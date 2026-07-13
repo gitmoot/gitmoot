@@ -51,7 +51,7 @@ artifact_blobs = %q
 # "daemon start" / "daemon run" remain the initial value; a key here is applied only
 # where the matching flag was NOT passed (flag = override). Its real purpose is WARM
 # RELOAD: send the running daemon SIGHUP (kill -HUP <pid>) and it RE-READS this section
-# and applies poll/workers/scheduler to the live supervisor WITHOUT a restart — a
+# and applies poll/workers/scheduler/idle cadence to the live supervisor WITHOUT a restart — a
 # restart tears down in-flight supervision and re-inherits the launching shell's env,
 # dropping runtime auth (#559). With no [daemon] section behavior is byte-identical.
 # poll is a Go duration; workers is the worker-pool size (applied live — the pool is
@@ -61,6 +61,8 @@ artifact_blobs = %q
 # poll = "30s"
 # workers = 1
 # scheduler = "barrier"
+# idle_grace_ticks = 3       # consecutive all-304 polls before decay starts
+# idle_max_multiplier = 4   # 1 disables idle cadence decay
 
 # [credentials] is OFF by default. When env_curation=true, only a pinned base
 # environment plus runtime-specific auth/state variables reaches runtime-agent
@@ -436,13 +438,17 @@ path = ""
 # with a secondary/abuse limit) and is the protection the incident needed. To also
 # smooth bursts proactively on a busy host, set a concurrency cap (e.g. 6) and/or a
 # small min_interval (e.g. "250ms"). Durations accept a Go duration ("250ms", "2s")
-# or a bare integer read as whole seconds.
+# or a bare integer read as whole seconds. conditional_requests uses in-memory ETags
+# for the four daemon polling reads (default true). calls_per_hour_warn is a
+# daemon-local approximate sliding-hour warning threshold; 0 disables it.
 # [github]
 # max_concurrent = 0
 # min_interval = "0s"
 # secondary_backoff = true
 # backoff_base = "60s"
 # backoff_max = "5m"
+# conditional_requests = true # ETag polling; in-memory cache is cold after restart
+# calls_per_hour_warn = 0      # off; daemon-local approximate count when enabled
 
 # [runtimes.<name>] is the OPTIONAL config-driven runtime metadata registry
 # (issue #652). Gitmoot ships built-in metadata for each compiled runtime (codex,

@@ -340,3 +340,34 @@ func TestConfigureDefaultResetsState(t *testing.T) {
 		t.Fatalf("reconfigure should reset live backoff state")
 	}
 }
+
+func TestRateLimiterSlidingCallWindowWarnsOnThresholdCrossing(t *testing.T) {
+	clock := newFakeClock()
+	warnings := 0
+	limiter := NewRateLimiter(RateLimiterConfig{
+		CallsPerHourWarn: 2,
+		Now:              clock.Now,
+		Sleep:            clock.Sleep,
+		Logf:             func(string, ...any) { warnings++ },
+	})
+	limiter.NoteCall()
+	if got := limiter.Snapshot().CallsInLastHour; got != 1 || warnings != 0 {
+		t.Fatalf("after one call count=%d warnings=%d", got, warnings)
+	}
+	limiter.NoteCall()
+	limiter.NoteCall()
+	if got := limiter.Snapshot().CallsInLastHour; got != 3 || warnings != 1 {
+		t.Fatalf("above threshold count=%d warnings=%d, want 3/1", got, warnings)
+	}
+	if err := clock.Sleep(context.Background(), time.Hour+time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := limiter.Snapshot().CallsInLastHour; got != 0 {
+		t.Fatalf("expired count=%d, want 0", got)
+	}
+	limiter.NoteCall()
+	limiter.NoteCall()
+	if warnings != 2 {
+		t.Fatalf("warnings after re-crossing = %d, want 2", warnings)
+	}
+}

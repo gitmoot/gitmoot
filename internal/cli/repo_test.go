@@ -107,6 +107,83 @@ func TestRunRepoAddAcceptsFlagsBeforeOrAfterPositional(t *testing.T) {
 	}
 }
 
+func TestRunRepoAddPollExplicitVsInherited(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"repo", "add", "owner/repo", "--home", home, "--path", repoDir}, &stdout, &stderr); code != 0 {
+		t.Fatalf("repo add inherited code=%d stderr=%s", code, stderr.String())
+	}
+	store := openCLIJobStore(t, home)
+	record, err := store.GetRepo(context.Background(), "owner/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.PollInterval != "" {
+		t.Fatalf("omitted --poll stored %q, want inherit sentinel", record.PollInterval)
+	}
+	store.Close()
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"repo", "list", "--home", home}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "inherit") {
+		t.Fatalf("repo list code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"repo", "add", "owner/repo", "--home", home, "--path", repoDir, "--poll", "45s"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("repo add explicit code=%d stderr=%s", code, stderr.String())
+	}
+	store = openCLIJobStore(t, home)
+	defer store.Close()
+	record, err = store.GetRepo(context.Background(), "owner/repo")
+	if err != nil || record.PollInterval != "45s" {
+		t.Fatalf("explicit --poll record=%+v err=%v", record, err)
+	}
+}
+
+func TestRunRepoSetIntervalSingleDefaultAndAll(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	ctx := context.Background()
+	for _, repo := range []db.Repo{{Owner: "owner", Name: "a"}, {Owner: "owner", Name: "b"}} {
+		if err := store.UpsertRepo(ctx, repo); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.Close()
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"repo", "set-interval", "owner/a", "45s", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("set single code=%d stderr=%s", code, stderr.String())
+	}
+	store = openCLIJobStore(t, home)
+	record, err := store.GetRepo(ctx, "owner/a")
+	if err != nil || record.PollInterval != "45s" {
+		t.Fatalf("single record=%+v err=%v", record, err)
+	}
+	store.Close()
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"repo", "set-interval", "owner/a", "default", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("set default code=%d stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"repo", "set-interval", "--all", "2m", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("set all code=%d stderr=%s", code, stderr.String())
+	}
+	store = openCLIJobStore(t, home)
+	defer store.Close()
+	for _, name := range []string{"owner/a", "owner/b"} {
+		record, err := store.GetRepo(ctx, name)
+		if err != nil || record.PollInterval != "2m0s" {
+			t.Fatalf("%s record=%+v err=%v", name, record, err)
+		}
+	}
+}
+
 func TestRunRepoAddRejectsWrongOrigin(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()

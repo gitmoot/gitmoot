@@ -2073,8 +2073,15 @@ func TestRepositoryMethods(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRepo returned error: %v", err)
 	}
-	if repo.FullName() != "jerryfane/gitmoot" || repo.DefaultBranch != "main" || repo.RemoteURL == "" || repo.CheckoutPath != "/repo/gitmoot" || repo.PrimaryCheckoutPath != "/repo/gitmoot" || !repo.Enabled || repo.PollInterval != "30s" {
+	if repo.FullName() != "jerryfane/gitmoot" || repo.DefaultBranch != "main" || repo.RemoteURL == "" || repo.CheckoutPath != "/repo/gitmoot" || repo.PrimaryCheckoutPath != "/repo/gitmoot" || !repo.Enabled || repo.PollInterval != "" {
 		t.Fatalf("repo = %+v", repo)
+	}
+	if err := store.SetRepoPollInterval(ctx, "jerryfane/gitmoot", "45s"); err != nil {
+		t.Fatalf("SetRepoPollInterval returned error: %v", err)
+	}
+	repo, err = store.GetRepo(ctx, "jerryfane/gitmoot")
+	if err != nil || repo.PollInterval != "45s" {
+		t.Fatalf("repo after SetRepoPollInterval = %+v err=%v", repo, err)
 	}
 	if err := store.UpsertRepo(ctx, Repo{Owner: "jerryfane", Name: "gitmoot", PollInterval: "1m"}); err != nil {
 		t.Fatalf("second UpsertRepo returned error: %v", err)
@@ -2980,6 +2987,44 @@ func TestMigrateAppendsTaskWorktreePath(t *testing.T) {
 	}
 	if task.WorktreePath != "" {
 		t.Fatalf("worktree path = %q, want empty default", task.WorktreePath)
+	}
+}
+
+func TestPollIntervalInheritanceMigrationPreservesExplicitValues(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gitmoot.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	store := &Store{db: raw}
+	for version, migration := range migrations[:len(migrations)-1] {
+		if err := store.applyMigration(ctx, version+1, migration); err != nil {
+			t.Fatalf("applyMigration(%d): %v", version+1, err)
+		}
+	}
+	for _, value := range []string{"30s", "45s", "3m0s"} {
+		name := strings.ReplaceAll(value, "0", "z")
+		if _, err := raw.ExecContext(ctx, `INSERT INTO repos(owner, name, full_name, poll_interval) VALUES ('owner', ?, ?, ?)`, name, "owner/"+name, value); err != nil {
+			t.Fatalf("insert %s: %v", value, err)
+		}
+	}
+	if err := store.applyMigration(ctx, len(migrations), migrations[len(migrations)-1]); err != nil {
+		t.Fatalf("apply poll interval migration: %v", err)
+	}
+	for repo, want := range map[string]string{
+		"owner/3zs":  "",
+		"owner/45s":  "45s",
+		"owner/3mzs": "3m0s",
+	} {
+		var got string
+		if err := raw.QueryRowContext(ctx, `SELECT poll_interval FROM repos WHERE full_name = ?`, repo).Scan(&got); err != nil {
+			t.Fatalf("read %s: %v", repo, err)
+		}
+		if got != want {
+			t.Fatalf("%s poll_interval=%q, want %q", repo, got, want)
+		}
 	}
 }
 

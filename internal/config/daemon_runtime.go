@@ -8,6 +8,11 @@ import (
 	"time"
 )
 
+const (
+	DefaultDaemonIdleGraceTicks    = 3
+	DefaultDaemonIdleMaxMultiplier = 4
+)
+
 // DaemonRuntimeConfig is the daemon's WARM-reloadable runtime settings, read from
 // the optional [daemon] section of the config file (issue #577). It is the concrete
 // reload source that lets a running daemon pick up poll/worker/scheduler changes on
@@ -42,6 +47,12 @@ type DaemonRuntimeConfig struct {
 	// per-tick worker dispatch reads the live mode each tick.
 	Scheduler    string
 	SchedulerSet bool
+	// IdleGraceTicks is the number of consecutive all-304 polls before cadence
+	// decay begins. IdleMaxMultiplier caps the decayed interval; 1 disables it.
+	IdleGraceTicks       int
+	IdleGraceTicksSet    bool
+	IdleMaxMultiplier    int
+	IdleMaxMultiplierSet bool
 }
 
 // LoadDaemonRuntimeConfig parses the [daemon] section. A file with no [daemon]
@@ -107,6 +118,20 @@ func LoadDaemonRuntimeConfig(paths Paths) (DaemonRuntimeConfig, error) {
 			}
 			parallel = parsed
 			parallelSet = true
+		case "idle_grace_ticks":
+			parsed, err := strconv.Atoi(value)
+			if err != nil {
+				return DaemonRuntimeConfig{}, fmt.Errorf("parse [daemon].idle_grace_ticks: %w", err)
+			}
+			cfg.IdleGraceTicks = parsed
+			cfg.IdleGraceTicksSet = true
+		case "idle_max_multiplier":
+			parsed, err := strconv.Atoi(value)
+			if err != nil {
+				return DaemonRuntimeConfig{}, fmt.Errorf("parse [daemon].idle_max_multiplier: %w", err)
+			}
+			cfg.IdleMaxMultiplier = parsed
+			cfg.IdleMaxMultiplierSet = true
 		default:
 			// Unknown keys are ignored so the section can grow (e.g. #576 per-repo
 			// caps) without breaking older binaries.
@@ -157,6 +182,12 @@ func validateDaemonRuntimeConfig(cfg DaemonRuntimeConfig) error {
 		default:
 			return fmt.Errorf("unsupported [daemon].scheduler %q; use barrier or pool", cfg.Scheduler)
 		}
+	}
+	if cfg.IdleGraceTicksSet && cfg.IdleGraceTicks <= 0 {
+		return fmt.Errorf("[daemon].idle_grace_ticks must be positive")
+	}
+	if cfg.IdleMaxMultiplierSet && cfg.IdleMaxMultiplier <= 0 {
+		return fmt.Errorf("[daemon].idle_max_multiplier must be positive")
 	}
 	return nil
 }

@@ -162,16 +162,21 @@ For structured local state, use `gitmoot dashboard --json` or
 ### Watched Repos
 
 ```sh
-gitmoot repo add owner/repo --path <path> [--poll 30s]
+gitmoot repo add owner/repo --path <path> [--poll <duration>]
 gitmoot repo list
+gitmoot repo set-interval owner/repo (<duration>|default)
+gitmoot repo set-interval --all (<duration>|default)
 gitmoot repo remove owner/repo
 gitmoot repo doctor owner/repo
 ```
 
 The `gitmoot repo` commands manage the **watched-repo registry**: one daemon
-per Gitmoot home supervises every **enabled** registered repo (each with its
-own `--poll` interval). `repo doctor owner/repo` checks a single repo's
-checkout/config health.
+per Gitmoot home supervises every **enabled** registered repo. Omitting
+`repo add --poll` stores `inherit`, so the repo follows the daemon's resolved
+`--poll` / `[daemon].poll` cadence; an explicit value is a per-repo override.
+`repo list` prints `inherit`. Use `repo set-interval` with a duration to change
+an override, with `default` to restore inheritance, or with `--all` to update all
+registered repos. `repo doctor owner/repo` checks checkout/config health.
 
 Use `daemon start` for the background daemon. Use `daemon run` only when the
 user explicitly wants a foreground process. Keep the default `--workers 1`
@@ -220,7 +225,8 @@ via a `[repos."owner/repo"]` section with `max_parallel = N` (#576) — see
 ### Reconfigure Without Restarting
 
 `kill -HUP <daemon-pid>` re-reads the `[daemon]` config section (`poll`,
-`workers`, `scheduler`, parallelism) live (#577) — no teardown, no dropped
+`workers`, `scheduler`, parallelism, `idle_grace_ticks`, and
+`idle_max_multiplier`) live (#577) — no teardown, no dropped
 jobs, no environment re-inheritance. Values pinned by explicit launch flags win
 over the re-read config. Prefer SIGHUP over a restart when only tuning
 throughput.
@@ -236,6 +242,23 @@ token may be stale — verify with `gitmoot doctor`. A (re)start that would come
 up without Claude auth warns loudly on stderr (non-fatal). `gitmoot daemon stop
 --forget-runtime-auth` deletes the persisted file so a later restart cannot
 recover the token.
+
+### GitHub Poll Budget And Idle Cadence
+
+`[github].conditional_requests` defaults to `true`. The daemon sends ETag
+validators on its four per-tick repository reads and reuses the cached raw JSON
+on `304 Not Modified`; set it to `false` as a kill switch. The cache is in memory,
+so the first sweep after a process restart is unconditional. The same section's
+`calls_per_hour_warn` is a count-and-warn threshold (`0` disables it). It is an
+approximate daemon-local sliding-hour count and excludes foreground and
+agent-owned `gh` processes.
+
+After `[daemon].idle_grace_ticks` all-304 polls (default `3`), a quiet repo moves
+to 2x and then up to `[daemon].idle_max_multiplier` (default `4`; `1` disables
+decay). A miss, poll error, queued job, or in-flight job resets it immediately.
+Open-PR repos remain at base cadence because their per-PR comment reads are not
+conditional. Decay gates repository GitHub calls only; heartbeat, pipeline, and
+chat maintenance still wakes at the base interval.
 
 `gitmoot dashboard` shows local state — daemon health, repos, agents and runtime
 sessions, jobs by state, worktrees, branch locks, SkillOpt train phase/candidate,

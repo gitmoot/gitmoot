@@ -41,6 +41,11 @@ type GitHubLimiterPolicy struct {
 	// response carries no Retry-After. Defaults 60s / 5m.
 	BackoffBase time.Duration
 	BackoffMax  time.Duration
+	// ConditionalRequests enables ETag-backed daemon polling reads. Default true.
+	ConditionalRequests bool
+	// CallsPerHourWarn logs when this daemon process reaches the threshold in a
+	// sliding hour. 0 disables the warning; agent-owned gh calls are not counted.
+	CallsPerHourWarn int
 }
 
 // DefaultGitHubLimiterPolicy returns the safe default: no proactive caps, reactive
@@ -52,6 +57,8 @@ func DefaultGitHubLimiterPolicy() GitHubLimiterPolicy {
 		SecondaryBackoffEnabled: true,
 		BackoffBase:             DefaultGitHubBackoffBase,
 		BackoffMax:              DefaultGitHubBackoffMax,
+		ConditionalRequests:     true,
+		CallsPerHourWarn:        0,
 	}
 }
 
@@ -132,6 +139,18 @@ func applyGitHubLimiterField(policy *GitHubLimiterPolicy, key string, value stri
 			return err
 		}
 		policy.BackoffMax = d
+	case "conditional_requests":
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return err
+		}
+		policy.ConditionalRequests = parsed
+	case "calls_per_hour_warn":
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
+		policy.CallsPerHourWarn = parsed
 	default:
 		// Unknown keys are ignored so a newer config on an older binary still loads.
 	}
@@ -162,6 +181,9 @@ func validateGitHubLimiterPolicy(policy GitHubLimiterPolicy) error {
 	}
 	if policy.BackoffMax < 0 {
 		return fmt.Errorf("github.backoff_max must be 0 or positive")
+	}
+	if policy.CallsPerHourWarn < 0 {
+		return fmt.Errorf("github.calls_per_hour_warn must be 0 (off) or positive")
 	}
 	return nil
 }

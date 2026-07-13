@@ -899,13 +899,15 @@ func configureGitHubLimiter(paths config.Paths, stdout io.Writer) {
 		policy = config.DefaultGitHubLimiterPolicy()
 	}
 	github.ConfigureDefault(github.RateLimiterConfig{
-		MaxConcurrent:  policy.MaxConcurrent,
-		MinInterval:    policy.MinInterval,
-		BackoffEnabled: policy.SecondaryBackoffEnabled,
-		BaseBackoff:    policy.BackoffBase,
-		MaxBackoff:     policy.BackoffMax,
-		Logf:           log.Printf,
+		MaxConcurrent:    policy.MaxConcurrent,
+		MinInterval:      policy.MinInterval,
+		BackoffEnabled:   policy.SecondaryBackoffEnabled,
+		BaseBackoff:      policy.BackoffBase,
+		MaxBackoff:       policy.BackoffMax,
+		CallsPerHourWarn: policy.CallsPerHourWarn,
+		Logf:             log.Printf,
 	})
+	github.ConfigureConditional(policy.ConditionalRequests)
 	writeLine(stdout, "daemon: %s", githubLimiterSummary(policy))
 }
 
@@ -923,8 +925,12 @@ func githubLimiterSummary(policy config.GitHubLimiterPolicy) string {
 	if policy.SecondaryBackoffEnabled {
 		backoff = fmt.Sprintf("on (base=%s max=%s)", policy.BackoffBase, policy.BackoffMax)
 	}
-	return fmt.Sprintf("github limiter: max_concurrent=%s min_interval=%s secondary_backoff=%s",
-		concurrent, interval, backoff)
+	conditional := "off"
+	if policy.ConditionalRequests {
+		conditional = "on"
+	}
+	return fmt.Sprintf("github limiter: max_concurrent=%s min_interval=%s secondary_backoff=%s conditional_requests=%s calls_per_hour_warn=%d",
+		concurrent, interval, backoff, conditional, policy.CallsPerHourWarn)
 }
 
 // daemonGitHubLimiterLine reports the configured [github] call budget (#683) for
@@ -1955,6 +1961,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 		schedule := registeredRepoSchedule{
 			NextPoll:    map[string]time.Time{},
 			ErrorStreak: map[string]int{},
+			IdleStreak:  map[string]int{},
 		}
 		_, initialWorkers, _ := live.snapshot()
 		// rawHome (the function's own param) feeds the read-only policy loaders;
@@ -2020,9 +2027,17 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 			if err := receiveSupervisorWorkerError(workerErr); err != nil {
 				return err
 			}
-			wait, err := pollRegisteredReposWithPoller(ctx, poller, schedule, time.Now().UTC(), live.pollInterval())
+			baseInterval := live.pollInterval()
+			pollerForTick := poller
+			pollerForTick.IdleGraceTicks, pollerForTick.IdleMaxMultiplier = live.idleCadence()
+			wait, err := pollRegisteredReposWithPoller(ctx, pollerForTick, schedule, time.Now().UTC(), baseInterval)
 			if err != nil {
 				return err
+			}
+			// Per-repo idle decay gates GitHub calls only. Heartbeats, pipelines,
+			// chat scans, and other supervisor maintenance still wake at base cadence.
+			if wait > baseInterval {
+				wait = baseInterval
 			}
 			if !dryRun {
 				if err := runHeartbeatScanOnce(ctx, paths, store, heartbeatEnqueue, time.Now().UTC()); err != nil {
@@ -2751,6 +2766,7 @@ func pollRegisteredRepos(ctx context.Context, store *db.Store, workers int, dryR
 type registeredRepoSchedule struct {
 	NextPoll    map[string]time.Time
 	ErrorStreak map[string]int
+	IdleStreak  map[string]int
 }
 
 func (s registeredRepoSchedule) ensure() registeredRepoSchedule {
@@ -2759,6 +2775,9 @@ func (s registeredRepoSchedule) ensure() registeredRepoSchedule {
 	}
 	if s.ErrorStreak == nil {
 		s.ErrorStreak = map[string]int{}
+	}
+	if s.IdleStreak == nil {
+		s.IdleStreak = map[string]int{}
 	}
 	return s
 }
@@ -2778,9 +2797,11 @@ type registeredRepoPoller struct {
 	// PollOnce may mutate the shared checkout, which used to be excluded by the
 	// per-repo lock being held for entire job runs. nil (legacy/test callers)
 	// behaves as always-idle.
-	Inflight        *inflightJobTracker
-	GitHubClient    func(checkout string) github.Client
-	WorkflowFactory func(store *db.Store, gh github.Client, checkout string) *workflow.Engine
+	Inflight          *inflightJobTracker
+	IdleGraceTicks    int
+	IdleMaxMultiplier int
+	GitHubClient      func(checkout string) github.Client
+	WorkflowFactory   func(store *db.Store, gh github.Client, checkout string) *workflow.Engine
 }
 
 // defaultRegisteredRepoPoller wires the registered-repo supervisor's per-tick
@@ -2806,6 +2827,8 @@ func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdo
 		Stdout:                 stdout,
 		EscalationTTL:          resolveEscalationTTL(rawHome),
 		RevertDetectionEnabled: resolveRevertDetectionEnabled(rawHome),
+		IdleGraceTicks:         config.DefaultDaemonIdleGraceTicks,
+		IdleMaxMultiplier:      config.DefaultDaemonIdleMaxMultiplier,
 		GitHubClient:           func(checkout string) github.Client { return github.NewClient(checkout) },
 		WorkflowFactory: func(store *db.Store, gh github.Client, checkout string) *workflow.Engine {
 			engine := daemonWorkflowEngine(store, gh, checkout, resolvedRoot)
@@ -2890,6 +2913,7 @@ func pollRegisteredReposWithPoller(ctx context.Context, poller registeredRepoPol
 	}
 	enabled := 0
 	polled := 0
+	decayed := 0
 	wait := fallbackPoll
 	waitSet := false
 	for _, repoRecord := range repos {
@@ -2899,50 +2923,84 @@ func pollRegisteredReposWithPoller(ctx context.Context, poller registeredRepoPol
 		enabled++
 		fullName := repoRecord.FullName()
 		interval := repoPollInterval(repoRecord.PollInterval, fallbackPoll)
+		queued, err := poller.Store.CountQueuedJobsForRepo(ctx, fullName)
+		if err != nil {
+			return wait, err
+		}
+		busy := poller.Inflight.busy(fullName)
+		promoted := queued > 0 || busy
+		if promoted {
+			delete(schedule.IdleStreak, fullName)
+		}
 		dueAt := schedule.NextPoll[fullName]
-		if !dueAt.IsZero() && dueAt.After(now) {
+		if !promoted && !dueAt.IsZero() && dueAt.After(now) {
+			if repoIdleMultiplier(schedule.IdleStreak[fullName], poller.IdleGraceTicks, poller.IdleMaxMultiplier) > 1 {
+				decayed++
+			}
 			wait = shorterWait(wait, dueAt.Sub(now), &waitSet)
 			continue
 		}
 		polled++
-		lastError, err := poller.pollRepo(ctx, repoRecord, now)
+		result, err := poller.pollRepo(ctx, repoRecord, now)
 		if err != nil {
 			return wait, err
 		}
 		nextInterval := interval
-		if lastError != "" {
+		if result.LastError != "" {
 			schedule.ErrorStreak[fullName]++
+			delete(schedule.IdleStreak, fullName)
 			nextInterval = repoBackoffInterval(interval, schedule.ErrorStreak[fullName])
 		} else {
 			delete(schedule.ErrorStreak, fullName)
+			idle := result.Conditional.Calls > 0 && result.Conditional.Misses == 0 &&
+				!poller.Inflight.busy(fullName) && queued == 0
+			if idle {
+				schedule.IdleStreak[fullName]++
+			} else {
+				delete(schedule.IdleStreak, fullName)
+			}
+			multiplier := repoIdleMultiplier(schedule.IdleStreak[fullName], poller.IdleGraceTicks, poller.IdleMaxMultiplier)
+			if multiplier > 1 {
+				decayed++
+				nextInterval = interval * time.Duration(multiplier)
+			}
 		}
 		schedule.NextPoll[fullName] = now.Add(nextInterval)
 		wait = shorterWait(wait, nextInterval, &waitSet)
 	}
-	writeLine(poller.Stdout, "supervised %d enabled repos, polled %d", enabled, polled)
+	writeLine(poller.Stdout, "supervised %d enabled repos, polled %d, decayed %d", enabled, polled, decayed)
 	if wait <= 0 {
 		wait = fallbackPoll
 	}
 	return wait, nil
 }
 
-func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, now time.Time) (string, error) {
+type registeredRepoPollResult struct {
+	LastError   string
+	Conditional github.ConditionalRequestStats
+}
+
+type conditionalRequestStatsProvider interface {
+	ConditionalRequestStats() github.ConditionalRequestStats
+}
+
+func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, now time.Time) (registeredRepoPollResult, error) {
 	store := p.Store
 	repo, err := daemon.ParseRepository(repoRecord.FullName())
 	if err != nil {
 		lastError := err.Error()
 		writeLine(p.Stdout, "%s: %s", repoRecord.FullName(), lastError)
-		return lastError, store.UpdateRepoPollResult(ctx, repoRecord.FullName(), now.Format(time.RFC3339), lastError)
+		return registeredRepoPollResult{LastError: lastError}, store.UpdateRepoPollResult(ctx, repoRecord.FullName(), now.Format(time.RFC3339), lastError)
 	}
 	lastPollAt := now.Format(time.RFC3339)
 	if strings.TrimSpace(repoRecord.CheckoutPath) == "" {
 		message := "registered repo has no checkout path"
 		writeLine(p.Stdout, "%s: %s", repoRecord.FullName(), message)
-		return message, store.UpdateRepoPollResult(ctx, repoRecord.FullName(), lastPollAt, message)
+		return registeredRepoPollResult{LastError: message}, store.UpdateRepoPollResult(ctx, repoRecord.FullName(), lastPollAt, message)
 	}
 	writeLine(p.Stdout, "polling %s with %d workers dry_run=%t", repoRecord.FullName(), p.Workers, p.DryRun)
 	if p.DryRun {
-		return "", store.UpdateRepoPollResult(ctx, repoRecord.FullName(), lastPollAt, "")
+		return registeredRepoPollResult{}, store.UpdateRepoPollResult(ctx, repoRecord.FullName(), lastPollAt, "")
 	}
 	gh := p.GitHubClient(repoRecord.CheckoutPath)
 	engine := p.WorkflowFactory(store, gh, repoRecord.CheckoutPath)
@@ -2988,7 +3046,33 @@ func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, 
 		lastError = err.Error()
 		writeLine(p.Stdout, "%s: %s", repoRecord.FullName(), lastError)
 	}
-	return lastError, store.UpdateRepoPollResult(ctx, repoRecord.FullName(), lastPollAt, lastError)
+	result := registeredRepoPollResult{LastError: lastError}
+	if provider, ok := gh.(conditionalRequestStatsProvider); ok {
+		result.Conditional = provider.ConditionalRequestStats()
+	}
+	return result, store.UpdateRepoPollResult(ctx, repoRecord.FullName(), lastPollAt, lastError)
+}
+
+func repoIdleMultiplier(streak, graceTicks, maxMultiplier int) int {
+	if maxMultiplier <= 0 {
+		maxMultiplier = config.DefaultDaemonIdleMaxMultiplier
+	}
+	if maxMultiplier <= 1 {
+		return 1
+	}
+	if graceTicks <= 0 {
+		graceTicks = config.DefaultDaemonIdleGraceTicks
+	}
+	if streak < graceTicks {
+		return 1
+	}
+	if streak == graceTicks {
+		if maxMultiplier < 2 {
+			return maxMultiplier
+		}
+		return 2
+	}
+	return maxMultiplier
 }
 
 func repoBackoffInterval(base time.Duration, streak int) time.Duration {
