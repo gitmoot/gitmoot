@@ -222,13 +222,20 @@ func (d *webDataSource) PipelineDetail(ctx context.Context, name string) (dashbo
 		spec, specParsed := pipeline.Spec{}, false
 		if loaded, lerr := pipeline.Load([]byte(rec.SpecYAML)); lerr == nil {
 			spec, specParsed = loaded, true
+			// Agent runtimes resolve best-effort so the declared preview can label
+			// agent stages even for a pipeline that has never run (#873).
+			agents := pipelineStageAgents(ctx, store, rec)
 			out.Declared = make([]dashboard.PipelineStage, 0, len(spec.Stages))
 			for _, s := range spec.Stages {
 				stage := dashboard.PipelineStage{
 					ID:    s.ID,
 					State: pipeline.StagePending,
+					Kind:  pipelineStageKindName(s),
 					Cmd:   s.Cmd,
 					Retry: s.Retry,
+				}
+				if agent, ok := agents[strings.TrimSpace(s.Agent)]; ok {
+					stage.AgentRuntime = strings.TrimSpace(agent.Runtime)
 				}
 				if len(s.Needs) > 0 {
 					stage.Deps = append([]string(nil), s.Needs...)

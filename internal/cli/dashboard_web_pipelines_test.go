@@ -546,6 +546,39 @@ func TestWebDataSourcePipelineDetailNeverRun(t *testing.T) {
 	if len(byID["publish"].Deps) != 2 || byID["publish"].Deps[0] != "ascore" || byID["publish"].Deps[1] != "bdedupe" {
 		t.Fatalf("declared publish Deps = %+v, want [ascore bdedupe]", byID["publish"].Deps)
 	}
+	// #873: the declared preview is self-describing with zero runs.
+	if byID["zfetch"].Kind != "shell" {
+		t.Fatalf("declared zfetch Kind = %q, want shell", byID["zfetch"].Kind)
+	}
+}
+
+// TestWebDataSourcePipelineDetailDeclaredAgentKind pins that a never-run AGENT
+// stage carries its kind and (when the agent is registered) runtime, so the
+// dashboard's declared DAG can badge it (#873).
+func TestWebDataSourcePipelineDetailDeclaredAgentKind(t *testing.T) {
+	home := dashboardTestHome(t)
+	store := openPipelineTestStore(t, home)
+	specYAML := "name: mailflow\nrepo: owner/repo\nstages:\n  - {id: triage, agent: helper, action: ask, prompt: read it}\n  - {id: run, cmd: echo, needs: [triage]}\n"
+	seedTestPipeline(t, store, db.Pipeline{Name: "mailflow", Repo: "owner/repo", SpecYAML: specYAML, Enabled: true})
+	if err := store.UpsertAgent(context.Background(), db.Agent{Name: "helper", Runtime: "codex", RepoScope: "owner/repo"}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	store.Close()
+
+	detail, err := (&webDataSource{home: home}).PipelineDetail(context.Background(), "mailflow")
+	if err != nil {
+		t.Fatalf("PipelineDetail: %v", err)
+	}
+	byID := map[string]dashboard.PipelineStage{}
+	for _, s := range detail.Declared {
+		byID[s.ID] = s
+	}
+	if byID["triage"].Kind != "agent_ask" || byID["triage"].AgentRuntime != "codex" {
+		t.Fatalf("declared triage = %+v, want agent_ask/codex", byID["triage"])
+	}
+	if byID["run"].Kind != "shell" || byID["run"].AgentRuntime != "" {
+		t.Fatalf("declared run = %+v, want shell with no runtime", byID["run"])
+	}
 }
 
 // TestWebDataSourcePipelineDetailHistory pins the run-history projection: runs come
