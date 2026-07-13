@@ -39,7 +39,7 @@ func TestWebDataSourceOverviewAndTasksEmpty(t *testing.T) {
 	}
 }
 
-func TestDashboardOverviewTasksAndAutoWorkflows(t *testing.T) {
+func TestDashboardOverviewTasksAndWorkflows(t *testing.T) {
 	home := dashboardTestHome(t)
 	paths := config.PathsForHome(home)
 	store, err := db.Open(paths.Database)
@@ -197,6 +197,9 @@ func TestDashboardOverviewTasksAndAutoWorkflows(t *testing.T) {
 	}
 	workflowByLabel := make(map[string]dashboard.WorkflowIndexEntry, len(workflows))
 	for _, entry := range workflows {
+		if entry.Auto {
+			t.Fatalf("workflow entry has auto flag set: %+v", entry)
+		}
 		workflowByLabel[entry.Label] = entry
 	}
 	if _, ok := workflowByLabel["pipeline/nightly"]; ok {
@@ -205,9 +208,8 @@ func TestDashboardOverviewTasksAndAutoWorkflows(t *testing.T) {
 	if _, ok := workflowByLabel["adhoc/alpha"]; ok {
 		t.Fatalf("pipeline stage was re-bucketed as adhoc/alpha: %+v", workflows)
 	}
-	adhocGroup := workflowByLabel["adhoc/beta"]
-	if !adhocGroup.Auto || adhocGroup.Summary != "" || adhocGroup.State != "active" || adhocGroup.Counts.Running != 1 {
-		t.Fatalf("adhoc auto group = %+v", adhocGroup)
+	if _, ok := workflowByLabel["adhoc/beta"]; ok {
+		t.Fatalf("unlabeled job was synthesized as adhoc/beta: %+v", workflows)
 	}
 	explicitPipeline := workflowByLabel["pipeline/manual"]
 	if explicitPipeline.Auto || explicitPipeline.Counts.Jobs != 1 || explicitPipeline.Counts.Succeeded != 1 || !reflect.DeepEqual(explicitPipeline.Repos, []string{"acme/manual"}) {

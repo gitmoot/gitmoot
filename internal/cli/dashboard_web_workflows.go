@@ -47,8 +47,7 @@ func deriveDashboardWorkflowState(now time.Time, activity dashboardWorkflowActiv
 }
 
 // Workflows returns one deterministic index row for every explicit workflow
-// label plus scalar-only adhoc/<agent> groups for unlabeled non-pipeline runs.
-// Auto groups never decode the global job payload corpus.
+// label. Unlabeled jobs are omitted from the workflow index.
 func (d *webDataSource) Workflows(ctx context.Context) ([]dashboard.WorkflowIndexEntry, error) {
 	out := []dashboard.WorkflowIndexEntry{}
 	now := time.Now().UTC()
@@ -73,23 +72,15 @@ func dashboardWorkflowEntries(ctx context.Context, store *db.Store, now time.Tim
 	if err != nil {
 		return nil, err
 	}
-	auto, err := store.ListDashboardAutoWorkflows(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	out := make([]dashboard.WorkflowIndexEntry, 0, len(summaries)+len(auto))
+	out := make([]dashboard.WorkflowIndexEntry, 0, len(summaries))
 	for _, summary := range summaries {
-		out = append(out, dashboardWorkflowEntry(now, summary, metaByWorkflow[summary.WorkflowID], reposByWorkflow[summary.WorkflowID], false))
-	}
-	for _, group := range auto {
-		out = append(out, dashboardWorkflowEntry(now, group.Summary, db.WorkflowMeta{}, group.Repos, true))
+		out = append(out, dashboardWorkflowEntry(now, summary, metaByWorkflow[summary.WorkflowID], reposByWorkflow[summary.WorkflowID]))
 	}
 	sort.SliceStable(out, func(i, j int) bool { return dashboardWorkflowIndexLess(out[i], out[j]) })
 	return out, nil
 }
 
-func dashboardWorkflowEntry(now time.Time, summary db.WorkflowSummary, meta db.WorkflowMeta, repos []string, auto bool) dashboard.WorkflowIndexEntry {
+func dashboardWorkflowEntry(now time.Time, summary db.WorkflowSummary, meta db.WorkflowMeta, repos []string) dashboard.WorkflowIndexEntry {
 	lastAt := parseJobTimeMillis(summary.LastAt)
 	state, stalledFor := deriveDashboardWorkflowState(now, dashboardWorkflowActivity{
 		Queued: summary.Queued, Running: summary.Running, Failed: summary.Failed,
@@ -97,20 +88,13 @@ func dashboardWorkflowEntry(now time.Time, summary db.WorkflowSummary, meta db.W
 		LastFailure: workflowMillisTime(parseJobTimeMillis(summary.LastFailureAt)),
 		LastNote:    workflowMillisTime(parseJobTimeMillis(summary.LastNoteAt)),
 	})
-	if auto && state == "stalled" {
-		// Auto-synthesized groups have no coordinator and no journal, so a
-		// failure can never be acknowledged and there is nobody to "go to" —
-		// stalled is a coordinated-workflow concept. Their failures surface
-		// through blocked-job / needs-a-human paths instead.
-		state, stalledFor = "settled", 0
-	}
 	author := strings.TrimSpace(meta.Author)
 	if author == "" {
 		author = strings.TrimSpace(summary.LastAuthor)
 	}
 	namespace, campaign := splitDashboardWorkflowLabel(summary.WorkflowID)
 	return dashboard.WorkflowIndexEntry{
-		Label: summary.WorkflowID, Namespace: namespace, Campaign: campaign, Auto: auto,
+		Label: summary.WorkflowID, Namespace: namespace, Campaign: campaign, Auto: false,
 		Summary: meta.Summary,
 		Coordinator: dashboard.WorkflowCoordinator{
 			Author: author, Pane: strings.TrimSpace(meta.Pane), SessionID: strings.TrimSpace(meta.SessionID),
