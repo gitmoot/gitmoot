@@ -480,3 +480,53 @@ func TestFormatTokens(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderHeaderPlainAndStyled(t *testing.T) {
+	full := Header{Action: "ask", Agent: "planner", Runtime: "codex", Model: "gpt-5.5", Workflow: "demo", Prompt: "do the thing"}
+	var plain bytes.Buffer
+	if err := NewRenderer(&plain).RenderHeader(full); err != nil {
+		t.Fatal(err)
+	}
+	want := "▶ ask · planner · codex/gpt-5.5 · workflow demo\n  do the thing\n\n"
+	if plain.String() != want {
+		t.Fatalf("plain header = %q, want %q", plain.String(), want)
+	}
+
+	var bare bytes.Buffer
+	if err := NewRenderer(&bare).RenderHeader(Header{Action: "review", Agent: "a", Runtime: "shell"}); err != nil {
+		t.Fatal(err)
+	}
+	if bare.String() != "▶ review · a · shell\n\n" {
+		t.Fatalf("bare header = %q", bare.String())
+	}
+
+	var styled bytes.Buffer
+	if err := NewStyledRenderer(&styled).RenderHeader(full); err != nil {
+		t.Fatal(err)
+	}
+	out := styled.String()
+	if !strings.Contains(out, "\x1b[90m▶ ask · planner · codex/gpt-5.5 · workflow demo\x1b[0m") {
+		t.Fatalf("styled meta not dim: %q", out)
+	}
+	if !strings.Contains(out, "\n  do the thing\n") {
+		t.Fatalf("styled prompt missing: %q", out)
+	}
+}
+
+func TestRenderHeaderTruncatesAndRedactsPrompt(t *testing.T) {
+	long := "token=ghp_1234567890abcdefghijklmnopqrstuvwxyz " + strings.Repeat("x", 600)
+	var got bytes.Buffer
+	if err := NewRenderer(&got).RenderHeader(Header{Action: "ask", Agent: "a", Runtime: "codex", Prompt: long}); err != nil {
+		t.Fatal(err)
+	}
+	out := got.String()
+	if strings.Contains(out, "ghp_") {
+		t.Fatalf("secret leaked into header: %q", out)
+	}
+	if !strings.Contains(out, "more chars)") {
+		t.Fatalf("missing truncation marker: %q", out)
+	}
+	if len(out) > headerPromptLimit+200 {
+		t.Fatalf("header too long: %d bytes", len(out))
+	}
+}

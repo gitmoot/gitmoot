@@ -193,3 +193,59 @@ func truncateUTF8(value string, limit int) string {
 	}
 	return value
 }
+
+// headerPromptLimit caps how much of the job prompt the transcript header
+// shows; the full prompt lives on the job payload, the header is orientation.
+const headerPromptLimit = 400
+
+// Header describes the job a transcript belongs to. It renders once, before
+// the event stream, so a pane (or a saved plain transcript) is self-describing.
+type Header struct {
+	Action   string
+	Agent    string
+	Runtime  string
+	Model    string
+	Workflow string
+	Prompt   string
+}
+
+// RenderHeader writes the job orientation block: one metadata line, then the
+// redacted, capped prompt, then a separating blank line. Styled mode dims the
+// metadata and truncation marker so the prompt reads as the lead.
+func (r *Renderer) RenderHeader(h Header) error {
+	meta := "▶ " + h.Action + " · " + h.Agent + " · " + h.Runtime
+	if h.Model != "" {
+		meta += "/" + h.Model
+	}
+	if h.Workflow != "" {
+		meta += " · workflow " + h.Workflow
+	}
+	prompt := cleanField(h.Prompt, headerPromptLimit)
+	marker := ""
+	if over := len(workflow.RedactCommentText(h.Prompt)) - len(prompt); over > 0 {
+		marker = fmt.Sprintf("… (+%d more chars)", over)
+	}
+	var out string
+	if r.styled {
+		out = sgrDim + meta + sgrReset + "\n"
+		if prompt != "" {
+			out += "  " + prompt
+			if marker != "" {
+				out += " " + sgrDim + marker + sgrReset
+			}
+			out += "\n"
+		}
+	} else {
+		out = meta + "\n"
+		if prompt != "" {
+			out += "  " + prompt
+			if marker != "" {
+				out += " " + marker
+			}
+			out += "\n"
+		}
+	}
+	r.wroteAny = true
+	_, err := fmt.Fprintln(r.w, out)
+	return err
+}

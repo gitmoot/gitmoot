@@ -286,7 +286,7 @@ func TestRunJobWatchTranscriptRendersExplicitShellLog(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{"job", "watch", "job-transcript", "--home", home, "--transcript", "--log-path", logPath, "--runtime", runtime.ShellRuntime, "--poll", "1ms"}, &stdout, &stderr)
-	if code != 0 || stdout.String() != "working\ndone without newline\n" {
+	if code != 0 || stdout.String() != "\u25b6 ask \u00b7 audit \u00b7 shell\n\nworking\ndone without newline\n" {
 		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 }
@@ -753,5 +753,28 @@ func TestTranscriptStyleTerminalStaysPlainOffTTY(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
 	if transcriptStyleTerminal(os.Stdout) {
 		t.Fatal("NO_COLOR must force plain output")
+	}
+}
+
+func TestTranscriptHeaderModelResolution(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertAgent(context.Background(), db.Agent{Name: "modeled", Runtime: runtime.CodexRuntime, Model: "gpt-5.5"}); err != nil {
+		t.Fatal(err)
+	}
+	job := db.Job{ID: "hdr", Type: "ask", Agent: "modeled", WorkflowID: "wf"}
+	h := transcriptHeader(context.Background(), store, job, workflow.JobPayload{Model: "gpt-5.4", Instructions: "prompt text"}, runtime.CodexRuntime)
+	if h.Model != "gpt-5.4" || h.Action != "ask" || h.Workflow != "wf" || h.Prompt != "prompt text" {
+		t.Fatalf("override header = %+v", h)
+	}
+	h = transcriptHeader(context.Background(), store, job, workflow.JobPayload{}, runtime.CodexRuntime)
+	if h.Model != "gpt-5.5" {
+		t.Fatalf("registry model = %q, want gpt-5.5", h.Model)
+	}
+	eph := db.Job{ID: "hdr2", Type: "ask", Agent: "no-row"}
+	h = transcriptHeader(context.Background(), store, eph, workflow.JobPayload{}, runtime.KimiRuntime)
+	if h.Model != "" {
+		t.Fatalf("ephemeral model = %q, want empty", h.Model)
 	}
 }

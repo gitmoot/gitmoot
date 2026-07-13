@@ -1167,6 +1167,11 @@ their line breaks, tool names are bold with dim argument digests, completed
 machinery and usage render dim, and failed tool results render red. Piped or
 redirected output always uses the plain byte-stable format.
 
+Every transcript opens with an orientation header — job action, agent,
+runtime/model (per-job override first, then the agent default), workflow label,
+and the redacted, length-capped prompt — so a pane or saved transcript is
+self-describing.
+
 `job watch --transcript` follows a cockpit tee log from offset zero and renders
 redacted, bounded human-readable runtime output until the job settles, then
 drains the file to EOF. It is incompatible with `--json`. Without `--log-path`,

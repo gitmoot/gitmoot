@@ -445,6 +445,9 @@ func runJobTranscriptWatch(jobID, home, requestedLogPath, requestedRuntime strin
 		if err != nil {
 			return err
 		}
+		if err := renderer.RenderHeader(transcriptHeader(context.Background(), store, job, payload, runtimeName)); err != nil {
+			return err
+		}
 		return transcript.Follow(context.Background(), logPath, transcript.FollowOptions{
 			PollInterval: poll,
 			Settled: func(ctx context.Context) (bool, error) {
@@ -976,4 +979,26 @@ func transcriptStyleTerminal(w io.Writer) bool {
 		return false
 	}
 	return info.Mode()&os.ModeCharDevice != 0
+}
+
+// transcriptHeader assembles the orientation block shown before a transcript:
+// job action, agent, runtime/model, workflow label, and the (capped, redacted)
+// prompt. Model resolution mirrors dispatch: per-job override first, then the
+// agent's registered default; empty stays empty rather than guessing a runtime
+// default. Agent-registry lookup is best-effort — ephemeral workers have no row.
+func transcriptHeader(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload, runtimeName string) transcript.Header {
+	model := strings.TrimSpace(payload.Model)
+	if model == "" {
+		if agent, err := store.GetAgent(ctx, job.Agent); err == nil {
+			model = strings.TrimSpace(agent.Model)
+		}
+	}
+	return transcript.Header{
+		Action:   job.Type,
+		Agent:    job.Agent,
+		Runtime:  runtimeName,
+		Model:    model,
+		Workflow: job.WorkflowID,
+		Prompt:   payload.Instructions,
+	}
 }
