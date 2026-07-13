@@ -115,6 +115,51 @@ A `[runtimes.<name>]` section can only tweak a **built-in** runtime's metadata; 
 cannot add a new first-class runtime (that requires a code change). An unknown
 runtime name is a config error surfaced by `gitmoot runtime list`.
 
+## Runtime Ambient Credential Hygiene
+
+Runtime-child environment curation is off by default. Enable it in
+`config.toml`:
+
+```toml
+[credentials]
+env_curation = true
+env_passthrough = ["GOCACHE", "NPM_*"]
+github = "deny"
+```
+
+With `env_curation = false`, runtime subprocesses inherit the full foreground or
+daemon environment exactly as before. With it enabled, the base allowlist is:
+`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `TMP`, `TEMP`, `TZ`,
+`LANG`, `LANGUAGE`, `TERM`, `COLORTERM`, `NO_COLOR`, all `LC_*` names,
+`XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`,
+`GOTOOLCHAIN`, `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`,
+`GIT_COMMITTER_EMAIL`, and `GITMOOT_HOME`.
+
+Codex additionally receives `CODEX_HOME`. Claude receives the transitional P1
+exceptions `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN`, and `CLAUDE_CONFIG_DIR`. Kimi, legacy `kimi-cli`, and
+shell add nothing. Gitmoot-owned relay, shell-stage, pipeline, and upstream-file
+variables are appended after the base and remain available.
+
+`env_passthrough` accepts exact names or a single trailing-`*` prefix glob.
+Names containing `=` or NUL and non-trailing `*` forms are invalid. The base
+deliberately excludes `SSH_AUTH_SOCK`, proxy variables, GitHub variables, and
+toolchain caches such as `GOCACHE`; pass through required non-secret operational
+variables explicitly.
+
+With curation enabled, `github = "deny"` is the default. All ambient `GH_*` and
+`GITHUB_*` values are omitted, including the four token variables. Gitmoot sets
+`GH_PROMPT_DISABLED=1` and gives each delivery a fresh empty `0700`
+`GH_CONFIG_DIR`, removed when the runtime exits on success, failure, timeout, or
+cancellation. `github = "inherit"` is the explicit opt-out: ambient `GH_*` and
+`GITHUB_*` variables pass through and Gitmoot adds neither GitHub variable.
+
+This is ambient credential hygiene/denial, not egress confinement or a proxy.
+There are no placeholder tokens or proxy changes. Credential files visible on
+disk remain readable under the current Landlock read-only `/` policy; SSH keys,
+SSH agents, credential helpers, and direct network access are untouched. Proxy
+enforcement is P2 and narrower Landlock read rules are P3.
+
 ## Runtime Launch Sandbox
 
 ```sh

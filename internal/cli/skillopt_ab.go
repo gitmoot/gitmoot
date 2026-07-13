@@ -152,7 +152,7 @@ func realSkillOptABDeliver(ctx context.Context, agent runtime.Agent, prompt stri
 	if adapterDir == "" {
 		adapterDir = agent.RepoScope
 	}
-	adapter, err := runtimeStartAdapterFor(newRuntimeFactory(), agent.Runtime, adapterDir)
+	adapter, err := runtimeAdapterFor(agent.ConfigHome, agent.Runtime, adapterDir)
 	if err != nil {
 		return "", err
 	}
@@ -330,6 +330,7 @@ func runSkillOptABWithStore(ctx context.Context, store *db.Store, paths config.P
 		AutonomyPolicy: firstNonEmpty(agent.AutonomyPolicy, runtime.AutonomyPolicyReadOnly),
 		Model:          agent.Model,
 		Effort:         agent.Effort,
+		ConfigHome:     options.home,
 	}
 
 	// Deliver BOTH variants, SERIALIZED (the second call only after the first
@@ -916,6 +917,7 @@ func runSkillOptABJudge(ctx context.Context, store *db.Store, paths config.Paths
 	}
 
 	judgeAgent := skillOptABJudgeAgent(reviewer)
+	judgeAgent.ConfigHome = options.home
 	prompt := buildSkillOptABJudgePrompt(options.prompt, optionA.answer, optionB.answer)
 	raw, err := skillOptABJudgeDeliver(ctx, judgeAgent, prompt)
 	if err != nil {
@@ -996,6 +998,7 @@ func runSkillOptABJudgeJury(ctx context.Context, store *db.Store, paths config.P
 	var jurors []skillOptABJuror
 	for _, reviewer := range jury {
 		judgeAgent := skillOptABJudgeAgent(reviewer)
+		judgeAgent.ConfigHome = options.home
 		raw, err := skillOptABJudgeDeliver(ctx, judgeAgent, prompt)
 		if err != nil {
 			// Fail-safe: a juror that errors is DROPPED; the jury proceeds with the rest.

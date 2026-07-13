@@ -317,6 +317,10 @@ func runSkillOptSynthWithStore(ctx context.Context, store *db.Store, opts synthO
 		fmt.Fprintf(stderr, "skillopt synth: challenger %v\n", err)
 		return 1
 	}
+	weakAgent.ConfigHome = opts.home
+	strongAgent.ConfigHome = opts.home
+	judgeAgent.ConfigHome = opts.home
+	challengerAgent.ConfigHome = opts.home
 	if err := os.MkdirAll(opts.out, 0o755); err != nil {
 		fmt.Fprintf(stderr, "skillopt synth: create out dir: %v\n", err)
 		return 1

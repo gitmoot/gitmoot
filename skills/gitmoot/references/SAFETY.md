@@ -115,6 +115,21 @@ plan explicitly says they are intended tracked fixtures or release assets.
 Redact secrets from GitHub comments, job summaries, raw examples, and copied
 command output.
 
+### Runtime ambient credential hygiene
+
+The optional `[credentials] env_curation = true` policy curates only runtime
+agent subprocess environments. Its default `github = "deny"` omits ambient
+`GH_*`/`GITHUB_*`, points `gh` at a fresh empty `0700` config directory, and
+disables interactive prompts. `github = "inherit"` explicitly restores ambient
+GitHub environment inheritance. See `CLI.md` for the exact base allowlist,
+runtime exceptions, and `env_passthrough` syntax.
+
+This is ambient credential hygiene/denial, not egress confinement or a proxy.
+It does not add placeholder tokens, alter proxy settings, hide credential files
+that remain readable from disk under Landlock's read-only `/`, disable SSH keys
+or agents, bypass Git credential helpers, or block direct network access. Those
+controls belong to the P2 proxy and P3 Landlock read-rule follow-ups.
+
 ## Pipeline Stages Run With Daemon Permissions
 
 `gitmoot pipeline add` (#681) is an **operator-trust action**. A pipeline stage's

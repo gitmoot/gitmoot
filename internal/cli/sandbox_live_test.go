@@ -71,7 +71,7 @@ func TestLiveKimiProduceLandlockState(t *testing.T) {
 		AutonomyPolicy: runtime.AutonomyPolicyWorkspaceWrite,
 		WritablePaths:  []string{data},
 	}
-	adapter, err := buildRuntimeAdapter(agent, work, nil)
+	adapter, err := buildRuntimeAdapter("", agent, work, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

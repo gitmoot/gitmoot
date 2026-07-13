@@ -61,6 +61,7 @@ const sidebars: SidebarsConfig = {
         'reference/cli',
         'reference/bridge',
         'reference/runtime-adapters',
+        'reference/credentials',
         'reference/result-contract',
         'reference/event-stream',
         'reference/skillopt-exchange-contract',

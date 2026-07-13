@@ -6006,7 +6006,7 @@ func startSkillOptTrainTargetSkillAgent(ctx context.Context, store *db.Store, se
 		AutonomyPolicy: "auto",
 		HealthStatus:   "idle",
 	}
-	adapter, err := runtimeStartAdapter(newRuntimeFactory(), agent.Runtime, record.CheckoutPath)
+	adapter, err := runtimeAdapterFor(request.Home, agent.Runtime, record.CheckoutPath)
 	if err != nil {
 		return "", err
 	}

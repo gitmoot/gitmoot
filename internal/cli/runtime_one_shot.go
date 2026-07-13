@@ -19,7 +19,7 @@ func deliverOneShotRuntimePrompt(ctx context.Context, agent runtime.Agent, promp
 	if adapterDir == "" {
 		adapterDir = agent.RepoScope
 	}
-	adapter, err := runtimeStartAdapterFor(newRuntimeFactory(), agent.Runtime, adapterDir)
+	adapter, err := runtimeAdapterFor(agent.ConfigHome, agent.Runtime, adapterDir)
 	if err != nil {
 		return "", err
 	}

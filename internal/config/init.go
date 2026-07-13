@@ -62,6 +62,16 @@ artifact_blobs = %q
 # workers = 1
 # scheduler = "barrier"
 
+# [credentials] is OFF by default. When env_curation=true, only a pinned base
+# environment plus runtime-specific auth/state variables reaches runtime-agent
+# subprocesses. env_passthrough accepts exact names or one trailing-* glob.
+# github=deny omits ambient GH_*/GITHUB_* values and gives gh a fresh empty config;
+# github=inherit explicitly restores ambient GitHub environment inheritance.
+# [credentials]
+# env_curation = false
+# env_passthrough = [] # e.g. ["GOCACHE", "NPM_*"]
+# github = "deny"
+
 [parallel_sessions]
 same_session = "fork_temp_session"
 merge_back = "summary"

@@ -84,6 +84,9 @@ type Agent struct {
 	// marshaled to the wire. Empty means "fall back to RepoScope" (unchanged
 	// legacy behavior for callers that never set it).
 	WorkingDir string
+	// ConfigHome is the raw --home value used only when constructing a runtime
+	// adapter for one-shot/SkillOpt deliveries. It is in-memory only.
+	ConfigHome string
 	// WritablePaths are additive runtime workspace grants for an action: produce
 	// pipeline stage. Codex enforces them itself; Claude/Kimi receive matching
 	// --add-dir hints while Gitmoot's Landlock wrapper provides hard enforcement.

@@ -1456,7 +1456,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	prompt := agentStartupPrompt(agent, cachedTemplate)
-	adapter, err := runtimeStartAdapter(newRuntimeFactory(), agent.Runtime, record.CheckoutPath)
+	adapter, err := runtimeAdapterFor(*home, agent.Runtime, record.CheckoutPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "load adapter: %v\n", err)
 		return 1
@@ -2228,7 +2228,7 @@ func runAgentRestart(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	adapter, err := runtimeStartAdapterFor(newRuntimeFactory(), existing.Runtime, record.CheckoutPath)
+	adapter, err := runtimeAdapterFor(*home, existing.Runtime, record.CheckoutPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "load adapter: %v\n", err)
 		return 1

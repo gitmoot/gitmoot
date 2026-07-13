@@ -77,9 +77,11 @@ func registerShellReviewer(t *testing.T, store *db.Store) {
 // probe that reports the shell reviewer available.
 func reviewDispatcherForTest(store *db.Store, diff reviewDiffFileReader) *crossFamilyReviewDispatcher {
 	return &crossFamilyReviewDispatcher{
-		store:        store,
-		diff:         diff,
-		buildAdapter: buildRuntimeAdapter,
+		store: store,
+		diff:  diff,
+		buildAdapter: func(agent runtime.Agent, checkout string, runner subprocess.Runner) (workflow.DeliveryAdapter, error) {
+			return buildRuntimeAdapter("", agent, checkout, runner)
+		},
 		authed: func(context.Context) map[string]bool {
 			return map[string]bool{runtime.ShellRuntime: true}
 		},

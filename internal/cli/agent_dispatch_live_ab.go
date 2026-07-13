@@ -181,6 +181,7 @@ func runLiveABChallenger(ctx context.Context, store *db.Store, request localAgen
 		AutonomyPolicy: firstNonEmpty(agent.AutonomyPolicy, runtime.AutonomyPolicyReadOnly),
 		Model:          agent.Model,
 		Effort:         agent.Effort,
+		ConfigHome:     request.Home,
 	}
 	prompt := strings.TrimSpace(request.Instructions)
 
