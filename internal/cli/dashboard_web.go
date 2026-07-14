@@ -47,6 +47,7 @@ func runDashboardWeb(home, addr string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/health", ds.handleHealth)
 	mux.HandleFunc("GET /api/learning/knowledge", ds.handleLearningKnowledge)
 	mux.Handle("/", dashboard.Serve(ds))
 	srv := &http.Server{Handler: mux}
@@ -100,6 +101,57 @@ type webDataSource struct {
 	updateResult    *dashboard.HealthUpdate
 	updateFetchedAt time.Time
 	updateOK        bool
+}
+
+type dashboardServerBuild struct {
+	Version string `json:"version"`
+	Commit  string `json:"commit"`
+}
+
+type dashboardHealthResponse struct {
+	dashboard.Health
+	Server dashboardServerBuild `json:"server"`
+}
+
+// handleHealth shadows the module's /api/health to add the build of the process
+// actually SERVING this response. Without it, a dashboard left on a stale binary
+// is invisible: the payload reports only the daemon's build, so the page looks
+// current while rendering old code's output (#932).
+//
+// It must otherwise reproduce the module's handler exactly — every list coerced
+// non-nil, so clients that consume the documented shape never see a null where
+// the contract promises an array.
+func (d *webDataSource) handleHealth(w http.ResponseWriter, r *http.Request) {
+	health, err := d.Health(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if health.Locks == nil {
+		health.Locks = []dashboard.HealthLock{}
+	}
+	if health.ResourceLocks == nil {
+		health.ResourceLocks = []dashboard.HealthResourceLock{}
+	}
+	if health.Stuck == nil {
+		health.Stuck = []dashboard.HealthStuckJob{}
+	}
+	if health.RecentFailures == nil {
+		health.RecentFailures = []dashboard.HealthFailure{}
+	}
+	build := buildinfo.Current()
+	response := dashboardHealthResponse{
+		Health: health,
+		Server: dashboardServerBuild{Version: build.Version, Commit: build.Commit},
+	}
+	buf, err := json.MarshalIndent(response, "", "  ")
+	if err != nil {
+		http.Error(w, "internal error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(append(buf, '\n'))
 }
 
 var _ dashboard.DataSource = (*webDataSource)(nil)
@@ -1335,30 +1387,38 @@ func (d *webDataSource) Health(ctx context.Context) (dashboard.Health, error) {
 	// which the version probe execs.
 	state := daemonProcessState(paths)
 	var executable string
+	var recordedDaemonVersion string
 	if pid, _, perr := currentDaemonPID(state); perr == nil && pid > 0 {
 		out.Daemon.Running = true
 		out.Daemon.PID = pid
 		if meta, merr := readDaemonMeta(state); merr == nil {
 			out.Daemon.StartedAt = parseJobTimeMillis(meta.StartedAt)
 			executable = strings.TrimSpace(meta.Executable)
+			recordedDaemonVersion = meta.Version
 		}
 	}
 
-	// The daemon-version probe (execs the binary) and the update check (hits
-	// GitHub) are the only slow parts of Health. Run them CONCURRENTLY — and with
-	// the local store read — so a cold cache never serially stacks their 3s + 4s
-	// timeouts past the health endpoint's latency budget. Both fail-open: a
-	// resolution error leaves the field empty/nil, never an error. The update
-	// check compares buildinfo.Current() (the exact documented shape); its
-	// displayed Current is overridden with the running daemon's version below,
-	// since that is the binary the operator actually runs.
+	// The on-disk probe (execs the binary) and the update check (hits GitHub) are
+	// the only slow parts of Health. Run them CONCURRENTLY — and with the local
+	// store read — so a cold cache never serially stacks their 3s + 4s timeouts
+	// past the health endpoint's latency budget. Both fail-open: a resolution
+	// error leaves the field empty/nil, never an error.
+	//
+	// Two DIFFERENT builds matter here and must not be conflated (#932):
+	//   - the build the daemon PROCESS is running (recorded in daemon.json),
+	//     which is what Daemon.Version reports; and
+	//   - the build of the binary now ON DISK at the daemon's path, which is what
+	//     `gitmoot update` replaces and therefore what the update badge compares.
+	// Pinning the badge to the running daemon instead would make it sticky: after
+	// an update, it would keep claiming an update is available until someone
+	// happened to restart the daemon.
 	var probes sync.WaitGroup
-	var daemonVersion string
+	var onDiskVersion string
 	var updateInfo *dashboard.HealthUpdate
 	probes.Add(2)
 	go func() {
 		defer probes.Done()
-		daemonVersion = d.resolveDaemonVersion(ctx, executable)
+		onDiskVersion = d.resolveOnDiskVersion(ctx, executable)
 	}()
 	go func() {
 		defer probes.Done()
@@ -1503,20 +1563,32 @@ func (d *webDataSource) Health(ctx context.Context) (dashboard.Health, error) {
 		return nil
 	})
 
-	// Join the concurrent probes. Prefer the running daemon's version for the
-	// update check's displayed Current (that is what the operator runs); fall back
-	// to the check's own current (buildinfo.Current().Version) when the daemon
-	// version is unavailable.
 	probes.Wait()
-	out.Daemon.Version = daemonVersion
+
+	// What the daemon PROCESS is running: its recorded build. Only a daemon
+	// started by an older gitmoot recorded none — then, and only then, fall back
+	// to asking the binary at its path (the pre-#932 behavior, which is wrong the
+	// moment the binary has been swapped, but is the best available answer).
+	out.Daemon.Version = recordedDaemonVersion
+	if out.Daemon.Version == "" {
+		out.Daemon.Version = onDiskVersion
+	}
+
+	// What an update would replace: the binary on disk. Keeping the badge
+	// on-disk-relative is what stops it from sticking on after `gitmoot update`
+	// until an unrelated daemon restart happens to clear it.
 	out.Update = updateInfo
-	if out.Update != nil && daemonVersion != "" {
-		// The update check ran against this dashboard-web process's OWN compiled
-		// version, but the operator runs the daemon binary — so make both the
-		// displayed Current AND the availability verdict daemon-relative,
-		// otherwise a divergent-binary deployment reports the wrong badge.
-		out.Update.Current = daemonVersion
-		out.Update.UpdateAvailable = out.Update.Latest != "" && !sameDaemonVersion(daemonVersion, out.Update.Latest)
+	badgeVersion := onDiskVersion
+	if badgeVersion == "" {
+		badgeVersion = out.Daemon.Version
+	}
+	if out.Update != nil && badgeVersion != "" {
+		// The update check ran against this serving process's OWN compiled
+		// version, which need not be the deployed binary at all — so make both the
+		// displayed Current AND the availability verdict relative to the binary on
+		// disk, otherwise a divergent-binary deployment reports the wrong badge.
+		out.Update.Current = badgeVersion
+		out.Update.UpdateAvailable = out.Update.Latest != "" && !sameDaemonVersion(badgeVersion, out.Update.Latest)
 	}
 	return out, err
 }
@@ -1534,14 +1606,15 @@ const (
 	updateFailureTTL = 10 * time.Minute
 )
 
-// resolveDaemonVersion returns the running daemon binary's reported version, or
-// "" when it cannot be determined (fail-open). It execs "<executable> version
-// --json" (preferred) or the plain-text form, under a hard timeout, and caches
-// the result keyed by the executable's path+mtime so SEQUENTIAL 12s health polls
-// never re-exec an unchanged binary (there is no singleflight, so concurrent cold
-// requests may each exec once). Only a regular, executable, existing file is ever
-// run.
-func (d *webDataSource) resolveDaemonVersion(ctx context.Context, executable string) string {
+// resolveOnDiskVersion returns the version of the binary NOW SITTING at the
+// daemon's executable path — what a restart (or an update) would pick up, which
+// is not necessarily what the daemon process is running. It execs
+// "<executable> version --json" (preferred) or the plain-text form under a hard
+// timeout, and caches by executable path+mtime so SEQUENTIAL 12s health polls
+// never re-exec an unchanged binary (there is no singleflight, so concurrent
+// cold requests may each exec once). Only a regular, executable, existing file
+// is ever run. Returns "" when it cannot be determined (fail-open).
+func (d *webDataSource) resolveOnDiskVersion(ctx context.Context, executable string) string {
 	executable = strings.TrimSpace(executable)
 	if executable == "" {
 		return ""
@@ -1560,7 +1633,7 @@ func (d *webDataSource) resolveDaemonVersion(ctx context.Context, executable str
 	}
 	d.mu.Unlock()
 
-	version := execDaemonVersion(ctx, executable)
+	version, _ := execBinaryBuildFn(ctx, executable)
 
 	d.mu.Lock()
 	d.daemonVersionKey = key
@@ -1569,12 +1642,17 @@ func (d *webDataSource) resolveDaemonVersion(ctx context.Context, executable str
 	return version
 }
 
-// execDaemonVersion runs the binary's version subcommand with a hard timeout and
-// returns the reported version. It prefers the JSON form ("version --json" ->
-// {"version": "..."}); on any failure it falls back to the plain-text form
-// ("version" -> "gitmoot <ver>", from which the "gitmoot" prefix is trimmed).
-// Returns "" on any error (fail-open).
-func execDaemonVersion(ctx context.Context, executable string) string {
+// execBinaryBuildFn is the seam the on-disk build probe goes through, so tests
+// can choose what the binary at a path reports without exec'ing anything (the
+// same pattern as updateCheckFn). The real exec path stays covered by
+// TestWebDataSourceDaemonVersionCache / ...TextFallback.
+var execBinaryBuildFn = execBinaryBuild
+
+// execBinaryBuild asks the binary AT THIS PATH what build it is — which is what a
+// daemon restart would load, and therefore the thing worth comparing the running
+// daemon against. The plain-text fallback yields no commit, so callers must treat
+// an empty commit as unknown rather than as "no commit".
+func execBinaryBuild(ctx context.Context, executable string) (version, commit string) {
 	// Both attempts share ONE budget so the whole probe is bounded by
 	// daemonVersionTimeout, never 2× it (a wedged binary must not stack).
 	ctx, cancel := context.WithTimeout(ctx, daemonVersionTimeout)
@@ -1582,19 +1660,20 @@ func execDaemonVersion(ctx context.Context, executable string) string {
 	if out, err := exec.CommandContext(ctx, executable, "version", "--json").Output(); err == nil {
 		var parsed struct {
 			Version string `json:"version"`
+			Commit  string `json:"commit"`
 		}
 		if json.Unmarshal(out, &parsed) == nil {
 			if v := strings.TrimSpace(parsed.Version); v != "" {
-				return v
+				return v, strings.TrimSpace(parsed.Commit)
 			}
 		}
 	}
 	out, err := exec.CommandContext(ctx, executable, "version").Output()
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	line := strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
-	return strings.TrimSpace(strings.TrimPrefix(line, "gitmoot"))
+	return strings.TrimSpace(strings.TrimPrefix(line, "gitmoot")), ""
 }
 
 // updateCheckFn is the seam the Health update check goes through so tests can

@@ -152,6 +152,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	// locate the running daemon. A failure here (no initialized home) just leaves
 	// Paths zero, which skips the daemon check and keeps the shell-local one.
 	paths, _ := config.DefaultPaths()
+	buildStatus := daemonBuildStatus(paths)
 	probeRunner, authState, authSource, authErr := runtimeJobRunnerWithAuth("", runtime.ClaudeRuntime, nil)
 	checker := doctor.Checker{
 		Dir:               *repoDir,
@@ -162,6 +163,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		ClaudeAuthSource:  authSource,
 		ClaudeAuthError:   authErr,
 		SkipDaemonAuth:    true,
+		Build:             &buildStatus,
 	}
 	checks := checker.Run(context.Background())
 	// #631: surface a stale backlog of blocked jobs (each paused awaiting a human)

@@ -1715,6 +1715,48 @@ The command must print a valid `gitmoot_result` object for normal jobs.
 Use `gitmoot doctor --repo .` first. It checks local prerequisites from the
 repository checkout.
 
+## The Daemon Is Running An Old Build
+
+Symptoms:
+
+- You upgraded gitmoot (or rebuilt it) and the fix did not take effect.
+- Jobs still behave like the previous version; new flags are ignored.
+- `gitmoot version` shows the new build, so everything *looks* current.
+
+Cause: the daemon is a long-lived process. Replacing the binary on disk does not
+change the code an already-running daemon executes — it keeps running the build
+it started from until it is restarted. `gitmoot version` reports the binary
+**you** invoked, not the one the daemon is running, so it cannot tell you this.
+
+Check:
+
+```sh
+gitmoot daemon status   # prints "build: <version>" and warns on skew
+gitmoot doctor          # non-fatal "build" check, same comparison
+```
+
+A skew reads:
+
+```
+WARNING: daemon running dev-cd43a49 (cd43a495); /usr/local/bin/gitmoot is dev-56ba1c7 (56ba1c74) — restart the daemon to pick it up
+```
+
+Fix: restart the daemon (when it is idle — confirm no running jobs first). If it
+runs under systemd, use your service manager rather than `gitmoot daemon restart`.
+
+Notes:
+
+- The comparison is between the daemon **process** and the binary at the
+  **daemon's own path** — the one a restart would load. It is not about the binary
+  you happen to be invoking, which may be a different one entirely.
+- The comparison is only made when both builds are identifiable, and an unknown is
+  never reported as skew *or* as agreement — it reports "comparison skipped". A
+  daemon started by an older gitmoot recorded no build; and two unstamped builds
+  with no VCS commit are both just `dev`, so comparing them would prove nothing.
+- If you run the web dashboard as a **separate service**, it is its own process
+  with its own build. `/api/health` reports the serving process's build separately
+  from the daemon's, so restart both after an upgrade.
+
 ## `gh`
 
 Symptoms:
@@ -9412,6 +9454,40 @@ gitmoot daemon stop
 For structured local state, use `gitmoot dashboard --json` or
 `gitmoot task list --repo owner/repo --json`. `gitmoot status --json` and
 `gitmoot task show` are not valid commands.
+
+### Build skew (upgraded but not restarted)
+
+The daemon is a long-lived process: replacing the binary does **not** change the
+code it is executing. It keeps running the old build until you restart it.
+
+The daemon records the build it started from in `<home>/.gitmoot/daemon.json`
+(`version` + `commit`). `gitmoot daemon status` prints that build and compares it
+against the build of the binary **now sitting at the daemon's own path** — the
+one a restart would load:
+
+```
+build: dev-cd43a49 (cd43a495)
+WARNING: daemon running dev-cd43a49 (cd43a495); /root/.local/bin/gitmoot is dev-56ba1c7 (56ba1c74) — restart the daemon to pick it up
+```
+
+`gitmoot doctor` reports the same comparison as a non-fatal `build` check. Note
+it compares the **daemon** against the **daemon's binary** — not against whatever
+binary you happen to be invoking, which may not be the daemon's at all.
+
+Unknown is never reported as skew, and never reported as agreement either. The
+comparison is skipped when the daemon is not running, when it was started by an
+older gitmoot (no recorded build), or when either side is an **unidentifiable**
+build. A build is identifiable if it was stamped (any release, and the documented
+deploy recipe) or if Go's VCS stamping supplied a commit — which a plain
+`go build` in a git tree provides. Two unstamped builds with no commit are both
+just `dev`: indistinguishable, so comparing them would prove nothing.
+
+The web dashboard's `/api/health` reports the daemon's **recorded** build (what
+the process is actually running — not the version of whatever binary now sits at
+its path) plus, separately, the serving dashboard process's own build, so a
+dashboard left on a stale binary is visible rather than silently wrong. The
+update badge stays relative to the binary on disk, since that is what an update
+replaces.
 
 The `gitmoot repo` commands manage the **watched-repo registry**: one daemon
 per Gitmoot home supervises every **enabled** registered repo. An omitted
