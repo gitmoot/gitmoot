@@ -39,6 +39,13 @@ workflow index and detail views. Omitting the flag preserves it; a new non-empty
 value replaces it; `--summary ""` clears it. Summaries are stored verbatim with
 a 300-byte limit.
 
+When `workflow note` runs inside Herdr and `--pane`, `--session`, or `--workdir`
+is omitted, it fills each omitted value from `herdr pane current --current`.
+The pane label, full agent session UUID, and pane working directory become the
+latest handoff; explicit flags always win. Use `--no-auto` to disable this for a
+script. Lookup failures are ignored so the note still lands, and author is never
+inferred. The dashboard only builds a resume command from a full UUID.
+
 In `gitmoot dashboard --web`, labeled jobs cluster around workflow hubs in
 Galaxy; a labeled run links to `/workflows/<label>`, which shows the complete
 run forest, state totals, best-effort token totals, and shared journal.

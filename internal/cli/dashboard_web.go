@@ -253,7 +253,7 @@ func (d *webDataSource) Workflow(ctx context.Context, label string, q dashboard.
 			author = strings.TrimSpace(summary.LastAuthor)
 		}
 		out.Coordinator = dashboard.WorkflowCoordinator{
-			Author: author, Pane: strings.TrimSpace(meta.Pane), SessionID: strings.TrimSpace(meta.SessionID),
+			Author: author, Pane: strings.TrimSpace(meta.Pane), SessionID: dashboardWorkflowResumeSessionID(meta.SessionID),
 		}
 		out.WorkDir = strings.TrimSpace(meta.WorkDir)
 
@@ -288,6 +288,18 @@ func (d *webDataSource) Workflow(ctx context.Context, label string, q dashboard.
 		return nil
 	})
 	return out, err
+}
+
+// The dashboard module has no separate resume-command field. Its workflow
+// detail client builds `claude --resume` whenever SessionID is non-empty, so the
+// detail projection exposes only canonical full UUIDs. The index projection
+// keeps the raw stored value visible as coordinator context.
+func dashboardWorkflowResumeSessionID(value string) string {
+	value = strings.TrimSpace(value)
+	if !isFullWorkflowSessionUUID(value) {
+		return ""
+	}
+	return value
 }
 
 func cappedWorkflowLimit(value, cap int) int {

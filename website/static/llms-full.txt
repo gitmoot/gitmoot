@@ -655,6 +655,8 @@ gitmoot agent doctor <name>
 gitmoot goal import --file GOAL.md --repo owner/repo
 gitmoot task run task-001 --repo owner/repo --owner lead --base main
 gitmoot task recover task-001 --owner lead   # finalize a dead implement's dirty worktree
+gitmoot task dismiss task-001 --reason "abandoned experiment"
+gitmoot task events task-001 --json
 gitmoot task list --repo owner/repo
 gitmoot job list
 gitmoot job show <job-id>
@@ -683,9 +685,26 @@ job, rather than silently discard the work, and point at `task recover <id>
 --owner <agent>`. `task recover` commits the full worktree state (`git add -A`,
 including untracked non-ignored files), pushes the branch, and opens or adopts
 the task's PR — the finalize steps the dead implementer never reached. `--repo`
-is optional (it falls back to the task's stored repo). Recovery refuses while a
-live process is still inside the task worktree; wait for it to exit or stop the
-orphaned implementer first.
+is optional (it falls back to the task's stored repo). `--owner` is required for
+this artifact-finalization path, while a dismissed task with no branch can be
+restored to `planned` without it. Recovery refuses while a live process is still
+inside the task worktree; wait for it to exit or stop the orphaned implementer
+first.
+
+`task dismiss` is the explicit terminal action for an abandoned
+`implementing` or `blocked` task. It refuses while a matching job or worktree
+process is live, preserves the branch and worktree, releases the branch lock
+best-effort, and records `task_dismissed_manual`. The daemon can record
+`task_dismissed_auto` for stale candidates using `updated_at` as a conservative
+activity proxy. Configure `[workflow].stale_task_ttl = "168h"` (the default), or
+set it to `"0"` to disable this poll leg. Candidates with a same-repo open PR,
+a remote branch, a live job, or an uncertain remote check are not dismissed.
+
+Dismissed tasks never return to implementation through ordinary task run,
+allocation, or late workflow advancement. `task recover` is the explicit path:
+preserved branch/worktree artifacts move through `implementing` to `pr_open`,
+while a branchless task returns to `planned` with task-run guidance. Inspect the
+full audit trail with `task events`.
 
 ## Runtime Plugin Setup
 
@@ -3917,9 +3936,10 @@ sessions**, with `--parallel N`.
 
 ## Reconfigure without restarting (SIGHUP)
 
-Changing workers/scheduler/poll no longer needs a daemon restart (#577):
+Changing workers/scheduler/poll/idle cadence no longer needs a daemon restart (#577):
 `kill -HUP <daemon-pid>` re-reads the `[daemon]` config section (`poll`,
-`workers`, `scheduler`, parallelism) live — no teardown, no dropped jobs, no
+`workers`, `scheduler`, parallelism, `idle_grace_ticks`, and
+`idle_max_multiplier`) live — no teardown, no dropped jobs, no
 environment re-inheritance (so the daemon's runtime auth is untouched). Values
 pinned by explicit launch flags win over the re-read config. When a full
 restart is genuinely needed, prefer `gitmoot daemon restart`, which recovers
@@ -3987,6 +4007,8 @@ min_interval = "0s"       # min spacing between call starts; 0 = off (Go duratio
 secondary_backoff = true  # pause all GitHub calls on a secondary/abuse limit (default true)
 backoff_base = "60s"      # exponential fallback base when no Retry-After (default 60s)
 backoff_max = "5m"        # exponential fallback cap (default 5m)
+conditional_requests = true # ETag conditional polling (default true)
+calls_per_hour_warn = 0      # daemon-local sliding-hour warning; 0 = off
 ```
 
 **Safe defaults:** the proactive caps (`max_concurrent`, `min_interval`) default
@@ -3999,6 +4021,25 @@ the abuse detector, which only prolongs the block. Calls are never dropped — t
 queue/delay until the window passes. On a busy host, set `max_concurrent` (e.g.
 `6`) and/or a small `min_interval` (e.g. `250ms`) to also smooth bursts
 proactively. `gitmoot daemon status` shows the configured budget.
+
+The four per-tick repository list reads use an in-memory ETag cache. A `304 Not
+Modified` replays the prior raw JSON and does not consume GitHub's REST quota.
+After three consecutive successful all-304 ticks, a quiet repo moves to 2x base
+cadence and then to 4x; configure the thresholds under `[daemon]`:
+
+```toml
+[daemon]
+idle_grace_ticks = 3
+idle_max_multiplier = 4  # 1 disables idle decay
+```
+
+Any response-body miss, poll error, queued repo job, or in-flight repo job resets
+the streak and promotes the repo immediately. A repo with an open PR remains at
+base cadence because its per-PR comment reads are deliberately non-conditional.
+The decayed `NextPoll` gates GitHub calls only: heartbeat, pipeline, and chat
+maintenance still wake at the resolved base interval. The local call count is
+approximate and covers only this daemon process; foreground commands and
+agent-owned `gh` processes are outside it.
 
 ## Not yet automatic (follow-ups)
 
@@ -6346,8 +6387,9 @@ Tasks is a read-only lifecycle board backed by Gitmoot's task registry. Internal
 states are projected into **implementing**, **PR open**, **blocked**, and
 **merged** columns; planned and unknown states are omitted, review,
 changes-requested, and ready-to-merge tasks remain in PR open, and awaiting-human
-tasks appear as blocked. Merged history is limited server-side to the last seven
-days.
+tasks appear as blocked. Dismissed tasks are excluded by the server-side query,
+and task-event cursor invalidation removes a newly dismissed card immediately.
+Merged history is limited server-side to the last seven days.
 
 Cards carry the task title, repository, assigned branch-lock owner when one is
 known, pull-request number, last-update age, and a blocked reason. The CI dot is
@@ -6523,6 +6565,10 @@ pane, session id), and a stalled workflow shows a go-here card with the pane,
 the session id, and a copyable resume command — the dashboard tells you where
 to intervene; it never intervenes itself. Coordinators should set the summary
 at kickoff with `gitmoot workflow note ... --summary "<one sentence>"`.
+Inside Herdr, omitted pane/session/workdir flags are detected from the current
+pane. The resume command is shown only when the stored session id is a full
+UUID; legacy shortened values remain visible in the workflow index but cannot
+produce a broken command.
 
 ## Brain
 
@@ -9336,8 +9382,10 @@ only declared data paths, the disposable workdir, and temp roots are writable.
 ```sh
 gitmoot status --repo owner/repo
 gitmoot events --repo owner/repo
-gitmoot repo add owner/repo --path <path> [--poll 30s]
+gitmoot repo add owner/repo --path <path> [--poll <duration>]
 gitmoot repo list
+gitmoot repo set-interval owner/repo (<duration>|default)
+gitmoot repo set-interval --all (<duration>|default)
 gitmoot repo remove owner/repo
 gitmoot repo doctor owner/repo
 gitmoot daemon start --poll 30s --workers 1
@@ -9354,9 +9402,13 @@ For structured local state, use `gitmoot dashboard --json` or
 `gitmoot task show` are not valid commands.
 
 The `gitmoot repo` commands manage the **watched-repo registry**: one daemon
-per Gitmoot home supervises every **enabled** registered repo (each with its
-own `--poll` interval). `repo doctor owner/repo` checks a single repo's
-checkout/config health.
+per Gitmoot home supervises every **enabled** registered repo. An omitted
+`repo add --poll` stores the `inherit` sentinel, so the repo follows the daemon's
+resolved `--poll` / `[daemon].poll` cadence; an explicit `--poll` stores a
+per-repo override. `repo list` renders the sentinel as `inherit`.
+`repo set-interval owner/repo <duration>` changes an override, `default` restores
+inheritance, and `--all` applies either value to every registered repo.
+`repo doctor owner/repo` checks a single repo's checkout/config health.
 
 Use `daemon start` for the background daemon. Use `daemon run` only when the
 user explicitly wants a foreground process. Keep the default `--workers 1`
@@ -9410,7 +9462,7 @@ keys are re-read every tick, so edits apply live.
 
 Reconfigure the running daemon without a restart: `kill -HUP <daemon-pid>`
 re-reads the `[daemon]` config section (`poll`, `workers`, `scheduler`,
-parallelism) live (#577) — no teardown, no dropped jobs, no environment
+parallelism, `idle_grace_ticks`, `idle_max_multiplier`) live (#577) — no teardown, no dropped jobs, no environment
 re-inheritance. Values pinned by explicit launch flags win over the re-read
 config. Prefer SIGHUP over a restart when only tuning throughput.
 
@@ -9446,12 +9498,25 @@ else exponential backoff) instead of retry-storming the abuse detector. Knobs:
 `min_interval` spaces successive call starts (0 = off; accepts a Go duration or a
 bare integer of seconds), `secondary_backoff` toggles the reactive pause (default
 `true`), and `backoff_base`/`backoff_max` bound the exponential fallback
-(defaults `60s`/`5m`). **Safe defaults:** the proactive caps are off (single-call
+(defaults `60s`/`5m`). `conditional_requests` defaults to `true` and adds ETag
+validators to the four per-tick polling reads; a `304 Not Modified` replays the
+cached raw response at zero GitHub quota cost. `calls_per_hour_warn` defaults to
+`0` (off) and logs when this daemon process crosses the configured sliding-hour
+count. The count is approximate and daemon-local: foreground commands and
+agent-owned `gh` processes are outside it. **Safe defaults:** the proactive caps are off (single-call
 latency and steady-state throughput unchanged) and only the invisible reactive
 backoff is on. Set `max_concurrent` (e.g. `6`) and/or a small `min_interval`
 (e.g. `250ms`) to also smooth bursts proactively on a busy host. Calls are never
 dropped — they queue/delay. `gitmoot daemon status` shows the configured budget
-(`github limiter: max_concurrent=… min_interval=… secondary_backoff=…`).
+(`github limiter: max_concurrent=… min_interval=… secondary_backoff=… conditional_requests=… calls_per_hour_warn=…`).
+
+After `idle_grace_ticks` consecutive successful polls in which every conditional
+read is a 304, a repo's GitHub poll cadence decays to 2x and then up to
+`idle_max_multiplier` (default `4`; `1` disables decay). Any response-body miss,
+poll error, queued repo job, or in-flight repo job resets/promotes it immediately.
+Repos with open PRs stay at base cadence because their per-PR comment reads are
+deliberately non-conditional. Idle decay gates only GitHub calls; heartbeat,
+pipeline, and chat maintenance still wake at the resolved base interval.
 
 `gitmoot dashboard` shows local state — daemon health, repos, agents and runtime
 sessions, jobs by state, worktrees, branch locks, SkillOpt train phase/candidate,
@@ -10174,7 +10239,7 @@ gitmoot orchestrate planner "Coordinate the dashboard wave." --repo owner/repo -
 gitmoot job list --workflow fable/dashboard-redesign
 gitmoot workflow list
 gitmoot workflow show fable/dashboard-redesign --limit 100
-gitmoot workflow note fable/dashboard-redesign "Kickoff." --author operator --pane wave-2 --session <session-id> --workdir /work/dashboard --summary "Coordinate and ship the dashboard redesign."
+gitmoot workflow note fable/dashboard-redesign "Kickoff." --author operator --summary "Coordinate and ship the dashboard redesign."
 ```
 
 `workflow list` reports per-state counts, note count, first/last activity, and
@@ -10184,7 +10249,14 @@ index plus a mission-log detail at `/workflows/<label>`. Workflows are `active`
 while queued/running or touched within 30 minutes, `stalled` when failed/blocked
 and quiet for 30 minutes to 24 hours, and `settled` otherwise. The optional
 `--pane`, `--session`, and `--workdir` note flags persist the latest coordinator
-handoff shown on that page; author defaults to the newest note author.
+handoff shown on that page. When those flags are omitted inside Herdr
+(`HERDR_SOCKET_PATH` or `HERDR_ENV=1`), `workflow note` reads the current pane
+label, full runtime session UUID, and working directory automatically. Explicit
+flags always win; `--no-auto` skips detection for scripted callers. Detection
+is fail-open and never prevents a note, and it does not infer `--author`.
+Dashboard resume commands require a full UUID; legacy short session values stay
+visible in the workflow index as context but are not rendered into a broken
+command. Author defaults to the newest note author.
 Coordinators should set a one-line human summary at kickoff with `--summary`.
 Omitting that flag preserves the stored summary, a non-empty value replaces it,
 and `--summary ""` clears it. Summary input is stored verbatim and limited to
@@ -10225,11 +10297,26 @@ Start a task in its dedicated branch worktree and inspect task state:
 gitmoot task run task-001 --repo owner/repo --owner lead --base main
 gitmoot task list --repo owner/repo
 gitmoot task list --repo owner/repo --state implementing --json
+gitmoot task dismiss task-001 --reason "abandoned experiment"
+gitmoot task events task-001 --json
 ```
 
 `task run` stores the deterministic task worktree path under
 `$GITMOOT_HOME/worktrees/<owner>--<repo>/<task-id>/` and leaves the registered
 checkout on its current branch.
+
+`task dismiss` is an explicit terminal action for stale `implementing` or
+`blocked` tasks. It refuses planned, PR/review/merge, awaiting-human, unknown,
+or otherwise machine-owned states; any live queued/running job, unsettled
+post-delivery advancement, unsettled running cancellation, or live process in
+the task worktree also blocks dismissal. The default reason is `dismissed by
+operator`. Success preserves the branch and worktree, releases the branch lock
+best-effort, and appends `task_dismissed_manual` to `task events`. Repeating the
+command is an exit-0 no-op with `changed:false` in JSON.
+
+`task events <id>` prints the append-only task lifecycle trail. Automatic stale
+dismissals use `task_dismissed_auto`; explicit recovery and retry use
+`task_recovered` and `task_recovered_job_retry`.
 
 ### Recover A Dead Implement
 
@@ -10244,9 +10331,11 @@ gitmoot task recover task-001 --owner lead
 gitmoot task recover task-001 --owner lead --repo owner/repo --skip-native-review-fanout --json
 ```
 
-`--owner <agent>` is required (a registered implement-capable agent, attributed
-as the recovery lead). `--repo owner/repo` is optional — it falls back to the
-task's stored repo and is only required when the task carries none.
+`--owner <agent>` is required when recovering preserved branch/worktree
+artifacts (a registered implement-capable agent, attributed as the recovery
+lead). A dismissed task with no branch returns directly to `planned`, so that
+path does not require `--owner`. `--repo owner/repo` is optional — it falls back
+to the task's stored repo and is only required when the task carries none.
 `--skip-native-review-fanout` persists that flag before the PR is opened;
 `--json` prints the machine-readable recovery result.
 
@@ -10255,6 +10344,14 @@ untracked non-ignored files), pushes the task branch, and opens or adopts the
 task's PR — the exact finalize steps the dead implementer never reached. If the
 worktree is already clean it recovers the commit already ahead of the base
 (and refuses when there is nothing ahead to recover).
+
+Recovery is also the only task-level escape hatch from `dismissed`. A dismissed
+task with a preserved branch and worktree first moves to `implementing`, then to
+`pr_open` after finalization. A branchless auto-dismissed task instead returns to
+`planned` and prints guidance to use `task run`. Ordinary `task run`, branch or
+worktree allocation, review continuation, and task-state advancement never
+resurrect a dismissed task implicitly. Retrying one of its jobs explicitly
+restores the task first and records `task_recovered_job_retry`.
 
 Two refusals guard `task recover` (and the `task run` / `agent implement`
 restart that points to it):
@@ -12089,6 +12186,13 @@ workflow index and detail views. Omitting the flag preserves it; a new non-empty
 value replaces it; `--summary ""` clears it. Summaries are stored verbatim with
 a 300-byte limit.
 
+When `workflow note` runs inside Herdr and `--pane`, `--session`, or `--workdir`
+is omitted, it fills each omitted value from `herdr pane current --current`.
+The pane label, full agent session UUID, and pane working directory become the
+latest handoff; explicit flags always win. Use `--no-auto` to disable this for a
+script. Lookup failures are ignored so the note still lands, and author is never
+inferred. The dashboard only builds a resume command from a full UUID.
+
 In `gitmoot dashboard --web`, labeled jobs cluster around workflow hubs in
 Galaxy; a labeled run links to `/workflows/<label>`, which shows the complete
 run forest, state totals, best-effort token totals, and shared journal.
@@ -12745,7 +12849,28 @@ over a dirty worktree with no active job (so nothing is discarded) and point at
 `gitmoot task recover <task-id> --owner <agent>`, which commits the full
 worktree state (`git add -A`, incl. untracked non-ignored files), pushes the
 branch, and opens or adopts the PR. `--repo` is optional (falls back to the
-task's repo). Recovery refuses while a live process is still inside the worktree.
+task's repo). `--owner` is required for this artifact-finalization path, but not
+when a dismissed branchless task is simply restored to `planned`. Recovery
+refuses while a live process is still inside the worktree.
+
+**Task dismissal and stale reconciliation:** `dismissed` is a terminal task
+state for implicit workflow transitions. An operator can run `gitmoot task
+dismiss <id> [--reason ...]` only from `implementing` or `blocked`; Gitmoot
+refuses while any matching job is live or a process remains in the task
+worktree. The branch and worktree are preserved, while the branch lock is
+released best-effort. Manual and daemon transitions are audited as
+`task_dismissed_manual` and `task_dismissed_auto` in `gitmoot task events <id>`.
+
+Each repo poll reads a bounded oldest-first stale window and processes up to 20
+qualifying `implementing`/`blocked` tasks whose `updated_at` predates
+`[workflow].stale_task_ttl` (default `168h`; `"0"` disables the leg).
+`updated_at` is deliberately a conservative activity proxy, not proof of
+abandonment. A candidate is skipped for a live job, a same-repo open-PR branch,
+or an exact branch still present on `origin`; remote lookup uncertainty skips
+mutation. A branchless candidate needs no remote lookup. Explicit `task
+recover` restores preserved artifacts through `implementing` to `pr_open`, or
+restores a branchless task to `planned`; job retry records its own recovery
+event. The server-side task board omits dismissed rows immediately.
 
 **PR-bound fix pass:** use `gitmoot agent implement <agent> --repo owner/repo
 --pr <number> "..."` or `gitmoot agent run <agent> --repo owner/repo --action
@@ -13727,6 +13852,16 @@ cannot recurse or fan out forever:
   `answer` verb is valid only on an ask round and `retry`/`continue`/`abort` only
   on a failure round — a mismatch is rejected with a clear message. Absence of
   `human_questions[]` is byte-identical to today's behavior.
+
+- Dismissed task terminality (#913): `dismissed` may be entered only from
+  `implementing` or `blocked`. Manual `task dismiss` proves there is no live
+  matching job and no process in the task worktree. Automatic stale-task
+  reconciliation proves there is no live matching job and requires its separate
+  open-PR/remote-branch evidence, but does not inspect worktree processes.
+  Ordinary task run/allocation and late review or continuation advancement fail
+  closed instead of overwriting it. Only `task recover` or retrying a job performs
+  an explicit audited recovery. Dismissal never deletes the task branch or
+  worktree.
 
 When a bound trips, the offending delegations are not dispatched and the parent
 receives a typed lifecycle event explaining why (for example, a delegation batch
