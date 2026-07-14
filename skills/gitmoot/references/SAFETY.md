@@ -124,6 +124,15 @@ cannot resurrect a legacy or ambient token. When one managed variable is
 selected, Gitmoot injects all three Claude auth names and blanks the absent
 ones, preventing ambient API-key precedence from changing the selection.
 
+An opt-in `[credentials] model_gateway = true` routes Claude through a
+daemon-owned `127.0.0.1` reverse model gateway. Each delivery gets a random,
+job-scoped placeholder; the daemon snapshots the real `runtime-auth.env`
+credential, attaches it only on the allowlisted upstream request, and revokes
+the placeholder when delivery returns. Unknown/revoked placeholders fail with
+`401`, and an unavailable gateway or unallowlisted upstream fails the delivery
+without direct-auth fallback. It is off by default and does not cover Codex or
+Kimi.
+
 ### Runtime ambient credential hygiene
 
 The optional `[credentials] env_curation = true` policy curates only runtime
@@ -133,11 +142,17 @@ disables interactive prompts. `github = "inherit"` explicitly restores ambient
 GitHub environment inheritance. See `CLI.md` for the exact base allowlist,
 runtime exceptions, and `env_passthrough` syntax.
 
-This is ambient credential hygiene/denial, not egress confinement or a proxy.
-It does not add placeholder tokens, alter proxy settings, hide credential files
-that remain readable from disk under Landlock's read-only `/`, disable SSH keys
-or agents, bypass Git credential helpers, or block direct network access. Those
-controls belong to the P2 proxy and P3 Landlock read-rule follow-ups.
+The gateway has two explicit limits:
+
+1. env-var routing is cooperative, not a hard egress boundary — a malicious
+   agent can unset it; this buys credential custody/policy/attribution, not
+   enforcement.
+2. The strong "agents never hold real credentials" claim also requires
+   Landlock read-rules for `runtime-auth.env` (same-UID read is currently
+   possible) — that is P3.
+
+Codex/Kimi custody, Landlock read rules, MITM CA support, corporate
+proxy/`NO_PROXY` interoperability, and hard egress enforcement remain P3.
 
 ## Pipeline Stages Run With Daemon Permissions
 

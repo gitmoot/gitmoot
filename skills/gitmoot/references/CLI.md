@@ -149,7 +149,16 @@ Runtime-child environment curation is off by default. Enable it in
 env_curation = true
 env_passthrough = ["GOCACHE", "NPM_*"]
 github = "deny"
+model_gateway = false
+model_gateway_allow_hosts = ["api.anthropic.com"]
 ```
+
+Set `model_gateway = true` to opt Claude into the daemon-owned loopback model
+gateway. Each delivery receives a random job-scoped placeholder and
+`ANTHROPIC_BASE_URL`; only the gateway holds the snapshotted real credential and
+it forwards only to an exact allowlisted hostname. Gateway startup, credential,
+and allowlist failures are fail-closed. The option is off by default and does
+not change Codex or Kimi.
 
 With `env_curation = false`, runtime subprocesses inherit the full foreground or
 daemon environment exactly as before. With it enabled, the base allowlist is:
@@ -178,11 +187,12 @@ With curation enabled, `github = "deny"` is the default. All ambient `GH_*` and
 cancellation. `github = "inherit"` is the explicit opt-out: ambient `GH_*` and
 `GITHUB_*` variables pass through and Gitmoot adds neither GitHub variable.
 
-This is ambient credential hygiene/denial, not egress confinement or a proxy.
-There are no placeholder tokens or proxy changes. Credential files visible on
-disk remain readable under the current Landlock read-only `/` policy; SSH keys,
-SSH agents, credential helpers, and direct network access are untouched. Proxy
-enforcement is P2 and narrower Landlock read rules are P3.
+Two limits apply: env-var routing is cooperative, not a hard egress boundary —
+a malicious agent can unset it; this buys credential custody/policy/attribution,
+not enforcement. The strong "agents never hold real credentials" claim also
+requires Landlock read-rules for `runtime-auth.env` (same-UID read is currently
+possible) — that is P3. Codex/Kimi custody and hard egress enforcement also
+remain P3.
 
 ## Runtime Launch Sandbox
 

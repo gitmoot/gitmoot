@@ -251,6 +251,26 @@ the absent ones so an ambient API key cannot override OAuth. Unset writes an
 explicit-empty file; do not delete it, because a missing file can trigger the
 one-time legacy/environment bootstrap.
 
+Opt Claude into the daemon-owned credential-terminating loopback gateway with:
+
+```toml
+[credentials]
+model_gateway = true
+model_gateway_allow_hosts = ["api.anthropic.com"]
+```
+
+Each delivery receives a job-scoped placeholder and `ANTHROPIC_BASE_URL`; the
+gateway holds the snapshotted real credential, forwards only to an allowlisted
+host, streams the response, and revokes the placeholder when delivery ends.
+Failures are fail-closed. The option is off by default and does not cover Codex
+or Kimi.
+
+env-var routing is cooperative, not a hard egress boundary — a malicious agent
+can unset it; this buys credential custody/policy/attribution, not enforcement.
+The strong "agents never hold real credentials" claim also requires Landlock
+read-rules for `runtime-auth.env` (same-UID read is currently possible) — that
+is P3.
+
 ### GitHub Poll Budget And Idle Cadence
 
 `[github].conditional_requests` defaults to `true`. The daemon sends ETag

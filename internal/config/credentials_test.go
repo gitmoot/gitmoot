@@ -25,7 +25,7 @@ func TestLoadCredentialsConfigDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadCredentialsConfig: %v", err)
 	}
-	want := CredentialsConfig{GitHub: CredentialsGitHubDeny}
+	want := CredentialsConfig{GitHub: CredentialsGitHubDeny, ModelGatewayAllowHosts: []string{DefaultModelGatewayHost}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("config = %#v, want %#v", got, want)
 	}
@@ -37,12 +37,14 @@ func TestLoadCredentialsConfigParsesSection(t *testing.T) {
 env_curation = true
 env_passthrough = ["GOCACHE", "NPM_*"]
 github = "inherit"
+model_gateway = true
+model_gateway_allow_hosts = ["api.anthropic.com", "localhost"]
 `)
 	got, err := LoadCredentialsConfig(paths)
 	if err != nil {
 		t.Fatalf("LoadCredentialsConfig: %v", err)
 	}
-	if !got.EnvCuration || got.GitHub != CredentialsGitHubInherit || !reflect.DeepEqual(got.EnvPassthrough, []string{"GOCACHE", "NPM_*"}) {
+	if !got.EnvCuration || got.GitHub != CredentialsGitHubInherit || !got.ModelGateway || !reflect.DeepEqual(got.EnvPassthrough, []string{"GOCACHE", "NPM_*"}) || !reflect.DeepEqual(got.ModelGatewayAllowHosts, []string{"api.anthropic.com", "localhost"}) {
 		t.Fatalf("unexpected config: %#v", got)
 	}
 }
@@ -58,6 +60,11 @@ func TestLoadCredentialsConfigRejectsInvalidValues(t *testing.T) {
 		{name: "nul", body: "env_passthrough = [\"A\\u0000B\"]", want: "must not contain"},
 		{name: "middle glob", body: "env_passthrough = [\"N*M\"]", want: "trailing '*'"},
 		{name: "multiple globs", body: "env_passthrough = [\"N**\"]", want: "trailing '*'"},
+		{name: "empty gateway allowlist", body: "model_gateway = true\nmodel_gateway_allow_hosts = []", want: "must not be empty"},
+		{name: "gateway scheme", body: "model_gateway_allow_hosts = [\"https://api.anthropic.com\"]", want: "without scheme"},
+		{name: "gateway port", body: "model_gateway_allow_hosts = [\"api.anthropic.com:443\"]", want: "without a port"},
+		{name: "gateway wildcard", body: "model_gateway_allow_hosts = [\"*.anthropic.com\"]", want: "unsupported character"},
+		{name: "gateway space", body: "model_gateway_allow_hosts = [\"api anthropic.com\"]", want: "unsupported character"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -76,7 +83,7 @@ func TestDefaultConfigCredentialsExampleRoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
-	for _, line := range []string{"# [credentials]", "# env_curation = false", "# env_passthrough = []", "# github = \"deny\""} {
+	for _, line := range []string{"# [credentials]", "# env_curation = false", "# env_passthrough = []", "# github = \"deny\"", "# model_gateway = false", "# model_gateway_allow_hosts = [\"api.anthropic.com\"]"} {
 		if !strings.Contains(string(content), line) {
 			t.Fatalf("DefaultConfig missing %q", line)
 		}

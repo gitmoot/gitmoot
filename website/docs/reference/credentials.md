@@ -9,6 +9,8 @@ and shell runtime adapters in foreground and daemon-worker delivery paths.
 env_curation = true
 env_passthrough = ["GOCACHE", "NPM_*"]
 github = "deny"
+model_gateway = false
+model_gateway_allow_hosts = ["api.anthropic.com"]
 ```
 
 `env_curation = false` preserves the historical behavior: runtime commands
@@ -35,6 +37,25 @@ missing, Gitmoot imports legacy `daemon-runtime.env` once, or otherwise seeds
 from ambient managed variables once. Existing files are never overwritten.
 For systemd deployments, keep `daemon.env` for operational values such as
 `PATH`; do not duplicate Claude secrets there after bootstrap.
+
+## Claude model gateway
+
+`model_gateway = true` opts Claude deliveries into a daemon-owned loopback
+model gateway. The gateway listens only on an OS-assigned `127.0.0.1` port. For
+each job, Gitmoot snapshots the selected real credential into daemon memory,
+mints a random `gitmoot-kc-...` placeholder, and gives the Claude child only
+that placeholder plus `ANTHROPIC_BASE_URL` pointing at the loopback listener.
+The gateway authenticates the placeholder, replaces it with the real upstream
+credential, streams the response, and revokes the placeholder when delivery
+ends. Unknown and revoked placeholders receive `401`.
+
+The feature is off by default and currently covers Claude only. A populated
+`runtime-auth.env` is required while it is enabled; Gitmoot fails the delivery
+instead of falling back to ambient auth, Claude's credential store, or direct
+upstream egress. `model_gateway_allow_hosts` is an exact hostname allowlist and
+defaults to `api.anthropic.com`. The upstream is fixed by Gitmoot, not selected
+by the child. Credentials are read once when the adapter is built, never once
+per proxied request, so rotation applies to the next adapter/job.
 
 ## Curated environment
 
@@ -83,9 +104,16 @@ disable prompts.
 
 ## Limits
 
-This is ambient credential hygiene and denial, not egress confinement and not a
-network proxy. It creates no placeholder tokens and changes no proxy settings.
-Runtime sandboxes can still read credential files that are visible on disk;
-the current Linux Landlock policy includes read-only `/`. SSH keys, SSH agents,
-Git credential helpers, and direct network access are also untouched. Network
-proxy enforcement is P2, and narrower Landlock read rules are P3.
+The model gateway is credential custody, policy, and attribution, not a hard
+egress boundary. These two limits are deliberate:
+
+1. env-var routing is cooperative, not a hard egress boundary — a malicious
+   agent can unset it; this buys credential custody/policy/attribution, not
+   enforcement.
+2. The strong "agents never hold real credentials" claim also requires
+   Landlock read-rules for `runtime-auth.env` (same-UID read is currently
+   possible) — that is P3.
+
+Codex/Kimi custody, MITM CA support, corporate proxy/`NO_PROXY` interoperability,
+Landlock read restrictions, and hard egress enforcement remain P3. SSH keys,
+SSH agents, Git credential helpers, and direct network access are untouched.
