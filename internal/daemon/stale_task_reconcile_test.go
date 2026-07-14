@@ -185,6 +185,39 @@ func TestStaleTaskReconcilerCapDrainAndRepeatIdempotence(t *testing.T) {
 	}
 }
 
+func TestStaleTaskReconcilerFiltersBeforeTickCap(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "owner", Name: "repo"}
+	seedStaleRepo(t, store, repo)
+	writeStaleTaskConfig(t, store, "1h")
+	for i := 0; i < staleTaskReconcileLimit+1; i++ {
+		id := fmt.Sprintf("task-%02d", i)
+		branch := "feature/" + id
+		if err := store.UpsertTask(ctx, db.Task{ID: id, RepoFullName: repo.FullName(), State: string(workflow.TaskImplementing), Branch: branch}); err != nil {
+			t.Fatal(err)
+		}
+		if i < staleTaskReconcileLimit {
+			payload, _ := json.Marshal(workflow.JobPayload{Repo: repo.FullName(), Branch: branch, TaskID: id})
+			if err := store.CreateJob(ctx, db.Job{ID: "job-" + id, Type: "ask", State: string(workflow.JobQueued), Payload: string(payload)}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	remote := &fakeRemoteBranchChecker{present: map[string]struct{}{}}
+	d := Daemon{Repo: repo, Store: store, RemoteBranches: remote, Now: futureClock}
+	if err := d.reconcileStaleTasks(ctx, map[string]struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.GetTask(ctx, "task-20")
+	if err != nil || task.State != string(workflow.TaskDismissed) {
+		t.Fatalf("task behind live prefix=%+v err=%v", task, err)
+	}
+	if len(remote.calls) != 1 || len(remote.calls[0]) != 1 || remote.calls[0][0] != "feature/task-20" {
+		t.Fatalf("remote calls=%v, want only task behind live prefix", remote.calls)
+	}
+}
+
 func TestStaleTaskReconcilerDisabledAndInvalidConfig(t *testing.T) {
 	for _, test := range []struct {
 		name, value string
@@ -232,6 +265,35 @@ func TestPollOnceRunsStaleTaskReconciler(t *testing.T) {
 	task, _ := store.GetTask(ctx, "task-1")
 	if task.State != string(workflow.TaskDismissed) {
 		t.Fatalf("PollOnce task state = %s", task.State)
+	}
+}
+
+func TestPollOnceForkPRBranchDoesNotProtectStaleTask(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "owner", Name: "repo"}
+	seedStaleRepo(t, store, repo)
+	writeStaleTaskConfig(t, store, "1h")
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: repo.FullName(), State: string(workflow.TaskImplementing), Branch: "feature/shared"}); err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeGitHub{
+		pullsByState: map[string][]github.PullRequest{"open": {{
+			Number: 9, State: "open", HeadRef: "feature/shared", HeadRepoFullName: "fork/repo", BaseRef: "main", HeadSHA: "abc123",
+		}}},
+		comments: map[int64][]github.IssueComment{},
+	}
+	remote := &fakeRemoteBranchChecker{present: map[string]struct{}{}}
+	d := Daemon{Repo: repo, Store: store, GitHub: client, Now: futureClock, RemoteBranches: remote}
+	if err := d.PollOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.GetTask(ctx, "task-1")
+	if err != nil || task.State != string(workflow.TaskDismissed) {
+		t.Fatalf("fork PR protected base task: task=%+v err=%v", task, err)
+	}
+	if len(remote.calls) != 1 || len(remote.calls[0]) != 1 || remote.calls[0][0] != "feature/shared" {
+		t.Fatalf("remote calls=%v", remote.calls)
 	}
 }
 

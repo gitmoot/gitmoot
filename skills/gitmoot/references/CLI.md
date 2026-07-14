@@ -1149,9 +1149,11 @@ gitmoot task recover task-001 --owner lead
 gitmoot task recover task-001 --owner lead --repo owner/repo --skip-native-review-fanout --json
 ```
 
-`--owner <agent>` is required (a registered implement-capable agent, attributed
-as the recovery lead). `--repo owner/repo` is optional — it falls back to the
-task's stored repo and is only required when the task carries none.
+`--owner <agent>` is required when recovering preserved branch/worktree
+artifacts (a registered implement-capable agent, attributed as the recovery
+lead). A dismissed task with no branch returns directly to `planned`, so that
+path does not require `--owner`. `--repo owner/repo` is optional — it falls back
+to the task's stored repo and is only required when the task carries none.
 `--skip-native-review-fanout` persists that flag before the PR is opened;
 `--json` prints the machine-readable recovery result.
 

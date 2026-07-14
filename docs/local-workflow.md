@@ -78,9 +78,11 @@ job, rather than silently discard the work, and point at `task recover <id>
 --owner <agent>`. `task recover` commits the full worktree state (`git add -A`,
 including untracked non-ignored files), pushes the branch, and opens or adopts
 the task's PR — the finalize steps the dead implementer never reached. `--repo`
-is optional (it falls back to the task's stored repo). Recovery refuses while a
-live process is still inside the task worktree; wait for it to exit or stop the
-orphaned implementer first.
+is optional (it falls back to the task's stored repo). `--owner` is required for
+this artifact-finalization path, while a dismissed task with no branch can be
+restored to `planned` without it. Recovery refuses while a live process is still
+inside the task worktree; wait for it to exit or stop the orphaned implementer
+first.
 
 `task dismiss` is the explicit terminal action for an abandoned
 `implementing` or `blocked` task. It refuses while a matching job or worktree
@@ -88,8 +90,8 @@ process is live, preserves the branch and worktree, releases the branch lock
 best-effort, and records `task_dismissed_manual`. The daemon can record
 `task_dismissed_auto` for stale candidates using `updated_at` as a conservative
 activity proxy. Configure `[workflow].stale_task_ttl = "168h"` (the default), or
-set it to `"0"` to disable this poll leg. Candidates with an open PR, a remote
-branch, a live job, or an uncertain remote check are not dismissed.
+set it to `"0"` to disable this poll leg. Candidates with a same-repo open PR,
+a remote branch, a live job, or an uncertain remote check are not dismissed.
 
 Dismissed tasks never return to implementation through ordinary task run,
 allocation, or late workflow advancement. `task recover` is the explicit path:

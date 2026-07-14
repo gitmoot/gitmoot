@@ -861,6 +861,101 @@ func TestPrepareLocalReviewDispatchRequestDoesNotReuseStaleReviewWorktree(t *tes
 	}
 }
 
+func TestPrepareLocalReviewWorktreeRejectsDismissedTask(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		task       db.Task
+		setRequest func(*localAgentDispatchRequest)
+	}{
+		{
+			name: "matching head worktree",
+			task: db.Task{ID: "dismissed-by-branch", RepoFullName: "owner/repo", State: string(workflow.TaskDismissed), Branch: "feature/review"},
+			setRequest: func(request *localAgentDispatchRequest) {
+				request.Branch = "feature/review"
+			},
+		},
+		{
+			name: "requested task upsert",
+			task: db.Task{ID: "dismissed-by-id", RepoFullName: "owner/repo", State: string(workflow.TaskDismissed)},
+			setRequest: func(request *localAgentDispatchRequest) {
+				request.TaskID = "dismissed-by-id"
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			home := t.TempDir()
+			repoDir := t.TempDir()
+			runGit(t, repoDir, "init")
+			runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+			runGit(t, repoDir, "config", "user.name", "Gitmoot")
+			writeFile(t, filepath.Join(repoDir, "README.md"), "review\n")
+			runGit(t, repoDir, "add", "README.md")
+			runGit(t, repoDir, "commit", "-m", "review head")
+			head, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.task.WorktreePath = repoDir
+			store := openCLIJobStore(t, home)
+			defer store.Close()
+			if err := store.UpsertTask(ctx, test.task); err != nil {
+				t.Fatal(err)
+			}
+			request := localAgentDispatchRequest{Home: home, PullRequest: 12, HeadSHA: head}
+			test.setRequest(&request)
+			_, _, err = prepareLocalReviewWorktree(ctx, store,
+				db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir},
+				github.Repository{Owner: "owner", Name: "repo"}, request)
+			if err == nil || !strings.Contains(err.Error(), "task "+test.task.ID+" is dismissed") || !strings.Contains(err.Error(), "task recover") {
+				t.Fatalf("prepareLocalReviewWorktree error = %v", err)
+			}
+			stored, getErr := store.GetTask(ctx, test.task.ID)
+			if getErr != nil || stored.State != string(workflow.TaskDismissed) {
+				t.Fatalf("stored task=%+v err=%v", stored, getErr)
+			}
+		})
+	}
+}
+
+func TestPrepareLocalReviewWorktreeReusesNonDismissedMatchingHead(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, repoDir, "config", "user.name", "Gitmoot")
+	writeFile(t, filepath.Join(repoDir, "README.md"), "review\n")
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "review head")
+	head, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "reviewing-task", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Review",
+		State: string(workflow.TaskReviewing), Branch: "feature/review", WorktreePath: repoDir,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request, checkout, err := prepareLocalReviewWorktree(ctx, store,
+		db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir},
+		github.Repository{Owner: "owner", Name: "repo"},
+		localAgentDispatchRequest{Home: home, PullRequest: 12, Branch: "feature/review", HeadSHA: head})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.TaskID != "reviewing-task" || request.GoalID != "goal-1" || request.TaskTitle != "Review" || checkout != repoDir {
+		t.Fatalf("request=%+v checkout=%q", request, checkout)
+	}
+	task, err := store.GetTask(ctx, "reviewing-task")
+	if err != nil || task.State != string(workflow.TaskReviewing) {
+		t.Fatalf("task=%+v err=%v", task, err)
+	}
+}
+
 func TestPrepareLocalImplementDispatchRequestReusesExistingBranchTask(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()

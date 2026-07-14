@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 )
@@ -55,5 +56,37 @@ func TestTransitionTaskStateWithEventAtomicCASAndOrdering(t *testing.T) {
 	}
 	if len(events) != 2 || events[0].Kind != "task_dismissed_manual" || events[0].FromState != "implementing" || events[0].ToState != "dismissed" || events[1].Kind != "note" || events[0].ID >= events[1].ID {
 		t.Fatalf("events = %+v", events)
+	}
+}
+
+func TestGuardedTaskTransitionRefusesMatchingActiveJob(t *testing.T) {
+	tests := []struct {
+		name    string
+		state   string
+		payload string
+	}{
+		{name: "task id queued", state: "queued", payload: `{"repo":"other/repo","branch":"other","task_id":"task-1"}`},
+		{name: "repo branch running", state: "running", payload: `{"repo":"owner/repo","branch":"feature/one","task_id":"other"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := openWorkflowTestStore(t)
+			ctx := context.Background()
+			if err := store.UpsertTask(ctx, Task{ID: "task-1", RepoFullName: "owner/repo", Branch: "feature/one", State: "implementing"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CreateJob(ctx, Job{ID: "job-1", Type: "review", State: test.state, Payload: test.payload}); err != nil {
+				t.Fatal(err)
+			}
+			changed, current, err := store.TransitionTaskStateWithEventIfNoActiveJob(ctx, "task-1", []string{"implementing"}, "dismissed", "task_dismissed_manual", "test")
+			if changed || current != "implementing" || !errors.Is(err, ErrTaskHasActiveJob) {
+				t.Fatalf("transition = changed %v current %q err %v", changed, current, err)
+			}
+			task, getErr := store.GetTask(ctx, "task-1")
+			events, listErr := store.ListTaskEvents(ctx, "task-1")
+			if getErr != nil || listErr != nil || task.State != "implementing" || len(events) != 0 {
+				t.Fatalf("task=%+v events=%+v getErr=%v listErr=%v", task, events, getErr, listErr)
+			}
+		})
 	}
 }

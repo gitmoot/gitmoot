@@ -985,9 +985,11 @@ gitmoot task recover task-001 --owner lead
 gitmoot task recover task-001 --owner lead --repo owner/repo --skip-native-review-fanout --json
 ```
 
-`--owner <agent>` is required and names a registered implement-capable agent,
-attributed as the recovery lead. `--repo owner/repo` is optional and falls back
-to the task's stored repo, so it is only needed when the task carries none.
+`--owner <agent>` is required for preserved branch/worktree recovery and names a
+registered implement-capable agent attributed as the recovery lead. A dismissed
+task with no branch returns directly to `planned`, so that path does not require
+`--owner`. `--repo owner/repo` is optional and falls back to the task's stored
+repo, so it is only needed when the task carries none.
 `--skip-native-review-fanout` persists that flag before the PR is opened, and
 `--json` prints the machine-readable recovery result.
 
@@ -1003,11 +1005,13 @@ task returns to `planned` with guidance to use `task run`. Ordinary allocation
 and workflow advancement cannot resurrect the task. Retrying one of its jobs
 restores it explicitly and records `task_recovered_job_retry`.
 
-The daemon scans up to 20 oldest stale `implementing`/`blocked` tasks per repo
-poll. `[workflow].stale_task_ttl = "168h"` is the default and `"0"` disables the
-leg. `updated_at` is a conservative activity proxy. Live jobs, open-PR branches,
-branches still present on `origin`, and remote-check uncertainty all prevent
-automatic dismissal; successful transitions record `task_dismissed_auto`.
+The daemon reads a bounded oldest-first stale window and processes up to 20
+qualifying `implementing`/`blocked` tasks per repo poll.
+`[workflow].stale_task_ttl = "168h"` is the default and `"0"` disables the leg.
+`updated_at` is a conservative activity proxy. Live jobs, same-repo open-PR
+branches, branches still present on `origin`, and remote-check uncertainty all
+prevent automatic dismissal; successful transitions record
+`task_dismissed_auto`.
 
 Two refusals guard recovery (and the `task run` / `agent implement` restart that
 points to it):

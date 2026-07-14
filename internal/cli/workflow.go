@@ -268,7 +268,7 @@ func runTask(args []string, stdout, stderr io.Writer) int {
 func printTaskUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot task run <id> --repo owner/repo --owner <agent> [--branch <branch>] [--base <branch>]")
-	fmt.Fprintln(w, "  gitmoot task recover <id> --owner <agent> [--repo owner/repo] [--skip-native-review-fanout] [--json]")
+	fmt.Fprintln(w, "  gitmoot task recover <id> [--owner <agent>] [--repo owner/repo] [--skip-native-review-fanout] [--json]")
 	fmt.Fprintln(w, "  gitmoot task dismiss <id> [--reason text] [--json]")
 	fmt.Fprintln(w, "  gitmoot task events <id> [--json]")
 	fmt.Fprintln(w, "  gitmoot task list [--repo owner/repo] [--state state] [--json]")
@@ -557,10 +557,13 @@ func runTaskDismiss(args []string, stdout, stderr io.Writer) int {
 		if strings.TrimSpace(task.WorktreePath) != "" && taskWorktreeHasLiveProcess(task.WorktreePath) {
 			return fmt.Errorf("task %s worktree %s still has a live process; wait for it to exit or stop it before dismissing", task.ID, task.WorktreePath)
 		}
-		changed, current, err := store.TransitionTaskStateWithEvent(context.Background(), task.ID,
+		changed, current, err := store.TransitionTaskStateWithEventIfNoActiveJob(context.Background(), task.ID,
 			[]string{string(workflow.TaskImplementing), string(workflow.TaskBlocked)},
 			string(workflow.TaskDismissed), "task_dismissed_manual", reason)
 		if err != nil {
+			if errors.Is(err, db.ErrTaskHasActiveJob) {
+				return fmt.Errorf("task %s gained a queued or running job while dismissing; wait for it to settle or cancel it before retrying: %w", task.ID, err)
+			}
 			return err
 		}
 		if !changed {
@@ -572,9 +575,11 @@ func runTaskDismiss(args []string, stdout, stderr io.Writer) int {
 		}
 		output.Changed = true
 		if strings.TrimSpace(task.RepoFullName) != "" && strings.TrimSpace(task.Branch) != "" {
-			_, _, _ = store.ForceReleaseLockWithEvent(context.Background(), task.RepoFullName, task.Branch, db.BranchLockEvent{
+			if _, _, err := store.ForceReleaseLockWithEvent(context.Background(), task.RepoFullName, task.Branch, db.BranchLockEvent{
 				Kind: "force_released", Message: "released after manual task dismissal (#913)",
-			})
+			}); err != nil {
+				fmt.Fprintf(stderr, "warning: dismissed task %s but could not release branch lock %s: %v\n", task.ID, task.Branch, err)
+			}
 		}
 		return nil
 	})
@@ -714,10 +719,6 @@ func runTaskRecover(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "task recover requires exactly one id")
 		return 2
 	}
-	if strings.TrimSpace(*owner) == "" {
-		fmt.Fprintln(stderr, "task recover requires --owner")
-		return 2
-	}
 	var output taskRecoverOutput
 	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
 		payload, err := recoverTaskImplementation(context.Background(), store, taskID, strings.TrimSpace(*repo), strings.TrimSpace(*owner), *skipFanout, nil)
@@ -786,6 +787,9 @@ func recoverTaskImplementation(ctx context.Context, store *db.Store, taskID stri
 		}
 		return workflow.JobPayload{Repo: task.RepoFullName, GoalID: task.GoalID, TaskID: task.ID, TaskTitle: task.Title}, nil
 	}
+	if strings.TrimSpace(owner) == "" {
+		return workflow.JobPayload{}, errors.New("task recover requires --owner")
+	}
 	requestRepo, err := resolveTaskRepoFlag(repoFlag, task.RepoFullName, "task recover")
 	if err != nil {
 		return workflow.JobPayload{}, err
@@ -815,10 +819,10 @@ func recoverTaskImplementation(ctx context.Context, store *db.Store, taskID stri
 	if err := ensureLocalAgentAccess(ctx, store, agent, requestRepo, "implement"); err != nil {
 		return workflow.JobPayload{}, err
 	}
-	if active, ok, err := findActiveImplementJobForTask(ctx, store, requestRepo, task.Branch, task.ID); err != nil {
+	if active, ok, err := workflow.FindLiveTaskJob(ctx, store, task); err != nil {
 		return workflow.JobPayload{}, err
 	} else if ok {
-		return workflow.JobPayload{}, fmt.Errorf("task %s still has active implement job %s; wait for it, cancel it, or resolve it before recovering", task.ID, active.ID)
+		return workflow.JobPayload{}, fmt.Errorf("task %s still has live job %s; wait for it, cancel it, or resolve it before recovering", task.ID, active.ID)
 	}
 	if strings.TrimSpace(task.WorktreePath) != "" && taskWorktreeHasLiveProcess(task.WorktreePath) {
 		return workflow.JobPayload{}, fmt.Errorf("task %s worktree %s still has a live process; wait for it to exit or stop the orphaned implementer before recovering", task.ID, task.WorktreePath)

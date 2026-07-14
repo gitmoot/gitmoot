@@ -613,16 +613,21 @@ func prepareLocalReviewWorktree(ctx context.Context, store *db.Store, record db.
 		return localAgentDispatchRequest{}, "", errors.New("agent review requires a pull request head SHA")
 	}
 	if strings.TrimSpace(request.Branch) != "" {
-		if task, err := store.GetTaskByRepoBranch(ctx, repo.FullName(), request.Branch); err == nil && strings.TrimSpace(task.WorktreePath) != "" {
-			head, headErr := (gitutil.Client{Dir: task.WorktreePath}).HeadSHA(ctx)
-			if headErr != nil {
-				return localAgentDispatchRequest{}, "", headErr
+		if task, err := store.GetTaskByRepoBranch(ctx, repo.FullName(), request.Branch); err == nil {
+			if task.State == string(workflow.TaskDismissed) {
+				return localAgentDispatchRequest{}, "", dismissedReviewTaskError(task.ID)
 			}
-			if head == request.HeadSHA {
-				request.TaskID = task.ID
-				request.GoalID = firstNonEmpty(request.GoalID, task.GoalID)
-				request.TaskTitle = firstNonEmpty(request.TaskTitle, task.Title)
-				return request, task.WorktreePath, nil
+			if strings.TrimSpace(task.WorktreePath) != "" {
+				head, headErr := (gitutil.Client{Dir: task.WorktreePath}).HeadSHA(ctx)
+				if headErr != nil {
+					return localAgentDispatchRequest{}, "", headErr
+				}
+				if head == request.HeadSHA {
+					request.TaskID = task.ID
+					request.GoalID = firstNonEmpty(request.GoalID, task.GoalID)
+					request.TaskTitle = firstNonEmpty(request.TaskTitle, task.Title)
+					return request, task.WorktreePath, nil
+				}
 			}
 		} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return localAgentDispatchRequest{}, "", err
@@ -635,6 +640,13 @@ func prepareLocalReviewWorktree(ctx context.Context, store *db.Store, record db.
 	taskID := strings.TrimSpace(request.TaskID)
 	if taskID == "" {
 		taskID = fmt.Sprintf("review-pr-%d-%s", request.PullRequest, shortHash(repo.FullName()+"\x00"+request.HeadSHA))
+	}
+	if existing, err := store.GetTask(ctx, taskID); err == nil {
+		if existing.State == string(workflow.TaskDismissed) {
+			return localAgentDispatchRequest{}, "", dismissedReviewTaskError(existing.ID)
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return localAgentDispatchRequest{}, "", err
 	}
 	path, err := workflow.TaskWorktreePath(paths.Home, repo.FullName(), taskID)
 	if err != nil {
@@ -662,13 +674,21 @@ func prepareLocalReviewWorktree(ctx context.Context, store *db.Store, record db.
 		State:        string(workflow.TaskReviewing),
 		WorktreePath: path,
 	}
-	if err := store.UpsertTask(ctx, task); err != nil {
+	updated, err := store.UpsertTaskUnlessState(ctx, task, string(workflow.TaskDismissed))
+	if err != nil {
 		return localAgentDispatchRequest{}, "", err
+	}
+	if !updated {
+		return localAgentDispatchRequest{}, "", dismissedReviewTaskError(task.ID)
 	}
 	request.TaskID = task.ID
 	request.GoalID = task.GoalID
 	request.TaskTitle = task.Title
 	return request, path, nil
+}
+
+func dismissedReviewTaskError(taskID string) error {
+	return fmt.Errorf("task %s is dismissed; run task recover first", taskID)
 }
 
 func prepareLocalImplementDispatchRequest(ctx context.Context, store *db.Store, record db.Repo, repo github.Repository, request localAgentDispatchRequest) (db.Task, localAgentDispatchRequest, error) {

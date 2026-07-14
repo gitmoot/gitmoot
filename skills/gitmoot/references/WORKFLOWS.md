@@ -695,7 +695,9 @@ over a dirty worktree with no active job (so nothing is discarded) and point at
 `gitmoot task recover <task-id> --owner <agent>`, which commits the full
 worktree state (`git add -A`, incl. untracked non-ignored files), pushes the
 branch, and opens or adopts the PR. `--repo` is optional (falls back to the
-task's repo). Recovery refuses while a live process is still inside the worktree.
+task's repo). `--owner` is required for this artifact-finalization path, but not
+when a dismissed branchless task is simply restored to `planned`. Recovery
+refuses while a live process is still inside the worktree.
 
 **Task dismissal and stale reconciliation:** `dismissed` is a terminal task
 state for implicit workflow transitions. An operator can run `gitmoot task
@@ -705,12 +707,13 @@ worktree. The branch and worktree are preserved, while the branch lock is
 released best-effort. Manual and daemon transitions are audited as
 `task_dismissed_manual` and `task_dismissed_auto` in `gitmoot task events <id>`.
 
-Each repo poll also considers up to 20 oldest `implementing`/`blocked` tasks
-whose `updated_at` predates `[workflow].stale_task_ttl` (default `168h`; `"0"`
-disables the leg). `updated_at` is deliberately a conservative activity proxy,
-not proof of abandonment. A candidate is skipped for a live job, an open-PR
-branch, or an exact branch still present on `origin`; remote lookup uncertainty
-skips mutation. A branchless candidate needs no remote lookup. Explicit `task
+Each repo poll reads a bounded oldest-first stale window and processes up to 20
+qualifying `implementing`/`blocked` tasks whose `updated_at` predates
+`[workflow].stale_task_ttl` (default `168h`; `"0"` disables the leg).
+`updated_at` is deliberately a conservative activity proxy, not proof of
+abandonment. A candidate is skipped for a live job, a same-repo open-PR branch,
+or an exact branch still present on `origin`; remote lookup uncertainty skips
+mutation. A branchless candidate needs no remote lookup. Explicit `task
 recover` restores preserved artifacts through `implementing` to `pr_open`, or
 restores a branchless task to `planned`; job retry records its own recovery
 event. The server-side task board omits dismissed rows immediately.

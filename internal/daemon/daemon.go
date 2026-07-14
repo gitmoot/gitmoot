@@ -28,6 +28,7 @@ const (
 	// PR history or allowing old task rows to dominate the daemon's API budget.
 	externalMergeReconcileLookupLimit = 20
 	staleTaskReconcileLimit           = 20
+	staleTaskReconcileScanLimit       = 200
 )
 
 // issueCommentPollOverlap is subtracted from the persisted last-seen cursor when
@@ -125,7 +126,10 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	// consumer that needs it, never retained beyond this poll.
 	reviewMemo := newReviewJobsMemo(d.Store)
 	for _, pull := range pulls {
-		openBranches[pull.HeadRef] = struct{}{}
+		headRepo := strings.TrimSpace(pull.HeadRepoFullName)
+		if headRepo == "" || headRepo == d.Repo.FullName() {
+			openBranches[pull.HeadRef] = struct{}{}
+		}
 		openPullNumbers[pull.Number] = struct{}{}
 		changed, err := d.pullRequestChanged(ctx, pull, reviewMemo)
 		if err != nil {
@@ -225,7 +229,7 @@ func (d Daemon) reconcileStaleTasks(ctx context.Context, openBranches map[string
 	}
 	candidates, err := d.Store.ListStaleTaskCandidates(ctx, d.Repo.FullName(), []string{
 		string(workflow.TaskImplementing), string(workflow.TaskBlocked),
-	}, d.now().Add(-ttl), staleTaskReconcileLimit)
+	}, d.now().Add(-ttl), staleTaskReconcileScanLimit)
 	if err != nil {
 		return err
 	}
@@ -241,6 +245,9 @@ func (d Daemon) reconcileStaleTasks(ctx context.Context, openBranches map[string
 	remoteCandidates := []readyCandidate{}
 	branches := []string{}
 	for _, candidate := range candidates {
+		if len(emptyBranch)+len(remoteCandidates) >= staleTaskReconcileLimit {
+			break
+		}
 		task := db.Task{ID: candidate.ID, RepoFullName: candidate.RepoFullName, State: candidate.State, Branch: candidate.Branch}
 		if _, live, err := workflow.FindLiveTaskJob(ctx, d.Store, task); err != nil {
 			return err
@@ -287,9 +294,12 @@ func (d Daemon) reconcileStaleTasks(ctx context.Context, openBranches map[string
 	}
 	for _, item := range emptyBranch {
 		reason := fmt.Sprintf("stale task auto-dismissed: empty branch; ttl=%s; updated_at=%s", ttl, item.candidate.UpdatedAt)
-		if _, _, err := d.Store.TransitionTaskStateWithEvent(ctx, item.task.ID,
+		if _, _, err := d.Store.TransitionTaskStateWithEventIfNoActiveJob(ctx, item.task.ID,
 			[]string{string(workflow.TaskImplementing), string(workflow.TaskBlocked)},
 			string(workflow.TaskDismissed), "task_dismissed_auto", reason); err != nil {
+			if errors.Is(err, db.ErrTaskHasActiveJob) {
+				continue
+			}
 			return err
 		}
 	}
@@ -299,9 +309,12 @@ func (d Daemon) reconcileStaleTasks(ctx context.Context, openBranches map[string
 			continue
 		}
 		reason := fmt.Sprintf("stale task auto-dismissed: remote ref refs/heads/%s absent; ttl=%s; updated_at=%s", branch, ttl, item.candidate.UpdatedAt)
-		if _, _, err := d.Store.TransitionTaskStateWithEvent(ctx, item.task.ID,
+		if _, _, err := d.Store.TransitionTaskStateWithEventIfNoActiveJob(ctx, item.task.ID,
 			[]string{string(workflow.TaskImplementing), string(workflow.TaskBlocked)},
 			string(workflow.TaskDismissed), "task_dismissed_auto", reason); err != nil {
+			if errors.Is(err, db.ErrTaskHasActiveJob) {
+				continue
+			}
 			return err
 		}
 	}

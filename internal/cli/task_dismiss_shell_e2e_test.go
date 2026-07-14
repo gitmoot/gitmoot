@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -125,8 +126,54 @@ func TestNoLLMShellTaskDismissAndRecoverE2E(t *testing.T) {
 		t.Fatalf("auto events=%+v", events)
 	}
 
-	if _, err := recoverTaskImplementation(ctx, store, task.ID, "owner/repo", "lead", false, gh); err != nil {
-		t.Fatalf("task recover: %v", err)
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"task", "events", task.ID, "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("task events code=%d stderr=%s", code, stderr.String())
+	}
+	var autoEvents []db.TaskEvent
+	if err := json.Unmarshal(stdout.Bytes(), &autoEvents); err != nil || len(autoEvents) != 1 || autoEvents[0].Kind != "task_dismissed_auto" {
+		t.Fatalf("task events output=%s events=%+v err=%v", stdout.String(), autoEvents, err)
+	}
+
+	if err := store.UpsertTask(ctx, db.Task{ID: "manual-e2e", RepoFullName: "owner/repo", State: string(workflow.TaskBlocked)}); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"task", "dismiss", "manual-e2e", "--home", home, "--reason", "e2e manual", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("task dismiss code=%d stderr=%s", code, stderr.String())
+	}
+	var dismissed taskDismissOutput
+	if err := json.Unmarshal(stdout.Bytes(), &dismissed); err != nil || !dismissed.Changed || dismissed.State != string(workflow.TaskDismissed) || dismissed.Reason != "e2e manual" {
+		t.Fatalf("task dismiss output=%s decoded=%+v err=%v", stdout.String(), dismissed, err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"task", "events", "manual-e2e", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("manual task events code=%d stderr=%s", code, stderr.String())
+	}
+	var manualEvents []db.TaskEvent
+	if err := json.Unmarshal(stdout.Bytes(), &manualEvents); err != nil || len(manualEvents) != 1 || manualEvents[0].Kind != "task_dismissed_manual" {
+		t.Fatalf("manual task events output=%s decoded=%+v err=%v", stdout.String(), manualEvents, err)
+	}
+
+	// The CLI finalizer adopts an existing local PR record, keeping this E2E
+	// entirely offline while still exercising the real recovery command.
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: "owner/repo", Number: 4, URL: "https://github.com/owner/repo/pull/4",
+		HeadBranch: task.Branch, BaseBranch: "main", State: "open",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"task", "recover", task.ID, "--home", home, "--repo", "owner/repo", "--owner", "lead", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("task recover code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	var recovered taskRecoverOutput
+	if err := json.Unmarshal(stdout.Bytes(), &recovered); err != nil || recovered.TaskID != task.ID || recovered.State != string(workflow.TaskPullRequestOpen) || recovered.PullRequest != 4 || recovered.HeadSHA == "" {
+		t.Fatalf("task recover output=%s decoded=%+v err=%v", stdout.String(), recovered, err)
 	}
 	task, _ = store.GetTask(ctx, task.ID)
 	events, _ = store.ListTaskEvents(ctx, task.ID)

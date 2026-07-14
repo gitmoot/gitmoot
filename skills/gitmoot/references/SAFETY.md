@@ -268,11 +268,14 @@ cannot recurse or fan out forever:
   `human_questions[]` is byte-identical to today's behavior.
 
 - Dismissed task terminality (#913): `dismissed` may be entered only from
-  `implementing` or `blocked` after Gitmoot proves there is no live matching job
-  and no process in the task worktree. Ordinary task run/allocation and late
-  review or continuation advancement fail closed instead of overwriting it.
-  Only `task recover` or retrying a job performs an explicit audited recovery.
-  Dismissal never deletes the task branch or worktree.
+  `implementing` or `blocked`. Manual `task dismiss` proves there is no live
+  matching job and no process in the task worktree. Automatic stale-task
+  reconciliation proves there is no live matching job and requires its separate
+  open-PR/remote-branch evidence, but does not inspect worktree processes.
+  Ordinary task run/allocation and late review or continuation advancement fail
+  closed instead of overwriting it. Only `task recover` or retrying a job performs
+  an explicit audited recovery. Dismissal never deletes the task branch or
+  worktree.
 
 When a bound trips, the offending delegations are not dispatched and the parent
 receives a typed lifecycle event explaining why (for example, a delegation batch
