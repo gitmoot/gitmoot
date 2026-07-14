@@ -9065,11 +9065,12 @@ ALTER TABLE workflow_meta ADD COLUMN summary TEXT NOT NULL DEFAULT '';
 	// non-default intervals, including the production 3m0s values, survive.
 	`
 UPDATE repos SET poll_interval = '' WHERE poll_interval = '30s';
+	`,
 	// #913 task dismissal lifecycle audit. Task state is already unconstrained
 	// TEXT, so the state itself needs no column migration; this append-only table
 	// records every explicit manual, automatic, and recovery transition.
 	`
-CREATE TABLE task_events (
+CREATE TABLE IF NOT EXISTS task_events (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	task_id TEXT NOT NULL,
 	kind TEXT NOT NULL,
@@ -9078,6 +9079,6 @@ CREATE TABLE task_events (
 	reason TEXT NOT NULL DEFAULT '',
 	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX idx_task_events_task_id_id ON task_events(task_id, id);
+CREATE INDEX IF NOT EXISTS idx_task_events_task_id_id ON task_events(task_id, id);
 	`,
 }
