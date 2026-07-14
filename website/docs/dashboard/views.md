@@ -215,6 +215,10 @@ pane, session id), and a stalled workflow shows a go-here card with the pane,
 the session id, and a copyable resume command — the dashboard tells you where
 to intervene; it never intervenes itself. Coordinators should set the summary
 at kickoff with `gitmoot workflow note ... --summary "<one sentence>"`.
+Inside Herdr, omitted pane/session/workdir flags are detected from the current
+pane. The resume command is shown only when the stored session id is a full
+UUID; legacy shortened values remain visible in the workflow index but cannot
+produce a broken command.
 
 ## Brain
 
