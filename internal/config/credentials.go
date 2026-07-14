@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strings"
 )
@@ -9,20 +10,26 @@ import (
 const (
 	CredentialsGitHubDeny    = "deny"
 	CredentialsGitHubInherit = "inherit"
+	DefaultModelGatewayHost  = "api.anthropic.com"
 )
 
-// CredentialsConfig controls the off-by-default environment curation applied
-// only to runtime-agent subprocesses. It is loaded when an adapter is built so
+// CredentialsConfig controls runtime-child environment curation and the
+// off-by-default Claude model gateway. It is loaded when an adapter is built so
 // each delivery observes the current file without daemon reload plumbing.
 type CredentialsConfig struct {
-	EnvCuration    bool
-	EnvPassthrough []string
-	GitHub         string
+	EnvCuration            bool
+	EnvPassthrough         []string
+	GitHub                 string
+	ModelGateway           bool
+	ModelGatewayAllowHosts []string
 }
 
-// DefaultCredentialsConfig preserves historical full-environment inheritance.
+// DefaultCredentialsConfig preserves direct auth and full-environment inheritance.
 func DefaultCredentialsConfig() CredentialsConfig {
-	return CredentialsConfig{GitHub: CredentialsGitHubDeny}
+	return CredentialsConfig{
+		GitHub:                 CredentialsGitHubDeny,
+		ModelGatewayAllowHosts: []string{DefaultModelGatewayHost},
+	}
 }
 
 // LoadCredentialsConfig parses the optional [credentials] section.
@@ -71,6 +78,18 @@ func LoadCredentialsConfig(paths Paths) (CredentialsConfig, error) {
 				return CredentialsConfig{}, fmt.Errorf("parse [credentials].github: %w", err)
 			}
 			cfg.GitHub = strings.TrimSpace(parsed)
+		case "model_gateway":
+			parsed, err := parseConfigBool(value)
+			if err != nil {
+				return CredentialsConfig{}, fmt.Errorf("parse [credentials].model_gateway: %w", err)
+			}
+			cfg.ModelGateway = parsed
+		case "model_gateway_allow_hosts":
+			parsed, err := parseConfigStringArray(value)
+			if err != nil {
+				return CredentialsConfig{}, fmt.Errorf("parse [credentials].model_gateway_allow_hosts: %w", err)
+			}
+			cfg.ModelGatewayAllowHosts = parsed
 		default:
 			// Ignore unknown keys so the section remains forward-compatible.
 		}
@@ -90,6 +109,45 @@ func validateCredentialsConfig(cfg CredentialsConfig) error {
 	for _, pattern := range cfg.EnvPassthrough {
 		if err := validateCredentialEnvPattern(pattern); err != nil {
 			return fmt.Errorf("invalid [credentials].env_passthrough entry %q: %w", pattern, err)
+		}
+	}
+	if cfg.ModelGateway && len(cfg.ModelGatewayAllowHosts) == 0 {
+		return fmt.Errorf("[credentials].model_gateway_allow_hosts must not be empty when model_gateway=true")
+	}
+	for _, host := range cfg.ModelGatewayAllowHosts {
+		if err := validateModelGatewayHost(host); err != nil {
+			return fmt.Errorf("invalid [credentials].model_gateway_allow_hosts entry %q: %w", host, err)
+		}
+	}
+	return nil
+}
+
+func validateModelGatewayHost(host string) error {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return fmt.Errorf("host must not be empty")
+	}
+	if strings.ContainsAny(host, "/@?#\x00") || strings.Contains(host, "://") {
+		return fmt.Errorf("use a hostname without scheme, path, or credentials")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return nil
+	}
+	if strings.Contains(host, ":") {
+		return fmt.Errorf("use a hostname without a port")
+	}
+	if len(host) > 253 {
+		return fmt.Errorf("hostname is too long")
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" || len(label) > 63 || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return fmt.Errorf("invalid hostname label")
+		}
+		for _, r := range label {
+			if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' {
+				continue
+			}
+			return fmt.Errorf("hostname contains unsupported character %q", r)
 		}
 	}
 	return nil

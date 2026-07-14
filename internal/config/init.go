@@ -72,10 +72,14 @@ artifact_blobs = %q
 # subprocesses. env_passthrough accepts exact names or one trailing-* glob.
 # github=deny omits ambient GH_*/GITHUB_* values and gives gh a fresh empty config;
 # github=inherit explicitly restores ambient GitHub environment inheritance.
+# model_gateway is an opt-in daemon-owned loopback gateway for Claude credentials;
+# its allowlist contains exact upstream hostnames and defaults to Anthropic only.
 # [credentials]
 # env_curation = false
 # env_passthrough = [] # e.g. ["GOCACHE", "NPM_*"]
 # github = "deny"
+# model_gateway = false
+# model_gateway_allow_hosts = ["api.anthropic.com"]
 
 [parallel_sessions]
 same_session = "fork_temp_session"

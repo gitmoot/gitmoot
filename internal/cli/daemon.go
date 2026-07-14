@@ -24,6 +24,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/artifact"
 	"github.com/jerryfane/gitmoot/internal/cockpit"
 	"github.com/jerryfane/gitmoot/internal/config"
+	"github.com/jerryfane/gitmoot/internal/credgw"
 	"github.com/jerryfane/gitmoot/internal/daemon"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/events"
@@ -303,6 +304,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		}); bootstrapErr != nil {
 			fmt.Fprintf(stderr, "daemon run: warning: could not bootstrap runtime auth: %v\n", bootstrapErr)
 		}
+		defer closeModelGatewayHome(paths.Home)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -5527,6 +5529,17 @@ func wrapProduceSandboxAdapter(action string, agent runtime.Agent, adapter workf
 		return nil, err
 	}
 	switch a := adapter.(type) {
+	case modelGatewayRuntimeAdapter:
+		wrapped, err := wrapProduceSandboxAdapter(action, agent, a.Adapter)
+		if err != nil {
+			return nil, err
+		}
+		runtimeAdapter, ok := wrapped.(runtime.Adapter)
+		if !ok {
+			return nil, fmt.Errorf("produce Landlock sandbox returned incompatible %T adapter", wrapped)
+		}
+		a.Adapter = runtimeAdapter
+		return a, nil
 	case runtime.ClaudeAdapter:
 		a.Runner = landlockProduceRunner(a.Runner, paths, env)
 		return a, nil
@@ -6936,6 +6949,7 @@ func buildRuntimeAdapter(home string, agent runtime.Agent, checkout string, runn
 	if err != nil {
 		return nil, err
 	}
+	gatewayRunner, _ := runner.(*credgw.Runner)
 	if len(agent.WritablePaths) > 0 && (agent.Runtime == runtime.ClaudeRuntime || agent.Runtime == runtime.KimiRuntime) {
 		paths, env, err := produceRuntimeSandboxGrants(agent.Runtime, agent.WritablePaths)
 		if err != nil {
@@ -6943,20 +6957,22 @@ func buildRuntimeAdapter(home string, agent runtime.Agent, checkout string, runn
 		}
 		runner = landlockProduceRunner(runner, paths, env)
 	}
+	var adapter runtime.Adapter
 	switch agent.Runtime {
 	case runtime.CodexRuntime:
-		return runtime.CodexAdapter{Dir: checkout, Runner: runner}, nil
+		adapter = runtime.CodexAdapter{Dir: checkout, Runner: runner}
 	case runtime.ClaudeRuntime:
-		return runtime.ClaudeAdapter{Dir: checkout, Runner: runner}, nil
+		adapter = runtime.ClaudeAdapter{Dir: checkout, Runner: runner}
 	case runtime.KimiRuntime:
-		return runtime.KimiAdapter{Dir: checkout, Runner: runner}, nil
+		adapter = runtime.KimiAdapter{Dir: checkout, Runner: runner}
 	case runtime.KimiCLIRuntime:
-		return runtime.KimiCLIAdapter{Dir: checkout, Runner: runner}, nil
+		adapter = runtime.KimiCLIAdapter{Dir: checkout, Runner: runner}
 	case runtime.ShellRuntime:
-		return runtime.ShellAdapter{Dir: checkout, Runner: runner}, nil
+		adapter = runtime.ShellAdapter{Dir: checkout, Runner: runner}
 	default:
 		return nil, fmt.Errorf("unsupported runtime: %s", agent.Runtime)
 	}
+	return wrapModelGatewayAdapter(adapter, gatewayRunner), nil
 }
 
 func (w jobWorker) defaultStartAdapter(runtimeName string, checkout string) (runtime.Adapter, error) {

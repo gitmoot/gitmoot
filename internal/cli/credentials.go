@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/jerryfane/gitmoot/internal/config"
+	"github.com/jerryfane/gitmoot/internal/credgw"
 	"github.com/jerryfane/gitmoot/internal/runtime"
 	"github.com/jerryfane/gitmoot/internal/subprocess"
 )
@@ -140,6 +141,8 @@ func runtimeJobRunner(home string, runtimeName string, outer subprocess.Runner) 
 func runtimeJobRunnerWithAuth(home string, runtimeName string, outer subprocess.Runner) (subprocess.Runner, runtimeAuthFile, string, error) {
 	var authState runtimeAuthFile
 	var authSource string
+	var credentialsCfg config.CredentialsConfig
+	var resolvedHome string
 	if runtimeName == runtime.ClaudeRuntime {
 		authSource = runtimeAuthFileName
 		paths, err := pathsFromFlag(home)
@@ -155,11 +158,30 @@ func runtimeJobRunnerWithAuth(home string, runtimeName string, outer subprocess.
 		}
 		authSource = runtimeAuthSource(authState, runtimeAuthEnvLookup)
 		warnRuntimeAuthConflicts(authState, runtimeAuthEnvLookup, runtimeAuthLogf)
+		credentialsCfg = config.DefaultCredentialsConfig()
+		loadedCredentials, loadErr := config.LoadCredentialsConfig(paths)
+		if loadErr == nil {
+			credentialsCfg = loadedCredentials
+		} else if !errors.Is(loadErr, os.ErrNotExist) {
+			return nil, authState, authSource, fmt.Errorf("load credentials config: %w", loadErr)
+		}
+		resolvedHome = paths.Home
 	}
 
 	curated, err := curatedJobRunner(home, runtimeName)
 	if err != nil {
 		return nil, authState, authSource, err
+	}
+	if runtimeName == runtime.ClaudeRuntime && credentialsCfg.ModelGateway {
+		base := outer
+		if curated != nil {
+			base = graftRuntimeBaseRunner(outer, curated)
+		}
+		gatewayRunner, err := buildModelGatewayRunner(resolvedHome, credentialsCfg, authState, base)
+		if err != nil {
+			return nil, authState, authSource, err
+		}
+		return gatewayRunner, authState, runtimeAuthFileName + " via model gateway", nil
 	}
 	if runtimeName == runtime.ClaudeRuntime {
 		authEnv := runtimeAuthInjectionEnv(authState)
@@ -254,5 +276,10 @@ func runtimeAdapterFor(home string, runtimeName string, checkout string) (runtim
 	if err != nil {
 		return nil, err
 	}
-	return runtimeStartAdapterFor(factory, runtimeName, checkout)
+	adapter, err := runtimeStartAdapterFor(factory, runtimeName, checkout)
+	if err != nil {
+		return nil, err
+	}
+	gatewayRunner, _ := factory.Runner.(*credgw.Runner)
+	return wrapModelGatewayAdapter(adapter, gatewayRunner), nil
 }
