@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
@@ -210,6 +214,216 @@ func TestWorkflowNotePersistsNamespacedCoordinatorMetadata(t *testing.T) {
 	if code := runWorkflowShow([]string{"fable/dashboard-redesign", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("namespaced workflow show exit=%d stderr=%q", code, stderr.String())
 	}
+}
+
+const workflowCoordinatorTestSession = "66fbda3c-4765-4cdd-9c48-15d495173823"
+
+func TestWorkflowNoteAutoDetectsHerdrCoordinatorIdentity(t *testing.T) {
+	home, store := workflowJournalTestHome(t)
+	ctx := context.Background()
+	if err := store.CreateJob(ctx, db.Job{ID: "auto-job", Agent: "coord", Type: "ask", State: "running", Payload: `{"repo":"acme/widget","workflow_id":"fable/auto"}`}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	logPath := installWorkflowHerdrStub(t, workflowHerdrJSON("Gitmoot2", "pane-id", "/work/gitmoot", "", workflowCoordinatorTestSession), 0, "")
+	t.Setenv("HERDR_ENV", "1")
+	t.Setenv("HERDR_SOCKET_PATH", "")
+
+	var stdout, stderr bytes.Buffer
+	code := runWorkflowJournal([]string{"note", "fable/auto", "Coordinator detected.", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("workflow note exit=%d stderr=%q", code, stderr.String())
+	}
+	meta, err := store.GetWorkflowMeta(ctx, "fable/auto")
+	if err != nil {
+		t.Fatalf("GetWorkflowMeta: %v", err)
+	}
+	if meta.Pane != "Gitmoot2" || meta.SessionID != workflowCoordinatorTestSession || meta.WorkDir != "/work/gitmoot" || meta.Author != "" {
+		t.Fatalf("auto-detected metadata = %+v", meta)
+	}
+	if calls := workflowHerdrStubCalls(t, logPath); calls != 1 {
+		t.Fatalf("herdr calls = %d, want 1", calls)
+	}
+}
+
+func TestWorkflowNoteHerdrFallbackFields(t *testing.T) {
+	installWorkflowHerdrStub(t, workflowHerdrJSON("", "w6536a4e5b44342:p1X", "", "/work/foreground", workflowCoordinatorTestSession), 0, "")
+	t.Setenv("HERDR_SOCKET_PATH", "/tmp/herdr.sock")
+	t.Setenv("HERDR_ENV", "")
+
+	got := detectWorkflowCoordinatorIdentity(context.Background())
+	if got.Pane != "w6536a4e5b44342:p1X" || got.SessionID != workflowCoordinatorTestSession || got.WorkDir != "/work/foreground" {
+		t.Fatalf("fallback identity = %+v", got)
+	}
+}
+
+func TestWorkflowNoteExplicitCoordinatorFlagsWinAndNoAutoSkips(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		extra     []string
+		want      workflowCoordinatorIdentity
+		wantCalls int
+	}{
+		{
+			name:      "all explicit flags avoid lookup",
+			extra:     []string{"--pane", "manual-pane", "--session", "11111111-2222-3333-4444-555555555555", "--workdir", "/manual"},
+			want:      workflowCoordinatorIdentity{Pane: "manual-pane", SessionID: "11111111-2222-3333-4444-555555555555", WorkDir: "/manual"},
+			wantCalls: 0,
+		},
+		{
+			name:      "partial explicit flags win over detected values",
+			extra:     []string{"--pane", "manual-pane"},
+			want:      workflowCoordinatorIdentity{Pane: "manual-pane", SessionID: workflowCoordinatorTestSession, WorkDir: "/auto"},
+			wantCalls: 1,
+		},
+		{name: "no auto", extra: []string{"--no-auto"}, want: workflowCoordinatorIdentity{}, wantCalls: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home, store := workflowJournalTestHome(t)
+			ctx := context.Background()
+			if err := store.CreateJob(ctx, db.Job{ID: "override-job", Agent: "coord", Type: "ask", State: "running", Payload: `{"repo":"acme/widget","workflow_id":"fable/override"}`}); err != nil {
+				t.Fatalf("CreateJob: %v", err)
+			}
+			logPath := installWorkflowHerdrStub(t, workflowHerdrJSON("auto-pane", "pane-id", "/auto", "", workflowCoordinatorTestSession), 0, "")
+			t.Setenv("HERDR_SOCKET_PATH", "/tmp/herdr.sock")
+			t.Setenv("HERDR_ENV", "")
+			args := []string{"note", "fable/override", "Explicit metadata.", "--home", home}
+			args = append(args, tc.extra...)
+			var stdout, stderr bytes.Buffer
+			if code := runWorkflowJournal(args, &stdout, &stderr); code != 0 {
+				t.Fatalf("workflow note exit=%d stderr=%q", code, stderr.String())
+			}
+			meta, err := store.GetWorkflowMeta(ctx, "fable/override")
+			if err != nil {
+				t.Fatalf("GetWorkflowMeta: %v", err)
+			}
+			if meta.Pane != tc.want.Pane || meta.SessionID != tc.want.SessionID || meta.WorkDir != tc.want.WorkDir {
+				t.Fatalf("metadata = %+v, want %+v", meta, tc.want)
+			}
+			if calls := workflowHerdrStubCalls(t, logPath); calls != tc.wantCalls {
+				t.Fatalf("herdr calls = %d, want %d", calls, tc.wantCalls)
+			}
+		})
+	}
+}
+
+func TestWorkflowNoteHerdrDetectionFailsOpen(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		enabled    bool
+		stubOutput string
+		stubExit   int
+		stub       bool
+	}{
+		{name: "non-herdr environment", stub: true, stubOutput: workflowHerdrJSON("auto", "pane", "/auto", "", workflowCoordinatorTestSession)},
+		{name: "herdr missing", enabled: true},
+		{name: "herdr exits non-zero", enabled: true, stub: true, stubExit: 7},
+		{name: "herdr emits garbage", enabled: true, stub: true, stubOutput: "not-json"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home, store := workflowJournalTestHome(t)
+			ctx := context.Background()
+			if err := store.CreateJob(ctx, db.Job{ID: "fail-open-job", Agent: "coord", Type: "ask", State: "running", Payload: `{"repo":"acme/widget","workflow_id":"fable/fail-open"}`}); err != nil {
+				t.Fatalf("CreateJob: %v", err)
+			}
+			if tc.stub {
+				installWorkflowHerdrStub(t, tc.stubOutput, tc.stubExit, "")
+			} else {
+				t.Setenv("PATH", t.TempDir())
+			}
+			if tc.enabled {
+				t.Setenv("HERDR_SOCKET_PATH", "/tmp/herdr.sock")
+			} else {
+				t.Setenv("HERDR_SOCKET_PATH", "")
+			}
+			t.Setenv("HERDR_ENV", "")
+			var stdout, stderr bytes.Buffer
+			if code := runWorkflowJournal([]string{"note", "fable/fail-open", "Still succeeds.", "--home", home}, &stdout, &stderr); code != 0 {
+				t.Fatalf("workflow note exit=%d stderr=%q", code, stderr.String())
+			}
+			meta, err := store.GetWorkflowMeta(ctx, "fable/fail-open")
+			if err != nil {
+				t.Fatalf("GetWorkflowMeta: %v", err)
+			}
+			if meta.Pane != "" || meta.SessionID != "" || meta.WorkDir != "" {
+				t.Fatalf("fail-open metadata = %+v", meta)
+			}
+		})
+	}
+}
+
+func TestWorkflowNoteHerdrDetectionTimeoutIsBounded(t *testing.T) {
+	home, store := workflowJournalTestHome(t)
+	ctx := context.Background()
+	if err := store.CreateJob(ctx, db.Job{ID: "timeout-job", Agent: "coord", Type: "ask", State: "running", Payload: `{"repo":"acme/widget","workflow_id":"fable/timeout"}`}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	installWorkflowHerdrStub(t, workflowHerdrJSON("late", "pane", "/late", "", workflowCoordinatorTestSession), 0, "10")
+	t.Setenv("HERDR_SOCKET_PATH", "/tmp/herdr.sock")
+	t.Setenv("HERDR_ENV", "")
+
+	started := time.Now()
+	var stdout, stderr bytes.Buffer
+	if code := runWorkflowJournal([]string{"note", "fable/timeout", "Timeout is fail-open.", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("workflow note exit=%d stderr=%q", code, stderr.String())
+	}
+	if elapsed := time.Since(started); elapsed > workflowHerdrLookupTimeout+1500*time.Millisecond {
+		t.Fatalf("workflow note took %s with %s timeout", elapsed, workflowHerdrLookupTimeout)
+	}
+	meta, err := store.GetWorkflowMeta(ctx, "fable/timeout")
+	if err != nil || meta.Pane != "" || meta.SessionID != "" || meta.WorkDir != "" {
+		t.Fatalf("timeout metadata = %+v, err=%v", meta, err)
+	}
+}
+
+func TestFullWorkflowSessionUUIDValidation(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{value: workflowCoordinatorTestSession, want: true},
+		{value: "550E8400-E29B-41D4-A716-446655440000", want: true},
+		{value: "66fbda3c", want: false},
+		{value: "66fbda3c47654cdd9c4815d495173823", want: false},
+		{value: "66fbda3c-4765-4cdd-9c48-15d49517382z", want: false},
+	} {
+		if got := isFullWorkflowSessionUUID(tc.value); got != tc.want {
+			t.Errorf("isFullWorkflowSessionUUID(%q) = %v, want %v", tc.value, got, tc.want)
+		}
+	}
+}
+
+func installWorkflowHerdrStub(t *testing.T, output string, exitCode int, sleepSeconds string) string {
+	t.Helper()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	t.Setenv("WORKFLOW_HERDR_STUB_LOG", logPath)
+	sleepLine := ""
+	if sleepSeconds != "" {
+		sleepLine = "/bin/sleep " + sleepSeconds + "\n"
+	}
+	script := "#!/bin/sh\nprintf 'call\\n' >> \"$WORKFLOW_HERDR_STUB_LOG\"\n" + sleepLine +
+		"/bin/cat <<'HERDR_EOF'\n" + output + "\nHERDR_EOF\nexit " + fmt.Sprint(exitCode) + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "herdr"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write herdr stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+"/usr/bin:/bin")
+	return logPath
+}
+
+func workflowHerdrJSON(label, paneID, cwd, foregroundCWD, sessionID string) string {
+	return fmt.Sprintf(`{"id":"cli:pane:current","result":{"pane":{"label":%q,"pane_id":%q,"cwd":%q,"foreground_cwd":%q,"agent_session":{"value":%q}},"type":"pane_current"}}`, label, paneID, cwd, foregroundCWD, sessionID)
+}
+
+func workflowHerdrStubCalls(t *testing.T, path string) int {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return 0
+	}
+	if err != nil {
+		t.Fatalf("read herdr stub log: %v", err)
+	}
+	return len(strings.Fields(string(body)))
 }
 
 func TestWorkflowNoteSummarySetPreserveClearAndLimit(t *testing.T) {

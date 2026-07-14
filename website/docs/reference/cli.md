@@ -914,7 +914,7 @@ gitmoot orchestrate planner "Coordinate the dashboard wave." --repo owner/repo -
 gitmoot job list --workflow fable/dashboard-redesign
 gitmoot workflow list
 gitmoot workflow show fable/dashboard-redesign --limit 100
-gitmoot workflow note fable/dashboard-redesign "Kickoff." --author operator --pane wave-2 --session <session-id> --workdir /work/dashboard --summary "Coordinate and ship the dashboard redesign."
+gitmoot workflow note fable/dashboard-redesign "Kickoff." --author operator --summary "Coordinate and ship the dashboard redesign."
 ```
 
 List/show include state counts, notes, first/last activity, and best-effort token
@@ -923,7 +923,12 @@ also renders labels as Galaxy hubs and provides a Workflows index plus mission
 log at `/workflows/<label>`. `active` means queued/running or touched within 30
 minutes; failed/blocked workflows quiet for 30 minutes to 24 hours are
 `stalled`; everything else is `settled`. The optional `--pane`, `--session`, and
-`--workdir` note flags persist the latest coordinator handoff. If coordinator
+`--workdir` note flags persist the latest coordinator handoff. Inside Herdr,
+omitted identity flags are filled from the current pane: its label, full agent
+session UUID, and working directory. Explicit flags always win; `--no-auto`
+disables detection. Missing Herdr state, command failures, timeouts, and invalid
+output are ignored so the note still succeeds, and author is not inferred.
+Only a full UUID is eligible for the dashboard resume command. If coordinator
 author metadata is empty, the newest note author is used.
 Coordinators should set a one-line human summary at kickoff with `--summary`.
 Omitting that flag preserves the stored summary, a non-empty value replaces it,

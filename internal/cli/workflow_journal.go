@@ -48,7 +48,7 @@ func printWorkflowJournalUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot workflow list [--json]")
 	fmt.Fprintln(w, "  gitmoot workflow show <label> [--json] [--limit N]")
-	fmt.Fprintln(w, "  gitmoot workflow note <label> \"<body>\" [--author A] [--pane P] [--session ID] [--workdir PATH] [--summary S] [--remember [--remember-status] [--agent NAME] [--repo R]]")
+	fmt.Fprintln(w, "  gitmoot workflow note <label> \"<body>\" [--author A] [--pane P] [--session ID] [--workdir PATH] [--no-auto] [--summary S] [--remember [--remember-status] [--agent NAME] [--repo R]]")
 }
 
 func runWorkflowList(args []string, stdout, stderr io.Writer) int {
@@ -293,6 +293,7 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 	pane := fs.String("pane", "", "coordinator pane name")
 	sessionID := fs.String("session", "", "coordinator runtime session id")
 	workdir := fs.String("workdir", "", "coordinator working directory")
+	noAuto := fs.Bool("no-auto", false, "disable Herdr coordinator identity detection")
 	summary := fs.String("summary", "", "one-line human workflow summary")
 	remember := fs.Bool("remember", false, "also stage the note as persistent memory")
 	rememberStatus := fs.Bool("remember-status", false, "explicitly allow a shipping-status-shaped note into memory")
@@ -326,11 +327,33 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	summarySet := false
+	paneSet := false
+	sessionSet := false
+	workdirSet := false
 	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "summary" {
+		switch f.Name {
+		case "summary":
 			summarySet = true
+		case "pane":
+			paneSet = true
+		case "session":
+			sessionSet = true
+		case "workdir":
+			workdirSet = true
 		}
 	})
+	if !*noAuto && (!paneSet || !sessionSet || !workdirSet) {
+		detected := detectWorkflowCoordinatorIdentity(context.Background())
+		if !paneSet {
+			*pane = detected.Pane
+		}
+		if !sessionSet {
+			*sessionID = detected.SessionID
+		}
+		if !workdirSet {
+			*workdir = detected.WorkDir
+		}
+	}
 	if len(*summary) > workflowSummaryMax {
 		fmt.Fprintf(stderr, "workflow note summary must be at most %d bytes\n", workflowSummaryMax)
 		return 2

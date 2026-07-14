@@ -8,7 +8,7 @@ several jobs. It works on agent ask/run/review/implement, `orchestrate`, and
 
 ```sh
 gitmoot orchestrate planner "Run release checks." --repo owner/repo --workflow fable/release-42
-gitmoot workflow note fable/release-42 "Canary passed." --author operator --pane release --session <session-id> --workdir /work/release --remember
+gitmoot workflow note fable/release-42 "Canary passed." --author operator --remember
 gitmoot workflow show fable/release-42
 ```
 
@@ -18,7 +18,11 @@ complete run trees, derived active/stalled/settled state, best-effort token
 totals, the shared note journal, and the latest coordinator handoff. Labels may
 use one namespace slash; each side remains a lowercase alphanumeric/single-hyphen
 slug. `--pane`, `--session`, and `--workdir` on `workflow note` update the
-handoff used by the dashboard's resume card.
+handoff used by the dashboard's resume card. Inside Herdr, omitted handoff flags
+default to the current pane label, full agent session UUID, and working
+directory. Explicit flags override detection; `--no-auto` disables it. Detection
+fails open without blocking the note and never invents an author. Resume
+commands are emitted only for full UUID session ids.
 
 Journal text and authors are stored verbatim. JSON keeps them verbatim, while
 terminal text output sanitizes escapes/control bytes and caps each field to one

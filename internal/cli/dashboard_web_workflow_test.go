@@ -328,7 +328,7 @@ func TestWebDataSourceWorkflowsIndexLifecycleCoordinatorAndSlashDetail(t *testin
 
 	activeNote, err := store.InsertWorkflowNoteWithMeta(ctx,
 		db.WorkflowNote{WorkflowID: "fable/dashboard-redesign", Author: "fable", Body: "  live\n coordinator   handoff  "},
-		db.WorkflowMeta{Author: "fable", Pane: "wave-2", SessionID: "session-123", WorkDir: "/work/dashboard", Summary: "Ship the dashboard redesign.", SummarySet: true})
+		db.WorkflowMeta{Author: "fable", Pane: "wave-2", SessionID: workflowCoordinatorTestSession, WorkDir: "/work/dashboard", Summary: "Ship the dashboard redesign.", SummarySet: true})
 	if err != nil {
 		t.Fatalf("Insert active note: %v", err)
 	}
@@ -388,8 +388,18 @@ func TestWebDataSourceWorkflowsIndexLifecycleCoordinatorAndSlashDetail(t *testin
 		t.Fatalf("stalled entry = %+v", stalled)
 	}
 	active := entries[1]
-	if active.Namespace != "fable" || active.Campaign != "dashboard-redesign" || active.Auto || active.Summary != "Ship the dashboard redesign." || active.Counts.Jobs != 1 || active.Counts.Running != 1 || active.TokensIn != 11 || active.TokensOut != 13 || active.LastNote != "live coordinator handoff" || active.Coordinator.Author != "fable" || active.Coordinator.SessionID != "session-123" {
+	if active.Namespace != "fable" || active.Campaign != "dashboard-redesign" || active.Auto || active.Summary != "Ship the dashboard redesign." || active.Counts.Jobs != 1 || active.Counts.Running != 1 || active.TokensIn != 11 || active.TokensOut != 13 || active.LastNote != "live coordinator handoff" || active.Coordinator.Author != "fable" || active.Coordinator.SessionID != workflowCoordinatorTestSession {
 		t.Fatalf("active entry = %+v", active)
+	}
+	if stalled.Coordinator.SessionID != "ops-session" {
+		t.Fatalf("workflow index hid raw legacy session id: %+v", stalled.Coordinator)
+	}
+	stalledDetail, err := ds.Workflow(ctx, "ops/stalled", dashboard.WorkflowQuery{})
+	if err != nil {
+		t.Fatalf("Workflow(ops/stalled): %v", err)
+	}
+	if stalledDetail.Coordinator.SessionID != "" {
+		t.Fatalf("stalled detail exposed invalid resume session: %+v", stalledDetail.Coordinator)
 	}
 	if len(active.Repos) != 1 || active.Repos[0] != "acme/dashboard" {
 		t.Fatalf("active repos = %v", active.Repos)
@@ -422,7 +432,7 @@ func TestWebDataSourceWorkflowsIndexLifecycleCoordinatorAndSlashDetail(t *testin
 	if err := json.Unmarshal(recorder.Body.Bytes(), &detail); err != nil {
 		t.Fatalf("decode detail: %v", err)
 	}
-	if detail.Summary.Label != "fable/dashboard-redesign" || detail.Summary.Summary != "Ship the dashboard redesign." || detail.State != "active" || detail.Coordinator.Pane != "wave-2" || detail.Coordinator.SessionID != "session-123" || detail.WorkDir != "/work/dashboard" || len(detail.Runs) != 1 || detail.Runs[0].Agent != "worker" || detail.Runs[0].Repo != "acme/dashboard" {
+	if detail.Summary.Label != "fable/dashboard-redesign" || detail.Summary.Summary != "Ship the dashboard redesign." || detail.State != "active" || detail.Coordinator.Pane != "wave-2" || detail.Coordinator.SessionID != workflowCoordinatorTestSession || detail.WorkDir != "/work/dashboard" || len(detail.Runs) != 1 || detail.Runs[0].Agent != "worker" || detail.Runs[0].Repo != "acme/dashboard" {
 		t.Fatalf("namespaced detail = %+v", detail)
 	}
 }
