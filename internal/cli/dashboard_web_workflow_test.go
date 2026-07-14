@@ -27,13 +27,13 @@ func TestDeriveDashboardWorkflowState(t *testing.T) {
 	}{
 		{name: "running stays active", activity: dashboardWorkflowActivity{Running: 1, LastActivity: now.Add(-48 * time.Hour)}, state: "active"},
 		{name: "queued stays active", activity: dashboardWorkflowActivity{Queued: 1, LastActivity: now.Add(-48 * time.Hour)}, state: "active"},
-		{name: "recent terminal is active", activity: dashboardWorkflowActivity{LastActivity: now.Add(-30 * time.Minute)}, state: "active"},
+		{name: "recent terminal is recent", activity: dashboardWorkflowActivity{LastActivity: now.Add(-10 * time.Minute)}, state: "recent"},
 		{name: "unacknowledged failure is stalled", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-31 * time.Minute), LastFailure: now.Add(-31 * time.Minute)}, state: "stalled", stalled: 31 * 60},
 		{name: "unacknowledged block is stalled", activity: dashboardWorkflowActivity{Blocked: 1, LastActivity: now.Add(-23 * time.Hour), LastFailure: now.Add(-23 * time.Hour)}, state: "stalled", stalled: 23 * 60 * 60},
 		{name: "note before failure does not acknowledge", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-40 * time.Minute), LastFailure: now.Add(-40 * time.Minute), LastNote: now.Add(-2 * time.Hour)}, state: "stalled", stalled: 40 * 60},
 		{name: "acknowledged failure is settled", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-31 * time.Minute), LastFailure: now.Add(-1 * time.Hour), LastNote: now.Add(-31 * time.Minute)}, state: "settled"},
 		{name: "failure without timestamp is settled", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-31 * time.Minute)}, state: "settled"},
-		{name: "successful quiet is settled", activity: dashboardWorkflowActivity{LastActivity: now.Add(-31 * time.Minute)}, state: "settled"},
+		{name: "successful quiet is settled", activity: dashboardWorkflowActivity{LastActivity: now.Add(-45 * time.Minute)}, state: "settled"},
 		{name: "stalled ages out at horizon", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-24 * time.Hour), LastFailure: now.Add(-24 * time.Hour)}, state: "settled"},
 		{name: "missing activity is settled", activity: dashboardWorkflowActivity{Failed: 1}, state: "settled"},
 	}
@@ -44,6 +44,18 @@ func TestDeriveDashboardWorkflowState(t *testing.T) {
 				t.Fatalf("derive = (%q, %d), want (%q, %d)", state, stalled, test.state, test.stalled)
 			}
 		})
+	}
+}
+
+func TestDashboardWorkflowIndexLessStateOrder(t *testing.T) {
+	active := dashboard.WorkflowIndexEntry{Label: "active", State: "active"}
+	recent := dashboard.WorkflowIndexEntry{Label: "recent", State: "recent"}
+	settled := dashboard.WorkflowIndexEntry{Label: "settled", State: "settled"}
+	if !dashboardWorkflowIndexLess(active, recent) || !dashboardWorkflowIndexLess(recent, settled) {
+		t.Fatal("workflow state order must place recent after active and before settled")
+	}
+	if dashboardWorkflowIndexLess(recent, active) || dashboardWorkflowIndexLess(settled, recent) {
+		t.Fatal("workflow state order reversed active/recent/settled precedence")
 	}
 }
 
@@ -323,6 +335,7 @@ func TestWebDataSourceWorkflowsIndexLifecycleCoordinatorAndSlashDetail(t *testin
 	}
 	seedJob("active-job", "fable/dashboard-redesign", "running", "acme/dashboard", 2*time.Hour, 11, 13)
 	seedJob("stalled-job", "ops/stalled", "failed", "acme/ops", 2*time.Hour, 17, 19)
+	seedJob("recent-job", "release/closing-note", "succeeded", "acme/release", 2*time.Hour, 20, 21)
 	seedJob("settled-job", "release/complete", "succeeded", "acme/release", 3*time.Hour, 23, 29)
 	seedJob("unlabeled-job", "", "running", "acme/unlabeled", 5*time.Minute, 31, 37)
 
@@ -337,6 +350,10 @@ func TestWebDataSourceWorkflowsIndexLifecycleCoordinatorAndSlashDetail(t *testin
 		db.WorkflowMeta{Author: "operator", Pane: "ops-pane", SessionID: "ops-session", WorkDir: "/work/ops"})
 	if err != nil {
 		t.Fatalf("Insert stalled note: %v", err)
+	}
+	closingNote, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{WorkflowID: "release/closing-note", Author: "release-coord", Body: "goal complete"})
+	if err != nil {
+		t.Fatalf("Insert closing note: %v", err)
 	}
 	settledNote, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{WorkflowID: "release/complete", Author: "release-coord", Body: "release complete"})
 	if err != nil {
@@ -358,6 +375,7 @@ func TestWebDataSourceWorkflowsIndexLifecycleCoordinatorAndSlashDetail(t *testin
 		// The stalled note predates the failure: an unacknowledged failure is what
 		// makes a workflow stalled (a note AFTER the failure would settle it).
 		stalledNote.ID: format(now.Add(-3 * time.Hour)),
+		closingNote.ID: format(now.Add(-10 * time.Minute)),
 		settledNote.ID: format(now.Add(-2 * time.Hour)),
 		archiveNote.ID: format(now.Add(-48 * time.Hour)),
 	} {
@@ -371,10 +389,10 @@ func TestWebDataSourceWorkflowsIndexLifecycleCoordinatorAndSlashDetail(t *testin
 	if err != nil {
 		t.Fatalf("Workflows: %v", err)
 	}
-	if len(entries) != 4 {
-		t.Fatalf("entries = %d, want 4: %+v", len(entries), entries)
+	if len(entries) != 5 {
+		t.Fatalf("entries = %d, want 5: %+v", len(entries), entries)
 	}
-	wantLabels := []string{"ops/stalled", "fable/dashboard-redesign", "release/complete", "journal/archive"}
+	wantLabels := []string{"ops/stalled", "fable/dashboard-redesign", "release/closing-note", "release/complete", "journal/archive"}
 	for i, want := range wantLabels {
 		if entries[i].Label != want {
 			t.Fatalf("entry labels changed at %d: got %q, want %q: %+v", i, entries[i].Label, want, entries)
@@ -403,6 +421,17 @@ func TestWebDataSourceWorkflowsIndexLifecycleCoordinatorAndSlashDetail(t *testin
 	}
 	if len(active.Repos) != 1 || active.Repos[0] != "acme/dashboard" {
 		t.Fatalf("active repos = %v", active.Repos)
+	}
+	recent := workflowIndexEntryByLabel(t, entries, "release/closing-note")
+	if recent.State != "recent" || recent.Counts.Running != 0 || recent.Counts.Queued != 0 || recent.LastNote != "goal complete" {
+		t.Fatalf("closing-note entry = %+v", recent)
+	}
+	recentDetail, err := ds.Workflow(ctx, "release/closing-note", dashboard.WorkflowQuery{})
+	if err != nil {
+		t.Fatalf("Workflow(release/closing-note): %v", err)
+	}
+	if recentDetail.State != "recent" || recentDetail.Summary.Running != 0 || recentDetail.Summary.Queued != 0 {
+		t.Fatalf("closing-note detail = %+v", recentDetail)
 	}
 	settled := workflowIndexEntryByLabel(t, entries, "release/complete")
 	if settled.State != "settled" || settled.Coordinator.Author != "release-coord" {

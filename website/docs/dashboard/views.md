@@ -198,7 +198,9 @@ live on the Pipelines page. An explicitly labeled workflow still appears here
 even when its label begins with `pipeline/` or `adhoc/`.
 
 The **index** groups every known explicit workflow by derived lifecycle: **stalled**
-pinned on top ("needs a look"), then **active**, then recently **settled**.
+pinned on top ("needs a look"), then **active**, **recent**, and **settled**.
+Active means work is currently running or queued. Recent means no work is live,
+but a job or journal note touched the workflow within the last 30 minutes.
 A coordinator-provided one-line summary identifies the campaign beside its
 journal activity.
 A workflow is stalled only when a failure has gone **unacknowledged** — nothing

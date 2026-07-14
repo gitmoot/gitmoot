@@ -12,8 +12,8 @@ import (
 )
 
 const (
-	// A recently touched workflow remains active long enough for coordinator
-	// handoffs and short pauses between dispatches to read as one live campaign.
+	// A recently touched workflow remains recent long enough for coordinator
+	// handoffs and short pauses between dispatches to read as one campaign.
 	dashboardWorkflowActiveWindow = 30 * time.Minute
 	// A failed/blocked quiet workflow needs attention for one day; after that it
 	// ages into settled history instead of pinning the operator's stalled list.
@@ -34,7 +34,7 @@ type dashboardWorkflowActivity struct {
 // workflow index and detail responses.
 func deriveDashboardWorkflowState(now time.Time, activity dashboardWorkflowActivity) (state string, stalledForS int64) {
 	age := now.Sub(activity.LastActivity)
-	if activity.Queued > 0 || activity.Running > 0 || (!activity.LastActivity.IsZero() && age <= dashboardWorkflowActiveWindow) {
+	if activity.Queued > 0 || activity.Running > 0 {
 		return "active", 0
 	}
 	failureUnacknowledged := !activity.LastFailure.IsZero() &&
@@ -42,6 +42,9 @@ func deriveDashboardWorkflowState(now time.Time, activity dashboardWorkflowActiv
 	if (activity.Failed > 0 || activity.Blocked > 0) && failureUnacknowledged &&
 		age > dashboardWorkflowActiveWindow && age < dashboardWorkflowStalledHorizon {
 		return "stalled", max(0, int64(age/time.Second))
+	}
+	if !activity.LastActivity.IsZero() && age <= dashboardWorkflowActiveWindow {
+		return "recent", 0
 	}
 	return "settled", 0
 }
@@ -119,10 +122,12 @@ func dashboardWorkflowIndexLess(a, b dashboard.WorkflowIndexEntry) bool {
 			return 0
 		case "active":
 			return 1
-		case "settled":
+		case "recent":
 			return 2
-		default:
+		case "settled":
 			return 3
+		default:
+			return 4
 		}
 	}
 	if ar, br := rank(a.State), rank(b.State); ar != br {

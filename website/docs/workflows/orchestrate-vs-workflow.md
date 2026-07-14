@@ -49,9 +49,10 @@ locking, budgets, or lifecycle behavior to the labeled jobs.
 Use a plain slug such as `release-42`, or one namespace slash such as
 `fable/dashboard-redesign`. Each side follows the same lowercase alphanumeric
 and single-hyphen slug rule. The dashboard derives presentation state without
-controlling execution: recently touched or queued/running workflows are active;
-failed/blocked workflows quiet for 30 minutes to 24 hours are stalled; older or
-otherwise terminal workflows are settled.
+controlling execution: queued/running workflows are active; workflows with no
+live work but activity within 30 minutes are recent; failed/blocked workflows
+with an unacknowledged failure and 30 minutes to 24 hours of silence are stalled;
+older or otherwise terminal workflows are settled.
 
 At kickoff, give the campaign a human-readable one-line summary alongside its
 journal:

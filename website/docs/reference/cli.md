@@ -920,9 +920,10 @@ gitmoot workflow note fable/dashboard-redesign "Kickoff." --author operator --su
 List/show include state counts, notes, first/last activity, and best-effort token
 totals. Notes store bodies and authors verbatim. The read-only web dashboard
 also renders labels as Galaxy hubs and provides a Workflows index plus mission
-log at `/workflows/<label>`. `active` means queued/running or touched within 30
-minutes; failed/blocked workflows quiet for 30 minutes to 24 hours are
-`stalled`; everything else is `settled`. The optional `--pane`, `--session`, and
+log at `/workflows/<label>`. `active` means queued/running; `recent` means no work
+is live but activity occurred within 30 minutes; failed/blocked workflows with
+an unacknowledged failure and 30 minutes to 24 hours of silence are `stalled`;
+everything else is `settled`. The optional `--pane`, `--session`, and
 `--workdir` note flags persist the latest coordinator handoff. Inside Herdr,
 omitted identity flags are filled from the current pane: its label, full agent
 session UUID, and working directory. Explicit flags always win; `--no-auto`
