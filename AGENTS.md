@@ -36,9 +36,9 @@ go build ./...
 go generate ./... && git diff --exit-code   # gitmoot_result contract is single-sourced + regenerated; stale artifact fails CI
 go vet ./...
 go test ./...
-# Race gate is scoped (not ./...). CI splits it across two parallel jobs (#733):
-# `build / vet / test` runs workflow+db+daemon at 20m, `race (internal/cli)` runs
-# the mega-package on its own at 35m. Locally you can run all four at once:
+# Race gate is scoped (not ./...). CI compiles one -race test binary per package
+# and runs timing-balanced shards from those binaries (#906). Locally you can
+# run the four complete packages at once:
 go test -race -timeout 35m ./internal/workflow/ ./internal/cli/ ./internal/db/ ./internal/daemon/
 ```
 
