@@ -324,6 +324,7 @@ func TestWebDataSourceWorkflowsIndexLifecycleCoordinatorAndSlashDetail(t *testin
 	seedJob("active-job", "fable/dashboard-redesign", "running", "acme/dashboard", 2*time.Hour, 11, 13)
 	seedJob("stalled-job", "ops/stalled", "failed", "acme/ops", 2*time.Hour, 17, 19)
 	seedJob("settled-job", "release/complete", "succeeded", "acme/release", 3*time.Hour, 23, 29)
+	seedJob("unlabeled-job", "", "running", "acme/unlabeled", 5*time.Minute, 31, 37)
 
 	activeNote, err := store.InsertWorkflowNoteWithMeta(ctx,
 		db.WorkflowNote{WorkflowID: "fable/dashboard-redesign", Author: "fable", Body: "  live\n coordinator   handoff  "},
@@ -373,6 +374,12 @@ func TestWebDataSourceWorkflowsIndexLifecycleCoordinatorAndSlashDetail(t *testin
 	if len(entries) != 4 {
 		t.Fatalf("entries = %d, want 4: %+v", len(entries), entries)
 	}
+	wantLabels := []string{"ops/stalled", "fable/dashboard-redesign", "release/complete", "journal/archive"}
+	for i, want := range wantLabels {
+		if entries[i].Label != want {
+			t.Fatalf("entry labels changed at %d: got %q, want %q: %+v", i, entries[i].Label, want, entries)
+		}
+	}
 	if entries[0].Label != "ops/stalled" || entries[0].State != "stalled" || entries[1].Label != "fable/dashboard-redesign" || entries[1].State != "active" {
 		t.Fatalf("state ordering = %+v", entries)
 	}
@@ -397,6 +404,15 @@ func TestWebDataSourceWorkflowsIndexLifecycleCoordinatorAndSlashDetail(t *testin
 	}
 
 	handler := dashboard.Serve(ds)
+	for _, entry := range entries {
+		detail, err := ds.Workflow(ctx, entry.Label, dashboard.WorkflowQuery{})
+		if err != nil {
+			t.Fatalf("Workflow(%q): %v", entry.Label, err)
+		}
+		if detail.Summary.Label != entry.Label {
+			t.Fatalf("Workflow(%q) returned label %q", entry.Label, detail.Summary.Label)
+		}
+	}
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/workflow/fable%2Fdashboard-redesign", nil))
 	if recorder.Code != http.StatusOK {

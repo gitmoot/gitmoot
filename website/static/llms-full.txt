@@ -6502,15 +6502,15 @@ Workflows are labeled campaigns of related work driven by a coordinator: jobs
 dispatched with `--workflow <label>` plus the journal written with
 `gitmoot workflow note`. Labels may carry one namespace slash
 (`fable/dashboard-redesign`) — by convention the coordinator's herdr pane name
-namespaces the campaign. Unlabeled non-pipeline runs are summarized without
-payload scans as synthetic `adhoc/<agent>` entries and marked unattended in the
-index. Pipeline stage jobs stay on the Pipelines page; an explicitly labeled
-workflow still appears here even when its label begins with `pipeline/`.
+namespaces the campaign. The Workflows page lists only explicitly labeled
+workflows. Unlabeled jobs remain visible on the Jobs page, while pipeline runs
+live on the Pipelines page. An explicitly labeled workflow still appears here
+even when its label begins with `pipeline/` or `adhoc/`.
 
-The **index** groups every known workflow by derived lifecycle: **stalled**
+The **index** groups every known explicit workflow by derived lifecycle: **stalled**
 pinned on top ("needs a look"), then **active**, then recently **settled**.
 A coordinator-provided one-line summary identifies the campaign beside its
-journal activity; synthetic `adhoc/<agent>` rows have no summary.
+journal activity.
 A workflow is stalled only when a failure has gone **unacknowledged** — nothing
 is running, the goal was not reached, and no journal note has been written
 since the last failure (a failure alone is not an alarm; the silence after it
