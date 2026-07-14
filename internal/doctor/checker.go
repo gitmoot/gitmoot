@@ -21,6 +21,30 @@ type Check struct {
 	Detail   string
 }
 
+type BuildInfo struct {
+	Version string
+	Commit  string
+}
+
+func BuildInfoFromValues(version, commit string) BuildInfo {
+	return BuildInfo{Version: strings.TrimSpace(version), Commit: strings.TrimSpace(commit)}
+}
+
+// BuildStatus compares what the daemon PROCESS is running against the binary it
+// would load if restarted. Those are the only two builds the operator can act
+// on; the build of whatever binary happens to be invoking `doctor` is not one of
+// them (it may not even be the daemon's binary), so it is deliberately absent.
+type BuildStatus struct {
+	// Daemon is the build recorded by the running daemon at startup — what it is
+	// actually executing. Zero when the daemon predates build stamping.
+	Daemon BuildInfo
+	// OnDisk is the build of the binary now sitting at the daemon's executable
+	// path — what a restart would pick up. Zero when it cannot be resolved.
+	OnDisk        BuildInfo
+	OnDiskPath    string
+	DaemonRunning bool
+}
+
 type Checker struct {
 	Dir    string
 	Runner subprocess.Runner
@@ -45,6 +69,10 @@ type Checker struct {
 	// background jobs is the daemon's own environment, not the shell that ran
 	// `gitmoot doctor`.
 	Paths config.Paths
+	// Build is supplied by the CLI so this package stays independent of both
+	// buildinfo and daemon-state persistence. Nil omits the check for callers
+	// such as the continuously refreshed terminal dashboard.
+	Build *BuildStatus
 }
 
 // Run returns the global (cwd-independent) checks followed by the per-repo
@@ -77,7 +105,88 @@ func (c Checker) GlobalChecks(ctx context.Context) []Check {
 		}
 	}
 	checks = append(checks, c.claudeAuthEnv(ctx), c.ghAuth(ctx, runner))
+	if c.Build != nil {
+		checks = append(checks, CheckBuild(*c.Build))
+	}
 	return checks
+}
+
+// CheckBuild reports whether the running daemon is executing stale code: the
+// build it started from, versus the build now sitting at its executable path
+// (what a restart would load). Those are the only two builds the operator can
+// act on — the build of whatever binary happens to be invoking `doctor` is not
+// necessarily either of them, so it is deliberately not part of the comparison.
+//
+// Every unknown is neutral. Inferring "skew" from missing information would fire
+// on every daemon started by an older gitmoot; inferring "same" would hide the
+// staleness this check exists to catch. So an unidentifiable build on either
+// side yields a skipped comparison, never a verdict.
+func CheckBuild(status BuildStatus) Check {
+	check := Check{Name: "build", OK: true, Required: false}
+	if !status.DaemonRunning {
+		check.Detail = "daemon not running; build comparison skipped"
+		return check
+	}
+	if !identifiableBuild(status.Daemon) {
+		check.Detail = "running daemon build unknown (older gitmoot, or an unstamped build); comparison skipped"
+		return check
+	}
+	if !identifiableBuild(status.OnDisk) {
+		check.Detail = "build at the daemon's binary path is unknown (unstamped build); comparison skipped"
+		return check
+	}
+
+	versionsDiffer := status.Daemon.Version != status.OnDisk.Version
+	commitsDiffer := knownBuildCommit(status.Daemon.Commit) && knownBuildCommit(status.OnDisk.Commit) && status.Daemon.Commit != status.OnDisk.Commit
+	if !versionsDiffer && !commitsDiffer {
+		check.Detail = "daemon is running the binary on disk (" + buildDisplay(status.OnDisk) + ")"
+		return check
+	}
+
+	check.OK = false
+	target := "the binary on disk"
+	if path := strings.TrimSpace(status.OnDiskPath); path != "" {
+		target = path
+	}
+	check.Detail = fmt.Sprintf("daemon running %s; %s is %s — restart the daemon to pick it up",
+		buildDisplay(status.Daemon), target, buildDisplay(status.OnDisk))
+	return check
+}
+
+// identifiableBuild mirrors buildinfo.Info.Identifiable, without importing it —
+// this package stays free of the build-stamp dependency and the CLI supplies the
+// values. An unstamped build with no VCS revision reports version "dev" and no
+// commit; every such build is the same anonymous "dev", so comparing two of them
+// tells you nothing and must not be treated as a verdict either way.
+func identifiableBuild(build BuildInfo) bool {
+	if !knownBuildVersion(build.Version) {
+		return false
+	}
+	if build.Version != "dev" {
+		return true
+	}
+	return knownBuildCommit(build.Commit)
+}
+
+func knownBuildVersion(version string) bool {
+	version = strings.TrimSpace(version)
+	return version != "" && !strings.EqualFold(version, "unknown")
+}
+
+func knownBuildCommit(commit string) bool {
+	commit = strings.TrimSpace(commit)
+	return commit != "" && !strings.EqualFold(commit, "unknown")
+}
+
+func buildDisplay(build BuildInfo) string {
+	if knownBuildCommit(build.Commit) {
+		commit := build.Commit
+		if len(commit) > 8 {
+			commit = commit[:8]
+		}
+		return fmt.Sprintf("%s (%s)", build.Version, commit)
+	}
+	return build.Version
 }
 
 // RepoChecks returns the per-repo diagnostics (origin remote resolves, base

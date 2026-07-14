@@ -159,6 +159,42 @@ For structured local state, use `gitmoot dashboard --json` or
 `gitmoot task list --repo owner/repo --json`. `gitmoot status --json` and
 `gitmoot task show` are not valid commands.
 
+### Build Skew (Upgraded But Not Restarted)
+
+The daemon is a long-lived process: replacing the binary does **not** change the
+code it is executing. It keeps running the old build until you restart it, which
+is easy to miss because `gitmoot version` describes the binary you just invoked,
+not the one the daemon is running.
+
+The daemon records the build it started from in `<home>/.gitmoot/daemon.json`
+(`version` + `commit`). `gitmoot daemon status` prints that build and compares it
+against the build of the binary **now sitting at the daemon's own path** — the one
+a restart would load:
+
+```
+build: dev-cd43a49 (cd43a495)
+WARNING: daemon running dev-cd43a49 (cd43a495); /root/.local/bin/gitmoot is dev-56ba1c7 (56ba1c74) — restart the daemon to pick it up
+```
+
+`gitmoot doctor` reports the same comparison as a non-fatal `build` check. It
+compares the **daemon** against the **daemon's own binary** — not against whatever
+binary you happen to be invoking, which need not be the daemon's at all.
+
+Unknown is never reported as skew — and never as agreement either. The comparison
+is skipped when the daemon is not running, when it was started by an older gitmoot
+(which recorded no build), or when either side is an **unidentifiable** build. A
+build is identifiable if it was stamped (any release, and the documented deploy
+recipe) or if Go's VCS stamping supplied a commit, which a plain `go build` in a
+git tree does. Two unstamped builds with no commit are both just `dev`:
+indistinguishable, so comparing them would prove nothing.
+
+The web dashboard's `/api/health` reports the daemon's **recorded** build — what
+the daemon process is actually running, not the version of whatever binary now
+sits at its path — plus, separately, the serving dashboard process's own build,
+so a dashboard left on a stale binary is visible rather than silently wrong. The
+update badge remains relative to the binary on disk, since that is what an update
+replaces.
+
 ### Watched Repos
 
 ```sh

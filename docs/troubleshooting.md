@@ -3,6 +3,48 @@
 Use `gitmoot doctor --repo .` first. It checks local prerequisites from the
 repository checkout.
 
+## The Daemon Is Running An Old Build
+
+Symptoms:
+
+- You upgraded gitmoot (or rebuilt it) and the fix did not take effect.
+- Jobs still behave like the previous version; new flags are ignored.
+- `gitmoot version` shows the new build, so everything *looks* current.
+
+Cause: the daemon is a long-lived process. Replacing the binary on disk does not
+change the code an already-running daemon executes — it keeps running the build
+it started from until it is restarted. `gitmoot version` reports the binary
+**you** invoked, not the one the daemon is running, so it cannot tell you this.
+
+Check:
+
+```sh
+gitmoot daemon status   # prints "build: <version>" and warns on skew
+gitmoot doctor          # non-fatal "build" check, same comparison
+```
+
+A skew reads:
+
+```
+WARNING: daemon running dev-cd43a49 (cd43a495); /usr/local/bin/gitmoot is dev-56ba1c7 (56ba1c74) — restart the daemon to pick it up
+```
+
+Fix: restart the daemon (when it is idle — confirm no running jobs first). If it
+runs under systemd, use your service manager rather than `gitmoot daemon restart`.
+
+Notes:
+
+- The comparison is between the daemon **process** and the binary at the
+  **daemon's own path** — the one a restart would load. It is not about the binary
+  you happen to be invoking, which may be a different one entirely.
+- The comparison is only made when both builds are identifiable, and an unknown is
+  never reported as skew *or* as agreement — it reports "comparison skipped". A
+  daemon started by an older gitmoot recorded no build; and two unstamped builds
+  with no VCS commit are both just `dev`, so comparing them would prove nothing.
+- If you run the web dashboard as a **separate service**, it is its own process
+  with its own build. `/api/health` reports the serving process's build separately
+  from the daemon's, so restart both after an upgrade.
+
 ## `gh`
 
 Symptoms:

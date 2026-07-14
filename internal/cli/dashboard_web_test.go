@@ -1388,7 +1388,7 @@ func execCount(t *testing.T, counterFile string) int {
 	return len(data)
 }
 
-// TestWebDataSourceDaemonVersionCache asserts resolveDaemonVersion execs the
+// TestWebDataSourceDaemonVersionCache asserts resolveOnDiskVersion execs the
 // binary's "version --json" once, parses the JSON version, serves subsequent
 // calls from the mtime-keyed cache WITHOUT re-execing, and re-execs after the
 // binary's mtime changes. A missing/non-executable path yields "" (fail-open).
@@ -1401,14 +1401,14 @@ func TestWebDataSourceDaemonVersionCache(t *testing.T) {
 	ds := &webDataSource{}
 	ctx := context.Background()
 
-	if v := ds.resolveDaemonVersion(ctx, bin); v != "v1.2.3" {
+	if v := ds.resolveOnDiskVersion(ctx, bin); v != "v1.2.3" {
 		t.Fatalf("version = %q, want v1.2.3", v)
 	}
 	if n := execCount(t, counter); n != 1 {
 		t.Fatalf("exec count = %d after first resolve, want 1", n)
 	}
 	// Cache hit: same binary/mtime -> no re-exec.
-	if v := ds.resolveDaemonVersion(ctx, bin); v != "v1.2.3" {
+	if v := ds.resolveOnDiskVersion(ctx, bin); v != "v1.2.3" {
 		t.Fatalf("cached version = %q, want v1.2.3", v)
 	}
 	if n := execCount(t, counter); n != 1 {
@@ -1421,7 +1421,7 @@ func TestWebDataSourceDaemonVersionCache(t *testing.T) {
 	if err := os.Chtimes(bin, future, future); err != nil {
 		t.Fatalf("Chtimes: %v", err)
 	}
-	if v := ds.resolveDaemonVersion(ctx, bin); v != "v4.5.6" {
+	if v := ds.resolveOnDiskVersion(ctx, bin); v != "v4.5.6" {
 		t.Fatalf("version after mtime change = %q, want v4.5.6", v)
 	}
 	if n := execCount(t, counter); n != 2 {
@@ -1429,12 +1429,12 @@ func TestWebDataSourceDaemonVersionCache(t *testing.T) {
 	}
 
 	// Fail-open on a path that does not exist.
-	if v := ds.resolveDaemonVersion(ctx, filepath.Join(dir, "nope")); v != "" {
+	if v := ds.resolveOnDiskVersion(ctx, filepath.Join(dir, "nope")); v != "" {
 		t.Fatalf("missing binary version = %q, want empty", v)
 	}
 }
 
-// TestWebDataSourceDaemonVersionTextFallback asserts resolveDaemonVersion falls
+// TestWebDataSourceDaemonVersionTextFallback asserts resolveOnDiskVersion falls
 // back to the plain-text "gitmoot <ver>" form (trimming the prefix) when the JSON
 // form does not parse.
 func TestWebDataSourceDaemonVersionTextFallback(t *testing.T) {
@@ -1446,7 +1446,7 @@ func TestWebDataSourceDaemonVersionTextFallback(t *testing.T) {
 	writeFakeVersionBin(t, bin, counter, `gitmoot v7.8.9`)
 
 	ds := &webDataSource{}
-	if v := ds.resolveDaemonVersion(context.Background(), bin); v != "v7.8.9" {
+	if v := ds.resolveOnDiskVersion(context.Background(), bin); v != "v7.8.9" {
 		t.Fatalf("text fallback version = %q, want v7.8.9", v)
 	}
 }

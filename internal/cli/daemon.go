@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/jerryfane/gitmoot/internal/artifact"
+	"github.com/jerryfane/gitmoot/internal/buildinfo"
 	"github.com/jerryfane/gitmoot/internal/cockpit"
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/credgw"
@@ -146,6 +147,7 @@ func runDaemonStartWithWorkDirRestart(args []string, workDir string, _ bool, _ b
 		fmt.Fprintf(stderr, "daemon start: %v\n", err)
 		return 1
 	}
+	started = daemonMetaWithCurrentBuild(started)
 	if err := writeDaemonState(state, started); err != nil {
 		_ = stopDaemonPID(started.PID)
 		fmt.Fprintf(stderr, "daemon start: %v\n", err)
@@ -596,7 +598,13 @@ func runDaemonStatus(args []string, stdout, stderr io.Writer) int {
 	writeLine(stdout, "log: %s", state.LogFile)
 	if pid > 0 {
 		if meta, err := readDaemonMeta(state); err == nil {
+			writeLine(stdout, "build: %s", daemonBuildLabel(meta))
+			if check := daemonBuildCheck(paths); !check.OK {
+				writeLine(stdout, "WARNING: %s", check.Detail)
+			}
 			writeLine(stdout, "%s", daemonSchedulerStatusLine(meta.Args))
+		} else {
+			writeLine(stdout, "build: unknown")
 		}
 		writeLine(stdout, "%s", daemonClaudeAuthLine(paths))
 	}
@@ -914,6 +922,8 @@ type daemonMeta struct {
 	LogFile    string   `json:"log_file"`
 	Executable string   `json:"executable"`
 	WorkingDir string   `json:"working_dir"`
+	Version    string   `json:"version,omitempty"`
+	Commit     string   `json:"commit,omitempty"`
 }
 
 type daemonStartConfig struct {
@@ -1635,6 +1645,13 @@ func writeDaemonState(state daemonState, meta daemonMeta) error {
 	return os.WriteFile(state.MetaFile, append(encoded, '\n'), 0o600)
 }
 
+func daemonMetaWithCurrentBuild(meta daemonMeta) daemonMeta {
+	build := buildinfo.Current()
+	meta.Version = build.Version
+	meta.Commit = build.Commit
+	return meta
+}
+
 // daemonRunStartupReconcile performs the two #505 startup steps for a directly
 // launched `daemon run`: it self-registers THIS process's pid/meta so `daemon
 // status` and the dashboard recognize it (gap 3), and it reconciles phantom
@@ -1688,14 +1705,14 @@ func registerDaemonRunState(state daemonState, argv []string, workDir string) (o
 	if len(argv) > 0 {
 		executable = argv[0]
 	}
-	meta := daemonMeta{
+	meta := daemonMetaWithCurrentBuild(daemonMeta{
 		PID:        os.Getpid(),
 		StartedAt:  time.Now().UTC().Format(time.RFC3339),
 		Args:       argv[1:],
 		LogFile:    state.LogFile,
 		Executable: executable,
 		WorkingDir: workDir,
-	}
+	})
 	if err := writeDaemonState(state, meta); err != nil {
 		return false, err
 	}
