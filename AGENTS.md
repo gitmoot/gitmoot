@@ -117,6 +117,10 @@ portable code behavior.
   never re-execs (it preserves inherited runtime auth — the #559 lesson).
 - Public read-only dashboard: <https://gitmoot.themartian.app> (a separate
   `gitmoot-dashboard-web` systemd service behind traefik). Docs site: gitmoot.io.
+  That service runs its **own copy of the binary** at
+  `/root/.local/bin/gitmoot-dashboard-web` (`ExecStart=… dashboard --web --addr
+  172.17.0.1:8790`), so replacing `/root/.local/bin/gitmoot` alone leaves the
+  public dashboard on the old build — see the deploy recipe.
 
 ## Hard rules (footguns)
 
@@ -163,14 +167,33 @@ pattern), bounded by depth, a per-root job budget, and loop detection.
 
 ## Deploy recipe (this host)
 
-1. On `main` after merge, build with the pinned toolchain (above).
+1. On `main` after merge, build with the pinned toolchain (above). Stamp the
+   version the way `release.yml` does, or `gitmoot version` reports
+   `commit: unknown`:
+
+   ```sh
+   PKG=github.com/jerryfane/gitmoot/internal/buildinfo
+   CGO_ENABLED=0 go build -trimpath -ldflags \
+     "-s -w -X $PKG.Version=dev-$(git rev-parse --short HEAD) \
+      -X $PKG.Commit=$(git rev-parse HEAD) -X $PKG.Date=$(date -Iseconds)" \
+     -o /root/.local/bin/gitmoot.new ./cmd/gitmoot
+   ```
+
 2. `mv`-rename the new binary into `/root/.local/bin/gitmoot` (same filesystem;
    the rename avoids `ETXTBSY`).
-3. Restart the daemon at idle: `systemctl --user restart gitmoot-daemon`
-   (confirm 0 running jobs first).
-4. Config-only changes (e.g. `[memory]`/`[skillopt]`) usually need no restart
+3. **Two services run two binaries.** The public dashboard has its own copy, so
+   a deploy that touches only `gitmoot` silently leaves the dashboard stale:
+
+   ```sh
+   cp /root/.local/bin/gitmoot /root/.local/bin/gitmoot-dashboard-web.new
+   mv /root/.local/bin/gitmoot-dashboard-web.new /root/.local/bin/gitmoot-dashboard-web
+   ```
+
+4. Restart at idle (confirm 0 running/queued jobs first):
+   `systemctl --user restart gitmoot-daemon gitmoot-dashboard-web`.
+5. Config-only changes (e.g. `[memory]`/`[skillopt]`) usually need no restart
    (re-read per tick / warm-reloaded on SIGHUP).
-5. **Public releases need explicit OWNER sign-off** —
+6. **Public releases need explicit OWNER sign-off** —
    `gh release create vX.Y.Z --latest` triggers `release.yml`. "Deploy locally"
    is not "cut a release".
 
@@ -179,6 +202,11 @@ pattern), bounded by depth, a per-root job budget, and loop detection.
 Prove a deploy: `gitmoot version` (commit/build), `gitmoot daemon status`,
 `gitmoot doctor`. For engine features, a `shell`-runtime E2E on an isolated
 `/tmp` home is the no-LLM smoke test.
+
+`gitmoot version` only proves the binary **you** invoked, not what the services
+run. Probe the deployed behavior instead: `/root/.local/bin/gitmoot-dashboard-web
+version` for the dashboard service, and hit its API for a field the new build
+changed (e.g. `curl -s http://172.17.0.1:8790/api/workflows`).
 
 ## Work strategy (lead-engineer)
 
