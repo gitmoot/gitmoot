@@ -5,16 +5,20 @@ name: CI
 # local run. Does NOT run the live multi-runtime (codex/claude/kimi) E2E — that
 # needs runtime auth and stays a manual step.
 #
-# Two speed levers (#754), both rigor-preserving:
+# Stage 1 lane map (#906; expected wall time ~10m), all rigor-preserving:
 #   - DEP-ONLY FAST LANE: a PR touching only go.mod/go.sum (the dashboard-module
 #     pin bumps — embedded assets, zero Go changes) skips the -race lanes. The
 #     full build + generated-contract check + vet + non-race `go test ./...`
 #     still run, and the bumped module passed its own CI. Pushes to main always
 #     run everything.
-#   - SHARDED race-cli: `go test -race ./internal/cli/` is the wall-time hog
-#     (17-21m, ~6x the plain run) — it is split across a 2-way matrix by an
-#     alternating deterministic partition of `go test -list` output, so the two
-#     shards together always cover the full current suite and wall time halves.
+#   - BUILD / VET / TEST: build, generated-contract check, vet, and plain
+#     `go test ./...` stay together as the non-race gate.
+#   - RACE: internal/cli is split 5 ways, internal/db is split 2 ways, and
+#     internal/workflow is split 3 ways; internal/daemon has its own small leg. Sharded packages use an
+#     alternating deterministic partition of `go test -list` output, so each
+#     matrix covers its full current suite.
+#
+# Stage 2 of #906 will add timing-balanced shards and compile-once race binaries.
 
 on:
   push:
@@ -92,21 +96,46 @@ jobs:
       - name: Test
         run: go test ./...
 
-      - name: Test (race detector, workflow engine + db + daemon)
-        # internal/db and internal/daemon are race-tested because the #536 stale-
-        # recovery / worktree-cleanup fix adds concurrency-sensitive resource_locks
-        # reads (JobRuntimeLockLiveness, DeleteExpiredResourceLocks) that the daemon
-        # worker pool exercises from multiple goroutines.
-        #
-        # internal/cli runs in the sharded `race-cli` matrix below (#733/#754).
-        #
-        # Skipped on dep-only PRs (#754): a go.mod/go.sum-only bump changes no
-        # concurrent Go code; the full non-race test above still covers the seam.
-        if: needs.changes.outputs.code == 'true'
-        run: go test -race -timeout 20m ./internal/workflow/ ./internal/db/ ./internal/daemon/
-
   race-cli:
-    name: race (internal/cli, shard ${{ matrix.shard }}/2)
+    name: race (internal/cli, shard ${{ matrix.shard }}/5)
+    needs: changes
+    # Skipped on dep-only PRs (#754); see the fast-lane note at the top.
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test (race detector, internal/cli — sharded)
+        # internal/cli is the mega-package (the #484 canary auto-rollback
+        # concurrency contract lives here, so it belongs under the detector),
+        # but under -race the full suite runs 17-21m and grows every wave
+        # (#733). It is sharded 5-way (#906): `go test -list` enumerates the
+        # current test functions and an alternating line split partitions them
+        # deterministically — adjacent names interleave, so alphabetical
+        # clusters of slow E2Es spread across the shards, and the union of
+        # the shards is always the complete suite as it exists on this commit.
+        run: |
+          TESTS=$(go test -list '.*' ./internal/cli/ | grep '^Test' || true)
+          if [ -z "$TESTS" ]; then echo "no tests listed"; exit 1; fi
+          PICK=$(echo "$TESTS" | awk -v s='${{ matrix.shard }}' 'NR % 5 == s')
+          COUNT=$(echo "$PICK" | grep -c . || true)
+          echo "shard ${{ matrix.shard }}: $COUNT of $(echo "$TESTS" | wc -l) tests"
+          RUN="^($(echo "$PICK" | paste -sd'|' -))$"
+          go test -race -timeout 20m -run "$RUN" ./internal/cli/
+
+  race-db:
+    name: race (internal/db, shard ${{ matrix.shard }}/2)
     needs: changes
     # Skipped on dep-only PRs (#754); see the fast-lane note at the top.
     if: needs.changes.outputs.code == 'true'
@@ -125,20 +154,67 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Test (race detector, internal/cli — sharded)
-        # internal/cli is the mega-package (the #484 canary auto-rollback
-        # concurrency contract lives here, so it belongs under the detector),
-        # but under -race the full suite runs 17-21m and grows every wave
-        # (#733). It is sharded 2-way (#754): `go test -list` enumerates the
-        # current test functions and an alternating line split partitions them
-        # deterministically — adjacent names interleave, so alphabetical
-        # clusters of slow E2Es spread across both shards, and the union of
-        # the shards is always the complete suite as it exists on this commit.
+      - name: Test (race detector, internal/db — sharded)
+        # The database package is large enough to need test-list sharding rather
+        # than package splitting. This is the same deterministic alternation used
+        # by race-cli, with both shards covering the complete current suite.
         run: |
-          TESTS=$(go test -list '.*' ./internal/cli/ | grep '^Test' || true)
+          TESTS=$(go test -list '.*' ./internal/db/ | grep '^Test' || true)
           if [ -z "$TESTS" ]; then echo "no tests listed"; exit 1; fi
           PICK=$(echo "$TESTS" | awk -v s='${{ matrix.shard }}' 'NR % 2 == s')
           COUNT=$(echo "$PICK" | grep -c . || true)
           echo "shard ${{ matrix.shard }}: $COUNT of $(echo "$TESTS" | wc -l) tests"
           RUN="^($(echo "$PICK" | paste -sd'|' -))$"
-          go test -race -timeout 30m -run "$RUN" ./internal/cli/
+          go test -race -timeout 20m -run "$RUN" ./internal/db/
+
+  race-workflow:
+    name: race (internal/workflow, shard ${{ matrix.shard }}/3)
+    needs: changes
+    # Skipped on dep-only PRs (#754); see the fast-lane note at the top.
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test (race detector, internal/workflow — sharded)
+        # The Stage-1 demonstration run measured this package at ~16m as a
+        # single leg — the true former critical path. Same deterministic
+        # alternating test-list split as race-cli/race-db.
+        run: |
+          TESTS=$(go test -list '.*' ./internal/workflow/ | grep '^Test' || true)
+          if [ -z "$TESTS" ]; then echo "no tests listed"; exit 1; fi
+          PICK=$(echo "$TESTS" | awk -v s='${{ matrix.shard }}' 'NR % 3 == s')
+          COUNT=$(echo "$PICK" | grep -c . || true)
+          echo "shard ${{ matrix.shard }}: $COUNT of $(echo "$TESTS" | wc -l) tests"
+          RUN="^($(echo "$PICK" | paste -sd'|' -))$"
+          go test -race -timeout 20m -run "$RUN" ./internal/workflow/
+
+  race-daemon:
+    name: race (internal/daemon)
+    needs: changes
+    # Skipped on dep-only PRs (#754); see the fast-lane note at the top.
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test (race detector, internal/daemon)
+        run: go test -race -timeout 20m ./internal/daemon/
