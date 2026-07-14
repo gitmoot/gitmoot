@@ -20,9 +20,9 @@ gh auth status
 ```
 
 `gitmoot doctor` is the environment preflight: it validates `gh auth` (with an
-actionable remediation hint) and the runtime credentials — including a
-daemon-aware live probe of the Claude token — so a bad credential is caught
-before jobs stall on it. Run it after install and before starting the daemon.
+actionable remediation hint) and live-probes the Claude credential selected by
+`runtime-auth.env`, so a bad credential is caught before jobs stall on it. Run
+it after install and before starting the daemon.
 
 One-shot onboarding: `gitmoot setup` registers the repo and an agent in one
 command (`--repo owner/repo --agent <name> --runtime codex|claude|shell
@@ -152,7 +152,7 @@ gitmoot daemon start
 gitmoot daemon status
 gitmoot daemon logs
 gitmoot daemon restart
-gitmoot daemon stop [--forget-runtime-auth]
+gitmoot daemon stop
 ```
 
 For structured local state, use `gitmoot dashboard --json` or
@@ -225,17 +225,25 @@ jobs, no environment re-inheritance. Values pinned by explicit launch flags win
 over the re-read config. Prefer SIGHUP over a restart when only tuning
 throughput.
 
-### Runtime Auth Across Restarts
+### Claude Runtime Auth
 
-The daemon persists its Claude token into an owner-only (0600)
-`daemon-runtime.env` file in the Gitmoot home (#578/#588). `gitmoot daemon
-restart` recovers that token even when the invoking shell lacks
-`CLAUDE_CODE_OAUTH_TOKEN`; a plain `daemon stop` + `daemon start` does **not**
-recover it (start re-inherits the launching shell's environment). A recovered
-token may be stale — verify with `gitmoot doctor`. A (re)start that would come
-up without Claude auth warns loudly on stderr (non-fatal). `gitmoot daemon stop
---forget-runtime-auth` deletes the persisted file so a later restart cannot
-recover the token.
+Claude runtime auth lives in owner-only (0600) `runtime-auth.env` and is re-read
+for every adapter build. Manage it without placing secrets on argv:
+
+```sh
+claude setup-token
+gitmoot auth set claude
+gitmoot auth status
+gitmoot auth probe claude
+gitmoot auth unset claude
+```
+
+Rotation takes effect on the next delivery without a daemon restart. Status is
+local and masked; probe is a paid fresh-session liveness check. When the file
+selects one managed Claude variable, Gitmoot injects all three names and blanks
+the absent ones so an ambient API key cannot override OAuth. Unset writes an
+explicit-empty file; do not delete it, because a missing file can trigger the
+one-time legacy/environment bootstrap.
 
 `gitmoot dashboard` shows local state — daemon health, repos, agents and runtime
 sessions, jobs by state, worktrees, branch locks, SkillOpt train phase/candidate,

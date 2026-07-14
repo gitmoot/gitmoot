@@ -53,7 +53,7 @@ func TestRunInitCreatesState(t *testing.T) {
 }
 
 func TestRunSubcommandHelpSucceeds(t *testing.T) {
-	for _, command := range []string{"init", "doctor", "version", "config", "update", "setup", "repo", "agent", "plugin", "events", "job", "report", "lock", "skillopt", "activepieces"} {
+	for _, command := range []string{"init", "doctor", "version", "config", "auth", "update", "setup", "repo", "agent", "plugin", "events", "job", "report", "lock", "skillopt", "activepieces"} {
 		t.Run(command, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 

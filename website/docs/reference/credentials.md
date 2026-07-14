@@ -12,9 +12,29 @@ github = "deny"
 ```
 
 `env_curation = false` preserves the historical behavior: runtime commands
-inherit the daemon or foreground shell environment unchanged. Gitmoot reads this
-section when it constructs an adapter for a job; it is not cached and needs no
-SIGHUP wiring.
+inherit the daemon or foreground shell environment, except for the Claude auth
+overlay described below. Gitmoot reads this section when it constructs an
+adapter for a job; it is not cached and needs no SIGHUP wiring.
+
+## Claude runtime auth
+
+`~/.gitmoot/runtime-auth.env` is the authoritative Claude auth source and is
+always mode `0600`. Create or rotate it with `gitmoot auth set claude`; the
+token is read from stdin and never appears in argv. Rotation is visible to the
+next foreground or daemon delivery without a restart. `gitmoot auth status`
+reports sources, masked fingerprints, mtime, and permissions without making a
+runtime call. `gitmoot auth probe claude` performs a paid fresh-session live
+check. `gitmoot auth unset claude` atomically writes an explicit empty file.
+
+Managed names are `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, and
+`ANTHROPIC_AUTH_TOKEN`. When the file contains any one of them, Gitmoot injects
+all three and blanks absent names so an ambient API key cannot override a
+file-selected OAuth token. An explicit-empty file injects nothing and leaves
+Claude's ambient/credential-store fallback intact. If the authoritative file is
+missing, Gitmoot imports legacy `daemon-runtime.env` once, or otherwise seeds
+from ambient managed variables once. Existing files are never overwritten.
+For systemd deployments, keep `daemon.env` for operational values such as
+`PATH`; do not duplicate Claude secrets there after bootstrap.
 
 ## Curated environment
 
@@ -32,9 +52,8 @@ When curation is enabled, Gitmoot forwards only these exact base names:
 Runtime-specific additions are:
 
 - Codex: `CODEX_HOME`
-- Claude Code: `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`,
-  `ANTHROPIC_AUTH_TOKEN`, and `CLAUDE_CONFIG_DIR`. This is a transitional P1
-  exception; P1 does not relocate Claude state or replace its runtime auth.
+- Claude Code: `CLAUDE_CONFIG_DIR`; the managed auth overlay is appended from
+  `runtime-auth.env` after the curated base.
 - Kimi Code, legacy `kimi-cli`, and shell: no additions. Shell stage variables,
   chat-relay variables, pipeline metadata, and the upstream-context file variable
   are job-owned injections and are appended after the curated base.

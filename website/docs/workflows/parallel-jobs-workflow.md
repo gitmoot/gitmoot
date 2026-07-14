@@ -116,7 +116,7 @@ Changing workers/scheduler/poll no longer needs a daemon restart (#577):
 environment re-inheritance (so the daemon's runtime auth is untouched). Values
 pinned by explicit launch flags win over the re-read config. When a full
 restart is genuinely needed, prefer `gitmoot daemon restart`, which recovers
-the persisted Claude token (#578).
+the per-delivery Claude auth file.
 
 ## Cap one repo's parallelism from config
 

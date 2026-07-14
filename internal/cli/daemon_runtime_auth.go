@@ -1,192 +1,340 @@
 package cli
 
 import (
+	"crypto/sha256"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
+	"sync"
+	"time"
+	"unicode"
 
 	"github.com/jerryfane/gitmoot/internal/runtime"
 )
 
-// daemon_runtime_auth.go persists the daemon's runtime auth so a `daemon
-// restart` (or a plain start) from a shell that lacks the token cannot silently
-// disable Claude-runtime auth — the #559 root cause. #581 only WARNS; this
-// PERSISTS (#578): on start the live token is written to an owner-only 0600 file
-// in the daemon home, and on a later (re)start that inherits an environment
-// WITHOUT the token, the persisted value is loaded and injected into the child
-// daemon's environment so auth is preserved automatically.
-//
-// Persistence is a full REPLACE of the file with the currently-present auth vars
-// (not a merge), and recovery is ALL-OR-NOTHING (only fires when the live env has
-// no runtime auth at all): together these ensure a credential the operator
-// deliberately removed is pruned rather than resurrected, and a present token is
-// never supplemented by a stale persisted one that could flip billing/precedence.
-//
-// SECURITY: the token value NEVER touches stdout/stderr, the log, or the
-// world-readable daemon.json/meta. It lives only in this 0600 file and in the
-// child process environment. Diagnostics name the env var and the file, never
-// the value.
-
-// daemonRuntimeAuthEnvVars is the single source of truth for which runtime auth
-// environment variables the daemon persists and recovers. Only Claude/Anthropic
-// credentials are runtime auth secrets today (Codex/Kimi authenticate out of
-// band); ordering is deterministic so the persisted file and injected child env
-// are stable.
-var daemonRuntimeAuthEnvVars = []string{
+var runtimeAuthEnvVars = []string{
 	runtime.ClaudeOAuthTokenEnv,
 	runtime.AnthropicAPIKeyEnv,
 	runtime.AnthropicAuthTokenEnv,
 }
 
-// daemonRuntimeAuthFileName is the owner-only (0600) file, under the daemon home
-// (config.Paths.Home = <home>/.gitmoot), that carries the persisted tokens.
-const daemonRuntimeAuthFileName = "daemon-runtime.env"
+const (
+	runtimeAuthFileName       = "runtime-auth.env"
+	legacyRuntimeAuthFileName = "daemon-runtime.env"
+	runtimeAuthMinValueBytes  = 16
+	runtimeAuthMaxValueBytes  = 4096
+)
 
-// daemonRuntimeAuthFilePerm is the required mode: owner read/write only. It is a
-// non-negotiable security invariant asserted by a test — the file carries live
-// credentials and must never be group/world readable.
-const daemonRuntimeAuthFilePerm os.FileMode = 0o600
+const runtimeAuthFilePerm os.FileMode = 0o600
 
-func daemonRuntimeAuthFilePath(homeDir string) string {
-	return filepath.Join(homeDir, daemonRuntimeAuthFileName)
+var (
+	runtimeAuthBootstrapMu sync.Mutex
+	runtimeAuthEnvLookup   = os.LookupEnv
+	runtimeAuthLogf        = log.Printf
+)
+
+type runtimeAuthFile struct {
+	Path    string
+	Exists  bool
+	Values  map[string]string
+	Mode    os.FileMode
+	ModTime time.Time
 }
 
-// collectRuntimeAuthEnv returns the runtime auth vars that are present AND
-// non-empty in the given environment lookup, keyed by env-var name. A nil lookup
-// or an unset/blank value contributes nothing.
+func runtimeAuthFilePath(homeDir string) string {
+	return filepath.Join(homeDir, runtimeAuthFileName)
+}
+
+func legacyRuntimeAuthFilePath(homeDir string) string {
+	return filepath.Join(homeDir, legacyRuntimeAuthFileName)
+}
+
 func collectRuntimeAuthEnv(lookup func(string) (string, bool)) map[string]string {
-	present := map[string]string{}
+	values := map[string]string{}
 	if lookup == nil {
-		return present
+		return values
 	}
-	for _, name := range daemonRuntimeAuthEnvVars {
-		if v, ok := lookup(name); ok && strings.TrimSpace(v) != "" {
-			present[name] = v
+	for _, name := range runtimeAuthEnvVars {
+		if value, ok := lookup(name); ok && strings.TrimSpace(value) != "" {
+			values[name] = value
 		}
 	}
-	return present
+	return values
 }
 
-// persistDaemonRuntimeAuth writes the runtime auth tokens present in the live
-// environment to the 0600 daemon-runtime.env file under homeDir.
-//
-// Invariants (#578):
-//   - Only persist when a token is actually present: an environment with NO
-//     runtime auth token leaves any existing file untouched — a good persisted
-//     token is NEVER overwritten with an empty/unset env.
-//   - Rewrite the file to EXACTLY the runtime auth vars currently present in the
-//     live env (a full replace, NOT a merge with prior on-disk state). A merge
-//     would preserve any var ever seen forever, so a credential the operator
-//     deliberately removed from the environment — e.g. switching from
-//     ANTHROPIC_API_KEY (which per runtime.ClaudeAuthEnv.Warning() overrides
-//     OAuth billing/precedence) to OAuth-only — would stick on disk and later be
-//     resurrected into the child. Replacing prunes removed vars; recovery only
-//     fires on a genuine total gap (see recoverDaemonChildAuthEnv).
-//   - The file is created/re-secured to 0600, owner read/write only.
-func persistDaemonRuntimeAuth(homeDir string, lookup func(string) (string, bool)) error {
-	present := collectRuntimeAuthEnv(lookup)
-	if len(present) == 0 {
-		// Nothing to persist; never clobber a previously-persisted good token.
-		return nil
+func loadRuntimeAuthFile(homeDir string) (runtimeAuthFile, error) {
+	path := runtimeAuthFilePath(homeDir)
+	state := runtimeAuthFile{Path: path, Values: map[string]string{}}
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return state, nil
 	}
-	// Write exactly the currently-present set so intentionally-removed
-	// credentials are pruned rather than carried forward.
-	return writeDaemonRuntimeAuthFile(daemonRuntimeAuthFilePath(homeDir), present)
-}
-
-// recoverDaemonChildAuthEnv returns the KEY=VALUE env entries to inject into the
-// (re)started daemon child from the persisted file. Recovery is ALL-OR-NOTHING and
-// scoped to a genuine total auth gap: if the launching environment already carries
-// ANY runtime auth, the live env is authoritative and nothing is injected — a
-// present token is never supplemented by a stale persisted var. This prevents a
-// deliberately-removed credential (e.g. a stale ANTHROPIC_API_KEY, which per
-// runtime.ClaudeAuthEnv.Warning() overrides OAuth billing/precedence) from being
-// silently resurrected alongside the operator's current token. Only when the live
-// env has NO runtime auth at all (the #559 token-less restart) are all persisted
-// vars injected. The result is sorted for determinism and empty when nothing needs
-// recovering.
-func recoverDaemonChildAuthEnv(homeDir string, lookup func(string) (string, bool)) []string {
-	persisted := loadDaemonRuntimeAuthFile(daemonRuntimeAuthFilePath(homeDir))
-	if len(persisted) == 0 {
-		return nil
+	if err != nil {
+		return state, fmt.Errorf("read %s: %w", path, err)
 	}
-	// If the launching env already has any auth, treat it as authoritative and do
-	// not gap-fill individual vars from stale on-disk state.
-	if len(collectRuntimeAuthEnv(lookup)) > 0 {
-		return nil
+	state.Exists = true
+	state.Mode = info.Mode().Perm()
+	state.ModTime = info.ModTime()
+	if !info.Mode().IsRegular() {
+		return state, fmt.Errorf("runtime auth file %s is not a regular file", path)
 	}
-	var extra []string
-	for _, name := range daemonRuntimeAuthEnvVars {
-		if value, ok := persisted[name]; ok {
-			extra = append(extra, name+"="+value)
-		}
+	if state.Mode != runtimeAuthFilePerm {
+		return state, fmt.Errorf("runtime auth file %s has permissions %04o; want 0600", path, state.Mode)
 	}
-	sort.Strings(extra)
-	return extra
-}
-
-// loadDaemonRuntimeAuthFile parses the persisted KEY=VALUE file into a map,
-// keeping only recognized runtime auth vars. It is best-effort: a missing or
-// unreadable file yields an empty (non-nil) map so callers can merge into it.
-func loadDaemonRuntimeAuthFile(path string) map[string]string {
-	out := map[string]string{}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return out
+		return state, fmt.Errorf("read runtime auth file %s: %w", path, err)
 	}
-	recognized := map[string]bool{}
-	for _, name := range daemonRuntimeAuthEnvVars {
-		recognized[name] = true
+	values, err := parseRuntimeAuthFile(path, data)
+	if err != nil {
+		return state, err
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+	state.Values = values
+	return state, nil
+}
+
+func parseRuntimeAuthFile(path string, data []byte) (map[string]string, error) {
+	values := map[string]string{}
+	for lineNumber, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSuffix(raw, "\r")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-		key, value, ok := strings.Cut(line, "=")
+		name, value, ok := strings.Cut(line, "=")
+		name = strings.TrimSpace(name)
+		if !ok || !managedRuntimeAuthVar(name) {
+			return nil, fmt.Errorf("runtime auth file %s line %d: expected NAME=VALUE for a managed Claude auth variable", path, lineNumber+1)
+		}
+		if _, duplicate := values[name]; duplicate {
+			return nil, fmt.Errorf("runtime auth file %s line %d: duplicate %s", path, lineNumber+1, name)
+		}
+		if err := validateRuntimeAuthValue(value); err != nil {
+			return nil, fmt.Errorf("runtime auth file %s line %d (%s): %w", path, lineNumber+1, name, err)
+		}
+		values[name] = value
+	}
+	return values, nil
+}
+
+func managedRuntimeAuthVar(name string) bool {
+	for _, managed := range runtimeAuthEnvVars {
+		if name == managed {
+			return true
+		}
+	}
+	return false
+}
+
+func validateRuntimeAuthValue(value string) error {
+	switch {
+	case value == "":
+		return fmt.Errorf("value must be non-empty")
+	case len(value) < runtimeAuthMinValueBytes:
+		return fmt.Errorf("value is too short (minimum %d bytes)", runtimeAuthMinValueBytes)
+	case len(value) > runtimeAuthMaxValueBytes:
+		return fmt.Errorf("value is too long (maximum %d bytes)", runtimeAuthMaxValueBytes)
+	case strings.IndexFunc(value, unicode.IsSpace) >= 0:
+		return fmt.Errorf("value must not contain whitespace")
+	case strings.ContainsRune(value, '\x00'):
+		return fmt.Errorf("value must not contain NUL")
+	default:
+		return nil
+	}
+}
+
+func writeRuntimeAuthFile(path string, values map[string]string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create runtime auth directory: %w", err)
+	}
+	var body strings.Builder
+	for _, name := range runtimeAuthEnvVars {
+		value, ok := values[name]
 		if !ok {
 			continue
 		}
-		key = strings.TrimSpace(key)
-		if recognized[key] && strings.TrimSpace(value) != "" {
-			out[key] = value
+		if err := validateRuntimeAuthValue(value); err != nil {
+			return fmt.Errorf("invalid %s: %w", name, err)
 		}
+		body.WriteString(name)
+		body.WriteByte('=')
+		body.WriteString(value)
+		body.WriteByte('\n')
 	}
-	return out
-}
-
-// writeDaemonRuntimeAuthFile writes vars as KEY=VALUE lines and enforces mode
-// 0600. It opens with O_CREATE|O_TRUNC and then explicitly Chmods, so an existing
-// file with looser permissions is re-secured (OpenFile does not change the mode
-// of a pre-existing file). Keys are emitted in daemonRuntimeAuthEnvVars order for
-// a stable file.
-func writeDaemonRuntimeAuthFile(path string, vars map[string]string) error {
-	var b strings.Builder
-	for _, name := range daemonRuntimeAuthEnvVars {
-		if value, ok := vars[name]; ok {
-			b.WriteString(name)
-			b.WriteString("=")
-			b.WriteString(value)
-			b.WriteString("\n")
-		}
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, daemonRuntimeAuthFilePerm)
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".runtime-auth-*.tmp")
 	if err != nil {
+		return fmt.Errorf("create runtime auth temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	fail := func(err error) error {
+		_ = tmp.Close()
 		return err
 	}
-	if _, err := f.WriteString(b.String()); err != nil {
-		f.Close()
-		return err
+	if _, err := tmp.WriteString(body.String()); err != nil {
+		return fail(fmt.Errorf("write runtime auth temp file: %w", err))
 	}
-	if err := f.Close(); err != nil {
-		return err
+	if err := tmp.Chmod(runtimeAuthFilePerm); err != nil {
+		return fail(fmt.Errorf("secure runtime auth temp file: %w", err))
 	}
-	// Re-assert 0600 in case the file pre-existed with looser bits or umask
-	// interfered: the mode is a security invariant, not an approximation.
-	if err := os.Chmod(path, daemonRuntimeAuthFilePerm); err != nil {
-		return fmt.Errorf("securing %s: %w", daemonRuntimeAuthFileName, err)
+	if err := tmp.Sync(); err != nil {
+		return fail(fmt.Errorf("sync runtime auth temp file: %w", err))
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close runtime auth temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("replace runtime auth file: %w", err)
+	}
+	if err := os.Chmod(path, runtimeAuthFilePerm); err != nil {
+		return fmt.Errorf("secure runtime auth file: %w", err)
 	}
 	return nil
+}
+
+// bootstrapRuntimeAuth performs the one-release transition only when the new
+// authoritative file is absent. Legacy persisted auth wins over ambient auth;
+// an existing runtime-auth.env is never rewritten from either source.
+func bootstrapRuntimeAuth(homeDir string, lookup func(string) (string, bool), logf func(string, ...any)) (bool, error) {
+	runtimeAuthBootstrapMu.Lock()
+	defer runtimeAuthBootstrapMu.Unlock()
+
+	path := runtimeAuthFilePath(homeDir)
+	if _, err := os.Stat(path); err == nil {
+		return false, nil
+	} else if !os.IsNotExist(err) {
+		return false, fmt.Errorf("inspect runtime auth file %s: %w", path, err)
+	}
+
+	legacy, exists, err := loadLegacyRuntimeAuthFile(legacyRuntimeAuthFilePath(homeDir))
+	if err != nil {
+		return false, err
+	}
+	if exists {
+		if err := writeRuntimeAuthFile(path, legacy); err != nil {
+			return false, err
+		}
+		if logf != nil {
+			logf("imported Claude runtime auth from legacy %s into %s", legacyRuntimeAuthFileName, runtimeAuthFileName)
+		}
+		return true, nil
+	}
+
+	ambient := collectRuntimeAuthEnv(lookup)
+	if len(ambient) == 0 {
+		return false, nil
+	}
+	if err := writeRuntimeAuthFile(path, ambient); err != nil {
+		return false, err
+	}
+	if logf != nil {
+		logf("seeded %s from ambient Claude auth environment", runtimeAuthFileName)
+	}
+	return true, nil
+}
+
+func loadLegacyRuntimeAuthFile(path string) (map[string]string, bool, error) {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("inspect legacy runtime auth file %s: %w", path, err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != runtimeAuthFilePerm {
+		return nil, true, fmt.Errorf("legacy runtime auth file %s must be a regular 0600 file", path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, true, fmt.Errorf("read legacy runtime auth file %s: %w", path, err)
+	}
+	values := map[string]string{}
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		name, value, ok := strings.Cut(line, "=")
+		name = strings.TrimSpace(name)
+		if !ok || !managedRuntimeAuthVar(name) || strings.TrimSpace(value) == "" {
+			continue
+		}
+		if err := validateRuntimeAuthValue(value); err != nil {
+			return nil, true, fmt.Errorf("legacy runtime auth file %s (%s): %w", path, name, err)
+		}
+		values[name] = value
+	}
+	return values, true, nil
+}
+
+// runtimeAuthInjectionEnv implements the blank-out rule. Once the authoritative
+// file selects at least one managed variable, all three names are appended; any
+// absent variable is explicitly empty so ambient Claude auth cannot outrank it.
+func runtimeAuthInjectionEnv(state runtimeAuthFile) []string {
+	if !state.Exists || len(state.Values) == 0 {
+		return nil
+	}
+	env := make([]string, 0, len(runtimeAuthEnvVars))
+	for _, name := range runtimeAuthEnvVars {
+		env = append(env, name+"="+state.Values[name])
+	}
+	return env
+}
+
+func runtimeAuthSource(state runtimeAuthFile, lookup func(string) (string, bool)) string {
+	if state.Exists && len(state.Values) > 0 {
+		return runtimeAuthFileName
+	}
+	ambient := collectRuntimeAuthEnv(lookup)
+	if len(ambient) > 0 {
+		if state.Exists {
+			return "ambient environment (runtime-auth.env explicitly empty)"
+		}
+		return "ambient environment"
+	}
+	if state.Exists {
+		return "Claude credential store (runtime-auth.env explicitly empty)"
+	}
+	return "Claude credential store"
+}
+
+func runtimeAuthEffectiveLookup(state runtimeAuthFile, ambient func(string) (string, bool)) func(string) (string, bool) {
+	if state.Exists && len(state.Values) > 0 {
+		return func(name string) (string, bool) {
+			value, ok := state.Values[name]
+			return value, ok
+		}
+	}
+	if ambient == nil {
+		return func(string) (string, bool) { return "", false }
+	}
+	return ambient
+}
+
+func warnRuntimeAuthConflicts(state runtimeAuthFile, lookup func(string) (string, bool), logf func(string, ...any)) {
+	if !state.Exists || len(state.Values) == 0 || lookup == nil || logf == nil {
+		return
+	}
+	var conflicts []string
+	for _, name := range runtimeAuthEnvVars {
+		fileValue, fileOK := state.Values[name]
+		ambientValue, ambientOK := lookup(name)
+		if fileOK && ambientOK && strings.TrimSpace(ambientValue) != "" && fileValue != ambientValue {
+			conflicts = append(conflicts, fmt.Sprintf("%s file=%s ambient=%s", name, maskedAuthFingerprint(fileValue), maskedAuthFingerprint(ambientValue)))
+		}
+	}
+	if len(conflicts) > 0 {
+		logf("WARNING: %s wins over conflicting ambient Claude auth: %s", runtimeAuthFileName, strings.Join(conflicts, "; "))
+	}
+}
+
+func maskedAuthFingerprint(value string) string {
+	runes := []rune(value)
+	if len(runes) > 12 {
+		return string(runes[:8]) + "..." + string(runes[len(runes)-4:])
+	}
+	sum := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("short(len=%d,sha256=%x)", len(runes), sum[:4])
 }

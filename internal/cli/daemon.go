@@ -29,7 +29,6 @@ import (
 	"github.com/jerryfane/gitmoot/internal/events"
 	gitutil "github.com/jerryfane/gitmoot/internal/git"
 	"github.com/jerryfane/gitmoot/internal/github"
-	"github.com/jerryfane/gitmoot/internal/presence"
 	"github.com/jerryfane/gitmoot/internal/runtime"
 	"github.com/jerryfane/gitmoot/internal/sandbox"
 	"github.com/jerryfane/gitmoot/internal/subprocess"
@@ -65,16 +64,13 @@ func printDaemonUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot daemon start [--repo owner/repo] [--poll 30s] [--workers 1 | --parallel N] [--scheduler barrier|pool] [--watch-skillopt-reviews] [--watch-issues]")
 	fmt.Fprintln(w, "  gitmoot daemon run [--repo owner/repo] [--poll 30s] [--workers 1 | --parallel N] [--scheduler barrier|pool] [--watch-skillopt-reviews] [--watch-issues]")
-	fmt.Fprintln(w, "  gitmoot daemon stop [--forget-runtime-auth]")
+	fmt.Fprintln(w, "  gitmoot daemon stop")
 	fmt.Fprintln(w, "  gitmoot daemon restart")
 	fmt.Fprintln(w, "  gitmoot daemon status")
 	fmt.Fprintln(w, "  gitmoot daemon logs")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "  --repo owner/repo SCOPES the daemon to a SINGLE repo: it polls only that repo's PRs and")
 	fmt.Fprintln(w, "  claims only that repo's queued jobs. Omit --repo to supervise ALL enabled registered repos.")
-	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "  --forget-runtime-auth (stop) deletes the persisted owner-only daemon-runtime.env so a later")
-	fmt.Fprintln(w, "  restart cannot recover the token; a plain restart still recovers it.")
 }
 
 func runDaemonStart(args []string, stdout, stderr io.Writer) int {
@@ -85,13 +81,10 @@ func runDaemonStartWithWorkDir(args []string, workDir string, stdout, stderr io.
 	return runDaemonStartWithWorkDirRestart(args, workDir, false, false, stdout, stderr)
 }
 
-// runDaemonStartWithWorkDirRestart is the shared (re)start body. restart selects
-// the auth-drop warning flavor (#559): a plain start warns that the new daemon
-// will come up without Claude auth; a restart warns that a previously-authed
-// daemon's auth will be LOST — but only when priorDaemonHadClaudeAuth confirms
-// the prior daemon actually had Claude auth (the caller inspects it before the
-// stop). When the prior state is unknown, the neutral plain-start wording is used.
-func runDaemonStartWithWorkDirRestart(args []string, workDir string, restart bool, priorDaemonHadClaudeAuth bool, stdout, stderr io.Writer) int {
+// runDaemonStartWithWorkDirRestart is the shared (re)start body. The legacy
+// restart parameters remain in the internal signature for existing callers, but
+// runtime auth is now loaded independently for every Claude adapter build.
+func runDaemonStartWithWorkDirRestart(args []string, workDir string, _ bool, _ bool, stdout, stderr io.Writer) int {
 	cfg, code := parseDaemonStartConfig("daemon start", args, stderr)
 	if code == daemonHelp {
 		return 0
@@ -141,36 +134,13 @@ func runDaemonStartWithWorkDirRestart(args []string, workDir string, restart boo
 		}
 	}
 
-	// Persist the runtime auth token present in this environment, and recover any
-	// the launching shell LACKS from the owner-only daemon-runtime.env, so a
-	// restart can't silently drop Claude auth (#578 — the #559 root cause; #581
-	// only warns). recoveredEnv is injected into the child so a restart from a
-	// token-less shell keeps auth automatically; when we recover it we suppress the
-	// #581 warning (there is no drop) and note the recovery instead.
-	if err := persistDaemonRuntimeAuth(paths.Home, claudeAuthEnvLookup); err != nil {
-		fmt.Fprintf(stderr, "daemon start: warning: could not persist runtime auth: %v\n", err)
-	}
-	// Recovery is RESTART-ONLY (#588): only an internal `daemon restart` — which
-	// tears the prior daemon down and re-inherits the launching shell's env — may
-	// recover the persisted token so a restart never silently drops Claude auth
-	// (the #559 root cause). A plain `daemon start` from a shell that deliberately
-	// unset the token must NOT resurrect the old persisted token; it warns instead
-	// (#581). Persistence above still runs on BOTH paths so the file stays fresh.
-	var recoveredEnv []string
-	if restart {
-		recoveredEnv = recoverDaemonChildAuthEnv(paths.Home, claudeAuthEnvLookup)
-	}
-	if len(recoveredEnv) > 0 {
-		writeLine(stdout, "recovered persisted runtime auth from %s (launching env lacked it)", daemonRuntimeAuthFileName)
-		// Do NOT fully suppress the #581 "no auth" signal (#588): the recovered
-		// token carries no expiry/validation metadata, so emit an INFORMATIONAL
-		// note that it may be STALE or REVOKED. The token VALUE is never printed.
-		noteRecoveredRuntimeAuthMayBeStale(stderr)
-	} else {
-		warnIfDaemonStartLosesClaudeAuth(stderr, restart, priorDaemonHadClaudeAuth)
+	if _, err := bootstrapRuntimeAuth(paths.Home, runtimeAuthEnvLookup, func(format string, args ...any) {
+		fmt.Fprintf(stderr, "daemon start: %s\n", fmt.Sprintf(format, args...))
+	}); err != nil {
+		fmt.Fprintf(stderr, "daemon start: warning: could not bootstrap runtime auth: %v\n", err)
 	}
 
-	started, err := startDaemonChildFn(cfg.Home, cfg.Poll.String(), cfg.Workers, cfg.WatchSkillOptReviews, cfg.WatchIssues, cfg.Scheduler, cfg.RepoFlag, cfg.Session, state, resolvedWorkDir, recoveredEnv)
+	started, err := startDaemonChildFn(cfg.Home, cfg.Poll.String(), cfg.Workers, cfg.WatchSkillOptReviews, cfg.WatchIssues, cfg.Scheduler, cfg.RepoFlag, cfg.Session, state, resolvedWorkDir)
 	if err != nil {
 		fmt.Fprintf(stderr, "daemon start: %v\n", err)
 		return 1
@@ -325,17 +295,13 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	}
 	defer releaseDaemonRunLock()
 
-	// Seed the persisted runtime-auth file from THIS process's inherited
-	// environment (#578). `daemon start` persists before spawning the child, but
-	// the production, systemd-managed daemon is launched DIRECTLY via `daemon run`
-	// (the unit's ExecStart, token from EnvironmentFile) and never goes through
-	// that path — so without this the file is never seeded in the primary
-	// deployment and the #559 recovery could not trigger there. Best-effort: a
-	// persist failure never blocks the daemon, and the token value never touches
-	// stdout/stderr (only the env-var name and file name are ever named).
+	// Bootstrap the authoritative runtime-auth file for direct systemd launches.
+	// Existing files are never overwritten; adapter builds reload the file.
 	if paths, err := initializedPaths(*home); err == nil {
-		if perr := persistDaemonRuntimeAuth(paths.Home, claudeAuthEnvLookup); perr != nil {
-			fmt.Fprintf(stderr, "daemon run: warning: could not persist runtime auth: %v\n", perr)
+		if _, bootstrapErr := bootstrapRuntimeAuth(paths.Home, runtimeAuthEnvLookup, func(format string, args ...any) {
+			fmt.Fprintf(stderr, "daemon run: %s\n", fmt.Sprintf(format, args...))
+		}); bootstrapErr != nil {
+			fmt.Fprintf(stderr, "daemon run: warning: could not bootstrap runtime auth: %v\n", bootstrapErr)
 		}
 	}
 
@@ -481,11 +447,6 @@ func runDaemonStop(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("daemon stop", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	// #588: opt-in teardown of the persisted 0600 daemon-runtime.env so a stopped
-	// daemon does not leave a recoverable token on disk. The INTERNAL restart's stop
-	// call must NOT pass this (it relies on recovery); only an explicit operator
-	// `daemon stop --forget-runtime-auth` forgets the token.
-	forgetRuntimeAuth := fs.Bool("forget-runtime-auth", false, "delete the persisted daemon runtime-auth file (daemon-runtime.env) after stopping")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -507,17 +468,6 @@ func runDaemonStop(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "daemon stop: %v\n", err)
 		return 1
 	}
-	forgetPersistedRuntimeAuth := func() {
-		if !*forgetRuntimeAuth {
-			return
-		}
-		path := daemonRuntimeAuthFilePath(paths.Home)
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			fmt.Fprintf(stderr, "daemon stop: warning: could not forget runtime auth: %v\n", err)
-			return
-		}
-		writeLine(stdout, "forgot persisted runtime auth (%s)", daemonRuntimeAuthFileName)
-	}
 	if stale || pid == 0 {
 		if stale {
 			writeLine(stdout, "removed stale daemon pid file")
@@ -528,15 +478,11 @@ func runDaemonStop(args []string, stdout, stderr io.Writer) int {
 		// the verified holder instead of lying "daemon not running", so `daemon
 		// restart` can actually terminate it.
 		if handled, code := stopUntrackedDaemonLockHolder(paths, stdout, stderr); handled {
-			if code == 0 {
-				forgetPersistedRuntimeAuth()
-			}
 			return code
 		}
 		if pid == 0 && !stale {
 			writeLine(stdout, "daemon not running")
 		}
-		forgetPersistedRuntimeAuth()
 		return 0
 	}
 	if err := stopDaemonPID(pid); err != nil {
@@ -545,7 +491,6 @@ func runDaemonStop(args []string, stdout, stderr io.Writer) int {
 	}
 	_ = os.Remove(state.PIDFile)
 	writeLine(stdout, "daemon stopped pid %d", pid)
-	forgetPersistedRuntimeAuth()
 	return 0
 }
 
@@ -597,14 +542,6 @@ func runDaemonRestart(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 	}
-	// Inspect the still-running daemon's ACTUAL Claude auth BEFORE stopping it, so
-	// the restart warning only claims a DROP when there is genuinely auth to lose
-	// (#559). This is the same mechanism `daemon status` uses; it degrades to
-	// Detected=false on a non-Linux/unreadable-/proc host, which correctly falls
-	// back to the neutral plain-start wording. Must run before runDaemonStop below,
-	// which tears the prior daemon down and makes its env unreadable.
-	priorAuth := presence.InspectDaemonClaudeAuth(paths)
-	priorDaemonHadClaudeAuth := priorAuth.Detected && priorAuth.Auth.Ready()
 	stopArgs := []string{}
 	if restartCfg.Home != "" {
 		stopArgs = append(stopArgs, "--home", restartCfg.Home)
@@ -613,69 +550,13 @@ func runDaemonRestart(args []string, stdout, stderr io.Writer) int {
 	if stopCode != 0 {
 		return stopCode
 	}
-	return runDaemonStartWithWorkDirRestart(targetArgs, targetWorkDir, true, priorDaemonHadClaudeAuth, stdout, stderr)
+	return runDaemonStartWithWorkDirRestart(targetArgs, targetWorkDir, true, false, stdout, stderr)
 }
-
-// claudeAuthEnvLookup predicts the environment the (re)started daemon child will
-// inherit. startDaemonChild launches the child with cmd.Env unset, so it inherits
-// THIS process's environment; the anti-footgun warning (#559) therefore inspects
-// that same environment BEFORE launch. It is a package var so tests can seed the
-// auth-readiness seam deterministically instead of depending on real host creds.
-var claudeAuthEnvLookup = os.LookupEnv
 
 // startDaemonChildFn is the daemon child-spawn indirection. It defaults to the
 // real startDaemonChild; tests swap it so the start/restart command body can be
 // driven end-to-end without launching an actual daemon process.
 var startDaemonChildFn = startDaemonChild
-
-// warnIfDaemonStartLosesClaudeAuth prints a prominent, non-fatal stderr warning
-// when the daemon about to (re)start will inherit an environment WITHOUT Claude
-// auth (#559). Because startDaemonChild does not set cmd.Env, the child inherits
-// this process's environment; a shell missing CLAUDE_CODE_OAUTH_TOKEN silently
-// disables Claude-runtime auth for ALL subscribed repos, discoverable only later
-// via `daemon status`. It only covers the Claude runtime (the one
-// InspectClaudeAuthEnv describes) and never refuses the start.
-//
-// The definite "this restart will DROP the auth the previous daemon had" wording
-// is only used when priorDaemonHadClaudeAuth is true — i.e. the caller confirmed,
-// by inspecting the still-running daemon's own environment BEFORE stopping it,
-// that there is genuinely auth to lose. On a Codex/Kimi-only box, or when the
-// prior daemon's env was unreadable (non-Linux/unreadable /proc), the prior state
-// is UNKNOWN and we fall back to the neutral plain-start wording rather than
-// asserting a loss that never happened.
-func warnIfDaemonStartLosesClaudeAuth(w io.Writer, restart bool, priorDaemonHadClaudeAuth bool) {
-	if runtime.InspectClaudeAuthEnv(claudeAuthEnvLookup).Ready() {
-		return
-	}
-	if restart && priorDaemonHadClaudeAuth {
-		fmt.Fprintln(w, "⚠️  WARNING: this restart will DROP Claude auth — the new daemon is being launched WITHOUT")
-		fmt.Fprintln(w, "    CLAUDE_CODE_OAUTH_TOKEN in this environment, so it will LOSE the auth the previous daemon had.")
-	} else {
-		fmt.Fprintln(w, "⚠️  WARNING: the daemon is starting WITHOUT Claude auth (CLAUDE_CODE_OAUTH_TOKEN is unset in")
-		fmt.Fprintln(w, "    this environment).")
-	}
-	fmt.Fprintln(w, "    Every Claude-runtime job across ALL subscribed repos will fail auth.")
-	fmt.Fprintln(w, "    Set the token in this shell before (re)starting, or run the daemon via its systemd service")
-	fmt.Fprintln(w, "    (which loads the token from its EnvironmentFile). See `gitmoot daemon status`.")
-}
-
-// noteRecoveredRuntimeAuthMayBeStale prints a NON-fatal INFORMATIONAL stderr note
-// (#588) after a restart recovers a persisted runtime-auth token from the 0600
-// daemon-runtime.env. Recovery keeps a token-less restart from silently dropping
-// Claude auth, but the persisted value carries NO expiry or validation metadata,
-// so it may be STALE or REVOKED. This deliberately does not fully suppress the
-// #581 "no auth" signal — it substitutes a softer note. The token VALUE is never
-// printed; only the fact of recovery and how to verify it. It points at
-// `gitmoot doctor` (a LIVE token probe) rather than `gitmoot daemon status`,
-// which only confirms a token is SET, not valid, and would still report a revoked
-// recovered token as "ok" — the exact silent-auth-failure class #559/#581/#588
-// set out to eliminate.
-func noteRecoveredRuntimeAuthMayBeStale(w io.Writer) {
-	fmt.Fprintln(w, "ℹ️  NOTE: the recovered Claude auth token was restored from persisted state and has NO")
-	fmt.Fprintln(w, "    expiry/validation metadata — it may be STALE or REVOKED. `gitmoot daemon status` only")
-	fmt.Fprintln(w, "    confirms a token is PRESENT, not that it is valid; run `gitmoot doctor` for a live")
-	fmt.Fprintln(w, "    validity probe that surfaces a revoked token.")
-}
 
 func runDaemonStatus(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("daemon status", flag.ContinueOnError)
@@ -961,20 +842,22 @@ func daemonAdmissionLine(paths config.Paths) string {
 	return fmt.Sprintf("admission budget: max_concurrent_sessions=%s max_memory_gb=%s", sessions, memory)
 }
 
-// daemonClaudeAuthLine reports the running daemon's Claude background-auth state
-// for `gitmoot daemon status` (#427). It is best-effort and OS-gated: when the
-// daemon's environment can't be read (non-Linux, hardened /proc) it says so
-// rather than implying the daemon is unauthenticated. Secrets are never printed
-// — only the masked set/unset booleans.
+// daemonClaudeAuthLine reports the authoritative per-delivery Claude auth source.
+// It never inspects the daemon process environment because adapter builds reload
+// runtime-auth.env independently of daemon lifetime.
 func daemonClaudeAuthLine(paths config.Paths) string {
-	daemon := presence.InspectDaemonClaudeAuth(paths)
-	if !daemon.Detected {
-		return "claude auth: unknown (daemon environment not readable on this host)"
+	state, err := loadRuntimeAuthFile(paths.Home)
+	if err != nil {
+		return "claude auth: warn (" + err.Error() + ")"
 	}
-	if daemon.Auth.Ready() {
-		return "claude auth: ok (" + daemon.Auth.MaskedDetail() + ")"
+	if state.Exists && len(state.Values) > 0 {
+		auth := runtime.InspectClaudeAuthEnv(runtimeAuthEffectiveLookup(state, nil))
+		return "claude auth: configured via " + runtimeAuthFileName + " (" + auth.MaskedDetail() + ")"
 	}
-	return "claude auth: warn (" + daemon.Auth.MaskedDetail() + "); " + runtime.ClaudeBackgroundTokenMessage
+	if state.Exists {
+		return "claude auth: fallback (runtime-auth.env explicitly empty); verify with `gitmoot auth probe claude`"
+	}
+	return "claude auth: fallback (runtime-auth.env missing); configure with `gitmoot auth set claude`"
 }
 
 func runDaemonLogs(args []string, stdout, stderr io.Writer) int {
@@ -1668,7 +1551,7 @@ func currentDaemonPID(state daemonState) (pid int, stale bool, err error) {
 	return pid, false, nil
 }
 
-func startDaemonChild(home string, poll string, workers int, watchSkillOptReviews bool, watchIssues bool, scheduler string, repo string, session string, state daemonState, workDir string, extraEnv []string) (daemonMeta, error) {
+func startDaemonChild(home string, poll string, workers int, watchSkillOptReviews bool, watchIssues bool, scheduler string, repo string, session string, state daemonState, workDir string) (daemonMeta, error) {
 	executable, err := os.Executable()
 	if err != nil {
 		return daemonMeta{}, err
@@ -1683,14 +1566,6 @@ func startDaemonChild(home string, poll string, workers int, watchSkillOptReview
 	cmd.Dir = workDir
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
-	// By default the child inherits THIS process's environment (cmd.Env unset).
-	// When extraEnv carries runtime auth recovered from the persisted 0600 file
-	// (#578), start from the current environ and append it so the restarted daemon
-	// keeps auth even though the launching shell lacked the token. The token is
-	// never written to args/meta/log — only to the child's live environment.
-	if len(extraEnv) > 0 {
-		cmd.Env = append(os.Environ(), extraEnv...)
-	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		return daemonMeta{}, err
@@ -4268,11 +4143,9 @@ func warnSerializedParallelJobs(ctx context.Context, worker jobWorker, limit int
 	writeLine(worker.Stdout, "         %s", daemonRestartEnvCaveat)
 }
 
-// daemonRestartEnvCaveat is the anti-footgun caveat (#559) appended to the
-// serialized-jobs relaunch hint: a `daemon restart` re-inherits the launching
-// shell's environment, so runtime tokens must be present in that shell or the
-// daemon loses auth, and it resets in-flight scheduler state.
-const daemonRestartEnvCaveat = "note: a restart RE-INHERITS the launching shell's environment (ensure runtime tokens like CLAUDE_CODE_OAUTH_TOKEN are set in that shell, or the daemon loses auth) and resets in-flight scheduler state."
+// daemonRestartEnvCaveat is appended to the serialized-jobs relaunch hint.
+// Runtime auth reloads per delivery; only scheduler state is restart-sensitive.
+const daemonRestartEnvCaveat = "note: Claude runtime auth is read per delivery from runtime-auth.env and does not require a restart; a restart resets in-flight scheduler state."
 
 // listPendingQueuedJobs returns the queued jobs eligible to run for this
 // repo/session filter, dropping children of a killed root.

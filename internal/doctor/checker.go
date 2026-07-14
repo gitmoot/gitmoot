@@ -24,6 +24,14 @@ type Check struct {
 type Checker struct {
 	Dir    string
 	Runner subprocess.Runner
+	// ClaudeProbeRunner and ClaudeAuthLookup let the one-shot CLI doctor probe
+	// the exact environment used for Claude deliveries. Other callers leave
+	// these unset and retain the inexpensive ambient-presence behavior.
+	ClaudeProbeRunner subprocess.Runner
+	ClaudeAuthLookup  func(string) (string, bool)
+	ClaudeAuthSource  string
+	ClaudeAuthError   error
+	SkipDaemonAuth    bool
 	// LiveProbe opts the claude auth check into a live `claude -p` probe when the
 	// auth env is not Ready, instead of false-reporting OK:false on a cached-creds
 	// box. It is opt-in because GlobalChecks is re-run on every dashboard refresh
@@ -63,8 +71,10 @@ func (c Checker) GlobalChecks(ctx context.Context) []Check {
 	// state first when it can be detected (issue #427). The shell-local check
 	// follows, clearly labeled, so a warn in a terminal can't be mistaken for "the
 	// daemon is broken".
-	if daemon, ok := c.claudeAuthDaemon(ctx); ok {
-		checks = append(checks, daemon)
+	if !c.SkipDaemonAuth {
+		if daemon, ok := c.claudeAuthDaemon(ctx); ok {
+			checks = append(checks, daemon)
+		}
 	}
 	checks = append(checks, c.claudeAuthEnv(ctx), c.ghAuth(ctx, runner))
 	return checks
@@ -229,8 +239,19 @@ func claudeAuthDaemonCheck(daemon presence.DaemonAuthSnapshot) (Check, bool) {
 }
 
 func (c Checker) claudeAuthEnv(ctx context.Context) Check {
-	auth := runtime.InspectClaudeAuthEnv(os.LookupEnv)
-	masked := claudeShellAuthLabel + ": " + auth.MaskedDetail()
+	lookup := c.ClaudeAuthLookup
+	if lookup == nil {
+		lookup = os.LookupEnv
+	}
+	source := strings.TrimSpace(c.ClaudeAuthSource)
+	if source == "" {
+		source = claudeShellAuthLabel
+	}
+	if c.ClaudeAuthError != nil {
+		return Check{Name: "claude auth", Required: false, Detail: source + ": " + c.ClaudeAuthError.Error()}
+	}
+	auth := runtime.InspectClaudeAuthEnv(lookup)
+	masked := source + ": " + auth.MaskedDetail()
 	withWarn := func(detail string) string {
 		if warning := auth.Warning(); warning != "" {
 			return detail + "; " + warning
@@ -250,7 +271,11 @@ func (c Checker) claudeAuthEnv(ctx context.Context) Check {
 	// ok. Probe the real dependency (a fresh `claude -p`, the same non-interactive
 	// path daemon jobs take) and distinguish valid / invalid / unknown. The probe
 	// also covers the cached-creds case (no env token) it always did.
-	probeErr := runtime.ClaudeLiveCheck(ctx, c.runner(), "")
+	probeRunner := c.ClaudeProbeRunner
+	if probeRunner == nil {
+		probeRunner = c.runner()
+	}
+	probeErr := runtime.ClaudeLiveCheckEnv(ctx, probeRunner, "", nil)
 	return claudeProbeCheck("claude auth", masked, runtime.ClaudeBackgroundTokenMessage, auth.Ready(), probeErr)
 }
 

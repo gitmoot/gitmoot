@@ -13,6 +13,7 @@ import (
 	"github.com/jerryfane/gitmoot/internal/config"
 	"github.com/jerryfane/gitmoot/internal/db"
 	"github.com/jerryfane/gitmoot/internal/doctor"
+	"github.com/jerryfane/gitmoot/internal/runtime"
 )
 
 type command struct {
@@ -27,6 +28,7 @@ var rootCommands = []command{
 	{name: "doctor", summary: "check local Gitmoot prerequisites", run: runDoctor},
 	{name: "version", summary: "show Gitmoot version and build metadata", run: runVersion},
 	{name: "config", summary: "show local Gitmoot config paths", run: runConfig},
+	{name: "auth", summary: "manage runtime authentication", run: runAuth},
 	{name: "update", summary: "check for and apply Gitmoot releases", run: runUpdate},
 	{name: "setup", summary: "register a repo and initial agent", run: runSetup},
 	{name: "repo", summary: "manage watched repositories", run: runRepo},
@@ -150,7 +152,18 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	// locate the running daemon. A failure here (no initialized home) just leaves
 	// Paths zero, which skips the daemon check and keeps the shell-local one.
 	paths, _ := config.DefaultPaths()
-	checks := doctor.Checker{Dir: *repoDir, LiveProbe: true, Paths: paths}.Run(context.Background())
+	probeRunner, authState, authSource, authErr := runtimeJobRunnerWithAuth("", runtime.ClaudeRuntime, nil)
+	checker := doctor.Checker{
+		Dir:               *repoDir,
+		LiveProbe:         true,
+		Paths:             paths,
+		ClaudeProbeRunner: probeRunner,
+		ClaudeAuthLookup:  runtimeAuthEffectiveLookup(authState, runtimeAuthEnvLookup),
+		ClaudeAuthSource:  authSource,
+		ClaudeAuthError:   authErr,
+		SkipDaemonAuth:    true,
+	}
+	checks := checker.Run(context.Background())
 	// #631: surface a stale backlog of blocked jobs (each paused awaiting a human)
 	// so an operator knows they can be bulk-dismissed. Best-effort and appended to
 	// both the text table and the --json array; the dashboard's cheaper

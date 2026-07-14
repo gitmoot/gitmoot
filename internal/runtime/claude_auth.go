@@ -30,8 +30,8 @@ const (
 	ClaudeConfigDirEnv = "CLAUDE_CONFIG_DIR"
 	// ClaudeBackgroundTokenMessage is the warn-path caveat: foreground Claude
 	// authenticates fine via cached credentials, but daemon background jobs run
-	// non-interactively and need an explicit token in the daemon env.
-	ClaudeBackgroundTokenMessage = "Foreground Claude works via cached credentials, but daemon background jobs run non-interactively and need a token in the daemon env. Run: claude setup-token; export CLAUDE_CODE_OAUTH_TOKEN=<token>; then restart the Gitmoot daemon from that same shell so it inherits the token. export is per-shell, so persist the token in ~/.bashrc (interactive non-login terminals read it; on Debian/Raspberry Pi OS ~/.profile is login-only and itself sources ~/.bashrc). For a daemon that does not depend on which shell launched it, run it under `systemd --user` with an EnvironmentFile."
+	// non-interactively and need managed runtime auth.
+	ClaudeBackgroundTokenMessage = "Foreground Claude works via cached credentials, but daemon background jobs run non-interactively and need managed runtime auth. Create a long-lived token with `claude setup-token`, then run `gitmoot auth set claude`; rotation is observed on the next delivery without restarting the daemon."
 	// ClaudeSessionAuthFailedMessage is the failure-path message: a genuine
 	// authentication/session failure (the cached session is expired or the
 	// --resume target is dead) that needs re-authentication and a fresh bind.

@@ -252,13 +252,11 @@ failure followed by a success):
   concurrency is retried with backoff without abandoning the session
   (#487/#509).
 
-Daemon restarts and Claude auth: the daemon persists its Claude token into an
-owner-only (0600) `daemon-runtime.env` file in the Gitmoot home (#578/#588).
-`gitmoot daemon restart` recovers that token even when the invoking shell lacks
-`CLAUDE_CODE_OAUTH_TOKEN`; a plain `stop` + `start` re-inherits the launching
-shell's environment (and warns loudly when that would come up auth-less). A
-recovered token may be stale — verify with `gitmoot doctor`. `gitmoot daemon
-stop --forget-runtime-auth` deletes the persisted file.
+Claude auth is read from owner-only (0600) `runtime-auth.env` for every adapter
+build. Rotate it with `gitmoot auth set claude`; no daemon restart is needed.
+Use `gitmoot auth status` for masked source details and `gitmoot auth probe
+claude` (or `gitmoot doctor`) for a live check. Clear it with `gitmoot auth
+unset claude`, not by deleting the file.
 
 ## Repo Remotes
 

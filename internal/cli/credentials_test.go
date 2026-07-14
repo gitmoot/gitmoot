@@ -158,6 +158,149 @@ func TestRuntimeJobRunnerComposesWrappersAboveCuratedBase(t *testing.T) {
 	}
 }
 
+func TestRuntimeJobRunnerClaudeAuthInjectionCurationOnAndOff(t *testing.T) {
+	for _, curation := range []bool{false, true} {
+		t.Run(fmt.Sprintf("curation-%t", curation), func(t *testing.T) {
+			home := t.TempDir()
+			paths := config.PathsForHome(home)
+			if err := config.Initialize(paths); err != nil {
+				t.Fatal(err)
+			}
+			if curation {
+				body := config.DefaultConfig(paths) + "\n[credentials]\nenv_curation = true\n"
+				if err := os.WriteFile(paths.ConfigFile, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := writeRuntimeAuthFile(runtimeAuthFilePath(paths.Home), map[string]string{
+				runtime.ClaudeOAuthTokenEnv: testOAuthToken,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv(runtime.ClaudeOAuthTokenEnv, "sk-ant-oat01-ambient-token-abcdefghijklmnopqrstuvwxyz")
+			t.Setenv(runtime.AnthropicAPIKeyEnv, testAPIKey)
+			t.Setenv(runtime.AnthropicAuthTokenEnv, testAuthToken)
+
+			runner, err := runtimeJobRunner(home, runtime.ClaudeRuntime, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			base, ok := runner.(subprocess.CuratedGroupRunner)
+			if !ok {
+				t.Fatalf("runner = %T", runner)
+			}
+			got := effectiveEnv(base.BaseEnv)
+			if got[runtime.ClaudeOAuthTokenEnv] != testOAuthToken {
+				t.Fatalf("OAuth = %q", got[runtime.ClaudeOAuthTokenEnv])
+			}
+			if got[runtime.AnthropicAPIKeyEnv] != "" || got[runtime.AnthropicAuthTokenEnv] != "" {
+				t.Fatalf("blank-out failed: api=%q auth=%q", got[runtime.AnthropicAPIKeyEnv], got[runtime.AnthropicAuthTokenEnv])
+			}
+		})
+	}
+}
+
+func TestRuntimeJobRunnerClaudeAuthNoInjectionStatesAndFailures(t *testing.T) {
+	clearAmbient := func(t *testing.T) {
+		t.Helper()
+		for _, name := range runtimeAuthEnvVars {
+			t.Setenv(name, "")
+		}
+	}
+	t.Run("explicit empty", func(t *testing.T) {
+		clearAmbient(t)
+		home := t.TempDir()
+		paths := config.PathsForHome(home)
+		if err := config.Initialize(paths); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeRuntimeAuthFile(runtimeAuthFilePath(paths.Home), nil); err != nil {
+			t.Fatal(err)
+		}
+		runner, err := runtimeJobRunner(home, runtime.ClaudeRuntime, nil)
+		if err != nil || runner != nil {
+			t.Fatalf("runner=%T err=%v", runner, err)
+		}
+	})
+	t.Run("missing", func(t *testing.T) {
+		clearAmbient(t)
+		home := t.TempDir()
+		if err := config.Initialize(config.PathsForHome(home)); err != nil {
+			t.Fatal(err)
+		}
+		runner, err := runtimeJobRunner(home, runtime.ClaudeRuntime, nil)
+		if err != nil || runner != nil {
+			t.Fatalf("runner=%T err=%v", runner, err)
+		}
+	})
+	for _, test := range []struct {
+		name string
+		body string
+		mode os.FileMode
+	}{
+		{name: "malformed", body: "BAD=value\n", mode: 0o600},
+		{name: "permissions", body: runtime.ClaudeOAuthTokenEnv + "=" + testOAuthToken + "\n", mode: 0o644},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clearAmbient(t)
+			home := t.TempDir()
+			paths := config.PathsForHome(home)
+			if err := config.Initialize(paths); err != nil {
+				t.Fatal(err)
+			}
+			path := runtimeAuthFilePath(paths.Home)
+			if err := os.WriteFile(path, []byte(test.body), test.mode); err != nil {
+				t.Fatal(err)
+			}
+			_, err := runtimeJobRunner(home, runtime.ClaudeRuntime, nil)
+			if err == nil || !strings.Contains(err.Error(), path) {
+				t.Fatalf("error = %v", err)
+			}
+			if other, err := runtimeJobRunner(home, runtime.ShellRuntime, nil); err != nil || other != nil {
+				t.Fatalf("non-Claude runner=%T err=%v", other, err)
+			}
+		})
+	}
+}
+
+func TestRuntimeJobRunnerClaudeAuthRemainsBelowWrapperEnvironment(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeRuntimeAuthFile(runtimeAuthFilePath(paths.Home), map[string]string{
+		runtime.ClaudeOAuthTokenEnv: testOAuthToken,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runner, err := runtimeJobRunner(home, runtime.ClaudeRuntime, subprocess.EnvInjectingRunner{Env: []string{
+		runtime.ClaudeConfigDirEnv + "=/wrapper-config",
+		"GITMOOT_CHAT_RELAY=/relay.sock",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runner.Run(context.Background(), "", "sh", "-c", `printf '%s|%s|%s|%s' "$CLAUDE_CODE_OAUTH_TOKEN" "$ANTHROPIC_API_KEY" "$CLAUDE_CONFIG_DIR" "$GITMOOT_CHAT_RELAY"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Stdout != testOAuthToken+"||/wrapper-config|/relay.sock" {
+		t.Fatalf("wrapper ordering output = %q", result.Stdout)
+	}
+}
+
+func effectiveEnv(entries []string) map[string]string {
+	values := map[string]string{}
+	for _, entry := range entries {
+		name, value, ok := strings.Cut(entry, "=")
+		if ok {
+			values[name] = value
+		}
+	}
+	return values
+}
+
 func removeCuratedRunnerScratch(runner subprocess.Runner) {
 	switch runner := runner.(type) {
 	case subprocess.CuratedGroupRunner:

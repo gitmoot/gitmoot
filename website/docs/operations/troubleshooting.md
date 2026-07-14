@@ -220,11 +220,10 @@ coordinator job itself. Restart it without `--repo`/`--session` to drain
 unrelated jobs.
 Also check the repo is enabled in `gitmoot repo list`.
 
-To restart the daemon without losing its Claude token, use `gitmoot daemon
-restart` — it recovers the token persisted in the owner-only
-`daemon-runtime.env` file, while a plain `stop` + `start` re-inherits the
-launching shell's environment (and warns loudly on stderr when that would come
-up auth-less). Verify runtime auth with `gitmoot doctor` afterwards.
+Claude auth is independent of daemon restarts. Rotate the owner-only
+`runtime-auth.env` with `gitmoot auth set claude`; the next delivery observes
+it. Inspect masked sources with `gitmoot auth status` and validate them with
+`gitmoot auth probe claude` or `gitmoot doctor`.
 
 ## Daemon Already Running
 
