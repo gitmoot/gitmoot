@@ -35,6 +35,14 @@ curl -fsS https://gitmoot.io/llms.txt | rg 'SkillOpt|Dashboard|Release Notes'
 curl -fsS https://gitmoot.io/llms-full.txt | rg 'skillopt-train-workflow|CLI.md|release-notes'
 ```
 
+## Daemon Restart Call Spike
+
+The repository polling ETag cache is process memory. After deploying a new
+binary and restarting the daemon, expect one unconditional sweep of enabled
+repos while that cache warms; the following sweeps send `If-None-Match` and
+normally receive quota-free 304 responses for unchanged repositories. Account
+for that one-sweep REST-call spike when restarting near a GitHub quota limit.
+
 ```mermaid
 flowchart LR
   Source[website/docs] --> Build[Docusaurus build]

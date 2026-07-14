@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jerryfane/gitmoot/internal/config"
+	"github.com/jerryfane/gitmoot/internal/github"
 )
 
 // daemonReloadableConfig holds the daemon's live, WARM-reloadable runtime settings
@@ -27,14 +28,22 @@ import (
 // re-dispatched per tick, so a changed value takes effect on the next iteration while
 // everything in flight completes untouched.
 type daemonReloadableConfig struct {
-	mu      sync.Mutex
-	poll    time.Duration
-	workers int
-	usePool bool
+	mu                sync.Mutex
+	poll              time.Duration
+	workers           int
+	usePool           bool
+	idleGraceTicks    int
+	idleMaxMultiplier int
 }
 
 func newDaemonReloadableConfig(poll time.Duration, workers int, usePool bool) *daemonReloadableConfig {
-	return &daemonReloadableConfig{poll: poll, workers: workers, usePool: usePool}
+	return &daemonReloadableConfig{
+		poll:              poll,
+		workers:           workers,
+		usePool:           usePool,
+		idleGraceTicks:    config.DefaultDaemonIdleGraceTicks,
+		idleMaxMultiplier: config.DefaultDaemonIdleMaxMultiplier,
+	}
 }
 
 // snapshot returns the current live settings atomically. Supervisor loops call it
@@ -51,6 +60,12 @@ func (c *daemonReloadableConfig) pollInterval() time.Duration {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.poll
+}
+
+func (c *daemonReloadableConfig) idleCadence() (graceTicks int, maxMultiplier int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.idleGraceTicks, c.idleMaxMultiplier
 }
 
 func schedulerName(usePool bool) string {
@@ -81,6 +96,14 @@ func (c *daemonReloadableConfig) applyStart(next config.DaemonRuntimeConfig, exp
 	if next.SchedulerSet && !explicitScheduler {
 		c.usePool = next.Scheduler == "pool"
 		applied = append(applied, "scheduler="+next.Scheduler)
+	}
+	if next.IdleGraceTicksSet {
+		c.idleGraceTicks = next.IdleGraceTicks
+		applied = append(applied, fmt.Sprintf("idle_grace_ticks=%d", next.IdleGraceTicks))
+	}
+	if next.IdleMaxMultiplierSet {
+		c.idleMaxMultiplier = next.IdleMaxMultiplier
+		applied = append(applied, fmt.Sprintf("idle_max_multiplier=%d", next.IdleMaxMultiplier))
 	}
 	return strings.Join(applied, ", ")
 }
@@ -119,6 +142,20 @@ func (c *daemonReloadableConfig) apply(next config.DaemonRuntimeConfig) string {
 			c.usePool = usePool
 		}
 	}
+	if next.IdleGraceTicksSet {
+		reread = append(reread, fmt.Sprintf("idle_grace_ticks=%d", next.IdleGraceTicks))
+		if next.IdleGraceTicks != c.idleGraceTicks {
+			changed = append(changed, fmt.Sprintf("idle_grace_ticks %d->%d", c.idleGraceTicks, next.IdleGraceTicks))
+			c.idleGraceTicks = next.IdleGraceTicks
+		}
+	}
+	if next.IdleMaxMultiplierSet {
+		reread = append(reread, fmt.Sprintf("idle_max_multiplier=%d", next.IdleMaxMultiplier))
+		if next.IdleMaxMultiplier != c.idleMaxMultiplier {
+			changed = append(changed, fmt.Sprintf("idle_max_multiplier %d->%d", c.idleMaxMultiplier, next.IdleMaxMultiplier))
+			c.idleMaxMultiplier = next.IdleMaxMultiplier
+		}
+	}
 	if len(reread) == 0 {
 		return "no [daemon] settings found; nothing to reload"
 	}
@@ -137,9 +174,15 @@ func reloadDaemonConfig(paths config.Paths, live *daemonReloadableConfig, stdout
 	next, err := config.LoadDaemonRuntimeConfig(paths)
 	if err != nil {
 		writeLine(stdout, "daemon reload (SIGHUP): config error, keeping current settings: %v", err)
+	} else {
+		writeLine(stdout, "daemon reload (SIGHUP): %s", live.apply(next))
+	}
+	policy, githubErr := config.LoadGitHubLimiterPolicy(paths)
+	if githubErr != nil {
+		writeLine(stdout, "daemon reload (SIGHUP): [github] config error, keeping conditional_requests unchanged: %v", githubErr)
 		return
 	}
-	writeLine(stdout, "daemon reload (SIGHUP): %s", live.apply(next))
+	github.ConfigureConditional(policy.ConditionalRequests)
 }
 
 // installDaemonReloadHandler wires SIGHUP to a warm config reload for the lifetime of

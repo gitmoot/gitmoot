@@ -31,11 +31,12 @@ import (
 type RateLimiter struct {
 	mu sync.Mutex
 
-	maxConcurrent  int
-	minInterval    time.Duration
-	backoffEnabled bool
-	baseBackoff    time.Duration
-	maxBackoff     time.Duration
+	maxConcurrent    int
+	minInterval      time.Duration
+	backoffEnabled   bool
+	baseBackoff      time.Duration
+	maxBackoff       time.Duration
+	callsPerHourWarn int
 
 	// sem is the concurrency semaphore; nil when maxConcurrent <= 0 (unlimited).
 	sem chan struct{}
@@ -52,6 +53,10 @@ type RateLimiter struct {
 	// secondaryHits is a lifetime counter of observed secondary-limit failures,
 	// surfaced by Snapshot for observability.
 	secondaryHits int
+	// callTimes is a sliding daemon-local window of gh calls made through this
+	// limiter. It is accounting only: calls are never rejected at the threshold.
+	callTimes   []time.Time
+	callsWarned bool
 
 	now   func() time.Time
 	sleep func(context.Context, time.Duration) error
@@ -99,6 +104,9 @@ type RateLimiterConfig struct {
 	// constants.
 	BaseBackoff time.Duration
 	MaxBackoff  time.Duration
+	// CallsPerHourWarn logs once when the sliding one-hour call count reaches this
+	// threshold. 0 disables the warning; it never gates calls.
+	CallsPerHourWarn int
 
 	// Now / Sleep / Logf are optional injection seams (tests supply a fake clock and
 	// capture logs). Nil values fall back to the real clock, a ctx-aware sleep, and a
@@ -123,14 +131,15 @@ func NewRateLimiter(cfg RateLimiterConfig) *RateLimiter {
 		max = base
 	}
 	l := &RateLimiter{
-		maxConcurrent:  cfg.MaxConcurrent,
-		minInterval:    cfg.MinInterval,
-		backoffEnabled: cfg.BackoffEnabled,
-		baseBackoff:    base,
-		maxBackoff:     max,
-		now:            cfg.Now,
-		sleep:          cfg.Sleep,
-		logf:           cfg.Logf,
+		maxConcurrent:    cfg.MaxConcurrent,
+		minInterval:      cfg.MinInterval,
+		backoffEnabled:   cfg.BackoffEnabled,
+		baseBackoff:      base,
+		maxBackoff:       max,
+		callsPerHourWarn: cfg.CallsPerHourWarn,
+		now:              cfg.Now,
+		sleep:            cfg.Sleep,
+		logf:             cfg.Logf,
 	}
 	if l.maxConcurrent > 0 {
 		l.sem = make(chan struct{}, l.maxConcurrent)
@@ -145,6 +154,37 @@ func NewRateLimiter(cfg RateLimiterConfig) *RateLimiter {
 		l.logf = func(string, ...any) {}
 	}
 	return l
+}
+
+// NoteCall records one admitted gh invocation in the sliding one-hour window.
+// It is observability-only and never delays or rejects the call.
+func (l *RateLimiter) NoteCall() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	l.pruneCallsLocked(now)
+	l.callTimes = append(l.callTimes, now)
+	if l.callsPerHourWarn > 0 && len(l.callTimes) >= l.callsPerHourWarn && !l.callsWarned {
+		l.callsWarned = true
+		l.logf("github: %d calls in the last hour reached calls_per_hour_warn=%d (daemon-local approximate count)", len(l.callTimes), l.callsPerHourWarn)
+	}
+}
+
+func (l *RateLimiter) pruneCallsLocked(now time.Time) {
+	cutoff := now.Add(-time.Hour)
+	first := 0
+	for first < len(l.callTimes) && l.callTimes[first].Before(cutoff) {
+		first++
+	}
+	if first > 0 {
+		l.callTimes = append([]time.Time(nil), l.callTimes[first:]...)
+	}
+	if l.callsPerHourWarn <= 0 || len(l.callTimes) < l.callsPerHourWarn {
+		l.callsWarned = false
+	}
 }
 
 // DefaultRateLimiter returns the inert limiter used before any ConfigureDefault:
@@ -318,6 +358,7 @@ type RateLimiterState struct {
 	InBackoff        bool
 	BackoffRemaining time.Duration
 	SecondaryHits    int
+	CallsInLastHour  int
 }
 
 // Snapshot returns the limiter's current configuration and live backoff state.
@@ -327,11 +368,13 @@ func (l *RateLimiter) Snapshot() RateLimiterState {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.pruneCallsLocked(l.now())
 	state := RateLimiterState{
-		MaxConcurrent:  l.maxConcurrent,
-		MinInterval:    l.minInterval,
-		BackoffEnabled: l.backoffEnabled,
-		SecondaryHits:  l.secondaryHits,
+		MaxConcurrent:   l.maxConcurrent,
+		MinInterval:     l.minInterval,
+		BackoffEnabled:  l.backoffEnabled,
+		SecondaryHits:   l.secondaryHits,
+		CallsInLastHour: len(l.callTimes),
 	}
 	if l.backoffEnabled {
 		if remaining := l.backoffUntil.Sub(l.now()); remaining > 0 {

@@ -207,8 +207,10 @@ only declared data paths, the disposable workdir, and temp roots are writable.
 ```sh
 gitmoot status --repo owner/repo
 gitmoot events --repo owner/repo
-gitmoot repo add owner/repo --path <path> [--poll 30s]
+gitmoot repo add owner/repo --path <path> [--poll <duration>]
 gitmoot repo list
+gitmoot repo set-interval owner/repo (<duration>|default)
+gitmoot repo set-interval --all (<duration>|default)
 gitmoot repo remove owner/repo
 gitmoot repo doctor owner/repo
 gitmoot daemon start --poll 30s --workers 1
@@ -225,9 +227,13 @@ For structured local state, use `gitmoot dashboard --json` or
 `gitmoot task show` are not valid commands.
 
 The `gitmoot repo` commands manage the **watched-repo registry**: one daemon
-per Gitmoot home supervises every **enabled** registered repo (each with its
-own `--poll` interval). `repo doctor owner/repo` checks a single repo's
-checkout/config health.
+per Gitmoot home supervises every **enabled** registered repo. An omitted
+`repo add --poll` stores the `inherit` sentinel, so the repo follows the daemon's
+resolved `--poll` / `[daemon].poll` cadence; an explicit `--poll` stores a
+per-repo override. `repo list` renders the sentinel as `inherit`.
+`repo set-interval owner/repo <duration>` changes an override, `default` restores
+inheritance, and `--all` applies either value to every registered repo.
+`repo doctor owner/repo` checks a single repo's checkout/config health.
 
 Use `daemon start` for the background daemon. Use `daemon run` only when the
 user explicitly wants a foreground process. Keep the default `--workers 1`
@@ -281,7 +287,7 @@ keys are re-read every tick, so edits apply live.
 
 Reconfigure the running daemon without a restart: `kill -HUP <daemon-pid>`
 re-reads the `[daemon]` config section (`poll`, `workers`, `scheduler`,
-parallelism) live (#577) — no teardown, no dropped jobs, no environment
+parallelism, `idle_grace_ticks`, `idle_max_multiplier`) live (#577) — no teardown, no dropped jobs, no environment
 re-inheritance. Values pinned by explicit launch flags win over the re-read
 config. Prefer SIGHUP over a restart when only tuning throughput.
 
@@ -317,12 +323,25 @@ else exponential backoff) instead of retry-storming the abuse detector. Knobs:
 `min_interval` spaces successive call starts (0 = off; accepts a Go duration or a
 bare integer of seconds), `secondary_backoff` toggles the reactive pause (default
 `true`), and `backoff_base`/`backoff_max` bound the exponential fallback
-(defaults `60s`/`5m`). **Safe defaults:** the proactive caps are off (single-call
+(defaults `60s`/`5m`). `conditional_requests` defaults to `true` and adds ETag
+validators to the four per-tick polling reads; a `304 Not Modified` replays the
+cached raw response at zero GitHub quota cost. `calls_per_hour_warn` defaults to
+`0` (off) and logs when this daemon process crosses the configured sliding-hour
+count. The count is approximate and daemon-local: foreground commands and
+agent-owned `gh` processes are outside it. **Safe defaults:** the proactive caps are off (single-call
 latency and steady-state throughput unchanged) and only the invisible reactive
 backoff is on. Set `max_concurrent` (e.g. `6`) and/or a small `min_interval`
 (e.g. `250ms`) to also smooth bursts proactively on a busy host. Calls are never
 dropped — they queue/delay. `gitmoot daemon status` shows the configured budget
-(`github limiter: max_concurrent=… min_interval=… secondary_backoff=…`).
+(`github limiter: max_concurrent=… min_interval=… secondary_backoff=… conditional_requests=… calls_per_hour_warn=…`).
+
+After `idle_grace_ticks` consecutive successful polls in which every conditional
+read is a 304, a repo's GitHub poll cadence decays to 2x and then up to
+`idle_max_multiplier` (default `4`; `1` disables decay). Any response-body miss,
+poll error, queued repo job, or in-flight repo job resets/promotes it immediately.
+Repos with open PRs stay at base cadence because their per-PR comment reads are
+deliberately non-conditional. Idle decay gates only GitHub calls; heartbeat,
+pipeline, and chat maintenance still wake at the resolved base interval.
 
 `gitmoot dashboard` shows local state — daemon health, repos, agents and runtime
 sessions, jobs by state, worktrees, branch locks, SkillOpt train phase/candidate,

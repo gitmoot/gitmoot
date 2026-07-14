@@ -793,9 +793,6 @@ func (s *Store) upsertRepo(ctx context.Context, repo Repo, force bool) error {
 	}
 	updatePollInterval := repo.PollInterval
 	insertPollInterval := repo.PollInterval
-	if strings.TrimSpace(insertPollInterval) == "" {
-		insertPollInterval = "30s"
-	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO repos(owner, name, full_name, default_branch, remote_url, checkout_path, primary_checkout_path, enabled, poll_interval, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(full_name) DO UPDATE SET
@@ -876,6 +873,16 @@ func (s *Store) SetRepoEnabled(ctx context.Context, fullName string, enabled boo
 		value = 1
 	}
 	result, err := s.db.ExecContext(ctx, `UPDATE repos SET enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE full_name = ?`, value, fullName)
+	if err != nil {
+		return err
+	}
+	return requireAffected(result, "repo", fullName)
+}
+
+// SetRepoPollInterval sets a repository's explicit poll interval. An empty
+// value is the inherit sentinel and falls back to the daemon --poll interval.
+func (s *Store) SetRepoPollInterval(ctx context.Context, fullName string, interval string) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE repos SET poll_interval = ?, updated_at = CURRENT_TIMESTAMP WHERE full_name = ?`, strings.TrimSpace(interval), strings.TrimSpace(fullName))
 	if err != nil {
 		return err
 	}
@@ -2809,6 +2816,16 @@ func (s *Store) ListQueuedJobs(ctx context.Context) ([]Job, error) {
 		jobs = append(jobs, job)
 	}
 	return jobs, rows.Err()
+}
+
+// CountQueuedJobsForRepo returns the queued engine-owned jobs targeting repo.
+// The literal queued predicate lets SQLite use idx_jobs_queued_created; repo is
+// then a residual filter over the normally small queued set.
+func (s *Store) CountQueuedJobsForRepo(ctx context.Context, repo string) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs
+		WHERE state = 'queued' AND externally_driven = 0 AND repo = ?`, strings.TrimSpace(repo)).Scan(&count)
+	return count, err
 }
 
 // listRunningJobsUpdatedBeforeSQL is ListRunningJobsUpdatedBefore's exact query,
@@ -8777,5 +8794,11 @@ CREATE TABLE groom_quality_verdicts (
 	// the legacy/default state; note writes preserve it unless --summary is set.
 	`
 ALTER TABLE workflow_meta ADD COLUMN summary TEXT NOT NULL DEFAULT '';
+	`,
+	// #911 makes an empty poll_interval inherit the daemon's resolved --poll
+	// cadence. Only the historical implicit default is migrated; operator-set
+	// non-default intervals, including the production 3m0s values, survive.
+	`
+UPDATE repos SET poll_interval = '' WHERE poll_interval = '30s';
 	`,
 }

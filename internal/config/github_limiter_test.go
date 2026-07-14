@@ -34,6 +34,9 @@ func TestLoadGitHubLimiterPolicyDefaultsWhenAbsent(t *testing.T) {
 	if !policy.SecondaryBackoffEnabled {
 		t.Fatalf("default policy must enable secondary backoff")
 	}
+	if !policy.ConditionalRequests || policy.CallsPerHourWarn != 0 {
+		t.Fatalf("conditional/accounting defaults = %t/%d, want true/0", policy.ConditionalRequests, policy.CallsPerHourWarn)
+	}
 }
 
 func TestLoadGitHubLimiterPolicyParsesSection(t *testing.T) {
@@ -43,6 +46,8 @@ min_interval = "250ms"
 secondary_backoff = false
 backoff_base = "30s"
 backoff_max = "2m"
+conditional_requests = false
+calls_per_hour_warn = 4000
 `)
 	policy, err := LoadGitHubLimiterPolicy(paths)
 	if err != nil {
@@ -59,6 +64,9 @@ backoff_max = "2m"
 	}
 	if policy.BackoffBase != 30*time.Second || policy.BackoffMax != 2*time.Minute {
 		t.Fatalf("backoff bounds = %s/%s, want 30s/2m", policy.BackoffBase, policy.BackoffMax)
+	}
+	if policy.ConditionalRequests || policy.CallsPerHourWarn != 4000 {
+		t.Fatalf("conditional/accounting = %t/%d, want false/4000", policy.ConditionalRequests, policy.CallsPerHourWarn)
 	}
 	if !policy.ProactiveSmoothingEnabled() {
 		t.Fatalf("cap/interval set should report proactive smoothing enabled")
@@ -83,6 +91,13 @@ func TestLoadGitHubLimiterPolicyRejectsNegative(t *testing.T) {
 	paths := writeGitHubConfig(t, "[github]\nmax_concurrent = -1\n")
 	if _, err := LoadGitHubLimiterPolicy(paths); err == nil {
 		t.Fatalf("expected error on negative max_concurrent")
+	}
+}
+
+func TestLoadGitHubLimiterPolicyRejectsNegativeCallWarning(t *testing.T) {
+	paths := writeGitHubConfig(t, "[github]\ncalls_per_hour_warn = -1\n")
+	if _, err := LoadGitHubLimiterPolicy(paths); err == nil {
+		t.Fatal("expected error on negative calls_per_hour_warn")
 	}
 }
 

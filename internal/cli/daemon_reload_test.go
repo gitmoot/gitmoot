@@ -32,7 +32,7 @@ func reloadFixture(t *testing.T, body string) config.Paths {
 // settings, the poll/worker/scheduler snapshot updates without any restart, and a
 // concise summary of what was re-read and what changed is logged.
 func TestReloadDaemonConfigAppliesLiveSettings(t *testing.T) {
-	paths := reloadFixture(t, "\n[daemon]\npoll = \"45s\"\nworkers = 4\nscheduler = \"pool\"\n")
+	paths := reloadFixture(t, "\n[daemon]\npoll = \"45s\"\nworkers = 4\nscheduler = \"pool\"\nidle_grace_ticks = 5\nidle_max_multiplier = 8\n")
 	live := newDaemonReloadableConfig(30*time.Second, 1, false)
 
 	var buf bytes.Buffer
@@ -48,8 +48,11 @@ func TestReloadDaemonConfigAppliesLiveSettings(t *testing.T) {
 	if !usePool {
 		t.Fatalf("usePool = false after reload, want true (scheduler=pool)")
 	}
+	if grace, max := live.idleCadence(); grace != 5 || max != 8 {
+		t.Fatalf("idle cadence=%d/%d, want 5/8", grace, max)
+	}
 	out := buf.String()
-	for _, want := range []string{"poll 30s->45s", "workers 1->4", "scheduler barrier->pool"} {
+	for _, want := range []string{"poll 30s->45s", "workers 1->4", "scheduler barrier->pool", "idle_grace_ticks 3->5", "idle_max_multiplier 4->8"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("reload summary %q missing %q", strings.TrimSpace(out), want)
 		}

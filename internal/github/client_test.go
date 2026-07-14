@@ -226,7 +226,7 @@ func TestListRepoIssueCommentsPassesSinceAndGroupsByIssue(t *testing.T) {
 		t.Fatalf("author decode: %+v", comments[1])
 	}
 	// One bounded page (no --paginate), since passthrough as RFC3339, oldest-first.
-	runner.wantArgs(t, 0, "api", "-X", "GET", "repos/jerryfane/gitmoot/issues/comments",
+	runner.wantArgs(t, 0, "api", "-i", "-X", "GET", "repos/jerryfane/gitmoot/issues/comments",
 		"-f", "sort=updated", "-f", "direction=asc", "-f", "per_page=100",
 		"-f", "since=2026-06-27T09:30:00Z")
 }
@@ -239,7 +239,7 @@ func TestListRepoIssueCommentsZeroSinceOmitsFilter(t *testing.T) {
 		t.Fatalf("ListRepoIssueComments returned error: %v", err)
 	}
 	// A zero since omits the since= arg entirely (no whole-history backfill trigger).
-	runner.wantArgs(t, 0, "api", "-X", "GET", "repos/jerryfane/gitmoot/issues/comments",
+	runner.wantArgs(t, 0, "api", "-i", "-X", "GET", "repos/jerryfane/gitmoot/issues/comments",
 		"-f", "sort=updated", "-f", "direction=asc", "-f", "per_page=100")
 }
 
@@ -364,7 +364,7 @@ func TestListIssuesFiltersOutPullRequests(t *testing.T) {
 	if issues[0].Number != 42 || issues[0].IsPullRequest {
 		t.Fatalf("issues[0] = %+v, want plain issue #42", issues[0])
 	}
-	runner.wantArgs(t, 0, "api", "--paginate", "-X", "GET", "repos/jerryfane/gitmoot/issues", "-f", "state=open")
+	runner.wantArgs(t, 0, "api", "-i", "-X", "GET", "repos/jerryfane/gitmoot/issues", "-f", "state=open", "-f", "per_page=100")
 }
 
 func TestPreflightChecksGhAuthAndRepoAccess(t *testing.T) {

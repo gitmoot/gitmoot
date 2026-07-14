@@ -93,9 +93,10 @@ sessions**, with `--parallel N`.
 
 ## Reconfigure without restarting (SIGHUP)
 
-Changing workers/scheduler/poll no longer needs a daemon restart (#577):
+Changing workers/scheduler/poll/idle cadence no longer needs a daemon restart (#577):
 `kill -HUP <daemon-pid>` re-reads the `[daemon]` config section (`poll`,
-`workers`, `scheduler`, parallelism) live — no teardown, no dropped jobs, no
+`workers`, `scheduler`, parallelism, `idle_grace_ticks`, and
+`idle_max_multiplier`) live — no teardown, no dropped jobs, no
 environment re-inheritance (so the daemon's runtime auth is untouched). Values
 pinned by explicit launch flags win over the re-read config. When a full
 restart is genuinely needed, prefer `gitmoot daemon restart`, which recovers
@@ -163,6 +164,8 @@ min_interval = "0s"       # min spacing between call starts; 0 = off (Go duratio
 secondary_backoff = true  # pause all GitHub calls on a secondary/abuse limit (default true)
 backoff_base = "60s"      # exponential fallback base when no Retry-After (default 60s)
 backoff_max = "5m"        # exponential fallback cap (default 5m)
+conditional_requests = true # ETag conditional polling (default true)
+calls_per_hour_warn = 0      # daemon-local sliding-hour warning; 0 = off
 ```
 
 **Safe defaults:** the proactive caps (`max_concurrent`, `min_interval`) default
@@ -175,6 +178,25 @@ the abuse detector, which only prolongs the block. Calls are never dropped — t
 queue/delay until the window passes. On a busy host, set `max_concurrent` (e.g.
 `6`) and/or a small `min_interval` (e.g. `250ms`) to also smooth bursts
 proactively. `gitmoot daemon status` shows the configured budget.
+
+The four per-tick repository list reads use an in-memory ETag cache. A `304 Not
+Modified` replays the prior raw JSON and does not consume GitHub's REST quota.
+After three consecutive successful all-304 ticks, a quiet repo moves to 2x base
+cadence and then to 4x; configure the thresholds under `[daemon]`:
+
+```toml
+[daemon]
+idle_grace_ticks = 3
+idle_max_multiplier = 4  # 1 disables idle decay
+```
+
+Any response-body miss, poll error, queued repo job, or in-flight repo job resets
+the streak and promotes the repo immediately. A repo with an open PR remains at
+base cadence because its per-PR comment reads are deliberately non-conditional.
+The decayed `NextPoll` gates GitHub calls only: heartbeat, pipeline, and chat
+maintenance still wake at the resolved base interval. The local call count is
+approximate and covers only this daemon process; foreground commands and
+agent-owned `gh` processes are outside it.
 
 ## Not yet automatic (follow-ups)
 

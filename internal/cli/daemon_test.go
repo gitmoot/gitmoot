@@ -649,6 +649,286 @@ func TestPollRegisteredReposBacksOffFailedRepoWithoutStoppingOthers(t *testing.T
 	}
 }
 
+func TestPollRegisteredReposAdaptiveIdleCadence(t *testing.T) {
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "idle", CheckoutPath: "/tmp/idle", PollInterval: "1s"}); err != nil {
+		t.Fatal(err)
+	}
+	stats := []github.ConditionalRequestStats{
+		{Calls: 1},
+		{Calls: 1},
+		{Calls: 1},
+		{Calls: 1},
+		{Calls: 1, Misses: 1},
+	}
+	index := 0
+	poller := defaultRegisteredRepoPoller(store, 1, false, io.Discard, "", "")
+	poller.GitHubClient = func(string) github.Client {
+		client := &cliPollFakeGitHub{conditionalStats: stats[index]}
+		index++
+		return client
+	}
+	poller.WorkflowFactory = func(*db.Store, github.Client, string) *workflow.Engine { return nil }
+	schedule := registeredRepoSchedule{NextPoll: map[string]time.Time{}, ErrorStreak: map[string]int{}, IdleStreak: map[string]int{}}
+	start := time.Date(2026, 7, 14, 0, 0, 0, 0, time.UTC)
+	steps := []struct {
+		at         time.Duration
+		wantStreak int
+		wantNext   time.Duration
+	}{
+		{at: 0, wantStreak: 1, wantNext: time.Second},
+		{at: time.Second, wantStreak: 2, wantNext: time.Second},
+		{at: 2 * time.Second, wantStreak: 3, wantNext: 2 * time.Second},
+		{at: 4 * time.Second, wantStreak: 4, wantNext: 4 * time.Second},
+		{at: 8 * time.Second, wantStreak: 0, wantNext: time.Second},
+	}
+	for _, step := range steps {
+		now := start.Add(step.at)
+		wait, err := pollRegisteredReposWithPoller(ctx, poller, schedule, now, time.Second)
+		if err != nil {
+			t.Fatalf("poll at %s: %v", step.at, err)
+		}
+		if got := schedule.IdleStreak["owner/idle"]; got != step.wantStreak {
+			t.Fatalf("at %s streak=%d, want %d", step.at, got, step.wantStreak)
+		}
+		if got := schedule.NextPoll["owner/idle"].Sub(now); got != step.wantNext {
+			t.Fatalf("at %s next=%s, want %s", step.at, got, step.wantNext)
+		}
+		if wait != step.wantNext {
+			t.Fatalf("at %s wait=%s, want %s", step.at, wait, step.wantNext)
+		}
+	}
+}
+
+func TestPollRegisteredReposIdleErrorBackoffTakesPrecedence(t *testing.T) {
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: "/tmp/repo", PollInterval: "1s"}); err != nil {
+		t.Fatal(err)
+	}
+	poller := defaultRegisteredRepoPoller(store, 1, false, io.Discard, "", "")
+	poller.GitHubClient = func(string) github.Client {
+		return &cliPollFakeGitHub{listErr: errors.New("rate limited"), conditionalStats: github.ConditionalRequestStats{Calls: 1, Misses: 1}}
+	}
+	poller.WorkflowFactory = func(*db.Store, github.Client, string) *workflow.Engine { return nil }
+	schedule := registeredRepoSchedule{
+		NextPoll:    map[string]time.Time{},
+		ErrorStreak: map[string]int{},
+		IdleStreak:  map[string]int{"owner/repo": 8},
+	}
+	now := time.Date(2026, 7, 14, 0, 0, 0, 0, time.UTC)
+	if _, err := pollRegisteredReposWithPoller(ctx, poller, schedule, now, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := schedule.NextPoll["owner/repo"].Sub(now); got != 2*time.Second {
+		t.Fatalf("error next interval=%s, want 2s backoff without idle multiplier", got)
+	}
+	if got := schedule.IdleStreak["owner/repo"]; got != 0 {
+		t.Fatalf("idle streak after error=%d, want reset", got)
+	}
+}
+
+func TestPollRegisteredReposQueuedJobPromotesImmediately(t *testing.T) {
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: "/tmp/repo", PollInterval: "1s"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "queued", Agent: "agent", Type: "ask", State: string(workflow.JobQueued), Payload: `{"repo":"owner/repo"}`}); err != nil {
+		t.Fatal(err)
+	}
+	client := &cliPollFakeGitHub{conditionalStats: github.ConditionalRequestStats{Calls: 1}}
+	poller := defaultRegisteredRepoPoller(store, 1, false, io.Discard, "", "")
+	poller.GitHubClient = func(string) github.Client { return client }
+	poller.WorkflowFactory = func(*db.Store, github.Client, string) *workflow.Engine { return nil }
+	start := time.Date(2026, 7, 14, 0, 0, 0, 0, time.UTC)
+	schedule := registeredRepoSchedule{
+		NextPoll:    map[string]time.Time{"owner/repo": start.Add(4 * time.Second)},
+		ErrorStreak: map[string]int{},
+		IdleStreak:  map[string]int{"owner/repo": 6},
+	}
+	now := start.Add(time.Second)
+	if _, err := pollRegisteredReposWithPoller(ctx, poller, schedule, now, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if client.listPullRequestsCalls != 1 {
+		t.Fatalf("poll calls=%d, want immediate poll", client.listPullRequestsCalls)
+	}
+	if got := schedule.IdleStreak["owner/repo"]; got != 0 {
+		t.Fatalf("idle streak=%d, want reset", got)
+	}
+	if got := schedule.NextPoll["owner/repo"].Sub(now); got != time.Second {
+		t.Fatalf("next interval=%s, want base 1s", got)
+	}
+}
+
+// A queued job must never override ERROR backoff: promotion is an exit from
+// idle decay only. Otherwise queued local work (which commonly piles up during
+// GitHub outages) would hammer the failing API at base cadence forever.
+func TestPollRegisteredReposQueuedJobDoesNotOverrideErrorBackoff(t *testing.T) {
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: "/tmp/repo", PollInterval: "1s"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "queued", Agent: "agent", Type: "ask", State: string(workflow.JobQueued), Payload: `{"repo":"owner/repo"}`}); err != nil {
+		t.Fatal(err)
+	}
+	client := &cliPollFakeGitHub{conditionalStats: github.ConditionalRequestStats{Calls: 1}}
+	poller := defaultRegisteredRepoPoller(store, 1, false, io.Discard, "", "")
+	poller.GitHubClient = func(string) github.Client { return client }
+	poller.WorkflowFactory = func(*db.Store, github.Client, string) *workflow.Engine { return nil }
+	start := time.Date(2026, 7, 14, 0, 0, 0, 0, time.UTC)
+	backoffUntil := start.Add(4 * time.Second)
+	schedule := registeredRepoSchedule{
+		NextPoll:    map[string]time.Time{"owner/repo": backoffUntil},
+		ErrorStreak: map[string]int{"owner/repo": 2},
+		IdleStreak:  map[string]int{},
+	}
+	now := start.Add(time.Second)
+	if _, err := pollRegisteredReposWithPoller(ctx, poller, schedule, now, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if client.listPullRequestsCalls != 0 {
+		t.Fatalf("poll calls=%d, want 0: queued job must not override error backoff", client.listPullRequestsCalls)
+	}
+	if got := schedule.NextPoll["owner/repo"]; !got.Equal(backoffUntil) {
+		t.Fatalf("next poll=%s, want untouched backoff %s", got, backoffUntil)
+	}
+}
+
+// Promotion is a one-shot exit from decay: a repo already at base cadence with
+// queued/busy work keeps its configured interval instead of being re-polled on
+// every supervisor tick (which would multiply API calls while jobs run).
+func TestPollRegisteredReposBusyRepoAtBaseCadenceKeepsInterval(t *testing.T) {
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: "/tmp/repo", PollInterval: "1s"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "queued", Agent: "agent", Type: "ask", State: string(workflow.JobQueued), Payload: `{"repo":"owner/repo"}`}); err != nil {
+		t.Fatal(err)
+	}
+	client := &cliPollFakeGitHub{conditionalStats: github.ConditionalRequestStats{Calls: 1}}
+	poller := defaultRegisteredRepoPoller(store, 1, false, io.Discard, "", "")
+	poller.GitHubClient = func(string) github.Client { return client }
+	poller.WorkflowFactory = func(*db.Store, github.Client, string) *workflow.Engine { return nil }
+	start := time.Date(2026, 7, 14, 0, 0, 0, 0, time.UTC)
+	dueAt := start.Add(900 * time.Millisecond)
+	schedule := registeredRepoSchedule{
+		NextPoll:    map[string]time.Time{"owner/repo": dueAt},
+		ErrorStreak: map[string]int{},
+		IdleStreak:  map[string]int{},
+	}
+	now := start.Add(500 * time.Millisecond)
+	if _, err := pollRegisteredReposWithPoller(ctx, poller, schedule, now, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if client.listPullRequestsCalls != 0 {
+		t.Fatalf("poll calls=%d, want 0: base-cadence repo with queued work polls at its interval, not every tick", client.listPullRequestsCalls)
+	}
+	if got := schedule.NextPoll["owner/repo"]; !got.Equal(dueAt) {
+		t.Fatalf("next poll=%s, want untouched %s", got, dueAt)
+	}
+}
+
+func TestPollRegisteredReposTreats304AsSuccess(t *testing.T) {
+	github.ConfigureConditional(true)
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "etag304", Name: "repo", CheckoutPath: "/tmp/etag304", PollInterval: "1s"}); err != nil {
+		t.Fatal(err)
+	}
+	runner := &cliETagRunner{}
+	limiter := github.NewRateLimiter(github.RateLimiterConfig{})
+	poller := defaultRegisteredRepoPoller(store, 1, false, io.Discard, "", "")
+	poller.GitHubClient = func(string) github.Client { return &github.GhClient{Runner: runner, Limiter: limiter} }
+	poller.WorkflowFactory = func(*db.Store, github.Client, string) *workflow.Engine { return nil }
+	schedule := registeredRepoSchedule{NextPoll: map[string]time.Time{}, ErrorStreak: map[string]int{}, IdleStreak: map[string]int{}}
+	start := time.Date(2026, 7, 14, 0, 0, 0, 0, time.UTC)
+	if _, err := pollRegisteredReposWithPoller(ctx, poller, schedule, start, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pollRegisteredReposWithPoller(ctx, poller, schedule, start.Add(time.Second), time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if len(schedule.ErrorStreak) != 0 {
+		t.Fatalf("304 populated ErrorStreak: %+v", schedule.ErrorStreak)
+	}
+	repo, err := store.GetRepo(ctx, "etag304/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repo.LastError != "" {
+		t.Fatalf("304 last_error=%q, want empty", repo.LastError)
+	}
+	if got := limiter.Snapshot().CallsInLastHour; got != 2 {
+		t.Fatalf("limiter calls=%d, want 2", got)
+	}
+}
+
+func TestRepoIdleMultiplier(t *testing.T) {
+	for _, tc := range []struct {
+		streak, grace, max, want int
+	}{
+		{0, 3, 4, 1}, {2, 3, 4, 1}, {3, 3, 4, 2}, {4, 3, 4, 4},
+		{20, 3, 4, 4}, {20, 3, 1, 1}, {5, 4, 3, 3},
+	} {
+		if got := repoIdleMultiplier(tc.streak, tc.grace, tc.max); got != tc.want {
+			t.Fatalf("repoIdleMultiplier(%d,%d,%d)=%d, want %d", tc.streak, tc.grace, tc.max, got, tc.want)
+		}
+	}
+}
+
 func TestRunQueuedJobsExecutesShellAdapterSuccess(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
@@ -5742,6 +6022,31 @@ type cliPollFakeGitHub struct {
 	postErr               error
 	listPullRequestsCalls int
 	posted                []cliPollPostedComment
+	conditionalStats      github.ConditionalRequestStats
+}
+
+type cliETagRunner struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (r *cliETagRunner) Run(_ context.Context, _ string, command string, _ ...string) (subprocess.Result, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	if command != "gh" {
+		return subprocess.Result{}, fmt.Errorf("unexpected command %s", command)
+	}
+	if r.calls == 1 {
+		return subprocess.Result{Stdout: "HTTP/2 200 OK\nETag: \"cli-etag\"\n\n[]"}, nil
+	}
+	return subprocess.Result{Stdout: "HTTP/2.0 304 Not Modified\n\n"}, errors.New("exit status 1")
+}
+
+func (r *cliETagRunner) LookPath(string) (string, error) { return "/usr/bin/gh", nil }
+
+func (f *cliPollFakeGitHub) ConditionalRequestStats() github.ConditionalRequestStats {
+	return f.conditionalStats
 }
 
 type cliPollPostedComment struct {

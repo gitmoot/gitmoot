@@ -429,6 +429,8 @@ type GhClient struct {
 	Limiter *RateLimiter
 
 	mutateMu sync.Mutex
+	statsMu  sync.Mutex
+	stats    ConditionalRequestStats
 }
 
 func NewClient(dir string) *GhClient {
@@ -561,7 +563,22 @@ func (c *GhClient) ListPullRequests(ctx context.Context, repo Repository, state 
 	if state == "" {
 		state = "open"
 	}
-	return apiPaginatedJSON[PullRequest](ctx, c, "-X", "GET", endpoint(repo, "pulls"), "-f", "state="+state)
+	args := []string{"-X", "GET", endpoint(repo, "pulls"), "-f", "state=" + state}
+	if !conditionalEnabled() {
+		return apiPaginatedJSON[PullRequest](ctx, c, args...)
+	}
+	page, key, err := conditionalPageJSON[PullRequest](ctx, c, repo,
+		append(args, "-f", "per_page=100")...)
+	if err != nil {
+		return nil, err
+	}
+	if len(page) == 100 {
+		// A full first page may have more results. Preserve the existing complete
+		// pagination path and never retain the partial page in the ETag cache.
+		evictConditionalEntry(key)
+		return apiPaginatedJSON[PullRequest](ctx, c, args...)
+	}
+	return page, nil
 }
 
 // recentClosedPullRequestsPerPage caps the bounded closed-PR scan (#467) at one
@@ -579,13 +596,18 @@ const recentClosedPullRequestsPerPage = 100
 // counterpart to ListPullRequests(state="closed"); revert detection only needs
 // recently-landed reverts, so a single recent page is sufficient.
 func (c *GhClient) ListRecentClosedPullRequests(ctx context.Context, repo Repository) ([]PullRequest, error) {
-	return apiPageJSON[PullRequest](ctx, c,
+	args := []string{
 		"-X", "GET", endpoint(repo, "pulls"),
 		"-f", "state=closed",
 		"-f", "sort=updated",
 		"-f", "direction=desc",
-		"-f", "per_page="+strconv.Itoa(recentClosedPullRequestsPerPage),
-	)
+		"-f", "per_page=" + strconv.Itoa(recentClosedPullRequestsPerPage),
+	}
+	if !conditionalEnabled() {
+		return apiPageJSON[PullRequest](ctx, c, args...)
+	}
+	values, _, err := conditionalPageJSON[PullRequest](ctx, c, repo, args...)
+	return values, err
 }
 
 // ListIssues lists repository issues via GET /repos/{owner}/{repo}/issues. That
@@ -596,7 +618,20 @@ func (c *GhClient) ListIssues(ctx context.Context, repo Repository, state string
 	if state == "" {
 		state = "open"
 	}
-	issues, err := apiPaginatedJSON[Issue](ctx, c, "-X", "GET", endpoint(repo, "issues"), "-f", "state="+state)
+	args := []string{"-X", "GET", endpoint(repo, "issues"), "-f", "state=" + state}
+	var issues []Issue
+	var err error
+	if conditionalEnabled() {
+		var key string
+		issues, key, err = conditionalPageJSON[Issue](ctx, c, repo,
+			append(args, "-f", "per_page=100")...)
+		if err == nil && len(issues) == 100 {
+			evictConditionalEntry(key)
+			issues, err = apiPaginatedJSON[Issue](ctx, c, args...)
+		}
+	} else {
+		issues, err = apiPaginatedJSON[Issue](ctx, c, args...)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -769,7 +804,13 @@ func (c *GhClient) ListRepoIssueComments(ctx context.Context, repo Repository, s
 	if !since.IsZero() {
 		args = append(args, "-f", "since="+since.UTC().Format(time.RFC3339))
 	}
-	comments, err := apiPageJSON[IssueComment](ctx, c, args...)
+	var comments []IssueComment
+	var err error
+	if conditionalEnabled() {
+		comments, _, err = conditionalPageJSON[IssueComment](ctx, c, repo, args...)
+	} else {
+		comments, err = apiPageJSON[IssueComment](ctx, c, args...)
+	}
 	return dedupeComments(comments), err
 }
 
@@ -1223,6 +1264,19 @@ func apiPageJSON[T any](ctx context.Context, c *GhClient, args ...string) ([]T, 
 	return values, nil
 }
 
+func conditionalPageJSON[T any](ctx context.Context, c *GhClient, repo Repository, args ...string) ([]T, string, error) {
+	result, key, err := c.conditionalRun(ctx, repo, args...)
+	if err != nil {
+		return nil, key, err
+	}
+	var values []T
+	if err := json.Unmarshal([]byte(result.Stdout), &values); err != nil {
+		evictConditionalEntry(key)
+		return nil, key, fmt.Errorf("decode gh api response: %w", err)
+	}
+	return values, key, nil
+}
+
 func decodePaginatedJSON[T any](output string) ([]T, error) {
 	decoder := json.NewDecoder(strings.NewReader(output))
 	var values []T
@@ -1238,7 +1292,95 @@ func decodePaginatedJSON[T any](output string) ([]T, error) {
 	}
 }
 
+// ConditionalRequestStats returns this client's per-tick conditional-read
+// accounting. A fresh GhClient is constructed for each daemon repository poll.
+func (c *GhClient) ConditionalRequestStats() ConditionalRequestStats {
+	if c == nil {
+		return ConditionalRequestStats{}
+	}
+	c.statsMu.Lock()
+	defer c.statsMu.Unlock()
+	return c.stats
+}
+
+func (c *GhClient) noteConditionalRequest(miss bool) {
+	c.statsMu.Lock()
+	c.stats.Calls++
+	if miss {
+		c.stats.Misses++
+	}
+	c.statsMu.Unlock()
+}
+
+func (c *GhClient) noteNonConditionalGET() {
+	c.statsMu.Lock()
+	c.stats.Misses++
+	c.statsMu.Unlock()
+}
+
+func (c *GhClient) noteConditionalMiss() {
+	c.statsMu.Lock()
+	c.stats.Misses++
+	c.statsMu.Unlock()
+}
+
+// conditionalRun executes one ETag-capable REST read. It adds gh's include
+// flag, replays a cached raw body on 304, and atomically replaces the cache on a
+// valid 200. A missing/corrupt body after 304 is evicted and retried once without
+// If-None-Match.
+func (c *GhClient) conditionalRun(ctx context.Context, repo Repository, args ...string) (subprocess.Result, string, error) {
+	baseArgs := append([]string{"api"}, args...)
+	key := conditionalRequestKey(repo, baseArgs)
+	forceUnconditional := false
+	for cacheAttempt := 0; cacheAttempt < 2; cacheAttempt++ {
+		entry, cached := loadConditionalEntry(key)
+		requestArgs := []string{"api", "-i"}
+		if cached && !forceUnconditional {
+			requestArgs = append(requestArgs, "-H", "If-None-Match: "+entry.etag)
+		}
+		requestArgs = append(requestArgs, args...)
+		result, err := c.runRequest(ctx, false, true, requestArgs...)
+		response := parseConditionalResponse([]byte(result.Stdout))
+		if response.status == 304 {
+			if cached && !forceUnconditional && len(entry.body) > 0 && json.Valid(entry.body) {
+				result.Stdout = string(entry.body)
+				return result, key, nil
+			}
+			c.noteConditionalMiss()
+			evictConditionalEntry(key)
+			if cacheAttempt == 0 {
+				forceUnconditional = true
+				continue
+			}
+			return result, key, fmt.Errorf("GitHub returned 304 without a usable cached response")
+		}
+		if err != nil {
+			return result, key, err
+		}
+		if response.headers {
+			result.Stdout = string(response.body)
+		}
+		if response.status == 200 {
+			if response.etag != "" && json.Valid(response.body) {
+				storeConditionalEntry(key, response.etag, response.body)
+			} else {
+				evictConditionalEntry(key)
+			}
+		} else if !response.headers {
+			// `-i` should always supply headers. Preserve the body for decoding but
+			// do not retain an older validator against an unparseable response.
+			evictConditionalEntry(key)
+		}
+		return result, key, nil
+	}
+	return subprocess.Result{}, key, fmt.Errorf("conditional GitHub request retry exhausted")
+}
+
 func (c *GhClient) run(ctx context.Context, mutate bool, args ...string) (subprocess.Result, error) {
+	return c.runRequest(ctx, mutate, false, args...)
+}
+
+func (c *GhClient) runRequest(ctx context.Context, mutate bool, conditional bool, args ...string) (subprocess.Result, error) {
 	if mutate {
 		c.mutateMu.Lock()
 		defer c.mutateMu.Unlock()
@@ -1266,8 +1408,22 @@ func (c *GhClient) run(ctx context.Context, mutate bool, args ...string) (subpro
 		if acqErr := limiter.Acquire(ctx); acqErr != nil {
 			return result, acqErr
 		}
+		limiter.NoteCall()
 		result, err = runner.Run(ctx, c.Dir, "gh", args...)
 		limiter.Release()
+		if conditional {
+			status := parseConditionalResponse([]byte(result.Stdout)).status
+			c.noteConditionalRequest(status != 304)
+			// gh 2.45 exits non-zero for a valid 304. Handle it before any
+			// transient/rate-limit classifier can turn an ETag hit into a failure.
+			if status == 304 {
+				limiter.NoteSuccess()
+				err = nil
+				break
+			}
+		} else if !mutate && isRESTGet(args) {
+			c.noteNonConditionalGET()
+		}
 		if err == nil {
 			limiter.NoteSuccess()
 			break
@@ -1299,6 +1455,18 @@ func (c *GhClient) run(ctx context.Context, mutate bool, args ...string) (subpro
 		return result, classifyTransientError(result, commandError(result, err))
 	}
 	return result, nil
+}
+
+func isRESTGet(args []string) bool {
+	if len(args) == 0 || args[0] != "api" {
+		return false
+	}
+	for i := 1; i+1 < len(args); i++ {
+		if args[i] == "-X" || args[i] == "--method" {
+			return strings.EqualFold(args[i+1], "GET")
+		}
+	}
+	return true
 }
 
 func (c *GhClient) sleep(ctx context.Context, d time.Duration) error {

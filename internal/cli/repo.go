@@ -29,6 +29,8 @@ func runRepo(args []string, stdout, stderr io.Writer) int {
 		return runRepoAdd(args[1:], stdout, stderr)
 	case "list":
 		return runRepoList(args[1:], stdout, stderr)
+	case "set-interval":
+		return runRepoSetInterval(args[1:], stdout, stderr)
 	case "remove":
 		return runRepoRemove(args[1:], stdout, stderr)
 	case "doctor":
@@ -66,8 +68,10 @@ func parseRepoPositional(fs *flag.FlagSet, command string, args []string, string
 
 func printRepoUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot repo add owner/repo --path <path> [--poll 30s] [--force]")
+	fmt.Fprintln(w, "  gitmoot repo add owner/repo --path <path> [--poll <duration>] [--force]")
 	fmt.Fprintln(w, "  gitmoot repo list")
+	fmt.Fprintln(w, "  gitmoot repo set-interval owner/repo (<duration>|default)")
+	fmt.Fprintln(w, "  gitmoot repo set-interval --all (<duration>|default)")
 	fmt.Fprintln(w, "  gitmoot repo remove owner/repo")
 	fmt.Fprintln(w, "  gitmoot repo doctor owner/repo")
 	fmt.Fprintln(w, "")
@@ -97,6 +101,12 @@ func runRepoAdd(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "poll interval must be positive")
 		return 2
 	}
+	pollExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "poll" {
+			pollExplicit = true
+		}
+	})
 	repo, err := daemon.ParseRepository(repoArg)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid repo: %v\n", err)
@@ -123,7 +133,9 @@ func runRepoAdd(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "repo add: %s is a linked worktree; register the primary checkout at %s instead (use --force to override)\n", record.CheckoutPath, primary)
 		return 1
 	}
-	record.PollInterval = poll.String()
+	if pollExplicit {
+		record.PollInterval = poll.String()
+	}
 	if err := withStore(*home, func(store *db.Store) error {
 		if *force {
 			return store.UpsertRepoForce(context.Background(), record)
@@ -165,7 +177,99 @@ func runRepoList(args []string, stdout, stderr io.Writer) int {
 		if repo.Enabled {
 			enabled = "enabled"
 		}
-		writeLine(stdout, "%-24s %-8s %-8s %s", repo.FullName(), enabled, repo.PollInterval, repo.CheckoutPath)
+		interval := repo.PollInterval
+		if strings.TrimSpace(interval) == "" {
+			interval = "inherit"
+		}
+		writeLine(stdout, "%-24s %-8s %-8s %s", repo.FullName(), enabled, interval, repo.CheckoutPath)
+	}
+	return 0
+}
+
+func runRepoSetInterval(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("repo set-interval", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	all := fs.Bool("all", false, "set the interval for all registered repositories")
+	parsedArgs, err := reorderFlagArgs(args, map[string]struct{}{"home": {}}, map[string]struct{}{"all": {}})
+	if err != nil {
+		fmt.Fprintf(stderr, "repo set-interval: %v\n", err)
+		return 2
+	}
+	if err := fs.Parse(parsedArgs); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	var repoArg, value string
+	if *all {
+		switch fs.NArg() {
+		case 1:
+			value = fs.Arg(0)
+		case 2:
+			// Accept the fully-spelled form from the command synopsis; --all makes
+			// the validated owner/repo selector informational.
+			repoArg, value = fs.Arg(0), fs.Arg(1)
+			if _, err := daemon.ParseRepository(repoArg); err != nil {
+				fmt.Fprintf(stderr, "invalid repo: %v\n", err)
+				return 2
+			}
+		default:
+			fmt.Fprintln(stderr, "repo set-interval --all requires (<duration>|default)")
+			return 2
+		}
+	} else {
+		if fs.NArg() != 2 {
+			fmt.Fprintln(stderr, "repo set-interval requires owner/repo and (<duration>|default)")
+			return 2
+		}
+		repoArg, value = fs.Arg(0), fs.Arg(1)
+		repo, err := daemon.ParseRepository(repoArg)
+		if err != nil {
+			fmt.Fprintf(stderr, "invalid repo: %v\n", err)
+			return 2
+		}
+		repoArg = repo.FullName()
+	}
+	interval := ""
+	if value != "default" {
+		parsed, err := time.ParseDuration(value)
+		if err != nil || parsed <= 0 {
+			fmt.Fprintf(stderr, "invalid poll interval %q; use a positive Go duration or default\n", value)
+			return 2
+		}
+		interval = parsed.String()
+	}
+	updated := 0
+	if err := withStore(*home, func(store *db.Store) error {
+		if !*all {
+			updated = 1
+			return store.SetRepoPollInterval(context.Background(), repoArg, interval)
+		}
+		repos, err := store.ListRepos(context.Background())
+		if err != nil {
+			return err
+		}
+		for _, repo := range repos {
+			if err := store.SetRepoPollInterval(context.Background(), repo.FullName(), interval); err != nil {
+				return err
+			}
+			updated++
+		}
+		return nil
+	}); err != nil {
+		fmt.Fprintf(stderr, "repo set-interval: %v\n", err)
+		return 1
+	}
+	display := interval
+	if display == "" {
+		display = "default"
+	}
+	if *all {
+		writeLine(stdout, "set poll interval for %d repos to %s", updated, display)
+	} else {
+		writeLine(stdout, "set poll interval for %s to %s", repoArg, display)
 	}
 	return 0
 }
