@@ -40,6 +40,23 @@ func (s *gatewayLogSink) String() string {
 	return s.lines.String()
 }
 
+// waitFor blocks until the logs contain substr and returns everything logged so
+// far, so assertions never race the goroutine that writes the entry.
+func (s *gatewayLogSink) waitFor(t *testing.T, substr string) string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		logged := s.String()
+		if strings.Contains(logged, substr) {
+			return logged
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("logs never contained %q: %q", substr, logged)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestRuntimeJobRunnerModelGatewayInjectsPlaceholderWithCurationOnAndOff(t *testing.T) {
 	for _, curation := range []bool{false, true} {
 		t.Run(fmt.Sprintf("curation-%t", curation), func(t *testing.T) {
@@ -274,14 +291,18 @@ model_gateway_allow_hosts = [%q]
 	if !strings.Contains(dumpText, "CLAUDE_CODE_OAUTH_TOKEN=gitmoot-kc-gateway-e2e-job-") || !strings.Contains(dumpText, "ANTHROPIC_BASE_URL=http://127.0.0.1:") {
 		t.Fatalf("child env dump = %q", dumpText)
 	}
+	// Wait for the gateway's own request log before asserting on log contents:
+	// it is written by the request goroutine after the response is proxied back,
+	// so reading too early would make these leak checks vacuous.
+	logged := logs.waitFor(t, "job_id=gateway-e2e-job")
 	for _, secret := range []string{realToken, "ambient-credential-must-not-win", "ambient-api-key-must-not-win"} {
-		if strings.Contains(dumpText, secret) || strings.Contains(logs.String(), secret) {
+		if strings.Contains(dumpText, secret) || strings.Contains(logged, secret) {
 			t.Fatalf("credential leaked through child env/logs")
 		}
 	}
 	placeholder := envDumpValue(dumpText, runtime.ClaudeOAuthTokenEnv)
-	if placeholder == "" || strings.Contains(logs.String(), placeholder) {
-		t.Fatalf("placeholder missing or logged: logs=%q", logs.String())
+	if placeholder == "" || strings.Contains(logged, placeholder) {
+		t.Fatalf("placeholder missing or logged: logs=%q", logged)
 	}
 	request, _ := http.NewRequest(http.MethodPost, envDumpValue(dumpText, "ANTHROPIC_BASE_URL")+"/v1/messages", bytes.NewReader(nil))
 	request.Header.Set("Authorization", "Bearer "+placeholder)

@@ -39,6 +39,23 @@ func (s *logSink) String() string {
 	return s.lines.String()
 }
 
+// waitFor blocks until the logs contain substr and returns everything logged so
+// far, so assertions never race the goroutine that writes the entry.
+func (s *logSink) waitFor(t *testing.T, substr string) string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		logged := s.String()
+		if strings.Contains(logged, substr) {
+			return logged
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("logs never contained %q: %q", substr, logged)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestGatewayPlaceholderLifecycleAndCredentialCustody(t *testing.T) {
 	var upstreamAuthorization string
 	var upstreamAPIKey string
@@ -90,18 +107,21 @@ func TestGatewayPlaceholderLifecycleAndCredentialCustody(t *testing.T) {
 		t.Fatalf("placeholder reached upstream x-api-key = %q", upstreamAPIKey)
 	}
 
+	// The gateway logs the request after the response is proxied back, so the
+	// client returning does not mean the log line exists yet.
+	entry := logs.waitFor(t, "job_id=job-123")
+	if !strings.Contains(entry, "method=POST") || !strings.Contains(entry, "status=201") {
+		t.Fatalf("safe request log = %q", entry)
+	}
 	for name, token := range map[string]string{
 		"credential":  testRealCredential,
 		"placeholder": placeholder,
 		"header":      "Authorization",
 		"body":        testRequestBody,
 	} {
-		if strings.Contains(logs.String(), token) {
-			t.Fatalf("logs contain %s: %q", name, logs.String())
+		if strings.Contains(entry, token) {
+			t.Fatalf("logs contain %s: %q", name, entry)
 		}
-	}
-	if !strings.Contains(logs.String(), "method=POST") || !strings.Contains(logs.String(), "status=201") || !strings.Contains(logs.String(), "job_id=job-123") {
-		t.Fatalf("safe request log = %q", logs.String())
 	}
 
 	gateway.Revoke(placeholder)
