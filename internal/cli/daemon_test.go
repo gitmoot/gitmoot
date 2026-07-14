@@ -787,6 +787,92 @@ func TestPollRegisteredReposQueuedJobPromotesImmediately(t *testing.T) {
 	}
 }
 
+// A queued job must never override ERROR backoff: promotion is an exit from
+// idle decay only. Otherwise queued local work (which commonly piles up during
+// GitHub outages) would hammer the failing API at base cadence forever.
+func TestPollRegisteredReposQueuedJobDoesNotOverrideErrorBackoff(t *testing.T) {
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: "/tmp/repo", PollInterval: "1s"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "queued", Agent: "agent", Type: "ask", State: string(workflow.JobQueued), Payload: `{"repo":"owner/repo"}`}); err != nil {
+		t.Fatal(err)
+	}
+	client := &cliPollFakeGitHub{conditionalStats: github.ConditionalRequestStats{Calls: 1}}
+	poller := defaultRegisteredRepoPoller(store, 1, false, io.Discard, "", "")
+	poller.GitHubClient = func(string) github.Client { return client }
+	poller.WorkflowFactory = func(*db.Store, github.Client, string) *workflow.Engine { return nil }
+	start := time.Date(2026, 7, 14, 0, 0, 0, 0, time.UTC)
+	backoffUntil := start.Add(4 * time.Second)
+	schedule := registeredRepoSchedule{
+		NextPoll:    map[string]time.Time{"owner/repo": backoffUntil},
+		ErrorStreak: map[string]int{"owner/repo": 2},
+		IdleStreak:  map[string]int{},
+	}
+	now := start.Add(time.Second)
+	if _, err := pollRegisteredReposWithPoller(ctx, poller, schedule, now, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if client.listPullRequestsCalls != 0 {
+		t.Fatalf("poll calls=%d, want 0: queued job must not override error backoff", client.listPullRequestsCalls)
+	}
+	if got := schedule.NextPoll["owner/repo"]; !got.Equal(backoffUntil) {
+		t.Fatalf("next poll=%s, want untouched backoff %s", got, backoffUntil)
+	}
+}
+
+// Promotion is a one-shot exit from decay: a repo already at base cadence with
+// queued/busy work keeps its configured interval instead of being re-polled on
+// every supervisor tick (which would multiply API calls while jobs run).
+func TestPollRegisteredReposBusyRepoAtBaseCadenceKeepsInterval(t *testing.T) {
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: "/tmp/repo", PollInterval: "1s"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "queued", Agent: "agent", Type: "ask", State: string(workflow.JobQueued), Payload: `{"repo":"owner/repo"}`}); err != nil {
+		t.Fatal(err)
+	}
+	client := &cliPollFakeGitHub{conditionalStats: github.ConditionalRequestStats{Calls: 1}}
+	poller := defaultRegisteredRepoPoller(store, 1, false, io.Discard, "", "")
+	poller.GitHubClient = func(string) github.Client { return client }
+	poller.WorkflowFactory = func(*db.Store, github.Client, string) *workflow.Engine { return nil }
+	start := time.Date(2026, 7, 14, 0, 0, 0, 0, time.UTC)
+	dueAt := start.Add(900 * time.Millisecond)
+	schedule := registeredRepoSchedule{
+		NextPoll:    map[string]time.Time{"owner/repo": dueAt},
+		ErrorStreak: map[string]int{},
+		IdleStreak:  map[string]int{},
+	}
+	now := start.Add(500 * time.Millisecond)
+	if _, err := pollRegisteredReposWithPoller(ctx, poller, schedule, now, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if client.listPullRequestsCalls != 0 {
+		t.Fatalf("poll calls=%d, want 0: base-cadence repo with queued work polls at its interval, not every tick", client.listPullRequestsCalls)
+	}
+	if got := schedule.NextPoll["owner/repo"]; !got.Equal(dueAt) {
+		t.Fatalf("next poll=%s, want untouched %s", got, dueAt)
+	}
+}
+
 func TestPollRegisteredReposTreats304AsSuccess(t *testing.T) {
 	github.ConfigureConditional(true)
 	paths := config.PathsForHome(t.TempDir())

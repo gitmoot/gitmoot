@@ -2057,8 +2057,10 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 				// repo polling backs off, and it would otherwise throttle the pipeline
 				// advancer to that same rate. While any run is in flight, cap the sleep
 				// to the configured (non-backed-off) poll interval so settled stages
-				// fold promptly; when idle, leave `wait` untouched so the daemon still
-				// sleeps out the full backoff. Only reduces the sleep, never extends it.
+				// fold promptly. NOTE (#911): the idle-decay clamp above already caps
+				// `wait` at the base interval on every pass, so this guard is now a
+				// second, narrower ceiling; it still only reduces the sleep, never
+				// extends it.
 				if inFlight, err := pipelineRunsInFlight(ctx, store); err != nil {
 					writeLine(stdout, "pipeline in-flight check error: %s", err)
 				} else {
@@ -2918,19 +2920,30 @@ func pollRegisteredReposWithPoller(ctx context.Context, poller registeredRepoPol
 	waitSet := false
 	for _, repoRecord := range repos {
 		if !repoRecord.Enabled {
+			// Drop any idle streak so a disabled repo re-earns its grace ticks
+			// when re-enabled instead of resuming a stale decayed cadence.
+			delete(schedule.IdleStreak, repoRecord.FullName())
 			continue
 		}
 		enabled++
 		fullName := repoRecord.FullName()
 		interval := repoPollInterval(repoRecord.PollInterval, fallbackPoll)
-		queued, err := poller.Store.CountQueuedJobsForRepo(ctx, fullName)
-		if err != nil {
-			return wait, err
-		}
-		busy := poller.Inflight.busy(fullName)
-		promoted := queued > 0 || busy
-		if promoted {
-			delete(schedule.IdleStreak, fullName)
+		// Local promotion is a ONE-SHOT exit from idle decay: it applies only
+		// to a repo that actually decayed (IdleStreak > 0) and is not in error
+		// backoff. Without the streak guard a busy repo would re-poll on every
+		// supervisor tick instead of at its configured interval, and without
+		// the error guard queued local jobs would override repoBackoffInterval
+		// and hammer a failing API at base cadence.
+		promoted := false
+		if schedule.IdleStreak[fullName] > 0 && schedule.ErrorStreak[fullName] == 0 {
+			queued, err := poller.Store.CountQueuedJobsForRepo(ctx, fullName)
+			if err != nil {
+				return wait, err
+			}
+			if queued > 0 || poller.Inflight.busy(fullName) {
+				promoted = true
+				delete(schedule.IdleStreak, fullName)
+			}
 		}
 		dueAt := schedule.NextPoll[fullName]
 		if !promoted && !dueAt.IsZero() && dueAt.After(now) {
@@ -2952,6 +2965,10 @@ func pollRegisteredReposWithPoller(ctx context.Context, poller registeredRepoPol
 			nextInterval = repoBackoffInterval(interval, schedule.ErrorStreak[fullName])
 		} else {
 			delete(schedule.ErrorStreak, fullName)
+			queued, err := poller.Store.CountQueuedJobsForRepo(ctx, fullName)
+			if err != nil {
+				return wait, err
+			}
 			idle := result.Conditional.Calls > 0 && result.Conditional.Misses == 0 &&
 				!poller.Inflight.busy(fullName) && queued == 0
 			if idle {
