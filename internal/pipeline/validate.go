@@ -34,13 +34,16 @@ func (s *Spec) normalize() {
 	}
 	if s.Trigger != nil {
 		s.Trigger.Kind = strings.TrimSpace(s.Trigger.Kind)
+		s.Trigger.Pipeline = strings.TrimSpace(s.Trigger.Pipeline)
 		s.Trigger.Connection = strings.TrimSpace(s.Trigger.Connection)
 		s.Trigger.Mailbox = strings.TrimSpace(s.Trigger.Mailbox)
-		if s.Trigger.Connection == "" {
-			s.Trigger.Connection = "gmail-imap"
-		}
-		if s.Trigger.Mailbox == "" {
-			s.Trigger.Mailbox = "INBOX"
+		if s.Trigger.Kind == "email" {
+			if s.Trigger.Connection == "" {
+				s.Trigger.Connection = "gmail-imap"
+			}
+			if s.Trigger.Mailbox == "" {
+				s.Trigger.Mailbox = "INBOX"
+			}
 		}
 	}
 	s.SuccessDecisions = trimAll(s.SuccessDecisions)
@@ -258,15 +261,36 @@ func (s Spec) validateTrigger() error {
 		return nil
 	}
 	if s.Trigger.Kind == "" {
-		return fmt.Errorf("pipeline %q trigger kind is required; supported kinds: email", s.Name)
+		return fmt.Errorf("pipeline %q trigger kind is required; supported kinds: email, pipeline", s.Name)
 	}
-	if s.Trigger.Kind != "email" {
-		return fmt.Errorf("pipeline %q trigger kind %q is not supported; supported kinds: email", s.Name, s.Trigger.Kind)
+	if s.Trigger.Kind != "email" && s.Trigger.Kind != "pipeline" {
+		return fmt.Errorf("pipeline %q trigger kind %q is not supported; supported kinds: email, pipeline", s.Name, s.Trigger.Kind)
 	}
 	// The bridge rejects runs of repo-less pipelines, so a triggered flow would
 	// fire 400s forever; fail at add time instead of silently at every email.
 	if strings.TrimSpace(s.Repo) == "" {
 		return fmt.Errorf("pipeline %q declares a trigger but no repo; triggered runs need a managed repo (add `repo: owner/name`)", s.Name)
+	}
+	if s.Trigger.Kind == "pipeline" {
+		if s.Trigger.Pipeline == "" {
+			return fmt.Errorf("pipeline %q pipeline trigger requires an upstream pipeline name", s.Name)
+		}
+		if !validToken(s.Trigger.Pipeline) {
+			return fmt.Errorf("pipeline %q upstream pipeline %q must be a name-safe token (letters, digits, '-', '_')", s.Name, s.Trigger.Pipeline)
+		}
+		if s.Trigger.Pipeline == s.Name {
+			return fmt.Errorf("pipeline %q pipeline trigger cannot reference itself", s.Name)
+		}
+		if s.Schedule != nil {
+			return fmt.Errorf("pipeline %q combines schedule and pipeline trigger; schedule+pipeline hybrid semantics are not supported", s.Name)
+		}
+		if s.Trigger.Connection != "" || s.Trigger.Mailbox != "" || s.Trigger.Map != nil {
+			return fmt.Errorf("pipeline %q pipeline trigger sets email-only fields; connection, mailbox, and map are only valid for kind: email", s.Name)
+		}
+		return nil
+	}
+	if s.Trigger.Pipeline != "" {
+		return fmt.Errorf("pipeline %q email trigger sets pipeline %q; pipeline is only valid for kind: pipeline", s.Name, s.Trigger.Pipeline)
 	}
 	if !triggerConnectionPattern.MatchString(s.Trigger.Connection) {
 		return fmt.Errorf("pipeline %q trigger connection %q must match [A-Za-z0-9][A-Za-z0-9_-]*", s.Name, s.Trigger.Connection)

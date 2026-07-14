@@ -143,6 +143,7 @@ func TestPipelineAddListShowEnableDisableRemove(t *testing.T) {
 
 func TestPipelineDisplayMode(t *testing.T) {
 	triggerSpec := "name: mail\nrepo: owner/repo\ntrigger: {kind: email}\nstages:\n  - {id: run, cmd: echo}\n"
+	pipelineTriggerSpec := "name: downstream\nrepo: owner/downstream\ntrigger: {kind: pipeline, pipeline: upstream}\nstages:\n  - {id: run, cmd: echo}\n"
 	scheduledSpec := "name: nightly\nschedule: {interval: 24h}\nstages:\n  - {id: run, cmd: echo}\n"
 	manualSpec := "name: manual\nstages:\n  - {id: run, cmd: echo}\n"
 	tests := []struct {
@@ -154,6 +155,7 @@ func TestPipelineDisplayMode(t *testing.T) {
 		{name: "trigger pending", record: db.Pipeline{SpecYAML: triggerSpec, TriggerBinding: `{"state":"pending"}`}, want: "email-triggered (pending)"},
 		{name: "trigger never bound", record: db.Pipeline{SpecYAML: triggerSpec}, want: "email-triggered (unbound)"},
 		{name: "trigger plus schedule hybrid", record: db.Pipeline{SpecYAML: "name: both\nrepo: owner/repo\ntrigger: {kind: email}\nschedule: {interval: 6h}\nstages:\n  - {id: run, cmd: echo}\n", TriggerBinding: `{"state":"bound"}`, Interval: "6h"}, want: "email-triggered (bound), scheduled 6h"},
+		{name: "pipeline trigger", record: db.Pipeline{SpecYAML: pipelineTriggerSpec}, want: "after: upstream"},
 		{name: "schedule", record: db.Pipeline{SpecYAML: scheduledSpec, Interval: "24h"}, want: "scheduled 24h"},
 		{name: "neither", record: db.Pipeline{SpecYAML: manualSpec}, want: "manual"},
 	}
@@ -163,6 +165,9 @@ func TestPipelineDisplayMode(t *testing.T) {
 				t.Fatalf("pipelineDisplayMode() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+	if got := pipelineDisplayMode(db.Pipeline{SpecYAML: pipelineTriggerSpec}, true); got != "after: upstream (upstream missing)" {
+		t.Fatalf("missing-upstream pipelineDisplayMode() = %q", got)
 	}
 }
 
@@ -372,6 +377,45 @@ func TestPipelineValidationExitCodes(t *testing.T) {
 	}
 }
 
+func TestPipelineAddTriggerCycleDetection(t *testing.T) {
+	triggerSpec := func(name, upstream string) string {
+		return fmt.Sprintf("name: %s\nrepo: owner/%s\ntrigger: {kind: pipeline, pipeline: %s}\nstages: [{id: run, cmd: echo}]\n", name, name, upstream)
+	}
+	t.Run("cycle rejected and dropping edge unblocks", func(t *testing.T) {
+		home := t.TempDir()
+		a := writeSpec(t, triggerSpec("A", "B"))
+		if code := Run([]string{"pipeline", "add", a, "--home", home}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
+			t.Fatalf("add A->B exit=%d", code)
+		}
+		b := writeSpec(t, triggerSpec("B", "A"))
+		var stderr bytes.Buffer
+		if code := Run([]string{"pipeline", "add", b, "--home", home}, &bytes.Buffer{}, &stderr); code == 0 {
+			t.Fatalf("add B->A unexpectedly succeeded")
+		}
+		if !strings.Contains(stderr.String(), "B -> A -> B") {
+			t.Fatalf("cycle error does not name chain: %s", stderr.String())
+		}
+		manualA := writeSpec(t, "name: A\nrepo: owner/A\nstages: [{id: run, cmd: echo}]\n")
+		if code := Run([]string{"pipeline", "add", manualA, "--home", home}, &bytes.Buffer{}, &stderr); code != 0 {
+			t.Fatalf("re-add A without edge exit=%d stderr=%s", code, stderr.String())
+		}
+		if code := Run([]string{"pipeline", "add", b, "--home", home}, &bytes.Buffer{}, &stderr); code != 0 {
+			t.Fatalf("B->A remained blocked after A dropped edge: exit=%d stderr=%s", code, stderr.String())
+		}
+	})
+
+	t.Run("chain accepted", func(t *testing.T) {
+		home := t.TempDir()
+		for _, edge := range [][2]string{{"A", "B"}, {"B", "C"}} {
+			spec := writeSpec(t, triggerSpec(edge[0], edge[1]))
+			var stderr bytes.Buffer
+			if code := Run([]string{"pipeline", "add", spec, "--home", home}, &bytes.Buffer{}, &stderr); code != 0 {
+				t.Fatalf("add %s->%s exit=%d stderr=%s", edge[0], edge[1], code, stderr.String())
+			}
+		}
+	})
+}
+
 // TestPipelineRunnerNameCollisionRefused proves `pipeline add` refuses to clobber
 // a pre-existing non-shell agent occupying the runner name.
 func TestPipelineRunnerNameCollisionRefused(t *testing.T) {
@@ -409,6 +453,13 @@ func TestPipelineListIntervalHybridKeepsInterval(t *testing.T) {
 	triggerOnly := db.Pipeline{SpecYAML: "name: mail\nrepo: owner/repo\ntrigger: {kind: email}\nstages:\n  - {id: run, cmd: echo}\n"}
 	if got := pipelineListInterval(triggerOnly); got != "email" {
 		t.Fatalf("trigger-only list interval = %q, want %q", got, "email")
+	}
+	pipelineTrigger := db.Pipeline{SpecYAML: "name: downstream\nrepo: owner/downstream\ntrigger: {kind: pipeline, pipeline: upstream}\nstages:\n  - {id: run, cmd: echo}\n"}
+	if got := pipelineListInterval(pipelineTrigger); got != "after: upstream" {
+		t.Fatalf("pipeline-trigger list interval = %q", got)
+	}
+	if got := pipelineListInterval(pipelineTrigger, true); got != "after: upstream (upstream missing)" {
+		t.Fatalf("missing-upstream list interval = %q", got)
 	}
 }
 

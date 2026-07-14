@@ -679,17 +679,19 @@ func createPipelineRun(ctx context.Context, store *db.Store, rec db.Pipeline, sp
 }
 
 // runPipelineScanOnce is the pipeline scan wired into BOTH daemon supervisor loops
-// next to runHeartbeatScanOnce (#681). Each tick is two passes, mirroring the
+// next to runHeartbeatScanOnce (#681). Each tick is three passes, mirroring the
 // heartbeat idiom:
 //
 //	SCHEDULE pass — for each enabled pipeline whose interval is due and that has no
 //	  active run, create a fresh scheduled run and advance next_due anchored to now
 //	  (missed ticks coalesce into one run; a durable next_due makes it restart-safe).
+//	TRIGGER pass — create one downstream run for the next unseen succeeded upstream
+//	  run, using a durable cursor and the same active-run guard.
 //	ADVANCE  pass — advance every in-flight (state='running') run once.
 //
-// Ordering matters: the schedule pass creates the run rows, then the advance pass
-// enqueues their ready root stages, so a scheduled run and a manual `pipeline run`
-// reach the worker by the identical code path. Off-by-default and zero-cost when
+// Ordering matters: the schedule and trigger passes create run rows, then the
+// advance pass enqueues their ready root stages, so every run source reaches the
+// worker by the identical code path. Off-by-default and zero-cost when
 // idle: a pipeline with no interval is skipped before any state touch, and a parked
 // or terminal run is never advanced. A per-pipeline / per-run error is collected
 // (first wins) but never stops the rest; the daemon caller logs it and never aborts
@@ -700,10 +702,80 @@ func runPipelineScanOnce(ctx context.Context, store *db.Store, enqueue pipelineS
 	if err := schedulePipelineRuns(ctx, store, now); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	if err := triggerPipelineRuns(ctx, store, now); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	if err := advancePipelineRuns(ctx, store, enqueue, now); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	return firstErr
+}
+
+// triggerPipelineRuns is the once-per-upstream-success scan pass. It creates at
+// most one run per downstream per tick; the downstream active-run guard leaves
+// the cursor untouched so the same upstream success is retried after settlement.
+func triggerPipelineRuns(ctx context.Context, store *db.Store, now time.Time) error {
+	records, err := store.ListPipelines(ctx)
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, rec := range records {
+		if err := triggerOnePipeline(ctx, store, rec, now.UTC()); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func triggerOnePipeline(ctx context.Context, store *db.Store, rec db.Pipeline, now time.Time) error {
+	if !rec.Enabled {
+		return nil
+	}
+	spec, err := pipeline.Load([]byte(rec.SpecYAML))
+	if err != nil || spec.Trigger == nil || spec.Trigger.Kind != "pipeline" {
+		return nil
+	}
+	if _, found, err := store.GetPipeline(ctx, spec.Trigger.Pipeline); err != nil {
+		return err
+	} else if !found {
+		return nil
+	}
+	state, found, err := store.GetPipelineTriggerState(ctx, rec.Name)
+	if err != nil {
+		return err
+	}
+	if !found || state.Upstream != spec.Trigger.Pipeline {
+		// Defensive compatibility for a row created outside `pipeline add`: establish
+		// the no-backfill boundary, then wait for a newer upstream run.
+		return store.ArmPipelineTrigger(ctx, rec.Name, spec.Trigger.Pipeline, now)
+	}
+	upstreamRun, found, err := store.NextSucceededPipelineTriggerRun(ctx, state)
+	if err != nil || !found {
+		return err
+	}
+	payload, err := json.Marshal(map[string]string{
+		"upstream_pipeline": spec.Trigger.Pipeline,
+		"upstream_run_id":   upstreamRun.ID,
+	})
+	if err != nil {
+		return err
+	}
+	run := db.PipelineRun{
+		ID:          pipelineRunID(rec.Name, now) + "-" + pipeline.Hash([]byte(upstreamRun.ID))[:12],
+		Pipeline:    rec.Name,
+		Trigger:     "pipeline",
+		PayloadJSON: string(payload),
+		SpecHash:    rec.SpecHash,
+		State:       pipeline.RunRunning,
+		StartedAt:   now,
+	}
+	stages := make([]db.PipelineRunStage, 0, len(spec.Stages))
+	for _, stage := range spec.Stages {
+		stages = append(stages, db.PipelineRunStage{RunID: run.ID, StageID: stage.ID, State: pipeline.StagePending})
+	}
+	_, err = store.FirePipelineTrigger(ctx, state, upstreamRun, run, stages)
+	return err
 }
 
 // pipelineRunsInFlight reports whether any pipeline run is still in flight

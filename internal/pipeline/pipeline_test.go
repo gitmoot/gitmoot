@@ -86,6 +86,38 @@ func TestLoadEmailTriggerDefaultsAndValidation(t *testing.T) {
 	}
 }
 
+func TestLoadPipelineTriggerValidation(t *testing.T) {
+	loaded, err := Load([]byte("name: downstream\nrepo: owner/downstream\ntrigger:\n  kind: pipeline\n  pipeline: upstream\nstages:\n  - {id: run, cmd: echo}\n"))
+	if err != nil {
+		t.Fatalf("Load pipeline trigger: %v", err)
+	}
+	if loaded.Trigger == nil || loaded.Trigger.Pipeline != "upstream" {
+		t.Fatalf("pipeline trigger = %+v", loaded.Trigger)
+	}
+	if loaded.Trigger.Connection != "" || loaded.Trigger.Mailbox != "" {
+		t.Fatalf("pipeline trigger received email defaults: %+v", loaded.Trigger)
+	}
+
+	cases := []struct {
+		name, spec, want string
+	}{
+		{"missing upstream", "name: downstream\nrepo: owner/repo\ntrigger: {kind: pipeline}\nstages: [{id: run, cmd: echo}]\n", "requires an upstream pipeline name"},
+		{"self reference", "name: downstream\nrepo: owner/repo\ntrigger: {kind: pipeline, pipeline: downstream}\nstages: [{id: run, cmd: echo}]\n", "cannot reference itself"},
+		{"connection field", "name: downstream\nrepo: owner/repo\ntrigger: {kind: pipeline, pipeline: upstream, connection: gmail-imap}\nstages: [{id: run, cmd: echo}]\n", "email-only fields"},
+		{"mailbox field", "name: downstream\nrepo: owner/repo\ntrigger: {kind: pipeline, pipeline: upstream, mailbox: INBOX}\nstages: [{id: run, cmd: echo}]\n", "email-only fields"},
+		{"map field", "name: downstream\nrepo: owner/repo\ntrigger: {kind: pipeline, pipeline: upstream, map: {subject: subject}}\nstages: [{id: run, cmd: echo}]\n", "email-only fields"},
+		{"schedule hybrid", "name: downstream\nrepo: owner/repo\nschedule: {interval: 1h}\ntrigger: {kind: pipeline, pipeline: upstream}\nstages: [{id: run, cmd: echo}]\n", "schedule+pipeline hybrid semantics are not supported"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load([]byte(tc.spec))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Load error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 // TestLoadValidAgentSpec exercises the #757 agent-stage schema: an agent stage
 // with no explicit action defaults to "ask", an explicit review action is kept,
 // and shell + agent stages coexist in one DAG.

@@ -9081,4 +9081,18 @@ CREATE TABLE IF NOT EXISTS task_events (
 );
 CREATE INDEX IF NOT EXISTS idx_task_events_task_id_id ON task_events(task_id, id);
 	`,
+	// #922 once-per-upstream-run pipeline trigger state. The downstream pipeline
+	// name is the durable identity; upstream is deliberately not foreign-keyed so
+	// removing an upstream leaves its dependants dormant and re-creatable. cursor
+	// stores the last observed/fired upstream run id, while armed_at is the no-
+	// backfill boundary used when no upstream run existed at arm time.
+	`
+CREATE TABLE pipeline_trigger_states (
+	downstream_pipeline TEXT PRIMARY KEY,
+	upstream_pipeline TEXT NOT NULL,
+	cursor TEXT NOT NULL DEFAULT '',
+	armed_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX idx_pipeline_trigger_states_upstream ON pipeline_trigger_states(upstream_pipeline);
+		`,
 }

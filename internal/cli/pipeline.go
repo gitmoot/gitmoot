@@ -202,6 +202,20 @@ func runPipelineAdd(args []string, stdout, stderr io.Writer) int {
 		if err := validatePipelineProducePaths(context.Background(), store, *home, spec); err != nil {
 			return err
 		}
+		registered, err := store.ListPipelines(ctx)
+		if err != nil {
+			return err
+		}
+		if err := validatePipelineTriggerCycle(registered, spec); err != nil {
+			return err
+		}
+		if spec.Trigger != nil && spec.Trigger.Kind == "pipeline" {
+			if _, found, err := store.GetPipeline(ctx, spec.Trigger.Pipeline); err != nil {
+				return err
+			} else if !found {
+				fmt.Fprintf(stderr, "warning: pipeline %q references upstream pipeline %q which does not exist yet; it will remain dormant until the upstream is added\n", spec.Name, spec.Trigger.Pipeline)
+			}
+		}
 		// Refuse to clobber a real managed agent that happens to occupy the runner
 		// name: a pre-existing non-shell agent by that name is a naming collision, not
 		// this pipeline's runner. A pre-existing shell agent (this pipeline's own
@@ -237,6 +251,13 @@ func runPipelineAdd(args []string, stdout, stderr io.Writer) int {
 		if err := store.CreateOrUpdatePipeline(ctx, record); err != nil {
 			return err
 		}
+		if spec.Trigger != nil && spec.Trigger.Kind == "pipeline" {
+			if err := store.ArmPipelineTrigger(ctx, spec.Name, spec.Trigger.Pipeline, time.Now().UTC()); err != nil {
+				return err
+			}
+		} else if err := store.DeletePipelineTriggerState(ctx, spec.Name); err != nil {
+			return err
+		}
 		if err := store.UpsertAgent(ctx, pipelineRunnerAgent(runnerName, repo)); err != nil {
 			return err
 		}
@@ -252,7 +273,7 @@ func runPipelineAdd(args []string, stdout, stderr io.Writer) int {
 			return err
 		}
 		finalEnabled = saved.Enabled
-		if finalEnabled && spec.Trigger != nil {
+		if finalEnabled && spec.Trigger != nil && spec.Trigger.Kind == "email" {
 			if _, bindErr := bindPipelineTrigger(ctx, store, saved, activepiecesAuthOptions{Home: *home}, triggerBindingPending); bindErr != nil {
 				fmt.Fprintf(stderr, "warning: pipeline %s was registered but its trigger is pending: %v; retry with `gitmoot pipeline bind-trigger %s`\n", spec.Name, bindErr, spec.Name)
 			}
@@ -285,6 +306,65 @@ func validatePipelineProducePaths(ctx context.Context, store *db.Store, homeFlag
 		if _, err := canonicalizePipelineProducePaths(ctx, store, homeFlag, fmt.Sprintf("stage %q", stage.ID), stage.Writes); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// validatePipelineTriggerCycle overlays candidate on the stored trigger graph
+// and walks downstream->upstream edges from the candidate. Missing upstreams are
+// leaves (the add path warns separately); only a closed chain is rejected.
+func validatePipelineTriggerCycle(records []db.Pipeline, candidate pipeline.Spec) error {
+	edges := make(map[string]string, len(records)+1)
+	for _, rec := range records {
+		spec, err := pipeline.Load([]byte(rec.SpecYAML))
+		if err != nil || spec.Trigger == nil || spec.Trigger.Kind != "pipeline" {
+			continue
+		}
+		edges[spec.Name] = spec.Trigger.Pipeline
+	}
+	delete(edges, candidate.Name)
+	if candidate.Trigger != nil && candidate.Trigger.Kind == "pipeline" {
+		edges[candidate.Name] = candidate.Trigger.Pipeline
+	} else {
+		return nil
+	}
+
+	const (
+		unvisited = iota
+		visiting
+		done
+	)
+	state := make(map[string]int, len(edges))
+	stack := make([]string, 0, len(edges)+1)
+	var visit func(string) []string
+	visit = func(name string) []string {
+		state[name] = visiting
+		stack = append(stack, name)
+		upstream := edges[name]
+		if upstream != "" {
+			switch state[upstream] {
+			case visiting:
+				start := 0
+				for i, item := range stack {
+					if item == upstream {
+						start = i
+						break
+					}
+				}
+				cycle := append([]string(nil), stack[start:]...)
+				return append(cycle, upstream)
+			case unvisited:
+				if cycle := visit(upstream); cycle != nil {
+					return cycle
+				}
+			}
+		}
+		stack = stack[:len(stack)-1]
+		state[name] = done
+		return nil
+	}
+	if cycle := visit(candidate.Name); cycle != nil {
+		return fmt.Errorf("pipeline trigger cycle: %s", strings.Join(cycle, " -> "))
 	}
 	return nil
 }
@@ -454,15 +534,16 @@ func runPipelineList(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "pipeline list: %v\n", err)
 		return 1
 	}
+	knownPipelines := pipelineNameSet(pipelines)
 	if *jsonOut {
 		out := make([]pipelineJSON, 0, len(pipelines))
 		for _, p := range pipelines {
-			out = append(out, pipelineToJSON(p, false, nil))
+			out = append(out, pipelineToJSON(p, false, nil, pipelineUpstreamMissing(p, knownPipelines)))
 		}
 		return encodePipelineJSON(stdout, stderr, out)
 	}
 	for _, p := range pipelines {
-		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t%s\n", p.Name, enabledLabel(p.Enabled), pipelineListInterval(p), firstNonEmpty(p.Repo, "-"), firstNonEmpty(p.LastStatus, "-"), firstNonEmpty(triggerBindingState(p.TriggerBinding), "-"))
+		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t%s\n", p.Name, enabledLabel(p.Enabled), pipelineListInterval(p, pipelineUpstreamMissing(p, knownPipelines)), firstNonEmpty(p.Repo, "-"), firstNonEmpty(p.LastStatus, "-"), firstNonEmpty(triggerBindingState(p.TriggerBinding), "-"))
 	}
 	return 0
 }
@@ -492,11 +573,12 @@ func runPipelineShow(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	var (
-		record   db.Pipeline
-		agents   map[string]db.Agent
-		found    bool
-		runView  pipelineRunView
-		runFound bool
+		record          db.Pipeline
+		agents          map[string]db.Agent
+		found           bool
+		runView         pipelineRunView
+		runFound        bool
+		upstreamMissing bool
 	)
 	if err := withStore(*home, func(store *db.Store) error {
 		ctx := context.Background()
@@ -510,6 +592,11 @@ func runPipelineShow(args []string, stdout, stderr io.Writer) int {
 		}
 		if found {
 			agents = pipelineStageAgents(ctx, store, record)
+			rows, listErr := store.ListPipelines(ctx)
+			if listErr != nil {
+				return listErr
+			}
+			upstreamMissing = pipelineUpstreamMissing(record, pipelineNameSet(rows))
 			return nil
 		}
 		runView, runFound, err = loadPipelineRunView(ctx, store, name)
@@ -520,9 +607,9 @@ func runPipelineShow(args []string, stdout, stderr io.Writer) int {
 	}
 	if found {
 		if *jsonOut {
-			return encodePipelineJSON(stdout, stderr, pipelineToJSON(record, true, agents))
+			return encodePipelineJSON(stdout, stderr, pipelineToJSON(record, true, agents, upstreamMissing))
 		}
-		printPipeline(stdout, record, agents)
+		printPipeline(stdout, record, agents, upstreamMissing)
 		return 0
 	}
 	if runFound {
@@ -588,7 +675,11 @@ func runPipelineSetEnabled(args []string, enabled bool, stdout, stderr io.Writer
 			if err := store.SetPipelineEnabled(ctx, name, false); err != nil {
 				return err
 			}
-			if strings.TrimSpace(rec.TriggerBinding) != "" {
+			shouldDisableBinding := true
+			if spec, loadErr := pipeline.Load([]byte(rec.SpecYAML)); loadErr == nil && spec.Trigger != nil && spec.Trigger.Kind == "pipeline" {
+				shouldDisableBinding = false
+			}
+			if shouldDisableBinding && strings.TrimSpace(rec.TriggerBinding) != "" {
 				if err := disablePipelineTrigger(ctx, store, rec, auth); err != nil {
 					fmt.Fprintf(stderr, "warning: pipeline %s is disabled locally, but Activepieces flow disable failed: %v\n", name, err)
 				}
@@ -602,7 +693,11 @@ func runPipelineSetEnabled(args []string, enabled bool, stdout, stderr io.Writer
 			}
 			return loadErr
 		}
-		if spec.Trigger != nil {
+		if spec.Trigger != nil && spec.Trigger.Kind == "pipeline" {
+			if err := store.ArmPipelineTrigger(ctx, name, spec.Trigger.Pipeline, time.Now().UTC()); err != nil {
+				return err
+			}
+		} else if spec.Trigger != nil && spec.Trigger.Kind == "email" {
 			if _, err := bindPipelineTrigger(ctx, store, rec, auth, triggerBindingError); err != nil {
 				return err
 			}
@@ -664,7 +759,14 @@ func runPipelineRemove(args []string, stdout, stderr io.Writer) int {
 		// leak it. Ignore the outcome — the pipeline row is what `remove` is about, and
 		// leaving an orphan runner is harmless (run/job cleanup lands in the run step).
 		_, _ = store.RemoveAgent(context.Background(), pipelineRunnerAgentName(name))
-		if removed && strings.TrimSpace(removedRecord.TriggerBinding) != "" {
+		shouldDeleteBinding := true
+		if spec, loadErr := pipeline.Load([]byte(removedRecord.SpecYAML)); loadErr == nil && spec.Trigger != nil && spec.Trigger.Kind == "pipeline" {
+			shouldDeleteBinding = false
+		}
+		if removed {
+			_ = store.DeletePipelineTriggerState(context.Background(), name)
+		}
+		if removed && shouldDeleteBinding && strings.TrimSpace(removedRecord.TriggerBinding) != "" {
 			auth := activepiecesAuthOptions{Home: *home, URL: *apURL, Port: *port, Email: *email, Password: *password}
 			if cleanupErr := deletePipelineTrigger(context.Background(), removedRecord, auth); cleanupErr != nil {
 				binding, _ := decodeTriggerBinding(removedRecord.TriggerBinding)
@@ -688,12 +790,12 @@ func runPipelineRemove(args []string, stdout, stderr io.Writer) int {
 // shape. When withStages is set it parses the stored (already-validated) spec to
 // enumerate the stage DAG; a parse failure degrades to no stages rather than
 // failing the command.
-func pipelineToJSON(record db.Pipeline, withStages bool, agents map[string]db.Agent) pipelineJSON {
+func pipelineToJSON(record db.Pipeline, withStages bool, agents map[string]db.Agent, upstreamMissing ...bool) pipelineJSON {
 	out := pipelineJSON{
 		Name:                record.Name,
 		Repo:                record.Repo,
 		Enabled:             record.Enabled,
-		Mode:                pipelineDisplayMode(record),
+		Mode:                pipelineDisplayMode(record, upstreamMissing...),
 		Interval:            record.Interval,
 		Jitter:              record.Jitter,
 		SpecHash:            record.SpecHash,
@@ -742,9 +844,16 @@ func pipelineToJSON(record db.Pipeline, withStages bool, agents map[string]db.Ag
 	return out
 }
 
-func pipelineDisplayMode(record db.Pipeline) string {
+func pipelineDisplayMode(record db.Pipeline, upstreamMissing ...bool) string {
 	spec, err := pipeline.Load([]byte(record.SpecYAML))
 	if err == nil && spec.Trigger != nil {
+		if spec.Trigger.Kind == "pipeline" {
+			mode := "after: " + spec.Trigger.Pipeline
+			if len(upstreamMissing) > 0 && upstreamMissing[0] {
+				mode += " (upstream missing)"
+			}
+			return mode
+		}
 		state := triggerBindingState(record.TriggerBinding)
 		if state == "" {
 			// No binding record exists yet (never bound, e.g. added disabled):
@@ -768,9 +877,16 @@ func pipelineDisplayMode(record db.Pipeline) string {
 	return "manual"
 }
 
-func pipelineListInterval(record db.Pipeline) string {
+func pipelineListInterval(record db.Pipeline, upstreamMissing ...bool) string {
 	spec, err := pipeline.Load([]byte(record.SpecYAML))
 	if err == nil && spec.Trigger != nil {
+		if spec.Trigger.Kind == "pipeline" {
+			mode := "after: " + spec.Trigger.Pipeline
+			if len(upstreamMissing) > 0 && upstreamMissing[0] {
+				mode += " (upstream missing)"
+			}
+			return mode
+		}
 		// Hybrids keep their live interval visible: the scheduler fires them too.
 		if interval := strings.TrimSpace(record.Interval); interval != "" {
 			return "email+" + interval
@@ -778,6 +894,23 @@ func pipelineListInterval(record db.Pipeline) string {
 		return "email"
 	}
 	return firstNonEmpty(record.Interval, "-")
+}
+
+func pipelineNameSet(records []db.Pipeline) map[string]struct{} {
+	known := make(map[string]struct{}, len(records))
+	for _, rec := range records {
+		known[rec.Name] = struct{}{}
+	}
+	return known
+}
+
+func pipelineUpstreamMissing(record db.Pipeline, known map[string]struct{}) bool {
+	spec, err := pipeline.Load([]byte(record.SpecYAML))
+	if err != nil || spec.Trigger == nil || spec.Trigger.Kind != "pipeline" {
+		return false
+	}
+	_, found := known[spec.Trigger.Pipeline]
+	return !found
 }
 
 func pipelineStageAgents(ctx context.Context, store *db.Store, record db.Pipeline) map[string]db.Agent {
@@ -882,11 +1015,11 @@ func pipelinePromptPreview(prompt string) string {
 	return pipelinePreview(prompt, " ", 100)
 }
 
-func printPipeline(stdout io.Writer, record db.Pipeline, agents map[string]db.Agent) {
+func printPipeline(stdout io.Writer, record db.Pipeline, agents map[string]db.Agent, upstreamMissing ...bool) {
 	writeLine(stdout, "name: %s", record.Name)
 	writeLine(stdout, "repo: %s", firstNonEmpty(record.Repo, "-"))
 	writeLine(stdout, "enabled: %t", record.Enabled)
-	writeLine(stdout, "mode: %s", pipelineDisplayMode(record))
+	writeLine(stdout, "mode: %s", pipelineDisplayMode(record, upstreamMissing...))
 	writeLine(stdout, "interval: %s", firstNonEmpty(record.Interval, "-"))
 	writeLine(stdout, "jitter: %s", firstNonEmpty(record.Jitter, "-"))
 	writeLine(stdout, "spec_hash: %s", record.SpecHash)
@@ -1151,6 +1284,9 @@ func printPipelineRunFunnelAt(stdout io.Writer, view pipelineRunView, now time.T
 	writeLine(stdout, "run: %s", run.ID)
 	writeLine(stdout, "pipeline: %s", run.Pipeline)
 	writeLine(stdout, "trigger: %s", firstNonEmpty(run.Trigger, "-"))
+	if payload := strings.TrimSpace(run.PayloadJSON); payload != "" && payload != "{}" {
+		writeLine(stdout, "payload_json: %s", payload)
+	}
 	writeLine(stdout, "state: %s", run.State)
 	writeLine(stdout, "started: %s", heartbeatTimeForStatus(run.StartedAt))
 	writeLine(stdout, "finished: %s", heartbeatTimeForStatus(run.FinishedAt))
@@ -1298,37 +1434,42 @@ type pipelineRunStageProgressJSON struct {
 }
 
 type pipelineRunJSON struct {
-	ID         string                 `json:"id"`
-	Pipeline   string                 `json:"pipeline"`
-	Trigger    string                 `json:"trigger"`
-	State      string                 `json:"state"`
-	HaltStage  string                 `json:"halt_stage,omitempty"`
-	HaltReason string                 `json:"halt_reason,omitempty"`
-	Needs      []string               `json:"needs,omitempty"`
-	SpecHash   string                 `json:"spec_hash"`
-	StartedAt  string                 `json:"started_at,omitempty"`
-	FinishedAt string                 `json:"finished_at,omitempty"`
-	Funnel     string                 `json:"funnel"`
-	Stages     []pipelineRunStageJSON `json:"stages,omitempty"`
-	Tokens     int                    `json:"tokens"`
+	ID          string                 `json:"id"`
+	Pipeline    string                 `json:"pipeline"`
+	Trigger     string                 `json:"trigger"`
+	PayloadJSON string                 `json:"payload_json,omitempty"`
+	State       string                 `json:"state"`
+	HaltStage   string                 `json:"halt_stage,omitempty"`
+	HaltReason  string                 `json:"halt_reason,omitempty"`
+	Needs       []string               `json:"needs,omitempty"`
+	SpecHash    string                 `json:"spec_hash"`
+	StartedAt   string                 `json:"started_at,omitempty"`
+	FinishedAt  string                 `json:"finished_at,omitempty"`
+	Funnel      string                 `json:"funnel"`
+	Stages      []pipelineRunStageJSON `json:"stages,omitempty"`
+	Tokens      int                    `json:"tokens"`
 }
 
 // pipelineRunToJSON projects a run view into its script-stable JSON shape.
 func pipelineRunToJSON(view pipelineRunView) pipelineRunJSON {
 	run := view.run
 	out := pipelineRunJSON{
-		ID:         run.ID,
-		Pipeline:   run.Pipeline,
-		Trigger:    run.Trigger,
-		State:      run.State,
-		HaltStage:  run.HaltStage,
-		HaltReason: run.HaltReason,
-		Needs:      decodePipelineNeeds(run.NeedsJSON),
-		SpecHash:   run.SpecHash,
-		StartedAt:  pipelineRunTimeJSON(run.StartedAt),
-		FinishedAt: pipelineRunTimeJSON(run.FinishedAt),
-		Funnel:     pipelineFunnelLine(view.stages),
-		Tokens:     view.tokens,
+		ID:          run.ID,
+		Pipeline:    run.Pipeline,
+		Trigger:     run.Trigger,
+		PayloadJSON: strings.TrimSpace(run.PayloadJSON),
+		State:       run.State,
+		HaltStage:   run.HaltStage,
+		HaltReason:  run.HaltReason,
+		Needs:       decodePipelineNeeds(run.NeedsJSON),
+		SpecHash:    run.SpecHash,
+		StartedAt:   pipelineRunTimeJSON(run.StartedAt),
+		FinishedAt:  pipelineRunTimeJSON(run.FinishedAt),
+		Funnel:      pipelineFunnelLine(view.stages),
+		Tokens:      view.tokens,
+	}
+	if out.PayloadJSON == "{}" {
+		out.PayloadJSON = ""
 	}
 	for _, stage := range view.stages {
 		stageJSON := pipelineRunStageJSON{

@@ -53,14 +53,18 @@ func writeTriggerTestAdminCredentials(t *testing.T, home, password string) {
 }
 
 func triggerRecord(t *testing.T, home string) db.Pipeline {
+	return triggerRecordNamed(t, home, "mail-flow")
+}
+
+func triggerRecordNamed(t *testing.T, home, name string) db.Pipeline {
 	t.Helper()
 	var rec db.Pipeline
 	if err := withStore(home, func(store *db.Store) error {
 		var ok bool
 		var err error
-		rec, ok, err = store.GetPipeline(context.Background(), "mail-flow")
+		rec, ok, err = store.GetPipeline(context.Background(), name)
 		if err == nil && !ok {
-			t.Fatal("mail-flow not found")
+			t.Fatalf("%s not found", name)
 		}
 		return err
 	}); err != nil {
@@ -590,5 +594,50 @@ func TestPipelineAddAutoBindUsesStackFrontendURL(t *testing.T) {
 	binding, err := decodeTriggerBinding(triggerRecord(t, home).TriggerBinding)
 	if err != nil || binding.State != triggerBindingBound || binding.FlowID != "auto-flow" || binding.BaseURL != server.URL {
 		t.Fatalf("binding=%+v err=%v stderr=%s", binding, err, stderr.String())
+	}
+}
+
+func TestPipelineTriggerKindNeverTouchesActivepieces(t *testing.T) {
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		http.Error(w, "pipeline triggers must not call Activepieces", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	home := t.TempDir()
+	writeTriggerTestAdminCredentials(t, home, "admin")
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(paths.Home, "activepieces", ".env"), []byte("AP_FRONTEND_URL="+server.URL+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	specFile := writeSpec(t, "name: downstream\nrepo: owner/downstream\ntrigger: {kind: pipeline, pipeline: upstream}\nstages: [{id: run, cmd: echo}]\n")
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"pipeline", "add", specFile, "--enable", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("add exit=%d stderr=%s", code, stderr.String())
+	}
+	if hits != 0 || strings.Contains(stderr.String(), "Activepieces") || strings.Contains(stderr.String(), "trigger is pending") {
+		t.Fatalf("add touched Activepieces: hits=%d stderr=%s", hits, stderr.String())
+	}
+	if binding := triggerRecordNamed(t, home, "downstream").TriggerBinding; binding != "" {
+		t.Fatalf("pipeline trigger wrote binding %q", binding)
+	}
+	if code := Run([]string{"pipeline", "disable", "downstream", "--home", home, "--url", server.URL, "--password", "admin"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("disable exit=%d stderr=%s", code, stderr.String())
+	}
+	if code := Run([]string{"pipeline", "enable", "downstream", "--home", home, "--url", server.URL, "--password", "admin"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("enable exit=%d stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+	if code := Run([]string{"pipeline", "bind-trigger", "downstream", "--home", home, "--url", server.URL, "--password", "admin"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("bind-trigger exit=%d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "no Activepieces binding is needed") {
+		t.Fatalf("bind-trigger message = %q", stdout.String())
+	}
+	if hits != 0 || triggerRecordNamed(t, home, "downstream").TriggerBinding != "" {
+		t.Fatalf("pipeline trigger path touched Activepieces: hits=%d binding=%q", hits, triggerRecordNamed(t, home, "downstream").TriggerBinding)
 	}
 }

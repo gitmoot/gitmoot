@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -13,8 +14,18 @@ func TestTaskEventsMigrationAppliesToExistingDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := legacy.db.Exec(`DROP TABLE task_events; DELETE FROM schema_migrations WHERE version = ?`, len(migrations)); err != nil {
-		t.Fatalf("rewind newest migration: %v", err)
+	taskEventsVersion := 0
+	for i, migration := range migrations {
+		if strings.Contains(migration, "CREATE TABLE IF NOT EXISTS task_events") {
+			taskEventsVersion = i + 1
+			break
+		}
+	}
+	if taskEventsVersion == 0 {
+		t.Fatal("task_events migration not found")
+	}
+	if _, err := legacy.db.Exec(`DROP TABLE task_events; DELETE FROM schema_migrations WHERE version = ?`, taskEventsVersion); err != nil {
+		t.Fatalf("rewind task_events migration: %v", err)
 	}
 	if err := legacy.Close(); err != nil {
 		t.Fatal(err)

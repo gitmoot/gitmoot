@@ -125,6 +125,37 @@ func TestWebDataSourcePipelinesEmpty(t *testing.T) {
 	}
 }
 
+func TestWebDataSourcePipelinesPipelineTriggerMode(t *testing.T) {
+	home := dashboardTestHome(t)
+	store := openPipelineTestStore(t, home)
+	upstreamSpec := "name: upstream\nstages: [{id: run, cmd: echo}]\n"
+	downstreamSpec := "name: downstream\nrepo: owner/downstream\ntrigger: {kind: pipeline, pipeline: upstream}\nstages: [{id: run, cmd: echo}]\n"
+	seedTestPipeline(t, store, db.Pipeline{Name: "upstream", SpecYAML: upstreamSpec})
+	seedTestPipeline(t, store, db.Pipeline{Name: "downstream", Repo: "owner/downstream", SpecYAML: downstreamSpec, Enabled: true})
+	store.Close()
+
+	ds := &webDataSource{home: home}
+	rows, err := ds.Pipelines(context.Background())
+	if err != nil {
+		t.Fatalf("Pipelines: %v", err)
+	}
+	if len(rows) != 2 || rows[0].Name != "downstream" || rows[0].Mode != "after: upstream" {
+		t.Fatalf("pipeline trigger dashboard mode = %+v", rows)
+	}
+	store = openPipelineTestStore(t, home)
+	if removed, err := store.DeletePipeline(context.Background(), "upstream"); err != nil || !removed {
+		t.Fatalf("remove upstream: removed=%v err=%v", removed, err)
+	}
+	store.Close()
+	rows, err = ds.Pipelines(context.Background())
+	if err != nil {
+		t.Fatalf("Pipelines after upstream removal: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Mode != "after: upstream (upstream missing)" {
+		t.Fatalf("missing-upstream dashboard mode = %+v", rows)
+	}
+}
+
 // TestWebDataSourcePipelines pins the list mapping: name order, schedule-state
 // field mapping (including the two time.Time -> epoch-ms conversions), the Recent
 // cap at 10 newest-first, and the Duration = finished-started rule.

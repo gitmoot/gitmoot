@@ -2473,7 +2473,8 @@ carry leaf cluster ids, while parent hubs remain an aggregate view only.
 ## Pipelines
 
 A pipeline (#681) runs a **declared DAG of shell and managed-agent stages** — a
-fixed, repeatable multi-step flow — on demand or on an interval schedule. Each
+fixed, repeatable multi-step flow — on demand, on an interval schedule, or after
+another pipeline succeeds. Each
 stage is an ordinary queued job: shell commands use the shell runtime, while agent
 stages use their registered runtime. The normal worker tick claims and runs it,
 and a scan-based advancer folds each stage's `gitmoot_result` **decision**
@@ -2490,8 +2491,8 @@ repo: owner/repo            # optional to register; REQUIRED to run
 schedule:                   # optional interval schedule (no cron in v1)
   interval: 24h             #   positive Go duration (required with a schedule block)
   jitter: 15m               #   optional random [0, jitter] added to next_due
-trigger:                    # optional generated Activepieces event source
-  kind: email               #   only supported kind
+trigger:                    # optional event source (email or pipeline)
+  kind: email
   connection: gmail-imap    #   default gmail-imap
   mailbox: INBOX            #   default INBOX
   map:                      #   optional output name -> closed email selector
@@ -2521,6 +2522,15 @@ stages:                     # the DAG, keyed by unique id and wired by needs
     retry: 2                # optional; re-attempt a FAILED stage up to N times
 ```
 
+To start this pipeline once for every newly-succeeded run of another pipeline,
+use the alternative pipeline trigger shape (do not combine it with `schedule`):
+
+```yaml
+trigger:
+  kind: pipeline
+  pipeline: upstream-name
+```
+
 ```sh
 gitmoot pipeline add nightly-sync.yaml --enable   # validate + store; omit --enable to add disabled
 gitmoot pipeline install-defaults                 # install built-in memory pipelines, skipping existing names
@@ -2538,7 +2548,8 @@ gitmoot pipeline remove nightly-sync
 ### Reading pipeline status
 
 The registry view is self-describing even before the first run. `mode` is
-`email-triggered (bound|pending|error)`, `scheduled <interval>`, or `manual`, and
+`email-triggered (bound|pending|error)`, `after: <upstream>`,
+`scheduled <interval>`, or `manual`, and
 stage lines carry their kind plus bounded command/prompt previews:
 
 ```text
@@ -2553,8 +2564,9 @@ stages:
 ```
 
 An absent agent row renders as `(unregistered)` without failing `show`.
-`pipeline list` retains six columns and uses `email` in the interval column for a
-trigger pipeline. JSON adds pipeline `mode` and stage `kind`, `agent_runtime`,
+`pipeline list` retains six columns and uses `email` or `after: <upstream>` in
+the interval column for a trigger pipeline. A removed or missing upstream is
+shown as `after: <upstream> (upstream missing)`. JSON adds pipeline `mode` and stage `kind`, `agent_runtime`,
 `prompt_preview`, and `cmd_preview`; the existing full fields remain unchanged.
 
 An enabled `trigger.kind: email` pipeline auto-binds. If Activepieces is down,
@@ -2566,8 +2578,32 @@ Provision the default IMAP connection with
 `gitmoot activepieces connect gmail` (`--with-smtp` is optional and unused by the
 generated receive flow).
 
+An enabled `trigger.kind: pipeline` pipeline fires once for each upstream run
+that reaches `succeeded`; failed and cancelled runs never fire it. The durable
+upstream-run cursor makes daemon re-ticks and restarts idempotent. Adding or
+enabling the downstream re-arms the cursor at the latest upstream run, so old
+history and successes from a disabled period never backfill. If the downstream
+already has an active run, the scan leaves the cursor unchanged and fires after
+that run settles. Missing upstreams warn at add time and remain dormant; removing
+an upstream is allowed. Add-time validation rejects self-reference and trigger
+cycles such as `B -> A -> B`. Pipeline triggers never use Activepieces, and
+`pipeline bind-trigger` reports that no binding is needed.
+
+For example, replace a clock-staggered `memory-ingest-sweep` schedule (such as
+24h30m after a 24h groom) with an ordered success chain:
+
+```yaml
+name: memory-ingest-sweep
+repo: owner/repo
+trigger:
+  kind: pipeline
+  pipeline: memory-groom-propose
+stages: [...]
+```
+
 `pipeline add` validates the whole spec at add time (unknown keys, duplicate/self/
-cyclic `needs`, a stage that is not exactly one of `cmd`/`agent`/`gate`, an agent stage
+cyclic `needs`, self/cyclic pipeline triggers, a schedule+pipeline-trigger hybrid,
+a stage that is not exactly one of `cmd`/`agent`/`gate`, an agent stage
 missing a `prompt` / invalid `action` / `implement` without `write: true` / a mutating
 stage on a scheduled pipeline without `allow_scheduled_writes` / a mutating stage on
 a triggered pipeline without `allow_triggered_writes` / a gate or review's
@@ -2587,7 +2623,8 @@ For a non-empty run payload, every agent stage (including roots) receives a
 dynamically fenced, 6000-byte-bounded `UNTRUSTED external data` block before
 upstream context; each rendered value is capped at 1500 bytes. Shell stages receive
 exact `GITMOOT_TRIGGER_<UPPERCASE_KEY>` exec environment entries, never shell-source
-interpolation. The full canonical payload is retained in the SQLite run row; job
+interpolation. The full canonical payload is retained in the SQLite run row and
+shown by `pipeline show <run-id>` as `payload_json`; job
 env/prompt projections follow normal job-data retention.
 
 Every pipeline shell stage also receives `GITMOOT_PIPELINE_NAME`,

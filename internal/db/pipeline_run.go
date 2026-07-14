@@ -47,10 +47,18 @@ type PipelineRunStage struct {
 	FinishedAt time.Time
 }
 
+type pipelineRunExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
 // CreatePipelineRun inserts a new run row. The caller supplies the id (a
 // deterministic manual/schedule run id); a duplicate id is an error so a
 // double-create is caught rather than silently overwriting an in-flight run.
 func (s *Store) CreatePipelineRun(ctx context.Context, run PipelineRun) error {
+	return insertPipelineRun(ctx, s.db, run)
+}
+
+func insertPipelineRun(ctx context.Context, execer pipelineRunExecer, run PipelineRun) error {
 	run.ID = strings.TrimSpace(run.ID)
 	run.Pipeline = strings.TrimSpace(run.Pipeline)
 	if run.ID == "" {
@@ -68,7 +76,7 @@ func (s *Store) CreatePipelineRun(ctx context.Context, run PipelineRun) error {
 	if strings.TrimSpace(run.PayloadJSON) == "" {
 		run.PayloadJSON = "{}"
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO pipeline_runs(id, pipeline, trigger, payload_json, spec_hash, state, halt_stage, halt_reason, needs_json, started_at, finished_at)
+	_, err := execer.ExecContext(ctx, `INSERT INTO pipeline_runs(id, pipeline, trigger, payload_json, spec_hash, state, halt_stage, halt_reason, needs_json, started_at, finished_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		run.ID, run.Pipeline, strings.TrimSpace(run.Trigger), run.PayloadJSON, strings.TrimSpace(run.SpecHash),
 		strings.TrimSpace(run.State), strings.TrimSpace(run.HaltStage), run.HaltReason, run.NeedsJSON,
@@ -193,6 +201,10 @@ func (s *Store) UpdatePipelineRun(ctx context.Context, run PipelineRun) error {
 // pair is the primary key, so a duplicate is an error (the run-creation path
 // inserts each stage exactly once).
 func (s *Store) CreatePipelineRunStage(ctx context.Context, stage PipelineRunStage) error {
+	return insertPipelineRunStage(ctx, s.db, stage)
+}
+
+func insertPipelineRunStage(ctx context.Context, execer pipelineRunExecer, stage PipelineRunStage) error {
 	stage.RunID = strings.TrimSpace(stage.RunID)
 	stage.StageID = strings.TrimSpace(stage.StageID)
 	if stage.RunID == "" || stage.StageID == "" {
@@ -201,7 +213,7 @@ func (s *Store) CreatePipelineRunStage(ctx context.Context, stage PipelineRunSta
 	if strings.TrimSpace(stage.State) == "" {
 		stage.State = "pending"
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO pipeline_run_stages(run_id, stage_id, state, job_id, attempt, needs_json, summary, started_at, finished_at)
+	_, err := execer.ExecContext(ctx, `INSERT INTO pipeline_run_stages(run_id, stage_id, state, job_id, attempt, needs_json, summary, started_at, finished_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		stage.RunID, stage.StageID, strings.TrimSpace(stage.State), strings.TrimSpace(stage.JobID), stage.Attempt,
 		stage.NeedsJSON, stage.Summary, formatHeartbeatTime(stage.StartedAt), formatHeartbeatTime(stage.FinishedAt))
@@ -287,17 +299,21 @@ func (s *Store) UpdatePipelineRunStage(ctx context.Context, stage PipelineRunSta
 // run to a terminal state. A missing pipeline row is NOT an error: a run outlives a
 // removed pipeline, and the bookkeeping is best-effort observability.
 func (s *Store) UpdatePipelineLastRun(ctx context.Context, name, runID, status string, at time.Time) error {
+	return updatePipelineLastRun(ctx, s.db, name, runID, status, at)
+}
+
+func updatePipelineLastRun(ctx context.Context, execer pipelineRunExecer, name, runID, status string, at time.Time) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return errors.New("pipeline name is required")
 	}
 	if at.IsZero() {
-		_, err := s.db.ExecContext(ctx,
+		_, err := execer.ExecContext(ctx,
 			`UPDATE pipelines SET last_run_id = ?, last_status = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?`,
 			strings.TrimSpace(runID), strings.TrimSpace(status), name)
 		return err
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err := execer.ExecContext(ctx,
 		`UPDATE pipelines SET last_run_at = ?, last_run_id = ?, last_status = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?`,
 		formatHeartbeatTime(at), strings.TrimSpace(runID), strings.TrimSpace(status), name)
 	return err

@@ -1,8 +1,8 @@
 # Run A Fixed Multi-Step Flow (Pipelines)
 
 Pipelines let the gitmoot daemon run a **declared DAG of shell and agent stages** — a fixed,
-repeatable multi-step flow with explicit dependencies — on demand or on an interval
-schedule. Each stage is an ordinary queued job (shell commands use the shell runtime;
+repeatable multi-step flow with explicit dependencies — on demand, on an interval,
+or after another pipeline succeeds. Each stage is an ordinary queued job (shell commands use the shell runtime;
 agent stages use their registered runtime): the
 existing worker tick claims and runs it, and a scan-based **advancer** folds each
 stage's `gitmoot_result` decision and enqueues the stages whose dependencies have all
@@ -28,8 +28,8 @@ repo: owner/repo            # optional to register; REQUIRED to run
 schedule:                   # optional; auto-runs every interval once enabled
   interval: 24h             #   positive Go duration (required with a schedule block)
   jitter: 15m               #   optional random [0, jitter] added to each next_due
-trigger:                    # optional; generated Activepieces event source (requires repo:)
-  kind: email               #   only email in this release
+trigger:                    # optional event source (requires repo:)
+  kind: email
   connection: gmail-imap    #   optional; default gmail-imap
   mailbox: INBOX            #   optional; default INBOX
   map:                      #   optional outputs from closed email selectors
@@ -67,11 +67,41 @@ name/id, a duplicate stage id, a stage that is not exactly one of `cmd`, `agent`
 `implement` without `write: true`, a mutating stage on a scheduled pipeline without
 `allow_scheduled_writes`, a mutating stage on a triggered pipeline without
 `allow_triggered_writes`, a gate/review's bad `source`, or `source` on another kind), an unknown/self/cyclic
-`needs`, an invalid duration, a negative retry, or a
+`needs`, a self/cyclic pipeline trigger, a schedule+pipeline-trigger hybrid, an invalid duration, a negative retry, or a
 `success_decisions` value outside `approved`/`implemented`/`changes_requested`/`skipped` - so a
 structural mistake is a clear error at registration, not a stuck run later. It stores the raw YAML **verbatim**
 plus a content hash; each run snapshots the hash and executes its snapshot, so
 editing the file later never mutates an in-flight run.
+
+### Chain pipelines on success
+
+Use a pipeline trigger when an upstream must finish successfully before the next
+flow starts:
+
+```yaml
+name: memory-ingest-sweep
+repo: owner/repo
+trigger:
+  kind: pipeline
+  pipeline: memory-groom-propose
+stages:
+  - id: sweep
+    cmd: gitmoot memory ingest sweep --json
+```
+
+This replaces a `24h` groom plus `24h30m` ingest clock stagger with real ordering.
+Each newly-succeeded groom run fires ingest once; failed and cancelled runs do
+nothing. A durable cursor makes re-ticks and daemon restarts idempotent. Add and
+enable re-arm at the latest upstream run, preventing historical or disabled-period
+backfill. If ingest already has an active run, its cursor stays put and the same
+upstream success fires after ingest settles.
+
+Pipeline-trigger cycles (including self-reference) are rejected at `pipeline
+add`. A missing upstream warns but is allowed: the downstream stays dormant and
+renders as `after: <upstream> (upstream missing)` until the upstream exists again.
+Pipeline triggers do not use Activepieces, and `pipeline bind-trigger` is a
+friendly no-op for them. Schedule-plus-pipeline hybrids are deliberately rejected
+in this MVP.
 
 ## Manage pipelines
 
@@ -92,7 +122,7 @@ gitmoot pipeline remove <name>
 ### Reading pipeline status
 
 `pipeline show <name>` labels how the pipeline starts: `email-triggered` plus its
-binding state, `scheduled <interval>`, or `manual`. Its stage block leads with the
+binding state, `after: <upstream>`, `scheduled <interval>`, or `manual`. Its stage block leads with the
 stage kind and resolves registered agent stages to their runtime/model settings:
 
 ```text
@@ -115,7 +145,9 @@ Shell commands are collapsed to a single-line preview (about 80 characters), and
 agent prompts to an escaped preview (about 100 characters); an ellipsis marks
 truncation. Missing agent registrations render as `(unregistered)` instead of
 making inspection fail. `pipeline list` keeps its existing six-column shape but
-uses `email` in the interval column for trigger pipelines (`email+6h` when a schedule is also present, and the mode reads `email-triggered (unbound)` before the first bind). `--json` remains
+uses `email` or `after: <upstream>` in the interval column for trigger pipelines
+(`email+6h` when an email schedule is also present, and the mode reads
+`email-triggered (unbound)` before the first bind). `--json` remains
 additive: pipeline objects include `mode`, while stage objects include `kind` and
 the available `agent_runtime`, `prompt_preview`, and `cmd_preview` fields without
 removing the full `prompt` or `cmd`.
@@ -163,7 +195,8 @@ fenced block labeled `UNTRUSTED external data`; each rendered value is capped at
 1500 bytes and the whole block at 6000 bytes with explicit truncation markers.
 Every shell stage receives exact `GITMOOT_TRIGGER_<UPPERCASE_KEY>` exec environment
 entries. Values are never interpolated into shell source, so newlines and UTF-8
-remain data. The full canonical payload lives in the SQLite run row; shell env and
+remain data. The full canonical payload lives in the SQLite run row, is printed
+as `payload_json` by `pipeline show <run-id>`, and shell env and
 agent prompt projections also live in normal job data.
 
 ### Shell-stage upstream context
@@ -199,7 +232,7 @@ never evaluate them as shell source, and do not put credentials in summaries.
 
 A triggered pipeline containing an `implement` or `produce` stage must set
 `allow_triggered_writes: true`, in addition to each stage's `write: true`. This is
-independent of `allow_scheduled_writes` when a pipeline has both trigger and schedule.
+independent of `allow_scheduled_writes` when an email pipeline has both trigger and schedule.
 
 `pipeline install-defaults` installs Gitmoot's built-in memory pipelines:
 `memory-ingest-sweep` and `memory-groom-propose`. The daemon also runs that

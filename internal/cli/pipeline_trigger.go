@@ -156,6 +156,9 @@ func bindPipelineTrigger(ctx context.Context, store *db.Store, rec db.Pipeline, 
 	if spec.Trigger == nil {
 		return pipelineTriggerBinding{}, fmt.Errorf("pipeline %s has no trigger block", rec.Name)
 	}
+	if spec.Trigger.Kind != "email" {
+		return pipelineTriggerBinding{}, fmt.Errorf("pipeline %s uses a %s trigger; Activepieces binding is only for kind: email", rec.Name, spec.Trigger.Kind)
+	}
 	binding, err := decodeTriggerBinding(rec.TriggerBinding)
 	if err != nil {
 		return pipelineTriggerBinding{}, err
@@ -322,6 +325,9 @@ func triggerFlowOwned(flow activepieces.Flow, displayName, bindingID string) boo
 }
 
 func disablePipelineTrigger(ctx context.Context, store *db.Store, rec db.Pipeline, auth activepiecesAuthOptions) error {
+	if spec, err := pipeline.Load([]byte(rec.SpecYAML)); err == nil && spec.Trigger != nil && spec.Trigger.Kind != "email" {
+		return nil
+	}
 	binding, err := decodeTriggerBinding(rec.TriggerBinding)
 	if err != nil || binding.FlowID == "" {
 		return err
@@ -357,6 +363,9 @@ func disablePipelineTrigger(ctx context.Context, store *db.Store, rec db.Pipelin
 }
 
 func deletePipelineTrigger(ctx context.Context, rec db.Pipeline, auth activepiecesAuthOptions) error {
+	if spec, err := pipeline.Load([]byte(rec.SpecYAML)); err == nil && spec.Trigger != nil && spec.Trigger.Kind != "email" {
+		return nil
+	}
 	binding, err := decodeTriggerBinding(rec.TriggerBinding)
 	if err != nil || binding.FlowID == "" {
 		return err
@@ -383,6 +392,9 @@ func deletePipelineTrigger(ctx context.Context, rec db.Pipeline, auth activepiec
 }
 
 func cleanupPipelineTrigger(ctx context.Context, store *db.Store, rec db.Pipeline, auth activepiecesAuthOptions) error {
+	if spec, err := pipeline.Load([]byte(rec.SpecYAML)); err == nil && spec.Trigger != nil && spec.Trigger.Kind != "email" {
+		return nil
+	}
 	if err := deletePipelineTrigger(ctx, rec, auth); err != nil {
 		return err
 	}
@@ -415,6 +427,7 @@ func runPipelineBindTrigger(args []string, stdout, stderr io.Writer) int {
 	name := strings.TrimSpace(fs.Arg(0))
 	var binding pipelineTriggerBinding
 	cleaned := false
+	noBindingNeeded := false
 	if err := withStore(*home, func(store *db.Store) error {
 		rec, ok, err := store.GetPipeline(context.Background(), name)
 		if err != nil {
@@ -438,6 +451,10 @@ func runPipelineBindTrigger(args []string, stdout, stderr io.Writer) int {
 			cleaned = true
 			return nil
 		}
+		if spec.Trigger.Kind == "pipeline" {
+			noBindingNeeded = true
+			return nil
+		}
 		binding, err = bindPipelineTrigger(context.Background(), store, rec, auth, triggerBindingError)
 		return err
 	}); err != nil {
@@ -446,6 +463,10 @@ func runPipelineBindTrigger(args []string, stdout, stderr io.Writer) int {
 	}
 	if cleaned {
 		writeLine(stdout, "cleaned up stale trigger flow for pipeline %s", name)
+		return 0
+	}
+	if noBindingNeeded {
+		writeLine(stdout, "pipeline %s uses a pipeline trigger; no Activepieces binding is needed", name)
 		return 0
 	}
 	writeLine(stdout, "bound trigger for pipeline %s (flow %s, state=%s)", name, binding.FlowID, binding.State)

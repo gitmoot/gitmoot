@@ -1078,6 +1078,32 @@ RUN=$(gitmoot pipeline run nightly-sync)          # or trigger a manual run now
 gitmoot pipeline show "$RUN"                       # watch the text funnel
 ```
 
+### Chain a pipeline after another succeeds
+
+Use `kind: pipeline` when ordering matters more than a clock stagger. This
+example runs ingest exactly once after each newly-succeeded groom run:
+
+```yaml
+name: memory-ingest-sweep
+repo: owner/repo
+trigger:
+  kind: pipeline
+  pipeline: memory-groom-propose
+stages:
+  - id: sweep
+    cmd: gitmoot memory ingest sweep --json
+```
+
+This replaces the old `24h` / `24h30m` imitation of ordering: failed or cancelled
+groom runs do not start ingest, while each successful run fires it once. The
+cursor is durable across daemon restarts. Adding or enabling ingest arms at the
+latest groom run, so no historical or disabled-period runs backfill. If ingest
+is already active, its cursor does not move and it fires after settlement.
+Pipeline-trigger cycles are rejected at add time. A missing or later-removed
+upstream is allowed but leaves the downstream dormant and visibly marked
+`(upstream missing)`. Pipeline triggers are local database state and never use
+Activepieces; `pipeline bind-trigger` is an informational no-op for them.
+
 A stage prints a `gitmoot_result` blob to stdout to signal its decision; the
 advancer folds by that **decision**, never the job's exit state:
 
