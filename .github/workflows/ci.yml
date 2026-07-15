@@ -17,8 +17,8 @@ name: CI
 #   - RACE BUILD: four package jobs compile one -race test binary each. Every
 #     package's full current test list is partitioned and asserted to appear
 #     exactly once before its binary + shard plan are uploaded.
-#   - RACE RUN: internal/cli is split 5 ways, internal/db 2 ways,
-#     internal/workflow 3 ways, and internal/daemon 1 way. Each runner downloads
+#   - RACE RUN: internal/cli is split 8 ways, internal/db 2 ways,
+#     internal/workflow 4 ways, and internal/daemon 1 way. Each runner downloads
 #     the package bundle and executes from the package directory, preserving Go
 #     test-binary working-directory semantics without recompiling.
 #   - TIMINGS: PRs use the newest non-expired main timing artifact (up to 30
@@ -163,11 +163,11 @@ jobs:
       matrix:
         include:
           - package: cli
-            shards: 5
+            shards: 8
           - package: db
             shards: 2
           - package: workflow
-            shards: 3
+            shards: 4
           - package: daemon
             shards: 1
     steps:
@@ -254,16 +254,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {package: cli, shard: 0, shards: 5}
-          - {package: cli, shard: 1, shards: 5}
-          - {package: cli, shard: 2, shards: 5}
-          - {package: cli, shard: 3, shards: 5}
-          - {package: cli, shard: 4, shards: 5}
+          - {package: cli, shard: 0, shards: 8}
+          - {package: cli, shard: 1, shards: 8}
+          - {package: cli, shard: 2, shards: 8}
+          - {package: cli, shard: 3, shards: 8}
+          - {package: cli, shard: 4, shards: 8}
+          - {package: cli, shard: 5, shards: 8}
+          - {package: cli, shard: 6, shards: 8}
+          - {package: cli, shard: 7, shards: 8}
           - {package: db, shard: 0, shards: 2}
           - {package: db, shard: 1, shards: 2}
-          - {package: workflow, shard: 0, shards: 3}
-          - {package: workflow, shard: 1, shards: 3}
-          - {package: workflow, shard: 2, shards: 3}
+          - {package: workflow, shard: 0, shards: 4}
+          - {package: workflow, shard: 1, shards: 4}
+          - {package: workflow, shard: 2, shards: 4}
+          - {package: workflow, shard: 3, shards: 4}
           - {package: daemon, shard: 0, shards: 1}
     steps:
       - name: Checkout
