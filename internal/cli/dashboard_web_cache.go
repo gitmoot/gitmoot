@@ -41,6 +41,12 @@ var dashboardCachePolicies = []dashboardCachePolicy{
 	{endpoint: "agents", keyKind: "job-event-id", retain: true, minRecompute: 5 * time.Second, maxAge: 30 * time.Second},
 	{endpoint: "tasks", keyKind: "task-event-id", retain: true, minRecompute: 2 * time.Second, maxAge: 15 * time.Second},
 	{endpoint: "workflows", keyKind: "job-event-id+workflow-note-id", retain: true, minRecompute: 5 * time.Second, maxAge: 15 * time.Second},
+	// knowledge (#962): the memory-cluster hierarchy costs ~1s CPU per compute
+	// and its inputs (memory tables) advance NO cursor component, so freshness
+	// is TTL-only. The hierarchy changes on memory writes (minutes-scale); 60s
+	// staleness is honest for a browsing surface and turns the needs-you
+	// radar's per-client polling into one compute per minute.
+	{endpoint: "knowledge", keyKind: "ttl-only", retain: true, minRecompute: 15 * time.Second, maxAge: 60 * time.Second},
 }
 
 var (
@@ -52,6 +58,7 @@ var (
 	dashboardAgentsCachePolicy    = dashboardCachePolicies[5]
 	dashboardTasksCachePolicy     = dashboardCachePolicies[6]
 	dashboardWorkflowsCachePolicy = dashboardCachePolicies[7]
+	dashboardKnowledgeCachePolicy = dashboardCachePolicies[8]
 )
 
 type dashboardCacheEntry struct {

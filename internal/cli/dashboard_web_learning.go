@@ -378,10 +378,18 @@ type dashboardKnowledgeCluster struct {
 }
 
 func (d *webDataSource) handleLearningKnowledge(w http.ResponseWriter, r *http.Request) {
-	k, sharedByFact, parentByCluster, err := d.knowledgeWithShared(r.Context())
+	// #962: the cluster hierarchy is the dashboard's most expensive compute and
+	// is radar-polled per client; serve it through the response cache. The
+	// cursor is a constant because no cursor component covers memory writes —
+	// the policy's TTLs alone govern freshness.
+	body, outcome, err := d.cacheForDashboard().get(r.Context(), "knowledge", "ttl", dashboardKnowledgeCachePolicy, d.knowledgeJSON)
+	d.writeCachedDashboardJSON(w, outcome, body, err)
+}
+
+func (d *webDataSource) knowledgeJSON(ctx context.Context) ([]byte, error) {
+	k, sharedByFact, parentByCluster, err := d.knowledgeWithShared(ctx)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return nil, err
 	}
 	resp := dashboardKnowledgeResponse{
 		Agents:   k.Agents,
@@ -403,13 +411,9 @@ func (d *webDataSource) handleLearningKnowledge(w http.ResponseWriter, r *http.R
 	}
 	buf, err := json.MarshalIndent(resp, "", "  ")
 	if err != nil {
-		http.Error(w, "internal error: "+err.Error(), http.StatusInternalServerError)
-		return
+		return nil, err
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	buf = append(buf, '\n')
-	_, _ = w.Write(buf)
+	return append(buf, '\n'), nil
 }
 
 // factSourceFileMarkers are the Provenance prefixes the file-ingest write paths
