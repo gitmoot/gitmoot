@@ -36,6 +36,12 @@ func runPipeline(args []string, stdout, stderr io.Writer) int {
 		return runPipelineExport(args[1:], stdout, stderr)
 	case "import":
 		return runPipelineImport(args[1:], stdout, stderr)
+	case "publish":
+		return runPipelinePublish(args[1:], stdout, stderr)
+	case "pull":
+		return runPipelinePull(args[1:], stdout, stderr)
+	case "remote":
+		return runPipelineRemote(args[1:], stdout, stderr)
 	case "install-defaults":
 		return runPipelineInstallDefaults(args[1:], stdout, stderr)
 	case "list":
@@ -68,6 +74,11 @@ func printPipelineUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot pipeline add <spec.yaml> [--enable]")
 	fmt.Fprintln(w, "  gitmoot pipeline export <name> --output <dir>")
 	fmt.Fprintln(w, "  gitmoot pipeline import <dir> --repo owner/name [--name <newname>] [--agent-map exported=local ...] [--force] [--enable]")
+	fmt.Fprintln(w, "  gitmoot pipeline publish <name> [--remote owner/repo] [--create]")
+	fmt.Fprintln(w, "  gitmoot pipeline pull <name> [--remote owner/repo] --repo owner/name [--name <newname>] [--agent-map exported=local ...] [--force] [--enable]")
+	fmt.Fprintln(w, "  gitmoot pipeline pull --list [--remote owner/repo]")
+	fmt.Fprintln(w, "  gitmoot pipeline remote set <owner/repo> [--ref <ref>] [--path <subdir>]")
+	fmt.Fprintln(w, "  gitmoot pipeline remote show")
 	fmt.Fprintln(w, "  gitmoot pipeline install-defaults")
 	fmt.Fprintln(w, "  gitmoot pipeline list [--json]")
 	fmt.Fprintln(w, "  gitmoot pipeline run <name>")

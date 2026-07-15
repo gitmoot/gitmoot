@@ -24,11 +24,11 @@ import (
 )
 
 // fakeGitHubBackend is a SINGLE faithful in-memory "GitHub" sitting at the gh
-// wire boundary (a subprocess.Runner). It is shared by BOTH the publish path
-// (github.GhClient.UpsertFile / RepositoryExists / CreateRepository) and the
-// pull/add path (agenttemplate.GHFetcher.ResolveRef / FetchFile / ListDir), so
-// the bytes `publish` PUTs are EXACTLY the bytes `pull`/`add --from-repo` GET
-// back. Everything above the wire (Export -> FormatTemplateContent -> publish ->
+// wire boundary (a subprocess.Runner). Template and pipeline round-trip E2Es
+// share it across the write path (github.GhClient Upsert/Delete/Create) and the
+// read path (agenttemplate.GHFetcher ResolveRef/FetchFile/ListDir), so bytes a
+// publisher PUTs are EXACTLY the bytes pull/add GET back. Everything above the
+// wire (Export -> FormatTemplateContent -> publish ->
 // UpsertFile; pull -> ListDir -> AddRemote -> ParseTemplateContent -> store) is
 // the real CLI/agenttemplate code. If publish and pull disagreed on the path or
 // the encoding, the GET would 404 (PullFailed) or decode to different bytes, and
@@ -105,6 +105,12 @@ func (b *fakeGitHubBackend) handleAPI(args []string) (subprocess.Result, error) 
 		body := fmt.Sprintf(`{"content":{"path":%q,"html_url":%q,"sha":%q}}`,
 			path, "https://github.com/"+repo+"/blob/main/"+path, blobSHA(content))
 		return subprocess.Result{Stdout: body}, nil
+	case "DELETE":
+		if _, ok := b.files[repo][path]; !ok {
+			return subprocess.Result{Stderr: "gh: Not Found (HTTP 404)"}, errors.New("not found")
+		}
+		delete(b.files[repo], path)
+		return subprocess.Result{Stdout: `{}`}, nil
 	default: // GET — serves UpsertFile's sha probe, FetchFile, and ListDir.
 		if data, ok := b.files[repo][path]; ok {
 			// A single-file contents response: `.sha` answers UpsertFile's probe,

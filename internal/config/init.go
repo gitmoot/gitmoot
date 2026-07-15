@@ -127,6 +127,16 @@ repo = ""
 ref = ""
 path = ""
 
+# [pipeline_remote] is the OPTIONAL default GitHub repo used by pipeline
+# publish / pull when --remote is omitted (#941). repo is owner/repo; ref
+# defaults to "main"; path defaults to "pipelines". Pipeline bundles include
+# agent-template prompts verbatim, so keep the remote private unless those
+# prompts are intentionally public.
+[pipeline_remote]
+repo = ""
+ref = ""
+path = ""
+
 # [memory] is the OFF-BY-DEFAULT agent persistent-memory read-path policy (#626).
 # With no [memory] section AND no agent enrolled, behavior is byte-identical: no
 # learnings block is ever injected and the feature is entirely inert. Enrollment is
