@@ -3628,6 +3628,29 @@ func (s *Store) GetLatestJobEventByKind(ctx context.Context, jobID, kind string)
 	return event, err == nil, err
 }
 
+// LatestAdvancementMarker returns the most recent post-delivery advancement
+// marker kind for jobID (or "" when the job has none). The kind set is exactly
+// the one jobNeedsAdvanceRetry (daemon.go) evaluates last-one-wins, so this is a
+// cheap way for the emitter to stay idempotent: a job already sitting on
+// advance_retry must not append another advance_retry on every ~1s tick — that
+// unbounded growth is what pinned a core once job_events reached hundreds of
+// thousands of rows (JobIDsWithPendingAdvanceRetry's per-tick GROUP BY and
+// jobNeedsAdvanceRetry's per-job ListJobEvents both scale with those rows). The
+// job stays a retry candidate regardless (last-one-wins is unchanged); only the
+// duplicate row is elided.
+func (s *Store) LatestAdvancementMarker(ctx context.Context, jobID string) (string, error) {
+	var kind string
+	err := s.db.QueryRowContext(ctx, `SELECT kind FROM job_events
+		WHERE job_id = ? AND kind IN (
+			'advance_started', 'advance_retry', 'advance_completed',
+			'advance_retried', 'advance_blocked', 'advance_retry_skipped', 'retry_queued')
+		ORDER BY id DESC LIMIT 1`, jobID).Scan(&kind)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return kind, err
+}
+
 // GetLatestJobEventsByKind returns the newest event of kind for each requested
 // job in one indexed query. Empty input returns an initialized empty map.
 func (s *Store) GetLatestJobEventsByKind(ctx context.Context, jobIDs []string, kind string) (map[string]JobEvent, error) {
@@ -9095,4 +9118,21 @@ CREATE TABLE pipeline_trigger_states (
 );
 CREATE INDEX idx_pipeline_trigger_states_upstream ON pipeline_trigger_states(upstream_pipeline);
 		`,
+	// Collapse unbounded advance_retry history. A terminal job whose post-delivery
+	// advancement kept failing appended a fresh advance_retry event on EVERY ~1s
+	// tick, so job_events grew without limit — a real install reached ~1.8M rows
+	// (96% of the table), and the per-tick JobIDsWithPendingAdvanceRetry GROUP BY
+	// over them (plus jobNeedsAdvanceRetry's per-job ListJobEvents) pinned a whole
+	// core with zero jobs in flight. Only the LATEST advance_retry per job is ever
+	// consulted (last-one-wins), so every earlier duplicate is dead weight: keep
+	// the max-id row per job and drop the rest. The emission path is idempotent
+	// now (recordAdvanceRetryOnce), so this is a one-time heal, not a recurring
+	// clean-up. Candidate/predicate semantics are unchanged: the surviving row is
+	// the newest advance_retry, so MAX(id) and last-one-wins both see the same
+	// result they did before.
+	`
+DELETE FROM job_events
+WHERE kind = 'advance_retry'
+  AND id NOT IN (SELECT MAX(id) FROM job_events WHERE kind = 'advance_retry' GROUP BY job_id);
+	`,
 }

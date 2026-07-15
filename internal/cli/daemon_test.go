@@ -4964,6 +4964,72 @@ func TestRunQueuedJobsRecordsPostDeliveryWorkflowErrorForRetry(t *testing.T) {
 	}
 }
 
+// TestRetryPendingJobAdvancementsDoesNotAccumulateAdvanceRetry guards the fix for
+// the unbounded job_events growth that pinned a daemon core: a job whose
+// post-delivery advancement keeps failing must NOT append a fresh advance_retry
+// on every tick. Across many failed retry passes the job stays a candidate but
+// its advance_retry row count stays at one.
+func TestRetryPendingJobAdvancementsDoesNotAccumulateAdvanceRetry(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
+	seedDaemonWorkerAgent(t, store, "reviewer", runtime.ShellRuntime, "unused", []string{"review"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID:          "job-review",
+		Agent:       "reviewer",
+		Action:      "review",
+		Repo:        "owner/repo",
+		Branch:      "task-1",
+		PullRequest: 1,
+		TaskID:      "task-1",
+		HeadSHA:     strings.Repeat("a", 40),
+	})
+	gate := &cliWorkerFakeMergeGate{err: errors.New("github unavailable")}
+	adapter := &cliWorkerFakeAdapter{
+		output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+	}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return t.TempDir(), nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return adapter, nil
+	}
+	worker.WorkflowFactory = func(string) workflow.Engine {
+		return workflow.Engine{Store: store, MergeGate: gate}
+	}
+	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+	// The gate stays broken: every retry pass fails advancement again.
+	for i := 0; i < 5; i++ {
+		if err := retryPendingJobAdvancements(ctx, worker, "", "", nil, newTickCandidates(worker.Store)); err != nil {
+			t.Fatalf("retryPendingJobAdvancements pass %d returned error: %v", i, err)
+		}
+	}
+	events, err := store.ListJobEvents(ctx, "job-review")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	retries := 0
+	for _, e := range events {
+		if e.Kind == "advance_retry" {
+			retries++
+		}
+	}
+	if retries != 1 {
+		t.Fatalf("advance_retry events = %d after 5 failed retry passes, want 1 (no per-tick accumulation)", retries)
+	}
+	// Still a live candidate — the job is not silently dropped from retry.
+	ids, err := store.JobIDsWithPendingAdvanceRetry(ctx)
+	if err != nil {
+		t.Fatalf("JobIDsWithPendingAdvanceRetry returned error: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != "job-review" {
+		t.Fatalf("pending advance-retry candidates = %v, want [job-review]", ids)
+	}
+}
+
 func TestRetryPendingJobAdvancementsRecoversStartedAdvancement(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
