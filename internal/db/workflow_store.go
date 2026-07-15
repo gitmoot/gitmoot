@@ -71,10 +71,14 @@ type WorkflowSummary struct {
 	LastAt       string `json:"last_activity"`
 	LastNote     string `json:"last_note,omitempty"`
 	LastAuthor   string `json:"last_author,omitempty"`
-	// LastFailureAt/LastNoteAt let the dashboard's stalled derivation apply the
-	// acknowledgment rule: a failure with a LATER journal note is not an alarm.
-	LastFailureAt string `json:"last_failure_at,omitempty"`
-	LastNoteAt    string `json:"last_note_at,omitempty"`
+	// LastNote and LastAuthor describe the literal latest journal entry, including
+	// daemon receipts. LastFailureAt/LastHumanNoteAt let the dashboard apply the
+	// acknowledgment rule: daemon lifecycle receipts remain activity, but only a
+	// non-daemon note acknowledges a failure.
+	LastFailureAt   string `json:"last_failure_at,omitempty"`
+	LastNoteAt      string `json:"last_note_at,omitempty"`
+	LastHumanAuthor string `json:"last_human_author,omitempty"`
+	LastHumanNoteAt string `json:"last_human_note_at,omitempty"`
 }
 
 // Exported query constants keep production SQL and EXPLAIN regression tests on
@@ -110,7 +114,11 @@ const workflowSummarySelectSQL = `WITH job_summary AS (
 			ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1), '') AS last_note,
 		COALESCE((SELECT latest.author FROM workflow_notes latest
 			WHERE latest.workflow_id = n.workflow_id
-			ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1), '') AS last_author
+			ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1), '') AS last_author,
+		COALESCE((SELECT latest.author FROM workflow_notes latest
+			WHERE latest.workflow_id = n.workflow_id AND latest.author != 'daemon'
+			ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1), '') AS last_human_author,
+		MAX(CASE WHEN n.author != 'daemon' THEN n.created_at END) AS last_human_at
 	FROM workflow_notes n INDEXED BY idx_workflow_notes_wid
 	GROUP BY n.workflow_id
 ), labels AS (
@@ -133,8 +141,8 @@ SELECT labels.workflow_id,
 		WHEN n.last_at IS NULL THEN j.last_at
 		WHEN j.last_at >= n.last_at THEN j.last_at ELSE n.last_at
 	END AS last_at,
-	COALESCE(n.last_note, ''), COALESCE(n.last_author, ''),
-	COALESCE(j.last_failure_at, ''), COALESCE(n.last_at, '')
+	COALESCE(n.last_note, ''), COALESCE(n.last_author, ''), COALESCE(n.last_human_author, ''),
+	COALESCE(j.last_failure_at, ''), COALESCE(n.last_at, ''), COALESCE(n.last_human_at, '')
 FROM labels
 LEFT JOIN job_summary j ON j.workflow_id = labels.workflow_id
 LEFT JOIN note_summary n ON n.workflow_id = labels.workflow_id`
@@ -363,7 +371,7 @@ func upsertWorkflowMetaTx(ctx context.Context, tx *sql.Tx, meta WorkflowMeta) er
 	_, err := tx.ExecContext(ctx, `INSERT INTO workflow_meta(workflow_id, author, pane, session_id, workdir, summary, description, status, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 ON CONFLICT(workflow_id) DO UPDATE SET
-	author = excluded.author,
+	author = CASE WHEN excluded.author != '' THEN excluded.author ELSE workflow_meta.author END,
 	pane = CASE WHEN excluded.pane != '' THEN excluded.pane ELSE workflow_meta.pane END,
 	session_id = CASE WHEN excluded.session_id != '' THEN excluded.session_id ELSE workflow_meta.session_id END,
 	workdir = CASE WHEN excluded.workdir != '' THEN excluded.workdir ELSE workflow_meta.workdir END,
@@ -647,7 +655,8 @@ func (s *Store) ListWorkflowSummaries(ctx context.Context) ([]WorkflowSummary, e
 		if err := rows.Scan(&item.WorkflowID, &item.JobCount, &item.Queued, &item.Running,
 			&item.Succeeded, &item.Failed, &item.Blocked, &item.Cancelled,
 			&item.InputTokens, &item.OutputTokens, &item.NoteCount, &item.FirstAt, &item.LastAt,
-			&item.LastNote, &item.LastAuthor, &item.LastFailureAt, &item.LastNoteAt); err != nil {
+			&item.LastNote, &item.LastAuthor, &item.LastHumanAuthor, &item.LastFailureAt,
+			&item.LastNoteAt, &item.LastHumanNoteAt); err != nil {
 			return nil, err
 		}
 		out = append(out, item)
@@ -743,7 +752,7 @@ func (s *Store) WorkflowSummary(ctx context.Context, workflowID string) (Workflo
 		&item.WorkflowID, &item.JobCount, &item.Queued, &item.Running, &item.Succeeded,
 		&item.Failed, &item.Blocked, &item.Cancelled, &item.InputTokens,
 		&item.OutputTokens, &item.NoteCount, &firstAt, &lastAt, &item.LastNote, &item.LastAuthor,
-		&item.LastFailureAt, &item.LastNoteAt)
+		&item.LastHumanAuthor, &item.LastFailureAt, &item.LastNoteAt, &item.LastHumanNoteAt)
 	if err != nil {
 		return WorkflowSummary{}, err
 	}

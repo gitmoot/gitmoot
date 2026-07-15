@@ -23,11 +23,11 @@ const (
 type dashboardWorkflowActivity struct {
 	Queued, Running, Failed, Blocked int
 	LastActivity                     time.Time
-	// LastFailure/LastNote drive the acknowledgment rule: a failure is only an
-	// alarm while no journal note has been written AFTER it ("a failure alone is
-	// not an alarm — the silence after it is").
-	LastFailure time.Time
-	LastNote    time.Time
+	// LastFailure/LastHumanNote drive the acknowledgment rule: a failure is only
+	// an alarm while no human journal note has been written AFTER it. Daemon PR
+	// receipts remain ordinary activity but cannot acknowledge an alarm.
+	LastFailure   time.Time
+	LastHumanNote time.Time
 }
 
 // deriveDashboardWorkflowState is the single lifecycle definition shared by
@@ -38,7 +38,7 @@ func deriveDashboardWorkflowState(now time.Time, activity dashboardWorkflowActiv
 		return "active", 0
 	}
 	failureUnacknowledged := !activity.LastFailure.IsZero() &&
-		(activity.LastNote.IsZero() || activity.LastNote.Before(activity.LastFailure))
+		(activity.LastHumanNote.IsZero() || activity.LastHumanNote.Before(activity.LastFailure))
 	if (activity.Failed > 0 || activity.Blocked > 0) && failureUnacknowledged &&
 		age > dashboardWorkflowActiveWindow && age < dashboardWorkflowStalledHorizon {
 		return "stalled", max(0, int64(age/time.Second))
@@ -122,12 +122,12 @@ func dashboardWorkflowEntry(now time.Time, summary db.WorkflowSummary, meta db.W
 	state, stalledFor := deriveDashboardWorkflowState(now, dashboardWorkflowActivity{
 		Queued: summary.Queued, Running: summary.Running, Failed: summary.Failed,
 		Blocked: summary.Blocked, LastActivity: workflowMillisTime(lastAt),
-		LastFailure: workflowMillisTime(parseJobTimeMillis(summary.LastFailureAt)),
-		LastNote:    workflowMillisTime(parseJobTimeMillis(summary.LastNoteAt)),
+		LastFailure:   workflowMillisTime(parseJobTimeMillis(summary.LastFailureAt)),
+		LastHumanNote: workflowMillisTime(parseJobTimeMillis(summary.LastHumanNoteAt)),
 	})
 	author := strings.TrimSpace(meta.Author)
 	if author == "" {
-		author = strings.TrimSpace(summary.LastAuthor)
+		author = strings.TrimSpace(summary.LastHumanAuthor)
 	}
 	namespace, campaign := splitDashboardWorkflowLabel(summary.WorkflowID)
 	description := workflowDisplayDescription(summary.WorkflowID, meta.Description)

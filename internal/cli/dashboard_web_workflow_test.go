@@ -31,8 +31,9 @@ func TestDeriveDashboardWorkflowState(t *testing.T) {
 		{name: "recent terminal is recent", activity: dashboardWorkflowActivity{LastActivity: now.Add(-10 * time.Minute)}, state: "recent"},
 		{name: "unacknowledged failure is stalled", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-31 * time.Minute), LastFailure: now.Add(-31 * time.Minute)}, state: "stalled", stalled: 31 * 60},
 		{name: "unacknowledged block is stalled", activity: dashboardWorkflowActivity{Blocked: 1, LastActivity: now.Add(-23 * time.Hour), LastFailure: now.Add(-23 * time.Hour)}, state: "stalled", stalled: 23 * 60 * 60},
-		{name: "note before failure does not acknowledge", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-40 * time.Minute), LastFailure: now.Add(-40 * time.Minute), LastNote: now.Add(-2 * time.Hour)}, state: "stalled", stalled: 40 * 60},
-		{name: "acknowledged failure is settled", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-31 * time.Minute), LastFailure: now.Add(-1 * time.Hour), LastNote: now.Add(-31 * time.Minute)}, state: "settled"},
+		{name: "human note before failure does not acknowledge", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-40 * time.Minute), LastFailure: now.Add(-40 * time.Minute), LastHumanNote: now.Add(-2 * time.Hour)}, state: "stalled", stalled: 40 * 60},
+		{name: "daemon note after failure does not acknowledge", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-40 * time.Minute), LastFailure: now.Add(-1 * time.Hour)}, state: "stalled", stalled: 40 * 60},
+		{name: "human note after failure acknowledges", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-31 * time.Minute), LastFailure: now.Add(-1 * time.Hour), LastHumanNote: now.Add(-31 * time.Minute)}, state: "settled"},
 		{name: "failure without timestamp is settled", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-31 * time.Minute)}, state: "settled"},
 		{name: "successful quiet is settled", activity: dashboardWorkflowActivity{LastActivity: now.Add(-45 * time.Minute)}, state: "settled"},
 		{name: "stalled ages out at horizon", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-24 * time.Hour), LastFailure: now.Add(-24 * time.Hour)}, state: "settled"},
@@ -464,6 +465,72 @@ func TestWebDataSourceWorkflowsIndexLifecycleCoordinatorAndSlashDetail(t *testin
 	}
 	if detail.Summary.Label != "fable/dashboard-redesign" || detail.Summary.Summary != "Ship the dashboard redesign." || detail.State != "active" || detail.Coordinator.Pane != "wave-2" || detail.Coordinator.SessionID != workflowCoordinatorTestSession || detail.WorkDir != "/work/dashboard" || len(detail.Runs) != 1 || detail.Runs[0].Agent != "worker" || detail.Runs[0].Repo != "acme/dashboard" {
 		t.Fatalf("namespaced detail = %+v", detail)
+	}
+}
+
+func TestDashboardWorkflowDaemonNotesDoNotAcknowledgeFailuresOrImpersonateCoordinator(t *testing.T) {
+	home := dashboardTestHome(t)
+	paths := config.PathsForHome(home)
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	ctx := context.Background()
+	const label = "ops/needs-attention"
+	mustCreateJob(t, store, db.Job{
+		ID: "failed-job", Agent: "worker", Type: "implement", State: "failed",
+		Payload: mustJSON(t, workflow.JobPayload{WorkflowID: label, Repo: "acme/ops", TaskTitle: "failed work"}),
+	}, "", "")
+	human, err := store.InsertWorkflowNoteWithMeta(ctx,
+		db.WorkflowNote{WorkflowID: label, Author: "coordinator", Body: "human handoff before failure"},
+		db.WorkflowMeta{Author: "coordinator", Pane: "ops-pane", SessionID: workflowCoordinatorTestSession, WorkDir: "/work/ops"})
+	if err != nil {
+		t.Fatalf("Insert human note: %v", err)
+	}
+	auto, inserted, err := store.InsertWorkflowAutoNoteWithMeta(ctx,
+		db.WorkflowNote{WorkflowID: label, Author: db.WorkflowAutoNoteAuthor, Body: "[auto:pr:958:closed] PR #958 closed without merging"},
+		db.WorkflowMeta{WorkflowID: label, Status: "PR #958 closed without merging", StatusSet: true})
+	if err != nil || !inserted {
+		t.Fatalf("Insert daemon note = (inserted=%v, err=%v)", inserted, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	format := func(value time.Time) string { return value.Format("2006-01-02 15:04:05") }
+	setJobTimes(t, home, "failed-job", format(now.Add(-2*time.Hour)), format(now.Add(-2*time.Hour)))
+	raw, err := sql.Open("sqlite", paths.Database)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	for id, stamp := range map[int64]string{
+		human.ID: format(now.Add(-3 * time.Hour)),
+		auto.ID:  format(now.Add(-40 * time.Minute)),
+	} {
+		if _, err := raw.Exec(`UPDATE workflow_notes SET created_at = ? WHERE id = ?`, stamp, id); err != nil {
+			t.Fatalf("UPDATE workflow note %d: %v", id, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw Close: %v", err)
+	}
+
+	ds := &webDataSource{home: home}
+	entries, err := ds.Workflows(ctx)
+	if err != nil {
+		t.Fatalf("Workflows: %v", err)
+	}
+	entry := workflowIndexEntryByLabel(t, entries, label)
+	if entry.State != "stalled" || entry.Coordinator.Author != "coordinator" || entry.LastNote != "[auto:pr:958:closed] PR #958 closed without merging" {
+		t.Fatalf("index entry = %+v; want stalled workflow with human coordinator and daemon receipt", entry)
+	}
+	detail, err := ds.Workflow(ctx, label, dashboard.WorkflowQuery{})
+	if err != nil {
+		t.Fatalf("Workflow: %v", err)
+	}
+	if detail.State != "stalled" || detail.Coordinator.Author != "coordinator" {
+		t.Fatalf("detail = %+v; want stalled workflow with human coordinator", detail)
 	}
 }
 

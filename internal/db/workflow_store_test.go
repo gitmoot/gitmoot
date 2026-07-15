@@ -347,6 +347,53 @@ func TestWorkflowMetaLastWriteWinsAndObservationFailureRollsBack(t *testing.T) {
 	}
 }
 
+func TestWorkflowAutoNotePreservesCoordinatorAuthor(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	const workflowID = "fable/dashboard-redesign"
+	if _, err := store.InsertWorkflowNoteWithMeta(ctx,
+		WorkflowNote{WorkflowID: workflowID, Author: "fable", Body: "kickoff"},
+		WorkflowMeta{Author: "fable", Pane: "Gitmoot2", SessionID: "full-session", WorkDir: "/work/fable"}); err != nil {
+		t.Fatalf("InsertWorkflowNoteWithMeta kickoff: %v", err)
+	}
+
+	// Production auto-note writers update only status: Author is deliberately
+	// empty so a daemon receipt cannot replace the coordinator identity.
+	_, inserted, err := store.InsertWorkflowAutoNoteWithMeta(ctx,
+		WorkflowNote{WorkflowID: workflowID, Author: WorkflowAutoNoteAuthor, Body: "[auto:pr:958:opened] PR #958 opened (feature/958)"},
+		WorkflowMeta{WorkflowID: workflowID, Status: "PR #958 open", StatusSet: true})
+	if err != nil || !inserted {
+		t.Fatalf("InsertWorkflowAutoNoteWithMeta = (inserted=%v, err=%v)", inserted, err)
+	}
+
+	meta, err := store.GetWorkflowMeta(ctx, workflowID)
+	if err != nil || meta.Author != "fable" || meta.Pane != "Gitmoot2" || meta.SessionID != "full-session" || meta.WorkDir != "/work/fable" || meta.Status != "PR #958 open" {
+		t.Fatalf("metadata after production-shaped auto note = %+v, err=%v", meta, err)
+	}
+}
+
+func TestWorkflowSummarySeparatesDaemonNotesFromHumanAcknowledgment(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	const workflowID = "release/958"
+	if _, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: workflowID, Author: "coordinator", Body: "human handoff"}); err != nil {
+		t.Fatalf("InsertWorkflowNote: %v", err)
+	}
+	if _, inserted, err := store.InsertWorkflowAutoNoteWithMeta(ctx,
+		WorkflowNote{WorkflowID: workflowID, Author: WorkflowAutoNoteAuthor, Body: "[auto:pr:958:closed] PR #958 closed without merging"},
+		WorkflowMeta{WorkflowID: workflowID, Status: "PR #958 closed without merging", StatusSet: true}); err != nil || !inserted {
+		t.Fatalf("InsertWorkflowAutoNoteWithMeta = (inserted=%v, err=%v)", inserted, err)
+	}
+
+	summary, err := store.WorkflowSummary(ctx, workflowID)
+	if err != nil {
+		t.Fatalf("WorkflowSummary: %v", err)
+	}
+	if summary.LastAuthor != WorkflowAutoNoteAuthor || summary.LastHumanAuthor != "coordinator" || summary.LastNoteAt == "" || summary.LastHumanNoteAt == "" {
+		t.Fatalf("summary = %+v; want daemon last author and coordinator last human author", summary)
+	}
+}
+
 func TestWorkflowMetaTextSetPreserveClearAndLimit(t *testing.T) {
 	store := openWorkflowTestStore(t)
 	ctx := context.Background()

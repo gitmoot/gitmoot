@@ -377,8 +377,8 @@ func (d *webDataSource) Workflow(ctx context.Context, label string, q dashboard.
 		out.State, out.StalledForS = deriveDashboardWorkflowState(now, dashboardWorkflowActivity{
 			Queued: summary.Queued, Running: summary.Running, Failed: summary.Failed,
 			Blocked: summary.Blocked, LastActivity: workflowMillisTime(out.Summary.LastAt),
-			LastFailure: workflowMillisTime(parseJobTimeMillis(summary.LastFailureAt)),
-			LastNote:    workflowMillisTime(parseJobTimeMillis(summary.LastNoteAt)),
+			LastFailure:   workflowMillisTime(parseJobTimeMillis(summary.LastFailureAt)),
+			LastHumanNote: workflowMillisTime(parseJobTimeMillis(summary.LastHumanNoteAt)),
 		})
 		meta, metaErr := store.GetWorkflowMeta(ctx, label)
 		if metaErr != nil && !errors.Is(metaErr, sql.ErrNoRows) {
@@ -388,7 +388,7 @@ func (d *webDataSource) Workflow(ctx context.Context, label string, q dashboard.
 		out.Summary.Summary = firstNonEmpty(meta.Summary, description)
 		author := strings.TrimSpace(meta.Author)
 		if author == "" {
-			author = strings.TrimSpace(summary.LastAuthor)
+			author = strings.TrimSpace(summary.LastHumanAuthor)
 		}
 		out.Coordinator = dashboard.WorkflowCoordinator{
 			Author: author, Pane: strings.TrimSpace(meta.Pane), SessionID: dashboardWorkflowResumeSessionID(meta.SessionID),
