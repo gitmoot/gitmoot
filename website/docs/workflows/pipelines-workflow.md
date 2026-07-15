@@ -108,6 +108,52 @@ Pipeline triggers do not use Activepieces, and `pipeline bind-trigger` is a
 friendly no-op for them. Schedule-plus-pipeline hybrids are deliberately rejected
 in this MVP.
 
+## Share a pipeline bundle
+
+Export a pipeline into a portable **directory** and import it in another Gitmoot
+home against that machine's repository:
+
+```sh
+gitmoot pipeline export nightly-sync --output ./nightly-sync.bundle
+
+gitmoot pipeline import ./nightly-sync.bundle \
+  --repo acme/nightly-target \
+  --name nightly-sync-copy \
+  --agent-map scorer=local-scorer
+```
+
+The bundle layout is intentionally inspectable:
+
+```text
+nightly-sync.bundle/
+├── bundle.yaml          # version, requirements, warnings, agents, spec hash
+├── spec.yaml            # original bytes with repo parameterized
+└── templates/
+    └── scorer.md        # canonical template snapshot, including full prompt
+```
+
+`spec.yaml` preserves comments, ordering, and block formatting; only its `repo`
+scalar becomes `__GITMOOT_REPO__`. Template prompts travel verbatim, so review
+them before publishing a bundle. Local trigger bindings, tokens, Activepieces
+credentials, and environment values are never exported. Connection names remain
+in `bundle.yaml` as requirements so the recipient can create the credentials
+locally.
+
+Import prints a requirements report on every attempt: runtimes, named connections
+when checkable, upstream pipelines, write-authority flags, and host-specific
+absolute paths found in command stages. An unmapped agent whose runtime is
+missing is a hard failure. `--agent-map exported=local` selects an existing local
+agent; without a mapping Gitmoot installs the embedded template and registers the
+agent. Different-content template/agent and pipeline-name collisions require
+`--force`; use `--name` when both copies should coexist.
+
+Imports land **disabled by default**. Review the report, especially
+`allow_scheduled_writes`, `allow_triggered_writes`, and `allow_auto_merge`, then
+enable explicitly (or pass `--enable` to import) to re-consent that authority.
+Missing upstreams are allowed and keep the pipeline dormant. The imported
+`spec_hash` is computed from the final stored bytes after repo/name/agent mapping,
+so it intentionally differs from the source hash when those parameters change.
+
 ## Manage pipelines
 
 ```sh
@@ -116,6 +162,8 @@ gitmoot pipeline show <name> [--json]        # registry view for a pipeline name
 gitmoot pipeline show <run-id> [--json]      # run funnel for a "prun-…" run id
 gitmoot pipeline bind-trigger <name>         # create/re-sync the owned AP flow
 gitmoot pipeline install-defaults            # install built-in memory pipelines
+gitmoot pipeline export <name> --output <dir>
+gitmoot pipeline import <dir> --repo owner/repo [--agent-map exported=local]
 gitmoot pipeline run <name>                  # start a manual run; prints the run id
 gitmoot pipeline resume <run-id> [--from <stage>]
 gitmoot pipeline cancel <run-id>

@@ -32,6 +32,10 @@ func runPipeline(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "add":
 		return runPipelineAdd(args[1:], stdout, stderr)
+	case "export":
+		return runPipelineExport(args[1:], stdout, stderr)
+	case "import":
+		return runPipelineImport(args[1:], stdout, stderr)
 	case "install-defaults":
 		return runPipelineInstallDefaults(args[1:], stdout, stderr)
 	case "list":
@@ -62,6 +66,8 @@ func runPipeline(args []string, stdout, stderr io.Writer) int {
 func printPipelineUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot pipeline add <spec.yaml> [--enable]")
+	fmt.Fprintln(w, "  gitmoot pipeline export <name> --output <dir>")
+	fmt.Fprintln(w, "  gitmoot pipeline import <dir> --repo owner/name [--name <newname>] [--agent-map exported=local ...] [--force] [--enable]")
 	fmt.Fprintln(w, "  gitmoot pipeline install-defaults")
 	fmt.Fprintln(w, "  gitmoot pipeline list [--json]")
 	fmt.Fprintln(w, "  gitmoot pipeline run <name>")
@@ -182,6 +188,49 @@ func runPipelineAdd(args []string, stdout, stderr io.Writer) int {
 		}
 		repo = parsed.FullName()
 	}
+	var finalEnabled bool
+	if err := withStore(*home, func(store *db.Store) error {
+		var err error
+		finalEnabled, err = addPipelineCore(context.Background(), store, spec, raw, repo, pipelineAddCoreOptions{
+			Home: *home, Enable: *enable, Stdout: stdout, Stderr: stderr,
+		})
+		return err
+	}); err != nil {
+		fmt.Fprintf(stderr, "pipeline add: %v\n", err)
+		return 1
+	}
+	writeLine(stdout, "added pipeline %s (%s, %d stages)", spec.Name, enabledLabel(finalEnabled), len(spec.Stages))
+	return 0
+}
+
+// pipelineAddCoreOptions controls the reusable registry mutation shared by
+// `pipeline add` and bundle import. ForceEnabled is deliberately separate from
+// Enable: ordinary add preserves an existing row's enabled bit unless --enable
+// is supplied, while import must land disabled unless its own --enable flag was
+// explicitly supplied.
+type pipelineAddCoreOptions struct {
+	Home         string
+	Enable       bool
+	ForceEnabled bool
+	Stdout       io.Writer
+	Stderr       io.Writer
+}
+
+// addPipelineCore is the behavior-preserving write core behind runPipelineAdd.
+// It validates local write targets and trigger cycles, warns about dormant
+// upstreams/missing agents, persists the verbatim bytes + hash, arms trigger
+// state, provisions the hidden runner, and performs the existing trigger bind /
+// cleanup behavior. Callers are responsible for parsing the YAML and validating
+// the repo string before entering this core.
+func addPipelineCore(ctx context.Context, store *db.Store, spec pipeline.Spec, raw []byte, repo string, opts pipelineAddCoreOptions) (bool, error) {
+	stdout := opts.Stdout
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	stderr := opts.Stderr
+	if stderr == nil {
+		stderr = io.Discard
+	}
 	interval, jitter := "", ""
 	if spec.Schedule != nil {
 		interval = spec.Schedule.Interval
@@ -196,102 +245,81 @@ func runPipelineAdd(args []string, stdout, stderr io.Writer) int {
 		Jitter:   jitter,
 	}
 	runnerName := pipelineRunnerAgentName(spec.Name)
-	var finalEnabled bool
-	if err := withStore(*home, func(store *db.Store) error {
-		ctx := context.Background()
-		if err := validatePipelineProducePaths(context.Background(), store, *home, spec); err != nil {
-			return err
-		}
-		registered, err := store.ListPipelines(ctx)
-		if err != nil {
-			return err
-		}
-		if err := validatePipelineTriggerCycle(registered, spec); err != nil {
-			return err
-		}
-		if spec.Trigger != nil && spec.Trigger.Kind == "pipeline" {
-			if _, found, err := store.GetPipeline(ctx, spec.Trigger.Pipeline); err != nil {
-				return err
-			} else if !found {
-				fmt.Fprintf(stderr, "warning: pipeline %q references upstream pipeline %q which does not exist yet; it will remain dormant until the upstream is added\n", spec.Name, spec.Trigger.Pipeline)
-			}
-		}
-		// Refuse to clobber a real managed agent that happens to occupy the runner
-		// name: a pre-existing non-shell agent by that name is a naming collision, not
-		// this pipeline's runner. A pre-existing shell agent (this pipeline's own
-		// runner from an earlier add) is fine — the upsert below is idempotent.
-		if existing, err := store.GetAgent(context.Background(), runnerName); err == nil && existing.Runtime != runtime.ShellRuntime {
-			return fmt.Errorf("runner agent name %q collides with an existing %s agent", runnerName, existing.Runtime)
-		}
-		// Agent stages (#757) run a NAMED managed agent, not the hidden shell runner.
-		// Validate every referenced agent exists at add time so a typo'd or missing
-		// agent surfaces here rather than as a stage job the worker can never resolve.
-		// Each distinct name is checked once.
-		checkedAgents := make(map[string]struct{}, len(spec.Stages))
-		for _, stage := range spec.Stages {
-			if stage.Agent == "" {
-				continue
-			}
-			if _, ok := checkedAgents[stage.Agent]; ok {
-				continue
-			}
-			checkedAgents[stage.Agent] = struct{}{}
-			if _, err := store.GetAgent(context.Background(), stage.Agent); err != nil {
-				// Warn, don't block: a spec may legitimately be added before its
-				// agents are provisioned (bundled/shareable pipelines, scripted
-				// setup). A genuinely-missing agent still fails loudly when the
-				// stage runs, so this only forfeits an add-time typo signal.
-				fmt.Fprintf(stderr, "warning: stage %q references agent %q which does not exist yet; create it before the pipeline runs (gitmoot agent ...)\n", stage.ID, stage.Agent)
-			}
-		}
-		previous, previousFound, err := store.GetPipeline(ctx, spec.Name)
-		if err != nil {
-			return err
-		}
-		if err := store.CreateOrUpdatePipeline(ctx, record); err != nil {
-			return err
-		}
-		if spec.Trigger != nil && spec.Trigger.Kind == "pipeline" {
-			if err := store.ArmPipelineTrigger(ctx, spec.Name, spec.Trigger.Pipeline, time.Now().UTC()); err != nil {
-				return err
-			}
-		} else if err := store.DeletePipelineTriggerState(ctx, spec.Name); err != nil {
-			return err
-		}
-		if err := store.UpsertAgent(ctx, pipelineRunnerAgent(runnerName, repo)); err != nil {
-			return err
-		}
-		if *enable {
-			if err := store.SetPipelineEnabled(ctx, spec.Name, true); err != nil {
-				return err
-			}
-		}
-		// Report the RESULTING enabled state, not just this invocation's --enable:
-		// re-adding an edited spec preserves an already-enabled pipeline.
-		saved, _, err := store.GetPipeline(ctx, spec.Name)
-		if err != nil {
-			return err
-		}
-		finalEnabled = saved.Enabled
-		if finalEnabled && spec.Trigger != nil && spec.Trigger.Kind == "email" {
-			if _, bindErr := bindPipelineTrigger(ctx, store, saved, activepiecesAuthOptions{Home: *home}, triggerBindingPending); bindErr != nil {
-				fmt.Fprintf(stderr, "warning: pipeline %s was registered but its trigger is pending: %v; retry with `gitmoot pipeline bind-trigger %s`\n", spec.Name, bindErr, spec.Name)
-			}
-		}
-		if spec.Trigger == nil && previousFound && strings.TrimSpace(previous.TriggerBinding) != "" {
-			if cleanupErr := cleanupPipelineTrigger(ctx, store, previous, activepiecesAuthOptions{Home: *home}); cleanupErr != nil {
-				fmt.Fprintf(stderr, "warning: pipeline %s no longer declares a trigger, but its stale Activepieces flow could not be removed: %v; retry cleanup with `gitmoot pipeline bind-trigger %s`\n", spec.Name, cleanupErr, spec.Name)
-			} else {
-				writeLine(stdout, "cleaned up stale trigger flow for pipeline %s", spec.Name)
-			}
-		}
-		return nil
-	}); err != nil {
-		fmt.Fprintf(stderr, "pipeline add: %v\n", err)
-		return 1
+	if err := validatePipelineProducePaths(ctx, store, opts.Home, spec); err != nil {
+		return false, err
 	}
-	writeLine(stdout, "added pipeline %s (%s, %d stages)", spec.Name, enabledLabel(finalEnabled), len(spec.Stages))
-	return 0
+	registered, err := store.ListPipelines(ctx)
+	if err != nil {
+		return false, err
+	}
+	if err := validatePipelineTriggerCycle(registered, spec); err != nil {
+		return false, err
+	}
+	if spec.Trigger != nil && spec.Trigger.Kind == "pipeline" {
+		if _, found, err := store.GetPipeline(ctx, spec.Trigger.Pipeline); err != nil {
+			return false, err
+		} else if !found {
+			fmt.Fprintf(stderr, "warning: pipeline %q references upstream pipeline %q which does not exist yet; it will remain dormant until the upstream is added\n", spec.Name, spec.Trigger.Pipeline)
+		}
+	}
+	// Refuse to clobber a real managed agent that happens to occupy the runner
+	// name. A pre-existing shell runner from an earlier add is idempotent.
+	if existing, err := store.GetAgent(ctx, runnerName); err == nil && existing.Runtime != runtime.ShellRuntime {
+		return false, fmt.Errorf("runner agent name %q collides with an existing %s agent", runnerName, existing.Runtime)
+	}
+	checkedAgents := make(map[string]struct{}, len(spec.Stages))
+	for _, stage := range spec.Stages {
+		if stage.Agent == "" {
+			continue
+		}
+		if _, ok := checkedAgents[stage.Agent]; ok {
+			continue
+		}
+		checkedAgents[stage.Agent] = struct{}{}
+		if _, err := store.GetAgent(ctx, stage.Agent); err != nil {
+			fmt.Fprintf(stderr, "warning: stage %q references agent %q which does not exist yet; create it before the pipeline runs (gitmoot agent ...)\n", stage.ID, stage.Agent)
+		}
+	}
+	previous, previousFound, err := store.GetPipeline(ctx, spec.Name)
+	if err != nil {
+		return false, err
+	}
+	if err := store.CreateOrUpdatePipeline(ctx, record); err != nil {
+		return false, err
+	}
+	if spec.Trigger != nil && spec.Trigger.Kind == "pipeline" {
+		if err := store.ArmPipelineTrigger(ctx, spec.Name, spec.Trigger.Pipeline, time.Now().UTC()); err != nil {
+			return false, err
+		}
+	} else if err := store.DeletePipelineTriggerState(ctx, spec.Name); err != nil {
+		return false, err
+	}
+	if err := store.UpsertAgent(ctx, pipelineRunnerAgent(runnerName, repo)); err != nil {
+		return false, err
+	}
+	if opts.ForceEnabled || opts.Enable {
+		if err := store.SetPipelineEnabled(ctx, spec.Name, opts.Enable); err != nil {
+			return false, err
+		}
+	}
+	saved, _, err := store.GetPipeline(ctx, spec.Name)
+	if err != nil {
+		return false, err
+	}
+	finalEnabled := saved.Enabled
+	if finalEnabled && spec.Trigger != nil && spec.Trigger.Kind == "email" {
+		if _, bindErr := bindPipelineTrigger(ctx, store, saved, activepiecesAuthOptions{Home: opts.Home}, triggerBindingPending); bindErr != nil {
+			fmt.Fprintf(stderr, "warning: pipeline %s was registered but its trigger is pending: %v; retry with `gitmoot pipeline bind-trigger %s`\n", spec.Name, bindErr, spec.Name)
+		}
+	}
+	if spec.Trigger == nil && previousFound && strings.TrimSpace(previous.TriggerBinding) != "" {
+		if cleanupErr := cleanupPipelineTrigger(ctx, store, previous, activepiecesAuthOptions{Home: opts.Home}); cleanupErr != nil {
+			fmt.Fprintf(stderr, "warning: pipeline %s no longer declares a trigger, but its stale Activepieces flow could not be removed: %v; retry cleanup with `gitmoot pipeline bind-trigger %s`\n", spec.Name, cleanupErr, spec.Name)
+		} else {
+			writeLine(stdout, "cleaned up stale trigger flow for pipeline %s", spec.Name)
+		}
+	}
+	return finalEnabled, nil
 }
 
 // validatePipelineProducePaths resolves every declared produce write target at

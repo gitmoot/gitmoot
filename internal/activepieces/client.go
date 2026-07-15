@@ -235,6 +235,18 @@ func (c *Client) findConnectionID(ctx context.Context, token, projectID, externa
 	return "", nil
 }
 
+// HasConnection reports whether the project-scoped Activepieces connection
+// store contains externalID. It deliberately returns only existence metadata:
+// callers such as pipeline bundle import can validate a named requirement
+// without ever reading or serializing the connection's credential value.
+func (c *Client) HasConnection(ctx context.Context, token, projectID, externalID string) (bool, error) {
+	id, err := c.findConnectionID(ctx, token, projectID, strings.TrimSpace(externalID))
+	if err != nil {
+		return false, err
+	}
+	return id != "", nil
+}
+
 func (c *Client) WaitHealthy(ctx context.Context, timeout time.Duration) error {
 	if timeout <= 0 {
 		timeout = 180 * time.Second

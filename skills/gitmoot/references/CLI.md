@@ -2577,6 +2577,8 @@ trigger:
 
 ```sh
 gitmoot pipeline add nightly-sync.yaml --enable   # validate + store; omit --enable to add disabled
+gitmoot pipeline export nightly-sync --output ./nightly-sync.bundle
+gitmoot pipeline import ./nightly-sync.bundle --repo new-owner/new-repo
 gitmoot pipeline install-defaults                 # install built-in memory pipelines, skipping existing names
 gitmoot pipeline list [--json]
 gitmoot pipeline show nightly-sync [--json]        # registry view for a name
@@ -2588,6 +2590,51 @@ gitmoot pipeline cancel <run-id>
 gitmoot pipeline enable|disable nightly-sync
 gitmoot pipeline remove nightly-sync
 ```
+
+### Export and import a pipeline bundle
+
+`pipeline export <name> --output <dir>` creates a portable directory, never a
+single YAML blob:
+
+```text
+nightly-sync.bundle/
+├── bundle.yaml          # version, requirements, warnings, agents, spec hash
+├── spec.yaml            # stored bytes with only repo replaced by __GITMOOT_REPO__
+└── templates/
+    └── reply-triager.md # canonical agenttemplate.Export snapshot
+```
+
+The exporter carries YAML comments and ordering through unchanged, reports
+host-specific `/root`, `/home`, `/Users`, and `/tmp` paths found in command
+stages, and warns that template prompts travel verbatim. It exports connection
+names as requirements, but never trigger-binding state, tokens, connection
+credentials, or environment values from local Gitmoot/Activepieces state.
+
+Import on another machine with its real repository and any local agent mapping:
+
+```sh
+gitmoot pipeline import ./nightly-sync.bundle \
+  --repo new-owner/new-repo \
+  --name nightly-sync-copy \
+  --agent-map reply-triager=local-triager
+```
+
+Every import prints a requirements report first: available/missing runtimes,
+named Activepieces connections when they can be checked, present/missing upstream
+pipelines, write-authority flags that need consent, and absolute-path warnings.
+Without `--agent-map`, embedded templates are installed and their declared agents
+are registered. Existing templates, agents, or pipeline names with different
+content are refused unless `--force`; identical content is a no-op. A missing
+runtime for an unmapped agent is a hard failure.
+
+Imported pipelines land **disabled**, even when replacing an enabled row. Review
+the report and stored spec, then run `pipeline enable <name>` or pass `--enable`
+to the import to explicitly re-consent any `allow_scheduled_writes`,
+`allow_triggered_writes`, or `allow_auto_merge` authority. The target repo and an
+optional new name are injected without re-marshaling the rest of the YAML. The
+stored `spec_hash` therefore hashes the imported bytes and correctly differs from
+the source bundle whenever repo/name/agent mappings changed. Missing upstream
+pipelines are allowed and leave the imported pipeline dormant until they exist.
 
 ### Reading pipeline status
 

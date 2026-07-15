@@ -1081,6 +1081,50 @@ RUN=$(gitmoot pipeline run nightly-sync)          # or trigger a manual run now
 gitmoot pipeline show "$RUN"                       # watch the text funnel
 ```
 
+### Share a pipeline with another Gitmoot home
+
+Export a directory bundle, copy that directory to the target machine, and import
+it against the target repository:
+
+```sh
+# Source home: creates bundle.yaml, spec.yaml, and templates/*.md.
+gitmoot pipeline export nightly-sync --output ./nightly-sync.bundle
+
+# Target home: connection credentials and runtime sessions stay local.
+gitmoot pipeline import ./nightly-sync.bundle \
+  --repo acme/nightly-target \
+  --agent-map scorer=local-scorer
+```
+
+`spec.yaml` is the stored pipeline text with only `repo` replaced by the declared
+`__GITMOOT_REPO__` parameter; comments, ordering, block scalars, and other bytes
+survive. Referenced custom templates are canonical snapshots produced by the same
+export path as `agent template export`. Template prompts are verbatim, so inspect
+them before sharing the directory. Trigger bindings, tokens, Activepieces
+credentials, and local environment values are never copied; only connection
+`kind`/`name` requirements are listed.
+
+Import always prints its requirements report. Use `--agent-map exported=local`
+for a machine-local agent/session, or omit it to install the embedded template and
+register the declared runtime. A missing runtime for an unmapped agent fails
+before anything is imported. Name/content collisions fail unless `--force`, and
+`--name` gives the pipeline a new local name.
+
+The imported pipeline is disabled by default. This is also the re-consent
+boundary for any bundled write authority (`allow_scheduled_writes`,
+`allow_triggered_writes`, or `allow_auto_merge`): review the report and absolute
+path warnings, then enable explicitly:
+
+```sh
+gitmoot pipeline enable nightly-sync
+# Or add --enable to the import after review.
+```
+
+Missing upstream-pipeline requirements are warnings, not import failures; the
+pipeline stays dormant until its upstream exists. The target repo/name/agent
+mapping changes the stored bytes, so the imported `spec_hash` is intentionally
+computed from those final bytes rather than copied from the source.
+
 ### Chain a pipeline after another succeeds
 
 Use `kind: pipeline` when ordering matters more than a clock stagger. This
