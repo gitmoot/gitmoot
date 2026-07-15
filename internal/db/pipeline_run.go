@@ -33,8 +33,9 @@ type PipelineRun struct {
 // of a single stage within a run, keyed by (RunID, StageID). JobID is the stage
 // job the advancer enqueued (empty until enqueued or after a retry reset), Attempt
 // is the current attempt number (the deterministic stage job id embeds it),
-// NeedsJSON persists a blocked stage's needs verbatim, and Summary is the settling
-// result's short summary (or the failure reason).
+// NeedsJSON snapshots the stage's dependency ids when the row is created; if the
+// stage later parks, it is replaced by that blocked stage's human-action needs.
+// Summary is the settling result's short summary (or the failure reason).
 type PipelineRunStage struct {
 	RunID      string
 	StageID    string

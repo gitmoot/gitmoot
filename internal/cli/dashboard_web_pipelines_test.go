@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"testing"
@@ -306,11 +307,17 @@ func TestWebDataSourcePipelineRunBlockedDiamond(t *testing.T) {
 	if ascore.Cmd != `./scripts/score.sh --filter "p<95> && q>1"` {
 		t.Fatalf("ascore Cmd = %q, want the verbatim (escapable) filter cmd", ascore.Cmd)
 	}
-	if len(ascore.Deps) != 1 || ascore.Deps[0] != "zfetch" {
-		t.Fatalf("ascore Deps = %+v, want [zfetch]", ascore.Deps)
+	// Persisted needs_json wins over the strict spec gate. This blocked row carries
+	// a human-action need rather than a stage id, so it safely produces no edge.
+	if ascore.Deps == nil || len(ascore.Deps) != 0 {
+		t.Fatalf("ascore Deps = %+v, want non-nil empty persisted override", ascore.Deps)
 	}
 	if len(ascore.Needs) != 1 || ascore.Needs[0] != "set R2 token: gitmoot config set r2.token" {
 		t.Fatalf("ascore Needs = %+v, want the persisted blocked need", ascore.Needs)
+	}
+	bdedupe := byID["bdedupe"]
+	if !slices.Equal(bdedupe.Deps, []string{"zfetch"}) {
+		t.Fatalf("bdedupe Deps = %+v, want strict-hash spec deps [zfetch]", bdedupe.Deps)
 	}
 	publish := byID["publish"]
 	if publish.State != pipeline.StageSkipped || publish.JobID != "" {
@@ -318,6 +325,60 @@ func TestWebDataSourcePipelineRunBlockedDiamond(t *testing.T) {
 	}
 	if len(publish.Deps) != 2 || publish.Deps[0] != "ascore" || publish.Deps[1] != "bdedupe" {
 		t.Fatalf("publish Deps = %+v, want [ascore bdedupe]", publish.Deps)
+	}
+}
+
+// TestWebDataSourcePipelineRunStoredDeps pins persisted-dependency precedence over
+// both spec gates: matching-hash and same-stage-set structural fallback. Stored
+// order is retained; roots and malformed values become non-nil empty slices.
+func TestWebDataSourcePipelineRunStoredDeps(t *testing.T) {
+	home := dashboardTestHome(t)
+	store := openPipelineTestStore(t, home)
+	realHash := pipeline.Hash([]byte(diamondSpecYAML))
+	seedTestPipeline(t, store, db.Pipeline{
+		Name: "listing-refresh", Repo: "jerryfane/noted", SpecYAML: diamondSpecYAML, SpecHash: realHash,
+	})
+	rows := []db.PipelineRunStage{
+		{StageID: "zfetch", State: pipeline.StageSucceeded},
+		{StageID: "ascore", State: pipeline.StagePending, NeedsJSON: `["bdedupe"]`},
+		{StageID: "bdedupe", State: pipeline.StagePending, NeedsJSON: `not-json`},
+		{StageID: "publish", State: pipeline.StagePending, NeedsJSON: `["zfetch","ascore"]`},
+	}
+	seedTestRun(t, store, db.PipelineRun{
+		ID: "prun-stored-deps-strict", Pipeline: "listing-refresh", State: pipeline.RunRunning, SpecHash: realHash,
+	}, rows)
+	seedTestRun(t, store, db.PipelineRun{
+		ID: "prun-stored-deps-structural", Pipeline: "listing-refresh", State: pipeline.RunRunning, SpecHash: "sha256-stale",
+	}, rows)
+	store.Close()
+
+	for _, runID := range []string{"prun-stored-deps-strict", "prun-stored-deps-structural"} {
+		run, err := (&webDataSource{home: home}).PipelineRun(context.Background(), runID)
+		if err != nil {
+			t.Fatalf("PipelineRun(%s): %v", runID, err)
+		}
+		byID := map[string]dashboard.PipelineStage{}
+		for _, stage := range run.Stages {
+			byID[stage.ID] = stage
+		}
+		if got := byID["ascore"].Deps; !slices.Equal(got, []string{"bdedupe"}) {
+			t.Fatalf("%s ascore Deps = %v, want persisted override [bdedupe]", runID, got)
+		}
+		if got := byID["publish"].Deps; !slices.Equal(got, []string{"zfetch", "ascore"}) {
+			t.Fatalf("%s publish Deps = %v, want persisted order [zfetch ascore]", runID, got)
+		}
+		for _, id := range []string{"zfetch", "bdedupe"} {
+			if got := byID[id].Deps; got == nil || len(got) != 0 {
+				t.Fatalf("%s %s Deps = %#v, want non-nil empty persisted result", runID, id, got)
+			}
+		}
+		encoded, err := json.Marshal(byID["zfetch"].Deps)
+		if err != nil {
+			t.Fatalf("marshal root Deps: %v", err)
+		}
+		if string(encoded) != "[]" {
+			t.Fatalf("%s root Deps JSON = %s, want []", runID, encoded)
+		}
 	}
 }
 
@@ -404,11 +465,10 @@ func TestWebDataSourcePipelineRunNotFound(t *testing.T) {
 	}
 }
 
-// TestWebDataSourcePipelineRunSpecHashMismatchFallback pins the fallback: when the
-// run's SpecHash does not match the stored pipeline's spec, stages keep the store's
-// stage_id order and carry NO spec-derived cmd/deps (the run's snapshot no longer
-// corresponds to the current spec) — mirroring orderPipelineRunStages' fallback.
-func TestWebDataSourcePipelineRunSpecHashMismatchFallback(t *testing.T) {
+// TestWebDataSourcePipelineRunSpecHashMismatchSameStageSetFallback pins the
+// metadata-only re-add case: a hash mismatch keeps store ordering and suppresses
+// metadata, but an exact stage-ID set restores dependency edges for layout.
+func TestWebDataSourcePipelineRunSpecHashMismatchSameStageSetFallback(t *testing.T) {
 	home := dashboardTestHome(t)
 	seedDiamondBlockedRun(t, home, "prun-diamond-stale", "sha256-stale-mismatch")
 
@@ -429,25 +489,71 @@ func TestWebDataSourcePipelineRunSpecHashMismatchFallback(t *testing.T) {
 				[]string{run.Stages[0].ID, run.Stages[1].ID, run.Stages[2].ID, run.Stages[3].ID}, wantOrder)
 		}
 	}
-	// No spec applied => no merged cmd/deps on any stage.
+	// The strict hash gate still suppresses all display metadata.
 	for _, s := range run.Stages {
-		if s.Cmd != "" || len(s.Deps) != 0 {
-			t.Fatalf("stage %s carried spec fields on hash mismatch: %+v", s.ID, s)
+		if s.Cmd != "" || s.Kind != "" || s.AgentRuntime != "" || s.Retry != 0 {
+			t.Fatalf("stage %s carried spec metadata on hash mismatch: %+v", s.ID, s)
 		}
+	}
+	byID := map[string]dashboard.PipelineStage{}
+	for _, stage := range run.Stages {
+		byID[stage.ID] = stage
+	}
+	if !slices.Equal(byID["bdedupe"].Deps, []string{"zfetch"}) {
+		t.Fatalf("bdedupe structural Deps = %v, want [zfetch]", byID["bdedupe"].Deps)
+	}
+	if !slices.Equal(byID["publish"].Deps, []string{"ascore", "bdedupe"}) {
+		t.Fatalf("publish structural Deps = %v, want [ascore bdedupe]", byID["publish"].Deps)
+	}
+	if byID["zfetch"].Deps == nil || len(byID["zfetch"].Deps) != 0 {
+		t.Fatalf("zfetch structural Deps = %#v, want non-nil empty root", byID["zfetch"].Deps)
+	}
+	// The blocked row's present needs_json wins over structural fallback and is
+	// filtered to no edge because its human-action text is not a stage id.
+	if byID["ascore"].Deps == nil || len(byID["ascore"].Deps) != 0 {
+		t.Fatalf("ascore persisted Deps = %#v, want non-nil empty", byID["ascore"].Deps)
 	}
 	// The blocked stage's PERSISTED needs still surface (they live on the row, not the spec).
-	var ascore dashboard.PipelineStage
-	for _, s := range run.Stages {
-		if s.ID == "ascore" {
-			ascore = s
-		}
-	}
+	ascore := byID["ascore"]
 	if len(ascore.Needs) != 1 {
 		t.Fatalf("ascore Needs on fallback = %+v, want the persisted need retained", ascore.Needs)
 	}
 	// Repo is a pipeline-level attribute, so it is still resolved from the current row.
 	if run.Repo != "jerryfane/noted" {
 		t.Fatalf("run Repo on fallback = %q, want jerryfane/noted", run.Repo)
+	}
+}
+
+// TestWebDataSourcePipelineRunSpecHashMismatchDifferentStageSetFallback pins the
+// honest fallback: when stage membership changed, an old run gets neither current
+// metadata nor current dependency edges.
+func TestWebDataSourcePipelineRunSpecHashMismatchDifferentStageSetFallback(t *testing.T) {
+	home := dashboardTestHome(t)
+	store := openPipelineTestStore(t, home)
+	seedTestPipeline(t, store, db.Pipeline{
+		Name: "listing-refresh", Repo: "jerryfane/noted", SpecYAML: diamondSpecYAML,
+	})
+	seedTestRun(t, store, db.PipelineRun{
+		ID: "prun-diamond-different-set", Pipeline: "listing-refresh", State: pipeline.RunRunning,
+		SpecHash: "sha256-stale-mismatch",
+	}, []db.PipelineRunStage{
+		{StageID: "zfetch", State: pipeline.StageSucceeded},
+		{StageID: "ascore", State: pipeline.StagePending},
+		{StageID: "publish", State: pipeline.StagePending},
+	})
+	store.Close()
+
+	run, err := (&webDataSource{home: home}).PipelineRun(context.Background(), "prun-diamond-different-set")
+	if err != nil {
+		t.Fatalf("PipelineRun: %v", err)
+	}
+	for _, stage := range run.Stages {
+		if stage.Deps == nil || len(stage.Deps) != 0 {
+			t.Fatalf("different-set stage %s Deps = %#v, want non-nil empty", stage.ID, stage.Deps)
+		}
+		if stage.Cmd != "" || stage.Kind != "" || stage.AgentRuntime != "" || stage.Retry != 0 {
+			t.Fatalf("different-set stage %s carried spec metadata: %+v", stage.ID, stage)
+		}
 	}
 }
 
@@ -821,8 +927,8 @@ func TestWebDataSourcePipelineDetailRetry(t *testing.T) {
 
 // TestWebDataSourcePipelineRunRetryAbsentOnHashMismatch pins the other half of
 // the retry hash gate: a run whose SpecHash no longer matches the pipeline's
-// stored spec gets NO spec-merged fields — Retry stays 0 alongside the already
-// gated Cmd/Deps, because stale-spec data would be wrong data.
+// stored spec gets no spec-merged metadata — Retry and Cmd stay empty. The exact
+// stage-ID set still permits the structural Deps fallback used for layout.
 func TestWebDataSourcePipelineRunRetryAbsentOnHashMismatch(t *testing.T) {
 	home := dashboardTestHome(t)
 	store := openPipelineTestStore(t, home)
@@ -844,10 +950,18 @@ func TestWebDataSourcePipelineRunRetryAbsentOnHashMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PipelineRun: %v", err)
 	}
+	byID := map[string]dashboard.PipelineStage{}
 	for _, s := range run.Stages {
-		if s.Retry != 0 || s.Cmd != "" || len(s.Deps) != 0 {
-			t.Fatalf("stale-spec stage %s carries spec-merged fields (%+v); retry/cmd/deps must be absent on a hash mismatch", s.ID, s)
+		byID[s.ID] = s
+		if s.Retry != 0 || s.Cmd != "" || s.Kind != "" || s.AgentRuntime != "" {
+			t.Fatalf("stale-spec stage %s carries spec metadata: %+v", s.ID, s)
 		}
+	}
+	if byID["build"].Deps == nil || len(byID["build"].Deps) != 0 {
+		t.Fatalf("stale build Deps = %#v, want non-nil empty root", byID["build"].Deps)
+	}
+	if !slices.Equal(byID["test"].Deps, []string{"build"}) {
+		t.Fatalf("stale test Deps = %v, want structural fallback [build]", byID["test"].Deps)
 	}
 	// The run-level data is untouched by the gate.
 	if run.Stages[0].Attempt+run.Stages[1].Attempt != 2 {

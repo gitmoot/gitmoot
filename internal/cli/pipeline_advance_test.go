@@ -143,6 +143,29 @@ stages:
     needs: [b]
 `
 
+func TestCreatePipelineRunPersistsStageDeps(t *testing.T) {
+	store := pipelineAdvanceStore(t)
+	rec, spec := newTestPipeline(t, store, "chain", linearChainSpec)
+	now := time.Date(2026, 7, 15, 20, 0, 0, 0, time.UTC)
+
+	run, err := createPipelineRun(context.Background(), store, rec, spec, "manual", "{}", now)
+	if err != nil {
+		t.Fatalf("createPipelineRun: %v", err)
+	}
+	for _, tc := range []struct {
+		stageID string
+		want    string
+	}{
+		{stageID: "a", want: ""},
+		{stageID: "b", want: `["a"]`},
+		{stageID: "c", want: `["b"]`},
+	} {
+		if got := stageRow(t, store, run.ID, tc.stageID).NeedsJSON; got != tc.want {
+			t.Fatalf("stage %s needs_json = %q, want %q", tc.stageID, got, tc.want)
+		}
+	}
+}
+
 // TestAdvancerLinearChain proves a linear a->b->c chain advances one layer per
 // scan: each stage is enqueued only after its single dependency succeeds, and the
 // run reaches succeeded exactly when the last stage does.

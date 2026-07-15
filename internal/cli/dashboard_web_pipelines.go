@@ -81,10 +81,14 @@ func (d *webDataSource) Pipelines(ctx context.Context) ([]dashboard.PipelineSumm
 // maps to dashboard.ErrPipelineRunNotFound (the API layer serves that as a 404).
 // It replicates orderPipelineRunStages: when the run's pipeline and a matching spec
 // snapshot are available it reorders the stage rows into the spec's declared order
-// and merges each spec stage's cmd + dependency needs onto the row; otherwise it
-// keeps the store's stable stage_id order with no spec-derived fields (the same
-// fall-back the funnel takes on a missing pipeline or a SpecHash mismatch). Stages
-// is always non-nil.
+// and merges each spec stage's metadata onto the row; otherwise it keeps the
+// store's stable stage_id order with no spec-derived metadata (the same fall-back
+// the funnel takes on a missing pipeline or a SpecHash mismatch). Deps prefer the
+// persisted stage needs_json snapshot. Empty snapshots may fall back to the
+// current spec under either the strict hash gate or an exact stage-ID-set gate:
+// dependency edges drive layout, so a metadata-only spec re-add must not flatten
+// run history, while a set mismatch keeps the honest vertical fallback. Stages
+// and every stage's Deps are always non-nil.
 func (d *webDataSource) PipelineRun(ctx context.Context, id string) (dashboard.PipelineRun, error) {
 	out := dashboard.PipelineRun{Stages: []dashboard.PipelineStage{}}
 	err := withStore(d.home, func(store *db.Store) error {
@@ -116,8 +120,11 @@ func (d *webDataSource) PipelineRun(ctx context.Context, id string) (dashboard.P
 			}
 		}
 		ordered, specOK := orderRunStages(spec, specParsed, specHash, run.SpecHash, stageRows)
+		depsSpecOK := specOK || (specParsed && pipelineRunStageIDsMatchSpec(spec, stageRows))
+		stageIDs := make(map[string]struct{}, len(ordered))
 		jobIDs := make([]string, 0, len(ordered))
 		for _, row := range ordered {
+			stageIDs[row.StageID] = struct{}{}
 			if row.JobID != "" {
 				jobIDs = append(jobIDs, row.JobID)
 			}
@@ -131,6 +138,13 @@ func (d *webDataSource) PipelineRun(ctx context.Context, id string) (dashboard.P
 			specByID = make(map[string]pipeline.Stage, len(spec.Stages))
 			for _, s := range spec.Stages {
 				specByID[s.ID] = s
+			}
+		}
+		var depsSpecByID map[string]pipeline.Stage
+		if depsSpecOK {
+			depsSpecByID = make(map[string]pipeline.Stage, len(spec.Stages))
+			for _, s := range spec.Stages {
+				depsSpecByID[s.ID] = s
 			}
 		}
 
@@ -149,9 +163,16 @@ func (d *webDataSource) PipelineRun(ctx context.Context, id string) (dashboard.P
 			Stages:     make([]dashboard.PipelineStage, 0, len(ordered)),
 		}
 		for _, row := range ordered {
+			deps, persisted := decodePipelineRunStageDeps(row.NeedsJSON, stageIDs)
+			if !persisted {
+				if spec, ok := depsSpecByID[row.StageID]; ok {
+					deps = append([]string{}, spec.Needs...)
+				}
+			}
 			stage := dashboard.PipelineStage{
 				ID:         row.StageID,
 				State:      row.State,
+				Deps:       deps,
 				JobID:      row.JobID,
 				Attempt:    row.Attempt,
 				Needs:      decodePipelineNeeds(row.NeedsJSON),
@@ -162,11 +183,9 @@ func (d *webDataSource) PipelineRun(ctx context.Context, id string) (dashboard.P
 			if spec, ok := specByID[row.StageID]; ok {
 				stage.Cmd = spec.Cmd
 				stage.Retry = spec.Retry
-				if len(spec.Needs) > 0 {
-					stage.Deps = append([]string(nil), spec.Needs...)
-				}
-				// #873 display metadata, under the same spec gate as cmd/deps: the
-				// stage kind badge and (when the agent is registered) its runtime.
+				// #873 display metadata stays under the same strict hash gate as
+				// cmd/retry: the structural dependency fallback must never leak the
+				// stage kind or agent runtime from a different spec snapshot.
 				stage.Kind = pipelineStageKindName(spec)
 				if name := strings.TrimSpace(spec.Agent); name != "" {
 					if agent, aerr := store.GetAgent(ctx, name); aerr == nil {
@@ -191,6 +210,56 @@ func (d *webDataSource) PipelineRun(ctx context.Context, id string) (dashboard.P
 		return dashboard.PipelineRun{}, err
 	}
 	return out, nil
+}
+
+// decodePipelineRunStageDeps decodes a persisted stage dependency list without
+// trusting arbitrary needs_json strings as graph edges. The stage row field also
+// carries human-action needs when a stage blocks, so only references to ids in the
+// same run become edges. Any non-empty persisted value is authoritative: malformed
+// JSON and non-stage values deliberately decode to an empty graph rather than
+// falling through to a possibly stale spec. The returned slice is always non-nil
+// and keeps the stored order.
+func decodePipelineRunStageDeps(value string, stageIDs map[string]struct{}) (deps []string, present bool) {
+	deps = []string{}
+	if strings.TrimSpace(value) == "" {
+		return deps, false
+	}
+	if err := json.Unmarshal([]byte(value), &deps); err != nil || deps == nil {
+		return []string{}, true
+	}
+	out := make([]string, 0, len(deps))
+	for _, dep := range deps {
+		dep = strings.TrimSpace(dep)
+		if _, ok := stageIDs[dep]; ok {
+			out = append(out, dep)
+		}
+	}
+	return out, true
+}
+
+// pipelineRunStageIDsMatchSpec is the structural dependency-fallback gate. It
+// compares exact sets (not order) so metadata-only spec re-adds can restore the
+// historical DAG without attaching edges from a genuinely different pipeline.
+func pipelineRunStageIDsMatchSpec(spec pipeline.Spec, rows []db.PipelineRunStage) bool {
+	if len(spec.Stages) != len(rows) {
+		return false
+	}
+	ids := make(map[string]struct{}, len(spec.Stages))
+	for _, stage := range spec.Stages {
+		id := strings.TrimSpace(stage.ID)
+		if _, duplicate := ids[id]; duplicate {
+			return false
+		}
+		ids[id] = struct{}{}
+	}
+	for _, row := range rows {
+		id := strings.TrimSpace(row.StageID)
+		if _, ok := ids[id]; !ok {
+			return false
+		}
+		delete(ids, id)
+	}
+	return len(ids) == 0
 }
 
 // PipelineDetail returns one pipeline's currently declared stage DAG plus its run
@@ -336,6 +405,8 @@ func pipelineStageCount(specYAML string) int {
 // caller may then merge spec-derived cmd/deps/retry). Any weaker condition — no
 // spec, parse failure, or a spec-hash mismatch — keeps the store's stage_id order
 // with specOK false, mirroring orderPipelineRunStages' fallback (the CLI funnel).
+// The caller may independently apply the narrower stage-ID-set fallback to Deps;
+// this strict result remains the only gate for ordering and display metadata.
 func orderRunStages(spec pipeline.Spec, specParsed bool, specHash, runSpecHash string, rows []db.PipelineRunStage) (ordered []db.PipelineRunStage, specOK bool) {
 	if specParsed && strings.TrimSpace(specHash) == strings.TrimSpace(runSpecHash) {
 		return orderPipelineStagesBySpec(spec, rows), true

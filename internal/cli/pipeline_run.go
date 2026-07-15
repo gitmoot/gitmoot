@@ -665,9 +665,10 @@ func createPipelineRun(ctx context.Context, store *db.Store, rec db.Pipeline, sp
 	}
 	for _, stage := range spec.Stages {
 		if err := store.CreatePipelineRunStage(ctx, db.PipelineRunStage{
-			RunID:   run.ID,
-			StageID: stage.ID,
-			State:   pipeline.StagePending,
+			RunID:     run.ID,
+			StageID:   stage.ID,
+			State:     pipeline.StagePending,
+			NeedsJSON: marshalPipelineNeeds(stage.Needs),
 		}); err != nil {
 			return db.PipelineRun{}, err
 		}
@@ -772,7 +773,12 @@ func triggerOnePipeline(ctx context.Context, store *db.Store, rec db.Pipeline, n
 	}
 	stages := make([]db.PipelineRunStage, 0, len(spec.Stages))
 	for _, stage := range spec.Stages {
-		stages = append(stages, db.PipelineRunStage{RunID: run.ID, StageID: stage.ID, State: pipeline.StagePending})
+		stages = append(stages, db.PipelineRunStage{
+			RunID:     run.ID,
+			StageID:   stage.ID,
+			State:     pipeline.StagePending,
+			NeedsJSON: marshalPipelineNeeds(stage.Needs),
+		})
 	}
 	_, err = store.FirePipelineTrigger(ctx, state, upstreamRun, run, stages)
 	return err

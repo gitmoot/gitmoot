@@ -41,7 +41,7 @@ func newScheduledPipeline(t *testing.T, store *db.Store, name, repo, interval, j
 
 func newPipelineTriggeredPipeline(t *testing.T, store *db.Store, name, upstream string, enabled bool, armedAt time.Time) db.Pipeline {
 	t.Helper()
-	specYAML := fmt.Sprintf("name: %s\nrepo: owner/%s\ntrigger: {kind: pipeline, pipeline: %s}\nstages:\n  - {id: run, cmd: echo ok}\n", name, name, upstream)
+	specYAML := fmt.Sprintf("name: %s\nrepo: owner/%s\ntrigger: {kind: pipeline, pipeline: %s}\nstages:\n  - {id: run, cmd: echo ok}\n  - {id: publish, cmd: echo publish, needs: [run]}\n", name, name, upstream)
 	rec := db.Pipeline{Name: name, Repo: "owner/" + name, SpecYAML: specYAML, SpecHash: pipeline.Hash([]byte(specYAML)), Enabled: enabled}
 	if err := store.CreateOrUpdatePipeline(context.Background(), rec); err != nil {
 		t.Fatalf("CreateOrUpdatePipeline: %v", err)
@@ -85,6 +85,12 @@ func TestPipelineSuccessTriggerFiresOnce(t *testing.T) {
 	}
 	if !strings.Contains(runs[0].PayloadJSON, upstream.ID) || !strings.Contains(runs[0].PayloadJSON, `"upstream_pipeline":"upstream"`) {
 		t.Fatalf("downstream payload_json = %q", runs[0].PayloadJSON)
+	}
+	if got := stageRow(t, store, runs[0].ID, "run").NeedsJSON; got != "" {
+		t.Fatalf("triggered root needs_json = %q, want empty", got)
+	}
+	if got := stageRow(t, store, runs[0].ID, "publish").NeedsJSON; got != `["run"]` {
+		t.Fatalf("triggered publish needs_json = %q, want [run]", got)
 	}
 	if err := triggerPipelineRuns(ctx, store, base.Add(3*time.Minute)); err != nil {
 		t.Fatalf("re-tick: %v", err)
