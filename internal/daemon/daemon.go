@@ -295,15 +295,20 @@ func (d Daemon) reconcileStaleTasks(ctx context.Context, openBranches map[string
 	if !remoteCertain {
 		return nil
 	}
+	dismissed := 0
 	for _, item := range emptyBranch {
 		reason := fmt.Sprintf("stale task auto-dismissed: empty branch; ttl=%s; updated_at=%s", ttl, item.candidate.UpdatedAt)
-		if _, _, err := d.Store.TransitionTaskStateWithEventIfNoActiveJob(ctx, item.task.ID,
+		changed, _, err := d.Store.TransitionTaskStateWithEventIfNoActiveJob(ctx, item.task.ID,
 			[]string{string(workflow.TaskImplementing), string(workflow.TaskBlocked)},
-			string(workflow.TaskDismissed), "task_dismissed_auto", reason); err != nil {
+			string(workflow.TaskDismissed), "task_dismissed_auto", reason)
+		if err != nil {
 			if errors.Is(err, db.ErrTaskHasActiveJob) {
 				continue
 			}
 			return err
+		}
+		if changed {
+			dismissed++
 		}
 	}
 	for _, item := range remoteCandidates {
@@ -312,15 +317,21 @@ func (d Daemon) reconcileStaleTasks(ctx context.Context, openBranches map[string
 			continue
 		}
 		reason := fmt.Sprintf("stale task auto-dismissed: remote ref refs/heads/%s absent; ttl=%s; updated_at=%s", branch, ttl, item.candidate.UpdatedAt)
-		if _, _, err := d.Store.TransitionTaskStateWithEventIfNoActiveJob(ctx, item.task.ID,
+		changed, _, err := d.Store.TransitionTaskStateWithEventIfNoActiveJob(ctx, item.task.ID,
 			[]string{string(workflow.TaskImplementing), string(workflow.TaskBlocked)},
-			string(workflow.TaskDismissed), "task_dismissed_auto", reason); err != nil {
+			string(workflow.TaskDismissed), "task_dismissed_auto", reason)
+		if err != nil {
 			if errors.Is(err, db.ErrTaskHasActiveJob) {
 				continue
 			}
 			return err
 		}
+		if changed {
+			dismissed++
+		}
 	}
+	d.logf("stale task reconciler for %s: candidates=%d checked=%d dismissed=%d",
+		d.Repo.FullName(), len(candidates), len(emptyBranch)+len(remoteCandidates), dismissed)
 	return nil
 }
 

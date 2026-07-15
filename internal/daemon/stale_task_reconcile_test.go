@@ -145,6 +145,35 @@ func TestStaleTaskReconcilerRemoteErrorMutatesNothing(t *testing.T) {
 	}
 }
 
+func TestStaleTaskReconcilerLogsTickCounts(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "owner", Name: "repo"}
+	seedStaleRepo(t, store, repo)
+	writeStaleTaskConfig(t, store, "1h")
+	for _, task := range []db.Task{
+		{ID: "task-empty", RepoFullName: repo.FullName(), State: string(workflow.TaskImplementing)},
+		{ID: "task-absent", RepoFullName: repo.FullName(), State: string(workflow.TaskBlocked), Branch: "feature/absent"},
+		{ID: "task-present", RepoFullName: repo.FullName(), State: string(workflow.TaskImplementing), Branch: "feature/present"},
+	} {
+		if err := store.UpsertTask(ctx, task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logs := []string{}
+	d := Daemon{
+		Repo: repo, Store: store, Now: futureClock,
+		RemoteBranches: &fakeRemoteBranchChecker{present: map[string]struct{}{"feature/present": {}}},
+		Logf:           func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) },
+	}
+	if err := d.reconcileStaleTasks(ctx, map[string]struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 || logs[0] != "stale task reconciler for owner/repo: candidates=3 checked=3 dismissed=2" {
+		t.Fatalf("logs = %v", logs)
+	}
+}
+
 func TestStaleTaskReconcilerCapDrainAndRepeatIdempotence(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
