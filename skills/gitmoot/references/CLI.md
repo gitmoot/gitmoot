@@ -2547,6 +2547,9 @@ Define a pipeline in a YAML file and register it:
 ```yaml
 name: nightly-sync          # required, name-safe token (letters, digits, - _)
 repo: owner/repo            # optional to register; REQUIRED to run
+env_file: /root/.config/nightly-sync/env # optional 0600 secret file
+env:                         # optional inline NON-secret defaults
+  OUTPUT_DIR: /srv/nightly-sync
 schedule:                   # optional interval schedule (no cron in v1)
   interval: 24h             #   positive Go duration (required with a schedule block)
   jitter: 15m               #   optional random [0, jitter] added to next_due
@@ -2560,6 +2563,7 @@ trigger:                    # optional event source (email or pipeline)
 stages:                     # the DAG, keyed by unique id and wired by needs
   - id: source
     cmd: "curl -sf https://example.com/data > data.json"
+    env_keys: [SOURCE_API_TOKEN]
   - id: score
     cmd: "python score.py data.json"
     needs: [source]         # runs only after every listed stage SUCCEEDS
@@ -2768,6 +2772,20 @@ runs a named managed agent on its own runtime as a read-only leaf (`ask`/`review
 its `needs` stages' result summaries are prepended to the prompt, and a repo-bound
 agent stage runs in its own detached read-only worktree so same-repo agent stages
 parallelize without touching the live checkout.
+
+Shell stages can opt into pipeline-owned environment values with `env_keys`.
+`env_file` must be an absolute, operator-owned regular file with mode exactly
+`0600`, outside the Gitmoot home and every managed checkout; inline `env` is for
+non-secret defaults. Exact names and globs such as `REDDIT_*` are expanded at
+enqueue, and every selector must resolve. Agent/gate stages cannot set
+`env_keys`; a shell stage with no list gets nothing. The file is read again at
+delivery, so rotation applies without a daemon restart. File values beat inline
+defaults, selected values beat inherited daemon environment, and reserved
+`GITMOOT_*` names are rejected while Gitmoot's internal entries remain final.
+The job payload audits only the env-file path and expanded key names, never file
+values. This injected mode exposes an opaque key to that shell process; it is
+separate from the Claude model gateway, whose proxied credential remains hidden
+from the child.
 
 For a non-empty run payload, every agent stage (including roots) receives a
 dynamically fenced, 6000-byte-bounded `UNTRUSTED external data` block before

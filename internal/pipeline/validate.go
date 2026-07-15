@@ -32,6 +32,7 @@ func (s *Spec) normalize() {
 	s.Repo = strings.TrimSpace(s.Repo)
 	s.Group = strings.TrimSpace(s.Group)
 	s.Description = strings.TrimSpace(s.Description)
+	s.EnvFile = strings.TrimSpace(s.EnvFile)
 	if s.Schedule != nil {
 		s.Schedule.Interval = strings.TrimSpace(s.Schedule.Interval)
 		s.Schedule.Jitter = strings.TrimSpace(s.Schedule.Jitter)
@@ -64,6 +65,7 @@ func (s *Spec) normalize() {
 		s.Stages[i].Check = strings.TrimSpace(s.Stages[i].Check)
 		s.Stages[i].Writes = trimAll(s.Stages[i].Writes)
 		s.Stages[i].Needs = trimAll(s.Stages[i].Needs)
+		s.Stages[i].EnvKeys = trimAll(s.Stages[i].EnvKeys)
 		s.Stages[i].SuccessDecisions = trimAll(s.Stages[i].SuccessDecisions)
 		// An agent stage defaults to the read-only "ask" verb when action is unset.
 		// A shell stage never carries an action, so this only touches agent stages.
@@ -106,6 +108,20 @@ func (s Spec) Validate() error {
 			return fmt.Errorf("pipeline %q description must not contain control characters other than newline", s.Name)
 		}
 	}
+	if s.EnvFile != "" && !filepath.IsAbs(s.EnvFile) {
+		return fmt.Errorf("pipeline %q env_file %q must be absolute", s.Name, s.EnvFile)
+	}
+	for name, value := range s.Env {
+		if err := ValidateEnvName(name); err != nil {
+			return fmt.Errorf("pipeline %q env key %q: %w", s.Name, name, err)
+		}
+		if ReservedEnvName(name) {
+			return fmt.Errorf("pipeline %q env key %q uses reserved GITMOOT_* namespace", s.Name, name)
+		}
+		if strings.ContainsRune(value, '\x00') {
+			return fmt.Errorf("pipeline %q env key %q contains NUL", s.Name, name)
+		}
+	}
 	if len(s.Stages) == 0 {
 		return fmt.Errorf("pipeline %q has no stages", s.Name)
 	}
@@ -137,6 +153,17 @@ func (s Spec) Validate() error {
 	for _, stage := range s.Stages {
 		if err := validateStageExecutor(s.Name, stage); err != nil {
 			return err
+		}
+		if len(stage.EnvKeys) > 0 && stage.Kind() != StageKindShell {
+			return fmt.Errorf("pipeline %q stage %q sets env_keys but is not a shell stage; agent and gate stages receive no injected environment", s.Name, stage.ID)
+		}
+		for _, selector := range stage.EnvKeys {
+			if err := ValidateEnvSelector(selector); err != nil {
+				return fmt.Errorf("pipeline %q stage %q env_keys entry %q: %w", s.Name, stage.ID, selector, err)
+			}
+			if ReservedEnvSelector(selector) {
+				return fmt.Errorf("pipeline %q stage %q env_keys entry %q uses reserved GITMOOT_* namespace", s.Name, stage.ID, selector)
+			}
 		}
 		// #768 mutating-implement safety model (spec double-key + scheduled-write gate).
 		// Kept out of validateStageExecutor because it spans stage AND spec context (the

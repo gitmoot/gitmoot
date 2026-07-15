@@ -2745,6 +2745,9 @@ and does not affect an in-flight run.
 ```yaml
 name: nightly-sync          # required, name-safe token (letters, digits, - _)
 repo: owner/repo            # optional to register; REQUIRED to actually run
+env_file: /root/.config/nightly-sync/env # optional 0600 secret file
+env:                       # optional inline NON-secret defaults
+  OUTPUT_DIR: /srv/nightly-sync
 schedule:                   # optional; interval schedule (no cron in v1)
   interval: 24h             #   required when a schedule block is present (positive Go duration)
   jitter: 15m               #   optional random [0, jitter] added to each next_due (>= 0)
@@ -2762,6 +2765,7 @@ success_decisions:          # optional top-level default (see below)
 stages:                     # the DAG, keyed by unique id and wired by needs
   - id: source
     cmd: "curl -sf https://example.com/data > data.json"
+    env_keys: [SOURCE_API_TOKEN]
   - id: score
     cmd: "python score.py data.json"
     needs: [source]         # runs only after every listed stage SUCCEEDS
@@ -2780,6 +2784,8 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 | --------------------------- | ------------ | -------- | ----- |
 | `name`                      | pipeline     | yes      | Stable identifier and DB primary key; a name-safe token (letters, digits, `-`, `_`). |
 | `repo`                      | pipeline     | no\*     | `owner/name` the stages run against. Optional to **register**, but **required to run** — stage jobs need a managed repo for the worker to claim them. |
+| `env_file`                  | pipeline     | no       | Absolute operator-owned secret file. It must exist, be a regular file owned by the current uid with mode exactly `0600`, and live outside the Gitmoot home and every managed checkout. |
+| `env`                       | pipeline     | no       | Inline **non-secret** `KEY: value` defaults. A file value with the same key wins. Values are delivered only when a shell stage selects the key. |
 | `schedule.interval`         | pipeline     | cond.    | Required when a `schedule:` block is present. A positive Go duration (`24h`, `1h30m`). |
 | `schedule.jitter`           | pipeline     | no       | Random `[0, jitter]` added to each `next_due` to de-thunder (`>= 0`). |
 | `trigger.kind`              | pipeline     | cond.    | Required with `trigger:`. Only `email` is supported; it generates an owned Activepieces IMAP flow. |
@@ -2807,6 +2813,7 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 | `stages[].needs`            | stage        | no       | Ids of sibling stages that must **succeed** before this stage is enqueued. Must reference known stages, never the stage itself, and form no cycle. |
 | `stages[].timeout`          | stage        | no       | Per-stage job timeout (positive Go duration). |
 | `stages[].retry`            | stage        | no       | How many times a **failed** stage may be re-attempted (`>= 0`, default `0`). |
+| `stages[].env_keys`         | stage        | no       | Exact names or globs (for example `REDDIT_*`) selected from `env_file`/`env`. Shell stages only; no entry means no injected values. |
 | `stages[].success_decisions`| stage        | no       | Per-stage override of the pipeline default. |
 
 `gitmoot pipeline add` validates the whole spec **at add time** — unknown keys, a
@@ -2820,6 +2827,41 @@ stage in `needs`, or `source` on another stage kind), an unknown/self/cyclic `ne
 timeout/interval/jitter, a negative retry, or a `success_decisions` value outside the
 allowed set — so a structural mistake surfaces as a clear error at registration
 rather than a stuck run later.
+
+### Stage-scoped environment
+
+Pipeline secrets are deny-by-default. A shell stage receives only the concrete
+names selected by its `env_keys`; a sibling with different or empty `env_keys`
+does not receive them. Agent and gate stages cannot declare `env_keys`.
+
+```yaml
+env_file: /root/.config/trend-scout/env
+env:
+  TREND_SCOUT_DATA: /srv/trend-scout # non-secret fallback
+stages:
+  - id: harvest
+    cmd: scripts/harvest.sh
+    env_keys: [REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, STACKEXCHANGE_*]
+  - id: deliver
+    cmd: scripts/deliver.sh
+    env_keys: [TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]
+```
+
+`pipeline add` parses the file and refuses missing files/keys, insecure mode,
+wrong ownership, protected locations, malformed selectors, and any inline,
+file, or selector collision with reserved `GITMOOT_*` names. Values are loaded
+again immediately before each stage process starts, so an atomic rewrite of the
+same `0600` file rotates credentials without a daemon restart. The file value
+wins an inline default; selected values win inherited daemon environment;
+Gitmoot's own later `GITMOOT_*` entries always win.
+
+The persisted stage job payload is the audit record: it contains the env-file
+path and expanded key **names**, never secret values. Inline `env` is stored in
+the pipeline spec and is therefore for non-secrets only. An injected/opaque key
+is necessarily visible to its shell process, which can print or transmit it;
+this is scoping and audit, not a vault. The Claude model gateway is independent:
+it continues to proxy the model credential without exposing the real value to
+the child.
 
 On `pipeline add --enable`, Gitmoot publishes the owned flow. An unavailable
 Activepieces instance leaves a pending binding; run
@@ -11787,6 +11829,9 @@ Define a pipeline in a YAML file and register it:
 ```yaml
 name: nightly-sync          # required, name-safe token (letters, digits, - _)
 repo: owner/repo            # optional to register; REQUIRED to run
+env_file: /root/.config/nightly-sync/env # optional 0600 secret file
+env:                         # optional inline NON-secret defaults
+  OUTPUT_DIR: /srv/nightly-sync
 schedule:                   # optional interval schedule (no cron in v1)
   interval: 24h             #   positive Go duration (required with a schedule block)
   jitter: 15m               #   optional random [0, jitter] added to next_due
@@ -11800,6 +11845,7 @@ trigger:                    # optional event source (email or pipeline)
 stages:                     # the DAG, keyed by unique id and wired by needs
   - id: source
     cmd: "curl -sf https://example.com/data > data.json"
+    env_keys: [SOURCE_API_TOKEN]
   - id: score
     cmd: "python score.py data.json"
     needs: [source]         # runs only after every listed stage SUCCEEDS
@@ -12008,6 +12054,20 @@ runs a named managed agent on its own runtime as a read-only leaf (`ask`/`review
 its `needs` stages' result summaries are prepended to the prompt, and a repo-bound
 agent stage runs in its own detached read-only worktree so same-repo agent stages
 parallelize without touching the live checkout.
+
+Shell stages can opt into pipeline-owned environment values with `env_keys`.
+`env_file` must be an absolute, operator-owned regular file with mode exactly
+`0600`, outside the Gitmoot home and every managed checkout; inline `env` is for
+non-secret defaults. Exact names and globs such as `REDDIT_*` are expanded at
+enqueue, and every selector must resolve. Agent/gate stages cannot set
+`env_keys`; a shell stage with no list gets nothing. The file is read again at
+delivery, so rotation applies without a daemon restart. File values beat inline
+defaults, selected values beat inherited daemon environment, and reserved
+`GITMOOT_*` names are rejected while Gitmoot's internal entries remain final.
+The job payload audits only the env-file path and expanded key names, never file
+values. This injected mode exposes an opaque key to that shell process; it is
+separate from the Claude model gateway, whose proxied credential remains hidden
+from the child.
 
 For a non-empty run payload, every agent stage (including roots) receives a
 dynamically fenced, 6000-byte-bounded `UNTRUSTED external data` block before
@@ -13470,12 +13530,16 @@ repo: owner/repo            # required to run (stages need a managed repo)
 group: Release Automation   # optional display section (falls back to repo when unset;
                             #   built-in memory pipelines ship under "Gitmoot System")
 description: Syncs nightly data for deployment. # optional detail-page purpose (multiline, max 500 chars)
+env_file: /root/.config/nightly-sync/env # optional 0600 secret file
+env:                         # optional inline NON-secret defaults
+  OUTPUT_DIR: /srv/nightly-sync
 schedule:                   # optional; auto-runs every interval once enabled
   interval: 24h
   jitter: 15m
 stages:
   - id: source
     cmd: "curl -sf https://example.com/data > data.json"
+    env_keys: [SOURCE_API_TOKEN]
   - id: score
     cmd: "python score.py data.json"
     needs: [source]         # runs only after source SUCCEEDS
@@ -13490,6 +13554,14 @@ gitmoot pipeline add nightly-sync.yaml --enable   # validate + store; --enable t
 RUN=$(gitmoot pipeline run nightly-sync)          # or trigger a manual run now
 gitmoot pipeline show "$RUN"                       # watch the text funnel
 ```
+
+`env_keys` is a shell-stage-only allowlist of exact names or globs resolved from
+the pipeline's `env_file` and inline non-secret `env`. No list means no injected
+values, and agent stages cannot request them. `pipeline add` requires the file
+to be absolute, operator-owned `0600`, and outside Gitmoot state/checkouts; it
+also refuses missing keys and reserved `GITMOOT_*` names. Values are read fresh
+at stage delivery for restart-free rotation. The job audit stores the path and
+expanded names only, not file values.
 
 ### Share a pipeline with another Gitmoot home
 
@@ -14117,9 +14189,15 @@ The spec is stored **verbatim** (the raw YAML bytes plus a content hash), so a s
 that embeds private hostnames, filesystem paths, tokens-by-reference, or repo names
 is retained in the local store as-is — the same private-repo caveat as a captured
 agent template or a published template. Do not register a spec carrying a secret in
-a stage command; provision the secret out of band and have the stage read it from
-the environment, and let the stage return `blocked` (with its `needs`) until the
-secret is present rather than baking it into the DAG.
+a stage command or inline `env`. Use an operator-owned `0600` `env_file` plus the
+shell stage's `env_keys` allowlist instead.
+
+Pipeline `env_file` injection (#968) is deny-by-default but deliberately
+**opaque**: only a shell stage's selected `env_keys` are injected, yet that
+process receives the real values and can print or transmit them. Gitmoot stores
+only the file path and expanded names in the job audit. This is distinct from
+the Claude keycard/model gateway, where the child receives a placeholder and the
+real model credential stays daemon-side.
 
 ## External Contracts
 

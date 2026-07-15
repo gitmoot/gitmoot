@@ -74,6 +74,12 @@ type Spec struct {
 	// Description is optional display metadata explaining a pipeline's purpose.
 	// It is shown verbatim on detail surfaces and has no execution semantics.
 	Description string `yaml:"description,omitempty"`
+	// EnvFile is an optional operator-owned 0600 file containing secret
+	// KEY=VALUE entries. Shell stages opt into individual names through EnvKeys.
+	EnvFile string `yaml:"env_file,omitempty"`
+	// Env contains non-secret defaults. Entries are delivered only when a shell
+	// stage explicitly names them in EnvKeys.
+	Env map[string]string `yaml:"env,omitempty"`
 	// Schedule, when present, drives interval-based auto-runs (heartbeat idiom: an
 	// interval plus optional jitter; no cron in v1).
 	Schedule *Schedule `yaml:"schedule,omitempty"`
@@ -179,6 +185,9 @@ type Stage struct {
 	Timeout string `yaml:"timeout,omitempty"`
 	// Retry is how many times a failed stage may be re-attempted (>= 0).
 	Retry int `yaml:"retry,omitempty"`
+	// EnvKeys is the deny-by-default list of environment names (or glob selectors)
+	// made available to this shell stage. Agent and gate stages may not request it.
+	EnvKeys []string `yaml:"env_keys,omitempty"`
 	// SuccessDecisions optionally overrides the pipeline default for this stage.
 	SuccessDecisions []string `yaml:"success_decisions,omitempty"`
 	// Orchestrate, when true on an agent stage, promotes the stage from a read-only

@@ -5387,6 +5387,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}()
 	}
 	writeLine(w.Stdout, "running job %s for %s in %s", job.ID, agent.Name, payload.Repo)
+	adapter = wrapPipelineEnvDeliveryAdapter(w.Store, w.ConfigHome, payload, adapter)
 	engine := w.WorkflowFactory(checkout)
 	// Wire the PRE-TERMINAL operational-blocker deferrer (#532 slice E) on the LIVE
 	// worker (not the WorkflowFactory-captured copy) so it observes this worker's

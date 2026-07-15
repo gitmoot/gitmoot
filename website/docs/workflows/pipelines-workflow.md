@@ -30,6 +30,9 @@ group: Release Automation   # optional display section on /pipelines and `pipeli
                             #   one repo may split across groups); unset falls back to repo.
                             #   Built-in memory pipelines ship under "Gitmoot System".
 description: Syncs nightly data for deployment. # optional detail-page purpose (multiline, max 500 chars)
+env_file: /root/.config/nightly-sync/env # optional operator-owned 0600 secret file
+env:                         # optional inline NON-secret defaults
+  OUTPUT_DIR: /srv/nightly-sync
 schedule:                   # optional; auto-runs every interval once enabled
   interval: 24h             #   positive Go duration (required with a schedule block)
   jitter: 15m               #   optional random [0, jitter] added to each next_due
@@ -43,6 +46,7 @@ trigger:                    # optional event source (requires repo:)
 stages:                     # the DAG, keyed by unique id and wired by needs
   - id: source
     cmd: "curl -sf https://example.com/data > data.json"
+    env_keys: [SOURCE_API_TOKEN]
   - id: score
     cmd: "python score.py data.json"
     needs: [source]         # runs only after source SUCCEEDS
@@ -77,6 +81,38 @@ name/id, a duplicate stage id, a stage that is not exactly one of `cmd`, `agent`
 structural mistake is a clear error at registration, not a stuck run later. It stores the raw YAML **verbatim**
 plus a content hash; each run snapshots the hash and executes its snapshot, so
 editing the file later never mutates an in-flight run.
+
+### Give each shell stage only the keys it needs
+
+Declare secrets in a pipeline-owned file and select them per shell stage:
+
+```yaml
+env_file: /root/.config/trend-scout/env
+env:
+  TREND_SCOUT_DATA: /srv/trend-scout # non-secret fallback
+stages:
+  - id: harvest
+    cmd: scripts/harvest.sh
+    env_keys: [REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, STACKEXCHANGE_*]
+  - id: deliver
+    cmd: scripts/deliver.sh
+    env_keys: [TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]
+```
+
+No `env_keys` means no injected values. Exact names and globs expand only for
+shell stages; agent and gate stages cannot request them. At registration,
+Gitmoot requires the absolute `env_file` to be operator-owned, mode exactly
+`0600`, and outside its home and managed checkouts. Missing keys, malformed
+files, and reserved `GITMOOT_*` names fail `pipeline add` without printing
+values.
+
+Gitmoot reads the file again immediately before each stage process starts, so
+rotation needs no daemon restart. File values beat inline non-secret defaults,
+selected values beat inherited daemon environment, and Gitmoot's internal
+`GITMOOT_*` entries remain final. The stage job payload audits the file path and
+expanded key names only; file values never enter SQLite. The selected shell can
+still read an injected key. This is separate from the Claude model gateway,
+which keeps its proxied real credential out of the child.
 
 ### Chain pipelines on success
 

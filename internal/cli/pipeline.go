@@ -259,6 +259,9 @@ func addPipelineCore(ctx context.Context, store *db.Store, spec pipeline.Spec, r
 	if err := validatePipelineProducePaths(ctx, store, opts.Home, spec); err != nil {
 		return false, err
 	}
+	if err := validatePipelineEnvironment(ctx, store, opts.Home, spec); err != nil {
+		return false, err
+	}
 	registered, err := store.ListPipelines(ctx)
 	if err != nil {
 		return false, err

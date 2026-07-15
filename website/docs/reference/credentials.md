@@ -58,6 +58,12 @@ credential and ignore the placeholder — the gateway would then `401` the
 delivery (#936). The mirror never contains a credential; the operator's real
 config is only read, never modified.
 
+Pipeline `env_file` + per-stage `env_keys` are a separate **injected** mode for
+opaque API credentials whose shell script must present the real value. Gitmoot
+scopes those values to selected shell stages and audits names only, but the
+selected process necessarily receives the real credential. Enabling or using
+this feature does not alter the Claude gateway or its placeholder flow.
+
 The feature is off by default and currently covers Claude only. A populated
 `runtime-auth.env` is required while it is enabled; Gitmoot fails the delivery
 instead of falling back to ambient auth, Claude's credential store, or direct

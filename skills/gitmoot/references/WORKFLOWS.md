@@ -1070,12 +1070,16 @@ repo: owner/repo            # required to run (stages need a managed repo)
 group: Release Automation   # optional display section (falls back to repo when unset;
                             #   built-in memory pipelines ship under "Gitmoot System")
 description: Syncs nightly data for deployment. # optional detail-page purpose (multiline, max 500 chars)
+env_file: /root/.config/nightly-sync/env # optional 0600 secret file
+env:                         # optional inline NON-secret defaults
+  OUTPUT_DIR: /srv/nightly-sync
 schedule:                   # optional; auto-runs every interval once enabled
   interval: 24h
   jitter: 15m
 stages:
   - id: source
     cmd: "curl -sf https://example.com/data > data.json"
+    env_keys: [SOURCE_API_TOKEN]
   - id: score
     cmd: "python score.py data.json"
     needs: [source]         # runs only after source SUCCEEDS
@@ -1090,6 +1094,14 @@ gitmoot pipeline add nightly-sync.yaml --enable   # validate + store; --enable t
 RUN=$(gitmoot pipeline run nightly-sync)          # or trigger a manual run now
 gitmoot pipeline show "$RUN"                       # watch the text funnel
 ```
+
+`env_keys` is a shell-stage-only allowlist of exact names or globs resolved from
+the pipeline's `env_file` and inline non-secret `env`. No list means no injected
+values, and agent stages cannot request them. `pipeline add` requires the file
+to be absolute, operator-owned `0600`, and outside Gitmoot state/checkouts; it
+also refuses missing keys and reserved `GITMOOT_*` names. Values are read fresh
+at stage delivery for restart-free rotation. The job audit stores the path and
+expanded names only, not file values.
 
 ### Share a pipeline with another Gitmoot home
 

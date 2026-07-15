@@ -1112,6 +1112,15 @@ func advancePipelineRunWithAutoMerge(ctx context.Context, store *db.Store, enque
 		}
 		skipNativeReviewFanout := stage.Kind() == pipeline.StageKindAgentImplement && pipelineImplementHasSourceBoundReview(spec, stage.ID)
 		request := pipelineStageJobRequest(rec, stage, run, row.Attempt, upstreamContext, binding, skipNativeReviewFanout)
+		if stage.Kind() == pipeline.StageKindShell {
+			access, envErr := resolvePipelineStageEnvAccess(ctx, store, filepath.Dir(store.DatabasePath()), spec, stage)
+			if envErr != nil {
+				return run, envErr
+			}
+			request.PipelineEnvFile = access.File
+			request.PipelineEnvKeys = access.Keys
+			request.PipelineEnv = access.Defaults
+		}
 		job, err := enqueuePipelineStageJob(ctx, store, enqueue, request, pipelineStageSourceBoundReviewRequest(request))
 		if err != nil {
 			return run, err

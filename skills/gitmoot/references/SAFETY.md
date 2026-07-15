@@ -172,9 +172,15 @@ The spec is stored **verbatim** (the raw YAML bytes plus a content hash), so a s
 that embeds private hostnames, filesystem paths, tokens-by-reference, or repo names
 is retained in the local store as-is — the same private-repo caveat as a captured
 agent template or a published template. Do not register a spec carrying a secret in
-a stage command; provision the secret out of band and have the stage read it from
-the environment, and let the stage return `blocked` (with its `needs`) until the
-secret is present rather than baking it into the DAG.
+a stage command or inline `env`. Use an operator-owned `0600` `env_file` plus the
+shell stage's `env_keys` allowlist instead.
+
+Pipeline `env_file` injection (#968) is deny-by-default but deliberately
+**opaque**: only a shell stage's selected `env_keys` are injected, yet that
+process receives the real values and can print or transmit them. Gitmoot stores
+only the file path and expanded names in the job audit. This is distinct from
+the Claude keycard/model gateway, where the child receives a placeholder and the
+real model credential stays daemon-side.
 
 ## External Contracts
 

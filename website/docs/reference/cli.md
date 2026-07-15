@@ -1879,6 +1879,9 @@ Define a pipeline in a YAML file, then register and run it:
 ```yaml
 name: nightly-sync          # required, name-safe token (letters, digits, - _)
 repo: owner/repo            # optional to register; REQUIRED to run
+env_file: /root/.config/nightly-sync/env # optional operator-owned 0600 secret file
+env:                         # optional inline NON-secret defaults
+  OUTPUT_DIR: /srv/nightly-sync
 schedule:                   # optional interval schedule (no cron in v1)
   interval: 24h
   jitter: 15m
@@ -1892,6 +1895,7 @@ trigger:                    # optional generated Activepieces event source
 stages:                     # the DAG, keyed by unique id and wired by needs
   - id: source
     cmd: "curl -sf https://example.com/data > data.json"
+    env_keys: [SOURCE_API_TOKEN]
   - id: score
     cmd: "python score.py data.json"
     needs: [source]         # runs only after source SUCCEEDS
@@ -1944,6 +1948,13 @@ coordinator that fans out owned children and folds the synthesis); and **gate** 
 implement stage's PR merges). A read-only stage's `needs` result summaries are prepended
 to its prompt, and a repo-bound read-only agent stage runs in its own detached
 read-only worktree so same-repo stages parallelize without touching the live checkout.
+For shell-stage API credentials, set an absolute pipeline `env_file` and list
+exact names or globs in each stage's `env_keys`. The file must be a regular,
+operator-owned `0600` file outside Gitmoot state and managed checkouts; inline
+`env` is for non-secret defaults. Missing/reserved keys and `env_keys` on an
+agent/gate stage are rejected at add time. A stage with no list receives no
+injected values. Values are read fresh at delivery for restart-free rotation;
+the job payload stores only the path and expanded names, never file values.
 Every agent stage receives a non-empty trigger payload as bounded, dynamically
 fenced `UNTRUSTED external data`; shell stages receive exact
 `GITMOOT_TRIGGER_<UPPERCASE_KEY>` environment entries. The full payload is retained

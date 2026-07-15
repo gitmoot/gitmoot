@@ -189,6 +189,14 @@ type JobRequest struct {
 	// KEY=value entries to a shell runtime job. It is empty for every non-pipeline
 	// and non-shell job.
 	ShellEnv []string
+	// PipelineEnvFile and PipelineEnvKeys are the names-only #968 injected-env
+	// authority for a pipeline shell stage. PipelineEnv contains only selected
+	// inline NON-secret defaults; secret values are loaded at delivery and never
+	// enter the persisted payload. A future keycard registry/grant resolver can
+	// feed this same delivery seam without changing the shell adapter.
+	PipelineEnvFile string
+	PipelineEnvKeys []string
+	PipelineEnv     map[string]string
 	// ShellUpstreamContext carries the persisted JSON CONTENT supplied to a
 	// dependent pipeline shell stage. Delivery writes it to a fresh temporary
 	// file; paths are deliberately never persisted. Additive/omitempty: empty
@@ -271,34 +279,37 @@ type JobPayload struct {
 	// without it serializes byte-identically. The terminal cleanup keys off it to
 	// dispose top-level read-only worktrees that the DelegationID-gated read-only
 	// delegation cleanup would otherwise orphan.
-	ReadOnlyWorktree       bool           `json:"read_only_worktree,omitempty"`
-	TemplateID             string         `json:"template_id,omitempty"`
-	TemplateResolvedCommit string         `json:"template_resolved_commit,omitempty"`
-	TemplateContent        string         `json:"template_content,omitempty"`
-	OriginalAgent          string         `json:"original_agent,omitempty"`
-	DelegatedAgent         string         `json:"delegated_agent,omitempty"`
-	DelegationReason       string         `json:"delegation_reason,omitempty"`
-	RecentDelegationHashes []string       `json:"recent_delegation_hashes,omitempty"`
-	DelegationRepeatCount  int            `json:"delegation_repeat_count,omitempty"`
-	NonProgressStreak      int            `json:"non_progress_streak,omitempty"`
-	LastProgressDigest     string         `json:"last_progress_digest,omitempty"`
-	VerifyAttempt          int            `json:"verify_attempt,omitempty"`
-	DelegationFinalize     bool           `json:"delegation_finalize,omitempty"`
-	Model                  string         `json:"model,omitempty"`
-	Effort                 string         `json:"effort,omitempty"`
-	WorkflowID             string         `json:"workflow_id,omitempty"`
-	RuntimeOverride        string         `json:"runtime_override,omitempty"`
-	RuntimeOverrideRef     string         `json:"runtime_override_ref,omitempty"`
-	ShellEnv               []string       `json:"shell_env,omitempty"`
-	ShellUpstreamContext   string         `json:"shell_upstream_context,omitempty"`
-	Phase                  string         `json:"phase,omitempty"`
-	Cockpit                bool           `json:"cockpit,omitempty"`
-	CockpitSession         string         `json:"cockpit_session,omitempty"`
-	CockpitPaneKey         string         `json:"cockpit_pane_key,omitempty"`
-	SkipNativeReviewFanout bool           `json:"skip_native_review_fanout,omitempty"`
-	ValidatedPullRequest   bool           `json:"validated_pull_request,omitempty"`
-	Ephemeral              *EphemeralSpec `json:"ephemeral,omitempty"`
-	HumanAnswer            string         `json:"human_answer,omitempty"`
+	ReadOnlyWorktree       bool              `json:"read_only_worktree,omitempty"`
+	TemplateID             string            `json:"template_id,omitempty"`
+	TemplateResolvedCommit string            `json:"template_resolved_commit,omitempty"`
+	TemplateContent        string            `json:"template_content,omitempty"`
+	OriginalAgent          string            `json:"original_agent,omitempty"`
+	DelegatedAgent         string            `json:"delegated_agent,omitempty"`
+	DelegationReason       string            `json:"delegation_reason,omitempty"`
+	RecentDelegationHashes []string          `json:"recent_delegation_hashes,omitempty"`
+	DelegationRepeatCount  int               `json:"delegation_repeat_count,omitempty"`
+	NonProgressStreak      int               `json:"non_progress_streak,omitempty"`
+	LastProgressDigest     string            `json:"last_progress_digest,omitempty"`
+	VerifyAttempt          int               `json:"verify_attempt,omitempty"`
+	DelegationFinalize     bool              `json:"delegation_finalize,omitempty"`
+	Model                  string            `json:"model,omitempty"`
+	Effort                 string            `json:"effort,omitempty"`
+	WorkflowID             string            `json:"workflow_id,omitempty"`
+	RuntimeOverride        string            `json:"runtime_override,omitempty"`
+	RuntimeOverrideRef     string            `json:"runtime_override_ref,omitempty"`
+	ShellEnv               []string          `json:"shell_env,omitempty"`
+	PipelineEnvFile        string            `json:"pipeline_env_file,omitempty"`
+	PipelineEnvKeys        []string          `json:"pipeline_env_keys,omitempty"`
+	PipelineEnv            map[string]string `json:"pipeline_env,omitempty"`
+	ShellUpstreamContext   string            `json:"shell_upstream_context,omitempty"`
+	Phase                  string            `json:"phase,omitempty"`
+	Cockpit                bool              `json:"cockpit,omitempty"`
+	CockpitSession         string            `json:"cockpit_session,omitempty"`
+	CockpitPaneKey         string            `json:"cockpit_pane_key,omitempty"`
+	SkipNativeReviewFanout bool              `json:"skip_native_review_fanout,omitempty"`
+	ValidatedPullRequest   bool              `json:"validated_pull_request,omitempty"`
+	Ephemeral              *EphemeralSpec    `json:"ephemeral,omitempty"`
+	HumanAnswer            string            `json:"human_answer,omitempty"`
 	// ThreadID / ChatMessageID back-link a chat-promoted job (#534) to its origin
 	// message. Additive/omitempty: a non-chat job serializes byte-identically.
 	ThreadID      string `json:"thread_id,omitempty"`
@@ -435,6 +446,9 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		RuntimeOverride:        strings.TrimSpace(request.RuntimeOverride),
 		RuntimeOverrideRef:     strings.TrimSpace(request.RuntimeOverrideRef),
 		ShellEnv:               append([]string(nil), request.ShellEnv...),
+		PipelineEnvFile:        strings.TrimSpace(request.PipelineEnvFile),
+		PipelineEnvKeys:        compactStrings(request.PipelineEnvKeys),
+		PipelineEnv:            request.PipelineEnv,
 		ShellUpstreamContext:   request.ShellUpstreamContext,
 		Phase:                  request.Phase,
 		Cockpit:                request.Cockpit,
