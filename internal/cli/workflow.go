@@ -406,7 +406,7 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fmt.Errorf("invalid repo: %w", err)
 		}
-		repoRecord, err := repoRecordForCheckout(context.Background(), repo, gitutil.Client{Dir: "."})
+		repoRecord, err := resolveRepoRecord(context.Background(), store, repo, ".")
 		if err != nil {
 			return err
 		}

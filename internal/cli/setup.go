@@ -46,7 +46,7 @@ func runSetup(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "invalid repo: %v\n", err)
 		return 2
 	}
-	record, err := repoRecordFromPath(context.Background(), repo, *path)
+	record, err := repoRecordFromStablePath(context.Background(), repo, *path)
 	if err != nil {
 		fmt.Fprintf(stderr, "setup: %v\n", err)
 		return 1

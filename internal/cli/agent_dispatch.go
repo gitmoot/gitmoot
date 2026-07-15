@@ -1352,32 +1352,18 @@ func resolveLocalAgentRepo(ctx context.Context, store *db.Store, repoFlag string
 	if err != nil {
 		return github.Repository{}, db.Repo{}, err
 	}
-	if strings.TrimSpace(repoFlag) == "" {
-		record, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: "."})
-		if err != nil {
-			return github.Repository{}, db.Repo{}, err
-		}
-		return repo, record, nil
-	}
-	if existing, err := store.GetRepo(ctx, repo.FullName()); err == nil && strings.TrimSpace(existing.CheckoutPath) != "" {
-		record, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: existing.CheckoutPath})
-		if err != nil {
-			return github.Repository{}, db.Repo{}, err
-		}
-		// repoRecordForCheckout reports the checkout's current branch. For a
-		// registered repo, keep the stored default branch so an old feature checkout
-		// cannot redefine the base branch during dispatch.
-		if strings.TrimSpace(existing.DefaultBranch) != "" {
-			record.DefaultBranch = existing.DefaultBranch
-		}
-		record.PollInterval = existing.PollInterval
-		return repo, record, nil
-	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return github.Repository{}, db.Repo{}, err
-	}
-	record, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: "."})
+	record, err := resolveRepoRecord(ctx, store, repo, ".")
 	if err != nil {
 		return github.Repository{}, db.Repo{}, err
+	}
+	// Without --repo, preserve the historical current-checkout branch selection
+	// for the job payload while retaining the registered/stable checkout path.
+	// This prevents an ephemeral cwd from becoming repo.CheckoutPath without
+	// silently rebasing local ask/review behavior onto the stored default branch.
+	if strings.TrimSpace(repoFlag) == "" {
+		if cwdRecord, cwdErr := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: "."}); cwdErr == nil {
+			record.DefaultBranch = cwdRecord.DefaultBranch
+		}
 	}
 	return repo, record, nil
 }

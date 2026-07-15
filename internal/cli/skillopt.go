@@ -30,7 +30,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/feedback"
-	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/skillopt"
@@ -10435,20 +10434,7 @@ func ensureSkillOptTrainGenerationRepoReady(ctx context.Context, store *db.Store
 	if err != nil {
 		return err
 	}
-	if existing, err := store.GetRepo(ctx, repo.FullName()); err == nil {
-		if strings.TrimSpace(existing.CheckoutPath) == "" {
-			return fmt.Errorf("generation repo %s has no checkout path; run `gitmoot repo add %s --path /path/to/checkout` before train continue", repo.FullName(), repo.FullName())
-		}
-		record, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: existing.CheckoutPath})
-		if err != nil {
-			return fmt.Errorf("generation repo %s checkout is not ready: %w", repo.FullName(), err)
-		}
-		record.PollInterval = existing.PollInterval
-		return store.UpsertRepo(ctx, record)
-	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	record, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: "."})
+	record, err := resolveRepoRecord(ctx, store, repo, ".")
 	if err != nil {
 		return fmt.Errorf("generation repo %s is not registered with a checkout path; run `gitmoot repo add %s --path /path/to/checkout` before train continue: %w", repo.FullName(), repo.FullName(), err)
 	}

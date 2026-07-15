@@ -292,3 +292,120 @@ func TestResolveLocalAgentRepoPreservesRegisteredDefaultBranch(t *testing.T) {
 		t.Fatalf("checkout branch = %q err=%v, want feature/stale", branch, err)
 	}
 }
+
+func TestResolveLocalAgentRepoSelfHealsDanglingCheckoutForImplementBase(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	primary, linked := setupLinkedWorktreeRepo(t)
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertRepoForce(ctx, db.Repo{
+		Owner: "owner", Name: "repo", DefaultBranch: "main",
+		CheckoutPath: linked, PrimaryCheckoutPath: primary,
+	}); err != nil {
+		t.Fatalf("UpsertRepoForce: %v", err)
+	}
+	runGit(t, primary, "worktree", "remove", "--force", linked)
+
+	_, record, err := resolveLocalAgentRepo(ctx, store, "owner/repo")
+	if err != nil {
+		t.Fatalf("resolveLocalAgentRepo: %v", err)
+	}
+	if record.CheckoutPath != primary || record.PrimaryCheckoutPath != primary {
+		t.Fatalf("resolved record = %+v, want repaired primary %s", record, primary)
+	}
+	wantSHA := strings.TrimSpace(runGitOutput(t, primary, "rev-parse", "HEAD"))
+	gotSHA, err := resolveLocalImplementBase(ctx, config.PathsForHome(home), record, "HEAD")
+	if err != nil || gotSHA != wantSHA {
+		t.Fatalf("resolveLocalImplementBase = %q, err=%v, want %q", gotSHA, err, wantSHA)
+	}
+	stored, err := store.GetRepo(ctx, "owner/repo")
+	if err != nil || stored.CheckoutPath != primary || stored.PrimaryCheckoutPath != primary {
+		t.Fatalf("stored record = %+v, err=%v", stored, err)
+	}
+}
+
+func TestResolveLocalAgentRepoSelfHealsNonGitCheckout(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	primary, linked := setupLinkedWorktreeRepo(t)
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertRepoForce(ctx, db.Repo{
+		Owner: "owner", Name: "repo", DefaultBranch: "main",
+		CheckoutPath: linked, PrimaryCheckoutPath: primary,
+	}); err != nil {
+		t.Fatalf("UpsertRepoForce: %v", err)
+	}
+	runGit(t, primary, "worktree", "remove", "--force", linked)
+	if err := os.MkdirAll(linked, 0o755); err != nil {
+		t.Fatalf("recreate non-git checkout directory: %v", err)
+	}
+
+	_, record, err := resolveLocalAgentRepo(ctx, store, "owner/repo")
+	if err != nil {
+		t.Fatalf("resolveLocalAgentRepo: %v", err)
+	}
+	if record.CheckoutPath != primary || record.PrimaryCheckoutPath != primary {
+		t.Fatalf("resolved record = %+v, want repaired primary %s", record, primary)
+	}
+	stored, err := store.GetRepo(ctx, "owner/repo")
+	if err != nil || stored.CheckoutPath != primary || stored.PrimaryCheckoutPath != primary {
+		t.Fatalf("stored record = %+v, err=%v", stored, err)
+	}
+}
+
+func TestResolveLocalAgentRepoLeavesValidLinkedCheckoutRegistered(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	primary, linked := setupLinkedWorktreeRepo(t)
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertRepoForce(ctx, db.Repo{
+		Owner: "owner", Name: "repo", DefaultBranch: "main",
+		CheckoutPath: linked, PrimaryCheckoutPath: primary,
+	}); err != nil {
+		t.Fatalf("UpsertRepoForce: %v", err)
+	}
+
+	_, record, err := resolveLocalAgentRepo(ctx, store, "owner/repo")
+	if err != nil {
+		t.Fatalf("resolveLocalAgentRepo: %v", err)
+	}
+	if record.CheckoutPath != linked || record.PrimaryCheckoutPath != primary {
+		t.Fatalf("resolved record = %+v, want valid linked checkout %s", record, linked)
+	}
+	stored, err := store.GetRepo(ctx, "owner/repo")
+	if err != nil || stored.CheckoutPath != linked {
+		t.Fatalf("stored record = %+v, err=%v", stored, err)
+	}
+}
+
+func TestResolveRepoRecordPinsImplicitLinkedCheckoutToPrimary(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	primary, initialLinked := setupLinkedWorktreeRepo(t)
+	runGit(t, primary, "worktree", "remove", "--force", initialLinked)
+	linked := filepath.Join(home, ".gitmoot", "worktrees", "owner--repo", "adhoc-root-prevention")
+	if err := os.MkdirAll(filepath.Dir(linked), 0o755); err != nil {
+		t.Fatalf("mkdir managed worktree parent: %v", err)
+	}
+	runGit(t, primary, "worktree", "add", "-b", "adhoc-root-prevention", linked)
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+
+	record, err := resolveRepoRecord(ctx, store, github.Repository{Owner: "owner", Name: "repo"}, linked)
+	if err != nil {
+		t.Fatalf("resolveRepoRecord: %v", err)
+	}
+	if record.CheckoutPath != primary || record.PrimaryCheckoutPath != primary {
+		t.Fatalf("implicit linked record = %+v, want primary %s", record, primary)
+	}
+	if err := store.UpsertRepo(ctx, record); err != nil {
+		t.Fatalf("UpsertRepo: %v", err)
+	}
+	stored, err := store.GetRepo(ctx, "owner/repo")
+	if err != nil || stored.CheckoutPath != primary {
+		t.Fatalf("stored record = %+v, err=%v", stored, err)
+	}
+}

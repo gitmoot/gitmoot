@@ -520,6 +520,9 @@ Fixes:
   worktree path on the task and routes task-tied jobs there.
 - Keep the registered checkout clean. Gitmoot still uses it for base branch
   updates and merge-gate cleanup.
+- If a removed task worktree was previously cached as the registered checkout,
+  run `gitmoot repo doctor owner/repo`. Gitmoot verifies the recorded primary
+  checkout and repairs the registration before the next job resolves its base.
 - Use separate runtime sessions, managed background instances, or forkable temp
   workers for jobs that should truly run concurrently. Worktrees isolate files;
   temp workers isolate busy Codex/Claude runtime sessions when eligible.

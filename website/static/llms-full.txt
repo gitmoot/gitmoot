@@ -44,7 +44,7 @@ gitmoot orchestrate lead "Review PR #123 from three independent angles." --repo 
 ```
 
 <p align="center">
-  <img src="website/static/img/dashboard/graph.png" alt="Live orchestration graph in the Gitmoot dashboard" width="94%">
+  <img src="website/static/img/dashboard/galaxy.png" alt="The delegation galaxy — every job, agent, and workflow as a live force-directed graph" width="94%">
 </p>
 
 ### Create custom agents in minutes
@@ -63,7 +63,7 @@ jobs can override it with the same flag. Gitmoot forwards the free-form value as
 
 ### Agents that evolve themselves with SkillOpt
 
-The [SkillOpt](https://github.com/jerryfane/gitmoot-skillopt) loop turns real usage into better agents: job traces feed an optimizer, candidate prompt versions run behind a canary with automatic rollback, and promotion stays a human decision. Blind A/B review, ranked exploration, and GitHub-based feedback collection are built in, so your review agent from last month keeps getting sharper without hand-tuning prompts.
+The [SkillOpt](https://github.com/gitmoot/gitmoot-skillopt) loop turns real usage into better agents: job traces feed an optimizer, candidate prompt versions run behind a canary with automatic rollback, and promotion stays a human decision. Blind A/B review, ranked exploration, and GitHub-based feedback collection are built in, so your review agent from last month keeps getting sharper without hand-tuning prompts.
 
 ### Built for unattended runs
 
@@ -73,9 +73,16 @@ Checkout, branch, and runtime-session locks; per-root token and dollar budgets; 
 
 Route work with `/gitmoot <agent> <action>` or `@agent` mentions on PRs and issues ([comment grammar](https://gitmoot.io/docs/workflows/pr-comment-workflow)). Follow it live in the PR thread, the terminal cockpit (`gitmoot dashboard`), or the [read-only web dashboard](https://gitmoot.io/docs/dashboard/overview): jobs, agents, delegation graphs, token and cost charts.
 
-<p align="center">
-  <img src="website/static/img/dashboard/jobs.png" alt="Gitmoot dashboard jobs view" width="94%">
-</p>
+<table>
+  <tr>
+    <td width="50%"><img src="website/static/img/dashboard/overview.png" alt="Overview — what needs you, live fleet activity, today's outcomes" width="100%"></td>
+    <td width="50%"><img src="website/static/img/dashboard/pipelines.png" alt="Pipelines — collapsible groups with health dots and due hints" width="100%"></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="website/static/img/dashboard/workflows.png" alt="Workflows — coordinated campaigns with lifecycle, journal notes, and token totals" width="100%"></td>
+    <td width="50%"><img src="website/static/img/dashboard/brain.png" alt="Brain — the agent memory galaxy: clusters, facts, and cross-repo links" width="100%"></td>
+  </tr>
+</table>
 
 ## How It Works
 
@@ -2236,6 +2243,9 @@ Fixes:
   worktree path on the task and routes task-tied jobs there.
 - Keep the registered checkout clean. Gitmoot still uses it for base branch
   updates and merge-gate cleanup.
+- If a removed task worktree was previously cached as the registered checkout,
+  run `gitmoot repo doctor owner/repo`. Gitmoot verifies the recorded primary
+  checkout and repairs the registration before the next job resolves its base.
 - Use separate runtime sessions, managed background instances, or forkable temp
   workers for jobs that should truly run concurrently. Worktrees isolate files;
   temp workers isolate busy Codex/Claude runtime sessions when eligible.
@@ -9507,7 +9517,11 @@ resolved `--poll` / `[daemon].poll` cadence; an explicit `--poll` stores a
 per-repo override. `repo list` renders the sentinel as `inherit`.
 `repo set-interval owner/repo <duration>` changes an override, `default` restores
 inheritance, and `--all` applies either value to every registered repo.
-`repo doctor owner/repo` checks a single repo's checkout/config health.
+`repo doctor owner/repo` checks a single repo's checkout/config health. If the
+registered checkout is missing or is no longer a Git worktree, Gitmoot verifies
+the recorded primary checkout, repairs the registration, and reports the
+self-heal. Implicit registration from inside a linked task worktree pins the
+repo to its primary checkout; an existing valid linked checkout remains usable.
 
 Use `daemon start` for the background daemon. Use `daemon run` only when the
 user explicitly wants a foreground process. Keep the default `--workers 1`
