@@ -7844,15 +7844,11 @@ func (w jobWorker) resolveJobCheckout(ctx context.Context, job db.Job, payload w
 	if err != nil {
 		return "", err
 	}
-	checkout := strings.TrimSpace(repoRecord.CheckoutPath)
-	if checkout == "" {
-		return "", fmt.Errorf("repo %s has no checkout path", payload.Repo)
-	}
 	repo, err := daemon.ParseRepository(payload.Repo)
 	if err != nil {
 		return "", err
 	}
-	checkout, err = w.healRegisteredRepoCheckout(ctx, job, repo, repoRecord)
+	checkout, err := w.healRegisteredRepoCheckout(ctx, job, repo, repoRecord)
 	if err != nil {
 		return "", err
 	}
@@ -7874,43 +7870,15 @@ func (w jobWorker) resolveJobCheckout(ctx context.Context, job db.Job, payload w
 
 func (w jobWorker) healRegisteredRepoCheckout(ctx context.Context, job db.Job, repo github.Repository, record db.Repo) (string, error) {
 	checkout := strings.TrimSpace(record.CheckoutPath)
-	if _, err := os.Stat(checkout); err == nil {
-		if strings.TrimSpace(record.PrimaryCheckoutPath) == "" {
-			if primary, primaryErr := (gitutil.Client{Dir: checkout}).PrimaryWorktree(ctx); primaryErr == nil {
-				if _, healErr := w.Store.HealRepoCheckout(ctx, record.FullName(), checkout, checkout, primary); healErr != nil {
-					return "", healErr
-				}
-			}
-		}
-		return checkout, nil
-	} else if !os.IsNotExist(err) {
-		return checkout, nil
-	}
-
-	primary := strings.TrimSpace(record.PrimaryCheckoutPath)
-	if primary == "" || sameCheckoutPath(primary, checkout) {
-		return checkout, nil
-	}
-	if _, err := os.Stat(primary); err != nil {
-		return checkout, nil
-	}
-	verified, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: primary})
-	if err != nil {
-		return "", fmt.Errorf("verify primary checkout for %s: %w", repo.FullName(), err)
-	}
-	healedPath := strings.TrimSpace(verified.CheckoutPath)
-	healed, err := w.Store.HealRepoCheckout(ctx, repo.FullName(), checkout, healedPath, healedPath)
+	resolved, healed, err := resolveRegisteredRepoRecord(ctx, w.Store, repo, record)
 	if err != nil {
 		return "", err
 	}
+	healedPath := strings.TrimSpace(resolved.CheckoutPath)
 	if !healed {
-		current, err := w.Store.GetRepo(ctx, repo.FullName())
-		if err != nil {
-			return "", err
-		}
-		return strings.TrimSpace(current.CheckoutPath), nil
+		return healedPath, nil
 	}
-	message := fmt.Sprintf("repo %s checkout self-healed from %s to %s", repo.FullName(), checkout, healedPath)
+	message := repoCheckoutHealMessage(repo.FullName(), checkout, healedPath)
 	if err := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "repo_checkout_self_healed", Message: message}); err != nil {
 		return "", err
 	}
@@ -8677,24 +8645,12 @@ func resolveDaemonCheckout(ctx context.Context, repo github.Repository, client g
 
 // resolveDaemonStartRepo resolves the repo record that `daemon start/run --repo
 // owner/repo` should run against. When the repo is already registered with a
-// checkout path, it resolves against that REGISTERED checkout so the command
-// works from any working directory (#202) — origin protection is still enforced,
-// just against the registered checkout rather than the cwd. When the repo is not
-// yet registered (or has no checkout path), it bootstraps from workDir (the
-// current checkout), preserving the original behavior for first-time setup.
+// checkout path, it validates that checkout and self-heals through its recorded
+// primary when necessary, so the command works from any working directory
+// (#202/#959). When the repo is not yet registered, it bootstraps from workDir;
+// an implicit linked checkout is pinned to its primary.
 func resolveDaemonStartRepo(ctx context.Context, store *db.Store, repo github.Repository, workDir string) (db.Repo, error) {
-	existing, err := store.GetRepo(ctx, repo.FullName())
-	switch {
-	case err == nil && strings.TrimSpace(existing.CheckoutPath) != "":
-		record, rerr := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: existing.CheckoutPath})
-		if rerr != nil {
-			return db.Repo{}, fmt.Errorf("registered checkout for %s at %s is unusable (re-register with `gitmoot repo add`): %w", repo.FullName(), existing.CheckoutPath, rerr)
-		}
-		return record, nil
-	case err != nil && !errors.Is(err, sql.ErrNoRows):
-		return db.Repo{}, err
-	}
-	return repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: workDir})
+	return resolveRepoRecord(ctx, store, repo, workDir)
 }
 
 func repoRecordForCheckout(ctx context.Context, repo github.Repository, client gitutil.Client) (db.Repo, error) {

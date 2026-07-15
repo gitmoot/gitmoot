@@ -212,7 +212,11 @@ per Gitmoot home supervises every **enabled** registered repo. Omitting
 `--poll` / `[daemon].poll` cadence; an explicit value is a per-repo override.
 `repo list` prints `inherit`. Use `repo set-interval` with a duration to change
 an override, with `default` to restore inheritance, or with `--all` to update all
-registered repos. `repo doctor owner/repo` checks checkout/config health.
+registered repos. `repo doctor owner/repo` checks checkout/config health. If the
+registered checkout is missing or is no longer a Git worktree, Gitmoot verifies
+the recorded primary checkout, repairs the registration, and reports the
+self-heal. Implicit registration from inside a linked task worktree pins the
+repo to its primary checkout; an existing valid linked checkout remains usable.
 
 Use `daemon start` for the background daemon. Use `daemon run` only when the
 user explicitly wants a foreground process. Keep the default `--workers 1`

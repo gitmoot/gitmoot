@@ -253,11 +253,46 @@ func TestRunRepoDoctorReportsLinkedAndDanglingCheckout(t *testing.T) {
 	runGit(t, primary, "worktree", "remove", "--force", linked)
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"repo", "doctor", "owner/repo", "--home", home}, &stdout, &stderr); code != 1 {
-		t.Fatalf("dangling repo doctor exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	if code := Run([]string{"repo", "doctor", "owner/repo", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("dangling repo doctor exit code = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "is missing") || !strings.Contains(stdout.String(), "primary: "+primary) {
-		t.Fatalf("dangling repo doctor output = %s", stdout.String())
+	for _, want := range []string{"checkout self-healed", "repo: owner/repo ok", "path: " + primary, "primary: " + primary} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("dangling repo doctor missing %q: %s", want, stdout.String())
+		}
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	record, err := store.GetRepo(context.Background(), "owner/repo")
+	if err != nil || record.CheckoutPath != primary || record.PrimaryCheckoutPath != primary {
+		t.Fatalf("repaired repo = %+v, err=%v", record, err)
+	}
+}
+
+func TestRunRepoAddForceSelfHealsDanglingRecordedCheckout(t *testing.T) {
+	home := t.TempDir()
+	primary, linked := setupLinkedWorktreeRepo(t)
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"repo", "add", "owner/repo", "--home", home, "--path", linked, "--force"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("initial forced repo add exit code = %d, stderr=%s", code, stderr.String())
+	}
+	runGit(t, primary, "worktree", "remove", "--force", linked)
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"repo", "add", "owner/repo", "--home", home, "--path", linked, "--force"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("repairing forced repo add exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "checkout self-healed") || !strings.Contains(stdout.String(), "registered owner/repo at "+primary) {
+		t.Fatalf("repair output stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	record, err := store.GetRepo(context.Background(), "owner/repo")
+	if err != nil || record.CheckoutPath != primary || record.PrimaryCheckoutPath != primary {
+		t.Fatalf("repaired repo = %+v, err=%v", record, err)
+	}
+	if _, err := os.Stat(linked); !os.IsNotExist(err) {
+		t.Fatalf("removed linked checkout unexpectedly exists: %v", err)
 	}
 }
 
@@ -287,8 +322,12 @@ func TestRepoCheckoutDoctorChecksWarnAndLazyBackfill(t *testing.T) {
 	}
 	runGit(t, primary, "worktree", "remove", "--force", linked)
 	checks = repoCheckoutDoctorChecks(config.PathsForHome(home))
-	if len(checks) != 1 || checks[0].OK || !strings.Contains(checks[0].Detail, "is missing") || !strings.Contains(checks[0].Detail, "is available") {
+	if len(checks) != 1 || !checks[0].OK || !strings.Contains(checks[0].Detail, "checkout self-healed") {
 		t.Fatalf("dangling checks = %+v", checks)
+	}
+	record, err = store.GetRepo(context.Background(), "owner/repo")
+	if err != nil || record.CheckoutPath != primary || record.PrimaryCheckoutPath != primary {
+		t.Fatalf("repaired aggregate-doctor repo = %+v, err=%v", record, err)
 	}
 }
 

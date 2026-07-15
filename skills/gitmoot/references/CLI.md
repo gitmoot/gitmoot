@@ -277,7 +277,11 @@ resolved `--poll` / `[daemon].poll` cadence; an explicit `--poll` stores a
 per-repo override. `repo list` renders the sentinel as `inherit`.
 `repo set-interval owner/repo <duration>` changes an override, `default` restores
 inheritance, and `--all` applies either value to every registered repo.
-`repo doctor owner/repo` checks a single repo's checkout/config health.
+`repo doctor owner/repo` checks a single repo's checkout/config health. If the
+registered checkout is missing or is no longer a Git worktree, Gitmoot verifies
+the recorded primary checkout, repairs the registration, and reports the
+self-heal. Implicit registration from inside a linked task worktree pins the
+repo to its primary checkout; an existing valid linked checkout remains usable.
 
 Use `daemon start` for the background daemon. Use `daemon run` only when the
 user explicitly wants a foreground process. Keep the default `--workers 1`

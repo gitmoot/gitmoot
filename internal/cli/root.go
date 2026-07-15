@@ -243,7 +243,8 @@ func repoCheckoutDoctorChecks(paths config.Paths) []doctor.Check {
 	}
 	checks := make([]doctor.Check, 0, len(repos))
 	for _, repo := range repos {
-		primary, linked, err := inspectRegisteredRepoCheckout(context.Background(), store, repo)
+		originalCheckout := strings.TrimSpace(repo.CheckoutPath)
+		resolved, linked, healed, err := inspectRegisteredRepoCheckout(context.Background(), store, repo)
 		check := doctor.Check{Name: "repo checkout", Required: false}
 		switch {
 		case err != nil:
@@ -255,11 +256,14 @@ func repoCheckoutDoctorChecks(paths config.Paths) []doctor.Check {
 					check.Detail += fmt.Sprintf("; primary checkout %s is unavailable", recorded)
 				}
 			}
+		case healed:
+			check.OK = true
+			check.Detail = repoCheckoutHealMessage(repo.FullName(), originalCheckout, resolved.CheckoutPath)
 		case linked:
-			check.Detail = fmt.Sprintf("%s: registered checkout %s is a linked worktree; use primary checkout %s", repo.FullName(), repo.CheckoutPath, primary)
+			check.Detail = fmt.Sprintf("%s: registered checkout %s is a linked worktree; use primary checkout %s", repo.FullName(), resolved.CheckoutPath, resolved.PrimaryCheckoutPath)
 		default:
 			check.OK = true
-			check.Detail = fmt.Sprintf("%s: registered checkout %s is primary", repo.FullName(), repo.CheckoutPath)
+			check.Detail = fmt.Sprintf("%s: registered checkout %s is primary", repo.FullName(), resolved.CheckoutPath)
 		}
 		checks = append(checks, check)
 	}
