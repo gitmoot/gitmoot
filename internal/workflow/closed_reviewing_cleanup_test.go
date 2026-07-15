@@ -16,6 +16,11 @@ import (
 // lock is stranded (held forever) and the worktree leaks on disk. The
 // closed-unmerged (`blocked`) branch must NOT clean up, since a blocked task
 // intentionally keeps its worktree/lock for human resumption.
+//
+// It runs from both `reviewing` and `blocked` start states (#953): a blocked
+// task whose branch merged externally is the exact live incident that motivated
+// #953 (a 21h stranded branch lock), so the merged case must release the lock +
+// worktree from `blocked` too, while blocked+closed-unmerged keeps them.
 func TestHandleReviewPullRequestClosedMergedReleasesLockAndWorktree(t *testing.T) {
 	const (
 		repo    = "jerryfane/gitmoot"
@@ -53,80 +58,90 @@ func TestHandleReviewPullRequestClosedMergedReleasesLockAndWorktree(t *testing.T
 		},
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
-			store := openEngineStore(t)
-			if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo, Branch: branch, Owner: "lead"}); err != nil || !acquired {
-				t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-			}
-			if err := store.UpsertTask(ctx, db.Task{
-				ID:           "task-7304",
-				RepoFullName: repo,
-				GoalID:       "goal-1",
-				Title:        "CSV Export",
-				State:        string(TaskReviewing),
-				Branch:       branch,
-				WorktreePath: path,
-			}); err != nil {
-				t.Fatalf("UpsertTask returned error: %v", err)
-			}
-			if err := store.UpsertPullRequest(ctx, db.PullRequest{
-				RepoFullName: repo,
-				Number:       6,
-				URL:          "https://github.com/jerryfane/gitmoot/pull/6",
-				HeadBranch:   branch,
-				BaseBranch:   "main",
-				HeadSHA:      headSHA,
-				State:        "open",
-			}); err != nil {
-				t.Fatalf("UpsertPullRequest returned error: %v", err)
-			}
+	for _, startState := range []TaskState{TaskReviewing, TaskBlocked} {
+		for _, tc := range cases {
+			t.Run(string(startState)+"/"+tc.name, func(t *testing.T) {
+				ctx := context.Background()
+				store := openEngineStore(t)
+				if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo, Branch: branch, Owner: "lead"}); err != nil || !acquired {
+					t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+				}
+				if err := store.UpsertTask(ctx, db.Task{
+					ID:           "task-7304",
+					RepoFullName: repo,
+					GoalID:       "goal-1",
+					Title:        "CSV Export",
+					State:        string(startState),
+					Branch:       branch,
+					WorktreePath: path,
+				}); err != nil {
+					t.Fatalf("UpsertTask returned error: %v", err)
+				}
+				if err := store.UpsertPullRequest(ctx, db.PullRequest{
+					RepoFullName: repo,
+					Number:       6,
+					URL:          "https://github.com/jerryfane/gitmoot/pull/6",
+					HeadBranch:   branch,
+					BaseBranch:   "main",
+					HeadSHA:      headSHA,
+					State:        "open",
+				}); err != nil {
+					t.Fatalf("UpsertPullRequest returned error: %v", err)
+				}
 
-			manager := &fakeWorktreeManager{}
-			engine := Engine{Store: store, DelegationWorktrees: manager}
+				manager := &fakeWorktreeManager{}
+				engine := Engine{Store: store, DelegationWorktrees: manager}
 
-			if err := engine.HandleReviewPullRequestClosed(ctx, PullRequestEvent{
-				Repo:        repo,
-				Branch:      branch,
-				PullRequest: 6,
-				HeadSHA:     headSHA,
-				GoalID:      "goal-1",
-				TaskID:      "task-7304",
-				TaskTitle:   "CSV Export",
-				LeadAgent:   "lead",
-				Sender:      "github",
-			}, tc.merged); err != nil {
-				t.Fatalf("HandleReviewPullRequestClosed returned error: %v", err)
-			}
+				if err := engine.HandleReviewPullRequestClosed(ctx, PullRequestEvent{
+					Repo:        repo,
+					Branch:      branch,
+					PullRequest: 6,
+					HeadSHA:     headSHA,
+					GoalID:      "goal-1",
+					TaskID:      "task-7304",
+					TaskTitle:   "CSV Export",
+					LeadAgent:   "lead",
+					Sender:      "github",
+				}, tc.merged); err != nil {
+					t.Fatalf("HandleReviewPullRequestClosed returned error: %v", err)
+				}
 
-			task, err := store.GetTask(ctx, "task-7304")
-			if err != nil {
-				t.Fatalf("GetTask returned error: %v", err)
-			}
-			if task.State != string(tc.wantTask) {
-				t.Fatalf("task state = %q, want %q", task.State, tc.wantTask)
-			}
-			if (task.WorktreePath == "") != tc.wantPathEmpty {
-				t.Fatalf("task worktree path = %q, wantEmpty=%v", task.WorktreePath, tc.wantPathEmpty)
-			}
-			pr, err := store.GetPullRequest(ctx, repo, 6)
-			if err != nil {
-				t.Fatalf("GetPullRequest returned error: %v", err)
-			}
-			if pr.State != tc.wantPRState {
-				t.Fatalf("PR #6 state = %q, want %q", pr.State, tc.wantPRState)
-			}
-			gotRemoved := len(manager.removedForce) == 1 && manager.removedForce[0] == path
-			if gotRemoved != tc.wantRemoved {
-				t.Fatalf("worktree removed = %v (%v), want %v", gotRemoved, manager.removedForce, tc.wantRemoved)
-			}
-			_, lockErr := store.GetBranchLock(ctx, repo, branch)
-			lockGone := errors.Is(lockErr, sql.ErrNoRows)
-			if lockGone != tc.wantLockGone {
-				t.Fatalf("branch lock gone = %v (err=%v), want %v", lockGone, lockErr, tc.wantLockGone)
-			}
-		})
+				task, err := store.GetTask(ctx, "task-7304")
+				if err != nil {
+					t.Fatalf("GetTask returned error: %v", err)
+				}
+				if task.State != string(tc.wantTask) {
+					t.Fatalf("task state = %q, want %q", task.State, tc.wantTask)
+				}
+				if (task.WorktreePath == "") != tc.wantPathEmpty {
+					t.Fatalf("task worktree path = %q, wantEmpty=%v", task.WorktreePath, tc.wantPathEmpty)
+				}
+				pr, err := store.GetPullRequest(ctx, repo, 6)
+				if err != nil {
+					t.Fatalf("GetPullRequest returned error: %v", err)
+				}
+				// blocked + closed-unmerged is a complete no-op: the handler returns
+				// early before touching the PR mirror, so it stays "open". Only the
+				// reviewing start state runs the closed-unmerged transition that also
+				// marks the PR "closed".
+				wantPRState := tc.wantPRState
+				if !tc.merged && startState == TaskBlocked {
+					wantPRState = "open"
+				}
+				if pr.State != wantPRState {
+					t.Fatalf("PR #6 state = %q, want %q", pr.State, wantPRState)
+				}
+				gotRemoved := len(manager.removedForce) == 1 && manager.removedForce[0] == path
+				if gotRemoved != tc.wantRemoved {
+					t.Fatalf("worktree removed = %v (%v), want %v", gotRemoved, manager.removedForce, tc.wantRemoved)
+				}
+				_, lockErr := store.GetBranchLock(ctx, repo, branch)
+				lockGone := errors.Is(lockErr, sql.ErrNoRows)
+				if lockGone != tc.wantLockGone {
+					t.Fatalf("branch lock gone = %v (err=%v), want %v", lockGone, lockErr, tc.wantLockGone)
+				}
+			})
+		}
 	}
 }
 
@@ -136,6 +151,7 @@ func TestHandleReviewPullRequestClosedMergedLifecycleStates(t *testing.T) {
 		TaskReviewing,
 		TaskChangesRequested,
 		TaskReadyToMerge,
+		TaskBlocked,
 	}
 	for _, state := range states {
 		t.Run(string(state), func(t *testing.T) {
@@ -185,7 +201,7 @@ func TestHandleReviewPullRequestClosedMergedLifecycleStates(t *testing.T) {
 }
 
 func TestHandleReviewPullRequestClosedUnmergedLeavesNonReviewingStatesUnchanged(t *testing.T) {
-	states := []TaskState{TaskPullRequestOpen, TaskChangesRequested}
+	states := []TaskState{TaskPullRequestOpen, TaskChangesRequested, TaskReadyToMerge, TaskBlocked}
 	for _, state := range states {
 		t.Run(string(state), func(t *testing.T) {
 			ctx := context.Background()

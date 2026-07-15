@@ -386,12 +386,13 @@ func (d Daemon) reconcilePROpenTasks(ctx context.Context, pulls []github.PullReq
 	return firstErr
 }
 
-// reconcileExternallyMergedTasks advances PR lifecycle tasks whose PR was
-// merged outside Gitmoot. It uses targeted single-PR reads rather than a closed
-// list, so old wedged tasks are not hidden by GitHub pagination. Empty-branch
-// local review tasks are keyed by their durable review-pr-<number>-<hash> id.
-// Closed-unmerged responses are deliberately ignored here; the existing
-// reviewing/ready-to-merge paths retain their current semantics.
+// reconcileExternallyMergedTasks advances PR lifecycle tasks, plus blocked
+// tasks, whose PR was merged outside Gitmoot. It uses targeted single-PR reads
+// rather than a closed list, so old wedged tasks are not hidden by GitHub
+// pagination. Empty-branch local review tasks are keyed by their durable
+// review-pr-<number>-<hash> id. Closed-unmerged responses are deliberately
+// ignored here; the existing reviewing/ready-to-merge paths retain their current
+// semantics.
 func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumbers map[int64]struct{}) error {
 	if d.Workflow == nil {
 		return nil
@@ -511,7 +512,7 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 
 func externalMergeCandidateState(state string) bool {
 	switch workflow.TaskState(strings.TrimSpace(state)) {
-	case workflow.TaskPullRequestOpen, workflow.TaskReviewing, workflow.TaskChangesRequested, workflow.TaskReadyToMerge:
+	case workflow.TaskPullRequestOpen, workflow.TaskReviewing, workflow.TaskChangesRequested, workflow.TaskReadyToMerge, workflow.TaskBlocked:
 		return true
 	default:
 		return false

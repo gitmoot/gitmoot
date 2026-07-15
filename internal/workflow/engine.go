@@ -1128,11 +1128,12 @@ func (e Engine) HandlePullRequestReadyToMerge(ctx context.Context, event PullReq
 // lists OPEN pull requests, so an externally merged PR otherwise disappears
 // while its task and local PR mirror remain stale.
 //
-// Merged PRs resolve any of pr_open/reviewing/changes_requested/ready_to_merge;
-// an already-merged task is accepted only to repair its stale PR mirror.
-// Closed-unmerged behavior remains deliberately narrower: only reviewing uses
-// the existing transition to blocked; the other lifecycle states are untouched.
-// Existing PR row fields (url/base/merge SHA) are preserved.
+// Merged PRs resolve any of
+// pr_open/reviewing/changes_requested/ready_to_merge/blocked; an already-merged
+// task is accepted only to repair its stale PR mirror. Closed-unmerged behavior
+// remains deliberately narrower: only reviewing uses the existing transition to
+// blocked; the other lifecycle states are untouched. Existing PR row fields
+// (url/base/merge SHA) are preserved.
 func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullRequestEvent, merged bool) error {
 	if err := e.validate(); err != nil {
 		return err
@@ -1152,7 +1153,7 @@ func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullReq
 	alreadyMerged := false
 	if merged {
 		switch taskState {
-		case TaskPullRequestOpen, TaskReviewing, TaskChangesRequested, TaskReadyToMerge:
+		case TaskPullRequestOpen, TaskReviewing, TaskChangesRequested, TaskReadyToMerge, TaskBlocked:
 		case TaskMerged:
 			// Keep the task terminal while repairing a stale local PR mirror after
 			// another path (notably the ready-to-merge gate) completed first.
@@ -1217,10 +1218,11 @@ func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullReq
 }
 
 // reconcileMergedCleanup releases the branch lock and removes the task worktree
-// after HandleReviewPullRequestClosed resolves an externally-merged reviewing
-// task to `merged` (#543). It mirrors PolicyMergeGate.finishMerged's post-merge
-// cleanup so the self-heal reconcile path does not leak a held branch lock or an
-// on-disk worktree. Every step is best-effort and nil-safe: failures are
+// after HandleReviewPullRequestClosed resolves an externally-merged lifecycle or
+// blocked task to `merged` (#543, #953). It mirrors
+// PolicyMergeGate.finishMerged's post-merge cleanup so the self-heal reconcile
+// path does not leak a held branch lock or an on-disk worktree. Every step is
+// best-effort and nil-safe: failures are
 // swallowed so the already-durable terminal `merged` transition is never undone,
 // matching finishMerged's treatment of these as non-fatal post-merge warnings.
 func (e Engine) reconcileMergedCleanup(ctx context.Context, repo string, task db.Task) {

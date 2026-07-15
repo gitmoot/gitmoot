@@ -17,6 +17,7 @@ func TestPollOnceReconcilesExternallyMergedLifecycleTasks(t *testing.T) {
 		workflow.TaskReviewing,
 		workflow.TaskChangesRequested,
 		workflow.TaskReadyToMerge,
+		workflow.TaskBlocked,
 	}
 	for _, state := range states {
 		t.Run(string(state), func(t *testing.T) {
@@ -38,6 +39,53 @@ func TestPollOnceReconcilesExternallyMergedLifecycleTasks(t *testing.T) {
 			assertExternalMergeState(t, store, repo.FullName(), "task-7", 7, workflow.TaskMerged, "merged")
 			if !reflect.DeepEqual(client.getPullRequestCalls, []int64{7}) {
 				t.Fatalf("GetPullRequest calls = %v, want [7]", client.getPullRequestCalls)
+			}
+		})
+	}
+}
+
+func TestBlockedTaskExternalMergeReconcileE2E(t *testing.T) {
+	// PollOnce's reconcile path performs no runtime delivery; the fake GitHub
+	// client and t.TempDir-backed store make this a deterministic no-LLM E2E.
+	// Keep the process environment isolated if that path ever grows orchestration.
+	t.Setenv("HERDR_SOCKET_PATH", "/tmp/throwaway")
+	t.Setenv("HERDR_ENV", "")
+
+	ctx := context.Background()
+	repo := github.Repository{Owner: "owner", Name: "repo"}
+	store := testStore(t)
+	seedExternalMergeTask(t, store, repo, "blocked-task", "feature/blocked", workflow.TaskBlocked, 953)
+	client := &fakeGitHub{
+		pullsByState:  map[string][]github.PullRequest{"open": nil, "closed": nil},
+		pullsByNumber: map[int64]github.PullRequest{953: mergedPull(953, "feature/blocked")},
+		comments:      map[int64][]github.IssueComment{},
+	}
+	engine := workflow.Engine{Store: store}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce: %v", err)
+	}
+	assertExternalMergeState(t, store, repo.FullName(), "blocked-task", 953, workflow.TaskMerged, "merged")
+}
+
+func TestExternalMergeCandidateState(t *testing.T) {
+	tests := []struct {
+		state workflow.TaskState
+		want  bool
+	}{
+		{workflow.TaskPullRequestOpen, true},
+		{workflow.TaskReviewing, true},
+		{workflow.TaskChangesRequested, true},
+		{workflow.TaskReadyToMerge, true},
+		{workflow.TaskBlocked, true},
+		{workflow.TaskAwaitingHuman, false},
+		{workflow.TaskPlanned, false},
+	}
+	for _, test := range tests {
+		t.Run(string(test.state), func(t *testing.T) {
+			if got := externalMergeCandidateState(string(test.state)); got != test.want {
+				t.Fatalf("externalMergeCandidateState(%q) = %v, want %v", test.state, got, test.want)
 			}
 		})
 	}
