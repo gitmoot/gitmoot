@@ -34,7 +34,7 @@ gitmoot orchestrate lead "Review PR #123 from three independent angles." --repo 
 ```
 
 <p align="center">
-  <img src="website/static/img/dashboard/graph.png" alt="Live orchestration graph in the Gitmoot dashboard" width="94%">
+  <img src="website/static/img/dashboard/galaxy.png" alt="The delegation galaxy — every job, agent, and workflow as a live force-directed graph" width="94%">
 </p>
 
 ### Create custom agents in minutes
@@ -53,7 +53,7 @@ jobs can override it with the same flag. Gitmoot forwards the free-form value as
 
 ### Agents that evolve themselves with SkillOpt
 
-The [SkillOpt](https://github.com/jerryfane/gitmoot-skillopt) loop turns real usage into better agents: job traces feed an optimizer, candidate prompt versions run behind a canary with automatic rollback, and promotion stays a human decision. Blind A/B review, ranked exploration, and GitHub-based feedback collection are built in, so your review agent from last month keeps getting sharper without hand-tuning prompts.
+The [SkillOpt](https://github.com/gitmoot/gitmoot-skillopt) loop turns real usage into better agents: job traces feed an optimizer, candidate prompt versions run behind a canary with automatic rollback, and promotion stays a human decision. Blind A/B review, ranked exploration, and GitHub-based feedback collection are built in, so your review agent from last month keeps getting sharper without hand-tuning prompts.
 
 ### Built for unattended runs
 
@@ -63,9 +63,16 @@ Checkout, branch, and runtime-session locks; per-root token and dollar budgets; 
 
 Route work with `/gitmoot <agent> <action>` or `@agent` mentions on PRs and issues ([comment grammar](https://gitmoot.io/docs/workflows/pr-comment-workflow)). Follow it live in the PR thread, the terminal cockpit (`gitmoot dashboard`), or the [read-only web dashboard](https://gitmoot.io/docs/dashboard/overview): jobs, agents, delegation graphs, token and cost charts.
 
-<p align="center">
-  <img src="website/static/img/dashboard/jobs.png" alt="Gitmoot dashboard jobs view" width="94%">
-</p>
+<table>
+  <tr>
+    <td width="50%"><img src="website/static/img/dashboard/overview.png" alt="Overview — what needs you, live fleet activity, today's outcomes" width="100%"></td>
+    <td width="50%"><img src="website/static/img/dashboard/pipelines.png" alt="Pipelines — collapsible groups with health dots and due hints" width="100%"></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="website/static/img/dashboard/jobs.png" alt="Jobs — every run with state, agent, and timing" width="100%"></td>
+    <td width="50%"><img src="website/static/img/dashboard/charts.png" alt="Charts — success rates, jobs per day, token usage by agent" width="100%"></td>
+  </tr>
+</table>
 
 ## How It Works
 
