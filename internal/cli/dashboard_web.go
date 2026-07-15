@@ -40,17 +40,13 @@ func runDashboardWeb(home, addr string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "dashboard: %v\n", err)
 		return 1
 	}
-	ds := &webDataSource{home: home}
+	ds := &webDataSource{home: home, responseCache: newDashboardJSONCache(stderr)}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		fmt.Fprintf(stderr, "dashboard: %v\n", err)
 		return 1
 	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/health", ds.handleHealth)
-	mux.HandleFunc("GET /api/learning/knowledge", ds.handleLearningKnowledge)
-	mux.Handle("/", dashboard.Serve(ds))
-	srv := &http.Server{Handler: mux}
+	srv := &http.Server{Handler: newDashboardWebHandler(ds)}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -74,6 +70,19 @@ func runDashboardWeb(home, addr string, stdout, stderr io.Writer) int {
 	}
 }
 
+// newDashboardWebHandler shadows only the three expensive endpoints covered by
+// the frozen #948 policy plus the already-local knowledge handler. Every other
+// route remains owned by the pinned dashboard module.
+func newDashboardWebHandler(ds *webDataSource) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/jobs", ds.handleJobs)
+	mux.HandleFunc("GET /api/charts", ds.handleCharts)
+	mux.HandleFunc("GET /api/health", ds.handleHealth)
+	mux.HandleFunc("GET /api/learning/knowledge", ds.handleLearningKnowledge)
+	mux.Handle("/", dashboard.Serve(ds))
+	return mux
+}
+
 // webDataSource implements dashboard.DataSource over a local Gitmoot home. It
 // reuses the existing read paths only — buildDashboardSnapshot for the run list
 // and the same store APIs the dashboard TUI reads (ListJobs / ListJobEvents /
@@ -81,6 +90,9 @@ func runDashboardWeb(home, addr string, stdout, stderr io.Writer) int {
 // touches workflow state.
 type webDataSource struct {
 	home string
+
+	cacheOnce     sync.Once
+	responseCache *dashboardJSONCache
 
 	// mu guards the Health() caches below (Health can be called concurrently and
 	// its resolvers run in goroutines). Everything else on the source is stateless
@@ -122,10 +134,14 @@ type dashboardHealthResponse struct {
 // non-nil, so clients that consume the documented shape never see a null where
 // the contract promises an array.
 func (d *webDataSource) handleHealth(w http.ResponseWriter, r *http.Request) {
-	health, err := d.Health(r.Context())
+	body, outcome, err := d.cacheForDashboard().get(r.Context(), "health", "", dashboardHealthCachePolicy, d.healthJSON)
+	d.writeCachedDashboardJSON(w, outcome, body, err)
+}
+
+func (d *webDataSource) healthJSON(ctx context.Context) ([]byte, error) {
+	health, err := d.Health(ctx)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return nil, err
 	}
 	if health.Locks == nil {
 		health.Locks = []dashboard.HealthLock{}
@@ -144,14 +160,7 @@ func (d *webDataSource) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Health: health,
 		Server: dashboardServerBuild{Version: build.Version, Commit: build.Commit},
 	}
-	buf, err := json.MarshalIndent(response, "", "  ")
-	if err != nil {
-		http.Error(w, "internal error: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(append(buf, '\n'))
+	return marshalDashboardJSON(response)
 }
 
 var _ dashboard.DataSource = (*webDataSource)(nil)
@@ -561,16 +570,14 @@ func (d *webDataSource) Job(ctx context.Context, jobID string) (dashboard.Node, 
 }
 
 // Jobs returns every job across every run, flattened into one JobSummary each,
-// sorted newest-activity first. It is a single read-only ListJobs pass: each
-// job's payload is parsed once for its title/repo/PR, its kind is derived the
-// same way summarizeRuns derives a run's kind (from the id shape, else the Type
-// column), its runtime is resolved through the agent registry with the ephemeral
-// worker fallback, and its Run is its delegation-tree root. No cap — the Jobs
-// page filters client-side.
+// sorted newest-activity first. ListDashboardJobSummaries keeps full payloads
+// out of this hot path: SQLite projects only the prompt/repo/PR/ephemeral-runtime
+// values this response consumes and joins the registered runtime. No cap — the
+// Jobs page filters client-side.
 func (d *webDataSource) Jobs(ctx context.Context) ([]dashboard.JobSummary, error) {
 	out := []dashboard.JobSummary{}
 	err := withStore(d.home, func(store *db.Store) error {
-		jobs, err := store.ListJobs(ctx)
+		jobs, err := store.ListDashboardJobSummaries(ctx)
 		if err != nil {
 			return err
 		}
@@ -579,34 +586,41 @@ func (d *webDataSource) Jobs(ctx context.Context) ([]dashboard.JobSummary, error
 		}
 		jobByID := make(map[string]db.Job, len(jobs))
 		for _, j := range jobs {
-			jobByID[j.ID] = j
+			jobByID[j.ID] = db.Job{ID: j.ID, Agent: j.Agent, Type: j.Type, ParentJobID: j.ParentJobID}
 		}
-		runtimeByAgent := agentRuntimeMap(ctx, store)
 
 		out = make([]dashboard.JobSummary, 0, len(jobs))
 		for _, j := range jobs {
-			payload, _ := workflow.ParseJobPayload(j.Payload)
 			// Kind mirrors summarizeRuns: parse the id's "<origin>-<kind>-<agent>-
 			// <hash>" shape (root jobs), else fall back to the lowercased Type column
 			// (delegation children, whose ids don't carry that shape).
-			kind, _ := parseRunKindAgent(j.ID, j)
+			job := jobByID[j.ID]
+			kind, _ := parseRunKindAgent(j.ID, job)
 			started := parseJobTimeMillis(j.CreatedAt)
 			updated := parseJobTimeMillis(j.UpdatedAt)
 			var duration int64
 			if started > 0 && updated > started {
 				duration = updated - started
 			}
+			runtimeName := strings.TrimSpace(j.RegisteredRuntime)
+			if runtimeName == "" {
+				runtimeName = strings.TrimSpace(j.EphemeralRuntime)
+			}
+			title := firstInstructionLine(j.Instructions)
+			if title == "" {
+				title = j.ID
+			}
 			out = append(out, dashboard.JobSummary{
 				ID:        j.ID,
-				Title:     jobTitle(payload, j),
+				Title:     title,
 				Agent:     strings.TrimSpace(j.Agent),
-				Runtime:   resolveJobRuntime(j, payload, runtimeByAgent),
-				Repo:      strings.TrimSpace(payload.Repo),
+				Runtime:   runtimeName,
+				Repo:      strings.TrimSpace(j.Repo),
 				Kind:      kind,
 				State:     mapNodeState(j.State),
 				Depth:     j.DelegationDepth,
 				Run:       jobRootID(jobByID, j.ID),
-				PR:        payload.PullRequest,
+				PR:        j.PullRequest,
 				Started:   started,
 				Updated:   updated,
 				Duration:  duration,

@@ -31,6 +31,29 @@ type DashboardJobRow struct {
 	Reason       string
 }
 
+// DashboardJobSummaryRow is the payload-slim projection consumed by the web
+// dashboard's /api/jobs response. It deliberately carries only the scalar job
+// columns and four payload values that JobSummary needs. RegisteredRuntime is
+// joined from agents; EphemeralRuntime is the fallback for unregistered inline
+// workers.
+type DashboardJobSummaryRow struct {
+	ID                string
+	Agent             string
+	Type              string
+	State             string
+	Instructions      string
+	ParentJobID       string
+	DelegationDepth   int
+	RegisteredRuntime string
+	EphemeralRuntime  string
+	Repo              string
+	PullRequest       int
+	InputTokens       int
+	OutputTokens      int
+	UpdatedAt         string
+	CreatedAt         string
+}
+
 type DashboardFleetCount struct {
 	Agent     string
 	Running   int
@@ -58,6 +81,48 @@ const dashboardChangeCursorSQL = `SELECT
 func (s *Store) DashboardChangeCursor(ctx context.Context) (jobEventID, workflowNoteID, taskEventID int64, err error) {
 	err = s.db.QueryRowContext(ctx, dashboardChangeCursorSQL).Scan(&jobEventID, &workflowNoteID, &taskEventID)
 	return jobEventID, workflowNoteID, taskEventID, err
+}
+
+// ListDashboardJobSummaries avoids materializing the full jobs.payload corpus
+// for /api/jobs. Current rows use the denormalized repo/pull_request columns;
+// pre-column rows fall back to their legacy payload values. Every json_extract
+// is guarded because modernc SQLite rejects malformed JSON, which the legacy Go
+// parser tolerated by returning an empty payload.
+func (s *Store) ListDashboardJobSummaries(ctx context.Context) ([]DashboardJobSummaryRow, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT
+		j.id, j.agent, j.type, j.state,
+		CASE WHEN json_valid(j.payload) AND json_type(j.payload, '$.instructions') = 'text'
+			THEN json_extract(j.payload, '$.instructions') ELSE '' END,
+		j.parent_job_id, j.delegation_depth, COALESCE(a.runtime, ''),
+		CASE WHEN json_valid(j.payload) AND json_type(j.payload, '$.ephemeral.runtime') = 'text'
+			THEN json_extract(j.payload, '$.ephemeral.runtime') ELSE '' END,
+		COALESCE(NULLIF(j.repo, ''), CASE
+			WHEN json_valid(j.payload) AND json_type(j.payload, '$.repo') = 'text'
+			THEN json_extract(j.payload, '$.repo') ELSE '' END),
+		CASE WHEN j.pull_request != 0 THEN j.pull_request
+			WHEN json_valid(j.payload) AND json_type(j.payload, '$.pull_request') = 'integer'
+			THEN json_extract(j.payload, '$.pull_request') ELSE 0 END,
+		j.input_tokens, j.output_tokens, j.updated_at, j.created_at
+	FROM jobs j LEFT JOIN agents a ON a.name = j.agent
+	ORDER BY j.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []DashboardJobSummaryRow{}
+	for rows.Next() {
+		var item DashboardJobSummaryRow
+		if err := rows.Scan(
+			&item.ID, &item.Agent, &item.Type, &item.State, &item.Instructions,
+			&item.ParentJobID, &item.DelegationDepth, &item.RegisteredRuntime,
+			&item.EphemeralRuntime, &item.Repo, &item.PullRequest,
+			&item.InputTokens, &item.OutputTokens, &item.UpdatedAt, &item.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) ListDashboardTasks(ctx context.Context, mergedSince string) ([]DashboardTaskRow, error) {
