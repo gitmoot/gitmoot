@@ -94,8 +94,8 @@ func newDashboardJSONCache(stderr io.Writer) *dashboardJSONCache {
 	}
 	now := time.Now
 	return &dashboardJSONCache{
-		entries:    make(map[string]dashboardCacheEntry, 5),
-		flights:    make(map[string]*dashboardCacheFlight, 6),
+		entries: make(map[string]dashboardCacheEntry, len(dashboardCachePolicies)),
+		flights: make(map[string]*dashboardCacheFlight, len(dashboardCachePolicies)+1),
 		stats:      make(map[string]dashboardCacheCounters, 3),
 		now:        now,
 		stderr:     stderr,
@@ -500,7 +500,36 @@ func (d *webDataSource) workflowsJSON(ctx context.Context) ([]byte, error) {
 			entries[i].Repos = []string{}
 		}
 	}
-	sort.SliceStable(entries, func(i, j int) bool { return dashboardWorkflowIndexLess(entries[i], entries[j]) })
+	// Sort with the pinned module's exact semantics (api.go workflowStateRank:
+	// stalled(0) < active(1) < settled(2) < default(3) — 'recent' is a gitmoot
+	// extension the module does not rank, so it must sort LAST for byte parity;
+	// dashboardWorkflowIndexLess ranks it between active and settled and must
+	// not be used here).
+	moduleRank := func(state string) int {
+		switch state {
+		case "stalled":
+			return 0
+		case "active":
+			return 1
+		case "settled":
+			return 2
+		default:
+			return 3
+		}
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		ri, rj := moduleRank(entries[i].State), moduleRank(entries[j].State)
+		if ri != rj {
+			return ri < rj
+		}
+		if entries[i].State == "stalled" && entries[i].StalledForS != entries[j].StalledForS {
+			return entries[i].StalledForS > entries[j].StalledForS
+		}
+		if entries[i].LastAt != entries[j].LastAt {
+			return entries[i].LastAt > entries[j].LastAt
+		}
+		return entries[i].Label < entries[j].Label
+	})
 	return marshalDashboardJSON(entries)
 }
 

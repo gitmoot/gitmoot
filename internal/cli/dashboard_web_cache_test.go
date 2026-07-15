@@ -323,6 +323,14 @@ func TestDashboardCachedHandlersMatchModuleBytes(t *testing.T) {
 	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{WorkflowID: "cache/tier-two", Author: "lead", Body: "byte parity"}); err != nil {
 		t.Fatal(err)
 	}
+	// A second labeled workflow whose note is backdated below: it derives
+	// 'settled' while cache/tier-two (fresh note) derives 'recent'. The pinned
+	// module does not rank 'recent' (default bucket, AFTER settled) while
+	// gitmoot's index comparator ranks it between active and settled — only a
+	// mixed recent+settled list makes the byte compare guard module parity.
+	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{WorkflowID: "cache/settled-old", Author: "lead", Body: "aged out"}); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -336,6 +344,13 @@ func TestDashboardCachedHandlersMatchModuleBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := raw.Exec(`UPDATE tasks SET updated_at = ''`); err != nil {
+		t.Fatal(err)
+	}
+	// Backdate ONLY the settled-old note past the active window so exactly one
+	// workflow derives 'settled' alongside tier-two's 'recent' (neither state
+	// carries server-side age fields, so wall-clock boundaries cannot
+	// desynchronize the byte compare).
+	if _, err := raw.Exec(`UPDATE workflow_notes SET created_at = '2026-06-01 00:00:00' WHERE workflow_id = 'cache/settled-old'`); err != nil {
 		t.Fatal(err)
 	}
 	if err := raw.Close(); err != nil {
