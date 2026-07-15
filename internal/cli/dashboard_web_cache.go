@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,7 +20,7 @@ const (
 	dashboardCacheReportInterval = time.Minute
 )
 
-// dashboardCachePolicy is the frozen endpoint policy for #948. Entries are
+// dashboardCachePolicy is the frozen endpoint policy for #948 and #956. Entries are
 // keyed by endpoint/canonical parameter; cursor is stored on the entry rather
 // than included in the flight key, which prevents overlapping generations.
 type dashboardCachePolicy struct {
@@ -35,12 +36,22 @@ var dashboardCachePolicies = []dashboardCachePolicy{
 	{endpoint: "jobs", keyKind: "job-event-id", retain: true, minRecompute: time.Second, maxAge: 15 * time.Second},
 	{endpoint: "charts", keyKind: "canonical-days+job-event-id", retain: true, minRecompute: 12 * time.Second, maxAge: 60 * time.Second, expireAtUTCMidnight: true},
 	{endpoint: "health", keyKind: "singleflight-only", retain: false},
+	{endpoint: "overview", keyKind: "full-cursor", retain: true, minRecompute: 5 * time.Second, maxAge: 15 * time.Second},
+	{endpoint: "attention", keyKind: "full-cursor", retain: true, minRecompute: time.Second, maxAge: 5 * time.Second},
+	{endpoint: "agents", keyKind: "job-event-id", retain: true, minRecompute: 5 * time.Second, maxAge: 30 * time.Second},
+	{endpoint: "tasks", keyKind: "task-event-id", retain: true, minRecompute: 2 * time.Second, maxAge: 15 * time.Second},
+	{endpoint: "workflows", keyKind: "job-event-id+workflow-note-id", retain: true, minRecompute: 5 * time.Second, maxAge: 15 * time.Second},
 }
 
 var (
-	dashboardJobsCachePolicy   = dashboardCachePolicies[0]
-	dashboardChartsCachePolicy = dashboardCachePolicies[1]
-	dashboardHealthCachePolicy = dashboardCachePolicies[2]
+	dashboardJobsCachePolicy      = dashboardCachePolicies[0]
+	dashboardChartsCachePolicy    = dashboardCachePolicies[1]
+	dashboardHealthCachePolicy    = dashboardCachePolicies[2]
+	dashboardOverviewCachePolicy  = dashboardCachePolicies[3]
+	dashboardAttentionCachePolicy = dashboardCachePolicies[4]
+	dashboardAgentsCachePolicy    = dashboardCachePolicies[5]
+	dashboardTasksCachePolicy     = dashboardCachePolicies[6]
+	dashboardWorkflowsCachePolicy = dashboardCachePolicies[7]
 )
 
 type dashboardCacheEntry struct {
@@ -83,8 +94,8 @@ func newDashboardJSONCache(stderr io.Writer) *dashboardJSONCache {
 	}
 	now := time.Now
 	return &dashboardJSONCache{
-		entries:    make(map[string]dashboardCacheEntry, 5),
-		flights:    make(map[string]*dashboardCacheFlight, 6),
+		entries: make(map[string]dashboardCacheEntry, len(dashboardCachePolicies)),
+		flights: make(map[string]*dashboardCacheFlight, len(dashboardCachePolicies)+1),
 		stats:      make(map[string]dashboardCacheCounters, 3),
 		now:        now,
 		stderr:     stderr,
@@ -197,11 +208,11 @@ func (c *dashboardJSONCache) recordLocked(endpoint, outcome string, bodyBytes in
 		return ""
 	}
 	line := "dashboard cache:"
-	for _, name := range []string{"jobs", "charts", "health"} {
-		s := c.stats[name]
-		line += fmt.Sprintf(" %s hits=%d misses=%d shared=%d bytes=%d;", name, s.hits, s.misses, s.shared, s.bytes)
+	for _, policy := range dashboardCachePolicies {
+		s := c.stats[policy.endpoint]
+		line += fmt.Sprintf(" %s hits=%d misses=%d shared=%d bytes=%d;", policy.endpoint, s.hits, s.misses, s.shared, s.bytes)
 	}
-	c.stats = make(map[string]dashboardCacheCounters, 3)
+	c.stats = make(map[string]dashboardCacheCounters, len(dashboardCachePolicies))
 	c.lastReport = now
 	return strings.TrimSuffix(line, ";") + "\n"
 }
@@ -251,6 +262,30 @@ func (d *webDataSource) jobEventCursor(ctx context.Context) (string, error) {
 	return jobEventID, nil
 }
 
+func (d *webDataSource) taskEventCursor(ctx context.Context) (string, error) {
+	cursor, err := d.ChangeCursor(ctx)
+	if err != nil {
+		return "", err
+	}
+	_, remainder, _ := strings.Cut(cursor, ".")
+	_, taskEventID, _ := strings.Cut(remainder, ".")
+	return taskEventID, nil
+}
+
+func (d *webDataSource) workflowEventCursor(ctx context.Context) (string, error) {
+	cursor, err := d.ChangeCursor(ctx)
+	if err != nil {
+		return "", err
+	}
+	jobEventID, remainder, _ := strings.Cut(cursor, ".")
+	workflowNoteID, _, _ := strings.Cut(remainder, ".")
+	return jobEventID + "." + workflowNoteID, nil
+}
+
+func (d *webDataSource) fullDashboardCursor(ctx context.Context) (string, error) {
+	return d.ChangeCursor(ctx)
+}
+
 func (d *webDataSource) handleJobs(w http.ResponseWriter, r *http.Request) {
 	cursor, err := d.jobEventCursor(r.Context())
 	if err != nil {
@@ -297,6 +332,205 @@ func (d *webDataSource) handleCharts(w http.ResponseWriter, r *http.Request) {
 		return marshalDashboardJSON(charts)
 	})
 	d.writeCachedDashboardJSON(w, outcome, body, err)
+}
+
+func (d *webDataSource) handleOverview(w http.ResponseWriter, r *http.Request) {
+	cursor, err := d.fullDashboardCursor(r.Context())
+	if err != nil {
+		w.Header().Set(dashboardCacheHeader, "miss")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	body, outcome, err := d.cacheForDashboard().get(r.Context(), "overview", cursor, dashboardOverviewCachePolicy, d.overviewJSON)
+	d.writeCachedDashboardJSON(w, outcome, body, err)
+}
+
+func (d *webDataSource) overviewJSON(ctx context.Context) ([]byte, error) {
+	overview, err := d.Overview(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if overview.NeedsYou == nil {
+		overview.NeedsYou = []dashboard.OverviewNeedsYou{}
+	}
+	if overview.Activity.Workflows == nil {
+		overview.Activity.Workflows = []dashboard.OverviewWorkflowActivity{}
+	}
+	for i := range overview.Activity.Workflows {
+		overview.Activity.Workflows[i].Namespace, overview.Activity.Workflows[i].Campaign = splitDashboardWorkflowLabel(overview.Activity.Workflows[i].Label)
+		if overview.Activity.Workflows[i].Agents == nil {
+			overview.Activity.Workflows[i].Agents = []string{}
+		}
+		sort.Strings(overview.Activity.Workflows[i].Agents)
+	}
+	if overview.Today.Notable == nil {
+		overview.Today.Notable = []dashboard.OverviewNotable{}
+	}
+	if overview.Scheduled == nil {
+		overview.Scheduled = []dashboard.OverviewScheduled{}
+	}
+	if overview.Fleet == nil {
+		overview.Fleet = []dashboard.OverviewFleet{}
+	}
+	sortDashboardOverview(&overview)
+	if len(overview.Today.Notable) > 5 {
+		overview.Today.Notable = overview.Today.Notable[:5]
+	}
+	return marshalDashboardJSON(overview)
+}
+
+func (d *webDataSource) handleAttention(w http.ResponseWriter, r *http.Request) {
+	cursor, err := d.fullDashboardCursor(r.Context())
+	if err != nil {
+		w.Header().Set(dashboardCacheHeader, "miss")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	body, outcome, err := d.cacheForDashboard().get(r.Context(), "attention", cursor, dashboardAttentionCachePolicy, d.attentionJSON)
+	d.writeCachedDashboardJSON(w, outcome, body, err)
+}
+
+func (d *webDataSource) attentionJSON(ctx context.Context) ([]byte, error) {
+	attention, err := d.Attention(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if attention.Gates == nil {
+		attention.Gates = []dashboard.AttentionGate{}
+	}
+	if attention.SynthItems == nil {
+		attention.SynthItems = []dashboard.AttentionSynthItem{}
+	}
+	if attention.Candidates == nil {
+		attention.Candidates = []dashboard.AttentionCandidate{}
+	}
+	return marshalDashboardJSON(attention)
+}
+
+func (d *webDataSource) handleAgents(w http.ResponseWriter, r *http.Request) {
+	cursor, err := d.jobEventCursor(r.Context())
+	if err != nil {
+		w.Header().Set(dashboardCacheHeader, "miss")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	body, outcome, err := d.cacheForDashboard().get(r.Context(), "agents", cursor, dashboardAgentsCachePolicy, func(ctx context.Context) ([]byte, error) {
+		agents, err := d.Agents(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if agents == nil {
+			agents = []dashboard.AgentSummary{}
+		}
+		return marshalDashboardJSON(agents)
+	})
+	d.writeCachedDashboardJSON(w, outcome, body, err)
+}
+
+func (d *webDataSource) handleTasks(w http.ResponseWriter, r *http.Request) {
+	cursor, err := d.taskEventCursor(r.Context())
+	if err != nil {
+		w.Header().Set(dashboardCacheHeader, "miss")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	body, outcome, err := d.cacheForDashboard().get(r.Context(), "tasks", cursor, dashboardTasksCachePolicy, d.tasksJSON)
+	d.writeCachedDashboardJSON(w, outcome, body, err)
+}
+
+func (d *webDataSource) tasksJSON(ctx context.Context) ([]byte, error) {
+	tasks, err := d.Tasks(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if tasks == nil {
+		tasks = []dashboard.TaskSummary{}
+	}
+	sort.SliceStable(tasks, func(i, j int) bool {
+		if ir, jr := dashboardWireTaskStateRank(tasks[i].State), dashboardWireTaskStateRank(tasks[j].State); ir != jr {
+			return ir < jr
+		}
+		if tasks[i].UpdatedAt != tasks[j].UpdatedAt {
+			return tasks[i].UpdatedAt > tasks[j].UpdatedAt
+		}
+		return tasks[i].ID < tasks[j].ID
+	})
+	return marshalDashboardJSON(tasks)
+}
+
+func dashboardWireTaskStateRank(state string) int {
+	switch state {
+	case "planned":
+		return 0
+	case "implementing":
+		return 1
+	case "pr_open":
+		return 2
+	case "blocked":
+		return 3
+	case "merged":
+		return 4
+	default:
+		return 5
+	}
+}
+
+func (d *webDataSource) handleWorkflows(w http.ResponseWriter, r *http.Request) {
+	cursor, err := d.workflowEventCursor(r.Context())
+	if err != nil {
+		w.Header().Set(dashboardCacheHeader, "miss")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	body, outcome, err := d.cacheForDashboard().get(r.Context(), "workflows", cursor, dashboardWorkflowsCachePolicy, d.workflowsJSON)
+	d.writeCachedDashboardJSON(w, outcome, body, err)
+}
+
+func (d *webDataSource) workflowsJSON(ctx context.Context) ([]byte, error) {
+	entries, err := d.Workflows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if entries == nil {
+		entries = []dashboard.WorkflowIndexEntry{}
+	}
+	for i := range entries {
+		entries[i].Namespace, entries[i].Campaign = splitDashboardWorkflowLabel(entries[i].Label)
+		if entries[i].Repos == nil {
+			entries[i].Repos = []string{}
+		}
+	}
+	// Sort with the pinned module's exact semantics (api.go workflowStateRank:
+	// stalled(0) < active(1) < settled(2) < default(3) — 'recent' is a gitmoot
+	// extension the module does not rank, so it must sort LAST for byte parity;
+	// dashboardWorkflowIndexLess ranks it between active and settled and must
+	// not be used here).
+	moduleRank := func(state string) int {
+		switch state {
+		case "stalled":
+			return 0
+		case "active":
+			return 1
+		case "settled":
+			return 2
+		default:
+			return 3
+		}
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		ri, rj := moduleRank(entries[i].State), moduleRank(entries[j].State)
+		if ri != rj {
+			return ri < rj
+		}
+		if entries[i].State == "stalled" && entries[i].StalledForS != entries[j].StalledForS {
+			return entries[i].StalledForS > entries[j].StalledForS
+		}
+		if entries[i].LastAt != entries[j].LastAt {
+			return entries[i].LastAt > entries[j].LastAt
+		}
+		return entries[i].Label < entries[j].Label
+	})
+	return marshalDashboardJSON(entries)
 }
 
 func (d *webDataSource) writeCachedDashboardJSON(w http.ResponseWriter, outcome string, body []byte, err error) {

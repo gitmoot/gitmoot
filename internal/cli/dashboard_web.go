@@ -70,14 +70,19 @@ func runDashboardWeb(home, addr string, stdout, stderr io.Writer) int {
 	}
 }
 
-// newDashboardWebHandler shadows only the three expensive endpoints covered by
-// the frozen #948 policy plus the already-local knowledge handler. Every other
-// route remains owned by the pinned dashboard module.
+// newDashboardWebHandler shadows only the expensive endpoints covered by the
+// frozen #948/#956 policies plus the already-local knowledge handler. Every
+// other route remains owned by the pinned dashboard module.
 func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/jobs", ds.handleJobs)
 	mux.HandleFunc("GET /api/charts", ds.handleCharts)
 	mux.HandleFunc("GET /api/health", ds.handleHealth)
+	mux.HandleFunc("GET /api/overview", ds.handleOverview)
+	mux.HandleFunc("GET /api/attention", ds.handleAttention)
+	mux.HandleFunc("GET /api/agents", ds.handleAgents)
+	mux.HandleFunc("GET /api/tasks", ds.handleTasks)
+	mux.HandleFunc("GET /api/workflows", ds.handleWorkflows)
 	mux.HandleFunc("GET /api/learning/knowledge", ds.handleLearningKnowledge)
 	mux.Handle("/", dashboard.Serve(ds))
 	return mux
