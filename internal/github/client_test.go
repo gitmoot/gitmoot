@@ -104,6 +104,41 @@ func TestCreateRepository(t *testing.T) {
 	})
 }
 
+func TestDeleteFile(t *testing.T) {
+	repo := Repository{Owner: "o", Name: "r"}
+
+	t.Run("deletes existing file", func(t *testing.T) {
+		runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"sha":"blob-sha"}`}, {Stdout: `{}`}}}
+		client := GhClient{Runner: runner, MaxRetries: 1}
+		file, err := client.DeleteFile(context.Background(), DeleteFileInput{
+			Repo: repo, Path: "pipelines/nightly/old.md", Message: "Publish pipeline nightly", Branch: "main",
+		})
+		if err != nil {
+			t.Fatalf("DeleteFile: %v", err)
+		}
+		if file.Path != "pipelines/nightly/old.md" || file.SHA != "blob-sha" {
+			t.Fatalf("DeleteFile result = %+v", file)
+		}
+		runner.wantArgs(t, 0, "api", "-X", "GET", "repos/o/r/contents/pipelines/nightly/old.md", "-f", "ref=main")
+		runner.wantArgs(t, 1, "api", "-X", "DELETE", "repos/o/r/contents/pipelines/nightly/old.md", "-f", "message=Publish pipeline nightly", "-f", "sha=blob-sha", "-f", "branch=main")
+	})
+
+	t.Run("already missing is idempotent", func(t *testing.T) {
+		runner := &fakeRunner{
+			results: []subprocess.Result{{Stderr: "gh: Not Found (HTTP 404)"}},
+			errs:    []error{errors.New("exit status 1")},
+		}
+		client := GhClient{Runner: runner, MaxRetries: 1}
+		file, err := client.DeleteFile(context.Background(), DeleteFileInput{Repo: repo, Path: "gone.md"})
+		if err != nil || file.Path != "gone.md" {
+			t.Fatalf("DeleteFile missing = (%+v, %v)", file, err)
+		}
+		if len(runner.calls) != 1 {
+			t.Fatalf("DeleteFile missing calls = %d", len(runner.calls))
+		}
+	})
+}
+
 func TestCloneRepository(t *testing.T) {
 	repo := Repository{Owner: "o", Name: "r"}
 

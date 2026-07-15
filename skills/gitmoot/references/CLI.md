@@ -2579,6 +2579,11 @@ trigger:
 gitmoot pipeline add nightly-sync.yaml --enable   # validate + store; omit --enable to add disabled
 gitmoot pipeline export nightly-sync --output ./nightly-sync.bundle
 gitmoot pipeline import ./nightly-sync.bundle --repo new-owner/new-repo
+gitmoot pipeline remote set owner/pipeline-catalog
+gitmoot pipeline remote show
+gitmoot pipeline publish nightly-sync [--remote owner/pipeline-catalog] [--create]
+gitmoot pipeline pull --list [--remote owner/pipeline-catalog]
+gitmoot pipeline pull nightly-sync [--remote owner/pipeline-catalog] --repo new-owner/new-repo [--agent-map exported=local]
 gitmoot pipeline install-defaults                 # install built-in memory pipelines, skipping existing names
 gitmoot pipeline list [--json]
 gitmoot pipeline show nightly-sync [--json]        # registry view for a name
@@ -2635,6 +2640,45 @@ optional new name are injected without re-marshaling the rest of the YAML. The
 stored `spec_hash` therefore hashes the imported bytes and correctly differs from
 the source bundle whenever repo/name/agent mappings changed. Missing upstream
 pipelines are allowed and leave the imported pipeline dormant until they exist.
+
+### Share a pipeline via GitHub
+
+Configure one GitHub repository as the default catalog, publish from the source
+home, then list and pull from another home:
+
+```sh
+# Source home. --create creates owner/pipeline-catalog as a PRIVATE repo.
+gitmoot pipeline remote set owner/pipeline-catalog
+gitmoot pipeline publish nightly-sync --create
+
+# Target home.
+gitmoot pipeline remote set owner/pipeline-catalog
+gitmoot pipeline pull --list
+gitmoot pipeline pull nightly-sync \
+  --repo new-owner/new-repo \
+  --agent-map reply-triager=local-triager
+```
+
+The optional `[pipeline_remote]` config section has the same `repo`, `ref`, and
+`path` shape as `[template_remote]`; `ref` defaults to `main` and `path` to
+`pipelines`. An explicit `--remote owner/repo` wins over the configured repo.
+`remote set` also accepts `--ref` and `--path`.
+
+Each published entry is a reviewable directory at
+`pipelines/<name>/bundle.yaml`, `spec.yaml`, and `templates/<id>.md`. Publishing
+compares the exported bytes with HEAD: unchanged files cause no commit, changed
+files alone are upserted, and files removed from the current bundle are deleted
+from that managed pipeline directory. Template prompts and metadata are stored
+verbatim. `--create` therefore creates a **private** repository; without it the
+remote must already exist, and prompts should only go to a public repo when they
+are intentionally public.
+
+`pipeline pull --list` prints each available name, description, and a one-line
+requirements summary. Pull downloads the selected directory at HEAD and hands
+it to the same `pipeline import` path: the requirements report, `--agent-map`,
+`--name`, collision/`--force` gates, and `--enable` behavior are unchanged.
+Nothing beyond the spec and embedded agent templates is installed, and the
+pipeline lands disabled unless `--enable` explicitly re-consents its authority.
 
 ### Reading pipeline status
 

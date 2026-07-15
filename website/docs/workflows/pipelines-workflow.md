@@ -110,27 +110,44 @@ in this MVP.
 
 ## Share a pipeline bundle
 
-Export a pipeline into a portable **directory** and import it in another Gitmoot
-home against that machine's repository:
+Use a private GitHub repository as a reviewable pipeline catalog, then pull it
+into another Gitmoot home against that machine's repository:
 
 ```sh
-gitmoot pipeline export nightly-sync --output ./nightly-sync.bundle
+# Source home. --create makes acme/pipeline-catalog PRIVATE.
+gitmoot pipeline remote set acme/pipeline-catalog
+gitmoot pipeline publish nightly-sync --create
 
-gitmoot pipeline import ./nightly-sync.bundle \
+# Target home.
+gitmoot pipeline remote set acme/pipeline-catalog
+gitmoot pipeline pull --list
+gitmoot pipeline pull nightly-sync \
   --repo acme/nightly-target \
   --name nightly-sync-copy \
   --agent-map scorer=local-scorer
 ```
 
-The bundle layout is intentionally inspectable:
+The remote layout is intentionally inspectable:
 
 ```text
-nightly-sync.bundle/
-├── bundle.yaml          # version, requirements, warnings, agents, spec hash
-├── spec.yaml            # original bytes with repo parameterized
+pipelines/nightly-sync/
+├── bundle.yaml           # version, requirements, warnings, agents, spec hash
+├── spec.yaml             # original bytes with repo parameterized
 └── templates/
-    └── scorer.md        # canonical template snapshot, including full prompt
+    └── scorer.md         # canonical template snapshot, including full prompt
 ```
+
+An unchanged republish performs no writes. When bytes change, only the changed
+files are committed, and template files that vanished from the exported bundle
+are deleted from that managed directory. Template prompts and metadata travel
+verbatim, so `--create` creates a private repository and you should only target a
+public repository when those prompts are intentionally public. Set a one-off
+repo with `--remote owner/repo`; `[pipeline_remote]` stores the default `repo`,
+`ref` (default `main`), and `path` (default `pipelines`).
+
+`pipeline pull --list` prints each manifest's name, description, and requirements
+on one line. Pull downloads the selected directory at HEAD and then uses the
+same import path and gates described below.
 
 `spec.yaml` preserves comments, ordering, and block formatting; only its `repo`
 scalar becomes `__GITMOOT_REPO__`. Template prompts travel verbatim, so review
@@ -154,6 +171,13 @@ Missing upstreams are allowed and keep the pipeline dormant. The imported
 `spec_hash` is computed from the final stored bytes after repo/name/agent mapping,
 so it intentionally differs from the source hash when those parameters change.
 
+For an offline transfer, export and import the same directory format directly:
+
+```sh
+gitmoot pipeline export nightly-sync --output ./nightly-sync.bundle
+gitmoot pipeline import ./nightly-sync.bundle --repo acme/nightly-target
+```
+
 ## Manage pipelines
 
 ```sh
@@ -164,6 +188,11 @@ gitmoot pipeline bind-trigger <name>         # create/re-sync the owned AP flow
 gitmoot pipeline install-defaults            # install built-in memory pipelines
 gitmoot pipeline export <name> --output <dir>
 gitmoot pipeline import <dir> --repo owner/repo [--agent-map exported=local]
+gitmoot pipeline remote set <owner/repo> [--ref <ref>] [--path <subdir>]
+gitmoot pipeline remote show
+gitmoot pipeline publish <name> [--remote owner/repo] [--create]
+gitmoot pipeline pull --list [--remote owner/repo]
+gitmoot pipeline pull <name> [--remote owner/repo] --repo owner/repo [--agent-map exported=local]
 gitmoot pipeline run <name>                  # start a manual run; prints the run id
 gitmoot pipeline resume <run-id> [--from <stage>]
 gitmoot pipeline cancel <run-id>

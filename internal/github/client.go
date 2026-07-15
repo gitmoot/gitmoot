@@ -411,6 +411,13 @@ type UpsertFileInput struct {
 	Branch  string
 }
 
+type DeleteFileInput struct {
+	Repo    Repository
+	Path    string
+	Message string
+	Branch  string
+}
+
 type RepositoryFile struct {
 	Path string
 	URL  string
@@ -1217,6 +1224,55 @@ func (c *GhClient) UpsertFile(ctx context.Context, input UpsertFileInput) (Repos
 		URL:  response.Content.URL,
 		SHA:  response.Content.SHA,
 	}, nil
+}
+
+// DeleteFile removes a repository file through the GitHub contents API. A
+// concurrently vanished path is an idempotent success.
+func (c *GhClient) DeleteFile(ctx context.Context, input DeleteFileInput) (RepositoryFile, error) {
+	path := strings.Trim(strings.TrimSpace(input.Path), "/")
+	if input.Repo.FullName() == "" {
+		return RepositoryFile{}, errors.New("repository is required")
+	}
+	if path == "" {
+		return RepositoryFile{}, errors.New("file path is required")
+	}
+	message := strings.TrimSpace(input.Message)
+	if message == "" {
+		message = "Delete " + path
+	}
+	var existing struct {
+		SHA string `json:"sha"`
+	}
+	getArgs := []string{"api", "-X", "GET", endpoint(input.Repo, "contents", path)}
+	if branch := strings.TrimSpace(input.Branch); branch != "" {
+		getArgs = append(getArgs, "-f", "ref="+branch)
+	}
+	result, err := c.run(ctx, false, getArgs...)
+	if err != nil {
+		if isNotFound(result) {
+			return RepositoryFile{Path: path}, nil
+		}
+		return RepositoryFile{}, err
+	}
+	if err := json.Unmarshal([]byte(result.Stdout), &existing); err != nil {
+		return RepositoryFile{}, fmt.Errorf("decode github contents response: %w", err)
+	}
+	sha := strings.TrimSpace(existing.SHA)
+	if sha == "" {
+		return RepositoryFile{}, errors.New("github contents response did not include a file sha")
+	}
+	args := []string{
+		"api", "-X", "DELETE", endpoint(input.Repo, "contents", path),
+		"-f", "message=" + message,
+		"-f", "sha=" + sha,
+	}
+	if branch := strings.TrimSpace(input.Branch); branch != "" {
+		args = append(args, "-f", "branch="+branch)
+	}
+	if _, err := c.run(ctx, true, args...); err != nil {
+		return RepositoryFile{}, err
+	}
+	return RepositoryFile{Path: path, SHA: sha}, nil
 }
 
 func (c *GhClient) getPullRequest(ctx context.Context, repo Repository, number int64) (PullRequest, error) {

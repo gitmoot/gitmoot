@@ -15,14 +15,9 @@ import (
 	"github.com/jerryfane/gitmoot/internal/github"
 )
 
-// templateRemoteClient is the GitHub write surface `publish` needs.
-// *github.GhClient satisfies it; tests inject a GhClient with a stubbed Runner
-// (or a fake) via newTemplateRemoteClient.
-type templateRemoteClient interface {
-	UpsertFile(ctx context.Context, input github.UpsertFileInput) (github.RepositoryFile, error)
-	RepositoryExists(ctx context.Context, repo github.Repository) (bool, error)
-	CreateRepository(ctx context.Context, repo github.Repository, private bool) error
-}
+// templateRemoteClient keeps the existing template-specific test seam while
+// sharing the write contract with other GitHub-backed publishers.
+type templateRemoteClient = githubRemoteWriteClient
 
 // newTemplateRemoteClient builds the GitHub client `publish` uses. It is a var so
 // tests can replace it with a stubbed-Runner GhClient.
@@ -41,15 +36,13 @@ var newAgentTemplateRemoteSource = func() agenttemplate.RemoteSource {
 // uninitialized home) reports "not configured" so callers fall back to their
 // existing flag-required behavior (off by default).
 func configuredTemplateRemote(home string) (config.TemplateRemotePolicy, bool) {
-	paths, err := pathsFromFlag(home)
-	if err != nil {
-		return config.TemplateRemotePolicy{}, false
-	}
+	remote, ok := configuredGitHubRemote(home, loadTemplateGitHubRemote)
+	return config.TemplateRemotePolicy(remote), ok
+}
+
+func loadTemplateGitHubRemote(paths config.Paths) (config.GitHubRemotePolicy, error) {
 	remote, err := config.LoadTemplateRemote(paths)
-	if err != nil || !remote.Configured() {
-		return config.TemplateRemotePolicy{}, false
-	}
-	return remote, true
+	return config.GitHubRemotePolicy(remote), err
 }
 
 // resolveTemplateRemote resolves the effective owner/repo, ref, and subdir for a
@@ -59,32 +52,9 @@ func configuredTemplateRemote(home string) (config.TemplateRemotePolicy, bool) {
 // default branch; pull defaults it to main). path falls back to the built-in
 // templates subdir.
 func resolveTemplateRemote(paths config.Paths, repoFlag, refFlag, pathFlag string) (repo, ref, path string, err error) {
-	remote, err := config.LoadTemplateRemote(paths)
-	if err != nil {
-		return "", "", "", err
-	}
-	repo = strings.TrimSpace(repoFlag)
-	if repo == "" {
-		repo = strings.TrimSpace(remote.Repo)
-	}
-	if repo == "" {
-		return "", "", "", errors.New("no template repo: pass --repo <owner/repo> or set a default with `gitmoot agent template remote set <owner/repo>`")
-	}
-	if _, perr := daemon.ParseRepository(repo); perr != nil {
-		return "", "", "", perr
-	}
-	ref = strings.TrimSpace(refFlag)
-	if ref == "" {
-		ref = strings.TrimSpace(remote.Ref)
-	}
-	path = strings.Trim(strings.TrimSpace(pathFlag), "/")
-	if path == "" {
-		path = strings.Trim(strings.TrimSpace(remote.Path), "/")
-	}
-	if path == "" {
-		path = config.DefaultTemplateRemotePath
-	}
-	return repo, ref, path, nil
+	return resolveGitHubRemote(paths, repoFlag, refFlag, pathFlag, config.DefaultTemplateRemotePath,
+		"no template repo: pass --repo <owner/repo> or set a default with `gitmoot agent template remote set <owner/repo>`",
+		loadTemplateGitHubRemote)
 }
 
 // runAgentTemplatePublish pushes each selected custom template's rebuilt .md to
@@ -283,90 +253,18 @@ func printAgentTemplateRemoteUsage(w io.Writer) {
 }
 
 func runAgentTemplateRemoteSet(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent template remote set", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	ref := fs.String("ref", "", "default git ref for publish/pull/add")
-	path := fs.String("path", "", "default subdir holding the template .md files")
-	repoArg, flagArgs := leadingID(args)
-	if err := fs.Parse(flagArgs); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 2
-	}
-	if repoArg == "" {
-		if fs.NArg() == 1 {
-			repoArg = fs.Arg(0)
-		} else {
-			fmt.Fprintln(stderr, "agent template remote set requires <owner/repo>")
-			return 2
-		}
-	} else if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "agent template remote set requires exactly one <owner/repo>")
-		return 2
-	}
-	repository, err := daemon.ParseRepository(repoArg)
-	if err != nil {
-		fmt.Fprintf(stderr, "set template remote: %v\n", err)
-		return 2
-	}
-	paths, err := pathsFromFlag(*home)
-	if err != nil {
-		fmt.Fprintf(stderr, "set template remote: %v\n", err)
-		return 1
-	}
-	if err := config.Initialize(paths); err != nil {
-		fmt.Fprintf(stderr, "set template remote: %v\n", err)
-		return 1
-	}
-	if err := config.EnsureTemplateRemoteSection(paths); err != nil {
-		fmt.Fprintf(stderr, "set template remote: %v\n", err)
-		return 1
-	}
-	edits := []struct {
-		key   string
-		value string
-		set   bool
-	}{
-		{"repo", repository.FullName(), true},
-		{"ref", strings.TrimSpace(*ref), strings.TrimSpace(*ref) != ""},
-		{"path", strings.Trim(strings.TrimSpace(*path), "/"), strings.TrimSpace(*path) != ""},
-	}
-	for _, edit := range edits {
-		if !edit.set {
-			continue
-		}
-		if err := config.SetConfigScalar(paths, []string{"template_remote", edit.key}, config.StringScalar(edit.value)); err != nil {
-			fmt.Fprintf(stderr, "set template remote: %v\n", err)
-			return 1
-		}
-	}
-	writeLine(stdout, "set default template remote to %s", repository.FullName())
-	return 0
+	return runGitHubRemoteSet(args, stdout, stderr, githubRemoteCommandOptions{
+		Command: "agent template remote", Noun: "template", Section: "template_remote",
+		DefaultRef: config.DefaultTemplateRemoteRef, DefaultPath: config.DefaultTemplateRemotePath,
+		RefHelp: "default git ref for publish/pull/add", PathHelp: "default subdir holding the template .md files",
+		Load: loadTemplateGitHubRemote, Ensure: config.EnsureTemplateRemoteSection,
+	})
 }
 
 func runAgentTemplateRemoteShow(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent template remote show", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 2
-	}
-	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "agent template remote show does not accept positional arguments")
-		return 2
-	}
-	remote, ok := configuredTemplateRemote(*home)
-	if !ok {
-		fmt.Fprintln(stdout, "no default template remote configured")
-		return 0
-	}
-	writeLine(stdout, "repo: %s", remote.Repo)
-	writeLine(stdout, "ref: %s", remote.ResolvedRef())
-	writeLine(stdout, "path: %s", remote.ResolvedPath())
-	return 0
+	return runGitHubRemoteShow(args, stdout, stderr, githubRemoteCommandOptions{
+		Command: "agent template remote", Noun: "template", Section: "template_remote",
+		DefaultRef: config.DefaultTemplateRemoteRef, DefaultPath: config.DefaultTemplateRemotePath,
+		Load: loadTemplateGitHubRemote, Ensure: config.EnsureTemplateRemoteSection,
+	})
 }
