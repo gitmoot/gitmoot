@@ -6836,6 +6836,31 @@ func (w jobWorker) jobNeedsAdvanceRetry(ctx context.Context, jobID string) (bool
 	return needsRetry, nil
 }
 
+// recordAdvanceRetryOnce appends an advance_retry marker UNLESS the job is already
+// sitting on one. A terminal job whose post-delivery advancement keeps failing is
+// re-attempted on every ~1s tick; appending a fresh advance_retry each time grew
+// job_events without bound (a real install reached ~1.8M rows — 96% of the table —
+// and the per-tick JobIDsWithPendingAdvanceRetry GROUP BY plus jobNeedsAdvanceRetry's
+// per-job ListJobEvents pinned a core with zero jobs in flight). Only the latest
+// marker per job is ever consulted (last-one-wins), so a job already on advance_retry
+// stays a candidate and keeps retrying with no new row; any other latest marker
+// (advance_started, or a prior terminal resolution before a re-trigger) still records
+// the transition to advance_retry. jobNeedsAdvanceRetry and JobIDsWithPendingAdvanceRetry
+// see an identical candidate set either way.
+func (w jobWorker) recordAdvanceRetryOnce(ctx context.Context, jobID, message string) error {
+	latest, err := w.Store.LatestAdvancementMarker(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if latest == "advance_retry" {
+		// Keep the single-row bound but refresh the surviving row so the why-stuck
+		// surface (#552) reports the current failure, not the first one.
+		_, err := w.Store.RefreshLatestAdvanceRetry(ctx, jobID, message)
+		return err
+	}
+	return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_retry", Message: message})
+}
+
 func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 	payload, err := daemonJobPayload(job)
 	if err != nil {
@@ -6847,13 +6872,13 @@ func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 	}
 	agent := runtimeAgent(dbAgent)
 	if refreshed, ok, err := w.refreshImplementedPayloadForRetry(ctx, job, payload); err != nil {
-		return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_retry", Message: "post-delivery workflow retry refresh failed: " + err.Error()})
+		return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry refresh failed: "+err.Error())
 	} else if ok {
 		payload = refreshed
 	}
 	checkout, err := w.CheckoutValidator(ctx, job, payload, agent)
 	if err != nil {
-		return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_retry", Message: "post-delivery workflow retry preflight failed: " + err.Error()})
+		return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry preflight failed: "+err.Error())
 	}
 	engine := w.WorkflowFactory(checkout)
 	if err := engine.AdvanceJob(ctx, job.ID); err != nil {
@@ -6865,7 +6890,7 @@ func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 		if errors.As(err, &blocked) {
 			return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_blocked", Message: err.Error()})
 		}
-		return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_retry", Message: "post-delivery workflow retry failed: " + err.Error()})
+		return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry failed: "+err.Error())
 	}
 	writeLine(w.Stdout, "job %s advancement retried", job.ID)
 	return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_retried", Message: "post-delivery workflow retry completed"})
@@ -8423,11 +8448,8 @@ func (w jobWorker) delegationParentCheckout(ctx context.Context, job db.Job) str
 }
 
 func (w jobWorker) recordPostDeliveryWorkflowError(ctx context.Context, job db.Job, cause error) error {
-	return w.Store.AddJobEvent(ctx, db.JobEvent{
-		JobID:   job.ID,
-		Kind:    "advance_retry",
-		Message: "post-delivery workflow error; advancement will retry from stored result: " + cause.Error(),
-	})
+	return w.recordAdvanceRetryOnce(ctx, job.ID,
+		"post-delivery workflow error; advancement will retry from stored result: "+cause.Error())
 }
 
 func (w jobWorker) postJobResultComment(ctx context.Context, jobID string, agent runtime.Agent, _ string, cause error) error {
