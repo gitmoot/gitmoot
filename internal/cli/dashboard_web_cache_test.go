@@ -36,6 +36,7 @@ func TestDashboardCachePolicyTable(t *testing.T) {
 		{endpoint: "agents", keyKind: "job-event-id", retain: true, minRecompute: 5 * time.Second, maxAge: 30 * time.Second},
 		{endpoint: "tasks", keyKind: "task-event-id", retain: true, minRecompute: 2 * time.Second, maxAge: 15 * time.Second},
 		{endpoint: "workflows", keyKind: "job-event-id+workflow-note-id", retain: true, minRecompute: 5 * time.Second, maxAge: 15 * time.Second},
+		{endpoint: "knowledge", keyKind: "ttl-only", retain: true, minRecompute: 15 * time.Second, maxAge: 60 * time.Second},
 	}
 	if !reflect.DeepEqual(dashboardCachePolicies, want) {
 		t.Fatalf("policies = %#v, want %#v", dashboardCachePolicies, want)
@@ -682,7 +683,7 @@ func TestDashboardCacheMetricsReportUsesPolicyTable(t *testing.T) {
 	cache.mu.Lock()
 	report := cache.recordLocked("overview", "hit", 42, base.Add(dashboardCacheReportInterval))
 	cache.mu.Unlock()
-	want := "dashboard cache: jobs hits=0 misses=0 shared=0 bytes=0; charts hits=0 misses=0 shared=0 bytes=0; health hits=0 misses=0 shared=0 bytes=0; overview hits=1 misses=0 shared=0 bytes=42; attention hits=0 misses=0 shared=0 bytes=0; agents hits=0 misses=0 shared=0 bytes=0; tasks hits=0 misses=0 shared=0 bytes=0; workflows hits=0 misses=0 shared=0 bytes=0\n"
+	want := "dashboard cache: jobs hits=0 misses=0 shared=0 bytes=0; charts hits=0 misses=0 shared=0 bytes=0; health hits=0 misses=0 shared=0 bytes=0; overview hits=1 misses=0 shared=0 bytes=42; attention hits=0 misses=0 shared=0 bytes=0; agents hits=0 misses=0 shared=0 bytes=0; tasks hits=0 misses=0 shared=0 bytes=0; workflows hits=0 misses=0 shared=0 bytes=0; knowledge hits=0 misses=0 shared=0 bytes=0\n"
 	if report != want {
 		t.Fatalf("metrics report:\n%s\nwant:\n%s", report, want)
 	}
@@ -805,5 +806,43 @@ func TestDashboardCacheLeaderDisconnectDoesNotAbortCompute(t *testing.T) {
 	})
 	if err != nil || string(body) != "survived" {
 		t.Fatalf("leader cancellation aborted the shared compute: %q, %v", body, err)
+	}
+}
+
+func TestDashboardKnowledgeCacheTTLAndParity(t *testing.T) {
+	home := dashboardTestHome(t)
+	seedWebDashboardTree(t, home)
+	now := time.Now()
+	ds := &webDataSource{home: home, responseCache: newDashboardJSONCache(nil)}
+	ds.responseCache.now = func() time.Time { return now }
+	h := newDashboardWebHandler(ds)
+	get := func() (string, string) {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/learning/knowledge", nil))
+		if rec.Code != 200 {
+			t.Fatalf("knowledge status %d: %s", rec.Code, rec.Body.String())
+		}
+		return rec.Body.String(), rec.Header().Get(dashboardCacheHeader)
+	}
+	first, o1 := get()
+	if o1 != "miss" {
+		t.Fatalf("first outcome %q, want miss", o1)
+	}
+	// Parity: the cached bytes must equal a direct compute.
+	direct, err := ds.knowledgeJSON(context.Background())
+	if err != nil || first != string(direct) {
+		t.Fatalf("cached body diverges from direct compute (err=%v, lens %d vs %d)", err, len(first), len(direct))
+	}
+	// Within maxAge: served from cache regardless of data (ttl-only policy).
+	now = now.Add(30 * time.Second)
+	second, o2 := get()
+	if o2 != "hit" || second != first {
+		t.Fatalf("30s outcome %q (want hit), bytes equal=%v", o2, second == first)
+	}
+	// Past maxAge: recompute.
+	now = now.Add(31 * time.Second)
+	_, o3 := get()
+	if o3 != "miss" {
+		t.Fatalf("61s outcome %q, want miss", o3)
 	}
 }
