@@ -69,8 +69,8 @@ Route work with `/gitmoot <agent> <action>` or `@agent` mentions on PRs and issu
     <td width="50%"><img src="website/static/img/dashboard/pipelines.png" alt="Pipelines — collapsible groups with health dots and due hints" width="100%"></td>
   </tr>
   <tr>
-    <td width="50%"><img src="website/static/img/dashboard/jobs.png" alt="Jobs — every run with state, agent, and timing" width="100%"></td>
-    <td width="50%"><img src="website/static/img/dashboard/charts.png" alt="Charts — success rates, jobs per day, token usage by agent" width="100%"></td>
+    <td width="50%"><img src="website/static/img/dashboard/workflows.png" alt="Workflows — coordinated campaigns with lifecycle, journal notes, and token totals" width="100%"></td>
+    <td width="50%"><img src="website/static/img/dashboard/brain.png" alt="Brain — the agent memory galaxy: clusters, facts, and cross-repo links" width="100%"></td>
   </tr>
 </table>
 
