@@ -146,26 +146,67 @@ if [[ -n "$timings_file" ]]; then
   cut -f1 "$package_timings" | sort >"$timing_names"
   timing_duplicates="$work_dir/timing-names.duplicates"
   uniq -d "$timing_names" >"$timing_duplicates"
+
+  # A duplicate row makes a test's weight ambiguous — that is a corrupt artifact,
+  # not a stale one, so it stays fatal.
+  if [[ -s "$timing_duplicates" ]]; then
+    echo "partition-race-tests: unusable timings: duplicate rows for package $package" >&2
+    sed 's/^/    /' "$timing_duplicates" >&2
+    exit 2
+  fi
+
+  # RECONCILE the timings against the CURRENT test list rather than demanding they
+  # match it (#930). Requiring an exact match meant any PR that added, renamed, or
+  # deleted a single test fell back to alternation — which is nearly every PR, so
+  # LPT balancing effectively never ran. Instead:
+  #   - a test with a recorded time keeps it;
+  #   - a test that is NEW here (no recorded time) gets the median of the known
+  #     times, so it is scheduled as a typical test rather than a free one;
+  #   - a recorded time for a test that no longer exists is dropped.
+  # Coverage is guaranteed downstream regardless: the shard-union assertion below
+  # compares the partition against the compiled binary's own -test.list, so a
+  # stale artifact can never drop or duplicate a test.
   missing="$work_dir/timing-names.missing"
   unknown="$work_dir/timing-names.unknown"
   comm -23 "$sorted_tests" "$timing_names" >"$missing"
   comm -13 "$sorted_tests" "$timing_names" >"$unknown"
 
-  if [[ -s "$timing_duplicates" || -s "$missing" || -s "$unknown" ]]; then
-    echo "partition-race-tests: unusable timings: test set does not match current package $package" >&2
-    if [[ -s "$timing_duplicates" ]]; then
-      echo "  duplicate timing rows:" >&2
-      sed 's/^/    /' "$timing_duplicates" >&2
-    fi
-    if [[ -s "$missing" ]]; then
-      echo "  current tests missing from timings:" >&2
-      sed 's/^/    /' "$missing" >&2
-    fi
-    if [[ -s "$unknown" ]]; then
-      echo "  timing rows absent from current tests:" >&2
-      sed 's/^/    /' "$unknown" >&2
-    fi
-    exit 2
+  reconciled="$work_dir/package-timings.reconciled"
+  awk -F '\t' -v current="$sorted_tests" '
+    BEGIN {
+      while ((getline line < current) > 0) {
+        if (line != "") present[line] = 1
+      }
+      close(current)
+    }
+    # keep only rows for tests that still exist
+    ($1 in present) { recorded[$1] = $2; n++; times[n] = $2 + 0 }
+    END {
+      # median of the known times is the weight for tests we have never timed
+      default_weight = 0
+      if (n > 0) {
+        # insertion sort: n is a few thousand at most, and this keeps the script
+        # dependency-free (no sort subprocess mid-stream).
+        for (i = 2; i <= n; i++) {
+          v = times[i]
+          for (j = i - 1; j >= 1 && times[j] > v; j--) times[j + 1] = times[j]
+          times[j + 1] = v
+        }
+        default_weight = (n % 2) ? times[(n + 1) / 2] : (times[n / 2] + times[n / 2 + 1]) / 2
+      }
+      while ((getline test < current) > 0) {
+        if (test == "") continue
+        print test "\t" ((test in recorded) ? recorded[test] : default_weight)
+      }
+      close(current)
+    }
+  ' "$package_timings" >"$reconciled"
+  package_timings="$reconciled"
+
+  new_count=$(grep -c . "$missing" || true)
+  dropped_count=$(grep -c . "$unknown" || true)
+  if [[ "$new_count" -gt 0 || "$dropped_count" -gt 0 ]]; then
+    echo "partition-race-tests: reconciled timings for $package: ${new_count} new test(s) weighted at the median, ${dropped_count} stale row(s) dropped" >&2
   fi
 
   # LPT: longest tests first, test name as the stable duration tiebreak, then

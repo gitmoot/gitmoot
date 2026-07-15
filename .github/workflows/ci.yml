@@ -22,9 +22,14 @@ name: CI
 #     the package bundle and executes from the package directory, preserving Go
 #     test-binary working-directory semantics without recompiling.
 #   - TIMINGS: PRs use the newest non-expired main timing artifact (up to 30
-#     days old) for deterministic LPT balancing. Missing, malformed, or stale
-#     timings fall back loudly to Stage 1's deterministic alternation. Successful
-#     pushes to main publish fresh per-test timings for subsequent PRs.
+#     days old) for deterministic LPT balancing. A PR's test set almost never
+#     matches main's exactly, so the timings are RECONCILED against the current
+#     test list (new tests weighted at the median, vanished rows dropped) rather
+#     than discarded — demanding an exact match meant LPT never ran (#930). Only a
+#     missing or corrupt artifact falls back loudly to Stage 1's deterministic
+#     alternation. Coverage never depends on the timings: the shard union is
+#     asserted against the compiled binary's own -test.list. Successful pushes to
+#     main publish fresh per-test timings for subsequent PRs.
 
 on:
   push:
@@ -222,7 +227,7 @@ jobs:
           status=$?
           set -e
           if [ "$status" -eq 2 ]; then
-            echo "::warning::main timings are stale or malformed for internal/$PACKAGE; using deterministic alternation"
+            echo "::warning::main timings are missing or corrupt for internal/$PACKAGE; using deterministic alternation"
             scripts/partition-race-tests.sh \
               --tests "$bundle/tests.list" \
               --shards "$SHARDS" \
