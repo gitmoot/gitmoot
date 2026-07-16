@@ -59,6 +59,9 @@ inferred. The dashboard only builds a resume command from a full UUID.
 In `gitmoot dashboard --web`, labeled jobs cluster around workflow hubs in
 Galaxy; a labeled run links to `/workflows/<label>`, which shows the complete
 run forest, state totals, best-effort token totals, and shared journal.
+The dashboard Config page also includes a read-only, names-only Keychain section
+with live file status, registry modes, configured proxy placement, and sorted
+pipeline grants. Credential values and value-derived data are never projected.
 
 The append-only journal stores text and authors verbatim. JSON show output keeps
 them verbatim; terminal text output sanitizes escapes/control bytes and caps each

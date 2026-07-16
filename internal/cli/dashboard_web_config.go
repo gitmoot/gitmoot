@@ -93,7 +93,13 @@ var dashboardConfigProjection = []dashboardConfigProjectionRow{
 // comes from a canonical loader and every default comes from its canonical
 // constructor; arbitrary TOML values are never copied into the response.
 func (d *webDataSource) Config(ctx context.Context) (dashboard.ConfigSnapshot, error) {
-	out := dashboard.ConfigSnapshot{ContractVersion: 1, Sections: []dashboard.ConfigSection{}, Agents: []dashboard.ConfigAgent{}, UnknownKeys: []string{}}
+	out := dashboard.ConfigSnapshot{
+		ContractVersion: 1,
+		Sections:        []dashboard.ConfigSection{},
+		Agents:          []dashboard.ConfigAgent{},
+		UnknownKeys:     []string{},
+		Keychain:        dashboard.KeychainView{Keys: []dashboard.KeychainKeyView{}},
+	}
 	err := withStoreAndPaths(d.home, func(paths config.Paths, store *db.Store) error {
 		out.Path = paths.ConfigFile
 		if info, err := os.Stat(paths.ConfigFile); err == nil {
@@ -118,6 +124,10 @@ func (d *webDataSource) Config(ctx context.Context) (dashboard.ConfigSnapshot, e
 			return fmt.Errorf("list agents: %w", err)
 		}
 		out.Agents = projectDashboardConfigAgents(agents, agentTypes)
+		out.Keychain, err = projectDashboardConfigKeychain(ctx, store, d.home)
+		if err != nil {
+			return fmt.Errorf("project keychain config: %w", err)
+		}
 		// Unknown-key discovery re-parses the file with a strict TOML reader,
 		// which can reject values gitmoot's lenient loader accepts (e.g. the
 		// live box's bare-word list `deterministic_checkers = diff_size,...`).
@@ -130,6 +140,54 @@ func (d *webDataSource) Config(ctx context.Context) (dashboard.ConfigSnapshot, e
 	})
 	if err != nil {
 		return dashboard.ConfigSnapshot{}, err
+	}
+	return out, nil
+}
+
+// projectDashboardConfigKeychain exposes registry metadata only. The live file
+// check reuses the names-only pipeline classifier; credential values have no
+// representation in this projection or in the dashboard contract.
+func projectDashboardConfigKeychain(ctx context.Context, store *db.Store, home string) (dashboard.KeychainView, error) {
+	path, err := resolveKeychainPath(store, home)
+	if err != nil {
+		return dashboard.KeychainView{}, err
+	}
+	inspection := classifyPipelineEnvFile(ctx, store, home, path)
+	out := dashboard.KeychainView{
+		File: dashboard.KeychainFileStatus{Path: path, Status: inspection.Status},
+		Keys: []dashboard.KeychainKeyView{},
+	}
+
+	keys, err := store.ListKeychainKeys(ctx)
+	if err != nil {
+		return dashboard.KeychainView{}, fmt.Errorf("list keychain keys: %w", err)
+	}
+	grants, err := store.ListKeychainGrants(ctx, "")
+	if err != nil {
+		return dashboard.KeychainView{}, fmt.Errorf("list keychain grants: %w", err)
+	}
+	grantsByKey := make(map[string][]dashboard.KeychainGrantView, len(keys))
+	for _, grant := range grants {
+		grantsByKey[grant.KeyName] = append(grantsByKey[grant.KeyName], dashboard.KeychainGrantView{
+			ConsumerKind: grant.ConsumerKind,
+			ConsumerID:   grant.ConsumerID,
+		})
+	}
+	for _, key := range keys {
+		row := dashboard.KeychainKeyView{
+			Name:      key.Name,
+			Mode:      key.Mode,
+			Grants:    grantsByKey[key.Name],
+			CreatedAt: key.CreatedAt,
+		}
+		if row.Grants == nil {
+			row.Grants = []dashboard.KeychainGrantView{}
+		}
+		if key.ProxyConfigured() {
+			row.ProxyUpstream = key.ProxyUpstream
+			row.ProxyAuth = keyProxyAuthLabel(key)
+		}
+		out.Keys = append(out.Keys, row)
 	}
 	return out, nil
 }

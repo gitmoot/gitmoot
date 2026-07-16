@@ -3,6 +3,9 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"reflect"
 	"strings"
@@ -201,4 +204,169 @@ func dashboardConfigKnob(t *testing.T, snapshot dashboard.ConfigSnapshot, sectio
 	}
 	t.Fatalf("missing config knob %s.%s", section, key)
 	return dashboard.ConfigKnob{}
+}
+
+func TestWebDataSourceConfigKeychainProjection(t *testing.T) {
+	home := dashboardTestHome(t)
+	path, _ := seedDashboardConfigKeychain(t, home)
+	snapshot, err := (&webDataSource{home: home}).Config(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Keychain.File.Path != path || snapshot.Keychain.File.Status != pipelineEnvFileStatusOK {
+		t.Fatalf("keychain file = %+v", snapshot.Keychain.File)
+	}
+	wantNames := []string{"GH_TOKEN", "OPENAI_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"}
+	if len(snapshot.Keychain.Keys) != len(wantNames) {
+		t.Fatalf("keys = %+v", snapshot.Keychain.Keys)
+	}
+	for i, want := range wantNames {
+		if snapshot.Keychain.Keys[i].Name != want || snapshot.Keychain.Keys[i].Grants == nil || snapshot.Keychain.Keys[i].CreatedAt == "" {
+			t.Fatalf("key[%d] = %+v, want %s with non-nil grants and created_at", i, snapshot.Keychain.Keys[i], want)
+		}
+	}
+	ghGrants := snapshot.Keychain.Keys[0].Grants
+	wantGrants := []dashboard.KeychainGrantView{
+		{ConsumerKind: "pipeline", ConsumerID: "alpha"},
+		{ConsumerKind: "pipeline", ConsumerID: "zeta"},
+	}
+	if !reflect.DeepEqual(ghGrants, wantGrants) {
+		t.Fatalf("GH_TOKEN grants = %+v, want %+v", ghGrants, wantGrants)
+	}
+	proxied := snapshot.Keychain.Keys[1]
+	if proxied.Mode != db.KeychainModeProxied || proxied.ProxyUpstream != "https://api.example.test/v1" || proxied.ProxyAuth != "header:X-Service-Key" {
+		t.Fatalf("proxied key = %+v", proxied)
+	}
+	for _, key := range []dashboard.KeychainKeyView{snapshot.Keychain.Keys[0], snapshot.Keychain.Keys[2], snapshot.Keychain.Keys[3]} {
+		if key.Mode != db.KeychainModeInjected || key.ProxyUpstream != "" || key.ProxyAuth != "" || len(key.Grants) == 0 {
+			t.Fatalf("injected key = %+v", key)
+		}
+	}
+}
+
+func TestWebDataSourceConfigKeychainLiveDriftKeepsRegistry(t *testing.T) {
+	home := dashboardTestHome(t)
+	path, _ := seedDashboardConfigKeychain(t, home)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := (&webDataSource{home: home}).Config(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Keychain.File.Path != path || snapshot.Keychain.File.Status != pipelineEnvFileStatusMissing || len(snapshot.Keychain.Keys) != 4 {
+		t.Fatalf("drifted keychain = %+v", snapshot.Keychain)
+	}
+	if got := snapshot.Keychain.Keys[0].Grants; !reflect.DeepEqual(got, []dashboard.KeychainGrantView{
+		{ConsumerKind: "pipeline", ConsumerID: "alpha"},
+		{ConsumerKind: "pipeline", ConsumerID: "zeta"},
+	}) {
+		t.Fatalf("registry grants changed after file drift: %+v", got)
+	}
+}
+
+func TestWebDataSourceConfigKeychainNeverLeaksValues(t *testing.T) {
+	home := dashboardTestHome(t)
+	_, sentinels := seedDashboardConfigKeychain(t, home)
+	snapshot, err := (&webDataSource{home: home}).Config(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sentinel := range sentinels {
+		if strings.Contains(string(raw), sentinel) {
+			t.Fatalf("config payload leaked keychain value %q: %s", sentinel, raw)
+		}
+	}
+}
+
+func TestDashboardConfigKeychainHTTPShape(t *testing.T) {
+	home := dashboardTestHome(t)
+	_, sentinels := seedDashboardConfigKeychain(t, home)
+	server := httptest.NewServer(dashboard.Serve(&webDataSource{home: home}))
+	defer server.Close()
+	resp, err := http.Get(server.URL + "/api/config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+	text := string(body)
+	for _, want := range []string{`"keychain"`, `"proxyUpstream"`, `"proxyAuth"`, `"consumerKind"`, `"consumerID"`, `"createdAt"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("config wire payload missing %s: %s", want, body)
+		}
+	}
+	for _, unwanted := range []string{`"proxy_upstream"`, `"proxy_auth"`, `"consumer_kind"`, `"consumer_id"`, `"created_at"`} {
+		if strings.Contains(text, unwanted) {
+			t.Fatalf("config wire payload contains non-camelCase key %s: %s", unwanted, body)
+		}
+	}
+	for _, sentinel := range sentinels {
+		if strings.Contains(text, sentinel) {
+			t.Fatalf("config wire payload leaked keychain value %q: %s", sentinel, body)
+		}
+	}
+	var snapshot dashboard.ConfigSnapshot
+	if err := json.Unmarshal(body, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Keychain.Keys == nil || len(snapshot.Keychain.Keys) != 4 || snapshot.Keychain.Keys[0].Grants == nil {
+		t.Fatalf("non-null array contract failed: %+v", snapshot.Keychain)
+	}
+}
+
+func seedDashboardConfigKeychain(t *testing.T, home string) (string, []string) {
+	t.Helper()
+	sentinels := []string{
+		"sentinel-gh-982-value",
+		"sentinel-openai-982-value",
+		"sentinel-telegram-bot-982-value",
+		"sentinel-telegram-chat-982-value",
+	}
+	path := writeDefaultKeychain(t, home, strings.Join([]string{
+		"GH_TOKEN=" + sentinels[0],
+		"OPENAI_API_KEY=" + sentinels[1],
+		"TELEGRAM_BOT_TOKEN=" + sentinels[2],
+		"TELEGRAM_CHAT_ID=" + sentinels[3],
+	}, "\n")+"\n")
+	store := openPipelineTestStore(t, home)
+	defer store.Close()
+	for _, name := range []string{"zeta", "alpha", "beta"} {
+		seedTestPipeline(t, store, db.Pipeline{Name: name, SpecYAML: "name: " + name + "\nstages:\n  - {id: run, cmd: echo}\n"})
+	}
+	for _, key := range []struct{ name, mode string }{
+		{"TELEGRAM_CHAT_ID", db.KeychainModeInjected},
+		{"GH_TOKEN", db.KeychainModeInjected},
+		{"OPENAI_API_KEY", db.KeychainModeProxied},
+		{"TELEGRAM_BOT_TOKEN", db.KeychainModeInjected},
+	} {
+		if _, err := store.AddKeychainKey(context.Background(), key.name, key.mode); err != nil {
+			t.Fatalf("AddKeychainKey %s: %v", key.name, err)
+		}
+	}
+	if _, err := store.ConfigureKeychainProxy(context.Background(), "OPENAI_API_KEY", "https://api.example.test/v1", db.KeychainProxyAuthHeader, "X-Service-Key"); err != nil {
+		t.Fatal(err)
+	}
+	for _, grant := range []struct{ key, pipeline string }{
+		{"GH_TOKEN", "zeta"},
+		{"GH_TOKEN", "alpha"},
+		{"OPENAI_API_KEY", "alpha"},
+		{"TELEGRAM_BOT_TOKEN", "beta"},
+		{"TELEGRAM_CHAT_ID", "zeta"},
+	} {
+		if _, err := store.GrantKeychainKey(context.Background(), db.KeychainConsumerPipeline, grant.pipeline, grant.key); err != nil {
+			t.Fatalf("GrantKeychainKey %s/%s: %v", grant.pipeline, grant.key, err)
+		}
+	}
+	return path, sentinels
 }

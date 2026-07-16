@@ -358,6 +358,12 @@ filter box narrows by key, section, or value, and every knob carries a
 click-to-copy `key = value` snippet for pasting into `config.toml`, whose path
 and last-modified time are shown in the footer.
 
+The Keychain section is a names-only registry view: it shows the configured
+keychain path and live file status, each registered key's injected/proxied mode,
+configured proxy upstream and auth placement, and sorted consumer grants. It
+never returns credential values or value-derived data; file rotation and drift
+are reflected on the next request.
+
 Values come from a strict server-side allowlist: only known, registered
 settings are ever serialized, so secrets and tokens can never appear. Keys
 present in `config.toml` that the allowlist does not recognize are listed by
