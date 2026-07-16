@@ -89,6 +89,7 @@ func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	mux.HandleFunc("GET /api/workflows", ds.handleWorkflows)
 	mux.HandleFunc("GET /api/learning/knowledge", ds.handleLearningKnowledge)
 	mux.HandleFunc("GET /api/brain/events", ds.handleBrainEvents)
+	mux.HandleFunc("GET /api/brain/fact", ds.handleBrainFact)
 	// #958 single-label detail widening (no module cache policy for this route).
 	mux.HandleFunc("GET /api/workflow/{label}", ds.handleWorkflowAPI)
 	mux.Handle("/", dashboard.Serve(ds))

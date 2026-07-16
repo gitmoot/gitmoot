@@ -64,6 +64,14 @@ type ConfirmedMemory struct {
 	SupersededBy     int64 // 0 == not superseded
 }
 
+// ConfirmedMemoryRecord is the complete read-only row shape used by audit
+// surfaces that must include retired and superseded facts.
+type ConfirmedMemoryRecord struct {
+	ConfirmedMemory
+	RetiredAt     string
+	RetiredReason string
+}
+
 // MemoryLink is one persisted, derived edge from a source confirmed memory to a
 // related target confirmed memory. It never mutates fact content; vault export and
 // inspection commands opt into this side table explicitly.
@@ -118,11 +126,15 @@ const (
 // than reviving content an operator already pulled from circulation.
 var ErrConfirmedMemoryRetired = errors.New("confirmed memory is retired")
 
+// ErrConfirmedMemoryNotFound reports a confirmed-memory id with no backing row.
+var ErrConfirmedMemoryNotFound = errors.New("confirmed memory not found")
+
 type upsertConfirmedMemoryOptions struct {
 	allowResurrect   bool
 	preserveEditions bool
 	eventKind        string
 	actor            string
+	eventDetail      any
 }
 
 // UpsertConfirmedMemoryOption tunes confirmed-memory upsert behavior.
@@ -157,6 +169,15 @@ func WithConfirmedMemoryEvent(kind, actor string) UpsertConfirmedMemoryOption {
 	return func(o *upsertConfirmedMemoryOptions) {
 		o.eventKind = strings.TrimSpace(kind)
 		o.actor = strings.TrimSpace(actor)
+	}
+}
+
+// WithConfirmedMemoryEventDetail attaches compact JSON detail to an event when
+// the mutation path does not already require a stronger detail payload (for
+// example, an updated event's before-content).
+func WithConfirmedMemoryEventDetail(detail any) UpsertConfirmedMemoryOption {
+	return func(o *upsertConfirmedMemoryOptions) {
+		o.eventDetail = detail
 	}
 }
 
@@ -360,6 +381,32 @@ ORDER BY id`)
 	return out, rows.Err()
 }
 
+// GetConfirmedMemoryByID returns one complete confirmed-memory row, including
+// retired and superseded facts. It is an audit read and deliberately applies no
+// active-fact filter.
+func (s *Store) GetConfirmedMemoryByID(ctx context.Context, id int64) (ConfirmedMemoryRecord, error) {
+	var record ConfirmedMemoryRecord
+	var repo sql.NullString
+	err := s.db.QueryRowContext(ctx, `
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content, context,
+	provenance, source_job, first_confirmed_at, updated_at, COALESCE(superseded_by, 0),
+	retired_at, retired_reason
+FROM confirmed_memories
+WHERE id = ?`, id).Scan(
+		&record.ID, &record.Owner.Kind, &record.Owner.Ref, &record.Owner.Version, &record.AuthorRef, &repo,
+		&record.Scope, &record.Key, &record.Content, &record.Context, &record.Provenance, &record.SourceJob,
+		&record.FirstConfirmedAt, &record.UpdatedAt, &record.SupersededBy,
+		&record.RetiredAt, &record.RetiredReason)
+	if err == sql.ErrNoRows {
+		return ConfirmedMemoryRecord{}, fmt.Errorf("%w: %d", ErrConfirmedMemoryNotFound, id)
+	}
+	if err != nil {
+		return ConfirmedMemoryRecord{}, fmt.Errorf("get confirmed memory %d: %w", id, err)
+	}
+	record.Repo = repo.String
+	return record, nil
+}
+
 // ObservationKeyWitnesses is a per-(owner_ref, repo, key) tally of how many
 // append-only observation sightings back that triple — the "witness" count a
 // confirmed fact on the same key accumulated. Repo is normalized ("" == general /
@@ -539,6 +586,12 @@ WHERE id = ?`,
 	case !inserted:
 		kind = MemoryEventUpdated
 		detail, err = memoryEventBeforeDetail(previousContent)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if recordEvent && detail == "" && options.eventDetail != nil {
+		detail, err = compactMemoryEventDetail(options.eventDetail)
 		if err != nil {
 			return 0, err
 		}

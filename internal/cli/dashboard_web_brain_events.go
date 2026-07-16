@@ -31,6 +31,23 @@ type dashboardBrainEvent struct {
 type dashboardBrainEventsResponse struct {
 	Events     []dashboardBrainEvent `json:"events"`
 	NextCursor int64                 `json:"nextCursor"`
+	Total      int64                 `json:"total"`
+}
+
+type dashboardBrainFact struct {
+	ID               int64  `json:"id"`
+	Key              string `json:"key"`
+	Content          string `json:"content"`
+	Status           string `json:"status"`
+	Repo             string `json:"repo,omitempty"`
+	Scope            string `json:"scope"`
+	OwnerKind        string `json:"ownerKind"`
+	OwnerRef         string `json:"ownerRef"`
+	RetiredAt        string `json:"retiredAt,omitempty"`
+	RetiredReason    string `json:"retiredReason,omitempty"`
+	SupersededBy     int64  `json:"supersededBy,omitempty"`
+	FirstConfirmedAt string `json:"firstConfirmedAt"`
+	UpdatedAt        string `json:"updatedAt"`
 }
 
 func (d *webDataSource) BrainEvents(ctx context.Context, cursor int64, limit int) (dashboardBrainEventsResponse, error) {
@@ -42,6 +59,11 @@ func (d *webDataSource) BrainEvents(ctx context.Context, cursor int64, limit int
 	}
 	out := dashboardBrainEventsResponse{Events: []dashboardBrainEvent{}}
 	err := withStore(d.home, func(store *db.Store) error {
+		var err error
+		out.Total, err = store.MaxMemoryEventID(ctx)
+		if err != nil {
+			return err
+		}
 		events, err := store.ListMemoryEvents(ctx, db.MemoryEventFilter{BeforeID: cursor, Limit: limit + 1})
 		if err != nil {
 			return err
@@ -58,6 +80,30 @@ func (d *webDataSource) BrainEvents(ctx context.Context, cursor int64, limit int
 			out.Events = append(out.Events, dashboardBrainEvent{ID: event.ID, At: event.At, Kind: event.Kind,
 				MemoryID: event.MemoryID, Key: event.Key, OwnerKind: event.OwnerKind, OwnerRef: event.OwnerRef,
 				Repo: event.Repo, Scope: event.Scope, Actor: event.Actor, Detail: detail})
+		}
+		return nil
+	})
+	return out, err
+}
+
+func (d *webDataSource) BrainFact(ctx context.Context, id int64) (dashboardBrainFact, error) {
+	var out dashboardBrainFact
+	err := withStore(d.home, func(store *db.Store) error {
+		record, err := store.GetConfirmedMemoryByID(ctx, id)
+		if err != nil {
+			return err
+		}
+		status := "active"
+		if record.SupersededBy != 0 {
+			status = "superseded"
+		} else if record.RetiredAt != "" {
+			status = "retired"
+		}
+		out = dashboardBrainFact{
+			ID: record.ID, Key: record.Key, Content: record.Content, Status: status,
+			Repo: record.Repo, Scope: record.Scope, OwnerKind: record.Owner.Kind, OwnerRef: record.Owner.Ref,
+			RetiredAt: record.RetiredAt, RetiredReason: record.RetiredReason, SupersededBy: record.SupersededBy,
+			FirstConfirmedAt: record.FirstConfirmedAt, UpdatedAt: record.UpdatedAt,
 		}
 		return nil
 	})
@@ -99,6 +145,50 @@ func (d *webDataSource) handleBrainEvents(w http.ResponseWriter, r *http.Request
 
 func dashboardBrainEventsCacheKey(cursor, limit int64) string {
 	return fmt.Sprintf("brain-events:%d.%d", cursor, limit)
+}
+
+func (d *webDataSource) handleBrainFact(w http.ResponseWriter, r *http.Request) {
+	id, err := dashboardBrainFactID(r)
+	if err != nil {
+		writeDashboardBrainError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	pageKey := dashboardBrainFactCacheKey(id)
+	body, outcome, err := d.cacheForDashboard().get(r.Context(), pageKey, "", dashboardBrainFactCachePolicy, func(ctx context.Context) ([]byte, error) {
+		fact, err := d.BrainFact(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(fact)
+	})
+	w.Header().Set(dashboardCacheHeader, outcome)
+	if errors.Is(err, db.ErrConfirmedMemoryNotFound) {
+		writeDashboardBrainError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	d.writeCachedDashboardJSON(w, outcome, body, err)
+}
+
+func dashboardBrainFactCacheKey(id int64) string {
+	return fmt.Sprintf("brain-fact:%d", id)
+}
+
+func dashboardBrainFactID(r *http.Request) (int64, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get("id"))
+	if raw == "" {
+		return 0, fmt.Errorf("id is required")
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id < 0 {
+		return 0, fmt.Errorf("id must be a non-negative integer")
+	}
+	return id, nil
+}
+
+func writeDashboardBrainError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
 
 func dashboardBrainEventIntQuery(r *http.Request, name string, fallback int64) (int64, error) {

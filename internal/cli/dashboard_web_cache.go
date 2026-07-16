@@ -52,6 +52,10 @@ var dashboardCachePolicies = []dashboardCachePolicy{
 	// nothing is retained — but concurrent identical polls (public dashboard on
 	// the ~1s SSE tick) still coalesce into one store read per page variant.
 	{endpoint: "brain-events", keyKind: "singleflight-only", retain: false},
+	// brain-fact (#988): facts may retire or be superseded at any time, so the
+	// selected row is re-read on every request while identical id lookups share
+	// one in-flight read.
+	{endpoint: "brain-fact", keyKind: "singleflight-only", retain: false},
 }
 
 var (
@@ -65,6 +69,7 @@ var (
 	dashboardWorkflowsCachePolicy   = dashboardCachePolicies[7]
 	dashboardKnowledgeCachePolicy   = dashboardCachePolicies[8]
 	dashboardBrainEventsCachePolicy = dashboardCachePolicies[9]
+	dashboardBrainFactCachePolicy   = dashboardCachePolicies[10]
 )
 
 type dashboardCacheEntry struct {

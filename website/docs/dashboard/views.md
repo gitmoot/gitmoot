@@ -238,6 +238,10 @@ deep cluster trees, and the fact-links / cross-repo / history header toggles.
 See the Learning section above for how facts are produced; Brain is where you
 read them.
 
+The changelog feed comes from `/api/brain/events`, whose `total` reports the
+exact append-only event count. Selecting an event loads `/api/brain/fact?id=ID`,
+which can return active, retired, or superseded facts for historical inspection.
+
 ## Agents
 
 Route: `/agents` (or `/agents/<name>`)

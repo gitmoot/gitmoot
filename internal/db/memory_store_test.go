@@ -20,6 +20,60 @@ func openMemTestStore(t *testing.T) *Store {
 	return store
 }
 
+func TestGetConfirmedMemoryByIDIncludesEveryLifecycleState(t *testing.T) {
+	ctx := context.Background()
+	store := openMemTestStore(t)
+	owner := MemoryOwner{Kind: "agent", Ref: "builder"}
+	activeID := mustUpsert(t, store, ConfirmedMemory{Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "active", Content: "active fact"})
+	retiredID := mustUpsert(t, store, ConfirmedMemory{Owner: owner, Scope: "general", Key: "retired", Content: "retired fact"})
+	if err := store.RetireConfirmedMemory(ctx, retiredID, "stale source"); err != nil {
+		t.Fatal(err)
+	}
+	liveID := mustUpsert(t, store, ConfirmedMemory{Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "edition", Content: "before"})
+	if _, err := store.UpsertConfirmedMemory(ctx,
+		ConfirmedMemory{Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "edition", Content: "after"},
+		PreserveSupersededEdition()); err != nil {
+		t.Fatal(err)
+	}
+	var supersededID int64
+	if err := store.db.QueryRowContext(ctx, `SELECT id FROM confirmed_memories WHERE superseded_by = ?`, liveID).Scan(&supersededID); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name, status, repo, reason string
+		id                         int64
+		supersededBy               int64
+	}{
+		{name: "active", id: activeID, status: "active", repo: "acme/widget"},
+		{name: "retired", id: retiredID, status: "retired", reason: "stale source"},
+		{name: "superseded", id: supersededID, status: "superseded", repo: "acme/widget", supersededBy: liveID},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			record, err := store.GetConfirmedMemoryByID(ctx, tc.id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			status := "active"
+			if record.SupersededBy != 0 {
+				status = "superseded"
+			} else if record.RetiredAt != "" {
+				status = "retired"
+			}
+			if status != tc.status || record.Repo != tc.repo || record.RetiredReason != tc.reason || record.SupersededBy != tc.supersededBy {
+				t.Fatalf("record = %+v, status=%q", record, status)
+			}
+			if record.FirstConfirmedAt == "" || record.UpdatedAt == "" {
+				t.Fatalf("timestamps missing: %+v", record)
+			}
+		})
+	}
+	if _, err := store.GetConfirmedMemoryByID(ctx, 999999); !errors.Is(err, ErrConfirmedMemoryNotFound) {
+		t.Fatalf("missing error = %v", err)
+	}
+}
+
 func TestMemoryEvalProbeAndCorpusFingerprint(t *testing.T) {
 	ctx := context.Background()
 	store := openMemTestStore(t)

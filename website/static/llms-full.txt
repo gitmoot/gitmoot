@@ -673,6 +673,8 @@ gitmoot job list
 gitmoot job show <job-id>
 gitmoot job watch <job-id>
 gitmoot job watch <job-id> --transcript   # readable cockpit tee log; falls back to events if unavailable
+gitmoot job transcript <job-id> --export md|jsonl
+gitmoot job transcript --all --state succeeded,failed --since 720h --export jsonl
 gitmoot job retry <job-id>
 gitmoot job cancel <job-id>               # abandon one queued|running|blocked job
 gitmoot job cancel --state blocked --older-than 7d --yes   # bulk-dismiss a blocked backlog (dry-run without --yes)
@@ -684,6 +686,15 @@ gitmoot daemon start --repo owner/repo --poll 30s --workers 1
 gitmoot daemon start
 gitmoot daemon status
 ```
+
+Transcript retention is opt-in through `[transcripts] enabled = true` with a
+default `retain = "168h"` and `max_total_bytes = 2147483648`. It captures
+foreground, daemon, temporary-session, ephemeral, and delegated runtime jobs;
+externally driven session jobs have no subprocess to capture. Raw retained logs
+are unredacted mode-`0600` files, seat logs remain transient, and observed disk
+cost on this host is roughly 440 MB/week. JSONL exports redact known credential
+patterns best-effort, but that masking is not a vault. `--output` writes through
+a private temporary file and atomic rename.
 
 Goal import turns Markdown headings shaped like `### Task N: Title` into local
 planned tasks. `task run` starts one task branch in a dedicated worktree,
@@ -4246,8 +4257,9 @@ pane labeled `<agent> · d<depth> · <branch>`, and that pane streams the child'
 progress while the job runs. Children inherit the cockpit setting from their
 parent, so a single `--cockpit` on the root lights up the whole orchestra.
 
-Each pane renders the cockpit-only tee log through `gitmoot job watch
---transcript`. Codex JSONL is readable live. Kimi stream-json is turn-buffered,
+Each pane renders its explicitly selected job or seat tee log through `gitmoot
+job watch --transcript`. With opt-in `[transcripts]`, a universal per-job tee is
+retained independently of cockpit; seat logs stay transient. Codex JSONL is readable live. Kimi stream-json is turn-buffered,
 and kimi-code 0.19.2 emits no usage. Claude currently emits one final JSON
 envelope, so its pane remains quiet until completion and then shows final text
 and usage. Shell output is redacted raw passthrough. Unknown or malformed lines
@@ -4257,10 +4269,11 @@ and pipeline progress stream are unchanged.
 
 On an interactive terminal, tool-specific icons, honest multi-line output
 previews, elapsed times, and lightweight narration markup make the stream easier
-to scan. Pipes and redirects retain the byte-stable plain format. While the tee
-log still exists, `gitmoot job transcript <id> --export md` creates a
-deterministic ANSI-free snapshot for an issue or pull request; add `--output`
-to write it to a file.
+to scan. Pipes and redirects retain the byte-stable plain format. `gitmoot job
+transcript <id> --export md` creates a deterministic ANSI-free snapshot;
+`--export jsonl` creates a schema-versioned redacted trajectory, and `job
+transcript --all ... --export jsonl` is the guarded bulk form. Raw retained logs
+are unredacted mode-`0600` files; export masking is best-effort, not a vault.
 
 Verified Codex command/file-change events and Kimi function tool calls/results
 use typed compact lines; other shapes retain the generic/raw path. Render-time
@@ -6761,6 +6774,10 @@ sub-cluster hub columns, enrolled agents as wells, progressive disclosure for
 deep cluster trees, and the fact-links / cross-repo / history header toggles.
 See the Learning section above for how facts are produced; Brain is where you
 read them.
+
+The changelog feed comes from `/api/brain/events`, whose `total` reports the
+exact append-only event count. Selecting an event loads `/api/brain/fact?id=ID`,
+which can return active, retired, or superseded facts for historical inspection.
 
 ## Agents
 
@@ -9580,6 +9597,31 @@ requires Landlock read-rules for `runtime-auth.env` (same-UID read is currently
 possible) — that is P3. Codex/Kimi custody and hard egress enforcement also
 remain P3.
 
+## Transcript Retention
+
+Runtime transcript retention is opt-in and invalid or missing configuration
+fails closed to disabled capture:
+
+```toml
+[transcripts]
+enabled = true
+retain = "168h"
+max_total_bytes = 2147483648
+```
+
+Enabled capture appends every engine-delivered job attempt (foreground, daemon,
+temporary session, ephemeral, and delegated jobs) to a private canonical log
+under `<home>/logs/jobs/`. Externally driven session jobs have no runtime
+subprocess and therefore no log. A home-scoped sweep removes settled logs after
+`retain`, then evicts the oldest settled logs when the total exceeds
+`max_total_bytes`; queued/running jobs and recently finalized jobs are protected.
+Seat logs remain transient. Expect roughly 440 MB/week at this host's observed
+rate, though workload output varies.
+
+Raw retained logs are mode `0600` and **unredacted on disk**. Treat the Gitmoot
+home as sensitive. JSONL exports redact known credential patterns best-effort,
+but that redaction is not a vault and cannot guarantee removal of every secret.
+
 ## Runtime Launch Sandbox
 
 ```sh
@@ -10667,7 +10709,8 @@ gitmoot job list --repo owner/repo   # add --json for machine-readable rows
 gitmoot job show <job-id>            # add --json for the full job + why-stuck detail
 gitmoot job watch <job-id>
 gitmoot job watch <job-id> --transcript [--log-path <path>] [--runtime codex|claude|kimi|kimi-cli|shell]
-gitmoot job transcript <job-id> --export md [--output <path>] [--log-path <path>] [--runtime codex|claude|kimi|kimi-cli|shell]
+gitmoot job transcript <job-id> --export md|jsonl [--output <path>] [--log-path <path>] [--runtime codex|claude|kimi|kimi-cli|shell]
+gitmoot job transcript --all [--state succeeded,failed] [--since 720h] --export jsonl [--output <path>]
 gitmoot job events <job-id>
 gitmoot job retry <job-id>
 gitmoot job gates <job-id>                                         # list resumable gates; add --json
@@ -10710,12 +10753,18 @@ completion; shell output passes through as redacted raw lines. Usage is labeled
 Malformed or unknown lines degrade individually to redacted capped raw output
 without stopping later lines.
 
-`job transcript <job-id> --export md` reads the same tee log as a snapshot and
-writes deterministic, ANSI-free Markdown to stdout. Add `--output <path>` to
-write a mode-`0600` file instead. The export includes user/assistant headings,
-model and elapsed details when reported, and fenced tool input/output. It does
-not fall back to lifecycle events: cockpit tee logs are removed after delivery
-today, so export fails clearly when the requested log is no longer retained.
+`job transcript <job-id> --export md` remains the deterministic, ANSI-free
+Markdown snapshot. `--export jsonl` emits schema-versioned, self-contained
+trajectory rows for every normalized event. Bulk export requires the explicit
+`--all` guard; `--state` and `--since` filter the created-time-then-id ordered
+stream. Bulk mode skips pre-retention or GC-missing logs and reports counts on
+stderr, while explicit single-job absence is an error. `--output <path>` uses a
+mode-`0600` temporary file plus atomic rename. Oversized runtime lines become
+marked truncated raw steps instead of aborting the export.
+
+JSONL export redacts every text-bearing event field with Gitmoot's best-effort
+credential masker and has no raw bypass. The source log remains unredacted and
+mode `0600`; best-effort export masking is not a vault.
 
 Verified Codex command/file-change events and Kimi function tool calls/results
 render as typed compact lines; unrecognized shapes keep the generic/raw
@@ -11697,6 +11746,10 @@ filters answer operational questions such as “what changed this week.” Valid
 `superseded` receipts from existing tombstones; `--dry-run` previews the work and
 repeat runs do not duplicate events. Edit details retain the previous content
 inline up to 2 KiB, then use a SHA-256 hash and 300-character preview.
+The read-only dashboard API exposes the same feed at
+`GET /api/brain/events?cursor=ID&limit=N`; its `total` is the exact append-only
+event count. `GET /api/brain/fact?id=ID` returns the selected fact even when it
+has been retired or superseded.
 
 > **Trust boundary.** Ingested Markdown is untrusted input — an
 > **indirect-prompt-injection vector**. Ingest records `trust_mark = low` on every
@@ -13615,9 +13668,11 @@ its progress; children inherit the cockpit setting from their parent, so one
 `--cockpit` on the root lights up the whole orchestra. The same panes are visible
 in the terminal (open the Herdr workspace) and on Telegram via the herdres bridge.
 
-The pane reads the cockpit-only tee log through `job watch --transcript`; this
-does not alter runtime invocation, result parsing, or the pipeline progress
-stream. Codex JSONL is readable live. Kimi stream-json is turn-buffered (and
+The pane reads its explicitly selected job or seat tee log through `job watch
+--transcript`; this does not alter runtime invocation, result parsing, or the
+pipeline progress stream. With opt-in `[transcripts]`, the same universal tee
+retains a private per-job append log even when no cockpit exists; seat logs stay
+transient. Codex JSONL is readable live. Kimi stream-json is turn-buffered (and
 kimi-code 0.19.2 emits no usage). Claude currently emits one final JSON envelope,
 so its pane remains quiet until completion and then shows final text and usage.
 Shell output is redacted raw passthrough. Unknown or malformed lines fail open
@@ -13627,6 +13682,11 @@ use typed compact lines; other shapes retain the generic/raw path. Render-time
 redaction is per-line best-effort defense in depth: a secret split across
 physical lines may be only partially masked, and the raw log plus external tail
 fallback remain unredacted.
+
+For offline trajectories, use `job transcript <id> --export jsonl` or the
+guarded bulk form `job transcript --all --state succeeded,failed --since 720h
+--export jsonl`. Exports are best-effort redacted (not a vault); retained source
+logs are unredacted `0600` files and retention has real disk cost.
 
 A cockpit pane is a **view, not the job**: closing a pane (in the terminal or
 from Telegram) tears down the visible surface but does NOT cancel the underlying
