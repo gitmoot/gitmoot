@@ -315,6 +315,16 @@ type Job struct {
 	CreatedAt string
 }
 
+// TranscriptJob is the narrow retention-GC projection. It intentionally omits
+// payload and every unrelated job column so a sweep never materializes large
+// prompts/results merely to decide whether a log file is protected or expired.
+type TranscriptJob struct {
+	ID        string
+	State     string
+	UpdatedAt string
+	CreatedAt string
+}
+
 type JobEvent struct {
 	JobID   string
 	Kind    string
@@ -2900,6 +2910,23 @@ func (s *Store) ListJobs(ctx context.Context) ([]Job, error) {
 		return nil, err
 	}
 	return scanJobs(rows)
+}
+
+func (s *Store) ListTranscriptJobs(ctx context.Context) ([]TranscriptJob, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, state, updated_at, created_at FROM jobs ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var jobs []TranscriptJob
+	for rows.Next() {
+		var job TranscriptJob
+		if err := rows.Scan(&job.ID, &job.State, &job.UpdatedAt, &job.CreatedAt); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
 }
 
 // ListJobsByType returns every job of the given type, with the SAME 14-column

@@ -145,6 +145,14 @@ func TestRuntimeJobRunnerComposesWrappersAboveCuratedBase(t *testing.T) {
 				t.Fatalf("wrapper inner = %T", wrap.Inner)
 			}
 		}},
+		{name: "nested wrapping env tee", outer: subprocess.WrappingRunner{Inner: subprocess.EnvInjectingRunner{Env: []string{"RELAY=yes"}, Inner: subprocess.TeeRunner{}}}, check: func(t *testing.T, got subprocess.Runner) {
+			wrap := got.(subprocess.WrappingRunner)
+			env := wrap.Inner.(subprocess.EnvInjectingRunner)
+			tee := env.Inner.(subprocess.TeeRunner)
+			if _, ok := tee.Inner.(subprocess.CuratedGroupRunner); !ok {
+				t.Fatalf("nested tee inner = %T", tee.Inner)
+			}
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

@@ -82,6 +82,14 @@ artifact_blobs = %q
 # model_gateway_allow_hosts = ["api.anthropic.com"]
 # keychain_path = "" # default: <base-home>/.config/gitmoot/keychain.env
 
+# [transcripts] is OFF by default. When enabled, raw unredacted runtime output
+# is retained in 0600 per-job append logs for deterministic trajectory export.
+# retain and max_total_bytes bound home-scoped garbage collection.
+# [transcripts]
+# enabled = false
+# retain = "168h"
+# max_total_bytes = 2147483648
+
 [parallel_sessions]
 same_session = "fork_temp_session"
 merge_back = "summary"

@@ -1002,9 +1002,11 @@ its progress; children inherit the cockpit setting from their parent, so one
 `--cockpit` on the root lights up the whole orchestra. The same panes are visible
 in the terminal (open the Herdr workspace) and on Telegram via the herdres bridge.
 
-The pane reads the cockpit-only tee log through `job watch --transcript`; this
-does not alter runtime invocation, result parsing, or the pipeline progress
-stream. Codex JSONL is readable live. Kimi stream-json is turn-buffered (and
+The pane reads its explicitly selected job or seat tee log through `job watch
+--transcript`; this does not alter runtime invocation, result parsing, or the
+pipeline progress stream. With opt-in `[transcripts]`, the same universal tee
+retains a private per-job append log even when no cockpit exists; seat logs stay
+transient. Codex JSONL is readable live. Kimi stream-json is turn-buffered (and
 kimi-code 0.19.2 emits no usage). Claude currently emits one final JSON envelope,
 so its pane remains quiet until completion and then shows final text and usage.
 Shell output is redacted raw passthrough. Unknown or malformed lines fail open
@@ -1014,6 +1016,11 @@ use typed compact lines; other shapes retain the generic/raw path. Render-time
 redaction is per-line best-effort defense in depth: a secret split across
 physical lines may be only partially masked, and the raw log plus external tail
 fallback remain unredacted.
+
+For offline trajectories, use `job transcript <id> --export jsonl` or the
+guarded bulk form `job transcript --all --state succeeded,failed --since 720h
+--export jsonl`. Exports are best-effort redacted (not a vault); retained source
+logs are unredacted `0600` files and retention has real disk cost.
 
 A cockpit pane is a **view, not the job**: closing a pane (in the terminal or
 from Telegram) tears down the visible surface but does NOT cancel the underlying

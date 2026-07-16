@@ -1905,6 +1905,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 			// outside daemonWorkflowEngine, which is rebuilt per repo/tick.
 			startMemoryHarvestLoop(ctx, paths, home, store, stdout)
 			startCockpitReconcileLoop(ctx, store, paths.Home, stdout)
+			startTranscriptRetentionLoop(ctx, paths, store, stdout)
 		}
 		// Heartbeat schedules (#533) reuse the normal job queue. Off-by-default: with
 		// no heartbeat sections the scan returns before any store touch. Skip it under
@@ -2021,6 +2022,7 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		// The single-repo daemon gets the same one-per-home sweep owner as the
 		// registered-repo supervisor; it is not attached to the per-tick engine.
 		startMemoryHarvestLoop(ctx, heartbeatPaths, home, store, stdout)
+		startTranscriptRetentionLoop(ctx, heartbeatPaths, store, stdout)
 	}
 	// Pipeline schedules (#681) fire in the single-repo daemon too, or a single-repo
 	// daemon would silently never advance/schedule pipelines. Off-by-default: with no
@@ -5297,6 +5299,28 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
 	}
+	// Opt-in retained capture is attached to the already-composed adapter so
+	// relay env, credential curation, gateway leases, Landlock, and pipeline
+	// progress all survive. Any open/composition failure is fail-open.
+	retainedLogPath, retainedLogFile, retainedLogErr := openRetainedTranscriptLog(w.ConfigHome, job.ID)
+	if retainedLogErr != nil {
+		writeLine(w.Stdout, "job %s transcript log open failed: %v", job.ID, retainedLogErr)
+	}
+	if retainedLogFile != nil {
+		teeAdapter, teeErr := appendDeliveryAdapterOutput(adapter, retainedLogFile)
+		if teeErr != nil {
+			_ = retainedLogFile.Close()
+			retainedLogFile = nil
+			writeLine(w.Stdout, "job %s transcript tee build failed: %v", job.ID, teeErr)
+		} else {
+			adapter = teeAdapter
+			defer func() {
+				if err := retainedLogFile.Close(); err != nil {
+					writeLine(w.Stdout, "job %s transcript log close failed: %v", job.ID, err)
+				}
+			}()
+		}
+	}
 	// Cockpit wrapping happens AFTER the runtime-session lock + checkout
 	// resolution so at most one live pane exists per held runtime session and the
 	// pane's CWD is the resolved worktree. It is strictly opt-in and best-effort:
@@ -5329,28 +5353,49 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		// is opened O_APPEND and is NOT removed per job (it persists for the root's
 		// life and is torn down by FinalizeRoot).
 		if maybeWrapCockpitAvailable(cp, payload.Cockpit, userOptedOff) {
-			var teeAdapter workflow.DeliveryAdapter
-			var logPath string
-			var logFile *os.File
-			if progressTracker != nil {
-				teeAdapter, logPath, logFile = w.cockpitLogAdapter(cp, agent, checkout, job.ID, meta.RootJobID, meta.PaneKey, seatMode, progressTracker)
+			if retainedLogFile != nil && !seatMode {
+				// Job-mode cockpit tails the canonical retained file. Presence alone
+				// never creates a pane; LogPath is set only inside this cockpit gate.
+				meta.LogPath = retainedLogPath
+			} else if retainedLogFile != nil && seatMode {
+				// Seat logs remain transient. Add the seat writer to the existing
+				// retained/progress runner chain without rebuilding the adapter.
+				seatPath, seatFile := w.cockpitSeatLogFile(cp, job.ID, meta.RootJobID, meta.PaneKey)
+				if seatFile != nil {
+					seatAdapter, seatErr := appendDeliveryAdapterOutput(adapter, seatFile)
+					if seatErr != nil {
+						_ = seatFile.Close()
+						writeLine(w.Stdout, "job %s cockpit seat tee build failed: %v", job.ID, seatErr)
+					} else {
+						adapter = seatAdapter
+						meta.LogPath = seatPath
+						defer func() { _ = seatFile.Close() }()
+					}
+				}
 			} else {
-				teeAdapter, logPath, logFile = w.cockpitLogAdapter(cp, agent, checkout, job.ID, meta.RootJobID, meta.PaneKey, seatMode)
-			}
-			if logFile != nil {
-				defer func() {
-					if err := logFile.Close(); err != nil {
-						writeLine(w.Stdout, "job %s cockpit log close failed: %v", job.ID, err)
-					}
-					// Job mode: the per-job log only backs a per-job pane torn down with
-					// the job, so remove it. Seat mode: keep the append log — it backs the
-					// persisted seat pane and is removed on root finalize.
-					if !seatMode {
-						_ = os.Remove(logPath)
-					}
-				}()
-				adapter = teeAdapter
-				meta.LogPath = logPath
+				var teeAdapter workflow.DeliveryAdapter
+				var logPath string
+				var logFile *os.File
+				if progressTracker != nil {
+					teeAdapter, logPath, logFile = w.cockpitLogAdapter(cp, agent, checkout, job.ID, meta.RootJobID, meta.PaneKey, seatMode, progressTracker)
+				} else {
+					teeAdapter, logPath, logFile = w.cockpitLogAdapter(cp, agent, checkout, job.ID, meta.RootJobID, meta.PaneKey, seatMode)
+				}
+				if logFile != nil {
+					defer func() {
+						if err := logFile.Close(); err != nil {
+							writeLine(w.Stdout, "job %s cockpit log close failed: %v", job.ID, err)
+						}
+						// Job mode: the per-job log only backs a per-job pane torn down with
+						// the job, so remove it. Seat mode: keep the append log — it backs the
+						// persisted seat pane and is removed on root finalize.
+						if !seatMode {
+							_ = os.Remove(logPath)
+						}
+					}()
+					adapter = teeAdapter
+					meta.LogPath = logPath
+				}
 			}
 		}
 		var unavailable bool
@@ -6106,27 +6151,35 @@ func (w jobWorker) cockpitLogAdapter(cp *cockpit.Cockpit, agent runtime.Agent, c
 // (unresolved path, mkdir, create, unsupported runtime) returns nils so the caller
 // falls back to the P0 pane.
 func (w jobWorker) cockpitSeatLogAdapter(cp *cockpit.Cockpit, agent runtime.Agent, checkout, jobID, rootJobID, paneKey string, additionalOutput ...io.Writer) (workflow.DeliveryAdapter, string, *os.File) {
+	logPath, logFile := w.cockpitSeatLogFile(cp, jobID, rootJobID, paneKey)
+	if logFile == nil {
+		return nil, "", nil
+	}
+	return w.cockpitTeeOnFile(agent, checkout, jobID, logPath, logFile, additionalOutput...)
+}
+
+func (w jobWorker) cockpitSeatLogFile(cp *cockpit.Cockpit, jobID, rootJobID, paneKey string) (string, *os.File) {
 	logPath := cp.SeatLogPath(rootJobID, paneKey)
 	if logPath == "" {
 		// Home unset (cockpit could not resolve GITMOOT_HOME): fall back to the P0
 		// pane rather than an unstable seat log.
-		return nil, "", nil
+		return "", nil
 	}
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
 		writeLine(w.Stdout, "job %s cockpit seat log dir create failed: %v", jobID, err)
-		return nil, "", nil
+		return "", nil
 	}
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		writeLine(w.Stdout, "job %s cockpit seat log open failed: %v", jobID, err)
-		return nil, "", nil
+		return "", nil
 	}
 	if err := logFile.Chmod(0o600); err != nil {
 		_ = logFile.Close()
 		writeLine(w.Stdout, "job %s cockpit seat log chmod failed: %v", jobID, err)
-		return nil, "", nil
+		return "", nil
 	}
-	return w.cockpitTeeOnFile(agent, checkout, jobID, logPath, logFile, additionalOutput...)
+	return logPath, logFile
 }
 
 // finalizeCockpitRootIfDone tears the root's cockpit down once the coordination
@@ -6465,6 +6518,22 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		return nil
 	}
 	adapter = wrapPipelineEnvDeliveryAdapter(w.Store, w.ConfigHome, payload, adapter)
+	// Temp-session delivery is a separate early-return path; attach the same
+	// append-only capture here or it would be absent from the trajectory corpus.
+	_, retainedLogFile, retainedLogErr := openRetainedTranscriptLog(w.ConfigHome, delegatedJob.ID)
+	if retainedLogErr != nil {
+		writeLine(w.Stdout, "job %s transcript log open failed: %v", delegatedJob.ID, retainedLogErr)
+	}
+	if retainedLogFile != nil {
+		teeAdapter, teeErr := appendDeliveryAdapterOutput(adapter, retainedLogFile)
+		if teeErr != nil {
+			_ = retainedLogFile.Close()
+			writeLine(w.Stdout, "job %s transcript tee build failed: %v", delegatedJob.ID, teeErr)
+		} else {
+			adapter = teeAdapter
+			defer func() { _ = retainedLogFile.Close() }()
+		}
+	}
 	if err := w.Store.MarkAgentInstanceRunning(ctx, started.Agent.Name, time.Now().UTC(), started.JobTimeout); err != nil {
 		if finishErr := w.finishQueuedJob(ctx, delegatedJob.ID, workflow.JobFailed, err); finishErr != nil {
 			return finishErr

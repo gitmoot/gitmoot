@@ -216,6 +216,31 @@ requires Landlock read-rules for `runtime-auth.env` (same-UID read is currently
 possible) — that is P3. Codex/Kimi custody and hard egress enforcement also
 remain P3.
 
+## Transcript Retention
+
+Runtime transcript retention is opt-in and invalid or missing configuration
+fails closed to disabled capture:
+
+```toml
+[transcripts]
+enabled = true
+retain = "168h"
+max_total_bytes = 2147483648
+```
+
+Enabled capture appends every engine-delivered job attempt (foreground, daemon,
+temporary session, ephemeral, and delegated jobs) to a private canonical log
+under `<home>/logs/jobs/`. Externally driven session jobs have no runtime
+subprocess and therefore no log. A home-scoped sweep removes settled logs after
+`retain`, then evicts the oldest settled logs when the total exceeds
+`max_total_bytes`; queued/running jobs and recently finalized jobs are protected.
+Seat logs remain transient. Expect roughly 440 MB/week at this host's observed
+rate, though workload output varies.
+
+Raw retained logs are mode `0600` and **unredacted on disk**. Treat the Gitmoot
+home as sensitive. JSONL exports redact known credential patterns best-effort,
+but that redaction is not a vault and cannot guarantee removal of every secret.
+
 ## Runtime Launch Sandbox
 
 ```sh
@@ -1303,7 +1328,8 @@ gitmoot job list --repo owner/repo   # add --json for machine-readable rows
 gitmoot job show <job-id>            # add --json for the full job + why-stuck detail
 gitmoot job watch <job-id>
 gitmoot job watch <job-id> --transcript [--log-path <path>] [--runtime codex|claude|kimi|kimi-cli|shell]
-gitmoot job transcript <job-id> --export md [--output <path>] [--log-path <path>] [--runtime codex|claude|kimi|kimi-cli|shell]
+gitmoot job transcript <job-id> --export md|jsonl [--output <path>] [--log-path <path>] [--runtime codex|claude|kimi|kimi-cli|shell]
+gitmoot job transcript --all [--state succeeded,failed] [--since 720h] --export jsonl [--output <path>]
 gitmoot job events <job-id>
 gitmoot job retry <job-id>
 gitmoot job gates <job-id>                                         # list resumable gates; add --json
@@ -1346,12 +1372,18 @@ completion; shell output passes through as redacted raw lines. Usage is labeled
 Malformed or unknown lines degrade individually to redacted capped raw output
 without stopping later lines.
 
-`job transcript <job-id> --export md` reads the same tee log as a snapshot and
-writes deterministic, ANSI-free Markdown to stdout. Add `--output <path>` to
-write a mode-`0600` file instead. The export includes user/assistant headings,
-model and elapsed details when reported, and fenced tool input/output. It does
-not fall back to lifecycle events: cockpit tee logs are removed after delivery
-today, so export fails clearly when the requested log is no longer retained.
+`job transcript <job-id> --export md` remains the deterministic, ANSI-free
+Markdown snapshot. `--export jsonl` emits schema-versioned, self-contained
+trajectory rows for every normalized event. Bulk export requires the explicit
+`--all` guard; `--state` and `--since` filter the created-time-then-id ordered
+stream. Bulk mode skips pre-retention or GC-missing logs and reports counts on
+stderr, while explicit single-job absence is an error. `--output <path>` uses a
+mode-`0600` temporary file plus atomic rename. Oversized runtime lines become
+marked truncated raw steps instead of aborting the export.
+
+JSONL export redacts every text-bearing event field with Gitmoot's best-effort
+credential masker and has no raw bypass. The source log remains unredacted and
+mode `0600`; best-effort export masking is not a vault.
 
 Verified Codex command/file-change events and Kimi function tool calls/results
 render as typed compact lines; unrecognized shapes keep the generic/raw

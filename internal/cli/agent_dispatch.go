@@ -383,6 +383,20 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}
+	// Foreground dispatch bypasses the daemon worker, so attach opt-in retained
+	// capture explicitly. Open/composition failures remain fail-open.
+	_, retainedLogFile, retainedLogErr := openRetainedTranscriptLog(request.Home, job.ID)
+	if retainedLogErr == nil && retainedLogFile != nil {
+		teeAdapter, teeErr := appendDeliveryAdapterOutput(adapter, retainedLogFile)
+		if teeErr != nil {
+			_ = retainedLogFile.Close()
+		} else if runtimeAdapter, ok := teeAdapter.(runtime.Adapter); ok {
+			adapter = runtimeAdapter
+			defer func() { _ = retainedLogFile.Close() }()
+		} else {
+			_ = retainedLogFile.Close()
+		}
+	}
 	if overrideRuntime != "" {
 		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "runtime_override", Message: jobRuntimeOverrideEventMessage(agent.Runtime, effectiveAgent, lockKey)}); err != nil {
 			return localAgentJobOutput{}, err
