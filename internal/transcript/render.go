@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -19,11 +21,12 @@ const (
 // tmux-pane portability (borrowed from the opencode/pi TUI conventions: dim =
 // finished machinery and metadata, red = failure, everything else stays calm).
 const (
-	sgrReset = "\x1b[0m"
-	sgrBold  = "\x1b[1m"
-	sgrDim   = "\x1b[90m"
-	sgrRed   = "\x1b[31m"
-	sgrCyan  = "\x1b[36m"
+	sgrReset  = "\x1b[0m"
+	sgrBold   = "\x1b[1m"
+	sgrDim    = "\x1b[90m"
+	sgrRed    = "\x1b[31m"
+	sgrCyan   = "\x1b[36m"
+	sgrYellow = "\x1b[33m"
 )
 
 // Renderer writes normalized events as redacted, bounded human-readable lines.
@@ -97,28 +100,52 @@ func (r *Renderer) renderStyled(event Event) error {
 			}
 		}
 		lines := strings.Split(cleanBlock(event.Text, renderFieldLimit), "\n")
-		line = "\u25cf " + lines[0]
+		line = "\u25cf " + styledNarrationLine(lines[0])
 		for _, cont := range lines[1:] {
-			line += "\n  " + cont
+			line += "\n  " + styledNarrationLine(cont)
 		}
 	case KindToolCall:
-		line = sgrCyan + "\u25b8 " + sgrReset + sgrBold + cleanField(event.Name, renderDigestLimit) + sgrReset
+		icon := event.ToolIcon
+		if icon == "" {
+			icon = "\u2699"
+		}
+		line = sgrCyan + icon + " " + sgrReset + sgrBold + cleanField(event.Name, renderDigestLimit) + sgrReset
 		if digest := cleanField(event.InputDigest, renderDigestLimit); digest != "" {
 			line += " " + sgrDim + digest + sgrReset
 		}
 	case KindToolResult:
 		status := cleanField(event.Status, renderDigestLimit)
-		digest := cleanTailField(event.OutputDigest, renderDigestLimit)
-		if strings.Contains(status, "fail") {
+		statusLower := strings.ToLower(status)
+		cancelled := strings.Contains(statusLower, "cancel")
+		if cancelled {
+			line = sgrYellow + "\u25c2 " + status + sgrReset
+		} else if strings.Contains(statusLower, "fail") || strings.Contains(statusLower, "error") {
 			line = sgrRed + "\u25c2 " + status + sgrReset
 		} else {
 			line = sgrDim + "\u25c2 " + status + sgrReset
 		}
-		if digest != "" {
-			line += "\n" + sgrDim + "  \u21b3 " + digest + sgrReset
+		preview := styledOutputPreview(event.OutputDigest, event.Preview, event.PreviewLines)
+		for i, outputLine := range preview {
+			prefix := "    "
+			if i == 0 {
+				prefix = "  \u21b3 "
+			}
+			line += "\n" + sgrDim + prefix + outputLine + sgrReset
+		}
+		if event.Duration > 0 {
+			durationLine := "  Took " + formatDuration(event.Duration)
+			if cancelled {
+				durationLine += " (cancelled)"
+				line += "\n" + sgrYellow + durationLine + sgrReset
+			} else {
+				line += "\n" + sgrDim + durationLine + sgrReset
+			}
 		}
 	case KindUsage:
 		line = sgrDim + fmt.Sprintf("\u2191%s \u2193%s tokens (latest reported)", formatTokens(event.InputTokens), formatTokens(event.OutputTokens)) + sgrReset
+		if event.Duration > 0 {
+			line += " " + sgrDim + "\u00b7 Took " + formatDuration(event.Duration) + sgrReset
+		}
 	case KindLifecycle:
 		line = "\u2022 " + cleanField(event.Phase, renderDigestLimit)
 		if detail := cleanField(event.Detail, renderFieldLimit); detail != "" {
@@ -133,6 +160,114 @@ func (r *Renderer) renderStyled(event Event) error {
 	r.wroteAny = true
 	_, err := fmt.Fprintln(r.w, line)
 	return err
+}
+
+func styledOutputPreview(value string, mode PreviewMode, limit int) []string {
+	value = workflow.RedactCommentText(value)
+	value = strings.ReplaceAll(value, "\r", "")
+	value = strings.TrimRight(value, "\n")
+	if value == "" {
+		return nil
+	}
+	lines := strings.Split(value, "\n")
+	if limit <= 0 {
+		limit = 10
+	}
+	if len(lines) <= limit {
+		return cleanPreviewLines(lines)
+	}
+	omitted := len(lines) - limit
+	if mode == PreviewTail {
+		result := []string{fmt.Sprintf("... (%d earlier lines)", omitted)}
+		return append(result, cleanPreviewLines(lines[len(lines)-limit:])...)
+	}
+	result := cleanPreviewLines(lines[:limit])
+	return append(result, fmt.Sprintf("... (%d more lines)", omitted))
+}
+
+func cleanPreviewLines(lines []string) []string {
+	cleaned := make([]string, len(lines))
+	for i, line := range lines {
+		cleaned[i] = truncateUTF8(line, renderDigestLimit)
+	}
+	return cleaned
+}
+
+// styledNarrationLine implements the deliberately small markdown subset used
+// in scrollback panes. It is line-oriented and cannot consume surrounding text.
+func styledNarrationLine(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if headingText, ok := styledHeading(trimmed); ok {
+		return sgrBold + styleInlineCode(headingText) + sgrReset
+	}
+	if markerLen := bulletMarkerLen(line); markerLen > 0 {
+		return sgrCyan + line[:markerLen] + sgrReset + styleInlineCode(line[markerLen:])
+	}
+	return styleInlineCode(line)
+}
+
+func styledHeading(line string) (string, bool) {
+	i := 0
+	for i < len(line) && line[i] == '#' {
+		i++
+	}
+	if i == 0 || i > 6 || i >= len(line) || line[i] != ' ' {
+		return "", false
+	}
+	return line[i+1:], true
+}
+
+func bulletMarkerLen(line string) int {
+	if strings.HasPrefix(line, "- ") || strings.HasPrefix(line, "* ") {
+		return 2
+	}
+	i := 0
+	for i < len(line) && unicode.IsDigit(rune(line[i])) {
+		i++
+	}
+	if i > 0 && i+1 < len(line) && line[i] == '.' && line[i+1] == ' ' {
+		return i + 2
+	}
+	return 0
+}
+
+func styleInlineCode(line string) string {
+	parts := strings.Split(line, "`")
+	if len(parts) == 1 {
+		return line
+	}
+	var out strings.Builder
+	for i, part := range parts {
+		if i > 0 {
+			out.WriteByte('`')
+		}
+		if i%2 == 1 {
+			out.WriteString(sgrCyan)
+			out.WriteString(part)
+			out.WriteString(sgrReset)
+		} else {
+			out.WriteString(part)
+		}
+	}
+	return out.String()
+}
+
+func formatDuration(duration time.Duration) string {
+	if duration < time.Millisecond {
+		return "<1ms"
+	}
+	if duration < time.Second {
+		return fmt.Sprintf("%dms", duration.Round(time.Millisecond)/time.Millisecond)
+	}
+	if duration < 10*time.Second {
+		return fmt.Sprintf("%.1fs", duration.Seconds())
+	}
+	if duration < time.Minute {
+		return fmt.Sprintf("%.0fs", duration.Seconds())
+	}
+	minutes := int(duration / time.Minute)
+	seconds := int((duration % time.Minute) / time.Second)
+	return fmt.Sprintf("%dm%02ds", minutes, seconds)
 }
 
 // formatTokens compacts counts the way agent TUIs do: 812, 1.2k, 42k, 1.7M.
