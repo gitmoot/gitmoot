@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/transcript"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -801,7 +802,7 @@ func (c *Cockpit) seatLogRootDir(rootJobID string) string {
 // path-safe token keeps it one file in <home>/logs/jobs/. It reuses seatSlug so
 // the per-job and per-seat sanitizers stay in lockstep.
 func SafeLogName(jobID string) string {
-	return seatSlug(jobID)
+	return transcript.LegacyLogName(jobID)
 }
 
 // seatSlug maps a pane key (e.g. an agent name) to a filesystem-safe slug for the

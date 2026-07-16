@@ -1,8 +1,6 @@
 package cli
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -17,7 +15,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gitmoot/gitmoot/internal/cockpit"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/transcript"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -68,7 +65,8 @@ func printJobUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot job show <id> [--json]")
 	fmt.Fprintln(w, "  gitmoot job events <id>")
 	fmt.Fprintln(w, "  gitmoot job watch <id> [--poll 1s] [--json] [--transcript [--log-path path] [--runtime runtime]]")
-	fmt.Fprintln(w, "  gitmoot job transcript <id> --export md [--output path] [--log-path path] [--runtime runtime]")
+	fmt.Fprintln(w, "  gitmoot job transcript <id> --export md|jsonl [--output path] [--log-path path] [--runtime runtime]")
+	fmt.Fprintln(w, "  gitmoot job transcript --all [--state succeeded,failed] [--since 720h] --export jsonl [--output path]")
 	fmt.Fprintln(w, "  gitmoot job run <id>")
 	fmt.Fprintln(w, "  gitmoot job retry <id>")
 	fmt.Fprintln(w, "  gitmoot job gates <id> [--json]")
@@ -414,7 +412,7 @@ func runJobTranscriptWatch(jobID, home, requestedLogPath, requestedRuntime strin
 			fmt.Fprintf(stderr, "job watch transcript: %v\n", err)
 			return 1
 		}
-		logPath = filepath.Join(paths.Logs, "jobs", cockpit.SafeLogName(jobID)+".log")
+		logPath = transcript.ResolveJobLogPath(paths.Logs, jobID)
 		if _, err := os.Stat(logPath); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				fmt.Fprintln(stdout, "transcript unavailable; showing job events")
@@ -481,75 +479,259 @@ func runJobTranscript(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("job transcript", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	exportFormat := fs.String("export", "", "export format (md)")
+	exportFormat := fs.String("export", "", "export format (md or jsonl)")
 	outputPath := fs.String("output", "", "write export to this file instead of stdout")
 	logPathFlag := fs.String("log-path", "", "cockpit-internal transcript log path")
 	runtimeNameFlag := fs.String("runtime", "", "cockpit-internal transcript runtime")
-	jobID, ok := parseSingleJobID(fs, args, stderr, "job transcript")
-	if !ok {
-		return parseSingleJobIDExitCode(args)
+	all := fs.Bool("all", false, "export every job matching the bulk filters")
+	stateFilter := fs.String("state", "", "bulk mode: comma-separated job states")
+	sinceValue := fs.String("since", "", "bulk mode: jobs created within this duration")
+	jobID := ""
+	parseArgs := args
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		jobID = args[0]
+		parseArgs = args[1:]
 	}
-	if strings.TrimSpace(*exportFormat) != "md" {
-		fmt.Fprintln(stderr, "job transcript: --export md is required")
+	if err := fs.Parse(parseArgs); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "job transcript accepts one id or --all")
+		return 2
+	}
+	if jobID == "" && !*all {
+		fmt.Fprintln(stderr, "job transcript: provide one id or use --all for bulk export")
+		return 2
+	}
+	if jobID != "" && *all {
+		fmt.Fprintln(stderr, "job transcript: an id and --all are mutually exclusive")
+		return 2
+	}
+	format := strings.TrimSpace(*exportFormat)
+	if format != "md" && format != "jsonl" {
+		fmt.Fprintln(stderr, "job transcript: --export md or --export jsonl is required")
+		return 2
+	}
+	if *all && format != "jsonl" {
+		fmt.Fprintln(stderr, "job transcript: --all requires --export jsonl")
+		return 2
+	}
+	if !*all && (strings.TrimSpace(*stateFilter) != "" || strings.TrimSpace(*sinceValue) != "") {
+		fmt.Fprintln(stderr, "job transcript: --state and --since require --all")
+		return 2
+	}
+	if *all && (strings.TrimSpace(*logPathFlag) != "" || strings.TrimSpace(*runtimeNameFlag) != "") {
+		fmt.Fprintln(stderr, "job transcript: --log-path and --runtime are single-job options")
 		return 2
 	}
 
-	logPath := strings.TrimSpace(*logPathFlag)
-	if logPath == "" {
-		paths, err := pathsFromFlag(*home)
-		if err != nil {
-			fmt.Fprintf(stderr, "job transcript: %v\n", err)
-			return 1
-		}
-		logPath = filepath.Join(paths.Logs, "jobs", cockpit.SafeLogName(jobID)+".log")
+	var bulkExported, bulkMissing int
+	render := func(w io.Writer) error {
+		return withStore(*home, func(store *db.Store) error {
+			if *all {
+				var err error
+				bulkExported, bulkMissing, err = exportAllJobTranscripts(context.Background(), store, *home, strings.TrimSpace(*stateFilter), strings.TrimSpace(*sinceValue), w)
+				return err
+			}
+			return exportOneJobTranscript(context.Background(), store, *home, jobID, format, strings.TrimSpace(*logPathFlag), strings.TrimSpace(*runtimeNameFlag), w)
+		})
 	}
-
-	var rendered bytes.Buffer
-	err := withStore(*home, func(store *db.Store) error {
-		job, err := store.GetJob(context.Background(), jobID)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("job %q not found", jobID)
-			}
-			return err
-		}
-		payload, err := daemonJobPayload(job)
-		if err != nil {
-			return err
-		}
-		runtimeName, err := resolveTranscriptRuntime(context.Background(), store, job, payload, *runtimeNameFlag)
-		if err != nil {
-			return err
-		}
-		translator, err := transcript.NewSnapshotTranslator(runtimeName)
-		if err != nil {
-			return err
-		}
-		events, err := readTranscriptEvents(logPath, translator)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("transcript log unavailable at %s (cockpit logs may already have been delivered and removed)", logPath)
-			}
-			return err
-		}
-		return transcript.RenderMarkdown(&rendered, transcriptHeader(context.Background(), store, job, payload, runtimeName), events)
-	})
+	path := strings.TrimSpace(*outputPath)
+	var err error
+	if path != "" && path != "-" {
+		err = writeTranscriptExport(path, render)
+	} else {
+		err = render(stdout)
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "job transcript: %v\n", err)
 		return 1
 	}
-	if path := strings.TrimSpace(*outputPath); path != "" && path != "-" {
-		if err := writeTranscriptExport(path, rendered.Bytes()); err != nil {
-			fmt.Fprintf(stderr, "job transcript: %v\n", err)
-			return 1
-		}
-		return 0
-	}
-	if _, err := stdout.Write(rendered.Bytes()); err != nil {
-		fmt.Fprintf(stderr, "job transcript: %v\n", err)
-		return 1
+	if *all {
+		fmt.Fprintf(stderr, "job transcript: exported %d jobs; skipped %d missing logs\n", bulkExported, bulkMissing)
 	}
 	return 0
+}
+
+func exportOneJobTranscript(ctx context.Context, store *db.Store, home, jobID, format, requestedLogPath, requestedRuntime string, w io.Writer) error {
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("job %q not found", jobID)
+		}
+		return err
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		return err
+	}
+	runtimeName, err := resolveTranscriptRuntime(ctx, store, job, payload, requestedRuntime)
+	if err != nil {
+		return err
+	}
+	logPath := requestedLogPath
+	if logPath == "" {
+		paths, err := pathsFromFlag(home)
+		if err != nil {
+			return err
+		}
+		logPath = transcript.ResolveJobLogPath(paths.Logs, job.ID)
+	}
+	translator, err := transcript.NewSnapshotTranslator(runtimeName)
+	if err != nil {
+		return err
+	}
+	events, err := readTranscriptEvents(logPath, translator)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("transcript log unavailable at %s (cockpit logs may already have been delivered and removed)", logPath)
+		}
+		return err
+	}
+	if format == "md" {
+		return transcript.RenderMarkdown(w, transcriptHeader(ctx, store, job, payload, runtimeName), events)
+	}
+	attempts, err := transcriptAttemptCount(ctx, store, job.ID)
+	if err != nil {
+		return err
+	}
+	return transcript.ExportJSONL(w, transcriptExportMetadata(job, payload, runtimeName, attempts), events)
+}
+
+func exportAllJobTranscripts(ctx context.Context, store *db.Store, home, stateValue, sinceValue string, w io.Writer) (int, int, error) {
+	states, err := parseTranscriptStates(stateValue)
+	if err != nil {
+		return 0, 0, err
+	}
+	var since time.Time
+	if sinceValue != "" {
+		duration, err := parseOlderThanDuration(sinceValue)
+		if err != nil || duration <= 0 {
+			if err == nil {
+				err = errors.New("must be positive")
+			}
+			return 0, 0, fmt.Errorf("invalid --since %q: %w", sinceValue, err)
+		}
+		since = time.Now().UTC().Add(-duration)
+	}
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	filtered := jobs[:0]
+	for _, job := range jobs {
+		if len(states) > 0 && !states[job.State] {
+			continue
+		}
+		if !since.IsZero() {
+			created := parseTranscriptStoreTime(job.CreatedAt)
+			if created.IsZero() || created.Before(since) {
+				continue
+			}
+		}
+		filtered = append(filtered, job)
+	}
+	sort.Slice(filtered, func(i, j int) bool {
+		left, right := parseTranscriptStoreTime(filtered[i].CreatedAt), parseTranscriptStoreTime(filtered[j].CreatedAt)
+		if left.Equal(right) {
+			return filtered[i].ID < filtered[j].ID
+		}
+		return left.Before(right)
+	})
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return 0, 0, err
+	}
+	exported, missing := 0, 0
+	for _, job := range filtered {
+		payload, err := daemonJobPayload(job)
+		if err != nil {
+			return exported, missing, err
+		}
+		runtimeName, err := resolveTranscriptRuntime(ctx, store, job, payload, "")
+		if err != nil {
+			return exported, missing, err
+		}
+		translator, err := transcript.NewSnapshotTranslator(runtimeName)
+		if err != nil {
+			return exported, missing, err
+		}
+		events, err := readTranscriptEvents(transcript.ResolveJobLogPath(paths.Logs, job.ID), translator)
+		if errors.Is(err, os.ErrNotExist) {
+			missing++
+			continue
+		}
+		if err != nil {
+			return exported, missing, err
+		}
+		attempts, err := transcriptAttemptCount(ctx, store, job.ID)
+		if err != nil {
+			return exported, missing, err
+		}
+		if err := transcript.ExportJSONL(w, transcriptExportMetadata(job, payload, runtimeName, attempts), events); err != nil {
+			return exported, missing, err
+		}
+		exported++
+	}
+	return exported, missing, nil
+}
+
+func parseTranscriptStates(value string) (map[string]bool, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+	allowed := map[string]bool{
+		string(workflow.JobQueued): true, string(workflow.JobRunning): true,
+		string(workflow.JobBlocked): true, string(workflow.JobFailed): true,
+		string(workflow.JobSucceeded): true, string(workflow.JobCancelled): true,
+	}
+	states := make(map[string]bool)
+	for _, state := range strings.Split(value, ",") {
+		state = strings.TrimSpace(state)
+		if !allowed[state] {
+			return nil, fmt.Errorf("invalid --state value %q", state)
+		}
+		states[state] = true
+	}
+	return states, nil
+}
+
+func transcriptAttemptCount(ctx context.Context, store *db.Store, jobID string) (int, error) {
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, event := range events {
+		if event.Kind == string(workflow.JobRunning) {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func transcriptExportMetadata(job db.Job, payload workflow.JobPayload, runtimeName string, attempts int) transcript.ExportMetadata {
+	root := payload.RootJobID
+	if strings.TrimSpace(root) == "" {
+		root = job.ID
+	}
+	decision := ""
+	if payload.Result != nil {
+		decision = payload.Result.Decision
+	}
+	ended := ""
+	if workflow.IsSettledJobState(job.State) {
+		ended = job.UpdatedAt
+	}
+	return transcript.ExportMetadata{
+		JobID: job.ID, RootJobID: root, ParentJobID: job.ParentJobID,
+		DelegationID: job.DelegationID, Runtime: runtimeName, Agent: job.Agent,
+		Action: job.Type, Repo: payload.Repo, Outcome: job.State, Decision: decision,
+		AttemptCount: attempts, CreatedAt: job.CreatedAt, EndedAt: ended,
+	}
 }
 
 func readTranscriptEvents(path string, translator transcript.Translator) ([]transcript.Event, error) {
@@ -558,33 +740,40 @@ func readTranscriptEvents(path string, translator transcript.Translator) ([]tran
 		return nil, err
 	}
 	defer file.Close()
-	var events []transcript.Event
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 0, 64*1024), transcript.MaxLogicalLineBytes)
-	for scanner.Scan() {
-		events = append(events, translator.Translate(scanner.Text())...)
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	events = append(events, translator.Flush()...)
-	return events, nil
+	return transcript.ReadSnapshotEvents(file, translator)
 }
 
-func writeTranscriptExport(path string, content []byte) error {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+func writeTranscriptExport(path string, render func(io.Writer) error) error {
+	dir := filepath.Dir(path)
+	temp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}
-	if err := file.Chmod(0o600); err != nil {
-		file.Close()
+	tempPath := temp.Name()
+	keep := false
+	defer func() {
+		_ = temp.Close()
+		if !keep {
+			_ = os.Remove(tempPath)
+		}
+	}()
+	if err := temp.Chmod(0o600); err != nil {
 		return err
 	}
-	if _, err := file.Write(content); err != nil {
-		file.Close()
+	if err := render(temp); err != nil {
 		return err
 	}
-	return file.Close()
+	if err := temp.Sync(); err != nil {
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return err
+	}
+	keep = true
+	return nil
 }
 
 func resolveTranscriptRuntime(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload, requested string) (string, error) {

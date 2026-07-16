@@ -59,6 +59,8 @@ gitmoot job list
 gitmoot job show <job-id>
 gitmoot job watch <job-id>
 gitmoot job watch <job-id> --transcript   # readable cockpit tee log; falls back to events if unavailable
+gitmoot job transcript <job-id> --export md|jsonl
+gitmoot job transcript --all --state succeeded,failed --since 720h --export jsonl
 gitmoot job retry <job-id>
 gitmoot job cancel <job-id>               # abandon one queued|running|blocked job
 gitmoot job cancel --state blocked --older-than 7d --yes   # bulk-dismiss a blocked backlog (dry-run without --yes)
@@ -70,6 +72,15 @@ gitmoot daemon start --repo owner/repo --poll 30s --workers 1
 gitmoot daemon start
 gitmoot daemon status
 ```
+
+Transcript retention is opt-in through `[transcripts] enabled = true` with a
+default `retain = "168h"` and `max_total_bytes = 2147483648`. It captures
+foreground, daemon, temporary-session, ephemeral, and delegated runtime jobs;
+externally driven session jobs have no subprocess to capture. Raw retained logs
+are unredacted mode-`0600` files, seat logs remain transient, and observed disk
+cost on this host is roughly 440 MB/week. JSONL exports redact known credential
+patterns best-effort, but that masking is not a vault. `--output` writes through
+a private temporary file and atomic rename.
 
 Goal import turns Markdown headings shaped like `### Task N: Title` into local
 planned tasks. `task run` starts one task branch in a dedicated worktree,

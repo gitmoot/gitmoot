@@ -211,46 +211,46 @@ func graftRuntimeBaseRunner(outer subprocess.Runner, curated subprocess.Runner) 
 	case *subprocess.GroupRunner:
 		return curated
 	case subprocess.TeeRunner:
-		if runner.Inner == nil {
-			runner.Inner = curated.(subprocess.StreamRunner)
-		} else if _, ok := runner.Inner.(subprocess.GroupRunner); ok {
-			runner.Inner = curated.(subprocess.StreamRunner)
+		inner := subprocess.Runner(runner.Inner)
+		if inner == nil {
+			inner = subprocess.GroupRunner{}
+		}
+		if grafted, ok := graftRuntimeBaseRunner(inner, curated).(subprocess.StreamRunner); ok {
+			runner.Inner = grafted
 		}
 		return runner
 	case *subprocess.TeeRunner:
-		if runner.Inner == nil {
-			runner.Inner = curated.(subprocess.StreamRunner)
-		} else if _, ok := runner.Inner.(subprocess.GroupRunner); ok {
-			runner.Inner = curated.(subprocess.StreamRunner)
+		inner := subprocess.Runner(runner.Inner)
+		if inner == nil {
+			inner = subprocess.GroupRunner{}
+		}
+		if grafted, ok := graftRuntimeBaseRunner(inner, curated).(subprocess.StreamRunner); ok {
+			runner.Inner = grafted
 		}
 		return runner
 	case subprocess.EnvInjectingRunner:
 		if runner.Inner == nil {
-			runner.Inner = curated
-		} else if _, ok := runner.Inner.(subprocess.GroupRunner); ok {
-			runner.Inner = curated
+			runner.Inner = subprocess.GroupRunner{}
 		}
+		runner.Inner = graftRuntimeBaseRunner(runner.Inner, curated)
 		return runner
 	case *subprocess.EnvInjectingRunner:
 		if runner.Inner == nil {
-			runner.Inner = curated
-		} else if _, ok := runner.Inner.(subprocess.GroupRunner); ok {
-			runner.Inner = curated
+			runner.Inner = subprocess.GroupRunner{}
 		}
+		runner.Inner = graftRuntimeBaseRunner(runner.Inner, curated)
 		return runner
 	case subprocess.WrappingRunner:
 		if runner.Inner == nil {
-			runner.Inner = curated
-		} else if _, ok := runner.Inner.(subprocess.GroupRunner); ok {
-			runner.Inner = curated
+			runner.Inner = subprocess.GroupRunner{}
 		}
+		runner.Inner = graftRuntimeBaseRunner(runner.Inner, curated)
 		return runner
 	case *subprocess.WrappingRunner:
 		if runner.Inner == nil {
-			runner.Inner = curated
-		} else if _, ok := runner.Inner.(subprocess.GroupRunner); ok {
-			runner.Inner = curated
+			runner.Inner = subprocess.GroupRunner{}
 		}
+		runner.Inner = graftRuntimeBaseRunner(runner.Inner, curated)
 		return runner
 	default:
 		// Explicit custom/fake runners remain authoritative test and extension seams.

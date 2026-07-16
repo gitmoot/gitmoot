@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/transcript"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -356,7 +358,7 @@ func TestRunJobTranscriptMarkdownExportStdoutAndFile(t *testing.T) {
 
 func TestRunJobTranscriptRequiresMarkdownAndRetainedLog(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"job", "transcript", "job", "--export", "text"}, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "--export md is required") {
+	if code := Run([]string{"job", "transcript", "job", "--export", "text"}, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "--export md or --export jsonl is required") {
 		t.Fatalf("format refusal code=%d stderr=%q", code, stderr.String())
 	}
 
@@ -369,6 +371,72 @@ func TestRunJobTranscriptRequiresMarkdownAndRetainedLog(t *testing.T) {
 	code := Run([]string{"job", "transcript", "job-no-log", "--home", home, "--export", "md", "--runtime", runtime.ShellRuntime}, &stdout, &stderr)
 	if code != 1 || !strings.Contains(stderr.String(), "cockpit logs may already have been delivered and removed") {
 		t.Fatalf("missing-log code=%d stderr=%q", code, stderr.String())
+	}
+}
+
+func TestRunJobTranscriptJSONLSingleBulkFiltersAndAtomicOutput(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	if err := store.UpsertAgent(context.Background(), db.Agent{Name: "shell-export", Runtime: runtime.ShellRuntime}); err != nil {
+		t.Fatal(err)
+	}
+	secret := "ghp_123456789012345678901234567890"
+	for _, job := range []db.Job{
+		{ID: "job-a", Agent: "shell-export", Type: "ask", State: string(workflow.JobSucceeded), Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Result: &workflow.AgentResult{Decision: "approved"}})},
+		{ID: "job-b", Agent: "shell-export", Type: "ask", State: string(workflow.JobFailed), Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo"})},
+		{ID: "job-c", Agent: "shell-export", Type: "ask", State: string(workflow.JobQueued), Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo"})},
+	} {
+		seedCLIJob(t, store, job, job.State)
+	}
+	for i := 0; i < 2; i++ {
+		if err := store.AddJobEvent(context.Background(), db.JobEvent{JobID: "job-a", Kind: string(workflow.JobRunning), Message: "attempt"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	paths := config.PathsForHome(home)
+	logPath := transcript.JobLogPath(paths.Logs, "job-a")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte("token="+secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"job", "transcript", "job-a", "--home", home, "--export", "jsonl"}, &stdout, &stderr)
+	if code != 0 || strings.Contains(stdout.String(), secret) || !strings.Contains(stdout.String(), `"attempt_count":2`) || !strings.Contains(stdout.String(), "[REDACTED]") {
+		t.Fatalf("single JSONL code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	var row transcript.ExportRow
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &row); err != nil || row.JobID != "job-a" || row.Outcome != string(workflow.JobSucceeded) {
+		t.Fatalf("single row=%+v err=%v", row, err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"job", "transcript", "--home", home, "--export", "jsonl", "--state", "succeeded"}, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "use --all") {
+		t.Fatalf("all guard code=%d stderr=%q", code, stderr.String())
+	}
+
+	output := filepath.Join(t.TempDir(), "trajectory.jsonl")
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"job", "transcript", "--all", "--home", home, "--state", "succeeded,failed", "--since", "720h", "--export", "jsonl", "--output", output}, &stdout, &stderr)
+	if code != 0 || !strings.Contains(stderr.String(), "exported 1 jobs; skipped 1 missing logs") {
+		t.Fatalf("bulk code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	written, err := os.ReadFile(output)
+	if err != nil || !bytes.Contains(written, []byte(`"job_id":"job-a"`)) || bytes.Contains(written, []byte(`"job_id":"job-c"`)) {
+		t.Fatalf("bulk output=%q err=%v", written, err)
+	}
+	info, err := os.Stat(output)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("bulk output mode=%v err=%v", info.Mode().Perm(), err)
+	}
+	entries, err := os.ReadDir(filepath.Dir(output))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("atomic temp cleanup entries=%v err=%v", entries, err)
 	}
 }
 
@@ -497,6 +565,78 @@ func TestRunJobRunUsesDaemonWorkerInternals(t *testing.T) {
 	}
 	if job.State != string(workflow.JobSucceeded) || !strings.Contains(job.Payload, `"summary":"done"`) {
 		t.Fatalf("job after run = %+v", job)
+	}
+	if _, err := os.Stat(filepath.Join(config.PathsForHome(home).Logs, "jobs")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("disabled transcript capture changed daemon lifecycle: %v", err)
+	}
+}
+
+func TestTranscriptRetentionForegroundAndDaemonShellE2E(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HERDR_ENV", "")
+	t.Setenv("HERDR_SOCKET_PATH", filepath.Join(t.TempDir(), "throwaway.sock"))
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	paths := config.PathsForHome(home)
+	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+"\n[transcripts]\nenabled = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checkout := t.TempDir()
+	runGit(t, checkout, "init")
+	runGit(t, checkout, "branch", "-m", "main")
+	runGit(t, checkout, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	script := `printf '%s\n' '{"gitmoot_result":{"decision":"approved","summary":"captured","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`
+	seedDaemonWorkerAgent(t, store, "capture-shell", runtime.ShellRuntime, script, []string{"ask"}, "owner/repo")
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"agent", "ask", "capture-shell", "foreground", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("foreground ask code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	jobs, err := store.ListJobs(context.Background())
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("foreground jobs=%v err=%v", jobs, err)
+	}
+	foregroundPath := transcript.JobLogPath(paths.Logs, jobs[0].ID)
+	if body, err := os.ReadFile(foregroundPath); err != nil || !bytes.Contains(body, []byte(`"summary":"captured"`)) {
+		t.Fatalf("foreground log=%q err=%v", body, err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"agent", "ask", "capture-shell", "background", "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("background enqueue code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	jobs, err = store.ListJobs(context.Background())
+	if err != nil || len(jobs) != 2 {
+		t.Fatalf("all jobs=%v err=%v", jobs, err)
+	}
+	var queuedID string
+	for _, job := range jobs {
+		if job.State == string(workflow.JobQueued) {
+			queuedID = job.ID
+		}
+	}
+	if queuedID == "" {
+		t.Fatalf("no queued background job: %+v", jobs)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"job", "run", queuedID, "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("daemon-path run code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	daemonPath := transcript.JobLogPath(paths.Logs, queuedID)
+	if body, err := os.ReadFile(daemonPath); err != nil || !bytes.Contains(body, []byte(`"summary":"captured"`)) {
+		t.Fatalf("daemon log=%q err=%v", body, err)
+	}
+	for _, path := range []string{foregroundPath, daemonPath} {
+		info, err := os.Stat(path)
+		if err != nil || info.Mode().Perm() != 0o600 {
+			t.Fatalf("retained mode path=%s mode=%v err=%v", path, info.Mode().Perm(), err)
+		}
 	}
 }
 

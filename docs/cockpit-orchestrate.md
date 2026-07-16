@@ -22,8 +22,9 @@ pane labeled `<agent> · d<depth> · <branch>`, and that pane streams the child'
 progress while the job runs. Children inherit the cockpit setting from their
 parent, so a single `--cockpit` on the root lights up the whole orchestra.
 
-Each pane renders the cockpit-only tee log through `gitmoot job watch
---transcript`. Codex JSONL is readable live. Kimi stream-json is turn-buffered,
+Each pane renders its explicitly selected job or seat tee log through `gitmoot
+job watch --transcript`. With opt-in `[transcripts]`, a universal per-job tee is
+retained independently of cockpit; seat logs stay transient. Codex JSONL is readable live. Kimi stream-json is turn-buffered,
 and kimi-code 0.19.2 emits no usage. Claude currently emits one final JSON
 envelope, so its pane remains quiet until completion and then shows final text
 and usage. Shell output is redacted raw passthrough. Unknown or malformed lines
@@ -33,10 +34,11 @@ and pipeline progress stream are unchanged.
 
 On an interactive terminal, tool-specific icons, honest multi-line output
 previews, elapsed times, and lightweight narration markup make the stream easier
-to scan. Pipes and redirects retain the byte-stable plain format. While the tee
-log still exists, `gitmoot job transcript <id> --export md` creates a
-deterministic ANSI-free snapshot for an issue or pull request; add `--output`
-to write it to a file.
+to scan. Pipes and redirects retain the byte-stable plain format. `gitmoot job
+transcript <id> --export md` creates a deterministic ANSI-free snapshot;
+`--export jsonl` creates a schema-versioned redacted trajectory, and `job
+transcript --all ... --export jsonl` is the guarded bulk form. Raw retained logs
+are unredacted mode-`0600` files; export masking is best-effort, not a vault.
 
 Verified Codex command/file-change events and Kimi function tool calls/results
 use typed compact lines; other shapes retain the generic/raw path. Render-time
