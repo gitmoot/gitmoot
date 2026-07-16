@@ -34,11 +34,11 @@ func (r *wrappingCaptureRunner) LookPath(file string) (string, error) { return f
 
 func TestWrappingRunnerRewritesArgvExactly(t *testing.T) {
 	capture := &wrappingCaptureRunner{}
-	runner := WrappingRunner{Inner: capture, Executable: "/opt/gitmoot", ReadablePaths: []string{"/input/a"}, WritablePaths: []string{"/data/a", "/data/b"}}
+	runner := WrappingRunner{Inner: capture, Executable: "/opt/gitmoot", ReadablePaths: []string{"/input/a"}, ReadableFiles: []string{"/home/operator/.claude.json"}, WritablePaths: []string{"/data/a", "/data/b"}}
 	if _, err := runner.Run(context.Background(), "/work", "claude", "-p", "task"); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"sandbox-exec", "--read", "/input/a", "--write", "/data/a", "--write", "/data/b", "--", "claude", "-p", "task"}
+	want := []string{"sandbox-exec", "--read", "/input/a", "--read-file", "/home/operator/.claude.json", "--write", "/data/a", "--write", "/data/b", "--", "claude", "-p", "task"}
 	if capture.dir != "/work" || capture.command != "/opt/gitmoot" || !reflect.DeepEqual(capture.args, want) {
 		t.Fatalf("wrapped call = dir %q command %q args %v, want /work /opt/gitmoot %v", capture.dir, capture.command, capture.args, want)
 	}

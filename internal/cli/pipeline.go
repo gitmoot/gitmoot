@@ -493,28 +493,9 @@ func canonicalizePipelineProduceReadPaths(ctx context.Context, store *db.Store, 
 	if store == nil {
 		return nil, errors.New("produce read path validation requires a store")
 	}
-	paths, err := pathsFromFlag(homeFlag)
+	protected, err := resolveProduceReadProtectedPaths(ctx, store, homeFlag, envFile)
 	if err != nil {
 		return nil, err
-	}
-	gitmootHome, err := resolveProduceSafetyPath(paths.Home)
-	if err != nil {
-		return nil, fmt.Errorf("resolve gitmoot home: %w", err)
-	}
-	keychainPath, err := resolveKeychainPath(store, homeFlag)
-	if err != nil {
-		return nil, err
-	}
-	keychainPath, err = resolveProduceSafetyPath(keychainPath)
-	if err != nil {
-		return nil, fmt.Errorf("resolve configured keychain_path: %w", err)
-	}
-	resolvedEnvFile := ""
-	if strings.TrimSpace(envFile) != "" {
-		resolvedEnvFile, err = resolveProduceSafetyPath(envFile)
-		if err != nil {
-			return nil, fmt.Errorf("resolve pipeline env_file: %w", err)
-		}
 	}
 
 	resolvedReads := make([]string, 0, len(reads))
@@ -526,14 +507,8 @@ func canonicalizePipelineProduceReadPaths(ctx context.Context, store *db.Store, 
 		if resolved == string(filepath.Separator) {
 			return nil, fmt.Errorf("%s reads path resolves to filesystem root, which is not allowed", subject)
 		}
-		if pathsOverlap(resolved, gitmootHome) {
-			return nil, fmt.Errorf("%s reads path overlaps the Gitmoot home", subject)
-		}
-		if pathsOverlap(resolved, keychainPath) {
-			return nil, fmt.Errorf("%s reads path overlaps the configured keychain_path", subject)
-		}
-		if resolvedEnvFile != "" && pathsOverlap(resolved, resolvedEnvFile) {
-			return nil, fmt.Errorf("%s reads path overlaps the pipeline env_file", subject)
+		if label, excluded := protected.exclusion(resolved); excluded {
+			return nil, fmt.Errorf("%s reads path overlaps %s", subject, label)
 		}
 		for _, writePath := range resolvedWrites {
 			if pathWithin(writePath, resolved) {
@@ -543,6 +518,52 @@ func canonicalizePipelineProduceReadPaths(ctx context.Context, store *db.Store, 
 		resolvedReads = append(resolvedReads, resolved)
 	}
 	return resolvedReads, nil
+}
+
+type produceReadProtectedPaths struct {
+	gitmootHome string
+	keychain    string
+	envFile     string
+}
+
+func resolveProduceReadProtectedPaths(ctx context.Context, store *db.Store, homeFlag, envFile string) (produceReadProtectedPaths, error) {
+	paths, err := pathsFromFlag(homeFlag)
+	if err != nil {
+		return produceReadProtectedPaths{}, err
+	}
+	gitmootHome, err := resolveProduceSafetyPath(paths.Home)
+	if err != nil {
+		return produceReadProtectedPaths{}, fmt.Errorf("resolve gitmoot home: %w", err)
+	}
+	keychainPath, err := resolveKeychainPath(store, homeFlag)
+	if err != nil {
+		return produceReadProtectedPaths{}, err
+	}
+	keychainPath, err = resolveProduceSafetyPath(keychainPath)
+	if err != nil {
+		return produceReadProtectedPaths{}, fmt.Errorf("resolve configured keychain_path: %w", err)
+	}
+	resolvedEnvFile := ""
+	if strings.TrimSpace(envFile) != "" {
+		resolvedEnvFile, err = resolveProduceSafetyPath(envFile)
+		if err != nil {
+			return produceReadProtectedPaths{}, fmt.Errorf("resolve pipeline env_file: %w", err)
+		}
+	}
+	return produceReadProtectedPaths{gitmootHome: gitmootHome, keychain: keychainPath, envFile: resolvedEnvFile}, nil
+}
+
+func (p produceReadProtectedPaths) exclusion(path string) (string, bool) {
+	switch {
+	case pathsOverlap(path, p.gitmootHome):
+		return "the Gitmoot home", true
+	case pathsOverlap(path, p.keychain):
+		return "the configured keychain_path", true
+	case p.envFile != "" && pathsOverlap(path, p.envFile):
+		return "the pipeline env_file", true
+	default:
+		return "", false
+	}
 }
 
 func resolveProduceSafetyPath(path string) (string, error) {

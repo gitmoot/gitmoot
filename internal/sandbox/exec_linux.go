@@ -22,7 +22,7 @@ const MinimumABI = 3
 // Exec applies Gitmoot's strict filesystem ruleset to the current process and
 // replaces it with argv. Landlock restrictions survive execve, so the runtime
 // and every descendant inherit the same filesystem confinement.
-func Exec(readPaths, writePaths []string, argv []string) error {
+func Exec(readPaths, readFiles, writePaths []string, argv []string) error {
 	if len(argv) == 0 || strings.TrimSpace(argv[0]) == "" {
 		return errors.New("sandbox target command is required")
 	}
@@ -48,7 +48,7 @@ func Exec(readPaths, writePaths []string, argv []string) error {
 	}
 
 	var rules []landlock.Rule
-	if len(readPaths) == 0 {
+	if len(readPaths) == 0 && len(readFiles) == 0 {
 		// Preserve the original write-confinement contract for existing produce
 		// stages: the filesystem is readable while writes remain allowlisted.
 		rules = append(rules, landlock.RODirs("/"))
@@ -58,6 +58,13 @@ func Exec(readPaths, writePaths []string, argv []string) error {
 			return err
 		}
 		rules = append(rules, landlock.RODirs(readable...))
+		files, err := readableFiles(readFiles)
+		if err != nil {
+			return err
+		}
+		if len(files) > 0 {
+			rules = append(rules, landlock.ROFiles(files...))
+		}
 	}
 	if len(writable) > 0 {
 		// WithRefer permits rename/link operations only when both the source and
@@ -78,6 +85,34 @@ func Exec(readPaths, writePaths []string, argv []string) error {
 		return fmt.Errorf("apply strict Landlock ruleset: %w", err)
 	}
 	return syscall.Exec(executable, argv, os.Environ())
+}
+
+func readableFiles(paths []string) ([]string, error) {
+	seen := make(map[string]struct{}, len(paths))
+	files := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		if !filepath.IsAbs(path) {
+			return nil, fmt.Errorf("sandbox read file %q must be absolute", path)
+		}
+		path = filepath.Clean(path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, fmt.Errorf("sandbox read file %q: %w", path, err)
+		}
+		if info.IsDir() {
+			return nil, fmt.Errorf("sandbox read file %q is a directory", path)
+		}
+		seen[path] = struct{}{}
+		files = append(files, path)
+	}
+	return files, nil
 }
 
 // readableRoots returns the explicit read-only inputs plus the fixed host roots

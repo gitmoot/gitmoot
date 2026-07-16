@@ -637,6 +637,17 @@ add-dir/network arguments. Produce runs from a disposable detached worktree and
 carries no branch, task, or PR fields. Allocation fails closed instead of falling
 back to the managed checkout.
 
+For Claude stages with `reads:`, Gitmoot inspects the operator's user-level Claude
+settings and auto-adds the parent directories of absolute command-hook scripts as
+read-only runtime resources. It also admits the Claude config directory and
+`~/.claude.json` (the latter as an individual read-only file). Gitmoot-home,
+keychain, and pipeline-`env_file` exclusions still win: a protected, missing, or
+unreadable hook fails before Claude starts with an actionable path, while relative
+or malformed commands produce a `produce_runtime_resource_warning` job event.
+Stages without `reads:` keep the historical unrestricted-read behavior. Kimi has
+no analogous command-hook config surface in the supported runtime; Codex remains
+on its native sandbox.
+
 Landlock does **not** govern network access in this feature. Network policy remains
 the selected runtime CLI's responsibility. Claude/Kimi have no advisory fallback:
 unsupported Landlock means produce is refused; Codex keeps its native sandbox.

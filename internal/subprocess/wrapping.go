@@ -15,6 +15,7 @@ type WrappingRunner struct {
 	Inner         Runner
 	Executable    string
 	ReadablePaths []string
+	ReadableFiles []string
 	WritablePaths []string
 	// Env is appended to the sandbox-exec process environment and inherited by
 	// the exec'd runtime. It is empty for every existing wrapper except Claude
@@ -41,6 +42,9 @@ func (r WrappingRunner) command(command string, args []string) (string, []string
 	wrapped := []string{"sandbox-exec"}
 	for _, path := range r.ReadablePaths {
 		wrapped = append(wrapped, "--read", path)
+	}
+	for _, path := range r.ReadableFiles {
+		wrapped = append(wrapped, "--read-file", path)
 	}
 	for _, path := range r.WritablePaths {
 		wrapped = append(wrapped, "--write", path)

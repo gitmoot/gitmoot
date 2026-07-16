@@ -5500,10 +5500,143 @@ func applyProduceRuntimeGrants(ctx context.Context, store *db.Store, home string
 	if err != nil {
 		return fmt.Errorf("produce readable path preflight failed: %w", err)
 	}
+	var readableFiles []string
+	if len(payload.ReadablePaths) > 0 && agent.Runtime == runtime.ClaudeRuntime {
+		var warnings []runtime.ClaudeHookWarning
+		readable, readableFiles, warnings, err = claudeProduceRuntimeReadAccess(ctx, store, home, envFile, readable)
+		recordClaudeProduceHookWarnings(ctx, store, job.ID, warnings)
+		if err != nil {
+			return fmt.Errorf("produce Claude runtime resource preflight failed: %w", err)
+		}
+	}
 	agent.WritablePaths = writable
 	agent.ReadablePaths = readable
+	agent.ReadableFiles = readableFiles
 	agent.ProduceNetwork = payload.Network
 	return nil
+}
+
+func claudeProduceRuntimeReadAccess(ctx context.Context, store *db.Store, homeFlag, envFile string, declared []string) ([]string, []string, []runtime.ClaudeHookWarning, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("resolve Claude operator home: %w", err)
+	}
+	home = filepath.Clean(home)
+	configDir := realClaudeConfigDir()
+	if strings.TrimSpace(configDir) == "" {
+		configDir = filepath.Join(home, ".claude")
+	}
+	configDir, err = resolveProduceSafetyPath(configDir)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("resolve Claude config directory: %w", err)
+	}
+	protected, err := resolveProduceReadProtectedPaths(ctx, store, homeFlag, envFile)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	resources, warnings := runtime.DiscoverClaudeHookResources(home, configDir)
+	readable := compactCleanPaths(declared)
+	readableFiles := []string{}
+	addDir := func(path, resource string) error {
+		resolved, resolveErr := resolveProduceSafetyPath(path)
+		if resolveErr != nil {
+			return fmt.Errorf("resolve Claude runtime resource %q: %w", resource, resolveErr)
+		}
+		if label, excluded := protected.exclusion(resolved); excluded {
+			return fmt.Errorf("Claude runtime resource %q cannot be read because its parent %q overlaps %s; move it outside protected state, then add reads: [%q] if needed", resource, resolved, label, resolved)
+		}
+		info, err := os.Stat(resolved)
+		if err != nil {
+			return fmt.Errorf("inspect Claude runtime resource directory %q: %w", resolved, err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("Claude runtime resource parent %q is not a directory", resolved)
+		}
+		readable = compactCleanPaths(append(readable, resolved))
+		return nil
+	}
+	if info, statErr := os.Stat(configDir); statErr == nil && info.IsDir() {
+		if err := addDir(configDir, configDir); err != nil {
+			return nil, nil, warnings, err
+		}
+	} else if statErr != nil && !os.IsNotExist(statErr) {
+		return nil, nil, warnings, fmt.Errorf("inspect Claude config directory %q: %w", configDir, statErr)
+	}
+
+	userState := filepath.Join(home, ".claude.json")
+	if _, statErr := os.Stat(userState); statErr == nil {
+		resolved, err := resolveProduceSafetyPath(userState)
+		if err != nil {
+			return nil, nil, warnings, fmt.Errorf("resolve Claude user settings %q: %w", userState, err)
+		}
+		if label, excluded := protected.exclusion(resolved); excluded {
+			return nil, nil, warnings, fmt.Errorf("Claude user settings %q cannot be read because it overlaps %s", userState, label)
+		}
+		readableFiles = compactCleanPaths(append(readableFiles, resolved))
+	} else if !os.IsNotExist(statErr) {
+		return nil, nil, warnings, fmt.Errorf("inspect Claude user settings %q: %w", userState, statErr)
+	}
+
+	for _, resource := range resources {
+		resolved, err := resolveProduceSafetyPath(resource.Path)
+		if err != nil {
+			return nil, nil, warnings, fmt.Errorf("resolve Claude hook path %q: %w", resource.Path, err)
+		}
+		parent := filepath.Dir(resolved)
+		if err := addDir(parent, resource.Path); err != nil {
+			return nil, nil, warnings, err
+		}
+		if info, statErr := os.Stat(resolved); statErr == nil {
+			if info.IsDir() {
+				return nil, nil, warnings, fmt.Errorf("Claude hook path %q is a directory, not a readable script", resource.Path)
+			}
+			file, openErr := os.Open(resolved)
+			if openErr != nil {
+				return nil, nil, warnings, fmt.Errorf("Claude hook path %q is not readable: %w", resource.Path, openErr)
+			}
+			_ = file.Close()
+		} else if os.IsNotExist(statErr) {
+			return nil, nil, warnings, fmt.Errorf("Claude hook path %q does not exist; fix the hook or add a readable absolute script", resource.Path)
+		} else {
+			return nil, nil, warnings, fmt.Errorf("inspect Claude hook path %q: %w", resource.Path, statErr)
+		}
+		if !pathCoveredByRuntimeReads(resolved, readable, readableFiles) {
+			return nil, nil, warnings, fmt.Errorf("Claude hook path %q is outside the final read allowlist; add reads: [%q]", resource.Path, parent)
+		}
+	}
+	return readable, readableFiles, warnings, nil
+}
+
+func pathCoveredByRuntimeReads(path string, dirs, files []string) bool {
+	for _, dir := range dirs {
+		if pathWithin(path, dir) {
+			return true
+		}
+	}
+	for _, file := range files {
+		if path == file {
+			return true
+		}
+	}
+	return false
+}
+
+func recordClaudeProduceHookWarnings(ctx context.Context, store *db.Store, jobID string, warnings []runtime.ClaudeHookWarning) {
+	if store == nil || strings.TrimSpace(jobID) == "" {
+		return
+	}
+	for _, warning := range warnings {
+		origin := warning.SettingsPath
+		if warning.Event != "" {
+			origin += " (" + warning.Event + ")"
+		}
+		_ = store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   jobID,
+			Kind:    "produce_runtime_resource_warning",
+			Message: fmt.Sprintf("Claude hook settings %s: %s", origin, warning.Reason),
+		})
+	}
 }
 
 func (w jobWorker) produceDispatchError(action string, agent runtime.Agent) error {
@@ -5567,7 +5700,7 @@ func wrapProduceSandboxAdapter(action string, agent runtime.Agent, adapter workf
 	if agent.Runtime != runtime.ClaudeRuntime && agent.Runtime != runtime.KimiRuntime {
 		return adapter, nil
 	}
-	reads, writes, env, err := produceRuntimeSandboxGrants(agent.Runtime, agent.ReadablePaths, agent.WritablePaths)
+	reads, readFiles, writes, env, err := produceRuntimeSandboxGrants(agent.Runtime, agent.ReadablePaths, agent.ReadableFiles, agent.WritablePaths)
 	if err != nil {
 		return nil, err
 	}
@@ -5584,26 +5717,26 @@ func wrapProduceSandboxAdapter(action string, agent runtime.Agent, adapter workf
 		a.Adapter = runtimeAdapter
 		return a, nil
 	case runtime.ClaudeAdapter:
-		a.Runner = landlockProduceRunner(a.Runner, reads, writes, env)
+		a.Runner = landlockProduceRunner(a.Runner, reads, readFiles, writes, env)
 		return a, nil
 	case *runtime.ClaudeAdapter:
-		a.Runner = landlockProduceRunner(a.Runner, reads, writes, env)
+		a.Runner = landlockProduceRunner(a.Runner, reads, readFiles, writes, env)
 		return a, nil
 	case runtime.KimiAdapter:
-		a.Runner = landlockProduceRunner(a.Runner, reads, writes, env)
+		a.Runner = landlockProduceRunner(a.Runner, reads, readFiles, writes, env)
 		return a, nil
 	case *runtime.KimiAdapter:
-		a.Runner = landlockProduceRunner(a.Runner, reads, writes, env)
+		a.Runner = landlockProduceRunner(a.Runner, reads, readFiles, writes, env)
 		return a, nil
 	default:
 		return nil, fmt.Errorf("produce Landlock sandbox cannot wrap %s adapter %T", agent.Runtime, adapter)
 	}
 }
 
-func produceRuntimeSandboxGrants(runtimeName string, readable, writable []string) ([]string, []string, []string, error) {
+func produceRuntimeSandboxGrants(runtimeName string, readable, readFiles, writable []string) ([]string, []string, []string, []string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("resolve runtime state home: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("resolve runtime state home: %w", err)
 	}
 	home = filepath.Clean(home)
 	var statePaths []string
@@ -5613,7 +5746,7 @@ func produceRuntimeSandboxGrants(runtimeName string, readable, writable []string
 		stateDir := filepath.Join(home, ".claude")
 		cacheRoot, err := os.UserCacheDir()
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("resolve Claude cache root: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("resolve Claude cache root: %w", err)
 		}
 		cacheDir := filepath.Join(cacheRoot, "claude-cli-nodejs")
 		statePaths = []string{stateDir, cacheDir}
@@ -5621,16 +5754,17 @@ func produceRuntimeSandboxGrants(runtimeName string, readable, writable []string
 	case runtime.KimiRuntime:
 		statePaths = []string{filepath.Join(home, ".kimi-code")}
 	default:
-		return compactCleanPaths(readable), compactCleanPaths(writable), nil, nil
+		return compactCleanPaths(readable), compactCleanPaths(readFiles), compactCleanPaths(writable), nil, nil
 	}
 	for _, path := range statePaths {
 		if err := os.MkdirAll(path, 0o700); err != nil {
-			return nil, nil, nil, fmt.Errorf("create %s runtime state directory %q: %w", runtimeName, path, err)
+			return nil, nil, nil, nil, fmt.Errorf("create %s runtime state directory %q: %w", runtimeName, path, err)
 		}
 	}
 	reads := compactCleanPaths(readable)
+	files := compactCleanPaths(readFiles)
 	writes := compactCleanPaths(append(append([]string(nil), writable...), statePaths...))
-	return reads, writes, env, nil
+	return reads, files, writes, env, nil
 }
 
 func compactCleanPaths(paths []string) []string {
@@ -5651,8 +5785,9 @@ func compactCleanPaths(paths []string) []string {
 	return out
 }
 
-func landlockProduceRunner(runner subprocess.Runner, reads, writes, env []string) subprocess.Runner {
+func landlockProduceRunner(runner subprocess.Runner, reads, readFiles, writes, env []string) subprocess.Runner {
 	readable := append([]string(nil), reads...)
+	files := append([]string(nil), readFiles...)
 	writable := append([]string(nil), writes...)
 	runtimeEnv := append([]string(nil), env...)
 	if tee, ok := runner.(subprocess.TeeRunner); ok {
@@ -5661,7 +5796,7 @@ func landlockProduceRunner(runner subprocess.Runner, reads, writes, env []string
 			inner = subprocess.GroupRunner{}
 		}
 		if _, wrapped := inner.(subprocess.WrappingRunner); !wrapped {
-			tee.Inner = subprocess.WrappingRunner{Inner: inner, ReadablePaths: readable, WritablePaths: writable, Env: runtimeEnv}
+			tee.Inner = subprocess.WrappingRunner{Inner: inner, ReadablePaths: readable, ReadableFiles: files, WritablePaths: writable, Env: runtimeEnv}
 		}
 		return tee
 	}
@@ -5671,7 +5806,7 @@ func landlockProduceRunner(runner subprocess.Runner, reads, writes, env []string
 			inner = subprocess.GroupRunner{}
 		}
 		if _, wrapped := inner.(subprocess.WrappingRunner); !wrapped {
-			tee.Inner = subprocess.WrappingRunner{Inner: inner, ReadablePaths: readable, WritablePaths: writable, Env: runtimeEnv}
+			tee.Inner = subprocess.WrappingRunner{Inner: inner, ReadablePaths: readable, ReadableFiles: files, WritablePaths: writable, Env: runtimeEnv}
 		}
 		return tee
 	}
@@ -5681,7 +5816,7 @@ func landlockProduceRunner(runner subprocess.Runner, reads, writes, env []string
 	if _, wrapped := runner.(subprocess.WrappingRunner); wrapped {
 		return runner
 	}
-	return subprocess.WrappingRunner{Inner: runner, ReadablePaths: readable, WritablePaths: writable, Env: runtimeEnv}
+	return subprocess.WrappingRunner{Inner: runner, ReadablePaths: readable, ReadableFiles: files, WritablePaths: writable, Env: runtimeEnv}
 }
 
 // configPaths resolves this worker's config.Paths for READ-ONLY policy loading
@@ -7020,12 +7155,12 @@ func buildRuntimeAdapter(home string, agent runtime.Agent, checkout string, runn
 		return nil, err
 	}
 	gatewayRunner, _ := runner.(*credgw.Runner)
-	if (len(agent.WritablePaths) > 0 || len(agent.ReadablePaths) > 0) && (agent.Runtime == runtime.ClaudeRuntime || agent.Runtime == runtime.KimiRuntime) {
-		reads, writes, env, err := produceRuntimeSandboxGrants(agent.Runtime, agent.ReadablePaths, agent.WritablePaths)
+	if (len(agent.WritablePaths) > 0 || len(agent.ReadablePaths) > 0 || len(agent.ReadableFiles) > 0) && (agent.Runtime == runtime.ClaudeRuntime || agent.Runtime == runtime.KimiRuntime) {
+		reads, readFiles, writes, env, err := produceRuntimeSandboxGrants(agent.Runtime, agent.ReadablePaths, agent.ReadableFiles, agent.WritablePaths)
 		if err != nil {
 			return nil, err
 		}
-		runner = landlockProduceRunner(runner, reads, writes, env)
+		runner = landlockProduceRunner(runner, reads, readFiles, writes, env)
 	}
 	var adapter runtime.Adapter
 	switch agent.Runtime {

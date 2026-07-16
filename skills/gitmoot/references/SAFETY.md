@@ -187,6 +187,14 @@ Claude/Kimi hosts fail closed instead of falling back to advisory confinement;
 Codex uses its native sandbox, and read paths are never passed as writable
 `--add-dir` grants.
 
+When Claude produce declares `reads:`, Gitmoot derives additional read-only
+runtime resources from the operator's user settings: the Claude config directory,
+`~/.claude.json`, and parent directories of absolute command-hook scripts. The same
+Gitmoot-home/keychain/`env_file` exclusions override auto-discovery. An excluded,
+missing, or unreadable script is refused before runtime launch with its path;
+relative or malformed hook commands emit a `produce_runtime_resource_warning`
+job event. No such discovery runs when `reads:` is absent.
+
 Pipeline key access is deny-by-default. An `injected` selection gives the shell
 the real value, which it can print or transmit. A configured `proxied` shared
 selection instead gives it a per-job placeholder and loopback URL; Gitmoot

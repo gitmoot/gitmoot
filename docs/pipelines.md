@@ -385,6 +385,18 @@ pushes that cwd. Unlike read-only ask/review isolation, produce worktree allocat
 fails closed and records a failed stage job rather than falling back to the managed
 checkout.
 
+For a Claude produce stage that declares `reads:`, Gitmoot also inspects the
+operator's user-level Claude settings (`$CLAUDE_CONFIG_DIR/settings.json`, or
+`$HOME/.claude/settings.json`, plus `$HOME/.claude.json`). Absolute script paths
+referenced by command hooks are admitted by parent directory as read-only runtime
+resources; `.claude.json` is admitted as an individual read-only file. Gitmoot
+never auto-admits a resource that would expose its home, the configured keychain,
+or the pipeline `env_file`. A protected, missing, or unreadable hook fails delivery
+before Claude starts and names the path; a relative or malformed hook command adds
+a `produce_runtime_resource_warning` job event. Stages without `reads:` retain the
+historical unrestricted-read behavior. Kimi exposes no analogous command-hook
+surface in its supported config, and Codex continues to use its native sandbox.
+
 Landlock governs filesystem access only in this feature. It does **not** implement
 the stage's network policy; network behavior remains whatever the selected runtime
 and its CLI policy enforce. There is no advisory fallback for Claude/Kimi: if

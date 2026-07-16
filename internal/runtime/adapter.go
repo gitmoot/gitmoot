@@ -96,6 +96,10 @@ type Agent struct {
 	// Codex's native workspace sandbox already permits filesystem reads and has no
 	// read-only --add-dir equivalent.
 	ReadablePaths []string
+	// ReadableFiles are runtime-owned configuration files admitted to the
+	// Landlock ruleset without exposing their parent directory. They are not
+	// passed as --add-dir hints and remain read-only.
+	ReadableFiles []string
 	// ProduceNetwork opts that produce delivery into workspace-write network access.
 	ProduceNetwork bool
 }

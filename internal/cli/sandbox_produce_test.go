@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -128,6 +129,12 @@ func TestWorkerClaudeKimiProduceDispatchWrappedArgv(t *testing.T) {
 				ref = "session_550e8400-e29b-41d4-a716-446655440000"
 			}
 			agent := runtime.Agent{Name: "p", Role: "producer", Runtime: tc.runtime, RuntimeRef: ref, RepoScope: "owner/repo", AutonomyPolicy: runtime.AutonomyPolicyWorkspaceWrite, ReadablePaths: []string{"/data/input"}, WritablePaths: []string{"/data/out"}}
+			if tc.runtime == runtime.ClaudeRuntime {
+				agent.ReadableFiles = []string{home + "/.claude.json"}
+				if err := os.WriteFile(agent.ReadableFiles[0], []byte("{}"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
 			wrapped, err := wrapProduceSandboxAdapter("produce", agent, tc.adapter(capture))
 			if err != nil {
 				t.Fatal(err)
@@ -135,13 +142,16 @@ func TestWorkerClaudeKimiProduceDispatchWrappedArgv(t *testing.T) {
 			if _, err := wrapped.Deliver(context.Background(), agent, runtime.Job{Prompt: "write"}); err != nil {
 				t.Fatalf("Deliver: %v", err)
 			}
-			wantPrefix := []string{"sandbox-exec", "--read", "/data/input", "--write", "/data/out"}
+			wantPrefix := []string{"sandbox-exec", "--read", "/data/input"}
 			if tc.runtime == runtime.ClaudeRuntime {
+				wantPrefix = append(wantPrefix, "--read-file", home+"/.claude.json")
+				wantPrefix = append(wantPrefix, "--write", "/data/out")
 				wantPrefix = append(wantPrefix, "--write", home+"/.claude", "--write", home+"/.cache/claude-cli-nodejs")
 				if !reflect.DeepEqual(capture.env, []string{"CLAUDE_CONFIG_DIR=" + home + "/.claude"}) {
 					t.Fatalf("Claude sandbox env = %v", capture.env)
 				}
 			} else {
+				wantPrefix = append(wantPrefix, "--write", "/data/out")
 				wantPrefix = append(wantPrefix, "--write", home+"/.kimi-code")
 				if len(capture.env) != 0 {
 					t.Fatalf("Kimi sandbox env = %v, want empty", capture.env)
@@ -168,7 +178,11 @@ func TestProduceRunnerComposesUnderTeeAndScopesByAction(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CACHE_HOME", home+"/.cache")
-	agent := runtime.Agent{Runtime: runtime.ClaudeRuntime, ReadablePaths: []string{"/input"}, WritablePaths: []string{"/data"}}
+	stateFile := filepath.Join(home, ".claude.json")
+	if err := os.WriteFile(stateFile, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	agent := runtime.Agent{Runtime: runtime.ClaudeRuntime, ReadablePaths: []string{"/input"}, ReadableFiles: []string{stateFile}, WritablePaths: []string{"/data"}}
 	base := runtime.ClaudeAdapter{Runner: subprocess.TeeRunner{Inner: subprocess.GroupRunner{}}}
 	wrapped, err := wrapProduceSandboxAdapter("produce", agent, base)
 	if err != nil {
@@ -187,7 +201,7 @@ func TestProduceRunnerComposesUnderTeeAndScopesByAction(t *testing.T) {
 		t.Fatalf("shim inner = %T, want GroupRunner", shim.Inner)
 	}
 	wantPaths := []string{"/data", home + "/.claude", home + "/.cache/claude-cli-nodejs"}
-	if !reflect.DeepEqual(shim.ReadablePaths, []string{"/input"}) || !reflect.DeepEqual(shim.WritablePaths, wantPaths) || !reflect.DeepEqual(shim.Env, []string{"CLAUDE_CONFIG_DIR=" + home + "/.claude"}) {
+	if !reflect.DeepEqual(shim.ReadablePaths, []string{"/input"}) || !reflect.DeepEqual(shim.ReadableFiles, []string{stateFile}) || !reflect.DeepEqual(shim.WritablePaths, wantPaths) || !reflect.DeepEqual(shim.Env, []string{"CLAUDE_CONFIG_DIR=" + home + "/.claude"}) {
 		t.Fatalf("Claude shim = reads %v writes %v env %v, want read /input, writes %v + config env", shim.ReadablePaths, shim.WritablePaths, shim.Env, wantPaths)
 	}
 

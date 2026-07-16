@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -148,6 +149,183 @@ func TestApplyProduceRuntimeReadableGrantsRevalidateAtDelivery(t *testing.T) {
 	err = applyProduceRuntimeGrants(context.Background(), store, home, db.Job{ID: "produce-read", Type: "produce"}, payload, &agent)
 	if err == nil || !strings.Contains(err.Error(), "produce readable path preflight failed") || len(agent.ReadablePaths) != 0 {
 		t.Fatalf("retargeted read symlink preflight = %v agent=%+v", err, agent)
+	}
+}
+
+func TestApplyProduceRuntimeGrantsAutoIncludesClaudeHooksAndPreservesNoReads(t *testing.T) {
+	base := t.TempDir()
+	operatorHome := filepath.Join(base, "operator")
+	configDir := filepath.Join(operatorHome, ".claude")
+	hookDir := filepath.Join(base, "operator-hooks")
+	inputDir := filepath.Join(base, "input")
+	outputDir := filepath.Join(base, "output")
+	for _, dir := range []string{configDir, hookDir, inputDir, outputDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("HOME", operatorHome)
+	t.Setenv(runtime.ClaudeConfigDirEnv, "")
+	hookPath := filepath.Join(hookDir, "prompt-hook.sh")
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeClaudeProduceSettings(t, configDir, fmt.Sprintf(`{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":%q}]}]}}`, hookPath))
+	userState := filepath.Join(operatorHome, ".claude.json")
+	if err := os.WriteFile(userState, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	home := filepath.Join(base, "config-home")
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(paths.Home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	createProduceGrantPipeline(t, store, inputDir, outputDir)
+	job := db.Job{ID: "claude-hooks", Agent: "producer", Type: "produce", State: string(workflow.JobQueued)}
+	if err := store.CreateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	payload := workflow.JobPayload{PipelineName: "p", WritablePaths: []string{outputDir}, ReadablePaths: []string{inputDir}}
+	agent := runtime.Agent{Name: "producer", Runtime: runtime.ClaudeRuntime}
+	if err := applyProduceRuntimeGrants(context.Background(), store, home, job, payload, &agent); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{inputDir, configDir, hookDir} {
+		if !containsString(agent.ReadablePaths, want) {
+			t.Fatalf("readable paths = %v, missing %q", agent.ReadablePaths, want)
+		}
+	}
+	if len(agent.ReadableFiles) != 1 || agent.ReadableFiles[0] != userState {
+		t.Fatalf("readable files = %v, want %q", agent.ReadableFiles, userState)
+	}
+
+	withoutReads := runtime.Agent{Name: "producer", Runtime: runtime.ClaudeRuntime}
+	if err := applyProduceRuntimeGrants(context.Background(), store, home, db.Job{ID: "no-reads", Type: "produce"}, workflow.JobPayload{WritablePaths: []string{outputDir}}, &withoutReads); err != nil {
+		t.Fatal(err)
+	}
+	if withoutReads.ReadablePaths != nil || withoutReads.ReadableFiles != nil {
+		t.Fatalf("no-reads stage gained runtime reads: dirs=%v files=%v", withoutReads.ReadablePaths, withoutReads.ReadableFiles)
+	}
+}
+
+func TestApplyProduceRuntimeGrantsRefusesProtectedClaudeHookLoudly(t *testing.T) {
+	base := t.TempDir()
+	operatorHome := filepath.Join(base, "operator")
+	configDir := filepath.Join(operatorHome, ".claude")
+	inputDir := filepath.Join(base, "input")
+	outputDir := filepath.Join(base, "output")
+	for _, dir := range []string{configDir, inputDir, outputDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("HOME", operatorHome)
+	t.Setenv(runtime.ClaudeConfigDirEnv, "")
+	home := filepath.Join(base, "config-home")
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(paths.Home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hookPath := filepath.Join(paths.Home, "protected-hook.sh")
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeClaudeProduceSettings(t, configDir, fmt.Sprintf(`{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":%q}]}]}}`, hookPath))
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	createProduceGrantPipeline(t, store, inputDir, outputDir)
+	agent := runtime.Agent{Name: "producer", Runtime: runtime.ClaudeRuntime}
+	err = applyProduceRuntimeGrants(context.Background(), store, home, db.Job{ID: "protected", Type: "produce"}, workflow.JobPayload{
+		PipelineName: "p", WritablePaths: []string{outputDir}, ReadablePaths: []string{inputDir},
+	}, &agent)
+	if err == nil || !strings.Contains(err.Error(), hookPath) || !strings.Contains(err.Error(), "Gitmoot home") || !strings.Contains(err.Error(), "reads:") {
+		t.Fatalf("protected hook preflight = %v", err)
+	}
+	if agent.ReadablePaths != nil || agent.ReadableFiles != nil {
+		t.Fatalf("failed preflight mutated agent reads: dirs=%v files=%v", agent.ReadablePaths, agent.ReadableFiles)
+	}
+}
+
+func TestApplyProduceRuntimeGrantsRecordsClaudeHookParseWarning(t *testing.T) {
+	base := t.TempDir()
+	operatorHome := filepath.Join(base, "operator")
+	configDir := filepath.Join(operatorHome, ".claude")
+	inputDir := filepath.Join(base, "input")
+	outputDir := filepath.Join(base, "output")
+	for _, dir := range []string{configDir, inputDir, outputDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("HOME", operatorHome)
+	t.Setenv(runtime.ClaudeConfigDirEnv, "")
+	writeClaudeProduceSettings(t, configDir, `{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"./relative-hook.sh"}]}]}}`)
+	home := filepath.Join(base, "config-home")
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(paths.Home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	createProduceGrantPipeline(t, store, inputDir, outputDir)
+	job := db.Job{ID: "hook-warning", Agent: "producer", Type: "produce", State: string(workflow.JobQueued)}
+	if err := store.CreateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	agent := runtime.Agent{Name: "producer", Runtime: runtime.ClaudeRuntime}
+	if err := applyProduceRuntimeGrants(context.Background(), store, home, job, workflow.JobPayload{
+		PipelineName: "p", WritablePaths: []string{outputDir}, ReadablePaths: []string{inputDir},
+	}, &agent); err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.ListJobEvents(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind == "produce_runtime_resource_warning" && strings.Contains(event.Message, "relative path") && strings.Contains(event.Message, "UserPromptSubmit") {
+			return
+		}
+	}
+	t.Fatalf("Claude hook warning event missing: %+v", events)
+}
+
+func writeClaudeProduceSettings(t *testing.T, configDir, body string) {
+	t.Helper()
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "settings.json"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func createProduceGrantPipeline(t *testing.T, store *db.Store, inputDir, outputDir string) {
+	t.Helper()
+	specYAML := "name: p\nstages:\n  - id: export\n    agent: producer\n    action: produce\n    prompt: x\n    write: true\n    reads: [" + inputDir + "]\n    writes: [" + outputDir + "]\n"
+	if err := store.CreateOrUpdatePipeline(context.Background(), db.Pipeline{Name: "p", SpecYAML: specYAML}); err != nil {
+		t.Fatal(err)
 	}
 }
 

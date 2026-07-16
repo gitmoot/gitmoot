@@ -1249,9 +1249,15 @@ runtime (claude / codex). Four kinds:
   `$XDG_CACHE_HOME/claude-cli-nodejs` for Claude and `$HOME/.kimi-code` for Kimi;
   apart from that state/cache and device nodes, only `writes:`, workdir, and temp
   roots are writable. When `reads:` is declared, Landlock gives those paths
-  read-only access and denies unrelated host data. Gitmoot home, keychain, pipeline
-  `env_file`, and read roots containing a write root are rejected after symlink
-  resolution at add and delivery time. Landlock governs filesystem access rather than network access,
+  read-only access and denies unrelated host data. For Claude, delivery also
+  discovers absolute command-hook scripts from the operator's user settings,
+  grants their parent directories read-only, and grants `~/.claude.json` as one
+  read-only file. Gitmoot home, keychain, pipeline `env_file`, and read roots
+  containing a write root are rejected after symlink resolution at add and delivery
+  time; those exclusions also override hook discovery. Missing/protected hooks fail
+  before launch, while relative or malformed hook commands emit a
+  `produce_runtime_resource_warning` event. No discovery runs without `reads:`.
+  Landlock governs filesystem access rather than network access,
   retries must be
   idempotent, and Gitmoot never cleans operator-owned data directories.
 - **orchestrate** (#758) — `orchestrate: true`. Sub-tree **coordinator** (the one
