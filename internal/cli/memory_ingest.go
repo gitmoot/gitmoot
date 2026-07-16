@@ -309,7 +309,8 @@ func autoConfirmObservationIfEnabled(ctx context.Context, store *db.Store, obs d
 		Content:    obs.Content,
 		Provenance: obs.Provenance,
 		SourceJob:  obs.SourceJob,
-	}, db.PreserveSupersededEdition(), db.WithConfirmedMemoryEvent(db.MemoryEventIngested, actor))
+	}, db.PreserveSupersededEdition(), db.WithConfirmedMemoryEvent(db.MemoryEventIngested, actor),
+		db.WithConfirmedMemoryEventDetail(ingestedMemoryEventDetail(obs.Provenance)))
 	if err != nil {
 		if errors.Is(err, db.ErrConfirmedMemoryRetired) {
 			return false, true, nil
@@ -320,6 +321,14 @@ func autoConfirmObservationIfEnabled(ctx context.Context, store *db.Store, obs d
 		ID: id, Owner: owner, Repo: obs.Repo, Scope: obs.Scope, Key: obs.Key, Content: obs.Content,
 	})
 	return true, false, nil
+}
+
+func ingestedMemoryEventDetail(provenance string) map[string]string {
+	source := strings.TrimSpace(provenance)
+	if strings.HasPrefix(source, "ingest:") {
+		source = strings.TrimPrefix(source, "ingest:")
+	}
+	return map[string]string{"source": source}
 }
 
 // autoConfirmEligibleProvenance is deliberately fail-closed. Only the three

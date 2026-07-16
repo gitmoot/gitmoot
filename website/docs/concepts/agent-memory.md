@@ -432,7 +432,9 @@ their reason, and split, promotion, and cluster operations retain compact JSON
 details. `memory log backfill` synthesizes historical creation, retirement, and
 supersession receipts from existing tombstones; it is idempotent and supports
 `--dry-run`. The dashboard server exposes the same chronology at
-`GET /api/brain/events?cursor=ID&limit=N`.
+`GET /api/brain/events?cursor=ID&limit=N`; each page includes the exact
+append-only event `total`. A selected chronology entry can load its full fact,
+including retired and superseded rows, from `GET /api/brain/fact?id=ID`.
 
 :::warning Ingested Markdown is untrusted
 Ingested Markdown is an **indirect-prompt-injection vector**. Ingest stamps

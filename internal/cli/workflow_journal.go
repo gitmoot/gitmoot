@@ -558,7 +558,8 @@ func autoConfirmWorkflowObservationIfEnabled(ctx context.Context, store *db.Stor
 	id, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
 		Owner: obs.Owner, AuthorRef: obs.AuthorRef, Repo: obs.Repo, Scope: obs.Scope,
 		Key: obs.Key, Content: obs.Content, Provenance: obs.Provenance,
-	}, db.PreserveSupersededEdition(), db.WithConfirmedMemoryEvent(db.MemoryEventIngested, actor))
+	}, db.PreserveSupersededEdition(), db.WithConfirmedMemoryEvent(db.MemoryEventIngested, actor),
+		db.WithConfirmedMemoryEventDetail(ingestedMemoryEventDetail(obs.Provenance)))
 	if err != nil {
 		if errors.Is(err, db.ErrConfirmedMemoryRetired) {
 			return false, true, nil

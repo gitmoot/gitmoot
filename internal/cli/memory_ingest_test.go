@@ -33,6 +33,22 @@ func writeFixture(t *testing.T, dir, name, content string) {
 	}
 }
 
+func assertIngestedEventSource(t *testing.T, store *db.Store, want string) {
+	t.Helper()
+	events, err := store.ListMemoryEvents(context.Background(), db.MemoryEventFilter{
+		Kinds: []string{db.MemoryEventIngested}, Limit: 10,
+	})
+	if err != nil || len(events) != 1 {
+		t.Fatalf("ingested events=%+v err=%v", events, err)
+	}
+	var detail struct {
+		Source string `json:"source"`
+	}
+	if err := json.Unmarshal([]byte(events[0].Detail), &detail); err != nil || detail.Source != want {
+		t.Fatalf("ingested detail=%s parsed=%+v err=%v", events[0].Detail, detail, err)
+	}
+}
+
 // TestMemoryIngestPreFilterAccountingAndDedup drives ingest over a fixture dir
 // containing a clean fact, a secret-shaped chunk, and a directive chunk, then
 // re-ingests to prove exact-content dedup yields zero new inserts.
@@ -223,6 +239,7 @@ ingest_auto_confirm = true
 	if len(sharedRows) != 0 {
 		t.Fatalf("auto-confirm must not write shared memory, got %+v", sharedRows)
 	}
+	assertIngestedEventSource(t, storeOn, "note.md")
 }
 
 // TestMemoryIngestConfirmExportRoundTrip is the P3 end-to-end: ingest → the note
@@ -456,6 +473,7 @@ tier = "repo"
 	if len(sharedRows) != 0 {
 		t.Fatalf("sweep auto-confirm must not write shared memory, got %+v", sharedRows)
 	}
+	assertIngestedEventSource(t, store, "sweep.md")
 }
 
 func TestMemoryIngestSweepAllSourcesFailExitsNonZero(t *testing.T) {

@@ -2365,6 +2365,10 @@ filters answer operational questions such as “what changed this week.” Valid
 `superseded` receipts from existing tombstones; `--dry-run` previews the work and
 repeat runs do not duplicate events. Edit details retain the previous content
 inline up to 2 KiB, then use a SHA-256 hash and 300-character preview.
+The read-only dashboard API exposes the same feed at
+`GET /api/brain/events?cursor=ID&limit=N`; its `total` is the exact append-only
+event count. `GET /api/brain/fact?id=ID` returns the selected fact even when it
+has been retired or superseded.
 
 > **Trust boundary.** Ingested Markdown is untrusted input — an
 > **indirect-prompt-injection vector**. Ingest records `trust_mark = low` on every
