@@ -177,16 +177,20 @@ in a stage command or inline `env`. Use an operator-owned `0600` pipeline
 grant it to the pipeline, then select it with the shell stage's `env_keys`
 allowlist.
 
-Pipeline injection is deny-by-default but deliberately **opaque**: only a shell
-stage's selected own or granted shared `env_keys` are injected, yet that process
-receives the real values and can print or transmit them. Gitmoot stores only
-`{stage,name,source,mode}` audit rows, never values or hashes. Keychain and
-pipeline files are revalidated as owner-only `0600` files outside Gitmoot state
-and managed checkouts. A shared grant is rechecked at delivery, so revocation
-fails closed without source fallback. `proxied` registry entries cannot be
-granted to pipelines in this phase. This is distinct from the Claude model
-gateway, where the child receives a placeholder and the real model credential
-stays daemon-side.
+Pipeline key access is deny-by-default. An `injected` selection gives the shell
+the real value, which it can print or transmit. A configured `proxied` shared
+selection instead gives it a per-job placeholder and loopback URL; Gitmoot
+rereads the value and rechecks the grant on every request, pins forwarding to
+the configured HTTPS origin/base path, and revokes the lease when delivery
+ends. Gitmoot stores only `{stage,name,source,mode}` audit rows, never values or
+hashes. Keychain and pipeline files are revalidated as owner-only `0600` files
+outside Gitmoot state and managed checkouts.
+
+Proxied mode hides key bytes; it does **not** prevent an authorized child from
+exercising the credential on the pinned upstream. Curated upstreams and base
+paths are part of the model, and only trusted upstreams should be configured.
+Agent and gate stages remain ineligible. This generic pipeline proxy is distinct
+from the Claude model gateway.
 
 ## External Contracts
 

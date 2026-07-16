@@ -20,6 +20,14 @@ const (
 type Lease struct {
 	gateway     *Gateway
 	placeholder string
+	route       string
+}
+
+func (l *Lease) URL() string {
+	if l == nil || l.gateway == nil || l.route == "" {
+		return ""
+	}
+	return l.gateway.URL() + l.route
 }
 
 func (l *Lease) Placeholder() string {
@@ -31,7 +39,11 @@ func (l *Lease) Placeholder() string {
 
 func (l *Lease) Revoke() {
 	if l != nil && l.gateway != nil {
-		l.gateway.Revoke(l.placeholder)
+		if l.route != "" {
+			l.gateway.revokeProxy(l.route, l.placeholder)
+		} else {
+			l.gateway.Revoke(l.placeholder)
+		}
 	}
 }
 

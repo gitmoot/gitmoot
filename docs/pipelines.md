@@ -102,7 +102,7 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 | `stages[].needs`            | stage        | no       | Ids of sibling stages that must **succeed** before this stage is enqueued. Must reference known stages, never the stage itself, and form no cycle. |
 | `stages[].timeout`          | stage        | no       | Per-stage job timeout (positive Go duration). |
 | `stages[].retry`            | stage        | no       | How many times a **failed** stage may be re-attempted (`>= 0`, default `0`). |
-| `stages[].env_keys`         | stage        | no       | Exact names or globs (for example `REDDIT_*`) selected from the pipeline's `env_file`, granted shared registry keys, or inline `env`. Shell stages only; no entry means no injected values. |
+| `stages[].env_keys`         | stage        | no       | Exact names or globs (for example `REDDIT_*`) selected from the pipeline's `env_file`, granted shared registry keys, or inline `env`. Shell stages only; no entry means no key access. |
 | `stages[].success_decisions`| stage        | no       | Per-stage override of the pipeline default. |
 
 `gitmoot pipeline add` validates the whole spec **at add time** — unknown keys, a
@@ -128,6 +128,9 @@ keys must be registered and granted separately:
 gitmoot key path # edit this 0600 file; the CLI never accepts values
 gitmoot key add REDDIT_CLIENT_SECRET --mode injected
 gitmoot key grant REDDIT_CLIENT_SECRET --pipeline trend-scout
+gitmoot key add PARTNER_API_TOKEN --mode proxied
+gitmoot key configure PARTNER_API_TOKEN --upstream https://api.partner.example/v1 --auth bearer
+gitmoot key grant PARTNER_API_TOKEN --pipeline trend-scout
 ```
 
 ```yaml
@@ -162,8 +165,21 @@ same rows. Delivery rechecks every shared grant and its registry mode; revoking
 after enqueue fails the stage rather than switching to another source. Inline
 `env` is stored in the pipeline spec and is therefore for non-secrets only. An
 injected key is visible to its shell process; this is scoping and audit, not a
-vault. `proxied` registry mode is stored for future gateway composition but is
-refused for pipeline grants. The Claude model gateway remains independent.
+vault.
+
+A configured `proxied` shared key instead gives the shell a per-job placeholder
+in `<KEY>` and a loopback endpoint in `GITMOOT_PROXY_<KEY>_URL`. The endpoint is
+pinned to the configured HTTPS origin and normalized base path. Gitmoot places
+the real credential as either bearer auth or an approved custom header, rereads
+the keychain and rechecks the grant on every request, and revokes the lease when
+delivery ends. Rotation therefore applies to the next request; revocation
+returns `401` without contacting the upstream. Agent and gate stages remain
+ineligible, and the Claude model gateway remains independent.
+
+Proxied mode hides key bytes; it does **not** prevent an authorized child from
+exercising the credential on the pinned upstream. Curated upstreams and base
+paths are part of the model. Configure only trusted upstreams because an
+upstream can observe and potentially reflect the credential.
 
 On `pipeline add --enable`, Gitmoot publishes the owned flow. An unavailable
 Activepieces instance leaves a pending binding; run

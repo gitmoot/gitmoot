@@ -91,6 +91,9 @@ per shell stage. The key CLI manages names and grants, never values:
 gitmoot key path
 gitmoot key add REDDIT_CLIENT_SECRET --mode injected
 gitmoot key grant REDDIT_CLIENT_SECRET --pipeline trend-scout
+gitmoot key add PARTNER_API_TOKEN --mode proxied
+gitmoot key configure PARTNER_API_TOKEN --upstream https://api.partner.example/v1 --auth bearer
+gitmoot key grant PARTNER_API_TOKEN --pipeline trend-scout
 ```
 
 ```yaml
@@ -121,8 +124,16 @@ shared keys, which beat inline non-secret defaults; Gitmoot's internal
 exact or glob selectors. The stage job payload and `pipeline show --json` audit
 only `{stage,name,source,mode}` rows. Delivery rechecks shared grants, so a
 post-enqueue revoke fails closed without switching sources. The selected shell
-can still read an injected key. `proxied` mode is reserved for future gateway
-composition and is refused for pipelines; the Claude model gateway is separate.
+can still read an injected key.
+
+A configured `proxied` shared key gives the shell a per-job placeholder in
+`<KEY>` and a loopback URL in `GITMOOT_PROXY_<KEY>_URL`. Gitmoot pins requests
+to the configured HTTPS origin/base path, places the real value as bearer auth
+or an approved custom header, rereads the keychain and rechecks the grant per
+request, and revokes the lease when delivery ends. Proxied mode hides key bytes;
+it does **not** prevent an authorized child from exercising the credential on
+the pinned upstream. Curated upstreams and base paths are part of the model;
+configure only trusted services. The Claude model gateway is separate.
 
 The pipeline detail **Keys** tab is a names-only view of the same projection. It
 shows every stage, resolved key names with `own`/`shared`/`default` sources and

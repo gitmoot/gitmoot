@@ -10,9 +10,14 @@ import (
 	"os"
 	"strings"
 
+	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 )
+
+// Test-only seam for local httptest upstreams. Production configuration remains
+// HTTPS-only even for loopback addresses.
+var keyConfigureAllowLoopbackHTTP bool
 
 type keychainPathStatus struct {
 	Path   string `json:"path"`
@@ -44,6 +49,8 @@ func runKey(args []string, stdout, stderr io.Writer) int {
 		return runKeyList(args[1:], stdout, stderr)
 	case "show":
 		return runKeyShow(args[1:], stdout, stderr)
+	case "configure":
+		return runKeyConfigure(args[1:], stdout, stderr)
 	case "rm":
 		return runKeyRemove(args[1:], stdout, stderr)
 	case "grant":
@@ -63,6 +70,7 @@ func printKeyUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot key add <NAME> --mode injected|proxied [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot key list [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot key show <NAME> [--json] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot key configure <NAME> --upstream <URL> --auth bearer|header:<HeaderName> [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot key rm <NAME> [--force] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot key grant <NAME> --pipeline <PIPELINE> [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot key revoke <NAME> --pipeline <PIPELINE> [--json] [--home DIR]")
@@ -254,13 +262,112 @@ func runKeyList(args []string, stdout, stderr io.Writer) int {
 		return encodeKeyJSON(stdout, stderr, output)
 	}
 	for _, key := range output.Keys {
-		writeLine(stdout, "%s\t%s\t%s\tgrants=%d", key.Name, key.Mode, key.CreatedAt, len(key.Grants))
+		writeLine(stdout, "%s\t%s\t%s\tgrants=%d\tupstream=%s\tauth=%s", key.Name, key.Mode, key.CreatedAt, len(key.Grants), firstNonEmpty(key.ProxyUpstream, "-"), keyProxyAuthLabel(key.KeychainKey))
 	}
 	return 0
 }
 
 func runKeyShow(args []string, stdout, stderr io.Writer) int {
 	return runKeyNamedRead("show", args, stdout, stderr)
+}
+
+func runKeyConfigure(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		printKeyUsage(stderr)
+		if len(args) == 0 {
+			fmt.Fprintln(stderr, "key configure requires a name")
+			return 2
+		}
+		return 0
+	}
+	name := strings.TrimSpace(args[0])
+	fs := flag.NewFlagSet("key configure", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	jsonOut := fs.Bool("json", false, "print JSON")
+	upstream := fs.String("upstream", "", "fixed HTTPS upstream origin and base path")
+	auth := fs.String("auth", "", "credential placement: bearer or header:<HeaderName>")
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 || strings.TrimSpace(*upstream) == "" || strings.TrimSpace(*auth) == "" {
+		fmt.Fprintln(stderr, "key configure requires one name, --upstream <url>, and --auth bearer|header:<HeaderName>")
+		return 2
+	}
+	authKind, header, err := parseKeyProxyAuth(*auth)
+	if err != nil {
+		fmt.Fprintf(stderr, "key configure: %v\n", err)
+		return 2
+	}
+	policy, _, err := credgw.ValidateProxyPolicy(credgw.ProxyPolicy{
+		Upstream: strings.TrimSpace(*upstream), AuthKind: authKind, Header: header,
+		AllowLoopbackHTTP: keyConfigureAllowLoopbackHTTP,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "key configure: %v\n", err)
+		return 2
+	}
+	var output keychainKeyOutput
+	var status keychainPathStatus
+	if err := withStore(*home, func(store *db.Store) error {
+		ctx := context.Background()
+		key, found, err := store.GetKeychainKey(ctx, name)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("key %s is not registered", name)
+		}
+		if key.Mode != db.KeychainModeProxied {
+			return fmt.Errorf("key %s uses %s mode; key configure requires proxied mode", name, key.Mode)
+		}
+		configured, err := store.ConfigureKeychainProxy(ctx, name, policy.Upstream, string(policy.AuthKind), policy.Header)
+		if err != nil {
+			return err
+		}
+		rows, err := keyOutputs(ctx, store, []db.KeychainKey{configured})
+		if err != nil {
+			return err
+		}
+		output = rows[0]
+		status = inspectKeychain(ctx, store, *home)
+		return nil
+	}); err != nil {
+		fmt.Fprintf(stderr, "key configure: %v\n", err)
+		return 1
+	}
+	if *jsonOut {
+		return encodeKeyJSON(stdout, stderr, struct {
+			Keychain keychainPathStatus `json:"keychain"`
+			Key      keychainKeyOutput  `json:"key"`
+		}{status, output})
+	}
+	writeLine(stdout, "configured key %s upstream=%s auth=%s", name, output.ProxyUpstream, keyProxyAuthLabel(output.KeychainKey))
+	return 0
+}
+
+func parseKeyProxyAuth(raw string) (credgw.ProxyAuthKind, string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == string(credgw.ProxyAuthBearer) {
+		return credgw.ProxyAuthBearer, "", nil
+	}
+	if header, ok := strings.CutPrefix(raw, "header:"); ok && strings.TrimSpace(header) != "" {
+		return credgw.ProxyAuthHeader, strings.TrimSpace(header), nil
+	}
+	return "", "", fmt.Errorf("invalid --auth %q; use bearer or header:<HeaderName>", raw)
+}
+
+func keyProxyAuthLabel(key db.KeychainKey) string {
+	if key.ProxyAuthKind == db.KeychainProxyAuthHeader {
+		return "header:" + key.ProxyHeader
+	}
+	if key.ProxyAuthKind == db.KeychainProxyAuthBearer {
+		return db.KeychainProxyAuthBearer
+	}
+	return "-"
 }
 
 func runKeyNamedRead(verb string, args []string, stdout, stderr io.Writer) int {
@@ -321,6 +428,8 @@ func runKeyNamedRead(verb string, args []string, stdout, stderr io.Writer) int {
 	}
 	writeLine(stdout, "name: %s", output.Name)
 	writeLine(stdout, "mode: %s", output.Mode)
+	writeLine(stdout, "proxy_upstream: %s", firstNonEmpty(output.ProxyUpstream, "-"))
+	writeLine(stdout, "proxy_auth: %s", keyProxyAuthLabel(output.KeychainKey))
 	writeLine(stdout, "created_at: %s", output.CreatedAt)
 	writeLine(stdout, "keychain: %s (%s)", status.Path, status.Status)
 	writeLine(stdout, "grants:")
@@ -441,8 +550,8 @@ func runKeyGrantMutation(grant bool, args []string, stdout, stderr io.Writer) in
 			if !found {
 				return fmt.Errorf("key %s is not registered", name)
 			}
-			if key.Mode != db.KeychainModeInjected {
-				return fmt.Errorf("key %s uses proxied mode; pipeline grants currently accept injected keys only", name)
+			if key.Mode == db.KeychainModeProxied && !key.ProxyConfigured() {
+				return fmt.Errorf("key %s uses proxied mode but is not configured; run %s", name, keyConfigureCommand(name))
 			}
 			path, values, err := loadValidatedKeychainFile(ctx, store, *home)
 			if err != nil {
@@ -478,4 +587,8 @@ func runKeyGrantMutation(grant bool, args []string, stdout, stderr io.Writer) in
 	}
 	writeLine(stdout, "%s key %s for pipeline %s", past, name, *pipelineName)
 	return 0
+}
+
+func keyConfigureCommand(name string) string {
+	return fmt.Sprintf("gitmoot key configure %s --upstream <url> --auth bearer|header:<HeaderName>", name)
 }

@@ -703,11 +703,12 @@ func TestWebDataSourcePipelineDetailKeysNamesOnlyAndLiveDrift(t *testing.T) {
 	const (
 		ownSentinel     = "own-secret-value-974"
 		sharedSentinel  = "shared-secret-value-974"
+		proxiedSentinel = "proxied-secret-value-874"
 		defaultSentinel = "inline-default-value-974"
 	)
 	home := dashboardTestHome(t)
 	envFile := writePipelineEnvFile(t, t.TempDir(), "OWN_TWO="+ownSentinel+"\nOWN_ONE="+ownSentinel+"\n", 0o600)
-	writeDefaultKeychain(t, home, "SHARED_TOKEN="+sharedSentinel+"\n")
+	writeDefaultKeychain(t, home, "SHARED_TOKEN="+sharedSentinel+"\nPROXY_TOKEN="+proxiedSentinel+"\n")
 	raw := fmt.Sprintf(`name: keys-view
 env_file: %q
 env:
@@ -715,7 +716,7 @@ env:
 stages:
   - id: deliver
     cmd: echo deliver
-    env_keys: [OWN_*, SHARED_TOKEN, DEFAULT_TOKEN]
+    env_keys: [OWN_*, SHARED_TOKEN, PROXY_TOKEN, DEFAULT_TOKEN]
   - id: harvest
     cmd: echo harvest
   - id: inspect
@@ -729,6 +730,15 @@ stages:
 		t.Fatal(err)
 	}
 	if _, err := store.GrantKeychainKey(context.Background(), db.KeychainConsumerPipeline, "keys-view", "SHARED_TOKEN"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddKeychainKey(context.Background(), "PROXY_TOKEN", db.KeychainModeProxied); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ConfigureKeychainProxy(context.Background(), "PROXY_TOKEN", "https://api.example.test/v1", db.KeychainProxyAuthBearer, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GrantKeychainKey(context.Background(), db.KeychainConsumerPipeline, "keys-view", "PROXY_TOKEN"); err != nil {
 		t.Fatal(err)
 	}
 	store.Close()
@@ -748,6 +758,7 @@ stages:
 		{Name: "OWN_ONE", Source: pipelineKeySourceOwn, Mode: db.KeychainModeInjected},
 		{Name: "OWN_TWO", Source: pipelineKeySourceOwn, Mode: db.KeychainModeInjected},
 		{Name: "SHARED_TOKEN", Source: pipelineKeySourceShared, Mode: db.KeychainModeInjected},
+		{Name: "PROXY_TOKEN", Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied},
 		{Name: "DEFAULT_TOKEN", Source: pipelineKeySourceDefault, Mode: db.KeychainModeInjected},
 	}
 	if got := detail.Keys.Stages[0]; got.ID != "deliver" || got.Kind != "shell" || !reflect.DeepEqual(got.Keys, wantKeys) || len(got.UnresolvedSelectors) != 0 {
@@ -762,7 +773,7 @@ stages:
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, sentinel := range []string{ownSentinel, sharedSentinel, defaultSentinel} {
+	for _, sentinel := range []string{ownSentinel, sharedSentinel, proxiedSentinel, defaultSentinel} {
 		if strings.Contains(string(encoded), sentinel) {
 			t.Fatalf("PipelineDetail leaked secret/default value %q: %s", sentinel, encoded)
 		}

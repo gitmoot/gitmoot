@@ -273,19 +273,19 @@ func dashboardPipelineKeys(ctx context.Context, store *db.Store, home string, sp
 	if err != nil {
 		return dashboard.PipelineKeys{}, err
 	}
-	sharedNames := make(map[string]struct{})
+	availableShared := make(map[string]db.KeychainKey)
 	if len(sharedCandidates) > 0 {
 		// Keychain drift is advisory on this read-only endpoint. A missing or invalid
 		// file makes shared selectors unresolved; delivery remains fail-closed.
 		if names, loadErr := loadValidatedKeychainNames(ctx, store, home); loadErr == nil {
-			for name := range sharedCandidates {
+			for name, key := range sharedCandidates {
 				if _, present := names[name]; present {
-					sharedNames[name] = struct{}{}
+					availableShared[name] = key
 				}
 			}
 		}
 	}
-	resolution := projectPipelineEnvironment(spec, inspection.Names, sharedNames)
+	resolution := projectPipelineEnvironment(spec, inspection.Names, availableShared)
 	for _, stage := range spec.Stages {
 		row := dashboard.PipelineStageKeys{
 			ID:                  stage.ID,

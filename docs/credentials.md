@@ -39,9 +39,9 @@ from ambient managed variables once. Existing files are never overwritten.
 For systemd deployments, keep `daemon.env` for operational values such as
 `PATH`; do not duplicate Claude secrets there after bootstrap.
 
-## Injected key registry and grants
+## Key registry and grants
 
-The shared injected-key source is an operator-owned env file. Its default path
+The shared key source is an operator-owned env file. Its default path
 is `<base-home>/.config/gitmoot/keychain.env`; `gitmoot key path` prints the
 resolved path and validation status. `[credentials] keychain_path` can select a
 different absolute path. The file must be regular, owned by the current uid,
@@ -56,6 +56,8 @@ print values:
 gitmoot key path
 gitmoot key add SOURCE_API_TOKEN --mode injected
 gitmoot key grant SOURCE_API_TOKEN --pipeline nightly-sync
+gitmoot key add PARTNER_API_TOKEN --mode proxied
+gitmoot key configure PARTNER_API_TOKEN --upstream https://api.partner.example/v1 --auth bearer
 gitmoot key list --json
 gitmoot key show SOURCE_API_TOKEN
 gitmoot key revoke SOURCE_API_TOKEN --pipeline nightly-sync
@@ -64,12 +66,26 @@ gitmoot key rm SOURCE_API_TOKEN --force
 ```
 
 `rm` removes registry metadata and grants, not the operator's file entry.
-`proxied` mode is reserved for future gateway composition and cannot be granted
-to a pipeline. Pipeline shell stages may request granted `injected` names with
+`proxied` keys must be configured before they can be granted. `--auth bearer`
+places the real value in the upstream `Authorization` header; `--auth
+header:X-Api-Key` uses an approved custom header. The upstream must be an
+absolute HTTPS origin and its normalized base path is pinned. Pipeline shell
+stages may request granted `injected` or configured `proxied` names with
 `env_keys`; agent and gate stages remain ineligible. Resolution is Gitmoot's
 reserved `GITMOOT_*` namespace, then the pipeline's own `env_file`, then a
 granted shared key, then inline non-secret `env`. Registered but ungranted names
 are not visible to exact or glob selectors.
+
+For a proxied key, the shell receives a per-job `gitmoot-kc-...` placeholder in
+the requested variable and a `GITMOOT_PROXY_<KEY>_URL` loopback URL. Gitmoot
+rechecks the grant and configuration and rereads the keychain on every request,
+so rotation applies to the next request and revocation fails closed with `401`.
+The lease is revoked when the stage delivery ends.
+
+Proxied mode hides key bytes; it does **not** prevent an authorized child from
+exercising the credential on the pinned upstream. Curated upstreams and base
+paths are part of the model. A malicious or compromised upstream could still
+reflect a credential, so configure only trusted services.
 
 ## Claude model gateway
 
@@ -91,12 +107,10 @@ credential and ignore the placeholder — the gateway would then `401` the
 delivery (#936). The mirror never contains a credential; the operator's real
 config is only read, never modified.
 
-Pipeline-owned `env_file` values and granted shared keychain values are a
-separate **injected** mode for opaque API credentials whose shell script must
-present the real value. Gitmoot scopes those values to selected shell stages
-and audits names, sources, and modes only, but the selected process necessarily
-receives the real credential. This does not alter the Claude gateway or its
-placeholder flow.
+Pipeline key delivery is independent of the Claude gateway. `injected` keys
+give the selected shell process the real value. `proxied` keys use generic
+per-job loopback leases whose values are resolved for each request; they do not
+alter Claude's model-gateway placeholder flow.
 
 The feature is off by default and currently covers Claude only. A populated
 `runtime-auth.env` is required while it is enabled; Gitmoot fails the delivery

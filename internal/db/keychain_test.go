@@ -15,16 +15,20 @@ func TestKeychainMigrationAppliesToExistingDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	version := 0
+	proxyVersion := 0
 	for i, migration := range migrations {
 		if strings.Contains(migration, "CREATE TABLE keychain_keys") {
 			version = i + 1
-			break
+		}
+		if strings.Contains(migration, "ADD COLUMN proxy_upstream") {
+			proxyVersion = i + 1
 		}
 	}
-	if version == 0 {
-		t.Fatal("keychain migration not found")
+	if version == 0 || proxyVersion == 0 {
+		t.Fatalf("keychain migrations not found: create=%d proxy=%d", version, proxyVersion)
 	}
-	if _, err := legacy.db.Exec(`DROP TABLE keychain_grants; DROP TABLE keychain_keys; DELETE FROM schema_migrations WHERE version = ?`, version); err != nil {
+	if _, err := legacy.db.Exec(`DROP TABLE keychain_grants; DROP TABLE keychain_keys;
+		DELETE FROM schema_migrations WHERE version IN (?, ?)`, version, proxyVersion); err != nil {
 		t.Fatalf("rewind keychain migration: %v", err)
 	}
 	if err := legacy.Close(); err != nil {
@@ -38,6 +42,26 @@ func TestKeychainMigrationAppliesToExistingDatabase(t *testing.T) {
 	for _, table := range []string{"keychain_keys", "keychain_grants"} {
 		if ok, err := store.HasTable(context.Background(), table); err != nil || !ok {
 			t.Fatalf("table %s ok=%v err=%v", table, ok, err)
+		}
+	}
+	columns, err := store.db.QueryContext(context.Background(), `PRAGMA table_info(keychain_keys)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer columns.Close()
+	found := map[string]bool{}
+	for columns.Next() {
+		var cid, notNull, primaryKey int
+		var name, typ string
+		var defaultValue any
+		if err := columns.Scan(&cid, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatal(err)
+		}
+		found[name] = true
+	}
+	for _, name := range []string{"proxy_upstream", "proxy_auth_kind", "proxy_header"} {
+		if !found[name] {
+			t.Fatalf("proxy migration did not add %s", name)
 		}
 	}
 }
@@ -64,8 +88,19 @@ func TestKeychainCRUDGrantIdempotenceAndForcedCleanup(t *testing.T) {
 	if _, err := store.AddKeychainKey(ctx, "MODEL_TOKEN", KeychainModeProxied); err != nil {
 		t.Fatal(err)
 	}
-	if changed, err := store.GrantKeychainKey(ctx, KeychainConsumerPipeline, "deploy-flow", "MODEL_TOKEN"); changed || !errors.Is(err, ErrKeychainProxiedGrant) {
-		t.Fatalf("proxied grant = changed %v err %v", changed, err)
+	if changed, err := store.GrantKeychainKey(ctx, KeychainConsumerPipeline, "deploy-flow", "MODEL_TOKEN"); changed || !errors.Is(err, ErrKeychainProxyUnconfigured) {
+		t.Fatalf("unconfigured proxied grant = changed %v err %v", changed, err)
+	}
+	configured, err := store.ConfigureKeychainProxy(ctx, "MODEL_TOKEN", "https://api.example.test/v1", KeychainProxyAuthHeader, "X-Model-Key")
+	if err != nil || configured.ProxyUpstream != "https://api.example.test/v1" || configured.ProxyAuthKind != KeychainProxyAuthHeader || configured.ProxyHeader != "X-Model-Key" || !configured.ProxyConfigured() {
+		t.Fatalf("ConfigureKeychainProxy = %+v err=%v", configured, err)
+	}
+	if changed, err := store.GrantKeychainKey(ctx, KeychainConsumerPipeline, "deploy-flow", "MODEL_TOKEN"); err != nil || !changed {
+		t.Fatalf("configured proxied grant = changed %v err %v", changed, err)
+	}
+	grantedProxy, found, err := store.GetGrantedKey(ctx, KeychainConsumerPipeline, "deploy-flow", "MODEL_TOKEN")
+	if err != nil || !found || !grantedProxy.ProxyConfigured() {
+		t.Fatalf("GetGrantedKey proxied = %+v found=%v err=%v", grantedProxy, found, err)
 	}
 	changed, err := store.GrantKeychainKey(ctx, KeychainConsumerPipeline, "deploy-flow", "API_TOKEN")
 	if err != nil || !changed {
@@ -93,7 +128,7 @@ func TestKeychainCRUDGrantIdempotenceAndForcedCleanup(t *testing.T) {
 		t.Fatalf("idempotent revoke = changed %v err %v", changed, err)
 	}
 	keys, err := store.ListKeychainKeys(ctx)
-	if err != nil || len(keys) != 1 || keys[0].Name != "MODEL_TOKEN" {
+	if err != nil || len(keys) != 1 || keys[0].Name != "MODEL_TOKEN" || keys[0].ProxyHeader != "X-Model-Key" {
 		t.Fatalf("keys = %+v err=%v", keys, err)
 	}
 }

@@ -3,16 +3,21 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -433,6 +438,111 @@ func TestPipelineSharedKeyDeliveryRotationAndRevocation(t *testing.T) {
 	}
 }
 
+func TestPipelineProxiedKeyResolutionAndDeliveryLease(t *testing.T) {
+	ctx := context.Background()
+	home, _, store := heartbeatLoopE2EHome(t)
+	writeDefaultKeychain(t, home, "PROXY_KEY="+pipelineEnvSecretA+"\n")
+	if err := store.CreateOrUpdatePipeline(ctx, db.Pipeline{Name: "proxy-delivery", SpecYAML: "name: proxy-delivery\nstages: [{id: run, cmd: echo}]\n"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddKeychainKey(ctx, "PROXY_KEY", db.KeychainModeProxied); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ConfigureKeychainProxy(ctx, "PROXY_KEY", "https://api.example.test/v1", db.KeychainProxyAuthBearer, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GrantKeychainKey(ctx, db.KeychainConsumerPipeline, "proxy-delivery", "PROXY_KEY"); err != nil {
+		t.Fatal(err)
+	}
+	spec := pipeline.Spec{Name: "proxy-delivery", Stages: []pipeline.Stage{{ID: "run", Cmd: "echo", EnvKeys: []string{"PROXY_KEY"}}}}
+	access, err := resolvePipelineStageEnvAccess(ctx, store, home, spec, spec.Stages[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []workflow.PipelineKeyAccess{{Stage: "run", Name: "PROXY_KEY", Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied}}
+	if !reflect.DeepEqual(access.Access, want) {
+		t.Fatalf("proxied access = %#v, want %#v", access.Access, want)
+	}
+
+	previousRegistry := modelGatewayRegistry
+	previousLogf := modelGatewayLogf
+	modelGatewayRegistry = credgw.NewRegistry()
+	modelGatewayLogf = func(string, ...any) {}
+	paths, err := configPathsForPipelineStore(store, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = modelGatewayRegistry.CloseHome(context.Background(), paths.Home)
+		modelGatewayRegistry = previousRegistry
+		modelGatewayLogf = previousLogf
+	})
+	capture := &pipelineEnvCaptureAdapter{}
+	wrapper := wrapPipelineEnvDeliveryAdapter(store, home, workflow.JobPayload{
+		PipelineName: "proxy-delivery", PipelineKeyAccess: access.Access,
+	}, capture)
+	if _, err := wrapper.Deliver(ctx, runtime.Agent{}, runtime.Job{ID: "proxy-delivery-job"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(capture.jobs) != 1 {
+		t.Fatalf("deliveries = %d", len(capture.jobs))
+	}
+	env := capture.jobs[0].ShellEnv
+	placeholder := envEntryValue(env, "PROXY_KEY")
+	leaseURL := envEntryValue(env, "GITMOOT_PROXY_PROXY_KEY_URL")
+	if !strings.HasPrefix(placeholder, "gitmoot-kc-proxy-delivery-job-") || !strings.HasPrefix(leaseURL, "http://127.0.0.1:") {
+		t.Fatalf("proxied shell env = %#v", env)
+	}
+	if strings.Contains(strings.Join(env, "\n"), pipelineEnvSecretA) {
+		t.Fatalf("real proxied value reached ShellEnv: %#v", env)
+	}
+	request, _ := http.NewRequest(http.MethodGet, leaseURL, nil)
+	request.Header.Set("Authorization", "Bearer "+placeholder)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("deferred lease revocation status = %d", response.StatusCode)
+	}
+}
+
+func TestPipelineUnconfiguredProxiedKeyFailsAtEnqueue(t *testing.T) {
+	ctx := context.Background()
+	home, _, store := heartbeatLoopE2EHome(t)
+	writeDefaultKeychain(t, home, "PROXY_KEY="+pipelineEnvSecretA+"\n")
+	if err := store.CreateOrUpdatePipeline(ctx, db.Pipeline{Name: "unconfigured-proxy", SpecYAML: "name: unconfigured-proxy\nstages: [{id: run, cmd: echo}]\n"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddKeychainKey(ctx, "PROXY_KEY", db.KeychainModeProxied); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.ExecContext(ctx, `INSERT INTO keychain_grants(consumer_kind, consumer_id, key_name) VALUES (?, ?, ?)`, db.KeychainConsumerPipeline, "unconfigured-proxy", "PROXY_KEY"); err != nil {
+		t.Fatal(err)
+	}
+	spec := pipeline.Spec{Name: "unconfigured-proxy", Stages: []pipeline.Stage{{ID: "run", Cmd: "echo", EnvKeys: []string{"PROXY_KEY"}}}}
+	_, err = resolvePipelineStageEnvAccess(ctx, store, home, spec, spec.Stages[0])
+	if err == nil || !strings.Contains(err.Error(), "gitmoot key configure PROXY_KEY") {
+		t.Fatalf("unconfigured proxied resolution error = %v", err)
+	}
+}
+
+func envEntryValue(env []string, name string) string {
+	prefix := name + "="
+	for i := len(env) - 1; i >= 0; i-- {
+		if strings.HasPrefix(env[i], prefix) {
+			return strings.TrimPrefix(env[i], prefix)
+		}
+	}
+	return ""
+}
+
 func TestPipelineEnvironmentValidationTiming(t *testing.T) {
 	home := t.TempDir()
 	specFile := writeSpec(t, "name: unresolved-env\nrepo: owner/repo\nstages: [{id: run, cmd: echo, env_keys: [MISSING]}]\n")
@@ -814,4 +924,237 @@ stages:
 	}); err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
+}
+
+func TestPipelineProxiedKeyShellE2E(t *testing.T) {
+	ctx := context.Background()
+	home, paths, store := heartbeatLoopE2EHome(t)
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	const (
+		keyName  = "KEYCARD_PROXY_E2E"
+		sentinel = "proxied-real-sentinel-874"
+	)
+	writeDefaultKeychain(t, home, keyName+"="+sentinel+"\n")
+
+	var upstreamMu sync.Mutex
+	upstreamCalls := 0
+	var upstreamProblems []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamMu.Lock()
+		upstreamCalls++
+		if r.URL.Path != "/pinned/action" {
+			upstreamProblems = append(upstreamProblems, "unexpected path "+r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer "+sentinel {
+			upstreamProblems = append(upstreamProblems, "upstream did not receive the real bearer")
+		}
+		if strings.Contains(r.Header.Get("Authorization"), "gitmoot-kc-") {
+			upstreamProblems = append(upstreamProblems, "upstream received the placeholder")
+		}
+		upstreamMu.Unlock()
+		if _, err := store.RevokeKeychainKey(context.Background(), db.KeychainConsumerPipeline, "proxy-e2e", keyName); err != nil {
+			upstreamMu.Lock()
+			upstreamProblems = append(upstreamProblems, "revoke failed")
+			upstreamMu.Unlock()
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	previousRegistry := modelGatewayRegistry
+	previousLogf := modelGatewayLogf
+	previousConfigureHTTP := keyConfigureAllowLoopbackHTTP
+	previousDeliveryHTTP := pipelineProxyAllowLoopbackHTTP
+	modelGatewayRegistry = credgw.NewRegistry()
+	var gatewayLogs gatewayLogSink
+	modelGatewayLogf = gatewayLogs.Logf
+	keyConfigureAllowLoopbackHTTP = true
+	pipelineProxyAllowLoopbackHTTP = true
+	configPaths, err := configPathsForPipelineStore(store, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = modelGatewayRegistry.CloseHome(context.Background(), configPaths.Home)
+		modelGatewayRegistry = previousRegistry
+		modelGatewayLogf = previousLogf
+		keyConfigureAllowLoopbackHTTP = previousConfigureHTTP
+		pipelineProxyAllowLoopbackHTTP = previousDeliveryHTTP
+	})
+
+	testBinary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	envDump := filepath.Join(t.TempDir(), "proxy-child-env.txt")
+	t.Setenv("GITMOOT_PIPELINE_PROXY_HELPER", "1")
+	t.Setenv("GITMOOT_PIPELINE_PROXY_ENV_DUMP", envDump)
+	command := fmt.Sprintf("%q -test.run '^TestPipelineProxiedShellHelperProcess$'", testBinary)
+	specFile := writeSpec(t, fmt.Sprintf(`name: proxy-e2e
+repo: owner/repo
+stages:
+  - id: call
+    cmd: |
+      %s
+    env_keys: [%s]
+`, command, keyName))
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"pipeline", "add", specFile, "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("pipeline add code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	for _, args := range [][]string{
+		{"key", "add", keyName, "--mode", "proxied", "--home", home},
+		{"key", "configure", keyName, "--upstream", upstream.URL + "/pinned", "--auth", "bearer", "--home", home},
+		{"key", "grant", keyName, "--pipeline", "proxy-e2e", "--home", home},
+	} {
+		stdout.Reset()
+		stderr.Reset()
+		if code := Run(args, &stdout, &stderr); code != 0 {
+			t.Fatalf("%v code=%d stdout=%q stderr=%q", args, code, stdout.String(), stderr.String())
+		}
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"pipeline", "run", "proxy-e2e", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("pipeline run code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	runID := strings.TrimSpace(stdout.String())
+	enqueue := newPipelineStageEnqueuer(store, home)
+	worker := defaultJobWorker(store, io.Discard, home)
+	now := time.Date(2026, 7, 16, 17, 0, 0, 0, time.UTC)
+	for i := 0; i < 8; i++ {
+		if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now); err != nil {
+			t.Fatalf("worker tick %d: %v", i, err)
+		}
+		if err := runPipelineScanOnce(ctx, store, enqueue, now); err != nil {
+			t.Fatalf("pipeline scan %d: %v", i, err)
+		}
+		run, _, err := store.GetPipelineRun(ctx, runID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if run.State != pipeline.RunRunning {
+			if run.State != pipeline.RunSucceeded {
+				t.Fatalf("run state=%s halt=%s reason=%s", run.State, run.HaltStage, run.HaltReason)
+			}
+			break
+		}
+	}
+	upstreamMu.Lock()
+	if upstreamCalls != 1 || len(upstreamProblems) != 0 {
+		t.Fatalf("upstream calls=%d problems=%v", upstreamCalls, upstreamProblems)
+	}
+	upstreamMu.Unlock()
+	dump, err := os.ReadFile(envDump)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dumpLines := strings.Split(strings.TrimSpace(string(dump)), "\n")
+	if len(dumpLines) != 2 || !strings.HasPrefix(dumpLines[0], "gitmoot-kc-") || !strings.HasPrefix(dumpLines[1], "http://127.0.0.1:") || strings.Contains(string(dump), sentinel) {
+		t.Fatalf("child proxy env dump = %q", dump)
+	}
+	placeholder := dumpLines[0]
+
+	stage := stageRow(t, store, runID, "call")
+	job, err := store.GetJob(ctx, stage.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAccess := []workflow.PipelineKeyAccess{{Stage: "call", Name: keyName, Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied}}
+	if !reflect.DeepEqual(payload.PipelineKeyAccess, wantAccess) {
+		t.Fatalf("proxied payload access = %#v", payload.PipelineKeyAccess)
+	}
+	detail, err := (&webDataSource{home: home}).PipelineDetail(ctx, "proxy-e2e")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dashboardJSON, err := json.Marshal(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.ListJobEvents(ctx, stage.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted := job.Payload + string(dashboardJSON) + gatewayLogs.String()
+	for _, event := range events {
+		persisted += event.Message
+	}
+	for _, forbidden := range []string{sentinel, placeholder} {
+		if strings.Contains(persisted, forbidden) {
+			t.Fatalf("persisted/logged output contains forbidden capability or value")
+		}
+	}
+	for _, persistedPath := range []string{paths.Database, paths.Database + "-wal"} {
+		data, err := os.ReadFile(persistedPath)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if bytes.Contains(data, []byte(sentinel)) || bytes.Contains(data, []byte(placeholder)) {
+			t.Fatalf("credential material persisted in %s", persistedPath)
+		}
+	}
+	if err := filepath.WalkDir(paths.Logs, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if bytes.Contains(data, []byte(sentinel)) || bytes.Contains(data, []byte(placeholder)) {
+			return fmt.Errorf("credential material persisted in log %s", path)
+		}
+		return nil
+	}); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+}
+
+func TestPipelineProxiedShellHelperProcess(t *testing.T) {
+	if os.Getenv("GITMOOT_PIPELINE_PROXY_HELPER") != "1" {
+		return
+	}
+	placeholder := os.Getenv("KEYCARD_PROXY_E2E")
+	leaseURL := os.Getenv("GITMOOT_PROXY_KEYCARD_PROXY_E2E_URL")
+	if !strings.HasPrefix(placeholder, "gitmoot-kc-") || leaseURL == "" || placeholder == "proxied-real-sentinel-874" {
+		fmt.Fprintln(os.Stderr, "invalid proxied child environment")
+		os.Exit(2)
+	}
+	if err := os.WriteFile(os.Getenv("GITMOOT_PIPELINE_PROXY_ENV_DUMP"), []byte(placeholder+"\n"+leaseURL+"\n"), 0o600); err != nil {
+		fmt.Fprintln(os.Stderr, "write proxy environment audit failed")
+		os.Exit(2)
+	}
+	call := func(want int) {
+		request, err := http.NewRequest(http.MethodPost, leaseURL+"/action", strings.NewReader("safe-body"))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "build proxy request failed")
+			os.Exit(2)
+		}
+		request.Header.Set("Authorization", "Bearer "+placeholder)
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "proxy request failed")
+			os.Exit(2)
+		}
+		response.Body.Close()
+		if response.StatusCode != want {
+			fmt.Fprintln(os.Stderr, "unexpected proxy response")
+			os.Exit(2)
+		}
+	}
+	call(http.StatusNoContent)
+	call(http.StatusUnauthorized)
+	fmt.Fprint(os.Stdout, `{"gitmoot_result":{"decision":"approved","summary":"proxied request lifecycle passed","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`)
+	os.Exit(0)
 }

@@ -9192,4 +9192,13 @@ CREATE TABLE keychain_grants (
 );
 CREATE INDEX idx_keychain_grants_key_name ON keychain_grants(key_name);
 	`,
+	// #874 fixed-upstream proxy metadata for proxied keycard entries. Existing
+	// proxied rows remain deliberately unconfigured until `gitmoot key configure`
+	// supplies all three fields; credential values remain outside SQLite.
+	`
+ALTER TABLE keychain_keys ADD COLUMN proxy_upstream TEXT;
+ALTER TABLE keychain_keys ADD COLUMN proxy_auth_kind TEXT
+	CHECK(proxy_auth_kind IS NULL OR proxy_auth_kind IN ('bearer', 'header'));
+ALTER TABLE keychain_keys ADD COLUMN proxy_header TEXT;
+	`,
 }

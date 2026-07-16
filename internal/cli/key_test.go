@@ -72,6 +72,14 @@ func TestKeyCLIRegistryGrantsAndSecretSafety(t *testing.T) {
 	} else if strings.Contains(out+errOut, keychainSentinel) {
 		t.Fatalf("proxied refusal leaked value: %q %q", out, errOut)
 	}
+	if code, out, errOut := runKeyTestCommand(t, "key", "configure", "PROXY", "--upstream", "https://api.example.test/v1/", "--auth", "header:X-Api-Token", "--home", home, "--json"); code != 0 || !strings.Contains(out, `"proxy_upstream": "https://api.example.test/v1"`) || !strings.Contains(out, `"proxy_auth_kind": "header"`) || !strings.Contains(out, `"proxy_header": "X-Api-Token"`) {
+		t.Fatalf("key configure code=%d out=%q err=%q", code, out, errOut)
+	} else if strings.Contains(out+errOut, keychainSentinel) {
+		t.Fatalf("key configure leaked value: %q %q", out, errOut)
+	}
+	if code, out, errOut := runKeyTestCommand(t, "key", "grant", "PROXY", "--pipeline", "pipe", "--home", home); code != 0 {
+		t.Fatalf("configured proxied grant code=%d out=%q err=%q", code, out, errOut)
+	}
 	if code, out, errOut := runKeyTestCommand(t, "key", "grant", "SHARED", "--pipeline", "pipe", "--home", home, "--json"); code != 0 {
 		t.Fatalf("grant code=%d out=%q err=%q", code, out, errOut)
 	} else if strings.Contains(out+errOut, keychainSentinel) {
@@ -81,13 +89,22 @@ func TestKeyCLIRegistryGrantsAndSecretSafety(t *testing.T) {
 	for _, args := range [][]string{
 		{"key", "list", "--home", home, "--json"},
 		{"key", "show", "SHARED", "--home", home, "--json"},
+		{"key", "show", "PROXY", "--home", home, "--json"},
 		{"key", "list", "--home", home},
 		{"key", "show", "SHARED", "--home", home},
+		{"key", "show", "PROXY", "--home", home},
 	} {
 		code, out, errOut := runKeyTestCommand(t, args...)
 		wantGrantTarget := args[1] == "show" || slices.Contains(args, "--json")
-		if code != 0 || !strings.Contains(out, "SHARED") || (wantGrantTarget && !strings.Contains(out, "pipe")) {
+		wantName := "SHARED"
+		if slices.Contains(args, "PROXY") {
+			wantName = "PROXY"
+		}
+		if code != 0 || !strings.Contains(out, wantName) || (wantGrantTarget && !strings.Contains(out, "pipe")) {
 			t.Fatalf("%v code=%d out=%q err=%q", args, code, out, errOut)
+		}
+		if wantName == "PROXY" && (!strings.Contains(out, "https://api.example.test/v1") || !strings.Contains(out, "X-Api-Token")) {
+			t.Fatalf("%v omitted proxy configuration: %q", args, out)
 		}
 		if strings.Contains(out+errOut, keychainSentinel) {
 			t.Fatalf("%v leaked value: %q %q", args, out, errOut)
@@ -115,6 +132,53 @@ func TestKeyCLIRegistryGrantsAndSecretSafety(t *testing.T) {
 	}
 	if strings.Contains(printKeyUsageString(), "value") {
 		t.Fatal("key command usage exposes a value-input option")
+	}
+}
+
+func TestKeyConfigureRejectsUnsafeProxyMetadata(t *testing.T) {
+	tests := []struct {
+		name     string
+		upstream string
+		auth     string
+		want     string
+	}{
+		{name: "http non-loopback", upstream: "http://api.example.test/v1", auth: "bearer", want: "HTTPS is required"},
+		{name: "userinfo", upstream: "https://user:pass@api.example.test/v1", auth: "bearer", want: "userinfo is not allowed"},
+		{name: "query", upstream: "https://api.example.test/v1?token=x", auth: "bearer", want: "query is not allowed"},
+		{name: "fragment", upstream: "https://api.example.test/v1#part", auth: "bearer", want: "fragment is not allowed"},
+		{name: "relative", upstream: "api.example.test/v1", auth: "bearer", want: "absolute URL with a host"},
+		{name: "dot path", upstream: "https://api.example.test/v1/../admin", auth: "bearer", want: "escaping segment"},
+		{name: "encoded dot path", upstream: "https://api.example.test/v1/%2e%2e/admin", auth: "bearer", want: "escaping segment"},
+		{name: "bad header token", upstream: "https://api.example.test/v1", auth: "header:Bad Header", want: "HTTP token"},
+		{name: "hop by hop", upstream: "https://api.example.test/v1", auth: "header:Connection", want: "not allowed"},
+		{name: "host", upstream: "https://api.example.test/v1", auth: "header:Host", want: "not allowed"},
+		{name: "cookie", upstream: "https://api.example.test/v1", auth: "header:Cookie", want: "not allowed"},
+		{name: "proxy auth", upstream: "https://api.example.test/v1", auth: "header:Proxy-Authorization", want: "not allowed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			writeDefaultKeychain(t, home, "PROXY=proxy-"+keychainSentinel+"\n")
+			if code, out, errOut := runKeyTestCommand(t, "key", "add", "PROXY", "--mode", "proxied", "--home", home); code != 0 {
+				t.Fatalf("key add code=%d out=%q err=%q", code, out, errOut)
+			}
+			code, out, errOut := runKeyTestCommand(t, "key", "configure", "PROXY", "--upstream", tt.upstream, "--auth", tt.auth, "--home", home)
+			if code == 0 || !strings.Contains(errOut, tt.want) {
+				t.Fatalf("configure code=%d out=%q err=%q want=%q", code, out, errOut, tt.want)
+			}
+			if strings.Contains(out+errOut, keychainSentinel) {
+				t.Fatalf("configure error leaked value: out=%q err=%q", out, errOut)
+			}
+		})
+	}
+
+	home := t.TempDir()
+	writeDefaultKeychain(t, home, "INJECTED="+keychainSentinel+"\n")
+	if code, out, errOut := runKeyTestCommand(t, "key", "add", "INJECTED", "--mode", "injected", "--home", home); code != 0 {
+		t.Fatalf("key add injected code=%d out=%q err=%q", code, out, errOut)
+	}
+	if code, out, errOut := runKeyTestCommand(t, "key", "configure", "INJECTED", "--upstream", "https://api.example.test", "--auth", "bearer", "--home", home); code == 0 || !strings.Contains(errOut, "requires proxied mode") {
+		t.Fatalf("configure injected code=%d out=%q err=%q", code, out, errOut)
 	}
 }
 

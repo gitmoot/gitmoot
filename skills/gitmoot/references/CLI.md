@@ -149,6 +149,7 @@ defaulting to `<base-home>/.config/gitmoot/keychain.env` (override with
 ```sh
 gitmoot key path [--json]
 gitmoot key add <NAME> --mode injected|proxied [--json]
+gitmoot key configure <NAME> --upstream <https-url> --auth bearer|header:<HeaderName> [--json]
 gitmoot key list [--json]
 gitmoot key show <NAME> [--json]
 gitmoot key grant <NAME> --pipeline <pipeline> [--json]
@@ -157,9 +158,9 @@ gitmoot key rm <NAME> [--force] [--json]
 ```
 
 There is deliberately no value flag, stdin value, or value-derived hash.
-`proxied` metadata is reserved for future gateway composition and cannot be
-granted to a pipeline. `rm --force` removes metadata and grants but leaves the
-file entry untouched.
+`proxied` keys must be configured with a pinned HTTPS origin/base path and
+bearer or approved custom-header placement before they can be granted.
+`rm --force` removes metadata and grants but leaves the file entry untouched.
 
 Runtime-child environment curation is off by default. Enable it in
 `config.toml`:
@@ -2801,19 +2802,27 @@ with `env_keys`. Source files must be absolute, operator-owned regular files
 with mode exactly `0600`, outside the Gitmoot home and every managed checkout;
 inline `env` is for non-secret defaults. Agent/gate stages cannot set
 `env_keys`; a shell stage with no list gets nothing. Resolution is own
-`env_file`, then a shared `injected` key granted with `gitmoot key grant`, then
-inline default. Registered but ungranted names do not match exact or glob
-selectors. Structural errors always fail add; unresolved names warn only while
-the pipeline remains disabled, then hard-fail add-with-enable, enable, manual
-run, and scheduled/triggered preflight.
+`env_file`, then a shared `injected` or configured `proxied` key granted with
+`gitmoot key grant`, then inline default. Registered but ungranted names do not
+match exact or glob selectors. Structural errors always fail add; unresolved
+names warn only while the pipeline remains disabled, then hard-fail
+add-with-enable, enable, manual run, and scheduled/triggered preflight.
 
 Sources are revalidated and reread at delivery, so rotation applies without a
 daemon restart. Each payload audits `PipelineName` and names-only
 `PipelineKeyAccess` rows `{stage,name,source,mode}`; `pipeline show --json`
 exposes the same projection. A shared grant is rechecked immediately before
 delivery: revocation fails closed and never switches to another source. Gitmoot
-internal `GITMOOT_*` entries remain final. This injected mode exposes the value
-to that shell process and stays separate from the Claude model gateway.
+internal `GITMOOT_*` entries remain final. Injected mode exposes the value to
+that shell process. Proxied mode puts a per-job placeholder in `<KEY>` and a
+loopback endpoint in `GITMOOT_PROXY_<KEY>_URL`; every request rereads the value,
+rechecks the grant, and is constrained to the configured upstream/base path.
+The lease is revoked when delivery ends.
+
+Proxied mode hides key bytes; it does **not** prevent an authorized child from
+exercising the credential on the pinned upstream. Curated upstreams and base
+paths are part of the model. Configure only trusted upstreams. Pipeline key
+delivery stays separate from the Claude model gateway.
 
 For a non-empty run payload, every agent stage (including roots) receives a
 dynamically fenced, 6000-byte-bounded `UNTRUSTED external data` block before

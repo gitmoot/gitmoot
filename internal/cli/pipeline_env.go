@@ -11,11 +11,16 @@ import (
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
+
+// Test-only seam for proxied shell-stage httptest upstreams. Production
+// keycard proxy delivery remains HTTPS-only.
+var pipelineProxyAllowLoopbackHTTP bool
 
 const pipelineEnvFileMode os.FileMode = 0o600
 
@@ -76,29 +81,40 @@ func resolvePipelineEnvironment(ctx context.Context, store *db.Store, home strin
 	if err != nil {
 		return pipelineEnvironmentResolution{}, err
 	}
-	sharedNames := make(map[string]struct{})
+	availableShared := make(map[string]db.KeychainKey)
 	if len(sharedCandidates) > 0 {
 		shared, err := loadValidatedKeychainNames(ctx, store, home)
 		if err != nil {
 			return pipelineEnvironmentResolution{}, err
 		}
-		for name := range sharedCandidates {
+		for name, key := range sharedCandidates {
 			if _, present := shared[name]; present {
-				sharedNames[name] = struct{}{}
+				availableShared[name] = key
 			}
 		}
 	}
-	return projectPipelineEnvironment(spec, ownNames, sharedNames), nil
+	return projectPipelineEnvironment(spec, ownNames, availableShared), nil
 }
 
-func projectPipelineEnvironment(spec pipeline.Spec, ownNames, sharedNames map[string]struct{}) pipelineEnvironmentResolution {
+func projectPipelineEnvironment(spec pipeline.Spec, ownNames map[string]struct{}, sharedKeys map[string]db.KeychainKey) pipelineEnvironmentResolution {
 	defaultNames := make(map[string]struct{}, len(spec.Env))
 	for name := range spec.Env {
 		defaultNames[name] = struct{}{}
 	}
+	sharedInjected := make(map[string]struct{})
+	sharedProxied := make(map[string]struct{})
+	for name, key := range sharedKeys {
+		switch key.Mode {
+		case db.KeychainModeInjected:
+			sharedInjected[name] = struct{}{}
+		case db.KeychainModeProxied:
+			sharedProxied[name] = struct{}{}
+		}
+	}
 	sources := []pipeline.EnvKeySource{
 		{Source: pipelineKeySourceOwn, Mode: db.KeychainModeInjected, Names: ownNames},
-		{Source: pipelineKeySourceShared, Mode: db.KeychainModeInjected, Names: sharedNames},
+		{Source: pipelineKeySourceShared, Mode: db.KeychainModeInjected, Names: sharedInjected},
+		{Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied, Names: sharedProxied},
 		{Source: pipelineKeySourceDefault, Mode: db.KeychainModeInjected, Names: defaultNames},
 	}
 	resolution := pipelineEnvironmentResolution{}
@@ -136,7 +152,13 @@ func pipelineSharedKeyCandidates(ctx context.Context, store *db.Store, spec pipe
 		if err != nil {
 			return nil, err
 		}
-		if found && key.Mode == db.KeychainModeInjected {
+		if !found {
+			continue
+		}
+		if key.Mode == db.KeychainModeProxied && !key.ProxyConfigured() {
+			return nil, fmt.Errorf("key %s uses proxied mode but is not configured; run %s", key.Name, keyConfigureCommand(key.Name))
+		}
+		if key.Mode == db.KeychainModeInjected || key.Mode == db.KeychainModeProxied {
 			candidates[key.Name] = key
 		}
 	}
@@ -465,7 +487,54 @@ func (a pipelineEnvDeliveryAdapter) Deliver(ctx context.Context, agent runtime.A
 	}
 	var own, shared map[string]string
 	entries := make([]string, 0, len(a.access))
+	var leases []*credgw.Lease
+	defer func() {
+		for i := len(leases) - 1; i >= 0; i-- {
+			leases[i].Revoke()
+		}
+	}()
+	var proxyGateway *credgw.Gateway
 	for _, access := range a.access {
+		if access.Mode == db.KeychainModeProxied {
+			if access.Source != pipelineKeySourceShared {
+				return runtime.Result{}, fmt.Errorf("load pipeline stage environment: proxied key %q must use shared source", access.Name)
+			}
+			if strings.TrimSpace(job.ID) == "" {
+				return runtime.Result{}, fmt.Errorf("load pipeline stage environment: proxied key %q requires a job id", access.Name)
+			}
+			key, granted, err := a.store.GetGrantedKey(ctx, db.KeychainConsumerPipeline, a.pipelineName, access.Name)
+			if err != nil {
+				return runtime.Result{}, fmt.Errorf("load pipeline stage environment: re-check proxied grant for key %q: %w", access.Name, err)
+			}
+			if !granted || key.Mode != db.KeychainModeProxied || !key.ProxyConfigured() {
+				return runtime.Result{}, fmt.Errorf("load pipeline stage environment: proxied grant for key %q was revoked, changed, or is unconfigured", access.Name)
+			}
+			policy, _, err := credgw.ValidateProxyPolicy(credgw.ProxyPolicy{
+				Upstream: key.ProxyUpstream, AuthKind: credgw.ProxyAuthKind(key.ProxyAuthKind), Header: key.ProxyHeader,
+				AllowLoopbackHTTP: pipelineProxyAllowLoopbackHTTP,
+			})
+			if err != nil {
+				return runtime.Result{}, fmt.Errorf("load pipeline stage environment: invalid proxy configuration for key %q: %w", access.Name, err)
+			}
+			if proxyGateway == nil {
+				paths, err := configPathsForPipelineStore(a.store, a.home)
+				if err != nil {
+					return runtime.Result{}, fmt.Errorf("load pipeline stage environment: resolve credential gateway home: %w", err)
+				}
+				proxyGateway, err = modelGatewayRegistry.Gateway(paths.Home, modelGatewayLogf)
+				if err != nil {
+					return runtime.Result{}, fmt.Errorf("load pipeline stage environment: start credential gateway: %w", err)
+				}
+			}
+			lease, err := proxyGateway.RegisterProxy(job.ID, policy, a.proxyResolver(access.Name))
+			if err != nil {
+				return runtime.Result{}, fmt.Errorf("load pipeline stage environment: mint proxied lease for key %q: %w", access.Name, err)
+			}
+			leases = append(leases, lease)
+			entries = append(entries, access.Name+"="+lease.Placeholder())
+			entries = append(entries, "GITMOOT_PROXY_"+access.Name+"_URL="+lease.URL())
+			continue
+		}
 		if access.Mode != db.KeychainModeInjected {
 			return runtime.Result{}, fmt.Errorf("load pipeline stage environment: key %q has unsupported mode %q", access.Name, access.Mode)
 		}
@@ -511,6 +580,30 @@ func (a pipelineEnvDeliveryAdapter) Deliver(ctx context.Context, agent runtime.A
 	}
 	job.ShellEnv = prependPipelineEnvironment(entries, job.ShellEnv)
 	return a.inner.Deliver(ctx, agent, job)
+}
+
+func (a pipelineEnvDeliveryAdapter) proxyResolver(name string) credgw.CredentialResolver {
+	return func(ctx context.Context) (credgw.ResolvedCredential, error) {
+		key, granted, err := a.store.GetGrantedKey(ctx, db.KeychainConsumerPipeline, a.pipelineName, name)
+		if err != nil {
+			return credgw.ResolvedCredential{}, err
+		}
+		if !granted || key.Mode != db.KeychainModeProxied || !key.ProxyConfigured() {
+			return credgw.ResolvedCredential{}, errors.New("proxied grant is unavailable")
+		}
+		_, values, err := loadValidatedKeychainFile(ctx, a.store, a.home)
+		if err != nil {
+			return credgw.ResolvedCredential{}, err
+		}
+		value := values[name]
+		if strings.TrimSpace(value) == "" {
+			return credgw.ResolvedCredential{}, errors.New("proxied key value is unavailable")
+		}
+		return credgw.ResolvedCredential{
+			Value: value, Upstream: key.ProxyUpstream,
+			AuthKind: credgw.ProxyAuthKind(key.ProxyAuthKind), Header: key.ProxyHeader,
+		}, nil
+	}
 }
 
 func (a pipelineEnvDeliveryAdapter) deliverLegacy(ctx context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error) {
