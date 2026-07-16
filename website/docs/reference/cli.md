@@ -1966,6 +1966,46 @@ operator-owned `0600` file outside Gitmoot state and managed checkouts; inline
 agent/gate stage are rejected at add time. A stage with no list receives no
 injected values. Values are read fresh at delivery for restart-free rotation;
 the job payload stores only the path and expanded names, never file values.
+A stage selector may also resolve to a **shared keychain key** the pipeline was
+granted (see the `gitmoot key` registry below): the pipeline's own `env_file`
+key always **wins over** a same-named grant, resolution is deny-by-default
+(`GITMOOT_*` internals > own `env_file` > granted shared > inline default >
+fail closed), and a grant revoked between enqueue and delivery fails closed. A
+granted key registered with mode `proxied` (and configured with
+`gitmoot key configure`) is never delivered as a value: the stage receives a
+per-job placeholder plus a `GITMOOT_PROXY_<KEY>_URL` loopback lease pinned to
+the configured HTTPS origin/base path, and Gitmoot re-checks the grant and
+reloads the real value on every request. Produce stages may additionally
+declare `reads:` — read-only Landlock input roots symmetric to `writes:` that
+narrow the readable filesystem to an allowlist and can never expose the
+Gitmoot home, the keychain, or the pipeline `env_file`.
+
+### Keychain registry (gitmoot key)
+
+```sh
+gitmoot key path [--json]
+gitmoot key add <NAME> --mode injected|proxied [--json]
+gitmoot key configure <NAME> --upstream <https-url> --auth bearer|header:<HeaderName> [--json]
+gitmoot key list [--json]
+gitmoot key show <NAME> [--json]
+gitmoot key grant <NAME> --pipeline <pipeline> [--json]
+gitmoot key revoke <NAME> --pipeline <pipeline> [--json]
+gitmoot key rm <NAME> [--force] [--json]
+```
+
+The keychain is one operator-owned `0600` env file (default
+`~/.config/gitmoot/keychain.env`, overridable via `[credentials] keychain_path`);
+`key path` prints its location and status. The CLI registers **names and
+metadata only** — there is deliberately no value flag anywhere, and secret
+values never enter SQLite, argv, logs, or `--json` output. `key add` requires
+the name to already exist non-empty in the keychain file; `key grant` requires
+the pipeline and key to exist and refuses unconfigured `proxied` keys;
+`key rm` refuses while grants exist unless `--force` (which removes metadata
+and grants but never touches the file). Grants are deny-by-default and audited
+by name: job payloads record `{stage, name, source, mode}` rows only. See
+[Runtime Ambient Credential Hygiene](credentials.md) for the full custody
+model, including the honest limits of proxied delivery.
+
 Every agent stage receives a non-empty trigger payload as bounded, dynamically
 fenced `UNTRUSTED external data`; shell stages receive exact
 `GITMOOT_TRIGGER_<UPPERCASE_KEY>` environment entries. The full payload is retained
