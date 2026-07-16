@@ -103,6 +103,22 @@ func TestRendererRedactsBeforeTruncationAndLabelsUsage(t *testing.T) {
 	}
 }
 
+func TestPlainRendererByteStableWithRoundTwoMetadata(t *testing.T) {
+	var got bytes.Buffer
+	events := []Event{
+		{Kind: KindToolCall, Name: "bash", ToolIcon: "$", Preview: PreviewTail, PreviewLines: 5, InputDigest: "echo ok"},
+		{Kind: KindToolResult, Name: "bash", ToolIcon: "$", Preview: PreviewTail, PreviewLines: 5, Status: "completed", OutputDigest: "one\ntwo", Duration: 1200 * time.Millisecond},
+		{Kind: KindUsage, InputTokens: 7, OutputTokens: 3, Duration: 2 * time.Second},
+	}
+	if err := NewRenderer(&got).Render(events...); err != nil {
+		t.Fatal(err)
+	}
+	want := "▸ bash echo ok\n◂ completed one two\nusage (latest reported usage): in=7 out=3\n"
+	if got.String() != want {
+		t.Fatalf("plain round-two output = %q, want %q", got.String(), want)
+	}
+}
+
 func TestClaudeMalformedLineDoesNotPoisonFinalEnvelope(t *testing.T) {
 	translator, err := NewTranslator("claude")
 	if err != nil {
@@ -422,7 +438,7 @@ func waitForLine(t *testing.T, lines <-chan string, want string) {
 }
 
 func TestStyledRendererGolden(t *testing.T) {
-	translator, err := NewTranslator("codex")
+	translator, err := newTranslator("codex", func() time.Time { return time.Unix(100, 0) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,6 +460,159 @@ func TestStyledRendererGolden(t *testing.T) {
 	}
 	if want := readTestdata(t, "codex_tool_run_styled.golden"); got.String() != want {
 		t.Fatalf("styled transcript:\n%q\nwant:\n%q", got.String(), want)
+	}
+}
+
+func TestStyledOutputPreviewHeadTailAndShort(t *testing.T) {
+	lines := func(prefix string, count int) string {
+		parts := make([]string, count)
+		for i := range parts {
+			parts[i] = fmt.Sprintf("%s-%02d", prefix, i+1)
+		}
+		return strings.Join(parts, "\n")
+	}
+	for _, tc := range []struct {
+		name    string
+		event   Event
+		want    []string
+		notWant []string
+	}{
+		{
+			name:    "shell tail",
+			event:   Event{Kind: KindToolResult, Status: "completed", OutputDigest: lines("tail", 8), Preview: PreviewTail, PreviewLines: 5},
+			want:    []string{"... (3 earlier lines)", "tail-04", "tail-08"},
+			notWant: []string{"tail-01", "tail-03"},
+		},
+		{
+			name:    "search head",
+			event:   Event{Kind: KindToolResult, Status: "completed", OutputDigest: lines("head", 17), Preview: PreviewHead, PreviewLines: 15},
+			want:    []string{"head-01", "head-15", "... (2 more lines)"},
+			notWant: []string{"head-16", "head-17"},
+		},
+		{
+			name:    "short unchanged",
+			event:   Event{Kind: KindToolResult, Status: "completed", OutputDigest: "alpha\nbeta", Preview: PreviewHead, PreviewLines: 10},
+			want:    []string{"alpha", "beta"},
+			notWant: []string{"more lines", "earlier lines"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got bytes.Buffer
+			if err := NewStyledRenderer(&got).Render(tc.event); err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(got.String(), want) {
+					t.Fatalf("preview missing %q: %q", want, got.String())
+				}
+			}
+			for _, notWant := range tc.notWant {
+				if strings.Contains(got.String(), notWant) {
+					t.Fatalf("preview unexpectedly contains %q: %q", notWant, got.String())
+				}
+			}
+		})
+	}
+}
+
+func TestToolPresentationTable(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		icon  string
+		mode  PreviewMode
+		lines int
+	}{
+		{"Bash", "$", PreviewTail, 5},
+		{"read_file", "→", PreviewHead, 10},
+		{"apply_patch", "←", PreviewHead, 10},
+		{"grep", "✱", PreviewHead, 15},
+		{"web_search", "◈", PreviewHead, 10},
+		{"web_fetch", "%", PreviewHead, 10},
+		{"future_tool", "⚙", PreviewHead, 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyTool(tc.name)
+			if got.icon != tc.icon || got.preview != tc.mode || got.previewLines != tc.lines {
+				t.Fatalf("classifyTool(%q) = %+v", tc.name, got)
+			}
+		})
+	}
+}
+
+func TestCodexTranslatorThreadsToolDurationAndPresentation(t *testing.T) {
+	times := []time.Time{time.Unix(100, 0), time.Unix(101, 200_000_000)}
+	translator, err := newTranslator("codex", func() time.Time {
+		got := times[0]
+		times = times[1:]
+		return got
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := translator.Translate(`{"type":"item.started","item":{"id":"tool-1","type":"command_execution","command":"bash -lc 'echo ok'","status":"in_progress"}}`)
+	completed := translator.Translate(`{"type":"item.completed","item":{"id":"tool-1","type":"command_execution","command":"bash -lc 'echo ok'","aggregated_output":"ok\n","exit_code":0,"status":"completed"}}`)
+	if len(started) != 1 || started[0].ToolIcon != "$" || started[0].Preview != PreviewTail || started[0].PreviewLines != 5 {
+		t.Fatalf("started event = %+v", started)
+	}
+	if len(completed) != 1 || completed[0].Name != "bash" || completed[0].Duration != 1200*time.Millisecond {
+		t.Fatalf("completed event = %+v", completed)
+	}
+}
+
+func TestStyledOutputPreviewRedactsBeforeSelection(t *testing.T) {
+	secret := "ghp_abcdefghijklmnopqrstuvwxyz"
+	preview := styledOutputPreview("first\n"+secret, PreviewHead, 10)
+	joined := strings.Join(preview, "\n")
+	if strings.Contains(joined, secret) || !strings.Contains(joined, "[REDACTED]") {
+		t.Fatalf("preview was not redacted: %q", joined)
+	}
+}
+
+func TestStyledRendererDurationCancellationAndNarration(t *testing.T) {
+	var got bytes.Buffer
+	err := NewStyledRenderer(&got).Render(
+		Event{Kind: KindAgentText, Text: "# Result\n- use `go test`\n1. verify"},
+		Event{Kind: KindToolResult, Status: "cancelled", Duration: 1200 * time.Millisecond},
+		Event{Kind: KindUsage, InputTokens: 1, OutputTokens: 2, Duration: 62 * time.Second},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := got.String()
+	for _, want := range []string{
+		"\x1b[1mResult\x1b[0m",
+		"\x1b[36m- \x1b[0muse `\x1b[36mgo test\x1b[0m`",
+		"\x1b[36m1. \x1b[0mverify",
+		"\x1b[33m◂ cancelled\x1b[0m",
+		"Took 1.2s (cancelled)",
+		"· Took 1m02s",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("styled output missing %q: %q", want, out)
+		}
+	}
+}
+
+func TestMarkdownRendererGolden(t *testing.T) {
+	header := Header{Action: "ask", Agent: "audit", Runtime: "codex", Model: "gpt-test", Workflow: "demo", Prompt: "Check `status`."}
+	events := []Event{
+		{Kind: KindLifecycle, Phase: "thread", Detail: "started"},
+		{Kind: KindLifecycle, Phase: "turn", Detail: "started"},
+		{Kind: KindAgentText, Text: "I will \x1b[31minspect\x1b[0m it."},
+		{Kind: KindToolCall, Name: "bash", InputDigest: "echo status"},
+		{Kind: KindToolResult, Name: "bash", Status: "completed (exit 0)", OutputDigest: "status\n```embedded", Duration: 1200 * time.Millisecond},
+		{Kind: KindAgentText, Text: "Done."},
+		{Kind: KindUsage, InputTokens: 1234, OutputTokens: 42, Duration: 2500 * time.Millisecond},
+	}
+	var got bytes.Buffer
+	if err := RenderMarkdown(&got, header, events); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got.String(), "\x1b[") {
+		t.Fatalf("markdown contains ANSI: %q", got.String())
+	}
+	if want := readTestdata(t, "codex_tool_run.md.golden"); got.String() != want {
+		t.Fatalf("markdown transcript:\n%s\nwant:\n%s", got.String(), want)
 	}
 }
 

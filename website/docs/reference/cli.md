@@ -1130,6 +1130,7 @@ gitmoot job list --repo owner/repo   # add --json for machine-readable rows
 gitmoot job show <job-id>            # add --json for the full job + why-stuck detail
 gitmoot job watch <job-id>
 gitmoot job watch <job-id> --transcript [--log-path <path>] [--runtime codex|claude|kimi|kimi-cli|shell]
+gitmoot job transcript <job-id> --export md [--output <path>] [--log-path <path>] [--runtime codex|claude|kimi|kimi-cli|shell]
 gitmoot job events <job-id>
 gitmoot job run <job-id>
 gitmoot job retry <job-id>
@@ -1144,9 +1145,12 @@ gitmoot lock show owner/repo <branch>
 
 When standard output is an interactive terminal (and `NO_COLOR` is unset),
 the transcript renders styled: agent turns get blank-line spacing and keep
-their line breaks, tool names are bold with dim argument digests, completed
-machinery and usage render dim, and failed tool results render red. Piped or
-redirected output always uses the plain byte-stable format.
+their line breaks plus lightweight heading/list/inline-code treatment. Tool
+calls use type-specific icons; shell output previews its last five lines while
+read/search output previews its first 10-15 lines, with exact omitted-line
+counts. Tool and turn durations render dim, cancelled tools render yellow,
+completed machinery and usage render dim, and failed tool results render red.
+Piped or redirected output always uses the plain byte-stable format.
 
 Every transcript opens with an orientation header — job action, agent,
 runtime/model (per-job override first, then the agent default), workflow label,
@@ -1169,6 +1173,13 @@ completion; shell output passes through as redacted raw lines. Usage is labeled
 `latest reported usage` because resumed Codex counts can be session-cumulative.
 Malformed or unknown lines degrade individually to redacted capped raw output
 without stopping later lines.
+
+`job transcript <job-id> --export md` reads the same tee log as a snapshot and
+writes deterministic, ANSI-free Markdown to stdout. Add `--output <path>` to
+write a mode-`0600` file instead. The export includes user/assistant headings,
+model and elapsed details when reported, and fenced tool input/output. It does
+not fall back to lifecycle events: cockpit tee logs are removed after delivery
+today, so export fails clearly when the requested log is no longer retained.
 
 Verified Codex command/file-change events and Kimi function tool calls/results
 render as typed compact lines; unrecognized shapes keep the generic/raw

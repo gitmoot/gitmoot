@@ -31,6 +31,13 @@ degrade individually to redacted bounded raw output; a fatal renderer exit or
 panic falls back externally to `tail -F`. The tee bytes, runtime result parsing,
 and pipeline progress stream are unchanged.
 
+On an interactive terminal, tool-specific icons, honest multi-line output
+previews, elapsed times, and lightweight narration markup make the stream easier
+to scan. Pipes and redirects retain the byte-stable plain format. While the tee
+log still exists, `gitmoot job transcript <id> --export md` creates a
+deterministic ANSI-free snapshot for an issue or pull request; add `--output`
+to write it to a file.
+
 Verified Codex command/file-change events and Kimi function tool calls/results
 use typed compact lines; other shapes retain the generic/raw path. Render-time
 redaction is per-line best-effort defense in depth: a secret split across

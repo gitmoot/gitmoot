@@ -1,13 +1,13 @@
 [90m• thread: started[0m
 [90m• turn: started[0m
 
-● Running the requested shell command, then I'll create `fx.txt` with `done` and return the exact completion string.
-[36m▸ [0m[1mbash[0m [90m/bin/bash -lc 'echo transcript-fixture-123'[0m
+● Running the requested shell command, then I'll create `[36mfx.txt[0m` with `[36mdone[0m` and return the exact completion string.
+[36m$ [0m[1mbash[0m [90m/bin/bash -lc 'echo transcript-fixture-123'[0m
 [90m◂ completed (exit 0)[0m
 [90m  ↳ transcript-fixture-123[0m
 
-● The command ran. I'm creating `fx.txt` now.
-[36m▸ [0m[1mfile_change[0m [90madd /tmp/example/fx.txt[0m
+● The command ran. I'm creating `[36mfx.txt[0m` now.
+[36m← [0m[1mfile_change[0m [90madd /tmp/example/fx.txt[0m
 [90m◂ completed[0m
 [90m  ↳ add /tmp/example/fx.txt[0m
 

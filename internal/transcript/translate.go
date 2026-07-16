@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	gitmootruntime "github.com/gitmoot/gitmoot/internal/runtime"
 )
@@ -19,13 +20,24 @@ type Translator interface {
 
 // NewTranslator returns the translator for a registered runtime family.
 func NewTranslator(runtimeName string) (Translator, error) {
+	return newTranslator(runtimeName, time.Now)
+}
+
+// NewSnapshotTranslator is for deterministic replay/export of a retained log.
+// Codex and Kimi streams carry no event timestamps, so replay must not invent
+// elapsed time from parser speed. Claude's reported duration_ms still survives.
+func NewSnapshotTranslator(runtimeName string) (Translator, error) {
+	return newTranslator(runtimeName, func() time.Time { return time.Time{} })
+}
+
+func newTranslator(runtimeName string, now func() time.Time) (Translator, error) {
 	switch strings.TrimSpace(runtimeName) {
 	case gitmootruntime.CodexRuntime:
-		return codexTranslator{}, nil
+		return &codexTranslator{now: now, tools: make(map[string]pendingTool)}, nil
 	case gitmootruntime.ClaudeRuntime:
 		return &claudeTranslator{}, nil
 	case gitmootruntime.KimiRuntime, gitmootruntime.KimiCLIRuntime:
-		return kimiTranslator{}, nil
+		return &kimiTranslator{now: now, tools: make(map[string]pendingTool)}, nil
 	case gitmootruntime.ShellRuntime:
 		return shellTranslator{}, nil
 	default:
@@ -33,9 +45,25 @@ func NewTranslator(runtimeName string) (Translator, error) {
 	}
 }
 
-type codexTranslator struct{}
+type pendingTool struct {
+	name         string
+	presentation toolPresentation
+	started      time.Time
+}
 
-func (codexTranslator) Translate(line string) []Event {
+type toolPresentation struct {
+	icon         string
+	preview      PreviewMode
+	previewLines int
+}
+
+type codexTranslator struct {
+	now         func() time.Time
+	tools       map[string]pendingTool
+	turnStarted time.Time
+}
+
+func (t *codexTranslator) Translate(line string) []Event {
 	event, err := gitmootruntime.ExtractCodexStreamEvent(strings.TrimSpace(line))
 	if err != nil {
 		return rawEvent(line)
@@ -44,16 +72,17 @@ func (codexTranslator) Translate(line string) []Event {
 	case "thread.started":
 		return []Event{{Kind: KindLifecycle, Phase: "thread", Detail: "started"}}
 	case "turn.started":
+		t.turnStarted = t.now()
 		return []Event{{Kind: KindLifecycle, Phase: "turn", Detail: "started"}}
 	case "item.started":
 		switch event.ItemType {
 		case "command_execution":
 			if event.CommandExecution != nil {
-				return []Event{{Kind: KindToolCall, Name: commandName(event.CommandExecution.Command), InputDigest: event.CommandExecution.Command}}
+				return []Event{t.startTool(event.ItemID, commandName(event.CommandExecution.Command), event.CommandExecution.Command)}
 			}
 		case "file_change":
 			if event.FileChange != nil {
-				return []Event{{Kind: KindToolCall, Name: "file_change", InputDigest: fileChangeDigest(event.FileChange.Changes)}}
+				return []Event{t.startTool(event.ItemID, "file_change", fileChangeDigest(event.FileChange.Changes))}
 			}
 		}
 		return rawEvent(line)
@@ -65,20 +94,12 @@ func (codexTranslator) Translate(line string) []Event {
 			return []Event{{Kind: KindLifecycle, Phase: "reasoning", Detail: event.Text}}
 		case "command_execution":
 			if event.CommandExecution != nil {
-				return []Event{{
-					Kind:         KindToolResult,
-					Status:       commandStatus(event.CommandExecution),
-					OutputDigest: event.CommandExecution.AggregatedOutput,
-				}}
+				return []Event{t.finishTool(event.ItemID, commandName(event.CommandExecution.Command), commandStatus(event.CommandExecution), event.CommandExecution.AggregatedOutput)}
 			}
 			return rawEvent(line)
 		case "file_change":
 			if event.FileChange != nil {
-				return []Event{{
-					Kind:         KindToolResult,
-					Status:       event.FileChange.Status,
-					OutputDigest: fileChangeDigest(event.FileChange.Changes),
-				}}
+				return []Event{t.finishTool(event.ItemID, "file_change", event.FileChange.Status, fileChangeDigest(event.FileChange.Changes))}
 			}
 			return rawEvent(line)
 		case "":
@@ -87,7 +108,9 @@ func (codexTranslator) Translate(line string) []Event {
 			return []Event{{Kind: KindToolCall, Name: event.ItemType, InputDigest: compactJSON(event.ItemRaw)}}
 		}
 	case "turn.completed":
-		return []Event{{Kind: KindUsage, InputTokens: event.Usage.InputTokens, OutputTokens: event.Usage.OutputTokens}}
+		duration := elapsed(t.turnStarted, t.now())
+		t.turnStarted = time.Time{}
+		return []Event{{Kind: KindUsage, InputTokens: event.Usage.InputTokens, OutputTokens: event.Usage.OutputTokens, Duration: duration}}
 	case "error":
 		return []Event{{Kind: KindLifecycle, Phase: "error", Detail: event.Message}}
 	case "turn.failed":
@@ -97,31 +120,62 @@ func (codexTranslator) Translate(line string) []Event {
 	}
 }
 
-func (codexTranslator) Flush() []Event { return nil }
+func (*codexTranslator) Flush() []Event { return nil }
 
-type kimiTranslator struct{}
+func (t *codexTranslator) startTool(id, name, input string) Event {
+	presentation := classifyTool(name)
+	t.tools[id] = pendingTool{name: name, presentation: presentation, started: t.now()}
+	return toolCallEvent(name, input, presentation)
+}
 
-func (kimiTranslator) Translate(line string) []Event {
+func (t *codexTranslator) finishTool(id, fallbackName, status, output string) Event {
+	pending, ok := t.tools[id]
+	if ok {
+		delete(t.tools, id)
+	} else {
+		pending = pendingTool{name: fallbackName, presentation: classifyTool(fallbackName)}
+	}
+	return toolResultEvent(pending, status, output, t.now())
+}
+
+type kimiTranslator struct {
+	now     func() time.Time
+	tools   map[string]pendingTool
+	started time.Time
+}
+
+func (t *kimiTranslator) Translate(line string) []Event {
 	event, err := gitmootruntime.ExtractKimiStreamEvent(strings.TrimSpace(line))
 	if err != nil {
 		return rawEvent(line)
 	}
+	if t.started.IsZero() {
+		t.started = t.now()
+	}
 	var events []Event
 	if event.Usage != nil {
-		events = append(events, Event{Kind: KindUsage, InputTokens: event.Usage.InputTokens, OutputTokens: event.Usage.OutputTokens})
+		events = append(events, Event{Kind: KindUsage, InputTokens: event.Usage.InputTokens, OutputTokens: event.Usage.OutputTokens, Duration: elapsed(t.started, t.now())})
 	}
 	switch event.Role {
 	case "assistant":
 		for _, call := range event.ToolCalls {
 			if call.Type == "function" {
-				events = append(events, Event{Kind: KindToolCall, Name: call.Function.Name, InputDigest: call.Function.Arguments})
+				presentation := classifyTool(call.Function.Name)
+				t.tools[call.ID] = pendingTool{name: call.Function.Name, presentation: presentation, started: t.now()}
+				events = append(events, toolCallEvent(call.Function.Name, call.Function.Arguments, presentation))
 			}
 		}
 		if event.ContentText != "" {
 			events = append(events, Event{Kind: KindAgentText, Text: event.ContentText})
 		}
 	case "tool":
-		events = append(events, Event{Kind: KindToolResult, Status: "tool", OutputDigest: event.ContentText})
+		pending, ok := t.tools[event.ToolCallID]
+		if ok {
+			delete(t.tools, event.ToolCallID)
+		} else {
+			pending = pendingTool{name: "tool", presentation: classifyTool("tool")}
+		}
+		events = append(events, toolResultEvent(pending, "tool", event.ContentText, t.now()))
 	case "meta":
 		if event.Type == "session.resume_hint" {
 			events = append(events, Event{Kind: KindLifecycle, Phase: "session", Detail: "resume hint reported"})
@@ -136,7 +190,7 @@ func (kimiTranslator) Translate(line string) []Event {
 	return events
 }
 
-func (kimiTranslator) Flush() []Event { return nil }
+func (*kimiTranslator) Flush() []Event { return nil }
 
 // Claude Code currently emits one final JSON envelope rather than JSONL. Hold
 // every complete line until EOF so the transcript honestly remains silent until
@@ -163,11 +217,57 @@ func (t *claudeTranslator) Flush() []Event {
 		}
 		events = append(events,
 			Event{Kind: KindAgentText, Text: payload.Result},
-			Event{Kind: KindUsage, InputTokens: payload.Usage.InputTokens, OutputTokens: payload.Usage.OutputTokens},
+			Event{Kind: KindUsage, InputTokens: payload.Usage.InputTokens, OutputTokens: payload.Usage.OutputTokens, Duration: time.Duration(payload.DurationMS) * time.Millisecond},
 		)
 	}
 	t.lines = nil
 	return events
+}
+
+func toolCallEvent(name, input string, presentation toolPresentation) Event {
+	return Event{Kind: KindToolCall, Name: name, ToolIcon: presentation.icon, Preview: presentation.preview, PreviewLines: presentation.previewLines, InputDigest: input}
+}
+
+func toolResultEvent(tool pendingTool, status, output string, now time.Time) Event {
+	return Event{
+		Kind:         KindToolResult,
+		Name:         tool.name,
+		ToolIcon:     tool.presentation.icon,
+		Preview:      tool.presentation.preview,
+		PreviewLines: tool.presentation.previewLines,
+		Status:       status,
+		OutputDigest: output,
+		Duration:     elapsed(tool.started, now),
+	}
+}
+
+func elapsed(started, finished time.Time) time.Duration {
+	if started.IsZero() || !finished.After(started) {
+		return 0
+	}
+	return finished.Sub(started)
+}
+
+// classifyTool is the single translator-layer icon and preview policy. Keep
+// this names-only: runtime-specific payload values never influence rendering.
+func classifyTool(name string) toolPresentation {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	switch normalized {
+	case "bash", "sh", "shell", "zsh", "powershell", "command", "command_execution", "exec", "exec_command", "terminal":
+		return toolPresentation{icon: "$", preview: PreviewTail, previewLines: 5}
+	case "read", "read_file", "cat", "view", "open":
+		return toolPresentation{icon: "→", preview: PreviewHead, previewLines: 10}
+	case "write", "write_file", "edit", "apply_patch", "patch", "file_change":
+		return toolPresentation{icon: "←", preview: PreviewHead, previewLines: 10}
+	case "glob", "grep", "rg", "find", "search", "search_files":
+		return toolPresentation{icon: "✱", preview: PreviewHead, previewLines: 15}
+	case "websearch", "web_search", "search_query":
+		return toolPresentation{icon: "◈", preview: PreviewHead, previewLines: 10}
+	case "webfetch", "web_fetch", "fetch_url":
+		return toolPresentation{icon: "%", preview: PreviewHead, previewLines: 10}
+	default:
+		return toolPresentation{icon: "⚙", preview: PreviewHead, previewLines: 10}
+	}
 }
 
 func commandName(command string) string {

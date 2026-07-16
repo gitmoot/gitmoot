@@ -291,6 +291,87 @@ func TestRunJobWatchTranscriptRendersExplicitShellLog(t *testing.T) {
 	}
 }
 
+func TestRunJobTranscriptMarkdownExportStdoutAndFile(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	seedCLIJob(t, store, db.Job{
+		ID:      "job-export",
+		Agent:   "audit",
+		Type:    "ask",
+		State:   string(workflow.JobSucceeded),
+		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Instructions: "Inspect the fixture."}),
+	}, "succeeded")
+	store.Close()
+	fixture, err := os.ReadFile(filepath.Join("..", "transcript", "testdata", "codex_tool_run.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(t.TempDir(), "codex.jsonl")
+	if err := os.WriteFile(logPath, fixture, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	args := []string{"job", "transcript", "job-export", "--home", home, "--export", "md", "--log-path", logPath, "--runtime", runtime.CodexRuntime}
+	var stdout, stderr bytes.Buffer
+	if code := Run(args, &stdout, &stderr); code != 0 {
+		t.Fatalf("stdout export code=%d stderr=%q", code, stderr.String())
+	}
+	for _, want := range []string{"# Job Transcript", "## User", "Inspect the fixture.", "**Tool: bash**", "FIXTURE COMPLETE"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("markdown export missing %q: %q", want, stdout.String())
+		}
+	}
+	if strings.Contains(stdout.String(), "\x1b[") {
+		t.Fatalf("markdown export contains ANSI: %q", stdout.String())
+	}
+	firstExport := stdout.String()
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run(args, &stdout, &stderr); code != 0 || stdout.String() != firstExport {
+		t.Fatalf("repeated export changed: code=%d equal=%v stderr=%q", code, stdout.String() == firstExport, stderr.String())
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "transcript.md")
+	args = append(args, "--output", outputPath)
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run(args, &stdout, &stderr); code != 0 {
+		t.Fatalf("file export code=%d stderr=%q", code, stderr.String())
+	}
+	written, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(written) == "" || stdout.Len() != 0 {
+		t.Fatalf("file export bytes=%d stdout=%q", len(written), stdout.String())
+	}
+	info, err := os.Stat(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("export mode = %o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestRunJobTranscriptRequiresMarkdownAndRetainedLog(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"job", "transcript", "job", "--export", "text"}, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "--export md is required") {
+		t.Fatalf("format refusal code=%d stderr=%q", code, stderr.String())
+	}
+
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	seedCLIJob(t, store, db.Job{ID: "job-no-log", Agent: "audit", Type: "ask", State: string(workflow.JobSucceeded), Payload: mustJobPayload(t, workflow.JobPayload{})}, "succeeded")
+	store.Close()
+	stdout.Reset()
+	stderr.Reset()
+	code := Run([]string{"job", "transcript", "job-no-log", "--home", home, "--export", "md", "--runtime", runtime.ShellRuntime}, &stdout, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "cockpit logs may already have been delivered and removed") {
+		t.Fatalf("missing-log code=%d stderr=%q", code, stderr.String())
+	}
+}
+
 func TestResolveTranscriptRuntimeOrder(t *testing.T) {
 	home := t.TempDir()
 	store := openCLIJobStore(t, home)

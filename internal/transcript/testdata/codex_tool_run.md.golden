@@ -1,0 +1,33 @@
+# Job Transcript
+- Action: ask
+- Agent: audit
+- Runtime: codex
+- Model: gpt-test
+- Workflow: demo
+
+## User
+
+Check `status`.
+
+## Assistant (gpt-test · 2.5s)
+
+I will inspect it.
+
+**Tool: bash**
+
+Input:
+```text
+echo status
+```
+
+Output (completed (exit 0)):
+````text
+status
+```embedded
+````
+
+_Took 1.2s_
+
+Done.
+
+_Tokens: 1.2k in · 42 out (latest reported)_

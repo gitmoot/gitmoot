@@ -18,6 +18,7 @@ type StreamUsage struct {
 // unverified item types generically without inventing field schemas.
 type CodexStreamEvent struct {
 	Type             string
+	ItemID           string
 	ItemType         string
 	Text             string
 	ItemRaw          json.RawMessage
@@ -73,10 +74,12 @@ func ExtractCodexStreamEvent(line string) (CodexStreamEvent, error) {
 	}
 	if len(wire.Item) != 0 {
 		var item struct {
+			ID   string `json:"id"`
 			Type string `json:"type"`
 			Text string `json:"text"`
 		}
 		if err := json.Unmarshal(wire.Item, &item); err == nil {
+			event.ItemID = item.ID
 			event.ItemType = item.Type
 			event.Text = item.Text
 			switch item.Type {
@@ -102,6 +105,7 @@ type ClaudeResultEnvelope struct {
 	Type           string      `json:"type"`
 	Result         string      `json:"result"`
 	Usage          StreamUsage `json:"usage"`
+	DurationMS     int64       `json:"duration_ms"`
 	IsError        bool        `json:"is_error"`
 	APIErrorStatus int         `json:"api_error_status"`
 }
