@@ -152,6 +152,62 @@ func TestPipelineAddEnvFileWrongOwner(t *testing.T) {
 	}
 }
 
+func TestClassifyPipelineEnvFileStatuses(t *testing.T) {
+	home := dashboardTestHome(t)
+	store := openPipelineTestStore(t, home)
+	defer store.Close()
+
+	insideHome := filepath.Join(home, ".gitmoot", "inside.env")
+	if err := os.WriteFile(insideHome, []byte("BROKEN"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name          string
+		path          func(t *testing.T) string
+		want          string
+		wrongOwnerUID bool
+	}{
+		{name: "none", path: func(*testing.T) string { return "" }, want: pipelineEnvFileStatusNone},
+		{name: "ok", path: func(t *testing.T) string {
+			return writePipelineEnvFile(t, t.TempDir(), "ALPHA=secret\nBETA=secret\n", 0o600)
+		}, want: pipelineEnvFileStatusOK},
+		{name: "missing", path: func(t *testing.T) string { return filepath.Join(t.TempDir(), "missing.env") }, want: pipelineEnvFileStatusMissing},
+		{name: "bad mode before parse", path: func(t *testing.T) string {
+			return writePipelineEnvFile(t, t.TempDir(), "BROKEN", 0o644)
+		}, want: pipelineEnvFileStatusBadMode},
+		{name: "bad owner before parse", path: func(t *testing.T) string {
+			return writePipelineEnvFile(t, t.TempDir(), "BROKEN", 0o600)
+		}, want: pipelineEnvFileStatusBadOwner, wrongOwnerUID: true},
+		{name: "bad location before parse", path: func(*testing.T) string { return insideHome }, want: pipelineEnvFileStatusBadLocation},
+		{name: "invalid parse", path: func(t *testing.T) string {
+			return writePipelineEnvFile(t, t.TempDir(), "BROKEN", 0o600)
+		}, want: pipelineEnvFileStatusInvalid},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			originalUID := pipelineEnvCurrentUID
+			if tt.wrongOwnerUID {
+				pipelineEnvCurrentUID = func() uint32 { return originalUID() + 1 }
+			}
+			defer func() { pipelineEnvCurrentUID = originalUID }()
+
+			got := classifyPipelineEnvFile(context.Background(), store, home, tt.path(t))
+			if got.Status != tt.want {
+				t.Fatalf("status = %q, want %q (inspection=%+v)", got.Status, tt.want, got)
+			}
+			if got.Names == nil {
+				t.Fatal("Names is nil")
+			}
+			if tt.want == pipelineEnvFileStatusOK && !reflect.DeepEqual(got.Names, map[string]struct{}{"ALPHA": {}, "BETA": {}}) {
+				t.Fatalf("ok names = %#v", got.Names)
+			}
+			if tt.want != pipelineEnvFileStatusOK && len(got.Names) != 0 {
+				t.Fatalf("unsafe file exposed names: %#v", got.Names)
+			}
+		})
+	}
+}
+
 type pipelineEnvCaptureAdapter struct {
 	jobs []runtime.Job
 }
@@ -299,6 +355,33 @@ func TestPipelineKeyAccessResolutionPrecedenceAndGrantBoundary(t *testing.T) {
 	}
 	if len(capture.jobs) != 0 {
 		t.Fatalf("disappeared own source reached delivery: %#v", capture.jobs)
+	}
+}
+
+func TestPipelineOwnKeyDoesNotRequireLowerPriorityKeychain(t *testing.T) {
+	ctx := context.Background()
+	home, _, store := heartbeatLoopE2EHome(t)
+	if err := store.CreateOrUpdatePipeline(ctx, db.Pipeline{Name: "own-only", SpecYAML: "name: own-only\nstages: [{id: run, cmd: echo}]\n"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddKeychainKey(ctx, "OVERLAP", db.KeychainModeInjected); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GrantKeychainKey(ctx, db.KeychainConsumerPipeline, "own-only", "OVERLAP"); err != nil {
+		t.Fatal(err)
+	}
+	envFile := writePipelineEnvFile(t, t.TempDir(), "OVERLAP=own\n", 0o600)
+	spec := pipeline.Spec{
+		Name: "own-only", EnvFile: envFile,
+		Stages: []pipeline.Stage{{ID: "run", Cmd: "echo", EnvKeys: []string{"OVERLAP"}}},
+	}
+	resolution, err := resolvePipelineEnvironment(ctx, store, home, spec)
+	if err != nil {
+		t.Fatalf("own source consulted missing lower-priority keychain: %v", err)
+	}
+	want := []workflow.PipelineKeyAccess{{Stage: "run", Name: "OVERLAP", Source: pipelineKeySourceOwn, Mode: db.KeychainModeInjected}}
+	if !reflect.DeepEqual(resolution.Access, want) || len(resolution.Unresolved) != 0 {
+		t.Fatalf("resolution=%#v unresolved=%#v", resolution.Access, resolution.Unresolved)
 	}
 }
 

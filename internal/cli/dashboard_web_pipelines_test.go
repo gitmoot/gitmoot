@@ -4,7 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -690,6 +696,145 @@ func TestWebDataSourcePipelineDetailNeverRun(t *testing.T) {
 	// #873: the declared preview is self-describing with zero runs.
 	if byID["zfetch"].Kind != "shell" {
 		t.Fatalf("declared zfetch Kind = %q, want shell", byID["zfetch"].Kind)
+	}
+}
+
+func TestWebDataSourcePipelineDetailKeysNamesOnlyAndLiveDrift(t *testing.T) {
+	const (
+		ownSentinel     = "own-secret-value-974"
+		sharedSentinel  = "shared-secret-value-974"
+		defaultSentinel = "inline-default-value-974"
+	)
+	home := dashboardTestHome(t)
+	envFile := writePipelineEnvFile(t, t.TempDir(), "OWN_TWO="+ownSentinel+"\nOWN_ONE="+ownSentinel+"\n", 0o600)
+	writeDefaultKeychain(t, home, "SHARED_TOKEN="+sharedSentinel+"\n")
+	raw := fmt.Sprintf(`name: keys-view
+env_file: %q
+env:
+  DEFAULT_TOKEN: %q
+stages:
+  - id: deliver
+    cmd: echo deliver
+    env_keys: [OWN_*, SHARED_TOKEN, DEFAULT_TOKEN]
+  - id: harvest
+    cmd: echo harvest
+  - id: inspect
+    agent: scout
+    action: ask
+    prompt: inspect
+`, envFile, defaultSentinel)
+	store := openPipelineTestStore(t, home)
+	seedTestPipeline(t, store, db.Pipeline{Name: "keys-view", SpecYAML: raw})
+	if _, err := store.AddKeychainKey(context.Background(), "SHARED_TOKEN", db.KeychainModeInjected); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GrantKeychainKey(context.Background(), db.KeychainConsumerPipeline, "keys-view", "SHARED_TOKEN"); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	ds := &webDataSource{home: home}
+	detail, err := ds.PipelineDetail(context.Background(), "keys-view")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Keys.EnvFile != (dashboard.PipelineEnvFileStatus{Path: envFile, Status: pipelineEnvFileStatusOK}) {
+		t.Fatalf("envFile = %+v", detail.Keys.EnvFile)
+	}
+	if len(detail.Keys.Stages) != 3 {
+		t.Fatalf("stages = %+v", detail.Keys.Stages)
+	}
+	wantKeys := []dashboard.PipelineKeyEntry{
+		{Name: "OWN_ONE", Source: pipelineKeySourceOwn, Mode: db.KeychainModeInjected},
+		{Name: "OWN_TWO", Source: pipelineKeySourceOwn, Mode: db.KeychainModeInjected},
+		{Name: "SHARED_TOKEN", Source: pipelineKeySourceShared, Mode: db.KeychainModeInjected},
+		{Name: "DEFAULT_TOKEN", Source: pipelineKeySourceDefault, Mode: db.KeychainModeInjected},
+	}
+	if got := detail.Keys.Stages[0]; got.ID != "deliver" || got.Kind != "shell" || !reflect.DeepEqual(got.Keys, wantKeys) || len(got.UnresolvedSelectors) != 0 {
+		t.Fatalf("deliver keys = %+v", got)
+	}
+	for _, stage := range detail.Keys.Stages[1:] {
+		if stage.Keys == nil || stage.UnresolvedSelectors == nil || len(stage.Keys) != 0 || len(stage.UnresolvedSelectors) != 0 {
+			t.Fatalf("empty stage arrays = %+v", stage)
+		}
+	}
+	encoded, err := json.Marshal(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sentinel := range []string{ownSentinel, sharedSentinel, defaultSentinel} {
+		if strings.Contains(string(encoded), sentinel) {
+			t.Fatalf("PipelineDetail leaked secret/default value %q: %s", sentinel, encoded)
+		}
+	}
+
+	if err := os.Remove(envFile); err != nil {
+		t.Fatal(err)
+	}
+	drifted, err := ds.PipelineDetail(context.Background(), "keys-view")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drifted.Keys.EnvFile.Status != pipelineEnvFileStatusMissing {
+		t.Fatalf("drifted envFile = %+v", drifted.Keys.EnvFile)
+	}
+	if got, want := drifted.Keys.Stages[0].Keys, wantKeys[2:]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("drifted keys = %#v, want %#v", got, want)
+	}
+	if got, want := drifted.Keys.Stages[0].UnresolvedSelectors, []string{"OWN_*"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("drifted unresolved = %#v, want %#v", got, want)
+	}
+}
+
+func TestDashboardPipelineDetailKeysHTTPShape(t *testing.T) {
+	home := dashboardTestHome(t)
+	envFile := writePipelineEnvFile(t, t.TempDir(), "TOKEN=http-secret-value-974\n", 0o600)
+	raw := fmt.Sprintf("name: http-keys\nenv_file: %q\nstages:\n  - {id: deliver, cmd: echo, env_keys: [TOKEN]}\n  - {id: idle, cmd: echo}\n", envFile)
+	store := openPipelineTestStore(t, home)
+	seedTestPipeline(t, store, db.Pipeline{Name: "http-keys", SpecYAML: raw})
+	store.Close()
+
+	server := httptest.NewServer(dashboard.Serve(&webDataSource{home: home}))
+	defer server.Close()
+	resp, err := http.Get(server.URL + "/api/pipelines/http-keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), `"envFile"`) || !strings.Contains(string(body), `"unresolvedSelectors"`) || strings.Contains(string(body), "http-secret-value-974") {
+		t.Fatalf("unexpected wire shape or value leak: %s", body)
+	}
+	var detail dashboard.PipelineDetail
+	if err := json.Unmarshal(body, &detail); err != nil {
+		t.Fatal(err)
+	}
+	if detail.Keys.Stages == nil || len(detail.Keys.Stages) != 2 || detail.Keys.Stages[0].Keys == nil || detail.Keys.Stages[1].Keys == nil || detail.Keys.Stages[1].UnresolvedSelectors == nil {
+		t.Fatalf("non-null array contract failed: %+v", detail.Keys)
+	}
+}
+
+func TestWebDataSourcePipelineDetailKeysFailOpenSpec(t *testing.T) {
+	home := dashboardTestHome(t)
+	store := openPipelineTestStore(t, home)
+	seedTestPipeline(t, store, db.Pipeline{Name: "broken-keys", SpecYAML: "name: [unterminated"})
+	store.Close()
+
+	detail, err := (&webDataSource{home: home}).PipelineDetail(context.Background(), "broken-keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Declared == nil || detail.Runs == nil || detail.Keys.Stages == nil {
+		t.Fatalf("fail-open slices must be non-nil: %+v", detail)
+	}
+	if detail.Keys.EnvFile.Status != pipelineEnvFileStatusNone || len(detail.Keys.Stages) != 0 {
+		t.Fatalf("fail-open keys = %+v", detail.Keys)
 	}
 }
 

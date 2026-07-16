@@ -262,6 +262,52 @@ func pipelineRunStageIDsMatchSpec(spec pipeline.Spec, rows []db.PipelineRunStage
 	return len(ids) == 0
 }
 
+func dashboardPipelineKeys(ctx context.Context, store *db.Store, home string, spec pipeline.Spec) (dashboard.PipelineKeys, error) {
+	inspection := classifyPipelineEnvFile(ctx, store, home, spec.EnvFile)
+	out := dashboard.PipelineKeys{
+		EnvFile: dashboard.PipelineEnvFileStatus{Path: inspection.Path, Status: inspection.Status},
+		Stages:  make([]dashboard.PipelineStageKeys, 0, len(spec.Stages)),
+	}
+
+	sharedCandidates, err := pipelineSharedKeyCandidates(ctx, store, spec, inspection.Names)
+	if err != nil {
+		return dashboard.PipelineKeys{}, err
+	}
+	sharedNames := make(map[string]struct{})
+	if len(sharedCandidates) > 0 {
+		// Keychain drift is advisory on this read-only endpoint. A missing or invalid
+		// file makes shared selectors unresolved; delivery remains fail-closed.
+		if names, loadErr := loadValidatedKeychainNames(ctx, store, home); loadErr == nil {
+			for name := range sharedCandidates {
+				if _, present := names[name]; present {
+					sharedNames[name] = struct{}{}
+				}
+			}
+		}
+	}
+	resolution := projectPipelineEnvironment(spec, inspection.Names, sharedNames)
+	for _, stage := range spec.Stages {
+		row := dashboard.PipelineStageKeys{
+			ID:                  stage.ID,
+			Kind:                pipelineStageKindName(stage),
+			Keys:                []dashboard.PipelineKeyEntry{},
+			UnresolvedSelectors: []string{},
+		}
+		for _, access := range resolution.Access {
+			if access.Stage == stage.ID {
+				row.Keys = append(row.Keys, dashboard.PipelineKeyEntry{Name: access.Name, Source: access.Source, Mode: access.Mode})
+			}
+		}
+		for _, unresolved := range resolution.Unresolved {
+			if unresolved.Stage == stage.ID {
+				row.UnresolvedSelectors = append(row.UnresolvedSelectors, unresolved.Selector)
+			}
+		}
+		out.Stages = append(out.Stages, row)
+	}
+	return out, nil
+}
+
 // PipelineDetail returns one pipeline's currently declared stage DAG plus its run
 // history (newest-first, capped at 100), each history row carrying its per-stage
 // marks. An unknown name maps to dashboard.ErrPipelineNotFound (the API layer
@@ -277,6 +323,10 @@ func (d *webDataSource) PipelineDetail(ctx context.Context, name string) (dashbo
 		Name:     name,
 		Declared: []dashboard.PipelineStage{},
 		Runs:     []dashboard.PipelineRunHistoryEntry{},
+		Keys: dashboard.PipelineKeys{
+			EnvFile: dashboard.PipelineEnvFileStatus{Status: pipelineEnvFileStatusNone},
+			Stages:  []dashboard.PipelineStageKeys{},
+		},
 	}
 	err := withStore(d.home, func(store *db.Store) error {
 		rec, ok, err := store.GetPipeline(ctx, name)
@@ -295,6 +345,11 @@ func (d *webDataSource) PipelineDetail(ctx context.Context, name string) (dashbo
 		if loaded, lerr := pipeline.Load([]byte(rec.SpecYAML)); lerr == nil {
 			spec, specParsed = loaded, true
 			out.Description = spec.Description
+			keys, keyErr := dashboardPipelineKeys(ctx, store, d.home, spec)
+			if keyErr != nil {
+				return keyErr
+			}
+			out.Keys = keys
 			// Agent runtimes resolve best-effort so the declared preview can label
 			// agent stages even for a pipeline that has never run (#873).
 			agents := pipelineStageAgents(ctx, store, rec)

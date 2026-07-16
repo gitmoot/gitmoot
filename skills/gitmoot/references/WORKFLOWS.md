@@ -1103,6 +1103,14 @@ also refuses missing keys and reserved `GITMOOT_*` names. Values are read fresh
 at stage delivery for restart-free rotation. The job audit stores the path and
 expanded names only, not file values.
 
+The pipeline detail **Keys** tab exposes this authorization as names only: every
+stage appears in spec order with each resolved key's `own`, `shared`, or
+`default` source and delivery mode. It live-checks the declared `env_file` and
+reports `none`, `ok`, `missing`, `bad_mode`, `bad_owner`, `bad_location`, or
+`invalid`; selectors that cannot resolve after file drift are listed separately.
+The tab never reads values into its response, and delivery-time validation
+remains authoritative.
+
 ### Share a pipeline with another Gitmoot home
 
 Use a private GitHub repository as a reviewable pipeline catalog. The source and
