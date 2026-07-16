@@ -557,6 +557,7 @@ type pipelineJSON struct {
 	Name                string                       `json:"name"`
 	Repo                string                       `json:"repo,omitempty"`
 	Group               string                       `json:"group"`
+	Description         string                       `json:"description,omitempty"`
 	Enabled             bool                         `json:"enabled"`
 	Mode                string                       `json:"mode"`
 	Interval            string                       `json:"interval,omitempty"`
@@ -606,7 +607,7 @@ func runPipelineList(args []string, stdout, stderr io.Writer) int {
 	}
 	for _, p := range pipelines {
 		group, _ := resolvedPipelineGroup(p)
-		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", p.Name, enabledLabel(p.Enabled), pipelineListInterval(p, pipelineUpstreamMissing(p, knownPipelines)), firstNonEmpty(p.Repo, "-"), firstNonEmpty(group, "-"), firstNonEmpty(p.LastStatus, "-"), firstNonEmpty(triggerBindingState(p.TriggerBinding), "-"))
+		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", p.Name, enabledLabel(p.Enabled), pipelineListInterval(p, pipelineUpstreamMissing(p, knownPipelines)), firstNonEmpty(p.Repo, "-"), firstNonEmpty(group, "-"), firstNonEmpty(p.LastStatus, "-"), firstNonEmpty(triggerBindingState(p.TriggerBinding), "-"), pipelineDescriptionPreview(pipelineDescription(p)))
 	}
 	return 0
 }
@@ -876,6 +877,7 @@ func pipelineToJSON(record db.Pipeline, withStages bool, agents map[string]db.Ag
 		Name:                record.Name,
 		Repo:                record.Repo,
 		Group:               group,
+		Description:         pipelineDescription(record),
 		Enabled:             record.Enabled,
 		Mode:                pipelineDisplayMode(record, upstreamMissing...),
 		Interval:            record.Interval,
@@ -937,6 +939,17 @@ func resolvedPipelineGroup(record db.Pipeline) (string, bool) {
 		return spec.Group, false
 	}
 	return strings.TrimSpace(record.Repo), true
+}
+
+func pipelineDescription(record db.Pipeline) string {
+	if spec, err := pipeline.Load([]byte(record.SpecYAML)); err == nil {
+		return spec.Description
+	}
+	return ""
+}
+
+func pipelineDescriptionPreview(description string) string {
+	return pipelinePreview(description, " ", 60)
 }
 
 func pipelineDisplayMode(record db.Pipeline, upstreamMissing ...bool) string {
