@@ -80,6 +80,10 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Release Notes',
       items: [
+        'release-notes/v0.9.1.3',
+        'release-notes/v0.9.1.2',
+        'release-notes/v0.9.1',
+        'release-notes/v0.9.0',
         'release-notes/v0.8.8',
         'release-notes/v0.8.7',
         'release-notes/v0.8.6',
