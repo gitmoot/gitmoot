@@ -9,7 +9,7 @@ require (
 	github.com/charmbracelet/x/ansi v0.11.6
 	github.com/charmbracelet/x/term v0.2.2
 	github.com/creachadair/tomledit v0.0.29
-	github.com/gitmoot/gitmoot-dashboard v0.0.0-20260716012516-ba81b5ad8e51
+	github.com/gitmoot/gitmoot-dashboard v0.0.0-20260716130329-dc862b677af0
 	github.com/landlock-lsm/go-landlock v0.9.0
 	github.com/muesli/termenv v0.16.0
 	gopkg.in/yaml.v3 v3.0.1

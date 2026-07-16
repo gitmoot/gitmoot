@@ -6860,6 +6860,12 @@ filter box narrows by key, section, or value, and every knob carries a
 click-to-copy `key = value` snippet for pasting into `config.toml`, whose path
 and last-modified time are shown in the footer.
 
+The Keychain section is a names-only registry view: it shows the configured
+keychain path and live file status, each registered key's injected/proxied mode,
+configured proxy upstream and auth placement, and sorted consumer grants. It
+never returns credential values or value-derived data; file rotation and drift
+are reflected on the next request.
+
 Values come from a strict server-side allowlist: only known, registered
 settings are ever serialized, so secrets and tokens can never appear. Keys
 present in `config.toml` that the allowlist does not recognize are listed by
@@ -12621,6 +12627,9 @@ inferred. The dashboard only builds a resume command from a full UUID.
 In `gitmoot dashboard --web`, labeled jobs cluster around workflow hubs in
 Galaxy; a labeled run links to `/workflows/<label>`, which shows the complete
 run forest, state totals, best-effort token totals, and shared journal.
+The dashboard Config page also includes a read-only, names-only Keychain section
+with live file status, registry modes, configured proxy placement, and sorted
+pipeline grants. Credential values and value-derived data are never projected.
 
 The append-only journal stores text and authors verbatim. JSON show output keeps
 them verbatim; terminal text output sanitizes escapes/control bytes and caps each
