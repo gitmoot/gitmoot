@@ -104,3 +104,14 @@ func TestSnapshotTranslatorRealFixturesExportJSONL(t *testing.T) {
 		})
 	}
 }
+
+func TestExportPreservesIdentifiersWhileMaskingText(t *testing.T) {
+	metadata := ExportMetadata{JobID: "local-ask-okbot-18c2d1ad11b07a07", RootJobID: "local-ask-okbot-18c2d1ad11b07a07", Runtime: "shell", Agent: "okbot", Action: "ask", Repo: "e2e/toy", Outcome: "succeeded"}
+	row := exportRow(metadata, 0, SanitizeEvent(Event{Kind: KindRaw, RawLine: "summary with token ghp_abcdefghijklmnopqrstuvwxyz123456789012"}))
+	if row.JobID != "local-ask-okbot-18c2d1ad11b07a07" {
+		t.Fatalf("job id mangled: %q", row.JobID)
+	}
+	if !strings.Contains(row.Text, "[REDACTED]") || strings.Contains(row.Text, "ghp_abcdefghijk") {
+		t.Fatalf("text not masked: %q", row.Text)
+	}
+}

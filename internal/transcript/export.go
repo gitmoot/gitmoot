@@ -69,7 +69,6 @@ func SanitizeEvent(event Event) Event {
 }
 
 func ExportJSONL(w io.Writer, metadata ExportMetadata, events []Event) error {
-	metadata = sanitizeExportMetadata(metadata)
 	encoder := json.NewEncoder(w)
 	encoder.SetEscapeHTML(false)
 	for index, event := range events {
@@ -80,21 +79,12 @@ func ExportJSONL(w io.Writer, metadata ExportMetadata, events []Event) error {
 	return nil
 }
 
-func sanitizeExportMetadata(metadata ExportMetadata) ExportMetadata {
-	metadata.JobID = workflow.RedactCommentText(metadata.JobID)
-	metadata.RootJobID = workflow.RedactCommentText(metadata.RootJobID)
-	metadata.ParentJobID = workflow.RedactCommentText(metadata.ParentJobID)
-	metadata.DelegationID = workflow.RedactCommentText(metadata.DelegationID)
-	metadata.Runtime = workflow.RedactCommentText(metadata.Runtime)
-	metadata.Agent = workflow.RedactCommentText(metadata.Agent)
-	metadata.Action = workflow.RedactCommentText(metadata.Action)
-	metadata.Repo = workflow.RedactCommentText(metadata.Repo)
-	metadata.Outcome = workflow.RedactCommentText(metadata.Outcome)
-	metadata.Decision = workflow.RedactCommentText(metadata.Decision)
-	metadata.CreatedAt = workflow.RedactCommentText(metadata.CreatedAt)
-	metadata.EndedAt = workflow.RedactCommentText(metadata.EndedAt)
-	return metadata
-}
+// Export metadata is deliberately NOT redacted: every field is a
+// gitmoot-issued identifier, enum, or timestamp — never free text — and the
+// generic credential patterns false-positive on them (a job id like
+// local-ask-x matches the sk- key pattern and would collapse every corpus row
+// to the same mangled id). Free text only flows through Event fields, which
+// sanitizeExportEvent masks above.
 
 func exportRow(metadata ExportMetadata, index int, event Event) ExportRow {
 	row := ExportRow{
