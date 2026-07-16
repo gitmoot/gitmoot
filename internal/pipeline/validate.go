@@ -155,8 +155,8 @@ func (s Spec) Validate() error {
 		if err := validateStageExecutor(s.Name, stage); err != nil {
 			return err
 		}
-		if len(stage.EnvKeys) > 0 && stage.Kind() != StageKindShell {
-			return fmt.Errorf("pipeline %q stage %q sets env_keys but is not a shell stage; agent and gate stages receive no injected environment", s.Name, stage.ID)
+		if len(stage.EnvKeys) > 0 && stage.Kind() == StageKindGate {
+			return fmt.Errorf("pipeline %q stage %q sets env_keys but is a gate stage; gates do not run a process and cannot receive keys", s.Name, stage.ID)
 		}
 		for _, selector := range stage.EnvKeys {
 			if err := ValidateEnvSelector(selector); err != nil {

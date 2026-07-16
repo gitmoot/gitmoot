@@ -58,6 +58,7 @@ gitmoot key add SOURCE_API_TOKEN --mode injected
 gitmoot key grant SOURCE_API_TOKEN --pipeline nightly-sync
 gitmoot key add PARTNER_API_TOKEN --mode proxied
 gitmoot key configure PARTNER_API_TOKEN --upstream https://api.partner.example/v1 --auth bearer
+gitmoot key grant PARTNER_API_TOKEN --agent researcher
 gitmoot key list --json
 gitmoot key show SOURCE_API_TOKEN
 gitmoot key revoke SOURCE_API_TOKEN --pipeline nightly-sync
@@ -67,19 +68,22 @@ gitmoot key rm SOURCE_API_TOKEN --force
 `rm` removes registry metadata and grants, not the operator's file entry.
 `proxied` keys must be configured before grant with an absolute HTTPS upstream
 and either bearer or approved custom-header placement. Pipeline shell stages
-may request granted `injected` or configured `proxied` names with `env_keys`;
-agent and gate stages remain ineligible. Resolution is Gitmoot's reserved
-`GITMOOT_*` namespace, then the pipeline's own `env_file`, then a granted shared
-key, then inline non-secret `env`. Registered but ungranted names are not
-visible to exact or glob selectors.
+may request pipeline-granted `injected` or configured `proxied` names with
+`env_keys`. Agent stages require both a configured proxied key granted to their
+registered seat and an explicit stage selector; injected agent grants are
+refused. Gates remain ineligible. Shell resolution includes the pipeline's own
+file/defaults and pipeline grants, while agent resolution never does.
 
-A proxied shell receives a per-job placeholder in `<KEY>` and a loopback URL in
+A proxied shell or agent stage receives a per-job placeholder in `<KEY>` and a loopback URL in
 `GITMOOT_PROXY_<KEY>_URL`. Gitmoot pins the destination origin/base path,
 rereads the keychain and rechecks the grant for every request, and revokes the
-lease when delivery ends. Proxied mode hides key bytes; it does **not** prevent
+lease when delivery ends. The real value never enters an agent process. Proxied mode hides key bytes; it does **not** prevent
 an authorized child from exercising the credential on the pinned upstream.
 Curated upstreams and base paths are part of the model; configure only trusted
 services.
+
+Ordinary agent jobs receive no keys, and delegation children do not inherit a
+pipeline stage's access.
 
 ## Claude model gateway
 

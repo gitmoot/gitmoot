@@ -62,7 +62,11 @@ func TestKeyCLIRegistryGrantsAndSecretSafety(t *testing.T) {
 		}
 	}
 	if err := withStore(home, func(store *db.Store) error {
-		return store.CreateOrUpdatePipeline(context.Background(), db.Pipeline{Name: "pipe", SpecYAML: "name: pipe\nstages: [{id: run, cmd: echo}]\n"})
+		ctx := context.Background()
+		if err := store.CreateOrUpdatePipeline(ctx, db.Pipeline{Name: "pipe", SpecYAML: "name: pipe\nstages: [{id: run, cmd: echo}]\n"}); err != nil {
+			return err
+		}
+		return store.UpsertAgent(ctx, db.Agent{Name: "seat", Runtime: "codex"})
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -72,6 +76,9 @@ func TestKeyCLIRegistryGrantsAndSecretSafety(t *testing.T) {
 	} else if strings.Contains(out+errOut, keychainSentinel) {
 		t.Fatalf("proxied refusal leaked value: %q %q", out, errOut)
 	}
+	if code, out, errOut := runKeyTestCommand(t, "key", "grant", "PROXY", "--agent", "seat", "--home", home); code == 0 || !strings.Contains(errOut, "not configured") {
+		t.Fatalf("unconfigured agent grant code=%d out=%q err=%q", code, out, errOut)
+	}
 	if code, out, errOut := runKeyTestCommand(t, "key", "configure", "PROXY", "--upstream", "https://api.example.test/v1/", "--auth", "header:X-Api-Token", "--home", home, "--json"); code != 0 || !strings.Contains(out, `"proxy_upstream": "https://api.example.test/v1"`) || !strings.Contains(out, `"proxy_auth_kind": "header"`) || !strings.Contains(out, `"proxy_header": "X-Api-Token"`) {
 		t.Fatalf("key configure code=%d out=%q err=%q", code, out, errOut)
 	} else if strings.Contains(out+errOut, keychainSentinel) {
@@ -79,6 +86,17 @@ func TestKeyCLIRegistryGrantsAndSecretSafety(t *testing.T) {
 	}
 	if code, out, errOut := runKeyTestCommand(t, "key", "grant", "PROXY", "--pipeline", "pipe", "--home", home); code != 0 {
 		t.Fatalf("configured proxied grant code=%d out=%q err=%q", code, out, errOut)
+	}
+	if code, out, errOut := runKeyTestCommand(t, "key", "grant", "SHARED", "--agent", "seat", "--home", home); code == 0 || !strings.Contains(errOut, "proxied-only") {
+		t.Fatalf("injected agent grant code=%d out=%q err=%q", code, out, errOut)
+	}
+	if code, out, errOut := runKeyTestCommand(t, "key", "grant", "PROXY", "--agent", "seat", "--home", home, "--json"); code != 0 || !strings.Contains(out, `"agent": "seat"`) {
+		t.Fatalf("agent grant code=%d out=%q err=%q", code, out, errOut)
+	} else if strings.Contains(out+errOut, keychainSentinel) {
+		t.Fatalf("agent grant leaked value: %q %q", out, errOut)
+	}
+	if code, out, errOut := runKeyTestCommand(t, "key", "grant", "PROXY", "--pipeline", "pipe", "--agent", "seat", "--home", home); code == 0 || !strings.Contains(errOut, "exactly one") {
+		t.Fatalf("mutually exclusive consumer flags code=%d out=%q err=%q", code, out, errOut)
 	}
 	if code, out, errOut := runKeyTestCommand(t, "key", "grant", "SHARED", "--pipeline", "pipe", "--home", home, "--json"); code != 0 {
 		t.Fatalf("grant code=%d out=%q err=%q", code, out, errOut)
@@ -106,9 +124,17 @@ func TestKeyCLIRegistryGrantsAndSecretSafety(t *testing.T) {
 		if wantName == "PROXY" && (!strings.Contains(out, "https://api.example.test/v1") || !strings.Contains(out, "X-Api-Token")) {
 			t.Fatalf("%v omitted proxy configuration: %q", args, out)
 		}
+		if wantName == "PROXY" && wantGrantTarget && !strings.Contains(out, "seat") {
+			t.Fatalf("%v omitted agent grant: %q", args, out)
+		}
 		if strings.Contains(out+errOut, keychainSentinel) {
 			t.Fatalf("%v leaked value: %q %q", args, out, errOut)
 		}
+	}
+	if code, out, errOut := runKeyTestCommand(t, "key", "revoke", "PROXY", "--agent", "seat", "--home", home, "--json"); code != 0 || !strings.Contains(out, `"agent": "seat"`) || !strings.Contains(out, `"changed": true`) {
+		t.Fatalf("agent revoke code=%d out=%q err=%q", code, out, errOut)
+	} else if strings.Contains(out+errOut, keychainSentinel) {
+		t.Fatalf("agent revoke leaked value: %q %q", out, errOut)
 	}
 
 	before, err := os.ReadFile(path)

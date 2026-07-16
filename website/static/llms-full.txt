@@ -2816,7 +2816,7 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 | `stages[].needs`            | stage        | no       | Ids of sibling stages that must **succeed** before this stage is enqueued. Must reference known stages, never the stage itself, and form no cycle. |
 | `stages[].timeout`          | stage        | no       | Per-stage job timeout (positive Go duration). |
 | `stages[].retry`            | stage        | no       | How many times a **failed** stage may be re-attempted (`>= 0`, default `0`). |
-| `stages[].env_keys`         | stage        | no       | Exact names or globs (for example `REDDIT_*`) selected from the pipeline's `env_file`, granted shared registry keys, or inline `env`. Shell stages only; no entry means no key access. |
+| `stages[].env_keys`         | stage        | no       | Exact names or globs (for example `REDDIT_*`). Shell stages resolve pipeline-owned, pipeline-granted, and inline sources. Agent stages resolve only configured proxied keys granted to their named seat. Gates reject this field; no entry means no key access. |
 | `stages[].success_decisions`| stage        | no       | Per-stage override of the pipeline default. |
 
 `gitmoot pipeline add` validates the whole spec **at add time** — unknown keys, a
@@ -2833,10 +2833,13 @@ rather than a stuck run later.
 
 ### Stage-scoped environment
 
-Pipeline secrets are deny-by-default. A shell stage receives only the concrete
-names selected by its `env_keys`; a sibling with different or empty `env_keys`
-does not receive them. Agent and gate stages cannot declare `env_keys`. Shared
-keys must be registered and granted separately:
+Pipeline secrets are deny-by-default. A stage receives only the concrete names
+selected by its own `env_keys`; a sibling with different or empty `env_keys`
+does not receive them. Shell grants belong to the pipeline. Agent stages require
+two independent locks: a configured proxied key granted to the registered agent
+seat, plus that stage's explicit selector. Injected agent grants are refused,
+and gate stages cannot declare `env_keys`. Shared keys must be registered and
+granted separately:
 
 ```sh
 gitmoot key path # edit this 0600 file; the CLI never accepts values
@@ -2845,6 +2848,7 @@ gitmoot key grant REDDIT_CLIENT_SECRET --pipeline trend-scout
 gitmoot key add PARTNER_API_TOKEN --mode proxied
 gitmoot key configure PARTNER_API_TOKEN --upstream https://api.partner.example/v1 --auth bearer
 gitmoot key grant PARTNER_API_TOKEN --pipeline trend-scout
+gitmoot key grant PARTNER_API_TOKEN --agent researcher
 ```
 
 ```yaml
@@ -2870,7 +2874,10 @@ again immediately before each stage process starts, so an atomic rewrite of a
 `0600` source rotates credentials without a daemon restart. Resolution is own
 `env_file`, then granted shared key, then inline default; Gitmoot's reserved
 `GITMOOT_*` entries always win. Registered but ungranted names are not glob or
-exact-match candidates.
+exact-match candidates. Agent stages resolve only from their seat's configured
+proxied grants: pipeline `env_file`, inline defaults, pipeline grants, and
+injected keys are never candidates. Ordinary agent jobs receive nothing, and
+delegated children do not inherit a pipeline stage's key access.
 
 The persisted stage job payload is the audit record: `PipelineKeyAccess` carries
 only `{stage,name,source,mode}` rows (plus legacy env-file/name fields for
@@ -2881,14 +2888,17 @@ after enqueue fails the stage rather than switching to another source. Inline
 injected key is visible to its shell process; this is scoping and audit, not a
 vault.
 
-A configured `proxied` shared key instead gives the shell a per-job placeholder
-in `<KEY>` and a loopback endpoint in `GITMOOT_PROXY_<KEY>_URL`. The endpoint is
+A configured `proxied` shared key gives the selected shell or agent stage a
+per-job placeholder in `<KEY>` and a loopback endpoint in
+`GITMOOT_PROXY_<KEY>_URL`. The endpoint is
 pinned to the configured HTTPS origin and normalized base path. Gitmoot places
 the real credential as either bearer auth or an approved custom header, rereads
 the keychain and rechecks the grant on every request, and revokes the lease when
 delivery ends. Rotation therefore applies to the next request; revocation
-returns `401` without contacting the upstream. Agent and gate stages remain
-ineligible, and the Claude model gateway remains independent.
+returns `401` without contacting the upstream. The real value never enters an
+agent process, though that authorized agent can exercise it against the pinned
+upstream. Gate stages remain ineligible, and the Claude model gateway remains
+independent.
 
 Proxied mode hides key bytes; it does **not** prevent an authorized child from
 exercising the credential on the pinned upstream. Curated upstreams and base
@@ -9506,8 +9516,8 @@ gitmoot key add <NAME> --mode injected|proxied [--json]
 gitmoot key configure <NAME> --upstream <https-url> --auth bearer|header:<HeaderName> [--json]
 gitmoot key list [--json]
 gitmoot key show <NAME> [--json]
-gitmoot key grant <NAME> --pipeline <pipeline> [--json]
-gitmoot key revoke <NAME> --pipeline <pipeline> [--json]
+gitmoot key grant <NAME> (--pipeline <pipeline> | --agent <seat>) [--json]
+gitmoot key revoke <NAME> (--pipeline <pipeline> | --agent <seat>) [--json]
 gitmoot key rm <NAME> [--force] [--json]
 ```
 
@@ -12162,16 +12172,22 @@ its `needs` stages' result summaries are prepended to the prompt, and a repo-bou
 agent stage runs in its own detached read-only worktree so same-repo agent stages
 parallelize without touching the live checkout.
 
-Shell stages can opt into pipeline-owned or granted shared environment values
-with `env_keys`. Source files must be absolute, operator-owned regular files
+Shell and agent stages can opt into scoped key access with `env_keys`. Source
+files must be absolute, operator-owned regular files
 with mode exactly `0600`, outside the Gitmoot home and every managed checkout;
-inline `env` is for non-secret defaults. Agent/gate stages cannot set
-`env_keys`; a shell stage with no list gets nothing. Resolution is own
+inline `env` is for non-secret defaults. A shell stage with no list gets
+nothing. Its resolution is own
 `env_file`, then a shared `injected` or configured `proxied` key granted with
 `gitmoot key grant`, then inline default. Registered but ungranted names do not
 match exact or glob selectors. Structural errors always fail add; unresolved
 names warn only while the pipeline remains disabled, then hard-fail
 add-with-enable, enable, manual run, and scheduled/triggered preflight.
+
+Agent stages resolve only configured `proxied` registry keys granted to their
+registered seat. The seat grant and the stage selector are both required;
+injected agent grants, pipeline files/defaults/grants, and gate-stage selectors
+are refused. Ordinary agent jobs receive no keys, and delegation children do
+not inherit the parent stage's key access.
 
 Sources are revalidated and reread at delivery, so rotation applies without a
 daemon restart. Each payload audits `PipelineName` and names-only
@@ -12181,7 +12197,9 @@ delivery: revocation fails closed and never switches to another source. Gitmoot
 internal `GITMOOT_*` entries remain final. Injected mode exposes the value to
 that shell process. Proxied mode puts a per-job placeholder in `<KEY>` and a
 loopback endpoint in `GITMOOT_PROXY_<KEY>_URL`; every request rereads the value,
-rechecks the grant, and is constrained to the configured upstream/base path.
+rechecks the pipeline or agent-seat grant, and is constrained to the configured
+upstream/base path. For agent stages the real value never enters the process,
+but the authorized agent can exercise it against that pinned upstream.
 The lease is revoked when delivery ends.
 
 Proxied mode hides key bytes; it does **not** prevent an authorized child from
@@ -13678,13 +13696,20 @@ RUN=$(gitmoot pipeline run nightly-sync)          # or trigger a manual run now
 gitmoot pipeline show "$RUN"                       # watch the text funnel
 ```
 
-`env_keys` is a shell-stage-only allowlist of exact names or globs resolved from
-the pipeline's `env_file` and inline non-secret `env`. No list means no injected
-values, and agent stages cannot request them. `pipeline add` requires the file
+`env_keys` is a deny-by-default allowlist of exact names or globs. Shell stages
+resolve the pipeline's `env_file`, pipeline-granted shared keys, and inline
+non-secret `env`. Agent stages resolve only configured proxied keys granted to
+their registered seat; the grant and explicit stage selector are both required,
+and the real value never enters the agent process. Gates reject the field. No
+list means no key access. `pipeline add` requires the file
 to be absolute, operator-owned `0600`, and outside Gitmoot state/checkouts; it
 also refuses missing keys and reserved `GITMOOT_*` names. Values are read fresh
 at stage delivery for restart-free rotation. The job audit stores the path and
 expanded names only, not file values.
+
+Ordinary agent jobs receive no pipeline-stage keys, and a coordinator's
+delegation children inherit nothing. A proxied agent can exercise the credential
+against its pinned upstream even though it never receives the underlying bytes.
 
 The pipeline detail **Keys** tab exposes this authorization as names only: every
 stage appears in spec order with each resolved key's `own`, `shared`, or
@@ -14354,20 +14379,24 @@ missing, or unreadable script is refused before runtime launch with its path;
 relative or malformed hook commands emit a `produce_runtime_resource_warning`
 job event. No such discovery runs when `reads:` is absent.
 
-Pipeline key access is deny-by-default. An `injected` selection gives the shell
-the real value, which it can print or transmit. A configured `proxied` shared
-selection instead gives it a per-job placeholder and loopback URL; Gitmoot
+Pipeline key access is deny-by-default. An `injected` selection gives only a
+shell stage the real value, which it can print or transmit. Agent stages require
+both a configured proxied key granted to their registered seat and an explicit
+stage selector; injected agent grants are refused. A configured `proxied`
+selection gives the selected shell or agent a per-job placeholder and loopback URL; Gitmoot
 rereads the value and rechecks the grant on every request, pins forwarding to
 the configured HTTPS origin/base path, and revokes the lease when delivery
 ends. Gitmoot stores only `{stage,name,source,mode}` audit rows, never values or
 hashes. Keychain and pipeline files are revalidated as owner-only `0600` files
 outside Gitmoot state and managed checkouts.
 
-Proxied mode hides key bytes; it does **not** prevent an authorized child from
+For agent stages, the real value never enters the agent process. Proxied mode
+hides key bytes; it does **not** prevent an authorized child from
 exercising the credential on the pinned upstream. Curated upstreams and base
 paths are part of the model, and only trusted upstreams should be configured.
-Agent and gate stages remain ineligible. This generic pipeline proxy is distinct
-from the Claude model gateway.
+Gate stages remain ineligible. Ordinary agent jobs receive nothing, and
+delegation children do not inherit a stage grant. This generic pipeline proxy
+is distinct from the Claude model gateway.
 
 ## External Contracts
 

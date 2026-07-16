@@ -117,6 +117,10 @@ type Job struct {
 	// injected into shell-stage subprocesses. Other runtimes ignore it; ordinary
 	// shell jobs leave it empty.
 	ShellEnv []string
+	// AgentEnv is an in-memory-only list of proxied keycard placeholders and
+	// loopback lease URLs for a pipeline agent stage. It is never represented in
+	// workflow.JobPayload. Empty preserves the historical plain Runner path.
+	AgentEnv []string
 	// ShellUpstreamContext is persisted JSON content for a dependent pipeline
 	// shell stage. Shell delivery writes it to a fresh 0600 temporary file and
 	// injects only that path into the subprocess environment.
@@ -548,7 +552,7 @@ func (a CodexAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 			return Result{}, err
 		}
 	}
-	result, err := a.runCodex(ctx, agent, job.Prompt, model, effort)
+	result, err := a.runCodex(ctx, agent, job.Prompt, model, effort, job.AgentEnv)
 	// The session id in play: the pinned concrete thread on a resume, or the
 	// thread id codex printed for a fresh/`last` run (best-effort — the stream
 	// may not carry one when the run died early).
@@ -623,10 +627,10 @@ func codexDeliverArgs(agent Agent, dir, prompt, model string, effort string, jso
 // pre-#658 semantics; codexDeliverResult then fails open on the non-JSONL stdout
 // and contributes 0 usage. Only the JSON re-run is retried — a genuine delivery
 // failure surfaces unchanged.
-func (a CodexAdapter) runCodex(ctx context.Context, agent Agent, prompt, model string, effort string) (subprocess.Result, error) {
-	result, err := a.runner().Run(ctx, a.Dir, "codex", codexDeliverArgs(agent, a.Dir, prompt, model, effort, true)...)
+func (a CodexAdapter) runCodex(ctx context.Context, agent Agent, prompt, model string, effort string, env []string) (subprocess.Result, error) {
+	result, err := runAgentCommand(ctx, a.runner(), a.Dir, env, "codex", codexDeliverArgs(agent, a.Dir, prompt, model, effort, true)...)
 	if err != nil && isCodexJSONUnsupported(result) {
-		result, err = a.runner().Run(ctx, a.Dir, "codex", codexDeliverArgs(agent, a.Dir, prompt, model, effort, false)...)
+		result, err = runAgentCommand(ctx, a.runner(), a.Dir, env, "codex", codexDeliverArgs(agent, a.Dir, prompt, model, effort, false)...)
 	}
 	return result, err
 }
@@ -1006,7 +1010,7 @@ func (a ClaudeAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Resul
 					refreshedRef = newRef
 				}
 				diagSessionRef = newRef
-				result, err = a.runner().Run(ctx, a.Dir, "claude", claudeFreshSessionArgs(agent, job.Prompt, model, newRef)...)
+				result, err = runAgentCommand(ctx, a.runner(), a.Dir, job.AgentEnv, "claude", claudeFreshSessionArgs(agent, job.Prompt, model, newRef)...)
 				if err != nil {
 					if sessionMissing {
 						return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, diagSessionRef)}, a.claudeSessionMissingError(agent, result, err)
@@ -1047,7 +1051,7 @@ func (a ClaudeAdapter) deliverFresh(ctx context.Context, agent Agent, job Job, m
 		if err != nil {
 			return Result{}, err
 		}
-		result, err = a.runner().Run(ctx, a.Dir, "claude", claudeFreshSessionArgs(agent, job.Prompt, model, sessionID)...)
+		result, err = runAgentCommand(ctx, a.runner(), a.Dir, job.AgentEnv, "claude", claudeFreshSessionArgs(agent, job.Prompt, model, sessionID)...)
 		if attempt >= claudeDeliveryMaxAttempts || !isTransientClaudeDeliveryError(result, err) {
 			break
 		}
@@ -1077,11 +1081,22 @@ func (a ClaudeAdapter) deliverFresh(ctx context.Context, agent Agent, job Job, m
 // runClaude performs a single Claude delivery attempt, including the JSON
 // output-format fallback re-run for older CLIs that reject --output-format.
 func (a ClaudeAdapter) runClaude(ctx context.Context, agent Agent, job Job, model string) (subprocess.Result, error) {
-	result, err := a.runner().Run(ctx, a.Dir, "claude", claudeArgs(agent, job.Prompt, true, model)...)
+	result, err := runAgentCommand(ctx, a.runner(), a.Dir, job.AgentEnv, "claude", claudeArgs(agent, job.Prompt, true, model)...)
 	if err != nil && isClaudeJSONUnsupported(result) {
-		result, err = a.runner().Run(ctx, a.Dir, "claude", claudeArgs(agent, job.Prompt, false, model)...)
+		result, err = runAgentCommand(ctx, a.runner(), a.Dir, job.AgentEnv, "claude", claudeArgs(agent, job.Prompt, false, model)...)
 	}
 	return result, err
+}
+
+func runAgentCommand(ctx context.Context, runner subprocess.Runner, dir string, env []string, command string, args ...string) (subprocess.Result, error) {
+	if len(env) == 0 {
+		return runner.Run(ctx, dir, command, args...)
+	}
+	envRunner, ok := runner.(subprocess.EnvRunner)
+	if !ok {
+		return subprocess.Result{}, errors.New("runtime runner does not support agent environment injection")
+	}
+	return envRunner.RunEnv(ctx, dir, env, command, args...)
 }
 
 // waitRetryBackoff pauses before the next delivery attempt (1-indexed), returning

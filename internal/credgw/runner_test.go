@@ -96,3 +96,31 @@ func TestRunnerWithoutChildConfigDirLeavesItUntouched(t *testing.T) {
 		t.Fatalf("CLAUDE_CONFIG_DIR = %q, want the caller's value preserved", dir)
 	}
 }
+
+func TestRunnerGatewayAuthOverridesAgentEnv(t *testing.T) {
+	gateway := newTestGateway(t)
+	capture := &envCapture{}
+	runner := &Runner{
+		Inner:      capture,
+		Gateway:    gateway,
+		Credential: Credential{Kind: CredentialBearer, Value: "real-token"},
+		Policy:     Policy{Upstream: DefaultAnthropicUpstream, AllowedHosts: []string{"api.anthropic.com"}},
+	}
+	if _, err := runner.RunEnv(context.Background(), "", []string{
+		"CLAUDE_CODE_OAUTH_TOKEN=stage-supplied-value",
+		"ANTHROPIC_BASE_URL=https://stage.invalid",
+	}, "claude", "-p", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	token, _ := envValue(capture.env, "CLAUDE_CODE_OAUTH_TOKEN")
+	if !strings.HasPrefix(token, "gitmoot-kc-") || token == "stage-supplied-value" {
+		t.Fatalf("effective Claude token = %q, want model-gateway placeholder", token)
+	}
+	base, _ := envValue(capture.env, "ANTHROPIC_BASE_URL")
+	if !strings.HasPrefix(base, "http://127.0.0.1:") {
+		t.Fatalf("effective Anthropic base URL = %q, want model gateway", base)
+	}
+	if got := strings.Join(capture.env, "\n"); !strings.Contains(got, "CLAUDE_CODE_OAUTH_TOKEN=stage-supplied-value") {
+		t.Fatalf("incoming AgentEnv entry was not composed beneath gateway env: %q", got)
+	}
+}

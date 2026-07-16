@@ -74,7 +74,7 @@ func TestPipelineEnvSpecValidation(t *testing.T) {
 		{name: "relative file", extra: "env_file: relative.env\n", stage: "{id: run, cmd: echo}", want: "must be absolute"},
 		{name: "reserved inline", extra: "env: {GITMOOT_PIPELINE_NAME: bad}\n", stage: "{id: run, cmd: echo}", want: "reserved GITMOOT_*"},
 		{name: "reserved selector", stage: "{id: run, cmd: echo, env_keys: [GITMOOT_*]}", want: "reserved GITMOOT_*"},
-		{name: "agent denied", stage: "{id: run, agent: scout, action: ask, prompt: inspect, env_keys: [TOKEN]}", want: "agent and gate stages receive no injected environment"},
+		{name: "valid agent selector", stage: "{id: run, agent: scout, action: ask, prompt: inspect, env_keys: [TOKEN]}"},
 		{name: "valid shell", extra: "env_file: /tmp/pipeline.env\nenv: {DATA_DIR: /tmp/data}\n", stage: "{id: run, cmd: echo, env_keys: [API_*, DATA_DIR]}"},
 	}
 	for _, tt := range tests {
@@ -90,9 +90,23 @@ func TestPipelineEnvSpecValidation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if tt.name == "valid agent selector" {
+				if spec.Stages[0].Agent != "scout" || !reflect.DeepEqual(spec.Stages[0].EnvKeys, []string{"TOKEN"}) {
+					t.Fatalf("parsed agent spec = %+v", spec)
+				}
+				return
+			}
 			if spec.EnvFile != "/tmp/pipeline.env" || spec.Env["DATA_DIR"] != "/tmp/data" || !reflect.DeepEqual(spec.Stages[0].EnvKeys, []string{"API_*", "DATA_DIR"}) {
 				t.Fatalf("parsed spec = %+v", spec)
 			}
 		})
+	}
+	gate := `name: gate-env
+stages:
+  - {id: impl, agent: builder, action: implement, prompt: build, write: true}
+  - {id: wait, gate: pr_merged, source: impl, needs: [impl], env_keys: [TOKEN]}
+`
+	if _, err := Load([]byte(gate)); err == nil || !strings.Contains(err.Error(), "gates do not run a process") {
+		t.Fatalf("gate env_keys error = %v", err)
 	}
 }

@@ -1830,6 +1830,151 @@ type shellContextRunner struct {
 	calls   [][]string
 }
 
+type agentEnvRunner struct {
+	results  []subprocess.Result
+	errs     []error
+	runCalls [][]string
+	envCalls []struct {
+		env  []string
+		argv []string
+	}
+}
+
+func (r *agentEnvRunner) result(command string, args []string, index int) (subprocess.Result, error) {
+	result := subprocess.Result{Command: command, Args: args}
+	if index < len(r.results) {
+		result = r.results[index]
+		result.Command = command
+		result.Args = args
+	}
+	var err error
+	if index < len(r.errs) {
+		err = r.errs[index]
+	}
+	return result, err
+}
+
+func (r *agentEnvRunner) Run(_ context.Context, _ string, command string, args ...string) (subprocess.Result, error) {
+	argv := append([]string{command}, args...)
+	r.runCalls = append(r.runCalls, argv)
+	return r.result(command, args, len(r.runCalls)+len(r.envCalls)-1)
+}
+
+func (r *agentEnvRunner) RunEnv(_ context.Context, _ string, env []string, command string, args ...string) (subprocess.Result, error) {
+	argv := append([]string{command}, args...)
+	r.envCalls = append(r.envCalls, struct {
+		env  []string
+		argv []string
+	}{env: append([]string(nil), env...), argv: argv})
+	return r.result(command, args, len(r.runCalls)+len(r.envCalls)-1)
+}
+
+func (r *agentEnvRunner) LookPath(file string) (string, error) {
+	return "/usr/bin/" + file, nil
+}
+
+func TestManagedRuntimeDeliveriesThreadAgentEnv(t *testing.T) {
+	const session = "550e8400-e29b-41d4-a716-446655440002"
+	wantEnv := []string{"PROXY_KEY=gitmoot-kc-agent-test", "GITMOOT_PROXY_PROXY_KEY_URL=http://127.0.0.1:1234/lease"}
+	tests := []struct {
+		name   string
+		output string
+		agent  Agent
+		build  func(subprocess.Runner) Adapter
+	}{
+		{
+			name: "codex", output: "done",
+			agent: Agent{Name: "seat", Role: "reviewer", Runtime: CodexRuntime, RuntimeRef: LastRef, RepoScope: "gitmoot/gitmoot"},
+			build: func(r subprocess.Runner) Adapter { return CodexAdapter{Runner: r} },
+		},
+		{
+			name: "claude", output: `{"result":"done"}`,
+			agent: Agent{Name: "seat", Role: "reviewer", Runtime: ClaudeRuntime, RuntimeRef: session, RepoScope: "gitmoot/gitmoot"},
+			build: func(r subprocess.Runner) Adapter { return ClaudeAdapter{Runner: r} },
+		},
+		{
+			name: "kimi", output: kimiStreamOK,
+			agent: Agent{Name: "seat", Role: "reviewer", Runtime: KimiRuntime, RuntimeRef: "session_" + session, RepoScope: "gitmoot/gitmoot"},
+			build: func(r subprocess.Runner) Adapter { return KimiAdapter{Runner: r} },
+		},
+		{
+			name: "kimi-cli", output: kimiStreamOK,
+			agent: Agent{Name: "seat", Role: "reviewer", Runtime: KimiCLIRuntime, RuntimeRef: "session_" + session, RepoScope: "gitmoot/gitmoot"},
+			build: func(r subprocess.Runner) Adapter { return KimiCLIAdapter{Runner: r} },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			withEnv := &agentEnvRunner{results: []subprocess.Result{{Stdout: tt.output}}}
+			if _, err := tt.build(withEnv).Deliver(context.Background(), tt.agent, Job{Prompt: "work", AgentEnv: wantEnv}); err != nil {
+				t.Fatalf("Deliver with AgentEnv: %v", err)
+			}
+			if len(withEnv.runCalls) != 0 || len(withEnv.envCalls) != 1 {
+				t.Fatalf("runner calls: Run=%#v RunEnv=%#v", withEnv.runCalls, withEnv.envCalls)
+			}
+			if !reflect.DeepEqual(withEnv.envCalls[0].env, wantEnv) {
+				t.Fatalf("RunEnv env = %#v, want %#v", withEnv.envCalls[0].env, wantEnv)
+			}
+
+			withoutEnv := &agentEnvRunner{results: []subprocess.Result{{Stdout: tt.output}}}
+			if _, err := tt.build(withoutEnv).Deliver(context.Background(), tt.agent, Job{Prompt: "work"}); err != nil {
+				t.Fatalf("Deliver without AgentEnv: %v", err)
+			}
+			if len(withoutEnv.runCalls) != 1 || len(withoutEnv.envCalls) != 0 {
+				t.Fatalf("empty AgentEnv changed runner path: Run=%#v RunEnv=%#v", withoutEnv.runCalls, withoutEnv.envCalls)
+			}
+		})
+	}
+}
+
+func TestAgentEnvReachesRuntimeFallbackAttempts(t *testing.T) {
+	wantEnv := []string{"PROXY_KEY=gitmoot-kc-fallback-test"}
+	tests := []struct {
+		name    string
+		results []subprocess.Result
+		errs    []error
+		agent   Agent
+		build   func(subprocess.Runner) Adapter
+	}{
+		{
+			name: "codex json fallback",
+			results: []subprocess.Result{
+				{Stderr: "error: unexpected argument '--json' found"},
+				{Stdout: "done"},
+			},
+			errs:  []error{errors.New("exit 2"), nil},
+			agent: Agent{Name: "seat", Role: "reviewer", Runtime: CodexRuntime, RuntimeRef: LastRef, RepoScope: "gitmoot/gitmoot"},
+			build: func(r subprocess.Runner) Adapter { return CodexAdapter{Runner: r} },
+		},
+		{
+			name: "claude output format fallback",
+			results: []subprocess.Result{
+				{Stderr: "unknown output-format option"},
+				{Stdout: "done"},
+			},
+			errs:  []error{errors.New("exit 2"), nil},
+			agent: Agent{Name: "seat", Role: "reviewer", Runtime: ClaudeRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "gitmoot/gitmoot"},
+			build: func(r subprocess.Runner) Adapter { return ClaudeAdapter{Runner: r} },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &agentEnvRunner{results: tt.results, errs: tt.errs}
+			if _, err := tt.build(runner).Deliver(context.Background(), tt.agent, Job{Prompt: "work", AgentEnv: wantEnv}); err != nil {
+				t.Fatalf("Deliver: %v", err)
+			}
+			if len(runner.envCalls) != 2 || len(runner.runCalls) != 0 {
+				t.Fatalf("fallback calls: Run=%#v RunEnv=%#v", runner.runCalls, runner.envCalls)
+			}
+			for i, call := range runner.envCalls {
+				if !reflect.DeepEqual(call.env, wantEnv) {
+					t.Fatalf("attempt %d env = %#v, want %#v", i, call.env, wantEnv)
+				}
+			}
+		})
+	}
+}
+
 func (r *shellContextRunner) Run(_ context.Context, _ string, command string, args ...string) (subprocess.Result, error) {
 	return subprocess.Result{}, errors.New("unexpected plain Run")
 }

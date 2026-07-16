@@ -187,8 +187,9 @@ type Stage struct {
 	// Retry is how many times a failed stage may be re-attempted (>= 0).
 	Retry int `yaml:"retry,omitempty"`
 	// EnvKeys is the deny-by-default list of environment names (or glob selectors)
-	// made available to this shell stage from own, shared, or default sources.
-	// Agent and gate grants are deliberately deferred to a later keycard phase.
+	// requested by this stage. Shell stages resolve own/shared/default sources;
+	// agent stages resolve only configured proxied keys granted to their seat.
+	// Gates run no process and reject env_keys.
 	EnvKeys []string `yaml:"env_keys,omitempty"`
 	// SuccessDecisions optionally overrides the pipeline default for this stage.
 	SuccessDecisions []string `yaml:"success_decisions,omitempty"`

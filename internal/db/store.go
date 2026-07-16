@@ -1095,6 +1095,9 @@ func (s *Store) RemoveAgent(ctx context.Context, name string) (bool, error) {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM agent_repos WHERE agent_name = ?`, name); err != nil {
 		return false, err
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM keychain_grants WHERE consumer_kind = 'agent' AND consumer_id = ?`, name); err != nil {
+		return false, err
+	}
 	result, err := tx.ExecContext(ctx, `DELETE FROM agents WHERE name = ?`, name)
 	if err != nil {
 		return false, err
@@ -1163,6 +1166,9 @@ func (s *Store) DeleteAgentChecked(ctx context.Context, name string) error {
 		return fmt.Errorf("agent %s has %d queued or running job(s); cancel them first: %w", name, active, ErrAgentHasActiveJobs)
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM agent_repos WHERE agent_name = ?`, name); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM keychain_grants WHERE consumer_kind = 'agent' AND consumer_id = ?`, name); err != nil {
 		return err
 	}
 	// agent_instances are NOT deleted: their `type` column references a managed

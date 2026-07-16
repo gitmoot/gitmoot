@@ -155,3 +155,66 @@ func TestDeletePipelineCleansKeychainGrantsInSameTransaction(t *testing.T) {
 		t.Fatalf("key metadata removed with pipeline: found=%v err=%v", found, err)
 	}
 }
+
+func TestAgentKeychainGrantsAreProxiedOnlyAndDeletionCleansBothPaths(t *testing.T) {
+	store := openPipelineStore(t)
+	ctx := context.Background()
+	for _, name := range []string{"remove-seat", "checked-seat"} {
+		if err := store.UpsertAgent(ctx, Agent{Name: name, Runtime: "codex"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.AddKeychainKey(ctx, "INJECTED", KeychainModeInjected); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddKeychainKey(ctx, "PROXY", KeychainModeProxied); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := store.GrantKeychainKey(ctx, KeychainConsumerAgent, "remove-seat", "INJECTED"); changed || !errors.Is(err, ErrKeychainAgentInjected) {
+		t.Fatalf("injected agent grant = changed %v err %v", changed, err)
+	}
+	if changed, err := store.GrantKeychainKey(ctx, KeychainConsumerAgent, "remove-seat", "PROXY"); changed || !errors.Is(err, ErrKeychainProxyUnconfigured) {
+		t.Fatalf("unconfigured agent grant = changed %v err %v", changed, err)
+	}
+	if _, err := store.ConfigureKeychainProxy(ctx, "PROXY", "https://api.example.test/v1", KeychainProxyAuthBearer, ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, seat := range []string{"remove-seat", "checked-seat"} {
+		if changed, err := store.GrantKeychainKey(ctx, KeychainConsumerAgent, seat, "PROXY"); err != nil || !changed {
+			t.Fatalf("grant %s = changed %v err %v", seat, changed, err)
+		}
+		if changed, err := store.GrantKeychainKey(ctx, KeychainConsumerAgent, seat, "PROXY"); err != nil || changed {
+			t.Fatalf("duplicate grant %s = changed %v err %v", seat, changed, err)
+		}
+		if key, found, err := store.GetGrantedKey(ctx, KeychainConsumerAgent, seat, "PROXY"); err != nil || !found || !key.ProxyConfigured() {
+			t.Fatalf("GetGrantedKey %s = %+v found=%v err=%v", seat, key, found, err)
+		}
+	}
+	if grants, err := store.ListKeychainGrantsForConsumer(ctx, KeychainConsumerAgent, "remove-seat"); err != nil || len(grants) != 1 || grants[0].ConsumerKind != KeychainConsumerAgent {
+		t.Fatalf("agent grants = %+v err=%v", grants, err)
+	}
+	if changed, err := store.RevokeKeychainKey(ctx, KeychainConsumerAgent, "remove-seat", "PROXY"); err != nil || !changed {
+		t.Fatalf("agent revoke = changed %v err %v", changed, err)
+	}
+	if changed, err := store.GrantKeychainKey(ctx, KeychainConsumerAgent, "remove-seat", "PROXY"); err != nil || !changed {
+		t.Fatalf("agent regrant = changed %v err %v", changed, err)
+	}
+	if removed, err := store.RemoveAgent(ctx, "remove-seat"); err != nil || !removed {
+		t.Fatalf("RemoveAgent = removed %v err %v", removed, err)
+	}
+	if grants, err := store.ListKeychainGrants(ctx, "PROXY"); err != nil || len(grants) != 1 || grants[0].ConsumerID != "checked-seat" {
+		t.Fatalf("grants after RemoveAgent = %+v err=%v", grants, err)
+	}
+	if err := store.DeleteAgentChecked(ctx, "checked-seat"); err != nil {
+		t.Fatalf("DeleteAgentChecked: %v", err)
+	}
+	if grants, err := store.ListKeychainGrants(ctx, "PROXY"); err != nil || len(grants) != 0 {
+		t.Fatalf("grants after DeleteAgentChecked = %+v err=%v", grants, err)
+	}
+	if changed, err := store.GrantKeychainKey(ctx, KeychainConsumerAgent, "missing-seat", "PROXY"); changed || !errors.Is(err, ErrKeychainConsumerNotFound) {
+		t.Fatalf("missing agent grant = changed %v err %v", changed, err)
+	}
+	if changed, err := store.RevokeKeychainKey(ctx, KeychainConsumerAgent, "missing-seat", "PROXY"); changed || !errors.Is(err, ErrKeychainConsumerNotFound) {
+		t.Fatalf("missing agent revoke = changed %v err %v", changed, err)
+	}
+}

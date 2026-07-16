@@ -120,7 +120,7 @@ type Mailbox struct {
 	produceCheckTimeout time.Duration
 }
 
-// PipelineKeyAccess is the persisted, names-only authorization for one shell
+// PipelineKeyAccess is the persisted, names-only authorization for one pipeline
 // stage environment name. Source is pinned at enqueue so delivery never changes
 // audit meaning by falling through to another source.
 type PipelineKeyAccess struct {
@@ -200,11 +200,13 @@ type JobRequest struct {
 	// and non-shell job.
 	ShellEnv []string
 	// PipelineName and PipelineKeyAccess are the names-only keycard authority for
-	// a pipeline shell stage. PipelineEnvFile/PipelineEnvKeys remain for in-flight
-	// jobs enqueued before registry/grant resolution shipped. PipelineEnv contains
-	// only selected inline NON-secret defaults; secret values are loaded at
-	// delivery and never enter the persisted payload.
+	// a pipeline stage. PipelineKeyAgent pins an agent stage to its registered seat
+	// grant; empty means the existing pipeline/shell consumer. PipelineEnvFile and
+	// PipelineEnvKeys remain for in-flight shell jobs enqueued before registry/grant
+	// resolution shipped. PipelineEnv contains only selected inline NON-secret
+	// defaults; secret values are loaded at delivery and never enter the payload.
 	PipelineName      string
+	PipelineKeyAgent  string
 	PipelineKeyAccess []PipelineKeyAccess
 	PipelineEnvFile   string
 	PipelineEnvKeys   []string
@@ -312,6 +314,7 @@ type JobPayload struct {
 	RuntimeOverrideRef     string              `json:"runtime_override_ref,omitempty"`
 	ShellEnv               []string            `json:"shell_env,omitempty"`
 	PipelineName           string              `json:"pipeline_name,omitempty"`
+	PipelineKeyAgent       string              `json:"pipeline_key_agent,omitempty"`
 	PipelineKeyAccess      []PipelineKeyAccess `json:"pipeline_key_access,omitempty"`
 	PipelineEnvFile        string              `json:"pipeline_env_file,omitempty"`
 	PipelineEnvKeys        []string            `json:"pipeline_env_keys,omitempty"`
@@ -463,6 +466,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		RuntimeOverrideRef:     strings.TrimSpace(request.RuntimeOverrideRef),
 		ShellEnv:               append([]string(nil), request.ShellEnv...),
 		PipelineName:           strings.TrimSpace(request.PipelineName),
+		PipelineKeyAgent:       strings.TrimSpace(request.PipelineKeyAgent),
 		PipelineKeyAccess:      compactPipelineKeyAccess(request.PipelineKeyAccess),
 		PipelineEnvFile:        strings.TrimSpace(request.PipelineEnvFile),
 		PipelineEnvKeys:        compactStrings(request.PipelineEnvKeys),

@@ -58,8 +58,10 @@ gitmoot key add SOURCE_API_TOKEN --mode injected
 gitmoot key grant SOURCE_API_TOKEN --pipeline nightly-sync
 gitmoot key add PARTNER_API_TOKEN --mode proxied
 gitmoot key configure PARTNER_API_TOKEN --upstream https://api.partner.example/v1 --auth bearer
+gitmoot key grant PARTNER_API_TOKEN --agent researcher
 gitmoot key list --json
 gitmoot key show SOURCE_API_TOKEN
+gitmoot key revoke PARTNER_API_TOKEN --agent researcher
 gitmoot key revoke SOURCE_API_TOKEN --pipeline nightly-sync
 gitmoot key rm SOURCE_API_TOKEN       # refuses while grants remain
 gitmoot key rm SOURCE_API_TOKEN --force
@@ -70,14 +72,20 @@ gitmoot key rm SOURCE_API_TOKEN --force
 places the real value in the upstream `Authorization` header; `--auth
 header:X-Api-Key` uses an approved custom header. The upstream must be an
 absolute HTTPS origin and its normalized base path is pinned. Pipeline shell
-stages may request granted `injected` or configured `proxied` names with
-`env_keys`; agent and gate stages remain ineligible. Resolution is Gitmoot's
-reserved `GITMOOT_*` namespace, then the pipeline's own `env_file`, then a
-granted shared key, then inline non-secret `env`. Registered but ungranted names
-are not visible to exact or glob selectors.
+stages may request pipeline-granted `injected` or configured `proxied` names
+with `env_keys`. An agent stage can request only a configured `proxied` key,
+and both the named agent seat grant and that stage's explicit `env_keys`
+selector are required. Injected agent grants are always refused; gate stages
+remain ineligible. Shell resolution is Gitmoot's reserved `GITMOOT_*`
+namespace, then the pipeline's own `env_file`, then a granted shared key, then
+inline non-secret `env`. Agent stages never resolve from the pipeline file,
+inline defaults, or pipeline grants. Registered but ungranted names are not
+visible to exact or glob selectors.
 
-For a proxied key, the shell receives a per-job `gitmoot-kc-...` placeholder in
-the requested variable and a `GITMOOT_PROXY_<KEY>_URL` loopback URL. Gitmoot
+For a proxied key, the selected shell or agent process receives a per-job
+`gitmoot-kc-...` placeholder in the requested variable and a
+`GITMOOT_PROXY_<KEY>_URL` loopback URL. The real value never enters an agent
+process. Gitmoot
 rechecks the grant and configuration and rereads the keychain on every request,
 so rotation applies to the next request and revocation fails closed with `401`.
 The lease is revoked when the stage delivery ends.
@@ -108,9 +116,11 @@ delivery (#936). The mirror never contains a credential; the operator's real
 config is only read, never modified.
 
 Pipeline key delivery is independent of the Claude gateway. `injected` keys
-give the selected shell process the real value. `proxied` keys use generic
-per-job loopback leases whose values are resolved for each request; they do not
-alter Claude's model-gateway placeholder flow.
+give only a selected shell process the real value. `proxied` keys use generic
+per-job loopback leases for selected shell or agent stages; their values are
+resolved for each request and they do not alter Claude's model-gateway
+placeholder flow. Ordinary non-pipeline agent jobs and delegated children
+receive no pipeline-stage keys.
 
 The feature is off by default and currently covers Claude only. A populated
 `runtime-auth.env` is required while it is enabled; Gitmoot fails the delivery

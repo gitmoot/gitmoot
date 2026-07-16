@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	dashboard "github.com/gitmoot/gitmoot-dashboard"
 
 	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -102,11 +105,12 @@ func TestPipelineAddEnvFileValidation(t *testing.T) {
 			enable: true,
 		},
 		{
-			name: "agent stage denied",
+			name: "agent env file key unresolved",
 			setup: func(t *testing.T, _ string) (string, string, string) {
 				return writePipelineEnvFile(t, t.TempDir(), "TOKEN="+pipelineEnvSecretA+"\n", 0o600), "", "{id: run, agent: scout, action: ask, prompt: inspect, env_keys: [TOKEN]}"
 			},
-			want: "agent and gate stages receive no injected environment",
+			want:   "gitmoot key grant TOKEN --agent scout",
+			enable: true,
 		},
 	}
 
@@ -214,11 +218,15 @@ func TestClassifyPipelineEnvFileStatuses(t *testing.T) {
 }
 
 type pipelineEnvCaptureAdapter struct {
-	jobs []runtime.Job
+	jobs    []runtime.Job
+	deliver func(runtime.Job) (runtime.Result, error)
 }
 
 func (a *pipelineEnvCaptureAdapter) Deliver(_ context.Context, _ runtime.Agent, job runtime.Job) (runtime.Result, error) {
 	a.jobs = append(a.jobs, job)
+	if a.deliver != nil {
+		return a.deliver(job)
+	}
 	return runtime.Result{Raw: `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}, nil
 }
 
@@ -360,6 +368,83 @@ func TestPipelineKeyAccessResolutionPrecedenceAndGrantBoundary(t *testing.T) {
 	}
 	if len(capture.jobs) != 0 {
 		t.Fatalf("disappeared own source reached delivery: %#v", capture.jobs)
+	}
+}
+
+func TestPipelineAgentKeyResolutionRequiresSeatGrantAndProxiedMode(t *testing.T) {
+	ctx := context.Background()
+	home, _, store := heartbeatLoopE2EHome(t)
+	writeDefaultKeychain(t, home, strings.Join([]string{
+		"AGENT_PROXY=agent-proxy-value",
+		"PIPELINE_ONLY=pipeline-proxy-value",
+		"AGENT_INJECTED=injected-value",
+		"OWN_ONLY=own-value",
+	}, "\n")+"\n")
+	if err := store.CreateOrUpdatePipeline(ctx, db.Pipeline{Name: "agent-sources", SpecYAML: "name: agent-sources\nstages: [{id: shell, cmd: echo}]\n"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{Name: "scout", Runtime: "codex"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []struct {
+		name string
+		mode string
+	}{
+		{name: "AGENT_PROXY", mode: db.KeychainModeProxied},
+		{name: "PIPELINE_ONLY", mode: db.KeychainModeProxied},
+		{name: "AGENT_INJECTED", mode: db.KeychainModeInjected},
+	} {
+		if _, err := store.AddKeychainKey(ctx, key.name, key.mode); err != nil {
+			t.Fatal(err)
+		}
+		if key.mode == db.KeychainModeProxied {
+			if _, err := store.ConfigureKeychainProxy(ctx, key.name, "https://api.example.test/v1", db.KeychainProxyAuthBearer, ""); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if _, err := store.GrantKeychainKey(ctx, db.KeychainConsumerAgent, "scout", "AGENT_PROXY"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GrantKeychainKey(ctx, db.KeychainConsumerPipeline, "agent-sources", "PIPELINE_ONLY"); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.ExecContext(ctx, `INSERT INTO keychain_grants(consumer_kind, consumer_id, key_name) VALUES (?, ?, ?)`, db.KeychainConsumerAgent, "scout", "AGENT_INJECTED"); err != nil {
+		t.Fatal(err)
+	}
+	envFile := writePipelineEnvFile(t, t.TempDir(), "OWN_ONLY=own-value\n", 0o600)
+	spec := pipeline.Spec{
+		Name: "agent-sources", EnvFile: envFile, Env: map[string]string{"DEFAULT_ONLY": "default"},
+		Stages: []pipeline.Stage{
+			{ID: "agent", Agent: "scout", Action: "ask", Prompt: "inspect", EnvKeys: []string{"AGENT_PROXY", "PIPELINE_ONLY", "AGENT_INJECTED", "OWN_ONLY", "DEFAULT_ONLY"}},
+			{ID: "shell", Cmd: "echo", EnvKeys: []string{"PIPELINE_ONLY", "DEFAULT_ONLY"}},
+		},
+	}
+	resolution, err := resolvePipelineEnvironment(ctx, store, home, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAccess := []workflow.PipelineKeyAccess{
+		{Stage: "agent", Name: "AGENT_PROXY", Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied},
+		{Stage: "shell", Name: "PIPELINE_ONLY", Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied},
+		{Stage: "shell", Name: "DEFAULT_ONLY", Source: pipelineKeySourceDefault, Mode: db.KeychainModeInjected},
+	}
+	wantUnresolved := []pipelineEnvUnresolved{
+		{Stage: "agent", Selector: "PIPELINE_ONLY"},
+		{Stage: "agent", Selector: "AGENT_INJECTED"},
+		{Stage: "agent", Selector: "OWN_ONLY"},
+		{Stage: "agent", Selector: "DEFAULT_ONLY"},
+	}
+	if !reflect.DeepEqual(resolution.Access, wantAccess) || !reflect.DeepEqual(resolution.Unresolved, wantUnresolved) {
+		t.Fatalf("resolution access=%#v unresolved=%#v", resolution.Access, resolution.Unresolved)
+	}
+	if err := pipelineEnvironmentResolutionError(spec, []pipelineEnvUnresolved{{Stage: "agent", Selector: "MISSING"}}); err == nil || !strings.Contains(err.Error(), "gitmoot key grant MISSING --agent scout") {
+		t.Fatalf("agent unresolved hint = %v", err)
 	}
 }
 
@@ -508,6 +593,192 @@ func TestPipelineProxiedKeyResolutionAndDeliveryLease(t *testing.T) {
 	}
 }
 
+func TestPipelineAgentProxiedKeyDeliveryE2E(t *testing.T) {
+	ctx := context.Background()
+	home, _, store := heartbeatLoopE2EHome(t)
+	const (
+		keyName      = "AGENT_PROXY"
+		real         = "agent-real-value-874-pr2"
+		pipelineName = "agent-proxy-e2e"
+		seatName     = "scout"
+	)
+	keychainPath := writeDefaultKeychain(t, home, keyName+"="+real+"\n")
+	specYAML := "name: " + pipelineName + "\nrepo: owner/repo\nstages: [{id: inspect, agent: " + seatName + ", action: ask, prompt: inspect, env_keys: [" + keyName + "]}]\n"
+	if err := store.CreateOrUpdatePipeline(ctx, db.Pipeline{Name: pipelineName, Repo: "owner/repo", SpecYAML: specYAML}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{Name: seatName, Runtime: runtime.CodexRuntime}); err != nil {
+		t.Fatal(err)
+	}
+	upstreamCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		if got := r.Header.Get("Authorization"); got != "Bearer "+real {
+			t.Errorf("upstream Authorization = %q, want real credential", got)
+		}
+		if strings.Contains(r.Header.Get("Authorization"), "gitmoot-kc-") {
+			t.Errorf("upstream received placeholder: %q", r.Header.Get("Authorization"))
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	if _, err := store.AddKeychainKey(ctx, keyName, db.KeychainModeProxied); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ConfigureKeychainProxy(ctx, keyName, upstream.URL+"/v1", db.KeychainProxyAuthBearer, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GrantKeychainKey(ctx, db.KeychainConsumerAgent, seatName, keyName); err != nil {
+		t.Fatal(err)
+	}
+	spec := pipeline.Spec{Name: pipelineName, Repo: "owner/repo", Stages: []pipeline.Stage{{ID: "inspect", Agent: seatName, Action: "ask", Prompt: "inspect", EnvKeys: []string{keyName}}}}
+	access, err := resolvePipelineStageEnvAccess(ctx, store, home, spec, spec.Stages[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAccess := []workflow.PipelineKeyAccess{{Stage: "inspect", Name: keyName, Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied}}
+	if !reflect.DeepEqual(access.Access, wantAccess) {
+		t.Fatalf("agent access = %#v, want %#v", access.Access, wantAccess)
+	}
+	rec, found, err := store.GetPipeline(ctx, pipelineName)
+	if err != nil || !found {
+		t.Fatalf("GetPipeline: found=%t err=%v", found, err)
+	}
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	run, err := createPipelineRun(ctx, store, rec, spec, "manual", "{}", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := advancePipelineRun(ctx, store, testStageEnqueuer(store), rec, spec, run, now); err != nil {
+		t.Fatal(err)
+	}
+	stageRow, ok, err := store.GetPipelineRunStage(ctx, run.ID, "inspect")
+	if err != nil || !ok || stageRow.JobID == "" {
+		t.Fatalf("agent stage row: ok=%t row=%+v err=%v", ok, stageRow, err)
+	}
+	queued, err := store.GetJob(ctx, stageRow.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queuedPayload, err := workflow.ParseJobPayload(queued.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queuedPayload.PipelineName != pipelineName || queuedPayload.PipelineKeyAgent != seatName || !reflect.DeepEqual(queuedPayload.PipelineKeyAccess, wantAccess) {
+		t.Fatalf("queued names-only authority = %+v", queuedPayload)
+	}
+	events, err := store.ListJobEvents(ctx, queued.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if strings.Contains(event.Message, real) {
+			t.Fatalf("real credential persisted in event %q", event.Kind)
+		}
+	}
+	detail, err := (&webDataSource{home: home}).PipelineDetail(ctx, pipelineName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detail.Keys.Stages) != 1 || !reflect.DeepEqual(detail.Keys.Stages[0].Keys, []dashboard.PipelineKeyEntry{{Name: keyName, Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied}}) {
+		t.Fatalf("agent Keys projection = %+v", detail.Keys)
+	}
+	detailJSON, err := json.Marshal(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(detailJSON), real) {
+		t.Fatalf("dashboard projection contains real credential: %s", detailJSON)
+	}
+	payload := workflow.JobPayload{PipelineName: pipelineName, PipelineKeyAgent: seatName, PipelineKeyAccess: access.Access}
+	persisted, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(persisted), real) || strings.Contains(string(persisted), "gitmoot-kc-") {
+		t.Fatalf("persisted payload contains credential material: %s", persisted)
+	}
+
+	previousRegistry := modelGatewayRegistry
+	previousLogf := modelGatewayLogf
+	previousLoopback := pipelineProxyAllowLoopbackHTTP
+	modelGatewayRegistry = credgw.NewRegistry()
+	modelGatewayLogf = func(string, ...any) {}
+	pipelineProxyAllowLoopbackHTTP = true
+	paths, err := configPathsForPipelineStore(store, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = modelGatewayRegistry.CloseHome(context.Background(), paths.Home)
+		modelGatewayRegistry = previousRegistry
+		modelGatewayLogf = previousLogf
+		pipelineProxyAllowLoopbackHTTP = previousLoopback
+	})
+	capture := &pipelineEnvCaptureAdapter{deliver: func(job runtime.Job) (runtime.Result, error) {
+		if len(job.ShellEnv) != 0 {
+			t.Fatalf("agent delivery populated ShellEnv: %#v", job.ShellEnv)
+		}
+		placeholder := envEntryValue(job.AgentEnv, keyName)
+		leaseURL := envEntryValue(job.AgentEnv, "GITMOOT_PROXY_"+keyName+"_URL")
+		if !strings.HasPrefix(placeholder, "gitmoot-kc-agent-proxy-job-") || !strings.HasPrefix(leaseURL, "http://127.0.0.1:") {
+			t.Fatalf("agent env = %#v", job.AgentEnv)
+		}
+		if strings.Contains(strings.Join(job.AgentEnv, "\n"), real) {
+			t.Fatalf("real credential reached AgentEnv: %#v", job.AgentEnv)
+		}
+		req, err := http.NewRequest(http.MethodGet, leaseURL+"/models", nil)
+		if err != nil {
+			return runtime.Result{}, err
+		}
+		req.Header.Set("Authorization", "Bearer "+placeholder)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return runtime.Result{}, err
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			return runtime.Result{}, fmt.Errorf("proxy status %d", resp.StatusCode)
+		}
+		return runtime.Result{Raw: "ok"}, nil
+	}}
+	wrapper := wrapPipelineEnvDeliveryAdapter(store, home, payload, capture)
+	result, err := wrapper.Deliver(ctx, runtime.Agent{}, runtime.Job{ID: "agent-proxy-job"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(result.Raw, real) {
+		t.Fatalf("delivery result contains real credential: %q", result.Raw)
+	}
+	if upstreamCalls != 1 {
+		t.Fatalf("upstream calls = %d, want 1", upstreamCalls)
+	}
+
+	if _, err := store.RevokeKeychainKey(ctx, db.KeychainConsumerAgent, seatName, keyName); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wrapper.Deliver(ctx, runtime.Agent{}, runtime.Job{ID: "agent-proxy-revoked"}); err == nil || !strings.Contains(err.Error(), "revoked") {
+		t.Fatalf("revoked agent grant delivery error = %v", err)
+	}
+	if len(capture.jobs) != 1 || upstreamCalls != 1 {
+		t.Fatalf("revoked delivery reached child/upstream: jobs=%d upstream=%d", len(capture.jobs), upstreamCalls)
+	}
+
+	for _, file := range []string{store.DatabasePath(), store.DatabasePath() + "-wal"} {
+		body, readErr := os.ReadFile(file)
+		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+			t.Fatal(readErr)
+		}
+		if bytes.Contains(body, []byte(real)) {
+			t.Fatalf("real credential persisted in %s", file)
+		}
+	}
+	keychainBody, err := os.ReadFile(keychainPath)
+	if err != nil || !bytes.Contains(keychainBody, []byte(real)) {
+		t.Fatalf("operator keychain unexpectedly changed: err=%v body=%q", err, keychainBody)
+	}
+}
+
 func TestPipelineUnconfiguredProxiedKeyFailsAtEnqueue(t *testing.T) {
 	ctx := context.Background()
 	home, _, store := heartbeatLoopE2EHome(t)
@@ -575,6 +846,29 @@ func TestPipelineEnvironmentValidationTiming(t *testing.T) {
 		return err
 	}); err != nil {
 		t.Fatal(err)
+	}
+
+	agentHome := t.TempDir()
+	if err := withStore(agentHome, func(store *db.Store) error {
+		return store.UpsertAgent(context.Background(), db.Agent{Name: "scout", Runtime: runtime.CodexRuntime})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	agentSpec := writeSpec(t, "name: unresolved-agent-env\nrepo: owner/repo\nstages: [{id: inspect, agent: scout, action: ask, prompt: inspect, env_keys: [MISSING]}]\n")
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"pipeline", "add", agentSpec, "--home", agentHome}, &stdout, &stderr); code != 0 || !strings.Contains(stderr.String(), "warning:") || !strings.Contains(stderr.String(), "gitmoot key grant MISSING --agent scout") {
+		t.Fatalf("disabled agent add code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	for _, args := range [][]string{
+		{"pipeline", "enable", "unresolved-agent-env", "--home", agentHome},
+		{"pipeline", "run", "unresolved-agent-env", "--home", agentHome},
+	} {
+		stdout.Reset()
+		stderr.Reset()
+		if code := Run(args, &stdout, &stderr); code == 0 || !strings.Contains(stderr.String(), "gitmoot key grant MISSING --agent scout") {
+			t.Fatalf("%v code=%d stdout=%q stderr=%q", args, code, stdout.String(), stderr.String())
+		}
 	}
 }
 
@@ -673,6 +967,7 @@ func TestPipelineInjectedEnvShellE2E(t *testing.T) {
 				t.Fatalf("stage %s event %q persisted a secret value", stageID, event.Kind)
 			}
 		}
+
 	}
 	for _, path := range []string{paths.Database, paths.Database + "-wal"} {
 		data, err := os.ReadFile(path)

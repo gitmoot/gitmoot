@@ -57,6 +57,11 @@ type pipelineEnvironmentResolution struct {
 	Unresolved []pipelineEnvUnresolved
 }
 
+type pipelineSharedKeys struct {
+	pipeline map[string]db.KeychainKey
+	agents   map[string]map[string]db.KeychainKey
+}
+
 type pipelineEnvFileInspection struct {
 	Path   string
 	Status string
@@ -81,29 +86,25 @@ func resolvePipelineEnvironment(ctx context.Context, store *db.Store, home strin
 	if err != nil {
 		return pipelineEnvironmentResolution{}, err
 	}
-	availableShared := make(map[string]db.KeychainKey)
-	if len(sharedCandidates) > 0 {
+	availableShared := pipelineSharedKeys{pipeline: map[string]db.KeychainKey{}, agents: map[string]map[string]db.KeychainKey{}}
+	if sharedCandidates.any() {
 		shared, err := loadValidatedKeychainNames(ctx, store, home)
 		if err != nil {
 			return pipelineEnvironmentResolution{}, err
 		}
-		for name, key := range sharedCandidates {
-			if _, present := shared[name]; present {
-				availableShared[name] = key
-			}
-		}
+		availableShared = sharedCandidates.available(shared)
 	}
 	return projectPipelineEnvironment(spec, ownNames, availableShared), nil
 }
 
-func projectPipelineEnvironment(spec pipeline.Spec, ownNames map[string]struct{}, sharedKeys map[string]db.KeychainKey) pipelineEnvironmentResolution {
+func projectPipelineEnvironment(spec pipeline.Spec, ownNames map[string]struct{}, sharedKeys pipelineSharedKeys) pipelineEnvironmentResolution {
 	defaultNames := make(map[string]struct{}, len(spec.Env))
 	for name := range spec.Env {
 		defaultNames[name] = struct{}{}
 	}
 	sharedInjected := make(map[string]struct{})
 	sharedProxied := make(map[string]struct{})
-	for name, key := range sharedKeys {
+	for name, key := range sharedKeys.pipeline {
 		switch key.Mode {
 		case db.KeychainModeInjected:
 			sharedInjected[name] = struct{}{}
@@ -111,7 +112,7 @@ func projectPipelineEnvironment(spec pipeline.Spec, ownNames map[string]struct{}
 			sharedProxied[name] = struct{}{}
 		}
 	}
-	sources := []pipeline.EnvKeySource{
+	shellSources := []pipeline.EnvKeySource{
 		{Source: pipelineKeySourceOwn, Mode: db.KeychainModeInjected, Names: ownNames},
 		{Source: pipelineKeySourceShared, Mode: db.KeychainModeInjected, Names: sharedInjected},
 		{Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied, Names: sharedProxied},
@@ -119,6 +120,16 @@ func projectPipelineEnvironment(spec pipeline.Spec, ownNames map[string]struct{}
 	}
 	resolution := pipelineEnvironmentResolution{}
 	for _, stage := range spec.Stages {
+		sources := shellSources
+		if stage.Kind() != pipeline.StageKindShell {
+			agentProxied := make(map[string]struct{})
+			for name, key := range sharedKeys.agents[stage.Agent] {
+				if key.Mode == db.KeychainModeProxied && key.ProxyConfigured() {
+					agentProxied[name] = struct{}{}
+				}
+			}
+			sources = []pipeline.EnvKeySource{{Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied, Names: agentProxied}}
+		}
 		projected, unresolved := pipeline.ProjectEnvKeys(stage.EnvKeys, sources)
 		for _, key := range projected {
 			resolution.Access = append(resolution.Access, workflow.PipelineKeyAccess{
@@ -132,54 +143,143 @@ func projectPipelineEnvironment(spec pipeline.Spec, ownNames map[string]struct{}
 	return resolution
 }
 
-func pipelineSharedKeyCandidates(ctx context.Context, store *db.Store, spec pipeline.Spec, ownNames map[string]struct{}) (map[string]db.KeychainKey, error) {
-	candidates := make(map[string]db.KeychainKey)
+func pipelineSharedKeyCandidates(ctx context.Context, store *db.Store, spec pipeline.Spec, ownNames map[string]struct{}) (pipelineSharedKeys, error) {
+	candidates := pipelineSharedKeys{pipeline: make(map[string]db.KeychainKey), agents: make(map[string]map[string]db.KeychainKey)}
 	if strings.TrimSpace(spec.Name) == "" {
 		return candidates, nil
 	}
 	grants, err := store.ListKeychainGrantsForConsumer(ctx, db.KeychainConsumerPipeline, spec.Name)
 	if err != nil {
-		return nil, err
+		return pipelineSharedKeys{}, err
 	}
 	for _, grant := range grants {
 		if _, owned := ownNames[grant.KeyName]; owned {
 			continue
 		}
-		if !pipelineSelectorUsed(spec, grant.KeyName) {
+		if !pipelineShellSelectorUsed(spec, grant.KeyName) {
 			continue
 		}
 		key, found, err := store.GetGrantedKey(ctx, db.KeychainConsumerPipeline, spec.Name, grant.KeyName)
 		if err != nil {
-			return nil, err
+			return pipelineSharedKeys{}, err
 		}
 		if !found {
 			continue
 		}
 		if key.Mode == db.KeychainModeProxied && !key.ProxyConfigured() {
-			return nil, fmt.Errorf("key %s uses proxied mode but is not configured; run %s", key.Name, keyConfigureCommand(key.Name))
+			return pipelineSharedKeys{}, fmt.Errorf("key %s uses proxied mode but is not configured; run %s", key.Name, keyConfigureCommand(key.Name))
 		}
 		if key.Mode == db.KeychainModeInjected || key.Mode == db.KeychainModeProxied {
-			candidates[key.Name] = key
+			candidates.pipeline[key.Name] = key
+		}
+	}
+	seenAgents := make(map[string]struct{})
+	for _, stage := range spec.Stages {
+		seat := strings.TrimSpace(stage.Agent)
+		if seat == "" || len(stage.EnvKeys) == 0 {
+			continue
+		}
+		if _, seen := seenAgents[seat]; seen {
+			continue
+		}
+		seenAgents[seat] = struct{}{}
+		grants, err := store.ListKeychainGrantsForConsumer(ctx, db.KeychainConsumerAgent, seat)
+		if err != nil {
+			return pipelineSharedKeys{}, err
+		}
+		for _, grant := range grants {
+			if !pipelineAgentSelectorUsed(spec, seat, grant.KeyName) {
+				continue
+			}
+			key, found, err := store.GetGrantedKey(ctx, db.KeychainConsumerAgent, seat, grant.KeyName)
+			if err != nil {
+				return pipelineSharedKeys{}, err
+			}
+			if !found || key.Mode != db.KeychainModeProxied {
+				continue
+			}
+			if !key.ProxyConfigured() {
+				return pipelineSharedKeys{}, fmt.Errorf("key %s uses proxied mode but is not configured; run %s", key.Name, keyConfigureCommand(key.Name))
+			}
+			if candidates.agents[seat] == nil {
+				candidates.agents[seat] = make(map[string]db.KeychainKey)
+			}
+			candidates.agents[seat][key.Name] = key
 		}
 	}
 	return candidates, nil
 }
 
-func pipelineSelectorUsed(spec pipeline.Spec, name string) bool {
+func pipelineShellSelectorUsed(spec pipeline.Spec, name string) bool {
 	for _, stage := range spec.Stages {
-		for _, selector := range stage.EnvKeys {
-			if selector == name {
+		if stage.Kind() != pipeline.StageKindShell {
+			continue
+		}
+		if pipelineStageSelectorUsed(stage, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func pipelineAgentSelectorUsed(spec pipeline.Spec, seat, name string) bool {
+	for _, stage := range spec.Stages {
+		if strings.TrimSpace(stage.Agent) != seat {
+			continue
+		}
+		if pipelineStageSelectorUsed(stage, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func pipelineStageSelectorUsed(stage pipeline.Stage, name string) bool {
+	for _, selector := range stage.EnvKeys {
+		if selector == name {
+			return true
+		}
+		if strings.ContainsAny(selector, "*?[") {
+			matched, _ := path.Match(selector, name)
+			if matched {
 				return true
-			}
-			if strings.ContainsAny(selector, "*?[") {
-				matched, _ := path.Match(selector, name)
-				if matched {
-					return true
-				}
 			}
 		}
 	}
 	return false
+}
+
+func (k pipelineSharedKeys) any() bool {
+	if len(k.pipeline) > 0 {
+		return true
+	}
+	for _, keys := range k.agents {
+		if len(keys) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (k pipelineSharedKeys) available(names map[string]struct{}) pipelineSharedKeys {
+	out := pipelineSharedKeys{pipeline: make(map[string]db.KeychainKey), agents: make(map[string]map[string]db.KeychainKey)}
+	for name, key := range k.pipeline {
+		if _, present := names[name]; present {
+			out.pipeline[name] = key
+		}
+	}
+	for seat, keys := range k.agents {
+		for name, key := range keys {
+			if _, present := names[name]; !present {
+				continue
+			}
+			if out.agents[seat] == nil {
+				out.agents[seat] = make(map[string]db.KeychainKey)
+			}
+			out.agents[seat][name] = key
+		}
+	}
+	return out
 }
 
 func pipelineEnvironmentResolutionError(spec pipeline.Spec, unresolved []pipelineEnvUnresolved) error {
@@ -190,6 +290,11 @@ func pipelineEnvironmentResolutionError(spec pipeline.Spec, unresolved []pipelin
 	name := item.Selector
 	if strings.ContainsAny(name, "*?[") {
 		name = "<name>"
+	}
+	for _, stage := range spec.Stages {
+		if stage.ID == item.Stage && strings.TrimSpace(stage.Agent) != "" {
+			return fmt.Errorf("stage %q env_keys entry %q is unresolved; register a configured proxied key and run gitmoot key grant %s --agent %s", item.Stage, item.Selector, name, stage.Agent)
+		}
 	}
 	return fmt.Errorf("stage %q env_keys entry %q is unresolved; register a matching key and run gitmoot key grant %s --pipeline %s", item.Stage, item.Selector, name, spec.Name)
 }
@@ -464,6 +569,8 @@ type pipelineEnvDeliveryAdapter struct {
 	store        *db.Store
 	home         string
 	pipelineName string
+	consumerKind string
+	consumerID   string
 	access       []workflow.PipelineKeyAccess
 	file         string
 	keys         []string
@@ -474,8 +581,13 @@ func wrapPipelineEnvDeliveryAdapter(store *db.Store, home string, payload workfl
 	if inner == nil || (len(payload.PipelineKeyAccess) == 0 && len(payload.PipelineEnvKeys) == 0) {
 		return inner
 	}
+	consumerKind, consumerID := db.KeychainConsumerPipeline, payload.PipelineName
+	if seat := strings.TrimSpace(payload.PipelineKeyAgent); seat != "" {
+		consumerKind, consumerID = db.KeychainConsumerAgent, seat
+	}
 	return pipelineEnvDeliveryAdapter{
 		inner: inner, store: store, home: home, pipelineName: payload.PipelineName,
+		consumerKind: consumerKind, consumerID: strings.TrimSpace(consumerID),
 		access: append([]workflow.PipelineKeyAccess(nil), payload.PipelineKeyAccess...),
 		file:   payload.PipelineEnvFile, keys: append([]string(nil), payload.PipelineEnvKeys...), env: payload.PipelineEnv,
 	}
@@ -502,7 +614,7 @@ func (a pipelineEnvDeliveryAdapter) Deliver(ctx context.Context, agent runtime.A
 			if strings.TrimSpace(job.ID) == "" {
 				return runtime.Result{}, fmt.Errorf("load pipeline stage environment: proxied key %q requires a job id", access.Name)
 			}
-			key, granted, err := a.store.GetGrantedKey(ctx, db.KeychainConsumerPipeline, a.pipelineName, access.Name)
+			key, granted, err := a.store.GetGrantedKey(ctx, a.consumerKind, a.consumerID, access.Name)
 			if err != nil {
 				return runtime.Result{}, fmt.Errorf("load pipeline stage environment: re-check proxied grant for key %q: %w", access.Name, err)
 			}
@@ -534,6 +646,9 @@ func (a pipelineEnvDeliveryAdapter) Deliver(ctx context.Context, agent runtime.A
 			entries = append(entries, access.Name+"="+lease.Placeholder())
 			entries = append(entries, "GITMOOT_PROXY_"+access.Name+"_URL="+lease.URL())
 			continue
+		}
+		if a.consumerKind == db.KeychainConsumerAgent {
+			return runtime.Result{}, fmt.Errorf("load pipeline stage environment: agent key %q must use proxied mode", access.Name)
 		}
 		if access.Mode != db.KeychainModeInjected {
 			return runtime.Result{}, fmt.Errorf("load pipeline stage environment: key %q has unsupported mode %q", access.Name, access.Mode)
@@ -578,13 +693,17 @@ func (a pipelineEnvDeliveryAdapter) Deliver(ctx context.Context, agent runtime.A
 		}
 		entries = append(entries, access.Name+"="+value)
 	}
-	job.ShellEnv = prependPipelineEnvironment(entries, job.ShellEnv)
+	if a.consumerKind == db.KeychainConsumerAgent {
+		job.AgentEnv = prependPipelineEnvironment(entries, job.AgentEnv)
+	} else {
+		job.ShellEnv = prependPipelineEnvironment(entries, job.ShellEnv)
+	}
 	return a.inner.Deliver(ctx, agent, job)
 }
 
 func (a pipelineEnvDeliveryAdapter) proxyResolver(name string) credgw.CredentialResolver {
 	return func(ctx context.Context) (credgw.ResolvedCredential, error) {
-		key, granted, err := a.store.GetGrantedKey(ctx, db.KeychainConsumerPipeline, a.pipelineName, name)
+		key, granted, err := a.store.GetGrantedKey(ctx, a.consumerKind, a.consumerID, name)
 		if err != nil {
 			return credgw.ResolvedCredential{}, err
 		}

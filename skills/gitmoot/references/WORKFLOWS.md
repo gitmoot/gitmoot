@@ -1098,13 +1098,20 @@ RUN=$(gitmoot pipeline run nightly-sync)          # or trigger a manual run now
 gitmoot pipeline show "$RUN"                       # watch the text funnel
 ```
 
-`env_keys` is a shell-stage-only allowlist of exact names or globs resolved from
-the pipeline's `env_file` and inline non-secret `env`. No list means no injected
-values, and agent stages cannot request them. `pipeline add` requires the file
+`env_keys` is a deny-by-default allowlist of exact names or globs. Shell stages
+resolve the pipeline's `env_file`, pipeline-granted shared keys, and inline
+non-secret `env`. Agent stages resolve only configured proxied keys granted to
+their registered seat; the grant and explicit stage selector are both required,
+and the real value never enters the agent process. Gates reject the field. No
+list means no key access. `pipeline add` requires the file
 to be absolute, operator-owned `0600`, and outside Gitmoot state/checkouts; it
 also refuses missing keys and reserved `GITMOOT_*` names. Values are read fresh
 at stage delivery for restart-free rotation. The job audit stores the path and
 expanded names only, not file values.
+
+Ordinary agent jobs receive no pipeline-stage keys, and a coordinator's
+delegation children inherit nothing. A proxied agent can exercise the credential
+against its pinned upstream even though it never receives the underlying bytes.
 
 The pipeline detail **Keys** tab exposes this authorization as names only: every
 stage appears in spec order with each resolved key's `own`, `shared`, or

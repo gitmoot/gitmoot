@@ -195,20 +195,24 @@ missing, or unreadable script is refused before runtime launch with its path;
 relative or malformed hook commands emit a `produce_runtime_resource_warning`
 job event. No such discovery runs when `reads:` is absent.
 
-Pipeline key access is deny-by-default. An `injected` selection gives the shell
-the real value, which it can print or transmit. A configured `proxied` shared
-selection instead gives it a per-job placeholder and loopback URL; Gitmoot
+Pipeline key access is deny-by-default. An `injected` selection gives only a
+shell stage the real value, which it can print or transmit. Agent stages require
+both a configured proxied key granted to their registered seat and an explicit
+stage selector; injected agent grants are refused. A configured `proxied`
+selection gives the selected shell or agent a per-job placeholder and loopback URL; Gitmoot
 rereads the value and rechecks the grant on every request, pins forwarding to
 the configured HTTPS origin/base path, and revokes the lease when delivery
 ends. Gitmoot stores only `{stage,name,source,mode}` audit rows, never values or
 hashes. Keychain and pipeline files are revalidated as owner-only `0600` files
 outside Gitmoot state and managed checkouts.
 
-Proxied mode hides key bytes; it does **not** prevent an authorized child from
+For agent stages, the real value never enters the agent process. Proxied mode
+hides key bytes; it does **not** prevent an authorized child from
 exercising the credential on the pinned upstream. Curated upstreams and base
 paths are part of the model, and only trusted upstreams should be configured.
-Agent and gate stages remain ineligible. This generic pipeline proxy is distinct
-from the Claude model gateway.
+Gate stages remain ineligible. Ordinary agent jobs receive nothing, and
+delegation children do not inherit a stage grant. This generic pipeline proxy
+is distinct from the Claude model gateway.
 
 ## External Contracts
 

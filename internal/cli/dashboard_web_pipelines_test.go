@@ -19,6 +19,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
+	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
 // diamondSpecYAML is a fan-out/fan-in pipeline whose declared (spec) stage order —
@@ -723,9 +724,13 @@ stages:
     agent: scout
     action: ask
     prompt: inspect
+    env_keys: [PROXY_TOKEN]
 `, envFile, defaultSentinel)
 	store := openPipelineTestStore(t, home)
 	seedTestPipeline(t, store, db.Pipeline{Name: "keys-view", SpecYAML: raw})
+	if err := store.UpsertAgent(context.Background(), db.Agent{Name: "scout", Runtime: runtime.CodexRuntime}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.AddKeychainKey(context.Background(), "SHARED_TOKEN", db.KeychainModeInjected); err != nil {
 		t.Fatal(err)
 	}
@@ -739,6 +744,9 @@ stages:
 		t.Fatal(err)
 	}
 	if _, err := store.GrantKeychainKey(context.Background(), db.KeychainConsumerPipeline, "keys-view", "PROXY_TOKEN"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GrantKeychainKey(context.Background(), db.KeychainConsumerAgent, "scout", "PROXY_TOKEN"); err != nil {
 		t.Fatal(err)
 	}
 	store.Close()
@@ -764,10 +772,15 @@ stages:
 	if got := detail.Keys.Stages[0]; got.ID != "deliver" || got.Kind != "shell" || !reflect.DeepEqual(got.Keys, wantKeys) || len(got.UnresolvedSelectors) != 0 {
 		t.Fatalf("deliver keys = %+v", got)
 	}
-	for _, stage := range detail.Keys.Stages[1:] {
-		if stage.Keys == nil || stage.UnresolvedSelectors == nil || len(stage.Keys) != 0 || len(stage.UnresolvedSelectors) != 0 {
-			t.Fatalf("empty stage arrays = %+v", stage)
-		}
+	if stage := detail.Keys.Stages[1]; stage.Keys == nil || stage.UnresolvedSelectors == nil || len(stage.Keys) != 0 || len(stage.UnresolvedSelectors) != 0 {
+		t.Fatalf("empty shell stage arrays = %+v", stage)
+	}
+	if got, want := detail.Keys.Stages[2], (dashboard.PipelineStageKeys{
+		ID: "inspect", Kind: "agent_ask",
+		Keys:                []dashboard.PipelineKeyEntry{{Name: "PROXY_TOKEN", Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied}},
+		UnresolvedSelectors: []string{},
+	}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("agent stage keys = %+v, want %+v", got, want)
 	}
 	encoded, err := json.Marshal(detail)
 	if err != nil {

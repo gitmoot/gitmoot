@@ -273,16 +273,12 @@ func dashboardPipelineKeys(ctx context.Context, store *db.Store, home string, sp
 	if err != nil {
 		return dashboard.PipelineKeys{}, err
 	}
-	availableShared := make(map[string]db.KeychainKey)
-	if len(sharedCandidates) > 0 {
+	availableShared := pipelineSharedKeys{pipeline: map[string]db.KeychainKey{}, agents: map[string]map[string]db.KeychainKey{}}
+	if sharedCandidates.any() {
 		// Keychain drift is advisory on this read-only endpoint. A missing or invalid
 		// file makes shared selectors unresolved; delivery remains fail-closed.
 		if names, loadErr := loadValidatedKeychainNames(ctx, store, home); loadErr == nil {
-			for name, key := range sharedCandidates {
-				if _, present := names[name]; present {
-					availableShared[name] = key
-				}
-			}
+			availableShared = sharedCandidates.available(names)
 		}
 	}
 	resolution := projectPipelineEnvironment(spec, inspection.Names, availableShared)

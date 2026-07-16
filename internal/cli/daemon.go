@@ -6464,6 +6464,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
 		return nil
 	}
+	adapter = wrapPipelineEnvDeliveryAdapter(w.Store, w.ConfigHome, payload, adapter)
 	if err := w.Store.MarkAgentInstanceRunning(ctx, started.Agent.Name, time.Now().UTC(), started.JobTimeout); err != nil {
 		if finishErr := w.finishQueuedJob(ctx, delegatedJob.ID, workflow.JobFailed, err); finishErr != nil {
 			return finishErr

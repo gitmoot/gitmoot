@@ -82,7 +82,7 @@ structural mistake is a clear error at registration, not a stuck run later. It s
 plus a content hash; each run snapshots the hash and executes its snapshot, so
 editing the file later never mutates an in-flight run.
 
-### Give each shell stage only the keys it needs
+### Give each stage only the keys it needs
 
 Declare secrets in a pipeline-owned file or the shared keychain and select them
 per shell stage. The key CLI manages names and grants, never values:
@@ -94,6 +94,7 @@ gitmoot key grant REDDIT_CLIENT_SECRET --pipeline trend-scout
 gitmoot key add PARTNER_API_TOKEN --mode proxied
 gitmoot key configure PARTNER_API_TOKEN --upstream https://api.partner.example/v1 --auth bearer
 gitmoot key grant PARTNER_API_TOKEN --pipeline trend-scout
+gitmoot key grant PARTNER_API_TOKEN --agent researcher
 ```
 
 ```yaml
@@ -109,8 +110,11 @@ stages:
     env_keys: [TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]
 ```
 
-No `env_keys` means no injected values. Exact names and globs expand only for
-shell stages; agent and gate stages cannot request them. At registration,
+No `env_keys` means no key access. Shell-stage selectors resolve pipeline-owned,
+pipeline-granted, and inline sources. Agent-stage selectors resolve only
+configured proxied keys granted to that registered seat; both locks are
+required, and injected agent grants are refused. Gate stages cannot request
+keys. At registration,
 Gitmoot requires each source file to be operator-owned, mode exactly `0600`, and
 outside its home and managed checkouts. Structural errors always fail. An
 unresolved name only warns while the pipeline remains disabled; add-with-enable,
@@ -124,16 +128,19 @@ shared keys, which beat inline non-secret defaults; Gitmoot's internal
 exact or glob selectors. The stage job payload and `pipeline show --json` audit
 only `{stage,name,source,mode}` rows. Delivery rechecks shared grants, so a
 post-enqueue revoke fails closed without switching sources. The selected shell
-can still read an injected key.
+can still read an injected key. Ordinary agent jobs receive nothing and
+delegation children do not inherit stage access.
 
-A configured `proxied` shared key gives the shell a per-job placeholder in
+A configured `proxied` shared key gives the selected shell or agent stage a per-job placeholder in
 `<KEY>` and a loopback URL in `GITMOOT_PROXY_<KEY>_URL`. Gitmoot pins requests
 to the configured HTTPS origin/base path, places the real value as bearer auth
 or an approved custom header, rereads the keychain and rechecks the grant per
 request, and revokes the lease when delivery ends. Proxied mode hides key bytes;
 it does **not** prevent an authorized child from exercising the credential on
 the pinned upstream. Curated upstreams and base paths are part of the model;
-configure only trusted services. The Claude model gateway is separate.
+configure only trusted services. The real value never enters an agent process,
+but the authorized agent can still exercise it against the pinned upstream.
+The Claude model gateway is separate.
 
 The pipeline detail **Keys** tab is a names-only view of the same projection. It
 shows every stage, resolved key names with `own`/`shared`/`default` sources and

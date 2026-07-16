@@ -72,8 +72,8 @@ func printKeyUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot key show <NAME> [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot key configure <NAME> --upstream <URL> --auth bearer|header:<HeaderName> [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot key rm <NAME> [--force] [--json] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot key grant <NAME> --pipeline <PIPELINE> [--json] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot key revoke <NAME> --pipeline <PIPELINE> [--json] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot key grant <NAME> (--pipeline <PIPELINE> | --agent <SEAT>) [--json] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot key revoke <NAME> (--pipeline <PIPELINE> | --agent <SEAT>) [--json] [--home DIR]")
 }
 
 func inspectKeychain(ctx context.Context, store *db.Store, home string) keychainPathStatus {
@@ -524,24 +524,35 @@ func runKeyGrantMutation(grant bool, args []string, stdout, stderr io.Writer) in
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	jsonOut := fs.Bool("json", false, "print JSON")
 	pipelineName := fs.String("pipeline", "", "pipeline consumer")
+	agentName := fs.String("agent", "", "registered agent seat consumer")
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 2
 	}
-	if fs.NArg() != 0 || strings.TrimSpace(*pipelineName) == "" {
-		fmt.Fprintf(stderr, "key %s requires one name and --pipeline <pipeline>\n", verb)
+	pipelineID := strings.TrimSpace(*pipelineName)
+	agentID := strings.TrimSpace(*agentName)
+	if fs.NArg() != 0 || (pipelineID == "") == (agentID == "") {
+		fmt.Fprintf(stderr, "key %s requires one name and exactly one of --pipeline <pipeline> or --agent <seat>\n", verb)
 		return 2
+	}
+	consumerKind, consumerID := db.KeychainConsumerPipeline, pipelineID
+	if agentID != "" {
+		consumerKind, consumerID = db.KeychainConsumerAgent, agentID
 	}
 	changed := false
 	if err := withStore(*home, func(store *db.Store) error {
 		ctx := context.Background()
 		if grant {
-			if _, found, err := store.GetPipeline(ctx, *pipelineName); err != nil {
-				return err
-			} else if !found {
-				return fmt.Errorf("pipeline %s not found", *pipelineName)
+			if consumerKind == db.KeychainConsumerPipeline {
+				if _, found, err := store.GetPipeline(ctx, consumerID); err != nil {
+					return err
+				} else if !found {
+					return fmt.Errorf("pipeline %s not found", consumerID)
+				}
+			} else if _, err := store.GetAgent(ctx, consumerID); err != nil {
+				return fmt.Errorf("agent %s not found", consumerID)
 			}
 			key, found, err := store.GetKeychainKey(ctx, name)
 			if err != nil {
@@ -549,6 +560,9 @@ func runKeyGrantMutation(grant bool, args []string, stdout, stderr io.Writer) in
 			}
 			if !found {
 				return fmt.Errorf("key %s is not registered", name)
+			}
+			if consumerKind == db.KeychainConsumerAgent && key.Mode != db.KeychainModeProxied {
+				return fmt.Errorf("key %s uses injected mode; agent grants are proxied-only", name)
 			}
 			if key.Mode == db.KeychainModeProxied && !key.ProxyConfigured() {
 				return fmt.Errorf("key %s uses proxied mode but is not configured; run %s", name, keyConfigureCommand(name))
@@ -560,11 +574,11 @@ func runKeyGrantMutation(grant bool, args []string, stdout, stderr io.Writer) in
 			if values[name] == "" {
 				return fmt.Errorf("key %q is absent or empty in %s", name, path)
 			}
-			changed, err = store.GrantKeychainKey(ctx, db.KeychainConsumerPipeline, *pipelineName, name)
+			changed, err = store.GrantKeychainKey(ctx, consumerKind, consumerID, name)
 			return err
 		}
 		var err error
-		changed, err = store.RevokeKeychainKey(ctx, db.KeychainConsumerPipeline, *pipelineName, name)
+		changed, err = store.RevokeKeychainKey(ctx, consumerKind, consumerID, name)
 		return err
 	}); err != nil {
 		fmt.Fprintf(stderr, "key %s: %v\n", verb, err)
@@ -573,19 +587,20 @@ func runKeyGrantMutation(grant bool, args []string, stdout, stderr io.Writer) in
 	if *jsonOut {
 		return encodeKeyJSON(stdout, stderr, struct {
 			Name     string `json:"name"`
-			Pipeline string `json:"pipeline"`
+			Pipeline string `json:"pipeline,omitempty"`
+			Agent    string `json:"agent,omitempty"`
 			Changed  bool   `json:"changed"`
-		}{name, strings.TrimSpace(*pipelineName), changed})
+		}{name, pipelineID, agentID, changed})
 	}
 	past := "granted"
 	if !grant {
 		past = "revoked"
 	}
 	if !changed {
-		writeLine(stdout, "key %s already %s for pipeline %s", name, past, *pipelineName)
+		writeLine(stdout, "key %s already %s for %s %s", name, past, consumerKind, consumerID)
 		return 0
 	}
-	writeLine(stdout, "%s key %s for pipeline %s", past, name, *pipelineName)
+	writeLine(stdout, "%s key %s for %s %s", past, name, consumerKind, consumerID)
 	return 0
 }
 
