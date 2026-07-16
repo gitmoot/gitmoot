@@ -25,6 +25,16 @@ const (
 	pipelineKeySourceDefault = "default"
 )
 
+const (
+	pipelineEnvFileStatusNone        = "none"
+	pipelineEnvFileStatusOK          = "ok"
+	pipelineEnvFileStatusMissing     = "missing"
+	pipelineEnvFileStatusBadMode     = "bad_mode"
+	pipelineEnvFileStatusBadOwner    = "bad_owner"
+	pipelineEnvFileStatusBadLocation = "bad_location"
+	pipelineEnvFileStatusInvalid     = "invalid"
+)
+
 type pipelineStageEnvAccess struct {
 	File     string
 	Keys     []string
@@ -42,82 +52,95 @@ type pipelineEnvironmentResolution struct {
 	Unresolved []pipelineEnvUnresolved
 }
 
+type pipelineEnvFileInspection struct {
+	Path   string
+	Status string
+	Names  map[string]struct{}
+}
+
 // resolvePipelineEnvironment is the single names-only projection used by add
 // validation, run preflight, payload audit, and `pipeline show --json`.
 func resolvePipelineEnvironment(ctx context.Context, store *db.Store, home string, spec pipeline.Spec) (pipelineEnvironmentResolution, error) {
-	available := make(map[string]string, len(spec.Env))
-	source := make(map[string]string, len(spec.Env))
-	for name := range spec.Env {
-		available[name] = ""
-		source[name] = pipelineKeySourceDefault
-	}
+	ownNames := make(map[string]struct{})
 	if strings.TrimSpace(spec.EnvFile) != "" {
-		own, err := loadValidatedPipelineEnvFile(ctx, store, home, spec.EnvFile)
+		own, err := loadValidatedSecretEnvNames(ctx, store, home, "env_file", spec.EnvFile)
 		if err != nil {
 			return pipelineEnvironmentResolution{}, err
 		}
 		for name := range own {
-			available[name] = ""
-			source[name] = pipelineKeySourceOwn
+			ownNames[name] = struct{}{}
 		}
 	}
 
-	var grants []db.KeychainGrant
-	if strings.TrimSpace(spec.Name) != "" {
-		var err error
-		grants, err = store.ListKeychainGrantsForConsumer(ctx, db.KeychainConsumerPipeline, spec.Name)
-		if err != nil {
-			return pipelineEnvironmentResolution{}, err
-		}
+	sharedCandidates, err := pipelineSharedKeyCandidates(ctx, store, spec, ownNames)
+	if err != nil {
+		return pipelineEnvironmentResolution{}, err
 	}
-	sharedCandidates := make(map[string]db.KeychainKey)
-	for _, grant := range grants {
-		if source[grant.KeyName] == pipelineKeySourceOwn || !pipelineSelectorUsed(spec, grant.KeyName) {
-			continue
-		}
-		key, found, err := store.GetGrantedKey(ctx, db.KeychainConsumerPipeline, spec.Name, grant.KeyName)
-		if err != nil {
-			return pipelineEnvironmentResolution{}, err
-		}
-		if found && key.Mode == db.KeychainModeInjected {
-			sharedCandidates[key.Name] = key
-		}
-	}
+	sharedNames := make(map[string]struct{})
 	if len(sharedCandidates) > 0 {
-		_, shared, err := loadValidatedKeychainFile(ctx, store, home)
+		shared, err := loadValidatedKeychainNames(ctx, store, home)
 		if err != nil {
 			return pipelineEnvironmentResolution{}, err
 		}
 		for name := range sharedCandidates {
-			if strings.TrimSpace(shared[name]) == "" {
-				continue
+			if _, present := shared[name]; present {
+				sharedNames[name] = struct{}{}
 			}
-			available[name] = ""
-			source[name] = pipelineKeySourceShared
 		}
 	}
+	return projectPipelineEnvironment(spec, ownNames, sharedNames), nil
+}
 
+func projectPipelineEnvironment(spec pipeline.Spec, ownNames, sharedNames map[string]struct{}) pipelineEnvironmentResolution {
+	defaultNames := make(map[string]struct{}, len(spec.Env))
+	for name := range spec.Env {
+		defaultNames[name] = struct{}{}
+	}
+	sources := []pipeline.EnvKeySource{
+		{Source: pipelineKeySourceOwn, Mode: db.KeychainModeInjected, Names: ownNames},
+		{Source: pipelineKeySourceShared, Mode: db.KeychainModeInjected, Names: sharedNames},
+		{Source: pipelineKeySourceDefault, Mode: db.KeychainModeInjected, Names: defaultNames},
+	}
 	resolution := pipelineEnvironmentResolution{}
 	for _, stage := range spec.Stages {
-		seen := make(map[string]struct{})
-		for _, selector := range stage.EnvKeys {
-			keys, err := pipeline.ResolveEnvKeys([]string{selector}, available)
-			if err != nil {
-				resolution.Unresolved = append(resolution.Unresolved, pipelineEnvUnresolved{Stage: stage.ID, Selector: selector})
-				continue
-			}
-			for _, name := range keys {
-				if _, ok := seen[name]; ok {
-					continue
-				}
-				seen[name] = struct{}{}
-				resolution.Access = append(resolution.Access, workflow.PipelineKeyAccess{
-					Stage: stage.ID, Name: name, Source: source[name], Mode: db.KeychainModeInjected,
-				})
-			}
+		projected, unresolved := pipeline.ProjectEnvKeys(stage.EnvKeys, sources)
+		for _, key := range projected {
+			resolution.Access = append(resolution.Access, workflow.PipelineKeyAccess{
+				Stage: stage.ID, Name: key.Name, Source: key.Source, Mode: key.Mode,
+			})
+		}
+		for _, selector := range unresolved {
+			resolution.Unresolved = append(resolution.Unresolved, pipelineEnvUnresolved{Stage: stage.ID, Selector: selector})
 		}
 	}
-	return resolution, nil
+	return resolution
+}
+
+func pipelineSharedKeyCandidates(ctx context.Context, store *db.Store, spec pipeline.Spec, ownNames map[string]struct{}) (map[string]db.KeychainKey, error) {
+	candidates := make(map[string]db.KeychainKey)
+	if strings.TrimSpace(spec.Name) == "" {
+		return candidates, nil
+	}
+	grants, err := store.ListKeychainGrantsForConsumer(ctx, db.KeychainConsumerPipeline, spec.Name)
+	if err != nil {
+		return nil, err
+	}
+	for _, grant := range grants {
+		if _, owned := ownNames[grant.KeyName]; owned {
+			continue
+		}
+		if !pipelineSelectorUsed(spec, grant.KeyName) {
+			continue
+		}
+		key, found, err := store.GetGrantedKey(ctx, db.KeychainConsumerPipeline, spec.Name, grant.KeyName)
+		if err != nil {
+			return nil, err
+		}
+		if found && key.Mode == db.KeychainModeInjected {
+			candidates[key.Name] = key
+		}
+	}
+	return candidates, nil
 }
 
 func pipelineSelectorUsed(spec pipeline.Spec, name string) bool {
@@ -203,6 +226,14 @@ func loadValidatedKeychainFile(ctx context.Context, store *db.Store, home string
 	return path, values, err
 }
 
+func loadValidatedKeychainNames(ctx context.Context, store *db.Store, home string) (map[string]struct{}, error) {
+	path, err := resolveKeychainPath(store, home)
+	if err != nil {
+		return nil, err
+	}
+	return loadValidatedSecretEnvNames(ctx, store, home, "keychain", path)
+}
+
 func resolveKeychainPath(store *db.Store, home string) (string, error) {
 	paths, err := configPathsForPipelineStore(store, home)
 	if err != nil {
@@ -234,52 +265,124 @@ func configPathsForPipelineStore(store *db.Store, home string) (config.Paths, er
 }
 
 func loadValidatedSecretEnvFile(ctx context.Context, store *db.Store, home, label, declared string) (map[string]string, error) {
-	declared = strings.TrimSpace(declared)
-	if !filepath.IsAbs(declared) {
-		return nil, fmt.Errorf("%s %q must be absolute", label, declared)
-	}
-	file, err := os.Open(declared)
+	file, _, err := openValidatedSecretEnvFile(ctx, store, home, label, declared)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("%s %s does not exist", label, declared)
-		}
-		return nil, fmt.Errorf("open %s %s: %w", label, declared, err)
-	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("stat %s %s: %w", label, declared, err)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s %s is not a regular file", label, declared)
-	}
-	if info.Mode().Perm() != pipelineEnvFileMode {
-		return nil, fmt.Errorf("%s %s has mode %04o; want 0600", label, declared, info.Mode().Perm())
-	}
-	owner, err := pipelineEnvOwnerUID(info)
-	if err != nil {
-		return nil, fmt.Errorf("%s %s: %w", label, declared, err)
-	}
-	if owner != pipelineEnvCurrentUID() {
-		return nil, fmt.Errorf("%s %s is owned by uid %d; want operator uid %d", label, declared, owner, pipelineEnvCurrentUID())
-	}
-	if err := validateSecretEnvFileLocation(ctx, store, home, label, declared); err != nil {
 		return nil, err
 	}
+	defer file.Close()
 	data, err := io.ReadAll(file)
 	if err != nil {
-		return nil, fmt.Errorf("read %s %s: %w", label, declared, err)
+		return nil, fmt.Errorf("read %s %s: %w", label, strings.TrimSpace(declared), err)
 	}
-	values, err := pipeline.ParseEnv(declared, data)
+	values, err := pipeline.ParseEnv(strings.TrimSpace(declared), data)
 	if err != nil {
 		return nil, err
 	}
 	for name := range values {
 		if pipeline.ReservedEnvName(name) {
-			return nil, fmt.Errorf("%s %s key %q uses reserved GITMOOT_* namespace", label, declared, name)
+			return nil, fmt.Errorf("%s %s key %q uses reserved GITMOOT_* namespace", label, strings.TrimSpace(declared), name)
 		}
 	}
 	return values, nil
+}
+
+func loadValidatedSecretEnvNames(ctx context.Context, store *db.Store, home, label, declared string) (map[string]struct{}, error) {
+	file, _, err := openValidatedSecretEnvFile(ctx, store, home, label, declared)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return nil, fmt.Errorf("read %s %s: %w", label, strings.TrimSpace(declared), err)
+	}
+	names, err := pipeline.ParseEnvNames(strings.TrimSpace(declared), data)
+	if err != nil {
+		return nil, err
+	}
+	for name := range names {
+		if pipeline.ReservedEnvName(name) {
+			return nil, fmt.Errorf("%s %s key %q uses reserved GITMOOT_* namespace", label, strings.TrimSpace(declared), name)
+		}
+	}
+	return names, nil
+}
+
+// classifyPipelineEnvFile returns the live advisory status and names needed by
+// the dashboard. It never returns file contents or an error string.
+func classifyPipelineEnvFile(ctx context.Context, store *db.Store, home, declared string) pipelineEnvFileInspection {
+	declared = strings.TrimSpace(declared)
+	inspection := pipelineEnvFileInspection{Path: declared, Status: pipelineEnvFileStatusNone, Names: map[string]struct{}{}}
+	if declared == "" {
+		return inspection
+	}
+	file, status, err := openValidatedSecretEnvFile(ctx, store, home, "env_file", declared)
+	if err != nil {
+		inspection.Status = status
+		return inspection
+	}
+	defer file.Close()
+	data, err := io.ReadAll(file)
+	if err != nil {
+		inspection.Status = pipelineEnvFileStatusInvalid
+		return inspection
+	}
+	names, err := pipeline.ParseEnvNames(declared, data)
+	if err != nil {
+		inspection.Status = pipelineEnvFileStatusInvalid
+		return inspection
+	}
+	for name := range names {
+		if pipeline.ReservedEnvName(name) {
+			inspection.Status = pipelineEnvFileStatusInvalid
+			return inspection
+		}
+	}
+	inspection.Status = pipelineEnvFileStatusOK
+	inspection.Names = names
+	return inspection
+}
+
+// openValidatedSecretEnvFile is the shared safety gate for value-loading
+// delivery and value-free status inspection. Its check order is fixed so unsafe
+// files are never read or parsed after an earlier failure.
+func openValidatedSecretEnvFile(ctx context.Context, store *db.Store, home, label, declared string) (*os.File, string, error) {
+	declared = strings.TrimSpace(declared)
+	if !filepath.IsAbs(declared) {
+		return nil, pipelineEnvFileStatusInvalid, fmt.Errorf("%s %q must be absolute", label, declared)
+	}
+	file, err := os.Open(declared)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, pipelineEnvFileStatusMissing, fmt.Errorf("%s %s does not exist", label, declared)
+		}
+		return nil, pipelineEnvFileStatusInvalid, fmt.Errorf("open %s %s: %w", label, declared, err)
+	}
+	closeWith := func(status string, err error) (*os.File, string, error) {
+		file.Close()
+		return nil, status, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return closeWith(pipelineEnvFileStatusInvalid, fmt.Errorf("stat %s %s: %w", label, declared, err))
+	}
+	if !info.Mode().IsRegular() {
+		return closeWith(pipelineEnvFileStatusInvalid, fmt.Errorf("%s %s is not a regular file", label, declared))
+	}
+	if info.Mode().Perm() != pipelineEnvFileMode {
+		return closeWith(pipelineEnvFileStatusBadMode, fmt.Errorf("%s %s has mode %04o; want 0600", label, declared, info.Mode().Perm()))
+	}
+	owner, err := pipelineEnvOwnerUID(info)
+	if err != nil {
+		return closeWith(pipelineEnvFileStatusInvalid, fmt.Errorf("%s %s: %w", label, declared, err))
+	}
+	if owner != pipelineEnvCurrentUID() {
+		return closeWith(pipelineEnvFileStatusBadOwner, fmt.Errorf("%s %s is owned by uid %d; want operator uid %d", label, declared, owner, pipelineEnvCurrentUID()))
+	}
+	if err := validateSecretEnvFileLocation(ctx, store, home, label, declared); err != nil {
+		return closeWith(pipelineEnvFileStatusBadLocation, err)
+	}
+	return file, pipelineEnvFileStatusOK, nil
 }
 
 func validatePipelineEnvFileLocation(ctx context.Context, store *db.Store, home, declared string) error {

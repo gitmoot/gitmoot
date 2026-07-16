@@ -124,6 +124,14 @@ post-enqueue revoke fails closed without switching sources. The selected shell
 can still read an injected key. `proxied` mode is reserved for future gateway
 composition and is refused for pipelines; the Claude model gateway is separate.
 
+The pipeline detail **Keys** tab is a names-only view of the same projection. It
+shows every stage, resolved key names with `own`/`shared`/`default` sources and
+delivery modes, plus unresolved selectors. The declared `env_file` is rechecked
+when the detail is requested and reported as `none`, `ok`, `missing`,
+`bad_mode`, `bad_owner`, `bad_location`, or `invalid`; no credential value is
+returned. This is an advisory drift snapshot, while delivery still performs the
+authoritative fail-closed validation.
+
 ### Chain pipelines on success
 
 Use a pipeline trigger when an upstream must finish successfully before the next
