@@ -2739,9 +2739,11 @@ stages:
 ```
 
 An absent agent row renders as `(unregistered)` without failing `show`.
-`pipeline list` retains six columns and uses `email` or `after: <upstream>` in
-the interval column for a trigger pipeline. A removed or missing upstream is
-shown as `after: <upstream> (upstream missing)`. JSON adds pipeline `mode` and stage `kind`, `agent_runtime`,
+`pipeline list` appends an eighth description column, truncated to about 60
+characters, and uses `email` or `after: <upstream>` in the interval column for a
+trigger pipeline. A removed or missing upstream is shown as
+`after: <upstream> (upstream missing)`. JSON includes the full pipeline
+`description` plus `mode`, and stage `kind`, `agent_runtime`,
 `prompt_preview`, and `cmd_preview`; the existing full fields remain unchanged.
 
 An enabled `trigger.kind: email` pipeline auto-binds. If Activepieces is down,

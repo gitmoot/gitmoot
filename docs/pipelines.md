@@ -32,6 +32,7 @@ and does not affect an in-flight run.
 ```yaml
 name: nightly-sync          # required, name-safe token (letters, digits, - _)
 repo: owner/repo            # optional to register; REQUIRED to actually run
+description: Syncs nightly data for deployment. # optional purpose shown in inspection views
 env_file: /root/.config/nightly-sync/env # optional 0600 secret file
 env:                       # optional inline NON-secret defaults
   OUTPUT_DIR: /srv/nightly-sync
@@ -71,6 +72,7 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 | --------------------------- | ------------ | -------- | ----- |
 | `name`                      | pipeline     | yes      | Stable identifier and DB primary key; a name-safe token (letters, digits, `-`, `_`). |
 | `repo`                      | pipeline     | no\*     | `owner/name` the stages run against. Optional to **register**, but **required to run** — stage jobs need a managed repo for the worker to claim them. |
+| `description`               | pipeline     | no       | Optional purpose (up to 500 characters) shown by `pipeline show`, dashboard detail, and `pipeline list` (truncated there). |
 | `env_file`                  | pipeline     | no       | Absolute operator-owned secret file. It must exist, be a regular file owned by the current uid with mode exactly `0600`, and live outside the Gitmoot home and every managed checkout. |
 | `env`                       | pipeline     | no       | Inline **non-secret** `KEY: value` defaults. Pipeline-owned and granted shared values take precedence. Values are delivered only when a shell stage selects the key. |
 | `schedule.interval`         | pipeline     | cond.    | Required when a `schedule:` block is present. A positive Go duration (`24h`, `1h30m`). |
@@ -637,9 +639,11 @@ stages:
 Shell commands are collapsed to a single-line preview (about 80 characters), and
 agent prompts to an escaped preview (about 100 characters); an ellipsis marks
 truncation. Missing agent registrations render as `(unregistered)` instead of
-making inspection fail. `pipeline list` keeps its existing six-column shape but
-uses `email` in the interval column for trigger pipelines (`email+6h` when a schedule is also present, and the mode reads `email-triggered (unbound)` before the first bind). `--json` remains
-additive: pipeline objects include `mode`, while stage objects include `kind` and
+making inspection fail. `pipeline list` appends an eighth description column,
+truncated to about 60 characters, and uses `email` in the interval column for
+trigger pipelines (`email+6h` when a schedule is also present, and the mode reads
+`email-triggered (unbound)` before the first bind). `--json` remains additive:
+pipeline objects include the full `description` and `mode`, while stage objects include `kind` and
 the available `agent_runtime`, `prompt_preview`, and `cmd_preview` fields without
 removing the full `prompt` or `cmd`.
 

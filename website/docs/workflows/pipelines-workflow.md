@@ -280,11 +280,12 @@ stages:
 Shell commands are collapsed to a single-line preview (about 80 characters), and
 agent prompts to an escaped preview (about 100 characters); an ellipsis marks
 truncation. Missing agent registrations render as `(unregistered)` instead of
-making inspection fail. `pipeline list` keeps its existing six-column shape but
-uses `email` or `after: <upstream>` in the interval column for trigger pipelines
-(`email+6h` when an email schedule is also present, and the mode reads
-`email-triggered (unbound)` before the first bind). `--json` remains
-additive: pipeline objects include `mode`, while stage objects include `kind` and
+making inspection fail. `pipeline list` appends an eighth description column,
+truncated to about 60 characters, and uses `email` or `after: <upstream>` in the
+interval column for trigger pipelines (`email+6h` when an email schedule is also
+present, and the mode reads `email-triggered (unbound)` before the first bind).
+`--json` remains additive: pipeline objects include the full `description` plus
+`mode`, while stage objects include `kind` and
 the available `agent_runtime`, `prompt_preview`, and `cmd_preview` fields without
 removing the full `prompt` or `cmd`.
 

@@ -310,11 +310,12 @@ stages:
 	if code := Run([]string{"pipeline", "list", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("list exit=%d stderr=%s", code, stderr.String())
 	}
-	rows := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	rows := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")
 	foundTrigger := false
+	foundDisplay := false
 	for _, row := range rows {
 		columns := strings.Split(row, "\t")
-		if len(columns) != 7 {
+		if len(columns) != 8 {
 			t.Fatalf("pipeline list changed column count: row=%q", row)
 		}
 		if columns[0] == "mail-flow" {
@@ -325,18 +326,55 @@ stages:
 			if columns[4] != "owner/repo" {
 				t.Fatalf("trigger pipeline group column = %q, want repo fallback", columns[4])
 			}
+			if columns[7] != "" {
+				t.Fatalf("trigger pipeline description column = %q, want empty", columns[7])
+			}
 		}
 		if columns[0] == "display-flow" {
+			foundDisplay = true
 			if columns[2] != "-" {
 				t.Fatalf("manual pipeline interval column = %q, want -", columns[2])
 			}
 			if columns[4] != "Product Operations" {
 				t.Fatalf("explicit pipeline group column = %q, want Product Operations", columns[4])
 			}
+			if columns[7] != "Coordinates product operations. Preserves the declared stage…" {
+				t.Fatalf("pipeline description column = %q, want truncated description", columns[7])
+			}
 		}
 	}
 	if !foundTrigger {
 		t.Fatalf("trigger pipeline missing from list: %s", stdout.String())
+	}
+	if !foundDisplay {
+		t.Fatalf("display pipeline missing from list: %s", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"pipeline", "list", "--json", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("list --json exit=%d stderr=%s", code, stderr.String())
+	}
+	var listed []pipelineJSON
+	if err := json.Unmarshal(stdout.Bytes(), &listed); err != nil {
+		t.Fatalf("decode list json: %v (%s)", err, stdout.String())
+	}
+	foundJSONDescription := false
+	for _, item := range listed {
+		switch item.Name {
+		case "display-flow":
+			foundJSONDescription = true
+			if item.Description != "Coordinates product operations.\nPreserves the declared stage order." {
+				t.Fatalf("list JSON description = %q, want full text", item.Description)
+			}
+		case "mail-flow":
+			if item.Description != "" {
+				t.Fatalf("list JSON empty description = %q", item.Description)
+			}
+		}
+	}
+	if !foundJSONDescription {
+		t.Fatalf("display pipeline missing from list JSON: %s", stdout.String())
 	}
 }
 
@@ -523,6 +561,18 @@ func TestPipelinePreviewMultibyteSafe(t *testing.T) {
 	}
 	if !strings.HasSuffix(preview, "\u2026") {
 		t.Fatalf("truncated preview should end with ellipsis: %q", preview)
+	}
+
+	description := strings.Repeat("界", 61)
+	descriptionPreview := pipelineDescriptionPreview(description)
+	if !utf8.ValidString(descriptionPreview) {
+		t.Fatalf("description preview is not valid UTF-8: %q", descriptionPreview)
+	}
+	if got := len([]rune(descriptionPreview)); got != 61 {
+		t.Fatalf("description preview rune length = %d, want 61", got)
+	}
+	if !strings.HasSuffix(descriptionPreview, "\u2026") {
+		t.Fatalf("truncated description should end with ellipsis: %q", descriptionPreview)
 	}
 }
 
