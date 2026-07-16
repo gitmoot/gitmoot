@@ -9199,8 +9199,8 @@ CREATE INDEX idx_keychain_grants_key_name ON keychain_grants(key_name);
 ALTER TABLE keychain_keys ADD COLUMN proxy_upstream TEXT;
 ALTER TABLE keychain_keys ADD COLUMN proxy_auth_kind TEXT
 	CHECK(proxy_auth_kind IS NULL OR proxy_auth_kind IN ('bearer', 'header'));
-	ALTER TABLE keychain_keys ADD COLUMN proxy_header TEXT;
-		`,
+ALTER TABLE keychain_keys ADD COLUMN proxy_header TEXT;
+`,
 	// #988 append-only brain changelog. Events observe confirmed-memory and
 	// cluster mutations in the same transaction; kind remains an open string so
 	// future lifecycle actions do not require another schema change.

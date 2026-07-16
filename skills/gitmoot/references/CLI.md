@@ -2324,7 +2324,10 @@ content-derived links in each note's `## Links` section and dedupes by target.
 
 `memory log` reads the append-only SQLite brain changelog. The default feed is
 newest-first and bounded to 50 events; key, agent, repository, kind, and duration
-filters answer operational questions such as “what changed this week.”
+filters answer operational questions such as “what changed this week.” Valid
+`--kind` values (unknown values are rejected): `created`, `updated`, `retired`,
+`unretired`, `superseded`, `confirmed`, `promoted`, `ingested`,
+`cluster_recompute`, `cluster_rename`.
 `memory log --id <memory-id>` returns that fact's complete biography oldest-first.
 `memory log backfill` synthesizes historical `created`, `retired`, and
 `superseded` receipts from existing tombstones; `--dry-run` previews the work and

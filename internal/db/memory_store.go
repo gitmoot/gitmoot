@@ -518,9 +518,24 @@ WHERE id = ?`,
 		kind = MemoryEventCreated
 	}
 	detail := ""
+	recordEvent := true
 	switch {
 	case resurrected:
 		kind = MemoryEventUnretired
+		// A resurrection may overwrite content in the same UPDATE; without a
+		// before-content receipt that edition would be unrecoverable (no
+		// superseded archive row exists on this path).
+		if previousContent != cm.Content {
+			detail, err = memoryEventBeforeDetail(previousContent)
+			if err != nil {
+				return 0, err
+			}
+		}
+	case !inserted && previousContent == cm.Content:
+		// Byte-identical re-confirmation (steady-state harvest/ingest
+		// re-observing an unchanged fact): no history to record — mirrors
+		// archiveSupersededEditionTx, which skips identical editions.
+		recordEvent = false
 	case !inserted:
 		kind = MemoryEventUpdated
 		detail, err = memoryEventBeforeDetail(previousContent)
@@ -528,8 +543,10 @@ WHERE id = ?`,
 			return 0, err
 		}
 	}
-	if err := recordMemoryEventTx(ctx, tx, id, kind, memoryEventActor(options.actor, cm.SourceJob), detail); err != nil {
-		return 0, err
+	if recordEvent {
+		if err := recordMemoryEventTx(ctx, tx, id, kind, memoryEventActor(options.actor, cm.SourceJob), detail); err != nil {
+			return 0, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
@@ -655,6 +672,10 @@ WHERE id = ?`, id).Scan(
 	if author == "" {
 		author = c.Owner.Ref
 	}
+	// Capture the source pool before the owner rewrite: the promoted event's
+	// most useful datum is where the fact came from, and recordMemoryEventTx
+	// snapshots the row post-UPDATE (owner already shared).
+	fromOwner := c.Owner
 	if _, err := tx.ExecContext(ctx, `
 UPDATE confirmed_memories
 SET owner_kind = ?, owner_ref = ?, owner_version = '', author_ref = ?, updated_at = ?
@@ -665,7 +686,12 @@ WHERE id = ?`,
 	c.Owner = MemoryOwner{Kind: memoryOwnerKindShared, Ref: memorySharedOwnerRef}
 	c.AuthorRef = author
 	c.UpdatedAt = now
-	if err := recordMemoryEventTx(ctx, tx, id, MemoryEventPromoted, actor, ""); err != nil {
+	promotedDetail, err := compactMemoryEventDetail(map[string]any{
+		"from_owner_kind": fromOwner.Kind, "from_owner_ref": fromOwner.Ref})
+	if err != nil {
+		return ConfirmedMemory{}, err
+	}
+	if err := recordMemoryEventTx(ctx, tx, id, MemoryEventPromoted, actor, promotedDetail); err != nil {
 		return ConfirmedMemory{}, err
 	}
 	return c, nil
@@ -1111,12 +1137,15 @@ WHERE id = ? AND updated_at = ? AND retired_at = ''`,
 	if _, err := tx.ExecContext(ctx, `INSERT INTO confirmed_memories_fts(rowid, content, key) VALUES (?, ?, ?)`, id, content, key); err != nil {
 		return fmt.Errorf("sync confirmed memory fts (insert): %w", err)
 	}
-	detail, err := memoryEventBeforeDetail(previousContent)
-	if err != nil {
-		return err
-	}
-	if err := recordMemoryEventTx(ctx, tx, id, MemoryEventUpdated, actor, detail); err != nil {
-		return err
+	// Byte-identical rewrite = no history to record (mirrors the upsert path).
+	if previousContent != content {
+		detail, err := memoryEventBeforeDetail(previousContent)
+		if err != nil {
+			return err
+		}
+		if err := recordMemoryEventTx(ctx, tx, id, MemoryEventUpdated, actor, detail); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1970,7 +1999,9 @@ WHERE id = ? AND retired_at = ''`, now, reason, id)
 	if err != nil {
 		return false, err
 	}
-	if err := recordMemoryEventTx(ctx, tx, id, MemoryEventRetired, reason, detail); err != nil {
+	// actor = stable producer identity; the free-text plan reason lives in
+	// detail only, so journal filtering/grouping by actor stays meaningful.
+	if err := recordMemoryEventTx(ctx, tx, id, MemoryEventRetired, "groom-retire", detail); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -2128,12 +2159,16 @@ UPDATE confirmed_memories SET key = ?, updated_at = ? WHERE id = ?`,
 			item.KeepID, keep.Content, item.NewKey); err != nil {
 			return false, fmt.Errorf("groom rekey fts insert %d: %w", item.KeepID, err)
 		}
-		detail, err := memoryEventBeforeDetail(keep.Content)
+		// The rekey mutates the KEY, not the content: record the old key (the
+		// datum the journal would otherwise lose — recordMemoryEventTx re-reads
+		// the row post-UPDATE so the event's key column holds the new key).
+		detail, err := compactMemoryEventDetail(map[string]any{
+			"before_key": keep.Key, "reason": item.Reason})
 		if err != nil {
 			return false, err
 		}
 		if err := recordMemoryEventTx(ctx, tx, item.KeepID, MemoryEventUpdated,
-			memoryEventActor(item.Reason, "groom-rekey"), detail); err != nil {
+			"groom-rekey", detail); err != nil {
 			return false, err
 		}
 	}
@@ -2179,7 +2214,7 @@ WHERE owner_kind = ? AND owner_ref = ? AND owner_version = ''
 	}
 
 	if _, err := promoteConfirmedMemoryToSharedTx(ctx, tx, item.PrivateID, now,
-		memoryEventActor(item.Reason, "groom-cross-pool")); err != nil {
+		"groom-cross-pool"); err != nil {
 		return false, err
 	}
 	return true, nil

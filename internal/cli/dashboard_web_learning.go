@@ -380,8 +380,10 @@ type dashboardKnowledgeCluster struct {
 func (d *webDataSource) handleLearningKnowledge(w http.ResponseWriter, r *http.Request) {
 	// #962: the cluster hierarchy is the dashboard's most expensive compute and
 	// is radar-polled per client; serve it through the response cache. The
-	// cursor is a constant because no cursor component covers memory writes —
-	// the policy's TTLs alone govern freshness.
+	// cursor is a constant by CHOICE: #988's memory-event cursor component
+	// could invalidate this precisely, but the hierarchy is a minutes-scale
+	// browsing surface, so the policy's TTLs alone govern freshness (switching
+	// to the memory-event component is a valid future refinement).
 	body, outcome, err := d.cacheForDashboard().get(r.Context(), "knowledge", "ttl", dashboardKnowledgeCachePolicy, d.knowledgeJSON)
 	d.writeCachedDashboardJSON(w, outcome, body, err)
 }

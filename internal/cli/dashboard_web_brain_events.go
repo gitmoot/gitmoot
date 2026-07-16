@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -74,15 +75,24 @@ func (d *webDataSource) handleBrainEvents(w http.ResponseWriter, r *http.Request
 		http.Error(w, "limit must be a positive integer", http.StatusBadRequest)
 		return
 	}
-	response, err := d.BrainEvents(r.Context(), cursor, int(limit))
-	if err != nil {
-		http.Error(w, "brain events unavailable", http.StatusInternalServerError)
+	// singleflight-only (#948 conventions): never a stale page, but concurrent
+	// identical polls coalesce into one store read per (cursor, limit) variant.
+	variant := fmt.Sprintf("%d.%d", cursor, limit)
+	body, outcome, err := d.cacheForDashboard().get(r.Context(), "brain-events", variant, dashboardBrainEventsCachePolicy, func(ctx context.Context) ([]byte, error) {
+		response, err := d.BrainEvents(ctx, cursor, int(limit))
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(response)
+	})
+	if errors.Is(err, db.ErrMemoryEventCursorUnknown) {
+		// Stale client state (e.g. a cursor persisted across a store rebuild):
+		// a 400 tells the client to restart from the newest page instead of
+		// rendering a permanently-empty feed.
+		http.Error(w, "unknown cursor; restart from the newest page", http.StatusBadRequest)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		return
-	}
+	d.writeCachedDashboardJSON(w, outcome, body, err)
 }
 
 func dashboardBrainEventIntQuery(r *http.Request, name string, fallback int64) (int64, error) {

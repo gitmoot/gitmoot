@@ -183,6 +183,69 @@ DELETE FROM memory_events`, retired, active, superseded); err != nil {
 	}
 }
 
+// The realistic upgrade shape the first version of this test masked with a
+// blanket DELETE: rows written AFTER the journal shipped already carry live
+// events (with kinds like ingested/confirmed — never 'created') and live
+// tombstone receipts. Backfill must not fabricate duplicate births or
+// duplicate retired/superseded receipts for them, while still synthesizing
+// the missing halves for pre-journal rows.
+func TestMemoryEventBackfillMixedLiveHistory(t *testing.T) {
+	ctx := context.Background()
+	store := openMemTestStore(t)
+
+	// Pre-journal rows: born before the feature (journal wiped for them only).
+	preActive := mustUpsert(t, store, ConfirmedMemory{Owner: agentOwner("builder"), Key: "pre-active", Content: "a"})
+	preRetiredLive := mustUpsert(t, store, ConfirmedMemory{Owner: agentOwner("builder"), Key: "pre-retired-live", Content: "b"})
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM memory_events`); err != nil {
+		t.Fatal(err)
+	}
+	// preRetiredLive is retired AFTER the journal shipped: live retired event.
+	if err := store.RetireConfirmedMemory(ctx, preRetiredLive, "live retire", "cli-test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Post-journal row: full live history from birth (ingest-style callers
+	// record births as confirmed/ingested — never 'created').
+	postLive, err := store.UpsertConfirmedMemory(ctx,
+		ConfirmedMemory{Owner: agentOwner("builder"), Key: "post-live", Content: "c"},
+		WithConfirmedMemoryEvent(MemoryEventConfirmed, "cli-test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := store.BackfillMemoryEvents(ctx, false)
+	if err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+	// Synthesized: created for preActive, created for preRetiredLive (birth
+	// predates journal) — but NOT a second retired for preRetiredLive, and
+	// NOTHING for postLive.
+	if first.Created != 2 {
+		t.Fatalf("first mixed backfill created=%d, want 2 (%+v)", first.Created, first)
+	}
+	assertEventCount := func(id int64, kind string, want int) {
+		t.Helper()
+		var got int
+		if err := store.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM memory_events WHERE memory_id = ? AND kind = ?`, id, kind).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("memory %d kind %s events=%d, want %d", id, kind, got, want)
+		}
+	}
+	assertEventCount(preActive, MemoryEventCreated, 1)
+	assertEventCount(preRetiredLive, MemoryEventCreated, 1)
+	assertEventCount(preRetiredLive, MemoryEventRetired, 1) // the LIVE one only
+	assertEventCount(postLive, MemoryEventCreated, 0)       // birth receipt is 'confirmed'
+	assertEventCount(postLive, MemoryEventConfirmed, 1)
+
+	second, err := store.BackfillMemoryEvents(ctx, false)
+	if err != nil || second.Created != 0 {
+		t.Fatalf("second mixed backfill = %+v err=%v, want fully idempotent", second, err)
+	}
+}
+
 func TestMemoryEventsCoverSplitRevertAndClusterMutations(t *testing.T) {
 	ctx := context.Background()
 	store := openMemTestStore(t)
@@ -252,7 +315,9 @@ func TestMemoryEventsCoverVaultAndGroomMutationPaths(t *testing.T) {
 		t.Fatalf("groom retirement=%+v err=%v", result, err)
 	}
 	events, err := store.ListMemoryEvents(ctx, MemoryEventFilter{MemoryID: groomID, Limit: 1})
-	if err != nil || len(events) != 1 || events[0].Kind != MemoryEventRetired || events[0].Actor != "groom-quality:2026-07-16" || !strings.Contains(events[0].Detail, "groom-quality") {
+	// actor = stable producer identity ("groom-retire"); the free-text plan
+	// reason lives in detail only so actor filtering stays meaningful.
+	if err != nil || len(events) != 1 || events[0].Kind != MemoryEventRetired || events[0].Actor != "groom-retire" || !strings.Contains(events[0].Detail, "groom-quality") {
 		t.Fatalf("groom event=%+v err=%v", events, err)
 	}
 }

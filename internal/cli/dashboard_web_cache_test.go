@@ -37,6 +37,7 @@ func TestDashboardCachePolicyTable(t *testing.T) {
 		{endpoint: "tasks", keyKind: "task-event-id", retain: true, minRecompute: 2 * time.Second, maxAge: 15 * time.Second},
 		{endpoint: "workflows", keyKind: "job-event-id+workflow-note-id", retain: true, minRecompute: 5 * time.Second, maxAge: 15 * time.Second},
 		{endpoint: "knowledge", keyKind: "ttl-only", retain: true, minRecompute: 15 * time.Second, maxAge: 60 * time.Second},
+		{endpoint: "brain-events", keyKind: "singleflight-only", retain: false},
 	}
 	if !reflect.DeepEqual(dashboardCachePolicies, want) {
 		t.Fatalf("policies = %#v, want %#v", dashboardCachePolicies, want)
@@ -726,7 +727,7 @@ func TestDashboardCacheMetricsReportUsesPolicyTable(t *testing.T) {
 	cache.mu.Lock()
 	report := cache.recordLocked("overview", "hit", 42, base.Add(dashboardCacheReportInterval))
 	cache.mu.Unlock()
-	want := "dashboard cache: jobs hits=0 misses=0 shared=0 bytes=0; charts hits=0 misses=0 shared=0 bytes=0; health hits=0 misses=0 shared=0 bytes=0; overview hits=1 misses=0 shared=0 bytes=42; attention hits=0 misses=0 shared=0 bytes=0; agents hits=0 misses=0 shared=0 bytes=0; tasks hits=0 misses=0 shared=0 bytes=0; workflows hits=0 misses=0 shared=0 bytes=0; knowledge hits=0 misses=0 shared=0 bytes=0\n"
+	want := "dashboard cache: jobs hits=0 misses=0 shared=0 bytes=0; charts hits=0 misses=0 shared=0 bytes=0; health hits=0 misses=0 shared=0 bytes=0; overview hits=1 misses=0 shared=0 bytes=42; attention hits=0 misses=0 shared=0 bytes=0; agents hits=0 misses=0 shared=0 bytes=0; tasks hits=0 misses=0 shared=0 bytes=0; workflows hits=0 misses=0 shared=0 bytes=0; knowledge hits=0 misses=0 shared=0 bytes=0; brain-events hits=0 misses=0 shared=0 bytes=0\n"
 	if report != want {
 		t.Fatalf("metrics report:\n%s\nwant:\n%s", report, want)
 	}

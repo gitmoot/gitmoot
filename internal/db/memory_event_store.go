@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 	"unicode/utf8"
 )
 
@@ -27,6 +26,20 @@ const (
 	memoryEventBeforeContentLimit = 2 * 1024
 	memoryEventBeforePreviewRunes = 300
 )
+
+// ErrMemoryEventCursorUnknown reports a pagination cursor that references no
+// existing event (stale client state or a rebuilt store).
+var ErrMemoryEventCursorUnknown = fmt.Errorf("unknown memory event cursor")
+
+// MemoryEventKinds enumerates every kind the store emits, in lifecycle order.
+// The column itself stays an open string; this list exists for flag/API
+// validation and docs.
+var MemoryEventKinds = []string{
+	MemoryEventCreated, MemoryEventUpdated, MemoryEventRetired,
+	MemoryEventUnretired, MemoryEventSuperseded, MemoryEventConfirmed,
+	MemoryEventPromoted, MemoryEventIngested,
+	MemoryEventClusterRecompute, MemoryEventClusterRename,
+}
 
 // MemoryEvent is one immutable brain lifecycle receipt. MemoryID is zero for
 // aggregate cluster events, which are stored as SQL NULL.
@@ -169,7 +182,17 @@ func (s *Store) ListMemoryEvents(ctx context.Context, filter MemoryEventFilter) 
 		args = append(args, since)
 	}
 	if filter.BeforeID > 0 {
-		where = append(where, "(datetime(at), id) < (SELECT datetime(at), id FROM memory_events WHERE id = ?)")
+		// A nonexistent cursor id would make the row-value comparison NULL and
+		// silently exclude everything; surface it as an error instead so the
+		// API can 400 rather than serve a permanently-empty feed.
+		var exists int
+		if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM memory_events WHERE id = ?)`, filter.BeforeID).Scan(&exists); err != nil {
+			return nil, err
+		}
+		if exists == 0 {
+			return nil, fmt.Errorf("%w: %d", ErrMemoryEventCursorUnknown, filter.BeforeID)
+		}
+		where = append(where, "(at, id) < (SELECT at, id FROM memory_events WHERE id = ?)")
 		args = append(args, filter.BeforeID)
 	}
 	if len(filter.Kinds) > 0 {
@@ -195,10 +218,13 @@ func (s *Store) ListMemoryEvents(ctx context.Context, filter MemoryEventFilter) 
 		limit = 50
 	}
 	args = append(args, limit)
+	// ORDER BY raw at (not datetime(at)): every writer stamps uniform RFC3339
+	// UTC, which sorts identically as text, and the raw column keeps
+	// idx_memory_events_at usable instead of forcing a full-table sort.
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, at, kind, memory_id, key, owner_kind, owner_ref, repo, scope, actor, detail
 FROM memory_events WHERE `+strings.Join(where, " AND ")+`
-ORDER BY datetime(at) `+order+`, id `+order+` LIMIT ?`, args...)
+ORDER BY at `+order+`, id `+order+` LIMIT ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list memory events: %w", err)
 	}
@@ -263,26 +289,42 @@ ORDER BY m.id`)
 	}
 	for _, item := range memories {
 		result.Scanned++
-		var exists int
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM memory_events WHERE memory_id = ? AND kind = 'created')`, item.id).Scan(&exists); err != nil {
+		// Live birth receipts are recorded under created/confirmed/ingested
+		// (callers choose the kind); a row carrying any of those was born after
+		// the journal shipped, so synthesizing a created event would fabricate
+		// a duplicate birth. Other live kinds (retired/updated/...) are NOT
+		// birth receipts — a pre-journal row retired after deploy still needs
+		// its synthesized birth.
+		var birthCount, liveRetired, liveSuperseded int
+		if err := tx.QueryRowContext(ctx, `SELECT
+			COALESCE(SUM(CASE WHEN kind IN ('created','confirmed','ingested') THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN kind = 'retired' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN kind = 'superseded' THEN 1 ELSE 0 END), 0)
+			FROM memory_events WHERE memory_id = ?`, item.id).Scan(&birthCount, &liveRetired, &liveSuperseded); err != nil {
 			return result, err
-		}
-		if exists != 0 {
-			result.Skipped++
-			continue
 		}
 		base := MemoryEvent{MemoryID: item.id, Key: item.key, OwnerKind: item.ownerKind, OwnerRef: item.ownerRef,
 			Repo: item.repo, Scope: item.scope, Actor: "cli:memory-log-backfill"}
-		createdDetail, _ := compactMemoryEventDetail(map[string]any{"backfilled": true})
-		base.At, base.Kind, base.Detail = item.first, MemoryEventCreated, createdDetail
-		result.Events = append(result.Events, base)
-		if item.retiredAt != "" {
+		synthesized := false
+		if birthCount == 0 {
+			createdDetail, _ := compactMemoryEventDetail(map[string]any{"backfilled": true})
+			event := base
+			event.At, event.Kind, event.Detail = item.first, MemoryEventCreated, createdDetail
+			result.Events = append(result.Events, event)
+			synthesized = true
+		}
+		// Tombstone receipts are synthesized independently of the birth check:
+		// a pre-journal memory retired AFTER the journal shipped already has a
+		// live retired event (with the real actor/reason) that must not be
+		// duplicated — same for superseded.
+		if item.retiredAt != "" && liveRetired == 0 {
 			detail, _ := compactMemoryEventDetail(map[string]any{"backfilled": true, "reason": item.reason})
 			event := base
 			event.At, event.Kind, event.Detail = item.retiredAt, MemoryEventRetired, detail
 			result.Events = append(result.Events, event)
+			synthesized = true
 		}
-		if item.supersededBy > 0 {
+		if item.supersededBy > 0 && liveSuperseded == 0 {
 			detail, _ := compactMemoryEventDetail(map[string]any{"backfilled": true, "superseded_by": item.supersededBy})
 			event := base
 			event.At, event.Kind, event.Detail = item.retiredAt, MemoryEventSuperseded, detail
@@ -290,6 +332,10 @@ ORDER BY m.id`)
 				event.At = item.first
 			}
 			result.Events = append(result.Events, event)
+			synthesized = true
+		}
+		if !synthesized {
+			result.Skipped++
 		}
 	}
 	result.Created = len(result.Events)
@@ -311,6 +357,3 @@ ORDER BY m.id`)
 	return result, nil
 }
 
-func memoryEventSince(duration time.Duration, now time.Time) string {
-	return now.UTC().Add(-duration).Format(time.RFC3339)
-}

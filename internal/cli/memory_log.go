@@ -46,7 +46,7 @@ func runMemoryLog(args []string, stdout, stderr io.Writer) int {
 	key := fs.String("key", "", "filter by exact memory key")
 	agent := fs.String("agent", "", "filter by owner agent")
 	repo := fs.String("repo", "", "filter by exact repository")
-	kinds := fs.String("kind", "", "comma-separated event kinds")
+	kinds := fs.String("kind", "", "comma-separated event kinds ("+strings.Join(db.MemoryEventKinds, ", ")+")")
 	since := fs.String("since", "", "show events from this duration ago (for example 168h)")
 	limit := fs.Int("limit", 50, "maximum events to return")
 	jsonOut := fs.Bool("json", false, "print as JSON")
@@ -63,16 +63,30 @@ func runMemoryLog(args []string, stdout, stderr io.Writer) int {
 	}
 	filter := db.MemoryEventFilter{MemoryID: *id, Key: strings.TrimSpace(*key), Agent: strings.TrimSpace(*agent),
 		Repo: strings.TrimSpace(*repo), Limit: *limit}
+	limitSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "limit" {
+			limitSet = true
+		}
+	})
 	if *id > 0 {
 		filter.OldestFirst = true
 		filter.Limit = 1_000_000
-		if filter.Key != "" || filter.Agent != "" || filter.Repo != "" || strings.TrimSpace(*kinds) != "" || strings.TrimSpace(*since) != "" {
-			fmt.Fprintln(stderr, "memory log: --id cannot be combined with feed filters")
+		// --id is a complete biography: reject every feed flag, including an
+		// explicit --limit, instead of silently ignoring some of them.
+		if filter.Key != "" || filter.Agent != "" || filter.Repo != "" || strings.TrimSpace(*kinds) != "" || strings.TrimSpace(*since) != "" || limitSet {
+			fmt.Fprintln(stderr, "memory log: --id cannot be combined with feed filters (--key/--agent/--repo/--kind/--since/--limit)")
 			return 2
 		}
 	}
 	if raw := strings.TrimSpace(*kinds); raw != "" {
 		filter.Kinds = strings.Split(raw, ",")
+		for _, kind := range filter.Kinds {
+			if !memoryEventKindKnown(strings.TrimSpace(kind)) {
+				fmt.Fprintf(stderr, "memory log: unknown --kind %q (valid: %s)\n", strings.TrimSpace(kind), strings.Join(db.MemoryEventKinds, ", "))
+				return 2
+			}
+		}
 	}
 	if raw := strings.TrimSpace(*since); raw != "" {
 		duration, err := time.ParseDuration(raw)
@@ -156,6 +170,15 @@ func runMemoryLogBackfill(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "scanned %d confirmed memory(s); %s %d event(s), skipped %d already backfilled\n",
 		out.Scanned, action, out.Created, out.Skipped)
 	return 0
+}
+
+func memoryEventKindKnown(kind string) bool {
+	for _, known := range db.MemoryEventKinds {
+		if kind == known {
+			return true
+		}
+	}
+	return false
 }
 
 func memoryLogEntries(events []db.MemoryEvent) []memoryLogEntry {

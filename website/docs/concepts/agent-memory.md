@@ -306,6 +306,8 @@ gitmoot memory promote --to-shared <id>... [--json]
 gitmoot memory links backfill [--dry-run] [--json]
 gitmoot memory links list <id> [--json]
 gitmoot memory log [--key K] [--agent A] [--repo R] [--kind k1,k2] [--since 168h] [--limit N] [--json]
+# --kind values: created, updated, retired, unretired, superseded, confirmed,
+#                promoted, ingested, cluster_recompute, cluster_rename
 gitmoot memory log --id <memory-id> [--json]
 gitmoot memory log backfill [--dry-run] [--json]
 ```
