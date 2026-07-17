@@ -266,7 +266,14 @@ type Job struct {
 	// Model is the durable model selected when the job was enqueued. Unlike the
 	// payload's per-job override, it also snapshots agent and runtime defaults so
 	// historical jobs do not change when mutable configuration changes.
-	Model           string
+	Model string
+	// Runtime and RuntimeRef are optional, best-effort proof projections. The
+	// jobs table does not persist a normal job's immutable runtime session: a
+	// per-job override is carried in payload.runtime_override(_ref), while an
+	// ordinary job can only be enriched from the agent's current registration.
+	// General job readers leave both empty.
+	Runtime         string
+	RuntimeRef      string
 	ParentJobID     string
 	DelegationID    string
 	DelegationDepth int
@@ -317,6 +324,10 @@ type Job struct {
 	// "2006-01-02 15:04:05"). Populated by ListJobs/GetJob so the web dashboard
 	// can stamp a node's StartedAt; other readers may leave it zero.
 	CreatedAt string
+	// ResultHash is the SHA-256 hex of the compacted raw payload.result JSON.
+	// It is populated by ListJobsByRoot for store-integrity projection; general
+	// readers may leave it empty.
+	ResultHash string
 }
 
 // TranscriptJob is the narrow retention-GC projection. It intentionally omits
@@ -2983,7 +2994,7 @@ func (s *Store) ListJobsByParent(ctx context.Context, parentJobID string) ([]Job
 // idx_jobs_root_id for an indexed lookup instead of a full-table scan that
 // unmarshals every payload. ORDER BY id is deterministic.
 func (s *Store) ListJobsByRoot(ctx context.Context, rootID string) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, root_killed, input_tokens, output_tokens, updated_at
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, root_killed, input_tokens, output_tokens, updated_at, created_at, result_hash
 		FROM jobs WHERE root_id = ? ORDER BY id`, rootID)
 	if err != nil {
 		return nil, err
@@ -2993,7 +3004,7 @@ func (s *Store) ListJobsByRoot(ctx context.Context, rootID string) ([]Job, error
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootID, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootID, &job.WorkflowID, &job.Repo, &job.PullRequest, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ResultHash); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)

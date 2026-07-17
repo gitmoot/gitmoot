@@ -77,7 +77,7 @@ func TestListJobsByRootReturnsTree(t *testing.T) {
 			t.Fatalf("CreateJob(%q) returned error: %v", id, err)
 		}
 	}
-	seed("R", `{}`)
+	seed("R", `{"workflow_id":"wf-proof","repo":"owner/repo","pull_request":12,"result":{"decision":"approved"}}`)
 	seed("R/a", `{"root_job_id":"R"}`)
 	seed("R/b", `{"root_job_id":"R"}`)
 	seed("S", `{}`) // unrelated root
@@ -92,6 +92,9 @@ func TestListJobsByRootReturnsTree(t *testing.T) {
 		gotIDs = append(gotIDs, j.ID)
 		if j.RootID != "R" {
 			t.Fatalf("ListJobsByRoot(R) returned job %q with RootID %q, want R", j.ID, j.RootID)
+		}
+		if j.ID == "R" && (j.WorkflowID != "wf-proof" || j.Repo != "owner/repo" || j.PullRequest != 12 || j.ResultHash == "" || j.CreatedAt == "") {
+			t.Fatalf("ListJobsByRoot(R) proof projection incomplete: %+v", j)
 		}
 	}
 	want := []string{"R", "R/a", "R/b"}
