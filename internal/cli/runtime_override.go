@@ -75,15 +75,7 @@ func resolveJobRuntimeOverride(overrideRuntime string, session string) (string, 
 // and --effort still flow through the job payload). A payload with no override
 // returns the agent unchanged. The stored agent row is never modified.
 func applyJobRuntimeOverride(agent runtime.Agent, payload workflow.JobPayload) runtime.Agent {
-	rt := strings.TrimSpace(payload.RuntimeOverride)
-	if rt == "" {
-		return agent
-	}
-	agent.Runtime = rt
-	agent.RuntimeRef = strings.TrimSpace(payload.RuntimeOverrideRef)
-	agent.Model = ""
-	agent.Effort = ""
-	return agent
+	return runtime.ApplyJobRuntimeOverride(agent, payload.RuntimeOverride, payload.RuntimeOverrideRef)
 }
 
 // scopeRegisteredFreshRefForJob rewrites a stored fresh:<seat> ref to a

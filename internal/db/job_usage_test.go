@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestUpdateJobUsageRoundTrip pins the #338 Part B usage write path: a job starts
@@ -266,4 +267,116 @@ INSERT INTO jobs(id, agent, type, state, payload) VALUES ('old', 'w', 'ask', 'su
 	if got.InputTokens != 42 || got.OutputTokens != 7 {
 		t.Fatalf("migrated row usage after write = (%d, %d), want (42, 7)", got.InputTokens, got.OutputTokens)
 	}
+}
+
+// TestJobModelMigrationOnPreExistingDB pins the additive model migration and
+// every Job-valued projection. A legacy row defaults to the honest unknown
+// value, while all three insert paths and every selector round-trip a new
+// enqueue-time snapshot without positional scan drift.
+func TestJobModelMigrationOnPreExistingDB(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gitmoot.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	preModel := &Store{db: raw, path: path}
+	modelMigration := -1
+	for i, migration := range migrations {
+		if strings.Contains(migration, "ALTER TABLE jobs ADD COLUMN model TEXT") {
+			modelMigration = i
+			break
+		}
+	}
+	if modelMigration < 0 {
+		t.Fatal("model migration not found")
+	}
+	for version, migration := range migrations[:modelMigration] {
+		if err := preModel.applyMigration(ctx, version+1, migration); err != nil {
+			t.Fatalf("apply pre-model migration %d: %v", version+1, err)
+		}
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload) VALUES ('legacy-model', 'old-agent', 'ask', 'succeeded', '{}')`); err != nil {
+		t.Fatalf("insert legacy job: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close pre-model db: %v", err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open migrated db: %v", err)
+	}
+	defer store.Close()
+	legacy, err := store.GetJob(ctx, "legacy-model")
+	if err != nil {
+		t.Fatalf("GetJob legacy: %v", err)
+	}
+	if legacy.Model != "" {
+		t.Fatalf("legacy Model = %q, want empty", legacy.Model)
+	}
+
+	basePayload := `{"root_job_id":"model-root","workflow_id":"model-wf","repo":"owner/repo"}`
+	if err := store.CreateJob(ctx, Job{
+		ID: "model-base", Agent: "worker", Type: "ask", State: "queued", Payload: basePayload,
+		Model: "gpt-5.6-sol", ParentJobID: "model-parent",
+	}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, Job{
+		ID: "model-event", Agent: "worker", Type: "review", State: "running", Payload: `{}`, Model: "k3",
+	}, JobEvent{Kind: "queued", Message: "created"}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+	if err := store.CreateExternallyDrivenJobWithEvent(ctx, Job{
+		ID: "model-external", Agent: "worker", Type: "ask", State: "running", Payload: `{}`, Model: "claude-fable-5",
+	}, JobEvent{Kind: "running", Message: "opened"}); err != nil {
+		t.Fatalf("CreateExternallyDrivenJobWithEvent: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET updated_at = '2000-01-01 00:00:00' WHERE id = 'model-event'`); err != nil {
+		t.Fatalf("backdate running job: %v", err)
+	}
+
+	assertJobModel := func(label string, jobs []Job, err error, id, want string) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: %v", label, err)
+		}
+		for _, job := range jobs {
+			if job.ID == id {
+				if job.Model != want {
+					t.Fatalf("%s %s Model = %q, want %q", label, id, job.Model, want)
+				}
+				return
+			}
+		}
+		t.Fatalf("%s missing %s: %+v", label, id, jobs)
+	}
+
+	got, err := store.GetJob(ctx, "model-base")
+	if err != nil || got.Model != "gpt-5.6-sol" {
+		t.Fatalf("GetJob model-base = %+v, err=%v", got, err)
+	}
+	for id, want := range map[string]string{"model-event": "k3", "model-external": "claude-fable-5"} {
+		got, err := store.GetJob(ctx, id)
+		if err != nil || got.Model != want {
+			t.Fatalf("GetJob %s = %+v, err=%v, want Model %q", id, got, err, want)
+		}
+	}
+	jobs, err := store.ListJobs(ctx)
+	assertJobModel("ListJobs", jobs, err, "model-base", "gpt-5.6-sol")
+	jobs, err = store.ListJobsByType(ctx, "ask")
+	assertJobModel("ListJobsByType", jobs, err, "model-base", "gpt-5.6-sol")
+	jobs, err = store.ListJobsByParent(ctx, "model-parent")
+	assertJobModel("ListJobsByParent", jobs, err, "model-base", "gpt-5.6-sol")
+	jobs, err = store.ListJobsByRoot(ctx, "model-root")
+	assertJobModel("ListJobsByRoot", jobs, err, "model-base", "gpt-5.6-sol")
+	jobs, err = store.ListQueuedJobs(ctx)
+	assertJobModel("ListQueuedJobs", jobs, err, "model-base", "gpt-5.6-sol")
+	jobs, err = store.ListRunningJobsUpdatedBefore(ctx, time.Now().Add(time.Hour))
+	assertJobModel("ListRunningJobsUpdatedBefore", jobs, err, "model-event", "k3")
+	jobs, err = store.ListJobsByWorkflow(ctx, "model-wf", 0)
+	assertJobModel("ListJobsByWorkflow", jobs, err, "model-base", "gpt-5.6-sol")
+	jobs, err = store.ListWorkflowGraphJobs(ctx, "model-wf")
+	assertJobModel("ListWorkflowGraphJobs", jobs, err, "model-base", "gpt-5.6-sol")
 }

@@ -1341,6 +1341,13 @@ gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 ```
 
+`gitmoot job show` reports the model selected when the job was enqueued: an
+explicit per-job/delegation model first, then the agent model, then the effective
+runtime's configured default model. Text output prints `model: -` when no model
+was known; `--json` carries the same durable value on the job row. This is the
+enqueue-time selection Gitmoot knew (P1), not a later runtime-reported effective
+model; runtime-reported truth is reserved for P2.
+
 When standard output is an interactive terminal (and `NO_COLOR` is unset),
 the transcript renders styled: agent turns get blank-line spacing and keep
 their line breaks plus lightweight heading/list/inline-code treatment. Tool

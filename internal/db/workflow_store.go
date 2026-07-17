@@ -153,7 +153,7 @@ ORDER BY last_at DESC, labels.workflow_id`
 const WorkflowSummarySQL = workflowSummarySelectSQL + `
 WHERE labels.workflow_id = ?`
 
-const ListJobsByWorkflowSQL = `SELECT id, agent, type, state, workflow_id, repo, pull_request,
+const ListJobsByWorkflowSQL = `SELECT id, agent, type, state, model, workflow_id, repo, pull_request,
 	blocker_retry_at, blocker_suggested_action, input_tokens, output_tokens, created_at, updated_at
 FROM jobs INDEXED BY idx_jobs_workflow_id
 WHERE workflow_id != '' AND workflow_id = ?
@@ -164,7 +164,7 @@ ORDER BY created_at, id LIMIT ?`
 // labeled job's payload to render titles, dependency edges, runtime overrides,
 // and models. The workflow_id predicate keeps that payload scan scoped to one
 // indexed label instead of materializing payloads globally.
-const ListWorkflowGraphJobsSQL = `SELECT id, agent, type, state, payload, parent_job_id,
+const ListWorkflowGraphJobsSQL = `SELECT id, agent, type, state, payload, model, parent_job_id,
 	delegation_id, delegation_depth, root_id, workflow_id, input_tokens, output_tokens,
 	created_at, updated_at
 FROM jobs INDEXED BY idx_jobs_workflow_id
@@ -675,7 +675,7 @@ func (s *Store) ListJobsByWorkflow(ctx context.Context, workflowID string, limit
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.WorkflowID, &job.Repo, &job.PullRequest,
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Model, &job.WorkflowID, &job.Repo, &job.PullRequest,
 			&job.BlockerRetryAt, &job.BlockerSuggestedAction,
 			&job.InputTokens, &job.OutputTokens, &job.CreatedAt, &job.UpdatedAt); err != nil {
 			return nil, err
@@ -697,7 +697,7 @@ func (s *Store) ListWorkflowGraphJobs(ctx context.Context, workflowID string) ([
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload,
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model,
 			&job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.RootID,
 			&job.WorkflowID, &job.InputTokens, &job.OutputTokens, &job.CreatedAt,
 			&job.UpdatedAt); err != nil {

@@ -128,7 +128,7 @@ type Job struct {
 	// RuntimeDefaultModel is the runtime's configured registry default_model
 	// (#652), threaded in by the dispatch layer from the HOME-AWARE resolved runtime
 	// registry (built-in defaults overlaid with [runtimes.<name>] config). It is the
-	// FINAL model fallback: effectiveModel uses it ONLY when neither the job (Model)
+	// FINAL model fallback: EffectiveModel uses it ONLY when neither the job (Model)
 	// nor the agent (Agent.Model) pins a model, so an agent/job --model always wins.
 	// Empty — the built-in default for every runtime, and the value when no config
 	// sets it — means "no registry default", so delivery defers to the runtime CLI's
@@ -541,7 +541,7 @@ func (a CodexAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 	if err := a.Validate(ctx, agent); err != nil {
 		return Result{}, err
 	}
-	model := effectiveModel(agent, job)
+	model := EffectiveModel(agent, job)
 	effort := effectiveEffort(agent, job)
 	// A fresh ref (per-job --runtime override, #531) starts a brand-new exec
 	// session — never `resume` — so an overridden job cannot read or pollute any
@@ -732,14 +732,14 @@ func (a CodexAdapter) sessionResolver() CodexSessionResolver {
 	return CodexSessionIndex{}
 }
 
-// effectiveModel resolves which model a delivered job runs on. Precedence, most
+// EffectiveModel resolves which model a delivered job runs on. Precedence, most
 // specific first: the per-job/per-delegation override (job.Model) wins, then the
 // agent's configured default (agent.Model), then — when NEITHER pins a model — the
 // runtime's configured registry default_model (job.RuntimeDefaultModel, #652). An
 // empty result means "no --model arg" (the runtime CLI's own default). Because the
 // registry default is consulted last and defaults to empty, an agent/job pin
 // always wins and an unset registry default is byte-identical to before #652.
-func effectiveModel(agent Agent, job Job) string {
+func EffectiveModel(agent Agent, job Job) string {
 	if job.Model != "" {
 		return job.Model
 	}
@@ -749,8 +749,24 @@ func effectiveModel(agent Agent, job Job) string {
 	return strings.TrimSpace(job.RuntimeDefaultModel)
 }
 
+// ApplyJobRuntimeOverride returns the effective agent identity for a job-level
+// runtime override. Model and effort defaults belong to the registered runtime,
+// so both are cleared when switching runtimes; the caller's per-job Model and
+// Effort continue to travel on Job.
+func ApplyJobRuntimeOverride(agent Agent, runtimeName, runtimeRef string) Agent {
+	runtimeName = strings.TrimSpace(runtimeName)
+	if runtimeName == "" {
+		return agent
+	}
+	agent.Runtime = runtimeName
+	agent.RuntimeRef = strings.TrimSpace(runtimeRef)
+	agent.Model = ""
+	agent.Effort = ""
+	return agent
+}
+
 // effectiveEffort resolves which reasoning effort a delivered job runs with.
-// Precedence mirrors effectiveModel exactly: the per-job override wins, then the
+// Precedence mirrors EffectiveModel exactly: the per-job override wins, then the
 // agent default, then the runtime registry default_effort. An empty result means
 // no `-c model_reasoning_effort=...` argument is emitted.
 func effectiveEffort(agent Agent, job Job) string {
@@ -929,7 +945,7 @@ func (a ClaudeAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Resul
 	if err := a.Validate(ctx, agent); err != nil {
 		return Result{}, err
 	}
-	model := effectiveModel(agent, job)
+	model := EffectiveModel(agent, job)
 	// A fresh ref (per-job --runtime override, #531) delivers on a brand-new
 	// dedicated --session-id — never --resume/--continue — so an overridden job
 	// cannot read or pollute any stored session's state.

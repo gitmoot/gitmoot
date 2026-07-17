@@ -385,6 +385,81 @@ func TestMailboxEnqueuePersistsModel(t *testing.T) {
 	}
 }
 
+// TestMailboxEnqueuePersistsResolvedModel proves the enqueue chokepoint stores
+// the selected model before any runtime delivery. It covers the complete
+// precedence plus the two agent shapes that cannot safely reuse a registered
+// default: runtime-overridden and ephemeral jobs.
+func TestMailboxEnqueuePersistsResolvedModel(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	for _, agent := range []db.Agent{
+		{Name: "pinned", Runtime: runtime.CodexRuntime, Model: "agent-codex"},
+		{Name: "defaulted", Runtime: runtime.KimiRuntime},
+		{Name: "overridden", Runtime: runtime.CodexRuntime, Model: "agent-codex"},
+	} {
+		if err := store.UpsertAgent(ctx, agent); err != nil {
+			t.Fatalf("UpsertAgent(%s): %v", agent.Name, err)
+		}
+	}
+	mailbox := Mailbox{Store: store, RuntimeDefaultModel: func(runtimeName string) string {
+		if runtimeName == runtime.KimiRuntime {
+			return "k3"
+		}
+		return ""
+	}}
+
+	for _, tc := range []struct {
+		name string
+		req  JobRequest
+		want string
+	}{
+		{
+			name: "explicit override beats agent and runtime",
+			req:  JobRequest{ID: "resolved-explicit", Agent: "pinned", Action: "ask", Repo: "owner/repo", Model: "job-model"},
+			want: "job-model",
+		},
+		{
+			name: "agent model beats runtime",
+			req:  JobRequest{ID: "resolved-agent", Agent: "pinned", Action: "ask", Repo: "owner/repo"},
+			want: "agent-codex",
+		},
+		{
+			name: "kimi runtime default",
+			req:  JobRequest{ID: "resolved-runtime", Agent: "defaulted", Action: "ask", Repo: "owner/repo"},
+			want: "k3",
+		},
+		{
+			name: "runtime override clears registered model",
+			req: JobRequest{ID: "resolved-runtime-override", Agent: "overridden", Action: "ask", Repo: "owner/repo",
+				RuntimeOverride: runtime.KimiRuntime, RuntimeOverrideRef: "fresh:override"},
+			want: "k3",
+		},
+		{
+			name: "ephemeral inline model",
+			req: JobRequest{ID: "resolved-ephemeral", Agent: "worker-ephemeral-test", Action: "review", Repo: "owner/repo",
+				ParentJobID: "parent", DelegationID: "worker", Ephemeral: &EphemeralSpec{Runtime: runtime.ClaudeRuntime, Model: "claude-fable-5"}},
+			want: "claude-fable-5",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			queued, err := mailbox.Enqueue(ctx, tc.req)
+			if err != nil {
+				t.Fatalf("Enqueue: %v", err)
+			}
+			if queued.Model != tc.want {
+				t.Fatalf("returned Model = %q, want %q", queued.Model, tc.want)
+			}
+			persisted, err := store.GetJob(ctx, tc.req.ID)
+			if err != nil {
+				t.Fatalf("GetJob before Run: %v", err)
+			}
+			if persisted.Model != tc.want {
+				t.Fatalf("persisted Model before Run = %q, want %q", persisted.Model, tc.want)
+			}
+		})
+	}
+}
+
 func TestMailboxEnqueueOmitsEmptyModel(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
@@ -489,7 +564,7 @@ func TestMailboxRunDeliversModelAndEffortOverrides(t *testing.T) {
 // home-aware RuntimeDefaultModel hook is consulted at delivery and threaded onto the
 // delivered runtime.Job as the FINAL model fallback. With no agent --model and no
 // job --model, the job carries the runtime's configured default (RuntimeDefaultModel
-// set) while its explicit Model pin stays empty — so effectiveModel uses the default,
+// set) while its explicit Model pin stays empty — so EffectiveModel uses the default,
 // yet an agent/job pin (which would populate job.Model) still wins.
 func TestMailboxRunThreadsRuntimeDefaultModel(t *testing.T) {
 	ctx := context.Background()

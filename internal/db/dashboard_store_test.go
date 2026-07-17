@@ -88,11 +88,13 @@ func TestListDashboardJobSummariesProjectsLegacyAndMalformedPayloads(t *testing.
 	jobs := []Job{
 		{
 			ID: "current", Agent: "registered", Type: "ask", State: "running",
+			Model:       "gpt-5.6-sol",
 			Payload:     `{"instructions":"  current title  ","repo":"acme/current","pull_request":42,"ephemeral":{"runtime":"kimi"}}`,
 			InputTokens: 3, OutputTokens: 5,
 		},
 		{
 			ID: "ephemeral", Agent: "temp-worker", Type: "implement", State: "queued",
+			Model:   "claude-fable-5",
 			Payload: `{"instructions":"inline","repo":"acme/inline","ephemeral":{"runtime":"claude"}}`,
 		},
 		{
@@ -129,19 +131,19 @@ func TestListDashboardJobSummariesProjectsLegacyAndMalformedPayloads(t *testing.
 	}
 	current := byID["current"]
 	if current.Instructions != "  current title  " || current.Repo != "acme/current" || current.PullRequest != 42 ||
-		current.RegisteredRuntime != "codex" || current.EphemeralRuntime != "kimi" || current.InputTokens != 3 || current.OutputTokens != 5 {
+		current.RegisteredRuntime != "codex" || current.EphemeralRuntime != "kimi" || current.Model != "gpt-5.6-sol" || current.InputTokens != 3 || current.OutputTokens != 5 {
 		t.Fatalf("current projection = %+v", current)
 	}
 	inline := byID["ephemeral"]
-	if inline.RegisteredRuntime != "" || inline.EphemeralRuntime != "claude" || inline.Repo != "acme/inline" {
+	if inline.RegisteredRuntime != "" || inline.EphemeralRuntime != "claude" || inline.Model != "claude-fable-5" || inline.Repo != "acme/inline" {
 		t.Fatalf("ephemeral projection = %+v", inline)
 	}
 	legacy := byID["legacy"]
-	if legacy.Repo != "acme/legacy" || legacy.PullRequest != 7 || legacy.Instructions != "legacy" {
+	if legacy.Repo != "acme/legacy" || legacy.PullRequest != 7 || legacy.Instructions != "legacy" || legacy.Model != "" {
 		t.Fatalf("legacy projection = %+v", legacy)
 	}
 	malformed := byID["malformed"]
-	if malformed.Instructions != "" || malformed.Repo != "" || malformed.PullRequest != 0 || malformed.EphemeralRuntime != "" {
+	if malformed.Instructions != "" || malformed.Repo != "" || malformed.PullRequest != 0 || malformed.EphemeralRuntime != "" || malformed.Model != "" {
 		t.Fatalf("malformed projection = %+v, want empty payload fields", malformed)
 	}
 }
