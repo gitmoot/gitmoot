@@ -2800,16 +2800,23 @@ uses unpredictable 128-bit run ids, and every service shell stage runs in a
 fail-closed detached worktree. Service exposure rejects any stage that declares
 `env_keys`, network access, or extra read/write authority.
 
-On the first authenticated GET after success, Gitmoot freezes an archive with
-the accepted #941 bundle plus `proof.json` and `verification.json`. The public,
-read-only `/receipts/<id>` page and `/receipts/<id>/bundle` download disclose
-only the pipeline outcome, sanitized proof tree, proof id, and archive digest —
-never bearer tokens, inputs, prompts, logs, or raw result text. The downloadable
-frozen #941 bundle intentionally includes the full shell command bodies and
-referenced environment-variable names from the pipeline spec. Never inline a
-secret literal in `cmd`; an `env_keys`-bearing pipeline cannot be exposed at all.
-Public capability receipt URLs remain public after token rotation. Use
-`--allow-remote` only behind owner-controlled TLS/firewall policy.
+Successful service shell stages may deliver files beneath `out/`. Gitmoot
+collects them before disposing the detached worktree, namespaces them as
+`artifacts/<stage-id>/...`, and caps the run at 64 MiB total; exceeding the cap
+fails finalization instead of truncating output. On the first authenticated GET
+after success, Gitmoot freezes an archive with those files, the accepted #941
+bundle, `proof.json`, and `verification.json`. Per-file size and SHA-256 metadata
+is committed by artifact nodes in the offline proof.
+
+The public, read-only `/receipts/<id>` page lists artifact names, sizes, and
+digests, but its sanitized `/receipts/<id>/bundle` omits artifact bytes. Only the
+authenticated `/v1/pipelines/runs/<id>/bundle` delivers the files. Neither
+surface discloses bearer tokens, inputs, prompts, logs, or raw result text. Both
+bundles intentionally include the frozen pipeline spec with its full shell
+command bodies and referenced environment-variable names. Never inline a secret
+literal in `cmd`; an `env_keys`-bearing pipeline cannot be exposed at all. Public
+capability receipt URLs remain public after token rotation. Use `--allow-remote`
+only behind owner-controlled TLS/firewall policy.
 
 ### Export and import a pipeline bundle
 

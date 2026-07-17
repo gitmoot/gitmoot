@@ -125,6 +125,12 @@ type Engine struct {
 	Home                string
 	DelegationWorktrees WorktreeManager
 	DelegationCheckout  string
+	// BeforeReadOnlyWorktreeCleanup is an optional terminal hook invoked after a
+	// read-only job has settled but before its detached worktree is force-removed.
+	// It lets the CLI durably collect service-stage outputs without teaching the
+	// workflow package about pipeline artifacts. An error is recorded as a job
+	// event but never suppresses cleanup; the hook owns any durable failure marker.
+	BeforeReadOnlyWorktreeCleanup func(context.Context, string, string, JobPayload) error
 	// OwnerPIDLive reports whether a recorded owner PID is a live process on this
 	// host. It gates the DESTRUCTIVE implement-delegation worktree/branch cleanup so
 	// a worktree still owned by a live runtime worker is never force-removed out from

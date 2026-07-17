@@ -131,6 +131,62 @@ func TestManifestContentAddressStable(t *testing.T) {
 	}
 }
 
+func TestArtifactNodesBindDigestsWithoutInflatingEvidenceGrade(t *testing.T) {
+	root, jobs, results, receipts, events := proofFixture(t, false)
+	base := Project(root, jobs, results, receipts, events)
+	beforeTally := GradeTally(base)
+	manifest, err := WithArtifactNodes(base, []ArtifactEvidence{
+		{Relpath: "artifacts/build/kit.txt", Stage: "build", Size: 9, SHA256: strings.Repeat("ab", 32)},
+	}, "2026-07-17T15:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyManifest(manifest); err != nil {
+		t.Fatalf("artifact manifest verification: %v", err)
+	}
+	entries, err := ArtifactEntries(manifest)
+	if err != nil || len(entries) != 1 || entries[0].Relpath != "artifacts/build/kit.txt" || entries[0].Size != 9 || entries[0].SHA256 != strings.Repeat("ab", 32) {
+		t.Fatalf("artifact entries=%+v err=%v", entries, err)
+	}
+	if got := GradeTally(manifest); got[GradeReported] != beforeTally[GradeReported] || got[GradeObserved] != beforeTally[GradeObserved] || got[GradeVerified] != beforeTally[GradeVerified] {
+		t.Fatalf("artifact integrity inflated substantive grades: before=%v after=%v", beforeTally, got)
+	}
+	var artifactNode Node
+	for _, node := range manifest.Nodes {
+		if node.Kind == KindArtifact {
+			artifactNode = node
+		}
+	}
+	if artifactNode.ID == "" {
+		t.Fatal("artifact node is absent")
+	}
+	foundClaim := false
+	for _, claim := range artifactNode.Claims {
+		if claim.Type == "integrity.artifact_sha256" && claim.Grade == GradeVerified {
+			foundClaim = true
+		}
+	}
+	if !foundClaim {
+		t.Fatalf("artifact digest integrity claim absent: %+v", artifactNode.Claims)
+	}
+	var rendered bytes.Buffer
+	if err := RenderTree(&rendered, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rendered.String(), "artifacts/build/kit.txt · 9 bytes · sha256:"+strings.Repeat("ab", 32)+" [verified integrity]") {
+		t.Fatalf("rendered tree omits artifact digest:\n%s", rendered.String())
+	}
+	tampered := manifest
+	tampered.Nodes = cloneNodes(manifest.Nodes)
+	node := tampered.Nodes[artifactNode.ID]
+	node.Attrs = cloneAttrs(node.Attrs)
+	node.Attrs["sha256"] = strings.Repeat("cd", 32)
+	tampered.Nodes[artifactNode.ID] = node
+	if err := VerifyManifest(tampered); err == nil {
+		t.Fatal("tampered artifact digest passed manifest verification")
+	}
+}
+
 func TestReviewIndependenceRequiresNormalizedNonEmptyAgents(t *testing.T) {
 	for _, tc := range []struct {
 		name, reviewer, wantClaim string

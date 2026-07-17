@@ -9,7 +9,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
 	"sort"
+	"strconv"
+	"strings"
 )
 
 const hashPrefix = "sha256:"
@@ -25,6 +28,7 @@ const (
 	KindTest       Kind = "test"
 	KindReview     Kind = "review"
 	KindPR         Kind = "pr"
+	KindArtifact   Kind = "artifact"
 )
 
 // Grade is the strength of evidence behind a claim.
@@ -62,6 +66,16 @@ type Manifest struct {
 	ProofID string          `json:"proof_id"`
 	Root    Node            `json:"root"`
 	Nodes   map[string]Node `json:"nodes"`
+}
+
+// ArtifactEvidence is the store-side digest metadata for one service-run file.
+// Relpath is the public, slash-separated artifacts/<stage>/<file> path; SHA256
+// is the lowercase hex digest of the collected bytes.
+type ArtifactEvidence struct {
+	Relpath string
+	Stage   string
+	Size    int64
+	SHA256  string
 }
 
 type nodeContent struct {
@@ -125,6 +139,138 @@ func WithVerifiedRootClaim(manifest Manifest, claimType, source, evidenceRef, as
 		return Manifest{}, err
 	}
 	return updated, nil
+}
+
+// WithArtifactNodes returns a manifest whose root commits one content-addressed
+// artifact node per collected service output. The artifact sha256 claim is an
+// integrity meta-claim: Gitmoot hashed stored bytes, but did not rerun or attest
+// the command that produced them.
+func WithArtifactNodes(manifest Manifest, artifacts []ArtifactEvidence, asOf string) (Manifest, error) {
+	if err := VerifyManifest(manifest); err != nil {
+		return Manifest{}, err
+	}
+	if len(artifacts) == 0 {
+		return manifest, nil
+	}
+	ordered := append([]ArtifactEvidence(nil), artifacts...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Relpath < ordered[j].Relpath })
+	seen := make(map[string]struct{}, len(ordered))
+	nodes := make(map[string]Node, len(manifest.Nodes)+len(ordered))
+	for id, node := range manifest.Nodes {
+		nodes[id] = node
+	}
+	root := manifest.Root
+	root.Attrs = cloneStringAttrs(root.Attrs)
+	root.Children = append([]string(nil), root.Children...)
+	root.Claims = append([]Claim(nil), root.Claims...)
+	var totalBytes int64
+	for _, artifact := range ordered {
+		relpath, digest, err := normalizeArtifactEvidence(artifact)
+		if err != nil {
+			return Manifest{}, err
+		}
+		if _, duplicate := seen[relpath]; duplicate {
+			return Manifest{}, fmt.Errorf("duplicate artifact relpath %q", relpath)
+		}
+		seen[relpath] = struct{}{}
+		attrs := map[string]string{
+			"relpath": relpath,
+			"size":    strconv.FormatInt(artifact.Size, 10),
+			"sha256":  digest,
+			"as_of":   asOf,
+		}
+		if strings.TrimSpace(artifact.Stage) != "" {
+			attrs["stage"] = strings.TrimSpace(artifact.Stage)
+		}
+		b := newBuilder()
+		id := b.add(Node{
+			Kind: KindArtifact, Ref: relpath, Attrs: attrs,
+			Claims: []Claim{{
+				Type: "integrity.artifact_sha256", Grade: GradeVerified,
+				Source: "pipeline.artifact_collector", EvidenceRef: relpath, AsOf: asOf,
+			}},
+		})
+		nodes[id] = b.nodes[id]
+		root.Children = append(root.Children, id)
+		if totalBytes > (1<<63-1)-artifact.Size {
+			return Manifest{}, errors.New("artifact byte total overflows int64")
+		}
+		totalBytes += artifact.Size
+	}
+	root.Attrs["artifacts_count"] = strconv.Itoa(len(ordered))
+	root.Attrs["artifact_bytes"] = strconv.FormatInt(totalBytes, 10)
+	normalizeNode(&root)
+	oldID := manifest.ProofID
+	root.ID = NodeID(root)
+	delete(nodes, oldID)
+	nodes[root.ID] = root
+	updated := Manifest{ProofID: root.ID, Root: root, Nodes: nodes}
+	if err := VerifyManifest(updated); err != nil {
+		return Manifest{}, err
+	}
+	return updated, nil
+}
+
+// ArtifactEntries returns the verified artifact metadata committed by a
+// manifest, sorted by relpath. It rejects malformed or duplicate artifact
+// nodes so receipt renderers never guess at public metadata.
+func ArtifactEntries(manifest Manifest) ([]ArtifactEvidence, error) {
+	if err := VerifyManifest(manifest); err != nil {
+		return nil, err
+	}
+	entries := make([]ArtifactEvidence, 0)
+	seen := map[string]struct{}{}
+	for _, node := range manifest.Nodes {
+		if node.Kind != KindArtifact {
+			continue
+		}
+		size, err := strconv.ParseInt(strings.TrimSpace(node.Attrs["size"]), 10, 64)
+		if err != nil || size < 0 {
+			return nil, fmt.Errorf("artifact %q has invalid size", node.Ref)
+		}
+		entry := ArtifactEvidence{
+			Relpath: node.Attrs["relpath"], Stage: node.Attrs["stage"],
+			Size: size, SHA256: node.Attrs["sha256"],
+		}
+		relpath, digest, err := normalizeArtifactEvidence(entry)
+		if err != nil {
+			return nil, err
+		}
+		if node.Ref != relpath {
+			return nil, fmt.Errorf("artifact node ref %q does not match relpath %q", node.Ref, relpath)
+		}
+		if _, duplicate := seen[relpath]; duplicate {
+			return nil, fmt.Errorf("duplicate artifact relpath %q", relpath)
+		}
+		seen[relpath] = struct{}{}
+		entry.Relpath = relpath
+		entry.SHA256 = digest
+		entries = append(entries, entry)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Relpath < entries[j].Relpath })
+	return entries, nil
+}
+
+func normalizeArtifactEvidence(artifact ArtifactEvidence) (string, string, error) {
+	relpath := strings.TrimSpace(artifact.Relpath)
+	cleaned := path.Clean(relpath)
+	if artifact.Size < 0 || relpath == "" || cleaned != relpath || strings.HasPrefix(cleaned, "/") ||
+		cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") || !strings.HasPrefix(cleaned, "artifacts/") {
+		return "", "", fmt.Errorf("invalid artifact relpath %q", artifact.Relpath)
+	}
+	parts := strings.Split(cleaned, "/")
+	if len(parts) < 3 || parts[1] == "" || parts[2] == "" {
+		return "", "", fmt.Errorf("artifact relpath %q lacks a stage and file", artifact.Relpath)
+	}
+	if stage := strings.TrimSpace(artifact.Stage); stage != "" && stage != parts[1] {
+		return "", "", fmt.Errorf("artifact stage %q does not match relpath %q", artifact.Stage, artifact.Relpath)
+	}
+	digest := strings.ToLower(strings.TrimSpace(artifact.SHA256))
+	decoded, err := hex.DecodeString(digest)
+	if err != nil || len(decoded) != sha256.Size {
+		return "", "", fmt.Errorf("artifact %q has invalid sha256", relpath)
+	}
+	return cleaned, digest, nil
 }
 
 func cloneStringAttrs(attrs map[string]string) map[string]string {

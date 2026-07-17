@@ -1998,17 +1998,24 @@ rejected.
 Admission atomically applies rate/concurrency limits and creates an unpredictable
 128-bit run id.
 
+Successful shell stages can deliver files from `out/`. Gitmoot collects them
+before disposing the detached worktree, stores them as
+`artifacts/<stage-id>/...`, and fails finalization if the run exceeds 64 MiB.
 After success, an authenticated status GET finalizes the frozen pipeline bundle
-with `proof.json` and `verification.json`. `gitmoot proof --verify
-<service-run-id>` checks the persisted run/stage/job/result-hash relationships
-offline; it does not rerun commands, query CI, or promote reported tests. The
-public `/receipts/<run-id>` and `/receipts/<run-id>/bundle` routes expose only the
-sanitized completed outcome and archive digest. Token rotation revokes the old
-bearer credential; disabling blocks new POSTs but does not revoke reads or
-polling of accepted runs. The public frozen #941 bundle includes full shell
-command bodies and referenced environment-variable names, so never inline a
-secret literal in `cmd`. Public capability receipt URLs remain public after
-token rotation.
+with those files, `proof.json`, and `verification.json`; artifact proof nodes
+commit each file's size and SHA-256 digest. `gitmoot proof --verify
+<service-run-id>` checks the persisted run/stage/job/result-hash and artifact
+relationships offline; it does not rerun commands, query CI, or promote reported
+tests.
+
+The public `/receipts/<run-id>` page shows artifact names, sizes, and digests,
+but its sanitized bundle omits artifact bytes. The authenticated service bundle
+is the only download containing them. Token rotation revokes the old bearer
+credential; disabling blocks new POSTs but does not revoke reads or polling of
+accepted runs. Both bundles include the frozen #941 spec with full shell command
+bodies and referenced environment-variable names, so never inline a secret
+literal in `cmd`. Public capability receipt URLs remain public after token
+rotation.
 
 An enabled `trigger.kind: email` pipeline auto-binds. If Activepieces is down,
 registration succeeds with a pending binding; `bind-trigger` retries it and

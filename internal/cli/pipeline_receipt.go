@@ -9,8 +9,11 @@ import (
 	"html/template"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/proof"
@@ -18,8 +21,8 @@ import (
 
 var pipelineReceiptTemplate = template.Must(template.New("receipt").Parse(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Gitmoot pipeline receipt</title><style>body{font:16px/1.5 system-ui,sans-serif;max-width:72rem;margin:3rem auto;padding:0 1.25rem;color:#171717}dl{display:grid;grid-template-columns:max-content 1fr;gap:.4rem 1rem}dt{font-weight:700}pre{padding:1rem;overflow:auto;background:#f5f5f5;border:1px solid #ddd}code{overflow-wrap:anywhere}</style></head>
-<body><main><h1>Pipeline receipt</h1><dl><dt>Pipeline</dt><dd>{{.Pipeline}}</dd><dt>Run</dt><dd><code>{{.RunID}}</code></dd><dt>Completed</dt><dd>{{.Completed}}</dd><dt>Proof</dt><dd><code>{{.ProofID}}</code> · stored pipeline outcome verified</dd><dt>Archive</dt><dd><code>{{.ArtifactSHA}}</code> · <a href="{{.BundleURL}}">download bundle</a></dd></dl><h2>Evidence tree</h2><pre>{{.Tree}}</pre></main></body></html>`))
+<title>Gitmoot pipeline receipt</title><style>body{font:16px/1.5 system-ui,sans-serif;max-width:72rem;margin:3rem auto;padding:0 1.25rem;color:#171717}dl{display:grid;grid-template-columns:max-content 1fr;gap:.4rem 1rem}dt{font-weight:700}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:.4rem;border-bottom:1px solid #ddd}pre{padding:1rem;overflow:auto;background:#f5f5f5;border:1px solid #ddd}code{overflow-wrap:anywhere}</style></head>
+<body><main><h1>Pipeline receipt</h1><dl><dt>Pipeline</dt><dd>{{.Pipeline}}</dd><dt>Run</dt><dd><code>{{.RunID}}</code></dd><dt>Completed</dt><dd>{{.Completed}}</dd><dt>Proof</dt><dd><code>{{.ProofID}}</code> · stored pipeline outcome verified</dd><dt>Authenticated bundle SHA-256</dt><dd><code>{{.ArtifactSHA}}</code></dd><dt>Public bundle</dt><dd><a href="{{.BundleURL}}">download sanitized receipt bundle</a></dd></dl><h2>Artifacts</h2>{{if .Artifacts}}<table><thead><tr><th>Name</th><th>Bytes</th><th>SHA-256</th></tr></thead><tbody>{{range .Artifacts}}<tr><td><code>{{.Relpath}}</code></td><td>{{.Size}}</td><td><code>{{.SHA256}}</code></td></tr>{{end}}</tbody></table>{{else}}<p>-</p>{{end}}<p>Artifact bytes are available only from the authenticated service bundle.</p><h2>Evidence tree</h2><pre>{{.Tree}}</pre></main></body></html>`))
 
 type publicPipelineReceipt struct {
 	RunID       string
@@ -30,6 +33,7 @@ type publicPipelineReceipt struct {
 	BundleURL   string
 	Tree        string
 	Artifact    string
+	Artifacts   []proof.ArtifactEvidence
 }
 
 func (d *webDataSource) handlePipelineReceipt(w http.ResponseWriter, r *http.Request) {
@@ -91,6 +95,35 @@ func (d *webDataSource) loadPublicPipelineReceipt(ctx context.Context, runID str
 	if err := proof.VerifyManifest(manifest); err != nil {
 		return publicPipelineReceipt{}, err
 	}
+	artifacts, err := proof.ArtifactEntries(manifest)
+	if err != nil {
+		return publicPipelineReceipt{}, err
+	}
+	receiptArchive, err := pipelineServiceReceiptArchivePath(paths, runID)
+	if err != nil {
+		return publicPipelineReceipt{}, err
+	}
+	if _, err := os.Stat(receiptArchive); os.IsNotExist(err) {
+		// Backward compatibility for already-finalized #1011 receipts: their sole
+		// archive is safe to expose only when it contains no artifact entries.
+		contains, inspectErr := archiveContainsPrefix(artifact, pipelineServiceArtifactsDir+"/")
+		if inspectErr != nil || contains {
+			return publicPipelineReceipt{}, errors.New("sanitized receipt archive is absent")
+		}
+		receiptArchive = artifact
+	} else if err != nil {
+		return publicPipelineReceipt{}, err
+	}
+	receiptManifest, err := readProofManifestFromArchive(receiptArchive)
+	if err != nil || receiptManifest.ProofID != manifest.ProofID {
+		return publicPipelineReceipt{}, errors.New("sanitized receipt archive proof mismatch")
+	}
+	if err := proof.VerifyManifest(receiptManifest); err != nil {
+		return publicPipelineReceipt{}, err
+	}
+	if contains, err := archiveContainsPrefix(receiptArchive, pipelineServiceArtifactsDir+"/"); err != nil || contains {
+		return publicPipelineReceipt{}, errors.New("sanitized receipt archive contains artifact bytes")
+	}
 	var tree bytes.Buffer
 	if err := proof.RenderTree(&tree, manifest); err != nil {
 		return publicPipelineReceipt{}, err
@@ -98,8 +131,30 @@ func (d *webDataSource) loadPublicPipelineReceipt(ctx context.Context, runID str
 	return publicPipelineReceipt{
 		RunID: run.ID, Pipeline: run.Pipeline, Completed: run.FinishedAt.UTC().Format("2006-01-02T15:04:05Z"),
 		ProofID: manifest.ProofID, ArtifactSHA: serviceRun.ArtifactSHA256,
-		BundleURL: pipelineServiceReceiptURL(run.ID) + "/bundle", Tree: tree.String(), Artifact: artifact,
+		BundleURL: pipelineServiceReceiptURL(run.ID) + "/bundle", Tree: tree.String(), Artifact: receiptArchive, Artifacts: artifacts,
 	}, nil
+}
+
+func pipelineServiceReceiptArchivePath(paths config.Paths, runID string) (string, error) {
+	root, _, _, _, err := pipelineServiceRunPaths(paths, runID)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "receipt.zip"), nil
+}
+
+func archiveContainsPrefix(path, prefix string) (bool, error) {
+	archive, err := zip.OpenReader(path)
+	if err != nil {
+		return false, err
+	}
+	defer archive.Close()
+	for _, file := range archive.File {
+		if strings.HasPrefix(file.Name, prefix) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func readProofManifestFromArchive(path string) (proof.Manifest, error) {

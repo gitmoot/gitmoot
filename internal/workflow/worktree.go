@@ -552,6 +552,14 @@ func (e Engine) cleanupReadOnlyDelegationWorktree(ctx context.Context, jobID str
 	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
 		return
 	}
+	if e.BeforeReadOnlyWorktreeCleanup != nil {
+		if err := e.BeforeReadOnlyWorktreeCleanup(opCtx, jobID, jobType, payload); err != nil {
+			_ = e.Store.AddJobEvent(opCtx, db.JobEvent{
+				JobID: jobID, Kind: "readonly_worktree_precleanup_failed",
+				Message: fmt.Sprintf("pre-cleanup hook failed before worktree disposal: %v", err),
+			})
+		}
+	}
 	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(opCtx, e.Store, e.DelegationCheckout, "worktree-cleanup:"+jobID, time.Now().UTC())
 	if err != nil {
 		// A transient failure (lock contention) must NOT be terminal: emit the same

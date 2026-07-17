@@ -365,13 +365,19 @@ requires a detached worktree and fails closed if isolation cannot be allocated.
 The listener binds to loopback by default; do not expose it to production
 networks without explicit owner action, TLS, and a trusted firewall.
 
-The public capability receipt bundle is the frozen #941 pipeline bundle: it
-contains full shell command bodies and referenced environment-variable names.
-Never inline secret literals in `cmd`. Public receipt handlers only read an
-already completed, sanitized, store-verified archive. Disabling an exposure
-blocks new runs but does not revoke authenticated reads or polling for accepted
-runs; rotate the token to revoke the old bearer credential (the public receipt
-URL remains public once finalized).
+Successful service shell stages can publish up to 64 MiB total from `out/`.
+Collection happens before detached-worktree disposal, rejects absolute/parent
+paths, symlinks, and non-regular files, and binds each accepted file's name,
+size, and SHA-256 digest into the store-verified proof. The authenticated service
+bundle contains those bytes under `artifacts/<stage-id>/`; the public receipt
+lists only their metadata and its sanitized bundle omits artifact bytes.
+
+Both bundles contain the frozen #941 pipeline spec, including full shell command
+bodies and referenced environment-variable names. Never inline secret literals
+in `cmd`. Public receipt handlers only read an already completed archive.
+Disabling an exposure blocks new runs but does not revoke authenticated reads or
+polling for accepted runs; rotate the token to revoke the old bearer credential
+(the public receipt URL remains public once finalized).
 
 ## When To Stop
 

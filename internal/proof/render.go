@@ -110,6 +110,17 @@ func RenderTree(w io.Writer, manifest Manifest) error {
 			}
 		}
 	}
+	artifacts, err := ArtifactEntries(manifest)
+	if err != nil {
+		return err
+	}
+	if len(artifacts) > 0 {
+		fmt.Fprintln(w, "artifacts:")
+		for _, artifact := range artifacts {
+			fmt.Fprintf(w, "  %s · %d bytes · sha256:%s [verified integrity]\n",
+				artifact.Relpath, artifact.Size, artifact.SHA256)
+		}
+	}
 
 	modelCount := len(models)
 	fmt.Fprintf(w, "summary: root %s · %d sessions / %d models · %d tests reported, CI verification deferred · %d reviews / %d approved · PR %s\n",
@@ -119,13 +130,25 @@ func RenderTree(w io.Writer, manifest Manifest) error {
 	fmt.Fprintf(w, "grades: reported=%d · observed=%d · verified=%d\n",
 		tally[GradeReported], tally[GradeObserved], tally[GradeVerified])
 	nodes, resultHashes := integrityTally(manifest)
+	artifactCount, artifactBytes := artifactIntegrityTally(manifest)
 	delegationDAG := "gap"
 	if manifest.Root.Attrs["dag_consistent"] == "true" {
 		delegationDAG = "consistent"
 	}
-	fmt.Fprintf(w, "integrity: all %d nodes hash-consistent · manifest DAG acyclic · delegation DAG %s · %d result_hashes matched\n",
-		nodes, delegationDAG, resultHashes)
+	fmt.Fprintf(w, "integrity: all %d nodes hash-consistent · manifest DAG acyclic · delegation DAG %s · %d result_hashes matched · %d artifact sha256 digests matched / %d bytes\n",
+		nodes, delegationDAG, resultHashes, artifactCount, artifactBytes)
 	return nil
+}
+
+func artifactIntegrityTally(manifest Manifest) (count int, bytes int64) {
+	entries, err := ArtifactEntries(manifest)
+	if err != nil {
+		return 0, 0
+	}
+	for _, entry := range entries {
+		bytes += entry.Size
+	}
+	return len(entries), bytes
 }
 
 // GradeTally counts substantive claims by grade across nodes reachable from the

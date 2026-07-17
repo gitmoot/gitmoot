@@ -12194,16 +12194,23 @@ uses unpredictable 128-bit run ids, and every service shell stage runs in a
 fail-closed detached worktree. Service exposure rejects any stage that declares
 `env_keys`, network access, or extra read/write authority.
 
-On the first authenticated GET after success, Gitmoot freezes an archive with
-the accepted #941 bundle plus `proof.json` and `verification.json`. The public,
-read-only `/receipts/<id>` page and `/receipts/<id>/bundle` download disclose
-only the pipeline outcome, sanitized proof tree, proof id, and archive digest —
-never bearer tokens, inputs, prompts, logs, or raw result text. The downloadable
-frozen #941 bundle intentionally includes the full shell command bodies and
-referenced environment-variable names from the pipeline spec. Never inline a
-secret literal in `cmd`; an `env_keys`-bearing pipeline cannot be exposed at all.
-Public capability receipt URLs remain public after token rotation. Use
-`--allow-remote` only behind owner-controlled TLS/firewall policy.
+Successful service shell stages may deliver files beneath `out/`. Gitmoot
+collects them before disposing the detached worktree, namespaces them as
+`artifacts/<stage-id>/...`, and caps the run at 64 MiB total; exceeding the cap
+fails finalization instead of truncating output. On the first authenticated GET
+after success, Gitmoot freezes an archive with those files, the accepted #941
+bundle, `proof.json`, and `verification.json`. Per-file size and SHA-256 metadata
+is committed by artifact nodes in the offline proof.
+
+The public, read-only `/receipts/<id>` page lists artifact names, sizes, and
+digests, but its sanitized `/receipts/<id>/bundle` omits artifact bytes. Only the
+authenticated `/v1/pipelines/runs/<id>/bundle` delivers the files. Neither
+surface discloses bearer tokens, inputs, prompts, logs, or raw result text. Both
+bundles intentionally include the frozen pipeline spec with its full shell
+command bodies and referenced environment-variable names. Never inline a secret
+literal in `cmd`; an `env_keys`-bearing pipeline cannot be exposed at all. Public
+capability receipt URLs remain public after token rotation. Use `--allow-remote`
+only behind owner-controlled TLS/firewall policy.
 
 ### Export and import a pipeline bundle
 
@@ -14769,13 +14776,19 @@ requires a detached worktree and fails closed if isolation cannot be allocated.
 The listener binds to loopback by default; do not expose it to production
 networks without explicit owner action, TLS, and a trusted firewall.
 
-The public capability receipt bundle is the frozen #941 pipeline bundle: it
-contains full shell command bodies and referenced environment-variable names.
-Never inline secret literals in `cmd`. Public receipt handlers only read an
-already completed, sanitized, store-verified archive. Disabling an exposure
-blocks new runs but does not revoke authenticated reads or polling for accepted
-runs; rotate the token to revoke the old bearer credential (the public receipt
-URL remains public once finalized).
+Successful service shell stages can publish up to 64 MiB total from `out/`.
+Collection happens before detached-worktree disposal, rejects absolute/parent
+paths, symlinks, and non-regular files, and binds each accepted file's name,
+size, and SHA-256 digest into the store-verified proof. The authenticated service
+bundle contains those bytes under `artifacts/<stage-id>/`; the public receipt
+lists only their metadata and its sanitized bundle omits artifact bytes.
+
+Both bundles contain the frozen #941 pipeline spec, including full shell command
+bodies and referenced environment-variable names. Never inline secret literals
+in `cmd`. Public receipt handlers only read an already completed archive.
+Disabling an exposure blocks new runs but does not revoke authenticated reads or
+polling for accepted runs; rotate the token to revoke the old bearer credential
+(the public receipt URL remains public once finalized).
 
 ## When To Stop
 

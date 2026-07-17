@@ -90,13 +90,21 @@ typed values are delivered only as `GITMOOT_INPUT_*` environment variables, not
 prompt text; admission, rate/concurrency checks, run rows, and receipt metadata
 commit atomically. Each service shell stage uses a detached worktree.
 
-The first authenticated successful GET freezes the accepted bundle together
-with `proof.json` and `verification.json`. The proof verifies persisted pipeline,
-stage, job, result-hash, and manifest consistency only — no command rerun or CI
-claim. A sanitized public receipt is available at `/receipts/<run-id>` with its
-archive download; it excludes input values, tokens, prompts, logs, and raw agent
-text. Disabling blocks new requests but leaves accepted runs pollable; rotating
-the token revokes the old credential while the new one can poll earlier runs.
+Stages publish caller deliverables beneath `out/`. Gitmoot copies successful
+stage output before detached-worktree disposal, namespaces it as
+`artifacts/<stage-id>/...`, and fails finalization rather than exceeding the
+64 MiB total cap. The first authenticated successful GET freezes those bytes
+with the accepted bundle, `proof.json`, and `verification.json`. Artifact proof
+nodes bind every file's name, size, and SHA-256 digest. The proof verifies
+persisted pipeline, stage, job, result-hash, artifact, and manifest consistency
+only — no command rerun or CI claim.
+
+The public receipt at `/receipts/<run-id>` lists artifact metadata, but its
+sanitized archive excludes artifact bytes. Only the authenticated service bundle
+delivers them. Both surfaces exclude input values, tokens, prompts, logs, and raw
+agent text. Disabling blocks new requests but leaves accepted runs pollable;
+rotating the token revokes the old credential while the new one can poll earlier
+runs.
 
 `pipeline add` validates the whole spec at add time — unknown keys, a non-name-safe
 name/id, a duplicate stage id, a stage that is not exactly one of `cmd`, `agent`, or
@@ -801,12 +809,14 @@ Service exposure is an additional explicit owner action. Keep the listener on
 loopback unless it is behind owner-controlled TLS and firewall policy. Its input
 schema prevents free-form prompt passthrough, and service shell runs fail closed
 unless Gitmoot can allocate a detached worktree. Pipelines with `env_keys`,
-network access, or extra read/write authority cannot be exposed. Public receipt
-routes read only already-finalized, sanitized artifacts, but the downloadable
-frozen #941 bundle includes full shell command bodies and referenced
-environment-variable names; never inline a secret literal in `cmd`. Disabling
-blocks new runs without revoking accepted-run reads or polling; rotate the token
-to revoke the old bearer credential. Public capability receipt URLs remain
-public after rotation.
+network access, or extra read/write authority cannot be exposed. Collection from
+`out/` rejects escaping paths, symlinks, and non-regular files and is capped at
+64 MiB per run. Public receipt routes read only already-finalized, sanitized
+artifacts: they reveal names, sizes, and digests, not artifact bytes. Both public
+and authenticated bundles include the frozen #941 spec with full shell command
+bodies and referenced environment-variable names; never inline a secret literal
+in `cmd`. Disabling blocks new runs without revoking accepted-run reads or
+polling; rotate the token to revoke the old bearer credential. Public capability
+receipt URLs remain public after rotation.
 
 See the in-repo reference at `docs/pipelines.md` for the full field reference.

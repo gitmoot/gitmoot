@@ -261,7 +261,7 @@ func (h *pipelineServiceHandler) handleGetRun(w http.ResponseWriter, r *http.Req
 		var err error
 		serviceRun, err = h.finalize(r.Context(), runID)
 		if err != nil {
-			h.writeError(w, http.StatusInternalServerError, "proof_finalization_failed")
+			h.writeServiceFinalizationError(w, err)
 			return
 		}
 	}
@@ -292,7 +292,7 @@ func (h *pipelineServiceHandler) handleGetBundle(w http.ResponseWriter, r *http.
 		var err error
 		serviceRun, err = h.finalize(r.Context(), runID)
 		if err != nil {
-			h.writeError(w, http.StatusInternalServerError, "proof_finalization_failed")
+			h.writeServiceFinalizationError(w, err)
 			return
 		}
 	}
@@ -392,7 +392,24 @@ func (h *pipelineServiceHandler) finalize(ctx context.Context, runID string) (db
 	if err != nil {
 		return db.PipelineServiceRun{}, err
 	}
-	if err := writePipelineServiceArchive(base, archive, manifestJSON, verificationJSON); err != nil {
+	actualArtifacts, err := loadPipelineServiceArtifacts(h.paths, runID)
+	if err != nil {
+		return db.PipelineServiceRun{}, err
+	}
+	if err := verifyPipelineServiceArtifactProof(verified.Manifest, actualArtifacts); err != nil {
+		return db.PipelineServiceRun{}, err
+	}
+	if err := writePipelineServiceArchive(base, archive, manifestJSON, verificationJSON, true); err != nil {
+		return db.PipelineServiceRun{}, err
+	}
+	if err := verifyPipelineServiceArchiveArtifacts(archive, verified.Manifest); err != nil {
+		return db.PipelineServiceRun{}, err
+	}
+	receiptArchive, err := pipelineServiceReceiptArchivePath(h.paths, runID)
+	if err != nil {
+		return db.PipelineServiceRun{}, err
+	}
+	if err := writePipelineServiceArchive(base, receiptArchive, manifestJSON, verificationJSON, false); err != nil {
 		return db.PipelineServiceRun{}, err
 	}
 	digest, err := hashFileSHA256(archive)
@@ -494,7 +511,7 @@ func freezePipelineServiceBundle(ctx context.Context, store *db.Store, paths con
 	})
 }
 
-func writePipelineServiceArchive(base, archive string, proofJSON, verificationJSON []byte) error {
+func writePipelineServiceArchive(base, archive string, proofJSON, verificationJSON []byte, includeArtifacts bool) error {
 	files := map[string][]byte{
 		"proof.json":        append(append([]byte(nil), proofJSON...), '\n'),
 		"verification.json": append(append([]byte(nil), verificationJSON...), '\n'),
@@ -506,15 +523,29 @@ func writePipelineServiceArchive(base, archive string, proofJSON, verificationJS
 		if entry.IsDir() {
 			return nil
 		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return errors.New("frozen bundle contains a symlink")
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return errors.New("frozen bundle contains a non-regular file")
+		}
 		rel, err := filepath.Rel(base, path)
 		if err != nil || !containedRelativePath(rel) {
 			return errors.New("frozen bundle contains an invalid path")
+		}
+		slashRel := filepath.ToSlash(rel)
+		if !includeArtifacts && (slashRel == pipelineServiceArtifactsDir || strings.HasPrefix(slashRel, pipelineServiceArtifactsDir+"/")) {
+			return nil
 		}
 		content, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
-		files[filepath.ToSlash(rel)] = content
+		files[slashRel] = content
 		return nil
 	})
 	if err != nil {
@@ -645,6 +676,17 @@ func (h *pipelineServiceHandler) writeServiceAdmissionError(w http.ResponseWrite
 		h.writeError(w, http.StatusTooManyRequests, "active_run_limit")
 	default:
 		h.writeError(w, http.StatusInternalServerError, "internal_error")
+	}
+}
+
+func (h *pipelineServiceHandler) writeServiceFinalizationError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, errPipelineServiceArtifactBundleTooLarge):
+		h.writeError(w, http.StatusInternalServerError, errPipelineServiceArtifactBundleTooLarge.Error())
+	case errors.Is(err, errPipelineServiceArtifactCollectionFailed):
+		h.writeError(w, http.StatusInternalServerError, errPipelineServiceArtifactCollectionFailed.Error())
+	default:
+		h.writeError(w, http.StatusInternalServerError, "proof_finalization_failed")
 	}
 }
 

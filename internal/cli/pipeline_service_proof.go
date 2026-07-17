@@ -43,6 +43,7 @@ type verifiedPipelineRunProof struct {
 	Verification pipelineStoredOutcomeVerification
 	Run          db.PipelineRun
 	Stages       []db.PipelineRunStage
+	Artifacts    []proof.ArtifactEvidence
 }
 
 func pipelineServiceRunPaths(paths config.Paths, runID string) (root, base, sourceSpec, archive string, err error) {
@@ -174,6 +175,14 @@ func verifyPipelineRunFromStore(ctx context.Context, store *db.Store, paths conf
 	}
 	publicJobs, publicResults := sanitizePipelineProofJobs(normalized, results)
 	publicManifest := proof.Project(root, publicJobs, publicResults, nil, nil)
+	artifacts, err := loadPipelineServiceArtifacts(paths, runID)
+	if err != nil {
+		return verifiedPipelineRunProof{}, err
+	}
+	publicManifest, err = proof.WithArtifactNodes(publicManifest, artifacts, asOf)
+	if err != nil {
+		return verifiedPipelineRunProof{}, fmt.Errorf("bind collected artifacts into proof: %w", err)
+	}
 	publicManifest, err = proof.WithVerifiedRootClaim(publicManifest,
 		"stored_pipeline_outcome", "pipeline_run", run.ID, asOf,
 		map[string]string{"pipeline": run.Pipeline, "run_state": run.State, "verification_kind": "stored_pipeline_outcome"})
@@ -185,7 +194,7 @@ func verifyPipelineRunFromStore(ctx context.Context, store *db.Store, paths conf
 		State: run.State, StagesChecked: len(stages), JobsChecked: len(jobs),
 		ResultHashesChecked: resultHashesChecked, ManifestVerified: true, OutcomeAsOf: asOf,
 	}
-	return verifiedPipelineRunProof{Manifest: publicManifest, Verification: verification, Run: run, Stages: stages}, nil
+	return verifiedPipelineRunProof{Manifest: publicManifest, Verification: verification, Run: run, Stages: stages, Artifacts: artifacts}, nil
 }
 
 func gatherPipelineProofJobs(ctx context.Context, store *db.Store, stages []db.PipelineRunStage) ([]db.Job, map[string]*workflow.AgentResult, map[string]string, error) {

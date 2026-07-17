@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -97,7 +98,21 @@ func TestCleanupDisposesTopLevelReadOnlyWorktree(t *testing.T) {
 	engine.DelegationWorktrees = manager
 
 	wt := t.TempDir()
+	hookCalled := false
+	engine.BeforeReadOnlyWorktreeCleanup = func(_ context.Context, jobID, jobType string, payload JobPayload) error {
+		hookCalled = true
+		if jobID != "local-ask-seat" || jobType != "ask" || payload.WorktreePath != wt {
+			t.Fatalf("pre-cleanup hook args: job=%q type=%q payload=%+v", jobID, jobType, payload)
+		}
+		if _, err := os.Stat(wt); err != nil {
+			t.Fatalf("worktree was absent before pre-cleanup hook: %v", err)
+		}
+		return nil
+	}
 	engine.cleanupReadOnlyDelegationWorktree(ctx, "local-ask-seat", "ask", JobPayload{WorktreePath: wt, ReadOnlyWorktree: true})
+	if !hookCalled {
+		t.Fatal("pre-cleanup hook was not called")
+	}
 	if len(manager.removedForce) != 1 || manager.removedForce[0] != wt {
 		t.Fatalf("removedForce = %+v, want one force-remove of the top-level worktree %q", manager.removedForce, wt)
 	}

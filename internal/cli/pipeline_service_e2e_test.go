@@ -4,6 +4,8 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -11,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -32,7 +35,8 @@ func TestPipelineServiceAcceptanceE2E(t *testing.T) {
 	beforeStatus := gitOutput(t, checkout, "status", "--porcelain")
 
 	const envSentinel = "GITMOOT_INPUT_COUNT=3"
-	cmd := `test "$GITMOOT_INPUT_COUNT" = "3" || exit 91; printf '%s' '{"gitmoot_result":{"decision":"approved","summary":"constant service result","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`
+	kitBytes := []byte("KIT-BYTES-1014\n")
+	cmd := `test "$GITMOOT_INPUT_COUNT" = "3" || exit 91; mkdir -p out; printf 'KIT-BYTES-%s\n' "$((1000 + 14))" > out/kit.txt; printf '%s' '{"gitmoot_result":{"decision":"approved","summary":"constant service result","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`
 	specYAML := "name: count-service\nrepo: owner/repo\nstages:\n" + pipelineE2EStage("check", cmd, "")
 	specFile := writeSpec(t, specYAML)
 	var stdout, stderr bytes.Buffer
@@ -145,6 +149,9 @@ func TestPipelineServiceAcceptanceE2E(t *testing.T) {
 	if strings.TrimSpace(payload.WorktreePath) == "" || !payload.ReadOnlyWorktree || payload.WorktreePath == checkout || !strings.HasPrefix(payload.WorktreePath, filepath.Clean(paths.Home)+string(filepath.Separator)) {
 		t.Fatalf("service shell did not use a detached home-contained worktree: %+v", payload)
 	}
+	if _, err := os.Stat(payload.WorktreePath); !os.IsNotExist(err) {
+		t.Fatalf("service stage worktree was not disposed after pre-cleanup artifact collection: %v", err)
+	}
 	if got := gitOutput(t, checkout, "rev-parse", "HEAD"); got != beforeHead {
 		t.Fatalf("primary checkout head changed: before=%s after=%s", beforeHead, got)
 	}
@@ -226,26 +233,34 @@ func TestPipelineServiceAcceptanceE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	names := make([]string, 0, len(archive.File))
-	var proofBytes []byte
+	var proofBytes, deliveredKit []byte
 	for _, file := range archive.File {
 		names = append(names, file.Name)
-		if file.Name == "proof.json" {
+		if file.Name == "proof.json" || file.Name == "artifacts/check/kit.txt" {
 			reader, err := file.Open()
 			if err != nil {
 				t.Fatal(err)
 			}
-			proofBytes, err = io.ReadAll(reader)
+			content, err := io.ReadAll(reader)
 			_ = reader.Close()
 			if err != nil {
 				t.Fatal(err)
 			}
+			if file.Name == "proof.json" {
+				proofBytes = content
+			} else {
+				deliveredKit = content
+			}
 		}
 	}
 	sort.Strings(names)
-	for _, required := range []string{"bundle.yaml", "proof.json", "spec.yaml", "verification.json"} {
+	for _, required := range []string{"artifacts/check/kit.txt", "bundle.yaml", "proof.json", "spec.yaml", "verification.json"} {
 		if !serviceContainsString(names, required) {
 			t.Fatalf("archive missing %s: %v", required, names)
 		}
+	}
+	if !bytes.Equal(deliveredKit, kitBytes) {
+		t.Fatalf("authenticated artifact bytes=%q want=%q", deliveredKit, kitBytes)
 	}
 	var manifest proof.Manifest
 	if err := json.Unmarshal(proofBytes, &manifest); err != nil {
@@ -253,6 +268,30 @@ func TestPipelineServiceAcceptanceE2E(t *testing.T) {
 	}
 	if err := proof.VerifyManifest(manifest); err != nil || manifest.ProofID != status.ProofID {
 		t.Fatalf("embedded proof invalid/mismatched: proof=%s status=%s err=%v", manifest.ProofID, status.ProofID, err)
+	}
+	kitSum := sha256.Sum256(kitBytes)
+	kitDigest := hex.EncodeToString(kitSum[:])
+	artifactNodes := 0
+	for _, node := range manifest.Nodes {
+		if string(node.Kind) != "artifact" {
+			continue
+		}
+		artifactNodes++
+		if node.Attrs["relpath"] != "artifacts/check/kit.txt" || node.Attrs["size"] != strconv.Itoa(len(kitBytes)) || node.Attrs["sha256"] != kitDigest {
+			t.Fatalf("artifact proof node=%+v", node)
+		}
+		claimFound := false
+		for _, claim := range node.Claims {
+			if claim.Type == "integrity.artifact_sha256" && claim.Grade == proof.GradeVerified {
+				claimFound = true
+			}
+		}
+		if !claimFound {
+			t.Fatalf("artifact node lacks verified digest claim: %+v", node.Claims)
+		}
+	}
+	if artifactNodes != 1 {
+		t.Fatalf("artifact proof node count=%d want=1", artifactNodes)
 	}
 	if bytes.Contains(proofBytes, []byte(envSentinel)) || bytes.Contains(proofBytes, []byte(`{"count":3}`)) || bytes.Contains(proofBytes, []byte(cmd)) {
 		t.Fatal("submitted input or shell command leaked into public proof")
@@ -275,7 +314,9 @@ func TestPipelineServiceAcceptanceE2E(t *testing.T) {
 		t.Fatalf("public receipt=%d body=%s", receiptResponse.StatusCode, readResponse(t, receiptResponse))
 	}
 	receiptBody := readResponse(t, receiptResponse)
-	if !strings.Contains(receiptBody, status.ProofID) || !strings.Contains(receiptBody, accepted.ReceiptURL+"/bundle") || strings.Contains(receiptBody, envSentinel) || strings.Contains(receiptBody, `{"count":3}`) || strings.Contains(receiptBody, cmd) {
+	if !strings.Contains(receiptBody, status.ProofID) || !strings.Contains(receiptBody, accepted.ReceiptURL+"/bundle") ||
+		!strings.Contains(receiptBody, "artifacts/check/kit.txt") || !strings.Contains(receiptBody, strconv.Itoa(len(kitBytes))) || !strings.Contains(receiptBody, kitDigest) ||
+		strings.Contains(receiptBody, string(kitBytes)) || strings.Contains(receiptBody, envSentinel) || strings.Contains(receiptBody, `{"count":3}`) || strings.Contains(receiptBody, cmd) {
 		t.Fatalf("public receipt missing proof/bundle or leaked input: %s", receiptBody)
 	}
 	publicBundle, err := http.Get(dashboard.URL + accepted.ReceiptURL + "/bundle")
@@ -285,9 +326,92 @@ func TestPipelineServiceAcceptanceE2E(t *testing.T) {
 	if publicBundle.StatusCode != http.StatusOK || !strings.Contains(publicBundle.Header.Get("Content-Disposition"), accepted.RunID) || publicBundle.Header.Get("Content-Security-Policy") == "" {
 		t.Fatalf("public bundle status/headers: status=%d headers=%v", publicBundle.StatusCode, publicBundle.Header)
 	}
-	if got := readResponseBytes(t, publicBundle); !bytes.Equal(got, bundleBytes) {
-		t.Fatal("public receipt bundle differs from authenticated bundle")
+	publicBundleBytes := readResponseBytes(t, publicBundle)
+	if bytes.Equal(publicBundleBytes, bundleBytes) {
+		t.Fatal("public sanitized bundle unexpectedly equals authenticated artifact bundle")
 	}
+	publicArchive, err := zip.NewReader(bytes.NewReader(publicBundleBytes), int64(len(publicBundleBytes)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range publicArchive.File {
+		if strings.HasPrefix(file.Name, "artifacts/") {
+			t.Fatalf("public bundle exposed artifact entry %q", file.Name)
+		}
+		reader, err := file.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		content, err := io.ReadAll(reader)
+		_ = reader.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(content, kitBytes) {
+			t.Fatalf("public bundle file %q exposed artifact bytes", file.Name)
+		}
+	}
+
+	oversizeCmd := `mkdir -p out; truncate -s 67108865 out/huge.bin; printf '%s' '{"gitmoot_result":{"decision":"approved","summary":"oversize produced","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`
+	oversizeSpec := "name: oversize-service\nrepo: owner/repo\nstages:\n" + pipelineE2EStage("build", oversizeCmd, "")
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"pipeline", "add", writeSpec(t, oversizeSpec), "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("oversize pipeline add exit=%d stderr=%s", code, stderr.String())
+	}
+	emptySchema := filepath.Join(t.TempDir(), "empty-schema.json")
+	if err := os.WriteFile(emptySchema, []byte(`{"version":1,"fields":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"pipeline", "expose", "--schema", emptySchema, "--home", home, "oversize-service"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("oversize expose exit=%d stderr=%s", code, stderr.String())
+	}
+	oversizeToken := exposeTokenFromText(t, stdout.String())
+	oversizeAcceptedResponse := serviceRequest(t, http.MethodPost, server.URL+"/v1/pipelines/oversize-service/runs", oversizeToken, `{}`)
+	if oversizeAcceptedResponse.StatusCode != http.StatusAccepted {
+		t.Fatalf("oversize POST=%d body=%s", oversizeAcceptedResponse.StatusCode, readResponse(t, oversizeAcceptedResponse))
+	}
+	var oversizeAccepted pipelineServiceAccepted
+	decodeResponse(t, oversizeAcceptedResponse, &oversizeAccepted)
+	oversizeNow := time.Now().UTC()
+	for i := 0; i < 8; i++ {
+		if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, oversizeNow.Add(time.Duration(i)*time.Second)); err != nil {
+			t.Fatalf("oversize worker tick %d: %v", i, err)
+		}
+		if err := runPipelineScanOnce(ctx, store, enqueue, oversizeNow.Add(time.Duration(i)*time.Second)); err != nil {
+			t.Fatalf("oversize pipeline scan %d: %v", i, err)
+		}
+		overRun, _, err := store.GetPipelineRun(ctx, oversizeAccepted.RunID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if overRun.State != pipeline.RunRunning {
+			break
+		}
+	}
+	overRun, ok, err := store.GetPipelineRun(ctx, oversizeAccepted.RunID)
+	if err != nil || !ok || overRun.State != pipeline.RunSucceeded {
+		t.Fatalf("oversize run did not reach succeeded before finalize: run=%+v ok=%v err=%v", overRun, ok, err)
+	}
+	oversizeStatus := serviceRequest(t, http.MethodGet, server.URL+oversizeAccepted.StatusURL, oversizeToken, "")
+	oversizeBody := readResponse(t, oversizeStatus)
+	if oversizeStatus.StatusCode != http.StatusInternalServerError || !strings.Contains(oversizeBody, `"error":"artifact_bundle_too_large"`) {
+		t.Fatalf("oversize finalize status=%d body=%s", oversizeStatus.StatusCode, oversizeBody)
+	}
+	oversizeServiceRun, ok, err := store.GetServiceRun(ctx, oversizeAccepted.RunID)
+	if err != nil || !ok || oversizeServiceRun.ArtifactRelpath != "" || oversizeServiceRun.ProofID != "" {
+		t.Fatalf("oversize finalize persisted a receipt: run=%+v ok=%v err=%v", oversizeServiceRun, ok, err)
+	}
+	oversizeReceipt, err := http.Get(dashboard.URL + oversizeAccepted.ReceiptURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oversizeReceipt.StatusCode != http.StatusNotFound {
+		t.Fatalf("oversize public receipt=%d body=%s", oversizeReceipt.StatusCode, readResponse(t, oversizeReceipt))
+	}
+	_ = readResponse(t, oversizeReceipt)
 }
 
 func TestPipelineRemoveRefusesActiveServiceRun(t *testing.T) {
