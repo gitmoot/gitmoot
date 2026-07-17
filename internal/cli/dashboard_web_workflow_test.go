@@ -260,11 +260,11 @@ func TestWebDataSourceWorkflowGroupsTreesAndPaginates(t *testing.T) {
 			{ID: "ship", Agent: "worker", Action: "ship", Deps: []string{"prep"}},
 		}},
 	}
-	mustCreateJob(t, store, db.Job{ID: "root", Agent: "lead", Type: "orchestrate", State: "succeeded", Payload: mustJSON(t, rootPayload)}, "", "")
+	mustCreateJob(t, store, db.Job{ID: "root", Agent: "lead", Type: "orchestrate", State: "succeeded", Payload: mustJSON(t, rootPayload), Model: "gpt-root"}, "", "")
 	prepPayload := workflow.JobPayload{WorkflowID: "release-42", RootJobID: "root", ParentJobID: "root", DelegationID: "prep", TaskTitle: "prepare release"}
 	mustCreateJob(t, store, db.Job{ID: "child-prep", Agent: "worker", Type: "ask", State: "succeeded", Payload: mustJSON(t, prepPayload), ParentJobID: "root", DelegationID: "prep", DelegationDepth: 1}, "", "")
 	shipPayload := workflow.JobPayload{WorkflowID: "release-42", RootJobID: "root", ParentJobID: "root", DelegationID: "ship", Deps: []string{"prep"}, Model: "sonnet"}
-	mustCreateJob(t, store, db.Job{ID: "child-ship", Agent: "worker", Type: "implement", State: "running", Payload: mustJSON(t, shipPayload), ParentJobID: "root", DelegationID: "ship", DelegationDepth: 1}, "", "")
+	mustCreateJob(t, store, db.Job{ID: "child-ship", Agent: "worker", Type: "implement", State: "running", Payload: mustJSON(t, shipPayload), Model: "sonnet", ParentJobID: "root", DelegationID: "ship", DelegationDepth: 1}, "", "")
 	singlePayload := workflow.JobPayload{WorkflowID: "release-42", TaskTitle: "standalone audit"}
 	mustCreateJob(t, store, db.Job{ID: "single", Agent: "worker", Type: "review", State: "succeeded", Payload: mustJSON(t, singlePayload)}, "", "")
 	for id, usage := range map[string][2]int{"root": {2, 3}, "child-prep": {5, 7}, "child-ship": {11, 13}, "single": {17, 19}} {

@@ -410,6 +410,16 @@ func TestDashboardCachedHandlersMatchModuleBytes(t *testing.T) {
 	if err := raw.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// The dashboard module has no JobSummary.Model field in this pane, so /api/jobs
+	// byte parity remains unchanged. The gitmoot-owned node builder must still carry
+	// the persisted model while the cached and uncached module responses match.
+	modelNode, err := (&webDataSource{home: home}).Job(context.Background(), "child-search")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if modelNode.Model != "claude-fable-5" {
+		t.Fatalf("persisted model did not reach node builder: %+v", modelNode)
+	}
 
 	cached := newDashboardWebHandler(&webDataSource{home: home, responseCache: newDashboardJSONCache(nil)})
 	uncached := dashboard.Serve(&webDataSource{home: home})

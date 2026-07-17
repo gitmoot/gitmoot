@@ -41,6 +41,7 @@ type DashboardJobSummaryRow struct {
 	Agent             string
 	Type              string
 	State             string
+	Model             string
 	Instructions      string
 	ParentJobID       string
 	DelegationDepth   int
@@ -93,7 +94,7 @@ func (s *Store) DashboardChangeCursor(ctx context.Context) (jobEventID, workflow
 // parser tolerated by returning an empty payload.
 func (s *Store) ListDashboardJobSummaries(ctx context.Context) ([]DashboardJobSummaryRow, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT
-		j.id, j.agent, j.type, j.state,
+		j.id, j.agent, j.type, j.state, j.model,
 		CASE WHEN json_valid(j.payload) AND json_type(j.payload, '$.instructions') = 'text'
 			THEN json_extract(j.payload, '$.instructions') ELSE '' END,
 		j.parent_job_id, j.delegation_depth, COALESCE(a.runtime, ''),
@@ -116,7 +117,7 @@ func (s *Store) ListDashboardJobSummaries(ctx context.Context) ([]DashboardJobSu
 	for rows.Next() {
 		var item DashboardJobSummaryRow
 		if err := rows.Scan(
-			&item.ID, &item.Agent, &item.Type, &item.State, &item.Instructions,
+			&item.ID, &item.Agent, &item.Type, &item.State, &item.Model, &item.Instructions,
 			&item.ParentJobID, &item.DelegationDepth, &item.RegisteredRuntime,
 			&item.EphemeralRuntime, &item.Repo, &item.PullRequest,
 			&item.InputTokens, &item.OutputTokens, &item.UpdatedAt, &item.CreatedAt,

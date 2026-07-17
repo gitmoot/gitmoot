@@ -227,9 +227,9 @@ func TestEffectiveModelResolutionOrder(t *testing.T) {
 		{"rt default trimmed", "", "", "  gpt-5.5  ", "gpt-5.5"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := effectiveModel(Agent{Model: tc.agentModel}, Job{Model: tc.jobModel, RuntimeDefaultModel: tc.rtDefault})
+			got := EffectiveModel(Agent{Model: tc.agentModel}, Job{Model: tc.jobModel, RuntimeDefaultModel: tc.rtDefault})
 			if got != tc.want {
-				t.Fatalf("effectiveModel(agent=%q, job=%q, rtDefault=%q) = %q, want %q", tc.agentModel, tc.jobModel, tc.rtDefault, got, tc.want)
+				t.Fatalf("EffectiveModel(agent=%q, job=%q, rtDefault=%q) = %q, want %q", tc.agentModel, tc.jobModel, tc.rtDefault, got, tc.want)
 			}
 		})
 	}

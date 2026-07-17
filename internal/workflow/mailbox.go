@@ -511,10 +511,46 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		DelegationDepth: request.DelegationDepth,
 		DelegatedBy:     request.DelegatedBy,
 	}
+	job.Model, err = m.resolveEnqueueModel(ctx, request)
+	if err != nil {
+		return db.Job{}, err
+	}
 	if err := m.Store.CreateJobWithEvent(ctx, job, db.JobEvent{JobID: job.ID, Kind: string(JobQueued), Message: "job queued"}); err != nil {
 		return db.Job{}, err
 	}
 	return job, nil
+}
+
+// resolveEnqueueModel snapshots the model selected for this job at the enqueue
+// chokepoint. It deliberately mirrors delivery: the job override wins, then the
+// effective agent's model, then that effective runtime's registry default. A
+// runtime override changes the runtime and clears the registered model because
+// that model belongs to the agent's original runtime. Ephemeral workers have no
+// agent row, so their inline runtime/model spec is their effective agent config.
+func (m Mailbox) resolveEnqueueModel(ctx context.Context, request JobRequest) (string, error) {
+	agent := runtime.Agent{}
+	if request.Ephemeral != nil {
+		agent.Runtime = strings.TrimSpace(request.Ephemeral.Runtime)
+		agent.Model = request.Ephemeral.Model
+	} else {
+		stored, err := m.Store.GetAgent(ctx, request.Agent)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+		if err == nil {
+			agent.Runtime = stored.Runtime
+			agent.Model = stored.Model
+		}
+	}
+	agent = runtime.ApplyJobRuntimeOverride(agent, request.RuntimeOverride, request.RuntimeOverrideRef)
+	runtimeDefaultModel := ""
+	if m.RuntimeDefaultModel != nil {
+		runtimeDefaultModel = m.RuntimeDefaultModel(strings.TrimSpace(agent.Runtime))
+	}
+	return runtime.EffectiveModel(agent, runtime.Job{
+		Model:               request.Model,
+		RuntimeDefaultModel: runtimeDefaultModel,
+	}), nil
 }
 
 func (m Mailbox) templateSnapshot(ctx context.Context, agentName string) (db.AgentTemplate, error) {
@@ -1109,7 +1145,7 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		ShellUpstreamContext: payload.ShellUpstreamContext,
 	}
 	// #652: thread in the runtime's configured registry default_model as the FINAL
-	// model fallback. effectiveModel applies the precedence (job.Model > agent.Model
+	// model fallback. EffectiveModel applies the precedence (job.Model > agent.Model
 	// > this default), so an agent/job --model always wins; a nil hook or empty
 	// default forces nothing and is byte-identical. Resolved for the agent's
 	// EFFECTIVE runtime, so a #531 per-job runtime override picks up the override

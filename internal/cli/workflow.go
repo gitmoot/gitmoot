@@ -1157,7 +1157,7 @@ func enqueueTaskRunImplementJob(ctx context.Context, store *db.Store, task db.Ta
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return db.Job{}, err
 	}
-	return (workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(home)}).Enqueue(ctx, request)
+	return (workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(home), RuntimeDefaultModel: runtimeDefaultModelResolver(home)}).Enqueue(ctx, request)
 }
 
 func findActiveTaskRunJob(ctx context.Context, store *db.Store, request workflow.JobRequest) (db.Job, bool, error) {

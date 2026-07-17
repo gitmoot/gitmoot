@@ -52,7 +52,7 @@ type pipelineAutoMergeExecutor interface {
 // indistinguishable from a normal background job once enqueued (the runner agent
 // carries no template, so canary never actually samples).
 func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueuer {
-	mailbox := workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(home)}
+	mailbox := workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(home), RuntimeDefaultModel: runtimeDefaultModelResolver(home)}
 	return func(ctx context.Context, request workflow.JobRequest) (db.Job, error) {
 		// #757 read-only isolation: a repo-bound AGENT stage (ask/review) is born
 		// with its OWN detached committed-tip worktree (the #739 shape) so it keys

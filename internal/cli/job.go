@@ -1220,6 +1220,11 @@ func printJob(stdout io.Writer, job db.Job, payload workflow.JobPayload, reason 
 	}
 	fmt.Fprintf(stdout, "type: %s\n", job.Type)
 	fmt.Fprintf(stdout, "agent: %s\n", job.Agent)
+	model := strings.TrimSpace(job.Model)
+	if model == "" {
+		model = "-"
+	}
+	fmt.Fprintf(stdout, "model: %s\n", model)
 	if payload.WorkflowID != "" {
 		fmt.Fprintf(stdout, "workflow: %s\n", payload.WorkflowID)
 	}
@@ -1287,21 +1292,14 @@ func transcriptStyleTerminal(w io.Writer) bool {
 
 // transcriptHeader assembles the orientation block shown before a transcript:
 // job action, agent, runtime/model, workflow label, and the (capped, redacted)
-// prompt. Model resolution mirrors dispatch: per-job override first, then the
-// agent's registered default; empty stays empty rather than guessing a runtime
-// default. Agent-registry lookup is best-effort — ephemeral workers have no row.
+// prompt. Model comes from the durable enqueue-time snapshot on the job row;
+// mutable agent/runtime defaults are never re-read for historical jobs.
 func transcriptHeader(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload, runtimeName string) transcript.Header {
-	model := strings.TrimSpace(payload.Model)
-	if model == "" {
-		if agent, err := store.GetAgent(ctx, job.Agent); err == nil {
-			model = strings.TrimSpace(agent.Model)
-		}
-	}
 	return transcript.Header{
 		Action:   job.Type,
 		Agent:    job.Agent,
 		Runtime:  runtimeName,
-		Model:    model,
+		Model:    strings.TrimSpace(job.Model),
 		Workflow: job.WorkflowID,
 		Prompt:   payload.Instructions,
 	}

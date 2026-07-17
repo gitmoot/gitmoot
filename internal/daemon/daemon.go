@@ -2009,7 +2009,11 @@ func (d Daemon) enqueueJob(ctx context.Context, request workflow.JobRequest) (db
 	// (and its regression comparator) is gated on, so a stranded canary is never
 	// sampled once the knob is off. The engine carries the resolved flag.
 	canaryEnabled := d.Workflow != nil && d.Workflow.CanaryEnabled
-	job, err := (workflow.Mailbox{Store: d.Store, CanaryEnabled: canaryEnabled}).Enqueue(ctx, request)
+	var runtimeDefaultModel func(string) string
+	if d.Workflow != nil {
+		runtimeDefaultModel = d.Workflow.RuntimeDefaultModel
+	}
+	job, err := (workflow.Mailbox{Store: d.Store, CanaryEnabled: canaryEnabled, RuntimeDefaultModel: runtimeDefaultModel}).Enqueue(ctx, request)
 	return job, true, err
 }
 

@@ -528,14 +528,11 @@ func buildDashboardWorkflowRuns(jobs []db.Job, runtimeByAgent map[string]string,
 				ID: job.ID, ParentID: strings.TrimSpace(job.ParentJobID), Deps: deps,
 				Title: nodeTitle(payload, job, action), Agent: job.Agent,
 				Runtime: resolveJobRuntime(job, payload, runtimeByAgent),
-				Model:   strings.TrimSpace(payload.Model), State: mapNodeState(job.State),
+				Model:   strings.TrimSpace(job.Model), State: mapNodeState(job.State),
 				StartedAt: parseJobTimeMillis(job.CreatedAt),
 			}
 			if node.ParentID == "" {
 				node.ParentID = strings.TrimSpace(payload.ParentJobID)
-			}
-			if node.Model == "" && payload.Ephemeral != nil {
-				node.Model = strings.TrimSpace(payload.Ephemeral.Model)
 			}
 			if workflow.IsFinalJobState(strings.TrimSpace(job.State)) {
 				node.EndedAt = parseJobTimeMillis(job.UpdatedAt)
@@ -1940,13 +1937,10 @@ func buildDashboardNode(job db.Job, payload workflow.JobPayload, events []db.Job
 		Title:    nodeTitle(payload, job, action),
 		Agent:    job.Agent,
 		Runtime:  resolveJobRuntime(job, payload, runtimeByAgent),
-		Model:    strings.TrimSpace(payload.Model),
+		Model:    strings.TrimSpace(job.Model),
 		State:    mapNodeState(job.State),
 		Depth:    job.DelegationDepth,
 		Events:   []dashboard.Event{},
-	}
-	if node.Model == "" && payload.Ephemeral != nil {
-		node.Model = strings.TrimSpace(payload.Ephemeral.Model)
 	}
 	if payload.PullRequest > 0 && strings.TrimSpace(payload.Repo) != "" {
 		node.PRURL = fmt.Sprintf("https://github.com/%s/pull/%d", payload.Repo, payload.PullRequest)

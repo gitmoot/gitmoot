@@ -27,19 +27,17 @@ func (m Mailbox) recordRoutingTelemetry(ctx context.Context, job db.Job, agent r
 	if m.Store == nil {
 		return
 	}
-	// Mirror deliver()'s effective-model precedence (job.Model > agent.Model >
-	// runtime registry default_model, #652) so the recorded model dimension matches
-	// the model the delivery ACTUALLY ran on. Without the final fallback a job with
-	// no --model/agent.Model but a configured [runtimes.<rt>].default_model would
-	// record an empty bucket even though delivery used that default, mislabeling the
-	// observation as "default"/"-" and splitting the telemetry buckets.
-	model := strings.TrimSpace(payload.Model)
-	if model == "" {
-		model = strings.TrimSpace(agent.Model)
+	// Use the delivery resolver so telemetry cannot drift from the runtime's model
+	// precedence. Inputs are trimmed here to preserve this advisory surface's
+	// historical normalization behavior.
+	runtimeDefaultModel := ""
+	if m.RuntimeDefaultModel != nil {
+		runtimeDefaultModel = m.RuntimeDefaultModel(strings.TrimSpace(agent.Runtime))
 	}
-	if model == "" && m.RuntimeDefaultModel != nil {
-		model = strings.TrimSpace(m.RuntimeDefaultModel(strings.TrimSpace(agent.Runtime)))
-	}
+	model := runtime.EffectiveModel(
+		runtime.Agent{Model: strings.TrimSpace(agent.Model)},
+		runtime.Job{Model: strings.TrimSpace(payload.Model), RuntimeDefaultModel: runtimeDefaultModel},
+	)
 	durationMS := duration.Milliseconds()
 	if durationMS < 0 {
 		durationMS = 0

@@ -28,6 +28,7 @@ func TestRunJobListShowEventsRetryCancel(t *testing.T) {
 		Agent:   "audit",
 		Type:    "ask",
 		State:   string(workflow.JobFailed),
+		Model:   "gpt-5.6-sol",
 		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Branch: "main", PullRequest: 7, RawOutputs: []string{"raw"}}),
 	}, "failed")
 	seedCLIJob(t, store, db.Job{
@@ -53,10 +54,34 @@ func TestRunJobListShowEventsRetryCancel(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("job show exit code = %d, stderr=%s", code, stderr.String())
 	}
-	for _, want := range []string{"id: job-failed", "state: failed", "repo: owner/repo", "raw_outputs: 1 retained locally"} {
+	for _, want := range []string{"id: job-failed", "state: failed", "model: gpt-5.6-sol", "repo: owner/repo", "raw_outputs: 1 retained locally"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("job show missing %q:\n%s", want, stdout.String())
 		}
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"job", "show", "job-failed", "--home", home, "--json"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("job show --json exit code = %d, stderr=%s", code, stderr.String())
+	}
+	var shown jobShowOutput
+	if err := json.Unmarshal(stdout.Bytes(), &shown); err != nil {
+		t.Fatalf("decode job show --json: %v\n%s", err, stdout.String())
+	}
+	if shown.Job.Model != "gpt-5.6-sol" {
+		t.Fatalf("job show --json model = %q, want gpt-5.6-sol", shown.Job.Model)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"job", "show", "job-queued", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("empty-model job show exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "model: -") {
+		t.Fatalf("empty-model job show output missing model placeholder:\n%s", stdout.String())
 	}
 
 	stdout.Reset()
@@ -984,18 +1009,22 @@ func TestTranscriptHeaderModelResolution(t *testing.T) {
 	if err := store.UpsertAgent(context.Background(), db.Agent{Name: "modeled", Runtime: runtime.CodexRuntime, Model: "gpt-5.5"}); err != nil {
 		t.Fatal(err)
 	}
-	job := db.Job{ID: "hdr", Type: "ask", Agent: "modeled", WorkflowID: "wf"}
+	job := db.Job{ID: "hdr", Type: "ask", Agent: "modeled", WorkflowID: "wf", Model: "gpt-5.6-sol"}
 	h := transcriptHeader(context.Background(), store, job, workflow.JobPayload{Model: "gpt-5.4", Instructions: "prompt text"}, runtime.CodexRuntime)
-	if h.Model != "gpt-5.4" || h.Action != "ask" || h.Workflow != "wf" || h.Prompt != "prompt text" {
-		t.Fatalf("override header = %+v", h)
+	if h.Model != "gpt-5.6-sol" || h.Action != "ask" || h.Workflow != "wf" || h.Prompt != "prompt text" {
+		t.Fatalf("persisted-model header = %+v", h)
+	}
+	// Mutable agent config must not rewrite the historical transcript header.
+	if err := store.UpsertAgent(context.Background(), db.Agent{Name: "modeled", Runtime: runtime.CodexRuntime, Model: "new-agent-default"}); err != nil {
+		t.Fatal(err)
 	}
 	h = transcriptHeader(context.Background(), store, job, workflow.JobPayload{}, runtime.CodexRuntime)
-	if h.Model != "gpt-5.5" {
-		t.Fatalf("registry model = %q, want gpt-5.5", h.Model)
+	if h.Model != "gpt-5.6-sol" {
+		t.Fatalf("model after agent mutation = %q, want persisted gpt-5.6-sol", h.Model)
 	}
-	eph := db.Job{ID: "hdr2", Type: "ask", Agent: "no-row"}
+	eph := db.Job{ID: "hdr2", Type: "ask", Agent: "no-row", Model: "k3"}
 	h = transcriptHeader(context.Background(), store, eph, workflow.JobPayload{}, runtime.KimiRuntime)
-	if h.Model != "" {
-		t.Fatalf("ephemeral model = %q, want empty", h.Model)
+	if h.Model != "k3" {
+		t.Fatalf("ephemeral model = %q, want k3", h.Model)
 	}
 }

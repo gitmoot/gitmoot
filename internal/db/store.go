@@ -258,11 +258,15 @@ type Comment struct {
 }
 
 type Job struct {
-	ID              string
-	Agent           string
-	Type            string
-	State           string
-	Payload         string
+	ID      string
+	Agent   string
+	Type    string
+	State   string
+	Payload string
+	// Model is the durable model selected when the job was enqueued. Unlike the
+	// payload's per-job override, it also snapshots agent and runtime defaults so
+	// historical jobs do not change when mutable configuration changes.
+	Model           string
 	ParentJobID     string
 	DelegationID    string
 	DelegationDepth int
@@ -2765,9 +2769,9 @@ func (s *Store) CreateJob(ctx context.Context, job Job) error {
 	// the invariant — payload root when set, else self-root — holds regardless of
 	// caller. payload.RootJobID stays the value source of truth.
 	projection := jobProjectionFromPayload(job.Payload)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-		job.ID, job.Agent, job.Type, job.State, job.Payload,
+	_, err := s.db.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, model, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		job.ID, job.Agent, job.Type, job.State, job.Payload, job.Model,
 		jobResultHashFromPayload(job.Payload),
 		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy,
 		rootIDFromPayload(job.Payload), job.ID, projection.WorkflowID, projection.Repo, projection.PullRequest,
@@ -2785,9 +2789,9 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent)
 	// See CreateJob: same COALESCE(NULLIF(?,''), ?) bound to (payload.RootJobID,
 	// job.ID) denormalizes the rootJobID() rule onto the indexed root_id column.
 	projection := jobProjectionFromPayload(job.Payload)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-		job.ID, job.Agent, job.Type, job.State, job.Payload,
+	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, model, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		job.ID, job.Agent, job.Type, job.State, job.Payload, job.Model,
 		jobResultHashFromPayload(job.Payload),
 		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy,
 		rootIDFromPayload(job.Payload), job.ID, projection.WorkflowID, projection.Repo, projection.PullRequest,
@@ -2819,9 +2823,9 @@ func (s *Store) CreateExternallyDrivenJobWithEvent(ctx context.Context, job Job,
 	defer tx.Rollback()
 
 	projection := jobProjectionFromPayload(job.Payload)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, externally_driven, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)`,
-		job.ID, job.Agent, job.Type, job.State, job.Payload,
+	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, model, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, externally_driven, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)`,
+		job.ID, job.Agent, job.Type, job.State, job.Payload, job.Model,
 		jobResultHashFromPayload(job.Payload),
 		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy,
 		rootIDFromPayload(job.Payload), job.ID, projection.WorkflowID, projection.Repo, projection.PullRequest,
@@ -2875,9 +2879,9 @@ func (s *Store) IsRootJobKilled(ctx context.Context, rootID string) (bool, error
 }
 
 func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, workflow_id, root_killed, input_tokens, output_tokens, updated_at, created_at, externally_driven FROM jobs WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, workflow_id, root_killed, input_tokens, output_tokens, updated_at, created_at, externally_driven FROM jobs WHERE id = ?`, id)
 	var job Job
-	if err := row.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.WorkflowID, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ExternallyDriven); err != nil {
+	if err := row.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.WorkflowID, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ExternallyDriven); err != nil {
 		return Job{}, err
 	}
 	return job, nil
@@ -2886,7 +2890,7 @@ func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
 // jobColumns is the shared core projection ListJobs and ListJobsByType both
 // read, kept as one const so their SELECT lists and scanJobs order cannot drift.
 // Workflow-only scalar projections are selected by ListJobsByWorkflow.
-const jobColumns = `id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, workflow_id, root_killed, input_tokens, output_tokens, updated_at, created_at, externally_driven`
+const jobColumns = `id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, workflow_id, root_killed, input_tokens, output_tokens, updated_at, created_at, externally_driven`
 
 // scanJobs reads every row of a *sql.Rows produced by a `SELECT `+jobColumns+`
 // FROM jobs …` query into Jobs, in jobColumns order, and closes rows. Shared by
@@ -2896,7 +2900,7 @@ func scanJobs(rows *sql.Rows) ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.WorkflowID, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ExternallyDriven); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.WorkflowID, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ExternallyDriven); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -2954,7 +2958,7 @@ func (s *Store) ListJobsByType(ctx context.Context, jobType string) ([]Job, erro
 // id for a stable tree. It selects updated_at like ListJobs so callers can show
 // child age; the idx_jobs_parent_job_id index backs the filter.
 func (s *Store) ListJobsByParent(ctx context.Context, parentJobID string) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, updated_at
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, updated_at
 		FROM jobs WHERE parent_job_id = ? ORDER BY delegation_id, id`, parentJobID)
 	if err != nil {
 		return nil, err
@@ -2964,7 +2968,7 @@ func (s *Store) ListJobsByParent(ctx context.Context, parentJobID string) ([]Job
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -2979,7 +2983,7 @@ func (s *Store) ListJobsByParent(ctx context.Context, parentJobID string) ([]Job
 // idx_jobs_root_id for an indexed lookup instead of a full-table scan that
 // unmarshals every payload. ORDER BY id is deterministic.
 func (s *Store) ListJobsByRoot(ctx context.Context, rootID string) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, root_killed, input_tokens, output_tokens, updated_at
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, root_killed, input_tokens, output_tokens, updated_at
 		FROM jobs WHERE root_id = ? ORDER BY id`, rootID)
 	if err != nil {
 		return nil, err
@@ -2989,7 +2993,7 @@ func (s *Store) ListJobsByRoot(ctx context.Context, rootID string) ([]Job, error
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootID, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootID, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -3023,7 +3027,7 @@ func (s *Store) SumJobTokensByRoot(ctx context.Context, rootID string) (int, err
 // so the plan test (TestListQueuedJobsUsesQueuedIndex) can EXPLAIN QUERY PLAN the
 // PRODUCTION text rather than a hand-copied duplicate — a change to this query is then
 // what the test actually asserts a plan for.
-const listQueuedJobsSQL = `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens
+const listQueuedJobsSQL = `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens
 		FROM jobs WHERE state = 'queued' AND externally_driven = 0 ORDER BY created_at, rowid`
 
 // ListQueuedJobs returns the queued jobs in created_at (then rowid) order. The
@@ -3051,7 +3055,7 @@ func (s *Store) ListQueuedJobs(ctx context.Context) ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -3079,7 +3083,7 @@ func (s *Store) CountQueuedJobsForRepo(ctx context.Context, repo string) (int, e
 // must never time it out and requeue it (which would try to Deliver work the
 // engine never owned). Engine-driven jobs default externally_driven = 0, so their
 // reaping is byte-identical.
-const listRunningJobsUpdatedBeforeSQL = `SELECT id, agent, type, state, payload, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens
+const listRunningJobsUpdatedBeforeSQL = `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens
 		FROM jobs WHERE state = 'running' AND externally_driven = 0 AND updated_at < ? ORDER BY updated_at`
 
 // ListRunningJobsUpdatedBefore returns the running jobs whose updated_at predates
@@ -3104,7 +3108,7 @@ func (s *Store) ListRunningJobsUpdatedBefore(ctx context.Context, before time.Ti
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -9253,5 +9257,11 @@ CREATE TABLE memory_events (
 );
 CREATE INDEX idx_memory_events_at ON memory_events(at);
 CREATE INDEX idx_memory_events_memory_id ON memory_events(memory_id);
+	`,
+	// #998 P1 durable enqueue-time model snapshot. Existing jobs honestly remain
+	// unknown; every mailbox-created job writes the selected override, agent
+	// default, or runtime default into this additive scalar column.
+	`
+ALTER TABLE jobs ADD COLUMN model TEXT NOT NULL DEFAULT '';
 	`,
 }

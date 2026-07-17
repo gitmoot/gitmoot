@@ -55,8 +55,8 @@ func seedWebDashboardTree(t *testing.T, home string) {
 	}
 	mustCreateJob(t, store, db.Job{ID: "coord", Agent: "project-lead", Type: "orchestrate", State: "succeeded", Payload: mustJSON(t, coordPayload)}, "delegation_enqueued", "fanned out 2 delegations")
 
-	searchPayload := workflow.JobPayload{Repo: "jerryfane/noted", TaskTitle: "implement: search", PullRequest: 12}
-	mustCreateJob(t, store, db.Job{ID: "child-search", Agent: "builder", Type: "implement", State: "succeeded", Payload: mustJSON(t, searchPayload), ParentJobID: "coord", DelegationID: "d-search", DelegationDepth: 1}, "worker_started", "picked up d-search")
+	searchPayload := workflow.JobPayload{Repo: "jerryfane/noted", TaskTitle: "implement: search", PullRequest: 12, Model: "payload-override-is-not-history"}
+	mustCreateJob(t, store, db.Job{ID: "child-search", Agent: "builder", Type: "implement", State: "succeeded", Payload: mustJSON(t, searchPayload), Model: "claude-fable-5", ParentJobID: "coord", DelegationID: "d-search", DelegationDepth: 1}, "worker_started", "picked up d-search")
 
 	exportPayload := workflow.JobPayload{Repo: "jerryfane/noted", TaskTitle: "implement: export"}
 	mustCreateJob(t, store, db.Job{ID: "child-export", Agent: "builder", Type: "implement", State: "running", Payload: mustJSON(t, exportPayload), ParentJobID: "coord", DelegationID: "d-export", DelegationDepth: 1}, "worker_started", "picked up d-export")
@@ -161,6 +161,9 @@ func TestWebDataSourceBuildsGraphFromStore(t *testing.T) {
 	}
 	if search.Runtime != "claude" {
 		t.Fatalf("child-search runtime = %q, want claude", search.Runtime)
+	}
+	if search.Model != "claude-fable-5" {
+		t.Fatalf("child-search model = %q, want persisted claude-fable-5", search.Model)
 	}
 	if search.State != "succeeded" {
 		t.Fatalf("child-search state = %q, want succeeded", search.State)
@@ -654,6 +657,15 @@ func TestWebDataSourceJobs(t *testing.T) {
 	if search.TokensIn != 2000 || search.TokensOut != 500 {
 		t.Errorf("child-search tokens = (%d,%d), want (2000,500)", search.TokensIn, search.TokensOut)
 	}
+	// JobSummary has no model field until the dashboard-module handoff lands, but
+	// the gitmoot-owned detail builder must already source the durable column.
+	node, err := ds.Job(context.Background(), "child-search")
+	if err != nil {
+		t.Fatalf("Job(child-search): %v", err)
+	}
+	if node.Model != "claude-fable-5" {
+		t.Fatalf("Job(child-search).Model = %q, want persisted claude-fable-5", node.Model)
+	}
 	wantStart := parseJobTimeMillis("2026-05-23 10:05:00")
 	wantUpdated := parseJobTimeMillis("2026-05-23 10:30:00")
 	if search.Started != wantStart || search.Updated != wantUpdated {
@@ -691,7 +703,7 @@ func TestWebDataSourceJobsEphemeralRuntime(t *testing.T) {
 	}
 	if err := store.CreateJob(context.Background(), db.Job{
 		ID: "eph-job", Agent: "task-9-ephemeral-abc123", Type: "implement",
-		State: "running", Payload: mustJSON(t, ephPayload),
+		State: "running", Payload: mustJSON(t, ephPayload), Model: "k3",
 	}); err != nil {
 		t.Fatalf("CreateJob: %v", err)
 	}
@@ -708,6 +720,13 @@ func TestWebDataSourceJobsEphemeralRuntime(t *testing.T) {
 	}
 	if eph.Runtime != "kimi" {
 		t.Fatalf("ephemeral runtime = %q, want kimi (from payload spec)", eph.Runtime)
+	}
+	node, err := ds.Job(context.Background(), "eph-job")
+	if err != nil {
+		t.Fatalf("Job(eph-job): %v", err)
+	}
+	if node.Model != "k3" {
+		t.Fatalf("ephemeral node model = %q, want persisted k3", node.Model)
 	}
 }
 

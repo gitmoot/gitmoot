@@ -139,7 +139,7 @@ func (a KimiAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result,
 		return Result{}, err
 	}
 	args := kimiPermissionArgs(agent)
-	model := effectiveModel(agent, job)
+	model := EffectiveModel(agent, job)
 	if model != "" {
 		args = append(args, "--model", model)
 	}
@@ -255,7 +255,7 @@ func (a KimiCLIAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Resu
 		return Result{}, err
 	}
 	defer cleanup()
-	result, err := runAgentCommand(ctx, a.runner(), a.Dir, job.AgentEnv, "kimi", kimiCLIPromptArgs(agent, effectiveModel(agent, job), promptArg, extraArgs)...)
+	result, err := runAgentCommand(ctx, a.runner(), a.Dir, job.AgentEnv, "kimi", kimiCLIPromptArgs(agent, EffectiveModel(agent, job), promptArg, extraArgs)...)
 	if err != nil {
 		return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, "")}, kimiCommandError(result, err)
 	}
