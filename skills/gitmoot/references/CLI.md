@@ -1350,6 +1350,7 @@ gitmoot lock show owner/repo <branch>
 ```sh
 gitmoot proof <root-id>
 gitmoot proof --json <root-id>
+gitmoot proof --verify <service-run-id>
 # As with other Go-flag commands, place --home before the positional root id:
 gitmoot proof --home /tmp/isolated-home <root-id>
 ```
@@ -1375,8 +1376,13 @@ is future work. The headline grade tally excludes `integrity.*` meta-claims and
 reports those separately on the `integrity:` line. The command never parses
 transcripts, contacts GitHub, or mutates store data.
 
-Remote `--verify`/CI upgrades and a dashboard proof view are future work and are
-not flags or surfaces in the core command. See [RESULT_CONTRACT.md](RESULT_CONTRACT.md)
+For a succeeded service pipeline run, `--verify` performs an **offline,
+store-only** outcome check: the run succeeded, all stages succeeded/skipped,
+each jobful stage has its expected terminal structured result, no failed or
+blocked job tail remains, result hashes match, and the projected manifest DAG
+verifies. It records `stored_pipeline_outcome`; it never reruns commands, queries
+CI/GitHub, or upgrades reported test claims. Remote CI upgrades remain future
+work. See [RESULT_CONTRACT.md](RESULT_CONTRACT.md)
 for the structured result and delegation inputs, and [SAFETY.md](SAFETY.md) for
 the read-only and bounded-DAG safety contracts.
 
@@ -2759,11 +2765,51 @@ gitmoot pipeline show nightly-sync [--json]        # registry view for a name
 gitmoot pipeline bind-trigger nightly-sync         # create/re-sync owned AP flow
 gitmoot pipeline run nightly-sync                  # start a manual run; prints the run id
 gitmoot pipeline show <run-id> [--json]            # run funnel for a "prun-…" id
+gitmoot pipeline expose --schema schema.json <name> # issue one bearer token (shown once)
+gitmoot pipeline serve                              # loopback API on 127.0.0.1:8792
 gitmoot pipeline resume <run-id> [--from <stage>]
 gitmoot pipeline cancel <run-id>
 gitmoot pipeline enable|disable nightly-sync
 gitmoot pipeline remove nightly-sync
 ```
+
+### Expose a shell pipeline as a service
+
+Service exposure is explicit and v1 accepts only shell-only, template-free
+pipelines. Define a bounded flat schema, expose the pipeline, then run the
+separate authenticated listener:
+
+```json
+{"version":1,"fields":{"count":{"type":"integer","required":true,"minimum":1,"maximum":5}}}
+```
+
+```sh
+gitmoot pipeline expose --schema schema.json nightly-sync
+gitmoot pipeline serve # --addr defaults to 127.0.0.1:8792
+```
+
+The exposure command stores only the SHA-256 token digest and prints the
+base64url bearer token once. `--disable` blocks new POSTs but does **not** revoke
+read/poll access to already accepted runs; use `--rotate-token` to revoke the old
+bearer credential. The API accepts
+`POST /v1/pipelines/<name>/runs` and exposes authenticated status/bundle reads at
+`/v1/pipelines/runs/<id>`. Inputs are schema-validated and delivered only as
+reserved `GITMOOT_INPUT_*` environment variables, never prompt text. Admission
+is atomic (rate bucket, global cap, per-pipeline overlap, run/stages/receipt),
+uses unpredictable 128-bit run ids, and every service shell stage runs in a
+fail-closed detached worktree. Service exposure rejects any stage that declares
+`env_keys`, network access, or extra read/write authority.
+
+On the first authenticated GET after success, Gitmoot freezes an archive with
+the accepted #941 bundle plus `proof.json` and `verification.json`. The public,
+read-only `/receipts/<id>` page and `/receipts/<id>/bundle` download disclose
+only the pipeline outcome, sanitized proof tree, proof id, and archive digest —
+never bearer tokens, inputs, prompts, logs, or raw result text. The downloadable
+frozen #941 bundle intentionally includes the full shell command bodies and
+referenced environment-variable names from the pipeline spec. Never inline a
+secret literal in `cmd`; an `env_keys`-bearing pipeline cannot be exposed at all.
+Public capability receipt URLs remain public after token rotation. Use
+`--allow-remote` only behind owner-controlled TLS/firewall policy.
 
 ### Export and import a pipeline bundle
 

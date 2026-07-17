@@ -92,6 +92,11 @@ func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	mux.HandleFunc("GET /api/brain/fact", ds.handleBrainFact)
 	// #958 single-label detail widening (no module cache policy for this route).
 	mux.HandleFunc("GET /api/workflow/{label}", ds.handleWorkflowAPI)
+	// Public pipeline receipts are deliberately narrow, read-only projections of
+	// already-finalized verified archives. Register them before the dashboard
+	// module fallback so no /api or module behavior changes.
+	mux.HandleFunc("GET /receipts/{id}", ds.handlePipelineReceipt)
+	mux.HandleFunc("GET /receipts/{id}/bundle", ds.handlePipelineReceiptBundle)
 	mux.Handle("/", dashboard.Serve(ds))
 	return mux
 }

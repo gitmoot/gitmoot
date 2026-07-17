@@ -90,3 +90,20 @@ func TestPipelineTriggerContextReachesEveryAgentStageAndShellUsesEnv(t *testing.
 		t.Fatalf("empty payload changed prompt: %q", empty.Instructions)
 	}
 }
+
+func TestServicePipelinePayloadNeverProjectsIntoStagePromptOrLegacyTriggerEnv(t *testing.T) {
+	const sentinel = "SERVICE_SENTINEL_MUST_STAY_TYPED"
+	run := db.PipelineRun{ID: "prun-service", Trigger: "service", PayloadJSON: `{"app_name":"` + sentinel + `"}`}
+	rec := db.Pipeline{Name: "kit", Repo: "owner/repo"}
+	agent := pipelineStageJobRequest(rec, pipeline.Stage{ID: "agent", Agent: "a", Action: "ask", Prompt: "Build the kit."}, run, 0, "", pipelineStagePRBinding{}, false)
+	if strings.Contains(agent.Instructions, sentinel) || agent.Instructions != "Build the kit." {
+		t.Fatalf("service payload entered agent instructions: %q", agent.Instructions)
+	}
+	shell := pipelineStageJobRequest(rec, pipeline.Stage{ID: "shell", Cmd: "printf ok"}, run, 0, "", pipelineStagePRBinding{}, false)
+	if strings.Contains(strings.Join(shell.ShellEnv, "\n"), sentinel) {
+		t.Fatalf("service payload entered legacy trigger env: %#v", shell.ShellEnv)
+	}
+	if shell.RuntimeOverrideRef != "printf ok" {
+		t.Fatalf("service payload changed shell command: %q", shell.RuntimeOverrideRef)
+	}
+}

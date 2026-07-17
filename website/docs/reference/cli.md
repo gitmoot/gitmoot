@@ -1978,11 +1978,37 @@ gitmoot pipeline show nightly-sync [--json]        # registry view for a name
 gitmoot pipeline bind-trigger nightly-sync         # create/re-sync owned AP flow
 gitmoot pipeline run nightly-sync                  # start a manual run; prints the run id
 gitmoot pipeline show <run-id> [--json]            # run funnel for a "prun-…" id
+gitmoot pipeline expose --schema schema.json <name>
+gitmoot pipeline serve [--addr 127.0.0.1:8792] [--allow-remote]
 gitmoot pipeline resume <run-id> [--from <stage>]
 gitmoot pipeline cancel <run-id>
 gitmoot pipeline enable|disable nightly-sync
 gitmoot pipeline remove nightly-sync
 ```
+
+### Service API and offline proof
+
+`pipeline expose` opts a shell-only, template-free pipeline into a bounded flat
+input schema and prints its base64url bearer token once; only the SHA-256 digest
+is stored. `pipeline serve` is a separate authenticated listener, loopback-only
+by default. Valid typed inputs reach stages only as reserved
+`GITMOOT_INPUT_*` environment variables in fail-closed detached worktrees.
+Stages declaring `env_keys`, network access, or extra read/write authority are
+rejected.
+Admission atomically applies rate/concurrency limits and creates an unpredictable
+128-bit run id.
+
+After success, an authenticated status GET finalizes the frozen pipeline bundle
+with `proof.json` and `verification.json`. `gitmoot proof --verify
+<service-run-id>` checks the persisted run/stage/job/result-hash relationships
+offline; it does not rerun commands, query CI, or promote reported tests. The
+public `/receipts/<run-id>` and `/receipts/<run-id>/bundle` routes expose only the
+sanitized completed outcome and archive digest. Token rotation revokes the old
+bearer credential; disabling blocks new POSTs but does not revoke reads or
+polling of accepted runs. The public frozen #941 bundle includes full shell
+command bodies and referenced environment-variable names, so never inline a
+secret literal in `cmd`. Public capability receipt URLs remain public after
+token rotation.
 
 An enabled `trigger.kind: email` pipeline auto-binds. If Activepieces is down,
 registration succeeds with a pending binding; `bind-trigger` retries it and

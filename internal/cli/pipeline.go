@@ -35,6 +35,10 @@ func runPipeline(args []string, stdout, stderr io.Writer) int {
 		return runPipelineAdd(args[1:], stdout, stderr)
 	case "export":
 		return runPipelineExport(args[1:], stdout, stderr)
+	case "expose":
+		return runPipelineExpose(args[1:], stdout, stderr)
+	case "serve":
+		return runPipelineServe(args[1:], stdout, stderr)
 	case "import":
 		return runPipelineImport(args[1:], stdout, stderr)
 	case "publish":
@@ -74,6 +78,8 @@ func printPipelineUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot pipeline add <spec.yaml> [--enable]")
 	fmt.Fprintln(w, "  gitmoot pipeline export <name> --output <dir>")
+	fmt.Fprintln(w, "  gitmoot pipeline expose --schema <file> [--rotate-token] [--disable] [--json] [--home DIR] <name>")
+	fmt.Fprintln(w, "  gitmoot pipeline serve [--addr 127.0.0.1:8792] [--allow-remote] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot pipeline import <dir> --repo owner/name [--name <newname>] [--agent-map exported=local ...] [--force] [--enable]")
 	fmt.Fprintln(w, "  gitmoot pipeline publish <name> [--remote owner/repo] [--create]")
 	fmt.Fprintln(w, "  gitmoot pipeline pull <name> [--remote owner/repo] --repo owner/name [--name <newname>] [--agent-map exported=local ...] [--force] [--enable]")
@@ -920,6 +926,11 @@ func runPipelineRemove(args []string, stdout, stderr io.Writer) int {
 		removedRecord, _, err = store.GetPipeline(context.Background(), name)
 		if err != nil {
 			return err
+		}
+		if active, ok, err := store.ActiveServicePipelineRun(context.Background(), name); err != nil {
+			return err
+		} else if ok {
+			return fmt.Errorf("pipeline %s has active service run %s; wait for it to settle before removal", name, active.ID)
 		}
 		removed, err = store.DeletePipeline(context.Background(), name)
 		if err != nil {
