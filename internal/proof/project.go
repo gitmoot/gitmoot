@@ -575,6 +575,13 @@ func resultHashMatches(payload, stored string) bool {
 	return stored == hex.EncodeToString(sum[:])
 }
 
+// StoredResultHashMatches reports whether jobs.result_hash is the SHA-256 hex
+// digest of the compacted, structured payload.result value. It deliberately
+// does not hash Instructions, raw output, or any other free-form field.
+func StoredResultHashMatches(payload, stored string) bool {
+	return resultHashMatches(payload, strings.TrimSpace(stored))
+}
+
 func reportedClaim(claimType string, job db.Job, asOf string) Claim {
 	evidence := job.ID
 	if job.ResultHash != "" {

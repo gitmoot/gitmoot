@@ -10744,6 +10744,7 @@ gitmoot lock show owner/repo <branch>
 ```sh
 gitmoot proof <root-id>
 gitmoot proof --json <root-id>
+gitmoot proof --verify <service-run-id>
 # As with other Go-flag commands, place --home before the positional root id:
 gitmoot proof --home /tmp/isolated-home <root-id>
 ```
@@ -10769,8 +10770,13 @@ is future work. The headline grade tally excludes `integrity.*` meta-claims and
 reports those separately on the `integrity:` line. The command never parses
 transcripts, contacts GitHub, or mutates store data.
 
-Remote `--verify`/CI upgrades and a dashboard proof view are future work and are
-not flags or surfaces in the core command. See [RESULT_CONTRACT.md](RESULT_CONTRACT.md)
+For a succeeded service pipeline run, `--verify` performs an **offline,
+store-only** outcome check: the run succeeded, all stages succeeded/skipped,
+each jobful stage has its expected terminal structured result, no failed or
+blocked job tail remains, result hashes match, and the projected manifest DAG
+verifies. It records `stored_pipeline_outcome`; it never reruns commands, queries
+CI/GitHub, or upgrades reported test claims. Remote CI upgrades remain future
+work. See [RESULT_CONTRACT.md](RESULT_CONTRACT.md)
 for the structured result and delegation inputs, and [SAFETY.md](SAFETY.md) for
 the read-only and bounded-DAG safety contracts.
 
@@ -12153,11 +12159,51 @@ gitmoot pipeline show nightly-sync [--json]        # registry view for a name
 gitmoot pipeline bind-trigger nightly-sync         # create/re-sync owned AP flow
 gitmoot pipeline run nightly-sync                  # start a manual run; prints the run id
 gitmoot pipeline show <run-id> [--json]            # run funnel for a "prun-…" id
+gitmoot pipeline expose --schema schema.json <name> # issue one bearer token (shown once)
+gitmoot pipeline serve                              # loopback API on 127.0.0.1:8792
 gitmoot pipeline resume <run-id> [--from <stage>]
 gitmoot pipeline cancel <run-id>
 gitmoot pipeline enable|disable nightly-sync
 gitmoot pipeline remove nightly-sync
 ```
+
+### Expose a shell pipeline as a service
+
+Service exposure is explicit and v1 accepts only shell-only, template-free
+pipelines. Define a bounded flat schema, expose the pipeline, then run the
+separate authenticated listener:
+
+```json
+{"version":1,"fields":{"count":{"type":"integer","required":true,"minimum":1,"maximum":5}}}
+```
+
+```sh
+gitmoot pipeline expose --schema schema.json nightly-sync
+gitmoot pipeline serve # --addr defaults to 127.0.0.1:8792
+```
+
+The exposure command stores only the SHA-256 token digest and prints the
+base64url bearer token once. `--disable` blocks new POSTs but does **not** revoke
+read/poll access to already accepted runs; use `--rotate-token` to revoke the old
+bearer credential. The API accepts
+`POST /v1/pipelines/<name>/runs` and exposes authenticated status/bundle reads at
+`/v1/pipelines/runs/<id>`. Inputs are schema-validated and delivered only as
+reserved `GITMOOT_INPUT_*` environment variables, never prompt text. Admission
+is atomic (rate bucket, global cap, per-pipeline overlap, run/stages/receipt),
+uses unpredictable 128-bit run ids, and every service shell stage runs in a
+fail-closed detached worktree. Service exposure rejects any stage that declares
+`env_keys`, network access, or extra read/write authority.
+
+On the first authenticated GET after success, Gitmoot freezes an archive with
+the accepted #941 bundle plus `proof.json` and `verification.json`. The public,
+read-only `/receipts/<id>` page and `/receipts/<id>/bundle` download disclose
+only the pipeline outcome, sanitized proof tree, proof id, and archive digest —
+never bearer tokens, inputs, prompts, logs, or raw result text. The downloadable
+frozen #941 bundle intentionally includes the full shell command bodies and
+referenced environment-variable names from the pipeline spec. Never inline a
+secret literal in `cmd`; an `env_keys`-bearing pipeline cannot be exposed at all.
+Public capability receipt URLs remain public after token rotation. Use
+`--allow-remote` only behind owner-controlled TLS/firewall policy.
 
 ### Export and import a pipeline bundle
 
@@ -13850,6 +13896,26 @@ RUN=$(gitmoot pipeline run nightly-sync)          # or trigger a manual run now
 gitmoot pipeline show "$RUN"                       # watch the text funnel
 ```
 
+### Pipelines as a service
+
+An owner can opt a shell-only, template-free pipeline into the service surface
+with a small versioned flat schema:
+
+```sh
+gitmoot pipeline expose --schema schema.json nightly-sync
+gitmoot pipeline serve # loopback-only by default
+```
+
+The bearer token is shown once and stored only as a SHA-256 digest. Requests are
+validated before admission; typed values reach stages only through reserved
+`GITMOOT_INPUT_*` environment variables, never prompts. Atomic admission applies
+the persisted rate bucket, a global active-run cap, and a same-pipeline overlap
+guard. Accepted shell jobs run in detached worktrees. A successful authenticated
+status read finalizes a frozen bundle containing `spec.yaml`, `bundle.yaml`,
+`proof.json`, and `verification.json`; `/receipts/<run-id>` is the sanitized
+public receipt. `gitmoot proof --verify <run-id>` repeats the offline store-only
+run/stage/job/result-hash consistency check and does not rerun work or contact CI.
+
 `env_keys` is a deny-by-default allowlist of exact names or globs. Shell stages
 resolve the pipeline's `env_file`, pipeline-granted shared keys, and inline
 non-secret `env`. Agent stages resolve only configured proxied keys granted to
@@ -14691,6 +14757,25 @@ delegate further and asked to synthesize a best-effort final result and return
 empty delegations. That continuation is terminal: any delegations it returns are
 ignored (`delegation_finalized`), so work is bounded and always ends in a clean
 synthesis, not a silent dead end.
+
+## Pipeline service exposures
+
+Service access is opt-in per pipeline and bounded schema. V1 exposes only
+shell-only, template-free pipelines; submitted values are validated as typed
+fields and delivered only through reserved `GITMOOT_INPUT_*` environment names,
+never prompt text. Stages declaring `env_keys`, network access, or extra
+read/write authority are ineligible for exposure. Every accepted shell stage
+requires a detached worktree and fails closed if isolation cannot be allocated.
+The listener binds to loopback by default; do not expose it to production
+networks without explicit owner action, TLS, and a trusted firewall.
+
+The public capability receipt bundle is the frozen #941 pipeline bundle: it
+contains full shell command bodies and referenced environment-variable names.
+Never inline secret literals in `cmd`. Public receipt handlers only read an
+already completed, sanitized, store-verified archive. Disabling an exposure
+blocks new runs but does not revoke authenticated reads or polling for accepted
+runs; rotate the token to revoke the old bearer credential (the public receipt
+URL remains public once finalized).
 
 ## When To Stop
 

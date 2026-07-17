@@ -70,6 +70,34 @@ RUN=$(gitmoot pipeline run nightly-sync)
 gitmoot pipeline show "$RUN"
 ```
 
+### Expose a pipeline as a service
+
+V1 service exposure is deliberately narrower than ordinary pipelines: only a
+shell-only, template-free pipeline may be exposed. The owner supplies a bounded
+flat schema and receives one bearer token:
+
+```json
+{"version":1,"fields":{"count":{"type":"integer","required":true,"minimum":1,"maximum":5}}}
+```
+
+```sh
+gitmoot pipeline expose --schema schema.json nightly-sync
+gitmoot pipeline serve # 127.0.0.1:8792 unless an owner explicitly allows remote binding
+```
+
+Invalid bodies return value-free field diagnostics and create no run. Accepted
+typed values are delivered only as `GITMOOT_INPUT_*` environment variables, not
+prompt text; admission, rate/concurrency checks, run rows, and receipt metadata
+commit atomically. Each service shell stage uses a detached worktree.
+
+The first authenticated successful GET freezes the accepted bundle together
+with `proof.json` and `verification.json`. The proof verifies persisted pipeline,
+stage, job, result-hash, and manifest consistency only — no command rerun or CI
+claim. A sanitized public receipt is available at `/receipts/<run-id>` with its
+archive download; it excludes input values, tokens, prompts, logs, and raw agent
+text. Disabling blocks new requests but leaves accepted runs pollable; rotating
+the token revokes the old credential while the new one can poll earlier runs.
+
 `pipeline add` validates the whole spec at add time — unknown keys, a non-name-safe
 name/id, a duplicate stage id, a stage that is not exactly one of `cmd`, `agent`, or
 `gate` (and, per kind: an agent stage's missing `prompt` or invalid `action`,
@@ -768,5 +796,17 @@ register specs you would run yourself, and treat a spec from an untrusted source
 arbitrary code execution. The spec is stored verbatim, so do not embed secrets in a
 stage command — provision them out of band and have the stage read them from the
 environment, letting it return `blocked` until they are present.
+
+Service exposure is an additional explicit owner action. Keep the listener on
+loopback unless it is behind owner-controlled TLS and firewall policy. Its input
+schema prevents free-form prompt passthrough, and service shell runs fail closed
+unless Gitmoot can allocate a detached worktree. Pipelines with `env_keys`,
+network access, or extra read/write authority cannot be exposed. Public receipt
+routes read only already-finalized, sanitized artifacts, but the downloadable
+frozen #941 bundle includes full shell command bodies and referenced
+environment-variable names; never inline a secret literal in `cmd`. Disabling
+blocks new runs without revoking accepted-run reads or polling; rotate the token
+to revoke the old bearer credential. Public capability receipt URLs remain
+public after rotation.
 
 See the in-repo reference at `docs/pipelines.md` for the full field reference.

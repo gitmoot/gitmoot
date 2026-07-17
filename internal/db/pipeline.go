@@ -176,6 +176,13 @@ func (s *Store) DeletePipeline(ctx context.Context, name string) (bool, error) {
 		return false, err
 	}
 	defer tx.Rollback()
+	// Foreign keys are intentionally not enabled globally in this store. Mirror
+	// pipeline_exposures' ON DELETE CASCADE explicitly so every connection gets the
+	// same semantics, while pipeline_service_runs remain attached to retained run
+	// rows and therefore survive exposure/pipeline removal.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM pipeline_exposures WHERE pipeline_name = ?`, name); err != nil {
+		return false, err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM keychain_grants WHERE consumer_kind = 'pipeline' AND consumer_id = ?`, name); err != nil {
 		return false, err
 	}

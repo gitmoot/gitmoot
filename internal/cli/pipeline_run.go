@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -54,6 +55,43 @@ type pipelineAutoMergeExecutor interface {
 func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueuer {
 	mailbox := workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(home), RuntimeDefaultModel: runtimeDefaultModelResolver(home)}
 	return func(ctx context.Context, request workflow.JobRequest) (db.Job, error) {
+		// #1011 service shell stages are an explicit fail-CLOSED exception to the
+		// generic read-only allocator below. Their run row is authoritative: every
+		// service-triggered shell command gets a detached worktree, and a missing
+		// checkout/allocation failure aborts enqueue instead of falling back to the
+		// registered checkout.
+		serviceShell, err := pipelineServiceShellStage(ctx, store, request)
+		if err != nil {
+			return db.Job{}, err
+		}
+		var worktreePath string
+		var worktreeErr error
+		if serviceShell {
+			// Allocation precedes Mailbox.Enqueue. If a scan crashed after enqueue but
+			// before recording stage.job_id, adopt the deterministic existing job before
+			// touching its equally deterministic worktree path.
+			existing, getErr := store.GetJob(ctx, request.ID)
+			if getErr == nil {
+				payload, parseErr := workflow.ParseJobPayload(existing.Payload)
+				if parseErr != nil {
+					return db.Job{}, fmt.Errorf("parse existing service shell stage payload: %w", parseErr)
+				}
+				if strings.TrimSpace(payload.WorktreePath) == "" || !payload.ReadOnlyWorktree {
+					return db.Job{}, errors.New("existing service shell stage is not isolated in a detached worktree")
+				}
+				return existing, nil
+			}
+			if !errors.Is(getErr, sql.ErrNoRows) {
+				return db.Job{}, getErr
+			}
+			request, worktreePath, worktreeErr = allocatePipelineServiceShellWorktree(ctx, store, home, request)
+			if worktreeErr != nil {
+				return db.Job{}, fmt.Errorf("allocate service shell stage detached worktree: %w", worktreeErr)
+			}
+			if strings.TrimSpace(worktreePath) == "" {
+				return db.Job{}, errors.New("service shell stage requires a detached worktree; managed repo checkout is unavailable")
+			}
+		}
 		// #757 read-only isolation: a repo-bound AGENT stage (ask/review) is born
 		// with its OWN detached committed-tip worktree (the #739 shape) so it keys
 		// worktree:<path> instead of the shared repo:<repo>. Same-repo agent stages
@@ -68,7 +106,9 @@ func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueue
 		// checkout) rather than stalling the pipeline scan loop. Produce is the explicit
 		// fail-closed exception below. Shell stages carry a RuntimeOverride and are
 		// excluded, so their request is byte-identical.
-		request, worktreePath, worktreeErr := allocatePipelineStageReadOnlyWorktree(ctx, store, home, request)
+		if !serviceShell {
+			request, worktreePath, worktreeErr = allocatePipelineStageReadOnlyWorktree(ctx, store, home, request)
+		}
 		if strings.TrimSpace(request.Action) == "produce" && strings.TrimSpace(request.WorktreePath) == "" {
 			reason := "produce stage requires a disposable detached worktree; managed repo checkout is unavailable"
 			if worktreeErr != nil {
@@ -121,12 +161,53 @@ func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueue
 		// FK). Allocated → observable worktree:<path> key; a fail-open skip → a loud
 		// event so a lost-parallelism serialize is never silent (#739).
 		if worktreePath != "" {
-			_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "readonly_worktree_allocated", Message: fmt.Sprintf("read-only worktree %s allocated for agent stage (#757/#739); job keyed worktree:<path> to run beside same-repo stages", worktreePath)})
+			message := fmt.Sprintf("read-only worktree %s allocated for agent stage (#757/#739); job keyed worktree:<path> to run beside same-repo stages", worktreePath)
+			if serviceShell {
+				message = fmt.Sprintf("detached worktree %s allocated for service shell stage (#1011); registered checkout is never used", worktreePath)
+			}
+			_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "readonly_worktree_allocated", Message: message})
 		} else if worktreeErr != nil {
 			_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "readonly_worktree_skipped", Message: fmt.Sprintf("read-only worktree isolation skipped for agent stage (#757/#739); job runs serialized in the shared checkout: %v", worktreeErr)})
 		}
 		return job, nil
 	}
+}
+
+func pipelineServiceShellStage(ctx context.Context, store *db.Store, request workflow.JobRequest) (bool, error) {
+	if request.Sender != workflow.PipelineJobSender || strings.TrimSpace(request.RuntimeOverride) != runtime.ShellRuntime {
+		return false, nil
+	}
+	runID := strings.TrimSpace(request.RootJobID)
+	if runID == "" {
+		return false, nil // defensive compatibility for synthetic/non-run requests
+	}
+	run, ok, err := store.GetPipelineRun(ctx, runID)
+	if err != nil {
+		return false, fmt.Errorf("load pipeline run %s for shell isolation: %w", runID, err)
+	}
+	return ok && strings.TrimSpace(run.Trigger) == "service", nil
+}
+
+func allocatePipelineServiceShellWorktree(ctx context.Context, store *db.Store, home string, request workflow.JobRequest) (workflow.JobRequest, string, error) {
+	checkout := pipelineStageCheckoutPath(ctx, store, request.Repo)
+	if checkout == "" {
+		return request, "", nil
+	}
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return request, "", err
+	}
+	path, err := workflow.AllocateReadOnlyWorktree(ctx, store, paths.Home, request.Repo, checkout, request.ID,
+		"pipeline-service-stage", 0, "", workflow.ReadOnlyWorktreeDispatchLockWaitBudget, gitutil.Client{Dir: checkout})
+	if err != nil {
+		return request, "", err
+	}
+	if strings.TrimSpace(path) == "" {
+		return request, "", nil
+	}
+	request.WorktreePath = path
+	request.ReadOnlyWorktree = true
+	return request, path, nil
 }
 
 // createFailedPipelineProduceJob records a fail-closed produce allocation as a
@@ -425,7 +506,17 @@ type pipelineStagePRBinding struct {
 }
 
 func pipelineStageJobRequest(rec db.Pipeline, stage pipeline.Stage, run db.PipelineRun, attempt int, upstreamContext string, binding pipelineStagePRBinding, skipNativeReviewFanout bool) workflow.JobRequest {
-	triggerContext := buildPipelineTriggerContext(run.PayloadJSON)
+	// Service input is schema-validated and delivered exclusively through the
+	// dedicated PipelineInputEnv field. Never project a service run's payload into
+	// an agent prompt; Pass 2 will attach the typed env after loading its service
+	// input receipt.
+	triggerContext := ""
+	pipelineInputEnv := []string(nil)
+	if strings.TrimSpace(run.Trigger) != "service" {
+		triggerContext = buildPipelineTriggerContext(run.PayloadJSON)
+	} else {
+		pipelineInputEnv = pipelineServiceInputEnvironment(run.PayloadJSON)
+	}
 	instructions := triggerContext + upstreamContext + stage.Prompt
 	if stage.Kind() == pipeline.StageKindAgentProduce && attempt > 0 {
 		// Note stays FIRST after the trigger block: byte-identical to the
@@ -488,25 +579,27 @@ func pipelineStageJobRequest(rec db.Pipeline, stage pipeline.Stage, run db.Pipel
 			RootJobID:        id,
 			JobTimeout:       stage.Timeout,
 			OrchestrateStage: true,
+			PipelineInputEnv: append([]string(nil), pipelineInputEnv...),
 		}
 	}
 	if stage.Kind() == pipeline.StageKindAgentProduce {
 		return workflow.JobRequest{
-			ID:            pipelineStageJobID(run.ID, stage.ID, attempt),
-			Agent:         stage.Agent,
-			Action:        "produce",
-			Repo:          rec.Repo,
-			Sender:        workflow.PipelineJobSender,
-			Instructions:  instructions,
-			Fingerprint:   pipelineStageFingerprint(rec.Name, run.ID, stage.ID, attempt),
-			RootJobID:     run.ID,
-			JobTimeout:    stage.Timeout,
-			PipelineName:  rec.Name,
-			WritablePaths: append([]string(nil), stage.Writes...),
-			ReadablePaths: append([]string(nil), stage.Reads...),
-			Network:       stage.Network,
-			Check:         stage.Check,
-			CheckRetries:  checkRetries,
+			ID:               pipelineStageJobID(run.ID, stage.ID, attempt),
+			Agent:            stage.Agent,
+			Action:           "produce",
+			Repo:             rec.Repo,
+			Sender:           workflow.PipelineJobSender,
+			Instructions:     instructions,
+			Fingerprint:      pipelineStageFingerprint(rec.Name, run.ID, stage.ID, attempt),
+			RootJobID:        run.ID,
+			JobTimeout:       stage.Timeout,
+			PipelineName:     rec.Name,
+			WritablePaths:    append([]string(nil), stage.Writes...),
+			ReadablePaths:    append([]string(nil), stage.Reads...),
+			Network:          stage.Network,
+			Check:            stage.Check,
+			CheckRetries:     checkRetries,
+			PipelineInputEnv: append([]string(nil), pipelineInputEnv...),
 		}
 	}
 	// #768 MUTATING implement stage: bind to the named agent running its OWN runtime,
@@ -534,19 +627,21 @@ func pipelineStageJobRequest(rec db.Pipeline, stage pipeline.Stage, run db.Pipel
 			// A declared source-bound review owns this PR's review step. Suppress the
 			// native reviewer fan-out so the same implementation is not reviewed twice.
 			SkipNativeReviewFanout: skipNativeReviewFanout,
+			PipelineInputEnv:       append([]string(nil), pipelineInputEnv...),
 		}
 	}
 	if stage.Agent != "" {
 		request := workflow.JobRequest{
-			ID:           pipelineStageJobID(run.ID, stage.ID, attempt),
-			Agent:        stage.Agent,
-			Action:       stage.Action,
-			Repo:         rec.Repo,
-			Sender:       workflow.PipelineJobSender,
-			Instructions: instructions,
-			Fingerprint:  pipelineStageFingerprint(rec.Name, run.ID, stage.ID, attempt),
-			RootJobID:    run.ID,
-			JobTimeout:   stage.Timeout,
+			ID:               pipelineStageJobID(run.ID, stage.ID, attempt),
+			Agent:            stage.Agent,
+			Action:           stage.Action,
+			Repo:             rec.Repo,
+			Sender:           workflow.PipelineJobSender,
+			Instructions:     instructions,
+			Fingerprint:      pipelineStageFingerprint(rec.Name, run.ID, stage.ID, attempt),
+			RootJobID:        run.ID,
+			JobTimeout:       stage.Timeout,
+			PipelineInputEnv: append([]string(nil), pipelineInputEnv...),
 		}
 		if stage.Kind() == pipeline.StageKindAgentReview && strings.TrimSpace(stage.Source) != "" {
 			request.PullRequest = binding.PullRequest
@@ -561,6 +656,10 @@ func pipelineStageJobRequest(rec db.Pipeline, stage pipeline.Stage, run db.Pipel
 	// override. The sh -c argv and prompt stay unchanged; exact pipeline metadata
 	// and trigger inputs travel through ShellEnv, while dependent-stage JSON
 	// content is persisted separately for delivery through a temporary file.
+	triggerEnv := []string(nil)
+	if strings.TrimSpace(run.Trigger) != "service" {
+		triggerEnv = pipelineTriggerShellEnv(run.PayloadJSON)
+	}
 	return workflow.JobRequest{
 		ID:                 pipelineStageJobID(run.ID, stage.ID, attempt),
 		Agent:              pipelineRunnerAgentName(rec.Name),
@@ -573,13 +672,50 @@ func pipelineStageJobRequest(rec db.Pipeline, stage pipeline.Stage, run db.Pipel
 		JobTimeout:         stage.Timeout,
 		RuntimeOverride:    runtime.ShellRuntime,
 		RuntimeOverrideRef: stage.Cmd,
-		ShellEnv: append(pipelineTriggerShellEnv(run.PayloadJSON),
+		ShellEnv: append(triggerEnv,
 			"GITMOOT_PIPELINE_NAME="+rec.Name,
 			"GITMOOT_PIPELINE_RUN_ID="+run.ID,
 			"GITMOOT_PIPELINE_STAGE_ID="+stage.ID,
 		),
 		ShellUpstreamContext: upstreamContext,
+		PipelineInputEnv:     append([]string(nil), pipelineInputEnv...),
 	}
+}
+
+// pipelineServiceInputEnvironment reconstructs the typed, reserved environment
+// projection from the canonical payload persisted at admission. It never emits
+// caller-selected names and is never incorporated into Instructions.
+func pipelineServiceInputEnvironment(payloadJSON string) []string {
+	decoder := json.NewDecoder(strings.NewReader(payloadJSON))
+	decoder.UseNumber()
+	var raw map[string]any
+	if err := decoder.Decode(&raw); err != nil {
+		return nil
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil
+	}
+	values := make(map[string]pipeline.TypedValue, len(raw))
+	for name, value := range raw {
+		if !pipeline.ValidTriggerPayloadKey(name) {
+			return nil
+		}
+		switch typed := value.(type) {
+		case string:
+			values[name] = pipeline.TypedValue{Type: pipeline.ServiceFieldString, String: typed}
+		case bool:
+			values[name] = pipeline.TypedValue{Type: pipeline.ServiceFieldBoolean, Boolean: typed}
+		case json.Number:
+			integer, err := typed.Int64()
+			if err != nil {
+				return nil
+			}
+			values[name] = pipeline.TypedValue{Type: pipeline.ServiceFieldInteger, Integer: integer}
+		default:
+			return nil
+		}
+	}
+	return pipeline.ServiceInputEnvironment(values)
 }
 
 func pipelineSourceBoundReview(stage pipeline.Stage) bool {

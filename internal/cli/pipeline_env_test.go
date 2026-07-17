@@ -246,11 +246,11 @@ func TestPipelineEnvDeliveryScopePrecedenceAndRotation(t *testing.T) {
 	wrapped := wrapPipelineEnvDeliveryAdapter(store, home, workflow.JobPayload{
 		PipelineEnvFile: access.File, PipelineEnvKeys: access.Keys, PipelineEnv: access.Defaults,
 	}, capture)
-	base := runtime.Job{ShellEnv: []string{"GITMOOT_PIPELINE_NAME=real"}}
+	base := runtime.Job{ShellEnv: []string{"GITMOOT_PIPELINE_NAME=real", "GITMOOT_INPUT_APP_NAME=typed-sentinel"}}
 	if _, err := wrapped.Deliver(context.Background(), runtime.Agent{}, base); err != nil {
 		t.Fatal(err)
 	}
-	if got := capture.jobs[0].ShellEnv; !reflect.DeepEqual(got, []string{"KEY_A=" + pipelineEnvSecretA, "DEFAULT=inline", "GITMOOT_PIPELINE_NAME=real"}) {
+	if got := capture.jobs[0].ShellEnv; !reflect.DeepEqual(got, []string{"KEY_A=" + pipelineEnvSecretA, "DEFAULT=inline", "GITMOOT_PIPELINE_NAME=real", "GITMOOT_INPUT_APP_NAME=typed-sentinel"}) {
 		t.Fatalf("first delivery env = %#v", got)
 	}
 	if strings.Contains(strings.Join(capture.jobs[0].ShellEnv, "\n"), "KEY_B=") {
@@ -283,7 +283,7 @@ func TestPipelineEnvDeliveryScopePrecedenceAndRotation(t *testing.T) {
 	if _, err := reserved.Deliver(context.Background(), runtime.Agent{}, base); err != nil {
 		t.Fatal(err)
 	}
-	if got := reservedCapture.jobs[0].ShellEnv; !reflect.DeepEqual(got, []string{"GITMOOT_PIPELINE_NAME=untrusted", "GITMOOT_PIPELINE_NAME=real"}) {
+	if got := reservedCapture.jobs[0].ShellEnv; !reflect.DeepEqual(got, []string{"GITMOOT_PIPELINE_NAME=untrusted", "GITMOOT_PIPELINE_NAME=real", "GITMOOT_INPUT_APP_NAME=typed-sentinel"}) {
 		t.Fatalf("Gitmoot internal value did not win at delivery: %#v", got)
 	}
 }
@@ -721,6 +721,9 @@ func TestPipelineAgentProxiedKeyDeliveryE2E(t *testing.T) {
 		}
 		placeholder := envEntryValue(job.AgentEnv, keyName)
 		leaseURL := envEntryValue(job.AgentEnv, "GITMOOT_PROXY_"+keyName+"_URL")
+		if got := envEntryValue(job.AgentEnv, "GITMOOT_INPUT_APP_NAME"); got != "typed-sentinel" {
+			t.Fatalf("typed input did not compose with proxied AgentEnv: %#v", job.AgentEnv)
+		}
 		if !strings.HasPrefix(placeholder, "gitmoot-kc-agent-proxy-job-") || !strings.HasPrefix(leaseURL, "http://127.0.0.1:") {
 			t.Fatalf("agent env = %#v", job.AgentEnv)
 		}
@@ -743,7 +746,7 @@ func TestPipelineAgentProxiedKeyDeliveryE2E(t *testing.T) {
 		return runtime.Result{Raw: "ok"}, nil
 	}}
 	wrapper := wrapPipelineEnvDeliveryAdapter(store, home, payload, capture)
-	result, err := wrapper.Deliver(ctx, runtime.Agent{}, runtime.Job{ID: "agent-proxy-job"})
+	result, err := wrapper.Deliver(ctx, runtime.Agent{}, runtime.Job{ID: "agent-proxy-job", AgentEnv: []string{"GITMOOT_INPUT_APP_NAME=typed-sentinel"}})
 	if err != nil {
 		t.Fatal(err)
 	}

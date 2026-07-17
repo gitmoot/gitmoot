@@ -1105,6 +1105,26 @@ RUN=$(gitmoot pipeline run nightly-sync)          # or trigger a manual run now
 gitmoot pipeline show "$RUN"                       # watch the text funnel
 ```
 
+### Pipelines as a service
+
+An owner can opt a shell-only, template-free pipeline into the service surface
+with a small versioned flat schema:
+
+```sh
+gitmoot pipeline expose --schema schema.json nightly-sync
+gitmoot pipeline serve # loopback-only by default
+```
+
+The bearer token is shown once and stored only as a SHA-256 digest. Requests are
+validated before admission; typed values reach stages only through reserved
+`GITMOOT_INPUT_*` environment variables, never prompts. Atomic admission applies
+the persisted rate bucket, a global active-run cap, and a same-pipeline overlap
+guard. Accepted shell jobs run in detached worktrees. A successful authenticated
+status read finalizes a frozen bundle containing `spec.yaml`, `bundle.yaml`,
+`proof.json`, and `verification.json`; `/receipts/<run-id>` is the sanitized
+public receipt. `gitmoot proof --verify <run-id>` repeats the offline store-only
+run/stage/job/result-hash consistency check and does not rerun work or contact CI.
+
 `env_keys` is a deny-by-default allowlist of exact names or globs. Shell stages
 resolve the pipeline's `env_file`, pipeline-granted shared keys, and inline
 non-secret `env`. Agent stages resolve only configured proxied keys granted to

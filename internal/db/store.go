@@ -9282,4 +9282,38 @@ ALTER TABLE jobs ADD COLUMN model TEXT NOT NULL DEFAULT '';
 ALTER TABLE skillopt_synth_items ADD COLUMN kind TEXT NOT NULL DEFAULT '';
 ALTER TABLE skillopt_synth_items ADD COLUMN injected_memory_key TEXT NOT NULL DEFAULT '';
 	`,
+	// #1011 opt-in pipeline service exposure + durable receipt metadata. Exposure
+	// rows hold only a SHA-256 bearer-token digest; deletion is tied to the pipeline
+	// declaration. Service-run receipts instead key to pipeline_runs, which already
+	// survive pipeline removal, so disabling/rotating/removing an exposure cannot
+	// erase an accepted run's receipt metadata. Foreign-key enforcement is not
+	// enabled globally in this store, so DeletePipeline also removes its exposure
+	// explicitly in the same transaction.
+	`
+CREATE TABLE pipeline_exposures (
+	pipeline_name TEXT PRIMARY KEY,
+	schema_version INTEGER NOT NULL,
+	schema_json TEXT NOT NULL,
+	schema_hash TEXT NOT NULL,
+	token_hash BLOB NOT NULL,
+	enabled INTEGER NOT NULL DEFAULT 1,
+	bucket_tokens REAL NOT NULL DEFAULT 0,
+	bucket_updated_at TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	FOREIGN KEY (pipeline_name) REFERENCES pipelines(name) ON DELETE CASCADE
+);
+
+CREATE TABLE pipeline_service_runs (
+	run_id TEXT PRIMARY KEY,
+	pipeline_name TEXT NOT NULL,
+	artifact_relpath TEXT NOT NULL DEFAULT '',
+	artifact_sha256 TEXT NOT NULL DEFAULT '',
+	proof_id TEXT NOT NULL DEFAULT '',
+	proof_verified_at TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	FOREIGN KEY (run_id) REFERENCES pipeline_runs(id)
+);
+CREATE INDEX idx_pipeline_service_runs_pipeline ON pipeline_service_runs(pipeline_name, created_at, run_id);
+	`,
 }

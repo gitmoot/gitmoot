@@ -199,6 +199,11 @@ type JobRequest struct {
 	// KEY=value entries to a shell runtime job. It is empty for every non-pipeline
 	// and non-shell job.
 	ShellEnv []string
+	// PipelineInputEnv carries schema-validated service input exclusively in the
+	// reserved GITMOOT_INPUT_* namespace. Values stay out of Instructions and every
+	// other free-form payload field; delivery routes them to ShellEnv for shell
+	// stages and AgentEnv for managed agent runtimes.
+	PipelineInputEnv []string
 	// PipelineName and PipelineKeyAccess are the names-only keycard authority for
 	// a pipeline stage. PipelineKeyAgent pins an agent stage to its registered seat
 	// grant; empty means the existing pipeline/shell consumer. PipelineEnvFile and
@@ -313,6 +318,7 @@ type JobPayload struct {
 	RuntimeOverride        string              `json:"runtime_override,omitempty"`
 	RuntimeOverrideRef     string              `json:"runtime_override_ref,omitempty"`
 	ShellEnv               []string            `json:"shell_env,omitempty"`
+	PipelineInputEnv       []string            `json:"pipeline_input_env,omitempty"`
 	PipelineName           string              `json:"pipeline_name,omitempty"`
 	PipelineKeyAgent       string              `json:"pipeline_key_agent,omitempty"`
 	PipelineKeyAccess      []PipelineKeyAccess `json:"pipeline_key_access,omitempty"`
@@ -470,6 +476,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		RuntimeOverride:        strings.TrimSpace(request.RuntimeOverride),
 		RuntimeOverrideRef:     strings.TrimSpace(request.RuntimeOverrideRef),
 		ShellEnv:               append([]string(nil), request.ShellEnv...),
+		PipelineInputEnv:       append([]string(nil), request.PipelineInputEnv...),
 		PipelineName:           strings.TrimSpace(request.PipelineName),
 		PipelineKeyAgent:       strings.TrimSpace(request.PipelineKeyAgent),
 		PipelineKeyAccess:      compactPipelineKeyAccess(request.PipelineKeyAccess),
@@ -1132,6 +1139,13 @@ func produceCheckCorrectionPrompt(output string) string {
 // flag, redacted crash-diagnostics snapshot (#806, nil when no CLI process
 // ran), and error.
 func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent runtime.Agent, job db.Job, payload JobPayload, prompt string) (string, string, bool, *FailureDiagnostics, error) {
+	shellEnv := append([]string(nil), payload.ShellEnv...)
+	var agentEnv []string
+	if agent.Runtime == runtime.ShellRuntime {
+		shellEnv = append(shellEnv, payload.PipelineInputEnv...)
+	} else {
+		agentEnv = append(agentEnv, payload.PipelineInputEnv...)
+	}
 	delivery := runtime.Job{
 		ID:                   job.ID,
 		AgentName:            agent.Name,
@@ -1141,7 +1155,8 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		PullRequest:          payload.PullRequest,
 		Model:                payload.Model,
 		Effort:               payload.Effort,
-		ShellEnv:             append([]string(nil), payload.ShellEnv...),
+		ShellEnv:             shellEnv,
+		AgentEnv:             agentEnv,
 		ShellUpstreamContext: payload.ShellUpstreamContext,
 	}
 	// #652: thread in the runtime's configured registry default_model as the FINAL
@@ -1438,7 +1453,33 @@ func validateJobRequest(request JobRequest) error {
 	if err := ValidateWorkflowID(request.WorkflowID); err != nil {
 		return err
 	}
+	if err := validatePipelineInputEnv(request.PipelineInputEnv); err != nil {
+		return err
+	}
 	return validateJobRuntimeOverrideRequest(request)
+}
+
+var pipelineInputEnvNamePattern = regexp.MustCompile(`^GITMOOT_INPUT_[A-Z][A-Z0-9_]*$`)
+
+func validatePipelineInputEnv(entries []string) error {
+	if len(entries) > 32 {
+		return errors.New("pipeline input env accepts at most 32 entries")
+	}
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		name, _, ok := strings.Cut(entry, "=")
+		if !ok || !pipelineInputEnvNamePattern.MatchString(name) {
+			return fmt.Errorf("pipeline input env entry %q must use GITMOOT_INPUT_<UPPER_SNAKE>=value", name)
+		}
+		if strings.ContainsRune(entry, '\x00') {
+			return fmt.Errorf("pipeline input env %s must not contain U+0000", name)
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return fmt.Errorf("pipeline input env contains duplicate key %s", name)
+		}
+		seen[name] = struct{}{}
+	}
+	return nil
 }
 
 const workflowIDSegmentPattern = `[a-z0-9]+(-[a-z0-9]+)*`

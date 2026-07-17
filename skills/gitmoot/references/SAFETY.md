@@ -354,6 +354,25 @@ empty delegations. That continuation is terminal: any delegations it returns are
 ignored (`delegation_finalized`), so work is bounded and always ends in a clean
 synthesis, not a silent dead end.
 
+## Pipeline service exposures
+
+Service access is opt-in per pipeline and bounded schema. V1 exposes only
+shell-only, template-free pipelines; submitted values are validated as typed
+fields and delivered only through reserved `GITMOOT_INPUT_*` environment names,
+never prompt text. Stages declaring `env_keys`, network access, or extra
+read/write authority are ineligible for exposure. Every accepted shell stage
+requires a detached worktree and fails closed if isolation cannot be allocated.
+The listener binds to loopback by default; do not expose it to production
+networks without explicit owner action, TLS, and a trusted firewall.
+
+The public capability receipt bundle is the frozen #941 pipeline bundle: it
+contains full shell command bodies and referenced environment-variable names.
+Never inline secret literals in `cmd`. Public receipt handlers only read an
+already completed, sanitized, store-verified archive. Disabling an exposure
+blocks new runs but does not revoke authenticated reads or polling for accepted
+runs; rotate the token to revoke the old bearer credential (the public receipt
+URL remains public once finalized).
+
 ## When To Stop
 
 Stop and report `blocked` when the target repo is unclear, GitHub auth is

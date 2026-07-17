@@ -92,6 +92,49 @@ func Marshal(manifest Manifest) ([]byte, error) {
 	return json.Marshal(manifest)
 }
 
+// WithVerifiedRootClaim returns a new manifest whose root commits an additional
+// store-only verification claim. Existing child hashes are retained; the root
+// and ProofID are re-addressed, so the claim cannot be removed without changing
+// the public proof identifier.
+func WithVerifiedRootClaim(manifest Manifest, claimType, source, evidenceRef, asOf string, attrs map[string]string) (Manifest, error) {
+	if err := VerifyManifest(manifest); err != nil {
+		return Manifest{}, err
+	}
+	root := manifest.Root
+	root.Attrs = cloneStringAttrs(root.Attrs)
+	for key, value := range attrs {
+		root.Attrs[key] = value
+	}
+	root.Children = append([]string(nil), root.Children...)
+	root.Claims = append(append([]Claim(nil), root.Claims...), Claim{
+		Type: claimType, Grade: GradeVerified, Source: source,
+		EvidenceRef: evidenceRef, AsOf: asOf,
+	})
+	normalizeNode(&root)
+	oldID := manifest.ProofID
+	root.ID = NodeID(root)
+	nodes := make(map[string]Node, len(manifest.Nodes))
+	for id, node := range manifest.Nodes {
+		if id != oldID {
+			nodes[id] = node
+		}
+	}
+	nodes[root.ID] = root
+	updated := Manifest{ProofID: root.ID, Root: root, Nodes: nodes}
+	if err := VerifyManifest(updated); err != nil {
+		return Manifest{}, err
+	}
+	return updated, nil
+}
+
+func cloneStringAttrs(attrs map[string]string) map[string]string {
+	cloned := make(map[string]string, len(attrs))
+	for key, value := range attrs {
+		cloned[key] = value
+	}
+	return cloned
+}
+
 // VerifyManifest recomputes node hashes and validates child references, DAG
 // acyclicity, and that every shipped node is committed by ProofID.
 func VerifyManifest(manifest Manifest) error {
