@@ -110,6 +110,47 @@ func overrideRuntimeSessionResourceKey(agent runtime.Agent) (string, bool) {
 	return "runtime:" + runtimeName + ":" + shortHash(runtimeRef), true
 }
 
+// isolatedShellStageRuntimeSessionKey returns a JOB-SCOPED runtime-session lock
+// key for a shell-override stage that runs in its OWN detached worktree, or
+// ok=false for any other job (leaving the normal key derivation in force).
+//
+// A pipeline shell stage runs as a runtime override, so it takes the bounded
+// override key runtime:shell:<hash(cmd)> (overrideRuntimeSessionResourceKey).
+// That key exists (#531) ONLY so the lock provably names the OVERRIDE runtime
+// and can never collide with the agent's default-runtime session lock —
+// serializing identical commands is an incidental side effect of hashing the
+// command, not a guarantee the key was created to provide. For an ISOLATED stage
+// that side effect is spurious: each such stage runs in its own detached
+// read-only worktree (#1016) and shares no checkout or session state, yet two
+// isolated forks of the identical command still hash to the same key and
+// serialize (#1034). Keying by job id removes that false dependency while
+// preserving the #531 invariant — the key keeps the runtime:shell: prefix (still
+// names the override runtime, still cannot collide with a resumable runtime's
+// runtime:<rt>:<ref> key) but is unique per job, so distinct isolated forks never
+// wait on one another. Non-isolated shell stages (shared checkout, no
+// WorktreePath) keep the command-hash key and stay serialized — their shared
+// checkout genuinely needs it (and the checkout lock covers it besides) — and
+// resumable runtimes are untouched.
+//
+// The signal is read from the PERSISTED payload: ReadOnlyWorktree + WorktreePath
+// are set synchronously at enqueue, before the job is visible to the daemon
+// selector, so this resolves identically at scheduling time
+// (queuedJobRuntimeResourceKey) and at lock acquisition — the two MUST agree or
+// the gate and the lock diverge.
+func isolatedShellStageRuntimeSessionKey(payload workflow.JobPayload, jobID string) (string, bool) {
+	if strings.TrimSpace(payload.RuntimeOverride) != runtime.ShellRuntime {
+		return "", false
+	}
+	if !payload.ReadOnlyWorktree || strings.TrimSpace(payload.WorktreePath) == "" {
+		return "", false
+	}
+	id := strings.TrimSpace(jobID)
+	if id == "" {
+		return "", false
+	}
+	return "runtime:" + runtime.ShellRuntime + ":job:" + shortHash(id), true
+}
+
 // jobRuntimeOverrideEventMessage renders the runtime_override job event that
 // exposes the effective runtime (and the session lock it ran under) in job
 // history.

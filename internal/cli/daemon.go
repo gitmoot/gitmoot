@@ -5020,6 +5020,12 @@ func queuedJobRuntimeResourceKey(ctx context.Context, store *db.Store, job db.Jo
 	// it under that key (fully payload-derived — no GetAgent needed) rather than
 	// the agent's default-runtime session it will never take.
 	if payload, err := daemonJobPayload(job); err == nil && strings.TrimSpace(payload.RuntimeOverride) != "" {
+		// An isolated shell stage keys by job id so identical-command isolated
+		// forks don't serialize (#1034). The worker's lock acquisition uses the
+		// SAME helper, so the gate and the lock can never disagree.
+		if key, ok := isolatedShellStageRuntimeSessionKey(payload, job.ID); ok {
+			return key
+		}
 		key, ok := overrideRuntimeSessionResourceKey(applyJobRuntimeOverride(runtime.Agent{}, payload))
 		if !ok {
 			return ""
@@ -5222,7 +5228,22 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// SESSION SAFETY (#531): the lock is taken on the EFFECTIVE agent, so an
 	// overridden job locks the OVERRIDE runtime's session key and can never
 	// collide with (or occupy) the agent's default-runtime session lock.
-	releaseLock, acquired, lockKey, ownerToken, err := acquireJobRuntimeSessionLock(ctx, w.Store, job.ID, agent, overridden, time.Now().UTC(), lockTTL)
+	var (
+		releaseLock func(context.Context) error
+		acquired    bool
+		lockKey     string
+		ownerToken  string
+	)
+	if key, ok := isolatedShellStageRuntimeSessionKey(payload, job.ID); ok {
+		// #1034: an isolated shell stage acquires the SAME job-scoped shell key the
+		// selector (queuedJobRuntimeResourceKey) gates on, so identical-command
+		// isolated forks neither serialize at the gate nor collide at acquisition.
+		// acquireRuntimeSessionLockWithKey is the shared low-level acquirer that
+		// acquireJobRuntimeSessionLock itself delegates to.
+		releaseLock, acquired, lockKey, ownerToken, err = acquireRuntimeSessionLockWithKey(ctx, w.Store, job.ID, key, true, time.Now().UTC(), lockTTL)
+	} else {
+		releaseLock, acquired, lockKey, ownerToken, err = acquireJobRuntimeSessionLock(ctx, w.Store, job.ID, agent, overridden, time.Now().UTC(), lockTTL)
+	}
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
 			return finishErr

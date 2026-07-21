@@ -426,11 +426,12 @@ never evaluate them as shell source, and do not put credentials in summaries.
 
 Set `isolate: true` on a non-service `cmd` stage to opt into a disposable detached
 read-only worktree at the managed checkout's committed tip. This gives forked
-same-repo shell stages distinct checkout keys so a multi-worker daemon can run
-stages with different commands concurrently. **Known v1 limitation (tracked follow-up):**
-identical commands still share a shell runtime-session key and serialize. The
-default remains the shared checkout, preserving uncommitted and gitignored inputs
-and intentional checkout writes; `isolate` is rejected on agent and gate stages.
+same-repo shell stages distinct checkout keys, and each also takes a job-scoped
+shell runtime-session key (`runtime:shell:job:<hash(job)>`) rather than the
+command-hash key, so a multi-worker daemon runs them concurrently even when they
+share the **identical** command (#1034). The default remains the shared checkout,
+preserving uncommitted and gitignored inputs and intentional checkout writes;
+`isolate` is rejected on agent and gate stages.
 
 Allocation is fail-open: Gitmoot records `readonly_worktree_skipped` and uses the
 shared checkout if it cannot create the worktree. Successful isolation adds the

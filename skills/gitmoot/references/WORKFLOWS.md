@@ -1381,10 +1381,11 @@ Its disposable worktree is the committed tip, while the default `false` continue
 to run in the shared checkout for commands that need dirty/gitignored data or write
 there. Allocation is fail-open (`readonly_worktree_skipped` records fallback), and
 successful isolation adds `GITMOOT_CHECKOUT=<live-checkout>` to the shell env. This
-removes checkout-lock serialization for siblings with different commands. **Known
-v1 limitation (tracked follow-up):** identical commands retain the same shell runtime-session
-key and serialize. Service shell stages remain unconditionally isolated and fail
-closed. The field is rejected on agent and gate stages.
+removes checkout-lock serialization for siblings, and each isolated stage also
+takes a job-scoped shell runtime-session key (`runtime:shell:job:<hash(job)>`)
+instead of the command-hash key, so siblings run concurrently even when they share
+the **identical** command (#1034). Service shell stages remain unconditionally
+isolated and fail closed. The field is rejected on agent and gate stages.
 
 A dependent `cmd` stage receives the same settled upstream results through a data
 channel, not shell interpolation. All pipeline shell stages get
