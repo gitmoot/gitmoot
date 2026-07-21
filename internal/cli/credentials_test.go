@@ -505,7 +505,7 @@ printf '%%s' '{"gitmoot_result":{"decision":"approved","summary":"credential e2e
 				}
 				if background {
 					worker := defaultJobWorker(store, io.Discard, home)
-					if err := runEnabledRepoWorkerTicks(context.Background(), store, worker, 1, io.Discard, time.Now().UTC()); err != nil {
+					if err := runEnabledRepoWorkerTicksTracked(context.Background(), store, worker, 1, "", io.Discard, time.Now().UTC(), nil, nil); err != nil {
 						t.Fatalf("worker tick: %v", err)
 					}
 				}

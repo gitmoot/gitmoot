@@ -183,37 +183,3 @@ func ProjectEnvKeys(selectors []string, sources []EnvKeySource) (resolved []EnvK
 	}
 	return resolved, unresolved
 }
-
-// ResolveEnvKeys expands selectors against available names. Selector order is
-// preserved, glob matches are lexical, and duplicate concrete names collapse.
-func ResolveEnvKeys(selectors []string, available map[string]string) ([]string, error) {
-	names := make([]string, 0, len(available))
-	for name := range available {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	seen := make(map[string]struct{})
-	resolved := make([]string, 0, len(selectors))
-	for _, selector := range selectors {
-		matched := false
-		for _, name := range names {
-			ok := selector == name
-			if strings.ContainsAny(selector, "*?[") {
-				ok, _ = path.Match(selector, name)
-			}
-			if !ok {
-				continue
-			}
-			matched = true
-			if _, exists := seen[name]; exists {
-				continue
-			}
-			seen[name] = struct{}{}
-			resolved = append(resolved, name)
-		}
-		if !matched {
-			return nil, fmt.Errorf("env_keys entry %q does not resolve to any declared key", selector)
-		}
-	}
-	return resolved, nil
-}

@@ -17,18 +17,8 @@ func TestLoadTemplateRemoteDefaultsUnconfigured(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadTemplateRemote returned error: %v", err)
 	}
-	if remote.Configured() {
-		t.Fatalf("default template remote must be unconfigured, got %+v", remote)
-	}
 	if remote.Repo != "" || remote.Ref != "" || remote.Path != "" {
 		t.Fatalf("default template remote must be all-empty, got %+v", remote)
-	}
-	// Resolved* fall back to the documented defaults.
-	if remote.ResolvedRef() != DefaultTemplateRemoteRef {
-		t.Fatalf("ResolvedRef default = %q, want %q", remote.ResolvedRef(), DefaultTemplateRemoteRef)
-	}
-	if remote.ResolvedPath() != DefaultTemplateRemotePath {
-		t.Fatalf("ResolvedPath default = %q, want %q", remote.ResolvedPath(), DefaultTemplateRemotePath)
 	}
 }
 
@@ -49,10 +39,7 @@ path = "agents"
 	if err != nil {
 		t.Fatalf("LoadTemplateRemote returned error: %v", err)
 	}
-	if !remote.Configured() {
-		t.Fatalf("template remote should be configured, got %+v", remote)
-	}
-	if remote.Repo != "jerry/my-templates" || remote.ResolvedRef() != "publish" || remote.ResolvedPath() != "agents" {
+	if remote.Repo != "jerry/my-templates" || remote.Ref != "publish" || remote.Path != "agents" {
 		t.Fatalf("parsed template remote = %+v", remote)
 	}
 }
@@ -114,7 +101,7 @@ func TestEnsureTemplateRemoteSectionAppendsThenSetRoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadTemplateRemote returned error: %v", err)
 	}
-	if remote.Repo != "jerry/templates" || remote.ResolvedPath() != "agents" {
+	if remote.Repo != "jerry/templates" || remote.Path != "agents" {
 		t.Fatalf("round-tripped template remote = %+v", remote)
 	}
 }

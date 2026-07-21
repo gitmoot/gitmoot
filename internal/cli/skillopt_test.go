@@ -2919,7 +2919,7 @@ func TestSkillOptTrainGenerationStampsCorrelationIDs(t *testing.T) {
 	defer store.Close()
 
 	const runID = "landing-train-review-001"
-	prefix := skillOptTrainGenerationCorrelationPrefix(runID)
+	prefix := "skillopt-train-generation:" + runID
 	if prefix != "skillopt-train-generation:"+runID {
 		t.Fatalf("correlation prefix = %q", prefix)
 	}
@@ -6565,9 +6565,9 @@ func TestSkillOptTrainCandidateReviewBodyMarksNoOpNotPromotable(t *testing.T) {
 	defer store.Close()
 
 	candidate := cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan with a changed candidate.")
-	version, err := skillopt.ImportCandidatePackage(context.Background(), store, candidate, "candidate.json")
+	version, err := skillopt.ImportCandidatePackageWithOptions(context.Background(), store, candidate, skillopt.CandidateImportOptions{SourcePath: "candidate.json"})
 	if err != nil {
-		t.Fatalf("ImportCandidatePackage returned error: %v", err)
+		t.Fatalf("ImportCandidatePackageWithOptions returned error: %v", err)
 	}
 	review, err := store.GetAgentTemplateCandidateReview(context.Background(), version.ID)
 	if err != nil {
@@ -6659,9 +6659,9 @@ func TestSkillOptTrainCandidateReviewBodyShowsTextSamplePreview(t *testing.T) {
 	defer store.Close()
 
 	candidate := cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan with a text reply candidate.")
-	version, err := skillopt.ImportCandidatePackage(context.Background(), store, candidate, "candidate.json")
+	version, err := skillopt.ImportCandidatePackageWithOptions(context.Background(), store, candidate, skillopt.CandidateImportOptions{SourcePath: "candidate.json"})
 	if err != nil {
-		t.Fatalf("ImportCandidatePackage returned error: %v", err)
+		t.Fatalf("ImportCandidatePackageWithOptions returned error: %v", err)
 	}
 	review, err := store.GetAgentTemplateCandidateReview(context.Background(), version.ID)
 	if err != nil {
@@ -6760,9 +6760,9 @@ func TestSkillOptTrainCandidateReviewRequiredPreviewKeepsBundleFailure(t *testin
 	defer store.Close()
 
 	candidate := cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan with a text reply candidate.")
-	version, err := skillopt.ImportCandidatePackage(context.Background(), store, candidate, "candidate.json")
+	version, err := skillopt.ImportCandidatePackageWithOptions(context.Background(), store, candidate, skillopt.CandidateImportOptions{SourcePath: "candidate.json"})
 	if err != nil {
-		t.Fatalf("ImportCandidatePackage returned error: %v", err)
+		t.Fatalf("ImportCandidatePackageWithOptions returned error: %v", err)
 	}
 	review, err := store.GetAgentTemplateCandidateReview(context.Background(), version.ID)
 	if err != nil {

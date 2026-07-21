@@ -87,7 +87,7 @@ func setDispatchLimitObserver(t *testing.T) (last func() int, seen func() []int)
 //     production installDaemonReloadHandler wiring. Synchronization is
 //     deterministic (an edge-triggered writer signal), not a sleep.
 //  3. Assert: the LIVE snapshot reflects the new workers/scheduler; the very next
-//     dispatch pass (the real runDaemonWorkerTick -> runQueuedJobsForRepo path)
+//     dispatch pass (the real runDaemonWorkerTickTracked -> runQueuedJobsForRepo path)
 //     reads the NEW limit; the process is not torn down; the launch env token is
 //     untouched (no re-inherit); and the explicit poll flag survives the reload
 //     (the file omitted poll, so the flag override is preserved).
@@ -140,8 +140,8 @@ func TestWarmReloadE2EChangesRunningDispatch(t *testing.T) {
 		_, workers, usePool := live.snapshot()
 		w := worker
 		w.UsePool = usePool
-		if err := runDaemonWorkerTick(ctx, store, w, workers, false, "owner/repo", "", io.Discard, time.Now().UTC()); err != nil {
-			t.Fatalf("runDaemonWorkerTick: %v", err)
+		if err := runDaemonWorkerTickTracked(ctx, store, w, workers, false, "owner/repo", "", io.Discard, time.Now().UTC(), nil, nil); err != nil {
+			t.Fatalf("runDaemonWorkerTickTracked: %v", err)
 		}
 	}
 

@@ -94,14 +94,6 @@ func evictConditionalEntry(key string) {
 	conditionalRequests.Unlock()
 }
 
-// resetConditionalForTest restores a deterministic cold, enabled cache.
-func resetConditionalForTest() {
-	conditionalRequests.Lock()
-	conditionalRequests.enabled = true
-	conditionalRequests.entries = map[string]conditionalCacheEntry{}
-	conditionalRequests.Unlock()
-}
-
 type conditionalResponse struct {
 	status  int
 	etag    string

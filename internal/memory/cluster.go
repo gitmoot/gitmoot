@@ -114,14 +114,6 @@ type ClusterHierarchyOptions struct {
 	Existing   []ClusterHierarchyState
 }
 
-func DefaultClusterHierarchyOptions() ClusterHierarchyOptions {
-	return ClusterHierarchyOptions{
-		Fanout:     DefaultClusterFanout,
-		FanoutKeep: DefaultClusterFanoutKeep,
-		DepthCap:   DefaultClusterHierarchyCap,
-	}
-}
-
 // ClusterResult is the full deterministic clustering.
 type ClusterResult struct {
 	Clusters []Cluster // real communities first (ascending medoid id), then the unclustered bucket if non-empty
@@ -269,29 +261,6 @@ func BuildClusters(nodes []ClusterNode, edges []ClusterEdge) ClusterResult {
 		})
 	}
 	return result
-}
-
-// BuildClusterHierarchy is the compatibility entry point for callers that only
-// know the original one-level split state. New callers should use
-// BuildClusterHierarchyWithOptions so fan-out and medoid-path state are explicit.
-func BuildClusterHierarchy(nodes []ClusterNode, edges []ClusterEdge, existingSplitParentMedoids map[int64]bool) ClusterResult {
-	options := DefaultClusterHierarchyOptions()
-	for medoid, split := range existingSplitParentMedoids {
-		if split {
-			options.Existing = append(options.Existing, ClusterHierarchyState{Level: 1, MedoidPath: []int64{medoid}})
-		}
-	}
-	return BuildClusterHierarchyWithOptions(nodes, edges, options)
-}
-
-func buildClusterHierarchy(top ClusterResult, nodes []ClusterNode, edges []ClusterEdge, existingSplitParentMedoids map[int64]bool) ClusterResult {
-	options := DefaultClusterHierarchyOptions()
-	for medoid, split := range existingSplitParentMedoids {
-		if split {
-			options.Existing = append(options.Existing, ClusterHierarchyState{Level: 1, MedoidPath: []int64{medoid}})
-		}
-	}
-	return buildClusterHierarchyWithOptions(top, nodes, edges, options)
 }
 
 // BuildClusterHierarchyWithOptions recursively applies the existing fact-size

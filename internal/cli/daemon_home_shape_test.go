@@ -293,7 +293,7 @@ func TestSupervisorPollerWorkflowArtifactRootResolvedNoPhantom(t *testing.T) {
 	assertNoPhantom(t, home)
 }
 
-// The legacy/test poller construction (pollRegisteredRepos passes "","") stays a
+// The direct test poller construction (pollRegisteredReposWithPoller passes "","") stays a
 // no-op: nil engine wiring, default TTL, and no filesystem writes.
 func TestEmptyHomePollerIsNoOp(t *testing.T) {
 	poller := defaultRegisteredRepoPoller(nil, 1, false, io.Discard, "", "")

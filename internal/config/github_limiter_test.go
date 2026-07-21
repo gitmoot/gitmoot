@@ -28,9 +28,6 @@ func TestLoadGitHubLimiterPolicyDefaultsWhenAbsent(t *testing.T) {
 		t.Fatalf("policy = %+v, want default %+v", policy, want)
 	}
 	// Default is safe: no proactive smoothing, reactive backoff on.
-	if policy.ProactiveSmoothingEnabled() {
-		t.Fatalf("default policy must not enable proactive smoothing")
-	}
 	if !policy.SecondaryBackoffEnabled {
 		t.Fatalf("default policy must enable secondary backoff")
 	}
@@ -67,9 +64,6 @@ calls_per_hour_warn = 4000
 	}
 	if policy.ConditionalRequests || policy.CallsPerHourWarn != 4000 {
 		t.Fatalf("conditional/accounting = %t/%d, want false/4000", policy.ConditionalRequests, policy.CallsPerHourWarn)
-	}
-	if !policy.ProactiveSmoothingEnabled() {
-		t.Fatalf("cap/interval set should report proactive smoothing enabled")
 	}
 }
 

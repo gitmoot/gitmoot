@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -186,7 +187,7 @@ stages:
 	if implDone.State != StageSucceeded {
 		t.Fatalf("impl stage = %s, want succeeded", implDone.State)
 	}
-	if pipelineSummaryIsSkipped(implDone.Summary) {
+	if strings.HasPrefix(implDone.Summary, pipelineSkippedSummaryMarker) {
 		t.Fatalf("impl summary retained forged skipped marker: %q", implDone.Summary)
 	}
 	if implDone.Summary != "landed the fix (opened PR #42)" {

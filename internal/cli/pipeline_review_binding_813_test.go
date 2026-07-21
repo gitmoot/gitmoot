@@ -508,7 +508,7 @@ stages:
 			}
 
 			worker := defaultJobWorker(store, io.Discard, home)
-			if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now.Add(2*time.Second)); err != nil {
+			if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now.Add(2*time.Second), nil, nil); err != nil {
 				t.Fatalf("review worker tick: %v", err)
 			}
 			events, err := store.ListJobEvents(ctx, reviewJob.ID)

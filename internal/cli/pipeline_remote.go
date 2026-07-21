@@ -33,11 +33,6 @@ var newPipelineRemoteSource = func() agenttemplate.RemoteSource {
 	return agenttemplate.GHFetcher{}
 }
 
-func configuredPipelineRemote(home string) (config.PipelineRemotePolicy, bool) {
-	remote, ok := configuredGitHubRemote(home, loadPipelineGitHubRemote)
-	return config.PipelineRemotePolicy(remote), ok
-}
-
 func loadPipelineGitHubRemote(paths config.Paths) (config.GitHubRemotePolicy, error) {
 	remote, err := config.LoadPipelineRemote(paths)
 	return config.GitHubRemotePolicy(remote), err

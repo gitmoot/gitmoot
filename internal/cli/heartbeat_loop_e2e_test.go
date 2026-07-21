@@ -144,7 +144,7 @@ func TestHeartbeatLoopFullChainE2E(t *testing.T) {
 
 	// The REAL worker tick claims + runs the queued job through the shell adapter.
 	worker := defaultJobWorker(store, io.Discard, home)
-	if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now0); err != nil {
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now0, nil, nil); err != nil {
 		t.Fatalf("worker tick 1: %v", err)
 	}
 	ranJob, err := store.GetJob(ctx, firstJobID)
@@ -177,7 +177,7 @@ func TestHeartbeatLoopFullChainE2E(t *testing.T) {
 	if err := runHeartbeatScanOnce(ctx, paths, restartStore, restartEnqueue, nowRestart); err != nil {
 		t.Fatalf("scan after restart: %v", err)
 	}
-	if err := runEnabledRepoWorkerTicks(ctx, restartStore, restartWorker, 1, io.Discard, nowRestart); err != nil {
+	if err := runEnabledRepoWorkerTicksTracked(ctx, restartStore, restartWorker, 1, "", io.Discard, nowRestart, nil, nil); err != nil {
 		t.Fatalf("worker tick after restart: %v", err)
 	}
 	if got := countHeartbeatJobs(t, restartStore); len(got) != 1 {
@@ -195,7 +195,7 @@ func TestHeartbeatLoopFullChainE2E(t *testing.T) {
 	if len(jobs2) != 2 {
 		t.Fatalf("second due window must enqueue one more job (total 2), got %d: %+v", len(jobs2), jobs2)
 	}
-	if err := runEnabledRepoWorkerTicks(ctx, restartStore, restartWorker, 1, io.Discard, now1); err != nil {
+	if err := runEnabledRepoWorkerTicksTracked(ctx, restartStore, restartWorker, 1, "", io.Discard, now1, nil, nil); err != nil {
 		t.Fatalf("worker tick 2: %v", err)
 	}
 	state2, _, err := restartStore.GetHeartbeatState(ctx, "maintainer", "beat")
@@ -283,7 +283,7 @@ func TestHeartbeatLoopReviewActionFullChainE2E(t *testing.T) {
 	// The REAL worker dispatches the review job through the shell adapter, and the
 	// engine's PR-less-review guard advances it to TERMINAL succeeded.
 	worker := defaultJobWorker(store, io.Discard, home)
-	if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now0); err != nil {
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now0, nil, nil); err != nil {
 		t.Fatalf("review worker tick: %v", err)
 	}
 	ranJob, err := store.GetJob(ctx, reviewJobID)
@@ -330,7 +330,7 @@ func TestHeartbeatLoopOffByDefaultE2E(t *testing.T) {
 		t.Fatalf("off-by-default scan: %v", err)
 	}
 	worker := defaultJobWorker(store, io.Discard, home)
-	if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now); err != nil {
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now, nil, nil); err != nil {
 		t.Fatalf("off-by-default worker tick: %v", err)
 	}
 	if jobs := countHeartbeatJobs(t, store); len(jobs) != 0 {

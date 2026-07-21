@@ -3,10 +3,8 @@ package cli
 import (
 	"context"
 
-	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
-	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 type pipelineStageEnvAccess = pipeline.PipelineStageEnvAccess
@@ -27,26 +25,6 @@ const (
 	pipelineEnvFileStatusBadLocation = pipeline.PipelineEnvFileStatusBadLocation
 	pipelineEnvFileStatusInvalid     = pipeline.PipelineEnvFileStatusInvalid
 )
-
-func resolvePipelineEnvironment(ctx context.Context, store *db.Store, home string, spec pipeline.Spec) (pipelineEnvironmentResolution, error) {
-	return pipeline.ResolvePipelineEnvironment(ctx, store, home, spec)
-}
-
-func pipelineEnvironmentResolutionError(spec pipeline.Spec, unresolved []pipelineEnvUnresolved) error {
-	return pipeline.PipelineEnvironmentResolutionError(spec, unresolved)
-}
-
-func resolvePipelineStageEnvAccess(ctx context.Context, store *db.Store, home string, spec pipeline.Spec, stage pipeline.Stage) (pipelineStageEnvAccess, error) {
-	return pipeline.ResolvePipelineStageEnvAccess(ctx, store, home, spec, stage)
-}
-
-func wrapPipelineEnvDeliveryAdapter(store *db.Store, home string, payload workflow.JobPayload, inner workflow.DeliveryAdapter) workflow.DeliveryAdapter {
-	return pipeline.WrapPipelineEnvDeliveryAdapter(store, home, payload, inner)
-}
-
-func configPathsForPipelineStore(store *db.Store, home string) (config.Paths, error) {
-	return pipeline.ConfigPathsForPipelineStore(store, home)
-}
 
 func classifyPipelineEnvFile(ctx context.Context, store *db.Store, home, declared string) pipelineEnvFileInspection {
 	return pipeline.ClassifyPipelineEnvFile(ctx, store, home, declared)

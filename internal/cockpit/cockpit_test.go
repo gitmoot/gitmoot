@@ -3,6 +3,7 @@ package cockpit
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,6 +14,33 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
+
+func newTestCockpit(opts Options, store PaneStore, run runner, lookPath func(string) (string, error)) *Cockpit {
+	if opts.HerdrBin == "" {
+		opts.HerdrBin = "herdr"
+	}
+	if opts.MaxPanes <= 0 {
+		opts.MaxPanes = defaultMaxPanes
+	}
+	if opts.PaneKeyMode == "" {
+		opts.PaneKeyMode = PaneKeyModeJob
+	}
+	return &Cockpit{
+		client:     herdrClient{run: run, bin: opts.HerdrBin, lookPath: lookPath},
+		store:      store,
+		opts:       opts,
+		gitmootBin: "gitmoot",
+		logger:     slog.Default(),
+		now:        time.Now,
+		removeAll:  os.RemoveAll,
+		sleepAfter: func(_ time.Duration, fn func()) *time.Timer {
+			fn()
+			timer := time.NewTimer(0)
+			timer.Stop()
+			return timer
+		},
+	}
+}
 
 // fakeRunner records every herdr invocation and returns canned stdout (and an
 // optional error) keyed by the first two args (the herdr subcommand path). It
@@ -270,14 +298,14 @@ func sampleMeta() JobMeta {
 
 func TestAvailable(t *testing.T) {
 	t.Run("up", func(t *testing.T) {
-		c := newWithRunner(Options{}, newFakeStore(), newFakeRunner().run, okLookPath)
+		c := newTestCockpit(Options{}, newFakeStore(), newFakeRunner().run, okLookPath)
 		if !c.Available(context.Background()) {
 			t.Fatal("expected available")
 		}
 	})
 	t.Run("binary absent ⇒ no runner calls", func(t *testing.T) {
 		fr := newFakeRunner()
-		c := newWithRunner(Options{}, newFakeStore(), fr.run, failLookPath)
+		c := newTestCockpit(Options{}, newFakeStore(), fr.run, failLookPath)
 		if c.Available(context.Background()) {
 			t.Fatal("expected unavailable when binary absent")
 		}
@@ -288,7 +316,7 @@ func TestAvailable(t *testing.T) {
 	t.Run("server down", func(t *testing.T) {
 		fr := newFakeRunner()
 		fr.replies["status"] = reply{stdout: `{"server":{"running":false}}`}
-		c := newWithRunner(Options{}, newFakeStore(), fr.run, okLookPath)
+		c := newTestCockpit(Options{}, newFakeStore(), fr.run, okLookPath)
 		if c.Available(context.Background()) {
 			t.Fatal("expected unavailable when server not running")
 		}
@@ -296,7 +324,7 @@ func TestAvailable(t *testing.T) {
 	t.Run("status errors", func(t *testing.T) {
 		fr := newFakeRunner()
 		fr.replies["status"] = reply{err: errors.New("socket gone")}
-		c := newWithRunner(Options{}, newFakeStore(), fr.run, okLookPath)
+		c := newTestCockpit(Options{}, newFakeStore(), fr.run, okLookPath)
 		if c.Available(context.Background()) {
 			t.Fatal("expected unavailable when status errors")
 		}
@@ -305,7 +333,7 @@ func TestAvailable(t *testing.T) {
 
 func TestAvailableMemoizesWithinTTL(t *testing.T) {
 	fr := newFakeRunner()
-	c := newWithRunner(Options{}, newFakeStore(), fr.run, okLookPath)
+	c := newTestCockpit(Options{}, newFakeStore(), fr.run, okLookPath)
 	now := time.Unix(0, 0)
 	c.now = func() time.Time { return now }
 
@@ -342,7 +370,7 @@ func TestAvailableMemoizesWithinTTL(t *testing.T) {
 
 func TestWrapUnavailableReturnsInnerUntouched(t *testing.T) {
 	fr := newFakeRunner()
-	c := newWithRunner(Options{}, newFakeStore(), fr.run, failLookPath)
+	c := newTestCockpit(Options{}, newFakeStore(), fr.run, failLookPath)
 	inner := &fakeInner{result: runtime.Result{Summary: "done"}}
 
 	got := c.Wrap(inner, sampleMeta())
@@ -358,7 +386,7 @@ func TestWrapUnavailableReturnsInnerUntouched(t *testing.T) {
 }
 
 func TestWrapNilInner(t *testing.T) {
-	c := newWithRunner(Options{}, newFakeStore(), newFakeRunner().run, okLookPath)
+	c := newTestCockpit(Options{}, newFakeStore(), newFakeRunner().run, okLookPath)
 	if c.Wrap(nil, sampleMeta()) != nil {
 		t.Fatal("expected nil inner to pass through")
 	}
@@ -367,7 +395,7 @@ func TestWrapNilInner(t *testing.T) {
 func TestWrapDeliverCommandSequence(t *testing.T) {
 	fr := newFakeRunner()
 	store := newFakeStore()
-	c := newWithRunner(Options{}, store, fr.run, okLookPath)
+	c := newTestCockpit(Options{}, store, fr.run, okLookPath)
 	inner := &fakeInner{result: runtime.Result{Decision: "approve", Summary: "ok", Raw: "raw"}}
 
 	adapter := c.Wrap(inner, sampleMeta())
@@ -421,7 +449,7 @@ func TestWrapDeliverDeletesPaneRowByJobOnClose(t *testing.T) {
 	// a re-run of the same job can reclaim its (workspace_id, pane_key) slot.
 	fr := newFakeRunner()
 	store := newFakeStore()
-	c := newWithRunner(Options{}, store, fr.run, okLookPath)
+	c := newTestCockpit(Options{}, store, fr.run, okLookPath)
 	inner := &fakeInner{result: runtime.Result{Summary: "ok"}}
 
 	adapter := c.Wrap(inner, sampleMeta())
@@ -444,7 +472,7 @@ func TestWrapDeliverDeletesPaneRowByJobOnClose(t *testing.T) {
 
 func TestWrapDeliverArgsCarryVerifiedFields(t *testing.T) {
 	fr := newFakeRunner()
-	c := newWithRunner(Options{}, newFakeStore(), fr.run, okLookPath)
+	c := newTestCockpit(Options{}, newFakeStore(), fr.run, okLookPath)
 	inner := &fakeInner{}
 	adapter := c.Wrap(inner, sampleMeta())
 	if _, err := adapter.Deliver(context.Background(), runtime.Agent{}, runtime.Job{}); err != nil {
@@ -487,7 +515,7 @@ func TestWrapDeliverFallsBackToDerivedRootPaneWhenEmpty(t *testing.T) {
 	store := newFakeStore()
 	// Seed a legacy row: workspace bound, root pane id absent (migration default '').
 	store.workspaces[sampleMeta().RootJobID] = "w1"
-	c := newWithRunner(Options{}, store, fr.run, okLookPath)
+	c := newTestCockpit(Options{}, store, fr.run, okLookPath)
 	if _, err := c.Wrap(&fakeInner{}, sampleMeta()).Deliver(context.Background(), runtime.Agent{}, runtime.Job{}); err != nil {
 		t.Fatal(err)
 	}
@@ -553,7 +581,7 @@ func TestWrapDeliverPaneRunTailsLogPath(t *testing.T) {
 	// End-to-end through Wrap/Deliver: a meta carrying LogPath makes the pane-run
 	// command tail the streamed log rather than run job-watch.
 	fr := newFakeRunner()
-	c := newWithRunner(Options{}, newFakeStore(), fr.run, okLookPath)
+	c := newTestCockpit(Options{}, newFakeStore(), fr.run, okLookPath)
 	meta := sampleMeta()
 	meta.LogPath = "/tmp/logs/jobs/abcdef0123456789.log"
 	adapter := c.Wrap(&fakeInner{}, meta)
@@ -574,7 +602,7 @@ func TestWrapSwallowsHerdrErrors(t *testing.T) {
 	// result is unchanged.
 	fr := newFakeRunner()
 	fr.replies["pane split"] = reply{err: errors.New("herdr boom")}
-	c := newWithRunner(Options{}, newFakeStore(), fr.run, okLookPath)
+	c := newTestCockpit(Options{}, newFakeStore(), fr.run, okLookPath)
 	inner := &fakeInner{result: runtime.Result{Summary: "still-ok"}}
 
 	adapter := c.Wrap(inner, sampleMeta())
@@ -603,7 +631,7 @@ func TestWrapSwallowsLabelAndPersistErrors(t *testing.T) {
 	fr.replies["pane report-agent"] = reply{err: errors.New("status boom")}
 	store := newFakeStore()
 	store.insertErr = errors.New("db boom")
-	c := newWithRunner(Options{}, store, fr.run, okLookPath)
+	c := newTestCockpit(Options{}, store, fr.run, okLookPath)
 	inner := &fakeInner{result: runtime.Result{Summary: "ok"}}
 
 	adapter := c.Wrap(inner, sampleMeta())
@@ -632,7 +660,7 @@ func TestWrapHonorsMaxPanes(t *testing.T) {
 	// Pre-seed MaxPanes panes under the root so the next open is status-only.
 	store.panes["pre1"] = Pane{JobID: "pre1", RootJobID: "root00001111"}
 	store.panes["pre2"] = Pane{JobID: "pre2", RootJobID: "root00001111"}
-	c := newWithRunner(Options{MaxPanes: 2}, store, fr.run, okLookPath)
+	c := newTestCockpit(Options{MaxPanes: 2}, store, fr.run, okLookPath)
 	inner := &fakeInner{result: runtime.Result{Summary: "ok"}}
 
 	adapter := c.Wrap(inner, sampleMeta())
@@ -651,7 +679,7 @@ func TestWrapHonorsMaxPanes(t *testing.T) {
 
 func TestWrapPropagatesInnerError(t *testing.T) {
 	fr := newFakeRunner()
-	c := newWithRunner(Options{}, newFakeStore(), fr.run, okLookPath)
+	c := newTestCockpit(Options{}, newFakeStore(), fr.run, okLookPath)
 	innerErr := errors.New("delivery failed")
 	inner := &fakeInner{err: innerErr}
 
@@ -744,7 +772,7 @@ func seatMeta(jobID, paneKey string) JobMeta {
 func TestSeatModeReusesPaneAcrossRounds(t *testing.T) {
 	fr := newFakeRunner()
 	store := newFakeStore()
-	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, store, fr.run, okLookPath)
+	c := newTestCockpit(Options{PaneKeyMode: PaneKeyModeSeat}, store, fr.run, okLookPath)
 
 	round1 := c.Wrap(&fakeInner{}, seatMeta("job-r1", "builder"))
 	if _, err := round1.Deliver(context.Background(), runtime.Agent{}, runtime.Job{}); err != nil {
@@ -781,7 +809,7 @@ func TestSeatModeDistinctSeatsSplitDistinctPanes(t *testing.T) {
 	fr := newFakeRunner()
 	fr.replies["pane split"] = reply{stdout: `{"result":{"pane":{"pane_id":"w1:pX"}}}`}
 	store := newFakeStore()
-	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, store, fr.run, okLookPath)
+	c := newTestCockpit(Options{PaneKeyMode: PaneKeyModeSeat}, store, fr.run, okLookPath)
 
 	a := c.Wrap(&fakeInner{}, seatMeta("job-a", "builder"))
 	if _, err := a.Deliver(context.Background(), runtime.Agent{}, runtime.Job{}); err != nil {
@@ -804,7 +832,7 @@ func TestSeatModeDistinctSeatsSplitDistinctPanes(t *testing.T) {
 // the agent idle but never releases/closes the pane (that is root-finalize's job).
 func TestSeatModeDeliverMarksIdleNotClosed(t *testing.T) {
 	fr := newFakeRunner()
-	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, newFakeStore(), fr.run, okLookPath)
+	c := newTestCockpit(Options{PaneKeyMode: PaneKeyModeSeat}, newFakeStore(), fr.run, okLookPath)
 	adapter := c.Wrap(&fakeInner{}, seatMeta("job-1", "builder"))
 	if _, err := adapter.Deliver(context.Background(), runtime.Agent{}, runtime.Job{}); err != nil {
 		t.Fatal(err)
@@ -832,7 +860,7 @@ func TestSeatModeConvergesOnUniqueViolation(t *testing.T) {
 	// loser proceeds to split + insert and hits the UNIQUE constraint; the row is
 	// still present for the insert constraint + the post-violation by-key lookup.
 	hiding := &hideThenShowStore{fakeStore: base}
-	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, hiding, fr.run, okLookPath)
+	c := newTestCockpit(Options{PaneKeyMode: PaneKeyModeSeat}, hiding, fr.run, okLookPath)
 
 	adapter := c.Wrap(&fakeInner{}, seatMeta("loser-job", "builder"))
 	paneID := adapter.(*paneAdapter).open(context.Background())
@@ -871,7 +899,7 @@ func (s *hideThenShowStore) ListCockpitPanesByRoot(ctx context.Context, rootJobI
 func TestFinalizeRootClosesDeletesAndRemovesSeatLogs(t *testing.T) {
 	fr := newFakeRunner()
 	store := newFakeStore()
-	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, store, fr.run, okLookPath)
+	c := newTestCockpit(Options{PaneKeyMode: PaneKeyModeSeat}, store, fr.run, okLookPath)
 	home := t.TempDir()
 	c.home = home
 
@@ -914,7 +942,7 @@ func TestFinalizeRootClosesDeletesAndRemovesSeatLogs(t *testing.T) {
 // close calls beyond the list.
 func TestFinalizeRootNoPanesIsNoop(t *testing.T) {
 	fr := newFakeRunner()
-	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, newFakeStore(), fr.run, okLookPath)
+	c := newTestCockpit(Options{PaneKeyMode: PaneKeyModeSeat}, newFakeStore(), fr.run, okLookPath)
 	c.FinalizeRoot(context.Background(), "root-empty")
 	if countVerb(fr, "pane close") != 0 || countVerb(fr, "workspace close") != 0 {
 		t.Fatalf("finalize of an empty root must make no close calls; calls: %v", fr.calls)
@@ -929,7 +957,7 @@ func TestFinalizeRootNoPanesIsNoop(t *testing.T) {
 func TestFinalizeRootClosesRegistryWorkspaceWithoutPaneRows(t *testing.T) {
 	fr := newFakeRunner()
 	store := newFakeStore()
-	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeJob}, store, fr.run, okLookPath)
+	c := newTestCockpit(Options{PaneKeyMode: PaneKeyModeJob}, store, fr.run, okLookPath)
 
 	// Simulate a finished job-mode run: a workspace was registered for the root, but
 	// the pane row was already deleted on the per-Deliver grace close, so no rows
@@ -969,7 +997,7 @@ func TestFinalizeRootClosesRegistryWorkspaceWithoutPaneRows(t *testing.T) {
 func TestFinalizeRootDedupsPaneAndRegistryWorkspace(t *testing.T) {
 	fr := newFakeRunner()
 	store := newFakeStore()
-	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, store, fr.run, okLookPath)
+	c := newTestCockpit(Options{PaneKeyMode: PaneKeyModeSeat}, store, fr.run, okLookPath)
 
 	adapter := c.Wrap(&fakeInner{}, seatMeta("job-a", "builder"))
 	if _, err := adapter.Deliver(context.Background(), runtime.Agent{}, runtime.Job{}); err != nil {
@@ -1002,7 +1030,7 @@ func TestReconcileDropsOrphans(t *testing.T) {
 	// orphan-active: pane gone but root NOT terminal -> kept
 	store.panes["job-active"] = Pane{ID: "id-active", JobID: "job-active", PaneID: "w1:gone2", RootJobID: "root-busy", WorkspaceID: "w1"}
 
-	c := newWithRunner(Options{}, store, fr.run, okLookPath)
+	c := newTestCockpit(Options{}, store, fr.run, okLookPath)
 	terminal := func(root string) bool { return root == "root-done" }
 	c.Reconcile(context.Background(), terminal)
 
@@ -1029,7 +1057,7 @@ func TestReconcileSkipsWhenPaneListUnavailable(t *testing.T) {
 	fr.replies["pane list"] = reply{err: errors.New("herdr down")}
 	store := newFakeStore()
 	store.panes["job-orphan"] = Pane{ID: "id-orphan", JobID: "job-orphan", PaneID: "w1:gone", RootJobID: "root-done", WorkspaceID: "w1"}
-	c := newWithRunner(Options{}, store, fr.run, okLookPath)
+	c := newTestCockpit(Options{}, store, fr.run, okLookPath)
 	c.Reconcile(context.Background(), func(string) bool { return true })
 	all, _ := store.ListAllCockpitPanes(context.Background())
 	if len(all) != 1 {
@@ -1043,7 +1071,7 @@ func TestFocusRootFocusesWorkspace(t *testing.T) {
 	fr := newFakeRunner()
 	store := newFakeStore()
 	store.panes["coord"] = Pane{ID: "id-c", JobID: "coord", PaneID: "w7:pC", RootJobID: "root-x", WorkspaceID: "w7"}
-	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, store, fr.run, okLookPath)
+	c := newTestCockpit(Options{PaneKeyMode: PaneKeyModeSeat}, store, fr.run, okLookPath)
 	c.FocusRoot(context.Background(), "root-x")
 	joined := strings.Join(fr.calls, "\n")
 	if !strings.Contains(joined, "workspace focus w7") {
@@ -1051,7 +1079,7 @@ func TestFocusRootFocusesWorkspace(t *testing.T) {
 	}
 
 	fr2 := newFakeRunner()
-	c2 := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, newFakeStore(), fr2.run, okLookPath)
+	c2 := newTestCockpit(Options{PaneKeyMode: PaneKeyModeSeat}, newFakeStore(), fr2.run, okLookPath)
 	c2.FocusRoot(context.Background(), "root-none")
 	if countVerb(fr2, "workspace focus") != 0 {
 		t.Fatalf("focus with no panes must be a no-op; calls: %v", fr2.calls)
@@ -1064,7 +1092,7 @@ func TestFocusRootFocusesWorkspace(t *testing.T) {
 func TestJobModeGraceCloseStillTearsDown(t *testing.T) {
 	fr := newFakeRunner()
 	store := newFakeStore()
-	c := newWithRunner(Options{}, store, fr.run, okLookPath) // default = job mode
+	c := newTestCockpit(Options{}, store, fr.run, okLookPath) // default = job mode
 	adapter := c.Wrap(&fakeInner{}, sampleMeta())
 	if _, err := adapter.Deliver(context.Background(), runtime.Agent{}, runtime.Job{ID: "abcdef0123456789"}); err != nil {
 		t.Fatal(err)
@@ -1084,7 +1112,7 @@ func TestJobModeGraceCloseStillTearsDown(t *testing.T) {
 
 // TestSeatLogPath builds the stable per-seat append-log path and slugs unsafe keys.
 func TestSeatLogPath(t *testing.T) {
-	c := newWithRunner(Options{PaneKeyMode: PaneKeyModeSeat}, newFakeStore(), newFakeRunner().run, okLookPath)
+	c := newTestCockpit(Options{PaneKeyMode: PaneKeyModeSeat}, newFakeStore(), newFakeRunner().run, okLookPath)
 	if got := c.SeatLogPath("root-x", "builder"); got != "" {
 		t.Fatalf("empty home must yield empty seat-log path, got %q", got)
 	}

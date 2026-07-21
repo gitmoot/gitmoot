@@ -136,7 +136,7 @@ func runPipelineShellUpstreamContextE2E(t *testing.T, name, sourceSummary string
 	worker := defaultJobWorker(store, io.Discard, home)
 	now := time.Date(2026, 7, 12, 9, 0, 0, 0, time.UTC)
 	for i := 0; i < 10; i++ {
-		if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now); err != nil {
+		if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now, nil, nil); err != nil {
 			t.Fatalf("worker tick %d: %v", i, err)
 		}
 		if err := runPipelineScanOnce(ctx, store, enqueue, now); err != nil {

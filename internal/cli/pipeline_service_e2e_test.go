@@ -113,7 +113,7 @@ func TestPipelineServiceAcceptanceE2E(t *testing.T) {
 	enqueue := newPipelineStageEnqueuer(store, home)
 	now := time.Now().UTC()
 	for i := 0; i < 8; i++ {
-		if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now.Add(time.Duration(i)*time.Second)); err != nil {
+		if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now.Add(time.Duration(i)*time.Second), nil, nil); err != nil {
 			t.Fatalf("worker tick %d: %v", i, err)
 		}
 		if err := runPipelineScanOnce(ctx, store, enqueue, now.Add(time.Duration(i)*time.Second)); err != nil {
@@ -377,7 +377,7 @@ func TestPipelineServiceAcceptanceE2E(t *testing.T) {
 	decodeResponse(t, oversizeAcceptedResponse, &oversizeAccepted)
 	oversizeNow := time.Now().UTC()
 	for i := 0; i < 8; i++ {
-		if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, oversizeNow.Add(time.Duration(i)*time.Second)); err != nil {
+		if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, oversizeNow.Add(time.Duration(i)*time.Second), nil, nil); err != nil {
 			t.Fatalf("oversize worker tick %d: %v", i, err)
 		}
 		if err := runPipelineScanOnce(ctx, store, enqueue, oversizeNow.Add(time.Duration(i)*time.Second)); err != nil {

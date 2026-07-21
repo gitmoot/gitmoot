@@ -457,10 +457,6 @@ func servicePipelinePublicSafetyError(spec pipeline.Spec) error {
 	return nil
 }
 
-func servicePipelineIsPublicSafe(spec pipeline.Spec) bool {
-	return servicePipelinePublicSafetyError(spec) == nil
-}
-
 func canonicalPipelineServicePayload(values map[string]pipeline.TypedValue) ([]byte, error) {
 	native := make(map[string]any, len(values))
 	for name, value := range values {

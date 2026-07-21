@@ -5,18 +5,6 @@ import (
 	"testing"
 )
 
-func TestTextDriverPreview(t *testing.T) {
-	driver := TextDriver{PreviewLines: 2}
-
-	preview := driver.Preview([]byte("one\ntwo\nthree\n"))
-
-	for _, want := range []string{"one", "two", "... 1 more lines"} {
-		if !strings.Contains(preview, want) {
-			t.Fatalf("preview missing %q:\n%s", want, preview)
-		}
-	}
-}
-
 func TestTextDriverDiff(t *testing.T) {
 	driver := TextDriver{}
 

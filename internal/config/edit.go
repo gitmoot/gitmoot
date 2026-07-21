@@ -75,11 +75,10 @@ type ConfigScalar struct {
 	list  []string
 }
 
-// StringScalar / IntScalar / FloatScalar / BoolScalar / StringListScalar
+// StringScalar / IntScalar / BoolScalar / StringListScalar
 // construct a ConfigScalar.
 func StringScalar(v string) ConfigScalar       { return ConfigScalar{str: &v} }
 func IntScalar(v int) ConfigScalar             { return ConfigScalar{num: &v} }
-func FloatScalar(v float64) ConfigScalar       { return ConfigScalar{float: &v} }
 func BoolScalar(v bool) ConfigScalar           { return ConfigScalar{flag: &v} }
 func StringListScalar(v []string) ConfigScalar { return ConfigScalar{list: v} }
 

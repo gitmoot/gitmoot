@@ -225,7 +225,7 @@ func TestRuntimeOverrideDaemonBackgroundShellE2E(t *testing.T) {
 
 	// The REAL worker tick honors the payload's override.
 	worker := defaultJobWorker(store, io.Discard, home)
-	if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, time.Now().UTC()); err != nil {
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, time.Now().UTC(), nil, nil); err != nil {
 		t.Fatalf("worker tick: %v", err)
 	}
 	assertRuntimeOverrideInvariants(t, store, home, output.JobID, marker)

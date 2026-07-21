@@ -95,8 +95,8 @@ func TestSessionJobFullChainE2E(t *testing.T) {
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "engine-ask-1", Agent: "lead", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
 	adapter := &cliWorkerFakeAdapter{output: poolSchedulerAskResult}
 	worker := poolSchedulerWorker(t, store, adapter, false)
-	if err := runDaemonWorkerTick(ctx, store, worker, 1, false, "owner/repo", "", io.Discard, time.Now().UTC()); err != nil {
-		t.Fatalf("runDaemonWorkerTick(dispatch) returned error: %v", err)
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, 1, false, "owner/repo", "", io.Discard, time.Now().UTC(), nil, nil); err != nil {
+		t.Fatalf("runDaemonWorkerTickTracked(dispatch) returned error: %v", err)
 	}
 	delivered := adapter.deliveredIDs()
 	if !containsString(delivered, "engine-ask-1") {

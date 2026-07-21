@@ -204,44 +204,6 @@ func New(opts Options, store PaneStore) *Cockpit {
 	}
 }
 
-// newWithRunner builds a Cockpit around an injected herdr runner and lookPath.
-// It backs the package tests, which drive the full pane lifecycle against a fake
-// runner (no real herdr server), and keeps gitmootBin/home deterministic.
-func newWithRunner(opts Options, store PaneStore, run runner, lookPath func(string) (string, error)) *Cockpit {
-	if opts.HerdrBin == "" {
-		opts.HerdrBin = "herdr"
-	}
-	if opts.MaxPanes <= 0 {
-		opts.MaxPanes = defaultMaxPanes
-	}
-	if opts.PaneKeyMode == "" {
-		opts.PaneKeyMode = PaneKeyModeJob
-	}
-	return &Cockpit{
-		client:     herdrClient{run: run, bin: opts.HerdrBin, lookPath: lookPath},
-		store:      store,
-		opts:       opts,
-		gitmootBin: "gitmoot",
-		home:       "",
-		logger:     slog.Default(),
-		now:        time.Now,
-		removeAll:  os.RemoveAll,
-		// Tests run the grace-close synchronously so the job-mode teardown sequence
-		// is observable inline (production uses the real time.AfterFunc timer).
-		sleepAfter: syncAfterFunc,
-	}
-}
-
-// syncAfterFunc runs fn immediately and returns a stopped timer. It is the
-// test-constructor's sleepAfter so the grace-close teardown is deterministic and
-// inline rather than firing on a real timer.
-func syncAfterFunc(_ time.Duration, fn func()) *time.Timer {
-	fn()
-	t := time.NewTimer(0)
-	t.Stop()
-	return t
-}
-
 const defaultMaxPanes = 4
 
 // defaultGraceClose is the default delay before a JOB-mode pane is torn down on

@@ -13,13 +13,6 @@ type PullRequestRef struct {
 	Number int
 }
 
-func (r PullRequestRef) Repository() string {
-	if r.Owner == "" || r.Repo == "" {
-		return ""
-	}
-	return r.Owner + "/" + r.Repo
-}
-
 func ParsePullRequestURL(raw string) (PullRequestRef, error) {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {

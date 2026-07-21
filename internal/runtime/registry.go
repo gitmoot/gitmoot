@@ -91,11 +91,6 @@ func (r Registry) Metadata(name string) (RuntimeMetadata, bool) {
 	return m.clone(), true
 }
 
-// Names returns the runtime names in registration order.
-func (r Registry) Names() []string {
-	return append([]string(nil), r.order...)
-}
-
 // All returns every runtime's metadata in registration order.
 func (r Registry) All() []RuntimeMetadata {
 	out := make([]RuntimeMetadata, 0, len(r.order))

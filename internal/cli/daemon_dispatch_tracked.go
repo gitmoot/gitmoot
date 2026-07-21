@@ -107,14 +107,6 @@ func (t *inflightJobTracker) jobContext(fallback context.Context) context.Contex
 	return t.runCtx
 }
 
-// begin registers a job as in flight, holding its checkout/runtime keys. It
-// returns false (and registers nothing) when the job is already in flight — the
-// double-dispatch guard for the window in which a claimed job is still 'queued'
-// in the DB.
-func (t *inflightJobTracker) begin(jobID, repo, checkoutKey, runtimeKey string) bool {
-	return t.beginWithin(0, jobID, repo, checkoutKey, runtimeKey)
-}
-
 // beginWithin is begin with an ATOMIC host-global admission check: when
 // hostCap > 0 it refuses (registering nothing) if the tracker already has
 // hostCap jobs in flight across all repos. The check must live under the same
@@ -442,13 +434,6 @@ var (
 	heldBackWarnMu    sync.Mutex
 	heldBackWarnByJob = map[string]heldBackWarnState{}
 )
-
-// resetHeldBackWarnThrottle clears the held-back log de-dup state. Test-only.
-func resetHeldBackWarnThrottle() {
-	heldBackWarnMu.Lock()
-	defer heldBackWarnMu.Unlock()
-	heldBackWarnByJob = map[string]heldBackWarnState{}
-}
 
 // warnJobHeldBack emits ONE throttled line explaining why a queued job was not
 // dispatched this tick (#562 point 5: these exclusions used to be silent). The

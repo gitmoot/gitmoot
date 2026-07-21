@@ -780,18 +780,8 @@ func setFeedbackItemSignal(entry *feedbackFileEntry, key string, value string) {
 	}
 }
 
-func splitRankingString(value string) []string {
-	labels, _ := splitRankingStringWithTieGroups(value)
-	return labels
-}
-
 func splitRankingStringWithTieGroups(value string) ([]string, [][]string) {
 	return splitRankingLabelsAndTieGroups([]string{value})
-}
-
-func splitRankingLabels(values []string) []string {
-	labels, _ := splitRankingLabelsAndTieGroups(values)
-	return labels
 }
 
 func splitRankingLabelsAndTieGroups(values []string) ([]string, [][]string) {
@@ -859,17 +849,6 @@ func trimStringList(values []string) []string {
 		return nil
 	}
 	return trimmed
-}
-
-func cloneTraitMap(values map[string][]string) map[string][]string {
-	if len(values) == 0 {
-		return nil
-	}
-	clone := make(map[string][]string, len(values))
-	for key, traits := range values {
-		clone[key] = append([]string(nil), traits...)
-	}
-	return clone
 }
 
 func fencedBlocks(content string) []string {

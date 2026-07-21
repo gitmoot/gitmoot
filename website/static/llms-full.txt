@@ -2775,6 +2775,29 @@ Pipelines are **off by default**: with no pipelines defined, the daemon's
 pipeline scan returns an empty list before touching any state, and behavior is
 unchanged.
 
+## Code map
+
+The pipeline engine lives in `internal/pipeline`. Start with `run.go` for run
+creation, scheduling, stage enqueue requests, advancement, settlement, worktree
+context, and job-event timestamps. Service admission, proof finalization, and
+artifact collection live beside it in `service*.go`; environment delivery and
+produce-path safety live in `env_runtime.go` and `core.go`.
+
+The engine uses three lower-level seams:
+
+- `internal/workflow` owns mailbox enqueueing, job and runtime-session locks,
+  result parsing, and read-only worktree cleanup.
+- `internal/db` owns persisted pipeline, run, stage, service-run, job, and event
+  state. Engine scans advance only from these stored snapshots.
+- `internal/runtime` supplies runtime identities and delivery adapters; pipeline
+  environment wrapping adds only the stage-scoped values already resolved by the
+  engine.
+
+`internal/cli` remains the command and presentation boundary. It parses
+`gitmoot pipeline ...`, renders CLI/dashboard views, owns GitHub bundle transport,
+and adapts the existing local implement-dispatch worktree allocator into the
+engine's stage enqueuer. The engine package never imports `internal/cli`.
+
 A pipeline is not an orchestra. Each stage is a **leaf**: it runs a shell command
 and returns a decision. A stage that emits `delegations[]` does **not** spawn
 children — the advancer ignores them and the engine strips them for a pipeline
@@ -2818,6 +2841,7 @@ stages:                     # the DAG, keyed by unique id and wired by needs
     env_keys: [SOURCE_API_TOKEN]
   - id: score
     cmd: "python score.py data.json"
+    isolate: true           # optional shell-only detached read-only worktree
     needs: [source]         # runs only after every listed stage SUCCEEDS
   - id: deploy
     cmd: "rclone copy out/ r2:bucket"
@@ -2849,6 +2873,7 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 | `allow_auto_merge`          | pipeline     | no       | Pipeline-level half of the auto-merge double key. Required with a gate's `merge: auto`; default `false`. It does not replace `allow_scheduled_writes` on scheduled pipelines. |
 | `stages[].id`               | stage        | yes      | Unique, name-safe stage id. Appears verbatim in the stage job's fingerprint and deterministic id. |
 | `stages[].cmd`              | stage        | cond.    | Shell command run verbatim via `sh -c` (see the stage contract below). A stage is **exactly one** of `cmd`, `agent`, or `gate`. |
+| `stages[].isolate`          | stage        | no       | Shell-only opt-in to a detached read-only committed-tip worktree, removing checkout-lock serialization so same-repo siblings with different commands can run concurrently. Default `false` preserves the shared checkout; rejected on non-shell stages. See [Shell-stage isolation](#shell-stage-isolation). |
 | `stages[].agent`            | stage        | cond.    | Name of a managed gitmoot agent to run this stage (instead of a shell `cmd`). Must be a name-safe token; `pipeline add` warns (does not block) if the agent does not exist yet, but it must exist before the stage runs. Mutually exclusive with `cmd`/`gate`. The stage kind depends on `action`/`write`/`orchestrate` — see [Agent stages](#agent-stages). |
 | `stages[].prompt`           | stage        | cond.    | Instruction handed to an agent stage's agent. **Required** for an agent stage; rejected for a shell/gate stage. Prepended with the upstream `needs` stages' result summaries at enqueue. |
 | `stages[].action`           | stage        | no       | `ask` (default), `review`, `implement`, or `produce`. Produce writes operator-owned data but never the repo or a PR. |
@@ -2872,7 +2897,8 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 non-name-safe name/id, a duplicate stage id, a stage that is not **exactly one** of
 `cmd`, `agent`, or `gate` (and, per kind: an agent stage's missing `prompt`, an
 invalid `action`, `implement` without `write: true` or `write: true` off an
-implement stage, a mutating stage on a scheduled pipeline without
+implement stage, `isolate: true` on a non-shell stage, a mutating stage on a
+scheduled pipeline without
 `allow_scheduled_writes`, a mutating stage on a triggered pipeline without
 `allow_triggered_writes`, a gate/review `source` that is not an upstream implement
 stage in `needs`, or `source` on another stage kind), an unknown/self/cyclic `needs`, an invalid
@@ -3035,6 +3061,34 @@ summary=$(jq -r '.stages.extract.summary' \
 Upstream summaries are **untrusted data flowing into your trusted script**. Parse
 them as data; never evaluate them as shell source, and do not put credentials in
 stage summaries.
+
+### Shell-stage isolation
+
+Non-service shell stages use the managed shared checkout by default, preserving
+access to uncommitted and gitignored files and commands that intentionally write
+there. Set `isolate: true` on a `cmd` stage to run it in a disposable detached
+read-only worktree at the checkout's committed tip. Isolated fork stages key on
+their own worktree paths, removing checkout-lock serialization so siblings with
+different commands can run concurrently. Agent stages already have their own
+isolation rules, so `isolate` is rejected on them.
+
+**Known v1 limitation (tracked follow-up):** two isolated forks with the identical `cmd`
+still share `runtime:shell:<hash(cmd)>` and serialize on that separate shell
+session lock. This field does not change runtime-session identity.
+
+This opt-in path is fail-open: if Gitmoot cannot allocate the worktree, it emits a
+`readonly_worktree_skipped` job event and runs the command in the shared checkout.
+On successful allocation, the shell environment includes the best-effort path
+`GITMOOT_CHECKOUT=<live managed checkout>` so the command can read gitignored
+`repos/**` or uncommitted data absent from the committed-tip worktree. Prefer the
+stage cwd for committed files. Treat `GITMOOT_CHECKOUT` as read-only: a concurrent
+default shell stage that mutates the live checkout can produce inconsistent reads
+(including a torn tree or `index.lock` contention), so do not run an isolated reader
+beside a checkout-mutating stage. The existing `GITMOOT_INPUT_*`,
+`GITMOOT_TRIGGER_*`, metadata, selected `env_keys`, and absolute upstream-context
+file remain available independent of the stage cwd.
+Service-triggered shell stages remain always isolated and fail closed; their policy
+does not depend on this field.
 
 ### Agent stages
 
@@ -12187,6 +12241,7 @@ stages:                     # the DAG, keyed by unique id and wired by needs
     env_keys: [SOURCE_API_TOKEN]
   - id: score
     cmd: "python score.py data.json"
+    isolate: true          # optional shell-only detached read-only worktree
     needs: [source]         # runs only after every listed stage SUCCEEDS
   - id: triage              # an AGENT stage instead of a shell cmd (exactly one of cmd|agent|gate)
     agent: reply-triager    #   #757 read-only leaf
@@ -12431,7 +12486,8 @@ a stage that is not exactly one of `cmd`/`agent`/`gate`, an agent stage
 missing a `prompt` / invalid `action` / `implement` without `write: true` / a mutating
 stage on a scheduled pipeline without `allow_scheduled_writes` / a mutating stage on
 a triggered pipeline without `allow_triggered_writes` / a gate or review's
-bad `source` / `source` on another stage kind, invalid durations, a `success_decisions` outside
+bad `source` / `source` on another stage kind / `isolate: true` on a non-shell
+stage, invalid durations, a `success_decisions` outside
 `approved`/`implemented`/`changes_requested`/`skipped`) so a mistake is a clear error, not a
 stuck run. It stores the raw YAML **verbatim** plus a content hash; each run
 snapshots that hash and executes its snapshot, so editing the file later never
@@ -12442,6 +12498,18 @@ runs a named managed agent on its own runtime as a read-only leaf (`ask`/`review
 its `needs` stages' result summaries are prepended to the prompt, and a repo-bound
 agent stage runs in its own detached read-only worktree so same-repo agent stages
 parallelize without touching the live checkout.
+
+A shell stage may set `isolate: true` to opt into a disposable detached read-only
+worktree at the managed checkout's committed tip. The default remains the shared
+checkout, including its uncommitted/gitignored data and any intentional writes.
+Opt-in allocation is fail-open: failure emits `readonly_worktree_skipped` and runs
+on the shared checkout. On success the command receives
+`GITMOOT_CHECKOUT=<live-checkout>` for cwd-independent access to data omitted from
+the clean worktree. This removes checkout-lock serialization, so same-repo stages
+with different commands can run concurrently. **Known v1 limitation (tracked follow-up):**
+identical commands still share `runtime:shell:<hash(cmd)>` and serialize on the
+separate shell session lock. Service shell stages retain their unconditional,
+fail-closed isolation; agent and gate stages reject this shell-only field.
 
 Shell and agent stages can opt into scoped key access with `env_keys`. Source
 files must be absolute, operator-owned regular files
@@ -12497,6 +12565,13 @@ signals partial data. The content is persisted and re-created at a fresh path fo
 retries; the file is removed after delivery. Treat summaries as untrusted data,
 never shell source, and keep credentials out of them. A strict consumer can start
 with `jq -e '.schema_version == 1 and .complete == true' "$GITMOOT_PIPELINE_UPSTREAM_CONTEXT_FILE"`.
+A successfully isolated non-service shell stage additionally receives
+`GITMOOT_CHECKOUT`, a best-effort path to the live managed checkout for reading
+gitignored `repos/**` or uncommitted data. Prefer the stage cwd for committed files.
+Treat this path as read-only, and do not run the isolated reader beside a default
+stage that mutates the checkout: those live reads can observe a torn tree or
+`index.lock` contention. The input, trigger, metadata, keycard, and upstream-context
+variables are unchanged by the detached cwd.
 
 `action: produce` (#814/#825) is a sandboxed pipeline leaf for writing operator-owned
 data, never repo/branch/task/PR state. Codex uses its native sandbox; Claude and
@@ -13961,6 +14036,7 @@ stages:
     env_keys: [SOURCE_API_TOKEN]
   - id: score
     cmd: "python score.py data.json"
+    isolate: true          # optional shell-only detached read-only worktree
     needs: [source]         # runs only after source SUCCEEDS
   - id: deploy
     cmd: "rclone copy out/ r2:bucket"
@@ -14244,6 +14320,16 @@ downstream agent stage acts on upstream output as real dataflow. A repo-bound
 ask/review agent stage runs in its own detached read-only worktree (#739), so
 same-repo agent stages parallelize and never touch the live checkout.
 
+A `cmd` stage can opt into the same concurrency boundary with `isolate: true`.
+Its disposable worktree is the committed tip, while the default `false` continues
+to run in the shared checkout for commands that need dirty/gitignored data or write
+there. Allocation is fail-open (`readonly_worktree_skipped` records fallback), and
+successful isolation adds `GITMOOT_CHECKOUT=<live-checkout>` to the shell env. This
+removes checkout-lock serialization for siblings with different commands. **Known
+v1 limitation (tracked follow-up):** identical commands retain the same shell runtime-session
+key and serialize. Service shell stages remain unconditionally isolated and fail
+closed. The field is rejected on agent and gate stages.
+
 A dependent `cmd` stage receives the same settled upstream results through a data
 channel, not shell interpolation. All pipeline shell stages get
 `GITMOOT_PIPELINE_NAME`, `GITMOOT_PIPELINE_RUN_ID`, and
@@ -14252,6 +14338,12 @@ channel, not shell interpolation. All pipeline shell stages get
 `0600` JSON tempfile for the duration of the delivery. Gitmoot persists the JSON
 content (not the path), recreates identical bytes on retry/restart, and removes the
 file after every exit path. Root stages have no context-file variable.
+An isolated non-service shell stage additionally receives `GITMOOT_CHECKOUT`, a
+best-effort path to the live checkout for gitignored or uncommitted reads. Prefer
+the stage cwd for committed files, treat the live path as read-only, and never run
+that reader beside a default stage mutating the checkout because reads can be torn
+or contend on `index.lock`. `GITMOOT_INPUT_*`, `GITMOOT_TRIGGER_*`, selected keys,
+and the absolute upstream context path remain cwd-independent.
 
 The v1 shape is
 `{"schema_version":1,"complete":true,"stages":{"extract":{"id":"extract","state":"succeeded","summary":"...","summary_truncated":false}}}`.
@@ -15112,11 +15204,9 @@ Delegation fields:
   `concurrency`, `migration`, `security`, `refactor`, …); a multi-file
   `implement`/`fix` action versus a read-only `ask`; broad scope (several
   `artifacts` or a dedicated `worktree`); and whether the leg is part of a
-  `quorum`. More of these lean **deep**; their absence leans **cheap**. Gitmoot
-  ships an uncalibrated helper for this — `workflow.ScoreComplexity` /
-  `workflow.TierFor` (`internal/workflow/modeltier.go`) — that turns a
-  delegation into a tier. It is a pure recommendation primitive: the engine
-  never calls it and never overrides a coordinator's chosen `model`.
+  `quorum`. More of these lean **deep**; their absence leans **cheap**. Model
+  choice remains the coordinator's responsibility; the engine never overrides
+  a coordinator's chosen `model`.
 
   **Cascade / escalate-in-continuation pattern.** Prefer to start a leg on the
   cheapest plausible tier and **escalate in a continuation** only if it falls

@@ -17,22 +17,6 @@ const (
 	DefaultTemplateRemotePath = "templates"
 )
 
-func DefaultTemplateRemotePolicy() TemplateRemotePolicy {
-	return TemplateRemotePolicy{}
-}
-
-func (p TemplateRemotePolicy) Configured() bool {
-	return GitHubRemotePolicy(p).Configured()
-}
-
-func (p TemplateRemotePolicy) ResolvedRef() string {
-	return GitHubRemotePolicy(p).ResolvedRef(DefaultTemplateRemoteRef)
-}
-
-func (p TemplateRemotePolicy) ResolvedPath() string {
-	return GitHubRemotePolicy(p).ResolvedPath(DefaultTemplateRemotePath)
-}
-
 func LoadTemplateRemote(paths Paths) (TemplateRemotePolicy, error) {
 	policy, err := loadGitHubRemote(paths, "template_remote")
 	return TemplateRemotePolicy(policy), err

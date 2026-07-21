@@ -331,12 +331,12 @@ func TestConfigureDefaultResetsState(t *testing.T) {
 	t.Cleanup(func() { ConfigureDefault(RateLimiterConfig{}) })
 	ConfigureDefault(RateLimiterConfig{BackoffEnabled: true, BaseBackoff: time.Minute, MaxBackoff: time.Minute})
 	DefaultLimiter().NoteSecondaryLimit(0)
-	if !DefaultLimiterSnapshot().InBackoff {
+	if !DefaultLimiter().Snapshot().InBackoff {
 		t.Fatalf("expected default limiter in backoff")
 	}
 	// Reconfiguring installs a fresh limiter, clearing the poisoned backoff window.
 	ConfigureDefault(RateLimiterConfig{})
-	if DefaultLimiterSnapshot().InBackoff {
+	if DefaultLimiter().Snapshot().InBackoff {
 		t.Fatalf("reconfigure should reset live backoff state")
 	}
 }

@@ -211,7 +211,7 @@ func TestPipelineSlowShellStageProgressE2E(t *testing.T) {
 	worker.PipelineProgressInterval = 5 * time.Millisecond
 	workerDone := make(chan error, 1)
 	go func() {
-		workerDone <- runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, time.Now().UTC())
+		workerDone <- runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, time.Now().UTC(), nil, nil)
 	}()
 
 	deadline := time.Now().Add(2 * time.Second)

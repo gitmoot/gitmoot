@@ -38,11 +38,3 @@ func storeWorkflowPresence(repoFullName string, headSHA string, present bool) {
 	}
 	workflowPresence.byHead[workflowPresenceKey(repoFullName, headSHA)] = present
 }
-
-// resetWorkflowPresenceCache clears the cache. It exists for deterministic tests
-// that assert on the number of workflow-awareness reads.
-func resetWorkflowPresenceCache() {
-	workflowPresence.Lock()
-	defer workflowPresence.Unlock()
-	workflowPresence.byHead = map[string]bool{}
-}

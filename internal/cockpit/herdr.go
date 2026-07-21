@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 )
 
@@ -141,17 +140,6 @@ func (c herdrClient) paneRename(ctx context.Context, pane, label string) error {
 // <agent> --state <state>`.
 func (c herdrClient) reportAgent(ctx context.Context, pane, source, agent, state string) error {
 	_, err := c.run(ctx, "pane", "report-agent", pane, "--source", source, "--agent", agent, "--state", state)
-	return err
-}
-
-// reportMetadata runs `herdr pane report-metadata <pane> --source <source>
-// --title "<title>" --ttl-ms <n>`.
-func (c herdrClient) reportMetadata(ctx context.Context, pane, source, title string, ttlMS int) error {
-	args := []string{"pane", "report-metadata", pane, "--source", source, "--title", title}
-	if ttlMS > 0 {
-		args = append(args, "--ttl-ms", strconv.Itoa(ttlMS))
-	}
-	_, err := c.run(ctx, args...)
 	return err
 }
 

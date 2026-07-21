@@ -85,7 +85,7 @@ func TestPipelineBlockedParkE2E(t *testing.T) {
 	worker := defaultJobWorker(store, io.Discard, home)
 	now := time.Date(2026, 7, 6, 9, 0, 0, 0, time.UTC)
 	for i := 0; i < 8; i++ {
-		if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now); err != nil {
+		if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now, nil, nil); err != nil {
 			t.Fatalf("worker tick %d: %v", i, err)
 		}
 		if err := runPipelineScanOnce(ctx, store, enqueue, now); err != nil {
@@ -179,7 +179,7 @@ func TestPipelineSkippedAdvancesE2E(t *testing.T) {
 	worker := defaultJobWorker(store, io.Discard, home)
 	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
 	for i := 0; i < 8; i++ {
-		if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now); err != nil {
+		if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now, nil, nil); err != nil {
 			t.Fatalf("worker tick %d: %v", i, err)
 		}
 		if err := runPipelineScanOnce(ctx, store, enqueue, now); err != nil {
@@ -252,7 +252,7 @@ stages:
 	worker := defaultJobWorker(store, io.Discard, home)
 	now := time.Date(2026, 7, 11, 11, 0, 0, 0, time.UTC)
 	for i := 0; i < 8; i++ {
-		if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now); err != nil {
+		if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now, nil, nil); err != nil {
 			t.Fatalf("worker tick %d: %v", i, err)
 		}
 		if err := runPipelineScanOnce(ctx, store, enqueue, now); err != nil {

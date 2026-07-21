@@ -97,7 +97,7 @@ func TestPipelineAutoMergeShellRuntimeE2E(t *testing.T) {
 	settleBoundImplementStageJob(t, store, implJob.ID, "implemented", pipeline.PipelineStagePRBinding{PullRequest: 815, HeadSHA: head, Branch: implPayload.Branch, TaskID: implPayload.TaskID, LeadAgent: "coder"})
 	executor := &stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: head}, mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merged-815"}}
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second), executor)
-	if err := runEnabledRepoWorkerTicks(ctx, store, defaultJobWorker(store, io.Discard, home), 1, io.Discard, now.Add(2*time.Second)); err != nil {
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, defaultJobWorker(store, io.Discard, home), 1, "", io.Discard, now.Add(2*time.Second), nil, nil); err != nil {
 		t.Fatalf("review worker tick: %v", err)
 	}
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(3*time.Second), executor)

@@ -153,40 +153,33 @@ func TestMedoidHighestIntraSimilarity(t *testing.T) {
 	}
 }
 
-// TestBuildClusterHierarchyDeterministic uses a graph whose full pass produces
-// a 22-fact parent and whose induced second pass produces valid 18/4 children.
-// Repeating the same seed must preserve the complete tree, including hashed ids.
-func TestBuildClusterHierarchyDeterministic(t *testing.T) {
-	nodes := make([]ClusterNode, 28)
-	for i := range nodes {
-		nodes[i] = ClusterNode{ID: int64(i + 1), Text: "hierarchy deterministic fact"}
+func TestClusterHierarchyFanoutDeterministicAndHysteretic(t *testing.T) {
+	top13, nodes13, edges13 := crowdedTopLevelFixture(13, "acme/repo")
+	options := ClusterHierarchyOptions{Fanout: 12, FanoutKeep: 9, DepthCap: 4}
+	first := buildClusterHierarchyWithOptions(top13, nodes13, edges13, options)
+	if maxChildren(first) > 12 {
+		t.Fatalf("fanout = %d, want <= 12: %+v", maxChildren(first), first)
 	}
-	raw := [][3]int{
-		{0, 11, 4}, {1, 8, 5}, {1, 17, 5}, {1, 20, 1}, {2, 4, 4}, {2, 9, 2},
-		{2, 14, 1}, {2, 15, 4}, {2, 18, 2}, {2, 22, 2}, {3, 12, 3}, {3, 23, 4},
-		{3, 26, 1}, {4, 14, 1}, {4, 20, 5}, {4, 23, 3}, {4, 24, 4}, {5, 16, 3},
-		{5, 18, 5}, {5, 22, 1}, {5, 25, 3}, {6, 9, 3}, {6, 14, 2}, {6, 27, 1},
-		{7, 14, 4}, {7, 21, 3}, {7, 27, 4}, {9, 16, 4}, {10, 14, 2}, {10, 15, 4},
-		{11, 13, 3}, {11, 24, 2}, {12, 15, 1}, {13, 20, 1}, {14, 22, 1}, {15, 16, 4},
-		{15, 17, 5}, {15, 18, 4}, {15, 20, 5}, {15, 21, 2}, {15, 23, 4}, {15, 25, 5},
-		{15, 27, 3}, {16, 19, 5}, {16, 24, 1}, {18, 22, 2}, {18, 27, 5}, {19, 27, 1},
-		{20, 22, 3}, {20, 23, 2}, {20, 25, 5}, {21, 26, 3}, {23, 25, 3}, {24, 27, 1},
-		{26, 27, 3},
-	}
-	edges := make([]ClusterEdge, 0, len(raw))
-	for _, e := range raw {
-		edges = append(edges, ClusterEdge{A: int64(e[0] + 1), B: int64(e[1] + 1), Weight: e[2]})
+	state := topSyntheticState(first, "acme/repo")
+	options.Existing = state
+	second := buildClusterHierarchyWithOptions(top13, nodes13, edges13, options)
+	third := buildClusterHierarchyWithOptions(top13, nodes13, edges13, options)
+	if !reflect.DeepEqual(second, third) {
+		t.Fatalf("unchanged hierarchy with persisted state is not deterministic:\nsecond=%+v\nthird=%+v", second, third)
 	}
 
-	first := BuildClusterHierarchy(nodes, edges, nil)
-	second := BuildClusterHierarchy(nodes, edges, nil)
-	if !reflect.DeepEqual(first, second) {
-		t.Fatalf("hierarchy not deterministic:\nfirst=%+v\nsecond=%+v", first, second)
+	top11, nodes11, edges11 := crowdedTopLevelFixture(11, "acme/repo")
+	shrunk := buildClusterHierarchyWithOptions(top11, nodes11, edges11, options)
+	if syntheticCount(shrunk) == 0 {
+		t.Fatalf("13->11 boundary dissolved existing grouping above keep=9: %+v", shrunk)
 	}
-	parents, children := hierarchyShape(first)
-	if parents != 3 || children != 2 {
-		t.Fatalf("hierarchy shape = %d parents/%d children, want 3/2: %+v", parents, children, first)
+	oldIDs := syntheticIDs(first)
+	for id := range syntheticIDs(shrunk) {
+		if oldIDs[id] {
+			return
+		}
 	}
+	t.Fatalf("13->11 boundary retained no synthetic parent identity: first=%+v shrunk=%+v", first, shrunk)
 }
 
 func TestClusterHierarchyThresholdAndMinChild(t *testing.T) {
@@ -216,35 +209,6 @@ func TestClusterHierarchyHysteresis(t *testing.T) {
 	if childCount(dissolved) != 0 || len(dissolved.Clusters) != 1 || len(dissolved.Clusters[0].Members) != 11 {
 		t.Fatalf("11-fact split did not dissolve to its parent: %+v", dissolved)
 	}
-}
-
-func TestClusterHierarchyFanoutDeterministicAndHysteretic(t *testing.T) {
-	top13, nodes13, edges13 := crowdedTopLevelFixture(13, "acme/repo")
-	options := ClusterHierarchyOptions{Fanout: 12, FanoutKeep: 9, DepthCap: 4}
-	first := buildClusterHierarchyWithOptions(top13, nodes13, edges13, options)
-	if maxChildren(first) > 12 {
-		t.Fatalf("fanout = %d, want <= 12: %+v", maxChildren(first), first)
-	}
-	state := topSyntheticState(first, "acme/repo")
-	options.Existing = state
-	second := buildClusterHierarchyWithOptions(top13, nodes13, edges13, options)
-	third := buildClusterHierarchyWithOptions(top13, nodes13, edges13, options)
-	if !reflect.DeepEqual(second, third) {
-		t.Fatalf("unchanged hierarchy with persisted state is not deterministic:\nsecond=%+v\nthird=%+v", second, third)
-	}
-
-	top11, nodes11, edges11 := crowdedTopLevelFixture(11, "acme/repo")
-	shrunk := buildClusterHierarchyWithOptions(top11, nodes11, edges11, options)
-	if syntheticCount(shrunk) == 0 {
-		t.Fatalf("13->11 boundary dissolved existing grouping above keep=9: %+v", shrunk)
-	}
-	oldIDs := syntheticIDs(first)
-	for id := range syntheticIDs(shrunk) {
-		if oldIDs[id] {
-			return
-		}
-	}
-	t.Fatalf("13->11 boundary retained no synthetic parent identity: first=%+v shrunk=%+v", first, shrunk)
 }
 
 func TestClusterHierarchyCrowdingIsPerRepoScope(t *testing.T) {
@@ -466,6 +430,16 @@ func hierarchyMaxDepth(result ClusterResult) int {
 	return max
 }
 
+func cliqueClusterEdges(first, last int) []ClusterEdge {
+	var edges []ClusterEdge
+	for i := first; i <= last; i++ {
+		for j := i + 1; j <= last; j++ {
+			edges = append(edges, ClusterEdge{A: int64(i), B: int64(j), Weight: 1})
+		}
+	}
+	return edges
+}
+
 func manualSplitResult(left, right int, existing bool) ClusterResult {
 	total := left + right
 	nodes := make([]ClusterNode, 0, total)
@@ -482,21 +456,15 @@ func manualSplitResult(left, right int, existing bool) ClusterResult {
 		members[i] = int64(i + 1)
 	}
 	top := ClusterResult{Clusters: []Cluster{{ID: 1, Label: "parent", MedoidID: 1, Members: members}}}
-	state := map[int64]bool{}
+	options := ClusterHierarchyOptions{
+		Fanout:     DefaultClusterFanout,
+		FanoutKeep: DefaultClusterFanoutKeep,
+		DepthCap:   DefaultClusterHierarchyCap,
+	}
 	if existing {
-		state[1] = true
+		options.Existing = []ClusterHierarchyState{{Level: 1, MedoidPath: []int64{1}}}
 	}
-	return buildClusterHierarchy(top, nodes, edges, state)
-}
-
-func cliqueClusterEdges(first, last int) []ClusterEdge {
-	var edges []ClusterEdge
-	for i := first; i <= last; i++ {
-		for j := i + 1; j <= last; j++ {
-			edges = append(edges, ClusterEdge{A: int64(i), B: int64(j), Weight: 1})
-		}
-	}
-	return edges
+	return buildClusterHierarchyWithOptions(top, nodes, edges, options)
 }
 
 func hierarchyShape(result ClusterResult) (parents, children int) {

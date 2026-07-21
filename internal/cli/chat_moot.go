@@ -371,7 +371,7 @@ func chatMootOverrunMessage(messageCap int) string {
 // at dispatch, they are born keyed worktree:<path> and no longer serialize on the
 // shared repo:<repo> checkout key under EITHER scheduler — the barrier scheduler
 // selects same-repo jobs with distinct checkout keys into one concurrent per-tick
-// batch (selectRunnableQueuedJobs), and the pool scheduler runs them continuously.
+// batch (selectRunnableQueuedJobsWithPolicy), and the pool scheduler runs them continuously.
 // So the only remaining serializer is a single worker (effective parallelism <2);
 // a pool-vs-barrier verdict would now false-warn a healthy multi-worker barrier
 // daemon.

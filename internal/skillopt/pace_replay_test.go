@@ -15,10 +15,10 @@ func replayHistory(cfg PaceConfig, history []PaceOutcome) (PaceVerdict, int) {
 	for _, o := range history {
 		v := acc.Observe(o)
 		if v == PaceCommit || v == PaceReject {
-			return v, acc.Pairs()
+			return v, acc.pairs
 		}
 	}
-	return acc.Verdict(), acc.Pairs()
+	return acc.Verdict(), acc.pairs
 }
 
 // bernoulliHistory builds a length-n history where each discordant pair is a

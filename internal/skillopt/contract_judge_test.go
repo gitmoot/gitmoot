@@ -1,7 +1,6 @@
 package skillopt
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -94,67 +93,5 @@ func TestParseJudgeCandidatePackageRejectsNoVariants(t *testing.T) {
 	data := `{"kind":"gitmoot-skillopt-judge-candidate","contract_version":1,"variants":{}}`
 	if _, err := ParseJudgeCandidatePackage([]byte(data)); err == nil {
 		t.Fatal("expected error for empty variants")
-	}
-}
-
-// TestEvaluationConfigForReaderRoundTrip proves the write encoding used by
-// `skillopt judge promote` (a flat Evaluation map[string]string where
-// judge_prompt_templates is a JSON-encoded object string) is readable back by
-// the production judge-prompt reader. EvaluationConfigForReader expands the flat
-// map into the nested evaluator config that judgePromptConfigFromConfig /
-// EvaluatorProfileFromConfig consume, mirroring the eval-run start nesting.
-func TestEvaluationConfigForReaderRoundTrip(t *testing.T) {
-	// Encode the templates exactly as the write path does.
-	templates := map[string]string{
-		"vue_landing_page": "Judge the landing page strictly.",
-		"generic":          "Judge the artifact.",
-	}
-	encoded, err := json.Marshal(templates)
-	if err != nil {
-		t.Fatalf("marshal templates: %v", err)
-	}
-	evaluation := map[string]string{
-		"driver":                 "code-review",
-		"preferred_gate":         "pairwise",
-		"evaluator_id":           "landing_page_v1",
-		"evaluator_model":        "gpt-evaluator",
-		"judge_prompt_templates": string(encoded),
-		"judge_prompt_version":   "v0+judge2",
-	}
-
-	config := EvaluationConfigForReader(evaluation)
-	if len(config) == 0 {
-		t.Fatal("EvaluationConfigForReader returned empty config")
-	}
-
-	// Read back through the production path.
-	profile := EvaluatorProfileFromConfig(config)
-	if profile == nil {
-		t.Fatal("EvaluatorProfileFromConfig returned nil")
-	}
-	if profile.Judge == nil {
-		t.Fatal("profile.Judge is nil")
-	}
-	payload := profile.Judge.JudgePromptConfig()
-	if payload == nil {
-		t.Fatal("JudgePromptConfig is nil; templates did not round-trip")
-	}
-	if got := payload.JudgePromptTemplates["vue_landing_page"]; got != "Judge the landing page strictly." {
-		t.Fatalf("judge_prompt_templates[vue_landing_page] = %q", got)
-	}
-	if got := payload.JudgePromptTemplates["generic"]; got != "Judge the artifact." {
-		t.Fatalf("judge_prompt_templates[generic] = %q", got)
-	}
-	if payload.JudgePromptVersion != "v0+judge2" {
-		t.Fatalf("judge_prompt_version = %q, want v0+judge2", payload.JudgePromptVersion)
-	}
-}
-
-func TestEvaluationConfigForReaderEmpty(t *testing.T) {
-	if config := EvaluationConfigForReader(nil); config != nil {
-		t.Fatalf("expected nil for empty map, got %q", string(config))
-	}
-	if config := EvaluationConfigForReader(map[string]string{}); config != nil {
-		t.Fatalf("expected nil for empty map, got %q", string(config))
 	}
 }
