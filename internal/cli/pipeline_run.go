@@ -53,7 +53,7 @@ type pipelineAutoMergeExecutor interface {
 // indistinguishable from a normal background job once enqueued (the runner agent
 // carries no template, so canary never actually samples).
 func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueuer {
-	mailbox := workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(home), RuntimeDefaultModel: runtimeDefaultModelResolver(home)}
+	mailbox := workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(home), RuntimeDefaultModel: runtimeDefaultModelResolver(home), RequireWorkflowPolicy: requireWorkflowPolicyResolver(home)}
 	return func(ctx context.Context, request workflow.JobRequest) (db.Job, error) {
 		// #1011 service shell stages are an explicit fail-CLOSED exception to the
 		// generic read-only allocator below. Their run row is authoritative: every

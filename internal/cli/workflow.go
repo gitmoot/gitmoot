@@ -268,7 +268,7 @@ func runTask(args []string, stdout, stderr io.Writer) int {
 
 func printTaskUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot task run <id> --repo owner/repo --owner <agent> [--branch <branch>] [--base <branch>]")
+	fmt.Fprintln(w, "  gitmoot task run <id> --repo owner/repo --owner <agent> [--branch <branch>] [--base <branch>] [--workflow <label>]")
 	fmt.Fprintln(w, "  gitmoot task recover <id> [--owner <agent>] [--repo owner/repo] [--skip-native-review-fanout] [--json]")
 	fmt.Fprintln(w, "  gitmoot task dismiss <id> [--reason text] [--json]")
 	fmt.Fprintln(w, "  gitmoot task events <id> [--json]")
@@ -359,6 +359,7 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 	owner := fs.String("owner", "", "agent that will hold the branch lock")
 	branch := fs.String("branch", "", "task branch name")
 	base := fs.String("base", "", "base branch for git worktree add")
+	workflowID := fs.String("workflow", "", "workflow label as namespace/campaign")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fs.Usage()
 		if len(args) == 0 {
@@ -380,6 +381,10 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 	}
 	if strings.TrimSpace(*owner) == "" {
 		fmt.Fprintln(stderr, "task run requires --owner")
+		return 2
+	}
+	if err := workflow.ValidateWorkflowID(*workflowID); err != nil {
+		fmt.Fprintf(stderr, "task run: %v\n", err)
 		return 2
 	}
 
@@ -407,6 +412,10 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fmt.Errorf("invalid repo: %w", err)
 		}
+		policy := requireWorkflowPolicyResolver(paths.Home)(requestRepo)
+		if policy.Enabled && policy.Mode == "strict" && strings.TrimSpace(*workflowID) == "" {
+			return fmt.Errorf("repo %s has require_workflow=strict: pass --workflow <namespace>/<campaign>", requestRepo)
+		}
 		repoRecord, err := resolveRepoRecord(context.Background(), store, repo, ".")
 		if err != nil {
 			return err
@@ -431,7 +440,7 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 			if err != nil {
 				return fmt.Errorf("resolve task worktree head: %w", err)
 			}
-			request := taskRunImplementJobRequest(taskRunImplementJobID(candidate.ID, strings.TrimSpace(*owner)), candidate, strings.TrimSpace(*owner), headSHA)
+			request := taskRunImplementJobRequest(taskRunImplementJobID(candidate.ID, strings.TrimSpace(*owner)), candidate, strings.TrimSpace(*owner), headSHA, *workflowID)
 			if active, ok, err := findActiveTaskRunJob(context.Background(), store, request); err != nil {
 				return err
 			} else if ok {
@@ -468,14 +477,14 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fmt.Errorf("resolve task worktree head: %w", err)
 		}
-		request := taskRunImplementJobRequest(taskRunImplementJobID(started.ID, strings.TrimSpace(*owner)), started, strings.TrimSpace(*owner), headSHA)
+		request := taskRunImplementJobRequest(taskRunImplementJobID(started.ID, strings.TrimSpace(*owner)), started, strings.TrimSpace(*owner), headSHA, *workflowID)
 		if active, ok, err := findActiveTaskRunJob(context.Background(), store, request); err != nil {
 			return err
 		} else if ok {
 			startedJob = active
 			return nil
 		}
-		startedJob, err = enqueueTaskRunImplementJob(context.Background(), store, started, strings.TrimSpace(*owner), headSHA, paths.Home)
+		startedJob, err = enqueueTaskRunImplementJob(context.Background(), store, started, strings.TrimSpace(*owner), headSHA, paths.Home, *workflowID)
 		return err
 	}); err != nil {
 		fmt.Fprintf(stderr, "run task: %v\n", err)
@@ -1139,10 +1148,10 @@ func taskRecoverJobID(taskID string, owner string) string {
 	return value
 }
 
-func enqueueTaskRunImplementJob(ctx context.Context, store *db.Store, task db.Task, owner string, headSHA string, home string) (db.Job, error) {
+func enqueueTaskRunImplementJob(ctx context.Context, store *db.Store, task db.Task, owner string, headSHA string, home string, workflowID string) (db.Job, error) {
 	baseJobID := taskRunImplementJobID(task.ID, owner)
 	jobID := baseJobID
-	request := taskRunImplementJobRequest(jobID, task, owner, headSHA)
+	request := taskRunImplementJobRequest(jobID, task, owner, headSHA, workflowID)
 	if existing, err := store.GetJob(ctx, jobID); err == nil {
 		if (existing.State == string(workflow.JobQueued) || existing.State == string(workflow.JobRunning)) && taskRunJobMatchesRequest(existing, request) {
 			return existing, nil
@@ -1153,11 +1162,11 @@ func enqueueTaskRunImplementJob(ctx context.Context, store *db.Store, task db.Ta
 			return active, nil
 		}
 		jobID = baseJobID + "-" + shortHash(existing.State+"\x00"+headSHA+"\x00"+time.Now().UTC().Format(time.RFC3339Nano))
-		request = taskRunImplementJobRequest(jobID, task, owner, headSHA)
+		request = taskRunImplementJobRequest(jobID, task, owner, headSHA, workflowID)
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return db.Job{}, err
 	}
-	return (workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(home), RuntimeDefaultModel: runtimeDefaultModelResolver(home)}).Enqueue(ctx, request)
+	return (workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(home), RuntimeDefaultModel: runtimeDefaultModelResolver(home), RequireWorkflowPolicy: requireWorkflowPolicyResolver(home)}).Enqueue(ctx, request)
 }
 
 func findActiveTaskRunJob(ctx context.Context, store *db.Store, request workflow.JobRequest) (db.Job, bool, error) {
@@ -1176,7 +1185,7 @@ func findActiveTaskRunJob(ctx context.Context, store *db.Store, request workflow
 	return db.Job{}, false, nil
 }
 
-func taskRunImplementJobRequest(jobID string, task db.Task, owner string, headSHA string) workflow.JobRequest {
+func taskRunImplementJobRequest(jobID string, task db.Task, owner string, headSHA string, workflowID string) workflow.JobRequest {
 	title := strings.TrimSpace(task.Title)
 	label := task.ID
 	if title != "" {
@@ -1194,6 +1203,7 @@ func taskRunImplementJobRequest(jobID string, task db.Task, owner string, headSH
 		TaskTitle:    task.Title,
 		LeadAgent:    owner,
 		Sender:       "task run",
+		WorkflowID:   strings.TrimSpace(workflowID),
 		Instructions: "Implement task " + label + ".",
 	}
 }

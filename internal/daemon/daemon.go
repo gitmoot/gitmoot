@@ -2013,7 +2013,11 @@ func (d Daemon) enqueueJob(ctx context.Context, request workflow.JobRequest) (db
 	if d.Workflow != nil {
 		runtimeDefaultModel = d.Workflow.RuntimeDefaultModel
 	}
-	job, err := (workflow.Mailbox{Store: d.Store, CanaryEnabled: canaryEnabled, RuntimeDefaultModel: runtimeDefaultModel}).Enqueue(ctx, request)
+	var requireWorkflowPolicy func(string) workflow.RequireWorkflowPolicy
+	if d.Workflow != nil {
+		requireWorkflowPolicy = d.Workflow.RequireWorkflowPolicy
+	}
+	job, err := (workflow.Mailbox{Store: d.Store, CanaryEnabled: canaryEnabled, RuntimeDefaultModel: runtimeDefaultModel, RequireWorkflowPolicy: requireWorkflowPolicy}).Enqueue(ctx, request)
 	return job, true, err
 }
 

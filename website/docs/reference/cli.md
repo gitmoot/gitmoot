@@ -994,6 +994,16 @@ to 64 characters. One `/` may separate a namespace and campaign; both sides use
 lowercase letters, digits, and single hyphens without leading/trailing hyphens.
 Orchestration children and continuations inherit the label.
 
+### Require workflow labels
+
+Repositories may turn on `[workflow] require_workflow = true`. In
+`require_workflow_mode = "auto"`, an unlabeled fresh agent dispatch is bucketed
+as `adhoc/<agent>-<yyyy-mm-dd>` and receives a `workflow_autolabeled` event.
+`strict` instead rejects it and tells the caller to pass
+`--workflow <namespace>/<campaign>`. Either key can be overridden in
+`[repos."owner/repo"]`. `gitmoot doctor` reports unlabeled-job drift, and
+`gitmoot repo add --agents-md` scaffolds the team discipline into AGENTS.md.
+
 ```sh
 gitmoot orchestrate planner "Coordinate the dashboard wave." --repo owner/repo --workflow fable/dashboard-redesign
 gitmoot job list --workflow fable/dashboard-redesign

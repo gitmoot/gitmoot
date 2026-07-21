@@ -13,10 +13,68 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
+
+func TestTaskRunRequireWorkflowPolicy(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+"\n[workflow]\nrequire_workflow = true\nrequire_workflow_mode = \"strict\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := openCLIJobStore(t, home)
+	if err := store.UpsertTask(context.Background(), db.Task{ID: "strict-task", RepoFullName: "owner/repo", Title: "Strict", State: "planned", Branch: "strict-task"}); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"task", "run", "strict-task", "--home", home, "--repo", "owner/repo", "--owner", "lead"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "pass --workflow") {
+		t.Fatalf("strict no-label code=%d stderr=%s", code, stderr.String())
+	}
+	store = openCLIJobStore(t, home)
+	task, err := store.GetTask(context.Background(), "strict-task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != "planned" || task.WorktreePath != "" {
+		t.Fatalf("strict preflight mutated task=%+v", task)
+	}
+	if _, err := enqueueTaskRunImplementJob(context.Background(), store, db.Task{ID: "strict-task", RepoFullName: "owner/repo", Title: "Strict", Branch: "strict-task"}, "lead", "abc", home, "team/campaign"); err != nil {
+		t.Fatalf("strict explicit workflow enqueue: %v", err)
+	}
+	if _, err := store.GetJob(context.Background(), "task-strict-task-implement-lead"); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	autoHome := t.TempDir()
+	autoPaths := config.PathsForHome(autoHome)
+	if err := config.Initialize(autoPaths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(autoPaths.ConfigFile, []byte(config.DefaultConfig(autoPaths)+"\n[workflow]\nrequire_workflow = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	autoStore := openCLIJobStore(t, autoHome)
+	defer autoStore.Close()
+	job, err := enqueueTaskRunImplementJob(context.Background(), autoStore, db.Task{ID: "auto-task", RepoFullName: "owner/repo", Branch: "auto-task"}, "lead", "abc", autoHome, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(payload.WorkflowID, "adhoc/") {
+		t.Fatalf("auto workflow=%q", payload.WorkflowID)
+	}
+}
 
 func TestRunGoalImportAndStatus(t *testing.T) {
 	home := t.TempDir()

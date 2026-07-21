@@ -31,6 +31,10 @@ const maxRepairAttempts = 2
 
 type Mailbox struct {
 	Store *db.Store
+	// RequireWorkflowPolicy resolves the current policy for a repository at the
+	// enqueue chokepoint. Nil deliberately means feature disabled so existing
+	// direct Mailbox users remain byte-identical.
+	RequireWorkflowPolicy func(repo string) RequireWorkflowPolicy
 	// emitTerminal, when set, is called best-effort AFTER a genuine running->
 	// terminal transition in BOTH finishWithPayload (success/advance + timeout-
 	// finalize) and finish (the m.fail delivery/parse-failure path) (#446). Wiring
@@ -419,6 +423,10 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 	if err := validateJobRequest(request); err != nil {
 		return db.Job{}, err
 	}
+	autolabeled, err := m.resolveEnqueueWorkflowID(&request)
+	if err != nil {
+		return db.Job{}, err
+	}
 
 	snapshot, err := m.templateSnapshot(ctx, request.Agent)
 	if err != nil {
@@ -525,7 +533,90 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 	if err := m.Store.CreateJobWithEvent(ctx, job, db.JobEvent{JobID: job.ID, Kind: string(JobQueued), Message: "job queued"}); err != nil {
 		return db.Job{}, err
 	}
+	if autolabeled {
+		if err := m.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "workflow_autolabeled", Message: fmt.Sprintf("auto-filed under %s (require_workflow=auto for %s; pass --workflow to name your initiative)", strings.TrimSpace(request.WorkflowID), strings.TrimSpace(request.Repo))}); err != nil {
+			// The queued job is durable. Never turn a successful enqueue into a
+			// rejection because an advisory follow-up event could not be written.
+			fmt.Fprintf(os.Stderr, "gitmoot: add workflow_autolabeled event for %s: %v\n", job.ID, err)
+		}
+	}
 	return job, nil
+}
+
+// RequireWorkflowPolicy is deliberately a small workflow-package type: callers
+// inject a home-aware config closure without coupling this package to config.
+type RequireWorkflowPolicy struct {
+	Enabled bool
+	Mode    string
+}
+
+// IsUnlabeledAgentDispatch is the shared eligibility predicate for enforcement
+// and diagnostics. The stored-row shape has workflow id, sender, and delegation
+// reason but not the original producer, so a non-empty delegation reason is the
+// durable approximation for internal continuations and merge-backs.
+func IsUnlabeledAgentDispatch(workflowID, sender, delegationReason string) bool {
+	if strings.TrimSpace(workflowID) != "" || strings.TrimSpace(sender) == PipelineJobSender {
+		return false
+	}
+	if strings.TrimSpace(delegationReason) != "" {
+		return false
+	}
+	return strings.TrimSpace(sender) != "heartbeat"
+}
+
+// resolveEnqueueWorkflowID applies require_workflow only to fresh external
+// dispatches. Engine children inherit their parent's WorkflowID, heartbeat and
+// temporary-worker merge-back are internal producers, and pipeline jobs have
+// their own grouping semantics, so none are auto-filed or strict-rejected.
+func (m Mailbox) resolveEnqueueWorkflowID(request *JobRequest) (bool, error) {
+	// Engine re-enqueues and descendants retain their parent label (including a
+	// legacy empty label). Never retroactively regroup or kill those trees.
+	if strings.TrimSpace(request.ParentJobID) != "" || strings.TrimSpace(request.DelegationReason) == "temp_worker_merge_back" {
+		return false, nil
+	}
+	if !IsUnlabeledAgentDispatch(request.WorkflowID, request.Sender, request.DelegationReason) || m.RequireWorkflowPolicy == nil {
+		return false, nil
+	}
+	p := m.RequireWorkflowPolicy(strings.TrimSpace(request.Repo))
+	if !p.Enabled {
+		return false, nil
+	}
+	if p.Mode == "strict" {
+		return false, fmt.Errorf("repo %s has require_workflow=strict: pass --workflow <namespace>/<campaign>", strings.TrimSpace(request.Repo))
+	}
+	request.WorkflowID = adhocWorkflowID(request.Agent, time.Now().UTC())
+	return true, nil
+}
+
+func adhocWorkflowID(agent string, now time.Time) string {
+	date := now.UTC().Format("2006-01-02")
+	maxAgent := 64 - len("adhoc/") - 1 - len(date)
+	var b strings.Builder
+	lastDash := false
+	for _, r := range strings.ToLower(strings.TrimSpace(agent)) {
+		valid := r >= 'a' && r <= 'z' || r >= '0' && r <= '9'
+		if !valid {
+			if b.Len() > 0 && !lastDash {
+				b.WriteByte('-')
+				lastDash = true
+			}
+			continue
+		}
+		if b.Len() >= maxAgent {
+			break
+		}
+		b.WriteRune(r)
+		lastDash = false
+	}
+	name := strings.Trim(b.String(), "-")
+	if name == "" {
+		name = "agent"
+	}
+	id := "adhoc/" + name + "-" + date
+	if err := ValidateWorkflowID(id); err != nil {
+		return "adhoc/agent-" + date
+	}
+	return id
 }
 
 // resolveEnqueueModel snapshots the model selected for this job at the enqueue

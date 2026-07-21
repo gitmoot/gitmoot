@@ -209,6 +209,11 @@ a note in persistent memory. Linked PR lifecycle transitions also add deduped
 `--workflow <label>` on agent
 ask/run/review/implement, orchestrate, or `job open`; orchestration descendants
 inherit the label automatically. Use
+`[workflow] require_workflow = true` to enforce this discipline. `auto` mode
+files fresh unlabeled dispatches under `adhoc/<agent>-<yyyy-mm-dd>` and records
+`workflow_autolabeled`; `strict` instead requires `--workflow`. Per-repo
+overrides live in `[repos."owner/repo"]`, and `repo add --agents-md` scaffolds
+the discipline into a checkout's AGENTS.md. Use
 `gitmoot report bug --job <job-id> --preview` to inspect a redacted GitHub issue
 draft for failed, blocked, or cancelled jobs; use
 `gitmoot report bug --job <job-id> --create --yes` only when the user

@@ -408,9 +408,10 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		mergeGate := newDaemonPolicyMergeGate(store, gh, checkout)
 		applyMergeGatePolicy(&mergeGate, *home, repo.FullName())
 		engine := workflow.Engine{
-			Store:           store,
-			ProduceCheckDir: checkout,
-			MergeGate:       mergeGate,
+			Store:                 store,
+			RequireWorkflowPolicy: requireWorkflowPolicyResolver(config.PathsForHome(*home).Home),
+			ProduceCheckDir:       checkout,
+			MergeGate:             mergeGate,
 			// Registry default model/effort fallbacks, home-aware and fail-open — see
 			// daemonWorkflowEngine. Empty by default => byte-identical.
 			RuntimeDefaultModel:  runtimeDefaultModelResolver(*home),
@@ -2105,7 +2106,7 @@ type heartbeatEnqueuer func(ctx context.Context, request workflow.JobRequest) (d
 // construction so a heartbeat job is indistinguishable from a normal background
 // job once enqueued.
 func newHeartbeatEnqueuer(store *db.Store, home string) heartbeatEnqueuer {
-	mailbox := workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(home), RuntimeDefaultModel: runtimeDefaultModelResolver(home)}
+	mailbox := workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(home), RuntimeDefaultModel: runtimeDefaultModelResolver(home), RequireWorkflowPolicy: requireWorkflowPolicyResolver(home)}
 	return func(ctx context.Context, request workflow.JobRequest) (db.Job, error) {
 		return mailbox.Enqueue(ctx, request)
 	}
@@ -6626,7 +6627,7 @@ func (w jobWorker) queueTempWorkerMergeBack(ctx context.Context, completedJobID 
 			"Do not edit files, create commits, open pull requests, or dispatch more agents unless the summary explicitly requires follow-up.",
 		},
 	}
-	if _, err := (workflow.Mailbox{Store: w.Store, CanaryEnabled: canaryRoutingEnabled(w.workflowHome()), RuntimeDefaultModel: runtimeDefaultModelResolver(w.workflowHome())}).Enqueue(ctx, request); err != nil {
+	if _, err := (workflow.Mailbox{Store: w.Store, CanaryEnabled: canaryRoutingEnabled(w.workflowHome()), RuntimeDefaultModel: runtimeDefaultModelResolver(w.workflowHome()), RequireWorkflowPolicy: requireWorkflowPolicyResolver(w.workflowHome())}).Enqueue(ctx, request); err != nil {
 		return err
 	}
 	return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: completedJob.ID, Kind: "temp_worker_merge_back_queued", Message: fmt.Sprintf("queued summary merge-back job %s for %s", mergeBackID, original.Name)})
@@ -7338,6 +7339,7 @@ var (
 func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, home string) workflow.Engine {
 	engine := workflow.Engine{
 		Store:                   store,
+		RequireWorkflowPolicy:   requireWorkflowPolicyResolver(home),
 		ProduceCheckDir:         checkout,
 		MergeGate:               daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout, Home: home},
 		ImplementationFinalizer: daemonImplementationFinalizer{Store: store, GitHub: gh, FallbackCheckout: checkout},

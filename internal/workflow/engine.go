@@ -22,6 +22,9 @@ import (
 
 type Engine struct {
 	Store *db.Store
+	// RequireWorkflowPolicy is passed to every mailbox the engine creates so
+	// continuations and delegation enqueue share the same home-aware policy.
+	RequireWorkflowPolicy func(repo string) RequireWorkflowPolicy
 	// ProduceCheckDir is the resolved checkout cwd for trusted produce-stage
 	// deterministic checks when no disposable worktree path is present.
 	ProduceCheckDir         string
@@ -482,7 +485,7 @@ func (e Engine) now() time.Time {
 // path is byte-identical. The hook maps the terminal JobState to the event_type,
 // resolves root_id from the payload, and ships a redacted event fire-and-forget.
 func (e Engine) mailbox() Mailbox {
-	mb := Mailbox{Store: e.Store, CanaryEnabled: e.CanaryEnabled, deferBlocker: e.BlockerDeferrer, RuntimeDefaultModel: e.RuntimeDefaultModel, RuntimeDefaultEffort: e.RuntimeDefaultEffort, routerContextEnabled: e.RouterContextEnabled, resultCheckMode: normalizeResultCheckMode(e.ResultCheckMode), produceCheckDir: e.ProduceCheckDir}
+	mb := Mailbox{Store: e.Store, RequireWorkflowPolicy: e.RequireWorkflowPolicy, CanaryEnabled: e.CanaryEnabled, deferBlocker: e.BlockerDeferrer, RuntimeDefaultModel: e.RuntimeDefaultModel, RuntimeDefaultEffort: e.RuntimeDefaultEffort, routerContextEnabled: e.RouterContextEnabled, resultCheckMode: normalizeResultCheckMode(e.ResultCheckMode), produceCheckDir: e.ProduceCheckDir}
 	// Wire the off-by-default memory hooks (#626). When e.Memory is nil (every
 	// non-enrolled path) both hooks stay nil, so Run's prompt assembly and terminal
 	// path are byte-identical. The hooks themselves also no-op when the executor

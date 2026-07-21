@@ -174,6 +174,27 @@ func (s *Store) ListDashboardActiveJobs(ctx context.Context) ([]DashboardJobRow,
 	return out, rows.Err()
 }
 
+// ListDashboardUnlabeledJobs reads only recent rows whose denormalized workflow
+// label is empty. Callers parse payload only to apply the sender/delegation
+// eligibility predicate, avoiding an overview-wide payload scan.
+func (s *Store) ListDashboardUnlabeledJobs(ctx context.Context, since string) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, workflow_id, payload, created_at
+	FROM jobs WHERE workflow_id = '' AND created_at >= ? ORDER BY created_at, id`, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Job{}
+	for rows.Next() {
+		var item Job
+		if err := rows.Scan(&item.ID, &item.WorkflowID, &item.Payload, &item.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) ListDashboardBlockedJobs(ctx context.Context) ([]DashboardJobRow, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT j.id, j.agent, j.state, j.workflow_id, j.repo,
 		j.payload, j.created_at, j.updated_at,

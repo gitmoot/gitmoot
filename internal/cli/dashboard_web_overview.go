@@ -212,6 +212,17 @@ func dashboardOverview(ctx context.Context, store *db.Store, now time.Time) (das
 		})
 	}
 
+	jobs, err := store.ListDashboardUnlabeledJobs(ctx, dashboardSQLiteTime(now.Add(-24*time.Hour)))
+	if err != nil {
+		return out, err
+	}
+	for repo, count := range unlabeledJobCounts(jobs, now, unlabeledJobsDoctorThreshold) {
+		out.NeedsYou = append(out.NeedsYou, dashboard.OverviewNeedsYou{
+			Kind: "unlabeled_jobs", Repo: repo,
+			Title: fmt.Sprintf("%d unlabeled agent jobs in 24h (%s)", count, repo),
+		})
+	}
+
 	active, err := store.ListDashboardActiveJobs(ctx)
 	if err != nil {
 		return out, err
@@ -466,9 +477,11 @@ func dashboardNeedRank(kind string) int {
 		return 1
 	case "blocked_job":
 		return 2
-	case "groom_proposal":
+	case "unlabeled_jobs":
 		return 3
-	default:
+	case "groom_proposal":
 		return 4
+	default:
+		return 5
 	}
 }

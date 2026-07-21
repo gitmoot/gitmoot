@@ -136,6 +136,9 @@ func validateConfigFile(paths Paths) error {
 	if _, err := LoadMergeGatePolicy(paths); err != nil {
 		return err
 	}
+	if _, err := LoadRequireWorkflow(paths); err != nil {
+		return err
+	}
 	if _, err := LoadMemorySettings(paths); err != nil {
 		return err
 	}

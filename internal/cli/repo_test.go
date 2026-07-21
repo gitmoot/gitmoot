@@ -299,6 +299,8 @@ func TestRunRepoAddForceSelfHealsDanglingRecordedCheckout(t *testing.T) {
 func TestRepoCheckoutDoctorChecksWarnAndLazyBackfill(t *testing.T) {
 	home := t.TempDir()
 	primary, linked := setupLinkedWorktreeRepo(t)
+	writeFile(t, filepath.Join(primary, "AGENTS.md"), gitmootDisciplineMarker+"\n")
+	writeFile(t, filepath.Join(linked, "AGENTS.md"), gitmootDisciplineMarker+"\n")
 	store := openCLIJobStore(t, home)
 	if err := store.UpsertRepoForce(context.Background(), db.Repo{Owner: "owner", Name: "repo", CheckoutPath: linked}); err != nil {
 		t.Fatalf("UpsertRepoForce returned error: %v", err)
@@ -351,5 +353,21 @@ func TestRepoCheckoutDoctorChecksSkipMissingDatabase(t *testing.T) {
 	}
 	if _, err := os.Stat(paths.Database); !os.IsNotExist(err) {
 		t.Fatalf("doctor sweep created database: %v", err)
+	}
+}
+
+func TestScaffoldAgentsMD(t *testing.T) {
+	checkout := t.TempDir()
+	already, err := scaffoldAgentsMD(checkout)
+	if err != nil || already {
+		t.Fatalf("first scaffold already=%v err=%v", already, err)
+	}
+	content, err := os.ReadFile(filepath.Join(checkout, "AGENTS.md"))
+	if err != nil || !strings.Contains(string(content), gitmootDisciplineMarker) {
+		t.Fatalf("AGENTS.md=%q err=%v", content, err)
+	}
+	already, err = scaffoldAgentsMD(checkout)
+	if err != nil || !already {
+		t.Fatalf("second scaffold already=%v err=%v", already, err)
 	}
 }

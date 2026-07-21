@@ -249,7 +249,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			request.Instructions += note
 		}
 	}
-	job, err := (workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(request.Home), RuntimeDefaultModel: runtimeDefaultModelResolver(request.Home)}).Enqueue(ctx, workflow.JobRequest{
+	job, err := (workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(request.Home), RuntimeDefaultModel: runtimeDefaultModelResolver(request.Home), RequireWorkflowPolicy: requireWorkflowPolicyResolver(request.Home)}).Enqueue(ctx, workflow.JobRequest{
 		ID:                     jobID,
 		Agent:                  agent.Name,
 		Action:                 request.Action,
@@ -535,7 +535,7 @@ func buildLocalAgentJobOutput(latest db.Job, request localAgentDispatchRequest) 
 }
 
 func enqueuePermissionBlockedLocalAgentJob(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string, defaultBranch string, agentName string, overrideRuntime string, overrideRef string) (localAgentJobOutput, error) {
-	job, err := (workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(request.Home), RuntimeDefaultModel: runtimeDefaultModelResolver(request.Home)}).Enqueue(ctx, workflow.JobRequest{
+	job, err := (workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(request.Home), RuntimeDefaultModel: runtimeDefaultModelResolver(request.Home), RequireWorkflowPolicy: requireWorkflowPolicyResolver(request.Home)}).Enqueue(ctx, workflow.JobRequest{
 		ID:           localAgentJobID(request.Action, agentName),
 		Agent:        agentName,
 		Action:       request.Action,

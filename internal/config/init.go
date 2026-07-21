@@ -45,10 +45,16 @@ artifact_blobs = %q
 # off | warn | block and defaults to warn when omitted. stale_task_ttl is the
 # conservative updated_at age after which abandoned implementing/blocked tasks
 # may be auto-dismissed; it defaults to 168h and "0" disables the reconciler.
+# require_workflow is false by default. When enabled, require_workflow_mode is
+# auto (file fresh unlabeled agent dispatches under adhoc/<agent>-<yyyy-mm-dd>)
+# or strict (reject and require --workflow). Both can be overridden in a flat
+# [repos."owner/repo"] section.
 # [workflow]
 # implement_base = "origin/main"
 # result_checks = "warn"
 # stale_task_ttl = "168h"
+# require_workflow = false
+# require_workflow_mode = "auto" # auto | strict
 
 # [daemon] is the OPTIONAL warm-reloadable runtime config (issue #577). CLI flags to
 # "daemon start" / "daemon run" remain the initial value; a key here is applied only

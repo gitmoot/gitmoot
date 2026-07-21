@@ -1154,6 +1154,17 @@ accepted by `agent ask`, `agent run`, `agent review`, `agent implement`,
 `orchestrate`, and `job open`; delegation children and every coordinator
 continuation inherit it.
 
+### Require workflow labels
+
+Set `[workflow] require_workflow = true` to prevent fresh agent dispatches from
+silently becoming ungrouped. `require_workflow_mode = "auto"` (the default)
+auto-files them as `adhoc/<agent>-<yyyy-mm-dd>` and emits a
+`workflow_autolabeled` event. `strict` rejects unlabeled dispatches with the
+required `--workflow <namespace>/<campaign>` fix. Both keys can be overridden
+per repository in `[repos."owner/repo"]`. `gitmoot doctor` warns about recent
+unlabeled-job drift, and `gitmoot repo add --agents-md` writes the recommended
+AGENTS.md discipline section.
+
 ```sh
 gitmoot orchestrate planner "Coordinate the dashboard wave." --repo owner/repo --workflow fable/dashboard-redesign
 gitmoot job list --workflow fable/dashboard-redesign

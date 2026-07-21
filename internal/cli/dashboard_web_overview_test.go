@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -36,6 +37,48 @@ func TestWebDataSourceOverviewAndTasksEmpty(t *testing.T) {
 	}
 	if tasks == nil || len(tasks) != 0 {
 		t.Fatalf("Tasks empty store = %#v, want non-nil empty", tasks)
+	}
+}
+
+func TestDashboardOverviewUnlabeledJobsNeedsYou(t *testing.T) {
+	home := dashboardTestHome(t)
+	paths := config.PathsForHome(home)
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < unlabeledJobsDoctorThreshold; i++ {
+		id := fmt.Sprintf("unlabeled-%02d", i)
+		payload := workflow.JobPayload{Repo: "acme/drift", Sender: "local"}
+		if err := store.CreateJob(ctx, db.Job{ID: id, Agent: "worker", Type: "ask", State: "queued", Payload: mustJSON(t, payload)}); err != nil {
+			t.Fatal(err)
+		}
+		setJobTimes(t, home, id, dashboardSQLiteTime(now.Add(-time.Hour)), dashboardSQLiteTime(now.Add(-time.Hour)))
+	}
+	for _, entry := range []struct {
+		id      string
+		payload workflow.JobPayload
+	}{
+		{"pipeline", workflow.JobPayload{Repo: "acme/drift", Sender: workflow.PipelineJobSender}},
+		{"continuation", workflow.JobPayload{Repo: "acme/drift", Sender: "worker", DelegationReason: "runtime_session_busy"}},
+	} {
+		if err := store.CreateJob(ctx, db.Job{ID: entry.id, Agent: "worker", Type: "ask", State: "queued", Payload: mustJSON(t, entry.payload)}); err != nil {
+			t.Fatal(err)
+		}
+		setJobTimes(t, home, entry.id, dashboardSQLiteTime(now.Add(-time.Hour)), dashboardSQLiteTime(now.Add(-time.Hour)))
+	}
+	overview, err := dashboardOverview(ctx, store, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(overview.NeedsYou) != 1 || overview.NeedsYou[0].Kind != "unlabeled_jobs" || overview.NeedsYou[0].Title != "10 unlabeled agent jobs in 24h (acme/drift)" {
+		t.Fatalf("needs=%+v", overview.NeedsYou)
+	}
+	if !(dashboardNeedRank("stalled_workflow") < dashboardNeedRank("unlabeled_jobs") && dashboardNeedRank("pr_awaiting_merge") < dashboardNeedRank("unlabeled_jobs") && dashboardNeedRank("blocked_job") < dashboardNeedRank("unlabeled_jobs") && dashboardNeedRank("unlabeled_jobs") < dashboardNeedRank("groom_proposal")) {
+		t.Fatal("unlabeled_jobs rank is not advisory")
 	}
 }
 

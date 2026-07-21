@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 func TestDashboardChangeCursor(t *testing.T) {
@@ -76,6 +77,37 @@ func TestListDashboardTasksExcludesDismissed(t *testing.T) {
 	}
 	if len(tasks) != 1 || tasks[0].ID != "visible" {
 		t.Fatalf("dashboard tasks = %+v, want only visible", tasks)
+	}
+}
+
+func TestListDashboardUnlabeledJobsIsWindowedAndLabelFiltered(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	for _, job := range []Job{
+		{ID: "recent-empty", Type: "ask", State: "queued", Payload: `{"workflow_id":""}`},
+		{ID: "old-empty", Type: "ask", State: "queued", Payload: `{"workflow_id":""}`},
+		{ID: "recent-labeled", Type: "ask", State: "queued", Payload: `{"workflow_id":"team/campaign"}`},
+	} {
+		if err := store.CreateJob(ctx, job); err != nil {
+			t.Fatalf("CreateJob(%s): %v", job.ID, err)
+		}
+	}
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET created_at = ? WHERE id = 'recent-empty'`, now.Format("2006-01-02 15:04:05")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET created_at = ? WHERE id = 'old-empty'`, now.Add(-25*time.Hour).Format("2006-01-02 15:04:05")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET created_at = ? WHERE id = 'recent-labeled'`, now.Format("2006-01-02 15:04:05")); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.ListDashboardUnlabeledJobs(ctx, now.Add(-24*time.Hour).Format("2006-01-02 15:04:05"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ID != "recent-empty" || rows[0].WorkflowID != "" {
+		t.Fatalf("rows=%+v", rows)
 	}
 }
 

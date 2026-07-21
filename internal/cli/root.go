@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/config"
@@ -175,6 +177,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	if check, ok := blockedBacklogDoctorCheck(paths); ok {
 		checks = append(checks, check)
 	}
+	if check, ok := unlabeledJobsDoctorCheck(paths); ok {
+		checks = append(checks, check)
+	}
 	checks = append(checks, repoCheckoutDoctorChecks(paths)...)
 	if *jsonOutput {
 		type checkJSON struct {
@@ -244,7 +249,17 @@ func repoCheckoutDoctorChecks(paths config.Paths) []doctor.Check {
 		return nil
 	}
 	checks := make([]doctor.Check, 0, len(repos))
+	missingDiscipline := make([]string, 0)
 	for _, repo := range repos {
+		if repo.Enabled {
+			path := filepath.Join(strings.TrimSpace(repo.CheckoutPath), "AGENTS.md")
+			if _, err := os.Stat(strings.TrimSpace(repo.CheckoutPath)); err == nil {
+				content, readErr := os.ReadFile(path)
+				if readErr != nil || !strings.Contains(string(content), gitmootDisciplineMarker) {
+					missingDiscipline = append(missingDiscipline, repo.FullName())
+				}
+			}
+		}
 		originalCheckout := strings.TrimSpace(repo.CheckoutPath)
 		resolved, linked, healed, err := inspectRegisteredRepoCheckout(context.Background(), store, repo)
 		check := doctor.Check{Name: "repo checkout", Required: false}
@@ -268,6 +283,10 @@ func repoCheckoutDoctorChecks(paths config.Paths) []doctor.Check {
 			check.Detail = fmt.Sprintf("%s: registered checkout %s is primary", repo.FullName(), resolved.CheckoutPath)
 		}
 		checks = append(checks, check)
+	}
+	if len(missingDiscipline) > 0 {
+		sort.Strings(missingDiscipline)
+		checks = append(checks, doctor.Check{Name: "workflow discipline", Required: false, Detail: fmt.Sprintf("missing %s in: %s — run gitmoot repo add <owner/repo> --agents-md", gitmootDisciplineMarker, strings.Join(missingDiscipline, ", "))})
 	}
 	return checks
 }
