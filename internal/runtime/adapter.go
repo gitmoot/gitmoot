@@ -1836,21 +1836,6 @@ func (r CodexSessionIndex) locations() ([]codexSessionLocation, error) {
 	return locations, nil
 }
 
-func (r CodexSessionIndex) path() (string, error) {
-	locations, err := r.locations()
-	if err != nil {
-		return "", err
-	}
-	if len(locations) == 0 {
-		userHome, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		return filepath.Join(userHome, ".codex", "session_index.jsonl"), nil
-	}
-	return locations[0].IndexPath, nil
-}
-
 func codexLocationForIndex(path string) codexSessionLocation {
 	home := filepath.Dir(path)
 	return codexSessionLocation{

@@ -36,10 +36,6 @@ func (r PhaseRecommendation) Summary() string {
 	return fmt.Sprintf("recommend %s - %s", mode, strings.TrimSpace(r.Reason))
 }
 
-func RecommendPhase(run db.EvalRun, feedback []db.FeedbackEvent, ranked []db.RankedFeedbackEvent, pairwise []db.PairwisePreference) PhaseRecommendation {
-	return RecommendPhaseForItems(run, nil, feedback, ranked, pairwise)
-}
-
 func RecommendPhaseForItems(run db.EvalRun, items []db.EvalReviewItem, feedback []db.FeedbackEvent, ranked []db.RankedFeedbackEvent, pairwise []db.PairwisePreference) PhaseRecommendation {
 	currentMode := normalizeRecommendationMode(run.Mode)
 	explorationLevel := strings.TrimSpace(run.ExplorationLevel)

@@ -153,7 +153,7 @@ func TestRunPipelineExposeRejectsInvalidSchemaAndUnknownPipeline(t *testing.T) {
 
 func TestServicePipelinePublicSafetyRejectsAuthorityDeclarations(t *testing.T) {
 	plain := pipeline.Spec{Stages: []pipeline.Stage{{ID: "build", Cmd: "printf ok"}}}
-	if !servicePipelineIsPublicSafe(plain) {
+	if servicePipelinePublicSafetyError(plain) != nil {
 		t.Fatalf("plain shell pipeline rejected: %v", servicePipelinePublicSafetyError(plain))
 	}
 	tests := []struct {
@@ -171,8 +171,8 @@ func TestServicePipelinePublicSafetyRejectsAuthorityDeclarations(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			spec := pipeline.Spec{Stages: []pipeline.Stage{tt.stage}}
 			err := servicePipelinePublicSafetyError(spec)
-			if err == nil || servicePipelineIsPublicSafe(spec) || !strings.Contains(err.Error(), `stage "build"`) || !strings.Contains(err.Error(), tt.field) {
-				t.Fatalf("public safety error=%v safe=%v", err, servicePipelineIsPublicSafe(spec))
+			if err == nil || !strings.Contains(err.Error(), `stage "build"`) || !strings.Contains(err.Error(), tt.field) {
+				t.Fatalf("public safety error=%v", err)
 			}
 		})
 	}

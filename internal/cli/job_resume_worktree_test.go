@@ -130,7 +130,7 @@ func TestResumeSelfDirtySkipsWhenProcessLive(t *testing.T) {
 	}
 	t.Cleanup(func() { taskWorktreeLiveness = previous })
 
-	if err := runQueuedJobs(ctx, fixture.worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, fixture.worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 	if fixture.adapter.calls != 0 {
@@ -172,7 +172,7 @@ func TestResumeSelfDirtySkipsWrongHeadWhileDirty(t *testing.T) {
 		t.Fatalf("WriteFile still-dirty work: %v", err)
 	}
 
-	if err := runQueuedJobs(ctx, fixture.worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, fixture.worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 	if fixture.adapter.calls != 0 {
@@ -200,7 +200,7 @@ func TestResumeSelfDirtySkipsMissingBranchLock(t *testing.T) {
 	ctx := context.Background()
 	fixture := newSelfDirtyResumeFixtureWithLockOwner(t, "job-missing-lock", "")
 
-	if err := runQueuedJobs(ctx, fixture.worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, fixture.worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 	if fixture.adapter.calls != 0 {
@@ -216,7 +216,7 @@ func TestResumeSelfDirtySkipsForeignBranchLock(t *testing.T) {
 	ctx := context.Background()
 	fixture := newSelfDirtyResumeFixtureWithLockOwner(t, "job-foreign-lock", "another-agent")
 
-	if err := runQueuedJobs(ctx, fixture.worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, fixture.worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 	if fixture.adapter.calls != 0 {
@@ -244,7 +244,7 @@ func TestResumeSelfDirtySkipsWhenLivenessUnknown(t *testing.T) {
 			taskWorktreeLiveness = func(string) (bool, bool) { return tc.live, tc.known }
 			defer func() { taskWorktreeLiveness = previous }()
 
-			if err := runQueuedJobs(context.Background(), fixture.worker, 1); err != nil {
+			if err := runQueuedJobsForRepo(context.Background(), fixture.worker, 1, "", ""); err != nil {
 				t.Fatalf("runQueuedJobs returned error: %v", err)
 			}
 			if fixture.adapter.calls != 0 {
@@ -282,7 +282,7 @@ func TestResumeSelfDirtySkipsDirtyByOther(t *testing.T) {
 	worker := defaultJobWorker(store, io.Discard)
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) { return adapter, nil }
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 	if adapter.calls != 0 {
@@ -438,7 +438,7 @@ func TestResumeSelfDirtyBudgetExhaustedStaysTerminal(t *testing.T) {
 		t.Fatalf("UpdateJobPayload returned error: %v", err)
 	}
 
-	if err := runQueuedJobs(ctx, fixture.worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, fixture.worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 	if fixture.adapter.calls != 0 {
@@ -492,7 +492,7 @@ func TestResumeSelfDirtySkipsWhenRuntimeLeaseHeld(t *testing.T) {
 	if err != nil || !acquired {
 		t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
 	}
-	if err := runQueuedJobs(ctx, fixture.worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, fixture.worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 	if fixture.adapter.calls != 0 {
@@ -524,7 +524,7 @@ func TestResumeSelfDirtyPredicateRequiresExactDirtyText(t *testing.T) {
 
 func TestResumeSelfDirtyEventMessageNamesPathAndAttempt(t *testing.T) {
 	fixture := newSelfDirtyResumeFixture(t, "job-resume-event")
-	if err := runQueuedJobs(context.Background(), fixture.worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(context.Background(), fixture.worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 	events, err := fixture.store.ListJobEvents(context.Background(), "job-resume-event")

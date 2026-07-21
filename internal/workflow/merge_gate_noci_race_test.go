@@ -11,6 +11,12 @@ import (
 	"github.com/gitmoot/gitmoot/internal/github"
 )
 
+func resetWorkflowPresenceState() {
+	workflowPresence.Lock()
+	workflowPresence.byHead = map[string]bool{}
+	workflowPresence.Unlock()
+}
+
 // workflowAwareFakeGitHub extends fakeMergeGateGitHub with the OPTIONAL #596
 // layer-2 workflow-awareness capability so tests can exercise the ".github/
 // workflows exists at head" path (and its error/fail-safe branch).
@@ -76,7 +82,7 @@ func noCIRequest() MergeRequest {
 // unguarded, so evaluation 2 observes and requires the check that has since
 // appeared — and the PR merges only after the check passes.
 func TestPolicyMergeGateNoCIRaceDefersThenRequiresLateCheck(t *testing.T) {
-	resetWorkflowPresenceCache()
+	resetWorkflowPresenceState()
 	ctx := context.Background()
 	store := openEngineStore(t)
 	gh := setupApprovedNoCIPR(t, store, "d342f97")
@@ -143,7 +149,7 @@ func TestPolicyMergeGateNoCIRaceDefersThenRequiresLateCheck(t *testing.T) {
 // observation and defers; the second, past MinCIWait with the head unchanged and
 // still zero external CI, concludes no-CI, stamps gitmoot/ci, and merges.
 func TestPolicyMergeGateNoCIMergesAfterGraceWindow(t *testing.T) {
-	resetWorkflowPresenceCache()
+	resetWorkflowPresenceState()
 	ctx := context.Background()
 	store := openEngineStore(t)
 	gh := setupApprovedNoCIPR(t, store, "cico001")
@@ -182,7 +188,7 @@ func TestPolicyMergeGateNoCIMergesAfterGraceWindow(t *testing.T) {
 // the two observations restarts the grace window: the gate never merges off the
 // old head's clock even after MinCIWait has elapsed.
 func TestPolicyMergeGateNoCIObservationResetsOnNewHead(t *testing.T) {
-	resetWorkflowPresenceCache()
+	resetWorkflowPresenceState()
 	ctx := context.Background()
 	store := openEngineStore(t)
 	gh := setupApprovedNoCIPR(t, store, "headAAA")
@@ -240,7 +246,7 @@ func TestPolicyMergeGateNoCIObservationResetsOnNewHead(t *testing.T) {
 // instead of wedging forever. This restores the liveness main had while keeping the
 // creation-lag protection.
 func TestPolicyMergeGateWorkflowAwarenessBoundsPendingThenConcludes(t *testing.T) {
-	resetWorkflowPresenceCache()
+	resetWorkflowPresenceState()
 	ctx := context.Background()
 	store := openEngineStore(t)
 	base := setupApprovedNoCIPR(t, store, "wfhead1")
@@ -290,7 +296,7 @@ func TestPolicyMergeGateWorkflowAwarenessBoundsPendingThenConcludes(t *testing.T
 // (rather than hard-blocking during the Actions creation-lag race) and only then
 // hard-blocks — as a TRANSIENT block the harvester ignores, never a gitmoot/ci stamp.
 func TestPolicyMergeGateWorkflowAwarenessRequireExternalCIBlocksAfterBound(t *testing.T) {
-	resetWorkflowPresenceCache()
+	resetWorkflowPresenceState()
 	ctx := context.Background()
 	store := openEngineStore(t)
 	base := setupApprovedNoCIPR(t, store, "wfreq01")
@@ -333,7 +339,7 @@ func TestPolicyMergeGateWorkflowAwarenessRequireExternalCIBlocksAfterBound(t *te
 // stamp): evaluation 1 still defers, and the repo only merges after a second
 // zero observation past the grace window.
 func TestPolicyMergeGateWorkflowReadErrorFailsSafeToGrace(t *testing.T) {
-	resetWorkflowPresenceCache()
+	resetWorkflowPresenceState()
 	ctx := context.Background()
 	store := openEngineStore(t)
 	base := setupApprovedNoCIPR(t, store, "wferr01")
@@ -367,7 +373,7 @@ func TestPolicyMergeGateWorkflowReadErrorFailsSafeToGrace(t *testing.T) {
 // still-zero external CI does it hard-block — with an actionable reason, as a
 // TRANSIENT block the harvester ignores, and never stamping gitmoot/ci.
 func TestPolicyMergeGateRequireExternalCIWaitsThenHardBlocks(t *testing.T) {
-	resetWorkflowPresenceCache()
+	resetWorkflowPresenceState()
 	ctx := context.Background()
 	store := openEngineStore(t)
 	gh := setupApprovedNoCIPR(t, store, "reqci01")

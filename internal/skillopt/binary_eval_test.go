@@ -266,23 +266,6 @@ func TestAggregateBinaryVerdictsDefaultsZeroWeight(t *testing.T) {
 	}
 }
 
-func TestToEvaluatorScoreShape(t *testing.T) {
-	res := BinaryEvaluationResult{
-		DimensionScores: map[string]float64{"a": 0.5, "b": 1.0},
-		Overall:         0.75,
-	}
-	score := res.ToEvaluatorScore("bugfix")
-	if score.TaskKind != "bugfix" {
-		t.Fatalf("task kind = %q", score.TaskKind)
-	}
-	if len(score.DimensionScores) != 2 || score.DimensionScores["a"] != 0.5 {
-		t.Fatalf("dimension scores = %+v", score.DimensionScores)
-	}
-	if score.Soft != nil || score.Hard != nil {
-		t.Fatal("expected Soft/Hard unset (contract additive, DimensionScores only)")
-	}
-}
-
 // stubEvaluator lets RunBinaryEvaluation be tested independently of the rule runner.
 type stubEvaluator struct{ answers map[string]BinaryAnswer }
 

@@ -257,11 +257,9 @@ the same `delegations` field, `coordinator`, and `continuation` mechanics.
   `concurrency`, `migration`, `security`, `refactor`, …); a multi-file
   `implement`/`fix` action versus a read-only `ask`; broad scope (several
   `artifacts` or a dedicated `worktree`); and whether the leg is part of a
-  `quorum`. More of these lean **deep**; their absence leans **cheap**. Gitmoot
-  ships an uncalibrated helper for this — `workflow.ScoreComplexity` /
-  `workflow.TierFor` (`internal/workflow/modeltier.go`) — that turns a
-  delegation into a tier. It is a pure recommendation primitive: the engine
-  never calls it and never overrides a coordinator's chosen `model`.
+  `quorum`. More of these lean **deep**; their absence leans **cheap**. Model
+  choice remains the coordinator's responsibility; the engine never overrides
+  a coordinator's chosen `model`.
 
   **Cascade / escalate-in-continuation pattern.** Prefer to start a leg on the
   cheapest plausible tier and **escalate in a continuation** only if it falls

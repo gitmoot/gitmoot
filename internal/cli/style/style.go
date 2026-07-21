@@ -58,13 +58,6 @@ func (s Style) Yellow(text string) string { return s.wrap(ansiYellow, text) }
 // Cyan returns text wrapped in cyan when styling is enabled.
 func (s Style) Cyan(text string) string { return s.wrap(ansiCyan, text) }
 
-// Enabled returns an always-on Style, for callers that have already decided to
-// style (or for tests).
-func Enabled() Style { return Style{enabled: true} }
-
-// Disabled returns an always-off Style.
-func Disabled() Style { return Style{enabled: false} }
-
 // For returns a Style for w, enabled per the resolved environment and whether w
 // is a real terminal.
 func For(w io.Writer) Style {
@@ -173,23 +166,4 @@ func GroupSuffix(name string) (prefix string, ok bool) {
 		return "", false
 	}
 	return name[:index], true
-}
-
-// MiddleTruncate shortens s to at most max runes, keeping the head and tail and
-// inserting a single "…" in the middle. max < 5 falls back to a plain head cut.
-func MiddleTruncate(s string, max int) string {
-	runes := []rune(s)
-	if len(runes) <= max {
-		return s
-	}
-	if max < 5 {
-		if max <= 0 {
-			return ""
-		}
-		return string(runes[:max])
-	}
-	keep := max - 1
-	head := (keep + 1) / 2
-	tail := keep - head
-	return string(runes[:head]) + "…" + string(runes[len(runes)-tail:])
 }

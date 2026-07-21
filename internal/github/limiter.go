@@ -412,11 +412,6 @@ func DefaultLimiter() *RateLimiter {
 	return defaultLimiter
 }
 
-// DefaultLimiterSnapshot returns the process-global limiter's live state.
-func DefaultLimiterSnapshot() RateLimiterState {
-	return DefaultLimiter().Snapshot()
-}
-
 // --- secondary-limit detection ----------------------------------------------
 
 // isSecondaryRateLimit reports whether a gh result carries GitHub's SECONDARY

@@ -221,62 +221,6 @@ func ParseJudgeCandidatePackage(data []byte) (JudgeCandidatePackage, error) {
 	return pkg, nil
 }
 
-// EvaluationConfigForReader expands a template's flat Evaluation map
-// (map[string]string, where judge_prompt_templates is stored as a JSON-encoded
-// object string per the write contract of `judge promote`) into the nested
-// evaluator config that judgePromptConfigFromConfig / EvaluatorProfileFromConfig
-// consume. It mirrors how the eval-run start path nests an "evaluation" object:
-// the JSON-string value of judge_prompt_templates is re-inlined as a real object
-// so the reader's map[string]string decode succeeds. This is the bridge that
-// proves the round-trip without changing the reader's contract. It returns nil
-// for an empty map so callers can fall back to existing config sources.
-func EvaluationConfigForReader(evaluation map[string]string) json.RawMessage {
-	if len(evaluation) == 0 {
-		return nil
-	}
-	nested := make(map[string]json.RawMessage, len(evaluation))
-	for key, value := range evaluation {
-		switch key {
-		case "judge_prompt_templates":
-			trimmed := strings.TrimSpace(value)
-			if trimmed == "" {
-				continue
-			}
-			// Stored as a JSON-encoded object string; re-inline as raw JSON when
-			// it parses as the map[string]string the reader expects, otherwise
-			// fall back to a JSON string so the value is never silently dropped.
-			var probe map[string]string
-			if err := json.Unmarshal([]byte(trimmed), &probe); err == nil {
-				nested[key] = json.RawMessage(trimmed)
-				continue
-			}
-			encoded, err := json.Marshal(value)
-			if err != nil {
-				continue
-			}
-			nested[key] = encoded
-		default:
-			encoded, err := json.Marshal(value)
-			if err != nil {
-				continue
-			}
-			nested[key] = encoded
-		}
-	}
-	if len(nested) == 0 {
-		return nil
-	}
-	nestedRaw, err := json.Marshal(nested)
-	if err != nil {
-		return nil
-	}
-	wrapper, err := json.Marshal(map[string]json.RawMessage{"evaluation": nestedRaw})
-	if err != nil {
-		return nil
-	}
-	return json.RawMessage(wrapper)
-}
-
 type EvaluatorStageStatus struct {
 	Stage      string          `json:"stage,omitempty"`
 	Status     string          `json:"status,omitempty"`
@@ -1056,10 +1000,6 @@ func evaluatorProfileMetadataString(metadata map[string]any, path ...string) str
 		return strings.TrimSpace(value)
 	}
 	return ""
-}
-
-func ImportCandidatePackage(ctx context.Context, store *db.Store, candidate CandidatePackage, sourcePath string) (db.AgentTemplateVersion, error) {
-	return ImportCandidatePackageWithOptions(ctx, store, candidate, CandidateImportOptions{SourcePath: sourcePath})
 }
 
 func ImportCandidatePackageWithOptions(ctx context.Context, store *db.Store, candidate CandidatePackage, options CandidateImportOptions) (db.AgentTemplateVersion, error) {

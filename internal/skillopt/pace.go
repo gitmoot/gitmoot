@@ -52,18 +52,6 @@ const (
 	PaceReject
 )
 
-// String renders a PaceVerdict for reasons/logs.
-func (v PaceVerdict) String() string {
-	switch v {
-	case PaceCommit:
-		return "commit"
-	case PaceReject:
-		return "reject"
-	default:
-		return "continue"
-	}
-}
-
 // Default PACE parameters (matching the RFC / arXiv:2606.08106):
 //   - alpha = 0.05  -> commit threshold 1/alpha = 20.
 //   - lambda = 0.5  -> a win multiplies wealth by 1.5, a loss by 0.5.
@@ -109,11 +97,6 @@ func (c PaceConfig) withDefaults() PaceConfig {
 		out.MaxPairs = DefaultPaceMaxPairs
 	}
 	return out
-}
-
-// CommitThreshold is 1/Alpha, the wealth at which the e-process commits.
-func (c PaceConfig) CommitThreshold() float64 {
-	return 1.0 / c.withDefaults().Alpha
 }
 
 // PaceAccumulator is the streaming e-process. It consumes paired outcomes one at a
@@ -178,30 +161,6 @@ func (a *PaceAccumulator) Verdict() PaceVerdict {
 	return PaceContinue
 }
 
-// Wealth is the current e-process wealth E (starts at 1).
-func (a *PaceAccumulator) Wealth() float64 { return a.wealth }
-
-// Pairs is the number of DISCORDANT pairs consumed (ties excluded).
-func (a *PaceAccumulator) Pairs() int { return a.pairs }
-
-// Committed reports whether the accumulator has latched PaceCommit.
-func (a *PaceAccumulator) Committed() bool { return a.committed }
-
-// EvaluatePaceStream feeds a whole sequence of paired outcomes through a fresh
-// accumulator (ties discarded, commit latching on first crossing — the early-stop
-// property) and returns the final verdict. The order of the stream matters for WHEN
-// the accumulator commits, exactly as an online anytime-valid test peeks after every
-// pair; it is the faithful streaming evaluation used by the replay harness.
-func EvaluatePaceStream(cfg PaceConfig, outcomes []PaceOutcome) PaceVerdict {
-	acc := NewPaceAccumulator(cfg)
-	for _, o := range outcomes {
-		if acc.Observe(o) == PaceCommit {
-			break
-		}
-	}
-	return acc.Verdict()
-}
-
 // EvaluatePaceCounts decides commit/reject/continue from AGGREGATE discordant-pair
 // counts (candidate wins and losses), which is what the Mode B bandit arm records
 // (skillopt_bandit_arms tallies win/loss; ties are never recorded). The bandit is a
@@ -211,9 +170,8 @@ func EvaluatePaceStream(cfg PaceConfig, outcomes []PaceOutcome) PaceVerdict {
 // making the commit decision equal to the ORDER-INVARIANT terminal-wealth test
 // (E = (1+lambda)^wins * (1-lambda)^losses >= 1/alpha). This is the conservative
 // reading: it never manufactures the false EARLY commit an arbitrary win-first
-// ordering could, so promoting on a count summary stays within the alpha bound. The
-// streaming early-stop lives in EvaluatePaceStream for a true ordered log / the
-// replay harness.
+// ordering could, so promoting on a count summary stays within the alpha bound.
+// Ordered streams should feed observations directly to PaceAccumulator.
 func EvaluatePaceCounts(cfg PaceConfig, wins, losses int) PaceVerdict {
 	if wins < 0 {
 		wins = 0

@@ -199,7 +199,7 @@ func TestWorkerEmitsCockpitUnavailableEvent(t *testing.T) {
 		return &cliPollFakeGitHub{}
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -413,7 +413,7 @@ func TestWorkerNoCockpitEventWhenNotRequested(t *testing.T) {
 		return &cliPollFakeGitHub{}
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 

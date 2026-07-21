@@ -61,7 +61,7 @@ func TestPipelineServiceRetrySuccessFinalizesProofAndReceipt(t *testing.T) {
 	enqueue := newPipelineStageEnqueuer(store, home)
 	now := time.Now().UTC()
 	for i := 0; i < 12; i++ {
-		if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now.Add(time.Duration(i)*time.Second)); err != nil {
+		if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now.Add(time.Duration(i)*time.Second), nil, nil); err != nil {
 			t.Fatalf("worker tick %d: %v", i, err)
 		}
 		if err := runPipelineScanOnce(ctx, store, enqueue, now.Add(time.Duration(i)*time.Second)); err != nil {

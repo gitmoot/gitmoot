@@ -829,7 +829,7 @@ func githubLimiterSummary(policy config.GitHubLimiterPolicy) string {
 // daemonGitHubLimiterLine reports the configured [github] call budget (#683) for
 // `gitmoot daemon status`. Like daemonAdmissionLine it is a single additive line
 // showing the CONFIGURED policy; the live backoff window lives in the running
-// daemon process (github.DefaultLimiterSnapshot), not this separate status CLI.
+// daemon process (github.DefaultLimiter().Snapshot()), not this separate status CLI.
 func daemonGitHubLimiterLine(paths config.Paths) string {
 	policy, err := config.LoadGitHubLimiterPolicy(paths)
 	if err != nil {
@@ -2484,10 +2484,6 @@ func startSingleRepoWorkerLoop(ctx context.Context, interval time.Duration, stor
 	})
 }
 
-func startSupervisorWorkerLoop(ctx context.Context, interval time.Duration, run func(time.Time) error) <-chan error {
-	return startSupervisorWorkerLoopInternal(ctx, interval, nil, run, false)
-}
-
 func startSupervisorWorkerLoopRecovering(ctx context.Context, interval time.Duration, stdout io.Writer, run func(time.Time) error) <-chan error {
 	return startSupervisorWorkerLoopInternal(ctx, interval, stdout, run, true)
 }
@@ -2659,10 +2655,6 @@ func (l *repoCheckoutLocks) For(repo string) *sync.Mutex {
 	return value.(*sync.Mutex)
 }
 
-func pollRegisteredRepos(ctx context.Context, store *db.Store, workers int, dryRun bool, stdout io.Writer, nextPoll map[string]time.Time, now time.Time, fallbackPoll time.Duration) (time.Duration, error) {
-	return pollRegisteredReposWithPoller(ctx, defaultRegisteredRepoPoller(store, workers, dryRun, stdout, "", ""), registeredRepoSchedule{NextPoll: nextPoll}, now, fallbackPoll)
-}
-
 type registeredRepoSchedule struct {
 	NextPoll    map[string]time.Time
 	ErrorStreak map[string]int
@@ -2716,7 +2708,7 @@ type registeredRepoPoller struct {
 //     It feeds the engine wiring — daemonWorkflowEngine's ArtifactRoot/Home and
 //     daemonEventSink — which expect the resolved root and do NOT re-resolve.
 //
-// The legacy/test caller (pollRegisteredRepos) passes "" for both, which is a
+// The direct pollRegisteredReposWithPoller caller passes "" for both, which is a
 // no-op: resolveEscalationTTL("") returns the default and daemonWorkflowEngine("")
 // leaves ArtifactRoot/Home/EventSink unset.
 func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdout io.Writer, rawHome, resolvedRoot string) registeredRepoPoller {
@@ -3297,11 +3289,6 @@ func configuredDaemonRunningJobStaleAfter(stdout io.Writer) time.Duration {
 	return d
 }
 
-func recoverRunningJobs(ctx context.Context, store *db.Store, stdout io.Writer) error {
-	now := time.Now().UTC()
-	return recoverRunningJobsBeforeForRepo(ctx, store, stdout, now, now.Add(-configuredDaemonRunningJobStaleAfter(stdout)), "", "")
-}
-
 func recoverExpiredRuntimeSessionLocks(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time) error {
 	return recoverExpiredRuntimeSessionLocksSkipping(ctx, store, stdout, now, nil)
 }
@@ -3466,10 +3453,6 @@ func runDaemonPollWithTimeout(ctx context.Context, timeout time.Duration, poll f
 	return poll(pollCtx)
 }
 
-func recoverRunningJobsBefore(ctx context.Context, store *db.Store, stdout io.Writer, before time.Time) error {
-	return recoverRunningJobsBeforeForRepo(ctx, store, stdout, time.Now().UTC(), before, "", "")
-}
-
 func recoverRunningJobsForRepo(ctx context.Context, store *db.Store, stdout io.Writer, repoFilter string, rootFilter string) error {
 	now := time.Now().UTC()
 	return recoverRunningJobsBeforeForRepo(ctx, store, stdout, now, now.Add(-configuredDaemonRunningJobStaleAfter(stdout)), repoFilter, rootFilter)
@@ -3576,10 +3559,6 @@ func recoverRunningJobIfLeaseExpired(ctx context.Context, store *db.Store, stdou
 		writeLine(stdout, "requeued stale running job %s", job.ID)
 	}
 	return nil
-}
-
-func runQueuedJobs(ctx context.Context, worker jobWorker, limit int) error {
-	return runQueuedJobsForRepo(ctx, worker, limit, "", "")
 }
 
 // tickCandidates memoizes the three per-tick job-candidate GROUP BY queries
@@ -3735,30 +3714,6 @@ func retryPendingJobAdvancements(ctx context.Context, worker jobWorker, repoFilt
 	return nil
 }
 
-// delegationWorktreeCleanupPending reports whether jobID's last terminal cleanup
-// outcome was a PRESERVE (delegation_worktree_cleanup_skipped) with no subsequent
-// reclamation (delegation_worktree_removed) — i.e. its per-delegation worktree and
-// gitmoot-delegation-* branch are still on disk awaiting reclaim once the foreign
-// runtime owner that blocked the cleanup releases/expires (#536). The order of the
-// two event kinds matters (a worktree can be preserved, then later removed), so the
-// LAST one wins.
-func (w jobWorker) delegationWorktreeCleanupPending(ctx context.Context, jobID string) (bool, error) {
-	events, err := w.Store.ListJobEvents(ctx, jobID)
-	if err != nil {
-		return false, err
-	}
-	pending := false
-	for _, event := range events {
-		switch event.Kind {
-		case "delegation_worktree_cleanup_skipped":
-			pending = true
-		case "delegation_worktree_removed":
-			pending = false
-		}
-	}
-	return pending, nil
-}
-
 // reclaimSkippedDelegationWorktrees re-fires the terminal worktree cleanup for any
 // terminal delegation child whose cleanup was previously SKIPPED because a foreign
 // runtime owner was still active (#536). The cleanup is idempotent and itself
@@ -3817,12 +3772,8 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 	return nil
 }
 
-func runDaemonWorkerTick(ctx context.Context, store *db.Store, worker jobWorker, workers int, dryRun bool, repoFilter string, rootFilter string, stdout io.Writer, now time.Time) error {
-	return runDaemonWorkerTickTracked(ctx, store, worker, workers, dryRun, repoFilter, rootFilter, stdout, now, nil, nil)
-}
-
 // runDaemonWorkerTickTracked is the per-tick worker pass. With a nil tracker it
-// is byte-identical to the historical runDaemonWorkerTick: maintenance scans,
+// follows the historical synchronous tick behavior: maintenance scans,
 // then a BLOCKING runQueuedJobsForRepo dispatch. The supervisors pass a live
 // tracker (#562), which changes the tick to claim-and-dispatch-async:
 //
@@ -3844,8 +3795,8 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	if dryRun {
 		return nil
 	}
-	// A nil carrier means this is a standalone tick (single-repo supervisor or the
-	// runDaemonWorkerTick wrapper): compute the shared candidate sets once for THIS
+	// A nil carrier means this is a standalone tick (single-repo supervisor or
+	// direct caller): compute the shared candidate sets once for THIS
 	// tick. The multi-repo supervisor passes a carrier it created once per tick, so
 	// the three GROUP BY queries run once per tick rather than once per enabled repo
 	// (#619).
@@ -3919,14 +3870,6 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 		return runQueuedJobsForRepo(ctx, worker, limit, repoFilter, rootFilter)
 	}
 	return dispatchQueuedJobsTracked(ctx, worker, limit, workers, repoFilter, rootFilter, tracker)
-}
-
-func runEnabledRepoWorkerTicks(ctx context.Context, store *db.Store, worker jobWorker, workers int, stdout io.Writer, now time.Time) error {
-	return runEnabledRepoWorkerTicksTracked(ctx, store, worker, workers, "", stdout, now, nil, nil)
-}
-
-func runEnabledRepoWorkerTicksWithLocks(ctx context.Context, store *db.Store, worker jobWorker, workers int, rootFilter string, stdout io.Writer, now time.Time, locks *repoCheckoutLocks) error {
-	return runEnabledRepoWorkerTicksTracked(ctx, store, worker, workers, rootFilter, stdout, now, locks, nil)
 }
 
 func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, worker jobWorker, workers int, rootFilter string, stdout io.Writer, now time.Time, locks *repoCheckoutLocks, tracker *inflightJobTracker) error {
@@ -4218,13 +4161,6 @@ var (
 	preflightWarnByRepo = map[string]preflightWarnState{}
 	preflightWarnReWarn = 30 * time.Minute
 )
-
-// resetPreflightWarnThrottle clears the preflight de-dup state. Test-only.
-func resetPreflightWarnThrottle() {
-	preflightWarnMu.Lock()
-	defer preflightWarnMu.Unlock()
-	preflightWarnByRepo = map[string]preflightWarnState{}
-}
 
 // shouldEmitPreflightWarn reports whether the warning for this repo/signature
 // should be emitted now, recording the decision so an unchanged backlog stays
@@ -4758,10 +4694,6 @@ type queuedJobResourceSelector struct {
 	checkouts        map[string]bool
 	runtimes         map[string]bool
 	tempReservations map[string]int
-}
-
-func selectRunnableQueuedJobs(ctx context.Context, store *db.Store, pending []db.Job, limit int) ([]db.Job, []db.Job) {
-	return selectRunnableQueuedJobsWithPolicy(ctx, store, pending, limit, config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue})
 }
 
 func selectRunnableQueuedJobsWithPolicy(ctx context.Context, store *db.Store, pending []db.Job, limit int, policy config.ParallelSessionPolicy) ([]db.Job, []db.Job) {
@@ -8903,14 +8835,6 @@ func daemonJobPayload(job db.Job) (workflow.JobPayload, error) {
 		return workflow.JobPayload{}, fmt.Errorf("parse job payload %q: %w", job.ID, err)
 	}
 	return payload, nil
-}
-
-func resolveDaemonCheckout(ctx context.Context, repo github.Repository, client gitutil.Client) (string, error) {
-	record, err := repoRecordForCheckout(ctx, repo, client)
-	if err != nil {
-		return "", err
-	}
-	return record.CheckoutPath, nil
 }
 
 // resolveDaemonStartRepo resolves the repo record that `daemon start/run --repo

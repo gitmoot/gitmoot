@@ -3,7 +3,6 @@ package runtime
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -379,10 +378,6 @@ func parseKimiStreamJSON(output string) (string, string, kimiUsage, error) {
 		return "", "", kimiUsage{}, err
 	}
 	return strings.Join(contentParts, ""), sessionID, usage, nil
-}
-
-func kimiEventContentText(raw json.RawMessage) string {
-	return extractKimiContentText(raw)
 }
 
 func isKimiSessionID(ref string) bool {

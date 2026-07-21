@@ -272,23 +272,6 @@ func normalizeVerdict(v string) string {
 	}
 }
 
-// ToEvaluatorScore maps the aggregated result onto the existing EvaluatorScore
-// shape WITHOUT any contract change: the per-dimension weighted yes-fractions
-// populate DimensionScores. TaskKind carries the set's template_or_task_kind so
-// the score is attributable. The overall score is intentionally left off the
-// contract (it is recoverable as the weighted mean of DimensionScores and is
-// surfaced separately in the CLI/result).
-func (r BinaryEvaluationResult) ToEvaluatorScore(taskKind string) *EvaluatorScore {
-	dims := make(map[string]float64, len(r.DimensionScores))
-	for k, v := range r.DimensionScores {
-		dims[k] = v
-	}
-	return &EvaluatorScore{
-		TaskKind:        strings.TrimSpace(taskKind),
-		DimensionScores: dims,
-	}
-}
-
 // RuleBasedBinaryEvaluator is the DETERMINISTIC, no-LLM runner used by tests and
 // by `binary run --deterministic`. It answers each question purely from the
 // question's Contains/NotContains/Regex/NotRegex assertions applied to the

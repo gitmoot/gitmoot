@@ -58,7 +58,7 @@ func TestConfigureGitHubLimiterInstallsPolicy(t *testing.T) {
 	if !strings.Contains(out.String(), "github limiter:") {
 		t.Fatalf("expected summary log line, got %q", out.String())
 	}
-	state := github.DefaultLimiterSnapshot()
+	state := github.DefaultLimiter().Snapshot()
 	if !state.BackoffEnabled {
 		t.Fatalf("default config should enable secondary backoff on the shared limiter")
 	}

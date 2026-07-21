@@ -80,54 +80,6 @@ func TestAllocateIntegrationWorktreeBlocksOnMergeConflict(t *testing.T) {
 	}
 }
 
-func TestIntegrationDepBranches(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	engine := testEngine(store)
-
-	// Two succeeded implement legs (distinct branches), one succeeded read-only dep
-	// (no branch), and one implement leg that ran in the shared checkout (branch ==
-	// base, so it is already on base and skipped).
-	insertCompletedJob(t, store, db.Job{ID: "p/delegation/legA", Agent: "builder", Type: "implement", ParentJobID: "p", DelegationID: "legA"},
-		JobPayload{Repo: "owner/repo", Branch: "branchA", DelegationID: "legA"})
-	insertCompletedJob(t, store, db.Job{ID: "p/delegation/legB", Agent: "builder", Type: "implement", ParentJobID: "p", DelegationID: "legB"},
-		JobPayload{Repo: "owner/repo", Branch: "branchB", DelegationID: "legB"})
-	insertCompletedJob(t, store, db.Job{ID: "p/delegation/note", Agent: "noter", Type: "ask", ParentJobID: "p", DelegationID: "note"},
-		JobPayload{Repo: "owner/repo", Branch: "task-x", DelegationID: "note"})
-	insertCompletedJob(t, store, db.Job{ID: "p/delegation/legBase", Agent: "builder", Type: "implement", ParentJobID: "p", DelegationID: "legBase"},
-		JobPayload{Repo: "owner/repo", Branch: "task-x", DelegationID: "legBase"})
-
-	parentJob := db.Job{ID: "p", Agent: "coord", Type: "ask"}
-	parentPayload := JobPayload{
-		Repo:   "owner/repo",
-		Branch: "task-x",
-		Result: &AgentResult{Delegations: []Delegation{
-			{ID: "legA", Action: "implement"},
-			{ID: "legB", Action: "implement"},
-			{ID: "note", Action: "ask"},
-			{ID: "legBase", Action: "implement"},
-		}},
-	}
-	verify := Delegation{ID: "verify", Action: "review", Deps: []string{"legA", "legB", "note", "legBase"}}
-
-	branches, err := engine.integrationDepBranches(ctx, parentJob, parentPayload, verify)
-	if err != nil {
-		t.Fatalf("integrationDepBranches returned error: %v", err)
-	}
-	if !reflect.DeepEqual(branches, []string{"branchA", "branchB"}) {
-		t.Fatalf("branches = %v, want [branchA branchB] (read-only and base-branch deps skipped)", branches)
-	}
-
-	// A delegation with no deps yields no integration.
-	none, err := engine.integrationDepBranches(ctx, parentJob, parentPayload, Delegation{ID: "x", Action: "review"})
-	if err != nil {
-		t.Fatalf("integrationDepBranches(no deps) returned error: %v", err)
-	}
-	if none != nil {
-		t.Fatalf("no-deps delegation = %v, want nil", none)
-	}
-}
-
 func TestCommitDelegationLeg(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -276,7 +228,7 @@ func TestAllocateAndEnqueueDelegationBlocksWhenImplementLegUnresolved(t *testing
 	engine.DelegationWorktrees = manager
 
 	// The implement leg "legA" is declared as a sibling and depended on, but NO
-	// succeeded leg job exists for it -> integrationDepBranches yields 0 branches
+	// succeeded leg job exists for it, so dependency branch resolution yields 0 branches
 	// while the delegation still declares an implement dep.
 	parentJob := db.Job{ID: "p", Agent: "coord", Type: "ask"}
 	parentPayload := JobPayload{

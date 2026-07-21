@@ -161,7 +161,7 @@ func TestPipelineBundleRoundTripE2E(t *testing.T) {
 	worker := defaultJobWorker(storeB, io.Discard, homeB)
 	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	for i := 0; i < 8; i++ {
-		if err := runEnabledRepoWorkerTicks(ctx, storeB, worker, 1, io.Discard, now); err != nil {
+		if err := runEnabledRepoWorkerTicksTracked(ctx, storeB, worker, 1, "", io.Discard, now, nil, nil); err != nil {
 			t.Fatalf("worker tick %d: %v", i, err)
 		}
 		if err := runPipelineScanOnce(ctx, storeB, enqueue, now); err != nil {

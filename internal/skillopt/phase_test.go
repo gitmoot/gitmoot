@@ -13,8 +13,9 @@ func TestRecommendPhaseExploreToRefine(t *testing.T) {
 		rankedEvent(t, "c", "c", "a", "d", "b"),
 		rankedEvent(t, "c", "c", "d", "a", "b"),
 	}
-	recommendation := RecommendPhase(
+	recommendation := RecommendPhaseForItems(
 		db.EvalRun{ID: "run-1", Mode: db.EvalRunModeExplore, ExplorationLevel: db.ExplorationLevelHigh},
+		nil,
 		nil,
 		ranked,
 		pairwisePreferences(12),
@@ -36,8 +37,9 @@ func TestRecommendPhaseExploreStableWinnerWithPoorQualityStaysExplore(t *testing
 	ranked[0].Quality = "poor"
 	ranked[1].Quality = "poor"
 
-	recommendation := RecommendPhase(
+	recommendation := RecommendPhaseForItems(
 		db.EvalRun{ID: "run-1", Mode: db.EvalRunModeExplore, ExplorationLevel: db.ExplorationLevelHigh},
+		nil,
 		nil,
 		ranked,
 		pairwisePreferences(12),
@@ -55,8 +57,9 @@ func TestRecommendPhaseExploreExplicitContinueModeStaysExplore(t *testing.T) {
 	}
 	ranked[0].ContinueMode = db.EvalRunModeExplore
 
-	recommendation := RecommendPhase(
+	recommendation := RecommendPhaseForItems(
 		db.EvalRun{ID: "run-1", Mode: db.EvalRunModeExplore, ExplorationLevel: db.ExplorationLevelHigh},
+		nil,
 		nil,
 		ranked,
 		pairwisePreferences(12),
@@ -72,8 +75,9 @@ func TestRecommendPhaseExploreTieStaysExplore(t *testing.T) {
 		rankedEvent(t, "c", "c", "a", "d", "b"),
 		rankedEvent(t, "d", "d", "c", "a", "b"),
 	}
-	recommendation := RecommendPhase(
+	recommendation := RecommendPhaseForItems(
 		db.EvalRun{ID: "run-1", Mode: db.EvalRunModeExplore, ExplorationLevel: db.ExplorationLevelHigh},
+		nil,
 		nil,
 		ranked,
 		pairwisePreferences(12),
@@ -92,8 +96,9 @@ func TestRecommendPhaseCountsTopTieAsFeedback(t *testing.T) {
 		rankedEvent(t, "c", "c", "d", "a", "b"),
 		tiedTop,
 	}
-	recommendation := RecommendPhase(
+	recommendation := RecommendPhaseForItems(
 		db.EvalRun{ID: "run-1", Mode: db.EvalRunModeExplore, ExplorationLevel: db.ExplorationLevelHigh},
+		nil,
 		nil,
 		ranked,
 		pairwisePreferences(12),
@@ -137,7 +142,7 @@ func TestRecommendPhaseRefineToDistill(t *testing.T) {
 	}
 	ranked[0].UsefulTraitsJSON = string(useful)
 
-	recommendation := RecommendPhase(db.EvalRun{ID: "run-1", Mode: db.EvalRunModeRefine}, nil, ranked, pairwisePreferences(12))
+	recommendation := RecommendPhaseForItems(db.EvalRun{ID: "run-1", Mode: db.EvalRunModeRefine}, nil, nil, ranked, pairwisePreferences(12))
 
 	if recommendation.RecommendedMode != db.EvalRunModeDistill {
 		t.Fatalf("recommendation = %+v", recommendation)
@@ -155,7 +160,7 @@ func TestRecommendPhaseRefineTieStaysRefine(t *testing.T) {
 	}
 	ranked[0].UsefulTraitsJSON = string(useful)
 
-	recommendation := RecommendPhase(db.EvalRun{ID: "run-1", Mode: db.EvalRunModeRefine}, nil, ranked, pairwisePreferences(12))
+	recommendation := RecommendPhaseForItems(db.EvalRun{ID: "run-1", Mode: db.EvalRunModeRefine}, nil, nil, ranked, pairwisePreferences(12))
 
 	if recommendation.RecommendedMode != db.EvalRunModeRefine || recommendation.RankingStability != "tie 1/2" {
 		t.Fatalf("recommendation = %+v", recommendation)
@@ -163,8 +168,9 @@ func TestRecommendPhaseRefineTieStaysRefine(t *testing.T) {
 }
 
 func TestRecommendPhaseDistillToValidate(t *testing.T) {
-	recommendation := RecommendPhase(
+	recommendation := RecommendPhaseForItems(
 		db.EvalRun{ID: "run-1", Mode: db.EvalRunModeDistill},
+		nil,
 		nil,
 		[]db.RankedFeedbackEvent{rankedEvent(t, "b", "b", "a")},
 		pairwisePreferences(1),
@@ -181,7 +187,7 @@ func TestRecommendPhaseValidateToPromote(t *testing.T) {
 		{Choice: "b"},
 		{Choice: "a"},
 	}
-	recommendation := RecommendPhase(db.EvalRun{ID: "run-1", Mode: db.EvalRunModeValidate}, feedback, nil, nil)
+	recommendation := RecommendPhaseForItems(db.EvalRun{ID: "run-1", Mode: db.EvalRunModeValidate}, nil, feedback, nil, nil)
 
 	if recommendation.RecommendedMode != PromoteRecommendation {
 		t.Fatalf("recommendation = %+v", recommendation)
@@ -193,7 +199,7 @@ func TestRecommendPhaseRankedValidateToPromote(t *testing.T) {
 		rankedEvent(t, "c", "c", "a", "d", "b"),
 		rankedEvent(t, "c", "c", "d", "a", "b"),
 	}
-	recommendation := RecommendPhase(db.EvalRun{ID: "run-1", Mode: db.EvalRunModeValidate, OptionsCount: 4}, nil, ranked, pairwisePreferences(12))
+	recommendation := RecommendPhaseForItems(db.EvalRun{ID: "run-1", Mode: db.EvalRunModeValidate, OptionsCount: 4}, nil, nil, ranked, pairwisePreferences(12))
 
 	if recommendation.RecommendedMode != PromoteRecommendation {
 		t.Fatalf("recommendation = %+v", recommendation)
@@ -205,7 +211,7 @@ func TestRecommendPhaseRankedValidateTieStaysValidate(t *testing.T) {
 		rankedEvent(t, "c", "c", "a", "d", "b"),
 		rankedEvent(t, "d", "d", "c", "a", "b"),
 	}
-	recommendation := RecommendPhase(db.EvalRun{ID: "run-1", Mode: db.EvalRunModeValidate, OptionsCount: 4}, nil, ranked, pairwisePreferences(12))
+	recommendation := RecommendPhaseForItems(db.EvalRun{ID: "run-1", Mode: db.EvalRunModeValidate, OptionsCount: 4}, nil, nil, ranked, pairwisePreferences(12))
 
 	if recommendation.RecommendedMode != db.EvalRunModeValidate || recommendation.RankingStability != "tie 1/2" {
 		t.Fatalf("recommendation = %+v", recommendation)
@@ -213,7 +219,7 @@ func TestRecommendPhaseRankedValidateTieStaysValidate(t *testing.T) {
 }
 
 func TestRecommendPhaseNoFeedbackContinuesCurrentMode(t *testing.T) {
-	recommendation := RecommendPhase(db.EvalRun{ID: "run-1", Mode: db.EvalRunModeExplore}, nil, nil, nil)
+	recommendation := RecommendPhaseForItems(db.EvalRun{ID: "run-1", Mode: db.EvalRunModeExplore}, nil, nil, nil, nil)
 
 	if recommendation.RecommendedMode != db.EvalRunModeExplore || recommendation.RankingStability != "none" {
 		t.Fatalf("recommendation = %+v", recommendation)

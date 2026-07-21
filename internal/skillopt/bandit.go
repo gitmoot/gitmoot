@@ -41,25 +41,6 @@ type BanditArm struct {
 	Pulls int
 }
 
-// NewArm returns a fresh arm with the uniform Beta(1,1) prior and zero pulls.
-func NewArm() BanditArm {
-	return BanditArm{Alpha: 1, Beta: 1, Pulls: 0}
-}
-
-// Update applies one pairwise outcome to the arm: a win bumps Alpha, a loss
-// bumps Beta, and either way the pull count increments. It is pure (returns a
-// new arm) so callers control persistence.
-func (a BanditArm) Update(win bool) BanditArm {
-	next := a
-	if win {
-		next.Alpha++
-	} else {
-		next.Beta++
-	}
-	next.Pulls++
-	return next
-}
-
 // SampleTheta draws one Thompson sample theta ~ Beta(Alpha, Beta) from the arm's
 // posterior using the injected rng. The draw is X/(X+Y) with X~Gamma(Alpha,1)
 // and Y~Gamma(Beta,1) — the standard Beta-from-two-Gammas construction — so the
@@ -80,8 +61,8 @@ func (p BetaParams) SampleTheta(rng *rand.Rand) float64 {
 // SAME injected rng and returns the fraction where the challenger sample is
 // strictly larger. This is the promotion confidence #471's auto_promote_min_
 // confidence guardrail compares against. Deterministic given a seeded rng; the
-// MANDATORY closed-form cross-check test (probChallengerBeatsClosedForm) proves
-// the sampler is unbiased. Equal samples (a measure-zero tie for continuous
+// MANDATORY closed-form cross-check in bandit_test.go proves the sampler is
+// unbiased. Equal samples (a measure-zero tie for continuous
 // Beta, but possible at the float boundary) count as NOT beating, the
 // conservative direction for a promotion gate.
 func ProbChallengerBeats(champion, challenger BetaParams, rng *rand.Rand, draws int) float64 {
@@ -145,62 +126,4 @@ func sampleGamma(rng *rand.Rand, shape float64) float64 {
 			return d * v
 		}
 	}
-}
-
-// probChallengerBeatsClosedForm is the exact P(X > Y) for X ~ Beta(challenger)
-// and Y ~ Beta(champion) when ALL four parameters are positive integers, used
-// ONLY as the cross-check oracle for the Monte Carlo sampler in tests (it is not
-// on any production path). It evaluates the standard Beta-exceedance identity
-//
-//	P(X > Y) = sum_{i=0}^{a_x-1} B(a_y+i, b_y+b_x) / ((b_x+i) * B(1+i, b_x) * B(a_y, b_y))
-//
-// where X ~ Beta(a_x,b_x), Y ~ Beta(a_y,b_y), and B is the Beta function. It is
-// summed in log space for numerical stability. Returns (value, true) when every
-// parameter is a positive integer, else (0, false).
-func probChallengerBeatsClosedForm(champion, challenger BetaParams) (float64, bool) {
-	ax, axOK := positiveInteger(challenger.Alpha)
-	bx, bxOK := positiveInteger(challenger.Beta)
-	ay, ayOK := positiveInteger(champion.Alpha)
-	by, byOK := positiveInteger(champion.Beta)
-	if !axOK || !bxOK || !ayOK || !byOK {
-		return 0, false
-	}
-	total := 0.0
-	for i := 0; i < ax; i++ {
-		// term = B(ay+i, by+bx) / ((bx+i) * B(1+i, bx) * B(ay, by)), evaluated as
-		// the exponential of a difference of log-Beta values.
-		logTerm := logBeta(float64(ay+i), float64(by+bx)) -
-			math.Log(float64(bx+i)) -
-			logBeta(float64(1+i), float64(bx)) -
-			logBeta(float64(ay), float64(by))
-		total += math.Exp(logTerm)
-	}
-	if total < 0 {
-		total = 0
-	}
-	if total > 1 {
-		total = 1
-	}
-	return total, true
-}
-
-// logBeta returns log B(a, b) = lgamma(a) + lgamma(b) - lgamma(a+b).
-func logBeta(a, b float64) float64 {
-	la, _ := math.Lgamma(a)
-	lb, _ := math.Lgamma(b)
-	lab, _ := math.Lgamma(a + b)
-	return la + lb - lab
-}
-
-// positiveInteger reports whether v is a positive integer and returns it as an
-// int when so.
-func positiveInteger(v float64) (int, bool) {
-	if v < 1 {
-		return 0, false
-	}
-	rounded := math.Round(v)
-	if math.Abs(v-rounded) > 1e-9 {
-		return 0, false
-	}
-	return int(rounded), true
 }

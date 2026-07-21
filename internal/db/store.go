@@ -7186,16 +7186,6 @@ type agentTemplateScanner interface {
 	Scan(dest ...any) error
 }
 
-func scanAgentTemplate(scanner agentTemplateScanner) (AgentTemplate, error) {
-	var template AgentTemplate
-	if err := scanner.Scan(&template.ID, &template.Name, &template.Description, &template.SourceRepo, &template.SourceRef, &template.SourcePath, &template.ResolvedCommit, &template.Content, &template.MetadataJSON, &template.CreatedAt, &template.UpdatedAt); err != nil {
-		return AgentTemplate{}, err
-	}
-	template.ContentHash = templateContentHash(template.Content)
-	template.VersionState = "current"
-	return template, nil
-}
-
 func scanAgentTemplateWithVersion(scanner agentTemplateScanner) (AgentTemplate, error) {
 	var template AgentTemplate
 	if err := scanner.Scan(&template.ID, &template.Name, &template.Description, &template.SourceRepo, &template.SourceRef, &template.SourcePath, &template.ResolvedCommit, &template.Content, &template.MetadataJSON, &template.VersionID, &template.VersionNumber, &template.VersionState, &template.ContentHash, &template.CreatedAt, &template.UpdatedAt); err != nil {

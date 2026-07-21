@@ -15,14 +15,6 @@ func TestPipelineEnvParseAndResolve(t *testing.T) {
 	if !reflect.DeepEqual(values, map[string]string{"REDDIT_ID": "one", "REDDIT_SECRET": "two", "PLAIN": "three"}) {
 		t.Fatalf("values = %#v", values)
 	}
-	keys, err := ResolveEnvKeys([]string{"REDDIT_*", "PLAIN", "REDDIT_ID"}, values)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := []string{"REDDIT_ID", "REDDIT_SECRET", "PLAIN"}; !reflect.DeepEqual(keys, want) {
-		t.Fatalf("keys = %#v, want %#v", keys, want)
-	}
-
 	const secret = "never-print-this-value"
 	_, err = ParseEnv("/tmp/pipeline.env", []byte("BROKEN "+secret))
 	if err == nil || strings.Contains(err.Error(), secret) {

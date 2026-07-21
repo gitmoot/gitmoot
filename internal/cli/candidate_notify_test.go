@@ -42,9 +42,9 @@ func candidateNotifyFixture(t *testing.T) (*db.Store, db.AgentTemplateVersion, s
 		t.Fatalf("GetAgentTemplate returned error: %v", err)
 	}
 	candidate := cliSkillOptCandidatePackage(t, "planner", installed.VersionID, "Plan with stronger guidance.")
-	version, err := skillopt.ImportCandidatePackage(context.Background(), store, candidate, "candidate.json")
+	version, err := skillopt.ImportCandidatePackageWithOptions(context.Background(), store, candidate, skillopt.CandidateImportOptions{SourcePath: "candidate.json"})
 	if err != nil {
-		t.Fatalf("ImportCandidatePackage returned error: %v", err)
+		t.Fatalf("ImportCandidatePackageWithOptions returned error: %v", err)
 	}
 	if version.State != "pending" {
 		t.Fatalf("imported version state = %q, want pending", version.State)

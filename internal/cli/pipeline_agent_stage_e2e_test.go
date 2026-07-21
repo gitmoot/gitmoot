@@ -70,7 +70,7 @@ func TestPipelineAgentStageAdvanceAndParkE2E(t *testing.T) {
 	worker := defaultJobWorker(store, io.Discard, home)
 	now := time.Date(2026, 7, 8, 9, 0, 0, 0, time.UTC)
 	for i := 0; i < 8; i++ {
-		if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now); err != nil {
+		if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now, nil, nil); err != nil {
 			t.Fatalf("worker tick %d: %v", i, err)
 		}
 		if err := runPipelineScanOnce(ctx, store, enqueue, now); err != nil {
@@ -181,7 +181,7 @@ func TestPipelineAgentStageUpstreamContextE2E(t *testing.T) {
 	worker := defaultJobWorker(store, io.Discard, home)
 	now := time.Date(2026, 7, 8, 9, 0, 0, 0, time.UTC)
 	for i := 0; i < 8; i++ {
-		if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now); err != nil {
+		if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now, nil, nil); err != nil {
 			t.Fatalf("worker tick %d: %v", i, err)
 		}
 		if err := runPipelineScanOnce(ctx, store, enqueue, now); err != nil {
@@ -308,7 +308,7 @@ func TestPipelineReviewStagesConcurrentWorktreesE2E(t *testing.T) {
 	var reva, revb db.PipelineRunStage
 	enqueued := false
 	for i := 0; i < 8 && !enqueued; i++ {
-		if err := runEnabledRepoWorkerTicks(ctx, store, tickWorker, 1, io.Discard, now); err != nil {
+		if err := runEnabledRepoWorkerTicksTracked(ctx, store, tickWorker, 1, "", io.Discard, now, nil, nil); err != nil {
 			t.Fatalf("worker tick %d: %v", i, err)
 		}
 		if err := runPipelineScanOnce(ctx, store, enqueue, now); err != nil {

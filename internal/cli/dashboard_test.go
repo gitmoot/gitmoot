@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -262,13 +263,17 @@ func TestDashboardAnswerCommand(t *testing.T) {
 
 func TestDashboardTruncate(t *testing.T) {
 	items := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
-	if shown, hidden := dashboardTruncate(style.Enabled(), false, items); len(shown) != dashboardListCap || hidden != 2 {
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("CLICOLOR_FORCE", "1")
+	styled := style.For(io.Discard)
+	if shown, hidden := dashboardTruncate(styled, false, items); len(shown) != dashboardListCap || hidden != 2 {
 		t.Fatalf("styled truncate = %d shown, %d hidden", len(shown), hidden)
 	}
-	if shown, hidden := dashboardTruncate(style.Enabled(), true, items); len(shown) != 10 || hidden != 0 {
+	if shown, hidden := dashboardTruncate(styled, true, items); len(shown) != 10 || hidden != 0 {
 		t.Fatalf("--all should keep all: %d, %d", len(shown), hidden)
 	}
-	if shown, hidden := dashboardTruncate(style.Disabled(), false, items); len(shown) != 10 || hidden != 0 {
+	t.Setenv("CLICOLOR_FORCE", "")
+	if shown, hidden := dashboardTruncate(style.For(io.Discard), false, items); len(shown) != 10 || hidden != 0 {
 		t.Fatalf("plain mode keeps all: %d, %d", len(shown), hidden)
 	}
 }

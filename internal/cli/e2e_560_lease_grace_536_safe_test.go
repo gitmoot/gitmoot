@@ -24,7 +24,7 @@ import (
 //   - a fake adapter that BLOCKS inside Deliver, standing in for a live worker that
 //     has passed its run-context deadline and is now in terminal teardown (runtime
 //     kill + worktree force-clean) while STILL holding its lease.
-//   - the REAL recovery chain (runDaemonWorkerTick ->
+//   - the REAL recovery chain (runDaemonWorkerTickTracked ->
 //     recoverExpiredRuntimeSessionLocks -> DeleteExpiredResourceLocks) against the
 //     REAL db.Store, fired at a simulated time INSIDE the teardown grace window:
 //     after t0+jobTimeout (context deadline) but before the lease expires.
@@ -121,7 +121,7 @@ func TestE2E560LeaseGraceGuardsTeardownWindow(t *testing.T) {
 	// reopened #536 clobber window (a SECOND worker on the dirty in-flight worktree).
 	teardownNow := t0.Add(jobTimeout + 30*time.Second)
 	recovery := defaultJobWorker(store, io.Discard)
-	if err := runDaemonWorkerTick(ctx, store, recovery, 0, false, "owner/repo", "", io.Discard, teardownNow); err != nil {
+	if err := runDaemonWorkerTickTracked(ctx, store, recovery, 0, false, "owner/repo", "", io.Discard, teardownNow, nil, nil); err != nil {
 		t.Fatalf("recovery tick during teardown grace returned error: %v", err)
 	}
 	job, err := store.GetJob(ctx, "job-a")
@@ -202,7 +202,7 @@ func TestE2E560ExpiredLeaseRequeuesStuckWorker(t *testing.T) {
 	// running ~now) — must still recover the crashed worker via the expired-lease
 	// reaper.
 	recovery := defaultJobWorker(store, io.Discard)
-	if err := runDaemonWorkerTick(ctx, store, recovery, 0, false, "owner/repo", "", io.Discard, now); err != nil {
+	if err := runDaemonWorkerTickTracked(ctx, store, recovery, 0, false, "owner/repo", "", io.Discard, now, nil, nil); err != nil {
 		t.Fatalf("recovery tick returned error: %v", err)
 	}
 	job, err := store.GetJob(ctx, "job-stuck")
@@ -246,7 +246,7 @@ func TestE2E560SubFloorStaleWindowRejected(t *testing.T) {
 	t.Run("sub_floor_rejected_uses_default_window", func(t *testing.T) {
 		ctx := context.Background()
 		store, worker, now := seed(t)
-		if err := runDaemonWorkerTick(ctx, store, worker, 0, false, "owner/repo", "", io.Discard, now.Add(5*time.Minute)); err != nil {
+		if err := runDaemonWorkerTickTracked(ctx, store, worker, 0, false, "owner/repo", "", io.Discard, now.Add(5*time.Minute), nil, nil); err != nil {
 			t.Fatalf("recovery tick returned error: %v", err)
 		}
 		job, err := store.GetJob(ctx, "job-x")
@@ -263,7 +263,7 @@ func TestE2E560SubFloorStaleWindowRejected(t *testing.T) {
 	t.Run("default_window_still_recovers_when_truly_stale", func(t *testing.T) {
 		ctx := context.Background()
 		store, worker, now := seed(t)
-		if err := runDaemonWorkerTick(ctx, store, worker, 0, false, "owner/repo", "", io.Discard, now.Add(31*time.Minute)); err != nil {
+		if err := runDaemonWorkerTickTracked(ctx, store, worker, 0, false, "owner/repo", "", io.Discard, now.Add(31*time.Minute), nil, nil); err != nil {
 			t.Fatalf("recovery tick returned error: %v", err)
 		}
 		job, err := store.GetJob(ctx, "job-x")

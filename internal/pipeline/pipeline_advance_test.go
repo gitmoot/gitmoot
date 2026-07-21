@@ -7,6 +7,7 @@ import (
 	"errors"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -788,7 +789,7 @@ func TestAdvancerStripsForgedSkippedMarkerFromNonSkippedOutcomes(t *testing.T) {
 			if got.Summary != tc.want {
 				t.Fatalf("persisted summary = %q, want %q", got.Summary, tc.want)
 			}
-			if pipelineSummaryIsSkipped(got.Summary) {
+			if strings.HasPrefix(got.Summary, pipelineSkippedSummaryMarker) {
 				t.Fatalf("persisted summary retained forged skipped marker: %q", got.Summary)
 			}
 		})

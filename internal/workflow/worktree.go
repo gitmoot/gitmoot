@@ -635,7 +635,7 @@ func (e Engine) cleanupImplementDelegationWorktree(ctx context.Context, jobID st
 		return
 	}
 	// #332 guard: a succeeded implement leg's branch is merged into a dependent
-	// integration worktree (integrationDepBranches requires JobSucceeded). Do
+	// integration worktree. Do
 	// NOT delete a succeeded leg whose branch a sibling lists in Deps, or a
 	// pending integration would fail to merge it. Failed/blocked legs are never
 	// merged, so they are always safe to clean.
@@ -862,7 +862,7 @@ func (e Engine) ReclaimTerminalDelegationWorktree(ctx context.Context, jobID str
 // implementLegBranchMayBeMerged reports whether a succeeded implement leg's
 // branch must be PRESERVED because a dependent integration step (#332) may still
 // merge it. A sibling delegation that lists this leg in its Deps consumes the
-// leg's branch (integrationDepBranches requires the leg JobSucceeded), but only
+// leg's branch after that leg succeeds, but only
 // until that consumer reaches a terminal state: once every consumer is terminal
 // the merge has already run (or failed terminally) and the branch can be torn
 // down (#478). cleanupConsumedImplementLegWorktrees re-fires this leg's cleanup

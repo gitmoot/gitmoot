@@ -11,6 +11,13 @@ import (
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
 
+func resetConditionalState() {
+	conditionalRequests.Lock()
+	conditionalRequests.enabled = true
+	conditionalRequests.entries = map[string]conditionalCacheEntry{}
+	conditionalRequests.Unlock()
+}
+
 func TestConditionalRequestKeyIncludesLiteralArguments(t *testing.T) {
 	t.Setenv("GH_HOST", "github.example.com")
 	repo := Repository{Owner: "owner", Name: "repo"}
@@ -77,7 +84,7 @@ func TestParseConditionalResponseHeaderBlocks(t *testing.T) {
 }
 
 func TestConditionalRunStoresAndReplays304(t *testing.T) {
-	resetConditionalForTest()
+	resetConditionalState()
 	runner := &fakeRunner{
 		results: []subprocess.Result{
 			{Stdout: "HTTP/2.0 200 OK\r\nETag: W/\"etag-1\"\r\n\r\n[{\"number\":7}]"},
@@ -102,7 +109,7 @@ func TestConditionalRunStoresAndReplays304(t *testing.T) {
 }
 
 func TestConditionalFullPageFallsBackToUnconditionalPagination(t *testing.T) {
-	resetConditionalForTest()
+	resetConditionalState()
 	page := make([]PullRequest, 100)
 	for i := range page {
 		page[i].Number = int64(i + 1)
@@ -129,7 +136,7 @@ func TestConditionalFullPageFallsBackToUnconditionalPagination(t *testing.T) {
 }
 
 func TestConditional304CorruptCacheEvictsAndRetriesOnce(t *testing.T) {
-	resetConditionalForTest()
+	resetConditionalState()
 	repo := Repository{Owner: "owner", Name: "repo"}
 	args := []string{"api", "-X", "GET", "repos/owner/repo/pulls", "-f", "state=open", "-f", "per_page=100"}
 	key := conditionalRequestKey(repo, args)
@@ -164,7 +171,7 @@ func TestConditionalSkipsBodiesOverOneMiBAndMissingETag(t *testing.T) {
 		{name: "missing etag", body: `[]`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			resetConditionalForTest()
+			resetConditionalState()
 			runner := &fakeRunner{results: []subprocess.Result{{Stdout: "HTTP/2 200 OK\n" + tc.header + "\n" + tc.body}}}
 			client := GhClient{Runner: runner}
 			repo := Repository{Owner: "owner", Name: "repo"}
@@ -180,7 +187,7 @@ func TestConditionalSkipsBodiesOverOneMiBAndMissingETag(t *testing.T) {
 }
 
 func TestConditional304NotesLimiterSuccess(t *testing.T) {
-	resetConditionalForTest()
+	resetConditionalState()
 	now := time.Date(2026, 7, 14, 0, 0, 0, 0, time.UTC)
 	limiter := NewRateLimiter(RateLimiterConfig{
 		BackoffEnabled: true,

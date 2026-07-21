@@ -57,7 +57,7 @@ func TestPipelineRestartRecoversE2E(t *testing.T) {
 	enqueue1 := newPipelineStageEnqueuer(store, home)
 	worker1 := defaultJobWorker(store, io.Discard, home)
 	for i := 0; i < 8; i++ {
-		if err := runEnabledRepoWorkerTicks(ctx, store, worker1, 1, io.Discard, now); err != nil {
+		if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker1, 1, "", io.Discard, now, nil, nil); err != nil {
 			t.Fatalf("phase-1 worker tick %d: %v", i, err)
 		}
 		if err := runPipelineScanOnce(ctx, store, enqueue1, now); err != nil {
@@ -86,7 +86,7 @@ func TestPipelineRestartRecoversE2E(t *testing.T) {
 	enqueue2 := newPipelineStageEnqueuer(store2, home)
 	worker2 := defaultJobWorker(store2, io.Discard, home)
 	for i := 0; i < 8; i++ {
-		if err := runEnabledRepoWorkerTicks(ctx, store2, worker2, 1, io.Discard, now); err != nil {
+		if err := runEnabledRepoWorkerTicksTracked(ctx, store2, worker2, 1, "", io.Discard, now, nil, nil); err != nil {
 			t.Fatalf("phase-2 worker tick %d: %v", i, err)
 		}
 		if err := runPipelineScanOnce(ctx, store2, enqueue2, now); err != nil {
@@ -160,7 +160,7 @@ func TestPipelineResumeE2E(t *testing.T) {
 	drive := func(label string) db.PipelineRun {
 		t.Helper()
 		for i := 0; i < 8; i++ {
-			if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now); err != nil {
+			if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now, nil, nil); err != nil {
 				t.Fatalf("%s worker tick %d: %v", label, i, err)
 			}
 			if err := runPipelineScanOnce(ctx, store, enqueue, now); err != nil {

@@ -686,13 +686,6 @@ func bridgePathParam(path, prefix, suffix string) (string, bool) {
 	return decoded, true
 }
 
-func decodeOptionalBridgeJSON(r *http.Request, dst any) error {
-	if r.Body == nil || r.ContentLength == 0 {
-		return nil
-	}
-	return decodeRequiredBridgeJSON(r, dst)
-}
-
 func decodeRequiredBridgeJSON(r *http.Request, dst any) error {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()

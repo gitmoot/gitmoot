@@ -77,8 +77,8 @@ func TestResumableGatesFullChainE2E(t *testing.T) {
 	// --- drive to blocked+needs through a REAL worker tick -------------------
 	adapter := &cliWorkerFakeAdapter{output: reliabilityBlockedNeedsResult}
 	worker := poolSchedulerWorker(t, store, adapter, false)
-	if err := runDaemonWorkerTick(ctx, store, worker, 1, false, "owner/repo", "", io.Discard, time.Now().UTC()); err != nil {
-		t.Fatalf("runDaemonWorkerTick(block) returned error: %v", err)
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, 1, false, "owner/repo", "", io.Discard, time.Now().UTC(), nil, nil); err != nil {
+		t.Fatalf("runDaemonWorkerTickTracked(block) returned error: %v", err)
 	}
 	if got := reliabilityDeliveredCount(adapter.deliveredIDs(), jobID); got != 1 {
 		t.Fatalf("delivered count after first tick = %d, want 1", got)
@@ -154,8 +154,8 @@ func TestResumableGatesFullChainE2E(t *testing.T) {
 	}
 
 	// --- a second REAL worker tick re-delivers the resumed stage -------------
-	if err := runDaemonWorkerTick(ctx, store, worker, 1, false, "owner/repo", "", io.Discard, time.Now().UTC()); err != nil {
-		t.Fatalf("runDaemonWorkerTick(resume) returned error: %v", err)
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, 1, false, "owner/repo", "", io.Discard, time.Now().UTC(), nil, nil); err != nil {
+		t.Fatalf("runDaemonWorkerTickTracked(resume) returned error: %v", err)
 	}
 	if got := reliabilityDeliveredCount(adapter.deliveredIDs(), jobID); got != 2 {
 		t.Fatalf("delivered count after resume tick = %d, want 2 (the resumed stage re-delivered)", got)
@@ -303,8 +303,8 @@ func TestReviewResyncFullChainDeliversOnOpenPRE2E(t *testing.T) {
 		return engine
 	}
 
-	if err := runDaemonWorkerTick(ctx, store, worker, 1, false, "owner/repo", "", io.Discard, time.Now().UTC()); err != nil {
-		t.Fatalf("runDaemonWorkerTick(review) returned error: %v", err)
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, 1, false, "owner/repo", "", io.Discard, time.Now().UTC(), nil, nil); err != nil {
+		t.Fatalf("runDaemonWorkerTickTracked(review) returned error: %v", err)
 	}
 
 	// The review was DELIVERED (not failed at the head-mismatch pre-flight).
@@ -475,12 +475,12 @@ func TestGitHubLimiterDaemonWiringFullChainE2E(t *testing.T) {
 	configureGitHubLimiter(paths, io.Discard)
 
 	// The config -> limiter wiring is live: the default limiter reflects the policy.
-	snap := github.DefaultLimiterSnapshot()
+	snap := github.DefaultLimiter().Snapshot()
 	if snap.MaxConcurrent != 2 {
-		t.Fatalf("DefaultLimiterSnapshot.MaxConcurrent = %d, want 2 (config not wired)", snap.MaxConcurrent)
+		t.Fatalf("DefaultLimiter().Snapshot().MaxConcurrent = %d, want 2 (config not wired)", snap.MaxConcurrent)
 	}
 	if !snap.BackoffEnabled {
-		t.Fatalf("DefaultLimiterSnapshot.BackoffEnabled = false, want true (config not wired)")
+		t.Fatalf("DefaultLimiter().Snapshot().BackoffEnabled = false, want true (config not wired)")
 	}
 
 	// --- concurrency cap bounds in-flight calls through the NewClient seam ----
@@ -528,7 +528,7 @@ func TestGitHubLimiterDaemonWiringFullChainE2E(t *testing.T) {
 	if err := secClient.Ping(context.Background()); err == nil {
 		t.Fatal("Ping through a persistent secondary limit returned nil error, want failure")
 	}
-	backoff := github.DefaultLimiterSnapshot()
+	backoff := github.DefaultLimiter().Snapshot()
 	if !backoff.InBackoff {
 		t.Fatalf("limiter not in backoff after a final secondary failure: %+v", backoff)
 	}

@@ -6,10 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/github"
-	"github.com/gitmoot/gitmoot/internal/runtime"
-	"github.com/gitmoot/gitmoot/internal/workflow"
 	"io"
 	"path/filepath"
 	"sort"
@@ -17,6 +13,11 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // The #681 pipeline RUN engine: create a run, enqueue ready stages, and advance it
@@ -1982,11 +1983,6 @@ func prependPipelineSkippedSummary(summary string) string {
 		return pipelineSkippedSummaryMarker
 	}
 	return pipelineSkippedSummaryMarker + " " + summary
-}
-
-func pipelineSummaryIsSkipped(summary string) bool {
-	summary = strings.TrimSpace(summary)
-	return summary == pipelineSkippedSummaryMarker || strings.HasPrefix(summary, pipelineSkippedSummaryMarker+" ")
 }
 
 // pipelineStageDepsSucceeded reports whether every stage this one needs has

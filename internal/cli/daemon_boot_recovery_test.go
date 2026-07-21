@@ -91,8 +91,8 @@ func TestRecoverForeignBootRunnersProtectsSameBootJob(t *testing.T) {
 	}
 	// Also drive the coarse lease-gated recovery well past the staleness threshold:
 	// the unexpired lease must still protect the live same-boot job.
-	if err := recoverRunningJobsBefore(ctx, store, io.Discard, now.Add(time.Hour)); err != nil {
-		t.Fatalf("recoverRunningJobsBefore returned error: %v", err)
+	if err := recoverRunningJobsBeforeForRepo(ctx, store, io.Discard, now, now.Add(time.Hour), "", ""); err != nil {
+		t.Fatalf("recoverRunningJobsBeforeForRepo returned error: %v", err)
 	}
 
 	job, err := store.GetJob(ctx, "job-live")

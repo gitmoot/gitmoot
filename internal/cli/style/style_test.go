@@ -3,7 +3,6 @@ package style
 import (
 	"bytes"
 	"os"
-	"strings"
 	"testing"
 	"time"
 )
@@ -52,26 +51,25 @@ func TestEnabledForPrecedence(t *testing.T) {
 	}
 }
 
-func TestStyleWrapsOnlyWhenEnabled(t *testing.T) {
-	on := Enabled()
-	if got := on.Bold("hi"); got != "\x1b[1mhi\x1b[0m" {
-		t.Fatalf("enabled Bold = %q", got)
-	}
-	if got := on.Bold(""); got != "" {
-		t.Fatalf("empty string should not be wrapped, got %q", got)
-	}
-	off := Disabled()
-	for _, got := range []string{off.Bold("hi"), off.Dim("hi"), off.Red("hi"), off.Green("hi"), off.Yellow("hi"), off.Cyan("hi")} {
-		if got != "hi" {
-			t.Fatalf("disabled style should be identity, got %q", got)
-		}
-	}
-}
-
 func TestForBufferIsPlain(t *testing.T) {
 	var buf bytes.Buffer
 	if For(&buf).Enabled() {
 		t.Fatalf("a bytes.Buffer must never be styled")
+	}
+}
+
+func TestStyleWrapsOnlyWhenEnabled(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("CLICOLOR_FORCE", "1")
+	on := For(&bytes.Buffer{})
+	if got := on.Bold("hi"); got != "\x1b[1mhi\x1b[0m" {
+		t.Fatalf("enabled Bold = %q", got)
+	}
+	if got := on.Red("hi"); got != "\x1b[31mhi\x1b[0m" {
+		t.Fatalf("enabled Red = %q", got)
+	}
+	if got := on.Bold(""); got != "" {
+		t.Fatalf("empty string should not be wrapped, got %q", got)
 	}
 }
 
@@ -131,19 +129,6 @@ func TestGroupSuffix(t *testing.T) {
 	prefix, ok = GroupSuffix("a-bg-1-bg-2")
 	if !ok || prefix != "a-bg-1" {
 		t.Fatalf("GroupSuffix last marker = %q, %v", prefix, ok)
-	}
-}
-
-func TestMiddleTruncate(t *testing.T) {
-	if got := MiddleTruncate("short", 10); got != "short" {
-		t.Fatalf("no truncation expected, got %q", got)
-	}
-	got := MiddleTruncate("abcdefghijklmnop", 9)
-	if len([]rune(got)) != 9 || !strings.Contains(got, "…") {
-		t.Fatalf("MiddleTruncate = %q (len %d)", got, len([]rune(got)))
-	}
-	if got := MiddleTruncate("abcdef", 3); got != "abc" {
-		t.Fatalf("small max fallback = %q", got)
 	}
 }
 

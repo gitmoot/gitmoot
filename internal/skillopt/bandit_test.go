@@ -6,23 +6,6 @@ import (
 	"testing"
 )
 
-// TestNewArmAndUpdate proves the prior and the win/loss accounting: Beta(1,1)
-// with zero pulls, a win bumps Alpha and pulls, a loss bumps Beta and pulls.
-func TestNewArmAndUpdate(t *testing.T) {
-	arm := NewArm()
-	if arm.Alpha != 1 || arm.Beta != 1 || arm.Pulls != 0 {
-		t.Fatalf("NewArm = Beta(%.0f,%.0f) pulls=%d, want Beta(1,1) pulls=0", arm.Alpha, arm.Beta, arm.Pulls)
-	}
-	won := arm.Update(true)
-	if won.Alpha != 2 || won.Beta != 1 || won.Pulls != 1 {
-		t.Fatalf("after win = Beta(%.0f,%.0f) pulls=%d, want Beta(2,1) pulls=1", won.Alpha, won.Beta, won.Pulls)
-	}
-	lost := won.Update(false)
-	if lost.Alpha != 2 || lost.Beta != 2 || lost.Pulls != 2 {
-		t.Fatalf("after loss = Beta(%.0f,%.0f) pulls=%d, want Beta(2,2) pulls=2", lost.Alpha, lost.Beta, lost.Pulls)
-	}
-}
-
 // TestProbChallengerBeatsPriorIsHalf proves two identical Beta(1,1) posteriors
 // give P(challenger>champion) ~ 0.5 (the uniform prior is symmetric), and that
 // it is exactly reproducible for a fixed seed.
@@ -76,11 +59,9 @@ func TestProbChallengerBeatsMonotone(t *testing.T) {
 	}
 }
 
-// TestProbChallengerBeatsClosedFormCrossCheck is the MANDATORY sampler-validation
+// TestProbChallengerBeatsClosedFormCrossCheck is the mandatory sampler-validation
 // test: for several small integer alpha/beta pairs the Monte Carlo estimate must
-// match the exact closed-form Beta-exceedance value within tolerance. This proves
-// the Gamma/Beta sampler is unbiased — without it a confidently-wrong confidence
-// could ship.
+// match the exact closed-form Beta-exceedance value within tolerance.
 func TestProbChallengerBeatsClosedFormCrossCheck(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -108,14 +89,11 @@ func TestProbChallengerBeatsClosedFormCrossCheck(t *testing.T) {
 	}
 }
 
-// TestClosedFormSanity checks the closed-form oracle itself against hand values:
-// symmetric priors give exactly 0.5, and a strict win ordering is > 0.5.
 func TestClosedFormSanity(t *testing.T) {
 	half, ok := probChallengerBeatsClosedForm(BetaParams{1, 1}, BetaParams{1, 1})
 	if !ok || math.Abs(half-0.5) > 1e-9 {
 		t.Fatalf("closed form P(Beta(1,1)>Beta(1,1)) = %.6f, want 0.5", half)
 	}
-	// P(Beta(2,1) > Beta(1,1)): challenger has one win. Exact value is 2/3.
 	ahead, ok := probChallengerBeatsClosedForm(BetaParams{1, 1}, BetaParams{2, 1})
 	if !ok || math.Abs(ahead-2.0/3.0) > 1e-9 {
 		t.Fatalf("closed form P(Beta(2,1)>Beta(1,1)) = %.6f, want 0.6667", ahead)
@@ -131,4 +109,47 @@ func TestConfidenceSummary(t *testing.T) {
 	if got := ConfidenceSummary(0.962, 80); got != "96% likely better over 80 samples" {
 		t.Fatalf("ConfidenceSummary = %q", got)
 	}
+}
+
+func probChallengerBeatsClosedForm(champion, challenger BetaParams) (float64, bool) {
+	ax, axOK := positiveInteger(challenger.Alpha)
+	bx, bxOK := positiveInteger(challenger.Beta)
+	ay, ayOK := positiveInteger(champion.Alpha)
+	by, byOK := positiveInteger(champion.Beta)
+	if !axOK || !bxOK || !ayOK || !byOK {
+		return 0, false
+	}
+	total := 0.0
+	for i := 0; i < ax; i++ {
+		logTerm := logBeta(float64(ay+i), float64(by+bx)) -
+			math.Log(float64(bx+i)) -
+			logBeta(float64(1+i), float64(bx)) -
+			logBeta(float64(ay), float64(by))
+		total += math.Exp(logTerm)
+	}
+	if total < 0 {
+		total = 0
+	}
+	if total > 1 {
+		total = 1
+	}
+	return total, true
+}
+
+func logBeta(a, b float64) float64 {
+	la, _ := math.Lgamma(a)
+	lb, _ := math.Lgamma(b)
+	lab, _ := math.Lgamma(a + b)
+	return la + lb - lab
+}
+
+func positiveInteger(v float64) (int, bool) {
+	if v < 1 {
+		return 0, false
+	}
+	rounded := math.Round(v)
+	if math.Abs(v-rounded) > 1e-9 {
+		return 0, false
+	}
+	return int(rounded), true
 }

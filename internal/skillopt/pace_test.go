@@ -38,11 +38,11 @@ func TestPaceCommitsOnConsecutiveWins(t *testing.T) {
 	if v := acc.Observe(PaceWin); v != PaceCommit {
 		t.Fatalf("after 8 wins verdict = %v, want commit", v)
 	}
-	if !acc.Committed() {
+	if !acc.committed {
 		t.Fatal("accumulator should have latched committed after 8 wins")
 	}
 	// Threshold crossed exactly at 8: wealth = 1.5^8.
-	if got, want := acc.Wealth(), math.Pow(1.5, 8); math.Abs(got-want) > 1e-9 {
+	if got, want := acc.wealth, math.Pow(1.5, 8); math.Abs(got-want) > 1e-9 {
 		t.Fatalf("wealth = %v, want %v", got, want)
 	}
 }
@@ -56,7 +56,7 @@ func TestPaceCommitLatches(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		acc.Observe(PaceWin)
 	}
-	if !acc.Committed() {
+	if !acc.committed {
 		t.Fatal("precondition: expected commit after 8 wins")
 	}
 	for i := 0; i < 100; i++ {
@@ -65,7 +65,7 @@ func TestPaceCommitLatches(t *testing.T) {
 		}
 	}
 	// The wealth is frozen once latched: losses after commit do not move it.
-	if got, want := acc.Wealth(), math.Pow(1.5, 8); math.Abs(got-want) > 1e-9 {
+	if got, want := acc.wealth, math.Pow(1.5, 8); math.Abs(got-want) > 1e-9 {
 		t.Fatalf("wealth moved after commit: got %v, want frozen %v", got, want)
 	}
 }
@@ -81,18 +81,18 @@ func TestPaceTiesDiscarded(t *testing.T) {
 			t.Fatalf("tie %d produced verdict %v, want continue", i, v)
 		}
 	}
-	if acc.Pairs() != 0 {
-		t.Fatalf("discordant pairs = %d after 1000 ties, want 0", acc.Pairs())
+	if acc.pairs != 0 {
+		t.Fatalf("discordant pairs = %d after 1000 ties, want 0", acc.pairs)
 	}
-	if acc.Wealth() != 1.0 {
-		t.Fatalf("wealth = %v after 1000 ties, want 1 (unchanged)", acc.Wealth())
+	if acc.wealth != 1.0 {
+		t.Fatalf("wealth = %v after 1000 ties, want 1 (unchanged)", acc.wealth)
 	}
 	// Ties interleaved with a real pair must not consume budget: only the win counts.
 	if v := acc.Observe(PaceWin); v != PaceContinue {
 		t.Fatalf("verdict after 1 win = %v, want continue", v)
 	}
-	if acc.Pairs() != 1 {
-		t.Fatalf("discordant pairs = %d, want 1 (ties excluded)", acc.Pairs())
+	if acc.pairs != 1 {
+		t.Fatalf("discordant pairs = %d, want 1 (ties excluded)", acc.pairs)
 	}
 }
 
@@ -106,8 +106,8 @@ func TestPaceLambdaZeroIsNoOp(t *testing.T) {
 		if v := acc.Observe(PaceWin); v != PaceContinue {
 			t.Fatalf("lambda=0 win %d verdict = %v, want continue", i, v)
 		}
-		if acc.Wealth() != 1.0 {
-			t.Fatalf("lambda=0 wealth = %v, want 1 (no-op)", acc.Wealth())
+		if acc.wealth != 1.0 {
+			t.Fatalf("lambda=0 wealth = %v, want 1 (no-op)", acc.wealth)
 		}
 	}
 	// 10th discordant pair exhausts the budget without ever crossing -> reject.
@@ -152,31 +152,12 @@ func TestPaceDeterministicSequenceOrderIndependentTerminal(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		lossFirst.Observe(PaceWin)
 	}
-	if math.Abs(winsFirst.Wealth()-lossFirst.Wealth()) > 1e-9 {
-		t.Fatalf("terminal wealth differs by order: wins-first %v vs loss-first %v", winsFirst.Wealth(), lossFirst.Wealth())
+	if math.Abs(winsFirst.wealth-lossFirst.wealth) > 1e-9 {
+		t.Fatalf("terminal wealth differs by order: wins-first %v vs loss-first %v", winsFirst.wealth, lossFirst.wealth)
 	}
 	// 3 wins (x1.5) and 3 losses (x0.5): 1.5^3 * 0.5^3 = 3.375 * 0.125 = 0.421875.
-	if got := lossFirst.Wealth(); math.Abs(got-0.421875) > 1e-9 {
+	if got := lossFirst.wealth; math.Abs(got-0.421875) > 1e-9 {
 		t.Fatalf("terminal wealth = %v, want 0.421875", got)
-	}
-}
-
-// TestEvaluatePaceCountsConservativeVsStream proves EvaluatePaceCounts (losses-first,
-// the count-summary reading) never commits when the terminal wealth is below the
-// threshold, even for a count where a WIN-first ordered stream WOULD have committed
-// early and then fallen back. This is the false-early-commit protection.
-func TestEvaluatePaceCountsConservativeVsStream(t *testing.T) {
-	cfg := PaceConfig{Alpha: DefaultPaceAlpha, Lambda: DefaultPaceLambda, MaxPairs: DefaultPaceMaxPairs}
-	// 8 wins then enough losses to drop terminal wealth below 20: 1.5^8 = 25.63,
-	// times 0.5^2 = 0.25 -> 6.4 < 20. Terminal does NOT cross.
-	wins, losses := 8, 2
-	// A win-first ordered stream commits (crosses at the 8th win) then latches.
-	if v := EvaluatePaceStream(cfg, buildStream(wins, losses, true)); v != PaceCommit {
-		t.Fatalf("win-first ordered stream verdict = %v, want commit (early crossing)", v)
-	}
-	// The count summary (losses-first / terminal) must NOT commit: terminal 6.4 < 20.
-	if v := EvaluatePaceCounts(cfg, wins, losses); v == PaceCommit {
-		t.Fatalf("EvaluatePaceCounts committed on terminal wealth below threshold (wins=%d losses=%d)", wins, losses)
 	}
 }
 
@@ -187,6 +168,16 @@ func TestEvaluatePaceCountsCommitsOnDominantCandidate(t *testing.T) {
 	// 10 wins, 1 loss: 1.5^10 * 0.5 = 57.67 * 0.5 = 28.8 >= 20 -> commit.
 	if v := EvaluatePaceCounts(cfg, 10, 1); v != PaceCommit {
 		t.Fatalf("dominant candidate verdict = %v, want commit", v)
+	}
+}
+
+// TestEvaluatePaceCountsConservativeVsStream guards the count-summary reading:
+// terminal wealth below the threshold must not commit even if wins-first order
+// would have crossed it transiently.
+func TestEvaluatePaceCountsConservativeVsStream(t *testing.T) {
+	cfg := PaceConfig{Alpha: DefaultPaceAlpha, Lambda: DefaultPaceLambda, MaxPairs: DefaultPaceMaxPairs}
+	if v := EvaluatePaceCounts(cfg, 8, 2); v == PaceCommit {
+		t.Fatalf("EvaluatePaceCounts committed on terminal wealth below threshold (wins=8 losses=2)")
 	}
 }
 
@@ -209,9 +200,6 @@ func TestPaceConfigDefaults(t *testing.T) {
 	kept := PaceConfig{Alpha: 0.1, Lambda: 0, MaxPairs: 12}.withDefaults()
 	if kept.Alpha != 0.1 || kept.Lambda != 0 || kept.MaxPairs != 12 {
 		t.Fatalf("legal config was altered: %+v (lambda=0 must be preserved)", kept)
-	}
-	if got, want := (PaceConfig{Alpha: 0.05}).CommitThreshold(), 20.0; math.Abs(got-want) > 1e-9 {
-		t.Fatalf("CommitThreshold = %v, want %v", got, want)
 	}
 }
 
@@ -241,10 +229,10 @@ func TestPaceMartingaleFalseCommitRateBounded(t *testing.T) {
 				break
 			}
 		}
-		if acc.Committed() {
+		if acc.committed {
 			commits++
 		}
-		sumWealth += acc.Wealth()
+		sumWealth += acc.wealth
 	}
 	falseRate := float64(commits) / float64(runs)
 	// Ville: P(ever commit) <= alpha. Allow a small Monte-Carlo margin.
@@ -258,23 +246,4 @@ func TestPaceMartingaleFalseCommitRateBounded(t *testing.T) {
 	if meanWealth > 1.5 {
 		t.Fatalf("mean terminal wealth %.4f is implausibly high for a fair martingale", meanWealth)
 	}
-}
-
-// buildStream materializes a win/loss stream in a fixed order for the ordered-stream
-// tests: winsFirst true => all wins then all losses; false => losses then wins.
-func buildStream(wins, losses int, winsFirst bool) []PaceOutcome {
-	out := make([]PaceOutcome, 0, wins+losses)
-	add := func(o PaceOutcome, n int) {
-		for i := 0; i < n; i++ {
-			out = append(out, o)
-		}
-	}
-	if winsFirst {
-		add(PaceWin, wins)
-		add(PaceLoss, losses)
-	} else {
-		add(PaceLoss, losses)
-		add(PaceWin, wins)
-	}
-	return out
 }

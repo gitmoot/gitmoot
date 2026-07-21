@@ -261,28 +261,6 @@ func TestSkillOptJudgePromoteApplyRoundTrip(t *testing.T) {
 		t.Fatalf("judge_prompt_version = %q, want v0+judge2", got)
 	}
 
-	// Round-trip through the production reader: the persisted flat Evaluation map
-	// expands into the nested config judgePromptConfigFromConfig consumes.
-	config := skillopt.EvaluationConfigForReader(metadata.Evaluation)
-	profile := skillopt.EvaluatorProfileFromConfig(config)
-	if profile == nil || profile.Judge == nil {
-		t.Fatalf("EvaluatorProfileFromConfig returned nil judge: %+v", profile)
-	}
-	payload := profile.Judge.JudgePromptConfig()
-	if payload == nil {
-		t.Fatal("JudgePromptConfig is nil; promoted prompt did not round-trip")
-	}
-	if got := payload.JudgePromptTemplates["vue_landing_page"]; got != "Judge the landing page strictly." {
-		t.Fatalf("round-trip judge_prompt_templates[vue_landing_page] = %q", got)
-	}
-	// Sibling task kind preserved.
-	if got := payload.JudgePromptTemplates["generic"]; got != "Existing generic prompt." {
-		t.Fatalf("sibling task kind not preserved: generic = %q", got)
-	}
-	if payload.JudgePromptVersion != "v0+judge2" {
-		t.Fatalf("round-trip judge_prompt_version = %q", payload.JudgePromptVersion)
-	}
-
 	// Audit row written.
 	outcomes, err := store.ListSkillOptJudgeOutcomes(context.Background(), "planner")
 	if err != nil {

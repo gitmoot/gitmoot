@@ -817,10 +817,6 @@ func writeOptionReferenceTable(builder *strings.Builder, options []blindOptionAs
 	writeOptionReferenceTableWithLocalPaths(builder, options, true)
 }
 
-func writeGitHubOptionReferenceTable(builder *strings.Builder, options []blindOptionAssignment) {
-	writeOptionReferenceTableWithLocalPaths(builder, options, false)
-}
-
 func writeOptionReferenceTableWithLocalPaths(builder *strings.Builder, options []blindOptionAssignment, includeLocalPaths bool) {
 	builder.WriteString("| Option | Artifact | Reference |\n")
 	builder.WriteString("| --- | --- | --- |\n")

@@ -203,9 +203,3 @@ func TestPipelinePublishWithoutRemoteNamesSetupCommand(t *testing.T) {
 		t.Fatalf("exit=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
 }
-
-func TestConfiguredPipelineRemoteFreshHomeIsOff(t *testing.T) {
-	if remote, ok := configuredPipelineRemote(t.TempDir()); ok || remote.Configured() {
-		t.Fatalf("fresh home remote = %+v configured=%v", remote, ok)
-	}
-}

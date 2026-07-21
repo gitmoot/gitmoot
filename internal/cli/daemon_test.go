@@ -29,6 +29,12 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
+func resetPreflightWarnState() {
+	preflightWarnMu.Lock()
+	preflightWarnByRepo = map[string]preflightWarnState{}
+	preflightWarnMu.Unlock()
+}
+
 func TestRunDaemonUsageAndValidation(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{"daemon", "--help"}, &stdout, &stderr)
@@ -441,9 +447,11 @@ func TestPollRegisteredReposHonorsPerRepoIntervals(t *testing.T) {
 
 	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
 	nextPoll := map[string]time.Time{}
+	schedule := registeredRepoSchedule{NextPoll: nextPoll}
 	var stdout bytes.Buffer
-	if _, err := pollRegisteredRepos(ctx, store, 1, true, &stdout, nextPoll, now, 30*time.Second); err != nil {
-		t.Fatalf("first pollRegisteredRepos returned error: %v", err)
+	poller := defaultRegisteredRepoPoller(store, 1, true, &stdout, "", "")
+	if _, err := pollRegisteredReposWithPoller(ctx, poller, schedule, now, 30*time.Second); err != nil {
+		t.Fatalf("first pollRegisteredReposWithPoller returned error: %v", err)
 	}
 	firstSlow, err := store.GetRepo(ctx, "owner/slow")
 	if err != nil {
@@ -454,8 +462,8 @@ func TestPollRegisteredReposHonorsPerRepoIntervals(t *testing.T) {
 		t.Fatalf("GetRepo fast: %v", err)
 	}
 
-	if _, err := pollRegisteredRepos(ctx, store, 1, true, &stdout, nextPoll, now.Add(31*time.Second), 30*time.Second); err != nil {
-		t.Fatalf("second pollRegisteredRepos returned error: %v", err)
+	if _, err := pollRegisteredReposWithPoller(ctx, poller, schedule, now.Add(31*time.Second), 30*time.Second); err != nil {
+		t.Fatalf("second pollRegisteredReposWithPoller returned error: %v", err)
 	}
 	secondSlow, err := store.GetRepo(ctx, "owner/slow")
 	if err != nil {
@@ -941,7 +949,7 @@ func TestRunQueuedJobsExecutesShellAdapterSuccess(t *testing.T) {
 		return checkout, nil
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -966,7 +974,7 @@ func TestRunQueuedJobsMarksShellAdapterFailure(t *testing.T) {
 		return checkout, nil
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -1004,7 +1012,7 @@ func TestRunQueuedJobsBlocksReadOnlyImplementBeforeRuntime(t *testing.T) {
 		return comments
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -1117,7 +1125,7 @@ func TestRunQueuedJobsAllowsReadOnlyAsk(t *testing.T) {
 		return adapter, nil
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -1156,7 +1164,7 @@ func TestRunQueuedJobsNormalizesRuntimePermissionFailure(t *testing.T) {
 		return comments
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -1209,7 +1217,7 @@ func TestRunQueuedJobsPreservesGenericRuntimePermissionFailure(t *testing.T) {
 		return comments
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -1263,7 +1271,7 @@ func TestRunQueuedJobsPreservesAdvanceRetryForPostDeliveryPermissionError(t *tes
 		}
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -1298,7 +1306,7 @@ func TestRunQueuedJobsUsesMailboxRepairForMalformedOutput(t *testing.T) {
 		return checkout, nil
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -1339,7 +1347,7 @@ func TestRunQueuedJobsPostsAttributedResultComment(t *testing.T) {
 		return comments
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -1395,7 +1403,7 @@ func TestRunQueuedJobsPostsMalformedOutputDiagnosticComment(t *testing.T) {
 		return comments
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -1431,7 +1439,7 @@ func TestRunQueuedJobsPostsCheckoutDiagnosticWithoutCheckoutCwd(t *testing.T) {
 		return comments
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -1468,7 +1476,7 @@ func TestDaemonWorkerTickRetriesFailedResultCommentPost(t *testing.T) {
 		return comments
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 	if len(comments.posted) != 0 {
@@ -1576,7 +1584,7 @@ func TestRunQueuedJobsPostsCommentAfterRetryDespitePriorComment(t *testing.T) {
 		return comments
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -1607,7 +1615,7 @@ func TestRunQueuedJobsDrainsBeyondWorkerLimit(t *testing.T) {
 		return adapter, nil
 	}
 
-	if err := runQueuedJobs(ctx, worker, 2); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 2, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -1660,7 +1668,7 @@ func TestRunQueuedJobsDefersJobsEnqueuedByCurrentSnapshot(t *testing.T) {
 		return workflow.Engine{Store: store, RequiredReviewers: []string{"reviewer"}}
 	}
 
-	if err := runQueuedJobs(ctx, worker, 2); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 2, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -1730,7 +1738,7 @@ func TestRunQueuedJobsRefreshesImplementedHeadBeforeReviewDispatch(t *testing.T)
 		return daemonWorkflowEngine(store, github.NoopClient{}, checkout, "")
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -1791,7 +1799,7 @@ func TestRunQueuedJobsSerializesSameRepoCheckout(t *testing.T) {
 		return adapter, nil
 	}
 
-	if err := runQueuedJobs(ctx, worker, 2); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 2, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -1849,7 +1857,7 @@ func TestRunQueuedJobsSerializesSameRuntimeSessionAcrossRepos(t *testing.T) {
 		return adapter, nil
 	}
 
-	if err := runQueuedJobs(ctx, worker, 2); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 2, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -1896,7 +1904,7 @@ func TestRunQueuedJobsAllowsDifferentRuntimeSessionsAcrossRepos(t *testing.T) {
 		return adapter, nil
 	}
 
-	if err := runQueuedJobs(ctx, worker, 2); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 2, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -1943,7 +1951,7 @@ func TestRunQueuedJobsLeavesBusyRuntimeSessionQueued(t *testing.T) {
 		return adapter, nil
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -2028,7 +2036,7 @@ func TestRunQueuedJobsDelegatesBusyRuntimeToTempWorker(t *testing.T) {
 		return workflow.Engine{Store: store}
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -2112,7 +2120,7 @@ func TestRunQueuedJobsDelegatesBusyRuntimeToTempWorker(t *testing.T) {
 	if mergePayload.OriginalAgent != "audit" || mergePayload.DelegatedAgent != job.Agent || mergePayload.DelegationReason != "temp_worker_merge_back" {
 		t.Fatalf("merge-back delegation payload = %+v, completed job agent=%s", mergePayload, job.Agent)
 	}
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs merge-back returned error: %v", err)
 	}
 	mergeBack, err = store.GetJob(ctx, "job-a-merge-back")
@@ -2230,7 +2238,7 @@ func TestRunQueuedJobsResumesDelegatedTempWorkerAfterRestart(t *testing.T) {
 		return workflow.Engine{Store: store}
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -2281,7 +2289,7 @@ func TestRunQueuedJobsReturnsTempWorkerIdleAfterDeliveryError(t *testing.T) {
 		return workflow.Engine{Store: store}
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -2338,7 +2346,7 @@ func TestRunQueuedJobsCleansTempWorkerWhenDelegationRaceLoses(t *testing.T) {
 		return deliveryAdapter, nil
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -2400,7 +2408,7 @@ func TestRunQueuedJobsMaterializesAndDisposesEphemeralWorker(t *testing.T) {
 		return workflow.Engine{Store: store}
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -2469,7 +2477,7 @@ func TestRunQueuedJobsDisposesEphemeralWorkerOnFailure(t *testing.T) {
 		return workflow.Engine{Store: store}
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -2520,7 +2528,7 @@ func TestRunQueuedJobsPreservesCreationOrderForSameRepo(t *testing.T) {
 		return adapter, nil
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -2556,7 +2564,7 @@ func TestRunQueuedJobsPreservesCancellationRace(t *testing.T) {
 		return comments
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -2601,7 +2609,7 @@ func TestRunQueuedJobsCancelsActiveDeliveryContext(t *testing.T) {
 		return adapter, nil
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -2646,7 +2654,7 @@ func TestRunQueuedJobsReleasesRuntimeSessionLockAfterCancellation(t *testing.T) 
 		return adapter, nil
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -2687,7 +2695,7 @@ func TestRunQueuedJobsUsesConfiguredMergeGate(t *testing.T) {
 		return workflow.Engine{Store: store, MergeGate: gate}
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -2721,7 +2729,7 @@ func TestRunQueuedJobsFailsImplementWithoutBranchLockBeforeDelivery(t *testing.T
 		return adapter, nil
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -2776,7 +2784,7 @@ func TestRunQueuedJobsUsesTaskWorktreeForImplement(t *testing.T) {
 		}
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -2847,7 +2855,7 @@ func TestRunQueuedJobsResumesSelfDirtyTaskWorktree(t *testing.T) {
 		return workflow.Engine{Store: store}
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -3166,7 +3174,7 @@ func TestRunQueuedJobsResumesDelegatedImplementWithOriginalBranchLock(t *testing
 		}
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -3213,7 +3221,7 @@ func TestRunQueuedJobsUsesTaskWorktreeForReview(t *testing.T) {
 		return workflow.Engine{Store: store}
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -3767,7 +3775,7 @@ func TestRunQueuedJobsKeepsReviewOnRegisteredCheckoutWithoutTaskWorktree(t *test
 		return workflow.Engine{Store: store}
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -3857,7 +3865,7 @@ func TestSelectRunnableQueuedJobsAllowsSeparateTaskWorktrees(t *testing.T) {
 		t.Fatalf("ListQueuedJobs returned error: %v", err)
 	}
 
-	selected, remaining := selectRunnableQueuedJobs(ctx, store, jobs, 2)
+	selected, remaining := selectRunnableQueuedJobsWithPolicy(ctx, store, jobs, 2, config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue})
 
 	if len(selected) != 2 || len(remaining) != 0 {
 		t.Fatalf("selected=%d remaining=%d, want two selected separate worktrees", len(selected), len(remaining))
@@ -3882,7 +3890,7 @@ func TestSelectRunnableQueuedJobsKeepsSameRuntimeSerializedAcrossWorktrees(t *te
 		t.Fatalf("ListQueuedJobs returned error: %v", err)
 	}
 
-	selected, remaining := selectRunnableQueuedJobs(ctx, store, jobs, 2)
+	selected, remaining := selectRunnableQueuedJobsWithPolicy(ctx, store, jobs, 2, config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue})
 
 	if len(selected) != 1 || len(remaining) != 1 {
 		t.Fatalf("selected=%d remaining=%d, want same runtime session serialized", len(selected), len(remaining))
@@ -4140,7 +4148,7 @@ func TestRunQueuedJobsFailsReviewOnWrongCheckoutBranchBeforeDelivery(t *testing.
 		return adapter, nil
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -4184,7 +4192,7 @@ func TestRunQueuedJobsDefersReviewOnWrongCheckoutHeadBeforeDelivery(t *testing.T
 		return adapter, nil
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -4234,7 +4242,7 @@ func TestRunQueuedJobsDefersPRScopedAskOnWrongCheckoutHeadBeforeDelivery(t *test
 		return adapter, nil
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
@@ -4988,7 +4996,7 @@ func TestRunEnabledRepoWorkerTicksSkipsDisabledRepos(t *testing.T) {
 		return adapter, nil
 	}
 
-	if err := runEnabledRepoWorkerTicks(ctx, store, worker, 2, io.Discard, time.Now().UTC()); err != nil {
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 2, "", io.Discard, time.Now().UTC(), nil, nil); err != nil {
 		t.Fatalf("runEnabledRepoWorkerTicks returned error: %v", err)
 	}
 
@@ -5041,7 +5049,7 @@ func TestRunQueuedJobsRecordsPostDeliveryWorkflowErrorForRetry(t *testing.T) {
 		return workflow.Engine{Store: store, MergeGate: gate}
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 	job, getErr := store.GetJob(ctx, "job-review")
@@ -5116,7 +5124,7 @@ func TestRetryPendingJobAdvancementsDoesNotAccumulateAdvanceRetry(t *testing.T) 
 	worker.WorkflowFactory = func(string) workflow.Engine {
 		return workflow.Engine{Store: store, MergeGate: gate}
 	}
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 	// The gate stays broken: every retry pass fails advancement again.
@@ -5406,7 +5414,7 @@ func TestRunQueuedJobsSwallowsPostDeliveryBlockedWorkflow(t *testing.T) {
 		return workflow.Engine{Store: store, MergeGate: gate}
 	}
 
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 	job, err := store.GetJob(ctx, "job-review")
@@ -5433,8 +5441,9 @@ func TestRecoverRunningJobsRequeuesStaleRunningJobs(t *testing.T) {
 		t.Fatalf("UpdateJobState returned error: %v", err)
 	}
 
-	if err := recoverRunningJobsBefore(ctx, store, io.Discard, time.Now().UTC().Add(time.Second)); err != nil {
-		t.Fatalf("recoverRunningJobsBefore returned error: %v", err)
+	now := time.Now().UTC()
+	if err := recoverRunningJobsBeforeForRepo(ctx, store, io.Discard, now, now.Add(time.Second), "", ""); err != nil {
+		t.Fatalf("recoverRunningJobsBeforeForRepo returned error: %v", err)
 	}
 
 	job, err := store.GetJob(ctx, "job-running")
@@ -5461,8 +5470,9 @@ func TestRecoverRunningJobsKeepsRecentRunningJobsOnStartup(t *testing.T) {
 		t.Fatalf("UpdateJobState returned error: %v", err)
 	}
 
-	if err := recoverRunningJobs(ctx, store, io.Discard); err != nil {
-		t.Fatalf("recoverRunningJobs returned error: %v", err)
+	now := time.Now().UTC()
+	if err := recoverRunningJobsBeforeForRepo(ctx, store, io.Discard, now, now.Add(-configuredDaemonRunningJobStaleAfter(io.Discard)), "", ""); err != nil {
+		t.Fatalf("recoverRunningJobsBeforeForRepo returned error: %v", err)
 	}
 
 	job, err := store.GetJob(ctx, "job-running")
@@ -5484,8 +5494,8 @@ func TestRecoverRunningJobsUsesConfiguredStaleWindow(t *testing.T) {
 	}
 	worker := defaultJobWorker(store, io.Discard)
 
-	if err := runDaemonWorkerTick(ctx, store, worker, 0, false, "owner/repo", "", io.Discard, time.Now().UTC().Add(3*time.Minute)); err != nil {
-		t.Fatalf("runDaemonWorkerTick returned error: %v", err)
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, 0, false, "owner/repo", "", io.Discard, time.Now().UTC().Add(3*time.Minute), nil, nil); err != nil {
+		t.Fatalf("runDaemonWorkerTickTracked returned error: %v", err)
 	}
 
 	job, err := store.GetJob(ctx, "job-running")
@@ -5518,8 +5528,8 @@ func TestRecoverExpiredRuntimeSessionLocksRequeuesOwnerBeforeGlobalStaleWindow(t
 	}
 	worker := defaultJobWorker(store, io.Discard)
 
-	if err := runDaemonWorkerTick(ctx, store, worker, 0, false, "owner/repo", "", io.Discard, now.Add(3*time.Minute)); err != nil {
-		t.Fatalf("runDaemonWorkerTick before timeout returned error: %v", err)
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, 0, false, "owner/repo", "", io.Discard, now.Add(3*time.Minute), nil, nil); err != nil {
+		t.Fatalf("runDaemonWorkerTickTracked before timeout returned error: %v", err)
 	}
 	job, err := store.GetJob(ctx, "job-running")
 	if err != nil {
@@ -5529,8 +5539,8 @@ func TestRecoverExpiredRuntimeSessionLocksRequeuesOwnerBeforeGlobalStaleWindow(t
 		t.Fatalf("job state after short wait = %q, want running", job.State)
 	}
 
-	if err := runDaemonWorkerTick(ctx, store, worker, 0, false, "owner/repo", "", io.Discard, now.Add(11*time.Minute)); err != nil {
-		t.Fatalf("runDaemonWorkerTick after timeout returned error: %v", err)
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, 0, false, "owner/repo", "", io.Discard, now.Add(11*time.Minute), nil, nil); err != nil {
+		t.Fatalf("runDaemonWorkerTickTracked after timeout returned error: %v", err)
 	}
 	job, err = store.GetJob(ctx, "job-running")
 	if err != nil {
@@ -5703,8 +5713,8 @@ func TestRunDaemonWorkerTickBlockedTTLSweepsAgedBlockedJob(t *testing.T) {
 	backdateJobUpdatedAt(t, paths.Database, "job-blocked", now.Add(-2*time.Hour))
 
 	worker := defaultJobWorker(store, io.Discard, home)
-	if err := runDaemonWorkerTick(ctx, store, worker, 0, false, "", "", io.Discard, now); err != nil {
-		t.Fatalf("runDaemonWorkerTick returned error: %v", err)
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, 0, false, "", "", io.Discard, now, nil, nil); err != nil {
+		t.Fatalf("runDaemonWorkerTickTracked returned error: %v", err)
 	}
 
 	job, err := store.GetJob(ctx, "job-blocked")
@@ -5779,8 +5789,8 @@ func TestRecoverRunningJobsHonorsLiveRuntimeLease(t *testing.T) {
 
 			// before = now+time so the running job (updated_at ~ now) is past the coarse
 			// staleness threshold; only the liveness gate may keep it running.
-			if err := recoverRunningJobsBefore(ctx, store, io.Discard, now.Add(time.Minute)); err != nil {
-				t.Fatalf("recoverRunningJobsBefore returned error: %v", err)
+			if err := recoverRunningJobsBeforeForRepo(ctx, store, io.Discard, now, now.Add(time.Minute), "", ""); err != nil {
+				t.Fatalf("recoverRunningJobsBeforeForRepo returned error: %v", err)
 			}
 
 			job, err := store.GetJob(ctx, "job-running")
@@ -5891,7 +5901,7 @@ func TestReclaimSkippedDelegationWorktrees(t *testing.T) {
 				t.Fatalf("reclaimSkippedDelegationWorktrees returned error: %v", err)
 			}
 
-			pending, err := worker.delegationWorktreeCleanupPending(ctx, jobID)
+			pending, err := delegationWorktreeCleanupPendingForTest(ctx, worker.Store, jobID)
 			if err != nil {
 				t.Fatalf("delegationWorktreeCleanupPending returned error: %v", err)
 			}
@@ -5992,13 +6002,26 @@ func TestReclaimSkippedDelegationWorktreesBoundedToMarkedJobs(t *testing.T) {
 	if len(manager.removed) != 1 || manager.removed[0] != wt {
 		t.Fatalf("only the marked pending worktree must be reclaimed: removed=%+v", manager.removed)
 	}
-	pending, err := worker.delegationWorktreeCleanupPending(ctx, pendingID)
+	pending, err := delegationWorktreeCleanupPendingForTest(ctx, worker.Store, pendingID)
 	if err != nil {
 		t.Fatalf("delegationWorktreeCleanupPending returned error: %v", err)
 	}
 	if pending {
 		t.Fatalf("cleanup pending must clear after reclaim")
 	}
+}
+
+func delegationWorktreeCleanupPendingForTest(ctx context.Context, store tickCandidateStore, jobID string) (bool, error) {
+	ids, err := store.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, id := range ids {
+		if id == jobID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func TestRecoverCancelledRunningJobsSettlesAbandonedCancellation(t *testing.T) {
@@ -6072,8 +6095,8 @@ func TestDaemonWorkerTickRechecksStaleRunningJobs(t *testing.T) {
 	worker := defaultJobWorker(store, io.Discard)
 	now := time.Now().UTC().Add(defaultDaemonRunningJobStaleAfter + time.Second)
 
-	if err := runDaemonWorkerTick(ctx, store, worker, 0, false, "", "", io.Discard, now); err != nil {
-		t.Fatalf("runDaemonWorkerTick returned error: %v", err)
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, 0, false, "", "", io.Discard, now, nil, nil); err != nil {
+		t.Fatalf("runDaemonWorkerTickTracked returned error: %v", err)
 	}
 
 	job, err := store.GetJob(ctx, "job-running")
@@ -6127,37 +6150,6 @@ func TestDaemonLogsEmptyWhenMissing(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "daemon log is empty") {
 		t.Fatalf("logs output = %q", stdout.String())
-	}
-}
-
-func TestResolveDaemonCheckoutRequiresMatchingOrigin(t *testing.T) {
-	runner := &daemonGitRunner{results: []subprocess.Result{
-		{Stdout: "/repo/gitmoot\n"},
-		{Stdout: "https://github.com/gitmoot/gitmoot.git\n"},
-	}}
-
-	root, err := resolveDaemonCheckout(context.Background(), github.Repository{Owner: "gitmoot", Name: "gitmoot"}, gitutil.Client{Runner: runner, Dir: "."})
-
-	if err != nil {
-		t.Fatalf("resolveDaemonCheckout returned error: %v", err)
-	}
-	if root != "/repo/gitmoot" {
-		t.Fatalf("root = %q, want /repo/gitmoot", root)
-	}
-	runner.wantArgs(t, 0, "git", "rev-parse", "--show-toplevel")
-	runner.wantArgs(t, 1, "git", "remote", "get-url", "origin")
-}
-
-func TestResolveDaemonCheckoutRejectsWrongOrigin(t *testing.T) {
-	runner := &daemonGitRunner{results: []subprocess.Result{
-		{Stdout: "/repo/other\n"},
-		{Stdout: "https://github.com/jerryfane/other.git\n"},
-	}}
-
-	_, err := resolveDaemonCheckout(context.Background(), github.Repository{Owner: "gitmoot", Name: "gitmoot"}, gitutil.Client{Runner: runner, Dir: "."})
-
-	if err == nil || !strings.Contains(err.Error(), "not gitmoot/gitmoot") {
-		t.Fatalf("error = %v, want wrong-origin error", err)
 	}
 }
 
@@ -6478,7 +6470,7 @@ func writeRepoConcurrencyConfigHome(t *testing.T, body string) string {
 }
 
 // runRepoConcurrencyTickPeak drives the REAL per-repo run path
-// (runDaemonWorkerTick -> resolveRepoScheduler -> runQueuedJobsForRepo) for one
+// (runDaemonWorkerTickTracked -> resolveRepoScheduler -> runQueuedJobsForRepo) for one
 // repo and returns the observed peak concurrent deliveries. It seeds `jobs`
 // parallelizable queued jobs (each with a DISTINCT worktree path, so their
 // checkout keys differ and nothing but the scheduler's concurrency limit can
@@ -6505,8 +6497,8 @@ func runRepoConcurrencyTickPeak(t *testing.T, configHome, repo string, jobs, glo
 	worker.ConfigHome = configHome
 	worker.ConfigHomeExplicit = true
 
-	if err := runDaemonWorkerTick(ctx, store, worker, globalWorkers, false, repo, "", io.Discard, time.Now().UTC()); err != nil {
-		t.Fatalf("runDaemonWorkerTick(%s): %v", repo, err)
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, globalWorkers, false, repo, "", io.Discard, time.Now().UTC(), nil, nil); err != nil {
+		t.Fatalf("runDaemonWorkerTickTracked(%s): %v", repo, err)
 	}
 	for _, id := range ids {
 		job, err := store.GetJob(ctx, id)
@@ -6715,27 +6707,6 @@ func TestEffectiveJobTimeout(t *testing.T) {
 	// With no managed config, a valid payload timeout still applies.
 	if got := effectiveJobTimeout(workflow.JobPayload{JobTimeout: "45s"}, managedJobRuntimeConfig{}); got != 45*time.Second {
 		t.Fatalf("effectiveJobTimeout(unmanaged, payload) = %v, want 45s", got)
-	}
-}
-
-func TestStartSupervisorWorkerLoopReportsErrorByDefault(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	errCh := startSupervisorWorkerLoop(ctx, time.Millisecond, func(time.Time) error {
-		return errors.New("boom")
-	})
-
-	select {
-	case err, ok := <-errCh:
-		if !ok {
-			t.Fatal("worker loop closed without reporting the run error")
-		}
-		if err == nil || err.Error() != "boom" {
-			t.Fatalf("worker loop error = %v, want boom", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("worker loop did not report the run error")
 	}
 }
 
@@ -7070,7 +7041,7 @@ func TestRunQueuedJobsFansOutDelegationsAndEnqueuesContinuation(t *testing.T) {
 
 	// Drain the DAG: coordinator -> two reviewer children -> continuation.
 	for range 5 {
-		if err := runQueuedJobs(ctx, worker, 2); err != nil {
+		if err := runQueuedJobsForRepo(ctx, worker, 2, "", ""); err != nil {
 			t.Fatalf("runQueuedJobs returned error: %v", err)
 		}
 	}
@@ -7467,7 +7438,7 @@ func TestWarnSerializedParallelJobsEmitsRelaunchCommand(t *testing.T) {
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-b", Agent: "b", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 2})
 	var out bytes.Buffer
 	worker := defaultJobWorker(store, &out)
-	resetPreflightWarnThrottle()
+	resetPreflightWarnState()
 	// Serializing config (single worker) with 2 parallelizable jobs warns.
 	warnSerializedParallelJobs(ctx, worker, 1, "owner/repo", "")
 	got := out.String()
@@ -7489,7 +7460,7 @@ func TestWarnSerializedParallelJobsRateLimitsUnchangedBacklog(t *testing.T) {
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-b", Agent: "b", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 2})
 	var out bytes.Buffer
 	worker := defaultJobWorker(store, &out)
-	resetPreflightWarnThrottle()
+	resetPreflightWarnState()
 	// First tick warns.
 	warnSerializedParallelJobs(ctx, worker, 1, "owner/repo", "")
 	if !strings.Contains(out.String(), "will run serially") {
@@ -7894,7 +7865,7 @@ func TestRuntimeLockWaitEventDedupedPerEpisode(t *testing.T) {
 
 	// Five dispatch attempts, all bounce busy → exactly ONE runtime_lock_wait row.
 	for i := 0; i < 5; i++ {
-		if err := runQueuedJobs(ctx, worker, 1); err != nil {
+		if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 			t.Fatalf("runQueuedJobs attempt %d returned error: %v", i, err)
 		}
 	}
@@ -7904,7 +7875,7 @@ func TestRuntimeLockWaitEventDedupedPerEpisode(t *testing.T) {
 
 	// A successful acquire closes the episode; the next busy wait is a fresh episode.
 	endRuntimeLockWaitEpisode("job-a")
-	if err := runQueuedJobs(ctx, worker, 1); err != nil {
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs after episode end returned error: %v", err)
 	}
 	if n := countWorkerJobEvents(t, store, "job-a", "runtime_lock_wait"); n != 2 {

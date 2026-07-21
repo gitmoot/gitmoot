@@ -15,8 +15,8 @@ func TestLoadPipelineRemoteDefaultsAndConfiguredValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if remote.Configured() || remote.ResolvedRef() != DefaultPipelineRemoteRef || remote.ResolvedPath() != DefaultPipelineRemotePath {
-		t.Fatalf("default pipeline remote = %+v ref=%q path=%q", remote, remote.ResolvedRef(), remote.ResolvedPath())
+	if remote.Repo != "" || remote.Ref != "" || remote.Path != "" {
+		t.Fatalf("default pipeline remote = %+v", remote)
 	}
 	if err := os.WriteFile(paths.ConfigFile, []byte(`
 [pipeline_remote]
@@ -30,8 +30,8 @@ path = "/catalog/pipelines/"
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !remote.Configured() || remote.Repo != "jerry/pipelines" || remote.ResolvedRef() != "shared" || remote.ResolvedPath() != "/catalog/pipelines/" {
-		t.Fatalf("configured pipeline remote = %+v ref=%q path=%q", remote, remote.ResolvedRef(), remote.ResolvedPath())
+	if remote.Repo != "jerry/pipelines" || remote.Ref != "shared" || remote.Path != "/catalog/pipelines/" {
+		t.Fatalf("configured pipeline remote = %+v", remote)
 	}
 }
 

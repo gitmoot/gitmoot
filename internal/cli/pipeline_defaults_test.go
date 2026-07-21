@@ -338,7 +338,7 @@ func runDefaultPipelineToTerminal(t *testing.T, home string, store *db.Store, na
 	enqueue := newPipelineStageEnqueuer(store, home)
 	now := time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC)
 	for i := 0; i < 12; i++ {
-		if err := runEnabledRepoWorkerTicks(context.Background(), store, worker, 1, io.Discard, now.Add(time.Duration(i)*time.Second)); err != nil {
+		if err := runEnabledRepoWorkerTicksTracked(context.Background(), store, worker, 1, "", io.Discard, now.Add(time.Duration(i)*time.Second), nil, nil); err != nil {
 			t.Fatalf("worker tick %d: %v", i, err)
 		}
 		if err := runPipelineScanOnce(context.Background(), store, enqueue, now.Add(time.Duration(i)*time.Second)); err != nil {

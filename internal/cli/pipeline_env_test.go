@@ -235,7 +235,7 @@ func TestPipelineEnvDeliveryScopePrecedenceAndRotation(t *testing.T) {
 	envFile := writePipelineEnvFile(t, t.TempDir(), "KEY_A="+pipelineEnvSecretA+"\nKEY_B="+pipelineEnvSecretB+"\n", 0o600)
 	spec := pipeline.Spec{EnvFile: envFile, Env: map[string]string{"DEFAULT": "inline"}}
 	stage := pipeline.Stage{ID: "a", Cmd: "echo", EnvKeys: []string{"KEY_A", "DEFAULT"}}
-	access, err := resolvePipelineStageEnvAccess(context.Background(), store, home, spec, stage)
+	access, err := pipeline.ResolvePipelineStageEnvAccess(context.Background(), store, home, spec, stage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +243,7 @@ func TestPipelineEnvDeliveryScopePrecedenceAndRotation(t *testing.T) {
 		t.Fatalf("resolved keys = %#v", access.Keys)
 	}
 	capture := &pipelineEnvCaptureAdapter{}
-	wrapped := wrapPipelineEnvDeliveryAdapter(store, home, workflow.JobPayload{
+	wrapped := pipeline.WrapPipelineEnvDeliveryAdapter(store, home, workflow.JobPayload{
 		PipelineEnvFile: access.File, PipelineEnvKeys: access.Keys, PipelineEnv: access.Defaults,
 	}, capture)
 	base := runtime.Job{ShellEnv: []string{"GITMOOT_PIPELINE_NAME=real", "GITMOOT_INPUT_APP_NAME=typed-sentinel"}}
@@ -257,7 +257,7 @@ func TestPipelineEnvDeliveryScopePrecedenceAndRotation(t *testing.T) {
 		t.Fatalf("sibling key leaked: %#v", capture.jobs[0].ShellEnv)
 	}
 	emptyCapture := &pipelineEnvCaptureAdapter{}
-	empty := wrapPipelineEnvDeliveryAdapter(store, home, workflow.JobPayload{}, emptyCapture)
+	empty := pipeline.WrapPipelineEnvDeliveryAdapter(store, home, workflow.JobPayload{}, emptyCapture)
 	if _, err := empty.Deliver(context.Background(), runtime.Agent{}, base); err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +276,7 @@ func TestPipelineEnvDeliveryScopePrecedenceAndRotation(t *testing.T) {
 	}
 
 	reservedCapture := &pipelineEnvCaptureAdapter{}
-	reserved := wrapPipelineEnvDeliveryAdapter(store, home, workflow.JobPayload{
+	reserved := pipeline.WrapPipelineEnvDeliveryAdapter(store, home, workflow.JobPayload{
 		PipelineEnvKeys: []string{"GITMOOT_PIPELINE_NAME"},
 		PipelineEnv:     map[string]string{"GITMOOT_PIPELINE_NAME": "untrusted"},
 	}, reservedCapture)
@@ -316,7 +316,7 @@ func TestPipelineKeyAccessResolutionPrecedenceAndGrantBoundary(t *testing.T) {
 		},
 		Stages: []pipeline.Stage{{ID: "run", Cmd: "echo", EnvKeys: []string{"OVERLAP", "SHARED_ONLY", "DEFAULT_ONLY"}}},
 	}
-	resolution, err := resolvePipelineEnvironment(ctx, store, home, spec)
+	resolution, err := pipeline.ResolvePipelineEnvironment(ctx, store, home, spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +332,7 @@ func TestPipelineKeyAccessResolutionPrecedenceAndGrantBoundary(t *testing.T) {
 	for _, selector := range []string{"UNGRANTED", "UNGRANTED*"} {
 		probe := spec
 		probe.Stages = []pipeline.Stage{{ID: "run", Cmd: "echo", EnvKeys: []string{selector}}}
-		got, err := resolvePipelineEnvironment(ctx, store, home, probe)
+		got, err := pipeline.ResolvePipelineEnvironment(ctx, store, home, probe)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -360,7 +360,7 @@ func TestPipelineKeyAccessResolutionPrecedenceAndGrantBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	capture := &pipelineEnvCaptureAdapter{}
-	pinnedOwn := wrapPipelineEnvDeliveryAdapter(store, home, workflow.JobPayload{
+	pinnedOwn := pipeline.WrapPipelineEnvDeliveryAdapter(store, home, workflow.JobPayload{
 		PipelineName: "sources", PipelineEnvFile: ownFile, PipelineKeyAccess: []workflow.PipelineKeyAccess{want[0]},
 	}, capture)
 	if _, err := pinnedOwn.Deliver(ctx, runtime.Agent{}, runtime.Job{}); err == nil || !strings.Contains(err.Error(), "source own") {
@@ -425,7 +425,7 @@ func TestPipelineAgentKeyResolutionRequiresSeatGrantAndProxiedMode(t *testing.T)
 			{ID: "shell", Cmd: "echo", EnvKeys: []string{"PIPELINE_ONLY", "DEFAULT_ONLY"}},
 		},
 	}
-	resolution, err := resolvePipelineEnvironment(ctx, store, home, spec)
+	resolution, err := pipeline.ResolvePipelineEnvironment(ctx, store, home, spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,7 +443,7 @@ func TestPipelineAgentKeyResolutionRequiresSeatGrantAndProxiedMode(t *testing.T)
 	if !reflect.DeepEqual(resolution.Access, wantAccess) || !reflect.DeepEqual(resolution.Unresolved, wantUnresolved) {
 		t.Fatalf("resolution access=%#v unresolved=%#v", resolution.Access, resolution.Unresolved)
 	}
-	if err := pipelineEnvironmentResolutionError(spec, []pipelineEnvUnresolved{{Stage: "agent", Selector: "MISSING"}}); err == nil || !strings.Contains(err.Error(), "gitmoot key grant MISSING --agent scout") {
+	if err := pipeline.PipelineEnvironmentResolutionError(spec, []pipelineEnvUnresolved{{Stage: "agent", Selector: "MISSING"}}); err == nil || !strings.Contains(err.Error(), "gitmoot key grant MISSING --agent scout") {
 		t.Fatalf("agent unresolved hint = %v", err)
 	}
 }
@@ -465,7 +465,7 @@ func TestPipelineOwnKeyDoesNotRequireLowerPriorityKeychain(t *testing.T) {
 		Name: "own-only", EnvFile: envFile,
 		Stages: []pipeline.Stage{{ID: "run", Cmd: "echo", EnvKeys: []string{"OVERLAP"}}},
 	}
-	resolution, err := resolvePipelineEnvironment(ctx, store, home, spec)
+	resolution, err := pipeline.ResolvePipelineEnvironment(ctx, store, home, spec)
 	if err != nil {
 		t.Fatalf("own source consulted missing lower-priority keychain: %v", err)
 	}
@@ -489,12 +489,12 @@ func TestPipelineSharedKeyDeliveryRotationAndRevocation(t *testing.T) {
 		t.Fatal(err)
 	}
 	spec := pipeline.Spec{Name: "shared-delivery", Stages: []pipeline.Stage{{ID: "run", Cmd: "echo", EnvKeys: []string{"SHARED"}}}}
-	access, err := resolvePipelineStageEnvAccess(ctx, store, home, spec, spec.Stages[0])
+	access, err := pipeline.ResolvePipelineStageEnvAccess(ctx, store, home, spec, spec.Stages[0])
 	if err != nil {
 		t.Fatal(err)
 	}
 	capture := &pipelineEnvCaptureAdapter{}
-	wrapped := wrapPipelineEnvDeliveryAdapter(store, home, workflow.JobPayload{
+	wrapped := pipeline.WrapPipelineEnvDeliveryAdapter(store, home, workflow.JobPayload{
 		PipelineName: "shared-delivery", PipelineKeyAccess: access.Access,
 	}, capture)
 	if _, err := wrapped.Deliver(ctx, runtime.Agent{}, runtime.Job{}); err != nil {
@@ -540,7 +540,7 @@ func TestPipelineProxiedKeyResolutionAndDeliveryLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	spec := pipeline.Spec{Name: "proxy-delivery", Stages: []pipeline.Stage{{ID: "run", Cmd: "echo", EnvKeys: []string{"PROXY_KEY"}}}}
-	access, err := resolvePipelineStageEnvAccess(ctx, store, home, spec, spec.Stages[0])
+	access, err := pipeline.ResolvePipelineStageEnvAccess(ctx, store, home, spec, spec.Stages[0])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -553,7 +553,7 @@ func TestPipelineProxiedKeyResolutionAndDeliveryLease(t *testing.T) {
 	previousLogf := credgw.DefaultLogf
 	credgw.DefaultRegistry = credgw.NewRegistry()
 	credgw.DefaultLogf = func(string, ...any) {}
-	paths, err := configPathsForPipelineStore(store, home)
+	paths, err := pipeline.ConfigPathsForPipelineStore(store, home)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -563,7 +563,7 @@ func TestPipelineProxiedKeyResolutionAndDeliveryLease(t *testing.T) {
 		credgw.DefaultLogf = previousLogf
 	})
 	capture := &pipelineEnvCaptureAdapter{}
-	wrapper := wrapPipelineEnvDeliveryAdapter(store, home, workflow.JobPayload{
+	wrapper := pipeline.WrapPipelineEnvDeliveryAdapter(store, home, workflow.JobPayload{
 		PipelineName: "proxy-delivery", PipelineKeyAccess: access.Access,
 	}, capture)
 	if _, err := wrapper.Deliver(ctx, runtime.Agent{}, runtime.Job{ID: "proxy-delivery-job"}); err != nil {
@@ -632,7 +632,7 @@ func TestPipelineAgentProxiedKeyDeliveryE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	spec := pipeline.Spec{Name: pipelineName, Repo: "owner/repo", Stages: []pipeline.Stage{{ID: "inspect", Agent: seatName, Action: "ask", Prompt: "inspect", EnvKeys: []string{keyName}}}}
-	access, err := resolvePipelineStageEnvAccess(ctx, store, home, spec, spec.Stages[0])
+	access, err := pipeline.ResolvePipelineStageEnvAccess(ctx, store, home, spec, spec.Stages[0])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -705,7 +705,7 @@ func TestPipelineAgentProxiedKeyDeliveryE2E(t *testing.T) {
 	credgw.DefaultRegistry = credgw.NewRegistry()
 	credgw.DefaultLogf = func(string, ...any) {}
 	pipeline.PipelineProxyAllowLoopbackHTTP = true
-	paths, err := configPathsForPipelineStore(store, home)
+	paths, err := pipeline.ConfigPathsForPipelineStore(store, home)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -745,7 +745,7 @@ func TestPipelineAgentProxiedKeyDeliveryE2E(t *testing.T) {
 		}
 		return runtime.Result{Raw: "ok"}, nil
 	}}
-	wrapper := wrapPipelineEnvDeliveryAdapter(store, home, payload, capture)
+	wrapper := pipeline.WrapPipelineEnvDeliveryAdapter(store, home, payload, capture)
 	result, err := wrapper.Deliver(ctx, runtime.Agent{}, runtime.Job{ID: "agent-proxy-job", AgentEnv: []string{"GITMOOT_INPUT_APP_NAME=typed-sentinel"}})
 	if err != nil {
 		t.Fatal(err)
@@ -801,7 +801,7 @@ func TestPipelineUnconfiguredProxiedKeyFailsAtEnqueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	spec := pipeline.Spec{Name: "unconfigured-proxy", Stages: []pipeline.Stage{{ID: "run", Cmd: "echo", EnvKeys: []string{"PROXY_KEY"}}}}
-	_, err = resolvePipelineStageEnvAccess(ctx, store, home, spec, spec.Stages[0])
+	_, err = pipeline.ResolvePipelineStageEnvAccess(ctx, store, home, spec, spec.Stages[0])
 	if err == nil || !strings.Contains(err.Error(), "gitmoot key configure PROXY_KEY") {
 		t.Fatalf("unconfigured proxied resolution error = %v", err)
 	}
@@ -918,7 +918,7 @@ func TestPipelineInjectedEnvShellE2E(t *testing.T) {
 	worker := defaultJobWorker(store, io.Discard, home)
 	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
 	for i := 0; i < 8; i++ {
-		if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now); err != nil {
+		if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now, nil, nil); err != nil {
 			t.Fatalf("worker tick %d: %v", i, err)
 		}
 		if err := runPipelineScanOnce(ctx, store, enqueue, now); err != nil {
@@ -1072,7 +1072,7 @@ stages:
 	rotated := false
 	revokedAfterEnqueue := false
 	for i := 0; i < 12; i++ {
-		if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now); err != nil {
+		if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now, nil, nil); err != nil {
 			t.Fatalf("worker tick %d: %v", i, err)
 		}
 		if !rotated {
@@ -1271,7 +1271,7 @@ func TestPipelineProxiedKeyShellE2E(t *testing.T) {
 	credgw.DefaultLogf = gatewayLogs.Logf
 	keyConfigureAllowLoopbackHTTP = true
 	pipeline.PipelineProxyAllowLoopbackHTTP = true
-	configPaths, err := configPathsForPipelineStore(store, home)
+	configPaths, err := pipeline.ConfigPathsForPipelineStore(store, home)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1324,7 +1324,7 @@ stages:
 	worker := defaultJobWorker(store, io.Discard, home)
 	now := time.Date(2026, 7, 16, 17, 0, 0, 0, time.UTC)
 	for i := 0; i < 8; i++ {
-		if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now); err != nil {
+		if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now, nil, nil); err != nil {
 			t.Fatalf("worker tick %d: %v", i, err)
 		}
 		if err := runPipelineScanOnce(ctx, store, enqueue, now); err != nil {

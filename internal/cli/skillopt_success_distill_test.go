@@ -125,9 +125,9 @@ distill_successes = true
 		t.Fatalf("GetAgentTemplate returned error: %v", err)
 	}
 	candidate := cliSkillOptCandidatePackage(t, "planner", installed.VersionID, "Plan with stronger guidance.")
-	version, err := skillopt.ImportCandidatePackage(ctx, store, candidate, "candidate.json")
+	version, err := skillopt.ImportCandidatePackageWithOptions(ctx, store, candidate, skillopt.CandidateImportOptions{SourcePath: "candidate.json"})
 	if err != nil {
-		t.Fatalf("ImportCandidatePackage returned error: %v", err)
+		t.Fatalf("ImportCandidatePackageWithOptions returned error: %v", err)
 	}
 	review, err := store.GetAgentTemplateCandidateReview(ctx, version.ID)
 	if err != nil {

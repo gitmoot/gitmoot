@@ -109,7 +109,7 @@ func TestPipelineForkedShellIsolationEventWindowsE2E(t *testing.T) {
 			now := time.Now().UTC()
 			var b, c db.PipelineRunStage
 			for i := 0; i < 8; i++ {
-				if err := runEnabledRepoWorkerTicks(ctx, store, tickWorker, 1, io.Discard, now); err != nil {
+				if err := runEnabledRepoWorkerTicksTracked(ctx, store, tickWorker, 1, "", io.Discard, now, nil, nil); err != nil {
 					t.Fatalf("worker tick %d: %v", i, err)
 				}
 				if err := runPipelineScanOnce(ctx, store, enqueue, now); err != nil {
@@ -202,7 +202,7 @@ func TestPipelineShellIsolationAllocationFailureFallsOpenE2E(t *testing.T) {
 	runID := addAndStartPipeline(t, home, pipelineName, specYAML)
 	worker := defaultJobWorker(store, io.Discard, home)
 	now := time.Now().UTC()
-	if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now); err != nil {
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	brokenHome := filepath.Join(t.TempDir(), "not-a-directory")
@@ -232,7 +232,7 @@ func TestPipelineShellIsolationAllocationFailureFallsOpenE2E(t *testing.T) {
 	if countCLIJobEvents(t, store, row.JobID, "readonly_worktree_skipped") != 1 {
 		t.Fatal("allocation failure did not emit readonly_worktree_skipped")
 	}
-	if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now); err != nil {
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := runPipelineScanOnce(ctx, store, newPipelineStageEnqueuer(store, home), now); err != nil {
@@ -259,7 +259,7 @@ func TestPipelineShellDefaultStillMutatesSharedCheckoutE2E(t *testing.T) {
 		if err := runPipelineScanOnce(ctx, store, enqueue, now); err != nil {
 			t.Fatal(err)
 		}
-		if err := runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, now); err != nil {
+		if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now, nil, nil); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"sort"
 	"strconv"
 	"strings"
 
@@ -411,15 +410,6 @@ func padRight(value string, width int) string {
 		return value
 	}
 	return value + strings.Repeat(" ", pad)
-}
-
-func sortedKeys(m map[string]int) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 func sidebarWidth(total int) int {

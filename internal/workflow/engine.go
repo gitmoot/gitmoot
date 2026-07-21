@@ -2943,22 +2943,6 @@ func (e Engine) resolveIntegrationDeps(ctx context.Context, job db.Job, payload 
 	return result, nil
 }
 
-// integrationDepBranches returns the per-delegation branches of delegation d's
-// succeeded implement-leg dependencies, so a dependent read-only step (e.g. a
-// decompose-and-verify verify gate) can run against a worktree with those legs
-// merged in rather than the base checkout (issue #332). It returns nil when d has
-// no branch-backed implement deps, in which case the normal read-only paths apply.
-// Read-only deps contribute no branch (they produce no implementation), and a leg
-// that ran in the shared checkout (branch == parent base) is skipped because its
-// work is already on the base.
-func (e Engine) integrationDepBranches(ctx context.Context, job db.Job, payload JobPayload, d Delegation) ([]string, error) {
-	result, err := e.resolveIntegrationDeps(ctx, job, payload, d)
-	if err != nil {
-		return nil, err
-	}
-	return result.branches, nil
-}
-
 // commitDelegationLeg commits an implement delegation leg's worktree changes to
 // its own branch when the leg has its own per-delegation worktree but no task/PR
 // finalizer (a PR-less local orchestrate, where the finalizer never runs and the
@@ -6847,7 +6831,7 @@ func (e Engine) setTaskState(ctx context.Context, ref taskRef, state TaskState) 
 	// under a fresh task id -- upserting `task` would fail with
 	// "UNIQUE constraint failed: tasks.repo_full_name, tasks.branch" and wedge the
 	// advancement. Advance the branch's canonical task in place instead of inserting a
-	// duplicate (mirrors StartTaskBranch's reuse check).
+	// duplicate (the same branch-reuse invariant used by task creation).
 	if task.Branch != "" {
 		byBranch, berr := e.Store.GetTaskByRepoBranch(ctx, task.RepoFullName, task.Branch)
 		if berr != nil && !errors.Is(berr, sql.ErrNoRows) {

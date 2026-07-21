@@ -62,13 +62,6 @@ func DefaultGitHubLimiterPolicy() GitHubLimiterPolicy {
 	}
 }
 
-// ProactiveSmoothingEnabled reports whether either proactive gate (concurrency cap
-// or min-interval spacing) is active. When false the limiter only reacts to
-// secondary limits and steady-state scheduling is unchanged.
-func (p GitHubLimiterPolicy) ProactiveSmoothingEnabled() bool {
-	return p.MaxConcurrent > 0 || p.MinInterval > 0
-}
-
 // LoadGitHubLimiterPolicy reads the [github] section, returning the default policy
 // when the section is absent (so a config with no [github] block is byte-identical
 // except for the invisible secondary-limit backoff).

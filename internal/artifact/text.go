@@ -14,20 +14,6 @@ type TextDriver struct {
 	PreviewLines int
 }
 
-func (d TextDriver) Preview(content []byte) string {
-	limit := d.PreviewLines
-	if limit <= 0 {
-		limit = DefaultPreviewLines
-	}
-	lines := splitLines(content)
-	if len(lines) <= limit {
-		return strings.Join(lines, "\n")
-	}
-	preview := append([]string{}, lines[:limit]...)
-	preview = append(preview, fmt.Sprintf("... %d more lines", len(lines)-limit))
-	return strings.Join(preview, "\n")
-}
-
 func (d TextDriver) Diff(oldName, newName string, oldContent, newContent []byte) string {
 	oldLines := splitLines(oldContent)
 	newLines := splitLines(newContent)

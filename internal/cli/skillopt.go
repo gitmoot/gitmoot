@@ -5478,16 +5478,6 @@ func skillOptTrainGenerationLockKey(sessionID string, iterationID string) string
 	return "skillopt-train-generation:" + sessionID + ":" + iterationID
 }
 
-// skillOptTrainGenerationCorrelationPrefix is the stable TaskID prefix shared by
-// every generation child job for a run, so the jobs can be found by TaskID
-// prefix. It is NOT used as ParentJobID/RootJobID: those are delegation-engine
-// fields and AdvanceJob dereferences ParentJobID as a real job row, so stamping
-// a synthetic value there would make a requeued generation job fail advancement
-// permanently. Keyed on the eval run so it stays stable across resumes.
-func skillOptTrainGenerationCorrelationPrefix(runID string) string {
-	return "skillopt-train-generation:" + strings.TrimSpace(runID)
-}
-
 // skillOptTrainGenerationTaskID is the per-option TaskID stamped on each
 // generation child job, uniquely identifying the (run, item, label, attempt)
 // option it produced.
@@ -12199,8 +12189,8 @@ func runSkillOptJudgePromote(args []string, stdout, stderr io.Writer) int {
 // applyJudgePromptToMetadata folds an accepted judge variant into a template's
 // flat Evaluation map: judge_prompt_templates is stored as a JSON-encoded
 // map[task_kind]string (merging so sibling task kinds are preserved), and
-// judge_prompt_version records the variant's version. The encoding round-trips
-// through EvaluationConfigForReader → judgePromptConfigFromConfig.
+// judge_prompt_version records the variant's version. The encoded map is read by
+// judgePromptConfigFromConfig.
 func applyJudgePromptToMetadata(metadata agenttemplate.Metadata, taskKind string, variant skillopt.JudgeCandidateVariant) (agenttemplate.Metadata, error) {
 	templates := map[string]string{}
 	if existing := strings.TrimSpace(metadata.Evaluation["judge_prompt_templates"]); existing != "" {

@@ -541,10 +541,6 @@ func openValidatedSecretEnvFile(ctx context.Context, store *db.Store, home, labe
 	return file, pipelineEnvFileStatusOK, nil
 }
 
-func validatePipelineEnvFileLocation(ctx context.Context, store *db.Store, home, declared string) error {
-	return validateSecretEnvFileLocation(ctx, store, home, "env_file", declared)
-}
-
 func validateSecretEnvFileLocation(ctx context.Context, store *db.Store, home, label, declared string) error {
 	if store == nil {
 		return fmt.Errorf("%s validation requires a store", label)

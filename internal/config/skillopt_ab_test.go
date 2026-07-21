@@ -131,7 +131,8 @@ live_ab_sample_rate = 0.0
 		t.Fatalf("write config: %v", err)
 	}
 
-	if err := SetConfigScalar(paths, []string{"skillopt", "live_ab_sample_rate"}, FloatScalar(0.3)); err != nil {
+	validRate := 0.3
+	if err := SetConfigScalar(paths, []string{"skillopt", "live_ab_sample_rate"}, ConfigScalar{float: &validRate}); err != nil {
 		t.Fatalf("SetConfigScalar valid: %v", err)
 	}
 	policy, err := LoadSkillOptABPolicy(paths)
@@ -143,7 +144,8 @@ live_ab_sample_rate = 0.0
 	}
 
 	// An out-of-range write must be rejected by validateConfigFile and reverted.
-	if err := SetConfigScalar(paths, []string{"skillopt", "live_ab_sample_rate"}, FloatScalar(2.0)); err == nil {
+	invalidRate := 2.0
+	if err := SetConfigScalar(paths, []string{"skillopt", "live_ab_sample_rate"}, ConfigScalar{float: &invalidRate}); err == nil {
 		t.Fatal("expected SetConfigScalar to reject out-of-range rate 2.0")
 	}
 	reverted, err := LoadSkillOptABPolicy(paths)

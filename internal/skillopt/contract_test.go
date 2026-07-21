@@ -17,6 +17,42 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 )
 
+func TestImportCandidatePackageWithOptionsRejectsNoCandidateMetadata(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+	template := testTemplate("planner", "Plan carefully.")
+	if err := store.UpsertAgentTemplate(ctx, template); err != nil {
+		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
+	}
+	candidateContent := testTemplateContent("planner", "Plan carefully with a concise risk section.")
+	parsed, err := agenttemplate.ParseTemplateContent(candidateContent)
+	if err != nil {
+		t.Fatalf("ParseTemplateContent returned error: %v", err)
+	}
+
+	_, err = ImportCandidatePackageWithOptions(ctx, store, CandidatePackage{
+		Kind:            CandidatePackageKind,
+		ContractVersion: ContractVersion,
+		TemplateID:      "planner",
+		BaseVersionID:   "planner@latest",
+		Candidate: CandidateTemplate{
+			Content:  candidateContent,
+			Metadata: parsed.Metadata,
+		},
+		EvalReport: json.RawMessage(`{"promotable":false,"no_candidate_reason":"best_origin_initial_skill"}`),
+		Summary: CandidateSummary{
+			Metadata: json.RawMessage(`{"promotable":false,"no_candidate_reason":"best_origin_initial_skill"}`),
+		},
+	}, CandidateImportOptions{SourcePath: "candidate.json"})
+	if !errors.Is(err, ErrNoCandidate) || !strings.Contains(err.Error(), "optimizer produced no candidate: best_origin_initial_skill") {
+		t.Fatalf("ImportCandidatePackageWithOptions error = %v", err)
+	}
+}
+
 func TestExportTrainingPackage(t *testing.T) {
 	ctx := context.Background()
 	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
@@ -800,153 +836,6 @@ func TestReviewIssueFromSourceURLSupportsIssueAndPullTargets(t *testing.T) {
 		if got := reviewIssueFromSourceURL(sourceURL); got != want {
 			t.Fatalf("reviewIssueFromSourceURL(%q) = %q, want %q", sourceURL, got, want)
 		}
-	}
-}
-
-func TestImportCandidatePackageCreatesPendingVersion(t *testing.T) {
-	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
-	if err != nil {
-		t.Fatalf("Open returned error: %v", err)
-	}
-	defer store.Close()
-	template := testTemplate("planner", "Plan carefully.")
-	if err := store.UpsertAgentTemplate(ctx, template); err != nil {
-		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
-	}
-	if err := store.UpsertEvalArtifact(ctx, db.EvalArtifact{
-		ID:        "candidate-diff",
-		Hash:      artifact.ContentHash([]byte("diff")),
-		MediaType: "text/plain",
-		SizeBytes: int64(len("diff")),
-		Driver:    "text",
-	}); err != nil {
-		t.Fatalf("UpsertEvalArtifact returned error: %v", err)
-	}
-	current, err := store.GetAgentTemplate(ctx, "planner")
-	if err != nil {
-		t.Fatalf("GetAgentTemplate returned error: %v", err)
-	}
-	candidateContent := testTemplateContent("planner", "Plan carefully with a concise risk section.")
-	parsed, err := agenttemplate.ParseTemplateContent(candidateContent)
-	if err != nil {
-		t.Fatalf("ParseTemplateContent returned error: %v", err)
-	}
-
-	version, err := ImportCandidatePackage(ctx, store, CandidatePackage{
-		Kind:            CandidatePackageKind,
-		ContractVersion: ContractVersion,
-		TemplateID:      "planner",
-		BaseVersionID:   "planner@latest",
-		Candidate: CandidateTemplate{
-			Content:  candidateContent,
-			Metadata: parsed.Metadata,
-		},
-		EvalReport: json.RawMessage(`{"score":0.82}`),
-		Summary: CandidateSummary{
-			DiffArtifactID:    "candidate-diff",
-			PreferenceSummary: "Candidate is more actionable.",
-		},
-	}, "candidate.json")
-	if err != nil {
-		t.Fatalf("ImportCandidatePackage returned error: %v", err)
-	}
-
-	if version.State != "pending" || version.TemplateID != "planner" {
-		t.Fatalf("candidate version = %+v", version)
-	}
-	after, err := store.GetAgentTemplate(ctx, "planner")
-	if err != nil {
-		t.Fatalf("GetAgentTemplate after import returned error: %v", err)
-	}
-	if after.VersionID != current.VersionID || after.Content != current.Content {
-		t.Fatalf("current template changed: before=%+v after=%+v", current, after)
-	}
-	latest, err := store.GetAgentTemplateReference(ctx, "planner@latest")
-	if err != nil {
-		t.Fatalf("GetAgentTemplateReference latest returned error: %v", err)
-	}
-	if latest.VersionID != version.ID || latest.Content != candidateContent {
-		t.Fatalf("latest template = %+v", latest)
-	}
-	review, err := store.GetAgentTemplateCandidateReview(ctx, version.ID)
-	if err != nil {
-		t.Fatalf("GetAgentTemplateCandidateReview returned error: %v", err)
-	}
-	if review.BaseVersionID != current.VersionID || review.DiffArtifactID != "candidate-diff" || review.PreferenceSummary != "Candidate is more actionable." || review.EvalReportJSON != `{"score":0.82}` {
-		t.Fatalf("candidate review = %+v", review)
-	}
-}
-
-func TestImportCandidatePackageRejectsNoCandidateMetadata(t *testing.T) {
-	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
-	if err != nil {
-		t.Fatalf("Open returned error: %v", err)
-	}
-	defer store.Close()
-	template := testTemplate("planner", "Plan carefully.")
-	if err := store.UpsertAgentTemplate(ctx, template); err != nil {
-		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
-	}
-	candidateContent := testTemplateContent("planner", "Plan carefully with a concise risk section.")
-	parsed, err := agenttemplate.ParseTemplateContent(candidateContent)
-	if err != nil {
-		t.Fatalf("ParseTemplateContent returned error: %v", err)
-	}
-
-	_, err = ImportCandidatePackage(ctx, store, CandidatePackage{
-		Kind:            CandidatePackageKind,
-		ContractVersion: ContractVersion,
-		TemplateID:      "planner",
-		BaseVersionID:   "planner@latest",
-		Candidate: CandidateTemplate{
-			Content:  candidateContent,
-			Metadata: parsed.Metadata,
-		},
-		EvalReport: json.RawMessage(`{"promotable":false,"no_candidate_reason":"best_origin_initial_skill"}`),
-		Summary: CandidateSummary{
-			Metadata: json.RawMessage(`{"promotable":false,"no_candidate_reason":"best_origin_initial_skill"}`),
-		},
-	}, "candidate.json")
-	if !errors.Is(err, ErrNoCandidate) || !strings.Contains(err.Error(), "optimizer produced no candidate: best_origin_initial_skill") {
-		t.Fatalf("ImportCandidatePackage error = %v", err)
-	}
-}
-
-func TestImportCandidatePackageRejectsUnchangedContent(t *testing.T) {
-	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
-	if err != nil {
-		t.Fatalf("Open returned error: %v", err)
-	}
-	defer store.Close()
-	template := testTemplate("planner", "Plan carefully.")
-	if err := store.UpsertAgentTemplate(ctx, template); err != nil {
-		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
-	}
-	current, err := store.GetAgentTemplate(ctx, "planner")
-	if err != nil {
-		t.Fatalf("GetAgentTemplate returned error: %v", err)
-	}
-	parsed, err := agenttemplate.ParseTemplateContent(current.Content)
-	if err != nil {
-		t.Fatalf("ParseTemplateContent returned error: %v", err)
-	}
-
-	_, err = ImportCandidatePackage(ctx, store, CandidatePackage{
-		Kind:            CandidatePackageKind,
-		ContractVersion: ContractVersion,
-		TemplateID:      "planner",
-		BaseVersionID:   current.VersionID,
-		Candidate: CandidateTemplate{
-			Content:  current.Content,
-			Metadata: parsed.Metadata,
-		},
-		Summary: CandidateSummary{},
-	}, "candidate.json")
-	if !errors.Is(err, ErrNoCandidate) || !strings.Contains(err.Error(), "optimizer produced no candidate: candidate content is unchanged") {
-		t.Fatalf("ImportCandidatePackage error = %v", err)
 	}
 }
 

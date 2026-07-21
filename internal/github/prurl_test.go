@@ -7,8 +7,8 @@ func TestParsePullRequestURL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParsePullRequestURL returned error: %v", err)
 	}
-	if ref.Repository() != "gitmoot/gitmoot" {
-		t.Fatalf("repository = %q", ref.Repository())
+	if ref.Owner != "gitmoot" || ref.Repo != "gitmoot" {
+		t.Fatalf("repository = %q/%q", ref.Owner, ref.Repo)
 	}
 	if ref.Number != 12 {
 		t.Fatalf("number = %d, want 12", ref.Number)

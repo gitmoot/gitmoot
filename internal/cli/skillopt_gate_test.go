@@ -76,9 +76,9 @@ func seedGateTemplate(t *testing.T, championMarkers, candidateMarkers int) (*db.
 	}
 	candidateBody := strings.TrimSpace(strings.Repeat("STRONG ", candidateMarkers)) + " guidance."
 	candidate := cliSkillOptCandidatePackage(t, "planner", installed.VersionID, candidateBody)
-	version, err := skillopt.ImportCandidatePackage(context.Background(), store, candidate, "candidate.json")
+	version, err := skillopt.ImportCandidatePackageWithOptions(context.Background(), store, candidate, skillopt.CandidateImportOptions{SourcePath: "candidate.json"})
 	if err != nil {
-		t.Fatalf("ImportCandidatePackage returned error: %v", err)
+		t.Fatalf("ImportCandidatePackageWithOptions returned error: %v", err)
 	}
 	return store, home, version
 }

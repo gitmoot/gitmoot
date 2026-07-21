@@ -21,6 +21,12 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
+func resetHeldBackWarnState() {
+	heldBackWarnMu.Lock()
+	heldBackWarnByJob = map[string]heldBackWarnState{}
+	heldBackWarnMu.Unlock()
+}
+
 // syncBuffer is a mutex-guarded bytes.Buffer so loop goroutines can writeLine
 // into it while the test reads.
 type syncBuffer struct {
@@ -327,7 +333,7 @@ func TestExpiredRuntimeLockReaperSkipsInFlightOwners(t *testing.T) {
 // throttled explanatory log line (reusing the #552 why-stuck vocabulary), not
 // silence and not a line per 1s tick.
 func TestTrackedDispatchLogsHeldBackJobs(t *testing.T) {
-	resetHeldBackWarnThrottle()
+	resetHeldBackWarnState()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store := daemonWorkerStore(t)
@@ -370,7 +376,7 @@ func TestTrackedDispatchLogsHeldBackJobs(t *testing.T) {
 // configured [admission] cap can NEVER be admitted — previously a silent
 // skip-forever — and now logs a throttled NEVER-fit line naming the cap.
 func TestTrackedDispatchLogsAdmissionNeverFit(t *testing.T) {
-	resetHeldBackWarnThrottle()
+	resetHeldBackWarnState()
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
@@ -485,7 +491,7 @@ func TestTrackedPoolIsolationHonorsSamePassRuntimeSibling(t *testing.T) {
 	tracker := newInflightJobTracker(ctx)
 	// An external in-flight job holds the shared checkout for the whole test, so
 	// job-iso is always checkout-contended (isolation is its only way to run).
-	if !tracker.begin("external-hold", "owner/repo", "repo:owner/repo", "") {
+	if !tracker.beginWithin(0, "external-hold", "owner/repo", "repo:owner/repo", "") {
 		t.Fatalf("begin(external-hold) refused on a fresh tracker")
 	}
 	errCh := make(chan error, 1)
@@ -612,7 +618,7 @@ func TestTrackedTickMaintenanceNotStarvedByInFlightJobs(t *testing.T) {
 	tracker := newInflightJobTracker(ctx)
 	// A long-running in-flight job occupying the shared checkout — on the old
 	// whole-repo busy gate this starved ALL maintenance below.
-	if !tracker.begin("job-live", "owner/repo", "repo:owner/repo", "") {
+	if !tracker.beginWithin(0, "job-live", "owner/repo", "repo:owner/repo", "") {
 		t.Fatalf("begin(job-live) refused on a fresh tracker")
 	}
 
