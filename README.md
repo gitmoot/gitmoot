@@ -15,6 +15,17 @@
 
 </div>
 
+
+## Built with Codex (OpenAI Build Week 2026)
+
+The Pipelines-as-a-Service layer (`pipeline expose` / `serve`, typed input firewall, public
+receipts) and the proof spine were implemented by **Codex running gpt-5.6-sol**, coordinated
+through gitmoot itself. Gitmoot mints receipts for its own implementation jobs, so the
+collaboration is verifiable: Codex session `019f6e86-fdf2-78f1-8f6a-7c5e0f948340`, proof
+manifest `sha256:78b3ab08...` (`gitmoot proof` reproduces it offline). The Build Week demo
+pipeline lives at [gitmoot/appkit-demo](https://github.com/gitmoot/appkit-demo), and its runs
+are public at <https://gitmoot.themartian.app/pipelines/appkit-pro>.
+
 ## Our Vision
 
 AI agents can already write code, review diffs, and run your tools. What they can't do is coordinate across sessions, runtimes, and days without losing the one thing software teams actually trust: **the pull request audit trail**.
