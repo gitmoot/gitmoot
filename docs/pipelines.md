@@ -709,7 +709,8 @@ gitmoot pipeline show <name> [--json]        # registry view for a pipeline name
 gitmoot pipeline show <run-id> [--json]      # run funnel for a "prun-…" run id
 gitmoot pipeline bind-trigger <name>         # create/re-sync the owned AP flow
 
-gitmoot pipeline run <name>                  # start a manual run; prints the run id
+gitmoot pipeline run <name> [--payload key=value ...] [--payload-json '<obj>']
+gitmoot pipeline watch <run-id> [--timeout 10m] [--poll 5s] [--json]
 gitmoot pipeline resume <run-id> [--from <stage>]
 gitmoot pipeline cancel <run-id>
 
@@ -752,9 +753,17 @@ the available `agent_runtime`, `prompt_preview`, and `cmd_preview` fields withou
 removing the full `prompt` or `cmd`.
 
 `pipeline run` prints just the run id (script-stable), so `RUN=$(gitmoot pipeline
-run nightly-sync)` works. A manual run ignores the `enabled` flag — a disabled
+run nightly-sync)` works. Repeat `--payload key=value` to inject manual trigger
+data, or pass one `--payload-json` object of string values; the two forms are
+mutually exclusive and use the bridge's existing key/count/size limits. A manual run ignores the `enabled` flag — a disabled
 pipeline can still be run by hand — but still requires a `repo` and refuses to
 start while the pipeline already has an active run (one active run per pipeline).
+
+`pipeline watch <run-id>` blocks until the run succeeds, fails, blocks, or is
+cancelled. It prints each stage state change once and exits `0` only for success;
+terminal non-success states exit `1`. A still-active run at `--timeout` exits `2`
+with `still running`, so automation can re-invoke the same command. `--json`
+suppresses transition lines and emits the final `pipeline show --json` shape.
 
 `pipeline show <run-id>` renders the run as a **text funnel**:
 
@@ -885,6 +894,7 @@ of `gitmoot agent list`**; `pipeline remove` disposes them.
 - `gitmoot pipeline show <name>` shows the registry view (spec hash, schedule,
   last/next run bookkeeping, and the stage DAG).
 - `gitmoot pipeline show <run-id>` shows the run funnel.
+- `gitmoot pipeline watch <run-id>` waits for terminal state without an agent-side poll loop.
 - Stage jobs are ordinary jobs (sender `pipeline`), so they also appear in the usual
   job/status surfaces.
 

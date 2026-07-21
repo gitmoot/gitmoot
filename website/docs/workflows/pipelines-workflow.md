@@ -65,10 +65,10 @@ Register it and run it:
 gitmoot pipeline add nightly-sync.yaml --enable
 
 # Or trigger a manual run right now (script-stable: prints just the run id).
-RUN=$(gitmoot pipeline run nightly-sync)
+RUN=$(gitmoot pipeline run nightly-sync --payload batch=nightly)
 
-# Watch the run as a text funnel.
-gitmoot pipeline show "$RUN"
+# Block until terminal state without an agent-side poll loop.
+gitmoot pipeline watch "$RUN" --timeout 10m
 ```
 
 ### Expose a pipeline as a service
@@ -302,7 +302,8 @@ gitmoot pipeline remote show
 gitmoot pipeline publish <name> [--remote owner/repo] [--create]
 gitmoot pipeline pull --list [--remote owner/repo]
 gitmoot pipeline pull <name> [--remote owner/repo] --repo owner/repo [--agent-map exported=local]
-gitmoot pipeline run <name>                  # start a manual run; prints the run id
+gitmoot pipeline run <name> [--payload key=value ...] [--payload-json '<obj>']
+gitmoot pipeline watch <run-id> [--timeout 10m] [--poll 5s] [--json]
 gitmoot pipeline resume <run-id> [--from <stage>]
 gitmoot pipeline cancel <run-id>
 gitmoot pipeline enable <name>
@@ -346,7 +347,9 @@ removing the full `prompt` or `cmd`.
 
 A manual `pipeline run` ignores the `enabled` flag — a disabled pipeline can still be
 run by hand — but still requires a `repo` and refuses to start while the pipeline
-already has an active run (one active run per pipeline). `pipeline add` also
+already has an active run (one active run per pipeline). Repeat `--payload
+key=value` or use one `--payload-json` object of strings to supply trigger data;
+the forms are mutually exclusive and use the bridge's shared limits. `pipeline add` also
 auto-creates one hidden shell runner agent per pipeline (`pipeline-<name>-runner`)
 that owns the stage jobs; it is filtered out of `gitmoot agent list` and disposed by
 `pipeline remove`.
@@ -388,8 +391,9 @@ fenced block labeled `UNTRUSTED external data`; each rendered value is capped at
 Every shell stage receives exact `GITMOOT_TRIGGER_<UPPERCASE_KEY>` exec environment
 entries. Values are never interpolated into shell source, so newlines and UTF-8
 remain data. The full canonical payload lives in the SQLite run row, is printed
-as `payload_json` by `pipeline show <run-id>`, and shell env and
-agent prompt projections also live in normal job data.
+as redacted/truncated key provenance in the text `pipeline show <run-id>` view
+(and as `payload_json` in JSON), and shell env and agent prompt projections also
+live in normal job data.
 
 ### Shell-stage upstream context
 
@@ -746,6 +750,12 @@ needs: R2 token
 
 source OK -> score BLOCKED (needs: R2 token) -> deploy SKIPPED
 ```
+
+Use `pipeline watch "$RUN"` as the normal blocking completion call. It emits each
+stage state change once and exits `0` only for success. Failed, blocked, or
+cancelled runs exit `1`; an active run that reaches `--timeout` exits `2` with
+`still running`, so a harness can re-invoke watch for another bounded window.
+`--json` emits the final `pipeline show --json` shape.
 
 Active runs also show queued/running stage details. The duration is labeled
 `enqueued` because the stage timestamp is recorded at enqueue, not worker claim.

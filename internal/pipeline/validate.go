@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -21,6 +22,47 @@ var triggerMapSelectors = []string{"subject", "from_address", "text", "message_i
 // decoded-size limits are byte budgets.
 func ValidTriggerPayloadKey(key string) bool {
 	return len(key) >= 1 && len(key) <= 64 && triggerPayloadKeyPattern.MatchString(key)
+}
+
+const (
+	triggerPayloadMaxEntries   = 32
+	triggerPayloadValueLimit   = 32 << 10
+	triggerPayloadDecodedLimit = 48 << 10
+)
+
+// ValidateAndEncodeTriggerPayload applies the shared trigger transport limits
+// and returns the canonical JSON persisted on the pipeline run row.
+func ValidateAndEncodeTriggerPayload(payload map[string]string) (string, error) {
+	if len(payload) > triggerPayloadMaxEntries {
+		return "", fmt.Errorf("payload has %d entries; maximum is %d", len(payload), triggerPayloadMaxEntries)
+	}
+	keys := make([]string, 0, len(payload))
+	for key := range payload {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	total := 0
+	for _, key := range keys {
+		value := payload[key]
+		if !ValidTriggerPayloadKey(key) {
+			return "", fmt.Errorf("payload key %q must be 1-64 bytes and match ^[a-z][a-z0-9_]*$", key)
+		}
+		if len(value) > triggerPayloadValueLimit {
+			return "", fmt.Errorf("payload value for key %q exceeds the 32 KiB limit", key)
+		}
+		if strings.ContainsRune(value, '\x00') {
+			return "", fmt.Errorf("payload value for key %q must not contain U+0000", key)
+		}
+		total += len(key) + len(value)
+		if total > triggerPayloadDecodedLimit {
+			return "", fmt.Errorf("payload decoded key/value total exceeds the 48 KiB limit (at key %q)", key)
+		}
+	}
+	canonical, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal validated payload: %w", err)
+	}
+	return string(canonical), nil
 }
 
 // normalize trims surrounding whitespace off every free-text field so validation

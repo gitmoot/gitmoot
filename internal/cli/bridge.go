@@ -19,7 +19,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -34,13 +33,10 @@ import (
 )
 
 const (
-	defaultBridgeAddr                 = "127.0.0.1:8791"
-	bridgeTokenName                   = "bridge.token"
-	bridgeBodyLimit                   = 1 << 20
-	bridgePipelineRunBodyLimit        = 64 << 10
-	bridgePipelinePayloadMaxEntries   = 32
-	bridgePipelinePayloadValueLimit   = 32 << 10
-	bridgePipelinePayloadDecodedLimit = 48 << 10
+	defaultBridgeAddr          = "127.0.0.1:8791"
+	bridgeTokenName            = "bridge.token"
+	bridgeBodyLimit            = 1 << 20
+	bridgePipelineRunBodyLimit = 64 << 10
 )
 
 var errBridgeConflict = errors.New("bridge conflict")
@@ -491,36 +487,7 @@ func decodeBridgePipelineRunPayload(r *http.Request) (string, error) {
 			return "", fmt.Errorf("payload must be a JSON object with string values: %w", err)
 		}
 	}
-	if len(payload) > bridgePipelinePayloadMaxEntries {
-		return "", fmt.Errorf("payload has %d entries; maximum is %d", len(payload), bridgePipelinePayloadMaxEntries)
-	}
-	keys := make([]string, 0, len(payload))
-	for key := range payload {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	total := 0
-	for _, key := range keys {
-		value := payload[key]
-		if !pipeline.ValidTriggerPayloadKey(key) {
-			return "", fmt.Errorf("payload key %q must be 1-64 bytes and match ^[a-z][a-z0-9_]*$", key)
-		}
-		if len(value) > bridgePipelinePayloadValueLimit {
-			return "", fmt.Errorf("payload value for key %q exceeds the 32 KiB limit", key)
-		}
-		if strings.ContainsRune(value, '\x00') {
-			return "", fmt.Errorf("payload value for key %q must not contain U+0000", key)
-		}
-		total += len(key) + len(value)
-		if total > bridgePipelinePayloadDecodedLimit {
-			return "", fmt.Errorf("payload decoded key/value total exceeds the 48 KiB limit (at key %q)", key)
-		}
-	}
-	canonical, err := json.Marshal(payload)
-	if err != nil {
-		return "", fmt.Errorf("marshal validated payload: %w", err)
-	}
-	return string(canonical), nil
+	return pipeline.ValidateAndEncodeTriggerPayload(payload)
 }
 
 func (s *bridgeServer) handleRunGet(w http.ResponseWriter, r *http.Request, id string) {

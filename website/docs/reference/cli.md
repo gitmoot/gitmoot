@@ -1998,7 +1998,8 @@ gitmoot pipeline install-defaults                 # install built-in memory pipe
 gitmoot pipeline list [--json]
 gitmoot pipeline show nightly-sync [--json]        # registry view for a name
 gitmoot pipeline bind-trigger nightly-sync         # create/re-sync owned AP flow
-gitmoot pipeline run nightly-sync                  # start a manual run; prints the run id
+gitmoot pipeline run nightly-sync [--payload key=value ...] [--payload-json '<obj>']
+gitmoot pipeline watch <run-id> [--timeout 10m] [--poll 5s] [--json]
 gitmoot pipeline show <run-id> [--json]            # run funnel for a "prun-…" id
 gitmoot pipeline expose --schema schema.json <name>
 gitmoot pipeline serve [--addr 127.0.0.1:8792] [--allow-remote]
@@ -2155,7 +2156,9 @@ is a succeeded job but folds as a stage **failure** by default):
 strict: omitting `skipped` makes it fail. A `pr_merged` gate whose terminal succeeded
 source opened no PR parks blocked because there is nothing to wait for.
 
-`pipeline run` prints only the run id (script-stable), ignores the `enabled` flag but
+`pipeline run` prints only the run id (script-stable). Repeat `--payload key=value`
+or provide one `--payload-json` string object to use the same validated trigger
+input seam as the bridge; the forms are mutually exclusive. It ignores the `enabled` flag but
 still needs a `repo` and refuses to start while a run is active. `pipeline show
 <run-id>` renders the **text funnel** (`source OK -> score BLOCKED (needs: R2 token)
 -> deploy SKIPPED`); a **failed** run also prints the exact `gitmoot report bug --job
@@ -2164,6 +2167,11 @@ from its halted stage (or `--from`) plus its transitive dependents while **never
 re-running a succeeded stage. A pipeline stage is a **leaf**: a stage result carrying
 `delegations[]` never spawns children. See
 [Pipelines](../workflows/pipelines-workflow.md) for the full workflow.
+
+`pipeline watch <run-id>` blocks until terminal state, printing each stage state
+change once. It exits `0` for succeeded, `1` for failed/blocked/cancelled, and `2`
+with `still running` when the timeout expires. `--json` emits the final
+`pipeline show --json` summary without transition lines.
 
 ## Native Chat (agent threads)
 
