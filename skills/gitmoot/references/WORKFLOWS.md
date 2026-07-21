@@ -1103,7 +1103,7 @@ stages:
 ```sh
 gitmoot pipeline add nightly-sync.yaml --enable   # validate + store; --enable turns on the schedule
 RUN=$(gitmoot pipeline run nightly-sync)          # or trigger a manual run now
-gitmoot pipeline show "$RUN"                       # watch the text funnel
+gitmoot pipeline watch "$RUN"                      # one blocking call; no agent poll loop
 ```
 
 ### Pipelines as a service
@@ -1422,6 +1422,19 @@ Produce batches use the existing result decisions: `implemented` = complete,
 `changes_requested` = partial (only advances when opted into `success_decisions`),
 `blocked` = needs a human, and `skipped` = no work. `pipeline show` reports a
 best-effort run token total and per-stage input/output usage in JSON.
+
+Manual runs can carry the same trigger payload as bridge-started runs:
+
+```sh
+RUN=$(gitmoot pipeline run nightly-sync --payload batch=nightly --payload region=eu)
+gitmoot pipeline watch "$RUN" --timeout 10m
+```
+
+Use `--payload-json '{"batch":"nightly"}'` instead of repeatable `--payload`
+when the input already exists as JSON. The forms are mutually exclusive and use
+the bridge's shared payload limits. If watch exits `2` with `still running`,
+re-invoke it with another timeout window; do not teach agents to poll `pipeline
+show` in a loop.
 
 ### Park and resume
 

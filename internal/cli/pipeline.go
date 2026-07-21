@@ -14,6 +14,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 	"io"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -51,6 +52,8 @@ func runPipeline(args []string, stdout, stderr io.Writer) int {
 		return runPipelineList(args[1:], stdout, stderr)
 	case "run":
 		return runPipelineRunCmd(args[1:], stdout, stderr)
+	case "watch":
+		return runPipelineWatchCmd(args[1:], stdout, stderr)
 	case "show":
 		return runPipelineShow(args[1:], stdout, stderr)
 	case "bind-trigger":
@@ -86,7 +89,8 @@ func printPipelineUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot pipeline remote show")
 	fmt.Fprintln(w, "  gitmoot pipeline install-defaults")
 	fmt.Fprintln(w, "  gitmoot pipeline list [--json]")
-	fmt.Fprintln(w, "  gitmoot pipeline run <name>")
+	fmt.Fprintln(w, "  gitmoot pipeline run <name> [--payload key=value ...] [--payload-json '<obj>']")
+	fmt.Fprintln(w, "  gitmoot pipeline watch <run-id> [--timeout 10m] [--poll 5s] [--json]")
 	fmt.Fprintln(w, "  gitmoot pipeline show <name|run-id> [--json]")
 	fmt.Fprintln(w, "  gitmoot pipeline bind-trigger <name>")
 	fmt.Fprintln(w, "  gitmoot pipeline resume <run-id> [--from <stage>]")
@@ -1064,6 +1068,10 @@ func runPipelineRunCmd(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("pipeline run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	var payloadFlags repeatedStringFlag
+	fs.Var(&payloadFlags, "payload", "trigger payload entry key=value (repeatable)")
+	var payloadJSONFlag pipelinePayloadJSONFlag
+	fs.Var(&payloadJSONFlag, "payload-json", "trigger payload as a JSON object of string values")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		printPipelineUsage(stderr)
 		if len(args) == 0 {
@@ -1081,6 +1089,11 @@ func runPipelineRunCmd(args []string, stdout, stderr io.Writer) int {
 	}
 	if fs.NArg() != 0 {
 		fmt.Fprintln(stderr, "pipeline run accepts exactly one name")
+		return 2
+	}
+	payloadJSON, err := pipelineRunPayload(payloadFlags, payloadJSONFlag.value, payloadJSONFlag.set)
+	if err != nil {
+		fmt.Fprintf(stderr, "pipeline run: %v\n", err)
 		return 2
 	}
 	var runID string
@@ -1113,7 +1126,7 @@ func runPipelineRunCmd(args []string, stdout, stderr io.Writer) int {
 			return err
 		}
 		now := time.Now().UTC()
-		run, err := pipeline.CreatePipelineRun(ctx, store, rec, spec, "manual", "{}", now)
+		run, err := pipeline.CreatePipelineRun(ctx, store, rec, spec, "manual", payloadJSON, now)
 		if err != nil {
 			return err
 		}
@@ -1129,6 +1142,154 @@ func runPipelineRunCmd(args []string, stdout, stderr io.Writer) int {
 	}
 	writeLine(stdout, "%s", runID)
 	return 0
+}
+
+type pipelinePayloadJSONFlag struct {
+	value string
+	set   bool
+}
+
+func (f *pipelinePayloadJSONFlag) String() string { return f.value }
+
+func (f *pipelinePayloadJSONFlag) Set(value string) error {
+	f.value = value
+	f.set = true
+	return nil
+}
+
+func pipelineRunPayload(entries []string, rawJSON string, rawJSONSet ...bool) (string, error) {
+	jsonSet := rawJSON != ""
+	if len(rawJSONSet) > 0 {
+		jsonSet = rawJSONSet[0]
+	}
+	if len(entries) > 0 && jsonSet {
+		return "", errors.New("--payload and --payload-json are mutually exclusive")
+	}
+	payload := make(map[string]string)
+	if jsonSet {
+		trimmed := strings.TrimSpace(rawJSON)
+		if len(trimmed) == 0 || trimmed[0] != '{' {
+			return "", errors.New("--payload-json must be a JSON object with string values")
+		}
+		if err := json.Unmarshal([]byte(trimmed), &payload); err != nil {
+			return "", fmt.Errorf("--payload-json must be a JSON object with string values: %w", err)
+		}
+	} else {
+		for _, entry := range entries {
+			key, value, ok := strings.Cut(entry, "=")
+			if !ok {
+				return "", fmt.Errorf("--payload %q must be key=value", entry)
+			}
+			if key == "" {
+				return "", errors.New("--payload key must not be empty")
+			}
+			payload[key] = value
+		}
+	}
+	return pipeline.ValidateAndEncodeTriggerPayload(payload)
+}
+
+var errPipelineWatchTimeout = errors.New("pipeline watch timed out while still running")
+
+func runPipelineWatchCmd(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("pipeline watch", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	timeout := fs.Duration("timeout", 10*time.Minute, "maximum time to wait")
+	poll := fs.Duration("poll", 5*time.Second, "poll interval")
+	jsonOut := fs.Bool("json", false, "print the final run summary as JSON")
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		printPipelineUsage(stderr)
+		if len(args) == 0 {
+			fmt.Fprintln(stderr, "pipeline watch requires a run id")
+			return 2
+		}
+		return 0
+	}
+	runID := strings.TrimSpace(args[0])
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "pipeline watch accepts exactly one run id")
+		return 2
+	}
+	if *poll <= 0 {
+		fmt.Fprintln(stderr, "pipeline watch poll interval must be positive")
+		return 2
+	}
+
+	var final pipelineRunView
+	err := withStore(*home, func(store *db.Store) error {
+		deadline := time.Now().Add(*timeout)
+		lastState := make(map[string]string)
+		for {
+			view, ok, err := loadPipelineRunView(context.Background(), store, runID)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("run %s not found", runID)
+			}
+			if !*jsonOut {
+				printPipelineStageTransitions(stdout, view.stages, lastState)
+			}
+			if pipelineRunTerminal(view.run.State) {
+				final = view
+				return nil
+			}
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return errPipelineWatchTimeout
+			}
+			wait := *poll
+			if wait > remaining {
+				wait = remaining
+			}
+			time.Sleep(wait)
+		}
+	})
+	if errors.Is(err, errPipelineWatchTimeout) {
+		fmt.Fprintf(stderr, "pipeline watch: still running after %s\n", *timeout)
+		return 2
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "pipeline watch: %v\n", err)
+		return 1
+	}
+	if *jsonOut {
+		if code := encodePipelineJSON(stdout, stderr, pipelineRunToJSON(final)); code != 0 {
+			return code
+		}
+	} else {
+		writeLine(stdout, "state: %s", final.run.State)
+	}
+	if final.run.State == pipeline.RunSucceeded {
+		return 0
+	}
+	return 1
+}
+
+func pipelineRunTerminal(state string) bool {
+	switch state {
+	case pipeline.RunSucceeded, pipeline.RunFailed, pipeline.RunBlocked, pipeline.RunCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+func printPipelineStageTransitions(w io.Writer, stages []db.PipelineRunStage, lastState map[string]string) {
+	for _, stage := range stages {
+		if lastState[stage.StageID] == stage.State {
+			continue
+		}
+		lastState[stage.StageID] = stage.State
+		writeLine(w, "%s: %s", stage.StageID, strings.ToUpper(stage.State))
+	}
 }
 
 // pipelineRunView is the resolved data behind `pipeline show <run-id>`: the run
@@ -1263,9 +1424,7 @@ func printPipelineRunFunnelAt(stdout io.Writer, view pipelineRunView, now time.T
 	writeLine(stdout, "run: %s", run.ID)
 	writeLine(stdout, "pipeline: %s", run.Pipeline)
 	writeLine(stdout, "trigger: %s", firstNonEmpty(run.Trigger, "-"))
-	if payload := strings.TrimSpace(run.PayloadJSON); payload != "" && payload != "{}" {
-		writeLine(stdout, "payload_json: %s", payload)
-	}
+	printPipelinePayloadPreview(stdout, run.PayloadJSON)
 	writeLine(stdout, "state: %s", run.State)
 	writeLine(stdout, "started: %s", heartbeatTimeForStatus(run.StartedAt))
 	writeLine(stdout, "finished: %s", heartbeatTimeForStatus(run.FinishedAt))
@@ -1311,6 +1470,39 @@ func printPipelineRunFunnelAt(stdout io.Writer, view pipelineRunView, now time.T
 			writeLine(stdout, "  gitmoot report bug --job %s", jobID)
 		}
 	}
+}
+
+func printPipelinePayloadPreview(w io.Writer, payloadJSON string) {
+	if payloadJSON = strings.TrimSpace(payloadJSON); payloadJSON == "" || payloadJSON == "{}" {
+		return
+	}
+	var payload map[string]string
+	if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil || len(payload) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(payload))
+	for key := range payload {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	writeLine(w, "payload:")
+	for _, key := range keys {
+		value := "[redacted]"
+		if !pipelinePayloadKeyLooksSecret(key) {
+			value = pipelinePreview(payload[key], " ", 40)
+		}
+		writeLine(w, "  %s: %s", key, strconv.Quote(value))
+	}
+}
+
+func pipelinePayloadKeyLooksSecret(key string) bool {
+	key = strings.ToLower(key)
+	for _, marker := range []string{"secret", "token", "password", "passwd", "credential", "api_key", "private_key", "auth", "cookie"} {
+		if strings.Contains(key, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func pipelineElapsed(now, started time.Time) string {

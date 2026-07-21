@@ -2785,7 +2785,8 @@ gitmoot pipeline install-defaults                 # install built-in memory pipe
 gitmoot pipeline list [--json]
 gitmoot pipeline show nightly-sync [--json]        # registry view for a name
 gitmoot pipeline bind-trigger nightly-sync         # create/re-sync owned AP flow
-gitmoot pipeline run nightly-sync                  # start a manual run; prints the run id
+gitmoot pipeline run nightly-sync [--payload key=value ...] [--payload-json '<obj>']
+gitmoot pipeline watch <run-id> [--timeout 10m] [--poll 5s] [--json]
 gitmoot pipeline show <run-id> [--json]            # run funnel for a "prun-…" id
 gitmoot pipeline expose --schema schema.json <name> # issue one bearer token (shown once)
 gitmoot pipeline serve                              # loopback API on 127.0.0.1:8792
@@ -3053,8 +3054,9 @@ dynamically fenced, 6000-byte-bounded `UNTRUSTED external data` block before
 upstream context; each rendered value is capped at 1500 bytes. Shell stages receive
 exact `GITMOOT_TRIGGER_<UPPERCASE_KEY>` exec environment entries, never shell-source
 interpolation. The full canonical payload is retained in the SQLite run row and
-shown by `pipeline show <run-id>` as `payload_json`; job
-env/prompt projections follow normal job-data retention.
+shown as redacted/truncated key provenance by text `pipeline show <run-id>` and
+as `payload_json` in JSON; job env/prompt projections follow normal job-data
+retention.
 
 Every pipeline shell stage also receives `GITMOOT_PIPELINE_NAME`,
 `GITMOOT_PIPELINE_RUN_ID`, and `GITMOOT_PIPELINE_STAGE_ID`. A dependent shell
@@ -3154,11 +3156,18 @@ strict: omitting `skipped` makes it fail. A `pr_merged` gate whose source skippe
 parks blocked because no PR can exist for that run.
 
 `pipeline run` prints only the run id (script-stable: `RUN=$(gitmoot pipeline run
-nightly-sync)`); a manual run ignores `enabled` but still needs a `repo` and refuses
+nightly-sync)`); repeat `--payload key=value` or use one `--payload-json` string
+object to enter the existing trigger-input seam. The forms are mutually exclusive
+and share the bridge's key/count/size validation. A manual run ignores `enabled` but still needs a `repo` and refuses
 to start while a run is already active. `pipeline show <run-id>` renders the **text
 funnel** (`source OK -> score BLOCKED (needs: R2 token) -> deploy SKIPPED`) under a
 run header; a **failed** run also prints the exact `gitmoot report bug --job
 <stage-job>` command (gitmoot never auto-files it).
+
+`pipeline watch <run-id>` is the blocking completion primitive. It prints each
+stage state transition once, returns `0` for succeeded, `1` for terminal
+failed/blocked/cancelled, and `2` with `still running` when `--timeout` expires.
+Use `--json` for the same final summary shape as `pipeline show --json`.
 
 While a stage is queued or running, the run view adds an honest
 `STATE; enqueued <elapsed> ago` detail (the stage timestamp is enqueue time, not
