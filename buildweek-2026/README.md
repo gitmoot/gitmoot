@@ -92,6 +92,36 @@ Week. Codex's role there was architecture, not implementation: two research-pane
 coordinator then implemented (PR #694 records the cross-runtime panel). Everything in the
 table above is July 13–21 work.
 
+## Prior work vs Build Week work (rule: pre-existing projects)
+
+Gitmoot is a pre-existing open source project. This section separates the two bodies of work;
+every claim below is verifiable from public, dated squash-merge commits on `main` and from the
+timestamped Codex session table above.
+
+**Existed before July 13** (prior work, not part of this submission):
+the gitmoot coordinator itself (agents, jobs, daemon, dashboard, reviews), and the bare
+pipeline primitive: a shell-only DAG runner, merged July 6 (`4aadf2e`, #681 via PR #694).
+
+**Built during the Submission Period, July 13 to 21** (the submission), each with its dated
+merge commit on `main`:
+
+| Date | Commit | What |
+|---|---|---|
+| Jul 14 | `cd43a49` | Chained pipeline triggers: run B when a run of A succeeds (#922) |
+| Jul 15 | `0a84fab` | Pipeline descriptions (#940) |
+| Jul 15 | `68e0d38` | Export/import bundles, share a pipeline across machines (#935) |
+| Jul 15 | `f93a435` | Publish/pull bundles via a GitHub remote (#941) |
+| Jul 16 | `b54b6f4` | Pipeline-owned env_file + per-stage secret injection (#968) |
+| Jul 16 | `0a326bd` | Produce stages declare read-only input paths (#965) |
+| Jul 17 | `fe2db28` | Proof spine: content-addressed evidence manifest + `gitmoot proof` (#1010) |
+| Jul 17 | `6392368` | Pipelines as a Service v1: schema-firewalled opt-in API with receipts (#1011/#1012) |
+| Jul 17 | `354270f` | Run artifact delivery: stage outputs in the bundle, digests in the proof (#1014/#1015) |
+| Jul 17-20 | [appkit-demo history](https://github.com/gitmoot/appkit-demo/commits/main) | The demo pipelines: agent derive stage, real-screen capture, the parallel fork, the notify chain |
+
+Codex / GPT-5.6 evidence within the period: the session table above (each session file is
+timestamped; the main one is receipted in `codex-proof-receipt.txt`), plus the dated commit
+history itself, authored through those sessions.
+
 ## The measured numbers, with provenance
 
 The video's comparison table comes from these records (nothing estimated):
