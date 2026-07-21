@@ -29,14 +29,6 @@ func pipelineStageCheckoutPath(ctx context.Context, store *db.Store, repo string
 	return strings.TrimSpace(record.CheckoutPath)
 }
 
-func pipelineStageImplementTaskID(runID, stageID string) string {
-	return fmt.Sprintf("pipe-%s-%s", runID, stageID)
-}
-
-func pipelineStageImplementBranch(runID, stageID string) string {
-	return "gitmoot/" + pipelineStageImplementTaskID(runID, stageID)
-}
-
 // newPipelineStageEnqueuer builds the production enqueuer: a Mailbox bound to the
 // store and the daemon's canary-routing policy, so a pipeline stage job is
 // indistinguishable from a normal background job once enqueued (the runner agent
