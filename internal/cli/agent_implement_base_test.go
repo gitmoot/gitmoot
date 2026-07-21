@@ -98,6 +98,9 @@ func TestLocalImplementStrictWorkflowPreflightLeavesNoTaskWorktreeOrLock(t *test
 	store := openCLIJobStore(t, fixture.home)
 	defer store.Close()
 	ctx := context.Background()
+	// The checkout must resolve as a GitHub repo for dispatch to reach the
+	// strict preflight; the URL is only parsed, never fetched.
+	runGit(t, fixture.checkout, "remote", "set-url", "origin", "https://github.com/owner/repo.git")
 	record := db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: fixture.checkout}
 	if err := store.UpsertRepo(ctx, record); err != nil {
 		t.Fatal(err)

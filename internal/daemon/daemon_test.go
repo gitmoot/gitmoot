@@ -96,7 +96,7 @@ func TestPollOnceCreatesJobAndAcknowledgement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListJobEvents returned error: %v", err)
 	}
-	if len(events) != 2 || events[0].Kind != string(workflow.JobQueued) || events[1].Kind != "routed" {
+	if len(events) != 3 || events[0].Kind != string(workflow.JobQueued) || events[1].Kind != "workflow_autolabeled" || events[2].Kind != "routed" {
 		t.Fatalf("events = %+v", events)
 	}
 }
