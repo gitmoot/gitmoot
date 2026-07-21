@@ -100,7 +100,7 @@ The video's comparison table comes from these records (nothing estimated):
 |---|---|---|---|
 | Tokens spent | 18,814,978 | 4,231,476 | Codex cumulative session usage; graph side adds the two agent-stage jobs (821,110+1,352 derive; 1,018,564+2,965 content) to the driving session (2,387,485) |
 | Prompts used | 6 | 1 | `user_message` count in each session log; the graph session also had zero permission requests |
-| Time used | 54:41 active | 21:24 | Loop: event timestamps, idle gaps over 30 min excluded (two sittings; 12h16m wall). Graph: first prompt 22:08:22Z to Telegram delivery 22:29:46Z (kit ready at 22:23:29Z) |
+| Time used | 54:41 active | 15:07 | Loop: event timestamps, idle gaps over 30 min excluded (two sittings; 12h16m wall). Graph: first prompt 22:08:22Z to pipeline succeeded 22:23:29Z; the chained delivery pipeline then posted the kit to Telegram at 22:29:46Z (21:24 from the prompt) |
 | Tasks completed | 3/3 | 3/3 | Loop needed corrective rounds; graph run `prun-appkit-pro-18c41ee476461c88`, all six stages succeeded |
 
 Sessions: loop `019f7b98-2f12-7e90-94ce-5248969c289e`, graph `019f8191-f721-79f1-9558-3c5f960da540`
