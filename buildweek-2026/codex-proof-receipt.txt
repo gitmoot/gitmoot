@@ -1,0 +1,25 @@
+proof sha256:78b3ab08cbc529544b67046d0d8b97889ba15feb174e6e0b50075474b5ebf581
+root local-ask-hx-proof-impl-18c30c375cbd5f16 [verified]
+  session local-ask-hx-proof-impl-18c30c375cbd5f16
+    hx-proof-impl · codex · gpt-5.6-sol · tokens 9742549/27147 · succeeded · ref 019f6e86-fdf2-78f1-8f6a-7c5e0f948340
+    lineage: -
+    commits:
+      - · result_hash 77bb800a5da3cd5faa4d1c992456654486058a270b97a53d9a96bb42c292fc9c · integrity true
+    tests:
+      Focused service/security/retry/store/acceptance tests: PASS. [reported; CI verification deferred]
+      Pinned gate test tail: internal/cli 410.620s; internal/pipeline cached; internal/db 114.045s; internal/workflow 109.244s; internal/proof cached; internal/runtime 0.099s; internal/daemon cached — all PASS. [reported; CI verification deferred]
+      Pinned gate: go build ./... PASS (silent); go vet ./... PASS (silent); go generate ./... PASS. git status showed only the intended source, test, docs, regenerated llms-full, and two new test files. [reported; CI verification deferred]
+      TestCheckServiceRunAdmissionIsReadOnlyAndMatchesGuards: proves the advisory check does not debit/refill persisted state and mirrors rate/pipeline guards. [reported; CI verification deferred]
+      TestPipelineServiceAcceptanceE2E remains green and now additionally proves the happy POST freezes exactly one bundle while an overlapping rejected POST freezes none. [reported; CI verification deferred]
+      TestPipelineServicePreAdmissionRejectsWithoutFreeze: proves empty-bucket, same-pipeline-active, and global-cap requests return 429/409 without touching pipeline-service-runs storage. [reported; CI verification deferred]
+      TestPipelineServicePrivateRunLookupIsUniformlyUnauthorized: proves missing-run and bad-token private GETs return byte-identical 401 responses. [reported; CI verification deferred]
+      TestPipelineServiceRejectsEnvKeysAtRequestTime: proves a directly stored unsafe exposure receives 422, creates no run, and freezes no bundle. [reported; CI verification deferred]
+      TestPipelineServiceRetrySuccessFinalizesProofAndReceipt: drives a retry:1 shell stage through failed attempt 0 and successful attempt 1; the run succeeds, authenticated GET finalizes, proof verifies, public receipt renders, and the superseded failed job is absent from proof.json. [reported; CI verification deferred]
+      TestRunPipelineExposeRejectsInvalidSchemaAndUnknownPipeline: proves env_keys exposure is rejected with the offending stage and field. [reported; CI verification deferred]
+      TestServicePipelinePublicSafetyRejectsAuthorityDeclarations: proves plain shell stages pass while env_keys, write, writes, reads, and network declarations fail closed. [reported; CI verification deferred]
+      git diff --check: PASS. HEAD remains d9d8afc; no commit, push, branch, or PR operation was performed. [reported; CI verification deferred]
+    reviews: -
+    PR: -
+summary: root local-ask-hx-proof-impl-18c30c375cbd5f16 · 1 sessions / 1 models · 12 tests reported, CI verification deferred · 0 reviews / 0 approved · PR -
+grades: reported=19 · observed=6 · verified=0
+integrity: all 15 nodes hash-consistent · manifest DAG acyclic · delegation DAG consistent · 1 result_hashes matched
