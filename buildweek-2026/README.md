@@ -2,6 +2,12 @@
 
 **Demo video: <https://www.youtube.com/watch?v=oiX8OiXAVrM>**
 
+**Frozen submission state**: development continues after the hackathon, so the exact trees as
+submitted on July 21 are tagged `buildweek-2026-submission` in both repos:
+[gitmoot](https://github.com/gitmoot/gitmoot/tree/buildweek-2026-submission) and
+[appkit-demo](https://github.com/gitmoot/appkit-demo/tree/buildweek-2026-submission).
+Anything after those tags is post-submission work.
+
 This folder documents the **Gitmoot Pipelines** submission for OpenAI Build Week 2026
 (July 13–21). It is temporary and will be removed after judging. The submission is one
 feature of this repo: agent graphs saved as yaml files that you can rerun, inspect, share,

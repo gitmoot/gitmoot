@@ -20,7 +20,9 @@
 
 **The Build Week submission is one feature of this repo: [Gitmoot Pipelines](https://gitmoot.io/docs/workflows/pipelines-workflow)**,
 agent graphs saved as yaml files that you can rerun, inspect, share, and expose as a typed
-service API with verifiable receipts. Start there if you came from Devpost. Demo video: <https://www.youtube.com/watch?v=oiX8OiXAVrM>. Submission assets, the Codex session table, and a
+service API with verifiable receipts. Start there if you came from Devpost. Demo video: <https://www.youtube.com/watch?v=oiX8OiXAVrM>. The repo keeps evolving after the
+hackathon; the exact tree as submitted on July 21 is frozen at the
+[`buildweek-2026-submission` tag](https://github.com/gitmoot/gitmoot/tree/buildweek-2026-submission). Submission assets, the Codex session table, and a
 verbatim proof receipt live in [`buildweek-2026/`](buildweek-2026/) (temporary folder,
 removed after judging).
 
