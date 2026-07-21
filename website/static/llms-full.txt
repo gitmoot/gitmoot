@@ -25,6 +25,25 @@ needs fuller local workflow, CLI, plugin, safety, and result-contract context.
 
 </div>
 
+
+## Built with Codex (OpenAI Build Week 2026)
+
+**The Build Week submission is one feature of this repo: [Gitmoot Pipelines](https://gitmoot.io/docs/workflows/pipelines-workflow)**,
+agent graphs saved as yaml files that you can rerun, inspect, share, and expose as a typed
+service API with verifiable receipts. Start there if you came from Devpost. Demo video: <https://www.youtube.com/watch?v=oiX8OiXAVrM>. The repo keeps evolving after the
+hackathon; the exact tree as submitted on July 21 is frozen at the
+[`buildweek-2026-submission` tag](https://github.com/gitmoot/gitmoot/tree/buildweek-2026-submission). Submission assets, the Codex session table, and a
+verbatim proof receipt live in [`buildweek-2026/`](buildweek-2026/) (temporary folder,
+removed after judging).
+
+The Pipelines-as-a-Service layer (`pipeline expose` / `serve`, typed input firewall, public
+receipts) and the proof spine were implemented by **Codex running gpt-5.6-sol**, coordinated
+through gitmoot itself. Gitmoot mints receipts for its own implementation jobs, so the
+collaboration is verifiable: Codex session `019f6e86-fdf2-78f1-8f6a-7c5e0f948340`, proof
+manifest `sha256:78b3ab08...` (`gitmoot proof` reproduces it offline). The Build Week demo
+pipeline lives at [gitmoot/appkit-demo](https://github.com/gitmoot/appkit-demo), and its runs
+are public at <https://gitmoot.themartian.app/pipelines/appkit-pro>.
+
 ## Our Vision
 
 AI agents can already write code, review diffs, and run your tools. What they can't do is coordinate across sessions, runtimes, and days without losing the one thing software teams actually trust: **the pull request audit trail**.
@@ -1782,7 +1801,11 @@ Notes:
   with no VCS commit are both just `dev`, so comparing them would prove nothing.
 - If you run the web dashboard as a **separate service**, it is its own process
   with its own build. `/api/health` reports the serving process's build separately
-  from the daemon's, so restart both after an upgrade.
+  from the daemon's, so restart both after an upgrade. The daemon block includes
+  `versionSource: "recorded"` when its version came from daemon startup metadata.
+  A daemon started by a pre-build-recording gitmoot instead reports
+  `versionSource: "unknown"` with an empty `version`; unknown is never a skew or
+  healthy-agreement verdict and never falls back to the binary now on disk.
 
 ## `gh`
 
@@ -6839,7 +6862,10 @@ Health is the operability view for unattended runs:
 
 - **Daemon** — running/stopped, PID, uptime, the running binary's version, and an
   update chip (`up to date`, or `update available: <version>` linking to the
-  release).
+  release). In `/api/health`, `daemon.versionSource` is `recorded` when the
+  running version came from daemon startup metadata. A daemon started by an
+  older gitmoot reports `unknown` with an empty `daemon.version`; clients must
+  treat that as neither build skew nor healthy agreement.
 - **State totals** — a chip per state (queued, running, blocked, succeeded,
   failed, cancelled).
 - **Stuck jobs** — blocked jobs (surfaced at any age) plus queued jobs older than
@@ -9706,10 +9732,13 @@ just `dev`: indistinguishable, so comparing them would prove nothing.
 
 The web dashboard's `/api/health` reports the daemon's **recorded** build (what
 the process is actually running — not the version of whatever binary now sits at
-its path) plus, separately, the serving dashboard process's own build, so a
-dashboard left on a stale binary is visible rather than silently wrong. The
-update badge stays relative to the binary on disk, since that is what an update
-replaces.
+its path) plus, separately, the serving dashboard process's own build. Its
+`daemon.versionSource` is `recorded` when `daemon.version` came from daemon
+startup metadata, or `unknown` when an older daemon recorded no build; in the
+latter case `daemon.version` is empty and must never be treated as either skew or
+agreement. This keeps a stale dashboard or daemon visible rather than silently
+wrong. The update badge stays relative to the binary on disk, since that is what
+an update replaces.
 
 The `gitmoot repo` commands manage the **watched-repo registry**: one daemon
 per Gitmoot home supervises every **enabled** registered repo. An omitted

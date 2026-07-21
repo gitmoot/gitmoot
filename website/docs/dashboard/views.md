@@ -297,7 +297,10 @@ Health is the operability view for unattended runs:
 
 - **Daemon** — running/stopped, PID, uptime, the running binary's version, and an
   update chip (`up to date`, or `update available: <version>` linking to the
-  release).
+  release). In `/api/health`, `daemon.versionSource` is `recorded` when the
+  running version came from daemon startup metadata. A daemon started by an
+  older gitmoot reports `unknown` with an empty `daemon.version`; clients must
+  treat that as neither build skew nor healthy agreement.
 - **State totals** — a chip per state (queued, running, blocked, succeeded,
   failed, cancelled).
 - **Stuck jobs** — blocked jobs (surfaced at any age) plus queued jobs older than

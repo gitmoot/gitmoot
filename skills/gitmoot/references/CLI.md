@@ -312,10 +312,13 @@ just `dev`: indistinguishable, so comparing them would prove nothing.
 
 The web dashboard's `/api/health` reports the daemon's **recorded** build (what
 the process is actually running — not the version of whatever binary now sits at
-its path) plus, separately, the serving dashboard process's own build, so a
-dashboard left on a stale binary is visible rather than silently wrong. The
-update badge stays relative to the binary on disk, since that is what an update
-replaces.
+its path) plus, separately, the serving dashboard process's own build. Its
+`daemon.versionSource` is `recorded` when `daemon.version` came from daemon
+startup metadata, or `unknown` when an older daemon recorded no build; in the
+latter case `daemon.version` is empty and must never be treated as either skew or
+agreement. This keeps a stale dashboard or daemon visible rather than silently
+wrong. The update badge stays relative to the binary on disk, since that is what
+an update replaces.
 
 The `gitmoot repo` commands manage the **watched-repo registry**: one daemon
 per Gitmoot home supervises every **enabled** registered repo. An omitted

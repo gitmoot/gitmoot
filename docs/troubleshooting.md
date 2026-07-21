@@ -43,7 +43,11 @@ Notes:
   with no VCS commit are both just `dev`, so comparing them would prove nothing.
 - If you run the web dashboard as a **separate service**, it is its own process
   with its own build. `/api/health` reports the serving process's build separately
-  from the daemon's, so restart both after an upgrade.
+  from the daemon's, so restart both after an upgrade. The daemon block includes
+  `versionSource: "recorded"` when its version came from daemon startup metadata.
+  A daemon started by a pre-build-recording gitmoot instead reports
+  `versionSource: "unknown"` with an empty `version`; unknown is never a skew or
+  healthy-agreement verdict and never falls back to the binary now on disk.
 
 ## `gh`
 

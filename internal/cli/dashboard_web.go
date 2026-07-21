@@ -203,9 +203,15 @@ type dashboardServerBuild struct {
 	Commit  string `json:"commit"`
 }
 
+type dashboardHealthDaemon struct {
+	dashboard.HealthDaemon
+	VersionSource string `json:"versionSource,omitempty"`
+}
+
 type dashboardHealthResponse struct {
 	dashboard.Health
-	Server dashboardServerBuild `json:"server"`
+	Daemon dashboardHealthDaemon `json:"daemon"`
+	Server dashboardServerBuild  `json:"server"`
 }
 
 // handleHealth shadows the module's /api/health to add the build of the process
@@ -239,8 +245,16 @@ func (d *webDataSource) healthJSON(ctx context.Context) ([]byte, error) {
 		health.RecentFailures = []dashboard.HealthFailure{}
 	}
 	build := buildinfo.Current()
+	versionSource := "unknown"
+	if health.Daemon.Version != "" {
+		versionSource = "recorded"
+	}
 	response := dashboardHealthResponse{
 		Health: health,
+		Daemon: dashboardHealthDaemon{
+			HealthDaemon:  health.Daemon,
+			VersionSource: versionSource,
+		},
 		Server: dashboardServerBuild{Version: build.Version, Commit: build.Commit},
 	}
 	return marshalDashboardJSON(response)
@@ -1655,14 +1669,11 @@ func (d *webDataSource) Health(ctx context.Context) (dashboard.Health, error) {
 
 	probes.Wait()
 
-	// What the daemon PROCESS is running: its recorded build. Only a daemon
-	// started by an older gitmoot recorded none — then, and only then, fall back
-	// to asking the binary at its path (the pre-#932 behavior, which is wrong the
-	// moment the binary has been swapped, but is the best available answer).
+	// What the daemon PROCESS is running: its recorded build. A daemon started by
+	// an older gitmoot recorded none, so its running build remains unknown. The
+	// binary now sitting at its path may have been replaced and cannot answer for
+	// the already-running process (#1003).
 	out.Daemon.Version = recordedDaemonVersion
-	if out.Daemon.Version == "" {
-		out.Daemon.Version = onDiskVersion
-	}
 
 	// What an update would replace: the binary on disk. Keeping the badge
 	// on-disk-relative is what stops it from sticking on after `gitmoot update`

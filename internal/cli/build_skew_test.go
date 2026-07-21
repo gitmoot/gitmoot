@@ -196,7 +196,8 @@ func TestHealthEndpointAddsServingBuildAndKeepsListsNonNil(t *testing.T) {
 
 	var payload struct {
 		Daemon struct {
-			Version string `json:"version"`
+			Version       string `json:"version"`
+			VersionSource string `json:"versionSource"`
 		} `json:"daemon"`
 		Server struct {
 			Version string `json:"version"`
@@ -212,6 +213,9 @@ func TestHealthEndpointAddsServingBuildAndKeepsListsNonNil(t *testing.T) {
 	}
 	if payload.Daemon.Version != "dev-stale-daemon" {
 		t.Fatalf("daemon build = %q", payload.Daemon.Version)
+	}
+	if payload.Daemon.VersionSource != "recorded" {
+		t.Fatalf("daemon version source = %q, want recorded", payload.Daemon.VersionSource)
 	}
 	current := buildinfo.Current()
 	if payload.Server.Version != current.Version || payload.Server.Commit != current.Commit {
@@ -231,6 +235,79 @@ func TestHealthEndpointAddsServingBuildAndKeepsListsNonNil(t *testing.T) {
 		if raw == nil || string(*raw) == "null" {
 			t.Fatalf("%s serialized as null; the contract promises an array", name)
 		}
+	}
+}
+
+// A daemon started before build recording was added has no trustworthy running
+// version. The binary now sitting at its path may already have been replaced,
+// so substituting that on-disk version would turn unknown into a false fact.
+func TestHealthEndpointDoesNotSubstituteOnDiskVersionForLegacyDaemon(t *testing.T) {
+	home := t.TempDir()
+	stageLiveDaemon(t, home, "", "")
+	stubOnDiskBuild(t, "dev-fresh-on-disk", "freshdisk")
+	stubUpdateCheck(t, "")
+
+	ds := &webDataSource{home: home}
+	recorder := httptest.NewRecorder()
+	ds.handleHealth(recorder, httptest.NewRequest(http.MethodGet, "/api/health", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+
+	var payload struct {
+		Daemon struct {
+			Version       string `json:"version"`
+			VersionSource string `json:"versionSource"`
+		} `json:"daemon"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Daemon.Version != "" {
+		t.Fatalf("legacy daemon build = %q, want unknown (not the on-disk build)", payload.Daemon.Version)
+	}
+	if payload.Daemon.VersionSource != "unknown" {
+		t.Fatalf("daemon version source = %q, want unknown", payload.Daemon.VersionSource)
+	}
+}
+
+// In the incident scenario, the serving dashboard and the freshly replaced
+// on-disk daemon binary are the same build while the still-running legacy daemon
+// is not. Unknown must not become a false server==daemon healthy match.
+func TestHealthEndpointUnknownDaemonVersionCannotFalseMatchServer(t *testing.T) {
+	home := t.TempDir()
+	stageLiveDaemon(t, home, "", "")
+	current := buildinfo.Current()
+	stubOnDiskBuild(t, current.Version, current.Commit)
+	stubUpdateCheck(t, "")
+
+	ds := &webDataSource{home: home}
+	recorder := httptest.NewRecorder()
+	ds.handleHealth(recorder, httptest.NewRequest(http.MethodGet, "/api/health", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+
+	var payload struct {
+		Daemon struct {
+			Version       string `json:"version"`
+			VersionSource string `json:"versionSource"`
+		} `json:"daemon"`
+		Server struct {
+			Version string `json:"version"`
+		} `json:"server"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Server.Version == "" {
+		t.Fatal("serving build version is empty; test cannot prove the false-match regression")
+	}
+	if payload.Daemon.Version != "" || payload.Daemon.VersionSource != "unknown" {
+		t.Fatalf("legacy daemon = version %q source %q, want empty/unknown", payload.Daemon.Version, payload.Daemon.VersionSource)
+	}
+	if payload.Server.Version == payload.Daemon.Version {
+		t.Fatalf("unknown daemon falsely matches serving build %q", payload.Server.Version)
 	}
 }
 
