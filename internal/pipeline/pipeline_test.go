@@ -18,6 +18,7 @@ stages:
     cmd: git fetch --all
   - id: score
     cmd: ./score.sh
+    isolate: true
     needs: [source]
     timeout: 10m
     retry: 2
@@ -41,7 +42,7 @@ func TestLoadValidSpec(t *testing.T) {
 	if len(spec.Stages) != 3 {
 		t.Fatalf("stages = %d, want 3", len(spec.Stages))
 	}
-	if spec.Stages[1].ID != "score" || spec.Stages[1].Retry != 2 || spec.Stages[1].Timeout != "10m" {
+	if spec.Stages[1].ID != "score" || !spec.Stages[1].Isolate || spec.Stages[1].Retry != 2 || spec.Stages[1].Timeout != "10m" {
 		t.Fatalf("unexpected score stage: %+v", spec.Stages[1])
 	}
 	if !reflect.DeepEqual(spec.Stages[1].Needs, []string{"source"}) {
@@ -465,6 +466,11 @@ func TestLoadValidationErrors(t *testing.T) {
 			name:    "write without implement rejected",
 			spec:    "name: p\nstages:\n  - {id: a, cmd: echo, write: true}\n",
 			wantSub: "write: true is only valid with action: implement",
+		},
+		{
+			name:    "isolate on agent rejected",
+			spec:    "name: p\nstages:\n  - {id: a, agent: rev, prompt: hi, isolate: true}\n",
+			wantSub: "isolate: true but is not a shell stage",
 		},
 		{
 			name:    "scheduled implement without allow rejected",

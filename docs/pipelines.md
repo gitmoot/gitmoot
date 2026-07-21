@@ -56,6 +56,7 @@ stages:                     # the DAG, keyed by unique id and wired by needs
     env_keys: [SOURCE_API_TOKEN]
   - id: score
     cmd: "python score.py data.json"
+    isolate: true           # optional shell-only detached read-only worktree
     needs: [source]         # runs only after every listed stage SUCCEEDS
   - id: deploy
     cmd: "rclone copy out/ r2:bucket"
@@ -87,6 +88,7 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 | `allow_auto_merge`          | pipeline     | no       | Pipeline-level half of the auto-merge double key. Required with a gate's `merge: auto`; default `false`. It does not replace `allow_scheduled_writes` on scheduled pipelines. |
 | `stages[].id`               | stage        | yes      | Unique, name-safe stage id. Appears verbatim in the stage job's fingerprint and deterministic id. |
 | `stages[].cmd`              | stage        | cond.    | Shell command run verbatim via `sh -c` (see the stage contract below). A stage is **exactly one** of `cmd`, `agent`, or `gate`. |
+| `stages[].isolate`          | stage        | no       | Shell-only opt-in to a detached read-only committed-tip worktree, removing checkout-lock serialization so same-repo siblings with different commands can run concurrently. Default `false` preserves the shared checkout; rejected on non-shell stages. See [Shell-stage isolation](#shell-stage-isolation). |
 | `stages[].agent`            | stage        | cond.    | Name of a managed gitmoot agent to run this stage (instead of a shell `cmd`). Must be a name-safe token; `pipeline add` warns (does not block) if the agent does not exist yet, but it must exist before the stage runs. Mutually exclusive with `cmd`/`gate`. The stage kind depends on `action`/`write`/`orchestrate` — see [Agent stages](#agent-stages). |
 | `stages[].prompt`           | stage        | cond.    | Instruction handed to an agent stage's agent. **Required** for an agent stage; rejected for a shell/gate stage. Prepended with the upstream `needs` stages' result summaries at enqueue. |
 | `stages[].action`           | stage        | no       | `ask` (default), `review`, `implement`, or `produce`. Produce writes operator-owned data but never the repo or a PR. |
@@ -110,7 +112,8 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 non-name-safe name/id, a duplicate stage id, a stage that is not **exactly one** of
 `cmd`, `agent`, or `gate` (and, per kind: an agent stage's missing `prompt`, an
 invalid `action`, `implement` without `write: true` or `write: true` off an
-implement stage, a mutating stage on a scheduled pipeline without
+implement stage, `isolate: true` on a non-shell stage, a mutating stage on a
+scheduled pipeline without
 `allow_scheduled_writes`, a mutating stage on a triggered pipeline without
 `allow_triggered_writes`, a gate/review `source` that is not an upstream implement
 stage in `needs`, or `source` on another stage kind), an unknown/self/cyclic `needs`, an invalid
@@ -273,6 +276,34 @@ summary=$(jq -r '.stages.extract.summary' \
 Upstream summaries are **untrusted data flowing into your trusted script**. Parse
 them as data; never evaluate them as shell source, and do not put credentials in
 stage summaries.
+
+### Shell-stage isolation
+
+Non-service shell stages use the managed shared checkout by default, preserving
+access to uncommitted and gitignored files and commands that intentionally write
+there. Set `isolate: true` on a `cmd` stage to run it in a disposable detached
+read-only worktree at the checkout's committed tip. Isolated fork stages key on
+their own worktree paths, removing checkout-lock serialization so siblings with
+different commands can run concurrently. Agent stages already have their own
+isolation rules, so `isolate` is rejected on them.
+
+**Known v1 limitation (tracked follow-up):** two isolated forks with the identical `cmd`
+still share `runtime:shell:<hash(cmd)>` and serialize on that separate shell
+session lock. This field does not change runtime-session identity.
+
+This opt-in path is fail-open: if Gitmoot cannot allocate the worktree, it emits a
+`readonly_worktree_skipped` job event and runs the command in the shared checkout.
+On successful allocation, the shell environment includes the best-effort path
+`GITMOOT_CHECKOUT=<live managed checkout>` so the command can read gitignored
+`repos/**` or uncommitted data absent from the committed-tip worktree. Prefer the
+stage cwd for committed files. Treat `GITMOOT_CHECKOUT` as read-only: a concurrent
+default shell stage that mutates the live checkout can produce inconsistent reads
+(including a torn tree or `index.lock` contention), so do not run an isolated reader
+beside a checkout-mutating stage. The existing `GITMOOT_INPUT_*`,
+`GITMOOT_TRIGGER_*`, metadata, selected `env_keys`, and absolute upstream-context
+file remain available independent of the stage cwd.
+Service-triggered shell stages remain always isolated and fail closed; their policy
+does not depend on this field.
 
 ### Agent stages
 

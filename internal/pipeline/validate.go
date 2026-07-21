@@ -155,6 +155,9 @@ func (s Spec) Validate() error {
 		if err := validateStageExecutor(s.Name, stage); err != nil {
 			return err
 		}
+		if stage.Isolate && stage.Kind() != StageKindShell {
+			return fmt.Errorf("pipeline %q stage %q sets isolate: true but is not a shell stage", s.Name, stage.ID)
+		}
 		if len(stage.EnvKeys) > 0 && stage.Kind() == StageKindGate {
 			return fmt.Errorf("pipeline %q stage %q sets env_keys but is a gate stage; gates do not run a process and cannot receive keys", s.Name, stage.ID)
 		}

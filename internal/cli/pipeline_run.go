@@ -104,10 +104,16 @@ func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueue
 		// most ReadOnlyWorktreeDispatchLockWaitBudget for the checkout mutation lock,
 		// and any failure leaves ask/review requests unchanged (serialized on the shared
 		// checkout) rather than stalling the pipeline scan loop. Produce is the explicit
-		// fail-closed exception below. Shell stages carry a RuntimeOverride and are
-		// excluded, so their request is byte-identical.
+		// fail-closed exception below. Shell stages carry a RuntimeOverride and stay
+		// excluded from this agent path; opted-in non-service shell stages use their
+		// own fail-open allocator so the three policies remain independent.
+		isolateShell := !serviceShell && pipelineShellStageReadOnlyWorktreeEligible(request)
 		if !serviceShell {
-			request, worktreePath, worktreeErr = allocatePipelineStageReadOnlyWorktree(ctx, store, home, request)
+			if isolateShell {
+				request, worktreePath, worktreeErr = allocatePipelineShellStageReadOnlyWorktree(ctx, store, home, request)
+			} else {
+				request, worktreePath, worktreeErr = allocatePipelineStageReadOnlyWorktree(ctx, store, home, request)
+			}
 		}
 		if strings.TrimSpace(request.Action) == "produce" && strings.TrimSpace(request.WorktreePath) == "" {
 			reason := "produce stage requires a disposable detached worktree; managed repo checkout is unavailable"
@@ -164,10 +170,16 @@ func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueue
 			message := fmt.Sprintf("read-only worktree %s allocated for agent stage (#757/#739); job keyed worktree:<path> to run beside same-repo stages", worktreePath)
 			if serviceShell {
 				message = fmt.Sprintf("detached worktree %s allocated for service shell stage (#1011); registered checkout is never used", worktreePath)
+			} else if isolateShell {
+				message = fmt.Sprintf("read-only worktree %s allocated for opted-in shell stage (#1016); job keyed worktree:<path> to remove shared-checkout serialization (identical shell commands still share a runtime-session key)", worktreePath)
 			}
 			_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "readonly_worktree_allocated", Message: message})
 		} else if worktreeErr != nil {
-			_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "readonly_worktree_skipped", Message: fmt.Sprintf("read-only worktree isolation skipped for agent stage (#757/#739); job runs serialized in the shared checkout: %v", worktreeErr)})
+			message := fmt.Sprintf("read-only worktree isolation skipped for agent stage (#757/#739); job runs serialized in the shared checkout: %v", worktreeErr)
+			if isolateShell {
+				message = fmt.Sprintf("read-only worktree isolation skipped for opted-in shell stage (#1016); job runs serialized in the shared checkout: %v", worktreeErr)
+			}
+			_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "readonly_worktree_skipped", Message: message})
 		}
 		return job, nil
 	}
@@ -276,6 +288,44 @@ func pipelineStageReadOnlyWorktreeEligible(request workflow.JobRequest) bool {
 	return strings.TrimSpace(request.WorktreePath) == ""
 }
 
+// pipelineShellStageReadOnlyWorktreeEligible reports whether a non-service shell
+// stage explicitly opted into fail-open committed-tip isolation. Service shell
+// stages are detected before this seam and retain their fail-closed #1011 path.
+func pipelineShellStageReadOnlyWorktreeEligible(request workflow.JobRequest) bool {
+	return request.Sender == workflow.PipelineJobSender &&
+		request.IsolateShellStage &&
+		strings.TrimSpace(request.RuntimeOverride) == runtime.ShellRuntime &&
+		strings.TrimSpace(request.Repo) != "" &&
+		strings.TrimSpace(request.WorktreePath) == ""
+}
+
+// allocatePipelineShellStageReadOnlyWorktree gives an opted-in non-service shell
+// stage its own detached committed-tip worktree. Allocation is FAIL-OPEN: callers
+// enqueue the unchanged request on any error and emit readonly_worktree_skipped.
+// Unlike agent isolation, shell commands receive the live managed checkout through
+// GITMOOT_CHECKOUT and do not get prose appended to their fixed instructions.
+func allocatePipelineShellStageReadOnlyWorktree(ctx context.Context, store *db.Store, home string, request workflow.JobRequest) (workflow.JobRequest, string, error) {
+	checkout := pipelineStageCheckoutPath(ctx, store, request.Repo)
+	if checkout == "" {
+		return request, "", nil // repo not managed/checked out yet — serialize as before
+	}
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return request, "", err
+	}
+	path, err := workflow.AllocateReadOnlyWorktree(ctx, store, paths.Home, request.Repo, checkout, request.ID, "pipeline-stage", 0, "", workflow.ReadOnlyWorktreeDispatchLockWaitBudget, gitutil.Client{Dir: checkout})
+	if err != nil {
+		return request, "", err
+	}
+	if strings.TrimSpace(path) == "" {
+		return request, "", errors.New("read-only worktree allocator returned an empty path")
+	}
+	request.WorktreePath = path
+	request.ReadOnlyWorktree = true
+	request.ShellEnv = append(request.ShellEnv, "GITMOOT_CHECKOUT="+checkout)
+	return request, path, nil
+}
+
 // allocatePipelineStageReadOnlyWorktree allocates a detached committed-tip worktree
 // for an eligible repo-bound agent stage and returns the request with WorktreePath +
 // the ReadOnlyWorktree disposal marker set (so the existing terminal cleanup and
@@ -321,8 +371,8 @@ func allocatePipelineStageReadOnlyWorktree(ctx context.Context, store *db.Store,
 }
 
 // pipelineStageCheckoutPath resolves a repo's on-disk checkout path, or "" when the
-// repo is unknown or not checked out. Used to allocate/roll back the agent-stage
-// read-only worktree.
+// repo is unknown or not checked out. Used to allocate/roll back pipeline-stage
+// read-only worktrees.
 func pipelineStageCheckoutPath(ctx context.Context, store *db.Store, repo string) string {
 	if strings.TrimSpace(repo) == "" {
 		return ""
@@ -672,6 +722,7 @@ func pipelineStageJobRequest(rec db.Pipeline, stage pipeline.Stage, run db.Pipel
 		JobTimeout:         stage.Timeout,
 		RuntimeOverride:    runtime.ShellRuntime,
 		RuntimeOverrideRef: stage.Cmd,
+		IsolateShellStage:  stage.Isolate && strings.TrimSpace(run.Trigger) != "service",
 		ShellEnv: append(triggerEnv,
 			"GITMOOT_PIPELINE_NAME="+rec.Name,
 			"GITMOOT_PIPELINE_RUN_ID="+run.ID,

@@ -49,6 +49,7 @@ stages:                     # the DAG, keyed by unique id and wired by needs
     env_keys: [SOURCE_API_TOKEN]
   - id: score
     cmd: "python score.py data.json"
+    isolate: true          # optional shell-only detached read-only worktree
     needs: [source]         # runs only after source SUCCEEDS
   - id: deploy
     cmd: "rclone copy out/ r2:bucket"
@@ -420,6 +421,25 @@ summary=$(jq -r '.stages.extract.summary' \
 
 Summaries are untrusted data flowing into your trusted script. Parse them as data,
 never evaluate them as shell source, and do not put credentials in summaries.
+
+### Shell-stage isolation
+
+Set `isolate: true` on a non-service `cmd` stage to opt into a disposable detached
+read-only worktree at the managed checkout's committed tip. This gives forked
+same-repo shell stages distinct checkout keys so a multi-worker daemon can run
+stages with different commands concurrently. **Known v1 limitation (tracked follow-up):**
+identical commands still share a shell runtime-session key and serialize. The
+default remains the shared checkout, preserving uncommitted and gitignored inputs
+and intentional checkout writes; `isolate` is rejected on agent and gate stages.
+
+Allocation is fail-open: Gitmoot records `readonly_worktree_skipped` and uses the
+shared checkout if it cannot create the worktree. Successful isolation adds the
+best-effort live path `GITMOOT_CHECKOUT=<managed checkout>` for data omitted from
+the clean worktree. Prefer cwd for committed files, treat the live path as read-only,
+and do not overlap the isolated reader with a default checkout-mutating stage because
+reads may be inconsistent. Existing input, trigger, metadata, selected-key, and
+absolute upstream-context variables remain available.
+Service shell stages keep their unconditional fail-closed isolation.
 
 A triggered pipeline containing an `implement` or `produce` stage must set
 `allow_triggered_writes: true`, in addition to each stage's `write: true`. This is

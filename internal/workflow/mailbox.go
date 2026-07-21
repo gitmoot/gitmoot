@@ -178,7 +178,11 @@ type JobRequest struct {
 	// Branch). It is the explicit signal the terminal cleanup uses to dispose a
 	// TOP-LEVEL read-only worktree that has no DelegationID. Additive/omitempty:
 	// false leaves the enqueued payload byte-identical.
-	ReadOnlyWorktree       bool
+	ReadOnlyWorktree bool
+	// IsolateShellStage is an enqueue-only marker for a non-service pipeline shell
+	// stage that opted into a detached read-only worktree. It is consumed before
+	// payload persistence; false preserves the legacy shared-checkout request.
+	IsolateShellStage      bool
 	OriginalAgent          string
 	DelegatedAgent         string
 	DelegationReason       string

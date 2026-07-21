@@ -1092,6 +1092,7 @@ stages:
     env_keys: [SOURCE_API_TOKEN]
   - id: score
     cmd: "python score.py data.json"
+    isolate: true          # optional shell-only detached read-only worktree
     needs: [source]         # runs only after source SUCCEEDS
   - id: deploy
     cmd: "rclone copy out/ r2:bucket"
@@ -1375,6 +1376,16 @@ downstream agent stage acts on upstream output as real dataflow. A repo-bound
 ask/review agent stage runs in its own detached read-only worktree (#739), so
 same-repo agent stages parallelize and never touch the live checkout.
 
+A `cmd` stage can opt into the same concurrency boundary with `isolate: true`.
+Its disposable worktree is the committed tip, while the default `false` continues
+to run in the shared checkout for commands that need dirty/gitignored data or write
+there. Allocation is fail-open (`readonly_worktree_skipped` records fallback), and
+successful isolation adds `GITMOOT_CHECKOUT=<live-checkout>` to the shell env. This
+removes checkout-lock serialization for siblings with different commands. **Known
+v1 limitation (tracked follow-up):** identical commands retain the same shell runtime-session
+key and serialize. Service shell stages remain unconditionally isolated and fail
+closed. The field is rejected on agent and gate stages.
+
 A dependent `cmd` stage receives the same settled upstream results through a data
 channel, not shell interpolation. All pipeline shell stages get
 `GITMOOT_PIPELINE_NAME`, `GITMOOT_PIPELINE_RUN_ID`, and
@@ -1383,6 +1394,12 @@ channel, not shell interpolation. All pipeline shell stages get
 `0600` JSON tempfile for the duration of the delivery. Gitmoot persists the JSON
 content (not the path), recreates identical bytes on retry/restart, and removes the
 file after every exit path. Root stages have no context-file variable.
+An isolated non-service shell stage additionally receives `GITMOOT_CHECKOUT`, a
+best-effort path to the live checkout for gitignored or uncommitted reads. Prefer
+the stage cwd for committed files, treat the live path as read-only, and never run
+that reader beside a default stage mutating the checkout because reads can be torn
+or contend on `index.lock`. `GITMOOT_INPUT_*`, `GITMOOT_TRIGGER_*`, selected keys,
+and the absolute upstream context path remain cwd-independent.
 
 The v1 shape is
 `{"schema_version":1,"complete":true,"stages":{"extract":{"id":"extract","state":"succeeded","summary":"...","summary_truncated":false}}}`.

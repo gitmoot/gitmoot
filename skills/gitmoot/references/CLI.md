@@ -2743,6 +2743,7 @@ stages:                     # the DAG, keyed by unique id and wired by needs
     env_keys: [SOURCE_API_TOKEN]
   - id: score
     cmd: "python score.py data.json"
+    isolate: true          # optional shell-only detached read-only worktree
     needs: [source]         # runs only after every listed stage SUCCEEDS
   - id: triage              # an AGENT stage instead of a shell cmd (exactly one of cmd|agent|gate)
     agent: reply-triager    #   #757 read-only leaf
@@ -2987,7 +2988,8 @@ a stage that is not exactly one of `cmd`/`agent`/`gate`, an agent stage
 missing a `prompt` / invalid `action` / `implement` without `write: true` / a mutating
 stage on a scheduled pipeline without `allow_scheduled_writes` / a mutating stage on
 a triggered pipeline without `allow_triggered_writes` / a gate or review's
-bad `source` / `source` on another stage kind, invalid durations, a `success_decisions` outside
+bad `source` / `source` on another stage kind / `isolate: true` on a non-shell
+stage, invalid durations, a `success_decisions` outside
 `approved`/`implemented`/`changes_requested`/`skipped`) so a mistake is a clear error, not a
 stuck run. It stores the raw YAML **verbatim** plus a content hash; each run
 snapshots that hash and executes its snapshot, so editing the file later never
@@ -2998,6 +3000,18 @@ runs a named managed agent on its own runtime as a read-only leaf (`ask`/`review
 its `needs` stages' result summaries are prepended to the prompt, and a repo-bound
 agent stage runs in its own detached read-only worktree so same-repo agent stages
 parallelize without touching the live checkout.
+
+A shell stage may set `isolate: true` to opt into a disposable detached read-only
+worktree at the managed checkout's committed tip. The default remains the shared
+checkout, including its uncommitted/gitignored data and any intentional writes.
+Opt-in allocation is fail-open: failure emits `readonly_worktree_skipped` and runs
+on the shared checkout. On success the command receives
+`GITMOOT_CHECKOUT=<live-checkout>` for cwd-independent access to data omitted from
+the clean worktree. This removes checkout-lock serialization, so same-repo stages
+with different commands can run concurrently. **Known v1 limitation (tracked follow-up):**
+identical commands still share `runtime:shell:<hash(cmd)>` and serialize on the
+separate shell session lock. Service shell stages retain their unconditional,
+fail-closed isolation; agent and gate stages reject this shell-only field.
 
 Shell and agent stages can opt into scoped key access with `env_keys`. Source
 files must be absolute, operator-owned regular files
@@ -3053,6 +3067,13 @@ signals partial data. The content is persisted and re-created at a fresh path fo
 retries; the file is removed after delivery. Treat summaries as untrusted data,
 never shell source, and keep credentials out of them. A strict consumer can start
 with `jq -e '.schema_version == 1 and .complete == true' "$GITMOOT_PIPELINE_UPSTREAM_CONTEXT_FILE"`.
+A successfully isolated non-service shell stage additionally receives
+`GITMOOT_CHECKOUT`, a best-effort path to the live managed checkout for reading
+gitignored `repos/**` or uncommitted data. Prefer the stage cwd for committed files.
+Treat this path as read-only, and do not run the isolated reader beside a default
+stage that mutates the checkout: those live reads can observe a torn tree or
+`index.lock` contention. The input, trigger, metadata, keycard, and upstream-context
+variables are unchanged by the detached cwd.
 
 `action: produce` (#814/#825) is a sandboxed pipeline leaf for writing operator-owned
 data, never repo/branch/task/PR state. Codex uses its native sandbox; Claude and

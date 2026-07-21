@@ -145,6 +145,11 @@ type Stage struct {
 	// Cmd is the shell command run verbatim via `sh -c`. Exactly one of Cmd or
 	// Agent must be set per stage (#757); a cmd stage's behavior is unchanged.
 	Cmd string `yaml:"cmd,omitempty"`
+	// Isolate opts a shell stage into a detached read-only committed-tip worktree
+	// so same-repo shell siblings with different commands may run concurrently.
+	// Agent stages are already isolated where appropriate; this field is valid
+	// only with Cmd.
+	Isolate bool `yaml:"isolate,omitempty"`
 	// Agent, when set, runs the named managed gitmoot agent for this stage instead
 	// of a shell command (#757). The agent runs as a LEAF: it may only ask/review
 	// (read-only) and its delegations are stripped. Mutually exclusive with Cmd.

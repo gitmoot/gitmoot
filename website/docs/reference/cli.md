@@ -1978,6 +1978,7 @@ stages:                     # the DAG, keyed by unique id and wired by needs
     env_keys: [SOURCE_API_TOKEN]
   - id: score
     cmd: "python score.py data.json"
+    isolate: true          # optional shell-only detached read-only worktree
     needs: [source]         # runs only after source SUCCEEDS
   - id: triage              # #757: an AGENT stage (exactly one of cmd|agent)
     agent: reply-triager    #   an existing managed agent, run as a read-only leaf
@@ -2061,6 +2062,14 @@ coordinator that fans out owned children and folds the synthesis); and **gate** 
 implement stage's PR merges). A read-only stage's `needs` result summaries are prepended
 to its prompt, and a repo-bound read-only agent stage runs in its own detached
 read-only worktree so same-repo stages parallelize without touching the live checkout.
+A non-service shell stage can opt in with `isolate: true`; it then runs in a
+disposable detached read-only committed-tip worktree. Default `false` preserves the
+shared checkout. Allocation failure records `readonly_worktree_skipped` and falls
+back to that checkout; success adds `GITMOOT_CHECKOUT=<live-checkout>` to the shell
+environment. This removes checkout-lock serialization for stages with different
+commands. **Known v1 limitation (tracked follow-up):** identical commands retain the same
+shell runtime-session key and serialize. The field is rejected on agent/gate stages,
+while service shell stages retain unconditional fail-closed isolation.
 For shell-stage API credentials, set an absolute pipeline `env_file` and list
 exact names or globs in each stage's `env_keys`. The file must be a regular,
 operator-owned `0600` file outside Gitmoot state and managed checkouts; inline
