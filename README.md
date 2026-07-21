@@ -18,6 +18,10 @@
 
 ## Built with Codex (OpenAI Build Week 2026)
 
+**The Build Week submission is one feature of this repo: [Gitmoot Pipelines](https://gitmoot.io/docs/workflows/pipelines-workflow)**,
+agent graphs saved as yaml files that you can rerun, inspect, share, and expose as a typed
+service API with verifiable receipts. Start there if you came from Devpost.
+
 The Pipelines-as-a-Service layer (`pipeline expose` / `serve`, typed input firewall, public
 receipts) and the proof spine were implemented by **Codex running gpt-5.6-sol**, coordinated
 through gitmoot itself. Gitmoot mints receipts for its own implementation jobs, so the
