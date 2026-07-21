@@ -36,7 +36,7 @@ stages:
     success_decisions: [approved]
 `
 
-func settleBoundImplementStageJob(t *testing.T, store *db.Store, jobID, decision string, binding pipelineStagePRBinding) {
+func settleBoundImplementStageJob(t *testing.T, store *db.Store, jobID, decision string, binding pipeline.PipelineStagePRBinding) {
 	t.Helper()
 	ctx := context.Background()
 	job, err := store.GetJob(ctx, jobID)
@@ -90,7 +90,7 @@ func TestPipelineSourceReviewBindingAndFanoutSuppression(t *testing.T) {
 		t.Fatal("implement stage with downstream source-bound review did not suppress native review fan-out")
 	}
 
-	want := pipelineStagePRBinding{PullRequest: 813, HeadSHA: "head-813", Branch: "feat/813", TaskID: "task-813", LeadAgent: "coder"}
+	want := pipeline.PipelineStagePRBinding{PullRequest: 813, HeadSHA: "head-813", Branch: "feat/813", TaskID: "task-813", LeadAgent: "coder"}
 	settleBoundImplementStageJob(t, store, impl.JobID, "implemented", want)
 	run = advance(t, store, rec, spec, enqueue, run, now.Add(time.Second))
 
@@ -185,7 +185,7 @@ stages:
 	if second.Attempt != 1 || second.JobID == first.JobID {
 		t.Fatalf("retry row = %+v, first=%+v", second, first)
 	}
-	want := pipelineStagePRBinding{PullRequest: 814, HeadSHA: "retry-head", Branch: "feat/retry", TaskID: "task-retry", LeadAgent: "coder"}
+	want := pipeline.PipelineStagePRBinding{PullRequest: 814, HeadSHA: "retry-head", Branch: "feat/retry", TaskID: "task-retry", LeadAgent: "coder"}
 	settleBoundImplementStageJob(t, store, second.JobID, "implemented", want)
 	run = advance(t, store, rec, spec, enqueue, run, now.Add(2*time.Second))
 	reviewJob, err := store.GetJob(ctx, stageRow(t, store, run.ID, "review").JobID)
@@ -219,7 +219,7 @@ func TestPipelineSourceReviewNoPRParksBlocked(t *testing.T) {
 			now := time.Date(2026, 7, 10, 11, 0, 0, 0, time.UTC)
 			run := startTestRun(t, store, rec, spec, enqueue, now)
 			impl := stageRow(t, store, run.ID, "impl")
-			settleBoundImplementStageJob(t, store, impl.JobID, tc.decision, pipelineStagePRBinding{})
+			settleBoundImplementStageJob(t, store, impl.JobID, tc.decision, pipeline.PipelineStagePRBinding{})
 			if tc.addEvent {
 				if err := store.AddJobEvent(ctx, db.JobEvent{JobID: impl.JobID, Kind: "advance_skipped_no_pr", Message: "no PR"}); err != nil {
 					t.Fatalf("AddJobEvent: %v", err)
@@ -275,7 +275,7 @@ func TestPipelineSourceReviewWorktreePinnedToBoundHead(t *testing.T) {
 	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
 	run := startTestRun(t, store, rec, spec, enqueue, now)
 	impl := stageRow(t, store, run.ID, "impl")
-	settleBoundImplementStageJob(t, store, impl.JobID, "implemented", pipelineStagePRBinding{PullRequest: 813, HeadSHA: head, Branch: "feat-813", TaskID: "task-813", LeadAgent: "coder"})
+	settleBoundImplementStageJob(t, store, impl.JobID, "implemented", pipeline.PipelineStagePRBinding{PullRequest: 813, HeadSHA: head, Branch: "feat-813", TaskID: "task-813", LeadAgent: "coder"})
 	run = advance(t, store, rec, spec, enqueue, run, now.Add(time.Second))
 	reviewJob, err := store.GetJob(ctx, stageRow(t, store, run.ID, "review").JobID)
 	if err != nil {
@@ -338,7 +338,7 @@ func TestPipelineSourceReviewEnqueueReplayAdoptsExistingJob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HeadSHA(impl): %v", err)
 	}
-	settleBoundImplementStageJob(t, store, implJob.ID, "implemented", pipelineStagePRBinding{
+	settleBoundImplementStageJob(t, store, implJob.ID, "implemented", pipeline.PipelineStagePRBinding{
 		PullRequest: 813,
 		HeadSHA:     head,
 		Branch:      implPayload.Branch,
@@ -359,7 +359,7 @@ func TestPipelineSourceReviewEnqueueReplayAdoptsExistingJob(t *testing.T) {
 		}
 		return job, err
 	}
-	if _, err := advancePipelineRun(faultCtx, store, faultEnqueue, rec, spec, run, now.Add(time.Second)); err == nil {
+	if _, err := pipeline.AdvancePipelineRun(faultCtx, store, faultEnqueue, rec, spec, run, now.Add(time.Second)); err == nil {
 		t.Fatal("fault-injected advance returned nil; want cancelled stage-row persist")
 	}
 	if enqueueCalls != 1 {
@@ -397,7 +397,7 @@ func TestPipelineSourceReviewEnqueueReplayAdoptsExistingJob(t *testing.T) {
 		replayEnqueueCalls++
 		return productionEnqueue(ctx, request)
 	}
-	run, err = advancePipelineRun(ctx, store, replayEnqueue, rec, spec, run, now.Add(2*time.Second))
+	run, err = pipeline.AdvancePipelineRun(ctx, store, replayEnqueue, rec, spec, run, now.Add(2*time.Second))
 	if err != nil {
 		t.Fatalf("replay advance: %v", err)
 	}
@@ -424,7 +424,7 @@ func TestPipelineSourceReviewEnqueueReplayAdoptsExistingJob(t *testing.T) {
 
 	// Once row and job agree, another scan is a strict no-op for enqueue.
 	before := reviewRow
-	run, err = advancePipelineRun(ctx, store, replayEnqueue, rec, spec, run, now.Add(3*time.Second))
+	run, err = pipeline.AdvancePipelineRun(ctx, store, replayEnqueue, rec, spec, run, now.Add(3*time.Second))
 	if err != nil {
 		t.Fatalf("consistent rescan: %v", err)
 	}
@@ -490,7 +490,7 @@ stages:
 			if err != nil {
 				t.Fatalf("HeadSHA(impl): %v", err)
 			}
-			binding := pipelineStagePRBinding{PullRequest: 813, HeadSHA: head, Branch: implPayload.Branch, TaskID: implPayload.TaskID, LeadAgent: "coder"}
+			binding := pipeline.PipelineStagePRBinding{PullRequest: 813, HeadSHA: head, Branch: implPayload.Branch, TaskID: implPayload.TaskID, LeadAgent: "coder"}
 			settleBoundImplementStageJob(t, store, implJob.ID, "implemented", binding)
 			run = advance(t, store, rec, spec, enqueue, run, now.Add(time.Second))
 

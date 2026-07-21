@@ -207,8 +207,8 @@ func TestPipelineSlowShellStageProgressE2E(t *testing.T) {
 	runID := strings.TrimSpace(out.String())
 	stage := stageRow(t, store, runID, "slow")
 	worker := defaultJobWorker(store, io.Discard, home)
-	worker.ProgressThreshold = 5 * time.Millisecond
-	worker.ProgressInterval = 5 * time.Millisecond
+	worker.PipelineProgressThreshold = 5 * time.Millisecond
+	worker.PipelineProgressInterval = 5 * time.Millisecond
 	workerDone := make(chan error, 1)
 	go func() {
 		workerDone <- runEnabledRepoWorkerTicks(ctx, store, worker, 1, io.Discard, time.Now().UTC())

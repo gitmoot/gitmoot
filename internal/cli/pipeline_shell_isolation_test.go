@@ -20,7 +20,7 @@ func TestPipelineShellIsolationRequestMarker(t *testing.T) {
 	rec := db.Pipeline{Name: "shell-isolation", Repo: "owner/repo"}
 	stage := pipeline.Stage{ID: "run", Cmd: "printf ok", Isolate: true}
 
-	manual := pipelineStageJobRequest(rec, stage, db.PipelineRun{ID: "manual-run", Trigger: "manual"}, 0, "", pipelineStagePRBinding{}, false)
+	manual := pipeline.PipelineStageJobRequest(rec, stage, db.PipelineRun{ID: "manual-run", Trigger: "manual"}, 0, "", pipeline.PipelineStagePRBinding{}, false)
 	if !manual.IsolateShellStage {
 		t.Fatal("manual isolate:true shell stage did not carry its enqueue-only isolation marker")
 	}
@@ -28,12 +28,12 @@ func TestPipelineShellIsolationRequestMarker(t *testing.T) {
 		t.Fatalf("GITMOOT_CHECKOUT was injected before worktree allocation: %q", got)
 	}
 
-	legacy := pipelineStageJobRequest(rec, pipeline.Stage{ID: "run", Cmd: "printf ok"}, db.PipelineRun{ID: "legacy-run", Trigger: "manual"}, 0, "", pipelineStagePRBinding{}, false)
+	legacy := pipeline.PipelineStageJobRequest(rec, pipeline.Stage{ID: "run", Cmd: "printf ok"}, db.PipelineRun{ID: "legacy-run", Trigger: "manual"}, 0, "", pipeline.PipelineStagePRBinding{}, false)
 	if legacy.IsolateShellStage || legacy.ReadOnlyWorktree || legacy.WorktreePath != "" {
 		t.Fatalf("default shell request changed from shared-checkout shape: %+v", legacy)
 	}
 
-	service := pipelineStageJobRequest(rec, stage, db.PipelineRun{ID: "service-run", Trigger: "service"}, 0, "", pipelineStagePRBinding{}, false)
+	service := pipeline.PipelineStageJobRequest(rec, stage, db.PipelineRun{ID: "service-run", Trigger: "service"}, 0, "", pipeline.PipelineStagePRBinding{}, false)
 	if service.IsolateShellStage {
 		t.Fatal("service shell stage entered the non-service fail-open isolation path")
 	}
@@ -42,11 +42,11 @@ func TestPipelineShellIsolationRequestMarker(t *testing.T) {
 func TestPipelineShellIsolationUnmanagedRepoFallsBackSilently(t *testing.T) {
 	ctx := context.Background()
 	home, _, store := heartbeatLoopE2EHome(t)
-	request := pipelineStageJobRequest(
+	request := pipeline.PipelineStageJobRequest(
 		db.Pipeline{Name: "shell-unmanaged", Repo: "owner/unmanaged"},
 		pipeline.Stage{ID: "run", Cmd: "printf ok", Isolate: true},
 		db.PipelineRun{ID: "unmanaged-run", Trigger: "manual"},
-		0, "", pipelineStagePRBinding{}, false,
+		0, "", pipeline.PipelineStagePRBinding{}, false,
 	)
 	job, err := newPipelineStageEnqueuer(store, home)(ctx, request)
 	if err != nil {

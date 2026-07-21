@@ -263,25 +263,14 @@ func pipelineRunStageIDsMatchSpec(spec pipeline.Spec, rows []db.PipelineRunStage
 }
 
 func dashboardPipelineKeys(ctx context.Context, store *db.Store, home string, spec pipeline.Spec) (dashboard.PipelineKeys, error) {
-	inspection := classifyPipelineEnvFile(ctx, store, home, spec.EnvFile)
+	inspection, resolution, err := pipeline.InspectPipelineEnvironment(ctx, store, home, spec)
 	out := dashboard.PipelineKeys{
 		EnvFile: dashboard.PipelineEnvFileStatus{Path: inspection.Path, Status: inspection.Status},
 		Stages:  make([]dashboard.PipelineStageKeys, 0, len(spec.Stages)),
 	}
-
-	sharedCandidates, err := pipelineSharedKeyCandidates(ctx, store, spec, inspection.Names)
 	if err != nil {
 		return dashboard.PipelineKeys{}, err
 	}
-	availableShared := pipelineSharedKeys{pipeline: map[string]db.KeychainKey{}, agents: map[string]map[string]db.KeychainKey{}}
-	if sharedCandidates.any() {
-		// Keychain drift is advisory on this read-only endpoint. A missing or invalid
-		// file makes shared selectors unresolved; delivery remains fail-closed.
-		if names, loadErr := loadValidatedKeychainNames(ctx, store, home); loadErr == nil {
-			availableShared = sharedCandidates.available(names)
-		}
-	}
-	resolution := projectPipelineEnvironment(spec, inspection.Names, availableShared)
 	for _, stage := range spec.Stages {
 		row := dashboard.PipelineStageKeys{
 			ID:                  stage.ID,

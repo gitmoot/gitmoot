@@ -1,18 +1,16 @@
-package cli
+package pipeline
 
 import (
 	"context"
 	"fmt"
+	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/daemon"
+	"github.com/gitmoot/gitmoot/internal/db"
+	yaml "gopkg.in/yaml.v3"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/daemon"
-	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
-	yaml "gopkg.in/yaml.v3"
 )
 
 const (
@@ -24,31 +22,31 @@ const (
 	defaultMemoryPipelineBinEnv                  = "GITMOOT_PIPELINE_BIN"
 )
 
-type defaultPipelineInstallResult struct {
+type DefaultPipelineInstallResult struct {
 	Installed []string
 	Skipped   []string
 }
 
 type defaultPipelineDefinition struct {
 	name    string
-	spec    pipeline.Spec
+	spec    Spec
 	enabled bool
 }
 
-func installDefaultMemoryPipelines(ctx context.Context, store *db.Store, paths config.Paths, rawHome string) (defaultPipelineInstallResult, error) {
+func InstallDefaultMemoryPipelines(ctx context.Context, store *db.Store, paths config.Paths, rawHome string) (DefaultPipelineInstallResult, error) {
 	settings, err := config.LoadMemoryPipelineSettings(paths)
 	if err != nil {
-		return defaultPipelineInstallResult{}, err
+		return DefaultPipelineInstallResult{}, err
 	}
 	repo, err := defaultMemoryPipelineRepo(ctx, store, settings)
 	if err != nil {
-		return defaultPipelineInstallResult{}, err
+		return DefaultPipelineInstallResult{}, err
 	}
 	definitions := []defaultPipelineDefinition{
 		renderMemoryIngestSweepPipeline(settings, paths, rawHome, repo),
 		renderMemoryGroomProposePipeline(settings, paths, rawHome, repo),
 	}
-	var result defaultPipelineInstallResult
+	var result DefaultPipelineInstallResult
 	for _, def := range definitions {
 		_, found, err := store.GetPipeline(ctx, def.name)
 		if err != nil {
@@ -62,7 +60,7 @@ func installDefaultMemoryPipelines(ctx context.Context, store *db.Store, paths c
 		if err != nil {
 			return result, fmt.Errorf("render default pipeline %s: %w", def.name, err)
 		}
-		loaded, err := pipeline.Load(raw)
+		loaded, err := Load(raw)
 		if err != nil {
 			return result, fmt.Errorf("validate default pipeline %s: %w", def.name, err)
 		}
@@ -70,7 +68,7 @@ func installDefaultMemoryPipelines(ctx context.Context, store *db.Store, paths c
 			Name:     loaded.Name,
 			Repo:     loaded.Repo,
 			SpecYAML: string(raw),
-			SpecHash: pipeline.Hash(raw),
+			SpecHash: Hash(raw),
 			Enabled:  def.enabled,
 		}
 		if loaded.Schedule != nil {
@@ -80,7 +78,7 @@ func installDefaultMemoryPipelines(ctx context.Context, store *db.Store, paths c
 		if err := store.CreateOrUpdatePipeline(ctx, record); err != nil {
 			return result, err
 		}
-		if err := store.UpsertAgent(ctx, pipelineRunnerAgent(pipelineRunnerAgentName(loaded.Name), loaded.Repo)); err != nil {
+		if err := store.UpsertAgent(ctx, PipelineRunnerAgent(pipelineRunnerAgentName(loaded.Name), loaded.Repo)); err != nil {
 			return result, err
 		}
 		result.Installed = append(result.Installed, loaded.Name)
@@ -88,8 +86,8 @@ func installDefaultMemoryPipelines(ctx context.Context, store *db.Store, paths c
 	return result, nil
 }
 
-func installDefaultMemoryPipelinesForDaemon(ctx context.Context, store *db.Store, paths config.Paths, rawHome string, stdout io.Writer) {
-	result, err := installDefaultMemoryPipelines(ctx, store, paths, rawHome)
+func InstallDefaultMemoryPipelinesForDaemon(ctx context.Context, store *db.Store, paths config.Paths, rawHome string, stdout io.Writer) {
+	result, err := InstallDefaultMemoryPipelines(ctx, store, paths, rawHome)
 	if err != nil {
 		writeLine(stdout, "default memory pipeline install error: %s", err)
 		return
@@ -129,30 +127,30 @@ func defaultMemoryPipelineRepo(ctx context.Context, store *db.Store, settings co
 }
 
 func renderMemoryIngestSweepPipeline(settings config.MemoryPipelineSettings, paths config.Paths, rawHome string, repo string) defaultPipelineDefinition {
-	spec := pipeline.Spec{
+	spec := Spec{
 		Name:        defaultMemoryIngestSweepPipeline,
 		Repo:        repo,
 		Group:       defaultMemoryPipelineGroup,
 		Description: defaultMemoryIngestSweepPipelineDescription,
-		Stages: []pipeline.Stage{
+		Stages: []Stage{
 			{ID: "sweep", Cmd: memoryIngestSweepStageCommand(paths, rawHome)},
 			{ID: "summarize", Cmd: memoryIngestSummaryStageCommand(paths), Needs: []string{"sweep"}},
 		},
 	}
 	enabled := settings.IngestSweepInterval != ""
 	if enabled {
-		spec.Schedule = &pipeline.Schedule{Interval: settings.IngestSweepInterval, Jitter: settings.IngestSweepJitter}
+		spec.Schedule = &Schedule{Interval: settings.IngestSweepInterval, Jitter: settings.IngestSweepJitter}
 	}
 	return defaultPipelineDefinition{name: spec.Name, spec: spec, enabled: enabled}
 }
 
 func renderMemoryGroomProposePipeline(settings config.MemoryPipelineSettings, paths config.Paths, rawHome string, repo string) defaultPipelineDefinition {
-	spec := pipeline.Spec{
+	spec := Spec{
 		Name:        defaultMemoryGroomProposePipeline,
 		Repo:        repo,
 		Group:       defaultMemoryPipelineGroup,
 		Description: defaultMemoryGroomProposePipelineDescription,
-		Stages: []pipeline.Stage{
+		Stages: []Stage{
 			{ID: "split", Cmd: memoryGroomSplitStageCommand(paths, rawHome)},
 			{ID: "propose", Cmd: memoryGroomProposeStageCommand(paths, rawHome), Needs: []string{"split"}},
 			{ID: "summarize", Cmd: memoryGroomSummaryStageCommand(paths), Needs: []string{"propose"}},
@@ -160,7 +158,7 @@ func renderMemoryGroomProposePipeline(settings config.MemoryPipelineSettings, pa
 	}
 	enabled := settings.GroomProposeInterval != ""
 	if enabled {
-		spec.Schedule = &pipeline.Schedule{Interval: settings.GroomProposeInterval, Jitter: settings.GroomProposeJitter}
+		spec.Schedule = &Schedule{Interval: settings.GroomProposeInterval, Jitter: settings.GroomProposeJitter}
 	}
 	return defaultPipelineDefinition{name: spec.Name, spec: spec, enabled: enabled}
 }
@@ -310,11 +308,4 @@ func memoryPipelineShellQuote(value string) string {
 		return "''"
 	}
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
-}
-
-func installDefaultsEnabledLabel(enabled bool) string {
-	if enabled {
-		return "enabled"
-	}
-	return "manual-only"
 }

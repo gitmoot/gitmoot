@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/proof"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -47,7 +48,7 @@ func runProof(args []string, stdout, stderr io.Writer) int {
 
 	var manifest proof.Manifest
 	if *verify {
-		verified, verifyErr := verifyPipelineRunFromStore(context.Background(), store, paths, rootID)
+		verified, verifyErr := pipeline.VerifyPipelineRunFromStore(context.Background(), store, paths, rootID)
 		err = verifyErr
 		manifest = verified.Manifest
 	} else {

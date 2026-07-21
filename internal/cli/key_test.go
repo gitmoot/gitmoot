@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/pipeline"
 )
 
 const keychainSentinel = "keychain-sentinel-value-874"
@@ -281,9 +282,9 @@ func TestKeychainFileValidationMatchesPipelineEnvFile(t *testing.T) {
 func TestKeychainFileWrongOwner(t *testing.T) {
 	home, _, store := heartbeatLoopE2EHome(t)
 	writeDefaultKeychain(t, home, "TOKEN="+keychainSentinel+"\n")
-	original := pipelineEnvCurrentUID
-	pipelineEnvCurrentUID = func() uint32 { return original() + 1 }
-	t.Cleanup(func() { pipelineEnvCurrentUID = original })
+	original := pipeline.PipelineEnvCurrentUID
+	pipeline.PipelineEnvCurrentUID = func() uint32 { return original() + 1 }
+	t.Cleanup(func() { pipeline.PipelineEnvCurrentUID = original })
 	_, _, err := loadValidatedKeychainFile(context.Background(), store, home)
 	if err == nil || !strings.Contains(err.Error(), "owned by uid") || strings.Contains(err.Error(), keychainSentinel) {
 		t.Fatalf("wrong-owner error=%v", err)

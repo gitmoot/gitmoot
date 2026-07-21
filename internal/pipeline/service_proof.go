@@ -1,4 +1,4 @@
-package cli
+package pipeline
 
 import (
 	"context"
@@ -15,14 +15,17 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/proof"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 const pipelineServiceRunsDir = "pipeline-service-runs"
 
+const PipelineServiceRunsDir = pipelineServiceRunsDir
+
 var pipelineServiceRunIDPattern = regexp.MustCompile(`^psr-[0-9a-f]{32}$`)
+
+var PipelineServiceRunIDPattern = pipelineServiceRunIDPattern
 
 type pipelineStoredOutcomeVerification struct {
 	Version             int    `json:"version"`
@@ -38,7 +41,7 @@ type pipelineStoredOutcomeVerification struct {
 	VerifiedAt          string `json:"verified_at"`
 }
 
-type verifiedPipelineRunProof struct {
+type VerifiedPipelineRunProof struct {
 	Manifest     proof.Manifest
 	Verification pipelineStoredOutcomeVerification
 	Run          db.PipelineRun
@@ -46,7 +49,7 @@ type verifiedPipelineRunProof struct {
 	Artifacts    []proof.ArtifactEvidence
 }
 
-func pipelineServiceRunPaths(paths config.Paths, runID string) (root, base, sourceSpec, archive string, err error) {
+func PipelineServiceRunPaths(paths config.Paths, runID string) (root, base, sourceSpec, archive string, err error) {
 	runID = strings.TrimSpace(runID)
 	if !pipelineServiceRunIDPattern.MatchString(runID) {
 		return "", "", "", "", fmt.Errorf("invalid service run id %q", runID)
@@ -58,112 +61,112 @@ func pipelineServiceRunPaths(paths config.Paths, runID string) (root, base, sour
 	return root, base, sourceSpec, archive, nil
 }
 
-// verifyPipelineRunFromStore checks only persisted Gitmoot state. It never runs
+// VerifyPipelineRunFromStore checks only persisted Gitmoot state. It never runs
 // a stage command, reads a transcript, or queries CI/GitHub.
-func verifyPipelineRunFromStore(ctx context.Context, store *db.Store, paths config.Paths, runID string) (verifiedPipelineRunProof, error) {
+func VerifyPipelineRunFromStore(ctx context.Context, store *db.Store, paths config.Paths, runID string) (VerifiedPipelineRunProof, error) {
 	serviceRun, ok, err := store.GetServiceRun(ctx, runID)
 	if err != nil {
-		return verifiedPipelineRunProof{}, err
+		return VerifiedPipelineRunProof{}, err
 	}
 	if !ok {
-		return verifiedPipelineRunProof{}, fmt.Errorf("unknown service pipeline run %q", runID)
+		return VerifiedPipelineRunProof{}, fmt.Errorf("unknown service pipeline run %q", runID)
 	}
 	run, ok, err := store.GetPipelineRun(ctx, runID)
 	if err != nil {
-		return verifiedPipelineRunProof{}, err
+		return VerifiedPipelineRunProof{}, err
 	}
 	if !ok || run.Trigger != "service" || run.Pipeline != serviceRun.PipelineName {
-		return verifiedPipelineRunProof{}, fmt.Errorf("service run %q has no consistent pipeline run", runID)
+		return VerifiedPipelineRunProof{}, fmt.Errorf("service run %q has no consistent pipeline run", runID)
 	}
-	if run.State != pipeline.RunSucceeded || run.FinishedAt.IsZero() {
-		return verifiedPipelineRunProof{}, fmt.Errorf("pipeline run %q is %s, not succeeded", runID, emptyProofValue(run.State))
+	if run.State != RunSucceeded || run.FinishedAt.IsZero() {
+		return VerifiedPipelineRunProof{}, fmt.Errorf("pipeline run %q is %s, not succeeded", runID, emptyProofValue(run.State))
 	}
-	_, _, sourceSpecPath, _, err := pipelineServiceRunPaths(paths, runID)
+	_, _, sourceSpecPath, _, err := PipelineServiceRunPaths(paths, runID)
 	if err != nil {
-		return verifiedPipelineRunProof{}, err
+		return VerifiedPipelineRunProof{}, err
 	}
 	rawSpec, err := os.ReadFile(sourceSpecPath)
 	if err != nil {
-		return verifiedPipelineRunProof{}, fmt.Errorf("read frozen run spec: %w", err)
+		return VerifiedPipelineRunProof{}, fmt.Errorf("read frozen run spec: %w", err)
 	}
-	if pipeline.Hash(rawSpec) != strings.TrimSpace(run.SpecHash) {
-		return verifiedPipelineRunProof{}, errors.New("frozen run spec hash does not match pipeline run")
+	if Hash(rawSpec) != strings.TrimSpace(run.SpecHash) {
+		return VerifiedPipelineRunProof{}, errors.New("frozen run spec hash does not match pipeline run")
 	}
-	spec, err := pipeline.Load(rawSpec)
+	spec, err := Load(rawSpec)
 	if err != nil {
-		return verifiedPipelineRunProof{}, fmt.Errorf("parse frozen run spec: %w", err)
+		return VerifiedPipelineRunProof{}, fmt.Errorf("parse frozen run spec: %w", err)
 	}
 	if spec.Name != run.Pipeline {
-		return verifiedPipelineRunProof{}, errors.New("frozen run spec pipeline name does not match run")
+		return VerifiedPipelineRunProof{}, errors.New("frozen run spec pipeline name does not match run")
 	}
 	stages, err := store.ListPipelineRunStages(ctx, runID)
 	if err != nil {
-		return verifiedPipelineRunProof{}, err
+		return VerifiedPipelineRunProof{}, err
 	}
 	byStage := make(map[string]db.PipelineRunStage, len(stages))
 	for _, stage := range stages {
 		if _, duplicate := byStage[stage.StageID]; duplicate {
-			return verifiedPipelineRunProof{}, fmt.Errorf("duplicate stored stage %q", stage.StageID)
+			return VerifiedPipelineRunProof{}, fmt.Errorf("duplicate stored stage %q", stage.StageID)
 		}
 		byStage[stage.StageID] = stage
 	}
 	if len(byStage) != len(spec.Stages) {
-		return verifiedPipelineRunProof{}, fmt.Errorf("stage count mismatch: stored=%d frozen=%d", len(byStage), len(spec.Stages))
+		return VerifiedPipelineRunProof{}, fmt.Errorf("stage count mismatch: stored=%d frozen=%d", len(byStage), len(spec.Stages))
 	}
 
 	jobs, results, stageRoots, err := gatherPipelineProofJobs(ctx, store, stages)
 	if err != nil {
-		return verifiedPipelineRunProof{}, err
+		return VerifiedPipelineRunProof{}, err
 	}
 	jobsByID := make(map[string]db.Job, len(jobs))
 	resultHashesChecked := 0
 	for _, job := range jobs {
 		jobsByID[job.ID] = job
 		if job.State != string(workflow.JobSucceeded) {
-			return verifiedPipelineRunProof{}, fmt.Errorf("job %q has non-success terminal state %q", job.ID, job.State)
+			return VerifiedPipelineRunProof{}, fmt.Errorf("job %q has non-success terminal state %q", job.ID, job.State)
 		}
 		if results[job.ID] == nil {
-			return verifiedPipelineRunProof{}, fmt.Errorf("job %q has no structured result", job.ID)
+			return VerifiedPipelineRunProof{}, fmt.Errorf("job %q has no structured result", job.ID)
 		}
 		if strings.TrimSpace(job.ResultHash) != "" {
 			resultHashesChecked++
 			if !proof.StoredResultHashMatches(job.Payload, job.ResultHash) {
-				return verifiedPipelineRunProof{}, fmt.Errorf("job %q result_hash does not match stored result", job.ID)
+				return VerifiedPipelineRunProof{}, fmt.Errorf("job %q result_hash does not match stored result", job.ID)
 			}
 		}
 	}
 	for _, stageSpec := range spec.Stages {
 		row, ok := byStage[stageSpec.ID]
 		if !ok {
-			return verifiedPipelineRunProof{}, fmt.Errorf("frozen stage %q has no stored row", stageSpec.ID)
+			return VerifiedPipelineRunProof{}, fmt.Errorf("frozen stage %q has no stored row", stageSpec.ID)
 		}
-		if row.State != pipeline.StageSucceeded && row.State != pipeline.StageSkipped {
-			return verifiedPipelineRunProof{}, fmt.Errorf("stage %q is %q, not succeeded/skipped", stageSpec.ID, row.State)
+		if row.State != StageSucceeded && row.State != StageSkipped {
+			return VerifiedPipelineRunProof{}, fmt.Errorf("stage %q is %q, not succeeded/skipped", stageSpec.ID, row.State)
 		}
-		if row.State == pipeline.StageSkipped {
+		if row.State == StageSkipped {
 			continue
 		}
 		expectedJobID := pipelineStageJobID(runID, stageSpec.ID, row.Attempt)
 		if row.JobID != expectedJobID {
-			return verifiedPipelineRunProof{}, fmt.Errorf("stage %q job id %q does not match expected %q", stageSpec.ID, row.JobID, expectedJobID)
+			return VerifiedPipelineRunProof{}, fmt.Errorf("stage %q job id %q does not match expected %q", stageSpec.ID, row.JobID, expectedJobID)
 		}
 		job, ok := jobsByID[row.JobID]
 		if !ok || job.State != string(workflow.JobSucceeded) || results[row.JobID] == nil {
-			return verifiedPipelineRunProof{}, fmt.Errorf("stage %q lacks its succeeded terminal job and result", stageSpec.ID)
+			return VerifiedPipelineRunProof{}, fmt.Errorf("stage %q lacks its succeeded terminal job and result", stageSpec.ID)
 		}
 		payload, err := workflow.ParseJobPayload(job.Payload)
 		if err != nil {
-			return verifiedPipelineRunProof{}, fmt.Errorf("stage %q payload is unparseable: %w", stageSpec.ID, err)
+			return VerifiedPipelineRunProof{}, fmt.Errorf("stage %q payload is unparseable: %w", stageSpec.ID, err)
 		}
 		expectedInputEnv := pipelineServiceInputEnvironment(run.PayloadJSON)
 		if !equalServiceStringSlices(payload.PipelineInputEnv, expectedInputEnv) {
-			return verifiedPipelineRunProof{}, fmt.Errorf("stage %q typed input environment does not match admitted payload", stageSpec.ID)
+			return VerifiedPipelineRunProof{}, fmt.Errorf("stage %q typed input environment does not match admitted payload", stageSpec.ID)
 		}
 		if strings.Contains(payload.Instructions, run.PayloadJSON) {
-			return verifiedPipelineRunProof{}, fmt.Errorf("stage %q instructions contain the admitted input payload", stageSpec.ID)
+			return VerifiedPipelineRunProof{}, fmt.Errorf("stage %q instructions contain the admitted input payload", stageSpec.ID)
 		}
 		if !serviceContainsString(spec.EffectiveSuccessDecisions(stageSpec), results[row.JobID].Decision) {
-			return verifiedPipelineRunProof{}, fmt.Errorf("stage %q result decision %q is not a success decision", stageSpec.ID, results[row.JobID].Decision)
+			return VerifiedPipelineRunProof{}, fmt.Errorf("stage %q result decision %q is not a success decision", stageSpec.ID, results[row.JobID].Decision)
 		}
 	}
 
@@ -171,30 +174,30 @@ func verifyPipelineRunFromStore(ctx context.Context, store *db.Store, paths conf
 	root, normalized := normalizePipelineProofJobs(run, jobs, stageRoots, asOf)
 	structured := proof.Project(root, normalized, results, nil, nil)
 	if err := proof.VerifyManifest(structured); err != nil {
-		return verifiedPipelineRunProof{}, fmt.Errorf("verify stored pipeline job DAG: %w", err)
+		return VerifiedPipelineRunProof{}, fmt.Errorf("verify stored pipeline job DAG: %w", err)
 	}
 	publicJobs, publicResults := sanitizePipelineProofJobs(normalized, results)
 	publicManifest := proof.Project(root, publicJobs, publicResults, nil, nil)
-	artifacts, err := loadPipelineServiceArtifacts(paths, runID)
+	artifacts, err := LoadPipelineServiceArtifacts(paths, runID)
 	if err != nil {
-		return verifiedPipelineRunProof{}, err
+		return VerifiedPipelineRunProof{}, err
 	}
 	publicManifest, err = proof.WithArtifactNodes(publicManifest, artifacts, asOf)
 	if err != nil {
-		return verifiedPipelineRunProof{}, fmt.Errorf("bind collected artifacts into proof: %w", err)
+		return VerifiedPipelineRunProof{}, fmt.Errorf("bind collected artifacts into proof: %w", err)
 	}
 	publicManifest, err = proof.WithVerifiedRootClaim(publicManifest,
 		"stored_pipeline_outcome", "pipeline_run", run.ID, asOf,
 		map[string]string{"pipeline": run.Pipeline, "run_state": run.State, "verification_kind": "stored_pipeline_outcome"})
 	if err != nil {
-		return verifiedPipelineRunProof{}, fmt.Errorf("verify public pipeline manifest: %w", err)
+		return VerifiedPipelineRunProof{}, fmt.Errorf("verify public pipeline manifest: %w", err)
 	}
 	verification := pipelineStoredOutcomeVerification{
 		Version: 1, Kind: "stored_pipeline_outcome", RunID: run.ID, Pipeline: run.Pipeline,
 		State: run.State, StagesChecked: len(stages), JobsChecked: len(jobs),
 		ResultHashesChecked: resultHashesChecked, ManifestVerified: true, OutcomeAsOf: asOf,
 	}
-	return verifiedPipelineRunProof{Manifest: publicManifest, Verification: verification, Run: run, Stages: stages, Artifacts: artifacts}, nil
+	return VerifiedPipelineRunProof{Manifest: publicManifest, Verification: verification, Run: run, Stages: stages, Artifacts: artifacts}, nil
 }
 
 func gatherPipelineProofJobs(ctx context.Context, store *db.Store, stages []db.PipelineRunStage) ([]db.Job, map[string]*workflow.AgentResult, map[string]string, error) {

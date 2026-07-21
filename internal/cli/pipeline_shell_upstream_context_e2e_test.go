@@ -15,6 +15,21 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
+const maxPipelineShellUpstreamSummaryBytes = 16 * 1024
+
+type pipelineShellUpstreamContext struct {
+	SchemaVersion int                                   `json:"schema_version"`
+	Complete      bool                                  `json:"complete"`
+	Stages        map[string]pipelineShellUpstreamStage `json:"stages"`
+}
+
+type pipelineShellUpstreamStage struct {
+	ID               string `json:"id"`
+	State            string `json:"state"`
+	Summary          string `json:"summary"`
+	SummaryTruncated bool   `json:"summary_truncated"`
+}
+
 func TestPipelineShellStageUpstreamContextE2E(t *testing.T) {
 	const extractSummary = "arxiv record one\narxiv record two with `ticks` and \"quotes\""
 	const downstreamSummary = "round-trip: arxiv record one\narxiv record two with `ticks` and \"quotes\""

@@ -136,7 +136,7 @@ func (d *webDataSource) loadPublicPipelineReceipt(ctx context.Context, runID str
 }
 
 func pipelineServiceReceiptArchivePath(paths config.Paths, runID string) (string, error) {
-	root, _, _, _, err := pipelineServiceRunPaths(paths, runID)
+	root, _, _, _, err := pipeline.PipelineServiceRunPaths(paths, runID)
 	if err != nil {
 		return "", err
 	}

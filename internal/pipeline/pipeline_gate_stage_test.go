@@ -1,12 +1,13 @@
-package cli
+package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // markPipelinePRMerged records (or updates) a PR in the store's pull_requests table
@@ -23,6 +24,31 @@ func markPipelinePRMerged(t *testing.T, store *db.Store, repo string, number int
 		State:        state,
 	}); err != nil {
 		t.Fatalf("UpsertPullRequest(%s#%d, %s): %v", repo, number, state, err)
+	}
+}
+
+func settleImplementStageJob(t *testing.T, store *db.Store, jobID, decision, summary string, pr int) {
+	t.Helper()
+	ctx := context.Background()
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob(%s): %v", jobID, err)
+	}
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload: %v", err)
+	}
+	payload.Result = &workflow.AgentResult{Decision: decision, Summary: summary}
+	payload.PullRequest = pr
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	to := jobStateForDecision(decision)
+	ok, err := store.TransitionJobStatePayloadWithEvent(ctx, jobID, job.State, to, string(encoded),
+		db.JobEvent{JobID: jobID, Kind: to, Message: "settled by test"})
+	if err != nil || !ok {
+		t.Fatalf("settle %s -> %s: ok=%v err=%v", jobID, to, ok, err)
 	}
 }
 
@@ -67,24 +93,24 @@ stages:
 	// The implement stage settles success WITH an opened PR (#42), so it folds succeeded
 	// and its summary carries "(opened PR #42)".
 	impl := stageRow(t, store, run.ID, "impl")
-	if impl.State != pipeline.StageQueued || impl.JobID == "" {
+	if impl.State != StageQueued || impl.JobID == "" {
 		t.Fatalf("impl stage = %+v, want queued with a job", impl)
 	}
 	settleImplementStageJob(t, store, impl.JobID, "implemented", "landed the fix", 42)
 	run = advance(t, store, rec, parsed, enqueue, run, now)
-	if got := stageRow(t, store, run.ID, "impl"); got.State != pipeline.StageSucceeded {
+	if got := stageRow(t, store, run.ID, "impl"); got.State != StageSucceeded {
 		t.Fatalf("impl stage = %s, want succeeded", got.State)
 	}
 
 	// The JOBLESS gate is now in-flight (marked queued in the ENQUEUE pass, with NO job).
 	gate := stageRow(t, store, run.ID, "wait")
-	if gate.State != pipeline.StageQueued {
+	if gate.State != StageQueued {
 		t.Fatalf("gate stage = %s, want queued (in-flight, jobless)", gate.State)
 	}
 	if gate.JobID != "" {
 		t.Fatalf("gate stage minted a job %q; a gate must be jobless", gate.JobID)
 	}
-	if got := stageRow(t, store, run.ID, "deploy"); got.State != pipeline.StagePending {
+	if got := stageRow(t, store, run.ID, "deploy"); got.State != StagePending {
 		t.Fatalf("deploy stage = %s, want pending (gate not satisfied)", got.State)
 	}
 
@@ -92,16 +118,16 @@ stages:
 	// deploy does not enqueue, and the run stays running.
 	run = advance(t, store, rec, parsed, enqueue, run, now)
 	gate = stageRow(t, store, run.ID, "wait")
-	if gate.State != pipeline.StageRunning {
+	if gate.State != StageRunning {
 		t.Fatalf("gate stage = %s, want running while the PR is unmerged", gate.State)
 	}
 	if gate.JobID != "" {
 		t.Fatalf("gate stage acquired a job %q while watching; a gate is jobless", gate.JobID)
 	}
-	if run.State != pipeline.RunRunning {
+	if run.State != RunRunning {
 		t.Fatalf("run = %s, want running while the gate waits on the merge", run.State)
 	}
-	if got := stageRow(t, store, run.ID, "deploy"); got.State != pipeline.StagePending {
+	if got := stageRow(t, store, run.ID, "deploy"); got.State != StagePending {
 		t.Fatalf("deploy stage = %s, want still pending while the gate waits", got.State)
 	}
 
@@ -110,18 +136,18 @@ stages:
 	markPipelinePRMerged(t, store, "owner/repo", 42, "merged")
 	run = advance(t, store, rec, parsed, enqueue, run, now)
 	gate = stageRow(t, store, run.ID, "wait")
-	if gate.State != pipeline.StageSucceeded {
+	if gate.State != StageSucceeded {
 		t.Fatalf("gate stage = %s, want succeeded once the PR merged", gate.State)
 	}
 	deploy := stageRow(t, store, run.ID, "deploy")
-	if deploy.State != pipeline.StageQueued || deploy.JobID == "" {
+	if deploy.State != StageQueued || deploy.JobID == "" {
 		t.Fatalf("deploy stage = %+v, want queued with a job after the gate folded", deploy)
 	}
 
 	// The run completes once the downstream deploy stage succeeds.
 	settleStageJob(t, store, deploy.JobID, "approved", "deployed", nil)
 	run = advance(t, store, rec, parsed, enqueue, run, now)
-	if run.State != pipeline.RunSucceeded {
+	if run.State != RunSucceeded {
 		t.Fatalf("run = %s, want succeeded", run.State)
 	}
 }
@@ -157,7 +183,7 @@ stages:
 
 	run = advance(t, store, rec, parsed, enqueue, run, now)
 	implDone := stageRow(t, store, run.ID, "impl")
-	if implDone.State != pipeline.StageSucceeded {
+	if implDone.State != StageSucceeded {
 		t.Fatalf("impl stage = %s, want succeeded", implDone.State)
 	}
 	if pipelineSummaryIsSkipped(implDone.Summary) {
@@ -166,16 +192,16 @@ stages:
 	if implDone.Summary != "landed the fix (opened PR #42)" {
 		t.Fatalf("impl summary = %q", implDone.Summary)
 	}
-	if got := stageRow(t, store, run.ID, "wait"); got.State != pipeline.StageQueued {
+	if got := stageRow(t, store, run.ID, "wait"); got.State != StageQueued {
 		t.Fatalf("gate stage = %s, want queued", got.State)
 	}
 
 	markPipelinePRMerged(t, store, "owner/repo", 42, "merged")
 	run = advance(t, store, rec, parsed, enqueue, run, now)
-	if got := stageRow(t, store, run.ID, "wait"); got.State != pipeline.StageSucceeded {
+	if got := stageRow(t, store, run.ID, "wait"); got.State != StageSucceeded {
 		t.Fatalf("gate stage = %s, want succeeded on the real merge", got.State)
 	}
-	if got := stageRow(t, store, run.ID, "deploy"); got.State != pipeline.StageQueued || got.JobID == "" {
+	if got := stageRow(t, store, run.ID, "deploy"); got.State != StageQueued || got.JobID == "" {
 		t.Fatalf("deploy stage = %+v, want queued after the gate passed", got)
 	}
 }
@@ -215,7 +241,7 @@ stages:
 
 	// The gate is in-flight and StartedAt is anchored at `start`.
 	gate := stageRow(t, store, run.ID, "wait")
-	if gate.State != pipeline.StageQueued || !gate.StartedAt.Equal(start.UTC()) {
+	if gate.State != StageQueued || !gate.StartedAt.Equal(start.UTC()) {
 		t.Fatalf("gate stage = %+v, want queued with StartedAt %s", gate, start.UTC())
 	}
 
@@ -224,13 +250,13 @@ stages:
 	late := start.Add(2 * time.Hour)
 	run = advance(t, store, rec, parsed, enqueue, run, late)
 	gate = stageRow(t, store, run.ID, "wait")
-	if gate.State != pipeline.StageBlocked {
+	if gate.State != StageBlocked {
 		t.Fatalf("gate stage = %s, want blocked after the timeout", gate.State)
 	}
 	if !gate.StartedAt.Equal(start.UTC()) {
 		t.Fatalf("jobless gate StartedAt = %s, want unchanged enqueue tick %s", gate.StartedAt, start.UTC())
 	}
-	if run.State != pipeline.RunBlocked {
+	if run.State != RunBlocked {
 		t.Fatalf("run = %s, want blocked", run.State)
 	}
 	if run.HaltStage != "wait" {
@@ -240,7 +266,7 @@ stages:
 		t.Fatalf("run needs = %v, want [\"PR #42 merged\"]", got)
 	}
 	// The downstream deploy stage is skipped (never reachable past a parked gate).
-	if got := stageRow(t, store, run.ID, "deploy"); got.State != pipeline.StageSkipped {
+	if got := stageRow(t, store, run.ID, "deploy"); got.State != StageSkipped {
 		t.Fatalf("deploy stage = %s, want skipped", got.State)
 	}
 }
@@ -281,16 +307,16 @@ stages:
 	markPipelinePRMerged(t, store, "owner/repo", 42, "closed")
 	run = advance(t, store, rec, parsed, enqueue, run, now)
 	gate := stageRow(t, store, run.ID, "wait")
-	if gate.State != pipeline.StageBlocked {
+	if gate.State != StageBlocked {
 		t.Fatalf("gate stage = %s, want blocked once the PR closed unmerged", gate.State)
 	}
-	if run.State != pipeline.RunBlocked {
+	if run.State != RunBlocked {
 		t.Fatalf("run = %s, want blocked", run.State)
 	}
 	if run.HaltStage != "wait" {
 		t.Fatalf("run halt stage = %q, want wait", run.HaltStage)
 	}
-	if got := stageRow(t, store, run.ID, "deploy"); got.State != pipeline.StageSkipped {
+	if got := stageRow(t, store, run.ID, "deploy"); got.State != StageSkipped {
 		t.Fatalf("deploy stage = %s, want skipped past the parked gate", got.State)
 	}
 }
@@ -323,22 +349,22 @@ stages:
 	settleImplementStageJob(t, store, impl.JobID, "skipped", "nothing changed", 0)
 
 	run = advance(t, store, rec, parsed, enqueue, run, now)
-	if got := stageRow(t, store, run.ID, "impl"); got.State != pipeline.StageSucceeded {
+	if got := stageRow(t, store, run.ID, "impl"); got.State != StageSucceeded {
 		t.Fatalf("impl stage = %s, want succeeded", got.State)
 	}
 	run = advance(t, store, rec, parsed, enqueue, run, now)
 
 	gate := stageRow(t, store, run.ID, "wait")
-	if gate.State != pipeline.StageBlocked {
+	if gate.State != StageBlocked {
 		t.Fatalf("gate stage = %s, want blocked", gate.State)
 	}
 	if got := decodePipelineNeeds(gate.NeedsJSON); len(got) != 1 || got[0] != "source stage succeeded without opening a PR; nothing to wait for" {
 		t.Fatalf("gate needs = %v", got)
 	}
-	if run.State != pipeline.RunBlocked {
+	if run.State != RunBlocked {
 		t.Fatalf("run = %s, want blocked", run.State)
 	}
-	if got := stageRow(t, store, run.ID, "deploy"); got.State != pipeline.StageSkipped || got.JobID != "" {
+	if got := stageRow(t, store, run.ID, "deploy"); got.State != StageSkipped || got.JobID != "" {
 		t.Fatalf("deploy stage = %+v, want skipped and never enqueued", got)
 	}
 }
@@ -369,18 +395,18 @@ stages:
 	markPipelinePRMerged(t, store, "owner/repo", 123, "merged")
 
 	run = advance(t, store, rec, parsed, enqueue, run, now)
-	if got := stageRow(t, store, run.ID, "impl"); got.State != pipeline.StageSucceeded {
+	if got := stageRow(t, store, run.ID, "impl"); got.State != StageSucceeded {
 		t.Fatalf("impl stage = %s, want succeeded", got.State)
 	}
 	run = advance(t, store, rec, parsed, enqueue, run, now)
 	gate := stageRow(t, store, run.ID, "wait")
-	if gate.State != pipeline.StageBlocked {
+	if gate.State != StageBlocked {
 		t.Fatalf("gate stage = %s, want blocked", gate.State)
 	}
 	if got := decodePipelineNeeds(gate.NeedsJSON); len(got) != 1 || got[0] != "source stage succeeded without opening a PR; nothing to wait for" {
 		t.Fatalf("gate needs = %v", got)
 	}
-	if run.State != pipeline.RunBlocked || run.HaltStage != "wait" {
+	if run.State != RunBlocked || run.HaltStage != "wait" {
 		t.Fatalf("run = %+v, want blocked at wait", run)
 	}
 }
@@ -420,7 +446,7 @@ stages:
 	markPipelinePRMerged(t, store, "owner/repo", 42, "merged")
 	run = advance(t, store, rec, parsed, enqueue, run, now)
 
-	if got := stageRow(t, store, run.ID, "wait"); got.State != pipeline.StageSucceeded {
+	if got := stageRow(t, store, run.ID, "wait"); got.State != StageSucceeded {
 		t.Fatalf("gate stage = %+v, want payload PR #42 to satisfy it", got)
 	}
 }
@@ -452,7 +478,7 @@ stages:
 	// terminal implemented job still lacks both its PR stamp and the no-PR event.
 	// The gate must not mistake that transient state for a final no-PR success.
 	implSucceeded := impl
-	implSucceeded.State = pipeline.StageSucceeded
+	implSucceeded.State = StageSucceeded
 	implSucceeded.Summary = "stamp pending (opened PR #123)"
 	implSucceeded.FinishedAt = now
 	if err := persistPipelineStage(ctx, store, impl, implSucceeded); err != nil {
@@ -461,15 +487,15 @@ stages:
 	markPipelinePRMerged(t, store, "owner/repo", 123, "merged")
 
 	run = advance(t, store, rec, parsed, enqueue, run, now)
-	if got := stageRow(t, store, run.ID, "wait"); got.State != pipeline.StageQueued {
+	if got := stageRow(t, store, run.ID, "wait"); got.State != StageQueued {
 		t.Fatalf("gate stage = %s, want queued", got.State)
 	}
 	run = advance(t, store, rec, parsed, enqueue, run, now)
 	gate := stageRow(t, store, run.ID, "wait")
-	if gate.State != pipeline.StageRunning {
+	if gate.State != StageRunning {
 		t.Fatalf("gate stage = %s, want running while implemented PR stamp is pending", gate.State)
 	}
-	if run.State != pipeline.RunRunning {
+	if run.State != RunRunning {
 		t.Fatalf("run = %s, want running during PR stamp race", run.State)
 	}
 }
@@ -477,7 +503,7 @@ stages:
 func TestPipelineGateStageSummaryFallbackRequiresMissingJob(t *testing.T) {
 	store := pipelineAdvanceStore(t)
 	pr, finalNoPR, err := pipelineSourceStagePR(context.Background(), store, db.PipelineRunStage{
-		State:   pipeline.StageSucceeded,
+		State:   StageSucceeded,
 		JobID:   "gc-removed-job",
 		Summary: "legacy result (opened PR #42)",
 	})

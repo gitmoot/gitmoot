@@ -148,9 +148,9 @@ func TestPipelineAddEnvFileValidation(t *testing.T) {
 func TestPipelineAddEnvFileWrongOwner(t *testing.T) {
 	home := t.TempDir()
 	envFile := writePipelineEnvFile(t, t.TempDir(), "TOKEN="+pipelineEnvSecretA+"\n", 0o600)
-	original := pipelineEnvCurrentUID
-	pipelineEnvCurrentUID = func() uint32 { return original() + 1 }
-	t.Cleanup(func() { pipelineEnvCurrentUID = original })
+	original := pipeline.PipelineEnvCurrentUID
+	pipeline.PipelineEnvCurrentUID = func() uint32 { return original() + 1 }
+	t.Cleanup(func() { pipeline.PipelineEnvCurrentUID = original })
 	specFile := writeSpec(t, fmt.Sprintf("name: wrong-owner\nenv_file: %q\nstages: [{id: run, cmd: echo, env_keys: [TOKEN]}]\n", envFile))
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{"pipeline", "add", specFile, "--home", home}, &stdout, &stderr); code == 0 || !strings.Contains(stderr.String(), "owned by uid") {
@@ -194,11 +194,11 @@ func TestClassifyPipelineEnvFileStatuses(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			originalUID := pipelineEnvCurrentUID
+			originalUID := pipeline.PipelineEnvCurrentUID
 			if tt.wrongOwnerUID {
-				pipelineEnvCurrentUID = func() uint32 { return originalUID() + 1 }
+				pipeline.PipelineEnvCurrentUID = func() uint32 { return originalUID() + 1 }
 			}
-			defer func() { pipelineEnvCurrentUID = originalUID }()
+			defer func() { pipeline.PipelineEnvCurrentUID = originalUID }()
 
 			got := classifyPipelineEnvFile(context.Background(), store, home, tt.path(t))
 			if got.Status != tt.want {
@@ -549,18 +549,18 @@ func TestPipelineProxiedKeyResolutionAndDeliveryLease(t *testing.T) {
 		t.Fatalf("proxied access = %#v, want %#v", access.Access, want)
 	}
 
-	previousRegistry := modelGatewayRegistry
-	previousLogf := modelGatewayLogf
-	modelGatewayRegistry = credgw.NewRegistry()
-	modelGatewayLogf = func(string, ...any) {}
+	previousRegistry := credgw.DefaultRegistry
+	previousLogf := credgw.DefaultLogf
+	credgw.DefaultRegistry = credgw.NewRegistry()
+	credgw.DefaultLogf = func(string, ...any) {}
 	paths, err := configPathsForPipelineStore(store, home)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = modelGatewayRegistry.CloseHome(context.Background(), paths.Home)
-		modelGatewayRegistry = previousRegistry
-		modelGatewayLogf = previousLogf
+		_ = credgw.DefaultRegistry.CloseHome(context.Background(), paths.Home)
+		credgw.DefaultRegistry = previousRegistry
+		credgw.DefaultLogf = previousLogf
 	})
 	capture := &pipelineEnvCaptureAdapter{}
 	wrapper := wrapPipelineEnvDeliveryAdapter(store, home, workflow.JobPayload{
@@ -699,21 +699,21 @@ func TestPipelineAgentProxiedKeyDeliveryE2E(t *testing.T) {
 		t.Fatalf("persisted payload contains credential material: %s", persisted)
 	}
 
-	previousRegistry := modelGatewayRegistry
-	previousLogf := modelGatewayLogf
-	previousLoopback := pipelineProxyAllowLoopbackHTTP
-	modelGatewayRegistry = credgw.NewRegistry()
-	modelGatewayLogf = func(string, ...any) {}
-	pipelineProxyAllowLoopbackHTTP = true
+	previousRegistry := credgw.DefaultRegistry
+	previousLogf := credgw.DefaultLogf
+	previousLoopback := pipeline.PipelineProxyAllowLoopbackHTTP
+	credgw.DefaultRegistry = credgw.NewRegistry()
+	credgw.DefaultLogf = func(string, ...any) {}
+	pipeline.PipelineProxyAllowLoopbackHTTP = true
 	paths, err := configPathsForPipelineStore(store, home)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = modelGatewayRegistry.CloseHome(context.Background(), paths.Home)
-		modelGatewayRegistry = previousRegistry
-		modelGatewayLogf = previousLogf
-		pipelineProxyAllowLoopbackHTTP = previousLoopback
+		_ = credgw.DefaultRegistry.CloseHome(context.Background(), paths.Home)
+		credgw.DefaultRegistry = previousRegistry
+		credgw.DefaultLogf = previousLogf
+		pipeline.PipelineProxyAllowLoopbackHTTP = previousLoopback
 	})
 	capture := &pipelineEnvCaptureAdapter{deliver: func(job runtime.Job) (runtime.Result, error) {
 		if len(job.ShellEnv) != 0 {
@@ -1262,25 +1262,25 @@ func TestPipelineProxiedKeyShellE2E(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	previousRegistry := modelGatewayRegistry
-	previousLogf := modelGatewayLogf
+	previousRegistry := credgw.DefaultRegistry
+	previousLogf := credgw.DefaultLogf
 	previousConfigureHTTP := keyConfigureAllowLoopbackHTTP
-	previousDeliveryHTTP := pipelineProxyAllowLoopbackHTTP
-	modelGatewayRegistry = credgw.NewRegistry()
+	previousDeliveryHTTP := pipeline.PipelineProxyAllowLoopbackHTTP
+	credgw.DefaultRegistry = credgw.NewRegistry()
 	var gatewayLogs gatewayLogSink
-	modelGatewayLogf = gatewayLogs.Logf
+	credgw.DefaultLogf = gatewayLogs.Logf
 	keyConfigureAllowLoopbackHTTP = true
-	pipelineProxyAllowLoopbackHTTP = true
+	pipeline.PipelineProxyAllowLoopbackHTTP = true
 	configPaths, err := configPathsForPipelineStore(store, home)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = modelGatewayRegistry.CloseHome(context.Background(), configPaths.Home)
-		modelGatewayRegistry = previousRegistry
-		modelGatewayLogf = previousLogf
+		_ = credgw.DefaultRegistry.CloseHome(context.Background(), configPaths.Home)
+		credgw.DefaultRegistry = previousRegistry
+		credgw.DefaultLogf = previousLogf
 		keyConfigureAllowLoopbackHTTP = previousConfigureHTTP
-		pipelineProxyAllowLoopbackHTTP = previousDeliveryHTTP
+		pipeline.PipelineProxyAllowLoopbackHTTP = previousDeliveryHTTP
 	})
 
 	testBinary, err := os.Executable()

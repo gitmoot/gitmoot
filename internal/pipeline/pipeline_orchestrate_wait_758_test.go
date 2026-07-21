@@ -1,4 +1,4 @@
-package cli
+package pipeline
 
 import (
 	"context"
@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -110,7 +109,7 @@ func TestOrchestrateStageFollowsContinuationChainAndFoldsTail(t *testing.T) {
 	}
 	// Guard the premise: the stage is classified orchestrate and the coordinator job is
 	// its OWN sub-tree root (RootJobID = its own id, the one #757 deviation).
-	if k := spec.Stages[0].Kind(); k != pipeline.StageKindOrchestrate {
+	if k := spec.Stages[0].Kind(); k != StageKindOrchestrate {
 		t.Fatalf("stage kind = %v, want orchestrate", k)
 	}
 	if cj, _ := store.GetJob(context.Background(), coordJob); mustPayloadRoot(t, cj) != coordJob {
@@ -137,10 +136,10 @@ func TestOrchestrateStageFollowsContinuationChainAndFoldsTail(t *testing.T) {
 
 	// Scan 1: coordinator settled + continuation exists → re-point to gen-1, stay running.
 	run = advance(t, store, rec, spec, enqueue, run, now)
-	if got := stageRow(t, store, run.ID, "coord"); got.JobID != contID || got.State != pipeline.StageRunning {
+	if got := stageRow(t, store, run.ID, "coord"); got.JobID != contID || got.State != StageRunning {
 		t.Fatalf("after scan 1: stage = {JobID=%q,State=%s}, want re-pointed to %q running", got.JobID, got.State, contID)
 	}
-	if run.State != pipeline.RunRunning {
+	if run.State != RunRunning {
 		t.Fatalf("after scan 1: run = %s, want running", run.State)
 	}
 
@@ -149,14 +148,14 @@ func TestOrchestrateStageFollowsContinuationChainAndFoldsTail(t *testing.T) {
 	if got := stageRow(t, store, run.ID, "coord"); got.JobID != contID2 {
 		t.Fatalf("after scan 2: stage JobID = %q, want re-pointed to the tail %q", got.JobID, contID2)
 	}
-	if run.State != pipeline.RunRunning {
+	if run.State != RunRunning {
 		t.Fatalf("after scan 2: run = %s, want running", run.State)
 	}
 
 	// Scan 3: the tail is settled with no continuation and zero delegations → FOLD it.
 	run = advance(t, store, rec, spec, enqueue, run, now)
 	got := stageRow(t, store, run.ID, "coord")
-	if got.State != pipeline.StageSucceeded {
+	if got.State != StageSucceeded {
 		t.Fatalf("after scan 3: stage = %s, want succeeded (fold the tail)", got.State)
 	}
 	if got.Summary != "final synthesis" {
@@ -165,7 +164,7 @@ func TestOrchestrateStageFollowsContinuationChainAndFoldsTail(t *testing.T) {
 	if !got.StartedAt.Equal(rootStartedAt) || !got.FinishedAt.Equal(tailFinishedAt) {
 		t.Fatalf("orchestrate times = (%s, %s), want root start %s and tail finish %s", got.StartedAt, got.FinishedAt, rootStartedAt, tailFinishedAt)
 	}
-	if run.State != pipeline.RunSucceeded {
+	if run.State != RunSucceeded {
 		t.Fatalf("run = %s, want succeeded", run.State)
 	}
 }
@@ -191,10 +190,10 @@ func TestOrchestrateStageFoldsTailBlockedDecision(t *testing.T) {
 	run = advance(t, store, rec, spec, enqueue, run, now) // re-point to the tail
 	run = advance(t, store, rec, spec, enqueue, run, now) // fold the tail
 
-	if got := stageRow(t, store, run.ID, "coord"); got.State != pipeline.StageBlocked {
+	if got := stageRow(t, store, run.ID, "coord"); got.State != StageBlocked {
 		t.Fatalf("stage = %s, want blocked (fold the tail, not the coordinator's approved)", got.State)
 	}
-	if run.State != pipeline.RunBlocked {
+	if run.State != RunBlocked {
 		t.Fatalf("run = %s, want blocked", run.State)
 	}
 	if got := decodePipelineNeeds(run.NeedsJSON); len(got) != 1 || got[0] != "R2 token" {
@@ -218,13 +217,13 @@ func TestOrchestrateStageMidFlightCoordinatorDoesNotFold(t *testing.T) {
 	settleChainJob(t, store, coordJob, "approved", "fanned out", nil, oneDelegation(), false)
 
 	run = advance(t, store, rec, spec, enqueue, run, now)
-	if got := stageRow(t, store, run.ID, "coord"); got.State == pipeline.StageSucceeded || got.State == pipeline.StageFailed {
+	if got := stageRow(t, store, run.ID, "coord"); got.State == StageSucceeded || got.State == StageFailed {
 		t.Fatalf("stage = %s, want still in flight — a mid-flight coordinator must not fold", got.State)
 	}
 	if got := stageRow(t, store, run.ID, "coord"); got.JobID != coordJob {
 		t.Fatalf("stage JobID = %q, want unchanged %q (no continuation to walk to yet)", got.JobID, coordJob)
 	}
-	if run.State != pipeline.RunRunning {
+	if run.State != RunRunning {
 		t.Fatalf("run = %s, want running while the sub-tree is live", run.State)
 	}
 }
@@ -274,17 +273,17 @@ func TestOrchestrateStageRestartReconnectsWithoutDuplicateTree(t *testing.T) {
 	if got := stageRow(t, store, reloaded.ID, "coord"); got.Attempt != 0 {
 		t.Fatalf("after restart: stage attempt = %d, want 0 (no fresh tree)", got.Attempt)
 	}
-	if reloaded.State != pipeline.RunRunning {
+	if reloaded.State != RunRunning {
 		t.Fatalf("after restart: run = %s, want still running", reloaded.State)
 	}
 
 	// The tail finally arrives: the reconnected walk folds it normally.
 	settleChainJob(t, store, contID, "approved", "final", nil, nil, false)
 	reloaded = advance(t, store, rec, spec, enqueue, reloaded, now)
-	if got := stageRow(t, store, reloaded.ID, "coord"); got.State != pipeline.StageSucceeded {
+	if got := stageRow(t, store, reloaded.ID, "coord"); got.State != StageSucceeded {
 		t.Fatalf("after tail: stage = %s, want succeeded", got.State)
 	}
-	if reloaded.State != pipeline.RunSucceeded {
+	if reloaded.State != RunSucceeded {
 		t.Fatalf("after tail: run = %s, want succeeded", reloaded.State)
 	}
 }
@@ -339,7 +338,7 @@ func TestOrchestrateStageTimeoutTripsKillAndFoldsFinalizeTail(t *testing.T) {
 	if killed, err := store.IsRootJobKilled(ctx, coordJob); err != nil || !killed {
 		t.Fatalf("stage timeout must trip the #341 kill switch on the sub-tree root: killed=%v err=%v", killed, err)
 	}
-	if run.State != pipeline.RunRunning {
+	if run.State != RunRunning {
 		t.Fatalf("run = %s, want still running (awaiting the finalize tail)", run.State)
 	}
 	killEventsAfterTrip := countJobEvents(t, store, coordJob, "delegation_killed")
@@ -361,13 +360,13 @@ func TestOrchestrateStageTimeoutTripsKillAndFoldsFinalizeTail(t *testing.T) {
 	run = advance(t, store, rec, spec, enqueue, run, past) // re-point to the finalize continuation
 	run = advance(t, store, rec, spec, enqueue, run, past) // fold the finalize tail
 	got := stageRow(t, store, run.ID, "coord")
-	if got.State != pipeline.StageSucceeded {
+	if got.State != StageSucceeded {
 		t.Fatalf("stage = %s, want succeeded (fold the finalize tail)", got.State)
 	}
 	if got.Summary != "finalized after timeout" {
 		t.Fatalf("stage summary = %q, want the finalize tail's %q", got.Summary, "finalized after timeout")
 	}
-	if run.State != pipeline.RunSucceeded {
+	if run.State != RunSucceeded {
 		t.Fatalf("run = %s, want succeeded", run.State)
 	}
 }

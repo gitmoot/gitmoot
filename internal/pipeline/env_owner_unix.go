@@ -1,6 +1,6 @@
 //go:build linux || darwin
 
-package cli
+package pipeline
 
 import (
 	"fmt"
@@ -8,7 +8,7 @@ import (
 	"syscall"
 )
 
-var pipelineEnvCurrentUID = func() uint32 {
+var PipelineEnvCurrentUID = func() uint32 {
 	return uint32(syscall.Geteuid())
 }
 

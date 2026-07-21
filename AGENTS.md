@@ -39,7 +39,7 @@ go test ./...
 # Race gate is scoped (not ./...). CI compiles one -race test binary per package
 # and runs timing-balanced shards from those binaries (#906). Locally you can
 # run the four complete packages at once:
-go test -race -timeout 35m ./internal/workflow/ ./internal/cli/ ./internal/db/ ./internal/daemon/
+go test -race -timeout 35m ./internal/workflow/ ./internal/cli/ ./internal/db/ ./internal/daemon/ ./internal/pipeline/
 ```
 
 The CLI entrypoint lives under `cmd/gitmoot/`. The CI gate is Go-only — it does

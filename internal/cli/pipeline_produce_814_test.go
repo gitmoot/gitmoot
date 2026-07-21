@@ -19,7 +19,7 @@ import (
 func TestPipelineProduceStageJobRequestShapeAndRetryNote(t *testing.T) {
 	retries := 2
 	stage := pipeline.Stage{ID: "export", Agent: "producer", Action: "produce", Prompt: "Write data.", Write: true, Writes: []string{"/data/a", "/data/b"}, Reads: []string{"/input/a"}, Network: true, Check: "test -s /data/a/out", CheckRetries: &retries}
-	req := pipelineStageJobRequest(db.Pipeline{Name: "p", Repo: "owner/repo"}, stage, db.PipelineRun{ID: "prun-p-1"}, 1, "UPSTREAM\n", pipelineStagePRBinding{}, false)
+	req := pipeline.PipelineStageJobRequest(db.Pipeline{Name: "p", Repo: "owner/repo"}, stage, db.PipelineRun{ID: "prun-p-1"}, 1, "UPSTREAM\n", pipeline.PipelineStagePRBinding{}, false)
 	if req.Action != "produce" || req.Sender != workflow.PipelineJobSender || req.Branch != "" || req.TaskID != "" || req.PullRequest != 0 {
 		t.Fatalf("produce request identity fields = %+v", req)
 	}

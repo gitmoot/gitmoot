@@ -85,16 +85,16 @@ model_gateway_allow_hosts = ["api.anthropic.com"]
 			t.Setenv(runtime.ClaudeConfigDirEnv, t.TempDir()) // isolate: never mirror the box's real ~/.claude
 
 			registry := credgw.NewRegistry()
-			previousRegistry := modelGatewayRegistry
-			previousGatewayLogf := modelGatewayLogf
+			previousRegistry := credgw.DefaultRegistry
+			previousGatewayLogf := credgw.DefaultLogf
 			previousAuthLogf := runtimeAuthLogf
-			modelGatewayRegistry = registry
-			modelGatewayLogf = func(string, ...any) {}
+			credgw.DefaultRegistry = registry
+			credgw.DefaultLogf = func(string, ...any) {}
 			runtimeAuthLogf = func(string, ...any) {}
 			t.Cleanup(func() {
 				closeModelGatewayHome(paths.Home)
-				modelGatewayRegistry = previousRegistry
-				modelGatewayLogf = previousGatewayLogf
+				credgw.DefaultRegistry = previousRegistry
+				credgw.DefaultLogf = previousGatewayLogf
 				runtimeAuthLogf = previousAuthLogf
 			})
 
@@ -254,20 +254,20 @@ model_gateway_allow_hosts = [%q]
 	}
 	t.Setenv(runtime.ClaudeConfigDirEnv, sourceConfig)
 
-	previousRegistry := modelGatewayRegistry
+	previousRegistry := credgw.DefaultRegistry
 	previousUpstream := modelGatewayUpstreamURL
-	previousLogf := modelGatewayLogf
+	previousLogf := credgw.DefaultLogf
 	previousAuthLogf := runtimeAuthLogf
-	modelGatewayRegistry = credgw.NewRegistry()
+	credgw.DefaultRegistry = credgw.NewRegistry()
 	modelGatewayUpstreamURL = upstream.URL
 	var logs gatewayLogSink
-	modelGatewayLogf = logs.Logf
+	credgw.DefaultLogf = logs.Logf
 	runtimeAuthLogf = logs.Logf
 	t.Cleanup(func() {
 		closeModelGatewayHome(paths.Home)
-		modelGatewayRegistry = previousRegistry
+		credgw.DefaultRegistry = previousRegistry
 		modelGatewayUpstreamURL = previousUpstream
-		modelGatewayLogf = previousLogf
+		credgw.DefaultLogf = previousLogf
 		runtimeAuthLogf = previousAuthLogf
 	})
 

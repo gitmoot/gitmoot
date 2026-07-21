@@ -70,6 +70,11 @@ type Policy struct {
 
 type LogFunc func(format string, args ...any)
 
+var (
+	DefaultRegistry         = NewRegistry()
+	DefaultLogf     LogFunc = log.Printf
+)
+
 type Gateway struct {
 	listener net.Listener
 	server   *http.Server

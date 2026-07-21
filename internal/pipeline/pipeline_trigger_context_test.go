@@ -1,4 +1,4 @@
-package cli
+package pipeline
 
 import (
 	"encoding/json"
@@ -8,7 +8,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
 )
 
 func TestBuildPipelineTriggerContextIsSortedFencedAndBounded(t *testing.T) {
@@ -52,7 +51,7 @@ func TestBuildPipelineTriggerContextIsSortedFencedAndBounded(t *testing.T) {
 func TestPipelineTriggerContextReachesEveryAgentStageAndShellUsesEnv(t *testing.T) {
 	run := db.PipelineRun{ID: "prun-1", PayloadJSON: `{"body":"first\n第二","subject":"Snowman ☃"}`}
 	rec := db.Pipeline{Name: "mail", Repo: "owner/repo"}
-	stages := []pipeline.Stage{
+	stages := []Stage{
 		{ID: "ask", Agent: "a", Action: "ask", Prompt: "Ask."},
 		{ID: "review", Agent: "a", Action: "review", Prompt: "Review."},
 		{ID: "orch", Agent: "a", Action: "ask", Orchestrate: true, Prompt: "Orchestrate."},
@@ -60,14 +59,14 @@ func TestPipelineTriggerContextReachesEveryAgentStageAndShellUsesEnv(t *testing.
 		{ID: "produce", Agent: "a", Action: "produce", Write: true, Writes: []string{"/tmp/out"}, Prompt: "Produce."},
 	}
 	for _, stage := range stages {
-		req := pipelineStageJobRequest(rec, stage, run, 0, "UPSTREAM\n", pipelineStagePRBinding{}, false)
+		req := PipelineStageJobRequest(rec, stage, run, 0, "UPSTREAM\n", PipelineStagePRBinding{}, false)
 		if !strings.HasPrefix(req.Instructions, pipelineTriggerContextHeader) || !strings.Contains(req.Instructions, "UPSTREAM\n") || !strings.HasSuffix(req.Instructions, stage.Prompt) {
 			t.Errorf("stage %s instructions lost trigger/upstream/prompt ordering:\n%s", stage.ID, req.Instructions)
 		}
 	}
 
-	shell := pipeline.Stage{ID: "shell", Cmd: "printf ok"}
-	req := pipelineStageJobRequest(rec, shell, run, 0, "", pipelineStagePRBinding{}, false)
+	shell := Stage{ID: "shell", Cmd: "printf ok"}
+	req := PipelineStageJobRequest(rec, shell, run, 0, "", PipelineStagePRBinding{}, false)
 	wantEnv := []string{
 		"GITMOOT_TRIGGER_BODY=first\n第二",
 		"GITMOOT_TRIGGER_SUBJECT=Snowman ☃",
@@ -85,7 +84,7 @@ func TestPipelineTriggerContextReachesEveryAgentStageAndShellUsesEnv(t *testing.
 		t.Fatalf("root shell stage upstream context = %q, want empty", req.ShellUpstreamContext)
 	}
 
-	empty := pipelineStageJobRequest(rec, stages[0], db.PipelineRun{ID: "prun-empty", PayloadJSON: "{}"}, 0, "", pipelineStagePRBinding{}, false)
+	empty := PipelineStageJobRequest(rec, stages[0], db.PipelineRun{ID: "prun-empty", PayloadJSON: "{}"}, 0, "", PipelineStagePRBinding{}, false)
 	if empty.Instructions != stages[0].Prompt {
 		t.Fatalf("empty payload changed prompt: %q", empty.Instructions)
 	}
@@ -95,11 +94,11 @@ func TestServicePipelinePayloadNeverProjectsIntoStagePromptOrLegacyTriggerEnv(t 
 	const sentinel = "SERVICE_SENTINEL_MUST_STAY_TYPED"
 	run := db.PipelineRun{ID: "prun-service", Trigger: "service", PayloadJSON: `{"app_name":"` + sentinel + `"}`}
 	rec := db.Pipeline{Name: "kit", Repo: "owner/repo"}
-	agent := pipelineStageJobRequest(rec, pipeline.Stage{ID: "agent", Agent: "a", Action: "ask", Prompt: "Build the kit."}, run, 0, "", pipelineStagePRBinding{}, false)
+	agent := PipelineStageJobRequest(rec, Stage{ID: "agent", Agent: "a", Action: "ask", Prompt: "Build the kit."}, run, 0, "", PipelineStagePRBinding{}, false)
 	if strings.Contains(agent.Instructions, sentinel) || agent.Instructions != "Build the kit." {
 		t.Fatalf("service payload entered agent instructions: %q", agent.Instructions)
 	}
-	shell := pipelineStageJobRequest(rec, pipeline.Stage{ID: "shell", Cmd: "printf ok"}, run, 0, "", pipelineStagePRBinding{}, false)
+	shell := PipelineStageJobRequest(rec, Stage{ID: "shell", Cmd: "printf ok"}, run, 0, "", PipelineStagePRBinding{}, false)
 	if strings.Contains(strings.Join(shell.ShellEnv, "\n"), sentinel) {
 		t.Fatalf("service payload entered legacy trigger env: %#v", shell.ShellEnv)
 	}

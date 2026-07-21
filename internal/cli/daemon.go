@@ -1918,7 +1918,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 		// --dry-run for the same reason.
 		pipelineEnqueue := newPipelineStageEnqueuer(store, home)
 		if !dryRun {
-			installDefaultMemoryPipelinesForDaemon(ctx, store, paths, home, stdout)
+			pipeline.InstallDefaultMemoryPipelinesForDaemon(ctx, store, paths, home, stdout)
 		}
 		for {
 			if err := receiveSupervisorWorkerError(workerErr); err != nil {
@@ -1940,7 +1940,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 				if err := runHeartbeatScanOnce(ctx, paths, store, heartbeatEnqueue, time.Now().UTC()); err != nil {
 					writeLine(stdout, "heartbeat scan error: %s", err)
 				}
-				if err := runPipelineScanOnce(ctx, store, pipelineEnqueue, time.Now().UTC()); err != nil {
+				if err := pipeline.RunPipelineScanOnce(ctx, store, pipelineEnqueue, time.Now().UTC()); err != nil {
 					writeLine(stdout, "pipeline scan error: %s", err)
 				}
 				// Chat auto-respond sweep (#534 V1.5). Off-by-default: with
@@ -1958,10 +1958,10 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 				// `wait` at the base interval on every pass, so this guard is now a
 				// second, narrower ceiling; it still only reduces the sleep, never
 				// extends it.
-				if inFlight, err := pipelineRunsInFlight(ctx, store); err != nil {
+				if inFlight, err := pipeline.PipelineRunsInFlight(ctx, store); err != nil {
 					writeLine(stdout, "pipeline in-flight check error: %s", err)
 				} else {
-					wait = pipelineAdvanceWait(wait, live.pollInterval(), inFlight)
+					wait = pipeline.PipelineAdvanceWait(wait, live.pollInterval(), inFlight)
 				}
 			}
 			if watchSkillOptReviews {
@@ -2032,7 +2032,7 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	// does not disable it.
 	pipelineEnqueue := newPipelineStageEnqueuer(store, home)
 	if heartbeatPathsErr == nil {
-		installDefaultMemoryPipelinesForDaemon(ctx, store, heartbeatPaths, home, stdout)
+		pipeline.InstallDefaultMemoryPipelinesForDaemon(ctx, store, heartbeatPaths, home, stdout)
 	} else {
 		writeLine(stdout, "default memory pipeline install disabled: %s", heartbeatPathsErr)
 	}
@@ -2071,7 +2071,7 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 				writeLine(stdout, "chat auto-respond scan error: %s", err)
 			}
 		}
-		if err := runPipelineScanOnce(ctx, store, pipelineEnqueue, time.Now().UTC()); err != nil {
+		if err := pipeline.RunPipelineScanOnce(ctx, store, pipelineEnqueue, time.Now().UTC()); err != nil {
 			writeLine(stdout, "pipeline scan error: %s", err)
 		}
 		// Read the warm-reloadable poll interval each cycle (#577) so a SIGHUP
@@ -3092,9 +3092,9 @@ type jobWorker struct {
 	SandboxProbe func() sandbox.ProbeResult
 	// Progress timing seams keep unit/E2E tests deterministic and short. Zero/nil
 	// values select the package defaults and real timer implementation.
-	ProgressThreshold  time.Duration
-	ProgressInterval   time.Duration
-	ProgressTickSource func(context.Context, time.Duration, time.Duration) <-chan time.Time
+	PipelineProgressThreshold time.Duration
+	PipelineProgressInterval  time.Duration
+	ProgressTickSource        func(context.Context, time.Duration, time.Duration) <-chan time.Time
 }
 
 // eventSink resolves the best-effort outbound event Sink (#446) for the
@@ -5440,7 +5440,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}()
 	}
 	writeLine(w.Stdout, "running job %s for %s in %s", job.ID, agent.Name, payload.Repo)
-	adapter = wrapPipelineEnvDeliveryAdapter(w.Store, w.ConfigHome, payload, adapter)
+	adapter = pipeline.WrapPipelineEnvDeliveryAdapter(w.Store, w.ConfigHome, payload, adapter)
 	engine := w.WorkflowFactory(checkout)
 	// Wire the PRE-TERMINAL operational-blocker deferrer (#532 slice E) on the LIVE
 	// worker (not the WorkflowFactory-captured copy) so it observes this worker's
@@ -5459,11 +5459,11 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if progressTracker != nil {
 		progressCtx, cancelProgress := context.WithCancel(runCtx)
 		done := make(chan struct{})
-		threshold := w.ProgressThreshold
+		threshold := w.PipelineProgressThreshold
 		if threshold <= 0 {
 			threshold = pipelineProgressThreshold
 		}
-		interval := w.ProgressInterval
+		interval := w.PipelineProgressInterval
 		if interval <= 0 {
 			interval = pipelineProgressInterval
 		}
@@ -5526,7 +5526,7 @@ func applyProduceRuntimeGrants(ctx context.Context, store *db.Store, home string
 		return errors.New("produce runtime agent is required")
 	}
 	subject := fmt.Sprintf("job %q", job.ID)
-	writable, err := canonicalizePipelineProducePaths(ctx, store, home, subject, payload.WritablePaths)
+	writable, err := pipeline.CanonicalizePipelineProducePaths(ctx, store, home, subject, payload.WritablePaths)
 	if err != nil {
 		return fmt.Errorf("produce writable path preflight failed: %w", err)
 	}
@@ -5548,7 +5548,7 @@ func applyProduceRuntimeGrants(ctx context.Context, store *db.Store, home string
 		}
 		envFile = spec.EnvFile
 	}
-	readable, err := canonicalizePipelineProduceReadPaths(ctx, store, home, subject, payload.ReadablePaths, writable, envFile)
+	readable, err := pipeline.CanonicalizePipelineProduceReadPaths(ctx, store, home, subject, payload.ReadablePaths, writable, envFile)
 	if err != nil {
 		return fmt.Errorf("produce readable path preflight failed: %w", err)
 	}
@@ -5578,11 +5578,11 @@ func claudeProduceRuntimeReadAccess(ctx context.Context, store *db.Store, homeFl
 	if strings.TrimSpace(configDir) == "" {
 		configDir = filepath.Join(home, ".claude")
 	}
-	configDir, err = resolveProduceSafetyPath(configDir)
+	configDir, err = pipeline.ResolveProduceSafetyPath(configDir)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("resolve Claude config directory: %w", err)
 	}
-	protected, err := resolveProduceReadProtectedPaths(ctx, store, homeFlag, envFile)
+	protected, err := pipeline.ResolveProduceReadProtectedPaths(ctx, store, homeFlag, envFile)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -5591,11 +5591,11 @@ func claudeProduceRuntimeReadAccess(ctx context.Context, store *db.Store, homeFl
 	readable := compactCleanPaths(declared)
 	readableFiles := []string{}
 	addDir := func(path, resource string) error {
-		resolved, resolveErr := resolveProduceSafetyPath(path)
+		resolved, resolveErr := pipeline.ResolveProduceSafetyPath(path)
 		if resolveErr != nil {
 			return fmt.Errorf("resolve Claude runtime resource %q: %w", resource, resolveErr)
 		}
-		if label, excluded := protected.exclusion(resolved); excluded {
+		if label, excluded := protected.Exclusion(resolved); excluded {
 			return fmt.Errorf("Claude runtime resource %q cannot be read because its parent %q overlaps %s; move it outside protected state, then add reads: [%q] if needed", resource, resolved, label, resolved)
 		}
 		info, err := os.Stat(resolved)
@@ -5618,11 +5618,11 @@ func claudeProduceRuntimeReadAccess(ctx context.Context, store *db.Store, homeFl
 
 	userState := filepath.Join(home, ".claude.json")
 	if _, statErr := os.Stat(userState); statErr == nil {
-		resolved, err := resolveProduceSafetyPath(userState)
+		resolved, err := pipeline.ResolveProduceSafetyPath(userState)
 		if err != nil {
 			return nil, nil, warnings, fmt.Errorf("resolve Claude user settings %q: %w", userState, err)
 		}
-		if label, excluded := protected.exclusion(resolved); excluded {
+		if label, excluded := protected.Exclusion(resolved); excluded {
 			return nil, nil, warnings, fmt.Errorf("Claude user settings %q cannot be read because it overlaps %s", userState, label)
 		}
 		readableFiles = compactCleanPaths(append(readableFiles, resolved))
@@ -5631,7 +5631,7 @@ func claudeProduceRuntimeReadAccess(ctx context.Context, store *db.Store, homeFl
 	}
 
 	for _, resource := range resources {
-		resolved, err := resolveProduceSafetyPath(resource.Path)
+		resolved, err := pipeline.ResolveProduceSafetyPath(resource.Path)
 		if err != nil {
 			return nil, nil, warnings, fmt.Errorf("resolve Claude hook path %q: %w", resource.Path, err)
 		}
@@ -5662,7 +5662,7 @@ func claudeProduceRuntimeReadAccess(ctx context.Context, store *db.Store, homeFl
 
 func pathCoveredByRuntimeReads(path string, dirs, files []string) bool {
 	for _, dir := range dirs {
-		if pathWithin(path, dir) {
+		if pipeline.PathWithin(path, dir) {
 			return true
 		}
 	}
@@ -6526,7 +6526,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
 		return nil
 	}
-	adapter = wrapPipelineEnvDeliveryAdapter(w.Store, w.ConfigHome, payload, adapter)
+	adapter = pipeline.WrapPipelineEnvDeliveryAdapter(w.Store, w.ConfigHome, payload, adapter)
 	// Temp-session delivery is a separate early-return path; attach the same
 	// append-only capture here or it would be absent from the trajectory corpus.
 	_, retainedLogFile, retainedLogErr := openRetainedTranscriptLog(w.ConfigHome, delegatedJob.ID)
@@ -7457,7 +7457,7 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 		// rather than inside the repo checkout, so generated briefs stay out of
 		// the tracked tree and are never committed.
 		engine.ArtifactRoot = home
-		engine.BeforeReadOnlyWorktreeCleanup = pipelineServiceArtifactPrecleanupHook(store, config.Paths{Home: home})
+		engine.BeforeReadOnlyWorktreeCleanup = pipeline.PipelineServiceArtifactPrecleanupHook(store, config.Paths{Home: home})
 	}
 	if strings.TrimSpace(home) != "" && strings.TrimSpace(checkout) != "" {
 		engine.Home = home

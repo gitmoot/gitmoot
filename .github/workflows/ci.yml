@@ -14,11 +14,11 @@ name: CI
 #   - BUILD / VET / TEST: build, generated-contract check, vet, and plain
 #     `go test ./...` stay together with the partition-script self-test as the
 #     non-race gate.
-#   - RACE BUILD: four package jobs compile one -race test binary each. Every
+#   - RACE BUILD: five package jobs compile one -race test binary each. Every
 #     package's full current test list is partitioned and asserted to appear
 #     exactly once before its binary + shard plan are uploaded.
-#   - RACE RUN: internal/cli is split 8 ways, internal/db 2 ways,
-#     internal/workflow 4 ways, and internal/daemon 1 way. Each runner downloads
+#   - RACE RUN: internal/cli is split 8 ways, internal/pipeline 4 ways,
+#     internal/db 2 ways, internal/workflow 4 ways, and internal/daemon 1 way. Each runner downloads
 #     the package bundle and executes from the package directory, preserving Go
 #     test-binary working-directory semantics without recompiling.
 #   - TIMINGS: PRs use the newest non-expired main timing artifact (up to 30
@@ -164,6 +164,8 @@ jobs:
         include:
           - package: cli
             shards: 8
+          - package: pipeline
+            shards: 4
           - package: db
             shards: 2
           - package: workflow
@@ -262,6 +264,10 @@ jobs:
           - {package: cli, shard: 5, shards: 8}
           - {package: cli, shard: 6, shards: 8}
           - {package: cli, shard: 7, shards: 8}
+          - {package: pipeline, shard: 0, shards: 4}
+          - {package: pipeline, shard: 1, shards: 4}
+          - {package: pipeline, shard: 2, shards: 4}
+          - {package: pipeline, shard: 3, shards: 4}
           - {package: db, shard: 0, shards: 2}
           - {package: db, shard: 1, shards: 2}
           - {package: workflow, shard: 0, shards: 4}

@@ -1,4 +1,4 @@
-package cli
+package pipeline
 
 import (
 	"context"
@@ -6,6 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 	"io"
 	"path/filepath"
 	"sort"
@@ -13,14 +17,6 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
-
-	"github.com/gitmoot/gitmoot/internal/daemon"
-	"github.com/gitmoot/gitmoot/internal/db"
-	gitutil "github.com/gitmoot/gitmoot/internal/git"
-	"github.com/gitmoot/gitmoot/internal/github"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
-	"github.com/gitmoot/gitmoot/internal/runtime"
-	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // The #681 pipeline RUN engine: create a run, enqueue ready stages, and advance it
@@ -30,344 +26,22 @@ import (
 // stateForDecision trap, workflow/result.go). Stage jobs are ordinary queued jobs
 // run through the SHELL runtime via a per-job runtime override; the normal worker
 // tick claims + runs them, and this advancer folds the results. The daemon-loop
-// wiring of runPipelineScanOnce lands in a later step — here it is driven by
+// wiring of RunPipelineScanOnce lands in a later step — here it is driven by
 // `pipeline run` and the tests.
 
 const pipelineSkippedSummaryMarker = "[skipped: no work]"
 
-// pipelineStageEnqueuer enqueues one pipeline stage job. In production it wraps
+// PipelineStageEnqueuer enqueues one pipeline stage job. In production it wraps
 // workflow.Mailbox.Enqueue (matching newHeartbeatEnqueuer); tests inject a fake to
 // assert the request shape without a real worker.
-type pipelineStageEnqueuer func(ctx context.Context, request workflow.JobRequest) (db.Job, error)
+type PipelineStageEnqueuer func(ctx context.Context, request workflow.JobRequest) (db.Job, error)
 
-// pipelineAutoMergeExecutor is the narrow write seam for merge: auto gates.
+// PipelineAutoMergeExecutor is the narrow write seam for merge: auto gates.
 // Tests inject a deterministic stub; production adapts the existing workflow
 // merge-gate checks and shared GitHub merge call.
-type pipelineAutoMergeExecutor interface {
+type PipelineAutoMergeExecutor interface {
 	Evaluate(context.Context, workflow.PipelineAutoMergeRequest) (workflow.PipelineAutoMergeReadiness, error)
 	Merge(context.Context, workflow.PipelineAutoMergeRequest) (workflow.PipelineAutoMergeResult, error)
-}
-
-// newPipelineStageEnqueuer builds the production enqueuer: a Mailbox bound to the
-// store and the daemon's canary-routing policy, so a pipeline stage job is
-// indistinguishable from a normal background job once enqueued (the runner agent
-// carries no template, so canary never actually samples).
-func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueuer {
-	mailbox := workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(home), RuntimeDefaultModel: runtimeDefaultModelResolver(home), RequireWorkflowPolicy: requireWorkflowPolicyResolver(home)}
-	return func(ctx context.Context, request workflow.JobRequest) (db.Job, error) {
-		// #1011 service shell stages are an explicit fail-CLOSED exception to the
-		// generic read-only allocator below. Their run row is authoritative: every
-		// service-triggered shell command gets a detached worktree, and a missing
-		// checkout/allocation failure aborts enqueue instead of falling back to the
-		// registered checkout.
-		serviceShell, err := pipelineServiceShellStage(ctx, store, request)
-		if err != nil {
-			return db.Job{}, err
-		}
-		var worktreePath string
-		var worktreeErr error
-		if serviceShell {
-			// Allocation precedes Mailbox.Enqueue. If a scan crashed after enqueue but
-			// before recording stage.job_id, adopt the deterministic existing job before
-			// touching its equally deterministic worktree path.
-			existing, getErr := store.GetJob(ctx, request.ID)
-			if getErr == nil {
-				payload, parseErr := workflow.ParseJobPayload(existing.Payload)
-				if parseErr != nil {
-					return db.Job{}, fmt.Errorf("parse existing service shell stage payload: %w", parseErr)
-				}
-				if strings.TrimSpace(payload.WorktreePath) == "" || !payload.ReadOnlyWorktree {
-					return db.Job{}, errors.New("existing service shell stage is not isolated in a detached worktree")
-				}
-				return existing, nil
-			}
-			if !errors.Is(getErr, sql.ErrNoRows) {
-				return db.Job{}, getErr
-			}
-			request, worktreePath, worktreeErr = allocatePipelineServiceShellWorktree(ctx, store, home, request)
-			if worktreeErr != nil {
-				return db.Job{}, fmt.Errorf("allocate service shell stage detached worktree: %w", worktreeErr)
-			}
-			if strings.TrimSpace(worktreePath) == "" {
-				return db.Job{}, errors.New("service shell stage requires a detached worktree; managed repo checkout is unavailable")
-			}
-		}
-		// #757 read-only isolation: a repo-bound AGENT stage (ask/review) is born
-		// with its OWN detached committed-tip worktree (the #739 shape) so it keys
-		// worktree:<path> instead of the shared repo:<repo>. Same-repo agent stages
-		// then run CONCURRENTLY and never touch the live checkout. Pipeline stage
-		// jobs are enqueued straight through the mailbox (NOT dispatchLocalAgentJob),
-		// so they do not get the born-isolated #739 worktree that background asks do;
-		// the reactive pool-isolation would only kick in on contention and still
-		// leaves one seat on the live checkout. Allocating here closes that gap. The
-		// The generic read-only allocator is FAIL-OPEN (the #739 lesson): it waits at
-		// most ReadOnlyWorktreeDispatchLockWaitBudget for the checkout mutation lock,
-		// and any failure leaves ask/review requests unchanged (serialized on the shared
-		// checkout) rather than stalling the pipeline scan loop. Produce is the explicit
-		// fail-closed exception below. Shell stages carry a RuntimeOverride and stay
-		// excluded from this agent path; opted-in non-service shell stages use their
-		// own fail-open allocator so the three policies remain independent.
-		isolateShell := !serviceShell && pipelineShellStageReadOnlyWorktreeEligible(request)
-		if !serviceShell {
-			if isolateShell {
-				request, worktreePath, worktreeErr = allocatePipelineShellStageReadOnlyWorktree(ctx, store, home, request)
-			} else {
-				request, worktreePath, worktreeErr = allocatePipelineStageReadOnlyWorktree(ctx, store, home, request)
-			}
-		}
-		if strings.TrimSpace(request.Action) == "produce" && strings.TrimSpace(request.WorktreePath) == "" {
-			reason := "produce stage requires a disposable detached worktree; managed repo checkout is unavailable"
-			if worktreeErr != nil {
-				reason = fmt.Sprintf("produce stage requires a disposable detached worktree: %v", worktreeErr)
-			}
-			return createFailedPipelineProduceJob(ctx, store, request, reason)
-		}
-		// A source-bound review is pinned to the implement job's immutable PR head.
-		// Unlike a generic read-only stage, it must never fail open onto the shared
-		// checkout: that checkout may be on the default branch, which would review the
-		// wrong tree. Keep generic #739 allocation fail-open, but fail this one binding
-		// closed unless the pinned detached worktree was allocated successfully.
-		if pipelineStageSourceBoundReviewRequest(request) && strings.TrimSpace(request.WorktreePath) == "" {
-			if worktreeErr != nil {
-				return db.Job{}, fmt.Errorf("allocate PR-bound pipeline review worktree at %s: %w", request.HeadSHA, worktreeErr)
-			}
-			return db.Job{}, fmt.Errorf("allocate PR-bound pipeline review worktree at %s: managed repo checkout is unavailable", request.HeadSHA)
-		}
-		// #768: a MUTATING implement stage takes the WRITABLE task-worktree path
-		// instead of the read-only committed-tip worktree — it must commit + push. Unlike
-		// the read-only allocator (fail-OPEN), this one is fail-CLOSED: on an active
-		// implement job / live process / uncommitted changes it errors and the stage is
-		// NOT enqueued, so a retry can never duplicate or clobber a branch/PR (`gitmoot
-		// task recover` is the operator escape hatch). The two allocators are mutually
-		// exclusive — read-only eligibility excludes the implement action.
-		var writableErr error
-		request, writableErr = allocatePipelineStageWritableWorktree(ctx, store, home, request)
-		if writableErr != nil {
-			return db.Job{}, writableErr
-		}
-		job, err := mailbox.Enqueue(ctx, request)
-		if err != nil {
-			// The worktree is created on disk BEFORE Enqueue; a failed Enqueue leaves
-			// no job row, so neither the terminal cleanup nor the daemon reclaim pass
-			// would ever dispose it. Roll it back here (detached from a possibly
-			// cancelled ctx) exactly as the #739 dispatch path does. Enqueue commonly
-			// fails with context.Canceled on daemon shutdown, so BOTH the checkout
-			// lookup AND the removal must run on a WithoutCancel ctx — otherwise the
-			// lookup itself returns context.Canceled -> empty checkout -> the removal
-			// is skipped and the just-created worktree leaks with no recovery path.
-			if worktreePath != "" {
-				rollbackCtx := context.WithoutCancel(ctx)
-				if checkout := pipelineStageCheckoutPath(rollbackCtx, store, request.Repo); checkout != "" {
-					_ = gitutil.Client{Dir: checkout}.RemoveWorktreeForce(rollbackCtx, worktreePath)
-				}
-			}
-			return db.Job{}, err
-		}
-		// Emit the isolation outcome now that the job row exists (events carry a JobID
-		// FK). Allocated → observable worktree:<path> key; a fail-open skip → a loud
-		// event so a lost-parallelism serialize is never silent (#739).
-		if worktreePath != "" {
-			message := fmt.Sprintf("read-only worktree %s allocated for agent stage (#757/#739); job keyed worktree:<path> to run beside same-repo stages", worktreePath)
-			if serviceShell {
-				message = fmt.Sprintf("detached worktree %s allocated for service shell stage (#1011); registered checkout is never used", worktreePath)
-			} else if isolateShell {
-				message = fmt.Sprintf("read-only worktree %s allocated for opted-in shell stage (#1016); job keyed worktree:<path> to remove shared-checkout serialization (identical shell commands still share a runtime-session key)", worktreePath)
-			}
-			_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "readonly_worktree_allocated", Message: message})
-		} else if worktreeErr != nil {
-			message := fmt.Sprintf("read-only worktree isolation skipped for agent stage (#757/#739); job runs serialized in the shared checkout: %v", worktreeErr)
-			if isolateShell {
-				message = fmt.Sprintf("read-only worktree isolation skipped for opted-in shell stage (#1016); job runs serialized in the shared checkout: %v", worktreeErr)
-			}
-			_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "readonly_worktree_skipped", Message: message})
-		}
-		return job, nil
-	}
-}
-
-func pipelineServiceShellStage(ctx context.Context, store *db.Store, request workflow.JobRequest) (bool, error) {
-	if request.Sender != workflow.PipelineJobSender || strings.TrimSpace(request.RuntimeOverride) != runtime.ShellRuntime {
-		return false, nil
-	}
-	runID := strings.TrimSpace(request.RootJobID)
-	if runID == "" {
-		return false, nil // defensive compatibility for synthetic/non-run requests
-	}
-	run, ok, err := store.GetPipelineRun(ctx, runID)
-	if err != nil {
-		return false, fmt.Errorf("load pipeline run %s for shell isolation: %w", runID, err)
-	}
-	return ok && strings.TrimSpace(run.Trigger) == "service", nil
-}
-
-func allocatePipelineServiceShellWorktree(ctx context.Context, store *db.Store, home string, request workflow.JobRequest) (workflow.JobRequest, string, error) {
-	checkout := pipelineStageCheckoutPath(ctx, store, request.Repo)
-	if checkout == "" {
-		return request, "", nil
-	}
-	paths, err := pathsFromFlag(home)
-	if err != nil {
-		return request, "", err
-	}
-	path, err := workflow.AllocateReadOnlyWorktree(ctx, store, paths.Home, request.Repo, checkout, request.ID,
-		"pipeline-service-stage", 0, "", workflow.ReadOnlyWorktreeDispatchLockWaitBudget, gitutil.Client{Dir: checkout})
-	if err != nil {
-		return request, "", err
-	}
-	if strings.TrimSpace(path) == "" {
-		return request, "", nil
-	}
-	request.WorktreePath = path
-	request.ReadOnlyWorktree = true
-	return request, path, nil
-}
-
-// createFailedPipelineProduceJob records a fail-closed produce allocation as a
-// real terminal stage job, including a loud event and result summary. The
-// advancer can therefore fold/retry it normally without ever exposing a queued
-// job whose cwd would resolve to the managed checkout.
-func createFailedPipelineProduceJob(ctx context.Context, store *db.Store, request workflow.JobRequest, reason string) (db.Job, error) {
-	payload := workflow.JobPayload{
-		Repo:          request.Repo,
-		Sender:        request.Sender,
-		Instructions:  request.Instructions,
-		RootJobID:     request.RootJobID,
-		JobTimeout:    request.JobTimeout,
-		Fingerprint:   request.Fingerprint,
-		WritablePaths: append([]string(nil), request.WritablePaths...),
-		ReadablePaths: append([]string(nil), request.ReadablePaths...),
-		Network:       request.Network,
-		Check:         request.Check,
-		CheckRetries:  request.CheckRetries,
-		Result:        &workflow.AgentResult{Decision: "failed", Summary: reason},
-	}
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return db.Job{}, err
-	}
-	job := db.Job{ID: request.ID, Agent: request.Agent, Type: request.Action, State: string(workflow.JobFailed), Payload: string(encoded)}
-	if err := store.CreateJobWithEvent(ctx, job, db.JobEvent{JobID: job.ID, Kind: "produce_worktree_failed", Message: reason}); err != nil {
-		if existing, getErr := store.GetJob(ctx, request.ID); getErr == nil {
-			return existing, nil
-		}
-		return db.Job{}, err
-	}
-	return job, nil
-}
-
-func pipelineStageSourceBoundReviewRequest(request workflow.JobRequest) bool {
-	return request.Sender == workflow.PipelineJobSender &&
-		strings.TrimSpace(request.Action) == "review" &&
-		request.PullRequest > 0
-}
-
-// pipelineStageReadOnlyWorktreeEligible reports whether a stage job request is a
-// repo-bound AGENT stage that should be born with its own detached read-only
-// worktree (#757). It is true only for a pipeline-sender ask/review job bound to a
-// named agent, running against a repo, that carries NO runtime override (the shell
-// runner sets one) and NO worktree yet. A pure-reasoning agent stage with no repo,
-// and every shell stage, are excluded — they never need a worktree.
-func pipelineStageReadOnlyWorktreeEligible(request workflow.JobRequest) bool {
-	if request.Sender != workflow.PipelineJobSender {
-		return false
-	}
-	if strings.TrimSpace(request.RuntimeOverride) != "" {
-		return false // the hidden shell runner, not an agent stage
-	}
-	if strings.TrimSpace(request.Agent) == "" {
-		return false
-	}
-	switch strings.TrimSpace(request.Action) {
-	case "ask", "review", "produce":
-	default:
-		return false
-	}
-	if strings.TrimSpace(request.Repo) == "" {
-		return false // pure-reasoning stage, nothing to isolate
-	}
-	return strings.TrimSpace(request.WorktreePath) == ""
-}
-
-// pipelineShellStageReadOnlyWorktreeEligible reports whether a non-service shell
-// stage explicitly opted into fail-open committed-tip isolation. Service shell
-// stages are detected before this seam and retain their fail-closed #1011 path.
-func pipelineShellStageReadOnlyWorktreeEligible(request workflow.JobRequest) bool {
-	return request.Sender == workflow.PipelineJobSender &&
-		request.IsolateShellStage &&
-		strings.TrimSpace(request.RuntimeOverride) == runtime.ShellRuntime &&
-		strings.TrimSpace(request.Repo) != "" &&
-		strings.TrimSpace(request.WorktreePath) == ""
-}
-
-// allocatePipelineShellStageReadOnlyWorktree gives an opted-in non-service shell
-// stage its own detached committed-tip worktree. Allocation is FAIL-OPEN: callers
-// enqueue the unchanged request on any error and emit readonly_worktree_skipped.
-// Unlike agent isolation, shell commands receive the live managed checkout through
-// GITMOOT_CHECKOUT and do not get prose appended to their fixed instructions.
-func allocatePipelineShellStageReadOnlyWorktree(ctx context.Context, store *db.Store, home string, request workflow.JobRequest) (workflow.JobRequest, string, error) {
-	checkout := pipelineStageCheckoutPath(ctx, store, request.Repo)
-	if checkout == "" {
-		return request, "", nil // repo not managed/checked out yet — serialize as before
-	}
-	paths, err := pathsFromFlag(home)
-	if err != nil {
-		return request, "", err
-	}
-	path, err := workflow.AllocateReadOnlyWorktree(ctx, store, paths.Home, request.Repo, checkout, request.ID, "pipeline-stage", 0, "", workflow.ReadOnlyWorktreeDispatchLockWaitBudget, gitutil.Client{Dir: checkout})
-	if err != nil {
-		return request, "", err
-	}
-	if strings.TrimSpace(path) == "" {
-		return request, "", errors.New("read-only worktree allocator returned an empty path")
-	}
-	request.WorktreePath = path
-	request.ReadOnlyWorktree = true
-	request.ShellEnv = append(request.ShellEnv, "GITMOOT_CHECKOUT="+checkout)
-	return request, path, nil
-}
-
-// allocatePipelineStageReadOnlyWorktree allocates a detached committed-tip worktree
-// for an eligible repo-bound agent stage and returns the request with WorktreePath +
-// the ReadOnlyWorktree disposal marker set (so the existing terminal cleanup and
-// daemon reclaim dispose it) plus the #654 context note appended to Instructions. It
-// resolves the ref to the checkout HEAD (always resolvable) via the shared
-// workflow.AllocateReadOnlyWorktree primitive under the short
-// ReadOnlyWorktreeDispatchLockWaitBudget. It is FAIL-OPEN: an ineligible stage or an
-// unknown checkout returns the request UNCHANGED with a nil error and empty path; a
-// genuine allocation failure returns the request unchanged with the error so the
-// caller enqueues on the shared checkout and emits a loud skip event.
-func allocatePipelineStageReadOnlyWorktree(ctx context.Context, store *db.Store, home string, request workflow.JobRequest) (workflow.JobRequest, string, error) {
-	if !pipelineStageReadOnlyWorktreeEligible(request) {
-		return request, "", nil
-	}
-	checkout := pipelineStageCheckoutPath(ctx, store, request.Repo)
-	if checkout == "" {
-		return request, "", nil // repo not managed/checked out yet — serialize as before
-	}
-	paths, err := pathsFromFlag(home)
-	if err != nil {
-		return request, "", err
-	}
-	// A source-bound review carries HeadSHA; use it as the detached base ref so the
-	// existing review checkout validation proves HEAD == payload.HeadSHA. Other
-	// read-only stages keep the empty-ref behavior (the checkout's committed tip).
-	baseRef := strings.TrimSpace(request.HeadSHA)
-	path, err := workflow.AllocateReadOnlyWorktree(ctx, store, paths.Home, request.Repo, checkout, request.ID, "pipeline-stage", 0, baseRef, workflow.ReadOnlyWorktreeDispatchLockWaitBudget, gitutil.Client{Dir: checkout})
-	if err != nil {
-		return request, "", err
-	}
-	if strings.TrimSpace(path) == "" {
-		return request, "", nil
-	}
-	request.WorktreePath = path
-	request.ReadOnlyWorktree = true
-	// The detached worktree is the committed tip, so it omits gitignored paths
-	// (repos/**) and uncommitted changes; point the read-only stage at the canonical
-	// checkout for those (#654), exactly as the delegation/dispatch paths do.
-	if note := workflow.ReadOnlyWorktreeContextNote(checkout); note != "" {
-		request.Instructions += note
-	}
-	return request, path, nil
 }
 
 // pipelineStageCheckoutPath resolves a repo's on-disk checkout path, or "" when the
@@ -382,102 +56,6 @@ func pipelineStageCheckoutPath(ctx context.Context, store *db.Store, repo string
 		return ""
 	}
 	return strings.TrimSpace(record.CheckoutPath)
-}
-
-// pipelineStageImplementWorktreeEligible reports whether a stage job request is a
-// repo-bound MUTATING implement stage (#768) that needs a WRITABLE task-worktree.
-// True only for a pipeline-sender implement job bound to a named agent, running
-// against a repo, that carries NO runtime override (the shell runner sets one) and NO
-// worktree yet. Every read-only agent stage (ask/review) and every shell stage is
-// excluded — the read-only allocator (which itself excludes non-ask/review) owns those.
-func pipelineStageImplementWorktreeEligible(request workflow.JobRequest) bool {
-	if request.Sender != workflow.PipelineJobSender {
-		return false
-	}
-	if strings.TrimSpace(request.RuntimeOverride) != "" {
-		return false
-	}
-	if strings.TrimSpace(request.Agent) == "" {
-		return false
-	}
-	if strings.TrimSpace(request.Action) != "implement" {
-		return false
-	}
-	if strings.TrimSpace(request.Repo) == "" {
-		return false
-	}
-	return strings.TrimSpace(request.WorktreePath) == ""
-}
-
-// allocatePipelineStageWritableWorktree gives a MUTATING implement stage (#768) a real
-// WRITABLE task-worktree on its DETERMINISTIC branch by REUSING the existing implement
-// dispatch preparation (prepareLocalImplementDispatchRequest): its GetTaskByRepoBranch
-// reuse lands a retry in the SAME branch/worktree (never a duplicate PR), and its
-// fail-closed guards (an active implement job, a live process still inside the
-// worktree, or uncommitted changes) reject a retry that would clobber or duplicate
-// work. Unlike the read-only allocator it is FAIL-CLOSED: any error propagates so the
-// stage is NOT enqueued. An ineligible request (every non-implement stage) returns
-// unchanged with a nil error. On success the request carries the task worktree path +
-// the resolved deterministic branch/task/head, so the enqueued job keys worktree:<path>
-// (mutating same-repo stages parallelize; the only serialization is the brief
-// checkout-mutation lock during allocation). ReadOnlyWorktree is deliberately left
-// false — the task worktree is durable (disposed by the task lifecycle, not the #739
-// read-only cleanup).
-func allocatePipelineStageWritableWorktree(ctx context.Context, store *db.Store, home string, request workflow.JobRequest) (workflow.JobRequest, error) {
-	if !pipelineStageImplementWorktreeEligible(request) {
-		return request, nil
-	}
-	record, err := store.GetRepo(ctx, request.Repo)
-	if err != nil {
-		return request, fmt.Errorf("resolve repo %q for implement stage: %w", request.Repo, err)
-	}
-	repo, err := daemon.ParseRepository(request.Repo)
-	if err != nil {
-		return request, err
-	}
-	// Ensure the DETERMINISTIC task row exists so prepareLocalImplementDispatchRequest's
-	// BRANCH-reuse path adopts THIS run+stage's task id — and, crucially, so its
-	// fail-closed guards (active job / live process / uncommitted changes) run on EVERY
-	// attempt. We therefore hand it an EMPTY TaskID (which routes through that guarded
-	// branch-reuse block) plus the deterministic Branch; passing a non-empty TaskID would
-	// skip the guards entirely. Idempotent: created once (Planned), reused thereafter.
-	if _, gerr := store.GetTask(ctx, request.TaskID); gerr != nil {
-		if !errors.Is(gerr, sql.ErrNoRows) {
-			return request, gerr
-		}
-		if uerr := store.UpsertTask(ctx, db.Task{
-			ID:           request.TaskID,
-			RepoFullName: request.Repo,
-			GoalID:       firstNonEmpty(request.GoalID, "pipeline"),
-			Title:        firstNonEmpty(request.TaskTitle, request.TaskID),
-			State:        string(workflow.TaskPlanned),
-			Branch:       request.Branch,
-		}); uerr != nil {
-			return request, uerr
-		}
-	}
-	dispatch := localAgentDispatchRequest{
-		Home:         home,
-		Agent:        request.Agent,
-		Action:       "implement",
-		Instructions: request.Instructions,
-		Branch:       request.Branch,
-		GoalID:       request.GoalID,
-		TaskTitle:    request.TaskTitle,
-		RepoFlag:     request.Repo,
-	}
-	task, dispatch, err := prepareLocalImplementDispatchRequest(ctx, store, record, repo, dispatch)
-	if err != nil {
-		return request, err
-	}
-	request.WorktreePath = task.WorktreePath
-	request.Branch = dispatch.Branch
-	request.TaskID = dispatch.TaskID
-	request.HeadSHA = dispatch.HeadSHA
-	request.GoalID = firstNonEmpty(request.GoalID, dispatch.GoalID)
-	request.TaskTitle = firstNonEmpty(request.TaskTitle, dispatch.TaskTitle)
-	request.LeadAgent = firstNonEmpty(request.LeadAgent, dispatch.LeadAgent)
-	return request, nil
 }
 
 // pipelineStageImplementTaskID / pipelineStageImplementBranch derive the DETERMINISTIC,
@@ -510,13 +88,16 @@ func pipelineStageJobID(runID, stageID string, attempt int) string {
 	return fmt.Sprintf("%s-%s-a%d", runID, stageID, attempt)
 }
 
+// PipelineStageJobID exposes the engine's deterministic stage job identifier.
+var PipelineStageJobID = pipelineStageJobID
+
 // pipelineStageFingerprint is the stage job fingerprint `pipeline:<name>:<run>:
 // <stage>:<attempt>` (decision 2), unique per stage attempt.
 func pipelineStageFingerprint(pipelineName, runID, stageID string, attempt int) string {
 	return fmt.Sprintf("pipeline:%s:%s:%s:%d", pipelineName, runID, stageID, attempt)
 }
 
-// pipelineStageJobRequest builds the JobRequest for one stage attempt. The stage
+// PipelineStageJobRequest builds the JobRequest for one stage attempt. The stage
 // command travels in RuntimeOverrideRef (the shell runtime runs it verbatim as
 // `sh -c <cmd> gitmoot <prompt>`), NOT on the runner agent's runtime_ref, so one
 // runner serves every stage. ParentJobID and DelegationID stay EMPTY (any
@@ -526,14 +107,14 @@ func pipelineStageFingerprint(pipelineName, runID, stageID string, attempt int) 
 // pipelineStageMintsJob reports whether a newly-ready stage of this kind enqueues a
 // worker job in the ENQUEUE pass. Every kind today (shell, agent ask/review) does,
 // so this is always true and the enqueue loop is byte-identical. A future JOBLESS
-// gate (#768 Phase 2) appends `case pipeline.StageKindGate: return false`, at which
+// gate (#768 Phase 2) appends `case StageKindGate: return false`, at which
 // point the enqueue loop marks the stage in-flight without a job and the settle seam
 // waits on the external predicate — a pure per-kind append, never an edit to the
-// shared enqueue loop or to pipelineStageJobRequest (which stays the per-kind REQUEST
+// shared enqueue loop or to PipelineStageJobRequest (which stays the per-kind REQUEST
 // builder: an implement kind #768 appends its writable-worktree/branch branch there).
-func pipelineStageMintsJob(stage pipeline.Stage) bool {
+func pipelineStageMintsJob(stage Stage) bool {
 	switch stage.Kind() {
-	case pipeline.StageKindGate:
+	case StageKindGate:
 		// A JOBLESS gate (#768 Phase 2) has no worker/runtime session: the ENQUEUE pass
 		// marks it in-flight (queued) WITHOUT minting a job, and the settle seam folds it
 		// on its external predicate (pr_merged) instead of on a job's terminal state.
@@ -543,11 +124,11 @@ func pipelineStageMintsJob(stage pipeline.Stage) bool {
 	}
 }
 
-// pipelineStagePRBinding is recovered from a source implement stage's immutable
+// PipelineStagePRBinding is recovered from a source implement stage's immutable
 // job payload after that stage folds success. It is intentionally not derived from
 // the human-readable stage summary: the finalizer's structured payload stamp is the
 // authoritative and deterministic PR identity across advancer re-scans.
-type pipelineStagePRBinding struct {
+type PipelineStagePRBinding struct {
 	PullRequest int
 	HeadSHA     string
 	Branch      string
@@ -555,7 +136,7 @@ type pipelineStagePRBinding struct {
 	LeadAgent   string
 }
 
-func pipelineStageJobRequest(rec db.Pipeline, stage pipeline.Stage, run db.PipelineRun, attempt int, upstreamContext string, binding pipelineStagePRBinding, skipNativeReviewFanout bool) workflow.JobRequest {
+func PipelineStageJobRequest(rec db.Pipeline, stage Stage, run db.PipelineRun, attempt int, upstreamContext string, binding PipelineStagePRBinding, skipNativeReviewFanout bool) workflow.JobRequest {
 	// Service input is schema-validated and delivered exclusively through the
 	// dedicated PipelineInputEnv field. Never project a service run's payload into
 	// an agent prompt; Pass 2 will attach the typed env after loading its service
@@ -568,7 +149,7 @@ func pipelineStageJobRequest(rec db.Pipeline, stage pipeline.Stage, run db.Pipel
 		pipelineInputEnv = pipelineServiceInputEnvironment(run.PayloadJSON)
 	}
 	instructions := triggerContext + upstreamContext + stage.Prompt
-	if stage.Kind() == pipeline.StageKindAgentProduce && attempt > 0 {
+	if stage.Kind() == StageKindAgentProduce && attempt > 0 {
 		// Note stays FIRST after the trigger block: byte-identical to the
 		// pre-#863 prompt when no payload is present, and the reconcile
 		// warning keeps its top-of-prompt salience.
@@ -616,7 +197,7 @@ func pipelineStageJobRequest(rec db.Pipeline, stage pipeline.Stage, run db.Pipel
 	// a cmd stage that also set the flag) must NOT set OrchestrateStage and relax the
 	// pipeline-sender delegations strip — the leaf-strip relaxation stays keyed to the
 	// exact shape the validator accepted as an orchestrate coordinator.
-	if stage.Kind() == pipeline.StageKindOrchestrate {
+	if stage.Kind() == StageKindOrchestrate {
 		id := pipelineStageJobID(run.ID, stage.ID, attempt)
 		return workflow.JobRequest{
 			ID:               id,
@@ -632,7 +213,7 @@ func pipelineStageJobRequest(rec db.Pipeline, stage pipeline.Stage, run db.Pipel
 			PipelineInputEnv: append([]string(nil), pipelineInputEnv...),
 		}
 	}
-	if stage.Kind() == pipeline.StageKindAgentProduce {
+	if stage.Kind() == StageKindAgentProduce {
 		return workflow.JobRequest{
 			ID:               pipelineStageJobID(run.ID, stage.ID, attempt),
 			Agent:            stage.Agent,
@@ -661,7 +242,7 @@ func pipelineStageJobRequest(rec db.Pipeline, stage pipeline.Stage, run db.Pipel
 	// (Sender=pipeline strips delegations/human_questions), and this implement job never
 	// merges its PR; only a separately authorized gate may. This is an APPEND above the
 	// read-only agent branch, which stays byte-identical.
-	if stage.Kind() == pipeline.StageKindAgentImplement {
+	if stage.Kind() == StageKindAgentImplement {
 		return workflow.JobRequest{
 			ID:           pipelineStageJobID(run.ID, stage.ID, attempt),
 			Agent:        stage.Agent,
@@ -693,7 +274,7 @@ func pipelineStageJobRequest(rec db.Pipeline, stage pipeline.Stage, run db.Pipel
 			JobTimeout:       stage.Timeout,
 			PipelineInputEnv: append([]string(nil), pipelineInputEnv...),
 		}
-		if stage.Kind() == pipeline.StageKindAgentReview && strings.TrimSpace(stage.Source) != "" {
+		if stage.Kind() == StageKindAgentReview && strings.TrimSpace(stage.Source) != "" {
 			request.PullRequest = binding.PullRequest
 			request.HeadSHA = binding.HeadSHA
 			request.Branch = binding.Branch
@@ -746,34 +327,34 @@ func pipelineServiceInputEnvironment(payloadJSON string) []string {
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return nil
 	}
-	values := make(map[string]pipeline.TypedValue, len(raw))
+	values := make(map[string]TypedValue, len(raw))
 	for name, value := range raw {
-		if !pipeline.ValidTriggerPayloadKey(name) {
+		if !ValidTriggerPayloadKey(name) {
 			return nil
 		}
 		switch typed := value.(type) {
 		case string:
-			values[name] = pipeline.TypedValue{Type: pipeline.ServiceFieldString, String: typed}
+			values[name] = TypedValue{Type: ServiceFieldString, String: typed}
 		case bool:
-			values[name] = pipeline.TypedValue{Type: pipeline.ServiceFieldBoolean, Boolean: typed}
+			values[name] = TypedValue{Type: ServiceFieldBoolean, Boolean: typed}
 		case json.Number:
 			integer, err := typed.Int64()
 			if err != nil {
 				return nil
 			}
-			values[name] = pipeline.TypedValue{Type: pipeline.ServiceFieldInteger, Integer: integer}
+			values[name] = TypedValue{Type: ServiceFieldInteger, Integer: integer}
 		default:
 			return nil
 		}
 	}
-	return pipeline.ServiceInputEnvironment(values)
+	return ServiceInputEnvironment(values)
 }
 
-func pipelineSourceBoundReview(stage pipeline.Stage) bool {
-	return stage.Kind() == pipeline.StageKindAgentReview && strings.TrimSpace(stage.Source) != ""
+func pipelineSourceBoundReview(stage Stage) bool {
+	return stage.Kind() == StageKindAgentReview && strings.TrimSpace(stage.Source) != ""
 }
 
-func pipelineImplementHasSourceBoundReview(spec pipeline.Spec, implementStageID string) bool {
+func pipelineImplementHasSourceBoundReview(spec Spec, implementStageID string) bool {
 	for _, candidate := range spec.Stages {
 		if pipelineSourceBoundReview(candidate) && strings.TrimSpace(candidate.Source) == implementStageID {
 			return true
@@ -782,19 +363,19 @@ func pipelineImplementHasSourceBoundReview(spec pipeline.Spec, implementStageID 
 	return false
 }
 
-func resolvePipelineStagePRBinding(ctx context.Context, store *db.Store, sourceRow db.PipelineRunStage) (pipelineStagePRBinding, error) {
+func resolvePipelineStagePRBinding(ctx context.Context, store *db.Store, sourceRow db.PipelineRunStage) (PipelineStagePRBinding, error) {
 	if strings.TrimSpace(sourceRow.JobID) == "" {
-		return pipelineStagePRBinding{}, fmt.Errorf("source stage %q has no job id", sourceRow.StageID)
+		return PipelineStagePRBinding{}, fmt.Errorf("source stage %q has no job id", sourceRow.StageID)
 	}
 	job, err := store.GetJob(ctx, sourceRow.JobID)
 	if err != nil {
-		return pipelineStagePRBinding{}, fmt.Errorf("load source stage %q job %q: %w", sourceRow.StageID, sourceRow.JobID, err)
+		return PipelineStagePRBinding{}, fmt.Errorf("load source stage %q job %q: %w", sourceRow.StageID, sourceRow.JobID, err)
 	}
 	payload, err := workflow.ParseJobPayload(job.Payload)
 	if err != nil {
-		return pipelineStagePRBinding{}, fmt.Errorf("parse source stage %q job %q payload: %w", sourceRow.StageID, sourceRow.JobID, err)
+		return PipelineStagePRBinding{}, fmt.Errorf("parse source stage %q job %q payload: %w", sourceRow.StageID, sourceRow.JobID, err)
 	}
-	return pipelineStagePRBinding{
+	return PipelineStagePRBinding{
 		PullRequest: payload.PullRequest,
 		HeadSHA:     strings.TrimSpace(payload.HeadSHA),
 		Branch:      strings.TrimSpace(payload.Branch),
@@ -807,7 +388,7 @@ func resolvePipelineStagePRBinding(ctx context.Context, store *db.Store, sourceR
 // (e.g. a duplicate id from a re-scan that raced the stage-row write) it adopts an
 // already-created job with the same deterministic id, mirroring the engine's
 // enqueue idiom (engine.go). A genuinely new error with no matching job propagates.
-func enqueuePipelineStageJob(ctx context.Context, store *db.Store, enqueue pipelineStageEnqueuer, request workflow.JobRequest, adoptBeforeEnqueue bool) (db.Job, error) {
+func enqueuePipelineStageJob(ctx context.Context, store *db.Store, enqueue PipelineStageEnqueuer, request workflow.JobRequest, adoptBeforeEnqueue bool) (db.Job, error) {
 	// A source-bound review allocates its deterministic pinned worktree before the
 	// mailbox creates the deterministic job. If a scan dies after that enqueue but
 	// before its stage row records JobID, the next scan must adopt the existing job
@@ -834,20 +415,20 @@ func enqueuePipelineStageJob(ctx context.Context, store *db.Store, enqueue pipel
 	return db.Job{}, err
 }
 
-// createPipelineRun creates a fresh manual/scheduled run: the pipeline_runs row
+// CreatePipelineRun creates a fresh manual/scheduled run: the pipeline_runs row
 // (snapshotting the pipeline's current spec_hash) plus one pending
 // pipeline_run_stages row per spec stage, and records the run on the pipeline's
 // last-run bookkeeping. It does NOT enqueue anything — the caller advances the run
 // once to enqueue the ready root stages, so creation and the first advance are the
 // same idempotent code path a re-scan uses.
-func createPipelineRun(ctx context.Context, store *db.Store, rec db.Pipeline, spec pipeline.Spec, trigger, payloadJSON string, now time.Time) (db.PipelineRun, error) {
+func CreatePipelineRun(ctx context.Context, store *db.Store, rec db.Pipeline, spec Spec, trigger, payloadJSON string, now time.Time) (db.PipelineRun, error) {
 	run := db.PipelineRun{
 		ID:          pipelineRunID(rec.Name, now),
 		Pipeline:    rec.Name,
 		Trigger:     trigger,
 		PayloadJSON: payloadJSON,
 		SpecHash:    rec.SpecHash,
-		State:       pipeline.RunRunning,
+		State:       RunRunning,
 		StartedAt:   now.UTC(),
 	}
 	if err := store.CreatePipelineRun(ctx, run); err != nil {
@@ -857,19 +438,19 @@ func createPipelineRun(ctx context.Context, store *db.Store, rec db.Pipeline, sp
 		if err := store.CreatePipelineRunStage(ctx, db.PipelineRunStage{
 			RunID:     run.ID,
 			StageID:   stage.ID,
-			State:     pipeline.StagePending,
+			State:     StagePending,
 			NeedsJSON: marshalPipelineNeeds(stage.Needs),
 		}); err != nil {
 			return db.PipelineRun{}, err
 		}
 	}
-	if err := store.UpdatePipelineLastRun(ctx, rec.Name, run.ID, pipeline.RunRunning, now.UTC()); err != nil {
+	if err := store.UpdatePipelineLastRun(ctx, rec.Name, run.ID, RunRunning, now.UTC()); err != nil {
 		return db.PipelineRun{}, err
 	}
 	return run, nil
 }
 
-// runPipelineScanOnce is the pipeline scan wired into BOTH daemon supervisor loops
+// RunPipelineScanOnce is the pipeline scan wired into BOTH daemon supervisor loops
 // next to runHeartbeatScanOnce (#681). Each tick is three passes, mirroring the
 // heartbeat idiom:
 //
@@ -887,13 +468,13 @@ func createPipelineRun(ctx context.Context, store *db.Store, rec db.Pipeline, sp
 // or terminal run is never advanced. A per-pipeline / per-run error is collected
 // (first wins) but never stops the rest; the daemon caller logs it and never aborts
 // the loop.
-func runPipelineScanOnce(ctx context.Context, store *db.Store, enqueue pipelineStageEnqueuer, now time.Time) error {
+func RunPipelineScanOnce(ctx context.Context, store *db.Store, enqueue PipelineStageEnqueuer, now time.Time) error {
 	now = now.UTC()
 	var firstErr error
 	if err := schedulePipelineRuns(ctx, store, now); err != nil && firstErr == nil {
 		firstErr = err
 	}
-	if err := triggerPipelineRuns(ctx, store, now); err != nil && firstErr == nil {
+	if err := TriggerPipelineRuns(ctx, store, now); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if err := advancePipelineRuns(ctx, store, enqueue, now); err != nil && firstErr == nil {
@@ -902,10 +483,10 @@ func runPipelineScanOnce(ctx context.Context, store *db.Store, enqueue pipelineS
 	return firstErr
 }
 
-// triggerPipelineRuns is the once-per-upstream-success scan pass. It creates at
+// TriggerPipelineRuns is the once-per-upstream-success scan pass. It creates at
 // most one run per downstream per tick; the downstream active-run guard leaves
 // the cursor untouched so the same upstream success is retried after settlement.
-func triggerPipelineRuns(ctx context.Context, store *db.Store, now time.Time) error {
+func TriggerPipelineRuns(ctx context.Context, store *db.Store, now time.Time) error {
 	records, err := store.ListPipelines(ctx)
 	if err != nil {
 		return err
@@ -923,7 +504,7 @@ func triggerOnePipeline(ctx context.Context, store *db.Store, rec db.Pipeline, n
 	if !rec.Enabled {
 		return nil
 	}
-	spec, err := pipeline.Load([]byte(rec.SpecYAML))
+	spec, err := Load([]byte(rec.SpecYAML))
 	if err != nil || spec.Trigger == nil || spec.Trigger.Kind != "pipeline" {
 		return nil
 	}
@@ -945,11 +526,11 @@ func triggerOnePipeline(ctx context.Context, store *db.Store, rec db.Pipeline, n
 	if err != nil || !found {
 		return err
 	}
-	environment, err := resolvePipelineEnvironment(ctx, store, "", spec)
+	environment, err := ResolvePipelineEnvironment(ctx, store, "", spec)
 	if err != nil {
 		return err
 	}
-	if err := pipelineEnvironmentResolutionError(spec, environment.Unresolved); err != nil {
+	if err := PipelineEnvironmentResolutionError(spec, environment.Unresolved); err != nil {
 		return err
 	}
 	payload, err := json.Marshal(map[string]string{
@@ -960,12 +541,12 @@ func triggerOnePipeline(ctx context.Context, store *db.Store, rec db.Pipeline, n
 		return err
 	}
 	run := db.PipelineRun{
-		ID:          pipelineRunID(rec.Name, now) + "-" + pipeline.Hash([]byte(upstreamRun.ID))[:12],
+		ID:          pipelineRunID(rec.Name, now) + "-" + Hash([]byte(upstreamRun.ID))[:12],
 		Pipeline:    rec.Name,
 		Trigger:     "pipeline",
 		PayloadJSON: string(payload),
 		SpecHash:    rec.SpecHash,
-		State:       pipeline.RunRunning,
+		State:       RunRunning,
 		StartedAt:   now,
 	}
 	stages := make([]db.PipelineRunStage, 0, len(spec.Stages))
@@ -973,7 +554,7 @@ func triggerOnePipeline(ctx context.Context, store *db.Store, rec db.Pipeline, n
 		stages = append(stages, db.PipelineRunStage{
 			RunID:     run.ID,
 			StageID:   stage.ID,
-			State:     pipeline.StagePending,
+			State:     StagePending,
 			NeedsJSON: marshalPipelineNeeds(stage.Needs),
 		})
 	}
@@ -981,13 +562,13 @@ func triggerOnePipeline(ctx context.Context, store *db.Store, rec db.Pipeline, n
 	return err
 }
 
-// pipelineRunsInFlight reports whether any pipeline run is still in flight
+// PipelineRunsInFlight reports whether any pipeline run is still in flight
 // (state='running'). The registered-repo supervisor calls it once per cycle,
-// AFTER runPipelineScanOnce, to decide whether the pipeline advancer needs a
+// AFTER RunPipelineScanOnce, to decide whether the pipeline advancer needs a
 // prompt next tick (#697). Off-by-default cheap: with no pipelines / no active
 // runs the active-run query returns an empty slice before any further work, so
 // an idle daemon pays only one indexed SELECT per cycle.
-func pipelineRunsInFlight(ctx context.Context, store *db.Store) (bool, error) {
+func PipelineRunsInFlight(ctx context.Context, store *db.Store) (bool, error) {
 	runs, err := store.ListActivePipelineRuns(ctx)
 	if err != nil {
 		return false, err
@@ -995,7 +576,7 @@ func pipelineRunsInFlight(ctx context.Context, store *db.Store) (bool, error) {
 	return len(runs) > 0, nil
 }
 
-// pipelineAdvanceWait decouples the pipeline-advance cadence from the repo-poll
+// PipelineAdvanceWait decouples the pipeline-advance cadence from the repo-poll
 // backoff (#697). The registered-repo supervisor sleeps for the wait the poller
 // returns, which grows to minutes when repo polling backs off (persistent repo
 // errors / a 404 repo / a GitHub secondary rate-limit; base 1m, max 5m). That
@@ -1008,7 +589,7 @@ func pipelineRunsInFlight(ctx context.Context, store *db.Store) (bool, error) {
 // before. The repo poller is unaffected: it re-checks each repo's own NextPoll
 // due time and skips repos not yet due, so an early wake never re-polls a
 // backed-off repo.
-func pipelineAdvanceWait(pollWait, pollFloor time.Duration, runsInFlight bool) time.Duration {
+func PipelineAdvanceWait(pollWait, pollFloor time.Duration, runsInFlight bool) time.Duration {
 	if !runsInFlight {
 		return pollWait
 	}
@@ -1018,7 +599,7 @@ func pipelineAdvanceWait(pollWait, pollFloor time.Duration, runsInFlight bool) t
 	return pollWait
 }
 
-// schedulePipelineRuns is runPipelineScanOnce's SCHEDULE pass (#681): it creates a
+// schedulePipelineRuns is RunPipelineScanOnce's SCHEDULE pass (#681): it creates a
 // run for each enabled pipeline whose interval schedule is due and has no active
 // run. A per-pipeline error is collected (first wins) but never stops the rest.
 func schedulePipelineRuns(ctx context.Context, store *db.Store, now time.Time) error {
@@ -1078,7 +659,7 @@ func scheduleOnePipeline(ctx context.Context, store *db.Store, rec db.Pipeline, 
 	if strings.TrimSpace(rec.Repo) == "" {
 		return store.AdvancePipelineNextDue(ctx, rec.Name, nextDue)
 	}
-	// Overlap guard: one active (state='running') run per pipeline. A run in flight
+	// Overlap guard: one active (state='running') run per  A run in flight
 	// means skip WITHOUT advancing next_due, so the next scheduled run fires as soon
 	// as this one settles. A parked (blocked/failed) run does NOT count as active,
 	// mirroring `pipeline run`'s ActivePipelineRun guard.
@@ -1087,15 +668,15 @@ func scheduleOnePipeline(ctx context.Context, store *db.Store, rec db.Pipeline, 
 	} else if active {
 		return nil
 	}
-	spec, err := pipeline.Load([]byte(rec.SpecYAML))
+	spec, err := Load([]byte(rec.SpecYAML))
 	if err != nil {
 		// A stored spec that no longer parses can't be run (`pipeline add` validates,
 		// so this is defensive); advance next_due so a broken spec does not hot-loop.
 		return store.AdvancePipelineNextDue(ctx, rec.Name, nextDue)
 	}
-	environment, envErr := resolvePipelineEnvironment(ctx, store, "", spec)
+	environment, envErr := ResolvePipelineEnvironment(ctx, store, "", spec)
 	if envErr == nil {
-		envErr = pipelineEnvironmentResolutionError(spec, environment.Unresolved)
+		envErr = PipelineEnvironmentResolutionError(spec, environment.Unresolved)
 	}
 	if envErr != nil {
 		if advanceErr := store.AdvancePipelineNextDue(ctx, rec.Name, nextDue); advanceErr != nil {
@@ -1103,21 +684,21 @@ func scheduleOnePipeline(ctx context.Context, store *db.Store, rec db.Pipeline, 
 		}
 		return envErr
 	}
-	if _, err := createPipelineRun(ctx, store, rec, spec, "schedule", "{}", now); err != nil {
+	if _, err := CreatePipelineRun(ctx, store, rec, spec, "schedule", "{}", now); err != nil {
 		return err
 	}
-	// createPipelineRun stamped last_run_*; advance ONLY next_due (anchored to now).
+	// CreatePipelineRun stamped last_run_*; advance ONLY next_due (anchored to now).
 	// The ADVANCE pass that follows enqueues this run's ready root stages.
 	return store.AdvancePipelineNextDue(ctx, rec.Name, nextDue)
 }
 
-// advancePipelineRuns is runPipelineScanOnce's ADVANCE pass (#681): it advances
+// advancePipelineRuns is RunPipelineScanOnce's ADVANCE pass (#681): it advances
 // every in-flight (state='running') run once, so parked (blocked/failed) and
 // terminal runs consume zero compute. A per-run error is collected (first wins) but
 // never stops the remaining runs. Runs whose pipeline was removed, whose stored
 // spec no longer parses, or whose spec drifted (hash no longer matches the run's
 // snapshot) are skipped rather than executed against a changed spec.
-func advancePipelineRuns(ctx context.Context, store *db.Store, enqueue pipelineStageEnqueuer, now time.Time) error {
+func advancePipelineRuns(ctx context.Context, store *db.Store, enqueue PipelineStageEnqueuer, now time.Time) error {
 	runs, err := store.ListActivePipelineRuns(ctx)
 	if err != nil {
 		return err
@@ -1135,7 +716,7 @@ func advancePipelineRuns(ctx context.Context, store *db.Store, enqueue pipelineS
 		if !ok {
 			continue
 		}
-		spec, err := pipeline.Load([]byte(rec.SpecYAML))
+		spec, err := Load([]byte(rec.SpecYAML))
 		if err != nil {
 			continue
 		}
@@ -1146,14 +727,14 @@ func advancePipelineRuns(ctx context.Context, store *db.Store, enqueue pipelineS
 		if strings.TrimSpace(rec.SpecHash) != strings.TrimSpace(run.SpecHash) {
 			continue
 		}
-		if _, err := advancePipelineRun(ctx, store, enqueue, rec, spec, run, now); err != nil && firstErr == nil {
+		if _, err := AdvancePipelineRun(ctx, store, enqueue, rec, spec, run, now); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 	return firstErr
 }
 
-// advancePipelineRun is the per-run advancer (decision 6). It is a single
+// AdvancePipelineRun is the per-run advancer (decision 6). It is a single
 // idempotent pass: FOLD every settled stage job into its stage row by DECISION,
 // ENQUEUE every newly-ready stage (deps all succeeded — a blocked/failed branch
 // halts only ITSELF, so independent branches keep running), then, if
@@ -1162,18 +743,18 @@ func advancePipelineRuns(ctx context.Context, store *db.Store, enqueue pipelineS
 // It writes only rows that actually change, so a re-scan on an unchanged run makes
 // no writes and no enqueues. It assumes run.State == running; a parked/terminal run
 // is a no-op. The updated run is returned for callers/tests.
-func advancePipelineRun(ctx context.Context, store *db.Store, enqueue pipelineStageEnqueuer, rec db.Pipeline, spec pipeline.Spec, run db.PipelineRun, now time.Time) (db.PipelineRun, error) {
-	var autoMerge pipelineAutoMergeExecutor
+func AdvancePipelineRun(ctx context.Context, store *db.Store, enqueue PipelineStageEnqueuer, rec db.Pipeline, spec Spec, run db.PipelineRun, now time.Time) (db.PipelineRun, error) {
+	var autoMerge PipelineAutoMergeExecutor
 	for _, stage := range spec.Stages {
-		if strings.TrimSpace(stage.Merge) == pipeline.GateMergeAuto {
-			autoMerge = newPipelineAutoMerger(ctx, store, rec.Repo)
+		if strings.TrimSpace(stage.Merge) == GateMergeAuto {
+			autoMerge = NewPipelineAutoMerger(ctx, store, rec.Repo)
 			break
 		}
 	}
-	return advancePipelineRunWithAutoMerge(ctx, store, enqueue, rec, spec, run, now, autoMerge)
+	return AdvancePipelineRunWithAutoMerge(ctx, store, enqueue, rec, spec, run, now, autoMerge)
 }
 
-func newPipelineAutoMerger(ctx context.Context, store *db.Store, repo string) workflow.PipelineAutoMerger {
+func NewPipelineAutoMerger(ctx context.Context, store *db.Store, repo string) workflow.PipelineAutoMerger {
 	checkout := pipelineStageCheckoutPath(ctx, store, repo)
 	merger := workflow.PipelineAutoMerger{Store: store, GitHub: github.NewClient(checkout)}
 	home := ""
@@ -1184,14 +765,14 @@ func newPipelineAutoMerger(ctx context.Context, store *db.Store, repo string) wo
 	return merger
 }
 
-// advancePipelineRunWithAutoMerge is the testable advancer core. The executor is
+// AdvancePipelineRunWithAutoMerge is the testable advancer core. The executor is
 // threaded only into the per-stage settle deps; human-default gates never call it.
-func advancePipelineRunWithAutoMerge(ctx context.Context, store *db.Store, enqueue pipelineStageEnqueuer, rec db.Pipeline, spec pipeline.Spec, run db.PipelineRun, now time.Time, autoMerge pipelineAutoMergeExecutor) (db.PipelineRun, error) {
+func AdvancePipelineRunWithAutoMerge(ctx context.Context, store *db.Store, enqueue PipelineStageEnqueuer, rec db.Pipeline, spec Spec, run db.PipelineRun, now time.Time, autoMerge PipelineAutoMergeExecutor) (db.PipelineRun, error) {
 	now = now.UTC()
-	if run.State != pipeline.RunRunning {
+	if run.State != RunRunning {
 		return run, nil
 	}
-	specByID := make(map[string]pipeline.Stage, len(spec.Stages))
+	specByID := make(map[string]Stage, len(spec.Stages))
 	for _, stage := range spec.Stages {
 		specByID[stage.ID] = stage
 	}
@@ -1203,7 +784,7 @@ func advancePipelineRunWithAutoMerge(ctx context.Context, store *db.Store, enque
 	jobIDs := make([]string, 0, len(rows))
 	for _, row := range rows {
 		byID[row.StageID] = row
-		if (row.State == pipeline.StageQueued || row.State == pipeline.StageRunning) && strings.TrimSpace(row.JobID) != "" {
+		if (row.State == StageQueued || row.State == StageRunning) && strings.TrimSpace(row.JobID) != "" {
 			jobIDs = append(jobIDs, row.JobID)
 		}
 	}
@@ -1218,7 +799,7 @@ func advancePipelineRunWithAutoMerge(ctx context.Context, store *db.Store, enque
 		if !ok {
 			continue
 		}
-		if row.State != pipeline.StageQueued && row.State != pipeline.StageRunning {
+		if row.State != StageQueued && row.State != StageRunning {
 			continue
 		}
 		// The per-kind settle predicate owns everything job-shaped: whether the stage
@@ -1244,18 +825,18 @@ func advancePipelineRunWithAutoMerge(ctx context.Context, store *db.Store, enque
 			}
 			continue
 		}
-		if state == pipeline.StageFailed && row.Attempt < stage.Retry {
+		if state == StageFailed && row.Attempt < stage.Retry {
 			// Retry budget remains: bump the attempt and reset to pending so the
 			// enqueue phase re-launches it under a fresh deterministic id/fingerprint.
 			row.Attempt++
-			row.State = pipeline.StagePending
+			row.State = StagePending
 			row.JobID = ""
 			row.Summary = summary
 			row.NeedsJSON = ""
 			row.StartedAt = time.Time{}
 			row.FinishedAt = time.Time{}
 		} else {
-			preserveStartedAt := stage.Kind() == pipeline.StageKindOrchestrate && row.State == pipeline.StageRunning
+			preserveStartedAt := stage.Kind() == StageKindOrchestrate && row.State == StageRunning
 			row.State = state
 			row.Summary = summary
 			row.NeedsJSON = marshalPipelineNeeds(needs)
@@ -1283,7 +864,7 @@ func advancePipelineRunWithAutoMerge(ctx context.Context, store *db.Store, enque
 	// never ready"). The run does not park until nothing is in flight below.
 	for _, stage := range spec.Stages {
 		row := byID[stage.ID]
-		if row.State != pipeline.StagePending || !pipelineStageDepsSucceeded(stage, byID) {
+		if row.State != StagePending || !pipelineStageDepsSucceeded(stage, byID) {
 			continue
 		}
 		if !pipelineStageMintsJob(stage) {
@@ -1295,7 +876,7 @@ func advancePipelineRunWithAutoMerge(ctx context.Context, store *db.Store, enque
 			// measures the gate's wait from. This stays a pure append (`case StageKindGate:
 			// return false` in pipelineStageMintsJob), not an edit to the shared enqueue loop
 			// below, which remains byte-identical for job-minting kinds.
-			row.State = pipeline.StageQueued
+			row.State = StageQueued
 			row.StartedAt = now
 			if err := persistPipelineStage(ctx, store, byID[stage.ID], row); err != nil {
 				return run, err
@@ -1307,10 +888,10 @@ func advancePipelineRunWithAutoMerge(ctx context.Context, store *db.Store, enque
 		// stage kind: bounded fenced prompt text for agents, bounded persisted JSON
 		// for shell stages. Both are empty for root stages.
 		upstreamContext := buildPipelineAgentStageContext(stage, byID)
-		if stage.Kind() == pipeline.StageKindShell {
+		if stage.Kind() == StageKindShell {
 			upstreamContext = buildPipelineShellStageUpstreamContext(stage, byID)
 		}
-		binding := pipelineStagePRBinding{}
+		binding := PipelineStagePRBinding{}
 		if pipelineSourceBoundReview(stage) {
 			sourceRow := byID[strings.TrimSpace(stage.Source)]
 			binding, err = resolvePipelineStagePRBinding(ctx, store, sourceRow)
@@ -1321,7 +902,7 @@ func advancePipelineRunWithAutoMerge(ctx context.Context, store *db.Store, enque
 				// implementStageSettleOutcome only folds success once its payload stamp is
 				// final. A zero PR here is therefore terminal (no-op or skipped), never a
 				// finalizer race: park immediately instead of dispatching an unbound review.
-				row.State = pipeline.StageBlocked
+				row.State = StageBlocked
 				row.Summary = fmt.Sprintf("review cannot run: source stage %q produced no PR", stage.Source)
 				row.NeedsJSON = marshalPipelineNeeds([]string{"source stage produced no PR; nothing to review"})
 				row.FinishedAt = now
@@ -1335,17 +916,17 @@ func advancePipelineRunWithAutoMerge(ctx context.Context, store *db.Store, enque
 				return run, fmt.Errorf("source stage %q job payload has PR #%d but no head SHA", stage.Source, binding.PullRequest)
 			}
 		}
-		skipNativeReviewFanout := stage.Kind() == pipeline.StageKindAgentImplement && pipelineImplementHasSourceBoundReview(spec, stage.ID)
-		request := pipelineStageJobRequest(rec, stage, run, row.Attempt, upstreamContext, binding, skipNativeReviewFanout)
+		skipNativeReviewFanout := stage.Kind() == StageKindAgentImplement && pipelineImplementHasSourceBoundReview(spec, stage.ID)
+		request := PipelineStageJobRequest(rec, stage, run, row.Attempt, upstreamContext, binding, skipNativeReviewFanout)
 		if len(stage.EnvKeys) > 0 {
-			access, envErr := resolvePipelineStageEnvAccess(ctx, store, "", spec, stage)
+			access, envErr := ResolvePipelineStageEnvAccess(ctx, store, "", spec, stage)
 			if envErr != nil {
 				return run, envErr
 			}
 			if len(access.Access) > 0 {
 				request.PipelineName = rec.Name
 				request.PipelineKeyAccess = access.Access
-				if stage.Kind() == pipeline.StageKindShell {
+				if stage.Kind() == StageKindShell {
 					request.PipelineEnvFile = access.File
 					request.PipelineEnvKeys = access.Keys
 					request.PipelineEnv = access.Defaults
@@ -1358,11 +939,11 @@ func advancePipelineRunWithAutoMerge(ctx context.Context, store *db.Store, enque
 		if err != nil {
 			return run, err
 		}
-		if stage.Kind() == pipeline.StageKindAgentProduce && workflow.IsSettledJobState(job.State) {
+		if stage.Kind() == StageKindAgentProduce && workflow.IsSettledJobState(job.State) {
 			state, summary, needs := foldPipelineStageOutcome(spec.EffectiveSuccessDecisions(stage), job)
-			if state == pipeline.StageFailed && row.Attempt < stage.Retry {
+			if state == StageFailed && row.Attempt < stage.Retry {
 				row.Attempt++
-				row.State = pipeline.StagePending
+				row.State = StagePending
 				row.Summary = summary
 			} else {
 				row.State = state
@@ -1380,7 +961,7 @@ func advancePipelineRunWithAutoMerge(ctx context.Context, store *db.Store, enque
 			byID[stage.ID] = row
 			continue
 		}
-		row.State = pipeline.StageQueued
+		row.State = StageQueued
 		row.JobID = job.ID
 		row.StartedAt = now
 		if err := persistPipelineStage(ctx, store, byID[stage.ID], row); err != nil {
@@ -1390,7 +971,7 @@ func advancePipelineRunWithAutoMerge(ctx context.Context, store *db.Store, enque
 	}
 
 	// --- SETTLE: park or finish once nothing is in flight --------------------
-	if anyPipelineStageInState(byID, pipeline.StageQueued, pipeline.StageRunning) {
+	if anyPipelineStageInState(byID, StageQueued, StageRunning) {
 		return run, nil
 	}
 
@@ -1403,8 +984,8 @@ func advancePipelineRunWithAutoMerge(ctx context.Context, store *db.Store, enque
 	// while a reachable independent branch was already run above.
 	for _, stage := range spec.Stages {
 		row := byID[stage.ID]
-		if row.State == pipeline.StagePending {
-			row.State = pipeline.StageSkipped
+		if row.State == StagePending {
+			row.State = StageSkipped
 			row.FinishedAt = now
 			if err := persistPipelineStage(ctx, store, byID[stage.ID], row); err != nil {
 				return run, err
@@ -1432,25 +1013,25 @@ type pipelineRunSettlement struct {
 // more urgent halt); otherwise blocked parks with the aggregated needs; otherwise
 // every stage is succeeded/skipped and the run succeeded. The halt stage is the
 // first blocked/failed stage in spec (topological) order for a stable funnel.
-func computePipelineRunSettlement(spec pipeline.Spec, byID map[string]db.PipelineRunStage, now time.Time) pipelineRunSettlement {
-	if stage, ok := firstPipelineStageInState(spec, byID, pipeline.StageFailed); ok {
+func computePipelineRunSettlement(spec Spec, byID map[string]db.PipelineRunStage, now time.Time) pipelineRunSettlement {
+	if stage, ok := firstPipelineStageInState(spec, byID, StageFailed); ok {
 		return pipelineRunSettlement{
-			State:      pipeline.RunFailed,
+			State:      RunFailed,
 			HaltStage:  stage.StageID,
 			HaltReason: stage.Summary,
 			FinishedAt: now,
 		}
 	}
-	if stage, ok := firstPipelineStageInState(spec, byID, pipeline.StageBlocked); ok {
+	if stage, ok := firstPipelineStageInState(spec, byID, StageBlocked); ok {
 		return pipelineRunSettlement{
-			State:      pipeline.RunBlocked,
+			State:      RunBlocked,
 			HaltStage:  stage.StageID,
 			HaltReason: stage.Summary,
 			NeedsJSON:  marshalPipelineNeeds(aggregatePipelineBlockedNeeds(spec, byID)),
 			FinishedAt: now,
 		}
 	}
-	return pipelineRunSettlement{State: pipeline.RunSucceeded, FinishedAt: now}
+	return pipelineRunSettlement{State: RunSucceeded, FinishedAt: now}
 }
 
 // applyPipelineRunSettlement persists the run's terminal state (only when it
@@ -1479,7 +1060,7 @@ func applyPipelineRunSettlement(ctx context.Context, store *db.Store, rec db.Pip
 // store (shell + agent kinds), so a JOBLESS kind is not forced to fabricate one.
 // rec/run/now and the narrow auto-merge executor are threaded here rather than
 // widening the shared fold loop. Everything is already in scope in
-// advancePipelineRun. Current specializations:
+// AdvancePipelineRun. Current specializations:
 //   - StageKindGate (#768 Phase 2): a gate has no job/worker; it settles when an
 //     external predicate holds (e.g. pr_merged on an upstream implement stage's
 //     PR). Because the seam — not the advancer — owns the "does this stage have a
@@ -1602,7 +1183,7 @@ func recordPipelineTerminalJobState(deps pipelineStageSettleDeps, state string) 
 
 func reflectPipelineStageRunning(ctx context.Context, deps pipelineStageSettleDeps, stageRow db.PipelineRunStage) (*db.PipelineRunStage, error) {
 	next := stageRow
-	next.State = pipeline.StageRunning
+	next.State = StageRunning
 	var event db.JobEvent
 	var ok bool
 	var err error
@@ -1625,7 +1206,7 @@ type pipelineStageSettleDeps struct {
 	rec              db.Pipeline
 	run              db.PipelineRun
 	now              time.Time
-	autoMerge        pipelineAutoMergeExecutor
+	autoMerge        PipelineAutoMergeExecutor
 	events           *pipelineJobEventSnapshot
 	terminalJobState *string
 }
@@ -1656,22 +1237,22 @@ type pipelineStageSettleDeps struct {
 // behavior BYTE-IDENTICALLY: the JobID guard, the GetJob, the queued->running funnel
 // reflect (now returned as nextRow), and `settled` true exactly when the job is
 // terminal, all unchanged. Future kinds branch here on stage.Kind() using deps.
-func stageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec pipeline.Spec, stage pipeline.Stage, stageRow db.PipelineRunStage) (settled bool, state, summary string, needs []string, nextRow *db.PipelineRunStage, err error) {
+func stageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec Spec, stage Stage, stageRow db.PipelineRunStage) (settled bool, state, summary string, needs []string, nextRow *db.PipelineRunStage, err error) {
 	switch stage.Kind() {
-	case pipeline.StageKindOrchestrate:
+	case StageKindOrchestrate:
 		// #758: the stage job is a bounded agent SUB-TREE root. It settles by walking
 		// the deterministic <jobID>/continuation chain to its terminal tail (re-pointing
 		// nextRow.JobID forward and staying unsettled until the tail appears), NOT by the
 		// stage job reaching a terminal state — the coordinator settles the instant it
 		// returns delegations while its sub-tree is still running.
 		return orchestrateStageSettleOutcome(ctx, deps, spec, stage, stageRow)
-	case pipeline.StageKindAgentImplement:
+	case StageKindAgentImplement:
 		// #768 MUTATING implement stage (Model A: fold-on-PR-opened). It settles like
 		// the default job-decision path but holds a SUCCESS fold back until the job
 		// payload carries an opened PR — closing the race where the implement job reaches
 		// terminal success a beat before the finalizer stamps the PR.
 		return implementStageSettleOutcome(ctx, deps, spec, stage, stageRow)
-	case pipeline.StageKindGate:
+	case StageKindGate:
 		// #768 Phase 2 JOBLESS gate: it has no worker job, so it NEVER calls GetJob. It
 		// folds success once its external predicate (pr_merged on the upstream source
 		// stage's PR) holds, or parks the run on the stage timeout. The predicate reads
@@ -1679,7 +1260,7 @@ func stageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec 
 		// ctx-bounded, and fails OPEN (settled=false while the merge has not landed / the
 		// PR is not yet recorded); a genuine store error surfaces via err.
 		return gateStageSettleOutcome(ctx, deps, spec, stage, stageRow)
-	case pipeline.StageKindAgentProduce:
+	case StageKindAgentProduce:
 		// A produce stage has no PR guard: once its leaf job is terminal it folds
 		// directly by gitmoot_result decision, just like a read-only agent stage.
 		return decisionStageSettleOutcome(ctx, deps, spec, stage, stageRow)
@@ -1693,7 +1274,7 @@ func stageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec 
 	}
 }
 
-func decisionStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec pipeline.Spec, stage pipeline.Stage, stageRow db.PipelineRunStage) (settled bool, state, summary string, needs []string, nextRow *db.PipelineRunStage, err error) {
+func decisionStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec Spec, stage Stage, stageRow db.PipelineRunStage) (settled bool, state, summary string, needs []string, nextRow *db.PipelineRunStage, err error) {
 	if strings.TrimSpace(stageRow.JobID) == "" {
 		return false, "", "", nil, nil, nil
 	}
@@ -1702,7 +1283,7 @@ func decisionStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDep
 		return false, "", "", nil, nil, err
 	}
 	if !workflow.IsSettledJobState(job.State) {
-		if job.State == string(workflow.JobRunning) && stageRow.State == pipeline.StageQueued {
+		if job.State == string(workflow.JobRunning) && stageRow.State == StageQueued {
 			next, eventErr := reflectPipelineStageRunning(ctx, deps, stageRow)
 			return false, "", "", nil, next, eventErr
 		}
@@ -1749,11 +1330,11 @@ func decisionStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDep
 // tail. The kill is set once (idempotent) and the walk keeps waiting for that tail.
 //
 // Retry: an orchestrate stage defaults to retry:0 (documented in
-// pipelineStageJobRequest). A retry never resumes into half a tree — the FOLD pass
+// PipelineStageJobRequest). A retry never resumes into half a tree — the FOLD pass
 // only reaches here with a settled TAIL, at which point the old tree is terminal, and
 // the shared retry branch mints a FRESH stage job under attempt+1 (a new deterministic
 // id => a new RootJobID => a brand-new tree).
-func orchestrateStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec pipeline.Spec, stage pipeline.Stage, stageRow db.PipelineRunStage) (settled bool, state, summary string, needs []string, nextRow *db.PipelineRunStage, err error) {
+func orchestrateStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec Spec, stage Stage, stageRow db.PipelineRunStage) (settled bool, state, summary string, needs []string, nextRow *db.PipelineRunStage, err error) {
 	if strings.TrimSpace(stageRow.JobID) == "" {
 		// The stage's coordinator has not been enqueued yet: leave it in flight,
 		// byte-identical to the default seam's empty-JobID guard.
@@ -1801,7 +1382,7 @@ func orchestrateStageSettleOutcome(ctx context.Context, deps pipelineStageSettle
 	if !workflow.IsSettledJobState(job.State) {
 		// The current frontier job is still running: reflect a queued->running funnel
 		// transition so the stage tracks the live frontier, otherwise leave it in flight.
-		if job.State == string(workflow.JobRunning) && stageRow.State == pipeline.StageQueued {
+		if job.State == string(workflow.JobRunning) && stageRow.State == StageQueued {
 			next, eventErr := reflectPipelineStageRunning(ctx, deps, stageRow)
 			return false, "", "", nil, next, eventErr
 		}
@@ -1814,7 +1395,7 @@ func orchestrateStageSettleOutcome(ctx context.Context, deps pipelineStageSettle
 	contID := workflow.DelegationContinuationID(job.ID)
 	if _, cerr := deps.store.GetJob(ctx, contID); cerr == nil {
 		next := &stageRow
-		if stageRow.State == pipeline.StageQueued {
+		if stageRow.State == StageQueued {
 			next, err = reflectPipelineStageRunning(ctx, deps, stageRow)
 			if err != nil {
 				return false, "", "", nil, nil, err
@@ -1823,7 +1404,7 @@ func orchestrateStageSettleOutcome(ctx context.Context, deps pipelineStageSettle
 		next.JobID = contID
 		// The continuation is the live frontier now; keep the stage RUNNING so a later
 		// scan re-enters this walk rather than treating the row as freshly queued.
-		next.State = pipeline.StageRunning
+		next.State = StageRunning
 		return false, "", "", nil, next, nil
 	} else if !errors.Is(cerr, sql.ErrNoRows) {
 		return false, "", "", nil, nil, cerr
@@ -1848,7 +1429,7 @@ func orchestrateStageSettleOutcome(ctx context.Context, deps pipelineStageSettle
 // per-root wall-clock bound. A blank timeout is no bound (0); a malformed one — which
 // Validate already rejects at add time — surfaces the parse error so the seam never
 // silently ignores an intended bound.
-func orchestrateStageTimeout(stage pipeline.Stage) (time.Duration, error) {
+func orchestrateStageTimeout(stage Stage) (time.Duration, error) {
 	if strings.TrimSpace(stage.Timeout) == "" {
 		return 0, nil
 	}
@@ -1868,7 +1449,7 @@ func orchestrateStageTimeout(stage pipeline.Stage) (time.Duration, error) {
 // no-PR note) is appended to the stage summary so it flows to downstream stages through
 // the #757 upstream-context injection. It reproduces the default kind's JobID guard +
 // queued->running funnel reflect byte-for-byte for the not-terminal path.
-func implementStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec pipeline.Spec, stage pipeline.Stage, stageRow db.PipelineRunStage) (settled bool, state, summary string, needs []string, nextRow *db.PipelineRunStage, err error) {
+func implementStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec Spec, stage Stage, stageRow db.PipelineRunStage) (settled bool, state, summary string, needs []string, nextRow *db.PipelineRunStage, err error) {
 	if strings.TrimSpace(stageRow.JobID) == "" {
 		return false, "", "", nil, nil, nil
 	}
@@ -1877,7 +1458,7 @@ func implementStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDe
 		return false, "", "", nil, nil, err
 	}
 	if !workflow.IsSettledJobState(job.State) {
-		if job.State == string(workflow.JobRunning) && stageRow.State == pipeline.StageQueued {
+		if job.State == string(workflow.JobRunning) && stageRow.State == StageQueued {
 			next, eventErr := reflectPipelineStageRunning(ctx, deps, stageRow)
 			return false, "", "", nil, next, eventErr
 		}
@@ -1886,7 +1467,7 @@ func implementStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDe
 	recordPipelineTerminalJobState(deps, job.State)
 	state, summary, needs = foldPipelineStageOutcome(spec.EffectiveSuccessDecisions(stage), job)
 	payload, payloadErr := workflow.ParseJobPayload(job.Payload)
-	if state == pipeline.StageSucceeded {
+	if state == StageSucceeded {
 		decision := ""
 		pr := 0
 		if payloadErr == nil {
@@ -1978,7 +1559,7 @@ func appendPipelineImplementNoPR(summary, decision string) string {
 }
 
 func pipelineSourceStagePR(ctx context.Context, store *db.Store, source db.PipelineRunStage) (pr int, finalNoPR bool, err error) {
-	if source.State != pipeline.StageSucceeded {
+	if source.State != StageSucceeded {
 		return 0, false, nil
 	}
 	jobID := strings.TrimSpace(source.JobID)
@@ -2039,8 +1620,8 @@ func pipelineSourceStagePR(ctx context.Context, store *db.Store, source db.Pipel
 // wait, not a mutation — parking blocked, never failed, keeps the retry budget from
 // re-arming the timer). A gate with no timeout waits indefinitely (cheaply — no job).
 // While in flight it reflects the one-time queued->running funnel transition via nextRow.
-func gateStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec pipeline.Spec, stage pipeline.Stage, stageRow db.PipelineRunStage) (settled bool, state, summary string, needs []string, nextRow *db.PipelineRunStage, err error) {
-	if strings.TrimSpace(stage.Merge) == pipeline.GateMergeAuto {
+func gateStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec Spec, stage Stage, stageRow db.PipelineRunStage) (settled bool, state, summary string, needs []string, nextRow *db.PipelineRunStage, err error) {
+	if strings.TrimSpace(stage.Merge) == GateMergeAuto {
 		return autoMergeGateStageSettleOutcome(ctx, deps, spec, stage, stageRow)
 	}
 	// Classify the upstream source from its structured job payload first. Summary text
@@ -2057,7 +1638,7 @@ func gateStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, s
 			}
 			if finalNoPR {
 				need := "source stage succeeded without opening a PR; nothing to wait for"
-				return true, pipeline.StageBlocked, fmt.Sprintf("gate %s cannot pass: source stage %q succeeded without opening a PR", stage.Gate, source), []string{need}, nil, nil
+				return true, StageBlocked, fmt.Sprintf("gate %s cannot pass: source stage %q succeeded without opening a PR", stage.Gate, source), []string{need}, nil, nil
 			}
 		}
 	}
@@ -2081,7 +1662,7 @@ func gateStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, s
 		}
 	}
 	if merged {
-		return true, pipeline.StageSucceeded, fmt.Sprintf("gate %s satisfied: PR #%d merged", stage.Gate, pr), nil, nil, nil
+		return true, StageSucceeded, fmt.Sprintf("gate %s satisfied: PR #%d merged", stage.Gate, pr), nil, nil, nil
 	}
 	// The upstream PR was CLOSED without merging: pr_merged can NEVER hold now, so the
 	// gate is terminal — waiting would hang the run forever (esp. with no stage timeout).
@@ -2089,21 +1670,21 @@ func gateStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, s
 	// keeps the retry budget from re-arming the timer), naming the terminal reason.
 	if closedUnmerged {
 		want := fmt.Sprintf("PR #%d merged (it was closed without merging)", pr)
-		return true, pipeline.StageBlocked, fmt.Sprintf("gate %s cannot pass: PR #%d was closed without merging", stage.Gate, pr), []string{want}, nil, nil
+		return true, StageBlocked, fmt.Sprintf("gate %s cannot pass: PR #%d was closed without merging", stage.Gate, pr), []string{want}, nil, nil
 	}
 
 	// Not merged yet. Bound the wait against the stage timeout (measured from StartedAt),
 	// parking the run BLOCKED on expiry with a needs entry naming what it waited on.
 	if timedOut, waited := pipelineGateTimedOut(stage, stageRow, deps.now); timedOut {
 		want := pipelineGateWaitDescription(stage.Gate, pr)
-		return true, pipeline.StageBlocked, fmt.Sprintf("gate %s timed out after %s waiting for %s", stage.Gate, waited, want), []string{want}, nil, nil
+		return true, StageBlocked, fmt.Sprintf("gate %s timed out after %s waiting for %s", stage.Gate, waited, want), []string{want}, nil, nil
 	}
 
 	// Still waiting: reflect the one-time queued->running funnel transition so the gate
 	// shows as actively watching, then stay in flight (settled=false).
-	if stageRow.State == pipeline.StageQueued {
+	if stageRow.State == StageQueued {
 		next := stageRow
-		next.State = pipeline.StageRunning
+		next.State = StageRunning
 		return false, "", "", nil, &next, nil
 	}
 	return false, "", "", nil, nil, nil
@@ -2114,9 +1695,9 @@ func gateStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, s
 // review folded approved at that exact head, and a green live GitHub observation.
 // It records intent before its single squash attempt and blocks terminally on any
 // merge failure, so an unchanged scan can never retry-spam the API.
-func autoMergeGateStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec pipeline.Spec, stage pipeline.Stage, stageRow db.PipelineRunStage) (settled bool, state, summary string, needs []string, nextRow *db.PipelineRunStage, err error) {
+func autoMergeGateStageSettleOutcome(ctx context.Context, deps pipelineStageSettleDeps, spec Spec, stage Stage, stageRow db.PipelineRunStage) (settled bool, state, summary string, needs []string, nextRow *db.PipelineRunStage, err error) {
 	block := func(reason string) (bool, string, string, []string, *db.PipelineRunStage, error) {
-		return true, pipeline.StageBlocked, "gate auto-merge blocked: " + reason, []string{reason}, nil, nil
+		return true, StageBlocked, "gate auto-merge blocked: " + reason, []string{reason}, nil, nil
 	}
 	if !spec.AllowAutoMerge {
 		return block("allow_auto_merge: true is required")
@@ -2130,7 +1711,7 @@ func autoMergeGateStageSettleOutcome(ctx context.Context, deps pipelineStageSett
 	if gerr != nil {
 		return false, "", "", nil, nil, gerr
 	}
-	if !ok || sourceRow.State != pipeline.StageSucceeded {
+	if !ok || sourceRow.State != StageSucceeded {
 		return autoMergeGateWaiting(stage, stageRow, deps.now, 0)
 	}
 	sourceJobID := strings.TrimSpace(sourceRow.JobID)
@@ -2155,7 +1736,7 @@ func autoMergeGateStageSettleOutcome(ctx context.Context, deps pipelineStageSett
 
 	reviewCount := 0
 	for _, reviewStage := range spec.Stages {
-		if reviewStage.Kind() != pipeline.StageKindAgentReview || strings.TrimSpace(reviewStage.Source) != sourceID {
+		if reviewStage.Kind() != StageKindAgentReview || strings.TrimSpace(reviewStage.Source) != sourceID {
 			continue
 		}
 		reviewCount++
@@ -2163,10 +1744,10 @@ func autoMergeGateStageSettleOutcome(ctx context.Context, deps pipelineStageSett
 		if rerr != nil {
 			return false, "", "", nil, nil, rerr
 		}
-		if !found || reviewRow.State == pipeline.StagePending || reviewRow.State == pipeline.StageQueued || reviewRow.State == pipeline.StageRunning {
+		if !found || reviewRow.State == StagePending || reviewRow.State == StageQueued || reviewRow.State == StageRunning {
 			return autoMergeGateWaiting(stage, stageRow, deps.now, payload.PullRequest)
 		}
-		if reviewRow.State != pipeline.StageSucceeded {
+		if reviewRow.State != StageSucceeded {
 			return block(fmt.Sprintf("source-bound review stage %q has not approved", reviewStage.ID))
 		}
 		reviewJobID := strings.TrimSpace(reviewRow.JobID)
@@ -2206,7 +1787,7 @@ func autoMergeGateStageSettleOutcome(ctx context.Context, deps pipelineStageSett
 		return block("GitHub readiness evaluation failed: " + evalErr.Error())
 	}
 	if readiness.Merged {
-		return true, pipeline.StageSucceeded, fmt.Sprintf("gate %s satisfied: PR #%d already merged", stage.Gate, payload.PullRequest), nil, nil, nil
+		return true, StageSucceeded, fmt.Sprintf("gate %s satisfied: PR #%d already merged", stage.Gate, payload.PullRequest), nil, nil, nil
 	}
 	currentHead := strings.TrimSpace(readiness.CurrentHeadSHA)
 	if currentHead == "" {
@@ -2261,17 +1842,17 @@ func autoMergeGateStageSettleOutcome(ctx context.Context, deps pipelineStageSett
 	if eventErr := deps.store.AddJobEvent(ctx, db.JobEvent{JobID: sourceJobID, Kind: "pipeline_auto_merge_confirmed", Message: string(confirmation)}); eventErr != nil {
 		return false, "", "", nil, nil, eventErr
 	}
-	return true, pipeline.StageSucceeded, fmt.Sprintf("gate %s auto-merged PR #%d at %s", stage.Gate, payload.PullRequest, shortPipelineSHA(reviewedHead)), nil, nil, nil
+	return true, StageSucceeded, fmt.Sprintf("gate %s auto-merged PR #%d at %s", stage.Gate, payload.PullRequest, shortPipelineSHA(reviewedHead)), nil, nil, nil
 }
 
-func autoMergeGateWaiting(stage pipeline.Stage, stageRow db.PipelineRunStage, now time.Time, pr int) (bool, string, string, []string, *db.PipelineRunStage, error) {
+func autoMergeGateWaiting(stage Stage, stageRow db.PipelineRunStage, now time.Time, pr int) (bool, string, string, []string, *db.PipelineRunStage, error) {
 	if timedOut, waited := pipelineGateTimedOut(stage, stageRow, now); timedOut {
 		want := pipelineGateWaitDescription(stage.Gate, pr)
-		return true, pipeline.StageBlocked, fmt.Sprintf("gate %s timed out after %s waiting for auto-merge readiness for %s", stage.Gate, waited, want), []string{want}, nil, nil
+		return true, StageBlocked, fmt.Sprintf("gate %s timed out after %s waiting for auto-merge readiness for %s", stage.Gate, waited, want), []string{want}, nil, nil
 	}
-	if stageRow.State == pipeline.StageQueued {
+	if stageRow.State == StageQueued {
 		next := stageRow
-		next.State = pipeline.StageRunning
+		next.State = StageRunning
 		return false, "", "", nil, &next, nil
 	}
 	return false, "", "", nil, nil, nil
@@ -2293,7 +1874,7 @@ func shortPipelineSHA(sha string) string {
 // jobless gate in-flight) to now. A gate with no timeout (or a not-yet-started row)
 // never times out — it waits indefinitely, cheaply. The elapsed duration is returned
 // for the park summary. Validation already guarantees a set timeout parses positive.
-func pipelineGateTimedOut(stage pipeline.Stage, stageRow db.PipelineRunStage, now time.Time) (bool, time.Duration) {
+func pipelineGateTimedOut(stage Stage, stageRow db.PipelineRunStage, now time.Time) (bool, time.Duration) {
 	to := strings.TrimSpace(stage.Timeout)
 	if to == "" || stageRow.StartedAt.IsZero() {
 		return false, 0
@@ -2350,11 +1931,11 @@ func parsePipelineImplementPR(summary string) int {
 // or a job with no result (errored before parse / unparseable) is a failure too.
 func foldPipelineStageOutcome(successDecisions []string, job db.Job) (state, summary string, needs []string) {
 	if job.State == string(workflow.JobCancelled) {
-		return pipeline.StageFailed, "stage job cancelled", nil
+		return StageFailed, "stage job cancelled", nil
 	}
 	payload, err := workflow.ParseJobPayload(job.Payload)
 	if err != nil || payload.Result == nil {
-		return pipeline.StageFailed, "stage job produced no gitmoot_result", nil
+		return StageFailed, "stage job produced no gitmoot_result", nil
 	}
 	decision := strings.TrimSpace(payload.Result.Decision)
 	// The skipped marker is reserved for Gitmoot-authored fold metadata. Strip every
@@ -2367,17 +1948,17 @@ func foldPipelineStageOutcome(successDecisions []string, job db.Job) (state, sum
 		if decision == "skipped" {
 			summary = prependPipelineSkippedSummary(summary)
 		}
-		return pipeline.StageSucceeded, summary, nil
+		return StageSucceeded, summary, nil
 	case decision == "blocked":
 		if summary == "" {
 			summary = "stage blocked"
 		}
-		return pipeline.StageBlocked, summary, append([]string(nil), payload.Result.Needs...)
+		return StageBlocked, summary, append([]string(nil), payload.Result.Needs...)
 	default:
 		if summary == "" {
 			summary = fmt.Sprintf("stage returned decision %q", decision)
 		}
-		return pipeline.StageFailed, summary, nil
+		return StageFailed, summary, nil
 	}
 }
 
@@ -2411,12 +1992,12 @@ func pipelineSummaryIsSkipped(summary string) bool {
 // pipelineStageDepsSucceeded reports whether every stage this one needs has
 // reached StageSucceeded (so it is ready to enqueue). A missing dep row is treated
 // as not-succeeded (defensive; validation already rejects unknown needs).
-func pipelineStageDepsSucceeded(stage pipeline.Stage, byID map[string]db.PipelineRunStage) bool {
+func pipelineStageDepsSucceeded(stage Stage, byID map[string]db.PipelineRunStage) bool {
 	for _, dep := range stage.Needs {
 		if dep == "" {
 			continue
 		}
-		if byID[dep].State != pipeline.StageSucceeded {
+		if byID[dep].State != StageSucceeded {
 			return false
 		}
 	}
@@ -2436,7 +2017,7 @@ func anyPipelineStageInState(byID map[string]db.PipelineRunStage, states ...stri
 
 // firstPipelineStageInState returns the first stage row (in spec/topological
 // order) that is in the wanted state, for a stable halt-stage / funnel ordering.
-func firstPipelineStageInState(spec pipeline.Spec, byID map[string]db.PipelineRunStage, want string) (db.PipelineRunStage, bool) {
+func firstPipelineStageInState(spec Spec, byID map[string]db.PipelineRunStage, want string) (db.PipelineRunStage, bool) {
 	for _, stage := range spec.Stages {
 		if row, ok := byID[stage.ID]; ok && row.State == want {
 			return row, true
@@ -2448,12 +2029,12 @@ func firstPipelineStageInState(spec pipeline.Spec, byID map[string]db.PipelineRu
 // aggregatePipelineBlockedNeeds collects the persisted needs of every blocked
 // stage, in spec order, deduped, so the run-level needs_json is the union of what
 // every parked stage is waiting on.
-func aggregatePipelineBlockedNeeds(spec pipeline.Spec, byID map[string]db.PipelineRunStage) []string {
+func aggregatePipelineBlockedNeeds(spec Spec, byID map[string]db.PipelineRunStage) []string {
 	seen := make(map[string]struct{})
 	var needs []string
 	for _, stage := range spec.Stages {
 		row, ok := byID[stage.ID]
-		if !ok || row.State != pipeline.StageBlocked {
+		if !ok || row.State != StageBlocked {
 			continue
 		}
 		for _, need := range decodePipelineNeeds(row.NeedsJSON) {
@@ -2510,6 +2091,9 @@ func marshalPipelineNeeds(needs []string) string {
 	return string(encoded)
 }
 
+// MarshalPipelineNeeds exposes the engine's needs_json encoding.
+var MarshalPipelineNeeds = marshalPipelineNeeds
+
 // decodePipelineNeeds parses a needs_json array back into a slice; a blank or
 // malformed value decodes to no needs.
 func decodePipelineNeeds(value string) []string {
@@ -2523,6 +2107,9 @@ func decodePipelineNeeds(value string) []string {
 	}
 	return compactPipelineNeeds(needs)
 }
+
+// DecodePipelineNeeds exposes the engine's needs_json decoding.
+var DecodePipelineNeeds = decodePipelineNeeds
 
 // Bounds for upstream needs-context. Agent stages receive the #757 fenced text
 // projection; shell stages receive the #775 versioned JSON projection. Both use
@@ -2555,8 +2142,8 @@ type pipelineShellUpstreamStage struct {
 // path, is persisted in the job payload so retries/restarts re-deliver identical
 // bytes. Per-summary and final-marshaled caps are byte budgets; truncation stays
 // on UTF-8 rune boundaries and is made explicit so consumers can fail closed.
-func buildPipelineShellStageUpstreamContext(stage pipeline.Stage, byID map[string]db.PipelineRunStage) string {
-	if stage.Kind() != pipeline.StageKindShell || len(stage.Needs) == 0 {
+func buildPipelineShellStageUpstreamContext(stage Stage, byID map[string]db.PipelineRunStage) string {
+	if stage.Kind() != StageKindShell || len(stage.Needs) == 0 {
 		return ""
 	}
 	context := pipelineShellUpstreamContext{
@@ -2702,7 +2289,7 @@ func buildPipelineTriggerContext(payloadJSON string) string {
 			value, _ = truncatePipelineContext(value, maxPipelineTriggerValueBytes-len(marker))
 			value += marker
 		}
-		fence := pipelineContextFence(value)
+		fence := PipelineContextFence(value)
 		entry := fmt.Sprintf("--- key %q ---\n%s\n%s", key, fence, value)
 		if !strings.HasSuffix(value, "\n") {
 			entry += "\n"
@@ -2733,7 +2320,7 @@ func buildPipelineTriggerContext(payloadJSON string) string {
 // before a stage enqueues), so a re-derivation is identical — required by the
 // idempotent-enqueue contract. It mirrors the #419 "Upstream dependency results"
 // idea for the pipeline (leaf) world, without the delegation artifact plumbing.
-func buildPipelineAgentStageContext(stage pipeline.Stage, byID map[string]db.PipelineRunStage) string {
+func buildPipelineAgentStageContext(stage Stage, byID map[string]db.PipelineRunStage) string {
 	if strings.TrimSpace(stage.Agent) == "" {
 		return ""
 	}
@@ -2782,7 +2369,7 @@ func buildPipelineAgentStageContext(stage pipeline.Stage, byID map[string]db.Pip
 		// task:`) would spoof this block's structure and inject instructions into
 		// the downstream agent. Inside the fence the summary is inert literal text
 		// that cannot break out.
-		fence := pipelineContextFence(truncated)
+		fence := PipelineContextFence(truncated)
 		b.WriteString(fence)
 		b.WriteString("\n")
 		b.WriteString(truncated)
@@ -2819,13 +2406,13 @@ func truncatePipelineContext(s string, max int) (string, bool) {
 	return s[:cut], true
 }
 
-// pipelineContextFence returns a backtick fence guaranteed longer than the
+// PipelineContextFence returns a backtick fence guaranteed longer than the
 // longest run of backticks in content, so an embedded delimiter or gitmoot_result
 // sentinel inside a fenced upstream summary cannot terminate the block early and
 // spoof the injected structure. It mirrors workflow.artifactBodyFence (#419),
 // duplicated here to keep the cli package free of a workflow-internal dependency.
 // Minimum three backticks.
-func pipelineContextFence(content string) string {
+func PipelineContextFence(content string) string {
 	longest, run := 0, 0
 	for _, r := range content {
 		if r == '`' {

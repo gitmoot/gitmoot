@@ -1,15 +1,12 @@
-package cli
+package pipeline
 
 import (
-	"bytes"
 	"context"
 	"fmt"
+	"github.com/gitmoot/gitmoot/internal/db"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
 )
 
 // newScheduledPipeline stores an enabled/disabled pipeline carrying an interval
@@ -24,7 +21,7 @@ func newScheduledPipeline(t *testing.T, store *db.Store, name, repo, interval, j
 		Name:     name,
 		Repo:     repo,
 		SpecYAML: specYAML,
-		SpecHash: pipeline.Hash([]byte(specYAML)),
+		SpecHash: Hash([]byte(specYAML)),
 		Interval: interval,
 		Jitter:   jitter,
 		Enabled:  enabled,
@@ -42,7 +39,7 @@ func newScheduledPipeline(t *testing.T, store *db.Store, name, repo, interval, j
 func newPipelineTriggeredPipeline(t *testing.T, store *db.Store, name, upstream string, enabled bool, armedAt time.Time) db.Pipeline {
 	t.Helper()
 	specYAML := fmt.Sprintf("name: %s\nrepo: owner/%s\ntrigger: {kind: pipeline, pipeline: %s}\nstages:\n  - {id: run, cmd: echo ok}\n  - {id: publish, cmd: echo publish, needs: [run]}\n", name, name, upstream)
-	rec := db.Pipeline{Name: name, Repo: "owner/" + name, SpecYAML: specYAML, SpecHash: pipeline.Hash([]byte(specYAML)), Enabled: enabled}
+	rec := db.Pipeline{Name: name, Repo: "owner/" + name, SpecYAML: specYAML, SpecHash: Hash([]byte(specYAML)), Enabled: enabled}
 	if err := store.CreateOrUpdatePipeline(context.Background(), rec); err != nil {
 		t.Fatalf("CreateOrUpdatePipeline: %v", err)
 	}
@@ -69,15 +66,15 @@ func TestPipelineSuccessTriggerFiresOnce(t *testing.T) {
 	ctx := context.Background()
 	store := pipelineAdvanceStore(t)
 	upstreamSpec := "name: upstream\nstages: [{id: run, cmd: echo}]\n"
-	if err := store.CreateOrUpdatePipeline(ctx, db.Pipeline{Name: "upstream", SpecYAML: upstreamSpec, SpecHash: pipeline.Hash([]byte(upstreamSpec))}); err != nil {
+	if err := store.CreateOrUpdatePipeline(ctx, db.Pipeline{Name: "upstream", SpecYAML: upstreamSpec, SpecHash: Hash([]byte(upstreamSpec))}); err != nil {
 		t.Fatal(err)
 	}
 	base := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
 	newPipelineTriggeredPipeline(t, store, "downstream", "upstream", true, base)
-	upstream := seedPipelineRunState(t, store, "prun-up-success", "upstream", pipeline.RunSucceeded, base.Add(time.Minute))
+	upstream := seedPipelineRunState(t, store, "prun-up-success", "upstream", RunSucceeded, base.Add(time.Minute))
 
-	if err := triggerPipelineRuns(ctx, store, base.Add(2*time.Minute)); err != nil {
-		t.Fatalf("triggerPipelineRuns: %v", err)
+	if err := TriggerPipelineRuns(ctx, store, base.Add(2*time.Minute)); err != nil {
+		t.Fatalf("TriggerPipelineRuns: %v", err)
 	}
 	runs := pipelineRunCount(t, store, "downstream")
 	if len(runs) != 1 || runs[0].Trigger != "pipeline" {
@@ -92,7 +89,7 @@ func TestPipelineSuccessTriggerFiresOnce(t *testing.T) {
 	if got := stageRow(t, store, runs[0].ID, "publish").NeedsJSON; got != `["run"]` {
 		t.Fatalf("triggered publish needs_json = %q, want [run]", got)
 	}
-	if err := triggerPipelineRuns(ctx, store, base.Add(3*time.Minute)); err != nil {
+	if err := TriggerPipelineRuns(ctx, store, base.Add(3*time.Minute)); err != nil {
 		t.Fatalf("re-tick: %v", err)
 	}
 	if got := len(pipelineRunCount(t, store, "downstream")); got != 1 {
@@ -108,14 +105,14 @@ func TestPipelineSuccessTriggerIgnoresFailedCancelledAndDisabled(t *testing.T) {
 	ctx := context.Background()
 	store := pipelineAdvanceStore(t)
 	upstreamSpec := "name: upstream\nstages: [{id: run, cmd: echo}]\n"
-	if err := store.CreateOrUpdatePipeline(ctx, db.Pipeline{Name: "upstream", SpecYAML: upstreamSpec, SpecHash: pipeline.Hash([]byte(upstreamSpec))}); err != nil {
+	if err := store.CreateOrUpdatePipeline(ctx, db.Pipeline{Name: "upstream", SpecYAML: upstreamSpec, SpecHash: Hash([]byte(upstreamSpec))}); err != nil {
 		t.Fatal(err)
 	}
 	base := time.Date(2026, 7, 14, 11, 0, 0, 0, time.UTC)
 	newPipelineTriggeredPipeline(t, store, "downstream", "upstream", true, base)
-	seedPipelineRunState(t, store, "prun-up-failed", "upstream", pipeline.RunFailed, base.Add(time.Minute))
-	seedPipelineRunState(t, store, "prun-up-cancelled", "upstream", pipeline.RunCancelled, base.Add(2*time.Minute))
-	if err := triggerPipelineRuns(ctx, store, base.Add(3*time.Minute)); err != nil {
+	seedPipelineRunState(t, store, "prun-up-failed", "upstream", RunFailed, base.Add(time.Minute))
+	seedPipelineRunState(t, store, "prun-up-cancelled", "upstream", RunCancelled, base.Add(2*time.Minute))
+	if err := TriggerPipelineRuns(ctx, store, base.Add(3*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if got := len(pipelineRunCount(t, store, "downstream")); got != 0 {
@@ -125,8 +122,8 @@ func TestPipelineSuccessTriggerIgnoresFailedCancelledAndDisabled(t *testing.T) {
 	if err := store.SetPipelineEnabled(ctx, "downstream", false); err != nil {
 		t.Fatal(err)
 	}
-	seedPipelineRunState(t, store, "prun-up-success", "upstream", pipeline.RunSucceeded, base.Add(4*time.Minute))
-	if err := triggerPipelineRuns(ctx, store, base.Add(5*time.Minute)); err != nil {
+	seedPipelineRunState(t, store, "prun-up-success", "upstream", RunSucceeded, base.Add(4*time.Minute))
+	if err := TriggerPipelineRuns(ctx, store, base.Add(5*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if got := len(pipelineRunCount(t, store, "downstream")); got != 0 {
@@ -142,33 +139,33 @@ func TestPipelineSuccessTriggerActiveRunDefersWithoutCursorAdvance(t *testing.T)
 	ctx := context.Background()
 	store := pipelineAdvanceStore(t)
 	upstreamSpec := "name: upstream\nstages: [{id: run, cmd: echo}]\n"
-	if err := store.CreateOrUpdatePipeline(ctx, db.Pipeline{Name: "upstream", SpecYAML: upstreamSpec, SpecHash: pipeline.Hash([]byte(upstreamSpec))}); err != nil {
+	if err := store.CreateOrUpdatePipeline(ctx, db.Pipeline{Name: "upstream", SpecYAML: upstreamSpec, SpecHash: Hash([]byte(upstreamSpec))}); err != nil {
 		t.Fatal(err)
 	}
 	base := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
 	rec := newPipelineTriggeredPipeline(t, store, "downstream", "upstream", true, base)
-	upstream := seedPipelineRunState(t, store, "prun-up-success", "upstream", pipeline.RunSucceeded, base.Add(time.Minute))
-	spec, err := pipeline.Load([]byte(rec.SpecYAML))
+	upstream := seedPipelineRunState(t, store, "prun-up-success", "upstream", RunSucceeded, base.Add(time.Minute))
+	spec, err := Load([]byte(rec.SpecYAML))
 	if err != nil {
 		t.Fatal(err)
 	}
-	active, err := createPipelineRun(ctx, store, rec, spec, "manual", "{}", base.Add(2*time.Minute))
+	active, err := CreatePipelineRun(ctx, store, rec, spec, "manual", "{}", base.Add(2*time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := triggerPipelineRuns(ctx, store, base.Add(3*time.Minute)); err != nil {
+	if err := TriggerPipelineRuns(ctx, store, base.Add(3*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	state, _, _ := store.GetPipelineTriggerState(ctx, "downstream")
 	if state.Cursor != "" || len(pipelineRunCount(t, store, "downstream")) != 1 {
 		t.Fatalf("active guard state=%+v runs=%+v", state, pipelineRunCount(t, store, "downstream"))
 	}
-	active.State = pipeline.RunSucceeded
+	active.State = RunSucceeded
 	active.FinishedAt = base.Add(4 * time.Minute)
 	if err := store.UpdatePipelineRun(ctx, active); err != nil {
 		t.Fatal(err)
 	}
-	if err := triggerPipelineRuns(ctx, store, base.Add(5*time.Minute)); err != nil {
+	if err := TriggerPipelineRuns(ctx, store, base.Add(5*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	state, _, _ = store.GetPipelineTriggerState(ctx, "downstream")
@@ -185,7 +182,7 @@ func TestPipelineEnvironmentPreflightScheduleAdvancesAndTriggerRetries(t *testin
 	scheduledYAML := "name: scheduled-env\nrepo: owner/repo\nstages: [{id: run, cmd: echo, env_keys: [MISSING]}]\n"
 	scheduled := db.Pipeline{
 		Name: "scheduled-env", Repo: "owner/repo", SpecYAML: scheduledYAML,
-		SpecHash: pipeline.Hash([]byte(scheduledYAML)), Interval: "1h", Enabled: true,
+		SpecHash: Hash([]byte(scheduledYAML)), Interval: "1h", Enabled: true,
 	}
 	if err := store.CreateOrUpdatePipeline(ctx, scheduled); err != nil {
 		t.Fatal(err)
@@ -206,18 +203,18 @@ func TestPipelineEnvironmentPreflightScheduleAdvancesAndTriggerRetries(t *testin
 	}
 
 	upstreamYAML := "name: upstream-env\nstages: [{id: run, cmd: echo}]\n"
-	if err := store.CreateOrUpdatePipeline(ctx, db.Pipeline{Name: "upstream-env", SpecYAML: upstreamYAML, SpecHash: pipeline.Hash([]byte(upstreamYAML))}); err != nil {
+	if err := store.CreateOrUpdatePipeline(ctx, db.Pipeline{Name: "upstream-env", SpecYAML: upstreamYAML, SpecHash: Hash([]byte(upstreamYAML))}); err != nil {
 		t.Fatal(err)
 	}
 	triggeredYAML := "name: triggered-env\nrepo: owner/repo\ntrigger: {kind: pipeline, pipeline: upstream-env}\nstages: [{id: run, cmd: echo, env_keys: [MISSING]}]\n"
-	triggered := db.Pipeline{Name: "triggered-env", Repo: "owner/repo", SpecYAML: triggeredYAML, SpecHash: pipeline.Hash([]byte(triggeredYAML)), Enabled: true}
+	triggered := db.Pipeline{Name: "triggered-env", Repo: "owner/repo", SpecYAML: triggeredYAML, SpecHash: Hash([]byte(triggeredYAML)), Enabled: true}
 	if err := store.CreateOrUpdatePipeline(ctx, triggered); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.ArmPipelineTrigger(ctx, triggered.Name, "upstream-env", base); err != nil {
 		t.Fatal(err)
 	}
-	seedPipelineRunState(t, store, "prun-upstream-env", "upstream-env", pipeline.RunSucceeded, base.Add(time.Minute))
+	seedPipelineRunState(t, store, "prun-upstream-env", "upstream-env", RunSucceeded, base.Add(time.Minute))
 	triggered, _, _ = store.GetPipeline(ctx, triggered.Name)
 	if err := triggerOnePipeline(ctx, store, triggered, base.Add(2*time.Minute)); err == nil || !strings.Contains(err.Error(), "gitmoot key grant MISSING --pipeline triggered-env") {
 		t.Fatalf("trigger preflight error=%v", err)
@@ -231,61 +228,6 @@ func TestPipelineEnvironmentPreflightScheduleAdvancesAndTriggerRetries(t *testin
 	}
 	if runs := pipelineRunCount(t, store, triggered.Name); len(runs) != 0 {
 		t.Fatalf("trigger created unusable runs: %+v", runs)
-	}
-}
-
-func TestPipelineSuccessTriggerArmsAtAddAndReenable(t *testing.T) {
-	home := t.TempDir()
-	upstreamFile := writeSpec(t, "name: upstream\nstages: [{id: run, cmd: echo}]\n")
-	if code := Run([]string{"pipeline", "add", upstreamFile, "--home", home}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
-		t.Fatalf("add upstream exit=%d", code)
-	}
-	base := time.Now().UTC().Add(-time.Hour)
-	if err := withStore(home, func(store *db.Store) error {
-		seedPipelineRunState(t, store, "prun-before-add", "upstream", pipeline.RunSucceeded, base)
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	downstreamFile := writeSpec(t, "name: downstream\nrepo: owner/downstream\ntrigger: {kind: pipeline, pipeline: upstream}\nstages: [{id: run, cmd: echo}]\n")
-	var stderr bytes.Buffer
-	if code := Run([]string{"pipeline", "add", downstreamFile, "--enable", "--home", home}, &bytes.Buffer{}, &stderr); code != 0 {
-		t.Fatalf("add downstream exit=%d stderr=%s", code, stderr.String())
-	}
-	if err := withStore(home, func(store *db.Store) error {
-		if err := triggerPipelineRuns(context.Background(), store, time.Now().UTC()); err != nil {
-			return err
-		}
-		if runs, err := store.ListPipelineRuns(context.Background(), "downstream"); err != nil || len(runs) != 0 {
-			return fmt.Errorf("add-time arm runs=%v err=%v", runs, err)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if code := Run([]string{"pipeline", "disable", "downstream", "--home", home}, &bytes.Buffer{}, &stderr); code != 0 {
-		t.Fatalf("disable exit=%d stderr=%s", code, stderr.String())
-	}
-	if err := withStore(home, func(store *db.Store) error {
-		seedPipelineRunState(t, store, "prun-while-disabled", "upstream", pipeline.RunSucceeded, time.Now().UTC())
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if code := Run([]string{"pipeline", "enable", "downstream", "--home", home}, &bytes.Buffer{}, &stderr); code != 0 {
-		t.Fatalf("enable exit=%d stderr=%s", code, stderr.String())
-	}
-	if err := withStore(home, func(store *db.Store) error {
-		if err := triggerPipelineRuns(context.Background(), store, time.Now().UTC().Add(time.Minute)); err != nil {
-			return err
-		}
-		runs, err := store.ListPipelineRuns(context.Background(), "downstream")
-		if err != nil || len(runs) != 0 {
-			return fmt.Errorf("re-enable arm runs=%v err=%v", runs, err)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -317,7 +259,7 @@ func TestSchedulePipelineDueFires(t *testing.T) {
 	if runs[0].Trigger != "schedule" {
 		t.Fatalf("run trigger = %q, want schedule", runs[0].Trigger)
 	}
-	if runs[0].State != pipeline.RunRunning {
+	if runs[0].State != RunRunning {
 		t.Fatalf("run state = %q, want running", runs[0].State)
 	}
 	rec, _, _ := store.GetPipeline(ctx, "nightly")
@@ -378,14 +320,14 @@ func TestSchedulePipelineOverlapGuard(t *testing.T) {
 	ctx := context.Background()
 	store := pipelineAdvanceStore(t)
 	rec := newScheduledPipeline(t, store, "nightly", "owner/repo", "24h", "", true)
-	spec, err := pipeline.Load([]byte(rec.SpecYAML))
+	spec, err := Load([]byte(rec.SpecYAML))
 	if err != nil {
-		t.Fatalf("pipeline.Load: %v", err)
+		t.Fatalf("Load: %v", err)
 	}
 	now := time.Date(2026, 7, 6, 9, 0, 0, 0, time.UTC)
 	// An already-running run exists (created earlier).
-	if _, err := createPipelineRun(ctx, store, rec, spec, "schedule", "{}", now.Add(-time.Hour)); err != nil {
-		t.Fatalf("createPipelineRun: %v", err)
+	if _, err := CreatePipelineRun(ctx, store, rec, spec, "schedule", "{}", now.Add(-time.Hour)); err != nil {
+		t.Fatalf("CreatePipelineRun: %v", err)
 	}
 
 	if err := schedulePipelineRuns(ctx, store, now); err != nil {
@@ -475,8 +417,8 @@ func TestRunPipelineScanOnceScheduleThenAdvance(t *testing.T) {
 	newScheduledPipeline(t, store, "nightly", "owner/repo", "24h", "", true)
 	now := time.Date(2026, 7, 6, 9, 0, 0, 0, time.UTC)
 
-	if err := runPipelineScanOnce(ctx, store, enqueue, now); err != nil {
-		t.Fatalf("runPipelineScanOnce: %v", err)
+	if err := RunPipelineScanOnce(ctx, store, enqueue, now); err != nil {
+		t.Fatalf("RunPipelineScanOnce: %v", err)
 	}
 	runs := pipelineRunCount(t, store, "nightly")
 	if len(runs) != 1 {
@@ -484,10 +426,10 @@ func TestRunPipelineScanOnceScheduleThenAdvance(t *testing.T) {
 	}
 	// The advance pass in the same scan enqueued the root stage (a), leaving b pending.
 	a := stageRow(t, store, runs[0].ID, "a")
-	if a.State != pipeline.StageQueued || a.JobID == "" {
+	if a.State != StageQueued || a.JobID == "" {
 		t.Fatalf("root stage a = %+v, want queued with a job (advance pass ran)", a)
 	}
-	if b := stageRow(t, store, runs[0].ID, "b"); b.State != pipeline.StagePending {
+	if b := stageRow(t, store, runs[0].ID, "b"); b.State != StagePending {
 		t.Fatalf("stage b = %s, want pending", b.State)
 	}
 }

@@ -1,24 +1,45 @@
-package cli
+package pipeline
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
-	"os"
-	"path/filepath"
+	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/gitmoot/gitmoot/internal/db"
-	gitutil "github.com/gitmoot/gitmoot/internal/git"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
-	"github.com/gitmoot/gitmoot/internal/runtime"
-	"github.com/gitmoot/gitmoot/internal/workflow"
 )
+
+func settleBoundImplementStageJob(t *testing.T, store *db.Store, jobID, decision string, binding PipelineStagePRBinding) {
+	t.Helper()
+	ctx := context.Background()
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob(%s): %v", jobID, err)
+	}
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload: %v", err)
+	}
+	payload.PullRequest = binding.PullRequest
+	payload.HeadSHA = binding.HeadSHA
+	payload.Branch = binding.Branch
+	payload.TaskID = binding.TaskID
+	payload.LeadAgent = binding.LeadAgent
+	payload.Result = &workflow.AgentResult{Decision: decision, Summary: "implementation settled"}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	to := jobStateForDecision(decision)
+	ok, err := store.TransitionJobStatePayloadWithEvent(ctx, job.ID, job.State, to, string(encoded), db.JobEvent{JobID: job.ID, Kind: to, Message: "settled by test"})
+	if err != nil || !ok {
+		t.Fatalf("settle implement job: ok=%v err=%v", ok, err)
+	}
+}
 
 const pipelineAutoMergeSpec = `name: auto-merge
 repo: owner/repo
@@ -86,11 +107,11 @@ func (s *stubPipelineAutoMerger) Merge(_ context.Context, request workflow.Pipel
 	return s.mergeResult, s.mergeErr
 }
 
-func advanceWithAutoMerge(t *testing.T, store *db.Store, enqueue pipelineStageEnqueuer, rec db.Pipeline, spec pipeline.Spec, run db.PipelineRun, now time.Time, executor pipelineAutoMergeExecutor) db.PipelineRun {
+func advanceWithAutoMerge(t *testing.T, store *db.Store, enqueue PipelineStageEnqueuer, rec db.Pipeline, spec Spec, run db.PipelineRun, now time.Time, executor PipelineAutoMergeExecutor) db.PipelineRun {
 	t.Helper()
-	updated, err := advancePipelineRunWithAutoMerge(context.Background(), store, enqueue, rec, spec, run, now, executor)
+	updated, err := AdvancePipelineRunWithAutoMerge(context.Background(), store, enqueue, rec, spec, run, now, executor)
 	if err != nil {
-		t.Fatalf("advancePipelineRunWithAutoMerge: %v", err)
+		t.Fatalf("AdvancePipelineRunWithAutoMerge: %v", err)
 	}
 	return updated
 }
@@ -119,7 +140,7 @@ func settleBoundReviewJob(t *testing.T, store *db.Store, jobID, decision, head s
 	}
 }
 
-func prepareAutoMergeGate(t *testing.T) (*db.Store, pipelineStageEnqueuer, db.Pipeline, pipeline.Spec, db.PipelineRun, string, time.Time) {
+func prepareAutoMergeGate(t *testing.T) (*db.Store, PipelineStageEnqueuer, db.Pipeline, Spec, db.PipelineRun, string, time.Time) {
 	t.Helper()
 	store := pipelineAdvanceStore(t)
 	rec, spec := newTestPipeline(t, store, "auto-merge", pipelineAutoMergeSpec)
@@ -127,7 +148,7 @@ func prepareAutoMergeGate(t *testing.T) (*db.Store, pipelineStageEnqueuer, db.Pi
 	now := time.Date(2026, 7, 11, 8, 0, 0, 0, time.UTC)
 	run := startTestRun(t, store, rec, spec, enqueue, now)
 	impl := stageRow(t, store, run.ID, "impl")
-	setttle := pipelineStagePRBinding{PullRequest: 813, HeadSHA: "0123456789abcdef", Branch: "feat/813", TaskID: "task-813", LeadAgent: "coder"}
+	setttle := PipelineStagePRBinding{PullRequest: 813, HeadSHA: "0123456789abcdef", Branch: "feat/813", TaskID: "task-813", LeadAgent: "coder"}
 	settleBoundImplementStageJob(t, store, impl.JobID, "implemented", setttle)
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second), &stubPipelineAutoMerger{})
 	return store, enqueue, rec, spec, run, impl.JobID, now
@@ -149,7 +170,7 @@ func TestPipelineAutoMergeGateExecutesAfterApprovedReviewAndGreenChecks(t *testi
 	if request.Repo != "owner/repo" || request.PullRequest != 813 || request.HeadSHA != "0123456789abcdef" || request.Pipeline != "auto-merge" || request.RunID != run.ID || request.StageID != "merge" {
 		t.Fatalf("merge request = %+v", request)
 	}
-	if run.State != pipeline.RunSucceeded || stageRow(t, store, run.ID, "merge").State != pipeline.StageSucceeded {
+	if run.State != RunSucceeded || stageRow(t, store, run.ID, "merge").State != StageSucceeded {
 		t.Fatalf("run/gate = %+v / %+v, want succeeded", run, stageRow(t, store, run.ID, "merge"))
 	}
 	events, err := store.ListJobEvents(context.Background(), sourceJobID)
@@ -193,17 +214,17 @@ func TestPipelineAutoMergeGateRequiresEverySourceBoundReview(t *testing.T) {
 	now := time.Date(2026, 7, 11, 8, 30, 0, 0, time.UTC)
 	run := startTestRun(t, store, rec, spec, enqueue, now)
 	impl := stageRow(t, store, run.ID, "impl")
-	settleBoundImplementStageJob(t, store, impl.JobID, "implemented", pipelineStagePRBinding{PullRequest: 813, HeadSHA: "all-review-head"})
+	settleBoundImplementStageJob(t, store, impl.JobID, "implemented", PipelineStagePRBinding{PullRequest: 813, HeadSHA: "all-review-head"})
 	executor := &stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "all-review-head"}, mergeResult: workflow.PipelineAutoMergeResult{Merged: true}}
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second), executor)
 	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "all-review-head")
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
-	if len(executor.evaluateReqs) != 0 || len(executor.mergeReqs) != 0 || stageRow(t, store, run.ID, "merge").State != pipeline.StageRunning {
+	if len(executor.evaluateReqs) != 0 || len(executor.mergeReqs) != 0 || stageRow(t, store, run.ID, "merge").State != StageRunning {
 		t.Fatalf("gate advanced before every review: evaluate=%d merge=%d gate=%+v", len(executor.evaluateReqs), len(executor.mergeReqs), stageRow(t, store, run.ID, "merge"))
 	}
 	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review-two").JobID, "approved", "all-review-head")
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(3*time.Second), executor)
-	if run.State != pipeline.RunSucceeded || len(executor.mergeReqs) != 1 {
+	if run.State != RunSucceeded || len(executor.mergeReqs) != 1 {
 		t.Fatalf("gate did not merge after every review: run=%+v merge=%d", run, len(executor.mergeReqs))
 	}
 }
@@ -214,7 +235,7 @@ func TestPipelineAutoMergeClaimAllowsExactlyOneRacingMerge(t *testing.T) {
 	waiting := &stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: "0123456789abcdef"}}
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), waiting)
 	gateRow := stageRow(t, store, run.ID, "merge")
-	var gateStage pipeline.Stage
+	var gateStage Stage
 	for _, candidate := range spec.Stages {
 		if candidate.ID == "merge" {
 			gateStage = candidate
@@ -261,7 +282,7 @@ func TestPipelineAutoMergeClaimAllowsExactlyOneRacingMerge(t *testing.T) {
 		t.Fatalf("claim events = %d, want 1; events=%+v", claims, events)
 	}
 	settled, state, _, _, _, err := gateStageSettleOutcome(context.Background(), deps, spec, gateStage, gateRow)
-	if err != nil || !settled || state != pipeline.StageSucceeded {
+	if err != nil || !settled || state != StageSucceeded {
 		t.Fatalf("post-race settle = settled:%v state:%q err:%v", settled, state, err)
 	}
 }
@@ -271,7 +292,7 @@ func TestPipelineAutoMergeGateSafetyStops(t *testing.T) {
 		name          string
 		decision      string
 		reviewHead    string
-		mutateSpec    func(*pipeline.Spec)
+		mutateSpec    func(*Spec)
 		readiness     workflow.PipelineAutoMergeReadiness
 		mergeErr      error
 		wantRunState  string
@@ -280,13 +301,13 @@ func TestPipelineAutoMergeGateSafetyStops(t *testing.T) {
 		wantEvaluate  int
 		wantMerge     int
 	}{
-		{name: "changes requested", decision: "changes_requested", reviewHead: "0123456789abcdef", wantRunState: pipeline.RunFailed, wantGateState: pipeline.StageBlocked, wantNeed: "has not approved"},
-		{name: "reviewed head mismatch", decision: "approved", reviewHead: "different-head", wantRunState: pipeline.RunBlocked, wantGateState: pipeline.StageBlocked, wantNeed: "reviewed head", wantEvaluate: 0},
-		{name: "live head drift", decision: "approved", reviewHead: "0123456789abcdef", readiness: workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "drifted-head"}, wantRunState: pipeline.RunBlocked, wantGateState: pipeline.StageBlocked, wantNeed: "head drifted", wantEvaluate: 1},
-		{name: "checks pending", decision: "approved", reviewHead: "0123456789abcdef", readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, Reason: "checks pending"}, wantRunState: pipeline.RunRunning, wantGateState: pipeline.StageRunning, wantEvaluate: 1},
-		{name: "allow key missing defensively", decision: "approved", reviewHead: "0123456789abcdef", mutateSpec: func(spec *pipeline.Spec) { spec.AllowAutoMerge = false }, wantRunState: pipeline.RunBlocked, wantGateState: pipeline.StageBlocked, wantNeed: "allow_auto_merge", wantEvaluate: 0},
-		{name: "already merged", decision: "approved", reviewHead: "0123456789abcdef", readiness: workflow.PipelineAutoMergeReadiness{Merged: true, MergeCommitSHA: "merged"}, wantRunState: pipeline.RunSucceeded, wantGateState: pipeline.StageSucceeded, wantEvaluate: 1},
-		{name: "merge API error", decision: "approved", reviewHead: "0123456789abcdef", readiness: workflow.PipelineAutoMergeReadiness{Ready: true}, mergeErr: errors.New("boom"), wantRunState: pipeline.RunBlocked, wantGateState: pipeline.StageBlocked, wantNeed: "retry stopped", wantEvaluate: 1, wantMerge: 1},
+		{name: "changes requested", decision: "changes_requested", reviewHead: "0123456789abcdef", wantRunState: RunFailed, wantGateState: StageBlocked, wantNeed: "has not approved"},
+		{name: "reviewed head mismatch", decision: "approved", reviewHead: "different-head", wantRunState: RunBlocked, wantGateState: StageBlocked, wantNeed: "reviewed head", wantEvaluate: 0},
+		{name: "live head drift", decision: "approved", reviewHead: "0123456789abcdef", readiness: workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "drifted-head"}, wantRunState: RunBlocked, wantGateState: StageBlocked, wantNeed: "head drifted", wantEvaluate: 1},
+		{name: "checks pending", decision: "approved", reviewHead: "0123456789abcdef", readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, Reason: "checks pending"}, wantRunState: RunRunning, wantGateState: StageRunning, wantEvaluate: 1},
+		{name: "allow key missing defensively", decision: "approved", reviewHead: "0123456789abcdef", mutateSpec: func(spec *Spec) { spec.AllowAutoMerge = false }, wantRunState: RunBlocked, wantGateState: StageBlocked, wantNeed: "allow_auto_merge", wantEvaluate: 0},
+		{name: "already merged", decision: "approved", reviewHead: "0123456789abcdef", readiness: workflow.PipelineAutoMergeReadiness{Merged: true, MergeCommitSHA: "merged"}, wantRunState: RunSucceeded, wantGateState: StageSucceeded, wantEvaluate: 1},
+		{name: "merge API error", decision: "approved", reviewHead: "0123456789abcdef", readiness: workflow.PipelineAutoMergeReadiness{Ready: true}, mergeErr: errors.New("boom"), wantRunState: RunBlocked, wantGateState: StageBlocked, wantNeed: "retry stopped", wantEvaluate: 1, wantMerge: 1},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -342,57 +363,12 @@ stages:
 	now := time.Date(2026, 7, 11, 9, 0, 0, 0, time.UTC)
 	run := startTestRun(t, store, rec, spec, enqueue, now)
 	impl := stageRow(t, store, run.ID, "impl")
-	settleBoundImplementStageJob(t, store, impl.JobID, "implemented", pipelineStagePRBinding{PullRequest: 814, HeadSHA: "human-head"})
+	settleBoundImplementStageJob(t, store, impl.JobID, "implemented", PipelineStagePRBinding{PullRequest: 814, HeadSHA: "human-head"})
 	executor := &stubPipelineAutoMerger{}
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second), executor)
 	markPipelinePRMerged(t, store, "owner/repo", 814, "merged")
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
-	if run.State != pipeline.RunSucceeded || len(executor.evaluateReqs) != 0 || len(executor.mergeReqs) != 0 {
+	if run.State != RunSucceeded || len(executor.evaluateReqs) != 0 || len(executor.mergeReqs) != 0 {
 		t.Fatalf("human gate run=%+v evaluate=%d merge=%d", run, len(executor.evaluateReqs), len(executor.mergeReqs))
-	}
-}
-
-func TestPipelineAutoMergeShellRuntimeE2E(t *testing.T) {
-	ctx := context.Background()
-	home, _, store := heartbeatLoopE2EHome(t)
-	checkout := createDaemonWorkerGitCheckout(t, "main")
-	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgentWithPolicy(t, store, "coder", runtime.ShellRuntime, pipelineStageResultCmd("implemented", "fixed", nil), []string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, pipelineStageResultCmd("approved", "approved", nil), []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
-
-	rec, spec := newTestPipeline(t, store, "auto-merge", pipelineAutoMergeSpec)
-	enqueue := newPipelineStageEnqueuer(store, home)
-	now := time.Date(2026, 7, 11, 10, 0, 0, 0, time.UTC)
-	run := startTestRun(t, store, rec, spec, enqueue, now)
-	implRow := stageRow(t, store, run.ID, "impl")
-	implJob, err := store.GetJob(ctx, implRow.JobID)
-	if err != nil {
-		t.Fatalf("GetJob(impl): %v", err)
-	}
-	implPayload, err := workflow.ParseJobPayload(implJob.Payload)
-	if err != nil {
-		t.Fatalf("ParseJobPayload(impl): %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(implPayload.WorktreePath, "auto.txt"), []byte("auto merge\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	runDaemonWorkerGit(t, implPayload.WorktreePath, "add", "auto.txt")
-	runDaemonWorkerGit(t, implPayload.WorktreePath, "commit", "-m", "auto merge fixture")
-	head, err := (gitutil.Client{Dir: implPayload.WorktreePath}).HeadSHA(ctx)
-	if err != nil {
-		t.Fatalf("HeadSHA: %v", err)
-	}
-	settleBoundImplementStageJob(t, store, implJob.ID, "implemented", pipelineStagePRBinding{PullRequest: 815, HeadSHA: head, Branch: implPayload.Branch, TaskID: implPayload.TaskID, LeadAgent: "coder"})
-	executor := &stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: head}, mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merged-815"}}
-	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second), executor)
-	if err := runEnabledRepoWorkerTicks(ctx, store, defaultJobWorker(store, io.Discard, home), 1, io.Discard, now.Add(2*time.Second)); err != nil {
-		t.Fatalf("review worker tick: %v", err)
-	}
-	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(3*time.Second), executor)
-	if run.State != pipeline.RunSucceeded || len(executor.mergeReqs) != 1 {
-		t.Fatalf("shell E2E run=%+v merge calls=%d", run, len(executor.mergeReqs))
-	}
-	if got := executor.mergeReqs[0]; got.PullRequest != 815 || got.HeadSHA != head {
-		t.Fatalf("shell E2E merge request = %+v, want PR 815 head %s", got, head)
 	}
 }

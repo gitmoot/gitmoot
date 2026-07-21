@@ -123,7 +123,7 @@ func pipelineSecretGatedCmd(secretPath, need string) string {
 }
 
 // TestPipelineResumeE2E is the resume E2E (#681): a run parks blocked on a missing
-// secret; the operator provisions the secret and ResumePipelineRun re-runs the
+// secret; the operator provisions the secret and pipeline.ResumePipelineRun re-runs the
 // halted stage and its dependents, which now succeed, driving the run to succeeded.
 // The already-succeeded upstream stage is NOT re-run. NO LLM, NO network.
 func TestPipelineResumeE2E(t *testing.T) {
@@ -191,9 +191,9 @@ func TestPipelineResumeE2E(t *testing.T) {
 	if err := os.WriteFile(secretPath, []byte("present"), 0o644); err != nil {
 		t.Fatalf("provision secret: %v", err)
 	}
-	resumed, err := ResumePipelineRun(ctx, store, runID, "")
+	resumed, err := pipeline.ResumePipelineRun(ctx, store, runID, "")
 	if err != nil {
-		t.Fatalf("ResumePipelineRun: %v", err)
+		t.Fatalf("pipeline.ResumePipelineRun: %v", err)
 	}
 	if resumed.State != pipeline.RunRunning {
 		t.Fatalf("resumed run = %s, want running", resumed.State)

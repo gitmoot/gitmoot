@@ -1,4 +1,4 @@
-package cli
+package pipeline
 
 import (
 	"context"
@@ -13,14 +13,13 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // Test-only seam for proxied shell-stage httptest upstreams. Production
 // keycard proxy delivery remains HTTPS-only.
-var pipelineProxyAllowLoopbackHTTP bool
+var PipelineProxyAllowLoopbackHTTP bool
 
 const pipelineEnvFileMode os.FileMode = 0o600
 
@@ -28,6 +27,10 @@ const (
 	pipelineKeySourceOwn     = "own"
 	pipelineKeySourceShared  = "shared"
 	pipelineKeySourceDefault = "default"
+
+	PipelineKeySourceOwn     = pipelineKeySourceOwn
+	PipelineKeySourceShared  = pipelineKeySourceShared
+	PipelineKeySourceDefault = pipelineKeySourceDefault
 )
 
 const (
@@ -38,23 +41,31 @@ const (
 	pipelineEnvFileStatusBadOwner    = "bad_owner"
 	pipelineEnvFileStatusBadLocation = "bad_location"
 	pipelineEnvFileStatusInvalid     = "invalid"
+
+	PipelineEnvFileStatusNone        = pipelineEnvFileStatusNone
+	PipelineEnvFileStatusOK          = pipelineEnvFileStatusOK
+	PipelineEnvFileStatusMissing     = pipelineEnvFileStatusMissing
+	PipelineEnvFileStatusBadMode     = pipelineEnvFileStatusBadMode
+	PipelineEnvFileStatusBadOwner    = pipelineEnvFileStatusBadOwner
+	PipelineEnvFileStatusBadLocation = pipelineEnvFileStatusBadLocation
+	PipelineEnvFileStatusInvalid     = pipelineEnvFileStatusInvalid
 )
 
-type pipelineStageEnvAccess struct {
+type PipelineStageEnvAccess struct {
 	File     string
 	Keys     []string
 	Defaults map[string]string
 	Access   []workflow.PipelineKeyAccess
 }
 
-type pipelineEnvUnresolved struct {
+type PipelineEnvUnresolved struct {
 	Stage    string
 	Selector string
 }
 
-type pipelineEnvironmentResolution struct {
+type PipelineEnvironmentResolution struct {
 	Access     []workflow.PipelineKeyAccess
-	Unresolved []pipelineEnvUnresolved
+	Unresolved []PipelineEnvUnresolved
 }
 
 type pipelineSharedKeys struct {
@@ -62,20 +73,35 @@ type pipelineSharedKeys struct {
 	agents   map[string]map[string]db.KeychainKey
 }
 
-type pipelineEnvFileInspection struct {
+type PipelineEnvFileInspection struct {
 	Path   string
 	Status string
 	Names  map[string]struct{}
 }
 
-// resolvePipelineEnvironment is the single names-only projection used by add
+func InspectPipelineEnvironment(ctx context.Context, store *db.Store, home string, spec Spec) (PipelineEnvFileInspection, PipelineEnvironmentResolution, error) {
+	inspection := ClassifyPipelineEnvFile(ctx, store, home, spec.EnvFile)
+	sharedCandidates, err := pipelineSharedKeyCandidates(ctx, store, spec, inspection.Names)
+	if err != nil {
+		return inspection, PipelineEnvironmentResolution{}, err
+	}
+	availableShared := pipelineSharedKeys{pipeline: map[string]db.KeychainKey{}, agents: map[string]map[string]db.KeychainKey{}}
+	if sharedCandidates.any() {
+		if names, loadErr := loadValidatedKeychainNames(ctx, store, home); loadErr == nil {
+			availableShared = sharedCandidates.available(names)
+		}
+	}
+	return inspection, projectPipelineEnvironment(spec, inspection.Names, availableShared), nil
+}
+
+// ResolvePipelineEnvironment is the single names-only projection used by add
 // validation, run preflight, payload audit, and `pipeline show --json`.
-func resolvePipelineEnvironment(ctx context.Context, store *db.Store, home string, spec pipeline.Spec) (pipelineEnvironmentResolution, error) {
+func ResolvePipelineEnvironment(ctx context.Context, store *db.Store, home string, spec Spec) (PipelineEnvironmentResolution, error) {
 	ownNames := make(map[string]struct{})
 	if strings.TrimSpace(spec.EnvFile) != "" {
 		own, err := loadValidatedSecretEnvNames(ctx, store, home, "env_file", spec.EnvFile)
 		if err != nil {
-			return pipelineEnvironmentResolution{}, err
+			return PipelineEnvironmentResolution{}, err
 		}
 		for name := range own {
 			ownNames[name] = struct{}{}
@@ -84,20 +110,20 @@ func resolvePipelineEnvironment(ctx context.Context, store *db.Store, home strin
 
 	sharedCandidates, err := pipelineSharedKeyCandidates(ctx, store, spec, ownNames)
 	if err != nil {
-		return pipelineEnvironmentResolution{}, err
+		return PipelineEnvironmentResolution{}, err
 	}
 	availableShared := pipelineSharedKeys{pipeline: map[string]db.KeychainKey{}, agents: map[string]map[string]db.KeychainKey{}}
 	if sharedCandidates.any() {
 		shared, err := loadValidatedKeychainNames(ctx, store, home)
 		if err != nil {
-			return pipelineEnvironmentResolution{}, err
+			return PipelineEnvironmentResolution{}, err
 		}
 		availableShared = sharedCandidates.available(shared)
 	}
 	return projectPipelineEnvironment(spec, ownNames, availableShared), nil
 }
 
-func projectPipelineEnvironment(spec pipeline.Spec, ownNames map[string]struct{}, sharedKeys pipelineSharedKeys) pipelineEnvironmentResolution {
+func projectPipelineEnvironment(spec Spec, ownNames map[string]struct{}, sharedKeys pipelineSharedKeys) PipelineEnvironmentResolution {
 	defaultNames := make(map[string]struct{}, len(spec.Env))
 	for name := range spec.Env {
 		defaultNames[name] = struct{}{}
@@ -112,38 +138,38 @@ func projectPipelineEnvironment(spec pipeline.Spec, ownNames map[string]struct{}
 			sharedProxied[name] = struct{}{}
 		}
 	}
-	shellSources := []pipeline.EnvKeySource{
+	shellSources := []EnvKeySource{
 		{Source: pipelineKeySourceOwn, Mode: db.KeychainModeInjected, Names: ownNames},
 		{Source: pipelineKeySourceShared, Mode: db.KeychainModeInjected, Names: sharedInjected},
 		{Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied, Names: sharedProxied},
 		{Source: pipelineKeySourceDefault, Mode: db.KeychainModeInjected, Names: defaultNames},
 	}
-	resolution := pipelineEnvironmentResolution{}
+	resolution := PipelineEnvironmentResolution{}
 	for _, stage := range spec.Stages {
 		sources := shellSources
-		if stage.Kind() != pipeline.StageKindShell {
+		if stage.Kind() != StageKindShell {
 			agentProxied := make(map[string]struct{})
 			for name, key := range sharedKeys.agents[stage.Agent] {
 				if key.Mode == db.KeychainModeProxied && key.ProxyConfigured() {
 					agentProxied[name] = struct{}{}
 				}
 			}
-			sources = []pipeline.EnvKeySource{{Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied, Names: agentProxied}}
+			sources = []EnvKeySource{{Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied, Names: agentProxied}}
 		}
-		projected, unresolved := pipeline.ProjectEnvKeys(stage.EnvKeys, sources)
+		projected, unresolved := ProjectEnvKeys(stage.EnvKeys, sources)
 		for _, key := range projected {
 			resolution.Access = append(resolution.Access, workflow.PipelineKeyAccess{
 				Stage: stage.ID, Name: key.Name, Source: key.Source, Mode: key.Mode,
 			})
 		}
 		for _, selector := range unresolved {
-			resolution.Unresolved = append(resolution.Unresolved, pipelineEnvUnresolved{Stage: stage.ID, Selector: selector})
+			resolution.Unresolved = append(resolution.Unresolved, PipelineEnvUnresolved{Stage: stage.ID, Selector: selector})
 		}
 	}
 	return resolution
 }
 
-func pipelineSharedKeyCandidates(ctx context.Context, store *db.Store, spec pipeline.Spec, ownNames map[string]struct{}) (pipelineSharedKeys, error) {
+func pipelineSharedKeyCandidates(ctx context.Context, store *db.Store, spec Spec, ownNames map[string]struct{}) (pipelineSharedKeys, error) {
 	candidates := pipelineSharedKeys{pipeline: make(map[string]db.KeychainKey), agents: make(map[string]map[string]db.KeychainKey)}
 	if strings.TrimSpace(spec.Name) == "" {
 		return candidates, nil
@@ -210,9 +236,9 @@ func pipelineSharedKeyCandidates(ctx context.Context, store *db.Store, spec pipe
 	return candidates, nil
 }
 
-func pipelineShellSelectorUsed(spec pipeline.Spec, name string) bool {
+func pipelineShellSelectorUsed(spec Spec, name string) bool {
 	for _, stage := range spec.Stages {
-		if stage.Kind() != pipeline.StageKindShell {
+		if stage.Kind() != StageKindShell {
 			continue
 		}
 		if pipelineStageSelectorUsed(stage, name) {
@@ -222,7 +248,7 @@ func pipelineShellSelectorUsed(spec pipeline.Spec, name string) bool {
 	return false
 }
 
-func pipelineAgentSelectorUsed(spec pipeline.Spec, seat, name string) bool {
+func pipelineAgentSelectorUsed(spec Spec, seat, name string) bool {
 	for _, stage := range spec.Stages {
 		if strings.TrimSpace(stage.Agent) != seat {
 			continue
@@ -234,7 +260,7 @@ func pipelineAgentSelectorUsed(spec pipeline.Spec, seat, name string) bool {
 	return false
 }
 
-func pipelineStageSelectorUsed(stage pipeline.Stage, name string) bool {
+func pipelineStageSelectorUsed(stage Stage, name string) bool {
 	for _, selector := range stage.EnvKeys {
 		if selector == name {
 			return true
@@ -282,7 +308,7 @@ func (k pipelineSharedKeys) available(names map[string]struct{}) pipelineSharedK
 	return out
 }
 
-func pipelineEnvironmentResolutionError(spec pipeline.Spec, unresolved []pipelineEnvUnresolved) error {
+func PipelineEnvironmentResolutionError(spec Spec, unresolved []PipelineEnvUnresolved) error {
 	if len(unresolved) == 0 {
 		return nil
 	}
@@ -299,9 +325,9 @@ func pipelineEnvironmentResolutionError(spec pipeline.Spec, unresolved []pipelin
 	return fmt.Errorf("stage %q env_keys entry %q is unresolved; register a matching key and run gitmoot key grant %s --pipeline %s", item.Stage, item.Selector, name, spec.Name)
 }
 
-func resolvePipelineStageEnvAccess(ctx context.Context, store *db.Store, home string, spec pipeline.Spec, stage pipeline.Stage) (pipelineStageEnvAccess, error) {
+func ResolvePipelineStageEnvAccess(ctx context.Context, store *db.Store, home string, spec Spec, stage Stage) (PipelineStageEnvAccess, error) {
 	if len(stage.EnvKeys) == 0 {
-		return pipelineStageEnvAccess{}, nil
+		return PipelineStageEnvAccess{}, nil
 	}
 	resolutionSpec := spec
 	foundStage := false
@@ -312,18 +338,18 @@ func resolvePipelineStageEnvAccess(ctx context.Context, store *db.Store, home st
 		}
 	}
 	if !foundStage {
-		resolutionSpec.Stages = append(append([]pipeline.Stage(nil), resolutionSpec.Stages...), stage)
+		resolutionSpec.Stages = append(append([]Stage(nil), resolutionSpec.Stages...), stage)
 	}
-	resolution, err := resolvePipelineEnvironment(ctx, store, home, resolutionSpec)
+	resolution, err := ResolvePipelineEnvironment(ctx, store, home, resolutionSpec)
 	if err != nil {
-		return pipelineStageEnvAccess{}, err
+		return PipelineStageEnvAccess{}, err
 	}
 	for _, unresolved := range resolution.Unresolved {
 		if unresolved.Stage == stage.ID {
-			return pipelineStageEnvAccess{}, pipelineEnvironmentResolutionError(spec, []pipelineEnvUnresolved{unresolved})
+			return PipelineStageEnvAccess{}, PipelineEnvironmentResolutionError(spec, []PipelineEnvUnresolved{unresolved})
 		}
 	}
-	access := pipelineStageEnvAccess{File: spec.EnvFile}
+	access := PipelineStageEnvAccess{File: spec.EnvFile}
 	for _, row := range resolution.Access {
 		if row.Stage != stage.ID {
 			continue
@@ -344,8 +370,8 @@ func loadValidatedPipelineEnvFile(ctx context.Context, store *db.Store, home, de
 	return loadValidatedSecretEnvFile(ctx, store, home, "env_file", declared)
 }
 
-func loadValidatedKeychainFile(ctx context.Context, store *db.Store, home string) (string, map[string]string, error) {
-	path, err := resolveKeychainPath(store, home)
+func LoadValidatedKeychainFile(ctx context.Context, store *db.Store, home string) (string, map[string]string, error) {
+	path, err := ResolveKeychainPath(store, home)
 	if err != nil {
 		return "", nil, err
 	}
@@ -354,14 +380,14 @@ func loadValidatedKeychainFile(ctx context.Context, store *db.Store, home string
 }
 
 func loadValidatedKeychainNames(ctx context.Context, store *db.Store, home string) (map[string]struct{}, error) {
-	path, err := resolveKeychainPath(store, home)
+	path, err := ResolveKeychainPath(store, home)
 	if err != nil {
 		return nil, err
 	}
 	return loadValidatedSecretEnvNames(ctx, store, home, "keychain", path)
 }
 
-func resolveKeychainPath(store *db.Store, home string) (string, error) {
+func ResolveKeychainPath(store *db.Store, home string) (string, error) {
 	paths, err := configPathsForPipelineStore(store, home)
 	if err != nil {
 		return "", err
@@ -391,6 +417,9 @@ func configPathsForPipelineStore(store *db.Store, home string) (config.Paths, er
 	return pathsFromFlag(home)
 }
 
+// ConfigPathsForPipelineStore exposes the engine's store-aware path resolution.
+var ConfigPathsForPipelineStore = configPathsForPipelineStore
+
 func loadValidatedSecretEnvFile(ctx context.Context, store *db.Store, home, label, declared string) (map[string]string, error) {
 	file, _, err := openValidatedSecretEnvFile(ctx, store, home, label, declared)
 	if err != nil {
@@ -401,12 +430,12 @@ func loadValidatedSecretEnvFile(ctx context.Context, store *db.Store, home, labe
 	if err != nil {
 		return nil, fmt.Errorf("read %s %s: %w", label, strings.TrimSpace(declared), err)
 	}
-	values, err := pipeline.ParseEnv(strings.TrimSpace(declared), data)
+	values, err := ParseEnv(strings.TrimSpace(declared), data)
 	if err != nil {
 		return nil, err
 	}
 	for name := range values {
-		if pipeline.ReservedEnvName(name) {
+		if ReservedEnvName(name) {
 			return nil, fmt.Errorf("%s %s key %q uses reserved GITMOOT_* namespace", label, strings.TrimSpace(declared), name)
 		}
 	}
@@ -423,23 +452,23 @@ func loadValidatedSecretEnvNames(ctx context.Context, store *db.Store, home, lab
 	if err != nil {
 		return nil, fmt.Errorf("read %s %s: %w", label, strings.TrimSpace(declared), err)
 	}
-	names, err := pipeline.ParseEnvNames(strings.TrimSpace(declared), data)
+	names, err := ParseEnvNames(strings.TrimSpace(declared), data)
 	if err != nil {
 		return nil, err
 	}
 	for name := range names {
-		if pipeline.ReservedEnvName(name) {
+		if ReservedEnvName(name) {
 			return nil, fmt.Errorf("%s %s key %q uses reserved GITMOOT_* namespace", label, strings.TrimSpace(declared), name)
 		}
 	}
 	return names, nil
 }
 
-// classifyPipelineEnvFile returns the live advisory status and names needed by
+// ClassifyPipelineEnvFile returns the live advisory status and names needed by
 // the dashboard. It never returns file contents or an error string.
-func classifyPipelineEnvFile(ctx context.Context, store *db.Store, home, declared string) pipelineEnvFileInspection {
+func ClassifyPipelineEnvFile(ctx context.Context, store *db.Store, home, declared string) PipelineEnvFileInspection {
 	declared = strings.TrimSpace(declared)
-	inspection := pipelineEnvFileInspection{Path: declared, Status: pipelineEnvFileStatusNone, Names: map[string]struct{}{}}
+	inspection := PipelineEnvFileInspection{Path: declared, Status: pipelineEnvFileStatusNone, Names: map[string]struct{}{}}
 	if declared == "" {
 		return inspection
 	}
@@ -454,13 +483,13 @@ func classifyPipelineEnvFile(ctx context.Context, store *db.Store, home, declare
 		inspection.Status = pipelineEnvFileStatusInvalid
 		return inspection
 	}
-	names, err := pipeline.ParseEnvNames(declared, data)
+	names, err := ParseEnvNames(declared, data)
 	if err != nil {
 		inspection.Status = pipelineEnvFileStatusInvalid
 		return inspection
 	}
 	for name := range names {
-		if pipeline.ReservedEnvName(name) {
+		if ReservedEnvName(name) {
 			inspection.Status = pipelineEnvFileStatusInvalid
 			return inspection
 		}
@@ -503,8 +532,8 @@ func openValidatedSecretEnvFile(ctx context.Context, store *db.Store, home, labe
 	if err != nil {
 		return closeWith(pipelineEnvFileStatusInvalid, fmt.Errorf("%s %s: %w", label, declared, err))
 	}
-	if owner != pipelineEnvCurrentUID() {
-		return closeWith(pipelineEnvFileStatusBadOwner, fmt.Errorf("%s %s is owned by uid %d; want operator uid %d", label, declared, owner, pipelineEnvCurrentUID()))
+	if owner != PipelineEnvCurrentUID() {
+		return closeWith(pipelineEnvFileStatusBadOwner, fmt.Errorf("%s %s is owned by uid %d; want operator uid %d", label, declared, owner, PipelineEnvCurrentUID()))
 	}
 	if err := validateSecretEnvFileLocation(ctx, store, home, label, declared); err != nil {
 		return closeWith(pipelineEnvFileStatusBadLocation, err)
@@ -520,7 +549,7 @@ func validateSecretEnvFileLocation(ctx context.Context, store *db.Store, home, l
 	if store == nil {
 		return fmt.Errorf("%s validation requires a store", label)
 	}
-	resolved, err := resolveProduceSafetyPath(declared)
+	resolved, err := ResolveProduceSafetyPath(declared)
 	if err != nil {
 		return fmt.Errorf("resolve %s %s: %w", label, declared, err)
 	}
@@ -548,18 +577,18 @@ func validateSecretEnvFileLocation(ctx context.Context, store *db.Store, home, l
 		}
 	}
 	for _, item := range protected {
-		protectedPath, err := resolveProduceSafetyPath(item.path)
+		protectedPath, err := ResolveProduceSafetyPath(item.path)
 		if err != nil {
 			return fmt.Errorf("resolve %s %q: %w", item.label, item.path, err)
 		}
-		if pathWithin(resolved, protectedPath) {
+		if PathWithin(resolved, protectedPath) {
 			return fmt.Errorf("%s %s resolves inside %s %q", label, declared, item.label, protectedPath)
 		}
 	}
 	return nil
 }
 
-func pathWithin(path, directory string) bool {
+func PathWithin(path, directory string) bool {
 	rel, err := filepath.Rel(directory, path)
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
@@ -577,7 +606,7 @@ type pipelineEnvDeliveryAdapter struct {
 	env          map[string]string
 }
 
-func wrapPipelineEnvDeliveryAdapter(store *db.Store, home string, payload workflow.JobPayload, inner workflow.DeliveryAdapter) workflow.DeliveryAdapter {
+func WrapPipelineEnvDeliveryAdapter(store *db.Store, home string, payload workflow.JobPayload, inner workflow.DeliveryAdapter) workflow.DeliveryAdapter {
 	if inner == nil || (len(payload.PipelineKeyAccess) == 0 && len(payload.PipelineEnvKeys) == 0) {
 		return inner
 	}
@@ -623,7 +652,7 @@ func (a pipelineEnvDeliveryAdapter) Deliver(ctx context.Context, agent runtime.A
 			}
 			policy, _, err := credgw.ValidateProxyPolicy(credgw.ProxyPolicy{
 				Upstream: key.ProxyUpstream, AuthKind: credgw.ProxyAuthKind(key.ProxyAuthKind), Header: key.ProxyHeader,
-				AllowLoopbackHTTP: pipelineProxyAllowLoopbackHTTP,
+				AllowLoopbackHTTP: PipelineProxyAllowLoopbackHTTP,
 			})
 			if err != nil {
 				return runtime.Result{}, fmt.Errorf("load pipeline stage environment: invalid proxy configuration for key %q: %w", access.Name, err)
@@ -633,7 +662,7 @@ func (a pipelineEnvDeliveryAdapter) Deliver(ctx context.Context, agent runtime.A
 				if err != nil {
 					return runtime.Result{}, fmt.Errorf("load pipeline stage environment: resolve credential gateway home: %w", err)
 				}
-				proxyGateway, err = modelGatewayRegistry.Gateway(paths.Home, modelGatewayLogf)
+				proxyGateway, err = credgw.DefaultRegistry.Gateway(paths.Home, credgw.DefaultLogf)
 				if err != nil {
 					return runtime.Result{}, fmt.Errorf("load pipeline stage environment: start credential gateway: %w", err)
 				}
@@ -676,7 +705,7 @@ func (a pipelineEnvDeliveryAdapter) Deliver(ctx context.Context, agent runtime.A
 				return runtime.Result{}, fmt.Errorf("load pipeline stage environment: grant for key %q was revoked or changed", access.Name)
 			}
 			if shared == nil {
-				_, shared, err = loadValidatedKeychainFile(ctx, a.store, a.home)
+				_, shared, err = LoadValidatedKeychainFile(ctx, a.store, a.home)
 				if err != nil {
 					return runtime.Result{}, fmt.Errorf("load pipeline stage environment: %w", err)
 				}
@@ -710,7 +739,7 @@ func (a pipelineEnvDeliveryAdapter) proxyResolver(name string) credgw.Credential
 		if !granted || key.Mode != db.KeychainModeProxied || !key.ProxyConfigured() {
 			return credgw.ResolvedCredential{}, errors.New("proxied grant is unavailable")
 		}
-		_, values, err := loadValidatedKeychainFile(ctx, a.store, a.home)
+		_, values, err := LoadValidatedKeychainFile(ctx, a.store, a.home)
 		if err != nil {
 			return credgw.ResolvedCredential{}, err
 		}

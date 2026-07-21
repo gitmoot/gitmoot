@@ -1,28 +1,25 @@
-package cli
+package pipeline
 
 import (
-	"bytes"
 	"context"
+	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
-	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // parkBlockedChainRun drives the linear a->b->c chain to a parked-blocked run: a
 // succeeds, b returns blocked, c is skipped, run parks blocked. It returns the
 // parked run for the resume/cancel tests to act on.
-func parkBlockedChainRun(t *testing.T, store *db.Store, enqueue pipelineStageEnqueuer, rec db.Pipeline, spec pipeline.Spec, now time.Time) db.PipelineRun {
+func parkBlockedChainRun(t *testing.T, store *db.Store, enqueue PipelineStageEnqueuer, rec db.Pipeline, spec Spec, now time.Time) db.PipelineRun {
 	t.Helper()
 	run := startTestRun(t, store, rec, spec, enqueue, now)
 	settleStageJob(t, store, stageRow(t, store, run.ID, "a").JobID, "approved", "a ok", nil)
 	run = advance(t, store, rec, spec, enqueue, run, now)
 	settleStageJob(t, store, stageRow(t, store, run.ID, "b").JobID, "blocked", "needs secret", []string{"R2 token"})
 	run = advance(t, store, rec, spec, enqueue, run, now)
-	if run.State != pipeline.RunBlocked {
+	if run.State != RunBlocked {
 		t.Fatalf("precondition: run = %s, want blocked", run.State)
 	}
 	return run
@@ -47,7 +44,7 @@ func TestResumeResetsHaltedStageAndDependents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResumePipelineRun: %v", err)
 	}
-	if resumed.State != pipeline.RunRunning {
+	if resumed.State != RunRunning {
 		t.Fatalf("resumed run = %s, want running", resumed.State)
 	}
 	if resumed.HaltStage != "" || resumed.HaltReason != "" || resumed.NeedsJSON != "" {
@@ -56,17 +53,17 @@ func TestResumeResetsHaltedStageAndDependents(t *testing.T) {
 
 	// a (succeeded) is untouched: same state, same attempt, same job.
 	a := stageRow(t, store, run.ID, "a")
-	if a.State != pipeline.StageSucceeded || a.Attempt != aBefore.Attempt || a.JobID != aBefore.JobID {
+	if a.State != StageSucceeded || a.Attempt != aBefore.Attempt || a.JobID != aBefore.JobID {
 		t.Fatalf("succeeded stage a changed on resume: before=%+v after=%+v", aBefore, a)
 	}
 	// b (halted) reset to pending, attempt bumped, job cleared, needs cleared.
 	b := stageRow(t, store, run.ID, "b")
-	if b.State != pipeline.StagePending || b.Attempt != 1 || b.JobID != "" || b.NeedsJSON != "" {
+	if b.State != StagePending || b.Attempt != 1 || b.JobID != "" || b.NeedsJSON != "" {
 		t.Fatalf("halted stage b not reset: %+v", b)
 	}
 	// c (skipped dependent) reset to pending, attempt bumped.
 	c := stageRow(t, store, run.ID, "c")
-	if c.State != pipeline.StagePending || c.Attempt != 1 {
+	if c.State != StagePending || c.Attempt != 1 {
 		t.Fatalf("dependent stage c not reset: %+v", c)
 	}
 
@@ -74,7 +71,7 @@ func TestResumeResetsHaltedStageAndDependents(t *testing.T) {
 	// Advance the RESUMED (running) run — the pre-resume handle is still blocked.
 	advance(t, store, rec, spec, enqueue, resumed, now)
 	b = stageRow(t, store, run.ID, "b")
-	if b.State != pipeline.StageQueued || b.JobID == "" || b.JobID == bBlockedJob {
+	if b.State != StageQueued || b.JobID == "" || b.JobID == bBlockedJob {
 		t.Fatalf("b not re-enqueued with a fresh job: %+v (was %q)", b, bBlockedJob)
 	}
 }
@@ -97,13 +94,13 @@ func TestResumeFromNeverTouchesSucceeded(t *testing.T) {
 		t.Fatalf("ResumePipelineRun(from=a): %v", err)
 	}
 	a := stageRow(t, store, run.ID, "a")
-	if a.State != pipeline.StageSucceeded || a.Attempt != aBefore.Attempt {
+	if a.State != StageSucceeded || a.Attempt != aBefore.Attempt {
 		t.Fatalf("succeeded stage a must stay untouched even as resume point: %+v", a)
 	}
-	if b := stageRow(t, store, run.ID, "b"); b.State != pipeline.StagePending {
+	if b := stageRow(t, store, run.ID, "b"); b.State != StagePending {
 		t.Fatalf("stage b = %s, want pending (dependent of resume point a)", b.State)
 	}
-	if c := stageRow(t, store, run.ID, "c"); c.State != pipeline.StagePending {
+	if c := stageRow(t, store, run.ID, "c"); c.State != StagePending {
 		t.Fatalf("stage c = %s, want pending (transitive dependent)", c.State)
 	}
 }
@@ -138,7 +135,7 @@ func TestResumeRefusesNonParkedRuns(t *testing.T) {
 	running = advance(t, store, rec, spec, enqueue, running, now)
 	settleStageJob(t, store, stageRow(t, store, running.ID, "c").JobID, "approved", "c", nil)
 	running = advance(t, store, rec, spec, enqueue, running, now)
-	if running.State != pipeline.RunSucceeded {
+	if running.State != RunSucceeded {
 		t.Fatalf("precondition: run = %s, want succeeded", running.State)
 	}
 	if _, err := ResumePipelineRun(ctx, store, running.ID, ""); err == nil ||
@@ -176,11 +173,11 @@ func TestCancelPipelineRunInFlight(t *testing.T) {
 	run := startTestRun(t, store, rec, spec, enqueue, now)
 	aJob := stageRow(t, store, run.ID, "a").JobID
 
-	cancelled, err := cancelPipelineRun(ctx, store, run.ID, now)
+	cancelled, err := CancelPipelineRun(ctx, store, run.ID, now)
 	if err != nil {
-		t.Fatalf("cancelPipelineRun: %v", err)
+		t.Fatalf("CancelPipelineRun: %v", err)
 	}
-	if cancelled.State != pipeline.RunCancelled {
+	if cancelled.State != RunCancelled {
 		t.Fatalf("run = %s, want cancelled", cancelled.State)
 	}
 	// The in-flight stage job was cancelled through the shared abandon verb.
@@ -189,12 +186,12 @@ func TestCancelPipelineRunInFlight(t *testing.T) {
 	}
 	// Every stage moved to cancelled (a was queued; b, c pending).
 	for _, id := range []string{"a", "b", "c"} {
-		if got := stageRow(t, store, run.ID, id); got.State != pipeline.StageCancelled {
+		if got := stageRow(t, store, run.ID, id); got.State != StageCancelled {
 			t.Fatalf("stage %s = %s, want cancelled", id, got.State)
 		}
 	}
 	// The pipeline's last_status mirrors the cancel.
-	if p, _, _ := store.GetPipeline(ctx, "chain"); p.LastStatus != pipeline.RunCancelled {
+	if p, _, _ := store.GetPipeline(ctx, "chain"); p.LastStatus != RunCancelled {
 		t.Fatalf("pipeline last_status = %q, want cancelled", p.LastStatus)
 	}
 }
@@ -210,20 +207,20 @@ func TestCancelPipelineRunPreservesSettledStages(t *testing.T) {
 	now := time.Date(2026, 7, 6, 9, 0, 0, 0, time.UTC)
 
 	run := parkBlockedChainRun(t, store, enqueue, rec, spec, now)
-	cancelled, err := cancelPipelineRun(ctx, store, run.ID, now)
+	cancelled, err := CancelPipelineRun(ctx, store, run.ID, now)
 	if err != nil {
-		t.Fatalf("cancelPipelineRun: %v", err)
+		t.Fatalf("CancelPipelineRun: %v", err)
 	}
-	if cancelled.State != pipeline.RunCancelled {
+	if cancelled.State != RunCancelled {
 		t.Fatalf("run = %s, want cancelled", cancelled.State)
 	}
-	if a := stageRow(t, store, run.ID, "a"); a.State != pipeline.StageSucceeded {
+	if a := stageRow(t, store, run.ID, "a"); a.State != StageSucceeded {
 		t.Fatalf("stage a = %s, want succeeded (preserved)", a.State)
 	}
-	if b := stageRow(t, store, run.ID, "b"); b.State != pipeline.StageBlocked {
+	if b := stageRow(t, store, run.ID, "b"); b.State != StageBlocked {
 		t.Fatalf("stage b = %s, want blocked (halt record preserved)", b.State)
 	}
-	if c := stageRow(t, store, run.ID, "c"); c.State != pipeline.StageSkipped {
+	if c := stageRow(t, store, run.ID, "c"); c.State != StageSkipped {
 		t.Fatalf("stage c = %s, want skipped (preserved)", c.State)
 	}
 }
@@ -237,48 +234,16 @@ func TestCancelPipelineRunRefusesTerminal(t *testing.T) {
 	now := time.Date(2026, 7, 6, 9, 0, 0, 0, time.UTC)
 
 	run := startTestRun(t, store, rec, spec, enqueue, now)
-	if _, err := cancelPipelineRun(ctx, store, run.ID, now); err != nil {
+	if _, err := CancelPipelineRun(ctx, store, run.ID, now); err != nil {
 		t.Fatalf("first cancel: %v", err)
 	}
 	// A second cancel of the now-cancelled run is refused.
-	if _, err := cancelPipelineRun(ctx, store, run.ID, now); err == nil ||
+	if _, err := CancelPipelineRun(ctx, store, run.ID, now); err == nil ||
 		!strings.Contains(err.Error(), "cancel requires") {
 		t.Fatalf("re-cancel: err=%v, want a refusal", err)
 	}
-	if _, err := cancelPipelineRun(ctx, store, "prun-nope", now); err == nil ||
+	if _, err := CancelPipelineRun(ctx, store, "prun-nope", now); err == nil ||
 		!strings.Contains(err.Error(), "not found") {
 		t.Fatalf("cancel missing run: err=%v, want not-found", err)
-	}
-}
-
-// TestPipelineResumeCancelCLI smoke-tests the resume/cancel CLI wrappers through
-// Run(): argument validation and the error/exit-code contract.
-func TestPipelineResumeCancelCLI(t *testing.T) {
-	home := t.TempDir()
-	run := func(args ...string) (string, string, int) {
-		var stdout, stderr bytes.Buffer
-		code := Run(append(args, "--home", home), &stdout, &stderr)
-		return stdout.String(), stderr.String(), code
-	}
-	// Missing run id: a usage error BEFORE any store touch, so it is safe to invoke
-	// without --home (the arg guard returns before withStore).
-	bare := func(args ...string) (string, int) {
-		var stdout, stderr bytes.Buffer
-		code := Run(args, &stdout, &stderr)
-		return stderr.String(), code
-	}
-
-	if errOut, code := bare("pipeline", "resume"); code != 2 || !strings.Contains(errOut, "requires a run id") {
-		t.Fatalf("resume no-arg: code=%d stderr=%q", code, errOut)
-	}
-	if errOut, code := bare("pipeline", "cancel"); code != 2 || !strings.Contains(errOut, "requires a run id") {
-		t.Fatalf("cancel no-arg: code=%d stderr=%q", code, errOut)
-	}
-	// Unknown run: a friendly not-found with exit 1.
-	if _, errOut, code := run("pipeline", "resume", "prun-nope"); code != 1 || !strings.Contains(errOut, "not found") {
-		t.Fatalf("resume unknown: code=%d stderr=%q", code, errOut)
-	}
-	if _, errOut, code := run("pipeline", "cancel", "prun-nope"); code != 1 || !strings.Contains(errOut, "not found") {
-		t.Fatalf("cancel unknown: code=%d stderr=%q", code, errOut)
 	}
 }

@@ -1,4 +1,4 @@
-package cli
+package pipeline
 
 import (
 	"context"
@@ -17,26 +17,27 @@ import (
 )
 
 const (
-	pipelineProgressThreshold = 60 * time.Second
-	pipelineProgressInterval  = 30 * time.Second
+	PipelineProgressThreshold = 60 * time.Second
+	PipelineProgressInterval  = 30 * time.Second
 	pipelineProgressLineBytes = 400
+	PipelineProgressLineBytes = pipelineProgressLineBytes
 )
 
-type pipelineProgressEventPayload struct {
+type PipelineProgressEventPayload struct {
 	Elapsed  string `json:"elapsed"`
 	Activity string `json:"activity,omitempty"`
 }
 
-// pipelineProgressLineTracker is the live-output writer shared with TeeRunner.
+// PipelineProgressLineTracker is the live-output writer shared with TeeRunner.
 // It retains only the most recent non-empty logical line. Sanitization happens
 // before the line can reach storage or an operator surface.
-type pipelineProgressLineTracker struct {
+type PipelineProgressLineTracker struct {
 	mu      sync.Mutex
 	pending string
 	last    string
 }
 
-func (t *pipelineProgressLineTracker) Write(p []byte) (int, error) {
+func (t *PipelineProgressLineTracker) Write(p []byte) (int, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.pending += string(p)
@@ -47,7 +48,7 @@ func (t *pipelineProgressLineTracker) Write(p []byte) (int, error) {
 		complete--
 	}
 	for _, line := range parts[:complete] {
-		if clean := sanitizePipelineProgressLine(line); clean != "" {
+		if clean := SanitizePipelineProgressLine(line); clean != "" {
 			t.last = clean
 		}
 	}
@@ -64,10 +65,10 @@ func (t *pipelineProgressLineTracker) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (t *pipelineProgressLineTracker) LastLine() string {
+func (t *PipelineProgressLineTracker) LastLine() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if clean := sanitizePipelineProgressLine(t.pending); clean != "" {
+	if clean := SanitizePipelineProgressLine(t.pending); clean != "" {
 		return clean
 	}
 	return t.last
@@ -75,7 +76,7 @@ func (t *pipelineProgressLineTracker) LastLine() string {
 
 var pipelineProgressEscapeRE = regexp.MustCompile("\\x1b(?:\\[[0-?]*[ -/]*[@-~]|\\][^\\x07]*(?:\\x07|\\x1b\\\\|$))")
 
-func sanitizePipelineProgressLine(value string) string {
+func SanitizePipelineProgressLine(value string) string {
 	value = pipelineProgressEscapeRE.ReplaceAllString(value, "")
 	var b strings.Builder
 	for _, r := range value {
@@ -103,10 +104,10 @@ func truncatePipelineProgressLine(value string, limit int) string {
 	return value
 }
 
-// runtimeOutputWriter is the one runtime-output composition point. Cockpit and
+// RuntimeOutputWriter is the one runtime-output composition point. Cockpit and
 // progress share one MultiWriter beneath one SyncWriter, so concurrent stdout /
 // stderr copies cannot race either destination.
-func runtimeOutputWriter(writers ...io.Writer) io.Writer {
+func RuntimeOutputWriter(writers ...io.Writer) io.Writer {
 	nonNil := make([]io.Writer, 0, len(writers))
 	for _, writer := range writers {
 		if writer != nil {
@@ -122,7 +123,7 @@ func runtimeOutputWriter(writers ...io.Writer) io.Writer {
 	return subprocess.SyncWriter(io.MultiWriter(nonNil...))
 }
 
-func pipelineProgressTicks(ctx context.Context, threshold, interval time.Duration) <-chan time.Time {
+func PipelineProgressTicks(ctx context.Context, threshold, interval time.Duration) <-chan time.Time {
 	out := make(chan time.Time, 1)
 	go func() {
 		defer close(out)
@@ -156,7 +157,7 @@ func pipelineProgressTicks(ctx context.Context, threshold, interval time.Duratio
 	return out
 }
 
-func emitPipelineProgress(ctx context.Context, store *db.Store, stdout io.Writer, jobID string, startedAt time.Time, tracker *pipelineProgressLineTracker, ticks <-chan time.Time) {
+func EmitPipelineProgress(ctx context.Context, store *db.Store, stdout io.Writer, jobID string, startedAt time.Time, tracker *PipelineProgressLineTracker, ticks <-chan time.Time) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -169,7 +170,7 @@ func emitPipelineProgress(ctx context.Context, store *db.Store, stdout io.Writer
 			if elapsed < 0 {
 				elapsed = 0
 			}
-			message, err := json.Marshal(pipelineProgressEventPayload{
+			message, err := json.Marshal(PipelineProgressEventPayload{
 				Elapsed:  elapsed.Round(time.Second).String(),
 				Activity: tracker.LastLine(),
 			})

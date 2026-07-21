@@ -1,4 +1,4 @@
-package cli
+package pipeline
 
 import (
 	"encoding/json"
@@ -8,14 +8,13 @@ import (
 	"unicode/utf8"
 
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
 )
 
 func TestBuildPipelineShellStageUpstreamContextDeterministicJSON(t *testing.T) {
-	stage := pipeline.Stage{ID: "consume", Cmd: "consume", Needs: []string{" z ", "a", "z"}}
+	stage := Stage{ID: "consume", Cmd: "consume", Needs: []string{" z ", "a", "z"}}
 	byID := map[string]db.PipelineRunStage{
-		"z": {StageID: "z", State: pipeline.StageSucceeded, Summary: "line one\nline two with `ticks` and \"quotes\"\x00"},
-		"a": {StageID: "a", State: pipeline.StageSucceeded, Summary: "snowman ☃"},
+		"z": {StageID: "z", State: StageSucceeded, Summary: "line one\nline two with `ticks` and \"quotes\"\x00"},
+		"a": {StageID: "a", State: StageSucceeded, Summary: "snowman ☃"},
 	}
 
 	got := buildPipelineShellStageUpstreamContext(stage, byID)
@@ -30,9 +29,9 @@ func TestBuildPipelineShellStageUpstreamContextDeterministicJSON(t *testing.T) {
 
 func TestBuildPipelineShellStageUpstreamContextCapsAndFlags(t *testing.T) {
 	t.Run("rune-safe per-summary truncation", func(t *testing.T) {
-		stage := pipeline.Stage{ID: "consume", Cmd: "consume", Needs: []string{"source"}}
+		stage := Stage{ID: "consume", Cmd: "consume", Needs: []string{"source"}}
 		got := buildPipelineShellStageUpstreamContext(stage, map[string]db.PipelineRunStage{
-			"source": {StageID: "source", State: pipeline.StageSucceeded, Summary: strings.Repeat("界", maxPipelineShellUpstreamSummaryBytes)},
+			"source": {StageID: "source", State: StageSucceeded, Summary: strings.Repeat("界", maxPipelineShellUpstreamSummaryBytes)},
 		})
 		var decoded pipelineShellUpstreamContext
 		if err := json.Unmarshal([]byte(got), &decoded); err != nil {
@@ -52,9 +51,9 @@ func TestBuildPipelineShellStageUpstreamContextCapsAndFlags(t *testing.T) {
 	})
 
 	t.Run("escaping expansion truncates instead of omitting", func(t *testing.T) {
-		stage := pipeline.Stage{ID: "consume", Cmd: "consume", Needs: []string{"source"}}
+		stage := Stage{ID: "consume", Cmd: "consume", Needs: []string{"source"}}
 		got := buildPipelineShellStageUpstreamContext(stage, map[string]db.PipelineRunStage{
-			"source": {StageID: "source", State: pipeline.StageSucceeded, Summary: strings.Repeat("\x00", 12_000)},
+			"source": {StageID: "source", State: StageSucceeded, Summary: strings.Repeat("\x00", 12_000)},
 		})
 		var decoded pipelineShellUpstreamContext
 		if err := json.Unmarshal([]byte(got), &decoded); err != nil {
@@ -77,7 +76,7 @@ func TestBuildPipelineShellStageUpstreamContextCapsAndFlags(t *testing.T) {
 	})
 
 	t.Run("marshaled exact boundary", func(t *testing.T) {
-		stage := pipeline.Stage{ID: "consume", Cmd: "consume", Needs: []string{"source"}}
+		stage := Stage{ID: "consume", Cmd: "consume", Needs: []string{"source"}}
 		for _, tc := range []struct {
 			name          string
 			summaryBytes  int
@@ -88,7 +87,7 @@ func TestBuildPipelineShellStageUpstreamContextCapsAndFlags(t *testing.T) {
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				got := buildPipelineShellStageUpstreamContext(stage, map[string]db.PipelineRunStage{
-					"source": {StageID: "source", State: pipeline.StageSucceeded, Summary: strings.Repeat("a", tc.summaryBytes)},
+					"source": {StageID: "source", State: StageSucceeded, Summary: strings.Repeat("a", tc.summaryBytes)},
 				})
 				var decoded pipelineShellUpstreamContext
 				if err := json.Unmarshal([]byte(got), &decoded); err != nil {
@@ -110,12 +109,12 @@ func TestBuildPipelineShellStageUpstreamContextCapsAndFlags(t *testing.T) {
 	})
 
 	t.Run("final marshaled byte cap omits expected stages", func(t *testing.T) {
-		stage := pipeline.Stage{ID: "consume", Cmd: "consume"}
+		stage := Stage{ID: "consume", Cmd: "consume"}
 		byID := make(map[string]db.PipelineRunStage)
 		for i := 0; i < 5; i++ {
 			id := fmt.Sprintf("source-%d", i)
 			stage.Needs = append(stage.Needs, id)
-			byID[id] = db.PipelineRunStage{StageID: id, State: pipeline.StageSucceeded, Summary: strings.Repeat(string(rune('a'+i)), maxPipelineShellUpstreamSummaryBytes-2)}
+			byID[id] = db.PipelineRunStage{StageID: id, State: StageSucceeded, Summary: strings.Repeat(string(rune('a'+i)), maxPipelineShellUpstreamSummaryBytes-2)}
 		}
 		got := buildPipelineShellStageUpstreamContext(stage, byID)
 		if len(got) > maxPipelineShellUpstreamContextBytes {
@@ -137,13 +136,13 @@ func TestBuildPipelineShellStageUpstreamContextCapsAndFlags(t *testing.T) {
 }
 
 func TestBuildPipelineShellStageUpstreamContextEmptyAndMissingNeeds(t *testing.T) {
-	if got := buildPipelineShellStageUpstreamContext(pipeline.Stage{ID: "root", Cmd: "true"}, nil); got != "" {
+	if got := buildPipelineShellStageUpstreamContext(Stage{ID: "root", Cmd: "true"}, nil); got != "" {
 		t.Fatalf("root context = %q, want empty", got)
 	}
-	if got := buildPipelineShellStageUpstreamContext(pipeline.Stage{ID: "agent", Agent: "a", Needs: []string{"source"}}, nil); got != "" {
+	if got := buildPipelineShellStageUpstreamContext(Stage{ID: "agent", Agent: "a", Needs: []string{"source"}}, nil); got != "" {
 		t.Fatalf("agent context = %q, want empty", got)
 	}
-	got := buildPipelineShellStageUpstreamContext(pipeline.Stage{ID: "consume", Cmd: "true", Needs: []string{"source"}}, nil)
+	got := buildPipelineShellStageUpstreamContext(Stage{ID: "consume", Cmd: "true", Needs: []string{"source"}}, nil)
 	if got != `{"schema_version":1,"complete":false,"stages":{}}` {
 		t.Fatalf("missing-upstream context = %s", got)
 	}

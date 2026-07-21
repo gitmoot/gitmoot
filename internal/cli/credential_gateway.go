@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -14,9 +13,7 @@ import (
 )
 
 var (
-	modelGatewayRegistry                   = credgw.NewRegistry()
-	modelGatewayUpstreamURL                = credgw.DefaultAnthropicUpstream
-	modelGatewayLogf        credgw.LogFunc = log.Printf
+	modelGatewayUpstreamURL = credgw.DefaultAnthropicUpstream
 )
 
 func buildModelGatewayRunner(home string, cfg config.CredentialsConfig, auth runtimeAuthFile, inner subprocess.Runner) (*credgw.Runner, error) {
@@ -24,7 +21,7 @@ func buildModelGatewayRunner(home string, cfg config.CredentialsConfig, auth run
 	if err != nil {
 		return nil, err
 	}
-	gateway, err := modelGatewayRegistry.Gateway(home, modelGatewayLogf)
+	gateway, err := credgw.DefaultRegistry.Gateway(home, credgw.DefaultLogf)
 	if err != nil {
 		return nil, fmt.Errorf("start Claude model gateway: %w", err)
 	}
@@ -107,5 +104,5 @@ func wrapModelGatewayAdapter(adapter runtime.Adapter, runner *credgw.Runner) run
 func closeModelGatewayHome(home string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_ = modelGatewayRegistry.CloseHome(ctx, home)
+	_ = credgw.DefaultRegistry.CloseHome(ctx, home)
 }

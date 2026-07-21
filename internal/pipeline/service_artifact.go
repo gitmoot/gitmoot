@@ -1,4 +1,4 @@
-package cli
+package pipeline
 
 import (
 	"archive/zip"
@@ -15,7 +15,6 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/proof"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -25,19 +24,25 @@ const (
 	pipelineServiceArtifactMaxBytes      int64 = 64 << 20
 	pipelineServiceArtifactsDir                = "artifacts"
 	pipelineServiceArtifactFailureMarker       = ".artifact-collection-failed"
+	PipelineServiceArtifactsDir                = pipelineServiceArtifactsDir
 )
 
 var (
-	errPipelineServiceArtifactCollectionFailed = errors.New("artifact_collection_failed")
-	errPipelineServiceArtifactBundleTooLarge   = errors.New("artifact_bundle_too_large")
+	ErrPipelineServiceArtifactCollectionFailed = errors.New("artifact_collection_failed")
+	ErrPipelineServiceArtifactBundleTooLarge   = errors.New("artifact_bundle_too_large")
 )
 
-// pipelineServiceArtifactPrecleanupHook is wired into workflow.Engine's
+func containedRelativePath(path string) bool {
+	path = filepath.Clean(strings.TrimSpace(path))
+	return path != "" && path != "." && !filepath.IsAbs(path) && path != ".." && !strings.HasPrefix(path, ".."+string(filepath.Separator))
+}
+
+// PipelineServiceArtifactPrecleanupHook is wired into workflow.Engine's
 // terminal read-only cleanup. AdvanceJob invokes it while the service shell
 // worktree still exists and cleanup removes the worktree immediately after it
 // returns. Pipeline stage settlement happens on a later daemon scan, so this is
 // the last reliable collection point that preserves normal disposal.
-func pipelineServiceArtifactPrecleanupHook(store *db.Store, paths config.Paths) func(context.Context, string, string, workflow.JobPayload) error {
+func PipelineServiceArtifactPrecleanupHook(store *db.Store, paths config.Paths) func(context.Context, string, string, workflow.JobPayload) error {
 	return func(ctx context.Context, jobID, jobType string, payload workflow.JobPayload) error {
 		if payload.Sender != workflow.PipelineJobSender || payload.RuntimeOverride != runtime.ShellRuntime ||
 			!payload.ReadOnlyWorktree || strings.TrimSpace(payload.WorktreePath) == "" ||
@@ -81,22 +86,22 @@ func collectPipelineServiceStageArtifacts(ctx context.Context, store *db.Store, 
 	return copyPipelineServiceStageOut(paths, runID, stage.ID, payload.WorktreePath)
 }
 
-func servicePipelineStageForJob(ctx context.Context, store *db.Store, paths config.Paths, runID, jobID string) (pipeline.Stage, pipeline.Spec, error) {
-	_, _, sourceSpec, _, err := pipelineServiceRunPaths(paths, runID)
+func servicePipelineStageForJob(ctx context.Context, store *db.Store, paths config.Paths, runID, jobID string) (Stage, Spec, error) {
+	_, _, sourceSpec, _, err := PipelineServiceRunPaths(paths, runID)
 	if err != nil {
-		return pipeline.Stage{}, pipeline.Spec{}, err
+		return Stage{}, Spec{}, err
 	}
 	raw, err := os.ReadFile(sourceSpec)
 	if err != nil {
-		return pipeline.Stage{}, pipeline.Spec{}, fmt.Errorf("read frozen service spec: %w", err)
+		return Stage{}, Spec{}, fmt.Errorf("read frozen service spec: %w", err)
 	}
-	spec, err := pipeline.Load(raw)
+	spec, err := Load(raw)
 	if err != nil {
-		return pipeline.Stage{}, pipeline.Spec{}, fmt.Errorf("parse frozen service spec: %w", err)
+		return Stage{}, Spec{}, fmt.Errorf("parse frozen service spec: %w", err)
 	}
 	rows, err := store.ListPipelineRunStages(ctx, runID)
 	if err != nil {
-		return pipeline.Stage{}, pipeline.Spec{}, err
+		return Stage{}, Spec{}, err
 	}
 	stageID := ""
 	for _, row := range rows {
@@ -120,7 +125,7 @@ func servicePipelineStageForJob(ctx context.Context, store *db.Store, paths conf
 			}
 		}
 	}
-	return pipeline.Stage{}, pipeline.Spec{}, fmt.Errorf("service job %q does not identify a frozen stage", jobID)
+	return Stage{}, Spec{}, fmt.Errorf("service job %q does not identify a frozen stage", jobID)
 }
 
 func copyPipelineServiceStageOut(paths config.Paths, runID, stageID, worktree string) error {
@@ -145,7 +150,7 @@ func copyPipelineServiceStageOut(paths config.Paths, runID, stageID, worktree st
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return errors.New("service stage out must be a real directory")
 	}
-	_, base, _, _, err := pipelineServiceRunPaths(paths, runID)
+	_, base, _, _, err := PipelineServiceRunPaths(paths, runID)
 	if err != nil {
 		return err
 	}
@@ -206,7 +211,7 @@ func copyPipelineServiceStageOut(paths config.Paths, runID, stageID, worktree st
 		}
 		staged += fileInfo.Size()
 		if committed+staged > pipelineServiceArtifactMaxBytes {
-			return errPipelineServiceArtifactBundleTooLarge
+			return ErrPipelineServiceArtifactBundleTooLarge
 		}
 		if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
 			return err
@@ -284,33 +289,33 @@ func pipelineServiceArtifactsCommittedBytes(artifactsRoot string) (int64, error)
 // cause (e.g. artifact_bundle_too_large) so the caller sees why, defaulting to
 // the generic collection-failed reason.
 func markPipelineServiceArtifactCollectionFailed(paths config.Paths, runID string, cause error) error {
-	root, _, _, _, err := pipelineServiceRunPaths(paths, runID)
+	root, _, _, _, err := PipelineServiceRunPaths(paths, runID)
 	if err != nil {
 		return err
 	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return err
 	}
-	reason := errPipelineServiceArtifactCollectionFailed.Error()
-	if errors.Is(cause, errPipelineServiceArtifactBundleTooLarge) {
-		reason = errPipelineServiceArtifactBundleTooLarge.Error()
+	reason := ErrPipelineServiceArtifactCollectionFailed.Error()
+	if errors.Is(cause, ErrPipelineServiceArtifactBundleTooLarge) {
+		reason = ErrPipelineServiceArtifactBundleTooLarge.Error()
 	}
 	return os.WriteFile(filepath.Join(root, pipelineServiceArtifactFailureMarker), []byte(reason+"\n"), 0o600)
 }
 
-// loadPipelineServiceArtifacts hashes the durable staging tree and enforces the
+// LoadPipelineServiceArtifacts hashes the durable staging tree and enforces the
 // aggregate 64 MiB cap before proof or archive creation. It rejects symlinks and
 // non-regular files again so a local post-collection mutation fails closed.
-func loadPipelineServiceArtifacts(paths config.Paths, runID string) ([]proof.ArtifactEvidence, error) {
-	root, base, _, _, err := pipelineServiceRunPaths(paths, runID)
+func LoadPipelineServiceArtifacts(paths config.Paths, runID string) ([]proof.ArtifactEvidence, error) {
+	root, base, _, _, err := PipelineServiceRunPaths(paths, runID)
 	if err != nil {
 		return nil, err
 	}
 	if marker, err := os.ReadFile(filepath.Join(root, pipelineServiceArtifactFailureMarker)); err == nil {
-		if strings.TrimSpace(string(marker)) == errPipelineServiceArtifactBundleTooLarge.Error() {
-			return nil, errPipelineServiceArtifactBundleTooLarge
+		if strings.TrimSpace(string(marker)) == ErrPipelineServiceArtifactBundleTooLarge.Error() {
+			return nil, ErrPipelineServiceArtifactBundleTooLarge
 		}
-		return nil, errPipelineServiceArtifactCollectionFailed
+		return nil, ErrPipelineServiceArtifactCollectionFailed
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
@@ -351,7 +356,7 @@ func loadPipelineServiceArtifacts(paths config.Paths, runID string) ([]proof.Art
 		}
 		total += info.Size()
 		if total > pipelineServiceArtifactMaxBytes {
-			return errPipelineServiceArtifactBundleTooLarge
+			return ErrPipelineServiceArtifactBundleTooLarge
 		}
 		digest, err := hashPipelineServiceArtifactHex(path)
 		if err != nil {
@@ -385,7 +390,7 @@ func hashPipelineServiceArtifactHex(path string) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-func verifyPipelineServiceArtifactProof(manifest proof.Manifest, actual []proof.ArtifactEvidence) error {
+func VerifyPipelineServiceArtifactProof(manifest proof.Manifest, actual []proof.ArtifactEvidence) error {
 	committed, err := proof.ArtifactEntries(manifest)
 	if err != nil {
 		return err
@@ -401,11 +406,11 @@ func verifyPipelineServiceArtifactProof(manifest proof.Manifest, actual []proof.
 	return nil
 }
 
-// verifyPipelineServiceArchiveArtifacts binds the bytes in the completed,
+// VerifyPipelineServiceArchiveArtifacts binds the bytes in the completed,
 // caller-facing archive to the artifact nodes, closing the gap between hashing
 // the staging tree and packaging it. It also rejects missing or extra artifact
 // entries.
-func verifyPipelineServiceArchiveArtifacts(archivePath string, manifest proof.Manifest) error {
+func VerifyPipelineServiceArchiveArtifacts(archivePath string, manifest proof.Manifest) error {
 	committed, err := proof.ArtifactEntries(manifest)
 	if err != nil {
 		return err

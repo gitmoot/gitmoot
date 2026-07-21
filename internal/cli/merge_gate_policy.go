@@ -21,16 +21,6 @@ func applyMergeGatePolicy(gate *workflow.PolicyMergeGate, home string, repo stri
 	gate.MaxCIWait = policy.MaxCIWait
 }
 
-func applyPipelineAutoMergePolicy(merger *workflow.PipelineAutoMerger, home string, repo string) {
-	policy, ok := resolvedMergeGatePolicy(home, repo)
-	if !ok {
-		return
-	}
-	merger.RequireExternalCI = policy.RequireExternalCI
-	merger.MinCIWait = policy.MinCIWait
-	merger.MaxCIWait = policy.MaxCIWait
-}
-
 // resolvedMergeGatePolicy is the single config path for the native merge gate
 // and pipeline auto-merge executor, including per-repo overrides.
 func resolvedMergeGatePolicy(home string, repo string) (config.MergeGatePolicy, bool) {

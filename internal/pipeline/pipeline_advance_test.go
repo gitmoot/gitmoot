@@ -1,4 +1,4 @@
-package cli
+package pipeline
 
 import (
 	"context"
@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -30,13 +29,13 @@ func pipelineAdvanceStore(t *testing.T) *db.Store {
 
 // newTestPipeline stores a pipeline record built from spec YAML and returns the
 // canonical stored record plus the parsed spec.
-func newTestPipeline(t *testing.T, store *db.Store, name, specYAML string) (db.Pipeline, pipeline.Spec) {
+func newTestPipeline(t *testing.T, store *db.Store, name, specYAML string) (db.Pipeline, Spec) {
 	t.Helper()
-	spec, err := pipeline.Load([]byte(specYAML))
+	spec, err := Load([]byte(specYAML))
 	if err != nil {
-		t.Fatalf("pipeline.Load: %v", err)
+		t.Fatalf("Load: %v", err)
 	}
-	rec := db.Pipeline{Name: name, Repo: "owner/repo", SpecYAML: specYAML, SpecHash: pipeline.Hash([]byte(specYAML))}
+	rec := db.Pipeline{Name: name, Repo: "owner/repo", SpecYAML: specYAML, SpecHash: Hash([]byte(specYAML))}
 	if err := store.CreateOrUpdatePipeline(context.Background(), rec); err != nil {
 		t.Fatalf("CreateOrUpdatePipeline: %v", err)
 	}
@@ -51,7 +50,7 @@ func newTestPipeline(t *testing.T, store *db.Store, name, specYAML string) (db.P
 // row so the advancer's later GetJob(stage.JobID) fold works. It requires no
 // agent (Mailbox tolerates a missing agent) — the unit tests exercise the
 // advancer's decision logic, not the worker.
-func testStageEnqueuer(store *db.Store) pipelineStageEnqueuer {
+func testStageEnqueuer(store *db.Store) PipelineStageEnqueuer {
 	mailbox := workflow.Mailbox{Store: store}
 	return func(ctx context.Context, request workflow.JobRequest) (db.Job, error) {
 		return mailbox.Enqueue(ctx, request)
@@ -154,22 +153,22 @@ func stageRow(t *testing.T, store *db.Store, runID, stageID string) db.PipelineR
 	return stage
 }
 
-func startTestRun(t *testing.T, store *db.Store, rec db.Pipeline, spec pipeline.Spec, enqueue pipelineStageEnqueuer, now time.Time) db.PipelineRun {
+func startTestRun(t *testing.T, store *db.Store, rec db.Pipeline, spec Spec, enqueue PipelineStageEnqueuer, now time.Time) db.PipelineRun {
 	t.Helper()
-	run, err := createPipelineRun(context.Background(), store, rec, spec, "manual", "{}", now)
+	run, err := CreatePipelineRun(context.Background(), store, rec, spec, "manual", "{}", now)
 	if err != nil {
-		t.Fatalf("createPipelineRun: %v", err)
+		t.Fatalf("CreatePipelineRun: %v", err)
 	}
-	run, err = advancePipelineRun(context.Background(), store, enqueue, rec, spec, run, now)
+	run, err = AdvancePipelineRun(context.Background(), store, enqueue, rec, spec, run, now)
 	if err != nil {
 		t.Fatalf("initial advance: %v", err)
 	}
 	return run
 }
 
-func advance(t *testing.T, store *db.Store, rec db.Pipeline, spec pipeline.Spec, enqueue pipelineStageEnqueuer, run db.PipelineRun, now time.Time) db.PipelineRun {
+func advance(t *testing.T, store *db.Store, rec db.Pipeline, spec Spec, enqueue PipelineStageEnqueuer, run db.PipelineRun, now time.Time) db.PipelineRun {
 	t.Helper()
-	updated, err := advancePipelineRun(context.Background(), store, enqueue, rec, spec, run, now)
+	updated, err := AdvancePipelineRun(context.Background(), store, enqueue, rec, spec, run, now)
 	if err != nil {
 		t.Fatalf("advance: %v", err)
 	}
@@ -194,9 +193,9 @@ func TestCreatePipelineRunPersistsStageDeps(t *testing.T) {
 	rec, spec := newTestPipeline(t, store, "chain", linearChainSpec)
 	now := time.Date(2026, 7, 15, 20, 0, 0, 0, time.UTC)
 
-	run, err := createPipelineRun(context.Background(), store, rec, spec, "manual", "{}", now)
+	run, err := CreatePipelineRun(context.Background(), store, rec, spec, "manual", "{}", now)
 	if err != nil {
-		t.Fatalf("createPipelineRun: %v", err)
+		t.Fatalf("CreatePipelineRun: %v", err)
 	}
 	for _, tc := range []struct {
 		stageID string
@@ -223,41 +222,41 @@ func TestAdvancerLinearChain(t *testing.T) {
 
 	run := startTestRun(t, store, rec, spec, enqueue, now)
 	// Only the root is enqueued; b/c wait on their deps.
-	if got := stageRow(t, store, run.ID, "a"); got.State != pipeline.StageQueued || got.JobID == "" {
+	if got := stageRow(t, store, run.ID, "a"); got.State != StageQueued || got.JobID == "" {
 		t.Fatalf("stage a = %+v, want queued with job", got)
 	}
-	if got := stageRow(t, store, run.ID, "b"); got.State != pipeline.StagePending || got.JobID != "" {
+	if got := stageRow(t, store, run.ID, "b"); got.State != StagePending || got.JobID != "" {
 		t.Fatalf("stage b = %+v, want pending with no job", got)
 	}
 
 	settleStageJob(t, store, stageRow(t, store, run.ID, "a").JobID, "approved", "a ok", nil)
 	run = advance(t, store, rec, spec, enqueue, run, now)
-	if got := stageRow(t, store, run.ID, "a"); got.State != pipeline.StageSucceeded {
+	if got := stageRow(t, store, run.ID, "a"); got.State != StageSucceeded {
 		t.Fatalf("stage a = %s, want succeeded", got.State)
 	}
-	if got := stageRow(t, store, run.ID, "b"); got.State != pipeline.StageQueued || got.JobID == "" {
+	if got := stageRow(t, store, run.ID, "b"); got.State != StageQueued || got.JobID == "" {
 		t.Fatalf("stage b = %+v, want queued after a succeeded", got)
 	}
-	if run.State != pipeline.RunRunning {
+	if run.State != RunRunning {
 		t.Fatalf("run = %s, want running", run.State)
 	}
 
 	settleStageJob(t, store, stageRow(t, store, run.ID, "b").JobID, "implemented", "b ok", nil)
 	run = advance(t, store, rec, spec, enqueue, run, now)
-	if got := stageRow(t, store, run.ID, "c"); got.State != pipeline.StageQueued {
+	if got := stageRow(t, store, run.ID, "c"); got.State != StageQueued {
 		t.Fatalf("stage c = %s, want queued after b succeeded", got.State)
 	}
 
 	settleStageJob(t, store, stageRow(t, store, run.ID, "c").JobID, "approved", "c ok", nil)
 	run = advance(t, store, rec, spec, enqueue, run, now)
-	if run.State != pipeline.RunSucceeded {
+	if run.State != RunSucceeded {
 		t.Fatalf("run = %s, want succeeded", run.State)
 	}
-	if got := stageRow(t, store, run.ID, "c"); got.State != pipeline.StageSucceeded {
+	if got := stageRow(t, store, run.ID, "c"); got.State != StageSucceeded {
 		t.Fatalf("stage c = %s, want succeeded", got.State)
 	}
 	// The pipeline row mirrors the terminal status.
-	if rec2, _, _ := store.GetPipeline(context.Background(), "chain"); rec2.LastStatus != pipeline.RunSucceeded {
+	if rec2, _, _ := store.GetPipeline(context.Background(), "chain"); rec2.LastStatus != RunSucceeded {
 		t.Fatalf("pipeline last_status = %q, want succeeded", rec2.LastStatus)
 	}
 }
@@ -290,36 +289,36 @@ func TestAdvancerDiamond(t *testing.T) {
 	settleStageJob(t, store, stageRow(t, store, run.ID, "a").JobID, "approved", "a", nil)
 	run = advance(t, store, rec, spec, enqueue, run, now)
 	// Fan-out: both b and c enqueue off a.
-	if got := stageRow(t, store, run.ID, "b"); got.State != pipeline.StageQueued {
+	if got := stageRow(t, store, run.ID, "b"); got.State != StageQueued {
 		t.Fatalf("stage b = %s, want queued", got.State)
 	}
-	if got := stageRow(t, store, run.ID, "c"); got.State != pipeline.StageQueued {
+	if got := stageRow(t, store, run.ID, "c"); got.State != StageQueued {
 		t.Fatalf("stage c = %s, want queued", got.State)
 	}
-	if got := stageRow(t, store, run.ID, "d"); got.State != pipeline.StagePending {
+	if got := stageRow(t, store, run.ID, "d"); got.State != StagePending {
 		t.Fatalf("stage d = %s, want pending", got.State)
 	}
 
 	// Only b succeeds: d must NOT enqueue (c still in flight).
 	settleStageJob(t, store, stageRow(t, store, run.ID, "b").JobID, "approved", "b", nil)
 	run = advance(t, store, rec, spec, enqueue, run, now)
-	if got := stageRow(t, store, run.ID, "d"); got.State != pipeline.StagePending {
+	if got := stageRow(t, store, run.ID, "d"); got.State != StagePending {
 		t.Fatalf("stage d = %s, want still pending (c not done)", got.State)
 	}
-	if run.State != pipeline.RunRunning {
+	if run.State != RunRunning {
 		t.Fatalf("run = %s, want running", run.State)
 	}
 
 	// c succeeds: now d is ready.
 	settleStageJob(t, store, stageRow(t, store, run.ID, "c").JobID, "approved", "c", nil)
 	run = advance(t, store, rec, spec, enqueue, run, now)
-	if got := stageRow(t, store, run.ID, "d"); got.State != pipeline.StageQueued {
+	if got := stageRow(t, store, run.ID, "d"); got.State != StageQueued {
 		t.Fatalf("stage d = %s, want queued (both deps done)", got.State)
 	}
 
 	settleStageJob(t, store, stageRow(t, store, run.ID, "d").JobID, "approved", "d", nil)
 	run = advance(t, store, rec, spec, enqueue, run, now)
-	if run.State != pipeline.RunSucceeded {
+	if run.State != RunSucceeded {
 		t.Fatalf("run = %s, want succeeded", run.State)
 	}
 }
@@ -425,7 +424,7 @@ func TestAdvancerPreClaimFailureHasNonNegativeDuration(t *testing.T) {
 	setPipelineJobEventTime(t, store, jobID, string(workflow.JobFailed), terminalAt)
 	run = advance(t, store, rec, spec, enqueue, run, tick.Add(time.Minute))
 	got := stageRow(t, store, run.ID, "a")
-	if got.State != pipeline.StageFailed || !got.StartedAt.Equal(terminalAt) || !got.FinishedAt.Equal(terminalAt) {
+	if got.State != StageFailed || !got.StartedAt.Equal(terminalAt) || !got.FinishedAt.Equal(terminalAt) {
 		t.Fatalf("pre-claim failure stage = %+v, want terminal with zero non-negative duration at %s", got, terminalAt)
 	}
 }
@@ -445,7 +444,7 @@ func TestAdvancerBlockedPark(t *testing.T) {
 	settleStageJob(t, store, stageRow(t, store, run.ID, "b").JobID, "blocked", "needs a secret", []string{"R2 token"})
 	run = advance(t, store, rec, spec, enqueue, run, now)
 
-	if run.State != pipeline.RunBlocked {
+	if run.State != RunBlocked {
 		t.Fatalf("run = %s, want blocked", run.State)
 	}
 	if run.HaltStage != "b" {
@@ -455,7 +454,7 @@ func TestAdvancerBlockedPark(t *testing.T) {
 		t.Fatalf("run needs = %v, want [R2 token]", got)
 	}
 	b := stageRow(t, store, run.ID, "b")
-	if b.State != pipeline.StageBlocked {
+	if b.State != StageBlocked {
 		t.Fatalf("stage b = %s, want blocked", b.State)
 	}
 	if got := decodePipelineNeeds(b.NeedsJSON); len(got) != 1 || got[0] != "R2 token" {
@@ -465,7 +464,7 @@ func TestAdvancerBlockedPark(t *testing.T) {
 	if c.JobID != "" {
 		t.Fatalf("stage c job = %q, want never enqueued", c.JobID)
 	}
-	if c.State != pipeline.StageSkipped {
+	if c.State != StageSkipped {
 		t.Fatalf("stage c = %s, want skipped", c.State)
 	}
 }
@@ -495,10 +494,10 @@ func TestAdvancerIndependentBranchRunsWhenSiblingBlocks(t *testing.T) {
 
 	// Both roots enqueue immediately; c waits on b.
 	run := startTestRun(t, store, rec, spec, enqueue, now)
-	if got := stageRow(t, store, run.ID, "a"); got.State != pipeline.StageQueued {
+	if got := stageRow(t, store, run.ID, "a"); got.State != StageQueued {
 		t.Fatalf("stage a = %s, want queued", got.State)
 	}
-	if got := stageRow(t, store, run.ID, "b"); got.State != pipeline.StageQueued {
+	if got := stageRow(t, store, run.ID, "b"); got.State != StageQueued {
 		t.Fatalf("stage b = %s, want queued", got.State)
 	}
 
@@ -509,23 +508,23 @@ func TestAdvancerIndependentBranchRunsWhenSiblingBlocks(t *testing.T) {
 
 	// c's dep b succeeded, so c is enqueued and the run stays running (c in flight).
 	c := stageRow(t, store, run.ID, "c")
-	if c.State != pipeline.StageQueued || c.JobID == "" {
+	if c.State != StageQueued || c.JobID == "" {
 		t.Fatalf("stage c = %+v, want queued after b succeeded (independent of blocked a)", c)
 	}
-	if run.State != pipeline.RunRunning {
+	if run.State != RunRunning {
 		t.Fatalf("run = %s, want still running while c is in flight", run.State)
 	}
-	if got := stageRow(t, store, run.ID, "a"); got.State != pipeline.StageBlocked {
+	if got := stageRow(t, store, run.ID, "a"); got.State != StageBlocked {
 		t.Fatalf("stage a = %s, want blocked", got.State)
 	}
 
 	// c completes: only now, with nothing in flight, does the run park blocked on a.
 	settleStageJob(t, store, c.JobID, "approved", "c ok", nil)
 	run = advance(t, store, rec, spec, enqueue, run, now)
-	if got := stageRow(t, store, run.ID, "c"); got.State != pipeline.StageSucceeded {
+	if got := stageRow(t, store, run.ID, "c"); got.State != StageSucceeded {
 		t.Fatalf("stage c = %s, want succeeded (reachable branch ran to completion)", got.State)
 	}
-	if run.State != pipeline.RunBlocked {
+	if run.State != RunBlocked {
 		t.Fatalf("run = %s, want blocked (parks on a once nothing is in flight)", run.State)
 	}
 	if run.HaltStage != "a" {
@@ -562,7 +561,7 @@ func TestAdvancerFailedRetryBudget(t *testing.T) {
 	settleStageJob(t, store, firstJob, "failed", "boom", nil)
 	run = advance(t, store, rec, spec, enqueue, run, now)
 	a := stageRow(t, store, run.ID, "a")
-	if a.State != pipeline.StageQueued {
+	if a.State != StageQueued {
 		t.Fatalf("stage a = %s, want re-queued after retry", a.State)
 	}
 	if a.Attempt != 1 {
@@ -571,23 +570,23 @@ func TestAdvancerFailedRetryBudget(t *testing.T) {
 	if a.JobID == firstJob || a.JobID == "" {
 		t.Fatalf("retry job id = %q, want a fresh id (was %q)", a.JobID, firstJob)
 	}
-	if run.State != pipeline.RunRunning {
+	if run.State != RunRunning {
 		t.Fatalf("run = %s, want still running during retry", run.State)
 	}
 
 	// Second failure: budget exhausted, run parks failed and b is skipped.
 	settleStageJob(t, store, a.JobID, "failed", "boom again", nil)
 	run = advance(t, store, rec, spec, enqueue, run, now)
-	if run.State != pipeline.RunFailed {
+	if run.State != RunFailed {
 		t.Fatalf("run = %s, want failed", run.State)
 	}
 	if run.HaltStage != "a" {
 		t.Fatalf("halt_stage = %q, want a", run.HaltStage)
 	}
-	if got := stageRow(t, store, run.ID, "a"); got.State != pipeline.StageFailed || got.Attempt != 1 {
+	if got := stageRow(t, store, run.ID, "a"); got.State != StageFailed || got.Attempt != 1 {
 		t.Fatalf("stage a = %+v, want failed attempt 1", got)
 	}
-	if got := stageRow(t, store, run.ID, "b"); got.State != pipeline.StageSkipped || got.JobID != "" {
+	if got := stageRow(t, store, run.ID, "b"); got.State != StageSkipped || got.JobID != "" {
 		t.Fatalf("stage b = %+v, want skipped never-enqueued", got)
 	}
 }
@@ -605,11 +604,11 @@ func TestAdvancerRetryResetsAndRederivesAttemptTimes(t *testing.T) {
 	failingEnqueue := func(context.Context, workflow.JobRequest) (db.Job, error) {
 		return db.Job{}, errors.New("pause after retry reset")
 	}
-	if _, err := advancePipelineRun(context.Background(), store, failingEnqueue, rec, spec, run, tick.Add(time.Minute)); err == nil {
+	if _, err := AdvancePipelineRun(context.Background(), store, failingEnqueue, rec, spec, run, tick.Add(time.Minute)); err == nil {
 		t.Fatal("advance with failing retry enqueue returned nil error")
 	}
 	reset := stageRow(t, store, run.ID, "a")
-	if reset.State != pipeline.StagePending || reset.JobID != "" || !reset.StartedAt.IsZero() || !reset.FinishedAt.IsZero() {
+	if reset.State != StagePending || reset.JobID != "" || !reset.StartedAt.IsZero() || !reset.FinishedAt.IsZero() {
 		t.Fatalf("retry reset stage = %+v, want pending with both timestamps zero", reset)
 	}
 
@@ -623,7 +622,7 @@ func TestAdvancerRetryResetsAndRederivesAttemptTimes(t *testing.T) {
 	startStageJob(t, store, second.JobID)
 	setPipelineJobEventTime(t, store, second.JobID, string(workflow.JobRunning), startedAt)
 	run = advance(t, store, rec, spec, enqueue, run, startedAt.Add(10*time.Second))
-	if live := stageRow(t, store, run.ID, "a"); live.State != pipeline.StageRunning || !live.StartedAt.Equal(startedAt) {
+	if live := stageRow(t, store, run.ID, "a"); live.State != StageRunning || !live.StartedAt.Equal(startedAt) {
 		t.Fatalf("live retry stage = %+v, want real running-event start %s", live, startedAt)
 	}
 	settleStageJob(t, store, second.JobID, "approved", "retry passed", nil)
@@ -665,13 +664,13 @@ func TestAdvancerChangesRequestedDoesNotAdvance(t *testing.T) {
 	}
 
 	run = advance(t, store, rec, spec, enqueue, run, now)
-	if got := stageRow(t, store, run.ID, "a"); got.State != pipeline.StageFailed {
+	if got := stageRow(t, store, run.ID, "a"); got.State != StageFailed {
 		t.Fatalf("stage a = %s, want failed (changes_requested must NOT advance)", got.State)
 	}
-	if got := stageRow(t, store, run.ID, "b"); got.JobID != "" || got.State == pipeline.StageQueued {
+	if got := stageRow(t, store, run.ID, "b"); got.JobID != "" || got.State == StageQueued {
 		t.Fatalf("stage b = %+v, want never enqueued", got)
 	}
-	if run.State != pipeline.RunFailed {
+	if run.State != RunFailed {
 		t.Fatalf("run = %s, want failed", run.State)
 	}
 }
@@ -698,10 +697,10 @@ stages:
 	run := startTestRun(t, store, rec, parsed, enqueue, now)
 	settleStageJob(t, store, stageRow(t, store, run.ID, "a").JobID, "changes_requested", "ok enough", nil)
 	run = advance(t, store, rec, parsed, enqueue, run, now)
-	if got := stageRow(t, store, run.ID, "a"); got.State != pipeline.StageSucceeded {
+	if got := stageRow(t, store, run.ID, "a"); got.State != StageSucceeded {
 		t.Fatalf("stage a = %s, want succeeded (override lists changes_requested)", got.State)
 	}
-	if got := stageRow(t, store, run.ID, "b"); got.State != pipeline.StageQueued {
+	if got := stageRow(t, store, run.ID, "b"); got.State != StageQueued {
 		t.Fatalf("stage b = %s, want queued", got.State)
 	}
 }
@@ -720,13 +719,13 @@ func TestAdvancerSkippedAdvancesByDefault(t *testing.T) {
 	run = advance(t, store, rec, spec, enqueue, run, now)
 
 	a := stageRow(t, store, run.ID, "a")
-	if a.State != pipeline.StageSucceeded {
+	if a.State != StageSucceeded {
 		t.Fatalf("stage a = %s, want succeeded", a.State)
 	}
 	if a.Summary != "[skipped: no work] no new replies" {
 		t.Fatalf("stage a summary = %q", a.Summary)
 	}
-	if got := stageRow(t, store, run.ID, "b"); got.State != pipeline.StageQueued || got.JobID == "" {
+	if got := stageRow(t, store, run.ID, "b"); got.State != StageQueued || got.JobID == "" {
 		t.Fatalf("stage b = %+v, want queued with a job", got)
 	}
 }
@@ -753,13 +752,13 @@ stages:
 	settleStageJob(t, store, stageRow(t, store, run.ID, "a").JobID, "skipped", "no new replies", nil)
 	run = advance(t, store, rec, parsed, enqueue, run, now)
 
-	if got := stageRow(t, store, run.ID, "a"); got.State != pipeline.StageFailed {
+	if got := stageRow(t, store, run.ID, "a"); got.State != StageFailed {
 		t.Fatalf("stage a = %s, want failed when strict list omits skipped", got.State)
 	}
-	if got := stageRow(t, store, run.ID, "b"); got.State != pipeline.StageSkipped || got.JobID != "" {
+	if got := stageRow(t, store, run.ID, "b"); got.State != StageSkipped || got.JobID != "" {
 		t.Fatalf("stage b = %+v, want skipped and never enqueued", got)
 	}
-	if run.State != pipeline.RunFailed {
+	if run.State != RunFailed {
 		t.Fatalf("run = %s, want failed", run.State)
 	}
 }
@@ -809,12 +808,12 @@ func TestAdvancerSkippedPropagation(t *testing.T) {
 	settleStageJob(t, store, stageRow(t, store, run.ID, "a").JobID, "failed", "root broke", nil)
 	run = advance(t, store, rec, spec, enqueue, run, now)
 
-	if run.State != pipeline.RunFailed {
+	if run.State != RunFailed {
 		t.Fatalf("run = %s, want failed", run.State)
 	}
 	for _, id := range []string{"b", "c"} {
 		got := stageRow(t, store, run.ID, id)
-		if got.State != pipeline.StageSkipped || got.JobID != "" {
+		if got.State != StageSkipped || got.JobID != "" {
 			t.Fatalf("stage %s = %+v, want skipped never-enqueued", id, got)
 		}
 	}
@@ -843,7 +842,7 @@ func TestAdvancerIdempotentRescan(t *testing.T) {
 	if afterA.State != beforeA.State || afterA.JobID != beforeA.JobID {
 		t.Fatalf("re-scan changed stage a: before=%+v after=%+v", beforeA, afterA)
 	}
-	if run.State != pipeline.RunRunning {
+	if run.State != RunRunning {
 		t.Fatalf("run = %s, want still running", run.State)
 	}
 
@@ -891,7 +890,7 @@ stages:
 	run := startTestRun(t, store, rec, spec, enqueue, now)
 	ctx := context.Background()
 
-	specByID := make(map[string]pipeline.Stage, len(spec.Stages))
+	specByID := make(map[string]Stage, len(spec.Stages))
 	for _, s := range spec.Stages {
 		specByID[s.ID] = s
 	}

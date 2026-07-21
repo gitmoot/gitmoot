@@ -13,6 +13,29 @@ Pipelines are **off by default**: with no pipelines defined, the daemon's
 pipeline scan returns an empty list before touching any state, and behavior is
 unchanged.
 
+## Code map
+
+The pipeline engine lives in `internal/pipeline`. Start with `run.go` for run
+creation, scheduling, stage enqueue requests, advancement, settlement, worktree
+context, and job-event timestamps. Service admission, proof finalization, and
+artifact collection live beside it in `service*.go`; environment delivery and
+produce-path safety live in `env_runtime.go` and `core.go`.
+
+The engine uses three lower-level seams:
+
+- `internal/workflow` owns mailbox enqueueing, job and runtime-session locks,
+  result parsing, and read-only worktree cleanup.
+- `internal/db` owns persisted pipeline, run, stage, service-run, job, and event
+  state. Engine scans advance only from these stored snapshots.
+- `internal/runtime` supplies runtime identities and delivery adapters; pipeline
+  environment wrapping adds only the stage-scoped values already resolved by the
+  engine.
+
+`internal/cli` remains the command and presentation boundary. It parses
+`gitmoot pipeline ...`, renders CLI/dashboard views, owns GitHub bundle transport,
+and adapts the existing local implement-dispatch worktree allocator into the
+engine's stage enqueuer. The engine package never imports `internal/cli`.
+
 A pipeline is not an orchestra. Each stage is a **leaf**: it runs a shell command
 and returns a decision. A stage that emits `delegations[]` does **not** spawn
 children — the advancer ignores them and the engine strips them for a pipeline

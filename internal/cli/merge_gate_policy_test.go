@@ -8,6 +8,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -53,11 +54,11 @@ require_external_ci = true
 	}
 	t.Cleanup(func() { store.Close() })
 
-	on := newPipelineAutoMerger(context.Background(), store, "jerryfane/noted")
+	on := pipeline.NewPipelineAutoMerger(context.Background(), store, "jerryfane/noted")
 	if !on.RequireExternalCI || on.MinCIWait != 45*time.Second || on.MaxCIWait != 7*time.Minute {
 		t.Fatalf("per-repo pipeline policy = %+v", on)
 	}
-	off := newPipelineAutoMerger(context.Background(), store, "gitmoot/gitmoot")
+	off := pipeline.NewPipelineAutoMerger(context.Background(), store, "gitmoot/gitmoot")
 	if off.RequireExternalCI || off.MinCIWait != 45*time.Second || off.MaxCIWait != 7*time.Minute {
 		t.Fatalf("global pipeline policy = %+v", off)
 	}
