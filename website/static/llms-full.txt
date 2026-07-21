@@ -1131,10 +1131,15 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    When required reviews are approved and the branch is ready, the merge gate
    checks the current PR head, local worktree cleanliness, branch freshness,
    Gitmoot statuses, external CI if present, and mergeability. Final merge work
-   is serialized per repository base branch. If a parallel PR became behind the
-   base branch because another PR merged first, Gitmoot asks GitHub to update
-   the PR branch with the expected head SHA and leaves the merge gate pending so
-   the daemon can reload the new head and checks on a later poll tick.
+   is serialized per repository base branch. Before the policy gate can issue
+   its squash-merge-and-delete request, the daemon checks the PR branch for any
+   queued or running job of any type (`ask`, `review`, or `implement`). It returns
+   a transient deferral while one exists, leaves the task in `ready_to_merge`,
+   and re-evaluates on the next daemon tick. No blocked state or merge-gate error
+   is emitted for this retry-later condition. If a parallel PR became behind the
+   base branch because another PR merged first, Gitmoot asks GitHub to update the
+   PR branch with the expected head SHA and leaves the merge gate pending so the
+   daemon can reload the new head and checks on a later poll tick.
 
    When a head reports **no** external CI at all (zero commit-statuses and zero
    check-runs), Gitmoot does not conclude "this repo has no CI" from a single
@@ -2361,6 +2366,11 @@ git status --short
 Fixes:
 
 - Clean the local worktree before the daemon attempts the merge.
+- If the reason says an active job is in flight on the PR branch, let that queued
+  or running job settle (or cancel it deliberately). This is a transient safety
+  deferral: the task stays `ready_to_merge` rather than becoming blocked, and the
+  daemon re-evaluates on its next tick instead of squash-merging and deleting a
+  branch beneath an `ask`, `review`, or `implement` job.
 - If the PR branch is merely behind or diverged from base, keep the daemon
   running. Gitmoot serializes the base-branch merge gate, asks GitHub to update
   the PR branch safely, then retries on a later daemon poll tick. The default
@@ -14459,7 +14469,16 @@ Do not ask child agents to run PR lifecycle commands such as `git pull`,
 Gitmoot owns the final merge gate. It serializes merge attempts per base branch,
 updates stale PR branches through GitHub when possible, retries pending states
 through the daemon, and blocks clearly when GitHub reports a real merge
-conflict. When an **external** system owns the merge decision instead, set
+conflict. Immediately before entering the policy gate, it also checks the PR
+branch for any queued or running `ask`, `review`, or `implement` job. An active
+job produces a transient deferral: the task remains `ready_to_merge` (not
+blocked), and the daemon re-evaluates it on the next tick. The native policy
+merge gate therefore never intentionally squash-merges and deletes a branch
+beneath in-flight work. (The separate pipeline auto-merge gate does not yet run
+this branch-activity check; it squash-merges *without* deleting the branch, so it
+cannot strand commits by branch deletion — closing that path is a tracked
+follow-up.) When an
+**external** system owns the merge decision instead, set
 `GITMOOT_DISABLE_NATIVE_MERGE_GATE=1` (also `true`/`yes`/`on`; #545): Gitmoot
 then **abstains** from its native merge gate — fail-closed, meaning it never
 merges gatelessly; the external gate makes the call.

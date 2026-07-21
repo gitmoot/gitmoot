@@ -346,6 +346,29 @@ branch lock only after confirming the owner is no longer working:
 gitmoot lock release owner/repo <branch> --owner <agent>
 ```
 
+## Merge Gate Deferred By An Active Branch Job
+
+Symptom: a ready PR remains unmerged and the gate reason says an active job is
+in flight on its branch.
+
+Likely cause: an `ask`, `review`, or `implement` job targeting that PR branch is
+still queued or running. Gitmoot treats this as a transient deferral so it cannot
+squash-merge, delete the source branch, and strand an in-progress fix. The task
+stays `ready_to_merge` rather than entering a blocked state or emitting a
+merge-gate error.
+
+Check:
+
+```sh
+gitmoot job list --repo owner/repo
+gitmoot job show <job-id>
+gitmoot job events <job-id>
+```
+
+Fix: let the job settle or cancel it deliberately. The daemon re-evaluates the
+unchanged policy merge path on its next tick; do not release its branch lock
+while the job is active.
+
 ## Dashboard Blank Or Noninteractive
 
 Symptom: `gitmoot dashboard` does not open the TUI, prints plain output, or

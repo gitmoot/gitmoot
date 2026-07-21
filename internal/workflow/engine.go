@@ -603,13 +603,21 @@ type MergeDecision struct {
 	Merged         bool
 	MergeCommitSHA string
 	Reason         string
-	// BlockClass classifies a not-ready block (Ready=false) so the Mode-A
+	// Deferred marks a transient, retry-later hold (for example, a job is in
+	// flight on the pull-request branch). Unlike a block, runMergeGate parks the
+	// task in ready_to_merge so the daemon re-evaluates it on a later tick; a
+	// deferred decision neither blocks nor fails the task. It is the explicit
+	// sibling of PolicyMergeGate.pending, which expresses the same "stay
+	// ready_to_merge, retry next tick" outcome as a Ready:true (unmerged)
+	// decision — do not collapse the two without preserving that parking.
+	Deferred bool
+	// BlockClass classifies a not-ready decision (Ready=false) so the Mode-A
 	// trace-harvester (#465) only scores AUTHORITATIVE template-quality rejections as
 	// a negative and skips transient/infra blocks (branch staleness, dirty local
 	// worktree, missing-SHA/base, freshness-unknown). It is the zero value
 	// (MergeBlockNone) for a ready/merged decision and is purely advisory — it never
-	// changes the block/merge transition itself, so behavior is byte-identical when
-	// the harvester is off.
+	// changes the transition itself (Deferred controls retry-later semantics), so
+	// behavior is byte-identical when the harvester is off.
 	BlockClass MergeBlockClass
 }
 
@@ -5422,6 +5430,17 @@ func (e Engine) runMergeGate(ctx context.Context, reviewer string, payload JobPa
 		return MergeDecision{}, err
 	}
 	if !decision.Ready {
+		if decision.Deferred {
+			// Park the task in ready_to_merge (NOT whatever state it arrived in) so
+			// the daemon's pullRequestReadyToMerge poll re-drives it every tick until
+			// the in-flight branch job settles. This matters for the no-reviewers
+			// auto-merge path: HandlePullRequestOpened reaches here with the task in
+			// pull_request_open, a state that poll does not re-evaluate — without this
+			// the deferred PR would wedge unmerged. Mirrors PolicyMergeGate.pending
+			// (which parks via a Ready:true tail); a deferred decision is never
+			// blocked, failed, or harvested.
+			return decision, e.setTaskState(ctx, ref, TaskReadyToMerge)
+		}
 		reason := strings.TrimSpace(decision.Reason)
 		if reason == "" {
 			reason = "merge gate rejected action"

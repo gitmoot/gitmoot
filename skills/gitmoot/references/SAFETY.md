@@ -19,7 +19,16 @@ Do not ask child agents to run PR lifecycle commands such as `git pull`,
 Gitmoot owns the final merge gate. It serializes merge attempts per base branch,
 updates stale PR branches through GitHub when possible, retries pending states
 through the daemon, and blocks clearly when GitHub reports a real merge
-conflict. When an **external** system owns the merge decision instead, set
+conflict. Immediately before entering the policy gate, it also checks the PR
+branch for any queued or running `ask`, `review`, or `implement` job. An active
+job produces a transient deferral: the task remains `ready_to_merge` (not
+blocked), and the daemon re-evaluates it on the next tick. The native policy
+merge gate therefore never intentionally squash-merges and deletes a branch
+beneath in-flight work. (The separate pipeline auto-merge gate does not yet run
+this branch-activity check; it squash-merges *without* deleting the branch, so it
+cannot strand commits by branch deletion — closing that path is a tracked
+follow-up.) When an
+**external** system owns the merge decision instead, set
 `GITMOOT_DISABLE_NATIVE_MERGE_GATE=1` (also `true`/`yes`/`on`; #545): Gitmoot
 then **abstains** from its native merge gate — fail-closed, meaning it never
 merges gatelessly; the external gate makes the call.

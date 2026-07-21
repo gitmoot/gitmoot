@@ -498,10 +498,15 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    When required reviews are approved and the branch is ready, the merge gate
    checks the current PR head, local worktree cleanliness, branch freshness,
    Gitmoot statuses, external CI if present, and mergeability. Final merge work
-   is serialized per repository base branch. If a parallel PR became behind the
-   base branch because another PR merged first, Gitmoot asks GitHub to update
-   the PR branch with the expected head SHA and leaves the merge gate pending so
-   the daemon can reload the new head and checks on a later poll tick.
+   is serialized per repository base branch. Before the policy gate can issue
+   its squash-merge-and-delete request, the daemon checks the PR branch for any
+   queued or running job of any type (`ask`, `review`, or `implement`). It returns
+   a transient deferral while one exists, leaves the task in `ready_to_merge`,
+   and re-evaluates on the next daemon tick. No blocked state or merge-gate error
+   is emitted for this retry-later condition. If a parallel PR became behind the
+   base branch because another PR merged first, Gitmoot asks GitHub to update the
+   PR branch with the expected head SHA and leaves the merge gate pending so the
+   daemon can reload the new head and checks on a later poll tick.
 
    When a head reports **no** external CI at all (zero commit-statuses and zero
    check-runs), Gitmoot does not conclude "this repo has no CI" from a single

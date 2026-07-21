@@ -4915,6 +4915,37 @@ func TestListJobsByType(t *testing.T) {
 	}
 }
 
+func TestListActiveJobsReturnsOnlyQueuedAndRunningInIDOrder(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	for _, job := range []Job{
+		{ID: "job-d-failed", Type: "ask", State: "failed", Payload: `{"marker":"failed"}`},
+		{ID: "job-b-running", Type: "review", State: "running", Payload: `{"marker":"running"}`},
+		{ID: "job-c-succeeded", Type: "implement", State: "succeeded", Payload: `{"marker":"succeeded"}`},
+		{ID: "job-a-queued", Type: "ask", State: "queued", Payload: `{"marker":"queued"}`},
+	} {
+		if err := store.CreateJob(ctx, job); err != nil {
+			t.Fatalf("CreateJob(%s): %v", job.ID, err)
+		}
+	}
+
+	got, err := store.ListActiveJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].ID != "job-a-queued" || got[1].ID != "job-b-running" {
+		t.Fatalf("ListActiveJobs = %+v, want queued/running jobs in id order", got)
+	}
+	if got[0].Payload == "" || got[1].Payload == "" {
+		t.Fatalf("ListActiveJobs omitted payload: %+v", got)
+	}
+}
+
 // TestListQueuedJobsUsesQueuedIndex pins FIX-4b (#619): ListQueuedJobs is served by
 // the partial index idx_jobs_queued_created with no temp b-tree, and returns only
 // queued rows in created_at then rowid order.

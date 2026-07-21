@@ -988,22 +988,33 @@ func resolveTaskRepoFlag(repoFlag string, taskRepo string, command string) (stri
 }
 
 func findActiveImplementJobForTask(ctx context.Context, store *db.Store, repo string, branch string, taskID string) (db.Job, bool, error) {
-	jobs, err := store.ListJobs(ctx)
+	return findActiveJobMatching(ctx, store, repo, branch, func(job db.Job, payload workflow.JobPayload) bool {
+		return job.Type == "implement" && payload.TaskID == taskID
+	})
+}
+
+// findActiveJobForBranch returns the first queued/running job whose structured
+// payload targets repo+branch, regardless of job type or task attribution. The
+// merge gate uses this broader branch ownership check so ask/review fix jobs are
+// protected just like implement jobs.
+func findActiveJobForBranch(ctx context.Context, store *db.Store, repo string, branch string) (db.Job, bool, error) {
+	if strings.TrimSpace(branch) == "" {
+		return db.Job{}, false, nil
+	}
+	return findActiveJobMatching(ctx, store, repo, branch, func(db.Job, workflow.JobPayload) bool { return true })
+}
+
+func findActiveJobMatching(ctx context.Context, store *db.Store, repo string, branch string, matches func(db.Job, workflow.JobPayload) bool) (db.Job, bool, error) {
+	jobs, err := store.ListActiveJobs(ctx)
 	if err != nil {
 		return db.Job{}, false, err
 	}
 	for _, job := range jobs {
-		if job.State != string(workflow.JobQueued) && job.State != string(workflow.JobRunning) {
-			continue
-		}
-		if job.Type != "implement" {
-			continue
-		}
 		payload, err := daemonJobPayload(job)
 		if err != nil {
 			continue
 		}
-		if payload.TaskID == taskID && payload.Repo == repo && payload.Branch == branch {
+		if payload.Repo == repo && payload.Branch == branch && matches(job, payload) {
 			return job, true, nil
 		}
 	}

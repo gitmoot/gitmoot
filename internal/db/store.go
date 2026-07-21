@@ -2927,6 +2927,26 @@ func (s *Store) ListJobs(ctx context.Context) ([]Job, error) {
 	return scanJobs(rows)
 }
 
+// ListActiveJobs returns only queued/running jobs in stable id order. Keeping
+// the state predicate in SQLite avoids decoding the terminal job backlog (and
+// its potentially large payloads) on the merge gate's final branch-activity
+// check, reducing both database work and the check-to-merge interval.
+//
+// "Active" is deliberately queued+running (jobs that are executing or about to),
+// NOT blocked: a blocked job is settled and may never be resumed, so holding the
+// merge gate for one would let an abandoned blocked job livelock a PR's merge
+// forever. Resuming a blocked job re-enqueues a fresh queued job, which this
+// predicate then catches — so the only exposure is the narrow window while a
+// stale blocked job sits un-retried, and there the visible resume failure is
+// preferable to an indefinite merge hold.
+func (s *Store) ListActiveJobs(ctx context.Context) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+jobColumns+` FROM jobs WHERE state IN (?, ?) ORDER BY id`, "queued", "running")
+	if err != nil {
+		return nil, err
+	}
+	return scanJobs(rows)
+}
+
 func (s *Store) ListTranscriptJobs(ctx context.Context) ([]TranscriptJob, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, state, updated_at, created_at FROM jobs ORDER BY id`)
 	if err != nil {

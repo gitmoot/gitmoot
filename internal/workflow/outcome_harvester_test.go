@@ -192,6 +192,108 @@ func TestEngineSkipsTransientBlockHarvest(t *testing.T) {
 	}
 }
 
+func TestRunMergeGateDeferredLeavesTaskReadyToMerge(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-deferred", RepoFullName: "gitmoot/gitmoot", GoalID: "goal-1",
+		Title: "Deferred merge", State: string(TaskReadyToMerge), Branch: "fix-round",
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	engine := testEngine(store)
+	engine.MergeGate = &fakeMergeGate{decision: MergeDecision{
+		Ready: false, Deferred: true, Reason: "active implement job in flight",
+		BlockClass: MergeBlockTransient,
+	}}
+	harvester := &recordingHarvester{}
+	engine.OutcomeHarvester = harvester
+
+	decision, err := engine.runMergeGate(ctx, "", JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "fix-round", PullRequest: 17,
+		TaskID: "task-deferred", GoalID: "goal-1", TaskTitle: "Deferred merge",
+	}, taskRef{
+		ID: "task-deferred", Repo: "gitmoot/gitmoot", GoalID: "goal-1",
+		Title: "Deferred merge", Branch: "fix-round",
+	})
+	if err != nil {
+		t.Fatalf("runMergeGate returned error for deferred decision: %v", err)
+	}
+	if decision.Ready || !decision.Deferred || decision.Merged {
+		t.Fatalf("decision = %+v, want deferred not-ready hold", decision)
+	}
+	assertTaskState(t, store, "task-deferred", TaskReadyToMerge)
+	if got := harvester.snapshot(); len(got) != 0 {
+		t.Fatalf("deferred decision must not be harvested, got %+v", got)
+	}
+}
+
+// A deferral reaching runMergeGate from the no-reviewers auto-merge path arrives
+// with the task in pull_request_open (not ready_to_merge). The deferral must PARK
+// it at ready_to_merge so the daemon's ready-to-merge poll re-drives it; leaving
+// it in pull_request_open would wedge the PR unmerged forever.
+func TestRunMergeGateDeferredParksPullRequestOpenTaskAtReadyToMerge(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-pr-open", RepoFullName: "gitmoot/gitmoot", GoalID: "goal-1",
+		Title: "No-reviewers merge", State: string(TaskPullRequestOpen), Branch: "auto-round",
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	engine := testEngine(store)
+	engine.MergeGate = &fakeMergeGate{decision: MergeDecision{
+		Ready: false, Deferred: true, Reason: "active implement job in flight",
+		BlockClass: MergeBlockTransient,
+	}}
+
+	decision, err := engine.runMergeGate(ctx, "", JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "auto-round", PullRequest: 21,
+		TaskID: "task-pr-open", GoalID: "goal-1", TaskTitle: "No-reviewers merge",
+	}, taskRef{
+		ID: "task-pr-open", Repo: "gitmoot/gitmoot", GoalID: "goal-1",
+		Title: "No-reviewers merge", Branch: "auto-round",
+	})
+	if err != nil {
+		t.Fatalf("runMergeGate returned error for deferred decision: %v", err)
+	}
+	if decision.Ready || !decision.Deferred || decision.Merged {
+		t.Fatalf("decision = %+v, want deferred not-ready hold", decision)
+	}
+	assertTaskState(t, store, "task-pr-open", TaskReadyToMerge)
+}
+
+func TestRunMergeGateNonDeferredNotReadyStillBlocks(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-blocked", RepoFullName: "gitmoot/gitmoot", GoalID: "goal-1",
+		Title: "Blocked merge", State: string(TaskReadyToMerge), Branch: "blocked-round",
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	engine := testEngine(store)
+	engine.MergeGate = &fakeMergeGate{decision: MergeDecision{
+		Ready: false, Reason: "external CI failed", BlockClass: MergeBlockQuality,
+	}}
+
+	decision, err := engine.runMergeGate(ctx, "", JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "blocked-round", PullRequest: 18,
+		TaskID: "task-blocked", GoalID: "goal-1", TaskTitle: "Blocked merge",
+	}, taskRef{
+		ID: "task-blocked", Repo: "gitmoot/gitmoot", GoalID: "goal-1",
+		Title: "Blocked merge", Branch: "blocked-round",
+	})
+	var blocked BlockedError
+	if !errors.As(err, &blocked) || blocked.Reason != "external CI failed" {
+		t.Fatalf("runMergeGate error = %v, want BlockedError for unchanged block path", err)
+	}
+	if decision.Ready || decision.Deferred || decision.Merged {
+		t.Fatalf("decision = %+v, want non-deferred not-ready block", decision)
+	}
+	assertTaskState(t, store, "task-blocked", TaskBlocked)
+}
+
 // TestEngineHarvestsChangesRequestedOnce proves a review changes_requested
 // harvests exactly one OutcomeChangesRequested while still dispatching the fix.
 func TestEngineHarvestsChangesRequestedOnce(t *testing.T) {

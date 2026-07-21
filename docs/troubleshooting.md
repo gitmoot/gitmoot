@@ -603,6 +603,11 @@ git status --short
 Fixes:
 
 - Clean the local worktree before the daemon attempts the merge.
+- If the reason says an active job is in flight on the PR branch, let that queued
+  or running job settle (or cancel it deliberately). This is a transient safety
+  deferral: the task stays `ready_to_merge` rather than becoming blocked, and the
+  daemon re-evaluates on its next tick instead of squash-merging and deleting a
+  branch beneath an `ask`, `review`, or `implement` job.
 - If the PR branch is merely behind or diverged from base, keep the daemon
   running. Gitmoot serializes the base-branch merge gate, asks GitHub to update
   the PR branch safely, then retries on a later daemon poll tick. The default
