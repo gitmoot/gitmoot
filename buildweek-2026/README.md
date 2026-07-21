@@ -19,14 +19,18 @@ or download a binary from the [releases page](https://github.com/gitmoot/gitmoot
 
 **Supported platforms**: linux/amd64, linux/arm64, darwin/amd64, darwin/arm64.
 
-**Test the pipeline feature in two minutes, no API keys needed** (shell stages need no LLM):
+**Test the pipeline feature in five minutes, no API keys needed** (shell stages need no LLM;
+verified verbatim on linux/amd64 with a fresh home):
 
-    mkdir -p /tmp/gm-demo && cd /tmp/gm-demo && git init -q
+    mkdir /tmp/hello && cd /tmp/hello && git init
+    git remote add origin https://github.com/you/hello.git   # identity only; nothing is pushed
+    gitmoot repo add you/hello --path .
     cat > hello.yaml <<'YAML'
     name: hello-graph
+    repo: you/hello
     stages:
       - id: a
-        cmd: sh -c 'echo hi > a.txt; printf '"'"'{"gitmoot_result":{"decision":"implemented","summary":"a"}}'"'"''
+        cmd: sh -c 'printf '"'"'{"gitmoot_result":{"decision":"implemented","summary":"a"}}'"'"''
       - id: b
         cmd: sh -c 'printf '"'"'{"gitmoot_result":{"decision":"implemented","summary":"b"}}'"'"''
       - id: join
@@ -34,8 +38,10 @@ or download a binary from the [releases page](https://github.com/gitmoot/gitmoot
         cmd: sh -c 'printf '"'"'{"gitmoot_result":{"decision":"implemented","summary":"join"}}'"'"''
     YAML
     gitmoot pipeline add hello.yaml
+    gitmoot daemon start --poll 2s     # the daemon executes stages
     gitmoot pipeline run hello-graph
-    gitmoot pipeline list        # watch a and b fork, join runs last
+    gitmoot pipeline list              # a and b fork, join runs last, then: succeeded
+    gitmoot daemon stop
 
 To test the service side (`expose` / `serve` / receipts) and the full demo pipeline with
 Codex agent stages, follow the README of
