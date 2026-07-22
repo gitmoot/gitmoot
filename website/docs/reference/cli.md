@@ -989,6 +989,32 @@ at a PRIVATE repo unless the prompts are meant to be public.** See the
 [template capture workflow](../workflows/template-capture-workflow.md#back-up-and-share-templates-via-github)
 for the full flow.
 
+## Organization Registry
+
+Organization mode is opt-in. Initialize a starter registry and verify the
+required Herdr provider (`>=0.7.5`) with:
+
+```sh
+gitmoot org init
+gitmoot org brief --role owner [--json]
+gitmoot org chart [--json]
+gitmoot org status [--json]
+```
+
+The registry uses `[org] enforce = "warn"|"block"` and
+`[org.roles."name"]` entries with `parent`, `scope`, and `merge_rule`. There is
+exactly one root named `owner`; accepted scopes are `*`, `owner/*`, `*/repo`,
+and `owner/repo`. Malformed org configuration fails closed and loudly. `brief`
+records passive last-seen presence for its role and can render static context
+with provider state `unknown` during an outage; `chart` and `status` require a
+live compatible Herdr snapshot. Escalations are recorded with `gitmoot org
+escalate`; their resolution and correlation surfaces are phase 2 work.
+
+Agent `ask`, `run`, `review`, `implement`, and `orchestrate` accept
+`--org-role <name>`. The role is validated and touched before dispatch, then
+stored as `acting_org_role` in the job payload for provenance, and its scope is
+enforced at enqueue. Capability booleans are not part of this phase.
+
 ## External-coordinator workflow groups
 
 Pass `--workflow <label>` to `agent ask`, `agent run`, `agent review`, `agent

@@ -108,6 +108,14 @@ func (c Checker) GlobalChecks(ctx context.Context) []Check {
 	if c.Build != nil {
 		checks = append(checks, CheckBuild(*c.Build))
 	}
+	if strings.TrimSpace(c.Paths.ConfigFile) != "" {
+		registry, err := config.LoadOrgRegistry(c.Paths)
+		if err != nil {
+			checks = append(checks, Check{Name: "org registry", Required: true, Detail: err.Error()})
+		} else if registry.Enabled() {
+			checks = append(checks, CheckHerdrVersion(ctx, runner, OrgMinimumHerdrVersion))
+		}
+	}
 	return checks
 }
 

@@ -1651,4 +1651,13 @@ CREATE TABLE pipeline_service_runs (
 );
 CREATE INDEX idx_pipeline_service_runs_pipeline ON pipeline_service_runs(pipeline_name, created_at, run_id);
 	`,
+	// #1059 passive organization-role presence. This is durable role activity,
+	// distinct from workflow notes and intentionally contains no command output.
+	`
+CREATE TABLE org_role_presence (
+	role TEXT PRIMARY KEY,
+	last_seen_at TEXT NOT NULL,
+	last_command TEXT NOT NULL DEFAULT ''
+);
+	`,
 }

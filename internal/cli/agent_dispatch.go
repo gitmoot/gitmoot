@@ -115,6 +115,13 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}
+	// #1059: validate the --org-role against the registry (unknown role fails
+	// loudly at ingress) and record passive presence for this dispatch. Restored
+	// during the #1057 reconcile — #1057's preflightOrgScope covers scope
+	// enforcement but not role-existence validation or presence.
+	if err := validateAndTouchActingOrgRole(ctx, store, request.Home, request.ActingOrgRole, request.ExecutionPath); err != nil {
+		return localAgentJobOutput{}, err
+	}
 	repo, record, err := resolveLocalAgentRepo(ctx, store, request.RepoFlag)
 	if err != nil {
 		return localAgentJobOutput{}, err

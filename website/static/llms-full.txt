@@ -10674,18 +10674,36 @@ at a PRIVATE repo unless the prompts are meant to be public.**
 
 ## Organization registry and scoped dispatch
 
+Organization mode is opt-in. Initialize a starter registry and verify the
+required Herdr provider (`>=0.7.5`) with:
+
+```sh
+gitmoot org init
+gitmoot org brief --role owner [--json]
+gitmoot org chart [--json]
+gitmoot org status [--json]
+```
+
 `gitmoot org validate [--home PATH]` validates the optional local `[org]`
 registry and prints its role count. `gitmoot org show [--home PATH]` prints the
-resolved role table. Any `[org.roles."name"]` section enables the registry.
-Roles have optional `parent`, `scope`, and advisory `merge_rule` (`owner`,
-`self`, or `none`); exactly one role has no parent. Scope is `*`, `owner/*`, or
-exact `owner/name`, and each child scope must be covered by its parent.
+resolved role table.
+
+The registry uses `[org] enforce = "warn"|"block"` and
+`[org.roles."name"]` entries with `parent`, `scope`, and `merge_rule`. There is
+exactly one root named `owner`; accepted scopes are `*`, `owner/*`, `*/repo`,
+and `owner/repo`, and each child scope must be covered by its parent. Malformed
+org configuration fails closed and loudly. `brief` records passive last-seen
+presence for its role and can render static context with provider state
+`unknown` during an outage; `chart` and `status` require a live compatible
+Herdr snapshot. Open escalations remain deferred to #1058's resolution and
+correlation contract.
 
 Fresh local `agent ask`, `agent run`, `agent review`, `agent implement`,
-`orchestrate`, and `task run` dispatches pass `--org-role <role>` (or the narrow
-`GITMOOT_ORG_ROLE` fallback) when enabled. The role scope is enforced at
-enqueue. `[org] enforce = "block"` rejects violations; `"warn"` queues and
-records an `org_scope_violation` event.
+`orchestrate`, and `task run` dispatches accept `--org-role <name>` (or the
+narrow `GITMOOT_ORG_ROLE` fallback). The role is validated and touched before
+dispatch, stored as `acting_org_role` in the job payload for provenance, and
+its scope is enforced at enqueue. `[org] enforce = "block"` rejects violations;
+`"warn"` queues and records an `org_scope_violation` event.
 
 `gitmoot org escalate --to <ancestor-role> --workflow <label> [--org-role
 <from-role>] [--repo <owner/repo>] "<question>"` records an escalation as a

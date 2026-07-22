@@ -56,6 +56,24 @@ func TestMailboxEnqueueCreatesQueuedJobAndEvent(t *testing.T) {
 	}
 }
 
+func TestMailboxPersistsActingOrgRoleProvenance(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	job, err := (Mailbox{Store: store}).Enqueue(ctx, JobRequest{
+		ID: "org-role-job", Agent: "audit", Action: "ask", Repo: "gitmoot/gitmoot", ActingOrgRole: " owner ",
+	})
+	if err != nil {
+		t.Fatalf("Enqueue() error = %v", err)
+	}
+	payload, err := ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload() error = %v", err)
+	}
+	if payload.ActingOrgRole != "owner" || !strings.Contains(job.Payload, `"acting_org_role":"owner"`) {
+		t.Fatalf("payload = %+v raw=%s", payload, job.Payload)
+	}
+}
+
 func TestMailboxProduceCheckRetriesSameSessionAndRecordsTokens(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)

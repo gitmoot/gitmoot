@@ -3,13 +3,18 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/org"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -246,5 +251,230 @@ func orgParityPolicy(enforce string) workflow.OrgEnforcement {
 		ScopeMatches: func(scopes []string, repo string) bool {
 			return len(scopes) == 1 && scopes[0] == "owner/*" && strings.HasPrefix(repo, "owner/")
 		},
+	}
+}
+
+type orgFixtureProvider struct {
+	snapshot org.Snapshot
+	err      error
+}
+
+func (p orgFixtureProvider) Snapshot(context.Context) (org.Snapshot, error) {
+	return p.snapshot, p.err
+}
+
+type orgFixtureRunner struct {
+	version string
+}
+
+func (r orgFixtureRunner) LookPath(string) (string, error) { return "/usr/bin/herdr", nil }
+
+func (r orgFixtureRunner) Run(context.Context, string, string, ...string) (subprocess.Result, error) {
+	return subprocess.Result{Stdout: r.version}, nil
+}
+
+func setupOrgHome(t *testing.T) (string, config.Paths) {
+	t.Helper()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = file.WriteString(`
+[org]
+enforce = "warn"
+[org.roles."owner"]
+scope = ["*"]
+merge_rule = "owner"
+[org.roles."review"]
+parent = "owner"
+scope = ["gitmoot/*"]
+merge_rule = "parent"
+`)
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return home, paths
+}
+
+func withOrgProvider(t *testing.T, provider org.Provider) {
+	t.Helper()
+	original := newOrgProvider
+	newOrgProvider = func([]string) org.Provider { return provider }
+	t.Cleanup(func() { newOrgProvider = original })
+}
+
+func TestRunOrgBriefChartStatusAndPresence(t *testing.T) {
+	home, paths := setupOrgHome(t)
+	observed := time.Date(2026, 7, 22, 9, 0, 0, 0, time.UTC)
+	withOrgProvider(t, orgFixtureProvider{snapshot: org.Snapshot{
+		States: map[string]org.RoleLiveState{
+			"owner":  {State: org.StateWorking},
+			"review": {State: org.StateIdle},
+		},
+		ObservedAt: observed, ProviderVersion: "0.7.5",
+	}})
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"org", "brief", "--home", home, "--role", "review", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("brief code = %d stderr=%s", code, stderr.String())
+	}
+	var brief orgBriefOutput
+	if err := json.Unmarshal(stdout.Bytes(), &brief); err != nil {
+		t.Fatalf("decode brief: %v; output=%s", err, stdout.String())
+	}
+	if brief.Role != "review" || brief.Parent != "owner" || brief.ProviderState != org.StateIdle || brief.LastSeenAt == "" || brief.LastCommand != "org brief" {
+		t.Fatalf("brief = %+v", brief)
+	}
+	if got := strings.Join(brief.Path, "/"); got != "owner/review" {
+		t.Fatalf("brief path = %q", got)
+	}
+
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	presence, err := store.ListOrgRolePresence(context.Background())
+	store.Close()
+	if err != nil || len(presence) != 1 || presence[0].Role != "review" || presence[0].LastCommand != "org brief" {
+		t.Fatalf("presence = %+v, err=%v", presence, err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"org", "chart", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("chart code = %d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "owner · working") || !strings.Contains(stdout.String(), "  review · idle") {
+		t.Fatalf("chart output = %q", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"org", "status", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("status code = %d stderr=%s", code, stderr.String())
+	}
+	var status []orgStatusOutput
+	if err := json.Unmarshal(stdout.Bytes(), &status); err != nil || len(status) != 2 {
+		t.Fatalf("status = %+v err=%v output=%s", status, err, stdout.String())
+	}
+}
+
+func TestRunOrgProviderFailureSemantics(t *testing.T) {
+	home, _ := setupOrgHome(t)
+	withOrgProvider(t, orgFixtureProvider{err: errors.New("socket unavailable")})
+	for _, command := range []string{"chart", "status"} {
+		var stdout, stderr bytes.Buffer
+		if code := Run([]string{"org", command, "--home", home}, &stdout, &stderr); code == 0 || !strings.Contains(stderr.String(), "snapshot unavailable") {
+			t.Fatalf("%s code/stderr = %d/%q", command, code, stderr.String())
+		}
+	}
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"org", "brief", "--home", home, "--role", "owner", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("brief code = %d stderr=%s", code, stderr.String())
+	}
+	var brief orgBriefOutput
+	if err := json.Unmarshal(stdout.Bytes(), &brief); err != nil {
+		t.Fatal(err)
+	}
+	if brief.ProviderState != org.StateUnknown || !strings.Contains(brief.ProviderDetail, "socket unavailable") {
+		t.Fatalf("brief = %+v", brief)
+	}
+}
+
+func TestValidateAndTouchActingOrgRole(t *testing.T) {
+	home, paths := setupOrgHome(t)
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := validateAndTouchActingOrgRole(ctx, store, home, "review", "agent_run"); err != nil {
+		t.Fatalf("validateAndTouchActingOrgRole() error = %v", err)
+	}
+	if err := validateAndTouchActingOrgRole(ctx, store, home, "missing", "agent_run"); err == nil {
+		t.Fatal("unknown role accepted")
+	}
+	presence, err := store.ListOrgRolePresence(ctx)
+	if err != nil || len(presence) != 1 || presence[0].Role != "review" || presence[0].LastCommand != "agent_run" {
+		t.Fatalf("presence = %+v err=%v", presence, err)
+	}
+}
+
+func TestRunOrgInitScaffoldsAndRunsHerdrGate(t *testing.T) {
+	home := t.TempDir()
+	originalRunner := orgDoctorRunner
+	orgDoctorRunner = orgFixtureRunner{version: "herdr 0.7.5\n"}
+	t.Cleanup(func() { orgDoctorRunner = originalRunner })
+	withOrgProvider(t, orgFixtureProvider{snapshot: org.Snapshot{
+		States:     map[string]org.RoleLiveState{"owner": {State: org.StateUnknown}},
+		ObservedAt: time.Now().UTC(), ProviderVersion: "0.7.5",
+	}})
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"org", "init", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("init code = %d stderr=%s", code, stderr.String())
+	}
+	registry, err := config.LoadOrgRegistry(config.PathsForHome(home))
+	if err != nil || !registry.Enabled() {
+		t.Fatalf("registry = %+v err=%v", registry, err)
+	}
+	if !strings.Contains(stdout.String(), "herdr 0.7.5") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestRunOrgInitRejectsOldHerdrLoudly(t *testing.T) {
+	home := t.TempDir()
+	originalRunner := orgDoctorRunner
+	orgDoctorRunner = orgFixtureRunner{version: "herdr 0.7.4\n"}
+	t.Cleanup(func() { orgDoctorRunner = originalRunner })
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"org", "init", "--home", home}, &stdout, &stderr); code == 0 || !strings.Contains(stderr.String(), "org requires herdr >=0.7.5") {
+		t.Fatalf("init code/stderr = %d/%q", code, stderr.String())
+	}
+	registry, err := config.LoadOrgRegistry(config.PathsForHome(home))
+	if err != nil || !registry.Enabled() {
+		t.Fatalf("scaffold should remain inspectable after gate failure: registry=%+v err=%v", registry, err)
+	}
+}
+
+func TestRunOrgMalformedConfigFailsClosedWithoutPresence(t *testing.T) {
+	home, paths := setupOrgHome(t)
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org]\nenforce = \"invalid\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"org", "brief", "--home", home, "--role", "owner"}, &stdout, &stderr); code == 0 || !strings.Contains(stderr.String(), "load org registry") {
+		t.Fatalf("brief code/stderr = %d/%q", code, stderr.String())
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	presence, err := store.ListOrgRolePresence(context.Background())
+	if err != nil || len(presence) != 0 {
+		t.Fatalf("presence = %+v err=%v", presence, err)
+	}
+}
+
+func TestParseAgentOrgRoleFlags(t *testing.T) {
+	var stderr bytes.Buffer
+	ask, ok := parseAgentAskOptions([]string{"agent", "message", "--org-role", "owner"}, &stderr)
+	if !ok || ask.orgRole != "owner" {
+		t.Fatalf("ask = %+v ok=%v stderr=%s", ask, ok, stderr.String())
+	}
+	stderr.Reset()
+	run, ok := parseAgentRunOptions("run", []string{"agent", "message", "--org-role=review"}, &stderr)
+	if !ok || run.orgRole != "review" {
+		t.Fatalf("run = %+v ok=%v stderr=%s", run, ok, stderr.String())
 	}
 }
