@@ -371,3 +371,77 @@ func TestSkillOptTrainStartOmitsJudgePromptWhenAbsent(t *testing.T) {
 		t.Fatal("evaluation should still carry preferred_gate")
 	}
 }
+
+func TestSkillOptJudgeReportRendersMatrixAndAgreement(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	for index, outcome := range []db.SkillOptJudgeOutcome{
+		{ID: "judge-outcome-1", CandidateVersionID: "planner@v2", TemplateID: "planner", JudgeScoreJSON: `{"soft":0.9,"dimension_scores":{"clarity":0.9,"safety":0.8}}`, HumanDecision: "promoted", Direction: db.SkillOptJudgeDirectionAgreeAccept},
+		{ID: "judge-outcome-2", CandidateVersionID: "planner@v3", TemplateID: "planner", JudgeScoreJSON: `{"soft":0.1,"dimension_scores":{"clarity":0.2,"safety":0.3}}`, HumanDecision: "rejected", Direction: db.SkillOptJudgeDirectionAgreeReject},
+		{ID: "judge-outcome-3", CandidateVersionID: "planner@v4", TemplateID: "planner", JudgeScoreJSON: `{"soft":0.8,"dimension_scores":{"clarity":0.85,"safety":0.7}}`, HumanDecision: "rejected", Direction: db.SkillOptJudgeDirectionJudgeAcceptHumanReject},
+	} {
+		if err := store.InsertSkillOptJudgeOutcome(context.Background(), outcome); err != nil {
+			t.Fatalf("InsertSkillOptJudgeOutcome %d returned error: %v", index, err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"skillopt", "judge-report", "--home", home, "--template", "planner"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("skillopt judge-report exit code = %d, stderr=%q", code, stderr.String())
+	}
+	output := stdout.String()
+	for _, want := range []string{
+		"judge outcomes: 3",
+		"confusion matrix (judge vs human)",
+		"judge accept",
+		"judge reject",
+		// agreement = (agree_accept + agree_reject) / total = 2/3.
+		"agreement rate: 0.667 (2/3)",
+		"cohen's kappa:",
+		"calibration (judge soft-score band vs human promote rate)",
+		"per-dimension disagreement",
+		"clarity",
+		"safety",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("skillopt judge-report output missing %q\n%s", want, output)
+		}
+	}
+}
+
+func TestSkillOptJudgeSoftScoreFallsBackToSelectionScore(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		report string
+		want   float64
+		wantOK bool
+	}{
+		{name: "top-level soft wins", report: `{"soft":0.42,"best_selection_soft":0.9}`, want: 0.42, wantOK: true},
+		{name: "nested evaluator_score soft", report: `{"evaluator_score":{"soft":0.55}}`, want: 0.55, wantOK: true},
+		{name: "landing-page best_selection_soft", report: `{"best_selection_hard":0.0,"best_selection_soft":0.76,"promotable":true}`, want: 0.76, wantOK: true},
+		{name: "best_selection_hard last resort", report: `{"best_selection_hard":0.5}`, want: 0.5, wantOK: true},
+		{name: "no continuous score", report: `{"quality_status":"fail"}`, wantOK: false},
+		{name: "empty report", report: ``, wantOK: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := skillOptJudgeSoftScore(tc.report)
+			if ok != tc.wantOK {
+				t.Fatalf("skillOptJudgeSoftScore ok = %v, want %v", ok, tc.wantOK)
+			}
+			if tc.wantOK && got != tc.want {
+				t.Fatalf("skillOptJudgeSoftScore = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

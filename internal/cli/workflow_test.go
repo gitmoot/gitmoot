@@ -1269,7 +1269,8 @@ func subscribeShellImplementAgent(t *testing.T, home string, name string, repo s
 
 func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	full := append([]string{"-c", "maintenance.auto=false", "-c", "gc.auto=0"}, args...)
+	cmd := exec.Command("git", full...)
 	cmd.Dir = dir
 	output, err := cmd.CombinedOutput()
 	if err != nil {
