@@ -72,6 +72,7 @@ func hardVerifierImplementPayload() workflow.JobPayload {
 // TestHardVerifierAllPassIsPass: every command exits 0 → HardPassed=true, ok=true, a
 // per-command rubric of all-1.0, tagged HardVerifier, and the sandbox is cleaned up.
 func TestHardVerifierAllPassIsPass(t *testing.T) {
+	t.Parallel()
 	prov := &fakeSandboxProvisioner{dir: "/sandbox/wt"}
 	runner := &fakeVerifierRunner{errByCommand: map[string]error{}} // no errors => all pass
 	d := &hardVerifierDispatcher{
@@ -106,6 +107,7 @@ func TestHardVerifierAllPassIsPass(t *testing.T) {
 // TestHardVerifierAnyFailIsFail: a SINGLE failing command (fail-closed set membership)
 // makes the whole verdict FAIL, and that command's rubric entry is 0.0.
 func TestHardVerifierAnyFailIsFail(t *testing.T) {
+	t.Parallel()
 	prov := &fakeSandboxProvisioner{dir: "/sandbox/wt"}
 	runner := &fakeVerifierRunner{errByCommand: map[string]error{
 		"go test ./...": errors.New("exit status 1"),
@@ -133,6 +135,7 @@ func TestHardVerifierAnyFailIsFail(t *testing.T) {
 // TestHardVerifierTimeoutIsFail: a command whose Run returns a context-deadline error
 // (the leg's bounded context cancelled it) is a FAIL, never a silent pass.
 func TestHardVerifierTimeoutIsFail(t *testing.T) {
+	t.Parallel()
 	prov := &fakeSandboxProvisioner{dir: "/sandbox/wt"}
 	runner := &fakeVerifierRunner{errByCommand: map[string]error{
 		"slow-suite": context.DeadlineExceeded,
@@ -155,6 +158,7 @@ func TestHardVerifierTimeoutIsFail(t *testing.T) {
 // working dir set to the SANDBOX the provisioner returned, never any other checkout.
 // This is the isolation contract the tier depends on for cheat-proofing.
 func TestHardVerifierRunsInSandboxNotRealCheckout(t *testing.T) {
+	t.Parallel()
 	const sandboxDir = "/tmp/gitmoot-hardverify-XYZ/wt"
 	prov := &fakeSandboxProvisioner{dir: sandboxDir}
 	runner := &fakeVerifierRunner{errByCommand: map[string]error{}}
@@ -179,6 +183,7 @@ func TestHardVerifierRunsInSandboxNotRealCheckout(t *testing.T) {
 // TestHardVerifierUnprovisionableSandboxSkips: a provisioner error yields ok=false (no
 // hard row) and runs NO verifier — the leg degrade-skips, never fails the merge.
 func TestHardVerifierUnprovisionableSandboxSkips(t *testing.T) {
+	t.Parallel()
 	prov := &fakeSandboxProvisioner{err: errors.New("merged head not present in base checkout")}
 	runner := &fakeVerifierRunner{errByCommand: map[string]error{}}
 	d := &hardVerifierDispatcher{
@@ -204,6 +209,7 @@ func TestHardVerifierUnprovisionableSandboxSkips(t *testing.T) {
 // negative from a setup failure (#474 false-negative hardening). A genuine exit-1 stays
 // a FAIL — see TestHardVerifierAnyFailIsFail.
 func TestHardVerifierExecLayerFailureSkips(t *testing.T) {
+	t.Parallel()
 	prov := &fakeSandboxProvisioner{dir: "/sandbox/wt"}
 	runner := &fakeVerifierRunner{errByCommand: map[string]error{
 		// The first command passes; the second cannot be run at all.
@@ -226,6 +232,7 @@ func TestHardVerifierExecLayerFailureSkips(t *testing.T) {
 // TestHardVerifierEmptyInputsSkip: no commands, no runner/provisioner, or an empty
 // merged head all skip (ok=false) — byte-identical no-op guards.
 func TestHardVerifierEmptyInputsSkip(t *testing.T) {
+	t.Parallel()
 	prov := &fakeSandboxProvisioner{dir: "/sandbox/wt"}
 	runner := &fakeVerifierRunner{errByCommand: map[string]error{}}
 	cases := []struct {
@@ -240,6 +247,7 @@ func TestHardVerifierEmptyInputsSkip(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			_, ok, err := tc.d.Verify(context.Background(), db.Job{ID: "j"}, hardVerifierImplementPayload(), tc.head)
 			if err != nil || ok {
 				t.Fatalf("%s: Verify = ok %v err %v, want ok=false err=nil", tc.name, ok, err)
@@ -304,6 +312,7 @@ func installHardVerifierTemplate(t *testing.T, store *db.Store) (db.AgentTemplat
 // checkout) through the REAL harvester, proving a PASS lands a choice "a" hard row
 // whose persisted hard_score is 1.0 (EvaluatorScore.Hard=1.0).
 func TestHardVerifierE2EPassFlowsIntoHardScore(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
@@ -337,6 +346,7 @@ func TestHardVerifierE2EPassFlowsIntoHardScore(t *testing.T) {
 // hard_score is 0.0 (EvaluatorScore.Hard=0.0). This is the mutation guard for the
 // exit-code mapping: if pass/fail were inverted, this row would be choice "a".
 func TestHardVerifierE2EFailFlowsIntoHardScore(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
@@ -372,6 +382,7 @@ func TestHardVerifierE2EFailFlowsIntoHardScore(t *testing.T) {
 // isolation guarantee. This is the mutation guard for the sandbox-fresh contract: if
 // the verifier ran in the base checkout, escapee.txt would appear there.
 func TestHardVerifierE2ESandboxIsolatesWrites(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
@@ -402,6 +413,7 @@ func TestHardVerifierE2ESandboxIsolatesWrites(t *testing.T) {
 // the throwaway clone and cannot escape into the live daemon checkout. A detached
 // worktree off the base (the pre-fix design) would have leaked all three.
 func TestHardVerifierE2ESandboxIsolatesGitState(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
@@ -446,6 +458,7 @@ func TestHardVerifierE2ESandboxIsolatesGitState(t *testing.T) {
 // (ok=false, no row), never map the missing-toolchain exit onto an authoritative
 // Hard=0 — the false-negative hardening (#474) proven end to end through real `sh`.
 func TestHardVerifierE2ECommandNotFoundSkips(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
@@ -514,6 +527,7 @@ func gitWorktreeRegistryEntries(t *testing.T, repoDir string) []string {
 // TestHardVerifierE2ETimeoutFailsFromRealContext drives a REAL slow command against a
 // short leg context, proving a genuine timeout (not a fake) is a FAIL.
 func TestHardVerifierE2ETimeoutFailsFromRealContext(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}

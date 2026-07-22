@@ -636,9 +636,7 @@ func runChatInbox(args []string, stdout, stderr io.Writer) int {
 
 // ---- wait (turn-taking poll) -----------------------------------------------
 
-// chatWaitPollInterval is how often `chat wait` re-polls the store for new
-// messages. A package var so tests can shrink it to keep the poll loop fast.
-var chatWaitPollInterval = 500 * time.Millisecond
+const chatWaitPollInterval = 500 * time.Millisecond
 
 // chatMootCapWaitLine is the exact, machine-detectable line `chat wait` prints
 // when the thread's moot cap is reached — the seat's cue to wrap up (#534 V1.5).
@@ -651,6 +649,13 @@ const chatMootCapWaitLine = "MOOT CAP REACHED — wrap up now"
 // it prints chatMootCapWaitLine and returns immediately (even with no new message),
 // so a seat stops instead of spinning until timeout.
 func runChatWait(args []string, stdout, stderr io.Writer) int {
+	return runChatWaitWithPollInterval(args, stdout, stderr, chatWaitPollInterval)
+}
+
+// runChatWaitWithPollInterval is runChatWait with an injected polling cadence.
+// Production uses chatWaitPollInterval; tests use a short cadence without
+// mutating package state, so independent waits can run concurrently.
+func runChatWaitWithPollInterval(args []string, stdout, stderr io.Writer, pollInterval time.Duration) int {
 	fs := flag.NewFlagSet("chat wait", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
@@ -688,7 +693,7 @@ func runChatWait(args []string, stdout, stderr io.Writer) int {
 			if len(newMsgs) > 0 || capReached || !time.Now().Before(deadline) {
 				break
 			}
-			time.Sleep(chatWaitPollInterval)
+			time.Sleep(pollInterval)
 		}
 	} else if err := withStore(*home, func(store *db.Store) error {
 		ctx := context.Background()
@@ -708,7 +713,7 @@ func runChatWait(args []string, stdout, stderr io.Writer) int {
 			if len(newMsgs) > 0 || capReached || !time.Now().Before(deadline) {
 				return nil
 			}
-			time.Sleep(chatWaitPollInterval)
+			time.Sleep(pollInterval)
 		}
 	}); err != nil {
 		fmt.Fprintf(stderr, "chat wait: %v\n", err)

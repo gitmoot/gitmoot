@@ -46,6 +46,7 @@ func configModel(t *testing.T, deps Deps, snap Snapshot) Model {
 }
 
 func TestConfigPageRendersSections(t *testing.T) {
+	t.Parallel()
 	m := configModel(t, Deps{}, configSnapshot())
 	view := m.View()
 	for _, want := range []string{
@@ -65,6 +66,7 @@ func TestConfigPageRendersSections(t *testing.T) {
 // render grouped under their section sub-headers (in section order) while the
 // cursor still indexes the flat field order across sections.
 func TestConfigEditableSettingsGroupedBySection(t *testing.T) {
+	t.Parallel()
 	snap := Snapshot{
 		Daemon: Daemon{Running: true},
 		Config: ConfigView{
@@ -118,6 +120,7 @@ func TestConfigEditableSettingsGroupedBySection(t *testing.T) {
 // a 3-part KeyPath (e.g. per agent type) sub-group under the entity name, with the
 // redundant "<entity> · " prefix dropped from the field label.
 func TestConfigEditableSettingsSubgroupedByEntity(t *testing.T) {
+	t.Parallel()
 	snap := Snapshot{
 		Daemon: Daemon{Running: true},
 		Config: ConfigView{
@@ -157,6 +160,7 @@ func TestConfigEditableSettingsSubgroupedByEntity(t *testing.T) {
 }
 
 func TestConfigEditDispatchesEditorCmd(t *testing.T) {
+	t.Parallel()
 	edited := false
 	deps := Deps{
 		EditConfig: func() tea.Cmd {
@@ -180,6 +184,7 @@ func TestConfigEditDispatchesEditorCmd(t *testing.T) {
 }
 
 func TestConfigEditValidationProblemsRender(t *testing.T) {
+	t.Parallel()
 	deps := Deps{
 		EditConfig:     func() tea.Cmd { return func() tea.Msg { return ConfigEditedMsg{} } },
 		ValidateConfig: func() []string { return []string{"[agents.*] max_background must be an integer"} },
@@ -196,6 +201,7 @@ func TestConfigEditValidationProblemsRender(t *testing.T) {
 }
 
 func TestConfigEditorLaunchErrorRenders(t *testing.T) {
+	t.Parallel()
 	m := configModel(t, Deps{EditConfig: func() tea.Cmd { return nil }}, configSnapshot())
 	next, _ := m.Update(ConfigEditedMsg{Err: errors.New("editor: command not found")})
 	m = next.(Model)
@@ -205,6 +211,7 @@ func TestConfigEditorLaunchErrorRenders(t *testing.T) {
 }
 
 func TestConfigEditNoOpWithoutDep(t *testing.T) {
+	t.Parallel()
 	m := configModel(t, Deps{}, configSnapshot())
 	next, cmd := m.Update(key("e"))
 	m = next.(Model)
@@ -251,6 +258,7 @@ func configEditModel(t *testing.T, deps Deps) Model {
 }
 
 func TestConfigInlineEditWritesScalar(t *testing.T) {
+	t.Parallel()
 	var gotPath []string
 	var gotValue string
 	deps := Deps{SetConfigScalar: func(keyPath []string, value string, kind ConfigKind) error {
@@ -284,6 +292,7 @@ func TestConfigInlineEditWritesScalar(t *testing.T) {
 }
 
 func TestConfigInlineEditValidatesBeforeWrite(t *testing.T) {
+	t.Parallel()
 	deps := Deps{SetConfigScalar: func(keyPath []string, value string, kind ConfigKind) error {
 		t.Fatal("must not write an invalid value")
 		return nil
@@ -308,6 +317,7 @@ func TestConfigInlineEditValidatesBeforeWrite(t *testing.T) {
 }
 
 func TestConfigInlineEditWriteErrorKeepsOverlay(t *testing.T) {
+	t.Parallel()
 	deps := Deps{SetConfigScalar: func(keyPath []string, value string, kind ConfigKind) error {
 		return errors.New("config invalid after edit (reverted)")
 	}}
@@ -324,6 +334,7 @@ func TestConfigInlineEditWriteErrorKeepsOverlay(t *testing.T) {
 }
 
 func TestConfigDurationFieldValidation(t *testing.T) {
+	t.Parallel()
 	if validateConfigValue(ConfigField{Kind: ConfigDuration}, "10m") != "" {
 		t.Fatal("10m should be a valid duration")
 	}
@@ -336,6 +347,7 @@ func TestConfigDurationFieldValidation(t *testing.T) {
 }
 
 func TestConfigEnumAndListValidation(t *testing.T) {
+	t.Parallel()
 	enum := ConfigField{Kind: ConfigText, Allowed: []string{"queue", "fork_temp_session"}}
 	if validateConfigValue(enum, "queue") != "" {
 		t.Fatal("queue should be allowed")

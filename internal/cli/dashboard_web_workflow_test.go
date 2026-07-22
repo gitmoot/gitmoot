@@ -19,6 +19,7 @@ import (
 )
 
 func TestDeriveDashboardWorkflowState(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
 	tests := []struct {
 		name     string
@@ -46,6 +47,7 @@ func TestDeriveDashboardWorkflowState(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			state, stalled := deriveDashboardWorkflowState(now, test.activity)
 			if state != test.state || stalled != test.stalled {
 				t.Fatalf("derive = (%q, %d), want (%q, %d)", state, stalled, test.state, test.stalled)
@@ -55,6 +57,7 @@ func TestDeriveDashboardWorkflowState(t *testing.T) {
 }
 
 func TestDashboardWorkflowIndexLessStateOrder(t *testing.T) {
+	t.Parallel()
 	active := dashboard.WorkflowIndexEntry{Label: "active", State: "active"}
 	recent := dashboard.WorkflowIndexEntry{Label: "recent", State: "recent"}
 	settled := dashboard.WorkflowIndexEntry{Label: "settled", State: "settled"}
@@ -67,6 +70,7 @@ func TestDashboardWorkflowIndexLessStateOrder(t *testing.T) {
 }
 
 func TestWebDataSourceStateCarriesRootWorkflowOnly(t *testing.T) {
+	t.Parallel()
 	unlabelledHome := dashboardTestHome(t)
 	seedWebDashboardTree(t, unlabelledHome)
 	unlabelled, err := (&webDataSource{home: unlabelledHome}).State(context.Background(), "coord")
@@ -96,6 +100,7 @@ func TestWebDataSourceStateCarriesRootWorkflowOnly(t *testing.T) {
 }
 
 func TestWebDataSourceGraphWorkflowHubsRespectVisibleJobs(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	store, err := db.Open(config.PathsForHome(home).Database)
 	if err != nil {
@@ -158,6 +163,7 @@ func TestWebDataSourceGraphWorkflowHubsRespectVisibleJobs(t *testing.T) {
 }
 
 func TestWebDataSourceGraphUnlabelledLegacyJSONUnchanged(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	store, err := db.Open(config.PathsForHome(home).Database)
 	if err != nil {
@@ -182,6 +188,7 @@ func TestWebDataSourceGraphUnlabelledLegacyJSONUnchanged(t *testing.T) {
 }
 
 func TestWebDashboardUnlabelledLegacyHTTPGolden(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	store, err := db.Open(config.PathsForHome(home).Database)
 	if err != nil {
@@ -242,6 +249,7 @@ func assertDashboardHTTPGolden(t *testing.T, handler http.Handler, target, want 
 }
 
 func TestWebDataSourceWorkflowGroupsTreesAndPaginates(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	store, err := db.Open(config.PathsForHome(home).Database)
 	if err != nil {
@@ -313,6 +321,7 @@ func TestWebDataSourceWorkflowGroupsTreesAndPaginates(t *testing.T) {
 }
 
 func TestWebDataSourceWorkflowNotFound(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	ds := &webDataSource{home: home}
 	if _, err := ds.Workflow(context.Background(), "missing", dashboard.WorkflowQuery{}); !errors.Is(err, dashboard.ErrWorkflowNotFound) {
@@ -321,6 +330,7 @@ func TestWebDataSourceWorkflowNotFound(t *testing.T) {
 }
 
 func TestWebDataSourceWorkflowsIndexLifecycleCoordinatorAndSlashDetail(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	paths := config.PathsForHome(home)
 	store, err := db.Open(paths.Database)
@@ -474,6 +484,7 @@ func TestWebDataSourceWorkflowsIndexLifecycleCoordinatorAndSlashDetail(t *testin
 }
 
 func TestDashboardWorkflowDaemonNotesDoNotAcknowledgeFailuresOrImpersonateCoordinator(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	paths := config.PathsForHome(home)
 	store, err := db.Open(paths.Database)
@@ -591,6 +602,7 @@ func workflowIndexEntryByLabel(t *testing.T, entries []dashboard.WorkflowIndexEn
 }
 
 func TestCappedWorkflowLimitDefaultsAndCaps(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name             string
 		value, cap, want int
@@ -601,6 +613,7 @@ func TestCappedWorkflowLimitDefaultsAndCaps(t *testing.T) {
 		{name: "in-range", value: 7, cap: dashboardWorkflowMaxNotes, want: 7},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			if got := cappedWorkflowLimit(tc.value, tc.cap); got != tc.want {
 				t.Fatalf("cappedWorkflowLimit(%d, %d) = %d, want %d", tc.value, tc.cap, got, tc.want)
 			}
@@ -609,6 +622,7 @@ func TestCappedWorkflowLimitDefaultsAndCaps(t *testing.T) {
 }
 
 func TestDashboardWorkflowDescriptionStatusAPI(t *testing.T) {
+	t.Parallel()
 	home, store := workflowJournalTestHome(t)
 	ctx := context.Background()
 	const label = "release/api-fields"

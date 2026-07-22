@@ -333,18 +333,14 @@ func TestChatWaitSinceSeq(t *testing.T) {
 // message arrives, still reporting the tail last-seq (a seat can then decide to
 // speak or stop).
 func TestChatWaitTimeout(t *testing.T) {
+	t.Parallel()
 	store, home := mootFixtureHome(t, "")
 	thread := seedChatThread(t, store, "quiet", "owner/repo")
 	seedChatMention(t, store, thread, db.ChatKindChat, db.ChatAuthorKindHuman, "human", "only", "")
 
-	// Shrink the poll interval so the timeout loop spins fast.
-	restore := chatWaitPollInterval
-	chatWaitPollInterval = 10 * time.Millisecond
-	t.Cleanup(func() { chatWaitPollInterval = restore })
-
 	var stdout bytes.Buffer
 	start := time.Now()
-	code := Run([]string{"chat", "wait", "quiet", "--since-seq", "1", "--timeout", "60ms", "--repo", "owner/repo", "--home", home}, &stdout, &bytes.Buffer{})
+	code := runChatWaitWithPollInterval([]string{"quiet", "--since-seq", "1", "--timeout", "60ms", "--repo", "owner/repo", "--home", home}, &stdout, &bytes.Buffer{}, 10*time.Millisecond)
 	if code != 0 {
 		t.Fatalf("wait exit = %d, want 0", code)
 	}
@@ -359,6 +355,7 @@ func TestChatWaitTimeout(t *testing.T) {
 // TestChatWaitCapSignal proves `chat wait` on a capped moot prints the exact
 // wrap-up line and returns immediately (no timeout spin), even with no new message.
 func TestChatWaitCapSignal(t *testing.T) {
+	t.Parallel()
 	store, home := mootFixtureHome(t, "")
 	ctx := context.Background()
 	thread := seedChatThread(t, store, "done", "owner/repo")
@@ -367,14 +364,10 @@ func TestChatWaitCapSignal(t *testing.T) {
 	}
 	seedChatMention(t, store, thread, db.ChatKindChat, db.ChatAuthorKindAgent, "seat", "final turn", "")
 
-	restore := chatWaitPollInterval
-	chatWaitPollInterval = 10 * time.Millisecond
-	t.Cleanup(func() { chatWaitPollInterval = restore })
-
 	var stdout bytes.Buffer
 	start := time.Now()
 	// A large --timeout: if the cap short-circuit works, wait returns immediately.
-	code := Run([]string{"chat", "wait", "done", "--since-seq", "99", "--timeout", "30s", "--repo", "owner/repo", "--home", home}, &stdout, &bytes.Buffer{})
+	code := runChatWaitWithPollInterval([]string{"done", "--since-seq", "99", "--timeout", "30s", "--repo", "owner/repo", "--home", home}, &stdout, &bytes.Buffer{}, 10*time.Millisecond)
 	if code != 0 {
 		t.Fatalf("wait exit = %d, want 0", code)
 	}

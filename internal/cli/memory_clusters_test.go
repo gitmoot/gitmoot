@@ -47,6 +47,7 @@ func clustersJSON(t *testing.T, home string) []clusterListEntry {
 // TestClustersFirstRunApplyAndList: on first run `recompute --apply` (no plan) is
 // allowed; it builds the two communities and the list surfaces them.
 func TestClustersFirstRunApplyAndList(t *testing.T) {
+	t.Parallel()
 	home, store := memoryTestHome(t)
 	dbIDs, netIDs := seedClusterCorpus(t, store)
 
@@ -89,6 +90,7 @@ func TestClustersFirstRunApplyAndList(t *testing.T) {
 // TestClustersApplyWithoutPlanRejectedWhenExist: once clusters exist, a bare
 // `--apply` (no plan) must be rejected — recompute has to go through propose.
 func TestClustersApplyWithoutPlanRejectedWhenExist(t *testing.T) {
+	t.Parallel()
 	home, store := memoryTestHome(t)
 	seedClusterCorpus(t, store)
 
@@ -109,6 +111,7 @@ func TestClustersApplyWithoutPlanRejectedWhenExist(t *testing.T) {
 // TestClustersProposeApplyStalenessAbort: a plan proposed then invalidated by a
 // new fact must abort as stale at apply.
 func TestClustersProposeApplyStalenessAbort(t *testing.T) {
+	t.Parallel()
 	home, store := memoryTestHome(t)
 	seedClusterCorpus(t, store)
 	ctx := context.Background()
@@ -146,6 +149,7 @@ func TestClustersProposeApplyStalenessAbort(t *testing.T) {
 // TestClusterRenameOverrideWinsAndSurvivesRecompute: rename sets an override that
 // wins in the list AND is carried forward across a recompute (medoid-anchored).
 func TestClusterRenameOverrideWinsAndSurvivesRecompute(t *testing.T) {
+	t.Parallel()
 	home, store := memoryTestHome(t)
 	seedClusterCorpus(t, store)
 
@@ -204,6 +208,7 @@ func TestClusterRenameOverrideWinsAndSurvivesRecompute(t *testing.T) {
 // TestClustersProposeDeterministic: two proposes over an unchanged store produce
 // the same anchor and the same cluster assignment.
 func TestClustersProposeDeterministic(t *testing.T) {
+	t.Parallel()
 	home, store := memoryTestHome(t)
 	seedClusterCorpus(t, store)
 
@@ -232,6 +237,7 @@ func TestClustersProposeDeterministic(t *testing.T) {
 // TestClustersIncrementalAttach: a newly confirmed fact attaches to the cluster of
 // its nearest neighbor.
 func TestClustersIncrementalAttach(t *testing.T) {
+	t.Parallel()
 	home, store := memoryTestHome(t)
 	dbIDs, _ := seedClusterCorpus(t, store)
 	ctx := context.Background()
@@ -266,6 +272,7 @@ func TestClustersIncrementalAttach(t *testing.T) {
 }
 
 func TestClustersListHierarchyAndAggregateCounts(t *testing.T) {
+	t.Parallel()
 	home, store := memoryTestHome(t)
 	dbIDs, netIDs := seedClusterCorpus(t, store)
 	ctx := context.Background()
@@ -307,6 +314,7 @@ func TestClustersListHierarchyAndAggregateCounts(t *testing.T) {
 }
 
 func TestClusterPlanIncludesSplitsAndDissolves(t *testing.T) {
+	t.Parallel()
 	const (
 		parentID = int64(1)
 		childAID = int64(1<<52 + 31)
@@ -339,6 +347,7 @@ func TestClusterPlanIncludesSplitsAndDissolves(t *testing.T) {
 }
 
 func TestClusterPlanDeepHierarchyCountsAndLegacyMigration(t *testing.T) {
+	t.Parallel()
 	const (
 		legacyParent = int64(1)
 		legacyA      = int64(1<<52 + 61)
@@ -384,6 +393,7 @@ func TestClusterPlanDeepHierarchyCountsAndLegacyMigration(t *testing.T) {
 }
 
 func TestClusterOwnerRenameSurvivesRegrouping(t *testing.T) {
+	t.Parallel()
 	previous := []db.MemoryCluster{
 		{ClusterID: 1, MedoidID: 7, LabelOverride: "owner-root"},
 		{ClusterID: int64(1<<51 + 77), MedoidID: 9, LabelOverride: "owner-synthetic"},
@@ -406,6 +416,7 @@ func TestClusterOwnerRenameSurvivesRegrouping(t *testing.T) {
 }
 
 func TestClustersIncrementalAttachTargetsLeaf(t *testing.T) {
+	t.Parallel()
 	home, store := memoryTestHome(t)
 	dbIDs, netIDs := seedClusterCorpus(t, store)
 	ctx := context.Background()

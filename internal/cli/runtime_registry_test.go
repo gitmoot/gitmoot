@@ -26,6 +26,7 @@ func writeCLIConfig(t *testing.T, body string) config.Paths {
 // TestResolveRuntimeRegistryDefaultByteIdentical proves that with no [runtimes.*]
 // section the resolved registry equals the built-in one.
 func TestResolveRuntimeRegistryDefaultByteIdentical(t *testing.T) {
+	t.Parallel()
 	paths := writeCLIConfig(t, "[paths]\ndatabase = \"x\"\n")
 	got, err := resolveRuntimeRegistry(paths)
 	if err != nil {
@@ -39,6 +40,7 @@ func TestResolveRuntimeRegistryDefaultByteIdentical(t *testing.T) {
 // TestResolveRuntimeRegistryMissingFile proves a missing config file resolves to
 // the built-in registry rather than erroring.
 func TestResolveRuntimeRegistryMissingFile(t *testing.T) {
+	t.Parallel()
 	paths := config.Paths{ConfigFile: filepath.Join(t.TempDir(), "nope.toml")}
 	got, err := resolveRuntimeRegistry(paths)
 	if err != nil {
@@ -52,6 +54,7 @@ func TestResolveRuntimeRegistryMissingFile(t *testing.T) {
 // TestResolveRuntimeRegistryOverride proves config overrides are applied on top of
 // the built-ins.
 func TestResolveRuntimeRegistryOverride(t *testing.T) {
+	t.Parallel()
 	paths := writeCLIConfig(t, `
 [runtimes.codex]
 default_model = "gpt-5.5-codex"
@@ -80,6 +83,7 @@ models = ["gpt-5.5-codex"]
 // TestResolveRuntimeRegistryUnknownErrors proves an unknown runtime name in config
 // surfaces the moat-preserving error.
 func TestResolveRuntimeRegistryUnknownErrors(t *testing.T) {
+	t.Parallel()
 	paths := writeCLIConfig(t, "[runtimes.gpt6]\ndefault_model = \"x\"\n")
 	if _, err := resolveRuntimeRegistry(paths); err == nil {
 		t.Fatal("expected error for unknown runtime")
@@ -88,6 +92,7 @@ func TestResolveRuntimeRegistryUnknownErrors(t *testing.T) {
 
 // TestRunRuntimeListText covers the human table output on the default registry.
 func TestRunRuntimeListText(t *testing.T) {
+	t.Parallel()
 	paths := writeCLIConfig(t, "[paths]\ndatabase = \"x\"\n")
 	var stdout, stderr bytes.Buffer
 	code := runRuntimeList([]string{"--home", homeFromConfig(t, paths)}, &stdout, &stderr)
@@ -107,6 +112,7 @@ func TestRunRuntimeListText(t *testing.T) {
 
 // TestRunRuntimeListJSON covers the JSON output shape.
 func TestRunRuntimeListJSON(t *testing.T) {
+	t.Parallel()
 	paths := writeCLIConfig(t, "[runtimes.codex]\ndefault_effort = \"high\"\n")
 	var stdout, stderr bytes.Buffer
 	code := runRuntimeList([]string{"--home", homeFromConfig(t, paths), "--json"}, &stdout, &stderr)
@@ -131,6 +137,7 @@ func TestRunRuntimeListJSON(t *testing.T) {
 // TestRunRuntimeListUnknownRuntimeExits proves the command exits non-zero on a bad
 // override.
 func TestRunRuntimeListUnknownRuntimeExits(t *testing.T) {
+	t.Parallel()
 	paths := writeCLIConfig(t, "[runtimes.gpt6]\ndefault_model = \"x\"\n")
 	var stdout, stderr bytes.Buffer
 	code := runRuntimeList([]string{"--home", homeFromConfig(t, paths)}, &stdout, &stderr)
@@ -146,6 +153,7 @@ func TestRunRuntimeListUnknownRuntimeExits(t *testing.T) {
 // (#652) returns the configured [runtimes.<rt>].default_model for a runtime, and
 // resolves NOTHING (byte-identical) for a runtime with no override.
 func TestRuntimeDefaultModelResolverReadsConfig(t *testing.T) {
+	t.Parallel()
 	src := writeCLIConfig(t, "[runtimes.codex]\ndefault_model = \"gpt-5.5\"\n")
 	home := homeFromConfig(t, src)
 	resolve := runtimeDefaultModelResolver(home)
@@ -159,6 +167,7 @@ func TestRuntimeDefaultModelResolverReadsConfig(t *testing.T) {
 }
 
 func TestRuntimeDefaultEffortResolverReadsConfig(t *testing.T) {
+	t.Parallel()
 	src := writeCLIConfig(t, "[runtimes.codex]\ndefault_effort = \"high\"\n")
 	home := homeFromConfig(t, src)
 	resolve := runtimeDefaultEffortResolver(home)
@@ -171,6 +180,7 @@ func TestRuntimeDefaultEffortResolverReadsConfig(t *testing.T) {
 }
 
 func TestRuntimeDefaultEffortResolverAbsentConfig(t *testing.T) {
+	t.Parallel()
 	if got := runtimeDefaultEffortResolver(t.TempDir())(runtime.CodexRuntime); got != "" {
 		t.Fatalf("missing-config resolve(codex) = %q, want empty", got)
 	}
@@ -183,6 +193,7 @@ func TestRuntimeDefaultEffortResolverAbsentConfig(t *testing.T) {
 // contract: with no config file (fresh box), an empty home, or an unknown runtime,
 // the hook resolves "" so delivery forces no model — byte-identical to before #652.
 func TestRuntimeDefaultModelResolverAbsentConfigByteIdentical(t *testing.T) {
+	t.Parallel()
 	missingHome := t.TempDir() // no config.toml written anywhere under it
 	if got := runtimeDefaultModelResolver(missingHome)(runtime.CodexRuntime); got != "" {
 		t.Fatalf("missing-config resolve(codex) = %q, want empty", got)
@@ -202,6 +213,7 @@ func TestRuntimeDefaultModelResolverAbsentConfigByteIdentical(t *testing.T) {
 // codex override — a single bad section is skipped, not a whole-config failure that
 // silently drops every valid override at delivery.
 func TestRuntimeDefaultModelResolverSkipsBadSection(t *testing.T) {
+	t.Parallel()
 	src := writeCLIConfig(t, `
 [runtimes.codex]
 default_model = "gpt-5.5"
@@ -226,6 +238,7 @@ default_model = "typo-runtime"
 // would reject it, but the delivery resolver skips only that section and keeps a
 // valid sibling's default_model.
 func TestRuntimeDefaultModelResolverSkipsBadCapabilitySection(t *testing.T) {
+	t.Parallel()
 	src := writeCLIConfig(t, `
 [runtimes.codex]
 default_model = "gpt-5.5"

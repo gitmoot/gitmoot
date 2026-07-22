@@ -40,6 +40,7 @@ func agentsModel(t *testing.T, deps Deps, snap Snapshot) Model {
 // agent's whole template group, surfaces the active-job skip heads-up, calls
 // DeleteAgents with the group's names, and reports the deleted/skipped result.
 func TestAgentGroupDeleteFlow(t *testing.T) {
+	t.Parallel()
 	snap := agentsSnapshot()
 	snap.Agents = append(snap.Agents, Agent{Name: "planner-2", Runtime: "claude", TemplateID: "planner-tpl"})
 	snap.JobRows = append(snap.JobRows, JobRow{ID: "jx", Agent: "planner", Type: "ask", State: "running"})
@@ -84,6 +85,7 @@ func TestAgentGroupDeleteFlow(t *testing.T) {
 // template-less agent opens the single-agent delete (not a bulk delete of the
 // whole heterogeneous "Standalone agents" catch-all).
 func TestAgentGroupDeleteStandaloneFallsBackToSingle(t *testing.T) {
+	t.Parallel()
 	snap := agentsSnapshot()
 	snap.Agents = append(snap.Agents, Agent{Name: "drifter", Runtime: "codex"}) // TemplateID ""
 	called := false
@@ -110,6 +112,7 @@ func TestAgentGroupDeleteStandaloneFallsBackToSingle(t *testing.T) {
 // still closes the overlay, reports the committed deletes, and surfaces the error
 // (so the stale list/retry-wedge can't happen).
 func TestAgentGroupDeletePartialErrorReported(t *testing.T) {
+	t.Parallel()
 	snap := agentsSnapshot()
 	snap.Agents = append(snap.Agents, Agent{Name: "planner-2", Runtime: "claude", TemplateID: "planner-tpl"})
 	deps := Deps{DeleteAgents: func(names []string) (int, []string, error) {
@@ -135,6 +138,7 @@ func TestAgentGroupDeletePartialErrorReported(t *testing.T) {
 
 // TestAgentGroupDeleteNoDepInert verifies X is inert without a DeleteAgents dep.
 func TestAgentGroupDeleteNoDepInert(t *testing.T) {
+	t.Parallel()
 	m := agentsModel(t, Deps{}, agentsSnapshot())
 	next, _ := m.Update(key("X"))
 	m = next.(Model)
@@ -147,6 +151,7 @@ func TestAgentGroupDeleteNoDepInert(t *testing.T) {
 // showing many training agents) windows around the cursor so the selection stays
 // visible and the scroll markers appear — rather than overflowing unscrollably.
 func TestAgentsListWindowsLongList(t *testing.T) {
+	t.Parallel()
 	snap := Snapshot{Daemon: Daemon{Running: true}}
 	for i := 0; i < 80; i++ {
 		snap.Agents = append(snap.Agents, Agent{
@@ -190,6 +195,7 @@ func TestAgentsListWindowsLongList(t *testing.T) {
 // many live sessions belong to hidden training agents (so the LIVE column isn't
 // silently empty when all live work is under hidden agents).
 func TestAgentsHiddenLineShowsLiveCount(t *testing.T) {
+	t.Parallel()
 	snap := agentsSnapshot()
 	snap.Agents = append(snap.Agents, Agent{Name: "skillopt-generator", Runtime: "codex"})
 	snap.Sessions = []Session{
@@ -209,6 +215,7 @@ func TestAgentsHiddenLineShowsLiveCount(t *testing.T) {
 // TestAgentsShowAllToggle verifies the 'a' key un-hides the training agents (and
 // hides them again), and that their LIVE counts then appear.
 func TestAgentsShowAllToggle(t *testing.T) {
+	t.Parallel()
 	snap := agentsSnapshot()
 	snap.Agents = append(snap.Agents, Agent{Name: "skillopt-generator", Runtime: "codex"})
 	snap.Sessions = []Session{
@@ -237,6 +244,7 @@ func TestAgentsShowAllToggle(t *testing.T) {
 }
 
 func TestAgentsPageHidesTrainingAgents(t *testing.T) {
+	t.Parallel()
 	snap := agentsSnapshot()
 	// Add internal training plumbing alongside the real agents.
 	snap.Agents = append(snap.Agents,
@@ -280,6 +288,7 @@ func TestAgentsPageHidesTrainingAgents(t *testing.T) {
 // Ephemeral agents are not training plumbing, so they must not be folded into
 // the "training agents hidden (skillopt-*)" count line.
 func TestAgentsPageHidesEphemeralAgents(t *testing.T) {
+	t.Parallel()
 	snap := agentsSnapshot()
 	snap.Agents = append(snap.Agents,
 		Agent{Name: "fixit-ephemeral-abc", Runtime: "claude", TemplateID: "planner-tpl"},
@@ -322,6 +331,7 @@ func TestAgentsPageHidesEphemeralAgents(t *testing.T) {
 }
 
 func TestAgentsPageGroupsByTemplate(t *testing.T) {
+	t.Parallel()
 	snap := agentsSnapshot()
 	// A second agent on planner-tpl (stays in the planner-tpl group) and one
 	// with no template (its own "Standalone agents (custom prompt)" group).
@@ -370,6 +380,7 @@ func TestAgentsPageGroupsByTemplate(t *testing.T) {
 // carries a "temp:" prefix) and that the agent list shows the per-agent live
 // count, while another agent's sessions don't leak.
 func TestAgentDetailShowsLiveSessions(t *testing.T) {
+	t.Parallel()
 	snap := agentsSnapshot()
 	snap.Sessions = []Session{
 		{Name: "claude-bg-9f2", Type: "planner", Runtime: "claude", Repo: "o/r", State: "running", Expires: "2026-06-18T10:09:00Z"},
@@ -405,6 +416,7 @@ func TestAgentDetailShowsLiveSessions(t *testing.T) {
 
 // TestAgentDetailNoLiveSessions shows the empty state when an agent has none.
 func TestAgentDetailNoLiveSessions(t *testing.T) {
+	t.Parallel()
 	m := agentsModel(t, Deps{}, agentsSnapshot()) // snapshot has no Sessions
 	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = next.(Model)
@@ -423,6 +435,7 @@ func TestAgentDetailNoLiveSessions(t *testing.T) {
 }
 
 func TestAgentDetailRendersVersionsAndJobs(t *testing.T) {
+	t.Parallel()
 	var asked string
 	deps := Deps{TemplateVersions: func(templateID string) ([]TemplateVersion, error) {
 		asked = templateID
@@ -482,6 +495,7 @@ func openAgentVersionDetail(t *testing.T, deps Deps) Model {
 }
 
 func TestAgentVersionPreviewLoadsAndRenders(t *testing.T) {
+	t.Parallel()
 	var asked string
 	deps := Deps{TemplateVersionContent: func(versionID string) (string, error) {
 		asked = versionID
@@ -517,6 +531,7 @@ func TestAgentVersionPreviewLoadsAndRenders(t *testing.T) {
 // are selectable; enter on one opens its job detail, and esc returns to the agent
 // detail (not the agents list).
 func TestAgentDetailRecentJobOpensAndReturns(t *testing.T) {
+	t.Parallel()
 	deps := Deps{TemplateVersions: func(string) ([]TemplateVersion, error) { return nil, nil }}
 	m := agentsModel(t, deps, agentsSnapshot()) // cursor 0 = planner (has job-1)
 	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -547,6 +562,7 @@ func TestAgentDetailRecentJobOpensAndReturns(t *testing.T) {
 // land back on the job detail (and then the agent detail) rather than dropping
 // to the agents list.
 func TestAgentDetailJobActionsReturnToDetail(t *testing.T) {
+	t.Parallel()
 	retried := ""
 	deps := Deps{
 		TemplateVersions: func(string) ([]TemplateVersion, error) { return nil, nil },
@@ -640,6 +656,7 @@ func TestAgentDetailJobActionsReturnToDetail(t *testing.T) {
 // leak: scrolling a job opened from the agent detail and pressing esc must land
 // the agent detail back at the top (showing its header), not stuck scrolled.
 func TestAgentDetailScrollResetsOnReturn(t *testing.T) {
+	t.Parallel()
 	// Many versions make the agent detail tall enough that a stale scroll offset
 	// would NOT be auto-clamped to zero on return — so this fails without the fix.
 	versions := make([]TemplateVersion, 30)
@@ -687,6 +704,7 @@ func TestAgentDetailScrollResetsOnReturn(t *testing.T) {
 // TestAgentDetailRecentJobsWindow guards that a busy agent's recent-jobs list
 // windows around the cursor so the detail stays scrollable.
 func TestAgentDetailRecentJobsWindow(t *testing.T) {
+	t.Parallel()
 	snap := Snapshot{Daemon: Daemon{Running: true}, Agents: []Agent{{Name: "busy", Runtime: "codex"}}}
 	for i := 0; i < 40; i++ {
 		snap.JobRows = append(snap.JobRows, JobRow{ID: "j-" + strconv.Itoa(i), Agent: "busy", Type: "ask", State: "succeeded"})
@@ -719,6 +737,7 @@ func TestAgentDetailRecentJobsWindow(t *testing.T) {
 }
 
 func TestAgentVersionPreviewEmptyContent(t *testing.T) {
+	t.Parallel()
 	deps := Deps{TemplateVersionContent: func(string) (string, error) { return "   \n", nil }}
 	m := openAgentVersionDetail(t, deps)
 	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -731,6 +750,7 @@ func TestAgentVersionPreviewEmptyContent(t *testing.T) {
 }
 
 func TestAgentVersionPreviewCachesPerVersion(t *testing.T) {
+	t.Parallel()
 	calls := map[string]int{}
 	deps := Deps{TemplateVersionContent: func(versionID string) (string, error) {
 		calls[versionID]++
@@ -768,6 +788,7 @@ func TestAgentVersionPreviewCachesPerVersion(t *testing.T) {
 }
 
 func TestAgentSwitchRuntimeFlow(t *testing.T) {
+	t.Parallel()
 	var got []string
 	deps := Deps{SetAgentRuntime: func(name, runtime string) error {
 		got = []string{name, runtime}
@@ -802,6 +823,7 @@ func TestAgentSwitchRuntimeFlow(t *testing.T) {
 }
 
 func TestAgentSwitchRuntimeNoChangeCloses(t *testing.T) {
+	t.Parallel()
 	deps := Deps{SetAgentRuntime: func(string, string) error {
 		t.Fatal("picking the current runtime must not call SetAgentRuntime")
 		return nil
@@ -821,6 +843,7 @@ func TestAgentSwitchRuntimeNoChangeCloses(t *testing.T) {
 }
 
 func TestAgentSwitchRuntimeErrorStaysOpen(t *testing.T) {
+	t.Parallel()
 	deps := Deps{SetAgentRuntime: func(string, string) error {
 		return errors.New("unknown runtime")
 	}}
@@ -842,6 +865,7 @@ func TestAgentSwitchRuntimeErrorStaysOpen(t *testing.T) {
 }
 
 func TestAgentCustomPromptRoutesToEditor(t *testing.T) {
+	t.Parallel()
 	var seededWith string
 	var createdPlain bool
 	deps := Deps{
@@ -874,6 +898,7 @@ func TestAgentCustomPromptRoutesToEditor(t *testing.T) {
 }
 
 func TestAgentCustomPromptCreatesFromContent(t *testing.T) {
+	t.Parallel()
 	var got []string
 	deps := Deps{
 		EditAgentPrompt: func(string) tea.Cmd {
@@ -905,6 +930,7 @@ func TestAgentCustomPromptCreatesFromContent(t *testing.T) {
 }
 
 func TestAgentCustomPromptWarnsWithoutContract(t *testing.T) {
+	t.Parallel()
 	created := false
 	deps := Deps{
 		EditAgentPrompt: func(string) tea.Cmd {
@@ -934,6 +960,7 @@ func TestAgentCustomPromptWarnsWithoutContract(t *testing.T) {
 }
 
 func TestAgentCustomPromptEditorErrorSurfaces(t *testing.T) {
+	t.Parallel()
 	deps := Deps{
 		EditAgentPrompt: func(string) tea.Cmd {
 			return func() tea.Msg { return AgentPromptEditedMsg{Err: errors.New("editor blew up")} }
@@ -956,6 +983,7 @@ func TestAgentCustomPromptEditorErrorSurfaces(t *testing.T) {
 }
 
 func TestAgentCreateFlowRunsCreateAgent(t *testing.T) {
+	t.Parallel()
 	var created []string
 	form := NewAgentCreateForm(newFakeStore(), []Choice{{Value: "planner-tpl", Label: "planner"}})
 	deps := Deps{
@@ -990,6 +1018,7 @@ func TestAgentCreateFlowRunsCreateAgent(t *testing.T) {
 }
 
 func TestAgentCreateAbortedFormDoesNothing(t *testing.T) {
+	t.Parallel()
 	deps := Deps{CreateAgent: func(name, runtime, template string) error {
 		t.Fatal("aborted form must not create")
 		return nil
@@ -1009,6 +1038,7 @@ func TestAgentCreateAbortedFormDoesNothing(t *testing.T) {
 }
 
 func TestAgentCreateErrorRendersInline(t *testing.T) {
+	t.Parallel()
 	deps := Deps{CreateAgent: func(name, runtime, template string) error {
 		return errors.New("agent name already registered")
 	}}
@@ -1023,6 +1053,7 @@ func TestAgentCreateErrorRendersInline(t *testing.T) {
 }
 
 func TestAgentDeleteGuardKeepsConfirmOpen(t *testing.T) {
+	t.Parallel()
 	deps := Deps{DeleteAgent: func(name string) error {
 		return errors.New("agent planner has queued or running jobs")
 	}}
@@ -1045,6 +1076,7 @@ func TestAgentDeleteGuardKeepsConfirmOpen(t *testing.T) {
 }
 
 func TestAgentDeleteSuccess(t *testing.T) {
+	t.Parallel()
 	var deleted string
 	deps := Deps{DeleteAgent: func(name string) error { deleted = name; return nil }}
 	m := agentsModel(t, deps, agentsSnapshot())
@@ -1065,6 +1097,7 @@ func TestAgentDeleteSuccess(t *testing.T) {
 }
 
 func TestAgentRevertPicksSupersededVersion(t *testing.T) {
+	t.Parallel()
 	var gotTemplate, gotVersion string
 	deps := Deps{
 		TemplateVersions: func(templateID string) ([]TemplateVersion, error) {
@@ -1110,6 +1143,7 @@ func TestAgentRevertPicksSupersededVersion(t *testing.T) {
 }
 
 func TestAgentRevertUnavailableWithoutSuperseded(t *testing.T) {
+	t.Parallel()
 	deps := Deps{TemplateVersions: func(templateID string) ([]TemplateVersion, error) {
 		return []TemplateVersion{{ID: "v1-id", Number: 1, State: "current"}}, nil
 	}}
@@ -1126,6 +1160,7 @@ func TestAgentRevertUnavailableWithoutSuperseded(t *testing.T) {
 }
 
 func TestAgentOptimizeFlowOpensPhaseView(t *testing.T) {
+	t.Parallel()
 	var startedTemplate string
 	var startedValues map[string]string
 	pushedTrain := ""
@@ -1199,6 +1234,7 @@ func TestAgentOptimizeFlowOpensPhaseView(t *testing.T) {
 }
 
 func TestAgentOptimizeErrorRendersInline(t *testing.T) {
+	t.Parallel()
 	deps := Deps{
 		StartOptimize: func(templateID string, values map[string]string) (string, error) {
 			return "", errors.New("train start failed: no items")
@@ -1215,6 +1251,7 @@ func TestAgentOptimizeErrorRendersInline(t *testing.T) {
 }
 
 func TestAgentOptimizeAbortedFormDoesNothing(t *testing.T) {
+	t.Parallel()
 	deps := Deps{
 		StartOptimize: func(templateID string, values map[string]string) (string, error) {
 			t.Fatal("aborted form must not start a session")
@@ -1230,6 +1267,7 @@ func TestAgentOptimizeAbortedFormDoesNothing(t *testing.T) {
 }
 
 func TestAgentCreateFormCompletionPopsWithResult(t *testing.T) {
+	t.Parallel()
 	form := NewAgentCreateForm(newFakeStore(), []Choice{{Value: "planner-tpl", Label: "planner"}})
 	var model tea.Model = form
 	step := func(msg tea.Msg) tea.Cmd {
@@ -1270,6 +1308,7 @@ func TestAgentCreateFormCompletionPopsWithResult(t *testing.T) {
 }
 
 func TestAgentCreateFormExternalFinishPopsNotQuits(t *testing.T) {
+	t.Parallel()
 	form := NewAgentCreateForm(newFakeStore(), []Choice{{Value: "planner-tpl", Label: "planner"}})
 	var model tea.Model = form
 	step := func(msg tea.Msg) tea.Cmd {
@@ -1321,6 +1360,7 @@ func TestAgentCreateFormExternalFinishPopsNotQuits(t *testing.T) {
 }
 
 func TestAgentCreateFormAbortPopsAborted(t *testing.T) {
+	t.Parallel()
 	form := NewAgentCreateForm(newFakeStore(), []Choice{{Value: "planner-tpl", Label: "planner"}})
 	next, _ := form.Update(initMsg{})
 	next, cmd := next.Update(tea.KeyMsg{Type: tea.KeyEsc})

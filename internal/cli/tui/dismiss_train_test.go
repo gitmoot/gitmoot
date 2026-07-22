@@ -12,6 +12,7 @@ import (
 )
 
 func TestDismissConfirmYes(t *testing.T) {
+	t.Parallel()
 	var dismissed string
 	deps := Deps{
 		Load:    func() (Snapshot, error) { return promptSnap(choicePrompt()), nil },
@@ -39,6 +40,7 @@ func TestDismissConfirmYes(t *testing.T) {
 }
 
 func TestDismissConfirmCancel(t *testing.T) {
+	t.Parallel()
 	called := false
 	deps := Deps{
 		Load:    func() (Snapshot, error) { return promptSnap(choicePrompt()), nil },
@@ -60,6 +62,7 @@ func TestDismissConfirmCancel(t *testing.T) {
 }
 
 func TestDismissNotFoundTreatedAsSuccess(t *testing.T) {
+	t.Parallel()
 	deps := Deps{
 		Load: func() (Snapshot, error) { return promptSnap(choicePrompt()), nil },
 		Dismiss: func(id string) error {
@@ -83,6 +86,7 @@ func TestDismissNotFoundTreatedAsSuccess(t *testing.T) {
 }
 
 func TestDismissRealErrorKeepsOverlay(t *testing.T) {
+	t.Parallel()
 	deps := Deps{
 		Load:    func() (Snapshot, error) { return promptSnap(choicePrompt()), nil },
 		Dismiss: func(id string) error { return errors.New("database is locked") },
@@ -126,6 +130,7 @@ func trainsModel(t *testing.T) Model {
 }
 
 func TestTrainDetailShowsSessionLocksOnly(t *testing.T) {
+	t.Parallel()
 	m := trainsModel(t)
 	if pages[m.selected].page != pageTrains {
 		t.Fatalf("expected to be on the Trains page")
@@ -152,6 +157,7 @@ func TestTrainDetailShowsSessionLocksOnly(t *testing.T) {
 }
 
 func TestTrainLocksMatchWholeSegmentNotPrefix(t *testing.T) {
+	t.Parallel()
 	locks := []ResourceLock{
 		{Key: "generation:train-a"},
 		{Key: "generation:train-aaa"},
@@ -169,6 +175,7 @@ func TestTrainLocksMatchWholeSegmentNotPrefix(t *testing.T) {
 }
 
 func TestTrainCursorClampedOnRefresh(t *testing.T) {
+	t.Parallel()
 	m := trainsModel(t)
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
 	m = next.(Model)
@@ -183,6 +190,7 @@ func TestTrainCursorClampedOnRefresh(t *testing.T) {
 }
 
 func TestTrainStatusCategory(t *testing.T) {
+	t.Parallel()
 	cases := map[string]int{
 		"request_confirmed":                trainCatActive,
 		"items_ready":                      trainCatActive,
@@ -208,6 +216,7 @@ func TestTrainStatusCategory(t *testing.T) {
 }
 
 func TestTrainLineageBase(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		id       string
 		wantBase string
@@ -232,6 +241,7 @@ func TestTrainLineageBase(t *testing.T) {
 // TestTrainsListGroupsAndCollapses renders a mixed list and asserts the section
 // headers, the collapsed lineage parent line, and that flat sessions stay flat.
 func TestTrainsListGroupsAndCollapses(t *testing.T) {
+	t.Parallel()
 	snap := Snapshot{
 		Daemon: Daemon{Running: true},
 		Trains: []TrainSession{
@@ -286,6 +296,7 @@ func TestTrainsListGroupsAndCollapses(t *testing.T) {
 // is selected first because the Active section renders before Done, so ↑/↓ always
 // move the highlight to the visually adjacent row.
 func TestTrainCursorFollowsDisplayOrder(t *testing.T) {
+	t.Parallel()
 	snap := Snapshot{
 		Daemon: Daemon{Running: true},
 		Trains: []TrainSession{
@@ -317,6 +328,7 @@ func TestTrainCursorFollowsDisplayOrder(t *testing.T) {
 // sessions are sub-grouped by repo (first-appearance order) with lineage
 // collapse inside each repo, and the cursor follows that display order.
 func TestTrainsGroupByRepoWithinSection(t *testing.T) {
+	t.Parallel()
 	snap := Snapshot{
 		Daemon: Daemon{Running: true},
 		Trains: []TrainSession{
@@ -355,6 +367,7 @@ func TestTrainsGroupByRepoWithinSection(t *testing.T) {
 // group (hiding its sessions and showing a [+] header) and that the collapsed
 // header is selectable so space re-expands it.
 func TestTrainsCollapseRepoFoldsSessions(t *testing.T) {
+	t.Parallel()
 	snap := Snapshot{
 		Daemon: Daemon{Running: true},
 		Trains: []TrainSession{
@@ -391,6 +404,7 @@ func TestTrainsCollapseRepoFoldsSessions(t *testing.T) {
 // TestTrainsCollapsedByDefault verifies the live default (CollapseGroupsByDefault)
 // folds repo groups on first show, and space on a [+] header expands one.
 func TestTrainsCollapsedByDefault(t *testing.T) {
+	t.Parallel()
 	snap := Snapshot{
 		Daemon: Daemon{Running: true},
 		Trains: []TrainSession{{ID: "s1", Phase: "items_ready", Repo: "o/alpha"}},

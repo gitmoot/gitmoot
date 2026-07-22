@@ -16,6 +16,7 @@ import (
 )
 
 func TestPipelineAddEnabledTriggerPersistsPendingBinding(t *testing.T) {
+	t.Parallel()
 	home := t.TempDir()
 	specFile := writeSpec(t, "name: mail-flow\nrepo: owner/repo\ntrigger:\n  kind: email\nstages:\n  - {id: run, cmd: echo ok}\n")
 	var stdout, stderr bytes.Buffer
@@ -73,6 +74,7 @@ func writeSpec(t *testing.T, content string) string {
 // through Run() with an isolated home, asserting the registry round-trip and the
 // hidden-runner-agent behavior.
 func TestPipelineAddListShowEnableDisableRemove(t *testing.T) {
+	t.Parallel()
 	home := t.TempDir()
 	run := func(args ...string) (string, string, int) {
 		var stdout, stderr bytes.Buffer
@@ -145,6 +147,7 @@ func TestPipelineAddListShowEnableDisableRemove(t *testing.T) {
 }
 
 func TestPipelineDisplayMode(t *testing.T) {
+	t.Parallel()
 	triggerSpec := "name: mail\nrepo: owner/repo\ntrigger: {kind: email}\nstages:\n  - {id: run, cmd: echo}\n"
 	pipelineTriggerSpec := "name: downstream\nrepo: owner/downstream\ntrigger: {kind: pipeline, pipeline: upstream}\nstages:\n  - {id: run, cmd: echo}\n"
 	scheduledSpec := "name: nightly\nschedule: {interval: 24h}\nstages:\n  - {id: run, cmd: echo}\n"
@@ -164,6 +167,7 @@ func TestPipelineDisplayMode(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			if got := pipelineDisplayMode(tt.record); got != tt.want {
 				t.Fatalf("pipelineDisplayMode() = %q, want %q", got, tt.want)
 			}
@@ -175,6 +179,7 @@ func TestPipelineDisplayMode(t *testing.T) {
 }
 
 func TestResolvedPipelineGroup(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name        string
 		record      db.Pipeline
@@ -196,6 +201,7 @@ func TestResolvedPipelineGroup(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			got, defaulted := resolvedPipelineGroup(tt.record)
 			if got != tt.want || defaulted != tt.wantDefault {
 				t.Fatalf("resolvedPipelineGroup() = %q,%v, want %q,%v", got, defaulted, tt.want, tt.wantDefault)
@@ -205,6 +211,7 @@ func TestResolvedPipelineGroup(t *testing.T) {
 }
 
 func TestPipelineShowSelfDescribingStagesAndTriggerListInterval(t *testing.T) {
+	t.Parallel()
 	home := t.TempDir()
 	if err := withStore(home, func(store *db.Store) error {
 		return store.UpsertAgent(context.Background(), db.Agent{
@@ -379,6 +386,7 @@ stages:
 }
 
 func TestPipelineShowJSON(t *testing.T) {
+	t.Parallel()
 	home := t.TempDir()
 	spec := writeSpec(t, testPipelineSpec)
 	if code := Run([]string{"pipeline", "add", spec, "--home", home}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
@@ -411,6 +419,7 @@ func TestPipelineShowJSON(t *testing.T) {
 }
 
 func TestPipelineListJSON(t *testing.T) {
+	t.Parallel()
 	home := t.TempDir()
 	spec := writeSpec(t, testPipelineSpec)
 	if code := Run([]string{"pipeline", "add", spec, "--enable", "--home", home}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
@@ -435,6 +444,7 @@ func TestPipelineListJSON(t *testing.T) {
 }
 
 func TestPipelineValidationExitCodes(t *testing.T) {
+	t.Parallel()
 	home := t.TempDir()
 	run := func(args ...string) int {
 		return Run(append(args, "--home", home), &bytes.Buffer{}, &bytes.Buffer{})
@@ -465,10 +475,12 @@ func TestPipelineValidationExitCodes(t *testing.T) {
 }
 
 func TestPipelineAddTriggerCycleDetection(t *testing.T) {
+	t.Parallel()
 	triggerSpec := func(name, upstream string) string {
 		return fmt.Sprintf("name: %s\nrepo: owner/%s\ntrigger: {kind: pipeline, pipeline: %s}\nstages: [{id: run, cmd: echo}]\n", name, name, upstream)
 	}
 	t.Run("cycle rejected and dropping edge unblocks", func(t *testing.T) {
+		t.Parallel()
 		home := t.TempDir()
 		a := writeSpec(t, triggerSpec("A", "B"))
 		if code := Run([]string{"pipeline", "add", a, "--home", home}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
@@ -492,6 +504,7 @@ func TestPipelineAddTriggerCycleDetection(t *testing.T) {
 	})
 
 	t.Run("chain accepted", func(t *testing.T) {
+		t.Parallel()
 		home := t.TempDir()
 		for _, edge := range [][2]string{{"A", "B"}, {"B", "C"}} {
 			spec := writeSpec(t, triggerSpec(edge[0], edge[1]))
@@ -506,6 +519,7 @@ func TestPipelineAddTriggerCycleDetection(t *testing.T) {
 // TestPipelineRunnerNameCollisionRefused proves `pipeline add` refuses to clobber
 // a pre-existing non-shell agent occupying the runner name.
 func TestPipelineRunnerNameCollisionRefused(t *testing.T) {
+	t.Parallel()
 	home := t.TempDir()
 	// Pre-seed a real codex agent named like the runner would be.
 	if err := withStore(home, func(store *db.Store) error {
@@ -533,6 +547,7 @@ func TestPipelineRunnerNameCollisionRefused(t *testing.T) {
 // Reviewer-required pins: hybrid list value, multibyte-safe previews, and the
 // orchestrate/produce badges (previously untested).
 func TestPipelineListIntervalHybridKeepsInterval(t *testing.T) {
+	t.Parallel()
 	hybrid := db.Pipeline{SpecYAML: "name: both\nrepo: owner/repo\ntrigger: {kind: email}\nschedule: {interval: 6h}\nstages:\n  - {id: run, cmd: echo}\n", Interval: "6h"}
 	if got := pipelineListInterval(hybrid); got != "email+6h" {
 		t.Fatalf("hybrid list interval = %q, want %q", got, "email+6h")
@@ -551,6 +566,7 @@ func TestPipelineListIntervalHybridKeepsInterval(t *testing.T) {
 }
 
 func TestPipelinePreviewMultibyteSafe(t *testing.T) {
+	t.Parallel()
 	prompt := strings.Repeat("\u65e5\u672c\u8a9e\U0001f680", 60) // 240 runes of multibyte text
 	preview := pipelinePromptPreview(prompt)
 	if !utf8.ValidString(preview) {
@@ -577,6 +593,7 @@ func TestPipelinePreviewMultibyteSafe(t *testing.T) {
 }
 
 func TestPipelineStageBadgesOrchestrateAndProduce(t *testing.T) {
+	t.Parallel()
 	orchestrate := pipeline.Stage{ID: "coord", Agent: "lead", Action: "ask", Prompt: "run the tree", Orchestrate: true}
 	if got := pipelineStageBadge(orchestrate); !strings.Contains(got, "ORCHESTRATE") {
 		t.Fatalf("orchestrate badge = %q", got)

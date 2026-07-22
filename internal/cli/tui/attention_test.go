@@ -36,6 +36,7 @@ func attentionModel(t *testing.T, deps Deps, snap Snapshot) Model {
 func key(s string) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)} }
 
 func TestAnswerChoiceHappyPath(t *testing.T) {
+	t.Parallel()
 	var gotID, gotVal string
 	deps := Deps{
 		Load:   func() (Snapshot, error) { return promptSnap(choicePrompt()), nil },
@@ -71,6 +72,7 @@ func TestAnswerChoiceHappyPath(t *testing.T) {
 }
 
 func TestAnswerTextHappyPath(t *testing.T) {
+	t.Parallel()
 	var gotVal string
 	deps := Deps{
 		Load:   func() (Snapshot, error) { return promptSnap(textPrompt()), nil },
@@ -101,6 +103,7 @@ func TestAnswerTextHappyPath(t *testing.T) {
 }
 
 func TestAnswerInvalidKeepsOverlay(t *testing.T) {
+	t.Parallel()
 	deps := Deps{
 		Load:   func() (Snapshot, error) { return promptSnap(choicePrompt()), nil },
 		Answer: func(id, value string) error { return errors.New("value \"drop\" is not one of the choices") },
@@ -125,6 +128,7 @@ func TestAnswerInvalidKeepsOverlay(t *testing.T) {
 }
 
 func TestAnswerCancelDoesNotMutate(t *testing.T) {
+	t.Parallel()
 	called := false
 	deps := Deps{
 		Load:   func() (Snapshot, error) { return promptSnap(choicePrompt()), nil },
@@ -145,6 +149,7 @@ func TestAnswerCancelDoesNotMutate(t *testing.T) {
 }
 
 func TestAnswerDoubleSubmitSuppressed(t *testing.T) {
+	t.Parallel()
 	count := 0
 	deps := Deps{
 		Load:   func() (Snapshot, error) { return promptSnap(choicePrompt()), nil },
@@ -175,6 +180,7 @@ func TestAnswerDoubleSubmitSuppressed(t *testing.T) {
 // PreflightFailed flag must still surface it on the Attention page (with its
 // reason), or the zero-child fan-out this issue set out to fix stays invisible.
 func TestAttentionSurfacesPreflightFailedCoordinator(t *testing.T) {
+	t.Parallel()
 	deps := Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }}
 	snap := Snapshot{
 		Daemon: Daemon{Running: true},
@@ -210,6 +216,7 @@ func TestAttentionSurfacesPreflightFailedCoordinator(t *testing.T) {
 }
 
 func TestAttentionGroupsUnderSectionHeaders(t *testing.T) {
+	t.Parallel()
 	deps := Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }}
 	snap := Snapshot{
 		Daemon:  Daemon{Running: true},
@@ -268,6 +275,7 @@ func TestAttentionGroupsUnderSectionHeaders(t *testing.T) {
 }
 
 func TestAttentionHeadersDoNotShiftCursor(t *testing.T) {
+	t.Parallel()
 	deps := Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }}
 	snap := Snapshot{
 		Daemon:  Daemon{Running: true},
@@ -299,6 +307,7 @@ func TestAttentionHeadersDoNotShiftCursor(t *testing.T) {
 }
 
 func TestAttentionLocksOnlyNoNeedsAttentionItems(t *testing.T) {
+	t.Parallel()
 	deps := Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }}
 	snap := Snapshot{
 		Daemon:        Daemon{Running: true},
@@ -319,6 +328,7 @@ func TestAttentionLocksOnlyNoNeedsAttentionItems(t *testing.T) {
 // at awaiting_human renders under an "Awaiting human" section with the resume
 // hint, even when there are no actionable prompts/jobs.
 func TestAttentionShowsAwaitingHuman(t *testing.T) {
+	t.Parallel()
 	deps := Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }}
 	snap := Snapshot{
 		Daemon:        Daemon{Running: true},
@@ -341,6 +351,7 @@ func TestAttentionShowsAwaitingHuman(t *testing.T) {
 // renders on the Attention page next to AwaitingHumanTask, with its version id,
 // template id, score, and the decide hint; zero candidates renders unchanged.
 func TestAttentionShowsPendingCandidates(t *testing.T) {
+	t.Parallel()
 	deps := Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }}
 	snap := Snapshot{
 		Daemon:            Daemon{Running: true},
@@ -362,6 +373,7 @@ func TestAttentionShowsPendingCandidates(t *testing.T) {
 }
 
 func TestAttentionCursorClampedOnRefresh(t *testing.T) {
+	t.Parallel()
 	deps := Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }}
 	m := attentionModel(t, deps, promptSnap(choicePrompt(), textPrompt()))
 	// Move cursor to the second prompt.
@@ -385,6 +397,7 @@ func TestAttentionCursorClampedOnRefresh(t *testing.T) {
 // repo sub-headers, with same-repo jobs contiguous, and the cursor walking them
 // in that display order.
 func TestAttentionGroupsJobsByRepo(t *testing.T) {
+	t.Parallel()
 	deps := Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }}
 	snap := Snapshot{
 		Daemon: Daemon{Running: true},
@@ -423,6 +436,7 @@ func TestAttentionGroupsJobsByRepo(t *testing.T) {
 // TestAttentionCollapseJobRepo verifies a job repo group folds with space and
 // re-expands, while prompts and other repos stay put.
 func TestAttentionCollapseJobRepo(t *testing.T) {
+	t.Parallel()
 	deps := Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }}
 	snap := Snapshot{
 		Daemon: Daemon{Running: true},

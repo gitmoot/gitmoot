@@ -68,6 +68,7 @@ func startTI(t *testing.T, store PromptStore, fields []Field) TrainInitModel {
 }
 
 func TestTrainInitSkipsConditionalField(t *testing.T) {
+	t.Parallel()
 	skipFields := func() []Field {
 		return []Field{
 			{Name: "first", Label: "First", Kind: FieldText, Prompt: db.InteractivePrompt{ID: "first"}},
@@ -91,6 +92,7 @@ func TestTrainInitSkipsConditionalField(t *testing.T) {
 }
 
 func TestTrainInitTextSubmitAdvances(t *testing.T) {
+	t.Parallel()
 	m := startTI(t, newFakeStore(), tiFields())
 	next, _ := m.Update(key("smithyx"))
 	m = next.(TrainInitModel)
@@ -105,6 +107,7 @@ func TestTrainInitTextSubmitAdvances(t *testing.T) {
 }
 
 func TestTrainInitEmptyTextInlineError(t *testing.T) {
+	t.Parallel()
 	m := startTI(t, newFakeStore(), tiFields())
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = next.(TrainInitModel)
@@ -117,6 +120,7 @@ func TestTrainInitEmptyTextInlineError(t *testing.T) {
 }
 
 func TestTrainInitChoiceDefaultPreselected(t *testing.T) {
+	t.Parallel()
 	m := startTI(t, newFakeStore(), tiFields())
 	// name → template → preview.
 	m = advanceText(t, m, "smithyx")
@@ -135,6 +139,7 @@ func TestTrainInitChoiceDefaultPreselected(t *testing.T) {
 }
 
 func TestTrainInitTemplateCustomFile(t *testing.T) {
+	t.Parallel()
 	m := startTI(t, newFakeStore(), tiFields())
 	m = advanceText(t, m, "smithyx")
 	// On template field: move to "Custom file" (index 2).
@@ -166,6 +171,7 @@ func TestTrainInitTemplateCustomFile(t *testing.T) {
 }
 
 func TestTrainInitExternalAnswerAdvancesWithFlash(t *testing.T) {
+	t.Parallel()
 	m := startTI(t, newFakeStore(), tiFields())
 	resolved := db.InteractivePrompt{ID: "ti.name", State: db.InteractivePromptStateResolved, AnswerValue: "remote-name", AnswerSource: "agent"}
 	next, _ := m.Update(pollResultMsg{gen: m.gen, prompt: resolved})
@@ -185,6 +191,7 @@ func TestTrainInitExternalAnswerAdvancesWithFlash(t *testing.T) {
 }
 
 func TestTrainInitStalePollIgnored(t *testing.T) {
+	t.Parallel()
 	m := startTI(t, newFakeStore(), tiFields())
 	before := m.idx
 	resolved := db.InteractivePrompt{ID: "ti.name", State: db.InteractivePromptStateResolved, AnswerValue: "x"}
@@ -200,6 +207,7 @@ func TestTrainInitStalePollIgnored(t *testing.T) {
 }
 
 func TestTrainInitConfirmAcceptDeclineAbort(t *testing.T) {
+	t.Parallel()
 	single := []Field{{Name: "name", Label: "Name", Kind: FieldText, Prompt: db.InteractivePrompt{ID: "ti.name"}}}
 
 	// Accept.
@@ -233,6 +241,7 @@ func TestTrainInitConfirmAcceptDeclineAbort(t *testing.T) {
 }
 
 func TestTrainInitAutoAcceptWhenExternallyAnswered(t *testing.T) {
+	t.Parallel()
 	single := []Field{{Name: "name", Label: "Name", Kind: FieldText, Prompt: db.InteractivePrompt{ID: "ti.name"}}}
 	m := startTI(t, newFakeStore(), single)
 	resolved := db.InteractivePrompt{ID: "ti.name", State: db.InteractivePromptStateResolved, AnswerValue: "x", AnswerSource: "agent"}
@@ -247,6 +256,7 @@ func TestTrainInitAutoAcceptWhenExternallyAnswered(t *testing.T) {
 }
 
 func TestTrainInitRepoCreateFlow(t *testing.T) {
+	t.Parallel()
 	created := ""
 	fields := []Field{
 		{Name: "review_repo", Label: "Review repository", Kind: FieldText, Prompt: db.InteractivePrompt{ID: "ti.review_repo"},
@@ -290,6 +300,7 @@ func TestTrainInitRepoCreateFlow(t *testing.T) {
 }
 
 func TestTrainInitRepoReEnter(t *testing.T) {
+	t.Parallel()
 	createCalls := 0
 	fields := []Field{
 		{Name: "review_repo", Label: "Review repository", Kind: FieldText, Prompt: db.InteractivePrompt{ID: "ti.review_repo"},
@@ -321,6 +332,7 @@ func TestTrainInitRepoReEnter(t *testing.T) {
 }
 
 func TestTrainInitProgressHeader(t *testing.T) {
+	t.Parallel()
 	m := startTI(t, newFakeStore(), tiFields())
 	if !strings.Contains(m.View(), "[1/3]") {
 		t.Fatalf("expected progress header:\n%s", m.View())
@@ -330,6 +342,7 @@ func TestTrainInitProgressHeader(t *testing.T) {
 // TestTrainInitPromptCmdsAgainstRealStore proves the upsert/check/delete commands
 // drive real SQL and observe an external answer, one prompt at a time.
 func TestTrainInitPromptCmdsAgainstRealStore(t *testing.T) {
+	t.Parallel()
 	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
