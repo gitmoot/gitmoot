@@ -966,6 +966,14 @@ func resolveBlockedTTL(home string) time.Duration {
 	return ttl
 }
 
+// resolveDelegationWorktreeTTL reads the default-on terminal worktree retention
+// policy without initializing or re-resolving the daemon home. Parse errors are
+// returned so the caller can surface the skipped housekeeping pass instead of
+// silently falling back to destructive defaults.
+func resolveDelegationWorktreeTTL(home string) (time.Duration, error) {
+	return config.LoadDelegationWorktreeTTL(config.Paths{ConfigFile: resolveConfigFile(home)})
+}
+
 func pollRegisteredReposWithPoller(ctx context.Context, poller registeredRepoPoller, schedule registeredRepoSchedule, now time.Time, fallbackPoll time.Duration) (time.Duration, error) {
 	schedule = schedule.ensure()
 	repos, err := poller.Store.ListRepos(ctx)

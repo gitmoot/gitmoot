@@ -181,6 +181,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	if check, ok := unlabeledJobsDoctorCheck(paths); ok {
 		checks = append(checks, check)
 	}
+	if check, ok := delegationWorktreeDoctorCheck(paths); ok {
+		checks = append(checks, check)
+	}
 	checks = append(checks, repoCheckoutDoctorChecks(paths)...)
 	if *jsonOutput {
 		type checkJSON struct {

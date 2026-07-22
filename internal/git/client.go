@@ -188,6 +188,14 @@ func (c Client) RemoveWorktreeForce(ctx context.Context, path string) error {
 	return err
 }
 
+// PruneWorktrees removes stale administrative entries left by interrupted or
+// forcibly removed worktrees. It runs against the primary checkout's shared git
+// directory and is idempotent.
+func (c Client) PruneWorktrees(ctx context.Context) error {
+	_, err := c.run(ctx, "worktree", "prune")
+	return err
+}
+
 // DeleteBranch force-deletes a local branch (git branch -D). It is used to tear
 // down a terminal implement delegation's gitmoot-delegation-* branch so it does
 // not linger in the shared checkout and contaminate a later coordinator's

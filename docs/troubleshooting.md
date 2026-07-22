@@ -639,3 +639,45 @@ Fixes:
   `GITMOOT_DISABLE_NATIVE_MERGE_GATE=1` (also `true`/`yes`/`on`; #545): Gitmoot
   then abstains from its native merge gate — fail-closed, it never merges
   gatelessly; the external gate makes the call.
+
+## Delegation worktrees consume too much disk
+
+`gitmoot doctor` reports delegation-worktree usage as
+`N stale worktrees / X GB under <home>/worktrees`. The detail separates aged
+final owners that are **reclaimable**, resumable/non-final owners that are
+**pinned**, and directories whose owner is **unproven**. Pinned includes
+`blocked`, `queued`, and `running`; Gitmoot never force-removes those.
+
+`[workflow].delegation_worktree_ttl = "72h"` is default-on because a final
+delegation owner cannot resume, while the grace period preserves short-term
+debugging access. Set it to `"0"` to disable the TTL pass. Aged final owners are
+force-removed even when dirty, Git worktree metadata is pruned, and
+`delegation_worktree_reclaimed_ttl` is recorded. The dashboard `/api/health`
+response exposes the same count, bytes, path, breakdown, and summary in its
+top-level `worktrees` field.
+
+For immediate manual relief, list paths and then prove the owner is final. Do
+not infer safety from directory age alone:
+
+```sh
+find "$HOME/.gitmoot/worktrees" -type d -path '*/delegations/*/*' -prune -print
+
+# sqlite3 is an optional operator aid, not a Gitmoot runtime dependency.
+sqlite3 "$HOME/.gitmoot/gitmoot.db" -header -column '
+SELECT id, state, updated_at, json_extract(payload, "$.worktree_path") AS path
+FROM jobs
+WHERE state IN ("succeeded", "failed", "cancelled")
+  AND datetime(updated_at) <= datetime("now", "-72 hours")
+  AND json_extract(payload, "$.worktree_path") <> ""
+  AND (json_extract(payload, "$.delegation_id") <> ""
+       OR json_extract(payload, "$.read_only_worktree") = 1);
+'
+
+gitmoot job show <job-id> --json
+git -C <registered-checkout> worktree remove --force <verified-worktree-path>
+git -C <registered-checkout> worktree prune
+```
+
+Before removal, verify that `job show` still reports `succeeded`, `failed`, or
+`cancelled` and the exact same `payload.worktree_path`. Never manually remove a
+worktree owned by a blocked, queued, or running job; settle that job first.

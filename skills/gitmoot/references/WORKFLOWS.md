@@ -738,6 +738,12 @@ recover` restores preserved artifacts through `implementing` to `pr_open`, or
 restores a branchless task to `planned`; job retry records its own recovery
 event. The server-side task board omits dismissed rows immediately.
 
+Delegation worktrees use a separate default-on retention policy:
+`[workflow].delegation_worktree_ttl = "72h"` (`"0"` disables it). Only final
+owners (`succeeded`, `failed`, `cancelled`) older than the TTL are force-removed.
+Blocked, queued, and running owners remain pinned; `gitmoot doctor` reports the
+reclaimable/pinned/unproven counts and logical size.
+
 Never-started `planned` tasks use a separate opt-in policy:
 `[workflow].planned_ttl = "720h"`. It is disabled by default; unset, empty,
 zero, and invalid values all resolve to off because automatic dismissal can

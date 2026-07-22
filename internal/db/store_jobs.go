@@ -1245,6 +1245,49 @@ func (s *Store) JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) 
 	return s.jobIDsByQuery(ctx, jobIDsWithPendingDelegationWorktreeReclaimSQL)
 }
 
+// JobIDsWithAgedTerminalDelegationWorktree returns final jobs whose recorded
+// delegation/read-only worktree has outlived cutoff and has no successful
+// cleanup event. Unlike the pending-marker query above, this deliberately finds
+// crash-window leftovers that never got far enough to emit a cleanup-skipped
+// marker. Blocked is excluded: it is resumable and therefore still owns its
+// worktree. The payload predicates exclude ordinary task worktrees.
+func (s *Store) JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cutoff time.Time) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT j.id
+		FROM jobs j
+		WHERE j.state IN ('succeeded', 'failed', 'cancelled')
+		  AND unixepoch(COALESCE(NULLIF(j.updated_at, ''), j.created_at)) <= unixepoch(?)
+		  AND COALESCE(json_extract(j.payload, '$.worktree_path'), '') <> ''
+		  AND (COALESCE(json_extract(j.payload, '$.delegation_id'), '') <> ''
+		       OR COALESCE(json_extract(j.payload, '$.read_only_worktree'), 0) = 1)
+		  AND NOT EXISTS (
+			SELECT 1 FROM jobs owner
+			WHERE owner.id <> j.id
+			  AND json_extract(owner.payload, '$.worktree_path') = json_extract(j.payload, '$.worktree_path')
+			  AND (owner.state NOT IN ('succeeded', 'failed', 'cancelled')
+			       OR unixepoch(COALESCE(NULLIF(owner.updated_at, ''), owner.created_at)) IS NULL
+			       OR unixepoch(COALESCE(NULLIF(owner.updated_at, ''), owner.created_at)) > unixepoch(?))
+		  )
+		  AND NOT EXISTS (
+			SELECT 1 FROM job_events e
+			WHERE e.job_id = j.id
+			  AND e.kind IN ('delegation_worktree_removed', 'delegation_worktree_reclaimed_ttl')
+		  )
+		ORDER BY j.id`, cutoff.UTC().Format("2006-01-02 15:04:05"), cutoff.UTC().Format("2006-01-02 15:04:05"))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // JobIDsWithPendingAdvanceRetry returns the IDs of jobs whose LATEST post-delivery
 // advancement event (by id) is still an unreconciled attempt marker
 // (advance_started/advance_retry) — exactly jobWorker.jobNeedsAdvanceRetry's

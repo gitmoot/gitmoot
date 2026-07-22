@@ -394,3 +394,25 @@ Stop and report `blocked` when the target repo is unclear, GitHub auth is
 missing, the daemon cannot access the repo, branch lock ownership is wrong, or
 continuing would require credentials or destructive operations the user did not
 approve.
+
+## Delegation Worktree Reclaim
+
+The daemon force-reclaims a recorded delegation/read-only worktree only when its
+owning job is final (`succeeded`, `failed`, or `cancelled`) and its terminal
+`updated_at` is older than `[workflow].delegation_worktree_ttl` (default `72h`;
+`"0"` disables). This default is safe because final owners cannot resume; the
+delay preserves a short debugging window. `blocked` is resumable and is never a
+TTL reclaim candidate. A successful force-remove and metadata prune records
+`delegation_worktree_reclaimed_ttl`.
+
+`gitmoot doctor` and dashboard `/api/health` surface stale count and logical
+size, split into reclaimable final owners, pinned non-final owners, and unproven
+directories. Pinned and unproven worktrees are observation-only.
+
+For manual relief, list
+`$GITMOOT_HOME/worktrees/*/delegations/*/*`, map each path to its job's
+`payload.worktree_path`, and run `gitmoot job show <job-id> --json`. Proceed only
+when the current state is `succeeded`, `failed`, or `cancelled` and the exact
+path matches; then run `git -C <registered-checkout> worktree remove --force
+<path>` followed by `git -C <registered-checkout> worktree prune`. Never remove
+a worktree owned by a blocked, queued, or running job.

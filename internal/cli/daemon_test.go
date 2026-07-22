@@ -289,6 +289,7 @@ type fakeReclaimWorktreeManager struct {
 	removed  []string
 	deleted  []string
 	branches map[string]bool
+	pruned   int
 }
 
 func (m *fakeReclaimWorktreeManager) AddWorktree(context.Context, string, string, string) error {
@@ -308,6 +309,10 @@ func (m *fakeReclaimWorktreeManager) DeleteBranch(_ context.Context, branch stri
 }
 func (m *fakeReclaimWorktreeManager) BranchExists(_ context.Context, branch string) (bool, error) {
 	return m.branches[branch], nil
+}
+func (m *fakeReclaimWorktreeManager) PruneWorktrees(context.Context) error {
+	m.pruned++
+	return nil
 }
 
 func delegationWorktreeCleanupPendingForTest(ctx context.Context, store tickCandidateStore, jobID string) (bool, error) {
@@ -843,10 +848,11 @@ func resetRuntimeLockWaitEpisodes() {
 // backs TestTickCandidatesComputedOncePerTick's proof that the #619 hoist runs each
 // candidate query once per tick, not once per enabled repo.
 type countingCandidateStore struct {
-	inner   *db.Store
-	advance int32
-	comment int32
-	reclaim int32
+	inner       *db.Store
+	advance     int32
+	comment     int32
+	reclaim     int32
+	agedReclaim int32
 }
 
 func (c *countingCandidateStore) JobIDsWithPendingAdvanceRetry(ctx context.Context) ([]string, error) {
@@ -864,15 +870,21 @@ func (c *countingCandidateStore) JobIDsWithPendingDelegationWorktreeReclaim(ctx 
 	return c.inner.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
 }
 
+func (c *countingCandidateStore) JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cutoff time.Time) ([]string, error) {
+	atomic.AddInt32(&c.agedReclaim, 1)
+	return c.inner.JobIDsWithAgedTerminalDelegationWorktree(ctx, cutoff)
+}
+
 // flakyCandidateStore returns an error on the first call to each candidate query and
 // the memoized success on every later call, counting total calls per query. It backs
 // TestTickCandidatesRetriesOnError's proof that tickCandidates memoizes SUCCESSES
 // only: a query that errors on one repo's pass must be re-attempted (not replayed as
 // the same error) on the next pass within the same tick.
 type flakyCandidateStore struct {
-	advanceCalls int32
-	commentCalls int32
-	reclaimCalls int32
+	advanceCalls     int32
+	commentCalls     int32
+	reclaimCalls     int32
+	agedReclaimCalls int32
 }
 
 var errCandidateTransient = errors.New("transient store fault")
@@ -896,4 +908,11 @@ func (s *flakyCandidateStore) JobIDsWithPendingDelegationWorktreeReclaim(context
 		return nil, errCandidateTransient
 	}
 	return []string{"reclaim-job"}, nil
+}
+
+func (s *flakyCandidateStore) JobIDsWithAgedTerminalDelegationWorktree(context.Context, time.Time) ([]string, error) {
+	if atomic.AddInt32(&s.agedReclaimCalls, 1) == 1 {
+		return nil, errCandidateTransient
+	}
+	return []string{"aged-reclaim-job"}, nil
 }

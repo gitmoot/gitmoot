@@ -210,8 +210,9 @@ type dashboardHealthDaemon struct {
 
 type dashboardHealthResponse struct {
 	dashboard.Health
-	Daemon dashboardHealthDaemon `json:"daemon"`
-	Server dashboardServerBuild  `json:"server"`
+	Daemon    dashboardHealthDaemon   `json:"daemon"`
+	Server    dashboardServerBuild    `json:"server"`
+	Worktrees delegationWorktreeUsage `json:"worktrees"`
 }
 
 // handleHealth shadows the module's /api/health to add the build of the process
@@ -244,6 +245,23 @@ func (d *webDataSource) healthJSON(ctx context.Context) ([]byte, error) {
 	if health.RecentFailures == nil {
 		health.RecentFailures = []dashboard.HealthFailure{}
 	}
+	paths, err := initializedPaths(d.home)
+	if err != nil {
+		return nil, err
+	}
+	ttl, err := config.LoadDelegationWorktreeTTL(paths)
+	if err != nil {
+		return nil, err
+	}
+	var worktrees delegationWorktreeUsage
+	err = withStore(d.home, func(store *db.Store) error {
+		var inspectErr error
+		worktrees, inspectErr = inspectDelegationWorktreeUsage(ctx, paths, store, time.Now().UTC(), ttl)
+		return inspectErr
+	})
+	if err != nil {
+		return nil, err
+	}
 	build := buildinfo.Current()
 	versionSource := "unknown"
 	if health.Daemon.Version != "" {
@@ -255,7 +273,8 @@ func (d *webDataSource) healthJSON(ctx context.Context) ([]byte, error) {
 			HealthDaemon:  health.Daemon,
 			VersionSource: versionSource,
 		},
-		Server: dashboardServerBuild{Version: build.Version, Commit: build.Commit},
+		Server:    dashboardServerBuild{Version: build.Version, Commit: build.Commit},
+		Worktrees: worktrees,
 	}
 	return marshalDashboardJSON(response)
 }
