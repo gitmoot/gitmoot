@@ -20,13 +20,13 @@ func TestBlockedEpisodeRoundTripKeepsFirstBlockedSince(t *testing.T) {
 		t.Fatalf("org_blocked_episodes migration missing: %v", err)
 	}
 	first := time.Date(2026, 7, 22, 8, 1, 2, 345678901, time.UTC)
-	if err := store.UpsertBlockedEpisode(ctx, "task:owner/repo:task-1", first); err != nil {
+	if err := store.UpsertBlockedEpisode(ctx, "task:owner/repo:task-1", first, first); err != nil {
 		t.Fatalf("UpsertBlockedEpisode(insert) error = %v", err)
 	}
-	if err := store.UpsertBlockedEpisode(ctx, "task:owner/repo:task-1", first.Add(3*time.Hour)); err != nil {
+	if err := store.UpsertBlockedEpisode(ctx, "task:owner/repo:task-1", first.Add(3*time.Hour), first.Add(3*time.Hour)); err != nil {
 		t.Fatalf("UpsertBlockedEpisode(update) error = %v", err)
 	}
-	if err := store.UpsertBlockedEpisode(ctx, "role:review", first.Add(time.Minute)); err != nil {
+	if err := store.UpsertBlockedEpisode(ctx, "role:review", first.Add(time.Minute), first.Add(time.Minute)); err != nil {
 		t.Fatalf("UpsertBlockedEpisode(second subject) error = %v", err)
 	}
 
@@ -37,7 +37,7 @@ func TestBlockedEpisodeRoundTripKeepsFirstBlockedSince(t *testing.T) {
 	if len(episodes) != 2 || episodes[0].Subject != "role:review" || episodes[1].Subject != "task:owner/repo:task-1" {
 		t.Fatalf("episodes = %+v, want subject-sorted rows", episodes)
 	}
-	if got, want := episodes[1].BlockedSince, first.Format(blockedEpisodeTimeLayout); got != want {
+	if got, want := episodes[1].BlockedSince, first.Format(BlockedEpisodeTimeLayout); got != want {
 		t.Fatalf("BlockedSince = %q, want first-seen %q", got, want)
 	}
 	if episodes[1].EmittedAt != "" {
@@ -54,7 +54,7 @@ func TestBlockedEpisodeRoundTripKeepsFirstBlockedSince(t *testing.T) {
 	if episodes[1].EmittedAt == "" {
 		t.Fatal("EmittedAt is empty after mark")
 	}
-	if _, err := time.Parse(blockedEpisodeTimeLayout, episodes[1].EmittedAt); err != nil {
+	if _, err := time.Parse(BlockedEpisodeTimeLayout, episodes[1].EmittedAt); err != nil {
 		t.Fatalf("EmittedAt = %q, want fixed-width UTC timestamp: %v", episodes[1].EmittedAt, err)
 	}
 
@@ -76,7 +76,7 @@ func TestUpsertBlockedEpisodeRejectsEmptySubject(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if err := store.UpsertBlockedEpisode(context.Background(), " ", time.Now()); err == nil {
+	if err := store.UpsertBlockedEpisode(context.Background(), " ", time.Now(), time.Now()); err == nil {
 		t.Fatal("UpsertBlockedEpisode() error = nil, want validation error")
 	}
 }

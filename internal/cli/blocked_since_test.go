@@ -250,3 +250,53 @@ func TestBlockedRoleEpisodeSurvivesTransientUnknownSnapshot(t *testing.T) {
 		t.Fatalf("StateIdle did not clear the episode: %+v", episodes)
 	}
 }
+
+// TestBlockedRoleEpisodeReapedWhenStaleThenReblockStartsFresh pins the staleness
+// reap: a role that goes permanently unknown/absent is NOT leaked forever (its
+// row is reaped once it stops being re-observed blocked past the gap), and a
+// later re-block under the same label starts a FRESH episode rather than reusing
+// the stale blocked_since to fire a spurious inflated-duration wake.
+func TestBlockedRoleEpisodeReapedWhenStaleThenReblockStartsFresh(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	sink := &recordingSink{}
+	wakeAfter := time.Hour
+	base := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	blocked := func(observedAt time.Time) org.Snapshot {
+		return org.Snapshot{States: map[string]org.RoleLiveState{"gone": {State: org.StateBlocked}}, ObservedAt: observedAt}
+	}
+	absent := func(observedAt time.Time) org.Snapshot {
+		return org.Snapshot{States: map[string]org.RoleLiveState{}, ObservedAt: observedAt}
+	}
+	run := func(snap org.Snapshot, now time.Time) {
+		t.Helper()
+		if err := evaluateBlockedRoleEpisodes(ctx, store, sink, snap, wakeAfter, io.Discard, now); err != nil {
+			t.Fatalf("evaluate at %s: %v", now, err)
+		}
+	}
+	run(blocked(base.Add(-2*time.Hour)), base) // blocked 2h → emit #1, episode open
+	if got := len(sink.byType(events.EventJobBlocked)); got != 1 {
+		t.Fatalf("first emit = %d, want 1", got)
+	}
+	run(absent(base.Add(time.Minute)), base.Add(time.Minute)) // vanished, within gap → survives
+	if eps, _ := store.ListBlockedEpisodes(ctx); len(eps) != 1 {
+		t.Fatalf("episode reaped within stale gap: %+v", eps)
+	}
+	past := base.Add(blockedEpisodeStaleGap + time.Minute)
+	run(absent(past), past) // past the gap → reaped, no leak
+	if eps, _ := store.ListBlockedEpisodes(ctx); len(eps) != 0 {
+		t.Fatalf("stale absent-role episode was not reaped (leak): %+v", eps)
+	}
+	reblock := past.Add(time.Minute)
+	run(blocked(reblock), reblock) // fresh incarnation blocks → fresh episode, no spurious wake
+	if got := len(sink.byType(events.EventJobBlocked)); got != 1 {
+		t.Fatalf("re-block fired a spurious wake: emits = %d, want still 1", got)
+	}
+	eps, _ := store.ListBlockedEpisodes(ctx)
+	if len(eps) != 1 {
+		t.Fatalf("re-block episode set = %+v, want exactly 1", eps)
+	}
+	if got, want := eps[0].BlockedSince, reblock.UTC().Format(db.BlockedEpisodeTimeLayout); got != want {
+		t.Fatalf("re-block blocked_since = %q, want fresh %q (not the stale 2h-old instant)", got, want)
+	}
+}

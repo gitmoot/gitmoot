@@ -18,7 +18,13 @@ import (
 const (
 	blockedRoleWakeInterval    = time.Minute
 	blockedRoleSnapshotTimeout = 5 * time.Second
-	blockedEpisodeTimeLayout   = "2006-01-02T15:04:05.000000000Z"
+	// blockedEpisodeStaleGap bounds how long a role episode survives without being
+	// re-observed blocked. Within it, a transient unknown/absent snapshot blip is
+	// tolerated (the accrued blocked duration is preserved); beyond it the subject is
+	// treated as no longer blocked (unblocked undetected, or the role gone for good)
+	// and the episode is reaped — so a permanently-unknown role neither leaks a row
+	// nor reuses a stale blocked_since on a later re-block.
+	blockedEpisodeStaleGap = 5 * blockedRoleWakeInterval
 )
 
 type blockedRoleAvailability interface {
@@ -107,22 +113,22 @@ func evaluateBlockedTaskEpisodes(ctx context.Context, store *db.Store, sink even
 			writeLine(stdout, "blocked_since task %s skipped: unparseable updated_at %q", candidate.ID, candidate.UpdatedAt)
 			continue
 		}
-		if err := store.UpsertBlockedEpisode(ctx, subject, blockedSince); err != nil {
+		if err := store.UpsertBlockedEpisode(ctx, subject, blockedSince, now); err != nil {
 			writeLine(stdout, "blocked_since task %s episode upsert failed: %v", candidate.ID, err)
 			continue
 		}
 		staleSubjects[subject] = candidate.ID
 	}
 
-	episodes, err := store.ListBlockedEpisodes(ctx)
+	// Prefix-scoped so a per-repo tick reads only this repo's task episodes.
+	episodes, err := store.ListBlockedEpisodesByPrefix(ctx, "task:"+strings.TrimSpace(repo)+":")
 	if err != nil {
 		return err
 	}
-	prefix := "task:" + strings.TrimSpace(repo) + ":"
 	for _, episode := range episodes {
-		if !strings.HasPrefix(episode.Subject, prefix) {
-			continue
-		}
+		// Tasks have an authoritative blocked set (gitmoot's own state), so an
+		// episode whose task is no longer blocked is cleared immediately — no
+		// staleness heuristic needed (unlike the ambiguous Herdr role source).
 		if _, blocked := blockedSubjects[episode.Subject]; !blocked {
 			if err := store.ClearBlockedEpisode(ctx, episode.Subject); err != nil {
 				writeLine(stdout, "blocked_since task episode clear failed for %s: %v", episode.Subject, err)
@@ -227,7 +233,7 @@ func evaluateBlockedRoleEpisodes(ctx context.Context, store *db.Store, sink even
 		switch live.State {
 		case org.StateBlocked:
 			blockedSubjects[subject] = role
-			if err := store.UpsertBlockedEpisode(ctx, subject, snapshot.ObservedAt); err != nil {
+			if err := store.UpsertBlockedEpisode(ctx, subject, snapshot.ObservedAt, now); err != nil {
 				writeLine(stdout, "blocked_since role %s episode upsert failed: %v", role, err)
 				continue
 			}
@@ -242,14 +248,13 @@ func evaluateBlockedRoleEpisodes(ctx context.Context, store *db.Store, sink even
 		}
 	}
 
-	episodes, err := store.ListBlockedEpisodes(ctx)
+	// Prefix-scoped read of only the role episodes.
+	episodes, err := store.ListBlockedEpisodesByPrefix(ctx, "role:")
 	if err != nil {
 		return err
 	}
+	staleBefore := now.Add(-blockedEpisodeStaleGap)
 	for _, episode := range episodes {
-		if !strings.HasPrefix(episode.Subject, "role:") {
-			continue
-		}
 		if role, blocked := blockedSubjects[episode.Subject]; blocked {
 			if _, ready := readySubjects[episode.Subject]; !ready {
 				continue
@@ -260,7 +265,11 @@ func evaluateBlockedRoleEpisodes(ctx context.Context, store *db.Store, sink even
 			}
 			continue
 		}
-		if _, confirmed := confirmedUnblocked[episode.Subject]; confirmed {
+		// Not observed blocked this tick. Clear on a DEFINITIVE non-blocked state, or
+		// once the episode has gone STALE (not re-observed blocked within the gap) —
+		// reaping a role gone permanently unknown/absent without letting a single
+		// transient blip discard the accrued duration or leak the row forever.
+		if _, confirmed := confirmedUnblocked[episode.Subject]; confirmed || blockedEpisodeStale(episode.UpdatedAt, staleBefore) {
 			if err := store.ClearBlockedEpisode(ctx, episode.Subject); err != nil {
 				writeLine(stdout, "blocked_since role episode clear failed for %s: %v", episode.Subject, err)
 			}
@@ -269,9 +278,20 @@ func evaluateBlockedRoleEpisodes(ctx context.Context, store *db.Store, sink even
 	return nil
 }
 
+// blockedEpisodeStale reports whether an episode's last blocked observation
+// (updatedAt, fixed-width UTC) is at or before staleBefore. An unparseable stamp
+// is treated as stale so a malformed row can never linger forever.
+func blockedEpisodeStale(updatedAt string, staleBefore time.Time) bool {
+	parsed, err := time.Parse(db.BlockedEpisodeTimeLayout, strings.TrimSpace(updatedAt))
+	if err != nil {
+		return true
+	}
+	return !parsed.After(staleBefore)
+}
+
 func emitBlockedSinceEpisode(ctx context.Context, store *db.Store, sink events.Sink, episode db.BlockedEpisode, subjectID, rootID, repo, detailSubject string, wakeAfter time.Duration, now time.Time) error {
 	now = now.UTC()
-	blockedSince, err := time.Parse(blockedEpisodeTimeLayout, episode.BlockedSince)
+	blockedSince, err := time.Parse(db.BlockedEpisodeTimeLayout, episode.BlockedSince)
 	if err != nil {
 		return fmt.Errorf("parse blocked_since %q: %w", episode.BlockedSince, err)
 	}
@@ -284,7 +304,7 @@ func emitBlockedSinceEpisode(ctx context.Context, store *db.Store, sink events.S
 	// is dropped downstream (herdr briefly down, a transient sink, a mark-write
 	// failure) self-heals on the next interval instead of being lost forever.
 	if last := strings.TrimSpace(episode.EmittedAt); last != "" {
-		if lastEmitted, err := time.Parse(blockedEpisodeTimeLayout, last); err == nil && now.Sub(lastEmitted) <= wakeAfter {
+		if lastEmitted, err := time.Parse(db.BlockedEpisodeTimeLayout, last); err == nil && now.Sub(lastEmitted) <= wakeAfter {
 			return nil // already nudged within the current interval
 		}
 	}
