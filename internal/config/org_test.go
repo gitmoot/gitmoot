@@ -105,6 +105,58 @@ func TestLoadOrgRecycleAfterFailsClosed(t *testing.T) {
 	}
 }
 
+func TestLoadOrgRecycleEnforce(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name  string
+		field string
+		want  string
+	}{
+		{name: "unset defaults off", want: "off"},
+		{name: "explicit off", field: "recycle_enforce = \"off\"\n", want: "off"},
+		{name: "warn", field: "recycle_enforce = \"warn\"\n", want: "warn"},
+		{name: "block", field: "recycle_enforce = \"block\"\n", want: "block"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := "[org]\n" + test.field + "[org.roles.\"owner\"]\nscope=[\"*\"]\n"
+			if err := os.WriteFile(paths.ConfigFile, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadOrg(paths)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.RecycleEnforce(); got != test.want {
+				t.Fatalf("RecycleEnforce() = %q, want %q", got, test.want)
+			}
+		})
+	}
+	for _, test := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "invalid", body: "[org]\nrecycle_enforce=\"strict\"\n[org.roles.\"owner\"]\nscope=[\"*\"]\n", want: "recycle_enforce must be"},
+		{name: "duplicate", body: "[org]\nrecycle_enforce=\"off\"\nrecycle_enforce=\"block\"\n[org.roles.\"owner\"]\nscope=[\"*\"]\n", want: "duplicate [org].recycle_enforce"},
+		{name: "per role override rejected", body: "[org.roles.\"owner\"]\nscope=[\"*\"]\nrecycle_enforce=\"block\"\n", want: "unknown field"},
+		{name: "unknown remains rejected", body: "[org]\nrecycle_enforce=\"off\"\nrecycle_mode=\"block\"\n[org.roles.\"owner\"]\nscope=[\"*\"]\n", want: "unknown [org] field"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(paths.ConfigFile, []byte(test.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadOrg(paths); err == nil {
+				t.Fatal("LoadOrg() error = nil, want fail-closed rejection")
+			} else if !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("LoadOrg() error = %q, want substring %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestOrgConfigAncestors(t *testing.T) {
 	cfg := OrgConfig{roles: map[string]OrgRole{
 		"owner":      {Name: "owner"},

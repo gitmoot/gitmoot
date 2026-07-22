@@ -34,6 +34,39 @@ func TestOrgRolePresenceMigrationAndUpsert(t *testing.T) {
 	if len(presence) != 2 || presence[0].Role != "owner" || presence[0].LastCommand != "agent run" || presence[0].LastSeenAt == "" || presence[1].Role != "review" {
 		t.Fatalf("presence = %+v", presence)
 	}
+	owner, found, err := store.GetOrgRolePresence(ctx, " owner ")
+	if err != nil || !found || owner.Role != "owner" || owner.LastCommand != "agent run" || owner.LastSeenAt == "" {
+		t.Fatalf("GetOrgRolePresence(owner) = %+v, %v, %v", owner, found, err)
+	}
+	missing, found, err := store.GetOrgRolePresence(ctx, "missing")
+	if err != nil || found || missing != (OrgRolePresence{}) {
+		t.Fatalf("GetOrgRolePresence(missing) = %+v, %v, %v", missing, found, err)
+	}
+}
+
+func TestOrgRolePresenceKeyIsCanonicalized(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	// A raw case-variant --org-role (e.g. "OWNER") must land on the canonical
+	// row so recycle enforcement's canonical read cannot miss it (the off->block
+	// case-staleness class).
+	if err := store.TouchOrgRolePresence(ctx, "OWNER", "agent run"); err != nil {
+		t.Fatalf("TouchOrgRolePresence(OWNER) error = %v", err)
+	}
+	rows, err := store.ListOrgRolePresence(ctx)
+	if err != nil || len(rows) != 1 || rows[0].Role != "owner" {
+		t.Fatalf("presence keyed non-canonically: %+v (err %v)", rows, err)
+	}
+	for _, lookup := range []string{"owner", "OWNER", " Owner "} {
+		got, found, err := store.GetOrgRolePresence(ctx, lookup)
+		if err != nil || !found || got.Role != "owner" {
+			t.Fatalf("GetOrgRolePresence(%q) = %+v, %v, %v; want canonical owner", lookup, got, found, err)
+		}
+	}
 }
 
 func TestTouchOrgRolePresenceRejectsEmptyRole(t *testing.T) {

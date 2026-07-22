@@ -77,6 +77,8 @@ var newOrgProvider = func(roles []string) org.Provider { return cockpit.NewHerdr
 
 var orgDoctorRunner subprocess.Runner = subprocess.ExecRunner{}
 
+var orgRecycleAdvisoryWriter io.Writer = os.Stderr
+
 func runOrg(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		printOrgUsage(stdout)
@@ -499,10 +501,40 @@ func validateAndTouchActingOrgRole(ctx context.Context, store *db.Store, home, r
 	if !cfg.Enabled() {
 		return errors.New("--org-role requires an enabled organization registry; run `gitmoot org init`")
 	}
-	if _, ok := cfg.Role(role); !ok {
+	configuredRole, ok := cfg.Role(role)
+	if !ok {
 		return fmt.Errorf("unknown org role %q", role)
 	}
-	return store.TouchOrgRolePresence(ctx, role, command)
+	// Recycle enforcement only applies to operator-origin --org-role dispatches:
+	// this ingress (dispatchLocalAgentJob) is the sole path passing a non-empty
+	// ActingOrgRole, and today only agent ask/run/implement/orchestrate
+	// (OperatorOrigin) do so. Delegated/engine children enqueue via the mailbox
+	// and never reach here, so an inherited role cannot be refused mid-tree.
+	touchRole := role
+	if mode := cfg.RecycleEnforce(); mode != "off" {
+		// Read/touch under the registry's canonical name; TouchOrgRolePresence
+		// also canonicalizes the key, so a stale case-variant presence row cannot
+		// let an overdue role slip past the enforcement read.
+		touchRole = configuredRole.Name
+		recycleAfter := cfg.RecycleAfterFor(configuredRole.Name)
+		if recycleAfter > 0 {
+			presence, found, err := store.GetOrgRolePresence(ctx, configuredRole.Name)
+			if err != nil {
+				return fmt.Errorf("read org role %q presence: %w", configuredRole.Name, err)
+			}
+			if found {
+				age, known, overdue := orgRecycleAge(presence.LastSeenAt, time.Now().UTC(), recycleAfter)
+				if known && overdue {
+					message := fmt.Sprintf("org role %q is overdue for recycling (idle %s ≥ recycle_after %s); journal a handoff note and recycle before dispatching new work", configuredRole.Name, age, formatOrgRecycleAfter(recycleAfter))
+					if mode == "block" {
+						return errors.New(message)
+					}
+					fmt.Fprintf(orgRecycleAdvisoryWriter, "warning: %s\n", message)
+				}
+			}
+		}
+	}
+	return store.TouchOrgRolePresence(ctx, touchRole, command)
 }
 
 func dash(value string) string {
@@ -545,15 +577,11 @@ func orgRecycleStatus(lastSeen string, now time.Time, state org.LifecycleState, 
 	if recycleAfter <= 0 {
 		return "off"
 	}
-	observed, ok := parseOrgPresenceTime(lastSeen)
-	if !ok {
+	_, known, overdue := orgRecycleAge(lastSeen, now, recycleAfter)
+	if !known {
 		return "off"
 	}
-	age := now.Sub(observed.UTC())
-	if age < 0 {
-		age = 0
-	}
-	if age < recycleAfter {
+	if !overdue {
 		return "fresh"
 	}
 	if activeJobs > 0 {
@@ -565,6 +593,21 @@ func orgRecycleStatus(lastSeen string, now time.Time, state org.LifecycleState, 
 	default:
 		return "overdue"
 	}
+}
+
+func orgRecycleAge(lastSeen string, now time.Time, recycleAfter time.Duration) (age time.Duration, known, overdue bool) {
+	if recycleAfter <= 0 {
+		return 0, false, false
+	}
+	observed, ok := parseOrgPresenceTime(lastSeen)
+	if !ok {
+		return 0, false, false
+	}
+	age = now.Sub(observed.UTC())
+	if age < 0 {
+		age = 0
+	}
+	return age, true, age >= recycleAfter
 }
 
 func formatOrgRecycleAfter(value time.Duration) string {

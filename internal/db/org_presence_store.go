@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 )
@@ -13,7 +14,11 @@ type OrgRolePresence struct {
 }
 
 func (s *Store) TouchOrgRolePresence(ctx context.Context, role, command string) error {
-	role = strings.TrimSpace(role)
+	// Canonicalize the key (trim+lower). Org role names are validated lowercase
+	// (validOrgRoleName), but cfg.Role accepts case-insensitively, so a raw
+	// --org-role like "OWNER" must not create a case-variant row the recycle
+	// enforcement read (GetOrgRolePresence) would then miss.
+	role = strings.ToLower(strings.TrimSpace(role))
 	command = strings.TrimSpace(command)
 	if role == "" {
 		return errors.New("org role is required")
@@ -24,6 +29,19 @@ func (s *Store) TouchOrgRolePresence(ctx context.Context, role, command string) 
 			last_seen_at = CURRENT_TIMESTAMP,
 			last_command = excluded.last_command`, role, command)
 	return err
+}
+
+func (s *Store) GetOrgRolePresence(ctx context.Context, role string) (OrgRolePresence, bool, error) {
+	var presence OrgRolePresence
+	err := s.db.QueryRowContext(ctx, `SELECT role, last_seen_at, last_command
+		FROM org_role_presence WHERE role = ?`, strings.ToLower(strings.TrimSpace(role))).Scan(&presence.Role, &presence.LastSeenAt, &presence.LastCommand)
+	if errors.Is(err, sql.ErrNoRows) {
+		return OrgRolePresence{}, false, nil
+	}
+	if err != nil {
+		return OrgRolePresence{}, false, err
+	}
+	return presence, true, nil
 }
 
 func (s *Store) ListOrgRolePresence(ctx context.Context) ([]OrgRolePresence, error) {
