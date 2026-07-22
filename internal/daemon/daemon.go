@@ -222,17 +222,49 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 
 func (d Daemon) reconcileStaleTasks(ctx context.Context, openBranches map[string]struct{}) error {
 	paths := config.Paths{ConfigFile: filepath.Join(filepath.Dir(d.Store.DatabasePath()), config.ConfigName)}
-	ttl, err := config.LoadStaleTaskTTL(paths)
+	plannedTTL, err := config.LoadPlannedTaskTTL(paths)
+	if err != nil {
+		d.logf("planned task reconciler skipped for %s: %v", d.Repo.FullName(), err)
+	} else if plannedTTL > 0 {
+		if err := d.reconcileTaskTTL(ctx, openBranches, taskTTLReconcilePolicy{
+			ttl:          plannedTTL,
+			states:       []string{string(workflow.TaskPlanned)},
+			eventKind:    "task_dismissed_planned_ttl",
+			reasonPrefix: "planned task auto-dismissed",
+			logLabel:     "planned task reconciler",
+		}); err != nil {
+			return err
+		}
+	}
+
+	staleTTL, err := config.LoadStaleTaskTTL(paths)
 	if err != nil {
 		d.logf("stale task reconciler skipped for %s: %v", d.Repo.FullName(), err)
 		return nil
 	}
-	if ttl == 0 {
+	if staleTTL == 0 {
 		return nil
 	}
-	candidates, err := d.Store.ListStaleTaskCandidates(ctx, d.Repo.FullName(), []string{
-		string(workflow.TaskImplementing), string(workflow.TaskBlocked),
-	}, d.now().Add(-ttl), staleTaskReconcileScanLimit)
+	return d.reconcileTaskTTL(ctx, openBranches, taskTTLReconcilePolicy{
+		ttl:          staleTTL,
+		states:       []string{string(workflow.TaskImplementing), string(workflow.TaskBlocked)},
+		eventKind:    "task_dismissed_auto",
+		reasonPrefix: "stale task auto-dismissed",
+		logLabel:     "stale task reconciler",
+	})
+}
+
+type taskTTLReconcilePolicy struct {
+	ttl          time.Duration
+	states       []string
+	eventKind    string
+	reasonPrefix string
+	logLabel     string
+}
+
+func (d Daemon) reconcileTaskTTL(ctx context.Context, openBranches map[string]struct{}, policy taskTTLReconcilePolicy) error {
+	candidates, err := d.Store.ListStaleTaskCandidates(ctx, d.Repo.FullName(), policy.states,
+		d.now().Add(-policy.ttl), staleTaskReconcileScanLimit)
 	if err != nil {
 		return err
 	}
@@ -275,7 +307,7 @@ func (d Daemon) reconcileStaleTasks(ctx context.Context, openBranches map[string
 		repo, err := d.Store.GetRepo(ctx, d.Repo.FullName())
 		if err != nil {
 			remoteCertain = false
-			d.logf("stale task reconciler remote check skipped for %s: %v", d.Repo.FullName(), err)
+			d.logf("%s remote check skipped for %s: %v", policy.logLabel, d.Repo.FullName(), err)
 		} else {
 			checker := d.RemoteBranches
 			if checker == nil {
@@ -284,7 +316,7 @@ func (d Daemon) reconcileStaleTasks(ctx context.Context, openBranches map[string
 			remotePresent, err = checker.RemoteBranches(ctx, repo.CheckoutPath, branches)
 			if err != nil {
 				remoteCertain = false
-				d.logf("stale task reconciler remote check skipped for %s: %v", d.Repo.FullName(), err)
+				d.logf("%s remote check skipped for %s: %v", policy.logLabel, d.Repo.FullName(), err)
 			}
 		}
 	}
@@ -297,10 +329,9 @@ func (d Daemon) reconcileStaleTasks(ctx context.Context, openBranches map[string
 	}
 	dismissed := 0
 	for _, item := range emptyBranch {
-		reason := fmt.Sprintf("stale task auto-dismissed: empty branch; ttl=%s; updated_at=%s", ttl, item.candidate.UpdatedAt)
+		reason := fmt.Sprintf("%s: empty branch; ttl=%s; updated_at=%s", policy.reasonPrefix, policy.ttl, item.candidate.UpdatedAt)
 		changed, _, err := d.Store.TransitionTaskStateWithEventIfNoActiveJob(ctx, item.task.ID,
-			[]string{string(workflow.TaskImplementing), string(workflow.TaskBlocked)},
-			string(workflow.TaskDismissed), "task_dismissed_auto", reason)
+			policy.states, string(workflow.TaskDismissed), policy.eventKind, reason)
 		if err != nil {
 			if errors.Is(err, db.ErrTaskHasActiveJob) {
 				continue
@@ -316,10 +347,9 @@ func (d Daemon) reconcileStaleTasks(ctx context.Context, openBranches map[string
 		if _, present := remotePresent[branch]; present {
 			continue
 		}
-		reason := fmt.Sprintf("stale task auto-dismissed: remote ref refs/heads/%s absent; ttl=%s; updated_at=%s", branch, ttl, item.candidate.UpdatedAt)
+		reason := fmt.Sprintf("%s: remote ref refs/heads/%s absent; ttl=%s; updated_at=%s", policy.reasonPrefix, branch, policy.ttl, item.candidate.UpdatedAt)
 		changed, _, err := d.Store.TransitionTaskStateWithEventIfNoActiveJob(ctx, item.task.ID,
-			[]string{string(workflow.TaskImplementing), string(workflow.TaskBlocked)},
-			string(workflow.TaskDismissed), "task_dismissed_auto", reason)
+			policy.states, string(workflow.TaskDismissed), policy.eventKind, reason)
 		if err != nil {
 			if errors.Is(err, db.ErrTaskHasActiveJob) {
 				continue
@@ -330,8 +360,8 @@ func (d Daemon) reconcileStaleTasks(ctx context.Context, openBranches map[string
 			dismissed++
 		}
 	}
-	d.logf("stale task reconciler for %s: candidates=%d checked=%d dismissed=%d",
-		d.Repo.FullName(), len(candidates), len(emptyBranch)+len(remoteCandidates), dismissed)
+	d.logf("%s for %s: candidates=%d checked=%d dismissed=%d",
+		policy.logLabel, d.Repo.FullName(), len(candidates), len(emptyBranch)+len(remoteCandidates), dismissed)
 	return nil
 }
 
@@ -477,9 +507,11 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 			// The PR left the open set without merging. If it is closed
 			// (abandoned), record a closed status breadcrumb for any linked
 			// workflow so a pr_open/changes_requested task does not leave its
-			// workflow status frozen at "open". This is observability only, with
-			// NO task state change: the #953 conservatism against advancing or
-			// un-blocking a task on an abandoned PR is preserved. Idempotent and
+			// workflow status frozen at "open". This pass remains observability-
+			// only: reconcileClosedReviewingTasks is the single authoritative home
+			// for the closed-unmerged -> blocked transition, avoiding two passes
+			// racing the same task. The #953 conservatism against advancing or
+			// un-blocking on any ambiguous PR state is preserved. Idempotent and
 			// non-fatal.
 			if strings.EqualFold(strings.TrimSpace(pull.State), "closed") {
 				if _, err := workflow.RecordPullRequestWorkflowTransition(ctx, d.Store, workflow.PullRequestEvent{
@@ -1118,19 +1150,28 @@ func (d Daemon) retryClosedReadyToMerge(ctx context.Context, openBranches map[st
 // a stale local `open` PR row.
 //
 // It mirrors retryClosedReadyToMerge's shape and cheap short-circuit: it only
-// consults GitHub's closed-PR list when a reviewing task has a branch with NO
-// currently-open PR (the wedge), so the healthy path — where a reviewing task's
-// PR is open and thus present in openBranches — makes zero extra GitHub reads.
+// consults GitHub's closed-PR list when a pr_open, reviewing, or
+// changes_requested task has a branch with NO currently-open PR (the wedge), so
+// the healthy path — where the task's PR is open and thus present in openBranches
+// — makes zero extra GitHub reads.
 // A genuinely-open PR is in openBranches and skipped, so the normal review path
 // is never disturbed. Matching is by branch + PR number (+ head SHA when known);
-// the engine transition is no-op unless the task is still `reviewing`.
+// the engine CAS is a no-op unless the task is still one of those three states.
 func (d Daemon) reconcileClosedReviewingTasks(ctx context.Context, openBranches map[string]struct{}) error {
 	if d.Workflow == nil {
 		return nil
 	}
-	tasks, err := d.Store.ListTasksByRepoState(ctx, d.Repo.FullName(), string(workflow.TaskReviewing))
-	if err != nil {
-		return err
+	var tasks []db.Task
+	for _, state := range []workflow.TaskState{
+		workflow.TaskPullRequestOpen,
+		workflow.TaskReviewing,
+		workflow.TaskChangesRequested,
+	} {
+		stateTasks, err := d.Store.ListTasksByRepoState(ctx, d.Repo.FullName(), string(state))
+		if err != nil {
+			return err
+		}
+		tasks = append(tasks, stateTasks...)
 	}
 	if len(tasks) == 0 {
 		return nil
@@ -1184,6 +1225,17 @@ func (d Daemon) reconcileClosedReviewingTasks(ctx context.Context, openBranches 
 			continue
 		}
 		task := candidate.task
+		// The fuzzy same-branch merged-sibling resolution (#543) is only safe for
+		// `reviewing`, whose merged case this pass has always owned. pr_open and
+		// changes_requested are folded in (#1054) ONLY for the closed-unmerged ->
+		// blocked arm; their merged resolution stays with the precise, pinned-PR-
+		// number reconcileExternallyMergedTasks pass. Otherwise an unrelated merged
+		// PR that merely shares a (fork) branch name — with the head-SHA guard
+		// skipped on an empty stored SHA — could drive a still-open task to a
+		// spurious `merged` and delete its worktree.
+		if merged && workflow.TaskState(task.State) != workflow.TaskReviewing {
+			continue
+		}
 		leadAgent := "github"
 		if lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), task.Branch); err == nil {
 			if owner := strings.TrimSpace(lock.Owner); owner != "" {

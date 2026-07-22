@@ -746,6 +746,24 @@ activity proxy. Configure `[workflow].stale_task_ttl = "168h"` (the default), or
 set it to `"0"` to disable this poll leg. Candidates with a same-repo open PR,
 a remote branch, a live job, or an uncertain remote check are not dismissed.
 
+Never-started plans have a separate destructive opt-in:
+`[workflow].planned_ttl = "720h"`. It is disabled by default; unset, empty,
+`"0"`, and invalid values all mean off because dismissing a plan can destroy
+human context that a goal-file re-import cannot reconstruct. When enabled, the
+same live-job, open-PR, remote-branch, and uncertain-remote safeguards apply,
+and a dismissal records `task_dismissed_planned_ttl`. `task run` claims
+`planned -> implementing` atomically at allocation time, so a concurrent TTL
+dismissal cannot resurrect the task; use explicit `task recover` before retrying.
+
+A PR cleanly observed closed without merging moves a linked `pr_open`,
+`reviewing`, or `changes_requested` task to `blocked` and records
+`pr_closed_unmerged`; ambiguous observations remain conservative. After
+advancement and delegation handling, a terminal top-level implement job with no
+PR and no live successor also moves `implementing` to `blocked`. Implemented
+success without a PR records `task_blocked_terminal_no_pr`; other terminal
+outcomes record `task_blocked_job_failed`. Delegation children and queued
+fix/retry/continuation jobs are excluded.
+
 Dismissed tasks never return to implementation through ordinary task run,
 allocation, or late workflow advancement. `task recover` is the explicit path:
 preserved branch/worktree artifacts move through `implementing` to `pr_open`,
@@ -10782,8 +10800,14 @@ best-effort, and appends `task_dismissed_manual` to `task events`. Repeating the
 command is an exit-0 no-op with `changed:false` in JSON.
 
 `task events <id>` prints the append-only task lifecycle trail. Automatic stale
-dismissals use `task_dismissed_auto`; explicit recovery and retry use
-`task_recovered` and `task_recovered_job_retry`.
+dismissals use `task_dismissed_auto`; opt-in never-started-plan retirement uses
+`task_dismissed_planned_ttl`; explicit recovery and retry use `task_recovered`
+and `task_recovered_job_retry`. A clean closed-unmerged PR records
+`pr_closed_unmerged` while moving `pr_open`, `reviewing`, or
+`changes_requested` to `blocked`. Once advancement/delegation handling has no
+live successor, a terminal top-level implement job without a PR records
+`task_blocked_terminal_no_pr` for implemented success or
+`task_blocked_job_failed` for another terminal outcome and blocks the task.
 
 ### Recover A Dead Implement
 
@@ -10830,6 +10854,15 @@ restart that points to it):
 - **Live process still in the worktree** — `task recover` refuses while a live
   process is still inside the task worktree; wait for it to exit or stop the
   orphaned implementer before recovering.
+
+Planned-task retirement is separate from the default-on stale implementation
+sweep. Set `[workflow].planned_ttl = "720h"` only when the repository explicitly
+wants old never-started plans dismissed. It is off by default; unset, empty,
+`"0"`, or invalid values disable it because dismissal can lose human context a
+goal-file import cannot restore. Live jobs, open PRs, remote branches, and
+uncertain remote checks prevent dismissal. A write-time allocation CAS also
+prevents `task run` from resurrecting a concurrently dismissed plan; recover it
+explicitly before retrying.
 
 ## PR Comments
 
@@ -13702,6 +13735,24 @@ mutation. A branchless candidate needs no remote lookup. Explicit `task
 recover` restores preserved artifacts through `implementing` to `pr_open`, or
 restores a branchless task to `planned`; job retry records its own recovery
 event. The server-side task board omits dismissed rows immediately.
+
+Never-started `planned` tasks use a separate opt-in policy:
+`[workflow].planned_ttl = "720h"`. It is disabled by default; unset, empty,
+zero, and invalid values all resolve to off because automatic dismissal can
+destroy human planning context that goal-file re-import cannot reconstruct.
+When enabled, it reuses the same live-job, same-repo open-PR, remote-branch,
+and remote-uncertainty skips and records `task_dismissed_planned_ttl`. Task
+worktree allocation claims `planned -> implementing` with a write-time CAS, so
+a concurrent TTL dismissal cannot be overwritten; explicit recovery is needed.
+
+A clean closed-unmerged PR moves `pr_open`, `reviewing`, or
+`changes_requested` to `blocked` with `pr_closed_unmerged`; ambiguous PR state
+does not advance or unblock anything. After advancement and delegation handling,
+a terminal top-level implement job with no PR and no live successor blocks an
+otherwise-stuck `implementing` task. Implemented success without a PR records
+`task_blocked_terminal_no_pr`; other terminal outcomes record
+`task_blocked_job_failed`. Delegation children and tasks with queued retries,
+fixes, continuations, or pending advancement remain under their existing owner.
 
 **PR-bound fix pass:** use `gitmoot agent implement <agent> --repo owner/repo
 --pr <number> "..."` or `gitmoot agent run <agent> --repo owner/repo --action

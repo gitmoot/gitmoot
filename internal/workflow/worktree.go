@@ -96,11 +96,14 @@ func (e Engine) AllocateTaskWorktree(ctx context.Context, request TaskWorktreeRe
 		return db.Task{}, err
 	}
 	task, err := e.Store.GetTask(ctx, request.TaskID)
+	claimPlanned := false
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return db.Task{}, err
 		}
 		task = db.Task{ID: request.TaskID, RepoFullName: request.Repo, State: string(TaskPlanned)}
+	} else {
+		claimPlanned = task.State == string(TaskPlanned)
 	}
 	if task.State == string(TaskDismissed) {
 		return db.Task{}, fmt.Errorf("task %s is dismissed; recover it explicitly before allocating a worktree", request.TaskID)
@@ -130,6 +133,14 @@ func (e Engine) AllocateTaskWorktree(ctx context.Context, request TaskWorktreeRe
 		}
 	}
 	if task.Branch == request.Branch && task.WorktreePath == path {
+		if claimPlanned {
+			if err := e.claimPlannedTaskForImplementation(ctx, task.ID); err != nil {
+				if createdLock {
+					_, _ = e.Store.ReleaseLock(ctx, lock)
+				}
+				return db.Task{}, err
+			}
+		}
 		task.State = string(TaskImplementing)
 		if err := e.Store.UpsertTask(ctx, task); err != nil {
 			if createdLock {
@@ -174,6 +185,20 @@ func (e Engine) AllocateTaskWorktree(ctx context.Context, request TaskWorktreeRe
 		Branch:       request.Branch,
 		WorktreePath: path,
 	}
+	if claimPlanned {
+		// Close the planned_ttl/task-run race at the write boundary. A TTL
+		// dismissal that won after the initial GetTask makes this CAS fail, so the
+		// following legacy UpsertTask can never resurrect dismissed -> implementing.
+		if err := e.claimPlannedTaskForImplementation(ctx, task.ID); err != nil {
+			if cleaner, ok := manager.(ReadOnlyWorktreeManager); ok {
+				_ = cleaner.RemoveWorktreeForce(context.Background(), path)
+			}
+			if createdLock {
+				_, _ = e.Store.ReleaseLock(ctx, lock)
+			}
+			return db.Task{}, err
+		}
+	}
 	if err := e.Store.UpsertTask(ctx, task); err != nil {
 		if createdLock {
 			_, _ = e.Store.ReleaseLock(ctx, lock)
@@ -181,6 +206,20 @@ func (e Engine) AllocateTaskWorktree(ctx context.Context, request TaskWorktreeRe
 		return db.Task{}, err
 	}
 	return task, nil
+}
+
+func (e Engine) claimPlannedTaskForImplementation(ctx context.Context, taskID string) error {
+	changed, current, err := e.Store.CompareAndSwapTaskState(ctx, taskID, string(TaskPlanned), string(TaskImplementing))
+	if err != nil {
+		return err
+	}
+	if changed {
+		return nil
+	}
+	if current == string(TaskDismissed) {
+		return fmt.Errorf("task %s was dismissed while task run was starting; recover it explicitly before retrying", taskID)
+	}
+	return fmt.Errorf("task %s left planned state while task run was starting (now %s); retry from its current lifecycle state", taskID, current)
 }
 
 // DelegationWorktreeRequest carries the inputs needed to allocate a git

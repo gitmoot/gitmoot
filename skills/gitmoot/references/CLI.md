@@ -1275,8 +1275,14 @@ best-effort, and appends `task_dismissed_manual` to `task events`. Repeating the
 command is an exit-0 no-op with `changed:false` in JSON.
 
 `task events <id>` prints the append-only task lifecycle trail. Automatic stale
-dismissals use `task_dismissed_auto`; explicit recovery and retry use
-`task_recovered` and `task_recovered_job_retry`.
+dismissals use `task_dismissed_auto`; opt-in never-started-plan retirement uses
+`task_dismissed_planned_ttl`; explicit recovery and retry use `task_recovered`
+and `task_recovered_job_retry`. A clean closed-unmerged PR records
+`pr_closed_unmerged` while moving `pr_open`, `reviewing`, or
+`changes_requested` to `blocked`. Once advancement/delegation handling has no
+live successor, a terminal top-level implement job without a PR records
+`task_blocked_terminal_no_pr` for implemented success or
+`task_blocked_job_failed` for another terminal outcome and blocks the task.
 
 ### Recover A Dead Implement
 
@@ -1323,6 +1329,15 @@ restart that points to it):
 - **Live process still in the worktree** — `task recover` refuses while a live
   process is still inside the task worktree; wait for it to exit or stop the
   orphaned implementer before recovering.
+
+Planned-task retirement is separate from the default-on stale implementation
+sweep. Set `[workflow].planned_ttl = "720h"` only when the repository explicitly
+wants old never-started plans dismissed. It is off by default; unset, empty,
+`"0"`, or invalid values disable it because dismissal can lose human context a
+goal-file import cannot restore. Live jobs, open PRs, remote branches, and
+uncertain remote checks prevent dismissal. A write-time allocation CAS also
+prevents `task run` from resurrecting a concurrently dismissed plan; recover it
+explicitly before retrying.
 
 ## PR Comments
 

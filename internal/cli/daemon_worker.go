@@ -607,6 +607,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		if markErr := w.handleRunJobError(ctx, job.ID, err); markErr != nil {
 			return markErr
 		}
+		if reconcileErr := engine.ReconcileTerminalDrivingJob(ctx, job.ID); reconcileErr != nil {
+			return reconcileErr
+		}
 		commentErr := err
 		if job.Type == "implement" && runtimePermissionFailure(err) {
 			latest, latestErr := w.Store.GetJob(ctx, job.ID)
@@ -617,6 +620,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, commentErr)
 		writeLine(w.Stdout, "job %s failed: %v", job.ID, err)
 		return nil
+	}
+	if err := engine.ReconcileTerminalDrivingJob(ctx, job.ID); err != nil {
+		return err
 	}
 	_ = w.postJobResultComment(ctx, job.ID, agent, checkout, nil)
 	writeLine(w.Stdout, "job %s completed", job.ID)
@@ -1676,6 +1682,9 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		if markErr := w.handleRunJobError(ctx, delegatedJob.ID, err); markErr != nil {
 			return markErr
 		}
+		if reconcileErr := engine.ReconcileTerminalDrivingJob(ctx, delegatedJob.ID); reconcileErr != nil {
+			return reconcileErr
+		}
 		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
 		writeLine(w.Stdout, "job %s failed: %v", delegatedJob.ID, err)
 		return nil
@@ -1687,6 +1696,9 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 			}
 			return err
 		}
+	}
+	if err := engine.ReconcileTerminalDrivingJob(ctx, delegatedJob.ID); err != nil {
+		return err
 	}
 	_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, nil)
 	writeLine(w.Stdout, "job %s completed by temporary worker %s", delegatedJob.ID, started.Agent.Name)
@@ -2243,7 +2255,10 @@ func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 		return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry failed: "+err.Error())
 	}
 	writeLine(w.Stdout, "job %s advancement retried", job.ID)
-	return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_retried", Message: "post-delivery workflow retry completed"})
+	if err := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_retried", Message: "post-delivery workflow retry completed"}); err != nil {
+		return err
+	}
+	return engine.ReconcileTerminalDrivingJob(ctx, job.ID)
 }
 
 func (w jobWorker) refreshImplementedPayloadForRetry(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, bool, error) {

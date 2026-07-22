@@ -44,7 +44,10 @@ artifact_blobs = %q
 # follows checkout HEAD and guards stale non-default checkouts. result_checks is
 # off | warn | block and defaults to warn when omitted. stale_task_ttl is the
 # conservative updated_at age after which abandoned implementing/blocked tasks
-# may be auto-dismissed; it defaults to 168h and "0" disables the reconciler.
+# may be auto-dismissed; it defaults to 168h and "0" disables that reconciler.
+# planned_ttl is a separate destructive retirement policy for never-started
+# plans. It is OPT-IN and disabled by default because dismissal can discard human
+# planning context that a later goal-file import cannot reconstruct.
 # require_workflow is true by default. In the default auto mode, fresh unlabeled
 # agent dispatches are filed under adhoc/<agent>-<yyyy-mm-dd> and never
 # rejected. Set require_workflow = false to opt out, or require_workflow_mode =
@@ -54,6 +57,7 @@ artifact_blobs = %q
 # implement_base = "origin/main"
 # result_checks = "warn"
 # stale_task_ttl = "168h"
+# planned_ttl = "720h" # opt-in; unset/empty/0/invalid disables
 # require_workflow = false # opt out (default is true)
 # require_workflow_mode = "auto" # auto | strict
 

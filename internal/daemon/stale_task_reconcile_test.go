@@ -277,6 +277,62 @@ func TestStaleTaskReconcilerDisabledAndInvalidConfig(t *testing.T) {
 	}
 }
 
+func TestPlannedTaskReconcilerDefaultOffAndOptIn(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		config      string
+		liveJob     bool
+		wantDismiss bool
+	}{
+		{name: "default off"},
+		{name: "invalid remains off", config: "later"},
+		{name: "opted in", config: "1h", wantDismiss: true},
+		{name: "in-flight task run stays planned", config: "1h", liveJob: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := testStore(t)
+			repo := github.Repository{Owner: "owner", Name: "repo"}
+			seedStaleRepo(t, store, repo)
+			if test.config != "" {
+				writeTaskTTLConfig(t, store, "0", test.config)
+			}
+			task := db.Task{ID: "task-planned", RepoFullName: repo.FullName(), State: string(workflow.TaskPlanned)}
+			if err := store.UpsertTask(ctx, task); err != nil {
+				t.Fatal(err)
+			}
+			if test.liveJob {
+				payload, _ := json.Marshal(workflow.JobPayload{Repo: repo.FullName(), TaskID: task.ID})
+				if err := store.CreateJob(ctx, db.Job{ID: "task-run", Type: "implement", State: string(workflow.JobQueued), Payload: string(payload)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			d := Daemon{Repo: repo, Store: store, Now: futureClock, RemoteBranches: &fakeRemoteBranchChecker{present: map[string]struct{}{}}}
+			if err := d.reconcileStaleTasks(ctx, map[string]struct{}{}); err != nil {
+				t.Fatalf("reconcileStaleTasks: %v", err)
+			}
+			got, err := store.GetTask(ctx, task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if dismissed := got.State == string(workflow.TaskDismissed); dismissed != test.wantDismiss {
+				t.Fatalf("task state = %s, wantDismiss=%v", got.State, test.wantDismiss)
+			}
+			events, err := store.ListTaskEvents(ctx, task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.wantDismiss {
+				if len(events) != 1 || events[0].Kind != "task_dismissed_planned_ttl" || events[0].FromState != string(workflow.TaskPlanned) || events[0].ToState != string(workflow.TaskDismissed) {
+					t.Fatalf("events = %+v", events)
+				}
+			} else if len(events) != 0 {
+				t.Fatalf("unexpected events = %+v", events)
+			}
+		})
+	}
+}
+
 func TestPollOnceRunsStaleTaskReconciler(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
@@ -335,8 +391,17 @@ func seedStaleRepo(t *testing.T, store *db.Store, repo github.Repository) {
 
 func writeStaleTaskConfig(t *testing.T, store *db.Store, value string) {
 	t.Helper()
+	writeTaskTTLConfig(t, store, value, "")
+}
+
+func writeTaskTTLConfig(t *testing.T, store *db.Store, staleTTL, plannedTTL string) {
+	t.Helper()
 	path := filepath.Join(filepath.Dir(store.DatabasePath()), "config.toml")
-	if err := os.WriteFile(path, []byte("[workflow]\nstale_task_ttl = \""+value+"\"\n"), 0o600); err != nil {
+	content := "[workflow]\nstale_task_ttl = \"" + staleTTL + "\"\n"
+	if plannedTTL != "" {
+		content += "planned_ttl = \"" + plannedTTL + "\"\n"
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }

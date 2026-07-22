@@ -1092,7 +1092,10 @@ resume machinery, and refuses while a matching job or worktree process remains
 live. It preserves branch and worktree, releases the branch lock best-effort,
 and records `task_dismissed_manual`; an already-dismissed task is an exit-0
 no-op (`changed:false` in JSON). `task events <id>` lists the append-only trail,
-including daemon `task_dismissed_auto` and explicit recovery events.
+including daemon `task_dismissed_auto`, opt-in
+`task_dismissed_planned_ttl`, closed-unmerged `pr_closed_unmerged`, terminal
+top-level implement triage (`task_blocked_terminal_no_pr` or
+`task_blocked_job_failed`), and explicit recovery events.
 
 ### Recover a dead implement
 
@@ -1142,6 +1145,24 @@ qualifying `implementing`/`blocked` tasks per repo poll.
 branches, branches still present on `origin`, and remote-check uncertainty all
 prevent automatic dismissal; successful transitions record
 `task_dismissed_auto`.
+
+`[workflow].planned_ttl = "720h"` is a separate repository opt-in for old
+never-started plans. It is disabled by default; unset, empty, `"0"`, and invalid
+values all mean off because automatic dismissal can destroy human planning
+context that goal-file re-import cannot reconstruct. When enabled it uses the
+same live-job, same-repo open-PR, remote-branch, and remote-uncertainty skips and
+records `task_dismissed_planned_ttl`. Task allocation claims
+`planned -> implementing` atomically at the write boundary, so a concurrent TTL
+dismissal cannot be resurrected by `task run`; explicit recovery is required.
+
+A clean closed-unmerged PR moves `pr_open`, `reviewing`, or
+`changes_requested` to `blocked` with `pr_closed_unmerged`; ambiguous PR state
+remains conservative. After advancement and delegation handling, a terminal
+top-level implement job with no PR and no live successor also blocks an
+`implementing` task. Implemented success without a PR records
+`task_blocked_terminal_no_pr`; other terminal outcomes record
+`task_blocked_job_failed`. Delegation children and queued fixes, retries,
+continuations, or pending advancement are not reclassified.
 
 Two refusals guard recovery (and the `task run` / `agent implement` restart that
 points to it):

@@ -738,6 +738,24 @@ recover` restores preserved artifacts through `implementing` to `pr_open`, or
 restores a branchless task to `planned`; job retry records its own recovery
 event. The server-side task board omits dismissed rows immediately.
 
+Never-started `planned` tasks use a separate opt-in policy:
+`[workflow].planned_ttl = "720h"`. It is disabled by default; unset, empty,
+zero, and invalid values all resolve to off because automatic dismissal can
+destroy human planning context that goal-file re-import cannot reconstruct.
+When enabled, it reuses the same live-job, same-repo open-PR, remote-branch,
+and remote-uncertainty skips and records `task_dismissed_planned_ttl`. Task
+worktree allocation claims `planned -> implementing` with a write-time CAS, so
+a concurrent TTL dismissal cannot be overwritten; explicit recovery is needed.
+
+A clean closed-unmerged PR moves `pr_open`, `reviewing`, or
+`changes_requested` to `blocked` with `pr_closed_unmerged`; ambiguous PR state
+does not advance or unblock anything. After advancement and delegation handling,
+a terminal top-level implement job with no PR and no live successor blocks an
+otherwise-stuck `implementing` task. Implemented success without a PR records
+`task_blocked_terminal_no_pr`; other terminal outcomes record
+`task_blocked_job_failed`. Delegation children and tasks with queued retries,
+fixes, continuations, or pending advancement remain under their existing owner.
+
 **PR-bound fix pass:** use `gitmoot agent implement <agent> --repo owner/repo
 --pr <number> "..."` or `gitmoot agent run <agent> --repo owner/repo --action
 implement --pr <number> "..."` to send an existing open PR back through its

@@ -200,17 +200,28 @@ func TestHandleReviewPullRequestClosedMergedLifecycleStates(t *testing.T) {
 	}
 }
 
-func TestHandleReviewPullRequestClosedUnmergedLeavesNonReviewingStatesUnchanged(t *testing.T) {
-	states := []TaskState{TaskPullRequestOpen, TaskChangesRequested, TaskReadyToMerge, TaskBlocked}
+func TestHandleReviewPullRequestClosedUnmergedLifecycleStates(t *testing.T) {
+	states := []struct {
+		state       TaskState
+		want        TaskState
+		wantPRState string
+		wantEvent   bool
+	}{
+		{state: TaskPullRequestOpen, want: TaskBlocked, wantPRState: "closed", wantEvent: true},
+		{state: TaskReviewing, want: TaskBlocked, wantPRState: "closed", wantEvent: true},
+		{state: TaskChangesRequested, want: TaskBlocked, wantPRState: "closed", wantEvent: true},
+		{state: TaskReadyToMerge, want: TaskReadyToMerge, wantPRState: "open"},
+		{state: TaskBlocked, want: TaskBlocked, wantPRState: "open"},
+	}
 	for _, state := range states {
-		t.Run(string(state), func(t *testing.T) {
+		t.Run(string(state.state), func(t *testing.T) {
 			ctx := context.Background()
 			store := openEngineStore(t)
 			if err := store.UpsertTask(ctx, db.Task{
 				ID:           "task-893",
 				RepoFullName: "owner/repo",
 				Title:        "Conservative close handling",
-				State:        string(state),
+				State:        string(state.state),
 				Branch:       "feature/893",
 			}); err != nil {
 				t.Fatalf("UpsertTask: %v", err)
@@ -225,25 +236,38 @@ func TestHandleReviewPullRequestClosedUnmergedLeavesNonReviewingStatesUnchanged(
 			}
 
 			engine := Engine{Store: store}
-			if err := engine.HandleReviewPullRequestClosed(ctx, PullRequestEvent{
-				Repo:        "owner/repo",
-				Branch:      "feature/893",
-				PullRequest: 893,
-				TaskID:      "task-893",
-				TaskTitle:   "Conservative close handling",
-				LeadAgent:   "github",
-				Sender:      "github",
-			}, false); err != nil {
-				t.Fatalf("HandleReviewPullRequestClosed: %v", err)
+			for i := 0; i < 2; i++ {
+				if err := engine.HandleReviewPullRequestClosed(ctx, PullRequestEvent{
+					Repo:        "owner/repo",
+					Branch:      "feature/893",
+					PullRequest: 893,
+					TaskID:      "task-893",
+					TaskTitle:   "Conservative close handling",
+					LeadAgent:   "github",
+					Sender:      "github",
+				}, false); err != nil {
+					t.Fatalf("HandleReviewPullRequestClosed pass %d: %v", i+1, err)
+				}
 			}
 
 			task, err := store.GetTask(ctx, "task-893")
-			if err != nil || task.State != string(state) {
-				t.Fatalf("task = %+v, err=%v; want %s", task, err, state)
+			if err != nil || task.State != string(state.want) {
+				t.Fatalf("task = %+v, err=%v; want %s", task, err, state.want)
 			}
 			pr, err := store.GetPullRequest(ctx, "owner/repo", 893)
-			if err != nil || pr.State != "open" {
-				t.Fatalf("pull request = %+v, err=%v; want open", pr, err)
+			if err != nil || pr.State != state.wantPRState {
+				t.Fatalf("pull request = %+v, err=%v; want %s", pr, err, state.wantPRState)
+			}
+			events, err := store.ListTaskEvents(ctx, "task-893")
+			if err != nil {
+				t.Fatalf("ListTaskEvents: %v", err)
+			}
+			if state.wantEvent {
+				if len(events) != 1 || events[0].Kind != "pr_closed_unmerged" || events[0].FromState != string(state.state) || events[0].ToState != string(TaskBlocked) {
+					t.Fatalf("task events = %+v", events)
+				}
+			} else if len(events) != 0 {
+				t.Fatalf("unexpected task events = %+v", events)
 			}
 		})
 	}

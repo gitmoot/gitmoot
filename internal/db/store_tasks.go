@@ -440,6 +440,30 @@ func (s *Store) ListTaskEvents(ctx context.Context, taskID string) ([]TaskEvent,
 
 var ErrTaskHasActiveJob = errors.New("task has a queued or running job")
 
+// CompareAndSwapTaskState atomically moves one task state without adding an
+// audit event. It exists for legacy lifecycle writers that already changed state
+// without task_events but need write-time exclusion against a concurrent
+// terminal transition. New audited lifecycle transitions should use
+// TransitionTaskStateWithEvent instead.
+func (s *Store) CompareAndSwapTaskState(ctx context.Context, taskID, from, to string) (changed bool, currentState string, err error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE tasks SET state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`,
+		strings.TrimSpace(to), strings.TrimSpace(taskID), strings.TrimSpace(from))
+	if err != nil {
+		return false, "", err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, "", err
+	}
+	if affected > 0 {
+		return true, strings.TrimSpace(to), nil
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT state FROM tasks WHERE id = ?`, strings.TrimSpace(taskID)).Scan(&currentState); err != nil {
+		return false, "", err
+	}
+	return false, currentState, nil
+}
+
 // TransitionTaskStateWithEvent atomically compares and moves a task state and
 // appends its audit event. A failed comparison writes no event and returns the
 // current state so callers can distinguish idempotence from a conflicting move.

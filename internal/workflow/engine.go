@@ -1151,10 +1151,11 @@ func (e Engine) HandlePullRequestReadyToMerge(ctx context.Context, event PullReq
 //
 // Merged PRs resolve any of
 // pr_open/reviewing/changes_requested/ready_to_merge/blocked; an already-merged
-// task is accepted only to repair its stale PR mirror. Closed-unmerged behavior
-// remains deliberately narrower: only reviewing uses the existing transition to
-// blocked; the other lifecycle states are untouched. Existing PR row fields
-// (url/base/merge SHA) are preserved.
+// task is accepted only to repair its stale PR mirror. A clean closed-unmerged
+// detection resolves pr_open/reviewing/changes_requested to blocked. The daemon's
+// closed-PR reconcile pass is the sole caller for that transition; the external-
+// merge pass only records its workflow breadcrumb, avoiding double handling.
+// Existing PR row fields (url/base/merge SHA) are preserved.
 func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullRequestEvent, merged bool) error {
 	if err := e.validate(); err != nil {
 		return err
@@ -1182,8 +1183,12 @@ func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullReq
 		default:
 			return nil
 		}
-	} else if taskState != TaskReviewing {
-		return nil
+	} else {
+		switch taskState {
+		case TaskPullRequestOpen, TaskReviewing, TaskChangesRequested:
+		default:
+			return nil
+		}
 	}
 	prState := "closed"
 	nextTaskState := TaskBlocked
@@ -1200,8 +1205,22 @@ func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullReq
 			// collision fallback advancing the implement task.
 			stateRef.Branch = ""
 		}
-		if err := e.setTaskState(ctx, stateRef, nextTaskState); err != nil {
-			return err
+		if merged {
+			if err := e.setTaskState(ctx, stateRef, nextTaskState); err != nil {
+				return err
+			}
+		} else {
+			changed, _, err := e.Store.TransitionTaskStateWithEvent(ctx, task.ID,
+				[]string{string(TaskPullRequestOpen), string(TaskReviewing), string(TaskChangesRequested)},
+				string(TaskBlocked), "pr_closed_unmerged", "pull request closed without merging")
+			if err != nil {
+				return err
+			}
+			if !changed {
+				// A concurrent lifecycle move won the CAS. Preserve that newer state and
+				// do not let this stale close observation rewrite the PR mirror.
+				return nil
+			}
 		}
 	}
 	pr := db.PullRequest{

@@ -113,6 +113,24 @@ activity proxy. Configure `[workflow].stale_task_ttl = "168h"` (the default), or
 set it to `"0"` to disable this poll leg. Candidates with a same-repo open PR,
 a remote branch, a live job, or an uncertain remote check are not dismissed.
 
+Never-started plans have a separate destructive opt-in:
+`[workflow].planned_ttl = "720h"`. It is disabled by default; unset, empty,
+`"0"`, and invalid values all mean off because dismissing a plan can destroy
+human context that a goal-file re-import cannot reconstruct. When enabled, the
+same live-job, open-PR, remote-branch, and uncertain-remote safeguards apply,
+and a dismissal records `task_dismissed_planned_ttl`. `task run` claims
+`planned -> implementing` atomically at allocation time, so a concurrent TTL
+dismissal cannot resurrect the task; use explicit `task recover` before retrying.
+
+A PR cleanly observed closed without merging moves a linked `pr_open`,
+`reviewing`, or `changes_requested` task to `blocked` and records
+`pr_closed_unmerged`; ambiguous observations remain conservative. After
+advancement and delegation handling, a terminal top-level implement job with no
+PR and no live successor also moves `implementing` to `blocked`. Implemented
+success without a PR records `task_blocked_terminal_no_pr`; other terminal
+outcomes record `task_blocked_job_failed`. Delegation children and queued
+fix/retry/continuation jobs are excluded.
+
 Dismissed tasks never return to implementation through ordinary task run,
 allocation, or late workflow advancement. `task recover` is the explicit path:
 preserved branch/worktree artifacts move through `implementing` to `pr_open`,

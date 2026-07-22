@@ -131,6 +131,38 @@ func TestEngineAllocateTaskWorktreeRejectsDismissedTask(t *testing.T) {
 	}
 }
 
+func TestEngineAllocateTaskWorktreeDoesNotResurrectConcurrentPlannedTTLDismissal(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-race", RepoFullName: "owner/repo", State: string(TaskPlanned)}); err != nil {
+		t.Fatal(err)
+	}
+	manager := &fakeWorktreeManager{onAdd: func() {
+		changed, _, err := store.TransitionTaskStateWithEventIfNoActiveJob(ctx, "task-race",
+			[]string{string(TaskPlanned)}, string(TaskDismissed), "task_dismissed_planned_ttl", "test interleave")
+		if err != nil || !changed {
+			t.Fatalf("planned_ttl interleave changed=%v err=%v", changed, err)
+		}
+	}}
+	_, err := testEngine(store).AllocateTaskWorktree(ctx, TaskWorktreeRequest{
+		Home: t.TempDir(), Repo: "owner/repo", TaskID: "task-race", Branch: "feature/race", Owner: "lead", Checkout: t.TempDir(),
+	}, manager)
+	if err == nil || !strings.Contains(err.Error(), "was dismissed") {
+		t.Fatalf("AllocateTaskWorktree error = %v, want concurrent dismissal refusal", err)
+	}
+	task, getErr := store.GetTask(ctx, "task-race")
+	if getErr != nil || task.State != string(TaskDismissed) {
+		t.Fatalf("task = %+v, err=%v; dismissed task was resurrected", task, getErr)
+	}
+	events, eventErr := store.ListTaskEvents(ctx, task.ID)
+	if eventErr != nil || len(events) != 1 || events[0].Kind != "task_dismissed_planned_ttl" {
+		t.Fatalf("events = %+v, err=%v", events, eventErr)
+	}
+	if len(manager.removedForce) != 1 {
+		t.Fatalf("worktree cleanup calls = %v, want one", manager.removedForce)
+	}
+}
+
 func TestEngineAllocateTaskWorktreeWaitsForCheckoutMutationLock(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

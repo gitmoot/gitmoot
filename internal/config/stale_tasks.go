@@ -9,6 +9,51 @@ import (
 
 const DefaultStaleTaskTTL = 168 * time.Hour
 
+// LoadPlannedTaskTTL resolves the hot-read [workflow].planned_ttl setting.
+// Planned-task retirement is destructive to human planning context, so every
+// absent, empty, zero, negative, or unparseable value disables it. Only an
+// explicit positive Go duration opts a repository daemon into the sweep.
+func LoadPlannedTaskTTL(paths Paths) (time.Duration, error) {
+	content, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	current := ""
+	for _, raw := range strings.Split(string(content), "\n") {
+		line := strings.TrimSpace(stripConfigComment(raw))
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			current = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]"))
+			continue
+		}
+		if current != "workflow" {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(key) != "planned_ttl" {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if strings.HasPrefix(value, "\"") {
+			value, err = parseConfigString(value)
+			if err != nil {
+				return 0, nil
+			}
+		}
+		ttl, err := time.ParseDuration(strings.TrimSpace(value))
+		if err != nil || ttl <= 0 {
+			return 0, nil
+		}
+		return ttl, nil
+	}
+	return 0, nil
+}
+
 // LoadStaleTaskTTL resolves the hot-read [workflow].stale_task_ttl setting.
 // Omitted or empty uses seven days, exactly "0" disables reconciliation, and
 // every other value must be a non-negative Go duration.

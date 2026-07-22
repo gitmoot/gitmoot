@@ -106,13 +106,15 @@ func TestExternalMergeCandidateState(t *testing.T) {
 	}
 }
 
-func TestPollOnceLeavesClosedUnmergedPullRequestOpenTaskUnchanged(t *testing.T) {
+func TestPollOnceBlocksClosedUnmergedPullRequestOpenTask(t *testing.T) {
 	ctx := context.Background()
 	repo := github.Repository{Owner: "owner", Name: "repo"}
 	store := testStore(t)
 	seedExternalMergeTask(t, store, repo, "task-7", "feature/seven", workflow.TaskPullRequestOpen, 7)
 	client := &fakeGitHub{
-		pullsByState:  map[string][]github.PullRequest{"open": nil, "closed": nil},
+		pullsByState: map[string][]github.PullRequest{"open": nil, "closed": {
+			{Number: 7, State: "closed", HeadRef: "feature/seven", HeadSHA: "head-7"},
+		}},
 		pullsByNumber: map[int64]github.PullRequest{7: {Number: 7, State: "closed", HeadRef: "feature/seven", HeadSHA: "head-7"}},
 		comments:      map[int64][]github.IssueComment{},
 	}
@@ -122,15 +124,18 @@ func TestPollOnceLeavesClosedUnmergedPullRequestOpenTaskUnchanged(t *testing.T) 
 	if err := daemon.PollOnce(ctx); err != nil {
 		t.Fatalf("PollOnce: %v", err)
 	}
-	assertExternalMergeState(t, store, repo.FullName(), "task-7", 7, workflow.TaskPullRequestOpen, "open")
+	assertExternalMergeState(t, store, repo.FullName(), "task-7", 7, workflow.TaskBlocked, "closed")
+	events, err := store.ListTaskEvents(ctx, "task-7")
+	if err != nil || len(events) != 1 || events[0].Kind != "pr_closed_unmerged" {
+		t.Fatalf("task events = %+v, err=%v", events, err)
+	}
 }
 
 // TestPollOnceRecordsClosedBreadcrumbForWorkflowLinkedPROpenTask covers #958's
 // acceptance criterion that a closed-unmerged PR reads as "closed" on the
-// workflow view even when the task never entered `reviewing`. The task state
-// must NOT change (an abandoned PR does not advance/un-block a pr_open task —
-// the #953 conservatism), only the workflow status breadcrumb is emitted, and
-// it must be idempotent across ticks and never imply success.
+// workflow view even when the task never entered `reviewing`. The clean closed-
+// unmerged detection blocks the task while the workflow breadcrumb remains
+// idempotent across ticks and never implies success.
 func TestPollOnceRecordsClosedBreadcrumbForWorkflowLinkedPROpenTask(t *testing.T) {
 	t.Setenv("HERDR_SOCKET_PATH", "/tmp/throwaway")
 	t.Setenv("HERDR_ENV", "")
@@ -144,7 +149,9 @@ func TestPollOnceRecordsClosedBreadcrumbForWorkflowLinkedPROpenTask(t *testing.T
 		t.Fatalf("CreateJob: %v", err)
 	}
 	client := &fakeGitHub{
-		pullsByState:  map[string][]github.PullRequest{"open": nil, "closed": nil},
+		pullsByState: map[string][]github.PullRequest{"open": nil, "closed": {
+			{Number: 7, State: "closed", HeadRef: "feature/seven", HeadSHA: "head-7"},
+		}},
 		pullsByNumber: map[int64]github.PullRequest{7: {Number: 7, State: "closed", HeadRef: "feature/seven", HeadSHA: "head-7"}},
 		comments:      map[int64][]github.IssueComment{},
 	}
@@ -158,8 +165,11 @@ func TestPollOnceRecordsClosedBreadcrumbForWorkflowLinkedPROpenTask(t *testing.T
 		t.Fatalf("second PollOnce: %v", err)
 	}
 
-	// Abandoned PR must not change task state; only the workflow view updates.
-	assertExternalMergeState(t, store, repo.FullName(), "task-7", 7, workflow.TaskPullRequestOpen, "open")
+	assertExternalMergeState(t, store, repo.FullName(), "task-7", 7, workflow.TaskBlocked, "closed")
+	taskEvents, err := store.ListTaskEvents(ctx, "task-7")
+	if err != nil || len(taskEvents) != 1 || taskEvents[0].Kind != "pr_closed_unmerged" {
+		t.Fatalf("task events after two ticks = %+v, err=%v", taskEvents, err)
+	}
 
 	notes, err := store.ListWorkflowNotes(ctx, "gitmoot4/selfdesc-958", 0)
 	if err != nil || len(notes) != 1 || notes[0].Author != db.WorkflowAutoNoteAuthor || notes[0].Body != "[auto:pr:7:closed] PR #7 closed without merging" {
