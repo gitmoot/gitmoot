@@ -260,6 +260,8 @@ type orgStatusOutput struct {
 	ProviderDetail  string             `json:"provider_detail,omitempty"`
 	ObservedAt      time.Time          `json:"observed_at,omitempty"`
 	ProviderVersion string             `json:"provider_version,omitempty"`
+	RecycleStatus   string             `json:"recycle,omitempty"`
+	RecycleAfter    string             `json:"recycle_after,omitempty"`
 }
 
 func runOrgBrief(args []string, stdout, stderr io.Writer) int {
@@ -377,10 +379,25 @@ func runOrgOverview(command string, args []string, stdout, stderr io.Writer) int
 			live = org.RoleLiveState{State: org.StateUnknown, Detail: "provider snapshot omitted this role"}
 		}
 		seen := presence[role.Name]
+		recycleStatus := ""
+		recycleAfterText := ""
+		if command == "status" {
+			recycleAfter := cfg.RecycleAfterFor(role.Name)
+			if recycleAfter > 0 {
+				activeJobs, err := store.CountActiveJobsByOrgRole(ctx, role.Name)
+				if err != nil {
+					fmt.Fprintf(stderr, "org status: count active jobs for role %q: %v\n", role.Name, err)
+					return 1
+				}
+				recycleStatus = orgRecycleStatus(seen.LastSeenAt, observedNow, live.State, activeJobs, recycleAfter)
+				recycleAfterText = formatOrgRecycleAfter(recycleAfter)
+			}
+		}
 		rows = append(rows, orgStatusOutput{
 			Role: role.Name, Parent: role.Parent, Pane: role.Pane, Depth: len(cfg.Path(role.Name)) - 1,
 			Scope: role.Scope, MergeRule: role.MergeRule, LastSeenAt: seen.LastSeenAt, LastSeenAge: orgPresenceAge(seen.LastSeenAt, observedNow), LastCommand: seen.LastCommand,
 			ProviderState: live.State, ProviderDetail: live.Detail, ObservedAt: snapshot.ObservedAt, ProviderVersion: snapshot.ProviderVersion,
+			RecycleStatus: recycleStatus, RecycleAfter: recycleAfterText,
 		})
 	}
 	if command == "chart" {
@@ -402,9 +419,9 @@ func runOrgOverview(command string, args []string, stdout, stderr io.Writer) int
 		}
 		return 0
 	}
-	fmt.Fprintln(stdout, "ROLE\tSTATE\tLAST SEEN\tAGE\tLAST COMMAND\tDETAIL")
+	fmt.Fprintln(stdout, "ROLE\tSTATE\tLAST SEEN\tAGE\tLAST COMMAND\tDETAIL\tRECYCLE")
 	for _, row := range rows {
-		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t%s\n", row.Role, row.ProviderState, dash(row.LastSeenAt), dash(row.LastSeenAge), dash(row.LastCommand), dash(row.ProviderDetail))
+		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t%s\trecycle=%s\n", row.Role, row.ProviderState, dash(row.LastSeenAt), dash(row.LastSeenAge), dash(row.LastCommand), dash(row.ProviderDetail), firstNonEmpty(row.RecycleStatus, "off"))
 	}
 	return 0
 }
@@ -496,19 +513,11 @@ func dash(value string) string {
 }
 
 func orgPresenceAge(value string, now time.Time) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
+	if strings.TrimSpace(value) == "" {
 		return ""
 	}
-	var observed time.Time
-	var err error
-	for _, layout := range []string{"2006-01-02 15:04:05", time.RFC3339Nano, time.RFC3339} {
-		observed, err = time.Parse(layout, value)
-		if err == nil {
-			break
-		}
-	}
-	if err != nil {
+	observed, ok := parseOrgPresenceTime(value)
+	if !ok {
 		return "unknown"
 	}
 	age := now.Sub(observed.UTC())
@@ -516,6 +525,59 @@ func orgPresenceAge(value string, now time.Time) string {
 		age = 0
 	}
 	return age.Round(time.Second).String()
+}
+
+func parseOrgPresenceTime(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{"2006-01-02 15:04:05", time.RFC3339Nano, time.RFC3339} {
+		observed, err := time.Parse(layout, value)
+		if err == nil {
+			return observed, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func orgRecycleStatus(lastSeen string, now time.Time, state org.LifecycleState, activeJobs int, recycleAfter time.Duration) string {
+	if recycleAfter <= 0 {
+		return "off"
+	}
+	observed, ok := parseOrgPresenceTime(lastSeen)
+	if !ok {
+		return "off"
+	}
+	age := now.Sub(observed.UTC())
+	if age < 0 {
+		age = 0
+	}
+	if age < recycleAfter {
+		return "fresh"
+	}
+	if activeJobs > 0 {
+		return "overdue"
+	}
+	switch state {
+	case org.StateIdle, org.StateDone, org.StateUnknown:
+		return "eligible"
+	default:
+		return "overdue"
+	}
+}
+
+func formatOrgRecycleAfter(value time.Duration) string {
+	switch {
+	case value%time.Hour == 0:
+		return fmt.Sprintf("%dh", value/time.Hour)
+	case value%time.Minute == 0:
+		return fmt.Sprintf("%dm", value/time.Minute)
+	case value%time.Second == 0:
+		return fmt.Sprintf("%ds", value/time.Second)
+	default:
+		return value.String()
+	}
 }
 
 type orgEscalateOutput struct {

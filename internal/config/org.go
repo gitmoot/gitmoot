@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -18,14 +19,16 @@ type OrgRole struct {
 	MergeRule string
 	// Pane optionally binds this role to a Herdr pane for event-rule wakes. It is
 	// advisory and unused unless an enabled event rule targets the role.
-	Pane string
+	Pane         string
+	RecycleAfter time.Duration
 }
 
 // OrgConfig is the local organization registry. Its fields stay private so the
 // loader remains the single place that establishes its invariants.
 type OrgConfig struct {
-	enforce string
-	roles   map[string]OrgRole
+	enforce      string
+	recycleAfter time.Duration
+	roles        map[string]OrgRole
 }
 
 func (c OrgConfig) Enabled() bool { return len(c.roles) > 0 }
@@ -40,6 +43,13 @@ func (c OrgConfig) Enforce() string {
 func (c OrgConfig) Role(name string) (OrgRole, bool) {
 	r, ok := c.roles[strings.ToLower(strings.TrimSpace(name))]
 	return r, ok
+}
+
+func (c OrgConfig) RecycleAfterFor(role string) time.Duration {
+	if configured, ok := c.Role(role); ok && configured.RecycleAfter != 0 {
+		return configured.RecycleAfter
+	}
+	return c.recycleAfter
 }
 
 // Ancestors returns name's parent chain, nearest parent first. The cycle guard
@@ -132,6 +142,7 @@ func LoadOrg(paths Paths) (OrgConfig, error) {
 	roleFields := map[string]map[string]bool{}
 	seenOrgSection := false
 	seenEnforce := false
+	seenRecycleAfter := false
 	current := ""
 	inOrg := false
 	lines := strings.Split(string(content), "\n")
@@ -186,21 +197,36 @@ func LoadOrg(paths Paths) (OrgConfig, error) {
 		}
 		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
 		if current == "" {
-			if key != "enforce" {
+			// recycle_after is binary-first: binaries predating this allowlist
+			// fail closed on a config that uses the field.
+			if key != "enforce" && key != "recycle_after" {
 				return OrgConfig{}, fmt.Errorf("unknown [org] field %q", key)
 			}
-			if seenEnforce {
-				return OrgConfig{}, fmt.Errorf("duplicate [org].enforce")
+			switch key {
+			case "enforce":
+				if seenEnforce {
+					return OrgConfig{}, fmt.Errorf("duplicate [org].enforce")
+				}
+				seenEnforce = true
+				v, err := parseOrgTOMLString(value)
+				if err != nil {
+					return OrgConfig{}, fmt.Errorf("parse [org].enforce: %w", err)
+				}
+				cfg.enforce = v
+			case "recycle_after":
+				if seenRecycleAfter {
+					return OrgConfig{}, fmt.Errorf("duplicate [org].recycle_after")
+				}
+				seenRecycleAfter = true
+				v, err := parseOrgDuration(value)
+				if err != nil {
+					return OrgConfig{}, fmt.Errorf("parse [org].recycle_after: %w", err)
+				}
+				cfg.recycleAfter = v
 			}
-			seenEnforce = true
-			v, err := parseOrgTOMLString(value)
-			if err != nil {
-				return OrgConfig{}, fmt.Errorf("parse [org].enforce: %w", err)
-			}
-			cfg.enforce = v
 			continue
 		}
-		if key != "parent" && key != "scope" && key != "merge_rule" && key != "pane" {
+		if key != "parent" && key != "scope" && key != "merge_rule" && key != "pane" && key != "recycle_after" {
 			return OrgConfig{}, fmt.Errorf("unknown field %q for org role %q", key, current)
 		}
 		if roleFields[current][key] {
@@ -247,6 +273,12 @@ func LoadOrg(paths Paths) (OrgConfig, error) {
 				return OrgConfig{}, fmt.Errorf("org role %q: parse pane: %w", current, err)
 			}
 			role.Pane = strings.TrimSpace(v)
+		case "recycle_after":
+			v, err := parseOrgDuration(value)
+			if err != nil {
+				return OrgConfig{}, fmt.Errorf("org role %q: parse recycle_after: %w", current, err)
+			}
+			role.RecycleAfter = v
 		}
 		cfg.roles[current] = role
 	}
@@ -314,6 +346,18 @@ func parseOrgTOMLString(value string) (string, error) {
 	return "", fmt.Errorf("expected quoted TOML string")
 }
 
+func parseOrgDuration(value string) (time.Duration, error) {
+	parsed, err := parseOrgTOMLString(value)
+	if err != nil {
+		return 0, err
+	}
+	duration, err := time.ParseDuration(parsed)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q: %w", parsed, err)
+	}
+	return duration, nil
+}
+
 // stripOrgConfigComment understands both TOML basic and literal strings. The
 // repo's older scanners only need basic strings; org also accepts TOML literals.
 func stripOrgConfigComment(value string) string {
@@ -344,6 +388,9 @@ func ValidateOrg(cfg OrgConfig) error {
 	if cfg.Enforce() != "block" && cfg.Enforce() != "warn" {
 		return fmt.Errorf("org enforce must be \"block\" or \"warn\"")
 	}
+	if cfg.recycleAfter < 0 {
+		return fmt.Errorf("org recycle_after must not be negative")
+	}
 	// Validate in sorted, structural passes so malformed registries return the
 	// same error regardless of Go map iteration order. Root naming deliberately
 	// precedes parent-reference checks, matching the retired Registry validator.
@@ -367,6 +414,9 @@ func ValidateOrg(cfg OrgConfig) error {
 		}
 		if role.MergeRule != "" && role.MergeRule != "owner" && role.MergeRule != "self" && role.MergeRule != "none" {
 			return fmt.Errorf("org role %q: invalid merge_rule %q", name, role.MergeRule)
+		}
+		if role.RecycleAfter < 0 {
+			return fmt.Errorf("org role %q: recycle_after must not be negative", name)
 		}
 		seenScope := map[string]bool{}
 		for _, scope := range role.Scope {

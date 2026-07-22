@@ -388,6 +388,19 @@ func (s *Store) CountQueuedJobsForRepo(ctx context.Context, repo string) (int, e
 	return count, err
 }
 
+// CountActiveJobsByOrgRole reports queued/running dispatched work attributed
+// to role. Anchor jobs omit acting_org_role and therefore do not count. The
+// role arg is trim+lowered to match how acting_org_role is persisted
+// (NormalizeActingOrgRole), so a non-normalized caller cannot silently
+// under-count — this method is trusted by phase-3 recycle enforcement.
+func (s *Store) CountActiveJobsByOrgRole(ctx context.Context, role string) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs
+		WHERE json_extract(payload, '$.acting_org_role') = ?
+		AND state IN ('queued', 'running')`, strings.ToLower(strings.TrimSpace(role))).Scan(&count)
+	return count, err
+}
+
 // listRunningJobsUpdatedBeforeSQL is ListRunningJobsUpdatedBefore's exact query,
 // exported as a package-level const so the plan test (TestListRunningJobsUpdatedBeforeOrder)
 // EXPLAINs the PRODUCTION text (binding the threshold as its `?` parameter) instead of

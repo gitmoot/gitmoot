@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadOrgAndScopeMatching(t *testing.T) {
@@ -30,6 +31,77 @@ func TestLoadOrgAndScopeMatching(t *testing.T) {
 	}
 	if !ScopeMatches(role.Scope, "ACME/one") || !ScopeMatches([]string{"*"}, "any/repo") || ScopeMatches(role.Scope, "acme") || ScopeMatches(role.Scope, "wrong/repo") {
 		t.Fatal("scope matching mismatch")
+	}
+}
+
+func TestLoadOrgRecycleAfterPrecedence(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content := `[org]
+recycle_after = "24h"
+[org.roles."owner"]
+scope = ["*"]
+[org.roles."platform"]
+parent = "owner"
+scope = ["gitmoot/*"]
+recycle_after = "12h"
+[org.roles."api"]
+parent = "platform"
+scope = ["gitmoot/api"]
+[org.roles."zero"]
+parent = "owner"
+scope = ["gitmoot/zero"]
+recycle_after = "0s"
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadOrg(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.RecycleAfterFor("owner"); got != 24*time.Hour {
+		t.Fatalf("RecycleAfterFor(owner) = %s, want 24h", got)
+	}
+	if got := cfg.RecycleAfterFor("platform"); got != 12*time.Hour {
+		t.Fatalf("RecycleAfterFor(platform) = %s, want 12h", got)
+	}
+	if got := cfg.RecycleAfterFor("api"); got != 24*time.Hour {
+		t.Fatalf("RecycleAfterFor(api) = %s, want inherited 24h", got)
+	}
+	if got := cfg.RecycleAfterFor("zero"); got != 24*time.Hour {
+		t.Fatalf("RecycleAfterFor(zero) = %s, want zero override to inherit 24h", got)
+	}
+}
+
+func TestLoadOrgRecycleAfterFailsClosed(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "bad global", body: "[org]\nrecycle_after=\"tomorrow\"\n[org.roles.\"owner\"]\nscope=[\"*\"]\n", want: "recycle_after"},
+		{name: "negative global", body: "[org]\nrecycle_after=\"-1h\"\n[org.roles.\"owner\"]\nscope=[\"*\"]\n", want: "recycle_after must not be negative"},
+		{name: "bad role", body: "[org.roles.\"owner\"]\nscope=[\"*\"]\nrecycle_after=\"often\"\n", want: "recycle_after"},
+		{name: "negative role", body: "[org.roles.\"owner\"]\nscope=[\"*\"]\nrecycle_after=\"-30m\"\n", want: "recycle_after must not be negative"},
+		{name: "other unknown field", body: "[org]\nrecycle_after=\"24h\"\nunknown_recycle=true\n[org.roles.\"owner\"]\nscope=[\"*\"]\n", want: "unknown [org] field"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(paths.ConfigFile, []byte(test.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadOrg(paths); err == nil {
+				t.Fatal("LoadOrg() error = nil, want fail-closed rejection")
+			} else if !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("LoadOrg() error = %q, want substring %q", err, test.want)
+			}
+		})
 	}
 }
 

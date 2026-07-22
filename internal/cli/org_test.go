@@ -367,6 +367,9 @@ func TestRunOrgBriefChartStatusAndPresence(t *testing.T) {
 	if strings.Contains(stdout.String(), `"pane"`) {
 		t.Fatalf("paneless status unexpectedly emitted pane: %s", stdout.String())
 	}
+	if strings.Contains(stdout.String(), `"recycle"`) {
+		t.Fatalf("status without recycle policy unexpectedly emitted recycle fields: %s", stdout.String())
+	}
 	var status []orgStatusOutput
 	if err := json.Unmarshal(stdout.Bytes(), &status); err != nil || len(status) != 2 {
 		t.Fatalf("status = %+v err=%v output=%s", status, err, stdout.String())
@@ -421,6 +424,149 @@ func TestRunOrgBriefAndStatusJSONSurfacePane(t *testing.T) {
 		}
 	}
 	t.Fatalf("review role missing from status: %+v", status)
+}
+
+func TestOrgRecycleStatus(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name         string
+		lastSeen     string
+		state        org.LifecycleState
+		activeJobs   int
+		recycleAfter time.Duration
+		want         string
+	}{
+		{name: "off without policy", lastSeen: now.Add(-48 * time.Hour).Format(time.RFC3339), state: org.StateIdle, want: "off"},
+		{name: "off without presence", state: org.StateIdle, recycleAfter: 24 * time.Hour, want: "off"},
+		{name: "fresh", lastSeen: now.Add(-time.Hour).Format(time.RFC3339), state: org.StateWorking, recycleAfter: 24 * time.Hour, want: "fresh"},
+		{name: "eligible idle", lastSeen: now.Add(-24 * time.Hour).Format(time.RFC3339), state: org.StateIdle, recycleAfter: 24 * time.Hour, want: "eligible"},
+		{name: "eligible done", lastSeen: now.Add(-25 * time.Hour).Format(time.RFC3339), state: org.StateDone, recycleAfter: 24 * time.Hour, want: "eligible"},
+		{name: "eligible unknown", lastSeen: now.Add(-25 * time.Hour).Format(time.RFC3339), state: org.StateUnknown, recycleAfter: 24 * time.Hour, want: "eligible"},
+		{name: "overdue working", lastSeen: now.Add(-25 * time.Hour).Format(time.RFC3339), state: org.StateWorking, recycleAfter: 24 * time.Hour, want: "overdue"},
+		{name: "overdue blocked", lastSeen: now.Add(-25 * time.Hour).Format(time.RFC3339), state: org.StateBlocked, recycleAfter: 24 * time.Hour, want: "overdue"},
+		{name: "overdue active job", lastSeen: now.Add(-25 * time.Hour).Format(time.RFC3339), state: org.StateIdle, activeJobs: 1, recycleAfter: 24 * time.Hour, want: "overdue"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := orgRecycleStatus(test.lastSeen, now, test.state, test.activeJobs, test.recycleAfter); got != test.want {
+				t.Fatalf("orgRecycleStatus() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRunOrgStatusRecycleStates(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = file.WriteString(`
+[org]
+enforce = "warn"
+[org.roles."owner"]
+scope = ["*"]
+[org.roles."fresh"]
+parent = "owner"
+scope = ["*"]
+recycle_after = "24h"
+[org.roles."eligible"]
+parent = "owner"
+scope = ["*"]
+recycle_after = "1ns"
+[org.roles."working"]
+parent = "owner"
+scope = ["*"]
+recycle_after = "1ns"
+[org.roles."active"]
+parent = "owner"
+scope = ["*"]
+recycle_after = "1ns"
+`)
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	withOrgProvider(t, orgFixtureProvider{snapshot: org.Snapshot{
+		States: map[string]org.RoleLiveState{
+			"owner":    {State: org.StateUnknown},
+			"fresh":    {State: org.StateIdle},
+			"eligible": {State: org.StateDone},
+			"working":  {State: org.StateWorking},
+			"active":   {State: org.StateIdle},
+		},
+		ObservedAt: time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC), ProviderVersion: "0.7.5",
+	}})
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for _, role := range []string{"fresh", "eligible", "working", "active"} {
+		if err := store.TouchOrgRolePresence(ctx, role, "test"); err != nil {
+			store.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "active-job", Agent: "worker", Type: "ask", State: "queued", Payload: `{"acting_org_role":"active"}`}); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"org", "status", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("status JSON code = %d stderr=%s", code, stderr.String())
+	}
+	var rows []orgStatusOutput
+	if err := json.Unmarshal(stdout.Bytes(), &rows); err != nil {
+		t.Fatalf("decode status: %v; output=%s", err, stdout.String())
+	}
+	want := map[string]struct{ status, after string }{
+		"owner":    {},
+		"fresh":    {status: "fresh", after: "24h"},
+		"eligible": {status: "eligible", after: "1ns"},
+		"working":  {status: "overdue", after: "1ns"},
+		"active":   {status: "overdue", after: "1ns"},
+	}
+	for _, row := range rows {
+		expected, ok := want[row.Role]
+		if !ok {
+			t.Fatalf("unexpected status role %+v", row)
+		}
+		if row.RecycleStatus != expected.status || row.RecycleAfter != expected.after {
+			t.Fatalf("status[%s] recycle=%q after=%q, want %q/%q", row.Role, row.RecycleStatus, row.RecycleAfter, expected.status, expected.after)
+		}
+		delete(want, row.Role)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing status roles: %+v", want)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"org", "status", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("status text code = %d stderr=%s", code, stderr.String())
+	}
+	for role, expected := range map[string]string{"owner": "off", "fresh": "fresh", "eligible": "eligible", "working": "overdue", "active": "overdue"} {
+		found := false
+		for _, line := range strings.Split(stdout.String(), "\n") {
+			if strings.HasPrefix(line, role+"\t") && strings.Contains(line, "recycle="+expected) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("status text missing %s recycle=%s: %q", role, expected, stdout.String())
+		}
+	}
 }
 
 func TestRunOrgProviderFailureSemantics(t *testing.T) {
