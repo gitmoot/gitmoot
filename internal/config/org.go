@@ -39,6 +39,21 @@ func (c OrgConfig) Role(name string) (OrgRole, bool) {
 	return r, ok
 }
 
+// Ancestors returns name's parent chain, nearest parent first. The cycle guard
+// keeps this safe for callers holding a manually constructed config too, even
+// though LoadOrg rejects parent cycles.
+func (c OrgConfig) Ancestors(name string) []string {
+	seen := map[string]bool{}
+	var out []string
+	role, ok := c.Role(name)
+	for ok && role.Parent != "" && !seen[role.Parent] {
+		seen[role.Parent] = true
+		out = append(out, role.Parent)
+		role, ok = c.Role(role.Parent)
+	}
+	return out
+}
+
 func (c OrgConfig) Roots() []string {
 	roots := make([]string, 0, len(c.roles))
 	for name, role := range c.roles {

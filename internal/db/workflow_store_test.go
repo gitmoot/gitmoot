@@ -394,6 +394,29 @@ func TestWorkflowSummarySeparatesDaemonNotesFromHumanAcknowledgment(t *testing.T
 	}
 }
 
+func TestWorkflowSummaryExcludesOrgEscalateFromHumanAcknowledgment(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	const workflowID = "release/escalate"
+	if _, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: workflowID, Author: "operator", Body: "[org:escalate to=owner from=operator wf=release/escalate] why failed?"}); err != nil {
+		t.Fatalf("InsertWorkflowNote: %v", err)
+	}
+	summary, err := store.WorkflowSummary(ctx, workflowID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.LastHumanAuthor != "" || summary.LastHumanNoteAt != "" {
+		t.Fatalf("escalation acknowledged failure: %+v", summary)
+	}
+	if _, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: workflowID, Author: "coordinator", Body: "human acknowledgment"}); err != nil {
+		t.Fatalf("InsertWorkflowNote: %v", err)
+	}
+	summary, err = store.WorkflowSummary(ctx, workflowID)
+	if err != nil || summary.LastHumanAuthor != "coordinator" || summary.LastHumanNoteAt == "" {
+		t.Fatalf("ordinary note did not acknowledge: %+v err=%v", summary, err)
+	}
+}
+
 func TestWorkflowSummaryTracksMergedDaemonReceipt(t *testing.T) {
 	store := openWorkflowTestStore(t)
 	ctx := context.Background()

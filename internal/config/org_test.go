@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -29,6 +30,27 @@ func TestLoadOrgAndScopeMatching(t *testing.T) {
 	}
 	if !ScopeMatches(role.Scope, "ACME/one") || !ScopeMatches([]string{"*"}, "any/repo") || ScopeMatches(role.Scope, "acme") || ScopeMatches(role.Scope, "wrong/repo") {
 		t.Fatal("scope matching mismatch")
+	}
+}
+
+func TestOrgConfigAncestors(t *testing.T) {
+	cfg := OrgConfig{roles: map[string]OrgRole{
+		"owner":      {Name: "owner"},
+		"maintainer": {Name: "maintainer", Parent: "owner"},
+		"operator":   {Name: "operator", Parent: "maintainer"},
+	}}
+	if got, want := cfg.Ancestors("operator"), []string{"maintainer", "owner"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Ancestors(operator) = %v, want %v", got, want)
+	}
+	if got := cfg.Ancestors("missing"); len(got) != 0 {
+		t.Fatalf("Ancestors(missing) = %v, want none", got)
+	}
+	cycle := OrgConfig{roles: map[string]OrgRole{
+		"one": {Name: "one", Parent: "two"},
+		"two": {Name: "two", Parent: "one"},
+	}}
+	if got, want := cycle.Ancestors("one"), []string{"two", "one"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cycle-safe Ancestors(one) = %v, want %v", got, want)
 	}
 }
 

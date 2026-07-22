@@ -122,8 +122,9 @@ const workflowSummarySelectSQL = `WITH job_summary AS (
 			ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1), '') AS last_author,
 		COALESCE((SELECT latest.author FROM workflow_notes latest
 			WHERE latest.workflow_id = n.workflow_id AND latest.author != 'daemon'
+				AND substr(latest.body, 1, length('[org:escalate ')) != '[org:escalate '
 			ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1), '') AS last_human_author,
-		MAX(CASE WHEN n.author != 'daemon' THEN n.created_at END) AS last_human_at,
+		MAX(CASE WHEN n.author != 'daemon' AND substr(n.body, 1, length('[org:escalate ')) != '[org:escalate ' THEN n.created_at END) AS last_human_at,
 		MAX(CASE WHEN n.author = 'daemon' AND substr(n.body, 1, instr(n.body, ']')) LIKE '[auto:pr:%:merged]' THEN n.created_at END) AS last_merged_at
 	FROM workflow_notes n INDEXED BY idx_workflow_notes_wid
 	GROUP BY n.workflow_id
