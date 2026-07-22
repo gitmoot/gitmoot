@@ -44,7 +44,7 @@ func TestBlockedEpisodeRoundTripKeepsFirstBlockedSince(t *testing.T) {
 		t.Fatalf("EmittedAt = %q, want empty", episodes[1].EmittedAt)
 	}
 
-	if err := store.MarkBlockedEpisodeEmitted(ctx, episodes[1].Subject); err != nil {
+	if err := store.MarkBlockedEpisodeEmitted(ctx, episodes[1].Subject, time.Now().UTC()); err != nil {
 		t.Fatalf("MarkBlockedEpisodeEmitted() error = %v", err)
 	}
 	episodes, err = store.ListBlockedEpisodes(ctx)

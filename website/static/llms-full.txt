@@ -2653,10 +2653,13 @@ The v1 `--match` filter is a case-insensitive substring tested against the event
 repo and job id; empty matches all. A plain `job.blocked` event matches both
 `job-terminal` and `blocked`, while guard-caused blocks match `guard` first. A
 synthesized `blocked_since` event matches only `blocked`. Set
-`[orchestrate].blocked_role_wake_after` to a positive Go duration to emit one
-such event when a task or Herdr role remains blocked past the threshold; `0s`
-(the default) disables both evaluators. The episode is cleared when the subject
-leaves blocked, so a later re-block can emit once again.
+`[orchestrate].blocked_role_wake_after` to a positive Go duration to emit such an
+event when a task or Herdr role stays blocked past the threshold, re-nudging at
+most once per that interval while it remains blocked (so a dropped wake
+self-heals on the next interval instead of being lost); `0s` (the default)
+disables both evaluators. An episode is cleared only on a definitive non-blocked
+observation — a transient `unknown` snapshot never resets it — so a later
+re-block starts a fresh episode.
 The wake role's config sets `pane = "<pane-id-or-label>"`: a value containing `:`
 is a `wX:pY` pane id used as-is, any other value is a pane label resolved to the
 current id at wake time (so a recycled pane is still reached). Wake delivery runs

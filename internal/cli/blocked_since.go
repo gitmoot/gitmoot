@@ -102,9 +102,9 @@ func evaluateBlockedTaskEpisodes(ctx context.Context, store *db.Store, sink even
 		if _, blocked := blockedSubjects[subject]; !blocked {
 			continue
 		}
-		blockedSince, err := parseTaskUpdatedAt(candidate.UpdatedAt)
-		if err != nil {
-			writeLine(stdout, "blocked_since task %s skipped: %v", candidate.ID, err)
+		blockedSince := parseTranscriptStoreTime(candidate.UpdatedAt)
+		if blockedSince.IsZero() {
+			writeLine(stdout, "blocked_since task %s skipped: unparseable updated_at %q", candidate.ID, candidate.UpdatedAt)
 			continue
 		}
 		if err := store.UpsertBlockedEpisode(ctx, subject, blockedSince); err != nil {
@@ -217,21 +217,29 @@ func evaluateBlockedRoleEpisodes(ctx context.Context, store *db.Store, sink even
 	}
 	blockedSubjects := map[string]string{}
 	readySubjects := map[string]struct{}{}
+	confirmedUnblocked := map[string]struct{}{}
 	for role, live := range snapshot.States {
-		if live.State != org.StateBlocked {
-			continue
-		}
 		role = strings.TrimSpace(role)
 		if role == "" {
 			continue
 		}
 		subject := "role:" + role
-		blockedSubjects[subject] = role
-		if err := store.UpsertBlockedEpisode(ctx, subject, snapshot.ObservedAt); err != nil {
-			writeLine(stdout, "blocked_since role %s episode upsert failed: %v", role, err)
-			continue
+		switch live.State {
+		case org.StateBlocked:
+			blockedSubjects[subject] = role
+			if err := store.UpsertBlockedEpisode(ctx, subject, snapshot.ObservedAt); err != nil {
+				writeLine(stdout, "blocked_since role %s episode upsert failed: %v", role, err)
+				continue
+			}
+			readySubjects[subject] = struct{}{}
+		case org.StateIdle, org.StateWorking, org.StateDone:
+			// A DEFINITIVE non-blocked observation is the only thing that closes an
+			// episode. StateUnknown — or a role absent from the snapshot (pane recycle,
+			// transient agent_status, a brief exact-label mismatch) — is ambiguous and
+			// MUST NOT clear the episode, else a momentary blip would discard the
+			// accrued blocked duration and reset the wake timer.
+			confirmedUnblocked[subject] = struct{}{}
 		}
-		readySubjects[subject] = struct{}{}
 	}
 
 	episodes, err := store.ListBlockedEpisodes(ctx)
@@ -242,57 +250,58 @@ func evaluateBlockedRoleEpisodes(ctx context.Context, store *db.Store, sink even
 		if !strings.HasPrefix(episode.Subject, "role:") {
 			continue
 		}
-		role, blocked := blockedSubjects[episode.Subject]
-		if !blocked {
-			if err := store.ClearBlockedEpisode(ctx, episode.Subject); err != nil {
-				writeLine(stdout, "blocked_since role episode clear failed for %s: %v", episode.Subject, err)
+		if role, blocked := blockedSubjects[episode.Subject]; blocked {
+			if _, ready := readySubjects[episode.Subject]; !ready {
+				continue
+			}
+			subjectID := "org-blocked:" + role
+			if err := emitBlockedSinceEpisode(ctx, store, sink, episode, subjectID, subjectID, "", "role "+role, wakeAfter, now); err != nil {
+				writeLine(stdout, "blocked_since role %s emit failed: %v", role, err)
 			}
 			continue
 		}
-		if _, ready := readySubjects[episode.Subject]; !ready {
-			continue
-		}
-		subjectID := "org-blocked:" + role
-		if err := emitBlockedSinceEpisode(ctx, store, sink, episode, subjectID, subjectID, "", "role "+role, wakeAfter, now); err != nil {
-			writeLine(stdout, "blocked_since role %s emit failed: %v", role, err)
+		if _, confirmed := confirmedUnblocked[episode.Subject]; confirmed {
+			if err := store.ClearBlockedEpisode(ctx, episode.Subject); err != nil {
+				writeLine(stdout, "blocked_since role episode clear failed for %s: %v", episode.Subject, err)
+			}
 		}
 	}
 	return nil
 }
 
 func emitBlockedSinceEpisode(ctx context.Context, store *db.Store, sink events.Sink, episode db.BlockedEpisode, subjectID, rootID, repo, detailSubject string, wakeAfter time.Duration, now time.Time) error {
-	if strings.TrimSpace(episode.EmittedAt) != "" {
-		return nil
-	}
+	now = now.UTC()
 	blockedSince, err := time.Parse(blockedEpisodeTimeLayout, episode.BlockedSince)
 	if err != nil {
 		return fmt.Errorf("parse blocked_since %q: %w", episode.BlockedSince, err)
 	}
-	blockedFor := now.UTC().Sub(blockedSince)
+	blockedFor := now.Sub(blockedSince)
 	if blockedFor <= wakeAfter {
-		return nil
+		return nil // not blocked long enough yet
 	}
-	if blockedFor < 0 {
-		blockedFor = 0
+	// Re-nudge at most once per wakeAfter interval while the subject stays blocked
+	// (an alert repeat_interval), rather than a single durable one-shot: a wake that
+	// is dropped downstream (herdr briefly down, a transient sink, a mark-write
+	// failure) self-heals on the next interval instead of being lost forever.
+	if last := strings.TrimSpace(episode.EmittedAt); last != "" {
+		if lastEmitted, err := time.Parse(blockedEpisodeTimeLayout, last); err == nil && now.Sub(lastEmitted) <= wakeAfter {
+			return nil // already nudged within the current interval
+		}
 	}
-	blockedFor = blockedFor.Round(time.Second)
-	detail := fmt.Sprintf("%s blocked %s", detailSubject, blockedFor)
+	// Mark BEFORE emit: a mark-write failure then means no emit this tick (retry
+	// next tick, the gate is still open) — never a per-tick duplicate — and a
+	// mark-success whose async wake is dropped re-nudges on the next interval.
+	if err := store.MarkBlockedEpisodeEmitted(ctx, episode.Subject, now); err != nil {
+		return fmt.Errorf("mark blocked episode emitted: %w", err)
+	}
+	detail := fmt.Sprintf("%s blocked %s", detailSubject, blockedFor.Round(time.Second))
 	ev := events.NewEvent(events.EventJobBlocked, subjectID, rootID, repo, string(workflow.TaskBlocked), detail, now, workflow.RedactCommentText)
 	ev.Cause = "blocked_since"
 	events.EmitEvent(ctx, sink, ev)
-	return store.MarkBlockedEpisodeEmitted(ctx, episode.Subject)
+	return nil
 }
 
 func taskEpisodeSubject(repo, taskID string) string {
 	return "task:" + strings.TrimSpace(repo) + ":" + strings.TrimSpace(taskID)
 }
 
-func parseTaskUpdatedAt(raw string) (time.Time, error) {
-	raw = strings.TrimSpace(raw)
-	for _, layout := range []string{"2006-01-02 15:04:05", time.RFC3339Nano, blockedEpisodeTimeLayout} {
-		if parsed, err := time.Parse(layout, raw); err == nil {
-			return parsed.UTC(), nil
-		}
-	}
-	return time.Time{}, fmt.Errorf("parse task updated_at %q", raw)
-}

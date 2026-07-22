@@ -10,7 +10,10 @@ import (
 const blockedEpisodeTimeLayout = "2006-01-02T15:04:05.000000000Z"
 
 // BlockedEpisode tracks one continuous task or organization-role blocked
-// episode. EmittedAt is empty until its synthesized blocked event is emitted.
+// episode. EmittedAt is empty until the first synthesized blocked event, then
+// carries the LAST-emitted instant so the evaluator can re-nudge at most once per
+// interval while the subject stays blocked (self-healing against a dropped wake)
+// rather than firing a single durable one-shot.
 type BlockedEpisode struct {
 	Subject      string `json:"subject"`
 	BlockedSince string `json:"blocked_since"`
@@ -32,12 +35,14 @@ func (s *Store) UpsertBlockedEpisode(ctx context.Context, subject string, blocke
 	return err
 }
 
-// MarkBlockedEpisodeEmitted records that the episode's one synthesized event
-// has been emitted. Marking a missing episode is an idempotent no-op.
-func (s *Store) MarkBlockedEpisodeEmitted(ctx context.Context, subject string) error {
-	now := time.Now().UTC().Format(blockedEpisodeTimeLayout)
+// MarkBlockedEpisodeEmitted records the instant a synthesized event was emitted
+// for the episode (the LAST-emitted time, used by the once-per-interval re-nudge
+// gate). `at` must be the evaluator's clock so the gate is deterministic and
+// testable. Marking a missing episode is an idempotent no-op.
+func (s *Store) MarkBlockedEpisodeEmitted(ctx context.Context, subject string, at time.Time) error {
+	stamp := at.UTC().Format(blockedEpisodeTimeLayout)
 	_, err := s.db.ExecContext(ctx, `UPDATE org_blocked_episodes SET emitted_at = ?, updated_at = ? WHERE subject = ?`,
-		now, now, strings.TrimSpace(subject))
+		stamp, stamp, strings.TrimSpace(subject))
 	return err
 }
 

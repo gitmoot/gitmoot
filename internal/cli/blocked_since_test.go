@@ -180,3 +180,73 @@ blocked_role_wake_after = "1h"
 		t.Fatalf("availability calls = %d, want 2", availability.calls)
 	}
 }
+
+// TestBlockedSinceReNudgesOncePerIntervalWhileStillBlocked pins the self-healing
+// semantic: while a subject stays blocked it is re-nudged at most once per
+// wakeAfter, not a single durable one-shot (so a dropped wake recovers).
+func TestBlockedSinceReNudgesOncePerIntervalWhileStillBlocked(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	repo := "owner/repo"
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-nudge", RepoFullName: repo, State: string(workflow.TaskBlocked)}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Truncate(time.Second).Add(2 * time.Hour)
+	wakeAfter := time.Hour
+	sink := &recordingSink{}
+	nudgeAt := func(at time.Time, want int) {
+		t.Helper()
+		if err := evaluateBlockedTaskEpisodes(ctx, store, sink, repo, wakeAfter, io.Discard, at); err != nil {
+			t.Fatalf("evaluate at %s: %v", at, err)
+		}
+		if got := len(sink.byType(events.EventJobBlocked)); got != want {
+			t.Fatalf("blocked events at %s = %d, want %d", at, got, want)
+		}
+	}
+	nudgeAt(base, 1)                            // crosses threshold → emit #1
+	nudgeAt(base.Add(30*time.Minute), 1)        // within interval → no re-emit
+	nudgeAt(base.Add(wakeAfter+time.Minute), 2) // past interval, still blocked → re-nudge #2
+}
+
+// TestBlockedRoleEpisodeSurvivesTransientUnknownSnapshot pins the fix that a
+// momentary StateUnknown (or absent) role observation must NOT clear the episode
+// or reset its accrued blocked duration; only a definitive non-blocked state does.
+func TestBlockedRoleEpisodeSurvivesTransientUnknownSnapshot(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	sink := &recordingSink{}
+	wakeAfter := time.Hour
+	base := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	snap := func(state org.LifecycleState, observedAt time.Time) org.Snapshot {
+		return org.Snapshot{States: map[string]org.RoleLiveState{"owner": {State: state}}, ObservedAt: observedAt}
+	}
+	// Blocked, first observed 2h ago → crosses threshold → emit #1, episode open.
+	if err := evaluateBlockedRoleEpisodes(ctx, store, sink, snap(org.StateBlocked, base.Add(-2*time.Hour)), wakeAfter, io.Discard, base); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(sink.byType(events.EventJobBlocked)); got != 1 {
+		t.Fatalf("emit after first blocked tick = %d, want 1", got)
+	}
+	// Transient StateUnknown → episode MUST survive.
+	if err := evaluateBlockedRoleEpisodes(ctx, store, sink, snap(org.StateUnknown, base.Add(time.Minute)), wakeAfter, io.Discard, base.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	episodes, err := store.ListBlockedEpisodes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(episodes) != 1 || episodes[0].Subject != "role:owner" {
+		t.Fatalf("StateUnknown cleared/altered the episode: %+v", episodes)
+	}
+	// A definitive idle observation clears it.
+	if err := evaluateBlockedRoleEpisodes(ctx, store, sink, snap(org.StateIdle, base.Add(2*time.Minute)), wakeAfter, io.Discard, base.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	episodes, err = store.ListBlockedEpisodes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(episodes) != 0 {
+		t.Fatalf("StateIdle did not clear the episode: %+v", episodes)
+	}
+}
