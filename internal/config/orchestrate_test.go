@@ -54,6 +54,9 @@ func TestLoadOrchestratePolicyDefaults(t *testing.T) {
 	if policy.BlockedTTL != "" {
 		t.Fatalf("BlockedTTL = %q, want empty (disabled) by default", policy.BlockedTTL)
 	}
+	if policy.MaxConsecutiveMissedWakes != 0 {
+		t.Fatalf("MaxConsecutiveMissedWakes = %d, want disabled by default", policy.MaxConsecutiveMissedWakes)
+	}
 	if policy.DefaultDelegationTimeout != "" || policy.DefaultPlanTimeout != "" || policy.DefaultImplementTimeout != "" || policy.DefaultReviewTimeout != "" || policy.DefaultGateTimeout != "" || policy.DefaultRepairTimeout != "" {
 		t.Fatalf("delegation timeout defaults = %+v, want all empty by default", policy)
 	}
@@ -421,6 +424,40 @@ func TestLoadOrchestratePolicyBlockedRoleWakeAfter(t *testing.T) {
 		}
 		if policy.BlockedRoleWakeAfter != test.want {
 			t.Fatalf("blocked_role_wake_after %q = %s, want %s", test.value, policy.BlockedRoleWakeAfter, test.want)
+		}
+	}
+}
+
+func TestLoadOrchestratePolicyMaxConsecutiveMissedWakes(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		value   string
+		want    int
+		wantErr bool
+	}{
+		{value: "3", want: 3},
+		{value: "0", want: 0},
+		{value: "-1", wantErr: true},
+		{value: "many", wantErr: true},
+	} {
+		if err := os.WriteFile(paths.ConfigFile, []byte("[orchestrate]\nmax_consecutive_missed_wakes = "+test.value+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		policy, err := LoadOrchestratePolicy(paths)
+		if test.wantErr {
+			if err == nil {
+				t.Fatalf("max_consecutive_missed_wakes %q accepted, want error", test.value)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("max_consecutive_missed_wakes %q error = %v", test.value, err)
+		}
+		if policy.MaxConsecutiveMissedWakes != test.want {
+			t.Fatalf("max_consecutive_missed_wakes %q = %d, want %d", test.value, policy.MaxConsecutiveMissedWakes, test.want)
 		}
 	}
 }

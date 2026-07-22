@@ -264,6 +264,9 @@ type orgStatusOutput struct {
 	ProviderVersion string             `json:"provider_version,omitempty"`
 	RecycleStatus   string             `json:"recycle,omitempty"`
 	RecycleAfter    string             `json:"recycle_after,omitempty"`
+	MissedWakes     int                `json:"missed_wakes,omitempty"`
+	Flagged         bool               `json:"flagged,omitempty"`
+	FlagReason      string             `json:"flag_reason,omitempty"`
 }
 
 func runOrgBrief(args []string, stdout, stderr io.Writer) int {
@@ -367,6 +370,32 @@ func runOrgOverview(command string, args []string, stdout, stderr io.Writer) int
 		return 1
 	}
 	defer store.Close()
+	paths, err := pathsFromFlag(*home)
+	if err != nil {
+		fmt.Fprintf(stderr, "org %s: %v\n", command, err)
+		return 1
+	}
+	// The missed-wake flag is a best-effort add-on (#1060 slice 2b): an unreadable
+	// [orchestrate] policy or missed-wake table must NEVER break the org chart/status
+	// diagnostic view, so a load error degrades to "flagging off" rather than exit 1.
+	// Reading the counters only when K>0 also keeps them fully invisible when flagging
+	// is disabled (the off-by-default contract — no missed_wakes JSON leak at K=0).
+	maxMissedWakes := 0
+	if policy, err := config.LoadOrchestratePolicy(paths); err != nil {
+		fmt.Fprintf(stderr, "org %s: missed-wake flag disabled (orchestrate policy unreadable): %v\n", command, err)
+	} else {
+		maxMissedWakes = policy.MaxConsecutiveMissedWakes
+	}
+	missedWakes := map[string]int{}
+	if maxMissedWakes > 0 {
+		if rows, err := store.ListRoleMissedWakes(ctx); err != nil {
+			fmt.Fprintf(stderr, "org %s: missed-wake counts unavailable: %v\n", command, err)
+		} else {
+			for _, row := range rows {
+				missedWakes[row.Role] = row.Consecutive
+			}
+		}
+	}
 	snapshot, err := orgProviderSnapshot(ctx, cfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "org %s: Herdr snapshot unavailable: %v\n", command, err)
@@ -381,6 +410,12 @@ func runOrgOverview(command string, args []string, stdout, stderr io.Writer) int
 			live = org.RoleLiveState{State: org.StateUnknown, Detail: "provider snapshot omitted this role"}
 		}
 		seen := presence[role.Name]
+		consecutive := missedWakes[role.Name]
+		flagged := maxMissedWakes > 0 && consecutive >= maxMissedWakes
+		flagReason := ""
+		if flagged {
+			flagReason = fmt.Sprintf("%d consecutive missed wakes", consecutive)
+		}
 		recycleStatus := ""
 		recycleAfterText := ""
 		if command == "status" {
@@ -400,6 +435,7 @@ func runOrgOverview(command string, args []string, stdout, stderr io.Writer) int
 			Scope: role.Scope, MergeRule: role.MergeRule, LastSeenAt: seen.LastSeenAt, LastSeenAge: orgPresenceAge(seen.LastSeenAt, observedNow), LastCommand: seen.LastCommand,
 			ProviderState: live.State, ProviderDetail: live.Detail, ObservedAt: snapshot.ObservedAt, ProviderVersion: snapshot.ProviderVersion,
 			RecycleStatus: recycleStatus, RecycleAfter: recycleAfterText,
+			MissedWakes: consecutive, Flagged: flagged, FlagReason: flagReason,
 		})
 	}
 	if command == "chart" {
@@ -417,15 +453,22 @@ func runOrgOverview(command string, args []string, stdout, stderr io.Writer) int
 	}
 	if command == "chart" {
 		for _, row := range rows {
-			fmt.Fprintf(stdout, "%s%s · %s · scope=%s · merge=%s · seen=%s\n", strings.Repeat("  ", row.Depth), row.Role, row.ProviderState, strings.Join(row.Scope, ","), dash(row.MergeRule), dash(row.LastSeenAge))
+			fmt.Fprintf(stdout, "%s%s · %s · scope=%s · merge=%s · seen=%s%s\n", strings.Repeat("  ", row.Depth), row.Role, row.ProviderState, strings.Join(row.Scope, ","), dash(row.MergeRule), dash(row.LastSeenAge), orgMissedWakeFlag(row))
 		}
 		return 0
 	}
 	fmt.Fprintln(stdout, "ROLE\tSTATE\tLAST SEEN\tAGE\tLAST COMMAND\tDETAIL\tRECYCLE")
 	for _, row := range rows {
-		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t%s\trecycle=%s\n", row.Role, row.ProviderState, dash(row.LastSeenAt), dash(row.LastSeenAge), dash(row.LastCommand), dash(row.ProviderDetail), firstNonEmpty(row.RecycleStatus, "off"))
+		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t%s\trecycle=%s%s\n", row.Role, row.ProviderState, dash(row.LastSeenAt), dash(row.LastSeenAge), dash(row.LastCommand), dash(row.ProviderDetail), firstNonEmpty(row.RecycleStatus, "off"), orgMissedWakeFlag(row))
 	}
 	return 0
+}
+
+func orgMissedWakeFlag(row orgStatusOutput) string {
+	if !row.Flagged {
+		return ""
+	}
+	return fmt.Sprintf(" ⚠ flagged (%d missed wakes)", row.MissedWakes)
 }
 
 func printOrgBrief(w io.Writer, brief orgBriefOutput) {

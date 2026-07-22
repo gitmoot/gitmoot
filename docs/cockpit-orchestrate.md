@@ -102,6 +102,7 @@ inline_artifact_max_bytes = 32768  # per-body cap (bytes) when inlining is on
 inject_upstream_dep_context = false  # inject succeeded upstream dependency results into a dependent leg's prompt; default off
 max_delegation_token_budget = 0  # per-root delegation token budget (input+output); 0 = unlimited (off)
 max_delegation_cost_usd = 0      # per-root delegation dollar-cost budget (USD); 0 = unlimited (off)
+max_consecutive_missed_wakes = 0 # flag org roles after N stalled wakes; 0 = disabled
 default_delegation_timeout = ""  # default child-job timeout when a delegation omits one; "" = unbounded
 default_plan_timeout = ""        # per-phase defaults (plan/implement/review/gate/repair) that
 default_implement_timeout = ""   # win over default_delegation_timeout for legs tagged with
@@ -128,6 +129,10 @@ default_repair_timeout = ""
   aggregate cap also bounds the total inlined across all children.
 - `inject_upstream_dep_context` (default `false`) injects succeeded upstream
   dependency results into a dependent leg's prompt; default off.
+- `max_consecutive_missed_wakes` (default `0` = disabled) flags an organization
+  role in `org chart` and `org status` after that many consecutive
+  `agent_prompt_stalled` wake outcomes. A delivered wake resets the role; Herdr
+  transport failures do not count.
 - `max_delegation_token_budget` (default `0` = unlimited/off) bounds a delegation
   tree by **cost** in addition to depth/width/total-jobs/wall-clock. When set to a
   positive value, the whole tree under one root is capped at that many cumulative

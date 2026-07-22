@@ -2672,6 +2672,16 @@ as delivered, `error.code = "agent_prompt_stalled"` as not delivered. Missing
 bindings, unavailable Herdr, stalls, and transport errors are swallowed after
 lightweight logging; they never block or fail a job.
 
+Each `agent_prompt_stalled` outcome increments a durable, consecutive counter
+for the wake role; a delivered prompt resets that role's counter. Transport
+errors and other non-delivery outcomes do not change it because a Herdr outage
+is infrastructure failure, not evidence that every role ignored a wake. Set
+`[orchestrate].max_consecutive_missed_wakes` to a positive integer to append a
+`⚠ flagged (N missed wakes)` marker to that role in `gitmoot org chart` and
+`gitmoot org status`; their JSON rows expose `missed_wakes`, `flagged`, and
+`flag_reason`. The default `0` disables flagging while leaving the best-effort
+counter available.
+
 ## Configuration
 
 Add an `[events]` section to the Gitmoot config file:
@@ -4555,6 +4565,7 @@ inline_artifact_max_bytes = 32768  # per-body cap (bytes) when inlining is on
 inject_upstream_dep_context = false  # inject succeeded upstream dependency results into a dependent leg's prompt; default off
 max_delegation_token_budget = 0  # per-root delegation token budget (input+output); 0 = unlimited (off)
 max_delegation_cost_usd = 0      # per-root delegation dollar-cost budget (USD); 0 = unlimited (off)
+max_consecutive_missed_wakes = 0 # flag org roles after N stalled wakes; 0 = disabled
 default_delegation_timeout = ""  # default child-job timeout when a delegation omits one; "" = unbounded
 default_plan_timeout = ""        # per-phase defaults (plan/implement/review/gate/repair) that
 default_implement_timeout = ""   # win over default_delegation_timeout for legs tagged with
@@ -4581,6 +4592,10 @@ default_repair_timeout = ""
   aggregate cap also bounds the total inlined across all children.
 - `inject_upstream_dep_context` (default `false`) injects succeeded upstream
   dependency results into a dependent leg's prompt; default off.
+- `max_consecutive_missed_wakes` (default `0` = disabled) flags an organization
+  role in `org chart` and `org status` after that many consecutive
+  `agent_prompt_stalled` wake outcomes. A delivered wake resets the role; Herdr
+  transport failures do not count.
 - `max_delegation_token_budget` (default `0` = unlimited/off) bounds a delegation
   tree by **cost** in addition to depth/width/total-jobs/wall-clock. When set to a
   positive value, the whole tree under one root is capped at that many cumulative
@@ -10798,12 +10813,17 @@ resolved role table.
 The registry uses `[org] enforce = "warn"|"block"` and
 `[org.roles."name"]` entries with `parent`, `scope`, `merge_rule`, and an
 optional `pane` Herdr binding (used by org event-rule wakes). There is
-exactly one root named `owner`; accepted scopes are `*`, `owner/*`, `*/repo`,
-and `owner/repo`, and each child scope must be covered by its parent. Malformed
+exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
+`owner/repo`, and each child scope must be covered by its parent. Malformed
 org configuration fails closed and loudly. `brief` records passive last-seen
 presence for its role and can render static context with provider state
 `unknown` during an outage; `chart` and `status` require a live compatible
-Herdr snapshot. Open escalations remain deferred to #1058's resolution and
+Herdr snapshot. When configured, `brief --json` and `status --json` include the
+role's `pane` binding. `chart` and `status` also show a `⚠ flagged (N missed
+wakes)` marker once a role reaches the positive
+`[orchestrate].max_consecutive_missed_wakes` threshold; their JSON rows expose
+`missed_wakes`, `flagged`, and `flag_reason`. The threshold defaults to `0`, so
+flagging is off. Open escalations remain deferred to #1058's resolution and
 correlation contract.
 
 Fresh local `agent ask`, `agent run`, `agent review`, `agent implement`,
@@ -10841,8 +10861,10 @@ with a `:` is a `wX:pY` id, otherwise a pane label resolved to the current id at
 wake time). The daemon calls `herdr agent prompt <pane> <text> --wait --timeout
 8000` and treats delivered (`result.type = "agent_prompted"`, or a post-delivery
 `error.code = "timeout"`) apart from stalled (`error.code =
-"agent_prompt_stalled"`). Rules, pane resolution, and wakes are best-effort; with
-no rule rows this path is off.
+"agent_prompt_stalled"`). Stalls increment the role's consecutive missed-wake
+counter and delivery resets it; transport failures leave it unchanged. Rules,
+pane resolution, counter writes, and wakes are best-effort; with no rule rows
+this path is off.
 
 ## External-coordinator workflow groups
 

@@ -21,6 +21,7 @@ type fakeEventWake struct {
 	prompt         string
 	until          string
 	labelToPane    map[string]string
+	stalled        bool
 }
 
 func (f *fakeEventWake) Available(context.Context) bool {
@@ -31,6 +32,9 @@ func (f *fakeEventWake) Available(context.Context) bool {
 func (f *fakeEventWake) AgentPrompt(_ context.Context, pane, prompt, until string) (bool, bool, error) {
 	f.promptCalls++
 	f.pane, f.prompt, f.until = pane, prompt, until
+	if f.stalled {
+		return false, true, nil
+	}
 	return true, false, nil
 }
 
@@ -102,6 +106,41 @@ func TestEventRuleEvaluatorResolvesPaneAndWakes(t *testing.T) {
 	}
 	if want := "gitmoot attention event for job job-1: Please choose"; wake.prompt != want {
 		t.Fatalf("prompt=%q want=%q", wake.prompt, want)
+	}
+}
+
+func TestEventRuleWakeStallIncrementsAndDeliveryResetsCounter(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.AddEventRule(ctx, db.EventRule{ID: "rule-counter", OnKind: "attention", WakeRole: "OWNER", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	wake := &fakeEventWake{stalled: true}
+	sink := &eventRuleSink{store: store, home: home, wake: wake}
+	event := events.Event{Type: events.EventJobNeedsAttention, Cause: "ask_gate", JobID: "job-counter"}
+	sink.evaluate(ctx, event)
+	misses, err := store.ListRoleMissedWakes(ctx)
+	if err != nil || len(misses) != 1 || misses[0].Role != "owner" || misses[0].Consecutive != 1 {
+		t.Fatalf("misses after stalled wake = %+v, err=%v", misses, err)
+	}
+
+	wake.stalled = false
+	sink.evaluate(ctx, event)
+	misses, err = store.ListRoleMissedWakes(ctx)
+	if err != nil || len(misses) != 0 {
+		t.Fatalf("misses after delivered wake = %+v, err=%v", misses, err)
 	}
 }
 

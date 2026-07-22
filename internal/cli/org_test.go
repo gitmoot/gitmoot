@@ -378,6 +378,139 @@ func TestRunOrgBriefChartStatusAndPresence(t *testing.T) {
 	}
 }
 
+func TestRunOrgOverviewFlagsConsecutiveMissedWakes(t *testing.T) {
+	home, paths := setupOrgHome(t)
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("\n[orchestrate]\nmax_consecutive_missed_wakes = 2\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for range 2 {
+		if err := store.IncrementRoleMissedWake(ctx, "REVIEW", time.Now()); err != nil {
+			store.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	withOrgProvider(t, orgFixtureProvider{snapshot: org.Snapshot{
+		States: map[string]org.RoleLiveState{
+			"owner":  {State: org.StateWorking},
+			"review": {State: org.StateIdle},
+		},
+		ObservedAt: time.Date(2026, 7, 22, 9, 0, 0, 0, time.UTC), ProviderVersion: "0.7.5",
+	}})
+
+	for _, command := range []string{"chart", "status"} {
+		var stdout, stderr bytes.Buffer
+		if code := Run([]string{"org", command, "--home", home}, &stdout, &stderr); code != 0 {
+			t.Fatalf("%s code = %d stderr=%s", command, code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "review") || !strings.Contains(stdout.String(), "⚠ flagged (2 missed wakes)") {
+			t.Fatalf("%s output = %q, want flagged review", command, stdout.String())
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"org", "status", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("status JSON code = %d stderr=%s", code, stderr.String())
+	}
+	var rows []orgStatusOutput
+	if err := json.Unmarshal(stdout.Bytes(), &rows); err != nil {
+		t.Fatalf("decode status JSON: %v; output=%s", err, stdout.String())
+	}
+	for _, row := range rows {
+		if row.Role == "review" {
+			if row.MissedWakes != 2 || !row.Flagged || row.FlagReason != "2 consecutive missed wakes" {
+				t.Fatalf("review status = %+v", row)
+			}
+			return
+		}
+	}
+	t.Fatalf("review role missing from status: %+v", rows)
+}
+
+func TestRunOrgOverviewZeroThresholdNeverFlags(t *testing.T) {
+	home, paths := setupOrgHome(t)
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.IncrementRoleMissedWake(context.Background(), "review", time.Now()); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	withOrgProvider(t, orgFixtureProvider{snapshot: org.Snapshot{States: map[string]org.RoleLiveState{
+		"owner": {State: org.StateWorking}, "review": {State: org.StateIdle},
+	}}})
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"org", "chart", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("chart JSON code = %d stderr=%s", code, stderr.String())
+	}
+	// Off-by-default: with the threshold at 0, the counter is FULLY invisible — no
+	// flag fields AND no missed_wakes leak — even though "review" has a stored miss.
+	if strings.Contains(stdout.String(), `"flagged"`) || strings.Contains(stdout.String(), `"flag_reason"`) || strings.Contains(stdout.String(), `"missed_wakes"`) {
+		t.Fatalf("zero threshold surfaced missed-wake state: %s", stdout.String())
+	}
+	var rows []orgStatusOutput
+	if err := json.Unmarshal(stdout.Bytes(), &rows); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.Role == "review" && (row.Flagged || row.FlagReason != "" || row.MissedWakes != 0) {
+			t.Fatalf("review status with threshold off = %+v", row)
+		}
+	}
+}
+
+// TestRunOrgOverviewDegradesOnBadOrchestrateConfig pins that a malformed
+// [orchestrate] value never breaks the org chart/status diagnostic view — the
+// missed-wake flag is a best-effort add-on that degrades to "off".
+func TestRunOrgOverviewDegradesOnBadOrchestrateConfig(t *testing.T) {
+	home, paths := setupOrgHome(t)
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("\n[orchestrate]\nmax_consecutive_missed_wakes = -1\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	withOrgProvider(t, orgFixtureProvider{snapshot: org.Snapshot{States: map[string]org.RoleLiveState{
+		"owner": {State: org.StateWorking}, "review": {State: org.StateIdle},
+	}}})
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"org", "chart", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("org chart hard-failed on a bad [orchestrate] value: code=%d stderr=%s", code, stderr.String())
+	}
+	var rows []orgStatusOutput
+	if err := json.Unmarshal(stdout.Bytes(), &rows); err != nil {
+		t.Fatalf("org chart output not renderable after degrade: %v (out=%s)", err, stdout.String())
+	}
+	if len(rows) == 0 {
+		t.Fatal("org chart returned no rows despite a valid [org] registry")
+	}
+}
+
 func TestRunOrgBriefAndStatusJSONSurfacePane(t *testing.T) {
 	home, paths := setupOrgHome(t)
 	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)

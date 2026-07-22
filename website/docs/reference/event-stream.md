@@ -194,6 +194,16 @@ as delivered, `error.code = "agent_prompt_stalled"` as not delivered. Missing
 bindings, unavailable Herdr, stalls, and transport errors are swallowed after
 lightweight logging; they never block or fail a job.
 
+Each `agent_prompt_stalled` outcome increments a durable, consecutive counter
+for the wake role; a delivered prompt resets that role's counter. Transport
+errors and other non-delivery outcomes do not change it because a Herdr outage
+is infrastructure failure, not evidence that every role ignored a wake. Set
+`[orchestrate].max_consecutive_missed_wakes` to a positive integer to append a
+`⚠ flagged (N missed wakes)` marker to that role in `gitmoot org chart` and
+`gitmoot org status`; their JSON rows expose `missed_wakes`, `flagged`, and
+`flag_reason`. The default `0` disables flagging while leaving the best-effort
+counter available.
+
 ## Configuration
 
 Add an `[events]` section to the Gitmoot config file:
