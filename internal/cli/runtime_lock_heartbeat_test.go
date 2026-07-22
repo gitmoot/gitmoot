@@ -137,8 +137,20 @@ func TestRuntimeSessionLockHeartbeatOwnershipGuardStopsStaleOwner(t *testing.T) 
 	if err != nil {
 		t.Fatalf("GetResourceLock returned error: %v", err)
 	}
-	if lock.OwnerToken != "token-new" || lock.ExpiresAt != newExpiry.Format(time.RFC3339Nano) {
-		t.Fatalf("reacquired lock changed by stale heartbeat: %+v", lock)
+	// Compare the reacquired lease by INSTANT, not by raw string: the store
+	// persists times via a fixed-width layout (…".000000000Z", always 9
+	// fractional digits) while time.RFC3339Nano trims trailing zeros, so a
+	// direct string compare spuriously fails ~10% of the time — whenever the
+	// captured `now` happens to have a trailing-zero nanosecond — even though the
+	// stored expiry is the exact same instant. The real assertion is that a stale
+	// token-old heartbeat did NOT change the reacquired token-new lease; the
+	// explicit HeartbeatResourceLock check below covers the owner-token CAS.
+	gotExpiry, err := time.Parse(time.RFC3339Nano, lock.ExpiresAt)
+	if err != nil {
+		t.Fatalf("parse reacquired lock expiry %q: %v", lock.ExpiresAt, err)
+	}
+	if lock.OwnerToken != "token-new" || !gotExpiry.Equal(newExpiry) {
+		t.Fatalf("reacquired lock changed by stale heartbeat: %+v (want owner token-new, expiry %s)", lock, newExpiry.Format(time.RFC3339Nano))
 	}
 	updated, err := store.HeartbeatResourceLock(ctx, lockKey, "token-old", now.Add(3*time.Minute))
 	if err != nil || updated {
