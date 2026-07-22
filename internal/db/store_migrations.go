@@ -1685,4 +1685,13 @@ CREATE TABLE org_blocked_episodes (
 	updated_at TEXT NOT NULL
 );
 	`,
+	// #1060 per-role consecutive missed-wake counters. A missing row means zero;
+	// successful delivery deletes the row so the default path stays sparse.
+	`
+CREATE TABLE org_role_missed_wakes (
+	role TEXT PRIMARY KEY,
+	consecutive INTEGER NOT NULL DEFAULT 0,
+	updated_at TEXT NOT NULL
+);
+	`,
 }

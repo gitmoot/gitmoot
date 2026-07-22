@@ -1010,9 +1010,12 @@ exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
 records passive last-seen presence for its role and can render static context
 with provider state `unknown` during an outage; `chart` and `status` require a
 live compatible Herdr snapshot. When configured, `brief --json` and `status
---json` include the role's `pane` binding. Escalations are recorded with
-`gitmoot org escalate`; their resolution and correlation surfaces are phase 2
-work.
+--json` include the role's `pane` binding. `chart` and `status` append a `⚠
+flagged (N missed wakes)` marker after the role reaches the positive
+`[orchestrate].max_consecutive_missed_wakes` threshold; their JSON rows expose
+`missed_wakes`, `flagged`, and `flag_reason`. The default threshold is `0`
+(disabled). Escalations are recorded with `gitmoot org escalate`; their
+resolution and correlation surfaces are phase 2 work.
 
 Agent `ask`, `run`, `review`, `implement`, and `orchestrate` accept
 `--org-role <name>`. The role is validated and touched before dispatch, then

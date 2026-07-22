@@ -1174,8 +1174,12 @@ org configuration fails closed and loudly. `brief` records passive last-seen
 presence for its role and can render static context with provider state
 `unknown` during an outage; `chart` and `status` require a live compatible
 Herdr snapshot. When configured, `brief --json` and `status --json` include the
-role's `pane` binding. Open escalations remain deferred to #1058's resolution
-and correlation contract.
+role's `pane` binding. `chart` and `status` also show a `⚠ flagged (N missed
+wakes)` marker once a role reaches the positive
+`[orchestrate].max_consecutive_missed_wakes` threshold; their JSON rows expose
+`missed_wakes`, `flagged`, and `flag_reason`. The threshold defaults to `0`, so
+flagging is off. Open escalations remain deferred to #1058's resolution and
+correlation contract.
 
 Fresh local `agent ask`, `agent run`, `agent review`, `agent implement`,
 `orchestrate`, and `task run` dispatches accept `--org-role <name>` (or the
@@ -1212,8 +1216,10 @@ with a `:` is a `wX:pY` id, otherwise a pane label resolved to the current id at
 wake time). The daemon calls `herdr agent prompt <pane> <text> --wait --timeout
 8000` and treats delivered (`result.type = "agent_prompted"`, or a post-delivery
 `error.code = "timeout"`) apart from stalled (`error.code =
-"agent_prompt_stalled"`). Rules, pane resolution, and wakes are best-effort; with
-no rule rows this path is off.
+"agent_prompt_stalled"`). Stalls increment the role's consecutive missed-wake
+counter and delivery resets it; transport failures leave it unchanged. Rules,
+pane resolution, counter writes, and wakes are best-effort; with no rule rows
+this path is off.
 
 ## External-coordinator workflow groups
 

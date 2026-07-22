@@ -81,6 +81,10 @@ type OrchestratePolicy struct {
 	// task or Herdr-backed organization role emits one synthesized blocked event.
 	// Zero (the default) disables both evaluators; negative values are rejected.
 	BlockedRoleWakeAfter time.Duration
+	// MaxConsecutiveMissedWakes is the per-role threshold at which org chart and
+	// status flag a role whose delivered prompts repeatedly stall. 0 (the default)
+	// disables flagging; negative values are rejected.
+	MaxConsecutiveMissedWakes int
 	// MaxDelegationNonProgressStreak is the per-root threshold for the result-aware
 	// non-progress loop detector (#339): how many consecutive continuation
 	// generations a delegation tree may produce with no new durable side effect
@@ -126,6 +130,7 @@ func DefaultOrchestratePolicy() OrchestratePolicy {
 		EscalationTTL:                  "",
 		BlockedTTL:                     "",
 		BlockedRoleWakeAfter:           0,
+		MaxConsecutiveMissedWakes:      0,
 		MaxDelegationNonProgressStreak: 0,
 		MaxVerifyReplanAttempts:        0,
 		DefaultDelegationTimeout:       "",
@@ -233,6 +238,10 @@ func applyOrchestratePolicyField(policy *OrchestratePolicy, key string, value st
 		}
 		policy.BlockedRoleWakeAfter, err = time.ParseDuration(parsed)
 		return err
+	case "max_consecutive_missed_wakes":
+		parsed, err := strconv.Atoi(value)
+		policy.MaxConsecutiveMissedWakes = parsed
+		return err
 	case "max_delegation_non_progress_streak":
 		parsed, err := strconv.Atoi(value)
 		policy.MaxDelegationNonProgressStreak = parsed
@@ -313,6 +322,9 @@ func validateOrchestratePolicy(policy OrchestratePolicy) error {
 	}
 	if policy.BlockedRoleWakeAfter < 0 {
 		return fmt.Errorf("orchestrate.blocked_role_wake_after must be zero (disabled) or a positive duration")
+	}
+	if policy.MaxConsecutiveMissedWakes < 0 {
+		return fmt.Errorf("orchestrate.max_consecutive_missed_wakes must be 0 (disabled) or positive")
 	}
 	if policy.MaxDelegationNonProgressStreak < 0 {
 		return fmt.Errorf("orchestrate.max_delegation_non_progress_streak must be 0 (engine default) or positive")
