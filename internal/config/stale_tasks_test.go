@@ -41,6 +41,43 @@ func TestLoadStaleTaskTTL(t *testing.T) {
 	}
 }
 
+func TestLoadDelegationWorktreeTTL(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "missing config", want: DefaultDelegationWorktreeTTL},
+		{name: "omitted", content: "[workflow]\nresult_checks = \"warn\"\n", want: DefaultDelegationWorktreeTTL},
+		{name: "empty", content: "[workflow]\ndelegation_worktree_ttl = \"\"\n", want: DefaultDelegationWorktreeTTL},
+		{name: "disabled", content: "[workflow]\ndelegation_worktree_ttl = \"0\"\n", want: 0},
+		{name: "duration", content: "[workflow]\ndelegation_worktree_ttl = \"24h\"\n", want: 24 * time.Hour},
+		{name: "invalid", content: "[workflow]\ndelegation_worktree_ttl = \"later\"\n", wantErr: true},
+		{name: "negative", content: "[workflow]\ndelegation_worktree_ttl = \"-1h\"\n", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			paths := Paths{ConfigFile: filepath.Join(t.TempDir(), ConfigName)}
+			if tc.content != "" {
+				if err := os.WriteFile(paths.ConfigFile, []byte(tc.content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := LoadDelegationWorktreeTTL(paths)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("LoadDelegationWorktreeTTL() = %s, want error", got)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("LoadDelegationWorktreeTTL() = %s, %v; want %s, nil", got, err, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoadPlannedTaskTTLOptIn(t *testing.T) {
 	tests := []struct {
 		name    string

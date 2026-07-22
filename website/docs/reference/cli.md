@@ -22,7 +22,9 @@ gh auth status
 `gitmoot doctor` is the environment preflight: it validates `gh auth` (with an
 actionable remediation hint) and live-probes the Claude credential selected by
 `runtime-auth.env`, so a bad credential is caught before jobs stall on it. Run
-it after install and before starting the daemon.
+it after install and before starting the daemon. It also reports delegation
+worktree count and logical disk size, warning at 10 stale worktrees or 1 GB and
+distinguishing aged-final reclaimable owners from pinned non-final owners.
 
 One-shot onboarding: `gitmoot setup` registers the repo and an agent in one
 command (`--repo owner/repo --agent <name> --runtime codex|claude|shell
@@ -1201,6 +1203,11 @@ qualifying `implementing`/`blocked` tasks per repo poll.
 branches, branches still present on `origin`, and remote-check uncertainty all
 prevent automatic dismissal; successful transitions record
 `task_dismissed_auto`.
+
+Delegation worktrees use the separate default-on
+`[workflow].delegation_worktree_ttl = "72h"`; `"0"` disables that pass. Only
+final job owners older than the TTL are force-reclaimed. Blocked, queued, and
+running owners remain pinned and are reported by `gitmoot doctor`.
 
 `[workflow].planned_ttl = "720h"` is a separate repository opt-in for old
 never-started plans. It is disabled by default; unset, empty, `"0"`, and invalid

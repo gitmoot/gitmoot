@@ -22,7 +22,9 @@ gh auth status
 `gitmoot doctor` is the environment preflight: it validates `gh auth` (with an
 actionable remediation hint) and live-probes the Claude credential selected by
 `runtime-auth.env`, so a bad credential is caught before jobs stall. Run it
-after install and before starting the daemon.
+after install and before starting the daemon. It also reports delegation
+worktree count and logical disk size, warning at 10 stale worktrees or 1 GB and
+distinguishing aged-final reclaimable owners from pinned non-final owners.
 
 One-shot onboarding: `gitmoot setup` registers the repo and an agent in one
 command (`--repo owner/repo --agent <name> --runtime codex|claude|shell

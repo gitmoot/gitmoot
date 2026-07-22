@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -498,6 +499,7 @@ type tickCandidateStore interface {
 	JobIDsWithPendingAdvanceRetry(ctx context.Context) ([]string, error)
 	JobIDsWithPendingCommentRetry(ctx context.Context) ([]string, error)
 	JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) ([]string, error)
+	JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cutoff time.Time) ([]string, error)
 }
 
 // candidateMemo lazily runs one per-tick candidate query and shares its RESULT
@@ -525,10 +527,11 @@ func (m *candidateMemo) get(fetch func() ([]string, error)) ([]string, error) {
 }
 
 type tickCandidates struct {
-	store   tickCandidateStore
-	advance candidateMemo
-	comment candidateMemo
-	reclaim candidateMemo
+	store       tickCandidateStore
+	advance     candidateMemo
+	comment     candidateMemo
+	reclaim     candidateMemo
+	agedReclaim candidateMemo
 }
 
 // newTickCandidates is a package var (not a plain func) only so the once-per-tick
@@ -553,6 +556,12 @@ func (c *tickCandidates) commentRetryCandidates(ctx context.Context) ([]string, 
 func (c *tickCandidates) delegationReclaimCandidates(ctx context.Context) ([]string, error) {
 	return c.reclaim.get(func() ([]string, error) {
 		return c.store.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
+	})
+}
+
+func (c *tickCandidates) agedDelegationReclaimCandidates(ctx context.Context, cutoff time.Time) ([]string, error) {
+	return c.agedReclaim.get(func() ([]string, error) {
+		return c.store.JobIDsWithAgedTerminalDelegationWorktree(ctx, cutoff)
 	})
 }
 
@@ -669,6 +678,46 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 	return nil
 }
 
+// reclaimAgedTerminalDelegationWorktrees closes the cleanup crash window that
+// has no _cleanup_skipped marker. The bounded store query selects only FINAL
+// owners older than the configured TTL. Re-verification happens both here and
+// in Engine.ReclaimAgedTerminalDelegationWorktree; blocked/queued/running jobs
+// are never force-removed.
+func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string, checkoutHeld func(string) bool, cand *tickCandidates, now time.Time, ttl time.Duration) error {
+	if ttl <= 0 {
+		return nil
+	}
+	jobIDs, err := cand.agedDelegationReclaimCandidates(ctx, now.Add(-ttl))
+	if err != nil {
+		return err
+	}
+	for _, jobID := range jobIDs {
+		job, err := worker.Store.GetJob(ctx, jobID)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !workflow.IsFinalJobState(job.State) || !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+			continue
+		}
+		if checkoutHeld != nil {
+			if checkoutHeld(queuedJobCheckoutKey(ctx, worker.Store, job)) {
+				continue
+			}
+			if repoFilter != "" && checkoutHeld("repo:"+repoFilter) {
+				continue
+			}
+		}
+		engine := worker.WorkflowFactory(worker.delegationParentCheckout(ctx, job))
+		if err := engine.ReclaimAgedTerminalDelegationWorktree(ctx, jobID, now.Add(-ttl)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // runDaemonWorkerTickTracked is the per-tick worker pass. With a nil tracker it
 // follows the historical synchronous tick behavior: maintenance scans,
 // then a BLOCKING runQueuedJobsForRepo dispatch. The supervisors pass a live
@@ -742,6 +791,14 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 			return err
 		}
 		if err := reclaimSkippedDelegationWorktrees(ctx, worker, repoFilter, rootFilter, tracker.checkoutHeld, cand); err != nil {
+			return err
+		}
+		// The store path is already the resolved Gitmoot root. Using it keeps this
+		// hot-read on the daemon's actual home and prevents the raw/resolved
+		// double-resolution bug class; isolated tests likewise stay in /tmp.
+		if ttl, err := resolveDelegationWorktreeTTL(filepath.Dir(store.DatabasePath())); err != nil {
+			writeLine(stdout, "delegation_worktree_ttl reclaim skipped: %v", err)
+		} else if err := reclaimAgedTerminalDelegationWorktrees(ctx, worker, repoFilter, rootFilter, tracker.checkoutHeld, cand, now, ttl); err != nil {
 			return err
 		}
 	}
@@ -838,15 +895,13 @@ func jobStateCanRetryAdvancement(state string) bool {
 }
 
 // jobStateEligibleForWorktreeReclaim gates the delegation/read-only worktree
-// reclaim pass. It is the advancement-retry set PLUS cancelled: a job aborted
-// (cancel / kill / supersede) before its terminal AdvanceJob leaves a
-// dispatch-allocated read-only worktree (#739) on disk with a
-// delegation_worktree_cleanup_skipped marker but a JobCancelled state, so the
-// reclaim pass must still dispose it. Cancelled is intentionally NOT added to
-// jobStateCanRetryAdvancement (a cancelled job must never RE-ADVANCE) — only its
-// worktree is reclaimed here, via the same idempotent, liveness-gated cleanup.
+// reclaim pass on FINAL states. Cancelled is included because an abort can leave
+// a dispatch-allocated read-only worktree, while blocked is excluded because it
+// is resumable and still owns its worktree. Cancelled remains intentionally out
+// of jobStateCanRetryAdvancement: its resources may be reclaimed, but the job
+// itself must never re-advance.
 func jobStateEligibleForWorktreeReclaim(state string) bool {
-	return jobStateCanRetryAdvancement(state) || state == string(workflow.JobCancelled)
+	return workflow.IsFinalJobState(state)
 }
 
 // retryPendingJobComments re-posts the result comment for any terminal job whose

@@ -113,6 +113,13 @@ activity proxy. Configure `[workflow].stale_task_ttl = "168h"` (the default), or
 set it to `"0"` to disable this poll leg. Candidates with a same-repo open PR,
 a remote branch, a live job, or an uncertain remote check are not dismissed.
 
+Delegation worktrees have a separate default-on retention bound:
+`[workflow].delegation_worktree_ttl = "72h"`. Only worktrees owned by final jobs
+(`succeeded`, `failed`, or `cancelled`) older than the TTL are force-removed;
+`"0"` disables the pass. Blocked, queued, and running owners stay pinned. Run
+`gitmoot doctor` to see stale count, logical size, and the
+reclaimable/pinned/unproven breakdown; dashboard `/api/health` mirrors it.
+
 Never-started plans have a separate destructive opt-in:
 `[workflow].planned_ttl = "720h"`. It is disabled by default; unset, empty,
 `"0"`, and invalid values all mean off because dismissing a plan can destroy

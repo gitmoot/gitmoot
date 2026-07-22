@@ -213,7 +213,7 @@ func TestClientAddWorktreeRejectsInvalidInput(t *testing.T) {
 }
 
 func TestClientDetachedAndForceRemoveCommandConstruction(t *testing.T) {
-	runner := &fakeRunner{results: []subprocess.Result{{}, {}}}
+	runner := &fakeRunner{results: []subprocess.Result{{}, {}, {}}}
 	client := Client{Runner: runner, Dir: "/repo"}
 	if err := client.AddDetachedWorktree(context.Background(), "/worktrees/d1", "main"); err != nil {
 		t.Fatalf("AddDetachedWorktree returned error: %v", err)
@@ -221,8 +221,12 @@ func TestClientDetachedAndForceRemoveCommandConstruction(t *testing.T) {
 	if err := client.RemoveWorktreeForce(context.Background(), "/worktrees/d1"); err != nil {
 		t.Fatalf("RemoveWorktreeForce returned error: %v", err)
 	}
+	if err := client.PruneWorktrees(context.Background()); err != nil {
+		t.Fatalf("PruneWorktrees returned error: %v", err)
+	}
 	runner.wantArgs(t, 0, "git", "worktree", "add", "--detach", "/worktrees/d1", "main")
 	runner.wantArgs(t, 1, "git", "worktree", "remove", "--force", "/worktrees/d1")
+	runner.wantArgs(t, 2, "git", "worktree", "prune")
 }
 
 func TestClientRemoveWorktreeForceSmoke(t *testing.T) {

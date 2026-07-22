@@ -4287,13 +4287,13 @@ func TestWarnSerializedParallelJobsSilentBelowTwo(t *testing.T) {
 func TestJobStateEligibleForWorktreeReclaim(t *testing.T) {
 	for _, s := range []string{
 		string(workflow.JobSucceeded), string(workflow.JobFailed),
-		string(workflow.JobBlocked), string(workflow.JobCancelled),
+		string(workflow.JobCancelled),
 	} {
 		if !jobStateEligibleForWorktreeReclaim(s) {
 			t.Fatalf("state %q must be worktree-reclaim eligible", s)
 		}
 	}
-	for _, s := range []string{string(workflow.JobQueued), string(workflow.JobRunning)} {
+	for _, s := range []string{string(workflow.JobQueued), string(workflow.JobRunning), string(workflow.JobBlocked)} {
 		if jobStateEligibleForWorktreeReclaim(s) {
 			t.Fatalf("state %q must not be worktree-reclaim eligible", s)
 		}
@@ -4678,6 +4678,7 @@ func TestTickCandidatesComputedOncePerTick(t *testing.T) {
 		atomic.StoreInt32(&counter.advance, 0)
 		atomic.StoreInt32(&counter.comment, 0)
 		atomic.StoreInt32(&counter.reclaim, 0)
+		atomic.StoreInt32(&counter.agedReclaim, 0)
 	}
 	now := time.Now().UTC()
 
@@ -4694,6 +4695,9 @@ func TestTickCandidatesComputedOncePerTick(t *testing.T) {
 	if got := atomic.LoadInt32(&counter.reclaim); got != 1 {
 		t.Fatalf("delegation-reclaim query ran %d times across %d repos, want 1", got, repoCount)
 	}
+	if got := atomic.LoadInt32(&counter.agedReclaim); got != 1 {
+		t.Fatalf("aged delegation-reclaim query ran %d times across %d repos, want 1", got, repoCount)
+	}
 
 	// Single-repo tick with a nil carrier self-computes each query at most once.
 	reset()
@@ -4709,13 +4713,16 @@ func TestTickCandidatesComputedOncePerTick(t *testing.T) {
 	if got := atomic.LoadInt32(&counter.reclaim); got != 1 {
 		t.Fatalf("single-repo delegation-reclaim query ran %d times, want 1", got)
 	}
+	if got := atomic.LoadInt32(&counter.agedReclaim); got != 1 {
+		t.Fatalf("single-repo aged delegation-reclaim query ran %d times, want 1", got)
+	}
 
 	// A dry-run tick returns before computing any candidate set.
 	reset()
 	if err := runDaemonWorkerTickTracked(ctx, store, worker, 1, true, "owner/repo0", "", io.Discard, now, nil, nil); err != nil {
 		t.Fatalf("dry-run runDaemonWorkerTickTracked returned error: %v", err)
 	}
-	if got := atomic.LoadInt32(&counter.advance) + atomic.LoadInt32(&counter.comment) + atomic.LoadInt32(&counter.reclaim); got != 0 {
+	if got := atomic.LoadInt32(&counter.advance) + atomic.LoadInt32(&counter.comment) + atomic.LoadInt32(&counter.reclaim) + atomic.LoadInt32(&counter.agedReclaim); got != 0 {
 		t.Fatalf("dry-run ran %d candidate queries, want 0", got)
 	}
 }
@@ -4772,5 +4779,14 @@ func TestTickCandidatesRetriesOnError(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&store.reclaimCalls); got != 2 {
 		t.Fatalf("reclaim query ran %d times, want 2", got)
+	}
+	if _, err := cand.agedDelegationReclaimCandidates(ctx, time.Now()); !errors.Is(err, errCandidateTransient) {
+		t.Fatalf("first agedDelegationReclaimCandidates err = %v, want transient", err)
+	}
+	if ids, err := cand.agedDelegationReclaimCandidates(ctx, time.Now()); err != nil || len(ids) != 1 || ids[0] != "aged-reclaim-job" {
+		t.Fatalf("second agedDelegationReclaimCandidates ids=%v err=%v, want [aged-reclaim-job] nil", ids, err)
+	}
+	if got := atomic.LoadInt32(&store.agedReclaimCalls); got != 2 {
+		t.Fatalf("aged reclaim query ran %d times, want 2", got)
 	}
 }

@@ -39,6 +39,13 @@ type ReadOnlyWorktreeManager interface {
 	RemoveWorktreeForce(ctx context.Context, path string) error
 }
 
+// WorktreePruner removes stale worktree administrative entries after a forced
+// TTL reclaim. The checkout-bound git client satisfies it; tests may omit it
+// because pruning is cleanup of shared git metadata, not the safety gate.
+type WorktreePruner interface {
+	PruneWorktrees(ctx context.Context) error
+}
+
 // BranchDeleter deletes a local branch. The checkout-bound gitutil.Client
 // satisfies it; used to tear down a terminal implement delegation's branch.
 type BranchDeleter interface {
@@ -896,6 +903,127 @@ func (e Engine) ReclaimTerminalDelegationWorktree(ctx context.Context, jobID str
 	e.cleanupImplementDelegationWorktree(ctx, jobID, job.Type, payload)
 	e.cleanupReadOnlyDelegationWorktree(ctx, jobID, job.Type, payload)
 	return nil
+}
+
+// ReclaimAgedTerminalDelegationWorktree force-removes a delegation/read-only
+// worktree only when the owning job is FINAL and its terminal updated_at is at
+// or before cutoff. This is the crash-window backstop: unlike the ordinary
+// cleanup path it intentionally bypasses dirty/unprovable-content and stale
+// runtime-owner preservation after the 72h default grace period. Blocked jobs
+// are resumable (not final), so they can never pass this gate.
+func (e Engine) ReclaimAgedTerminalDelegationWorktree(ctx context.Context, jobID string, cutoff time.Time) error {
+	if err := e.validate(); err != nil {
+		return err
+	}
+	job, payload, err := e.jobPayload(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if !IsFinalJobState(job.State) {
+		return fmt.Errorf("refusing TTL worktree reclaim for non-final job %s in state %s", jobID, job.State)
+	}
+	terminalAt, ok := parseStoredJobTime(job.UpdatedAt)
+	if !ok {
+		terminalAt, ok = parseStoredJobTime(job.CreatedAt)
+	}
+	if !ok || terminalAt.After(cutoff.UTC()) {
+		return nil
+	}
+	readOnly := isReadOnlyDelegationWorktree(job.Type, payload)
+	implement := isImplementDelegationWorktree(job.Type, payload)
+	if !readOnly && !implement {
+		return nil
+	}
+	// A deterministic path can appear in more than one historical row. Never let
+	// an aged row reclaim it out from under a newer or resumable owner.
+	jobs, err := e.Store.ListJobs(ctx)
+	if err != nil {
+		return err
+	}
+	for _, other := range jobs {
+		if other.ID == job.ID {
+			continue
+		}
+		otherPayload, err := ParseJobPayload(other.Payload)
+		if err != nil || filepath.Clean(strings.TrimSpace(otherPayload.WorktreePath)) != filepath.Clean(strings.TrimSpace(payload.WorktreePath)) {
+			continue
+		}
+		if !IsFinalJobState(other.State) {
+			return nil
+		}
+		otherAt, ok := parseStoredJobTime(other.UpdatedAt)
+		if !ok {
+			otherAt, ok = parseStoredJobTime(other.CreatedAt)
+		}
+		if !ok || otherAt.After(cutoff.UTC()) {
+			return nil
+		}
+	}
+	manager, ok := e.DelegationWorktrees.(ReadOnlyWorktreeManager)
+	if !ok || manager == nil {
+		return errors.New("delegation worktree manager cannot force-remove worktrees")
+	}
+
+	opCtx := context.WithoutCancel(ctx)
+	path := strings.TrimSpace(payload.WorktreePath)
+	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(opCtx, e.Store, e.DelegationCheckout, "worktree-ttl-reclaim:"+jobID, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("lock checkout for TTL worktree reclaim: %w", err)
+	}
+	defer func() {
+		if releaseCheckoutLock != nil {
+			_ = releaseCheckoutLock(context.Background())
+		}
+	}()
+
+	if _, statErr := os.Stat(path); statErr == nil {
+		if err := manager.RemoveWorktreeForce(opCtx, path); err != nil {
+			return fmt.Errorf("force-remove aged terminal worktree %s: %w", path, err)
+		}
+	} else if !os.IsNotExist(statErr) {
+		return fmt.Errorf("inspect aged terminal worktree %s: %w", path, statErr)
+	}
+
+	branch := strings.TrimSpace(payload.Branch)
+	if implement {
+		if _, err := releaseDelegationBranchLock(opCtx, e.Store, job.Type, payload); err != nil {
+			return fmt.Errorf("release delegation branch lock %s: %w", branch, err)
+		}
+		if deleter, ok := e.DelegationWorktrees.(BranchDeleter); ok && deleter != nil {
+			shouldDelete := true
+			if checker, ok := e.DelegationWorktrees.(BranchExistenceChecker); ok && checker != nil {
+				exists, err := checker.BranchExists(opCtx, branch)
+				if err != nil {
+					return fmt.Errorf("inspect delegation branch %s: %w", branch, err)
+				}
+				shouldDelete = exists
+			}
+			if shouldDelete {
+				if err := deleter.DeleteBranch(opCtx, branch); err != nil {
+					return fmt.Errorf("force-delete aged terminal branch %s: %w", branch, err)
+				}
+			}
+		}
+	}
+	if pruner, ok := e.DelegationWorktrees.(WorktreePruner); ok && pruner != nil {
+		if err := pruner.PruneWorktrees(opCtx); err != nil {
+			return fmt.Errorf("prune worktree metadata after TTL reclaim: %w", err)
+		}
+	}
+	return e.Store.AddJobEvent(opCtx, db.JobEvent{
+		JobID: jobID, Kind: "delegation_worktree_reclaimed_ttl",
+		Message: fmt.Sprintf("aged terminal delegation worktree %s force-removed after TTL", path),
+	})
+}
+
+func parseStoredJobTime(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	for _, layout := range []string{"2006-01-02 15:04:05", time.RFC3339Nano, time.RFC3339} {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return parsed.UTC(), true
+		}
+	}
+	return time.Time{}, false
 }
 
 // implementLegBranchMayBeMerged reports whether a succeeded implement leg's

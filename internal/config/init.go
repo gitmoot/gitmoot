@@ -45,6 +45,9 @@ artifact_blobs = %q
 # off | warn | block and defaults to warn when omitted. stale_task_ttl is the
 # conservative updated_at age after which abandoned implementing/blocked tasks
 # may be auto-dismissed; it defaults to 168h and "0" disables that reconciler.
+# delegation_worktree_ttl defaults to 72h and bounds terminal-job worktree
+# retention; terminal owners cannot resume, so this safe cleanup is default-on.
+# Set it to "0" to disable the TTL reclaim pass.
 # planned_ttl is a separate destructive retirement policy for never-started
 # plans. It is OPT-IN and disabled by default because dismissal can discard human
 # planning context that a later goal-file import cannot reconstruct.
@@ -58,6 +61,7 @@ artifact_blobs = %q
 # implement_base = "origin/main"
 # result_checks = "warn"
 # stale_task_ttl = "168h"
+# delegation_worktree_ttl = "72h"
 # planned_ttl = "720h" # opt-in; unset/empty/0/invalid disables
 # require_workflow = false # opt out (default is true)
 # require_workflow_mode = "auto" # auto | strict

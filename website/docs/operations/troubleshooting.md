@@ -479,3 +479,40 @@ cd /root/gitmoot/website
 npm run build
 rsync -a --delete build/ /var/www/gitmoot-docs/
 ```
+
+## Delegation worktrees consume too much disk
+
+`gitmoot doctor` reports `N stale worktrees / X GB under <home>/worktrees` and
+separates reclaimable final owners, pinned non-final owners, and unproven
+directories. `/api/health` exposes the same metric in its top-level `worktrees`
+field.
+
+`[workflow].delegation_worktree_ttl = "72h"` is default-on: after that grace
+period the daemon force-removes dirty terminal-owned delegation worktrees,
+prunes Git worktree metadata, and records
+`delegation_worktree_reclaimed_ttl`. Set it to `"0"` to disable this pass.
+Blocked, queued, and running owners remain pinned and are never force-removed.
+
+For immediate relief, list candidate directories and prove ownership before
+removing anything:
+
+```sh
+find "$HOME/.gitmoot/worktrees" -type d -path '*/delegations/*/*' -prune -print
+sqlite3 "$HOME/.gitmoot/gitmoot.db" -header -column '
+SELECT id, state, updated_at, json_extract(payload, "$.worktree_path") AS path
+FROM jobs
+WHERE state IN ("succeeded", "failed", "cancelled")
+  AND datetime(updated_at) <= datetime("now", "-72 hours")
+  AND json_extract(payload, "$.worktree_path") <> ""
+  AND (json_extract(payload, "$.delegation_id") <> ""
+       OR json_extract(payload, "$.read_only_worktree") = 1);
+'
+gitmoot job show <job-id> --json
+git -C <registered-checkout> worktree remove --force <verified-worktree-path>
+git -C <registered-checkout> worktree prune
+```
+
+The `sqlite3` command is an optional operator aid, not a Gitmoot dependency.
+Verify that `job show` still reports `succeeded`, `failed`, or `cancelled` and
+the same `payload.worktree_path`. Never remove a worktree for a blocked, queued,
+or running job; settle it first.
