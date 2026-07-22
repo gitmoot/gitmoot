@@ -272,9 +272,16 @@ func presentLiveABAndCapturePick(prompt, championAnswer, challengerAnswer string
 // is the common non-interactive case and returns ok=false (fail-safe skip). When
 // a valid pick arrives it is mapped back through the shuffle to the correct role.
 func defaultLiveABPresenter(prompt, championAnswer, challengerAnswer string) (string, string, bool) {
+	return defaultLiveABPresenterWith(prompt, championAnswer, challengerAnswer, defaultLiveABShuffle, defaultReadSkillOptABLine)
+}
+
+// defaultLiveABPresenterWith presents a blinded comparison with injected input
+// seams. Production supplies the default randomizer and line reader; tests can
+// pin either without mutating package state.
+func defaultLiveABPresenterWith(prompt, championAnswer, challengerAnswer string, shuffle func() bool, readLine func() (string, bool)) (string, string, bool) {
 	// Shuffle so the human cannot infer which answer is the challenger; map the
 	// pick back to the role via the recorded swap.
-	swap := liveABShuffle()
+	swap := shuffle()
 	optionAAnswer, optionAIsChampion := championAnswer, true
 	optionBAnswer := challengerAnswer
 	if swap {
@@ -287,7 +294,7 @@ func defaultLiveABPresenter(prompt, championAnswer, challengerAnswer string) (st
 	fmt.Printf("Option B:\n%s\n\n", optionBAnswer)
 	fmt.Print("Which is better? [a/b] (enter to skip): ")
 
-	line, gotLine := readSkillOptABLine()
+	line, gotLine := readLine()
 	if !gotLine {
 		return "", "", false
 	}
@@ -302,7 +309,6 @@ func defaultLiveABPresenter(prompt, championAnswer, challengerAnswer string) (st
 	return skillOptABChallengerLabel, skillOptABChampionLabel, true
 }
 
-// liveABShuffle is a seam over the one coin flip that decides the A/B label
-// shuffle; tests pin it. The default uses the same package math/rand source as
-// liveABSampler so an unseeded run is non-deterministic (no fixed-seed bias).
-var liveABShuffle = func() bool { return rand.Intn(2) == 1 }
+// defaultLiveABShuffle uses the same package math/rand source as liveABSampler
+// so an unseeded run is non-deterministic (no fixed-seed bias).
+func defaultLiveABShuffle() bool { return rand.Intn(2) == 1 }

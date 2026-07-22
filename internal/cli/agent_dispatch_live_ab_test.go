@@ -487,32 +487,22 @@ func assertLiveABSkippedEvent(t *testing.T, store *db.Store, jobID string) {
 // maps a pick back to the correct role under both shuffle orientations, so a
 // captured preference is never silently inverted.
 func TestDefaultLiveABPresenterMapsPickThroughShuffle(t *testing.T) {
-	prevShuffle := liveABShuffle
-	prevLine := readSkillOptABLine
-	t.Cleanup(func() {
-		liveABShuffle = prevShuffle
-		readSkillOptABLine = prevLine
-	})
+	t.Parallel()
 
 	// No swap: Option A = champion. Pick "a" -> champion wins.
-	liveABShuffle = func() bool { return false }
-	readSkillOptABLine = func() (string, bool) { return "a", true }
-	winner, loser, ok := defaultLiveABPresenter("q", "champ", "chal")
+	winner, loser, ok := defaultLiveABPresenterWith("q", "champ", "chal", func() bool { return false }, func() (string, bool) { return "a", true })
 	if !ok || winner != skillOptABChampionLabel || loser != skillOptABChallengerLabel {
 		t.Fatalf("no-swap pick a: winner=%q loser=%q ok=%v, want champion wins", winner, loser, ok)
 	}
 
 	// Swap: Option A = challenger. Pick "a" -> challenger wins.
-	liveABShuffle = func() bool { return true }
-	readSkillOptABLine = func() (string, bool) { return "a", true }
-	winner, loser, ok = defaultLiveABPresenter("q", "champ", "chal")
+	winner, loser, ok = defaultLiveABPresenterWith("q", "champ", "chal", func() bool { return true }, func() (string, bool) { return "a", true })
 	if !ok || winner != skillOptABChallengerLabel || loser != skillOptABChampionLabel {
 		t.Fatalf("swap pick a: winner=%q loser=%q ok=%v, want challenger wins", winner, loser, ok)
 	}
 
 	// No pick line -> ok=false (fail-safe skip).
-	readSkillOptABLine = func() (string, bool) { return "", false }
-	if _, _, ok := defaultLiveABPresenter("q", "champ", "chal"); ok {
+	if _, _, ok := defaultLiveABPresenterWith("q", "champ", "chal", func() bool { return false }, func() (string, bool) { return "", false }); ok {
 		t.Fatal("missing pick line must return ok=false")
 	}
 }

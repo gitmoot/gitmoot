@@ -51,6 +51,7 @@ func selectJob(t *testing.T, m Model, id string) Model {
 }
 
 func TestFormatJobTime(t *testing.T) {
+	t.Parallel()
 	cases := map[string]string{
 		"2026-06-11 14:30:05":  "06-11 14:30",
 		"2026-01-02T15:04:05Z": "01-02 15:04",
@@ -69,6 +70,7 @@ func TestFormatJobTime(t *testing.T) {
 }
 
 func TestJobsRowShowsTime(t *testing.T) {
+	t.Parallel()
 	snap := jobsSnapshot()
 	snap.JobRows[0].UpdatedAt = "2026-06-11 14:30:05"
 	m := jobsModel(t, Deps{}, snap)
@@ -78,6 +80,7 @@ func TestJobsRowShowsTime(t *testing.T) {
 }
 
 func TestJobsListWindowsLongList(t *testing.T) {
+	t.Parallel()
 	snap := Snapshot{Daemon: Daemon{Running: true}}
 	for i := 0; i < 100; i++ {
 		snap.JobRows = append(snap.JobRows, JobRow{
@@ -119,6 +122,7 @@ func TestJobsListWindowsLongList(t *testing.T) {
 // (with ×counts) in active-first order, and that the cursor resolves through the
 // grouped order rather than snapshot order.
 func TestJobsGroupedByStatus(t *testing.T) {
+	t.Parallel()
 	m := jobsModel(t, Deps{}, jobsSnapshot())
 	view := m.View()
 	for _, want := range []string{"running  ×1", "failed  ×1", "succeeded  ×1", "cancelled  ×1"} {
@@ -144,6 +148,7 @@ func TestJobsGroupedByStatus(t *testing.T) {
 // TestJobsCollapsedByDefault verifies the live default folds the status groups so
 // the page opens as status headers, and space expands one.
 func TestJobsCollapsedByDefault(t *testing.T) {
+	t.Parallel()
 	snap := jobsSnapshot()
 	deps := Deps{Load: func() (Snapshot, error) { return snap, nil }, CollapseGroupsByDefault: true}
 	m := sizedModel(deps)
@@ -173,6 +178,7 @@ func TestJobsCollapsedByDefault(t *testing.T) {
 // mid-list), the windowed content fits inside the viewport so the "more rows
 // below" marker and the footer help are not clipped off the bottom.
 func TestJobsWindowFitsViewport(t *testing.T) {
+	t.Parallel()
 	snap := Snapshot{Daemon: Daemon{Running: true}}
 	for i := 0; i < 100; i++ {
 		snap.JobRows = append(snap.JobRows, JobRow{ID: "job-" + strconv.Itoa(i), Agent: "planner", Type: "ask", State: "succeeded"})
@@ -207,6 +213,7 @@ func TestJobsWindowFitsViewport(t *testing.T) {
 // TestJobsWindowKeepsGroupContext guards that scrolling deep into a status group
 // (so its header scrolls off) keeps the group context on the "above" marker.
 func TestJobsWindowKeepsGroupContext(t *testing.T) {
+	t.Parallel()
 	snap := Snapshot{Daemon: Daemon{Running: true}}
 	for i := 0; i < 100; i++ {
 		snap.JobRows = append(snap.JobRows, JobRow{ID: "job-" + strconv.Itoa(i), Agent: "planner", Type: "ask", State: "succeeded"})
@@ -222,6 +229,7 @@ func TestJobsWindowKeepsGroupContext(t *testing.T) {
 }
 
 func TestJobsPageDetailLoadsEvents(t *testing.T) {
+	t.Parallel()
 	var asked string
 	deps := Deps{JobEvents: func(id string) ([]JobEventView, error) {
 		asked = id
@@ -244,6 +252,7 @@ func TestJobsPageDetailLoadsEvents(t *testing.T) {
 }
 
 func TestJobsRetryConfirmFlow(t *testing.T) {
+	t.Parallel()
 	var retried string
 	deps := Deps{RetryJob: func(id string) error { retried = id; return nil }}
 	m := jobsModel(t, deps, jobsSnapshot())
@@ -269,6 +278,7 @@ func TestJobsRetryConfirmFlow(t *testing.T) {
 }
 
 func TestJobsCancelRunningShowsCancelling(t *testing.T) {
+	t.Parallel()
 	var cancelled string
 	snap := jobsSnapshot()
 	deps := Deps{
@@ -303,6 +313,7 @@ func TestJobsCancelRunningShowsCancelling(t *testing.T) {
 }
 
 func TestJobsRetryOnNonRetryableIgnored(t *testing.T) {
+	t.Parallel()
 	deps := Deps{RetryJob: func(id string) error { t.Fatal("must not retry"); return nil }}
 	m := jobsModel(t, deps, jobsSnapshot())
 	m = selectJob(t, m, "j-done")
@@ -314,6 +325,7 @@ func TestJobsRetryOnNonRetryableIgnored(t *testing.T) {
 }
 
 func TestJobsBugReportPreviewCreateFlow(t *testing.T) {
+	t.Parallel()
 	var previewed, created string
 	deps := Deps{
 		BugReportPreview: func(id string) (BugReportPreview, error) {
@@ -379,6 +391,7 @@ func TestJobsBugReportPreviewCreateFlow(t *testing.T) {
 }
 
 func TestJobsBugReportPreviewKeepsFooterVisibleForLongBody(t *testing.T) {
+	t.Parallel()
 	deps := Deps{
 		BugReportPreview: func(id string) (BugReportPreview, error) {
 			return BugReportPreview{
@@ -406,6 +419,7 @@ func TestJobsBugReportPreviewKeepsFooterVisibleForLongBody(t *testing.T) {
 }
 
 func TestJobsBugReportCreateErrorKeepsPreview(t *testing.T) {
+	t.Parallel()
 	deps := Deps{
 		BugReportPreview: func(id string) (BugReportPreview, error) {
 			return BugReportPreview{Title: "draft", Body: "body"}, nil
@@ -433,6 +447,7 @@ func TestJobsBugReportCreateErrorKeepsPreview(t *testing.T) {
 }
 
 func TestJobsBugReportExistingIssueLabel(t *testing.T) {
+	t.Parallel()
 	deps := Deps{
 		BugReportPreview: func(id string) (BugReportPreview, error) {
 			return BugReportPreview{Title: "draft", Body: "body", Fingerprint: "abc123"}, nil
@@ -461,6 +476,7 @@ func TestJobsBugReportExistingIssueLabel(t *testing.T) {
 }
 
 func TestJobsBugReportCreateResultNotDroppedAfterEsc(t *testing.T) {
+	t.Parallel()
 	deps := Deps{
 		BugReportPreview: func(id string) (BugReportPreview, error) {
 			return BugReportPreview{Title: "draft", Body: "body", Fingerprint: "abc123"}, nil
@@ -490,6 +506,7 @@ func TestJobsBugReportCreateResultNotDroppedAfterEsc(t *testing.T) {
 }
 
 func TestJobsBugReportBuildErrorKeepsPreview(t *testing.T) {
+	t.Parallel()
 	deps := Deps{BugReportPreview: func(id string) (BugReportPreview, error) {
 		return BugReportPreview{}, errors.New("payload malformed")
 	}}
@@ -509,6 +526,7 @@ func TestJobsBugReportBuildErrorKeepsPreview(t *testing.T) {
 }
 
 func TestJobsBugReportPreviewWithoutCreateDepDoesNotAdvertiseCreate(t *testing.T) {
+	t.Parallel()
 	deps := Deps{BugReportPreview: func(id string) (BugReportPreview, error) {
 		return BugReportPreview{Title: "draft", Body: "body"}, nil
 	}}
@@ -529,6 +547,7 @@ func TestJobsBugReportPreviewWithoutCreateDepDoesNotAdvertiseCreate(t *testing.T
 }
 
 func TestJobsBugReportIgnoredForNonReportableJob(t *testing.T) {
+	t.Parallel()
 	deps := Deps{
 		BugReportPreview: func(id string) (BugReportPreview, error) {
 			t.Fatalf("must not build report for non-reportable job %s", id)
@@ -548,6 +567,7 @@ func TestJobsBugReportIgnoredForNonReportableJob(t *testing.T) {
 }
 
 func TestAttentionCancelledJobReportable(t *testing.T) {
+	t.Parallel()
 	var previewed string
 	snap := Snapshot{
 		Daemon:  Daemon{Running: true},
@@ -576,6 +596,7 @@ func TestAttentionCancelledJobReportable(t *testing.T) {
 }
 
 func TestAttentionJobRowsActionable(t *testing.T) {
+	t.Parallel()
 	var retried string
 	snap := jobsSnapshot()
 	deps := Deps{
@@ -604,6 +625,7 @@ func TestAttentionJobRowsActionable(t *testing.T) {
 }
 
 func TestAttentionDaemonStart(t *testing.T) {
+	t.Parallel()
 	started := false
 	snap := jobsSnapshot()
 	snap.Daemon.Running = false
@@ -647,6 +669,7 @@ func TestAttentionDaemonStart(t *testing.T) {
 }
 
 func TestDaemonStartResultDoesNotCloseJobConfirm(t *testing.T) {
+	t.Parallel()
 	snap := jobsSnapshot()
 	snap.Daemon.Running = false
 	deps := Deps{
@@ -676,6 +699,7 @@ func TestDaemonStartResultDoesNotCloseJobConfirm(t *testing.T) {
 }
 
 func TestJobDetailZeroEventsShowsNoEvents(t *testing.T) {
+	t.Parallel()
 	deps := Deps{JobEvents: func(id string) ([]JobEventView, error) { return nil, nil }}
 	m := jobsModel(t, deps, jobsSnapshot())
 	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -690,6 +714,7 @@ func TestJobDetailZeroEventsShowsNoEvents(t *testing.T) {
 }
 
 func TestJobConfirmStaysOpenWhileActionInFlight(t *testing.T) {
+	t.Parallel()
 	deps := Deps{RetryJob: func(id string) error { return nil }}
 	m := jobsModel(t, deps, jobsSnapshot())
 	m = selectJob(t, m, "j-failed")
@@ -712,6 +737,7 @@ func TestJobConfirmStaysOpenWhileActionInFlight(t *testing.T) {
 }
 
 func TestJobActionErrorKeepsConfirm(t *testing.T) {
+	t.Parallel()
 	deps := Deps{RetryJob: func(id string) error { return errors.New("db locked") }}
 	m := jobsModel(t, deps, jobsSnapshot())
 	m = selectJob(t, m, "j-failed")
@@ -749,6 +775,7 @@ func drainBatch(t *testing.T, m Model, cmd tea.Cmd) Model {
 }
 
 func TestJobDetailShowsRequestAndResult(t *testing.T) {
+	t.Parallel()
 	deps := Deps{
 		JobEvents: func(id string) ([]JobEventView, error) {
 			return []JobEventView{{Kind: "failed", Message: "boom"}}, nil
@@ -773,6 +800,7 @@ func TestJobDetailShowsRequestAndResult(t *testing.T) {
 // TestJobDetailWrapsLongResult guards that a long single-line result summary is
 // soft-wrapped to the viewport width instead of being clipped at the right edge.
 func TestJobDetailWrapsLongResult(t *testing.T) {
+	t.Parallel()
 	long := "Implementation blocked because the workspace is mounted read-only. " +
 		strings.Repeat("decrypt-failure replay-poisoning regression coverage ", 12) + "END_TOKEN"
 	deps := Deps{
@@ -798,6 +826,7 @@ func TestJobDetailWrapsLongResult(t *testing.T) {
 }
 
 func TestJobDetailOmitsBlocksWhenAbsent(t *testing.T) {
+	t.Parallel()
 	deps := Deps{
 		JobEvents: func(id string) ([]JobEventView, error) { return nil, nil },
 		JobDetail: func(id string) (JobDetail, error) { return JobDetail{}, nil },
@@ -815,6 +844,7 @@ func TestJobDetailOmitsBlocksWhenAbsent(t *testing.T) {
 }
 
 func TestJobDetailShowsDelegationTree(t *testing.T) {
+	t.Parallel()
 	deps := Deps{
 		JobEvents: func(id string) ([]JobEventView, error) { return nil, nil },
 		JobDetail: func(id string) (JobDetail, error) {
@@ -848,6 +878,7 @@ func TestJobDetailShowsDelegationTree(t *testing.T) {
 }
 
 func TestJobDetailOmitsDelegationsWhenNone(t *testing.T) {
+	t.Parallel()
 	deps := Deps{
 		JobEvents: func(id string) ([]JobEventView, error) { return nil, nil },
 		JobDetail: func(id string) (JobDetail, error) { return JobDetail{Request: "no children here"}, nil },
@@ -862,6 +893,7 @@ func TestJobDetailOmitsDelegationsWhenNone(t *testing.T) {
 }
 
 func TestJobDetailDelegationDepsPending(t *testing.T) {
+	t.Parallel()
 	deps := Deps{
 		JobEvents: func(id string) ([]JobEventView, error) { return nil, nil },
 		JobDetail: func(id string) (JobDetail, error) {
@@ -889,6 +921,7 @@ func TestJobDetailDelegationDepsPending(t *testing.T) {
 }
 
 func TestDepsLabel(t *testing.T) {
+	t.Parallel()
 	if got := depsLabel(JobChild{}); got != "-" {
 		t.Fatalf("depsLabel(no deps) = %q, want -", got)
 	}

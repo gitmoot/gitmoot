@@ -75,6 +75,7 @@ func tabToPage(t *testing.T, m Model, p page) Model {
 }
 
 func TestPagesRenderExpectedContent(t *testing.T) {
+	t.Parallel()
 	m := loadedModel(t)
 	// Page order: Attention, Activity, Trains, Agents, Workers, Jobs, Locks, Health, Config.
 	wants := []string{"Prompts (1)", "No active jobs", "train-s1", "planner", "skillopt-generator", "failed", "branch locks", "environment", "edit in $EDITOR"}
@@ -90,6 +91,7 @@ func TestPagesRenderExpectedContent(t *testing.T) {
 }
 
 func TestTabCyclesAllPages(t *testing.T) {
+	t.Parallel()
 	m := loadedModel(t)
 	for range pages {
 		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
@@ -106,6 +108,7 @@ func TestTabCyclesAllPages(t *testing.T) {
 }
 
 func TestRefreshSuppressionWhileInFlight(t *testing.T) {
+	t.Parallel()
 	m := loadedModel(t)
 	if m.inFlight {
 		t.Fatal("model should be idle after a snapshotMsg")
@@ -123,6 +126,7 @@ func TestRefreshSuppressionWhileInFlight(t *testing.T) {
 }
 
 func TestLoadErrorKeepsStaleData(t *testing.T) {
+	t.Parallel()
 	m := loadedModel(t)
 	next, _ := m.Update(snapshotMsg{err: errors.New("db locked"), at: time.Unix(2, 0)})
 	m = next.(Model)
@@ -138,6 +142,7 @@ func TestLoadErrorKeepsStaleData(t *testing.T) {
 }
 
 func TestEmptyStatesRenderWithoutPanic(t *testing.T) {
+	t.Parallel()
 	// Daemon running so the attention page shows the empty state rather than
 	// the (legitimate) daemon-stopped banner.
 	empty := Snapshot{Daemon: Daemon{Running: true}}
@@ -155,6 +160,7 @@ func TestEmptyStatesRenderWithoutPanic(t *testing.T) {
 }
 
 func TestResizeUpdatesViewport(t *testing.T) {
+	t.Parallel()
 	m := loadedModel(t)
 	next, _ := m.Update(tea.WindowSizeMsg{Width: 60, Height: 20})
 	m = next.(Model)
@@ -167,6 +173,7 @@ func TestResizeUpdatesViewport(t *testing.T) {
 }
 
 func TestTickRearmsAndRefreshes(t *testing.T) {
+	t.Parallel()
 	m := loadedModel(t)
 	_, cmd := m.Update(tickMsg{gen: m.tickGen})
 	if cmd == nil {
@@ -175,6 +182,7 @@ func TestTickRearmsAndRefreshes(t *testing.T) {
 }
 
 func TestPopNudgeResetsInFlightLoad(t *testing.T) {
+	t.Parallel()
 	m := loadedModel(t)
 	// A load dispatched just before a push has its snapshotMsg routed to the
 	// covering view and dropped; the latch must not survive the pop.
@@ -192,6 +200,7 @@ func TestPopNudgeResetsInFlightLoad(t *testing.T) {
 }
 
 func TestStaleTickGenerationDropped(t *testing.T) {
+	t.Parallel()
 	m := loadedModel(t)
 	// A pop-nudge starts a new tick generation…
 	next, cmd := m.Update(refreshNudgeMsg{})

@@ -119,6 +119,7 @@ func seedDiamondBlockedRun(t *testing.T, home, runID, specHash string) {
 // TestWebDataSourcePipelinesEmpty pins the empty-store contract: a non-nil, empty
 // slice (never nil), so the API layer's nil->[] coercion has nothing to do.
 func TestWebDataSourcePipelinesEmpty(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	ds := &webDataSource{home: home}
 
@@ -135,6 +136,7 @@ func TestWebDataSourcePipelinesEmpty(t *testing.T) {
 }
 
 func TestWebDataSourcePipelinesPipelineTriggerMode(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	store := openPipelineTestStore(t, home)
 	upstreamSpec := "name: upstream\nstages: [{id: run, cmd: echo}]\n"
@@ -169,6 +171,7 @@ func TestWebDataSourcePipelinesPipelineTriggerMode(t *testing.T) {
 // field mapping (including the two time.Time -> epoch-ms conversions), the Recent
 // cap at 10 newest-first, and the Duration = finished-started rule.
 func TestWebDataSourcePipelines(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	store := openPipelineTestStore(t, home)
 	ctx := context.Background()
@@ -265,6 +268,7 @@ func TestWebDataSourcePipelines(t *testing.T) {
 // spec-derived cmd + dependency deps merged, the blocked stage carrying its
 // persisted needs, the skipped stage present, and the run-level halt/needs mapped.
 func TestWebDataSourcePipelineRunBlockedDiamond(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	seedDiamondBlockedRun(t, home, "prun-diamond-0001", "")
 
@@ -339,6 +343,7 @@ func TestWebDataSourcePipelineRunBlockedDiamond(t *testing.T) {
 // both spec gates: matching-hash and same-stage-set structural fallback. Stored
 // order is retained; roots and malformed values become non-nil empty slices.
 func TestWebDataSourcePipelineRunStoredDeps(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	store := openPipelineTestStore(t, home)
 	realHash := pipeline.Hash([]byte(diamondSpecYAML))
@@ -393,6 +398,7 @@ func TestWebDataSourcePipelineRunStoredDeps(t *testing.T) {
 // latest-event read maps valid progress onto running stages only. Missing and
 // malformed events fail open, and terminal stages never retain stale progress.
 func TestWebDataSourcePipelineRunProgress(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	store := openPipelineTestStore(t, home)
 	started := time.UnixMilli(1_751_000_000_000).UTC()
@@ -434,24 +440,28 @@ func TestWebDataSourcePipelineRunProgress(t *testing.T) {
 	}
 
 	t.Run("maps running progress activity and event millis", func(t *testing.T) {
+		t.Parallel()
 		got := byID["mapped"]
 		if got.ProgressActivity != "compiled package 42/100" || got.ProgressAt != wantProgressAt || got.ProgressAt == 0 {
 			t.Fatalf("mapped progress = %q/%d, want activity/%d", got.ProgressActivity, got.ProgressAt, wantProgressAt)
 		}
 	})
 	t.Run("absent event stays zero", func(t *testing.T) {
+		t.Parallel()
 		got := byID["absent"]
 		if got.ProgressActivity != "" || got.ProgressAt != 0 {
 			t.Fatalf("absent progress = %q/%d, want zero values", got.ProgressActivity, got.ProgressAt)
 		}
 	})
 	t.Run("malformed event stays zero without error", func(t *testing.T) {
+		t.Parallel()
 		got := byID["malformed"]
 		if got.ProgressActivity != "" || got.ProgressAt != 0 {
 			t.Fatalf("malformed progress = %q/%d, want zero values", got.ProgressActivity, got.ProgressAt)
 		}
 	})
 	t.Run("terminal stage never carries progress", func(t *testing.T) {
+		t.Parallel()
 		got := byID["terminal"]
 		if got.ProgressActivity != "" || got.ProgressAt != 0 {
 			t.Fatalf("terminal progress = %q/%d, want zero values", got.ProgressActivity, got.ProgressAt)
@@ -463,6 +473,7 @@ func TestWebDataSourcePipelineRunProgress(t *testing.T) {
 // store maps to dashboard.ErrPipelineRunNotFound (the API layer serves 404), NOT an
 // empty 200.
 func TestWebDataSourcePipelineRunNotFound(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	ds := &webDataSource{home: home}
 
@@ -476,6 +487,7 @@ func TestWebDataSourcePipelineRunNotFound(t *testing.T) {
 // metadata-only re-add case: a hash mismatch keeps store ordering and suppresses
 // metadata, but an exact stage-ID set restores dependency edges for layout.
 func TestWebDataSourcePipelineRunSpecHashMismatchSameStageSetFallback(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	seedDiamondBlockedRun(t, home, "prun-diamond-stale", "sha256-stale-mismatch")
 
@@ -535,6 +547,7 @@ func TestWebDataSourcePipelineRunSpecHashMismatchSameStageSetFallback(t *testing
 // honest fallback: when stage membership changed, an old run gets neither current
 // metadata nor current dependency edges.
 func TestWebDataSourcePipelineRunSpecHashMismatchDifferentStageSetFallback(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	store := openPipelineTestStore(t, home)
 	seedTestPipeline(t, store, db.Pipeline{
@@ -567,6 +580,7 @@ func TestWebDataSourcePipelineRunSpecHashMismatchDifferentStageSetFallback(t *te
 // TestWebDataSourcePipelinesDeterministic pins byte-stable output (the UI polls with
 // a change-signature skip): two calls produce identical %+v.
 func TestWebDataSourcePipelinesDeterministic(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	store := openPipelineTestStore(t, home)
 	seedTestPipeline(t, store, db.Pipeline{Name: "beta", Repo: "acme/b", SpecYAML: diamondSpecYAML, Enabled: false, Interval: "12h"})
@@ -596,6 +610,7 @@ func TestWebDataSourcePipelinesDeterministic(t *testing.T) {
 
 // TestWebDataSourcePipelineRunDeterministic pins byte-stable run detail across calls.
 func TestWebDataSourcePipelineRunDeterministic(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	seedDiamondBlockedRun(t, home, "prun-diamond-det", "")
 
@@ -643,6 +658,7 @@ func diamondStageRows(state string) []db.PipelineRunStage {
 // pipeline that has never run: Declared is the spec DAG in spec order (every stage
 // pending, with cmd/deps merged) and Runs is a non-nil empty slice.
 func TestWebDataSourcePipelineDetailNeverRun(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	store := openPipelineTestStore(t, home)
 	seedTestPipeline(t, store, db.Pipeline{
@@ -701,6 +717,7 @@ func TestWebDataSourcePipelineDetailNeverRun(t *testing.T) {
 }
 
 func TestWebDataSourcePipelineDetailKeysNamesOnlyAndLiveDrift(t *testing.T) {
+	t.Parallel()
 	const (
 		ownSentinel     = "own-secret-value-974"
 		sharedSentinel  = "shared-secret-value-974"
@@ -811,6 +828,7 @@ stages:
 }
 
 func TestDashboardPipelineDetailKeysHTTPShape(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	envFile := writePipelineEnvFile(t, t.TempDir(), "TOKEN=http-secret-value-974\n", 0o600)
 	raw := fmt.Sprintf("name: http-keys\nenv_file: %q\nstages:\n  - {id: deliver, cmd: echo, env_keys: [TOKEN]}\n  - {id: idle, cmd: echo}\n", envFile)
@@ -845,6 +863,7 @@ func TestDashboardPipelineDetailKeysHTTPShape(t *testing.T) {
 }
 
 func TestWebDataSourcePipelineDetailKeysFailOpenSpec(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	store := openPipelineTestStore(t, home)
 	seedTestPipeline(t, store, db.Pipeline{Name: "broken-keys", SpecYAML: "name: [unterminated"})
@@ -866,6 +885,7 @@ func TestWebDataSourcePipelineDetailKeysFailOpenSpec(t *testing.T) {
 // stage carries its kind and (when the agent is registered) runtime, so the
 // dashboard's declared DAG can badge it (#873).
 func TestWebDataSourcePipelineDetailDeclaredAgentKind(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	store := openPipelineTestStore(t, home)
 	specYAML := "name: mailflow\nrepo: owner/repo\nstages:\n  - {id: triage, agent: helper, action: ask, prompt: read it}\n  - {id: run, cmd: echo, needs: [triage]}\n"
@@ -895,6 +915,7 @@ func TestWebDataSourcePipelineDetailDeclaredAgentKind(t *testing.T) {
 // back newest-first, each carrying non-nil per-stage marks in spec order, with
 // run-level state/trigger/duration mapped.
 func TestWebDataSourcePipelineDetailHistory(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	store := openPipelineTestStore(t, home)
 	realHash := pipeline.Hash([]byte(diamondSpecYAML))
@@ -952,7 +973,9 @@ func TestWebDataSourcePipelineDetailHistory(t *testing.T) {
 // shared with the run-detail path: spec order when the run's SpecHash matches the
 // current spec, and the store's stage_id fallback order on a hash mismatch.
 func TestWebDataSourcePipelineDetailMarksOrdering(t *testing.T) {
+	t.Parallel()
 	t.Run("spec order on hash match", func(t *testing.T) {
+		t.Parallel()
 		home := dashboardTestHome(t)
 		seedDiamondBlockedRun(t, home, "prun-detail-match", "")
 
@@ -982,6 +1005,7 @@ func TestWebDataSourcePipelineDetailMarksOrdering(t *testing.T) {
 	})
 
 	t.Run("stage_id fallback on hash mismatch", func(t *testing.T) {
+		t.Parallel()
 		home := dashboardTestHome(t)
 		seedDiamondBlockedRun(t, home, "prun-detail-stale", "sha256-stale-mismatch")
 
@@ -1004,6 +1028,7 @@ func TestWebDataSourcePipelineDetailMarksOrdering(t *testing.T) {
 	})
 
 	t.Run("mixed hashes in one history order per run", func(t *testing.T) {
+		t.Parallel()
 		// One history containing BOTH a current-spec run and a stale-spec run:
 		// the ordering decision must be made per run, not hoisted — the matching
 		// run keeps spec order while the stale one falls back to stage_id order
@@ -1046,6 +1071,7 @@ func TestWebDataSourcePipelineDetailMarksOrdering(t *testing.T) {
 // propagates to both the declared DAG (PipelineDetail) and a run's merged stage
 // (PipelineRun) under the hash gate, and is absent on a hash mismatch.
 func TestWebDataSourcePipelineDetailRetry(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	store := openPipelineTestStore(t, home)
 	realHash := pipeline.Hash([]byte(retrySpecYAML))
@@ -1099,6 +1125,7 @@ func TestWebDataSourcePipelineDetailRetry(t *testing.T) {
 // stored spec gets no spec-merged metadata — Retry and Cmd stay empty. The exact
 // stage-ID set still permits the structural Deps fallback used for layout.
 func TestWebDataSourcePipelineRunRetryAbsentOnHashMismatch(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	store := openPipelineTestStore(t, home)
 	seedTestPipeline(t, store, db.Pipeline{
@@ -1142,6 +1169,7 @@ func TestWebDataSourcePipelineRunRetryAbsentOnHashMismatch(t *testing.T) {
 // pipeline maps to dashboard.ErrPipelineNotFound (the API layer serves 404), not an
 // empty 200.
 func TestWebDataSourcePipelineDetailNotFound(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	ds := &webDataSource{home: home}
 
@@ -1154,6 +1182,7 @@ func TestWebDataSourcePipelineDetailNotFound(t *testing.T) {
 // TestWebDataSourcePipelineDetailDeterministic pins byte-stable detail output across
 // calls (the UI polls with a change-signature skip).
 func TestWebDataSourcePipelineDetailDeterministic(t *testing.T) {
+	t.Parallel()
 	home := dashboardTestHome(t)
 	store := openPipelineTestStore(t, home)
 	seedTestPipeline(t, store, db.Pipeline{

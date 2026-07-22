@@ -19,6 +19,7 @@ func trainRunModel(t *testing.T, snap TrainRunSnapshot) TrainRunModel {
 }
 
 func TestTrainPhaseSegment(t *testing.T) {
+	t.Parallel()
 	cases := map[string]int{
 		"items_ready":                0,
 		"generating_options":         0,
@@ -45,6 +46,7 @@ func TestTrainPhaseSegment(t *testing.T) {
 }
 
 func TestTrainRunRendersHeaderAndPhaseBar(t *testing.T) {
+	t.Parallel()
 	m := trainRunModel(t, TrainRunSnapshot{
 		SessionID: "train-abc", Template: "smithyx@v9", ReviewRepo: "o/r",
 		Phase: "items_ready", ReviewItems: 2, NextAction: "generate review options",
@@ -58,6 +60,7 @@ func TestTrainRunRendersHeaderAndPhaseBar(t *testing.T) {
 }
 
 func TestTrainRunReviewPhaseShowsIssueLink(t *testing.T) {
+	t.Parallel()
 	m := trainRunModel(t, TrainRunSnapshot{
 		SessionID: "s", Phase: "review_published",
 		IssueURL: "https://github.com/o/r/issues/7", FeedbackCount: 3,
@@ -75,6 +78,7 @@ func TestTrainRunReviewPhaseShowsIssueLink(t *testing.T) {
 }
 
 func TestTrainRunGeneratingShowsJobCounts(t *testing.T) {
+	t.Parallel()
 	m := trainRunModel(t, TrainRunSnapshot{
 		SessionID: "s", Phase: "generating_options",
 		JobsRunning: 1, JobsSucceeded: 2, JobsFailed: 0, ETA: "41s",
@@ -86,6 +90,7 @@ func TestTrainRunGeneratingShowsJobCounts(t *testing.T) {
 }
 
 func TestTrainRunSurfacesGenerationError(t *testing.T) {
+	t.Parallel()
 	m := trainRunModel(t, TrainRunSnapshot{SessionID: "s", Template: "t@v1", Phase: "items_ready"})
 	// A spawn first reports the optimistic "started in the background" note…
 	next, _ := m.Update(trainSpawnMsg{logPath: "/tmp/x.log"})
@@ -111,6 +116,7 @@ func TestTrainRunSurfacesGenerationError(t *testing.T) {
 }
 
 func TestTrainRunNoGenerationErrorKeepsNote(t *testing.T) {
+	t.Parallel()
 	m := trainRunModel(t, TrainRunSnapshot{SessionID: "s", Phase: "items_ready"})
 	next, _ := m.Update(trainSpawnMsg{logPath: "/tmp/x.log"})
 	m = next.(TrainRunModel)
@@ -127,6 +133,7 @@ func TestTrainRunNoGenerationErrorKeepsNote(t *testing.T) {
 }
 
 func TestTrainRunLoadErrorKeepsStaleData(t *testing.T) {
+	t.Parallel()
 	m := trainRunModel(t, TrainRunSnapshot{SessionID: "s", Template: "t@v1", Phase: "items_ready"})
 	next, _ := m.Update(trainSnapshotMsg{err: errors.New("db locked"), at: time.Unix(2, 0)})
 	m = next.(TrainRunModel)
@@ -140,6 +147,7 @@ func TestTrainRunLoadErrorKeepsStaleData(t *testing.T) {
 }
 
 func TestTrainRunRefreshSuppression(t *testing.T) {
+	t.Parallel()
 	m := trainRunModel(t, TrainRunSnapshot{SessionID: "s", Phase: "items_ready"})
 	if m.inFlight {
 		t.Fatal("should be idle after a snapshot")
@@ -153,6 +161,7 @@ func TestTrainRunRefreshSuppression(t *testing.T) {
 }
 
 func TestTrainRunTickRearms(t *testing.T) {
+	t.Parallel()
 	m := trainRunModel(t, TrainRunSnapshot{SessionID: "s", Phase: "items_ready"})
 	_, cmd := m.Update(trainTickMsg{})
 	if cmd == nil {
@@ -170,6 +179,7 @@ func trainRunModelWithDeps(t *testing.T, deps TrainRunDeps, snap TrainRunSnapsho
 }
 
 func TestTrainRunGenerateSpawnsChild(t *testing.T) {
+	t.Parallel()
 	spawned := false
 	deps := TrainRunDeps{
 		Load:          func() (TrainRunSnapshot, error) { return TrainRunSnapshot{SessionID: "s", Phase: "items_ready"}, nil },
@@ -188,6 +198,7 @@ func TestTrainRunGenerateSpawnsChild(t *testing.T) {
 }
 
 func TestTrainRunPublishUsesInProcessContinue(t *testing.T) {
+	t.Parallel()
 	called := false
 	deps := TrainRunDeps{
 		Load: func() (TrainRunSnapshot, error) {
@@ -216,6 +227,7 @@ func TestTrainRunPublishUsesInProcessContinue(t *testing.T) {
 }
 
 func TestTrainRunPromote(t *testing.T) {
+	t.Parallel()
 	var gotPromote bool
 	var gotCandidate string
 	deps := TrainRunDeps{
@@ -240,6 +252,7 @@ func TestTrainRunPromote(t *testing.T) {
 }
 
 func TestTrainRunActionsGateOnIterationPhase(t *testing.T) {
+	t.Parallel()
 	// Post-optimizer, the display phase stays "optimizer_completed_candidate"
 	// while the iteration phase advances; the action keys must follow the
 	// iteration phase or p/x/enter go dead exactly when a human is needed.
@@ -273,6 +286,7 @@ func TestTrainRunActionsGateOnIterationPhase(t *testing.T) {
 }
 
 func TestTrainRunTerminalKeysAndDecisionLinkPostOptimizer(t *testing.T) {
+	t.Parallel()
 	// Display phase stuck at optimizer_completed_candidate, iteration promoted:
 	// the terminal screen must offer n and show the candidate review link.
 	snap := TrainRunSnapshot{
@@ -307,6 +321,7 @@ func TestTrainRunTerminalKeysAndDecisionLinkPostOptimizer(t *testing.T) {
 }
 
 func TestTrainRunPromoteScreenShowsDecisionLink(t *testing.T) {
+	t.Parallel()
 	snap := TrainRunSnapshot{
 		SessionID:          "s",
 		Phase:              "optimizer_completed_candidate",
@@ -324,6 +339,7 @@ func TestTrainRunPromoteScreenShowsDecisionLink(t *testing.T) {
 }
 
 func TestTrainRunRejectRequiresReason(t *testing.T) {
+	t.Parallel()
 	var gotReason string
 	decided := false
 	deps := TrainRunDeps{
@@ -363,6 +379,7 @@ func TestTrainRunRejectRequiresReason(t *testing.T) {
 }
 
 func TestTrainRunStartNextOnTerminal(t *testing.T) {
+	t.Parallel()
 	called := false
 	deps := TrainRunDeps{
 		Load: func() (TrainRunSnapshot, error) {
@@ -383,6 +400,7 @@ func TestTrainRunStartNextOnTerminal(t *testing.T) {
 }
 
 func TestTrainRunActionBusySuppressesReentry(t *testing.T) {
+	t.Parallel()
 	deps := TrainRunDeps{
 		Load: func() (TrainRunSnapshot, error) {
 			return TrainRunSnapshot{SessionID: "s", Phase: "options_generated"}, nil
@@ -400,6 +418,7 @@ func TestTrainRunActionBusySuppressesReentry(t *testing.T) {
 }
 
 func TestTrainRunConfirmCreatesAndEntersPhase(t *testing.T) {
+	t.Parallel()
 	var gotWS string
 	created := false
 	deps := TrainRunDeps{
@@ -434,6 +453,7 @@ func TestTrainRunConfirmCreatesAndEntersPhase(t *testing.T) {
 }
 
 func TestTrainRunConfirmNeedsWorkspaceRepo(t *testing.T) {
+	t.Parallel()
 	called := false
 	deps := TrainRunDeps{
 		Plan:          &TrainRunPlan{Name: "n", Template: "t @v1", ReviewRepo: "o/r", NeedWorkspaceRepo: true},
@@ -464,6 +484,7 @@ func TestTrainRunConfirmNeedsWorkspaceRepo(t *testing.T) {
 }
 
 func TestTrainRunConfirmAbort(t *testing.T) {
+	t.Parallel()
 	called := false
 	deps := TrainRunDeps{
 		Plan:          &TrainRunPlan{Name: "n", Template: "t", ReviewRepo: "o/r", WorkspaceRepo: "o/ws"},
@@ -483,6 +504,7 @@ func TestTrainRunConfirmAbort(t *testing.T) {
 }
 
 func TestTrainRunTailsLogDuringLongPhase(t *testing.T) {
+	t.Parallel()
 	tailCalls := 0
 	deps := TrainRunDeps{
 		Load: func() (TrainRunSnapshot, error) {
@@ -512,6 +534,7 @@ func TestTrainRunTailsLogDuringLongPhase(t *testing.T) {
 }
 
 func TestTrainRunLogClearsDisplayButKeepsOffset(t *testing.T) {
+	t.Parallel()
 	deps := TrainRunDeps{Load: func() (TrainRunSnapshot, error) {
 		return TrainRunSnapshot{SessionID: "s", Phase: "generating_options"}, nil
 	}}
@@ -544,6 +567,7 @@ func TestTrainRunLogClearsDisplayButKeepsOffset(t *testing.T) {
 }
 
 func TestTrainRunLogCapsLines(t *testing.T) {
+	t.Parallel()
 	deps := TrainRunDeps{Load: func() (TrainRunSnapshot, error) {
 		return TrainRunSnapshot{SessionID: "s", Phase: "optimizer_running"}, nil
 	}}
@@ -560,6 +584,7 @@ func TestTrainRunLogCapsLines(t *testing.T) {
 }
 
 func TestTrainRunActionErrorShown(t *testing.T) {
+	t.Parallel()
 	m := trainRunModel(t, TrainRunSnapshot{SessionID: "s", Phase: "options_generated"})
 	next, _ := m.Update(trainActionMsg{err: errors.New("another worker holds the lock")})
 	m = next.(TrainRunModel)
