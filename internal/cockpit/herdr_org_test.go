@@ -74,3 +74,33 @@ func TestHerdrOrgProviderFailures(t *testing.T) {
 		})
 	}
 }
+
+func TestHerdrOrgProviderRecycleCommand(t *testing.T) {
+	var got []string
+	run := func(ctx context.Context, args ...string) (string, error) {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Fatal("Recycle runner context has no deadline")
+		}
+		got = append([]string(nil), args...)
+		return "", nil
+	}
+	provider := newHerdrOrgProvider(run, []string{"owner"}, time.Now)
+	req := org.RecycleRequest{Role: "owner", Pane: "w1:p2", Kind: "codex", AgentName: "owner", BootPrompt: "role: owner\n\nhandoff: ship it"}
+	if err := provider.Recycle(context.Background(), req); err != nil {
+		t.Fatalf("Recycle() error = %v", err)
+	}
+	want := []string{"agent", "start", "owner", "--kind", "codex", "--pane", "w1:p2", "--timeout", "30000", "--", req.BootPrompt}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("Recycle() args = %q, want %q", got, want)
+	}
+}
+
+func TestHerdrOrgProviderRecycleFailureIsActionable(t *testing.T) {
+	provider := newHerdrOrgProvider(func(context.Context, ...string) (string, error) {
+		return "", errors.New("pane is not at shell")
+	}, []string{"owner"}, time.Now)
+	err := provider.Recycle(context.Background(), org.RecycleRequest{Role: "owner", Pane: "w1:p2", Kind: "codex", AgentName: "owner", BootPrompt: "brief"})
+	if err == nil || !strings.Contains(err.Error(), "interactive shell prompt") || !strings.Contains(err.Error(), "pane is not at shell") {
+		t.Fatalf("Recycle() error = %v", err)
+	}
+}

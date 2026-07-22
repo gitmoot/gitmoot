@@ -26,6 +26,15 @@ type Snapshot struct {
 	ProviderVersion string                   `json:"provider_version,omitempty"`
 }
 
+type RecycleRequest struct {
+	Role       string
+	Pane       string
+	Kind       string
+	AgentName  string
+	BootPrompt string
+}
+
 type Provider interface {
 	Snapshot(ctx context.Context) (Snapshot, error)
+	Recycle(ctx context.Context, req RecycleRequest) error
 }

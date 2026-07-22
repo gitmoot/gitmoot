@@ -95,6 +95,8 @@ func runOrg(args []string, stdout, stderr io.Writer) int {
 		return runOrgChart(args[1:], stdout, stderr)
 	case "status":
 		return runOrgStatus(args[1:], stdout, stderr)
+	case "recycle":
+		return runOrgRecycle(args[1:], stdout, stderr)
 	case "escalate":
 		return runOrgEscalate(args[1:], stdout, stderr)
 	case "events":
@@ -114,6 +116,7 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org brief --role NAME [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org chart [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org status [--json] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org recycle ROLE --kind KIND --handoff NOTE [--pane ID] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org escalate --to ROLE --workflow LABEL [--org-role ROLE] [--repo OWNER/REPO] [--json] [--home DIR] \"QUESTION\"")
 	fmt.Fprintln(w, "  gitmoot org events rule add --on KIND [--match FILTER] --wake ROLE [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org events rule list [--home DIR]")
@@ -310,6 +313,19 @@ func runOrgBrief(args []string, stdout, stderr io.Writer) int {
 		presence[row.Role] = row
 	}
 	snapshot, snapshotErr := orgProviderSnapshot(ctx, cfg)
+	out := buildOrgBriefOutput(cfg, presence, role, snapshot, snapshotErr)
+	if *jsonOutput {
+		if err := writeJSON(stdout, out); err != nil {
+			fmt.Fprintf(stderr, "org brief: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	printOrgBrief(stdout, out)
+	return 0
+}
+
+func buildOrgBriefOutput(cfg config.OrgConfig, presence map[string]db.OrgRolePresence, role config.OrgRole, snapshot org.Snapshot, snapshotErr error) orgBriefOutput {
 	live := org.RoleLiveState{State: org.StateUnknown}
 	if snapshotErr != nil {
 		live.Detail = snapshotErr.Error()
@@ -324,20 +340,11 @@ func runOrgBrief(args []string, stdout, stderr io.Writer) int {
 		childNames = append(childNames, child.Name)
 	}
 	row := presence[role.Name]
-	out := orgBriefOutput{
+	return orgBriefOutput{
 		Role: role.Name, Parent: role.Parent, Pane: role.Pane, Children: childNames, Path: cfg.Path(role.Name), Scope: role.Scope,
 		MergeRule: role.MergeRule, LastSeenAt: row.LastSeenAt, LastCommand: row.LastCommand,
 		ProviderState: live.State, ProviderDetail: live.Detail, ObservedAt: snapshot.ObservedAt, ProviderVersion: snapshot.ProviderVersion,
 	}
-	if *jsonOutput {
-		if err := writeJSON(stdout, out); err != nil {
-			fmt.Fprintf(stderr, "org brief: %v\n", err)
-			return 1
-		}
-		return 0
-	}
-	printOrgBrief(stdout, out)
-	return 0
 }
 
 func runOrgChart(args []string, stdout, stderr io.Writer) int {
@@ -482,6 +489,128 @@ func printOrgBrief(w io.Writer, brief orgBriefOutput) {
 	fmt.Fprintf(w, "last_command: %s\n", dash(brief.LastCommand))
 	fmt.Fprintf(w, "provider: %s\n", brief.ProviderState)
 	fmt.Fprintf(w, "provider_detail: %s\n", dash(brief.ProviderDetail))
+}
+
+type orgRecycleOutput struct {
+	Role       string `json:"role"`
+	Pane       string `json:"pane"`
+	Kind       string `json:"kind"`
+	AgentName  string `json:"agent_name"`
+	WorkflowID string `json:"workflow_id"`
+}
+
+const orgRecycleSnapshotTimeout = 10 * time.Second
+
+func runOrgRecycle(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("org recycle", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	kindFlag := fs.String("kind", "", "Herdr agent kind for the successor session")
+	handoffFlag := fs.String("handoff", "", "handoff note for the successor session")
+	paneFlag := fs.String("pane", "", "Herdr pane id (overrides the role's configured pane)")
+	jsonOutput := fs.Bool("json", false, "print JSON")
+	roleArg := ""
+	flagArgs := args
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		roleArg, flagArgs = args[0], args[1:]
+	}
+	if err := fs.Parse(flagArgs); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if roleArg == "" {
+		if fs.NArg() != 1 {
+			fmt.Fprintln(stderr, "org recycle requires exactly one ROLE")
+			return 2
+		}
+		roleArg = fs.Arg(0)
+	} else if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "org recycle requires exactly one ROLE")
+		return 2
+	}
+	handoff := strings.TrimSpace(*handoffFlag)
+	if handoff == "" {
+		fmt.Fprintln(stderr, "org recycle requires a non-empty --handoff note")
+		return 2
+	}
+	kind := strings.ToLower(strings.TrimSpace(*kindFlag))
+	if !validOrgRecycleKind(kind) {
+		fmt.Fprintf(stderr, "org recycle requires a valid --kind (got %q)\n", strings.TrimSpace(*kindFlag))
+		return 2
+	}
+
+	ctx := context.Background()
+	cfg, presence, store, err := loadOrgCommandState(ctx, *home)
+	if err != nil {
+		fmt.Fprintf(stderr, "org recycle: %v\n", err)
+		return 1
+	}
+	defer store.Close()
+	role, ok := cfg.Role(roleArg)
+	if !ok {
+		fmt.Fprintf(stderr, "org recycle: unknown org role %q\n", strings.TrimSpace(roleArg))
+		return 2
+	}
+	pane := strings.TrimSpace(*paneFlag)
+	if pane == "" {
+		pane = strings.TrimSpace(role.Pane)
+	}
+	if pane == "" {
+		fmt.Fprintf(stderr, "org recycle: role %q has no bound pane; set [org.roles.%q].pane or pass --pane\n", role.Name, role.Name)
+		return 2
+	}
+
+	workflowID := "org/" + role.Name
+	if err := workflow.ValidateWorkflowID(workflowID); err != nil {
+		fmt.Fprintf(stderr, "org recycle: role lifecycle workflow: %v\n", err)
+		return 1
+	}
+	noteBody := workflow.FormatOrgHandoffNote(role.Name, handoff)
+	if noteBody == "" || len(noteBody) > workflowNoteBodyMax {
+		fmt.Fprintf(stderr, "org recycle handoff must produce a note of at most %d bytes\n", workflowNoteBodyMax)
+		return 2
+	}
+	if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{WorkflowID: workflowID, Author: role.Name, Body: noteBody}); err != nil {
+		fmt.Fprintf(stderr, "org recycle: journal handoff: %v\n", err)
+		return 1
+	}
+
+	provider := newOrgProvider([]string{role.Name})
+	if provider == nil {
+		fmt.Fprintf(stderr, "org recycle: organization provider is not configured (handoff journaled in workflow %s)\n", workflowID)
+		return 1
+	}
+	snapshotCtx, cancelSnapshot := context.WithTimeout(ctx, orgRecycleSnapshotTimeout)
+	snapshot, snapshotErr := provider.Snapshot(snapshotCtx)
+	cancelSnapshot()
+	brief := buildOrgBriefOutput(cfg, presence, role, snapshot, snapshotErr)
+	var boot strings.Builder
+	printOrgBrief(&boot, brief)
+	fmt.Fprintf(&boot, "\nhandoff: %s\n", handoff)
+	req := org.RecycleRequest{Role: role.Name, Pane: pane, Kind: kind, AgentName: role.Name, BootPrompt: boot.String()}
+	if err := provider.Recycle(ctx, req); err != nil {
+		fmt.Fprintf(stderr, "org recycle: %v (handoff journaled in workflow %s)\n", err, workflowID)
+		return 1
+	}
+	out := orgRecycleOutput{Role: role.Name, Pane: pane, Kind: kind, AgentName: role.Name, WorkflowID: workflowID}
+	if *jsonOutput {
+		if err := writeJSON(stdout, out); err != nil {
+			fmt.Fprintf(stderr, "org recycle: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	fmt.Fprintf(stdout, "recycled org role %s as %s in pane %s; handoff journaled in workflow %s\n", role.Name, kind, pane, workflowID)
+	return 0
+}
+
+func validOrgRecycleKind(kind string) bool {
+	return slices.Contains([]string{
+		"pi", "claude", "codex", "gemini", "cursor", "devin", "agy", "cline", "omp", "mastracode", "opencode",
+		"copilot", "kimi", "kiro", "droid", "amp", "grok", "hermes", "kilo", "qodercli", "maki",
+	}, kind)
 }
 
 func loadOrgCommandState(ctx context.Context, home string) (config.OrgConfig, map[string]db.OrgRolePresence, *db.Store, error) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +17,11 @@ type herdrOrgProvider struct {
 	roles []string
 	now   func() time.Time
 }
+
+const (
+	herdrOrgRecycleTimeoutMS = 30000
+	herdrOrgRecycleDeadline  = 35 * time.Second
+)
 
 // NewHerdrOrgProvider returns the v1 organization live-state provider. Role
 // identity is exact pane-label equality; runtime/agent names are never inferred.
@@ -86,6 +92,29 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 		now = p.now
 	}
 	return org.Snapshot{States: states, ObservedAt: now().UTC(), ProviderVersion: version}, nil
+}
+
+// Recycle starts a fresh interactive agent in a pane that has already returned
+// to its shell prompt. Herdr cannot safely prove or cause that transition, so
+// winding down the prior agent remains an explicit operator precondition.
+func (p *herdrOrgProvider) Recycle(ctx context.Context, req org.RecycleRequest) error {
+	if p == nil || p.run == nil {
+		return fmt.Errorf("herdr org provider is not configured")
+	}
+	role := strings.TrimSpace(req.Role)
+	pane := strings.TrimSpace(req.Pane)
+	kind := strings.TrimSpace(req.Kind)
+	agentName := strings.TrimSpace(req.AgentName)
+	if role == "" || pane == "" || kind == "" || agentName == "" || strings.TrimSpace(req.BootPrompt) == "" {
+		return fmt.Errorf("herdr recycle requires role, pane, kind, agent name, and boot prompt")
+	}
+	bounded, cancel := context.WithTimeout(ctx, herdrOrgRecycleDeadline)
+	defer cancel()
+	_, err := p.run(bounded, "agent", "start", agentName, "--kind", kind, "--pane", pane, "--timeout", strconv.Itoa(herdrOrgRecycleTimeoutMS), "--", req.BootPrompt)
+	if err != nil {
+		return fmt.Errorf("herdr agent start for org role %q (pane %q must already be at an interactive shell prompt): %w", role, pane, err)
+	}
+	return nil
 }
 
 func mapHerdrAgentStatus(raw string) org.RoleLiveState {

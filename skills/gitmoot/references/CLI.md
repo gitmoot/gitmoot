@@ -1194,6 +1194,15 @@ configured `recycle_after` to have any effect. Both fields are **binary-first**:
 a binary predating them fails closed on a config that uses them, so deploy the
 binary before any config sets them.
 
+`gitmoot org recycle <role> --kind <kind> --handoff "<note>" [--pane <id>]
+[--json] [--home <dir>]` journals a typed handoff in the role-lifecycle workflow
+`org/<role>`, builds the successor's boot prompt from `org brief` plus that
+handoff, and starts the requested Herdr agent kind in `--pane` or the role's
+configured `pane`. A pane binding and non-empty handoff are required. For safety,
+recycle does not kill or send exit keys to the old agent: the pane must already
+be at its interactive shell prompt. The Herdr start wait is bounded to 30
+seconds; a failed start leaves the durable handoff note available for recovery.
+
 Fresh local `agent ask`, `agent run`, `agent review`, `agent implement`,
 `orchestrate`, and `task run` dispatches accept `--org-role <name>` (or the
 narrow `GITMOOT_ORG_ROLE` fallback). The role is validated and touched before

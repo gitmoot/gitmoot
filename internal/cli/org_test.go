@@ -259,10 +259,18 @@ func orgParityPolicy(enforce string) workflow.OrgEnforcement {
 type orgFixtureProvider struct {
 	snapshot org.Snapshot
 	err      error
+	recycle  func(context.Context, org.RecycleRequest) error
 }
 
 func (p orgFixtureProvider) Snapshot(context.Context) (org.Snapshot, error) {
 	return p.snapshot, p.err
+}
+
+func (p orgFixtureProvider) Recycle(ctx context.Context, req org.RecycleRequest) error {
+	if p.recycle == nil {
+		return nil
+	}
+	return p.recycle(ctx, req)
 }
 
 type orgFixtureRunner struct {
@@ -725,6 +733,155 @@ func TestRunOrgProviderFailureSemantics(t *testing.T) {
 	if brief.ProviderState != org.StateUnknown || !strings.Contains(brief.ProviderDetail, "socket unavailable") {
 		t.Fatalf("brief = %+v", brief)
 	}
+}
+
+func TestRunOrgRecycleValidation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		pane string
+		args []string
+		want string
+	}{
+		{name: "missing handoff", pane: "w1:p2", args: []string{"owner", "--kind", "codex"}, want: "requires a non-empty --handoff"},
+		{name: "missing kind", pane: "w1:p2", args: []string{"owner", "--handoff", "done"}, want: "requires a valid --kind"},
+		{name: "invalid kind", pane: "w1:p2", args: []string{"owner", "--kind", "shell", "--handoff", "done"}, want: "requires a valid --kind"},
+		{name: "unbound pane", args: []string{"owner", "--kind", "codex", "--handoff", "done"}, want: "has no bound pane"},
+		{name: "unknown role", pane: "w1:p2", args: []string{"missing", "--kind", "codex", "--handoff", "done"}, want: "unknown org role"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home, paths := setupOrgRecycleHome(t, test.pane)
+			calls := 0
+			withOrgProvider(t, orgFixtureProvider{recycle: func(context.Context, org.RecycleRequest) error {
+				calls++
+				return nil
+			}})
+			var stdout, stderr bytes.Buffer
+			args := append(append([]string(nil), test.args...), "--home", home)
+			if code := runOrgRecycle(args, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), test.want) {
+				t.Fatalf("code=%d stdout=%q stderr=%q, want %q", code, stdout.String(), stderr.String(), test.want)
+			}
+			if calls != 0 {
+				t.Fatalf("provider Recycle called %d times on validation failure", calls)
+			}
+			store, err := db.Open(paths.Database)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			notes, err := store.ListWorkflowNotes(context.Background(), "org/owner", 0)
+			if err != nil || len(notes) != 0 {
+				t.Fatalf("validation failure journaled notes: %+v err=%v", notes, err)
+			}
+		})
+	}
+}
+
+func TestRunOrgRecycleJournalsAndBootsSuccessor(t *testing.T) {
+	home, paths := setupOrgRecycleHome(t, "w1:p2")
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.TouchOrgRolePresence(context.Background(), "owner", "agent_run"); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var requests []org.RecycleRequest
+	withOrgProvider(t, orgFixtureProvider{
+		snapshot: org.Snapshot{
+			States:     map[string]org.RoleLiveState{"owner": {State: org.StateIdle}},
+			ObservedAt: time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC), ProviderVersion: "0.7.5",
+		},
+		recycle: func(_ context.Context, req org.RecycleRequest) error {
+			requests = append(requests, req)
+			return nil
+		},
+	})
+	var stdout, stderr bytes.Buffer
+	code := runOrgRecycle([]string{"OWNER", "--kind", "codex", "--handoff", "Release is ready for final verification.", "--home", home, "--json"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if len(requests) != 1 {
+		t.Fatalf("Recycle requests = %+v", requests)
+	}
+	req := requests[0]
+	if req.Role != "owner" || req.Pane != "w1:p2" || req.Kind != "codex" || req.AgentName != "owner" {
+		t.Fatalf("Recycle request = %+v", req)
+	}
+	for _, want := range []string{"role: owner", "path: owner", "provider: idle", "last_command: agent_run", "handoff: Release is ready for final verification."} {
+		if !strings.Contains(req.BootPrompt, want) {
+			t.Fatalf("BootPrompt missing %q: %q", want, req.BootPrompt)
+		}
+	}
+	var out orgRecycleOutput
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("decode output: %v; output=%q", err, stdout.String())
+	}
+	if out.Role != "owner" || out.Pane != "w1:p2" || out.Kind != "codex" || out.AgentName != "owner" || out.WorkflowID != "org/owner" {
+		t.Fatalf("output = %+v", out)
+	}
+	store, err = db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	notes, err := store.ListWorkflowNotes(context.Background(), "org/owner", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(notes) != 1 || notes[0].Author != "owner" || notes[0].Body != workflow.FormatOrgHandoffNote("owner", "Release is ready for final verification.") {
+		t.Fatalf("handoff notes = %+v", notes)
+	}
+}
+
+func TestRunOrgRecycleProviderFailureKeepsHandoff(t *testing.T) {
+	home, paths := setupOrgRecycleHome(t, "w1:p2")
+	withOrgProvider(t, orgFixtureProvider{
+		snapshot: org.Snapshot{States: map[string]org.RoleLiveState{"owner": {State: org.StateDone}}},
+		recycle:  func(context.Context, org.RecycleRequest) error { return errors.New("pane is not at shell") },
+	})
+	var stdout, stderr bytes.Buffer
+	if code := runOrgRecycle([]string{"owner", "--kind", "codex", "--handoff", "Safe to resume.", "--home", home}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "handoff journaled in workflow org/owner") {
+		t.Fatalf("code/stderr = %d/%q", code, stderr.String())
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	notes, err := store.ListWorkflowNotes(context.Background(), "org/owner", 0)
+	if err != nil || len(notes) != 1 {
+		t.Fatalf("handoff notes after provider failure = %+v err=%v", notes, err)
+	}
+}
+
+func setupOrgRecycleHome(t *testing.T, pane string) (string, config.Paths) {
+	t.Helper()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	content := "\n[org.roles.\"owner\"]\nscope = [\"*\"]\nmerge_rule = \"owner\"\n"
+	if pane != "" {
+		content += fmt.Sprintf("pane = %q\n", pane)
+	}
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(content); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return home, paths
 }
 
 func TestValidateAndTouchActingOrgRole(t *testing.T) {

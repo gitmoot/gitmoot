@@ -1078,6 +1078,15 @@ at enqueue.
 `enforce = "block"` is the default; `"warn"` allows the job and records an
 `org_scope_violation` event. Merge rules are advisory in this phase.
 
+`gitmoot org recycle <role> --kind <kind> --handoff "<note>" [--pane <id>]
+[--json] [--home <dir>]` journals a typed handoff in the role-lifecycle workflow
+`org/<role>`, builds the successor's boot prompt from `org brief` plus that
+handoff, and starts the requested Herdr agent kind in `--pane` or the role's
+configured `pane`. A pane binding and non-empty handoff are required. For safety,
+recycle does not kill or send exit keys to the old agent: the pane must already
+be at its interactive shell prompt. The Herdr start wait is bounded to 30
+seconds; a failed start leaves the durable handoff note available for recovery.
+
 `gitmoot org escalate --to <ancestor-role> --workflow <label> [--org-role
 <from-role>] [--repo <owner/repo>] "<question>"` writes a workflow journal
 note. The acting role is `--org-role` when given, otherwise `GITMOOT_ORG_ROLE`;
