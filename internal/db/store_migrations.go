@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -45,6 +46,59 @@ func (s *Store) applyMigration(ctx context.Context, version int, migration strin
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)`, version, time.Now().UTC().Format(time.RFC3339)); err != nil {
 		return err
+	}
+	return tx.Commit()
+}
+
+// backfillJobRootID populates the denormalized root_id column for any pre-#420
+// jobs row that still has the migration's DEFAULT ” (every row inserted after
+// #420 gets root_id at write time, so this only ever touches the historical
+// backlog once). It is the Go-side equivalent of the spec's in-migration
+// backfill SQL, chosen because modernc's json_extract raises a SQL error on a
+// malformed payload — which would abort the migration — whereas unmarshalling in
+// Go lets a malformed or root_job_id-less payload self-root to the job's own id,
+// matching the engine's rootJobID() fallback exactly.
+//
+// It is idempotent: the WHERE root_id = ” filter means a second run touches
+// nothing, and a job whose true root is genuinely "" is impossible because the
+// fallback is always the non-empty job id. Done outside applyMigration so it can
+// re-converge a partially-backfilled DB on any startup without bumping a version.
+func (s *Store) backfillJobRootID(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, payload FROM jobs WHERE root_id = ''`)
+	if err != nil {
+		return err
+	}
+	type pending struct{ id, rootID string }
+	var todo []pending
+	for rows.Next() {
+		var id, payload string
+		if err := rows.Scan(&id, &payload); err != nil {
+			rows.Close()
+			return err
+		}
+		rootID := rootIDFromPayload(payload)
+		if strings.TrimSpace(rootID) == "" {
+			rootID = id // malformed / root_job_id-less payload self-roots
+		}
+		todo = append(todo, pending{id: id, rootID: rootID})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if len(todo) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, p := range todo {
+		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET root_id = ? WHERE id = ? AND root_id = ''`, p.rootID, p.id); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
