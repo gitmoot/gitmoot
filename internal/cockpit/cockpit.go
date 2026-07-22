@@ -192,7 +192,7 @@ func New(opts Options, store PaneStore) *Cockpit {
 		bin = "gitmoot"
 	}
 	return &Cockpit{
-		client:     herdrClient{run: newExecRunner(opts.HerdrBin), bin: opts.HerdrBin, lookPath: exec.LookPath},
+		client:     herdrClient{run: newExecRunner(opts.HerdrBin), runCombined: newExecRunnerCombined(opts.HerdrBin), bin: opts.HerdrBin, lookPath: exec.LookPath},
 		store:      store,
 		opts:       opts,
 		gitmootBin: bin,
@@ -238,6 +238,31 @@ func (c *Cockpit) Available(ctx context.Context) bool {
 	c.availOK = ok
 	c.availAt = clock()
 	return ok
+}
+
+// AgentPrompt sends a delivery-verified prompt to an existing Herdr pane. It is
+// the narrow exported seam used by the organization event-rule evaluator; pane
+// lifecycle remains owned by Cockpit's regular Wrap path.
+func (c *Cockpit) AgentPrompt(ctx context.Context, pane, prompt, until string) (delivered bool, stalled bool, err error) {
+	if c == nil {
+		return false, false, fmt.Errorf("cockpit is nil")
+	}
+	return c.client.agentPrompt(ctx, pane, prompt, until)
+}
+
+// ResolvePaneByLabel resolves a herdr pane label to its current pane id. It backs
+// the org event-rule role→pane binding when the configured value is a stable
+// label rather than a wX:pY id, so a recycled pane is still reached. It is
+// best-effort: any herdr error reports "not found" so a wake stays a no-op.
+func (c *Cockpit) ResolvePaneByLabel(ctx context.Context, label string) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	pane, ok, err := c.client.resolvePaneByLabel(ctx, label)
+	if err != nil {
+		return "", false
+	}
+	return pane, ok
 }
 
 // Wrap returns a DeliveryAdapter that opens a pane (best-effort), runs

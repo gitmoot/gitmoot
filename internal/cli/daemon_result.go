@@ -124,7 +124,7 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, cause er
 				// Mailbox.finishWithPayload chokepoint), so emit job.blocked exactly
 				// once here. The following finalizePreflightDelegationChild only attaches
 				// a synthetic result (savePayload, no transition), so it never re-emits.
-				emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, events.EventJobBlocked, string(workflow.JobBlocked), agentPermissionBlockedMessage)
+				emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, events.EventJobBlocked, string(workflow.JobBlocked), agentPermissionBlockedMessage, "permission_guard")
 				// A WRITABLE implement DELEGATION child whose runtime fails MID-RUN
 				// with a permission error (read-only FS / sandbox denies write) is
 				// transitioned JobRunning->JobBlocked here and returns early — it never

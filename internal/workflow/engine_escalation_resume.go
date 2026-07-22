@@ -138,7 +138,7 @@ func (e Engine) pauseAwaitingHuman(ctx context.Context, parentJob db.Job, parent
 	if rootID == "" {
 		rootID = parentJob.ID
 	}
-	events.EmitEvent(ctx, e.EventSink, events.NewEvent(
+	ev := events.NewEvent(
 		events.EventJobNeedsAttention,
 		parentJob.ID,
 		rootID,
@@ -147,7 +147,9 @@ func (e Engine) pauseAwaitingHuman(ctx context.Context, parentJob db.Job, parent
 		strings.TrimSpace(d.Prompt),
 		e.now(),
 		RedactCommentText,
-	))
+	)
+	ev.Cause = "escalation"
+	events.EmitEvent(ctx, e.EventSink, ev)
 
 	// Auto-link a local chat thread as the answer channel (#534): best-effort and
 	// swallow-all, so a chat failure never affects the pause. Participant is the
@@ -280,7 +282,7 @@ func (e Engine) pauseAwaitingHumanAnswer(ctx context.Context, job db.Job, payloa
 	if rootID == "" {
 		rootID = targetID
 	}
-	events.EmitEvent(ctx, e.EventSink, events.NewEvent(
+	ev := events.NewEvent(
 		events.EventJobNeedsAttention,
 		targetID,
 		rootID,
@@ -289,7 +291,9 @@ func (e Engine) pauseAwaitingHumanAnswer(ctx context.Context, job db.Job, payloa
 		renderHumanQuestions(questions),
 		e.now(),
 		RedactCommentText,
-	))
+	)
+	ev.Cause = "ask_gate"
+	events.EmitEvent(ctx, e.EventSink, ev)
 
 	// Auto-link a local chat thread carrying the questions as the answer channel
 	// (#534 keystone): best-effort and swallow-all. Keyed on the resume target

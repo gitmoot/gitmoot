@@ -27,6 +27,8 @@ import (
 // SchemaVersion is the contract version stamped on every emitted Event. Consumers
 // pin to it; a breaking field change bumps it. Reserved (parsed-but-unused for
 // the pilot) event types let consumers be forward-compatible without churn.
+// Event.Cause is additive and optional, so introducing it does not bump this
+// version or change the representation of existing events.
 const SchemaVersion = 1
 
 // EventType is the lifecycle/terminal enum carried on an Event. The pilot emits
@@ -97,10 +99,10 @@ const (
 )
 
 // Event is the stable, versioned, redacted JSON object emitted outbound. Every
-// string field is redacted at construction (see NewEvent); ids are opaque, ts is
-// RFC3339, status is the terminal/lifecycle enum string. It is intentionally
-// small — a tight allowlist, not the AddJobEvent firehose — so the contract is
-// easy to consume and stable.
+// free-text field is redacted at construction (see NewEvent); ids are opaque,
+// Cause is a trusted enum, ts is RFC3339, and status is the terminal/lifecycle
+// enum string. It is intentionally small — a tight allowlist, not the
+// AddJobEvent firehose — so the contract is easy to consume and stable.
 type Event struct {
 	// SchemaVersion is the contract version (currently SchemaVersion=1).
 	SchemaVersion int `json:"schema_version"`
@@ -123,6 +125,10 @@ type Event struct {
 	// Detail is a short redacted human-facing string (failure summary, the
 	// escalation question, …). Never raw runtime output or secrets.
 	Detail string `json:"detail,omitempty"`
+	// Cause is an optional internal enum that discriminates events sharing an
+	// EventType. It is assigned by trusted emit sites and deliberately bypasses
+	// free-text redaction and path scrubbing.
+	Cause string `json:"cause,omitempty"`
 }
 
 // Sink is the injected, best-effort outbound seam the engine and daemon call

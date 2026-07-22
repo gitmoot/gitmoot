@@ -1660,4 +1660,18 @@ CREATE TABLE org_role_presence (
 	last_command TEXT NOT NULL DEFAULT ''
 );
 	`,
+	// #1060 opt-in organization event rules. Rows are absent by default, so the
+	// daemon's rule evaluator remains completely disabled until an operator adds
+	// one explicitly. Filters are plain text rather than JSON so malformed
+	// user-controlled payloads can never make modernc abort a query.
+	`
+CREATE TABLE event_rules (
+	id TEXT PRIMARY KEY,
+	on_kind TEXT NOT NULL,
+	match_filter TEXT,
+	wake_role TEXT NOT NULL,
+	enabled INTEGER NOT NULL DEFAULT 1,
+	created_at TEXT NOT NULL
+);
+	`,
 }

@@ -48,6 +48,27 @@ func TestNewEventContractShape(t *testing.T) {
 	if decoded["event_type"].(string) != "job.finished" {
 		t.Fatalf("event_type = %v, want job.finished", decoded["event_type"])
 	}
+	if _, ok := decoded["cause"]; ok {
+		t.Fatalf("empty optional cause must be omitted; got %s", raw)
+	}
+}
+
+func TestEventCauseIsOptionalTrustedEnumWithoutSchemaBump(t *testing.T) {
+	ev := NewEvent(EventJobNeedsAttention, "job-1", "root-1", "owner/repo", "awaiting_human", "question", time.Now(), func(string) string {
+		return "redacted"
+	})
+	ev.Cause = "escalation"
+	raw, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded["schema_version"] != float64(1) || decoded["cause"] != "escalation" {
+		t.Fatalf("event = %s", raw)
+	}
 }
 
 func TestEventTypeEnumValues(t *testing.T) {

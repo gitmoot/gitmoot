@@ -478,3 +478,57 @@ func TestParseAgentOrgRoleFlags(t *testing.T) {
 		t.Fatalf("run = %+v ok=%v stderr=%s", run, ok, stderr.String())
 	}
 }
+
+func TestOrgEventRuleAddListRemoveAndValidation(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n[org.roles.\"maintainer\"]\nparent=\"owner\"\nscope=[\"*\"]\npane=\"w1:p2\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	if code := runOrg([]string{"events", "rule", "add", "--home", home, "--on", "attention", "--match", "Acme/Widget", "--wake", "MAINTAINER"}, &out, &errOut); code != 0 {
+		t.Fatalf("add code=%d out=%q err=%q", code, out.String(), errOut.String())
+	}
+	id := strings.TrimSpace(strings.TrimPrefix(out.String(), "added "))
+	if !strings.HasPrefix(id, "event-rule-") {
+		t.Fatalf("add output=%q", out.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if code := runOrg([]string{"events", "rule", "list", "--home", home}, &out, &errOut); code != 0 {
+		t.Fatalf("list code=%d out=%q err=%q", code, out.String(), errOut.String())
+	}
+	for _, want := range []string{id, "on=attention", "match=Acme/Widget", "wake=maintainer", "enabled=true"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("list output %q missing %q", out.String(), want)
+		}
+	}
+	out.Reset()
+	errOut.Reset()
+	if code := runOrg([]string{"events", "rule", "rm", "--home", home, id}, &out, &errOut); code != 0 {
+		t.Fatalf("rm code=%d out=%q err=%q", code, out.String(), errOut.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if code := runOrg([]string{"events", "rule", "list", "--home", home}, &out, &errOut); code != 0 || out.Len() != 0 {
+		t.Fatalf("list after rm code=%d out=%q err=%q", code, out.String(), errOut.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	if code := runOrg([]string{"events", "rule", "add", "--on", "surprise", "--wake", "owner"}, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "unknown event rule kind") {
+		t.Fatalf("unknown kind code=%d err=%q", code, errOut.String())
+	}
+	errOut.Reset()
+	if code := runOrg([]string{"events", "rule", "add", "--home", home, "--on", "guard", "--wake", "unknown"}, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "unknown org role") {
+		t.Fatalf("unknown role code=%d err=%q", code, errOut.String())
+	}
+	errOut.Reset()
+	if code := runOrg([]string{"events", "rule", "rm", id, "--home", home}, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "place --home before the id") {
+		t.Fatalf("post-positional --home code=%d err=%q", code, errOut.String())
+	}
+}

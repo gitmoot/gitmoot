@@ -16,6 +16,9 @@ type OrgRole struct {
 	Parent    string
 	Scope     []string
 	MergeRule string
+	// Pane optionally binds this role to a Herdr pane for event-rule wakes. It is
+	// advisory and unused unless an enabled event rule targets the role.
+	Pane string
 }
 
 // OrgConfig is the local organization registry. Its fields stay private so the
@@ -180,6 +183,12 @@ func LoadOrg(paths Paths) (OrgConfig, error) {
 				return OrgConfig{}, fmt.Errorf("org role %q: parse merge_rule: %w", current, err)
 			}
 			role.MergeRule = v
+		case "pane":
+			v, err := parseOrgTOMLString(value)
+			if err != nil {
+				return OrgConfig{}, fmt.Errorf("org role %q: parse pane: %w", current, err)
+			}
+			role.Pane = strings.TrimSpace(v)
 		}
 		cfg.roles[current] = role
 	}

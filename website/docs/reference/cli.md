@@ -1050,9 +1050,10 @@ remains policy-gated.
 ### Organization registry and scoped dispatch
 
 The optional `[org]` registry is enabled by any `[org.roles."name"]` section.
-Roles have `parent`, `scope`, and advisory `merge_rule` (`owner`, `self`, or
-`none`); exactly one parent-less role is required. Scope entries are `*`,
-`owner/*`, or exact `owner/name`, and child scope must be a subset of its parent.
+Roles have `parent`, `scope`, advisory `merge_rule` (`owner`, `self`, or
+`none`), and an optional Herdr `pane`; exactly one parent-less role is required.
+Scope entries are `*`, `owner/*`, or exact `owner/name`, and child scope must be
+a subset of its parent.
 
 Use `gitmoot org validate` to validate the registry and `gitmoot org show` to
 view its roles. When enabled, fresh local `agent ask`, `agent run`, `agent
@@ -1074,6 +1075,20 @@ panes; there is no code-level marker to migrate. Phase 1a writes the typed
 note, which is visible with `workflow show`; structured escalation surfaces
 land with the org brief and active delivery/wake is phase 2. Pane/agent creation
 permissions and Herdr checks remain later work.
+
+Event-rule wakes are separately opt-in:
+
+```sh
+gitmoot org events rule add --on attention --match owner/repo --wake maintainer
+gitmoot org events rule list
+gitmoot org events rule rm --home /alternate/home <rule-id>
+```
+
+`--on` accepts `escalation`, `attention`, `guard`, `job-terminal`, or `blocked`.
+`--match` is a case-insensitive substring matched against the event repo or job
+id; empty matches all. The wake role must exist and set `pane = "<herdr-pane>"`.
+Delivery is best-effort and verified with Herdr's `agent_prompted` versus
+`agent_prompt_stalled` result; zero rules leaves the feature off.
 
 ```sh
 gitmoot orchestrate planner "Coordinate the dashboard wave." --repo owner/repo --workflow fable/dashboard-redesign

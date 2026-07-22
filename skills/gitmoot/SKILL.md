@@ -146,7 +146,9 @@ or `gitmoot task list --repo owner/repo --json` for imported task state. Use
 `gitmoot job list --repo owner/repo` for jobs, and use
 `gitmoot dashboard --json` only when a structured full dashboard snapshot is
 needed. Do not use nonexistent commands such as `gitmoot status --json` or
-`gitmoot task show`. Use `gitmoot agent prompt <agent-or-template>` to import an
+`gitmoot task show`. Use `gitmoot org events rule add|list|rm` to manage opt-in
+organization event wakes; add validates the event kind and target org role. Use
+`gitmoot agent prompt <agent-or-template>` to import an
 agent prompt into the current chat. Use
 `gitmoot agent run <agent> --repo owner/repo "..."` for coordinator delegation
 so Gitmoot can route to ask, review, or implement and own worktrees, branch

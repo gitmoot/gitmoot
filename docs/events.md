@@ -3,7 +3,8 @@
 Gitmoot can push a small, versioned, redacted JSON event to one HTTP endpoint
 whenever a job reaches a terminal state or pauses awaiting a human. This is an
 **off-by-default, best-effort** outbound seam (#446): with no `[events]` config
-nothing is constructed and behavior is byte-identical to a build without it.
+and no organization event rules, nothing is constructed and behavior is
+byte-identical to a build without it.
 
 It complements — it does not replace — the existing observability surfaces
 (`gitmoot job watch`, the local dashboard, PR comments). The typed lifecycle
@@ -91,13 +92,14 @@ Every event is a single JSON object:
 ```json
 {
   "schema_version": 1,
-  "event_type": "job.finished",
+  "event_type": "job.needs_attention",
   "job_id": "implement-task-7",
   "root_id": "coordinator-job-id",
   "repo": "owner/repo",
-  "status": "succeeded",
+  "status": "awaiting_human",
   "ts": "2026-06-16T12:00:00Z",
-  "detail": "Opened PR #42"
+  "detail": "Choose the rollout window",
+  "cause": "escalation"
 }
 ```
 
@@ -111,6 +113,12 @@ Every event is a single JSON object:
 | `status`         | string | Terminal/lifecycle state (`succeeded`/`failed`/`blocked`/`awaiting_human`). |
 | `ts`             | string | RFC3339 emit time.                                                          |
 | `detail`         | string | Short redacted human-facing string (failure summary, the escalation question). |
+| `cause`          | string | Optional internal discriminator (`escalation`, `ask_gate`, `merge_guard`, or `permission_guard`). |
+
+`cause` is an additive optional field, so `schema_version` remains `1` and
+existing events serialize unchanged. It is a trusted enum assigned at emit
+sites, not free text, and therefore is not passed through path scrubbing or
+redaction.
 
 There is **no** synthetic `orchestration.finished` in the pilot — every event
 carries `root_id`, so a consumer groups a run client-side. Server-side
@@ -118,7 +126,7 @@ tree-convergence aggregation is a documented graduate item.
 
 ## Redaction
 
-Every outbound string field is redacted at event construction through the same
+Every outbound free-text string field is redacted at event construction through the same
 redactor Gitmoot uses for off-box PR/issue comments and bug reports
 (`workflow.RedactCommentText`): GitHub tokens, OpenAI keys, AWS secrets, and
 `api_key`/`token`/`secret`/`password` assignments are replaced with
@@ -145,6 +153,38 @@ blocks or fails a job — this mirrors the `escalate_human` notifier contract:
 There is **no** outbox / retry in the pilot: at-least-once delivery and an
 outbox table are the explicit graduate step.
 
+## Organization event-rule wakes
+
+The daemon can also use the same event seam to wake a Herdr pane bound to an
+organization role. This is independently off by default: zero `event_rules`
+rows means no evaluator and no Herdr call, whether or not the webhook is on.
+
+```toml
+[org.roles."maintainer"]
+parent = "owner"
+scope = ["owner/*"]
+pane = "w1:p2"
+```
+
+```sh
+gitmoot org events rule add --on guard --match owner/repo --wake maintainer
+gitmoot org events rule list
+gitmoot org events rule rm <rule-id>
+```
+
+Kinds are `escalation`, `attention`, `guard`, `job-terminal`, and `blocked`.
+The v1 `--match` filter is a case-insensitive substring tested against the event
+repo and job id; empty matches all. A plain `job.blocked` event matches both
+`job-terminal` and `blocked`, while guard-caused blocks match `guard` first.
+The wake role's config sets `pane = "<pane-id-or-label>"`: a value containing `:`
+is a `wX:pY` pane id used as-is, any other value is a pane label resolved to the
+current id at wake time (so a recycled pane is still reached). Wake delivery runs
+`herdr agent prompt <pane> <prompt> --wait --timeout 8000` and treats
+`result.type = "agent_prompted"` — and a post-delivery `error.code = "timeout"` —
+as delivered, `error.code = "agent_prompt_stalled"` as not delivered. Missing
+bindings, unavailable Herdr, stalls, and transport errors are swallowed after
+lightweight logging; they never block or fail a job.
+
 ## Configuration
 
 Add an `[events]` section to the Gitmoot config file:
@@ -152,8 +192,8 @@ Add an `[events]` section to the Gitmoot config file:
 ```toml
 [events]
 # The single endpoint each event is POSTed to as application/json.
-# Empty (the default) means the event stream is OFF: no sink, no goroutine,
-# no emits, byte-identical behavior.
+# Empty (the default) means the webhook transport is OFF. Organization event
+# rules, when explicitly added, can still consume the same local event seam.
 webhook_url = "https://example.com/gitmoot-events"
 
 # Per-POST timeout (Go duration). Default 2s. Bounds a hung consumer.

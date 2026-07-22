@@ -8,14 +8,16 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/cockpit"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// eventSinkCache holds the single, process-global webhook Sink the daemon shares
-// across every per-tick / per-repo engine construction (#446). The webhook sink
+// eventSinkCache holds the process-global webhook Sink and rule decorator the
+// daemon shares across every per-tick / per-repo engine construction (#446).
+// The webhook sink
 // owns a long-lived drain goroutine, so it MUST be constructed once — building a
 // fresh one per engine would leak a goroutine per poll. It is keyed by resolved
 // home so a multi-home test process never crosses streams; in the normal single-
@@ -24,14 +26,16 @@ import (
 // re-parse and, crucially, no sink/goroutine — the off-by-default guarantee.
 var eventSinkCache = struct {
 	sync.Mutex
-	built map[string]events.Sink
-}{built: map[string]events.Sink{}}
+	webhooks map[string]events.Sink
+	rules    map[string]*eventRuleSink
+}{webhooks: map[string]events.Sink{}, rules: map[string]*eventRuleSink{}}
 
-// daemonEventSink returns the shared best-effort webhook Sink for this home, or
-// nil when the event stream is OFF (no [events].webhook_url, or any config load
-// failure — fail-safe to disabled so a malformed config never breaks the daemon
-// or silently starts emitting). It is safe for concurrent callers and constructs
-// the underlying webhook sink (and its drain goroutine) at most once per home.
+// daemonEventSink composes the shared best-effort webhook Sink with the opt-in
+// organization rule evaluator. It returns nil when both features are OFF (no
+// [events].webhook_url and zero enabled event_rules rows). Config/store failures
+// fail safe to disabled and never break the daemon. It is safe for concurrent
+// callers and constructs the underlying webhook sink (and its drain goroutine)
+// at most once per home.
 //
 // When enabled, the sink's OnDrop records a single best-effort event_sink_drop
 // job event so a dropped emit (full buffer / dead consumer) is locally
@@ -40,12 +44,36 @@ var eventSinkCache = struct {
 func daemonEventSink(store *db.Store, home string) events.Sink {
 	home = strings.TrimSpace(home)
 	eventSinkCache.Lock()
+	webhook, built := eventSinkCache.webhooks[home]
+	if !built {
+		webhook = buildDaemonEventSink(store, home)
+		eventSinkCache.webhooks[home] = webhook
+	}
+	eventSinkCache.Unlock()
+
+	// Event rules can be added or removed while the daemon is running. Probe the
+	// lightweight table when each per-tick engine is built; zero enabled rows
+	// preserve the exact historical sink (including nil when webhooks are off).
+	if store == nil {
+		return webhook
+	}
+	rules, err := store.ListEventRules(context.Background())
+	if err != nil || !hasEnabledEventRule(rules) {
+		return webhook
+	}
+	key := home + "\x00" + store.DatabasePath()
+	eventSinkCache.Lock()
 	defer eventSinkCache.Unlock()
-	if sink, ok := eventSinkCache.built[home]; ok {
+	if sink := eventSinkCache.rules[key]; sink != nil {
 		return sink
 	}
-	sink := buildDaemonEventSink(store, home)
-	eventSinkCache.built[home] = sink
+	sink := &eventRuleSink{
+		inner: webhook,
+		store: store,
+		home:  home,
+		wake:  cockpit.New(cockpit.Options{HerdrBin: "herdr"}, nil),
+	}
+	eventSinkCache.rules[key] = sink
 	return sink
 }
 
@@ -138,7 +166,7 @@ func daemonTerminalEventType(state workflow.JobState) (events.EventType, bool) {
 // resolves root_id from the payload (falling back to the job id). It must only be
 // called on a GENUINE transition so the engine and daemon never double-emit for
 // the same terminal state.
-func emitDaemonTerminalEvent(ctx context.Context, sink events.Sink, store *db.Store, jobID string, eventType events.EventType, status, detail string) {
+func emitDaemonTerminalEvent(ctx context.Context, sink events.Sink, store *db.Store, jobID string, eventType events.EventType, status, detail string, cause ...string) {
 	if sink == nil {
 		return
 	}
@@ -154,7 +182,7 @@ func emitDaemonTerminalEvent(ctx context.Context, sink events.Sink, store *db.St
 			}
 		}
 	}
-	events.EmitEvent(ctx, sink, events.NewEvent(
+	event := events.NewEvent(
 		eventType,
 		jobID,
 		rootID,
@@ -163,5 +191,9 @@ func emitDaemonTerminalEvent(ctx context.Context, sink events.Sink, store *db.St
 		detail,
 		time.Time{},
 		workflow.RedactCommentText,
-	))
+	)
+	if len(cause) > 0 {
+		event.Cause = strings.TrimSpace(cause[0])
+	}
+	events.EmitEvent(ctx, sink, event)
 }

@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -93,6 +95,8 @@ func runOrg(args []string, stdout, stderr io.Writer) int {
 		return runOrgStatus(args[1:], stdout, stderr)
 	case "escalate":
 		return runOrgEscalate(args[1:], stdout, stderr)
+	case "events":
+		return runOrgEvents(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown org command %q\n\n", args[0])
 		printOrgUsage(stderr)
@@ -109,6 +113,9 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org chart [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org status [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org escalate --to ROLE --workflow LABEL [--org-role ROLE] [--repo OWNER/REPO] [--json] [--home DIR] \"QUESTION\"")
+	fmt.Fprintln(w, "  gitmoot org events rule add --on KIND [--match FILTER] --wake ROLE [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org events rule list [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org events rule rm [--home DIR] ID")
 }
 
 func runOrgValidateOrShow(args []string, stdout, stderr io.Writer) int {
@@ -640,4 +647,162 @@ func orgEscalateQuestionAndFlags(args []string) (string, []string, bool) {
 		return strings.TrimSpace(arg), args[:i], strings.TrimSpace(arg) != ""
 	}
 	return "", nil, false
+}
+
+var eventRuleKinds = map[string]struct{}{
+	"escalation":   {},
+	"attention":    {},
+	"guard":        {},
+	"job-terminal": {},
+	"blocked":      {},
+}
+
+func runOrgEvents(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		fmt.Fprintln(stdout, "Usage:\n  gitmoot org events rule add --on <kind> [--match <filter>] --wake <role> [--home path]\n  gitmoot org events rule list [--home path]\n  gitmoot org events rule rm [--home path] <id>")
+		return 0
+	}
+	if args[0] != "rule" {
+		fmt.Fprintf(stderr, "unknown org events command %q\n", args[0])
+		return 2
+	}
+	if len(args) == 1 || args[1] == "-h" || args[1] == "--help" {
+		fmt.Fprintln(stdout, "Usage:\n  gitmoot org events rule add --on <kind> [--match <filter>] --wake <role> [--home path]\n  gitmoot org events rule list [--home path]\n  gitmoot org events rule rm [--home path] <id>")
+		return 0
+	}
+	switch args[1] {
+	case "add":
+		return runOrgEventRuleAdd(args[2:], stdout, stderr)
+	case "list":
+		return runOrgEventRuleList(args[2:], stdout, stderr)
+	case "rm":
+		return runOrgEventRuleRemove(args[2:], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "unknown org events rule command %q\n", args[1])
+		return 2
+	}
+}
+
+func runOrgEventRuleAdd(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("org events rule add", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	onKind := fs.String("on", "", "event kind: escalation, attention, guard, job-terminal, or blocked")
+	// V1 intentionally keeps matching simple and inspectable: one
+	// case-insensitive substring tested independently against repo and job id;
+	// an empty filter matches every event of the selected kind.
+	match := fs.String("match", "", "case-insensitive substring matched against event repo or job id; empty matches all")
+	wake := fs.String("wake", "", "organization role to wake")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "org events rule add does not accept positional arguments")
+		return 2
+	}
+	kind := strings.ToLower(strings.TrimSpace(*onKind))
+	if _, ok := eventRuleKinds[kind]; !ok {
+		fmt.Fprintf(stderr, "unknown event rule kind %q; want escalation, attention, guard, job-terminal, or blocked\n", kind)
+		return 2
+	}
+	roleName := strings.ToLower(strings.TrimSpace(*wake))
+	if roleName == "" {
+		fmt.Fprintln(stderr, "org events rule add requires --wake")
+		return 2
+	}
+	paths, err := pathsFromFlag(*home)
+	if err != nil {
+		fmt.Fprintf(stderr, "org events rule add: resolve paths: %v\n", err)
+		return 1
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		fmt.Fprintf(stderr, "org events rule add: %v\n", err)
+		return 1
+	}
+	role, ok := cfg.Role(roleName)
+	if !ok {
+		fmt.Fprintf(stderr, "unknown org role %q\n", roleName)
+		return 2
+	}
+	id, err := newEventRuleID()
+	if err != nil {
+		fmt.Fprintf(stderr, "org events rule add: generate id: %v\n", err)
+		return 1
+	}
+	rule := db.EventRule{ID: id, OnKind: kind, MatchFilter: strings.TrimSpace(*match), WakeRole: role.Name, Enabled: true}
+	if err := withStore(*home, func(store *db.Store) error {
+		return store.AddEventRule(context.Background(), rule)
+	}); err != nil {
+		fmt.Fprintf(stderr, "org events rule add: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "added %s\n", id)
+	return 0
+}
+
+func runOrgEventRuleList(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("org events rule list", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "org events rule list does not accept positional arguments")
+		return 2
+	}
+	if err := withStore(*home, func(store *db.Store) error {
+		rules, err := store.ListEventRules(context.Background())
+		if err != nil {
+			return err
+		}
+		for _, rule := range rules {
+			fmt.Fprintf(stdout, "%s\ton=%s\tmatch=%s\twake=%s\tenabled=%t\n", rule.ID, rule.OnKind, rule.MatchFilter, rule.WakeRole, rule.Enabled)
+		}
+		return nil
+	}); err != nil {
+		fmt.Fprintf(stderr, "org events rule list: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func runOrgEventRuleRemove(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("org events rule rm", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 1 || strings.TrimSpace(fs.Arg(0)) == "" {
+		fmt.Fprintln(stderr, "org events rule rm requires exactly one rule id; place --home before the id")
+		return 2
+	}
+	id := strings.TrimSpace(fs.Arg(0))
+	if err := withStore(*home, func(store *db.Store) error {
+		return store.DeleteEventRule(context.Background(), id)
+	}); err != nil {
+		fmt.Fprintf(stderr, "org events rule rm: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "removed %s\n", id)
+	return 0
+}
+
+func newEventRuleID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return "event-rule-" + hex.EncodeToString(raw[:]), nil
 }

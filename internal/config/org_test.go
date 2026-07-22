@@ -13,7 +13,7 @@ func TestLoadOrgAndScopeMatching(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	content := "[org]\nenforce = \"block\"\n[org.roles.\"owner\"]\nscope = [\"*\"]\n[org.roles.\"maintainer\"]\nparent = \"owner\"\nscope = [\"Acme/*\", \"other/repo\"]\nmerge_rule = \"self\"\n"
+	content := "[org]\nenforce = \"block\"\n[org.roles.\"owner\"]\nscope = [\"*\"]\n[org.roles.\"maintainer\"]\nparent = \"owner\"\nscope = [\"Acme/*\", \"other/repo\"]\nmerge_rule = \"self\"\npane = \"w1:p2\"\n"
 	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -25,7 +25,7 @@ func TestLoadOrgAndScopeMatching(t *testing.T) {
 		t.Fatalf("cfg=%+v roots=%v", cfg, cfg.Roots())
 	}
 	role, ok := cfg.Role("maintainer")
-	if !ok || role.Scope[0] != "acme/*" {
+	if !ok || role.Scope[0] != "acme/*" || role.Pane != "w1:p2" {
 		t.Fatalf("role=%+v ok=%v", role, ok)
 	}
 	if !ScopeMatches(role.Scope, "ACME/one") || !ScopeMatches([]string{"*"}, "any/repo") || ScopeMatches(role.Scope, "acme") || ScopeMatches(role.Scope, "wrong/repo") {
