@@ -268,9 +268,11 @@ func presentLiveABAndCapturePick(prompt, championAnswer, challengerAnswer string
 }
 
 // defaultLiveABPresenter prints both answers (shuffled as Option A/B) to stdout
-// and reads one pick line via the shared readSkillOptABLine seam. A missing pick
-// is the common non-interactive case and returns ok=false (fail-safe skip). When
-// a valid pick arrives it is mapped back through the shuffle to the correct role.
+// and reads one pick line. It wires the production seams — the default randomizer
+// (defaultLiveABShuffle) and the default line reader (defaultReadSkillOptABLine) —
+// into defaultLiveABPresenterWith, which holds the blinding/mapping logic. A
+// missing pick is the common non-interactive case and returns ok=false (fail-safe
+// skip); a valid pick is mapped back through the shuffle to the correct role.
 func defaultLiveABPresenter(prompt, championAnswer, challengerAnswer string) (string, string, bool) {
 	return defaultLiveABPresenterWith(prompt, championAnswer, challengerAnswer, defaultLiveABShuffle, defaultReadSkillOptABLine)
 }

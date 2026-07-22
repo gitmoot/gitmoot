@@ -507,6 +507,28 @@ func TestDefaultLiveABPresenterMapsPickThroughShuffle(t *testing.T) {
 	}
 }
 
+// TestDefaultLiveABShuffleReturnsBothOrientations covers the production shuffle
+// seam (the func defaultLiveABPresenter wires into defaultLiveABPresenterWith):
+// it must be a real coin flip, not stuck on one orientation. math/rand's global
+// source is mutex-safe, so this is parallel-safe. (The presenter's wiring of the
+// two seams is guarded by the type system — the shuffle is func() bool and the
+// reader is func() (string, bool), so they cannot be transposed without a compile
+// error.)
+func TestDefaultLiveABShuffleReturnsBothOrientations(t *testing.T) {
+	t.Parallel()
+	var sawTrue, sawFalse bool
+	for i := 0; i < 200 && !(sawTrue && sawFalse); i++ {
+		if defaultLiveABShuffle() {
+			sawTrue = true
+		} else {
+			sawFalse = true
+		}
+	}
+	if !sawTrue || !sawFalse {
+		t.Fatalf("defaultLiveABShuffle did not produce both orientations in 200 draws (true=%v false=%v)", sawTrue, sawFalse)
+	}
+}
+
 // TestMaybeRunLiveABChallengerUsesForkedSession is the session-isolation guard
 // (#482, goal Risk #4): the challenger Deliver must run on a FORKED/throwaway
 // session, never the agent's live RuntimeRef. The fixture pins the agent to the
