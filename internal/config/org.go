@@ -26,9 +26,10 @@ type OrgRole struct {
 // OrgConfig is the local organization registry. Its fields stay private so the
 // loader remains the single place that establishes its invariants.
 type OrgConfig struct {
-	enforce      string
-	recycleAfter time.Duration
-	roles        map[string]OrgRole
+	enforce        string
+	recycleAfter   time.Duration
+	recycleEnforce string
+	roles          map[string]OrgRole
 }
 
 func (c OrgConfig) Enabled() bool { return len(c.roles) > 0 }
@@ -50,6 +51,13 @@ func (c OrgConfig) RecycleAfterFor(role string) time.Duration {
 		return configured.RecycleAfter
 	}
 	return c.recycleAfter
+}
+
+func (c OrgConfig) RecycleEnforce() string {
+	if c.recycleEnforce == "" {
+		return "off"
+	}
+	return c.recycleEnforce
 }
 
 // Ancestors returns name's parent chain, nearest parent first. The cycle guard
@@ -143,6 +151,7 @@ func LoadOrg(paths Paths) (OrgConfig, error) {
 	seenOrgSection := false
 	seenEnforce := false
 	seenRecycleAfter := false
+	seenRecycleEnforce := false
 	current := ""
 	inOrg := false
 	lines := strings.Split(string(content), "\n")
@@ -197,9 +206,9 @@ func LoadOrg(paths Paths) (OrgConfig, error) {
 		}
 		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
 		if current == "" {
-			// recycle_after is binary-first: binaries predating this allowlist
-			// fail closed on a config that uses the field.
-			if key != "enforce" && key != "recycle_after" {
+			// Recycle fields are binary-first: binaries predating this allowlist
+			// fail closed on a config that uses either field.
+			if key != "enforce" && key != "recycle_after" && key != "recycle_enforce" {
 				return OrgConfig{}, fmt.Errorf("unknown [org] field %q", key)
 			}
 			switch key {
@@ -223,6 +232,16 @@ func LoadOrg(paths Paths) (OrgConfig, error) {
 					return OrgConfig{}, fmt.Errorf("parse [org].recycle_after: %w", err)
 				}
 				cfg.recycleAfter = v
+			case "recycle_enforce":
+				if seenRecycleEnforce {
+					return OrgConfig{}, fmt.Errorf("duplicate [org].recycle_enforce")
+				}
+				seenRecycleEnforce = true
+				v, err := parseOrgTOMLString(value)
+				if err != nil {
+					return OrgConfig{}, fmt.Errorf("parse [org].recycle_enforce: %w", err)
+				}
+				cfg.recycleEnforce = v
 			}
 			continue
 		}
@@ -390,6 +409,9 @@ func ValidateOrg(cfg OrgConfig) error {
 	}
 	if cfg.recycleAfter < 0 {
 		return fmt.Errorf("org recycle_after must not be negative")
+	}
+	if mode := cfg.RecycleEnforce(); mode != "off" && mode != "warn" && mode != "block" {
+		return fmt.Errorf("org recycle_enforce must be \"off\", \"warn\", or \"block\"")
 	}
 	// Validate in sorted, structural passes so malformed registries return the
 	// same error regardless of Go map iteration order. Root naming deliberately

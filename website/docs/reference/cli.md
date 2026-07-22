@@ -1014,6 +1014,16 @@ live compatible Herdr snapshot. When configured, `brief --json` and `status
 `gitmoot org escalate`; their resolution and correlation surfaces are phase 2
 work.
 
+Session lifecycle (phase 3): `[org] recycle_after = "24h"` (a duration, per-role
+overridable) marks a role recycle-overdue after it has been idle that long,
+shown read-only in the `recycle` column of `org status`
+(`off | fresh | eligible | overdue`). `[org] recycle_enforce = "off" | "warn" |
+"block"` (default `off`) then refuses (`block`) or advises (`warn`) new
+`--org-role` dispatches from a role past its `recycle_after`, until it hands off
+and recycles; journaling a handoff note is never blocked. `recycle_enforce`
+needs a configured `recycle_after` to take effect. Both are binary-first —
+deploy the binary before any config sets them.
+
 Agent `ask`, `run`, `review`, `implement`, and `orchestrate` accept
 `--org-role <name>`. The role is validated and touched before dispatch, then
 stored as `acting_org_role` in the job payload for provenance, and its scope is

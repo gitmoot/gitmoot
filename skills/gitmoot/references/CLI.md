@@ -1177,6 +1177,19 @@ Herdr snapshot. When configured, `brief --json` and `status --json` include the
 role's `pane` binding. Open escalations remain deferred to #1058's resolution
 and correlation contract.
 
+**Session lifecycle (phase 3).** `[org] recycle_after = "24h"` (a duration,
+per-role overridable via `[org.roles."name"] recycle_after`) marks a role
+recycle-overdue once it has been idle at least that long — surfaced read-only in
+the `recycle` column of `org status` (`off | fresh | eligible | overdue`).
+`[org] recycle_enforce = "off" | "warn" | "block"` (default `off`) then, for a
+role past its `recycle_after`, either refuses (`block`) new `--org-role`
+dispatches with an actionable error or logs a one-line advisory (`warn`) — the
+"overgrown sessions become impossible" economics; journaling a handoff note is
+never blocked, so an overdue role can always hand off. `recycle_enforce` needs a
+configured `recycle_after` to have any effect. Both fields are **binary-first**:
+a binary predating them fails closed on a config that uses them, so deploy the
+binary before any config sets them.
+
 Fresh local `agent ask`, `agent run`, `agent review`, `agent implement`,
 `orchestrate`, and `task run` dispatches accept `--org-role <name>` (or the
 narrow `GITMOOT_ORG_ROLE` fallback). The role is validated and touched before

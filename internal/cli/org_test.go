@@ -3,8 +3,10 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -438,6 +440,7 @@ func TestOrgRecycleStatus(t *testing.T) {
 	}{
 		{name: "off without policy", lastSeen: now.Add(-48 * time.Hour).Format(time.RFC3339), state: org.StateIdle, want: "off"},
 		{name: "off without presence", state: org.StateIdle, recycleAfter: 24 * time.Hour, want: "off"},
+		{name: "off with malformed presence", lastSeen: "not-a-timestamp", state: org.StateIdle, recycleAfter: 24 * time.Hour, want: "off"},
 		{name: "fresh", lastSeen: now.Add(-time.Hour).Format(time.RFC3339), state: org.StateWorking, recycleAfter: 24 * time.Hour, want: "fresh"},
 		{name: "eligible idle", lastSeen: now.Add(-24 * time.Hour).Format(time.RFC3339), state: org.StateIdle, recycleAfter: 24 * time.Hour, want: "eligible"},
 		{name: "eligible done", lastSeen: now.Add(-25 * time.Hour).Format(time.RFC3339), state: org.StateDone, recycleAfter: 24 * time.Hour, want: "eligible"},
@@ -608,6 +611,129 @@ func TestValidateAndTouchActingOrgRole(t *testing.T) {
 	presence, err := store.ListOrgRolePresence(ctx)
 	if err != nil || len(presence) != 1 || presence[0].Role != "review" || presence[0].LastCommand != "agent_run" {
 		t.Fatalf("presence = %+v err=%v", presence, err)
+	}
+}
+
+func TestValidateAndTouchActingOrgRoleRecycleEnforcement(t *testing.T) {
+	old := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+	for _, test := range []struct {
+		name         string
+		requestRole  string
+		mode         string
+		recycleAfter string
+		seedPresence bool
+		seedAt       time.Time
+		wantError    bool
+		wantWarning  bool
+		wantTouch    bool
+	}{
+		{name: "block overdue", mode: "block", recycleAfter: "1h", seedPresence: true, seedAt: old, wantError: true},
+		{name: "block overdue case variant", requestRole: "OWNER", mode: "block", recycleAfter: "1h", seedPresence: true, seedAt: old, wantError: true},
+		{name: "warn overdue", mode: "warn", recycleAfter: "1h", seedPresence: true, seedAt: old, wantWarning: true, wantTouch: true},
+		{name: "off overdue", mode: "off", recycleAfter: "1h", seedPresence: true, seedAt: old, wantTouch: true},
+		{name: "default off overdue", recycleAfter: "1h", seedPresence: true, seedAt: old, wantTouch: true},
+		{name: "block fresh", mode: "block", recycleAfter: "24h", seedPresence: true, seedAt: time.Now().UTC(), wantTouch: true},
+		{name: "block missing presence", mode: "block", recycleAfter: "1h", wantTouch: true},
+		{name: "block without recycle after", mode: "block", seedPresence: true, seedAt: old, wantTouch: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home, paths := setupOrgRecycleEnforcementHome(t, test.mode, test.recycleAfter)
+			store, err := db.Open(paths.Database)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			if test.seedPresence {
+				seedOrgRolePresenceAt(t, paths, "owner", test.seedAt, "seed")
+			}
+			before, beforeFound, err := store.GetOrgRolePresence(context.Background(), "owner")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var warning bytes.Buffer
+			originalWriter := orgRecycleAdvisoryWriter
+			orgRecycleAdvisoryWriter = &warning
+			t.Cleanup(func() { orgRecycleAdvisoryWriter = originalWriter })
+			requestRole := test.requestRole
+			if requestRole == "" {
+				requestRole = "owner"
+			}
+			err = validateAndTouchActingOrgRole(context.Background(), store, home, requestRole, "agent_run")
+			if (err != nil) != test.wantError {
+				t.Fatalf("validateAndTouchActingOrgRole() error = %v, wantError=%v", err, test.wantError)
+			}
+			if test.wantError && (!strings.Contains(err.Error(), "overdue for recycling") || !strings.Contains(err.Error(), "handoff note")) {
+				t.Fatalf("block error is not actionable: %v", err)
+			}
+			if gotWarning := warning.String() != ""; gotWarning != test.wantWarning {
+				t.Fatalf("warning = %q, wantWarning=%v", warning.String(), test.wantWarning)
+			}
+			if test.wantWarning && (!strings.Contains(warning.String(), "warning:") || !strings.Contains(warning.String(), "handoff note")) {
+				t.Fatalf("warning is not actionable: %q", warning.String())
+			}
+
+			after, afterFound, err := store.GetOrgRolePresence(context.Background(), "owner")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !test.wantTouch {
+				if afterFound != beforeFound || after != before {
+					t.Fatalf("blocked dispatch touched presence: before=%+v/%v after=%+v/%v", before, beforeFound, after, afterFound)
+				}
+				return
+			}
+			if !afterFound || after.LastCommand != "agent_run" {
+				t.Fatalf("allowed dispatch did not touch presence: %+v found=%v", after, afterFound)
+			}
+			if beforeFound && test.seedAt.Equal(old) && after.LastSeenAt == before.LastSeenAt {
+				t.Fatalf("allowed overdue dispatch did not reset last_seen_at: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+func setupOrgRecycleEnforcementHome(t *testing.T, mode, recycleAfter string) (string, config.Paths) {
+	t.Helper()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	var body strings.Builder
+	body.WriteString("\n[org]\n")
+	if mode != "" {
+		fmt.Fprintf(&body, "recycle_enforce = %q\n", mode)
+	}
+	if recycleAfter != "" {
+		fmt.Fprintf(&body, "recycle_after = %q\n", recycleAfter)
+	}
+	body.WriteString("[org.roles.\"owner\"]\nscope = [\"*\"]\n")
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(body.String()); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return home, paths
+}
+
+func seedOrgRolePresenceAt(t *testing.T, paths config.Paths, role string, at time.Time, command string) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`INSERT INTO org_role_presence(role, last_seen_at, last_command)
+		VALUES (?, ?, ?)
+		ON CONFLICT(role) DO UPDATE SET last_seen_at = excluded.last_seen_at, last_command = excluded.last_command`, role, at.UTC().Format("2006-01-02 15:04:05"), command); err != nil {
+		t.Fatal(err)
 	}
 }
 
