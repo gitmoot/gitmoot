@@ -155,8 +155,68 @@ func TestHarvestObservationDedupAndMetadata(t *testing.T) {
 	if got.Owner.Kind != memory.OwnerKindShared || got.Owner.Ref != memory.SharedOwnerRef || got.AuthorRef != "persistent-author" ||
 		got.Repo != "owner/repo" || got.Scope != memory.ScopeRepo || got.TrustMark != memory.TrustLow ||
 		got.Provenance != "harvest:"+candidate.ResultHash || got.SourceJob != candidate.JobID ||
-		got.Key != "harvest-"+memory.ContentHash(got.Content) {
+		got.Key != "harvest-sqlite-uses-a-pure-go-modernc-driver-"+memory.ContentHash(got.Content)[:16] {
 		t.Fatalf("harvest metadata = %+v", got)
+	}
+}
+
+func harvestObservationForContent(t *testing.T, content string) db.MemoryObservation {
+	t.Helper()
+	store, err := db.Open(filepath.Join(t.TempDir(), "harvest-key.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	candidate := harvestTestCandidate(t, nil, nil)
+	var payload workflow.JobPayload
+	if err := json.Unmarshal([]byte(candidate.Payload), &payload); err != nil {
+		t.Fatal(err)
+	}
+	observations, err := harvestObservations(context.Background(), store, candidate, payload, []string{content})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(observations) != 1 {
+		t.Fatalf("observations = %+v, want one", observations)
+	}
+	return observations[0]
+}
+
+func TestHarvestSlugReadable(t *testing.T) {
+	got := harvestObservationForContent(t, "Deployments use canaries before production traffic moves. Rollback remains automatic.")
+	want := "harvest-deployments-use-canaries-before-production-traffic-" + memory.ContentHash(got.Content)[:16]
+	if got.Key != want {
+		t.Fatalf("key = %q, want %q", got.Key, want)
+	}
+}
+
+func TestHarvestSlugStableForSameContent(t *testing.T) {
+	content := "Deployments use canaries before production traffic moves."
+	first := harvestObservationForContent(t, content)
+	second := harvestObservationForContent(t, content)
+	if first.Key != second.Key {
+		t.Fatalf("same content keys differ: %q vs %q", first.Key, second.Key)
+	}
+}
+
+func TestHarvestSlugDistinctForDistinctContent(t *testing.T) {
+	first := harvestObservationForContent(t, "Deployments use canaries. First detail follows.")
+	second := harvestObservationForContent(t, "Deployments use canaries! Second detail follows.")
+	firstPrefix := strings.TrimSuffix(first.Key, memory.ContentHash(first.Content)[:16])
+	secondPrefix := strings.TrimSuffix(second.Key, memory.ContentHash(second.Content)[:16])
+	if firstPrefix != secondPrefix {
+		t.Fatalf("title slugs differ: %q vs %q", firstPrefix, secondPrefix)
+	}
+	if first.Key == second.Key {
+		t.Fatalf("distinct content produced the same key: %q", first.Key)
+	}
+}
+
+func TestHarvestSlugDegenerateContent(t *testing.T) {
+	got := harvestObservationForContent(t, "```go\nfmt.Println(\"hello\")\n```")
+	want := "harvest-untitled-" + memory.ContentHash(got.Content)[:16]
+	if got.Key != want {
+		t.Fatalf("key = %q, want %q", got.Key, want)
 	}
 }
 

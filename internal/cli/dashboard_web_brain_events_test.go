@@ -75,7 +75,7 @@ func TestBrainFactHTTPAPIIncludesHistoricalRowsAndErrors(t *testing.T) {
 	ctx := context.Background()
 	owner := db.MemoryOwner{Kind: "agent", Ref: "builder"}
 	activeID, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
-		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "active", Content: "active fact"})
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "active", Content: "Active fact. More detail."})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,15 +109,21 @@ func TestBrainFactHTTPAPIIncludesHistoricalRowsAndErrors(t *testing.T) {
 	if supersededID == 0 {
 		t.Fatal("superseded archive not found")
 	}
+	degenerateID, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
+		Owner: owner, Repo: "acme/widget", Scope: "repo", Key: "code-only", Content: "```go\nfmt.Println(\"hello\")\n```"})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	handler := newDashboardWebHandler(&webDataSource{home: home})
 	tests := []struct {
-		name, status string
-		id           int64
+		name, status, title string
+		id                  int64
 	}{
-		{name: "active", id: activeID, status: "active"},
-		{name: "retired", id: retiredID, status: "retired"},
-		{name: "superseded", id: supersededID, status: "superseded"},
+		{name: "active", id: activeID, status: "active", title: "Active fact"},
+		{name: "retired", id: retiredID, status: "retired", title: "retired fact"},
+		{name: "superseded", id: supersededID, status: "superseded", title: "before"},
+		{name: "degenerate title fallback", id: degenerateID, status: "active", title: "code-only"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -130,7 +136,7 @@ func TestBrainFactHTTPAPIIncludesHistoricalRowsAndErrors(t *testing.T) {
 			if err := json.Unmarshal(recorder.Body.Bytes(), &fact); err != nil {
 				t.Fatal(err)
 			}
-			if fact["status"] != tc.status || fact["ownerKind"] != "agent" || fact["ownerRef"] != "builder" || fact["content"] == "" || fact["firstConfirmedAt"] == "" || fact["updatedAt"] == "" {
+			if fact["status"] != tc.status || fact["title"] != tc.title || fact["ownerKind"] != "agent" || fact["ownerRef"] != "builder" || fact["content"] == "" || fact["firstConfirmedAt"] == "" || fact["updatedAt"] == "" {
 				t.Fatalf("fact=%s", recorder.Body.String())
 			}
 			switch tc.status {

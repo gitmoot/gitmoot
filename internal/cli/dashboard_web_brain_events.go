@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/memory"
 )
 
 const dashboardBrainEventsMaxLimit = 200
@@ -37,6 +38,7 @@ type dashboardBrainEventsResponse struct {
 type dashboardBrainFact struct {
 	ID               int64  `json:"id"`
 	Key              string `json:"key"`
+	Title            string `json:"title"`
 	Content          string `json:"content"`
 	Status           string `json:"status"`
 	Repo             string `json:"repo,omitempty"`
@@ -99,8 +101,12 @@ func (d *webDataSource) BrainFact(ctx context.Context, id int64) (dashboardBrain
 		} else if record.RetiredAt != "" {
 			status = "retired"
 		}
+		title := memory.Title(record.Content)
+		if title == "" {
+			title = record.Key
+		}
 		out = dashboardBrainFact{
-			ID: record.ID, Key: record.Key, Content: record.Content, Status: status,
+			ID: record.ID, Key: record.Key, Title: title, Content: record.Content, Status: status,
 			Repo: record.Repo, Scope: record.Scope, OwnerKind: record.Owner.Kind, OwnerRef: record.Owner.Ref,
 			RetiredAt: record.RetiredAt, RetiredReason: record.RetiredReason, SupersededBy: record.SupersededBy,
 			FirstConfirmedAt: record.FirstConfirmedAt, UpdatedAt: record.UpdatedAt,

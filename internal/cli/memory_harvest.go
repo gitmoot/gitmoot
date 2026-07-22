@@ -396,6 +396,7 @@ func harvestObservations(ctx context.Context, store *db.Store, candidate db.Memo
 			continue
 		}
 		hash := memory.ContentHash(content)
+		slug := memory.Slug(firstWords(memory.Title(content), 6))
 		dkey := db.MemoryDedupKey(memory.ScopeRepo, payload.Repo, hash)
 		if _, duplicate := seen[dkey]; duplicate {
 			continue
@@ -407,12 +408,23 @@ func harvestObservations(ctx context.Context, store *db.Store, candidate db.Memo
 		out = append(out, db.MemoryObservation{
 			Owner:     db.MemoryOwner{Kind: memory.OwnerKindShared, Ref: memory.SharedOwnerRef},
 			AuthorRef: author, Repo: payload.Repo, Scope: memory.ScopeRepo,
-			Key: "harvest-" + hash, Content: content,
+			Key: "harvest-" + slug + "-" + hash[:16], Content: content,
 			Provenance: "harvest:" + candidate.ResultHash, TrustMark: memory.TrustLow,
 			SourceJob: candidate.JobID,
 		})
 	}
 	return out, nil
+}
+
+func firstWords(s string, n int) string {
+	words := strings.Fields(s)
+	if n <= 0 {
+		return ""
+	}
+	if len(words) > n {
+		words = words[:n]
+	}
+	return strings.Join(words, " ")
 }
 
 func normalizeHarvestAtom(value string) string {
