@@ -17,6 +17,7 @@ type fakeEventWake struct {
 	pane           string
 	prompt         string
 	until          string
+	labelToPane    map[string]string
 }
 
 func (f *fakeEventWake) Available(context.Context) bool {
@@ -27,6 +28,11 @@ func (f *fakeEventWake) Available(context.Context) bool {
 func (f *fakeEventWake) AgentPrompt(_ context.Context, pane, prompt, until string) (bool, bool, error) {
 	f.pane, f.prompt, f.until = pane, prompt, until
 	return true, false, nil
+}
+
+func (f *fakeEventWake) ResolvePaneByLabel(_ context.Context, label string) (string, bool) {
+	pane, ok := f.labelToPane[label]
+	return pane, ok
 }
 
 func TestClassifyEventRuleKinds(t *testing.T) {
@@ -86,11 +92,37 @@ func TestEventRuleEvaluatorResolvesPaneAndWakes(t *testing.T) {
 	wake := &fakeEventWake{}
 	sink := &eventRuleSink{store: store, home: home, wake: wake}
 	sink.evaluate(context.Background(), events.Event{Type: events.EventJobNeedsAttention, Cause: "ask_gate", Repo: "acme/widget", JobID: "job-1", Detail: "Please choose"})
-	if wake.availableCalls != 1 || wake.pane != "w1:p1" || wake.until != "idle" {
+	if wake.availableCalls != 1 || wake.pane != "w1:p1" || wake.until != "" {
 		t.Fatalf("wake=%+v", wake)
 	}
 	if want := "gitmoot attention event for job job-1: Please choose"; wake.prompt != want {
 		t.Fatalf("prompt=%q want=%q", wake.prompt, want)
+	}
+}
+
+func TestEventRuleEvaluatorResolvesPaneLabel(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// A binding without ':' is a herdr pane LABEL, resolved to the live id at wake time.
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"coordinator-a\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.AddEventRule(context.Background(), db.EventRule{ID: "rule-lbl", OnKind: "guard", WakeRole: "owner", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	wake := &fakeEventWake{labelToPane: map[string]string{"coordinator-a": "w2:p5"}}
+	sink := &eventRuleSink{store: store, home: home, wake: wake}
+	sink.evaluate(context.Background(), events.Event{Type: events.EventJobBlocked, Cause: "merge_guard", JobID: "job-9"})
+	if wake.pane != "w2:p5" {
+		t.Fatalf("label did not resolve to live pane id: %+v", wake)
 	}
 }
 

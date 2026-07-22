@@ -1204,11 +1204,13 @@ gitmoot org events rule rm --home /alternate/home <rule-id>
 `--on` accepts `escalation`, `attention`, `guard`, `job-terminal`, or `blocked`.
 `--match` is a case-insensitive substring matched independently against the
 event repo and job id; omit it to match every event of that kind. `--wake` must
-name a declared role whose config has `pane = "<herdr-pane>"`. The daemon calls
-`herdr agent prompt <pane> <text> --wait --until idle` and distinguishes
-delivered (`result.type = "agent_prompted"`) from stalled
-(`error.code = "agent_prompt_stalled"`) outcomes. Rules, pane resolution, and
-wakes are best-effort; with no rule rows this path is off.
+name a declared role whose config sets `pane = "<pane-id-or-label>"` (a value
+with a `:` is a `wX:pY` id, otherwise a pane label resolved to the current id at
+wake time). The daemon calls `herdr agent prompt <pane> <text> --wait --timeout
+8000` and treats delivered (`result.type = "agent_prompted"`, or a post-delivery
+`error.code = "timeout"`) apart from stalled (`error.code =
+"agent_prompt_stalled"`). Rules, pane resolution, and wakes are best-effort; with
+no rule rows this path is off.
 
 ## External-coordinator workflow groups
 

@@ -176,11 +176,14 @@ Kinds are `escalation`, `attention`, `guard`, `job-terminal`, and `blocked`.
 The v1 `--match` filter is a case-insensitive substring tested against the event
 repo and job id; empty matches all. A plain `job.blocked` event matches both
 `job-terminal` and `blocked`, while guard-caused blocks match `guard` first.
-Wake delivery runs `herdr agent prompt <pane> <prompt> --wait --until idle` and
-distinguishes `result.type = "agent_prompted"` from the non-delivery outcome
-`error.code = "agent_prompt_stalled"`. Missing bindings, unavailable Herdr,
-stalls, and transport errors are swallowed after lightweight logging; they
-never block or fail a job.
+The wake role's config sets `pane = "<pane-id-or-label>"`: a value containing `:`
+is a `wX:pY` pane id used as-is, any other value is a pane label resolved to the
+current id at wake time (so a recycled pane is still reached). Wake delivery runs
+`herdr agent prompt <pane> <prompt> --wait --timeout 8000` and treats
+`result.type = "agent_prompted"` — and a post-delivery `error.code = "timeout"` —
+as delivered, `error.code = "agent_prompt_stalled"` as not delivered. Missing
+bindings, unavailable Herdr, stalls, and transport errors are swallowed after
+lightweight logging; they never block or fail a job.
 
 ## Configuration
 

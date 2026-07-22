@@ -18,6 +18,7 @@ const eventRuleWakeTimeout = 12 * time.Second
 type eventWakeClient interface {
 	Available(context.Context) bool
 	AgentPrompt(context.Context, string, string, string) (bool, bool, error)
+	ResolvePaneByLabel(context.Context, string) (string, bool)
 }
 
 // eventRuleSink decorates the existing outbound sink. Its rule work is detached
@@ -67,14 +68,15 @@ func (s *eventRuleSink) evaluate(ctx context.Context, event events.Event) {
 		if !rule.Enabled || !containsEventRuleKind(kinds, rule.OnKind) || !eventRuleMatches(rule.MatchFilter, event) {
 			continue
 		}
-		pane, ok := s.resolveRolePane(rule.WakeRole)
+		pane, ok := s.resolveRolePane(ctx, rule.WakeRole)
 		if !ok {
 			continue
 		}
 		prompt := eventRuleWakePrompt(rule.OnKind, event)
-		// Herdr's completion status is "idle" (the CLI does not accept the
-		// notification label "finished" as an --until value).
-		delivered, stalled, err := s.wake.AgentPrompt(ctx, pane, prompt, "idle")
+		// until="" uses herdr's default settled set; a wake only needs delivery
+		// confirmation, so agentPrompt's bounded --timeout returns as soon as the
+		// prompt is confirmed landed and never blocks on the woken agent settling.
+		delivered, stalled, err := s.wake.AgentPrompt(ctx, pane, prompt, "")
 		switch {
 		case err != nil:
 			slog.Warn("org event wake failed", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "error", err)
@@ -90,8 +92,11 @@ func (s *eventRuleSink) evaluate(ctx context.Context, event events.Event) {
 
 // resolveRolePane is the v1 config-backed role→pane binding seam. Keeping it in
 // one small method lets a later live registry replace config without changing
-// classification, matching, or wake delivery.
-func (s *eventRuleSink) resolveRolePane(role string) (pane string, ok bool) {
+// classification, matching, or wake delivery. The configured value is either a
+// herdr pane id (contains ':', the wX:pY shape) used directly, or a pane LABEL
+// resolved to the current pane id at wake time so a recycled pane (org phase 3)
+// is still reached by its stable label.
+func (s *eventRuleSink) resolveRolePane(ctx context.Context, role string) (pane string, ok bool) {
 	configFile := resolveConfigFile(s.home)
 	if configFile == "" {
 		return "", false
@@ -101,8 +106,17 @@ func (s *eventRuleSink) resolveRolePane(role string) (pane string, ok bool) {
 		return "", false
 	}
 	orgRole, ok := cfg.Role(role)
-	pane = strings.TrimSpace(orgRole.Pane)
-	return pane, ok && pane != ""
+	if !ok {
+		return "", false
+	}
+	binding := strings.TrimSpace(orgRole.Pane)
+	if binding == "" {
+		return "", false
+	}
+	if strings.Contains(binding, ":") {
+		return binding, true
+	}
+	return s.wake.ResolvePaneByLabel(ctx, binding)
 }
 
 func classifyEventRuleKinds(event events.Event) []string {
