@@ -187,12 +187,12 @@ func runOrgInit(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "org init: %v\n", err)
 		return 1
 	}
-	registry, err := config.LoadOrgRegistry(paths)
+	cfg, err := config.LoadOrg(paths)
 	if err != nil {
-		fmt.Fprintf(stderr, "org init: %v\n", err)
+		fmt.Fprintf(stderr, "org init: load org registry: %v\n", err)
 		return 1
 	}
-	if !registry.Enabled() {
+	if !cfg.Enabled() {
 		file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
 			fmt.Fprintf(stderr, "org init: open config: %v\n", err)
@@ -208,9 +208,9 @@ func runOrgInit(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "org init: close config: %v\n", closeErr)
 			return 1
 		}
-		registry, err = config.LoadOrgRegistry(paths)
+		cfg, err = config.LoadOrg(paths)
 		if err != nil {
-			fmt.Fprintf(stderr, "org init: validate scaffold: %v\n", err)
+			fmt.Fprintf(stderr, "org init: validate scaffold: load org registry: %v\n", err)
 			return 1
 		}
 	}
@@ -219,7 +219,7 @@ func runOrgInit(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "org init: %s\n", check.Detail)
 		return 1
 	}
-	if _, err := orgProviderSnapshot(context.Background(), registry); err != nil {
+	if _, err := orgProviderSnapshot(context.Background(), cfg); err != nil {
 		fmt.Fprintf(stderr, "org init: Herdr snapshot unavailable: %v\n", err)
 		return 1
 	}
@@ -231,6 +231,7 @@ func runOrgInit(args []string, stdout, stderr io.Writer) int {
 type orgBriefOutput struct {
 	Role            string             `json:"role"`
 	Parent          string             `json:"parent,omitempty"`
+	Pane            string             `json:"pane,omitempty"`
 	Children        []string           `json:"children"`
 	Path            []string           `json:"path"`
 	Scope           []string           `json:"scope"`
@@ -248,6 +249,7 @@ type orgBriefOutput struct {
 type orgStatusOutput struct {
 	Role            string             `json:"role"`
 	Parent          string             `json:"parent,omitempty"`
+	Pane            string             `json:"pane,omitempty"`
 	Depth           int                `json:"depth,omitempty"`
 	Scope           []string           `json:"scope"`
 	MergeRule       string             `json:"merge_rule"`
@@ -277,13 +279,13 @@ func runOrgBrief(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	ctx := context.Background()
-	registry, presence, store, err := loadOrgCommandState(ctx, *home)
+	cfg, presence, store, err := loadOrgCommandState(ctx, *home)
 	if err != nil {
 		fmt.Fprintf(stderr, "org brief: %v\n", err)
 		return 1
 	}
 	defer store.Close()
-	role, ok := registry.Role(*roleName)
+	role, ok := cfg.Role(*roleName)
 	if !ok {
 		fmt.Fprintf(stderr, "org brief: unknown org role %q\n", strings.TrimSpace(*roleName))
 		return 1
@@ -300,7 +302,7 @@ func runOrgBrief(args []string, stdout, stderr io.Writer) int {
 	for _, row := range updatedPresence {
 		presence[row.Role] = row
 	}
-	snapshot, snapshotErr := orgProviderSnapshot(ctx, registry)
+	snapshot, snapshotErr := orgProviderSnapshot(ctx, cfg)
 	live := org.RoleLiveState{State: org.StateUnknown}
 	if snapshotErr != nil {
 		live.Detail = snapshotErr.Error()
@@ -309,14 +311,14 @@ func runOrgBrief(args []string, stdout, stderr io.Writer) int {
 	} else {
 		live.Detail = "provider snapshot omitted this role"
 	}
-	children := registry.Children(role.Name)
+	children := cfg.Children(role.Name)
 	childNames := make([]string, 0, len(children))
 	for _, child := range children {
 		childNames = append(childNames, child.Name)
 	}
 	row := presence[role.Name]
 	out := orgBriefOutput{
-		Role: role.Name, Parent: role.Parent, Children: childNames, Path: registry.Path(role.Name), Scope: role.Scope,
+		Role: role.Name, Parent: role.Parent, Pane: role.Pane, Children: childNames, Path: cfg.Path(role.Name), Scope: role.Scope,
 		MergeRule: role.MergeRule, LastSeenAt: row.LastSeenAt, LastCommand: row.LastCommand,
 		ProviderState: live.State, ProviderDetail: live.Detail, ObservedAt: snapshot.ObservedAt, ProviderVersion: snapshot.ProviderVersion,
 	}
@@ -355,34 +357,35 @@ func runOrgOverview(command string, args []string, stdout, stderr io.Writer) int
 		return 2
 	}
 	ctx := context.Background()
-	registry, presence, store, err := loadOrgCommandState(ctx, *home)
+	cfg, presence, store, err := loadOrgCommandState(ctx, *home)
 	if err != nil {
 		fmt.Fprintf(stderr, "org %s: %v\n", command, err)
 		return 1
 	}
 	defer store.Close()
-	snapshot, err := orgProviderSnapshot(ctx, registry)
+	snapshot, err := orgProviderSnapshot(ctx, cfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "org %s: Herdr snapshot unavailable: %v\n", command, err)
 		return 1
 	}
-	rows := make([]orgStatusOutput, 0, len(registry.Roles))
+	roles := cfg.Roles()
+	rows := make([]orgStatusOutput, 0, len(roles))
 	observedNow := time.Now().UTC()
-	for _, role := range registry.SortedRoles() {
+	for _, role := range roles {
 		live, ok := snapshot.States[role.Name]
 		if !ok {
 			live = org.RoleLiveState{State: org.StateUnknown, Detail: "provider snapshot omitted this role"}
 		}
 		seen := presence[role.Name]
 		rows = append(rows, orgStatusOutput{
-			Role: role.Name, Parent: role.Parent, Depth: len(registry.Path(role.Name)) - 1,
+			Role: role.Name, Parent: role.Parent, Pane: role.Pane, Depth: len(cfg.Path(role.Name)) - 1,
 			Scope: role.Scope, MergeRule: role.MergeRule, LastSeenAt: seen.LastSeenAt, LastSeenAge: orgPresenceAge(seen.LastSeenAt, observedNow), LastCommand: seen.LastCommand,
 			ProviderState: live.State, ProviderDetail: live.Detail, ObservedAt: snapshot.ObservedAt, ProviderVersion: snapshot.ProviderVersion,
 		})
 	}
 	if command == "chart" {
 		sort.Slice(rows, func(i, j int) bool {
-			left, right := strings.Join(registry.Path(rows[i].Role), "/"), strings.Join(registry.Path(rows[j].Role), "/")
+			left, right := strings.Join(cfg.Path(rows[i].Role), "/"), strings.Join(cfg.Path(rows[j].Role), "/")
 			return left < right
 		})
 	}
@@ -419,36 +422,36 @@ func printOrgBrief(w io.Writer, brief orgBriefOutput) {
 	fmt.Fprintf(w, "provider_detail: %s\n", dash(brief.ProviderDetail))
 }
 
-func loadOrgCommandState(ctx context.Context, home string) (org.Registry, map[string]db.OrgRolePresence, *db.Store, error) {
+func loadOrgCommandState(ctx context.Context, home string) (config.OrgConfig, map[string]db.OrgRolePresence, *db.Store, error) {
 	paths, err := pathsFromFlag(home)
 	if err != nil {
-		return org.Registry{}, nil, nil, err
+		return config.OrgConfig{}, nil, nil, err
 	}
-	registry, err := config.LoadOrgRegistry(paths)
+	cfg, err := config.LoadOrg(paths)
 	if err != nil {
-		return org.Registry{}, nil, nil, err
+		return config.OrgConfig{}, nil, nil, fmt.Errorf("load org registry: %w", err)
 	}
-	if !registry.Enabled() {
-		return org.Registry{}, nil, nil, errors.New("organization registry is disabled; run `gitmoot org init`")
+	if !cfg.Enabled() {
+		return config.OrgConfig{}, nil, nil, errors.New("organization registry is disabled; run `gitmoot org init`")
 	}
 	store, err := db.Open(paths.Database)
 	if err != nil {
-		return org.Registry{}, nil, nil, err
+		return config.OrgConfig{}, nil, nil, err
 	}
 	rows, err := store.ListOrgRolePresence(ctx)
 	if err != nil {
 		store.Close()
-		return org.Registry{}, nil, nil, err
+		return config.OrgConfig{}, nil, nil, err
 	}
 	presence := make(map[string]db.OrgRolePresence, len(rows))
 	for _, row := range rows {
 		presence[row.Role] = row
 	}
-	return registry, presence, store, nil
+	return cfg, presence, store, nil
 }
 
-func orgProviderSnapshot(ctx context.Context, registry org.Registry) (org.Snapshot, error) {
-	roles := registry.SortedRoles()
+func orgProviderSnapshot(ctx context.Context, cfg config.OrgConfig) (org.Snapshot, error) {
+	roles := cfg.Roles()
 	names := make([]string, 0, len(roles))
 	for _, role := range roles {
 		names = append(names, role.Name)
@@ -472,14 +475,14 @@ func validateAndTouchActingOrgRole(ctx context.Context, store *db.Store, home, r
 	if err != nil {
 		return err
 	}
-	registry, err := config.LoadOrgRegistry(paths)
+	cfg, err := config.LoadOrg(paths)
 	if err != nil {
-		return err
+		return fmt.Errorf("load org registry: %w", err)
 	}
-	if !registry.Enabled() {
+	if !cfg.Enabled() {
 		return errors.New("--org-role requires an enabled organization registry; run `gitmoot org init`")
 	}
-	if _, ok := registry.Role(role); !ok {
+	if _, ok := cfg.Role(role); !ok {
 		return fmt.Errorf("unknown org role %q", role)
 	}
 	return store.TouchOrgRolePresence(ctx, role, command)

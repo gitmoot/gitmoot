@@ -1168,13 +1168,14 @@ resolved role table.
 The registry uses `[org] enforce = "warn"|"block"` and
 `[org.roles."name"]` entries with `parent`, `scope`, `merge_rule`, and an
 optional `pane` Herdr binding (used by org event-rule wakes). There is
-exactly one root named `owner`; accepted scopes are `*`, `owner/*`, `*/repo`,
-and `owner/repo`, and each child scope must be covered by its parent. Malformed
+exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
+`owner/repo`, and each child scope must be covered by its parent. Malformed
 org configuration fails closed and loudly. `brief` records passive last-seen
 presence for its role and can render static context with provider state
 `unknown` during an outage; `chart` and `status` require a live compatible
-Herdr snapshot. Open escalations remain deferred to #1058's resolution and
-correlation contract.
+Herdr snapshot. When configured, `brief --json` and `status --json` include the
+role's `pane` binding. Open escalations remain deferred to #1058's resolution
+and correlation contract.
 
 Fresh local `agent ask`, `agent run`, `agent review`, `agent implement`,
 `orchestrate`, and `task run` dispatches accept `--org-role <name>` (or the

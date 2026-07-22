@@ -293,7 +293,7 @@ merge_rule = "owner"
 [org.roles."review"]
 parent = "owner"
 scope = ["gitmoot/*"]
-merge_rule = "parent"
+merge_rule = "self"
 `)
 	if closeErr := file.Close(); err == nil {
 		err = closeErr
@@ -325,6 +325,9 @@ func TestRunOrgBriefChartStatusAndPresence(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{"org", "brief", "--home", home, "--role", "review", "--json"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("brief code = %d stderr=%s", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), `"pane"`) {
+		t.Fatalf("paneless brief unexpectedly emitted pane: %s", stdout.String())
 	}
 	var brief orgBriefOutput
 	if err := json.Unmarshal(stdout.Bytes(), &brief); err != nil {
@@ -361,10 +364,63 @@ func TestRunOrgBriefChartStatusAndPresence(t *testing.T) {
 	if code := Run([]string{"org", "status", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("status code = %d stderr=%s", code, stderr.String())
 	}
+	if strings.Contains(stdout.String(), `"pane"`) {
+		t.Fatalf("paneless status unexpectedly emitted pane: %s", stdout.String())
+	}
 	var status []orgStatusOutput
 	if err := json.Unmarshal(stdout.Bytes(), &status); err != nil || len(status) != 2 {
 		t.Fatalf("status = %+v err=%v output=%s", status, err, stdout.String())
 	}
+}
+
+func TestRunOrgBriefAndStatusJSONSurfacePane(t *testing.T) {
+	home, paths := setupOrgHome(t)
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("pane = \"w1:p2\"\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	withOrgProvider(t, orgFixtureProvider{snapshot: org.Snapshot{
+		States: map[string]org.RoleLiveState{
+			"owner":  {State: org.StateWorking},
+			"review": {State: org.StateIdle},
+		},
+		ObservedAt: time.Date(2026, 7, 22, 9, 0, 0, 0, time.UTC), ProviderVersion: "0.7.5",
+	}})
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"org", "brief", "--home", home, "--role", "review", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("brief code = %d stderr=%s", code, stderr.String())
+	}
+	var brief orgBriefOutput
+	if err := json.Unmarshal(stdout.Bytes(), &brief); err != nil || brief.Pane != "w1:p2" {
+		t.Fatalf("brief = %+v err=%v output=%s", brief, err, stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"org", "status", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("status code = %d stderr=%s", code, stderr.String())
+	}
+	var status []orgStatusOutput
+	if err := json.Unmarshal(stdout.Bytes(), &status); err != nil {
+		t.Fatalf("decode status: %v; output=%s", err, stdout.String())
+	}
+	for _, row := range status {
+		if row.Role == "review" {
+			if row.Pane != "w1:p2" {
+				t.Fatalf("review status pane = %q, want w1:p2", row.Pane)
+			}
+			return
+		}
+	}
+	t.Fatalf("review role missing from status: %+v", status)
 }
 
 func TestRunOrgProviderFailureSemantics(t *testing.T) {
@@ -422,9 +478,9 @@ func TestRunOrgInitScaffoldsAndRunsHerdrGate(t *testing.T) {
 	if code := Run([]string{"org", "init", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("init code = %d stderr=%s", code, stderr.String())
 	}
-	registry, err := config.LoadOrgRegistry(config.PathsForHome(home))
-	if err != nil || !registry.Enabled() {
-		t.Fatalf("registry = %+v err=%v", registry, err)
+	cfg, err := config.LoadOrg(config.PathsForHome(home))
+	if err != nil || !cfg.Enabled() {
+		t.Fatalf("registry = %+v err=%v", cfg, err)
 	}
 	if !strings.Contains(stdout.String(), "herdr 0.7.5") {
 		t.Fatalf("stdout = %q", stdout.String())
@@ -440,9 +496,9 @@ func TestRunOrgInitRejectsOldHerdrLoudly(t *testing.T) {
 	if code := Run([]string{"org", "init", "--home", home}, &stdout, &stderr); code == 0 || !strings.Contains(stderr.String(), "org requires herdr >=0.7.5") {
 		t.Fatalf("init code/stderr = %d/%q", code, stderr.String())
 	}
-	registry, err := config.LoadOrgRegistry(config.PathsForHome(home))
-	if err != nil || !registry.Enabled() {
-		t.Fatalf("scaffold should remain inspectable after gate failure: registry=%+v err=%v", registry, err)
+	cfg, err := config.LoadOrg(config.PathsForHome(home))
+	if err != nil || !cfg.Enabled() {
+		t.Fatalf("scaffold should remain inspectable after gate failure: registry=%+v err=%v", cfg, err)
 	}
 }
 

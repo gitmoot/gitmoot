@@ -81,6 +81,42 @@ func (c OrgConfig) Roles() []OrgRole {
 	return out
 }
 
+func (c OrgConfig) Children(name string) []OrgRole {
+	var children []OrgRole
+	for _, role := range c.roles {
+		if role.Parent == name {
+			children = append(children, role)
+		}
+	}
+	sort.Slice(children, func(i, j int) bool { return children[i].Name < children[j].Name })
+	return children
+}
+
+func (c OrgConfig) Path(name string) []string {
+	role, ok := c.Role(name)
+	if !ok {
+		return nil
+	}
+	path := []string{role.Name}
+	visited := map[string]bool{role.Name: true}
+	for role.Parent != "" {
+		parent, ok := c.Role(role.Parent)
+		if !ok {
+			return nil
+		}
+		if visited[parent.Name] {
+			break
+		}
+		visited[parent.Name] = true
+		path = append(path, parent.Name)
+		role = parent
+	}
+	for left, right := 0, len(path)-1; left < right; left, right = left+1, right-1 {
+		path[left], path[right] = path[right], path[left]
+	}
+	return path
+}
+
 // LoadOrg reads the optional [org] registry. A missing file means org has not
 // been configured; any other IO or parse error is intentionally returned so the
 // enqueue resolver can fail closed.
@@ -93,6 +129,9 @@ func LoadOrg(paths Paths) (OrgConfig, error) {
 		return OrgConfig{}, err
 	}
 	cfg := OrgConfig{roles: map[string]OrgRole{}}
+	roleFields := map[string]map[string]bool{}
+	seenOrgSection := false
+	seenEnforce := false
 	current := ""
 	inOrg := false
 	lines := strings.Split(string(content), "\n")
@@ -123,11 +162,18 @@ func LoadOrg(paths Paths) (OrgConfig, error) {
 				return OrgConfig{}, err
 			}
 			inOrg, current = name, role
+			if inOrg && current == "" && ok {
+				if seenOrgSection {
+					return OrgConfig{}, fmt.Errorf("duplicate [org] section")
+				}
+				seenOrgSection = true
+			}
 			if current != "" && ok {
 				if _, exists := cfg.roles[current]; exists {
 					return OrgConfig{}, fmt.Errorf("org role %q: duplicate section", current)
 				}
 				cfg.roles[current] = OrgRole{Name: current}
+				roleFields[current] = map[string]bool{}
 			}
 			continue
 		}
@@ -140,15 +186,27 @@ func LoadOrg(paths Paths) (OrgConfig, error) {
 		}
 		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
 		if current == "" {
-			if key == "enforce" {
-				v, err := parseOrgTOMLString(value)
-				if err != nil {
-					return OrgConfig{}, fmt.Errorf("parse [org].enforce: %w", err)
-				}
-				cfg.enforce = v
+			if key != "enforce" {
+				return OrgConfig{}, fmt.Errorf("unknown [org] field %q", key)
 			}
+			if seenEnforce {
+				return OrgConfig{}, fmt.Errorf("duplicate [org].enforce")
+			}
+			seenEnforce = true
+			v, err := parseOrgTOMLString(value)
+			if err != nil {
+				return OrgConfig{}, fmt.Errorf("parse [org].enforce: %w", err)
+			}
+			cfg.enforce = v
 			continue
 		}
+		if key != "parent" && key != "scope" && key != "merge_rule" && key != "pane" {
+			return OrgConfig{}, fmt.Errorf("unknown field %q for org role %q", key, current)
+		}
+		if roleFields[current][key] {
+			return OrgConfig{}, fmt.Errorf("duplicate field %q for org role %q", key, current)
+		}
+		roleFields[current][key] = true
 		role := cfg.roles[current]
 		switch key {
 		case "parent":
@@ -201,6 +259,9 @@ func LoadOrg(paths Paths) (OrgConfig, error) {
 func parseOrgSection(section string) (inOrg bool, role string, ok bool, err error) {
 	if section == "org" {
 		return true, "", true, nil
+	}
+	if section == "org.roles" {
+		return false, "", false, fmt.Errorf("parse org role section: expected [org.roles.\"name\"]")
 	}
 	const prefix = "org.roles."
 	if !strings.HasPrefix(section, prefix) {
@@ -283,34 +344,62 @@ func ValidateOrg(cfg OrgConfig) error {
 	if cfg.Enforce() != "block" && cfg.Enforce() != "warn" {
 		return fmt.Errorf("org enforce must be \"block\" or \"warn\"")
 	}
-	for name, role := range cfg.roles {
+	// Validate in sorted, structural passes so malformed registries return the
+	// same error regardless of Go map iteration order. Root naming deliberately
+	// precedes parent-reference checks, matching the retired Registry validator.
+	names := make([]string, 0, len(cfg.roles))
+	for name := range cfg.roles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	roots := 0
+	for _, name := range names {
+		role := cfg.roles[name]
 		if !validOrgRoleName(name) {
 			return fmt.Errorf("org role %q: invalid name", name)
 		}
 		if role.Name != "" && role.Name != name {
 			return fmt.Errorf("org role %q: name mismatch", name)
 		}
+		if len(role.Scope) == 0 {
+			return fmt.Errorf("org role %q: scope must not be empty", name)
+		}
 		if role.MergeRule != "" && role.MergeRule != "owner" && role.MergeRule != "self" && role.MergeRule != "none" {
 			return fmt.Errorf("org role %q: invalid merge_rule %q", name, role.MergeRule)
 		}
+		seenScope := map[string]bool{}
 		for _, scope := range role.Scope {
 			if _, err := normalizeOrgScope(scope); err != nil {
 				return fmt.Errorf("org role %q: %w", name, err)
 			}
+			if seenScope[scope] {
+				return fmt.Errorf("org role %q: duplicate scope %q", name, scope)
+			}
+			seenScope[scope] = true
 		}
-		if role.Parent != "" {
-			if _, ok := cfg.roles[role.Parent]; !ok {
-				return fmt.Errorf("org role %q: parent %q is not declared", name, role.Parent)
+		if role.Parent == "" {
+			roots++
+			if name != "owner" {
+				return fmt.Errorf("root org role must be named %q; got %q", "owner", name)
 			}
 		}
 	}
 	if len(cfg.roles) == 0 {
 		return nil
 	}
-	if len(cfg.Roots()) != 1 {
-		return fmt.Errorf("org: expected exactly one root role, got %d", len(cfg.Roots()))
+	if roots != 1 {
+		return fmt.Errorf("org: expected exactly one root role, got %d", roots)
 	}
-	for name := range cfg.roles {
+	for _, name := range names {
+		role := cfg.roles[name]
+		if role.Parent != "" {
+			if _, ok := cfg.roles[role.Parent]; !ok {
+				return fmt.Errorf("org role %q: parent %q is not declared", name, role.Parent)
+			}
+		}
+	}
+	for _, name := range names {
 		seen := map[string]bool{}
 		for current := name; current != ""; {
 			if seen[current] {
@@ -320,7 +409,8 @@ func ValidateOrg(cfg OrgConfig) error {
 			current = cfg.roles[current].Parent
 		}
 	}
-	for name, role := range cfg.roles {
+	for _, name := range names {
+		role := cfg.roles[name]
 		if role.Parent == "" {
 			continue
 		}

@@ -109,10 +109,10 @@ func (c Checker) GlobalChecks(ctx context.Context) []Check {
 		checks = append(checks, CheckBuild(*c.Build))
 	}
 	if strings.TrimSpace(c.Paths.ConfigFile) != "" {
-		registry, err := config.LoadOrgRegistry(c.Paths)
+		cfg, err := config.LoadOrg(c.Paths)
 		if err != nil {
-			checks = append(checks, Check{Name: "org registry", Required: true, Detail: err.Error()})
-		} else if registry.Enabled() {
+			checks = append(checks, Check{Name: "org registry", Required: true, Detail: fmt.Sprintf("load org registry: %v", err)})
+		} else if cfg.Enabled() {
 			checks = append(checks, CheckHerdrVersion(ctx, runner, OrgMinimumHerdrVersion))
 		}
 	}

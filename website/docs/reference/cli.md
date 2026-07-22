@@ -1005,12 +1005,14 @@ gitmoot org status [--json]
 
 The registry uses `[org] enforce = "warn"|"block"` and
 `[org.roles."name"]` entries with `parent`, `scope`, and `merge_rule`. There is
-exactly one root named `owner`; accepted scopes are `*`, `owner/*`, `*/repo`,
-and `owner/repo`. Malformed org configuration fails closed and loudly. `brief`
+exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
+`owner/repo`. Malformed org configuration fails closed and loudly. `brief`
 records passive last-seen presence for its role and can render static context
 with provider state `unknown` during an outage; `chart` and `status` require a
-live compatible Herdr snapshot. Escalations are recorded with `gitmoot org
-escalate`; their resolution and correlation surfaces are phase 2 work.
+live compatible Herdr snapshot. When configured, `brief --json` and `status
+--json` include the role's `pane` binding. Escalations are recorded with
+`gitmoot org escalate`; their resolution and correlation surfaces are phase 2
+work.
 
 Agent `ask`, `run`, `review`, `implement`, and `orchestrate` accept
 `--org-role <name>`. The role is validated and touched before dispatch, then
