@@ -1225,6 +1225,17 @@ func (d Daemon) reconcileClosedReviewingTasks(ctx context.Context, openBranches 
 			continue
 		}
 		task := candidate.task
+		// The fuzzy same-branch merged-sibling resolution (#543) is only safe for
+		// `reviewing`, whose merged case this pass has always owned. pr_open and
+		// changes_requested are folded in (#1054) ONLY for the closed-unmerged ->
+		// blocked arm; their merged resolution stays with the precise, pinned-PR-
+		// number reconcileExternallyMergedTasks pass. Otherwise an unrelated merged
+		// PR that merely shares a (fork) branch name — with the head-SHA guard
+		// skipped on an empty stored SHA — could drive a still-open task to a
+		// spurious `merged` and delete its worktree.
+		if merged && workflow.TaskState(task.State) != workflow.TaskReviewing {
+			continue
+		}
 		leadAgent := "github"
 		if lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), task.Branch); err == nil {
 			if owner := strings.TrimSpace(lock.Owner); owner != "" {

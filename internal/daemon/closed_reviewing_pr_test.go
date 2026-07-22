@@ -161,6 +161,82 @@ func TestPollOnceReconcilesClosedReviewingPullRequest(t *testing.T) {
 	}
 }
 
+// TestPollOnceDoesNotFuzzyMergeNonReviewingTasks guards the #1054-review finding:
+// pr_open and changes_requested are folded into reconcileClosedReviewingTasks
+// ONLY for the closed-unmerged -> blocked arm; they must NOT take the fuzzy
+// same-branch merged-sibling resolution that reviewing owns for #543. Otherwise
+// an UNRELATED merged PR that merely shares a (fork) branch name — with the head-
+// SHA guard skipped because the stored PR row has an empty SHA — would drive a
+// still-open task to a spurious `merged` and force-remove its worktree. reviewing
+// keeps the fuzzy resolution; the precise pinned-number reconcileExternallyMergedTasks
+// pass still owns the real merged case for the folded-in states.
+func TestPollOnceDoesNotFuzzyMergeNonReviewingTasks(t *testing.T) {
+	repo := github.Repository{Owner: "acme", Name: "widgets"}
+	const branch = "patch-1" // a generic fork head ref reused across unrelated PRs
+
+	for _, startState := range []workflow.TaskState{
+		workflow.TaskPullRequestOpen,
+		workflow.TaskChangesRequested,
+	} {
+		t.Run(string(startState), func(t *testing.T) {
+			ctx := context.Background()
+			store := testStore(t)
+			if err := store.UpsertTask(ctx, db.Task{
+				ID:           "task-fork",
+				RepoFullName: repo.FullName(),
+				GoalID:       "goal-1",
+				Title:        "Fork PR work",
+				State:        string(startState),
+				Branch:       branch,
+			}); err != nil {
+				t.Fatalf("UpsertTask returned error: %v", err)
+			}
+			// The stored PR row (our own PR #12) carries an EMPTY head SHA, so the
+			// selectReconciledPull SHA guard is skipped.
+			if err := store.UpsertPullRequest(ctx, db.PullRequest{
+				RepoFullName: repo.FullName(),
+				Number:       12,
+				URL:          "https://github.com/acme/widgets/pull/12",
+				HeadBranch:   branch,
+				BaseBranch:   "main",
+				State:        "open",
+			}); err != nil {
+				t.Fatalf("UpsertPullRequest returned error: %v", err)
+			}
+			client := &fakeGitHub{
+				pullsByState: map[string][]github.PullRequest{
+					"open": nil,
+					"closed": {
+						// The task's OWN PR #12 is closed-unmerged...
+						{Number: 12, State: "closed", HeadRef: branch, BaseRef: "main"},
+						// ...alongside an UNRELATED already-merged PR #5 on the same fork head ref.
+						{Number: 5, State: "closed", HeadRef: branch, BaseRef: "main", HeadSHA: "unrelated-sha", MergedAt: "2026-06-30T09:48:20Z"},
+					},
+				},
+				// reconcileExternallyMergedTasks looks up the pinned PR by number; #12
+				// is closed-unmerged, so the precise pass records a breadcrumb only.
+				pullsByNumber: map[int64]github.PullRequest{12: {Number: 12, State: "closed", HeadRef: branch, BaseRef: "main"}},
+				comments:      map[int64][]github.IssueComment{},
+			}
+			engine := workflow.Engine{Store: store}
+			daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+			if err := daemon.PollOnce(ctx); err != nil {
+				t.Fatalf("PollOnce returned error: %v", err)
+			}
+			task, err := store.GetTask(ctx, "task-fork")
+			if err != nil {
+				t.Fatalf("GetTask returned error: %v", err)
+			}
+			if task.State == string(workflow.TaskMerged) {
+				t.Fatalf("task falsely resolved to merged by an unrelated same-branch sibling (state=%q)", task.State)
+			}
+			if task.State != string(startState) {
+				t.Fatalf("task state = %q, want it left at %q (no fuzzy merge, no worktree delete)", task.State, startState)
+			}
+		})
+	}
+}
+
 // TestPollOnceReconcilesMergedSiblingPullRequest covers the literal #543 scenario
 // (finding 1): the real PR (#5) is MERGED while a duplicate (#6) on the SAME
 // branch was closed unmerged. Only #6 was ever recorded locally
