@@ -2589,7 +2589,7 @@ Every event is a single JSON object:
 | `status`         | string | Terminal/lifecycle state (`succeeded`/`failed`/`blocked`/`awaiting_human`). |
 | `ts`             | string | RFC3339 emit time.                                                          |
 | `detail`         | string | Short redacted human-facing string (failure summary, the escalation question). |
-| `cause`          | string | Optional internal discriminator (`escalation`, `ask_gate`, `merge_guard`, or `permission_guard`). |
+| `cause`          | string | Optional internal discriminator (`escalation`, `ask_gate`, `merge_guard`, `permission_guard`, or `blocked_since`). |
 
 `cause` is an additive optional field, so `schema_version` remains `1` and
 existing events serialize unchanged. It is a trusted enum assigned at emit
@@ -2651,7 +2651,12 @@ gitmoot org events rule rm <rule-id>
 Kinds are `escalation`, `attention`, `guard`, `job-terminal`, and `blocked`.
 The v1 `--match` filter is a case-insensitive substring tested against the event
 repo and job id; empty matches all. A plain `job.blocked` event matches both
-`job-terminal` and `blocked`, while guard-caused blocks match `guard` first.
+`job-terminal` and `blocked`, while guard-caused blocks match `guard` first. A
+synthesized `blocked_since` event matches only `blocked`. Set
+`[orchestrate].blocked_role_wake_after` to a positive Go duration to emit one
+such event when a task or Herdr role remains blocked past the threshold; `0s`
+(the default) disables both evaluators. The episode is cleared when the subject
+leaves blocked, so a later re-block can emit once again.
 The wake role's config sets `pane = "<pane-id-or-label>"`: a value containing `:`
 is a `wX:pY` pane id used as-is, any other value is a pane label resolved to the
 current id at wake time (so a recycled pane is still reached). Wake delivery runs

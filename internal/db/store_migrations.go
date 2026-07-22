@@ -1674,4 +1674,15 @@ CREATE TABLE event_rules (
 	created_at TEXT NOT NULL
 );
 	`,
+	// #1060 durable de-duplication for synthesized blocked-since events. A row
+	// represents one continuous blocked episode; leaving blocked deletes it so a
+	// later episode can emit once again.
+	`
+CREATE TABLE org_blocked_episodes (
+	subject TEXT PRIMARY KEY,
+	blocked_since TEXT NOT NULL,
+	emitted_at TEXT,
+	updated_at TEXT NOT NULL
+);
+	`,
 }

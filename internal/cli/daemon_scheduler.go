@@ -774,6 +774,13 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	if err := sweepExpiredBlockedJobs(ctx, store, resolveBlockedTTL(worker.workflowHome()), stdout, now); err != nil {
 		writeLine(stdout, "blocked_ttl sweep failed: %v", err)
 	}
+	// Opt-in blocked-since source (#1060): stale BLOCKED tasks synthesize one
+	// blocked event per continuous episode for the existing event-rule engine.
+	// Like blocked_ttl, every failure is logged and swallowed so this optional
+	// evaluator can never fail the repo tick.
+	if err := sweepBlockedTaskWakeEvents(ctx, store, worker.workflowHome(), repoFilter, stdout, now); err != nil {
+		writeLine(stdout, "blocked_since task sweep failed: %v", err)
+	}
 	// Checkout-mutating maintenance (advancement/merge retries, delegation
 	// worktree reclaims) is gated on the ACTUAL mutation hazard — each
 	// candidate is skipped while an in-flight job holds the checkout key the

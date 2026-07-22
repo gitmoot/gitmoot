@@ -77,6 +77,10 @@ type OrchestratePolicy struct {
 	// default — this dismisses a SINGLE blocked job and is OFF by default. The daemon
 	// resolves it per tick via resolveBlockedTTL.
 	BlockedTTL string
+	// BlockedRoleWakeAfter is the opt-in age after which a continuously blocked
+	// task or Herdr-backed organization role emits one synthesized blocked event.
+	// Zero (the default) disables both evaluators; negative values are rejected.
+	BlockedRoleWakeAfter time.Duration
 	// MaxDelegationNonProgressStreak is the per-root threshold for the result-aware
 	// non-progress loop detector (#339): how many consecutive continuation
 	// generations a delegation tree may produce with no new durable side effect
@@ -121,6 +125,7 @@ func DefaultOrchestratePolicy() OrchestratePolicy {
 		EscalationHandle:               "",
 		EscalationTTL:                  "",
 		BlockedTTL:                     "",
+		BlockedRoleWakeAfter:           0,
 		MaxDelegationNonProgressStreak: 0,
 		MaxVerifyReplanAttempts:        0,
 		DefaultDelegationTimeout:       "",
@@ -216,6 +221,18 @@ func applyOrchestratePolicyField(policy *OrchestratePolicy, key string, value st
 		parsed, err := parseConfigString(value)
 		policy.BlockedTTL = strings.TrimSpace(parsed)
 		return err
+	case "blocked_role_wake_after":
+		parsed, err := parseConfigString(value)
+		if err != nil {
+			return err
+		}
+		parsed = strings.TrimSpace(parsed)
+		if parsed == "" {
+			policy.BlockedRoleWakeAfter = 0
+			return nil
+		}
+		policy.BlockedRoleWakeAfter, err = time.ParseDuration(parsed)
+		return err
 	case "max_delegation_non_progress_streak":
 		parsed, err := strconv.Atoi(value)
 		policy.MaxDelegationNonProgressStreak = parsed
@@ -293,6 +310,9 @@ func validateOrchestratePolicy(policy OrchestratePolicy) error {
 		if parsed < 0 {
 			return fmt.Errorf("orchestrate.blocked_ttl must be zero (disabled) or a positive duration")
 		}
+	}
+	if policy.BlockedRoleWakeAfter < 0 {
+		return fmt.Errorf("orchestrate.blocked_role_wake_after must be zero (disabled) or a positive duration")
 	}
 	if policy.MaxDelegationNonProgressStreak < 0 {
 		return fmt.Errorf("orchestrate.max_delegation_non_progress_streak must be 0 (engine default) or positive")

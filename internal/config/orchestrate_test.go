@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadOrchestratePolicyDefaults(t *testing.T) {
@@ -378,6 +379,49 @@ blocked_ttl = "soon"
 	}
 	if _, err := LoadOrchestratePolicy(paths); err == nil {
 		t.Fatal("LoadOrchestratePolicy accepted an invalid blocked_ttl")
+	}
+}
+
+func TestLoadOrchestratePolicyBlockedRoleWakeAfter(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+
+	policy, err := LoadOrchestratePolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadOrchestratePolicy(default) error = %v", err)
+	}
+	if policy.BlockedRoleWakeAfter != 0 {
+		t.Fatalf("BlockedRoleWakeAfter = %s, want disabled", policy.BlockedRoleWakeAfter)
+	}
+
+	for _, test := range []struct {
+		value   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{value: "36h", want: 36 * time.Hour},
+		{value: "0s", want: 0},
+		{value: "-1m", wantErr: true},
+		{value: "soon", wantErr: true},
+	} {
+		if err := os.WriteFile(paths.ConfigFile, []byte("[orchestrate]\nblocked_role_wake_after = \""+test.value+"\"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		policy, err := LoadOrchestratePolicy(paths)
+		if test.wantErr {
+			if err == nil {
+				t.Fatalf("blocked_role_wake_after %q accepted, want error", test.value)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("blocked_role_wake_after %q error = %v", test.value, err)
+		}
+		if policy.BlockedRoleWakeAfter != test.want {
+			t.Fatalf("blocked_role_wake_after %q = %s, want %s", test.value, policy.BlockedRoleWakeAfter, test.want)
+		}
 	}
 }
 

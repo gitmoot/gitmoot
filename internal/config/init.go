@@ -128,6 +128,9 @@ cockpit_pane_key = "job"
 # (Go duration; default 24h). Both optional.
 escalation_handle = ""
 escalation_ttl = ""
+# Emit one synthetic blocked event per continuously blocked task or Herdr org
+# role after this Go duration. 0s keeps both evaluators disabled.
+blocked_role_wake_after = "0s"
 # Optional default timeouts for child delegation jobs. Empty means unbounded,
 # preserving historical behavior. Per-delegation timeout always wins; otherwise
 # phase-specific defaults apply, then default_delegation_timeout, then unbounded.

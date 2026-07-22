@@ -173,6 +173,8 @@ func classifyEventRuleKinds(event events.Event) []string {
 		switch event.Cause {
 		case "merge_guard", "permission_guard":
 			return []string{"guard"}
+		case "blocked_since":
+			return []string{"blocked"}
 		case "":
 			// A plain blocked transition is both a terminal outcome and the
 			// narrower blocked rule kind.

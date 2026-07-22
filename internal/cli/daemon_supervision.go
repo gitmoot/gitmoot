@@ -75,6 +75,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 			// outside daemonWorkflowEngine, which is rebuilt per repo/tick.
 			startMemoryHarvestLoop(ctx, paths, home, store, stdout)
 			startCockpitReconcileLoop(ctx, store, paths.Home, stdout)
+			startBlockedRoleWakeLoop(ctx, store, paths.Home, stdout)
 			startTranscriptRetentionLoop(ctx, paths, store, stdout)
 		}
 		// Heartbeat schedules (#533) reuse the normal job queue. Off-by-default: with
@@ -179,6 +180,7 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	defer tracker.drain(stdout, daemonShutdownDrainTimeout)
 	workerErr := startSingleRepoWorkerLoop(ctx, daemonWorkerLoopInterval, store, worker, live, &checkoutLock, tracker, d.Repo.FullName(), rootFilter, stdout)
 	startCockpitReconcileLoop(ctx, store, home, stdout)
+	startBlockedRoleWakeLoop(ctx, store, home, stdout)
 	// Heartbeat schedules (#533) must also fire in the single-repo daemon, or a
 	// single-repo daemon would silently never run them. Off-by-default: with no
 	// heartbeat sections the scan returns before any store touch. A failure to
@@ -964,6 +966,24 @@ func resolveBlockedTTL(home string) time.Duration {
 		return 0
 	}
 	return ttl
+}
+
+// resolveBlockedRoleWakeAfter reads the opt-in blocked-since threshold. It is
+// read-only and shape-tolerant like resolveBlockedTTL: either a raw --home or an
+// already-resolved <home>/.gitmoot root is accepted without initializing or
+// re-resolving the home. Zero, missing, or invalid values keep both evaluators
+// disabled.
+func resolveBlockedRoleWakeAfter(home string) time.Duration {
+	policy := config.DefaultOrchestratePolicy()
+	if cfg := resolveConfigFile(home); cfg != "" {
+		if loaded, err := config.LoadOrchestratePolicy(config.Paths{ConfigFile: cfg}); err == nil {
+			policy = loaded
+		}
+	}
+	if policy.BlockedRoleWakeAfter <= 0 {
+		return 0
+	}
+	return policy.BlockedRoleWakeAfter
 }
 
 // resolveDelegationWorktreeTTL reads the default-on terminal worktree retention
