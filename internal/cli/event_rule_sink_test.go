@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -14,6 +16,7 @@ import (
 
 type fakeEventWake struct {
 	availableCalls int
+	promptCalls    int
 	pane           string
 	prompt         string
 	until          string
@@ -26,6 +29,7 @@ func (f *fakeEventWake) Available(context.Context) bool {
 }
 
 func (f *fakeEventWake) AgentPrompt(_ context.Context, pane, prompt, until string) (bool, bool, error) {
+	f.promptCalls++
 	f.pane, f.prompt, f.until = pane, prompt, until
 	return true, false, nil
 }
@@ -167,5 +171,56 @@ func TestDaemonEventSinkRuleOnlyActivationAndRemoval(t *testing.T) {
 	}
 	if sink := daemonEventSink(store, paths.Home); sink != nil {
 		t.Fatal("removing the last rule must restore the nil off path")
+	}
+}
+
+// TestEventRuleWakeFiresEachMatchingRule guards the multi-rule fan-out: a plain
+// job.blocked event classifies to BOTH job-terminal and blocked, so two rules —
+// one per kind — must each produce a wake. (The per-rule wake context in evaluate
+// is what keeps a slow earlier wake from starving the later one; see #1060.)
+func TestEventRuleWakeFiresEachMatchingRule(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, r := range []db.EventRule{
+		{ID: "r-term", OnKind: "job-terminal", WakeRole: "owner", Enabled: true},
+		{ID: "r-blk", OnKind: "blocked", WakeRole: "owner", Enabled: true},
+	} {
+		if err := store.AddEventRule(context.Background(), r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wake := &fakeEventWake{}
+	sink := &eventRuleSink{store: store, home: home, wake: wake}
+	sink.evaluate(context.Background(), events.Event{Type: events.EventJobBlocked, JobID: "job-1"})
+	if wake.promptCalls != 2 {
+		t.Fatalf("want a wake for each of the 2 matching rules, got %d", wake.promptCalls)
+	}
+}
+
+func TestTruncateForWakeRuneSafe(t *testing.T) {
+	// A multibyte run whose byte length exceeds the cap; a naive detail[:max] would
+	// split a rune and emit invalid UTF-8 into the herdr prompt.
+	long := strings.Repeat("é", 400) // 800 bytes, 400 runes
+	out := truncateForWake(long, 320)
+	if !utf8.ValidString(out) {
+		t.Fatalf("truncated prompt is not valid UTF-8: %q", out)
+	}
+	if !strings.HasSuffix(out, "…") {
+		t.Fatalf("expected ellipsis on truncation, got %q", out)
+	}
+	// A short ASCII string is returned unchanged (no ellipsis).
+	if got := truncateForWake("ok", 320); got != "ok" {
+		t.Fatalf("short string altered: %q", got)
 	}
 }

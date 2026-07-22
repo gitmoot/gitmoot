@@ -34,7 +34,10 @@ func (s *Store) AddEventRule(ctx context.Context, rule EventRule) error {
 		return errors.New("event rule wake_role is required")
 	}
 	if strings.TrimSpace(rule.CreatedAt) == "" {
-		rule.CreatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		// Fixed-width nanoseconds (not RFC3339Nano, which trims trailing zeros) so
+		// the lexical `ORDER BY created_at` in ListEventRules matches true
+		// chronological order even for rules added within the same second.
+		rule.CreatedAt = time.Now().UTC().Format("2006-01-02T15:04:05.000000000Z")
 	}
 	enabled := 0
 	if rule.Enabled {

@@ -512,7 +512,19 @@ func (e Engine) runMergeGate(ctx context.Context, reviewer string, payload JobPa
 		// durable) block.
 		err := e.block(ctx, ref, reason)
 		var blocked BlockedError
-		if errors.As(err, &blocked) {
+		if errors.As(err, &blocked) && decision.BlockClass == MergeBlockQuality {
+			// Only an AUTHORITATIVE template-quality block (external CI failed, a
+			// blocking review captured, closed-without-merge) is worth waking an org
+			// role for and harvesting. Transient/infra blocks (branch staleness, dirty
+			// worktree, missing head/base SHA, freshness-unknown) are self-clearing
+			// daemon-retry noise — the same set the #465 harvest excludes — so gating
+			// the merge_guard wake here keeps it from re-firing on every push of a
+			// self-clearing condition.
+			//
+			// On the poll-driven path (HandlePullRequestOpened) the payload carries no
+			// driving job, so the id falls through to the task id — the only stable
+			// identifier the task-scoped merge gate has. A rule --match on job id will
+			// not match these; --match on repo (or an empty filter) will.
 			jobID := firstNonEmptyString(payload.RootJobID, payload.ParentJobID, ref.ID, payload.TaskID)
 			rootID := firstNonEmptyString(payload.RootJobID, jobID)
 			ev := events.NewEvent(
@@ -527,15 +539,13 @@ func (e Engine) runMergeGate(ctx context.Context, reviewer string, payload JobPa
 			)
 			ev.Cause = "merge_guard"
 			events.EmitEvent(ctx, e.EventSink, ev)
-			if decision.BlockClass == MergeBlockQuality {
-				e.harvestOutcomeForMergeGate(ctx, payload, Outcome{
-					Kind:        OutcomeBlocked,
-					Repo:        payload.Repo,
-					PullRequest: payload.PullRequest,
-					HeadSHA:     payload.HeadSHA,
-					Reason:      reason,
-				})
-			}
+			e.harvestOutcomeForMergeGate(ctx, payload, Outcome{
+				Kind:        OutcomeBlocked,
+				Repo:        payload.Repo,
+				PullRequest: payload.PullRequest,
+				HeadSHA:     payload.HeadSHA,
+				Reason:      reason,
+			})
 		}
 		return decision, err
 	}
