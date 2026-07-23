@@ -28,6 +28,7 @@ func TestTaskDismissPredicateFailsClosed(t *testing.T) {
 		{state: string(workflow.TaskReadyToMerge)},
 		{state: string(workflow.TaskMerged)},
 		{state: string(workflow.TaskBlocked), want: true},
+		{state: string(workflow.TaskAwaitingHumanMerge), want: true},
 		{state: string(workflow.TaskAwaitingHuman)},
 		{state: string(workflow.TaskDismissed)},
 		{state: "future"},
@@ -40,7 +41,7 @@ func TestTaskDismissPredicateFailsClosed(t *testing.T) {
 }
 
 func TestRunTaskDismissAllowedStatesJSONLockAndEvents(t *testing.T) {
-	for _, state := range []workflow.TaskState{workflow.TaskImplementing, workflow.TaskBlocked} {
+	for _, state := range []workflow.TaskState{workflow.TaskImplementing, workflow.TaskBlocked, workflow.TaskAwaitingHumanMerge} {
 		t.Run(string(state), func(t *testing.T) {
 			home := t.TempDir()
 			store := openCLIJobStore(t, home)

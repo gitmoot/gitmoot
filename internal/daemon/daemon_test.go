@@ -1958,6 +1958,33 @@ func TestPollOnceMergeCommandRunsMergeGate(t *testing.T) {
 	}
 }
 
+func TestPollOnceMergeCommandAcceptsAwaitingHumanMergeTask(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-awaiting", RepoFullName: repo.FullName(), Title: "Awaiting human merge", State: string(workflow.TaskAwaitingHumanMerge), Branch: "task-awaiting"}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-awaiting", Owner: "builder"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock = %v, %v", acquired, err)
+	}
+	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{Ready: true, Merged: true, MergeCommitSHA: "merge-awaiting"}}
+	engine := workflow.Engine{Store: store, MergeGate: gate}
+	client := &fakeGitHub{}
+	if err := (Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}).handleMergeCommand(ctx,
+		github.PullRequest{Number: 27, State: "open", HeadRef: "task-awaiting", BaseRef: "main", HeadSHA: "abc"},
+		github.IssueComment{ID: 27, Body: "/gitmoot merge", Author: "operator"}); err != nil {
+		t.Fatalf("handleMergeCommand: %v", err)
+	}
+	if len(gate.requests) != 1 || !gate.requests[0].HumanMergeRequested {
+		t.Fatalf("merge requests = %+v; want one explicit human request", gate.requests)
+	}
+	task, err := store.GetTask(ctx, "task-awaiting")
+	if err != nil || task.State != string(workflow.TaskMerged) {
+		t.Fatalf("task = %+v, err=%v; want merged", task, err)
+	}
+}
+
 func TestPollOnceMergeCommandRefusesSkipNativeFanoutBranch(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)

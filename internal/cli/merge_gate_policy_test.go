@@ -24,6 +24,9 @@ func TestApplyMergeGatePolicyOffByDefault(t *testing.T) {
 	if gate.RequireExternalCI {
 		t.Fatalf("RequireExternalCI = true, want off by default")
 	}
+	if gate.AutoMerge {
+		t.Fatalf("AutoMerge = true, want false by default")
+	}
 	if gate.MinCIWait != config.DefaultMinCIWait {
 		t.Fatalf("MinCIWait = %v, want default %v", gate.MinCIWait, config.DefaultMinCIWait)
 	}
@@ -40,6 +43,7 @@ func TestNewPipelineAutoMergerAppliesPerRepoPolicyOnAndOff(t *testing.T) {
 	}
 	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+`
 [merge_gate]
+auto_merge = false
 min_ci_wait = "45s"
 max_ci_wait = "7m"
 
@@ -56,7 +60,7 @@ require_external_ci = true
 
 	on := pipeline.NewPipelineAutoMerger(context.Background(), store, "jerryfane/noted")
 	if !on.RequireExternalCI || on.MinCIWait != 45*time.Second || on.MaxCIWait != 7*time.Minute {
-		t.Fatalf("per-repo pipeline policy = %+v", on)
+		t.Fatalf("per-repo pipeline policy = %+v; native auto_merge must not affect pipeline auto-merge", on)
 	}
 	off := pipeline.NewPipelineAutoMerger(context.Background(), store, "gitmoot/gitmoot")
 	if off.RequireExternalCI || off.MinCIWait != 45*time.Second || off.MaxCIWait != 7*time.Minute {
@@ -72,6 +76,7 @@ func TestApplyMergeGatePolicyReadsPerRepoKnob(t *testing.T) {
 	}
 	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+`
 [merge_gate]
+auto_merge = true
 min_ci_wait = "45s"
 max_ci_wait = "7m"
 
@@ -86,6 +91,9 @@ require_external_ci = true
 	if !noted.RequireExternalCI {
 		t.Fatalf("noted RequireExternalCI = false, want true from per-repo override")
 	}
+	if !noted.AutoMerge {
+		t.Fatalf("noted AutoMerge = false, want true from global policy")
+	}
 	if noted.MinCIWait != 45*time.Second {
 		t.Fatalf("noted MinCIWait = %v, want inherited 45s", noted.MinCIWait)
 	}
@@ -98,6 +106,9 @@ require_external_ci = true
 	if other.RequireExternalCI {
 		t.Fatalf("non-override repo RequireExternalCI = true, want false")
 	}
+	if !other.AutoMerge {
+		t.Fatalf("other AutoMerge = false, want global true")
+	}
 	if other.MinCIWait != 45*time.Second {
 		t.Fatalf("non-override repo MinCIWait = %v, want global 45s", other.MinCIWait)
 	}
@@ -109,7 +120,28 @@ require_external_ci = true
 func TestApplyMergeGatePolicyEmptyHomeIsNoop(t *testing.T) {
 	gate := workflow.PolicyMergeGate{}
 	applyMergeGatePolicy(&gate, "", "jerryfane/noted")
-	if gate.RequireExternalCI || gate.MinCIWait != 0 || gate.MaxCIWait != 0 {
+	if gate.AutoMerge || gate.RequireExternalCI || gate.MinCIWait != 0 || gate.MaxCIWait != 0 {
 		t.Fatalf("empty home must leave the gate untouched, got %+v", gate)
+	}
+}
+
+func TestAutoMergeEnabledResolverRereadsConfig(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	resolver := autoMergeEnabledResolver(paths.Home)
+	if resolver("owner/repo") {
+		t.Fatal("default auto_merge resolved true")
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+`
+[repos."owner/repo".merge_gate]
+auto_merge = true
+`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if !resolver("owner/repo") {
+		t.Fatal("resolver did not observe auto_merge config flip")
 	}
 }

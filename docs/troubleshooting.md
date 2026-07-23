@@ -618,6 +618,10 @@ Fixes:
   `gitmoot task list` / `gitmoot job events <job-id>`. Resolve the conflict
   manually or run an explicit implement/fix job, then rerun review/merge.
 - Fix failing external CI or Gitmoot statuses.
+- If the task is `awaiting_human_merge`, Gitmoot intentionally left the PR open
+  because `[merge_gate] auto_merge` defaults to `false`. Merge it in GitHub, use
+  an authorized `@gitmoot merge` comment, or opt that repository in with
+  `[repos."owner/repo".merge_gate] auto_merge = true`.
 - If the reason reads `waiting to confirm no external CI` (or `waiting … for CI
   to be created`), the gate saw **zero** external commit-statuses and check-runs
   at the head and is deferring rather than merging before GitHub Actions creates

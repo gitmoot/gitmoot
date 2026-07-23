@@ -15,10 +15,15 @@ import (
 )
 
 const (
-	gitmootMergeGateContext         = "gitmoot/merge-gate"
-	gitmootNoCIContext              = "gitmoot/ci"
-	commitStatusDescriptionMaxRunes = 140
-	mergeQueueLockTTL               = 30 * time.Minute
+	gitmootMergeGateContext = "gitmoot/merge-gate"
+	gitmootNoCIContext      = "gitmoot/ci"
+	// MergeLeaveOpenAutoMergeDisabledReason is persisted with a parked task so
+	// a later auto_merge=false -> true config flip can re-arm only this policy
+	// decision. Future leave-open causes must use their own reason and stay
+	// parked until their own resolver acts.
+	MergeLeaveOpenAutoMergeDisabledReason = "native auto-merge is disabled; leave the pull request open for a human merge"
+	commitStatusDescriptionMaxRunes       = 140
+	mergeQueueLockTTL                     = 30 * time.Minute
 )
 
 type MergeGateGitHub interface {
@@ -54,6 +59,11 @@ type PolicyMergeGate struct {
 	CheckoutPath string
 	DeleteBranch bool
 	MergeMethod  string
+	// AutoMerge permits this native task merge gate to perform a GitHub merge.
+	// Default false leaves the PR open without touching GitHub or local locks.
+	// PipelineAutoMerger does not call Evaluate and remains governed only by its
+	// independent pipeline allow_auto_merge mechanism.
+	AutoMerge bool
 	// RequireExternalCI hard-blocks a merge whose head reports zero external CI
 	// instead of ever stamping the synthetic gitmoot/ci success (#596, layer 3 —
 	// the [merge_gate] require_external_ci knob). Default false.
@@ -116,6 +126,12 @@ type workflowAwareGitHub interface {
 }
 
 func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (MergeDecision, error) {
+	// This must remain before validation and every GitHub/local-store operation.
+	// The safe default deliberately has zero GitHub calls, status writes, lock
+	// acquisition, CI probes, or merge attempts.
+	if !g.AutoMerge && !request.HumanMergeRequested {
+		return MergeDecision{LeaveOpen: true, Reason: MergeLeaveOpenAutoMergeDisabledReason}, nil
+	}
 	if err := g.validate(); err != nil {
 		return MergeDecision{}, err
 	}

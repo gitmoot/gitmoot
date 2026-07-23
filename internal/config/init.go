@@ -566,8 +566,10 @@ path = ""
 # [agents.builder]
 # chat_autorespond = true
 
-# [merge_gate] tunes how the native merge gate handles a PR head that reports NO
-# external CI (issue #596). By default (no section) the gate defers concluding
+# [merge_gate] controls native task merges and tunes how their gate handles a PR
+# head that reports NO external CI (issue #596). Native auto-merge is OFF by
+# default: Gitmoot leaves approved PRs open for a human merge. Set auto_merge =
+# true globally or for a specific repo to opt in. Once enabled, the gate defers concluding
 # "no CI" until a SECOND consecutive zero-external observation at the same head,
 # at least min_ci_wait later, so a fresh head cannot merge before GitHub Actions
 # creates its check run. When .github/workflows/ exists at the head it instead
@@ -579,6 +581,7 @@ path = ""
 # always have CI). All keys can be set globally and overridden per repo under
 # [repos."owner/repo".merge_gate].
 # [merge_gate]
+# auto_merge = false
 # require_external_ci = false
 # min_ci_wait = "60s"
 # max_ci_wait = "10m"

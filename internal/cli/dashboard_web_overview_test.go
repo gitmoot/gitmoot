@@ -389,6 +389,7 @@ func TestDashboardTaskStateFiltersUnsupportedStates(t *testing.T) {
 		{internal: "ready_to_merge", state: "pr_open", ok: true},
 		{internal: "blocked", state: "blocked", reason: "Task is blocked", ok: true},
 		{internal: "awaiting_human", state: "blocked", reason: "Awaiting human input", ok: true},
+		{internal: "awaiting_human_merge", state: "blocked", reason: "Awaiting human merge", ok: true},
 		{internal: "merged", state: "merged", ok: true},
 	}
 	for _, test := range tests {

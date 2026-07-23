@@ -6,7 +6,8 @@ import (
 )
 
 // applyMergeGatePolicy loads the [merge_gate] policy for `home` and applies the
-// per-repo resolved knobs (require_external_ci, min_ci_wait, max_ci_wait) onto a
+// per-repo resolved knobs (auto_merge, require_external_ci, min_ci_wait,
+// max_ci_wait) onto a
 // constructed merge gate (#596). It is fail-safe: an empty home, a missing config,
 // or a parse error leaves the gate at its off-by-default behavior (no external CI
 // required, built-in grace/max windows) rather than erroring the daemon —
@@ -16,6 +17,7 @@ func applyMergeGatePolicy(gate *workflow.PolicyMergeGate, home string, repo stri
 	if !ok {
 		return
 	}
+	gate.AutoMerge = policy.AutoMerge
 	gate.RequireExternalCI = policy.RequireExternalCI
 	gate.MinCIWait = policy.MinCIWait
 	gate.MaxCIWait = policy.MaxCIWait
@@ -33,4 +35,14 @@ func resolvedMergeGatePolicy(home string, repo string) (config.MergeGatePolicy, 
 		return config.MergeGatePolicy{}, false
 	}
 	return loaded.For(repo), true
+}
+
+// autoMergeEnabledResolver re-reads the merge policy on every daemon poll so an
+// operator can explicitly re-arm auto-merge-disabled parked tasks without a
+// daemon restart. Invalid or unreadable configuration fails closed.
+func autoMergeEnabledResolver(home string) func(repo string) bool {
+	return func(repo string) bool {
+		policy, ok := resolvedMergeGatePolicy(home, repo)
+		return ok && policy.AutoMerge
+	}
 }

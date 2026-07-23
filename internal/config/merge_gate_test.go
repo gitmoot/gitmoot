@@ -11,6 +11,9 @@ func TestDefaultMergeGatePolicyOff(t *testing.T) {
 	if policy.RequireExternalCI {
 		t.Fatalf("default require_external_ci = true, want false (off)")
 	}
+	if policy.AutoMerge {
+		t.Fatalf("default auto_merge = true, want false")
+	}
 	if policy.MinCIWait != DefaultMinCIWait {
 		t.Fatalf("default MinCIWait = %v, want %v", policy.MinCIWait, DefaultMinCIWait)
 	}
@@ -41,6 +44,7 @@ func TestLoadMergeGatePolicyGlobalSection(t *testing.T) {
 	}
 	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
 [merge_gate]
+auto_merge = true
 require_external_ci = true
 min_ci_wait = "90s"
 max_ci_wait = "5m"
@@ -54,6 +58,9 @@ max_ci_wait = "5m"
 	got := cfg.For("jerryfane/noted")
 	if !got.RequireExternalCI {
 		t.Fatalf("global require_external_ci = false, want true")
+	}
+	if !got.AutoMerge {
+		t.Fatalf("global auto_merge = false, want true")
 	}
 	if got.MinCIWait != 90*time.Second {
 		t.Fatalf("global MinCIWait = %v, want 90s", got.MinCIWait)
@@ -70,9 +77,11 @@ func TestLoadMergeGatePolicyPerRepoOverride(t *testing.T) {
 	}
 	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
 [merge_gate]
+auto_merge = true
 min_ci_wait = "30s"
 
 [repos."jerryfane/noted".merge_gate]
+auto_merge = false
 require_external_ci = true
 max_ci_wait = "3m"
 `), 0o600); err != nil {
@@ -89,6 +98,9 @@ max_ci_wait = "3m"
 	if !noted.RequireExternalCI {
 		t.Fatalf("override require_external_ci = false, want true")
 	}
+	if noted.AutoMerge {
+		t.Fatalf("override auto_merge = true, want false")
+	}
 	if noted.MinCIWait != 30*time.Second {
 		t.Fatalf("override MinCIWait = %v, want inherited 30s", noted.MinCIWait)
 	}
@@ -101,6 +113,9 @@ max_ci_wait = "3m"
 	other := cfg.For("gitmoot/gitmoot")
 	if other.RequireExternalCI {
 		t.Fatalf("non-override repo require_external_ci = true, want false")
+	}
+	if !other.AutoMerge {
+		t.Fatalf("non-override repo auto_merge = false, want inherited true")
 	}
 	if other.MinCIWait != 30*time.Second {
 		t.Fatalf("non-override repo MinCIWait = %v, want 30s", other.MinCIWait)

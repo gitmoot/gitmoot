@@ -26,11 +26,14 @@ const DefaultMinCIWait = 60 * time.Second
 // finite to restore liveness.
 const DefaultMaxCIWait = 10 * time.Minute
 
-// MergeGatePolicy is the resolved merge-gate behavior for a repo (#596). It is
-// OFF BY DEFAULT in the sense that the historical behavior — conclude "no CI"
-// from a zero-external observation — still happens, just deferred by one grace
-// window (MinCIWait) instead of instantly, and require_external_ci defaults false.
+// MergeGatePolicy is the resolved merge-gate behavior for a repo. Native task
+// auto-merge defaults off; when explicitly enabled, the historical no-CI handling
+// still applies with its grace window and require_external_ci defaults false.
 type MergeGatePolicy struct {
+	// AutoMerge permits Gitmoot's native task merge gate to merge an approved PR.
+	// It defaults false: leave the PR open for a human unless this is explicitly
+	// enabled globally or for the repository.
+	AutoMerge bool
 	// RequireExternalCI, when true, HARD-BLOCKS a merge whose head reports zero
 	// external CI (no external commit-statuses AND no check-runs) instead of ever
 	// stamping the synthetic gitmoot/ci success. Use it for repos the operator
@@ -47,11 +50,11 @@ type MergeGatePolicy struct {
 	MaxCIWait time.Duration
 }
 
-// DefaultMergeGatePolicy returns the off-by-default policy: no external CI is not
-// required, and the no-CI conclusion is deferred by the default grace window (and
-// bounded by the default max window when workflows exist at the head).
+// DefaultMergeGatePolicy leaves native task PRs open for human merge. If an
+// operator opts in, no external CI is not required and the no-CI conclusion is
+// deferred by the default grace window (and bounded by the default max window).
 func DefaultMergeGatePolicy() MergeGatePolicy {
-	return MergeGatePolicy{RequireExternalCI: false, MinCIWait: DefaultMinCIWait, MaxCIWait: DefaultMaxCIWait}
+	return MergeGatePolicy{AutoMerge: false, RequireExternalCI: false, MinCIWait: DefaultMinCIWait, MaxCIWait: DefaultMaxCIWait}
 }
 
 // MergeGateConfig is the parsed [merge_gate] configuration: a global default plus
@@ -67,6 +70,7 @@ type MergeGateConfig struct {
 // merges onto the global default field-by-field (a missing key inherits the
 // global value rather than resetting it to a zero value).
 type mergeGateOverride struct {
+	autoMerge         *bool
 	requireExternalCI *bool
 	minCIWait         *time.Duration
 	maxCIWait         *time.Duration
@@ -87,6 +91,9 @@ func (c MergeGateConfig) For(repo string) MergeGatePolicy {
 	if !ok {
 		return policy
 	}
+	if override.autoMerge != nil {
+		policy.AutoMerge = *override.autoMerge
+	}
 	if override.requireExternalCI != nil {
 		policy.RequireExternalCI = *override.requireExternalCI
 	}
@@ -101,8 +108,8 @@ func (c MergeGateConfig) For(repo string) MergeGatePolicy {
 
 // LoadMergeGatePolicy parses the [merge_gate] section (global) and every
 // [repos."owner/repo".merge_gate] section (per-repo override) from the config
-// file (#596). It is OFF BY DEFAULT: a config with neither section yields the
-// default policy for every repo (no external CI required, default grace window).
+// file. It is safe by default: a config with neither section leaves every native
+// task PR open for a human merge.
 //
 // It reuses the same naive line-scanner shape as LoadRepoConcurrency /
 // LoadAdmissionPolicy. Unrelated sections are ignored.
@@ -191,6 +198,13 @@ func parseMergeGateSection(section string) (string, bool) {
 
 func applyMergeGateGlobalField(policy *MergeGatePolicy, key string, value string) error {
 	switch key {
+	case "auto_merge":
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return err
+		}
+		policy.AutoMerge = parsed
+		return nil
 	case "require_external_ci":
 		parsed, err := strconv.ParseBool(value)
 		if err != nil {
@@ -219,6 +233,13 @@ func applyMergeGateGlobalField(policy *MergeGatePolicy, key string, value string
 
 func applyMergeGateOverrideField(override *mergeGateOverride, key string, value string) error {
 	switch key {
+	case "auto_merge":
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return err
+		}
+		override.autoMerge = &parsed
+		return nil
 	case "require_external_ci":
 		parsed, err := strconv.ParseBool(value)
 		if err != nil {

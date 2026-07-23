@@ -1796,6 +1796,11 @@ disables it (a negative value is rejected). Unlike `[orchestrate].escalation_ttl
 (which auto-finalizes a whole paused delegation *tree* and is on by default, 24h),
 `blocked_ttl` dismisses a *single* blocked job and is off by default.
 
+Native task PRs are left open by default. Opt a repository into daemon merges
+with `[repos."owner/repo".merge_gate] auto_merge = true`; otherwise the task is
+shown as `awaiting_human_merge` until a human merges it or sends an authorized
+`@gitmoot merge` command. Pipeline `allow_auto_merge` is independent.
+
 Merge-gate retries are automatic while the daemon is running. Retryable states,
 such as a busy base-branch merge queue or a GitHub branch update in progress,
 are retried on the next daemon poll tick. The default poll interval is `30s`

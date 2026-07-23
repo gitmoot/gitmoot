@@ -575,7 +575,7 @@ func runTaskDismiss(args []string, stdout, stderr io.Writer) int {
 			return fmt.Errorf("task %s worktree %s still has a live process; wait for it to exit or stop it before dismissing", task.ID, task.WorktreePath)
 		}
 		changed, current, err := store.TransitionTaskStateWithEventIfNoActiveJob(context.Background(), task.ID,
-			[]string{string(workflow.TaskImplementing), string(workflow.TaskBlocked)},
+			[]string{string(workflow.TaskImplementing), string(workflow.TaskBlocked), string(workflow.TaskAwaitingHumanMerge)},
 			string(workflow.TaskDismissed), "task_dismissed_manual", reason)
 		if err != nil {
 			if errors.Is(err, db.ErrTaskHasActiveJob) {
@@ -621,7 +621,7 @@ func runTaskDismiss(args []string, stdout, stderr io.Writer) int {
 
 func taskDismissibleState(state string) bool {
 	switch workflow.TaskState(strings.TrimSpace(state)) {
-	case workflow.TaskImplementing, workflow.TaskBlocked:
+	case workflow.TaskImplementing, workflow.TaskBlocked, workflow.TaskAwaitingHumanMerge:
 		return true
 	default:
 		return false
@@ -639,6 +639,8 @@ func taskDismissRefusal(task db.Task) error {
 		owner = "task run/implement dispatch"
 	case workflow.TaskPullRequestOpen, workflow.TaskReviewing, workflow.TaskChangesRequested, workflow.TaskReadyToMerge:
 		owner = "pull-request review and merge machinery"
+	case workflow.TaskAwaitingHumanMerge:
+		owner = "the human merge decision"
 	case workflow.TaskMerged:
 		owner = "the terminal merge record"
 	case workflow.TaskAwaitingHuman:
@@ -967,14 +969,16 @@ func taskBranchReusableForImplement(state string) bool {
 }
 
 func taskRecoverableState(state string) bool {
-	return workflow.TaskState(strings.TrimSpace(state)) == workflow.TaskDismissed || taskBranchReusableForImplement(state)
+	return workflow.TaskState(strings.TrimSpace(state)) == workflow.TaskDismissed ||
+		workflow.TaskState(strings.TrimSpace(state)) == workflow.TaskAwaitingHumanMerge ||
+		taskBranchReusableForImplement(state)
 }
 
 func taskRecoveryActiveStates() []string {
 	return []string{
 		"", string(workflow.TaskPlanned), string(workflow.TaskImplementing),
 		string(workflow.TaskChangesRequested), string(workflow.TaskBlocked),
-		string(workflow.TaskAwaitingHuman),
+		string(workflow.TaskAwaitingHuman), string(workflow.TaskAwaitingHumanMerge),
 	}
 }
 

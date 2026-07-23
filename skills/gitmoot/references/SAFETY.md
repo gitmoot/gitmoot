@@ -33,6 +33,23 @@ follow-up.) When an
 then **abstains** from its native merge gate — fail-closed, meaning it never
 merges gatelessly; the external gate makes the call.
 
+### Native merge requires opt-in (#1114)
+
+Gitmoot leaves native task PRs open by default. Set `auto_merge = true` only for
+repositories where the operator explicitly wants the daemon to issue the GitHub
+merge after its normal review and CI gate. It may be set globally or per repo:
+
+```toml
+[repos."owner/repo".merge_gate]
+auto_merge = true
+```
+
+With the default `false`, the task becomes `awaiting_human_merge`; this is not a
+quality block and is not stale-task reaped. A human GitHub merge is reconciled
+normally, while `@gitmoot merge` is an explicit authorized merge request. Turning
+`auto_merge` on re-arms only tasks parked for this exact disabled-policy reason.
+Pipeline `allow_auto_merge` remains a separate double-keyed mechanism.
+
 ### No external CI: grace window, not instant pass (#596)
 
 When a PR head reports **zero** external commit-statuses **and** zero check-runs,

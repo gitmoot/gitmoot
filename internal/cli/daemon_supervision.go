@@ -860,6 +860,7 @@ type registeredRepoPoller struct {
 	WatchIssues            bool
 	EscalationTTL          time.Duration
 	RevertDetectionEnabled bool
+	AutoMergeEnabled       func(repo string) bool
 	CheckoutLocks          *repoCheckoutLocks
 	// Inflight is the supervisor's in-flight job tracker (#562). A repo with
 	// dispatched jobs still running gets the recovery-command-only poll: a full
@@ -896,6 +897,7 @@ func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdo
 		Stdout:                 stdout,
 		EscalationTTL:          resolveEscalationTTL(rawHome),
 		RevertDetectionEnabled: resolveRevertDetectionEnabled(rawHome),
+		AutoMergeEnabled:       autoMergeEnabledResolver(rawHome),
 		IdleGraceTicks:         config.DefaultDaemonIdleGraceTicks,
 		IdleMaxMultiplier:      config.DefaultDaemonIdleMaxMultiplier,
 		GitHubClient:           func(checkout string) github.Client { return github.NewClient(checkout) },
@@ -1139,6 +1141,7 @@ func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, 
 		WatchIssues:            p.WatchIssues,
 		EscalationTTL:          p.EscalationTTL,
 		RevertDetectionEnabled: p.RevertDetectionEnabled,
+		AutoMergeEnabled:       p.AutoMergeEnabled,
 	}
 	// Bound the poll the same way the single-repo supervisor does (#555 / #536):
 	// this call runs while HOLDING the per-repo checkout lock (deferred Unlock

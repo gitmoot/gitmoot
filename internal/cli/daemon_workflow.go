@@ -589,6 +589,15 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 			Reason: "native Gitmoot merge gate disabled by GITMOOT_DISABLE_NATIVE_MERGE_GATE; use external gate",
 		}, nil
 	}
+	// Resolve the default-safe policy before looking up a checkout or active jobs.
+	// The actual leave-open decision remains inside PolicyMergeGate.Evaluate, whose
+	// early return guarantees no GitHub/client side effects. A config flip races
+	// safely: a false observed here waits for the next poll, while a false observed
+	// again by the fully built gate below still parks before any merge operation.
+	policy, ok := resolvedMergeGatePolicy(g.Home, request.Repo)
+	if (!ok || !policy.AutoMerge) && !request.HumanMergeRequested {
+		return (workflow.PolicyMergeGate{}).Evaluate(ctx, request)
+	}
 	checkout, err := mergeGateCheckout(ctx, g.Store, request.Repo, g.FallbackCheckout)
 	if err != nil {
 		return workflow.MergeDecision{}, err

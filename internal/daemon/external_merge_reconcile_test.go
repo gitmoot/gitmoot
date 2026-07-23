@@ -17,6 +17,7 @@ func TestPollOnceReconcilesExternallyMergedLifecycleTasks(t *testing.T) {
 		workflow.TaskReviewing,
 		workflow.TaskChangesRequested,
 		workflow.TaskReadyToMerge,
+		workflow.TaskAwaitingHumanMerge,
 		workflow.TaskBlocked,
 	}
 	for _, state := range states {
@@ -93,6 +94,7 @@ func TestExternalMergeCandidateState(t *testing.T) {
 		{workflow.TaskReviewing, true},
 		{workflow.TaskChangesRequested, true},
 		{workflow.TaskReadyToMerge, true},
+		{workflow.TaskAwaitingHumanMerge, true},
 		{workflow.TaskBlocked, true},
 		{workflow.TaskAwaitingHuman, false},
 		{workflow.TaskPlanned, false},

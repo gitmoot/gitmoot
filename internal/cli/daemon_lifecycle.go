@@ -368,14 +368,16 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		}
 		checkout := repoRecord.CheckoutPath
 		gh := github.NewClient(checkout)
-		mergeGate := newDaemonPolicyMergeGate(store, gh, checkout)
-		applyMergeGatePolicy(&mergeGate, *home, repo.FullName())
+		resolvedHome := config.PathsForHome(*home).Home
 		engine := workflow.Engine{
 			Store:                 store,
-			RequireWorkflowPolicy: requireWorkflowPolicyResolverRoot(config.PathsForHome(*home).Home),
-			OrgPolicy:             orgPolicyResolverRoot(config.PathsForHome(*home).Home),
+			RequireWorkflowPolicy: requireWorkflowPolicyResolverRoot(resolvedHome),
+			OrgPolicy:             orgPolicyResolverRoot(resolvedHome),
 			ProduceCheckDir:       checkout,
-			MergeGate:             mergeGate,
+			// Resolve [merge_gate] inside daemonMergeGate for every evaluation so a
+			// live auto_merge flip both re-arms parked tasks and changes their next
+			// gate decision without a daemon restart.
+			MergeGate: daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout, Home: resolvedHome},
 			// Registry default model/effort fallbacks, home-aware and fail-open — see
 			// daemonWorkflowEngine. Empty by default => byte-identical.
 			RuntimeDefaultModel:  runtimeDefaultModelResolver(*home),
@@ -401,6 +403,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 			WatchIssues:            *watchIssues,
 			EscalationTTL:          resolveEscalationTTL(*home),
 			RevertDetectionEnabled: resolveRevertDetectionEnabled(*home),
+			AutoMergeEnabled:       autoMergeEnabledResolver(*home),
 		}, store, live, session, stdout)
 	})
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

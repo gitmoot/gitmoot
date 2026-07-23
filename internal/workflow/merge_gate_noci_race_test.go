@@ -87,7 +87,7 @@ func TestPolicyMergeGateNoCIRaceDefersThenRequiresLateCheck(t *testing.T) {
 	store := openEngineStore(t)
 	gh := setupApprovedNoCIPR(t, store, "d342f97")
 	clock := &fakeClock{now: time.Date(2026, 7, 1, 22, 23, 32, 0, time.UTC)}
-	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir(), MinCIWait: time.Minute, Clock: clock.Now}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir(), MinCIWait: time.Minute, Clock: clock.Now}
 
 	// Evaluation 1: zero external CI in the Actions lag window -> defer, do NOT
 	// stamp gitmoot/ci, do NOT merge.
@@ -154,7 +154,7 @@ func TestPolicyMergeGateNoCIMergesAfterGraceWindow(t *testing.T) {
 	store := openEngineStore(t)
 	gh := setupApprovedNoCIPR(t, store, "cico001")
 	clock := &fakeClock{now: time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)}
-	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir(), MinCIWait: time.Minute, Clock: clock.Now}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir(), MinCIWait: time.Minute, Clock: clock.Now}
 
 	d1, err := gate.Evaluate(ctx, noCIRequest())
 	if err != nil {
@@ -193,7 +193,7 @@ func TestPolicyMergeGateNoCIObservationResetsOnNewHead(t *testing.T) {
 	store := openEngineStore(t)
 	gh := setupApprovedNoCIPR(t, store, "headAAA")
 	clock := &fakeClock{now: time.Date(2026, 7, 1, 9, 0, 0, 0, time.UTC)}
-	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir(), MinCIWait: time.Minute, Clock: clock.Now}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir(), MinCIWait: time.Minute, Clock: clock.Now}
 
 	if _, err := gate.Evaluate(ctx, noCIRequest()); err != nil {
 		t.Fatalf("evaluation 1 returned error: %v", err)
@@ -252,7 +252,7 @@ func TestPolicyMergeGateWorkflowAwarenessBoundsPendingThenConcludes(t *testing.T
 	base := setupApprovedNoCIPR(t, store, "wfhead1")
 	gh := &workflowAwareFakeGitHub{fakeMergeGateGitHub: base, workflowsExist: true}
 	clock := &fakeClock{now: time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)}
-	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir(), MinCIWait: time.Minute, MaxCIWait: 10 * time.Minute, Clock: clock.Now}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir(), MinCIWait: time.Minute, MaxCIWait: 10 * time.Minute, Clock: clock.Now}
 
 	// Within the MaxCIWait bound: stay pending on the workflow-awareness reason and
 	// never stamp gitmoot/ci, even well past the (shorter) grace window.
@@ -302,7 +302,7 @@ func TestPolicyMergeGateWorkflowAwarenessRequireExternalCIBlocksAfterBound(t *te
 	base := setupApprovedNoCIPR(t, store, "wfreq01")
 	gh := &workflowAwareFakeGitHub{fakeMergeGateGitHub: base, workflowsExist: true}
 	clock := &fakeClock{now: time.Date(2026, 7, 1, 6, 0, 0, 0, time.UTC)}
-	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir(), MinCIWait: time.Minute, MaxCIWait: 10 * time.Minute, RequireExternalCI: true, Clock: clock.Now}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir(), MinCIWait: time.Minute, MaxCIWait: 10 * time.Minute, RequireExternalCI: true, Clock: clock.Now}
 
 	// Inside the bound: pending (waiting for CI), NOT a hard block during the race.
 	d1, err := gate.Evaluate(ctx, noCIRequest())
@@ -345,7 +345,7 @@ func TestPolicyMergeGateWorkflowReadErrorFailsSafeToGrace(t *testing.T) {
 	base := setupApprovedNoCIPR(t, store, "wferr01")
 	gh := &workflowAwareFakeGitHub{fakeMergeGateGitHub: base, workflowsErr: errors.New("HTTP 500")}
 	clock := &fakeClock{now: time.Date(2026, 7, 1, 7, 0, 0, 0, time.UTC)}
-	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir(), MinCIWait: time.Minute, Clock: clock.Now}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir(), MinCIWait: time.Minute, Clock: clock.Now}
 
 	d1, err := gate.Evaluate(ctx, noCIRequest())
 	if err != nil {
@@ -378,7 +378,7 @@ func TestPolicyMergeGateRequireExternalCIWaitsThenHardBlocks(t *testing.T) {
 	store := openEngineStore(t)
 	gh := setupApprovedNoCIPR(t, store, "reqci01")
 	clock := &fakeClock{now: time.Date(2026, 7, 1, 5, 0, 0, 0, time.UTC)}
-	gate := PolicyMergeGate{Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir(), MinCIWait: time.Minute, RequireExternalCI: true, Clock: clock.Now}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir(), MinCIWait: time.Minute, RequireExternalCI: true, Clock: clock.Now}
 
 	// Evaluation 1 (inside the grace window): pending, NOT a hard block — this is the
 	// creation-lag race window #596 targets. No gitmoot/ci stamp, no merge.

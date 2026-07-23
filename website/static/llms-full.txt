@@ -1153,7 +1153,10 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
 8. Let the PR converge.
 
    Agents review, request fixes, and rerun work through comments and job output.
-   When required reviews are approved and the branch is ready, the merge gate
+   When required reviews are approved and the branch is ready, Gitmoot leaves the
+   PR open for a human merge by default. Set `[merge_gate] auto_merge = true`
+   globally or under `[repos."owner/repo".merge_gate]` to opt the repository into
+   daemon merges. With that explicit opt-in, the merge gate
    checks the current PR head, local worktree cleanliness, branch freshness,
    Gitmoot statuses, external CI if present, and mergeability. Final merge work
    is serialized per repository base branch. Before the policy gate can issue
@@ -1182,7 +1185,8 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
 
 9. Merge and continue.
 
-   By default Gitmoot merges with a squash merge guarded by the current head SHA.
+   A human GitHub merge is reconciled automatically. With `auto_merge = true`,
+   Gitmoot instead merges with a squash merge guarded by the current head SHA.
    After merge it records the merged commit, releases the branch lock, removes
    the task worktree when one is recorded, updates the local base branch, and can
    enqueue the next task once the task queueing policy selects it. If worktree
@@ -2406,6 +2410,10 @@ Fixes:
   `gitmoot task list` / `gitmoot job events <job-id>`. Resolve the conflict
   manually or run an explicit implement/fix job, then rerun review/merge.
 - Fix failing external CI or Gitmoot statuses.
+- If the task is `awaiting_human_merge`, Gitmoot intentionally left the PR open
+  because `[merge_gate] auto_merge` defaults to `false`. Merge it in GitHub, use
+  an authorized `@gitmoot merge` comment, or opt that repository in with
+  `[repos."owner/repo".merge_gate] auto_merge = true`.
 - If the reason reads `waiting to confirm no external CI` (or `waiting … for CI
   to be created`), the gate saw **zero** external commit-statuses and check-runs
   at the head and is deferring rather than merging before GitHub Actions creates
@@ -11446,6 +11454,11 @@ disables it (a negative value is rejected). Unlike `[orchestrate].escalation_ttl
 (which auto-finalizes a whole paused delegation *tree* and is on by default, 24h),
 `blocked_ttl` dismisses a *single* blocked job and is off by default.
 
+Native task PRs are left open by default. Opt a repository into daemon merges
+with `[repos."owner/repo".merge_gate] auto_merge = true`; otherwise the task is
+shown as `awaiting_human_merge` until a human merges it or sends an authorized
+`@gitmoot merge` command. Pipeline `allow_auto_merge` is independent.
+
 Merge-gate retries are automatic while the daemon is running. Retryable states,
 such as a busy base-branch merge queue or a GitHub branch update in progress,
 are retried on the next daemon poll tick. The default poll interval is `30s`
@@ -14976,6 +14989,23 @@ follow-up.) When an
 `GITMOOT_DISABLE_NATIVE_MERGE_GATE=1` (also `true`/`yes`/`on`; #545): Gitmoot
 then **abstains** from its native merge gate — fail-closed, meaning it never
 merges gatelessly; the external gate makes the call.
+
+### Native merge requires opt-in (#1114)
+
+Gitmoot leaves native task PRs open by default. Set `auto_merge = true` only for
+repositories where the operator explicitly wants the daemon to issue the GitHub
+merge after its normal review and CI gate. It may be set globally or per repo:
+
+```toml
+[repos."owner/repo".merge_gate]
+auto_merge = true
+```
+
+With the default `false`, the task becomes `awaiting_human_merge`; this is not a
+quality block and is not stale-task reaped. A human GitHub merge is reconciled
+normally, while `@gitmoot merge` is an explicit authorized merge request. Turning
+`auto_merge` on re-arms only tasks parked for this exact disabled-policy reason.
+Pipeline `allow_auto_merge` remains a separate double-keyed mechanism.
 
 ### No external CI: grace window, not instant pass (#596)
 

@@ -71,6 +71,10 @@ type Daemon struct {
 	// Default false is a CHEAP SHORT-CIRCUIT: PollOnce parses NO PR body and fires
 	// nothing, so the off path is byte-identical (no new GitHub reads, no new work).
 	RevertDetectionEnabled bool
+	// AutoMergeEnabled resolves the current native auto_merge policy for this
+	// repository. When it turns on, only tasks parked by the auto-merge-disabled
+	// leave-open reason are re-armed. Nil preserves direct daemon users' behavior.
+	AutoMergeEnabled func(repo string) bool
 }
 
 // RemoteBranchChecker returns the subset of exact branch names present on
@@ -110,6 +114,9 @@ func (d Daemon) Run(ctx context.Context) error {
 
 func (d Daemon) PollOnce(ctx context.Context) error {
 	if err := d.validate(); err != nil {
+		return err
+	}
+	if err := d.rearmAutoMergeDisabledTasks(ctx); err != nil {
 		return err
 	}
 
@@ -578,7 +585,7 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 
 func externalMergeCandidateState(state string) bool {
 	switch workflow.TaskState(strings.TrimSpace(state)) {
-	case workflow.TaskPullRequestOpen, workflow.TaskReviewing, workflow.TaskChangesRequested, workflow.TaskReadyToMerge, workflow.TaskBlocked:
+	case workflow.TaskPullRequestOpen, workflow.TaskReviewing, workflow.TaskChangesRequested, workflow.TaskReadyToMerge, workflow.TaskAwaitingHumanMerge, workflow.TaskBlocked:
 		return true
 	default:
 		return false
@@ -1166,6 +1173,7 @@ func (d Daemon) reconcileClosedReviewingTasks(ctx context.Context, openBranches 
 		workflow.TaskPullRequestOpen,
 		workflow.TaskReviewing,
 		workflow.TaskChangesRequested,
+		workflow.TaskAwaitingHumanMerge,
 	} {
 		stateTasks, err := d.Store.ListTasksByRepoState(ctx, d.Repo.FullName(), string(state))
 		if err != nil {
@@ -1888,8 +1896,8 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 	if task.State == string(workflow.TaskMerged) {
 		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot merged PR #%d.", pull.Number))
 	}
-	if task.State != string(workflow.TaskReadyToMerge) {
-		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot cannot merge PR #%d because task `%s` is `%s`, not `%s`.", pull.Number, task.ID, task.State, workflow.TaskReadyToMerge))
+	if task.State != string(workflow.TaskReadyToMerge) && task.State != string(workflow.TaskAwaitingHumanMerge) {
+		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot cannot merge PR #%d because task `%s` is `%s`, not `%s` or `%s`.", pull.Number, task.ID, task.State, workflow.TaskReadyToMerge, workflow.TaskAwaitingHumanMerge))
 	}
 	leadAgent := "github"
 	lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), pull.HeadRef)
@@ -1908,16 +1916,17 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 		return err
 	}
 	err = d.Workflow.HandlePullRequestReadyToMerge(ctx, workflow.PullRequestEvent{
-		Repo:              d.Repo.FullName(),
-		Branch:            firstNonEmpty(task.Branch, pull.HeadRef),
-		PullRequest:       int(pull.Number),
-		HeadSHA:           pull.HeadSHA,
-		GoalID:            task.GoalID,
-		TaskID:            task.ID,
-		TaskTitle:         task.Title,
-		LeadAgent:         leadAgent,
-		Sender:            comment.Author,
-		RequiredReviewers: reviewers,
+		Repo:                d.Repo.FullName(),
+		Branch:              firstNonEmpty(task.Branch, pull.HeadRef),
+		PullRequest:         int(pull.Number),
+		HeadSHA:             pull.HeadSHA,
+		GoalID:              task.GoalID,
+		TaskID:              task.ID,
+		TaskTitle:           task.Title,
+		LeadAgent:           leadAgent,
+		Sender:              comment.Author,
+		RequiredReviewers:   reviewers,
+		HumanMergeRequested: true,
 	})
 	if err != nil {
 		var blocked workflow.BlockedError

@@ -108,6 +108,8 @@ func dashboardTaskState(state string) (stateName, blockedReason string, ok bool)
 		return "blocked", "Task is blocked", true
 	case "awaiting_human":
 		return "blocked", "Awaiting human input", true
+	case "awaiting_human_merge":
+		return "blocked", "Awaiting human merge", true
 	case "merged":
 		return "merged", "", true
 	default:

@@ -15,7 +15,9 @@ import (
 // as the canonical merge path (PolicyMergeGate.finishMerged) does — otherwise the
 // lock is stranded (held forever) and the worktree leaks on disk. The
 // closed-unmerged (`blocked`) branch must NOT clean up, since a blocked task
-// intentionally keeps its worktree/lock for human resumption.
+// intentionally keeps its worktree/lock for human resumption. A task parked for
+// a human merge is the exception: closing that PR unmerged preserves its
+// worktree, but releases the lock so the abandoned PR cannot strand it.
 //
 // It runs from both `reviewing` and `blocked` start states (#953): a blocked
 // task whose branch merged externally is the exact live incident that motivated
@@ -48,7 +50,7 @@ func TestHandleReviewPullRequestClosedMergedReleasesLockAndWorktree(t *testing.T
 			wantPathEmpty: true,
 		},
 		{
-			name:          "closed unmerged keeps lock and worktree for human",
+			name:          "closed unmerged preserves worktree for human",
 			merged:        false,
 			wantTask:      TaskBlocked,
 			wantPRState:   "closed",
@@ -58,7 +60,7 @@ func TestHandleReviewPullRequestClosedMergedReleasesLockAndWorktree(t *testing.T
 		},
 	}
 
-	for _, startState := range []TaskState{TaskReviewing, TaskBlocked} {
+	for _, startState := range []TaskState{TaskReviewing, TaskAwaitingHumanMerge, TaskBlocked} {
 		for _, tc := range cases {
 			t.Run(string(startState)+"/"+tc.name, func(t *testing.T) {
 				ctx := context.Background()
@@ -121,9 +123,9 @@ func TestHandleReviewPullRequestClosedMergedReleasesLockAndWorktree(t *testing.T
 					t.Fatalf("GetPullRequest returned error: %v", err)
 				}
 				// blocked + closed-unmerged is a complete no-op: the handler returns
-				// early before touching the PR mirror, so it stays "open". Only the
-				// reviewing start state runs the closed-unmerged transition that also
-				// marks the PR "closed".
+				// early before touching the PR mirror, so it stays "open". A parked
+				// awaiting_human_merge task instead resolves to blocked and marks the
+				// PR closed, so a human-abandoned merge cannot stay parked forever.
 				wantPRState := tc.wantPRState
 				if !tc.merged && startState == TaskBlocked {
 					wantPRState = "open"
@@ -137,7 +139,11 @@ func TestHandleReviewPullRequestClosedMergedReleasesLockAndWorktree(t *testing.T
 				}
 				_, lockErr := store.GetBranchLock(ctx, repo, branch)
 				lockGone := errors.Is(lockErr, sql.ErrNoRows)
-				if lockGone != tc.wantLockGone {
+				if !tc.merged && startState == TaskAwaitingHumanMerge {
+					if !lockGone {
+						t.Fatalf("parked closed-unmerged task kept branch lock: %v", lockErr)
+					}
+				} else if lockGone != tc.wantLockGone {
 					t.Fatalf("branch lock gone = %v (err=%v), want %v", lockGone, lockErr, tc.wantLockGone)
 				}
 			})
@@ -151,6 +157,7 @@ func TestHandleReviewPullRequestClosedMergedLifecycleStates(t *testing.T) {
 		TaskReviewing,
 		TaskChangesRequested,
 		TaskReadyToMerge,
+		TaskAwaitingHumanMerge,
 		TaskBlocked,
 	}
 	for _, state := range states {
@@ -210,6 +217,7 @@ func TestHandleReviewPullRequestClosedUnmergedLifecycleStates(t *testing.T) {
 		{state: TaskPullRequestOpen, want: TaskBlocked, wantPRState: "closed", wantEvent: true},
 		{state: TaskReviewing, want: TaskBlocked, wantPRState: "closed", wantEvent: true},
 		{state: TaskChangesRequested, want: TaskBlocked, wantPRState: "closed", wantEvent: true},
+		{state: TaskAwaitingHumanMerge, want: TaskBlocked, wantPRState: "closed", wantEvent: true},
 		{state: TaskReadyToMerge, want: TaskReadyToMerge, wantPRState: "open"},
 		{state: TaskBlocked, want: TaskBlocked, wantPRState: "open"},
 	}

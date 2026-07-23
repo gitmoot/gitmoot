@@ -68,17 +68,17 @@ func (e Engine) dispatchFix(ctx context.Context, reviewer string, payload JobPay
 		return err
 	}
 	request := JobRequest{
-		PolicyExempt: "exempt",
-		Agent:        leadAgent,
-		Action:       "implement",
-		Repo:         payload.Repo,
-		Branch:       payload.Branch,
-		PullRequest:  payload.PullRequest,
-		HeadSHA:      payload.HeadSHA,
-		GoalID:       payload.GoalID,
-		TaskID:       payload.TaskID,
-		TaskTitle:    payload.TaskTitle,
-		LeadAgent:    leadAgent,
+		PolicyExempt:  "exempt",
+		Agent:         leadAgent,
+		Action:        "implement",
+		Repo:          payload.Repo,
+		Branch:        payload.Branch,
+		PullRequest:   payload.PullRequest,
+		HeadSHA:       payload.HeadSHA,
+		GoalID:        payload.GoalID,
+		TaskID:        payload.TaskID,
+		TaskTitle:     payload.TaskTitle,
+		LeadAgent:     leadAgent,
 		Reviewers:     e.requiredReviewers(payload),
 		ReviewRound:   payload.ReviewRound,
 		Sender:        reviewer,
@@ -463,6 +463,10 @@ func (e Engine) ensureBranchLock(ctx context.Context, repo string, branch string
 }
 
 func (e Engine) runMergeGate(ctx context.Context, reviewer string, payload JobPayload, ref taskRef) (MergeDecision, error) {
+	return e.runMergeGateWithHumanMerge(ctx, reviewer, payload, ref, false)
+}
+
+func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string, payload JobPayload, ref taskRef, humanMergeRequested bool) (MergeDecision, error) {
 	if e.MergeGate == nil {
 		return MergeDecision{Ready: true}, e.setTaskState(ctx, ref, TaskReadyToMerge)
 	}
@@ -471,16 +475,24 @@ func (e Engine) runMergeGate(ctx context.Context, reviewer string, payload JobPa
 		return MergeDecision{}, err
 	}
 	decision, err := e.MergeGate.Evaluate(ctx, MergeRequest{
-		Repo:           payload.Repo,
-		Branch:         payload.Branch,
-		PullRequest:    payload.PullRequest,
-		HeadSHA:        payload.HeadSHA,
-		TaskID:         payload.TaskID,
-		Reviewer:       reviewer,
-		ReviewOptional: !reviewRequired,
+		Repo:                payload.Repo,
+		Branch:              payload.Branch,
+		PullRequest:         payload.PullRequest,
+		HeadSHA:             payload.HeadSHA,
+		TaskID:              payload.TaskID,
+		Reviewer:            reviewer,
+		ReviewOptional:      !reviewRequired,
+		HumanMergeRequested: humanMergeRequested,
 	})
 	if err != nil {
 		return MergeDecision{}, err
+	}
+	if decision.LeaveOpen {
+		reason := strings.TrimSpace(decision.Reason)
+		if reason == "" {
+			reason = "merge requires a human action"
+		}
+		return decision, e.parkTaskAwaitingHumanMerge(ctx, ref, reason)
 	}
 	if !decision.Ready {
 		if decision.Deferred {
@@ -598,6 +610,27 @@ func (e Engine) runMergeGate(ctx context.Context, reviewer string, payload JobPa
 		return decision, nil
 	}
 	return decision, e.setTaskState(ctx, ref, TaskReadyToMerge)
+}
+
+func (e Engine) parkTaskAwaitingHumanMerge(ctx context.Context, ref taskRef, reason string) error {
+	if strings.TrimSpace(ref.ID) == "" {
+		return e.setTaskState(ctx, ref, TaskAwaitingHumanMerge)
+	}
+	changed, current, err := e.Store.TransitionTaskStateWithEvent(ctx, ref.ID,
+		[]string{
+			string(TaskPullRequestOpen), string(TaskReviewing),
+			string(TaskChangesRequested), string(TaskReadyToMerge),
+		},
+		string(TaskAwaitingHumanMerge), "task_awaiting_human_merge", reason)
+	if err != nil {
+		return err
+	}
+	if changed || current == string(TaskAwaitingHumanMerge) {
+		return nil
+	}
+	// A concurrent lifecycle move won the CAS. Preserve it rather than rewriting
+	// a merged, dismissed, or newly reviewed task from a stale gate result.
+	return nil
 }
 
 // reviewCrossFamilyForMergeGate runs the cross-family review leg for a just-merged

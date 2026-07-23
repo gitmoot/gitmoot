@@ -11,7 +11,12 @@ const (
 	TaskReadyToMerge     TaskState = "ready_to_merge"
 	TaskMerged           TaskState = "merged"
 	TaskBlocked          TaskState = "blocked"
-	TaskDismissed        TaskState = "dismissed"
+	// TaskAwaitingHumanMerge parks an otherwise-ready pull request for a human
+	// merge. It is intentionally distinct from TaskBlocked and TaskAwaitingHuman:
+	// it is neither a quality failure nor a delegation pause, and it must not be
+	// auto-reaped while the pull request remains open.
+	TaskAwaitingHumanMerge TaskState = "awaiting_human_merge"
+	TaskDismissed          TaskState = "dismissed"
 	// TaskAwaitingHuman is the resumable pause state a task enters when a
 	// delegation fails under the escalate_human failure_policy (#340). Unlike
 	// TaskBlocked (terminal), it is a durable human-in-the-loop pause: the tree

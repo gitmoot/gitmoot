@@ -44,7 +44,9 @@ type PipelineAutoMergeResult struct {
 
 // PipelineAutoMerger adapts the existing policy merge-gate checks and the shared
 // low-level merge call for the jobless pipeline gate. Review approval is checked
-// by the pipeline advancer before this type is invoked.
+// by the pipeline advancer before this type is invoked. It deliberately does not
+// call PolicyMergeGate.Evaluate, so native merge_gate.auto_merge does not affect
+// the pipeline's separate allow_auto_merge policy.
 type PipelineAutoMerger struct {
 	Store             *db.Store
 	GitHub            MergeGateGitHub

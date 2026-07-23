@@ -520,7 +520,10 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
 8. Let the PR converge.
 
    Agents review, request fixes, and rerun work through comments and job output.
-   When required reviews are approved and the branch is ready, the merge gate
+   When required reviews are approved and the branch is ready, Gitmoot leaves the
+   PR open for a human merge by default. Set `[merge_gate] auto_merge = true`
+   globally or under `[repos."owner/repo".merge_gate]` to opt the repository into
+   daemon merges. With that explicit opt-in, the merge gate
    checks the current PR head, local worktree cleanliness, branch freshness,
    Gitmoot statuses, external CI if present, and mergeability. Final merge work
    is serialized per repository base branch. Before the policy gate can issue
@@ -549,7 +552,8 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
 
 9. Merge and continue.
 
-   By default Gitmoot merges with a squash merge guarded by the current head SHA.
+   A human GitHub merge is reconciled automatically. With `auto_merge = true`,
+   Gitmoot instead merges with a squash merge guarded by the current head SHA.
    After merge it records the merged commit, releases the branch lock, removes
    the task worktree when one is recorded, updates the local base branch, and can
    enqueue the next task once the task queueing policy selects it. If worktree
