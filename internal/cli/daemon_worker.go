@@ -1652,6 +1652,17 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
 		return nil
 	}
+	// Shared tool-cache grant (#1113 lever 1): mirrors the primary worker path so
+	// runtime-session contention rerouting through the temp worker doesn't
+	// silently lose the cache redirect. Fail-open (disk hygiene, not security).
+	var tempToolCacheEnv []string
+	if cachePaths, cacheErr := w.configPaths(); cacheErr != nil {
+		writeLine(w.Stdout, "job %s tool cache config load failed: %v", delegatedJob.ID, cacheErr)
+	} else if env, grantErr := applyIsolatedToolCacheGrants(cachePaths, payload, &started.Agent); grantErr != nil {
+		writeLine(w.Stdout, "job %s tool cache grant failed: %v", delegatedJob.ID, grantErr)
+	} else {
+		tempToolCacheEnv = env
+	}
 	adapter, err = wrapProduceSandboxAdapter(delegatedJob.Type, started.Agent, adapter)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, delegatedJob.ID, workflow.JobFailed, err); finishErr != nil {
@@ -1659,6 +1670,13 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		}
 		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
 		return nil
+	}
+	if len(tempToolCacheEnv) > 0 {
+		if envAdapter, envErr := injectDeliveryAdapterEnv(adapter, tempToolCacheEnv); envErr != nil {
+			writeLine(w.Stdout, "job %s tool cache env inject failed: %v", delegatedJob.ID, envErr)
+		} else {
+			adapter = envAdapter
+		}
 	}
 	adapter = pipeline.WrapPipelineEnvDeliveryAdapter(w.Store, w.ConfigHome, payload, adapter)
 	// Temp-session delivery is a separate early-return path; attach the same

@@ -43,11 +43,27 @@ var toolCacheEnvSubdirs = []struct{ env, subdir string }{
 // widening WritablePaths for them is a harmless no-op — nothing reads it — and
 // the env vars alone suffice to redirect their cache.
 //
+// codex only honors WritablePaths under the workspace-write autonomy policy
+// (codexSandboxArgs' --add-dir loop; read-only mode grants nothing). Pointing
+// UV_CACHE_DIR/GOCACHE/etc. at the shared dir for a read-only codex job would
+// redirect tools to a directory their sandbox cannot write, breaking Go builds
+// and degrading uv/pip/npm — worse than leaving the env unset. So a read-only
+// (or unrecognized) codex autonomy policy is a no-op here; danger-full-access
+// is unrestricted and proceeds like any other job.
+//
 // Errors here are the caller's to treat as fail-open: this is disk hygiene, not
 // a security precondition, and must never fail a job.
 func applyIsolatedToolCacheGrants(paths config.Paths, payload workflow.JobPayload, agent *runtime.Agent) ([]string, error) {
 	if strings.TrimSpace(payload.WorktreePath) == "" {
 		return nil, nil
+	}
+	if agent.Runtime == runtime.CodexRuntime && !agent.ChatSeat {
+		switch runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
+		case runtime.AutonomyPolicyWorkspaceWrite, runtime.AutonomyPolicyDangerFullAccess:
+			// proceeds below
+		default:
+			return nil, nil
+		}
 	}
 	policy, err := config.LoadToolCache(paths)
 	if err != nil {

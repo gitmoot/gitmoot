@@ -12,6 +12,48 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
+// TestApplyIsolatedToolCacheGrantsCodexAutonomyGate pins the #1113 finder
+// finding: codex only honors WritablePaths under workspace-write, so a
+// read-only (or unrecognized) codex job must get neither the grant nor the env
+// -- pointing its tools at an unwritable shared dir would be worse than doing
+// nothing. workspace-write and danger-full-access proceed; a ChatSeat always
+// proceeds regardless of policy (codex grants it workspace-write unconditionally).
+func TestApplyIsolatedToolCacheGrantsCodexAutonomyGate(t *testing.T) {
+	tests := []struct {
+		name     string
+		policy   string
+		chatSeat bool
+		wantNoop bool
+	}{
+		{name: "read-only skipped", policy: runtime.AutonomyPolicyReadOnly, wantNoop: true},
+		{name: "unrecognized policy skipped", policy: "bogus", wantNoop: true},
+		{name: "empty policy skipped", policy: "", wantNoop: true},
+		{name: "workspace-write proceeds", policy: runtime.AutonomyPolicyWorkspaceWrite, wantNoop: false},
+		{name: "danger-full-access proceeds", policy: runtime.AutonomyPolicyDangerFullAccess, wantNoop: false},
+		{name: "chat seat proceeds despite read-only policy", policy: runtime.AutonomyPolicyReadOnly, chatSeat: true, wantNoop: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			paths := config.PathsForHome(t.TempDir())
+			agent := runtime.Agent{Runtime: runtime.CodexRuntime, AutonomyPolicy: test.policy, ChatSeat: test.chatSeat}
+			payload := workflow.JobPayload{WorktreePath: filepath.Join(paths.Home, "worktrees", "w1")}
+			env, err := applyIsolatedToolCacheGrants(paths, payload, &agent)
+			if err != nil {
+				t.Fatalf("applyIsolatedToolCacheGrants: %v", err)
+			}
+			if test.wantNoop {
+				if len(env) != 0 || len(agent.WritablePaths) != 0 {
+					t.Fatalf("policy %q chatSeat=%v must be a no-op: env=%v writable=%v", test.policy, test.chatSeat, env, agent.WritablePaths)
+				}
+				return
+			}
+			if len(env) != len(toolCacheEnvSubdirs) || len(agent.WritablePaths) != 1 {
+				t.Fatalf("policy %q chatSeat=%v must grant: env=%v writable=%v", test.policy, test.chatSeat, env, agent.WritablePaths)
+			}
+		})
+	}
+}
+
 func TestApplyIsolatedToolCacheGrantsNonIsolatedNoop(t *testing.T) {
 	paths := config.PathsForHome(t.TempDir())
 	agent := runtime.Agent{}
