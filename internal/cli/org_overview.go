@@ -15,6 +15,8 @@ import (
 
 type orgLiveSource func(ctx context.Context, cfg config.OrgConfig) (states map[string]org.RoleLiveState, observedAt time.Time, providerVersion string, err error)
 
+const storeOrgLivePresenceMaxAge = 5 * time.Minute
+
 type orgSharedState struct {
 	Config          config.OrgConfig
 	Presence        map[string]db.OrgRolePresence
@@ -26,6 +28,8 @@ type orgSharedState struct {
 	jobCountsLoaded bool
 	blockedEpisodes []db.BlockedEpisode
 	blockedLoaded   bool
+	livePresence    map[string]db.RoleLivePresence
+	liveLoaded      bool
 }
 
 type orgLiveSourceError struct {
@@ -86,39 +90,67 @@ func herdrOrgLiveSource(ctx context.Context, cfg config.OrgConfig) (map[string]o
 	return snapshot.States, snapshot.ObservedAt, snapshot.ProviderVersion, err
 }
 
-// storeOrgLiveSource derives live state entirely from persisted Gitmoot data.
-// It does not construct or contact a Herdr provider.
+// storeOrgLiveSource derives live state entirely from the latest persisted
+// Herdr snapshot. It does not construct or contact a Herdr provider.
 func storeOrgLiveSource(shared *orgSharedState) orgLiveSource {
 	return func(ctx context.Context, cfg config.OrgConfig) (map[string]org.RoleLiveState, time.Time, string, error) {
+		presence, err := shared.loadLivePresence(ctx)
+		if err != nil {
+			return nil, time.Time{}, "", err
+		}
+		// Blocked stays sourced from org_blocked_episodes so the node dot cannot
+		// contradict the blocked_since badge, Health.Blocked, or the feed: an
+		// episode persists through a transient absent/unknown snapshot, while the
+		// live-presence row for that role is reaped or ages out of the freshness
+		// window. Working/idle come from the persisted Herdr snapshot.
 		episodes, err := shared.loadBlockedEpisodes(ctx)
 		if err != nil {
 			return nil, time.Time{}, "", err
 		}
-		jobCounts, err := shared.loadJobCounts(ctx)
-		if err != nil {
-			return nil, time.Time{}, "", err
-		}
-		blocked := make(map[string]bool)
+		blocked := make(map[string]bool, len(episodes))
 		for _, episode := range episodes {
 			if strings.HasPrefix(episode.Subject, "role:") {
 				blocked[strings.TrimPrefix(episode.Subject, "role:")] = true
 			}
 		}
+		now := time.Now().UTC()
+		var latest time.Time
 		states := make(map[string]org.RoleLiveState, len(cfg.Roles()))
 		for _, role := range cfg.Roles() {
 			state := org.StateUnknown
-			switch {
-			case blocked[role.Name]:
+			if blocked[role.Name] {
 				state = org.StateBlocked
-			case jobCounts[role.Name]["running"] > 0:
-				state = org.StateWorking
-			case shared.Presence[role.Name].Role != "":
-				state = org.StateIdle
+			} else if row, ok := presence[role.Name]; ok {
+				if observedAt, parsed := parseOrgPresenceTime(row.ObservedAt); parsed && !observedAt.After(now) && now.Sub(observedAt) <= storeOrgLivePresenceMaxAge {
+					switch org.LifecycleState(row.State) {
+					case org.StateWorking, org.StateIdle:
+						state = org.LifecycleState(row.State)
+						if observedAt.After(latest) {
+							latest = observedAt
+						}
+					}
+				}
 			}
 			states[role.Name] = org.RoleLiveState{State: state}
 		}
-		return states, time.Now().UTC(), "store", nil
+		return states, latest, "store", nil
 	}
+}
+
+func (shared *orgSharedState) loadLivePresence(ctx context.Context) (map[string]db.RoleLivePresence, error) {
+	if shared.liveLoaded {
+		return shared.livePresence, nil
+	}
+	rows, err := shared.Store.ListRoleLivePresence(ctx)
+	if err != nil {
+		return nil, err
+	}
+	shared.livePresence = make(map[string]db.RoleLivePresence, len(rows))
+	for _, row := range rows {
+		shared.livePresence[row.Role] = row
+	}
+	shared.liveLoaded = true
+	return shared.livePresence, nil
 }
 
 func (shared *orgSharedState) loadBlockedEpisodes(ctx context.Context) ([]db.BlockedEpisode, error) {

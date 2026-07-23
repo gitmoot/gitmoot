@@ -14,7 +14,7 @@ func TestLoadOrgAndScopeMatching(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	content := "[org]\nenforce = \"block\"\n[org.roles.\"owner\"]\nscope = [\"*\"]\n[org.roles.\"maintainer\"]\nparent = \"owner\"\nscope = [\"Acme/*\", \"other/repo\"]\nmerge_rule = \"self\"\npane = \"w1:p2\"\n"
+	content := "[org]\nenforce = \"block\"\n[org.roles.\"owner\"]\ndisplay_name = \"Owner\"\nscope = [\"*\"]\n[org.roles.\"maintainer\"]\nparent = \"owner\"\nscope = [\"Acme/*\", \"other/repo\"]\nmerge_rule = \"self\"\npane = \"w1:p2\"\n"
 	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -24,6 +24,9 @@ func TestLoadOrgAndScopeMatching(t *testing.T) {
 	}
 	if !cfg.Enabled() || cfg.Enforce() != "block" || len(cfg.Roots()) != 1 || cfg.Roots()[0] != "owner" {
 		t.Fatalf("cfg=%+v roots=%v", cfg, cfg.Roots())
+	}
+	if owner, ok := cfg.Role("owner"); !ok || owner.DisplayName != "Owner" {
+		t.Fatalf("owner=%+v ok=%v", owner, ok)
 	}
 	role, ok := cfg.Role("maintainer")
 	if !ok || role.Scope[0] != "acme/*" || role.Pane != "w1:p2" {

@@ -1004,10 +1004,10 @@ gitmoot org status [--json]
 ```
 
 The registry uses `[org] enforce = "warn"|"block"` and
-`[org.roles."name"]` entries with `parent`, `scope`, `merge_rule`, and an
-optional `pane` Herdr binding. The binding resolves as an exact live pane label
-first, then as a literal pane id; roles without a binding retain exact
-role-name-as-label presence lookup. There is
+`[org.roles."name"]` entries with `parent`, `scope`, `merge_rule`, an optional
+cosmetic `display_name`, and an optional `pane` Herdr binding. The binding
+resolves as an exact live pane label first, then as a literal pane id; roles
+without a binding retain exact role-name-as-label presence lookup. There is
 exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
 `owner/repo`. Malformed org configuration fails closed and loudly. `brief`
 records passive last-seen presence for its role and can render static context
@@ -1028,7 +1028,10 @@ Herdr. Responses are cached for at most 15 seconds; `data_as_of` is the newest
 persisted source timestamp, not the request time. `detection_enabled` is true
 only when `blocked_role_wake_after` is positive and at least one org event rule
 is enabled; otherwise `detection_hint` explains why an empty signal feed is not
-evidence that every role is healthy.
+evidence that every role is healthy. The enabled blocked-role evaluator also
+persists its latest Herdr snapshot for these endpoints. Only observations from
+the last five minutes are rendered as `blocked`, `working`, or `idle`; stale,
+missing, `done`, and `unknown` observations render as `never-seen`.
 
 Session lifecycle (phase 3): `[org] recycle_after = "24h"` (a duration, per-role
 overridable) marks a role recycle-overdue after it has been idle that long,

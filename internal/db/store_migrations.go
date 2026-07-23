@@ -1715,4 +1715,14 @@ CREATE TABLE org_recycle_overdue_episodes (
 	updated_at TEXT NOT NULL
 );
 	`,
+	// #1105 last successful Herdr role snapshot. The daemon writes this only from
+	// the existing blocked-role evaluator tick; dashboard readers remain SQLite-only.
+	`
+CREATE TABLE org_role_live_presence (
+	role TEXT PRIMARY KEY,
+	state TEXT NOT NULL,
+	observed_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+	`,
 }

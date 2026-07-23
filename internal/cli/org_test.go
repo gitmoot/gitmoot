@@ -299,6 +299,7 @@ func setupOrgHome(t *testing.T) (string, config.Paths) {
 [org]
 enforce = "warn"
 [org.roles."owner"]
+display_name = "Owner"
 scope = ["*"]
 merge_rule = "owner"
 [org.roles."review"]

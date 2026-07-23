@@ -213,8 +213,32 @@ func runBlockedRoleWakeOnce(ctx context.Context, store *db.Store, home string, s
 		writeLine(stdout, "blocked_since role snapshot skipped: observed_at is zero")
 		return
 	}
+	persistOrgRoleLivePresence(ctx, store, snapshot, stdout)
 	if err := evaluateBlockedRoleEpisodes(ctx, store, sink, snapshot, wakeAfter, stdout, now.UTC()); err != nil {
 		writeLine(stdout, "blocked_since role evaluation failed: %v", err)
+	}
+}
+
+func persistOrgRoleLivePresence(ctx context.Context, store *db.Store, snapshot org.Snapshot, stdout io.Writer) {
+	roles := make([]string, 0, len(snapshot.States))
+	persistedAll := true
+	for role, live := range snapshot.States {
+		role = strings.TrimSpace(role)
+		if role == "" {
+			continue
+		}
+		if err := store.UpsertRoleLivePresence(ctx, role, string(live.State), snapshot.ObservedAt); err != nil {
+			writeLine(stdout, "blocked_since role live presence persist failed for %s: %v", role, err)
+			persistedAll = false
+			continue
+		}
+		roles = append(roles, role)
+	}
+	// Do not prune a previously complete snapshot after a partial write failure.
+	if persistedAll {
+		if err := store.DeleteRoleLivePresenceExcept(ctx, roles); err != nil {
+			writeLine(stdout, "blocked_since role live presence reap failed: %v", err)
+		}
 	}
 }
 

@@ -69,6 +69,12 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 
 	base := time.Now().UTC().Truncate(time.Second)
 	sourceMax := base.Add(5 * time.Hour)
+	if err := store.UpsertRoleLivePresence(ctx, "owner", "working", base); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertRoleLivePresence(ctx, "review", "blocked", base); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.UpsertBlockedEpisode(ctx, "role:review", base.Add(-2*time.Hour), base.Add(-time.Hour)); err != nil {
 		t.Fatal(err)
 	}
@@ -145,6 +151,9 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 	if len(view.Roles) != 2 || view.Roles[0].Name != "owner" || view.Roles[1].Name != "review" {
 		t.Fatalf("roles = %+v", view.Roles)
 	}
+	if view.Roles[0].DisplayName != "Owner" {
+		t.Fatalf("owner display_name = %q", view.Roles[0].DisplayName)
+	}
 	if view.Roles[0].PresenceState != "working" || view.Roles[0].Badges.Overdue == "" {
 		t.Fatalf("owner = %+v", view.Roles[0])
 	}
@@ -180,7 +189,7 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if role.Identity.Name != "owner" || len(role.Identity.Path) != 1 || role.Presence.State != "working" {
+	if role.Identity.Name != "owner" || role.Identity.DisplayName != "Owner" || len(role.Identity.Path) != 1 || role.Presence.State != "working" {
 		t.Fatalf("owner role = %+v", role)
 	}
 	if role.Recycle.LastHandoffText != "Latest handoff." || role.Recycle.LastHandoffAt == "" || role.Recycle.Overdue == "" {
@@ -227,6 +236,58 @@ func TestDashboardOrgDetectionDisabledIsHonest(t *testing.T) {
 	}
 	if view.DetectionEnabled || !strings.Contains(view.DetectionHint, "no enabled org event rules") {
 		t.Fatalf("detection = %v hint %q", view.DetectionEnabled, view.DetectionHint)
+	}
+}
+
+func TestDashboardOrgDetectionUsesLoadedOrchestratePolicy(t *testing.T) {
+	tests := []struct {
+		name        string
+		enableKnob  bool
+		seedLive    bool
+		wantEnabled bool
+		wantHint    string
+	}{
+		{name: "configured with live presence", enableKnob: true, seedLive: true, wantEnabled: true},
+		{name: "configured but no live presence yet", enableKnob: true, wantEnabled: true, wantHint: "waiting for live presence"},
+		{name: "zero knob", wantHint: "blocked_role_wake_after is disabled"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			home, paths := setupOrgHome(t)
+			if test.enableKnob {
+				enableDashboardOrgDetection(t, paths.ConfigFile)
+			}
+			store, err := db.Open(paths.Database)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.AddEventRule(context.Background(), db.EventRule{
+				ID: "org-signals", OnKind: "blocked", WakeRole: "owner", Enabled: true,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if test.seedLive {
+				if err := store.UpsertRoleLivePresence(context.Background(), "owner", "working", time.Now().UTC()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			view, err := (&webDataSource{home: home}).Org(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if view.DetectionEnabled != test.wantEnabled {
+				t.Fatalf("DetectionEnabled = %v, want %v (hint %q)", view.DetectionEnabled, test.wantEnabled, view.DetectionHint)
+			}
+			if test.wantHint == "" && view.DetectionHint != "" {
+				t.Fatalf("DetectionHint = %q, want empty", view.DetectionHint)
+			}
+			if test.wantHint != "" && !strings.Contains(view.DetectionHint, test.wantHint) {
+				t.Fatalf("DetectionHint = %q, want substring %q", view.DetectionHint, test.wantHint)
+			}
+		})
 	}
 }
 

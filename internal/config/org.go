@@ -13,10 +13,11 @@ import (
 // OrgRole is one role in the local organization registry. MergeRule is
 // deliberately advisory in phase 1a; scope is enforced at dispatch.
 type OrgRole struct {
-	Name      string
-	Parent    string
-	Scope     []string
-	MergeRule string
+	Name        string
+	DisplayName string
+	Parent      string
+	Scope       []string
+	MergeRule   string
 	// Pane optionally binds this role to a Herdr pane for live presence and
 	// event-rule wakes.
 	Pane         string
@@ -245,7 +246,7 @@ func LoadOrg(paths Paths) (OrgConfig, error) {
 			}
 			continue
 		}
-		if key != "parent" && key != "scope" && key != "merge_rule" && key != "pane" && key != "recycle_after" {
+		if key != "display_name" && key != "parent" && key != "scope" && key != "merge_rule" && key != "pane" && key != "recycle_after" {
 			return OrgConfig{}, fmt.Errorf("unknown field %q for org role %q", key, current)
 		}
 		if roleFields[current][key] {
@@ -254,6 +255,12 @@ func LoadOrg(paths Paths) (OrgConfig, error) {
 		roleFields[current][key] = true
 		role := cfg.roles[current]
 		switch key {
+		case "display_name":
+			v, err := parseOrgTOMLString(value)
+			if err != nil {
+				return OrgConfig{}, fmt.Errorf("org role %q: parse display_name: %w", current, err)
+			}
+			role.DisplayName = v
 		case "parent":
 			v, err := parseOrgTOMLString(value)
 			if err != nil {

@@ -164,6 +164,14 @@ blocked_role_wake_after = "1h"
 	}
 	var output bytes.Buffer
 	runBlockedRoleWakeOnce(context.Background(), store, home, &output, now, deps)
+	livePresence, err := store.ListRoleLivePresence(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(livePresence) != 2 || livePresence[0].Role != "owner" || livePresence[0].State != string(org.StateBlocked) ||
+		livePresence[1].Role != "review" || livePresence[1].State != string(org.StateIdle) {
+		t.Fatalf("persisted live presence = %+v", livePresence)
+	}
 	blocked := sink.byType(events.EventJobBlocked)
 	if len(blocked) != 1 {
 		t.Fatalf("job.blocked events = %d, want 1; output=%s", len(blocked), output.String())
@@ -183,6 +191,17 @@ blocked_role_wake_after = "1h"
 	}
 	if availability.calls != 2 {
 		t.Fatalf("availability calls = %d, want 2", availability.calls)
+	}
+
+	snapshot.States = map[string]org.RoleLiveState{"owner": {State: org.StateWorking}}
+	deps.provider = func([]config.OrgRole) org.Provider { return orgFixtureProvider{snapshot: snapshot} }
+	runBlockedRoleWakeOnce(context.Background(), store, home, io.Discard, now.Add(2*time.Minute), deps)
+	livePresence, err = store.ListRoleLivePresence(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(livePresence) != 1 || livePresence[0].Role != "owner" || livePresence[0].State != string(org.StateWorking) {
+		t.Fatalf("persisted live presence after reap = %+v", livePresence)
 	}
 }
 
