@@ -158,6 +158,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	watchIssues := fs.Bool("watch-issues", false, "poll open issues and route @<agent> ask comments to jobs (#389)")
 	scheduler := fs.String("scheduler", "barrier", "queued-job scheduler: barrier (default) or pool (#394 opt-in continuous worker pool)")
 	parallel := fs.Int("parallel", 0, "run jobs in parallel: sets --workers N and --scheduler pool together (#444)")
+	pprofAddr := fs.String("pprof-addr", "", "off by default; if set (use a loopback addr, e.g. 127.0.0.1:6060) serve net/http/pprof on it for live diagnostics (#1111)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -264,6 +265,16 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Off-by-default live-profiling listener (#1111). When --pprof-addr is set it
+	// serves net/http/pprof on a DEDICATED mux (never DefaultServeMux, so pprof can
+	// never leak onto another server) so a running daemon can be profiled without a
+	// restart; unset = no listener and byte-identical behavior. Tied to ctx so it
+	// shuts down with the daemon.
+	if addr := strings.TrimSpace(*pprofAddr); addr != "" {
+		stopPprof := startDaemonPprofServer(ctx, addr, stdout)
+		defer stopPprof()
+	}
 
 	// Warm-reconfigure path (#577): the live supervisor settings (poll, worker-pool
 	// size, scheduler mode) are held behind a mutex so a SIGHUP can re-read the
