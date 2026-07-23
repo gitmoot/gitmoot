@@ -79,7 +79,7 @@ func TestBlockedTaskExternalMergeReconcileE2E(t *testing.T) {
 		t.Fatalf("workflow notes after two ticks = %+v, err=%v", notes, err)
 	}
 	meta, err := store.GetWorkflowMeta(ctx, "gitmoot4/blocked-reconcile-953")
-	if err != nil || meta.Status != "PR #953 merged" || meta.Description != "blocked-reconcile-953" {
+	if err != nil || meta.Status != "active" || meta.Description != "blocked-reconcile-953" {
 		t.Fatalf("workflow meta after two ticks = %+v, err=%v", meta, err)
 	}
 }
@@ -176,7 +176,7 @@ func TestPollOnceRecordsClosedBreadcrumbForWorkflowLinkedPROpenTask(t *testing.T
 		t.Fatalf("workflow notes after two ticks = %+v, err=%v", notes, err)
 	}
 	meta, err := store.GetWorkflowMeta(ctx, "gitmoot4/selfdesc-958")
-	if err != nil || meta.Status != "PR #7 closed without merging" {
+	if err != nil || meta.Status != "active" {
 		t.Fatalf("workflow meta after two ticks = %+v, err=%v", meta, err)
 	}
 }

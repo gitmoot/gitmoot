@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -257,6 +258,20 @@ func executePullRequestMerge(ctx context.Context, client interface {
 func (g PolicyMergeGate) finishMerged(ctx context.Context, request MergeRequest, pr github.PullRequest, mergeSHA string) (MergeDecision, error) {
 	if err := g.recordMerged(ctx, request, pr, mergeSHA); err != nil {
 		return MergeDecision{}, err
+	}
+	branch := strings.TrimSpace(pr.HeadRef)
+	if branch == "" {
+		branch = strings.TrimSpace(request.Branch)
+	}
+	if _, err := RecordPullRequestWorkflowTransition(ctx, g.Store, PullRequestEvent{
+		Repo:        request.Repo,
+		Branch:      branch,
+		PullRequest: request.PullRequest,
+	}, PullRequestJournalMerged); err != nil {
+		// The GitHub merge and local PR record are already durable. Journaling is
+		// observability only and must never turn a successful merge into a failure
+		// or alter its MergeDecision.
+		log.Printf("WARNING: workflow journal PR-merged breadcrumb failed for %s#%d: %v", request.Repo, request.PullRequest, err)
 	}
 	postMergeWarnings := []string{}
 	lock, err := g.Store.GetBranchLock(ctx, request.Repo, pr.HeadRef)

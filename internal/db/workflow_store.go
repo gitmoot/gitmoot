@@ -278,7 +278,7 @@ VALUES (?, ?, ?, ?, ?)`, note.WorkflowID, note.Author, note.Body, note.Repo, not
 		return WorkflowNote{}, false, err
 	}
 	meta.WorkflowID = note.WorkflowID
-	if err := upsertWorkflowMetaTx(ctx, tx, meta); err != nil {
+	if err := upsertWorkflowMetaConditionalStatusTx(ctx, tx, meta); err != nil {
 		return WorkflowNote{}, false, err
 	}
 	if !meta.DescriptionSet {
@@ -372,6 +372,18 @@ VALUES (?, ?, ?, ?, ?)`, note.WorkflowID, note.Author, note.Body, note.Repo, not
 }
 
 func upsertWorkflowMetaTx(ctx context.Context, tx *sql.Tx, meta WorkflowMeta) error {
+	return upsertWorkflowMetaTxWithStatusGuard(ctx, tx, meta, false)
+}
+
+// upsertWorkflowMetaConditionalStatusTx preserves operator-owned lifecycle
+// states while allowing daemon PR receipts to canonicalize stale machine-owned
+// status. Only the status field is guarded; coordinator metadata keeps the same
+// last-write-wins behavior as upsertWorkflowMetaTx.
+func upsertWorkflowMetaConditionalStatusTx(ctx context.Context, tx *sql.Tx, meta WorkflowMeta) error {
+	return upsertWorkflowMetaTxWithStatusGuard(ctx, tx, meta, true)
+}
+
+func upsertWorkflowMetaTxWithStatusGuard(ctx context.Context, tx *sql.Tx, meta WorkflowMeta, protectStatus bool) error {
 	if err := validateWorkflowMeta(meta); err != nil {
 		return err
 	}
@@ -384,9 +396,13 @@ ON CONFLICT(workflow_id) DO UPDATE SET
 	workdir = CASE WHEN excluded.workdir != '' THEN excluded.workdir ELSE workflow_meta.workdir END,
 	summary = CASE WHEN ? THEN excluded.summary ELSE workflow_meta.summary END,
 	description = CASE WHEN ? THEN excluded.description ELSE workflow_meta.description END,
-	status = CASE WHEN ? THEN excluded.status ELSE workflow_meta.status END,
+	status = CASE
+		WHEN ? AND (NOT ? OR workflow_meta.status NOT IN ('blocked', 'parked', 'done', 'settled'))
+			THEN excluded.status
+		ELSE workflow_meta.status
+	END,
 	updated_at = CURRENT_TIMESTAMP`, meta.WorkflowID, meta.Author, meta.Pane, meta.SessionID, meta.WorkDir,
-		meta.Summary, meta.Description, meta.Status, meta.SummarySet, meta.DescriptionSet, meta.StatusSet)
+		meta.Summary, meta.Description, meta.Status, meta.SummarySet, meta.DescriptionSet, meta.StatusSet, protectStatus)
 	return err
 }
 

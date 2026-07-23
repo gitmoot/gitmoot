@@ -24,9 +24,15 @@ func TestPolicyMergeGateMergesPassingPullRequest(t *testing.T) {
 		PullRequest: 9,
 		HeadSHA:     "head123",
 		TaskID:      "task-9",
+		WorkflowID:  "release/native-merge",
 		ReviewRound: "review-1",
 		Result:      &AgentResult{Decision: "approved", Summary: "ready"},
 	})
+	if _, err := store.InsertWorkflowNoteWithMeta(ctx,
+		db.WorkflowNote{WorkflowID: "release/native-merge", Author: "operator", Body: "ready"},
+		db.WorkflowMeta{Status: "ready_to_merge", StatusSet: true}); err != nil {
+		t.Fatalf("seed workflow status: %v", err)
+	}
 	mergeable := true
 	gh := &fakeMergeGateGitHub{
 		pr: github.PullRequest{
@@ -90,6 +96,84 @@ func TestPolicyMergeGateMergesPassingPullRequest(t *testing.T) {
 	}
 	if len(git.updated) != 1 || git.updated[0] != "origin/main" {
 		t.Fatalf("updated base calls = %+v", git.updated)
+	}
+	meta, err := store.GetWorkflowMeta(ctx, "release/native-merge")
+	if err != nil || meta.Status != "active" {
+		t.Fatalf("workflow meta after native merge = %+v, err=%v", meta, err)
+	}
+	notes, err := store.ListWorkflowNotes(ctx, "release/native-merge", 0)
+	if err != nil {
+		t.Fatalf("ListWorkflowNotes: %v", err)
+	}
+	mergedReceipts := 0
+	for _, note := range notes {
+		if note.Body == "[auto:pr:9:merged] PR #9 merged" {
+			mergedReceipts++
+		}
+	}
+	if mergedReceipts != 1 {
+		t.Fatalf("merged receipt count = %d, want 1; notes=%+v", mergedReceipts, notes)
+	}
+	if inserted, err := RecordPullRequestWorkflowTransition(ctx, store, PullRequestEvent{
+		Repo: "gitmoot/gitmoot", Branch: "task-9", PullRequest: 9,
+	}, PullRequestJournalMerged); err != nil || inserted {
+		t.Fatalf("daemon replay = (inserted=%v, err=%v), want deduplicated no-op", inserted, err)
+	}
+}
+
+func TestPolicyMergeGateJournalFailureDoesNotChangeMergedDecision(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	insertCompletedJob(t, store, db.Job{ID: "native-journal-link", Agent: "audit", Type: "review"}, JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		Branch:      "task-9",
+		PullRequest: 9,
+		WorkflowID:  "release/native-journal-failure",
+	})
+	if _, err := store.InsertWorkflowNoteWithMeta(ctx,
+		db.WorkflowNote{WorkflowID: "release/native-journal-failure", Author: "operator", Body: "ready"},
+		db.WorkflowMeta{Status: "ready_to_merge", StatusSet: true}); err != nil {
+		t.Fatalf("seed workflow status: %v", err)
+	}
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
+	}
+	defer raw.Close()
+	if _, err := raw.ExecContext(ctx, `
+CREATE TRIGGER fail_native_merge_workflow_journal
+BEFORE INSERT ON workflow_notes
+WHEN NEW.author = 'daemon' AND NEW.body LIKE '[auto:pr:%:merged]%'
+BEGIN
+	SELECT RAISE(ABORT, 'forced workflow journal failure');
+END`); err != nil {
+		t.Fatalf("create journal failure trigger: %v", err)
+	}
+
+	gate := PolicyMergeGate{Store: store}
+	decision, err := gate.finishMerged(ctx, MergeRequest{
+		Repo: "gitmoot/gitmoot", Branch: "task-9", PullRequest: 9,
+	}, github.PullRequest{
+		Number: 9, URL: "https://github.com/gitmoot/gitmoot/pull/9",
+		HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123",
+	}, "merge123")
+	if err != nil {
+		t.Fatalf("finishMerged returned journal error: %v", err)
+	}
+	if !decision.Ready || !decision.Merged || decision.MergeCommitSHA != "merge123" || decision.Reason != "merged" {
+		t.Fatalf("decision changed by journal failure: %+v", decision)
+	}
+	pr, err := store.GetPullRequest(ctx, "gitmoot/gitmoot", 9)
+	if err != nil || pr.State != "merged" || pr.MergeCommitSHA != "merge123" {
+		t.Fatalf("durable merged PR = %+v, err=%v", pr, err)
+	}
+	meta, err := store.GetWorkflowMeta(ctx, "release/native-journal-failure")
+	if err != nil || meta.Status != "ready_to_merge" {
+		t.Fatalf("failed journal changed workflow meta = %+v, err=%v", meta, err)
+	}
+	notes, err := store.ListWorkflowNotes(ctx, "release/native-journal-failure", 0)
+	if err != nil || len(notes) != 1 {
+		t.Fatalf("notes after forced journal failure = %+v, err=%v", notes, err)
 	}
 }
 

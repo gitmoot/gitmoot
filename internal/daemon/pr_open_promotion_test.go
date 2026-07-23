@@ -140,7 +140,7 @@ func TestReconcilePROpenTasksJournalsWorkflowOnce(t *testing.T) {
 		t.Fatalf("auto note = %+v", notes[0])
 	}
 	meta, err := store.GetWorkflowMeta(ctx, workflowID)
-	if err != nil || meta.Status != "PR #958 open" || meta.Description != "lifecycle" {
+	if err != nil || meta.Status != "active" || meta.Description != "lifecycle" {
 		t.Fatalf("meta = %+v, err=%v", meta, err)
 	}
 }

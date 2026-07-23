@@ -21,9 +21,10 @@ const (
 )
 
 // RecordPullRequestWorkflowTransition appends one machine-owned PR breadcrumb
-// and updates live status for the workflow linked to repo+PR/branch. A missing
-// workflow link is a successful no-op. The store's partial unique index makes
-// the structured body an at-most-once receipt for (workflow, PR, transition).
+// and updates live status for the workflow linked to repo+PR/branch unless an
+// operator-owned terminal/hold status is present. A missing workflow link is a
+// successful no-op. The store's partial unique index makes the structured body
+// an at-most-once receipt for (workflow, PR, transition).
 func RecordPullRequestWorkflowTransition(ctx context.Context, store *db.Store, event PullRequestEvent, transition PullRequestJournalTransition) (bool, error) {
 	if store == nil {
 		return false, nil
@@ -49,16 +50,16 @@ func RecordPullRequestWorkflowTransition(ctx context.Context, store *db.Store, e
 	switch transition {
 	case PullRequestJournalOpened:
 		message = fmt.Sprintf("PR #%d opened (%s)", event.PullRequest, strings.TrimSpace(event.Branch))
-		status = fmt.Sprintf("PR #%d open", event.PullRequest)
+		status = "active"
 	case PullRequestJournalReady:
 		message = fmt.Sprintf("PR #%d checks green — ready to merge", event.PullRequest)
-		status = message
+		status = "ready_to_merge"
 	case PullRequestJournalMerged:
 		message = fmt.Sprintf("PR #%d merged", event.PullRequest)
-		status = message
+		status = "active"
 	case PullRequestJournalClosed:
 		message = fmt.Sprintf("PR #%d closed without merging", event.PullRequest)
-		status = message
+		status = "active"
 	default:
 		return false, fmt.Errorf("unknown pull request journal transition %q", transition)
 	}
