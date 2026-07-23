@@ -30,8 +30,11 @@ func TestDeriveDashboardWorkflowState(t *testing.T) {
 	}{
 		{name: "running stays active", activity: dashboardWorkflowActivity{Running: 1, LastActivity: now.Add(-48 * time.Hour)}, state: "active"},
 		{name: "queued stays active", activity: dashboardWorkflowActivity{Queued: 1, LastActivity: now.Add(-48 * time.Hour)}, state: "active"},
-		{name: "terminal with running work stays active", activity: dashboardWorkflowActivity{Running: 1, LastActivity: now.Add(-48 * time.Hour)}, status: "done", state: "active"},
-		{name: "terminal with queued work stays active", activity: dashboardWorkflowActivity{Queued: 1, LastActivity: now.Add(-48 * time.Hour)}, status: "settled", state: "active"},
+		// #1106: a deliberate terminal status wins over a lingering job. A coordinator
+		// workflow born via `job open` has a perpetually-running job, so an explicitly
+		// closed (`done`) workflow must NOT read active; revival is note-based.
+		{name: "done with running coordinator job is settled", activity: dashboardWorkflowActivity{Running: 1, LastActivity: now.Add(-48 * time.Hour)}, status: "done", state: "settled"},
+		{name: "settled with queued job is settled", activity: dashboardWorkflowActivity{Queued: 1, LastActivity: now.Add(-48 * time.Hour)}, status: "settled", state: "settled"},
 		{name: "recent done is settled", activity: dashboardWorkflowActivity{LastActivity: now.Add(-10 * time.Minute)}, status: "done", state: "settled"},
 		{name: "recent settled is settled", activity: dashboardWorkflowActivity{LastActivity: now.Add(-10 * time.Minute)}, status: "settled", state: "settled"},
 		{name: "recent quiet is recent", activity: dashboardWorkflowActivity{LastActivity: now.Add(-10 * time.Minute)}, state: "recent"},
@@ -92,6 +95,45 @@ func TestDashboardWorkflowTerminalStatusIndexAndDetailAgree(t *testing.T) {
 	}
 	if entries[0].State != "settled" || detail.State != "settled" {
 		t.Fatalf("terminal state mismatch: index=%q detail=%q", entries[0].State, detail.State)
+	}
+}
+
+// TestDashboardClosedWorkflowWithRunningJobIsNotActive pins #1106 on the consumed
+// /api/workflows path: a coordinator workflow born via `job open` keeps a
+// perpetually-running job, so closing it (status=done) must leave the active
+// bucket -- the terminal status wins over the lingering running job.
+func TestDashboardClosedWorkflowWithRunningJobIsNotActive(t *testing.T) {
+	t.Parallel()
+	home, store := workflowJournalTestHome(t)
+	ctx := context.Background()
+	const label = "g4/1106-repro"
+	payload := workflow.JobPayload{WorkflowID: label, Repo: "acme/widget", TaskTitle: "Coordinator track"}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "coordinator-job", Agent: "coord", Type: "ask", State: "running", Payload: mustJSON(t, payload),
+	}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if _, err := store.InsertWorkflowNoteWithMeta(ctx,
+		db.WorkflowNote{WorkflowID: label, Author: "operator", Body: "[workflow:close] done"},
+		db.WorkflowMeta{Status: string(db.WorkflowStatusDone), StatusSet: true}); err != nil {
+		t.Fatalf("InsertWorkflowNoteWithMeta: %v", err)
+	}
+	store.Close()
+
+	ds := &webDataSource{home: home}
+	entries, err := ds.Workflows(ctx)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("Workflows = %+v, err=%v", entries, err)
+	}
+	detail, err := ds.Workflow(ctx, label, dashboard.WorkflowQuery{})
+	if err != nil {
+		t.Fatalf("Workflow: %v", err)
+	}
+	if entries[0].State == "active" || detail.State == "active" {
+		t.Fatalf("closed workflow with running job read active: index=%q detail=%q", entries[0].State, detail.State)
+	}
+	if entries[0].State != "settled" || detail.State != "settled" {
+		t.Fatalf("want settled, got index=%q detail=%q", entries[0].State, detail.State)
 	}
 }
 
