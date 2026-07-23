@@ -177,9 +177,17 @@ type webDataSource struct {
 	cacheOnce     sync.Once
 	responseCache *dashboardJSONCache
 
+	registryMu sync.Mutex
+	pollers    map[string]*ssePoller
+
+	// These hooks keep the shared-poller concurrency tests fast and
+	// deterministic. Production leaves them nil/zero.
+	sseState        func(context.Context, string) (dashboard.State, error)
+	ssePollInterval time.Duration
+
 	// mu guards the Health() caches below (Health can be called concurrently and
 	// its resolvers run in goroutines). Everything else on the source is stateless
-	// per call, so only the caches need protection.
+	// per call; SSE pollers use registryMu and their own locks.
 	mu sync.Mutex
 	// daemonVersionKey/daemonVersion cache the running daemon binary's reported
 	// version, keyed by (executable path, file mtime) so SEQUENTIAL 12s health
@@ -1906,44 +1914,164 @@ func healthStuckSince(job db.Job, cutoffMillis int64) (since int64, stuck bool) 
 	return since, false
 }
 
-// Subscribe polls State for the requested run and pushes a fresh snapshot to the
-// returned channel whenever it changes (plus one initial snapshot). It is a
-// read-only poller — no store writes — and stops when the caller invokes the
-// returned cancel func or the parent context is cancelled.
+const (
+	sseMaxSubscribersPerRun = 64
+	ssePollInterval         = 2 * time.Second
+)
+
+type ssePoller struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+
+	mu   sync.Mutex
+	subs map[int]chan dashboard.State
+	seq  int
+	refs int
+
+	last      string
+	lastState dashboard.State
+	haveState bool
+}
+
+// Subscribe shares one read-only State poller between every viewer of the same
+// requested run and fans changed snapshots out to per-connection channels.
+// The registry uses the trimmed raw run id: canonicalizing "" or a child id to
+// its root currently requires the same full ListJobs rebuild this path avoids.
+// In practice dashboard viewers use the same run query, so equivalent requests
+// still collapse in the common case.
 func (d *webDataSource) Subscribe(ctx context.Context, runID string) (<-chan dashboard.State, func(), error) {
+	_ = ctx // The module handler owns connection cancellation and calls cancel.
+	runID = strings.TrimSpace(runID)
+
+	d.registryMu.Lock()
+	if d.pollers == nil {
+		d.pollers = make(map[string]*ssePoller)
+	}
+	poller := d.pollers[runID]
+	created := poller == nil
+	var pollCtx context.Context
+	if created {
+		poller = &ssePoller{}
+		pollCtx, poller.cancel = context.WithCancel(context.Background())
+		poller.done = make(chan struct{})
+		poller.subs = make(map[int]chan dashboard.State)
+		d.pollers[runID] = poller
+	}
+
+	poller.mu.Lock()
+	if len(poller.subs) >= sseMaxSubscribersPerRun {
+		// Only an existing over-capacity poller can reject: a freshly created
+		// poller has zero subscribers and always admits its first below.
+		poller.mu.Unlock()
+		d.registryMu.Unlock()
+		return nil, nil, errors.New("dashboard: too many SSE subscribers for run")
+	}
+	id := poller.seq
+	poller.seq++
+	// Buffer 1 with coalescing fanout (see runSSEPoller): the channel holds at
+	// most the newest snapshot for a slow subscriber, never a stale backlog.
 	ch := make(chan dashboard.State, 1)
-	pollCtx, cancel := context.WithCancel(ctx)
-	go func() {
-		defer close(ch)
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		var last string
-		push := func() {
-			state, err := d.State(pollCtx, runID)
-			if err != nil {
-				return
+	poller.subs[id] = ch
+	poller.refs++
+	poller.mu.Unlock()
+	d.registryMu.Unlock()
+	if created {
+		go d.runSSEPoller(pollCtx, runID, poller)
+	}
+
+	// Seed only after releasing registryMu: the hard lock rule forbids channel
+	// sends while the registry is held. Re-taking only the poller's own lock
+	// serializes this with fanout. If fanout already queued a fresher snapshot,
+	// the channel is non-empty and no stale cached seed is appended behind it.
+	poller.mu.Lock()
+	if poller.haveState && len(ch) == 0 {
+		ch <- poller.lastState
+	}
+	poller.mu.Unlock()
+
+	var once sync.Once
+	cancel := func() {
+		once.Do(func() {
+			d.registryMu.Lock()
+			poller.mu.Lock()
+			if sub, ok := poller.subs[id]; ok {
+				delete(poller.subs, id)
+				close(sub)
+				poller.refs--
+				if poller.refs == 0 {
+					poller.cancel()
+					delete(d.pollers, runID)
+				}
 			}
-			key := stateFingerprint(state)
-			if key == last {
-				return
-			}
-			last = key
-			select {
-			case ch <- state:
-			case <-pollCtx.Done():
-			}
-		}
-		push()
-		for {
-			select {
-			case <-pollCtx.Done():
-				return
-			case <-ticker.C:
-				push()
-			}
-		}
-	}()
+			poller.mu.Unlock()
+			d.registryMu.Unlock()
+		})
+	}
 	return ch, cancel, nil
+}
+
+func (d *webDataSource) runSSEPoller(ctx context.Context, runID string, poller *ssePoller) {
+	defer close(poller.done)
+	interval := d.ssePollInterval
+	if interval <= 0 {
+		interval = ssePollInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	publish := func() {
+		// One shared rebuild per tick regardless of viewer count, deduped by
+		// fingerprint — byte-identical to the old per-connection poller, just
+		// shared. (A cheap version-cache was rejected: no cheap signal covers a
+		// bare jobs-table state write, so it risked freezing a live viewer.)
+		state, err := d.sseStateSnapshot(ctx, runID)
+		if err != nil {
+			return
+		}
+		key := stateFingerprint(state)
+
+		poller.mu.Lock()
+		changed := !poller.haveState || key != poller.last
+		poller.lastState = state
+		poller.haveState = true
+		if changed {
+			poller.last = key
+			for _, sub := range poller.subs {
+				// Coalescing latest-wins delivery: drop any stale queued snapshot
+				// then enqueue the newest, so a briefly-slow viewer converges to
+				// the current state instead of freezing on an intermediate one,
+				// and the shared poller never blocks on one lagging subscriber.
+				select {
+				case <-sub:
+				default:
+				}
+				select {
+				case sub <- state:
+				default:
+				}
+			}
+		}
+		poller.mu.Unlock()
+	}
+
+	publish()
+	for {
+		select {
+		case <-ctx.Done():
+			// Cancelled only at refs==0, after the last unsubscribe removed and
+			// closed its channel under poller.mu, so nothing remains to close.
+			return
+		case <-ticker.C:
+			publish()
+		}
+	}
+}
+
+func (d *webDataSource) sseStateSnapshot(ctx context.Context, runID string) (dashboard.State, error) {
+	if d.sseState != nil {
+		return d.sseState(ctx, runID)
+	}
+	return d.State(ctx, runID)
 }
 
 // agentRuntimeMap builds a name->runtime lookup from the agent registry so a
