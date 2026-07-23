@@ -1329,28 +1329,58 @@ func (s *Store) JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) 
 // crash-window leftovers that never got far enough to emit a cleanup-skipped
 // marker. Blocked is excluded: it is resumable and therefore still owns its
 // worktree. The payload predicates exclude ordinary task worktrees.
+//
+// The `job_wt` MATERIALIZED CTE extracts each job's worktree_path (and the other
+// payload fields) EXACTLY ONCE. The prior form correlated the owner NOT EXISTS
+// with json_extract(owner.payload,...) = json_extract(j.payload,...), so SQLite
+// re-parsed every owner row's full JSON payload for every outer candidate row —
+// O(jobs^2) JSON reparses. On this host's live store (~3500 jobs, some payloads
+// >10MB) that made a single run take ~100s, and it runs every ~1s reclaim tick,
+// pinning a core in modernc's VDBE/JSON1 (#1111). Materializing the extract once
+// turns it into O(jobs) parses + an equality join on the plain column: same rows,
+// ~700x faster (verified against a live snapshot). The MATERIALIZED hint is
+// required — without it SQLite inlines the CTE and re-parses per reference.
+//
+// The `WHERE json_valid(payload)` guard is load-bearing: the CTE extracts eagerly
+// over every row, and json_extract ERRORS on a non-JSON payload — and ” is the
+// column's schema default (payload TEXT NOT NULL DEFAULT ”), a tolerated store
+// state (the write path swallows marshal errors). Without the guard a single
+// bad-payload row would fail this query on every reclaim tick. Invalid-payload
+// rows have no worktree_path, so they can never be a candidate or an owner: the
+// guard is a no-op on the result set and matches the sibling json_valid guards
+// (store_jobs.go json*Reclaim queries).
 func (s *Store) JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cutoff time.Time) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT j.id
-		FROM jobs j
+	cutoffStr := cutoff.UTC().Format("2006-01-02 15:04:05")
+	rows, err := s.db.QueryContext(ctx, `
+		WITH job_wt AS MATERIALIZED (
+			SELECT id, state,
+			       unixepoch(COALESCE(NULLIF(updated_at, ''), created_at)) AS ts,
+			       json_extract(payload, '$.worktree_path') AS worktree_path,
+			       COALESCE(json_extract(payload, '$.delegation_id'), '') AS delegation_id,
+			       COALESCE(json_extract(payload, '$.read_only_worktree'), 0) AS read_only_worktree
+			FROM jobs
+			WHERE json_valid(payload)
+		)
+		SELECT j.id
+		FROM job_wt j
 		WHERE j.state IN ('succeeded', 'failed', 'cancelled')
-		  AND unixepoch(COALESCE(NULLIF(j.updated_at, ''), j.created_at)) <= unixepoch(?)
-		  AND COALESCE(json_extract(j.payload, '$.worktree_path'), '') <> ''
-		  AND (COALESCE(json_extract(j.payload, '$.delegation_id'), '') <> ''
-		       OR COALESCE(json_extract(j.payload, '$.read_only_worktree'), 0) = 1)
+		  AND j.ts <= unixepoch(?)
+		  AND COALESCE(j.worktree_path, '') <> ''
+		  AND (j.delegation_id <> '' OR j.read_only_worktree = 1)
 		  AND NOT EXISTS (
-			SELECT 1 FROM jobs owner
+			SELECT 1 FROM job_wt owner
 			WHERE owner.id <> j.id
-			  AND json_extract(owner.payload, '$.worktree_path') = json_extract(j.payload, '$.worktree_path')
+			  AND owner.worktree_path = j.worktree_path
 			  AND (owner.state NOT IN ('succeeded', 'failed', 'cancelled')
-			       OR unixepoch(COALESCE(NULLIF(owner.updated_at, ''), owner.created_at)) IS NULL
-			       OR unixepoch(COALESCE(NULLIF(owner.updated_at, ''), owner.created_at)) > unixepoch(?))
+			       OR owner.ts IS NULL
+			       OR owner.ts > unixepoch(?))
 		  )
 		  AND NOT EXISTS (
 			SELECT 1 FROM job_events e
 			WHERE e.job_id = j.id
 			  AND e.kind IN ('delegation_worktree_removed', 'delegation_worktree_reclaimed_ttl')
 		  )
-		ORDER BY j.id`, cutoff.UTC().Format("2006-01-02 15:04:05"), cutoff.UTC().Format("2006-01-02 15:04:05"))
+		ORDER BY j.id`, cutoffStr, cutoffStr)
 	if err != nil {
 		return nil, err
 	}
