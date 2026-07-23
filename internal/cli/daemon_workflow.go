@@ -589,7 +589,24 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 			Reason: "native Gitmoot merge gate disabled by GITMOOT_DISABLE_NATIVE_MERGE_GATE; use external gate",
 		}, nil
 	}
-	// Resolve the default-safe policy before looking up a checkout or active jobs.
+	// Never make a merge-or-human decision while a job still owns this branch.
+	// This is a local store query, so preserving the #1017 hold does not weaken
+	// the default path's zero GitHub side effects. An explicit @gitmoot merge
+	// request bypasses only the auto_merge policy, not this branch-safety hold.
+	active, found, err := findActiveJobForBranch(ctx, g.Store, request.Repo, request.Branch)
+	if err != nil {
+		return workflow.MergeDecision{}, fmt.Errorf("inspect active jobs on merge branch: %w", err)
+	}
+	if found {
+		return workflow.MergeDecision{
+			Ready:      false,
+			Merged:     false,
+			Deferred:   true,
+			Reason:     fmt.Sprintf("active %s job %s in flight on branch %s; holding merge until it settles", active.Type, active.ID, request.Branch),
+			BlockClass: workflow.MergeBlockTransient,
+		}, nil
+	}
+	// Resolve the default-safe policy before looking up a checkout.
 	// The actual leave-open decision remains inside PolicyMergeGate.Evaluate, whose
 	// early return guarantees no GitHub/client side effects. A config flip races
 	// safely: a false observed here waits for the next poll, while a false observed
@@ -604,11 +621,11 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 	}
 	gate := newDaemonPolicyMergeGate(g.Store, g.githubClient(checkout), checkout)
 	applyMergeGatePolicy(&gate, g.Home, request.Repo)
-	// This last-moment check minimizes but does not eliminate the enqueue-to-merge
-	// race: gate.Evaluate still performs review/CI reads before the squash merge, so
-	// a job enqueued in that window can escape the check. A branch-activity
-	// lease/barrier is the durable follow-up; until then, defer every job already in
-	// flight and leave the task ready_to_merge for the next daemon tick.
+	// The check above minimizes but does not eliminate the enqueue-to-merge race:
+	// gate.Evaluate still performs review/CI reads before the squash merge, so a job
+	// enqueued in that window can escape the check. A branch-activity lease/barrier
+	// is the durable follow-up; until then, defer every job already in flight and
+	// leave the task ready_to_merge for the next daemon tick.
 	//
 	// PRECONDITION (self-defer safety): the job that DROVE this evaluation must
 	// already be terminal, or the gate would match it and defer forever. It holds
@@ -617,19 +634,6 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 	// path is a daemon tick, not a job — so ListActiveJobs (queued/running only)
 	// never sees the driver. Keep it that way: never call the gate from within a
 	// still-running job's own execution.
-	active, found, err := findActiveJobForBranch(ctx, g.Store, request.Repo, request.Branch)
-	if err != nil {
-		return workflow.MergeDecision{}, fmt.Errorf("inspect active jobs on merge branch: %w", err)
-	}
-	if found {
-		return workflow.MergeDecision{
-			Ready:      false,
-			Merged:     false,
-			Deferred:   true,
-			Reason:     fmt.Sprintf("active %s job %s in flight on branch %s; holding merge until it settles", active.Type, active.ID, request.Branch),
-			BlockClass: workflow.MergeBlockTransient,
-		}, nil
-	}
 	return gate.Evaluate(ctx, request)
 }
 

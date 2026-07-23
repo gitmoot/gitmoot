@@ -3,9 +3,11 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -67,10 +69,37 @@ func TestDaemonMergeGateHoldsWhileImplementJobActiveOnBranch(t *testing.T) {
 	}
 }
 
-func TestDaemonMergeGateWithoutActiveBranchJobPreservesMergePath(t *testing.T) {
+func TestDaemonMergeGateHoldsHumanMergeRequestWhileJobActiveOnBranch(t *testing.T) {
 	store, checkout, gh, request := daemonMergeGateActiveJobFixture(t)
+	request.HumanMergeRequested = true
+	seedDaemonMergeGateJob(t, store, db.Job{
+		ID: "fix-round-running", Agent: "implementer", Type: "implement", State: string(workflow.JobRunning),
+	}, workflow.JobPayload{Repo: request.Repo, Branch: request.Branch, TaskID: request.TaskID})
 
 	decision, err := (daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout}).Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if decision.Ready || !decision.Deferred || decision.Merged || decision.BlockClass != workflow.MergeBlockTransient {
+		t.Fatalf("active human-request decision = %+v, want transient deferred not-ready hold", decision)
+	}
+	if len(gh.mergeInputs) != 0 {
+		t.Fatalf("explicit human request merged active branch: %+v", gh.mergeInputs)
+	}
+}
+
+func TestDaemonMergeGateWithoutActiveBranchJobPreservesMergePath(t *testing.T) {
+	store, checkout, gh, request := daemonMergeGateActiveJobFixture(t)
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize config: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+"\n[merge_gate]\nauto_merge = true\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile config: %v", err)
+	}
+
+	decision, err := (daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout, Home: paths.Home}).Evaluate(context.Background(), request)
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
