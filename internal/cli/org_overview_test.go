@@ -57,7 +57,7 @@ func TestStoreOrgLiveSourcePrecedence(t *testing.T) {
 				t.Fatal(err)
 			}
 			before := time.Now()
-			states, observedAt, version, err := storeOrgLiveSource(shared)(ctx, shared.Config)
+			states, observedAt, version, err := storeOrgLiveSource(&shared)(ctx, shared.Config)
 			after := time.Now()
 			if err != nil {
 				t.Fatal(err)

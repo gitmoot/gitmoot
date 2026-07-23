@@ -1020,6 +1020,16 @@ flagged (N missed wakes)` marker after the role reaches the positive
 (disabled). Escalations are recorded with `gitmoot org escalate`; their
 resolution and correlation surfaces are phase 2 work.
 
+The read-only Org page consumes `GET /api/org` for the store-backed role tree,
+health strip, typed escalations, and current signal feed, plus
+`GET /api/org/role/{name}` for one role's identity, presence, recycle history,
+and today's job counts. These endpoints open SQLite read-only and never contact
+Herdr. Responses are cached for at most 15 seconds; `data_as_of` is the newest
+persisted source timestamp, not the request time. `detection_enabled` is true
+only when `blocked_role_wake_after` is positive and at least one org event rule
+is enabled; otherwise `detection_hint` explains why an empty signal feed is not
+evidence that every role is healthy.
+
 Session lifecycle (phase 3): `[org] recycle_after = "24h"` (a duration, per-role
 overridable) marks a role recycle-overdue after it has been idle that long,
 shown read-only in the `recycle` column of `org status`

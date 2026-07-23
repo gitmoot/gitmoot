@@ -2,7 +2,7 @@ package workflow
 
 import "strings"
 
-const orgEscalatePrefix = "[org:escalate "
+const OrgEscalatePrefix = "[org:escalate "
 
 // FormatOrgEscalateNote encodes an org escalation in its durable workflow-note
 // schema. Invalid delimiter-bearing fields return an empty string; normal CLI
@@ -11,20 +11,20 @@ func FormatOrgEscalateNote(from, to, wf, question string) string {
 	if !validOrgEscalateField(from) || !validOrgEscalateField(to) || !validOrgEscalateField(wf) || strings.TrimSpace(question) == "" {
 		return ""
 	}
-	return orgEscalatePrefix + "to=" + to + " from=" + from + " wf=" + wf + "] " + question
+	return OrgEscalatePrefix + "to=" + to + " from=" + from + " wf=" + wf + "] " + question
 }
 
 // ParseOrgEscalateNote decodes the typed escalation prefix. The first closing
 // bracket ends the key block, so brackets in the question are preserved.
 func ParseOrgEscalateNote(body string) (from, to, wf, question string, ok bool) {
-	if !strings.HasPrefix(body, orgEscalatePrefix) {
+	if !strings.HasPrefix(body, OrgEscalatePrefix) {
 		return "", "", "", "", false
 	}
 	end := strings.IndexByte(body, ']')
-	if end < 0 || end == len(orgEscalatePrefix)-1 || end+1 >= len(body) || body[end+1] != ' ' {
+	if end < 0 || end == len(OrgEscalatePrefix)-1 || end+1 >= len(body) || body[end+1] != ' ' {
 		return "", "", "", "", false
 	}
-	fields := strings.Fields(body[len(orgEscalatePrefix):end])
+	fields := strings.Fields(body[len(OrgEscalatePrefix):end])
 	if len(fields) != 3 {
 		return "", "", "", "", false
 	}

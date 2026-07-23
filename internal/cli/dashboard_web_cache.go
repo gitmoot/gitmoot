@@ -56,6 +56,11 @@ var dashboardCachePolicies = []dashboardCachePolicy{
 	// selected row is re-read on every request while identical id lookups share
 	// one in-flight read.
 	{endpoint: "brain-fact", keyKind: "singleflight-only", retain: false},
+	// Org projections aggregate store-backed role state and signal journals.
+	// The short full-cursor TTL bounds public polling while episode/presence
+	// tables that are not cursor components still become visible within 15s.
+	{endpoint: "org", keyKind: "full-cursor", retain: true, minRecompute: time.Second, maxAge: 15 * time.Second},
+	{endpoint: "org-role", keyKind: "full-cursor+role", retain: true, minRecompute: time.Second, maxAge: 15 * time.Second},
 }
 
 var (
@@ -70,6 +75,8 @@ var (
 	dashboardKnowledgeCachePolicy   = dashboardCachePolicies[8]
 	dashboardBrainEventsCachePolicy = dashboardCachePolicies[9]
 	dashboardBrainFactCachePolicy   = dashboardCachePolicies[10]
+	dashboardOrgCachePolicy         = dashboardCachePolicies[11]
+	dashboardOrgRoleCachePolicy     = dashboardCachePolicies[12]
 )
 
 type dashboardCacheEntry struct {

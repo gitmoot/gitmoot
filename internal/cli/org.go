@@ -396,7 +396,7 @@ func runOrgOverview(command string, args []string, stdout, stderr io.Writer) int
 	for _, warning := range shared.Warnings {
 		fmt.Fprintf(stderr, "org %s: %s\n", command, warning)
 	}
-	rows, err := buildOrgStatusRows(ctx, shared, herdrOrgLiveSource, command)
+	rows, err := buildOrgStatusRows(ctx, &shared, herdrOrgLiveSource, command)
 	if err != nil {
 		var liveErr *orgLiveSourceError
 		if errors.As(err, &liveErr) {

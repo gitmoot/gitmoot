@@ -388,17 +388,53 @@ func (s *Store) CountQueuedJobsForRepo(ctx context.Context, repo string) (int, e
 	return count, err
 }
 
-// CountActiveJobsByOrgRole reports queued/running dispatched work attributed
-// to role. Anchor jobs omit acting_org_role and therefore do not count. The
-// role arg is trim+lowered to match how acting_org_role is persisted
-// (NormalizeActingOrgRole), so a non-normalized caller cannot silently
-// under-count — this method is trusted by phase-3 recycle enforcement.
-func (s *Store) CountActiveJobsByOrgRole(ctx context.Context, role string) (int, error) {
-	var count int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs
-		WHERE json_extract(payload, '$.acting_org_role') = ?
-		AND state IN ('queued', 'running')`, strings.ToLower(strings.TrimSpace(role))).Scan(&count)
-	return count, err
+const countCurrentJobsByOrgRoleRunningSQL = `SELECT json_extract(payload, '$.acting_org_role') AS role, COUNT(*)
+	FROM jobs INDEXED BY idx_jobs_running_updated_at
+	WHERE state = 'running' AND json_valid(payload)
+	AND json_type(payload, '$.acting_org_role') = 'text'
+	AND json_extract(payload, '$.acting_org_role') <> ''
+	GROUP BY role`
+
+const countCurrentJobsByOrgRoleQueuedSQL = `SELECT json_extract(payload, '$.acting_org_role') AS role, COUNT(*)
+	FROM jobs INDEXED BY idx_jobs_queued_created
+	WHERE state = 'queued' AND json_valid(payload)
+	AND json_type(payload, '$.acting_org_role') = 'text'
+	AND json_extract(payload, '$.acting_org_role') <> ''
+	GROUP BY role`
+
+// CountCurrentJobsByOrgRole returns queued/running counts for every attributed
+// role. It reads only the two partial active-state indexes rather than the
+// historical jobs table.
+func (s *Store) CountCurrentJobsByOrgRole(ctx context.Context) (map[string]map[string]int, error) {
+	counts := map[string]map[string]int{}
+	for _, query := range []struct {
+		state string
+		sql   string
+	}{
+		{state: "running", sql: countCurrentJobsByOrgRoleRunningSQL},
+		{state: "queued", sql: countCurrentJobsByOrgRoleQueuedSQL},
+	} {
+		rows, err := s.db.QueryContext(ctx, query.sql)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var role string
+			var count int
+			if err := rows.Scan(&role, &count); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			if counts[role] == nil {
+				counts[role] = map[string]int{}
+			}
+			counts[role][query.state] = count
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return counts, nil
 }
 
 // CountJobsByOrgRoleSince returns one grouped state-count projection for all

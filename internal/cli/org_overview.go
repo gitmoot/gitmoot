@@ -16,12 +16,16 @@ import (
 type orgLiveSource func(ctx context.Context, cfg config.OrgConfig) (states map[string]org.RoleLiveState, observedAt time.Time, providerVersion string, err error)
 
 type orgSharedState struct {
-	Config         config.OrgConfig
-	Presence       map[string]db.OrgRolePresence
-	Store          *db.Store
-	MaxMissedWakes int
-	MissedWakes    map[string]int
-	Warnings       []string
+	Config          config.OrgConfig
+	Presence        map[string]db.OrgRolePresence
+	Store           *db.Store
+	MaxMissedWakes  int
+	MissedWakes     map[string]int
+	Warnings        []string
+	jobCounts       map[string]map[string]int
+	jobCountsLoaded bool
+	blockedEpisodes []db.BlockedEpisode
+	blockedLoaded   bool
 }
 
 type orgLiveSourceError struct {
@@ -84,13 +88,13 @@ func herdrOrgLiveSource(ctx context.Context, cfg config.OrgConfig) (map[string]o
 
 // storeOrgLiveSource derives live state entirely from persisted Gitmoot data.
 // It does not construct or contact a Herdr provider.
-func storeOrgLiveSource(shared orgSharedState) orgLiveSource {
+func storeOrgLiveSource(shared *orgSharedState) orgLiveSource {
 	return func(ctx context.Context, cfg config.OrgConfig) (map[string]org.RoleLiveState, time.Time, string, error) {
-		episodes, err := shared.Store.ListBlockedEpisodes(ctx)
+		episodes, err := shared.loadBlockedEpisodes(ctx)
 		if err != nil {
 			return nil, time.Time{}, "", err
 		}
-		jobCounts, err := shared.Store.CountJobsByOrgRoleSince(ctx, time.Time{})
+		jobCounts, err := shared.loadJobCounts(ctx)
 		if err != nil {
 			return nil, time.Time{}, "", err
 		}
@@ -117,7 +121,35 @@ func storeOrgLiveSource(shared orgSharedState) orgLiveSource {
 	}
 }
 
-func buildOrgStatusRows(ctx context.Context, shared orgSharedState, src orgLiveSource, command string) ([]orgStatusOutput, error) {
+func (shared *orgSharedState) loadBlockedEpisodes(ctx context.Context) ([]db.BlockedEpisode, error) {
+	if shared.blockedLoaded {
+		return shared.blockedEpisodes, nil
+	}
+	episodes, err := shared.Store.ListBlockedEpisodes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	shared.blockedEpisodes = episodes
+	shared.blockedLoaded = true
+	return episodes, nil
+}
+
+// loadJobCounts caches the indexed queued/running counts for one overview
+// projection. Presence and recycle enrichment share the same snapshot.
+func (shared *orgSharedState) loadJobCounts(ctx context.Context) (map[string]map[string]int, error) {
+	if shared.jobCountsLoaded {
+		return shared.jobCounts, nil
+	}
+	counts, err := shared.Store.CountCurrentJobsByOrgRole(ctx)
+	if err != nil {
+		return nil, err
+	}
+	shared.jobCounts = counts
+	shared.jobCountsLoaded = true
+	return counts, nil
+}
+
+func buildOrgStatusRows(ctx context.Context, shared *orgSharedState, src orgLiveSource, command string) ([]orgStatusOutput, error) {
 	states, observedAt, providerVersion, err := src(ctx, shared.Config)
 	if err != nil {
 		return nil, &orgLiveSourceError{err: err}
@@ -142,10 +174,11 @@ func buildOrgStatusRows(ctx context.Context, shared orgSharedState, src orgLiveS
 		if command == "status" {
 			recycleAfter := shared.Config.RecycleAfterFor(role.Name)
 			if recycleAfter > 0 {
-				activeJobs, err := shared.Store.CountActiveJobsByOrgRole(ctx, role.Name)
+				jobCounts, err := shared.loadJobCounts(ctx)
 				if err != nil {
 					return nil, fmt.Errorf("count active jobs for role %q: %w", role.Name, err)
 				}
+				activeJobs := jobCounts[role.Name]["queued"] + jobCounts[role.Name]["running"]
 				recycleStatus = orgRecycleStatus(seen.LastSeenAt, observedNow, live.State, activeJobs, recycleAfter)
 				recycleAfterText = formatOrgRecycleAfter(recycleAfter)
 			}

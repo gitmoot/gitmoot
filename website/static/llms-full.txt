@@ -7023,6 +7023,9 @@ read them.
 The changelog feed comes from `/api/brain/events`, whose `total` reports the
 exact append-only event count. Selecting an event loads `/api/brain/fact?id=ID`,
 which can return active, retired, or superseded facts for historical inspection.
+Fact-detail and Knowledge payloads also include injection and direct-recall
+counts plus their last-use timestamps; these distinguish unused facts without
+turning absence of usage into an automatic retirement decision.
 
 ## Agents
 
@@ -9234,6 +9237,8 @@ prompt as a read-only "Prior learnings" reference block (never instructions).
 The block can include `[linked]` facts reached from persisted memory links, and
 non-empty blocks end with a footer pointing the agent to
 `gitmoot memory recall "<query>" --agent <agent-name>` for on-demand recall.
+Live prompt injection and direct recall hits maintain best-effort per-fact usage
+counters; preview/eval reads and linked-only recall expansion do not count.
 Enrollment is per agent via `[agents.<name>].memory = true` plus an optional
 `[memory]` section; inspect the store read-only with `gitmoot memory list`. For
 owner-curated memory, `gitmoot memory ingest` stages Markdown as pending
@@ -10812,7 +10817,9 @@ resolved role table.
 
 The registry uses `[org] enforce = "warn"|"block"` and
 `[org.roles."name"]` entries with `parent`, `scope`, `merge_rule`, and an
-optional `pane` Herdr binding (used by org event-rule wakes). There is
+optional `pane` Herdr binding (used by live presence and org event-rule wakes).
+The binding resolves as an exact live pane label first, then as a literal pane
+id; roles without a binding retain exact role-name-as-label presence lookup. There is
 exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
 `owner/repo`, and each child scope must be covered by its parent. Malformed
 org configuration fails closed and loudly. `brief` records passive last-seen
@@ -10825,6 +10832,43 @@ wakes)` marker once a role reaches the positive
 `missed_wakes`, `flagged`, and `flag_reason`. The threshold defaults to `0`, so
 flagging is off. Open escalations remain deferred to #1058's resolution and
 correlation contract.
+
+The read-only Org page consumes `GET /api/org` for the store-backed role tree,
+health strip, typed escalations, and current signal feed, plus
+`GET /api/org/role/{name}` for one role's identity, presence, recycle history,
+and today's job counts. These endpoints open SQLite read-only and never contact
+Herdr. Responses are cached for at most 15 seconds; `data_as_of` is the newest
+persisted source timestamp, not the request time. `detection_enabled` is true
+only when `blocked_role_wake_after` is positive and at least one org event rule
+is enabled; otherwise `detection_hint` explains why an empty signal feed is not
+evidence that every role is healthy.
+
+**Session lifecycle (phase 3).** `[org] recycle_after = "24h"` (a duration,
+per-role overridable via `[org.roles."name"] recycle_after`) marks a role
+recycle-overdue once it has been idle at least that long — surfaced read-only in
+the `recycle` column of `org status` (`off | fresh | eligible | overdue`).
+`[org] recycle_enforce = "off" | "warn" | "block"` (default `off`) then, for a
+role past its `recycle_after`, either refuses (`block`) new `--org-role`
+dispatches with an actionable error or logs a one-line advisory (`warn`) — the
+"overgrown sessions become impossible" economics; journaling a handoff note is
+never blocked, so an overdue role can always hand off. `recycle_enforce` needs a
+configured `recycle_after` to have any effect. Both fields are **binary-first**:
+a binary predating them fails closed on a config that uses them, so deploy the
+binary before any config sets them. When `recycle_enforce` is not `off`, an
+overdue refusal or warning also emits a repeating (once per `recycle_after`)
+`org.recycle_overdue` event through the org event sink; route it to a wake with
+`org events rule add --on recycle-overdue --wake <role>`. Notification delivery
+is best-effort — reliable from a foreground `agent ask`, but a short-lived
+`--background`/`orchestrate` dispatch may exit before the wake fires.
+
+`gitmoot org recycle <role> --kind <kind> --handoff "<note>" [--pane <id>]
+[--json] [--home <dir>]` journals a typed handoff in the role-lifecycle workflow
+`org/<role>`, builds the successor's boot prompt from `org brief` plus that
+handoff, and starts the requested Herdr agent kind in `--pane` or the role's
+configured `pane`. A pane binding and non-empty handoff are required. For safety,
+recycle does not kill or send exit keys to the old agent: the pane must already
+be at its interactive shell prompt. The Herdr start wait is bounded to 30
+seconds; a failed start leaves the durable handoff note available for recovery.
 
 Fresh local `agent ask`, `agent run`, `agent review`, `agent implement`,
 `orchestrate`, and `task run` dispatches accept `--org-role <name>` (or the
@@ -10856,9 +10900,9 @@ gitmoot org events rule rm --home /alternate/home <rule-id>
 `--on` accepts `escalation`, `attention`, `guard`, `job-terminal`, or `blocked`.
 `--match` is a case-insensitive substring matched independently against the
 event repo and job id; omit it to match every event of that kind. `--wake` must
-name a declared role whose config sets `pane = "<pane-id-or-label>"` (a value
-with a `:` is a `wX:pY` id, otherwise a pane label resolved to the current id at
-wake time). The daemon calls `herdr agent prompt <pane> <text> --wait --timeout
+name a declared role whose config sets `pane = "<pane-id-or-label>"`. Gitmoot
+first resolves the value as an exact pane label and otherwise uses it as a
+literal pane id. The daemon calls `herdr agent prompt <pane> <text> --wait --timeout
 8000` and treats delivered (`result.type = "agent_prompted"`, or a post-delivery
 `error.code = "timeout"`) apart from stalled (`error.code =
 "agent_prompt_stalled"`). Stalls increment the role's consecutive missed-wake
@@ -11964,6 +12008,12 @@ persisted memory links from the direct matches, appending visible linked facts
 after every direct match and marking their bullets with `[linked]`. `--json`
 returns raw rows for scripts, including `author_ref` when a shared fact preserves
 a different author and `linked_from` when a row came from link expansion.
+Successful live prompt delivery increments per-fact injection telemetry only for
+the entries that fit the token budget; preview/replay/eval reads never increment
+it. A successful `memory recall` increments recall telemetry for direct FTS hits
+only, not linked expansion rows. Both counters are best-effort and can never fail
+the job or recall command. Brain fact and Knowledge JSON expose
+`injectedCount`, `lastInjectedAt`, `recalledCount`, and `lastRecalledAt`.
 `memory replay` is an offline A/B:
 it re-renders recent real jobs' prompts with and
 without the learnings block and reports the injection delta (added tokens,
@@ -12251,8 +12301,11 @@ child's current cluster when available. The operation is idempotent, and
 `--propose` reads every **active** confirmed memory (retired rows excluded),
 computes the current vault `snapshot_hash` (the same anchor `vault export`/`import`
 use), runs deterministic detectors, and writes a reviewable plan artifact
-(`{schema_version, snapshot_hash, proposed_retirements, rewrite_flags, rekeys,
-cross_pool, quality, stale, stats}`). It never changes confirmed memories;
+(`{schema_version, snapshot_hash, proposed_retirements, rewrite_flags,
+never_used_flags, rekeys, cross_pool, quality, stale, stats}`). Facts at least 90
+days old with zero injection and recall usage are listed in the separate
+`never_used_flags` review section; they are never added to automatic retirement
+actions. The proposal never changes confirmed memories;
 quality and enabled staleness passes may add immutable verdict-cache rows. The
 detectors are:
 

@@ -1183,6 +1183,16 @@ wakes)` marker once a role reaches the positive
 flagging is off. Open escalations remain deferred to #1058's resolution and
 correlation contract.
 
+The read-only Org page consumes `GET /api/org` for the store-backed role tree,
+health strip, typed escalations, and current signal feed, plus
+`GET /api/org/role/{name}` for one role's identity, presence, recycle history,
+and today's job counts. These endpoints open SQLite read-only and never contact
+Herdr. Responses are cached for at most 15 seconds; `data_as_of` is the newest
+persisted source timestamp, not the request time. `detection_enabled` is true
+only when `blocked_role_wake_after` is positive and at least one org event rule
+is enabled; otherwise `detection_hint` explains why an empty signal feed is not
+evidence that every role is healthy.
+
 **Session lifecycle (phase 3).** `[org] recycle_after = "24h"` (a duration,
 per-role overridable via `[org.roles."name"] recycle_after`) marks a role
 recycle-overdue once it has been idle at least that long — surfaced read-only in
