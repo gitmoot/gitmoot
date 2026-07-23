@@ -27,8 +27,8 @@ func (d *webDataSource) Org(ctx context.Context) (dashboard.OrgView, error) {
 		return dashboard.OrgView{}, err
 	}
 	// Org-less deployments (the default, plus non-org dashboard hosts) degrade to
-	// an empty view — the page shows the "Org not configured" empty state — rather
-	// than surfacing the "registry disabled" error as an HTTP 500.
+	// an empty view. The page shows the "Org not configured" empty state instead
+	// of surfacing the "registry disabled" error as an HTTP 500.
 	if cfg, cfgErr := config.LoadOrg(paths); cfgErr == nil && !cfg.Enabled() {
 		return dashboard.OrgView{Roles: []dashboard.OrgNode{}, Escalations: []dashboard.OrgEscalation{}, Feed: []dashboard.OrgFeedRow{}}, nil
 	}
@@ -39,7 +39,7 @@ func (d *webDataSource) Org(ctx context.Context) (dashboard.OrgView, error) {
 			return err
 		}
 		body, _, err := d.cacheForDashboard().get(ctx, "org", cursor, dashboardOrgCachePolicy, func(cacheCtx context.Context) ([]byte, error) {
-			view, err := buildDashboardOrg(cacheCtx, paths, store, d.home, time.Now().UTC())
+			view, err := buildDashboardOrg(cacheCtx, paths, store, time.Now().UTC())
 			if err != nil {
 				return nil, err
 			}
@@ -107,7 +107,7 @@ type dashboardOrgInputs struct {
 	dataAsOf         time.Time
 }
 
-func loadDashboardOrgInputs(ctx context.Context, paths config.Paths, store *db.Store, home string) (dashboardOrgInputs, error) {
+func loadDashboardOrgInputs(ctx context.Context, paths config.Paths, store *db.Store) (dashboardOrgInputs, error) {
 	shared, err := loadOrgSharedState(ctx, paths, store)
 	if err != nil {
 		return dashboardOrgInputs{}, err
@@ -141,11 +141,17 @@ func loadDashboardOrgInputs(ctx context.Context, paths config.Paths, store *db.S
 		return dashboardOrgInputs{}, err
 	}
 
-	wakeAfter := resolveBlockedRoleWakeAfter(home)
+	policy, policyErr := config.LoadOrchestratePolicy(paths)
+	wakeAfter := time.Duration(0)
+	if policyErr == nil {
+		wakeAfter = policy.BlockedRoleWakeAfter
+	}
 	enabledRules := hasEnabledEventRule(rules)
 	enabled := wakeAfter > 0 && enabledRules
 	hint := ""
 	switch {
+	case policyErr != nil:
+		hint = "blocked detection off - orchestrate policy is unreadable"
 	case wakeAfter <= 0:
 		hint = "blocked detection off - blocked_role_wake_after is disabled"
 	case !enabledRules:
@@ -159,6 +165,9 @@ func loadDashboardOrgInputs(ctx context.Context, paths config.Paths, store *db.S
 	}
 	for _, presence := range shared.Presence {
 		inputs.observe(presence.LastSeenAt)
+	}
+	for _, presence := range shared.livePresence {
+		inputs.observe(presence.ObservedAt)
 	}
 	for _, episode := range blocked {
 		inputs.observe(episode.UpdatedAt)
@@ -184,8 +193,8 @@ func (i *dashboardOrgInputs) observe(value string) {
 	}
 }
 
-func buildDashboardOrg(ctx context.Context, paths config.Paths, store *db.Store, home string, now time.Time) (dashboard.OrgView, error) {
-	inputs, err := loadDashboardOrgInputs(ctx, paths, store, home)
+func buildDashboardOrg(ctx context.Context, paths config.Paths, store *db.Store, now time.Time) (dashboard.OrgView, error) {
+	inputs, err := loadDashboardOrgInputs(ctx, paths, store)
 	if err != nil {
 		return dashboard.OrgView{}, err
 	}
@@ -205,7 +214,7 @@ func buildDashboardOrg(ctx context.Context, paths config.Paths, store *db.Store,
 		recycleAfter := inputs.shared.Config.RecycleAfterFor(row.Role)
 		_, overdue := dashboardOrgRecycleTiming(row.LastSeenAt, now, recycleAfter)
 		node := dashboard.OrgNode{
-			Name: row.Role, Parent: row.Parent, Depth: row.Depth,
+			Name: row.Role, DisplayName: dashboardOrgDisplayName(inputs.shared.Config, row.Role), Parent: row.Parent, Depth: row.Depth,
 			Scope: append([]string{}, row.Scope...), MergeRule: row.MergeRule, Pane: row.Pane,
 			PresenceState:  dashboardOrgPresenceState(row.ProviderState),
 			PresenceDetail: row.ProviderDetail,
@@ -290,7 +299,7 @@ func buildDashboardOrgRole(ctx context.Context, paths config.Paths, store *db.St
 	remaining, overdue := dashboardOrgRecycleTiming(row.LastSeenAt, now, shared.Config.RecycleAfterFor(role.Name))
 	out := dashboard.OrgRoleView{
 		Identity: dashboard.OrgRoleIdentity{
-			Name: role.Name, Parent: role.Parent, MergeRule: role.MergeRule, Pane: role.Pane,
+			Name: role.Name, DisplayName: role.DisplayName, Parent: role.Parent, MergeRule: role.MergeRule, Pane: role.Pane,
 			Scope: append([]string{}, role.Scope...), Depth: len(path) - 1, Path: append([]string{}, path...),
 		},
 		Presence: dashboard.OrgRolePresence{
@@ -329,6 +338,11 @@ func dashboardOrgPresenceState(state org.LifecycleState) string {
 	default:
 		return "never-seen"
 	}
+}
+
+func dashboardOrgDisplayName(cfg config.OrgConfig, role string) string {
+	configured, _ := cfg.Role(role)
+	return configured.DisplayName
 }
 
 func dashboardOrgBlockedSince(episodes []db.BlockedEpisode) map[string]string {

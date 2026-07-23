@@ -9,20 +9,21 @@ import (
 	"github.com/gitmoot/gitmoot/internal/org"
 )
 
-func TestStoreOrgLiveSourcePrecedence(t *testing.T) {
+func TestStoreOrgLiveSourcePersistedFreshness(t *testing.T) {
+	fresh := time.Now().UTC().Add(-time.Minute)
 	tests := []struct {
-		name     string
-		presence bool
-		jobState string
-		blocked  string
-		want     org.LifecycleState
+		name       string
+		state      org.LifecycleState
+		observedAt time.Time
+		want       org.LifecycleState
 	}{
-		{name: "blocked wins over working", presence: true, jobState: "running", blocked: "role:review", want: org.StateBlocked},
-		{name: "working wins over idle", presence: true, jobState: "running", want: org.StateWorking},
-		{name: "queued is not working", presence: true, jobState: "queued", want: org.StateIdle},
-		{name: "task episode does not block role", presence: true, blocked: "task:repo:review", want: org.StateIdle},
-		{name: "presence is idle", presence: true, want: org.StateIdle},
-		{name: "never seen", want: org.StateUnknown},
+		{name: "fresh blocked", state: org.StateBlocked, observedAt: fresh, want: org.StateBlocked},
+		{name: "fresh working", state: org.StateWorking, observedAt: fresh, want: org.StateWorking},
+		{name: "fresh idle", state: org.StateIdle, observedAt: fresh, want: org.StateIdle},
+		{name: "stale", state: org.StateWorking, observedAt: fresh.Add(-storeOrgLivePresenceMaxAge), want: org.StateUnknown},
+		{name: "done", state: org.StateDone, observedAt: fresh, want: org.StateUnknown},
+		{name: "unknown", state: org.StateUnknown, observedAt: fresh, want: org.StateUnknown},
+		{name: "absent", want: org.StateUnknown},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -33,22 +34,8 @@ func TestStoreOrgLiveSourcePrecedence(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = store.Close() })
 			ctx := context.Background()
-			if test.presence {
-				if err := store.TouchOrgRolePresence(ctx, "review", "test"); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if test.jobState != "" {
-				if err := store.CreateJob(ctx, db.Job{
-					ID: "review-job", Agent: "worker", Type: "ask", State: test.jobState,
-					Payload: `{"acting_org_role":"review"}`,
-				}); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if test.blocked != "" {
-				now := time.Now().UTC()
-				if err := store.UpsertBlockedEpisode(ctx, test.blocked, now, now); err != nil {
+			if !test.observedAt.IsZero() {
+				if err := store.UpsertRoleLivePresence(ctx, "review", string(test.state), test.observedAt); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -56,17 +43,18 @@ func TestStoreOrgLiveSourcePrecedence(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			before := time.Now()
 			states, observedAt, version, err := storeOrgLiveSource(&shared)(ctx, shared.Config)
-			after := time.Now()
 			if err != nil {
 				t.Fatal(err)
 			}
 			if got := states["review"].State; got != test.want {
 				t.Fatalf("review state = %q, want %q", got, test.want)
 			}
-			if version != "store" || observedAt.Before(before) || observedAt.After(after) {
+			if version != "store" {
 				t.Fatalf("source metadata = observed %v version %q", observedAt, version)
+			}
+			if test.want == org.StateUnknown && !observedAt.IsZero() && test.state != org.StateDone && test.state != org.StateUnknown {
+				t.Fatalf("unknown source observedAt = %v, want zero", observedAt)
 			}
 		})
 	}
