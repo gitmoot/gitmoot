@@ -58,6 +58,9 @@ const (
 	// handling (recovery, alerting, cleanup) for that job until a later
 	// job.failed arrives WITHOUT a following job.deferred.
 	EventJobDeferred EventType = "job.deferred"
+	// EventOrgRecycleOverdue is emitted when an organization role crosses its
+	// configured recycle age and the CLI dispatch ingress warns or refuses it.
+	EventOrgRecycleOverdue EventType = "org.recycle_overdue"
 
 	// EventCandidateAwaitingPromotion is emitted once when a SkillOpt template
 	// candidate becomes PENDING (the post-import notify, #471): a new pending

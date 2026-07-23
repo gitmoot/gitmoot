@@ -1703,4 +1703,16 @@ ALTER TABLE confirmed_memories ADD COLUMN last_injected_at TEXT NOT NULL DEFAULT
 ALTER TABLE confirmed_memories ADD COLUMN recalled_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE confirmed_memories ADD COLUMN last_recalled_at TEXT NOT NULL DEFAULT '';
 	`,
+	// #1061 durable de-duplication for recycle-overdue dispatch events. This is
+	// deliberately parallel to org_blocked_episodes: the CLI ingress owns these
+	// episodes and never mutates the daemon's blocked-since state. Appended AFTER
+	// #1078's confirmed_memories telemetry entry — positional versions, never reorder.
+	`
+CREATE TABLE org_recycle_overdue_episodes (
+	subject TEXT PRIMARY KEY,
+	overdue_since TEXT NOT NULL,
+	emitted_at TEXT,
+	updated_at TEXT NOT NULL
+);
+	`,
 }

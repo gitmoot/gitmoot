@@ -15,6 +15,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/org"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -978,6 +979,223 @@ func TestValidateAndTouchActingOrgRoleRecycleEnforcement(t *testing.T) {
 			}
 			if beforeFound && test.seedAt.Equal(old) && after.LastSeenAt == before.LastSeenAt {
 				t.Fatalf("allowed overdue dispatch did not reset last_seen_at: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+type recycleOverdueRecordingSink struct {
+	t      *testing.T
+	store  *db.Store
+	events []events.Event
+}
+
+func (s *recycleOverdueRecordingSink) Emit(ctx context.Context, event events.Event) {
+	s.t.Helper()
+	episodes, err := s.store.ListRecycleOverdueEpisodes(ctx)
+	if err != nil {
+		s.t.Fatalf("ListRecycleOverdueEpisodes(at emit) error = %v", err)
+	}
+	marked := false
+	for _, episode := range episodes {
+		if episode.Subject == event.JobID && episode.EmittedAt != "" {
+			marked = true
+			break
+		}
+	}
+	if !marked {
+		s.t.Fatalf("event emitted before episode mark: event=%+v episodes=%+v", event, episodes)
+	}
+	s.events = append(s.events, event)
+}
+
+func TestRecycleOverdueEventBlockCadenceAndFreshClear(t *testing.T) {
+	home, paths := setupOrgRecycleEnforcementHome(t, "block", "1h")
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.AddEventRule(ctx, db.EventRule{ID: "recycle-overdue", OnKind: "blocked", WakeRole: "owner", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	seedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
+	seedOrgRolePresenceAt(t, paths, "owner", seedAt, "seed")
+	sink := &recycleOverdueRecordingSink{t: t, store: store}
+	originalSink := orgRecycleOverdueEventSink
+	orgRecycleOverdueEventSink = func(ctx context.Context, store *db.Store, _ string) (events.Sink, error) {
+		rules, err := store.ListEventRules(ctx)
+		if err != nil || !hasEnabledEventRule(rules) {
+			return nil, err
+		}
+		return sink, nil
+	}
+	t.Cleanup(func() { orgRecycleOverdueEventSink = originalSink })
+
+	if err := validateAndTouchActingOrgRole(ctx, store, home, "owner", "agent_run"); err == nil {
+		t.Fatal("overdue block dispatch error = nil")
+	}
+	if len(sink.events) != 1 {
+		t.Fatalf("first dispatch events = %+v, want one", sink.events)
+	}
+	ev := sink.events[0]
+	if ev.Type != events.EventOrgRecycleOverdue || ev.JobID != "owner" || ev.RootID != "owner" || ev.Status != "overdue" || ev.Cause != "recycle_overdue" {
+		t.Fatalf("recycle-overdue event = %+v", ev)
+	}
+	if !strings.Contains(ev.Detail, "role owner overdue for recycling") || !strings.Contains(ev.Detail, "since ") {
+		t.Fatalf("recycle-overdue detail = %q", ev.Detail)
+	}
+	episodes, err := store.ListRecycleOverdueEpisodes(ctx)
+	if err != nil || len(episodes) != 1 {
+		t.Fatalf("episodes after first dispatch = %+v err=%v", episodes, err)
+	}
+	if got, want := episodes[0].OverdueSince, seedAt.Add(time.Hour).Format(db.BlockedEpisodeTimeLayout); got != want {
+		t.Fatalf("OverdueSince = %q, want stable threshold %q", got, want)
+	}
+
+	if err := validateAndTouchActingOrgRole(ctx, store, home, "owner", "agent_run"); err == nil {
+		t.Fatal("repeat overdue block dispatch error = nil")
+	}
+	if len(sink.events) != 1 {
+		t.Fatalf("within-interval events = %d, want 1", len(sink.events))
+	}
+	if err := store.MarkRecycleOverdueEpisodeEmitted(ctx, "owner", time.Now().UTC().Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateAndTouchActingOrgRole(ctx, store, home, "owner", "agent_run"); err == nil {
+		t.Fatal("post-interval overdue block dispatch error = nil")
+	}
+	if len(sink.events) != 2 {
+		t.Fatalf("post-interval events = %d, want 2", len(sink.events))
+	}
+	episodes, err = store.ListRecycleOverdueEpisodes(ctx)
+	if err != nil || len(episodes) != 1 || episodes[0].OverdueSince != seedAt.Add(time.Hour).Format(db.BlockedEpisodeTimeLayout) {
+		t.Fatalf("repeat changed episode identity: %+v err=%v", episodes, err)
+	}
+
+	seedOrgRolePresenceAt(t, paths, "owner", time.Now().UTC(), "fresh")
+	if err := validateAndTouchActingOrgRole(ctx, store, home, "owner", "agent_run"); err != nil {
+		t.Fatalf("fresh dispatch error = %v", err)
+	}
+	episodes, err = store.ListRecycleOverdueEpisodes(ctx)
+	if err != nil || len(episodes) != 0 {
+		t.Fatalf("fresh dispatch did not clear episode: %+v err=%v", episodes, err)
+	}
+}
+
+func TestRecycleOverdueEventOffAndNoRuleAreNoOps(t *testing.T) {
+	old := time.Now().UTC().Add(-2 * time.Hour)
+	t.Run("enforcement off", func(t *testing.T) {
+		home, paths := setupOrgRecycleEnforcementHome(t, "off", "1h")
+		store, err := db.Open(paths.Database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		seedOrgRolePresenceAt(t, paths, "owner", old, "seed")
+		calls := 0
+		original := orgRecycleOverdueEventSink
+		orgRecycleOverdueEventSink = func(context.Context, *db.Store, string) (events.Sink, error) {
+			calls++
+			return &recordingSink{}, nil
+		}
+		t.Cleanup(func() { orgRecycleOverdueEventSink = original })
+		if err := validateAndTouchActingOrgRole(context.Background(), store, home, "owner", "agent_run"); err != nil {
+			t.Fatalf("off dispatch error = %v", err)
+		}
+		if calls != 0 {
+			t.Fatalf("off enforcement constructed event sink %d times", calls)
+		}
+	})
+
+	t.Run("no enabled event rule", func(t *testing.T) {
+		home, paths := setupOrgRecycleEnforcementHome(t, "block", "1h")
+		store, err := db.Open(paths.Database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		seedOrgRolePresenceAt(t, paths, "owner", old, "seed")
+		if err := validateAndTouchActingOrgRole(context.Background(), store, home, "owner", "agent_run"); err == nil {
+			t.Fatal("block dispatch error = nil")
+		}
+		episodes, err := store.ListRecycleOverdueEpisodes(context.Background())
+		if err != nil || len(episodes) != 0 {
+			t.Fatalf("no-rule dispatch created episodes: %+v err=%v", episodes, err)
+		}
+	})
+
+	t.Run("fresh dispatch clears a stale episode without a rule", func(t *testing.T) {
+		home, paths := setupOrgRecycleEnforcementHome(t, "block", "1h")
+		store, err := db.Open(paths.Database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		ctx := context.Background()
+		// A prior episode (e.g. from when a rule was enabled) must be cleared by a
+		// later fresh dispatch even with no rule now, so a re-overdue opens fresh.
+		if err := store.UpsertRecycleOverdueEpisode(ctx, "owner", old, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+		seedOrgRolePresenceAt(t, paths, "owner", time.Now().UTC(), "seed")
+		if err := validateAndTouchActingOrgRole(ctx, store, home, "owner", "agent_run"); err != nil {
+			t.Fatalf("fresh dispatch error = %v", err)
+		}
+		episodes, err := store.ListRecycleOverdueEpisodes(ctx)
+		if err != nil || len(episodes) != 0 {
+			t.Fatalf("fresh dispatch left a stale episode (clear must run without a rule): %+v err=%v", episodes, err)
+		}
+	})
+}
+
+func TestRecycleOverdueEventFailurePreservesEnforcementOutcome(t *testing.T) {
+	for _, mode := range []string{"block", "warn"} {
+		t.Run(mode, func(t *testing.T) {
+			home, paths := setupOrgRecycleEnforcementHome(t, mode, "1h")
+			store, err := db.Open(paths.Database)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			seedOrgRolePresenceAt(t, paths, "owner", time.Now().UTC().Add(-2*time.Hour), "seed")
+			originalSink := orgRecycleOverdueEventSink
+			originalEmitter := orgRecycleOverdueEpisodeEmitter
+			originalEventWriter := orgRecycleOverdueEventWriter
+			orgRecycleOverdueEventSink = func(context.Context, *db.Store, string) (events.Sink, error) { return &recordingSink{}, nil }
+			orgRecycleOverdueEpisodeEmitter = func(context.Context, *db.Store, events.Sink, db.RecycleOverdueEpisode, time.Duration, time.Time) error {
+				return errors.New("synthetic emit failure")
+			}
+			var eventWarnings bytes.Buffer
+			orgRecycleOverdueEventWriter = &eventWarnings
+			t.Cleanup(func() {
+				orgRecycleOverdueEventSink = originalSink
+				orgRecycleOverdueEpisodeEmitter = originalEmitter
+				orgRecycleOverdueEventWriter = originalEventWriter
+			})
+
+			var advisory bytes.Buffer
+			originalAdvisory := orgRecycleAdvisoryWriter
+			orgRecycleAdvisoryWriter = &advisory
+			t.Cleanup(func() { orgRecycleAdvisoryWriter = originalAdvisory })
+			err = validateAndTouchActingOrgRole(ctx, store, home, "owner", "agent_run")
+			if (err != nil) != (mode == "block") {
+				t.Fatalf("mode=%s error=%v", mode, err)
+			}
+			if !strings.Contains(eventWarnings.String(), "synthetic emit failure") {
+				t.Fatalf("event failure was not logged: %q", eventWarnings.String())
+			}
+			presence, found, readErr := store.GetOrgRolePresence(ctx, "owner")
+			if readErr != nil || !found {
+				t.Fatalf("presence = %+v found=%v err=%v", presence, found, readErr)
+			}
+			if mode == "warn" && presence.LastCommand != "agent_run" {
+				t.Fatalf("warn emit failure changed allow/touch outcome: %+v", presence)
+			}
+			if mode == "block" && presence.LastCommand != "seed" {
+				t.Fatalf("block emit failure changed refuse/no-touch outcome: %+v", presence)
 			}
 		})
 	}

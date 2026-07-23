@@ -1192,7 +1192,12 @@ dispatches with an actionable error or logs a one-line advisory (`warn`) — the
 never blocked, so an overdue role can always hand off. `recycle_enforce` needs a
 configured `recycle_after` to have any effect. Both fields are **binary-first**:
 a binary predating them fails closed on a config that uses them, so deploy the
-binary before any config sets them.
+binary before any config sets them. When `recycle_enforce` is not `off`, an
+overdue refusal or warning also emits a repeating (once per `recycle_after`)
+`org.recycle_overdue` event through the org event sink; route it to a wake with
+`org events rule add --on recycle-overdue --wake <role>`. Notification delivery
+is best-effort — reliable from a foreground `agent ask`, but a short-lived
+`--background`/`orchestrate` dispatch may exit before the wake fires.
 
 `gitmoot org recycle <role> --kind <kind> --handoff "<note>" [--pane <id>]
 [--json] [--home <dir>]` journals a typed handoff in the role-lifecycle workflow

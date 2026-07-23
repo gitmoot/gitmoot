@@ -10,10 +10,22 @@ import (
 
 func TestMigrationAddsUsageColumns_Idempotent(t *testing.T) {
 	ctx := context.Background()
-	usageMigration := migrations[len(migrations)-1]
+	// Locate the usage migration by content, not by tail position: versions are
+	// positional and later migrations legitimately append after this one.
+	usageIndex := -1
+	for i, m := range migrations {
+		if strings.Contains(m, "ADD COLUMN injected_count") {
+			usageIndex = i
+			break
+		}
+	}
+	if usageIndex < 0 {
+		t.Fatal("usage-columns migration not found")
+	}
+	usageMigration := migrations[usageIndex]
 	for _, column := range []string{"injected_count", "last_injected_at", "recalled_count", "last_recalled_at"} {
 		if !strings.Contains(usageMigration, "ADD COLUMN "+column) {
-			t.Fatalf("tail migration missing %s", column)
+			t.Fatalf("usage migration missing %s", column)
 		}
 	}
 	path := filepath.Join(t.TempDir(), "pre-usage.db")
@@ -28,7 +40,7 @@ func TestMigrationAddsUsageColumns_Idempotent(t *testing.T) {
 	}
 	store := &Store{db: raw}
 	t.Cleanup(func() { _ = store.Close() })
-	for i, migration := range migrations[:len(migrations)-1] {
+	for i, migration := range migrations[:usageIndex] {
 		if err := store.applyMigration(ctx, i+1, migration); err != nil {
 			t.Fatalf("apply pre-usage migration %d: %v", i+1, err)
 		}
@@ -36,7 +48,7 @@ func TestMigrationAddsUsageColumns_Idempotent(t *testing.T) {
 	id := mustUpsert(t, store, ConfirmedMemory{
 		Owner: agentOwner("builder"), Repo: "acme/widget", Scope: "repo", Key: "legacy", Content: "legacy fact",
 	})
-	if err := store.applyMigration(ctx, len(migrations), usageMigration); err != nil {
+	if err := store.applyMigration(ctx, usageIndex+1, usageMigration); err != nil {
 		t.Fatalf("apply usage migration: %v", err)
 	}
 	var injected int64

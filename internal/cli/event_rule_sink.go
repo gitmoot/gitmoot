@@ -204,6 +204,8 @@ func classifyEventRuleKinds(event events.Event) []string {
 		case "ask_gate":
 			return []string{"attention"}
 		}
+	case events.EventOrgRecycleOverdue:
+		return []string{"recycle-overdue"}
 	}
 	return nil
 }

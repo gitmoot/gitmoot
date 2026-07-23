@@ -19,6 +19,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/doctor"
+	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/org"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -78,6 +79,12 @@ var newOrgProvider = func(roles []string) org.Provider { return cockpit.NewHerdr
 var orgDoctorRunner subprocess.Runner = subprocess.ExecRunner{}
 
 var orgRecycleAdvisoryWriter io.Writer = os.Stderr
+
+var orgRecycleOverdueEventWriter io.Writer = os.Stderr
+
+var orgRecycleOverdueEventSink = enabledBlockedSinceEventSink
+
+var orgRecycleOverdueEpisodeEmitter = emitRecycleOverdueEpisode
 
 func runOrg(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
@@ -695,7 +702,16 @@ func validateAndTouchActingOrgRole(ctx context.Context, store *db.Store, home, r
 				return fmt.Errorf("read org role %q presence: %w", configuredRole.Name, err)
 			}
 			if found {
-				age, known, overdue := orgRecycleAge(presence.LastSeenAt, time.Now().UTC(), recycleAfter)
+				now := time.Now().UTC()
+				age, known, overdue := orgRecycleAge(presence.LastSeenAt, now, recycleAfter)
+				if known {
+					overdueSince := time.Time{}
+					if overdue {
+						lastSeen, _ := parseOrgPresenceTime(presence.LastSeenAt)
+						overdueSince = lastSeen.UTC().Add(recycleAfter)
+					}
+					updateRecycleOverdueEpisodeBestEffort(ctx, store, home, configuredRole.Name, overdueSince, recycleAfter, now)
+				}
 				if known && overdue {
 					message := fmt.Sprintf("org role %q is overdue for recycling (idle %s ≥ recycle_after %s); journal a handoff note and recycle before dispatching new work", configuredRole.Name, age, formatOrgRecycleAfter(recycleAfter))
 					if mode == "block" {
@@ -707,6 +723,90 @@ func validateAndTouchActingOrgRole(ctx context.Context, store *db.Store, home, r
 		}
 	}
 	return store.TouchOrgRolePresence(ctx, touchRole, command)
+}
+
+// updateRecycleOverdueEpisodeBestEffort mirrors the blocked-since episode
+// pattern without coupling the CLI ingress to its daemon evaluator. A zero
+// overdueSince means the role is fresh and closes any prior episode. Every
+// failure is advisory-only so event bookkeeping can never change dispatch.
+func updateRecycleOverdueEpisodeBestEffort(ctx context.Context, store *db.Store, home, role string, overdueSince time.Time, repeatAfter time.Duration, now time.Time) {
+	if store == nil || repeatAfter <= 0 {
+		return
+	}
+	// ALWAYS clear on a fresh dispatch, regardless of whether notifications are
+	// enabled, so a prior episode can't linger stale across a rule toggle and
+	// later mis-report overdue_since or wrongly suppress a legitimate emit.
+	if overdueSince.IsZero() {
+		if err := store.ClearRecycleOverdueEpisode(ctx, role); err != nil {
+			fmt.Fprintf(orgRecycleOverdueEventWriter, "warning: org role %q recycle-overdue episode clear failed: %v\n", role, err)
+		}
+		return
+	}
+	// The overdue episode is a notification-dedup record (read only by this emit
+	// path), so open/refresh it and emit only when an org event rule is enabled
+	// (a nil sink otherwise). The wake/webhook is fire-and-forget; on a
+	// short-lived --background/orchestrate dispatch the process may exit before
+	// delivery, so the notification is best-effort (reliable on foreground
+	// `agent ask`). Reliable background delivery is a tracked follow-up.
+	if orgRecycleOverdueEventSink == nil {
+		return
+	}
+	sink, err := orgRecycleOverdueEventSink(ctx, store, home)
+	if err != nil {
+		fmt.Fprintf(orgRecycleOverdueEventWriter, "warning: org role %q recycle-overdue event sink unavailable: %v\n", role, err)
+		return
+	}
+	if sink == nil {
+		return
+	}
+	if err := store.UpsertRecycleOverdueEpisode(ctx, role, overdueSince, now); err != nil {
+		fmt.Fprintf(orgRecycleOverdueEventWriter, "warning: org role %q recycle-overdue episode upsert failed: %v\n", role, err)
+		return
+	}
+	episodes, err := store.ListRecycleOverdueEpisodes(ctx)
+	if err != nil {
+		fmt.Fprintf(orgRecycleOverdueEventWriter, "warning: org role %q recycle-overdue episode read failed: %v\n", role, err)
+		return
+	}
+	for _, episode := range episodes {
+		if episode.Subject != role {
+			continue
+		}
+		if err := orgRecycleOverdueEpisodeEmitter(ctx, store, sink, episode, repeatAfter, now); err != nil {
+			fmt.Fprintf(orgRecycleOverdueEventWriter, "warning: org role %q recycle-overdue event emit failed: %v\n", role, err)
+		}
+		return
+	}
+}
+
+// emitRecycleOverdueEpisode marks before emitting and carries the stable first
+// overdue instant so consumers can distinguish a repeat from a fresh episode.
+func emitRecycleOverdueEpisode(ctx context.Context, store *db.Store, sink events.Sink, episode db.RecycleOverdueEpisode, repeatAfter time.Duration, now time.Time) error {
+	if store == nil || sink == nil || repeatAfter <= 0 {
+		return nil
+	}
+	now = now.UTC()
+	overdueSince, err := time.Parse(db.BlockedEpisodeTimeLayout, episode.OverdueSince)
+	if err != nil {
+		return fmt.Errorf("parse overdue_since %q: %w", episode.OverdueSince, err)
+	}
+	if last := strings.TrimSpace(episode.EmittedAt); last != "" {
+		if lastEmitted, err := time.Parse(db.BlockedEpisodeTimeLayout, last); err == nil && now.Sub(lastEmitted) <= repeatAfter {
+			return nil
+		}
+	}
+	if err := store.MarkRecycleOverdueEpisodeEmitted(ctx, episode.Subject, now); err != nil {
+		return fmt.Errorf("mark recycle-overdue episode emitted: %w", err)
+	}
+	overdueFor := now.Sub(overdueSince)
+	if overdueFor < 0 {
+		overdueFor = 0
+	}
+	detail := fmt.Sprintf("role %s overdue for recycling %s (since %s)", episode.Subject, overdueFor.Round(time.Second), overdueSince.UTC().Format(time.RFC3339))
+	ev := events.NewEvent(events.EventOrgRecycleOverdue, episode.Subject, episode.Subject, "", "overdue", detail, now, workflow.RedactCommentText)
+	ev.Cause = "recycle_overdue"
+	events.EmitEvent(ctx, sink, ev)
+	return nil
 }
 
 func dash(value string) string {
@@ -930,11 +1030,12 @@ func orgEscalateQuestionAndFlags(args []string) (string, []string, bool) {
 }
 
 var eventRuleKinds = map[string]struct{}{
-	"escalation":   {},
-	"attention":    {},
-	"guard":        {},
-	"job-terminal": {},
-	"blocked":      {},
+	"escalation":      {},
+	"attention":       {},
+	"guard":           {},
+	"job-terminal":    {},
+	"blocked":         {},
+	"recycle-overdue": {},
 }
 
 func runOrgEvents(args []string, stdout, stderr io.Writer) int {

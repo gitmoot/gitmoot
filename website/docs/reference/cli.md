@@ -1025,7 +1025,13 @@ shown read-only in the `recycle` column of `org status`
 `--org-role` dispatches from a role past its `recycle_after`, until it hands off
 and recycles; journaling a handoff note is never blocked. `recycle_enforce`
 needs a configured `recycle_after` to take effect. Both are binary-first —
-deploy the binary before any config sets them.
+deploy the binary before any config sets them. When `recycle_enforce` is not
+`off`, an overdue refusal or warning also emits a repeating (once per
+`recycle_after`) `org.recycle_overdue` event through the org event sink; route
+it to a wake with `org events rule add --on recycle-overdue --wake <role>`.
+Notification delivery is best-effort — reliable from a foreground `agent ask`,
+but a short-lived `--background`/`orchestrate` dispatch may exit before the wake
+fires.
 
 Agent `ask`, `run`, `review`, `implement`, and `orchestrate` accept
 `--org-role <name>`. The role is validated and touched before dispatch, then
