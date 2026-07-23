@@ -21,6 +21,42 @@ const (
 	WorkflowAutoNoteAuthor = "daemon"
 )
 
+// WorkflowStatus is the canonical lifecycle vocabulary accepted by new writes.
+// Legacy values remain readable; validation is intentionally write-only.
+type WorkflowStatus string
+
+const (
+	WorkflowStatusActive       WorkflowStatus = "active"
+	WorkflowStatusBlocked      WorkflowStatus = "blocked"
+	WorkflowStatusReadyToMerge WorkflowStatus = "ready_to_merge"
+	WorkflowStatusDone         WorkflowStatus = "done"
+	WorkflowStatusSettled      WorkflowStatus = "settled"
+	WorkflowStatusParked       WorkflowStatus = "parked"
+)
+
+// ValidateWorkflowStatus accepts the canonical lifecycle values and the empty
+// string, which means unset. Existing legacy values are never validated on read.
+func ValidateWorkflowStatus(status string) error {
+	switch WorkflowStatus(status) {
+	case "", WorkflowStatusActive, WorkflowStatusBlocked, WorkflowStatusReadyToMerge,
+		WorkflowStatusDone, WorkflowStatusSettled, WorkflowStatusParked:
+		return nil
+	default:
+		return fmt.Errorf("workflow status must be empty or one of active, blocked, ready_to_merge, done, settled, parked")
+	}
+}
+
+// IsTerminalWorkflowStatus reports the only statuses that leave the active
+// workflow lifecycle: explicit completion and quiescent settlement.
+func IsTerminalWorkflowStatus(status string) bool {
+	switch WorkflowStatus(status) {
+	case WorkflowStatusDone, WorkflowStatusSettled:
+		return true
+	default:
+		return false
+	}
+}
+
 var workflowIssueReferencePattern = regexp.MustCompile(`#([1-9][0-9]*)`)
 
 // WorkflowNote is one append-only external-coordinator journal entry.
@@ -200,49 +236,15 @@ func workflowQueryLimit(limit int) int {
 }
 
 func (s *Store) InsertWorkflowNote(ctx context.Context, note WorkflowNote) (WorkflowNote, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return WorkflowNote{}, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	id, err := insertWorkflowNoteTx(ctx, tx, note)
-	if err != nil {
-		return WorkflowNote{}, err
-	}
-	if err := ensureWorkflowDescriptionTx(ctx, tx, note.WorkflowID); err != nil {
-		return WorkflowNote{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return WorkflowNote{}, err
-	}
-	return s.getWorkflowNote(ctx, id)
+	stored, _, err := s.insertWorkflowNoteWithObservationAndMeta(ctx, note, MemoryObservation{}, WorkflowMeta{}, false, false)
+	return stored, err
 }
 
 // InsertWorkflowNoteWithMeta atomically appends a note and updates the
 // workflow's coordinator handoff metadata with the values from this note.
 func (s *Store) InsertWorkflowNoteWithMeta(ctx context.Context, note WorkflowNote, meta WorkflowMeta) (WorkflowNote, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return WorkflowNote{}, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	noteID, err := insertWorkflowNoteTx(ctx, tx, note)
-	if err != nil {
-		return WorkflowNote{}, err
-	}
-	meta.WorkflowID = note.WorkflowID
-	if err := upsertWorkflowMetaTx(ctx, tx, meta); err != nil {
-		return WorkflowNote{}, err
-	}
-	if !meta.DescriptionSet {
-		if err := ensureWorkflowDescriptionTx(ctx, tx, note.WorkflowID); err != nil {
-			return WorkflowNote{}, err
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return WorkflowNote{}, err
-	}
-	return s.getWorkflowNote(ctx, noteID)
+	stored, _, err := s.insertWorkflowNoteWithObservationAndMeta(ctx, note, MemoryObservation{}, meta, true, false)
+	return stored, err
 }
 
 // InsertWorkflowAutoNoteWithMeta atomically appends one structured daemon note
@@ -309,22 +311,45 @@ func (s *Store) WorkflowAutoNoteExists(ctx context.Context, workflowID, key stri
 // pending memory observation. The note id is part of the stable ingest key and
 // provenance, so both rows are derived and committed in this one transaction.
 func (s *Store) InsertWorkflowNoteWithObservation(ctx context.Context, note WorkflowNote, obs MemoryObservation) (WorkflowNote, MemoryObservation, error) {
-	return s.insertWorkflowNoteWithObservationAndMeta(ctx, note, obs, WorkflowMeta{}, false)
+	return s.insertWorkflowNoteWithObservationAndMeta(ctx, note, obs, WorkflowMeta{}, false, true)
 }
 
 // InsertWorkflowNoteWithObservationAndMeta is the coordinator-metadata variant
 // of InsertWorkflowNoteWithObservation. Note, metadata, and memory observation
 // either all commit or all roll back.
 func (s *Store) InsertWorkflowNoteWithObservationAndMeta(ctx context.Context, note WorkflowNote, obs MemoryObservation, meta WorkflowMeta) (WorkflowNote, MemoryObservation, error) {
-	return s.insertWorkflowNoteWithObservationAndMeta(ctx, note, obs, meta, true)
+	return s.insertWorkflowNoteWithObservationAndMeta(ctx, note, obs, meta, true, true)
 }
 
-func (s *Store) insertWorkflowNoteWithObservationAndMeta(ctx context.Context, note WorkflowNote, obs MemoryObservation, meta WorkflowMeta, writeMeta bool) (WorkflowNote, MemoryObservation, error) {
+func (s *Store) insertWorkflowNoteWithObservationAndMeta(ctx context.Context, note WorkflowNote, obs MemoryObservation, meta WorkflowMeta, writeMeta, writeObservation bool) (WorkflowNote, MemoryObservation, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return WorkflowNote{}, MemoryObservation{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if !writeMeta || !meta.StatusSet {
+		status, err := workflowMetaStatusTx(ctx, tx, note.WorkflowID)
+		if err != nil {
+			return WorkflowNote{}, MemoryObservation{}, err
+		}
+		if IsTerminalWorkflowStatus(status) {
+			if _, err := insertWorkflowNoteTx(ctx, tx, WorkflowNote{
+				WorkflowID: note.WorkflowID,
+				Author:     WorkflowAutoNoteAuthor,
+				Body:       fmt.Sprintf("[auto:workflow:reopened] reopened from %s", status),
+				Repo:       note.Repo,
+			}); err != nil {
+				return WorkflowNote{}, MemoryObservation{}, err
+			}
+			if err := upsertWorkflowMetaTx(ctx, tx, WorkflowMeta{
+				WorkflowID: note.WorkflowID,
+				Status:     string(WorkflowStatusActive),
+				StatusSet:  true,
+			}); err != nil {
+				return WorkflowNote{}, MemoryObservation{}, err
+			}
+		}
+	}
 	noteID, err := insertWorkflowNoteTx(ctx, tx, note)
 	if err != nil {
 		return WorkflowNote{}, MemoryObservation{}, err
@@ -339,6 +364,13 @@ func (s *Store) insertWorkflowNoteWithObservationAndMeta(ctx context.Context, no
 		if err := ensureWorkflowDescriptionTx(ctx, tx, note.WorkflowID); err != nil {
 			return WorkflowNote{}, MemoryObservation{}, err
 		}
+	}
+	if !writeObservation {
+		if err := tx.Commit(); err != nil {
+			return WorkflowNote{}, MemoryObservation{}, err
+		}
+		stored, err := s.getWorkflowNote(ctx, noteID)
+		return stored, MemoryObservation{}, err
 	}
 	obs.Key = "workflow-" + note.WorkflowID + "-" + strconv.FormatInt(noteID, 10)
 	obs.Provenance = fmt.Sprintf("workflow:%s#%d", note.WorkflowID, noteID)
@@ -359,6 +391,15 @@ func (s *Store) insertWorkflowNoteWithObservationAndMeta(ctx context.Context, no
 		return WorkflowNote{}, MemoryObservation{}, err
 	}
 	return stored, obs, nil
+}
+
+func workflowMetaStatusTx(ctx context.Context, tx *sql.Tx, workflowID string) (string, error) {
+	var status string
+	err := tx.QueryRowContext(ctx, `SELECT status FROM workflow_meta WHERE workflow_id = ?`, workflowID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return status, err
 }
 
 func insertWorkflowNoteTx(ctx context.Context, tx *sql.Tx, note WorkflowNote) (int64, error) {
@@ -407,6 +448,11 @@ ON CONFLICT(workflow_id) DO UPDATE SET
 }
 
 func validateWorkflowMeta(meta WorkflowMeta) error {
+	if meta.StatusSet {
+		if err := ValidateWorkflowStatus(meta.Status); err != nil {
+			return err
+		}
+	}
 	for _, field := range []struct {
 		name  string
 		value string

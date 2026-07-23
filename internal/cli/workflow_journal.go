@@ -37,6 +37,8 @@ func runWorkflowJournal(args []string, stdout, stderr io.Writer) int {
 		return runWorkflowDescribe(args[1:], stdout, stderr)
 	case "note":
 		return runWorkflowNote(args[1:], stdout, stderr)
+	case "close":
+		return runWorkflowClose(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown workflow command %q\n\n", args[0])
 		printWorkflowJournalUsage(stderr)
@@ -52,6 +54,7 @@ func printWorkflowJournalUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot workflow show <label> [--json] [--limit N]")
 	fmt.Fprintln(w, "  gitmoot workflow describe <label> \"<text>\" [--json]")
 	fmt.Fprintln(w, "  gitmoot workflow note <label> \"<body>\" [--author A] [--pane P] [--session ID] [--workdir PATH] [--no-auto] [--summary DESCRIPTION] [--status STATUS] [--remember [--remember-status] [--agent NAME] [--repo R]]")
+	fmt.Fprintln(w, "  gitmoot workflow close <label> [--reason R] [--json]")
 }
 
 func runWorkflowList(args []string, stdout, stderr io.Writer) int {
@@ -281,6 +284,67 @@ func runWorkflowDescribe(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+func runWorkflowClose(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("workflow close", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	reason := fs.String("reason", "", "reason for closing the workflow")
+	jsonOutput := fs.Bool("json", false, "print the close result as JSON")
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		if len(args) == 0 {
+			fmt.Fprintln(stderr, "workflow close requires a label")
+			return 2
+		}
+		return 0
+	}
+	label := strings.TrimSpace(args[0])
+	if err := workflowpkg.ValidateWorkflowID(label); err != nil {
+		fmt.Fprintf(stderr, "workflow close: %v\n", err)
+		return 2
+	}
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "workflow close accepts one label")
+		return 2
+	}
+	reasonText := strings.TrimSpace(*reason)
+	closeNoteLen := len("[workflow:close]")
+	if reasonText != "" {
+		closeNoteLen += 1 + len(reasonText)
+	}
+	if closeNoteLen > workflowNoteBodyMax {
+		fmt.Fprintf(stderr, "workflow close reason must produce a note of at most %d bytes\n", workflowNoteBodyMax)
+		return 2
+	}
+	var result db.CloseWorkflowResult
+	if err := withStore(*home, func(store *db.Store) error {
+		var err error
+		result, err = store.CloseWorkflow(context.Background(), label, *reason)
+		return err
+	}); err != nil {
+		fmt.Fprintf(stderr, "workflow close: %v\n", err)
+		return 1
+	}
+	if *jsonOutput {
+		if err := writeJSON(stdout, result); err != nil {
+			fmt.Fprintf(stderr, "workflow close: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	if result.AlreadyTerminal {
+		fmt.Fprintf(stdout, "workflow %s already terminal (%s)\n", label, result.Status)
+		return 0
+	}
+	fmt.Fprintf(stdout, "closed workflow %s\n", label)
+	return 0
+}
+
 const workflowTextLineMaxRunes = 512
 
 // terminalSafeWorkflowText is used only by the plain-text renderer. Storage and
@@ -440,6 +504,12 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 	if len(*status) > workflowSummaryMax {
 		fmt.Fprintf(stderr, "workflow note status must be at most %d bytes\n", workflowSummaryMax)
 		return 2
+	}
+	if statusSet {
+		if err := db.ValidateWorkflowStatus(*status); err != nil {
+			fmt.Fprintf(stderr, "workflow note: %v\n", err)
+			return 2
+		}
 	}
 	if !*remember && (strings.TrimSpace(*agent) != "" || strings.TrimSpace(*repo) != "" || *rememberStatus) {
 		fmt.Fprintln(stderr, "workflow note: --agent, --repo, and --remember-status require --remember")

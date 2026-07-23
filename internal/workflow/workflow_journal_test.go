@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"database/sql"
 	"strings"
 	"testing"
 
@@ -124,7 +125,19 @@ func TestRecordPullRequestWorkflowTransitionConditionallyUpdatesStatus(t *testin
 			ctx := context.Background()
 			event := seedWorkflowJournalLifecycle(t, store, TaskReviewing)
 			if tc.initial != "" {
-				if _, err := store.InsertWorkflowNoteWithMeta(ctx,
+				if tc.initial == "PR #123 open" {
+					raw, err := sql.Open("sqlite", store.DatabasePath())
+					if err != nil {
+						t.Fatalf("open raw database: %v", err)
+					}
+					if _, err := raw.ExecContext(ctx, `UPDATE workflow_meta SET status = ? WHERE workflow_id = ?`, tc.initial, "release/lifecycle"); err != nil {
+						_ = raw.Close()
+						t.Fatalf("seed legacy status: %v", err)
+					}
+					if err := raw.Close(); err != nil {
+						t.Fatalf("close raw database: %v", err)
+					}
+				} else if _, err := store.InsertWorkflowNoteWithMeta(ctx,
 					db.WorkflowNote{WorkflowID: "release/lifecycle", Author: "operator", Body: "status seed"},
 					db.WorkflowMeta{Status: tc.initial, StatusSet: true}); err != nil {
 					t.Fatalf("seed status: %v", err)

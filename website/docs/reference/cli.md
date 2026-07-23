@@ -1132,7 +1132,8 @@ gitmoot job list --workflow fable/dashboard-redesign
 gitmoot workflow list
 gitmoot workflow show fable/dashboard-redesign --limit 100
 gitmoot workflow describe fable/dashboard-redesign "Coordinate and ship the dashboard redesign."
-gitmoot workflow note fable/dashboard-redesign "Kickoff." --author operator --status "Implementation started"
+gitmoot workflow note fable/dashboard-redesign "Implementation started." --author operator --status active
+gitmoot workflow close fable/dashboard-redesign --reason "Shipped and verified."
 ```
 
 List/show include state counts, notes, first/last activity, and best-effort token
@@ -1141,7 +1142,9 @@ also renders labels as Galaxy hubs and provides a Workflows index plus mission
 log at `/workflows/<label>`. `active` means queued/running; `recent` means no work
 is live but activity occurred within 30 minutes; failed/blocked workflows with
 an unacknowledged failure and 30 minutes to 24 hours of silence are `stalled`;
-everything else is `settled`. The optional `--pane`, `--session`, and
+everything else is `settled`. A `done` or `settled` status immediately projects
+as settled regardless of note recency, unless queued/running work makes it
+active. The optional `--pane`, `--session`, and
 `--workdir` note flags persist the latest coordinator handoff. Inside Herdr,
 omitted identity flags are filled from the current pane: its label, full agent
 session UUID, and working directory. Explicit flags always win; `--no-auto`
@@ -1154,7 +1157,17 @@ auto-seeded from a referenced local issue title, else the first note sentence,
 else the label campaign; override it with `workflow describe`. Legacy
 `workflow note --summary` remains a description alias and mirrors the retained
 summary field for older clients. `workflow note --status` is the manual status
-escape hatch. Each field is limited to 300 bytes.
+control and accepts only `active`, `blocked`, `ready_to_merge`, `done`,
+`settled`, or `parked` (plus an explicit empty value to unset it). Put free-text
+detail in the note body. Legacy status strings remain readable but cannot be
+written anew. Each metadata field is limited to 300 bytes.
+
+`workflow close <label> [--reason "..."]` refuses queued/running work, appends
+a typed `[workflow:close]` note, and sets status to `done` atomically. Repeating
+close on `done` or `settled` is an idempotent success without another close
+note. A later note without explicit `--status` writes a preceding
+`[auto:workflow:reopened]` receipt and returns the workflow to `active`;
+explicit status remains authoritative.
 
 Linked PR transitions add structured `[auto:pr:...]` notes as author `daemon`
 and advance status at open, checks-green/ready-to-merge, and merged or

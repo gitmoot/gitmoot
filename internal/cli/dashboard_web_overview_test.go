@@ -199,7 +199,7 @@ func TestDashboardOverviewTasksAndWorkflows(t *testing.T) {
 	}
 	mergedReceipt, inserted, err := store.InsertWorkflowAutoNoteWithMeta(ctx,
 		db.WorkflowNote{WorkflowID: "ops/merge-settled", Author: db.WorkflowAutoNoteAuthor, Body: "[auto:pr:987:merged] PR #987 merged"},
-		db.WorkflowMeta{WorkflowID: "ops/merge-settled", Status: "PR #987 merged", StatusSet: true})
+		db.WorkflowMeta{WorkflowID: "ops/merge-settled", Status: string(db.WorkflowStatusActive), StatusSet: true})
 	if err != nil || !inserted {
 		t.Fatalf("InsertWorkflowAutoNoteWithMeta = (inserted=%v, err=%v)", inserted, err)
 	}

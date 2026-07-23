@@ -24,12 +24,18 @@ func TestDeriveDashboardWorkflowState(t *testing.T) {
 	tests := []struct {
 		name     string
 		activity dashboardWorkflowActivity
+		status   string
 		state    string
 		stalled  int64
 	}{
 		{name: "running stays active", activity: dashboardWorkflowActivity{Running: 1, LastActivity: now.Add(-48 * time.Hour)}, state: "active"},
 		{name: "queued stays active", activity: dashboardWorkflowActivity{Queued: 1, LastActivity: now.Add(-48 * time.Hour)}, state: "active"},
-		{name: "recent terminal is recent", activity: dashboardWorkflowActivity{LastActivity: now.Add(-10 * time.Minute)}, state: "recent"},
+		{name: "terminal with running work stays active", activity: dashboardWorkflowActivity{Running: 1, LastActivity: now.Add(-48 * time.Hour)}, status: "done", state: "active"},
+		{name: "terminal with queued work stays active", activity: dashboardWorkflowActivity{Queued: 1, LastActivity: now.Add(-48 * time.Hour)}, status: "settled", state: "active"},
+		{name: "recent done is settled", activity: dashboardWorkflowActivity{LastActivity: now.Add(-10 * time.Minute)}, status: "done", state: "settled"},
+		{name: "recent settled is settled", activity: dashboardWorkflowActivity{LastActivity: now.Add(-10 * time.Minute)}, status: "settled", state: "settled"},
+		{name: "recent quiet is recent", activity: dashboardWorkflowActivity{LastActivity: now.Add(-10 * time.Minute)}, state: "recent"},
+		{name: "legacy status keeps existing derivation", activity: dashboardWorkflowActivity{LastActivity: now.Add(-10 * time.Minute)}, status: "PR #1 open", state: "recent"},
 		{name: "unacknowledged failure is stalled", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-31 * time.Minute), LastFailure: now.Add(-31 * time.Minute)}, state: "stalled", stalled: 31 * 60},
 		{name: "unacknowledged block is stalled", activity: dashboardWorkflowActivity{Blocked: 1, LastActivity: now.Add(-23 * time.Hour), LastFailure: now.Add(-23 * time.Hour)}, state: "stalled", stalled: 23 * 60 * 60},
 		{name: "human note before failure does not acknowledge", activity: dashboardWorkflowActivity{Failed: 1, LastActivity: now.Add(-40 * time.Minute), LastFailure: now.Add(-40 * time.Minute), LastHumanNote: now.Add(-2 * time.Hour)}, state: "stalled", stalled: 40 * 60},
@@ -49,11 +55,43 @@ func TestDeriveDashboardWorkflowState(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			state, stalled := deriveDashboardWorkflowState(now, test.activity)
+			state, stalled := deriveDashboardWorkflowState(now, test.activity, test.status)
 			if state != test.state || stalled != test.stalled {
 				t.Fatalf("derive = (%q, %d), want (%q, %d)", state, stalled, test.state, test.stalled)
 			}
 		})
+	}
+}
+
+func TestDashboardWorkflowTerminalStatusIndexAndDetailAgree(t *testing.T) {
+	t.Parallel()
+	home, store := workflowJournalTestHome(t)
+	ctx := context.Background()
+	const label = "release/terminal"
+	payload := workflow.JobPayload{WorkflowID: label, Repo: "acme/widget", TaskTitle: "Terminal workflow"}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "terminal-job", Agent: "worker", Type: "ask", State: "succeeded", Payload: mustJSON(t, payload),
+	}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if _, err := store.InsertWorkflowNoteWithMeta(ctx,
+		db.WorkflowNote{WorkflowID: label, Author: "operator", Body: "[workflow:close] shipped"},
+		db.WorkflowMeta{Status: string(db.WorkflowStatusDone), StatusSet: true}); err != nil {
+		t.Fatalf("InsertWorkflowNoteWithMeta: %v", err)
+	}
+	store.Close()
+
+	ds := &webDataSource{home: home}
+	entries, err := ds.Workflows(ctx)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("Workflows = %+v, err=%v", entries, err)
+	}
+	detail, err := ds.Workflow(ctx, label, dashboard.WorkflowQuery{})
+	if err != nil {
+		t.Fatalf("Workflow: %v", err)
+	}
+	if entries[0].State != "settled" || detail.State != "settled" {
+		t.Fatalf("terminal state mismatch: index=%q detail=%q", entries[0].State, detail.State)
 	}
 }
 
@@ -506,7 +544,7 @@ func TestDashboardWorkflowDaemonNotesDoNotAcknowledgeFailuresOrImpersonateCoordi
 	}
 	auto, inserted, err := store.InsertWorkflowAutoNoteWithMeta(ctx,
 		db.WorkflowNote{WorkflowID: label, Author: db.WorkflowAutoNoteAuthor, Body: "[auto:pr:958:closed] PR #958 closed without merging"},
-		db.WorkflowMeta{WorkflowID: label, Status: "PR #958 closed without merging", StatusSet: true})
+		db.WorkflowMeta{WorkflowID: label, Status: string(db.WorkflowStatusActive), StatusSet: true})
 	if err != nil || !inserted {
 		t.Fatalf("Insert daemon note = (inserted=%v, err=%v)", inserted, err)
 	}
@@ -556,7 +594,7 @@ func TestDashboardWorkflowDaemonNotesDoNotAcknowledgeFailuresOrImpersonateCoordi
 	}
 	merged, inserted, err := store.InsertWorkflowAutoNoteWithMeta(ctx,
 		db.WorkflowNote{WorkflowID: label, Author: db.WorkflowAutoNoteAuthor, Body: "[auto:pr:958:merged] PR #958 merged"},
-		db.WorkflowMeta{WorkflowID: label, Status: "PR #958 merged", StatusSet: true})
+		db.WorkflowMeta{WorkflowID: label, Status: string(db.WorkflowStatusActive), StatusSet: true})
 	if err != nil || !inserted {
 		t.Fatalf("Insert merged daemon note = (inserted=%v, err=%v)", inserted, err)
 	}
@@ -628,7 +666,7 @@ func TestDashboardWorkflowDescriptionStatusAPI(t *testing.T) {
 	ctx := context.Background()
 	const label = "release/api-fields"
 	description := strings.Repeat("d", db.WorkflowMetaTextMax)
-	status := strings.Repeat("s", db.WorkflowMetaTextMax)
+	status := string(db.WorkflowStatusBlocked)
 	payload, err := json.Marshal(workflow.JobPayload{WorkflowID: label, Repo: "acme/widget", TaskTitle: "API fields"})
 	if err != nil {
 		t.Fatal(err)
@@ -660,7 +698,7 @@ func TestDashboardWorkflowDescriptionStatusAPI(t *testing.T) {
 		t.Fatalf("index entries=%+v err=%v body=%s", entries, err, indexRecorder.Body.String())
 	}
 	if entries[0].Description != description || entries[0].Status != status || entries[0].Summary != description {
-		t.Fatalf("index entry lost untruncated fields: description=%d status=%d entry=%+v", len(entries[0].Description), len(entries[0].Status), entries[0])
+		t.Fatalf("index entry lost fields: description=%d status=%q entry=%+v", len(entries[0].Description), entries[0].Status, entries[0])
 	}
 
 	detailRecorder := httptest.NewRecorder()

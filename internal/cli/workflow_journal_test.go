@@ -445,9 +445,9 @@ func TestWorkflowNoteDescriptionStatusSetPreserveClearAndLimit(t *testing.T) {
 		return code
 	}
 
-	runNote("kickoff", "--summary", "Ship the dashboard redesign.", "--status", "Implementation started")
+	runNote("kickoff", "--summary", "Ship the dashboard redesign.", "--status", "active")
 	meta, err := store.GetWorkflowMeta(ctx, workflowID)
-	if err != nil || meta.Summary != "Ship the dashboard redesign." || meta.Description != meta.Summary || meta.Status != "Implementation started" {
+	if err != nil || meta.Summary != "Ship the dashboard redesign." || meta.Description != meta.Summary || meta.Status != "active" {
 		t.Fatalf("metadata after set = %+v, err=%v", meta, err)
 	}
 	var stdout, stderr bytes.Buffer
@@ -455,14 +455,14 @@ func TestWorkflowNoteDescriptionStatusSetPreserveClearAndLimit(t *testing.T) {
 		t.Fatalf("workflow show exit=%d stderr=%q", code, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "description: Ship the dashboard redesign.\n") ||
-		!strings.Contains(stdout.String(), "status: Implementation started\n") ||
+		!strings.Contains(stdout.String(), "status: active\n") ||
 		!strings.Contains(stdout.String(), "summary: Ship the dashboard redesign.\n") {
 		t.Fatalf("workflow show missing metadata headers: %q", stdout.String())
 	}
 
 	runNote("progress")
 	meta, err = store.GetWorkflowMeta(ctx, workflowID)
-	if err != nil || meta.Description != "Ship the dashboard redesign." || meta.Status != "Implementation started" {
+	if err != nil || meta.Description != "Ship the dashboard redesign." || meta.Status != "active" {
 		t.Fatalf("metadata after absent flags = %+v, err=%v", meta, err)
 	}
 
@@ -488,6 +488,123 @@ func TestWorkflowNoteDescriptionStatusSetPreserveClearAndLimit(t *testing.T) {
 	}, &stdout, &stderr)
 	if code != 2 || !strings.Contains(stderr.String(), "workflow note status must be at most 300 bytes") {
 		t.Fatalf("over-length status exit=%d stderr=%q", code, stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = runWorkflowJournal([]string{
+		"note", workflowID, "bad status", "--status", "Implementation started", "--home", home,
+	}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "active, blocked, ready_to_merge, done, settled, parked") {
+		t.Fatalf("invalid status exit=%d stderr=%q", code, stderr.String())
+	}
+}
+
+func TestWorkflowCloseReasonJSONAndUnknownLabel(t *testing.T) {
+	home, store := workflowJournalTestHome(t)
+	ctx := context.Background()
+	const label = "release/close-cli"
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "close-cli-job", Agent: "coord", Type: "ask", State: "succeeded",
+		Payload: `{"repo":"acme/widget","workflow_id":"release/close-cli"}`,
+	}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := runWorkflowJournal([]string{
+		"close", label, "--reason", "shipped successfully", "--home", home, "--json",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("workflow close exit=%d stderr=%q", code, stderr.String())
+	}
+	var result db.CloseWorkflowResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decode close result: %v body=%s", err, stdout.String())
+	}
+	if result.Status != db.WorkflowStatusDone || result.Note == nil ||
+		result.Note.Body != "[workflow:close] shipped successfully" {
+		t.Fatalf("close result = %+v", result)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = runWorkflowJournal([]string{"close", "release/missing", "--home", home}, &stdout, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), `workflow "release/missing" not found`) {
+		t.Fatalf("unknown close exit=%d stderr=%q", code, stderr.String())
+	}
+}
+
+func TestWorkflowNoteExplicitStatusBypassesReopen(t *testing.T) {
+	home, store := workflowJournalTestHome(t)
+	ctx := context.Background()
+	const label = "release/explicit-cli"
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "explicit-cli-job", Agent: "coord", Type: "ask", State: "succeeded",
+		Payload: `{"repo":"acme/widget","workflow_id":"release/explicit-cli"}`,
+	}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if _, err := store.InsertWorkflowNoteWithMeta(ctx,
+		db.WorkflowNote{WorkflowID: label, Body: "settled seed"},
+		db.WorkflowMeta{Status: string(db.WorkflowStatusSettled), StatusSet: true}); err != nil {
+		t.Fatalf("seed settled: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := runWorkflowJournal([]string{
+		"note", label, "operator block", "--status", "blocked", "--no-auto", "--home", home,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("workflow note exit=%d stderr=%q", code, stderr.String())
+	}
+	meta, err := store.GetWorkflowMeta(ctx, label)
+	if err != nil || meta.Status != string(db.WorkflowStatusBlocked) {
+		t.Fatalf("meta = %+v, err=%v", meta, err)
+	}
+	notes, err := store.ListWorkflowNotes(ctx, label, 0)
+	if err != nil || len(notes) != 2 {
+		t.Fatalf("notes = %+v, err=%v", notes, err)
+	}
+	for _, note := range notes {
+		if strings.HasPrefix(note.Body, "[auto:workflow:reopened]") {
+			t.Fatalf("explicit status emitted reopen receipt: %+v", notes)
+		}
+	}
+}
+
+func TestWorkflowNoteWithoutStatusReopensDoneWorkflow(t *testing.T) {
+	home, store := workflowJournalTestHome(t)
+	ctx := context.Background()
+	const label = "release/reopen-cli"
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "reopen-cli-job", Agent: "coord", Type: "ask", State: "succeeded",
+		Payload: `{"repo":"acme/widget","workflow_id":"release/reopen-cli"}`,
+	}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if _, err := store.InsertWorkflowNoteWithMeta(ctx,
+		db.WorkflowNote{WorkflowID: label, Body: "[workflow:close] shipped"},
+		db.WorkflowMeta{Status: string(db.WorkflowStatusDone), StatusSet: true}); err != nil {
+		t.Fatalf("seed done: %v", err)
+	}
+	const body = "follow-up note\nkept verbatim"
+	var stdout, stderr bytes.Buffer
+	code := runWorkflowJournal([]string{
+		"note", label, body, "--author", "operator", "--no-auto", "--home", home,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("workflow note exit=%d stderr=%q", code, stderr.String())
+	}
+	meta, err := store.GetWorkflowMeta(ctx, label)
+	if err != nil || meta.Status != string(db.WorkflowStatusActive) {
+		t.Fatalf("meta = %+v, err=%v", meta, err)
+	}
+	notes, err := store.ListWorkflowNotes(ctx, label, 0)
+	if err != nil || len(notes) != 3 {
+		t.Fatalf("notes = %+v, err=%v", notes, err)
+	}
+	if notes[1].Body != "[auto:workflow:reopened] reopened from done" ||
+		notes[2].Body != body || notes[2].Author != "operator" {
+		t.Fatalf("reopen ordering/content = %+v", notes)
 	}
 }
 

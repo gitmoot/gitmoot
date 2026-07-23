@@ -43,10 +43,13 @@ func dashboardActivityFromSummary(summary db.WorkflowSummary, lastAt int64) dash
 
 // deriveDashboardWorkflowState is the single lifecycle definition shared by
 // workflow index and detail responses.
-func deriveDashboardWorkflowState(now time.Time, activity dashboardWorkflowActivity) (state string, stalledForS int64) {
+func deriveDashboardWorkflowState(now time.Time, activity dashboardWorkflowActivity, status string) (state string, stalledForS int64) {
 	age := now.Sub(activity.LastActivity)
 	if activity.Queued > 0 || activity.Running > 0 {
 		return "active", 0
+	}
+	if db.IsTerminalWorkflowStatus(status) {
+		return "settled", 0
 	}
 	// A merged receipt records the daemon's observation time (note created_at),
 	// not the true GitHub merge time. A failure landing in the poll window before
@@ -138,7 +141,7 @@ func dashboardWorkflowEntries(ctx context.Context, store *db.Store, now time.Tim
 
 func dashboardWorkflowEntry(now time.Time, summary db.WorkflowSummary, meta db.WorkflowMeta, repos []string) dashboardWorkflowAPIEntry {
 	lastAt := parseJobTimeMillis(summary.LastAt)
-	state, stalledFor := deriveDashboardWorkflowState(now, dashboardActivityFromSummary(summary, lastAt))
+	state, stalledFor := deriveDashboardWorkflowState(now, dashboardActivityFromSummary(summary, lastAt), meta.Status)
 	author := strings.TrimSpace(meta.Author)
 	if author == "" {
 		author = strings.TrimSpace(summary.LastHumanAuthor)

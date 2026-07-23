@@ -361,13 +361,13 @@ func TestWorkflowAutoNotePreservesCoordinatorAuthor(t *testing.T) {
 	// empty so a daemon receipt cannot replace the coordinator identity.
 	_, inserted, err := store.InsertWorkflowAutoNoteWithMeta(ctx,
 		WorkflowNote{WorkflowID: workflowID, Author: WorkflowAutoNoteAuthor, Body: "[auto:pr:958:opened] PR #958 opened (feature/958)"},
-		WorkflowMeta{WorkflowID: workflowID, Status: "PR #958 open", StatusSet: true})
+		WorkflowMeta{WorkflowID: workflowID, Status: string(WorkflowStatusActive), StatusSet: true})
 	if err != nil || !inserted {
 		t.Fatalf("InsertWorkflowAutoNoteWithMeta = (inserted=%v, err=%v)", inserted, err)
 	}
 
 	meta, err := store.GetWorkflowMeta(ctx, workflowID)
-	if err != nil || meta.Author != "fable" || meta.Pane != "Gitmoot2" || meta.SessionID != "full-session" || meta.WorkDir != "/work/fable" || meta.Status != "PR #958 open" {
+	if err != nil || meta.Author != "fable" || meta.Pane != "Gitmoot2" || meta.SessionID != "full-session" || meta.WorkDir != "/work/fable" || meta.Status != string(WorkflowStatusActive) {
 		t.Fatalf("metadata after production-shaped auto note = %+v, err=%v", meta, err)
 	}
 }
@@ -381,7 +381,7 @@ func TestWorkflowSummarySeparatesDaemonNotesFromHumanAcknowledgment(t *testing.T
 	}
 	if _, inserted, err := store.InsertWorkflowAutoNoteWithMeta(ctx,
 		WorkflowNote{WorkflowID: workflowID, Author: WorkflowAutoNoteAuthor, Body: "[auto:pr:958:closed] PR #958 closed without merging"},
-		WorkflowMeta{WorkflowID: workflowID, Status: "PR #958 closed without merging", StatusSet: true}); err != nil || !inserted {
+		WorkflowMeta{WorkflowID: workflowID, Status: string(WorkflowStatusActive), StatusSet: true}); err != nil || !inserted {
 		t.Fatalf("InsertWorkflowAutoNoteWithMeta = (inserted=%v, err=%v)", inserted, err)
 	}
 
@@ -434,7 +434,7 @@ func TestWorkflowSummaryTracksMergedDaemonReceipt(t *testing.T) {
 		if fixture.author == WorkflowAutoNoteAuthor {
 			if _, inserted, err := store.InsertWorkflowAutoNoteWithMeta(ctx,
 				WorkflowNote{WorkflowID: fixture.workflowID, Author: fixture.author, Body: fixture.body},
-				WorkflowMeta{WorkflowID: fixture.workflowID, Status: fixture.body, StatusSet: true}); err != nil || !inserted {
+				WorkflowMeta{WorkflowID: fixture.workflowID, Status: string(WorkflowStatusActive), StatusSet: true}); err != nil || !inserted {
 				t.Fatalf("InsertWorkflowAutoNoteWithMeta(%q) = (inserted=%v, err=%v)", fixture.workflowID, inserted, err)
 			}
 			continue
@@ -485,11 +485,11 @@ func TestWorkflowMetaTextSetPreserveClearAndLimit(t *testing.T) {
 	write("kickoff", WorkflowMeta{
 		Author: "coord", Summary: "Ship the dashboard redesign.", SummarySet: true,
 		Description: "Stable intent", DescriptionSet: true,
-		Status: "Starting", StatusSet: true,
+		Status: string(WorkflowStatusActive), StatusSet: true,
 	})
 	write("progress", WorkflowMeta{Author: "coord"})
 	meta, err := store.GetWorkflowMeta(ctx, workflowID)
-	if err != nil || meta.Summary != "Ship the dashboard redesign." || meta.Description != "Stable intent" || meta.Status != "Starting" {
+	if err != nil || meta.Summary != "Ship the dashboard redesign." || meta.Description != "Stable intent" || meta.Status != string(WorkflowStatusActive) {
 		t.Fatalf("metadata after omitted update = %+v, err=%v", meta, err)
 	}
 
@@ -505,7 +505,6 @@ func TestWorkflowMetaTextSetPreserveClearAndLimit(t *testing.T) {
 	}{
 		{name: "summary", meta: WorkflowMeta{Summary: strings.Repeat("s", WorkflowMetaTextMax+1), SummarySet: true}},
 		{name: "description", meta: WorkflowMeta{Description: strings.Repeat("d", WorkflowMetaTextMax+1), DescriptionSet: true}},
-		{name: "status", meta: WorkflowMeta{Status: strings.Repeat("x", WorkflowMetaTextMax+1), StatusSet: true}},
 	} {
 		t.Run(tc.name+"_over_limit", func(t *testing.T) {
 			if _, err := store.InsertWorkflowNoteWithMeta(ctx,
