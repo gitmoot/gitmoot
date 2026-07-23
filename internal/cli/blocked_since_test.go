@@ -205,6 +205,119 @@ blocked_role_wake_after = "1h"
 	}
 }
 
+// TestRunBlockedRoleWakeOncePersistsPresenceWithWakeDisabled guards #1118: org
+// live-presence must populate even when blocked-role WAKING is off
+// (blocked_role_wake_after=0, the default), i.e. presence is decoupled from wake.
+func TestRunBlockedRoleWakeOncePersistsPresenceWithWakeDisabled(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No blocked_role_wake_after override → defaults to 0 (waking disabled).
+	if _, err := file.WriteString(`
+[org]
+enforce = "warn"
+[org.roles."owner"]
+scope = ["*"]
+merge_rule = "owner"
+pane = "Gitmoot"
+`); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if got := resolveBlockedRoleWakeAfter(home); got != 0 {
+		t.Fatalf("resolveBlockedRoleWakeAfter() = %s, want 0 (disabled)", got)
+	}
+
+	now := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	snapshot := org.Snapshot{
+		States:     map[string]org.RoleLiveState{"owner": {State: org.StateWorking}},
+		ObservedAt: now, ProviderVersion: "test-v1",
+	}
+	availability := &fakeBlockedRoleAvailability{available: true}
+	sink := &recordingSink{}
+	deps := blockedRoleWakeDependencies{
+		availability: availability,
+		provider:     func([]config.OrgRole) org.Provider { return orgFixtureProvider{snapshot: snapshot} },
+		eventSink:    func(context.Context, *db.Store, string) (events.Sink, error) { return sink, nil },
+	}
+
+	var output bytes.Buffer
+	runBlockedRoleWakeOnce(context.Background(), store, home, &output, now, deps)
+
+	// Presence persists despite waking being disabled — the #1118 decoupling.
+	livePresence, err := store.ListRoleLivePresence(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(livePresence) != 1 || livePresence[0].Role != "owner" || livePresence[0].State != string(org.StateWorking) {
+		t.Fatalf("presence not persisted with wake disabled: %+v (output=%s)", livePresence, output.String())
+	}
+	// Waking is disabled → the snapshot was still taken (availability probed) but
+	// NO blocked-role evaluation ran, so no events were emitted.
+	if availability.calls != 1 {
+		t.Fatalf("availability calls = %d, want 1", availability.calls)
+	}
+	if got := len(sink.byType(events.EventJobBlocked)); got != 0 {
+		t.Fatalf("blocked events with waking disabled = %d, want 0", got)
+	}
+}
+
+// TestRunBlockedRoleWakeOnceSkipsSilentlyWithNoOrgRolesConfigured guards the
+// regression a high review caught in #1118's first pass: a herdr-less/no-org
+// deployment (the common OSS/automated-user case) must NEVER probe herdr or log
+// on this once-a-minute loop — with zero org roles configured there is nothing
+// to snapshot, so the availability check (and its diagnostic line) must not run.
+func TestRunBlockedRoleWakeOnceSkipsSilentlyWithNoOrgRolesConfigured(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	availability := &fakeBlockedRoleAvailability{available: false}
+	deps := blockedRoleWakeDependencies{
+		availability: availability,
+		provider: func([]config.OrgRole) org.Provider {
+			t.Fatal("provider factory must not be called with zero org roles configured")
+			return nil
+		},
+		eventSink: func(context.Context, *db.Store, string) (events.Sink, error) {
+			t.Fatal("event sink must not be resolved with zero org roles configured")
+			return nil, nil
+		},
+	}
+
+	var output bytes.Buffer
+	runBlockedRoleWakeOnce(context.Background(), store, home, &output, time.Now().UTC(), deps)
+
+	if availability.calls != 0 {
+		t.Fatalf("availability.Available calls = %d, want 0 (herdr must not be probed)", availability.calls)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("output = %q, want empty (no log spam for an unconfigured daemon)", output.String())
+	}
+}
+
 // TestBlockedSinceReNudgesOncePerIntervalWhileStillBlocked pins the self-healing
 // semantic: while a subject stays blocked it is re-nudged at most once per
 // wakeAfter, not a single durable one-shot (so a dropped wake recovers).

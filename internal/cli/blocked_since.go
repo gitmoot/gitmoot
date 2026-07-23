@@ -174,16 +174,7 @@ func startBlockedRoleWakeLoop(ctx context.Context, store *db.Store, home string,
 // evaluation. It swallows and logs every failure so the background lane can
 // never affect daemon supervision.
 func runBlockedRoleWakeOnce(ctx context.Context, store *db.Store, home string, stdout io.Writer, now time.Time, deps blockedRoleWakeDependencies) {
-	wakeAfter := resolveBlockedRoleWakeAfter(home)
-	if wakeAfter <= 0 || store == nil || deps.eventSink == nil {
-		return
-	}
-	sink, err := deps.eventSink(ctx, store, home)
-	if err != nil {
-		writeLine(stdout, "blocked_since role event sink unavailable: %v", err)
-		return
-	}
-	if sink == nil || deps.availability == nil || !deps.availability.Available(ctx) {
+	if store == nil {
 		return
 	}
 	configFile := resolveConfigFile(home)
@@ -195,11 +186,30 @@ func runBlockedRoleWakeOnce(ctx context.Context, store *db.Store, home string, s
 		writeLine(stdout, "blocked_since role org config load failed: %v", err)
 		return
 	}
-	if deps.provider == nil {
+	roles := orgConfig.Roles()
+	if len(roles) == 0 {
+		// No org roles configured: there is nothing to snapshot or persist, so
+		// skip silently (matches the pre-#1118 behavior for an unconfigured
+		// daemon). Checking this FIRST means a herdr-less/no-org deployment — the
+		// common OSS/automated-user case — never probes herdr and never logs.
 		return
 	}
-	provider := deps.provider(orgConfig.Roles())
+	// Herdr reachability gates the snapshot that BOTH org live-presence and the
+	// blocked-role wake need. This return was previously silent, which made a
+	// broken /org page impossible to diagnose from daemon.log for a deployment
+	// that DOES configure org roles (#1118). Scoped to the roles-configured case
+	// above so it cannot spam an unconfigured daemon's log every tick.
+	if deps.availability == nil || !deps.availability.Available(ctx) {
+		writeLine(stdout, "blocked_since role loop: herdr not available; org presence + wake skipped this tick")
+		return
+	}
+	if deps.provider == nil {
+		writeLine(stdout, "blocked_since role loop: nil org presence provider factory; skipped")
+		return
+	}
+	provider := deps.provider(roles)
 	if provider == nil {
+		writeLine(stdout, "blocked_since role loop: nil org presence provider; skipped")
 		return
 	}
 	snapshotCtx, cancel := context.WithTimeout(ctx, blockedRoleSnapshotTimeout)
@@ -213,7 +223,26 @@ func runBlockedRoleWakeOnce(ctx context.Context, store *db.Store, home string, s
 		writeLine(stdout, "blocked_since role snapshot skipped: observed_at is zero")
 		return
 	}
+
+	// Org live-presence persists on EVERY tick herdr is reachable, INDEPENDENT of
+	// whether blocked-role waking is enabled — the /org page must populate even
+	// when blocked_role_wake_after is 0 (its default). Coupling these was #1118.
 	persistOrgRoleLivePresence(ctx, store, snapshot, stdout)
+
+	// Blocked-role WAKE evaluation is the opt-in half: only when a wake threshold
+	// is configured and the blocked-role event rule yields a sink.
+	wakeAfter := resolveBlockedRoleWakeAfter(home)
+	if wakeAfter <= 0 || deps.eventSink == nil {
+		return
+	}
+	sink, err := deps.eventSink(ctx, store, home)
+	if err != nil {
+		writeLine(stdout, "blocked_since role event sink unavailable: %v", err)
+		return
+	}
+	if sink == nil {
+		return
+	}
 	if err := evaluateBlockedRoleEpisodes(ctx, store, sink, snapshot, wakeAfter, stdout, now.UTC()); err != nil {
 		writeLine(stdout, "blocked_since role evaluation failed: %v", err)
 	}
