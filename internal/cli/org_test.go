@@ -318,8 +318,45 @@ merge_rule = "self"
 func withOrgProvider(t *testing.T, provider org.Provider) {
 	t.Helper()
 	original := newOrgProvider
-	newOrgProvider = func([]string) org.Provider { return provider }
+	newOrgProvider = func([]config.OrgRole) org.Provider { return provider }
 	t.Cleanup(func() { newOrgProvider = original })
+}
+
+func TestOrgProviderSnapshotPassesRolePaneBindings(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(`
+[org.roles."owner"]
+scope = ["*"]
+pane = "Gitmoot"
+[org.roles."review"]
+parent = "owner"
+scope = ["gitmoot/*"]
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	original := newOrgProvider
+	var got []config.OrgRole
+	newOrgProvider = func(roles []config.OrgRole) org.Provider {
+		got = append([]config.OrgRole(nil), roles...)
+		return orgFixtureProvider{snapshot: org.Snapshot{ObservedAt: time.Now()}}
+	}
+	t.Cleanup(func() { newOrgProvider = original })
+
+	if _, err := orgProviderSnapshot(context.Background(), cfg); err != nil {
+		t.Fatalf("orgProviderSnapshot() error = %v", err)
+	}
+	if len(got) != 2 || got[0].Name != "owner" || got[0].Pane != "Gitmoot" || got[1].Name != "review" {
+		t.Fatalf("provider roles = %+v", got)
+	}
 }
 
 func TestRunOrgBriefChartStatusAndPresence(t *testing.T) {

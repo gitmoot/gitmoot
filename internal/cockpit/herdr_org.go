@@ -9,12 +9,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/org"
 )
 
 type herdrOrgProvider struct {
 	run   runner
-	roles []string
+	roles []config.OrgRole
 	now   func() time.Time
 }
 
@@ -23,15 +24,14 @@ const (
 	herdrOrgRecycleDeadline  = 35 * time.Second
 )
 
-// NewHerdrOrgProvider returns the v1 organization live-state provider. Role
-// identity is exact pane-label equality; runtime/agent names are never inferred.
-func NewHerdrOrgProvider(roles []string) org.Provider {
+// NewHerdrOrgProvider returns the v1 organization live-state provider.
+func NewHerdrOrgProvider(roles []config.OrgRole) org.Provider {
 	return newHerdrOrgProvider(newExecRunner("herdr"), roles, time.Now)
 }
 
-func newHerdrOrgProvider(run runner, roles []string, now func() time.Time) *herdrOrgProvider {
-	roles = append([]string(nil), roles...)
-	sort.Strings(roles)
+func newHerdrOrgProvider(run runner, roles []config.OrgRole, now func() time.Time) *herdrOrgProvider {
+	roles = append([]config.OrgRole(nil), roles...)
+	sort.Slice(roles, func(i, j int) bool { return roles[i].Name < roles[j].Name })
 	return &herdrOrgProvider{run: run, roles: roles, now: now}
 }
 
@@ -40,6 +40,7 @@ type herdrOrgSnapshotResult struct {
 		Snapshot struct {
 			Version json.RawMessage `json:"version"`
 			Panes   []struct {
+				PaneID      string `json:"pane_id"`
 				Label       string `json:"label"`
 				AgentStatus string `json:"agent_status"`
 			} `json:"panes"`
@@ -68,23 +69,55 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 	}
 
 	byLabel := map[string][]string{}
+	labelToPaneIDs := map[string][]string{}
+	statusByPaneID := map[string]string{}
 	for _, pane := range decoded.Result.Snapshot.Panes {
-		label := pane.Label
-		if label == "" {
-			continue
+		// Mirror the wake resolver (herdr.go resolvePaneByLabel, which matches only
+		// `p.PaneID != ""`): a pane with an empty pane_id is not a resolvable
+		// target. Seeding it would collide every empty-id pane on the "" key of
+		// statusByPaneID and let a binding read the wrong pane's status.
+		if pane.PaneID != "" {
+			statusByPaneID[pane.PaneID] = pane.AgentStatus
+			if pane.Label != "" {
+				labelToPaneIDs[pane.Label] = append(labelToPaneIDs[pane.Label], pane.PaneID)
+			}
 		}
-		byLabel[label] = append(byLabel[label], pane.AgentStatus)
+		if pane.Label != "" {
+			byLabel[pane.Label] = append(byLabel[pane.Label], pane.AgentStatus)
+		}
 	}
 	states := make(map[string]org.RoleLiveState, len(p.roles))
 	for _, role := range p.roles {
-		matches := byLabel[role]
+		binding := strings.TrimSpace(role.Pane)
+		if binding != "" {
+			if len(labelToPaneIDs[binding]) > 1 {
+				states[role.Name] = org.RoleLiveState{State: org.StateUnknown, Detail: fmt.Sprintf("multiple Herdr panes labeled %q", binding)}
+				continue
+			}
+			paneID, _ := config.ResolveRolePaneBinding(ctx, binding, func(_ context.Context, label string) (string, bool) {
+				ids := labelToPaneIDs[label]
+				if len(ids) == 1 {
+					return ids[0], true
+				}
+				return "", false
+			})
+			status, present := statusByPaneID[paneID]
+			if !present {
+				states[role.Name] = org.RoleLiveState{State: org.StateUnknown, Detail: fmt.Sprintf("no Herdr pane bound as %q", binding)}
+				continue
+			}
+			states[role.Name] = mapHerdrAgentStatus(status)
+			continue
+		}
+
+		matches := byLabel[role.Name]
 		switch len(matches) {
 		case 0:
-			states[role] = org.RoleLiveState{State: org.StateUnknown, Detail: "no Herdr pane has this exact role label"}
+			states[role.Name] = org.RoleLiveState{State: org.StateUnknown, Detail: "no Herdr pane has this exact role label"}
 		case 1:
-			states[role] = mapHerdrAgentStatus(matches[0])
+			states[role.Name] = mapHerdrAgentStatus(matches[0])
 		default:
-			states[role] = org.RoleLiveState{State: org.StateUnknown, Detail: "multiple Herdr panes have this exact role label"}
+			states[role.Name] = org.RoleLiveState{State: org.StateUnknown, Detail: "multiple Herdr panes have this exact role label"}
 		}
 	}
 	now := time.Now

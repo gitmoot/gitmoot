@@ -118,10 +118,12 @@ enforce = "warn"
 [org.roles."owner"]
 scope = ["*"]
 merge_rule = "owner"
+pane = "Gitmoot"
 [org.roles."review"]
 parent = "owner"
 scope = ["gitmoot/*"]
 merge_rule = "self"
+pane = "Gitmoot Review"
 [orchestrate]
 blocked_role_wake_after = "1h"
 `); err != nil {
@@ -147,11 +149,11 @@ blocked_role_wake_after = "1h"
 	}
 	availability := &fakeBlockedRoleAvailability{available: true}
 	sink := &recordingSink{}
-	var providerRoles []string
+	var providerRoles []config.OrgRole
 	deps := blockedRoleWakeDependencies{
 		availability: availability,
-		provider: func(roles []string) org.Provider {
-			providerRoles = append([]string(nil), roles...)
+		provider: func(roles []config.OrgRole) org.Provider {
+			providerRoles = append([]config.OrgRole(nil), roles...)
 			return orgFixtureProvider{snapshot: snapshot}
 		},
 		eventSink: func(context.Context, *db.Store, string) (events.Sink, error) { return sink, nil },
@@ -166,7 +168,9 @@ blocked_role_wake_after = "1h"
 	if len(blocked) != 1 {
 		t.Fatalf("job.blocked events = %d, want 1; output=%s", len(blocked), output.String())
 	}
-	if len(providerRoles) != 2 || providerRoles[0] != "owner" || providerRoles[1] != "review" {
+	if len(providerRoles) != 2 ||
+		providerRoles[0].Name != "owner" || providerRoles[0].Pane != "Gitmoot" ||
+		providerRoles[1].Name != "review" || providerRoles[1].Pane != "Gitmoot Review" {
 		t.Fatalf("provider roles = %v", providerRoles)
 	}
 	ev := blocked[0]

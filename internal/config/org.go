@@ -17,8 +17,8 @@ type OrgRole struct {
 	Parent    string
 	Scope     []string
 	MergeRule string
-	// Pane optionally binds this role to a Herdr pane for event-rule wakes. It is
-	// advisory and unused unless an enabled event rule targets the role.
+	// Pane optionally binds this role to a Herdr pane for live presence and
+	// event-rule wakes.
 	Pane         string
 	RecycleAfter time.Duration
 }

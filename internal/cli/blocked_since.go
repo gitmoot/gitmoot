@@ -33,7 +33,7 @@ type blockedRoleAvailability interface {
 
 type blockedRoleWakeDependencies struct {
 	availability blockedRoleAvailability
-	provider     func([]string) org.Provider
+	provider     func([]config.OrgRole) org.Provider
 	eventSink    func(context.Context, *db.Store, string) (events.Sink, error)
 }
 
@@ -195,15 +195,10 @@ func runBlockedRoleWakeOnce(ctx context.Context, store *db.Store, home string, s
 		writeLine(stdout, "blocked_since role org config load failed: %v", err)
 		return
 	}
-	roles := orgConfig.Roles()
-	names := make([]string, 0, len(roles))
-	for _, role := range roles {
-		names = append(names, role.Name)
-	}
 	if deps.provider == nil {
 		return
 	}
-	provider := deps.provider(names)
+	provider := deps.provider(orgConfig.Roles())
 	if provider == nil {
 		return
 	}
@@ -335,4 +330,3 @@ func emitBlockedSinceEpisode(ctx context.Context, store *db.Store, sink events.S
 func taskEpisodeSubject(repo, taskID string) string {
 	return "task:" + strings.TrimSpace(repo) + ":" + strings.TrimSpace(taskID)
 }
-

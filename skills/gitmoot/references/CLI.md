@@ -1167,7 +1167,9 @@ resolved role table.
 
 The registry uses `[org] enforce = "warn"|"block"` and
 `[org.roles."name"]` entries with `parent`, `scope`, `merge_rule`, and an
-optional `pane` Herdr binding (used by org event-rule wakes). There is
+optional `pane` Herdr binding (used by live presence and org event-rule wakes).
+The binding resolves as an exact live pane label first, then as a literal pane
+id; roles without a binding retain exact role-name-as-label presence lookup. There is
 exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
 `owner/repo`, and each child scope must be covered by its parent. Malformed
 org configuration fails closed and loudly. `brief` records passive last-seen
@@ -1238,9 +1240,9 @@ gitmoot org events rule rm --home /alternate/home <rule-id>
 `--on` accepts `escalation`, `attention`, `guard`, `job-terminal`, or `blocked`.
 `--match` is a case-insensitive substring matched independently against the
 event repo and job id; omit it to match every event of that kind. `--wake` must
-name a declared role whose config sets `pane = "<pane-id-or-label>"` (a value
-with a `:` is a `wX:pY` id, otherwise a pane label resolved to the current id at
-wake time). The daemon calls `herdr agent prompt <pane> <text> --wait --timeout
+name a declared role whose config sets `pane = "<pane-id-or-label>"`. Gitmoot
+first resolves the value as an exact pane label and otherwise uses it as a
+literal pane id. The daemon calls `herdr agent prompt <pane> <text> --wait --timeout
 8000` and treats delivered (`result.type = "agent_prompted"`, or a post-delivery
 `error.code = "timeout"`) apart from stalled (`error.code =
 "agent_prompt_stalled"`). Stalls increment the role's consecutive missed-wake

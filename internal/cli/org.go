@@ -74,7 +74,7 @@ func fixedOrgPolicy(policy workflow.OrgEnforcement) func(string) workflow.OrgEnf
 	return func(string) workflow.OrgEnforcement { return policy }
 }
 
-var newOrgProvider = func(roles []string) org.Provider { return cockpit.NewHerdrOrgProvider(roles) }
+var newOrgProvider = func(roles []config.OrgRole) org.Provider { return cockpit.NewHerdrOrgProvider(roles) }
 
 var orgDoctorRunner subprocess.Runner = subprocess.ExecRunner{}
 
@@ -584,7 +584,7 @@ func runOrgRecycle(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	provider := newOrgProvider([]string{role.Name})
+	provider := newOrgProvider([]config.OrgRole{role})
 	if provider == nil {
 		fmt.Fprintf(stderr, "org recycle: organization provider is not configured (handoff journaled in workflow %s)\n", workflowID)
 		return 1
@@ -649,12 +649,7 @@ func loadOrgCommandState(ctx context.Context, home string) (config.OrgConfig, ma
 }
 
 func orgProviderSnapshot(ctx context.Context, cfg config.OrgConfig) (org.Snapshot, error) {
-	roles := cfg.Roles()
-	names := make([]string, 0, len(roles))
-	for _, role := range roles {
-		names = append(names, role.Name)
-	}
-	provider := newOrgProvider(names)
+	provider := newOrgProvider(cfg.Roles())
 	if provider == nil {
 		return org.Snapshot{}, errors.New("organization live-state provider is not configured")
 	}

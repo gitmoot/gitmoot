@@ -156,30 +156,18 @@ func (s *eventRuleSink) loadOrgConfig() (config.OrgConfig, bool) {
 
 // resolveRolePane is the v1 config-backed role→pane binding seam. Keeping it in
 // one small method lets a later live registry replace config without changing
-// classification, matching, or wake delivery. The configured value is resolved as
-// a herdr pane LABEL first: a wX:pY pane id matches no pane's label, so an id
-// binding falls through to literal use, while a label — even one that itself
-// contains ':' — resolves to its live pane's CURRENT id (recycle-safe, since ids
-// rot on recycle but a stable label does not).
+// classification, matching, or wake delivery.
 func (s *eventRuleSink) resolveRolePane(ctx context.Context, cfg config.OrgConfig, role string) (pane string, ok bool) {
 	orgRole, ok := cfg.Role(role)
 	if !ok {
 		return "", false
 	}
-	binding := strings.TrimSpace(orgRole.Pane)
-	if binding == "" {
-		return "", false
-	}
-	// Bound the `pane list` resolution so it cannot hang the wake path.
-	resolveCtx, cancel := context.WithTimeout(ctx, eventRuleProbeTimeout)
-	resolved, found := s.wake.ResolvePaneByLabel(resolveCtx, binding)
-	cancel()
-	if found {
-		return resolved, true
-	}
-	// Not a live label: use the value as a literal pane id (best-effort — herdr
-	// no-ops an unknown id, which is the correct outcome for a down role).
-	return binding, true
+	return config.ResolveRolePaneBinding(ctx, orgRole.Pane, func(ctx context.Context, label string) (string, bool) {
+		// Bound the `pane list` resolution so it cannot hang the wake path.
+		resolveCtx, cancel := context.WithTimeout(ctx, eventRuleProbeTimeout)
+		defer cancel()
+		return s.wake.ResolvePaneByLabel(resolveCtx, label)
+	})
 }
 
 func classifyEventRuleKinds(event events.Event) []string {
