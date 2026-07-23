@@ -22,6 +22,7 @@ func TestLoadToolCache(t *testing.T) {
 		{name: "relative dir rejected", content: "[cache]\ndir = \"relative/path\"\n", wantErr: "must be absolute"},
 		{name: "garbage enabled", content: "[cache]\nenabled = maybe\n", wantErr: "invalid [cache].enabled"},
 		{name: "other section", content: "[workflow]\nenabled = false\ndir = \"/should/not/apply\"\n", wantEnabled: true},
+		{name: "malformed header ends cache section", content: "[cache]\nenabled = true\n[workflow\nenabled = false\n", wantEnabled: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

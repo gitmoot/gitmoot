@@ -41,8 +41,16 @@ func LoadToolCache(paths Paths) (ToolCachePolicy, error) {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			current = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]"))
+		if strings.HasPrefix(line, "[") {
+			if strings.HasSuffix(line, "]") {
+				current = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]"))
+			} else {
+				// A malformed header (no closing bracket) ends whatever section
+				// was active rather than silently continuing it — otherwise a
+				// botched "[workflow" typo right after "[cache]" would keep
+				// applying subsequent lines to [cache] instead (#1113 finder).
+				current = ""
+			}
 			continue
 		}
 		if current != "cache" {
