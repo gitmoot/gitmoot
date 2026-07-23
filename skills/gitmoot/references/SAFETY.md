@@ -416,3 +416,23 @@ when the current state is `succeeded`, `failed`, or `cancelled` and the exact
 path matches; then run `git -C <registered-checkout> worktree remove --force
 <path>` followed by `git -C <registered-checkout> worktree prune`. Never remove
 a worktree owned by a blocked, queued, or running job.
+
+## Shared Tool Cache (isolated worktrees)
+
+An isolated-worktree job (a per-job worktree under `$GITMOOT_HOME/worktrees/...`)
+gets `UV_CACHE_DIR`, `PIP_CACHE_DIR`, `npm_config_cache`, `GOCACHE`, and
+`GOMODCACHE` pointed at one shared, host-level directory (default
+`$GITMOOT_HOME/cache/tools`) instead of each isolated job re-materializing its
+own copy of immutable, content-addressed package caches inside its worktree —
+which otherwise grows unbounded with fleet lifetime and is deleted only when
+the reaper removes the worktree (#1113). Enabled by default; set `[cache]
+enabled = false` to opt out, or `[cache] dir = "/absolute/path"` to relocate it
+(must be absolute). The shared directory is created on first use and is never
+swept by worktree teardown. Non-isolated jobs (the persistent registered
+checkout) are unaffected — they do not duplicate caches per job.
+
+Codex is always sandboxed, so this also widens its `--add-dir` writable-path
+allowlist to the shared cache directory; Claude/Kimi `produce` jobs pick up the
+same grant through their existing Landlock write-allowlist. Non-produce
+Claude/Kimi and `shell` runtime jobs already run unsandboxed, so only the env
+redirect applies to them.

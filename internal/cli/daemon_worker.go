@@ -406,6 +406,19 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
 	}
+	// Shared tool-cache grant (#1113 lever 1): disk hygiene, not a security
+	// precondition, so any failure is fail-open (logged, job proceeds without the
+	// cache redirect) rather than failing the job like the produce grants above.
+	// MUST run after applyProduceRuntimeGrants: that call overwrites
+	// agent.WritablePaths for produce jobs, so appending earlier would be lost.
+	var toolCacheEnv []string
+	if cachePaths, cacheErr := w.configPaths(); cacheErr != nil {
+		writeLine(w.Stdout, "job %s tool cache config load failed: %v", job.ID, cacheErr)
+	} else if env, grantErr := applyIsolatedToolCacheGrants(cachePaths, payload, &agent); grantErr != nil {
+		writeLine(w.Stdout, "job %s tool cache grant failed: %v", job.ID, grantErr)
+	} else {
+		toolCacheEnv = env
+	}
 	adapter, err = wrapProduceSandboxAdapter(job.Type, agent, adapter)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
@@ -413,6 +426,13 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
+	}
+	if len(toolCacheEnv) > 0 {
+		if envAdapter, envErr := injectDeliveryAdapterEnv(adapter, toolCacheEnv); envErr != nil {
+			writeLine(w.Stdout, "job %s tool cache env inject failed: %v", job.ID, envErr)
+		} else {
+			adapter = envAdapter
+		}
 	}
 	// Opt-in retained capture is attached to the already-composed adapter so
 	// relay env, credential curation, gateway leases, Landlock, and pipeline
