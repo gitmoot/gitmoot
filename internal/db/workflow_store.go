@@ -650,6 +650,33 @@ func (s *Store) ListWorkflowNotes(ctx context.Context, workflowID string, limit 
 	return notes, rows.Err()
 }
 
+// ListWorkflowNotesByBodyPrefix returns recent journal entries whose body starts
+// with prefix. It supports typed org signal feeds without parsing unrelated
+// workflow notes.
+func (s *Store) ListWorkflowNotesByBodyPrefix(ctx context.Context, prefix string, limit int) ([]WorkflowNote, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 200
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, workflow_id, author, body, repo, memory_observation_id, created_at
+FROM workflow_notes
+WHERE substr(body, 1, length(?)) = ?
+ORDER BY created_at DESC, id DESC
+LIMIT ?`, prefix, prefix, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	notes := []WorkflowNote{}
+	for rows.Next() {
+		var note WorkflowNote
+		if err := rows.Scan(&note.ID, &note.WorkflowID, &note.Author, &note.Body, &note.Repo, &note.MemoryObservationID, &note.CreatedAt); err != nil {
+			return nil, err
+		}
+		notes = append(notes, note)
+	}
+	return notes, rows.Err()
+}
+
 func (s *Store) ListWorkflowSummaries(ctx context.Context) ([]WorkflowSummary, error) {
 	rows, err := s.db.QueryContext(ctx, ListWorkflowSummariesSQL)
 	if err != nil {

@@ -11,7 +11,6 @@ import (
 	"io"
 	"os"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 
@@ -378,85 +377,34 @@ func runOrgOverview(command string, args []string, stdout, stderr io.Writer) int
 		return 2
 	}
 	ctx := context.Background()
-	cfg, presence, store, err := loadOrgCommandState(ctx, *home)
-	if err != nil {
-		fmt.Fprintf(stderr, "org %s: %v\n", command, err)
-		return 1
-	}
-	defer store.Close()
 	paths, err := pathsFromFlag(*home)
 	if err != nil {
 		fmt.Fprintf(stderr, "org %s: %v\n", command, err)
 		return 1
 	}
-	// The missed-wake flag is a best-effort add-on (#1060 slice 2b): an unreadable
-	// [orchestrate] policy or missed-wake table must NEVER break the org chart/status
-	// diagnostic view, so a load error degrades to "flagging off" rather than exit 1.
-	// Reading the counters only when K>0 also keeps them fully invisible when flagging
-	// is disabled (the off-by-default contract — no missed_wakes JSON leak at K=0).
-	maxMissedWakes := 0
-	if policy, err := config.LoadOrchestratePolicy(paths); err != nil {
-		fmt.Fprintf(stderr, "org %s: missed-wake flag disabled (orchestrate policy unreadable): %v\n", command, err)
-	} else {
-		maxMissedWakes = policy.MaxConsecutiveMissedWakes
-	}
-	missedWakes := map[string]int{}
-	if maxMissedWakes > 0 {
-		if rows, err := store.ListRoleMissedWakes(ctx); err != nil {
-			fmt.Fprintf(stderr, "org %s: missed-wake counts unavailable: %v\n", command, err)
-		} else {
-			for _, row := range rows {
-				missedWakes[row.Role] = row.Consecutive
-			}
-		}
-	}
-	snapshot, err := orgProviderSnapshot(ctx, cfg)
+	store, err := db.Open(paths.Database)
 	if err != nil {
-		fmt.Fprintf(stderr, "org %s: Herdr snapshot unavailable: %v\n", command, err)
+		fmt.Fprintf(stderr, "org %s: %v\n", command, err)
 		return 1
 	}
-	roles := cfg.Roles()
-	rows := make([]orgStatusOutput, 0, len(roles))
-	observedNow := time.Now().UTC()
-	for _, role := range roles {
-		live, ok := snapshot.States[role.Name]
-		if !ok {
-			live = org.RoleLiveState{State: org.StateUnknown, Detail: "provider snapshot omitted this role"}
-		}
-		seen := presence[role.Name]
-		consecutive := missedWakes[role.Name]
-		flagged := maxMissedWakes > 0 && consecutive >= maxMissedWakes
-		flagReason := ""
-		if flagged {
-			flagReason = fmt.Sprintf("%d consecutive missed wakes", consecutive)
-		}
-		recycleStatus := ""
-		recycleAfterText := ""
-		if command == "status" {
-			recycleAfter := cfg.RecycleAfterFor(role.Name)
-			if recycleAfter > 0 {
-				activeJobs, err := store.CountActiveJobsByOrgRole(ctx, role.Name)
-				if err != nil {
-					fmt.Fprintf(stderr, "org status: count active jobs for role %q: %v\n", role.Name, err)
-					return 1
-				}
-				recycleStatus = orgRecycleStatus(seen.LastSeenAt, observedNow, live.State, activeJobs, recycleAfter)
-				recycleAfterText = formatOrgRecycleAfter(recycleAfter)
-			}
-		}
-		rows = append(rows, orgStatusOutput{
-			Role: role.Name, Parent: role.Parent, Pane: role.Pane, Depth: len(cfg.Path(role.Name)) - 1,
-			Scope: role.Scope, MergeRule: role.MergeRule, LastSeenAt: seen.LastSeenAt, LastSeenAge: orgPresenceAge(seen.LastSeenAt, observedNow), LastCommand: seen.LastCommand,
-			ProviderState: live.State, ProviderDetail: live.Detail, ObservedAt: snapshot.ObservedAt, ProviderVersion: snapshot.ProviderVersion,
-			RecycleStatus: recycleStatus, RecycleAfter: recycleAfterText,
-			MissedWakes: consecutive, Flagged: flagged, FlagReason: flagReason,
-		})
+	defer store.Close()
+	shared, err := loadOrgSharedState(ctx, paths, store)
+	if err != nil {
+		fmt.Fprintf(stderr, "org %s: %v\n", command, err)
+		return 1
 	}
-	if command == "chart" {
-		sort.Slice(rows, func(i, j int) bool {
-			left, right := strings.Join(cfg.Path(rows[i].Role), "/"), strings.Join(cfg.Path(rows[j].Role), "/")
-			return left < right
-		})
+	for _, warning := range shared.Warnings {
+		fmt.Fprintf(stderr, "org %s: %s\n", command, warning)
+	}
+	rows, err := buildOrgStatusRows(ctx, shared, herdrOrgLiveSource, command)
+	if err != nil {
+		var liveErr *orgLiveSourceError
+		if errors.As(err, &liveErr) {
+			fmt.Fprintf(stderr, "org %s: Herdr snapshot unavailable: %v\n", command, liveErr.err)
+		} else {
+			fmt.Fprintf(stderr, "org %s: %v\n", command, err)
+		}
+		return 1
 	}
 	if *jsonOutput {
 		if err := writeJSON(stdout, rows); err != nil {

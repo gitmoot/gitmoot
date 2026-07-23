@@ -401,6 +401,34 @@ func (s *Store) CountActiveJobsByOrgRole(ctx context.Context, role string) (int,
 	return count, err
 }
 
+// CountJobsByOrgRoleSince returns one grouped state-count projection for all
+// attributed org roles. A zero since includes the full job history.
+func (s *Store) CountJobsByOrgRoleSince(ctx context.Context, since time.Time) (map[string]map[string]int, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT json_extract(payload, '$.acting_org_role') AS role, state, COUNT(*)
+		FROM jobs
+		WHERE json_extract(payload, '$.acting_org_role') IS NOT NULL
+		AND json_extract(payload, '$.acting_org_role') <> ''
+		AND created_at >= ?
+		GROUP BY role, state`, since.UTC().Format("2006-01-02 15:04:05"))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	counts := map[string]map[string]int{}
+	for rows.Next() {
+		var role, state string
+		var count int
+		if err := rows.Scan(&role, &state, &count); err != nil {
+			return nil, err
+		}
+		if counts[role] == nil {
+			counts[role] = map[string]int{}
+		}
+		counts[role][state] = count
+	}
+	return counts, rows.Err()
+}
+
 // listRunningJobsUpdatedBeforeSQL is ListRunningJobsUpdatedBefore's exact query,
 // exported as a package-level const so the plan test (TestListRunningJobsUpdatedBeforeOrder)
 // EXPLAINs the PRODUCTION text (binding the threshold as its `?` parameter) instead of

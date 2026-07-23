@@ -77,6 +77,35 @@ func TestWorkflowStoreAggregatesAndFiltersByIndexedColumn(t *testing.T) {
 	}
 }
 
+func TestListWorkflowNotesByBodyPrefix(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	for _, note := range []WorkflowNote{
+		{WorkflowID: "release/one", Author: "owner", Body: "[org:escalate to=owner] first"},
+		{WorkflowID: "release/two", Author: "review", Body: "[org:handoff role=review] done"},
+		{WorkflowID: "release/three", Author: "owner", Body: "[org:escalate to=owner] second"},
+		{WorkflowID: "release/four", Author: "owner", Body: "ordinary note"},
+	} {
+		if _, err := store.InsertWorkflowNote(ctx, note); err != nil {
+			t.Fatal(err)
+		}
+	}
+	escalations, err := store.ListWorkflowNotesByBodyPrefix(ctx, "[org:escalate ", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(escalations) != 1 || escalations[0].WorkflowID != "release/three" {
+		t.Fatalf("limited escalations = %+v", escalations)
+	}
+	handoffs, err := store.ListWorkflowNotesByBodyPrefix(ctx, "[org:handoff ", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(handoffs) != 1 || handoffs[0].WorkflowID != "release/two" {
+		t.Fatalf("handoffs = %+v", handoffs)
+	}
+}
+
 func TestWorkflowProductionQueriesUseIndexes(t *testing.T) {
 	store := openWorkflowTestStore(t)
 	queries := []struct {
