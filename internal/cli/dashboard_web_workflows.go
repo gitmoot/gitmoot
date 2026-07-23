@@ -45,11 +45,18 @@ func dashboardActivityFromSummary(summary db.WorkflowSummary, lastAt int64) dash
 // workflow index and detail responses.
 func deriveDashboardWorkflowState(now time.Time, activity dashboardWorkflowActivity, status string) (state string, stalledForS int64) {
 	age := now.Sub(activity.LastActivity)
-	if activity.Queued > 0 || activity.Running > 0 {
-		return "active", 0
-	}
+	// A deliberate terminal status (`done` via close, `settled` via auto-settle or
+	// manual --status) leaves the active bucket regardless of note recency AND of
+	// any lingering job. This MUST precede the live-job check: a coordinator
+	// workflow born via `job open` keeps a perpetually-running job for the life of
+	// the coordination, so an explicitly-closed workflow would otherwise read
+	// `active` forever (#1106). Revival is note-based -- reopen-on-note flips a
+	// terminal workflow back to non-terminal, after which live work shows active.
 	if db.IsTerminalWorkflowStatus(status) {
 		return "settled", 0
+	}
+	if activity.Queued > 0 || activity.Running > 0 {
+		return "active", 0
 	}
 	// A merged receipt records the daemon's observation time (note created_at),
 	// not the true GitHub merge time. A failure landing in the poll window before
