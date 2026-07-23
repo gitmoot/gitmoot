@@ -3,8 +3,11 @@ package db
 import (
 	"context"
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidateWorkflowStatus(t *testing.T) {
@@ -260,5 +263,281 @@ func assertNoWorkflowReopenReceipt(t *testing.T, store *Store, label string) {
 		if strings.HasPrefix(note.Body, "[auto:workflow:reopened]") {
 			t.Fatalf("unexpected reopen receipt: %+v", notes)
 		}
+	}
+}
+
+func TestWorkflowPullRequestRefsUnionsJobsAndAutoNotes(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	const label = "release/refs"
+	seedAutoSettleJob(t, store, "ref-job", label, "succeeded", "acme/widget", 5)
+	if _, inserted, err := store.InsertWorkflowAutoNoteWithMeta(ctx,
+		WorkflowNote{
+			WorkflowID: label,
+			Author:     WorkflowAutoNoteAuthor,
+			Body:       "[auto:pr:7:merged] PR #7 merged",
+		},
+		WorkflowMeta{Status: string(WorkflowStatusActive), StatusSet: true}); err != nil || !inserted {
+		t.Fatalf("insert fallback-repo receipt = (inserted=%v, err=%v)", inserted, err)
+	}
+	if _, inserted, err := store.InsertWorkflowAutoNoteWithMeta(ctx,
+		WorkflowNote{
+			WorkflowID: label,
+			Author:     WorkflowAutoNoteAuthor,
+			Body:       "[auto:pr:9:closed] PR #9 closed",
+			Repo:       "acme/other",
+		},
+		WorkflowMeta{Status: string(WorkflowStatusActive), StatusSet: true}); err != nil || !inserted {
+		t.Fatalf("insert explicit-repo receipt = (inserted=%v, err=%v)", inserted, err)
+	}
+	refs, err := store.WorkflowPullRequestRefs(ctx, label)
+	want := []PullRequestRef{
+		{Repo: "acme/other", Number: 9},
+		{Repo: "acme/widget", Number: 5},
+		{Repo: "acme/widget", Number: 7},
+	}
+	if err != nil || !reflect.DeepEqual(refs, want) {
+		t.Fatalf("WorkflowPullRequestRefs = %+v, err=%v, want %+v", refs, err, want)
+	}
+}
+
+func TestWorkflowPullRequestRefsKeepsAmbiguousRepoUnresolved(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	const label = "release/ambiguous"
+	seedAutoSettleJob(t, store, "ref-a", label, "succeeded", "acme/a", 0)
+	seedAutoSettleJob(t, store, "ref-b", label, "succeeded", "acme/b", 0)
+	if _, inserted, err := store.InsertWorkflowAutoNoteWithMeta(ctx,
+		WorkflowNote{
+			WorkflowID: label,
+			Author:     WorkflowAutoNoteAuthor,
+			Body:       "[auto:pr:7:merged] PR #7 merged",
+		},
+		WorkflowMeta{Status: string(WorkflowStatusActive), StatusSet: true}); err != nil || !inserted {
+		t.Fatalf("insert receipt = (inserted=%v, err=%v)", inserted, err)
+	}
+	refs, err := store.WorkflowPullRequestRefs(ctx, label)
+	if err != nil || len(refs) != 1 || refs[0] != (PullRequestRef{Number: 7}) {
+		t.Fatalf("WorkflowPullRequestRefs = %+v, err=%v", refs, err)
+	}
+	settled, err := store.SettleWorkflowIfEligible(ctx, label, time.Now().UTC().Add(48*time.Hour), 24*time.Hour)
+	if err != nil || settled {
+		t.Fatalf("ambiguous ref settled=%v, err=%v", settled, err)
+	}
+}
+
+func TestSettleWorkflowIfEligibleConservativeGates(t *testing.T) {
+	tests := []struct {
+		name       string
+		jobState   string
+		prState    string
+		addPRRow   bool
+		addPRRef   bool
+		recentNote bool
+		recentJob  bool
+		status     string
+		want       bool
+	}{
+		{name: "all terminal", jobState: "succeeded", prState: "merged", addPRRow: true, addPRRef: true, want: true},
+		{name: "closed terminal", jobState: "succeeded", prState: "closed", addPRRow: true, addPRRef: true, want: true},
+		{name: "open PR", jobState: "succeeded", prState: "open", addPRRow: true, addPRRef: true},
+		{name: "missing PR row", jobState: "succeeded", addPRRef: true},
+		{name: "zero PR refs", jobState: "succeeded"},
+		{name: "queued job", jobState: "queued", prState: "merged", addPRRow: true, addPRRef: true},
+		{name: "running job", jobState: "running", prState: "merged", addPRRow: true, addPRRef: true},
+		{name: "recent human note", jobState: "succeeded", prState: "merged", addPRRow: true, addPRRef: true, recentNote: true},
+		{name: "recent job update", jobState: "succeeded", prState: "merged", addPRRow: true, addPRRef: true, recentJob: true},
+		{name: "blocked status", jobState: "succeeded", prState: "merged", addPRRow: true, addPRRef: true, status: "blocked"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := openWorkflowTestStore(t)
+			ctx := context.Background()
+			label := "release/" + strings.ReplaceAll(test.name, " ", "-")
+			pr := 0
+			if test.addPRRef {
+				pr = 11
+			}
+			seedAutoSettleJob(t, store, "job-"+label, label, test.jobState, "acme/widget", pr)
+			note := WorkflowNote{WorkflowID: label, Author: "operator", Body: "human checkpoint"}
+			if test.status != "" {
+				if _, err := store.InsertWorkflowNoteWithMeta(ctx, note,
+					WorkflowMeta{Status: test.status, StatusSet: true}); err != nil {
+					t.Fatalf("insert human note: %v", err)
+				}
+			} else if _, err := store.InsertWorkflowNote(ctx, note); err != nil {
+				t.Fatalf("insert human note: %v", err)
+			}
+			if test.addPRRow {
+				seedAutoSettlePullRequest(t, store, "acme/widget", int64(pr), test.prState)
+			}
+			now := time.Now().UTC().Add(72 * time.Hour)
+			if test.recentNote {
+				setWorkflowNoteTimes(t, store, label, "operator", now.Add(-time.Hour))
+			}
+			if test.recentJob {
+				setWorkflowJobTime(t, store, "job-"+label, now.Add(-time.Hour))
+			}
+			settled, err := store.SettleWorkflowIfEligible(ctx, label, now, 24*time.Hour)
+			if err != nil || settled != test.want {
+				t.Fatalf("SettleWorkflowIfEligible = %v, err=%v, want %v", settled, err, test.want)
+			}
+		})
+	}
+}
+
+func TestSettleWorkflowIfEligibleRequiresEveryReferencedPRTerminal(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	const label = "release/multi-pr"
+	seedAutoSettleJob(t, store, "multi-pr-job", label, "succeeded", "acme/widget", 1)
+	if _, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: label, Author: "operator", Body: "old"}); err != nil {
+		t.Fatalf("insert human note: %v", err)
+	}
+	if _, inserted, err := store.InsertWorkflowAutoNoteWithMeta(ctx,
+		WorkflowNote{
+			WorkflowID: label,
+			Author:     WorkflowAutoNoteAuthor,
+			Body:       "[auto:pr:2:opened] PR #2 opened",
+			Repo:       "acme/widget",
+		},
+		WorkflowMeta{Status: string(WorkflowStatusActive), StatusSet: true}); err != nil || !inserted {
+		t.Fatalf("insert second PR receipt = (inserted=%v, err=%v)", inserted, err)
+	}
+	seedAutoSettlePullRequest(t, store, "acme/widget", 1, "merged")
+	seedAutoSettlePullRequest(t, store, "acme/widget", 2, "open")
+	now := time.Now().UTC().Add(72 * time.Hour)
+	if settled, err := store.SettleWorkflowIfEligible(ctx, label, now, 24*time.Hour); err != nil || settled {
+		t.Fatalf("settled with one open ref = %v, err=%v", settled, err)
+	}
+	seedAutoSettlePullRequest(t, store, "acme/widget", 2, "closed")
+	if settled, err := store.SettleWorkflowIfEligible(ctx, label, now, 24*time.Hour); err != nil || !settled {
+		t.Fatalf("settled after all refs terminal = %v, err=%v", settled, err)
+	}
+}
+
+func TestSettleWorkflowIgnoresRecentDaemonNoteAndIsIdempotent(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	const label = "release/daemon-quiet"
+	seedAutoSettleJob(t, store, "daemon-quiet-job", label, "succeeded", "acme/widget", 17)
+	if _, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: label, Author: "operator", Body: "old human"}); err != nil {
+		t.Fatalf("insert human note: %v", err)
+	}
+	if _, inserted, err := store.InsertWorkflowAutoNoteWithMeta(ctx,
+		WorkflowNote{
+			WorkflowID: label,
+			Author:     WorkflowAutoNoteAuthor,
+			Body:       "[auto:pr:17:merged] PR #17 merged",
+			Repo:       "acme/widget",
+		},
+		WorkflowMeta{Status: string(WorkflowStatusActive), StatusSet: true}); err != nil || !inserted {
+		t.Fatalf("insert daemon receipt = (inserted=%v, err=%v)", inserted, err)
+	}
+	seedAutoSettlePullRequest(t, store, "acme/widget", 17, "merged")
+	now := time.Now().UTC().Add(72 * time.Hour)
+	setWorkflowNoteTimes(t, store, label, WorkflowAutoNoteAuthor, now.Add(-time.Minute))
+
+	candidates, err := store.ListWorkflowAutoSettleCandidates(ctx)
+	if err != nil || len(candidates) != 1 || candidates[0].WorkflowID != label ||
+		now.Sub(candidates[0].QuietAnchor) < 24*time.Hour {
+		t.Fatalf("candidates = %+v, err=%v", candidates, err)
+	}
+	settled, err := store.SettleWorkflowIfEligible(ctx, label, now, 24*time.Hour)
+	if err != nil || !settled {
+		t.Fatalf("first settle = %v, err=%v", settled, err)
+	}
+	settled, err = store.SettleWorkflowIfEligible(ctx, label, now.Add(time.Hour), 24*time.Hour)
+	if err != nil || settled {
+		t.Fatalf("repeat settle = %v, err=%v", settled, err)
+	}
+	notes, err := store.ListWorkflowNotes(ctx, label, 0)
+	if err != nil {
+		t.Fatalf("ListWorkflowNotes: %v", err)
+	}
+	settleNotes := 0
+	for _, note := range notes {
+		if note.Body == "[auto:workflow:settled] merged/closed PRs, quiet ≥ 24h0m0s" {
+			settleNotes++
+		}
+	}
+	if settleNotes != 1 {
+		t.Fatalf("settle note count = %d, notes=%+v", settleNotes, notes)
+	}
+
+	if _, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: label, Author: "operator", Body: "new work"}); err != nil {
+		t.Fatalf("reopen with human note: %v", err)
+	}
+	meta, err := store.GetWorkflowMeta(ctx, label)
+	if err != nil || meta.Status != string(WorkflowStatusActive) {
+		t.Fatalf("meta after reopen = %+v, err=%v", meta, err)
+	}
+}
+
+func TestListWorkflowAutoSettleCandidatesExcludesProtectedStates(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	for _, status := range []WorkflowStatus{
+		WorkflowStatusParked,
+		WorkflowStatusDone,
+		WorkflowStatusSettled,
+		WorkflowStatusBlocked,
+	} {
+		label := "release/" + string(status)
+		seedAutoSettleJob(t, store, label+"-job", label, "succeeded", "acme/widget", 1)
+		if _, err := store.InsertWorkflowNoteWithMeta(ctx,
+			WorkflowNote{WorkflowID: label, Author: "operator", Body: "protected"},
+			WorkflowMeta{Status: string(status), StatusSet: true}); err != nil {
+			t.Fatalf("seed %s: %v", status, err)
+		}
+	}
+	// A journal-only coordinator workflow with no PR reference can never settle,
+	// so it must be excluded from candidates (keeps the per-tick sweep bounded).
+	seedAutoSettleJob(t, store, "journal-job", "release/journal-only", "succeeded", "acme/widget", 0)
+	seedAutoSettleJob(t, store, "active-job", "release/active-candidate", "succeeded", "acme/widget", 1)
+	candidates, err := store.ListWorkflowAutoSettleCandidates(ctx)
+	if err != nil || len(candidates) != 1 || candidates[0].WorkflowID != "release/active-candidate" {
+		t.Fatalf("candidates = %+v, err=%v", candidates, err)
+	}
+}
+
+func seedAutoSettleJob(t *testing.T, store *Store, id, workflowID, state, repo string, pullRequest int) {
+	t.Helper()
+	payload := fmt.Sprintf(`{"repo":%q,"workflow_id":%q,"pull_request":%d}`, repo, workflowID, pullRequest)
+	if err := store.CreateJob(context.Background(), Job{
+		ID: id, Agent: "worker", Type: "ask", State: state, Payload: payload,
+	}); err != nil {
+		t.Fatalf("CreateJob(%s): %v", id, err)
+	}
+}
+
+func seedAutoSettlePullRequest(t *testing.T, store *Store, repo string, number int64, state string) {
+	t.Helper()
+	if err := store.UpsertPullRequest(context.Background(), PullRequest{
+		RepoFullName: repo,
+		Number:       number,
+		URL:          fmt.Sprintf("https://example.invalid/%s/pull/%d", repo, number),
+		HeadBranch:   fmt.Sprintf("feature/%d", number),
+		BaseBranch:   "main",
+		State:        state,
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest(%s#%d): %v", repo, number, err)
+	}
+}
+
+func setWorkflowNoteTimes(t *testing.T, store *Store, workflowID, author string, at time.Time) {
+	t.Helper()
+	if _, err := store.db.ExecContext(context.Background(), `UPDATE workflow_notes
+SET created_at = ? WHERE workflow_id = ? AND author = ?`,
+		at.UTC().Format("2006-01-02 15:04:05"), workflowID, author); err != nil {
+		t.Fatalf("set note times: %v", err)
+	}
+}
+
+func setWorkflowJobTime(t *testing.T, store *Store, jobID string, at time.Time) {
+	t.Helper()
+	if _, err := store.db.ExecContext(context.Background(), `UPDATE jobs SET updated_at = ? WHERE id = ?`,
+		at.UTC().Format("2006-01-02 15:04:05"), jobID); err != nil {
+		t.Fatalf("set job time: %v", err)
 	}
 }

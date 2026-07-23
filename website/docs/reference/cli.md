@@ -1179,6 +1179,18 @@ note. A later note without explicit `--status` writes a preceding
 `[auto:workflow:reopened]` receipt and returns the workflow to `active`;
 explicit status remains authoritative.
 
+The daemon conservatively auto-settles a workflow only when it references at
+least one PR, every referenced PR is locally known as merged or closed, no job
+is queued or running, its status is not `blocked`/`parked`/`done`/`settled`
+(deliberate human-set states are never auto-settled), and the latest human note
+or job update has been quiet for `[workflow].auto_settle_after` (default `24h`;
+set `"0"` to disable). Daemon receipts do not extend the quiet period.
+Auto-settle appends an `[auto:workflow:settled]` note, sets status to `settled`,
+never deletes data, and any later note revives the workflow. Two edges are
+reversible-by-note rather than auto-revived: a task paused at `awaiting_human`
+(still shown in the dashboard Attention section regardless of workflow status),
+and a PR reopened after auto-settle — post a workflow note to revive it.
+
 Linked PR transitions add structured `[auto:pr:...]` notes as author `daemon`
 and advance status at open, checks-green/ready-to-merge, and merged or
 closed-without-merging. The workflow/PR/transition key deduplicates poll replays,

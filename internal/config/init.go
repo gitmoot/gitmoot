@@ -61,6 +61,7 @@ artifact_blobs = %q
 # implement_base = "origin/main"
 # result_checks = "warn"
 # stale_task_ttl = "168h"
+# auto_settle_after = "24h" # default 24h; 0 disables workflow auto-settle
 # delegation_worktree_ttl = "72h"
 # planned_ttl = "720h" # opt-in; unset/empty/0/invalid disables
 # require_workflow = false # opt out (default is true)

@@ -10949,7 +10949,8 @@ gitmoot job list --workflow fable/dashboard-redesign
 gitmoot workflow list
 gitmoot workflow show fable/dashboard-redesign --limit 100
 gitmoot workflow describe fable/dashboard-redesign "Coordinate and ship the dashboard redesign."
-gitmoot workflow note fable/dashboard-redesign "Kickoff." --author operator --status "Implementation started"
+gitmoot workflow note fable/dashboard-redesign "Implementation started." --author operator --status active
+gitmoot workflow close fable/dashboard-redesign --reason "Shipped and verified."
 ```
 
 `workflow list` reports per-state counts, note count, first/last activity, and
@@ -10962,7 +10963,9 @@ while queued/running, `recent` when no work is live but activity occurred within
 30 minutes, `stalled` when failed/blocked with an unacknowledged failure (newer
 than any non-daemon journal note and any merged-PR daemon receipt; other daemon
 receipts never acknowledge) and quiet for 30 minutes to 24 hours, and `settled`
-otherwise. The optional
+otherwise. A workflow whose status is `done` or `settled` leaves the active
+bucket immediately regardless of note recency, unless it has queued/running
+work. The optional
 `--pane`, `--session`, and `--workdir` note flags persist the latest coordinator
 handoff shown on that page. When those flags are omitted inside Herdr
 (`HERDR_SOCKET_PATH` or `HERDR_ENV=1`), `workflow note` reads the current pane
@@ -10978,8 +10981,30 @@ issue title, else the first kickoff-note sentence, else the label campaign.
 `workflow describe <label> "<text>"` overrides it. Legacy `workflow note
 --summary` remains an alias for description and also mirrors the value into the
 retained summary field for older clients. `workflow note --status "..."` is the
-manual status escape hatch. Each field is stored verbatim and limited to 300
+manual status control and accepts only `active`, `blocked`, `ready_to_merge`,
+`done`, `settled`, or `parked` (plus an explicit empty value to unset it).
+Put free-text detail in the note body. Existing legacy status strings remain
+readable but cannot be written anew. Each metadata field is limited to 300
 bytes.
+
+`workflow close <label> [--reason "..."]` refuses workflows with queued/running
+jobs, appends a typed `[workflow:close]` journal note, and sets status to `done`
+atomically. Repeating close on a `done` or `settled` workflow is an idempotent
+success without another close note. A later note without an explicit
+`--status` records a preceding `[auto:workflow:reopened]` receipt and returns
+the workflow to `active`; an explicit status remains authoritative.
+
+The daemon conservatively auto-settles a workflow only when it references at
+least one PR, every referenced PR is locally known as merged or closed, no job
+is queued or running, its status is not `blocked`/`parked`/`done`/`settled`
+(deliberate human-set states are never auto-settled), and the latest human note
+or job update has been quiet for `[workflow].auto_settle_after` (default `24h`;
+set `"0"` to disable). Daemon receipts do not extend the quiet period.
+Auto-settle appends an `[auto:workflow:settled]` note, sets status to `settled`,
+never deletes data, and any later note revives the workflow. Two edges are
+reversible-by-note rather than auto-revived: a task paused at `awaiting_human`
+(still shown in the dashboard Attention section regardless of workflow status),
+and a PR reopened after auto-settle — post a workflow note to revive it.
 
 For a workflow-linked PR, the daemon adds a structured `[auto:pr:...]` note as
 author `daemon` and advances status when the PR opens, checks turn green, and it

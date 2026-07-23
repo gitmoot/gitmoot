@@ -107,6 +107,9 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 				wait = baseInterval
 			}
 			if !dryRun {
+				if err := runWorkflowAutoSettleOnce(ctx, paths, store, time.Now().UTC(), stdout); err != nil {
+					writeLine(stdout, "workflow auto-settle error: %s", err)
+				}
 				if err := runHeartbeatScanOnce(ctx, paths, store, heartbeatEnqueue, time.Now().UTC()); err != nil {
 					writeLine(stdout, "heartbeat scan error: %s", err)
 				}
@@ -232,6 +235,9 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 			_ = runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollRecoveryCommandsOnce)
 		}
 		if heartbeatPathsErr == nil {
+			if err := runWorkflowAutoSettleOnce(ctx, heartbeatPaths, store, time.Now().UTC(), stdout); err != nil {
+				writeLine(stdout, "workflow auto-settle error: %s", err)
+			}
 			if err := runHeartbeatScanOnce(ctx, heartbeatPaths, store, heartbeatEnqueue, time.Now().UTC()); err != nil {
 				writeLine(stdout, "heartbeat scan error: %s", err)
 			}
