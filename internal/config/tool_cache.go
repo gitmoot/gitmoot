@@ -23,7 +23,11 @@ type ToolCachePolicy struct {
 // true) and dir (default "<home>/cache/tools"). An explicit dir override must
 // be absolute. enabled=false disables the feature entirely regardless of dir.
 func LoadToolCache(paths Paths) (ToolCachePolicy, error) {
-	policy := ToolCachePolicy{Enabled: true, Dir: filepath.Join(paths.Home, filepath.FromSlash(ToolCacheDefaultSubdir))}
+	defaultDir, err := defaultToolCacheDir(paths.Home)
+	if err != nil {
+		return ToolCachePolicy{}, err
+	}
+	policy := ToolCachePolicy{Enabled: true, Dir: defaultDir}
 	content, err := os.ReadFile(paths.ConfigFile)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -69,7 +73,7 @@ func LoadToolCache(paths Paths) (ToolCachePolicy, error) {
 			}
 		case "dir":
 			if value == "" {
-				policy.Dir = filepath.Join(paths.Home, filepath.FromSlash(ToolCacheDefaultSubdir))
+				policy.Dir = defaultDir
 				continue
 			}
 			if !filepath.IsAbs(value) {
@@ -79,4 +83,22 @@ func LoadToolCache(paths Paths) (ToolCachePolicy, error) {
 		}
 	}
 	return policy, nil
+}
+
+// defaultToolCacheDir joins home with the default subdir and normalizes the
+// result to an absolute path: pathsFromFlag does not itself require --home to
+// be absolute, so home (and therefore this join) can be relative. A relative
+// Dir is rejected outright by Landlock (produce jobs) and, for unsandboxed
+// jobs, would resolve against the CHILD PROCESS's cwd (the worktree checkout)
+// rather than the daemon's — a different absolute path per worktree, silently
+// recreating the exact per-worktree cache duplication this feature exists to
+// eliminate. filepath.Abs only errors if the working directory is
+// unresolvable, which is already fatal for the daemon process itself.
+func defaultToolCacheDir(home string) (string, error) {
+	dir := filepath.Join(home, filepath.FromSlash(ToolCacheDefaultSubdir))
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("resolve default tool cache dir: %w", err)
+	}
+	return abs, nil
 }

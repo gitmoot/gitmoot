@@ -57,3 +57,31 @@ func TestLoadToolCache(t *testing.T) {
 		})
 	}
 }
+
+// TestLoadToolCacheDefaultDirIsAbsoluteEvenWithRelativeHome pins a finder
+// finding: pathsFromFlag does not itself require --home to be absolute, so
+// paths.Home (and therefore the naive join of it with the default subdir) can
+// be relative. A relative Dir is rejected outright by Landlock and, for
+// unsandboxed jobs, resolves against the CHILD PROCESS's cwd (the worktree
+// checkout) rather than the daemon's -- a different path per worktree,
+// silently recreating the per-worktree cache duplication this feature exists
+// to eliminate.
+func TestLoadToolCacheDefaultDirIsAbsoluteEvenWithRelativeHome(t *testing.T) {
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+	paths := PathsForHome("relhome")
+	if filepath.IsAbs(paths.Home) {
+		t.Fatalf("test setup invalid: paths.Home %q is already absolute", paths.Home)
+	}
+	got, err := LoadToolCache(paths)
+	if err != nil {
+		t.Fatalf("LoadToolCache: %v", err)
+	}
+	if !filepath.IsAbs(got.Dir) {
+		t.Fatalf("Dir = %q, want an absolute path", got.Dir)
+	}
+	want := filepath.Join(cwd, "relhome", ".gitmoot", "cache", "tools")
+	if got.Dir != want {
+		t.Fatalf("Dir = %q, want %q", got.Dir, want)
+	}
+}
