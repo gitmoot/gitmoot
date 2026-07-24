@@ -796,15 +796,11 @@ func TestListPullRequestChecksUsesGhChecksOutput(t *testing.T) {
 }
 
 func TestListCheckRunsForRefUsesExactCommitSHAAndPaginates(t *testing.T) {
-	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `[{
-		"check_runs": [
-			{"name":"build","status":"completed","conclusion":"success","html_url":"https://example.test/build","completed_at":"2026-07-23T10:00:00Z"}
-		]
-	},{
-		"check_runs": [
-			{"name":"lint","status":"in_progress","conclusion":"","html_url":"https://example.test/lint","completed_at":null}
-		]
-	}]`}}}
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `
+{"name":"page-1-build","status":"completed","conclusion":"success","html_url":"https://example.test/build","completed_at":"2026-07-23T10:00:00Z"}
+
+{"name":"page-2-lint","status":"in_progress","conclusion":"","html_url":"https://example.test/lint","completed_at":null}
+`}}}
 	client := GhClient{Runner: runner}
 
 	checks, err := client.ListCheckRunsForRef(
@@ -816,14 +812,33 @@ func TestListCheckRunsForRefUsesExactCommitSHAAndPaginates(t *testing.T) {
 		t.Fatalf("ListCheckRunsForRef: %v", err)
 	}
 	if len(checks) != 2 ||
-		checks[0].Name != "build" || checks[0].State != "success" ||
-		checks[1].Name != "lint" || checks[1].State != "in_progress" {
+		checks[0].Name != "page-1-build" || checks[0].State != "success" ||
+		checks[1].Name != "page-2-lint" || checks[1].State != "in_progress" {
 		t.Fatalf("checks = %+v", checks)
 	}
 	runner.wantArgs(t, 0,
-		"api", "--paginate", "--slurp",
+		"api", "--paginate", "--jq",
+		".check_runs[] | {name, status, conclusion, html_url, completed_at}",
 		"repos/gitmoot/gitmoot/commits/head123/check-runs?per_page=100",
 	)
+}
+
+func TestListCheckRunsForRefRejectsMalformedNDJSON(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `
+{"name":"build","status":"completed","conclusion":"success"}
+not-json
+{"name":"lint","status":"completed","conclusion":"success"}
+`}}}
+	client := GhClient{Runner: runner}
+
+	_, err := client.ListCheckRunsForRef(
+		context.Background(),
+		Repository{Owner: "gitmoot", Name: "gitmoot"},
+		"head123",
+	)
+	if err == nil || !strings.Contains(err.Error(), "decode gh check-run line 3") {
+		t.Fatalf("error = %v, want malformed NDJSON line", err)
+	}
 }
 
 func TestListPullRequestChecksAcceptsPendingExitWithJSON(t *testing.T) {

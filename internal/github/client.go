@@ -1,6 +1,7 @@
 package github
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -1017,37 +1018,42 @@ func (c *GhClient) GetCombinedStatus(ctx context.Context, repo Repository, ref s
 }
 
 func (c *GhClient) ListCheckRunsForRef(ctx context.Context, repo Repository, ref string) ([]PullRequestCheck, error) {
-	type checkRunsPage struct {
-		CheckRuns []struct {
-			Name        string `json:"name"`
-			Status      string `json:"status"`
-			Conclusion  string `json:"conclusion"`
-			HTMLURL     string `json:"html_url"`
-			CompletedAt string `json:"completed_at"`
-		} `json:"check_runs"`
+	type checkRun struct {
+		Name        string `json:"name"`
+		Status      string `json:"status"`
+		Conclusion  string `json:"conclusion"`
+		HTMLURL     string `json:"html_url"`
+		CompletedAt string `json:"completed_at"`
 	}
 	result, err := c.run(ctx, false,
-		"api", "--paginate", "--slurp",
+		"api", "--paginate", "--jq",
+		".check_runs[] | {name, status, conclusion, html_url, completed_at}",
 		endpoint(repo, "commits", ref, "check-runs")+"?per_page=100",
 	)
 	if err != nil {
 		return nil, err
 	}
-	var pages []checkRunsPage
-	if err := json.Unmarshal([]byte(result.Stdout), &pages); err != nil {
-		return nil, fmt.Errorf("decode gh api response: %w", err)
-	}
 	checks := []PullRequestCheck{}
-	for _, page := range pages {
-		for _, run := range page.CheckRuns {
-			state := strings.TrimSpace(run.Conclusion)
-			if state == "" {
-				state = strings.TrimSpace(run.Status)
-			}
-			checks = append(checks, PullRequestCheck{
-				Name: run.Name, State: state, Link: run.HTMLURL, CompletedAt: run.CompletedAt,
-			})
+	scanner := bufio.NewScanner(strings.NewReader(result.Stdout))
+	for line := 1; scanner.Scan(); line++ {
+		raw := strings.TrimSpace(scanner.Text())
+		if raw == "" {
+			continue
 		}
+		var run checkRun
+		if err := json.Unmarshal([]byte(raw), &run); err != nil {
+			return nil, fmt.Errorf("decode gh check-run line %d: %w", line, err)
+		}
+		state := strings.TrimSpace(run.Conclusion)
+		if state == "" {
+			state = strings.TrimSpace(run.Status)
+		}
+		checks = append(checks, PullRequestCheck{
+			Name: run.Name, State: state, Link: run.HTMLURL, CompletedAt: run.CompletedAt,
+		})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan gh check-runs response: %w", err)
 	}
 	return checks, nil
 }
