@@ -516,3 +516,28 @@ The `sqlite3` command is an optional operator aid, not a Gitmoot dependency.
 Verify that `job show` still reports `succeeded`, `failed`, or `cancelled` and
 the same `payload.worktree_path`. Never remove a worktree for a blocked, queued,
 or running job; settle it first.
+
+## Isolated worktrees duplicate gigabytes of tool cache
+
+An isolated-worktree job re-materializing its own `uv`/`go`/`npm`/`pip` cache
+inside its worktree (rather than reusing a shared one) is the largest driver of
+`gitmoot doctor`'s worktree disk figure once a fleet has run for a while — one
+worktree can carry several gigabytes of immutable, content-addressed packages
+that duplicate what every other job already downloaded.
+
+Gitmoot points `UV_CACHE_DIR`, `PIP_CACHE_DIR`, `npm_config_cache`, `GOCACHE`,
+and `GOMODCACHE` at one shared, host-level directory (default
+`<home>/cache/tools`) for isolated-worktree jobs, so package caches are reused
+across jobs instead of duplicated per worktree. This is on by default; set
+`[cache] enabled = false` in `config.toml` to opt out, or `[cache] dir =
+"/absolute/path"` to relocate the shared directory (must be absolute).
+
+A read-only/`auto` codex job and a codex chat seat do not get the redirect —
+codex never grants writable-path access to either, so pointing their tools at
+the shared directory would break rather than help. Those jobs keep their
+pre-existing (in-worktree) cache behavior.
+
+If an existing worktree already carries a large in-worktree cache from before
+this took effect, it is cleaned up the same way as any other worktree content:
+by the delegation-worktree reclaim pass above, or manually once the owning job
+is terminal.

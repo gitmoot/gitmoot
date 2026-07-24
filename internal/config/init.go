@@ -67,6 +67,15 @@ artifact_blobs = %q
 # require_workflow = false # opt out (default is true)
 # require_workflow_mode = "auto" # auto | strict
 
+# [cache] gives isolated-worktree jobs (codex is always sandboxed; claude/kimi
+# "produce" jobs are Landlock-sandboxed) a shared, host-level tool-cache
+# directory instead of each job re-materializing its own uv/go/npm/pip caches
+# inside its worktree. Enabled by default; the shared dir is created on first
+# use and is never swept by worktree teardown.
+# [cache]
+# enabled = true
+# dir = "/root/.gitmoot/cache/tools" # default: "<home>/cache/tools"
+
 # [daemon] is the OPTIONAL warm-reloadable runtime config (issue #577). CLI flags to
 # "daemon start" / "daemon run" remain the initial value; a key here is applied only
 # where the matching flag was NOT passed (flag = override). Its real purpose is WARM
