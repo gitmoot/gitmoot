@@ -136,17 +136,38 @@ func TestHerdrOrgProviderFailures(t *testing.T) {
 func TestHerdrOrgProviderRecycleCommand(t *testing.T) {
 	for _, test := range []struct {
 		name  string
+		kind  string
 		model string
 		want  []string
 	}{
 		{
 			name: "unpinned preserves command",
+			kind: "codex",
 			want: []string{"agent", "start", "owner", "--kind", "codex", "--pane", "w1:p2", "--timeout", "30000", "--", "role: owner\n\nhandoff: ship it"},
 		},
 		{
 			name:  "pinned model precedes boot prompt",
+			kind:  "codex",
 			model: "sonnet",
 			want:  []string{"agent", "start", "owner", "--kind", "codex", "--pane", "w1:p2", "--timeout", "30000", "--", "--model", "sonnet", "role: owner\n\nhandoff: ship it"},
+		},
+		{
+			name:  "pinned model trims stray whitespace",
+			kind:  "claude",
+			model: "  sonnet  ",
+			want:  []string{"agent", "start", "owner", "--kind", "claude", "--pane", "w1:p2", "--timeout", "30000", "--", "--model", "sonnet", "role: owner\n\nhandoff: ship it"},
+		},
+		{
+			name:  "pinned model applies for kimi",
+			kind:  "kimi",
+			model: "k2",
+			want:  []string{"agent", "start", "owner", "--kind", "kimi", "--pane", "w1:p2", "--timeout", "30000", "--", "--model", "k2", "role: owner\n\nhandoff: ship it"},
+		},
+		{
+			name:  "pinned model ignored for an unverified kind",
+			kind:  "gemini",
+			model: "sonnet",
+			want:  []string{"agent", "start", "owner", "--kind", "gemini", "--pane", "w1:p2", "--timeout", "30000", "--", "role: owner\n\nhandoff: ship it"},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -160,7 +181,7 @@ func TestHerdrOrgProviderRecycleCommand(t *testing.T) {
 			}
 			provider := newHerdrOrgProvider(run, []config.OrgRole{{Name: "owner"}}, time.Now)
 			req := org.RecycleRequest{
-				Role: "owner", Pane: "w1:p2", Kind: "codex", AgentName: "owner",
+				Role: "owner", Pane: "w1:p2", Kind: test.kind, AgentName: "owner",
 				Model: test.model, BootPrompt: "role: owner\n\nhandoff: ship it",
 			}
 			if err := provider.Recycle(context.Background(), req); err != nil {

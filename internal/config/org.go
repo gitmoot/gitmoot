@@ -305,7 +305,7 @@ func LoadOrg(paths Paths) (OrgConfig, error) {
 			if err != nil {
 				return OrgConfig{}, fmt.Errorf("org role %q: parse model: %w", current, err)
 			}
-			role.Model = v
+			role.Model = strings.TrimSpace(v)
 		case "recycle_after":
 			v, err := parseOrgDuration(value)
 			if err != nil {

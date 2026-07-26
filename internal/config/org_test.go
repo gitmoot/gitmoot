@@ -55,6 +55,7 @@ scope = ["gitmoot/*"]
 		wantErr   string
 	}{
 		{name: "configured", suffix: `model = "sonnet"` + "\n", wantModel: "sonnet"},
+		{name: "padded value is trimmed", suffix: `model = "  sonnet  "` + "\n", wantModel: "sonnet"},
 		{name: "absent", wantModel: ""},
 		{name: "unknown remains rejected", suffix: "network = true\n", wantErr: "unknown field"},
 		{name: "duplicate", suffix: "model = \"sonnet\"\nmodel = \"opus\"\n", wantErr: `duplicate field "model"`},

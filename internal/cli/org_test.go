@@ -613,6 +613,44 @@ func TestRunOrgBriefAndChartSurfaceModelPin(t *testing.T) {
 		!strings.Contains(stdout.String(), "review · idle · scope=gitmoot/* · merge=self · model=sonnet") {
 		t.Fatalf("chart output = %q", stdout.String())
 	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"org", "brief", "--home", home, "--role", "review", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("brief --json code = %d stderr=%s", code, stderr.String())
+	}
+	var brief orgBriefOutput
+	if err := json.Unmarshal(stdout.Bytes(), &brief); err != nil || brief.Model != "sonnet" {
+		t.Fatalf("brief.Model = %+v err=%v output=%s", brief, err, stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"org", "status", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("status --json code = %d stderr=%s", code, stderr.String())
+	}
+	var status []orgStatusOutput
+	if err := json.Unmarshal(stdout.Bytes(), &status); err != nil {
+		t.Fatalf("decode status: %v; output=%s", err, stdout.String())
+	}
+	seen := map[string]bool{}
+	for _, row := range status {
+		switch row.Role {
+		case "review":
+			if row.Model != "sonnet" {
+				t.Fatalf("review status model = %q, want sonnet", row.Model)
+			}
+			seen["review"] = true
+		case "owner":
+			if row.Model != "" {
+				t.Fatalf("owner status model = %q, want empty (unpinned)", row.Model)
+			}
+			seen["owner"] = true
+		}
+	}
+	if !seen["review"] || !seen["owner"] {
+		t.Fatalf("expected roles missing from status: %+v", status)
+	}
 }
 
 func TestRunOrgOverviewFlagsConsecutiveMissedWakes(t *testing.T) {
