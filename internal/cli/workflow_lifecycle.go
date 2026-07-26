@@ -44,3 +44,24 @@ func runWorkflowAutoSettleOnce(ctx context.Context, paths config.Paths, store *d
 	}
 	return nil
 }
+
+// runGhostSessionJobReaperOnce performs one home-scoped orphan sweep. Unlike
+// workflow auto-settle, a disabled age threshold still leaves the independent
+// terminal-workflow signal enabled.
+func runGhostSessionJobReaperOnce(ctx context.Context, paths config.Paths, store *db.Store, now time.Time, stdout io.Writer) error {
+	policy, err := config.LoadWorkflowLifecycle(paths)
+	after := time.Duration(0)
+	if err != nil {
+		writeLine(stdout, "ghost session-job reaper config error: %s; age-based reaping disabled for this sweep", err)
+	} else {
+		after = policy.AutoSettleAfter
+	}
+	reaped, err := store.ReapGhostSessionJobs(ctx, now, after)
+	if err != nil {
+		return err
+	}
+	for _, jobID := range reaped {
+		writeLine(stdout, "reaped ghost session job %s", jobID)
+	}
+	return nil
+}

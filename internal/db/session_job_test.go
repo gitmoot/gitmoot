@@ -73,8 +73,9 @@ func TestCreateExternallyDrivenJobWithEvent(t *testing.T) {
 }
 
 // TestListRunningJobsUpdatedBeforeSkipsExternallyDriven is the highest-risk
-// correctness point (#657): the stuck-running reaper MUST NOT reclaim a session job
-// even when it is stale, because the calling session may hold it open for minutes.
+// correctness point (#657): the engine lease-recovery reaper MUST NOT reclaim a
+// session job even when it is stale, because the calling session may hold it open
+// for minutes. Session lifecycle cleanup uses separate workflow/age signals.
 func TestListRunningJobsUpdatedBeforeSkipsExternallyDriven(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))

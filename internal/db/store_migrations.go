@@ -16,6 +16,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err := s.backfillJobRootID(ctx); err != nil {
 		return err
 	}
+	if err := s.backfillGhostSessionJobs(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
