@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/org"
 )
@@ -130,5 +132,67 @@ func TestLoadOrgSharedStateMissedWakeAgeOut(t *testing.T) {
 	}
 	if missedWakeIsStale(now.Add(-missedWakeStaleAfter).Format(db.BlockedEpisodeTimeLayout), now) {
 		t.Fatal("miss exactly at stale boundary was hidden")
+	}
+}
+
+func TestBuildOrgStatusRowsActiveJobsFailureDegradesOnce(t *testing.T) {
+	_, paths := setupOrgHome(t)
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	shared, err := loadOrgSharedState(ctx, paths, store, time.Now().UTC())
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	source := func(context.Context, config.OrgConfig) (map[string]org.RoleLiveState, time.Time, string, error) {
+		return map[string]org.RoleLiveState{
+			"owner":  {State: org.StateIdle},
+			"review": {State: org.StateIdle},
+		}, time.Time{}, "fixture", nil
+	}
+
+	rows, err := buildOrgStatusRows(ctx, &shared, source, "status", true)
+	if err != nil {
+		t.Fatalf("buildOrgStatusRows() error = %v, want best-effort rows", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %+v, want owner and review", rows)
+	}
+	for _, row := range rows {
+		if row.ActiveJobs != 0 {
+			t.Fatalf("row[%s].ActiveJobs = %d, want 0", row.Role, row.ActiveJobs)
+		}
+	}
+	if len(shared.Warnings) != 1 || !strings.Contains(shared.Warnings[0], "active-jobs counts unavailable") {
+		t.Fatalf("warnings = %+v, want one active-jobs warning", shared.Warnings)
+	}
+	counts, err := shared.loadJobCounts(ctx)
+	if err != nil || counts != nil {
+		t.Fatalf("cached loadJobCounts() = (%+v, %v), want (nil, nil)", counts, err)
+	}
+
+	withoutActiveJobs := shared
+	withoutActiveJobs.jobCountsLoaded = false
+	withoutActiveJobs.Warnings = nil
+	rows, err = buildOrgStatusRows(ctx, &withoutActiveJobs, source, "status", false)
+	if err != nil {
+		t.Fatalf("buildOrgStatusRows(includeActiveJobs=false) error = %v", err)
+	}
+	if withoutActiveJobs.jobCountsLoaded {
+		t.Fatal("includeActiveJobs=false queried active-job counts")
+	}
+	if len(withoutActiveJobs.Warnings) != 0 {
+		t.Fatalf("includeActiveJobs=false warnings = %+v, want none", withoutActiveJobs.Warnings)
+	}
+	for _, row := range rows {
+		if row.ActiveJobs != 0 {
+			t.Fatalf("row[%s].ActiveJobs = %d with counts excluded, want 0", row.Role, row.ActiveJobs)
+		}
 	}
 }

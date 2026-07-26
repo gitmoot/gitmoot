@@ -124,7 +124,7 @@ func loadDashboardOrgInputs(ctx context.Context, paths config.Paths, store *db.S
 	if err != nil {
 		return dashboardOrgInputs{}, err
 	}
-	rows, err := buildOrgStatusRows(ctx, &shared, storeOrgLiveSource(&shared), "status")
+	rows, err := buildOrgStatusRows(ctx, &shared, storeOrgLiveSource(&shared), "status", true)
 	if err != nil {
 		return dashboardOrgInputs{}, err
 	}
@@ -293,7 +293,7 @@ func buildDashboardOrgRole(ctx context.Context, paths config.Paths, store *db.St
 	if !ok {
 		return dashboard.OrgRoleView{}, dashboard.ErrOrgRoleNotFound
 	}
-	rows, err := buildOrgStatusRows(ctx, &shared, storeOrgLiveSource(&shared), "status")
+	rows, err := buildOrgStatusRows(ctx, &shared, storeOrgLiveSource(&shared), "status", false)
 	if err != nil {
 		return dashboard.OrgRoleView{}, err
 	}

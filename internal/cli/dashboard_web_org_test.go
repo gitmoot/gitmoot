@@ -231,6 +231,9 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 		if recorder.Code != http.StatusOK {
 			t.Fatalf("GET %s: status=%d body=%s", route, recorder.Code, recorder.Body.String())
 		}
+		if route == "/api/org/role/owner" && strings.Contains(recorder.Body.String(), `"active_jobs"`) {
+			t.Fatalf("single-role response leaked tree-only active_jobs: %s", recorder.Body.String())
+		}
 	}
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/org/role/missing", nil))

@@ -1017,8 +1017,11 @@ live compatible Herdr snapshot. When configured, `brief --json` and `status
 flagged (N missed wakes)` marker after the role reaches the positive
 `[orchestrate].max_consecutive_missed_wakes` threshold; their JSON rows expose
 `missed_wakes`, `flagged`, and `flag_reason`. The default threshold is `0`
-(disabled). Escalations are recorded with `gitmoot org escalate`; their
-resolution and correlation surfaces are phase 2 work.
+(disabled). `status --json` also exposes `active_jobs`, the live
+queued-plus-running job count attributed to the role through `ActingOrgRole`
+(#1114); it is distinct from daily or historical job counts. Escalations are
+recorded with `gitmoot org escalate`; their resolution and correlation surfaces
+are phase 2 work.
 
 The read-only Org page consumes `GET /api/org` for the store-backed role tree,
 health strip, typed escalations, and current signal feed, plus
