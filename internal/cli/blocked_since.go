@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -128,6 +129,7 @@ func evaluateBlockedTaskEpisodes(ctx context.Context, store *db.Store, sink even
 		return err
 	}
 	taskPrefix := "task:" + strings.TrimSpace(repo) + ":"
+	var digestItems []blockedTaskDigestItem
 	for _, episode := range episodes {
 		if !strings.HasPrefix(episode.Subject, taskPrefix) {
 			continue
@@ -145,10 +147,34 @@ func evaluateBlockedTaskEpisodes(ctx context.Context, store *db.Store, sink even
 		if !stale {
 			continue
 		}
-		if err := emitBlockedSinceEpisode(ctx, store, sink, episode, taskID, taskID, repo, "task "+taskID, wakeAfter, now); err != nil {
+		blockedSince, blockedFor, due, err := blockedEpisodeDue(episode, wakeAfter, now)
+		if err != nil {
 			writeLine(stdout, "blocked_since task %s emit failed: %v", taskID, err)
+			continue
 		}
+		if !due {
+			continue
+		}
+		if err := markBlockedEpisodeEmitted(ctx, store, episode, now); err != nil {
+			writeLine(stdout, "blocked_since task %s emit failed: %v", taskID, err)
+			continue
+		}
+		digestItems = append(digestItems, blockedTaskDigestItem{
+			taskID:       taskID,
+			blockedSince: blockedSince,
+			blockedFor:   blockedFor,
+		})
 	}
+	if len(digestItems) == 0 {
+		return nil
+	}
+	sort.Slice(digestItems, func(i, j int) bool {
+		if digestItems[i].blockedFor == digestItems[j].blockedFor {
+			return digestItems[i].taskID < digestItems[j].taskID
+		}
+		return digestItems[i].blockedFor > digestItems[j].blockedFor
+	})
+	events.EmitEvent(ctx, sink, buildBlockedTaskDigestEvent(repo, digestItems, now))
 	return nil
 }
 
@@ -345,15 +371,15 @@ func blockedEpisodeStale(updatedAt string, staleBefore time.Time) bool {
 	return !parsed.After(staleBefore)
 }
 
-func emitBlockedSinceEpisode(ctx context.Context, store *db.Store, sink events.Sink, episode db.BlockedEpisode, subjectID, rootID, repo, detailSubject string, wakeAfter time.Duration, now time.Time) error {
+func blockedEpisodeDue(episode db.BlockedEpisode, wakeAfter time.Duration, now time.Time) (time.Time, time.Duration, bool, error) {
 	now = now.UTC()
 	blockedSince, err := time.Parse(db.BlockedEpisodeTimeLayout, episode.BlockedSince)
 	if err != nil {
-		return fmt.Errorf("parse blocked_since %q: %w", episode.BlockedSince, err)
+		return time.Time{}, 0, false, fmt.Errorf("parse blocked_since %q: %w", episode.BlockedSince, err)
 	}
 	blockedFor := now.Sub(blockedSince)
 	if blockedFor <= wakeAfter {
-		return nil // not blocked long enough yet
+		return time.Time{}, 0, false, nil // not blocked long enough yet
 	}
 	// Re-nudge at most once per wakeAfter interval while the subject stays blocked
 	// (an alert repeat_interval), rather than a single durable one-shot: a wake that
@@ -361,23 +387,65 @@ func emitBlockedSinceEpisode(ctx context.Context, store *db.Store, sink events.S
 	// failure) self-heals on the next interval instead of being lost forever.
 	if last := strings.TrimSpace(episode.EmittedAt); last != "" {
 		if lastEmitted, err := time.Parse(db.BlockedEpisodeTimeLayout, last); err == nil && now.Sub(lastEmitted) <= wakeAfter {
-			return nil // already nudged within the current interval
+			return time.Time{}, 0, false, nil // already nudged within the current interval
 		}
 	}
+	return blockedSince, blockedFor, true, nil
+}
+
+func markBlockedEpisodeEmitted(ctx context.Context, store *db.Store, episode db.BlockedEpisode, now time.Time) error {
 	// Mark BEFORE emit: a mark-write failure then means no emit this tick (retry
 	// next tick, the gate is still open) — never a per-tick duplicate — and a
 	// mark-success whose async wake is dropped re-nudges on the next interval.
 	if err := store.MarkBlockedEpisodeEmitted(ctx, episode.Subject, now); err != nil {
 		return fmt.Errorf("mark blocked episode emitted: %w", err)
 	}
+	return nil
+}
+
+func buildBlockedSinceEvent(subjectID, rootID, repo, detailSubject string, blockedSince time.Time, blockedFor time.Duration, now time.Time) events.Event {
 	// Carry the stable first_since (blocked_since) so a consumer distinguishes a
 	// re-nudge (same job_id + same since) from a genuinely fresh episode after a
 	// re-block (same job_id, new since) — a repeat must not read as a fresh alert.
 	detail := fmt.Sprintf("%s blocked %s (since %s)", detailSubject, blockedFor.Round(time.Second), blockedSince.UTC().Format(time.RFC3339))
 	ev := events.NewEvent(events.EventJobBlocked, subjectID, rootID, repo, string(workflow.TaskBlocked), detail, now, workflow.RedactCommentText)
 	ev.Cause = "blocked_since"
+	return ev
+}
+
+func emitBlockedSinceEpisode(ctx context.Context, store *db.Store, sink events.Sink, episode db.BlockedEpisode, subjectID, rootID, repo, detailSubject string, wakeAfter time.Duration, now time.Time) error {
+	now = now.UTC()
+	blockedSince, blockedFor, due, err := blockedEpisodeDue(episode, wakeAfter, now)
+	if err != nil {
+		return err
+	}
+	if !due {
+		return nil
+	}
+	if err := markBlockedEpisodeEmitted(ctx, store, episode, now); err != nil {
+		return err
+	}
+	ev := buildBlockedSinceEvent(subjectID, rootID, repo, detailSubject, blockedSince, blockedFor, now)
 	events.EmitEvent(ctx, sink, ev)
 	return nil
+}
+
+type blockedTaskDigestItem struct {
+	taskID       string
+	blockedSince time.Time
+	blockedFor   time.Duration
+}
+
+func buildBlockedTaskDigestEvent(repo string, items []blockedTaskDigestItem, now time.Time) events.Event {
+	oldest := items[0]
+	suffix := ""
+	if len(items) > 1 {
+		suffix = fmt.Sprintf(" (+%d more)", len(items)-1)
+	}
+	detail := fmt.Sprintf("%d tasks blocked — oldest %s — %s%s", len(items), oldest.blockedFor.Round(time.Second), oldest.taskID, suffix)
+	ev := events.NewEvent(events.EventJobBlocked, oldest.taskID, oldest.taskID, repo, string(workflow.TaskBlocked), detail, now, workflow.RedactCommentText)
+	ev.Cause = "blocked_since"
+	return ev
 }
 
 func taskEpisodeSubject(repo, taskID string) string {

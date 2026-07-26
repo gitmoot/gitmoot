@@ -1553,3 +1553,74 @@ func TestOrgEventRuleAddListRemoveAndValidation(t *testing.T) {
 		t.Fatalf("post-positional --home code=%d err=%q", code, errOut.String())
 	}
 }
+
+func TestOrgEventRuleRepoAliasUsesMatchFilter(t *testing.T) {
+	home, paths := setupOrgHome(t)
+	add := func(flagName string) string {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		if code := runOrg([]string{"events", "rule", "add", "--home", home, "--on", "blocked", flagName, "tendwire", "--wake", "owner"}, &stdout, &stderr); code != 0 {
+			t.Fatalf("add %s code=%d out=%q err=%q", flagName, code, stdout.String(), stderr.String())
+		}
+		return strings.TrimSpace(strings.TrimPrefix(stdout.String(), "added "))
+	}
+	matchID := add("--match")
+	repoID := add("--repo")
+
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	rules, err := store.ListEventRules(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rules) != 2 {
+		t.Fatalf("event rules = %d, want 2", len(rules))
+	}
+	byID := make(map[string]db.EventRule, len(rules))
+	for _, rule := range rules {
+		byID[rule.ID] = rule
+	}
+	matchRule, matchOK := byID[matchID]
+	repoRule, repoOK := byID[repoID]
+	if !matchOK || !repoOK {
+		t.Fatalf("created rules missing: ids=%q,%q rules=%+v", matchID, repoID, rules)
+	}
+	if matchRule.OnKind != repoRule.OnKind ||
+		matchRule.MatchFilter != repoRule.MatchFilter ||
+		matchRule.WakeRole != repoRule.WakeRole ||
+		matchRule.Enabled != repoRule.Enabled ||
+		repoRule.MatchFilter != "tendwire" {
+		t.Fatalf("--match rule = %+v, --repo rule = %+v", matchRule, repoRule)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := runOrg([]string{"events", "rule", "list", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("list code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	lineSuffixes := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		id, suffix, ok := strings.Cut(line, "\t")
+		if ok {
+			lineSuffixes[id] = suffix
+		}
+	}
+	if lineSuffixes[matchID] == "" || lineSuffixes[matchID] != lineSuffixes[repoID] || !strings.Contains(lineSuffixes[repoID], "match=tendwire") {
+		t.Fatalf("list output differs by input alias: %q", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := runOrg([]string{"events", "rule", "add", "--home", home, "--on", "blocked", "--match", "tendwire", "--repo", "gitmoot/", "--wake", "owner"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("both filters code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--match and --repo cannot both be set") {
+		t.Fatalf("both filters error = %q", stderr.String())
+	}
+	rules, err = store.ListEventRules(context.Background())
+	if err != nil || len(rules) != 2 {
+		t.Fatalf("ambiguous add changed rules: rules=%+v err=%v", rules, err)
+	}
+}

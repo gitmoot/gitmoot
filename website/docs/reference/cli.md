@@ -1127,15 +1127,17 @@ Event-rule wakes are separately opt-in:
 
 ```sh
 gitmoot org events rule add --on attention --match owner/repo --wake maintainer
+gitmoot org events rule add --on blocked --repo tendwire --wake maintainer
 gitmoot org events rule list
 gitmoot org events rule rm --home /alternate/home <rule-id>
 ```
 
 `--on` accepts `escalation`, `attention`, `guard`, `job-terminal`, or `blocked`.
 `--match` is a case-insensitive substring matched against the event repo or job
-id; empty matches all. The wake role must exist and set `pane = "<herdr-pane>"`;
-Gitmoot resolves that value as an exact pane label first and otherwise treats it
-as a literal pane id.
+id; empty matches all. `--repo` is a discoverable alias for the same substring
+filter; pass only one of `--match` or `--repo`. The wake role must exist and set
+`pane = "<herdr-pane>"`; Gitmoot resolves that value as an exact pane label first
+and otherwise treats it as a literal pane id.
 Delivery is best-effort and verified with Herdr's `agent_prompted` versus
 `agent_prompt_stalled` result; zero rules leaves the feature off.
 

@@ -92,6 +92,95 @@ func assertBlockedSinceTaskEvent(t *testing.T, sink *recordingSink, want int) {
 	}
 }
 
+func TestEvaluateBlockedTaskEpisodesDigestsDueTasksAndMarksEachEpisode(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	repo := "owner/repo"
+	now := time.Now().UTC().Truncate(time.Second).Add(4 * time.Hour)
+	wakeAfter := time.Hour
+	tasks := []struct {
+		id           string
+		blockedSince time.Time
+	}{
+		{id: "task-newest", blockedSince: now.Add(-2 * time.Hour)},
+		{id: "task-oldest", blockedSince: now.Add(-4 * time.Hour)},
+		{id: "task-middle", blockedSince: now.Add(-3 * time.Hour)},
+	}
+	for _, task := range tasks {
+		if err := store.UpsertTask(ctx, db.Task{ID: task.id, RepoFullName: repo, State: string(workflow.TaskBlocked)}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.UpsertBlockedEpisode(ctx, taskEpisodeSubject(repo, task.id), task.blockedSince, now.Add(-time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sink := &recordingSink{}
+	if err := evaluateBlockedTaskEpisodes(ctx, store, sink, repo, wakeAfter, io.Discard, now); err != nil {
+		t.Fatalf("evaluateBlockedTaskEpisodes() error = %v", err)
+	}
+	blocked := sink.byType(events.EventJobBlocked)
+	if len(blocked) != 1 {
+		t.Fatalf("job.blocked events = %d, want one digest", len(blocked))
+	}
+	ev := blocked[0]
+	if ev.JobID != "task-oldest" || ev.RootID != "task-oldest" || ev.Repo != repo || ev.Cause != "blocked_since" {
+		t.Fatalf("digest event = %+v", ev)
+	}
+	for _, want := range []string{"3 tasks blocked", "oldest 4h0m0s", "task-oldest", "(+2 more)"} {
+		if !strings.Contains(ev.Detail, want) {
+			t.Fatalf("digest detail %q missing %q", ev.Detail, want)
+		}
+	}
+
+	episodes, err := store.ListBlockedEpisodes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(episodes) != len(tasks) {
+		t.Fatalf("blocked episodes = %d, want %d", len(episodes), len(tasks))
+	}
+	wantEmittedAt := now.Format(db.BlockedEpisodeTimeLayout)
+	for _, episode := range episodes {
+		if episode.EmittedAt != wantEmittedAt {
+			t.Errorf("episode %q emitted_at = %q, want %q", episode.Subject, episode.EmittedAt, wantEmittedAt)
+		}
+	}
+
+	if err := evaluateBlockedTaskEpisodes(ctx, store, sink, repo, wakeAfter, io.Discard, now.Add(time.Minute)); err != nil {
+		t.Fatalf("evaluateBlockedTaskEpisodes(subsequent) error = %v", err)
+	}
+	if got := len(sink.byType(events.EventJobBlocked)); got != 1 {
+		t.Fatalf("job.blocked events after subsequent pass = %d, want 1", got)
+	}
+}
+
+func TestEvaluateBlockedTaskEpisodesSingleTaskUsesOneItemDigest(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	repo := "owner/repo"
+	taskID := "task-only"
+	now := time.Now().UTC().Truncate(time.Second).Add(2 * time.Hour)
+	if err := store.UpsertTask(ctx, db.Task{ID: taskID, RepoFullName: repo, State: string(workflow.TaskBlocked)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertBlockedEpisode(ctx, taskEpisodeSubject(repo, taskID), now.Add(-2*time.Hour), now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	sink := &recordingSink{}
+	if err := evaluateBlockedTaskEpisodes(ctx, store, sink, repo, time.Hour, io.Discard, now); err != nil {
+		t.Fatalf("evaluateBlockedTaskEpisodes() error = %v", err)
+	}
+	blocked := sink.byType(events.EventJobBlocked)
+	if len(blocked) != 1 {
+		t.Fatalf("job.blocked events = %d, want 1", len(blocked))
+	}
+	if ev := blocked[0]; ev.Detail != "1 tasks blocked — oldest 2h0m0s — task-only" || strings.Contains(ev.Detail, "(+") {
+		t.Fatalf("one-item digest detail = %q", ev.Detail)
+	}
+}
+
 type fakeBlockedRoleAvailability struct {
 	available bool
 	calls     int
@@ -340,21 +429,53 @@ func TestBlockedSinceReNudgesOncePerIntervalWhileStillBlocked(t *testing.T) {
 			t.Fatalf("blocked events at %s = %d, want %d", at, got, want)
 		}
 	}
-	nudgeAt(base, 1)                            // crosses threshold → emit #1
+	nudgeAt(base, 1) // crosses threshold → emit #1
+	episodes, err := store.ListBlockedEpisodes(ctx)
+	if err != nil || len(episodes) != 1 {
+		t.Fatalf("episodes after first nudge = %+v, err=%v", episodes, err)
+	}
+	firstSince := episodes[0].BlockedSince
 	nudgeAt(base.Add(30*time.Minute), 1)        // within interval → no re-emit
 	nudgeAt(base.Add(wakeAfter+time.Minute), 2) // past interval, still blocked → re-nudge #2
 
-	// Repeats must be self-identifying: both re-nudges of the SAME episode carry the
-	// SAME first_since, so a consumer never reads a re-nudge as a fresh episode.
-	blocked := sink.byType(events.EventJobBlocked)
-	sinceOf := func(detail string) string {
-		if i := strings.Index(detail, "(since "); i >= 0 {
-			return detail[i:]
-		}
-		return ""
+	// The task digest no longer carries each item's first_since, but the durable
+	// per-task episode must retain that stable identity across re-nudges.
+	episodes, err = store.ListBlockedEpisodes(ctx)
+	if err != nil || len(episodes) != 1 || episodes[0].BlockedSince != firstSince {
+		t.Fatalf("re-nudge changed episode identity: episodes=%+v first_since=%q err=%v", episodes, firstSince, err)
 	}
-	if s0, s1 := sinceOf(blocked[0].Detail), sinceOf(blocked[1].Detail); s0 == "" || s0 != s1 {
-		t.Fatalf("re-nudges not self-identifying by first_since: %q vs %q", blocked[0].Detail, blocked[1].Detail)
+	blocked := sink.byType(events.EventJobBlocked)
+	for _, ev := range blocked {
+		if !strings.Contains(ev.Detail, "1 tasks blocked — oldest") || strings.Contains(ev.Detail, "(+") {
+			t.Fatalf("re-nudge event is not a one-item digest: %q", ev.Detail)
+		}
+	}
+}
+
+func TestEvaluateBlockedRoleEpisodesStillEmitsPerRole(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	sink := &recordingSink{}
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	snapshot := org.Snapshot{
+		States: map[string]org.RoleLiveState{
+			"owner":  {State: org.StateBlocked},
+			"review": {State: org.StateBlocked},
+			"worker": {State: org.StateBlocked},
+		},
+		ObservedAt: now.Add(-2 * time.Hour),
+	}
+	if err := evaluateBlockedRoleEpisodes(ctx, store, sink, snapshot, time.Hour, io.Discard, now); err != nil {
+		t.Fatalf("evaluateBlockedRoleEpisodes() error = %v", err)
+	}
+	blocked := sink.byType(events.EventJobBlocked)
+	if len(blocked) != 3 {
+		t.Fatalf("job.blocked role events = %d, want one per role", len(blocked))
+	}
+	for _, ev := range blocked {
+		if ev.Cause != "blocked_since" || !strings.HasPrefix(ev.JobID, "org-blocked:") || !strings.HasPrefix(ev.Detail, "role ") {
+			t.Fatalf("role event changed shape: %+v", ev)
+		}
 	}
 }
 
