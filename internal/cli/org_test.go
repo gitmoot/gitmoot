@@ -924,9 +924,15 @@ recycle_after = "1ns"
 			t.Fatal(err)
 		}
 	}
-	if err := store.CreateJob(ctx, db.Job{ID: "active-job", Agent: "worker", Type: "ask", State: "queued", Payload: `{"acting_org_role":"active"}`}); err != nil {
-		store.Close()
-		t.Fatal(err)
+	for _, job := range []db.Job{
+		{ID: "owner-queued-job", Agent: "worker", Type: "ask", State: "queued", Payload: `{"acting_org_role":"owner"}`},
+		{ID: "owner-running-job", Agent: "worker", Type: "ask", State: "running", Payload: `{"acting_org_role":"owner"}`},
+		{ID: "active-job", Agent: "worker", Type: "ask", State: "queued", Payload: `{"acting_org_role":"active"}`},
+	} {
+		if err := store.CreateJob(ctx, job); err != nil {
+			store.Close()
+			t.Fatal(err)
+		}
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -940,12 +946,27 @@ recycle_after = "1ns"
 	if err := json.Unmarshal(stdout.Bytes(), &rows); err != nil {
 		t.Fatalf("decode status: %v; output=%s", err, stdout.String())
 	}
-	want := map[string]struct{ status, after string }{
-		"owner":    {},
+	var rawRows []map[string]json.RawMessage
+	if err := json.Unmarshal(stdout.Bytes(), &rawRows); err != nil {
+		t.Fatalf("decode raw status: %v; output=%s", err, stdout.String())
+	}
+	rawByRole := make(map[string]map[string]json.RawMessage, len(rawRows))
+	for _, raw := range rawRows {
+		var role string
+		if err := json.Unmarshal(raw["role"], &role); err != nil {
+			t.Fatalf("decode raw status role: %v; row=%s", err, raw["role"])
+		}
+		rawByRole[role] = raw
+	}
+	want := map[string]struct {
+		status, after string
+		activeJobs    int
+	}{
+		"owner":    {activeJobs: 2},
 		"fresh":    {status: "fresh", after: "24h"},
 		"eligible": {status: "eligible", after: "1ns"},
 		"working":  {status: "overdue", after: "1ns"},
-		"active":   {status: "overdue", after: "1ns"},
+		"active":   {status: "overdue", after: "1ns", activeJobs: 1},
 	}
 	for _, row := range rows {
 		expected, ok := want[row.Role]
@@ -954,6 +975,13 @@ recycle_after = "1ns"
 		}
 		if row.RecycleStatus != expected.status || row.RecycleAfter != expected.after {
 			t.Fatalf("status[%s] recycle=%q after=%q, want %q/%q", row.Role, row.RecycleStatus, row.RecycleAfter, expected.status, expected.after)
+		}
+		if row.ActiveJobs != expected.activeJobs {
+			t.Fatalf("status[%s] active_jobs=%d, want %d", row.Role, row.ActiveJobs, expected.activeJobs)
+		}
+		_, hasActiveJobs := rawByRole[row.Role]["active_jobs"]
+		if hasActiveJobs != (expected.activeJobs > 0) {
+			t.Fatalf("status[%s] active_jobs JSON presence=%v, want %v", row.Role, hasActiveJobs, expected.activeJobs > 0)
 		}
 		delete(want, row.Role)
 	}

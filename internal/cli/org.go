@@ -269,6 +269,7 @@ type orgStatusOutput struct {
 	Scope           []string           `json:"scope"`
 	MergeRule       string             `json:"merge_rule"`
 	Model           string             `json:"model"`
+	ActiveJobs      int                `json:"active_jobs,omitempty"`
 	LastSeenAt      string             `json:"last_seen_at,omitempty"`
 	LastSeenAge     string             `json:"last_seen_age,omitempty"`
 	LastCommand     string             `json:"last_command,omitempty"`
@@ -401,7 +402,8 @@ func runOrgOverview(command string, args []string, stdout, stderr io.Writer) int
 	for _, warning := range shared.Warnings {
 		fmt.Fprintf(stderr, "org %s: %s\n", command, warning)
 	}
-	rows, err := buildOrgStatusRows(ctx, &shared, herdrOrgLiveSource, command)
+	reportedWarnings := len(shared.Warnings)
+	rows, err := buildOrgStatusRows(ctx, &shared, herdrOrgLiveSource, command, command == "status")
 	if err != nil {
 		var liveErr *orgLiveSourceError
 		if errors.As(err, &liveErr) {
@@ -410,6 +412,9 @@ func runOrgOverview(command string, args []string, stdout, stderr io.Writer) int
 			fmt.Fprintf(stderr, "org %s: %v\n", command, err)
 		}
 		return 1
+	}
+	for _, warning := range shared.Warnings[reportedWarnings:] {
+		fmt.Fprintf(stderr, "org %s: %s\n", command, warning)
 	}
 	if *jsonOutput {
 		if err := writeJSON(stdout, rows); err != nil {

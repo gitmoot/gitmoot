@@ -29,6 +29,7 @@ type orgSharedState struct {
 	MissedWakes     map[string]int
 	Warnings        []string
 	jobCounts       map[string]map[string]int
+	jobCountsErr    error
 	jobCountsLoaded bool
 	blockedEpisodes []db.BlockedEpisode
 	blockedLoaded   bool
@@ -185,18 +186,20 @@ func (shared *orgSharedState) loadBlockedEpisodes(ctx context.Context) ([]db.Blo
 // projection. Presence and recycle enrichment share the same snapshot.
 func (shared *orgSharedState) loadJobCounts(ctx context.Context) (map[string]map[string]int, error) {
 	if shared.jobCountsLoaded {
-		return shared.jobCounts, nil
+		return shared.jobCounts, shared.jobCountsErr
 	}
+	shared.jobCountsLoaded = true
 	counts, err := shared.Store.CountCurrentJobsByOrgRole(ctx)
 	if err != nil {
+		shared.jobCountsErr = err
+		shared.Warnings = append(shared.Warnings, fmt.Sprintf("active-jobs counts unavailable: %v", err))
 		return nil, err
 	}
 	shared.jobCounts = counts
-	shared.jobCountsLoaded = true
 	return counts, nil
 }
 
-func buildOrgStatusRows(ctx context.Context, shared *orgSharedState, src orgLiveSource, command string) ([]orgStatusOutput, error) {
+func buildOrgStatusRows(ctx context.Context, shared *orgSharedState, src orgLiveSource, command string, includeActiveJobs bool) ([]orgStatusOutput, error) {
 	states, observedAt, providerVersion, err := src(ctx, shared.Config)
 	if err != nil {
 		return nil, &orgLiveSourceError{err: err}
@@ -218,21 +221,20 @@ func buildOrgStatusRows(ctx context.Context, shared *orgSharedState, src orgLive
 		}
 		recycleStatus := ""
 		recycleAfterText := ""
-		if command == "status" {
-			recycleAfter := shared.Config.RecycleAfterFor(role.Name)
-			if recycleAfter > 0 {
-				jobCounts, err := shared.loadJobCounts(ctx)
-				if err != nil {
-					return nil, fmt.Errorf("count active jobs for role %q: %w", role.Name, err)
+		activeJobs := 0
+		if command == "status" && includeActiveJobs {
+			jobCounts, err := shared.loadJobCounts(ctx)
+			if err == nil {
+				activeJobs = jobCounts[role.Name]["queued"] + jobCounts[role.Name]["running"]
+				if recycleAfter := shared.Config.RecycleAfterFor(role.Name); recycleAfter > 0 {
+					recycleStatus = orgRecycleStatus(seen.LastSeenAt, observedNow, live.State, activeJobs, recycleAfter)
+					recycleAfterText = formatOrgRecycleAfter(recycleAfter)
 				}
-				activeJobs := jobCounts[role.Name]["queued"] + jobCounts[role.Name]["running"]
-				recycleStatus = orgRecycleStatus(seen.LastSeenAt, observedNow, live.State, activeJobs, recycleAfter)
-				recycleAfterText = formatOrgRecycleAfter(recycleAfter)
 			}
 		}
 		rows = append(rows, orgStatusOutput{
 			Role: role.Name, Parent: role.Parent, Pane: role.Pane, Depth: len(shared.Config.Path(role.Name)) - 1,
-			Scope: role.Scope, MergeRule: role.MergeRule, Model: role.Model, LastSeenAt: seen.LastSeenAt, LastSeenAge: orgPresenceAge(seen.LastSeenAt, observedNow), LastCommand: seen.LastCommand,
+			Scope: role.Scope, MergeRule: role.MergeRule, Model: role.Model, ActiveJobs: activeJobs, LastSeenAt: seen.LastSeenAt, LastSeenAge: orgPresenceAge(seen.LastSeenAt, observedNow), LastCommand: seen.LastCommand,
 			ProviderState: live.State, ProviderDetail: live.Detail, ObservedAt: observedAt, ProviderVersion: providerVersion,
 			RecycleStatus: recycleStatus, RecycleAfter: recycleAfterText,
 			MissedWakes: consecutive, Flagged: flagged, FlagReason: flagReason,
