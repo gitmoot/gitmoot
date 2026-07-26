@@ -29,6 +29,7 @@ type orgSharedState struct {
 	MissedWakes     map[string]int
 	Warnings        []string
 	jobCounts       map[string]map[string]int
+	jobCountsErr    error
 	jobCountsLoaded bool
 	blockedEpisodes []db.BlockedEpisode
 	blockedLoaded   bool
@@ -185,11 +186,13 @@ func (shared *orgSharedState) loadBlockedEpisodes(ctx context.Context) ([]db.Blo
 // projection. Presence and recycle enrichment share the same snapshot.
 func (shared *orgSharedState) loadJobCounts(ctx context.Context) (map[string]map[string]int, error) {
 	if shared.jobCountsLoaded {
-		return shared.jobCounts, nil
+		return shared.jobCounts, shared.jobCountsErr
 	}
 	shared.jobCountsLoaded = true
 	counts, err := shared.Store.CountCurrentJobsByOrgRole(ctx)
 	if err != nil {
+		shared.jobCountsErr = err
+		shared.Warnings = append(shared.Warnings, fmt.Sprintf("active-jobs counts unavailable: %v", err))
 		return nil, err
 	}
 	shared.jobCounts = counts
@@ -221,14 +224,12 @@ func buildOrgStatusRows(ctx context.Context, shared *orgSharedState, src orgLive
 		activeJobs := 0
 		if command == "status" && includeActiveJobs {
 			jobCounts, err := shared.loadJobCounts(ctx)
-			if err != nil {
-				shared.Warnings = append(shared.Warnings, fmt.Sprintf("active-jobs counts unavailable: %v", err))
-			} else {
+			if err == nil {
 				activeJobs = jobCounts[role.Name]["queued"] + jobCounts[role.Name]["running"]
-			}
-			if recycleAfter := shared.Config.RecycleAfterFor(role.Name); recycleAfter > 0 {
-				recycleStatus = orgRecycleStatus(seen.LastSeenAt, observedNow, live.State, activeJobs, recycleAfter)
-				recycleAfterText = formatOrgRecycleAfter(recycleAfter)
+				if recycleAfter := shared.Config.RecycleAfterFor(role.Name); recycleAfter > 0 {
+					recycleStatus = orgRecycleStatus(seen.LastSeenAt, observedNow, live.State, activeJobs, recycleAfter)
+					recycleAfterText = formatOrgRecycleAfter(recycleAfter)
+				}
 			}
 		}
 		rows = append(rows, orgStatusOutput{

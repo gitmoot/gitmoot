@@ -137,11 +137,31 @@ func TestLoadOrgSharedStateMissedWakeAgeOut(t *testing.T) {
 
 func TestBuildOrgStatusRowsActiveJobsFailureDegradesOnce(t *testing.T) {
 	_, paths := setupOrgHome(t)
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(`
+[org.roles."recyclable"]
+parent = "owner"
+scope = ["gitmoot/*"]
+recycle_after = "1ns"
+`); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
 	store, err := db.Open(paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
+	if err := store.TouchOrgRolePresence(ctx, "recyclable", "test"); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
 	shared, err := loadOrgSharedState(ctx, paths, store, time.Now().UTC())
 	if err != nil {
 		store.Close()
@@ -152,8 +172,9 @@ func TestBuildOrgStatusRowsActiveJobsFailureDegradesOnce(t *testing.T) {
 	}
 	source := func(context.Context, config.OrgConfig) (map[string]org.RoleLiveState, time.Time, string, error) {
 		return map[string]org.RoleLiveState{
-			"owner":  {State: org.StateIdle},
-			"review": {State: org.StateIdle},
+			"owner":      {State: org.StateIdle},
+			"review":     {State: org.StateIdle},
+			"recyclable": {State: org.StateIdle},
 		}, time.Time{}, "fixture", nil
 	}
 
@@ -161,24 +182,43 @@ func TestBuildOrgStatusRowsActiveJobsFailureDegradesOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildOrgStatusRows() error = %v, want best-effort rows", err)
 	}
-	if len(rows) != 2 {
-		t.Fatalf("rows = %+v, want owner and review", rows)
+	if len(rows) != 3 {
+		t.Fatalf("rows = %+v, want owner, review, and recyclable", rows)
 	}
+	foundRecyclable := false
 	for _, row := range rows {
 		if row.ActiveJobs != 0 {
 			t.Fatalf("row[%s].ActiveJobs = %d, want 0", row.Role, row.ActiveJobs)
 		}
+		if row.Role == "recyclable" {
+			foundRecyclable = true
+			recycleAfter := shared.Config.RecycleAfterFor(row.Role)
+			if got := orgRecycleStatus(row.LastSeenAt, time.Now().UTC(), row.ProviderState, 0, recycleAfter); got != "eligible" {
+				t.Fatalf("recyclable fixture status with known-zero jobs = %q, want eligible", got)
+			}
+			if row.RecycleStatus != "" || row.RecycleAfter != "" {
+				t.Fatalf("recyclable row exposed recycle=%q after=%q with unknown job counts", row.RecycleStatus, row.RecycleAfter)
+			}
+		}
+	}
+	if !foundRecyclable {
+		t.Fatal("recyclable role missing from rows")
 	}
 	if len(shared.Warnings) != 1 || !strings.Contains(shared.Warnings[0], "active-jobs counts unavailable") {
 		t.Fatalf("warnings = %+v, want one active-jobs warning", shared.Warnings)
 	}
+	cachedErr := shared.jobCountsErr
+	if cachedErr == nil {
+		t.Fatal("job-count failure was not cached")
+	}
 	counts, err := shared.loadJobCounts(ctx)
-	if err != nil || counts != nil {
-		t.Fatalf("cached loadJobCounts() = (%+v, %v), want (nil, nil)", counts, err)
+	if err != cachedErr || counts != nil {
+		t.Fatalf("cached loadJobCounts() = (%+v, %v), want (nil, %v)", counts, err, cachedErr)
 	}
 
 	withoutActiveJobs := shared
 	withoutActiveJobs.jobCountsLoaded = false
+	withoutActiveJobs.jobCountsErr = nil
 	withoutActiveJobs.Warnings = nil
 	rows, err = buildOrgStatusRows(ctx, &withoutActiveJobs, source, "status", false)
 	if err != nil {

@@ -1183,7 +1183,7 @@ wakes)` marker once a role reaches the positive
 `missed_wakes`, `flagged`, and `flag_reason`. The threshold defaults to `0`, so
 flagging is off. `status --json` also exposes `active_jobs`, the live
 queued-plus-running job count attributed to the role through `ActingOrgRole`
-(#1114); it is distinct from daily or historical job counts. Open escalations
+(#1057); it is distinct from daily or historical job counts. Open escalations
 remain deferred to #1058's resolution and correlation contract.
 
 The read-only Org page consumes `GET /api/org` for the store-backed role tree,

@@ -1019,7 +1019,7 @@ flagged (N missed wakes)` marker after the role reaches the positive
 `missed_wakes`, `flagged`, and `flag_reason`. The default threshold is `0`
 (disabled). `status --json` also exposes `active_jobs`, the live
 queued-plus-running job count attributed to the role through `ActingOrgRole`
-(#1114); it is distinct from daily or historical job counts. Escalations are
+(#1057); it is distinct from daily or historical job counts. Escalations are
 recorded with `gitmoot org escalate`; their resolution and correlation surfaces
 are phase 2 work.
 
