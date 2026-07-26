@@ -143,11 +143,35 @@ func (p *herdrOrgProvider) Recycle(ctx context.Context, req org.RecycleRequest) 
 	}
 	bounded, cancel := context.WithTimeout(ctx, herdrOrgRecycleDeadline)
 	defer cancel()
-	_, err := p.run(bounded, "agent", "start", agentName, "--kind", kind, "--pane", pane, "--timeout", strconv.Itoa(herdrOrgRecycleTimeoutMS), "--", req.BootPrompt)
+	args := []string{"agent", "start", agentName, "--kind", kind, "--pane", pane, "--timeout", strconv.Itoa(herdrOrgRecycleTimeoutMS), "--"}
+	// Herdr snapshots do not expose the running model, so this can enforce the
+	// configured pin at recycle but cannot detect live-vs-pinned drift until
+	// Herdr provides that signal. Only inject --model for kinds gitmoot has
+	// verified support it (its own codex/claude/kimi runtimes) — herdr's other
+	// ~18 agent kinds are unverified and a rejected flag would break recycle
+	// outright, so an unsupported kind silently ignores the pin.
+	if model := strings.TrimSpace(req.Model); model != "" && herdrKindSupportsModelFlag(kind) {
+		args = append(args, "--model", model)
+	}
+	args = append(args, req.BootPrompt)
+	_, err := p.run(bounded, args...)
 	if err != nil {
 		return fmt.Errorf("herdr agent start for org role %q (pane %q must already be at an interactive shell prompt): %w", role, pane, err)
 	}
 	return nil
+}
+
+// herdrKindSupportsModelFlag reports whether the named herdr agent kind's CLI
+// is verified to accept a startup `-m/--model <value>` flag. Restricted to
+// gitmoot's own three driven runtimes (codex, claude, kimi) — herdr supports
+// many more kinds, but their model-flag support has not been checked.
+func herdrKindSupportsModelFlag(kind string) bool {
+	switch kind {
+	case "codex", "claude", "kimi":
+		return true
+	default:
+		return false
+	}
 }
 
 func mapHerdrAgentStatus(raw string) org.RoleLiveState {

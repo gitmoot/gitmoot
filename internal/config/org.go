@@ -18,6 +18,7 @@ type OrgRole struct {
 	Parent      string
 	Scope       []string
 	MergeRule   string
+	Model       string
 	// Pane optionally binds this role to a Herdr pane for live presence and
 	// event-rule wakes.
 	Pane         string
@@ -246,7 +247,7 @@ func LoadOrg(paths Paths) (OrgConfig, error) {
 			}
 			continue
 		}
-		if key != "display_name" && key != "parent" && key != "scope" && key != "merge_rule" && key != "pane" && key != "recycle_after" {
+		if key != "display_name" && key != "parent" && key != "scope" && key != "merge_rule" && key != "pane" && key != "model" && key != "recycle_after" {
 			return OrgConfig{}, fmt.Errorf("unknown field %q for org role %q", key, current)
 		}
 		if roleFields[current][key] {
@@ -299,6 +300,12 @@ func LoadOrg(paths Paths) (OrgConfig, error) {
 				return OrgConfig{}, fmt.Errorf("org role %q: parse pane: %w", current, err)
 			}
 			role.Pane = strings.TrimSpace(v)
+		case "model":
+			v, err := parseOrgTOMLString(value)
+			if err != nil {
+				return OrgConfig{}, fmt.Errorf("org role %q: parse model: %w", current, err)
+			}
+			role.Model = strings.TrimSpace(v)
 		case "recycle_after":
 			v, err := parseOrgDuration(value)
 			if err != nil {

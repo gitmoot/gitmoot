@@ -572,6 +572,87 @@ func TestRunOrgBriefChartStatusAndPresence(t *testing.T) {
 	}
 }
 
+func TestRunOrgBriefAndChartSurfaceModelPin(t *testing.T) {
+	home, paths := setupOrgHome(t)
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("model = \"sonnet\"\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	withOrgProvider(t, orgFixtureProvider{snapshot: org.Snapshot{States: map[string]org.RoleLiveState{
+		"owner": {State: org.StateWorking}, "review": {State: org.StateIdle},
+	}}})
+
+	for _, test := range []struct {
+		role string
+		want string
+	}{
+		{role: "review", want: "model: sonnet\n"},
+		{role: "owner", want: "model: -\n"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if code := Run([]string{"org", "brief", "--home", home, "--role", test.role}, &stdout, &stderr); code != 0 {
+			t.Fatalf("brief %s code = %d stderr=%s", test.role, code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), test.want) {
+			t.Fatalf("brief %s output = %q, want containing %q", test.role, stdout.String(), test.want)
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"org", "chart", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("chart code = %d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "owner · working · scope=* · merge=owner · model=-") ||
+		!strings.Contains(stdout.String(), "review · idle · scope=gitmoot/* · merge=self · model=sonnet") {
+		t.Fatalf("chart output = %q", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"org", "brief", "--home", home, "--role", "review", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("brief --json code = %d stderr=%s", code, stderr.String())
+	}
+	var brief orgBriefOutput
+	if err := json.Unmarshal(stdout.Bytes(), &brief); err != nil || brief.Model != "sonnet" {
+		t.Fatalf("brief.Model = %+v err=%v output=%s", brief, err, stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"org", "status", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("status --json code = %d stderr=%s", code, stderr.String())
+	}
+	var status []orgStatusOutput
+	if err := json.Unmarshal(stdout.Bytes(), &status); err != nil {
+		t.Fatalf("decode status: %v; output=%s", err, stdout.String())
+	}
+	seen := map[string]bool{}
+	for _, row := range status {
+		switch row.Role {
+		case "review":
+			if row.Model != "sonnet" {
+				t.Fatalf("review status model = %q, want sonnet", row.Model)
+			}
+			seen["review"] = true
+		case "owner":
+			if row.Model != "" {
+				t.Fatalf("owner status model = %q, want empty (unpinned)", row.Model)
+			}
+			seen["owner"] = true
+		}
+	}
+	if !seen["review"] || !seen["owner"] {
+		t.Fatalf("expected roles missing from status: %+v", status)
+	}
+}
+
 func TestRunOrgOverviewFlagsConsecutiveMissedWakes(t *testing.T) {
 	home, paths := setupOrgHome(t)
 	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
@@ -964,6 +1045,17 @@ func TestRunOrgRecycleValidation(t *testing.T) {
 
 func TestRunOrgRecycleJournalsAndBootsSuccessor(t *testing.T) {
 	home, paths := setupOrgRecycleHome(t, "w1:p2")
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("model = \"sonnet\"\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
 	store, err := db.Open(paths.Database)
 	if err != nil {
 		t.Fatal(err)
@@ -995,7 +1087,7 @@ func TestRunOrgRecycleJournalsAndBootsSuccessor(t *testing.T) {
 		t.Fatalf("Recycle requests = %+v", requests)
 	}
 	req := requests[0]
-	if req.Role != "owner" || req.Pane != "w1:p2" || req.Kind != "codex" || req.AgentName != "owner" {
+	if req.Role != "owner" || req.Pane != "w1:p2" || req.Kind != "codex" || req.AgentName != "owner" || req.Model != "sonnet" {
 		t.Fatalf("Recycle request = %+v", req)
 	}
 	for _, want := range []string{"role: owner", "path: owner", "provider: idle", "last_command: agent_run", "handoff: Release is ready for final verification."} {

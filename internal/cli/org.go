@@ -250,6 +250,7 @@ type orgBriefOutput struct {
 	Path            []string           `json:"path"`
 	Scope           []string           `json:"scope"`
 	MergeRule       string             `json:"merge_rule"`
+	Model           string             `json:"model"`
 	LastSeenAt      string             `json:"last_seen_at,omitempty"`
 	LastCommand     string             `json:"last_command,omitempty"`
 	ProviderState   org.LifecycleState `json:"provider_state"`
@@ -267,6 +268,7 @@ type orgStatusOutput struct {
 	Depth           int                `json:"depth,omitempty"`
 	Scope           []string           `json:"scope"`
 	MergeRule       string             `json:"merge_rule"`
+	Model           string             `json:"model"`
 	LastSeenAt      string             `json:"last_seen_at,omitempty"`
 	LastSeenAge     string             `json:"last_seen_age,omitempty"`
 	LastCommand     string             `json:"last_command,omitempty"`
@@ -351,7 +353,7 @@ func buildOrgBriefOutput(cfg config.OrgConfig, presence map[string]db.OrgRolePre
 	row := presence[role.Name]
 	return orgBriefOutput{
 		Role: role.Name, Parent: role.Parent, Pane: role.Pane, Children: childNames, Path: cfg.Path(role.Name), Scope: role.Scope,
-		MergeRule: role.MergeRule, LastSeenAt: row.LastSeenAt, LastCommand: row.LastCommand,
+		MergeRule: role.MergeRule, Model: role.Model, LastSeenAt: row.LastSeenAt, LastCommand: row.LastCommand,
 		ProviderState: live.State, ProviderDetail: live.Detail, ObservedAt: snapshot.ObservedAt, ProviderVersion: snapshot.ProviderVersion,
 	}
 }
@@ -418,7 +420,7 @@ func runOrgOverview(command string, args []string, stdout, stderr io.Writer) int
 	}
 	if command == "chart" {
 		for _, row := range rows {
-			fmt.Fprintf(stdout, "%s%s · %s · scope=%s · merge=%s · seen=%s%s\n", strings.Repeat("  ", row.Depth), row.Role, row.ProviderState, strings.Join(row.Scope, ","), dash(row.MergeRule), dash(row.LastSeenAge), orgMissedWakeFlag(row))
+			fmt.Fprintf(stdout, "%s%s · %s · scope=%s · merge=%s · model=%s · seen=%s%s\n", strings.Repeat("  ", row.Depth), row.Role, row.ProviderState, strings.Join(row.Scope, ","), dash(row.MergeRule), dash(row.Model), dash(row.LastSeenAge), orgMissedWakeFlag(row))
 		}
 		return 0
 	}
@@ -443,6 +445,7 @@ func printOrgBrief(w io.Writer, brief orgBriefOutput) {
 	fmt.Fprintf(w, "path: %s\n", dash(strings.Join(brief.Path, " > ")))
 	fmt.Fprintf(w, "scope: %s\n", dash(strings.Join(brief.Scope, ", ")))
 	fmt.Fprintf(w, "merge_rule: %s\n", dash(brief.MergeRule))
+	fmt.Fprintf(w, "model: %s\n", dash(brief.Model))
 	fmt.Fprintf(w, "last_seen: %s\n", dash(brief.LastSeenAt))
 	fmt.Fprintf(w, "last_command: %s\n", dash(brief.LastCommand))
 	fmt.Fprintf(w, "provider: %s\n", brief.ProviderState)
@@ -547,7 +550,7 @@ func runOrgRecycle(args []string, stdout, stderr io.Writer) int {
 	var boot strings.Builder
 	printOrgBrief(&boot, brief)
 	fmt.Fprintf(&boot, "\nhandoff: %s\n", handoff)
-	req := org.RecycleRequest{Role: role.Name, Pane: pane, Kind: kind, AgentName: role.Name, BootPrompt: boot.String()}
+	req := org.RecycleRequest{Role: role.Name, Pane: pane, Kind: kind, AgentName: role.Name, Model: role.Model, BootPrompt: boot.String()}
 	if err := provider.Recycle(ctx, req); err != nil {
 		fmt.Fprintf(stderr, "org recycle: %v (handoff journaled in workflow %s)\n", err, workflowID)
 		return 1

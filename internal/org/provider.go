@@ -31,6 +31,7 @@ type RecycleRequest struct {
 	Pane       string
 	Kind       string
 	AgentName  string
+	Model      string
 	BootPrompt string
 }
 

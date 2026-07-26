@@ -601,6 +601,7 @@ path = ""
 # [org.roles."owner"]
 # scope = ["*"]
 # merge_rule = "owner"
+# model = "gpt-5.6-sol"  # optional: pin the runtime model honored at org recycle
 # [org.roles."maintainer"]
 # parent = "owner"
 # scope = ["owner/*"]
