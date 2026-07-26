@@ -127,7 +127,8 @@ func TestEvaluateBlockedTaskEpisodesDigestsDueTasksAndMarksEachEpisode(t *testin
 	if ev.JobID != "task-oldest" || ev.RootID != "task-oldest" || ev.Repo != repo || ev.Cause != "blocked_since" {
 		t.Fatalf("digest event = %+v", ev)
 	}
-	for _, want := range []string{"3 tasks blocked", "oldest 4h0m0s", "task-oldest", "(+2 more)"} {
+	wantSince := tasks[1].blockedSince.UTC().Format(time.RFC3339) // task-oldest, the digest anchor
+	for _, want := range []string{"3 tasks blocked", "oldest 4h0m0s", "(since " + wantSince + ")", "task-oldest", "(+2 more)"} {
 		if !strings.Contains(ev.Detail, want) {
 			t.Fatalf("digest detail %q missing %q", ev.Detail, want)
 		}
@@ -176,8 +177,10 @@ func TestEvaluateBlockedTaskEpisodesSingleTaskUsesOneItemDigest(t *testing.T) {
 	if len(blocked) != 1 {
 		t.Fatalf("job.blocked events = %d, want 1", len(blocked))
 	}
-	if ev := blocked[0]; ev.Detail != "1 tasks blocked — oldest 2h0m0s — task-only" || strings.Contains(ev.Detail, "(+") {
-		t.Fatalf("one-item digest detail = %q", ev.Detail)
+	wantSince := now.Add(-2 * time.Hour).UTC().Format(time.RFC3339)
+	wantDetail := "1 tasks blocked — oldest 2h0m0s (since " + wantSince + ") — task-only"
+	if ev := blocked[0]; ev.Detail != wantDetail || strings.Contains(ev.Detail, "(+") {
+		t.Fatalf("one-item digest detail = %q, want %q", ev.Detail, wantDetail)
 	}
 }
 
@@ -438,8 +441,8 @@ func TestBlockedSinceReNudgesOncePerIntervalWhileStillBlocked(t *testing.T) {
 	nudgeAt(base.Add(30*time.Minute), 1)        // within interval → no re-emit
 	nudgeAt(base.Add(wakeAfter+time.Minute), 2) // past interval, still blocked → re-nudge #2
 
-	// The task digest no longer carries each item's first_since, but the durable
-	// per-task episode must retain that stable identity across re-nudges.
+	// The digest carries only the anchor item's first_since, not every item's, but
+	// the durable per-task episode must retain that stable identity across re-nudges.
 	episodes, err = store.ListBlockedEpisodes(ctx)
 	if err != nil || len(episodes) != 1 || episodes[0].BlockedSince != firstSince {
 		t.Fatalf("re-nudge changed episode identity: episodes=%+v first_since=%q err=%v", episodes, firstSince, err)

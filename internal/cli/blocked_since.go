@@ -442,7 +442,13 @@ func buildBlockedTaskDigestEvent(repo string, items []blockedTaskDigestItem, now
 	if len(items) > 1 {
 		suffix = fmt.Sprintf(" (+%d more)", len(items)-1)
 	}
-	detail := fmt.Sprintf("%d tasks blocked — oldest %s — %s%s", len(items), oldest.blockedFor.Round(time.Second), oldest.taskID, suffix)
+	// Carry the anchor's "(since ...)" the same way buildBlockedSinceEvent does
+	// for the role path: JobID/RootID here is the oldest item's taskID, so a
+	// consumer keying off (job_id, since) can still tell a re-nudge of the SAME
+	// anchor apart from a fresh digest whose oldest task changed identity
+	// between ticks.
+	detail := fmt.Sprintf("%d tasks blocked — oldest %s (since %s) — %s%s",
+		len(items), oldest.blockedFor.Round(time.Second), oldest.blockedSince.UTC().Format(time.RFC3339), oldest.taskID, suffix)
 	ev := events.NewEvent(events.EventJobBlocked, oldest.taskID, oldest.taskID, repo, string(workflow.TaskBlocked), detail, now, workflow.RedactCommentText)
 	ev.Cause = "blocked_since"
 	return ev
