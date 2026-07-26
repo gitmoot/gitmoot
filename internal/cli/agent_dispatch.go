@@ -805,6 +805,16 @@ func prepareLocalImplementDispatchRequest(ctx context.Context, store *db.Store, 
 			if dirty, err := taskWorktreeDirty(ctx, existing); err != nil {
 				return db.Task{}, localAgentDispatchRequest{}, err
 			} else if dirty {
+				handled, blockErr := (workflow.Engine{Store: store}).ReconcileDirtyTaskWorktreeLineage(
+					ctx,
+					gitutil.Client{Dir: record.CheckoutPath},
+					existing,
+					existing.WorktreePath,
+					baseSHA,
+				)
+				if handled {
+					return db.Task{}, localAgentDispatchRequest{}, blockErr
+				}
 				if prOpenFixPass {
 					return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s has uncommitted changes in task worktree %s; inspect and commit/push them, or clean/stash them before retrying the PR fix-pass", branchHint, existing.WorktreePath)
 				}

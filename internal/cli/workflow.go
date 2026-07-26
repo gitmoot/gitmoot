@@ -460,6 +460,16 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 				return err
 			}
 			if dirty {
+				handled, blockErr := (workflow.Engine{Store: store}).ReconcileDirtyTaskWorktreeLineage(
+					context.Background(),
+					gitutil.Client{Dir: checkout},
+					candidate,
+					candidate.WorktreePath,
+					*base,
+				)
+				if handled {
+					return blockErr
+				}
 				skipFanout := taskRecoverSkipFanout(context.Background(), store, requestRepo, requestBranch)
 				recoverCmd := taskRecoverCommand(task.ID, *home, requestRepo, strings.TrimSpace(*owner), skipFanout)
 				return fmt.Errorf("task %s worktree has uncommitted changes at %s; inspect it, then run %s to commit/push/open a PR, or clean/stash it before retrying task run", task.ID, candidate.WorktreePath, recoverCmd)

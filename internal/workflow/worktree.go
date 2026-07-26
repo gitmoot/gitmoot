@@ -95,6 +95,48 @@ type TaskWorktreeRequest struct {
 	Checkout   string
 }
 
+// ReconcileDirtyTaskWorktreeLineage distinguishes ordinary resumable dirtiness
+// from a dirty worktree whose base has moved. Callers invoke it only after their
+// existing dirty-worktree preflight has succeeded.
+//
+// A confirmed off-lineage worktree is blocked and journaled through the same
+// path used by AllocateTaskWorktree. An intact or indeterminate lineage returns
+// handled=false so callers preserve their existing recover-or-clean guidance.
+func (e Engine) ReconcileDirtyTaskWorktreeLineage(ctx context.Context, manager WorktreeManager, task db.Task, path, baseRef string) (handled bool, blockErr error) {
+	// Every probe/setup failure is deliberately indeterminate. This method may
+	// only replace the caller's existing dirty-worktree behavior when it can
+	// affirmatively prove the worktree is off-lineage.
+	if err := e.validate(); err != nil {
+		return false, nil
+	}
+	lineage, err := writableWorktreeLineageManager(manager)
+	if err != nil {
+		return false, nil
+	}
+	baseHead, err := fetchAndResolveLineageBase(ctx, lineage, baseRef)
+	if err != nil {
+		return false, nil
+	}
+	worktreeHead, err := lineage.HeadSHAAt(ctx, path)
+	if err != nil {
+		return false, nil
+	}
+	isAncestor, err := lineage.IsAncestor(ctx, baseHead, worktreeHead)
+	if err != nil || isAncestor {
+		return false, nil
+	}
+	result := worktreeLineageResult{DirtyBlocked: true, BaseHead: baseHead, OldHead: worktreeHead}
+	reason := result.dirtyBlockedMessage(path)
+	request := TaskWorktreeRequest{
+		Repo:      task.RepoFullName,
+		TaskID:    task.ID,
+		GoalID:    task.GoalID,
+		TaskTitle: task.Title,
+		Branch:    task.Branch,
+	}
+	return true, blockTaskForDirtyWorktree(ctx, e.Store, task, request, path, reason)
+}
+
 func (e Engine) AllocateTaskWorktree(ctx context.Context, request TaskWorktreeRequest, manager WorktreeManager) (db.Task, error) {
 	if err := e.validate(); err != nil {
 		return db.Task{}, err
