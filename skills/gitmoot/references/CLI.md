@@ -1243,6 +1243,14 @@ panes; there is no code-level marker to migrate. Phase 1a writes the typed
 note, which is visible with `workflow show`; structured escalation surfaces
 land with the org brief and active delivery/wake is phase 2. Pane/agent creation
 permissions and Herdr checks remain later work.
+
+`gitmoot org escalate resolve <escalation-note-id> [--by <role>] [--note
+<answer-note-id>] [--home <dir>]` appends a typed resolution marker to the same
+workflow journal. `--by` defaults to the escalation's target role, and `--note`
+optionally links the workflow note containing the answer. Resolved escalations
+are omitted from org dashboard projections while the original journal entry
+remains intact.
+
 Event-rule wakes are separately opt-in:
 
 ```sh

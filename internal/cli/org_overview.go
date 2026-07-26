@@ -17,6 +17,10 @@ type orgLiveSource func(ctx context.Context, cfg config.OrgConfig) (states map[s
 
 const storeOrgLivePresenceMaxAge = 5 * time.Minute
 
+// A single miss older than this stops being flagged as current. The stored
+// counter remains untouched for the next real delivery attempt.
+const missedWakeStaleAfter = 24 * time.Hour
+
 type orgSharedState struct {
 	Config          config.OrgConfig
 	Presence        map[string]db.OrgRolePresence
@@ -41,7 +45,7 @@ func (e *orgLiveSourceError) Unwrap() error { return e.err }
 
 // loadOrgSharedState loads the configuration and store-backed inputs shared by
 // CLI and dashboard org projections. The caller owns the already-open store.
-func loadOrgSharedState(ctx context.Context, paths config.Paths, store *db.Store) (orgSharedState, error) {
+func loadOrgSharedState(ctx context.Context, paths config.Paths, store *db.Store, now time.Time) (orgSharedState, error) {
 	cfg, err := config.LoadOrg(paths)
 	if err != nil {
 		return orgSharedState{}, fmt.Errorf("load org registry: %w", err)
@@ -80,9 +84,20 @@ func loadOrgSharedState(ctx context.Context, paths config.Paths, store *db.Store
 		return state, nil
 	}
 	for _, row := range missed {
+		if missedWakeIsStale(row.UpdatedAt, now) {
+			continue
+		}
 		state.MissedWakes[row.Role] = row.Consecutive
 	}
 	return state, nil
+}
+
+func missedWakeIsStale(updatedAt string, now time.Time) bool {
+	updated, err := time.Parse(db.BlockedEpisodeTimeLayout, updatedAt)
+	if err != nil {
+		return false
+	}
+	return now.Sub(updated) > missedWakeStaleAfter
 }
 
 func herdrOrgLiveSource(ctx context.Context, cfg config.OrgConfig) (map[string]org.RoleLiveState, time.Time, string, error) {

@@ -99,8 +99,11 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 	handoffOld := workflow.FormatOrgHandoffNote("owner", "Initial handoff.")
 	handoffNew := workflow.FormatOrgHandoffNote("owner", "Latest handoff.")
 	handoffReview := workflow.FormatOrgHandoffNote("review", "Review journaled.")
+	resolvedEscalation, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{WorkflowID: "release/one", Author: "review", Body: escalationOld})
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, note := range []db.WorkflowNote{
-		{WorkflowID: "release/one", Author: "review", Body: escalationOld},
 		{WorkflowID: "release/two", Author: "owner", Body: escalationNew},
 		{WorkflowID: "org/owner", Author: "owner", Body: handoffOld},
 		{WorkflowID: "org/owner", Author: "owner", Body: handoffNew},
@@ -109,6 +112,12 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 		if _, err := store.InsertWorkflowNote(ctx, note); err != nil {
 			t.Fatal(err)
 		}
+	}
+	resolutionBody := workflow.FormatOrgEscalateResolvedNote(resolvedEscalation.ID, "owner", 0)
+	if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: resolvedEscalation.WorkflowID, Author: "owner", Body: resolutionBody,
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -119,6 +128,7 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
+	resolutionMax := base.Add(6 * time.Hour)
 	for _, update := range []struct {
 		query string
 		args  []any
@@ -128,6 +138,7 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 		{`UPDATE org_recycle_overdue_episodes SET updated_at = ? WHERE subject = 'owner'`, []any{sourceMax.Format(db.BlockedEpisodeTimeLayout)}},
 		{`UPDATE workflow_notes SET created_at = ? WHERE body = ?`, []any{base.Add(-25 * time.Minute).Format("2006-01-02 15:04:05"), escalationOld}},
 		{`UPDATE workflow_notes SET created_at = ? WHERE body = ?`, []any{base.Add(-20 * time.Minute).Format("2006-01-02 15:04:05"), escalationNew}},
+		{`UPDATE workflow_notes SET created_at = ? WHERE body = ?`, []any{resolutionMax.Format("2006-01-02 15:04:05"), resolutionBody}},
 		{`UPDATE workflow_notes SET created_at = ? WHERE body = ?`, []any{base.Add(-45 * time.Minute).Format("2006-01-02 15:04:05"), handoffOld}},
 		{`UPDATE workflow_notes SET created_at = ? WHERE body = ?`, []any{base.Add(-15 * time.Minute).Format("2006-01-02 15:04:05"), handoffNew}},
 		{`UPDATE workflow_notes SET created_at = ? WHERE body = ?`, []any{base.Add(-10 * time.Minute).Format("2006-01-02 15:04:05"), handoffReview}},
@@ -145,8 +156,8 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 	if !view.DetectionEnabled || view.DetectionHint != "" {
 		t.Fatalf("detection = %v hint %q", view.DetectionEnabled, view.DetectionHint)
 	}
-	if view.DataAsOf != sourceMax.Format(time.RFC3339) {
-		t.Fatalf("data_as_of = %q, want persisted max %q", view.DataAsOf, sourceMax.Format(time.RFC3339))
+	if view.DataAsOf != resolutionMax.Format(time.RFC3339) {
+		t.Fatalf("data_as_of = %q, want resolution max %q", view.DataAsOf, resolutionMax.Format(time.RFC3339))
 	}
 	if len(view.Roles) != 2 || view.Roles[0].Name != "owner" || view.Roles[1].Name != "review" {
 		t.Fatalf("roles = %+v", view.Roles)
@@ -160,10 +171,10 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 	if view.Roles[1].PresenceState != "blocked" || view.Roles[1].Badges.BlockedSince == "" || view.Roles[1].Badges.MissedWakes != 1 {
 		t.Fatalf("review = %+v", view.Roles[1])
 	}
-	if got := view.Health; got.Roles != 2 || got.Working != 1 || got.Blocked != 1 || got.Overdue != 1 || got.OpenEscalations != 2 || got.StalledWakes != 1 {
+	if got := view.Health; got.Roles != 2 || got.Working != 1 || got.Blocked != 1 || got.Overdue != 1 || got.OpenEscalations != 1 || got.StalledWakes != 1 {
 		t.Fatalf("health = %+v", got)
 	}
-	if len(view.Escalations) != 2 || view.Escalations[0].Wf != "release/one" || view.Escalations[1].Wf != "release/two" {
+	if len(view.Escalations) != 1 || view.Escalations[0].Wf != "release/two" {
 		t.Fatalf("escalations = %+v", view.Escalations)
 	}
 	if len(view.Feed) != 5 {
@@ -198,7 +209,7 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 	if role.Activity.JobsToday["running"] != 1 || role.Activity.Notes != 2 {
 		t.Fatalf("owner activity = %+v", role.Activity)
 	}
-	if len(role.Escalations) != 2 {
+	if len(role.Escalations) != 1 || role.Escalations[0].Wf != "release/two" {
 		t.Fatalf("owner escalations = %+v", role.Escalations)
 	}
 
@@ -217,6 +228,95 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/org/role/missing", nil))
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("missing role HTTP status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestDashboardOrgMissedWakeAgeOutMatchesBadgesAndHealth(t *testing.T) {
+	_, paths := setupOrgHome(t)
+	enableDashboardOrgDetection(t, paths.ConfigFile)
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	if err := store.IncrementRoleMissedWake(ctx, "owner", now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.IncrementRoleMissedWake(ctx, "review", now.Add(-missedWakeStaleAfter-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	view, err := buildDashboardOrg(ctx, paths, store, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Roles) != 2 {
+		t.Fatalf("roles = %+v", view.Roles)
+	}
+	badges := map[string]int{}
+	for _, role := range view.Roles {
+		badges[role.Name] = role.Badges.MissedWakes
+	}
+	if badges["owner"] != 1 || badges["review"] != 0 {
+		t.Fatalf("missed-wake badges = %+v", badges)
+	}
+	if view.Health.StalledWakes != 1 {
+		t.Fatalf("stalled wakes = %d, want 1", view.Health.StalledWakes)
+	}
+}
+
+// TestDashboardOrgResolvedEscalationSurvivesUnrelatedResolutionVolume guards a
+// high-review-caught regression: resolved-escalation lookup must not depend on
+// a single globally time-windowed LIMIT-200 scan of ALL resolve-marker notes.
+// A resolve marker far older than 200 UNRELATED newer resolutions (in other
+// workflows) must still be found, because lookup is scoped per-workflow, not by
+// a global recency window that could push the marker out while the original
+// escalation note (itself capped at 200, in its own small workflow) stays in.
+func TestDashboardOrgResolvedEscalationSurvivesUnrelatedResolutionVolume(t *testing.T) {
+	_, paths := setupOrgHome(t)
+	enableDashboardOrgDetection(t, paths.ConfigFile)
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	target, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/one", Author: "review",
+		Body: workflow.FormatOrgEscalateNote("review", "owner", "release/one", "Need a decision."),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/one", Author: "owner",
+		Body: workflow.FormatOrgEscalateResolvedNote(target.ID, "owner", 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 200+ newer, UNRELATED resolve-marker notes in a different workflow. A
+	// single global "most recent 200 resolve markers" scan would push the
+	// target's marker out of window; a per-workflow scoped lookup never sees
+	// these at all when resolving "release/one"'s escalation.
+	for i := 0; i < dashboardOrgNoteLimit+10; i++ {
+		if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: "filler/other", Author: "owner",
+			Body: workflow.FormatOrgEscalateResolvedNote(target.ID+int64(1000+i), "owner", 0),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	view, err := buildDashboardOrg(ctx, paths, store, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Escalations) != 0 || view.Health.OpenEscalations != 0 {
+		t.Fatalf("resolved escalation resurfaced as open: escalations=%+v health=%+v", view.Escalations, view.Health)
 	}
 }
 

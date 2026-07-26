@@ -95,16 +95,17 @@ func dashboardOrgCursor(ctx context.Context, store *db.Store) (string, error) {
 }
 
 type dashboardOrgInputs struct {
-	shared           orgSharedState
-	rows             []orgStatusOutput
-	blocked          []db.BlockedEpisode
-	recycleOverdue   []db.RecycleOverdueEpisode
-	missedWakes      []db.RoleMissedWake
-	escalationNotes  []db.WorkflowNote
-	handoffNotes     []db.WorkflowNote
-	detectionEnabled bool
-	detectionHint    string
-	dataAsOf         time.Time
+	shared                orgSharedState
+	rows                  []orgStatusOutput
+	blocked               []db.BlockedEpisode
+	recycleOverdue        []db.RecycleOverdueEpisode
+	missedWakes           []db.RoleMissedWake
+	escalationNotes       []db.WorkflowNote
+	resolvedEscalationIDs map[int64]bool
+	handoffNotes          []db.WorkflowNote
+	detectionEnabled      bool
+	detectionHint         string
+	dataAsOf              time.Time
 }
 
 // hasFreshLivePresence reports whether any persisted Herdr snapshot row is still
@@ -118,8 +119,8 @@ func hasFreshLivePresence(rows map[string]db.RoleLivePresence, now time.Time) bo
 	return false
 }
 
-func loadDashboardOrgInputs(ctx context.Context, paths config.Paths, store *db.Store) (dashboardOrgInputs, error) {
-	shared, err := loadOrgSharedState(ctx, paths, store)
+func loadDashboardOrgInputs(ctx context.Context, paths config.Paths, store *db.Store, now time.Time) (dashboardOrgInputs, error) {
+	shared, err := loadOrgSharedState(ctx, paths, store, now)
 	if err != nil {
 		return dashboardOrgInputs{}, err
 	}
@@ -140,6 +141,10 @@ func loadDashboardOrgInputs(ctx context.Context, paths config.Paths, store *db.S
 		return dashboardOrgInputs{}, err
 	}
 	escalationNotes, err := store.ListWorkflowNotesByBodyPrefix(ctx, workflow.OrgEscalatePrefix, dashboardOrgNoteLimit)
+	if err != nil {
+		return dashboardOrgInputs{}, err
+	}
+	resolvedEscalationIDs, resolvedNotes, err := dashboardResolvedEscalationIDs(ctx, store, escalationNotes)
 	if err != nil {
 		return dashboardOrgInputs{}, err
 	}
@@ -172,13 +177,14 @@ func loadDashboardOrgInputs(ctx context.Context, paths config.Paths, store *db.S
 	// passing its own Herdr-availability gate. If nothing fresh has been written,
 	// the page would otherwise show every role never-seen with no explanation, so
 	// distinguish "configured off" from "on but no data yet".
-	if enabled && !hasFreshLivePresence(shared.livePresence, time.Now().UTC()) {
+	if enabled && !hasFreshLivePresence(shared.livePresence, now) {
 		hint = "blocked detection on, waiting for live presence (the daemon or Herdr may be unavailable)"
 	}
 
 	inputs := dashboardOrgInputs{
 		shared: shared, rows: rows, blocked: blocked, recycleOverdue: recycleOverdue,
-		missedWakes: missedWakes, escalationNotes: escalationNotes, handoffNotes: handoffNotes,
+		missedWakes: missedWakes, escalationNotes: escalationNotes,
+		resolvedEscalationIDs: resolvedEscalationIDs, handoffNotes: handoffNotes,
 		detectionEnabled: enabled, detectionHint: hint,
 	}
 	for _, presence := range shared.Presence {
@@ -199,6 +205,9 @@ func loadDashboardOrgInputs(ctx context.Context, paths config.Paths, store *db.S
 	for _, note := range escalationNotes {
 		inputs.observe(note.CreatedAt)
 	}
+	for _, note := range resolvedNotes {
+		inputs.observe(note.CreatedAt)
+	}
 	for _, note := range handoffNotes {
 		inputs.observe(note.CreatedAt)
 	}
@@ -212,7 +221,7 @@ func (i *dashboardOrgInputs) observe(value string) {
 }
 
 func buildDashboardOrg(ctx context.Context, paths config.Paths, store *db.Store, now time.Time) (dashboard.OrgView, error) {
-	inputs, err := loadDashboardOrgInputs(ctx, paths, store)
+	inputs, err := loadDashboardOrgInputs(ctx, paths, store, now)
 	if err != nil {
 		return dashboard.OrgView{}, err
 	}
@@ -220,7 +229,7 @@ func buildDashboardOrg(ctx context.Context, paths config.Paths, store *db.Store,
 		DetectionEnabled: inputs.detectionEnabled,
 		DetectionHint:    inputs.detectionHint,
 		Roles:            []dashboard.OrgNode{},
-		Escalations:      dashboardOrgEscalations(inputs.escalationNotes, ""),
+		Escalations:      dashboardOrgEscalations(inputs.escalationNotes, "", inputs.resolvedEscalationIDs),
 		Feed:             dashboardOrgFeed(inputs.blocked, inputs.recycleOverdue, inputs.handoffNotes),
 	}
 	if !inputs.dataAsOf.IsZero() {
@@ -266,7 +275,7 @@ func buildDashboardOrg(ctx context.Context, paths config.Paths, store *db.Store,
 	// the health tile can't leak (or contradict the chart) at K=0.
 	if inputs.shared.MaxMissedWakes > 0 {
 		for _, missed := range inputs.missedWakes {
-			if missed.Consecutive > 0 {
+			if missed.Consecutive > 0 && !missedWakeIsStale(missed.UpdatedAt, now) {
 				out.Health.StalledWakes++
 			}
 		}
@@ -275,7 +284,7 @@ func buildDashboardOrg(ctx context.Context, paths config.Paths, store *db.Store,
 }
 
 func buildDashboardOrgRole(ctx context.Context, paths config.Paths, store *db.Store, name string, now time.Time) (dashboard.OrgRoleView, error) {
-	shared, err := loadOrgSharedState(ctx, paths, store)
+	shared, err := loadOrgSharedState(ctx, paths, store, now)
 	if err != nil {
 		return dashboard.OrgRoleView{}, err
 	}
@@ -299,6 +308,10 @@ func buildDashboardOrgRole(ctx context.Context, paths config.Paths, store *db.St
 		return dashboard.OrgRoleView{}, err
 	}
 	escalationNotes, err := store.ListWorkflowNotesByBodyPrefix(ctx, workflow.OrgEscalatePrefix, dashboardOrgNoteLimit)
+	if err != nil {
+		return dashboard.OrgRoleView{}, err
+	}
+	resolvedEscalationIDs, _, err := dashboardResolvedEscalationIDs(ctx, store, escalationNotes)
 	if err != nil {
 		return dashboard.OrgRoleView{}, err
 	}
@@ -332,7 +345,7 @@ func buildDashboardOrgRole(ctx context.Context, paths config.Paths, store *db.St
 			JobsToday: copyOrgJobCounts(jobsToday[role.Name]),
 			Notes:     len(notes),
 		},
-		Escalations: dashboardOrgEscalations(escalationNotes, role.Name),
+		Escalations: dashboardOrgEscalations(escalationNotes, role.Name, resolvedEscalationIDs),
 	}
 	for index := len(notes) - 1; index >= 0; index-- {
 		noteRole, handoff, ok := workflow.ParseOrgHandoffNote(notes[index].Body)
@@ -407,11 +420,49 @@ type dashboardOrgEscalationRecord struct {
 	id   int64
 }
 
-func dashboardOrgEscalations(notes []db.WorkflowNote, role string) []dashboard.OrgEscalation {
+// dashboardResolvedEscalationIDs returns the set of escalation note IDs that
+// have a matching [org:escalate-resolved ...] marker, plus the resolve-marker
+// notes found (for the caller's dataAsOf watermark). It is scoped to exactly
+// the workflows the given escalation notes belong to and fetched UNBOUNDED per
+// workflow (a coordination workflow's note count is small).
+//
+// This deliberately avoids a single globally-capped prefix scan for resolve
+// markers: two independently time-windowed LIMIT-200 queries (one for open
+// escalations, one for resolve markers) can desync once resolution volume
+// exceeds escalation volume, silently resurrecting an already-resolved
+// escalation as open once its marker falls out of its own separately
+// paginated window while the original escalation note stays in-window.
+func dashboardResolvedEscalationIDs(ctx context.Context, store *db.Store, escalationNotes []db.WorkflowNote) (map[int64]bool, []db.WorkflowNote, error) {
+	workflowIDs := map[string]struct{}{}
+	for _, note := range escalationNotes {
+		if wf := strings.TrimSpace(note.WorkflowID); wf != "" {
+			workflowIDs[wf] = struct{}{}
+		}
+	}
+	resolved := make(map[int64]bool)
+	var resolvedNotes []db.WorkflowNote
+	for wf := range workflowIDs {
+		notes, err := store.ListWorkflowNotes(ctx, wf, 0)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, note := range notes {
+			escalationNoteID, _, _, ok := workflow.ParseOrgEscalateResolvedNote(note.Body)
+			if !ok {
+				continue
+			}
+			resolved[escalationNoteID] = true
+			resolvedNotes = append(resolvedNotes, note)
+		}
+	}
+	return resolved, resolvedNotes, nil
+}
+
+func dashboardOrgEscalations(notes []db.WorkflowNote, role string, resolvedIDs map[int64]bool) []dashboard.OrgEscalation {
 	records := []dashboardOrgEscalationRecord{}
 	for _, note := range notes {
 		from, to, workflowID, question, ok := workflow.ParseOrgEscalateNote(note.Body)
-		if !ok || (role != "" && from != role && to != role) {
+		if !ok || resolvedIDs[note.ID] || (role != "" && from != role && to != role) {
 			continue
 		}
 		records = append(records, dashboardOrgEscalationRecord{
