@@ -32,6 +32,8 @@ github.com/gitmoot/gitmoot-dashboard v0.0.0-20260723235132-2ee2d26694cf h1:ooqc+
 github.com/gitmoot/gitmoot-dashboard v0.0.0-20260723235132-2ee2d26694cf/go.mod h1:uKBMK3kRRDJ1gYrek/XsPzUo/PBOv+aqY2UG8vBETXI=
 github.com/gitmoot/gitmoot-dashboard v0.0.0-20260726152319-0f0153ec1626 h1:+Ku2cRcpJsx3ZD2ajIXR4mbAbkVg3IbCJ312mxWrOKA=
 github.com/gitmoot/gitmoot-dashboard v0.0.0-20260726152319-0f0153ec1626/go.mod h1:uKBMK3kRRDJ1gYrek/XsPzUo/PBOv+aqY2UG8vBETXI=
+github.com/gitmoot/gitmoot-dashboard v0.0.0-20260726160023-a6365fe9d2cf h1:7t0BUp6dx9E/tEc4oUhiI4bflxi8w6Qg9pB+BDw7kyg=
+github.com/gitmoot/gitmoot-dashboard v0.0.0-20260726160023-a6365fe9d2cf/go.mod h1:uKBMK3kRRDJ1gYrek/XsPzUo/PBOv+aqY2UG8vBETXI=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
 github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
 github.com/google/pprof v0.0.0-20250317173921-a4b03ec1a45e h1:ijClszYn+mADRFY17kjQEVQ1XRhq2/JR1M3sGqeJoxs=
