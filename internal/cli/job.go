@@ -86,7 +86,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 	repo := fs.String("repo", "", "repo scope as owner/repo")
 	state := fs.String("state", "", "job state filter")
 	workflowID := fs.String("workflow", "", "external-coordinator workflow label")
-	jsonOutput := fs.Bool("json", false, "print jobs (with why-stuck detail) as JSON")
+	jsonOutput := fs.Bool("json", false, "print jobs (with operational detail) as JSON")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -143,6 +143,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 			payload, _ := jobListPayload(job)
 			ev, ok := reasonEvents[job.ID]
 			reason := deriveStuckReason(job, ev, ok, locks)
+			processActive := deriveWorktreeProcessActive(job, jobWorktreeLiveness)
 			entries = append(entries, jobListEntry{
 				ID:              job.ID,
 				State:           job.State,
@@ -155,6 +156,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 				WhyStuck:        reason.Reason,
 				NextRetryAt:     reason.NextRetryAt,
 				SuggestedAction: reason.SuggestedAction,
+				ProcessActive:   processActive,
 			})
 		}
 		if err := writeJSON(stdout, entries); err != nil {
@@ -182,6 +184,9 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 				fmt.Fprintf(stdout, " [action: %s]", reason.SuggestedAction)
 			}
 		}
+		if deriveWorktreeProcessActive(job, jobWorktreeLiveness) {
+			fmt.Fprint(stdout, "\tLIVE PROCESS: worktree still has an active process")
+		}
 		fmt.Fprintln(stdout)
 	}
 	return 0
@@ -198,8 +203,8 @@ func flagWasSupplied(fs *flag.FlagSet, name string) bool {
 }
 
 // jobListEntry is the JSON shape for `job list --json`: the existing table
-// columns plus the additive why-stuck fields (#552). The stuck fields are omitted
-// when empty so a healthy job's JSON is not bloated.
+// columns plus additive operational fields (#552, #1132). Zero-value detail is
+// omitted so a healthy job's JSON is not bloated.
 type jobListEntry struct {
 	ID              string `json:"id"`
 	State           string `json:"state"`
@@ -212,13 +217,14 @@ type jobListEntry struct {
 	WhyStuck        string `json:"why_stuck,omitempty"`
 	NextRetryAt     string `json:"next_retry_at,omitempty"`
 	SuggestedAction string `json:"suggested_action,omitempty"`
+	ProcessActive   bool   `json:"process_active,omitempty"`
 }
 
 func runJobShow(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("job show", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	jsonOutput := fs.Bool("json", false, "print the job (with why-stuck detail) as JSON")
+	jsonOutput := fs.Bool("json", false, "print the job (with operational detail) as JSON")
 	jobID, ok := parseSingleJobID(fs, args, stderr, "job show")
 	if !ok {
 		return parseSingleJobIDExitCode(args)
@@ -245,27 +251,36 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "job show: %v\n", err)
 		return 1
 	}
+	processActive := deriveWorktreeProcessActive(job, jobWorktreeLiveness)
 	if *jsonOutput {
-		out := jobShowOutput{Job: job, Payload: payload, WhyStuck: reason.Reason, NextRetryAt: reason.NextRetryAt, SuggestedAction: reason.SuggestedAction}
+		out := jobShowOutput{
+			Job:             job,
+			Payload:         payload,
+			WhyStuck:        reason.Reason,
+			NextRetryAt:     reason.NextRetryAt,
+			SuggestedAction: reason.SuggestedAction,
+			ProcessActive:   processActive,
+		}
 		if err := writeJSON(stdout, out); err != nil {
 			fmt.Fprintf(stderr, "job show: %v\n", err)
 			return 1
 		}
 		return 0
 	}
-	printJob(stdout, job, payload, reason)
+	printJob(stdout, job, payload, reason, processActive)
 	return 0
 }
 
 // jobShowOutput is the JSON shape for `job show --json`: the job, its decoded
-// payload, and the additive why-stuck detail (#552). The stuck fields are omitted
-// when empty so a healthy job's JSON is unchanged in spirit.
+// payload, and additive operational detail (#552, #1132). Zero-value detail is
+// omitted so a healthy job's JSON is unchanged in spirit.
 type jobShowOutput struct {
 	Job             db.Job              `json:"job"`
 	Payload         workflow.JobPayload `json:"payload"`
 	WhyStuck        string              `json:"why_stuck,omitempty"`
 	NextRetryAt     string              `json:"next_retry_at,omitempty"`
 	SuggestedAction string              `json:"suggested_action,omitempty"`
+	ProcessActive   bool                `json:"process_active,omitempty"`
 }
 
 // loadStuckReason derives a queued/blocked job's why-stuck reason from its full
@@ -1206,7 +1221,7 @@ func jobListPayload(job db.Job) (workflow.JobPayload, error) {
 	return daemonJobPayload(job)
 }
 
-func printJob(stdout io.Writer, job db.Job, payload workflow.JobPayload, reason stuckReason) {
+func printJob(stdout io.Writer, job db.Job, payload workflow.JobPayload, reason stuckReason, processActive bool) {
 	fmt.Fprintf(stdout, "id: %s\n", job.ID)
 	fmt.Fprintf(stdout, "state: %s\n", job.State)
 	if !reason.empty() {
@@ -1217,6 +1232,9 @@ func printJob(stdout io.Writer, job db.Job, payload workflow.JobPayload, reason 
 		if reason.SuggestedAction != "" {
 			fmt.Fprintf(stdout, "suggested_action: %s\n", reason.SuggestedAction)
 		}
+	}
+	if processActive {
+		fmt.Fprintln(stdout, "process_active: worktree still has an active process")
 	}
 	fmt.Fprintf(stdout, "type: %s\n", job.Type)
 	fmt.Fprintf(stdout, "agent: %s\n", job.Agent)

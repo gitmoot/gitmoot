@@ -1358,7 +1358,7 @@ the [PR comment workflow](../workflows/pr-comment-workflow.md).
 
 ```sh
 gitmoot job list --repo owner/repo   # add --json for machine-readable rows
-gitmoot job show <job-id>            # add --json for the full job + why-stuck detail
+gitmoot job show <job-id>            # add --json for the full job + operational detail
 gitmoot job watch <job-id>
 gitmoot job watch <job-id> --transcript [--log-path <path>] [--runtime codex|claude|kimi|kimi-cli|shell]
 gitmoot job transcript <job-id> --export md|jsonl [--output <path>] [--log-path <path>] [--runtime codex|claude|kimi|kimi-cli|shell]
@@ -1502,6 +1502,14 @@ human`, `auth failing: …`, `throttled: …`, or `retrying: …` (#552). The re
 is derived from the most authoritative existing signal (the latest
 reason-bearing `job events` entry plus the owning resource lock's lease); a
 healthy job's output is unchanged.
+
+For a terminal (`succeeded`, `failed`, `blocked`, or `cancelled`) job whose
+recorded worktree still has a locally observable process, `job list` reports
+`LIVE PROCESS: worktree still has an active process` and `job show` prints the
+same detail as `process_active: worktree still has an active process`; their
+JSON forms carry `process_active: true`. The badge is omitted when no live
+process is observed, when local process liveness is unavailable, or while the
+job is still non-terminal.
 
 Operational blockers auto-retry (#532): a delivery failure classified as
 `runtime_auth` or `runtime_quota` does **not** fail the job terminally — the
