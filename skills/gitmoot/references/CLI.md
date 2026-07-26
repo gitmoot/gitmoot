@@ -1255,14 +1255,17 @@ Event-rule wakes are separately opt-in:
 
 ```sh
 gitmoot org events rule add --on attention --match owner/repo --wake maintainer
+gitmoot org events rule add --on blocked --repo tendwire --wake maintainer
 gitmoot org events rule list
 gitmoot org events rule rm --home /alternate/home <rule-id>
 ```
 
 `--on` accepts `escalation`, `attention`, `guard`, `job-terminal`, or `blocked`.
 `--match` is a case-insensitive substring matched independently against the
-event repo and job id; omit it to match every event of that kind. `--wake` must
-name a declared role whose config sets `pane = "<pane-id-or-label>"`. Gitmoot
+event repo and job id; omit it to match every event of that kind. `--repo` is a
+discoverable alias for the same substring filter, useful for repo-to-role
+routing. Pass only one of `--match` or `--repo`. `--wake` must name a declared
+role whose config sets `pane = "<pane-id-or-label>"`. Gitmoot
 first resolves the value as an exact pane label and otherwise uses it as a
 literal pane id. The daemon calls `herdr agent prompt <pane> <text> --wait --timeout
 8000` and treats delivered (`result.type = "agent_prompted"`, or a post-delivery
@@ -1270,7 +1273,8 @@ literal pane id. The daemon calls `herdr agent prompt <pane> <text> --wait --tim
 "agent_prompt_stalled"`). Stalls increment the role's consecutive missed-wake
 counter and delivery resets it; transport failures leave it unchanged. Rules,
 pane resolution, counter writes, and wakes are best-effort; with no rule rows
-this path is off.
+this path is off. Task episodes due in one evaluator pass produce one
+oldest-first digest event; blocked roles retain one event per role.
 
 ## External-coordinator workflow groups
 

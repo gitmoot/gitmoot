@@ -127,7 +127,7 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org recycle ROLE --kind KIND --handoff NOTE [--pane ID] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org escalate --to ROLE --workflow LABEL [--org-role ROLE] [--repo OWNER/REPO] [--json] [--home DIR] \"QUESTION\"")
 	fmt.Fprintln(w, "  gitmoot org escalate resolve NOTE_ID [--by ROLE] [--note ANSWER_NOTE_ID] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot org events rule add --on KIND [--match FILTER] --wake ROLE [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org events rule add --on KIND [--match FILTER | --repo SUBSTRING] --wake ROLE [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org events rule list [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org events rule rm [--home DIR] ID")
 }
@@ -1104,7 +1104,7 @@ var eventRuleKinds = map[string]struct{}{
 
 func runOrgEvents(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprintln(stdout, "Usage:\n  gitmoot org events rule add --on <kind> [--match <filter>] --wake <role> [--home path]\n  gitmoot org events rule list [--home path]\n  gitmoot org events rule rm [--home path] <id>")
+		fmt.Fprintln(stdout, "Usage:\n  gitmoot org events rule add --on <kind> [--match <filter> | --repo <substring>] --wake <role> [--home path]\n  gitmoot org events rule list [--home path]\n  gitmoot org events rule rm [--home path] <id>")
 		return 0
 	}
 	if args[0] != "rule" {
@@ -1112,7 +1112,7 @@ func runOrgEvents(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if len(args) == 1 || args[1] == "-h" || args[1] == "--help" {
-		fmt.Fprintln(stdout, "Usage:\n  gitmoot org events rule add --on <kind> [--match <filter>] --wake <role> [--home path]\n  gitmoot org events rule list [--home path]\n  gitmoot org events rule rm [--home path] <id>")
+		fmt.Fprintln(stdout, "Usage:\n  gitmoot org events rule add --on <kind> [--match <filter> | --repo <substring>] --wake <role> [--home path]\n  gitmoot org events rule list [--home path]\n  gitmoot org events rule rm [--home path] <id>")
 		return 0
 	}
 	switch args[1] {
@@ -1137,6 +1137,7 @@ func runOrgEventRuleAdd(args []string, stdout, stderr io.Writer) int {
 	// case-insensitive substring tested independently against repo and job id;
 	// an empty filter matches every event of the selected kind.
 	match := fs.String("match", "", "case-insensitive substring matched against event repo or job id; empty matches all")
+	repo := fs.String("repo", "", "case-insensitive repo substring (alias for --match)")
 	wake := fs.String("wake", "", "organization role to wake")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -1147,6 +1148,15 @@ func runOrgEventRuleAdd(args []string, stdout, stderr io.Writer) int {
 	if fs.NArg() != 0 {
 		fmt.Fprintln(stderr, "org events rule add does not accept positional arguments")
 		return 2
+	}
+	matchFilter := strings.TrimSpace(*match)
+	repoFilter := strings.TrimSpace(*repo)
+	if matchFilter != "" && repoFilter != "" {
+		fmt.Fprintln(stderr, "org events rule add: --match and --repo cannot both be set; choose one")
+		return 2
+	}
+	if repoFilter != "" {
+		matchFilter = repoFilter
 	}
 	kind := strings.ToLower(strings.TrimSpace(*onKind))
 	if _, ok := eventRuleKinds[kind]; !ok {
@@ -1178,7 +1188,7 @@ func runOrgEventRuleAdd(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "org events rule add: generate id: %v\n", err)
 		return 1
 	}
-	rule := db.EventRule{ID: id, OnKind: kind, MatchFilter: strings.TrimSpace(*match), WakeRole: role.Name, Enabled: true}
+	rule := db.EventRule{ID: id, OnKind: kind, MatchFilter: matchFilter, WakeRole: role.Name, Enabled: true}
 	if err := withStore(*home, func(store *db.Store) error {
 		return store.AddEventRule(context.Background(), rule)
 	}); err != nil {

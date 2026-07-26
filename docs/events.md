@@ -168,15 +168,19 @@ pane = "w1:p2"
 
 ```sh
 gitmoot org events rule add --on guard --match owner/repo --wake maintainer
+gitmoot org events rule add --on blocked --repo tendwire --wake maintainer
 gitmoot org events rule list
 gitmoot org events rule rm <rule-id>
 ```
 
 Kinds are `escalation`, `attention`, `guard`, `job-terminal`, and `blocked`.
 The v1 `--match` filter is a case-insensitive substring tested against the event
-repo and job id; empty matches all. A plain `job.blocked` event matches both
+repo and job id; empty matches all. `--repo` is an alias for that same filter;
+pass only one of the two flags. A plain `job.blocked` event matches both
 `job-terminal` and `blocked`, while guard-caused blocks match `guard` first. A
-synthesized `blocked_since` event matches only `blocked`. Set
+synthesized `blocked_since` event matches only `blocked`. Task episodes due in
+one evaluator pass are emitted as one oldest-first digest; blocked roles retain
+one event per role. Set
 `[orchestrate].blocked_role_wake_after` to a positive Go duration to emit such an
 event when a task or Herdr role stays blocked past the threshold, re-nudging at
 most once per that interval while it remains blocked (so a dropped wake
