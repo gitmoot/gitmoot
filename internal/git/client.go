@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -421,6 +422,14 @@ func (c Client) WorktreeClean(ctx context.Context) (bool, error) {
 	return strings.TrimSpace(result.Stdout) == "", nil
 }
 
+func (c Client) WorktreeCleanAt(ctx context.Context, path string) (bool, error) {
+	path, err := validateWorktreePath(path)
+	if err != nil {
+		return false, err
+	}
+	return (Client{Runner: c.Runner, Dir: path}).WorktreeClean(ctx)
+}
+
 func (c Client) StatusPorcelain(ctx context.Context) (string, error) {
 	result, err := c.run(ctx, "status", "--porcelain")
 	if err != nil {
@@ -453,6 +462,14 @@ func (c Client) HeadSHA(ctx context.Context) (string, error) {
 	return sha, nil
 }
 
+func (c Client) HeadSHAAt(ctx context.Context, path string) (string, error) {
+	path, err := validateWorktreePath(path)
+	if err != nil {
+		return "", err
+	}
+	return (Client{Runner: c.Runner, Dir: path}).HeadSHA(ctx)
+}
+
 func (c Client) RevParse(ctx context.Context, rev string) (string, error) {
 	rev = strings.TrimSpace(rev)
 	if rev == "" {
@@ -473,6 +490,29 @@ func (c Client) RevParse(ctx context.Context, rev string) (string, error) {
 		return "", errors.New("git revision SHA is empty")
 	}
 	return sha, nil
+}
+
+// IsAncestor reports whether ancestor is reachable from descendant. Git uses
+// exit status 1 for the ordinary "not an ancestor" result; every other failure
+// remains an error so invalid refs and repository failures fail closed.
+func (c Client) IsAncestor(ctx context.Context, ancestor, descendant string) (bool, error) {
+	ancestor = strings.TrimSpace(ancestor)
+	descendant = strings.TrimSpace(descendant)
+	if err := validateRef(ancestor); err != nil {
+		return false, err
+	}
+	if err := validateRef(descendant); err != nil {
+		return false, err
+	}
+	_, err := c.run(ctx, "merge-base", "--is-ancestor", ancestor, descendant)
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
 }
 
 // BehindCount reports how many commits upstream has that HEAD does not. It is
