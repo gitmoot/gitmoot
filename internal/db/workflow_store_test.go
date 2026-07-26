@@ -732,7 +732,7 @@ func TestWorkflowMigrationDefaultsExistingJobsToUnlabelled(t *testing.T) {
 	if err := raw.QueryRowContext(ctx, `SELECT payload, workflow_id, repo, pull_request FROM jobs WHERE id = 'legacy'`).Scan(&gotPayload, &workflowID, &repo, &pullRequest); err != nil {
 		t.Fatalf("read upgraded job: %v", err)
 	}
-	if gotPayload != payload || workflowID != "" || repo != "" || pullRequest != 0 {
+	if gotPayload != payload || workflowID != "" || repo != "acme/widget" || pullRequest != 0 {
 		t.Fatalf("upgraded job payload=%q workflow_id=%q repo=%q pull_request=%d", gotPayload, workflowID, repo, pullRequest)
 	}
 	_ = raw.Close()

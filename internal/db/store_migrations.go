@@ -1735,4 +1735,12 @@ CREATE INDEX idx_jobs_blocked_updated_at ON jobs(updated_at, id) WHERE state = '
 	`
 CREATE INDEX idx_jobs_repo ON jobs(repo);
 	`,
+	// #1066 jobs written before the denormalized repo column existed retained its
+	// empty default even when payload.repo was populated. Current write paths keep
+	// both representations synchronized; this idempotently repairs only that
+	// historical backlog so indexed task-liveness lookups cannot miss live jobs.
+	`
+UPDATE jobs SET repo = json_extract(payload, '$.repo')
+WHERE repo = '' AND json_valid(payload) AND COALESCE(json_extract(payload, '$.repo'), '') != '';
+	`,
 }

@@ -2,7 +2,9 @@ package workflow
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"path/filepath"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -167,6 +169,57 @@ func TestFindLiveTaskJobRepoScoped(t *testing.T) {
 				t.Fatalf("FindLiveTaskJob = job %+v live=%v, want %q live", got, live, test.wantJobID)
 			}
 		})
+	}
+}
+
+func TestFindLiveTaskJobFindsLegacyJobAfterRepoBackfill(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gitmoot.db")
+	store, err := db.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	task := db.Task{ID: "task-1", RepoFullName: "owner/repo", Branch: "feature/shared"}
+	encoded, err := json.Marshal(JobPayload{Repo: task.RepoFullName, Branch: task.Branch, TaskID: task.ID})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "legacy-live", Type: "implement", State: string(JobQueued), Payload: string(encoded)}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close before legacy seed: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `UPDATE jobs SET repo = '' WHERE id = 'legacy-live'`); err != nil {
+		raw.Close()
+		t.Fatalf("clear projected repo: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version = (SELECT MAX(version) FROM schema_migrations)`); err != nil {
+		raw.Close()
+		t.Fatalf("mark tail migration unapplied: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw Close: %v", err)
+	}
+
+	store, err = db.Open(path)
+	if err != nil {
+		t.Fatalf("reopen with repo backfill migration: %v", err)
+	}
+	defer store.Close()
+
+	got, live, err := FindLiveTaskJob(ctx, store, task)
+	if err != nil {
+		t.Fatalf("FindLiveTaskJob: %v", err)
+	}
+	if !live || got.ID != "legacy-live" {
+		t.Fatalf("FindLiveTaskJob = job %+v live=%v, want legacy-live live", got, live)
 	}
 }
 

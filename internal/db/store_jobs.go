@@ -187,6 +187,8 @@ func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
 // Workflow-only scalar projections are selected by ListJobsByWorkflow.
 const jobColumns = `id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, workflow_id, root_killed, input_tokens, output_tokens, updated_at, created_at, externally_driven`
 
+const listJobsByStateSQL = `SELECT ` + jobColumns + ` FROM jobs WHERE state = ? ORDER BY updated_at, id`
+
 // scanJobs reads every row of a *sql.Rows produced by a `SELECT `+jobColumns+`
 // FROM jobs …` query into Jobs, in jobColumns order, and closes rows. Shared by
 // ListJobs and ListJobsByType so their identical scan lives in exactly one place.
@@ -269,7 +271,7 @@ func (s *Store) ListJobsByType(ctx context.Context, jobType string) ([]Job, erro
 }
 
 func (s *Store) ListJobsByState(ctx context.Context, state string) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+jobColumns+` FROM jobs WHERE state = ? ORDER BY id`, state)
+	rows, err := s.db.QueryContext(ctx, listJobsByStateSQL, state)
 	if err != nil {
 		return nil, err
 	}

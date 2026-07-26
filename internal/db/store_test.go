@@ -4990,13 +4990,94 @@ func TestListJobsByStateAndRepoUseIndexedFilters(t *testing.T) {
 		}
 	}
 
-	statePlan := explainQueryPlan(t, store, `SELECT id FROM jobs WHERE state = ?`, "blocked")
-	if !strings.Contains(statePlan, "USING COVERING INDEX idx_jobs_blocked_updated_at") {
-		t.Fatalf("blocked-state plan does not use idx_jobs_blocked_updated_at as a covering index:\n%s", statePlan)
+	statePlan := explainQueryPlan(t, store, listJobsByStateSQL, "blocked")
+	t.Logf("production blocked-state plan:\n%s", statePlan)
+	if !strings.Contains(statePlan, "USING INDEX idx_jobs_blocked_updated_at") {
+		t.Fatalf("production blocked-state plan does not use idx_jobs_blocked_updated_at:\n%s", statePlan)
 	}
 	repoPlan := explainQueryPlan(t, store, `SELECT id FROM jobs WHERE repo = ?`, "some/repo")
 	if !strings.Contains(repoPlan, "USING INDEX idx_jobs_repo") {
 		t.Fatalf("repo plan does not use idx_jobs_repo:\n%s", repoPlan)
+	}
+}
+
+func TestJobRepoBackfillMigrationUpdatesOnlyStaleRows(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	// Find the backfill migration BY CONTENT, never by tail index: migrations is
+	// an append-only positional slice shared with every other in-flight branch,
+	// so a sibling PR's later append would silently point migrations[len-1] at
+	// the WRONG entry (the migration-tail-collision class; see AGENTS.local.md).
+	backfillIndex := -1
+	for i, m := range migrations {
+		if strings.Contains(m, "UPDATE jobs SET repo = json_extract(payload, '$.repo')") {
+			backfillIndex = i
+		}
+	}
+	if backfillIndex == -1 {
+		t.Fatal("could not locate the #1066 repo-backfill migration by content")
+	}
+	backfillMigration := migrations[backfillIndex]
+
+	for _, seed := range []struct {
+		id      string
+		payload string
+		repo    string
+	}{
+		{id: "legacy-one", payload: `{"repo":"owner/one"}`},
+		{id: "legacy-two", payload: `{"repo":"owner/two"}`},
+		{id: "already-projected", payload: `{"repo":"owner/new"}`, repo: "owner/current"},
+		{id: "no-payload-repo", payload: `{"task_id":"task-1"}`},
+		{id: "malformed-payload", payload: `{`},
+	} {
+		if _, err := store.db.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, repo) VALUES (?, 'legacy', 'ask', 'succeeded', ?, ?)`,
+			seed.id, seed.payload, seed.repo); err != nil {
+			t.Fatalf("insert %s: %v", seed.id, err)
+		}
+	}
+
+	result, err := store.db.ExecContext(ctx, backfillMigration)
+	if err != nil {
+		t.Fatalf("run repo backfill migration: %v", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		t.Fatalf("repo backfill RowsAffected: %v", err)
+	} else if affected != 2 {
+		t.Fatalf("repo backfill affected %d rows, want 2", affected)
+	} else {
+		t.Logf("repo backfill affected %d stale rows", affected)
+	}
+
+	wantRepos := map[string]string{
+		"legacy-one":        "owner/one",
+		"legacy-two":        "owner/two",
+		"already-projected": "owner/current",
+		"no-payload-repo":   "",
+		"malformed-payload": "",
+	}
+	for id, want := range wantRepos {
+		var got string
+		if err := store.db.QueryRowContext(ctx, `SELECT repo FROM jobs WHERE id = ?`, id).Scan(&got); err != nil {
+			t.Fatalf("read repo for %s: %v", id, err)
+		}
+		if got != want {
+			t.Fatalf("repo for %s = %q, want %q", id, got, want)
+		}
+	}
+
+	result, err = store.db.ExecContext(ctx, backfillMigration)
+	if err != nil {
+		t.Fatalf("rerun repo backfill migration: %v", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		t.Fatalf("repo backfill rerun RowsAffected: %v", err)
+	} else if affected != 0 {
+		t.Fatalf("repo backfill rerun affected %d rows, want 0", affected)
 	}
 }
 
