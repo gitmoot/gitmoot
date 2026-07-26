@@ -297,6 +297,49 @@ func TestWorkflowIDImmutableAcrossPayloadUpdatePaths(t *testing.T) {
 	}
 }
 
+func TestUpdateJobPayloadAndStateWithEventUpdatesAtomicallyWithoutCAS(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	original := `{"repo":"acme/old","pull_request":3,"workflow_id":"release-42"}`
+	if err := store.CreateJob(ctx, Job{
+		ID:      "recover-race",
+		Agent:   "lead",
+		Type:    "implement",
+		State:   "succeeded",
+		Payload: original,
+	}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+
+	payload := `{"repo":"acme/new","pull_request":9,"workflow_id":"release-42","blocker_retry_at":"2026-07-26T10:00:00Z","blocker_suggested_action":"inspect recovery","result":{"decision":"changes_requested","summary":"blocked"}}`
+	if err := store.UpdateJobPayloadAndStateWithEvent(ctx, "recover-race", payload, "blocked", JobEvent{
+		Kind:    "blocked",
+		Message: "recovery finalization raced",
+	}); err != nil {
+		t.Fatalf("UpdateJobPayloadAndStateWithEvent: %v", err)
+	}
+
+	var state, gotPayload, resultHash, repo, blockerRetryAt, blockerSuggestedAction string
+	var pullRequest int
+	if err := store.db.QueryRowContext(ctx, `SELECT state, payload, result_hash, repo, pull_request, blocker_retry_at, blocker_suggested_action FROM jobs WHERE id = ?`, "recover-race").
+		Scan(&state, &gotPayload, &resultHash, &repo, &pullRequest, &blockerRetryAt, &blockerSuggestedAction); err != nil {
+		t.Fatalf("read updated job: %v", err)
+	}
+	if state != "blocked" || gotPayload != payload || resultHash != jobResultHashFromPayload(payload) ||
+		repo != "acme/new" || pullRequest != 9 || blockerRetryAt != "2026-07-26T10:00:00Z" ||
+		blockerSuggestedAction != "inspect recovery" {
+		t.Fatalf("updated job state=%q payload=%q result_hash=%q repo=%q pull_request=%d blocker_retry_at=%q blocker_suggested_action=%q",
+			state, gotPayload, resultHash, repo, pullRequest, blockerRetryAt, blockerSuggestedAction)
+	}
+	events, err := store.ListJobEvents(ctx, "recover-race")
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	if len(events) != 1 || events[0].JobID != "recover-race" || events[0].Kind != "blocked" || events[0].Message != "recovery finalization raced" {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
 func TestWorkflowIDDerivedAtEveryJobInsertPath(t *testing.T) {
 	store := openWorkflowTestStore(t)
 	ctx := context.Background()

@@ -1137,10 +1137,7 @@ func finishTaskRecoverJob(ctx context.Context, store *db.Store, jobID string, st
 		return err
 	}
 	if !ok {
-		if err := store.UpdateJobPayload(ctx, jobID, encoded); err != nil {
-			return err
-		}
-		return store.UpdateJobState(ctx, jobID, state)
+		return store.UpdateJobPayloadAndStateWithEvent(ctx, jobID, encoded, state, db.JobEvent{Kind: state, Message: message})
 	}
 	return nil
 }
