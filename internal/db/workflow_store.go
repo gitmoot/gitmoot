@@ -695,6 +695,11 @@ FROM workflow_notes WHERE id = ?`, id).Scan(
 	return note, err
 }
 
+// GetWorkflowNote returns the globally identified workflow journal entry.
+func (s *Store) GetWorkflowNote(ctx context.Context, id int64) (WorkflowNote, error) {
+	return s.getWorkflowNote(ctx, id)
+}
+
 func (s *Store) ListWorkflowNotes(ctx context.Context, workflowID string, limit int) ([]WorkflowNote, error) {
 	rows, err := s.db.QueryContext(ctx, ListWorkflowNotesSQL, workflowID, workflowQueryLimit(limit))
 	if err != nil {

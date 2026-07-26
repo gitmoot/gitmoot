@@ -93,6 +93,153 @@ func TestOrgEscalateWritesTypedWorkflowNote(t *testing.T) {
 	}
 }
 
+func TestOrgEscalateResolveLifecycle(t *testing.T) {
+	home := writeOrgEscalateConfig(t)
+	store := openCLIJobStore(t, home)
+	ctx := context.Background()
+	target, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/one",
+		Author:     "operator",
+		Body:       workflow.FormatOrgEscalateNote("operator", "owner", "release/one", "Need a decision."),
+		Repo:       "acme/widget",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	answer, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/one", Author: "owner", Body: "Approved for release.", Repo: "acme/widget",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinary, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/one", Author: "owner", Body: "ordinary note",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	code := runOrg([]string{
+		"escalate", "resolve", fmt.Sprint(target.ID),
+		"--home", home, "--note", fmt.Sprint(answer.ID),
+	}, &out, &errOut)
+	if code != 0 || !strings.Contains(out.String(), fmt.Sprintf("resolved escalation %d in workflow release/one", target.ID)) {
+		t.Fatalf("resolve code=%d out=%q err=%q", code, out.String(), errOut.String())
+	}
+	store = openCLIJobStore(t, home)
+	resolutions, err := store.ListWorkflowNotesByBodyPrefix(ctx, workflow.OrgEscalateResolvedPrefix, 0)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if len(resolutions) != 1 {
+		store.Close()
+		t.Fatalf("resolution notes = %+v", resolutions)
+	}
+	escalationNoteID, resolvedBy, answerNoteID, ok := workflow.ParseOrgEscalateResolvedNote(resolutions[0].Body)
+	if !ok || escalationNoteID != target.ID || resolvedBy != "owner" || answerNoteID != answer.ID {
+		store.Close()
+		t.Fatalf("resolution marker = (%d, %q, %d, %v), body=%q", escalationNoteID, resolvedBy, answerNoteID, ok, resolutions[0].Body)
+	}
+	if resolutions[0].WorkflowID != target.WorkflowID || resolutions[0].Author != "owner" || resolutions[0].Repo != target.Repo {
+		store.Close()
+		t.Fatalf("resolution note = %+v, target = %+v", resolutions[0], target)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name string
+		id   int64
+		want string
+	}{
+		{name: "non escalation", id: ordinary.ID, want: fmt.Sprintf("note %d is not an org escalation", ordinary.ID)},
+		{name: "missing", id: resolutions[0].ID + 1000, want: "not found"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			out.Reset()
+			errOut.Reset()
+			code := runOrg([]string{"escalate", "resolve", fmt.Sprint(test.id), "--home", home}, &out, &errOut)
+			if code != 1 || !strings.Contains(errOut.String(), test.want) {
+				t.Fatalf("resolve code=%d out=%q err=%q, want %q", code, out.String(), errOut.String(), test.want)
+			}
+		})
+	}
+}
+
+// TestOrgEscalateResolveIDPlacement guards orgEscalateResolveIDAndFlags: the
+// escalation note id must resolve correctly regardless of where it appears
+// among the flags (its whole reason for existing over flag.Args()).
+func TestOrgEscalateResolveIDPlacement(t *testing.T) {
+	home := writeOrgEscalateConfig(t)
+	for _, test := range []struct {
+		name string
+		wf   string
+		args func(home string, id int64) []string
+	}{
+		{name: "id first", wf: "release/id-first", args: func(home string, id int64) []string {
+			return []string{"escalate", "resolve", fmt.Sprint(id), "--home", home, "--by", "owner"}
+		}},
+		{name: "id last", wf: "release/id-last", args: func(home string, id int64) []string {
+			return []string{"escalate", "resolve", "--home", home, "--by", "owner", fmt.Sprint(id)}
+		}},
+		{name: "id between flags", wf: "release/id-between", args: func(home string, id int64) []string {
+			return []string{"escalate", "resolve", "--home", home, fmt.Sprint(id), "--by", "owner"}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := openCLIJobStore(t, home)
+			ctx := context.Background()
+			target, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+				WorkflowID: test.wf, Author: "operator",
+				Body: workflow.FormatOrgEscalateNote("operator", "owner", test.wf, "Need a decision."),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			var out, errOut bytes.Buffer
+			code := runOrg(test.args(home, target.ID), &out, &errOut)
+			if code != 0 || !strings.Contains(out.String(), fmt.Sprintf("resolved escalation %d", target.ID)) {
+				t.Fatalf("resolve code=%d out=%q err=%q", code, out.String(), errOut.String())
+			}
+		})
+	}
+}
+
+// TestOrgEscalateResolveHelp guards the fix for --help being swallowed by the
+// id-extraction scan before flag.Parse ever ran (the scan treated --help as a
+// skippable flag, never set an id, and fell into the generic "requires exactly
+// one escalation note id" error instead of printing usage).
+func TestOrgEscalateResolveHelp(t *testing.T) {
+	for _, args := range [][]string{
+		{"escalate", "resolve", "--help"},
+		{"escalate", "resolve", "-h"},
+		{"escalate", "resolve", "--by", "owner", "--help"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			code := runOrg(args, &out, &errOut)
+			if code != 0 {
+				t.Fatalf("resolve --help code=%d out=%q err=%q", code, out.String(), errOut.String())
+			}
+			if strings.Contains(errOut.String(), "requires exactly one escalation note id") {
+				t.Fatalf("--help fell through to the generic id error instead of usage: err=%q", errOut.String())
+			}
+			if !strings.Contains(errOut.String(), "-by") && !strings.Contains(errOut.String(), "-note") {
+				t.Fatalf("--help did not print flag usage: err=%q", errOut.String())
+			}
+		})
+	}
+}
+
 func TestOrgEscalateValidation(t *testing.T) {
 	for _, tt := range []struct {
 		name string

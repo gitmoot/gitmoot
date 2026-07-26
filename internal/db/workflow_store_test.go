@@ -106,6 +106,27 @@ func TestListWorkflowNotesByBodyPrefix(t *testing.T) {
 	}
 }
 
+func TestGetWorkflowNote(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	inserted, err := store.InsertWorkflowNote(ctx, WorkflowNote{
+		WorkflowID: "release/one", Author: "owner", Body: "answer", Repo: "acme/widget",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetWorkflowNote(ctx, inserted.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != inserted.ID || got.WorkflowID != inserted.WorkflowID || got.Author != inserted.Author || got.Body != inserted.Body || got.Repo != inserted.Repo {
+		t.Fatalf("GetWorkflowNote = %+v, want fields from %+v", got, inserted)
+	}
+	if _, err := store.GetWorkflowNote(ctx, inserted.ID+1); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetWorkflowNote(missing) error = %v, want sql.ErrNoRows", err)
+	}
+}
+
 func TestWorkflowProductionQueriesUseIndexes(t *testing.T) {
 	store := openWorkflowTestStore(t)
 	queries := []struct {

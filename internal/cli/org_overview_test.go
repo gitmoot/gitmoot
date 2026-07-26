@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"database/sql"
+	"os"
 	"testing"
 	"time"
 
@@ -50,7 +52,7 @@ func TestStoreOrgLiveSourcePersistedFreshness(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			shared, err := loadOrgSharedState(ctx, paths, store)
+			shared, err := loadOrgSharedState(ctx, paths, store, time.Now().UTC())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -68,5 +70,65 @@ func TestStoreOrgLiveSourcePersistedFreshness(t *testing.T) {
 				t.Fatalf("unknown source observedAt = %v, want zero", observedAt)
 			}
 		})
+	}
+}
+
+func TestLoadOrgSharedStateMissedWakeAgeOut(t *testing.T) {
+	_, paths := setupOrgHome(t)
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("\n[orchestrate]\nmax_consecutive_missed_wakes = 1\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	for role, updatedAt := range map[string]time.Time{
+		"review": now.Add(-missedWakeStaleAfter - time.Second),
+		"owner":  now.Add(-time.Hour),
+		"broken": now.Add(-time.Hour),
+	} {
+		if err := store.IncrementRoleMissedWake(ctx, role, updatedAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conn, err := sql.Open("sqlite", paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE org_role_missed_wakes SET updated_at = 'not-a-timestamp' WHERE role = 'broken'`); err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	shared, err := loadOrgSharedState(ctx, paths, store, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := shared.MissedWakes["review"]; exists {
+		t.Fatalf("stale review miss remained visible: %+v", shared.MissedWakes)
+	}
+	if shared.MissedWakes["owner"] != 1 {
+		t.Fatalf("fresh owner miss = %d, want 1", shared.MissedWakes["owner"])
+	}
+	if shared.MissedWakes["broken"] != 1 {
+		t.Fatalf("malformed timestamp hid miss: %+v", shared.MissedWakes)
+	}
+	if missedWakeIsStale(now.Add(-missedWakeStaleAfter).Format(db.BlockedEpisodeTimeLayout), now) {
+		t.Fatal("miss exactly at stale boundary was hidden")
 	}
 }

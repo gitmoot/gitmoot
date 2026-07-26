@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"io"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -124,6 +126,7 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org status [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org recycle ROLE --kind KIND --handoff NOTE [--pane ID] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org escalate --to ROLE --workflow LABEL [--org-role ROLE] [--repo OWNER/REPO] [--json] [--home DIR] \"QUESTION\"")
+	fmt.Fprintln(w, "  gitmoot org escalate resolve NOTE_ID [--by ROLE] [--note ANSWER_NOTE_ID] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org events rule add --on KIND [--match FILTER] --wake ROLE [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org events rule list [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org events rule rm [--home DIR] ID")
@@ -388,7 +391,7 @@ func runOrgOverview(command string, args []string, stdout, stderr io.Writer) int
 		return 1
 	}
 	defer store.Close()
-	shared, err := loadOrgSharedState(ctx, paths, store)
+	shared, err := loadOrgSharedState(ctx, paths, store, time.Now().UTC())
 	if err != nil {
 		fmt.Fprintf(stderr, "org %s: %v\n", command, err)
 		return 1
@@ -846,6 +849,9 @@ type orgEscalateOutput struct {
 }
 
 func runOrgEscalate(args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "resolve" {
+		return runOrgEscalateResolve(args[1:], stdout, stderr)
+	}
 	fs := flag.NewFlagSet("org escalate", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
@@ -948,6 +954,121 @@ func runOrgEscalate(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "escalated from %s to %s in workflow %s\n", from, to, label)
 	return 0
+}
+
+func runOrgEscalateResolve(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("org escalate resolve", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	byFlag := fs.String("by", "", "organization role resolving the escalation")
+	answerNoteFlag := fs.String("note", "", "workflow note id containing the answer")
+	// A bare --help/-h anywhere in args is a skippable flag to the id-extraction
+	// scan below (it never sets idIndex), which previously fell through to the
+	// generic "requires exactly one escalation note id" error before flag.Parse
+	// ever ran — so help never printed. Detect it first and let the flag package
+	// handle it the normal way, regardless of where it appears among the other args.
+	for _, arg := range args {
+		if arg == "-h" || arg == "--help" {
+			_ = fs.Parse([]string{"--help"})
+			return 0
+		}
+	}
+	escalationIDText, flagArgs, ok := orgEscalateResolveIDAndFlags(args)
+	if !ok {
+		fmt.Fprintln(stderr, "org escalate resolve requires exactly one escalation note id")
+		return 2
+	}
+	if err := fs.Parse(flagArgs); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "org escalate resolve requires exactly one escalation note id")
+		return 2
+	}
+	escalationNoteID, err := strconv.ParseInt(escalationIDText, 10, 64)
+	if err != nil || escalationNoteID <= 0 {
+		fmt.Fprintf(stderr, "org escalate resolve: invalid escalation note id %q\n", escalationIDText)
+		return 2
+	}
+	var answerNoteID int64
+	if value := strings.TrimSpace(*answerNoteFlag); value != "" {
+		answerNoteID, err = strconv.ParseInt(value, 10, 64)
+		if err != nil || answerNoteID <= 0 {
+			fmt.Fprintf(stderr, "org escalate resolve: invalid answer note id %q\n", value)
+			return 2
+		}
+	}
+
+	var workflowID string
+	if err := withStore(*home, func(store *db.Store) error {
+		ctx := context.Background()
+		target, err := store.GetWorkflowNote(ctx, escalationNoteID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("escalation note %d not found", escalationNoteID)
+		}
+		if err != nil {
+			return err
+		}
+		_, to, _, _, parsed := workflow.ParseOrgEscalateNote(target.Body)
+		if !parsed {
+			return fmt.Errorf("note %d is not an org escalation", escalationNoteID)
+		}
+		resolvedBy := strings.ToLower(strings.TrimSpace(*byFlag))
+		if resolvedBy == "" {
+			resolvedBy = to
+		}
+		body := workflow.FormatOrgEscalateResolvedNote(escalationNoteID, resolvedBy, answerNoteID)
+		if body == "" {
+			return fmt.Errorf("invalid resolving role %q", resolvedBy)
+		}
+		if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: target.WorkflowID,
+			Author:     resolvedBy,
+			Body:       body,
+			Repo:       target.Repo,
+		}); err != nil {
+			return err
+		}
+		workflowID = target.WorkflowID
+		return nil
+	}); err != nil {
+		fmt.Fprintf(stderr, "org escalate resolve: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "resolved escalation %d in workflow %s\n", escalationNoteID, workflowID)
+	return 0
+}
+
+func orgEscalateResolveIDAndFlags(args []string) (string, []string, bool) {
+	needsValue := map[string]bool{"--home": true, "--by": true, "--note": true}
+	idIndex := -1
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if needsValue[arg] {
+			i++
+			if i >= len(args) {
+				return "", nil, false
+			}
+			continue
+		}
+		if arg == "-h" || arg == "--help" || strings.HasPrefix(arg, "--home=") || strings.HasPrefix(arg, "--by=") || strings.HasPrefix(arg, "--note=") || strings.HasPrefix(arg, "-") {
+			continue
+		}
+		if idIndex >= 0 {
+			return "", nil, false
+		}
+		idIndex = i
+	}
+	if idIndex < 0 {
+		return "", nil, false
+	}
+	flagArgs := make([]string, 0, len(args)-1)
+	flagArgs = append(flagArgs, args[:idIndex]...)
+	flagArgs = append(flagArgs, args[idIndex+1:]...)
+	return strings.TrimSpace(args[idIndex]), flagArgs, strings.TrimSpace(args[idIndex]) != ""
 }
 
 func orgEscalateQuestionAndFlags(args []string) (string, []string, bool) {
