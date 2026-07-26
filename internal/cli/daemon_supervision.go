@@ -110,6 +110,9 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 				if err := runWorkflowAutoSettleOnce(ctx, paths, store, time.Now().UTC(), stdout); err != nil {
 					writeLine(stdout, "workflow auto-settle error: %s", err)
 				}
+				if err := runGhostSessionJobReaperOnce(ctx, paths, store, time.Now().UTC(), stdout); err != nil {
+					writeLine(stdout, "ghost session-job reaper error: %s", err)
+				}
 				if err := runHeartbeatScanOnce(ctx, paths, store, heartbeatEnqueue, time.Now().UTC()); err != nil {
 					writeLine(stdout, "heartbeat scan error: %s", err)
 				}
@@ -237,6 +240,9 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		if heartbeatPathsErr == nil {
 			if err := runWorkflowAutoSettleOnce(ctx, heartbeatPaths, store, time.Now().UTC(), stdout); err != nil {
 				writeLine(stdout, "workflow auto-settle error: %s", err)
+			}
+			if err := runGhostSessionJobReaperOnce(ctx, heartbeatPaths, store, time.Now().UTC(), stdout); err != nil {
+				writeLine(stdout, "ghost session-job reaper error: %s", err)
 			}
 			if err := runHeartbeatScanOnce(ctx, heartbeatPaths, store, heartbeatEnqueue, time.Now().UTC()); err != nil {
 				writeLine(stdout, "heartbeat scan error: %s", err)

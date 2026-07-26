@@ -189,7 +189,21 @@ pattern), bounded by depth, a per-root job budget, and loop detection.
    mv /root/.local/bin/gitmoot-dashboard-web.new /root/.local/bin/gitmoot-dashboard-web
    ```
 
-4. Restart at idle (confirm 0 running/queued jobs first):
+4. Restart at idle: confirm 0 running/queued **engine-dispatched** jobs
+   first, not raw job count. Session-recorded jobs (`session-ask-*`/
+   `session-implement-*`, #657) run entirely outside the daemon process — no
+   subprocess, no lease — and may legitimately stay `running` for hours, so
+   they don't belong in this check. #1125's reaper keeps genuinely abandoned
+   session jobs from piling up forever, but on an hours-to-a-day timescale;
+   that is a background-hygiene guarantee, not a substitute for checking
+   right now:
+
+   ```sh
+   gitmoot job list --state running --json | jq '[.[] | select(.id | startswith("session-") | not)]'
+   gitmoot job list --state queued --json | jq '[.[] | select(.id | startswith("session-") | not)]'
+   ```
+
+   Both empty (`[]`), then:
    `systemctl --user restart gitmoot-daemon gitmoot-dashboard-web`.
 5. Config-only changes (e.g. `[memory]`/`[skillopt]`) usually need no restart
    (re-read per tick / warm-reloaded on SIGHUP).

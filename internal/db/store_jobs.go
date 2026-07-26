@@ -104,7 +104,7 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent)
 
 // CreateExternallyDrivenJobWithEvent creates a session job (#657) whose execution
 // happens OUTSIDE the engine: it sets externally_driven = 1 so the daemon's
-// queued selector never claims it and the stuck-running reaper skips it. It
+// queued selector never claims it and the engine lease reaper skips it. It
 // mirrors CreateJobWithEvent (same root_id denormalization, same in-tx event) but
 // stamps the extra column; the caller supplies job.State = 'running' so the job
 // is created directly running, never queued. This is the ONLY insert site that

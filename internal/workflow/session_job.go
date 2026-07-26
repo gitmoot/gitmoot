@@ -13,11 +13,12 @@ import (
 // unit of work as a first-class tracked job WITHOUT the engine spawning a runtime
 // (#657). The job is created directly in RUNNING state and flagged
 // externally_driven, so the daemon's queued selector never claims it (no Deliver,
-// no runtime subprocess, no runtime-session/checkout lock) and the stuck-running
+// no runtime subprocess, no runtime-session/checkout lock) and the engine lease
 // reaper skips it. It emits the same running-state ("job started") event a normal
 // job emits on claim, so the job list, events, and dashboard reflect it. The
 // calling session does the real work and later calls CloseExternalJob to apply the
-// result and move the job to its terminal state.
+// result and move the job to its terminal state; lifecycle maintenance separately
+// cancels a genuinely orphaned session row.
 func (m Mailbox) OpenExternalJob(ctx context.Context, request JobRequest) (db.Job, error) {
 	if m.Store == nil {
 		return db.Job{}, errors.New("mailbox store is required")

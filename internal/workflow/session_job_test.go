@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
@@ -205,6 +206,46 @@ func TestCloseExternalJobErrors(t *testing.T) {
 	}
 	if _, err := mb.CloseExternalJob(ctx, "sess", AgentResult{Decision: "approved"}, 0, ""); err == nil || !strings.Contains(err.Error(), "already been closed") {
 		t.Fatalf("double CloseExternalJob err = %v, want already-been-closed", err)
+	}
+}
+
+func TestCloseExternalJobAfterGhostReaperReturnsCleanAlreadyClosedError(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"ask"}, "gitmoot/gitmoot")
+	mb := Mailbox{Store: store}
+	if _, err := mb.OpenExternalJob(ctx, JobRequest{
+		ID:         "session-race",
+		Agent:      "lead",
+		Action:     "ask",
+		Repo:       "gitmoot/gitmoot",
+		WorkflowID: "release/settled",
+	}); err != nil {
+		t.Fatalf("OpenExternalJob: %v", err)
+	}
+	if _, err := store.InsertWorkflowNoteWithMeta(ctx,
+		db.WorkflowNote{WorkflowID: "release/settled", Author: "operator", Body: "done"},
+		db.WorkflowMeta{Status: string(db.WorkflowStatusDone), StatusSet: true}); err != nil {
+		t.Fatalf("InsertWorkflowNoteWithMeta: %v", err)
+	}
+	reaped, err := store.ReapGhostSessionJobs(ctx, time.Now().UTC().Add(10*time.Minute), 24*time.Hour)
+	if err != nil {
+		t.Fatalf("ReapGhostSessionJobs: %v", err)
+	}
+	if len(reaped) != 1 || reaped[0] != "session-race" {
+		t.Fatalf("reaped = %v", reaped)
+	}
+	if _, err := mb.CloseExternalJob(ctx, "session-race", AgentResult{Decision: "approved"}, 0, ""); err == nil ||
+		!strings.Contains(err.Error(), "already been closed") {
+		t.Fatalf("CloseExternalJob after reaper err = %v, want already-been-closed", err)
+	}
+	job, err := store.GetJob(ctx, "session-race")
+	if err != nil || job.State != string(JobCancelled) {
+		t.Fatalf("job = %+v, err=%v", job, err)
+	}
+	events, err := store.ListJobEvents(ctx, "session-race")
+	if err != nil || len(events) != 2 || events[1].Kind != string(JobCancelled) {
+		t.Fatalf("events = %+v, err=%v", events, err)
 	}
 }
 
