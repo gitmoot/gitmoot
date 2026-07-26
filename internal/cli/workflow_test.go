@@ -851,6 +851,49 @@ func (s *stubTaskRecoverGitHub) EnsurePullRequest(_ context.Context, input githu
 	}, nil
 }
 
+func TestFinishTaskRecoverJobCASMissEmitsTerminalEvent(t *testing.T) {
+	ctx := context.Background()
+	store := openCLIJobStore(t, t.TempDir())
+	defer store.Close()
+	jobID := "task-task-001-recover-lead"
+	payload := workflow.JobPayload{
+		Repo:        "owner/repo",
+		Branch:      "task-001-bootstrap",
+		PullRequest: 4,
+		TaskID:      "task-001",
+		WorkflowID:  "release-42",
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID:      jobID,
+		Agent:   "lead",
+		Type:    "implement",
+		State:   string(workflow.JobQueued),
+		Payload: mustJobPayload(t, payload),
+	}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+
+	payload.HeadSHA = "abc123"
+	message := "recovered task implementation"
+	if err := finishTaskRecoverJob(ctx, store, jobID, string(workflow.JobSucceeded), payload, message); err != nil {
+		t.Fatalf("finishTaskRecoverJob: %v", err)
+	}
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if job.State != string(workflow.JobSucceeded) || job.Payload != mustJobPayload(t, payload) {
+		t.Fatalf("job = %+v", job)
+	}
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	if len(events) != 1 || events[0].Kind != string(workflow.JobSucceeded) || events[0].Message != message {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
 func TestRecoverTaskImplementationFinalizesDirtyWorktree(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
