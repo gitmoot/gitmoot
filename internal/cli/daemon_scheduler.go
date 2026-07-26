@@ -303,7 +303,7 @@ func sweepExpiredBlockedJobs(ctx context.Context, store *db.Store, ttl time.Dura
 	if ttl <= 0 {
 		return nil
 	}
-	jobs, err := store.ListJobs(ctx)
+	jobs, err := store.ListJobsByState(ctx, string(workflow.JobBlocked))
 	if err != nil {
 		return err
 	}

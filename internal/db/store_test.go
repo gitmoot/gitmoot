@@ -4915,6 +4915,172 @@ func TestListJobsByType(t *testing.T) {
 	}
 }
 
+func TestListJobsByStateAndRepoUseIndexedFilters(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	largeBlob := strings.Repeat("x", 4*1024)
+	bulkRepos := []string{"bulk/one", "bulk/two", "bulk/three"}
+	for i := 0; i < 300; i++ {
+		payload, err := json.Marshal(map[string]string{
+			"repo": bulkRepos[i%len(bulkRepos)],
+			"blob": largeBlob,
+		})
+		if err != nil {
+			t.Fatalf("Marshal bulk payload %d: %v", i, err)
+		}
+		job := Job{
+			ID:      "bulk-" + strconv.Itoa(i),
+			Agent:   "bulk",
+			Type:    "ask",
+			State:   "succeeded",
+			Payload: string(payload),
+		}
+		if err := store.CreateJob(ctx, job); err != nil {
+			t.Fatalf("CreateJob(%s): %v", job.ID, err)
+		}
+	}
+
+	for _, job := range []Job{
+		{ID: "blocked-a", Agent: "audit", Type: "ask", State: "blocked", Payload: `{"repo":"some/repo","marker":"old"}`},
+		{ID: "blocked-b", Agent: "audit", Type: "ask", State: "blocked", Payload: `{"repo":"other/repo","marker":"middle"}`},
+		{ID: "blocked-c", Agent: "audit", Type: "ask", State: "blocked", Payload: `{"repo":"some/repo","marker":"new"}`},
+		{ID: "repo-only", Agent: "audit", Type: "ask", State: "failed", Payload: `{"repo":"some/repo","marker":"terminal"}`},
+	} {
+		if err := store.CreateJob(ctx, job); err != nil {
+			t.Fatalf("CreateJob(%s): %v", job.ID, err)
+		}
+	}
+	for i, id := range []string{"blocked-a", "blocked-b", "blocked-c"} {
+		if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET updated_at = ? WHERE id = ?`,
+			time.Now().UTC().Add(time.Duration(i-3)*time.Hour).Format(time.RFC3339Nano), id); err != nil {
+			t.Fatalf("backdate %s: %v", id, err)
+		}
+	}
+
+	blocked, err := store.ListJobsByState(ctx, "blocked")
+	if err != nil {
+		t.Fatalf("ListJobsByState(blocked): %v", err)
+	}
+	wantBlocked := []string{"blocked-a", "blocked-b", "blocked-c"}
+	if len(blocked) != len(wantBlocked) {
+		t.Fatalf("ListJobsByState(blocked) returned %d jobs, want %d: %+v", len(blocked), len(wantBlocked), blocked)
+	}
+	for i, job := range blocked {
+		if job.ID != wantBlocked[i] || job.State != "blocked" {
+			t.Fatalf("blocked[%d] = %+v, want ID %q and state blocked", i, job, wantBlocked[i])
+		}
+	}
+
+	byRepo, err := store.ListJobsByRepo(ctx, "some/repo")
+	if err != nil {
+		t.Fatalf("ListJobsByRepo(some/repo): %v", err)
+	}
+	wantRepo := []string{"blocked-a", "blocked-c", "repo-only"}
+	if len(byRepo) != len(wantRepo) {
+		t.Fatalf("ListJobsByRepo(some/repo) returned %d jobs, want %d: %+v", len(byRepo), len(wantRepo), byRepo)
+	}
+	for i, job := range byRepo {
+		if job.ID != wantRepo[i] {
+			t.Fatalf("repo job[%d].ID = %q, want %q", i, job.ID, wantRepo[i])
+		}
+	}
+
+	statePlan := explainQueryPlan(t, store, listJobsByStateSQL, "blocked")
+	t.Logf("production blocked-state plan:\n%s", statePlan)
+	if !strings.Contains(statePlan, "USING INDEX idx_jobs_blocked_updated_at") {
+		t.Fatalf("production blocked-state plan does not use idx_jobs_blocked_updated_at:\n%s", statePlan)
+	}
+	repoPlan := explainQueryPlan(t, store, `SELECT id FROM jobs WHERE repo = ?`, "some/repo")
+	if !strings.Contains(repoPlan, "USING INDEX idx_jobs_repo") {
+		t.Fatalf("repo plan does not use idx_jobs_repo:\n%s", repoPlan)
+	}
+}
+
+func TestJobRepoBackfillMigrationUpdatesOnlyStaleRows(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	// Find the backfill migration BY CONTENT, never by tail index: migrations is
+	// an append-only positional slice shared with every other in-flight branch,
+	// so a sibling PR's later append would silently point migrations[len-1] at
+	// the WRONG entry (the migration-tail-collision class; see AGENTS.local.md).
+	backfillIndex := -1
+	for i, m := range migrations {
+		if strings.Contains(m, "UPDATE jobs SET repo = json_extract(payload, '$.repo')") {
+			backfillIndex = i
+		}
+	}
+	if backfillIndex == -1 {
+		t.Fatal("could not locate the #1066 repo-backfill migration by content")
+	}
+	backfillMigration := migrations[backfillIndex]
+
+	for _, seed := range []struct {
+		id      string
+		payload string
+		repo    string
+	}{
+		{id: "legacy-one", payload: `{"repo":"owner/one"}`},
+		{id: "legacy-two", payload: `{"repo":"owner/two"}`},
+		{id: "already-projected", payload: `{"repo":"owner/new"}`, repo: "owner/current"},
+		{id: "no-payload-repo", payload: `{"task_id":"task-1"}`},
+		{id: "malformed-payload", payload: `{`},
+	} {
+		if _, err := store.db.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, repo) VALUES (?, 'legacy', 'ask', 'succeeded', ?, ?)`,
+			seed.id, seed.payload, seed.repo); err != nil {
+			t.Fatalf("insert %s: %v", seed.id, err)
+		}
+	}
+
+	result, err := store.db.ExecContext(ctx, backfillMigration)
+	if err != nil {
+		t.Fatalf("run repo backfill migration: %v", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		t.Fatalf("repo backfill RowsAffected: %v", err)
+	} else if affected != 2 {
+		t.Fatalf("repo backfill affected %d rows, want 2", affected)
+	} else {
+		t.Logf("repo backfill affected %d stale rows", affected)
+	}
+
+	wantRepos := map[string]string{
+		"legacy-one":        "owner/one",
+		"legacy-two":        "owner/two",
+		"already-projected": "owner/current",
+		"no-payload-repo":   "",
+		"malformed-payload": "",
+	}
+	for id, want := range wantRepos {
+		var got string
+		if err := store.db.QueryRowContext(ctx, `SELECT repo FROM jobs WHERE id = ?`, id).Scan(&got); err != nil {
+			t.Fatalf("read repo for %s: %v", id, err)
+		}
+		if got != want {
+			t.Fatalf("repo for %s = %q, want %q", id, got, want)
+		}
+	}
+
+	result, err = store.db.ExecContext(ctx, backfillMigration)
+	if err != nil {
+		t.Fatalf("rerun repo backfill migration: %v", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		t.Fatalf("repo backfill rerun RowsAffected: %v", err)
+	} else if affected != 0 {
+		t.Fatalf("repo backfill rerun affected %d rows, want 0", affected)
+	}
+}
+
 func TestListActiveJobsReturnsOnlyQueuedAndRunningInIDOrder(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))

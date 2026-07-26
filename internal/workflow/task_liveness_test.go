@@ -2,7 +2,9 @@ package workflow
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"path/filepath"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -73,6 +75,151 @@ func TestReconcileTerminalDrivingJob(t *testing.T) {
 				t.Fatalf("task events = %+v, want one %s", events, test.wantEvent)
 			}
 		})
+	}
+}
+
+func TestFindLiveTaskJobRepoScoped(t *testing.T) {
+	tests := []struct {
+		name      string
+		taskRepo  string
+		payload   JobPayload
+		state     JobState
+		events    []db.JobEvent
+		wantJobID string
+	}{
+		{
+			name:      "task id match",
+			taskRepo:  "owner/repo",
+			payload:   JobPayload{Repo: "owner/repo", Branch: "feature/other", TaskID: "task-1"},
+			state:     JobQueued,
+			wantJobID: "z-live",
+		},
+		{
+			name:      "repo and branch match",
+			taskRepo:  "owner/repo",
+			payload:   JobPayload{Repo: "owner/repo", Branch: "feature/shared", TaskID: "other-task"},
+			state:     JobRunning,
+			wantJobID: "z-live",
+		},
+		{
+			name:      "settled job with advancement pending",
+			taskRepo:  "owner/repo",
+			payload:   JobPayload{Repo: "owner/repo", Branch: "feature/shared"},
+			state:     JobSucceeded,
+			events:    []db.JobEvent{{Kind: "advance_started"}},
+			wantJobID: "z-live",
+		},
+		{
+			name:      "cancelled from running remains live",
+			taskRepo:  "owner/repo",
+			payload:   JobPayload{Repo: "owner/repo", Branch: "feature/shared"},
+			state:     JobCancelled,
+			events:    []db.JobEvent{{Kind: string(JobCancelled), Message: "cancel requested from running"}},
+			wantJobID: "z-live",
+		},
+		{
+			name:      "empty repo falls back to branch scan",
+			payload:   JobPayload{Branch: "feature/shared"},
+			state:     JobQueued,
+			wantJobID: "z-live",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			task := db.Task{ID: "task-1", RepoFullName: test.taskRepo, Branch: "feature/shared"}
+
+			for _, seed := range []struct {
+				id      string
+				payload JobPayload
+			}{
+				{id: "a-unrelated-same-branch", payload: JobPayload{Repo: "other/repo", Branch: task.Branch}},
+				{id: "b-third-repo", payload: JobPayload{Repo: "third/repo", Branch: task.Branch}},
+				{id: "c-same-repo-wrong-branch", payload: JobPayload{Repo: test.taskRepo, Branch: "feature/wrong", TaskID: "other-task"}},
+			} {
+				encoded, err := json.Marshal(seed.payload)
+				if err != nil {
+					t.Fatalf("Marshal(%s): %v", seed.id, err)
+				}
+				if err := store.CreateJob(ctx, db.Job{ID: seed.id, Type: "implement", State: string(JobQueued), Payload: string(encoded)}); err != nil {
+					t.Fatalf("CreateJob(%s): %v", seed.id, err)
+				}
+			}
+
+			encoded, err := json.Marshal(test.payload)
+			if err != nil {
+				t.Fatalf("Marshal live payload: %v", err)
+			}
+			if err := store.CreateJob(ctx, db.Job{ID: "z-live", Type: "implement", State: string(test.state), Payload: string(encoded)}); err != nil {
+				t.Fatalf("CreateJob(z-live): %v", err)
+			}
+			for _, event := range test.events {
+				event.JobID = "z-live"
+				if err := store.AddJobEvent(ctx, event); err != nil {
+					t.Fatalf("AddJobEvent(%s): %v", event.Kind, err)
+				}
+			}
+
+			got, live, err := FindLiveTaskJob(ctx, store, task)
+			if err != nil {
+				t.Fatalf("FindLiveTaskJob: %v", err)
+			}
+			if !live || got.ID != test.wantJobID {
+				t.Fatalf("FindLiveTaskJob = job %+v live=%v, want %q live", got, live, test.wantJobID)
+			}
+		})
+	}
+}
+
+func TestFindLiveTaskJobFindsLegacyJobAfterRepoBackfill(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gitmoot.db")
+	store, err := db.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	task := db.Task{ID: "task-1", RepoFullName: "owner/repo", Branch: "feature/shared"}
+	encoded, err := json.Marshal(JobPayload{Repo: task.RepoFullName, Branch: task.Branch, TaskID: task.ID})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "legacy-live", Type: "implement", State: string(JobQueued), Payload: string(encoded)}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close before legacy seed: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `UPDATE jobs SET repo = '' WHERE id = 'legacy-live'`); err != nil {
+		raw.Close()
+		t.Fatalf("clear projected repo: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version = (SELECT MAX(version) FROM schema_migrations)`); err != nil {
+		raw.Close()
+		t.Fatalf("mark tail migration unapplied: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw Close: %v", err)
+	}
+
+	store, err = db.Open(path)
+	if err != nil {
+		t.Fatalf("reopen with repo backfill migration: %v", err)
+	}
+	defer store.Close()
+
+	got, live, err := FindLiveTaskJob(ctx, store, task)
+	if err != nil {
+		t.Fatalf("FindLiveTaskJob: %v", err)
+	}
+	if !live || got.ID != "legacy-live" {
+		t.Fatalf("FindLiveTaskJob = job %+v live=%v, want legacy-live live", got, live)
 	}
 }
 

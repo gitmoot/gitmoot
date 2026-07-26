@@ -3434,15 +3434,19 @@ func TestRecoverExpiredRuntimeSessionLocksRequeuesOwnerBeforeGlobalStaleWindow(t
 func TestSweepExpiredBlockedJobsCancelsOnlyOlderThanTTL(t *testing.T) {
 	ctx := context.Background()
 	store, paths := blockedTTLTestStore(t)
-	for _, id := range []string{"job-old", "job-recent"} {
+	for _, id := range []string{"job-old", "job-recent", "job-nonblocked"} {
 		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: id, Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
 		if err := store.UpdateJobState(ctx, id, string(workflow.JobBlocked)); err != nil {
 			t.Fatalf("UpdateJobState(%s) returned error: %v", id, err)
 		}
 	}
+	if err := store.UpdateJobState(ctx, "job-nonblocked", string(workflow.JobSucceeded)); err != nil {
+		t.Fatalf("UpdateJobState(job-nonblocked) returned error: %v", err)
+	}
 	now := time.Now().UTC()
 	// job-old blocked two hours ago (past the 1h TTL); job-recent stays at ~now.
 	backdateJobUpdatedAt(t, paths.Database, "job-old", now.Add(-2*time.Hour))
+	backdateJobUpdatedAt(t, paths.Database, "job-nonblocked", now.Add(-2*time.Hour))
 
 	if err := sweepExpiredBlockedJobs(ctx, store, time.Hour, io.Discard, now); err != nil {
 		t.Fatalf("sweepExpiredBlockedJobs returned error: %v", err)
@@ -3479,6 +3483,21 @@ func TestSweepExpiredBlockedJobsCancelsOnlyOlderThanTTL(t *testing.T) {
 	}
 	if daemonWorkerHasEvent(recentEvents, jobEventBlockedTTLExpired) {
 		t.Fatalf("job-recent events = %+v, want no %s event", recentEvents, jobEventBlockedTTLExpired)
+	}
+
+	nonblocked, err := store.GetJob(ctx, "job-nonblocked")
+	if err != nil {
+		t.Fatalf("GetJob(job-nonblocked) returned error: %v", err)
+	}
+	if nonblocked.State != string(workflow.JobSucceeded) {
+		t.Fatalf("job-nonblocked state = %q, want succeeded (untouched)", nonblocked.State)
+	}
+	nonblockedEvents, err := store.ListJobEvents(ctx, "job-nonblocked")
+	if err != nil {
+		t.Fatalf("ListJobEvents(job-nonblocked) returned error: %v", err)
+	}
+	if daemonWorkerHasEvent(nonblockedEvents, jobEventBlockedTTLExpired) {
+		t.Fatalf("job-nonblocked events = %+v, want no %s event", nonblockedEvents, jobEventBlockedTTLExpired)
 	}
 }
 

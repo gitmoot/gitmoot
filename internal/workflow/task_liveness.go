@@ -20,7 +20,13 @@ const (
 // branch can be advanced by any job type, so either the payload task id or the
 // exact non-empty repo+branch identity is sufficient.
 func FindLiveTaskJob(ctx context.Context, store *db.Store, task db.Task) (db.Job, bool, error) {
-	jobs, err := store.ListJobs(ctx)
+	var jobs []db.Job
+	var err error
+	if strings.TrimSpace(task.RepoFullName) != "" {
+		jobs, err = store.ListJobsByRepo(ctx, task.RepoFullName)
+	} else {
+		jobs, err = store.ListJobs(ctx)
+	}
 	if err != nil {
 		return db.Job{}, false, err
 	}

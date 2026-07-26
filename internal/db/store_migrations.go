@@ -1725,4 +1725,22 @@ CREATE TABLE org_role_live_presence (
 	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 	`,
+	// #1134 blocked-job TTL sweeps filter by this exact state on every worker
+	// tick. Keep the predicate exact so SQLite can use the small partial index.
+	`
+CREATE INDEX idx_jobs_blocked_updated_at ON jobs(updated_at, id) WHERE state = 'blocked';
+	`,
+	// #1066 stale-task reconciliation narrows task-liveness candidates by the
+	// jobs table's denormalized repo column before decoding payloads.
+	`
+CREATE INDEX idx_jobs_repo ON jobs(repo);
+	`,
+	// #1066 jobs written before the denormalized repo column existed retained its
+	// empty default even when payload.repo was populated. Current write paths keep
+	// both representations synchronized; this idempotently repairs only that
+	// historical backlog so indexed task-liveness lookups cannot miss live jobs.
+	`
+UPDATE jobs SET repo = json_extract(payload, '$.repo')
+WHERE repo = '' AND json_valid(payload) AND COALESCE(json_extract(payload, '$.repo'), '') != '';
+	`,
 }
