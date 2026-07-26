@@ -59,10 +59,12 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 		if err := store.TouchOrgRolePresence(ctx, role, "agent dispatch"); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.CreateJob(ctx, db.Job{
-			ID: role + "-running", Agent: role, Type: "ask", State: "running",
-			Payload: `{"acting_org_role":"` + role + `"}`,
-		}); err != nil {
+	}
+	for _, job := range []db.Job{
+		{ID: "owner-running", Agent: "owner", Type: "ask", State: "running", Payload: `{"acting_org_role":"owner"}`},
+		{ID: "owner-queued", Agent: "owner", Type: "ask", State: "queued", Payload: `{"acting_org_role":"owner"}`},
+	} {
+		if err := store.CreateJob(ctx, job); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -168,8 +170,14 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 	if view.Roles[0].PresenceState != "working" || view.Roles[0].Badges.Overdue == "" {
 		t.Fatalf("owner = %+v", view.Roles[0])
 	}
+	if view.Roles[0].Badges.ActiveJobs != 2 {
+		t.Fatalf("owner active_jobs = %d, want 2", view.Roles[0].Badges.ActiveJobs)
+	}
 	if view.Roles[1].PresenceState != "blocked" || view.Roles[1].Badges.BlockedSince == "" || view.Roles[1].Badges.MissedWakes != 1 {
 		t.Fatalf("review = %+v", view.Roles[1])
+	}
+	if view.Roles[1].Badges.ActiveJobs != 0 {
+		t.Fatalf("review active_jobs = %d, want 0", view.Roles[1].Badges.ActiveJobs)
 	}
 	if got := view.Health; got.Roles != 2 || got.Working != 1 || got.Blocked != 1 || got.Overdue != 1 || got.OpenEscalations != 1 || got.StalledWakes != 1 {
 		t.Fatalf("health = %+v", got)

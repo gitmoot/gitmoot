@@ -218,21 +218,21 @@ func buildOrgStatusRows(ctx context.Context, shared *orgSharedState, src orgLive
 		}
 		recycleStatus := ""
 		recycleAfterText := ""
+		activeJobs := 0
 		if command == "status" {
-			recycleAfter := shared.Config.RecycleAfterFor(role.Name)
-			if recycleAfter > 0 {
-				jobCounts, err := shared.loadJobCounts(ctx)
-				if err != nil {
-					return nil, fmt.Errorf("count active jobs for role %q: %w", role.Name, err)
-				}
-				activeJobs := jobCounts[role.Name]["queued"] + jobCounts[role.Name]["running"]
+			jobCounts, err := shared.loadJobCounts(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("count active jobs for role %q: %w", role.Name, err)
+			}
+			activeJobs = jobCounts[role.Name]["queued"] + jobCounts[role.Name]["running"]
+			if recycleAfter := shared.Config.RecycleAfterFor(role.Name); recycleAfter > 0 {
 				recycleStatus = orgRecycleStatus(seen.LastSeenAt, observedNow, live.State, activeJobs, recycleAfter)
 				recycleAfterText = formatOrgRecycleAfter(recycleAfter)
 			}
 		}
 		rows = append(rows, orgStatusOutput{
 			Role: role.Name, Parent: role.Parent, Pane: role.Pane, Depth: len(shared.Config.Path(role.Name)) - 1,
-			Scope: role.Scope, MergeRule: role.MergeRule, Model: role.Model, LastSeenAt: seen.LastSeenAt, LastSeenAge: orgPresenceAge(seen.LastSeenAt, observedNow), LastCommand: seen.LastCommand,
+			Scope: role.Scope, MergeRule: role.MergeRule, Model: role.Model, ActiveJobs: activeJobs, LastSeenAt: seen.LastSeenAt, LastSeenAge: orgPresenceAge(seen.LastSeenAt, observedNow), LastCommand: seen.LastCommand,
 			ProviderState: live.State, ProviderDetail: live.Detail, ObservedAt: observedAt, ProviderVersion: providerVersion,
 			RecycleStatus: recycleStatus, RecycleAfter: recycleAfterText,
 			MissedWakes: consecutive, Flagged: flagged, FlagReason: flagReason,

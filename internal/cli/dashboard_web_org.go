@@ -249,6 +249,7 @@ func buildDashboardOrg(ctx context.Context, paths config.Paths, store *db.Store,
 				BlockedSince: dashboardOrgTimestamp(blockedSince[row.Role]),
 				Overdue:      overdue,
 				MissedWakes:  inputs.shared.MissedWakes[row.Role],
+				ActiveJobs:   row.ActiveJobs,
 			},
 			LastSeenAt: dashboardOrgTimestamp(row.LastSeenAt),
 		}
