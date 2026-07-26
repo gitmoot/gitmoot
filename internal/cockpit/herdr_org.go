@@ -143,7 +143,15 @@ func (p *herdrOrgProvider) Recycle(ctx context.Context, req org.RecycleRequest) 
 	}
 	bounded, cancel := context.WithTimeout(ctx, herdrOrgRecycleDeadline)
 	defer cancel()
-	_, err := p.run(bounded, "agent", "start", agentName, "--kind", kind, "--pane", pane, "--timeout", strconv.Itoa(herdrOrgRecycleTimeoutMS), "--", req.BootPrompt)
+	args := []string{"agent", "start", agentName, "--kind", kind, "--pane", pane, "--timeout", strconv.Itoa(herdrOrgRecycleTimeoutMS), "--"}
+	// Herdr snapshots do not expose the running model, so this can enforce the
+	// configured pin at recycle but cannot detect live-vs-pinned drift until
+	// Herdr provides that signal.
+	if strings.TrimSpace(req.Model) != "" {
+		args = append(args, "--model", req.Model)
+	}
+	args = append(args, req.BootPrompt)
+	_, err := p.run(bounded, args...)
 	if err != nil {
 		return fmt.Errorf("herdr agent start for org role %q (pane %q must already be at an interactive shell prompt): %w", role, pane, err)
 	}

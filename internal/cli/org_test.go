@@ -572,6 +572,49 @@ func TestRunOrgBriefChartStatusAndPresence(t *testing.T) {
 	}
 }
 
+func TestRunOrgBriefAndChartSurfaceModelPin(t *testing.T) {
+	home, paths := setupOrgHome(t)
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("model = \"sonnet\"\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	withOrgProvider(t, orgFixtureProvider{snapshot: org.Snapshot{States: map[string]org.RoleLiveState{
+		"owner": {State: org.StateWorking}, "review": {State: org.StateIdle},
+	}}})
+
+	for _, test := range []struct {
+		role string
+		want string
+	}{
+		{role: "review", want: "model: sonnet\n"},
+		{role: "owner", want: "model: -\n"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if code := Run([]string{"org", "brief", "--home", home, "--role", test.role}, &stdout, &stderr); code != 0 {
+			t.Fatalf("brief %s code = %d stderr=%s", test.role, code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), test.want) {
+			t.Fatalf("brief %s output = %q, want containing %q", test.role, stdout.String(), test.want)
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"org", "chart", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("chart code = %d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "owner · working · scope=* · merge=owner · model=-") ||
+		!strings.Contains(stdout.String(), "review · idle · scope=gitmoot/* · merge=self · model=sonnet") {
+		t.Fatalf("chart output = %q", stdout.String())
+	}
+}
+
 func TestRunOrgOverviewFlagsConsecutiveMissedWakes(t *testing.T) {
 	home, paths := setupOrgHome(t)
 	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
@@ -964,6 +1007,17 @@ func TestRunOrgRecycleValidation(t *testing.T) {
 
 func TestRunOrgRecycleJournalsAndBootsSuccessor(t *testing.T) {
 	home, paths := setupOrgRecycleHome(t, "w1:p2")
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("model = \"sonnet\"\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
 	store, err := db.Open(paths.Database)
 	if err != nil {
 		t.Fatal(err)
@@ -995,7 +1049,7 @@ func TestRunOrgRecycleJournalsAndBootsSuccessor(t *testing.T) {
 		t.Fatalf("Recycle requests = %+v", requests)
 	}
 	req := requests[0]
-	if req.Role != "owner" || req.Pane != "w1:p2" || req.Kind != "codex" || req.AgentName != "owner" {
+	if req.Role != "owner" || req.Pane != "w1:p2" || req.Kind != "codex" || req.AgentName != "owner" || req.Model != "sonnet" {
 		t.Fatalf("Recycle request = %+v", req)
 	}
 	for _, want := range []string{"role: owner", "path: owner", "provider: idle", "last_command: agent_run", "handoff: Release is ready for final verification."} {

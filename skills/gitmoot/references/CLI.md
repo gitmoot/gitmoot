@@ -1167,8 +1167,8 @@ resolved role table.
 
 The registry uses `[org] enforce = "warn"|"block"` and
 `[org.roles."name"]` entries with `parent`, `scope`, `merge_rule`, an optional
-cosmetic `display_name`, and an optional `pane` Herdr binding (used by live
-presence and org event-rule wakes).
+cosmetic `display_name`, an optional `model` runtime pin, and an optional `pane`
+Herdr binding (used by live presence and org event-rule wakes).
 The binding resolves as an exact live pane label first, then as a literal pane
 id; roles without a binding retain exact role-name-as-label presence lookup. There is
 exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
@@ -1223,6 +1223,10 @@ configured `pane`. A pane binding and non-empty handoff are required. For safety
 recycle does not kill or send exit keys to the old agent: the pane must already
 be at its interactive shell prompt. The Herdr start wait is bounded to 30
 seconds; a failed start leaves the durable handoff note available for recovery.
+When a role configures `model`, recycle passes `--model <value>` to the successor
+agent; deploy this binary before adding the fail-closed field to config. Brief
+and chart surface the configured pin, but live-vs-pinned drift detection awaits
+a running-model signal from Herdr.
 
 Fresh local `agent ask`, `agent run`, `agent review`, `agent implement`,
 `orchestrate`, and `task run` dispatches accept `--org-role <name>` (or the

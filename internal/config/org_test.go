@@ -37,6 +37,50 @@ func TestLoadOrgAndScopeMatching(t *testing.T) {
 	}
 }
 
+func TestLoadOrgRoleModel(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	base := `[org.roles."owner"]
+scope = ["*"]
+[org.roles."g2"]
+parent = "owner"
+scope = ["gitmoot/*"]
+`
+	for _, test := range []struct {
+		name      string
+		suffix    string
+		wantModel string
+		wantErr   string
+	}{
+		{name: "configured", suffix: `model = "sonnet"` + "\n", wantModel: "sonnet"},
+		{name: "absent", wantModel: ""},
+		{name: "unknown remains rejected", suffix: "network = true\n", wantErr: "unknown field"},
+		{name: "duplicate", suffix: "model = \"sonnet\"\nmodel = \"opus\"\n", wantErr: `duplicate field "model"`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(paths.ConfigFile, []byte(base+test.suffix), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadOrg(paths)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("LoadOrg() error = %v, want containing %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LoadOrg() error = %v", err)
+			}
+			role, ok := cfg.Role("g2")
+			if !ok || role.Model != test.wantModel {
+				t.Fatalf("Role(g2) = %+v, %v; want model %q", role, ok, test.wantModel)
+			}
+		})
+	}
+}
+
 func TestLoadOrgRecycleAfterPrecedence(t *testing.T) {
 	paths := PathsForHome(t.TempDir())
 	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {

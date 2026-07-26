@@ -134,22 +134,42 @@ func TestHerdrOrgProviderFailures(t *testing.T) {
 }
 
 func TestHerdrOrgProviderRecycleCommand(t *testing.T) {
-	var got []string
-	run := func(ctx context.Context, args ...string) (string, error) {
-		if _, ok := ctx.Deadline(); !ok {
-			t.Fatal("Recycle runner context has no deadline")
-		}
-		got = append([]string(nil), args...)
-		return "", nil
-	}
-	provider := newHerdrOrgProvider(run, []config.OrgRole{{Name: "owner"}}, time.Now)
-	req := org.RecycleRequest{Role: "owner", Pane: "w1:p2", Kind: "codex", AgentName: "owner", BootPrompt: "role: owner\n\nhandoff: ship it"}
-	if err := provider.Recycle(context.Background(), req); err != nil {
-		t.Fatalf("Recycle() error = %v", err)
-	}
-	want := []string{"agent", "start", "owner", "--kind", "codex", "--pane", "w1:p2", "--timeout", "30000", "--", req.BootPrompt}
-	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
-		t.Fatalf("Recycle() args = %q, want %q", got, want)
+	for _, test := range []struct {
+		name  string
+		model string
+		want  []string
+	}{
+		{
+			name: "unpinned preserves command",
+			want: []string{"agent", "start", "owner", "--kind", "codex", "--pane", "w1:p2", "--timeout", "30000", "--", "role: owner\n\nhandoff: ship it"},
+		},
+		{
+			name:  "pinned model precedes boot prompt",
+			model: "sonnet",
+			want:  []string{"agent", "start", "owner", "--kind", "codex", "--pane", "w1:p2", "--timeout", "30000", "--", "--model", "sonnet", "role: owner\n\nhandoff: ship it"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var got []string
+			run := func(ctx context.Context, args ...string) (string, error) {
+				if _, ok := ctx.Deadline(); !ok {
+					t.Fatal("Recycle runner context has no deadline")
+				}
+				got = append([]string(nil), args...)
+				return "", nil
+			}
+			provider := newHerdrOrgProvider(run, []config.OrgRole{{Name: "owner"}}, time.Now)
+			req := org.RecycleRequest{
+				Role: "owner", Pane: "w1:p2", Kind: "codex", AgentName: "owner",
+				Model: test.model, BootPrompt: "role: owner\n\nhandoff: ship it",
+			}
+			if err := provider.Recycle(context.Background(), req); err != nil {
+				t.Fatalf("Recycle() error = %v", err)
+			}
+			if strings.Join(got, "\x00") != strings.Join(test.want, "\x00") {
+				t.Fatalf("Recycle() args = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 
