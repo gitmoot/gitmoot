@@ -76,6 +76,100 @@ func TestReconcileTerminalDrivingJob(t *testing.T) {
 	}
 }
 
+func TestFindLiveTaskJobRepoScoped(t *testing.T) {
+	tests := []struct {
+		name      string
+		taskRepo  string
+		payload   JobPayload
+		state     JobState
+		events    []db.JobEvent
+		wantJobID string
+	}{
+		{
+			name:      "task id match",
+			taskRepo:  "owner/repo",
+			payload:   JobPayload{Repo: "owner/repo", Branch: "feature/other", TaskID: "task-1"},
+			state:     JobQueued,
+			wantJobID: "z-live",
+		},
+		{
+			name:      "repo and branch match",
+			taskRepo:  "owner/repo",
+			payload:   JobPayload{Repo: "owner/repo", Branch: "feature/shared", TaskID: "other-task"},
+			state:     JobRunning,
+			wantJobID: "z-live",
+		},
+		{
+			name:      "settled job with advancement pending",
+			taskRepo:  "owner/repo",
+			payload:   JobPayload{Repo: "owner/repo", Branch: "feature/shared"},
+			state:     JobSucceeded,
+			events:    []db.JobEvent{{Kind: "advance_started"}},
+			wantJobID: "z-live",
+		},
+		{
+			name:      "cancelled from running remains live",
+			taskRepo:  "owner/repo",
+			payload:   JobPayload{Repo: "owner/repo", Branch: "feature/shared"},
+			state:     JobCancelled,
+			events:    []db.JobEvent{{Kind: string(JobCancelled), Message: "cancel requested from running"}},
+			wantJobID: "z-live",
+		},
+		{
+			name:      "empty repo falls back to branch scan",
+			payload:   JobPayload{Branch: "feature/shared"},
+			state:     JobQueued,
+			wantJobID: "z-live",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			task := db.Task{ID: "task-1", RepoFullName: test.taskRepo, Branch: "feature/shared"}
+
+			for _, seed := range []struct {
+				id      string
+				payload JobPayload
+			}{
+				{id: "a-unrelated-same-branch", payload: JobPayload{Repo: "other/repo", Branch: task.Branch}},
+				{id: "b-third-repo", payload: JobPayload{Repo: "third/repo", Branch: task.Branch}},
+				{id: "c-same-repo-wrong-branch", payload: JobPayload{Repo: test.taskRepo, Branch: "feature/wrong", TaskID: "other-task"}},
+			} {
+				encoded, err := json.Marshal(seed.payload)
+				if err != nil {
+					t.Fatalf("Marshal(%s): %v", seed.id, err)
+				}
+				if err := store.CreateJob(ctx, db.Job{ID: seed.id, Type: "implement", State: string(JobQueued), Payload: string(encoded)}); err != nil {
+					t.Fatalf("CreateJob(%s): %v", seed.id, err)
+				}
+			}
+
+			encoded, err := json.Marshal(test.payload)
+			if err != nil {
+				t.Fatalf("Marshal live payload: %v", err)
+			}
+			if err := store.CreateJob(ctx, db.Job{ID: "z-live", Type: "implement", State: string(test.state), Payload: string(encoded)}); err != nil {
+				t.Fatalf("CreateJob(z-live): %v", err)
+			}
+			for _, event := range test.events {
+				event.JobID = "z-live"
+				if err := store.AddJobEvent(ctx, event); err != nil {
+					t.Fatalf("AddJobEvent(%s): %v", event.Kind, err)
+				}
+			}
+
+			got, live, err := FindLiveTaskJob(ctx, store, task)
+			if err != nil {
+				t.Fatalf("FindLiveTaskJob: %v", err)
+			}
+			if !live || got.ID != test.wantJobID {
+				t.Fatalf("FindLiveTaskJob = job %+v live=%v, want %q live", got, live, test.wantJobID)
+			}
+		})
+	}
+}
+
 func TestJobKeepsTaskLiveTable(t *testing.T) {
 	completionMarkers := []string{"advance_completed", "advance_retried", "advance_blocked", "advance_retry_skipped", "retry_queued"}
 	type testCase struct {

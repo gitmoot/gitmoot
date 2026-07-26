@@ -4915,6 +4915,91 @@ func TestListJobsByType(t *testing.T) {
 	}
 }
 
+func TestListJobsByStateAndRepoUseIndexedFilters(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	largeBlob := strings.Repeat("x", 4*1024)
+	bulkRepos := []string{"bulk/one", "bulk/two", "bulk/three"}
+	for i := 0; i < 300; i++ {
+		payload, err := json.Marshal(map[string]string{
+			"repo": bulkRepos[i%len(bulkRepos)],
+			"blob": largeBlob,
+		})
+		if err != nil {
+			t.Fatalf("Marshal bulk payload %d: %v", i, err)
+		}
+		job := Job{
+			ID:      "bulk-" + strconv.Itoa(i),
+			Agent:   "bulk",
+			Type:    "ask",
+			State:   "succeeded",
+			Payload: string(payload),
+		}
+		if err := store.CreateJob(ctx, job); err != nil {
+			t.Fatalf("CreateJob(%s): %v", job.ID, err)
+		}
+	}
+
+	for _, job := range []Job{
+		{ID: "blocked-a", Agent: "audit", Type: "ask", State: "blocked", Payload: `{"repo":"some/repo","marker":"old"}`},
+		{ID: "blocked-b", Agent: "audit", Type: "ask", State: "blocked", Payload: `{"repo":"other/repo","marker":"middle"}`},
+		{ID: "blocked-c", Agent: "audit", Type: "ask", State: "blocked", Payload: `{"repo":"some/repo","marker":"new"}`},
+		{ID: "repo-only", Agent: "audit", Type: "ask", State: "failed", Payload: `{"repo":"some/repo","marker":"terminal"}`},
+	} {
+		if err := store.CreateJob(ctx, job); err != nil {
+			t.Fatalf("CreateJob(%s): %v", job.ID, err)
+		}
+	}
+	for i, id := range []string{"blocked-a", "blocked-b", "blocked-c"} {
+		if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET updated_at = ? WHERE id = ?`,
+			time.Now().UTC().Add(time.Duration(i-3)*time.Hour).Format(time.RFC3339Nano), id); err != nil {
+			t.Fatalf("backdate %s: %v", id, err)
+		}
+	}
+
+	blocked, err := store.ListJobsByState(ctx, "blocked")
+	if err != nil {
+		t.Fatalf("ListJobsByState(blocked): %v", err)
+	}
+	wantBlocked := []string{"blocked-a", "blocked-b", "blocked-c"}
+	if len(blocked) != len(wantBlocked) {
+		t.Fatalf("ListJobsByState(blocked) returned %d jobs, want %d: %+v", len(blocked), len(wantBlocked), blocked)
+	}
+	for i, job := range blocked {
+		if job.ID != wantBlocked[i] || job.State != "blocked" {
+			t.Fatalf("blocked[%d] = %+v, want ID %q and state blocked", i, job, wantBlocked[i])
+		}
+	}
+
+	byRepo, err := store.ListJobsByRepo(ctx, "some/repo")
+	if err != nil {
+		t.Fatalf("ListJobsByRepo(some/repo): %v", err)
+	}
+	wantRepo := []string{"blocked-a", "blocked-c", "repo-only"}
+	if len(byRepo) != len(wantRepo) {
+		t.Fatalf("ListJobsByRepo(some/repo) returned %d jobs, want %d: %+v", len(byRepo), len(wantRepo), byRepo)
+	}
+	for i, job := range byRepo {
+		if job.ID != wantRepo[i] {
+			t.Fatalf("repo job[%d].ID = %q, want %q", i, job.ID, wantRepo[i])
+		}
+	}
+
+	statePlan := explainQueryPlan(t, store, `SELECT id FROM jobs WHERE state = ?`, "blocked")
+	if !strings.Contains(statePlan, "USING COVERING INDEX idx_jobs_blocked_updated_at") {
+		t.Fatalf("blocked-state plan does not use idx_jobs_blocked_updated_at as a covering index:\n%s", statePlan)
+	}
+	repoPlan := explainQueryPlan(t, store, `SELECT id FROM jobs WHERE repo = ?`, "some/repo")
+	if !strings.Contains(repoPlan, "USING INDEX idx_jobs_repo") {
+		t.Fatalf("repo plan does not use idx_jobs_repo:\n%s", repoPlan)
+	}
+}
+
 func TestListActiveJobsReturnsOnlyQueuedAndRunningInIDOrder(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))

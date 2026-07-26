@@ -162,7 +162,7 @@ func TestRunTaskDismissRefusesLiveJobAndWorktreeProcess(t *testing.T) {
 				t.Fatal(err)
 			}
 			if test.liveJob {
-				payload, _ := json.Marshal(workflow.JobPayload{TaskID: task.ID})
+				payload, _ := json.Marshal(workflow.JobPayload{Repo: task.RepoFullName, TaskID: task.ID})
 				if err := store.CreateJob(context.Background(), db.Job{ID: "job-1", Type: "ask", State: string(workflow.JobQueued), Payload: string(payload)}); err != nil {
 					t.Fatal(err)
 				}

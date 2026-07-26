@@ -268,6 +268,22 @@ func (s *Store) ListJobsByType(ctx context.Context, jobType string) ([]Job, erro
 	return scanJobs(rows)
 }
 
+func (s *Store) ListJobsByState(ctx context.Context, state string) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+jobColumns+` FROM jobs WHERE state = ? ORDER BY id`, state)
+	if err != nil {
+		return nil, err
+	}
+	return scanJobs(rows)
+}
+
+func (s *Store) ListJobsByRepo(ctx context.Context, repo string) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+jobColumns+` FROM jobs WHERE repo = ? ORDER BY id`, repo)
+	if err != nil {
+		return nil, err
+	}
+	return scanJobs(rows)
+}
+
 // ListJobsByParent returns the direct children of parentJobID (delegation
 // children and the coordinator continuation job), ordered by delegation_id then
 // id for a stable tree. It selects updated_at like ListJobs so callers can show
