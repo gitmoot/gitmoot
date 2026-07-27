@@ -61,6 +61,9 @@ const (
 	// EventOrgRecycleOverdue is emitted when an organization role crosses its
 	// configured recycle age and the CLI dispatch ingress warns or refuses it.
 	EventOrgRecycleOverdue EventType = "org.recycle_overdue"
+	// EventOrgInputPending is emitted when a Herdr pane bound to an organization
+	// role remains at an interactive input dialog past the configured threshold.
+	EventOrgInputPending EventType = "org.input_pending"
 
 	// EventCandidateAwaitingPromotion is emitted once when a SkillOpt template
 	// candidate becomes PENDING (the post-import notify, #471): a new pending

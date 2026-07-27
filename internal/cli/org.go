@@ -1102,12 +1102,13 @@ func orgEscalateQuestionAndFlags(args []string) (string, []string, bool) {
 }
 
 var eventRuleKinds = map[string]struct{}{
-	"escalation":      {},
-	"attention":       {},
-	"guard":           {},
-	"job-terminal":    {},
-	"blocked":         {},
-	"recycle-overdue": {},
+	"escalation":         {},
+	"attention":          {},
+	"guard":              {},
+	"job-terminal":       {},
+	"blocked":            {},
+	"recycle-overdue":    {},
+	"pane_input_pending": {},
 }
 
 func runOrgEvents(args []string, stdout, stderr io.Writer) int {
@@ -1140,7 +1141,7 @@ func runOrgEventRuleAdd(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("org events rule add", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	onKind := fs.String("on", "", "event kind: escalation, attention, guard, job-terminal, or blocked")
+	onKind := fs.String("on", "", "event kind: escalation, attention, guard, job-terminal, blocked, recycle-overdue, or pane_input_pending")
 	// V1 intentionally keeps matching simple and inspectable: one
 	// case-insensitive substring tested independently against repo and job id;
 	// an empty filter matches every event of the selected kind.
@@ -1168,7 +1169,7 @@ func runOrgEventRuleAdd(args []string, stdout, stderr io.Writer) int {
 	}
 	kind := strings.ToLower(strings.TrimSpace(*onKind))
 	if _, ok := eventRuleKinds[kind]; !ok {
-		fmt.Fprintf(stderr, "unknown event rule kind %q; want escalation, attention, guard, job-terminal, or blocked\n", kind)
+		fmt.Fprintf(stderr, "unknown event rule kind %q; want escalation, attention, guard, job-terminal, blocked, recycle-overdue, or pane_input_pending\n", kind)
 		return 2
 	}
 	roleName := strings.ToLower(strings.TrimSpace(*wake))

@@ -55,6 +55,7 @@ func TestClassifyEventRuleKinds(t *testing.T) {
 		{name: "permission guard", event: events.Event{Type: events.EventJobBlocked, Cause: "permission_guard"}, want: []string{"guard"}},
 		{name: "blocked since only", event: events.Event{Type: events.EventJobBlocked, Cause: "blocked_since"}, want: []string{"blocked"}},
 		{name: "recycle overdue", event: events.Event{Type: events.EventOrgRecycleOverdue, Cause: "recycle_overdue"}, want: []string{"recycle-overdue"}},
+		{name: "pane input pending", event: events.Event{Type: events.EventOrgInputPending, Cause: "input_pending_since"}, want: []string{"pane_input_pending"}},
 		{name: "finished terminal", event: events.Event{Type: events.EventJobFinished}, want: []string{"job-terminal"}},
 		{name: "failed terminal", event: events.Event{Type: events.EventJobFailed, Cause: "unrelated"}, want: []string{"job-terminal"}},
 		{name: "plain blocked terminal and blocked", event: events.Event{Type: events.EventJobBlocked}, want: []string{"job-terminal", "blocked"}},
