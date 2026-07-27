@@ -481,10 +481,9 @@ func (s *Store) TransitionTaskStateWithEventObserved(ctx context.Context, taskID
 }
 
 // TransitionTaskStateWithEventIfNoActiveJob adds a queued/running job guard to
-// the same transaction as the task CAS. It is reserved for dismissal: broader
-// liveness (pending advancement and unsettled cancellation) is checked by the
-// caller before entering this transaction, while this guard closes the window
-// in which a newly queued/running job could acquire the task.
+// the same transaction as the task CAS. Callers perform any broader liveness
+// checks before entering this transaction; this guard closes the window in
+// which a newly queued/running job could acquire the task.
 func (s *Store) TransitionTaskStateWithEventIfNoActiveJob(ctx context.Context, taskID string, fromStates []string, to string, kind string, reason string) (changed bool, currentState string, err error) {
 	changed, _, currentState, err = s.transitionTaskStateWithEvent(ctx, taskID, fromStates, to, kind, reason, true)
 	return changed, currentState, err

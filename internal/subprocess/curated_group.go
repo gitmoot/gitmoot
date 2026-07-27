@@ -21,26 +21,42 @@ type CuratedGroupRunner struct {
 }
 
 func (r CuratedGroupRunner) Run(ctx context.Context, dir string, command string, args ...string) (Result, error) {
-	return r.run(ctx, dir, nil, nil, command, args...)
+	return r.run(ctx, dir, nil, nil, nil, command, args...)
 }
 
 func (r CuratedGroupRunner) RunEnv(ctx context.Context, dir string, env []string, command string, args ...string) (Result, error) {
-	return r.run(ctx, dir, env, nil, command, args...)
+	return r.run(ctx, dir, env, nil, nil, command, args...)
 }
 
 func (r CuratedGroupRunner) RunStream(ctx context.Context, dir string, out io.Writer, command string, args ...string) (Result, error) {
-	return r.run(ctx, dir, nil, out, command, args...)
+	return r.run(ctx, dir, nil, out, nil, command, args...)
 }
 
 func (r CuratedGroupRunner) RunEnvStream(ctx context.Context, dir string, env []string, out io.Writer, command string, args ...string) (Result, error) {
-	return r.run(ctx, dir, env, out, command, args...)
+	return r.run(ctx, dir, env, out, nil, command, args...)
+}
+
+func (r CuratedGroupRunner) RunWithPID(ctx context.Context, dir string, onPID PIDCallback, command string, args ...string) (Result, error) {
+	return r.run(ctx, dir, nil, nil, onPID, command, args...)
+}
+
+func (r CuratedGroupRunner) RunEnvWithPID(ctx context.Context, dir string, env []string, onPID PIDCallback, command string, args ...string) (Result, error) {
+	return r.run(ctx, dir, env, nil, onPID, command, args...)
+}
+
+func (r CuratedGroupRunner) RunStreamWithPID(ctx context.Context, dir string, out io.Writer, onPID PIDCallback, command string, args ...string) (Result, error) {
+	return r.run(ctx, dir, nil, out, onPID, command, args...)
+}
+
+func (r CuratedGroupRunner) RunEnvStreamWithPID(ctx context.Context, dir string, env []string, out io.Writer, onPID PIDCallback, command string, args ...string) (Result, error) {
+	return r.run(ctx, dir, env, out, onPID, command, args...)
 }
 
 func (r CuratedGroupRunner) LookPath(file string) (string, error) {
 	return exec.LookPath(file)
 }
 
-func (r CuratedGroupRunner) run(ctx context.Context, dir string, extraEnv []string, out io.Writer, command string, args ...string) (Result, error) {
+func (r CuratedGroupRunner) run(ctx context.Context, dir string, extraEnv []string, out io.Writer, onPID PIDCallback, command string, args ...string) (Result, error) {
 	// Cleanup is registered before prepare so a partial prepare failure still
 	// removes whatever was created instead of leaking scratch directories.
 	defer r.cleanupScratch()
@@ -51,10 +67,19 @@ func (r CuratedGroupRunner) run(ctx context.Context, dir string, extraEnv []stri
 	env = append(env, r.BaseEnv...)
 	env = append(env, extraEnv...)
 	if out != nil {
+		if onPID != nil {
+			return runCuratedGroupStreamWithPID(ctx, dir, env, out, onPID, command, args...)
+		}
 		return runCuratedGroupStream(ctx, dir, env, out, command, args...)
 	}
 	if r.MaxOutputBytes > 0 {
+		if onPID != nil {
+			return runCuratedGroupBoundedWithPID(ctx, dir, env, r.MaxOutputBytes, onPID, command, args...)
+		}
 		return runCuratedGroupBounded(ctx, dir, env, r.MaxOutputBytes, command, args...)
+	}
+	if onPID != nil {
+		return runCuratedGroupWithPID(ctx, dir, env, onPID, command, args...)
 	}
 	return runCuratedGroup(ctx, dir, env, command, args...)
 }
@@ -91,6 +116,17 @@ func runCuratedGroup(ctx context.Context, dir string, env []string, command stri
 	return Result{Command: command, Args: args, Stdout: stdout.String(), Stderr: stderr.String()}, err
 }
 
+func runCuratedGroupWithPID(ctx context.Context, dir string, env []string, onPID PIDCallback, command string, args ...string) (Result, error) {
+	cmd, sweep := newGroupCmd(ctx, dir, command, args)
+	cmd.Env = env
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := startAndWait(cmd, onPID)
+	sweep()
+	return Result{Command: command, Args: args, Stdout: stdout.String(), Stderr: stderr.String()}, err
+}
+
 func runCuratedGroupBounded(ctx context.Context, dir string, env []string, maxOutputBytes int, command string, args ...string) (Result, error) {
 	cmd, sweep := newGroupCmd(ctx, dir, command, args)
 	cmd.Env = env
@@ -103,6 +139,18 @@ func runCuratedGroupBounded(ctx context.Context, dir string, env []string, maxOu
 	return Result{Command: command, Args: args, Stdout: stdout.String(), Stderr: stderr.String()}, err
 }
 
+func runCuratedGroupBoundedWithPID(ctx context.Context, dir string, env []string, maxOutputBytes int, onPID PIDCallback, command string, args ...string) (Result, error) {
+	cmd, sweep := newGroupCmd(ctx, dir, command, args)
+	cmd.Env = env
+	stdout := tailBuffer{max: maxOutputBytes}
+	stderr := tailBuffer{max: maxOutputBytes}
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := startAndWait(cmd, onPID)
+	sweep()
+	return Result{Command: command, Args: args, Stdout: stdout.String(), Stderr: stderr.String()}, err
+}
+
 func runCuratedGroupStream(ctx context.Context, dir string, env []string, out io.Writer, command string, args ...string) (Result, error) {
 	if out == nil {
 		return runCuratedGroup(ctx, dir, env, command, args...)
@@ -110,6 +158,17 @@ func runCuratedGroupStream(ctx context.Context, dir string, env []string, out io
 	cmd, sweep := newGroupCmd(ctx, dir, command, args)
 	cmd.Env = env
 	result, err := runStreamingCmd(cmd, out, command, args)
+	sweep()
+	return result, err
+}
+
+func runCuratedGroupStreamWithPID(ctx context.Context, dir string, env []string, out io.Writer, onPID PIDCallback, command string, args ...string) (Result, error) {
+	if out == nil {
+		return runCuratedGroupWithPID(ctx, dir, env, onPID, command, args...)
+	}
+	cmd, sweep := newGroupCmd(ctx, dir, command, args)
+	cmd.Env = env
+	result, err := runStreamingCmdWithPID(cmd, out, onPID, command, args)
 	sweep()
 	return result, err
 }

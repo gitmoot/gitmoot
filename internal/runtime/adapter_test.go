@@ -1998,6 +1998,87 @@ func (r *shellContextRunner) want(t *testing.T, want ...string) {
 	}
 }
 
+type pidFakeRunner struct {
+	*fakeRunner
+	pid int
+}
+
+func (f *pidFakeRunner) RunWithPID(ctx context.Context, dir string, onPID subprocess.PIDCallback, command string, args ...string) (subprocess.Result, error) {
+	if onPID != nil {
+		onPID(f.pid)
+	}
+	return f.Run(ctx, dir, command, args...)
+}
+
+func TestDeliverReportsPIDWhenRunnerSupportsCapability(t *testing.T) {
+	const wantPID = 424242
+	tests := []struct {
+		name    string
+		adapter Adapter
+		agent   Agent
+	}{
+		{
+			name:    "codex",
+			adapter: CodexAdapter{Runner: &pidFakeRunner{fakeRunner: &fakeRunner{results: []subprocess.Result{{Stdout: `{"type":"item.completed","item":{"type":"agent_message","text":"done"}}` + "\n"}}}, pid: wantPID}},
+			agent:   Agent{Name: "codex", Role: "implementer", Runtime: CodexRuntime, RuntimeRef: FreshRefForJob("pid-codex"), RepoScope: "gitmoot/gitmoot"},
+		},
+		{
+			name: "claude",
+			adapter: ClaudeAdapter{
+				Runner: &pidFakeRunner{fakeRunner: &fakeRunner{results: []subprocess.Result{{Stdout: `{"result":"done"}`}}}, pid: wantPID},
+				NewRuntimeRef: func() (string, error) {
+					return "550e8400-e29b-41d4-a716-446655440099", nil
+				},
+			},
+			agent: Agent{Name: "claude", Role: "implementer", Runtime: ClaudeRuntime, RuntimeRef: FreshRefForJob("pid-claude"), RepoScope: "gitmoot/gitmoot"},
+		},
+		{
+			name:    "kimi",
+			adapter: KimiAdapter{Runner: &pidFakeRunner{fakeRunner: &fakeRunner{results: []subprocess.Result{{Stdout: `{"role":"assistant","content":"done"}` + "\n"}}}, pid: wantPID}},
+			agent:   Agent{Name: "kimi", Role: "implementer", Runtime: KimiRuntime, RuntimeRef: FreshRefForJob("pid-kimi"), RepoScope: "gitmoot/gitmoot"},
+		},
+		{
+			name:    "kimi-cli",
+			adapter: KimiCLIAdapter{Runner: &pidFakeRunner{fakeRunner: &fakeRunner{results: []subprocess.Result{{Stdout: `{"role":"assistant","content":"done"}` + "\n"}}}, pid: wantPID}},
+			agent:   Agent{Name: "kimi-cli", Role: "implementer", Runtime: KimiCLIRuntime, RuntimeRef: FreshRefForJob("pid-kimi-cli"), RepoScope: "gitmoot/gitmoot"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotPID := 0
+			if _, err := tc.adapter.Deliver(context.Background(), tc.agent, Job{
+				Prompt: "work",
+				OnPID:  func(pid int) { gotPID = pid },
+			}); err != nil {
+				t.Fatalf("Deliver returned error: %v", err)
+			}
+			if gotPID != wantPID {
+				t.Fatalf("captured PID = %d, want %d", gotPID, wantPID)
+			}
+		})
+	}
+}
+
+func TestDeliverWithoutPIDCapabilityPreservesBehavior(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"role":"assistant","content":"done"}` + "\n"}}}
+	adapter := KimiAdapter{Runner: runner}
+	agent := Agent{Name: "kimi", Role: "implementer", Runtime: KimiRuntime, RuntimeRef: FreshRefForJob("no-pid-kimi"), RepoScope: "gitmoot/gitmoot"}
+	gotPID := 0
+	result, err := adapter.Deliver(context.Background(), agent, Job{
+		Prompt: "work",
+		OnPID:  func(pid int) { gotPID = pid },
+	})
+	if err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	if result.Summary != "done" || gotPID != 0 {
+		t.Fatalf("Deliver result = %+v, captured PID = %d; want unchanged result and no PID", result, gotPID)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("runner calls = %d, want 1", len(runner.calls))
+	}
+}
+
 func (f *fakeRunner) Run(_ context.Context, _ string, command string, args ...string) (subprocess.Result, error) {
 	call := append([]string{command}, args...)
 	f.calls = append(f.calls, call)

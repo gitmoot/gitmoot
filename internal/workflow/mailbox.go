@@ -313,6 +313,13 @@ type JobPayload struct {
 	SynthesisRule         string   `json:"synthesis_rule,omitempty"`
 	DelegationArtifactDir string   `json:"delegation_artifact_dir,omitempty"`
 	WorktreePath          string   `json:"worktree_path,omitempty"`
+	// RuntimePID is the exact subprocess started by the runtime runner for the
+	// current delivery. RuntimePIDStartTime is Linux /proc starttime field 22,
+	// captured at the same moment so liveness checks cannot mistake a recycled
+	// PID for the original process. Both are additive payload metadata; jobs
+	// dispatched through legacy/custom runners simply omit them.
+	RuntimePID          int    `json:"runtime_pid,omitempty"`
+	RuntimePIDStartTime string `json:"runtime_pid_start_time,omitempty"`
 	// ReadOnlyWorktree marks a top-level read-only (ask) worktree allocated at
 	// dispatch time (#739): its WorktreePath is a throwaway detached committed-tip
 	// worktree with no DelegationID and no Branch. Additive/omitempty so a payload
@@ -1000,7 +1007,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		// there are zero prior artifacts to reconcile — this is its first real run.
 		prompt = blockerRetryReconciliationNotice(payload.BlockerClass, payload.BlockerAttempts) + "\n\n" + prompt
 	}
-	firstRaw, firstRefreshedRef, firstEphemeral, firstDiag, firstErr := m.deliver(ctx, adapter, agent, job, payload, prompt)
+	firstRaw, firstRefreshedRef, firstEphemeral, firstDiag, firstErr := m.deliver(ctx, adapter, agent, job, &payload, prompt)
 	if firstErr != nil {
 		deliveryErr := DeliveryError{Err: firstErr}
 		// PRE-TERMINAL operational-blocker classification (#532 slice E): consult the
@@ -1084,7 +1091,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 			}
 
 			repairPrompt := prompts.RenderRepairPrompt(lastRaw, parseErr)
-			repairRaw, repairRefreshedRef, repairEphemeral, repairDiag, repairErr := m.deliver(ctx, adapter, agent, job, payload, repairPrompt)
+			repairRaw, repairRefreshedRef, repairEphemeral, repairDiag, repairErr := m.deliver(ctx, adapter, agent, job, &payload, repairPrompt)
 			if repairErr != nil {
 				deliveryErr := DeliveryError{Err: repairErr}
 				// Same pre-terminal seam as the first delivery, but the deferrer's
@@ -1181,7 +1188,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 			if err := m.addEvent(ctx, job.ID, "produce_check_retry", fmt.Sprintf("retrying after deterministic check failure (attempt %d of %d)", correction+1, payload.CheckRetries)); err != nil {
 				return AgentResult{}, err
 			}
-			correctionRaw, refreshedRef, ephemeral, diag, deliveryErr := m.deliver(ctx, adapter, agent, job, payload, produceCheckCorrectionPrompt(checkOutput))
+			correctionRaw, refreshedRef, ephemeral, diag, deliveryErr := m.deliver(ctx, adapter, agent, job, &payload, produceCheckCorrectionPrompt(checkOutput))
 			if deliveryErr != nil {
 				m.storeFailureDiagnostics(ctx, job.ID, &payload, diag)
 				_ = m.fail(ctx, job.ID, fmt.Sprintf("produce correction delivery failed: %v", deliveryErr))
@@ -1338,7 +1345,7 @@ func produceCheckCorrectionPrompt(output string) string {
 // deliver returns the delivery's raw text, refreshed runtime ref, ephemeral
 // flag, redacted crash-diagnostics snapshot (#806, nil when no CLI process
 // ran), and error.
-func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent runtime.Agent, job db.Job, payload JobPayload, prompt string) (string, string, bool, *FailureDiagnostics, error) {
+func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent runtime.Agent, job db.Job, payload *JobPayload, prompt string) (string, string, bool, *FailureDiagnostics, error) {
 	shellEnv := append([]string(nil), payload.ShellEnv...)
 	var agentEnv []string
 	if agent.Runtime == runtime.ShellRuntime {
@@ -1358,6 +1365,14 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		ShellEnv:             shellEnv,
 		AgentEnv:             agentEnv,
 		ShellUpstreamContext: payload.ShellUpstreamContext,
+		OnPID: func(pid int) {
+			payload.RuntimePID = pid
+			payload.RuntimePIDStartTime = RuntimeProcessIdentity(pid)
+			// Persist before the runner blocks so an independently invoked doctor
+			// can inspect the running job. Best-effort: observability must never
+			// turn a successful runtime start into a delivery failure.
+			_ = m.savePayload(ctx, job.ID, *payload)
+		},
 	}
 	// #652: thread in the runtime's configured registry default_model as the FINAL
 	// model fallback. EffectiveModel applies the precedence (job.Model > agent.Model
@@ -1372,6 +1387,14 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		delivery.RuntimeDefaultEffort = m.RuntimeDefaultEffort(agent.Runtime)
 	}
 	result, err := adapter.Deliver(ctx, agent, delivery)
+	// The recorded identity describes only a process that is currently executing
+	// this delivery. Clear it immediately when Deliver returns, before parsing,
+	// retry backoff, or a produce check keeps the job legitimately running without
+	// a runtime subprocess. Best-effort persistence mirrors the start callback:
+	// observability must never change the delivery result.
+	payload.RuntimePID = 0
+	payload.RuntimePIDStartTime = ""
+	_ = m.savePayload(ctx, job.ID, *payload)
 	// Record best-effort runtime token usage so the per-root delegation token
 	// budget (#338 Part B) can sum a tree's cost. Usage accounting must never fail
 	// a delivery, so every write error here is swallowed.
