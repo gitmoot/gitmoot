@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	TaskEventBlockedTerminalNoPR = "task_blocked_terminal_no_pr"
-	TaskEventBlockedJobFailed    = "task_blocked_job_failed"
+	TaskEventBlockedTerminalNoPR    = "task_blocked_terminal_no_pr"
+	TaskEventBlockedJobFailed       = "task_blocked_job_failed"
+	TaskEventTerminalPushedToOpenPR = "task_terminal_pushed_to_open_pr"
 )
 
 // FindLiveTaskJob returns one job that still owns lifecycle progress for task.
@@ -88,8 +89,31 @@ func (e Engine) ReconcileTerminalDrivingJob(ctx context.Context, jobID string) e
 	kind := TaskEventBlockedJobFailed
 	reason := fmt.Sprintf("top-level implement job %s ended in %s without a pull request or live successor", job.ID, job.State)
 	if job.State == string(JobSucceeded) && payload.Result != nil && payload.Result.Decision == "implemented" {
+		pr, prErr := e.Store.GetPullRequestByRepoBranch(ctx, task.RepoFullName, task.Branch)
+		if prErr == nil && strings.EqualFold(strings.TrimSpace(pr.State), "open") {
+			// Repo+branch is the durable task/PR binding. Do not require HeadSHA
+			// equality here: payload.HeadSHA is the allocated/finalized head when
+			// available, while the independently refreshed PR row can lag it. An
+			// equality gate would recreate the false block this reconciliation is
+			// meant to heal.
+			reason = fmt.Sprintf("top-level implement job %s pushed to existing open PR #%d on branch %q", job.ID, pr.Number, task.Branch)
+			_, _, err = e.Store.TransitionTaskStateWithEvent(ctx, task.ID,
+				[]string{string(TaskImplementing)}, string(TaskPullRequestOpen), TaskEventTerminalPushedToOpenPR, reason)
+			return err
+		}
+		if prErr != nil && !errors.Is(prErr, sql.ErrNoRows) {
+			return prErr
+		}
 		kind = TaskEventBlockedTerminalNoPR
-		reason = fmt.Sprintf("top-level implement job %s succeeded with decision implemented but produced no pull request or live successor", job.ID)
+		branch := strings.TrimSpace(task.Branch)
+		if branch == "" {
+			branch = "<unknown>"
+		}
+		headSHA := strings.TrimSpace(payload.HeadSHA)
+		if headSHA == "" {
+			headSHA = "<unknown>"
+		}
+		reason = fmt.Sprintf("top-level implement job %s succeeded with decision implemented on branch %q at commit %s but produced no open pull request or live successor", job.ID, branch, headSHA)
 	} else if payload.Result != nil && strings.TrimSpace(payload.Result.Decision) != "" {
 		reason = fmt.Sprintf("top-level implement job %s ended in %s with decision %s and no pull request or live successor", job.ID, job.State, payload.Result.Decision)
 	}

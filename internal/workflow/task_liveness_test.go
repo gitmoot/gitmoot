@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -12,18 +13,42 @@ import (
 
 func TestReconcileTerminalDrivingJob(t *testing.T) {
 	tests := []struct {
-		name          string
-		jobState      JobState
-		decision      string
-		parentJobID   string
-		delegationID  string
-		taskState     TaskState
-		successor     bool
-		wantTaskState TaskState
-		wantEvent     string
+		name             string
+		jobState         JobState
+		decision         string
+		parentJobID      string
+		delegationID     string
+		taskState        TaskState
+		successor        bool
+		pullRequestState string
+		wantTaskState    TaskState
+		wantEvent        string
+		wantReason       string
 	}{
-		{name: "terminal failure blocks", jobState: JobFailed, decision: "failed", taskState: TaskImplementing, wantTaskState: TaskBlocked, wantEvent: TaskEventBlockedJobFailed},
-		{name: "implemented success without PR blocks", jobState: JobSucceeded, decision: "implemented", taskState: TaskImplementing, wantTaskState: TaskBlocked, wantEvent: TaskEventBlockedTerminalNoPR},
+		{
+			name:     "terminal failure without decision blocks",
+			jobState: JobFailed, taskState: TaskImplementing,
+			wantTaskState: TaskBlocked, wantEvent: TaskEventBlockedJobFailed,
+			wantReason: "top-level implement job job-1 ended in failed without a pull request or live successor",
+		},
+		{
+			name:     "terminal failure with decision blocks",
+			jobState: JobFailed, decision: "failed", taskState: TaskImplementing,
+			wantTaskState: TaskBlocked, wantEvent: TaskEventBlockedJobFailed,
+			wantReason: "top-level implement job job-1 ended in failed with decision failed and no pull request or live successor",
+		},
+		{
+			name:     "implemented success without PR blocks",
+			jobState: JobSucceeded, decision: "implemented", taskState: TaskImplementing,
+			wantTaskState: TaskBlocked, wantEvent: TaskEventBlockedTerminalNoPR,
+			wantReason: `top-level implement job job-1 succeeded with decision implemented on branch "feature/one" at commit head123 but produced no open pull request or live successor`,
+		},
+		{
+			name:     "implemented success with closed PR blocks",
+			jobState: JobSucceeded, decision: "implemented", taskState: TaskImplementing, pullRequestState: "closed",
+			wantTaskState: TaskBlocked, wantEvent: TaskEventBlockedTerminalNoPR,
+			wantReason: `top-level implement job job-1 succeeded with decision implemented on branch "feature/one" at commit head123 but produced no open pull request or live successor`,
+		},
 		{name: "already advanced to pr_open is untouched", jobState: JobSucceeded, decision: "implemented", taskState: TaskPullRequestOpen, wantTaskState: TaskPullRequestOpen},
 		{name: "delegation child is untouched", jobState: JobFailed, decision: "failed", parentJobID: "parent", delegationID: "child", taskState: TaskImplementing, wantTaskState: TaskImplementing},
 		{name: "queued successor keeps task live", jobState: JobFailed, decision: "failed", taskState: TaskImplementing, successor: true, wantTaskState: TaskImplementing},
@@ -37,6 +62,7 @@ func TestReconcileTerminalDrivingJob(t *testing.T) {
 			}
 			payload := JobPayload{
 				Repo: "owner/repo", Branch: "feature/one", TaskID: "task-1",
+				HeadSHA:     "head123",
 				ParentJobID: test.parentJobID, DelegationID: test.delegationID,
 				Result: &AgentResult{Decision: test.decision, Summary: "done"},
 			}
@@ -46,6 +72,17 @@ func TestReconcileTerminalDrivingJob(t *testing.T) {
 			}
 			if err := store.AddJobEvent(ctx, db.JobEvent{JobID: "job-1", Kind: "advance_completed"}); err != nil {
 				t.Fatal(err)
+			}
+			if test.pullRequestState != "" {
+				if err := store.UpsertPullRequest(ctx, db.PullRequest{
+					RepoFullName: "owner/repo",
+					Number:       41,
+					HeadBranch:   "feature/one",
+					HeadSHA:      "head123",
+					State:        test.pullRequestState,
+				}); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if test.successor {
 				successorPayload, _ := json.Marshal(JobPayload{Repo: "owner/repo", Branch: "feature/one", TaskID: "task-1"})
@@ -71,10 +108,109 @@ func TestReconcileTerminalDrivingJob(t *testing.T) {
 				if len(events) != 0 {
 					t.Fatalf("unexpected task events = %+v", events)
 				}
-			} else if len(events) != 1 || events[0].Kind != test.wantEvent {
+			} else if len(events) != 1 || events[0].Kind != test.wantEvent || events[0].Reason != test.wantReason {
 				t.Fatalf("task events = %+v, want one %s", events, test.wantEvent)
 			}
 		})
+	}
+}
+
+func TestReconcileTerminalDrivingJobSplitsOpenPRFromStrand(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := Engine{Store: store}
+
+	type fixture struct {
+		taskID string
+		jobID  string
+		branch string
+		head   string
+	}
+	healthy := fixture{taskID: "task-fix-pass", jobID: "job-fix-pass", branch: "feature/fix-pass", head: "abc123"}
+	stranded := fixture{taskID: "task-stranded", jobID: "job-stranded", branch: "feature/stranded", head: "def456"}
+	for _, item := range []fixture{healthy, stranded} {
+		if err := store.UpsertTask(ctx, db.Task{
+			ID:           item.taskID,
+			RepoFullName: "owner/repo",
+			Branch:       item.branch,
+			State:        string(TaskImplementing),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := json.Marshal(JobPayload{
+			Repo:    "owner/repo",
+			Branch:  item.branch,
+			TaskID:  item.taskID,
+			HeadSHA: item.head,
+			Result:  &AgentResult{Decision: "implemented", Summary: "done"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.CreateJob(ctx, db.Job{ID: item.jobID, Type: "implement", State: string(JobSucceeded), Payload: string(encoded)}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: item.jobID, Kind: "advance_completed"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: "owner/repo",
+		Number:       41,
+		HeadBranch:   healthy.branch,
+		HeadSHA:      healthy.head,
+		State:        "open",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, item := range []fixture{healthy, stranded} {
+		if err := engine.ReconcileTerminalDrivingJob(ctx, item.jobID); err != nil {
+			t.Fatalf("ReconcileTerminalDrivingJob(%s): %v", item.jobID, err)
+		}
+	}
+
+	healthyTask, err := store.GetTask(ctx, healthy.taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if healthyTask.State != string(TaskPullRequestOpen) {
+		t.Fatalf("healthy task state = %s, want %s", healthyTask.State, TaskPullRequestOpen)
+	}
+	strandedTask, err := store.GetTask(ctx, stranded.taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strandedTask.State != string(TaskBlocked) {
+		t.Fatalf("stranded task state = %s, want %s", strandedTask.State, TaskBlocked)
+	}
+
+	healthyEvents, err := store.ListTaskEvents(ctx, healthy.taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	strandedEvents, err := store.ListTaskEvents(ctx, stranded.taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(healthyEvents) != 1 || healthyEvents[0].Kind != TaskEventTerminalPushedToOpenPR ||
+		!strings.Contains(healthyEvents[0].Reason, "#41") || !strings.Contains(healthyEvents[0].Reason, healthy.branch) {
+		t.Fatalf("healthy events = %+v, want open-PR informational transition", healthyEvents)
+	}
+	if len(strandedEvents) != 1 || strandedEvents[0].Kind != TaskEventBlockedTerminalNoPR ||
+		!strings.Contains(strandedEvents[0].Reason, stranded.branch) || !strings.Contains(strandedEvents[0].Reason, stranded.head) {
+		t.Fatalf("stranded events = %+v, want blocked event naming branch and SHA", strandedEvents)
+	}
+	if healthyEvents[0].Kind == strandedEvents[0].Kind || healthyEvents[0].Reason == strandedEvents[0].Reason {
+		t.Fatalf("healthy and stranded outcomes must differ: healthy=%+v stranded=%+v", healthyEvents[0], strandedEvents[0])
+	}
+
+	blocked, err := store.ListTasksByRepoState(ctx, "owner/repo", string(TaskBlocked))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blocked) != 1 || blocked[0].ID != stranded.taskID {
+		t.Fatalf("blocked tasks = %+v, want only %s", blocked, stranded.taskID)
 	}
 }
 
