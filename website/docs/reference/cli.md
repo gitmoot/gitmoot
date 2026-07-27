@@ -29,6 +29,19 @@ running job whose directly recorded runtime PID is confirmably dead is a
 required `stuck jobs` failure; legacy jobs with no recorded PID and hosts where
 process identity cannot be verified are neutral and produce no ghost-job
 finding.
+It also reports the SQLite auto-vacuum mode. New homes use bounded incremental
+reclaim automatically. A legacy home remains a non-blocking warning until an
+operator deliberately converts it during an idle maintenance window:
+
+```sh
+sqlite3 "$HOME/.gitmoot/gitmoot.db" \
+  'PRAGMA auto_vacuum=INCREMENTAL; VACUUM;'
+```
+
+The one-time command fully rewrites the database; the daemon never runs a full
+`VACUUM` automatically. `sqlite3` is an optional operator tool, not a Gitmoot
+runtime dependency. For a non-default home, use the exact path printed by
+`gitmoot doctor`.
 
 One-shot onboarding: `gitmoot setup` registers the repo and an agent in one
 command (`--repo owner/repo --agent <name> --runtime codex|claude|shell

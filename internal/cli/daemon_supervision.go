@@ -90,6 +90,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 		if !dryRun {
 			pipeline.InstallDefaultMemoryPipelinesForDaemon(ctx, store, paths, home, stdout)
 		}
+		sqliteMaintenance := &sqliteMaintenanceState{}
 		for {
 			if err := receiveSupervisorWorkerError(workerErr); err != nil {
 				return err
@@ -112,6 +113,9 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 				}
 				if err := runGhostSessionJobReaperOnce(ctx, paths, store, time.Now().UTC(), stdout); err != nil {
 					writeLine(stdout, "ghost session-job reaper error: %s", err)
+				}
+				if err := runSQLiteIncrementalVacuumOnce(ctx, store, time.Now().UTC(), sqliteMaintenance); err != nil {
+					writeLine(stdout, "incremental sqlite vacuum error: %s", err)
 				}
 				if err := runHeartbeatScanOnce(ctx, paths, store, heartbeatEnqueue, time.Now().UTC()); err != nil {
 					writeLine(stdout, "heartbeat scan error: %s", err)
@@ -213,6 +217,7 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	} else {
 		writeLine(stdout, "default memory pipeline install disabled: %s", heartbeatPathsErr)
 	}
+	sqliteMaintenance := &sqliteMaintenanceState{}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -253,6 +258,9 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 			if err := runChatAutoRespondScanOnce(ctx, heartbeatPaths, home, store, dispatchLocalAgentJob, time.Now().UTC()); err != nil {
 				writeLine(stdout, "chat auto-respond scan error: %s", err)
 			}
+		}
+		if err := runSQLiteIncrementalVacuumOnce(ctx, store, time.Now().UTC(), sqliteMaintenance); err != nil {
+			writeLine(stdout, "incremental sqlite vacuum error: %s", err)
 		}
 		if err := pipeline.RunPipelineScanOnce(ctx, store, pipelineEnqueue, time.Now().UTC()); err != nil {
 			writeLine(stdout, "pipeline scan error: %s", err)
