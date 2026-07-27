@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -417,6 +418,161 @@ func TestMaybeRunLiveABChallengerErrorFailSafe(t *testing.T) {
 	}
 	// A live_ab_skipped job event was recorded.
 	assertLiveABSkippedEvent(t, store, job.ID)
+}
+
+func TestDispatchLiveABChallengerQuotaRecordsUnavailableWithoutBreakingChampion(t *testing.T) {
+	home, store, request, agent, _, _ := liveABFixture(t, 50)
+	ctx := context.Background()
+	paths := config.PathsForHome(home)
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = file.WriteString(`
+[org.roles."owner"]
+scope = ["*"]
+pane = "w1:p1"
+[org.roles."review"]
+parent = "owner"
+scope = ["gitmoot/*"]
+pane = "w1:p2"
+`)
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveAgentType(paths, config.AgentType{
+		Name: "planner", Runtime: runtime.ClaudeRuntime, Template: "planner", Role: "ask",
+		Capabilities: []string{"ask"}, AutonomyPolicy: runtime.AutonomyPolicyReadOnly,
+		MaxBackground: 1, IdleTimeout: "20m", JobTimeout: "45m",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	agent.Runtime = runtime.ClaudeRuntime
+	agent.RuntimeRef = runtime.LastRef
+	agent.RepoScope = "gitmoot/gitmoot"
+	agent.Capabilities = []string{"ask"}
+	if err := store.UpsertAgent(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := store.UpsertAgentInstance(ctx, db.AgentInstance{
+		Name: agent.Name, Type: "planner", Runtime: agent.Runtime, RuntimeRef: agent.RuntimeRef,
+		RepoFullName: agent.RepoScope, Role: agent.Role, TemplateID: agent.TemplateID,
+		Capabilities: agent.Capabilities, AutonomyPolicy: agent.AutonomyPolicy, State: "idle",
+		CreatedAt: now.Format(time.RFC3339Nano), LastUsedAt: now.Format(time.RFC3339Nano),
+		ExpiresAt: now.Add(time.Hour).Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	checkout := t.TempDir()
+	runGit(t, checkout, "init")
+	runGit(t, checkout, "branch", "-m", "main")
+	runGit(t, checkout, "remote", "add", "origin", "https://github.com/gitmoot/gitmoot.git")
+	seedDaemonWorkerRepo(t, store, "gitmoot/gitmoot", checkout)
+
+	request.RepoFlag = "gitmoot/gitmoot"
+	request.ActingOrgRole = "review"
+	request.OperatorOrigin = true
+	request.ExecutionPath = "agent_ask"
+	withLiveABPolicy(t, 1.0, 30)
+	withLiveABSampler(t, 0.0)
+	withLiveABInteractive(t, true)
+
+	championAdapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"Champion answer.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}
+	previousAdapterFactory := localAgentDispatchRuntimeAdapterFor
+	localAgentDispatchRuntimeAdapterFor = func(string, string, string) (runtime.Adapter, error) {
+		return championAdapter, nil
+	}
+	t.Cleanup(func() { localAgentDispatchRuntimeAdapterFor = previousAdapterFactory })
+
+	previousDeliver := skillOptABDeliver
+	var challengerAgent runtime.Agent
+	skillOptABDeliver = func(_ context.Context, deliveredAgent runtime.Agent, _ string) (string, error) {
+		challengerAgent = deliveredAgent
+		return "", errors.New("API error: You've hit your weekly limit - resets Jul 28, 1am (Europe/Berlin)")
+	}
+	t.Cleanup(func() { skillOptABDeliver = previousDeliver })
+	wake := &fakeEventWake{}
+	previousWakeFactory := newQuotaRoleUnavailableWakeClient
+	newQuotaRoleUnavailableWakeClient = func() eventWakeClient { return wake }
+	t.Cleanup(func() { newQuotaRoleUnavailableWakeClient = previousWakeFactory })
+
+	output, err := dispatchLocalAgentJob(ctx, store, request)
+	if err != nil {
+		t.Fatalf("champion success was broken by challenger quota: %v", err)
+	}
+	if output.State != string(workflow.JobSucceeded) || output.Result == nil || output.Result.Summary != "Champion answer." {
+		t.Fatalf("champion output = %+v, want succeeded Champion answer", output)
+	}
+	if challengerAgent.Runtime != runtime.ClaudeRuntime || challengerAgent.Name != agent.Name || challengerAgent.RuntimeRef != "" {
+		t.Fatalf("challenger delivery agent = %+v", challengerAgent)
+	}
+	incident, found, err := store.GetActiveOrgRoleUnavailable(ctx, "review", time.Now().UTC())
+	if err != nil || !found || incident.EscalatedAt == "" {
+		t.Fatalf("challenger quota incident = %+v found=%v err=%v", incident, found, err)
+	}
+	if wake.promptCalls != 1 {
+		t.Fatalf("challenger quota escalation calls = %d, want 1", wake.promptCalls)
+	}
+	assertLiveABSkippedEvent(t, store, output.JobID)
+}
+
+func TestMaybeRunLiveABChallengerSuccessDoesNotClearConcurrentIncident(t *testing.T) {
+	_, store, request, agent, job, _ := liveABFixture(t, 50)
+	ctx := context.Background()
+	request.ActingOrgRole = "review"
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload.ActingOrgRole = "review"
+	if err := store.UpdateJobPayload(ctx, job.ID, mustJobPayload(t, payload)); err != nil {
+		t.Fatal(err)
+	}
+	job, err = store.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := store.UpsertOrgRoleUnavailable(ctx, "review", "quota", now.Add(time.Hour), now); err != nil {
+		t.Fatal(err)
+	}
+
+	withLiveABPolicy(t, 1.0, 30)
+	withLiveABSampler(t, 0.0)
+	withLiveABInteractive(t, true)
+	withLiveABPresenter(t, skillOptABChampionLabel, skillOptABChallengerLabel, true)
+	previousDeliver := skillOptABDeliver
+	sawChampionClear := false
+	skillOptABDeliver = func(_ context.Context, _ runtime.Agent, _ string) (string, error) {
+		if _, found, err := store.GetActiveOrgRoleUnavailable(ctx, "review", time.Now().UTC()); err != nil {
+			t.Errorf("read incident in challenger: %v", err)
+		} else {
+			sawChampionClear = !found
+		}
+		concurrentNow := time.Now().UTC()
+		if err := store.UpsertOrgRoleUnavailable(ctx, "review", "quota", concurrentNow.Add(time.Hour), concurrentNow); err != nil {
+			t.Errorf("seed concurrent incident: %v", err)
+		}
+		return "Challenger answer.", nil
+	}
+	t.Cleanup(func() { skillOptABDeliver = previousDeliver })
+
+	champion := &liveABChampionAdapter{summary: "Champion answer."}
+	handled, err := maybeRunLiveAB(ctx, store, request, agent, job, champion, true)
+	if err != nil || !handled {
+		t.Fatalf("maybeRunLiveAB handled=%v err=%v", handled, err)
+	}
+	if !sawChampionClear {
+		t.Fatal("challenger did not observe the champion's canonical success-clear")
+	}
+	if incident, found, err := store.GetActiveOrgRoleUnavailable(ctx, "review", time.Now().UTC()); err != nil || !found {
+		t.Fatalf("successful challenger cleared concurrent incident = %+v found=%v err=%v", incident, found, err)
+	}
 }
 
 // TestMaybeRunLiveABNoPickFailSafe: when the presenter captures no pick (non-

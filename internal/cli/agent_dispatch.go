@@ -495,8 +495,8 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 				recordRuntimeOutcome(err)
 				return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, err)
 			}
+			recordRuntimeOutcome(nil)
 		}
-		recordRuntimeOutcome(nil)
 		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_completed", Message: "workflow advancement completed"}); err != nil {
 			return localAgentJobOutput{}, err
 		}
