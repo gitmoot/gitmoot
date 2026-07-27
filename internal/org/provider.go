@@ -21,8 +21,18 @@ const (
 )
 
 type RoleLiveState struct {
-	State  LifecycleState `json:"state"`
-	Detail string         `json:"detail,omitempty"`
+	State    LifecycleState `json:"state"`
+	Detail   string         `json:"detail,omitempty"`
+	Activity *RoleActivity  `json:"activity,omitempty"`
+}
+
+// RoleActivity identifies a completed provider turn. A nil *RoleActivity means
+// the provider did not report turn activity; callers must not treat that as a
+// zero-valued or stale turn.
+type RoleActivity struct {
+	Turn        int64     `json:"turn"`
+	TurnEpoch   int64     `json:"turn_epoch"`
+	CompletedAt time.Time `json:"completed_at"`
 }
 
 type Snapshot struct {

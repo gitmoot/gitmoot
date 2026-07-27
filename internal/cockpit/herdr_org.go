@@ -45,10 +45,17 @@ type herdrOrgSnapshotResult struct {
 }
 
 type herdrOrgPane struct {
-	PaneID       string `json:"pane_id"`
-	Label        string `json:"label"`
-	AgentStatus  string `json:"agent_status"`
-	InputPending bool   `json:"input_pending"`
+	PaneID            string                  `json:"pane_id"`
+	Label             string                  `json:"label"`
+	AgentStatus       string                  `json:"agent_status"`
+	InputPending      bool                    `json:"input_pending"`
+	LastCompletedTurn *herdrCompletedTurnWire `json:"last_completed_turn"`
+}
+
+type herdrCompletedTurnWire struct {
+	Turn            *int64 `json:"turn"`
+	TurnEpoch       *int64 `json:"turn_epoch"`
+	CompletedUnixMS *int64 `json:"completed_unix_ms"`
 }
 
 func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
@@ -130,6 +137,17 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 	return org.Snapshot{States: states, ObservedAt: now().UTC(), ProviderVersion: version}, nil
 }
 
+func mapHerdrCompletedTurn(turn *herdrCompletedTurnWire) *org.RoleActivity {
+	if turn == nil || turn.Turn == nil || turn.TurnEpoch == nil || turn.CompletedUnixMS == nil {
+		return nil
+	}
+	return &org.RoleActivity{
+		Turn:        *turn.Turn,
+		TurnEpoch:   *turn.TurnEpoch,
+		CompletedAt: time.UnixMilli(*turn.CompletedUnixMS).UTC(),
+	}
+}
+
 // Recycle starts a fresh interactive agent in a pane that has already returned
 // to its shell prompt. Herdr cannot safely prove or cause that transition, so
 // winding down the prior agent remains an explicit operator precondition.
@@ -178,14 +196,17 @@ func herdrKindSupportsModelFlag(kind string) bool {
 }
 
 func mapHerdrPaneState(pane herdrOrgPane) org.RoleLiveState {
+	state := mapHerdrAgentStatus(pane.AgentStatus)
+	state.Activity = mapHerdrCompletedTurn(pane.LastCompletedTurn)
 	// input_pending is orthogonal to Herdr's agent_status enum
 	// (idle/working/blocked/done/unknown). It wins whenever true because an
 	// interactive dialog prevents forward progress even if the last activity
 	// detector still reports idle or working.
 	if pane.InputPending {
-		return org.RoleLiveState{State: org.StateInputPending}
+		state.State = org.StateInputPending
+		state.Detail = ""
 	}
-	return mapHerdrAgentStatus(pane.AgentStatus)
+	return state
 }
 
 func mapHerdrAgentStatus(raw string) org.RoleLiveState {
