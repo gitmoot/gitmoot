@@ -77,12 +77,12 @@ func (r WrappingRunner) RunWithPID(ctx context.Context, dir string, onPID PIDCal
 		if inner, ok := r.inner().(EnvPIDRunner); ok {
 			return inner.RunEnvWithPID(ctx, dir, r.Env, onPID, executable, wrapped...)
 		}
-		return Result{}, errors.New("wrapped runner does not support environment PID capture")
+		return r.Run(ctx, dir, command, args...)
 	}
 	if inner, ok := r.inner().(PIDRunner); ok {
 		return inner.RunWithPID(ctx, dir, onPID, executable, wrapped...)
 	}
-	return Result{}, errors.New("wrapped runner does not support PID capture")
+	return r.inner().Run(ctx, dir, executable, wrapped...)
 }
 
 func (r WrappingRunner) RunStream(ctx context.Context, dir string, out io.Writer, command string, args ...string) (Result, error) {
@@ -111,7 +111,7 @@ func (r WrappingRunner) RunStreamWithPID(ctx context.Context, dir string, out io
 		if inner, ok := r.inner().(EnvPIDStreamRunner); ok {
 			return inner.RunEnvStreamWithPID(ctx, dir, r.Env, out, onPID, executable, wrapped...)
 		}
-		return Result{}, errors.New("wrapped streaming runner does not support environment PID capture")
+		return r.RunStream(ctx, dir, out, command, args...)
 	}
 	if inner, ok := r.inner().(PIDStreamRunner); ok {
 		return inner.RunStreamWithPID(ctx, dir, out, onPID, executable, wrapped...)
@@ -121,7 +121,7 @@ func (r WrappingRunner) RunStreamWithPID(ctx context.Context, dir string, out io
 			return inner.RunWithPID(ctx, dir, onPID, executable, wrapped...)
 		}
 	}
-	return Result{}, errors.New("wrapped streaming runner does not support PID capture")
+	return r.RunStream(ctx, dir, out, command, args...)
 }
 
 func (r WrappingRunner) RunEnv(ctx context.Context, dir string, env []string, command string, args ...string) (Result, error) {
@@ -155,7 +155,7 @@ func (r WrappingRunner) RunEnvWithPID(ctx context.Context, dir string, env []str
 			return inner.RunWithPID(ctx, dir, onPID, executable, wrapped...)
 		}
 	}
-	return Result{}, errors.New("wrapped runner does not support environment PID capture")
+	return r.RunEnv(ctx, dir, env, command, args...)
 }
 
 func (r WrappingRunner) LookPath(file string) (string, error) {

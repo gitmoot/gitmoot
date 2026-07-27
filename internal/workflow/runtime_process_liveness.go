@@ -28,15 +28,21 @@ func runtimeProcessLiveness(pid int, identity, procRoot string) (live bool, know
 	if pid <= 0 {
 		return false, false
 	}
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return false, false
+	}
+	// Distinguish an unavailable process table (for example macOS has no /proc)
+	// from a readable process table whose specific PID entry is gone. Only the
+	// latter confirms that a process with a previously recorded identity died.
+	if _, err := os.Stat(procRoot); err != nil {
+		return false, false
+	}
 	current, err := runtimeProcessIdentity(pid, procRoot)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return false, true
 		}
-		return false, false
-	}
-	identity = strings.TrimSpace(identity)
-	if identity == "" {
 		return false, false
 	}
 	return current == identity, true

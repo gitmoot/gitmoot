@@ -74,7 +74,7 @@ func TestMailboxPersistsActingOrgRoleProvenance(t *testing.T) {
 	}
 }
 
-func TestMailboxPersistsCapturedRuntimePIDInPayload(t *testing.T) {
+func TestMailboxPersistsRuntimePIDOnlyWhileDeliveryRuns(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	mailbox := Mailbox{Store: store}
@@ -85,6 +85,19 @@ func TestMailboxPersistsCapturedRuntimePIDInPayload(t *testing.T) {
 	}
 	adapter := &fakeDelivery{
 		pid: os.Getpid(),
+		onDeliver: func() {
+			stored, err := store.GetJob(ctx, "pid-job")
+			if err != nil {
+				t.Fatalf("GetJob during delivery: %v", err)
+			}
+			payload, err := ParseJobPayload(stored.Payload)
+			if err != nil {
+				t.Fatalf("ParseJobPayload during delivery: %v", err)
+			}
+			if payload.RuntimePID != os.Getpid() || payload.RuntimePIDStartTime == "" {
+				t.Fatalf("runtime identity during delivery = pid %d start %q, want pid %d with starttime", payload.RuntimePID, payload.RuntimePIDStartTime, os.Getpid())
+			}
+		},
 		outputs: []string{
 			`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 		},
@@ -100,8 +113,70 @@ func TestMailboxPersistsCapturedRuntimePIDInPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseJobPayload: %v", err)
 	}
-	if payload.RuntimePID != os.Getpid() || payload.RuntimePIDStartTime == "" {
-		t.Fatalf("stored runtime identity = pid %d start %q, want pid %d with starttime", payload.RuntimePID, payload.RuntimePIDStartTime, os.Getpid())
+	if payload.RuntimePID != 0 || payload.RuntimePIDStartTime != "" {
+		t.Fatalf("runtime identity after delivery = pid %d start %q, want cleared", payload.RuntimePID, payload.RuntimePIDStartTime)
+	}
+}
+
+func TestMailboxClearsRuntimePIDBeforeProduceCheck(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	dir := t.TempDir()
+	started := filepath.Join(dir, "check.started")
+	release := filepath.Join(dir, "check.release")
+	mailbox := Mailbox{Store: store, produceCheckTimeout: 5 * time.Second}
+	if _, err := mailbox.Enqueue(ctx, JobRequest{
+		ID: "produce-pid-window", Agent: "producer", Action: "produce", Repo: "owner/repo",
+		Sender: PipelineJobSender, WorktreePath: dir, WritablePaths: []string{dir},
+		Check: `touch check.started; while test ! -f check.release; do sleep 0.01; done`,
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	adapter := &fakeDelivery{
+		pid: os.Getpid(),
+		outputs: []string{
+			`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		},
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := mailbox.Run(ctx, "produce-pid-window", runtime.Agent{Name: "producer", Runtime: runtime.KimiRuntime, RuntimeRef: "fresh:produce-pid-window"}, adapter)
+		done <- err
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("produce check did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	stored, err := store.GetJob(ctx, "produce-pid-window")
+	if err != nil {
+		t.Fatalf("GetJob during produce check: %v", err)
+	}
+	payload, err := ParseJobPayload(stored.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload during produce check: %v", err)
+	}
+	if stored.State != string(JobRunning) || payload.RuntimePID != 0 || payload.RuntimePIDStartTime != "" {
+		t.Fatalf("produce check window = state %q pid %d start %q, want running with no runtime identity", stored.State, payload.RuntimePID, payload.RuntimePIDStartTime)
+	}
+	if live, known := RuntimeProcessLiveness(payload.RuntimePID, payload.RuntimePIDStartTime); live || known {
+		t.Fatalf("produce-check runtime liveness = (%v, %v), want neutral unknown", live, known)
+	}
+	if err := os.WriteFile(release, []byte("go"), 0o600); err != nil {
+		t.Fatalf("release produce check: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Mailbox.Run: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Mailbox.Run did not finish after produce check release")
 	}
 }
 

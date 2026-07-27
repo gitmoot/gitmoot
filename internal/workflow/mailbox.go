@@ -1387,6 +1387,14 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		delivery.RuntimeDefaultEffort = m.RuntimeDefaultEffort(agent.Runtime)
 	}
 	result, err := adapter.Deliver(ctx, agent, delivery)
+	// The recorded identity describes only a process that is currently executing
+	// this delivery. Clear it immediately when Deliver returns, before parsing,
+	// retry backoff, or a produce check keeps the job legitimately running without
+	// a runtime subprocess. Best-effort persistence mirrors the start callback:
+	// observability must never change the delivery result.
+	payload.RuntimePID = 0
+	payload.RuntimePIDStartTime = ""
+	_ = m.savePayload(ctx, job.ID, *payload)
 	// Record best-effort runtime token usage so the per-root delegation token
 	// budget (#338 Part B) can sum a tree's cost. Usage accounting must never fail
 	// a delivery, so every write error here is swallowed.

@@ -39,4 +39,10 @@ func TestRuntimeProcessLivenessUsesRecordedStartTime(t *testing.T) {
 	if live, known := runtimeProcessLiveness(pid, "", procRoot); live || known {
 		t.Fatalf("missing identity liveness = (%v, %v), want unknown", live, known)
 	}
+	if live, known := runtimeProcessLiveness(9999, "", procRoot); live || known {
+		t.Fatalf("missing PID with no recorded identity liveness = (%v, %v), want unknown", live, known)
+	}
+	if live, known := runtimeProcessLiveness(pid, identity, filepath.Join(procRoot, "no-proc")); live || known {
+		t.Fatalf("unavailable process table liveness = (%v, %v), want unknown", live, known)
+	}
 }
