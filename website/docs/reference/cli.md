@@ -186,6 +186,14 @@ For structured local state, use `gitmoot dashboard --json` or
 `gitmoot task list --repo owner/repo --json`. `gitmoot status --json` and
 `gitmoot task show` are not valid commands.
 
+`gitmoot daemon status` always prints the configured daemon log path. For a
+running daemon, it also compares that file's last write with the daemon's
+recorded start time. A missing file or an older last write produces a warning
+with both times and suggests
+`journalctl --user -u gitmoot-daemon -f` if the daemon runs under systemd.
+`gitmoot doctor` reports the same confirmed condition as a non-fatal
+`daemon log` check. Fresh, stopped, and indeterminate cases add no output.
+
 ### Build Skew (Upgraded But Not Restarted)
 
 The daemon is a long-lived process: replacing the binary does **not** change the

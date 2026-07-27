@@ -567,6 +567,9 @@ func runDaemonStatus(args []string, stdout, stderr io.Writer) int {
 	writeLine(stdout, "log: %s", state.LogFile)
 	if pid > 0 {
 		if meta, err := readDaemonMeta(state); err == nil {
+			if warning := daemonLogWarning(state.LogFile, meta.StartedAt); warning != "" {
+				writeLine(stdout, "WARNING: %s", warning)
+			}
 			writeLine(stdout, "build: %s", daemonBuildLabel(meta))
 			if check := daemonBuildCheck(paths); !check.OK {
 				writeLine(stdout, "WARNING: %s", check.Detail)
