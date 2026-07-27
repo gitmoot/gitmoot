@@ -3,7 +3,9 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,6 +16,58 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 )
+
+type workflowShowMidCallCreateStore struct {
+	*db.Store
+	created   bool
+	listCalls int
+}
+
+type workflowShowPostSummaryInsertStore struct {
+	*db.Store
+	insertCount int
+}
+
+func (s *workflowShowPostSummaryInsertStore) WorkflowSummary(ctx context.Context, label string) (db.WorkflowSummary, error) {
+	summary, err := s.Store.WorkflowSummary(ctx, label)
+	if err != nil {
+		return summary, err
+	}
+	for i := 0; i < s.insertCount; i++ {
+		if _, insertErr := s.Store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: label,
+			Author:     "operator",
+			Body:       fmt.Sprintf("post-summary-%d", i),
+		}); insertErr != nil {
+			return db.WorkflowSummary{}, fmt.Errorf("insert post-summary note: %w", insertErr)
+		}
+	}
+	return summary, nil
+}
+
+func (s *workflowShowMidCallCreateStore) WorkflowSummary(ctx context.Context, label string) (db.WorkflowSummary, error) {
+	summary, err := s.Store.WorkflowSummary(ctx, label)
+	if errors.Is(err, sql.ErrNoRows) && !s.created {
+		s.created = true
+		if createErr := s.Store.CreateJob(ctx, db.Job{
+			ID: "mid-call-job", Agent: "worker", Type: "ask", State: "succeeded",
+			Payload: `{"repo":"acme/widget","workflow_id":"release/mid-call"}`,
+		}); createErr != nil {
+			return db.WorkflowSummary{}, fmt.Errorf("create workflow mid-call: %w", createErr)
+		}
+	}
+	return summary, err
+}
+
+func (s *workflowShowMidCallCreateStore) ListJobsByWorkflow(ctx context.Context, label string, limit int) ([]db.Job, error) {
+	s.listCalls++
+	return s.Store.ListJobsByWorkflow(ctx, label, limit)
+}
+
+func (s *workflowShowMidCallCreateStore) ListWorkflowNotes(ctx context.Context, label string, limit int) ([]db.WorkflowNote, error) {
+	s.listCalls++
+	return s.Store.ListWorkflowNotes(ctx, label, limit)
+}
 
 func TestWorkflowFlagParsesOnAllAgentVerbs(t *testing.T) {
 	for _, command := range []string{"run", "review", "implement", "orchestrate"} {
@@ -80,12 +134,75 @@ func TestWorkflowFlagParsesOnAllAgentVerbs(t *testing.T) {
 
 func TestMergeWorkflowTimelineDeterministicKindAndIDTieBreak(t *testing.T) {
 	jobs := []db.Job{{ID: "b", CreatedAt: "2026-01-01 00:00:00"}, {ID: "a", CreatedAt: "2026-01-01 00:00:00"}}
-	notes := []db.WorkflowNote{{ID: 2, CreatedAt: "2026-01-01 00:00:00"}, {ID: 1, CreatedAt: "2026-01-01 00:00:00"}}
+	notes := []db.WorkflowNote{{ID: 10, CreatedAt: "2026-01-01 00:00:00"}, {ID: 9, CreatedAt: "2026-01-01 00:00:00"}}
 	entries := mergeWorkflowTimeline(jobs, notes)
-	want := []string{"job:a", "job:b", "note:1", "note:2"}
+	want := []string{"job:a", "job:b", "note:9", "note:10"}
 	for i, entry := range entries {
 		if got := entry.Kind + ":" + entry.ID; got != want[i] {
 			t.Fatalf("entries[%d] = %q, want %q", i, got, want[i])
+		}
+	}
+}
+
+func TestWorkflowShowTiedNoteIDsKeepsNumericNewest(t *testing.T) {
+	home, store := workflowJournalTestHome(t)
+	ctx := context.Background()
+	const workflowID = "release-tied-notes"
+	notes := make([]db.WorkflowNote, 0, 10)
+	for i := 1; i <= 10; i++ {
+		note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: workflowID,
+			Author:     "operator",
+			Body:       fmt.Sprintf("note-%02d", i),
+		})
+		if err != nil {
+			t.Fatalf("InsertWorkflowNote(%d): %v", i, err)
+		}
+		notes = append(notes, note)
+	}
+	if notes[8].ID != 9 || notes[9].ID != 10 {
+		t.Fatalf("note IDs = %d and %d, want digit-boundary IDs 9 and 10", notes[8].ID, notes[9].ID)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "later-job", Agent: "worker", Type: "ask", State: "succeeded",
+		Payload: `{"repo":"acme/widget","workflow_id":"release-tied-notes"}`,
+	}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer raw.Close()
+	if _, err := raw.ExecContext(ctx,
+		`UPDATE workflow_notes SET created_at = CASE WHEN id IN (?, ?) THEN ? ELSE ? END WHERE workflow_id = ?`,
+		notes[8].ID, notes[9].ID, "2026-07-27 12:00:00", "2026-07-27 11:00:00", workflowID); err != nil {
+		t.Fatalf("set note timestamps: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx,
+		`UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`,
+		"2026-07-27 12:01:00", "2026-07-27 12:01:00", "later-job"); err != nil {
+		t.Fatalf("set job timestamp: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := runWorkflowShow([]string{workflowID, "--home", home, "--limit", "2", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("workflow show exit=%d stderr=%q", code, stderr.String())
+	}
+	var out workflowShowJSON
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("decode JSON: %v raw=%s", err, stdout.String())
+	}
+	if len(out.Entries) != 2 || !out.Truncated {
+		t.Fatalf("entries=%+v truncated=%v", out.Entries, out.Truncated)
+	}
+	if out.Entries[0].Kind != "note" || out.Entries[0].Note == nil || out.Entries[0].Note.ID != 10 {
+		t.Fatalf("numeric-newest tied note did not survive: %+v", out.Entries)
+	}
+	for _, entry := range out.Entries {
+		if entry.Note != nil && entry.Note.ID == 9 {
+			t.Fatalf("numeric-older tied note survived instead: %+v", out.Entries)
 		}
 	}
 }
@@ -103,6 +220,370 @@ func workflowJournalTestHome(t *testing.T) (string, *db.Store) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	return home, store
+}
+
+func TestLoadWorkflowShowNotFoundWinsWhenWorkflowCreatedMidCall(t *testing.T) {
+	_, store := workflowJournalTestHome(t)
+	ctx := context.Background()
+	const workflowID = "release/mid-call"
+	wrapped := &workflowShowMidCallCreateStore{Store: store}
+
+	_, err := loadWorkflowShow(ctx, wrapped, workflowID, 4)
+	if err == nil || err.Error() != `workflow "release/mid-call" not found` {
+		t.Fatalf("loadWorkflowShow error = %v, want clean not-found error", err)
+	}
+	if !wrapped.created {
+		t.Fatal("workflow was not created during the summary lookup")
+	}
+	if wrapped.listCalls != 0 {
+		t.Fatalf("list calls after summary not-found = %d, want 0", wrapped.listCalls)
+	}
+	summary, err := store.WorkflowSummary(ctx, workflowID)
+	if err != nil || summary.JobCount != 1 {
+		t.Fatalf("mid-call workflow summary = %+v, err=%v", summary, err)
+	}
+}
+
+func TestWorkflowShowOverfetchBoundary(t *testing.T) {
+	const displayLimit = 3
+	for _, tc := range []struct {
+		name          string
+		entryCount    int
+		limit         int
+		wantShown     int
+		wantFirstID   string
+		wantTruncated bool
+	}{
+		{name: "limit-plus-one", entryCount: displayLimit + 1, limit: displayLimit, wantShown: displayLimit, wantFirstID: "2", wantTruncated: true},
+		{name: "exact-limit", entryCount: displayLimit, limit: displayLimit, wantShown: displayLimit, wantFirstID: "1"},
+		{name: "limit-minus-one", entryCount: displayLimit - 1, limit: displayLimit, wantShown: displayLimit - 1, wantFirstID: "1"},
+		{name: "unbounded", entryCount: displayLimit + 1, limit: 0, wantShown: displayLimit + 1, wantFirstID: "1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home, store := workflowJournalTestHome(t)
+			ctx := context.Background()
+			const workflowID = "release/overfetch"
+			for i := 1; i <= tc.entryCount; i++ {
+				if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+					WorkflowID: workflowID,
+					Author:     "operator",
+					Body:       fmt.Sprintf("note-%d", i),
+				}); err != nil {
+					t.Fatalf("InsertWorkflowNote(%d): %v", i, err)
+				}
+			}
+
+			var stdout, stderr bytes.Buffer
+			if code := runWorkflowShow([]string{
+				workflowID, "--home", home, "--limit", fmt.Sprintf("%d", tc.limit), "--json",
+			}, &stdout, &stderr); code != 0 {
+				t.Fatalf("workflow show exit=%d stderr=%q", code, stderr.String())
+			}
+			var out workflowShowJSON
+			if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+				t.Fatalf("decode JSON: %v raw=%s", err, stdout.String())
+			}
+			if out.Truncated != tc.wantTruncated || len(out.Entries) != tc.wantShown {
+				t.Fatalf("truncated=%v entries=%d, want truncated=%v entries=%d",
+					out.Truncated, len(out.Entries), tc.wantTruncated, tc.wantShown)
+			}
+			if len(out.Entries) == 0 || out.Entries[0].ID != tc.wantFirstID {
+				t.Fatalf("first entry = %+v, want ID %s", out.Entries, tc.wantFirstID)
+			}
+		})
+	}
+}
+
+func TestWorkflowShowClampsStaleSummaryTotalAfterPostSummaryInsert(t *testing.T) {
+	originalLoader := workflowShowLoader
+	workflowShowLoader = func(ctx context.Context, store workflowShowStore, label string, fetchLimit int) (workflowShowData, error) {
+		concrete, ok := store.(*db.Store)
+		if !ok {
+			t.Fatalf("workflow show store type = %T, want *db.Store", store)
+		}
+		return loadWorkflowShow(ctx, &workflowShowPostSummaryInsertStore{
+			Store: concrete, insertCount: 2,
+		}, label, fetchLimit)
+	}
+	t.Cleanup(func() { workflowShowLoader = originalLoader })
+
+	run := func(t *testing.T, jsonOutput bool) (string, string) {
+		t.Helper()
+		home, store := workflowJournalTestHome(t)
+		const workflowID = "release/stale-summary"
+		if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+			WorkflowID: workflowID,
+			Author:     "operator",
+			Body:       "summary-visible-note",
+		}); err != nil {
+			t.Fatalf("InsertWorkflowNote: %v", err)
+		}
+		args := []string{workflowID, "--home", home, "--limit", "2"}
+		if jsonOutput {
+			args = append(args, "--json")
+		}
+		var stdout, stderr bytes.Buffer
+		if code := runWorkflowShow(args, &stdout, &stderr); code != 0 {
+			t.Fatalf("workflow show exit=%d stderr=%q", code, stderr.String())
+		}
+		return stdout.String(), stderr.String()
+	}
+
+	text, notice := run(t, false)
+	if got := strings.Count(text, "\tnote\t"); got != 2 {
+		t.Fatalf("shown note rows = %d, want 2; output=%q", got, text)
+	}
+	wantNotice := "workflow show: showing the latest 2 of 3 entries (0 jobs, 3 notes); pass --limit 0 for all or a larger --limit N\n"
+	if notice != wantNotice {
+		t.Fatalf("stale-summary truncation notice = %q, want %q", notice, wantNotice)
+	}
+
+	rawJSON, jsonStderr := run(t, true)
+	if jsonStderr != "" {
+		t.Fatalf("JSON stderr = %q", jsonStderr)
+	}
+	var out workflowShowJSON
+	if err := json.Unmarshal([]byte(rawJSON), &out); err != nil {
+		t.Fatalf("decode JSON: %v raw=%s", err, rawJSON)
+	}
+	if !out.Truncated || len(out.Entries) != 2 || out.Summary.NoteCount != 1 {
+		t.Fatalf("JSON output = %+v", out)
+	}
+}
+
+func seedWorkflowShowRecencyFixture(t *testing.T) (string, *db.Store) {
+	t.Helper()
+	home, store := workflowJournalTestHome(t)
+	ctx := context.Background()
+	const workflowID = "release-recency"
+	jobTimes := map[string]string{
+		"job-oldest": "2026-07-20 08:00:00",
+		"job-middle": "2026-07-22 12:00:00",
+		"job-newest": "2026-07-27 11:00:00",
+	}
+	for id := range jobTimes {
+		if err := store.CreateJob(ctx, db.Job{
+			ID: id, Agent: "worker", Type: "ask", State: "succeeded",
+			Payload: `{"repo":"acme/widget","workflow_id":"release-recency"}`,
+		}); err != nil {
+			t.Fatalf("CreateJob(%s): %v", id, err)
+		}
+	}
+	noteTimes := []struct {
+		body      string
+		createdAt string
+	}{
+		{"note-oldest", "2026-07-21 09:00:00"},
+		{"note-newer", "2026-07-26 19:06:00"},
+		{"note-latest", "2026-07-27 12:03:00"},
+	}
+	noteIDs := make(map[string]int64, len(noteTimes))
+	for _, item := range noteTimes {
+		note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: workflowID, Author: "operator", Body: item.body,
+		})
+		if err != nil {
+			t.Fatalf("InsertWorkflowNote(%s): %v", item.body, err)
+		}
+		noteIDs[item.body] = note.ID
+	}
+
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer raw.Close()
+	for id, createdAt := range jobTimes {
+		if _, err := raw.ExecContext(ctx,
+			`UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`,
+			createdAt, createdAt, id); err != nil {
+			t.Fatalf("set job %s timestamp: %v", id, err)
+		}
+	}
+	for _, item := range noteTimes {
+		if _, err := raw.ExecContext(ctx,
+			`UPDATE workflow_notes SET created_at = ? WHERE id = ?`,
+			item.createdAt, noteIDs[item.body]); err != nil {
+			t.Fatalf("set note %s timestamp: %v", item.body, err)
+		}
+	}
+	return home, store
+}
+
+func TestWorkflowShowKeepsNewestEntriesAndReportsTextTruncation(t *testing.T) {
+	home, store := seedWorkflowShowRecencyFixture(t)
+
+	var stdout, stderr bytes.Buffer
+	if code := runWorkflowShow([]string{"release-recency", "--home", home, "--limit", "3"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("workflow show exit=%d stderr=%q", code, stderr.String())
+	}
+	text := stdout.String()
+	if strings.Contains(text, "\tjob\tjob-oldest\t") || strings.Contains(text, "\toperator\tnote-oldest\n") {
+		t.Fatalf("oldest entries were not truncated: %q", text)
+	}
+	if !strings.Contains(text, "\tnote\t") || !strings.Contains(text, "note-latest") ||
+		!strings.Contains(text, "jobs: 3\nnotes: 3\n") {
+		t.Fatalf("newest entry or summary counts missing: %q", text)
+	}
+	if got := stderr.String(); !strings.Contains(got, "showing the latest 3 of 6 entries (3 jobs, 3 notes)") ||
+		!strings.Contains(got, "pass --limit 0 for all") {
+		t.Fatalf("truncation notice = %q", got)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := runWorkflowShow([]string{"release-recency", "--home", home, "--limit", "0"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("workflow show --limit 0 exit=%d stderr=%q", code, stderr.String())
+	}
+	if got := strings.Count(stdout.String(), "\tjob\t") + strings.Count(stdout.String(), "\tnote\t"); got != 6 {
+		t.Fatalf("--limit 0 row count = %d, want 6; output=%q", got, stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("--limit 0 truncation notice = %q", stderr.String())
+	}
+
+	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+		WorkflowID: "release-small", Author: "operator", Body: "only-note",
+	}); err != nil {
+		t.Fatalf("InsertWorkflowNote(small): %v", err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := runWorkflowShow([]string{"release-small", "--home", home, "--limit", "3"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("small workflow show exit=%d stderr=%q", code, stderr.String())
+	}
+	if stderr.Len() != 0 || !strings.Contains(stdout.String(), "only-note") {
+		t.Fatalf("small workflow output=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestWorkflowShowJSONAnnouncesOnlyActualTruncation(t *testing.T) {
+	home, store := seedWorkflowShowRecencyFixture(t)
+
+	var stdout, stderr bytes.Buffer
+	if code := runWorkflowShow([]string{"release-recency", "--home", home, "--limit", "3", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("truncated JSON show exit=%d stderr=%q", code, stderr.String())
+	}
+	var out workflowShowJSON
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("decode truncated JSON: %v raw=%s", err, stdout.String())
+	}
+	if !out.Truncated || len(out.Entries) != 3 ||
+		out.Summary.JobCount+out.Summary.NoteCount != 6 {
+		t.Fatalf("truncated JSON = %+v", out)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(stdout.Bytes(), &raw); err != nil {
+		t.Fatalf("decode truncated JSON fields: %v", err)
+	}
+	if _, ok := raw["truncated"]; !ok {
+		t.Fatalf("truncated field omitted from truncated JSON: %s", stdout.String())
+	}
+
+	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+		WorkflowID: "release-small-json", Author: "operator", Body: "only-note",
+	}); err != nil {
+		t.Fatalf("InsertWorkflowNote(small JSON): %v", err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := runWorkflowShow([]string{"release-small-json", "--home", home, "--limit", "3", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("small JSON show exit=%d stderr=%q", code, stderr.String())
+	}
+	out = workflowShowJSON{}
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil || out.Truncated {
+		t.Fatalf("small JSON = %+v err=%v raw=%s", out, err, stdout.String())
+	}
+	raw = nil
+	if err := json.Unmarshal(stdout.Bytes(), &raw); err != nil {
+		t.Fatalf("decode small JSON fields: %v", err)
+	}
+	if _, ok := raw["truncated"]; ok {
+		t.Fatalf("truncated field present for complete window: %s", stdout.String())
+	}
+}
+
+func TestWorkflowShowDefaultLimitWithAsymmetricSources(t *testing.T) {
+	home, store := workflowJournalTestHome(t)
+	ctx := context.Background()
+	const workflowID = "release-asymmetric"
+	base := time.Date(2026, 7, 20, 8, 0, 0, 0, time.UTC)
+	for i := 0; i < 105; i++ {
+		id := fmt.Sprintf("job-%03d", i)
+		if err := store.CreateJob(ctx, db.Job{
+			ID: id, Agent: "worker", Type: "ask", State: "succeeded",
+			Payload: `{"repo":"acme/widget","workflow_id":"release-asymmetric"}`,
+		}); err != nil {
+			t.Fatalf("CreateJob(%s): %v", id, err)
+		}
+	}
+	noteIDs := make([]int64, 0, 3)
+	for i := 0; i < 3; i++ {
+		note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: workflowID, Author: "operator", Body: fmt.Sprintf("note-%d", i),
+		})
+		if err != nil {
+			t.Fatalf("InsertWorkflowNote(%d): %v", i, err)
+		}
+		noteIDs = append(noteIDs, note.ID)
+	}
+
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer raw.Close()
+	tx, err := raw.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	for i := 0; i < 105; i++ {
+		id := fmt.Sprintf("job-%03d", i)
+		createdAt := base.Add(time.Duration(i) * time.Minute).Format("2006-01-02 15:04:05")
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`,
+			createdAt, createdAt, id); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("set job %s timestamp: %v", id, err)
+		}
+	}
+	for i, id := range noteIDs {
+		createdAt := base.Add(time.Duration(105+i) * time.Minute).Format("2006-01-02 15:04:05")
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE workflow_notes SET created_at = ? WHERE id = ?`,
+			createdAt, id); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("set note %d timestamp: %v", id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := runWorkflowShow([]string{workflowID, "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("workflow show exit=%d stderr=%q", code, stderr.String())
+	}
+	var out workflowShowJSON
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("decode JSON: %v raw=%s", err, stdout.String())
+	}
+	if !out.Truncated || len(out.Entries) != 100 ||
+		out.Summary.JobCount != 105 || out.Summary.NoteCount != 3 {
+		t.Fatalf("asymmetric output: truncated=%v entries=%d summary=%+v", out.Truncated, len(out.Entries), out.Summary)
+	}
+	seen := make(map[string]bool, len(out.Entries))
+	for _, entry := range out.Entries {
+		seen[entry.Kind+":"+entry.ID] = true
+	}
+	if seen["job:job-007"] || !seen["job:job-008"] {
+		t.Fatalf("wrong job recency boundary: job-007=%v job-008=%v", seen["job:job-007"], seen["job:job-008"])
+	}
+	for i, id := range noteIDs {
+		if !seen["note:"+fmt.Sprintf("%d", id)] {
+			t.Fatalf("newest note %d (id %d) missing from asymmetric window", i, id)
+		}
+	}
 }
 
 func TestWorkflowNoteRememberSharedDefaultAndPrefilterRollback(t *testing.T) {

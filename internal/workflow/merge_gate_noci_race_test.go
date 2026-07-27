@@ -19,7 +19,7 @@ import (
 func TestPolicyMergeGateZeroExternalCIDefersWithinGraceWindow(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "jerryfane/noted",
 		Branch:      "task-11",
 		PullRequest: 11,

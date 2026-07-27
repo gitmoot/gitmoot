@@ -24,7 +24,11 @@ actionable remediation hint) and live-probes the Claude credential selected by
 `runtime-auth.env`, so a bad credential is caught before jobs stall. Run it
 after install and before starting the daemon. It also reports delegation
 worktree count and logical disk size, warning at 10 stale worktrees or 1 GB and
-distinguishing aged-final reclaimable owners from pinned non-final owners.
+distinguishing aged-final reclaimable owners from pinned non-final owners. A
+running job whose directly recorded runtime PID is confirmably dead is a
+required `stuck jobs` failure; legacy jobs with no recorded PID and hosts where
+process identity cannot be verified are neutral and produce no ghost-job
+finding.
 It also reports the SQLite auto-vacuum mode. New homes use bounded incremental
 reclaim automatically. A legacy home remains a non-blocking warning until an
 operator deliberately converts it during an idle maintenance window:
@@ -297,6 +301,14 @@ gitmoot daemon stop
 For structured local state, use `gitmoot dashboard --json` or
 `gitmoot task list --repo owner/repo --json`. `gitmoot status --json` and
 `gitmoot task show` are not valid commands.
+
+`gitmoot daemon status` always prints the configured daemon log path. For a
+running daemon, it also compares that file's last write with the daemon's
+recorded start time. A missing file or an older last write produces a warning
+with both times and suggests
+`journalctl --user -u gitmoot-daemon -f` if the daemon runs under systemd.
+`gitmoot doctor` reports the same confirmed condition as a non-fatal
+`daemon log` check. Fresh, stopped, and indeterminate cases add no output.
 
 ### Build skew (upgraded but not restarted)
 
@@ -1348,6 +1360,10 @@ gitmoot workflow close fable/dashboard-redesign --reason "Shipped and verified."
 best-effort token totals. Its JSON summary also includes the acknowledgment
 timestamps `last_failure_at`, `last_human_note_at`, and
 `last_merged_receipt_at`. `workflow show` merges jobs and notes chronologically.
+By default it keeps the newest 100 entries and displays that window oldest to
+newest; pass `--limit 0` for the complete timeline or a larger `--limit N` for
+a wider window. When rows are omitted, text mode prints the shown and total
+counts plus that guidance to stderr, while JSON includes `"truncated": true`.
 The read-only web dashboard shows labels as Galaxy hubs and provides a Workflows
 index plus a mission-log detail at `/workflows/<label>`. Workflows are `active`
 while queued/running, `recent` when no work is live but activity occurred within
@@ -1769,6 +1785,14 @@ same detail as `process_active: worktree still has an active process`; their
 JSON forms carry `process_active: true`. The badge is omitted when no live
 process is observed, when local process liveness is unavailable, or while the
 job is still non-terminal.
+
+For a `running` job dispatched through a PID-aware runtime runner, the payload
+records `runtime_pid` plus a process-start identity. `job list --json` and `job
+show --json` derive `runtime_process_active`: `true` means that exact process is
+alive, `false` means it is confirmably gone (including PID reuse), and an omitted
+field means unknown because no PID/identity was recorded or process inspection
+is unavailable. This is direct per-job ground truth and is separate from the
+terminal worktree-scanning `process_active` badge above.
 
 Operational blockers auto-retry (#532): a delivery failure classified as an
 operational blocker — `runtime_auth`, `runtime_quota`, `network_outage`

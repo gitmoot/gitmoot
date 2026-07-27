@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -19,6 +20,27 @@ func TestRunCapturesStdout(t *testing.T) {
 	}
 	if strings.TrimSpace(result.Stdout) != "gitmoot" {
 		t.Fatalf("stdout = %q", result.Stdout)
+	}
+}
+
+func TestGroupRunnerPIDCaptureReportsStartedProcess(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("PID assertion uses a POSIX shell")
+	}
+	var captured int
+	runner := GroupRunner{}
+	result, err := runner.RunWithPID(context.Background(), "", func(pid int) {
+		captured = pid
+	}, "sh", "-c", `printf %s "$$"`)
+	if err != nil {
+		t.Fatalf("RunWithPID returned error: %v", err)
+	}
+	reported, err := strconv.Atoi(strings.TrimSpace(result.Stdout))
+	if err != nil {
+		t.Fatalf("parse child PID from stdout %q: %v", result.Stdout, err)
+	}
+	if captured <= 0 || captured != reported {
+		t.Fatalf("captured PID = %d, child reported %d", captured, reported)
 	}
 }
 
