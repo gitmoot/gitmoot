@@ -1167,8 +1167,9 @@ resolved role table.
 
 The registry uses `[org] enforce = "warn"|"block"` and
 `[org.roles."name"]` entries with `parent`, `scope`, `merge_rule`, an optional
-cosmetic `display_name`, an optional `model` runtime pin, and an optional `pane`
-Herdr binding (used by live presence and org event-rule wakes).
+cosmetic `display_name`, an optional `model` runtime pin, an optional per-role
+`recycle_after` duration override, and an optional `pane` Herdr binding (used by
+live presence and org event-rule wakes).
 The binding resolves as an exact live pane label first, then as a literal pane
 id; roles without a binding retain exact role-name-as-label presence lookup. There is
 exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
