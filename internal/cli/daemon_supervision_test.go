@@ -17,31 +17,93 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-func TestRunForeignBootRecoveryAtCurrentTimeUsesInvocationTimestamp(t *testing.T) {
-	ctx := context.Background()
-	store := daemonWorkerStore(t)
-	tracker := newInflightJobTracker(ctx)
-	defer tracker.drain(io.Discard, time.Second)
-
-	// Model the timestamp captured before a slow poll. Both supervisor loops call
-	// the helper only after polling, so a correct helper must replace this stale
-	// value with one captured at its own invocation boundary.
-	prePoll := time.Now().UTC().Add(-time.Hour)
-	tracker.markForeignBootRecoverySuccessful(prePoll)
-	invokedAfter := time.Now().UTC()
-	if err := runForeignBootRecoveryAtCurrentTime(ctx, store, io.Discard, tracker); err != nil {
-		t.Fatalf("runForeignBootRecoveryAtCurrentTime returned error: %v", err)
+func TestForeignBootRecoveryLoopIndependentOfSlowPollInterval(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
 	}
-	invokedBefore := time.Now().UTC()
 
-	tracker.mu.Lock()
-	recorded := tracker.foreignBootRecoveryAt
-	tracker.mu.Unlock()
-	if recorded.Before(invokedAfter) || recorded.After(invokedBefore) {
-		t.Fatalf("recorded recovery time = %s, want invocation boundary [%s, %s]", recorded, invokedAfter, invokedBefore)
+	const slowPollInterval = 5 * time.Minute
+	if slowPollInterval <= foreignBootRecoveryInterval {
+		t.Fatalf("test poll interval = %s, want slower than recovery interval %s", slowPollInterval, foreignBootRecoveryInterval)
 	}
-	if recorded.Equal(prePoll) {
-		t.Fatalf("recorded recovery time reused stale pre-poll timestamp %s", prePoll)
+
+	ticks := make(chan time.Time, 1)
+	tickerStarted := make(chan time.Duration, 1)
+	tickerStopped := make(chan struct{})
+	originalTicker := newForeignBootRecoveryTicker
+	newForeignBootRecoveryTicker = func(interval time.Duration) (<-chan time.Time, func()) {
+		tickerStarted <- interval
+		return ticks, func() { close(tickerStopped) }
+	}
+	originalRecovery := recoverForeignBootRunnersForSweep
+	recoveryCalls := make(chan struct{}, 3)
+	recoverForeignBootRunnersForSweep = func(context.Context, *db.Store, io.Writer) error {
+		recoveryCalls <- struct{}{}
+		return nil
+	}
+	t.Cleanup(func() {
+		newForeignBootRecoveryTicker = originalTicker
+		recoverForeignBootRunnersForSweep = originalRecovery
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runRegisteredRepoSupervisor(ctx, home, newDaemonReloadableConfig(slowPollInterval, 1, false), false, false, false, "", io.Discard)
+	}()
+
+	select {
+	case <-recoveryCalls:
+		// The eager startup pass is intentionally unchanged.
+	case err := <-done:
+		t.Fatalf("supervisor stopped before eager startup recovery: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for eager startup recovery")
+	}
+	select {
+	case interval := <-tickerStarted:
+		if interval != foreignBootRecoveryInterval {
+			t.Fatalf("foreign-boot ticker interval = %s, want %s", interval, foreignBootRecoveryInterval)
+		}
+	case err := <-done:
+		t.Fatalf("supervisor stopped before starting recovery ticker: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for foreign-boot recovery ticker")
+	}
+
+	// The supervisor's repo-poll loop is configured to sleep for five minutes,
+	// but its independent recovery ticker can fire immediately in the test. The
+	// second call therefore proves recovery is no longer waiting on that loop.
+	ticks <- time.Now().UTC()
+	select {
+	case <-recoveryCalls:
+	case err := <-done:
+		t.Fatalf("supervisor stopped before ticker-driven recovery: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ticker-driven recovery did not run while poll interval was five minutes")
+	}
+
+	select {
+	case <-recoveryCalls:
+		t.Fatal("unexpected third recovery call without another ticker event")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("supervisor returned %v, want context cancellation", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for supervisor shutdown")
+	}
+	select {
+	case <-tickerStopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("foreign-boot recovery ticker was not stopped on shutdown")
 	}
 }
 

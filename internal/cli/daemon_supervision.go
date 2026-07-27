@@ -21,11 +21,30 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// runForeignBootRecoveryAtCurrentTime is the post-poll boundary shared by both
-// supervisor loops. Capture time here, immediately before the recovery pass,
-// rather than reusing the timestamp taken before a potentially slow repo poll.
-func runForeignBootRecoveryAtCurrentTime(ctx context.Context, store *db.Store, stdout io.Writer, tracker *inflightJobTracker) error {
-	return runForeignBootRecoveryOnce(ctx, store, stdout, time.Now().UTC(), tracker)
+var newForeignBootRecoveryTicker = func(interval time.Duration) (<-chan time.Time, func()) {
+	ticker := time.NewTicker(interval)
+	return ticker.C, ticker.Stop
+}
+
+// startForeignBootRecoveryLoop keeps cross-boot recovery independent from the
+// operator-configurable repo-poll cadence. The eager startup pass retains the
+// tracker-backed throttle; after that, this dedicated ticker owns the cadence
+// directly, so even a poll loop sleeping for minutes still checks every 15s.
+func startForeignBootRecoveryLoop(ctx context.Context, store *db.Store, stdout io.Writer) {
+	ticks, stop := newForeignBootRecoveryTicker(foreignBootRecoveryInterval)
+	go func() {
+		defer stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticks:
+				if err := recoverForeignBootRunnersForSweep(ctx, store, stdout); err != nil {
+					writeLine(stdout, "foreign-boot runner recovery error: %s", err)
+				}
+			}
+		}
+	}()
 }
 
 func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonReloadableConfig, dryRun bool, watchSkillOptReviews bool, watchIssues bool, rootFilter string, stdout io.Writer) error {
@@ -51,8 +70,8 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 		var tracker *inflightJobTracker
 		if !dryRun {
 			// The tracker also owns process-lifetime maintenance cadence. Create it
-			// before startup recovery so that successful eager passes suppress an
-			// immediate duplicate on the first supervisor iteration.
+			// before startup recovery so the eager pass keeps its existing
+			// tracker-backed success semantics; recurring recovery uses its own loop.
 			tracker = newInflightJobTracker(ctx)
 			defer tracker.drain(stdout, daemonShutdownDrainTimeout)
 			startupNow := time.Now().UTC()
@@ -65,6 +84,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 			if err := recoverCancelledRunningJobsForEnabledRepos(ctx, store, rootFilter, stdout); err != nil {
 				return err
 			}
+			startForeignBootRecoveryLoop(ctx, store, stdout)
 			// The in-flight tracker (#562) keeps one hung/long job on any repo
 			// from wedging the whole sweep: ticks claim + dispatch async and
 			// return promptly. The poller consults it so a repo with in-flight
@@ -120,9 +140,6 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 				wait = baseInterval
 			}
 			if !dryRun {
-				if err := runForeignBootRecoveryAtCurrentTime(ctx, store, stdout, tracker); err != nil {
-					writeLine(stdout, "foreign-boot runner recovery error: %s", err)
-				}
 				if err := runWorkflowAutoSettleOnce(ctx, paths, store, time.Now().UTC(), stdout); err != nil {
 					writeLine(stdout, "workflow auto-settle error: %s", err)
 				}
@@ -179,8 +196,8 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 
 func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, store *db.Store, live *daemonReloadableConfig, rootFilter string, stdout io.Writer) error {
 	// The tracker also owns process-lifetime maintenance cadence. Create it before
-	// startup recovery so the first supervisor iteration does not repeat an eager
-	// pass that just succeeded.
+	// startup recovery so the eager pass keeps its existing tracker-backed success
+	// semantics; recurring recovery uses its own loop.
 	tracker := newInflightJobTracker(ctx)
 	defer tracker.drain(stdout, daemonShutdownDrainTimeout)
 	startupNow := time.Now().UTC()
@@ -196,6 +213,7 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	if err := recoverCancelledRunningJobsForRepo(ctx, store, stdout, d.Repo.FullName(), rootFilter); err != nil {
 		return err
 	}
+	startForeignBootRecoveryLoop(ctx, store, stdout)
 	worker := defaultJobWorker(store, stdout, home)
 	worker.CommenterFactory = worker.defaultCommenter
 	worker.Admission = worker.loadAdmissionBudget()
@@ -256,9 +274,6 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		}
 		if !polledFull {
 			_ = runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollRecoveryCommandsOnce)
-		}
-		if err := runForeignBootRecoveryAtCurrentTime(ctx, store, stdout, tracker); err != nil {
-			writeLine(stdout, "foreign-boot runner recovery error: %s", err)
 		}
 		if heartbeatPathsErr == nil {
 			if err := runWorkflowAutoSettleOnce(ctx, heartbeatPaths, store, time.Now().UTC(), stdout); err != nil {
