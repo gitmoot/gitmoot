@@ -35,6 +35,7 @@ type orgSharedState struct {
 	blockedLoaded   bool
 	livePresence    map[string]db.RoleLivePresence
 	liveLoaded      bool
+	unavailable     map[string]db.OrgRoleUnavailable
 }
 
 type orgLiveSourceError struct {
@@ -63,9 +64,17 @@ func loadOrgSharedState(ctx context.Context, paths config.Paths, store *db.Store
 		Presence:    make(map[string]db.OrgRolePresence, len(rows)),
 		Store:       store,
 		MissedWakes: map[string]int{},
+		unavailable: map[string]db.OrgRoleUnavailable{},
 	}
 	for _, row := range rows {
 		state.Presence[row.Role] = row
+	}
+	unavailable, err := store.ListActiveOrgRolesUnavailable(ctx, now)
+	if err != nil {
+		return orgSharedState{}, fmt.Errorf("load org role unavailability: %w", err)
+	}
+	for _, row := range unavailable {
+		state.unavailable[row.Role] = row
 	}
 
 	// Missed-wake flagging is a best-effort add-on. Keep its existing
@@ -212,6 +221,16 @@ func buildOrgStatusRows(ctx context.Context, shared *orgSharedState, src orgLive
 		if !ok {
 			live = org.RoleLiveState{State: org.StateUnknown, Detail: "provider snapshot omitted this role"}
 		}
+		unavailableReason := ""
+		unavailableUntil := ""
+		if incident, unavailable := shared.unavailable[role.Name]; unavailable {
+			unavailableReason = incident.Reason
+			unavailableUntil = formatOrgRoleUnavailableUntil(incident.Until)
+			live = org.RoleLiveState{
+				State:  org.StateUnavailable,
+				Detail: fmt.Sprintf("⚠ UNAVAILABLE reason=%s until=%s", incident.Reason, unavailableUntil),
+			}
+		}
 		seen := shared.Presence[role.Name]
 		consecutive := shared.MissedWakes[role.Name]
 		flagged := shared.MaxMissedWakes > 0 && consecutive >= shared.MaxMissedWakes
@@ -238,6 +257,7 @@ func buildOrgStatusRows(ctx context.Context, shared *orgSharedState, src orgLive
 			ProviderState: live.State, ProviderDetail: live.Detail, ObservedAt: observedAt, ProviderVersion: providerVersion,
 			RecycleStatus: recycleStatus, RecycleAfter: recycleAfterText,
 			MissedWakes: consecutive, Flagged: flagged, FlagReason: flagReason,
+			UnavailableReason: unavailableReason, UnavailableUntil: unavailableUntil,
 		})
 	}
 	if command == "chart" {
@@ -248,4 +268,12 @@ func buildOrgStatusRows(ctx context.Context, shared *orgSharedState, src orgLive
 		})
 	}
 	return rows, nil
+}
+
+func formatOrgRoleUnavailableUntil(value string) string {
+	until, err := time.Parse(db.BlockedEpisodeTimeLayout, strings.TrimSpace(value))
+	if err != nil {
+		return strings.TrimSpace(value)
+	}
+	return until.UTC().Format(time.RFC3339)
 }

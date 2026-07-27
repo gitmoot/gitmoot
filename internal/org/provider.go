@@ -11,8 +11,12 @@ const (
 	StateIdle    LifecycleState = "idle"
 	StateWorking LifecycleState = "working"
 	StateBlocked LifecycleState = "blocked"
-	StateDone    LifecycleState = "done"
-	StateUnknown LifecycleState = "unknown"
+	// StateUnavailable is a durable Gitmoot overlay for a role whose runtime
+	// provider explicitly refused work until a known boundary. It is distinct
+	// from Herdr-observed StateBlocked.
+	StateUnavailable LifecycleState = "unavailable"
+	StateDone        LifecycleState = "done"
+	StateUnknown     LifecycleState = "unknown"
 )
 
 type RoleLiveState struct {

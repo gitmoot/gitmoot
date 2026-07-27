@@ -34,6 +34,18 @@ func TestClassifyOperationalBlocker(t *testing.T) {
 			wantClass: blockerClassRuntimeQuota,
 		},
 		{
+			name:      "claude weekly limit wording",
+			err:       workflow.DeliveryError{Err: errors.New("API error: You've hit your weekly limit - resets Jul 28, 1am (Europe/Berlin) / /usage-credits to finish what you're working on.")},
+			wantOK:    true,
+			wantClass: blockerClassRuntimeQuota,
+		},
+		{
+			name:      "claude durable hit-your-limit variant",
+			err:       workflow.DeliveryError{Err: errors.New("API error: You have hit your current limit; resets on July 28 at 1:00 AM (Europe/Berlin)")},
+			wantOK:    true,
+			wantClass: blockerClassRuntimeQuota,
+		},
+		{
 			// The typed sentinel is trustworthy without the DeliveryError marker.
 			name:      "typed claude auth sentinel",
 			err:       fmt.Errorf("delivery failed: %w", runtime.ErrClaudeAuthFailed),
@@ -139,6 +151,54 @@ func TestClassifyOperationalBlockerQuotaUsesParsedReset(t *testing.T) {
 	max := min.Add(30 * time.Second) // parsed delay + max jitter headroom
 	if got.RetryAt.Before(min) || got.RetryAt.After(max) {
 		t.Fatalf("RetryAt %s outside [%s, %s]", got.RetryAt, min, max)
+	}
+}
+
+func TestClassifyOperationalBlockerClaudeAbsoluteReset(t *testing.T) {
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	message := "API error: You've hit your weekly limit - resets Jul 28, 1am (Europe/Berlin) / /usage-credits to finish what you're working on."
+	got, ok := classifyOperationalBlocker(workflow.DeliveryError{Err: errors.New(message)}, now)
+	if !ok || got.Class != blockerClassRuntimeQuota {
+		t.Fatalf("classification = %+v, %v", got, ok)
+	}
+	location, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2026, 7, 28, 1, 0, 0, 0, location)
+	if !got.QuotaResetParsed || !got.QuotaResetAt.Equal(want) {
+		t.Fatalf("QuotaResetAt = %s parsed=%v, want %s", got.QuotaResetAt, got.QuotaResetParsed, want)
+	}
+	if got.QuotaResetAt.Location().String() != "Europe/Berlin" {
+		t.Fatalf("QuotaResetAt location = %s, want Europe/Berlin", got.QuotaResetAt.Location())
+	}
+	if got.RetryAt.Before(want) || got.RetryAt.After(want.Add(30*time.Second)) {
+		t.Fatalf("RetryAt = %s, want reset plus bounded jitter", got.RetryAt)
+	}
+
+	variant := "API error: You have hit your current limit; resets on July 28 at 1:00 AM (Europe/Berlin)"
+	resetAt, parsed := parseQuotaResetAt(variant, now)
+	if !parsed || !resetAt.Equal(want) {
+		t.Fatalf("variant reset = %s parsed=%v, want %s", resetAt, parsed, want)
+	}
+}
+
+func TestClassifyOperationalBlockerQuotaFallbackIsBounded(t *testing.T) {
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	got, ok := classifyOperationalBlocker(workflow.DeliveryError{Err: errors.New("API error: You've hit your weekly limit.")}, now)
+	if !ok || got.QuotaResetParsed {
+		t.Fatalf("classification = %+v, %v", got, ok)
+	}
+	if got.QuotaResetMentioned {
+		t.Fatalf("reset mention = true for message without a reset hint: %+v", got)
+	}
+	if want := now.Add(quotaBlockerFallbackDelay); !got.QuotaResetAt.Equal(want) {
+		t.Fatalf("fallback reset = %s, want %s", got.QuotaResetAt, want)
+	}
+
+	got, ok = classifyOperationalBlocker(workflow.DeliveryError{Err: errors.New("API error: You've hit your weekly limit; resets sometime soon.")}, now)
+	if !ok || got.QuotaResetParsed || !got.QuotaResetMentioned || !got.QuotaResetAt.Equal(now.Add(quotaBlockerFallbackDelay)) {
+		t.Fatalf("unparseable reset hint classification = %+v, %v", got, ok)
 	}
 }
 

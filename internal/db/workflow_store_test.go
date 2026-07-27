@@ -856,7 +856,17 @@ func TestWorkflowMigrationDefaultsExistingJobsToUnlabelled(t *testing.T) {
 		t.Fatalf("sql.Open: %v", err)
 	}
 	store := &Store{db: raw}
-	for version, migration := range migrations[:len(migrations)-1] {
+	backfillIndex := -1
+	for i, migration := range migrations {
+		if strings.Contains(migration, "UPDATE jobs SET repo = json_extract(payload, '$.repo')") {
+			backfillIndex = i
+			break
+		}
+	}
+	if backfillIndex < 0 {
+		t.Fatal("could not locate repo projection migration")
+	}
+	for version, migration := range migrations[:backfillIndex] {
 		if err := store.applyMigration(ctx, version+1, migration); err != nil {
 			t.Fatalf("applyMigration(%d): %v", version+1, err)
 		}
@@ -865,7 +875,7 @@ func TestWorkflowMigrationDefaultsExistingJobsToUnlabelled(t *testing.T) {
 	if _, err := raw.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload) VALUES ('legacy', 'a', 'ask', 'succeeded', ?)`, payload); err != nil {
 		t.Fatalf("insert legacy job: %v", err)
 	}
-	if err := store.applyMigration(ctx, len(migrations), migrations[len(migrations)-1]); err != nil {
+	if err := store.applyMigration(ctx, backfillIndex+1, migrations[backfillIndex]); err != nil {
 		t.Fatalf("apply workflow migration: %v", err)
 	}
 	var gotPayload, workflowID, repo string

@@ -1190,6 +1190,19 @@ queued-plus-running job count attributed to the role through `ActingOrgRole`
 resolved with `gitmoot org escalate resolve`; correlation beyond the optional
 `--note` link remains deferred to #1058.
 
+For Claude-runtime jobs attributed with `ActingOrgRole`, an explicit provider
+weekly-quota rejection marks that role `unavailable` until the provider's
+stated reset time. `org status` prints `⚠ UNAVAILABLE`, `reason=quota`, and the
+UTC reset instant in the role detail; `org chart` appends the same warning, and
+their JSON rows expose `provider_state: "unavailable"`,
+`unavailable_reason`, and `unavailable_until`. New operator dispatches to the
+role are refused and already-queued jobs for it stay held. The incident sends
+one best-effort direct wake to the role's configured parent, then clears at the
+reset instant or on that role's first successful job, whichever happens first.
+If Claude supplies no parseable reset, Gitmoot uses the existing bounded
+15-minute quota fallback. Codex and Kimi quota-message detection are not part
+of this phase.
+
 The read-only Org page consumes `GET /api/org` for the store-backed role tree,
 health strip, typed escalations, and current signal feed, plus
 `GET /api/org/role/{name}` for one role's identity, presence, recycle history,
