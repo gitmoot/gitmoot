@@ -84,15 +84,23 @@ type WorktreeCommitter interface {
 }
 
 type TaskWorktreeRequest struct {
-	Home       string
-	Repo       string
-	TaskID     string
-	GoalID     string
-	TaskTitle  string
-	Branch     string
+	Home      string
+	Repo      string
+	TaskID    string
+	GoalID    string
+	TaskTitle string
+	Branch    string
+	// BaseBranch is the independently resolved lineage base for ordinary
+	// allocation and reuse checks.
 	BaseBranch string
-	Owner      string
-	Checkout   string
+	// LineageUnknown is set when no independently resolved base applies because
+	// a more precise validation already proved an existing worktree correct,
+	// such as an implicit PR fix-pass's exact branch and HEAD match. The
+	// existing-worktree reuse path treats lineage as satisfied without deriving
+	// a fallback base or performing another Git probe.
+	LineageUnknown bool
+	Owner          string
+	Checkout       string
 }
 
 // ReconcileDirtyTaskWorktreeLineage distinguishes ordinary resumable dirtiness
@@ -210,27 +218,31 @@ func (e Engine) AllocateTaskWorktree(ctx context.Context, request TaskWorktreeRe
 		}
 	}()
 	if task.Branch == request.Branch && task.WorktreePath == path {
-		lineage, err := ensureExistingWorktreeLineage(ctx, manager, request.Branch, path, request.BaseBranch)
-		if err != nil {
-			if createdLock {
-				_, _ = e.Store.ReleaseLock(ctx, lock)
-			}
-			return db.Task{}, err
-		}
-		if lineage.DirtyBlocked {
-			reason := lineage.dirtyBlockedMessage(path)
-			blockErr := blockTaskForDirtyWorktree(ctx, e.Store, task, request, path, reason)
-			if createdLock {
-				_, _ = e.Store.ReleaseLock(ctx, lock)
-			}
-			return db.Task{}, blockErr
-		}
-		if lineage.Recut {
-			if err := addTaskWorktreeLineageEvent(ctx, e.Store, task.ID, "stale_worktree_recut", lineage.message("stale task worktree detected and re-cut")); err != nil {
+		// An implicit PR fix-pass may already have proved this exact branch and
+		// HEAD through PR-specific validation, with no applicable ancestry base.
+		if !request.LineageUnknown {
+			lineage, err := ensureExistingWorktreeLineage(ctx, manager, request.Branch, path, request.BaseBranch)
+			if err != nil {
 				if createdLock {
 					_, _ = e.Store.ReleaseLock(ctx, lock)
 				}
 				return db.Task{}, err
+			}
+			if lineage.DirtyBlocked {
+				reason := lineage.dirtyBlockedMessage(path)
+				blockErr := blockTaskForDirtyWorktree(ctx, e.Store, task, request, path, reason)
+				if createdLock {
+					_, _ = e.Store.ReleaseLock(ctx, lock)
+				}
+				return db.Task{}, blockErr
+			}
+			if lineage.Recut {
+				if err := addTaskWorktreeLineageEvent(ctx, e.Store, task.ID, "stale_worktree_recut", lineage.message("stale task worktree detected and re-cut")); err != nil {
+					if createdLock {
+						_, _ = e.Store.ReleaseLock(ctx, lock)
+					}
+					return db.Task{}, err
+				}
 			}
 		}
 		if claimPlanned {

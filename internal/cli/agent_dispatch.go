@@ -805,15 +805,17 @@ func prepareLocalImplementDispatchRequest(ctx context.Context, store *db.Store, 
 			if dirty, err := taskWorktreeDirty(ctx, existing); err != nil {
 				return db.Task{}, localAgentDispatchRequest{}, err
 			} else if dirty {
-				handled, blockErr := (workflow.Engine{Store: store}).ReconcileDirtyTaskWorktreeLineage(
-					ctx,
-					gitutil.Client{Dir: record.CheckoutPath},
-					existing,
-					existing.WorktreePath,
-					baseSHA,
-				)
-				if handled {
-					return db.Task{}, localAgentDispatchRequest{}, blockErr
+				if baseSHA != "" {
+					handled, blockErr := (workflow.Engine{Store: store}).ReconcileDirtyTaskWorktreeLineage(
+						ctx,
+						gitutil.Client{Dir: record.CheckoutPath},
+						existing,
+						existing.WorktreePath,
+						baseSHA,
+					)
+					if handled {
+						return db.Task{}, localAgentDispatchRequest{}, blockErr
+					}
 				}
 				if prOpenFixPass {
 					return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s has uncommitted changes in task worktree %s; inspect and commit/push them, or clean/stash them before retrying the PR fix-pass", branchHint, existing.WorktreePath)
@@ -875,15 +877,16 @@ func prepareLocalImplementDispatchRequest(ctx context.Context, store *db.Store, 
 	}
 	owner := strings.TrimSpace(request.Agent)
 	started, err := (workflow.Engine{Store: store}).AllocateTaskWorktree(ctx, workflow.TaskWorktreeRequest{
-		Home:       paths.Home,
-		Repo:       repo.FullName(),
-		GoalID:     task.GoalID,
-		TaskID:     task.ID,
-		TaskTitle:  task.Title,
-		Branch:     branch,
-		BaseBranch: baseSHA,
-		Owner:      owner,
-		Checkout:   record.CheckoutPath,
+		Home:           paths.Home,
+		Repo:           repo.FullName(),
+		GoalID:         task.GoalID,
+		TaskID:         task.ID,
+		TaskTitle:      task.Title,
+		Branch:         branch,
+		BaseBranch:     baseSHA,
+		LineageUnknown: deferImplicitPRBase && baseSHA == "",
+		Owner:          owner,
+		Checkout:       record.CheckoutPath,
 	}, gitutil.Client{Dir: record.CheckoutPath})
 	if err != nil {
 		return db.Task{}, localAgentDispatchRequest{}, err

@@ -184,6 +184,91 @@ func TestPrepareLocalImplementDispatchRequestReconcilesDirtyWorktreeLineage(t *t
 	}
 }
 
+func TestPrepareLocalImplementDispatchRequestImplicitPRBaseSkipsGenericLineage(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		dirty bool
+	}{
+		{name: "dirty validated PR keeps existing refusal", dirty: true},
+		{name: "clean validated PR keeps worktree and head"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newDirtyTaskLineageFixture(t, true)
+			defer fixture.store.Close()
+
+			runGit(t, fixture.worktree, "add", "salvage.txt")
+			runGit(t, fixture.worktree, "commit", "-m", "PR branch work")
+			prHead := strings.TrimSpace(runGitOutput(t, fixture.worktree, "rev-parse", "HEAD"))
+			if tc.dirty {
+				writeFile(t, filepath.Join(fixture.worktree, "follow-up.txt"), "uncommitted follow-up\n")
+			}
+			fixture.task.State = string(workflow.TaskPullRequestOpen)
+			if err := fixture.store.UpsertTask(context.Background(), fixture.task); err != nil {
+				t.Fatalf("UpsertTask PR state: %v", err)
+			}
+
+			started, _, err := prepareLocalImplementDispatchRequest(
+				context.Background(),
+				fixture.store,
+				db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: fixture.checkout},
+				github.Repository{Owner: "owner", Name: "repo"},
+				localAgentDispatchRequest{
+					Home:                 fixture.home,
+					Agent:                "lead",
+					Action:               "implement",
+					Instructions:         "Apply a PR fix-pass.",
+					PullRequest:          42,
+					ImplementPRValidated: true,
+					Branch:               fixture.task.Branch,
+					HeadSHA:              prHead,
+				},
+			)
+
+			stored, getErr := fixture.store.GetTask(context.Background(), fixture.task.ID)
+			if getErr != nil {
+				t.Fatalf("GetTask: %v", getErr)
+			}
+			events, eventsErr := fixture.store.ListTaskEvents(context.Background(), fixture.task.ID)
+			if eventsErr != nil {
+				t.Fatalf("ListTaskEvents: %v", eventsErr)
+			}
+			if tc.dirty {
+				if err == nil {
+					t.Fatal("dirty implicit PR fix-pass succeeded")
+				}
+				want := "branch " + fixture.task.Branch + " has uncommitted changes in task worktree " + fixture.worktree + "; inspect and commit/push them, or clean/stash them before retrying the PR fix-pass"
+				if err.Error() != want {
+					t.Fatalf("dirty implicit PR error = %q, want unchanged %q", err, want)
+				}
+				if stored.State != string(workflow.TaskPullRequestOpen) {
+					t.Fatalf("dirty implicit PR task state = %q, want pr_open", stored.State)
+				}
+				if len(events) != 0 {
+					t.Fatalf("dirty implicit PR task events = %+v, want none", events)
+				}
+				if content, readErr := os.ReadFile(filepath.Join(fixture.worktree, "follow-up.txt")); readErr != nil || string(content) != "uncommitted follow-up\n" {
+					t.Fatalf("dirty implicit PR follow-up = %q, %v", content, readErr)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("clean implicit PR fix-pass: %v", err)
+			}
+			if started.WorktreePath != fixture.worktree {
+				t.Fatalf("clean implicit PR worktree = %q, want %q", started.WorktreePath, fixture.worktree)
+			}
+			afterHead := strings.TrimSpace(runGitOutput(t, fixture.worktree, "rev-parse", "HEAD"))
+			if afterHead != prHead {
+				t.Fatalf("clean implicit PR head = %s, want preserved %s", afterHead, prHead)
+			}
+			if len(events) != 0 {
+				t.Fatalf("clean implicit PR task events = %+v, want none", events)
+			}
+		})
+	}
+}
+
 func TestRunTaskRunReconcilesDirtyWorktreeLineage(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
