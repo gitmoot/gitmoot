@@ -54,6 +54,16 @@ const daemonJobCancelPollInterval = 250 * time.Millisecond
 
 const daemonWorkerLoopInterval = 1 * time.Second
 
+// foreignBootRecoveryInterval keeps the reboot fast-path comfortably inside
+// the one-minute minimum crash-backstop window while avoiding a global DB scan
+// on every supervisor iteration.
+const foreignBootRecoveryInterval = 15 * time.Second
+
+// agedDelegationWorktreeReclaimInterval is tiny beside the default 72-hour
+// eligibility TTL, but removes the 0.151s global candidate query from the
+// daemon's one-second hot path.
+const agedDelegationWorktreeReclaimInterval = 5 * time.Minute
+
 // daemonPollTimeout bounds a single repo's PollOnce / PollRecoveryCommandsOnce.
 // The poll runs while HOLDING that repo's checkout lock, and both supervisors
 // take each repo's lock SEQUENTIALLY, so a wedged (ctx-respecting-but-slow)
@@ -191,22 +201,21 @@ func recoverExpiredRuntimeSessionLocks(ctx context.Context, store *db.Store, std
 	return recoverExpiredRuntimeSessionLocksSkipping(ctx, store, stdout, now, nil)
 }
 
-// recoverForeignBootRunners is the #651 cross-boot recovery pass, run at daemon
-// startup AND every worker tick. When this host's boot id differs from the boot id
-// recorded on a running job / held runtime-session lock, that owner was claimed on
-// a PREVIOUS boot and its in-process worker died when the host rebooted — so it is
-// recovered IMMEDIATELY, regardless of any runtime-session lease (which survives a
-// reboot in the DB and would otherwise keep the job "held" until it expired: the
-// AC2 gap #536's lease gate cannot close by itself).
+// recoverForeignBootRunners is the #651 cross-boot recovery pass, run eagerly at
+// daemon startup and then on a throttled, once-per-supervisor-sweep cadence. When
+// this host's boot id differs from the boot id recorded on a running job / held
+// runtime-session lock, that owner was claimed on a PREVIOUS boot and its
+// in-process worker died when the host rebooted — so it is recovered promptly,
+// regardless of any runtime-session lease (which survives a reboot in the DB and
+// would otherwise keep the job "held" until it expired: the AC2 gap #536's lease
+// gate cannot close by itself).
 //
 // It requeues the foreign-boot running jobs (this covers non-resumable/shell jobs
 // too, which hold no lease at all) and reclaims the foreign-boot runtime-session
 // locks so a requeued resumable owner can re-acquire its session on re-dispatch.
 // It is a STRICT no-op off Linux (BootID()=="") — preserving today's age/lease
 // behavior — and never touches a SAME-boot owner, so a live in-process worker is
-// never double-run (the #536 protection is untouched). Cheap and idempotent: after
-// the first pass reclaims them there are no foreign-boot rows left, so re-running
-// it per repo per tick is a near-empty indexed scan.
+// never double-run (the #536 protection is untouched).
 func recoverForeignBootRunners(ctx context.Context, store *db.Store, stdout io.Writer) error {
 	bootID := db.BootID()
 	if bootID == "" {
@@ -226,6 +235,21 @@ func recoverForeignBootRunners(ctx context.Context, store *db.Store, stdout io.W
 	if released > 0 {
 		writeLine(stdout, "reclaimed %d runtime session lock(s) held on a previous boot", released)
 	}
+	return nil
+}
+
+// recoverForeignBootRunnersForSweep is a test seam for pinning the
+// supervisor-level call frequency. Production never reassigns it.
+var recoverForeignBootRunnersForSweep = recoverForeignBootRunners
+
+func runForeignBootRecoveryOnce(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time, tracker *inflightJobTracker) error {
+	if !tracker.foreignBootRecoveryDue(now) {
+		return nil
+	}
+	if err := recoverForeignBootRunnersForSweep(ctx, store, stdout); err != nil {
+		return err
+	}
+	tracker.markForeignBootRecoverySuccessful(now)
 	return nil
 }
 
@@ -459,7 +483,7 @@ func recoverRunningJobIfLeaseExpired(ctx context.Context, store *db.Store, stdou
 	return nil
 }
 
-// tickCandidates memoizes the three per-tick job-candidate GROUP BY queries
+// tickCandidates memoizes the four per-tick job-candidate GROUP BY queries
 // (advance-retry / comment-retry / delegation-worktree-reclaim) so they run ONCE
 // per supervisor tick instead of once per enabled repo (#619). Each query takes
 // NO repo argument — they scan the whole job_events table and return the global
@@ -527,11 +551,12 @@ func (m *candidateMemo) get(fetch func() ([]string, error)) ([]string, error) {
 }
 
 type tickCandidates struct {
-	store       tickCandidateStore
-	advance     candidateMemo
-	comment     candidateMemo
-	reclaim     candidateMemo
-	agedReclaim candidateMemo
+	store           tickCandidateStore
+	advance         candidateMemo
+	comment         candidateMemo
+	reclaim         candidateMemo
+	agedReclaim     candidateMemo
+	skipAgedReclaim bool
 }
 
 // newTickCandidates is a package var (not a plain func) only so the once-per-tick
@@ -560,6 +585,9 @@ func (c *tickCandidates) delegationReclaimCandidates(ctx context.Context) ([]str
 }
 
 func (c *tickCandidates) agedDelegationReclaimCandidates(ctx context.Context, cutoff time.Time) ([]string, error) {
+	if c.skipAgedReclaim {
+		return nil, nil
+	}
 	return c.agedReclaim.get(func() ([]string, error) {
 		return c.store.JobIDsWithAgedTerminalDelegationWorktree(ctx, cutoff)
 	})
@@ -741,23 +769,17 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	if dryRun {
 		return nil
 	}
+	ownsCandidates := cand == nil
 	// A nil carrier means this is a standalone tick (single-repo supervisor or
 	// direct caller): compute the shared candidate sets once for THIS
 	// tick. The multi-repo supervisor passes a carrier it created once per tick, so
-	// the three GROUP BY queries run once per tick rather than once per enabled repo
+	// the four GROUP BY queries run once per tick rather than once per enabled repo
 	// (#619).
 	if cand == nil {
 		cand = newTickCandidates(worker.Store)
+		cand.skipAgedReclaim = !tracker.agedDelegationWorktreeReclaimDue(now)
 	}
 	inflightIDs := tracker.inflightIDs()
-	// Cross-boot recovery (#651): requeue jobs / reclaim runtime-session locks whose
-	// recorded boot id proves a reboot happened, before the lease-gated recovery
-	// below (which alone would leave a rebooted long-lease job "held"). It is
-	// boot-scoped and repo-agnostic — no in-flight skip is needed because a foreign
-	// boot id can never belong to a job this process is currently running.
-	if err := recoverForeignBootRunners(ctx, store, stdout); err != nil {
-		return err
-	}
 	if err := recoverRunningJobsBeforeForRepoSkipping(ctx, store, stdout, now, now.Add(-configuredDaemonRunningJobStaleAfter(stdout)), repoFilter, rootFilter, inflightIDs); err != nil {
 		return err
 	}
@@ -827,10 +849,19 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	// local to this tick's dispatch and never leaks to sibling repos.
 	limit, usePool := worker.resolveRepoScheduler(repoFilter, workers)
 	worker.UsePool = usePool
+	var err error
 	if tracker == nil {
-		return runQueuedJobsForRepo(ctx, worker, limit, repoFilter, rootFilter)
+		err = runQueuedJobsForRepo(ctx, worker, limit, repoFilter, rootFilter)
+	} else {
+		err = dispatchQueuedJobsTracked(ctx, worker, limit, workers, repoFilter, rootFilter, tracker)
 	}
-	return dispatchQueuedJobsTracked(ctx, worker, limit, workers, repoFilter, rootFilter, tracker)
+	if err != nil {
+		return err
+	}
+	if ownsCandidates && cand.agedReclaim.done {
+		tracker.markAgedDelegationWorktreeReclaimSuccessful(now)
+	}
+	return nil
 }
 
 func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, worker jobWorker, workers int, rootFilter string, stdout io.Writer, now time.Time, locks *repoCheckoutLocks, tracker *inflightJobTracker) error {
@@ -839,12 +870,14 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 		return err
 	}
 	// Compute the shared per-tick job-candidate sets ONCE for this whole sweep and
-	// pass the carrier into every enabled repo's tick (#619). The three GROUP BY
+	// pass the carrier into every enabled repo's tick (#619). The four GROUP BY
 	// candidate queries take no repo argument — they return the global candidate set
 	// that each repo's retry pass then filters in Go — so running them once here
 	// instead of once inside each runDaemonWorkerTickTracked collapses 18×/tick down
 	// to 1×/tick on a multi-repo daemon. Fresh each sweep; never retained.
 	cand := newTickCandidates(worker.Store)
+	runAgedReclaim := tracker.agedDelegationWorktreeReclaimDue(now)
+	cand.skipAgedReclaim = !runAgedReclaim
 	// Scope tick faults per repo (#555 follow-up): the recovering supervisor
 	// treats a returned error as one fleet-wide failure unit and, after a bounded
 	// streak, exits the WHOLE daemon. Returning on the first repo's error would
@@ -881,6 +914,9 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 			lastErr = tickErr
 			writeLine(stdout, "%s: worker tick error: %v", repo.FullName(), tickErr)
 		}
+	}
+	if failed == 0 && runAgedReclaim && cand.agedReclaim.done {
+		tracker.markAgedDelegationWorktreeReclaimSuccessful(now)
 	}
 	// Every enabled repo failing is the global-fault signal: return it so the
 	// recovering supervisor's streak can trip and escalate. A single-repo daemon

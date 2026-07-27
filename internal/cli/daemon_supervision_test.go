@@ -17,6 +17,34 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
+func TestRunForeignBootRecoveryAtCurrentTimeUsesInvocationTimestamp(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	tracker := newInflightJobTracker(ctx)
+	defer tracker.drain(io.Discard, time.Second)
+
+	// Model the timestamp captured before a slow poll. Both supervisor loops call
+	// the helper only after polling, so a correct helper must replace this stale
+	// value with one captured at its own invocation boundary.
+	prePoll := time.Now().UTC().Add(-time.Hour)
+	tracker.markForeignBootRecoverySuccessful(prePoll)
+	invokedAfter := time.Now().UTC()
+	if err := runForeignBootRecoveryAtCurrentTime(ctx, store, io.Discard, tracker); err != nil {
+		t.Fatalf("runForeignBootRecoveryAtCurrentTime returned error: %v", err)
+	}
+	invokedBefore := time.Now().UTC()
+
+	tracker.mu.Lock()
+	recorded := tracker.foreignBootRecoveryAt
+	tracker.mu.Unlock()
+	if recorded.Before(invokedAfter) || recorded.After(invokedBefore) {
+		t.Fatalf("recorded recovery time = %s, want invocation boundary [%s, %s]", recorded, invokedAfter, invokedBefore)
+	}
+	if recorded.Equal(prePoll) {
+		t.Fatalf("recorded recovery time reused stale pre-poll timestamp %s", prePoll)
+	}
+}
+
 func TestPollRegisteredReposHonorsPerRepoIntervals(t *testing.T) {
 	paths := config.PathsForHome(t.TempDir())
 	if err := config.Initialize(paths); err != nil {
