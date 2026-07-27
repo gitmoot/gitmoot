@@ -3,12 +3,108 @@ package cli
 import (
 	"bytes"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 )
+
+func TestDaemonLogStalenessDefersMissingAndBehindLogsDuringStartupGrace(t *testing.T) {
+	now := time.Date(2026, 7, 27, 8, 30, 10, 0, time.UTC)
+	started := now.Add(-daemonLogStartupGrace / 2)
+	logPath := filepath.Join(t.TempDir(), "daemon.log")
+
+	for _, tc := range []struct {
+		name    string
+		prepare func()
+	}{
+		{
+			name:    "missing",
+			prepare: func() {},
+		},
+		{
+			name: "last write before daemon start",
+			prepare: func() {
+				if err := os.WriteFile(logPath, []byte("old daemon output\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				lastWrite := started.Add(-time.Hour)
+				if err := os.Chtimes(logPath, lastWrite, lastWrite); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = os.Remove(logPath)
+			tc.prepare()
+
+			status, determined := daemonLogStaleness(logPath, started.Format(time.RFC3339), now)
+			if determined || status.Determined || status.Stale || status.Missing {
+				t.Fatalf("startup log status = %+v, determined=%t; want neutral", status, determined)
+			}
+		})
+	}
+}
+
+func TestDaemonLogStalenessWarnsAfterStartupGrace(t *testing.T) {
+	started := time.Date(2026, 7, 27, 8, 30, 0, 0, time.UTC)
+	now := started.Add(daemonLogStartupGrace)
+	logPath := filepath.Join(t.TempDir(), "daemon.log")
+
+	for _, tc := range []struct {
+		name        string
+		prepare     func()
+		wantMissing bool
+	}{
+		{
+			name:        "missing",
+			prepare:     func() {},
+			wantMissing: true,
+		},
+		{
+			name: "last write before daemon start",
+			prepare: func() {
+				if err := os.WriteFile(logPath, []byte("old daemon output\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				lastWrite := started.Add(-time.Hour)
+				if err := os.Chtimes(logPath, lastWrite, lastWrite); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = os.Remove(logPath)
+			tc.prepare()
+
+			status, determined := daemonLogStaleness(logPath, started.Format(time.RFC3339), now)
+			if !determined || !status.Determined || !status.Stale || status.Missing != tc.wantMissing {
+				t.Fatalf("post-grace log status = %+v, determined=%t; want stale (missing=%t)", status, determined, tc.wantMissing)
+			}
+		})
+	}
+}
+
+func TestDaemonStatusSuppressesMissingLogWarningDuringStartupGrace(t *testing.T) {
+	home := t.TempDir()
+	paths := stageLiveDaemon(t, home, "dev-log-test", "logtest0")
+	stubOnDiskBuild(t, "dev-log-test", "logtest0")
+	state := daemonProcessState(paths)
+	setDaemonStartedAt(t, state, time.Now().UTC().Format(time.RFC3339))
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"daemon", "status", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("daemon status exit = %d, stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	if strings.Contains(out, "advertised log") || strings.Contains(out, "journalctl") {
+		t.Fatalf("newly started daemon with no first log write received a stale warning:\n%s", out)
+	}
+}
 
 func TestDaemonStatusWarnsWhenRunningLogPredatesStart(t *testing.T) {
 	home := t.TempDir()

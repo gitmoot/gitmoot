@@ -10,10 +10,14 @@ import (
 	"github.com/gitmoot/gitmoot/internal/doctor"
 )
 
+// Ten seconds lets a directly launched daemon register before its first write
+// without hiding an unwritten log through the normal 30-second poll interval.
+const daemonLogStartupGrace = 10 * time.Second
+
 // daemonLogStaleness compares the advertised daemon log's last write with the
-// running daemon's recorded start time. A missing log is a definite stale
-// signal; malformed metadata and other stat failures stay neutral.
-func daemonLogStaleness(logPath, startedAt string) (doctor.DaemonLogStatus, bool) {
+// running daemon's recorded start time. A missing log after startup grace is a
+// definite stale signal; malformed metadata and other stat failures stay neutral.
+func daemonLogStaleness(logPath, startedAt string, now time.Time) (doctor.DaemonLogStatus, bool) {
 	status := doctor.DaemonLogStatus{
 		DaemonRunning: true,
 		LogPath:       strings.TrimSpace(logPath),
@@ -23,6 +27,9 @@ func daemonLogStaleness(logPath, startedAt string) (doctor.DaemonLogStatus, bool
 		return status, false
 	}
 	status.StartedAt = started
+	if now.Before(started.Add(daemonLogStartupGrace)) {
+		return status, false
+	}
 
 	info, err := os.Stat(status.LogPath)
 	if errors.Is(err, os.ErrNotExist) {
@@ -60,7 +67,7 @@ func daemonLogStatus(paths config.Paths) doctor.DaemonLogStatus {
 	if err != nil {
 		return status
 	}
-	observed, ok := daemonLogStaleness(state.LogFile, meta.StartedAt)
+	observed, ok := daemonLogStaleness(state.LogFile, meta.StartedAt, time.Now())
 	if !ok {
 		return status
 	}
@@ -68,7 +75,7 @@ func daemonLogStatus(paths config.Paths) doctor.DaemonLogStatus {
 }
 
 func daemonLogWarning(logPath, startedAt string) string {
-	status, ok := daemonLogStaleness(logPath, startedAt)
+	status, ok := daemonLogStaleness(logPath, startedAt, time.Now())
 	if !ok {
 		return ""
 	}
