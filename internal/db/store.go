@@ -106,6 +106,14 @@ func configureWritableSQLite(ctx context.Context, db *sql.DB) error {
 	if err := configureReadOnlySQLite(ctx, db); err != nil {
 		return err
 	}
+	// auto_vacuum must be selected before the first table is created. Fresh
+	// homes therefore start with the page metadata needed for bounded
+	// incremental reclaim. On an existing database created with NONE, SQLite
+	// leaves the mode unchanged until an operator explicitly runs a full
+	// VACUUM; startup must never perform that potentially expensive rewrite.
+	if _, err := db.ExecContext(ctx, `PRAGMA auto_vacuum=INCREMENTAL`); err != nil {
+		return fmt.Errorf("configure sqlite incremental auto-vacuum: %w", err)
+	}
 	if _, err := db.ExecContext(ctx, `PRAGMA journal_mode=WAL`); err != nil {
 		return fmt.Errorf("configure sqlite WAL: %w", err)
 	}

@@ -99,6 +99,13 @@ func TestOpenConfiguresSQLiteContentionPragmas(t *testing.T) {
 	if journalMode != "wal" {
 		t.Fatalf("journal_mode = %q, want wal", journalMode)
 	}
+	autoVacuum, err := store.SQLiteAutoVacuumMode(context.Background())
+	if err != nil {
+		t.Fatalf("SQLiteAutoVacuumMode returned error: %v", err)
+	}
+	if autoVacuum != SQLiteAutoVacuumIncremental {
+		t.Fatalf("auto_vacuum = %d, want %d (INCREMENTAL)", autoVacuum, SQLiteAutoVacuumIncremental)
+	}
 
 	if err := store.Close(); err != nil {
 		t.Fatalf("Close returned error: %v", err)
@@ -113,6 +120,88 @@ func TestOpenConfiguresSQLiteContentionPragmas(t *testing.T) {
 	}
 	if busyTimeout != sqliteBusyTimeoutMillis {
 		t.Fatalf("read-only busy_timeout = %d, want %d", busyTimeout, sqliteBusyTimeoutMillis)
+	}
+}
+
+func TestOpenDoesNotFullVacuumLegacyDatabase(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw legacy database: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `CREATE TABLE legacy_value (value TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO legacy_value(value) VALUES ('preserved')`); err != nil {
+		t.Fatalf("insert legacy value: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw legacy database: %v", err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open legacy database: %v", err)
+	}
+	defer store.Close()
+
+	mode, err := store.SQLiteAutoVacuumMode(ctx)
+	if err != nil {
+		t.Fatalf("SQLiteAutoVacuumMode returned error: %v", err)
+	}
+	if mode != SQLiteAutoVacuumNone {
+		t.Fatalf("legacy auto_vacuum = %d, want %d (NONE) until an explicit full VACUUM", mode, SQLiteAutoVacuumNone)
+	}
+	var value string
+	if err := store.db.QueryRowContext(ctx, `SELECT value FROM legacy_value`).Scan(&value); err != nil {
+		t.Fatalf("read legacy value: %v", err)
+	}
+	if value != "preserved" {
+		t.Fatalf("legacy value = %q, want preserved", value)
+	}
+}
+
+func TestIncrementalVacuumReclaimsOnlyRequestedPages(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "incremental.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	if _, err := store.db.ExecContext(ctx, `CREATE TABLE reclaimable (payload BLOB NOT NULL)`); err != nil {
+		t.Fatalf("create reclaimable table: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO reclaimable(payload) VALUES (zeroblob(1048576))`); err != nil {
+		t.Fatalf("insert reclaimable payload: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM reclaimable`); err != nil {
+		t.Fatalf("delete reclaimable payload: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatalf("checkpoint reclaimable pages: %v", err)
+	}
+	var before int
+	if err := store.db.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&before); err != nil {
+		t.Fatalf("read freelist before incremental vacuum: %v", err)
+	}
+	if before < 2 {
+		t.Fatalf("freelist before incremental vacuum = %d, want at least 2 pages", before)
+	}
+
+	if err := store.IncrementalVacuum(ctx, 1); err != nil {
+		t.Fatalf("IncrementalVacuum returned error: %v", err)
+	}
+	var after int
+	if err := store.db.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&after); err != nil {
+		t.Fatalf("read freelist after incremental vacuum: %v", err)
+	}
+	if after != before-1 {
+		t.Fatalf("freelist after one-page incremental vacuum = %d, want %d", after, before-1)
+	}
+	if err := store.IncrementalVacuum(ctx, 0); err == nil {
+		t.Fatal("IncrementalVacuum(0) returned nil, want validation error")
 	}
 }
 

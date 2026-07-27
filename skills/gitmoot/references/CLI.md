@@ -25,6 +25,19 @@ actionable remediation hint) and live-probes the Claude credential selected by
 after install and before starting the daemon. It also reports delegation
 worktree count and logical disk size, warning at 10 stale worktrees or 1 GB and
 distinguishing aged-final reclaimable owners from pinned non-final owners.
+It also reports the SQLite auto-vacuum mode. New homes use bounded incremental
+reclaim automatically. A legacy home remains a non-blocking warning until an
+operator deliberately converts it during an idle maintenance window:
+
+```sh
+sqlite3 "$HOME/.gitmoot/gitmoot.db" \
+  'PRAGMA auto_vacuum=INCREMENTAL; VACUUM;'
+```
+
+The one-time command fully rewrites the database; the daemon never runs a full
+`VACUUM` automatically. `sqlite3` is an optional operator tool, not a Gitmoot
+runtime dependency. For a non-default home, use the exact path printed by
+`gitmoot doctor`.
 
 One-shot onboarding: `gitmoot setup` registers the repo and an agent in one
 command (`--repo owner/repo --agent <name> --runtime codex|claude|shell
