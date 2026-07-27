@@ -125,6 +125,47 @@ type workflowShowJSON struct {
 	Truncated bool                    `json:"truncated,omitempty"`
 }
 
+// workflowShowStore keeps the summary-first read sequence deterministic under
+// test while production continues to use the concrete SQLite store.
+type workflowShowStore interface {
+	WorkflowSummary(context.Context, string) (db.WorkflowSummary, error)
+	ListJobsByWorkflow(context.Context, string, int) ([]db.Job, error)
+	ListWorkflowNotes(context.Context, string, int) ([]db.WorkflowNote, error)
+	GetWorkflowMeta(context.Context, string) (db.WorkflowMeta, error)
+}
+
+type workflowShowData struct {
+	summary db.WorkflowSummary
+	meta    db.WorkflowMeta
+	jobs    []db.Job
+	notes   []db.WorkflowNote
+}
+
+func loadWorkflowShow(ctx context.Context, store workflowShowStore, label string, fetchLimit int) (workflowShowData, error) {
+	var data workflowShowData
+	var err error
+	data.summary, err = store.WorkflowSummary(ctx, label)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return workflowShowData{}, fmt.Errorf("workflow %q not found", label)
+		}
+		return workflowShowData{}, err
+	}
+	data.jobs, err = store.ListJobsByWorkflow(ctx, label, fetchLimit)
+	if err != nil {
+		return workflowShowData{}, err
+	}
+	data.notes, err = store.ListWorkflowNotes(ctx, label, fetchLimit)
+	if err != nil {
+		return workflowShowData{}, err
+	}
+	data.meta, err = store.GetWorkflowMeta(ctx, label)
+	if errors.Is(err, sql.ErrNoRows) {
+		return data, nil
+	}
+	return data, err
+}
+
 func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("workflow show", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -153,43 +194,26 @@ func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "workflow show requires one label and --limit >= 0")
 		return 2
 	}
-	var summary db.WorkflowSummary
-	var meta db.WorkflowMeta
-	var jobs []db.Job
-	var notes []db.WorkflowNote
+	fetchLimit := *limit
+	if fetchLimit > 0 {
+		fetchLimit++
+	}
+	var data workflowShowData
 	if err := withStore(*home, func(store *db.Store) error {
-		ctx := context.Background()
 		var err error
-		jobs, err = store.ListJobsByWorkflow(ctx, label, *limit)
-		if err != nil {
-			return err
-		}
-		notes, err = store.ListWorkflowNotes(ctx, label, *limit)
-		if err != nil {
-			return err
-		}
-		summary, err = store.WorkflowSummary(ctx, label)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("workflow %q not found", label)
-			}
-			return err
-		}
-		meta, err = store.GetWorkflowMeta(ctx, label)
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil
-		}
+		data, err = loadWorkflowShow(context.Background(), store, label, fetchLimit)
 		return err
 	}); err != nil {
 		fmt.Fprintf(stderr, "workflow show: %v\n", err)
 		return 1
 	}
+	summary, meta, jobs, notes := data.summary, data.meta, data.jobs, data.notes
 	entries := mergeWorkflowTimeline(jobs, notes)
-	if *limit > 0 && len(entries) > *limit {
+	truncated := *limit > 0 && len(entries) > *limit
+	if truncated {
 		entries = entries[len(entries)-*limit:]
 	}
 	totalEntries := summary.JobCount + summary.NoteCount
-	truncated := *limit > 0 && totalEntries > len(entries)
 	out := workflowShowJSON{Summary: summary, Meta: meta, Entries: entries, Truncated: truncated}
 	out.Meta.Description = workflowDisplayDescription(summary.WorkflowID, out.Meta.Description)
 	if *jsonOutput {

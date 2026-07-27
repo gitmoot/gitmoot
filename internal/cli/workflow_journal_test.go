@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,36 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 )
+
+type workflowShowMidCallCreateStore struct {
+	*db.Store
+	created   bool
+	listCalls int
+}
+
+func (s *workflowShowMidCallCreateStore) WorkflowSummary(ctx context.Context, label string) (db.WorkflowSummary, error) {
+	summary, err := s.Store.WorkflowSummary(ctx, label)
+	if errors.Is(err, sql.ErrNoRows) && !s.created {
+		s.created = true
+		if createErr := s.Store.CreateJob(ctx, db.Job{
+			ID: "mid-call-job", Agent: "worker", Type: "ask", State: "succeeded",
+			Payload: `{"repo":"acme/widget","workflow_id":"release/mid-call"}`,
+		}); createErr != nil {
+			return db.WorkflowSummary{}, fmt.Errorf("create workflow mid-call: %w", createErr)
+		}
+	}
+	return summary, err
+}
+
+func (s *workflowShowMidCallCreateStore) ListJobsByWorkflow(ctx context.Context, label string, limit int) ([]db.Job, error) {
+	s.listCalls++
+	return s.Store.ListJobsByWorkflow(ctx, label, limit)
+}
+
+func (s *workflowShowMidCallCreateStore) ListWorkflowNotes(ctx context.Context, label string, limit int) ([]db.WorkflowNote, error) {
+	s.listCalls++
+	return s.Store.ListWorkflowNotes(ctx, label, limit)
+}
 
 func TestWorkflowFlagParsesOnAllAgentVerbs(t *testing.T) {
 	for _, command := range []string{"run", "review", "implement", "orchestrate"} {
@@ -167,6 +198,78 @@ func workflowJournalTestHome(t *testing.T) (string, *db.Store) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	return home, store
+}
+
+func TestLoadWorkflowShowNotFoundWinsWhenWorkflowCreatedMidCall(t *testing.T) {
+	_, store := workflowJournalTestHome(t)
+	ctx := context.Background()
+	const workflowID = "release/mid-call"
+	wrapped := &workflowShowMidCallCreateStore{Store: store}
+
+	_, err := loadWorkflowShow(ctx, wrapped, workflowID, 4)
+	if err == nil || err.Error() != `workflow "release/mid-call" not found` {
+		t.Fatalf("loadWorkflowShow error = %v, want clean not-found error", err)
+	}
+	if !wrapped.created {
+		t.Fatal("workflow was not created during the summary lookup")
+	}
+	if wrapped.listCalls != 0 {
+		t.Fatalf("list calls after summary not-found = %d, want 0", wrapped.listCalls)
+	}
+	summary, err := store.WorkflowSummary(ctx, workflowID)
+	if err != nil || summary.JobCount != 1 {
+		t.Fatalf("mid-call workflow summary = %+v, err=%v", summary, err)
+	}
+}
+
+func TestWorkflowShowOverfetchBoundary(t *testing.T) {
+	const displayLimit = 3
+	for _, tc := range []struct {
+		name          string
+		entryCount    int
+		limit         int
+		wantShown     int
+		wantFirstID   string
+		wantTruncated bool
+	}{
+		{name: "limit-plus-one", entryCount: displayLimit + 1, limit: displayLimit, wantShown: displayLimit, wantFirstID: "2", wantTruncated: true},
+		{name: "exact-limit", entryCount: displayLimit, limit: displayLimit, wantShown: displayLimit, wantFirstID: "1"},
+		{name: "limit-minus-one", entryCount: displayLimit - 1, limit: displayLimit, wantShown: displayLimit - 1, wantFirstID: "1"},
+		{name: "unbounded", entryCount: displayLimit + 1, limit: 0, wantShown: displayLimit + 1, wantFirstID: "1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home, store := workflowJournalTestHome(t)
+			ctx := context.Background()
+			const workflowID = "release/overfetch"
+			for i := 1; i <= tc.entryCount; i++ {
+				if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+					WorkflowID: workflowID,
+					Author:     "operator",
+					Body:       fmt.Sprintf("note-%d", i),
+				}); err != nil {
+					t.Fatalf("InsertWorkflowNote(%d): %v", i, err)
+				}
+			}
+
+			var stdout, stderr bytes.Buffer
+			if code := runWorkflowShow([]string{
+				workflowID, "--home", home, "--limit", fmt.Sprintf("%d", tc.limit), "--json",
+			}, &stdout, &stderr); code != 0 {
+				t.Fatalf("workflow show exit=%d stderr=%q", code, stderr.String())
+			}
+			var out workflowShowJSON
+			if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+				t.Fatalf("decode JSON: %v raw=%s", err, stdout.String())
+			}
+			if out.Truncated != tc.wantTruncated || len(out.Entries) != tc.wantShown {
+				t.Fatalf("truncated=%v entries=%d, want truncated=%v entries=%d",
+					out.Truncated, len(out.Entries), tc.wantTruncated, tc.wantShown)
+			}
+			if len(out.Entries) == 0 || out.Entries[0].ID != tc.wantFirstID {
+				t.Fatalf("first entry = %+v, want ID %s", out.Entries, tc.wantFirstID)
+			}
+		})
+	}
 }
 
 func seedWorkflowShowRecencyFixture(t *testing.T) (string, *db.Store) {
