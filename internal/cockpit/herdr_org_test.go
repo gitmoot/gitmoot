@@ -185,6 +185,67 @@ func TestHerdrOrgProviderSnapshotPartialTurnIsAbsent(t *testing.T) {
 	}
 }
 
+func TestHerdrOrgProviderSnapshotInvalidTurnValuesAreAbsent(t *testing.T) {
+	tests := []struct {
+		name string
+		turn string
+	}{
+		{name: "zero turn", turn: `{"turn":0,"turn_epoch":2,"completed_unix_ms":3}`},
+		{name: "zero turn epoch", turn: `{"turn":1,"turn_epoch":0,"completed_unix_ms":3}`},
+		{name: "zero completion time", turn: `{"turn":1,"turn_epoch":2,"completed_unix_ms":0}`},
+		{name: "all zero", turn: `{"turn":0,"turn_epoch":0,"completed_unix_ms":0}`},
+		{name: "negative turn", turn: `{"turn":-1,"turn_epoch":2,"completed_unix_ms":3}`},
+		{name: "negative turn epoch", turn: `{"turn":1,"turn_epoch":-2,"completed_unix_ms":3}`},
+		{name: "negative completion time", turn: `{"turn":1,"turn_epoch":2,"completed_unix_ms":-3}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			run := func(_ context.Context, _ ...string) (string, error) {
+				return `{"result":{"snapshot":{"version":"0.7.5","panes":[
+{"pane_id":"w1:p1","label":"owner","agent_status":"working","last_completed_turn":` + test.turn + `}
+]}}}`, nil
+			}
+			provider := newHerdrOrgProvider(run, []config.OrgRole{{Name: "owner"}}, time.Now)
+			snapshot, err := provider.Snapshot(context.Background())
+			if err != nil {
+				t.Fatalf("Snapshot() error = %v", err)
+			}
+			if activity := snapshot.States["owner"].Activity; activity != nil {
+				t.Fatalf("owner activity = %+v, want absent for invalid turn", activity)
+			}
+		})
+	}
+}
+
+func TestHerdrOrgProviderSnapshotOversizedUint64TurnEpochFailsClosedPerPane(t *testing.T) {
+	run := func(_ context.Context, _ ...string) (string, error) {
+		return `{"result":{"snapshot":{"version":"0.7.5","panes":[
+{"pane_id":"w1:p1","label":"oversized","agent_status":"working","last_completed_turn":{"turn":1,"turn_epoch":9223372036854775808,"completed_unix_ms":3}},
+{"pane_id":"w1:p2","label":"valid","agent_status":"idle","last_completed_turn":{"turn":4,"turn_epoch":5,"completed_unix_ms":6}},
+{"pane_id":"w1:p3","label":"absent","agent_status":"blocked"}
+]}}}`, nil
+	}
+	provider := newHerdrOrgProvider(run, []config.OrgRole{
+		{Name: "oversized"}, {Name: "valid"}, {Name: "absent"},
+	}, time.Now)
+	snapshot, err := provider.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	if state := snapshot.States["oversized"]; state.State != org.StateWorking || state.Activity != nil {
+		t.Errorf("oversized state = %+v, want working with absent activity", state)
+	}
+	valid := snapshot.States["valid"]
+	if valid.State != org.StateIdle || valid.Activity == nil ||
+		valid.Activity.Turn != 4 || valid.Activity.TurnEpoch != 5 ||
+		!valid.Activity.CompletedAt.Equal(time.UnixMilli(6).UTC()) {
+		t.Errorf("valid state = %+v", valid)
+	}
+	if state := snapshot.States["absent"]; state.State != org.StateBlocked || state.Activity != nil {
+		t.Errorf("absent state = %+v, want blocked with absent activity", state)
+	}
+}
+
 func TestHerdrOrgProviderFailures(t *testing.T) {
 	tests := []struct {
 		name string

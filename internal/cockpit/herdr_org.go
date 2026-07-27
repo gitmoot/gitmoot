@@ -53,9 +53,9 @@ type herdrOrgPane struct {
 }
 
 type herdrCompletedTurnWire struct {
-	Turn            *int64 `json:"turn"`
-	TurnEpoch       *int64 `json:"turn_epoch"`
-	CompletedUnixMS *int64 `json:"completed_unix_ms"`
+	Turn            *json.Number `json:"turn"`
+	TurnEpoch       *json.Number `json:"turn_epoch"`
+	CompletedUnixMS *json.Number `json:"completed_unix_ms"`
 }
 
 func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
@@ -138,14 +138,28 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 }
 
 func mapHerdrCompletedTurn(turn *herdrCompletedTurnWire) *org.RoleActivity {
-	if turn == nil || turn.Turn == nil || turn.TurnEpoch == nil || turn.CompletedUnixMS == nil {
+	if turn == nil {
+		return nil
+	}
+	turnNumber, turnOK := positiveHerdrInt64(turn.Turn)
+	turnEpoch, epochOK := positiveHerdrInt64(turn.TurnEpoch)
+	completedUnixMS, completedOK := positiveHerdrInt64(turn.CompletedUnixMS)
+	if !turnOK || !epochOK || !completedOK {
 		return nil
 	}
 	return &org.RoleActivity{
-		Turn:        *turn.Turn,
-		TurnEpoch:   *turn.TurnEpoch,
-		CompletedAt: time.UnixMilli(*turn.CompletedUnixMS).UTC(),
+		Turn:        turnNumber,
+		TurnEpoch:   turnEpoch,
+		CompletedAt: time.UnixMilli(completedUnixMS).UTC(),
 	}
+}
+
+func positiveHerdrInt64(value *json.Number) (int64, bool) {
+	if value == nil {
+		return 0, false
+	}
+	parsed, err := strconv.ParseInt(value.String(), 10, 64)
+	return parsed, err == nil && parsed > 0
 }
 
 // Recycle starts a fresh interactive agent in a pane that has already returned
