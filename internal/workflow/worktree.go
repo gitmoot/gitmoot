@@ -28,6 +28,19 @@ type BranchExistenceChecker interface {
 	BranchExists(ctx context.Context, branch string) (bool, error)
 }
 
+// WritableWorktreeLineageManager is implemented by the checkout-bound Git
+// client. It keeps lineage checks and any stale-worktree replacement inside the
+// same checkout mutation lock used for ordinary worktree allocation.
+type WritableWorktreeLineageManager interface {
+	FetchRemote(ctx context.Context, remote string) error
+	HeadSHAAt(ctx context.Context, path string) (string, error)
+	RevParse(ctx context.Context, rev string) (string, error)
+	IsAncestor(ctx context.Context, ancestor, descendant string) (bool, error)
+	WorktreeCleanAt(ctx context.Context, path string) (bool, error)
+	RemoveWorktree(ctx context.Context, path string) error
+	DeleteBranch(ctx context.Context, branch string) error
+}
+
 // ReadOnlyWorktreeManager allocates and disposes throwaway detached worktrees
 // for read-only (ask/review) delegation fan-out. Unlike implement worktrees
 // these carry no branch and no branch lock: the worker only reads the checkout,
@@ -71,15 +84,65 @@ type WorktreeCommitter interface {
 }
 
 type TaskWorktreeRequest struct {
-	Home       string
-	Repo       string
-	TaskID     string
-	GoalID     string
-	TaskTitle  string
-	Branch     string
+	Home      string
+	Repo      string
+	TaskID    string
+	GoalID    string
+	TaskTitle string
+	Branch    string
+	// BaseBranch is the independently resolved lineage base for ordinary
+	// allocation and reuse checks.
 	BaseBranch string
-	Owner      string
-	Checkout   string
+	// LineageUnknown is set when no independently resolved base applies because
+	// a more precise validation already proved an existing worktree correct,
+	// such as an implicit PR fix-pass's exact branch and HEAD match. The
+	// existing-worktree reuse path treats lineage as satisfied without deriving
+	// a fallback base or performing another Git probe.
+	LineageUnknown bool
+	Owner          string
+	Checkout       string
+}
+
+// ReconcileDirtyTaskWorktreeLineage distinguishes ordinary resumable dirtiness
+// from a dirty worktree whose base has moved. Callers invoke it only after their
+// existing dirty-worktree preflight has succeeded.
+//
+// A confirmed off-lineage worktree is blocked and journaled through the same
+// path used by AllocateTaskWorktree. An intact or indeterminate lineage returns
+// handled=false so callers preserve their existing recover-or-clean guidance.
+func (e Engine) ReconcileDirtyTaskWorktreeLineage(ctx context.Context, manager WorktreeManager, task db.Task, path, baseRef string) (handled bool, blockErr error) {
+	// Every probe/setup failure is deliberately indeterminate. This method may
+	// only replace the caller's existing dirty-worktree behavior when it can
+	// affirmatively prove the worktree is off-lineage.
+	if err := e.validate(); err != nil {
+		return false, nil
+	}
+	lineage, err := writableWorktreeLineageManager(manager)
+	if err != nil {
+		return false, nil
+	}
+	baseHead, err := fetchAndResolveLineageBase(ctx, lineage, baseRef)
+	if err != nil {
+		return false, nil
+	}
+	worktreeHead, err := lineage.HeadSHAAt(ctx, path)
+	if err != nil {
+		return false, nil
+	}
+	isAncestor, err := lineage.IsAncestor(ctx, baseHead, worktreeHead)
+	if err != nil || isAncestor {
+		return false, nil
+	}
+	result := worktreeLineageResult{DirtyBlocked: true, BaseHead: baseHead, OldHead: worktreeHead}
+	reason := result.dirtyBlockedMessage(path)
+	request := TaskWorktreeRequest{
+		Repo:      task.RepoFullName,
+		TaskID:    task.ID,
+		GoalID:    task.GoalID,
+		TaskTitle: task.Title,
+		Branch:    task.Branch,
+	}
+	return true, blockTaskForDirtyWorktree(ctx, e.Store, task, request, path, reason)
 }
 
 func (e Engine) AllocateTaskWorktree(ctx context.Context, request TaskWorktreeRequest, manager WorktreeManager) (db.Task, error) {
@@ -142,7 +205,46 @@ func (e Engine) AllocateTaskWorktree(ctx context.Context, request TaskWorktreeRe
 			return db.Task{}, BlockedError{Reason: "branch lock rejected action for " + request.Branch}
 		}
 	}
+	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(ctx, e.Store, request.Checkout, "worktree:"+request.TaskID, time.Now().UTC())
+	if err != nil {
+		if createdLock {
+			_, _ = e.Store.ReleaseLock(ctx, lock)
+		}
+		return db.Task{}, err
+	}
+	defer func() {
+		if releaseCheckoutLock != nil {
+			_ = releaseCheckoutLock(context.Background())
+		}
+	}()
 	if task.Branch == request.Branch && task.WorktreePath == path {
+		// An implicit PR fix-pass may already have proved this exact branch and
+		// HEAD through PR-specific validation, with no applicable ancestry base.
+		if !request.LineageUnknown {
+			lineage, err := ensureExistingWorktreeLineage(ctx, manager, request.Branch, path, request.BaseBranch)
+			if err != nil {
+				if createdLock {
+					_, _ = e.Store.ReleaseLock(ctx, lock)
+				}
+				return db.Task{}, err
+			}
+			if lineage.DirtyBlocked {
+				reason := lineage.dirtyBlockedMessage(path)
+				blockErr := blockTaskForDirtyWorktree(ctx, e.Store, task, request, path, reason)
+				if createdLock {
+					_, _ = e.Store.ReleaseLock(ctx, lock)
+				}
+				return db.Task{}, blockErr
+			}
+			if lineage.Recut {
+				if err := addTaskWorktreeLineageEvent(ctx, e.Store, task.ID, "stale_worktree_recut", lineage.message("stale task worktree detected and re-cut")); err != nil {
+					if createdLock {
+						_, _ = e.Store.ReleaseLock(ctx, lock)
+					}
+					return db.Task{}, err
+				}
+			}
+		}
 		if claimPlanned {
 			if err := e.claimPlannedTaskForImplementation(ctx, task.ID); err != nil {
 				if createdLock {
@@ -160,23 +262,28 @@ func (e Engine) AllocateTaskWorktree(ctx context.Context, request TaskWorktreeRe
 		}
 		return task, nil
 	}
-	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(ctx, e.Store, request.Checkout, "worktree:"+request.TaskID, time.Now().UTC())
+	lineage, err := addTaskWorktree(ctx, manager, request.Branch, path, request.BaseBranch)
 	if err != nil {
 		if createdLock {
 			_, _ = e.Store.ReleaseLock(ctx, lock)
 		}
 		return db.Task{}, err
 	}
-	defer func() {
-		if releaseCheckoutLock != nil {
-			_ = releaseCheckoutLock(context.Background())
-		}
-	}()
-	if err := addTaskWorktree(ctx, manager, request.Branch, path, request.BaseBranch); err != nil {
+	if lineage.DirtyBlocked {
+		reason := lineage.dirtyBlockedMessage(path)
+		blockErr := blockTaskForDirtyWorktree(ctx, e.Store, task, request, path, reason)
 		if createdLock {
 			_, _ = e.Store.ReleaseLock(ctx, lock)
 		}
-		return db.Task{}, err
+		return db.Task{}, blockErr
+	}
+	if lineage.Recut {
+		if err := addTaskWorktreeLineageEvent(ctx, e.Store, task.ID, "stale_worktree_recut", lineage.message("stale task worktree detected and re-cut")); err != nil {
+			if createdLock {
+				_, _ = e.Store.ReleaseLock(ctx, lock)
+			}
+			return db.Task{}, err
+		}
 	}
 	taskGoalID := task.GoalID
 	if taskGoalID == "" {
@@ -315,11 +422,41 @@ func (e Engine) AllocateDelegationWorktree(ctx context.Context, request Delegati
 			_ = releaseCheckoutLock(context.Background())
 		}
 	}()
-	if err := addTaskWorktree(ctx, manager, branch, path, request.BaseBranch); err != nil {
+	lineage, err := addTaskWorktree(ctx, manager, branch, path, request.BaseBranch)
+	if err != nil {
 		if createdLock {
 			_, _ = e.Store.ReleaseLock(ctx, lock)
 		}
 		return DelegationWorktreeResult{}, err
+	}
+	if lineage.DirtyBlocked {
+		reason := lineage.dirtyBlockedMessage(path)
+		if err := e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   request.ParentJobID,
+			Kind:    "stale_worktree_dirty_blocked",
+			Message: reason,
+		}); err != nil {
+			if createdLock {
+				_, _ = e.Store.ReleaseLock(ctx, lock)
+			}
+			return DelegationWorktreeResult{}, err
+		}
+		if createdLock {
+			_, _ = e.Store.ReleaseLock(ctx, lock)
+		}
+		return DelegationWorktreeResult{}, BlockedError{Reason: reason}
+	}
+	if lineage.Recut {
+		if err := e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   request.ParentJobID,
+			Kind:    "stale_worktree_recut",
+			Message: lineage.message("stale delegation worktree detected and re-cut"),
+		}); err != nil {
+			if createdLock {
+				_, _ = e.Store.ReleaseLock(ctx, lock)
+			}
+			return DelegationWorktreeResult{}, err
+		}
 	}
 	return DelegationWorktreeResult{Path: path, Branch: branch}, nil
 }
@@ -1113,21 +1250,217 @@ func (e Engine) cleanupConsumedImplementLegWorktrees(ctx context.Context, payloa
 	}
 }
 
-func addTaskWorktree(ctx context.Context, manager WorktreeManager, branch string, path string, base string) error {
+type worktreeLineageResult struct {
+	Recut        bool
+	DirtyBlocked bool
+	BaseHead     string
+	OldHead      string
+	NewHead      string
+}
+
+func (r worktreeLineageResult) message(prefix string) string {
+	return fmt.Sprintf("%s: base=%s old_head=%s new_head=%s", prefix, r.BaseHead, r.OldHead, r.NewHead)
+}
+
+func (r worktreeLineageResult) dirtyBlockedMessage(path string) string {
+	return fmt.Sprintf("worktree at %s is stale (HEAD %s is not a descendant of resolved base %s) and has uncommitted changes; manually salvage, commit, stash, or clean them before retrying so the worktree can be re-cut", path, r.OldHead, r.BaseHead)
+}
+
+func addTaskWorktree(ctx context.Context, manager WorktreeManager, branch string, path string, base string) (worktreeLineageResult, error) {
 	if checker, ok := manager.(BranchExistenceChecker); ok {
 		exists, err := checker.BranchExists(ctx, branch)
 		if err != nil {
-			return err
+			return worktreeLineageResult{}, err
 		}
 		if exists {
 			existingManager, ok := manager.(ExistingBranchWorktreeManager)
 			if !ok {
-				return errors.New("existing branch worktree manager is required")
+				return worktreeLineageResult{}, errors.New("existing branch worktree manager is required")
 			}
-			return existingManager.AddExistingBranchWorktree(ctx, branch, path)
+			return reuseExistingBranchWorktree(ctx, manager, existingManager, branch, path, base)
 		}
 	}
-	return manager.AddWorktree(ctx, branch, path, base)
+	return worktreeLineageResult{}, manager.AddWorktree(ctx, branch, path, base)
+}
+
+func ensureExistingWorktreeLineage(ctx context.Context, manager WorktreeManager, branch, path, base string) (worktreeLineageResult, error) {
+	lineage, err := writableWorktreeLineageManager(manager)
+	if err != nil {
+		return worktreeLineageResult{}, err
+	}
+	baseHead, err := fetchAndResolveLineageBase(ctx, lineage, base)
+	if err != nil {
+		return worktreeLineageResult{}, err
+	}
+	oldHead, err := lineage.HeadSHAAt(ctx, path)
+	if err != nil {
+		return worktreeLineageResult{}, fmt.Errorf("resolve existing worktree head: %w", err)
+	}
+	isAncestor, err := lineage.IsAncestor(ctx, baseHead, oldHead)
+	if err != nil {
+		return worktreeLineageResult{}, fmt.Errorf("verify existing worktree lineage: %w", err)
+	}
+	if isAncestor {
+		return worktreeLineageResult{BaseHead: baseHead, OldHead: oldHead, NewHead: oldHead}, nil
+	}
+	clean, err := lineage.WorktreeCleanAt(ctx, path)
+	if err != nil {
+		return worktreeLineageResult{}, fmt.Errorf("inspect stale worktree for uncommitted changes: %w", err)
+	}
+	if !clean {
+		return worktreeLineageResult{DirtyBlocked: true, BaseHead: baseHead, OldHead: oldHead}, nil
+	}
+	if err := lineage.RemoveWorktree(ctx, path); err != nil {
+		return worktreeLineageResult{}, fmt.Errorf("remove stale worktree: %w", err)
+	}
+	if err := lineage.DeleteBranch(ctx, branch); err != nil {
+		return worktreeLineageResult{}, fmt.Errorf("delete stale worktree branch: %w", err)
+	}
+	if err := manager.AddWorktree(ctx, branch, path, baseHead); err != nil {
+		return worktreeLineageResult{}, fmt.Errorf("re-create stale worktree: %w", err)
+	}
+	newHead, err := lineage.HeadSHAAt(ctx, path)
+	if err != nil {
+		return worktreeLineageResult{}, fmt.Errorf("resolve re-created worktree head: %w", err)
+	}
+	return worktreeLineageResult{Recut: true, BaseHead: baseHead, OldHead: oldHead, NewHead: newHead}, nil
+}
+
+func reuseExistingBranchWorktree(ctx context.Context, manager WorktreeManager, existing ExistingBranchWorktreeManager, branch, path, base string) (worktreeLineageResult, error) {
+	lineage, err := writableWorktreeLineageManager(manager)
+	if err != nil {
+		return worktreeLineageResult{}, err
+	}
+	baseHead, err := fetchAndResolveLineageBase(ctx, lineage, base)
+	if err != nil {
+		return worktreeLineageResult{}, err
+	}
+	pathExists := false
+	if _, statErr := os.Stat(path); statErr == nil {
+		pathExists = true
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return worktreeLineageResult{}, fmt.Errorf("inspect existing worktree path: %w", statErr)
+	}
+	var oldHead string
+	if pathExists {
+		oldHead, err = lineage.HeadSHAAt(ctx, path)
+	} else {
+		oldHead, err = lineage.RevParse(ctx, branch)
+	}
+	if err != nil {
+		return worktreeLineageResult{}, fmt.Errorf("resolve existing worktree branch head: %w", err)
+	}
+	isAncestor, err := lineage.IsAncestor(ctx, baseHead, oldHead)
+	if err != nil {
+		return worktreeLineageResult{}, fmt.Errorf("verify existing worktree branch lineage: %w", err)
+	}
+	if isAncestor {
+		if pathExists {
+			return worktreeLineageResult{BaseHead: baseHead, OldHead: oldHead, NewHead: oldHead}, nil
+		}
+		return worktreeLineageResult{}, existing.AddExistingBranchWorktree(ctx, branch, path)
+	}
+	if pathExists {
+		clean, err := lineage.WorktreeCleanAt(ctx, path)
+		if err != nil {
+			return worktreeLineageResult{}, fmt.Errorf("inspect stale worktree for uncommitted changes: %w", err)
+		}
+		if !clean {
+			return worktreeLineageResult{DirtyBlocked: true, BaseHead: baseHead, OldHead: oldHead}, nil
+		}
+		if err := lineage.RemoveWorktree(ctx, path); err != nil {
+			return worktreeLineageResult{}, fmt.Errorf("remove stale worktree: %w", err)
+		}
+	}
+	if err := lineage.DeleteBranch(ctx, branch); err != nil {
+		return worktreeLineageResult{}, fmt.Errorf("delete stale worktree branch: %w", err)
+	}
+	if err := manager.AddWorktree(ctx, branch, path, baseHead); err != nil {
+		return worktreeLineageResult{}, fmt.Errorf("re-create stale worktree branch: %w", err)
+	}
+	newHead, err := lineage.HeadSHAAt(ctx, path)
+	if err != nil {
+		return worktreeLineageResult{}, fmt.Errorf("resolve re-created worktree head: %w", err)
+	}
+	return worktreeLineageResult{Recut: true, BaseHead: baseHead, OldHead: oldHead, NewHead: newHead}, nil
+}
+
+func writableWorktreeLineageManager(manager WorktreeManager) (WritableWorktreeLineageManager, error) {
+	lineage, ok := manager.(WritableWorktreeLineageManager)
+	if !ok {
+		return nil, errors.New("writable worktree lineage manager is required")
+	}
+	return lineage, nil
+}
+
+func fetchAndResolveLineageBase(ctx context.Context, manager WritableWorktreeLineageManager, base string) (string, error) {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		base = "HEAD"
+	}
+	// HEAD and full object IDs already identify the prepared checkout's exact
+	// local commit; fetching cannot change what either resolves to and would make
+	// local-only repositories fail a purely local retry. Mutable base refs still
+	// refresh origin before resolution.
+	if base != "HEAD" && !isFullGitObjectID(base) {
+		if err := manager.FetchRemote(ctx, "origin"); err != nil {
+			return "", fmt.Errorf("fetch origin before worktree lineage check: %w", err)
+		}
+	}
+	head, err := manager.RevParse(ctx, base)
+	if err != nil {
+		return "", fmt.Errorf("resolve worktree lineage base %q: %w", base, err)
+	}
+	return head, nil
+}
+
+func isFullGitObjectID(ref string) bool {
+	if len(ref) != 40 && len(ref) != 64 {
+		return false
+	}
+	for _, char := range ref {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') && (char < 'A' || char > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+func addTaskWorktreeLineageEvent(ctx context.Context, store *db.Store, taskID, kind, reason string) error {
+	return store.AddTaskEvent(ctx, db.TaskEvent{
+		TaskID: taskID,
+		Kind:   kind,
+		Reason: reason,
+	})
+}
+
+func blockTaskForDirtyWorktree(ctx context.Context, store *db.Store, task db.Task, request TaskWorktreeRequest, path, reason string) error {
+	fromState := task.State
+	task.State = string(TaskBlocked)
+	task.Branch = request.Branch
+	task.WorktreePath = path
+	if task.RepoFullName == "" {
+		task.RepoFullName = request.Repo
+	}
+	if task.GoalID == "" {
+		task.GoalID = request.GoalID
+	}
+	if task.Title == "" {
+		task.Title = request.TaskTitle
+	}
+	if err := store.UpsertTask(ctx, task); err != nil {
+		return err
+	}
+	if err := store.AddTaskEvent(ctx, db.TaskEvent{
+		TaskID:    task.ID,
+		Kind:      "stale_worktree_dirty_blocked",
+		FromState: fromState,
+		ToState:   string(TaskBlocked),
+		Reason:    reason,
+	}); err != nil {
+		return err
+	}
+	return BlockedError{Reason: reason}
 }
 
 func TaskWorktreePath(home string, repo string, taskID string) (string, error) {

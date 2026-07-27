@@ -484,6 +484,57 @@ func TestClientBehindCountRejectsInvalidOutput(t *testing.T) {
 	}
 }
 
+func TestClientIsAncestor(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	ctx := context.Background()
+	dir := t.TempDir()
+	runGit(t, dir, "init", "-b", "main")
+	runGit(t, dir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, dir, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(dir, "history.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile base: %v", err)
+	}
+	runGit(t, dir, "add", "history.txt")
+	runGit(t, dir, "commit", "-m", "base")
+	client := Client{Dir: dir}
+	base, err := client.HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("HeadSHA base: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "history.txt"), []byte("base\nchild\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile child: %v", err)
+	}
+	runGit(t, dir, "commit", "-am", "child")
+	child, err := client.HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("HeadSHA child: %v", err)
+	}
+	isAncestor, err := client.IsAncestor(ctx, base, child)
+	if err != nil || !isAncestor {
+		t.Fatalf("IsAncestor true case = %t, %v", isAncestor, err)
+	}
+
+	runGit(t, dir, "switch", "--detach", base)
+	if err := os.WriteFile(filepath.Join(dir, "sibling.txt"), []byte("sibling\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile sibling: %v", err)
+	}
+	runGit(t, dir, "add", "sibling.txt")
+	runGit(t, dir, "commit", "-m", "sibling")
+	sibling, err := client.HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("HeadSHA sibling: %v", err)
+	}
+	isAncestor, err = client.IsAncestor(ctx, child, sibling)
+	if err != nil || isAncestor {
+		t.Fatalf("IsAncestor false case = %t, %v", isAncestor, err)
+	}
+	if _, err := client.IsAncestor(ctx, "missing-ref", sibling); err == nil {
+		t.Fatal("IsAncestor accepted an invalid ref")
+	}
+}
+
 func TestClientCreateBranchSmoke(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")

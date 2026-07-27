@@ -4,12 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	gitutil "github.com/gitmoot/gitmoot/internal/git"
 )
 
 func TestTaskWorktreePath(t *testing.T) {
@@ -380,7 +383,11 @@ func TestEngineAllocateTaskWorktreeReusesExistingTaskWorktree(t *testing.T) {
 	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: "task-1", Owner: "lead"}); err != nil || !acquired {
 		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
 	}
-	manager := &fakeWorktreeManager{}
+	manager := &fakeWorktreeManager{
+		pathHeads: map[string]string{path: "agent-head"},
+		revHeads:  map[string]string{"HEAD": "base-head"},
+		ancestor:  true,
+	}
 
 	task, err := engine.AllocateTaskWorktree(ctx, TaskWorktreeRequest{
 		Home:     home,
@@ -399,6 +406,86 @@ func TestEngineAllocateTaskWorktreeReusesExistingTaskWorktree(t *testing.T) {
 	}
 	if len(manager.calls) != 0 {
 		t.Fatalf("AddWorktree ran despite existing task worktree: %+v", manager.calls)
+	}
+	if len(manager.removed) != 0 || len(manager.deletedBranches) != 0 || len(manager.cleanCalls) != 0 {
+		t.Fatalf("fresh worktree was mutated or dirty-checked: removed=%v deleted=%v clean_checks=%v", manager.removed, manager.deletedBranches, manager.cleanCalls)
+	}
+	if len(manager.ancestorCalls) != 1 || manager.ancestorCalls[0] != [2]string{"base-head", "agent-head"} {
+		t.Fatalf("ancestor calls = %v, want base-head -> agent-head", manager.ancestorCalls)
+	}
+}
+
+func TestEngineAllocateTaskWorktreeRecutsCleanOffLineageWorktree(t *testing.T) {
+	ctx, store, engine, manager, request, path, oldHead, baseHead := setupOffLineageTaskWorktree(t, false)
+
+	task, err := engine.AllocateTaskWorktree(ctx, request, manager)
+	if err != nil {
+		t.Fatalf("AllocateTaskWorktree: %v", err)
+	}
+	if task.WorktreePath != path {
+		t.Fatalf("task worktree = %q, want %q", task.WorktreePath, path)
+	}
+	newHead, err := (gitutil.Client{Dir: path}).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("HeadSHA re-cut worktree: %v", err)
+	}
+	if newHead != baseHead || newHead == oldHead {
+		t.Fatalf("re-cut head = %s, want base %s and not old %s", newHead, baseHead, oldHead)
+	}
+	events, err := store.ListTaskEvents(ctx, request.TaskID)
+	if err != nil {
+		t.Fatalf("ListTaskEvents: %v", err)
+	}
+	if len(events) != 1 || events[0].Kind != "stale_worktree_recut" ||
+		!strings.Contains(events[0].Reason, "old_head="+oldHead) ||
+		!strings.Contains(events[0].Reason, "new_head="+newHead) {
+		t.Fatalf("task events = %+v", events)
+	}
+}
+
+func TestEngineAllocateTaskWorktreeBlocksDirtyOffLineageWorktree(t *testing.T) {
+	ctx, store, engine, manager, request, path, oldHead, baseHead := setupOffLineageTaskWorktree(t, true)
+
+	_, err := engine.AllocateTaskWorktree(ctx, request, manager)
+	var blocked BlockedError
+	if !errors.As(err, &blocked) {
+		t.Fatalf("AllocateTaskWorktree error = %v, want BlockedError", err)
+	}
+	for _, want := range []string{path, oldHead, baseHead, "uncommitted changes", "manually salvage"} {
+		if !strings.Contains(blocked.Reason, want) {
+			t.Fatalf("blocked reason %q missing %q", blocked.Reason, want)
+		}
+	}
+	headAfter, err := (gitutil.Client{Dir: path}).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("HeadSHA preserved worktree: %v", err)
+	}
+	if headAfter != oldHead {
+		t.Fatalf("dirty worktree head = %s, want preserved %s", headAfter, oldHead)
+	}
+	dirtyPath := filepath.Join(path, "salvage.txt")
+	content, err := os.ReadFile(dirtyPath)
+	if err != nil {
+		t.Fatalf("read preserved dirty file: %v", err)
+	}
+	if string(content) != "salvage me\n" {
+		t.Fatalf("preserved dirty content = %q", content)
+	}
+	task, err := store.GetTask(ctx, request.TaskID)
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if task.State != string(TaskBlocked) || task.WorktreePath != path {
+		t.Fatalf("blocked task = %+v, want blocked with preserved worktree", task)
+	}
+	events, err := store.ListTaskEvents(ctx, request.TaskID)
+	if err != nil {
+		t.Fatalf("ListTaskEvents: %v", err)
+	}
+	if len(events) != 1 || events[0].Kind != "stale_worktree_dirty_blocked" ||
+		events[0].ToState != string(TaskBlocked) ||
+		!strings.Contains(events[0].Reason, "uncommitted changes") {
+		t.Fatalf("task events = %+v", events)
 	}
 }
 
@@ -694,6 +781,81 @@ func TestAllocateDelegationWorktreeReusesExistingBranch(t *testing.T) {
 	}
 }
 
+func TestAllocateDelegationWorktreeExistingBranchLineageOutcomes(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		clean     bool
+		wantBlock bool
+		wantEvent string
+	}{
+		{name: "clean stale worktree is re-cut", clean: true, wantEvent: "stale_worktree_recut"},
+		{name: "dirty stale worktree is preserved and blocked", clean: false, wantBlock: true, wantEvent: "stale_worktree_dirty_blocked"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			engine := testEngine(store)
+			home := t.TempDir()
+			branch := delegationBranchName(Delegation{ID: "d1"}, "job-1", "d1", 0)
+			path, err := DelegationWorktreePath(home, "owner/repo", "job-1", "d1", 0)
+			if err != nil {
+				t.Fatalf("DelegationWorktreePath: %v", err)
+			}
+			if err := os.MkdirAll(path, 0o755); err != nil {
+				t.Fatalf("MkdirAll delegation worktree: %v", err)
+			}
+			manager := &fakeWorktreeManager{
+				existingBranches: map[string]bool{branch: true},
+				pathHeads:        map[string]string{path: "stale-head"},
+				revHeads:         map[string]string{"parent": "parent-head"},
+				ancestor:         false,
+				ancestorSet:      true,
+				clean:            tc.clean,
+				cleanSet:         true,
+			}
+
+			result, err := engine.AllocateDelegationWorktree(ctx, DelegationWorktreeRequest{
+				Home:         home,
+				Repo:         "owner/repo",
+				ParentJobID:  "job-1",
+				DelegationID: "d1",
+				BaseBranch:   "parent",
+				Owner:        "helper",
+				Checkout:     t.TempDir(),
+			}, manager)
+			var blocked BlockedError
+			if tc.wantBlock {
+				if !errors.As(err, &blocked) {
+					t.Fatalf("AllocateDelegationWorktree error = %v, want BlockedError", err)
+				}
+				if len(manager.removed) != 0 || len(manager.deletedBranches) != 0 || len(manager.calls) != 0 {
+					t.Fatalf("dirty delegation worktree was mutated: removed=%v deleted=%v add=%v", manager.removed, manager.deletedBranches, manager.calls)
+				}
+				if !strings.Contains(blocked.Reason, "uncommitted changes") {
+					t.Fatalf("blocked reason = %q", blocked.Reason)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("AllocateDelegationWorktree: %v", err)
+				}
+				if result.Path != path {
+					t.Fatalf("result path = %q, want %q", result.Path, path)
+				}
+				if len(manager.removed) != 1 || len(manager.deletedBranches) != 1 || len(manager.calls) != 1 {
+					t.Fatalf("clean delegation recut calls: removed=%v deleted=%v add=%v", manager.removed, manager.deletedBranches, manager.calls)
+				}
+			}
+			events, err := store.ListJobEvents(ctx, "job-1")
+			if err != nil {
+				t.Fatalf("ListJobEvents: %v", err)
+			}
+			if len(events) != 1 || events[0].Kind != tc.wantEvent {
+				t.Fatalf("job events = %+v, want kind %q", events, tc.wantEvent)
+			}
+		})
+	}
+}
+
 func TestAllocateDelegationWorktreeReleasesBranchLockOnFailure(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -717,13 +879,113 @@ func TestAllocateDelegationWorktreeReleasesBranchLockOnFailure(t *testing.T) {
 	}
 }
 
+func setupOffLineageTaskWorktree(t *testing.T, dirty bool) (context.Context, *db.Store, Engine, gitutil.Client, TaskWorktreeRequest, string, string, string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "origin.git")
+	checkout := filepath.Join(root, "checkout")
+	if err := os.MkdirAll(checkout, 0o755); err != nil {
+		t.Fatalf("MkdirAll checkout: %v", err)
+	}
+	runWorktreeGit(t, root, "init", "--bare", remote)
+	runWorktreeGit(t, checkout, "init", "-b", "main")
+	runWorktreeGit(t, checkout, "config", "user.email", "gitmoot@example.com")
+	runWorktreeGit(t, checkout, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(checkout, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile base: %v", err)
+	}
+	runWorktreeGit(t, checkout, "add", "base.txt")
+	runWorktreeGit(t, checkout, "commit", "-m", "base")
+	runWorktreeGit(t, checkout, "remote", "add", "origin", remote)
+	runWorktreeGit(t, checkout, "push", "-u", "origin", "main")
+
+	home := filepath.Join(root, "home")
+	path, err := TaskWorktreePath(home, "owner/repo", "task-1")
+	if err != nil {
+		t.Fatalf("TaskWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll worktree parent: %v", err)
+	}
+	runWorktreeGit(t, checkout, "worktree", "add", "-b", "task-1", path, "HEAD")
+	if err := os.WriteFile(filepath.Join(path, "stale.txt"), []byte("committed stale work\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile stale: %v", err)
+	}
+	runWorktreeGit(t, path, "add", "stale.txt")
+	runWorktreeGit(t, path, "commit", "-m", "stale branch")
+	oldHead, err := (gitutil.Client{Dir: path}).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("HeadSHA stale worktree: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(checkout, "current.txt"), []byte("current base\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile current: %v", err)
+	}
+	runWorktreeGit(t, checkout, "add", "current.txt")
+	runWorktreeGit(t, checkout, "commit", "-m", "advance base")
+	runWorktreeGit(t, checkout, "push", "origin", "main")
+	baseHead, err := (gitutil.Client{Dir: checkout}).RevParse(ctx, "origin/main")
+	if err != nil {
+		t.Fatalf("RevParse origin/main: %v", err)
+	}
+	if dirty {
+		if err := os.WriteFile(filepath.Join(path, "salvage.txt"), []byte("salvage me\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile salvage: %v", err)
+		}
+	}
+
+	store := openEngineStore(t)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-1",
+		RepoFullName: "owner/repo",
+		State:        string(TaskImplementing),
+		Branch:       "task-1",
+		WorktreePath: path,
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	request := TaskWorktreeRequest{
+		Home:       home,
+		Repo:       "owner/repo",
+		TaskID:     "task-1",
+		Branch:     "task-1",
+		BaseBranch: "origin/main",
+		Owner:      "lead",
+		Checkout:   checkout,
+	}
+	return ctx, store, testEngine(store), gitutil.Client{Dir: checkout}, request, path, oldHead, baseHead
+}
+
+func runWorktreeGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, output)
+	}
+}
+
 type fakeWorktreeManager struct {
 	err              error
 	onAdd            func()
 	existingBranches map[string]bool
+	fetchedRemotes   []string
+	pathHeads        map[string]string
+	revHeads         map[string]string
+	ancestor         bool
+	ancestorSet      bool
+	clean            bool
+	cleanSet         bool
+	cleanCalls       []string
+	ancestorCalls    [][2]string
 	calls            []worktreeCall
 	existingCalls    []worktreeCall
 	detachedCalls    []worktreeCall // AddDetachedWorktree: path in .path, ref in .base
+	removed          []string       // RemoveWorktree paths
 	removedForce     []string       // RemoveWorktreeForce paths
 	removeErr        error
 	deletedBranches  []string // DeleteBranch branches
@@ -751,6 +1013,9 @@ func (f *fakeWorktreeManager) AddWorktree(_ context.Context, branch string, path
 		f.onAdd()
 	}
 	f.calls = append(f.calls, worktreeCall{branch: branch, path: path, base: base})
+	if f.pathHeads != nil {
+		f.pathHeads[path] = base
+	}
 	return f.err
 }
 
@@ -764,6 +1029,41 @@ func (f *fakeWorktreeManager) AddExistingBranchWorktree(_ context.Context, branc
 
 func (f *fakeWorktreeManager) BranchExists(_ context.Context, branch string) (bool, error) {
 	return f.existingBranches[branch], nil
+}
+
+func (f *fakeWorktreeManager) FetchRemote(_ context.Context, remote string) error {
+	f.fetchedRemotes = append(f.fetchedRemotes, remote)
+	return nil
+}
+
+func (f *fakeWorktreeManager) HeadSHAAt(_ context.Context, path string) (string, error) {
+	if head := f.pathHeads[path]; head != "" {
+		return head, nil
+	}
+	return "existing-head", nil
+}
+
+func (f *fakeWorktreeManager) RevParse(_ context.Context, rev string) (string, error) {
+	if head := f.revHeads[rev]; head != "" {
+		return head, nil
+	}
+	return rev + "-head", nil
+}
+
+func (f *fakeWorktreeManager) IsAncestor(_ context.Context, ancestor, descendant string) (bool, error) {
+	f.ancestorCalls = append(f.ancestorCalls, [2]string{ancestor, descendant})
+	if f.ancestorSet {
+		return f.ancestor, nil
+	}
+	return true, nil
+}
+
+func (f *fakeWorktreeManager) WorktreeCleanAt(_ context.Context, path string) (bool, error) {
+	f.cleanCalls = append(f.cleanCalls, path)
+	if f.cleanSet {
+		return f.clean, nil
+	}
+	return true, nil
 }
 
 func (f *fakeWorktreeManager) AddDetachedWorktree(_ context.Context, path string, ref string) error {
@@ -786,6 +1086,11 @@ func (f *fakeWorktreeManager) CommitWorktree(_ context.Context, dir string, _ st
 
 func (f *fakeWorktreeManager) RemoveWorktreeForce(_ context.Context, path string) error {
 	f.removedForce = append(f.removedForce, path)
+	return f.removeErr
+}
+
+func (f *fakeWorktreeManager) RemoveWorktree(_ context.Context, path string) error {
+	f.removed = append(f.removed, path)
 	return f.removeErr
 }
 
