@@ -537,10 +537,16 @@ func newTrace(selector string, repo github.Repository, issue int64) IssueTrace {
 }
 
 func attemptFromGitHub(pr github.TracePullRequest, evidence []Evidence) PullRequestAttempt {
+	mergeSHA := ""
+	if strings.TrimSpace(pr.MergedAt) != "" {
+		// GitHub populates merge_commit_sha on open PRs with a synthetic test
+		// merge commit. Only merged_at makes that SHA observed merge evidence.
+		mergeSHA = pr.MergeSHA
+	}
 	return PullRequestAttempt{
 		Number: pr.Number, Title: pr.Title, State: pr.State, URL: pr.URL,
 		CreatedAt: pr.CreatedAt, HeadBranch: pr.Head.Ref, HeadSHA: pr.Head.SHA,
-		MergedAt: pr.MergedAt, MergeSHA: pr.MergeSHA, Evidence: evidence,
+		MergedAt: pr.MergedAt, MergeSHA: mergeSHA, Evidence: evidence,
 	}
 }
 
