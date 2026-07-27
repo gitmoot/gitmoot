@@ -23,6 +23,28 @@ type workflowShowMidCallCreateStore struct {
 	listCalls int
 }
 
+type workflowShowPostSummaryInsertStore struct {
+	*db.Store
+	insertCount int
+}
+
+func (s *workflowShowPostSummaryInsertStore) WorkflowSummary(ctx context.Context, label string) (db.WorkflowSummary, error) {
+	summary, err := s.Store.WorkflowSummary(ctx, label)
+	if err != nil {
+		return summary, err
+	}
+	for i := 0; i < s.insertCount; i++ {
+		if _, insertErr := s.Store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: label,
+			Author:     "operator",
+			Body:       fmt.Sprintf("post-summary-%d", i),
+		}); insertErr != nil {
+			return db.WorkflowSummary{}, fmt.Errorf("insert post-summary note: %w", insertErr)
+		}
+	}
+	return summary, nil
+}
+
 func (s *workflowShowMidCallCreateStore) WorkflowSummary(ctx context.Context, label string) (db.WorkflowSummary, error) {
 	summary, err := s.Store.WorkflowSummary(ctx, label)
 	if errors.Is(err, sql.ErrNoRows) && !s.created {
@@ -269,6 +291,63 @@ func TestWorkflowShowOverfetchBoundary(t *testing.T) {
 				t.Fatalf("first entry = %+v, want ID %s", out.Entries, tc.wantFirstID)
 			}
 		})
+	}
+}
+
+func TestWorkflowShowClampsStaleSummaryTotalAfterPostSummaryInsert(t *testing.T) {
+	originalLoader := workflowShowLoader
+	workflowShowLoader = func(ctx context.Context, store workflowShowStore, label string, fetchLimit int) (workflowShowData, error) {
+		concrete, ok := store.(*db.Store)
+		if !ok {
+			t.Fatalf("workflow show store type = %T, want *db.Store", store)
+		}
+		return loadWorkflowShow(ctx, &workflowShowPostSummaryInsertStore{
+			Store: concrete, insertCount: 2,
+		}, label, fetchLimit)
+	}
+	t.Cleanup(func() { workflowShowLoader = originalLoader })
+
+	run := func(t *testing.T, jsonOutput bool) (string, string) {
+		t.Helper()
+		home, store := workflowJournalTestHome(t)
+		const workflowID = "release/stale-summary"
+		if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+			WorkflowID: workflowID,
+			Author:     "operator",
+			Body:       "summary-visible-note",
+		}); err != nil {
+			t.Fatalf("InsertWorkflowNote: %v", err)
+		}
+		args := []string{workflowID, "--home", home, "--limit", "2"}
+		if jsonOutput {
+			args = append(args, "--json")
+		}
+		var stdout, stderr bytes.Buffer
+		if code := runWorkflowShow(args, &stdout, &stderr); code != 0 {
+			t.Fatalf("workflow show exit=%d stderr=%q", code, stderr.String())
+		}
+		return stdout.String(), stderr.String()
+	}
+
+	text, notice := run(t, false)
+	if got := strings.Count(text, "\tnote\t"); got != 2 {
+		t.Fatalf("shown note rows = %d, want 2; output=%q", got, text)
+	}
+	if !strings.Contains(notice, "showing the latest 2 of 2 entries") ||
+		strings.Contains(notice, "showing the latest 2 of 1 entries") {
+		t.Fatalf("stale-summary truncation notice = %q", notice)
+	}
+
+	rawJSON, jsonStderr := run(t, true)
+	if jsonStderr != "" {
+		t.Fatalf("JSON stderr = %q", jsonStderr)
+	}
+	var out workflowShowJSON
+	if err := json.Unmarshal([]byte(rawJSON), &out); err != nil {
+		t.Fatalf("decode JSON: %v raw=%s", err, rawJSON)
+	}
+	if !out.Truncated || len(out.Entries) != 2 || out.Summary.NoteCount != 1 {
+		t.Fatalf("JSON output = %+v", out)
 	}
 }
 

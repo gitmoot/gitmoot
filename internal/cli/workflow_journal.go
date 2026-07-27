@@ -166,6 +166,8 @@ func loadWorkflowShow(ctx context.Context, store workflowShowStore, label string
 	return data, err
 }
 
+var workflowShowLoader = loadWorkflowShow
+
 func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("workflow show", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -201,7 +203,7 @@ func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 	var data workflowShowData
 	if err := withStore(*home, func(store *db.Store) error {
 		var err error
-		data, err = loadWorkflowShow(context.Background(), store, label, fetchLimit)
+		data, err = workflowShowLoader(context.Background(), store, label, fetchLimit)
 		return err
 	}); err != nil {
 		fmt.Fprintf(stderr, "workflow show: %v\n", err)
@@ -214,6 +216,9 @@ func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 		entries = entries[len(entries)-*limit:]
 	}
 	totalEntries := summary.JobCount + summary.NoteCount
+	if totalEntries < len(entries) {
+		totalEntries = len(entries)
+	}
 	out := workflowShowJSON{Summary: summary, Meta: meta, Entries: entries, Truncated: truncated}
 	out.Meta.Description = workflowDisplayDescription(summary.WorkflowID, out.Meta.Description)
 	if *jsonOutput {
