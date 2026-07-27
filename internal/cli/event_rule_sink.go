@@ -194,6 +194,8 @@ func classifyEventRuleKinds(event events.Event) []string {
 		}
 	case events.EventOrgRecycleOverdue:
 		return []string{"recycle-overdue"}
+	case events.EventOrgInputPending:
+		return []string{"pane_input_pending"}
 	}
 	return nil
 }

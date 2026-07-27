@@ -1,7 +1,8 @@
 # Outbound Event Stream (`[events]`)
 
 Gitmoot can push a small, versioned, redacted JSON event to one HTTP endpoint
-whenever a job reaches a terminal state or pauses awaiting a human. This is an
+whenever a job reaches a terminal state, pauses awaiting a human, or an
+organization role remains in a configured alert condition. This is an
 **off-by-default, best-effort** outbound seam (#446): with no `[events]` config
 and no organization event rules, nothing is constructed and behavior is
 byte-identical to a build without it.
@@ -22,12 +23,15 @@ The pilot emits a tight allowlist of event types over the webhook transport:
 | `job.blocked`                   | a job reaches the `blocked` terminal state                                         |
 | `job.needs_attention`           | a tree pauses awaiting a human (the `escalate_human` pause today)                  |
 | `job.deferred`                  | the daemon re-queued a run whose delivery failed on a retryable operational blocker (runtime auth, rate limit/quota, network/GitHub outage, checkout contention) — it will be re-dispatched automatically. Since #532 slice E this is a **first-class** transition emitted INSTEAD of `job.failed` (no preceding `job.failed` for that run) |
+| `org.input_pending`             | a Herdr pane bound to an organization role continuously reports an interactive input dialog past the configured threshold |
 | `candidate.awaiting_promotion`  | a SkillOpt template candidate becomes `pending` after import (always, off the auto-promote policy) |
 | `candidate.auto_promoted`       | the off-by-default `[skillopt].auto_promote` policy auto-promoted a candidate to `current` (also the canary GRADUATE event) |
 | `candidate.canary_started`      | the off-by-default `[skillopt].auto_promote_canary` policy promoted a candidate to the `canary` state behind the live champion |
 | `candidate.rolled_back`         | the canary regression window auto-rolled-back a canary on a material regression (champion stays current, canary rejected) |
 
-Each terminal transition emits **exactly once**. The engine owns the
+Each terminal transition emits **exactly once**. `org.input_pending` is an
+episode alert instead: it repeats at most once per configured interval while
+the same interactive dialog condition remains observed. The engine owns the
 succeeded/failed/blocked emit on its `Mailbox` terminal path; the daemon owns the
 pre-flight (`queued -> failed|blocked`) and permission-blocked cases that never
 pass through that path. `job.needs_attention` is emitted once per fresh
@@ -108,10 +112,10 @@ Every event is a single JSON object:
 | `job_id`         | string | Opaque job id this event is about.                                          |
 | `root_id`        | string | The coordination tree's root id, so a consumer can aggregate a run client-side. |
 | `repo`           | string | `owner/repo` only — never an absolute checkout path.                        |
-| `status`         | string | Terminal/lifecycle state (`succeeded`/`failed`/`blocked`/`awaiting_human`). |
+| `status`         | string | Terminal/lifecycle state (`succeeded`/`failed`/`blocked`/`awaiting_human`/`input_pending`). |
 | `ts`             | string | RFC3339 emit time.                                                          |
 | `detail`         | string | Short redacted human-facing string (failure summary, the escalation question). |
-| `cause`          | string | Optional internal discriminator (`escalation`, `ask_gate`, `merge_guard`, `permission_guard`, or `blocked_since`). |
+| `cause`          | string | Optional internal discriminator (`escalation`, `ask_gate`, `merge_guard`, `permission_guard`, `blocked_since`, or `input_pending_since`). |
 
 `cause` is an additive optional field, so `schema_version` remains `1` and
 existing events serialize unchanged. It is a trusted enum assigned at emit
@@ -167,11 +171,13 @@ pane = "w1:p2"
 ```sh
 gitmoot org events rule add --on guard --match owner/repo --wake maintainer
 gitmoot org events rule add --on blocked --repo tendwire --wake maintainer
+gitmoot org events rule add --on pane_input_pending --wake maintainer
 gitmoot org events rule list
 gitmoot org events rule rm <rule-id>
 ```
 
-Kinds are `escalation`, `attention`, `guard`, `job-terminal`, and `blocked`.
+Kinds are `escalation`, `attention`, `guard`, `job-terminal`, `blocked`,
+`recycle-overdue`, and `pane_input_pending`.
 The v1 `--match` filter is a case-insensitive substring tested against the event
 repo and job id; empty matches all. `--repo` is an alias for that same filter;
 pass only one of the two flags. A plain `job.blocked` event matches both
@@ -182,9 +188,12 @@ one event per role. Set
 `[orchestrate].blocked_role_wake_after` to a positive Go duration to emit such an
 event when a task or Herdr role stays blocked past the threshold, re-nudging at
 most once per that interval while it remains blocked (so a dropped wake
-self-heals on the next interval instead of being lost); `0s` (the default)
-disables both evaluators. An episode is cleared on a definitive non-blocked
-observation, or once the subject stops being observed blocked for a short grace
+self-heals on the next interval instead of being lost). The same threshold and
+repeat interval apply to `org.input_pending`: Herdr's `input_pending: true`
+overrides the pane's last `idle` or `working` status, opens a separately keyed
+episode, and matches only `pane_input_pending`. `0s` (the default) disables
+these evaluators. An episode is cleared on a definitive non-matching
+observation, or once the subject stops matching for a short grace
 (so a role gone for good is not leaked); a brief `unknown`/absent snapshot blip
 within that grace never resets it, and a later re-block starts a fresh episode.
 Each synthesized event's `detail` carries the stable since-time, so a re-nudge

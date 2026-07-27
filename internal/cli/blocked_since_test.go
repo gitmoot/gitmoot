@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -572,5 +573,140 @@ func TestBlockedRoleEpisodeReapedWhenStaleThenReblockStartsFresh(t *testing.T) {
 	}
 	if got, want := eps[0].BlockedSince, reblock.UTC().Format(db.BlockedEpisodeTimeLayout); got != want {
 		t.Fatalf("re-block blocked_since = %q, want fresh %q (not the stale 2h-old instant)", got, want)
+	}
+}
+
+func TestInputPendingRoleEpisodeDueReNudgeClearAndStale(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	sink := &recordingSink{}
+	wakeAfter := time.Hour
+	base := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	snap := func(states map[string]org.RoleLiveState, observedAt time.Time) org.Snapshot {
+		return org.Snapshot{States: states, ObservedAt: observedAt}
+	}
+	pending := func(observedAt time.Time) org.Snapshot {
+		return snap(map[string]org.RoleLiveState{"owner": {State: org.StateInputPending}}, observedAt)
+	}
+	run := func(snapshot org.Snapshot, now time.Time) {
+		t.Helper()
+		if err := evaluateInputPendingRoleEpisodes(ctx, store, sink, snapshot, wakeAfter, io.Discard, now); err != nil {
+			t.Fatalf("evaluate at %s: %v", now, err)
+		}
+	}
+
+	run(pending(base.Add(-2*time.Hour)), base)
+	if got := len(sink.byType(events.EventOrgInputPending)); got != 1 {
+		t.Fatalf("first input-pending emit = %d, want 1", got)
+	}
+	episodes, err := store.ListBlockedEpisodes(ctx)
+	if err != nil || len(episodes) != 1 || episodes[0].Subject != "input-pending:role:owner" {
+		t.Fatalf("input-pending episode = %+v, err=%v", episodes, err)
+	}
+	firstSince := episodes[0].BlockedSince
+
+	run(pending(base.Add(30*time.Minute)), base.Add(30*time.Minute))
+	if got := len(sink.byType(events.EventOrgInputPending)); got != 1 {
+		t.Fatalf("emit within repeat interval = %d, want 1", got)
+	}
+	run(pending(base.Add(wakeAfter+time.Minute)), base.Add(wakeAfter+time.Minute))
+	if got := len(sink.byType(events.EventOrgInputPending)); got != 2 {
+		t.Fatalf("emit after repeat interval = %d, want 2", got)
+	}
+	episodes, err = store.ListBlockedEpisodes(ctx)
+	if err != nil || len(episodes) != 1 || episodes[0].BlockedSince != firstSince {
+		t.Fatalf("re-nudge changed input-pending episode identity: %+v, err=%v", episodes, err)
+	}
+	for _, ev := range sink.byType(events.EventOrgInputPending) {
+		if ev.Cause != "input_pending_since" || ev.JobID != "org-input-pending:owner" ||
+			ev.RootID != ev.JobID || ev.Status != string(org.StateInputPending) ||
+			!strings.Contains(ev.Detail, "role owner input pending") {
+			t.Fatalf("input-pending event changed shape: %+v", ev)
+		}
+	}
+
+	// Unknown is ambiguous and preserves the episode; a concrete state clears it.
+	run(snap(map[string]org.RoleLiveState{"owner": {State: org.StateUnknown}}, base.Add(62*time.Minute)), base.Add(62*time.Minute))
+	if episodes, _ = store.ListBlockedEpisodes(ctx); len(episodes) != 1 {
+		t.Fatalf("unknown cleared input-pending episode: %+v", episodes)
+	}
+	run(snap(map[string]org.RoleLiveState{"owner": {State: org.StateWorking}}, base.Add(63*time.Minute)), base.Add(63*time.Minute))
+	if episodes, _ = store.ListBlockedEpisodes(ctx); len(episodes) != 0 {
+		t.Fatalf("working did not clear input-pending episode: %+v", episodes)
+	}
+
+	// A fresh episode that disappears stays through the grace, then reaps stale.
+	fresh := base.Add(64 * time.Minute)
+	run(pending(fresh), fresh)
+	run(snap(map[string]org.RoleLiveState{}, fresh.Add(time.Minute)), fresh.Add(time.Minute))
+	if episodes, _ = store.ListBlockedEpisodes(ctx); len(episodes) != 1 {
+		t.Fatalf("absent input-pending episode reaped within grace: %+v", episodes)
+	}
+	past := fresh.Add(blockedEpisodeStaleGap + time.Minute)
+	run(snap(map[string]org.RoleLiveState{}, past), past)
+	if episodes, _ = store.ListBlockedEpisodes(ctx); len(episodes) != 0 {
+		t.Fatalf("stale input-pending episode was not reaped: %+v", episodes)
+	}
+}
+
+type synchronousEventRuleTestSink struct {
+	sink *eventRuleSink
+}
+
+func (s synchronousEventRuleTestSink) Emit(ctx context.Context, event events.Event) {
+	s.sink.evaluate(ctx, event)
+}
+
+func TestPaneInputPendingRuleObservationWakesAndTracksDelivery(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := runOrg([]string{"events", "rule", "add", "--home", home, "--on", "pane_input_pending", "--wake", "owner"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("add pane_input_pending rule code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	wake := &fakeEventWake{stalled: true}
+	ruleSink := &eventRuleSink{store: store, home: home, wake: wake}
+	sink := synchronousEventRuleTestSink{sink: ruleSink}
+	wakeAfter := time.Hour
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	snapshot := org.Snapshot{
+		States:     map[string]org.RoleLiveState{"owner": {State: org.StateInputPending}},
+		ObservedAt: now.Add(-2 * time.Hour),
+	}
+	if err := evaluateInputPendingRoleEpisodes(context.Background(), store, sink, snapshot, wakeAfter, io.Discard, now); err != nil {
+		t.Fatal(err)
+	}
+	if wake.promptCalls != 1 || wake.pane != "w1:p1" || !strings.Contains(wake.prompt, "pane_input_pending event for job org-input-pending:owner") {
+		t.Fatalf("input-pending wake = %+v", wake)
+	}
+	misses, err := store.ListRoleMissedWakes(context.Background())
+	if err != nil || len(misses) != 1 || misses[0].Role != "owner" || misses[0].Consecutive != 1 {
+		t.Fatalf("missed-wake tracking after stalled input-pending wake = %+v, err=%v", misses, err)
+	}
+
+	wake.stalled = false
+	reNudgeAt := now.Add(wakeAfter + time.Minute)
+	snapshot.ObservedAt = reNudgeAt
+	if err := evaluateInputPendingRoleEpisodes(context.Background(), store, sink, snapshot, wakeAfter, io.Discard, reNudgeAt); err != nil {
+		t.Fatal(err)
+	}
+	if wake.promptCalls != 2 {
+		t.Fatalf("input-pending re-nudge wake calls = %d, want 2", wake.promptCalls)
+	}
+	misses, err = store.ListRoleMissedWakes(context.Background())
+	if err != nil || len(misses) != 0 {
+		t.Fatalf("delivered input-pending wake did not reset counter: %+v, err=%v", misses, err)
 	}
 }

@@ -1280,11 +1280,18 @@ Event-rule wakes are separately opt-in:
 ```sh
 gitmoot org events rule add --on attention --match owner/repo --wake maintainer
 gitmoot org events rule add --on blocked --repo tendwire --wake maintainer
+gitmoot org events rule add --on pane_input_pending --wake maintainer
 gitmoot org events rule list
 gitmoot org events rule rm --home /alternate/home <rule-id>
 ```
 
-`--on` accepts `escalation`, `attention`, `guard`, `job-terminal`, or `blocked`.
+`--on` accepts `escalation`, `attention`, `guard`, `job-terminal`, `blocked`,
+`recycle-overdue`, or `pane_input_pending`. `pane_input_pending` matches the
+`org.input_pending` event emitted when Herdr continuously reports
+`input_pending: true` for a role's pane longer than
+`[orchestrate].blocked_role_wake_after`; it re-nudges at most once per that
+interval while the dialog remains pending. The pending signal takes precedence
+over the pane's last `idle` or `working` activity status.
 `--match` is a case-insensitive substring matched independently against the
 event repo and job id; omit it to match every event of that kind. `--repo` is a
 discoverable alias for the same substring filter, useful for repo-to-role
