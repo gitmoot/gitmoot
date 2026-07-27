@@ -201,6 +201,19 @@ gitmoot daemon logs
 gitmoot status --repo owner/repo
 ```
 
+If `daemon status` warns that the advertised log is missing or was last written
+before the running daemon started, the path is not receiving current output.
+`gitmoot doctor` reports the same confirmed condition as a non-fatal
+`daemon log` check. If the daemon runs under `systemd --user`, follow the likely
+live stream instead:
+
+```sh
+journalctl --user -u gitmoot-daemon -f
+```
+
+The warning does not assert how the daemon was launched. It is omitted when the
+daemon is stopped, the log is current, or the comparison cannot be made.
+
 Fix:
 
 ```sh
