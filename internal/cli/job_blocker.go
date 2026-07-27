@@ -244,16 +244,17 @@ func classifyAuthQuotaStrict(text string) string {
 	return ""
 }
 
+// claudeQuotaSignalRe matches a genuine quota/usage word (allowing a suffix,
+// e.g. "weekly", "credits", "resets") at a word boundary, so an unrelated
+// message can't false-match by embedding the signal mid-word (e.g. "rate"
+// inside "generate").
+var claudeQuotaSignalRe = regexp.MustCompile(`\b(week|usage|quota|credit|reset|rate)`)
+
 func claudeHitYourQuotaLimit(line string) bool {
 	if !strings.Contains(line, "hit your") || !strings.Contains(line, "limit") {
 		return false
 	}
-	for _, signal := range []string{"week", "usage", "quota", "credit", "reset", "rate"} {
-		if strings.Contains(line, signal) {
-			return true
-		}
-	}
-	return false
+	return claudeQuotaSignalRe.MatchString(line)
 }
 
 // quotaResetInRe matches relative reset hints the providers actually emit, e.g.

@@ -51,6 +51,13 @@ func TestClassifyOperationalBlocker(t *testing.T) {
 			wantOK: false,
 		},
 		{
+			// "generate" embeds "rate" mid-word; a bare substring match would
+			// misclassify this as a quota wall.
+			name:   "context limit suggesting a shorter prompt is not provider quota",
+			err:    workflow.DeliveryError{Err: errors.New("You've hit your maximum context limit; generate a shorter prompt")},
+			wantOK: false,
+		},
+		{
 			// The typed sentinel is trustworthy without the DeliveryError marker.
 			name:      "typed claude auth sentinel",
 			err:       fmt.Errorf("delivery failed: %w", runtime.ErrClaudeAuthFailed),
