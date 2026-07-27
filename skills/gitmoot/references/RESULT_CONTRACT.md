@@ -536,6 +536,10 @@ work was available. Produce remains a leaf, so its delegations are stripped.
   coordinator deciding whether work was delivered must check `delivery_status`
   from `gitmoot job show` / `job list --json`, the `advance_*` job events, or a
   non-zero `pull_request` instead of trusting the agent's prose on this question.
+  For a fix-pass job, `delivery_status` and the latest advancement marker take
+  precedence over a pull-request number inherited when the job was dispatched.
+  An omitted `delivery_status` means unknown or not applicable, not "not
+  delivered."
 - Do not claim tests were run unless they were actually run.
 - Do not claim files were changed unless they were actually changed.
 - Use `needs` for missing credentials, unclear scope, unavailable tools, failing

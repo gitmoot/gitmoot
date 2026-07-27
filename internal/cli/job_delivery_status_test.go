@@ -19,19 +19,28 @@ func TestRunJobListShowSurfaceDeliveryStatus(t *testing.T) {
 	jobs := []struct {
 		id          string
 		jobType     string
+		decision    string
 		pullRequest int
 		events      []string
 		want        string
 	}{
-		{id: "completed", jobType: "implement", events: []string{"advance_started", "advance_completed"}, want: jobDeliveryStatusDelivered},
+		{id: "completed", jobType: "implement", pullRequest: 41, events: []string{"advance_started", "advance_completed"}, want: jobDeliveryStatusDelivered},
 		{id: "pull-request", jobType: "implement", pullRequest: 42, want: jobDeliveryStatusDelivered},
 		{id: "pending-started", jobType: "implement", events: []string{"advance_started"}, want: jobDeliveryStatusPending},
 		{id: "pending-retry", jobType: "implement", events: []string{"advance_started", "advance_retry"}, want: jobDeliveryStatusPending},
 		{id: "blocked", jobType: "implement", events: []string{"advance_started", "advance_retry", "advance_blocked"}, want: jobDeliveryStatusBlocked},
+		{id: "fix-pass-blocked", jobType: "implement", pullRequest: 43, events: []string{"advance_started", "advance_blocked"}, want: jobDeliveryStatusBlocked},
+		{id: "failed-no-pr", jobType: "implement", decision: "failed", events: []string{"advance_started", "advance_completed"}},
+		{id: "blocked-no-pr", jobType: "implement", decision: "blocked", events: []string{"advance_started", "advance_completed"}},
+		{id: "implemented-no-pr", jobType: "implement", events: []string{"advance_started", "advance_skipped_no_pr", "advance_completed"}},
 		{id: "old-style", jobType: "implement"},
 		{id: "non-implement", jobType: "review", pullRequest: 42, events: []string{"advance_completed"}},
 	}
 	for _, item := range jobs {
+		decision := item.decision
+		if decision == "" {
+			decision = "implemented"
+		}
 		seedCLIJob(t, store, db.Job{
 			ID:    item.id,
 			Agent: "worker",
@@ -40,6 +49,7 @@ func TestRunJobListShowSurfaceDeliveryStatus(t *testing.T) {
 			Payload: mustJobPayload(t, workflow.JobPayload{
 				Repo:        "owner/repo",
 				PullRequest: item.pullRequest,
+				Result:      &workflow.AgentResult{Decision: decision},
 			}),
 		}, "succeeded")
 		for _, kind := range item.events {
@@ -120,22 +130,32 @@ func TestRunJobListShowSurfaceDeliveryStatus(t *testing.T) {
 
 func TestDeriveJobDeliveryStatusLatestMarkerWinsAndUnknownStaysSilent(t *testing.T) {
 	job := db.Job{Type: "implement"}
-	payload := workflow.JobPayload{}
 
 	tests := []struct {
-		name   string
-		events []db.JobEvent
-		want   string
+		name        string
+		decision    string
+		pullRequest int
+		events      []db.JobEvent
+		want        string
 	}{
-		{name: "blocked after retry", events: []db.JobEvent{{Kind: "advance_retry"}, {Kind: "advance_blocked"}}, want: jobDeliveryStatusBlocked},
-		{name: "retry after blocked", events: []db.JobEvent{{Kind: "advance_blocked"}, {Kind: "advance_retry"}}, want: jobDeliveryStatusPending},
-		{name: "completed after retry", events: []db.JobEvent{{Kind: "advance_retry"}, {Kind: "advance_completed"}}, want: jobDeliveryStatusDelivered},
-		{name: "retry queued suppresses stale pending", events: []db.JobEvent{{Kind: "advance_retry"}, {Kind: "retry_queued"}}},
-		{name: "awaiting human stays unknown", events: []db.JobEvent{{Kind: "advance_retry"}, {Kind: "advance_awaiting_human"}}},
+		{name: "blocked after retry", decision: "implemented", events: []db.JobEvent{{Kind: "advance_retry"}, {Kind: "advance_blocked"}}, want: jobDeliveryStatusBlocked},
+		{name: "inherited PR does not mask blocked delivery", decision: "implemented", pullRequest: 42, events: []db.JobEvent{{Kind: "advance_started"}, {Kind: "advance_blocked"}}, want: jobDeliveryStatusBlocked},
+		{name: "inherited PR stays pending until this job advances", decision: "implemented", pullRequest: 42, events: []db.JobEvent{{Kind: "advance_started"}, {Kind: "advance_retry"}}, want: jobDeliveryStatusPending},
+		{name: "retry after blocked", decision: "implemented", events: []db.JobEvent{{Kind: "advance_blocked"}, {Kind: "advance_retry"}}, want: jobDeliveryStatusPending},
+		{name: "completed with PR", decision: "implemented", pullRequest: 42, events: []db.JobEvent{{Kind: "advance_retry"}, {Kind: "advance_completed"}}, want: jobDeliveryStatusDelivered},
+		{name: "failed result cannot be delivered", decision: "failed", events: []db.JobEvent{{Kind: "advance_started"}, {Kind: "advance_completed"}}},
+		{name: "blocked result cannot be delivered", decision: "blocked", events: []db.JobEvent{{Kind: "advance_started"}, {Kind: "advance_completed"}}},
+		{name: "implemented no PR stays unknown after generic completion", decision: "implemented", events: []db.JobEvent{{Kind: "advance_started"}, {Kind: "advance_skipped_no_pr"}, {Kind: "advance_completed"}}},
+		{name: "retry queued suppresses stale pending", decision: "implemented", events: []db.JobEvent{{Kind: "advance_retry"}, {Kind: "retry_queued"}}},
+		{name: "awaiting human stays unknown", decision: "implemented", events: []db.JobEvent{{Kind: "advance_retry"}, {Kind: "advance_awaiting_human"}}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			latest, ok := latestDeliveryStatusEvent(tc.events)
+			payload := workflow.JobPayload{
+				PullRequest: tc.pullRequest,
+				Result:      &workflow.AgentResult{Decision: tc.decision},
+			}
 			if got := deriveJobDeliveryStatus(job, payload, latest, ok); got != tc.want {
 				t.Fatalf("deriveJobDeliveryStatus = %q, want %q", got, tc.want)
 			}

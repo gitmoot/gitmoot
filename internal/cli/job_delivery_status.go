@@ -30,25 +30,31 @@ var deliveryStatusEventKinds = []string{
 
 // deriveJobDeliveryStatus reports Gitmoot's own post-agent delivery status for
 // implement jobs. An empty string means unknown/not applicable and is omitted
-// from JSON. A persisted pull request is conclusive even when a later workflow
-// advancement marker records work after delivery.
+// from JSON. The latest job-local marker takes precedence over a pull request
+// inherited by a fix-pass job.
 func deriveJobDeliveryStatus(job db.Job, payload workflow.JobPayload, latest db.JobEvent, hasLatest bool) string {
-	if job.Type != "implement" {
+	if job.Type != "implement" || payload.Result == nil || payload.Result.Decision != "implemented" {
 		return ""
 	}
-	if payload.PullRequest > 0 {
-		return jobDeliveryStatusDelivered
-	}
 	if !hasLatest {
+		if payload.PullRequest > 0 {
+			return jobDeliveryStatusDelivered
+		}
 		return ""
 	}
 	switch latest.Kind {
-	case "advance_completed", "advance_retried":
-		return jobDeliveryStatusDelivered
 	case "advance_started", "advance_retry":
 		return jobDeliveryStatusPending
 	case "advance_blocked":
 		return jobDeliveryStatusBlocked
+	case "advance_completed", "advance_retried":
+		// RunJob appends advance_completed whenever AdvanceJob returns nil,
+		// including after advance_skipped_no_pr. Completion therefore confirms
+		// delivery only when the finalized payload also carries a PR.
+		if payload.PullRequest > 0 {
+			return jobDeliveryStatusDelivered
+		}
+		return ""
 	default:
 		return ""
 	}
@@ -60,9 +66,6 @@ func deriveJobDeliveryStatus(job db.Job, payload workflow.JobPayload, latest db.
 func loadJobDeliveryStatus(store *db.Store, job db.Job, payload workflow.JobPayload) string {
 	if job.Type != "implement" {
 		return ""
-	}
-	if payload.PullRequest > 0 {
-		return jobDeliveryStatusDelivered
 	}
 	events, err := store.ListJobEvents(context.Background(), job.ID)
 	if err != nil {
