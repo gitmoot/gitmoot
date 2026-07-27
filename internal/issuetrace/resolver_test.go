@@ -108,7 +108,7 @@ func TestIssue1113MergedCommitRemainsPartialEvidenceGolden(t *testing.T) {
 	pr.Head.SHA = "reviewed-head"
 	remote := &fakeReader{
 		issue: github.TraceIssue{
-			Number: 1113, Title: "disk footprint has four independent causes", State: "closed",
+			Number: 1113, Title: "disk footprint has four independent causes", State: "open",
 			URL: "https://github.com/gitmoot/gitmoot/issues/1113",
 		},
 		prs: map[int64]github.TracePullRequest{1122: pr},
@@ -175,6 +175,46 @@ func TestOpenPullRequestSyntheticMergeCommitIsNotMergeEvidence(t *testing.T) {
 			t.Fatalf("open PR has false merge evidence: %+v", attempt.Evidence)
 		}
 	}
+}
+
+func TestLocalOpenPullRequestSyntheticMergeCommitIsNotMergeEvidence(t *testing.T) {
+	repo := github.Repository{Owner: "o", Name: "r"}
+	const syntheticMergeSHA = "7926663839084c634e86d8c7b63deeee676df879"
+	local := fakeLocal{prs: []db.PullRequest{{
+		RepoFullName: "o/r", Number: 12, HeadBranch: "fix/twelve",
+		MergeCommitSHA: syntheticMergeSHA, State: "open",
+	}}}
+
+	t.Run("join remote attempt", func(t *testing.T) {
+		pr := tracePR(12, "Open attempt")
+		pr.Head.Ref = "fix/twelve"
+		remote := &fakeReader{
+			issue:       github.TraceIssue{Number: 9, State: "open"},
+			prs:         map[int64]github.TracePullRequest{12: pr},
+			refs:        map[int64][]github.TraceCrossReference{9: {crossReference(repo, pr)}},
+			search:      map[string][]github.TracePullRequest{},
+			repository:  github.TraceRepository{DefaultBranch: "main"},
+			comparisons: map[string]github.CompareResult{},
+		}
+
+		trace, err := (&Resolver{Remote: remote, Local: local}).TraceIssue(context.Background(), repo, 9)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(trace.Attempts) != 1 || trace.Attempts[0].MergeSHA != "" {
+			t.Fatalf("local open PR synthetic merge commit became merge evidence: %+v", trace.Attempts)
+		}
+	})
+
+	t.Run("local fallback", func(t *testing.T) {
+		trace, err := (&Resolver{Local: local}).TracePullRequest(context.Background(), repo, 12)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(trace.Attempts) != 1 || trace.Attempts[0].MergeSHA != "" {
+			t.Fatalf("local fallback exposed open PR synthetic merge commit: %+v", trace.Attempts)
+		}
+	})
 }
 
 func TestTraceIssueJoinsLocalRowsWithoutUsingJobPullRequest(t *testing.T) {

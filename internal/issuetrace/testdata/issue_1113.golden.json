@@ -5,14 +5,14 @@
   "issue": {
     "number": 1113,
     "title": "disk footprint has four independent causes",
-    "state": "closed",
+    "state": "open",
     "url": "https://github.com/gitmoot/gitmoot/issues/1113",
     "evidence": [
       {
         "kind": "github_issue",
         "basis": "issue_state",
         "certainty": "observed",
-        "detail": "GitHub reports issue #1113 as closed",
+        "detail": "GitHub reports issue #1113 as open",
         "url": "https://github.com/gitmoot/gitmoot/issues/1113"
       }
     ]

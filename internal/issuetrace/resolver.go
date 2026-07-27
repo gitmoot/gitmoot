@@ -414,7 +414,7 @@ func (r *Resolver) joinLocal(trace *IssueTrace, snapshot localSnapshot) {
 			attempt.HeadSHA = localPR.HeadSHA
 		}
 		if attempt.MergeSHA == "" {
-			attempt.MergeSHA = localPR.MergeCommitSHA
+			attempt.MergeSHA = observedMergeSHA(localPR.State, "", localPR.MergeCommitSHA)
 		}
 		attempt.Evidence = appendEvidence(attempt.Evidence, Evidence{
 			Kind: "local_pr", Basis: "local_pull_request_row", Certainty: CertaintyObserved,
@@ -474,7 +474,7 @@ func (r *Resolver) addLocalPRFallback(trace *IssueTrace, snapshot localSnapshot,
 		}
 		trace.Attempts = append(trace.Attempts, PullRequestAttempt{
 			Number: pr.Number, State: pr.State, URL: pr.URL, HeadBranch: pr.HeadBranch,
-			HeadSHA: pr.HeadSHA, MergeSHA: pr.MergeCommitSHA,
+			HeadSHA: pr.HeadSHA, MergeSHA: observedMergeSHA(pr.State, "", pr.MergeCommitSHA),
 			Evidence: []Evidence{{
 				Kind: "local_pr", Basis: "local_pull_request_row", Certainty: CertaintyObserved,
 				Detail: fmt.Sprintf("local PR row records #%d on branch %s in state %s", pr.Number, pr.HeadBranch, pr.State), URL: pr.URL,
@@ -537,17 +537,21 @@ func newTrace(selector string, repo github.Repository, issue int64) IssueTrace {
 }
 
 func attemptFromGitHub(pr github.TracePullRequest, evidence []Evidence) PullRequestAttempt {
-	mergeSHA := ""
-	if strings.TrimSpace(pr.MergedAt) != "" {
-		// GitHub populates merge_commit_sha on open PRs with a synthetic test
-		// merge commit. Only merged_at makes that SHA observed merge evidence.
-		mergeSHA = pr.MergeSHA
-	}
 	return PullRequestAttempt{
 		Number: pr.Number, Title: pr.Title, State: pr.State, URL: pr.URL,
 		CreatedAt: pr.CreatedAt, HeadBranch: pr.Head.Ref, HeadSHA: pr.Head.SHA,
-		MergedAt: pr.MergedAt, MergeSHA: mergeSHA, Evidence: evidence,
+		MergedAt: pr.MergedAt, MergeSHA: observedMergeSHA(pr.State, pr.MergedAt, pr.MergeSHA), Evidence: evidence,
 	}
+}
+
+func observedMergeSHA(state, mergedAt, mergeSHA string) string {
+	// GitHub populates merge_commit_sha on open PRs with a synthetic test merge
+	// commit. Remote and local evidence must both prove the PR merged before
+	// surfacing that SHA.
+	if !strings.EqualFold(strings.TrimSpace(state), "merged") && strings.TrimSpace(mergedAt) == "" {
+		return ""
+	}
+	return strings.TrimSpace(mergeSHA)
 }
 
 func mergeTracePR(dst *github.TracePullRequest, src github.TracePullRequest) {
