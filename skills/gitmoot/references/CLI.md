@@ -1602,8 +1602,9 @@ before Gitmoot removes that worktree. `job show` prints the captured diff and
 `read_only_worktree_diff_error`; the same durable fields are present under
 `job show --json`'s `payload`. Capture is capped at 4 MiB, and an oversized
 snapshot ends with an explicit omitted-byte marker instead of being silently
-cut. Capture failures are recorded without delaying or blocking worktree
-cleanup.
+cut. Capture is synchronously bounded by a 10-second timeout; failures can delay
+cleanup up to that bound, but are recorded and never permanently block worktree
+removal.
 
 ### Evidence-graded proof manifests
 

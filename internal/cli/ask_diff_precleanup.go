@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -85,12 +88,18 @@ func captureReadOnlyWorktreeDiff(ctx context.Context, worktree string) (string, 
 	ctx, cancel := context.WithTimeout(ctx, readOnlyWorktreeDiffTimeout)
 	defer cancel()
 
-	out := &boundedCountingBuffer{limit: readOnlyWorktreeDiffMaxBytes - readOnlyWorktreeDiffReserve}
-	status, err := runReadOnlyWorktreeGit(ctx, worktree, "git status --short", "status", "--short", "--untracked-files=all")
+	sandbox, err := newReadOnlyWorktreeGitSandbox(ctx, worktree)
 	if err != nil {
 		return "", false, err
 	}
-	diff, err := runReadOnlyWorktreeGit(ctx, worktree, "git diff HEAD", "diff", "--no-ext-diff", "--binary", "HEAD", "--")
+	defer sandbox.close()
+
+	out := &boundedCountingBuffer{limit: readOnlyWorktreeDiffMaxBytes - readOnlyWorktreeDiffReserve}
+	status, err := sandbox.run(ctx, "git status --short", "status", "--short", "--untracked-files=all", "--ignore-submodules=all")
+	if err != nil {
+		return "", false, err
+	}
+	diff, err := sandbox.run(ctx, "git diff HEAD", "diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--binary", "HEAD", "--")
 	if err != nil {
 		return "", false, err
 	}
@@ -108,22 +117,180 @@ func captureReadOnlyWorktreeDiff(ctx context.Context, worktree string) (string, 
 	return strings.TrimRight(snapshot, "\n") + marker, true, nil
 }
 
-func runReadOnlyWorktreeGit(ctx context.Context, worktree, label string, args ...string) (*boundedCountingBuffer, error) {
+// readOnlyWorktreeGitSandbox is a minimal temporary Git directory that reuses
+// only the target worktree's index and object database. In particular it does
+// not reuse the repository's local config, so attribute-selected clean,
+// textconv, and external-diff helpers plus core.fsmonitor cannot execute under
+// the daemon's authority during capture.
+type readOnlyWorktreeGitSandbox struct {
+	dir      string
+	worktree string
+	env      []string
+}
+
+func newReadOnlyWorktreeGitSandbox(ctx context.Context, worktree string) (*readOnlyWorktreeGitSandbox, error) {
+	worktree = filepath.Clean(strings.TrimSpace(worktree))
+	if !filepath.IsAbs(worktree) {
+		absolute, err := filepath.Abs(worktree)
+		if err != nil {
+			return nil, fmt.Errorf("resolve worktree path: %w", err)
+		}
+		worktree = absolute
+	}
+	temp, err := os.MkdirTemp("", "gitmoot-readonly-diff-")
+	if err != nil {
+		return nil, fmt.Errorf("create isolated git metadata: %w", err)
+	}
+	sandbox := &readOnlyWorktreeGitSandbox{dir: temp, worktree: worktree}
+	ok := false
+	defer func() {
+		if !ok {
+			sandbox.close()
+		}
+	}()
+
+	baseEnv := sanitizedReadOnlyWorktreeGitEnv(temp)
+	head, err := runReadOnlyWorktreeMetadataGit(ctx, baseEnv, worktree, "resolve HEAD", "rev-parse", "--verify", "HEAD")
+	if err != nil {
+		return nil, err
+	}
+	indexPath, err := runReadOnlyWorktreeMetadataGit(ctx, baseEnv, worktree, "resolve index", "rev-parse", "--git-path", "index")
+	if err != nil {
+		return nil, err
+	}
+	objectsPath, err := runReadOnlyWorktreeMetadataGit(ctx, baseEnv, worktree, "resolve object database", "rev-parse", "--git-path", "objects")
+	if err != nil {
+		return nil, err
+	}
+	indexPath = absoluteGitPath(worktree, indexPath)
+	objectsPath = absoluteGitPath(worktree, objectsPath)
+
+	if err := os.MkdirAll(filepath.Join(temp, "objects"), 0o700); err != nil {
+		return nil, fmt.Errorf("create isolated git object directory: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(temp, "refs"), 0o700); err != nil {
+		return nil, fmt.Errorf("create isolated git refs directory: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(temp, "HEAD"), []byte(strings.TrimSpace(head)+"\n"), 0o600); err != nil {
+		return nil, fmt.Errorf("write isolated git HEAD: %w", err)
+	}
+	if err := copyReadOnlyWorktreeGitIndex(indexPath, filepath.Join(temp, "index")); err != nil {
+		return nil, err
+	}
+
+	sandbox.env = append(baseEnv,
+		"GIT_DIR="+temp,
+		"GIT_WORK_TREE="+worktree,
+		"GIT_INDEX_FILE="+filepath.Join(temp, "index"),
+		"GIT_OBJECT_DIRECTORY="+objectsPath,
+	)
+	ok = true
+	return sandbox, nil
+}
+
+func (s *readOnlyWorktreeGitSandbox) close() {
+	if s != nil && strings.TrimSpace(s.dir) != "" {
+		_ = os.RemoveAll(s.dir)
+	}
+}
+
+func (s *readOnlyWorktreeGitSandbox) run(ctx context.Context, label string, args ...string) (*boundedCountingBuffer, error) {
 	out := &boundedCountingBuffer{limit: readOnlyWorktreeDiffMaxBytes}
 	var stderr boundedCountingBuffer
 	stderr.limit = 4096
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = worktree
+	cmdArgs := append([]string{"--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.DevNull}, args...)
+	cmd := exec.CommandContext(ctx, "git", cmdArgs...)
+	cmd.Dir = s.worktree
+	cmd.Env = s.env
 	cmd.Stdout = out
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		detail := strings.TrimSpace(stderr.String())
 		if detail != "" {
-			return nil, fmt.Errorf("%s in %s: %w: %s", label, worktree, err, detail)
+			return nil, fmt.Errorf("%s in %s: %w: %s", label, s.worktree, err, detail)
 		}
-		return nil, fmt.Errorf("%s in %s: %w", label, worktree, err)
+		return nil, fmt.Errorf("%s in %s: %w", label, s.worktree, err)
 	}
 	return out, nil
+}
+
+func runReadOnlyWorktreeMetadataGit(ctx context.Context, env []string, worktree, label string, args ...string) (string, error) {
+	cmdArgs := append([]string{"--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.DevNull}, args...)
+	cmd := exec.CommandContext(ctx, "git", cmdArgs...)
+	cmd.Dir = worktree
+	cmd.Env = env
+	var stdout, stderr boundedCountingBuffer
+	stdout.limit = 64 << 10
+	stderr.limit = 4096
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail != "" {
+			return "", fmt.Errorf("%s in %s: %w: %s", label, worktree, err, detail)
+		}
+		return "", fmt.Errorf("%s in %s: %w", label, worktree, err)
+	}
+	value := strings.TrimSpace(stdout.String())
+	if value == "" || stdout.dropped != 0 {
+		return "", fmt.Errorf("%s in %s returned invalid metadata", label, worktree)
+	}
+	return value, nil
+}
+
+func sanitizedReadOnlyWorktreeGitEnv(tempHome string) []string {
+	env := make([]string, 0, len(os.Environ())+6)
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(key, "GIT_") || key == "HOME" || key == "XDG_CONFIG_HOME" {
+			continue
+		}
+		env = append(env, entry)
+	}
+	return append(env,
+		"HOME="+tempHome,
+		"XDG_CONFIG_HOME="+tempHome,
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_ATTR_NOSYSTEM=1",
+		"GIT_OPTIONAL_LOCKS=0",
+		"GIT_TERMINAL_PROMPT=0",
+	)
+}
+
+func absoluteGitPath(worktree, path string) string {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(worktree, path)
+}
+
+func copyReadOnlyWorktreeGitIndex(source, destination string) error {
+	input, err := os.Open(source)
+	if err != nil {
+		return fmt.Errorf("open worktree index: %w", err)
+	}
+	defer input.Close()
+	output, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("create isolated git index: %w", err)
+	}
+	keep := false
+	defer func() {
+		_ = output.Close()
+		if !keep {
+			_ = os.Remove(destination)
+		}
+	}()
+	if _, err := io.Copy(output, input); err != nil {
+		return fmt.Errorf("copy worktree index: %w", err)
+	}
+	if err := output.Close(); err != nil {
+		return fmt.Errorf("close isolated git index: %w", err)
+	}
+	keep = true
+	return nil
 }
 
 func writeReadOnlyWorktreeDiffSection(out *boundedCountingBuffer, heading string, section *boundedCountingBuffer) {
