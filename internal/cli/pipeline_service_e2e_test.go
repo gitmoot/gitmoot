@@ -149,6 +149,9 @@ func TestPipelineServiceAcceptanceE2E(t *testing.T) {
 	if strings.TrimSpace(payload.WorktreePath) == "" || !payload.ReadOnlyWorktree || payload.WorktreePath == checkout || !strings.HasPrefix(payload.WorktreePath, filepath.Clean(paths.Home)+string(filepath.Separator)) {
 		t.Fatalf("service shell did not use a detached home-contained worktree: %+v", payload)
 	}
+	if !strings.Contains(payload.ReadOnlyWorktreeDiff, "?? out/kit.txt") {
+		t.Fatalf("composed pre-cleanup hooks did not capture the service worktree status: %q", payload.ReadOnlyWorktreeDiff)
+	}
 	if _, err := os.Stat(payload.WorktreePath); !os.IsNotExist(err) {
 		t.Fatalf("service stage worktree was not disposed after pre-cleanup artifact collection: %v", err)
 	}

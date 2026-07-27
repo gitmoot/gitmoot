@@ -581,7 +581,13 @@ func (s *bridgeServer) handleJobGet(w http.ResponseWriter, r *http.Request, id s
 		writeBridgeMappedError(w, err)
 		return
 	}
-	writeBridgeJSON(w, http.StatusOK, jobShowOutput{Job: job, Payload: payload})
+	writeBridgeJSON(w, http.StatusOK, jobShowOutput{
+		Job:                           job,
+		Payload:                       payload,
+		ReadOnlyWorktreeDiff:          payload.ReadOnlyWorktreeDiff,
+		ReadOnlyWorktreeDiffTruncated: payload.ReadOnlyWorktreeDiffTruncated,
+		ReadOnlyWorktreeDiffError:     payload.ReadOnlyWorktreeDiffError,
+	})
 }
 
 type bridgeAgentAskRequest struct {

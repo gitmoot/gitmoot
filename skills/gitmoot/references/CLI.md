@@ -1594,6 +1594,17 @@ gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 ```
 
+Terminal background `ask` and `review` jobs that ran in a throwaway read-only
+worktree preserve a bounded `git status --short` plus `git diff HEAD` snapshot
+before Gitmoot removes that worktree. `job show` prints the captured diff and
+`job list` adds a compact `DIFF:` badge. Their JSON forms expose
+`read_only_worktree_diff`, `read_only_worktree_diff_truncated`, and
+`read_only_worktree_diff_error`; the same durable fields are present under
+`job show --json`'s `payload`. Capture is capped at 4 MiB, and an oversized
+snapshot ends with an explicit omitted-byte marker instead of being silently
+cut. Capture failures are recorded without delaying or blocking worktree
+cleanup.
+
 ### Evidence-graded proof manifests
 
 ```sh
