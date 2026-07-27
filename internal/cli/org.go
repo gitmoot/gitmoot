@@ -647,10 +647,8 @@ func validateAndTouchActingOrgRole(ctx context.Context, store *db.Store, home, r
 	if !ok {
 		return fmt.Errorf("unknown org role %q", role)
 	}
-	if unavailable, found, err := store.GetActiveOrgRoleUnavailable(ctx, configuredRole.Name, time.Now().UTC()); err != nil {
-		return fmt.Errorf("read org role %q unavailability: %w", configuredRole.Name, err)
-	} else if found {
-		return unavailableRoleDispatchError(unavailable)
+	if err := refuseUnavailableOrgRole(ctx, store, configuredRole.Name, time.Now().UTC()); err != nil {
+		return err
 	}
 	// Recycle enforcement only applies to operator-origin --org-role dispatches:
 	// this ingress (dispatchLocalAgentJob) is the sole path passing a non-empty

@@ -46,6 +46,11 @@ func TestClassifyOperationalBlocker(t *testing.T) {
 			wantClass: blockerClassRuntimeQuota,
 		},
 		{
+			name:   "context length limit is not provider quota",
+			err:    workflow.DeliveryError{Err: errors.New("You've hit your maximum context length; the model limit is 200k tokens")},
+			wantOK: false,
+		},
+		{
 			// The typed sentinel is trustworthy without the DeliveryError marker.
 			name:      "typed claude auth sentinel",
 			err:       fmt.Errorf("delivery failed: %w", runtime.ErrClaudeAuthFailed),
@@ -199,6 +204,34 @@ func TestClassifyOperationalBlockerQuotaFallbackIsBounded(t *testing.T) {
 	got, ok = classifyOperationalBlocker(workflow.DeliveryError{Err: errors.New("API error: You've hit your weekly limit; resets sometime soon.")}, now)
 	if !ok || got.QuotaResetParsed || !got.QuotaResetMentioned || !got.QuotaResetAt.Equal(now.Add(quotaBlockerFallbackDelay)) {
 		t.Fatalf("unparseable reset hint classification = %+v, %v", got, ok)
+	}
+}
+
+func TestParseQuotaResetAtPastResetDoesNotRollForwardAFullYear(t *testing.T) {
+	location, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 28, 1, 2, 0, 0, location)
+	got, parsed := parseQuotaResetAt("You've hit your weekly limit - resets Jul 28, 1am (Europe/Berlin)", now)
+	if parsed {
+		t.Fatalf("past reset parsed as a future absolute date: %s", got)
+	}
+	if want := now.UTC().Add(quotaBlockerFallbackDelay); !got.Equal(want) {
+		t.Fatalf("past reset fallback = %s, want %s", got, want)
+	}
+}
+
+func TestParseQuotaResetAtRollsDecemberIntoJanuary(t *testing.T) {
+	location, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 12, 31, 23, 0, 0, 0, location)
+	got, parsed := parseQuotaResetAt("You've hit your weekly limit - resets Jan 1, 1am (Europe/Berlin)", now)
+	want := time.Date(2027, 1, 1, 1, 0, 0, 0, location)
+	if !parsed || !got.Equal(want) {
+		t.Fatalf("year-boundary reset = %s parsed=%v, want %s", got, parsed, want)
 	}
 }
 

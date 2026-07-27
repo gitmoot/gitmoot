@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -105,6 +106,72 @@ func TestCaptureQuotaRoleUnavailableClaudeOnly(t *testing.T) {
 	}
 }
 
+func TestForegroundDispatchCapturesQuotaFailureAndClearsOnSuccess(t *testing.T) {
+	home, paths := setupQuotaUnavailableOrgHome(t)
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	checkout := t.TempDir()
+	runGit(t, checkout, "init")
+	runGit(t, checkout, "branch", "-m", "main")
+	runGit(t, checkout, "remote", "add", "origin", "https://github.com/gitmoot/gitmoot.git")
+	seedDaemonWorkerRepo(t, store, "gitmoot/gitmoot", checkout)
+	seedDaemonWorkerAgent(t, store, "claude-reviewer", runtime.ClaudeRuntime,
+		"550e8400-e29b-41d4-a716-446655440002", []string{"ask"}, "gitmoot/gitmoot")
+
+	adapter := &cliWorkerFakeAdapter{err: errors.New("API error: You've hit your weekly limit - resets Jul 28, 1am (Europe/Berlin)")}
+	previousAdapterFactory := localAgentDispatchRuntimeAdapterFor
+	localAgentDispatchRuntimeAdapterFor = func(string, string, string) (runtime.Adapter, error) {
+		return adapter, nil
+	}
+	t.Cleanup(func() { localAgentDispatchRuntimeAdapterFor = previousAdapterFactory })
+	wake := &fakeEventWake{}
+	previousWakeFactory := newQuotaRoleUnavailableWakeClient
+	newQuotaRoleUnavailableWakeClient = func() eventWakeClient { return wake }
+	t.Cleanup(func() { newQuotaRoleUnavailableWakeClient = previousWakeFactory })
+
+	request := localAgentDispatchRequest{
+		RepoFlag:       "gitmoot/gitmoot",
+		Agent:          "claude-reviewer",
+		Action:         "ask",
+		Instructions:   "Review the change.",
+		ActingOrgRole:  "review",
+		OperatorOrigin: true,
+		ExecutionPath:  "agent_ask",
+		Home:           home,
+	}
+	if _, err := dispatchLocalAgentJob(context.Background(), store, request); err == nil {
+		t.Fatal("foreground quota failure returned nil error")
+	}
+	now := time.Now().UTC()
+	if incident, found, err := store.GetActiveOrgRoleUnavailable(context.Background(), "review", now); err != nil || !found {
+		t.Fatalf("foreground quota incident = %+v found=%v err=%v", incident, found, err)
+	}
+	if wake.promptCalls != 1 {
+		t.Fatalf("foreground quota escalation calls = %d, want 1", wake.promptCalls)
+	}
+
+	if err := store.ClearOrgRoleUnavailable(context.Background(), "review"); err != nil {
+		t.Fatal(err)
+	}
+	adapter.err = nil
+	adapter.output = `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+	adapter.onDeliver = func() {
+		seedNow := time.Now().UTC()
+		if err := store.UpsertOrgRoleUnavailable(context.Background(), "review", "quota", seedNow.Add(time.Hour), seedNow); err != nil {
+			t.Errorf("seed in-flight unavailability: %v", err)
+		}
+	}
+	if _, err := dispatchLocalAgentJob(context.Background(), store, request); err != nil {
+		t.Fatalf("foreground success: %v", err)
+	}
+	if incident, found, err := store.GetActiveOrgRoleUnavailable(context.Background(), "review", time.Now().UTC()); err != nil || found {
+		t.Fatalf("foreground success left incident = %+v found=%v err=%v", incident, found, err)
+	}
+}
+
 func TestSuccessfulJobClearsQuotaRoleUnavailable(t *testing.T) {
 	home, paths := setupQuotaUnavailableOrgHome(t)
 	store, err := db.Open(paths.Database)
@@ -143,6 +210,80 @@ func TestSuccessfulJobClearsQuotaRoleUnavailable(t *testing.T) {
 	}
 }
 
+func TestTempWorkerDispatchCapturesQuotaFailureAndClearsOnSuccess(t *testing.T) {
+	home, paths := setupQuotaUnavailableOrgHome(t)
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	checkout := t.TempDir()
+	runGit(t, checkout, "init")
+	runGit(t, checkout, "branch", "-m", "main")
+	runGit(t, checkout, "remote", "add", "origin", "https://github.com/gitmoot/gitmoot.git")
+	seedDaemonWorkerRepo(t, store, "gitmoot/gitmoot", checkout)
+	original := runtime.Agent{
+		Name: "claude-reviewer", Role: "worker", Runtime: runtime.ClaudeRuntime,
+		RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "gitmoot/gitmoot",
+		Capabilities: []string{"ask"}, AutonomyPolicy: runtime.AutonomyPolicyAuto,
+	}
+	seedDaemonWorkerAgent(t, store, original.Name, original.Runtime, original.RuntimeRef, original.Capabilities, original.RepoScope)
+
+	starter := &cliWorkerFakeAdapter{startRuntimeRef: "550e8400-e29b-41d4-a716-446655440003"}
+	delivery := &cliWorkerFakeAdapter{err: errors.New("API error: You've hit your weekly limit - resets Jul 28, 1am (Europe/Berlin)")}
+	wake := &fakeEventWake{}
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.StartAdapterFactory = func(string, string) (runtime.Adapter, error) { return starter, nil }
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) { return delivery, nil }
+	worker.QuotaWake = wake
+	policy := config.DefaultParallelSessionPolicy()
+	policy.MergeBack = config.ParallelSessionMergeBackOff
+
+	runTemp := func(jobID string) {
+		t.Helper()
+		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+			ID: jobID, Agent: original.Name, Action: "ask", Repo: "gitmoot/gitmoot",
+			ActingOrgRole: "review",
+		})
+		job, err := store.GetJob(context.Background(), jobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, err := daemonJobPayload(job)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := worker.runWithTempWorker(context.Background(), job, payload, original, checkout, policy, "test contention"); err != nil {
+			t.Fatalf("runWithTempWorker(%s): %v", jobID, err)
+		}
+	}
+
+	runTemp("job-temp-quota")
+	now := time.Now().UTC()
+	if incident, found, err := store.GetActiveOrgRoleUnavailable(context.Background(), "review", now); err != nil || !found {
+		t.Fatalf("temp-worker quota incident = %+v found=%v err=%v", incident, found, err)
+	}
+	if wake.promptCalls != 1 {
+		t.Fatalf("temp-worker escalation calls = %d, want 1", wake.promptCalls)
+	}
+
+	if err := store.ClearOrgRoleUnavailable(context.Background(), "review"); err != nil {
+		t.Fatal(err)
+	}
+	delivery.err = nil
+	delivery.output = `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+	delivery.onDeliver = func() {
+		seedNow := time.Now().UTC()
+		if err := store.UpsertOrgRoleUnavailable(context.Background(), "review", "quota", seedNow.Add(time.Hour), seedNow); err != nil {
+			t.Errorf("seed in-flight unavailability: %v", err)
+		}
+	}
+	runTemp("job-temp-success")
+	if incident, found, err := store.GetActiveOrgRoleUnavailable(context.Background(), "review", time.Now().UTC()); err != nil || found {
+		t.Fatalf("temp-worker success left incident = %+v found=%v err=%v", incident, found, err)
+	}
+}
+
 func TestValidateAndTouchActingOrgRoleRefusesUnavailableAndClearsExpired(t *testing.T) {
 	home, paths := setupQuotaUnavailableOrgHome(t)
 	store, err := db.Open(paths.Database)
@@ -176,6 +317,71 @@ func TestValidateAndTouchActingOrgRoleRefusesUnavailableAndClearsExpired(t *test
 	}
 	if _, found, err := store.GetActiveOrgRoleUnavailable(ctx, "review", now); err != nil || found {
 		t.Fatalf("expired row found=%v err=%v", found, err)
+	}
+}
+
+func TestRunTaskRunRefusesUnavailableRoleBeforeWorktreeAllocation(t *testing.T) {
+	home, paths := setupQuotaUnavailableOrgHome(t)
+	goalPath := filepath.Join(t.TempDir(), "GOAL.md")
+	if err := os.WriteFile(goalPath, []byte("# Build Gitmoot\n\n### Task 1: Bootstrap\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"goal", "import", "--home", home, "--file", goalPath, "--repo", "gitmoot/gitmoot"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("goal import code=%d stderr=%q", code, stderr.String())
+	}
+	subscribeShellImplementAgent(t, home, "lead", "gitmoot/gitmoot")
+	checkout := t.TempDir()
+	runGit(t, checkout, "init")
+	runGit(t, checkout, "branch", "-m", "main")
+	runGit(t, checkout, "remote", "add", "origin", "https://github.com/gitmoot/gitmoot.git")
+	if err := os.WriteFile(filepath.Join(checkout, "README.md"), []byte("test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, checkout, "add", "README.md")
+	runGit(t, checkout, "-c", "user.name=Gitmoot Test", "-c", "user.email=gitmoot@example.com", "commit", "-m", "initial")
+	withWorkingDirectory(t, checkout)
+
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := store.UpsertOrgRoleUnavailable(context.Background(), "review", "quota", now.Add(time.Hour), now); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code := Run([]string{
+		"task", "run", "task-001", "--home", home, "--repo", "gitmoot/gitmoot",
+		"--owner", "lead", "--org-role", "review",
+	}, &stdout, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), `org role "review" is unavailable`) ||
+		!strings.Contains(stderr.String(), "dispatch refused") {
+		t.Fatalf("task run unavailable: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	store, err = db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	task, err := store.GetTask(context.Background(), "task-001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != string(workflow.TaskPlanned) || strings.TrimSpace(task.WorktreePath) != "" {
+		t.Fatalf("task mutated before refusal: %+v", task)
+	}
+	if jobs, err := store.ListJobs(context.Background()); err != nil || len(jobs) != 0 {
+		t.Fatalf("jobs after refused task run = %+v err=%v", jobs, err)
+	}
+	if _, err := os.Stat(filepath.Join(paths.Home, "worktrees", "gitmoot--gitmoot", "task-001")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("worktree exists after refused task run: %v", err)
 	}
 }
 

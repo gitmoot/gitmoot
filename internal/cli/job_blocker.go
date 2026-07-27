@@ -231,7 +231,7 @@ func classifyAuthQuotaStrict(text string) string {
 		switch {
 		case strings.Contains(l, "usage limit"), strings.Contains(l, "rate limit"),
 			strings.Contains(l, "weekly limit"),
-			strings.Contains(l, "hit your") && strings.Contains(l, "limit"),
+			claudeHitYourQuotaLimit(l),
 			strings.Contains(l, "quota"), strings.Contains(l, "limit resets"),
 			httpCtx && code429Re.MatchString(l):
 			return "throttled"
@@ -242,6 +242,18 @@ func classifyAuthQuotaStrict(text string) string {
 		}
 	}
 	return ""
+}
+
+func claudeHitYourQuotaLimit(line string) bool {
+	if !strings.Contains(line, "hit your") || !strings.Contains(line, "limit") {
+		return false
+	}
+	for _, signal := range []string{"week", "usage", "quota", "credit", "reset", "rate"} {
+		if strings.Contains(line, signal) {
+			return true
+		}
+	}
+	return false
 }
 
 // quotaResetInRe matches relative reset hints the providers actually emit, e.g.
@@ -324,6 +336,14 @@ func parseQuotaResetAt(text string, now time.Time) (time.Time, bool) {
 			// Reject normalized impossible dates such as Feb 31.
 			if candidate.Month() == month && candidate.Day() == day {
 				if !candidate.After(localNow) {
+					// Claude omits the year. Only roll forward across the one
+					// credible boundary: a December observation naming January.
+					// A same-day reset a few minutes in the past is more likely
+					// provider/host skew or delayed delivery; parking the role for
+					// a clamped eight days would be actively unsafe.
+					if localNow.Month() != time.December || month != time.January {
+						return now.Add(quotaBlockerFallbackDelay), false
+					}
 					candidate = time.Date(localNow.Year()+1, month, day, hour, minute, 0, 0, location)
 				}
 				if delay := candidate.Sub(now); delay > 0 {

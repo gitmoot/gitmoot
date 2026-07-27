@@ -3,9 +3,11 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/cockpit"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -13,6 +15,37 @@ import (
 )
 
 const orgRoleUnavailableReasonQuota = "quota"
+
+var newQuotaRoleUnavailableWakeClient = func() eventWakeClient {
+	return cockpit.New(cockpit.Options{HerdrBin: "herdr"}, nil)
+}
+
+type quotaRoleUnavailableHooks struct {
+	store  *db.Store
+	home   string
+	stdout io.Writer
+	wake   eventWakeClient
+}
+
+func newQuotaRoleUnavailableHooks(store *db.Store, home string, stdout io.Writer) quotaRoleUnavailableHooks {
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	return quotaRoleUnavailableHooks{
+		store:  store,
+		home:   home,
+		stdout: stdout,
+		wake:   newQuotaRoleUnavailableWakeClient(),
+	}
+}
+
+func (w jobWorker) quotaRoleUnavailableHooks() quotaRoleUnavailableHooks {
+	stdout := w.Stdout
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	return quotaRoleUnavailableHooks{store: w.Store, home: w.ConfigHome, stdout: stdout, wake: w.QuotaWake}
+}
 
 // classifyRuntimeRoleUnavailable is the provider-specific edge around the
 // shared operational-blocker classifier. Phase 1 recognizes Claude only; the
@@ -28,13 +61,23 @@ func classifyRuntimeRoleUnavailable(runtimeName string, cause error, now time.Ti
 	}
 }
 
-// captureQuotaRoleUnavailable records a Claude quota wall for the canonical
-// job-attributed organization role, then atomically claims and attempts the
-// incident's single escalation. Failures are returned for daemon logging but
-// never replace the job's original outcome.
-func (w jobWorker) captureQuotaRoleUnavailable(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent, cause error, now time.Time) error {
+// recordRuntimeOutcome applies the same role-availability transition at every
+// delivery seam: a Claude quota failure records/escalates the incident, while a
+// successful attributed job is the definitive signal that clears it.
+func (h quotaRoleUnavailableHooks) recordRuntimeOutcome(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent, runErr error, now time.Time) error {
+	if runErr == nil {
+		return h.clearOnSuccess(ctx, payload.ActingOrgRole)
+	}
+	return h.captureFailure(ctx, job, payload, agent, runErr, now)
+}
+
+// captureFailure records a Claude quota wall for the canonical job-attributed
+// organization role, then atomically claims and attempts the incident's single
+// escalation. Failures are returned for caller logging but never replace the
+// job's original outcome.
+func (h quotaRoleUnavailableHooks) captureFailure(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent, cause error, now time.Time) error {
 	role := strings.ToLower(strings.TrimSpace(payload.ActingOrgRole))
-	if role == "" || w.Store == nil {
+	if role == "" || h.store == nil {
 		return nil
 	}
 	classification, ok := classifyRuntimeRoleUnavailable(agent.Runtime, cause, now)
@@ -45,80 +88,88 @@ func (w jobWorker) captureQuotaRoleUnavailable(ctx context.Context, job db.Job, 
 	if until.IsZero() {
 		until = now.UTC().Add(quotaBlockerFallbackDelay)
 	}
-	if err := w.Store.UpsertOrgRoleUnavailable(ctx, role, orgRoleUnavailableReasonQuota, until, now); err != nil {
+	if err := h.store.UpsertOrgRoleUnavailable(ctx, role, orgRoleUnavailableReasonQuota, until, now); err != nil {
 		return fmt.Errorf("record org role %q unavailable: %w", role, err)
 	}
-	claimed, err := w.Store.MarkOrgRoleUnavailableEscalated(ctx, role, now)
+	claimed, err := h.store.MarkOrgRoleUnavailableEscalated(ctx, role, now)
 	if err != nil {
 		return fmt.Errorf("claim org role %q quota escalation: %w", role, err)
 	}
 	if !claimed {
 		return nil
 	}
-	incident, found, err := w.Store.GetActiveOrgRoleUnavailable(ctx, role, now)
+	incident, found, err := h.store.GetActiveOrgRoleUnavailable(ctx, role, now)
 	if err != nil {
 		return fmt.Errorf("reload org role %q unavailability: %w", role, err)
 	}
 	if found {
-		w.wakeQuotaRoleUnavailable(ctx, job, payload, incident, classification.QuotaResetParsed, classification.QuotaResetMentioned)
+		h.wakeParent(ctx, job, payload, incident, classification.QuotaResetParsed, classification.QuotaResetMentioned)
 	}
 	return nil
 }
 
-func (w jobWorker) clearQuotaRoleUnavailableOnSuccess(ctx context.Context, role string) error {
+func (h quotaRoleUnavailableHooks) clearOnSuccess(ctx context.Context, role string) error {
 	role = strings.TrimSpace(role)
-	if role == "" || w.Store == nil {
+	if role == "" || h.store == nil {
 		return nil
 	}
-	return w.Store.ClearOrgRoleUnavailable(ctx, role)
+	return h.store.ClearOrgRoleUnavailable(ctx, role)
+}
+
+func (w jobWorker) captureQuotaRoleUnavailable(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent, cause error, now time.Time) error {
+	return w.quotaRoleUnavailableHooks().captureFailure(ctx, job, payload, agent, cause, now)
+}
+
+func (w jobWorker) clearQuotaRoleUnavailableOnSuccess(ctx context.Context, role string) error {
+	return w.quotaRoleUnavailableHooks().clearOnSuccess(ctx, role)
 }
 
 // wakeQuotaRoleUnavailable directly wakes the unavailable role's configured
 // parent. The durable escalation claim is marked before this best-effort call,
 // matching the codebase's mark-before-emit discipline and preventing storms.
-func (w jobWorker) wakeQuotaRoleUnavailable(ctx context.Context, job db.Job, payload workflow.JobPayload, incident db.OrgRoleUnavailable, resetParsed, resetMentioned bool) {
-	if w.QuotaWake == nil {
+func (h quotaRoleUnavailableHooks) wakeParent(ctx context.Context, job db.Job, payload workflow.JobPayload, incident db.OrgRoleUnavailable, resetParsed, resetMentioned bool) {
+	if h.wake == nil {
 		return
 	}
-	paths, err := w.configPaths()
+	paths, err := pathsFromFlag(h.home)
 	if err != nil {
-		writeLine(w.Stdout, "org role %s quota escalation skipped: resolve config: %v", incident.Role, err)
+		writeLine(h.stdout, "org role %s quota escalation skipped: resolve config: %v", incident.Role, err)
 		return
 	}
 	cfg, err := config.LoadOrg(paths)
 	if err != nil {
-		writeLine(w.Stdout, "org role %s quota escalation skipped: load org registry: %v", incident.Role, err)
+		writeLine(h.stdout, "org role %s quota escalation skipped: load org registry: %v", incident.Role, err)
 		return
 	}
 	source, ok := cfg.Role(incident.Role)
 	if !ok {
-		writeLine(w.Stdout, "org role %s quota escalation skipped: role is not configured", incident.Role)
+		writeLine(h.stdout, "org role %s quota escalation skipped: role is not configured", incident.Role)
 		return
 	}
 	targetName := strings.TrimSpace(source.Parent)
 	if targetName == "" {
-		writeLine(w.Stdout, "org role %s quota escalation skipped: role has no parent", incident.Role)
+		writeLine(h.stdout, "org role %s quota escalation skipped: role has no parent", incident.Role)
 		return
 	}
 	target, ok := cfg.Role(targetName)
 	if !ok {
-		writeLine(w.Stdout, "org role %s quota escalation skipped: parent role %s is not configured", incident.Role, targetName)
+		writeLine(h.stdout, "org role %s quota escalation skipped: parent role %s is not configured", incident.Role, targetName)
 		return
 	}
 	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), eventRuleProbeTimeout)
-	available := w.QuotaWake.Available(probeCtx)
+	available := h.wake.Available(probeCtx)
 	cancel()
 	if !available {
-		writeLine(w.Stdout, "org role %s quota escalation not delivered: Herdr unavailable", incident.Role)
+		writeLine(h.stdout, "org role %s quota escalation not delivered: Herdr unavailable", incident.Role)
 		return
 	}
 	pane, ok := config.ResolveRolePaneBinding(context.WithoutCancel(ctx), target.Pane, func(resolveCtx context.Context, label string) (string, bool) {
 		bounded, cancel := context.WithTimeout(resolveCtx, eventRuleProbeTimeout)
 		defer cancel()
-		return w.QuotaWake.ResolvePaneByLabel(bounded, label)
+		return h.wake.ResolvePaneByLabel(bounded, label)
 	})
 	if !ok {
-		writeLine(w.Stdout, "org role %s quota escalation skipped: parent role %s has no pane", incident.Role, targetName)
+		writeLine(h.stdout, "org role %s quota escalation skipped: parent role %s has no pane", incident.Role, targetName)
 		return
 	}
 	resetSource := "provider reset"
@@ -132,14 +183,29 @@ func (w jobWorker) wakeQuotaRoleUnavailable(ctx context.Context, job db.Job, pay
 		incident.Role, formatOrgRoleUnavailableUntil(incident.Until), resetSource, job.ID, payload.Repo,
 	)
 	callCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), eventRuleWakeTimeout)
-	delivered, stalled, err := w.QuotaWake.AgentPrompt(callCtx, pane, prompt, "")
+	delivered, stalled, err := h.wake.AgentPrompt(callCtx, pane, prompt, "")
 	cancel()
 	if err != nil || stalled || !delivered {
-		writeLine(w.Stdout, "org role %s quota escalation not delivered to %s: %v", incident.Role, targetName, err)
+		writeLine(h.stdout, "org role %s quota escalation not delivered to %s: %v", incident.Role, targetName, err)
 	}
 }
 
 func unavailableRoleDispatchError(incident db.OrgRoleUnavailable) error {
 	return fmt.Errorf("org role %q is unavailable (reason=%s) until %s; dispatch refused",
 		incident.Role, incident.Reason, formatOrgRoleUnavailableUntil(incident.Until))
+}
+
+func refuseUnavailableOrgRole(ctx context.Context, store *db.Store, role string, now time.Time) error {
+	role = strings.TrimSpace(role)
+	if role == "" || store == nil {
+		return nil
+	}
+	incident, found, err := store.GetActiveOrgRoleUnavailable(ctx, role, now)
+	if err != nil {
+		return fmt.Errorf("read org role %q unavailability: %w", role, err)
+	}
+	if found {
+		return unavailableRoleDispatchError(incident)
+	}
+	return nil
 }

@@ -832,6 +832,13 @@ func runJobRun(args []string, stdout, stderr io.Writer) int {
 		if job.State != string(workflow.JobQueued) {
 			return fmt.Errorf("job %s is %s; run requires queued", job.ID, job.State)
 		}
+		payload, err := daemonJobPayload(job)
+		if err != nil {
+			return err
+		}
+		if err := refuseUnavailableOrgRole(context.Background(), store, payload.ActingOrgRole, time.Now().UTC()); err != nil {
+			return err
+		}
 		worker := defaultJobWorker(store, stdout, *home)
 		worker.CommenterFactory = worker.defaultCommenter
 		if err := worker.run(context.Background(), job); err != nil {
