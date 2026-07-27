@@ -146,6 +146,37 @@ func TestIssue1113MergedCommitRemainsPartialEvidenceGolden(t *testing.T) {
 	}
 }
 
+func TestOpenPullRequestSyntheticMergeCommitIsNotMergeEvidence(t *testing.T) {
+	repo := github.Repository{Owner: "o", Name: "r"}
+	pr := tracePR(12, "Open attempt")
+	pr.MergeSHA = "synthetic-test-merge"
+	remote := &fakeReader{
+		issue:       github.TraceIssue{Number: 9, State: "open"},
+		prs:         map[int64]github.TracePullRequest{12: pr},
+		refs:        map[int64][]github.TraceCrossReference{9: {crossReference(repo, pr)}},
+		search:      map[string][]github.TracePullRequest{},
+		repository:  github.TraceRepository{DefaultBranch: "main"},
+		comparisons: map[string]github.CompareResult{},
+	}
+
+	trace, err := (&Resolver{Remote: remote}).TraceIssue(context.Background(), repo, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trace.Attempts) != 1 {
+		t.Fatalf("attempts = %+v", trace.Attempts)
+	}
+	attempt := trace.Attempts[0]
+	if attempt.MergeSHA != "" || attempt.MergedAt != "" || attempt.OnDefault != nil {
+		t.Fatalf("open PR synthetic merge commit became merge evidence: %+v", attempt)
+	}
+	for _, evidence := range attempt.Evidence {
+		if evidence.Kind == "merge" || evidence.Kind == "default_branch_ancestry" {
+			t.Fatalf("open PR has false merge evidence: %+v", attempt.Evidence)
+		}
+	}
+}
+
 func TestTraceIssueJoinsLocalRowsWithoutUsingJobPullRequest(t *testing.T) {
 	repo := github.Repository{Owner: "o", Name: "r"}
 	pr := tracePR(8, "Fix issue")
