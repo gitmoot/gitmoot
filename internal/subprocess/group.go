@@ -33,6 +33,10 @@ func (r GroupRunner) Run(ctx context.Context, dir string, command string, args .
 	return RunGroup(ctx, dir, command, args...)
 }
 
+func (r GroupRunner) RunWithPID(ctx context.Context, dir string, onPID PIDCallback, command string, args ...string) (Result, error) {
+	return r.RunEnvWithPID(ctx, dir, nil, onPID, command, args...)
+}
+
 // RunEnv gives GroupRunner the EnvRunner contract: process-group kill semantics
 // PLUS extra KEY=VALUE env vars appended to the inherited environment. It is what
 // the #732 chat relay uses to inject a moot seat's GITMOOT_CHAT_RELAY[_AUTH] into
@@ -46,6 +50,13 @@ func (r GroupRunner) RunEnv(ctx context.Context, dir string, env []string, comma
 	return RunGroupEnv(ctx, dir, env, command, args...)
 }
 
+func (r GroupRunner) RunEnvWithPID(ctx context.Context, dir string, env []string, onPID PIDCallback, command string, args ...string) (Result, error) {
+	if r.MaxOutputBytes > 0 {
+		return runGroupEnvBoundedWithPID(ctx, dir, env, r.MaxOutputBytes, onPID, command, args...)
+	}
+	return runGroupEnvWithPID(ctx, dir, env, onPID, command, args...)
+}
+
 // RunStream gives GroupRunner the StreamRunner contract: process-group kill
 // semantics PLUS a live line-tee of the child's stdout/stderr to out. It is what
 // TeeRunner{} defaults to, so teeing a runtime adapter's output into a per-job
@@ -55,8 +66,16 @@ func (GroupRunner) RunStream(ctx context.Context, dir string, out io.Writer, com
 	return RunGroupStream(ctx, dir, out, command, args...)
 }
 
+func (GroupRunner) RunStreamWithPID(ctx context.Context, dir string, out io.Writer, onPID PIDCallback, command string, args ...string) (Result, error) {
+	return RunGroupEnvStreamWithPID(ctx, dir, nil, out, onPID, command, args...)
+}
+
 func (GroupRunner) RunEnvStream(ctx context.Context, dir string, env []string, out io.Writer, command string, args ...string) (Result, error) {
 	return RunGroupEnvStream(ctx, dir, env, out, command, args...)
+}
+
+func (GroupRunner) RunEnvStreamWithPID(ctx context.Context, dir string, env []string, out io.Writer, onPID PIDCallback, command string, args ...string) (Result, error) {
+	return RunGroupEnvStreamWithPID(ctx, dir, env, out, onPID, command, args...)
 }
 
 func (GroupRunner) LookPath(file string) (string, error) {
@@ -94,6 +113,26 @@ func RunGroupEnv(ctx context.Context, dir string, extraEnv []string, command str
 	}, err
 }
 
+func runGroupEnvWithPID(ctx context.Context, dir string, extraEnv []string, onPID PIDCallback, command string, args ...string) (Result, error) {
+	cmd, sweep := newGroupCmd(ctx, dir, command, args)
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := startAndWait(cmd, onPID)
+	sweep()
+	return Result{
+		Command: command,
+		Args:    args,
+		Stdout:  stdout.String(),
+		Stderr:  stderr.String(),
+	}, err
+}
+
 // RunGroupEnvBounded is RunGroupEnv with bounded tail capture for stdout and
 // stderr. It preserves the same process-group cancellation, WaitDelay, and final
 // SIGKILL sweep while preventing a noisy child from growing memory without bound.
@@ -107,6 +146,20 @@ func RunGroupEnvBounded(ctx context.Context, dir string, extraEnv []string, maxO
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
+	sweep()
+	return Result{Command: command, Args: args, Stdout: stdout.String(), Stderr: stderr.String()}, err
+}
+
+func runGroupEnvBoundedWithPID(ctx context.Context, dir string, extraEnv []string, maxOutputBytes int, onPID PIDCallback, command string, args ...string) (Result, error) {
+	cmd, sweep := newGroupCmd(ctx, dir, command, args)
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
+	stdout := tailBuffer{max: maxOutputBytes}
+	stderr := tailBuffer{max: maxOutputBytes}
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := startAndWait(cmd, onPID)
 	sweep()
 	return Result{Command: command, Args: args, Stdout: stdout.String(), Stderr: stderr.String()}, err
 }
@@ -149,6 +202,19 @@ func RunGroupEnvStream(ctx context.Context, dir string, extraEnv []string, out i
 		cmd.Env = append(os.Environ(), extraEnv...)
 	}
 	result, err := runStreamingCmd(cmd, out, command, args)
+	sweep()
+	return result, err
+}
+
+func RunGroupEnvStreamWithPID(ctx context.Context, dir string, extraEnv []string, out io.Writer, onPID PIDCallback, command string, args ...string) (Result, error) {
+	if out == nil {
+		return runGroupEnvWithPID(ctx, dir, extraEnv, onPID, command, args...)
+	}
+	cmd, sweep := newGroupCmd(ctx, dir, command, args)
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
+	result, err := runStreamingCmdWithPID(cmd, out, onPID, command, args)
 	sweep()
 	return result, err
 }

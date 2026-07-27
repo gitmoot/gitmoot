@@ -47,6 +47,71 @@ func TestWrappingRunnerRewritesArgvExactly(t *testing.T) {
 	}
 }
 
+func TestWrappingRunnerPIDMethodsFallBackToPlainRunner(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(WrappingRunner, PIDCallback) (Result, error)
+	}{
+		{
+			name: "run",
+			run: func(runner WrappingRunner, onPID PIDCallback) (Result, error) {
+				return runner.RunWithPID(context.Background(), "/work", onPID, "claude", "-p", "task")
+			},
+		},
+		{
+			name: "run env",
+			run: func(runner WrappingRunner, onPID PIDCallback) (Result, error) {
+				return runner.RunEnvWithPID(context.Background(), "/work", nil, onPID, "claude", "-p", "task")
+			},
+		},
+		{
+			name: "run stream",
+			run: func(runner WrappingRunner, onPID PIDCallback) (Result, error) {
+				return runner.RunStreamWithPID(context.Background(), "/work", &bytes.Buffer{}, onPID, "claude", "-p", "task")
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			capture := &wrappingCaptureRunner{}
+			runner := WrappingRunner{Inner: capture, Executable: "/opt/gitmoot"}
+			reportedPID := 0
+			result, err := tc.run(runner, func(pid int) { reportedPID = pid })
+			if err != nil {
+				t.Fatalf("PID method returned error: %v", err)
+			}
+			want := []string{"sandbox-exec", "--", "claude", "-p", "task"}
+			if result.Command != "/opt/gitmoot" || capture.command != "/opt/gitmoot" || !reflect.DeepEqual(capture.args, want) {
+				t.Fatalf("fallback call = command %q args %v result %+v, want /opt/gitmoot %v", capture.command, capture.args, result, want)
+			}
+			if reportedPID != 0 {
+				t.Fatalf("fallback reported PID %d, want none", reportedPID)
+			}
+		})
+	}
+}
+
+func TestWrappingRunnerPIDMethodWithEnvFallsBackToEnvRunner(t *testing.T) {
+	capture := &wrappingCaptureRunner{}
+	runner := WrappingRunner{
+		Inner:      capture,
+		Executable: "/opt/gitmoot",
+		Env:        []string{"CLAUDE_CONFIG_DIR=/sandbox"},
+	}
+	reportedPID := 0
+	if _, err := runner.RunWithPID(context.Background(), "/work", func(pid int) {
+		reportedPID = pid
+	}, "claude", "-p", "task"); err != nil {
+		t.Fatalf("RunWithPID returned error: %v", err)
+	}
+	if !reflect.DeepEqual(capture.env, []string{"CLAUDE_CONFIG_DIR=/sandbox"}) {
+		t.Fatalf("fallback env = %v, want wrapper env", capture.env)
+	}
+	if reportedPID != 0 {
+		t.Fatalf("fallback reported PID %d, want none", reportedPID)
+	}
+}
+
 func TestWrappingRunnerInjectsEnvWhileStreaming(t *testing.T) {
 	dir := t.TempDir()
 	shim := filepath.Join(dir, "shim.sh")

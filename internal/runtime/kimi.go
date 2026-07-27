@@ -156,7 +156,7 @@ func (a KimiAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result,
 	defer cleanup()
 	args = append(args, extraArgs...)
 	args = append(args, "-p", promptArg, "--output-format", "stream-json")
-	result, err := runAgentCommand(ctx, a.runner(), a.Dir, job.AgentEnv, "kimi", args...)
+	result, err := runAgentCommand(ctx, a.runner(), a.Dir, job.AgentEnv, job.OnPID, "kimi", args...)
 	// The fresh per-job kimi session never reports its id, so SessionID stays
 	// empty; the exit/stderr diagnostics still apply.
 	if err != nil {
@@ -254,7 +254,7 @@ func (a KimiCLIAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Resu
 		return Result{}, err
 	}
 	defer cleanup()
-	result, err := runAgentCommand(ctx, a.runner(), a.Dir, job.AgentEnv, "kimi", kimiCLIPromptArgs(agent, EffectiveModel(agent, job), promptArg, extraArgs)...)
+	result, err := runAgentCommand(ctx, a.runner(), a.Dir, job.AgentEnv, job.OnPID, "kimi", kimiCLIPromptArgs(agent, EffectiveModel(agent, job), promptArg, extraArgs)...)
 	if err != nil {
 		return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, "")}, kimiCommandError(result, err)
 	}
