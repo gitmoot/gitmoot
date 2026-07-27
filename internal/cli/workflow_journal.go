@@ -119,9 +119,10 @@ type workflowJobJSON struct {
 }
 
 type workflowShowJSON struct {
-	Summary db.WorkflowSummary      `json:"summary"`
-	Meta    db.WorkflowMeta         `json:"meta"`
-	Entries []workflowTimelineEntry `json:"entries"`
+	Summary   db.WorkflowSummary      `json:"summary"`
+	Meta      db.WorkflowMeta         `json:"meta"`
+	Entries   []workflowTimelineEntry `json:"entries"`
+	Truncated bool                    `json:"truncated,omitempty"`
 }
 
 func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
@@ -185,9 +186,11 @@ func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 	}
 	entries := mergeWorkflowTimeline(jobs, notes)
 	if *limit > 0 && len(entries) > *limit {
-		entries = entries[:*limit]
+		entries = entries[len(entries)-*limit:]
 	}
-	out := workflowShowJSON{Summary: summary, Meta: meta, Entries: entries}
+	totalEntries := summary.JobCount + summary.NoteCount
+	truncated := *limit > 0 && totalEntries > len(entries)
+	out := workflowShowJSON{Summary: summary, Meta: meta, Entries: entries, Truncated: truncated}
 	out.Meta.Description = workflowDisplayDescription(summary.WorkflowID, out.Meta.Description)
 	if *jsonOutput {
 		if err := writeJSON(stdout, out); err != nil {
@@ -205,6 +208,10 @@ func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "jobs: %d\nnotes: %d\ntokens(best-effort): input=%d output=%d\nfirst: %s\nlast: %s\n",
 		summary.JobCount, summary.NoteCount, summary.InputTokens,
 		summary.OutputTokens, summary.FirstAt, summary.LastAt)
+	if truncated {
+		fmt.Fprintf(stderr, "workflow show: showing the latest %d of %d entries (%d jobs, %d notes); pass --limit 0 for all or a larger --limit N\n",
+			len(entries), totalEntries, summary.JobCount, summary.NoteCount)
+	}
 	for _, entry := range entries {
 		if entry.Job != nil {
 			fmt.Fprintf(stdout, "%s\tjob\t%s\t%s\t%s\t%s\n", entry.CreatedAt, entry.Job.ID, entry.Job.State, entry.Job.Type, entry.Job.Agent)

@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -103,6 +104,158 @@ func workflowJournalTestHome(t *testing.T) (string, *db.Store) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	return home, store
+}
+
+func seedWorkflowShowRecencyFixture(t *testing.T) (string, *db.Store) {
+	t.Helper()
+	home, store := workflowJournalTestHome(t)
+	ctx := context.Background()
+	const workflowID = "release-recency"
+	jobTimes := map[string]string{
+		"job-oldest": "2026-07-20 08:00:00",
+		"job-middle": "2026-07-22 12:00:00",
+		"job-newest": "2026-07-27 11:00:00",
+	}
+	for id := range jobTimes {
+		if err := store.CreateJob(ctx, db.Job{
+			ID: id, Agent: "worker", Type: "ask", State: "succeeded",
+			Payload: `{"repo":"acme/widget","workflow_id":"release-recency"}`,
+		}); err != nil {
+			t.Fatalf("CreateJob(%s): %v", id, err)
+		}
+	}
+	noteTimes := []struct {
+		body      string
+		createdAt string
+	}{
+		{"note-oldest", "2026-07-21 09:00:00"},
+		{"note-newer", "2026-07-26 19:06:00"},
+		{"note-latest", "2026-07-27 12:03:00"},
+	}
+	noteIDs := make(map[string]int64, len(noteTimes))
+	for _, item := range noteTimes {
+		note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: workflowID, Author: "operator", Body: item.body,
+		})
+		if err != nil {
+			t.Fatalf("InsertWorkflowNote(%s): %v", item.body, err)
+		}
+		noteIDs[item.body] = note.ID
+	}
+
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer raw.Close()
+	for id, createdAt := range jobTimes {
+		if _, err := raw.ExecContext(ctx,
+			`UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`,
+			createdAt, createdAt, id); err != nil {
+			t.Fatalf("set job %s timestamp: %v", id, err)
+		}
+	}
+	for _, item := range noteTimes {
+		if _, err := raw.ExecContext(ctx,
+			`UPDATE workflow_notes SET created_at = ? WHERE id = ?`,
+			item.createdAt, noteIDs[item.body]); err != nil {
+			t.Fatalf("set note %s timestamp: %v", item.body, err)
+		}
+	}
+	return home, store
+}
+
+func TestWorkflowShowKeepsNewestEntriesAndReportsTextTruncation(t *testing.T) {
+	home, store := seedWorkflowShowRecencyFixture(t)
+
+	var stdout, stderr bytes.Buffer
+	if code := runWorkflowShow([]string{"release-recency", "--home", home, "--limit", "3"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("workflow show exit=%d stderr=%q", code, stderr.String())
+	}
+	text := stdout.String()
+	if strings.Contains(text, "\tjob\tjob-oldest\t") || strings.Contains(text, "\toperator\tnote-oldest\n") {
+		t.Fatalf("oldest entries were not truncated: %q", text)
+	}
+	if !strings.Contains(text, "\tnote\t") || !strings.Contains(text, "note-latest") ||
+		!strings.Contains(text, "jobs: 3\nnotes: 3\n") {
+		t.Fatalf("newest entry or summary counts missing: %q", text)
+	}
+	if got := stderr.String(); !strings.Contains(got, "showing the latest 3 of 6 entries (3 jobs, 3 notes)") ||
+		!strings.Contains(got, "pass --limit 0 for all") {
+		t.Fatalf("truncation notice = %q", got)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := runWorkflowShow([]string{"release-recency", "--home", home, "--limit", "0"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("workflow show --limit 0 exit=%d stderr=%q", code, stderr.String())
+	}
+	if got := strings.Count(stdout.String(), "\tjob\t") + strings.Count(stdout.String(), "\tnote\t"); got != 6 {
+		t.Fatalf("--limit 0 row count = %d, want 6; output=%q", got, stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("--limit 0 truncation notice = %q", stderr.String())
+	}
+
+	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+		WorkflowID: "release-small", Author: "operator", Body: "only-note",
+	}); err != nil {
+		t.Fatalf("InsertWorkflowNote(small): %v", err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := runWorkflowShow([]string{"release-small", "--home", home, "--limit", "3"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("small workflow show exit=%d stderr=%q", code, stderr.String())
+	}
+	if stderr.Len() != 0 || !strings.Contains(stdout.String(), "only-note") {
+		t.Fatalf("small workflow output=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestWorkflowShowJSONAnnouncesOnlyActualTruncation(t *testing.T) {
+	home, store := seedWorkflowShowRecencyFixture(t)
+
+	var stdout, stderr bytes.Buffer
+	if code := runWorkflowShow([]string{"release-recency", "--home", home, "--limit", "3", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("truncated JSON show exit=%d stderr=%q", code, stderr.String())
+	}
+	var out workflowShowJSON
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("decode truncated JSON: %v raw=%s", err, stdout.String())
+	}
+	if !out.Truncated || len(out.Entries) != 3 ||
+		out.Summary.JobCount+out.Summary.NoteCount != 6 {
+		t.Fatalf("truncated JSON = %+v", out)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(stdout.Bytes(), &raw); err != nil {
+		t.Fatalf("decode truncated JSON fields: %v", err)
+	}
+	if _, ok := raw["truncated"]; !ok {
+		t.Fatalf("truncated field omitted from truncated JSON: %s", stdout.String())
+	}
+
+	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+		WorkflowID: "release-small-json", Author: "operator", Body: "only-note",
+	}); err != nil {
+		t.Fatalf("InsertWorkflowNote(small JSON): %v", err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := runWorkflowShow([]string{"release-small-json", "--home", home, "--limit", "3", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("small JSON show exit=%d stderr=%q", code, stderr.String())
+	}
+	out = workflowShowJSON{}
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil || out.Truncated {
+		t.Fatalf("small JSON = %+v err=%v raw=%s", out, err, stdout.String())
+	}
+	raw = nil
+	if err := json.Unmarshal(stdout.Bytes(), &raw); err != nil {
+		t.Fatalf("decode small JSON fields: %v", err)
+	}
+	if _, ok := raw["truncated"]; ok {
+		t.Fatalf("truncated field present for complete window: %s", stdout.String())
+	}
 }
 
 func TestWorkflowNoteRememberSharedDefaultAndPrefilterRollback(t *testing.T) {
