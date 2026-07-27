@@ -1335,6 +1335,10 @@ gitmoot workflow close fable/dashboard-redesign --reason "Shipped and verified."
 best-effort token totals. Its JSON summary also includes the acknowledgment
 timestamps `last_failure_at`, `last_human_note_at`, and
 `last_merged_receipt_at`. `workflow show` merges jobs and notes chronologically.
+By default it keeps the newest 100 entries and displays that window oldest to
+newest; pass `--limit 0` for the complete timeline or a larger `--limit N` for
+a wider window. When rows are omitted, text mode prints the shown and total
+counts plus that guidance to stderr, while JSON includes `"truncated": true`.
 The read-only web dashboard shows labels as Galaxy hubs and provides a Workflows
 index plus a mission-log detail at `/workflows/<label>`. Workflows are `active`
 while queued/running, `recent` when no work is live but activity occurred within

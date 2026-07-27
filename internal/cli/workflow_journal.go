@@ -119,10 +119,54 @@ type workflowJobJSON struct {
 }
 
 type workflowShowJSON struct {
-	Summary db.WorkflowSummary      `json:"summary"`
-	Meta    db.WorkflowMeta         `json:"meta"`
-	Entries []workflowTimelineEntry `json:"entries"`
+	Summary   db.WorkflowSummary      `json:"summary"`
+	Meta      db.WorkflowMeta         `json:"meta"`
+	Entries   []workflowTimelineEntry `json:"entries"`
+	Truncated bool                    `json:"truncated,omitempty"`
 }
+
+// workflowShowStore keeps the summary-first read sequence deterministic under
+// test while production continues to use the concrete SQLite store.
+type workflowShowStore interface {
+	WorkflowSummary(context.Context, string) (db.WorkflowSummary, error)
+	ListJobsByWorkflow(context.Context, string, int) ([]db.Job, error)
+	ListWorkflowNotes(context.Context, string, int) ([]db.WorkflowNote, error)
+	GetWorkflowMeta(context.Context, string) (db.WorkflowMeta, error)
+}
+
+type workflowShowData struct {
+	summary db.WorkflowSummary
+	meta    db.WorkflowMeta
+	jobs    []db.Job
+	notes   []db.WorkflowNote
+}
+
+func loadWorkflowShow(ctx context.Context, store workflowShowStore, label string, fetchLimit int) (workflowShowData, error) {
+	var data workflowShowData
+	var err error
+	data.summary, err = store.WorkflowSummary(ctx, label)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return workflowShowData{}, fmt.Errorf("workflow %q not found", label)
+		}
+		return workflowShowData{}, err
+	}
+	data.jobs, err = store.ListJobsByWorkflow(ctx, label, fetchLimit)
+	if err != nil {
+		return workflowShowData{}, err
+	}
+	data.notes, err = store.ListWorkflowNotes(ctx, label, fetchLimit)
+	if err != nil {
+		return workflowShowData{}, err
+	}
+	data.meta, err = store.GetWorkflowMeta(ctx, label)
+	if errors.Is(err, sql.ErrNoRows) {
+		return data, nil
+	}
+	return data, err
+}
+
+var workflowShowLoader = loadWorkflowShow
 
 func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("workflow show", flag.ContinueOnError)
@@ -152,42 +196,29 @@ func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "workflow show requires one label and --limit >= 0")
 		return 2
 	}
-	var summary db.WorkflowSummary
-	var meta db.WorkflowMeta
-	var jobs []db.Job
-	var notes []db.WorkflowNote
+	fetchLimit := *limit
+	if fetchLimit > 0 {
+		fetchLimit++
+	}
+	var data workflowShowData
 	if err := withStore(*home, func(store *db.Store) error {
-		ctx := context.Background()
 		var err error
-		summary, err = store.WorkflowSummary(ctx, label)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("workflow %q not found", label)
-			}
-			return err
-		}
-		jobs, err = store.ListJobsByWorkflow(ctx, label, *limit)
-		if err != nil {
-			return err
-		}
-		notes, err = store.ListWorkflowNotes(ctx, label, *limit)
-		if err != nil {
-			return err
-		}
-		meta, err = store.GetWorkflowMeta(ctx, label)
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil
-		}
+		data, err = workflowShowLoader(context.Background(), store, label, fetchLimit)
 		return err
 	}); err != nil {
 		fmt.Fprintf(stderr, "workflow show: %v\n", err)
 		return 1
 	}
+	summary, meta, jobs, notes := data.summary, data.meta, data.jobs, data.notes
 	entries := mergeWorkflowTimeline(jobs, notes)
-	if *limit > 0 && len(entries) > *limit {
-		entries = entries[:*limit]
+	truncated := *limit > 0 && len(entries) > *limit
+	if truncated {
+		entries = entries[len(entries)-*limit:]
 	}
-	out := workflowShowJSON{Summary: summary, Meta: meta, Entries: entries}
+	displayJobCount := max(summary.JobCount, len(jobs))
+	displayNoteCount := max(summary.NoteCount, len(notes))
+	totalEntries := displayJobCount + displayNoteCount
+	out := workflowShowJSON{Summary: summary, Meta: meta, Entries: entries, Truncated: truncated}
 	out.Meta.Description = workflowDisplayDescription(summary.WorkflowID, out.Meta.Description)
 	if *jsonOutput {
 		if err := writeJSON(stdout, out); err != nil {
@@ -205,6 +236,10 @@ func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "jobs: %d\nnotes: %d\ntokens(best-effort): input=%d output=%d\nfirst: %s\nlast: %s\n",
 		summary.JobCount, summary.NoteCount, summary.InputTokens,
 		summary.OutputTokens, summary.FirstAt, summary.LastAt)
+	if truncated {
+		fmt.Fprintf(stderr, "workflow show: showing the latest %d of %d entries (%d jobs, %d notes); pass --limit 0 for all or a larger --limit N\n",
+			len(entries), totalEntries, displayJobCount, displayNoteCount)
+	}
 	for _, entry := range entries {
 		if entry.Job != nil {
 			fmt.Fprintf(stdout, "%s\tjob\t%s\t%s\t%s\t%s\n", entry.CreatedAt, entry.Job.ID, entry.Job.State, entry.Job.Type, entry.Job.Agent)
@@ -409,6 +444,9 @@ func mergeWorkflowTimeline(jobs []db.Job, notes []db.WorkflowNote) []workflowTim
 		}
 		if entries[i].Kind != entries[j].Kind {
 			return entries[i].Kind < entries[j].Kind
+		}
+		if entries[i].Kind == "note" {
+			return entries[i].Note.ID < entries[j].Note.ID
 		}
 		return entries[i].ID < entries[j].ID
 	})

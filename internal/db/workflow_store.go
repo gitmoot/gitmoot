@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -122,7 +123,7 @@ type WorkflowSummary struct {
 // exactly the same statements.
 const ListWorkflowNotesSQL = `SELECT id, workflow_id, author, body, repo, memory_observation_id, created_at
 FROM workflow_notes INDEXED BY idx_workflow_notes_wid
-WHERE workflow_id = ? ORDER BY created_at, id LIMIT ?`
+WHERE workflow_id = ? ORDER BY created_at DESC, id DESC LIMIT ?`
 
 // SQLite LIKE is ASCII-case-insensitive but harmless here: the sole writer path
 // (InsertWorkflowAutoNoteWithMeta) validates the lowercase "[auto:pr:" prefix.
@@ -200,7 +201,7 @@ const ListJobsByWorkflowSQL = `SELECT id, agent, type, state, model, workflow_id
 	blocker_retry_at, blocker_suggested_action, input_tokens, output_tokens, created_at, updated_at
 FROM jobs INDEXED BY idx_jobs_workflow_id
 WHERE workflow_id != '' AND workflow_id = ?
-ORDER BY created_at, id LIMIT ?`
+ORDER BY created_at DESC, id DESC LIMIT ?`
 
 // ListWorkflowGraphJobsSQL is the workflow dashboard's bounded payload
 // projection. Unlike the scalar CLI list above, the workflow forest needs each
@@ -714,7 +715,13 @@ func (s *Store) ListWorkflowNotes(ctx context.Context, workflowID string, limit 
 		}
 		notes = append(notes, note)
 	}
-	return notes, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// The descending query makes LIMIT select the newest rows; restore the
+	// chronological order callers expect from this workflow timeline API.
+	slices.Reverse(notes)
+	return notes, nil
 }
 
 // ListWorkflowNotesByBodyPrefix returns recent journal entries whose body starts
@@ -783,7 +790,13 @@ func (s *Store) ListJobsByWorkflow(ctx context.Context, workflowID string, limit
 		}
 		jobs = append(jobs, job)
 	}
-	return jobs, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// The descending query makes LIMIT select the newest rows; restore the
+	// chronological order callers expect from this workflow timeline API.
+	slices.Reverse(jobs)
+	return jobs, nil
 }
 
 // ListWorkflowGraphJobs returns every job carrying workflowID, including the

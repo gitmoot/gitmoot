@@ -39,6 +39,16 @@ func TestWorkflowStoreAggregatesAndFiltersByIndexedColumn(t *testing.T) {
 	seedWorkflowJob(t, store, "a", "release-42", "queued", "acme/widget", 2, 3)
 	seedWorkflowJob(t, store, "b", "release-42", "succeeded", "acme/widget", 5, 7)
 	seedWorkflowJob(t, store, "c", "other", "failed", "acme/other", 100, 100)
+	for id, createdAt := range map[string]string{
+		"a": "2026-07-20 08:00:00",
+		"b": "2026-07-27 12:03:00",
+	} {
+		if _, err := store.db.ExecContext(ctx,
+			`UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`,
+			createdAt, createdAt, id); err != nil {
+			t.Fatalf("set job %s timestamp: %v", id, err)
+		}
+	}
 	if _, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: "release-42", Body: "checkpoint"}); err != nil {
 		t.Fatalf("InsertWorkflowNote: %v", err)
 	}
@@ -61,11 +71,11 @@ func TestWorkflowStoreAggregatesAndFiltersByIndexedColumn(t *testing.T) {
 		t.Fatalf("jobs = %+v", jobs)
 	}
 	limitedJobs, err := store.ListJobsByWorkflow(ctx, "release-42", 1)
-	if err != nil || len(limitedJobs) != 1 || limitedJobs[0].ID != "a" {
+	if err != nil || len(limitedJobs) != 1 || limitedJobs[0].ID != "b" {
 		t.Fatalf("limited jobs=%+v err=%v", limitedJobs, err)
 	}
 	limitedNotes, err := store.ListWorkflowNotes(ctx, "release-42", 1)
-	if err != nil || len(limitedNotes) != 1 || limitedNotes[0].Body != "checkpoint" {
+	if err != nil || len(limitedNotes) != 1 || limitedNotes[0].Body != "checkpoint two" {
 		t.Fatalf("limited notes=%+v err=%v", limitedNotes, err)
 	}
 	repos, err := store.WorkflowRepos(ctx, "release-42")
@@ -74,6 +84,73 @@ func TestWorkflowStoreAggregatesAndFiltersByIndexedColumn(t *testing.T) {
 	}
 	if strings.Contains(strings.ToLower(ListJobsByWorkflowSQL), "payload") || strings.Contains(strings.ToLower(WorkflowReposSQL), "payload") {
 		t.Fatal("workflow scalar queries must not read or parse payload")
+	}
+}
+
+func TestListWorkflowTimelineRowsKeepsNewestByCreatedAt(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	const workflowID = "release-recency"
+	jobTimes := map[string]string{
+		"job-oldest": "2026-07-01 08:00:00",
+		"job-middle": "2026-07-15 12:00:00",
+		"job-newer":  "2026-07-26 19:06:00",
+		"job-newest": "2026-07-27 12:03:00",
+	}
+	for id := range jobTimes {
+		seedWorkflowJob(t, store, id, workflowID, "succeeded", "acme/widget", 0, 0)
+	}
+	for id, createdAt := range jobTimes {
+		if _, err := store.db.ExecContext(ctx,
+			`UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`,
+			createdAt, createdAt, id); err != nil {
+			t.Fatalf("set job %s timestamp: %v", id, err)
+		}
+	}
+
+	noteTimes := []struct {
+		body      string
+		createdAt string
+	}{
+		{"note-oldest", "2026-06-01 08:00:00"},
+		{"note-middle", "2026-07-10 12:00:00"},
+		{"note-newer", "2026-07-26 20:00:00"},
+		{"note-newest", "2026-07-27 12:04:00"},
+	}
+	for _, item := range noteTimes {
+		note, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: workflowID, Body: item.body})
+		if err != nil {
+			t.Fatalf("InsertWorkflowNote(%s): %v", item.body, err)
+		}
+		if _, err := store.db.ExecContext(ctx,
+			`UPDATE workflow_notes SET created_at = ? WHERE id = ?`,
+			item.createdAt, note.ID); err != nil {
+			t.Fatalf("set note %s timestamp: %v", item.body, err)
+		}
+	}
+
+	jobs, err := store.ListJobsByWorkflow(ctx, workflowID, 2)
+	if err != nil {
+		t.Fatalf("ListJobsByWorkflow: %v", err)
+	}
+	if len(jobs) != 2 || jobs[0].ID != "job-newer" || jobs[1].ID != "job-newest" {
+		t.Fatalf("limited jobs = %+v, want newest two", jobs)
+	}
+	notes, err := store.ListWorkflowNotes(ctx, workflowID, 2)
+	if err != nil {
+		t.Fatalf("ListWorkflowNotes: %v", err)
+	}
+	if len(notes) != 2 || notes[0].Body != "note-newer" || notes[1].Body != "note-newest" {
+		t.Fatalf("limited notes = %+v, want newest two", notes)
+	}
+
+	allJobs, err := store.ListJobsByWorkflow(ctx, workflowID, 0)
+	if err != nil || len(allJobs) != len(jobTimes) {
+		t.Fatalf("unbounded jobs = %+v, err=%v", allJobs, err)
+	}
+	allNotes, err := store.ListWorkflowNotes(ctx, workflowID, 0)
+	if err != nil || len(allNotes) != len(noteTimes) {
+		t.Fatalf("unbounded notes = %+v, err=%v", allNotes, err)
 	}
 }
 
