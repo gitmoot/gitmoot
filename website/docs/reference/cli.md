@@ -1263,6 +1263,8 @@ gitmoot task run task-001 --repo owner/repo --owner lead --base main
 gitmoot task list --repo owner/repo
 gitmoot task list --repo owner/repo --state implementing --json
 gitmoot task dismiss task-001 --reason "abandoned experiment"
+gitmoot task resume-work task-001 --reason "review requires another fix pass"
+gitmoot task resume-work task-001 --reason "withdraw pending merge" --override-pending-human-decision
 gitmoot task events task-001 --json
 ```
 
@@ -1280,6 +1282,17 @@ including daemon `task_dismissed_auto`, opt-in
 `task_dismissed_planned_ttl`, closed-unmerged `pr_closed_unmerged`, terminal
 top-level implement triage (`task_blocked_terminal_no_pr` or
 `task_blocked_job_failed`), and explicit recovery events.
+
+`task resume-work` is an explicit coordinator-only return to development from
+`reviewing`, `ready_to_merge`, or `awaiting_human_merge`. It requires `--reason`,
+refuses while a matching job or worktree process is live, preserves the branch
+lock, moves the task to `implementing`, and records `task_resume_work_manual`.
+The `awaiting_human_merge` state also requires
+`--override-pending-human-decision`, acknowledging that Gitmoot cannot observe a
+human who may be about to merge. Daemon advancement and autonomous retries do
+not invoke this command. Repeated manual use can still recreate the uncapped
+review/fix pattern tracked by #1142; the distinct event makes that activity
+measurable rather than invisible.
 
 ### Recover a dead implement
 

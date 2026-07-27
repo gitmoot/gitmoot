@@ -1442,6 +1442,8 @@ gitmoot task run task-001 --repo owner/repo --owner lead --base main
 gitmoot task list --repo owner/repo
 gitmoot task list --repo owner/repo --state implementing --json
 gitmoot task dismiss task-001 --reason "abandoned experiment"
+gitmoot task resume-work task-001 --reason "review requires another fix pass"
+gitmoot task resume-work task-001 --reason "withdraw pending merge" --override-pending-human-decision
 gitmoot task events task-001 --json
 ```
 
@@ -1457,6 +1459,21 @@ the task worktree also blocks dismissal. The default reason is `dismissed by
 operator`. Success preserves the branch and worktree, releases the branch lock
 best-effort, and appends `task_dismissed_manual` to `task events`. Repeating the
 command is an exit-0 no-op with `changed:false` in JSON.
+
+`task resume-work` is the explicit coordinator-only path for taking an orphaned
+`reviewing` or `ready_to_merge` task back into development, or for withdrawing a
+task from `awaiting_human_merge`. It requires `--reason`, refuses while any
+matching job or worktree process is live, transitions only those three states to
+`implementing`, preserves the branch lock, and records
+`task_resume_work_manual`. Resuming `awaiting_human_merge` additionally requires
+`--override-pending-human-decision`, because Gitmoot cannot observe whether a
+human is about to merge. The command is never called by daemon advancement or an
+autonomous retry path.
+
+Repeated coordinator use can still hand-recreate an uncapped review/fix loop;
+this command does not solve that separate #1142 problem. Its distinct event
+makes such manual re-entry measurable so the automatic round-cap design can
+account for it deliberately.
 
 `task events <id>` prints the append-only task lifecycle trail. Automatic stale
 dismissals use `task_dismissed_auto`; opt-in never-started-plan retirement uses
