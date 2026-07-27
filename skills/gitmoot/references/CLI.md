@@ -1167,8 +1167,9 @@ resolved role table.
 
 The registry uses `[org] enforce = "warn"|"block"` and
 `[org.roles."name"]` entries with `parent`, `scope`, `merge_rule`, an optional
-cosmetic `display_name`, an optional `model` runtime pin, and an optional `pane`
-Herdr binding (used by live presence and org event-rule wakes).
+cosmetic `display_name`, an optional `model` runtime pin, an optional per-role
+`recycle_after` duration override, and an optional `pane` Herdr binding (used by
+live presence and org event-rule wakes).
 The binding resolves as an exact live pane label first, then as a literal pane
 id; roles without a binding retain exact role-name-as-label presence lookup. There is
 exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
@@ -1181,10 +1182,13 @@ role's `pane` binding. `chart` and `status` also show a `⚠ flagged (N missed
 wakes)` marker once a role reaches the positive
 `[orchestrate].max_consecutive_missed_wakes` threshold; their JSON rows expose
 `missed_wakes`, `flagged`, and `flag_reason`. The threshold defaults to `0`, so
-flagging is off. `status --json` also exposes `active_jobs`, the live
+flagging is off. A missed-wake row more than 24 hours old is omitted from this
+flag calculation; its stored consecutive counter remains unchanged for the
+next real delivery attempt. `status --json` also exposes `active_jobs`, the live
 queued-plus-running job count attributed to the role through `ActingOrgRole`
-(#1057); it is distinct from daily or historical job counts. Open escalations
-remain deferred to #1058's resolution and correlation contract.
+(#1057); it is distinct from daily or historical job counts. Escalations can be
+resolved with `gitmoot org escalate resolve`; correlation beyond the optional
+`--note` link remains deferred to #1058.
 
 The read-only Org page consumes `GET /api/org` for the store-backed role tree,
 health strip, typed escalations, and current signal feed, plus
@@ -1226,9 +1230,11 @@ recycle does not kill or send exit keys to the old agent: the pane must already
 be at its interactive shell prompt. The Herdr start wait is bounded to 30
 seconds; a failed start leaves the durable handoff note available for recovery.
 When a role configures `model`, recycle passes `--model <value>` to the successor
-agent; deploy this binary before adding the fail-closed field to config. Brief
-and chart surface the configured pin, but live-vs-pinned drift detection awaits
-a running-model signal from Herdr.
+only for the verified Herdr kinds `codex`, `claude`, and `kimi`; other accepted
+`--kind` values silently ignore the pin without an error or warning. Deploy this
+binary before adding the fail-closed field to config. Brief and chart surface
+the configured pin, but live-vs-pinned drift detection awaits a running-model
+signal from Herdr.
 
 Fresh local `agent ask`, `agent run`, `agent review`, `agent implement`,
 `orchestrate`, and `task run` dispatches accept `--org-role <name>` (or the
@@ -1480,6 +1486,12 @@ task with a preserved branch and worktree first moves to `implementing`, then to
 worktree allocation, review continuation, and task-state advancement never
 resurrect a dismissed task implicitly. Retrying one of its jobs explicitly
 restores the task first and records `task_recovered_job_retry`.
+
+If an existing task worktree has fallen off the resolved base lineage, Gitmoot
+re-cuts it only when it is clean. When it also has uncommitted changes, `task
+run`/`agent implement` preserve the worktree, move the task to `blocked`, and
+record `stale_worktree_dirty_blocked`; manually salvage, commit, stash, or clean
+the changes before retrying.
 
 Two refusals guard `task recover` (and the `task run` / `agent implement`
 restart that points to it):

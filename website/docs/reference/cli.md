@@ -1005,23 +1005,28 @@ gitmoot org status [--json]
 
 The registry uses `[org] enforce = "warn"|"block"` and
 `[org.roles."name"]` entries with `parent`, `scope`, `merge_rule`, an optional
-cosmetic `display_name`, and an optional `pane` Herdr binding. The binding
-resolves as an exact live pane label first, then as a literal pane id; roles
-without a binding retain exact role-name-as-label presence lookup. There is
-exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
+cosmetic `display_name`, an optional `model` runtime pin, an optional per-role
+`recycle_after` duration override, and an optional `pane` Herdr binding. The
+binding resolves as an exact live pane label first, then as a literal pane id;
+roles without a binding retain exact role-name-as-label presence lookup. There
+is exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
 `owner/repo`. Malformed org configuration fails closed and loudly. `brief`
 records passive last-seen presence for its role and can render static context
 with provider state `unknown` during an outage; `chart` and `status` require a
-live compatible Herdr snapshot. When configured, `brief --json` and `status
---json` include the role's `pane` binding. `chart` and `status` append a `⚠
+live compatible Herdr snapshot. When configured,
+`brief --json` and `status --json` include the role's `pane` binding. `chart`
+and `status` append a `⚠
 flagged (N missed wakes)` marker after the role reaches the positive
 `[orchestrate].max_consecutive_missed_wakes` threshold; their JSON rows expose
 `missed_wakes`, `flagged`, and `flag_reason`. The default threshold is `0`
-(disabled). `status --json` also exposes `active_jobs`, the live
+(disabled). A missed-wake row more than 24 hours old is omitted from this flag
+calculation; its stored consecutive counter remains unchanged for the next real
+delivery attempt. `status --json` also exposes `active_jobs`, the live
 queued-plus-running job count attributed to the role through `ActingOrgRole`
 (#1057); it is distinct from daily or historical job counts. Escalations are
-recorded with `gitmoot org escalate`; their resolution and correlation surfaces
-are phase 2 work.
+recorded with `gitmoot org escalate` and resolved with
+`gitmoot org escalate resolve`; correlation beyond the optional `--note` link
+remains phase 2 work.
 
 The read-only Org page consumes `GET /api/org` for the store-backed role tree,
 health strip, typed escalations, and current signal feed, plus
@@ -1091,8 +1096,9 @@ remains policy-gated.
 
 The optional `[org]` registry is enabled by any `[org.roles."name"]` section.
 Roles have `parent`, `scope`, advisory `merge_rule` (`owner`, `self`, or
-`none`), and an optional Herdr `pane` used by live presence and event-rule
-wakes; exactly one parent-less role is required.
+`none`), an optional `model` runtime pin, an optional per-role `recycle_after`
+duration override, and an optional Herdr `pane` used by live presence and
+event-rule wakes; exactly one parent-less role is required.
 Scope entries are `*`, `owner/*`, or exact `owner/name`, and child scope must be
 a subset of its parent.
 
@@ -1112,6 +1118,9 @@ configured `pane`. A pane binding and non-empty handoff are required. For safety
 recycle does not kill or send exit keys to the old agent: the pane must already
 be at its interactive shell prompt. The Herdr start wait is bounded to 30
 seconds; a failed start leaves the durable handoff note available for recovery.
+When a role configures `model`, recycle passes `--model <value>` to the successor
+only for the verified Herdr kinds `codex`, `claude`, and `kimi`; other accepted
+`--kind` values silently ignore the pin without an error or warning.
 
 `gitmoot org escalate --to <ancestor-role> --workflow <label> [--org-role
 <from-role>] [--repo <owner/repo>] "<question>"` writes a workflow journal
@@ -1125,6 +1134,13 @@ panes; there is no code-level marker to migrate. Phase 1a writes the typed
 note, which is visible with `workflow show`; structured escalation surfaces
 land with the org brief and active delivery/wake is phase 2. Pane/agent creation
 permissions and Herdr checks remain later work.
+
+`gitmoot org escalate resolve <escalation-note-id> [--by <role>] [--note
+<answer-note-id>] [--home <dir>]` appends a typed resolution marker to the same
+workflow journal. `--by` defaults to the escalation's target role, and `--note`
+optionally links the workflow note containing the answer. Resolved escalations
+are omitted from org dashboard projections while the original journal entry
+remains intact.
 
 Event-rule wakes are separately opt-in:
 
@@ -1289,6 +1305,12 @@ branch/worktree artifacts move through `implementing` to `pr_open`; a branchless
 task returns to `planned` with guidance to use `task run`. Ordinary allocation
 and workflow advancement cannot resurrect the task. Retrying one of its jobs
 restores it explicitly and records `task_recovered_job_retry`.
+
+If an existing task worktree has fallen off the resolved base lineage, Gitmoot
+re-cuts it only when it is clean. When it also has uncommitted changes, `task
+run`/`agent implement` preserve the worktree, move the task to `blocked`, and
+record `stale_worktree_dirty_blocked`; manually salvage, commit, stash, or clean
+the changes before retrying.
 
 The daemon reads a bounded oldest-first stale window and processes up to 20
 qualifying `implementing`/`blocked` tasks per repo poll.
