@@ -1761,6 +1761,16 @@ JSON forms carry `process_active: true`. The badge is omitted when no live
 process is observed, when local process liveness is unavailable, or while the
 job is still non-terminal.
 
+For an `implement` job, `job show` and `job list --json` expose Gitmoot's own
+post-agent delivery verdict as `delivery_status`: `delivered` means workflow
+advancement completed or the job has a persisted non-zero pull request,
+`pending` means delivery is in flight or scheduled for retry, and `blocked`
+means the latest delivery attempt blocked. The field is derived at read time
+from the existing `advance_*` job events and pull-request payload; it is omitted
+for non-implement jobs and legacy/unknown states. This field, not the agent's
+free-text result summary, is authoritative about commit/push/PR delivery because
+Gitmoot performs that step after the agent turn ends.
+
 Operational blockers auto-retry (#532): a delivery failure classified as an
 operational blocker — `runtime_auth`, `runtime_quota`, `network_outage`
 (transient network/GitHub outage), or `checkout_contention` (a self-healing

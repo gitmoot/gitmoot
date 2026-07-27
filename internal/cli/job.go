@@ -117,6 +117,9 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 	// single query so the derived reason costs no per-job lookup. Best-effort: a
 	// lookup error leaves the reason off rather than failing the listing.
 	var reasonEvents map[string]db.JobEvent
+	// deliveryEvents feeds the authoritative post-agent delivery status for
+	// implement jobs. Best-effort: unknown stays omitted if the lookup fails.
+	var deliveryEvents map[string]db.JobEvent
 	var locks []db.ResourceLock
 	if err := withStore(*home, func(store *db.Store) error {
 		var err error
@@ -130,6 +133,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 		}
 		preflightFailed, _ = store.JobIDsWithEventKind(context.Background(), "delegation_preflight_failed")
 		reasonEvents, _ = store.LatestJobEventsOfKinds(context.Background(), stuckReasonEventKinds)
+		deliveryEvents, _ = store.LatestJobEventsOfKinds(context.Background(), deliveryStatusEventKinds)
 		locks, _ = store.ListResourceLocks(context.Background())
 		return nil
 	}); err != nil {
@@ -144,6 +148,8 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 			ev, ok := reasonEvents[job.ID]
 			reason := deriveStuckReason(job, ev, ok, locks)
 			processActive := deriveWorktreeProcessActive(job, jobWorktreeLiveness)
+			deliveryEvent, hasDeliveryEvent := deliveryEvents[job.ID]
+			deliveryStatus := deriveJobDeliveryStatus(job, payload, deliveryEvent, hasDeliveryEvent)
 			entries = append(entries, jobListEntry{
 				ID:              job.ID,
 				State:           job.State,
@@ -157,6 +163,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 				NextRetryAt:     reason.NextRetryAt,
 				SuggestedAction: reason.SuggestedAction,
 				ProcessActive:   processActive,
+				DeliveryStatus:  deliveryStatus,
 			})
 		}
 		if err := writeJSON(stdout, entries); err != nil {
@@ -218,6 +225,7 @@ type jobListEntry struct {
 	NextRetryAt     string `json:"next_retry_at,omitempty"`
 	SuggestedAction string `json:"suggested_action,omitempty"`
 	ProcessActive   bool   `json:"process_active,omitempty"`
+	DeliveryStatus  string `json:"delivery_status,omitempty"`
 }
 
 func runJobShow(args []string, stdout, stderr io.Writer) int {
@@ -232,6 +240,7 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 	var job db.Job
 	var payload workflow.JobPayload
 	var reason stuckReason
+	var deliveryStatus string
 	if err := withStore(*home, func(store *db.Store) error {
 		var err error
 		job, err = store.GetJob(context.Background(), jobID)
@@ -246,6 +255,7 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 			return err
 		}
 		reason = loadStuckReason(store, job)
+		deliveryStatus = loadJobDeliveryStatus(store, job, payload)
 		return nil
 	}); err != nil {
 		fmt.Fprintf(stderr, "job show: %v\n", err)
@@ -260,6 +270,7 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 			NextRetryAt:     reason.NextRetryAt,
 			SuggestedAction: reason.SuggestedAction,
 			ProcessActive:   processActive,
+			DeliveryStatus:  deliveryStatus,
 		}
 		if err := writeJSON(stdout, out); err != nil {
 			fmt.Fprintf(stderr, "job show: %v\n", err)
@@ -267,7 +278,7 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	printJob(stdout, job, payload, reason, processActive)
+	printJob(stdout, job, payload, reason, processActive, deliveryStatus)
 	return 0
 }
 
@@ -281,6 +292,7 @@ type jobShowOutput struct {
 	NextRetryAt     string              `json:"next_retry_at,omitempty"`
 	SuggestedAction string              `json:"suggested_action,omitempty"`
 	ProcessActive   bool                `json:"process_active,omitempty"`
+	DeliveryStatus  string              `json:"delivery_status,omitempty"`
 }
 
 // loadStuckReason derives a queued/blocked job's why-stuck reason from its full
@@ -1221,9 +1233,12 @@ func jobListPayload(job db.Job) (workflow.JobPayload, error) {
 	return daemonJobPayload(job)
 }
 
-func printJob(stdout io.Writer, job db.Job, payload workflow.JobPayload, reason stuckReason, processActive bool) {
+func printJob(stdout io.Writer, job db.Job, payload workflow.JobPayload, reason stuckReason, processActive bool, deliveryStatus string) {
 	fmt.Fprintf(stdout, "id: %s\n", job.ID)
 	fmt.Fprintf(stdout, "state: %s\n", job.State)
+	if deliveryStatus != "" {
+		fmt.Fprintf(stdout, "delivery_status: %s\n", deliveryStatus)
+	}
 	if !reason.empty() {
 		fmt.Fprintf(stdout, "why_stuck: %s\n", reason.Reason)
 		if reason.NextRetryAt != "" {
