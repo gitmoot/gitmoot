@@ -1,0 +1,71 @@
+{
+  "schema_version": "gitmoot.issue-trace.v1",
+  "selector": "issue",
+  "repository": "gitmoot/gitmoot",
+  "issue": {
+    "number": 1113,
+    "title": "disk footprint has four independent causes",
+    "state": "closed",
+    "url": "https://github.com/gitmoot/gitmoot/issues/1113",
+    "evidence": [
+      {
+        "kind": "github_issue",
+        "basis": "issue_state",
+        "certainty": "observed",
+        "detail": "GitHub reports issue #1113 as closed",
+        "url": "https://github.com/gitmoot/gitmoot/issues/1113"
+      }
+    ]
+  },
+  "attempts": [
+    {
+      "number": 1122,
+      "title": "feat(daemon): shared host tool cache for isolated-worktree jobs (#1113)",
+      "state": "closed",
+      "url": "https://github.com/gitmoot/gitmoot/pull/1122",
+      "created_at": "2026-07-23T20:01:34Z",
+      "head_branch": "fix/1113-tool-cache",
+      "head_sha": "reviewed-head",
+      "merged_at": "2026-07-24T03:14:05Z",
+      "merge_sha": "b2524ef",
+      "on_default_branch": true,
+      "evidence": [
+        {
+          "kind": "issue_pr_link",
+          "basis": "github_timeline_cross_reference",
+          "certainty": "observed",
+          "detail": "issue #1113 timeline cross-references PR #1122",
+          "url": "https://github.com/gitmoot/gitmoot/pull/1122"
+        },
+        {
+          "kind": "github_pr",
+          "basis": "pull_request_state",
+          "certainty": "observed",
+          "detail": "GitHub reports PR #1122 as closed",
+          "url": "https://github.com/gitmoot/gitmoot/pull/1122"
+        },
+        {
+          "kind": "merge",
+          "basis": "github_merge_sha",
+          "certainty": "observed",
+          "detail": "GitHub records PR #1122 merged as commit b2524ef",
+          "url": "https://github.com/gitmoot/gitmoot/pull/1122"
+        },
+        {
+          "kind": "default_branch_ancestry",
+          "basis": "github_compare",
+          "certainty": "observed",
+          "detail": "commit b2524ef ancestor of main at observation time: true"
+        }
+      ]
+    }
+  ],
+  "successors": [],
+  "assessment": "partial_evidence",
+  "deployment": {
+    "status": "unknown",
+    "certainty": "unknowable",
+    "reason": "deployment is not derivable from issue, pull request, commit, or local workflow records"
+  },
+  "remote_unavailable": false
+}

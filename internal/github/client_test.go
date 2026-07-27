@@ -139,6 +139,63 @@ func TestDeleteFile(t *testing.T) {
 	})
 }
 
+func TestTraceReadsUseConditionalGitHubClient(t *testing.T) {
+	ConfigureConditional(true)
+	repo := Repository{Owner: "trace-owner", Name: "trace-repo"}
+	runner := &fakeRunner{results: []subprocess.Result{
+		{Stdout: `{"number":1159,"title":"Trace issue","state":"open","html_url":"https://example/issue/1159"}`},
+		{Stdout: `[{"created_at":"2026-07-27T00:00:00Z","source":{"issue":{"number":1160,"title":"Fix","html_url":"https://example/pr/1160","repository_url":"https://api.github.com/repos/trace-owner/trace-repo","pull_request":{}}}}]`},
+		{Stdout: `{"items":[{"number":1160,"title":"Fix","body":"Closes #1159","state":"open","html_url":"https://example/pr/1160","created_at":"2026-07-27T00:00:00Z"}]}`},
+	}}
+	client := GhClient{Runner: runner}
+
+	issue, err := client.GetTraceIssue(context.Background(), repo, 1159)
+	if err != nil || issue.Number != 1159 {
+		t.Fatalf("GetTraceIssue = (%+v, %v)", issue, err)
+	}
+	refs, err := client.ListTraceCrossReferences(context.Background(), repo, 1159)
+	if err != nil || len(refs) != 1 || !refs[0].IsPullRequest() {
+		t.Fatalf("ListTraceCrossReferences = (%+v, %v)", refs, err)
+	}
+	prs, err := client.SearchTracePullRequests(context.Background(), repo, `"#1159"`)
+	if err != nil || len(prs) != 1 || prs[0].Number != 1160 {
+		t.Fatalf("SearchTracePullRequests = (%+v, %v)", prs, err)
+	}
+
+	runner.wantArgs(t, 0, "api", "-i", "repos/trace-owner/trace-repo/issues/1159")
+	runner.wantArgs(t, 1,
+		"api", "-i", "-X", "GET", "repos/trace-owner/trace-repo/issues/1159/timeline",
+		"-H", "Accept: application/vnd.github+json", "-f", "per_page=100",
+	)
+	runner.wantArgs(t, 2,
+		"api", "-i", "-X", "GET", "search/issues",
+		"-f", `q=repo:trace-owner/trace-repo is:pr "#1159"`, "-f", "per_page=100",
+	)
+}
+
+func TestSearchTracePullRequestsPaginatesBeyondConditionalFirstPage(t *testing.T) {
+	ConfigureConditional(true)
+	repo := Repository{Owner: "trace-pages", Name: "repo"}
+	item := `{"number":1,"title":"candidate"}`
+	firstPage := `{"total_count":101,"items":[` + strings.TrimSuffix(strings.Repeat(item+",", 100), ",") + `]}`
+	paginated := `[` + strings.TrimSuffix(strings.Repeat(item+",", 100), ",") + "]\n" +
+		`[{"number":101,"title":"candidate"}]`
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: firstPage}, {Stdout: paginated}}}
+	client := GhClient{Runner: runner}
+
+	prs, err := client.SearchTracePullRequests(context.Background(), repo, `"needle"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prs) != 101 || prs[100].Number != 101 {
+		t.Fatalf("pull requests = %d, last=%+v", len(prs), prs[len(prs)-1])
+	}
+	runner.wantArgs(t, 1,
+		"api", "--paginate", "--jq", ".items", "-X", "GET", "search/issues",
+		"-f", `q=repo:trace-pages/repo is:pr "needle"`, "-f", "per_page=100",
+	)
+}
+
 func TestCloneRepository(t *testing.T) {
 	repo := Repository{Owner: "o", Name: "r"}
 
