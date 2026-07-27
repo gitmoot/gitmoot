@@ -333,9 +333,9 @@ func TestWorkflowShowClampsStaleSummaryTotalAfterPostSummaryInsert(t *testing.T)
 	if got := strings.Count(text, "\tnote\t"); got != 2 {
 		t.Fatalf("shown note rows = %d, want 2; output=%q", got, text)
 	}
-	if !strings.Contains(notice, "showing the latest 2 of 2 entries") ||
-		strings.Contains(notice, "showing the latest 2 of 1 entries") {
-		t.Fatalf("stale-summary truncation notice = %q", notice)
+	wantNotice := "workflow show: showing the latest 2 of 3 entries (0 jobs, 3 notes); pass --limit 0 for all or a larger --limit N\n"
+	if notice != wantNotice {
+		t.Fatalf("stale-summary truncation notice = %q, want %q", notice, wantNotice)
 	}
 
 	rawJSON, jsonStderr := run(t, true)

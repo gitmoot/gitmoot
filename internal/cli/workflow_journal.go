@@ -215,10 +215,15 @@ func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 	if truncated {
 		entries = entries[len(entries)-*limit:]
 	}
-	totalEntries := summary.JobCount + summary.NoteCount
-	if totalEntries < len(entries) {
-		totalEntries = len(entries)
+	displayJobCount := summary.JobCount
+	if displayJobCount < len(jobs) {
+		displayJobCount = len(jobs)
 	}
+	displayNoteCount := summary.NoteCount
+	if displayNoteCount < len(notes) {
+		displayNoteCount = len(notes)
+	}
+	totalEntries := displayJobCount + displayNoteCount
 	out := workflowShowJSON{Summary: summary, Meta: meta, Entries: entries, Truncated: truncated}
 	out.Meta.Description = workflowDisplayDescription(summary.WorkflowID, out.Meta.Description)
 	if *jsonOutput {
@@ -239,7 +244,7 @@ func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 		summary.OutputTokens, summary.FirstAt, summary.LastAt)
 	if truncated {
 		fmt.Fprintf(stderr, "workflow show: showing the latest %d of %d entries (%d jobs, %d notes); pass --limit 0 for all or a larger --limit N\n",
-			len(entries), totalEntries, summary.JobCount, summary.NoteCount)
+			len(entries), totalEntries, displayJobCount, displayNoteCount)
 	}
 	for _, entry := range entries {
 		if entry.Job != nil {
