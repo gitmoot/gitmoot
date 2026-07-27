@@ -1552,10 +1552,15 @@ process is observed, when local process liveness is unavailable, or while the
 job is still non-terminal.
 
 For an `implement` job, `job show` and `job list --json` expose Gitmoot's own
-post-agent delivery verdict as `delivery_status`: `delivered` means workflow
-advancement completed or the job has a persisted non-zero pull request,
-`pending` means delivery is in flight or scheduled for retry, and `blocked`
-means the latest delivery attempt blocked. The field is derived at read time
+post-agent delivery verdict as `delivery_status`: `delivered` means the job's
+result decision was `implemented` and either a completion marker is paired
+with a persisted non-zero pull request, or the job has no advance events at
+all and already carries a persisted non-zero pull request; `pending` means
+delivery is in flight or scheduled for retry, and `blocked` means the latest
+delivery attempt blocked. A completed advancement alone (e.g. an implemented
+result that produced no PR, or a non-`implemented` decision) does NOT count as
+delivered — the field is omitted in that case, never a false `delivered`. The
+field is derived at read time
 from the existing `advance_*` job events and pull-request payload; it is omitted
 for non-implement jobs and legacy/unknown states. This field, not the agent's
 free-text result summary, is authoritative about commit/push/PR delivery because
