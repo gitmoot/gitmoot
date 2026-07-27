@@ -222,7 +222,58 @@ func TestPolicyMergeGateRejectsUnverifiableReviewAuthorship(t *testing.T) {
 	}
 }
 
-func TestPolicyMergeGatePreservesSelfApprovalReasonOverLaterHeadMismatch(t *testing.T) {
+func TestPolicyMergeGatePreservesSelfApprovalReasonWhenHeadMismatchSortsFirst(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	basePayload := JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		Branch:      "task-9",
+		PullRequest: 9,
+		TaskID:      "task-9",
+	}
+	implementPayload := basePayload
+	implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
+	insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: "sol", Type: "implement"}, implementPayload)
+
+	selfReview := basePayload
+	selfReview.HeadSHA = "head123"
+	selfReview.ReviewRound = "review-1"
+	selfReview.Result = &AgentResult{Decision: "approved", Summary: "self-approved"}
+	insertCompletedJob(t, store, db.Job{ID: "review-z-self", Agent: "sol", Type: "review"}, selfReview)
+
+	staleReview := basePayload
+	staleReview.HeadSHA = "old123"
+	staleReview.ReviewRound = "review-1"
+	staleReview.Result = &AgentResult{Decision: "approved", Summary: "stale approval"}
+	insertCompletedJob(t, store, db.Job{ID: "review-a-stale", Agent: "audit", Type: "review"}, staleReview)
+
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr: github.PullRequest{
+			Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+			HeadSHA: "head123", Mergeable: &mergeable,
+		},
+		status: github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+		checks: []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+	}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Ready || decision.Merged {
+		t.Fatalf("decision = %+v, want escalating LeaveOpen", decision)
+	}
+	if !strings.Contains(decision.Reason, "approval was authored by sol, the implementing agent") {
+		t.Fatalf("decision reason lost self-approval cause: %q", decision.Reason)
+	}
+	if strings.Contains(decision.Reason, "different head SHA") {
+		t.Fatalf("incidental stale-head error replaced self-approval cause: %q", decision.Reason)
+	}
+}
+
+func TestPolicyMergeGatePreservesSelfApprovalReasonWhenSelfApprovalSortsFirst(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	basePayload := JobPayload{

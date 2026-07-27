@@ -470,6 +470,11 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	var selfApprovalReason string
 	var unknownImplementerReason string
 	var unattributedReviewerReason string
+	type eligibleReview struct {
+		job     db.Job
+		payload JobPayload
+	}
+	var eligible []eligibleReview
 	for _, job := range jobs {
 		if job.Type != "review" {
 			continue
@@ -507,6 +512,11 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 				}
 			}
 		}
+		eligible = append(eligible, eligibleReview{job: job, payload: payload})
+	}
+	for _, review := range eligible {
+		job := review.job
+		payload := review.payload
 		if err := g.ensureReviewMatchesHead(payload, headSHA, job.Agent); err != nil {
 			if reason := reviewAuthorshipFailureReason(selfApprovalReason, unknownImplementerReason, unattributedReviewerReason); reason != "" {
 				return errors.New(reason)
