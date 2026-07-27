@@ -12,13 +12,36 @@ import (
 	"github.com/gitmoot/gitmoot/internal/github"
 )
 
+func insertIndependentMergeGateReview(t *testing.T, store *db.Store, reviewJob db.Job, reviewPayload JobPayload) {
+	t.Helper()
+	implementingAgent := "implementer"
+	if strings.TrimSpace(reviewJob.Agent) == implementingAgent {
+		implementingAgent = "different-implementer"
+	}
+	implementPayload := reviewPayload
+	implementPayload.ReviewRound = ""
+	implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
+	insertCompletedJob(t, store, db.Job{
+		ID:    reviewJob.ID + "-implement-author",
+		Agent: implementingAgent,
+		Type:  "implement",
+	}, implementPayload)
+	insertCompletedJob(t, store, reviewJob, reviewPayload)
+}
+
 func TestPolicyMergeGateMergesPassingPullRequest(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-9", Owner: "lead"}); err != nil || !acquired {
 		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
 	}
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: "malformed-unrelated-implement", Agent: "other", Type: "implement",
+		State: string(JobSucceeded), Payload: "{not-json",
+	}, db.JobEvent{Kind: string(JobSucceeded), Message: "malformed unrelated fixture"}); err != nil {
+		t.Fatalf("CreateJobWithEvent malformed unrelated implement: %v", err)
+	}
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		Branch:      "task-9",
 		PullRequest: 9,
@@ -124,6 +147,132 @@ func TestPolicyMergeGateMergesPassingPullRequest(t *testing.T) {
 	}
 }
 
+func TestPolicyMergeGateRejectsUnverifiableReviewAuthorship(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		implementingAgent string
+		reviewerAgent     string
+		wantReason        string
+	}{
+		{
+			name:              "self approval",
+			implementingAgent: "sol",
+			reviewerAgent:     "sol",
+			wantReason:        "approval was authored by sol, the implementing agent; an independent reviewer is required",
+		},
+		{
+			name:              "unattributed reviewer",
+			implementingAgent: "sol",
+			reviewerAgent:     "",
+			wantReason:        "approval has no recorded reviewer author; an independent reviewer cannot be verified",
+		},
+		{
+			name:          "unknown implementer",
+			reviewerAgent: "audit",
+			wantReason:    "approval cannot be verified as independent because the implementing agent for this task could not be determined",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			payload := JobPayload{
+				Repo:        "gitmoot/gitmoot",
+				Branch:      "task-9",
+				PullRequest: 9,
+				HeadSHA:     "head123",
+				TaskID:      "task-9",
+				ReviewRound: "review-1",
+			}
+			if tc.implementingAgent != "" {
+				implementPayload := payload
+				implementPayload.ReviewRound = ""
+				implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
+				insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: tc.implementingAgent, Type: "implement"}, implementPayload)
+			}
+			reviewPayload := payload
+			reviewPayload.Result = &AgentResult{Decision: "approved", Summary: "approved"}
+			insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: tc.reviewerAgent, Type: "review"}, reviewPayload)
+
+			mergeable := true
+			gh := &fakeMergeGateGitHub{
+				pr: github.PullRequest{
+					Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+					HeadSHA: "head123", Mergeable: &mergeable,
+				},
+				status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+				checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+				mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+			}
+			gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+			decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Ready || decision.Merged {
+				t.Fatalf("decision = %+v, want escalating LeaveOpen", decision)
+			}
+			if !strings.Contains(decision.Reason, tc.wantReason) {
+				t.Fatalf("decision reason = %q, want %q", decision.Reason, tc.wantReason)
+			}
+			if len(gh.merges) != 0 {
+				t.Fatalf("unverifiable approval issued merge: %+v", gh.merges)
+			}
+		})
+	}
+}
+
+func TestPolicyMergeGatePreservesSelfApprovalReasonOverLaterHeadMismatch(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	basePayload := JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		Branch:      "task-9",
+		PullRequest: 9,
+		TaskID:      "task-9",
+	}
+	implementPayload := basePayload
+	implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
+	insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: "sol", Type: "implement"}, implementPayload)
+
+	selfReview := basePayload
+	selfReview.HeadSHA = "head123"
+	selfReview.ReviewRound = "review-1"
+	selfReview.Result = &AgentResult{Decision: "approved", Summary: "self-approved"}
+	insertCompletedJob(t, store, db.Job{ID: "review-a-self", Agent: "sol", Type: "review"}, selfReview)
+
+	staleReview := basePayload
+	staleReview.HeadSHA = "old123"
+	staleReview.ReviewRound = "review-1"
+	staleReview.Result = &AgentResult{Decision: "approved", Summary: "stale approval"}
+	insertCompletedJob(t, store, db.Job{ID: "review-z-stale", Agent: "audit", Type: "review"}, staleReview)
+
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr: github.PullRequest{
+			Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+			HeadSHA: "head123", Mergeable: &mergeable,
+		},
+		status: github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+		checks: []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+	}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Ready || decision.Merged {
+		t.Fatalf("decision = %+v, want escalating LeaveOpen", decision)
+	}
+	if !strings.Contains(decision.Reason, "approval was authored by sol, the implementing agent") {
+		t.Fatalf("decision reason lost self-approval cause: %q", decision.Reason)
+	}
+	if strings.Contains(decision.Reason, "different head SHA") {
+		t.Fatalf("incidental stale-head error replaced self-approval cause: %q", decision.Reason)
+	}
+}
+
 func TestPolicyMergeGateExplicitKillSwitchLeavesOpenWithoutGitHubCalls(t *testing.T) {
 	ctx := context.Background()
 	gh := &fakeMergeGateGitHub{}
@@ -163,7 +312,7 @@ func TestRunMergeGateExplicitKillSwitchParksReviewedAndUnreviewedTasks(t *testin
 			}
 			payload := JobPayload{Repo: "owner/repo", Branch: tc.taskID, PullRequest: 17, TaskID: tc.taskID, TaskTitle: tc.name}
 			if tc.withReview {
-				insertCompletedJob(t, store, db.Job{ID: "review-" + tc.taskID, Agent: "reviewer", Type: "review"}, JobPayload{
+				insertIndependentMergeGateReview(t, store, db.Job{ID: "review-" + tc.taskID, Agent: "reviewer", Type: "review"}, JobPayload{
 					Repo: "owner/repo", Branch: tc.taskID, PullRequest: 17, TaskID: tc.taskID,
 					Result: &AgentResult{Decision: "approved", Summary: "approved"},
 				})
@@ -232,7 +381,7 @@ func TestPolicyMergeGateHumanRequestBypassesKillSwitchAndMandatoryGate(t *testin
 func TestPolicyMergeGateJournalFailureDoesNotChangeMergedDecision(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	insertCompletedJob(t, store, db.Job{ID: "native-journal-link", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "native-journal-link", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		Branch:      "task-9",
 		PullRequest: 9,
@@ -294,7 +443,7 @@ func TestPolicyMergeGateCleansTaskWorktreeAfterMerge(t *testing.T) {
 	if err := store.UpsertTask(ctx, db.Task{ID: "task-9", RepoFullName: "gitmoot/gitmoot", GoalID: "goal-1", Title: "Task 9", State: string(TaskReadyToMerge), Branch: "task-9", WorktreePath: "/tmp/gitmoot/worktrees/gitmoot--gitmoot/task-9"}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		Branch:      "task-9",
 		PullRequest: 9,
@@ -341,7 +490,7 @@ func TestPolicyMergeGateReportsWorktreeCleanupWarning(t *testing.T) {
 	if err := store.UpsertTask(ctx, db.Task{ID: "task-9", RepoFullName: "gitmoot/gitmoot", GoalID: "goal-1", Title: "Task 9", State: string(TaskReadyToMerge), Branch: "task-9", WorktreePath: "/tmp/gitmoot/worktrees/gitmoot--gitmoot/task-9"}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		Branch:      "task-9",
 		PullRequest: 9,
@@ -385,7 +534,7 @@ func TestPolicyMergeGateDoesNotCleanWorktreeForMismatchedTaskBranch(t *testing.T
 	if err := store.UpsertTask(ctx, db.Task{ID: "task-8", RepoFullName: "gitmoot/gitmoot", GoalID: "goal-1", Title: "Task 8", State: string(TaskImplementing), Branch: "task-8", WorktreePath: "/tmp/gitmoot/worktrees/gitmoot--gitmoot/task-8"}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		Branch:      "task-9",
 		PullRequest: 9,
@@ -429,7 +578,7 @@ func TestPolicyMergeGateLocksCheckoutDuringLocalBaseUpdate(t *testing.T) {
 	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-9", Owner: "lead"}); err != nil || !acquired {
 		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
 	}
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		Branch:      "task-9",
 		PullRequest: 9,
@@ -471,7 +620,7 @@ func TestPolicyMergeGateLocksCheckoutDuringLocalBaseUpdate(t *testing.T) {
 func TestPolicyMergeGateReturnsRetryableErrorForBusyCheckout(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		Branch:      "task-9",
 		PullRequest: 9,
@@ -531,7 +680,7 @@ func TestPolicyMergeGateReturnsRetryableErrorForBusyCheckout(t *testing.T) {
 func TestPolicyMergeGateDoesNotRecordPreMergeSyntheticSHA(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		Branch:      "task-9",
 		PullRequest: 9,
@@ -577,7 +726,7 @@ func TestPolicyMergeGateDoesNotRecordPreMergeSyntheticSHA(t *testing.T) {
 func TestPolicyMergeGateBlocksDirtyWorktree(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo: "gitmoot/gitmoot", PullRequest: 9, HeadSHA: "head123", TaskID: "task-9",
 		ReviewRound: "review-1", Result: &AgentResult{Decision: "approved"},
 	})
@@ -600,7 +749,7 @@ func TestPolicyMergeGateBlocksDirtyWorktree(t *testing.T) {
 func TestPolicyMergeGateBlocksFailedExternalCI(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		PullRequest: 9,
 		HeadSHA:     "head123",
@@ -637,7 +786,7 @@ func TestPolicyMergeGateBlocksFailedExternalCI(t *testing.T) {
 func TestPolicyMergeGateTruncatesLongStatusDescriptions(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		PullRequest: 9,
 		HeadSHA:     "head123",
@@ -673,7 +822,7 @@ func TestPolicyMergeGateTruncatesLongStatusDescriptions(t *testing.T) {
 func TestPolicyMergeGateAllowsSkippedExternalCI(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		PullRequest: 9,
 		HeadSHA:     "head123",
@@ -703,7 +852,7 @@ func TestPolicyMergeGateAllowsSkippedExternalCI(t *testing.T) {
 func TestPolicyMergeGateUpdatesStaleBranchAndStaysPending(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		PullRequest: 9,
 		HeadSHA:     "head123",
@@ -741,7 +890,7 @@ func TestPolicyMergeGateUpdatesStaleBranchAndStaysPending(t *testing.T) {
 func TestPolicyMergeGateBlocksStaleBranchUpdateConflict(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		PullRequest: 9,
 		HeadSHA:     "head123",
@@ -780,7 +929,7 @@ func TestPolicyMergeGateBlocksStaleBranchUpdateConflict(t *testing.T) {
 func TestPolicyMergeGateKeepsStaleHeadRacePending(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		PullRequest: 9,
 		HeadSHA:     "head123",
@@ -813,7 +962,7 @@ func TestPolicyMergeGateKeepsStaleHeadRacePending(t *testing.T) {
 func TestPolicyMergeGateKeepsMergeQueueBusyPending(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		PullRequest: 9,
 		HeadSHA:     "head123",
@@ -855,7 +1004,7 @@ func TestPolicyMergeGateKeepsMergeQueueBusyPending(t *testing.T) {
 func TestPolicyMergeGateKeepsPendingCIReadyToRetry(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		PullRequest: 9,
 		HeadSHA:     "head123",
@@ -893,7 +1042,7 @@ func TestPolicyMergeGateKeepsQueuedMergePending(t *testing.T) {
 	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-9", Owner: "lead"}); err != nil || !acquired {
 		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
 	}
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		Branch:      "task-9",
 		PullRequest: 9,
@@ -1023,7 +1172,7 @@ func TestPolicyMergeGateBlocksClosedUnmergedPullRequest(t *testing.T) {
 func TestPolicyMergeGateUsesLatestNumericReviewRound(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	insertCompletedJob(t, store, db.Job{ID: "review-nine", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-nine", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		PullRequest: 9,
 		HeadSHA:     "old123",
@@ -1031,7 +1180,7 @@ func TestPolicyMergeGateUsesLatestNumericReviewRound(t *testing.T) {
 		ReviewRound: "review-9",
 		Result:      &AgentResult{Decision: "changes_requested", Summary: "old change"},
 	})
-	insertCompletedJob(t, store, db.Job{ID: "review-ten", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-ten", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		PullRequest: 9,
 		HeadSHA:     "head123",
@@ -1060,7 +1209,7 @@ func TestPolicyMergeGateUsesLatestNumericReviewRound(t *testing.T) {
 func TestPolicyMergeGateBlocksReviewForStaleHead(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		PullRequest: 9,
 		HeadSHA:     "old123",
@@ -1102,7 +1251,7 @@ func TestPolicyMergeGateBlocksLegacyReviewWithoutHeadSHA(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertPullRequest returned error: %v", err)
 	}
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		PullRequest: 9,
 		TaskID:      "task-9",
@@ -1149,7 +1298,7 @@ func TestPolicyMergeGateAdvancesIntegrationWorktreeReviewWithoutHeadSHA(t *testi
 	}
 	// An integration-worktree review: a delegation child (DelegationID +
 	// WorktreePath set) whose HeadSHA the engine intentionally cleared.
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review", DelegationID: "verify-gate"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review", DelegationID: "verify-gate"}, JobPayload{
 		Repo:         "gitmoot/gitmoot",
 		PullRequest:  9,
 		TaskID:       "task-9",
@@ -1184,7 +1333,7 @@ func TestPolicyMergeGateAdvancesIntegrationWorktreeReviewWithoutHeadSHA(t *testi
 func TestPolicyMergeGateBlocksDelegationReviewForMismatchedHead(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review", DelegationID: "verify-gate"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review", DelegationID: "verify-gate"}, JobPayload{
 		Repo:         "gitmoot/gitmoot",
 		PullRequest:  9,
 		HeadSHA:      "stale999",

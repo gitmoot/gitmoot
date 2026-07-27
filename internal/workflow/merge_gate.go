@@ -424,6 +424,25 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		return err
 	}
 	current := JobPayload{Repo: request.Repo, PullRequest: request.PullRequest, TaskID: request.TaskID}
+	implementingAgents := map[string]struct{}{}
+	for _, job := range jobs {
+		if job.Type != "implement" {
+			continue
+		}
+		payload, err := unmarshalPayload(job.Payload)
+		if err != nil {
+			// A malformed implement record cannot prove authorship for this
+			// task, but it also must not block unrelated merge gates.
+			continue
+		}
+		if !sameTask(current, payload) {
+			continue
+		}
+		agent := strings.TrimSpace(job.Agent)
+		if agent != "" {
+			implementingAgents[agent] = struct{}{}
+		}
+	}
 	latest := ""
 	for _, job := range jobs {
 		if job.Type != "review" {
@@ -448,6 +467,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		return errors.New("final agent review is not captured")
 	}
 	approved := false
+	var selfApprovalReason string
+	var unknownImplementerReason string
+	var unattributedReviewerReason string
 	for _, job := range jobs {
 		if job.Type != "review" {
 			continue
@@ -463,7 +485,32 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if !sameTask(current, payload) || round != latest || payload.Result == nil {
 			continue
 		}
+		if payload.Result.Decision == "approved" {
+			reviewerAgent := strings.TrimSpace(job.Agent)
+			switch {
+			case reviewerAgent == "":
+				if unattributedReviewerReason == "" {
+					unattributedReviewerReason = "latest review round's approval has no recorded reviewer author; an independent reviewer cannot be verified"
+				}
+				continue
+			case len(implementingAgents) == 0:
+				if unknownImplementerReason == "" {
+					unknownImplementerReason = "latest review round's approval cannot be verified as independent because the implementing agent for this task could not be determined"
+				}
+				continue
+			default:
+				if _, selfApproved := implementingAgents[reviewerAgent]; selfApproved {
+					if selfApprovalReason == "" {
+						selfApprovalReason = fmt.Sprintf("latest review round's approval was authored by %s, the implementing agent; an independent reviewer is required", reviewerAgent)
+					}
+					continue
+				}
+			}
+		}
 		if err := g.ensureReviewMatchesHead(payload, headSHA, job.Agent); err != nil {
+			if reason := reviewAuthorshipFailureReason(selfApprovalReason, unknownImplementerReason, unattributedReviewerReason); reason != "" {
+				return errors.New(reason)
+			}
 			return err
 		}
 		switch payload.Result.Decision {
@@ -478,9 +525,23 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		}
 	}
 	if !approved {
+		if reason := reviewAuthorshipFailureReason(selfApprovalReason, unknownImplementerReason, unattributedReviewerReason); reason != "" {
+			return errors.New(reason)
+		}
 		return errors.New("required reviewer approval is missing")
 	}
 	return nil
+}
+
+func reviewAuthorshipFailureReason(selfApproval string, unknownImplementer string, unattributedReviewer string) string {
+	// Keep the operator-facing cause stable when a round contains multiple
+	// disqualified approvals.
+	for _, reason := range []string{selfApproval, unknownImplementer, unattributedReviewer} {
+		if reason = strings.TrimSpace(reason); reason != "" {
+			return reason
+		}
+	}
+	return ""
 }
 
 func (g PolicyMergeGate) ensureBranchFresh(ctx context.Context, repo github.Repository, request MergeRequest, pr github.PullRequest, headSHA string) (MergeDecision, bool, error) {
