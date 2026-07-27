@@ -24,7 +24,11 @@ actionable remediation hint) and live-probes the Claude credential selected by
 `runtime-auth.env`, so a bad credential is caught before jobs stall. Run it
 after install and before starting the daemon. It also reports delegation
 worktree count and logical disk size, warning at 10 stale worktrees or 1 GB and
-distinguishing aged-final reclaimable owners from pinned non-final owners.
+distinguishing aged-final reclaimable owners from pinned non-final owners. A
+running job whose directly recorded runtime PID is confirmably dead is a
+required `stuck jobs` failure; legacy jobs with no recorded PID and hosts where
+process identity cannot be verified are neutral and produce no ghost-job
+finding.
 
 One-shot onboarding: `gitmoot setup` registers the repo and an agent in one
 command (`--repo owner/repo --agent <name> --runtime codex|claude|shell
@@ -1783,6 +1787,14 @@ from the existing `advance_*` job events and pull-request payload; it is omitted
 for non-implement jobs and legacy/unknown states. This field, not the agent's
 free-text result summary, is authoritative about commit/push/PR delivery because
 Gitmoot performs that step after the agent turn ends.
+
+For a `running` job dispatched through a PID-aware runtime runner, the payload
+records `runtime_pid` plus a process-start identity. `job list --json` and `job
+show --json` derive `runtime_process_active`: `true` means that exact process is
+alive, `false` means it is confirmably gone (including PID reuse), and an omitted
+field means unknown because no PID/identity was recorded or process inspection
+is unavailable. This is direct per-job ground truth and is separate from the
+terminal worktree-scanning `process_active` badge above.
 
 Operational blockers auto-retry (#532): a delivery failure classified as an
 operational blocker — `runtime_auth`, `runtime_quota`, `network_outage`
