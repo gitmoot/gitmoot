@@ -1440,8 +1440,11 @@ before Gitmoot removes that worktree. `job show` prints the captured diff and
 `read_only_worktree_diff_error`; the same durable fields are present under
 `job show --json`'s `payload`. Capture is capped at 4 MiB, and an oversized
 snapshot ends with an explicit omitted-byte marker instead of being silently
-cut. Capture is synchronously bounded by a 10-second timeout; failures can delay
-cleanup up to that bound, but are recorded and never permanently block worktree
+cut. Git subprocesses and the wait for each index-file copy share a 10-second
+context: on expiry Gitmoot kills the subprocess or stops waiting for the copy.
+The operating system still owns cancellation of an in-progress filesystem
+syscall, so this is a bounded-wait guarantee rather than a promise that kernel
+I/O itself is cancelled. Failures are recorded and never prevent worktree
 removal.
 
 When standard output is an interactive terminal (and `NO_COLOR` is unset),

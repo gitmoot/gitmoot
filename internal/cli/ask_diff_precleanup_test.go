@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -206,6 +207,133 @@ func TestCaptureReadOnlyWorktreeDiffDoesNotRunConfiguredGitHelpers(t *testing.T)
 	if strings.Contains(snapshot, "HOSTILE-TEXTCONV") {
 		t.Fatalf("configured textconv output leaked into captured payload:\n%s", snapshot)
 	}
+}
+
+func TestCaptureReadOnlyWorktreeDiffSupportsSplitIndex(t *testing.T) {
+	ctx := context.Background()
+	checkout, _ := gitFixtureRepo(t, "split base\n")
+	runGit(t, checkout, "config", "core.splitIndex", "true")
+	worktree := filepath.Join(t.TempDir(), "detached")
+	runGit(t, checkout, "worktree", "add", "--detach", worktree, "HEAD")
+	runGit(t, worktree, "update-index", "--split-index")
+	sharedIndex := gitOutput(t, worktree, "rev-parse", "--shared-index-path")
+	if strings.TrimSpace(sharedIndex) == "" {
+		t.Fatal("split-index fixture has no shared index companion")
+	}
+	sharedIndex = absoluteGitPath(worktree, sharedIndex)
+	if _, err := os.Stat(sharedIndex); err != nil {
+		t.Fatalf("split-index companion is unavailable: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "marker.txt"), []byte("split changed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, truncated, err := captureReadOnlyWorktreeDiff(ctx, worktree)
+	if err != nil {
+		t.Fatalf("capture split-index worktree: %v", err)
+	}
+	if truncated {
+		t.Fatal("small split-index diff was unexpectedly truncated")
+	}
+	for _, want := range []string{" M marker.txt", "## git diff HEAD", "+split changed"} {
+		if !strings.Contains(snapshot, want) {
+			t.Fatalf("split-index capture missing %q:\n%s", want, snapshot)
+		}
+	}
+}
+
+func TestCaptureReadOnlyWorktreeDiffIncludesStagedGitlinkWithoutRunningSubmoduleHelpers(t *testing.T) {
+	ctx := context.Background()
+	subRepo := t.TempDir()
+	runGit(t, subRepo, "init")
+	runGit(t, subRepo, "config", "user.email", "test@example.com")
+	runGit(t, subRepo, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(subRepo, ".gitattributes"), []byte("marker.txt filter=hostile diff=hostile\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subRepo, "marker.txt"), []byte("submodule v1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, subRepo, "add", ".")
+	runGit(t, subRepo, "commit", "-m", "submodule v1")
+	firstCommit := gitOutput(t, subRepo, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(subRepo, "marker.txt"), []byte("submodule v2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, subRepo, "add", "marker.txt")
+	runGit(t, subRepo, "commit", "-m", "submodule v2")
+	secondCommit := gitOutput(t, subRepo, "rev-parse", "HEAD")
+	runGit(t, subRepo, "checkout", "--detach", firstCommit)
+
+	parent, _ := gitFixtureRepo(t, "parent\n")
+	runGit(t, parent, "-c", "protocol.file.allow=always", "submodule", "add", subRepo, "nested")
+	runGit(t, parent, "commit", "-m", "add submodule")
+	nested := filepath.Join(parent, "nested")
+	runGit(t, nested, "checkout", "--detach", secondCommit)
+	runGit(t, parent, "add", "nested")
+
+	probeDir := t.TempDir()
+	fsmonitorSentinel := filepath.Join(probeDir, "sub-fsmonitor-fired")
+	cleanSentinel := filepath.Join(probeDir, "sub-clean-fired")
+	textconvSentinel := filepath.Join(probeDir, "sub-textconv-fired")
+	fsmonitor := writeExecutableGitHelper(t, probeDir, "sub-fsmonitor.sh",
+		fmt.Sprintf("#!/bin/sh\nprintf fired > %q\nprintf 'token\\0'\n", fsmonitorSentinel))
+	clean := writeExecutableGitHelper(t, probeDir, "sub-clean.sh",
+		fmt.Sprintf("#!/bin/sh\nprintf fired > %q\ncat\n", cleanSentinel))
+	textconv := writeExecutableGitHelper(t, probeDir, "sub-textconv.sh",
+		fmt.Sprintf("#!/bin/sh\nprintf fired > %q\ncat \"$1\"\n", textconvSentinel))
+	runGit(t, nested, "config", "core.fsmonitor", fsmonitor)
+	runGit(t, nested, "config", "filter.hostile.clean", clean)
+	runGit(t, nested, "config", "diff.hostile.textconv", textconv)
+	if err := os.WriteFile(filepath.Join(nested, "marker.txt"), []byte("dirty submodule worktree\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, truncated, err := captureReadOnlyWorktreeDiff(ctx, parent)
+	if err != nil {
+		t.Fatalf("capture staged gitlink: %v", err)
+	}
+	if truncated {
+		t.Fatal("small gitlink diff was unexpectedly truncated")
+	}
+	for _, want := range []string{"M  nested", "Subproject commit " + firstCommit, "Subproject commit " + secondCommit} {
+		if !strings.Contains(snapshot, want) {
+			t.Fatalf("staged gitlink capture missing %q:\n%s", want, snapshot)
+		}
+	}
+	if strings.Contains(snapshot, secondCommit+"-dirty") {
+		t.Fatalf("capture traversed dirty submodule state:\n%s", snapshot)
+	}
+	for _, sentinel := range []string{fsmonitorSentinel, cleanSentinel, textconvSentinel} {
+		if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
+			t.Fatalf("submodule helper executed during parent capture: sentinel=%s stat=%v", sentinel, err)
+		}
+	}
+}
+
+func TestWaitForReadOnlyWorktreeGitIndexCopyHonorsContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- waitForReadOnlyWorktreeGitIndexCopy(ctx, func() error {
+			close(started)
+			<-release
+			return nil
+		})
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("bounded copy wait error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bounded copy wait did not return after context cancellation")
+	}
+	close(release)
 }
 
 func writeExecutableGitHelper(t *testing.T, dir, name, body string) string {

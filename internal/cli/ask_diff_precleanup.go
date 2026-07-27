@@ -95,11 +95,11 @@ func captureReadOnlyWorktreeDiff(ctx context.Context, worktree string) (string, 
 	defer sandbox.close()
 
 	out := &boundedCountingBuffer{limit: readOnlyWorktreeDiffMaxBytes - readOnlyWorktreeDiffReserve}
-	status, err := sandbox.run(ctx, "git status --short", "status", "--short", "--untracked-files=all", "--ignore-submodules=all")
+	status, err := sandbox.run(ctx, "git status --short", "status", "--short", "--untracked-files=all", "--ignore-submodules=dirty")
 	if err != nil {
 		return "", false, err
 	}
-	diff, err := sandbox.run(ctx, "git diff HEAD", "diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--binary", "HEAD", "--")
+	diff, err := sandbox.run(ctx, "git diff HEAD", "diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty", "--binary", "HEAD", "--")
 	if err != nil {
 		return "", false, err
 	}
@@ -158,11 +158,18 @@ func newReadOnlyWorktreeGitSandbox(ctx context.Context, worktree string) (*readO
 	if err != nil {
 		return nil, err
 	}
+	sharedIndexPath, err := runOptionalReadOnlyWorktreeMetadataGit(ctx, baseEnv, worktree, "resolve shared index", "rev-parse", "--shared-index-path")
+	if err != nil {
+		return nil, err
+	}
 	objectsPath, err := runReadOnlyWorktreeMetadataGit(ctx, baseEnv, worktree, "resolve object database", "rev-parse", "--git-path", "objects")
 	if err != nil {
 		return nil, err
 	}
 	indexPath = absoluteGitPath(worktree, indexPath)
+	if strings.TrimSpace(sharedIndexPath) != "" {
+		sharedIndexPath = absoluteGitPath(worktree, sharedIndexPath)
+	}
 	objectsPath = absoluteGitPath(worktree, objectsPath)
 
 	if err := os.MkdirAll(filepath.Join(temp, "objects"), 0o700); err != nil {
@@ -174,8 +181,17 @@ func newReadOnlyWorktreeGitSandbox(ctx context.Context, worktree string) (*readO
 	if err := os.WriteFile(filepath.Join(temp, "HEAD"), []byte(strings.TrimSpace(head)+"\n"), 0o600); err != nil {
 		return nil, fmt.Errorf("write isolated git HEAD: %w", err)
 	}
-	if err := copyReadOnlyWorktreeGitIndex(indexPath, filepath.Join(temp, "index")); err != nil {
+	if err := copyReadOnlyWorktreeGitIndex(ctx, indexPath, filepath.Join(temp, "index")); err != nil {
 		return nil, err
+	}
+	if sharedIndexPath != "" {
+		name := filepath.Base(sharedIndexPath)
+		if !strings.HasPrefix(name, "sharedindex.") || name == "sharedindex." {
+			return nil, fmt.Errorf("resolve shared index in %s returned invalid path %q", worktree, sharedIndexPath)
+		}
+		if err := copyReadOnlyWorktreeGitIndex(ctx, sharedIndexPath, filepath.Join(temp, name)); err != nil {
+			return nil, err
+		}
 	}
 
 	sandbox.env = append(baseEnv,
@@ -215,6 +231,14 @@ func (s *readOnlyWorktreeGitSandbox) run(ctx context.Context, label string, args
 }
 
 func runReadOnlyWorktreeMetadataGit(ctx context.Context, env []string, worktree, label string, args ...string) (string, error) {
+	return runReadOnlyWorktreeMetadataGitOutput(ctx, env, worktree, label, false, args...)
+}
+
+func runOptionalReadOnlyWorktreeMetadataGit(ctx context.Context, env []string, worktree, label string, args ...string) (string, error) {
+	return runReadOnlyWorktreeMetadataGitOutput(ctx, env, worktree, label, true, args...)
+}
+
+func runReadOnlyWorktreeMetadataGitOutput(ctx context.Context, env []string, worktree, label string, allowEmpty bool, args ...string) (string, error) {
 	cmdArgs := append([]string{"--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.DevNull}, args...)
 	cmd := exec.CommandContext(ctx, "git", cmdArgs...)
 	cmd.Dir = worktree
@@ -232,7 +256,7 @@ func runReadOnlyWorktreeMetadataGit(ctx context.Context, env []string, worktree,
 		return "", fmt.Errorf("%s in %s: %w", label, worktree, err)
 	}
 	value := strings.TrimSpace(stdout.String())
-	if value == "" || stdout.dropped != 0 {
+	if (!allowEmpty && value == "") || stdout.dropped != 0 {
 		return "", fmt.Errorf("%s in %s returned invalid metadata", label, worktree)
 	}
 	return value, nil
@@ -266,7 +290,32 @@ func absoluteGitPath(worktree, path string) string {
 	return filepath.Join(worktree, path)
 }
 
-func copyReadOnlyWorktreeGitIndex(source, destination string) error {
+func copyReadOnlyWorktreeGitIndex(ctx context.Context, source, destination string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("copy worktree index: %w", err)
+	}
+	return waitForReadOnlyWorktreeGitIndexCopy(ctx, func() error {
+		return copyReadOnlyWorktreeGitIndexFile(source, destination)
+	})
+}
+
+func waitForReadOnlyWorktreeGitIndexCopy(ctx context.Context, copyFile func() error) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- copyFile()
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		// A filesystem syscall already in progress cannot be force-cancelled
+		// portably. Stop waiting so terminal cleanup can proceed; the buffered
+		// result lets the copier exit without depending on this caller.
+		return fmt.Errorf("copy worktree index: %w", ctx.Err())
+	}
+}
+
+func copyReadOnlyWorktreeGitIndexFile(source, destination string) error {
 	input, err := os.Open(source)
 	if err != nil {
 		return fmt.Errorf("open worktree index: %w", err)
