@@ -419,6 +419,34 @@ func TestGlobalChecksHaveNoRepoChecks(t *testing.T) {
 	}
 }
 
+func TestCheckStuckJobsTreatsOnlyConfirmedDeadPIDAsHardFinding(t *testing.T) {
+	check := CheckStuckJobs(StuckJobsStatus{Jobs: []StuckJobProcess{
+		{JobID: "dead", PID: 101, Known: true, Live: false},
+		{JobID: "live", PID: 202, Known: true, Live: true},
+		{JobID: "legacy-no-pid"},
+		{JobID: "unknown", PID: 303, Known: false},
+	}})
+	if check.OK || !check.Required {
+		t.Fatalf("check = %+v, want required hard finding", check)
+	}
+	if !strings.Contains(check.Detail, "dead (pid 101)") {
+		t.Fatalf("detail = %q, want dead job identity", check.Detail)
+	}
+	for _, absent := range []string{"live", "legacy-no-pid", "unknown"} {
+		if strings.Contains(check.Detail, absent) {
+			t.Fatalf("detail = %q, must not flag %s", check.Detail, absent)
+		}
+	}
+
+	healthy := CheckStuckJobs(StuckJobsStatus{Jobs: []StuckJobProcess{
+		{JobID: "live", PID: 202, Known: true, Live: true},
+		{JobID: "legacy-no-pid"},
+	}})
+	if !healthy.OK || !healthy.Required {
+		t.Fatalf("healthy check = %+v, want required OK", healthy)
+	}
+}
+
 func TestRepoChecksAgainstCheckoutPath(t *testing.T) {
 	runner := pathSensitiveRunner{
 		want: "/checkout",

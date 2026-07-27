@@ -45,6 +45,17 @@ type BuildStatus struct {
 	DaemonRunning bool
 }
 
+type StuckJobProcess struct {
+	JobID string
+	PID   int
+	Live  bool
+	Known bool
+}
+
+type StuckJobsStatus struct {
+	Jobs []StuckJobProcess
+}
+
 type Checker struct {
 	Dir    string
 	Runner subprocess.Runner
@@ -73,6 +84,9 @@ type Checker struct {
 	// buildinfo and daemon-state persistence. Nil omits the check for callers
 	// such as the continuously refreshed terminal dashboard.
 	Build *BuildStatus
+	// StuckJobs is supplied by the CLI, which owns store access and process
+	// probing. Nil omits the check for callers such as the dashboard.
+	StuckJobs *StuckJobsStatus
 }
 
 // Run returns the global (cwd-independent) checks followed by the per-repo
@@ -108,6 +122,9 @@ func (c Checker) GlobalChecks(ctx context.Context) []Check {
 	if c.Build != nil {
 		checks = append(checks, CheckBuild(*c.Build))
 	}
+	if c.StuckJobs != nil {
+		checks = append(checks, CheckStuckJobs(*c.StuckJobs))
+	}
 	if strings.TrimSpace(c.Paths.ConfigFile) != "" {
 		cfg, err := config.LoadOrg(c.Paths)
 		if err != nil {
@@ -117,6 +134,32 @@ func (c Checker) GlobalChecks(ctx context.Context) []Check {
 		}
 	}
 	return checks
+}
+
+// CheckStuckJobs reports running jobs whose directly recorded runtime process
+// is confirmably dead. Unknowns are neutral: a legacy job with no PID, an
+// unavailable process table, or an identity that could not be captured never
+// produces a finding.
+func CheckStuckJobs(status StuckJobsStatus) Check {
+	check := Check{
+		Name:     "stuck jobs",
+		OK:       true,
+		Required: true,
+		Detail:   "no running jobs with a dead recorded runtime process",
+	}
+	var dead []string
+	for _, job := range status.Jobs {
+		if !job.Known || job.Live || job.PID <= 0 {
+			continue
+		}
+		dead = append(dead, fmt.Sprintf("%s (pid %d)", job.JobID, job.PID))
+	}
+	if len(dead) == 0 {
+		return check
+	}
+	check.OK = false
+	check.Detail = fmt.Sprintf("%d running job(s) have a dead recorded runtime process: %s", len(dead), strings.Join(dead, ", "))
+	return check
 }
 
 // CheckBuild reports whether the running daemon is executing stale code: the

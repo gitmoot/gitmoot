@@ -74,6 +74,37 @@ func TestMailboxPersistsActingOrgRoleProvenance(t *testing.T) {
 	}
 }
 
+func TestMailboxPersistsCapturedRuntimePIDInPayload(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+	if _, err := mailbox.Enqueue(ctx, JobRequest{
+		ID: "pid-job", Agent: "worker", Action: "ask", Repo: "gitmoot/gitmoot",
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	adapter := &fakeDelivery{
+		pid: os.Getpid(),
+		outputs: []string{
+			`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		},
+	}
+	if _, err := mailbox.Run(ctx, "pid-job", runtime.Agent{Name: "worker", Runtime: runtime.KimiRuntime, RuntimeRef: "fresh:pid-job"}, adapter); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	stored, err := store.GetJob(ctx, "pid-job")
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	payload, err := ParseJobPayload(stored.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload: %v", err)
+	}
+	if payload.RuntimePID != os.Getpid() || payload.RuntimePIDStartTime == "" {
+		t.Fatalf("stored runtime identity = pid %d start %q, want pid %d with starttime", payload.RuntimePID, payload.RuntimePIDStartTime, os.Getpid())
+	}
+}
+
 func TestMailboxProduceCheckRetriesSameSessionAndRecordsTokens(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
@@ -1789,6 +1820,7 @@ type fakeDelivery struct {
 	agentEnvs             [][]string
 	shellUpstreamContexts []string
 	onDeliver             func()
+	pid                   int
 	err                   error
 }
 
@@ -1802,6 +1834,9 @@ func (f *fakeDelivery) Deliver(_ context.Context, agent runtime.Agent, job runti
 	f.shellEnvs = append(f.shellEnvs, append([]string(nil), job.ShellEnv...))
 	f.agentEnvs = append(f.agentEnvs, append([]string(nil), job.AgentEnv...))
 	f.shellUpstreamContexts = append(f.shellUpstreamContexts, job.ShellUpstreamContext)
+	if f.pid > 0 && job.OnPID != nil {
+		job.OnPID(f.pid)
+	}
 	if f.onDeliver != nil {
 		f.onDeliver()
 	}

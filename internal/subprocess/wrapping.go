@@ -68,6 +68,23 @@ func (r WrappingRunner) Run(ctx context.Context, dir string, command string, arg
 	return r.inner().Run(ctx, dir, executable, wrapped...)
 }
 
+func (r WrappingRunner) RunWithPID(ctx context.Context, dir string, onPID PIDCallback, command string, args ...string) (Result, error) {
+	executable, wrapped, err := r.command(command, args)
+	if err != nil {
+		return Result{}, err
+	}
+	if len(r.Env) > 0 {
+		if inner, ok := r.inner().(EnvPIDRunner); ok {
+			return inner.RunEnvWithPID(ctx, dir, r.Env, onPID, executable, wrapped...)
+		}
+		return Result{}, errors.New("wrapped runner does not support environment PID capture")
+	}
+	if inner, ok := r.inner().(PIDRunner); ok {
+		return inner.RunWithPID(ctx, dir, onPID, executable, wrapped...)
+	}
+	return Result{}, errors.New("wrapped runner does not support PID capture")
+}
+
 func (r WrappingRunner) RunStream(ctx context.Context, dir string, out io.Writer, command string, args ...string) (Result, error) {
 	executable, wrapped, err := r.command(command, args)
 	if err != nil {
@@ -85,6 +102,28 @@ func (r WrappingRunner) RunStream(ctx context.Context, dir string, out io.Writer
 	return r.inner().Run(ctx, dir, executable, wrapped...)
 }
 
+func (r WrappingRunner) RunStreamWithPID(ctx context.Context, dir string, out io.Writer, onPID PIDCallback, command string, args ...string) (Result, error) {
+	executable, wrapped, err := r.command(command, args)
+	if err != nil {
+		return Result{}, err
+	}
+	if len(r.Env) > 0 {
+		if inner, ok := r.inner().(EnvPIDStreamRunner); ok {
+			return inner.RunEnvStreamWithPID(ctx, dir, r.Env, out, onPID, executable, wrapped...)
+		}
+		return Result{}, errors.New("wrapped streaming runner does not support environment PID capture")
+	}
+	if inner, ok := r.inner().(PIDStreamRunner); ok {
+		return inner.RunStreamWithPID(ctx, dir, out, onPID, executable, wrapped...)
+	}
+	if out == nil {
+		if inner, ok := r.inner().(PIDRunner); ok {
+			return inner.RunWithPID(ctx, dir, onPID, executable, wrapped...)
+		}
+	}
+	return Result{}, errors.New("wrapped streaming runner does not support PID capture")
+}
+
 func (r WrappingRunner) RunEnv(ctx context.Context, dir string, env []string, command string, args ...string) (Result, error) {
 	executable, wrapped, err := r.command(command, args)
 	if err != nil {
@@ -100,6 +139,23 @@ func (r WrappingRunner) RunEnv(ctx context.Context, dir string, env []string, co
 		return Result{}, errors.New("wrapped runner does not support environment injection")
 	}
 	return r.inner().Run(ctx, dir, executable, wrapped...)
+}
+
+func (r WrappingRunner) RunEnvWithPID(ctx context.Context, dir string, env []string, onPID PIDCallback, command string, args ...string) (Result, error) {
+	executable, wrapped, err := r.command(command, args)
+	if err != nil {
+		return Result{}, err
+	}
+	merged := append(append([]string{}, env...), r.Env...)
+	if inner, ok := r.inner().(EnvPIDRunner); ok {
+		return inner.RunEnvWithPID(ctx, dir, merged, onPID, executable, wrapped...)
+	}
+	if len(merged) == 0 {
+		if inner, ok := r.inner().(PIDRunner); ok {
+			return inner.RunWithPID(ctx, dir, onPID, executable, wrapped...)
+		}
+	}
+	return Result{}, errors.New("wrapped runner does not support environment PID capture")
 }
 
 func (r WrappingRunner) LookPath(file string) (string, error) {
