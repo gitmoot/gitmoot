@@ -162,6 +162,48 @@ func TestOpenDoesNotFullVacuumLegacyDatabase(t *testing.T) {
 	}
 }
 
+func TestOpenPreservesExistingFullAutoVacuumMode(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "full.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw full auto-vacuum database: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `PRAGMA auto_vacuum=FULL`); err != nil {
+		t.Fatalf("configure full auto-vacuum: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `CREATE TABLE full_value (value TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create full auto-vacuum table: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO full_value(value) VALUES ('preserved')`); err != nil {
+		t.Fatalf("insert full auto-vacuum value: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw full auto-vacuum database: %v", err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open full auto-vacuum database: %v", err)
+	}
+	defer store.Close()
+
+	mode, err := store.SQLiteAutoVacuumMode(ctx)
+	if err != nil {
+		t.Fatalf("SQLiteAutoVacuumMode returned error: %v", err)
+	}
+	if mode != SQLiteAutoVacuumFull {
+		t.Fatalf("full auto_vacuum after Open = %d, want %d (FULL)", mode, SQLiteAutoVacuumFull)
+	}
+	var value string
+	if err := store.db.QueryRowContext(ctx, `SELECT value FROM full_value`).Scan(&value); err != nil {
+		t.Fatalf("read full auto-vacuum value: %v", err)
+	}
+	if value != "preserved" {
+		t.Fatalf("full auto-vacuum value = %q, want preserved", value)
+	}
+}
+
 func TestIncrementalVacuumReclaimsOnlyRequestedPages(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "incremental.db"))

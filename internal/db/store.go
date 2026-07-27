@@ -111,8 +111,16 @@ func configureWritableSQLite(ctx context.Context, db *sql.DB) error {
 	// incremental reclaim. On an existing database created with NONE, SQLite
 	// leaves the mode unchanged until an operator explicitly runs a full
 	// VACUUM; startup must never perform that potentially expensive rewrite.
-	if _, err := db.ExecContext(ctx, `PRAGMA auto_vacuum=INCREMENTAL`); err != nil {
-		return fmt.Errorf("configure sqlite incremental auto-vacuum: %w", err)
+	// FULL and INCREMENTAL databases are already configured for automatic
+	// reclaim and must retain the mode explicitly chosen by their operator.
+	var autoVacuumMode int
+	if err := db.QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&autoVacuumMode); err != nil {
+		return fmt.Errorf("read sqlite auto-vacuum mode: %w", err)
+	}
+	if autoVacuumMode == SQLiteAutoVacuumNone {
+		if _, err := db.ExecContext(ctx, `PRAGMA auto_vacuum=INCREMENTAL`); err != nil {
+			return fmt.Errorf("configure sqlite incremental auto-vacuum: %w", err)
+		}
 	}
 	if _, err := db.ExecContext(ctx, `PRAGMA journal_mode=WAL`); err != nil {
 		return fmt.Errorf("configure sqlite WAL: %w", err)
