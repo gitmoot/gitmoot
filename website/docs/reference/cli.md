@@ -1393,6 +1393,36 @@ points to it):
   process is still inside the task worktree. Wait for it to exit, or stop the
   orphaned implementer, before recovering.
 
+## Issue And PR Trace
+
+Trace the evidence connecting an issue to local tasks, pull-request attempts,
+declared successors, and merge commits:
+
+```sh
+gitmoot trace issue owner/repo#1159
+gitmoot trace issue --json owner/repo#1159
+gitmoot trace pr owner/repo#1160
+gitmoot trace pr --json owner/repo#1160
+```
+
+`trace issue` starts from the issue number, so the reader does not need to know
+a PR number in advance. `trace pr` discovers the same issue-rooted trace from a
+PR's same-repository issue references when possible. Both forms return one
+`gitmoot.issue-trace.v1` object under `--json`.
+
+The trace is an on-demand evidence view. It combines GitHub timeline
+cross-references, declared `Closes`/`Fixes`/`Resolves` links, same-repository
+titles matching `SUPERSEDE PR #NNN`, merge records, default-branch ancestry at
+observation time, and local exact-branch associations. Each edge states its
+`basis` and `certainty`; successor relationships remain a graph, so forks and
+cycles are warnings rather than a fabricated linear history.
+
+A merge reference is always rendered as `partial_evidence`, not proof that the
+issue scope was satisfied. Deployment is `unknown`/`unknowable`. GitHub or auth
+failures set `remote_unavailable` and `refresh_error` instead of presenting a
+partial refresh as complete. The command never closes issues and is deliberately
+separate from task-list rendering, so ordinary lists perform no GitHub fan-out.
+
 ## PR Comments
 
 Use GitHub PR comments as the public audit trail:
