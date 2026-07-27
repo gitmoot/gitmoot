@@ -81,12 +81,75 @@ func TestWorkflowFlagParsesOnAllAgentVerbs(t *testing.T) {
 
 func TestMergeWorkflowTimelineDeterministicKindAndIDTieBreak(t *testing.T) {
 	jobs := []db.Job{{ID: "b", CreatedAt: "2026-01-01 00:00:00"}, {ID: "a", CreatedAt: "2026-01-01 00:00:00"}}
-	notes := []db.WorkflowNote{{ID: 2, CreatedAt: "2026-01-01 00:00:00"}, {ID: 1, CreatedAt: "2026-01-01 00:00:00"}}
+	notes := []db.WorkflowNote{{ID: 10, CreatedAt: "2026-01-01 00:00:00"}, {ID: 9, CreatedAt: "2026-01-01 00:00:00"}}
 	entries := mergeWorkflowTimeline(jobs, notes)
-	want := []string{"job:a", "job:b", "note:1", "note:2"}
+	want := []string{"job:a", "job:b", "note:9", "note:10"}
 	for i, entry := range entries {
 		if got := entry.Kind + ":" + entry.ID; got != want[i] {
 			t.Fatalf("entries[%d] = %q, want %q", i, got, want[i])
+		}
+	}
+}
+
+func TestWorkflowShowTiedNoteIDsKeepsNumericNewest(t *testing.T) {
+	home, store := workflowJournalTestHome(t)
+	ctx := context.Background()
+	const workflowID = "release-tied-notes"
+	notes := make([]db.WorkflowNote, 0, 10)
+	for i := 1; i <= 10; i++ {
+		note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: workflowID,
+			Author:     "operator",
+			Body:       fmt.Sprintf("note-%02d", i),
+		})
+		if err != nil {
+			t.Fatalf("InsertWorkflowNote(%d): %v", i, err)
+		}
+		notes = append(notes, note)
+	}
+	if notes[8].ID != 9 || notes[9].ID != 10 {
+		t.Fatalf("note IDs = %d and %d, want digit-boundary IDs 9 and 10", notes[8].ID, notes[9].ID)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "later-job", Agent: "worker", Type: "ask", State: "succeeded",
+		Payload: `{"repo":"acme/widget","workflow_id":"release-tied-notes"}`,
+	}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer raw.Close()
+	if _, err := raw.ExecContext(ctx,
+		`UPDATE workflow_notes SET created_at = CASE WHEN id IN (?, ?) THEN ? ELSE ? END WHERE workflow_id = ?`,
+		notes[8].ID, notes[9].ID, "2026-07-27 12:00:00", "2026-07-27 11:00:00", workflowID); err != nil {
+		t.Fatalf("set note timestamps: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx,
+		`UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`,
+		"2026-07-27 12:01:00", "2026-07-27 12:01:00", "later-job"); err != nil {
+		t.Fatalf("set job timestamp: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := runWorkflowShow([]string{workflowID, "--home", home, "--limit", "2", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("workflow show exit=%d stderr=%q", code, stderr.String())
+	}
+	var out workflowShowJSON
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("decode JSON: %v raw=%s", err, stdout.String())
+	}
+	if len(out.Entries) != 2 || !out.Truncated {
+		t.Fatalf("entries=%+v truncated=%v", out.Entries, out.Truncated)
+	}
+	if out.Entries[0].Kind != "note" || out.Entries[0].Note == nil || out.Entries[0].Note.ID != 10 {
+		t.Fatalf("numeric-newest tied note did not survive: %+v", out.Entries)
+	}
+	for _, entry := range out.Entries {
+		if entry.Note != nil && entry.Note.ID == 9 {
+			t.Fatalf("numeric-older tied note survived instead: %+v", out.Entries)
 		}
 	}
 }
@@ -255,6 +318,89 @@ func TestWorkflowShowJSONAnnouncesOnlyActualTruncation(t *testing.T) {
 	}
 	if _, ok := raw["truncated"]; ok {
 		t.Fatalf("truncated field present for complete window: %s", stdout.String())
+	}
+}
+
+func TestWorkflowShowDefaultLimitWithAsymmetricSources(t *testing.T) {
+	home, store := workflowJournalTestHome(t)
+	ctx := context.Background()
+	const workflowID = "release-asymmetric"
+	base := time.Date(2026, 7, 20, 8, 0, 0, 0, time.UTC)
+	for i := 0; i < 105; i++ {
+		id := fmt.Sprintf("job-%03d", i)
+		if err := store.CreateJob(ctx, db.Job{
+			ID: id, Agent: "worker", Type: "ask", State: "succeeded",
+			Payload: `{"repo":"acme/widget","workflow_id":"release-asymmetric"}`,
+		}); err != nil {
+			t.Fatalf("CreateJob(%s): %v", id, err)
+		}
+	}
+	noteIDs := make([]int64, 0, 3)
+	for i := 0; i < 3; i++ {
+		note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: workflowID, Author: "operator", Body: fmt.Sprintf("note-%d", i),
+		})
+		if err != nil {
+			t.Fatalf("InsertWorkflowNote(%d): %v", i, err)
+		}
+		noteIDs = append(noteIDs, note.ID)
+	}
+
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer raw.Close()
+	tx, err := raw.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	for i := 0; i < 105; i++ {
+		id := fmt.Sprintf("job-%03d", i)
+		createdAt := base.Add(time.Duration(i) * time.Minute).Format("2006-01-02 15:04:05")
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`,
+			createdAt, createdAt, id); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("set job %s timestamp: %v", id, err)
+		}
+	}
+	for i, id := range noteIDs {
+		createdAt := base.Add(time.Duration(105+i) * time.Minute).Format("2006-01-02 15:04:05")
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE workflow_notes SET created_at = ? WHERE id = ?`,
+			createdAt, id); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("set note %d timestamp: %v", id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := runWorkflowShow([]string{workflowID, "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("workflow show exit=%d stderr=%q", code, stderr.String())
+	}
+	var out workflowShowJSON
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("decode JSON: %v raw=%s", err, stdout.String())
+	}
+	if !out.Truncated || len(out.Entries) != 100 ||
+		out.Summary.JobCount != 105 || out.Summary.NoteCount != 3 {
+		t.Fatalf("asymmetric output: truncated=%v entries=%d summary=%+v", out.Truncated, len(out.Entries), out.Summary)
+	}
+	seen := make(map[string]bool, len(out.Entries))
+	for _, entry := range out.Entries {
+		seen[entry.Kind+":"+entry.ID] = true
+	}
+	if seen["job:job-007"] || !seen["job:job-008"] {
+		t.Fatalf("wrong job recency boundary: job-007=%v job-008=%v", seen["job:job-007"], seen["job:job-008"])
+	}
+	for i, id := range noteIDs {
+		if !seen["note:"+fmt.Sprintf("%d", id)] {
+			t.Fatalf("newest note %d (id %d) missing from asymmetric window", i, id)
+		}
 	}
 }
 

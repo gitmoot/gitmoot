@@ -1171,14 +1171,18 @@ gitmoot workflow close fable/dashboard-redesign --reason "Shipped and verified."
 ```
 
 List/show include state counts, notes, first/last activity, and best-effort token
-totals. Notes store bodies and authors verbatim. The read-only web dashboard
-also renders labels as Galaxy hubs and provides a Workflows index plus mission
-log at `/workflows/<label>`. `active` means queued/running; `recent` means no work
-is live but activity occurred within 30 minutes; failed/blocked workflows with
-an unacknowledged failure and 30 minutes to 24 hours of silence are `stalled`;
-everything else is `settled`. A `done` or `settled` status immediately projects
-as settled regardless of note recency, unless queued/running work makes it
-active. The optional `--pane`, `--session`, and
+totals. `workflow show` keeps the newest 100 entries by default and displays
+that window chronologically; use `--limit 0` for the complete timeline or a
+larger `--limit N` for a wider window. If entries are omitted, text mode reports
+the shown and total counts with that guidance on stderr, and JSON includes
+`"truncated": true`. Notes store bodies and authors verbatim. The read-only web
+dashboard also renders labels as Galaxy hubs and provides a Workflows index plus
+mission log at `/workflows/<label>`. `active` means queued/running; `recent`
+means no work is live but activity occurred within 30 minutes; failed/blocked
+workflows with an unacknowledged failure and 30 minutes to 24 hours of silence
+are `stalled`; everything else is `settled`. A `done` or `settled` status
+immediately projects as settled regardless of note recency, unless queued/running
+work makes it active. The optional `--pane`, `--session`, and
 `--workdir` note flags persist the latest coordinator handoff. Inside Herdr,
 omitted identity flags are filled from the current pane: its label, full agent
 session UUID, and working directory. Explicit flags always win; `--no-auto`

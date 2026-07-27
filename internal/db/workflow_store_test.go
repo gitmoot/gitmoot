@@ -39,6 +39,16 @@ func TestWorkflowStoreAggregatesAndFiltersByIndexedColumn(t *testing.T) {
 	seedWorkflowJob(t, store, "a", "release-42", "queued", "acme/widget", 2, 3)
 	seedWorkflowJob(t, store, "b", "release-42", "succeeded", "acme/widget", 5, 7)
 	seedWorkflowJob(t, store, "c", "other", "failed", "acme/other", 100, 100)
+	for id, createdAt := range map[string]string{
+		"a": "2026-07-20 08:00:00",
+		"b": "2026-07-27 12:03:00",
+	} {
+		if _, err := store.db.ExecContext(ctx,
+			`UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`,
+			createdAt, createdAt, id); err != nil {
+			t.Fatalf("set job %s timestamp: %v", id, err)
+		}
+	}
 	if _, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: "release-42", Body: "checkpoint"}); err != nil {
 		t.Fatalf("InsertWorkflowNote: %v", err)
 	}

@@ -160,19 +160,19 @@ func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 	if err := withStore(*home, func(store *db.Store) error {
 		ctx := context.Background()
 		var err error
-		summary, err = store.WorkflowSummary(ctx, label)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("workflow %q not found", label)
-			}
-			return err
-		}
 		jobs, err = store.ListJobsByWorkflow(ctx, label, *limit)
 		if err != nil {
 			return err
 		}
 		notes, err = store.ListWorkflowNotes(ctx, label, *limit)
 		if err != nil {
+			return err
+		}
+		summary, err = store.WorkflowSummary(ctx, label)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("workflow %q not found", label)
+			}
 			return err
 		}
 		meta, err = store.GetWorkflowMeta(ctx, label)
@@ -416,6 +416,9 @@ func mergeWorkflowTimeline(jobs []db.Job, notes []db.WorkflowNote) []workflowTim
 		}
 		if entries[i].Kind != entries[j].Kind {
 			return entries[i].Kind < entries[j].Kind
+		}
+		if entries[i].Kind == "note" {
+			return entries[i].Note.ID < entries[j].Note.ID
 		}
 		return entries[i].ID < entries[j].ID
 	})

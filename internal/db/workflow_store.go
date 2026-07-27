@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -719,9 +720,7 @@ func (s *Store) ListWorkflowNotes(ctx context.Context, workflowID string, limit 
 	}
 	// The descending query makes LIMIT select the newest rows; restore the
 	// chronological order callers expect from this workflow timeline API.
-	for i, j := 0, len(notes)-1; i < j; i, j = i+1, j-1 {
-		notes[i], notes[j] = notes[j], notes[i]
-	}
+	slices.Reverse(notes)
 	return notes, nil
 }
 
@@ -796,9 +795,7 @@ func (s *Store) ListJobsByWorkflow(ctx context.Context, workflowID string, limit
 	}
 	// The descending query makes LIMIT select the newest rows; restore the
 	// chronological order callers expect from this workflow timeline API.
-	for i, j := 0, len(jobs)-1; i < j; i, j = i+1, j-1 {
-		jobs[i], jobs[j] = jobs[j], jobs[i]
-	}
+	slices.Reverse(jobs)
 	return jobs, nil
 }
 
