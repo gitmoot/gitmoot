@@ -40,12 +40,19 @@ type herdrOrgSnapshotResult struct {
 		Snapshot struct {
 			Version json.RawMessage `json:"version"`
 			Panes   []struct {
-				PaneID      string `json:"pane_id"`
-				Label       string `json:"label"`
-				AgentStatus string `json:"agent_status"`
+				PaneID            string                  `json:"pane_id"`
+				Label             string                  `json:"label"`
+				AgentStatus       string                  `json:"agent_status"`
+				LastCompletedTurn *herdrCompletedTurnWire `json:"last_completed_turn"`
 			} `json:"panes"`
 		} `json:"snapshot"`
 	} `json:"result"`
+}
+
+type herdrCompletedTurnWire struct {
+	Turn            *int64 `json:"turn"`
+	TurnEpoch       *int64 `json:"turn_epoch"`
+	CompletedUnixMS *int64 `json:"completed_unix_ms"`
 }
 
 func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
@@ -68,22 +75,24 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 		return org.Snapshot{}, fmt.Errorf("herdr api snapshot returned an incomplete snapshot shape")
 	}
 
-	byLabel := map[string][]string{}
+	byLabel := map[string][]org.RoleLiveState{}
 	labelToPaneIDs := map[string][]string{}
-	statusByPaneID := map[string]string{}
+	stateByPaneID := map[string]org.RoleLiveState{}
 	for _, pane := range decoded.Result.Snapshot.Panes {
+		state := mapHerdrAgentStatus(pane.AgentStatus)
+		state.Activity = mapHerdrCompletedTurn(pane.LastCompletedTurn)
 		// Mirror the wake resolver (herdr.go resolvePaneByLabel, which matches only
 		// `p.PaneID != ""`): a pane with an empty pane_id is not a resolvable
 		// target. Seeding it would collide every empty-id pane on the "" key of
-		// statusByPaneID and let a binding read the wrong pane's status.
+		// stateByPaneID and let a binding read the wrong pane's state.
 		if pane.PaneID != "" {
-			statusByPaneID[pane.PaneID] = pane.AgentStatus
+			stateByPaneID[pane.PaneID] = state
 			if pane.Label != "" {
 				labelToPaneIDs[pane.Label] = append(labelToPaneIDs[pane.Label], pane.PaneID)
 			}
 		}
 		if pane.Label != "" {
-			byLabel[pane.Label] = append(byLabel[pane.Label], pane.AgentStatus)
+			byLabel[pane.Label] = append(byLabel[pane.Label], state)
 		}
 	}
 	states := make(map[string]org.RoleLiveState, len(p.roles))
@@ -101,12 +110,12 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 				}
 				return "", false
 			})
-			status, present := statusByPaneID[paneID]
+			state, present := stateByPaneID[paneID]
 			if !present {
 				states[role.Name] = org.RoleLiveState{State: org.StateUnknown, Detail: fmt.Sprintf("no Herdr pane bound as %q", binding)}
 				continue
 			}
-			states[role.Name] = mapHerdrAgentStatus(status)
+			states[role.Name] = state
 			continue
 		}
 
@@ -115,7 +124,7 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 		case 0:
 			states[role.Name] = org.RoleLiveState{State: org.StateUnknown, Detail: "no Herdr pane has this exact role label"}
 		case 1:
-			states[role.Name] = mapHerdrAgentStatus(matches[0])
+			states[role.Name] = matches[0]
 		default:
 			states[role.Name] = org.RoleLiveState{State: org.StateUnknown, Detail: "multiple Herdr panes have this exact role label"}
 		}
@@ -125,6 +134,17 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 		now = p.now
 	}
 	return org.Snapshot{States: states, ObservedAt: now().UTC(), ProviderVersion: version}, nil
+}
+
+func mapHerdrCompletedTurn(turn *herdrCompletedTurnWire) *org.RoleActivity {
+	if turn == nil || turn.Turn == nil || turn.TurnEpoch == nil || turn.CompletedUnixMS == nil {
+		return nil
+	}
+	return &org.RoleActivity{
+		Turn:        *turn.Turn,
+		TurnEpoch:   *turn.TurnEpoch,
+		CompletedAt: time.UnixMilli(*turn.CompletedUnixMS).UTC(),
+	}
 }
 
 // Recycle starts a fresh interactive agent in a pane that has already returned
