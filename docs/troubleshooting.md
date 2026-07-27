@@ -463,6 +463,14 @@ Fixes:
   (a failing probe extends the hold without spending a retry). Over `[events]`
   the deferral is a first-class `job.deferred` emitted instead of `job.failed`.
   Only act when the retry budget is spent and the job stays failed.
+- A `stale_worktree_dirty_blocked` task event is not an auto-retrying
+  `checkout_contention` deferral. It means the existing task worktree is off the
+  resolved base lineage and has uncommitted changes, so Gitmoot preserves it and
+  moves the task to `blocked`. Confirm the event with `gitmoot task events
+  <task-id> --json`; `gitmoot task list --repo owner/repo --state blocked
+  --json` exposes its `worktree_path`. Manually salvage, commit, stash, or clean
+  the changes before retrying `task run`/`agent implement`; an off-lineage
+  worktree is re-cut automatically only when it is clean.
 - A job stuck in `running` is recovered automatically once it shows no lease
   progress past the staleness window (default 30m; tune with the
   `GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value
