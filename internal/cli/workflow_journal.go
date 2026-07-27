@@ -215,14 +215,8 @@ func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 	if truncated {
 		entries = entries[len(entries)-*limit:]
 	}
-	displayJobCount := summary.JobCount
-	if displayJobCount < len(jobs) {
-		displayJobCount = len(jobs)
-	}
-	displayNoteCount := summary.NoteCount
-	if displayNoteCount < len(notes) {
-		displayNoteCount = len(notes)
-	}
+	displayJobCount := max(summary.JobCount, len(jobs))
+	displayNoteCount := max(summary.NoteCount, len(notes))
 	totalEntries := displayJobCount + displayNoteCount
 	out := workflowShowJSON{Summary: summary, Meta: meta, Entries: entries, Truncated: truncated}
 	out.Meta.Description = workflowDisplayDescription(summary.WorkflowID, out.Meta.Description)
