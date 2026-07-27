@@ -159,6 +159,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	paths, _ := config.DefaultPaths()
 	buildStatus := daemonBuildStatus(paths)
 	stuckStatus := stuckJobsStatus(paths)
+	logStatus := daemonLogStatus(paths)
 	probeRunner, authState, authSource, authErr := runtimeJobRunnerWithAuth("", runtime.ClaudeRuntime, nil)
 	checker := doctor.Checker{
 		Dir:               *repoDir,
@@ -171,6 +172,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		SkipDaemonAuth:    true,
 		Build:             &buildStatus,
 		StuckJobs:         stuckStatus,
+		LogStatus:         &logStatus,
 	}
 	checks := checker.Run(context.Background())
 	// #631: surface a stale backlog of blocked jobs (each paused awaiting a human)

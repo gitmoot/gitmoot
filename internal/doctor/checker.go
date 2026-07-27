@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
@@ -56,6 +57,18 @@ type StuckJobsStatus struct {
 	Jobs []StuckJobProcess
 }
 
+// DaemonLogStatus records the evidence needed to decide whether the running
+// daemon is still writing the log path advertised by `daemon status`.
+type DaemonLogStatus struct {
+	DaemonRunning bool
+	Determined    bool
+	Stale         bool
+	Missing       bool
+	LogPath       string
+	StartedAt     time.Time
+	LastWrite     time.Time
+}
+
 type Checker struct {
 	Dir    string
 	Runner subprocess.Runner
@@ -87,6 +100,9 @@ type Checker struct {
 	// StuckJobs is supplied by the CLI, which owns store access and process
 	// probing. Nil omits the check for callers such as the dashboard.
 	StuckJobs *StuckJobsStatus
+	// LogStatus is supplied by the one-shot CLI. Nil omits the check for callers
+	// such as the continuously refreshed terminal dashboard.
+	LogStatus *DaemonLogStatus
 }
 
 // Run returns the global (cwd-independent) checks followed by the per-repo
@@ -124,6 +140,13 @@ func (c Checker) GlobalChecks(ctx context.Context) []Check {
 	}
 	if c.StuckJobs != nil {
 		checks = append(checks, CheckStuckJobs(*c.StuckJobs))
+	}
+	if c.LogStatus != nil {
+		// Preserve the existing doctor surface unless staleness is positively
+		// established. Fresh, stopped, and indeterminate states are neutral.
+		if check := CheckDaemonLog(*c.LogStatus); !check.OK {
+			checks = append(checks, check)
+		}
 	}
 	if strings.TrimSpace(c.Paths.ConfigFile) != "" {
 		cfg, err := config.LoadOrg(c.Paths)
@@ -201,6 +224,29 @@ func CheckBuild(status BuildStatus) Check {
 	}
 	check.Detail = fmt.Sprintf("daemon running %s; %s is %s — restart the daemon to pick it up",
 		buildDisplay(status.Daemon), target, buildDisplay(status.OnDisk))
+	return check
+}
+
+// CheckDaemonLog warns only when a running daemon's advertised log is
+// definitely missing or predates that daemon's recorded start. Every unknown is
+// neutral, matching CheckBuild's conservative daemon-state posture.
+func CheckDaemonLog(status DaemonLogStatus) Check {
+	check := Check{Name: "daemon log", OK: true, Required: false}
+	if !status.DaemonRunning || !status.Determined || !status.Stale {
+		return check
+	}
+
+	check.OK = false
+	lastWrite := "missing (no timestamp)"
+	if !status.Missing && !status.LastWrite.IsZero() {
+		lastWrite = status.LastWrite.UTC().Format(time.RFC3339)
+	}
+	check.Detail = fmt.Sprintf(
+		"advertised log %s is stale (last write: %s; daemon started: %s); if running under systemd, follow logs with journalctl --user -u gitmoot-daemon -f",
+		status.LogPath,
+		lastWrite,
+		status.StartedAt.UTC().Format(time.RFC3339),
+	)
 	return check
 }
 

@@ -3,6 +3,25 @@
 Use `gitmoot doctor --repo .` first. It checks local prerequisites from the
 repository checkout.
 
+## The Advertised Daemon Log Is Stale
+
+`gitmoot daemon status` prints the configured log path. When the daemon is
+running, it warns if that file is missing or its last write predates the
+daemon's recorded start time; `gitmoot doctor` reports the same confirmed
+condition as a non-fatal `daemon log` check.
+
+This commonly means the daemon runs under `systemd --user`, which captures
+stdout and stderr in the journal instead of the file. Follow the likely live
+stream with:
+
+```sh
+journalctl --user -u gitmoot-daemon -f
+```
+
+The warning is mechanism-agnostic: it reports the timestamp mismatch and phrases
+systemd as a possibility. It is omitted when the daemon is stopped, the log is
+current, or the comparison cannot be made.
+
 ## The Daemon Is Running An Old Build
 
 Symptoms:

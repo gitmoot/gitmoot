@@ -250,6 +250,12 @@ func daemonMergeGateActiveJobFixture(t *testing.T, seedReview ...bool) (*db.Stor
 	}
 	if len(seedReview) == 0 || seedReview[0] {
 		seedDaemonMergeGateJob(t, store, db.Job{
+			ID: "implement-complete", Agent: "implementer", Type: "implement", State: string(workflow.JobSucceeded),
+		}, workflow.JobPayload{
+			Repo: "owner/repo", Branch: "fix-round", PullRequest: 17, HeadSHA: "head123", TaskID: "task-1017",
+			Result: &workflow.AgentResult{Decision: "implemented", Summary: "implemented"},
+		})
+		seedDaemonMergeGateJob(t, store, db.Job{
 			ID: "review-approved", Agent: "reviewer", Type: "review", State: string(workflow.JobSucceeded),
 		}, workflow.JobPayload{
 			Repo: "owner/repo", Branch: "fix-round", PullRequest: 17, HeadSHA: "head123", TaskID: "task-1017",
