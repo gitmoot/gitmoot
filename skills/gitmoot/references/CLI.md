@@ -1229,9 +1229,11 @@ recycle does not kill or send exit keys to the old agent: the pane must already
 be at its interactive shell prompt. The Herdr start wait is bounded to 30
 seconds; a failed start leaves the durable handoff note available for recovery.
 When a role configures `model`, recycle passes `--model <value>` to the successor
-agent; deploy this binary before adding the fail-closed field to config. Brief
-and chart surface the configured pin, but live-vs-pinned drift detection awaits
-a running-model signal from Herdr.
+only for the verified Herdr kinds `codex`, `claude`, and `kimi`; other accepted
+`--kind` values silently ignore the pin without an error or warning. Deploy this
+binary before adding the fail-closed field to config. Brief and chart surface
+the configured pin, but live-vs-pinned drift detection awaits a running-model
+signal from Herdr.
 
 Fresh local `agent ask`, `agent run`, `agent review`, `agent implement`,
 `orchestrate`, and `task run` dispatches accept `--org-role <name>` (or the

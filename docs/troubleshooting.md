@@ -470,7 +470,12 @@ Fixes:
   <task-id> --json`; `gitmoot task list --repo owner/repo --state blocked
   --json` exposes its `worktree_path`. Manually salvage, commit, stash, or clean
   the changes before retrying `task run`/`agent implement`; an off-lineage
-  worktree is re-cut automatically only when it is clean.
+  worktree is re-cut automatically only when it is clean. For a
+  delegated/Orchestra implement worktree, the same event is stored as a
+  JobEvent on the parent coordinator job; the delegation-worktree allocator
+  writes nothing to the tasks table. Inspect it with `gitmoot job events
+  <parent-job-id>` (`job events` has no `--json` flag). `gitmoot job show
+  <parent-job-id> --json` is valid but does not include event history.
 - A job stuck in `running` is recovered automatically once it shows no lease
   progress past the staleness window (default 30m; tune with the
   `GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value

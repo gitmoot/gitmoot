@@ -1005,14 +1005,15 @@ gitmoot org status [--json]
 
 The registry uses `[org] enforce = "warn"|"block"` and
 `[org.roles."name"]` entries with `parent`, `scope`, `merge_rule`, an optional
-cosmetic `display_name`, an optional `model` runtime pin, and an optional `pane`
-Herdr binding. The binding resolves as an exact live pane label first, then as
-a literal pane id; roles without a binding retain exact role-name-as-label
-presence lookup. There is exactly one root named `owner`; accepted scopes are
-`*`, `owner/*`, and `owner/repo`. Malformed org configuration fails closed and
-loudly. `brief` records passive last-seen presence for its role and can render
-static context with provider state `unknown` during an outage; `chart` and
-`status` require a live compatible Herdr snapshot. When configured,
+cosmetic `display_name`, an optional `model` runtime pin, an optional per-role
+`recycle_after` duration override, and an optional `pane` Herdr binding. The
+binding resolves as an exact live pane label first, then as a literal pane id;
+roles without a binding retain exact role-name-as-label presence lookup. There
+is exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
+`owner/repo`. Malformed org configuration fails closed and loudly. `brief`
+records passive last-seen presence for its role and can render static context
+with provider state `unknown` during an outage; `chart` and `status` require a
+live compatible Herdr snapshot. When configured,
 `brief --json` and `status --json` include the role's `pane` binding. `chart`
 and `status` append a `⚠
 flagged (N missed wakes)` marker after the role reaches the positive
@@ -1095,8 +1096,9 @@ remains policy-gated.
 
 The optional `[org]` registry is enabled by any `[org.roles."name"]` section.
 Roles have `parent`, `scope`, advisory `merge_rule` (`owner`, `self`, or
-`none`), an optional `model` runtime pin, and an optional Herdr `pane` used by
-live presence and event-rule wakes; exactly one parent-less role is required.
+`none`), an optional `model` runtime pin, an optional per-role `recycle_after`
+duration override, and an optional Herdr `pane` used by live presence and
+event-rule wakes; exactly one parent-less role is required.
 Scope entries are `*`, `owner/*`, or exact `owner/name`, and child scope must be
 a subset of its parent.
 
@@ -1117,7 +1119,8 @@ recycle does not kill or send exit keys to the old agent: the pane must already
 be at its interactive shell prompt. The Herdr start wait is bounded to 30
 seconds; a failed start leaves the durable handoff note available for recovery.
 When a role configures `model`, recycle passes `--model <value>` to the successor
-agent.
+only for the verified Herdr kinds `codex`, `claude`, and `kimi`; other accepted
+`--kind` values silently ignore the pin without an error or warning.
 
 `gitmoot org escalate --to <ancestor-role> --workflow <label> [--org-role
 <from-role>] [--repo <owner/repo>] "<question>"` writes a workflow journal
