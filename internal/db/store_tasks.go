@@ -438,6 +438,50 @@ func (s *Store) ListTaskEvents(ctx context.Context, taskID string) ([]TaskEvent,
 	return out, rows.Err()
 }
 
+// LatestTaskEventByKinds returns the newest matching event for a task.
+func (s *Store) LatestTaskEventByKinds(ctx context.Context, taskID string, kinds ...string) (TaskEvent, bool, error) {
+	taskID = strings.TrimSpace(taskID)
+	filteredKinds := make([]string, 0, len(kinds))
+	for _, kind := range kinds {
+		if kind = strings.TrimSpace(kind); kind != "" {
+			filteredKinds = append(filteredKinds, kind)
+		}
+	}
+	if taskID == "" || len(filteredKinds) == 0 {
+		return TaskEvent{}, false, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(filteredKinds)), ",")
+	args := make([]any, 0, len(filteredKinds)+1)
+	args = append(args, taskID)
+	for _, kind := range filteredKinds {
+		args = append(args, kind)
+	}
+	var event TaskEvent
+	err := s.db.QueryRowContext(ctx, `SELECT id, task_id, kind, from_state, to_state, reason, created_at
+		FROM task_events WHERE task_id = ? AND kind IN (`+placeholders+`) ORDER BY id DESC LIMIT 1`, args...).
+		Scan(&event.ID, &event.TaskID, &event.Kind, &event.FromState, &event.ToState, &event.Reason, &event.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return TaskEvent{}, false, nil
+	}
+	if err != nil {
+		return TaskEvent{}, false, err
+	}
+	return event, true, nil
+}
+
+// CountTaskEventsByKind returns the durable count for one task event kind.
+func (s *Store) CountTaskEventsByKind(ctx context.Context, taskID string, kind string) (int, error) {
+	taskID = strings.TrimSpace(taskID)
+	kind = strings.TrimSpace(kind)
+	if taskID == "" || kind == "" {
+		return 0, nil
+	}
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM task_events
+		WHERE task_id = ? AND kind = ?`, taskID, kind).Scan(&count)
+	return count, err
+}
+
 var ErrTaskHasActiveJob = errors.New("task has a queued or running job")
 
 // CompareAndSwapTaskState atomically moves one task state without adding an

@@ -866,6 +866,9 @@ func printAgentRunUsage(w io.Writer, command string) {
 		fmt.Fprintln(w, "  --base <ref> selects the starting commit for implement worktrees; origin/* refs are fetched before resolution.")
 		fmt.Fprintln(w, "  On implement, --head-sha is a compatibility alias for --base. Different values are rejected.")
 	}
+	if command == "orchestrate" || command == "implement" || command == "run" {
+		fmt.Fprintln(w, "  --skip-native-review-fanout suppresses only competing native reviewer fan-out (#371); it does not stop review-to-fix advancement.")
+	}
 	printAgentRuntimeOverrideHelp(w)
 }
 

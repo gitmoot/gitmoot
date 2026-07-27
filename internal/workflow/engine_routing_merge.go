@@ -62,34 +62,50 @@ func validatePullRequestEvent(event PullRequestEvent) error {
 	return nil
 }
 
-func (e Engine) dispatchFix(ctx context.Context, reviewer string, payload JobPayload, result AgentResult, ref taskRef) error {
+func (e Engine) dispatchFix(ctx context.Context, reviewer string, payload JobPayload, result AgentResult, ref taskRef) (int, error) {
 	leadAgent, err := e.leadAgent(ctx, payload)
 	if err != nil {
-		return err
+		return 0, err
 	}
+	dispatchCount := 0
 	request := JobRequest{
-		PolicyExempt:  "exempt",
-		Agent:         leadAgent,
-		Action:        "implement",
-		Repo:          payload.Repo,
-		Branch:        payload.Branch,
-		PullRequest:   payload.PullRequest,
-		HeadSHA:       payload.HeadSHA,
-		GoalID:        payload.GoalID,
-		TaskID:        payload.TaskID,
-		TaskTitle:     payload.TaskTitle,
-		LeadAgent:     leadAgent,
-		Reviewers:     e.requiredReviewers(payload),
-		ReviewRound:   payload.ReviewRound,
-		Sender:        reviewer,
-		ActingOrgRole: payload.ActingOrgRole,
+		PolicyExempt:              "exempt",
+		RequireTaskNotHeld:        true,
+		AutomaticFixDispatchCount: &dispatchCount,
+		Agent:                     leadAgent,
+		Action:                    "implement",
+		Repo:                      payload.Repo,
+		Branch:                    payload.Branch,
+		PullRequest:               payload.PullRequest,
+		HeadSHA:                   payload.HeadSHA,
+		GoalID:                    payload.GoalID,
+		TaskID:                    payload.TaskID,
+		TaskTitle:                 payload.TaskTitle,
+		LeadAgent:                 leadAgent,
+		Reviewers:                 e.requiredReviewers(payload),
+		ReviewRound:               payload.ReviewRound,
+		Sender:                    reviewer,
+		ActingOrgRole:             payload.ActingOrgRole,
 		Instructions: fmt.Sprintf(
 			"Address requested changes from %s: %s",
 			reviewer,
 			result.Summary,
 		),
 	}
-	return e.dispatch(ctx, request, ref)
+	if err := e.dispatch(ctx, request, ref); err != nil {
+		return 0, err
+	}
+	if dispatchCount > 0 {
+		return dispatchCount, nil
+	}
+	// An idempotent retry can match a job that was already inserted, so the fresh
+	// transaction has no count to return. Read the same durable source in that
+	// narrow case rather than producer-supplied review metadata.
+	dispatchCount, err = e.automaticFixDispatchCount(ctx, payload.TaskID)
+	if err != nil {
+		return 0, fmt.Errorf("count automatic fix dispatches after idempotent enqueue: %w", err)
+	}
+	return dispatchCount, nil
 }
 
 func (e Engine) leadAgent(ctx context.Context, payload JobPayload) (string, error) {

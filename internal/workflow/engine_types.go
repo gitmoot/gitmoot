@@ -416,8 +416,9 @@ type Outcome struct {
 	// Reason is the merge-gate rejection reason for OutcomeBlocked (free text from
 	// merge_gates.Reason), surfaced verbatim in the negative feedback reasoning.
 	Reason string
-	// FixRounds is the review-round number at a changes_requested decision (round 1
-	// is the first), used to grade the negative: more rounds => worse score.
+	// FixRounds is the durable automatic-fix dispatch count reached by a
+	// changes_requested decision, used to grade the negative: more dispatched
+	// fixes => worse score.
 	FixRounds int
 
 	// The fields below are populated ONLY for Kind == OutcomeReviewed (the

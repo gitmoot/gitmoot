@@ -102,6 +102,105 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent)
 	return tx.Commit()
 }
 
+var (
+	ErrTaskAdvancementHeld   = errors.New("task automatic advancement is held")
+	ErrTaskAdvancementCapped = errors.New("task automatic advancement reached its fix-dispatch cap")
+)
+
+// TaskAdvancementCappedError reports the durable dispatch count observed by the
+// transaction that refused a new automatic fix.
+type TaskAdvancementCappedError struct {
+	DispatchCount int
+	MaxDispatches int
+}
+
+func (e *TaskAdvancementCappedError) Error() string {
+	return fmt.Sprintf("%v: %d automatic fixes already dispatched (maximum %d)",
+		ErrTaskAdvancementCapped, e.DispatchCount, e.MaxDispatches)
+}
+
+func (e *TaskAdvancementCappedError) Unwrap() error {
+	return ErrTaskAdvancementCapped
+}
+
+// CreateJobWithEventIfTaskNotHeld atomically orders an automatic job enqueue
+// against coordinator hold/unhold events and the durable automatic-fix count
+// for the same task. A successful transaction creates the job, its queued
+// event, and exactly one task dispatch event together.
+func (s *Store) CreateJobWithEventIfTaskNotHeld(
+	ctx context.Context,
+	job Job,
+	event JobEvent,
+	taskID string,
+	holdKind string,
+	clearKind string,
+	dispatchKind string,
+	maxDispatches int,
+) (int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	taskID = strings.TrimSpace(taskID)
+	holdKind = strings.TrimSpace(holdKind)
+	clearKind = strings.TrimSpace(clearKind)
+	dispatchKind = strings.TrimSpace(dispatchKind)
+	var latestKind string
+	err = tx.QueryRowContext(ctx, `SELECT kind FROM task_events
+		WHERE task_id = ? AND kind IN (?, ?) ORDER BY id DESC LIMIT 1`,
+		taskID, holdKind, clearKind).Scan(&latestKind)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	if latestKind == holdKind {
+		return 0, ErrTaskAdvancementHeld
+	}
+
+	var dispatchCount int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM task_events
+		WHERE task_id = ? AND kind = ?`, taskID, dispatchKind).Scan(&dispatchCount); err != nil {
+		return 0, err
+	}
+	if maxDispatches <= 0 {
+		return dispatchCount, errors.New("automatic fix dispatch limit must be positive")
+	}
+	if dispatchCount >= maxDispatches {
+		return dispatchCount, &TaskAdvancementCappedError{
+			DispatchCount: dispatchCount,
+			MaxDispatches: maxDispatches,
+		}
+	}
+
+	projection := jobProjectionFromPayload(job.Payload)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, model, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		job.ID, job.Agent, job.Type, job.State, job.Payload, job.Model,
+		jobResultHashFromPayload(job.Payload),
+		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy,
+		rootIDFromPayload(job.Payload), job.ID, projection.WorkflowID, projection.Repo, projection.PullRequest,
+		projection.BlockerRetryAt, projection.BlockerSuggestedAction); err != nil {
+		return dispatchCount, err
+	}
+	if event.JobID == "" {
+		event.JobID = job.ID
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+		return dispatchCount, err
+	}
+	dispatchCount++
+	if _, err := tx.ExecContext(ctx, `INSERT INTO task_events(task_id, kind, reason)
+		VALUES (?, ?, ?)`, taskID, dispatchKind,
+		fmt.Sprintf("automatic fix job %s queued; dispatch_count=%d", job.ID, dispatchCount)); err != nil {
+		return dispatchCount - 1, err
+	}
+	if err := tx.Commit(); err != nil {
+		return dispatchCount - 1, err
+	}
+	return dispatchCount, nil
+}
+
 // CreateExternallyDrivenJobWithEvent creates a session job (#657) whose execution
 // happens OUTSIDE the engine: it sets externally_driven = 1 so the daemon's
 // queued selector never claims it and the engine lease reaper skips it. It

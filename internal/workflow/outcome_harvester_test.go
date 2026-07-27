@@ -331,8 +331,8 @@ func TestEngineHarvestsChangesRequestedOnce(t *testing.T) {
 	if len(got) != 1 || got[0].Kind != OutcomeChangesRequested {
 		t.Fatalf("Harvest calls = %+v, want one changes_requested", got)
 	}
-	if got[0].FixRounds != 2 {
-		t.Fatalf("changes_requested fix rounds = %d, want 2 (review-2)", got[0].FixRounds)
+	if got[0].FixRounds != 1 {
+		t.Fatalf("changes_requested fix rounds = %d, want durable dispatch count 1", got[0].FixRounds)
 	}
 }
 

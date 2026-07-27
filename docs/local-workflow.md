@@ -54,6 +54,8 @@ gitmoot task run task-001 --repo owner/repo --owner lead --base main
 gitmoot task recover task-001 --owner lead   # finalize a dead implement's dirty worktree
 gitmoot task dismiss task-001 --reason "abandoned experiment"
 gitmoot task resume-work task-001 --reason "review requires another fix pass"
+gitmoot task hold task-001 --reason "coordinator inspection"
+gitmoot task unhold task-001
 gitmoot task events task-001 --json
 gitmoot task list --repo owner/repo
 gitmoot job list
@@ -120,6 +122,16 @@ a remote branch, a live job, or an uncertain remote check are not dismissed.
 `--override-pending-human-decision`. Every path refuses live jobs and worktree
 processes, preserves the branch lock, and records `task_resume_work_manual`; no
 daemon or autonomous retry invokes it.
+
+`task hold` blocks automatic review→fix advancement, and `task unhold` permits
+the next new or explicitly retried review verdict to advance. Neither command
+replays a review that already completed its held skip. They are explicit
+coordinator CLI actions, do not change task state, and record `task_hold_set_manual` /
+`task_hold_cleared_manual` in `task events`. A held task records
+`advancement_skipped_held` instead of dispatching a fix. Separately, automatic
+fixes record `automatic_fix_dispatched`; after two dispatched fixes, the third
+automatic fix attempt parks the task in `blocked` with
+`advancement_stopped_round_cap`, regardless of review-round metadata.
 
 Delegation worktrees have a separate default-on retention bound:
 `[workflow].delegation_worktree_ttl = "72h"`. Only worktrees owned by final jobs

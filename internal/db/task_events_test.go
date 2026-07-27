@@ -86,6 +86,33 @@ func TestTransitionTaskStateWithEventObservedReturnsCASSourceState(t *testing.T)
 	}
 }
 
+func TestLatestTaskEventByKinds(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	for _, event := range []TaskEvent{
+		{TaskID: "task-1", Kind: "task_hold_set_manual", Reason: "first"},
+		{TaskID: "task-1", Kind: "unrelated", Reason: "ignore"},
+		{TaskID: "task-1", Kind: "task_hold_cleared_manual", Reason: "latest"},
+	} {
+		if err := store.AddTaskEvent(ctx, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	event, found, err := store.LatestTaskEventByKinds(ctx, "task-1", "task_hold_set_manual", "task_hold_cleared_manual")
+	if err != nil || !found || event.Kind != "task_hold_cleared_manual" || event.Reason != "latest" {
+		t.Fatalf("latest event = %+v found=%v err=%v", event, found, err)
+	}
+	if event, found, err = store.LatestTaskEventByKinds(ctx, "task-2", "task_hold_set_manual"); err != nil || found || event.ID != 0 {
+		t.Fatalf("missing event = %+v found=%v err=%v", event, found, err)
+	}
+	if count, err := store.CountTaskEventsByKind(ctx, "task-1", "task_hold_set_manual"); err != nil || count != 1 {
+		t.Fatalf("hold event count = %d err=%v", count, err)
+	}
+	if count, err := store.CountTaskEventsByKind(ctx, "task-2", "task_hold_set_manual"); err != nil || count != 0 {
+		t.Fatalf("missing event count = %d err=%v", count, err)
+	}
+}
+
 func TestGuardedTaskTransitionRefusesMatchingActiveJob(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -259,6 +259,10 @@ func runTask(args []string, stdout, stderr io.Writer) int {
 		return runTaskDismiss(args[1:], stdout, stderr)
 	case "resume-work":
 		return runTaskResumeWork(args[1:], stdout, stderr)
+	case "hold":
+		return runTaskHold(args[1:], stdout, stderr, true)
+	case "unhold":
+		return runTaskHold(args[1:], stdout, stderr, false)
 	case "events":
 		return runTaskEvents(args[1:], stdout, stderr)
 	default:
@@ -274,6 +278,8 @@ func printTaskUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot task recover <id> [--owner <agent>] [--repo owner/repo] [--skip-native-review-fanout] [--json]")
 	fmt.Fprintln(w, "  gitmoot task dismiss <id> [--reason text] [--json]")
 	fmt.Fprintln(w, "  gitmoot task resume-work <id> --reason text [--override-pending-human-decision] [--json]")
+	fmt.Fprintln(w, "  gitmoot task hold <id> [--reason text] [--json]")
+	fmt.Fprintln(w, "  gitmoot task unhold <id> [--json]")
 	fmt.Fprintln(w, "  gitmoot task events <id> [--json]")
 	fmt.Fprintln(w, "  gitmoot task list [--repo owner/repo] [--state state] [--json]")
 }
@@ -532,6 +538,87 @@ type taskDismissOutput struct {
 	Source        string `json:"source"`
 	Reason        string `json:"reason"`
 	Changed       bool   `json:"changed"`
+}
+
+type taskHoldOutput struct {
+	TaskID string `json:"task_id"`
+	Held   bool   `json:"held"`
+	Source string `json:"source"`
+	Reason string `json:"reason"`
+}
+
+func runTaskHold(args []string, stdout, stderr io.Writer, held bool) int {
+	command := "hold"
+	if !held {
+		command = "unhold"
+	}
+	fs := flag.NewFlagSet("task "+command, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	jsonOutput := fs.Bool("json", false, "print hold result as JSON")
+	var reasonFlag *string
+	if held {
+		reasonFlag = fs.String("reason", "", "coordinator reason recorded in the task event trail")
+	}
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		fs.Usage()
+		if len(args) == 0 {
+			fmt.Fprintf(stderr, "task %s requires exactly one id\n", command)
+			return 2
+		}
+		return 0
+	}
+	taskID := strings.TrimSpace(args[0])
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 || taskID == "" {
+		fmt.Fprintf(stderr, "task %s requires exactly one id\n", command)
+		return 2
+	}
+	reason := "coordinator cleared the automatic review-fix hold"
+	eventKind := workflow.TaskHoldClearedManualEventKind
+	if held {
+		reason = strings.TrimSpace(*reasonFlag)
+		if reason == "" {
+			reason = "coordinator paused automatic review-fix advancement"
+		}
+		eventKind = workflow.TaskHoldSetManualEventKind
+	}
+	output := taskHoldOutput{TaskID: taskID, Held: held, Source: "manual", Reason: reason}
+	err := withStore(*home, func(store *db.Store) error {
+		if _, err := store.GetTask(context.Background(), taskID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("task %q not found", taskID)
+			}
+			return err
+		}
+		return store.AddTaskEvent(context.Background(), db.TaskEvent{
+			TaskID: taskID,
+			Kind:   eventKind,
+			Reason: reason,
+		})
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "%s task: %v\n", command, err)
+		return 1
+	}
+	if *jsonOutput {
+		if err := writeJSON(stdout, output); err != nil {
+			fmt.Fprintf(stderr, "%s task: %v\n", command, err)
+			return 1
+		}
+		return 0
+	}
+	if held {
+		fmt.Fprintf(stdout, "held automatic review-fix advancement for %s: %s\n", taskID, reason)
+	} else {
+		fmt.Fprintf(stdout, "cleared automatic review-fix hold for %s\n", taskID)
+	}
+	return 0
 }
 
 func runTaskDismiss(args []string, stdout, stderr io.Writer) int {
@@ -868,7 +955,7 @@ func runTaskRecover(args []string, stdout, stderr io.Writer) int {
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	repo := fs.String("repo", "", "repo scope as owner/repo")
 	owner := fs.String("owner", "", "registered implement-capable agent attributed as recovery lead")
-	skipFanout := fs.Bool("skip-native-review-fanout", false, "persist skip-native-review-fanout before opening the PR")
+	skipFanout := fs.Bool("skip-native-review-fanout", false, "suppress only #371 native reviewer fan-out; does not stop review-to-fix advancement")
 	jsonOutput := fs.Bool("json", false, "print recovery result as JSON")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fs.Usage()

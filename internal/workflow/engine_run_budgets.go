@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -458,24 +459,70 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 		reviewer := reviewDecisionAgent(job, payload)
 		switch payload.Result.Decision {
 		case "changes_requested":
+			ref, err = e.canonicalAdvancementTaskRef(ctx, ref)
+			if err != nil {
+				return err
+			}
+			payload.TaskID = ref.ID
+			// Explicit coordinator intent wins over the automatic cap explanation:
+			// check the hold first, then apply the hard safety ceiling.
+			held, err := e.taskAdvancementHeld(ctx, ref.ID)
+			if err != nil {
+				if stateErr := e.setTaskState(ctx, ref, TaskChangesRequested); stateErr != nil {
+					return stateErr
+				}
+				reason := fmt.Sprintf("automatic review-fix advancement skipped because coordinator hold status could not be determined: %v", err)
+				if eventErr := e.recordAutomaticFixHeldSkip(ctx, ref, reason); eventErr != nil {
+					return fmt.Errorf("determine coordinator hold status: %v; record held advancement skip: %w", err, eventErr)
+				}
+				return fmt.Errorf("determine coordinator hold status: %w", err)
+			}
+			if held {
+				if err := e.setTaskState(ctx, ref, TaskChangesRequested); err != nil {
+					return err
+				}
+				return e.recordAutomaticFixHeldSkip(ctx, ref, "automatic review-fix advancement skipped because a coordinator hold is active")
+			}
+			capEvent, capped, err := e.automaticFixRoundCapEvent(ctx, ref.ID)
+			if err != nil {
+				return fmt.Errorf("determine automatic fix round cap status: %w", err)
+			}
+			if capped {
+				return e.parkTaskForAutomaticFixCap(ctx, ref, capEvent.Reason)
+			}
 			if err := e.setTaskState(ctx, ref, TaskChangesRequested); err != nil {
 				return err
 			}
-			if err := e.dispatchFix(ctx, reviewer, payload, *payload.Result, ref); err != nil {
+			if e.BeforeAutomaticFixEnqueue != nil {
+				e.BeforeAutomaticFixEnqueue()
+			}
+			dispatchCount, err := e.dispatchFix(ctx, reviewer, payload, *payload.Result, ref)
+			if err != nil {
+				if errors.Is(err, db.ErrTaskAdvancementHeld) {
+					return e.recordAutomaticFixHeldSkip(ctx, ref, "automatic review-fix advancement skipped because a coordinator hold was set before fix dispatch")
+				}
+				if errors.Is(err, db.ErrTaskAdvancementCapped) {
+					var cappedErr *db.TaskAdvancementCappedError
+					if !errors.As(err, &cappedErr) {
+						return fmt.Errorf("automatic fix dispatch reached its cap without a durable count: %w", err)
+					}
+					return e.parkTaskForAutomaticFixCap(ctx, ref,
+						automaticFixRoundCapReason(cappedErr.DispatchCount))
+				}
 				return err
 			}
 			// Verifiable graded negative (#465): a review asked for changes, so the
 			// implement job's diff did not pass review. Harvested AFTER dispatchFix so a
 			// harvest error can never affect the (already-completed) fix dispatch. The
-			// fix-round count (the review round number, round 1 = first) grades severity:
-			// more rounds => a worse score.
+			// durable automatic-fix dispatch count grades severity: more dispatched
+			// fixes => a worse score, independent of producer-supplied round metadata.
 			e.harvestOutcomeForMergeGate(ctx, payload, Outcome{
 				Kind:        OutcomeChangesRequested,
 				Repo:        payload.Repo,
 				PullRequest: payload.PullRequest,
 				HeadSHA:     payload.HeadSHA,
 				Reason:      strings.TrimSpace(payload.Result.Summary),
-				FixRounds:   reviewRoundCount(payload.ReviewRound),
+				FixRounds:   dispatchCount,
 			})
 			return nil
 		case "approved":

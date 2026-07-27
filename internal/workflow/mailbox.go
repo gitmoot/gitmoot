@@ -141,6 +141,13 @@ type JobRequest struct {
 	ID string
 	// PolicyExempt is enqueue-only policy routing; it is never persisted.
 	PolicyExempt string
+	// RequireTaskNotHeld makes this enqueue atomically check the task's manual
+	// advancement hold and durable fix-dispatch cap. It is used only by automatic
+	// review-fix dispatch.
+	RequireTaskNotHeld bool
+	// AutomaticFixDispatchCount receives the durable count created by a fresh
+	// automatic-fix enqueue. It is enqueue-only and never persisted.
+	AutomaticFixDispatchCount *int
 	// OperatorOrigin marks a genuine human CLI dispatch. It is deliberately
 	// enqueue-only: shared local dispatch helpers also serve automated producers.
 	OperatorOrigin bool
@@ -567,7 +574,19 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 	if err != nil {
 		return db.Job{}, err
 	}
-	if err := m.Store.CreateJobWithEvent(ctx, job, db.JobEvent{JobID: job.ID, Kind: string(JobQueued), Message: "job queued"}); err != nil {
+	event := db.JobEvent{JobID: job.ID, Kind: string(JobQueued), Message: "job queued"}
+	if request.RequireTaskNotHeld {
+		var dispatchCount int
+		dispatchCount, err = m.Store.CreateJobWithEventIfTaskNotHeld(ctx, job, event, request.TaskID,
+			TaskHoldSetManualEventKind, TaskHoldClearedManualEventKind,
+			AutomaticFixDispatchedEventKind, maxAutoFixRounds-1)
+		if err == nil && request.AutomaticFixDispatchCount != nil {
+			*request.AutomaticFixDispatchCount = dispatchCount
+		}
+	} else {
+		err = m.Store.CreateJobWithEvent(ctx, job, event)
+	}
+	if err != nil {
 		return db.Job{}, err
 	}
 	if autolabeled {

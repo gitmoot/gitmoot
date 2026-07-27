@@ -889,7 +889,10 @@ gate, and records the `implemented` decision, but it enqueues **no** native
 review jobs. The skip is honored on both PR-open paths — the engine's
 implement-advance and the daemon's GitHub PR-watcher — so a PR opened either way
 stays free of native review fan-out. The flag defaults off; leave it off for the
-full native review fan-out, which is byte-identical to prior behavior.
+full native review fan-out, which is byte-identical to prior behavior. This flag
+only suppresses the competing fan-out mechanism introduced in #371. It does
+**not** stop the task-state-driven review→fix→review advancement loop; use
+`task hold` to pause that automatic advancement.
 
 When a synchronous `agent implement`/`run`/`ask`/`review`/`orchestrate` job
 delivers and **succeeds terminally** but a benign *post-success* advancement step
@@ -1464,6 +1467,8 @@ gitmoot task list --repo owner/repo --state implementing --json
 gitmoot task dismiss task-001 --reason "abandoned experiment"
 gitmoot task resume-work task-001 --reason "review requires another fix pass"
 gitmoot task resume-work task-001 --reason "withdraw pending merge" --override-pending-human-decision
+gitmoot task hold task-001 --reason "coordinator inspection"
+gitmoot task unhold task-001
 gitmoot task events task-001 --json
 ```
 
@@ -1494,6 +1499,20 @@ Repeated coordinator use can still hand-recreate an uncapped review/fix loop;
 this command does not solve that separate #1142 problem. Its distinct event
 makes such manual re-entry measurable so the automatic round-cap design can
 account for it deliberately.
+
+`task hold` and `task unhold` are explicit, coordinator-driven controls over
+automatic review→fix advancement. They do not change task state. Instead they
+append `task_hold_set_manual` and `task_hold_cleared_manual` to the permanent
+task event trail; while the latest event is a hold, a `changes_requested`
+review records `advancement_skipped_held` and dispatches no automatic fix. The
+`unhold` permits the next new or explicitly retried review verdict to advance;
+it does not replay a review that already completed its held skip. The engine
+fails closed when it cannot determine hold status. Independently, it
+records each successfully enqueued fix as `automatic_fix_dispatched`; after two
+such dispatches, the third automatic fix attempt parks the task in `blocked`
+with `advancement_stopped_round_cap`, regardless of review-round metadata.
+These commands are CLI-only coordinator actions and are not invoked by daemon
+advancement.
 
 `task events <id>` prints the append-only task lifecycle trail. Automatic stale
 dismissals use `task_dismissed_auto`; opt-in never-started-plan retirement uses
@@ -1526,7 +1545,8 @@ artifacts (a registered implement-capable agent, attributed as the recovery
 lead). A dismissed task with no branch returns directly to `planned`, so that
 path does not require `--owner`. `--repo owner/repo` is optional — it falls back
 to the task's stored repo and is only required when the task carries none.
-`--skip-native-review-fanout` persists that flag before the PR is opened;
+`--skip-native-review-fanout` persists the #371 native-reviewer-fan-out
+suppression before the PR is opened; it does not stop review→fix advancement.
 `--json` prints the machine-readable recovery result.
 
 `task recover` commits the full worktree state (`git add -A`, including

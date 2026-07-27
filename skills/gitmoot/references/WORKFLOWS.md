@@ -937,7 +937,12 @@ merge gate, and records the `implemented` decision — it simply enqueues **no**
 native review jobs. The skip is honored on both PR-open paths: the engine's
 implement-advance and the daemon's GitHub PR-watcher, so a PR opened either way
 stays free of native review fan-out. The flag defaults off; leaving it off keeps
-the full native review fan-out, byte-identical to prior behavior.
+the full native review fan-out, byte-identical to prior behavior. The flag only
+suppresses this #371 competing-fan-out path; it does not stop task-state-driven
+review→fix→review advancement. Coordinators pause that loop explicitly with
+`gitmoot task hold <id> --reason "..."`; `gitmoot task unhold <id>` permits the
+next new or explicitly retried review verdict to advance but does not replay a
+review that already completed its held skip.
 
 ## Coordinator Recipes
 

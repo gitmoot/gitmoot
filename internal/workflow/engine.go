@@ -16,6 +16,12 @@ import (
 
 type Engine struct {
 	Store *db.Store
+	// TaskHoldStatus is an optional test seam for the event-derived coordinator
+	// hold check. Production leaves it nil and reads the task event trail.
+	TaskHoldStatus func(context.Context, string) (bool, error)
+	// BeforeAutomaticFixEnqueue is an optional test seam immediately before the
+	// atomic hold-check/fix-enqueue transaction. Production leaves it nil.
+	BeforeAutomaticFixEnqueue func()
 	// RequireWorkflowPolicy is passed to every mailbox the engine creates so
 	// continuations and delegation enqueue share the same home-aware policy.
 	RequireWorkflowPolicy func(repo string) RequireWorkflowPolicy
