@@ -1448,9 +1448,12 @@ dismissals use `task_dismissed_auto`; opt-in never-started-plan retirement uses
 and `task_recovered_job_retry`. A clean closed-unmerged PR records
 `pr_closed_unmerged` while moving `pr_open`, `reviewing`, or
 `changes_requested` to `blocked`. Once advancement/delegation handling has no
-live successor, a terminal top-level implement job without a PR records
-`task_blocked_terminal_no_pr` for implemented success or
-`task_blocked_job_failed` for another terminal outcome and blocks the task.
+live successor, an implemented top-level job with no attached PR first checks
+for an existing open PR on the task branch. A match restores the task to
+`pr_open` and records `task_terminal_pushed_to_open_pr`; otherwise the task is
+blocked with `task_blocked_terminal_no_pr`, whose reason names the recoverable
+branch and recorded head SHA when available. Other terminal outcomes remain
+`task_blocked_job_failed`.
 
 ### Recover A Dead Implement
 

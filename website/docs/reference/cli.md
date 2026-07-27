@@ -1337,9 +1337,12 @@ dismissal cannot be resurrected by `task run`; explicit recovery is required.
 A clean closed-unmerged PR moves `pr_open`, `reviewing`, or
 `changes_requested` to `blocked` with `pr_closed_unmerged`; ambiguous PR state
 remains conservative. After advancement and delegation handling, a terminal
-top-level implement job with no PR and no live successor also blocks an
-`implementing` task. Implemented success without a PR records
-`task_blocked_terminal_no_pr`; other terminal outcomes record
+top-level implement job with no attached PR and no live successor checks whether
+the task branch already has an open PR. An implemented success with that binding
+returns the task to `pr_open` and records
+`task_terminal_pushed_to_open_pr`; without an open branch PR it blocks with
+`task_blocked_terminal_no_pr`, whose reason names the recoverable branch and
+recorded head SHA when available. Other terminal outcomes remain
 `task_blocked_job_failed`. Delegation children and queued fixes, retries,
 continuations, or pending advancement are not reclassified.
 
