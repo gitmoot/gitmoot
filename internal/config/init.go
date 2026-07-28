@@ -76,6 +76,15 @@ artifact_blobs = %q
 # enabled = true
 # dir = "/root/.gitmoot/cache/tools" # default: "<home>/cache/tools"
 
+# [disk_guard] prevents normal agent dispatch when the filesystem holding the
+# Gitmoot home/worktrees is below either configured free-space floor. It is
+# enabled by default. When both floors are non-zero, both must pass (the more
+# conservative floor wins). Set enabled=false only for an explicit opt-out.
+# [disk_guard]
+# enabled = true
+# min_free_bytes = 2147483648 # 2 GiB
+# min_free_percent = 5
+
 # [daemon] is the OPTIONAL warm-reloadable runtime config (issue #577). CLI flags to
 # "daemon start" / "daemon run" remain the initial value; a key here is applied only
 # where the matching flag was NOT passed (flag = override). Its real purpose is WARM

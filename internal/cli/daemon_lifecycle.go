@@ -581,6 +581,7 @@ func runDaemonStatus(args []string, stdout, stderr io.Writer) int {
 		writeLine(stdout, "%s", daemonClaudeAuthLine(paths))
 	}
 	writeLine(stdout, "%s", daemonAdmissionLine(paths))
+	writeLine(stdout, "%s", daemonDiskGuardLine(paths))
 	writeLine(stdout, "%s", daemonGitHubLimiterLine(paths))
 	writeLine(stdout, "%s", daemonPreflightFailureLine(*home))
 	if line := daemonMemoryHarvestLine(paths, *home); line != "" {

@@ -416,6 +416,31 @@ parallelism, `idle_grace_ticks`, `idle_max_multiplier`) live (#577) — no teard
 re-inheritance. Values pinned by explicit launch flags win over the re-read
 config. Prefer SIGHUP over a restart when only tuning throughput.
 
+The default-on `[disk_guard]` section pauses normal queued-job dispatch when the
+filesystem holding the Gitmoot home and worktrees has less than either
+`min_free_bytes` (default `2147483648`, 2 GiB) or `min_free_percent` (default
+`5`) available. Both checks apply when both are non-zero, so the more
+conservative floor wins:
+
+```toml
+[disk_guard]
+enabled = true
+min_free_bytes = 2147483648
+min_free_percent = 5
+```
+
+The guard fails closed: an unreadable config, missing path, `statfs` error, or
+invalid filesystem measurement pauses dispatch instead of assuming the disk is
+healthy. Paused jobs remain `queued` and retry automatically on the next healthy
+daemon pass. The daemon writes a greppable
+`DISK GUARD REFUSED JOB DISPATCH` log and a
+`dispatch_refused_disk_guard` job event containing the measured free space,
+configured floors, and measured path. `gitmoot daemon status` always reports the
+current measurement and prints `UNHEALTHY, dispatch paused` when the measurement
+cannot be established or a floor is breached. The guard applies only to normal
+agent-job dispatch; daemon maintenance/reconciliation remains runnable so an
+internal reclaim pass can free space.
+
 Claude runtime auth is independent of daemon restarts. Use `gitmoot auth set
 claude` to rotate the owner-only `runtime-auth.env`; the next delivery observes
 it. Use `gitmoot auth unset claude` to write the explicit-empty state. Do not
