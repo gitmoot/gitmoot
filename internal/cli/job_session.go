@@ -46,8 +46,8 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 	typeName := fs.String("type", "", "job type: "+strings.Join(workflow.DelegationActions, "|"))
 	title := fs.String("title", "", "optional human title for the job")
 	task := fs.String("task", "", "optional task id to associate")
-	pr := fs.Int("pr", 0, "optional pull request number")
-	headSHA := fs.String("head-sha", "", "optional pull request head SHA")
+	pr := fs.Int("pr", 0, "pull request number (required for review)")
+	headSHA := fs.String("head-sha", "", "pull request head SHA (required for review)")
 	workflowID := fs.String("workflow", "", "external-coordinator workflow label")
 	jsonOutput := fs.Bool("json", false, "print the created job as JSON")
 	if err := fs.Parse(args); err != nil {
@@ -62,6 +62,9 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 	}
 	action, ok := validateSessionAction(*typeName, stderr)
 	if !ok {
+		return 2
+	}
+	if !validateSessionReviewTarget(action, *pr, *headSHA, stderr) {
 		return 2
 	}
 	if strings.TrimSpace(*agent) == "" || strings.TrimSpace(*repo) == "" {
@@ -200,8 +203,8 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 	title := fs.String("title", "", "optional human title for the job")
 	summary := fs.String("summary", "", "optional result summary")
 	task := fs.String("task", "", "optional task id to associate")
-	pr := fs.Int("pr", 0, "optional pull request number")
-	headSHA := fs.String("head-sha", "", "optional pull request head SHA")
+	pr := fs.Int("pr", 0, "pull request number (required for review)")
+	headSHA := fs.String("head-sha", "", "pull request head SHA (required for review)")
 	branch := fs.String("branch", "", "optional branch to record")
 	jsonOutput := fs.Bool("json", false, "print the recorded job as JSON")
 	if err := fs.Parse(args); err != nil {
@@ -216,6 +219,9 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 	}
 	action, ok := validateSessionAction(*typeName, stderr)
 	if !ok {
+		return 2
+	}
+	if !validateSessionReviewTarget(action, *pr, *headSHA, stderr) {
 		return 2
 	}
 	if strings.TrimSpace(*agent) == "" || strings.TrimSpace(*repo) == "" {
@@ -307,6 +313,17 @@ func validateSessionDecision(value string, stderr io.Writer) bool {
 	}
 	fmt.Fprintf(stderr, "invalid --decision %q; want one of %s\n", value, strings.Join(workflow.ResultDecisions, ", "))
 	return false
+}
+
+func validateSessionReviewTarget(action string, pullRequest int, headSHA string, stderr io.Writer) bool {
+	if action != "review" {
+		return true
+	}
+	if pullRequest <= 0 || strings.TrimSpace(headSHA) == "" {
+		fmt.Fprintln(stderr, "session review requires both --pr and --head-sha so its exact review target is recorded")
+		return false
+	}
+	return true
 }
 
 // validateSessionAgentRepo confirms the agent and repo exist, returning the

@@ -12,6 +12,7 @@ import (
 const (
 	reviewStatusInProgress = "in_progress"
 	reviewStatusStalled    = "stalled"
+	reviewStatusUnknown    = "unknown"
 
 	// sessionReviewStaleGap is four times the existing five-minute
 	// unconfirmed-activity precedent. That leaves enough room for a substantive
@@ -31,36 +32,32 @@ func deriveReviewStatuses(ctx context.Context, store *db.Store, jobs []db.Job, n
 }
 
 // deriveReviewStatus projects liveness only for running, externally-driven
-// reviews. Every unknown is neutral: ineligible jobs, a failed note lookup, or
-// an unparseable signal timestamp omit the field rather than inventing a state.
+// reviews. Eligible reviews always get an explicit state: only a workflow note
+// observed at or after this job opened can establish in_progress or stalled;
+// missing or unreadable evidence is unknown rather than silently omitted.
 func deriveReviewStatus(ctx context.Context, store *db.Store, job db.Job, now time.Time) string {
-	if store == nil ||
-		job.Type != "review" ||
+	if job.Type != "review" ||
 		!job.ExternallyDriven ||
 		job.State != string(workflow.JobRunning) {
 		return ""
 	}
 
-	latestSignal := parseTranscriptStoreTime(job.CreatedAt)
-	if latestSignal.IsZero() {
-		return ""
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil || payload.PullRequest <= 0 || strings.TrimSpace(payload.HeadSHA) == "" {
+		return reviewStatusUnknown
 	}
-	if workflowID := strings.TrimSpace(job.WorkflowID); workflowID != "" {
-		notes, err := store.ListWorkflowNotes(ctx, workflowID, 1)
-		if err != nil {
-			return ""
-		}
-		if len(notes) > 0 {
-			noteAt := parseTranscriptStoreTime(notes[len(notes)-1].CreatedAt)
-			if noteAt.IsZero() {
-				return ""
-			}
-			// A workflow label may be reused after older notes already exist.
-			// Opening this job is itself the newer signal in that case.
-			if noteAt.After(latestSignal) {
-				latestSignal = noteAt
-			}
-		}
+	openedAt := parseTranscriptStoreTime(job.CreatedAt)
+	workflowID := strings.TrimSpace(job.WorkflowID)
+	if store == nil || openedAt.IsZero() || workflowID == "" {
+		return reviewStatusUnknown
+	}
+	notes, err := store.ListWorkflowNotes(ctx, workflowID, 1)
+	if err != nil || len(notes) == 0 {
+		return reviewStatusUnknown
+	}
+	latestSignal := parseTranscriptStoreTime(notes[len(notes)-1].CreatedAt)
+	if latestSignal.IsZero() || latestSignal.Before(openedAt) || now.UTC().Before(latestSignal) {
+		return reviewStatusUnknown
 	}
 	if now.UTC().Sub(latestSignal) > sessionReviewStaleGap {
 		return reviewStatusStalled

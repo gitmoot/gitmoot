@@ -40,6 +40,9 @@ func runAgentPrompt(args []string, stdout, stderr io.Writer) int {
 	record := fs.Bool("record", false, "open a session job for this import so the here-method work is tracked (#657); print the job id in the header and close it with `gitmoot job close`")
 	repo := fs.String("repo", "", "repo scope as owner/repo for the recorded session job (default: the agent's repo_scope); only used with --record")
 	typeName := fs.String("type", "implement", "session job type when recording: "+strings.Join(workflow.DelegationActions, "|")+"; only used with --record")
+	pr := fs.Int("pr", 0, "pull request number for a recorded review; only used with --record")
+	headSHA := fs.String("head-sha", "", "pull request head SHA for a recorded review; only used with --record")
+	workflowID := fs.String("workflow", "", "external-coordinator workflow label for the recorded session job; only used with --record")
 	id, flagArgs := leadingID(args)
 	if len(args) == 0 || containsHelpFlag(args) {
 		fs.Usage()
@@ -67,7 +70,7 @@ func runAgentPrompt(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if *record {
-		return runAgentPromptRecord(*home, id, *repo, *typeName, *jsonOutput, stdout, stderr)
+		return runAgentPromptRecord(*home, id, *repo, *typeName, *pr, *headSHA, *workflowID, *jsonOutput, stdout, stderr)
 	}
 
 	var output agentPromptOutput
@@ -110,9 +113,16 @@ func sessionCloseHint(jobID string) string {
 //   - a bare template (no agent registered): --repo owner/repo is REQUIRED (a
 //     template has no repo_scope to fall back on), and the session job records the
 //     template id as its identity (#673).
-func runAgentPromptRecord(home, id, repoFlag, typeName string, jsonOutput bool, stdout, stderr io.Writer) int {
+func runAgentPromptRecord(home, id, repoFlag, typeName string, pullRequest int, headSHA, workflowID string, jsonOutput bool, stdout, stderr io.Writer) int {
 	action, ok := validateSessionAction(typeName, stderr)
 	if !ok {
+		return 2
+	}
+	if !validateSessionReviewTarget(action, pullRequest, headSHA, stderr) {
+		return 2
+	}
+	if err := workflow.ValidateWorkflowID(workflowID); err != nil {
+		fmt.Fprintf(stderr, "agent prompt --record: %v\n", err)
 		return 2
 	}
 	ctx := context.Background()
@@ -173,11 +183,14 @@ func runAgentPromptRecord(home, id, repoFlag, typeName string, jsonOutput bool, 
 
 		engine := sessionWorkflowEngine(store, paths.Home)
 		job, err := engine.OpenExternalJob(ctx, workflow.JobRequest{
-			ID:     sessionJobID(action, identity),
-			Agent:  identity,
-			Action: action,
-			Repo:   repoName,
-			Sender: "session",
+			ID:          sessionJobID(action, identity),
+			Agent:       identity,
+			Action:      action,
+			Repo:        repoName,
+			PullRequest: pullRequest,
+			HeadSHA:     strings.TrimSpace(headSHA),
+			Sender:      "session",
+			WorkflowID:  strings.TrimSpace(workflowID),
 		})
 		if err != nil {
 			return err

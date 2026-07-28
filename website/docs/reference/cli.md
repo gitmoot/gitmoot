@@ -941,7 +941,8 @@ line naming the job id, so the imported work shows in `job list` / the dashboard
 once you clock out:
 
 ```sh
-gitmoot agent prompt frontend-reviewer --record [--repo owner/repo] [--type ask|review|implement] [--json]
+gitmoot agent prompt frontend-reviewer --record [--repo owner/repo] [--type ask|review|implement] \
+  [--pr <n> --head-sha <sha>] [--workflow <label>] [--json]
 # prints:  [gitmoot session job <id> — when this work is complete, run:
 #           gitmoot job close <id> --decision <approved|changes_requested|implemented|blocked|failed|skipped> --summary "..."]
 # followed by the prompt body.
@@ -1632,14 +1633,17 @@ gitmoot job close <id> --decision approved|changes_requested|blocked \
   --summary "..."
 ```
 
-For a running externally-driven review, `job list --json` and `job show --json`
-derive `review_status: "in_progress"|"stalled"` from the newest workflow note,
-falling back to the job's creation time. The text forms print `REVIEW:
-in_progress|stalled` and `review_status: ...`. A signal becomes stale after 20
-minutes. The field is omitted for dispatched reviews, non-review jobs, terminal
-jobs, and unknown timestamps or note-query failures. `head_sha` is also exposed
-in list JSON and the decoded `job show` payload; text output prints `head=<sha>`
-in a list row and `head_sha: <sha>` in detail.
+Session reviews require both `--pr` and `--head-sha`; their target cannot be
+changed at close. For a running externally-driven review, `job list --json` and
+`job show --json` derive `review_status:
+"in_progress"|"stalled"|"unknown"` from the newest workflow note observed at or
+after that job opened. The open timestamp alone is not activity evidence. The
+text forms print `REVIEW: in_progress|stalled|unknown` and `review_status: ...`.
+A note becomes stale after 20 minutes. Missing notes, missing workflow labels,
+invalid timestamps, and note-query failures report `unknown`. The field remains
+omitted for dispatched reviews, non-review jobs, and terminal jobs. `head_sha`
+is also exposed in list JSON and the decoded `job show` payload; text output
+prints `head=<sha>` in a list row and `head_sha: <sha>` in detail.
 
 **Make in-chat / "here" work show on the dashboard.** The one-step default is
 `gitmoot agent prompt <agent-or-template> --record`: it opens the session job *as

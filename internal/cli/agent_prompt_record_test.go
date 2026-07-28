@@ -186,6 +186,43 @@ func TestAgentPromptRecordRepoFlagOverridesScope(t *testing.T) {
 	}
 }
 
+func TestAgentPromptRecordReviewRequiresAndPersistsExactTarget(t *testing.T) {
+	home, store := seedPromptRecordFixture(t)
+
+	for _, args := range [][]string{
+		{"lead", "--record", "--type", "review", "--head-sha", "review-head", "--home", home},
+		{"lead", "--record", "--type", "review", "--pr", "7", "--home", home},
+	} {
+		var stderr bytes.Buffer
+		if code := runAgentPrompt(args, io.Discard, &stderr); code != 2 {
+			t.Fatalf("agent prompt incomplete review target exit = %d, want 2; stderr=%q", code, stderr.String())
+		}
+	}
+	if session := sessionJobsFor(t, store); len(session) != 0 {
+		t.Fatalf("incomplete review target opened %d session jobs, want 0", len(session))
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := runAgentPrompt([]string{
+		"lead", "--record", "--type", "review", "--pr", "7",
+		"--head-sha", "review-head", "--workflow", "review/prompt",
+		"--home", home, "--json",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agent prompt review --record exit = %d, stderr=%q", code, stderr.String())
+	}
+	session := sessionJobsFor(t, store)
+	if len(session) != 1 {
+		t.Fatalf("session jobs = %d, want 1", len(session))
+	}
+	payload, err := workflow.ParseJobPayload(session[0].Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload returned error: %v", err)
+	}
+	if payload.PullRequest != 7 || payload.HeadSHA != "review-head" || payload.WorkflowID != "review/prompt" {
+		t.Fatalf("recorded review target = PR %d head %q workflow %q", payload.PullRequest, payload.HeadSHA, payload.WorkflowID)
+	}
+}
+
 // TestAgentPromptRecordBareTemplateOpensSessionJob proves the #673 extension: an id
 // that resolves to a bare TEMPLATE (no registered agent of that name) plus an
 // explicit --repo opens a running externally_driven session job recorded against

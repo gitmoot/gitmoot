@@ -89,7 +89,7 @@ func TestJobCloseAppliesDecision(t *testing.T) {
 	seedSessionAgentRepo(t, store)
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"job", "open", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "review", "--json"}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"job", "open", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "ask", "--json"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("job open exit = %d, stderr=%s", code, stderr.String())
 	}
 	var opened jobSessionOutput
@@ -169,6 +169,9 @@ func TestSessionReviewStatusDistinguishesProgressAndStall(t *testing.T) {
 	open := func(typeName, workflowID, headSHA string) jobSessionOutput {
 		t.Helper()
 		args := []string{"job", "open", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", typeName, "--json"}
+		if typeName == "review" {
+			args = append(args, "--pr", "7")
+		}
 		if workflowID != "" {
 			args = append(args, "--workflow", workflowID)
 		}
@@ -187,10 +190,10 @@ func TestSessionReviewStatusDistinguishesProgressAndStall(t *testing.T) {
 	}
 
 	fresh := open("review", "review/fresh", "fresh-head")
-	stalled := open("review", "review/stalled", "")
-	noted := open("review", "review/noted", "")
+	stalled := open("review", "review/stalled", "stalled-head")
+	unknown := open("review", "review/unknown", "unknown-head")
 	otherType := open("ask", "review/ask", "")
-	terminal := open("review", "review/terminal", "")
+	terminal := open("review", "review/terminal", "terminal-head")
 
 	if err := store.CreateJobWithEvent(context.Background(), db.Job{
 		ID:      "dispatched-review",
@@ -211,14 +214,23 @@ func TestSessionReviewStatusDistinguishesProgressAndStall(t *testing.T) {
 		t.Fatalf("sql.Open returned error: %v", err)
 	}
 	defer raw.Close()
-	for _, id := range []string{stalled.JobID, noted.JobID} {
-		if _, err := raw.Exec(`UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`, old, old, id); err != nil {
-			t.Fatalf("backdate job %s: %v", id, err)
+	if _, err := raw.Exec(`UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`, old, old, stalled.JobID); err != nil {
+		t.Fatalf("backdate job %s: %v", stalled.JobID, err)
+	}
+	for _, note := range []struct {
+		workflowID string
+		body       string
+	}{
+		{"review/fresh", "reviewed fresh tests"},
+		{"review/stalled", "reviewed stale tests"},
+	} {
+		var noteOut, noteErr bytes.Buffer
+		if code := Run([]string{"workflow", "note", note.workflowID, note.body, "--home", home, "--no-auto"}, &noteOut, &noteErr); code != 0 {
+			t.Fatalf("workflow note %s exit = %d, stderr=%s", note.workflowID, code, noteErr.String())
 		}
 	}
-	var noteOut, noteErr bytes.Buffer
-	if code := Run([]string{"workflow", "note", "review/noted", "reviewed tests", "--home", home, "--no-auto"}, &noteOut, &noteErr); code != 0 {
-		t.Fatalf("workflow note exit = %d, stderr=%s", code, noteErr.String())
+	if _, err := raw.Exec(`UPDATE workflow_notes SET created_at = ? WHERE workflow_id = ?`, old, "review/stalled"); err != nil {
+		t.Fatalf("backdate stalled note: %v", err)
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -247,8 +259,8 @@ func TestSessionReviewStatusDistinguishesProgressAndStall(t *testing.T) {
 	if got := byID[stalled.JobID].ReviewStatus; got != reviewStatusStalled {
 		t.Fatalf("stalled review status = %q, want %q", got, reviewStatusStalled)
 	}
-	if got := byID[noted.JobID].ReviewStatus; got != reviewStatusInProgress {
-		t.Fatalf("noted review status = %q, want %q", got, reviewStatusInProgress)
+	if got := byID[unknown.JobID].ReviewStatus; got != reviewStatusUnknown {
+		t.Fatalf("review without an observed heartbeat = %q, want %q", got, reviewStatusUnknown)
 	}
 	for _, id := range []string{otherType.JobID, "dispatched-review", terminal.JobID} {
 		if got := byID[id].ReviewStatus; got != "" {
@@ -284,7 +296,9 @@ func TestSessionReviewStatusDistinguishesProgressAndStall(t *testing.T) {
 	if !strings.Contains(textRows, fresh.JobID+"\trunning\treview") ||
 		!strings.Contains(textRows, "\thead=fresh-head\tREVIEW: in_progress") ||
 		!strings.Contains(textRows, stalled.JobID+"\trunning\treview") ||
-		!strings.Contains(textRows, "\tREVIEW: stalled") {
+		!strings.Contains(textRows, "\tREVIEW: stalled") ||
+		!strings.Contains(textRows, unknown.JobID+"\trunning\treview") ||
+		!strings.Contains(textRows, "\tREVIEW: unknown") {
 		t.Fatalf("job list text missing review status/head badges:\n%s", textRows)
 	}
 
@@ -323,7 +337,7 @@ func TestSessionReviewStatusReusedWorkflowLabel(t *testing.T) {
 		if code := Run([]string{
 			"job", "open", "--home", home, "--agent", "lead",
 			"--repo", "owner/repo", "--type", "review",
-			"--workflow", "review/reused", "--head-sha", headSHA, "--json",
+			"--workflow", "review/reused", "--pr", "7", "--head-sha", headSHA, "--json",
 		}, &stdout, &stderr); code != 0 {
 			t.Fatalf("job open exit = %d, stderr=%s", code, stderr.String())
 		}
@@ -380,19 +394,17 @@ func TestSessionReviewStatusReusedWorkflowLabel(t *testing.T) {
 		return job
 	}
 
-	// The prior review's older note must not override review B's newer open
-	// signal. This assertion fails if the noteAt.After(createdAt) guard is
-	// removed and the older note is used unconditionally.
+	// The prior review's older note is not evidence that review B is active.
 	freshSecond := setSecondCreatedAt(now.Add(-10 * time.Minute))
-	if got := deriveReviewStatus(context.Background(), store, freshSecond, now); got != reviewStatusInProgress {
-		t.Fatalf("fresh review B with older review-A note = %q, want %q", got, reviewStatusInProgress)
+	if got := deriveReviewStatus(context.Background(), store, freshSecond, now); got != reviewStatusUnknown {
+		t.Fatalf("fresh review B with older review-A note = %q, want %q", got, reviewStatusUnknown)
 	}
 
-	// Once review B's own open signal ages past the gap, the same reused label
-	// must read stalled even though review A left a note under it.
+	// Aging the open record does not turn an unrelated prior note into review B
+	// liveness evidence.
 	staleSecond := setSecondCreatedAt(now.Add(-sessionReviewStaleGap - time.Second))
-	if got := deriveReviewStatus(context.Background(), store, staleSecond, now); got != reviewStatusStalled {
-		t.Fatalf("stale review B with older review-A note = %q, want %q", got, reviewStatusStalled)
+	if got := deriveReviewStatus(context.Background(), store, staleSecond, now); got != reviewStatusUnknown {
+		t.Fatalf("stale review B with older review-A note = %q, want %q", got, reviewStatusUnknown)
 	}
 }
 
@@ -406,7 +418,7 @@ func TestSessionReviewStatusExactStalenessBoundary(t *testing.T) {
 	if code := Run([]string{
 		"job", "open", "--home", home, "--agent", "lead",
 		"--repo", "owner/repo", "--type", "review",
-		"--workflow", "review/boundary", "--json",
+		"--workflow", "review/boundary", "--pr", "7", "--head-sha", "boundary-head", "--json",
 	}, &stdout, &stderr); code != 0 {
 		t.Fatalf("job open exit = %d, stderr=%s", code, stderr.String())
 	}
@@ -461,6 +473,35 @@ func TestSessionReviewStatusExactStalenessBoundary(t *testing.T) {
 	}
 }
 
+func TestSessionReviewStatusUnknownWhenHeartbeatCannotBeRead(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	seedSessionAgentRepo(t, store)
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{
+		"job", "open", "--home", home, "--agent", "lead",
+		"--repo", "owner/repo", "--type", "review",
+		"--workflow", "review/unreadable", "--pr", "7", "--head-sha", "review-head", "--json",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("job open exit = %d, stderr=%s", code, stderr.String())
+	}
+	var opened jobSessionOutput
+	if err := json.Unmarshal(stdout.Bytes(), &opened); err != nil {
+		t.Fatalf("decode job open JSON: %v (%s)", err, stdout.String())
+	}
+	job, err := store.GetJob(context.Background(), opened.JobID)
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	if got := deriveReviewStatus(context.Background(), store, job, time.Now().UTC()); got != reviewStatusUnknown {
+		t.Fatalf("review status after note-query failure = %q, want %q", got, reviewStatusUnknown)
+	}
+}
+
 // TestJobSessionValidationErrors proves the CLI rejects bad input cleanly.
 func TestJobSessionValidationErrors(t *testing.T) {
 	home := t.TempDir()
@@ -476,6 +517,10 @@ func TestJobSessionValidationErrors(t *testing.T) {
 		{"invalid type", []string{"job", "open", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "bogus"}, 2},
 		{"invalid decision", []string{"job", "record", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "ask", "--decision", "bogus"}, 2},
 		{"missing agent", []string{"job", "open", "--home", home, "--repo", "owner/repo", "--type", "ask"}, 2},
+		{"review missing pr", []string{"job", "open", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "review", "--head-sha", "deadbeef"}, 2},
+		{"review missing head", []string{"job", "open", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "review", "--pr", "7"}, 2},
+		{"record review missing pr", []string{"job", "record", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "review", "--decision", "approved", "--head-sha", "deadbeef"}, 2},
+		{"record review missing head", []string{"job", "record", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "review", "--decision", "approved", "--pr", "7"}, 2},
 		{"unknown agent", []string{"job", "open", "--home", home, "--agent", "ghost", "--repo", "owner/repo", "--type", "ask"}, 1},
 		{"untracked repo", []string{"job", "open", "--home", home, "--agent", "lead", "--repo", "owner/nope", "--type", "ask"}, 1},
 		{"close unknown id", []string{"job", "close", "no-such-job", "--home", home, "--decision", "approved"}, 1},

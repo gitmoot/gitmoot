@@ -180,6 +180,74 @@ func TestCloseExternalJobRecordsPRHeadAndBranch(t *testing.T) {
 	}
 }
 
+func TestOpenExternalReviewRequiresExactTarget(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"review"}, "gitmoot/gitmoot")
+	mb := Mailbox{Store: store}
+
+	for _, tc := range []struct {
+		name    string
+		request JobRequest
+	}{
+		{
+			name: "missing pull request",
+			request: JobRequest{
+				ID: "review-no-pr", Agent: "lead", Action: "review",
+				Repo: "gitmoot/gitmoot", HeadSHA: "deadbeef",
+			},
+		},
+		{
+			name: "missing head sha",
+			request: JobRequest{
+				ID: "review-no-head", Agent: "lead", Action: "review",
+				Repo: "gitmoot/gitmoot", PullRequest: 7,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := mb.OpenExternalJob(ctx, tc.request); err == nil ||
+				!strings.Contains(err.Error(), "review target") {
+				t.Fatalf("OpenExternalJob err = %v, want review-target refusal", err)
+			}
+		})
+	}
+}
+
+func TestCloseExternalReviewCannotRetarget(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"review"}, "gitmoot/gitmoot")
+	mb := Mailbox{Store: store}
+
+	for _, tc := range []struct {
+		name    string
+		pr      int
+		headSHA string
+	}{
+		{name: "pull request", pr: 8},
+		{name: "head sha", headSHA: "other-head"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := "session-review-" + strings.ReplaceAll(tc.name, " ", "-")
+			if _, err := mb.OpenExternalJob(ctx, JobRequest{
+				ID: id, Agent: "lead", Action: "review", Repo: "gitmoot/gitmoot",
+				PullRequest: 7, HeadSHA: "reviewed-head",
+			}); err != nil {
+				t.Fatalf("OpenExternalJob returned error: %v", err)
+			}
+			if _, err := mb.CloseExternalJob(ctx, id, AgentResult{Decision: "approved"}, tc.pr, tc.headSHA, ""); err == nil ||
+				!strings.Contains(err.Error(), "cannot change review target") {
+				t.Fatalf("CloseExternalJob err = %v, want immutable-target refusal", err)
+			}
+			job := mustJob(t, store, id)
+			if job.State != string(JobRunning) {
+				t.Fatalf("job state after refused retarget = %q, want running", job.State)
+			}
+		})
+	}
+}
+
 // TestCloseExternalJobErrors proves the clean-error edges: double-close, closing an
 // unknown id, closing an engine (non-session) job, and an invalid decision.
 func TestCloseExternalJobErrors(t *testing.T) {

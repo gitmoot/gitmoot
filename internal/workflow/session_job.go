@@ -26,6 +26,10 @@ func (m Mailbox) OpenExternalJob(ctx context.Context, request JobRequest) (db.Jo
 	if err := validateJobRequest(request); err != nil {
 		return db.Job{}, err
 	}
+	if request.Action == "review" &&
+		(request.PullRequest <= 0 || strings.TrimSpace(request.HeadSHA) == "") {
+		return db.Job{}, errors.New("session review target requires both a pull request and head SHA")
+	}
 
 	snapshot, err := m.templateSnapshot(ctx, request.Agent)
 	if err != nil {
@@ -104,6 +108,17 @@ func (m Mailbox) CloseExternalJob(ctx context.Context, jobID string, result Agen
 	payload, err := unmarshalPayload(job.Payload)
 	if err != nil {
 		return db.Job{}, err
+	}
+	if job.Type == "review" {
+		reviewHead := strings.TrimSpace(payload.HeadSHA)
+		overrideHead := strings.TrimSpace(headSHAOverride)
+		if payload.PullRequest <= 0 || reviewHead == "" {
+			return db.Job{}, errors.New("session review target is incomplete; it cannot be closed as a gateable review")
+		}
+		if (prOverride > 0 && prOverride != payload.PullRequest) ||
+			(overrideHead != "" && overrideHead != reviewHead) {
+			return db.Job{}, errors.New("cannot change review target while closing a session review")
+		}
 	}
 	resultCopy := result
 	payload.Result = &resultCopy
