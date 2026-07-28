@@ -45,10 +45,17 @@ type herdrOrgSnapshotResult struct {
 }
 
 type herdrOrgPane struct {
-	PaneID       string `json:"pane_id"`
-	Label        string `json:"label"`
-	AgentStatus  string `json:"agent_status"`
-	InputPending bool   `json:"input_pending"`
+	PaneID            string                  `json:"pane_id"`
+	Label             string                  `json:"label"`
+	AgentStatus       string                  `json:"agent_status"`
+	InputPending      bool                    `json:"input_pending"`
+	LastCompletedTurn *herdrCompletedTurnWire `json:"last_completed_turn"`
+}
+
+type herdrCompletedTurnWire struct {
+	Turn            *json.Number `json:"turn"`
+	TurnEpoch       *json.Number `json:"turn_epoch"`
+	CompletedUnixMS *json.Number `json:"completed_unix_ms"`
 }
 
 func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
@@ -130,6 +137,31 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 	return org.Snapshot{States: states, ObservedAt: now().UTC(), ProviderVersion: version}, nil
 }
 
+func mapHerdrCompletedTurn(turn *herdrCompletedTurnWire) *org.RoleActivity {
+	if turn == nil {
+		return nil
+	}
+	turnNumber, turnOK := positiveHerdrInt64(turn.Turn)
+	turnEpoch, epochOK := positiveHerdrInt64(turn.TurnEpoch)
+	completedUnixMS, completedOK := positiveHerdrInt64(turn.CompletedUnixMS)
+	if !turnOK || !epochOK || !completedOK {
+		return nil
+	}
+	return &org.RoleActivity{
+		Turn:        turnNumber,
+		TurnEpoch:   turnEpoch,
+		CompletedAt: time.UnixMilli(completedUnixMS).UTC(),
+	}
+}
+
+func positiveHerdrInt64(value *json.Number) (int64, bool) {
+	if value == nil {
+		return 0, false
+	}
+	parsed, err := strconv.ParseInt(value.String(), 10, 64)
+	return parsed, err == nil && parsed > 0
+}
+
 // Recycle starts a fresh interactive agent in a pane that has already returned
 // to its shell prompt. Herdr cannot safely prove or cause that transition, so
 // winding down the prior agent remains an explicit operator precondition.
@@ -178,14 +210,17 @@ func herdrKindSupportsModelFlag(kind string) bool {
 }
 
 func mapHerdrPaneState(pane herdrOrgPane) org.RoleLiveState {
+	state := mapHerdrAgentStatus(pane.AgentStatus)
+	state.Activity = mapHerdrCompletedTurn(pane.LastCompletedTurn)
 	// input_pending is orthogonal to Herdr's agent_status enum
 	// (idle/working/blocked/done/unknown). It wins whenever true because an
 	// interactive dialog prevents forward progress even if the last activity
 	// detector still reports idle or working.
 	if pane.InputPending {
-		return org.RoleLiveState{State: org.StateInputPending}
+		state.State = org.StateInputPending
+		state.Detail = ""
 	}
-	return mapHerdrAgentStatus(pane.AgentStatus)
+	return state
 }
 
 func mapHerdrAgentStatus(raw string) org.RoleLiveState {
