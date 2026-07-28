@@ -5,11 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"strings"
 
-	"github.com/gitmoot/gitmoot/internal/cockpit"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -586,13 +584,11 @@ type daemonMergeGate struct {
 	// [merge_gate] policy (#596). Empty uses the default mandatory review-and-CI
 	// merge gate.
 	Home string
-	Wake eventWakeClient
 }
 
 func newDaemonMergeGate(store *db.Store, gh github.Client, checkout, home string) daemonMergeGate {
 	return daemonMergeGate{
 		Store: store, GitHub: gh, FallbackCheckout: checkout, Home: home,
-		Wake: cockpit.New(cockpit.Options{HerdrBin: "herdr"}, nil),
 	}
 }
 
@@ -688,6 +684,10 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 	if body == "" {
 		return errors.New("format merge-gate escalation note")
 	}
+	_, addressedTarget, _, _, parsed := workflow.ParseOrgEscalateNote(body)
+	if !parsed {
+		return errors.New("parse merge-gate escalation note")
+	}
 	notes, err := g.Store.ListWorkflowNotes(ctx, label, 0)
 	if err != nil {
 		return err
@@ -699,10 +699,10 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 	}
 	if _, err := g.Store.InsertWorkflowNote(ctx, db.WorkflowNote{
 		WorkflowID: label, Author: from, Body: body, Repo: request.Repo,
+		AddressedTarget: addressedTarget,
 	}); err != nil {
 		return fmt.Errorf("record merge-gate escalation: %w", err)
 	}
-	g.wakeMergeGateEscalation(ctx, cfg, request, reason)
 	return nil
 }
 
@@ -732,38 +732,6 @@ func mergeGateEscalationFrom(cfg config.OrgConfig, repo string) string {
 		return parts[1]
 	}
 	return "gitmoot"
-}
-
-func (g daemonMergeGate) wakeMergeGateEscalation(ctx context.Context, cfg config.OrgConfig, request workflow.MergeRequest, reason string) {
-	if g.Wake == nil {
-		return
-	}
-	role, ok := cfg.Role("jarvis")
-	if !ok {
-		slog.Warn("merge-gate escalation wake skipped", "reason", "jarvis role is not configured")
-		return
-	}
-	probeCtx, cancel := context.WithTimeout(ctx, eventRuleProbeTimeout)
-	available := g.Wake.Available(probeCtx)
-	cancel()
-	if !available {
-		return
-	}
-	pane, ok := config.ResolveRolePaneBinding(ctx, role.Pane, func(resolveCtx context.Context, label string) (string, bool) {
-		bounded, cancel := context.WithTimeout(resolveCtx, eventRuleProbeTimeout)
-		defer cancel()
-		return g.Wake.ResolvePaneByLabel(bounded, label)
-	})
-	if !ok {
-		return
-	}
-	prompt := fmt.Sprintf("Merge safety escalation for %s#%d: %s", request.Repo, request.PullRequest, reason)
-	callCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), eventRuleWakeTimeout)
-	defer cancel()
-	delivered, stalled, err := g.Wake.AgentPrompt(callCtx, pane, prompt, "")
-	if err != nil || stalled || !delivered {
-		slog.Warn("merge-gate escalation wake not delivered", "repo", request.Repo, "pull_request", request.PullRequest, "error", err)
-	}
 }
 
 func nativeMergeGateDisabled() bool {

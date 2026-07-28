@@ -948,6 +948,11 @@ func runOrgEscalate(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "org escalate question must produce a note of at most %d bytes\n", workflowNoteBodyMax)
 		return 2
 	}
+	_, addressedTarget, _, _, parsed := workflow.ParseOrgEscalateNote(body)
+	if !parsed {
+		fmt.Fprintln(stderr, "org escalate: formatted escalation could not be parsed")
+		return 1
+	}
 	if err := withStore(*home, func(store *db.Store) error {
 		count, err := store.CountJobsByWorkflow(context.Background(), label)
 		if err != nil {
@@ -958,6 +963,7 @@ func runOrgEscalate(args []string, stdout, stderr io.Writer) int {
 		}
 		_, err = store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
 			WorkflowID: label, Author: from, Body: body, Repo: strings.TrimSpace(*repo),
+			AddressedTarget: addressedTarget,
 		})
 		return err
 	}); err != nil {
@@ -1121,6 +1127,7 @@ var eventRuleKinds = map[string]struct{}{
 	"blocked":            {},
 	"recycle-overdue":    {},
 	"pane_input_pending": {},
+	"reply":              {},
 }
 
 func runOrgEvents(args []string, stdout, stderr io.Writer) int {
@@ -1153,7 +1160,7 @@ func runOrgEventRuleAdd(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("org events rule add", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	onKind := fs.String("on", "", "event kind: escalation, attention, guard, job-terminal, blocked, recycle-overdue, or pane_input_pending")
+	onKind := fs.String("on", "", "event kind: escalation, attention, guard, job-terminal, blocked, recycle-overdue, pane_input_pending, or reply")
 	// V1 intentionally keeps matching simple and inspectable: one
 	// case-insensitive substring tested independently against repo and job id;
 	// an empty filter matches every event of the selected kind.
@@ -1181,7 +1188,7 @@ func runOrgEventRuleAdd(args []string, stdout, stderr io.Writer) int {
 	}
 	kind := strings.ToLower(strings.TrimSpace(*onKind))
 	if _, ok := eventRuleKinds[kind]; !ok {
-		fmt.Fprintf(stderr, "unknown event rule kind %q; want escalation, attention, guard, job-terminal, blocked, recycle-overdue, or pane_input_pending\n", kind)
+		fmt.Fprintf(stderr, "unknown event rule kind %q; want escalation, attention, guard, job-terminal, blocked, recycle-overdue, pane_input_pending, or reply\n", kind)
 		return 2
 	}
 	roleName := strings.ToLower(strings.TrimSpace(*wake))

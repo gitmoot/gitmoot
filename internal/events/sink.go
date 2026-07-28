@@ -64,6 +64,9 @@ const (
 	// EventOrgInputPending is emitted when a Herdr pane bound to an organization
 	// role remains at an interactive input dialog past the configured threshold.
 	EventOrgInputPending EventType = "org.input_pending"
+	// EventOrgReply is emitted by the daemon for a durable, coalesced batch of
+	// notes addressed to one organization role.
+	EventOrgReply EventType = "org.reply"
 
 	// EventCandidateAwaitingPromotion is emitted once when a SkillOpt template
 	// candidate becomes PENDING (the post-import notify, #471): a new pending
@@ -135,6 +138,10 @@ type Event struct {
 	// EventType. It is assigned by trusted emit sites and deliberately bypasses
 	// free-text redaction and path scrubbing.
 	Cause string `json:"cause,omitempty"`
+	// WakeTargetRole and WakeOutboxIDs are internal delivery metadata for the
+	// durable wake drain. They never alter the public event JSON contract.
+	WakeTargetRole string  `json:"-"`
+	WakeOutboxIDs  []int64 `json:"-"`
 }
 
 // Sink is the injected, best-effort outbound seam the engine and daemon call

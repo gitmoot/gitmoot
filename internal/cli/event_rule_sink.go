@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -59,42 +60,76 @@ func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
 	// slow earlier rule cannot starve a later rule's wake.
 	base := context.WithoutCancel(ctx)
 	go func() {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				slog.Warn("org event wake panicked", "job_id", event.JobID, "error", recovered)
-			}
-		}()
-		s.evaluate(base, event)
+		if err := s.evaluateSafely(base, event, nil); err != nil {
+			slog.Warn("org event wake failed", "job_id", event.JobID, "error", err)
+		}
 	}()
 }
 
-func (s *eventRuleSink) evaluate(ctx context.Context, event events.Event) {
-	kinds := classifyEventRuleKinds(event)
-	if len(kinds) == 0 {
-		return
+// emitWakeOutbox evaluates one already-claimed durable wake synchronously. The
+// daemon tick is the delivery owner after the short-lived producer exits, so it
+// must not return while an untracked goroutine still owns the attempted row.
+// Ordinary event emissions retain Emit's detached, best-effort behavior.
+func (s *eventRuleSink) emitWakeOutbox(ctx context.Context, event events.Event, rules []db.EventRule) error {
+	if s == nil {
+		return fmt.Errorf("event-rule sink is nil")
 	}
+	events.EmitEvent(ctx, s.inner, event)
+	if s.store == nil || s.wake == nil {
+		return fmt.Errorf("event-rule sink is not configured for durable delivery")
+	}
+	return s.evaluateSafely(context.WithoutCancel(ctx), event, rules)
+}
+
+func (s *eventRuleSink) evaluateSafely(ctx context.Context, event events.Event, rules []db.EventRule) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			slog.Warn("org event wake panicked", "job_id", event.JobID, "error", recovered)
+			panicErr := fmt.Errorf("event-rule wake panicked: %v", recovered)
+			err = errors.Join(panicErr, s.finishWakeOutbox(ctx, event, db.WakeOutboxStateFailed, panicErr.Error()))
+		}
+	}()
+	if rules == nil {
+		return s.evaluate(ctx, event)
+	}
+	return s.evaluateRules(ctx, event, rules)
+}
+
+func (s *eventRuleSink) evaluate(ctx context.Context, event events.Event) error {
 	rules, err := s.store.ListEventRules(ctx)
 	if err != nil {
 		slog.Warn("org event rules list failed", "job_id", event.JobID, "error", err)
-		return
+		return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, err.Error(), err)
+	}
+	return s.evaluateRules(ctx, event, rules)
+}
+
+func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, rules []db.EventRule) error {
+	kinds := classifyEventRuleKinds(event)
+	if len(kinds) == 0 {
+		return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "event was not classifiable", errors.New("event was not classifiable"))
 	}
 	if !hasEnabledEventRule(rules) {
-		return
+		return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "no enabled event rule", errors.New("no enabled event rule"))
 	}
 	// Any matching rule needs herdr; probe once under its own bounded context.
 	probeCtx, probeCancel := context.WithTimeout(ctx, eventRuleProbeTimeout)
 	available := s.wake.Available(probeCtx)
 	probeCancel()
 	if !available {
-		return
+		return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "herdr unavailable", errors.New("herdr unavailable"))
 	}
 	// Load the org registry ONCE per event, not once per matching rule.
 	cfg, ok := s.loadOrgConfig()
 	if !ok {
-		return
+		return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "organization registry unavailable", errors.New("organization registry unavailable"))
 	}
+	isReply := event.Type == events.EventOrgReply
 	for _, rule := range rules {
 		if !rule.Enabled || !containsEventRuleKind(kinds, rule.OnKind) || !eventRuleMatches(rule.MatchFilter, event) {
+			continue
+		}
+		if isReply && !strings.EqualFold(strings.TrimSpace(rule.WakeRole), strings.TrimSpace(event.WakeTargetRole)) {
 			continue
 		}
 		pane, ok := s.resolveRolePane(ctx, cfg, rule.WakeRole)
@@ -121,6 +156,9 @@ func (s *eventRuleSink) evaluate(ctx context.Context, event events.Event) {
 			}
 			ccancel()
 			slog.Info("org event wake delivered", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "delivered", true)
+			if err := s.finishWakeOutbox(ctx, event, db.WakeOutboxStateDelivered, ""); err != nil {
+				return err
+			}
 		case stalled:
 			counterCtx, ccancel := context.WithTimeout(ctx, eventRuleProbeTimeout)
 			if incrementErr := s.store.IncrementRoleMissedWake(counterCtx, rule.WakeRole, time.Now().UTC()); incrementErr != nil {
@@ -128,16 +166,51 @@ func (s *eventRuleSink) evaluate(ctx context.Context, event events.Event) {
 			}
 			ccancel()
 			slog.Info("org event wake stalled", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "delivered", false)
+			if err := s.finishWakeOutbox(ctx, event, db.WakeOutboxStateStalled, "agent_prompt_stalled"); err != nil {
+				return err
+			}
 		case err != nil:
 			// A Herdr outage is infrastructure failure, not a role ignoring a wake;
 			// it must not falsely increment every role's missed-wake counter.
 			slog.Warn("org event wake failed", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "error", err)
+			return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, err.Error(), err)
 		default:
 			// An odd non-delivery is not proof that the role ignored a delivered
 			// prompt, so leave the counter unchanged just as for infrastructure errors.
 			slog.Info("org event wake not delivered", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "delivered", false)
+			return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "agent prompt was not delivered", errors.New("agent prompt was not delivered"))
+		}
+		// A coalesced reply batch targets one serial pane. Even if duplicate
+		// matching rules exist, one rule gets one attempt for this window.
+		if isReply {
+			return nil
 		}
 	}
+	if isReply {
+		return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "no matching reply rule or role binding", errors.New("no matching reply rule or role binding"))
+	}
+	return nil
+}
+
+func (s *eventRuleSink) completeWakeOutbox(ctx context.Context, event events.Event, state, detail string, cause error) error {
+	finishErr := s.finishWakeOutbox(ctx, event, state, detail)
+	if len(event.WakeOutboxIDs) == 0 {
+		return finishErr
+	}
+	return errors.Join(cause, finishErr)
+}
+
+func (s *eventRuleSink) finishWakeOutbox(ctx context.Context, event events.Event, state, detail string) error {
+	if s == nil || s.store == nil || len(event.WakeOutboxIDs) == 0 {
+		return nil
+	}
+	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), eventRuleProbeTimeout)
+	defer cancel()
+	if err := s.store.FinishWakeOutbox(finishCtx, event.WakeOutboxIDs, state, detail, time.Now().UTC()); err != nil {
+		slog.Warn("wake outbox state update failed", "job_id", event.JobID, "state", state, "error", err)
+		return fmt.Errorf("finish wake outbox as %s: %w", state, err)
+	}
+	return nil
 }
 
 // loadOrgConfig reads the org registry once per event. Best-effort: a missing or
@@ -196,6 +269,8 @@ func classifyEventRuleKinds(event events.Event) []string {
 		return []string{"recycle-overdue"}
 	case events.EventOrgInputPending:
 		return []string{"pane_input_pending"}
+	case events.EventOrgReply:
+		return []string{"reply"}
 	}
 	return nil
 }

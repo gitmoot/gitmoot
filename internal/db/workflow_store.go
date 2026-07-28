@@ -62,11 +62,14 @@ var workflowIssueReferencePattern = regexp.MustCompile(`#([1-9][0-9]*)`)
 
 // WorkflowNote is one append-only external-coordinator journal entry.
 type WorkflowNote struct {
-	ID                  int64  `json:"id"`
-	WorkflowID          string `json:"workflow_id"`
-	Author              string `json:"author,omitempty"`
-	Body                string `json:"body"`
-	Repo                string `json:"repo,omitempty"`
+	ID         int64  `json:"id"`
+	WorkflowID string `json:"workflow_id"`
+	Author     string `json:"author,omitempty"`
+	Body       string `json:"body"`
+	Repo       string `json:"repo,omitempty"`
+	// AddressedTarget is write-only routing metadata. The CLI parses typed note
+	// bodies and sets it; db must not import workflow merely to rediscover it.
+	AddressedTarget     string `json:"-"`
 	MemoryObservationID int64  `json:"memory_observation_id,omitempty"`
 	CreatedAt           string `json:"created_at"`
 }
@@ -410,7 +413,16 @@ VALUES (?, ?, ?, ?, ?)`, note.WorkflowID, note.Author, note.Body, note.Repo, not
 	if err != nil {
 		return 0, fmt.Errorf("insert workflow note: %w", err)
 	}
-	return res.LastInsertId()
+	noteID, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if note.AddressedTarget != "" {
+		if err := insertWorkflowNoteWakeOutboxTx(ctx, tx, noteID, note.AddressedTarget); err != nil {
+			return 0, err
+		}
+	}
+	return noteID, nil
 }
 
 func upsertWorkflowMetaTx(ctx context.Context, tx *sql.Tx, meta WorkflowMeta) error {

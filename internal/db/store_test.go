@@ -56,6 +56,7 @@ func TestOpenMigratesSchema(t *testing.T) {
 		"skillopt_binary_verdicts",
 		"merge_gate_ci_observations",
 		"job_gates",
+		"wake_outbox",
 	} {
 		ok, err := store.HasTable(ctx, table)
 		if err != nil {

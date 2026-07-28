@@ -111,6 +111,27 @@ func (w jobWorker) eventSink() events.Sink {
 	return daemonEventSink(w.Store, w.workflowHome())
 }
 
+// replyWakeDelivery resolves one authoritative, batch-scoped rules snapshot and
+// the sink built from it. The outbox invokes this immediately before each claim
+// and passes the same snapshot through delivery, so authorization cannot outlive
+// its batch and routing cannot become unreadable after claim.
+func (w jobWorker) replyWakeDelivery(ctx context.Context) (replyWakeDelivery, error) {
+	if w.Store == nil {
+		return replyWakeDelivery{}, errors.New("wake outbox store is required")
+	}
+	rules, err := w.Store.ListEventRules(ctx)
+	if err != nil {
+		return replyWakeDelivery{}, fmt.Errorf("list event rules: %w", err)
+	}
+	if w.EventSinkOverride != nil {
+		return replyWakeDelivery{sink: w.EventSinkOverride, rules: rules}, nil
+	}
+	return replyWakeDelivery{
+		sink:  resolveDaemonEventSinkWithRules(w.Store, w.workflowHome(), rules),
+		rules: rules,
+	}, nil
+}
+
 type tempWorkerEligibility struct {
 	Eligible bool
 	Reason   string

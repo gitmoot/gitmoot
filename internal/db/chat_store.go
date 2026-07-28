@@ -343,6 +343,8 @@ func seqConflictBackoff(attempt int) {
 // retry). We wrap the whole read-modify-write tx in a bounded retry that recomputes
 // the seq on such a conflict, so a cross-process race is resolved transparently
 // instead of dropping the daemon's back-link or spuriously failing a human send.
+// Addressed chat messages write their wake-outbox rows in this same transaction;
+// non-chat back-links remain non-triggering.
 // It also stamps ts_ms with unix-millis and origin/author_origin with this DB's
 // home_id, and builds the deterministic canonical envelope_json. The returned
 // message carries the assigned id/seq/ts_ms/origin/envelope.
@@ -448,6 +450,12 @@ func (s *Store) AddChatMessage(ctx context.Context, msg ChatMessage) (ChatMessag
 				msg.ID, msg.Origin, msg.ThreadID, msg.Seq, msg.TsMs, msg.AuthorKind, msg.AuthorName, msg.AuthorOrigin,
 				msg.Kind, msg.Body, msg.EnvelopeJSON, string(refsJSON), strings.TrimSpace(msg.ReplyTo), strings.TrimSpace(msg.PromotedJobID)); err != nil {
 				return err
+			}
+
+			if msg.Kind == ChatKindChat {
+				if err := insertChatMessageWakeOutboxTx(ctx, tx, msg.ID, msg.Mentions); err != nil {
+					return err
+				}
 			}
 
 			// Bump the thread's activity clock so ListChatThreads orders by recency.

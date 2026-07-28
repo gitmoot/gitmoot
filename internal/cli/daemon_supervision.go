@@ -694,6 +694,12 @@ func allocateHeartbeatImplement(ctx context.Context, store *db.Store, home strin
 // never drift from the deployed one.
 func startSingleRepoWorkerLoop(ctx context.Context, interval time.Duration, store *db.Store, worker jobWorker, live *daemonReloadableConfig, checkoutLock *sync.Mutex, tracker *inflightJobTracker, repo string, rootFilter string, stdout io.Writer) <-chan error {
 	return startSupervisorWorkerLoopRecovering(ctx, interval, stdout, func(now time.Time) error {
+		// The durable reply outbox is store-global maintenance. Run it once at
+		// the supervisor boundary, outside the repository tick, matching the
+		// multi-repo fleet loop.
+		if err := drainFleetReplyWakeOutbox(ctx, store, worker, now); err != nil {
+			return err
+		}
 		// The checkout lock now guards the TICK (maintenance + claim/dispatch),
 		// not whole job runs: dispatched jobs execute on their own goroutines
 		// after this returns, tracked by the in-flight tracker (#562). Holding it

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,6 +43,29 @@ var eventSinkCache = struct {
 // observable without coupling the events package to the db layer or ever
 // blocking the caller.
 func daemonEventSink(store *db.Store, home string) events.Sink {
+	sink, _ := resolveDaemonEventSink(context.Background(), store, home)
+	return sink
+}
+
+// resolveDaemonEventSink exposes event-rule read failures to callers that own
+// durable delivery. Ordinary event emission uses daemonEventSink's historical
+// best-effort wrapper; the wake outbox tick must distinguish "rules disabled"
+// from "rules unreadable" so pending delivery work never looks healthy.
+func resolveDaemonEventSink(ctx context.Context, store *db.Store, home string) (events.Sink, error) {
+	if store == nil {
+		return resolveDaemonEventSinkWithRules(store, home, nil), nil
+	}
+	rules, err := store.ListEventRules(ctx)
+	if err != nil {
+		return resolveDaemonEventSinkWithRules(store, home, nil), fmt.Errorf("list event rules: %w", err)
+	}
+	return resolveDaemonEventSinkWithRules(store, home, rules), nil
+}
+
+// resolveDaemonEventSinkWithRules builds the delivery sink from a rules
+// snapshot already read by the caller. The durable outbox uses this form so it
+// never re-reads routing state after claiming rows.
+func resolveDaemonEventSinkWithRules(store *db.Store, home string, rules []db.EventRule) events.Sink {
 	home = strings.TrimSpace(home)
 	eventSinkCache.Lock()
 	webhook, built := eventSinkCache.webhooks[home]
@@ -57,8 +81,7 @@ func daemonEventSink(store *db.Store, home string) events.Sink {
 	if store == nil {
 		return webhook
 	}
-	rules, err := store.ListEventRules(context.Background())
-	if err != nil || !hasEnabledEventRule(rules) {
+	if !hasEnabledEventRule(rules) {
 		return webhook
 	}
 	key := home + "\x00" + store.DatabasePath()
