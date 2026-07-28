@@ -869,7 +869,7 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 	// any repository. Drain before listing repos so zero enabled repos cannot
 	// suppress delivery or hide an unreadable outbox behind a healthy fleet tick.
 	if err := drainFleetReplyWakeOutbox(ctx, store, worker, now); err != nil {
-		return err
+		writeLine(stdout, "reply wake outbox drain unhealthy: %v", err)
 	}
 	repos, err := store.ListRepos(ctx)
 	if err != nil {
