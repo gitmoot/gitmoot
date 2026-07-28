@@ -1009,7 +1009,7 @@ func TestPrintJobRendersFailureDiagnosticsBlock(t *testing.T) {
 		},
 	}
 
-	printJob(&buf, db.Job{ID: "job-x", State: "failed", Type: "review", Agent: "audit"}, payload, stuckReason{}, false)
+	printJob(&buf, db.Job{ID: "job-x", State: "failed", Type: "review", Agent: "audit"}, payload, stuckReason{}, false, "")
 
 	out := buf.String()
 	for _, want := range []string{
@@ -1030,7 +1030,7 @@ func TestPrintJobRendersFailureDiagnosticsBlock(t *testing.T) {
 func TestPrintJobOmitsFailureDiagnosticsWhenAbsent(t *testing.T) {
 	var buf bytes.Buffer
 
-	printJob(&buf, db.Job{ID: "job-y", State: "succeeded", Type: "review", Agent: "audit"}, workflow.JobPayload{Repo: "owner/repo"}, stuckReason{}, false)
+	printJob(&buf, db.Job{ID: "job-y", State: "succeeded", Type: "review", Agent: "audit"}, workflow.JobPayload{Repo: "owner/repo"}, stuckReason{}, false, "")
 
 	if strings.Contains(buf.String(), "failure_diagnostics:") {
 		t.Fatalf("job show output has a failure diagnostics block for a healthy job:\n%s", buf.String())
