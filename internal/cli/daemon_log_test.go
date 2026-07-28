@@ -146,6 +146,9 @@ func TestDaemonStatusFreshLogPreservesExistingOutput(t *testing.T) {
 	paths := stageLiveDaemon(t, home, "dev-log-test", "logtest0")
 	stubOnDiskBuild(t, "dev-log-test", "logtest0")
 	state := daemonProcessState(paths)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 100 << 30, FreeBytes: 20 << 30}, nil
+	})
 
 	started := time.Date(2026, 7, 27, 8, 30, 0, 0, time.UTC)
 	lastWrite := started
