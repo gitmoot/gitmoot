@@ -257,6 +257,8 @@ func runTask(args []string, stdout, stderr io.Writer) int {
 		return runTaskRecover(args[1:], stdout, stderr)
 	case "dismiss":
 		return runTaskDismiss(args[1:], stdout, stderr)
+	case "resume-work":
+		return runTaskResumeWork(args[1:], stdout, stderr)
 	case "events":
 		return runTaskEvents(args[1:], stdout, stderr)
 	default:
@@ -271,6 +273,7 @@ func printTaskUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot task run <id> --repo owner/repo --owner <agent> [--branch <branch>] [--base <branch>] [--workflow <label>] [--org-role <role>]")
 	fmt.Fprintln(w, "  gitmoot task recover <id> [--owner <agent>] [--repo owner/repo] [--skip-native-review-fanout] [--json]")
 	fmt.Fprintln(w, "  gitmoot task dismiss <id> [--reason text] [--json]")
+	fmt.Fprintln(w, "  gitmoot task resume-work <id> --reason text [--override-pending-human-decision] [--json]")
 	fmt.Fprintln(w, "  gitmoot task events <id> [--json]")
 	fmt.Fprintln(w, "  gitmoot task list [--repo owner/repo] [--state state] [--json]")
 }
@@ -565,7 +568,8 @@ func runTaskDismiss(args []string, stdout, stderr io.Writer) int {
 	}
 	output := taskDismissOutput{TaskID: taskID, State: string(workflow.TaskDismissed), Source: "manual", Reason: reason}
 	err := withStore(*home, func(store *db.Store) error {
-		task, err := store.GetTask(context.Background(), taskID)
+		ctx := context.Background()
+		task, err := store.GetTask(ctx, taskID)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("task %q not found", taskID)
@@ -646,20 +650,157 @@ func taskDismissRefusal(task db.Task) error {
 	if state == "" {
 		state = "unknown"
 	}
+	return fmt.Errorf("task %s is in state %s; task dismiss only supports implementing or blocked tasks because this state is owned by %s", task.ID, state, taskStateOwner(state))
+}
+
+type taskResumeWorkOutput struct {
+	TaskID                       string `json:"task_id"`
+	PreviousState                string `json:"previous_state"`
+	State                        string `json:"state"`
+	Source                       string `json:"source"`
+	Reason                       string `json:"reason"`
+	OverridePendingHumanDecision bool   `json:"override_pending_human_decision"`
+	Changed                      bool   `json:"changed"`
+}
+
+func runTaskResumeWork(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("task resume-work", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	reasonFlag := fs.String("reason", "", "coordinator reason recorded in the task event trail")
+	overridePendingHuman := fs.Bool("override-pending-human-decision", false, "acknowledge overriding a pending human merge decision")
+	jsonOutput := fs.Bool("json", false, "print resume-work result as JSON")
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		fs.Usage()
+		if len(args) == 0 {
+			fmt.Fprintln(stderr, "task resume-work requires exactly one id")
+			return 2
+		}
+		return 0
+	}
+	taskID := strings.TrimSpace(args[0])
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 || taskID == "" {
+		fmt.Fprintln(stderr, "task resume-work requires exactly one id")
+		return 2
+	}
+	reason := strings.TrimSpace(*reasonFlag)
+	output := taskResumeWorkOutput{
+		TaskID: taskID, State: string(workflow.TaskImplementing), Source: "manual",
+		Reason: reason,
+	}
+	err := withStore(*home, func(store *db.Store) error {
+		ctx := context.Background()
+		task, err := store.GetTask(ctx, taskID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("task %q not found", taskID)
+			}
+			return err
+		}
+		output.PreviousState = task.State
+		if !taskResumeWorkEligibleState(task.State) {
+			return taskResumeWorkRefusal(task)
+		}
+		if reason == "" {
+			return fmt.Errorf("task resume-work requires --reason for task %s", task.ID)
+		}
+		awaitingHumanMerge := workflow.TaskState(strings.TrimSpace(task.State)) == workflow.TaskAwaitingHumanMerge
+		if awaitingHumanMerge && !*overridePendingHuman {
+			return fmt.Errorf("task %s is awaiting a human merge decision; pass --override-pending-human-decision with --reason to resume development", task.ID)
+		}
+		output.OverridePendingHumanDecision = awaitingHumanMerge && *overridePendingHuman
+		if live, ok, err := workflow.FindLiveTaskJob(ctx, store, task); err != nil {
+			return err
+		} else if ok {
+			return fmt.Errorf("task %s still has live job %s (%s); wait for it to settle or cancel it before resuming work", task.ID, live.ID, live.State)
+		}
+		if strings.TrimSpace(task.WorktreePath) != "" {
+			live, known := taskWorktreeLiveness(task.WorktreePath)
+			if live {
+				return fmt.Errorf("task %s worktree %s still has a live process; wait for it to exit or stop it before resuming work", task.ID, task.WorktreePath)
+			}
+			if !known {
+				return fmt.Errorf("task %s worktree %s process liveness could not be determined; verify no process is using it before resuming work", task.ID, task.WorktreePath)
+			}
+		}
+		eventReason := reason
+		if output.OverridePendingHumanDecision {
+			eventReason += "; override_pending_human_decision=true"
+		}
+		changed, current, err := store.TransitionTaskStateWithEventIfNoActiveJob(ctx, task.ID,
+			[]string{strings.TrimSpace(task.State)},
+			string(workflow.TaskImplementing), "task_resume_work_manual", eventReason)
+		if err != nil {
+			if errors.Is(err, db.ErrTaskHasActiveJob) {
+				return fmt.Errorf("task %s gained a queued or running job while resuming work; wait for it to settle or cancel it before retrying: %w", task.ID, err)
+			}
+			return err
+		}
+		if !changed {
+			return fmt.Errorf("task %s changed from %s to %s while resuming work; retry after inspecting it", task.ID, task.State, current)
+		}
+		output.Changed = true
+		return nil
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "resume task work: %v\n", err)
+		return 1
+	}
+	if *jsonOutput {
+		if err := writeJSON(stdout, output); err != nil {
+			fmt.Fprintf(stderr, "resume task work: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	fmt.Fprintf(stdout, "resumed work on %s from %s: %s\n", output.TaskID, output.PreviousState, output.Reason)
+	return 0
+}
+
+func taskResumeWorkEligibleState(state string) bool {
+	switch workflow.TaskState(strings.TrimSpace(state)) {
+	case workflow.TaskReviewing, workflow.TaskReadyToMerge, workflow.TaskAwaitingHumanMerge:
+		return true
+	default:
+		return false
+	}
+}
+
+func taskResumeWorkRefusal(task db.Task) error {
+	state := strings.TrimSpace(task.State)
+	if state == "" {
+		state = "unknown"
+	}
+	return fmt.Errorf("task %s is in state %s; task resume-work only supports reviewing, ready_to_merge, or awaiting_human_merge because this state is owned by %s", task.ID, state, taskStateOwner(state))
+}
+
+func taskStateOwner(state string) string {
 	owner := "other workflow machinery"
 	switch workflow.TaskState(state) {
 	case workflow.TaskPlanned:
 		owner = "task run/implement dispatch"
-	case workflow.TaskPullRequestOpen, workflow.TaskReviewing, workflow.TaskChangesRequested, workflow.TaskReadyToMerge:
+	case workflow.TaskImplementing, workflow.TaskBlocked:
+		owner = "active implementation and recovery machinery"
+	case workflow.TaskPullRequestOpen, workflow.TaskReviewing, workflow.TaskReadyToMerge:
 		owner = "pull-request review and merge machinery"
+	case workflow.TaskChangesRequested:
+		owner = "implement fix-pass dispatch"
 	case workflow.TaskAwaitingHumanMerge:
 		owner = "the human merge decision"
 	case workflow.TaskMerged:
 		owner = "the terminal merge record"
 	case workflow.TaskAwaitingHuman:
 		owner = "the explicit human-resume machinery"
+	case workflow.TaskDismissed:
+		owner = "explicit task recovery"
 	}
-	return fmt.Errorf("task %s is in state %s; task dismiss only supports implementing or blocked tasks because this state is owned by %s", task.ID, state, owner)
+	return owner
 }
 
 func runTaskEvents(args []string, stdout, stderr io.Writer) int {

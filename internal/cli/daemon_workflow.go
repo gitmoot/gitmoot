@@ -159,7 +159,10 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 		// rather than inside the repo checkout, so generated briefs stay out of
 		// the tracked tree and are never committed.
 		engine.ArtifactRoot = home
-		engine.BeforeReadOnlyWorktreeCleanup = pipeline.PipelineServiceArtifactPrecleanupHook(store, config.Paths{Home: home})
+		engine.BeforeReadOnlyWorktreeCleanup = composeBeforeReadOnlyWorktreeCleanupHooks(
+			pipeline.PipelineServiceArtifactPrecleanupHook(store, config.Paths{Home: home}),
+			askReviewDiffPrecleanupHook(store),
+		)
 	}
 	if strings.TrimSpace(home) != "" && strings.TrimSpace(checkout) != "" {
 		engine.Home = home

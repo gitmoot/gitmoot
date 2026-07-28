@@ -29,6 +29,19 @@ running job whose directly recorded runtime PID is confirmably dead is a
 required `stuck jobs` failure; legacy jobs with no recorded PID and hosts where
 process identity cannot be verified are neutral and produce no ghost-job
 finding.
+It also reports the SQLite auto-vacuum mode. New homes use bounded incremental
+reclaim automatically. A legacy home remains a non-blocking warning until an
+operator deliberately converts it during an idle maintenance window:
+
+```sh
+sqlite3 "$HOME/.gitmoot/gitmoot.db" \
+  'PRAGMA auto_vacuum=INCREMENTAL; VACUUM;'
+```
+
+The one-time command fully rewrites the database; the daemon never runs a full
+`VACUUM` automatically. `sqlite3` is an optional operator tool, not a Gitmoot
+runtime dependency. For a non-default home, use the exact path printed by
+`gitmoot doctor`.
 
 One-shot onboarding: `gitmoot setup` registers the repo and an agent in one
 command (`--repo owner/repo --agent <name> --runtime codex|claude|shell
@@ -1172,11 +1185,18 @@ Event-rule wakes are separately opt-in:
 ```sh
 gitmoot org events rule add --on attention --match owner/repo --wake maintainer
 gitmoot org events rule add --on blocked --repo tendwire --wake maintainer
+gitmoot org events rule add --on pane_input_pending --wake maintainer
 gitmoot org events rule list
 gitmoot org events rule rm --home /alternate/home <rule-id>
 ```
 
-`--on` accepts `escalation`, `attention`, `guard`, `job-terminal`, or `blocked`.
+`--on` accepts `escalation`, `attention`, `guard`, `job-terminal`, `blocked`,
+`recycle-overdue`, or `pane_input_pending`. `pane_input_pending` matches the
+`org.input_pending` event emitted when Herdr continuously reports
+`input_pending: true` for a role's pane longer than
+`[orchestrate].blocked_role_wake_after`; it re-nudges at most once per that
+interval while the dialog remains pending. The pending signal takes precedence
+over the pane's last `idle` or `working` activity status.
 `--match` is a case-insensitive substring matched against the event repo or job
 id; empty matches all. `--repo` is a discoverable alias for the same substring
 filter; pass only one of `--match` or `--repo`. The wake role must exist and set
@@ -1276,6 +1296,8 @@ gitmoot task run task-001 --repo owner/repo --owner lead --base main
 gitmoot task list --repo owner/repo
 gitmoot task list --repo owner/repo --state implementing --json
 gitmoot task dismiss task-001 --reason "abandoned experiment"
+gitmoot task resume-work task-001 --reason "review requires another fix pass"
+gitmoot task resume-work task-001 --reason "withdraw pending merge" --override-pending-human-decision
 gitmoot task events task-001 --json
 ```
 
@@ -1293,6 +1315,17 @@ including daemon `task_dismissed_auto`, opt-in
 `task_dismissed_planned_ttl`, closed-unmerged `pr_closed_unmerged`, terminal
 top-level implement triage (`task_blocked_terminal_no_pr` or
 `task_blocked_job_failed`), and explicit recovery events.
+
+`task resume-work` is an explicit coordinator-only return to development from
+`reviewing`, `ready_to_merge`, or `awaiting_human_merge`. It requires `--reason`,
+refuses while a matching job or worktree process is live, preserves the branch
+lock, moves the task to `implementing`, and records `task_resume_work_manual`.
+The `awaiting_human_merge` state also requires
+`--override-pending-human-decision`, acknowledging that Gitmoot cannot observe a
+human who may be about to merge. Daemon advancement and autonomous retries do
+not invoke this command. Repeated manual use can still recreate the uncapped
+review/fix pattern tracked by #1142; the distinct event makes that activity
+measurable rather than invisible.
 
 ### Recover a dead implement
 
@@ -1431,6 +1464,21 @@ gitmoot job kill <root-job-id>
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 ```
+
+Terminal background `ask` and `review` jobs that ran in a throwaway read-only
+worktree preserve a bounded `git status --short` plus `git diff HEAD` snapshot
+before Gitmoot removes that worktree. `job show` prints the captured diff and
+`job list` adds a compact `DIFF:` badge. Their JSON forms expose
+`read_only_worktree_diff`, `read_only_worktree_diff_truncated`, and
+`read_only_worktree_diff_error`; the same durable fields are present under
+`job show --json`'s `payload`. Capture is capped at 4 MiB, and an oversized
+snapshot ends with an explicit omitted-byte marker instead of being silently
+cut. Git subprocesses and the wait for each index-file copy share a 10-second
+context: on expiry Gitmoot kills the subprocess or stops waiting for the copy.
+The operating system still owns cancellation of an in-progress filesystem
+syscall, so this is a bounded-wait guarantee rather than a promise that kernel
+I/O itself is cancelled. Failures are recorded and never prevent worktree
+removal.
 
 When standard output is an interactive terminal (and `NO_COLOR` is unset),
 the transcript renders styled: agent turns get blank-line spacing and keep

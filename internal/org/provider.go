@@ -8,9 +8,10 @@ import (
 type LifecycleState string
 
 const (
-	StateIdle    LifecycleState = "idle"
-	StateWorking LifecycleState = "working"
-	StateBlocked LifecycleState = "blocked"
+	StateIdle         LifecycleState = "idle"
+	StateWorking      LifecycleState = "working"
+	StateBlocked      LifecycleState = "blocked"
+	StateInputPending LifecycleState = "input_pending"
 	// StateUnavailable is a durable Gitmoot overlay for a role whose runtime
 	// provider explicitly refused work until a known boundary. It is distinct
 	// from Herdr-observed StateBlocked.

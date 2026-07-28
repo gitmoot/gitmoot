@@ -53,6 +53,7 @@ gitmoot goal import --file GOAL.md --repo owner/repo
 gitmoot task run task-001 --repo owner/repo --owner lead --base main
 gitmoot task recover task-001 --owner lead   # finalize a dead implement's dirty worktree
 gitmoot task dismiss task-001 --reason "abandoned experiment"
+gitmoot task resume-work task-001 --reason "review requires another fix pass"
 gitmoot task events task-001 --json
 gitmoot task list --repo owner/repo
 gitmoot job list
@@ -112,6 +113,13 @@ best-effort, and records `task_dismissed_manual`. The daemon can record
 activity proxy. Configure `[workflow].stale_task_ttl = "168h"` (the default), or
 set it to `"0"` to disable this poll leg. Candidates with a same-repo open PR,
 a remote branch, a live job, or an uncertain remote check are not dismissed.
+
+`task resume-work` is the coordinator-only, non-terminal exit from orphaned
+`reviewing`/`ready_to_merge` machinery back to `implementing`. It also supports
+`awaiting_human_merge`, but only with both `--reason` and
+`--override-pending-human-decision`. Every path refuses live jobs and worktree
+processes, preserves the branch lock, and records `task_resume_work_manual`; no
+daemon or autonomous retry invokes it.
 
 Delegation worktrees have a separate default-on retention bound:
 `[workflow].delegation_worktree_ttl = "72h"`. Only worktrees owned by final jobs

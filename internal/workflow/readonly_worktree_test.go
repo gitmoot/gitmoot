@@ -128,6 +128,44 @@ func TestCleanupDisposesTopLevelReadOnlyWorktree(t *testing.T) {
 	}
 }
 
+func TestReadOnlyPrecleanupFailureEventRedactsHookError(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	manager := &fakeWorktreeManager{}
+	engine.DelegationCheckout = t.TempDir()
+	engine.DelegationWorktrees = manager
+
+	const secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+	wt := t.TempDir()
+	engine.BeforeReadOnlyWorktreeCleanup = func(context.Context, string, string, JobPayload) error {
+		return errors.New("hostile helper failed with token=" + secret)
+	}
+	engine.cleanupReadOnlyDelegationWorktree(ctx, "secret-capture-error", "ask", JobPayload{
+		WorktreePath: wt, ReadOnlyWorktree: true,
+	})
+
+	events, err := store.ListJobEvents(ctx, "secret-capture-error")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var message string
+	for _, event := range events {
+		if event.Kind == "readonly_worktree_precleanup_failed" {
+			message = event.Message
+		}
+	}
+	if message == "" {
+		t.Fatal("readonly_worktree_precleanup_failed event was not recorded")
+	}
+	if strings.Contains(message, secret) || !strings.Contains(message, "token=[REDACTED]") {
+		t.Fatalf("pre-cleanup failure event did not redact hostile content: %q", message)
+	}
+	if len(manager.removedForce) != 1 || manager.removedForce[0] != wt {
+		t.Fatalf("redacted hook error blocked worktree cleanup: removed=%v", manager.removedForce)
+	}
+}
+
 // TestReclaimReadOnlyWorktree proves ReclaimTerminalDelegationWorktree (the daemon's
 // restart/lock-expiry reclaim path) now also reclaims an orphaned TOP-LEVEL
 // read-only worktree (#739) whose deferred cleanup never ran (crash between terminal

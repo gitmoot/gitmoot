@@ -278,6 +278,9 @@ func runBlockedRoleWakeOnce(ctx context.Context, store *db.Store, home string, s
 	if err := evaluateBlockedRoleEpisodes(ctx, store, sink, snapshot, wakeAfter, stdout, now.UTC()); err != nil {
 		writeLine(stdout, "blocked_since role evaluation failed: %v", err)
 	}
+	if err := evaluateInputPendingRoleEpisodes(ctx, store, sink, snapshot, wakeAfter, stdout, now.UTC()); err != nil {
+		writeLine(stdout, "input_pending role evaluation failed: %v", err)
+	}
 }
 
 func persistOrgRoleLivePresence(ctx context.Context, store *db.Store, snapshot org.Snapshot, stdout io.Writer) {
@@ -324,7 +327,7 @@ func evaluateBlockedRoleEpisodes(ctx context.Context, store *db.Store, sink even
 				continue
 			}
 			readySubjects[subject] = struct{}{}
-		case org.StateIdle, org.StateWorking, org.StateDone:
+		case org.StateIdle, org.StateWorking, org.StateInputPending, org.StateDone:
 			// A DEFINITIVE non-blocked observation is the only thing that closes an
 			// episode. StateUnknown — or a role absent from the snapshot (pane recycle,
 			// transient agent_status, a brief exact-label mismatch) — is ambiguous and
@@ -366,9 +369,86 @@ func evaluateBlockedRoleEpisodes(ctx context.Context, store *db.Store, sink even
 	return nil
 }
 
-// blockedEpisodeStale reports whether an episode's last blocked observation
-// (updatedAt, fixed-width UTC) is at or before staleBefore. An unparseable stamp
-// is treated as stale so a malformed row can never linger forever.
+func evaluateInputPendingRoleEpisodes(ctx context.Context, store *db.Store, sink events.Sink, snapshot org.Snapshot, wakeAfter time.Duration, stdout io.Writer, now time.Time) error {
+	if store == nil || sink == nil || wakeAfter <= 0 {
+		return nil
+	}
+	pendingSubjects := map[string]string{}
+	readySubjects := map[string]struct{}{}
+	confirmedNotPending := map[string]struct{}{}
+	for role, live := range snapshot.States {
+		role = strings.TrimSpace(role)
+		if role == "" {
+			continue
+		}
+		subject := "input-pending:role:" + role
+		switch live.State {
+		case org.StateInputPending:
+			pendingSubjects[subject] = role
+			if err := store.UpsertBlockedEpisode(ctx, subject, snapshot.ObservedAt, now); err != nil {
+				writeLine(stdout, "input_pending role %s episode upsert failed: %v", role, err)
+				continue
+			}
+			readySubjects[subject] = struct{}{}
+		case org.StateIdle, org.StateWorking, org.StateBlocked, org.StateDone:
+			// Unknown or absent is ambiguous and preserves accrued duration through
+			// a transient Herdr snapshot blip. Any concrete non-pending state closes
+			// the episode.
+			confirmedNotPending[subject] = struct{}{}
+		}
+	}
+
+	episodes, err := store.ListBlockedEpisodes(ctx)
+	if err != nil {
+		return err
+	}
+	staleBefore := now.Add(-blockedEpisodeStaleGap)
+	for _, episode := range episodes {
+		if !strings.HasPrefix(episode.Subject, "input-pending:role:") {
+			continue
+		}
+		if role, pending := pendingSubjects[episode.Subject]; pending {
+			if _, ready := readySubjects[episode.Subject]; !ready {
+				continue
+			}
+			if err := emitInputPendingEpisode(ctx, store, sink, episode, role, wakeAfter, now); err != nil {
+				writeLine(stdout, "input_pending role %s emit failed: %v", role, err)
+			}
+			continue
+		}
+		if _, confirmed := confirmedNotPending[episode.Subject]; confirmed || blockedEpisodeStale(episode.UpdatedAt, staleBefore) {
+			if err := store.ClearBlockedEpisode(ctx, episode.Subject); err != nil {
+				writeLine(stdout, "input_pending role episode clear failed for %s: %v", episode.Subject, err)
+			}
+		}
+	}
+	return nil
+}
+
+func emitInputPendingEpisode(ctx context.Context, store *db.Store, sink events.Sink, episode db.BlockedEpisode, role string, wakeAfter time.Duration, now time.Time) error {
+	now = now.UTC()
+	pendingSince, pendingFor, due, err := blockedEpisodeDue(episode, wakeAfter, now)
+	if err != nil {
+		return err
+	}
+	if !due {
+		return nil
+	}
+	if err := markBlockedEpisodeEmitted(ctx, store, episode, now); err != nil {
+		return err
+	}
+	subjectID := "org-input-pending:" + role
+	detail := fmt.Sprintf("role %s input pending %s (since %s)", role, pendingFor.Round(time.Second), pendingSince.UTC().Format(time.RFC3339))
+	ev := events.NewEvent(events.EventOrgInputPending, subjectID, subjectID, "", string(org.StateInputPending), detail, now, workflow.RedactCommentText)
+	ev.Cause = "input_pending_since"
+	events.EmitEvent(ctx, sink, ev)
+	return nil
+}
+
+// blockedEpisodeStale reports whether an episode's last matching observation
+// (updatedAt, fixed-width UTC) is at or before staleBefore. It is shared by the
+// blocked and input-pending episode evaluators. An unparseable stamp is treated
+// as stale so a malformed row can never linger forever.
 func blockedEpisodeStale(updatedAt string, staleBefore time.Time) bool {
 	parsed, err := time.Parse(db.BlockedEpisodeTimeLayout, strings.TrimSpace(updatedAt))
 	if err != nil {

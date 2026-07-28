@@ -13,18 +13,19 @@ import (
 // contract rather than two constants that could silently drift apart.
 const BlockedEpisodeTimeLayout = "2006-01-02T15:04:05.000000000Z"
 
-// BlockedEpisode tracks one continuous task or organization-role blocked
-// episode. EmittedAt is empty until the first synthesized blocked event, then
-// carries the LAST-emitted instant so the evaluator can re-nudge at most once per
-// interval while the subject stays blocked (self-healing against a dropped wake)
+// BlockedEpisode tracks one continuous condition episode. Subjects use distinct
+// prefixes for task blocks, organization-role blocks, and role input-pending
+// dialogs. EmittedAt is empty until the first synthesized event, then carries
+// the LAST-emitted instant so the evaluator can re-nudge at most once per
+// interval while the condition persists (self-healing against a dropped wake)
 // rather than firing a single durable one-shot.
 type BlockedEpisode struct {
 	Subject      string `json:"subject"`
 	BlockedSince string `json:"blocked_since"`
 	EmittedAt    string `json:"emitted_at,omitempty"`
-	// UpdatedAt is the last instant the subject was observed blocked (refreshed on
+	// UpdatedAt is the last instant the subject matched its condition (refreshed on
 	// every UpsertBlockedEpisode). The role evaluator reaps an episode whose
-	// UpdatedAt has gone stale — the subject stopped being observed blocked — which
+	// UpdatedAt has gone stale — the subject stopped matching — which
 	// distinguishes a genuinely ended block (or a role gone for good) from a
 	// transient unknown/absent snapshot blip, without leaking rows forever.
 	UpdatedAt string `json:"updated_at,omitempty"`

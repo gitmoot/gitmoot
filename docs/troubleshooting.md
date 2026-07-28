@@ -653,7 +653,11 @@ Fixes:
 - If the task is `awaiting_human_merge`, inspect its reason. Either the mandatory
   exact-head review/CI gate missed (also escalated to `jarvis`) or the repository
   has the explicit `[merge_gate] auto_merge = false` kill-switch. Merge it in
-  GitHub or use an authorized `@gitmoot merge` comment.
+  GitHub or use an authorized `@gitmoot merge` comment. If more implementation
+  is required instead, a coordinator can explicitly run `gitmoot task
+  resume-work <id> --reason "..." --override-pending-human-decision`; this
+  preserves the branch lock and records the override before returning the task
+  to `implementing`.
 - If the reason reads `waiting to confirm no external CI` (or `waiting … for CI
   to be created`), the gate saw **zero** external commit-statuses and check-runs
   at the head and is deferring rather than merging before GitHub Actions creates

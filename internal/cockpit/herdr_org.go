@@ -39,13 +39,16 @@ type herdrOrgSnapshotResult struct {
 	Result struct {
 		Snapshot struct {
 			Version json.RawMessage `json:"version"`
-			Panes   []struct {
-				PaneID      string `json:"pane_id"`
-				Label       string `json:"label"`
-				AgentStatus string `json:"agent_status"`
-			} `json:"panes"`
+			Panes   []herdrOrgPane  `json:"panes"`
 		} `json:"snapshot"`
 	} `json:"result"`
+}
+
+type herdrOrgPane struct {
+	PaneID       string `json:"pane_id"`
+	Label        string `json:"label"`
+	AgentStatus  string `json:"agent_status"`
+	InputPending bool   `json:"input_pending"`
 }
 
 func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
@@ -68,22 +71,22 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 		return org.Snapshot{}, fmt.Errorf("herdr api snapshot returned an incomplete snapshot shape")
 	}
 
-	byLabel := map[string][]string{}
+	byLabel := map[string][]herdrOrgPane{}
 	labelToPaneIDs := map[string][]string{}
-	statusByPaneID := map[string]string{}
+	paneByID := map[string]herdrOrgPane{}
 	for _, pane := range decoded.Result.Snapshot.Panes {
 		// Mirror the wake resolver (herdr.go resolvePaneByLabel, which matches only
 		// `p.PaneID != ""`): a pane with an empty pane_id is not a resolvable
 		// target. Seeding it would collide every empty-id pane on the "" key of
-		// statusByPaneID and let a binding read the wrong pane's status.
+		// paneByID and let a binding read the wrong pane's live state.
 		if pane.PaneID != "" {
-			statusByPaneID[pane.PaneID] = pane.AgentStatus
+			paneByID[pane.PaneID] = pane
 			if pane.Label != "" {
 				labelToPaneIDs[pane.Label] = append(labelToPaneIDs[pane.Label], pane.PaneID)
 			}
 		}
 		if pane.Label != "" {
-			byLabel[pane.Label] = append(byLabel[pane.Label], pane.AgentStatus)
+			byLabel[pane.Label] = append(byLabel[pane.Label], pane)
 		}
 	}
 	states := make(map[string]org.RoleLiveState, len(p.roles))
@@ -101,12 +104,12 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 				}
 				return "", false
 			})
-			status, present := statusByPaneID[paneID]
+			pane, present := paneByID[paneID]
 			if !present {
 				states[role.Name] = org.RoleLiveState{State: org.StateUnknown, Detail: fmt.Sprintf("no Herdr pane bound as %q", binding)}
 				continue
 			}
-			states[role.Name] = mapHerdrAgentStatus(status)
+			states[role.Name] = mapHerdrPaneState(pane)
 			continue
 		}
 
@@ -115,7 +118,7 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 		case 0:
 			states[role.Name] = org.RoleLiveState{State: org.StateUnknown, Detail: "no Herdr pane has this exact role label"}
 		case 1:
-			states[role.Name] = mapHerdrAgentStatus(matches[0])
+			states[role.Name] = mapHerdrPaneState(matches[0])
 		default:
 			states[role.Name] = org.RoleLiveState{State: org.StateUnknown, Detail: "multiple Herdr panes have this exact role label"}
 		}
@@ -172,6 +175,17 @@ func herdrKindSupportsModelFlag(kind string) bool {
 	default:
 		return false
 	}
+}
+
+func mapHerdrPaneState(pane herdrOrgPane) org.RoleLiveState {
+	// input_pending is orthogonal to Herdr's agent_status enum
+	// (idle/working/blocked/done/unknown). It wins whenever true because an
+	// interactive dialog prevents forward progress even if the last activity
+	// detector still reports idle or working.
+	if pane.InputPending {
+		return org.RoleLiveState{State: org.StateInputPending}
+	}
+	return mapHerdrAgentStatus(pane.AgentStatus)
 }
 
 func mapHerdrAgentStatus(raw string) org.RoleLiveState {
