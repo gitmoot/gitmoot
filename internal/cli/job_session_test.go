@@ -3,9 +3,11 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -40,7 +42,7 @@ func TestJobOpenCreatesRunningSessionJob(t *testing.T) {
 	seedSessionAgentRepo(t, store)
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "open", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "ask", "--title", "lead session", "--json"}, &stdout, &stderr)
+	code := Run([]string{"job", "open", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "ask", "--title", "lead session", "--head-sha", "open-head", "--json"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("job open exit = %d, stderr=%s", code, stderr.String())
 	}
@@ -51,6 +53,9 @@ func TestJobOpenCreatesRunningSessionJob(t *testing.T) {
 	if out.State != string(workflow.JobRunning) || !out.ExternallyDriven || out.Type != "ask" || out.Repo != "owner/repo" {
 		t.Fatalf("job open output = %+v", out)
 	}
+	if out.HeadSHA != "open-head" {
+		t.Fatalf("job open head SHA = %q, want open-head", out.HeadSHA)
+	}
 
 	stored, err := store.GetJob(context.Background(), out.JobID)
 	if err != nil {
@@ -58,6 +63,13 @@ func TestJobOpenCreatesRunningSessionJob(t *testing.T) {
 	}
 	if stored.State != string(workflow.JobRunning) || !stored.ExternallyDriven {
 		t.Fatalf("stored job = %+v, want running externally_driven", stored)
+	}
+	payload, err := workflow.ParseJobPayload(stored.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload returned error: %v", err)
+	}
+	if payload.HeadSHA != "open-head" {
+		t.Fatalf("stored head SHA = %q, want open-head", payload.HeadSHA)
 	}
 	queued, err := store.ListQueuedJobs(context.Background())
 	if err != nil {
@@ -87,14 +99,14 @@ func TestJobCloseAppliesDecision(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"job", "close", opened.JobID, "--home", home, "--decision", "changes_requested", "--summary", "needs work", "--pr", "9", "--json"}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"job", "close", opened.JobID, "--home", home, "--decision", "changes_requested", "--summary", "needs work", "--pr", "9", "--head-sha", "close-head", "--json"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("job close exit = %d, stderr=%s", code, stderr.String())
 	}
 	var closed jobSessionOutput
 	if err := json.Unmarshal(stdout.Bytes(), &closed); err != nil {
 		t.Fatalf("decode close JSON: %v", err)
 	}
-	if closed.State != string(workflow.JobSucceeded) || closed.Decision != "changes_requested" || closed.PullRequest != 9 {
+	if closed.State != string(workflow.JobSucceeded) || closed.Decision != "changes_requested" || closed.PullRequest != 9 || closed.HeadSHA != "close-head" {
 		t.Fatalf("close output = %+v", closed)
 	}
 	stored, err := store.GetJob(context.Background(), opened.JobID)
@@ -103,6 +115,13 @@ func TestJobCloseAppliesDecision(t *testing.T) {
 	}
 	if stored.State != string(workflow.JobSucceeded) {
 		t.Fatalf("stored state = %q, want succeeded", stored.State)
+	}
+	payload, err := workflow.ParseJobPayload(stored.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload returned error: %v", err)
+	}
+	if payload.HeadSHA != "close-head" {
+		t.Fatalf("stored head SHA = %q, want close-head", payload.HeadSHA)
 	}
 }
 
@@ -114,7 +133,7 @@ func TestJobRecordOneShotTerminal(t *testing.T) {
 	seedSessionAgentRepo(t, store)
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "record", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "implement", "--decision", "implemented", "--summary", "done", "--pr", "12", "--json"}, &stdout, &stderr)
+	code := Run([]string{"job", "record", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "implement", "--decision", "implemented", "--summary", "done", "--pr", "12", "--head-sha", "record-head", "--json"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("job record exit = %d, stderr=%s", code, stderr.String())
 	}
@@ -122,7 +141,7 @@ func TestJobRecordOneShotTerminal(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
 		t.Fatalf("decode record JSON: %v", err)
 	}
-	if out.State != string(workflow.JobSucceeded) || out.Decision != "implemented" || !out.ExternallyDriven {
+	if out.State != string(workflow.JobSucceeded) || out.Decision != "implemented" || !out.ExternallyDriven || out.HeadSHA != "record-head" {
 		t.Fatalf("record output = %+v", out)
 	}
 	stored, err := store.GetJob(context.Background(), out.JobID)
@@ -131,6 +150,148 @@ func TestJobRecordOneShotTerminal(t *testing.T) {
 	}
 	if stored.State != string(workflow.JobSucceeded) || !stored.ExternallyDriven {
 		t.Fatalf("stored job = %+v", stored)
+	}
+	payload, err := workflow.ParseJobPayload(stored.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload returned error: %v", err)
+	}
+	if payload.HeadSHA != "record-head" {
+		t.Fatalf("stored head SHA = %q, want record-head", payload.HeadSHA)
+	}
+}
+
+func TestSessionReviewStatusDistinguishesProgressAndStall(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	seedSessionAgentRepo(t, store)
+
+	open := func(typeName, workflowID, headSHA string) jobSessionOutput {
+		t.Helper()
+		args := []string{"job", "open", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", typeName, "--json"}
+		if workflowID != "" {
+			args = append(args, "--workflow", workflowID)
+		}
+		if headSHA != "" {
+			args = append(args, "--head-sha", headSHA)
+		}
+		var stdout, stderr bytes.Buffer
+		if code := Run(args, &stdout, &stderr); code != 0 {
+			t.Fatalf("job open exit = %d, stderr=%s", code, stderr.String())
+		}
+		var out jobSessionOutput
+		if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+			t.Fatalf("decode job open JSON: %v (%s)", err, stdout.String())
+		}
+		return out
+	}
+
+	fresh := open("review", "review/fresh", "fresh-head")
+	stalled := open("review", "review/stalled", "")
+	noted := open("review", "review/noted", "")
+	otherType := open("ask", "review/ask", "")
+	terminal := open("review", "review/terminal", "")
+
+	if err := store.CreateJobWithEvent(context.Background(), db.Job{
+		ID:      "dispatched-review",
+		Agent:   "lead",
+		Type:    "review",
+		State:   string(workflow.JobRunning),
+		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo"}),
+	}, db.JobEvent{Kind: string(workflow.JobRunning), Message: "job started"}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	if code := Run([]string{"job", "close", terminal.JobID, "--home", home, "--decision", "approved"}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
+		t.Fatalf("job close terminal fixture exit = %d", code)
+	}
+
+	old := time.Now().UTC().Add(-sessionReviewStaleGap - time.Minute).Format("2006-01-02 15:04:05")
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("sql.Open returned error: %v", err)
+	}
+	defer raw.Close()
+	for _, id := range []string{stalled.JobID, noted.JobID} {
+		if _, err := raw.Exec(`UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`, old, old, id); err != nil {
+			t.Fatalf("backdate job %s: %v", id, err)
+		}
+	}
+	var noteOut, noteErr bytes.Buffer
+	if code := Run([]string{"workflow", "note", "review/noted", "reviewed tests", "--home", home, "--no-auto"}, &noteOut, &noteErr); code != 0 {
+		t.Fatalf("workflow note exit = %d, stderr=%s", code, noteErr.String())
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"job", "list", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("job list --json exit = %d, stderr=%s", code, stderr.String())
+	}
+	var entries []jobListEntry
+	if err := json.Unmarshal(stdout.Bytes(), &entries); err != nil {
+		t.Fatalf("decode job list JSON: %v (%s)", err, stdout.String())
+	}
+	var rawEntries []map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &rawEntries); err != nil {
+		t.Fatalf("decode raw job list JSON: %v (%s)", err, stdout.String())
+	}
+	byID := make(map[string]jobListEntry, len(entries))
+	for _, entry := range entries {
+		byID[entry.ID] = entry
+	}
+	rawByID := make(map[string]map[string]any, len(rawEntries))
+	for _, entry := range rawEntries {
+		rawByID[entry["id"].(string)] = entry
+	}
+	if got := byID[fresh.JobID]; got.ReviewStatus != reviewStatusInProgress || got.HeadSHA != "fresh-head" {
+		t.Fatalf("fresh review = %+v, want in_progress with head SHA", got)
+	}
+	if got := byID[stalled.JobID].ReviewStatus; got != reviewStatusStalled {
+		t.Fatalf("stalled review status = %q, want %q", got, reviewStatusStalled)
+	}
+	if got := byID[noted.JobID].ReviewStatus; got != reviewStatusInProgress {
+		t.Fatalf("noted review status = %q, want %q", got, reviewStatusInProgress)
+	}
+	for _, id := range []string{otherType.JobID, "dispatched-review", terminal.JobID} {
+		if got := byID[id].ReviewStatus; got != "" {
+			t.Fatalf("ineligible job %s review status = %q, want omitted", id, got)
+		}
+		if _, present := rawByID[id]["review_status"]; present {
+			t.Fatalf("ineligible job %s unexpectedly includes review_status: %+v", id, rawByID[id])
+		}
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"job", "list", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("job list exit = %d, stderr=%s", code, stderr.String())
+	}
+	textRows := stdout.String()
+	if !strings.Contains(textRows, fresh.JobID+"\trunning\treview") ||
+		!strings.Contains(textRows, "\thead=fresh-head\tREVIEW: in_progress") ||
+		!strings.Contains(textRows, stalled.JobID+"\trunning\treview") ||
+		!strings.Contains(textRows, "\tREVIEW: stalled") {
+		t.Fatalf("job list text missing review status/head badges:\n%s", textRows)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"job", "show", stalled.JobID, "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("job show exit = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "review_status: stalled") {
+		t.Fatalf("job show missing stalled review status:\n%s", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"job", "show", fresh.JobID, "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("job show --json exit = %d, stderr=%s", code, stderr.String())
+	}
+	var shown jobShowOutput
+	if err := json.Unmarshal(stdout.Bytes(), &shown); err != nil {
+		t.Fatalf("decode job show JSON: %v (%s)", err, stdout.String())
+	}
+	if shown.ReviewStatus != reviewStatusInProgress || shown.Payload.HeadSHA != "fresh-head" {
+		t.Fatalf("fresh job show = %+v, want in_progress with fresh-head", shown)
 	}
 }
 

@@ -74,9 +74,9 @@ func printJobUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot job cancel <id>")
 	fmt.Fprintln(w, "  gitmoot job cancel --state blocked [--older-than 168h|7d] [--repo owner/repo] [--agent name] [--yes]")
 	fmt.Fprintln(w, "  gitmoot job kill <root-job-id>")
-	fmt.Fprintf(w, "  gitmoot job open --agent name --repo owner/repo --type %s [--title ...] [--task id] [--pr n] [--workflow label] [--json]\n", strings.Join(workflow.DelegationActions, "|"))
-	fmt.Fprintf(w, "  gitmoot job close <id> --decision %s [--summary ...] [--pr n] [--branch name] [--json]\n", strings.Join(workflow.ResultDecisions, "|"))
-	fmt.Fprintf(w, "  gitmoot job record --agent name --repo owner/repo --type %s --decision ... [--title ...] [--summary ...] [--task id] [--pr n] [--branch name] [--json]\n", strings.Join(workflow.DelegationActions, "|"))
+	fmt.Fprintf(w, "  gitmoot job open --agent name --repo owner/repo --type %s [--title ...] [--task id] [--pr n] [--head-sha sha] [--workflow label] [--json]\n", strings.Join(workflow.DelegationActions, "|"))
+	fmt.Fprintf(w, "  gitmoot job close <id> --decision %s [--summary ...] [--pr n] [--head-sha sha] [--branch name] [--json]\n", strings.Join(workflow.ResultDecisions, "|"))
+	fmt.Fprintf(w, "  gitmoot job record --agent name --repo owner/repo --type %s --decision ... [--title ...] [--summary ...] [--task id] [--pr n] [--head-sha sha] [--branch name] [--json]\n", strings.Join(workflow.DelegationActions, "|"))
 }
 
 func runJobList(args []string, stdout, stderr io.Writer) int {
@@ -122,6 +122,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 	var deliveryEvents map[string]db.JobEvent
 	var deliveryEventsKnown bool
 	var locks []db.ResourceLock
+	var reviewStatuses map[string]string
 	if err := withStore(*home, func(store *db.Store) error {
 		var err error
 		if strings.TrimSpace(*workflowID) != "" {
@@ -137,6 +138,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 		deliveryEvents, err = store.LatestJobEventsOfKinds(context.Background(), deliveryStatusEventKinds)
 		deliveryEventsKnown = err == nil
 		locks, _ = store.ListResourceLocks(context.Background())
+		reviewStatuses = deriveReviewStatuses(context.Background(), store, jobs, time.Now().UTC())
 		return nil
 	}); err != nil {
 		fmt.Fprintf(stderr, "job list: %v\n", err)
@@ -163,7 +165,9 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 				Agent:                         job.Agent,
 				Repo:                          payload.Repo,
 				PullRequest:                   payload.PullRequest,
+				HeadSHA:                       payload.HeadSHA,
 				WorkflowID:                    job.WorkflowID,
+				ReviewStatus:                  reviewStatuses[job.ID],
 				PreflightFailed:               strings.TrimSpace(preflightFailed[job.ID]),
 				WhyStuck:                      reason.Reason,
 				NextRetryAt:                   reason.NextRetryAt,
@@ -187,6 +191,12 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t#%d", job.ID, job.State, job.Type, job.Agent, payload.Repo, payload.PullRequest)
 		if job.WorkflowID != "" {
 			fmt.Fprintf(stdout, "\tworkflow=%s", job.WorkflowID)
+		}
+		if payload.HeadSHA != "" {
+			fmt.Fprintf(stdout, "\thead=%s", payload.HeadSHA)
+		}
+		if status := reviewStatuses[job.ID]; status != "" {
+			fmt.Fprintf(stdout, "\tREVIEW: %s", status)
 		}
 		if reason, ok := preflightFailed[job.ID]; ok && strings.TrimSpace(reason) != "" {
 			fmt.Fprintf(stdout, "\tPREFLIGHT_FAILED: %s", reason)
@@ -230,7 +240,9 @@ type jobListEntry struct {
 	Agent                         string `json:"agent"`
 	Repo                          string `json:"repo"`
 	PullRequest                   int    `json:"pull_request"`
+	HeadSHA                       string `json:"head_sha,omitempty"`
 	WorkflowID                    string `json:"workflow_id,omitempty"`
+	ReviewStatus                  string `json:"review_status,omitempty"`
 	PreflightFailed               string `json:"preflight_failed,omitempty"`
 	WhyStuck                      string `json:"why_stuck,omitempty"`
 	NextRetryAt                   string `json:"next_retry_at,omitempty"`
@@ -256,6 +268,7 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 	var payload workflow.JobPayload
 	var reason stuckReason
 	var deliveryStatus string
+	var reviewStatus string
 	if err := withStore(*home, func(store *db.Store) error {
 		var err error
 		job, err = store.GetJob(context.Background(), jobID)
@@ -271,6 +284,7 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 		}
 		reason = loadStuckReason(store, job)
 		deliveryStatus = loadJobDeliveryStatus(store, job, payload)
+		reviewStatus = deriveReviewStatus(context.Background(), store, job, time.Now().UTC())
 		return nil
 	}); err != nil {
 		fmt.Fprintf(stderr, "job show: %v\n", err)
@@ -282,6 +296,7 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 		out := jobShowOutput{
 			Job:                           job,
 			Payload:                       payload,
+			ReviewStatus:                  reviewStatus,
 			WhyStuck:                      reason.Reason,
 			NextRetryAt:                   reason.NextRetryAt,
 			SuggestedAction:               reason.SuggestedAction,
@@ -298,7 +313,7 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	printJob(stdout, job, payload, reason, processActive, deliveryStatus)
+	printJob(stdout, job, payload, reason, processActive, deliveryStatus, reviewStatus)
 	return 0
 }
 
@@ -308,6 +323,7 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 type jobShowOutput struct {
 	Job                           db.Job              `json:"job"`
 	Payload                       workflow.JobPayload `json:"payload"`
+	ReviewStatus                  string              `json:"review_status,omitempty"`
 	WhyStuck                      string              `json:"why_stuck,omitempty"`
 	NextRetryAt                   string              `json:"next_retry_at,omitempty"`
 	SuggestedAction               string              `json:"suggested_action,omitempty"`
@@ -1264,7 +1280,7 @@ func jobListPayload(job db.Job) (workflow.JobPayload, error) {
 	return daemonJobPayload(job)
 }
 
-func printJob(stdout io.Writer, job db.Job, payload workflow.JobPayload, reason stuckReason, processActive bool, deliveryStatus string) {
+func printJob(stdout io.Writer, job db.Job, payload workflow.JobPayload, reason stuckReason, processActive bool, deliveryStatus, reviewStatus string) {
 	fmt.Fprintf(stdout, "id: %s\n", job.ID)
 	fmt.Fprintf(stdout, "state: %s\n", job.State)
 	if deliveryStatus != "" {
@@ -1282,6 +1298,9 @@ func printJob(stdout io.Writer, job db.Job, payload workflow.JobPayload, reason 
 	if processActive {
 		fmt.Fprintln(stdout, "process_active: worktree still has an active process")
 	}
+	if reviewStatus != "" {
+		fmt.Fprintf(stdout, "review_status: %s\n", reviewStatus)
+	}
 	fmt.Fprintf(stdout, "type: %s\n", job.Type)
 	fmt.Fprintf(stdout, "agent: %s\n", job.Agent)
 	model := strings.TrimSpace(job.Model)
@@ -1295,6 +1314,9 @@ func printJob(stdout io.Writer, job db.Job, payload workflow.JobPayload, reason 
 	fmt.Fprintf(stdout, "repo: %s\n", payload.Repo)
 	fmt.Fprintf(stdout, "branch: %s\n", payload.Branch)
 	fmt.Fprintf(stdout, "pull_request: %d\n", payload.PullRequest)
+	if payload.HeadSHA != "" {
+		fmt.Fprintf(stdout, "head_sha: %s\n", payload.HeadSHA)
+	}
 	if payload.Result != nil {
 		fmt.Fprintf(stdout, "decision: %s\n", payload.Result.Decision)
 		fmt.Fprintf(stdout, "summary: %s\n", payload.Result.Summary)

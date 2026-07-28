@@ -49,6 +49,30 @@ credentials, unclear scope, unavailable tools, failing external services, or
 required human decisions. Always redact secrets from summaries, findings, raw
 command output, and examples.
 
+## In-session review discipline
+
+A coordinator reviewing a PR inline in its current conversation has no
+dispatched runtime job to record that work. Before reading the diff, open a
+session review against the exact head:
+
+```sh
+gitmoot job open --agent <name> --repo owner/repo --type review \
+  --pr <n> --head-sha <sha> --workflow <label>
+```
+
+During the review, journal meaningful progress with `gitmoot workflow note
+<label> "..."`. The timestamped workflow notes double as the session review's
+liveness signal. After posting the verdict, close the returned job id:
+
+```sh
+gitmoot job close <id> --decision approved|changes_requested|blocked \
+  --summary "..."
+```
+
+This open/note/close sequence is required for an in-session verdict to be
+durable and for `job list` / `job show` to distinguish an active review from a
+stalled one.
+
 ## Findings
 
 `findings` is a free-form array — each entry may be a plain string or a JSON

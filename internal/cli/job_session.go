@@ -34,6 +34,7 @@ type jobSessionOutput struct {
 	Decision         string `json:"decision,omitempty"`
 	Summary          string `json:"summary,omitempty"`
 	PullRequest      int    `json:"pull_request,omitempty"`
+	HeadSHA          string `json:"head_sha,omitempty"`
 }
 
 func runJobOpen(args []string, stdout, stderr io.Writer) int {
@@ -46,6 +47,7 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 	title := fs.String("title", "", "optional human title for the job")
 	task := fs.String("task", "", "optional task id to associate")
 	pr := fs.Int("pr", 0, "optional pull request number")
+	headSHA := fs.String("head-sha", "", "optional pull request head SHA")
 	workflowID := fs.String("workflow", "", "external-coordinator workflow label")
 	jsonOutput := fs.Bool("json", false, "print the created job as JSON")
 	if err := fs.Parse(args); err != nil {
@@ -90,6 +92,7 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 			TaskID:      strings.TrimSpace(*task),
 			TaskTitle:   strings.TrimSpace(*title),
 			PullRequest: *pr,
+			HeadSHA:     strings.TrimSpace(*headSHA),
 			Sender:      "session",
 			WorkflowID:  strings.TrimSpace(*workflowID),
 		})
@@ -104,6 +107,7 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 			Repo:             fullName,
 			ExternallyDriven: true,
 			PullRequest:      *pr,
+			HeadSHA:          strings.TrimSpace(*headSHA),
 		}
 		return nil
 	}); err != nil {
@@ -121,6 +125,7 @@ func runJobClose(args []string, stdout, stderr io.Writer) int {
 	decision := fs.String("decision", "", "result decision: "+strings.Join(workflow.ResultDecisions, "|"))
 	summary := fs.String("summary", "", "optional result summary")
 	pr := fs.Int("pr", 0, "optional pull request number to record")
+	headSHA := fs.String("head-sha", "", "optional pull request head SHA to record")
 	branch := fs.String("branch", "", "optional branch to record")
 	jsonOutput := fs.Bool("json", false, "print the closed job as JSON")
 	// The job id is positional and precedes the flags (`job close <id> --decision
@@ -158,7 +163,7 @@ func runJobClose(args []string, stdout, stderr io.Writer) int {
 		job, err := engine.CloseExternalJob(context.Background(), jobID, workflow.AgentResult{
 			Decision: *decision,
 			Summary:  strings.TrimSpace(*summary),
-		}, *pr, *branch)
+		}, *pr, *headSHA, *branch)
 		if err != nil {
 			return err
 		}
@@ -173,6 +178,7 @@ func runJobClose(args []string, stdout, stderr io.Writer) int {
 			Decision:         *decision,
 			Summary:          strings.TrimSpace(*summary),
 			PullRequest:      payload.PullRequest,
+			HeadSHA:          payload.HeadSHA,
 		}
 		return nil
 	}); err != nil {
@@ -195,6 +201,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 	summary := fs.String("summary", "", "optional result summary")
 	task := fs.String("task", "", "optional task id to associate")
 	pr := fs.Int("pr", 0, "optional pull request number")
+	headSHA := fs.String("head-sha", "", "optional pull request head SHA")
 	branch := fs.String("branch", "", "optional branch to record")
 	jsonOutput := fs.Bool("json", false, "print the recorded job as JSON")
 	if err := fs.Parse(args); err != nil {
@@ -234,6 +241,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 			TaskID:      strings.TrimSpace(*task),
 			TaskTitle:   strings.TrimSpace(*title),
 			PullRequest: *pr,
+			HeadSHA:     strings.TrimSpace(*headSHA),
 			Sender:      "session",
 		})
 		if err != nil {
@@ -242,7 +250,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 		job, err := engine.CloseExternalJob(context.Background(), opened.ID, workflow.AgentResult{
 			Decision: *decision,
 			Summary:  strings.TrimSpace(*summary),
-		}, *pr, *branch)
+		}, *pr, *headSHA, *branch)
 		if err != nil {
 			return err
 		}
@@ -257,6 +265,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 			Decision:         *decision,
 			Summary:          strings.TrimSpace(*summary),
 			PullRequest:      payload.PullRequest,
+			HeadSHA:          payload.HeadSHA,
 		}
 		return nil
 	}); err != nil {
@@ -360,5 +369,8 @@ func printJobSessionOutput(stdout io.Writer, out jobSessionOutput, jsonOutput bo
 	}
 	if out.PullRequest > 0 {
 		writeLine(stdout, "pull_request: %d", out.PullRequest)
+	}
+	if out.HeadSHA != "" {
+		writeLine(stdout, "head_sha: %s", out.HeadSHA)
 	}
 }

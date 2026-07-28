@@ -51,6 +51,20 @@ also clock in/out manually with `gitmoot job open` / `gitmoot job close`, or log
 already-finished work in one shot with `gitmoot job record` (see
 `references/CLI.md` → Session jobs).
 
+Before starting an in-session PR review, clock in with the exact review target:
+
+```sh
+gitmoot job open --agent <name> --repo owner/repo --type review \
+  --pr <n> --head-sha <sha> --workflow <label>
+```
+
+Journal meaningful progress with `gitmoot workflow note <label> "..."`; those
+timestamped notes are also the review's liveness signal. After posting the
+verdict, clock out with `gitmoot job close <id> --decision
+approved|changes_requested|blocked --summary "..."`. Do not leave a real
+in-session review only in conversation: without the open/note/close discipline,
+other Gitmoot surfaces cannot distinguish the review from an idle lane.
+
 For template capture, phrases like "capture this session as a Gitmoot agent
 template", "turn this workflow into a Gitmoot template", or "draft a reusable
 agent template from this chat" mean read [TEMPLATE_CAPTURE.md](references/TEMPLATE_CAPTURE.md)

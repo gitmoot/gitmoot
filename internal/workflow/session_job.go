@@ -36,6 +36,7 @@ func (m Mailbox) OpenExternalJob(ctx context.Context, request JobRequest) (db.Jo
 		Repo:                   request.Repo,
 		Branch:                 request.Branch,
 		PullRequest:            request.PullRequest,
+		HeadSHA:                strings.TrimSpace(request.HeadSHA),
 		GoalID:                 request.GoalID,
 		TaskID:                 request.TaskID,
 		TaskTitle:              request.TaskTitle,
@@ -81,7 +82,7 @@ func (m Mailbox) OpenExternalJob(ctx context.Context, request JobRequest) (db.Jo
 // A job can be closed exactly once: it must currently be running AND
 // externally_driven, else a clear error is returned (double-close, closing an
 // engine job, or an unknown id all fail cleanly).
-func (m Mailbox) CloseExternalJob(ctx context.Context, jobID string, result AgentResult, prOverride int, branchOverride string) (db.Job, error) {
+func (m Mailbox) CloseExternalJob(ctx context.Context, jobID string, result AgentResult, prOverride int, headSHAOverride, branchOverride string) (db.Job, error) {
 	if m.Store == nil {
 		return db.Job{}, errors.New("mailbox store is required")
 	}
@@ -108,6 +109,9 @@ func (m Mailbox) CloseExternalJob(ctx context.Context, jobID string, result Agen
 	payload.Result = &resultCopy
 	if prOverride > 0 {
 		payload.PullRequest = prOverride
+	}
+	if strings.TrimSpace(headSHAOverride) != "" {
+		payload.HeadSHA = strings.TrimSpace(headSHAOverride)
 	}
 	if strings.TrimSpace(branchOverride) != "" {
 		payload.Branch = strings.TrimSpace(branchOverride)
@@ -152,6 +156,6 @@ func (e Engine) OpenExternalJob(ctx context.Context, request JobRequest) (db.Job
 // CloseExternalJob applies a session job's result and moves it to its terminal
 // state, emitting the outbound terminal event through the engine's wired EventSink.
 // See Mailbox.CloseExternalJob.
-func (e Engine) CloseExternalJob(ctx context.Context, jobID string, result AgentResult, prOverride int, branchOverride string) (db.Job, error) {
-	return e.mailbox().CloseExternalJob(ctx, jobID, result, prOverride, branchOverride)
+func (e Engine) CloseExternalJob(ctx context.Context, jobID string, result AgentResult, prOverride int, headSHAOverride, branchOverride string) (db.Job, error) {
+	return e.mailbox().CloseExternalJob(ctx, jobID, result, prOverride, headSHAOverride, branchOverride)
 }
