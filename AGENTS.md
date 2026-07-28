@@ -26,21 +26,98 @@ Requires Go 1.26+ (see `go.mod`; CI resolves the version via
 
 ```sh
 export GOTOOLCHAIN=local PATH=/root/.local/toolchains/go1.26.4/bin:$PATH
+export GOCACHE=/tmp/gitmoot-go-build-cache
+mkdir -p "$GOCACHE"
 ```
 
 Run from the repo root and make these pass before committing — they mirror the CI
 gate in `.github/workflows/ci.yml`:
 
 ```sh
-go build ./...
+go build -buildvcs=false ./...
 go generate ./... && git diff --exit-code   # gitmoot_result contract is single-sourced + regenerated; stale artifact fails CI
 go vet ./...
-go test ./...
-# Race gate is scoped (not ./...). CI compiles one -race test binary per package
-# and runs timing-balanced shards from those binaries (#906). Locally you can
-# run the four complete packages at once:
-go test -race -timeout 35m ./internal/workflow/ ./internal/cli/ ./internal/db/ ./internal/daemon/ ./internal/pipeline/
+go test -timeout 25m ./...
+
+# Race gate is scoped (not ./...). Use CI's package shard counts and its
+# deterministic fallback partitioner so no growing package hits one monolithic
+# timeout. Each compiled binary covers every package test exactly once.
+(
+  set -e
+  race_dir="$(mktemp -d "${TMPDIR:-/tmp}/gitmoot-race.XXXXXX")"
+  printf 'race artifacts: %s\n' "$race_dir"
+  for spec in cli:8 pipeline:4 db:2 workflow:4 daemon:1; do
+    package="${spec%%:*}"
+    shards="${spec##*:}"
+    bundle="$race_dir/$package"
+    mkdir -p "$bundle/partitions"
+    go test -c -race -o "$bundle/$package.test" "./internal/$package/"
+    (
+      cd "internal/$package"
+      "$bundle/$package.test" -test.list '.*'
+    ) >"$bundle/tests.list"
+    scripts/partition-race-tests.sh \
+      --tests "$bundle/tests.list" \
+      --shards "$shards" \
+      --out-dir "$bundle/partitions"
+    for ((shard = 0; shard < shards; shard++)); do
+      run_regex="$(cat "$bundle/partitions/shard-$shard.regex")"
+      (
+        cd "internal/$package"
+        "$bundle/$package.test" \
+          -test.run="$run_regex" \
+          -test.timeout=20m
+      )
+    done
+  done
+)
 ```
+
+The explicit temporary `GOCACHE` is also part of the host setup. Managed
+worktrees can inherit a read-only `/root/.cache/go-build`; redirecting the cache
+keeps build, vet, and test from failing during package setup before compilation.
+This is documented instead of changing `/root/.cache` permissions because that
+directory is host-global external state, while the gate must remain runnable in
+each agent's environment.
+
+The race block deliberately does not delete `race_dir`: recursive deletion is
+policy-rejected for managed coordinators, and cleanup is not required for gate
+correctness. The printed per-run directory and
+`/tmp/gitmoot-go-build-cache` therefore persist for later owner-managed cleanup.
+
+When the repository checkout itself is under `/tmp`,
+`TestClaudeProduceHookAutoReadLandlockE2E` is a known host-environment confound:
+it fails there on current `main` as well as feature branches, so that failure is
+not evidence about the branch under test. In a `/tmp` checkout, run the non-race
+gate with that one test explicitly skipped:
+
+```sh
+go test -timeout 25m -skip 'TestClaudeProduceHookAutoReadLandlockE2E' ./...
+```
+
+`-buildvcs=false` is required, not optional, inside a gitmoot worktree (#1209):
+Go's VCS auto-stamp only recognizes a `.git` **directory** as a repo root
+(`cmd/go/internal/vcs.vcsGit.RootNames`), but a linked worktree's `.git` is a
+**file** (a `gitdir:` pointer). Go's root-detection walk-up skips past the
+worktree's real root looking for any ancestor with a `.git`-shaped directory,
+and can land on an unrelated one — hard-failing with `error obtaining VCS
+status: exit status 128` even though `git status` itself works fine from the
+same directory. This is a genuine Go toolchain limitation with linked
+worktrees (confirmed by reading `cmd/go/internal/vcs/vcs.go`'s `FromDir` /
+`isVCSRoot`), not something gitmoot's code or config can fix, and even the
+non-failing cases can silently stamp the wrong VCS metadata (wrong commit,
+wrong dirty bit) from whatever directory the walk-up happened to land on.
+Disabling it here costs nothing real: release binaries get their version
+info from the explicit `-ldflags -X ...Commit=$(git rev-parse HEAD)` recipe
+in the deploy section below, never from Go's auto-stamp.
+
+`-timeout 25m` on the plain `go test ./...` closes the same kind of gap
+(#1210): Go's default test timeout is 600s **per package**, not per `./...`
+invocation, and `internal/cli`'s suite alone can run past that on a clean
+local clone. CI's own build+generate+vet+test job isn't at risk (it
+completes in well under 10 minutes on its runners), so this was a
+local-only gap — but a command documented as "run this before committing"
+has to actually be able to finish.
 
 The CLI entrypoint lives under `cmd/gitmoot/`. The CI gate is Go-only — it does
 **not** build the website or run the live multi-runtime (codex/claude/kimi) E2E
