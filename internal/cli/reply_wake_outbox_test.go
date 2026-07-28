@@ -214,6 +214,39 @@ func TestReplyWakeOutboxRecordsExistingDeliveryOutcomeStates(t *testing.T) {
 	}
 }
 
+func TestReplyWakeOutboxReadFailureFailsDaemonTickClosed(t *testing.T) {
+	store, sink, _, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
+	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+		WorkflowID: "release/read-failure", Author: "worker", Body: "must stay visible",
+		AddressedTarget: "owner",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`DROP TABLE wake_outbox`); err != nil {
+		t.Fatal(err)
+	}
+
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.EventSinkOverride = sink
+	err = runDaemonWorkerTickTracked(
+		context.Background(), store, worker, 0, false, "", "", io.Discard,
+		time.Now().UTC(), nil, nil,
+	)
+	if err == nil {
+		t.Fatal("daemon tick reported healthy after the wake outbox became unreadable")
+	}
+	if !strings.Contains(err.Error(), "reply wake outbox drain failed") ||
+		!strings.Contains(err.Error(), "no such table: wake_outbox") {
+		t.Fatalf("daemon tick error = %q, want explicit unreadable wake outbox cause", err)
+	}
+}
+
 const replyWakeProducerDatabaseEnv = "GITMOOT_TEST_REPLY_WAKE_PRODUCER_DATABASE"
 
 func TestReplyWakeOutboxSurvivesProducerProcessExitAndDrainsOnLaterDaemonTick(t *testing.T) {

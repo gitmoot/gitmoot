@@ -806,9 +806,12 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	// #1200/#1201 durable addressed-note wakes. The note transaction writes only
 	// SQL; this daemon tick claims due coalesced rows and invokes the existing
 	// event-rule delivery path after every producer transaction has committed.
-	// Best-effort delivery must never abort ordinary job dispatch.
+	// The outbox is the durable delivery record, so a read/drain failure makes
+	// delivery indeterminate. Fail the tick instead of reporting healthy and
+	// dispatching more work; the recovering supervisor retries transient faults
+	// and escalates persistent shared-store failures through its existing path.
 	if err := drainReplyWakeOutbox(ctx, store, worker.eventSink(), now); err != nil {
-		writeLine(stdout, "reply wake outbox drain failed: %v", err)
+		return fmt.Errorf("reply wake outbox drain failed: %w", err)
 	}
 	// Checkout-mutating maintenance (advancement/merge retries, delegation
 	// worktree reclaims) is gated on the ACTUAL mutation hazard — each
