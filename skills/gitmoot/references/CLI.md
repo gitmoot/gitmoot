@@ -1322,10 +1322,12 @@ gitmoot org events rule rm --home /alternate/home <rule-id>
 `[orchestrate].blocked_role_wake_after`; it re-nudges at most once per that
 interval while the dialog remains pending. The pending signal takes precedence
 over the pane's last `idle` or `working` activity status.
-`reply` matches durable batches of workflow notes addressed to the same role as
-`--wake`. The daemon coalesces a rolling five-second window into one prompt
-carrying `N new items, oldest id X`; separate roles and later windows stay
-separate. A later tick flushes the quiet tail without requiring another note.
+`reply` matches durable batches of workflow notes and `kind=chat` messages
+addressed to the same role as `--wake`; non-triggering chat back-links such as
+`job_result` are excluded. The daemon coalesces a rolling five-second window
+into one prompt carrying `N new items, oldest id X`; separate roles and later
+windows stay separate. A later tick flushes the quiet tail without requiring
+another message.
 Every outbox row retains a queryable `pending`, `attempted`, `delivered`,
 `stalled`, or `failed` state, so never-attempted is not confused with success.
 `--match` is a case-insensitive substring matched independently against the

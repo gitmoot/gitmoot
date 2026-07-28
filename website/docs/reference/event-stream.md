@@ -153,7 +153,7 @@ blocks or fails a job — this mirrors the `escalate_human` notifier contract:
   **dropped** and a single best-effort `event_sink_drop` job event is recorded
   locally (so a drop is observable without coupling delivery to the job).
 
-Webhook delivery has no outbox or retry. Addressed-note role wakes are the
+Webhook delivery has no outbox or retry. Addressed-message role wakes are the
 exception: their producer-agnostic SQL outbox is described below.
 
 ## Organization event-rule wakes
@@ -200,9 +200,11 @@ observation, or once the subject stops matching for a short grace
 within that grace never resets it, and a later re-block starts a fresh episode.
 Each synthesized event's `detail` carries the stable since-time, so a re-nudge
 (same `job_id` + same since) is distinguishable from a fresh episode.
-`reply` consumes addressed workflow notes from the durable wake outbox and only
-wakes the role named by both the note and the rule. The daemon uses rolling
-five-second windows per role: one wake carries `N new items, oldest id X`.
+`reply` consumes addressed workflow notes and `kind=chat` messages from the
+durable wake outbox and only wakes the role named by both the message and the
+rule. Non-triggering chat back-links such as `job_result` do not enter the
+outbox. The daemon uses rolling five-second windows per role: one wake carries
+`N new items, oldest id X`.
 Pending, attempted, delivered, stalled, and failed remain queryable per outbox
 row, so an escalation that was never attempted is distinct from a successful
 wake. A quiet burst tail is flushed by a later daemon tick; it does not require
@@ -262,6 +264,6 @@ on the tracking issue:
 
 - The Unix-socket transport (`socket_path`), behind the same `Sink` seam.
 - More event types (`job.started`, `delegation.*`, `orchestration.finished`).
-- A webhook outbox for at-least-once HTTP delivery (addressed-note role wakes
+- A webhook outbox for at-least-once HTTP delivery (addressed-message role wakes
   already use a local durable outbox).
 - A server-side synthetic `orchestration.finished` (reliable tree convergence).

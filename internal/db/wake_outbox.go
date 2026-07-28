@@ -18,6 +18,7 @@ const (
 	WakeOutboxStateFailed    = "failed"
 
 	WakeOutboxSourceWorkflowNote  = "workflow_note"
+	WakeOutboxSourceChatMessage   = "chat_message"
 	WakeOutboxReplyCoalescePrefix = "reply:"
 )
 
@@ -39,19 +40,54 @@ type WakeOutboxEntry struct {
 }
 
 func insertWorkflowNoteWakeOutboxTx(ctx context.Context, tx *sql.Tx, noteID int64, targetRole string) error {
+	if err := insertWakeOutboxTx(
+		ctx, tx, WakeOutboxSourceWorkflowNote, strconv.FormatInt(noteID, 10), targetRole,
+	); err != nil {
+		return fmt.Errorf("insert workflow note wake outbox: %w", err)
+	}
+	return nil
+}
+
+func insertChatMessageWakeOutboxTx(ctx context.Context, tx *sql.Tx, messageID string, targetRoles []string) error {
+	seen := make(map[string]struct{}, len(targetRoles))
+	for _, targetRole := range targetRoles {
+		role := strings.ToLower(strings.TrimSpace(targetRole))
+		if role == "" {
+			continue
+		}
+		if _, exists := seen[role]; exists {
+			continue
+		}
+		seen[role] = struct{}{}
+		if err := insertWakeOutboxTx(ctx, tx, WakeOutboxSourceChatMessage, messageID, role); err != nil {
+			return fmt.Errorf("insert chat message wake outbox: %w", err)
+		}
+	}
+	return nil
+}
+
+func insertWakeOutboxTx(ctx context.Context, tx *sql.Tx, sourceKind, sourceID, targetRole string) error {
+	sourceKind = strings.TrimSpace(sourceKind)
+	if sourceKind == "" {
+		return errors.New("wake outbox source kind is required")
+	}
+	sourceID = strings.TrimSpace(sourceID)
+	if sourceID == "" {
+		return errors.New("wake outbox source id is required")
+	}
 	role := strings.ToLower(strings.TrimSpace(targetRole))
 	if role == "" {
-		return errors.New("workflow note addressed target is required")
+		return errors.New("wake outbox target role is required")
 	}
 	_, err := tx.ExecContext(ctx, `
 INSERT INTO wake_outbox(source_kind, source_id, target_role, coalesce_key)
 VALUES (?, ?, ?, ?)`,
-		WakeOutboxSourceWorkflowNote,
-		strconv.FormatInt(noteID, 10),
+		sourceKind,
+		sourceID,
 		role,
 		WakeOutboxReplyCoalescePrefix+role)
 	if err != nil {
-		return fmt.Errorf("insert workflow note wake outbox: %w", err)
+		return err
 	}
 	return nil
 }

@@ -58,15 +58,32 @@ func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
 	// wake) with NO deadline of its own: each herdr call below bounds itself, so a
 	// slow earlier rule cannot starve a later rule's wake.
 	base := context.WithoutCancel(ctx)
-	go func() {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				slog.Warn("org event wake panicked", "job_id", event.JobID, "error", recovered)
-				s.finishWakeOutbox(base, event, db.WakeOutboxStateFailed, "event-rule wake panicked")
-			}
-		}()
-		s.evaluate(base, event)
+	go s.evaluateSafely(base, event)
+}
+
+// emitWakeOutbox evaluates one already-claimed durable wake synchronously. The
+// daemon tick is the delivery owner after the short-lived producer exits, so it
+// must not return while an untracked goroutine still owns the attempted row.
+// Ordinary event emissions retain Emit's detached, best-effort behavior.
+func (s *eventRuleSink) emitWakeOutbox(ctx context.Context, event events.Event) {
+	if s == nil {
+		return
+	}
+	events.EmitEvent(ctx, s.inner, event)
+	if s.store == nil || s.wake == nil {
+		return
+	}
+	s.evaluateSafely(context.WithoutCancel(ctx), event)
+}
+
+func (s *eventRuleSink) evaluateSafely(ctx context.Context, event events.Event) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			slog.Warn("org event wake panicked", "job_id", event.JobID, "error", recovered)
+			s.finishWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "event-rule wake panicked")
+		}
 	}()
+	s.evaluate(ctx, event)
 }
 
 func (s *eventRuleSink) evaluate(ctx context.Context, event events.Event) {

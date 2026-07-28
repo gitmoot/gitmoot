@@ -91,12 +91,24 @@ func drainReplyWakeOutbox(ctx context.Context, store *db.Store, sink events.Sink
 			}
 			if claimed {
 				event.WakeOutboxIDs = ids
-				events.EmitEvent(ctx, sink, event)
+				emitReplyWakeOutboxEvent(ctx, sink, event)
 			}
 			start = end
 		}
 	}
 	return nil
+}
+
+type synchronousWakeOutboxSink interface {
+	emitWakeOutbox(context.Context, events.Event)
+}
+
+func emitReplyWakeOutboxEvent(ctx context.Context, sink events.Sink, event events.Event) {
+	if durable, ok := sink.(synchronousWakeOutboxSink); ok {
+		durable.emitWakeOutbox(ctx, event)
+		return
+	}
+	events.EmitEvent(ctx, sink, event)
 }
 
 func replyWakeEvent(batch []db.WakeOutboxEntry, now time.Time) events.Event {

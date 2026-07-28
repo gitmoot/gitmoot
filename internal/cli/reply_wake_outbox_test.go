@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -51,6 +52,32 @@ func TestReplyWakeOutboxBurstCoalescesToExactlyOneWake(t *testing.T) {
 	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
 	if err != nil || len(delivered) != 10 {
 		t.Fatalf("delivered rows = %+v, err=%v", delivered, err)
+	}
+}
+
+func TestReplyWakeOutboxDeliversAddressedChatMessage(t *testing.T) {
+	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
+	ctx := context.Background()
+	thread, err := store.CreateChatThread(ctx, db.ChatThread{Slug: "wake-chat", Repo: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := store.AddChatMessage(ctx, db.ChatMessage{
+		ThreadID: thread.ID, AuthorName: "human", Kind: db.ChatKindChat,
+		Body: "@owner please inspect", Mentions: []string{"owner"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	drainReplyWakeAfterAllRowsAreDue(t, store, sink)
+
+	if wake.promptCalls != 1 || !strings.Contains(wake.prompt, "1 new items, oldest id "+message.ID) {
+		t.Fatalf("chat wake = calls=%d prompt=%q", wake.promptCalls, wake.prompt)
+	}
+	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
+	if err != nil || len(delivered) != 1 || delivered[0].SourceKind != db.WakeOutboxSourceChatMessage {
+		t.Fatalf("delivered chat rows = %+v, err=%v", delivered, err)
 	}
 }
 
@@ -185,6 +212,133 @@ func TestReplyWakeOutboxRecordsExistingDeliveryOutcomeStates(t *testing.T) {
 			}
 		})
 	}
+}
+
+const replyWakeProducerDatabaseEnv = "GITMOOT_TEST_REPLY_WAKE_PRODUCER_DATABASE"
+
+func TestReplyWakeOutboxSurvivesProducerProcessExitAndDrainsOnLaterDaemonTick(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddEventRule(context.Background(), db.EventRule{
+		ID: "reply-process-exit", OnKind: "reply", WakeRole: "owner", Enabled: true,
+	}); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer := exec.Command(executable, "-test.run", "^TestReplyWakeOutboxProducerProcess$")
+	producer.Env = append(os.Environ(), replyWakeProducerDatabaseEnv+"="+paths.Database)
+	if output, err := producer.CombinedOutput(); err != nil {
+		t.Fatalf("producer process: %v\n%s", err, output)
+	}
+
+	store, err = db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending after producer exit = %+v, err=%v", pending, err)
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, pending[0].CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wake := &blockingReplyWake{started: make(chan struct{}), release: make(chan struct{})}
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.EventSinkOverride = &eventRuleSink{store: store, home: home, wake: wake}
+	tickDone := make(chan error, 1)
+	go func() {
+		tickDone <- runDaemonWorkerTickTracked(
+			context.Background(), store, worker, 0, false, "", "", io.Discard,
+			createdAt.Add(replyWakeCoalescingWindow+time.Second), nil, nil,
+		)
+	}()
+
+	select {
+	case <-wake.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("later daemon tick did not begin durable wake delivery")
+	}
+	select {
+	case err := <-tickDone:
+		t.Fatalf("daemon tick returned before durable delivery completed: %v", err)
+	case <-time.After(2 * time.Second):
+	}
+	close(wake.release)
+	select {
+	case err := <-tickDone:
+		if err != nil {
+			t.Fatalf("later daemon tick: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("later daemon tick did not finish after delivery")
+	}
+
+	delivered, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStateDelivered)
+	if err != nil || len(delivered) != 1 || delivered[0].SourceID != pending[0].SourceID {
+		t.Fatalf("delivered after producer exit = %+v, err=%v", delivered, err)
+	}
+}
+
+func TestReplyWakeOutboxProducerProcess(t *testing.T) {
+	databasePath := strings.TrimSpace(os.Getenv(replyWakeProducerDatabaseEnv))
+	if databasePath == "" {
+		return
+	}
+	store, err := db.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+		WorkflowID: "release/process-exit", Author: "worker", Body: "survive exit",
+		AddressedTarget: "owner",
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type blockingReplyWake struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (w *blockingReplyWake) Available(context.Context) bool {
+	return true
+}
+
+func (w *blockingReplyWake) AgentPrompt(ctx context.Context, _, _, _ string) (bool, bool, error) {
+	close(w.started)
+	select {
+	case <-w.release:
+		return true, false, nil
+	case <-ctx.Done():
+		return false, false, ctx.Err()
+	}
+}
+
+func (w *blockingReplyWake) ResolvePaneByLabel(_ context.Context, label string) (string, bool) {
+	return label, true
 }
 
 type replyWakeTestRole struct {
