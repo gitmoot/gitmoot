@@ -596,6 +596,59 @@ func TestRunJobRunUsesDaemonWorkerInternals(t *testing.T) {
 	}
 }
 
+func TestRunJobRunRefusesUnavailableRoleAndAllowsExpiredIncident(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	checkout := t.TempDir()
+	runGit(t, checkout, "init")
+	runGit(t, checkout, "branch", "-m", "main")
+	runGit(t, checkout, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime,
+		`printf '%s\n' '{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`,
+		[]string{"ask"}, "owner/repo")
+	seedCLIJob(t, store, db.Job{
+		ID:      "job-run-unavailable",
+		Agent:   "audit",
+		Type:    "ask",
+		State:   string(workflow.JobQueued),
+		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Branch: "main", ActingOrgRole: "review"}),
+	}, "queued")
+	now := time.Now().UTC()
+	if err := store.UpsertOrgRoleUnavailable(context.Background(), "review", "quota", now.Add(time.Hour), now); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"job", "run", "job-run-unavailable", "--home", home}, &stdout, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), `org role "review" is unavailable`) ||
+		!strings.Contains(stderr.String(), "dispatch refused") {
+		t.Fatalf("active unavailable job run: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	job, err := store.GetJob(context.Background(), "job-run-unavailable")
+	if err != nil || job.State != string(workflow.JobQueued) {
+		t.Fatalf("held job = %+v err=%v, want queued", job, err)
+	}
+
+	if err := store.ClearOrgRoleUnavailable(context.Background(), "review"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertOrgRoleUnavailable(context.Background(), "review", "quota", now.Add(-time.Minute), now.Add(-2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"job", "run", "job-run-unavailable", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("expired incident job run: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	job, err = store.GetJob(context.Background(), "job-run-unavailable")
+	if err != nil || job.State != string(workflow.JobSucceeded) {
+		t.Fatalf("job after expired incident = %+v err=%v", job, err)
+	}
+}
+
 func TestTranscriptRetentionForegroundAndDaemonShellE2E(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HERDR_ENV", "")

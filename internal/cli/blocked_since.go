@@ -203,6 +203,12 @@ func runBlockedRoleWakeOnce(ctx context.Context, store *db.Store, home string, s
 	if store == nil {
 		return
 	}
+	// #1136 shares this host-global one-minute cadence but is independent of
+	// Herdr/config availability: a provider-declared quota reset must clear even
+	// on a daemon with no live org presence provider.
+	if _, err := store.ClearExpiredOrgRolesUnavailable(ctx, now.UTC()); err != nil {
+		writeLine(stdout, "org role quota-unavailable sweep failed: %v", err)
+	}
 	configFile := resolveConfigFile(home)
 	if configFile == "" {
 		return

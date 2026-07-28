@@ -416,6 +416,9 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return fmt.Errorf("invalid repo: %w", err)
 		}
+		if err := validateAndTouchActingOrgRole(context.Background(), store, *home, *orgRole, "task_run"); err != nil {
+			return err
+		}
 		// Capture the registry once before any repo/task/worktree mutation, then
 		// hand the identical policy to the enqueue chokepoint below.
 		orgPolicy := orgPolicyResolverRoot(paths.Home)(requestRepo)

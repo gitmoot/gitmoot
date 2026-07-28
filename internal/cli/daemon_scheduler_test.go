@@ -4746,6 +4746,156 @@ func TestTickCandidatesComputedOncePerTick(t *testing.T) {
 	}
 }
 
+func TestForeignBootRecoveryRunsOnceOutsideMultiRepoSweepAndIsThrottled(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	const repoCount = 3
+	for i := 0; i < repoCount; i++ {
+		seedDaemonWorkerRepo(t, store, fmt.Sprintf("owner/repo%d", i), t.TempDir())
+	}
+	worker := defaultJobWorker(store, io.Discard)
+	tracker := newInflightJobTracker(ctx)
+	defer tracker.drain(io.Discard, time.Second)
+
+	realRecover := recoverForeignBootRunnersForSweep
+	var calls int32
+	recoverForeignBootRunnersForSweep = func(ctx context.Context, store *db.Store, stdout io.Writer) error {
+		atomic.AddInt32(&calls, 1)
+		return realRecover(ctx, store, stdout)
+	}
+	defer func() { recoverForeignBootRunnersForSweep = realRecover }()
+
+	now := time.Now().UTC()
+	// The per-repo worker sweep must not own this global pass anymore: three
+	// enabled repos still produce zero foreign-boot recovery calls here.
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now, nil, tracker); err != nil {
+		t.Fatalf("runEnabledRepoWorkerTicksTracked returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Fatalf("foreign-boot recovery calls inside %d-repo worker sweep = %d, want 0", repoCount, got)
+	}
+
+	// Its supervisor-level sibling pass runs eagerly once, then observes the
+	// process-lifetime cadence rather than multiplying by repo count.
+	if err := runForeignBootRecoveryOnce(ctx, store, io.Discard, now, tracker); err != nil {
+		t.Fatalf("first runForeignBootRecoveryOnce returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("first supervisor recovery calls = %d, want 1", got)
+	}
+	if err := runForeignBootRecoveryOnce(ctx, store, io.Discard, now.Add(foreignBootRecoveryInterval-time.Nanosecond), tracker); err != nil {
+		t.Fatalf("throttled runForeignBootRecoveryOnce returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("recovery calls inside throttle window = %d, want 1", got)
+	}
+	if err := runForeignBootRecoveryOnce(ctx, store, io.Discard, now.Add(foreignBootRecoveryInterval), tracker); err != nil {
+		t.Fatalf("due runForeignBootRecoveryOnce returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("recovery calls after throttle window = %d, want 2", got)
+	}
+}
+
+func TestForeignBootRecoveryFailureDoesNotAdvanceThrottle(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	tracker := newInflightJobTracker(ctx)
+	defer tracker.drain(io.Discard, time.Second)
+
+	realRecover := recoverForeignBootRunnersForSweep
+	var calls int32
+	recoverForeignBootRunnersForSweep = func(context.Context, *db.Store, io.Writer) error {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			return errors.New("transient recovery failure")
+		}
+		return nil
+	}
+	defer func() { recoverForeignBootRunnersForSweep = realRecover }()
+
+	now := time.Now().UTC()
+	if err := runForeignBootRecoveryOnce(ctx, store, io.Discard, now, tracker); err == nil {
+		t.Fatal("first runForeignBootRecoveryOnce returned nil, want injected error")
+	}
+	// The same synthetic instant must retry: only a successful pass advances the
+	// throttle timestamp.
+	if err := runForeignBootRecoveryOnce(ctx, store, io.Discard, now, tracker); err != nil {
+		t.Fatalf("retry runForeignBootRecoveryOnce returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("recovery calls after failed first pass = %d, want 2", got)
+	}
+	if err := runForeignBootRecoveryOnce(ctx, store, io.Discard, now, tracker); err != nil {
+		t.Fatalf("post-success throttled run returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("recovery calls after successful retry = %d, want still 2", got)
+	}
+}
+
+func TestAgedDelegationReclaimThrottledAcrossMultiRepoTicks(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	const repoCount = 3
+	for i := 0; i < repoCount; i++ {
+		seedDaemonWorkerRepo(t, store, fmt.Sprintf("owner/repo%d", i), t.TempDir())
+	}
+	worker := defaultJobWorker(store, io.Discard)
+	tracker := newInflightJobTracker(ctx)
+	defer tracker.drain(io.Discard, time.Second)
+
+	counter := &countingCandidateStore{inner: store}
+	realNewTickCandidates := newTickCandidates
+	newTickCandidates = func(tickCandidateStore) *tickCandidates {
+		return realNewTickCandidates(counter)
+	}
+	defer func() { newTickCandidates = realNewTickCandidates }()
+
+	now := time.Now().UTC()
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now, nil, tracker); err != nil {
+		t.Fatalf("first runEnabledRepoWorkerTicksTracked returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&counter.agedReclaim); got != 1 {
+		t.Fatalf("first aged-reclaim query count = %d, want 1 (fresh daemon runs eagerly)", got)
+	}
+
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now.Add(agedDelegationWorktreeReclaimInterval-time.Nanosecond), nil, tracker); err != nil {
+		t.Fatalf("throttled runEnabledRepoWorkerTicksTracked returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&counter.agedReclaim); got != 1 {
+		t.Fatalf("aged-reclaim query count inside throttle window = %d, want 1", got)
+	}
+
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now.Add(agedDelegationWorktreeReclaimInterval), nil, tracker); err != nil {
+		t.Fatalf("due runEnabledRepoWorkerTicksTracked returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&counter.agedReclaim); got != 2 {
+		t.Fatalf("aged-reclaim query count after throttle window = %d, want 2", got)
+	}
+
+	// The single-repo supervisor passes a nil carrier and lets the tick build its
+	// own. Pin that separate production path too: it shares the same persistent
+	// tracker cadence and must not regress to one query per second.
+	atomic.StoreInt32(&counter.agedReclaim, 0)
+	singleTracker := newInflightJobTracker(ctx)
+	defer singleTracker.drain(io.Discard, time.Second)
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, 1, false, "owner/repo0", "", io.Discard, now, singleTracker, nil); err != nil {
+		t.Fatalf("first single-repo tick returned error: %v", err)
+	}
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, 1, false, "owner/repo0", "", io.Discard, now.Add(agedDelegationWorktreeReclaimInterval-time.Nanosecond), singleTracker, nil); err != nil {
+		t.Fatalf("throttled single-repo tick returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&counter.agedReclaim); got != 1 {
+		t.Fatalf("single-repo aged-reclaim count inside throttle window = %d, want 1", got)
+	}
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, 1, false, "owner/repo0", "", io.Discard, now.Add(agedDelegationWorktreeReclaimInterval), singleTracker, nil); err != nil {
+		t.Fatalf("due single-repo tick returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&counter.agedReclaim); got != 2 {
+		t.Fatalf("single-repo aged-reclaim count after throttle window = %d, want 2", got)
+	}
+}
+
 // TestTickCandidatesRetriesOnError pins FIX-A (#620 review): the per-tick carrier
 // memoizes SUCCESSES only. The first access to each query returns the store's
 // transient error WITHOUT memoizing it; the second access re-runs the query and

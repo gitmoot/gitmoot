@@ -99,8 +99,9 @@ const authBlockerRetryDelay = 5 * time.Minute
 const quotaBlockerFallbackDelay = 15 * time.Minute
 
 // quotaBlockerMaxParsedDelay caps a parsed reset delay so a garbled "try again
-// in N hours" can never park a job for days.
-const quotaBlockerMaxParsedDelay = 24 * time.Hour
+// in N hours" can never park a job indefinitely. Eight days covers a provider's
+// real weekly quota window while remaining bounded.
+const quotaBlockerMaxParsedDelay = 8 * 24 * time.Hour
 
 // quotaBlockerMinParsedDelay floors a parsed reset delay so a sub-second
 // provider hint ("try again in 1.898s") plus jitter can never re-dispatch
@@ -118,6 +119,15 @@ type blockerClassification struct {
 	Class   blockerClass
 	RetryAt time.Time // earliest safe automatic re-dispatch (UTC)
 	Detail  string    // first line of the causing error, for events/UX
+	// QuotaResetAt is the provider-declared reset instant, or the bounded
+	// fallback instant when no reset could be parsed. RetryAt may include fleet
+	// jitter; role unavailability must use this exact, non-jittered boundary.
+	QuotaResetAt     time.Time
+	QuotaResetParsed bool
+	// QuotaResetMentioned distinguishes a malformed/unknown reset hint from a
+	// quota error that supplied no reset hint at all. Both use the bounded
+	// fallback, but diagnostics should not conflate them.
+	QuotaResetMentioned bool
 	// SuggestedAction, when set, is a concrete human-facing remedy surfaced through
 	// the #552 stuck surface (job list/show) and persisted in the payload. Only the
 	// checkout dirty/wrong-head sub-class sets it today (#532 slice C); auth/quota/
@@ -171,8 +181,12 @@ func classifyOperationalBlocker(cause error, now time.Time) (blockerClassificati
 	}
 	switch classifyAuthQuotaStrict(text) {
 	case "throttled":
-		delay := parseQuotaResetDelay(text)
-		return blockerClassification{Class: blockerClassRuntimeQuota, RetryAt: now.Add(delay + blockerRetryJitter(delay)), Detail: detail}, true
+		resetAt, parsed := parseQuotaResetAt(text, now)
+		delay := resetAt.Sub(now)
+		return blockerClassification{
+			Class: blockerClassRuntimeQuota, RetryAt: resetAt.Add(blockerRetryJitter(delay)), Detail: detail,
+			QuotaResetAt: resetAt, QuotaResetParsed: parsed, QuotaResetMentioned: quotaResetHintMentioned(text),
+		}, true
 	case "auth failing":
 		return blockerClassification{Class: blockerClassRuntimeAuth, RetryAt: now.Add(authBlockerRetryDelay), Detail: detail}, true
 	}
@@ -204,8 +218,9 @@ var (
 // to be co-located with genuine HTTP context on the SAME line, and "HTTP
 // context" means http/status code/retry-after — NOT the bare "status" that
 // every "exit status N" exec error carries. The word signatures (usage/rate
-// limit, quota, authentication, unauthorized, auth+invalid) are unchanged from
-// #552. The first matching line wins.
+// limit, quota, authentication, unauthorized, auth+invalid) are extended with
+// Claude's provider wording ("weekly limit", and durable "hit your ... limit"
+// variants). The first matching line wins.
 func classifyAuthQuotaStrict(text string) string {
 	for _, line := range strings.Split(text, "\n") {
 		l := strings.ToLower(strings.TrimSpace(line))
@@ -215,6 +230,8 @@ func classifyAuthQuotaStrict(text string) string {
 		httpCtx := strings.Contains(l, "http") || strings.Contains(l, "status code") || strings.Contains(l, "retry-after")
 		switch {
 		case strings.Contains(l, "usage limit"), strings.Contains(l, "rate limit"),
+			strings.Contains(l, "weekly limit"),
+			claudeHitYourQuotaLimit(l),
 			strings.Contains(l, "quota"), strings.Contains(l, "limit resets"),
 			httpCtx && code429Re.MatchString(l):
 			return "throttled"
@@ -225,6 +242,19 @@ func classifyAuthQuotaStrict(text string) string {
 		}
 	}
 	return ""
+}
+
+// claudeQuotaSignalRe matches a genuine quota/usage word (allowing a suffix,
+// e.g. "weekly", "credits", "resets") at a word boundary, so an unrelated
+// message can't false-match by embedding the signal mid-word (e.g. "rate"
+// inside "generate").
+var claudeQuotaSignalRe = regexp.MustCompile(`\b(week|usage|quota|credit|reset|rate)`)
+
+func claudeHitYourQuotaLimit(line string) bool {
+	if !strings.Contains(line, "hit your") || !strings.Contains(line, "limit") {
+		return false
+	}
+	return claudeQuotaSignalRe.MatchString(line)
 }
 
 // quotaResetInRe matches relative reset hints the providers actually emit, e.g.
@@ -239,15 +269,22 @@ var quotaResetInRe = regexp.MustCompile(`(?i)(?:try again in|retry after|retry i
 // "Claude AI usage limit reached|<unix-epoch>".
 var quotaResetEpochRe = regexp.MustCompile(`\|(\d{10})\b`)
 
-// parseQuotaResetDelay extracts the provider-declared reset delay from a
-// rate-limit/quota error. A bare number with no unit is seconds (the
-// Retry-After header shape) — but a number followed by an UNRECOGNIZED unit
-// word ("try again in 5 fortnights") is unparseable, because reading it as
-// seconds would re-dispatch inside a still-closed window and burn the retry
-// budget. Unparseable messages (e.g. codex's "try again at Jun 14th") fall
-// back to quotaBlockerFallbackDelay; parsed values are clamped to
-// [quotaBlockerMinParsedDelay, quotaBlockerMaxParsedDelay].
-func parseQuotaResetDelay(text string) time.Duration {
+// quotaResetAbsoluteRe matches Claude's current natural-language weekly reset
+// hint, including small punctuation variations:
+//
+//	"resets Jul 28, 1am (Europe/Berlin)"
+//	"resets on July 28 at 1:00 AM (Europe/Berlin)"
+//
+// The named zone is intentionally required. Guessing a timezone from a local
+// abbreviation would make the durable refusal window unsafe.
+var quotaResetAbsoluteRe = regexp.MustCompile(`(?i)\bresets?\s+(?:on\s+)?([a-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?(?:,\s*|\s+)(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(([^)]+)\)`)
+
+// parseQuotaResetAt extracts the provider-declared reset instant. Its bool says
+// whether a provider hint was successfully parsed; false returns the existing
+// bounded 15-minute fallback. Relative, epoch, and absolute values share the
+// same min/max clamp.
+func parseQuotaResetAt(text string, now time.Time) (time.Time, bool) {
+	now = now.UTC()
 	if idx := quotaResetInRe.FindStringSubmatchIndex(text); idx != nil {
 		unit := ""
 		if idx[4] >= 0 {
@@ -263,19 +300,87 @@ func parseQuotaResetDelay(text string) time.Duration {
 				case strings.HasPrefix(strings.ToLower(unit), "h"):
 					scale = time.Hour
 				}
-				return clampQuotaDelay(time.Duration(n * float64(scale)))
+				return now.Add(clampQuotaDelay(time.Duration(n * float64(scale)))), true
 			}
 		}
 	}
 	if m := quotaResetEpochRe.FindStringSubmatch(text); m != nil {
 		epoch, err := strconv.ParseInt(m[1], 10, 64)
 		if err == nil {
-			if until := time.Until(time.Unix(epoch, 0)); until > 0 {
-				return clampQuotaDelay(until)
+			if delay := time.Unix(epoch, 0).Sub(now); delay > 0 {
+				return now.Add(clampQuotaDelay(delay)), true
 			}
 		}
 	}
-	return quotaBlockerFallbackDelay
+	if m := quotaResetAbsoluteRe.FindStringSubmatch(text); m != nil {
+		month, ok := parseQuotaResetMonth(m[1])
+		day, dayErr := strconv.Atoi(m[2])
+		hour, hourErr := strconv.Atoi(m[3])
+		minute := 0
+		var minuteErr error
+		if m[4] != "" {
+			minute, minuteErr = strconv.Atoi(m[4])
+		}
+		zoneName := strings.TrimSpace(m[6])
+		location, zoneErr := time.LoadLocation(zoneName)
+		if ok && dayErr == nil && hourErr == nil && minuteErr == nil && zoneErr == nil &&
+			day >= 1 && day <= 31 && hour >= 1 && hour <= 12 && minute >= 0 && minute <= 59 {
+			if strings.EqualFold(m[5], "am") {
+				if hour == 12 {
+					hour = 0
+				}
+			} else if hour != 12 {
+				hour += 12
+			}
+			localNow := now.In(location)
+			candidate := time.Date(localNow.Year(), month, day, hour, minute, 0, 0, location)
+			// Reject normalized impossible dates such as Feb 31.
+			if candidate.Month() == month && candidate.Day() == day {
+				if !candidate.After(localNow) {
+					// Claude omits the year. Only roll forward across the one
+					// credible boundary: a December observation naming January.
+					// A same-day reset a few minutes in the past is more likely
+					// provider/host skew or delayed delivery; parking the role for
+					// a clamped eight days would be actively unsafe.
+					if localNow.Month() != time.December || month != time.January {
+						return now.Add(quotaBlockerFallbackDelay), false
+					}
+					candidate = time.Date(localNow.Year()+1, month, day, hour, minute, 0, 0, location)
+				}
+				if delay := candidate.Sub(now); delay > 0 {
+					if clamped := clampQuotaDelay(delay); clamped != delay {
+						return now.Add(clamped), true
+					}
+					return candidate, true
+				}
+			}
+		}
+	}
+	return now.Add(quotaBlockerFallbackDelay), false
+}
+
+func parseQuotaResetMonth(value string) (time.Month, bool) {
+	for month := time.January; month <= time.December; month++ {
+		long := strings.ToLower(month.String())
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == long || (len(value) == 3 && value == long[:3]) {
+			return month, true
+		}
+	}
+	return 0, false
+}
+
+func quotaResetHintMentioned(text string) bool {
+	text = strings.ToLower(text)
+	return strings.Contains(text, "reset") || strings.Contains(text, "try again") || strings.Contains(text, "retry")
+}
+
+// parseQuotaResetDelay is the duration compatibility wrapper used by the
+// existing blocker tests and retry path.
+func parseQuotaResetDelay(text string) time.Duration {
+	now := time.Now().UTC()
+	resetAt, _ := parseQuotaResetAt(text, now)
+	return resetAt.Sub(now)
 }
 
 // startsWithLetter reports whether rest — the text immediately after a matched
