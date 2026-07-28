@@ -111,15 +111,25 @@ func (w jobWorker) eventSink() events.Sink {
 	return daemonEventSink(w.Store, w.workflowHome())
 }
 
-// replyWakeEventSink is the strict sink-resolution seam for durable outbox
-// delivery. Unlike ordinary best-effort event emission, an event-rules read
-// failure must fail the worker tick instead of becoming an indistinguishable
-// nil/disabled sink.
-func (w jobWorker) replyWakeEventSink(ctx context.Context) (events.Sink, error) {
-	if w.EventSinkOverride != nil {
-		return w.EventSinkOverride, nil
+// replyWakeDelivery resolves one authoritative rules snapshot and the sink
+// built from it. The outbox reads pending rows before invoking this method, and
+// the sink receives the same snapshot after claim, so routing cannot become
+// unreadable between claim and delivery.
+func (w jobWorker) replyWakeDelivery(ctx context.Context) (replyWakeDelivery, error) {
+	if w.Store == nil {
+		return replyWakeDelivery{}, errors.New("wake outbox store is required")
 	}
-	return resolveDaemonEventSink(ctx, w.Store, w.workflowHome())
+	rules, err := w.Store.ListEventRules(ctx)
+	if err != nil {
+		return replyWakeDelivery{}, fmt.Errorf("list event rules: %w", err)
+	}
+	if w.EventSinkOverride != nil {
+		return replyWakeDelivery{sink: w.EventSinkOverride, rules: rules}, nil
+	}
+	return replyWakeDelivery{
+		sink:  resolveDaemonEventSinkWithRules(w.Store, w.workflowHome(), rules),
+		rules: rules,
+	}, nil
 }
 
 type tempWorkerEligibility struct {

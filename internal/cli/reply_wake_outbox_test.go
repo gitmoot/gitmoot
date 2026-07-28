@@ -134,7 +134,7 @@ func TestReplyWakeOutboxStartsNewBatchAfterWindow(t *testing.T) {
 	setWakeOutboxCreatedAt(t, store.DatabasePath(), fmt.Sprint(first.ID), base)
 	setWakeOutboxCreatedAt(t, store.DatabasePath(), fmt.Sprint(second.ID), base.Add(replyWakeCoalescingWindow))
 
-	if err := drainReplyWakeOutbox(ctx, store, sink, base.Add(2*replyWakeCoalescingWindow+time.Second)); err != nil {
+	if err := drainReplyWakeOutbox(ctx, store, base.Add(2*replyWakeCoalescingWindow+time.Second), replyWakeTestDeliveryResolver(sink)); err != nil {
 		t.Fatal(err)
 	}
 	if wake.promptCalls != 2 {
@@ -147,7 +147,7 @@ func TestReplyWakeOutboxStartsNewBatchAfterWindow(t *testing.T) {
 	}
 }
 
-func TestReplyWakeOutboxTailFlushesWithoutAnotherNote(t *testing.T) {
+func TestReplyWakeOutboxFleetDrainRunsWithZeroEnabledRepos(t *testing.T) {
 	store, sink, wake, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
 	ctx := context.Background()
 	for index := 0; index < 4; index++ {
@@ -166,19 +166,23 @@ func TestReplyWakeOutboxTailFlushesWithoutAnotherNote(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := drainReplyWakeOutbox(ctx, store, sink, oldestAt.Add(replyWakeCoalescingWindow-time.Millisecond)); err != nil {
+	if err := drainReplyWakeOutbox(ctx, store, oldestAt.Add(replyWakeCoalescingWindow-time.Millisecond), replyWakeTestDeliveryResolver(sink)); err != nil {
 		t.Fatal(err)
 	}
 	if wake.promptCalls != 0 {
 		t.Fatalf("tail woke before window closed: %v", wake.prompts)
 	}
 	worker := defaultJobWorker(store, io.Discard, home)
-	worker.EventSinkOverride = sink
-	if err := runDaemonWorkerTickTracked(
-		ctx, store, worker, 0, false, "", "", io.Discard,
+	installReplyWakeProductionSink(t, worker, sink.sink)
+	repos, err := store.ListRepos(ctx)
+	if err != nil || len(repos) != 0 {
+		t.Fatalf("repos = %+v, err=%v; test requires a zero-repo fleet", repos, err)
+	}
+	if err := runEnabledRepoWorkerTicksTracked(
+		ctx, store, worker, 0, "", io.Discard,
 		oldestAt.Add(replyWakeCoalescingWindow), nil, nil,
 	); err != nil {
-		t.Fatalf("daemon tick: %v", err)
+		t.Fatalf("fleet daemon tick: %v", err)
 	}
 	if wake.promptCalls != 1 || !strings.Contains(wake.prompt, "4 new items, oldest id ") {
 		t.Fatalf("tail wake = calls=%d prompt=%q", wake.promptCalls, wake.prompt)
@@ -190,10 +194,11 @@ func TestReplyWakeOutboxRecordsExistingDeliveryOutcomeStates(t *testing.T) {
 		name      string
 		configure func(*fakeEventWake)
 		wantState string
+		wantErr   bool
 	}{
 		{name: "stalled", configure: func(w *fakeEventWake) { w.stalled = true }, wantState: db.WakeOutboxStateStalled},
-		{name: "transport failure", configure: func(w *fakeEventWake) { w.promptErr = errors.New("transport down") }, wantState: db.WakeOutboxStateFailed},
-		{name: "odd non delivery", configure: func(w *fakeEventWake) { w.oddNonDelivery = true }, wantState: db.WakeOutboxStateFailed},
+		{name: "transport failure", configure: func(w *fakeEventWake) { w.promptErr = errors.New("transport down") }, wantState: db.WakeOutboxStateFailed, wantErr: true},
+		{name: "odd non delivery", configure: func(w *fakeEventWake) { w.oddNonDelivery = true }, wantState: db.WakeOutboxStateFailed, wantErr: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -205,7 +210,10 @@ func TestReplyWakeOutboxRecordsExistingDeliveryOutcomeStates(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			drainReplyWakeAfterAllRowsAreDue(t, store, sink)
+			drainErr := drainReplyWakeAfterAllRowsAreDueResult(t, store, sink)
+			if (drainErr != nil) != test.wantErr {
+				t.Fatalf("drain error = %v, wantErr=%v", drainErr, test.wantErr)
+			}
 			rows, err := store.ListWakeOutbox(context.Background(), test.wantState)
 			if err != nil || len(rows) != 1 || rows[0].AttemptCount != 1 || rows[0].FinishedAt == "" {
 				t.Fatalf("%s rows = %+v, err=%v", test.wantState, rows, err)
@@ -214,8 +222,8 @@ func TestReplyWakeOutboxRecordsExistingDeliveryOutcomeStates(t *testing.T) {
 	}
 }
 
-func TestReplyWakeOutboxReadFailureFailsDaemonTickClosed(t *testing.T) {
-	store, sink, _, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
+func TestReplyWakeOutboxReadFailureFailsFleetTickClosedWithoutSinkOverride(t *testing.T) {
+	store, _, _, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
 	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
 		WorkflowID: "release/read-failure", Author: "worker", Body: "must stay visible",
 		AddressedTarget: "owner",
@@ -233,9 +241,8 @@ func TestReplyWakeOutboxReadFailureFailsDaemonTickClosed(t *testing.T) {
 	}
 
 	worker := defaultJobWorker(store, io.Discard, home)
-	worker.EventSinkOverride = sink
-	err = runDaemonWorkerTickTracked(
-		context.Background(), store, worker, 0, false, "", "", io.Discard,
+	err = runEnabledRepoWorkerTicksTracked(
+		context.Background(), store, worker, 0, "", io.Discard,
 		time.Now().UTC(), nil, nil,
 	)
 	if err == nil {
@@ -247,7 +254,7 @@ func TestReplyWakeOutboxReadFailureFailsDaemonTickClosed(t *testing.T) {
 	}
 }
 
-func TestReplyWakeOutboxEventRulesReadFailureFailsDaemonTickClosed(t *testing.T) {
+func TestReplyWakeOutboxEventRulesReadFailureFailsFleetTickClosedWithoutSinkOverride(t *testing.T) {
 	store, _, _, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
 	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
 		WorkflowID: "release/rules-read-failure", Author: "worker", Body: "must stay pending",
@@ -266,8 +273,8 @@ func TestReplyWakeOutboxEventRulesReadFailureFailsDaemonTickClosed(t *testing.T)
 	}
 
 	worker := defaultJobWorker(store, io.Discard, home)
-	tickErr := runDaemonWorkerTickTracked(
-		context.Background(), store, worker, 0, false, "", "", io.Discard,
+	tickErr := runEnabledRepoWorkerTicksTracked(
+		context.Background(), store, worker, 0, "", io.Discard,
 		time.Now().UTC(), nil, nil,
 	)
 	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
@@ -277,9 +284,89 @@ func TestReplyWakeOutboxEventRulesReadFailureFailsDaemonTickClosed(t *testing.T)
 	if tickErr == nil {
 		t.Fatal("daemon tick reported healthy after sink resolution skipped a pending wake")
 	}
-	if !strings.Contains(tickErr.Error(), "reply wake outbox sink resolution failed") ||
+	if !strings.Contains(tickErr.Error(), "resolve wake outbox delivery") ||
 		!strings.Contains(tickErr.Error(), "no such table: event_rules") {
 		t.Fatalf("daemon tick error = %q, want explicit event_rules read cause", tickErr)
+	}
+}
+
+func TestReplyWakeOutboxZeroRulesFailsFleetTickClosedWithoutSinkOverride(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+		WorkflowID: "release/zero-rules", Author: "worker", Body: "must stay pending",
+		AddressedTarget: "owner",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	worker := defaultJobWorker(store, io.Discard, home)
+	tickErr := runEnabledRepoWorkerTicksTracked(
+		context.Background(), store, worker, 0, "", io.Discard,
+		time.Now().UTC(), nil, nil,
+	)
+	if tickErr == nil || !strings.Contains(tickErr.Error(), "pending reply wakes have no enabled delivery sink") {
+		t.Fatalf("fleet tick error = %v, want explicit zero-rule refusal", tickErr)
+	}
+	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending rows after zero-rule refusal = %+v, err=%v", pending, err)
+	}
+}
+
+func TestReplyWakeOutboxFinishFailureFailsFleetTickAfterClaimWithoutSinkOverride(t *testing.T) {
+	store, sink, _, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
+	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+		WorkflowID: "release/finish-failure", Author: "worker", Body: "must surface finish failure",
+		AddressedTarget: "owner",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending rows = %+v, err=%v", pending, err)
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, pending[0].CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`
+CREATE TRIGGER reject_wake_outbox_finish
+BEFORE UPDATE OF state ON wake_outbox
+WHEN OLD.state = 'attempted' AND NEW.state = 'delivered'
+BEGIN
+	SELECT RAISE(ABORT, 'forced wake outbox finish failure');
+END`); err != nil {
+		t.Fatal(err)
+	}
+
+	worker := defaultJobWorker(store, io.Discard, home)
+	installReplyWakeProductionSink(t, worker, sink.sink)
+	tickErr := runEnabledRepoWorkerTicksTracked(
+		context.Background(), store, worker, 0, "", io.Discard,
+		createdAt.Add(replyWakeCoalescingWindow+time.Second), nil, nil,
+	)
+	if tickErr == nil ||
+		!strings.Contains(tickErr.Error(), "finish wake outbox as delivered") ||
+		!strings.Contains(tickErr.Error(), "forced wake outbox finish failure") {
+		t.Fatalf("fleet tick error = %v, want propagated post-claim finish failure", tickErr)
+	}
+	attempted, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStateAttempted)
+	if err != nil || len(attempted) != 1 {
+		t.Fatalf("attempted rows after finish failure = %+v, err=%v", attempted, err)
 	}
 }
 
@@ -334,11 +421,11 @@ func TestReplyWakeOutboxSurvivesProducerProcessExitAndDrainsOnLaterDaemonTick(t 
 
 	wake := &blockingReplyWake{started: make(chan struct{}), release: make(chan struct{})}
 	worker := defaultJobWorker(store, io.Discard, home)
-	worker.EventSinkOverride = &eventRuleSink{store: store, home: home, wake: wake}
+	installReplyWakeProductionSink(t, worker, &eventRuleSink{wake: wake})
 	tickDone := make(chan error, 1)
 	go func() {
-		tickDone <- runDaemonWorkerTickTracked(
-			context.Background(), store, worker, 0, false, "", "", io.Discard,
+		tickDone <- runEnabledRepoWorkerTicksTracked(
+			context.Background(), store, worker, 0, "", io.Discard,
 			createdAt.Add(replyWakeCoalescingWindow+time.Second), nil, nil,
 		)
 	}()
@@ -451,6 +538,13 @@ func replyWakeTestHarness(t *testing.T, roles []replyWakeTestRole) (*db.Store, s
 
 func drainReplyWakeAfterAllRowsAreDue(t *testing.T, store *db.Store, sink synchronousEventRuleTestSink) {
 	t.Helper()
+	if err := drainReplyWakeAfterAllRowsAreDueResult(t, store, sink); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func drainReplyWakeAfterAllRowsAreDueResult(t *testing.T, store *db.Store, sink synchronousEventRuleTestSink) error {
+	t.Helper()
 	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
 	if err != nil || len(pending) == 0 {
 		t.Fatalf("pending rows = %+v, err=%v", pending, err)
@@ -465,9 +559,39 @@ func drainReplyWakeAfterAllRowsAreDue(t *testing.T, store *db.Store, sink synchr
 			latest = createdAt
 		}
 	}
-	if err := drainReplyWakeOutbox(context.Background(), store, sink, latest.Add(replyWakeCoalescingWindow+time.Second)); err != nil {
-		t.Fatal(err)
+	return drainReplyWakeOutbox(context.Background(), store, latest.Add(replyWakeCoalescingWindow+time.Second), replyWakeTestDeliveryResolver(sink))
+}
+
+func replyWakeTestDeliveryResolver(sink synchronousEventRuleTestSink) replyWakeDeliveryResolver {
+	return func(ctx context.Context) (replyWakeDelivery, error) {
+		rules, err := sink.sink.store.ListEventRules(ctx)
+		if err != nil {
+			return replyWakeDelivery{}, err
+		}
+		return replyWakeDelivery{sink: sink, rules: rules}, nil
 	}
+}
+
+func installReplyWakeProductionSink(t *testing.T, worker jobWorker, sink *eventRuleSink) {
+	t.Helper()
+	home := worker.workflowHome()
+	key := home + "\x00" + worker.Store.DatabasePath()
+	sink.store = worker.Store
+	sink.home = home
+	eventSinkCache.Lock()
+	oldSink, hadSink := eventSinkCache.rules[key]
+	eventSinkCache.rules[key] = sink
+	eventSinkCache.Unlock()
+	t.Cleanup(func() {
+		eventSinkCache.Lock()
+		if hadSink {
+			eventSinkCache.rules[key] = oldSink
+		} else {
+			delete(eventSinkCache.rules, key)
+		}
+		delete(eventSinkCache.webhooks, home)
+		eventSinkCache.Unlock()
+	})
 }
 
 func setWakeOutboxCreatedAt(t *testing.T, databasePath, sourceID string, at time.Time) {

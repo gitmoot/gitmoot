@@ -803,20 +803,6 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	if err := sweepBlockedTaskWakeEvents(ctx, store, worker.workflowHome(), repoFilter, stdout, now); err != nil {
 		writeLine(stdout, "blocked_since task sweep failed: %v", err)
 	}
-	// #1200/#1201 durable addressed-note wakes. The note transaction writes only
-	// SQL; this daemon tick claims due coalesced rows and invokes the existing
-	// event-rule delivery path after every producer transaction has committed.
-	// The outbox is the durable delivery record, so a read/drain failure makes
-	// delivery indeterminate. Fail the tick instead of reporting healthy and
-	// dispatching more work; the recovering supervisor retries transient faults
-	// and escalates persistent shared-store failures through its existing path.
-	replyWakeSink, sinkErr := worker.replyWakeEventSink(ctx)
-	if sinkErr != nil {
-		return fmt.Errorf("reply wake outbox sink resolution failed: %w", sinkErr)
-	}
-	if err := drainReplyWakeOutbox(ctx, store, replyWakeSink, now); err != nil {
-		return fmt.Errorf("reply wake outbox drain failed: %w", err)
-	}
 	// Checkout-mutating maintenance (advancement/merge retries, delegation
 	// worktree reclaims) is gated on the ACTUAL mutation hazard — each
 	// candidate is skipped while an in-flight job holds the checkout key the
@@ -879,6 +865,12 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 }
 
 func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, worker jobWorker, workers int, rootFilter string, stdout io.Writer, now time.Time, locks *repoCheckoutLocks, tracker *inflightJobTracker) error {
+	// #1200/#1201 durable addressed-note wakes belong to the shared store, not
+	// any repository. Drain before listing repos so zero enabled repos cannot
+	// suppress delivery or hide an unreadable outbox behind a healthy fleet tick.
+	if err := drainFleetReplyWakeOutbox(ctx, store, worker, now); err != nil {
+		return err
+	}
 	repos, err := store.ListRepos(ctx)
 	if err != nil {
 		return err
@@ -938,6 +930,13 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 	// single-repo supervisor.
 	if enabled > 0 && failed == enabled {
 		return lastErr
+	}
+	return nil
+}
+
+func drainFleetReplyWakeOutbox(ctx context.Context, store *db.Store, worker jobWorker, now time.Time) error {
+	if err := drainReplyWakeOutbox(ctx, store, now, worker.replyWakeDelivery); err != nil {
+		return fmt.Errorf("reply wake outbox drain failed: %w", err)
 	}
 	return nil
 }

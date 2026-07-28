@@ -654,7 +654,11 @@ type synchronousEventRuleTestSink struct {
 }
 
 func (s synchronousEventRuleTestSink) Emit(ctx context.Context, event events.Event) {
-	s.sink.evaluate(ctx, event)
+	_ = s.sink.evaluate(ctx, event)
+}
+
+func (s synchronousEventRuleTestSink) emitWakeOutbox(ctx context.Context, event events.Event, rules []db.EventRule) error {
+	return s.sink.emitWakeOutbox(ctx, event, rules)
 }
 
 func TestPaneInputPendingRuleObservationWakesAndTracksDelivery(t *testing.T) {

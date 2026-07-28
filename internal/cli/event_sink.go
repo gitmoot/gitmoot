@@ -52,6 +52,20 @@ func daemonEventSink(store *db.Store, home string) events.Sink {
 // best-effort wrapper; the wake outbox tick must distinguish "rules disabled"
 // from "rules unreadable" so pending delivery work never looks healthy.
 func resolveDaemonEventSink(ctx context.Context, store *db.Store, home string) (events.Sink, error) {
+	if store == nil {
+		return resolveDaemonEventSinkWithRules(store, home, nil), nil
+	}
+	rules, err := store.ListEventRules(ctx)
+	if err != nil {
+		return resolveDaemonEventSinkWithRules(store, home, nil), fmt.Errorf("list event rules: %w", err)
+	}
+	return resolveDaemonEventSinkWithRules(store, home, rules), nil
+}
+
+// resolveDaemonEventSinkWithRules builds the delivery sink from a rules
+// snapshot already read by the caller. The durable outbox uses this form so it
+// never re-reads routing state after claiming rows.
+func resolveDaemonEventSinkWithRules(store *db.Store, home string, rules []db.EventRule) events.Sink {
 	home = strings.TrimSpace(home)
 	eventSinkCache.Lock()
 	webhook, built := eventSinkCache.webhooks[home]
@@ -65,20 +79,16 @@ func resolveDaemonEventSink(ctx context.Context, store *db.Store, home string) (
 	// lightweight table when each per-tick engine is built; zero enabled rows
 	// preserve the exact historical sink (including nil when webhooks are off).
 	if store == nil {
-		return webhook, nil
-	}
-	rules, err := store.ListEventRules(ctx)
-	if err != nil {
-		return webhook, fmt.Errorf("list event rules: %w", err)
+		return webhook
 	}
 	if !hasEnabledEventRule(rules) {
-		return webhook, nil
+		return webhook
 	}
 	key := home + "\x00" + store.DatabasePath()
 	eventSinkCache.Lock()
 	defer eventSinkCache.Unlock()
 	if sink := eventSinkCache.rules[key]; sink != nil {
-		return sink, nil
+		return sink
 	}
 	sink := &eventRuleSink{
 		inner: webhook,
@@ -87,7 +97,7 @@ func resolveDaemonEventSink(ctx context.Context, store *db.Store, home string) (
 		wake:  cockpit.New(cockpit.Options{HerdrBin: "herdr"}, nil),
 	}
 	eventSinkCache.rules[key] = sink
-	return sink, nil
+	return sink
 }
 
 func buildDaemonEventSink(store *db.Store, home string) events.Sink {

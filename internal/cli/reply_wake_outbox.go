@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -19,19 +20,22 @@ const (
 	replyWakeCoalescingWindow = 5 * time.Second
 )
 
-// drainReplyWakeOutbox runs on the existing daemon tick. It claims durable
-// batches before emitting, then the existing eventRuleSink delivery switch
-// records delivered/stalled/failed outside every note transaction.
-func drainReplyWakeOutbox(ctx context.Context, store *db.Store, sink events.Sink, now time.Time) error {
-	if store == nil || sink == nil {
-		return nil
+type replyWakeDelivery struct {
+	sink  events.Sink
+	rules []db.EventRule
+}
+
+type replyWakeDeliveryResolver func(context.Context) (replyWakeDelivery, error)
+
+// drainReplyWakeOutbox is a store-global daemon operation. It deliberately
+// reads durable work before resolving delivery: unreadable outbox state and an
+// empty outbox therefore cannot collapse into the same result.
+func drainReplyWakeOutbox(ctx context.Context, store *db.Store, now time.Time, resolve replyWakeDeliveryResolver) error {
+	if store == nil {
+		return errors.New("wake outbox store is required")
 	}
 	entries, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
 	if err != nil || len(entries) == 0 {
-		return err
-	}
-	rules, err := store.ListEventRules(ctx)
-	if err != nil {
 		return err
 	}
 
@@ -43,6 +47,23 @@ func drainReplyWakeOutbox(ctx context.Context, store *db.Store, sink events.Sink
 		key := strings.ToLower(strings.TrimSpace(entry.TargetRole)) + "\x00" + entry.CoalesceKey
 		groups[key] = append(groups[key], entry)
 	}
+	if len(groups) == 0 {
+		return nil
+	}
+	if resolve == nil {
+		return errors.New("wake outbox delivery resolver is required")
+	}
+	delivery, err := resolve(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve wake outbox delivery: %w", err)
+	}
+	if delivery.sink == nil {
+		return errors.New("pending reply wakes have no enabled delivery sink")
+	}
+	if !hasEnabledEventRule(delivery.rules) {
+		return errors.New("pending reply wakes have no enabled event rule")
+	}
+
 	keys := make([]string, 0, len(groups))
 	for key := range groups {
 		keys = append(keys, key)
@@ -76,7 +97,7 @@ func drainReplyWakeOutbox(ctx context.Context, store *db.Store, sink events.Sink
 
 			batch := items[start:end]
 			event := replyWakeEvent(batch, now)
-			if !hasMatchingReplyRule(rules, event) {
+			if !hasMatchingReplyRule(delivery.rules, event) {
 				// Pending remains an explicit never-attempted state. A rule added
 				// later can deliver the same batch; nothing is silently erased.
 				break
@@ -91,7 +112,9 @@ func drainReplyWakeOutbox(ctx context.Context, store *db.Store, sink events.Sink
 			}
 			if claimed {
 				event.WakeOutboxIDs = ids
-				emitReplyWakeOutboxEvent(ctx, sink, event)
+				if err := emitReplyWakeOutboxEvent(ctx, delivery.sink, event, delivery.rules); err != nil {
+					return fmt.Errorf("emit claimed reply wake: %w", err)
+				}
 			}
 			start = end
 		}
@@ -100,15 +123,14 @@ func drainReplyWakeOutbox(ctx context.Context, store *db.Store, sink events.Sink
 }
 
 type synchronousWakeOutboxSink interface {
-	emitWakeOutbox(context.Context, events.Event)
+	emitWakeOutbox(context.Context, events.Event, []db.EventRule) error
 }
 
-func emitReplyWakeOutboxEvent(ctx context.Context, sink events.Sink, event events.Event) {
+func emitReplyWakeOutboxEvent(ctx context.Context, sink events.Sink, event events.Event, rules []db.EventRule) error {
 	if durable, ok := sink.(synchronousWakeOutboxSink); ok {
-		durable.emitWakeOutbox(ctx, event)
-		return
+		return durable.emitWakeOutbox(ctx, event, rules)
 	}
-	events.EmitEvent(ctx, sink, event)
+	return errors.New("wake outbox sink does not support synchronous delivery")
 }
 
 func replyWakeEvent(batch []db.WakeOutboxEntry, now time.Time) events.Event {
