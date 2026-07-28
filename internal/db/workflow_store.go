@@ -733,28 +733,6 @@ func (s *Store) ListWorkflowNotes(ctx context.Context, workflowID string, limit 
 	return notes, nil
 }
 
-// LatestWorkflowNoteByAuthor returns the newest workflow note attributable to
-// one exact author. Workflow-wide activity cannot establish liveness for a
-// specific actor, so callers must not substitute ListWorkflowNotes for this
-// query when projecting actor-level state.
-func (s *Store) LatestWorkflowNoteByAuthor(ctx context.Context, workflowID, author string) (WorkflowNote, error) {
-	var note WorkflowNote
-	err := s.db.QueryRowContext(ctx, `SELECT id, workflow_id, author, body, repo, memory_observation_id, created_at
-FROM workflow_notes INDEXED BY idx_workflow_notes_wid
-WHERE workflow_id = ? AND author = ?
-ORDER BY created_at DESC, id DESC
-LIMIT 1`, strings.TrimSpace(workflowID), strings.TrimSpace(author)).Scan(
-		&note.ID,
-		&note.WorkflowID,
-		&note.Author,
-		&note.Body,
-		&note.Repo,
-		&note.MemoryObservationID,
-		&note.CreatedAt,
-	)
-	return note, err
-}
-
 // ListWorkflowNotesByBodyPrefix returns recent journal entries whose body starts
 // with prefix. It supports typed org signal feeds without parsing unrelated
 // workflow notes.

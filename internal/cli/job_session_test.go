@@ -33,6 +33,17 @@ func seedSessionAgentRepo(t *testing.T, store *db.Store) {
 	}
 }
 
+func noteSessionReviewHeartbeat(t *testing.T, home, workflowID, jobID, body string) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{
+		"workflow", "note", workflowID, body,
+		"--author", "lead", "--job", jobID, "--home", home, "--no-auto",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("workflow note heartbeat for %s exit = %d, stderr=%s", jobID, code, stderr.String())
+	}
+}
+
 // TestJobOpenCreatesRunningSessionJob proves `job open` creates a running,
 // externally_driven job with no queued row (no dispatch).
 func TestJobOpenCreatesRunningSessionJob(t *testing.T) {
@@ -219,18 +230,19 @@ func TestSessionReviewStatusDistinguishesProgressAndStall(t *testing.T) {
 	}
 	for _, note := range []struct {
 		workflowID string
+		jobID      string
 		body       string
 	}{
-		{"review/fresh", "reviewed fresh tests"},
-		{"review/stalled", "reviewed stale tests"},
+		{"review/fresh", fresh.JobID, "reviewed fresh tests"},
+		{"review/stalled", stalled.JobID, "reviewed stale tests"},
 	} {
-		var noteOut, noteErr bytes.Buffer
-		if code := Run([]string{"workflow", "note", note.workflowID, note.body, "--author", "lead", "--home", home, "--no-auto"}, &noteOut, &noteErr); code != 0 {
-			t.Fatalf("workflow note %s exit = %d, stderr=%s", note.workflowID, code, noteErr.String())
-		}
+		noteSessionReviewHeartbeat(t, home, note.workflowID, note.jobID, note.body)
 	}
-	if _, err := raw.Exec(`UPDATE workflow_notes SET created_at = ? WHERE workflow_id = ?`, old, "review/stalled"); err != nil {
-		t.Fatalf("backdate stalled note: %v", err)
+	if _, err := raw.Exec(
+		`UPDATE job_events SET created_at = ? WHERE job_id = ? AND kind = ?`,
+		old, stalled.JobID, sessionReviewHeartbeatEventKind,
+	); err != nil {
+		t.Fatalf("backdate stalled heartbeat: %v", err)
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -349,13 +361,7 @@ func TestSessionReviewStatusReusedWorkflowLabel(t *testing.T) {
 	}
 
 	first := openReview("head-a")
-	var noteOut, noteErr bytes.Buffer
-	if code := Run([]string{
-		"workflow", "note", "review/reused", "review A progress",
-		"--author", "lead", "--home", home, "--no-auto",
-	}, &noteOut, &noteErr); code != 0 {
-		t.Fatalf("workflow note exit = %d, stderr=%s", code, noteErr.String())
-	}
+	noteSessionReviewHeartbeat(t, home, "review/reused", first.JobID, "review A progress")
 	if code := Run([]string{
 		"job", "close", first.JobID, "--home", home,
 		"--decision", "approved", "--summary", "review A done",
@@ -365,19 +371,11 @@ func TestSessionReviewStatusReusedWorkflowLabel(t *testing.T) {
 	second := openReview("head-b")
 
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
-	oldNoteAt := now.Add(-2 * sessionReviewStaleGap)
 	raw, err := sql.Open("sqlite", store.DatabasePath())
 	if err != nil {
 		t.Fatalf("sql.Open returned error: %v", err)
 	}
 	defer raw.Close()
-	if _, err := raw.Exec(
-		`UPDATE workflow_notes SET created_at = ? WHERE workflow_id = ?`,
-		oldNoteAt.Format("2006-01-02 15:04:05"), "review/reused",
-	); err != nil {
-		t.Fatalf("backdate prior-review note: %v", err)
-	}
-
 	setSecondCreatedAt := func(at time.Time) db.Job {
 		t.Helper()
 		stamp := at.Format("2006-01-02 15:04:05")
@@ -394,17 +392,17 @@ func TestSessionReviewStatusReusedWorkflowLabel(t *testing.T) {
 		return job
 	}
 
-	// The prior review's older note is not evidence that review B is active.
+	// Review A's job-bound note is not evidence that review B is active.
 	freshSecond := setSecondCreatedAt(now.Add(-10 * time.Minute))
 	if got := deriveReviewStatus(context.Background(), store, freshSecond, now); got != reviewStatusUnknown {
-		t.Fatalf("fresh review B with older review-A note = %q, want %q", got, reviewStatusUnknown)
+		t.Fatalf("fresh review B with review-A heartbeat = %q, want %q", got, reviewStatusUnknown)
 	}
 
-	// Aging the open record does not turn an unrelated prior note into review B
+	// Aging the open record does not turn an unrelated job-bound note into review B
 	// liveness evidence.
 	staleSecond := setSecondCreatedAt(now.Add(-sessionReviewStaleGap - time.Second))
 	if got := deriveReviewStatus(context.Background(), store, staleSecond, now); got != reviewStatusUnknown {
-		t.Fatalf("stale review B with older review-A note = %q, want %q", got, reviewStatusUnknown)
+		t.Fatalf("stale review B with review-A heartbeat = %q, want %q", got, reviewStatusUnknown)
 	}
 }
 
@@ -426,14 +424,7 @@ func TestSessionReviewStatusExactStalenessBoundary(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &opened); err != nil {
 		t.Fatalf("decode job open JSON: %v (%s)", err, stdout.String())
 	}
-	note, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
-		WorkflowID: "review/boundary",
-		Author:     "lead",
-		Body:       "boundary heartbeat",
-	})
-	if err != nil {
-		t.Fatalf("InsertWorkflowNote returned error: %v", err)
-	}
+	noteSessionReviewHeartbeat(t, home, "review/boundary", opened.JobID, "boundary heartbeat")
 
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	raw, err := sql.Open("sqlite", store.DatabasePath())
@@ -453,22 +444,22 @@ func TestSessionReviewStatusExactStalenessBoundary(t *testing.T) {
 		t.Fatalf("GetJob returned error: %v", err)
 	}
 
-	setNoteAt := func(at time.Time) {
+	setHeartbeatAt := func(at time.Time) {
 		t.Helper()
 		if _, err := raw.Exec(
-			`UPDATE workflow_notes SET created_at = ? WHERE id = ?`,
-			at.Format("2006-01-02 15:04:05"), note.ID,
+			`UPDATE job_events SET created_at = ? WHERE job_id = ? AND kind = ?`,
+			at.Format("2006-01-02 15:04:05"), opened.JobID, sessionReviewHeartbeatEventKind,
 		); err != nil {
-			t.Fatalf("set boundary note timestamp: %v", err)
+			t.Fatalf("set boundary heartbeat timestamp: %v", err)
 		}
 	}
 
-	setNoteAt(now.Add(-sessionReviewStaleGap))
+	setHeartbeatAt(now.Add(-sessionReviewStaleGap))
 	if got := deriveReviewStatus(context.Background(), store, job, now); got != reviewStatusInProgress {
 		t.Fatalf("review at exact stale gap = %q, want %q", got, reviewStatusInProgress)
 	}
 
-	setNoteAt(now.Add(-sessionReviewStaleGap - time.Second))
+	setHeartbeatAt(now.Add(-sessionReviewStaleGap - time.Second))
 	if got := deriveReviewStatus(context.Background(), store, job, now); got != reviewStatusStalled {
 		t.Fatalf("review one second past stale gap = %q, want %q", got, reviewStatusStalled)
 	}
@@ -492,14 +483,7 @@ func TestSessionReviewStatusIgnoresFreshDaemonLifecycleNote(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &opened); err != nil {
 		t.Fatalf("decode job open JSON: %v (%s)", err, stdout.String())
 	}
-	reviewerNote, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
-		WorkflowID: "review/daemon-noise",
-		Author:     "lead",
-		Body:       "reviewer checkpoint",
-	})
-	if err != nil {
-		t.Fatalf("Insert reviewer note: %v", err)
-	}
+	noteSessionReviewHeartbeat(t, home, "review/daemon-noise", opened.JobID, "reviewer checkpoint")
 	daemonNote, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
 		WorkflowID: "review/daemon-noise",
 		Author:     db.WorkflowAutoNoteAuthor,
@@ -515,16 +499,18 @@ func TestSessionReviewStatusIgnoresFreshDaemonLifecycleNote(t *testing.T) {
 		t.Fatalf("sql.Open returned error: %v", err)
 	}
 	defer raw.Close()
-	for id, at := range map[int64]time.Time{
-		reviewerNote.ID: now.Add(-sessionReviewStaleGap - time.Minute),
-		daemonNote.ID:   now.Add(-time.Minute),
-	} {
-		if _, err := raw.Exec(
-			`UPDATE workflow_notes SET created_at = ? WHERE id = ?`,
-			at.Format("2006-01-02 15:04:05"), id,
-		); err != nil {
-			t.Fatalf("set note %d timestamp: %v", id, err)
-		}
+	if _, err := raw.Exec(
+		`UPDATE job_events SET created_at = ? WHERE job_id = ? AND kind = ?`,
+		now.Add(-sessionReviewStaleGap-time.Minute).Format("2006-01-02 15:04:05"),
+		opened.JobID, sessionReviewHeartbeatEventKind,
+	); err != nil {
+		t.Fatalf("backdate reviewer heartbeat: %v", err)
+	}
+	if _, err := raw.Exec(
+		`UPDATE workflow_notes SET created_at = ? WHERE id = ?`,
+		now.Add(-time.Minute).Format("2006-01-02 15:04:05"), daemonNote.ID,
+	); err != nil {
+		t.Fatalf("freshen daemon note: %v", err)
 	}
 	if _, err := raw.Exec(
 		`UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`,
@@ -541,6 +527,84 @@ func TestSessionReviewStatusIgnoresFreshDaemonLifecycleNote(t *testing.T) {
 
 	if got := deriveReviewStatus(context.Background(), store, job, now); got != reviewStatusStalled {
 		t.Fatalf("stalled review with fresh daemon lifecycle note = %q, want %q", got, reviewStatusStalled)
+	}
+}
+
+func TestSessionReviewStatusDoesNotCrossRefreshSameAgentConcurrentReviews(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	seedSessionAgentRepo(t, store)
+
+	openReview := func(pr, head string) jobSessionOutput {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		if code := Run([]string{
+			"job", "open", "--home", home, "--agent", "lead",
+			"--repo", "owner/repo", "--type", "review",
+			"--workflow", "review/concurrent", "--pr", pr, "--head-sha", head, "--json",
+		}, &stdout, &stderr); code != 0 {
+			t.Fatalf("job open exit = %d, stderr=%s", code, stderr.String())
+		}
+		var opened jobSessionOutput
+		if err := json.Unmarshal(stdout.Bytes(), &opened); err != nil {
+			t.Fatalf("decode job open JSON: %v (%s)", err, stdout.String())
+		}
+		return opened
+	}
+
+	active := openReview("7", "active-head")
+	stalled := openReview("8", "stalled-head")
+	noteSessionReviewHeartbeat(t, home, "review/concurrent", stalled.JobID, "review 8 checkpoint")
+
+	now := time.Now().UTC().Truncate(time.Second)
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("sql.Open returned error: %v", err)
+	}
+	defer raw.Close()
+	oldJobAt := now.Add(-time.Hour).Format("2006-01-02 15:04:05")
+	if _, err := raw.Exec(
+		`UPDATE jobs SET created_at = ?, updated_at = ? WHERE id IN (?, ?)`,
+		oldJobAt, oldJobAt, active.JobID, stalled.JobID,
+	); err != nil {
+		t.Fatalf("backdate concurrent review jobs: %v", err)
+	}
+	if _, err := raw.Exec(
+		`UPDATE job_events SET created_at = ? WHERE job_id = ? AND kind = ?`,
+		now.Add(-sessionReviewStaleGap-time.Minute).Format("2006-01-02 15:04:05"),
+		stalled.JobID, sessionReviewHeartbeatEventKind,
+	); err != nil {
+		t.Fatalf("backdate stalled review heartbeat: %v", err)
+	}
+
+	// The same caller-controlled author now records fresh activity for the other
+	// review under the same workflow. Only that exact job may become in_progress.
+	noteSessionReviewHeartbeat(t, home, "review/concurrent", active.JobID, "review 7 checkpoint")
+	heartbeat, ok, err := store.GetLatestJobEventByKind(
+		context.Background(), active.JobID, sessionReviewHeartbeatEventKind,
+	)
+	if err != nil || !ok {
+		t.Fatalf("active review heartbeat = (%+v, %v, %v)", heartbeat, ok, err)
+	}
+	if !strings.Contains(heartbeat.Message, "owner/repo#7 at active-head") {
+		t.Fatalf("active review heartbeat lacks stored PR/HEAD target: %q", heartbeat.Message)
+	}
+
+	activeJob, err := store.GetJob(context.Background(), active.JobID)
+	if err != nil {
+		t.Fatalf("GetJob(active) returned error: %v", err)
+	}
+	stalledJob, err := store.GetJob(context.Background(), stalled.JobID)
+	if err != nil {
+		t.Fatalf("GetJob(stalled) returned error: %v", err)
+	}
+	observedAt := time.Now().UTC().Add(time.Second)
+	if got := deriveReviewStatus(context.Background(), store, activeJob, observedAt); got != reviewStatusInProgress {
+		t.Fatalf("active review status = %q, want %q", got, reviewStatusInProgress)
+	}
+	if got := deriveReviewStatus(context.Background(), store, stalledJob, observedAt); got != reviewStatusStalled {
+		t.Fatalf("stalled same-agent review after other review heartbeat = %q, want %q", got, reviewStatusStalled)
 	}
 }
 
@@ -569,7 +633,7 @@ func TestSessionReviewStatusUnknownWhenHeartbeatCannotBeRead(t *testing.T) {
 		t.Fatalf("Close returned error: %v", err)
 	}
 	if got := deriveReviewStatus(context.Background(), store, job, time.Now().UTC()); got != reviewStatusUnknown {
-		t.Fatalf("review status after note-query failure = %q, want %q", got, reviewStatusUnknown)
+		t.Fatalf("review status after heartbeat-query failure = %q, want %q", got, reviewStatusUnknown)
 	}
 }
 

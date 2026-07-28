@@ -1263,6 +1263,9 @@ omitted identity flags are filled from the current pane: its label, full agent
 session UUID, and working directory. Explicit flags always win; `--no-auto`
 disables detection. Missing Herdr state, command failures, timeouts, and invalid
 output are ignored so the note still succeeds, and author is not inferred.
+`workflow note --job <id>` additionally records a liveness heartbeat only after
+Gitmoot verifies that the id is a running session review in the same workflow
+with a stored PR and HEAD target.
 Only a full UUID is eligible for the dashboard resume command. If coordinator
 author metadata is empty, the newest note author is used.
 Each workflow has a stable `description` and live `status`. Description is
@@ -1627,7 +1630,7 @@ durable row to both its exact head and a workflow journal:
 ```sh
 gitmoot job open --agent <name> --repo owner/repo --type review \
   --pr <n> --head-sha <sha> --workflow <label>
-gitmoot workflow note <label> "reviewed tests and error paths" --author <name>
+gitmoot workflow note <label> "reviewed tests and error paths" --job <id>
 # Post the verdict, then:
 gitmoot job close <id> --decision approved|changes_requested|blocked \
   --summary "..."
@@ -1636,13 +1639,15 @@ gitmoot job close <id> --decision approved|changes_requested|blocked \
 Session reviews require both `--pr` and `--head-sha`; their target cannot be
 changed at close. For a running externally-driven review, `job list --json` and
 `job show --json` derive `review_status:
-"in_progress"|"stalled"|"unknown"` from the newest workflow note authored by
-that job's recorded agent and observed at or after the job opened. Notes from
-the daemon or any other author are workflow activity, not reviewer activity,
-and do not refresh this status. The open timestamp alone is not activity
+"in_progress"|"stalled"|"unknown"` from the newest heartbeat event bound to
+that exact job by `workflow note --job`. Gitmoot validates the job's workflow
+and its stored PR and HEAD before recording the heartbeat. Unbound notes,
+including notes whose caller-controlled `--author` matches the review agent,
+are workflow activity rather than job activity and do not refresh this status.
+The open timestamp alone is not activity
 evidence. The text forms print `REVIEW: in_progress|stalled|unknown` and
-`review_status: ...`. A reviewer-authored note becomes stale after 20 minutes.
-Missing notes, missing workflow labels, invalid timestamps, and note-query
+`review_status: ...`. A job-bound heartbeat becomes stale after 20 minutes.
+Missing heartbeats, missing workflow labels, invalid timestamps, and event-query
 failures report `unknown`. The field remains omitted for dispatched reviews,
 non-review jobs, and terminal jobs. `head_sha` is also exposed in list JSON and
 the decoded `job show` payload; text output prints `head=<sha>` in a list row

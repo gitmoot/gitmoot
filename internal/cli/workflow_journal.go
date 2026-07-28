@@ -53,7 +53,7 @@ func printWorkflowJournalUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot workflow list [--json]")
 	fmt.Fprintln(w, "  gitmoot workflow show <label> [--json] [--limit N]")
 	fmt.Fprintln(w, "  gitmoot workflow describe <label> \"<text>\" [--json]")
-	fmt.Fprintln(w, "  gitmoot workflow note <label> \"<body>\" [--author A] [--pane P] [--session ID] [--workdir PATH] [--no-auto] [--summary DESCRIPTION] [--status STATUS] [--remember [--remember-status] [--agent NAME] [--repo R]]")
+	fmt.Fprintln(w, "  gitmoot workflow note <label> \"<body>\" [--author A] [--job ID] [--pane P] [--session ID] [--workdir PATH] [--no-auto] [--summary DESCRIPTION] [--status STATUS] [--remember [--remember-status] [--agent NAME] [--repo R]]")
 	fmt.Fprintln(w, "  gitmoot workflow close <label> [--reason R] [--json]")
 }
 
@@ -467,6 +467,7 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	author := fs.String("author", "", "verbatim journal author")
+	reviewJobID := fs.String("job", "", "running session-review job this note heartbeats")
 	pane := fs.String("pane", "", "coordinator pane name")
 	sessionID := fs.String("session", "", "coordinator runtime session id")
 	workdir := fs.String("workdir", "", "coordinator working directory")
@@ -502,6 +503,10 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 	}
 	if fs.NArg() != 0 || len(*author) > workflowNoteAuthorMax {
 		fmt.Fprintf(stderr, "workflow note accepts one label and body; author must be at most %d bytes\n", workflowNoteAuthorMax)
+		return 2
+	}
+	if flagWasSupplied(fs, "job") && strings.TrimSpace(*reviewJobID) == "" {
+		fmt.Fprintln(stderr, "workflow note: --job requires a non-blank session review job id")
 		return 2
 	}
 	summarySet := false
@@ -561,6 +566,25 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 	var out workflowNoteOutput
 	err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
 		ctx := context.Background()
+		heartbeatJob, heartbeatPayload, err := validateSessionReviewHeartbeatTarget(
+			ctx, store, label, strings.TrimSpace(*reviewJobID),
+		)
+		if err != nil {
+			return err
+		}
+		recordHeartbeat := func() error {
+			if heartbeatJob.ID == "" {
+				return nil
+			}
+			return store.UpsertLatestJobEvent(ctx, db.JobEvent{
+				JobID: heartbeatJob.ID,
+				Kind:  sessionReviewHeartbeatEventKind,
+				Message: fmt.Sprintf(
+					"workflow note %d records review activity for %s#%d at %s",
+					out.Note.ID, heartbeatPayload.Repo, heartbeatPayload.PullRequest, heartbeatPayload.HeadSHA,
+				),
+			})
+		}
 		count, err := store.CountJobsByWorkflow(ctx, label)
 		if err != nil {
 			return err
@@ -584,7 +608,10 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 		}
 		if !*remember {
 			out.Note, err = store.InsertWorkflowNoteWithMeta(ctx, note, meta)
-			return err
+			if err != nil {
+				return err
+			}
+			return recordHeartbeat()
 		}
 		settings, err := config.LoadMemorySettings(paths)
 		if err != nil {
@@ -622,7 +649,10 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 		if _, duplicate := seen[db.MemoryDedupKey(memory.ScopeRepo, memoryRepo, memory.ContentHash(body))]; duplicate {
 			out.Note, err = store.InsertWorkflowNoteWithMeta(ctx, note, meta)
 			out.Deduped = err == nil
-			return err
+			if err != nil {
+				return err
+			}
+			return recordHeartbeat()
 		}
 		obs := db.MemoryObservation{Owner: owner, AuthorRef: *author, Repo: memoryRepo,
 			Scope: memory.ScopeRepo, Content: body, TrustMark: memory.TrustLow}
@@ -633,7 +663,10 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 		out.Remembered = true
 		out.MemoryKey = obs.Key
 		out.AutoConfirmed, out.SkippedRetired, err = autoConfirmWorkflowObservationIfEnabled(ctx, store, obs, settings.IngestAutoConfirm)
-		return err
+		if err != nil {
+			return err
+		}
+		return recordHeartbeat()
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "workflow note: %v\n", err)
@@ -653,6 +686,37 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "memory: exact duplicate already known; note stored without another observation")
 	}
 	return 0
+}
+
+func validateSessionReviewHeartbeatTarget(ctx context.Context, store *db.Store, workflowID, jobID string) (db.Job, workflowpkg.JobPayload, error) {
+	if jobID == "" {
+		return db.Job{}, workflowpkg.JobPayload{}, nil
+	}
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		return db.Job{}, workflowpkg.JobPayload{}, fmt.Errorf("review heartbeat job %q: %w", jobID, err)
+	}
+	if !job.ExternallyDriven || job.Type != "review" || job.State != string(workflowpkg.JobRunning) {
+		return db.Job{}, workflowpkg.JobPayload{}, fmt.Errorf(
+			"review heartbeat job %q must be a running externally-driven review", jobID,
+		)
+	}
+	if strings.TrimSpace(job.WorkflowID) != strings.TrimSpace(workflowID) {
+		return db.Job{}, workflowpkg.JobPayload{}, fmt.Errorf(
+			"review heartbeat job %q belongs to workflow %q, not %q",
+			jobID, job.WorkflowID, workflowID,
+		)
+	}
+	payload, err := workflowpkg.ParseJobPayload(job.Payload)
+	if err != nil {
+		return db.Job{}, workflowpkg.JobPayload{}, fmt.Errorf("review heartbeat job %q payload: %w", jobID, err)
+	}
+	if payload.PullRequest <= 0 || strings.TrimSpace(payload.HeadSHA) == "" {
+		return db.Job{}, workflowpkg.JobPayload{}, fmt.Errorf(
+			"review heartbeat job %q has no complete PR and HEAD target", jobID,
+		)
+	}
+	return job, payload, nil
 }
 
 func autoConfirmWorkflowObservationIfEnabled(ctx context.Context, store *db.Store, obs db.MemoryObservation, enabled bool) (bool, bool, error) {

@@ -61,9 +61,9 @@ gitmoot job open --agent <name> --repo owner/repo --type review \
 ```
 
 During the review, journal meaningful progress with `gitmoot workflow note
-<label> "..." --author <name>`. Only notes authored by the review job's recorded
-agent count as its liveness signal; daemon and other-actor workflow notes do
-not. After posting the verdict, close the returned job id:
+<label> "..." --job <id>`. Only heartbeats bound to that exact review job count
+as its liveness signal; unbound workflow notes and caller-controlled `--author`
+values do not. After posting the verdict, close the returned job id:
 
 ```sh
 gitmoot job close <id> --decision approved|changes_requested|blocked \

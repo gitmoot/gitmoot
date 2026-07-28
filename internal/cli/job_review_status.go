@@ -14,6 +14,8 @@ const (
 	reviewStatusStalled    = "stalled"
 	reviewStatusUnknown    = "unknown"
 
+	sessionReviewHeartbeatEventKind = "session_review_heartbeat"
+
 	// sessionReviewStaleGap is four times the existing five-minute
 	// unconfirmed-activity precedent. That leaves enough room for a substantive
 	// review pass between journal notes while making a silent lane visible well
@@ -32,10 +34,9 @@ func deriveReviewStatuses(ctx context.Context, store *db.Store, jobs []db.Job, n
 }
 
 // deriveReviewStatus projects liveness only for running, externally-driven
-// reviews. Eligible reviews always get an explicit state: only a workflow note
-// authored by this job's reviewer and observed at or after this job opened can
-// establish in_progress or stalled; missing or unreadable evidence is unknown
-// rather than silently omitted.
+// reviews. Eligible reviews always get an explicit state: only a heartbeat
+// event bound to this exact review job can establish in_progress or stalled;
+// missing or unreadable evidence is unknown rather than silently omitted.
 func deriveReviewStatus(ctx context.Context, store *db.Store, job db.Job, now time.Time) string {
 	if job.Type != "review" ||
 		!job.ExternallyDriven ||
@@ -49,15 +50,14 @@ func deriveReviewStatus(ctx context.Context, store *db.Store, job db.Job, now ti
 	}
 	openedAt := parseTranscriptStoreTime(job.CreatedAt)
 	workflowID := strings.TrimSpace(job.WorkflowID)
-	reviewer := strings.TrimSpace(job.Agent)
-	if store == nil || openedAt.IsZero() || workflowID == "" || reviewer == "" {
+	if store == nil || openedAt.IsZero() || workflowID == "" {
 		return reviewStatusUnknown
 	}
-	note, err := store.LatestWorkflowNoteByAuthor(ctx, workflowID, reviewer)
-	if err != nil {
+	heartbeat, ok, err := store.GetLatestJobEventByKind(ctx, job.ID, sessionReviewHeartbeatEventKind)
+	if err != nil || !ok {
 		return reviewStatusUnknown
 	}
-	latestSignal := parseTranscriptStoreTime(note.CreatedAt)
+	latestSignal := parseTranscriptStoreTime(heartbeat.CreatedAt)
 	if latestSignal.IsZero() || latestSignal.Before(openedAt) || now.UTC().Before(latestSignal) {
 		return reviewStatusUnknown
 	}
