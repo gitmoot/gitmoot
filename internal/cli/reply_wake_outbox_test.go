@@ -166,8 +166,9 @@ func TestReplyWakeOutboxFleetDrainRunsWithZeroEnabledRepos(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := drainReplyWakeOutbox(ctx, store, oldestAt.Add(replyWakeCoalescingWindow-time.Millisecond), replyWakeTestDeliveryResolver(sink)); err != nil {
-		t.Fatal(err)
+	err = drainReplyWakeOutbox(ctx, store, oldestAt.Add(replyWakeCoalescingWindow-time.Millisecond), replyWakeTestDeliveryResolver(sink))
+	if err == nil || !strings.Contains(err.Error(), "outstanding obligations: pending=4") {
+		t.Fatalf("pre-window drain health = %v, want four pending obligations", err)
 	}
 	if wake.promptCalls != 0 {
 		t.Fatalf("tail woke before window closed: %v", wake.prompts)
@@ -262,6 +263,14 @@ func TestReplyWakeOutboxEventRulesReadFailureFailsFleetTickClosedWithoutSinkOver
 	}); err != nil {
 		t.Fatal(err)
 	}
+	pendingBefore, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
+	if err != nil || len(pendingBefore) != 1 {
+		t.Fatalf("pending before event_rules failure = %+v, err=%v", pendingBefore, err)
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, pendingBefore[0].CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	raw, err := sql.Open("sqlite", store.DatabasePath())
 	if err != nil {
@@ -275,7 +284,7 @@ func TestReplyWakeOutboxEventRulesReadFailureFailsFleetTickClosedWithoutSinkOver
 	worker := defaultJobWorker(store, io.Discard, home)
 	tickErr := runEnabledRepoWorkerTicksTracked(
 		context.Background(), store, worker, 0, "", io.Discard,
-		time.Now().UTC(), nil, nil,
+		createdAt.Add(replyWakeCoalescingWindow+time.Second), nil, nil,
 	)
 	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
 	if err != nil || len(pending) != 1 {
@@ -313,12 +322,161 @@ func TestReplyWakeOutboxZeroRulesFailsFleetTickClosedWithoutSinkOverride(t *test
 		context.Background(), store, worker, 0, "", io.Discard,
 		time.Now().UTC(), nil, nil,
 	)
-	if tickErr == nil || !strings.Contains(tickErr.Error(), "pending reply wakes have no enabled delivery sink") {
-		t.Fatalf("fleet tick error = %v, want explicit zero-rule refusal", tickErr)
+	if tickErr == nil || !strings.Contains(tickErr.Error(), "outstanding obligations: pending=1") {
+		t.Fatalf("fleet tick error = %v, want pending-obligation health failure", tickErr)
 	}
 	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("pending rows after zero-rule refusal = %+v, err=%v", pending, err)
+	}
+}
+
+func TestReplyWakeOutboxUnrelatedEnabledRuleLeavesPendingObligationUnhealthy(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.AddEventRule(context.Background(), db.EventRule{
+		ID: "unrelated-blocked", OnKind: "blocked", WakeRole: "owner", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+		WorkflowID: "release/unrelated-rule", Author: "worker", Body: "must remain visible",
+		AddressedTarget: "owner",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending = %+v, err=%v", pending, err)
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, pending[0].CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	worker := defaultJobWorker(store, io.Discard, home)
+	tickErr := runEnabledRepoWorkerTicksTracked(
+		context.Background(), store, worker, 0, "", io.Discard,
+		createdAt.Add(replyWakeCoalescingWindow+time.Second), nil, nil,
+	)
+	if tickErr == nil || !strings.Contains(tickErr.Error(), "outstanding obligations: pending=1") {
+		t.Fatalf("fleet tick error = %v, want pending-obligation health failure", tickErr)
+	}
+	pending, err = store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
+	if err != nil || len(pending) != 1 || pending[0].AttemptCount != 0 {
+		t.Fatalf("pending after unrelated rule = %+v, err=%v", pending, err)
+	}
+}
+
+func TestReplyWakeOutboxAgedAttemptedExpiresDeliveryUnknownWithoutDuplicateWake(t *testing.T) {
+	store, sink, wake, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
+	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+		WorkflowID: "release/crash-recovery", Author: "worker", Body: "crash residue",
+		AddressedTarget: "owner",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending = %+v, err=%v", pending, err)
+	}
+	attemptedAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	claimed, err := store.ClaimWakeOutbox(context.Background(), []int64{pending[0].ID}, attemptedAt)
+	if err != nil || !claimed {
+		t.Fatalf("simulate pre-crash claim = %v, err=%v", claimed, err)
+	}
+
+	worker := defaultJobWorker(store, io.Discard, home)
+	installReplyWakeProductionSink(t, worker, sink.sink)
+	recoveryAt := attemptedAt.Add(replyWakeAttemptedUnknownAfter)
+	tickErr := runEnabledRepoWorkerTicksTracked(
+		context.Background(), store, worker, 0, "", io.Discard,
+		recoveryAt, nil, nil,
+	)
+	if tickErr == nil || !strings.Contains(tickErr.Error(), "delivery unknown") {
+		t.Fatalf("crash-recovery tick error = %v, want delivery-unknown health failure", tickErr)
+	}
+	if wake.promptCalls != 0 {
+		t.Fatalf("aged attempted row was blindly re-emitted: calls=%d prompts=%v", wake.promptCalls, wake.prompts)
+	}
+	unknown, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStateDeliveryUnknown)
+	if err != nil || len(unknown) != 1 || unknown[0].ID != pending[0].ID {
+		t.Fatalf("delivery unknown rows = %+v, err=%v", unknown, err)
+	}
+	events, err := store.ListJobEvents(context.Background(), fmt.Sprintf("wake-outbox:%d", pending[0].ID))
+	if err != nil || len(events) != 1 || events[0].Kind != db.WakeOutboxDeliveryUnknownEventKind {
+		t.Fatalf("delivery unknown events = %+v, err=%v", events, err)
+	}
+
+	if err := runEnabledRepoWorkerTicksTracked(
+		context.Background(), store, worker, 0, "", io.Discard,
+		recoveryAt.Add(time.Second), nil, nil,
+	); err != nil {
+		t.Fatalf("post-resolution fleet tick = %v", err)
+	}
+	if wake.promptCalls != 0 {
+		t.Fatalf("resolved delivery-unknown row emitted on later tick: calls=%d", wake.promptCalls)
+	}
+	events, err = store.ListJobEvents(context.Background(), fmt.Sprintf("wake-outbox:%d", pending[0].ID))
+	if err != nil || len(events) != 1 {
+		t.Fatalf("delivery unknown event duplicated: %+v, err=%v", events, err)
+	}
+}
+
+func TestReplyWakeOutboxRuleDeletedMidDrainRefusesLaterBatch(t *testing.T) {
+	store, sink, wake, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
+	ctx := context.Background()
+	first, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/rule-generation", Author: "worker", Body: "first",
+		AddressedTarget: "owner",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/rule-generation", Author: "worker", Body: "second",
+		AddressedTarget: "owner",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	setWakeOutboxCreatedAt(t, store.DatabasePath(), fmt.Sprint(first.ID), base)
+	setWakeOutboxCreatedAt(t, store.DatabasePath(), fmt.Sprint(second.ID), base.Add(replyWakeCoalescingWindow))
+	wake.onPrompt = func() error {
+		return store.DeleteEventRule(ctx, "reply-0")
+	}
+
+	worker := defaultJobWorker(store, io.Discard, home)
+	installReplyWakeProductionSink(t, worker, sink.sink)
+	tickErr := runEnabledRepoWorkerTicksTracked(
+		ctx, store, worker, 0, "", io.Discard,
+		base.Add(2*replyWakeCoalescingWindow+time.Second), nil, nil,
+	)
+	if tickErr == nil || !strings.Contains(tickErr.Error(), "outstanding obligations: pending=1") {
+		t.Fatalf("fleet tick error = %v, want later batch refusal", tickErr)
+	}
+	if wake.promptCalls != 1 {
+		t.Fatalf("wake calls = %d, want only the authorized first batch; prompts=%v", wake.promptCalls, wake.prompts)
+	}
+	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
+	if err != nil || len(delivered) != 1 || delivered[0].SourceID != fmt.Sprint(first.ID) {
+		t.Fatalf("delivered = %+v, err=%v", delivered, err)
+	}
+	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
+	if err != nil || len(pending) != 1 || pending[0].SourceID != fmt.Sprint(second.ID) || pending[0].AttemptCount != 0 {
+		t.Fatalf("pending later batch = %+v, err=%v", pending, err)
 	}
 }
 

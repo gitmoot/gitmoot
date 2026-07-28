@@ -1798,4 +1798,47 @@ CREATE INDEX IF NOT EXISTS idx_wake_outbox_pending
 UPDATE jobs SET repo = json_extract(payload, '$.repo')
 WHERE repo = '' AND json_valid(payload) AND COALESCE(json_extract(payload, '$.repo'), '') != '';
 	`,
+	// #1200/#1201 explicit delivery-unknown resolution. An attempted wake can
+	// survive a daemon crash after Herdr accepted the prompt but before the
+	// terminal row update. Rebuilding the table extends the state constraint
+	// without reordering the original outbox migration; the append-only event
+	// written by the expiry transaction records why no blind retry occurred.
+	`
+ALTER TABLE wake_outbox RENAME TO wake_outbox_before_delivery_unknown;
+
+CREATE TABLE wake_outbox (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	source_kind TEXT NOT NULL,
+	source_id TEXT NOT NULL,
+	target_role TEXT NOT NULL,
+	coalesce_key TEXT NOT NULL,
+	state TEXT NOT NULL DEFAULT 'pending'
+		CHECK(state IN ('pending', 'attempted', 'delivered', 'stalled', 'failed', 'delivery_unknown')),
+	attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+	last_error TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+	attempted_at TEXT,
+	finished_at TEXT,
+	updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+	UNIQUE(source_kind, source_id, target_role)
+);
+
+INSERT INTO wake_outbox(
+	id, source_kind, source_id, target_role, coalesce_key, state,
+	attempt_count, last_error, created_at, attempted_at, finished_at, updated_at
+)
+SELECT
+	id, source_kind, source_id, target_role, coalesce_key, state,
+	attempt_count, last_error, created_at, attempted_at, finished_at, updated_at
+FROM wake_outbox_before_delivery_unknown;
+
+DROP TABLE wake_outbox_before_delivery_unknown;
+
+CREATE INDEX idx_wake_outbox_pending
+	ON wake_outbox(target_role, coalesce_key, created_at, id)
+	WHERE state = 'pending';
+CREATE INDEX idx_wake_outbox_attempted
+	ON wake_outbox(attempted_at, id)
+	WHERE state = 'attempted';
+	`,
 }

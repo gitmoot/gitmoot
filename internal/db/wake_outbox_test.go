@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -211,5 +212,59 @@ func TestWakeOutboxClaimAndFinishStatesAreQueryable(t *testing.T) {
 	delivered, err := store.ListWakeOutbox(ctx, WakeOutboxStateDelivered)
 	if err != nil || len(delivered) != 1 || delivered[0].FinishedAt == "" {
 		t.Fatalf("delivered = %+v, err=%v", delivered, err)
+	}
+}
+
+func TestExpireAgedWakeOutboxRecordsDeliveryUnknownWithoutRetry(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	if _, err := store.InsertWorkflowNote(ctx, WorkflowNote{
+		WorkflowID: "wake/unknown", Author: "operator", Body: "unknown",
+		AddressedTarget: "owner",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.ListWakeOutbox(ctx, WakeOutboxStatePending)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending = %+v, err=%v", pending, err)
+	}
+	attemptedAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	claimed, err := store.ClaimWakeOutbox(ctx, []int64{pending[0].ID}, attemptedAt)
+	if err != nil || !claimed {
+		t.Fatalf("claim = %v, err=%v", claimed, err)
+	}
+
+	obligations, err := store.ListWakeOutboxObligations(ctx, attemptedAt)
+	if err != nil || len(obligations) != 1 || obligations[0].State != WakeOutboxStateAttempted {
+		t.Fatalf("obligations = %+v, err=%v", obligations, err)
+	}
+	expired, err := store.ExpireAgedWakeOutbox(ctx, attemptedAt, attemptedAt.Add(time.Minute))
+	if err != nil || len(expired) != 1 || expired[0].ID != pending[0].ID {
+		t.Fatalf("expired = %+v, err=%v", expired, err)
+	}
+	unknown, err := store.ListWakeOutbox(ctx, WakeOutboxStateDeliveryUnknown)
+	if err != nil || len(unknown) != 1 ||
+		unknown[0].AttemptCount != 1 ||
+		unknown[0].FinishedAt == "" ||
+		!strings.Contains(unknown[0].LastError, "not retried") {
+		t.Fatalf("delivery unknown = %+v, err=%v", unknown, err)
+	}
+	events, err := store.ListJobEvents(ctx, fmt.Sprintf("wake-outbox:%d", pending[0].ID))
+	if err != nil || len(events) != 1 ||
+		events[0].Kind != WakeOutboxDeliveryUnknownEventKind ||
+		!strings.Contains(events[0].Message, "policy=expire_without_retry") {
+		t.Fatalf("delivery unknown events = %+v, err=%v", events, err)
+	}
+	obligations, err = store.ListWakeOutboxObligations(ctx, attemptedAt.Add(time.Hour))
+	if err != nil || len(obligations) != 0 {
+		t.Fatalf("obligations after expiry = %+v, err=%v", obligations, err)
+	}
+	expired, err = store.ExpireAgedWakeOutbox(ctx, attemptedAt.Add(time.Hour), attemptedAt.Add(2*time.Hour))
+	if err != nil || len(expired) != 0 {
+		t.Fatalf("second expiry = %+v, err=%v", expired, err)
+	}
+	events, err = store.ListJobEvents(ctx, fmt.Sprintf("wake-outbox:%d", pending[0].ID))
+	if err != nil || len(events) != 1 {
+		t.Fatalf("events after second expiry = %+v, err=%v", events, err)
 	}
 }

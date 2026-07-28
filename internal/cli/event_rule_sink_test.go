@@ -26,6 +26,7 @@ type fakeEventWake struct {
 	stalled        bool
 	promptErr      error
 	oddNonDelivery bool
+	onPrompt       func() error
 }
 
 func (f *fakeEventWake) Available(context.Context) bool {
@@ -38,6 +39,11 @@ func (f *fakeEventWake) AgentPrompt(_ context.Context, pane, prompt, until strin
 	f.pane, f.prompt, f.until = pane, prompt, until
 	f.panes = append(f.panes, pane)
 	f.prompts = append(f.prompts, prompt)
+	if f.onPrompt != nil {
+		if err := f.onPrompt(); err != nil {
+			return false, false, err
+		}
+	}
 	if f.stalled {
 		return false, true, nil
 	}

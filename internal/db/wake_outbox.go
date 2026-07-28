@@ -16,6 +16,12 @@ const (
 	WakeOutboxStateDelivered = "delivered"
 	WakeOutboxStateStalled   = "stalled"
 	WakeOutboxStateFailed    = "failed"
+	// WakeOutboxStateDeliveryUnknown means a prior process claimed the row but
+	// disappeared before recording whether Herdr accepted the wake. It is
+	// terminal and MUST NOT be retried blindly.
+	WakeOutboxStateDeliveryUnknown = "delivery_unknown"
+
+	WakeOutboxDeliveryUnknownEventKind = "wake_delivery_unknown"
 
 	WakeOutboxSourceWorkflowNote  = "workflow_note"
 	WakeOutboxSourceChatMessage   = "chat_message"
@@ -126,6 +132,119 @@ FROM wake_outbox`
 		out = append(out, entry)
 	}
 	return out, rows.Err()
+}
+
+// ListWakeOutboxObligations is the authoritative health projection for durable
+// wake delivery. Pending rows and attempted rows older than attemptedBefore are
+// the only non-terminal obligations; terminal outcomes never appear.
+func (s *Store) ListWakeOutboxObligations(ctx context.Context, attemptedBefore time.Time) ([]WakeOutboxEntry, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, source_kind, source_id, target_role, coalesce_key, state,
+	attempt_count, last_error, created_at, COALESCE(attempted_at, ''),
+	COALESCE(finished_at, ''), updated_at
+FROM wake_outbox
+WHERE state = 'pending'
+	OR (state = 'attempted' AND attempted_at IS NOT NULL AND attempted_at <= ?)
+ORDER BY created_at, id`,
+		attemptedBefore.UTC().Format(BlockedEpisodeTimeLayout))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []WakeOutboxEntry{}
+	for rows.Next() {
+		var entry WakeOutboxEntry
+		if err := rows.Scan(
+			&entry.ID, &entry.SourceKind, &entry.SourceID, &entry.TargetRole,
+			&entry.CoalesceKey, &entry.State, &entry.AttemptCount,
+			&entry.LastError, &entry.CreatedAt, &entry.AttemptedAt,
+			&entry.FinishedAt, &entry.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, entry)
+	}
+	return out, rows.Err()
+}
+
+// ExpireAgedWakeOutbox marks delivery-unknown rows terminal without re-emitting
+// them. Each transition and its audit event share one transaction, so a crash
+// cannot silently resolve the obligation without recording the policy outcome.
+func (s *Store) ExpireAgedWakeOutbox(ctx context.Context, attemptedBefore, at time.Time) ([]WakeOutboxEntry, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `
+SELECT id, source_kind, source_id, target_role, coalesce_key, state,
+	attempt_count, last_error, created_at, COALESCE(attempted_at, ''),
+	COALESCE(finished_at, ''), updated_at
+FROM wake_outbox
+WHERE state = 'attempted' AND attempted_at IS NOT NULL AND attempted_at <= ?
+ORDER BY attempted_at, id`,
+		attemptedBefore.UTC().Format(BlockedEpisodeTimeLayout))
+	if err != nil {
+		return nil, err
+	}
+	var entries []WakeOutboxEntry
+	for rows.Next() {
+		var entry WakeOutboxEntry
+		if err := rows.Scan(
+			&entry.ID, &entry.SourceKind, &entry.SourceID, &entry.TargetRole,
+			&entry.CoalesceKey, &entry.State, &entry.AttemptCount,
+			&entry.LastError, &entry.CreatedAt, &entry.AttemptedAt,
+			&entry.FinishedAt, &entry.UpdatedAt,
+		); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, tx.Commit()
+	}
+
+	stamp := at.UTC().Format(BlockedEpisodeTimeLayout)
+	const detail = "delivery outcome unknown after attempted wake aged out; not retried"
+	for _, entry := range entries {
+		result, err := tx.ExecContext(ctx, `
+UPDATE wake_outbox
+SET state = ?, last_error = ?, finished_at = ?, updated_at = ?
+WHERE id = ? AND state = 'attempted' AND attempted_at <= ?`,
+			WakeOutboxStateDeliveryUnknown, detail, stamp, stamp, entry.ID,
+			attemptedBefore.UTC().Format(BlockedEpisodeTimeLayout))
+		if err != nil {
+			return nil, err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if affected != 1 {
+			return nil, fmt.Errorf("expire wake outbox row %d updated %d rows, want 1", entry.ID, affected)
+		}
+		message := fmt.Sprintf(
+			"source=%s:%s target_role=%s attempted_at=%s policy=expire_without_retry",
+			entry.SourceKind, entry.SourceID, entry.TargetRole, entry.AttemptedAt,
+		)
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
+			fmt.Sprintf("wake-outbox:%d", entry.ID),
+			WakeOutboxDeliveryUnknownEventKind,
+			message,
+		); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return entries, nil
 }
 
 // ClaimWakeOutbox atomically marks an entire coalesced batch attempted. If any

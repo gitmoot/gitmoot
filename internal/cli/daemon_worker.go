@@ -111,10 +111,10 @@ func (w jobWorker) eventSink() events.Sink {
 	return daemonEventSink(w.Store, w.workflowHome())
 }
 
-// replyWakeDelivery resolves one authoritative rules snapshot and the sink
-// built from it. The outbox reads pending rows before invoking this method, and
-// the sink receives the same snapshot after claim, so routing cannot become
-// unreadable between claim and delivery.
+// replyWakeDelivery resolves one authoritative, batch-scoped rules snapshot and
+// the sink built from it. The outbox invokes this immediately before each claim
+// and passes the same snapshot through delivery, so authorization cannot outlive
+// its batch and routing cannot become unreadable after claim.
 func (w jobWorker) replyWakeDelivery(ctx context.Context) (replyWakeDelivery, error) {
 	if w.Store == nil {
 		return replyWakeDelivery{}, errors.New("wake outbox store is required")

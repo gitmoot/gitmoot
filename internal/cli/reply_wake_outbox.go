@@ -18,6 +18,10 @@ const (
 	// short-lived `org escalate` processes while keeping the daemon-tick wake
 	// latency small. Rolling windows start at the oldest pending item.
 	replyWakeCoalescingWindow = 5 * time.Second
+	// A synchronous reply wake gets one 12s Herdr call plus bounded probes and
+	// its terminal store write. Thirty seconds leaves margin for a live owner;
+	// older attempted rows are crash residue whose delivery outcome is unknown.
+	replyWakeAttemptedUnknownAfter = 30 * time.Second
 )
 
 type replyWakeDelivery struct {
@@ -34,34 +38,44 @@ func drainReplyWakeOutbox(ctx context.Context, store *db.Store, now time.Time, r
 	if store == nil {
 		return errors.New("wake outbox store is required")
 	}
-	entries, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
-	if err != nil || len(entries) == 0 {
+	attemptedBefore := now.UTC().Add(-replyWakeAttemptedUnknownAfter)
+	obligations, err := store.ListWakeOutboxObligations(ctx, attemptedBefore)
+	if err != nil || len(obligations) == 0 {
 		return err
 	}
 
+	agedAttempted := 0
+	for _, entry := range obligations {
+		if entry.State == db.WakeOutboxStateAttempted {
+			agedAttempted++
+		}
+	}
+	if agedAttempted > 0 {
+		expired, err := store.ExpireAgedWakeOutbox(ctx, attemptedBefore, now)
+		if err != nil {
+			return fmt.Errorf("expire aged attempted wake outbox: %w", err)
+		}
+		if len(expired) > 0 {
+			return fmt.Errorf(
+				"wake outbox delivery unknown: expired %d aged attempted rows without retry",
+				len(expired),
+			)
+		}
+	}
+
 	groups := make(map[string][]db.WakeOutboxEntry)
-	for _, entry := range entries {
+	for _, entry := range obligations {
+		if entry.State != db.WakeOutboxStatePending {
+			continue
+		}
 		if !strings.HasPrefix(entry.CoalesceKey, db.WakeOutboxReplyCoalescePrefix) {
 			continue
 		}
 		key := strings.ToLower(strings.TrimSpace(entry.TargetRole)) + "\x00" + entry.CoalesceKey
 		groups[key] = append(groups[key], entry)
 	}
-	if len(groups) == 0 {
-		return nil
-	}
 	if resolve == nil {
 		return errors.New("wake outbox delivery resolver is required")
-	}
-	delivery, err := resolve(ctx)
-	if err != nil {
-		return fmt.Errorf("resolve wake outbox delivery: %w", err)
-	}
-	if delivery.sink == nil {
-		return errors.New("pending reply wakes have no enabled delivery sink")
-	}
-	if !hasEnabledEventRule(delivery.rules) {
-		return errors.New("pending reply wakes have no enabled event rule")
 	}
 
 	keys := make([]string, 0, len(groups))
@@ -97,6 +111,17 @@ func drainReplyWakeOutbox(ctx context.Context, store *db.Store, now time.Time, r
 
 			batch := items[start:end]
 			event := replyWakeEvent(batch, now)
+			// Authorization is deliberately batch-scoped and pre-claim. A rule
+			// removed while an earlier synchronous batch is delivering cannot
+			// authorize this later claim, and no post-claim rule read can strand
+			// attempted rows on a routing-store failure.
+			delivery, err := resolve(ctx)
+			if err != nil {
+				return fmt.Errorf("resolve wake outbox delivery: %w", err)
+			}
+			if delivery.sink == nil {
+				break
+			}
 			if !hasMatchingReplyRule(delivery.rules, event) {
 				// Pending remains an explicit never-attempted state. A rule added
 				// later can deliver the same batch; nothing is silently erased.
@@ -119,7 +144,32 @@ func drainReplyWakeOutbox(ctx context.Context, store *db.Store, now time.Time, r
 			start = end
 		}
 	}
-	return nil
+	return wakeOutboxObligationHealth(ctx, store, attemptedBefore)
+}
+
+func wakeOutboxObligationHealth(ctx context.Context, store *db.Store, attemptedBefore time.Time) error {
+	obligations, err := store.ListWakeOutboxObligations(ctx, attemptedBefore)
+	if err != nil {
+		return fmt.Errorf("read wake outbox obligations: %w", err)
+	}
+	pending := 0
+	agedAttempted := 0
+	for _, entry := range obligations {
+		switch entry.State {
+		case db.WakeOutboxStatePending:
+			pending++
+		case db.WakeOutboxStateAttempted:
+			agedAttempted++
+		}
+	}
+	if pending == 0 && agedAttempted == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"wake outbox has outstanding obligations: pending=%d aged_attempted=%d",
+		pending,
+		agedAttempted,
+	)
 }
 
 type synchronousWakeOutboxSink interface {
