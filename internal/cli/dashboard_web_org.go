@@ -367,6 +367,8 @@ func dashboardOrgPresenceState(state org.LifecycleState) string {
 		return "working"
 	case org.StateIdle:
 		return "idle"
+	case org.StateUnavailable:
+		return "unavailable"
 	default:
 		return "never-seen"
 	}

@@ -1746,4 +1746,25 @@ CREATE INDEX idx_jobs_repo ON jobs(repo);
 UPDATE jobs SET repo = json_extract(payload, '$.repo')
 WHERE repo = '' AND json_valid(payload) AND COALESCE(json_extract(payload, '$.repo'), '') != '';
 	`,
+	// #1136 provider-declared per-role unavailability. This is deliberately
+	// separate from org_blocked_episodes: the latter is an inferred Herdr-pane
+	// signal, while this row records an explicit runtime quota wall with a known,
+	// bounded expiry and a one-shot escalation claim.
+	`
+CREATE TABLE org_role_unavailable (
+	role TEXT PRIMARY KEY,
+	reason TEXT NOT NULL,
+	unavailable_until TEXT NOT NULL,
+	escalated_at TEXT NOT NULL DEFAULT '',
+	updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_org_role_unavailable_until ON org_role_unavailable(unavailable_until);
+	`,
+	// #1136 provider identity for quota incidents. Successful work may clear an
+	// incident only when it ran on the same runtime that reported the wall.
+	// Existing rows remain unattributed and therefore expire naturally instead
+	// of being cleared by an unrelated runtime.
+	`
+ALTER TABLE org_role_unavailable ADD COLUMN runtime TEXT NOT NULL DEFAULT '';
+	`,
 }

@@ -1223,6 +1223,14 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 	if err != nil {
 		return nil, err
 	}
+	unavailableRows, err := worker.Store.ListActiveOrgRolesUnavailable(ctx, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	unavailableRoles := make(map[string]db.OrgRoleUnavailable, len(unavailableRows))
+	for _, row := range unavailableRows {
+		unavailableRoles[row.Role] = row
+	}
 	var probeCache authProbeCache
 	if forDispatch {
 		probeCache = authProbeCache{}
@@ -1241,6 +1249,15 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 		// is honored everywhere; jobs without the payload field are unaffected.
 		if queuedJobBlockerHeld(job, time.Now().UTC()) {
 			continue
+		}
+		// Provider-declared role unavailability (#1136): all queued work attributed
+		// to that role is held until the reset boundary. ListActive... excludes
+		// expired rows (the one-minute sweep removes them), so stale incidents
+		// never suppress dispatch.
+		if payload, payloadErr := daemonJobPayload(job); payloadErr == nil {
+			if _, unavailable := unavailableRoles[strings.ToLower(strings.TrimSpace(payload.ActingOrgRole))]; unavailable {
+				continue
+			}
 		}
 		// Auth-probe gate (#532 slice B): once a runtime_auth deferral's coarse hold
 		// elapses, only re-dispatch when a live doctor-style probe says the credential

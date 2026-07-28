@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -139,6 +140,10 @@ func maybeRunLiveAB(ctx context.Context, store *db.Store, request localAgentDisp
 		// path would (the caller propagates the same error).
 		return true, runErr
 	}
+	// The champion is the canonical job outcome. Clear any older incident now,
+	// before the independent challenger delivery, so a quota wall from that
+	// second provider call cannot be erased by the caller's success handling.
+	recordLiveABQuotaOutcome(ctx, store, request, job, runtimeAgent(agent), nil)
 	championAnswer := strings.TrimSpace(championResult.Summary)
 
 	// 2) Challenger: a SECOND Deliver, strictly AFTER the champion returned, under
@@ -189,6 +194,12 @@ func runLiveABChallenger(ctx context.Context, store *db.Store, request localAgen
 	// returned (serialized under the single held lock) via the shared #473 seam.
 	challengerDelivery, err := deliverSkillOptABVariant(ctx, abAgent, prompt, challenger)
 	if err != nil {
+		// This is a known runtime-delivery seam but, unlike Mailbox.Run, the
+		// one-shot SkillOpt path does not add DeliveryError itself. Wrap it for
+		// the shared strict classifier and observe failures only: a successful
+		// challenger is not the canonical job success and must never clear an
+		// incident opened by another delivery.
+		recordLiveABQuotaOutcome(ctx, store, request, job, abAgent, workflow.DeliveryError{Err: err})
 		return fmt.Errorf("live_ab challenger deliver: %w", err)
 	}
 	championDelivery := skillOptABDelivery{label: skillOptABChampionLabel, answer: championAnswer}
@@ -223,6 +234,15 @@ func runLiveABChallenger(ctx context.Context, store *db.Store, request localAgen
 		return fmt.Errorf("live_ab update challenger arm: %w", err)
 	}
 	return nil
+}
+
+func recordLiveABQuotaOutcome(ctx context.Context, store *db.Store, request localAgentDispatchRequest, job db.Job, agent runtime.Agent, runErr error) {
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		return
+	}
+	_ = newQuotaRoleUnavailableHooks(store, request.Home, nil).
+		recordRuntimeOutcome(ctx, job, payload, agent, runErr, time.Now().UTC())
 }
 
 // resolveLiveABVariants resolves the champion (current promoted version) and the

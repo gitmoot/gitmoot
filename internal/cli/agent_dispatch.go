@@ -24,6 +24,8 @@ var newAgentDispatchGitHubClient = func(checkout string) github.Client {
 	return github.NewClient(checkout)
 }
 
+var localAgentDispatchRuntimeAdapterFor = runtimeAdapterFor
+
 type localAgentDispatchRequest struct {
 	RepoFlag       string
 	Agent          string
@@ -415,7 +417,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	ctx = workflow.WithRuntimeSelfOwnerToken(ctx, ownerToken)
 	// Adapter selection uses the EFFECTIVE runtime: this is the seam that makes
 	// a --runtime override actually deliver through the override adapter (#531).
-	adapter, err := runtimeAdapterFor(request.Home, effectiveAgent.Runtime, checkoutPath)
+	adapter, err := localAgentDispatchRuntimeAdapterFor(request.Home, effectiveAgent.Runtime, checkoutPath)
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}
@@ -453,6 +455,16 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		runCtx, cancel = context.WithTimeout(ctx, jobTimeout)
 		defer cancel()
 	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		return localAgentJobOutput{}, err
+	}
+	quotaHooks := newQuotaRoleUnavailableHooks(store, request.Home, io.Discard)
+	recordRuntimeOutcome := func(runErr error) {
+		// Availability bookkeeping is deliberately best-effort here, as it is in
+		// the daemon worker: it must never replace the foreground job's outcome.
+		_ = quotaHooks.recordRuntimeOutcome(ctx, job, payload, effectiveAgent, runErr, time.Now().UTC())
+	}
 	if request.Action == "ask" {
 		// Live-traffic A/B interception (#482). Off by default: when
 		// [skillopt].live_ab_sample_rate is 0 (every existing home + DefaultConfig),
@@ -470,6 +482,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			var abErr error
 			handled, abErr = maybeRunLiveAB(runCtx, store, request, agent, job, adapter, managed.OK)
 			if abErr != nil {
+				recordRuntimeOutcome(abErr)
 				return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, abErr)
 			}
 		}
@@ -479,8 +492,10 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			// Fail-open/empty by default; an agent/job pin wins.
 			mailbox := workflow.Mailbox{Store: store, RuntimeDefaultModel: runtimeDefaultModelResolver(request.Home), RuntimeDefaultEffort: runtimeDefaultEffortResolver(request.Home)}
 			if _, err := mailbox.Run(runCtx, job.ID, effectiveAgent, adapter); err != nil {
+				recordRuntimeOutcome(err)
 				return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, err)
 			}
+			recordRuntimeOutcome(nil)
 		}
 		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_completed", Message: "workflow advancement completed"}); err != nil {
 			return localAgentJobOutput{}, err
@@ -493,10 +508,13 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		engine := daemonWorkflowEngine(store, newAgentDispatchGitHubClient(checkoutPath), checkoutPath, workflowHome)
 		if _, err := engine.RunJob(runCtx, job.ID, effectiveAgent, adapter); err != nil {
 			if out, ok, _ := recoverAdvanceErrorOutput(ctx, store, job.ID, request, err); ok {
+				recordRuntimeOutcome(nil)
 				return out, nil
 			}
+			recordRuntimeOutcome(err)
 			return localAgentJobOutput{}, err
 		}
+		recordRuntimeOutcome(nil)
 	}
 	latest, err := store.GetJob(ctx, job.ID)
 	if err != nil {

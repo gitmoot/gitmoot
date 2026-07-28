@@ -336,9 +336,13 @@ func TestFindLiveTaskJobFindsLegacyJobAfterRepoBackfill(t *testing.T) {
 		raw.Close()
 		t.Fatalf("clear projected repo: %v", err)
 	}
-	if _, err := raw.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version = (SELECT MAX(version) FROM schema_migrations)`); err != nil {
+	// Apply the #1066 repair shape directly. The db package owns a separate
+	// content-addressed migration test; this workflow test only needs the
+	// post-backfill row to prove the indexed liveness lookup.
+	if _, err := raw.ExecContext(ctx, `UPDATE jobs SET repo = json_extract(payload, '$.repo')
+		WHERE repo = '' AND json_valid(payload) AND COALESCE(json_extract(payload, '$.repo'), '') != ''`); err != nil {
 		raw.Close()
-		t.Fatalf("mark tail migration unapplied: %v", err)
+		t.Fatalf("backfill projected repo: %v", err)
 	}
 	if err := raw.Close(); err != nil {
 		t.Fatalf("raw Close: %v", err)

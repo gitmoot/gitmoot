@@ -262,26 +262,28 @@ type orgBriefOutput struct {
 }
 
 type orgStatusOutput struct {
-	Role            string             `json:"role"`
-	Parent          string             `json:"parent,omitempty"`
-	Pane            string             `json:"pane,omitempty"`
-	Depth           int                `json:"depth,omitempty"`
-	Scope           []string           `json:"scope"`
-	MergeRule       string             `json:"merge_rule"`
-	Model           string             `json:"model"`
-	ActiveJobs      int                `json:"active_jobs,omitempty"`
-	LastSeenAt      string             `json:"last_seen_at,omitempty"`
-	LastSeenAge     string             `json:"last_seen_age,omitempty"`
-	LastCommand     string             `json:"last_command,omitempty"`
-	ProviderState   org.LifecycleState `json:"provider_state"`
-	ProviderDetail  string             `json:"provider_detail,omitempty"`
-	ObservedAt      time.Time          `json:"observed_at,omitempty"`
-	ProviderVersion string             `json:"provider_version,omitempty"`
-	RecycleStatus   string             `json:"recycle,omitempty"`
-	RecycleAfter    string             `json:"recycle_after,omitempty"`
-	MissedWakes     int                `json:"missed_wakes,omitempty"`
-	Flagged         bool               `json:"flagged,omitempty"`
-	FlagReason      string             `json:"flag_reason,omitempty"`
+	Role              string             `json:"role"`
+	Parent            string             `json:"parent,omitempty"`
+	Pane              string             `json:"pane,omitempty"`
+	Depth             int                `json:"depth,omitempty"`
+	Scope             []string           `json:"scope"`
+	MergeRule         string             `json:"merge_rule"`
+	Model             string             `json:"model"`
+	ActiveJobs        int                `json:"active_jobs,omitempty"`
+	LastSeenAt        string             `json:"last_seen_at,omitempty"`
+	LastSeenAge       string             `json:"last_seen_age,omitempty"`
+	LastCommand       string             `json:"last_command,omitempty"`
+	ProviderState     org.LifecycleState `json:"provider_state"`
+	ProviderDetail    string             `json:"provider_detail,omitempty"`
+	ObservedAt        time.Time          `json:"observed_at,omitempty"`
+	ProviderVersion   string             `json:"provider_version,omitempty"`
+	RecycleStatus     string             `json:"recycle,omitempty"`
+	RecycleAfter      string             `json:"recycle_after,omitempty"`
+	MissedWakes       int                `json:"missed_wakes,omitempty"`
+	Flagged           bool               `json:"flagged,omitempty"`
+	FlagReason        string             `json:"flag_reason,omitempty"`
+	UnavailableReason string             `json:"unavailable_reason,omitempty"`
+	UnavailableUntil  string             `json:"unavailable_until,omitempty"`
 }
 
 func runOrgBrief(args []string, stdout, stderr io.Writer) int {
@@ -425,7 +427,7 @@ func runOrgOverview(command string, args []string, stdout, stderr io.Writer) int
 	}
 	if command == "chart" {
 		for _, row := range rows {
-			fmt.Fprintf(stdout, "%s%s · %s · scope=%s · merge=%s · model=%s · seen=%s%s\n", strings.Repeat("  ", row.Depth), row.Role, row.ProviderState, strings.Join(row.Scope, ","), dash(row.MergeRule), dash(row.Model), dash(row.LastSeenAge), orgMissedWakeFlag(row))
+			fmt.Fprintf(stdout, "%s%s · %s%s · scope=%s · merge=%s · model=%s · seen=%s%s\n", strings.Repeat("  ", row.Depth), row.Role, row.ProviderState, orgUnavailableFlag(row), strings.Join(row.Scope, ","), dash(row.MergeRule), dash(row.Model), dash(row.LastSeenAge), orgMissedWakeFlag(row))
 		}
 		return 0
 	}
@@ -434,6 +436,13 @@ func runOrgOverview(command string, args []string, stdout, stderr io.Writer) int
 		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t%s\trecycle=%s%s\n", row.Role, row.ProviderState, dash(row.LastSeenAt), dash(row.LastSeenAge), dash(row.LastCommand), dash(row.ProviderDetail), firstNonEmpty(row.RecycleStatus, "off"), orgMissedWakeFlag(row))
 	}
 	return 0
+}
+
+func orgUnavailableFlag(row orgStatusOutput) string {
+	if row.ProviderState != org.StateUnavailable {
+		return ""
+	}
+	return fmt.Sprintf(" ⚠ UNAVAILABLE reason=%s until=%s", dash(row.UnavailableReason), dash(row.UnavailableUntil))
 }
 
 func orgMissedWakeFlag(row orgStatusOutput) string {
@@ -637,6 +646,9 @@ func validateAndTouchActingOrgRole(ctx context.Context, store *db.Store, home, r
 	configuredRole, ok := cfg.Role(role)
 	if !ok {
 		return fmt.Errorf("unknown org role %q", role)
+	}
+	if err := refuseUnavailableOrgRole(ctx, store, configuredRole.Name, time.Now().UTC()); err != nil {
+		return err
 	}
 	// Recycle enforcement only applies to operator-origin --org-role dispatches:
 	// this ingress (dispatchLocalAgentJob) is the sole path passing a non-empty
