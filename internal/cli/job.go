@@ -120,6 +120,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 	// deliveryEvents feeds the authoritative post-agent delivery status for
 	// implement jobs. Best-effort: unknown stays omitted if the lookup fails.
 	var deliveryEvents map[string]db.JobEvent
+	var deliveryEventsKnown bool
 	var locks []db.ResourceLock
 	if err := withStore(*home, func(store *db.Store) error {
 		var err error
@@ -133,7 +134,8 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 		}
 		preflightFailed, _ = store.JobIDsWithEventKind(context.Background(), "delegation_preflight_failed")
 		reasonEvents, _ = store.LatestJobEventsOfKinds(context.Background(), stuckReasonEventKinds)
-		deliveryEvents, _ = store.LatestJobEventsOfKinds(context.Background(), deliveryStatusEventKinds)
+		deliveryEvents, err = store.LatestJobEventsOfKinds(context.Background(), deliveryStatusEventKinds)
+		deliveryEventsKnown = err == nil
 		locks, _ = store.ListResourceLocks(context.Background())
 		return nil
 	}); err != nil {
@@ -149,7 +151,10 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 			reason := deriveStuckReason(job, ev, ok, locks)
 			processActive := deriveWorktreeProcessActive(job, jobWorktreeLiveness)
 			deliveryEvent, hasDeliveryEvent := deliveryEvents[job.ID]
-			deliveryStatus := deriveJobDeliveryStatus(job, payload, deliveryEvent, hasDeliveryEvent)
+			var deliveryStatus string
+			if deliveryEventsKnown {
+				deliveryStatus = deriveJobDeliveryStatus(job, payload, deliveryEvent, hasDeliveryEvent)
+			}
 			runtimeProcessActive := deriveRuntimeProcessActive(job, jobRuntimeProcessLiveness)
 			entries = append(entries, jobListEntry{
 				ID:                            job.ID,

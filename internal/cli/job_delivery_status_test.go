@@ -3,10 +3,12 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"strings"
 	"testing"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -125,6 +127,52 @@ func TestRunJobListShowSurfaceDeliveryStatus(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "delivery_status: pending") {
 		t.Fatalf("job show missing delivery status:\n%s", stdout.String())
+	}
+}
+
+func TestRunJobListWithholdsDeliveryStatusWhenEventLookupFails(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	seedCLIJob(t, store, db.Job{
+		ID:    "persisted-pr",
+		Agent: "worker",
+		Type:  "implement",
+		State: string(workflow.JobSucceeded),
+		Payload: mustJobPayload(t, workflow.JobPayload{
+			Repo:        "owner/repo",
+			PullRequest: 42,
+			Result:      &workflow.AgentResult{Decision: "implemented"},
+		}),
+	}, "succeeded")
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
+	}
+	if _, err := raw.Exec(`DROP TABLE job_events`); err != nil {
+		raw.Close()
+		t.Fatalf("drop job_events to force delivery-event lookup failure: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw database: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"job", "list", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("job list --json exit = %d, stderr=%s", code, stderr.String())
+	}
+	var entries []map[string]json.RawMessage
+	if err := json.Unmarshal(stdout.Bytes(), &entries); err != nil {
+		t.Fatalf("decode job list --json: %v\n%s", err, stdout.String())
+	}
+	if len(entries) != 1 {
+		t.Fatalf("job list entries = %d, want 1", len(entries))
+	}
+	if _, present := entries[0]["delivery_status"]; present {
+		t.Fatalf("job list inferred delivery_status from persisted PR after lookup failure: %s", stdout.String())
 	}
 }
 
