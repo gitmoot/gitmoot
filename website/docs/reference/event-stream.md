@@ -208,10 +208,10 @@ outbox. The daemon uses rolling five-second windows per role: one wake carries
 Pending, attempted, delivered, stalled, and failed remain queryable per outbox
 row, so an escalation that was never attempted is distinct from a successful
 wake. A quiet burst tail is flushed by a later daemon tick; it does not require
-another note. If the outbox cannot be queried, parsed, or claimed, the worker
-tick fails and the existing recovering supervisor retries and escalates a
-persistent shared-store fault; an indeterminate drain is never reported as
-healthy.
+another note. If the outbox or its delivery rules cannot be queried, or an
+outbox row cannot be parsed or claimed, the worker tick fails and the existing
+recovering supervisor retries and escalates a persistent shared-store fault; an
+indeterminate drain is never reported as healthy.
 The wake role's config sets `pane = "<pane-id-or-label>"`: a value containing `:`
 is a `wX:pY` pane id used as-is, any other value is a pane label resolved to the
 current id at wake time (so a recycled pane is still reached). Wake delivery runs

@@ -810,7 +810,11 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	// delivery indeterminate. Fail the tick instead of reporting healthy and
 	// dispatching more work; the recovering supervisor retries transient faults
 	// and escalates persistent shared-store failures through its existing path.
-	if err := drainReplyWakeOutbox(ctx, store, worker.eventSink(), now); err != nil {
+	replyWakeSink, sinkErr := worker.replyWakeEventSink(ctx)
+	if sinkErr != nil {
+		return fmt.Errorf("reply wake outbox sink resolution failed: %w", sinkErr)
+	}
+	if err := drainReplyWakeOutbox(ctx, store, replyWakeSink, now); err != nil {
 		return fmt.Errorf("reply wake outbox drain failed: %w", err)
 	}
 	// Checkout-mutating maintenance (advancement/merge retries, delegation

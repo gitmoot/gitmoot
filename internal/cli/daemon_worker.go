@@ -111,6 +111,17 @@ func (w jobWorker) eventSink() events.Sink {
 	return daemonEventSink(w.Store, w.workflowHome())
 }
 
+// replyWakeEventSink is the strict sink-resolution seam for durable outbox
+// delivery. Unlike ordinary best-effort event emission, an event-rules read
+// failure must fail the worker tick instead of becoming an indistinguishable
+// nil/disabled sink.
+func (w jobWorker) replyWakeEventSink(ctx context.Context) (events.Sink, error) {
+	if w.EventSinkOverride != nil {
+		return w.EventSinkOverride, nil
+	}
+	return resolveDaemonEventSink(ctx, w.Store, w.workflowHome())
+}
+
 type tempWorkerEligibility struct {
 	Eligible bool
 	Reason   string

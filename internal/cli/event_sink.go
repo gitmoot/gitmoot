@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,6 +43,15 @@ var eventSinkCache = struct {
 // observable without coupling the events package to the db layer or ever
 // blocking the caller.
 func daemonEventSink(store *db.Store, home string) events.Sink {
+	sink, _ := resolveDaemonEventSink(context.Background(), store, home)
+	return sink
+}
+
+// resolveDaemonEventSink exposes event-rule read failures to callers that own
+// durable delivery. Ordinary event emission uses daemonEventSink's historical
+// best-effort wrapper; the wake outbox tick must distinguish "rules disabled"
+// from "rules unreadable" so pending delivery work never looks healthy.
+func resolveDaemonEventSink(ctx context.Context, store *db.Store, home string) (events.Sink, error) {
 	home = strings.TrimSpace(home)
 	eventSinkCache.Lock()
 	webhook, built := eventSinkCache.webhooks[home]
@@ -55,17 +65,20 @@ func daemonEventSink(store *db.Store, home string) events.Sink {
 	// lightweight table when each per-tick engine is built; zero enabled rows
 	// preserve the exact historical sink (including nil when webhooks are off).
 	if store == nil {
-		return webhook
+		return webhook, nil
 	}
-	rules, err := store.ListEventRules(context.Background())
-	if err != nil || !hasEnabledEventRule(rules) {
-		return webhook
+	rules, err := store.ListEventRules(ctx)
+	if err != nil {
+		return webhook, fmt.Errorf("list event rules: %w", err)
+	}
+	if !hasEnabledEventRule(rules) {
+		return webhook, nil
 	}
 	key := home + "\x00" + store.DatabasePath()
 	eventSinkCache.Lock()
 	defer eventSinkCache.Unlock()
 	if sink := eventSinkCache.rules[key]; sink != nil {
-		return sink
+		return sink, nil
 	}
 	sink := &eventRuleSink{
 		inner: webhook,
@@ -74,7 +87,7 @@ func daemonEventSink(store *db.Store, home string) events.Sink {
 		wake:  cockpit.New(cockpit.Options{HerdrBin: "herdr"}, nil),
 	}
 	eventSinkCache.rules[key] = sink
-	return sink
+	return sink, nil
 }
 
 func buildDaemonEventSink(store *db.Store, home string) events.Sink {

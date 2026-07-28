@@ -247,6 +247,42 @@ func TestReplyWakeOutboxReadFailureFailsDaemonTickClosed(t *testing.T) {
 	}
 }
 
+func TestReplyWakeOutboxEventRulesReadFailureFailsDaemonTickClosed(t *testing.T) {
+	store, _, _, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
+	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+		WorkflowID: "release/rules-read-failure", Author: "worker", Body: "must stay pending",
+		AddressedTarget: "owner",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`DROP TABLE event_rules`); err != nil {
+		t.Fatal(err)
+	}
+
+	worker := defaultJobWorker(store, io.Discard, home)
+	tickErr := runDaemonWorkerTickTracked(
+		context.Background(), store, worker, 0, false, "", "", io.Discard,
+		time.Now().UTC(), nil, nil,
+	)
+	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending rows after event_rules read failure = %+v, err=%v", pending, err)
+	}
+	if tickErr == nil {
+		t.Fatal("daemon tick reported healthy after sink resolution skipped a pending wake")
+	}
+	if !strings.Contains(tickErr.Error(), "reply wake outbox sink resolution failed") ||
+		!strings.Contains(tickErr.Error(), "no such table: event_rules") {
+		t.Fatalf("daemon tick error = %q, want explicit event_rules read cause", tickErr)
+	}
+}
+
 const replyWakeProducerDatabaseEnv = "GITMOOT_TEST_REPLY_WAKE_PRODUCER_DATABASE"
 
 func TestReplyWakeOutboxSurvivesProducerProcessExitAndDrainsOnLaterDaemonTick(t *testing.T) {
