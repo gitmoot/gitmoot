@@ -73,7 +73,7 @@ func TestCaptureQuotaRoleUnavailableEscalatesOnceAndSuccessClears(t *testing.T) 
 		t.Fatalf("wake prompt = %q", wake.prompt)
 	}
 	incident, found, err := store.GetActiveOrgRoleUnavailable(context.Background(), "review", now)
-	if err != nil || !found || incident.EscalatedAt == "" {
+	if err != nil || !found || incident.Runtime != runtime.ClaudeRuntime || incident.EscalatedAt == "" {
 		t.Fatalf("incident = %+v found=%v err=%v", incident, found, err)
 	}
 
@@ -84,7 +84,7 @@ func TestCaptureQuotaRoleUnavailableEscalatesOnceAndSuccessClears(t *testing.T) 
 		t.Fatalf("repeat quota failure woke %d times, want exactly once", wake.promptCalls)
 	}
 
-	if err := worker.clearQuotaRoleUnavailableOnSuccess(context.Background(), "review"); err != nil {
+	if err := worker.clearQuotaRoleUnavailableOnSuccess(context.Background(), "review", runtime.ClaudeRuntime); err != nil {
 		t.Fatal(err)
 	}
 	if _, found, err := store.GetActiveOrgRoleUnavailable(context.Background(), "review", now); err != nil || found {
@@ -160,7 +160,7 @@ func TestForegroundDispatchCapturesQuotaFailureAndClearsOnSuccess(t *testing.T) 
 	adapter.output = `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
 	adapter.onDeliver = func() {
 		seedNow := time.Now().UTC()
-		if err := store.UpsertOrgRoleUnavailable(context.Background(), "review", "quota", seedNow.Add(time.Hour), seedNow); err != nil {
+		if err := store.UpsertOrgRoleUnavailableForRuntime(context.Background(), "review", runtime.ClaudeRuntime, "quota", seedNow.Add(time.Hour), seedNow); err != nil {
 			t.Errorf("seed in-flight unavailability: %v", err)
 		}
 	}
@@ -172,7 +172,7 @@ func TestForegroundDispatchCapturesQuotaFailureAndClearsOnSuccess(t *testing.T) 
 	}
 }
 
-func TestSuccessfulJobClearsQuotaRoleUnavailable(t *testing.T) {
+func TestSuccessfulJobOnlyClearsQuotaRoleUnavailableForSameRuntime(t *testing.T) {
 	home, paths := setupQuotaUnavailableOrgHome(t)
 	store, err := db.Open(paths.Database)
 	if err != nil {
@@ -189,7 +189,7 @@ func TestSuccessfulJobClearsQuotaRoleUnavailable(t *testing.T) {
 		ActingOrgRole: "review",
 	})
 	now := time.Now().UTC()
-	if err := store.UpsertOrgRoleUnavailable(context.Background(), "review", "quota", now.Add(time.Hour), now); err != nil {
+	if err := store.UpsertOrgRoleUnavailableForRuntime(context.Background(), "review", runtime.ClaudeRuntime, "quota", now.Add(time.Hour), now); err != nil {
 		t.Fatal(err)
 	}
 	worker := blockerE2EWorker(store, home, checkout)
@@ -205,8 +205,20 @@ func TestSuccessfulJobClearsQuotaRoleUnavailable(t *testing.T) {
 	if err != nil || job.State != string(workflow.JobSucceeded) {
 		t.Fatalf("successful job = %+v err=%v", job, err)
 	}
+	if incident, found, err := store.GetActiveOrgRoleUnavailable(context.Background(), "review", now); err != nil || !found {
+		t.Fatalf("shell success cleared Claude incident = %+v found=%v err=%v", incident, found, err)
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.quotaRoleUnavailableHooks().recordRuntimeOutcome(
+		context.Background(), job, payload, runtime.Agent{Runtime: runtime.ClaudeRuntime}, nil, now,
+	); err != nil {
+		t.Fatal(err)
+	}
 	if _, found, err := store.GetActiveOrgRoleUnavailable(context.Background(), "review", now); err != nil || found {
-		t.Fatalf("incident after successful job found=%v err=%v", found, err)
+		t.Fatalf("Claude success left Claude incident found=%v err=%v", found, err)
 	}
 }
 
@@ -274,7 +286,7 @@ func TestTempWorkerDispatchCapturesQuotaFailureAndClearsOnSuccess(t *testing.T) 
 	delivery.output = `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
 	delivery.onDeliver = func() {
 		seedNow := time.Now().UTC()
-		if err := store.UpsertOrgRoleUnavailable(context.Background(), "review", "quota", seedNow.Add(time.Hour), seedNow); err != nil {
+		if err := store.UpsertOrgRoleUnavailableForRuntime(context.Background(), "review", runtime.ClaudeRuntime, "quota", seedNow.Add(time.Hour), seedNow); err != nil {
 			t.Errorf("seed in-flight unavailability: %v", err)
 		}
 	}

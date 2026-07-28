@@ -16,6 +16,8 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/org"
+	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -239,6 +241,58 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/org/role/missing", nil))
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("missing role HTTP status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestDashboardOrgProjectionDistinguishesUnavailableAvailableAndNeverReported(t *testing.T) {
+	_, paths := setupOrgHome(t)
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+
+	initial, err := buildDashboardOrg(ctx, paths, store, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, role := range initial.Roles {
+		if role.PresenceState != "never-seen" {
+			t.Fatalf("unreported role %q state = %q, want never-seen", role.Name, role.PresenceState)
+		}
+	}
+
+	if err := store.UpsertRoleLivePresence(ctx, "owner", string(org.StateIdle), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertOrgRoleUnavailableForRuntime(ctx, "review", runtime.ClaudeRuntime, "quota", now.Add(time.Hour), now); err != nil {
+		t.Fatal(err)
+	}
+	view, err := buildDashboardOrg(ctx, paths, store, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	states := map[string]string{}
+	details := map[string]string{}
+	for _, role := range view.Roles {
+		states[role.Name] = role.PresenceState
+		details[role.Name] = role.PresenceDetail
+	}
+	if states["owner"] != "idle" {
+		t.Fatalf("reported available owner state = %q, want idle", states["owner"])
+	}
+	if states["review"] != "unavailable" || !strings.Contains(details["review"], "reason=quota") {
+		t.Fatalf("reported unavailable review = state %q detail %q", states["review"], details["review"])
+	}
+
+	role, err := buildDashboardOrgRole(ctx, paths, store, "review", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if role.Presence.State != "unavailable" {
+		t.Fatalf("unavailable role detail state = %q", role.Presence.State)
 	}
 }
 

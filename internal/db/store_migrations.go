@@ -1760,4 +1760,11 @@ CREATE TABLE org_role_unavailable (
 );
 CREATE INDEX idx_org_role_unavailable_until ON org_role_unavailable(unavailable_until);
 	`,
+	// #1136 provider identity for quota incidents. Successful work may clear an
+	// incident only when it ran on the same runtime that reported the wall.
+	// Existing rows remain unattributed and therefore expire naturally instead
+	// of being cleared by an unrelated runtime.
+	`
+ALTER TABLE org_role_unavailable ADD COLUMN runtime TEXT NOT NULL DEFAULT '';
+	`,
 }

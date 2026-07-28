@@ -63,10 +63,11 @@ func classifyRuntimeRoleUnavailable(runtimeName string, cause error, now time.Ti
 
 // recordRuntimeOutcome applies the same role-availability transition at every
 // delivery seam: a Claude quota failure records/escalates the incident, while a
-// successful attributed job is the definitive signal that clears it.
+// successful attributed job on that same runtime is the definitive signal that
+// clears it.
 func (h quotaRoleUnavailableHooks) recordRuntimeOutcome(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent, runErr error, now time.Time) error {
 	if runErr == nil {
-		return h.clearOnSuccess(ctx, payload.ActingOrgRole)
+		return h.clearOnSuccess(ctx, payload.ActingOrgRole, agent.Runtime)
 	}
 	return h.captureFailure(ctx, job, payload, agent, runErr, now)
 }
@@ -88,10 +89,10 @@ func (h quotaRoleUnavailableHooks) captureFailure(ctx context.Context, job db.Jo
 	if until.IsZero() {
 		until = now.UTC().Add(quotaBlockerFallbackDelay)
 	}
-	if err := h.store.UpsertOrgRoleUnavailable(ctx, role, orgRoleUnavailableReasonQuota, until, now); err != nil {
+	if err := h.store.UpsertOrgRoleUnavailableForRuntime(ctx, role, agent.Runtime, orgRoleUnavailableReasonQuota, until, now); err != nil {
 		return fmt.Errorf("record org role %q unavailable: %w", role, err)
 	}
-	claimed, err := h.store.MarkOrgRoleUnavailableEscalated(ctx, role, now)
+	claimed, err := h.store.MarkOrgRoleUnavailableEscalatedForRuntime(ctx, role, agent.Runtime, now)
 	if err != nil {
 		return fmt.Errorf("claim org role %q quota escalation: %w", role, err)
 	}
@@ -108,20 +109,21 @@ func (h quotaRoleUnavailableHooks) captureFailure(ctx context.Context, job db.Jo
 	return nil
 }
 
-func (h quotaRoleUnavailableHooks) clearOnSuccess(ctx context.Context, role string) error {
+func (h quotaRoleUnavailableHooks) clearOnSuccess(ctx context.Context, role, runtimeName string) error {
 	role = strings.TrimSpace(role)
-	if role == "" || h.store == nil {
+	runtimeName = strings.TrimSpace(runtimeName)
+	if role == "" || runtimeName == "" || h.store == nil {
 		return nil
 	}
-	return h.store.ClearOrgRoleUnavailable(ctx, role)
+	return h.store.ClearOrgRoleUnavailableForRuntime(ctx, role, runtimeName)
 }
 
 func (w jobWorker) captureQuotaRoleUnavailable(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent, cause error, now time.Time) error {
 	return w.quotaRoleUnavailableHooks().captureFailure(ctx, job, payload, agent, cause, now)
 }
 
-func (w jobWorker) clearQuotaRoleUnavailableOnSuccess(ctx context.Context, role string) error {
-	return w.quotaRoleUnavailableHooks().clearOnSuccess(ctx, role)
+func (w jobWorker) clearQuotaRoleUnavailableOnSuccess(ctx context.Context, role, runtimeName string) error {
+	return w.quotaRoleUnavailableHooks().clearOnSuccess(ctx, role, runtimeName)
 }
 
 // wakeQuotaRoleUnavailable directly wakes the unavailable role's configured

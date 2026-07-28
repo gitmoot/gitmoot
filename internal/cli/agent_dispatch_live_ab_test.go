@@ -538,7 +538,7 @@ func TestMaybeRunLiveABChallengerSuccessDoesNotClearConcurrentIncident(t *testin
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	if err := store.UpsertOrgRoleUnavailable(ctx, "review", "quota", now.Add(time.Hour), now); err != nil {
+	if err := store.UpsertOrgRoleUnavailableForRuntime(ctx, "review", runtime.ShellRuntime, "quota", now.Add(time.Hour), now); err != nil {
 		t.Fatal(err)
 	}
 
@@ -555,7 +555,7 @@ func TestMaybeRunLiveABChallengerSuccessDoesNotClearConcurrentIncident(t *testin
 			sawChampionClear = !found
 		}
 		concurrentNow := time.Now().UTC()
-		if err := store.UpsertOrgRoleUnavailable(ctx, "review", "quota", concurrentNow.Add(time.Hour), concurrentNow); err != nil {
+		if err := store.UpsertOrgRoleUnavailableForRuntime(ctx, "review", runtime.ClaudeRuntime, "quota", concurrentNow.Add(time.Hour), concurrentNow); err != nil {
 			t.Errorf("seed concurrent incident: %v", err)
 		}
 		return "Challenger answer.", nil

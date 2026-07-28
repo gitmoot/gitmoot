@@ -1061,10 +1061,11 @@ their JSON rows expose `provider_state: "unavailable"`,
 `unavailable_reason`, and `unavailable_until`. New operator dispatches to the
 role are refused and already-queued jobs for it stay held. The incident sends
 one best-effort direct wake to the role's configured parent, then clears at the
-reset instant or on that role's first successful job, whichever happens first.
-If Claude supplies no parseable reset, Gitmoot uses the existing bounded
-15-minute quota fallback. Codex and Kimi quota-message detection are not part
-of this phase.
+reset instant or on that role's first subsequent successful Claude-runtime job,
+whichever happens first. Success on another runtime cannot clear the Claude
+wall. If Claude supplies no parseable reset, Gitmoot uses the existing bounded
+15-minute quota fallback. Codex and Kimi quota-message detection are not part of
+this phase.
 
 The read-only Org page consumes `GET /api/org` for the store-backed role tree,
 health strip, typed escalations, and current signal feed, plus
@@ -1077,7 +1078,10 @@ is enabled; otherwise `detection_hint` explains why an empty signal feed is not
 evidence that every role is healthy. The enabled blocked-role evaluator also
 persists its latest Herdr snapshot for these endpoints. Only observations from
 the last five minutes are rendered as `blocked`, `working`, or `idle`; stale,
-missing, `done`, and `unknown` observations render as `never-seen`.
+missing, `done`, and `unknown` observations render as `never-seen`. An active
+provider quota incident renders separately as `unavailable`, including its
+reason and reset boundary in `presence_detail`; it is never collapsed into
+`never-seen`.
 
 Session lifecycle (phase 3): `[org] recycle_after = "24h"` (a duration, per-role
 overridable) marks a role recycle-overdue after it has been idle that long,
