@@ -28,14 +28,16 @@ Requires Go 1.26+ (see `go.mod`; CI resolves the version via
 export GOTOOLCHAIN=local PATH=/root/.local/toolchains/go1.26.4/bin:$PATH
 ```
 
-Run from the repo root and make these pass before committing — they mirror the CI
-gate in `.github/workflows/ci.yml`:
+Run from the repo root and make these pass before committing. They are the local
+equivalent of the CI gate in `.github/workflows/ci.yml`; the build flag works
+around Go VCS discovery in linked worktrees, and the explicit timeout covers
+packages whose valid runtime exceeds Go's 10-minute default:
 
 ```sh
-go build ./...
+go build -buildvcs=false ./...
 go generate ./... && git diff --exit-code   # gitmoot_result contract is single-sourced + regenerated; stale artifact fails CI
 go vet ./...
-go test ./...
+go test -timeout 30m ./...
 # Race gate is scoped (not ./...). CI compiles one -race test binary per package
 # and runs timing-balanced shards from those binaries (#906). Locally you can
 # run the four complete packages at once:
