@@ -58,9 +58,10 @@ gitmoot job open --agent <name> --repo owner/repo --type review \
   --pr <n> --head-sha <sha> --workflow <label>
 ```
 
-Journal meaningful progress with `gitmoot workflow note <label> "..."`; those
-timestamped notes are also the review's liveness signal. After posting the
-verdict, clock out with `gitmoot job close <id> --decision
+Journal meaningful progress with `gitmoot workflow note <label> "..." --author
+<name>`; only notes attributed to the review job's recorded agent are its
+liveness signal. After posting the verdict, clock out with `gitmoot job close
+<id> --decision
 approved|changes_requested|blocked --summary "..."`. Do not leave a real
 in-session review only in conversation: without the open/note/close discipline,
 other Gitmoot surfaces cannot distinguish the review from an idle lane.

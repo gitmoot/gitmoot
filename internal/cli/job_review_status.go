@@ -33,8 +33,9 @@ func deriveReviewStatuses(ctx context.Context, store *db.Store, jobs []db.Job, n
 
 // deriveReviewStatus projects liveness only for running, externally-driven
 // reviews. Eligible reviews always get an explicit state: only a workflow note
-// observed at or after this job opened can establish in_progress or stalled;
-// missing or unreadable evidence is unknown rather than silently omitted.
+// authored by this job's reviewer and observed at or after this job opened can
+// establish in_progress or stalled; missing or unreadable evidence is unknown
+// rather than silently omitted.
 func deriveReviewStatus(ctx context.Context, store *db.Store, job db.Job, now time.Time) string {
 	if job.Type != "review" ||
 		!job.ExternallyDriven ||
@@ -48,14 +49,15 @@ func deriveReviewStatus(ctx context.Context, store *db.Store, job db.Job, now ti
 	}
 	openedAt := parseTranscriptStoreTime(job.CreatedAt)
 	workflowID := strings.TrimSpace(job.WorkflowID)
-	if store == nil || openedAt.IsZero() || workflowID == "" {
+	reviewer := strings.TrimSpace(job.Agent)
+	if store == nil || openedAt.IsZero() || workflowID == "" || reviewer == "" {
 		return reviewStatusUnknown
 	}
-	notes, err := store.ListWorkflowNotes(ctx, workflowID, 1)
-	if err != nil || len(notes) == 0 {
+	note, err := store.LatestWorkflowNoteByAuthor(ctx, workflowID, reviewer)
+	if err != nil {
 		return reviewStatusUnknown
 	}
-	latestSignal := parseTranscriptStoreTime(notes[len(notes)-1].CreatedAt)
+	latestSignal := parseTranscriptStoreTime(note.CreatedAt)
 	if latestSignal.IsZero() || latestSignal.Before(openedAt) || now.UTC().Before(latestSignal) {
 		return reviewStatusUnknown
 	}

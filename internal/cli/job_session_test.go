@@ -225,7 +225,7 @@ func TestSessionReviewStatusDistinguishesProgressAndStall(t *testing.T) {
 		{"review/stalled", "reviewed stale tests"},
 	} {
 		var noteOut, noteErr bytes.Buffer
-		if code := Run([]string{"workflow", "note", note.workflowID, note.body, "--home", home, "--no-auto"}, &noteOut, &noteErr); code != 0 {
+		if code := Run([]string{"workflow", "note", note.workflowID, note.body, "--author", "lead", "--home", home, "--no-auto"}, &noteOut, &noteErr); code != 0 {
 			t.Fatalf("workflow note %s exit = %d, stderr=%s", note.workflowID, code, noteErr.String())
 		}
 	}
@@ -352,7 +352,7 @@ func TestSessionReviewStatusReusedWorkflowLabel(t *testing.T) {
 	var noteOut, noteErr bytes.Buffer
 	if code := Run([]string{
 		"workflow", "note", "review/reused", "review A progress",
-		"--home", home, "--no-auto",
+		"--author", "lead", "--home", home, "--no-auto",
 	}, &noteOut, &noteErr); code != 0 {
 		t.Fatalf("workflow note exit = %d, stderr=%s", code, noteErr.String())
 	}
@@ -428,6 +428,7 @@ func TestSessionReviewStatusExactStalenessBoundary(t *testing.T) {
 	}
 	note, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
 		WorkflowID: "review/boundary",
+		Author:     "lead",
 		Body:       "boundary heartbeat",
 	})
 	if err != nil {
@@ -470,6 +471,76 @@ func TestSessionReviewStatusExactStalenessBoundary(t *testing.T) {
 	setNoteAt(now.Add(-sessionReviewStaleGap - time.Second))
 	if got := deriveReviewStatus(context.Background(), store, job, now); got != reviewStatusStalled {
 		t.Fatalf("review one second past stale gap = %q, want %q", got, reviewStatusStalled)
+	}
+}
+
+func TestSessionReviewStatusIgnoresFreshDaemonLifecycleNote(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	seedSessionAgentRepo(t, store)
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{
+		"job", "open", "--home", home, "--agent", "lead",
+		"--repo", "owner/repo", "--type", "review",
+		"--workflow", "review/daemon-noise", "--pr", "7", "--head-sha", "review-head", "--json",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("job open exit = %d, stderr=%s", code, stderr.String())
+	}
+	var opened jobSessionOutput
+	if err := json.Unmarshal(stdout.Bytes(), &opened); err != nil {
+		t.Fatalf("decode job open JSON: %v (%s)", err, stdout.String())
+	}
+	reviewerNote, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+		WorkflowID: "review/daemon-noise",
+		Author:     "lead",
+		Body:       "reviewer checkpoint",
+	})
+	if err != nil {
+		t.Fatalf("Insert reviewer note: %v", err)
+	}
+	daemonNote, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+		WorkflowID: "review/daemon-noise",
+		Author:     db.WorkflowAutoNoteAuthor,
+		Body:       "[auto:pr:7:ready] unrelated PR lifecycle activity",
+	})
+	if err != nil {
+		t.Fatalf("Insert daemon note: %v", err)
+	}
+
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("sql.Open returned error: %v", err)
+	}
+	defer raw.Close()
+	for id, at := range map[int64]time.Time{
+		reviewerNote.ID: now.Add(-sessionReviewStaleGap - time.Minute),
+		daemonNote.ID:   now.Add(-time.Minute),
+	} {
+		if _, err := raw.Exec(
+			`UPDATE workflow_notes SET created_at = ? WHERE id = ?`,
+			at.Format("2006-01-02 15:04:05"), id,
+		); err != nil {
+			t.Fatalf("set note %d timestamp: %v", id, err)
+		}
+	}
+	if _, err := raw.Exec(
+		`UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`,
+		now.Add(-time.Hour).Format("2006-01-02 15:04:05"),
+		now.Add(-time.Hour).Format("2006-01-02 15:04:05"),
+		opened.JobID,
+	); err != nil {
+		t.Fatalf("backdate review job: %v", err)
+	}
+	job, err := store.GetJob(context.Background(), opened.JobID)
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+
+	if got := deriveReviewStatus(context.Background(), store, job, now); got != reviewStatusStalled {
+		t.Fatalf("stalled review with fresh daemon lifecycle note = %q, want %q", got, reviewStatusStalled)
 	}
 }
 
