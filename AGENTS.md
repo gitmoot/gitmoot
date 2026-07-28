@@ -32,15 +32,39 @@ Run from the repo root and make these pass before committing — they mirror the
 gate in `.github/workflows/ci.yml`:
 
 ```sh
-go build ./...
+go build -buildvcs=false ./...
 go generate ./... && git diff --exit-code   # gitmoot_result contract is single-sourced + regenerated; stale artifact fails CI
 go vet ./...
-go test ./...
+go test -timeout 25m ./...
 # Race gate is scoped (not ./...). CI compiles one -race test binary per package
 # and runs timing-balanced shards from those binaries (#906). Locally you can
 # run the four complete packages at once:
 go test -race -timeout 35m ./internal/workflow/ ./internal/cli/ ./internal/db/ ./internal/daemon/ ./internal/pipeline/
 ```
+
+`-buildvcs=false` is required, not optional, inside a gitmoot worktree (#1209):
+Go's VCS auto-stamp only recognizes a `.git` **directory** as a repo root
+(`cmd/go/internal/vcs.vcsGit.RootNames`), but a linked worktree's `.git` is a
+**file** (a `gitdir:` pointer). Go's root-detection walk-up skips past the
+worktree's real root looking for any ancestor with a `.git`-shaped directory,
+and can land on an unrelated one — hard-failing with `error obtaining VCS
+status: exit status 128` even though `git status` itself works fine from the
+same directory. This is a genuine Go toolchain limitation with linked
+worktrees (confirmed by reading `cmd/go/internal/vcs/vcs.go`'s `FromDir` /
+`isVCSRoot`), not something gitmoot's code or config can fix, and even the
+non-failing cases can silently stamp the wrong VCS metadata (wrong commit,
+wrong dirty bit) from whatever directory the walk-up happened to land on.
+Disabling it here costs nothing real: release binaries get their version
+info from the explicit `-ldflags -X ...Commit=$(git rev-parse HEAD)` recipe
+in the deploy section below, never from Go's auto-stamp.
+
+`-timeout 25m` on the plain `go test ./...` closes the same kind of gap
+(#1210): Go's default test timeout is 600s **per package**, not per `./...`
+invocation, and `internal/cli`'s suite alone can run past that on a clean
+local clone. CI's own build+generate+vet+test job isn't at risk (it
+completes in well under 10 minutes on its runners), so this was a
+local-only gap — but a command documented as "run this before committing"
+has to actually be able to finish.
 
 The CLI entrypoint lives under `cmd/gitmoot/`. The CI gate is Go-only — it does
 **not** build the website or run the live multi-runtime (codex/claude/kimi) E2E
