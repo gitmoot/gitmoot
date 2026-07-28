@@ -146,19 +146,22 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 			processActive := deriveWorktreeProcessActive(job, jobWorktreeLiveness)
 			runtimeProcessActive := deriveRuntimeProcessActive(job, jobRuntimeProcessLiveness)
 			entries = append(entries, jobListEntry{
-				ID:                   job.ID,
-				State:                job.State,
-				Type:                 job.Type,
-				Agent:                job.Agent,
-				Repo:                 payload.Repo,
-				PullRequest:          payload.PullRequest,
-				WorkflowID:           job.WorkflowID,
-				PreflightFailed:      strings.TrimSpace(preflightFailed[job.ID]),
-				WhyStuck:             reason.Reason,
-				NextRetryAt:          reason.NextRetryAt,
-				SuggestedAction:      reason.SuggestedAction,
-				ProcessActive:        processActive,
-				RuntimeProcessActive: runtimeProcessActive,
+				ID:                            job.ID,
+				State:                         job.State,
+				Type:                          job.Type,
+				Agent:                         job.Agent,
+				Repo:                          payload.Repo,
+				PullRequest:                   payload.PullRequest,
+				WorkflowID:                    job.WorkflowID,
+				PreflightFailed:               strings.TrimSpace(preflightFailed[job.ID]),
+				WhyStuck:                      reason.Reason,
+				NextRetryAt:                   reason.NextRetryAt,
+				SuggestedAction:               reason.SuggestedAction,
+				ProcessActive:                 processActive,
+				RuntimeProcessActive:          runtimeProcessActive,
+				ReadOnlyWorktreeDiff:          payload.ReadOnlyWorktreeDiff,
+				ReadOnlyWorktreeDiffTruncated: payload.ReadOnlyWorktreeDiffTruncated,
+				ReadOnlyWorktreeDiffError:     payload.ReadOnlyWorktreeDiffError,
 			})
 		}
 		if err := writeJSON(stdout, entries); err != nil {
@@ -189,6 +192,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 		if deriveWorktreeProcessActive(job, jobWorktreeLiveness) {
 			fmt.Fprint(stdout, "\tLIVE PROCESS: worktree still has an active process")
 		}
+		printReadOnlyWorktreeDiffSummary(stdout, payload, "\t")
 		fmt.Fprintln(stdout)
 	}
 	return 0
@@ -208,19 +212,22 @@ func flagWasSupplied(fs *flag.FlagSet, name string) bool {
 // columns plus additive operational fields (#552, #1132). Zero-value detail is
 // omitted so a healthy job's JSON is not bloated.
 type jobListEntry struct {
-	ID                   string `json:"id"`
-	State                string `json:"state"`
-	Type                 string `json:"type"`
-	Agent                string `json:"agent"`
-	Repo                 string `json:"repo"`
-	PullRequest          int    `json:"pull_request"`
-	WorkflowID           string `json:"workflow_id,omitempty"`
-	PreflightFailed      string `json:"preflight_failed,omitempty"`
-	WhyStuck             string `json:"why_stuck,omitempty"`
-	NextRetryAt          string `json:"next_retry_at,omitempty"`
-	SuggestedAction      string `json:"suggested_action,omitempty"`
-	ProcessActive        bool   `json:"process_active,omitempty"`
-	RuntimeProcessActive *bool  `json:"runtime_process_active,omitempty"`
+	ID                            string `json:"id"`
+	State                         string `json:"state"`
+	Type                          string `json:"type"`
+	Agent                         string `json:"agent"`
+	Repo                          string `json:"repo"`
+	PullRequest                   int    `json:"pull_request"`
+	WorkflowID                    string `json:"workflow_id,omitempty"`
+	PreflightFailed               string `json:"preflight_failed,omitempty"`
+	WhyStuck                      string `json:"why_stuck,omitempty"`
+	NextRetryAt                   string `json:"next_retry_at,omitempty"`
+	SuggestedAction               string `json:"suggested_action,omitempty"`
+	ProcessActive                 bool   `json:"process_active,omitempty"`
+	RuntimeProcessActive          *bool  `json:"runtime_process_active,omitempty"`
+	ReadOnlyWorktreeDiff          string `json:"read_only_worktree_diff,omitempty"`
+	ReadOnlyWorktreeDiffTruncated bool   `json:"read_only_worktree_diff_truncated,omitempty"`
+	ReadOnlyWorktreeDiffError     string `json:"read_only_worktree_diff_error,omitempty"`
 }
 
 func runJobShow(args []string, stdout, stderr io.Writer) int {
@@ -258,13 +265,16 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 	runtimeProcessActive := deriveRuntimeProcessActive(job, jobRuntimeProcessLiveness)
 	if *jsonOutput {
 		out := jobShowOutput{
-			Job:                  job,
-			Payload:              payload,
-			WhyStuck:             reason.Reason,
-			NextRetryAt:          reason.NextRetryAt,
-			SuggestedAction:      reason.SuggestedAction,
-			ProcessActive:        processActive,
-			RuntimeProcessActive: runtimeProcessActive,
+			Job:                           job,
+			Payload:                       payload,
+			WhyStuck:                      reason.Reason,
+			NextRetryAt:                   reason.NextRetryAt,
+			SuggestedAction:               reason.SuggestedAction,
+			ProcessActive:                 processActive,
+			RuntimeProcessActive:          runtimeProcessActive,
+			ReadOnlyWorktreeDiff:          payload.ReadOnlyWorktreeDiff,
+			ReadOnlyWorktreeDiffTruncated: payload.ReadOnlyWorktreeDiffTruncated,
+			ReadOnlyWorktreeDiffError:     payload.ReadOnlyWorktreeDiffError,
 		}
 		if err := writeJSON(stdout, out); err != nil {
 			fmt.Fprintf(stderr, "job show: %v\n", err)
@@ -280,13 +290,16 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 // payload, and additive operational detail (#552, #1132). Zero-value detail is
 // omitted so a healthy job's JSON is unchanged in spirit.
 type jobShowOutput struct {
-	Job                  db.Job              `json:"job"`
-	Payload              workflow.JobPayload `json:"payload"`
-	WhyStuck             string              `json:"why_stuck,omitempty"`
-	NextRetryAt          string              `json:"next_retry_at,omitempty"`
-	SuggestedAction      string              `json:"suggested_action,omitempty"`
-	ProcessActive        bool                `json:"process_active,omitempty"`
-	RuntimeProcessActive *bool               `json:"runtime_process_active,omitempty"`
+	Job                           db.Job              `json:"job"`
+	Payload                       workflow.JobPayload `json:"payload"`
+	WhyStuck                      string              `json:"why_stuck,omitempty"`
+	NextRetryAt                   string              `json:"next_retry_at,omitempty"`
+	SuggestedAction               string              `json:"suggested_action,omitempty"`
+	ProcessActive                 bool                `json:"process_active,omitempty"`
+	RuntimeProcessActive          *bool               `json:"runtime_process_active,omitempty"`
+	ReadOnlyWorktreeDiff          string              `json:"read_only_worktree_diff,omitempty"`
+	ReadOnlyWorktreeDiffTruncated bool                `json:"read_only_worktree_diff_truncated,omitempty"`
+	ReadOnlyWorktreeDiffError     string              `json:"read_only_worktree_diff_error,omitempty"`
 }
 
 // loadStuckReason derives a queued/blocked job's why-stuck reason from its full
@@ -1262,10 +1275,32 @@ func printJob(stdout io.Writer, job db.Job, payload workflow.JobPayload, reason 
 	if len(payload.RawOutputs) > 0 {
 		fmt.Fprintf(stdout, "raw_outputs: %d retained locally\n", len(payload.RawOutputs))
 	}
+	if strings.TrimSpace(payload.ReadOnlyWorktreeDiff) != "" {
+		fmt.Fprintf(stdout, "read_only_worktree_diff: captured %d bytes", len(payload.ReadOnlyWorktreeDiff))
+		if payload.ReadOnlyWorktreeDiffTruncated {
+			fmt.Fprint(stdout, " (truncated)")
+		}
+		fmt.Fprintln(stdout)
+	} else if payload.ReadOnlyWorktreeDiffError != "" {
+		fmt.Fprintf(stdout, "read_only_worktree_diff_error: %s\n", payload.ReadOnlyWorktreeDiffError)
+	}
 	printFailureDiagnostics(stdout, payload.FailureDiagnostics)
 	encoded, err := json.MarshalIndent(payload, "", "  ")
 	if err == nil {
 		fmt.Fprintf(stdout, "payload: %s\n", string(encoded))
+	}
+}
+
+func printReadOnlyWorktreeDiffSummary(stdout io.Writer, payload workflow.JobPayload, prefix string) {
+	if strings.TrimSpace(payload.ReadOnlyWorktreeDiff) != "" {
+		fmt.Fprintf(stdout, "%sDIFF: %d bytes captured", prefix, len(payload.ReadOnlyWorktreeDiff))
+		if payload.ReadOnlyWorktreeDiffTruncated {
+			fmt.Fprint(stdout, " (truncated)")
+		}
+		return
+	}
+	if payload.ReadOnlyWorktreeDiffError != "" {
+		fmt.Fprintf(stdout, "%sDIFF CAPTURE FAILED: %s", prefix, payload.ReadOnlyWorktreeDiffError)
 	}
 }
 

@@ -1452,6 +1452,21 @@ gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 ```
 
+Terminal background `ask` and `review` jobs that ran in a throwaway read-only
+worktree preserve a bounded `git status --short` plus `git diff HEAD` snapshot
+before Gitmoot removes that worktree. `job show` prints the captured diff and
+`job list` adds a compact `DIFF:` badge. Their JSON forms expose
+`read_only_worktree_diff`, `read_only_worktree_diff_truncated`, and
+`read_only_worktree_diff_error`; the same durable fields are present under
+`job show --json`'s `payload`. Capture is capped at 4 MiB, and an oversized
+snapshot ends with an explicit omitted-byte marker instead of being silently
+cut. Git subprocesses and the wait for each index-file copy share a 10-second
+context: on expiry Gitmoot kills the subprocess or stops waiting for the copy.
+The operating system still owns cancellation of an in-progress filesystem
+syscall, so this is a bounded-wait guarantee rather than a promise that kernel
+I/O itself is cancelled. Failures are recorded and never prevent worktree
+removal.
+
 When standard output is an interactive terminal (and `NO_COLOR` is unset),
 the transcript renders styled: agent turns get blank-line spacing and keep
 their line breaks plus lightweight heading/list/inline-code treatment. Tool
