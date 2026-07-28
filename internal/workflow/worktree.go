@@ -742,7 +742,7 @@ func (e Engine) cleanupReadOnlyDelegationWorktree(ctx context.Context, jobID str
 		if err := e.BeforeReadOnlyWorktreeCleanup(opCtx, jobID, jobType, payload); err != nil {
 			_ = e.Store.AddJobEvent(opCtx, db.JobEvent{
 				JobID: jobID, Kind: "readonly_worktree_precleanup_failed",
-				Message: fmt.Sprintf("pre-cleanup hook failed before worktree disposal: %v", err),
+				Message: fmt.Sprintf("pre-cleanup hook failed before worktree disposal: %s", RedactCommentText(err.Error())),
 			})
 		}
 	}

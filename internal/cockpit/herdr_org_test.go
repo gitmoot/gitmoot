@@ -27,12 +27,16 @@ func TestHerdrOrgProviderSnapshotMapping(t *testing.T) {
 {"pane_id":"w1:p7","label":"duplicate","agent_status":"idle"},
 {"pane_id":"w1:p8","label":"claude","agent_status":"working"},
 {"pane_id":"w1:p9","label":" whitespace-label ","agent_status":"working"},
-{"pane_id":"w1:p10","label":"whitespace-status","agent_status":" working "}
+{"pane_id":"w1:p10","label":"whitespace-status","agent_status":" working "},
+{"pane_id":"w1:p11","label":"pending-working","agent_status":"working","input_pending":true},
+{"pane_id":"w1:p12","label":"pending-idle","agent_status":"idle","input_pending":true},
+{"pane_id":"w1:p13","label":"pending-unknown","agent_status":"unknown","input_pending":true}
 ]}}}`, nil
 	}
 	provider := newHerdrOrgProvider(run, []config.OrgRole{
 		{Name: "owner"}, {Name: "review"}, {Name: "done"}, {Name: "idle"}, {Name: "future"},
 		{Name: "duplicate"}, {Name: "missing"}, {Name: "whitespace-label"}, {Name: "whitespace-status"},
+		{Name: "pending-working"}, {Name: "pending-idle"}, {Name: "pending-unknown"},
 	}, func() time.Time { return observed })
 	snapshot, err := provider.Snapshot(context.Background())
 	if err != nil {
@@ -45,6 +49,7 @@ func TestHerdrOrgProviderSnapshotMapping(t *testing.T) {
 		"owner": org.StateWorking, "review": org.StateBlocked, "done": org.StateDone,
 		"idle": org.StateIdle, "future": org.StateUnknown, "duplicate": org.StateUnknown,
 		"missing": org.StateUnknown, "whitespace-label": org.StateUnknown, "whitespace-status": org.StateUnknown,
+		"pending-working": org.StateInputPending, "pending-idle": org.StateInputPending, "pending-unknown": org.StateInputPending,
 	}
 	for role, want := range wants {
 		if got := snapshot.States[role].State; got != want {
@@ -67,7 +72,8 @@ func TestHerdrOrgProviderSnapshotPaneBindings(t *testing.T) {
 {"pane_id":"w1:p6","label":"duplicate-label","agent_status":"idle"},
 {"pane_id":"w1:p7","label":"duplicate-label","agent_status":"blocked"},
 {"pane_id":"","label":"Empty A","agent_status":"blocked"},
-{"pane_id":"","label":"Empty B","agent_status":"idle"}
+{"pane_id":"","label":"Empty B","agent_status":"idle"},
+{"pane_id":"w1:p8","label":"Gitmoot Pending","agent_status":"working","input_pending":true}
 ]}}}`, nil
 	}
 	provider := newHerdrOrgProvider(run, []config.OrgRole{
@@ -75,6 +81,7 @@ func TestHerdrOrgProviderSnapshotPaneBindings(t *testing.T) {
 		{Name: "working-role", Pane: "Gitmoot Working"},
 		{Name: "blocked-role", Pane: "Gitmoot Blocked"},
 		{Name: "done-role", Pane: "Gitmoot Done"},
+		{Name: "pending-role", Pane: "Gitmoot Pending"},
 		{Name: "literal-role", Pane: "w1:p5"},
 		{Name: "missing-role", Pane: "missing-label"},
 		{Name: "ambiguous-role", Pane: "duplicate-label"},
@@ -91,6 +98,7 @@ func TestHerdrOrgProviderSnapshotPaneBindings(t *testing.T) {
 	wants := map[string]org.LifecycleState{
 		"idle-role": org.StateIdle, "working-role": org.StateWorking,
 		"blocked-role": org.StateBlocked, "done-role": org.StateDone,
+		"pending-role": org.StateInputPending,
 		"literal-role": org.StateWorking, "missing-role": org.StateUnknown,
 		"ambiguous-role": org.StateUnknown, "empty-id-role": org.StateUnknown,
 	}

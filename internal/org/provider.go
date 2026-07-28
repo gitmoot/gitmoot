@@ -8,11 +8,12 @@ import (
 type LifecycleState string
 
 const (
-	StateIdle    LifecycleState = "idle"
-	StateWorking LifecycleState = "working"
-	StateBlocked LifecycleState = "blocked"
-	StateDone    LifecycleState = "done"
-	StateUnknown LifecycleState = "unknown"
+	StateIdle         LifecycleState = "idle"
+	StateWorking      LifecycleState = "working"
+	StateBlocked      LifecycleState = "blocked"
+	StateInputPending LifecycleState = "input_pending"
+	StateDone         LifecycleState = "done"
+	StateUnknown      LifecycleState = "unknown"
 )
 
 type RoleLiveState struct {
