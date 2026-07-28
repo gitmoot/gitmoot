@@ -20,12 +20,45 @@ const (
 	// disappeared before recording whether Herdr accepted the wake. It is
 	// terminal and MUST NOT be retried blindly.
 	WakeOutboxStateDeliveryUnknown = "delivery_unknown"
+	wakeOutboxStateCount = iota
+)
 
+const (
 	WakeOutboxDeliveryUnknownEventKind = "wake_delivery_unknown"
 
 	WakeOutboxSourceWorkflowNote  = "workflow_note"
 	WakeOutboxSourceChatMessage   = "chat_message"
 	WakeOutboxReplyCoalescePrefix = "reply:"
+)
+
+type wakeOutboxStateClass uint8
+
+const (
+	wakeOutboxStateObligation wakeOutboxStateClass = iota
+	wakeOutboxStateTerminal
+	wakeOutboxStateDeliveryUnknown
+)
+
+type wakeOutboxStateDefinition struct {
+	state               string
+	class               wakeOutboxStateClass
+	obligationPredicate string
+	agedAttempt         bool
+}
+
+var wakeOutboxStateDefinitions = [...]wakeOutboxStateDefinition{
+	{WakeOutboxStatePending, wakeOutboxStateObligation, "state = ?", false},
+	{WakeOutboxStateAttempted, wakeOutboxStateObligation, "(state = ? AND attempted_at IS NOT NULL AND attempted_at <= ?)", true},
+	{WakeOutboxStateDelivered, wakeOutboxStateTerminal, "", false},
+	{WakeOutboxStateStalled, wakeOutboxStateTerminal, "", false},
+	{WakeOutboxStateFailed, wakeOutboxStateTerminal, "", false},
+	{WakeOutboxStateDeliveryUnknown, wakeOutboxStateDeliveryUnknown, "", false},
+}
+
+// Opposing lengths make an unclassified state or a stray definition fail compilation.
+var (
+	_ [wakeOutboxStateCount - len(wakeOutboxStateDefinitions)]struct{}
+	_ [len(wakeOutboxStateDefinitions) - wakeOutboxStateCount]struct{}
 )
 
 // WakeOutboxEntry is one durable delivery item. A pending row is positive,
@@ -138,15 +171,15 @@ FROM wake_outbox`
 // wake delivery. Pending rows and attempted rows older than attemptedBefore are
 // the only non-terminal obligations; terminal outcomes never appear.
 func (s *Store) ListWakeOutboxObligations(ctx context.Context, attemptedBefore time.Time) ([]WakeOutboxEntry, error) {
+	predicate, args := wakeOutboxObligationPredicate(attemptedBefore)
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, source_kind, source_id, target_role, coalesce_key, state,
-	attempt_count, last_error, created_at, COALESCE(attempted_at, ''),
-	COALESCE(finished_at, ''), updated_at
+		attempt_count, last_error, created_at, COALESCE(attempted_at, ''),
+		COALESCE(finished_at, ''), updated_at
 FROM wake_outbox
-WHERE state = 'pending'
-	OR (state = 'attempted' AND attempted_at IS NOT NULL AND attempted_at <= ?)
+WHERE `+predicate+`
 ORDER BY created_at, id`,
-		attemptedBefore.UTC().Format(BlockedEpisodeTimeLayout))
+		args...)
 	if err != nil {
 		return nil, err
 	}
@@ -287,9 +320,8 @@ WHERE state = 'pending' AND id IN (`, ids, at)
 // FinishWakeOutbox records the existing event-rule delivery classification for
 // every row in one attempted batch.
 func (s *Store) FinishWakeOutbox(ctx context.Context, ids []int64, state, detail string, at time.Time) error {
-	switch state {
-	case WakeOutboxStateDelivered, WakeOutboxStateStalled, WakeOutboxStateFailed:
-	default:
+	class, ok := classifyWakeOutboxState(state)
+	if !ok || class != wakeOutboxStateTerminal {
 		return fmt.Errorf("invalid terminal wake outbox state %q", state)
 	}
 	query, args, err := wakeOutboxIDUpdate(`
@@ -311,6 +343,31 @@ WHERE state = 'attempted' AND id IN (`, ids, at, state, strings.TrimSpace(detail
 		return fmt.Errorf("finish wake outbox updated %d rows, want %d", affected, len(ids))
 	}
 	return nil
+}
+
+func classifyWakeOutboxState(state string) (wakeOutboxStateClass, bool) {
+	for _, definition := range wakeOutboxStateDefinitions {
+		if state == definition.state {
+			return definition.class, true
+		}
+	}
+	return 0, false
+}
+
+func wakeOutboxObligationPredicate(attemptedBefore time.Time) (string, []any) {
+	var clauses []string
+	var args []any
+	for _, definition := range wakeOutboxStateDefinitions {
+		if definition.class != wakeOutboxStateObligation {
+			continue
+		}
+		clauses = append(clauses, definition.obligationPredicate)
+		args = append(args, definition.state)
+		if definition.agedAttempt {
+			args = append(args, attemptedBefore.UTC().Format(BlockedEpisodeTimeLayout))
+		}
+	}
+	return strings.Join(clauses, " OR "), args
 }
 
 func wakeOutboxIDUpdate(prefix string, ids []int64, at time.Time, leading ...string) (string, []any, error) {

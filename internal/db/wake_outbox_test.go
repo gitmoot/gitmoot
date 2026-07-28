@@ -9,6 +9,29 @@ import (
 	"time"
 )
 
+func TestWakeOutboxStateClassificationIsExhaustive(t *testing.T) {
+	tests := []struct {
+		state string
+		class wakeOutboxStateClass
+	}{
+		{WakeOutboxStatePending, wakeOutboxStateObligation},
+		{WakeOutboxStateAttempted, wakeOutboxStateObligation},
+		{WakeOutboxStateDelivered, wakeOutboxStateTerminal},
+		{WakeOutboxStateStalled, wakeOutboxStateTerminal},
+		{WakeOutboxStateFailed, wakeOutboxStateTerminal},
+		{WakeOutboxStateDeliveryUnknown, wakeOutboxStateDeliveryUnknown},
+	}
+	if len(tests) != int(wakeOutboxStateCount) {
+		t.Fatalf("classified states = %d, declared states = %d", len(tests), wakeOutboxStateCount)
+	}
+	for _, test := range tests {
+		class, ok := classifyWakeOutboxState(test.state)
+		if !ok || class != test.class {
+			t.Errorf("classifyWakeOutboxState(%q) = (%d, %v), want (%d, true)", test.state, class, ok, test.class)
+		}
+	}
+}
+
 func TestAddressedWorkflowNoteWritesOutboxThroughEveryInsertEntryPoint(t *testing.T) {
 	store := openWorkflowTestStore(t)
 	ctx := context.Background()
