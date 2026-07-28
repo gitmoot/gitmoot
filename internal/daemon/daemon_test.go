@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -857,6 +858,133 @@ func TestPollOnceRetriesReadyToMergePullRequestWithoutHeadChange(t *testing.T) {
 	}
 	if len(gate.requests) != 1 || gate.requests[0].PullRequest != 7 || gate.requests[0].HeadSHA != "abc123" {
 		t.Fatalf("merge gate requests = %+v", gate.requests)
+	}
+}
+
+func TestPollOnceDismissedEscalationDoesNotBlockEligibleMerge(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-ready",
+		RepoFullName: repo.FullName(),
+		State:        string(workflow.TaskReadyToMerge),
+		Branch:       "ready-branch",
+	}); err != nil {
+		t.Fatalf("UpsertTask ready: %v", err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-dismissed",
+		RepoFullName: repo.FullName(),
+		State:        string(workflow.TaskDismissed),
+		Branch:       "dismissed-branch",
+	}); err != nil {
+		t.Fatalf("UpsertTask dismissed: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName: repo.FullName(),
+		Branch:       "ready-branch",
+		Owner:        "lead",
+	}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "coordinator",
+		Role:           "coordinator",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"ask"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent coordinator: %v", err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo.FullName(),
+		Number:       7,
+		HeadBranch:   "ready-branch",
+		BaseBranch:   "main",
+		HeadSHA:      "abc123",
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest: %v", err)
+	}
+	payload, err := json.Marshal(workflow.JobPayload{
+		Repo:      repo.FullName(),
+		Branch:    "dismissed-branch",
+		TaskID:    "task-dismissed",
+		Result:    &workflow.AgentResult{Decision: "approved", Summary: "stale escalation"},
+		LeadAgent: "coordinator",
+	})
+	if err != nil {
+		t.Fatalf("Marshal payload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID:      "dismissed-coordinator",
+		Agent:   "coordinator",
+		Type:    "ask",
+		State:   string(workflow.JobSucceeded),
+		Payload: string(payload),
+	}, db.JobEvent{
+		JobID:   "dismissed-coordinator",
+		Kind:    string(workflow.JobSucceeded),
+		Message: "completed",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+	escalation, err := json.Marshal(workflow.EscalationRecord{
+		DelegationID: "stale-leg",
+		PausedAt:     time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339),
+	})
+	if err != nil {
+		t.Fatalf("Marshal escalation: %v", err)
+	}
+	if err := store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   "dismissed-coordinator",
+		Kind:    "delegation_escalation_requested",
+		Message: string(escalation),
+	}); err != nil {
+		t.Fatalf("AddJobEvent escalation: %v", err)
+	}
+
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{
+			Number:  7,
+			Title:   "Ready",
+			State:   "open",
+			HeadRef: "ready-branch",
+			BaseRef: "main",
+			HeadSHA: "abc123",
+		}},
+		comments: map[int64][]github.IssueComment{7: {}},
+	}
+	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{Ready: true, Merged: true}}
+	engine := workflow.Engine{Store: store, MergeGate: gate}
+	d := Daemon{
+		Repo:          repo,
+		Store:         store,
+		GitHub:        client,
+		Workflow:      &engine,
+		EscalationTTL: time.Hour,
+	}
+
+	if err := d.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(gate.requests) != 1 || gate.requests[0].PullRequest != 7 {
+		t.Fatalf("merge gate requests = %+v, want eligible PR #7", gate.requests)
+	}
+	ready, err := store.GetTask(ctx, "task-ready")
+	if err != nil || ready.State != string(workflow.TaskMerged) {
+		t.Fatalf("ready task = %+v, err=%v; want merged", ready, err)
+	}
+	dismissed, err := store.GetTask(ctx, "task-dismissed")
+	if err != nil || dismissed.State != string(workflow.TaskDismissed) {
+		t.Fatalf("dismissed task = %+v, err=%v; want dismissed", dismissed, err)
+	}
+	if _, err := store.GetJob(ctx, workflow.DelegationContinuationID("dismissed-coordinator")); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("dismissed task continuation error = %v, want no row", err)
 	}
 }
 

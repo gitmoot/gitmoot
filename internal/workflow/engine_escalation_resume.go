@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -834,11 +835,22 @@ func (e Engine) AutoFinalizeExpiredEscalations(ctx context.Context, ttl time.Dur
 		if payload.Result == nil {
 			continue
 		}
+		ref := taskRefFromPayload(payload)
+		dismissedTaskID, dismissed, err := e.dismissedTaskForAdvancement(ctx, ref)
+		if err != nil {
+			return finalized, err
+		}
+		if dismissed {
+			slog.Debug("workflow advancement skipped dismissed task",
+				"task_id", dismissedTaskID,
+				"job_id", jobID)
+			continue
+		}
 		reason := fmt.Sprintf("escalation TTL of %s elapsed with no human response", ttl)
 		if err := e.enqueueFinalizeContinuation(ctx, job, payload, reason); err != nil {
 			return finalized, err
 		}
-		if err := e.setTaskState(ctx, taskRefFromPayload(payload), TaskPlanned); err != nil {
+		if err := e.setTaskState(ctx, ref, TaskPlanned); err != nil {
 			return finalized, err
 		}
 		resolution := EscalationRecord{
@@ -861,4 +873,32 @@ func (e Engine) AutoFinalizeExpiredEscalations(ctx context.Context, ttl time.Dur
 		finalized++
 	}
 	return finalized, nil
+}
+
+// dismissedTaskForAdvancement checks both identities setTaskState can resolve:
+// the payload task ID and the canonical task owning its repo branch. A dismissed
+// task is terminal, so automatic advancement must skip it before enqueueing any
+// continuation work.
+func (e Engine) dismissedTaskForAdvancement(ctx context.Context, ref taskRef) (string, bool, error) {
+	if strings.TrimSpace(ref.ID) != "" {
+		task, err := e.Store.GetTask(ctx, ref.ID)
+		if err == nil {
+			if task.State == string(TaskDismissed) {
+				return task.ID, true, nil
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return "", false, err
+		}
+	}
+	if strings.TrimSpace(ref.Repo) == "" || strings.TrimSpace(ref.Branch) == "" {
+		return "", false, nil
+	}
+	task, err := e.Store.GetTaskByRepoBranch(ctx, ref.Repo, ref.Branch)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return task.ID, task.State == string(TaskDismissed), nil
 }
