@@ -261,6 +261,22 @@ func TestSessionReviewStatusDistinguishesProgressAndStall(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
+	if code := Run([]string{"job", "list", "--home", home, "--workflow", "review/fresh", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("workflow-filtered job list --json exit = %d, stderr=%s", code, stderr.String())
+	}
+	var workflowEntries []jobListEntry
+	if err := json.Unmarshal(stdout.Bytes(), &workflowEntries); err != nil {
+		t.Fatalf("decode workflow-filtered job list JSON: %v (%s)", err, stdout.String())
+	}
+	if len(workflowEntries) != 1 ||
+		workflowEntries[0].ID != fresh.JobID ||
+		workflowEntries[0].ReviewStatus != reviewStatusInProgress ||
+		workflowEntries[0].HeadSHA != "fresh-head" {
+		t.Fatalf("workflow-filtered review = %+v, want same in_progress/head_sha fields as plain list", workflowEntries)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
 	if code := Run([]string{"job", "list", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("job list exit = %d, stderr=%s", code, stderr.String())
 	}
@@ -292,6 +308,156 @@ func TestSessionReviewStatusDistinguishesProgressAndStall(t *testing.T) {
 	}
 	if shown.ReviewStatus != reviewStatusInProgress || shown.Payload.HeadSHA != "fresh-head" {
 		t.Fatalf("fresh job show = %+v, want in_progress with fresh-head", shown)
+	}
+}
+
+func TestSessionReviewStatusReusedWorkflowLabel(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	seedSessionAgentRepo(t, store)
+
+	openReview := func(headSHA string) jobSessionOutput {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		if code := Run([]string{
+			"job", "open", "--home", home, "--agent", "lead",
+			"--repo", "owner/repo", "--type", "review",
+			"--workflow", "review/reused", "--head-sha", headSHA, "--json",
+		}, &stdout, &stderr); code != 0 {
+			t.Fatalf("job open exit = %d, stderr=%s", code, stderr.String())
+		}
+		var out jobSessionOutput
+		if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+			t.Fatalf("decode job open JSON: %v (%s)", err, stdout.String())
+		}
+		return out
+	}
+
+	first := openReview("head-a")
+	var noteOut, noteErr bytes.Buffer
+	if code := Run([]string{
+		"workflow", "note", "review/reused", "review A progress",
+		"--home", home, "--no-auto",
+	}, &noteOut, &noteErr); code != 0 {
+		t.Fatalf("workflow note exit = %d, stderr=%s", code, noteErr.String())
+	}
+	if code := Run([]string{
+		"job", "close", first.JobID, "--home", home,
+		"--decision", "approved", "--summary", "review A done",
+	}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
+		t.Fatalf("job close review A exit = %d", code)
+	}
+	second := openReview("head-b")
+
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	oldNoteAt := now.Add(-2 * sessionReviewStaleGap)
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("sql.Open returned error: %v", err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(
+		`UPDATE workflow_notes SET created_at = ? WHERE workflow_id = ?`,
+		oldNoteAt.Format("2006-01-02 15:04:05"), "review/reused",
+	); err != nil {
+		t.Fatalf("backdate prior-review note: %v", err)
+	}
+
+	setSecondCreatedAt := func(at time.Time) db.Job {
+		t.Helper()
+		stamp := at.Format("2006-01-02 15:04:05")
+		if _, err := raw.Exec(
+			`UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`,
+			stamp, stamp, second.JobID,
+		); err != nil {
+			t.Fatalf("set review B timestamp: %v", err)
+		}
+		job, err := store.GetJob(context.Background(), second.JobID)
+		if err != nil {
+			t.Fatalf("GetJob(review B) returned error: %v", err)
+		}
+		return job
+	}
+
+	// The prior review's older note must not override review B's newer open
+	// signal. This assertion fails if the noteAt.After(createdAt) guard is
+	// removed and the older note is used unconditionally.
+	freshSecond := setSecondCreatedAt(now.Add(-10 * time.Minute))
+	if got := deriveReviewStatus(context.Background(), store, freshSecond, now); got != reviewStatusInProgress {
+		t.Fatalf("fresh review B with older review-A note = %q, want %q", got, reviewStatusInProgress)
+	}
+
+	// Once review B's own open signal ages past the gap, the same reused label
+	// must read stalled even though review A left a note under it.
+	staleSecond := setSecondCreatedAt(now.Add(-sessionReviewStaleGap - time.Second))
+	if got := deriveReviewStatus(context.Background(), store, staleSecond, now); got != reviewStatusStalled {
+		t.Fatalf("stale review B with older review-A note = %q, want %q", got, reviewStatusStalled)
+	}
+}
+
+func TestSessionReviewStatusExactStalenessBoundary(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	seedSessionAgentRepo(t, store)
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{
+		"job", "open", "--home", home, "--agent", "lead",
+		"--repo", "owner/repo", "--type", "review",
+		"--workflow", "review/boundary", "--json",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("job open exit = %d, stderr=%s", code, stderr.String())
+	}
+	var opened jobSessionOutput
+	if err := json.Unmarshal(stdout.Bytes(), &opened); err != nil {
+		t.Fatalf("decode job open JSON: %v (%s)", err, stdout.String())
+	}
+	note, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+		WorkflowID: "review/boundary",
+		Body:       "boundary heartbeat",
+	})
+	if err != nil {
+		t.Fatalf("InsertWorkflowNote returned error: %v", err)
+	}
+
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("sql.Open returned error: %v", err)
+	}
+	defer raw.Close()
+	oldJobAt := now.Add(-time.Hour).Format("2006-01-02 15:04:05")
+	if _, err := raw.Exec(
+		`UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`,
+		oldJobAt, oldJobAt, opened.JobID,
+	); err != nil {
+		t.Fatalf("backdate boundary job: %v", err)
+	}
+	job, err := store.GetJob(context.Background(), opened.JobID)
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+
+	setNoteAt := func(at time.Time) {
+		t.Helper()
+		if _, err := raw.Exec(
+			`UPDATE workflow_notes SET created_at = ? WHERE id = ?`,
+			at.Format("2006-01-02 15:04:05"), note.ID,
+		); err != nil {
+			t.Fatalf("set boundary note timestamp: %v", err)
+		}
+	}
+
+	setNoteAt(now.Add(-sessionReviewStaleGap))
+	if got := deriveReviewStatus(context.Background(), store, job, now); got != reviewStatusInProgress {
+		t.Fatalf("review at exact stale gap = %q, want %q", got, reviewStatusInProgress)
+	}
+
+	setNoteAt(now.Add(-sessionReviewStaleGap - time.Second))
+	if got := deriveReviewStatus(context.Background(), store, job, now); got != reviewStatusStalled {
+		t.Fatalf("review one second past stale gap = %q, want %q", got, reviewStatusStalled)
 	}
 }
 

@@ -126,7 +126,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 	if err := withStore(*home, func(store *db.Store) error {
 		var err error
 		if strings.TrimSpace(*workflowID) != "" {
-			jobs, err = store.ListJobsByWorkflow(context.Background(), strings.TrimSpace(*workflowID), 0)
+			jobs, err = store.ListDetailedJobsByWorkflow(context.Background(), strings.TrimSpace(*workflowID), 0)
 		} else {
 			jobs, err = store.ListJobs(context.Background())
 		}
