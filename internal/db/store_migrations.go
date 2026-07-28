@@ -1772,7 +1772,7 @@ ALTER TABLE org_role_unavailable ADD COLUMN runtime TEXT NOT NULL DEFAULT '';
 	// first producer. Per-row state makes never-attempted delivery detectable.
 	// Appended at the tail: migration versions are positional, never reorder.
 	`
-CREATE TABLE wake_outbox (
+CREATE TABLE IF NOT EXISTS wake_outbox (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	source_kind TEXT NOT NULL,
 	source_id TEXT NOT NULL,
@@ -1788,8 +1788,14 @@ CREATE TABLE wake_outbox (
 	updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
 	UNIQUE(source_kind, source_id)
 );
-CREATE INDEX idx_wake_outbox_pending
+CREATE INDEX IF NOT EXISTS idx_wake_outbox_pending
 	ON wake_outbox(target_role, coalesce_key, created_at, id)
 	WHERE state = 'pending';
+
+-- Keep the immediately preceding denormalized-repo repair effective for
+-- databases upgraded directly through this new tail migration. The update is
+-- idempotent and leaves already-projected jobs untouched.
+UPDATE jobs SET repo = json_extract(payload, '$.repo')
+WHERE repo = '' AND json_valid(payload) AND COALESCE(json_extract(payload, '$.repo'), '') != '';
 	`,
 }
