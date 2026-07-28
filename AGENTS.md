@@ -26,6 +26,8 @@ Requires Go 1.26+ (see `go.mod`; CI resolves the version via
 
 ```sh
 export GOTOOLCHAIN=local PATH=/root/.local/toolchains/go1.26.4/bin:$PATH
+export GOCACHE=/tmp/gitmoot-go-build-cache
+mkdir -p "$GOCACHE"
 ```
 
 Run from the repo root and make these pass before committing — they mirror the CI
@@ -36,11 +38,47 @@ go build -buildvcs=false ./...
 go generate ./... && git diff --exit-code   # gitmoot_result contract is single-sourced + regenerated; stale artifact fails CI
 go vet ./...
 go test -timeout 25m ./...
-# Race gate is scoped (not ./...). CI compiles one -race test binary per package
-# and runs timing-balanced shards from those binaries (#906). Locally you can
-# run the four complete packages at once:
-go test -race -timeout 35m ./internal/workflow/ ./internal/cli/ ./internal/db/ ./internal/daemon/ ./internal/pipeline/
+
+# Race gate is scoped (not ./...). Use CI's package shard counts and its
+# deterministic fallback partitioner so no growing package hits one monolithic
+# timeout. Each compiled binary covers every package test exactly once.
+(
+  set -e
+  race_dir="$(mktemp -d "${TMPDIR:-/tmp}/gitmoot-race.XXXXXX")"
+  trap 'rm -rf "$race_dir"' EXIT
+  for spec in cli:8 pipeline:4 db:2 workflow:4 daemon:1; do
+    package="${spec%%:*}"
+    shards="${spec##*:}"
+    bundle="$race_dir/$package"
+    mkdir -p "$bundle/partitions"
+    go test -c -race -o "$bundle/$package.test" "./internal/$package/"
+    (
+      cd "internal/$package"
+      "$bundle/$package.test" -test.list '.*'
+    ) >"$bundle/tests.list"
+    scripts/partition-race-tests.sh \
+      --tests "$bundle/tests.list" \
+      --shards "$shards" \
+      --out-dir "$bundle/partitions"
+    for ((shard = 0; shard < shards; shard++)); do
+      run_regex="$(cat "$bundle/partitions/shard-$shard.regex")"
+      (
+        cd "internal/$package"
+        "$bundle/$package.test" \
+          -test.run="$run_regex" \
+          -test.timeout=20m
+      )
+    done
+  done
+)
 ```
+
+The explicit temporary `GOCACHE` is also part of the host setup. Managed
+worktrees can inherit a read-only `/root/.cache/go-build`; redirecting the cache
+keeps build, vet, and test from failing during package setup before compilation.
+This is documented instead of changing `/root/.cache` permissions because that
+directory is host-global external state, while the gate must remain runnable in
+each agent's environment.
 
 `-buildvcs=false` is required, not optional, inside a gitmoot worktree (#1209):
 Go's VCS auto-stamp only recognizes a `.git` **directory** as a repo root
