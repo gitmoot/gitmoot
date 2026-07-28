@@ -1599,16 +1599,19 @@ spawning a runtime** — a clock-in / clock-out pair (plus a one-shot recorder):
 ```sh
 # Clock in: create a RUNNING, externally-driven job (no dispatch); prints its id.
 gitmoot job open --agent <name> --repo owner/repo --type ask|review|implement \
-                 [--title "..."] [--task <id>] [--pr <n>] [--json]
+                 [--title "..."] [--task <id>] [--pr <n>] [--head-sha <sha>] \
+                 [--workflow <label>] [--json]
 
 # Clock out: apply the result and move the job to its terminal state.
 gitmoot job close <id> --decision approved|changes_requested|blocked|implemented|failed|skipped \
-                 [--summary "..."] [--pr <n>] [--branch <name>] [--json]
+                 [--summary "..."] [--pr <n>] [--head-sha <sha>] \
+                 [--branch <name>] [--json]
 
 # One-shot post-hoc: create an already-terminal job (open + close in one).
 gitmoot job record --agent <name> --repo owner/repo --type ask|review|implement \
                  --decision <decision> [--title "..."] [--summary "..."] \
-                 [--task <id>] [--pr <n>] [--branch <name>] [--json]
+                 [--task <id>] [--pr <n>] [--head-sha <sha>] \
+                 [--branch <name>] [--json]
 ```
 
 An `externally_driven` job is created directly in `running` (it never queues, so
@@ -1624,6 +1627,29 @@ stays `running` (reaper-exempt) until you `job close --decision failed` or `job
 cancel <id>` it. A session job is never engine-executed, so `job retry` **refuses**
 it (retrying would re-queue it for a real runtime with an empty payload) — recover
 one by opening a fresh session job instead. The agent and repo must exist.
+
+For an in-session PR review, clock in before reading the diff and bind the
+display row to its exact head and workflow journal:
+
+```sh
+gitmoot job open --agent <name> --repo owner/repo --type review \
+  --pr <n> --head-sha <sha> --workflow <label>
+gitmoot workflow note <label> "reviewed tests and error paths"
+# Post the verdict, then:
+gitmoot job close <id> --decision approved|changes_requested|blocked \
+  --summary "..."
+```
+
+For a running externally-driven review, `job list` and `job show` derive
+`review_status: in_progress|stalled` from the newest workflow note, falling back
+to the job's creation time; the signal becomes stale after 20 minutes.
+`head_sha` is also exposed in text and JSON. Every review status is explicitly
+`review_status_grade: reported` and
+`review_status_authority: non_authoritative` (text lists use `REVIEW (reported;
+non-authoritative): ...`). Workflow notes are caller assertions, not
+system-observed reviewer attribution. These fields are display-only: they never
+satisfy, block, or otherwise feed the merge gate, and this feature never writes
+`tasks.state`.
 
 **Make in-chat / "here" work show on the dashboard.** The one-step default is
 `gitmoot agent prompt <agent-or-template> --record`: it opens the session job *as
