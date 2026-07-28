@@ -73,6 +73,9 @@ go test -timeout 25m ./...
 )
 ```
 
+Managed-worktree runtime seats append `-buildvcs=false` to inherited `GOFLAGS`
+so stray ancestor `.git` directories cannot confuse Go's VCS root detection.
+
 The explicit temporary `GOCACHE` is also part of the host setup. Managed
 worktrees can inherit a read-only `/root/.cache/go-build`; redirecting the cache
 keeps build, vet, and test from failing during package setup before compilation.

@@ -574,6 +574,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	writeLine(w.Stdout, "running job %s for %s in %s", job.ID, agent.Name, payload.Repo)
 	adapter = pipeline.WrapPipelineEnvDeliveryAdapter(w.Store, w.ConfigHome, payload, adapter)
+	adapter = wrapManagedWorktreeRuntimeEnv(payload, adapter)
 	engine := w.WorkflowFactory(checkout)
 	// Wire the PRE-TERMINAL operational-blocker deferrer (#532 slice E) on the LIVE
 	// worker (not the WorkflowFactory-captured copy) so it observes this worker's
@@ -1706,6 +1707,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 			defer func() { _ = retainedLogFile.Close() }()
 		}
 	}
+	adapter = wrapManagedWorktreeRuntimeEnv(payload, adapter)
 	if err := w.Store.MarkAgentInstanceRunning(ctx, started.Agent.Name, time.Now().UTC(), started.JobTimeout); err != nil {
 		if finishErr := w.finishQueuedJob(ctx, delegatedJob.ID, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
