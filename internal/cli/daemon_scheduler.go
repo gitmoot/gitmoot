@@ -803,6 +803,13 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	if err := sweepBlockedTaskWakeEvents(ctx, store, worker.workflowHome(), repoFilter, stdout, now); err != nil {
 		writeLine(stdout, "blocked_since task sweep failed: %v", err)
 	}
+	// #1200/#1201 durable addressed-note wakes. The note transaction writes only
+	// SQL; this daemon tick claims due coalesced rows and invokes the existing
+	// event-rule delivery path after every producer transaction has committed.
+	// Best-effort delivery must never abort ordinary job dispatch.
+	if err := drainReplyWakeOutbox(ctx, store, worker.eventSink(), now); err != nil {
+		writeLine(stdout, "reply wake outbox drain failed: %v", err)
+	}
 	// Checkout-mutating maintenance (advancement/merge retries, delegation
 	// worktree reclaims) is gated on the ACTUAL mutation hazard — each
 	// candidate is skipped while an in-flight job holds the checkout key the

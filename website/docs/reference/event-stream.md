@@ -24,6 +24,7 @@ The pilot emits a tight allowlist of event types over the webhook transport:
 | `job.needs_attention`           | a tree pauses awaiting a human (the `escalate_human` pause today)                  |
 | `job.deferred`                  | the daemon re-queued a run whose delivery failed on a retryable operational blocker (runtime auth, rate limit/quota, network/GitHub outage, checkout contention) — it will be re-dispatched automatically. Since #532 slice E this is a **first-class** transition emitted INSTEAD of `job.failed` (no preceding `job.failed` for that run) |
 | `org.input_pending`             | a Herdr pane bound to an organization role continuously reports an interactive input dialog past the configured threshold |
+| `org.reply`                     | the daemon drains a durable, coalesced batch of notes addressed to one organization role |
 | `candidate.awaiting_promotion`  | a SkillOpt template candidate becomes `pending` after import (always, off the auto-promote policy) |
 | `candidate.auto_promoted`       | the off-by-default `[skillopt].auto_promote` policy auto-promoted a candidate to `current` (also the canary GRADUATE event) |
 | `candidate.canary_started`      | the off-by-default `[skillopt].auto_promote_canary` policy promoted a candidate to the `canary` state behind the live champion |
@@ -112,10 +113,10 @@ Every event is a single JSON object:
 | `job_id`         | string | Opaque job id this event is about.                                          |
 | `root_id`        | string | The coordination tree's root id, so a consumer can aggregate a run client-side. |
 | `repo`           | string | `owner/repo` only — never an absolute checkout path.                        |
-| `status`         | string | Terminal/lifecycle state (`succeeded`/`failed`/`blocked`/`awaiting_human`/`input_pending`). |
+| `status`         | string | Terminal/lifecycle state (`succeeded`/`failed`/`blocked`/`awaiting_human`/`input_pending`/`attempted`). |
 | `ts`             | string | RFC3339 emit time.                                                          |
 | `detail`         | string | Short redacted human-facing string (failure summary, the escalation question). |
-| `cause`          | string | Optional internal discriminator (`escalation`, `ask_gate`, `merge_guard`, `permission_guard`, `blocked_since`, or `input_pending_since`). |
+| `cause`          | string | Optional internal discriminator (`escalation`, `ask_gate`, `merge_guard`, `permission_guard`, `blocked_since`, `input_pending_since`, or `addressed_note`). |
 
 `cause` is an additive optional field, so `schema_version` remains `1` and
 existing events serialize unchanged. It is a trusted enum assigned at emit
@@ -152,8 +153,8 @@ blocks or fails a job — this mirrors the `escalate_human` notifier contract:
   **dropped** and a single best-effort `event_sink_drop` job event is recorded
   locally (so a drop is observable without coupling delivery to the job).
 
-There is **no** outbox / retry in the pilot: at-least-once delivery and an
-outbox table are the explicit graduate step.
+Webhook delivery has no outbox or retry. Addressed-note role wakes are the
+exception: their producer-agnostic SQL outbox is described below.
 
 ## Organization event-rule wakes
 
@@ -172,12 +173,13 @@ pane = "w1:p2"
 gitmoot org events rule add --on guard --match owner/repo --wake maintainer
 gitmoot org events rule add --on blocked --repo tendwire --wake maintainer
 gitmoot org events rule add --on pane_input_pending --wake maintainer
+gitmoot org events rule add --on reply --wake maintainer
 gitmoot org events rule list
 gitmoot org events rule rm <rule-id>
 ```
 
 Kinds are `escalation`, `attention`, `guard`, `job-terminal`, `blocked`,
-`recycle-overdue`, and `pane_input_pending`.
+`recycle-overdue`, `pane_input_pending`, and `reply`.
 The v1 `--match` filter is a case-insensitive substring tested against the event
 repo and job id; empty matches all. `--repo` is an alias for that same filter;
 pass only one of the two flags. A plain `job.blocked` event matches both
@@ -198,6 +200,13 @@ observation, or once the subject stops matching for a short grace
 within that grace never resets it, and a later re-block starts a fresh episode.
 Each synthesized event's `detail` carries the stable since-time, so a re-nudge
 (same `job_id` + same since) is distinguishable from a fresh episode.
+`reply` consumes addressed workflow notes from the durable wake outbox and only
+wakes the role named by both the note and the rule. The daemon uses rolling
+five-second windows per role: one wake carries `N new items, oldest id X`.
+Pending, attempted, delivered, stalled, and failed remain queryable per outbox
+row, so an escalation that was never attempted is distinct from a successful
+wake. A quiet burst tail is flushed by a later daemon tick; it does not require
+another note.
 The wake role's config sets `pane = "<pane-id-or-label>"`: a value containing `:`
 is a `wX:pY` pane id used as-is, any other value is a pane label resolved to the
 current id at wake time (so a recycled pane is still reached). Wake delivery runs
@@ -253,5 +262,6 @@ on the tracking issue:
 
 - The Unix-socket transport (`socket_path`), behind the same `Sink` seam.
 - More event types (`job.started`, `delegation.*`, `orchestration.finished`).
-- An outbox table for at-least-once / durable delivery.
+- A webhook outbox for at-least-once HTTP delivery (addressed-note role wakes
+  already use a local durable outbox).
 - A server-side synthetic `orchestration.finished` (reliable tree convergence).

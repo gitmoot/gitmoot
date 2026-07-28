@@ -19,9 +19,13 @@ type fakeEventWake struct {
 	promptCalls    int
 	pane           string
 	prompt         string
+	panes          []string
+	prompts        []string
 	until          string
 	labelToPane    map[string]string
 	stalled        bool
+	promptErr      error
+	oddNonDelivery bool
 }
 
 func (f *fakeEventWake) Available(context.Context) bool {
@@ -32,8 +36,16 @@ func (f *fakeEventWake) Available(context.Context) bool {
 func (f *fakeEventWake) AgentPrompt(_ context.Context, pane, prompt, until string) (bool, bool, error) {
 	f.promptCalls++
 	f.pane, f.prompt, f.until = pane, prompt, until
+	f.panes = append(f.panes, pane)
+	f.prompts = append(f.prompts, prompt)
 	if f.stalled {
 		return false, true, nil
+	}
+	if f.promptErr != nil {
+		return false, false, f.promptErr
+	}
+	if f.oddNonDelivery {
+		return false, false, nil
 	}
 	return true, false, nil
 }
@@ -56,6 +68,7 @@ func TestClassifyEventRuleKinds(t *testing.T) {
 		{name: "blocked since only", event: events.Event{Type: events.EventJobBlocked, Cause: "blocked_since"}, want: []string{"blocked"}},
 		{name: "recycle overdue", event: events.Event{Type: events.EventOrgRecycleOverdue, Cause: "recycle_overdue"}, want: []string{"recycle-overdue"}},
 		{name: "pane input pending", event: events.Event{Type: events.EventOrgInputPending, Cause: "input_pending_since"}, want: []string{"pane_input_pending"}},
+		{name: "addressed reply", event: events.Event{Type: events.EventOrgReply, Cause: "addressed_note"}, want: []string{"reply"}},
 		{name: "finished terminal", event: events.Event{Type: events.EventJobFinished}, want: []string{"job-terminal"}},
 		{name: "failed terminal", event: events.Event{Type: events.EventJobFailed, Cause: "unrelated"}, want: []string{"job-terminal"}},
 		{name: "plain blocked terminal and blocked", event: events.Event{Type: events.EventJobBlocked}, want: []string{"job-terminal", "blocked"}},

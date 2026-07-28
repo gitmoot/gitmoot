@@ -91,6 +91,11 @@ func TestOrgEscalateWritesTypedWorkflowNote(t *testing.T) {
 	if notes[0].WorkflowID != want.WorkflowID || notes[0].Author != want.Author || notes[0].Body != want.Body || notes[0].Repo != want.Repo {
 		t.Fatalf("note = %+v, want fields %+v", notes[0], want)
 	}
+	outbox, err := store.ListWakeOutbox(context.Background(), "")
+	if err != nil || len(outbox) != 1 || outbox[0].State != db.WakeOutboxStatePending ||
+		outbox[0].TargetRole != "owner" || outbox[0].SourceID != fmt.Sprint(notes[0].ID) {
+		t.Fatalf("escalation wake outbox = %+v, err=%v", outbox, err)
+	}
 }
 
 func TestOrgEscalateResolveLifecycle(t *testing.T) {
@@ -1657,6 +1662,11 @@ func TestOrgEventRuleAddListRemoveAndValidation(t *testing.T) {
 	errOut.Reset()
 	if code := runOrg([]string{"events", "rule", "list", "--home", home}, &out, &errOut); code != 0 || out.Len() != 0 {
 		t.Fatalf("list after rm code=%d out=%q err=%q", code, out.String(), errOut.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if code := runOrg([]string{"events", "rule", "add", "--home", home, "--on", "reply", "--wake", "owner"}, &out, &errOut); code != 0 {
+		t.Fatalf("add reply code=%d out=%q err=%q", code, out.String(), errOut.String())
 	}
 
 	out.Reset()

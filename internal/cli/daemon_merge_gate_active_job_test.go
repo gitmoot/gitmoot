@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -138,8 +139,7 @@ scope = ["owner/repo"]
 	if _, err := config.LoadOrg(paths); err != nil {
 		t.Fatalf("LoadOrg: %v", err)
 	}
-	wake := &fakeEventWake{}
-	gate := daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout, Home: paths.Home, Wake: wake}
+	gate := daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout, Home: paths.Home}
 	for attempt := 0; attempt < 2; attempt++ {
 		decision, err := gate.Evaluate(context.Background(), request)
 		if err != nil {
@@ -157,8 +157,10 @@ scope = ["owner/repo"]
 	if !ok || from != "worker" || to != "jarvis" || wf != request.WorkflowID || !strings.Contains(question, "final agent review is not captured") {
 		t.Fatalf("escalation = from=%q to=%q wf=%q question=%q ok=%v", from, to, wf, question, ok)
 	}
-	if wake.promptCalls != 1 || wake.pane != "w1:p1" || !strings.Contains(wake.prompt, question) {
-		t.Fatalf("wake = calls=%d pane=%q prompt=%q", wake.promptCalls, wake.pane, wake.prompt)
+	outbox, err := store.ListWakeOutbox(context.Background(), "")
+	if err != nil || len(outbox) != 1 || outbox[0].State != db.WakeOutboxStatePending ||
+		outbox[0].TargetRole != "jarvis" || outbox[0].SourceID != fmt.Sprint(notes[0].ID) {
+		t.Fatalf("merge-gate wake outbox = %+v, err=%v", outbox, err)
 	}
 }
 
@@ -173,14 +175,14 @@ func TestDaemonMergeGateKillSwitchDoesNotEscalate(t *testing.T) {
 	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+"\n[merge_gate]\nauto_merge = false\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	wake := &fakeEventWake{}
-	decision, err := (daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout, Home: paths.Home, Wake: wake}).Evaluate(context.Background(), request)
+	decision, err := (daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout, Home: paths.Home}).Evaluate(context.Background(), request)
 	if err != nil || !decision.LeaveOpen || decision.EscalateMergeGateMiss {
 		t.Fatalf("decision = %+v, err=%v", decision, err)
 	}
 	notes, err := store.ListWorkflowNotes(context.Background(), request.WorkflowID, 0)
-	if err != nil || len(notes) != 0 || wake.promptCalls != 0 {
-		t.Fatalf("notes=%+v wake_calls=%d err=%v", notes, wake.promptCalls, err)
+	outbox, outboxErr := store.ListWakeOutbox(context.Background(), "")
+	if err != nil || len(notes) != 0 || outboxErr != nil || len(outbox) != 0 {
+		t.Fatalf("notes=%+v outbox=%+v err=%v outbox_err=%v", notes, outbox, err, outboxErr)
 	}
 }
 

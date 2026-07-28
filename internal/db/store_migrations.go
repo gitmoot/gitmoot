@@ -1767,4 +1767,29 @@ CREATE INDEX idx_org_role_unavailable_until ON org_role_unavailable(unavailable_
 	`
 ALTER TABLE org_role_unavailable ADD COLUMN runtime TEXT NOT NULL DEFAULT '';
 	`,
+	// #1200/#1201 durable wake outbox. The source discriminator/id and caller-set
+	// coalesce key keep the schema producer-agnostic; workflow notes are only the
+	// first producer. Per-row state makes never-attempted delivery detectable.
+	// Appended at the tail: migration versions are positional, never reorder.
+	`
+CREATE TABLE wake_outbox (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	source_kind TEXT NOT NULL,
+	source_id TEXT NOT NULL,
+	target_role TEXT NOT NULL,
+	coalesce_key TEXT NOT NULL,
+	state TEXT NOT NULL DEFAULT 'pending'
+		CHECK(state IN ('pending', 'attempted', 'delivered', 'stalled', 'failed')),
+	attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+	last_error TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+	attempted_at TEXT,
+	finished_at TEXT,
+	updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+	UNIQUE(source_kind, source_id)
+);
+CREATE INDEX idx_wake_outbox_pending
+	ON wake_outbox(target_role, coalesce_key, created_at, id)
+	WHERE state = 'pending';
+	`,
 }

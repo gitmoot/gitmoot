@@ -1293,10 +1293,9 @@ an ancestor of that role, never the same role or a sibling. The note uses the
 typed schema `[org:escalate to=<to> from=<from> wf=<workflow>] <question>`, has
 the from-role as author, and can be rendered as JSON with `--json`. It
 formalizes the earlier ad-hoc practice of typing escalations into notes or
-panes; there is no code-level marker to migrate. Phase 1a writes the typed
-note, which is visible with `workflow show`; structured escalation surfaces
-land with the org brief and active delivery/wake is phase 2. Pane/agent creation
-permissions and Herdr checks remain later work.
+panes; there is no code-level marker to migrate. The note and a `pending` wake
+outbox row commit atomically. With an opt-in `reply` rule, a daemon tick wakes
+the addressed role through its configured Herdr pane.
 
 `gitmoot org escalate resolve <escalation-note-id> [--by <role>] [--note
 <answer-note-id>] [--home <dir>]` appends a typed resolution marker to the same
@@ -1311,17 +1310,24 @@ Event-rule wakes are separately opt-in:
 gitmoot org events rule add --on attention --match owner/repo --wake maintainer
 gitmoot org events rule add --on blocked --repo tendwire --wake maintainer
 gitmoot org events rule add --on pane_input_pending --wake maintainer
+gitmoot org events rule add --on reply --wake maintainer
 gitmoot org events rule list
 gitmoot org events rule rm --home /alternate/home <rule-id>
 ```
 
 `--on` accepts `escalation`, `attention`, `guard`, `job-terminal`, `blocked`,
-`recycle-overdue`, or `pane_input_pending`. `pane_input_pending` matches the
+`recycle-overdue`, `pane_input_pending`, or `reply`. `pane_input_pending` matches the
 `org.input_pending` event emitted when Herdr continuously reports
 `input_pending: true` for a role's pane longer than
 `[orchestrate].blocked_role_wake_after`; it re-nudges at most once per that
 interval while the dialog remains pending. The pending signal takes precedence
 over the pane's last `idle` or `working` activity status.
+`reply` matches durable batches of workflow notes addressed to the same role as
+`--wake`. The daemon coalesces a rolling five-second window into one prompt
+carrying `N new items, oldest id X`; separate roles and later windows stay
+separate. A later tick flushes the quiet tail without requiring another note.
+Every outbox row retains a queryable `pending`, `attempted`, `delivered`,
+`stalled`, or `failed` state, so never-attempted is not confused with success.
 `--match` is a case-insensitive substring matched independently against the
 event repo and job id; omit it to match every event of that kind. `--repo` is a
 discoverable alias for the same substring filter, useful for repo-to-role
