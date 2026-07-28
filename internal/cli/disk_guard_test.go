@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -152,6 +153,70 @@ func TestDispatchDiskGuardLowSpaceThenAutomaticRecovery(t *testing.T) {
 	}
 }
 
+func TestDispatchDiskGuardRateLimitIgnoresFluctuatingMeasurements(t *testing.T) {
+	ctx, _, _, worker := diskGuardDispatchFixture(t)
+	var output bytes.Buffer
+	worker.Stdout = &output
+	measurements := []diskFilesystemUsage{
+		{TotalBytes: 100 << 30, FreeBytes: 1 << 30},
+		// This clears the byte floor but remains below the percentage floor.
+		// Crossing one threshold must not turn a continuing refusal into a new
+		// log identity.
+		{TotalBytes: 100 << 30, FreeBytes: 3 << 30},
+	}
+	measurement := 0
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		usage := measurements[measurement]
+		measurement++
+		return usage, nil
+	})
+
+	for range measurements {
+		pending, err := listPendingQueuedJobs(ctx, worker, "owner/repo", "", true)
+		if err != nil {
+			t.Fatalf("listPendingQueuedJobs: %v", err)
+		}
+		if len(pending) != 0 {
+			t.Fatalf("pending jobs = %d, want 0 below disk floor", len(pending))
+		}
+	}
+
+	if got := strings.Count(output.String(), "DISK GUARD REFUSED JOB DISPATCH:"); got != 1 {
+		t.Fatalf("refusal log count = %d, want 1 across fluctuating measurements:\n%s", got, output.String())
+	}
+}
+
+func TestDispatchDiskGuardAggregatesAndRateLimitsEventWriteFailures(t *testing.T) {
+	ctx, store, _, worker := diskGuardDispatchFixture(t)
+	var output bytes.Buffer
+	worker.Stdout = &output
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 100 << 30, FreeBytes: 1 << 30}, nil
+	})
+	jobs := []db.Job{
+		{ID: "disk-guard-job-1", State: string(workflow.JobQueued), Payload: `{"repo":"owner/repo"}`},
+		{ID: "disk-guard-job-2", State: string(workflow.JobQueued), Payload: `{"repo":"owner/repo"}`},
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close store: %v", err)
+	}
+
+	for range 2 {
+		if diskGuardAllowsQueuedDispatch(ctx, worker, jobs, "owner/repo", "") {
+			t.Fatal("dispatch allowed below disk floor")
+		}
+	}
+
+	if got := strings.Count(output.String(), "DISK GUARD event writes failed:"); got != 1 {
+		t.Fatalf("event-write failure log count = %d, want 1 summary across repeated passes:\n%s", got, output.String())
+	}
+	for _, want := range []string{"failed=2", "matching_jobs=2"} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("event-write failure summary missing %q:\n%s", want, output.String())
+		}
+	}
+}
+
 func TestDiskGuardUsesMoreConservativeConfiguredFloor(t *testing.T) {
 	evaluation := diskGuardEvaluation{
 		Policy: config.DiskGuardPolicy{
@@ -174,6 +239,43 @@ func TestDiskGuardUsesMoreConservativeConfiguredFloor(t *testing.T) {
 	evaluation.FreePercent = 15
 	if !evaluation.allowsDispatch() {
 		t.Fatal("both floors passed but dispatch was refused")
+	}
+}
+
+func TestDiskGuardStableFingerprintChangesOnlyWithReasonOrFloor(t *testing.T) {
+	t.Cleanup(func() {
+		diskGuardLogMu.Lock()
+		diskGuardLogEntries = map[string]diskGuardLogEntry{}
+		diskGuardLogMu.Unlock()
+	})
+	base := diskGuardEvaluation{
+		Path:        "/tmp/gitmoot",
+		Policy:      config.DiskGuardPolicy{Enabled: true, MinFreeBytes: 100, MinFreePercent: 10},
+		Usage:       diskFilesystemUsage{TotalBytes: 1000, FreeBytes: 50},
+		FreePercent: 5,
+	}
+	fingerprint := base.refusalFingerprint()
+	base.Usage.FreeBytes = 40
+	base.FreePercent = 4
+	if got := base.refusalFingerprint(); got != fingerprint {
+		t.Fatalf("measurement changed fingerprint:\nfirst: %s\nsecond: %s", fingerprint, got)
+	}
+	base.Policy.MinFreeBytes++
+	if got := base.refusalFingerprint(); got == fingerprint {
+		t.Fatalf("floor change did not change fingerprint: %s", got)
+	}
+	base.Policy.MinFreeBytes--
+	base.Err = errors.New("measurement failed")
+	if got := base.refusalFingerprint(); got == fingerprint {
+		t.Fatalf("reason change did not change fingerprint: %s", got)
+	}
+
+	now := time.Now()
+	if !shouldLogDiskGuardRefusal("/tmp/gitmoot", fingerprint, now) {
+		t.Fatal("first refusal was suppressed")
+	}
+	if shouldLogDiskGuardRefusal("/tmp/gitmoot", fingerprint, now.Add(time.Minute)) {
+		t.Fatal("matching stable fingerprint was not suppressed")
 	}
 }
 

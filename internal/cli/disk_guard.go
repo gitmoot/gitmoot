@@ -15,8 +15,10 @@ import (
 )
 
 const (
-	diskGuardRefusalEventKind = "dispatch_refused_disk_guard"
-	diskGuardLogRepeat        = 15 * time.Minute
+	diskGuardRefusalEventKind  = "dispatch_refused_disk_guard"
+	diskGuardLogRepeat         = 15 * time.Minute
+	diskGuardRefusalLogKind    = "refusal"
+	diskGuardEventErrorLogKind = "event_error"
 )
 
 type diskFilesystemUsage struct {
@@ -58,6 +60,23 @@ func (e diskGuardEvaluation) detail() string {
 		e.FreePercent,
 		e.Usage.TotalBytes,
 		floors,
+	)
+}
+
+func (e diskGuardEvaluation) refusalReason() string {
+	if e.Err != nil {
+		return "measurement_unavailable"
+	}
+	return "below_configured_floor"
+}
+
+func (e diskGuardEvaluation) refusalFingerprint() string {
+	return fmt.Sprintf(
+		"path=%s reason=%s min_free_bytes=%d min_free_percent=%.2f",
+		e.Path,
+		e.refusalReason(),
+		e.Policy.MinFreeBytes,
+		e.Policy.MinFreePercent,
 	)
 }
 
@@ -128,8 +147,8 @@ func evaluateConfiguredDiskGuard(paths config.Paths) diskGuardEvaluation {
 }
 
 type diskGuardLogEntry struct {
-	detail string
-	at     time.Time
+	fingerprint string
+	at          time.Time
 }
 
 var (
@@ -137,21 +156,35 @@ var (
 	diskGuardLogEntries = map[string]diskGuardLogEntry{}
 )
 
-func shouldLogDiskGuardRefusal(path, detail string, now time.Time) bool {
+func diskGuardLogKey(kind, path string) string {
+	return kind + "\x00" + path
+}
+
+func shouldLogDiskGuard(kind, path, fingerprint string, now time.Time) bool {
 	diskGuardLogMu.Lock()
 	defer diskGuardLogMu.Unlock()
-	previous, ok := diskGuardLogEntries[path]
-	if ok && previous.detail == detail && now.Sub(previous.at) < diskGuardLogRepeat {
+	key := diskGuardLogKey(kind, path)
+	previous, ok := diskGuardLogEntries[key]
+	if ok && previous.fingerprint == fingerprint && now.Sub(previous.at) < diskGuardLogRepeat {
 		return false
 	}
-	diskGuardLogEntries[path] = diskGuardLogEntry{detail: detail, at: now}
+	diskGuardLogEntries[key] = diskGuardLogEntry{fingerprint: fingerprint, at: now}
 	return true
+}
+
+func shouldLogDiskGuardRefusal(path, fingerprint string, now time.Time) bool {
+	return shouldLogDiskGuard(diskGuardRefusalLogKind, path, fingerprint, now)
+}
+
+func shouldLogDiskGuardEventError(path, fingerprint string, now time.Time) bool {
+	return shouldLogDiskGuard(diskGuardEventErrorLogKind, path, fingerprint, now)
 }
 
 func clearDiskGuardRefusal(path string) {
 	diskGuardLogMu.Lock()
 	defer diskGuardLogMu.Unlock()
-	delete(diskGuardLogEntries, path)
+	delete(diskGuardLogEntries, diskGuardLogKey(diskGuardRefusalLogKind, path))
+	delete(diskGuardLogEntries, diskGuardLogKey(diskGuardEventErrorLogKind, path))
 }
 
 func diskGuardPaths(worker jobWorker) (config.Paths, error) {
@@ -208,17 +241,35 @@ func diskGuardAllowsQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 	}
 
 	detail := evaluation.detail()
-	if shouldLogDiskGuardRefusal(evaluation.Path, detail, time.Now()) {
+	fingerprint := evaluation.refusalFingerprint()
+	now := time.Now()
+	if shouldLogDiskGuardRefusal(evaluation.Path, fingerprint, now) {
 		writeLine(worker.Stdout, "DISK GUARD REFUSED JOB DISPATCH: %s", detail)
 	}
+	failedEventWrites := 0
+	var firstEventWriteErr error
 	for _, job := range matching {
 		if err := worker.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    diskGuardRefusalEventKind,
 			Message: detail,
 		}); err != nil {
-			writeLine(worker.Stdout, "DISK GUARD event write failed for job %s: %v", job.ID, err)
+			failedEventWrites++
+			if firstEventWriteErr == nil {
+				firstEventWriteErr = err
+			}
 		}
+	}
+	if failedEventWrites > 0 && shouldLogDiskGuardEventError(evaluation.Path, fingerprint, now) {
+		writeLine(
+			worker.Stdout,
+			"DISK GUARD event writes failed: failed=%d matching_jobs=%d path=%s reason=%s first_error=%v",
+			failedEventWrites,
+			len(matching),
+			evaluation.Path,
+			evaluation.refusalReason(),
+			firstEventWriteErr,
+		)
 	}
 	return false
 }
