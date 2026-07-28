@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/gitmoot/gitmoot/internal/evidence"
 )
 
 const hashPrefix = "sha256:"
@@ -31,13 +33,16 @@ const (
 	KindArtifact   Kind = "artifact"
 )
 
-// Grade is the strength of evidence behind a claim.
-type Grade string
+// Grade is the strength of evidence behind a claim. The alias keeps proof's
+// public vocabulary stable while allowing display-only consumers to use the
+// dependency-free evidence package without importing proof (which depends on
+// workflow).
+type Grade = evidence.Grade
 
 const (
-	GradeReported Grade = "reported"
-	GradeObserved Grade = "observed"
-	GradeVerified Grade = "verified"
+	GradeReported = evidence.GradeReported
+	GradeObserved = evidence.GradeObserved
+	GradeVerified = evidence.GradeVerified
 )
 
 // Claim is one evidence-graded assertion attached to a node.

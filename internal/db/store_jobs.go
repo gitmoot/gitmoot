@@ -110,7 +110,7 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent)
 // is created directly running, never queued. This is the ONLY insert site that
 // sets externally_driven — every other job insert leaves it at its DEFAULT 0, so
 // the normal dispatch path is byte-identical.
-func (s *Store) CreateExternallyDrivenJobWithEvent(ctx context.Context, job Job, event JobEvent) error {
+func (s *Store) CreateExternallyDrivenJobWithEvent(ctx context.Context, job Job, event JobEvent, extraEvents ...JobEvent) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -132,6 +132,14 @@ func (s *Store) CreateExternallyDrivenJobWithEvent(ctx context.Context, job Job,
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
 		return err
+	}
+	for _, extra := range extraEvents {
+		if extra.JobID == "" {
+			extra.JobID = job.ID
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, extra.JobID, extra.Kind, extra.Message); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

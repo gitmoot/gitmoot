@@ -17,6 +17,15 @@ truthful, and tied to work that actually happened.
 }
 ```
 
+## Display-only in-session review state
+
+An inline PR review can be recorded with `job open --type review --pr <n>
+--head-sha <sha> --workflow <label>`, progress notes, and `job close`. The
+resulting `review_status` is always graded `reported` and labeled
+`non_authoritative`: note authorship is a caller assertion, not system-observed
+reviewer identity. It is an operator visibility hint only and never enters the
+merge gate or changes `tasks.state`.
+
 ## Findings
 
 `findings` is a free-form array — each entry may be a plain string or a JSON

@@ -215,6 +215,7 @@ func TestWorkflowProductionQueriesUseIndexes(t *testing.T) {
 		{"list", ListWorkflowSummariesSQL, nil, "idx_jobs_workflow_id"},
 		{"show-summary", WorkflowSummarySQL, []any{"release-42"}, "idx_jobs_workflow_id"},
 		{"show-jobs", ListJobsByWorkflowSQL, []any{"release-42", 100}, "idx_jobs_workflow_id"},
+		{"filtered-job-list", ListDetailedJobsByWorkflowSQL, []any{"release-42", 100}, "idx_jobs_workflow_id"},
 		{"dashboard-graph-jobs", ListWorkflowGraphJobsSQL, []any{"release-42"}, "idx_jobs_workflow_id"},
 		{"show-notes", ListWorkflowNotesSQL, []any{"release-42", 100}, "idx_workflow_notes_wid"},
 		{"filter", CountJobsByWorkflowSQL, []any{"release-42"}, "idx_jobs_workflow_id"},

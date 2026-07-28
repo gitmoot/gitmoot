@@ -2,12 +2,51 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 )
+
+// SessionJobDisplayEventKind is a display-plane event. Merge policy must not
+// read it: its head SHA comes from the CLI caller, not system-observed evidence.
+const SessionJobDisplayEventKind = "session_job_display"
+
+type SessionJobDisplayEvent struct {
+	HeadSHA string `json:"head_sha"`
+}
+
+func sessionJobDisplayEvent(jobID, headSHA string) (db.JobEvent, bool) {
+	headSHA = strings.TrimSpace(headSHA)
+	if headSHA == "" {
+		return db.JobEvent{}, false
+	}
+	message, err := json.Marshal(SessionJobDisplayEvent{HeadSHA: headSHA})
+	if err != nil {
+		return db.JobEvent{}, false
+	}
+	return db.JobEvent{
+		JobID:   jobID,
+		Kind:    SessionJobDisplayEventKind,
+		Message: string(message),
+	}, true
+}
+
+// ParseSessionJobDisplayEvent decodes caller-reported display metadata. The
+// value is not merge evidence and must remain outside JobPayload.
+func ParseSessionJobDisplayEvent(event db.JobEvent) (SessionJobDisplayEvent, bool) {
+	if event.Kind != SessionJobDisplayEventKind {
+		return SessionJobDisplayEvent{}, false
+	}
+	var display SessionJobDisplayEvent
+	if err := json.Unmarshal([]byte(event.Message), &display); err != nil || strings.TrimSpace(display.HeadSHA) == "" {
+		return SessionJobDisplayEvent{}, false
+	}
+	display.HeadSHA = strings.TrimSpace(display.HeadSHA)
+	return display, true
+}
 
 // OpenExternalJob records the "clock in" of a session-driven ("here"/prompt-import)
 // unit of work as a first-class tracked job WITHOUT the engine spawning a runtime
@@ -58,11 +97,15 @@ func (m Mailbox) OpenExternalJob(ctx context.Context, request JobRequest) (db.Jo
 		Payload:          payload,
 		ExternallyDriven: true,
 	}
-	if err := m.Store.CreateExternallyDrivenJobWithEvent(ctx, job, db.JobEvent{
+	events := []db.JobEvent{{
 		JobID:   job.ID,
 		Kind:    string(JobRunning),
 		Message: "job started (externally driven session)",
-	}); err != nil {
+	}}
+	if displayEvent, ok := sessionJobDisplayEvent(job.ID, request.HeadSHA); ok {
+		events = append(events, displayEvent)
+	}
+	if err := m.Store.CreateExternallyDrivenJobWithEvent(ctx, job, events[0], events[1:]...); err != nil {
 		return db.Job{}, err
 	}
 	return job, nil
@@ -81,7 +124,7 @@ func (m Mailbox) OpenExternalJob(ctx context.Context, request JobRequest) (db.Jo
 // A job can be closed exactly once: it must currently be running AND
 // externally_driven, else a clear error is returned (double-close, closing an
 // engine job, or an unknown id all fail cleanly).
-func (m Mailbox) CloseExternalJob(ctx context.Context, jobID string, result AgentResult, prOverride int, branchOverride string) (db.Job, error) {
+func (m Mailbox) CloseExternalJob(ctx context.Context, jobID string, result AgentResult, prOverride int, headSHAOverride, branchOverride string) (db.Job, error) {
 	if m.Store == nil {
 		return db.Job{}, errors.New("mailbox store is required")
 	}
@@ -118,11 +161,15 @@ func (m Mailbox) CloseExternalJob(ctx context.Context, jobID string, result Agen
 	}
 
 	state := stateForDecision(result.Decision)
+	extraEvents := []db.JobEvent{}
+	if displayEvent, ok := sessionJobDisplayEvent(jobID, headSHAOverride); ok {
+		extraEvents = append(extraEvents, displayEvent)
+	}
 	transitioned, err := m.Store.TransitionJobStatePayloadWithEvent(ctx, jobID, string(JobRunning), string(state), encoded, db.JobEvent{
 		JobID:   jobID,
 		Kind:    string(state),
 		Message: fmt.Sprintf("job %s", state),
-	})
+	}, extraEvents...)
 	if err != nil {
 		return db.Job{}, err
 	}
@@ -152,6 +199,6 @@ func (e Engine) OpenExternalJob(ctx context.Context, request JobRequest) (db.Job
 // CloseExternalJob applies a session job's result and moves it to its terminal
 // state, emitting the outbound terminal event through the engine's wired EventSink.
 // See Mailbox.CloseExternalJob.
-func (e Engine) CloseExternalJob(ctx context.Context, jobID string, result AgentResult, prOverride int, branchOverride string) (db.Job, error) {
-	return e.mailbox().CloseExternalJob(ctx, jobID, result, prOverride, branchOverride)
+func (e Engine) CloseExternalJob(ctx context.Context, jobID string, result AgentResult, prOverride int, headSHAOverride, branchOverride string) (db.Job, error) {
+	return e.mailbox().CloseExternalJob(ctx, jobID, result, prOverride, headSHAOverride, branchOverride)
 }
