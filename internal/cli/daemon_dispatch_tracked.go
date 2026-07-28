@@ -66,21 +66,24 @@ type inflightDispatch struct {
 	runtimeKey  string
 }
 
-// inflightJobTracker owns the cross-tick in-flight job accounting for a
-// supervisor. All methods are nil-receiver safe (a nil tracker means "untracked
-// / legacy inline path" and behaves as permanently idle).
+// inflightJobTracker owns the cross-tick in-flight job accounting and
+// process-lifetime maintenance cadence for a supervisor. All methods are
+// nil-receiver safe (a nil tracker means "untracked / legacy inline path" and
+// behaves as permanently idle with maintenance always due).
 type inflightJobTracker struct {
-	mu        sync.Mutex
-	wg        sync.WaitGroup
-	runCtx    context.Context
-	cancelRun context.CancelFunc
-	draining  bool // set once drain() starts: no new work may begin
-	jobs      map[string]inflightDispatch
-	checkouts map[string]int // key -> holder count (counted to stay robust)
-	runtimes  map[string]int
-	perRepo   map[string]int
-	poolRuns  map[string]bool // repos with a background pool pass in flight
-	errs      map[string][]error
+	mu                           sync.Mutex
+	wg                           sync.WaitGroup
+	runCtx                       context.Context
+	cancelRun                    context.CancelFunc
+	draining                     bool // set once drain() starts: no new work may begin
+	jobs                         map[string]inflightDispatch
+	checkouts                    map[string]int // key -> holder count (counted to stay robust)
+	runtimes                     map[string]int
+	perRepo                      map[string]int
+	poolRuns                     map[string]bool // repos with a background pool pass in flight
+	errs                         map[string][]error
+	foreignBootRecoveryAt        time.Time
+	agedDelegationWorktreeReapAt time.Time
 }
 
 func newInflightJobTracker(ctx context.Context) *inflightJobTracker {
@@ -295,6 +298,52 @@ func (t *inflightJobTracker) poolRunning(repo string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.poolRuns[repo]
+}
+
+func maintenancePassDue(lastRun time.Time, now time.Time, interval time.Duration) bool {
+	return lastRun.IsZero() || !now.Before(lastRun.Add(interval))
+}
+
+// foreignBootRecoveryDue reports whether the supervisor-scoped cross-boot
+// recovery pass should run. The zero value is deliberately due so a fresh daemon
+// checks eagerly; markForeignBootRecoverySuccessful advances the cadence only
+// after both recovery operations succeed.
+func (t *inflightJobTracker) foreignBootRecoveryDue(now time.Time) bool {
+	if t == nil {
+		return true
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return maintenancePassDue(t.foreignBootRecoveryAt, now, foreignBootRecoveryInterval)
+}
+
+func (t *inflightJobTracker) markForeignBootRecoverySuccessful(now time.Time) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.foreignBootRecoveryAt = now
+}
+
+// agedDelegationWorktreeReclaimDue gates only the low-frequency TTL backstop.
+// Its zero value is due so daemon start still performs an eager cleanup pass.
+func (t *inflightJobTracker) agedDelegationWorktreeReclaimDue(now time.Time) bool {
+	if t == nil {
+		return true
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return maintenancePassDue(t.agedDelegationWorktreeReapAt, now, agedDelegationWorktreeReclaimInterval)
+}
+
+func (t *inflightJobTracker) markAgedDelegationWorktreeReclaimSuccessful(now time.Time) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.agedDelegationWorktreeReapAt = now
 }
 
 // holderOf returns the job ID currently holding checkoutKey, if any.
