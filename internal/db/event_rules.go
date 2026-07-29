@@ -3,8 +3,16 @@ package db
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
+)
+
+type EventRuleScope string
+
+const (
+	EventRuleScopeAddressed EventRuleScope = "addressed"
+	EventRuleScopeObserver  EventRuleScope = "observer"
 )
 
 // EventRule binds one classified daemon event kind to an organization role.
@@ -15,6 +23,7 @@ type EventRule struct {
 	OnKind      string
 	MatchFilter string
 	WakeRole    string
+	Scope       EventRuleScope
 	Enabled     bool
 	CreatedAt   string
 }
@@ -24,6 +33,10 @@ func (s *Store) AddEventRule(ctx context.Context, rule EventRule) error {
 	rule.ID = strings.TrimSpace(rule.ID)
 	rule.OnKind = strings.TrimSpace(rule.OnKind)
 	rule.WakeRole = strings.TrimSpace(rule.WakeRole)
+	rule.Scope = EventRuleScope(strings.ToLower(strings.TrimSpace(string(rule.Scope))))
+	if rule.Scope == "" {
+		rule.Scope = EventRuleScopeAddressed
+	}
 	if rule.ID == "" {
 		return errors.New("event rule id is required")
 	}
@@ -32,6 +45,9 @@ func (s *Store) AddEventRule(ctx context.Context, rule EventRule) error {
 	}
 	if rule.WakeRole == "" {
 		return errors.New("event rule wake_role is required")
+	}
+	if rule.Scope != EventRuleScopeAddressed && rule.Scope != EventRuleScopeObserver {
+		return fmt.Errorf("event rule scope %q is invalid; want addressed or observer", rule.Scope)
 	}
 	if strings.TrimSpace(rule.CreatedAt) == "" {
 		// Fixed-width nanoseconds (not RFC3339Nano, which trims trailing zeros) so
@@ -44,16 +60,16 @@ func (s *Store) AddEventRule(ctx context.Context, rule EventRule) error {
 		enabled = 1
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO event_rules(
-		id, on_kind, match_filter, wake_role, enabled, created_at
-	) VALUES (?, ?, ?, ?, ?, ?)`,
+		id, on_kind, match_filter, wake_role, scope, enabled, created_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		rule.ID, rule.OnKind, strings.TrimSpace(rule.MatchFilter), rule.WakeRole,
-		enabled, rule.CreatedAt)
+		rule.Scope, enabled, rule.CreatedAt)
 	return err
 }
 
 // ListEventRules returns all rules in stable creation/id order.
 func (s *Store) ListEventRules(ctx context.Context) ([]EventRule, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, on_kind, COALESCE(match_filter, ''), wake_role, enabled, created_at
+	rows, err := s.db.QueryContext(ctx, `SELECT id, on_kind, COALESCE(match_filter, ''), wake_role, scope, enabled, created_at
 		FROM event_rules ORDER BY created_at, id`)
 	if err != nil {
 		return nil, err
@@ -63,7 +79,7 @@ func (s *Store) ListEventRules(ctx context.Context) ([]EventRule, error) {
 	for rows.Next() {
 		var rule EventRule
 		var enabled int
-		if err := rows.Scan(&rule.ID, &rule.OnKind, &rule.MatchFilter, &rule.WakeRole, &enabled, &rule.CreatedAt); err != nil {
+		if err := rows.Scan(&rule.ID, &rule.OnKind, &rule.MatchFilter, &rule.WakeRole, &rule.Scope, &enabled, &rule.CreatedAt); err != nil {
 			return nil, err
 		}
 		rule.Enabled = enabled != 0

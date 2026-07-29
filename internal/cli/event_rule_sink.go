@@ -125,11 +125,21 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 		return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "organization registry unavailable", errors.New("organization registry unavailable"))
 	}
 	isReply := event.Type == events.EventOrgReply
+	hasAddressee := strings.TrimSpace(event.WakeTargetRole) != ""
+	replyHandled := false
+	addressedReplyHandled := false
 	for _, rule := range rules {
 		if !rule.Enabled || !containsEventRuleKind(kinds, rule.OnKind) || !eventRuleMatches(rule.MatchFilter, event) {
 			continue
 		}
-		if isReply && !strings.EqualFold(strings.TrimSpace(rule.WakeRole), strings.TrimSpace(event.WakeTargetRole)) {
+		observer := rule.Scope == db.EventRuleScopeObserver
+		if hasAddressee && !observer && !strings.EqualFold(strings.TrimSpace(rule.WakeRole), strings.TrimSpace(event.WakeTargetRole)) {
+			continue
+		}
+		// Preserve the existing one-attempt-per-target behavior for duplicate
+		// addressed reply rules while allowing every observer rule to see the
+		// directed event independently.
+		if isReply && !observer && addressedReplyHandled {
 			continue
 		}
 		pane, ok := s.resolveRolePane(ctx, cfg, rule.WakeRole)
@@ -180,13 +190,17 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 			slog.Info("org event wake not delivered", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "delivered", false)
 			return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "agent prompt was not delivered", errors.New("agent prompt was not delivered"))
 		}
-		// A coalesced reply batch targets one serial pane. Even if duplicate
-		// matching rules exist, one rule gets one attempt for this window.
+		// A coalesced reply batch still gives its addressed target one attempt per
+		// window. Observer rules are independent copies and do not consume that
+		// target attempt.
 		if isReply {
-			return nil
+			replyHandled = true
+			if !observer {
+				addressedReplyHandled = true
+			}
 		}
 	}
-	if isReply {
+	if isReply && !replyHandled {
 		return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "no matching reply rule or role binding", errors.New("no matching reply rule or role binding"))
 	}
 	return nil
