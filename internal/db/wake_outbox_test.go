@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -53,6 +54,42 @@ func (r *recordingWakeOutboxQueryer) QueryContext(
 	return r.delegate.QueryContext(ctx, query, args...)
 }
 
+const expectedWakeOutboxObligationQuery = `
+SELECT id, source_kind, source_id, target_role, coalesce_key, state,
+		attempt_count, last_error, created_at, COALESCE(attempted_at, ''),
+		COALESCE(finished_at, ''), updated_at
+FROM wake_outbox
+WHERE state = ? OR (state = ? AND attempted_at IS NOT NULL AND attempted_at <= ?)
+ORDER BY created_at, id`
+
+const handwrittenWakeOutboxObligationQueryFixture = `
+SELECT id, source_kind, source_id, target_role, coalesce_key, state,
+		attempt_count, last_error, created_at, COALESCE(attempted_at, ''),
+		COALESCE(finished_at, ''), updated_at
+FROM wake_outbox
+WHERE state = 'pending'
+	OR (state = 'attempted' AND attempted_at IS NOT NULL AND attempted_at <= ?)
+ORDER BY created_at, id`
+
+func validateWakeOutboxObligationQuery(
+	query string,
+	args []any,
+	attemptedBefore time.Time,
+) error {
+	if query != expectedWakeOutboxObligationQuery {
+		return fmt.Errorf("executed query does not match the independent obligation contract")
+	}
+	wantArgs := []any{
+		"pending",
+		"attempted",
+		attemptedBefore.UTC().Format(BlockedEpisodeTimeLayout),
+	}
+	if !reflect.DeepEqual(args, wantArgs) {
+		return fmt.Errorf("executed args = %#v, want independent args %#v", args, wantArgs)
+	}
+	return nil
+}
+
 func TestListWakeOutboxObligationsExecutesGeneratedQuery(t *testing.T) {
 	store := openWorkflowTestStore(t)
 	ctx := context.Background()
@@ -62,12 +99,39 @@ func TestListWakeOutboxObligationsExecutesGeneratedQuery(t *testing.T) {
 	if _, err := listWakeOutboxObligations(ctx, recorder, attemptedBefore); err != nil {
 		t.Fatal(err)
 	}
-	wantQuery, wantArgs := wakeOutboxObligationQuery(attemptedBefore)
-	if recorder.query != wantQuery {
-		t.Errorf("executed query:\n%s\nwant generated query:\n%s", recorder.query, wantQuery)
+	if err := validateWakeOutboxObligationQuery(recorder.query, recorder.args, attemptedBefore); err != nil {
+		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(recorder.args, wantArgs) {
-		t.Errorf("executed args = %#v, want generated args %#v", recorder.args, wantArgs)
+	t.Run("rejects handwritten bypass fixture", func(t *testing.T) {
+		args := []any{attemptedBefore.UTC().Format(BlockedEpisodeTimeLayout)}
+		err := validateWakeOutboxObligationQuery(
+			handwrittenWakeOutboxObligationQueryFixture,
+			args,
+			attemptedBefore,
+		)
+		if err == nil {
+			t.Fatal("handwritten query fixture unexpectedly satisfied the obligation query contract")
+		}
+		if !strings.Contains(err.Error(), "does not match") {
+			t.Fatalf("handwritten query violation = %v, want query mismatch", err)
+		}
+	})
+}
+
+func TestWakeOutboxEntryStateRemainsSerializable(t *testing.T) {
+	encoded, err := json.Marshal(WakeOutboxEntry{State: WakeOutboxStatePending})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"state":"pending"`) {
+		t.Fatalf("encoded wake outbox entry = %s, want serialized state", encoded)
+	}
+	var decoded WakeOutboxEntry
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.State != WakeOutboxStatePending {
+		t.Fatalf("decoded state = %q, want %q", decoded.State, WakeOutboxStatePending)
 	}
 }
 
@@ -102,8 +166,11 @@ INSERT INTO wake_outbox(
 		t.Fatal(err)
 	}
 	var got []string
-	for _, obligation := range obligations {
-		got = append(got, obligation.State)
+	for range obligations.Pending {
+		got = append(got, WakeOutboxStatePending)
+	}
+	for range obligations.AgedAttempted {
+		got = append(got, WakeOutboxStateAttempted)
 	}
 	want := []string{WakeOutboxStatePending, WakeOutboxStateAttempted}
 	if !reflect.DeepEqual(got, want) {
@@ -337,7 +404,7 @@ func TestExpireAgedWakeOutboxRecordsDeliveryUnknownWithoutRetry(t *testing.T) {
 	}
 
 	obligations, err := store.ListWakeOutboxObligations(ctx, attemptedAt)
-	if err != nil || len(obligations) != 1 || obligations[0].State != WakeOutboxStateAttempted {
+	if err != nil || len(obligations.Pending) != 0 || len(obligations.AgedAttempted) != 1 {
 		t.Fatalf("obligations = %+v, err=%v", obligations, err)
 	}
 	expired, err := store.ExpireAgedWakeOutbox(ctx, attemptedAt, attemptedAt.Add(time.Minute))
@@ -358,7 +425,7 @@ func TestExpireAgedWakeOutboxRecordsDeliveryUnknownWithoutRetry(t *testing.T) {
 		t.Fatalf("delivery unknown events = %+v, err=%v", events, err)
 	}
 	obligations, err = store.ListWakeOutboxObligations(ctx, attemptedAt.Add(time.Hour))
-	if err != nil || len(obligations) != 0 {
+	if err != nil || obligations.Len() != 0 {
 		t.Fatalf("obligations after expiry = %+v, err=%v", obligations, err)
 	}
 	expired, err = store.ExpireAgedWakeOutbox(ctx, attemptedAt.Add(time.Hour), attemptedAt.Add(2*time.Hour))

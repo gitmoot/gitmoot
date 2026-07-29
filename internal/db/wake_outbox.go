@@ -77,6 +77,28 @@ type WakeOutboxEntry struct {
 	UpdatedAt    string `json:"updated_at"`
 }
 
+// WakeOutboxObligation is the row data needed to act on an outstanding wake.
+// State is deliberately absent: ListWakeOutboxObligations classifies it before
+// returning across the package boundary.
+type WakeOutboxObligation struct {
+	ID          int64
+	SourceKind  string
+	SourceID    string
+	TargetRole  string
+	CoalesceKey string
+	CreatedAt   string
+}
+
+// WakeOutboxObligationProjection exposes decisions, not persisted states.
+type WakeOutboxObligationProjection struct {
+	Pending       []WakeOutboxObligation
+	AgedAttempted []WakeOutboxObligation
+}
+
+func (p WakeOutboxObligationProjection) Len() int {
+	return len(p.Pending) + len(p.AgedAttempted)
+}
+
 func insertWorkflowNoteWakeOutboxTx(ctx context.Context, tx *sql.Tx, noteID int64, targetRole string) error {
 	if err := insertWakeOutboxTx(
 		ctx, tx, WakeOutboxSourceWorkflowNote, strconv.FormatInt(noteID, 10), targetRole,
@@ -169,7 +191,10 @@ FROM wake_outbox`
 // ListWakeOutboxObligations is the authoritative health projection for durable
 // wake delivery. Pending rows and attempted rows older than attemptedBefore are
 // the only non-terminal obligations; terminal outcomes never appear.
-func (s *Store) ListWakeOutboxObligations(ctx context.Context, attemptedBefore time.Time) ([]WakeOutboxEntry, error) {
+func (s *Store) ListWakeOutboxObligations(
+	ctx context.Context,
+	attemptedBefore time.Time,
+) (WakeOutboxObligationProjection, error) {
 	return listWakeOutboxObligations(ctx, s.db, attemptedBefore)
 }
 
@@ -181,14 +206,14 @@ func listWakeOutboxObligations(
 	ctx context.Context,
 	queryer wakeOutboxQueryer,
 	attemptedBefore time.Time,
-) ([]WakeOutboxEntry, error) {
+) (WakeOutboxObligationProjection, error) {
 	query, args := wakeOutboxObligationQuery(attemptedBefore)
 	rows, err := queryer.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, err
+		return WakeOutboxObligationProjection{}, err
 	}
 	defer rows.Close()
-	out := []WakeOutboxEntry{}
+	out := WakeOutboxObligationProjection{}
 	for rows.Next() {
 		var entry WakeOutboxEntry
 		if err := rows.Scan(
@@ -197,11 +222,34 @@ func listWakeOutboxObligations(
 			&entry.LastError, &entry.CreatedAt, &entry.AttemptedAt,
 			&entry.FinishedAt, &entry.UpdatedAt,
 		); err != nil {
-			return nil, err
+			return WakeOutboxObligationProjection{}, err
 		}
-		out = append(out, entry)
+		obligation := WakeOutboxObligation{
+			ID: entry.ID, SourceKind: entry.SourceKind, SourceID: entry.SourceID,
+			TargetRole: entry.TargetRole, CoalesceKey: entry.CoalesceKey,
+			CreatedAt: entry.CreatedAt,
+		}
+		interpretation, ok := interpretWakeOutboxState(entry.State)
+		if !ok {
+			return WakeOutboxObligationProjection{}, fmt.Errorf(
+				"wake outbox obligation row has unclassified state %q", entry.State,
+			)
+		}
+		switch interpretation {
+		case wakeOutboxStatePendingObligation:
+			out.Pending = append(out.Pending, obligation)
+		case wakeOutboxStateAgedAttemptObligation:
+			out.AgedAttempted = append(out.AgedAttempted, obligation)
+		default:
+			return WakeOutboxObligationProjection{}, fmt.Errorf(
+				"wake outbox obligation query returned non-obligation state %q", entry.State,
+			)
+		}
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return WakeOutboxObligationProjection{}, err
+	}
+	return out, nil
 }
 
 func wakeOutboxObligationQuery(attemptedBefore time.Time) (string, []any) {
