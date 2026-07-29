@@ -138,17 +138,19 @@ type Event struct {
 	// EventType. It is assigned by trusted emit sites and deliberately bypasses
 	// free-text redaction and path scrubbing.
 	Cause string `json:"cause,omitempty"`
-	// WakeTargetRole and WakeOutboxIDs are internal delivery metadata for the
-	// durable wake drain. They never alter the public event JSON contract.
+	// WakeKind, WakeTargetRole, and WakeOutboxIDs are internal delivery metadata
+	// for the durable wake drain. They never alter the public event JSON contract.
+	WakeKind       string  `json:"-"`
 	WakeTargetRole string  `json:"-"`
 	WakeOutboxIDs  []int64 `json:"-"`
 }
 
-// Sink is the injected, best-effort outbound seam the engine and daemon call
-// from the terminal-transition path. Implementations MUST be non-blocking and
-// MUST NOT return an error path that can fail a job: Emit is fire-and-forget.
-// A nil Sink is a no-op (callers guard with EmitEvent / a nil check), so the
-// default (no [events] config) path is byte-identical.
+// Sink is the injected outbound seam the engine and daemon call from the
+// terminal-transition path. Implementations may synchronously persist local
+// durable obligations, but network delivery stays detached and bounded. Emit
+// has no error path that can fail a job. A nil Sink is a no-op (callers guard
+// with EmitEvent / a nil check), so the default (no [events] config) path is
+// byte-identical.
 type Sink interface {
 	// Emit dispatches an event best-effort. It must not block beyond a bounded
 	// transport timeout and must never panic or fail the caller. ctx is honored
