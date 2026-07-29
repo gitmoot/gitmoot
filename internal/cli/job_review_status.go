@@ -24,8 +24,8 @@ const (
 )
 
 // reviewStatusDisplay is intentionally incapable of expressing an authoritative
-// verdict. The liveness signal comes from caller-authored workflow notes, so the
-// strongest honest evidence grade is reported.
+// verdict. Its grade names the display signal: caller-authored workflow notes are
+// reported, while a daemon-descendant process-tree observation is observed.
 type reviewStatusDisplay struct {
 	Status    string
 	Grade     evidence.Grade

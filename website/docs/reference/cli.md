@@ -1660,13 +1660,26 @@ gitmoot job close <id> --decision approved|changes_requested|blocked \
 For a running externally-driven review, `job list` and `job show` derive
 `review_status: in_progress|stalled` from the newest workflow note, falling back
 to the job's creation time; the signal becomes stale after 20 minutes.
-`head_sha` is also exposed in text and JSON. Every review status is explicitly
+`head_sha` is also exposed in text and JSON. Every such session status is explicitly
 `review_status_grade: reported` and
 `review_status_authority: non_authoritative` (text lists use `REVIEW (reported;
 non-authoritative): ...`). Workflow notes are caller assertions, not
 system-observed reviewer attribution. These fields are display-only: they never
 satisfy, block, or otherwise feed the merge gate, and this feature never writes
 `tasks.state`.
+
+For a running engine-dispatched review with an isolated worktree, `job list`
+also samples the verified daemon's descendant process tree twice. A descendant
+whose cwd is that worktree (or a directory below it) yields
+`review_status: in_progress`; a conclusive absence in both samples yields
+`review_status: stalled`. A runtime root remains visible while the agent is idle
+between tool commands, so the check does not depend on a transient tool child.
+These statuses carry `review_status_grade: observed` and
+`review_status_authority: non_authoritative`. If the daemon identity or process
+table cannot be verified, the status is omitted rather than guessed. The
+daemon-valued `jobs.runner_pid`, job timestamps, and event age do not decide this
+status. This is observation only: it does not cancel, retry, reclaim, or feed the
+merge gate.
 
 **Make in-chat / "here" work show on the dashboard.** The one-step default is
 `gitmoot agent prompt <agent-or-template> --record`: it opens the session job *as
