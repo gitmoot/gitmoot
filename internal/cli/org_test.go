@@ -1675,7 +1675,7 @@ func TestOrgEventRuleAddListRemoveAndValidation(t *testing.T) {
 		t.Fatalf("unknown kind code=%d err=%q", code, errOut.String())
 	}
 	errOut.Reset()
-	if code := runOrg([]string{"events", "rule", "add", "--on", "attention", "--wake", "owner", "--scope", "broadcast"}, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "unknown event rule scope") {
+	if code := runOrg([]string{"events", "rule", "add", "--home", home, "--on", "attention", "--wake", "owner", "--scope", "broadcast"}, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "unknown event rule scope") {
 		t.Fatalf("unknown scope code=%d err=%q", code, errOut.String())
 	}
 	errOut.Reset()

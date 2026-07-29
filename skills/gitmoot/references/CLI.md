@@ -1358,6 +1358,10 @@ Rules default to `--scope addressed`: when an event names a target role, only
 the matching addressed rule receives it. `--scope observer` exempts a rule from
 that addressee gate, so it observes directed events regardless of target role.
 Events without a target role keep matching both scopes exactly as before.
+For `reply`, the durable batch is still claimed only when the addressed
+target's own enabled reply rule authorizes it. A reply observer is delivered
+only after that authorization; an observer-only reply rule leaves the batch
+pending.
 Every outbox row retains a queryable `pending`, `attempted`, `delivered`,
 `stalled`, or `failed` state, so never-attempted is not confused with success.
 `--match` is a case-insensitive substring matched independently against the

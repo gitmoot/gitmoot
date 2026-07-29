@@ -2,9 +2,15 @@ package cli
 
 import (
 	"context"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -91,45 +97,101 @@ func TestClassifyEventRuleKinds(t *testing.T) {
 	}
 }
 
-func TestWakeTargetRoleIsPopulatedOnlyForOrgReply(t *testing.T) {
-	eventTypes := []events.EventType{
-		events.EventJobFinished,
-		events.EventJobFailed,
-		events.EventJobBlocked,
-		events.EventJobNeedsAttention,
-		events.EventJobDeferred,
-		events.EventOrgRecycleOverdue,
-		events.EventOrgInputPending,
-		events.EventOrgReply,
-		events.EventCandidateAwaitingPromotion,
-		events.EventCandidateAutoPromoted,
-		events.EventCandidateCanaryStarted,
-		events.EventCandidateRolledBack,
-		events.EventJobStarted,
-		events.EventDelegationEscalation,
-		events.EventDelegationFinalized,
-		events.EventOrchestrationFinished,
+func TestWakeTargetRoleHasExactlyOneProductionWriteInReplyWakeEvent(t *testing.T) {
+	writes := productionWakeTargetRoleWrites(t)
+	if got, want := fmt.Sprint(writes), "[internal/cli/reply_wake_outbox.go:replyWakeEvent]"; got != want {
+		t.Fatalf("production WakeTargetRole writes = %s, want %s", got, want)
 	}
-	for _, eventType := range eventTypes {
-		t.Run(string(eventType), func(t *testing.T) {
-			event := events.NewEvent(eventType, "job-1", "root-1", "owner/repo", "status", "detail", time.Now(), nil)
-			if eventType == events.EventOrgReply {
-				event = replyWakeEvent([]db.WakeOutboxEntry{{
-					SourceKind: "workflow_note", SourceID: "note-1", TargetRole: "owner",
-				}}, time.Now())
+	event := replyWakeEvent([]db.WakeOutboxEntry{{
+		SourceKind: "workflow_note", SourceID: "note-1", TargetRole: "owner",
+	}}, time.Now())
+	if event.Type != events.EventOrgReply || strings.TrimSpace(event.WakeTargetRole) != "owner" {
+		t.Fatalf("reply wake event = {Type:%q WakeTargetRole:%q}, want org.reply addressed to owner", event.Type, event.WakeTargetRole)
+	}
+}
+
+type wakeTargetRoleWrite struct {
+	file     string
+	function string
+}
+
+func (w wakeTargetRoleWrite) String() string {
+	return w.file + ":" + w.function
+}
+
+func productionWakeTargetRoleWrites(t *testing.T) []wakeTargetRoleWrite {
+	t.Helper()
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var writes []wakeTargetRoleWrite
+	err = filepath.WalkDir(root, func(filename string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" {
+				return filepath.SkipDir
 			}
-			target := strings.TrimSpace(event.WakeTargetRole)
-			if eventType == events.EventOrgReply {
-				if target != "owner" {
-					t.Fatalf("WakeTargetRole = %q, want owner", target)
+			return nil
+		}
+		if filepath.Ext(filename) != ".go" || strings.HasSuffix(filename, "_test.go") {
+			return nil
+		}
+		fset := token.NewFileSet()
+		parsed, err := parser.ParseFile(fset, filename, nil, 0)
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(root, filename)
+		if err != nil {
+			return err
+		}
+		for _, declaration := range parsed.Decls {
+			functionName := "<package>"
+			node := ast.Node(declaration)
+			if function, ok := declaration.(*ast.FuncDecl); ok {
+				if function.Body == nil {
+					continue
 				}
-				return
+				functionName = function.Name.Name
+				node = function.Body
 			}
-			if target != "" {
-				t.Fatalf("WakeTargetRole = %q, want empty", target)
-			}
-		})
+			ast.Inspect(node, func(node ast.Node) bool {
+				switch node := node.(type) {
+				case *ast.AssignStmt:
+					for _, expression := range node.Lhs {
+						selector, ok := expression.(*ast.SelectorExpr)
+						if ok && selector.Sel.Name == "WakeTargetRole" {
+							writes = append(writes, wakeTargetRoleWrite{
+								file: filepath.ToSlash(relative), function: functionName,
+							})
+						}
+					}
+				case *ast.KeyValueExpr:
+					key, ok := node.Key.(*ast.Ident)
+					if ok && key.Name == "WakeTargetRole" {
+						writes = append(writes, wakeTargetRoleWrite{
+							file: filepath.ToSlash(relative), function: functionName,
+						})
+					}
+				}
+				return true
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
+	sort.Slice(writes, func(i, j int) bool {
+		if writes[i].file != writes[j].file {
+			return writes[i].file < writes[j].file
+		}
+		return writes[i].function < writes[j].function
+	})
+	return writes
 }
 
 func TestEventRuleAddresseeGateIsKindAgnosticAndObserverExempt(t *testing.T) {
