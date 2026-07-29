@@ -14,6 +14,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/evidence"
 	"github.com/gitmoot/gitmoot/internal/prompts"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -393,6 +394,9 @@ type JobPayload struct {
 	CheckRetries     int          `json:"check_retries,omitempty"`
 	RawOutputs       []string     `json:"raw_outputs,omitempty"`
 	Result           *AgentResult `json:"result,omitempty"`
+	// ReviewStatusGrade records the evidence strength of an externally-driven
+	// review when it closes. Caller-supplied session inputs are always reported.
+	ReviewStatusGrade evidence.Grade `json:"review_status_grade,omitempty"`
 	// ResultObservation records the engine-owned git diff of an implement
 	// worktree at result-persistence time and its bidirectional comparison with
 	// changes_made. It is recorded independently of result-check mode; the

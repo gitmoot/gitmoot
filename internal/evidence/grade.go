@@ -9,4 +9,9 @@ const (
 	GradeReported Grade = "reported"
 	GradeObserved Grade = "observed"
 	GradeVerified Grade = "verified"
+
+	// SessionReviewGrade is shared by the running display hint and the durable
+	// close-time record. Session review inputs are caller-supplied, so this can
+	// never be stronger than reported.
+	SessionReviewGrade Grade = GradeReported
 )

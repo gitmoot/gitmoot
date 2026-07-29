@@ -8,6 +8,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
+	"github.com/gitmoot/gitmoot/internal/evidence"
 )
 
 // TestOpenExternalJobCreatesRunningNoQueue proves `job open` (clock-in) creates a
@@ -188,6 +189,37 @@ func TestCloseExternalJobRecordsPRAndBranch(t *testing.T) {
 	display, ok := ParseSessionJobDisplayEvent(event)
 	if !ok || display.HeadSHA != "reviewed-head" {
 		t.Fatalf("display event = %+v ok=%v, want reviewed-head", display, ok)
+	}
+}
+
+func TestCloseExternalReviewPersistsReportedGrade(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"review"}, "gitmoot/gitmoot")
+	mb := Mailbox{Store: store}
+
+	if _, err := mb.OpenExternalJob(ctx, JobRequest{
+		ID:     "session-review-grade",
+		Agent:  "lead",
+		Action: "review",
+		Repo:   "gitmoot/gitmoot",
+	}); err != nil {
+		t.Fatalf("OpenExternalJob returned error: %v", err)
+	}
+	if _, err := mb.CloseExternalJob(ctx, "session-review-grade", AgentResult{
+		Decision: "approved",
+		Summary:  "reviewed",
+	}, 0, "", ""); err != nil {
+		t.Fatalf("CloseExternalJob returned error: %v", err)
+	}
+
+	stored := mustJob(t, store, "session-review-grade")
+	payload, err := unmarshalPayload(stored.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload returned error: %v", err)
+	}
+	if payload.ReviewStatusGrade != evidence.GradeReported {
+		t.Fatalf("stored review status grade = %q, want %q", payload.ReviewStatusGrade, evidence.GradeReported)
 	}
 }
 

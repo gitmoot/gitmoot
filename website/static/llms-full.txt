@@ -716,6 +716,13 @@ cost on this host is roughly 440 MB/week. JSONL exports redact known credential
 patterns best-effort, but that masking is not a vault. `--output` writes through
 a private temporary file and atomic rename.
 
+Closing an externally driven `review` job persists
+`review_status_grade: reported` in its payload, and `job show --json` and `job
+list --json` expose that grade after the running liveness hint ends. The grade
+cannot be `observed` or `verified`: the session supplies both the reviewed head
+and decision. A reported review record is operator-visible history, not
+merge-admissible evidence, and no merge gate consumes it.
+
 Goal import turns Markdown headings shaped like `### Task N: Title` into local
 planned tasks. `task run` starts one task branch in a dedicated worktree,
 records its branch lock, and stores the worktree path on the task.
@@ -11642,6 +11649,13 @@ non-authoritative): ...`). Workflow notes are caller assertions, not
 system-observed reviewer attribution. These fields are display-only: they never
 satisfy, block, or otherwise feed the merge gate, and this feature never writes
 `tasks.state`.
+
+When an externally-driven review closes, its payload retains
+`review_status_grade: reported`; `job list --json` and `job show --json` continue
+to expose that field after the running liveness status ends. The grade is never
+`observed` or `verified` because both the reviewed head and verdict came from
+caller-supplied flags. This durable reported record is not merge-admissible
+evidence, and no merge gate consumes it.
 
 For a running engine-dispatched review with an isolated worktree, `job list`
 also samples the verified daemon's descendant process tree twice. A descendant

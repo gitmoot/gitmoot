@@ -83,6 +83,13 @@ cost on this host is roughly 440 MB/week. JSONL exports redact known credential
 patterns best-effort, but that masking is not a vault. `--output` writes through
 a private temporary file and atomic rename.
 
+Closing an externally driven `review` job persists
+`review_status_grade: reported` in its payload, and `job show --json` and `job
+list --json` expose that grade after the running liveness hint ends. The grade
+cannot be `observed` or `verified`: the session supplies both the reviewed head
+and decision. A reported review record is operator-visible history, not
+merge-admissible evidence, and no merge gate consumes it.
+
 Goal import turns Markdown headings shaped like `### Task N: Title` into local
 planned tasks. `task run` starts one task branch in a dedicated worktree,
 records its branch lock, and stores the worktree path on the task.
