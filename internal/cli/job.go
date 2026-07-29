@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/evidence"
 	"github.com/gitmoot/gitmoot/internal/transcript"
@@ -124,7 +125,9 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 	var deliveryEventsKnown bool
 	var locks []db.ResourceLock
 	var reviewStatuses map[string]reviewStatusDisplay
-	if err := withStore(*home, func(store *db.Store) error {
+	var paths config.Paths
+	if err := withStoreAndPaths(*home, func(resolvedPaths config.Paths, store *db.Store) error {
+		paths = resolvedPaths
 		var err error
 		if strings.TrimSpace(*workflowID) != "" {
 			jobs, err = store.ListDetailedJobsByWorkflow(context.Background(), strings.TrimSpace(*workflowID), 0)
@@ -146,6 +149,9 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	filtered := filterJobs(jobs, *repo, *state)
+	for jobID, status := range deriveDispatchedReviewStatuses(paths, filtered) {
+		reviewStatuses[jobID] = status
+	}
 	if *jsonOutput {
 		entries := make([]jobListEntry, 0, len(filtered))
 		for _, job := range filtered {
