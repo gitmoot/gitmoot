@@ -686,6 +686,7 @@ gitmoot goal import --file GOAL.md --repo owner/repo
 gitmoot task run task-001 --repo owner/repo --owner lead --base main
 gitmoot task recover task-001 --owner lead   # finalize a dead implement's dirty worktree
 gitmoot task dismiss task-001 --reason "abandoned experiment"
+gitmoot task resume-work task-001 --reason "review requires another fix pass"
 gitmoot task events task-001 --json
 gitmoot task list --repo owner/repo
 gitmoot job list
@@ -745,6 +746,13 @@ best-effort, and records `task_dismissed_manual`. The daemon can record
 activity proxy. Configure `[workflow].stale_task_ttl = "168h"` (the default), or
 set it to `"0"` to disable this poll leg. Candidates with a same-repo open PR,
 a remote branch, a live job, or an uncertain remote check are not dismissed.
+
+`task resume-work` is the coordinator-only, non-terminal exit from orphaned
+`reviewing`/`ready_to_merge` machinery back to `implementing`. It also supports
+`awaiting_human_merge`, but only with both `--reason` and
+`--override-pending-human-decision`. Every path refuses live jobs and worktree
+processes, preserves the branch lock, and records `task_resume_work_manual`; no
+daemon or autonomous retry invokes it.
 
 Delegation worktrees have a separate default-on retention bound:
 `[workflow].delegation_worktree_ttl = "72h"`. Only worktrees owned by final jobs
@@ -1797,6 +1805,25 @@ The command must print a valid `gitmoot_result` object for normal jobs.
 Use `gitmoot doctor --repo .` first. It checks local prerequisites from the
 repository checkout.
 
+## The Advertised Daemon Log Is Stale
+
+`gitmoot daemon status` prints the configured log path. When the daemon is
+running, it warns if that file is missing or its last write predates the
+daemon's recorded start time; `gitmoot doctor` reports the same confirmed
+condition as a non-fatal `daemon log` check.
+
+This commonly means the daemon runs under `systemd --user`, which captures
+stdout and stderr in the journal instead of the file. Follow the likely live
+stream with:
+
+```sh
+journalctl --user -u gitmoot-daemon -f
+```
+
+The warning is mechanism-agnostic: it reports the timestamp mismatch and phrases
+systemd as a possibility. It is omitted when the daemon is stopped, the log is
+current, or the comparison cannot be made.
+
 ## The Daemon Is Running An Old Build
 
 Symptoms:
@@ -2257,6 +2284,19 @@ Fixes:
   (a failing probe extends the hold without spending a retry). Over `[events]`
   the deferral is a first-class `job.deferred` emitted instead of `job.failed`.
   Only act when the retry budget is spent and the job stays failed.
+- A `stale_worktree_dirty_blocked` task event is not an auto-retrying
+  `checkout_contention` deferral. It means the existing task worktree is off the
+  resolved base lineage and has uncommitted changes, so Gitmoot preserves it and
+  moves the task to `blocked`. Confirm the event with `gitmoot task events
+  <task-id> --json`; `gitmoot task list --repo owner/repo --state blocked
+  --json` exposes its `worktree_path`. Manually salvage, commit, stash, or clean
+  the changes before retrying `task run`/`agent implement`; an off-lineage
+  worktree is re-cut automatically only when it is clean. For a
+  delegated/Orchestra implement worktree, the same event is stored as a
+  JobEvent on the parent coordinator job; the delegation-worktree allocator
+  writes nothing to the tasks table. Inspect it with `gitmoot job events
+  <parent-job-id>` (`job events` has no `--json` flag). `gitmoot job show
+  <parent-job-id> --json` is valid but does not include event history.
 - A job stuck in `running` is recovered automatically once it shows no lease
   progress past the staleness window (default 30m; tune with the
   `GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value
@@ -2415,7 +2455,11 @@ Fixes:
 - If the task is `awaiting_human_merge`, inspect its reason. Either the mandatory
   exact-head review/CI gate missed (also escalated to `jarvis`) or the repository
   has the explicit `[merge_gate] auto_merge = false` kill-switch. Merge it in
-  GitHub or use an authorized `@gitmoot merge` comment.
+  GitHub or use an authorized `@gitmoot merge` comment. If more implementation
+  is required instead, a coordinator can explicitly run `gitmoot task
+  resume-work <id> --reason "..." --override-pending-human-decision`; this
+  preserves the branch lock and records the override before returning the task
+  to `implementing`.
 - If the reason reads `waiting to confirm no external CI` (or `waiting … for CI
   to be created`), the gate saw **zero** external commit-statuses and check-runs
   at the head and is deferring rather than merging before GitHub Actions creates
@@ -2490,7 +2534,8 @@ worktree owned by a blocked, queued, or running job; settle that job first.
 # Outbound Event Stream (`[events]`)
 
 Gitmoot can push a small, versioned, redacted JSON event to one HTTP endpoint
-whenever a job reaches a terminal state or pauses awaiting a human. This is an
+whenever a job reaches a terminal state, pauses awaiting a human, or an
+organization role remains in a configured alert condition. This is an
 **off-by-default, best-effort** outbound seam (#446): with no `[events]` config
 and no organization event rules, nothing is constructed and behavior is
 byte-identical to a build without it.
@@ -2511,12 +2556,16 @@ The pilot emits a tight allowlist of event types over the webhook transport:
 | `job.blocked`                   | a job reaches the `blocked` terminal state                                         |
 | `job.needs_attention`           | a tree pauses awaiting a human (the `escalate_human` pause today)                  |
 | `job.deferred`                  | the daemon re-queued a run whose delivery failed on a retryable operational blocker (runtime auth, rate limit/quota, network/GitHub outage, checkout contention) — it will be re-dispatched automatically. Since #532 slice E this is a **first-class** transition emitted INSTEAD of `job.failed` (no preceding `job.failed` for that run) |
+| `org.input_pending`             | a Herdr pane bound to an organization role continuously reports an interactive input dialog past the configured threshold |
+| `org.reply`                     | the daemon drains a durable, coalesced batch of notes addressed to one organization role |
 | `candidate.awaiting_promotion`  | a SkillOpt template candidate becomes `pending` after import (always, off the auto-promote policy) |
 | `candidate.auto_promoted`       | the off-by-default `[skillopt].auto_promote` policy auto-promoted a candidate to `current` (also the canary GRADUATE event) |
 | `candidate.canary_started`      | the off-by-default `[skillopt].auto_promote_canary` policy promoted a candidate to the `canary` state behind the live champion |
 | `candidate.rolled_back`         | the canary regression window auto-rolled-back a canary on a material regression (champion stays current, canary rejected) |
 
-Each terminal transition emits **exactly once**. The engine owns the
+Each terminal transition emits **exactly once**. `org.input_pending` is an
+episode alert instead: it repeats at most once per configured interval while
+the same interactive dialog condition remains observed. The engine owns the
 succeeded/failed/blocked emit on its `Mailbox` terminal path; the daemon owns the
 pre-flight (`queued -> failed|blocked`) and permission-blocked cases that never
 pass through that path. `job.needs_attention` is emitted once per fresh
@@ -2599,10 +2648,10 @@ Every event is a single JSON object:
 | `job_id`         | string | Opaque job id this event is about.                                          |
 | `root_id`        | string | The coordination tree's root id, so a consumer can aggregate a run client-side. |
 | `repo`           | string | `owner/repo` only — never an absolute checkout path.                        |
-| `status`         | string | Terminal/lifecycle state (`succeeded`/`failed`/`blocked`/`awaiting_human`). |
+| `status`         | string | Terminal/lifecycle state (`succeeded`/`failed`/`blocked`/`awaiting_human`/`input_pending`/`attempted`). |
 | `ts`             | string | RFC3339 emit time.                                                          |
 | `detail`         | string | Short redacted human-facing string (failure summary, the escalation question). |
-| `cause`          | string | Optional internal discriminator (`escalation`, `ask_gate`, `merge_guard`, `permission_guard`, or `blocked_since`). |
+| `cause`          | string | Optional internal discriminator (`escalation`, `ask_gate`, `merge_guard`, `permission_guard`, `blocked_since`, `input_pending_since`, or `addressed_note`). |
 
 `cause` is an additive optional field, so `schema_version` remains `1` and
 existing events serialize unchanged. It is a trusted enum assigned at emit
@@ -2639,8 +2688,8 @@ blocks or fails a job — this mirrors the `escalate_human` notifier contract:
   **dropped** and a single best-effort `event_sink_drop` job event is recorded
   locally (so a drop is observable without coupling delivery to the job).
 
-There is **no** outbox / retry in the pilot: at-least-once delivery and an
-outbox table are the explicit graduate step.
+Webhook delivery has no outbox or retry. Addressed-message role wakes are the
+exception: their producer-agnostic SQL outbox is described below.
 
 ## Organization event-rule wakes
 
@@ -2657,25 +2706,47 @@ pane = "w1:p2"
 
 ```sh
 gitmoot org events rule add --on guard --match owner/repo --wake maintainer
+gitmoot org events rule add --on blocked --repo tendwire --wake maintainer
+gitmoot org events rule add --on pane_input_pending --wake maintainer
+gitmoot org events rule add --on reply --wake maintainer
 gitmoot org events rule list
 gitmoot org events rule rm <rule-id>
 ```
 
-Kinds are `escalation`, `attention`, `guard`, `job-terminal`, and `blocked`.
+Kinds are `escalation`, `attention`, `guard`, `job-terminal`, `blocked`,
+`recycle-overdue`, `pane_input_pending`, and `reply`.
 The v1 `--match` filter is a case-insensitive substring tested against the event
-repo and job id; empty matches all. A plain `job.blocked` event matches both
+repo and job id; empty matches all. `--repo` is an alias for that same filter;
+pass only one of the two flags. A plain `job.blocked` event matches both
 `job-terminal` and `blocked`, while guard-caused blocks match `guard` first. A
-synthesized `blocked_since` event matches only `blocked`. Set
+synthesized `blocked_since` event matches only `blocked`. Task episodes due in
+one evaluator pass are emitted as one oldest-first digest; blocked roles retain
+one event per role. Set
 `[orchestrate].blocked_role_wake_after` to a positive Go duration to emit such an
 event when a task or Herdr role stays blocked past the threshold, re-nudging at
 most once per that interval while it remains blocked (so a dropped wake
-self-heals on the next interval instead of being lost); `0s` (the default)
-disables both evaluators. An episode is cleared on a definitive non-blocked
-observation, or once the subject stops being observed blocked for a short grace
+self-heals on the next interval instead of being lost). The same threshold and
+repeat interval apply to `org.input_pending`: Herdr's `input_pending: true`
+overrides the pane's last `idle` or `working` status, opens a separately keyed
+episode, and matches only `pane_input_pending`. `0s` (the default) disables
+these evaluators. An episode is cleared on a definitive non-matching
+observation, or once the subject stops matching for a short grace
 (so a role gone for good is not leaked); a brief `unknown`/absent snapshot blip
 within that grace never resets it, and a later re-block starts a fresh episode.
 Each synthesized event's `detail` carries the stable since-time, so a re-nudge
 (same `job_id` + same since) is distinguishable from a fresh episode.
+`reply` consumes addressed workflow notes and `kind=chat` messages from the
+durable wake outbox and only wakes the role named by both the message and the
+rule. Non-triggering chat back-links such as `job_result` do not enter the
+outbox. The daemon uses rolling five-second windows per role: one wake carries
+`N new items, oldest id X`.
+Pending, attempted, delivered, stalled, and failed remain queryable per outbox
+row, so an escalation that was never attempted is distinct from a successful
+wake. A quiet burst tail is flushed by a later daemon tick; it does not require
+another note. If the outbox or its delivery rules cannot be queried, or an
+outbox row cannot be parsed or claimed, the worker tick fails and the existing
+recovering supervisor retries and escalates a persistent shared-store fault; an
+indeterminate drain is never reported as healthy.
 The wake role's config sets `pane = "<pane-id-or-label>"`: a value containing `:`
 is a `wX:pY` pane id used as-is, any other value is a pane label resolved to the
 current id at wake time (so a recycled pane is still reached). Wake delivery runs
@@ -2731,7 +2802,8 @@ on the tracking issue:
 
 - The Unix-socket transport (`socket_path`), behind the same `Sink` seam.
 - More event types (`job.started`, `delegation.*`, `orchestration.finished`).
-- An outbox table for at-least-once / durable delivery.
+- A webhook outbox for at-least-once HTTP delivery (addressed-message role wakes
+  already use a local durable outbox).
 - A server-side synthetic `orchestration.finished` (reliable tree convergence).
 
 ---
@@ -9228,6 +9300,14 @@ also clock in/out manually with `gitmoot job open` / `gitmoot job close`, or log
 already-finished work in one shot with `gitmoot job record` (see
 `references/CLI.md` → Session jobs).
 
+For an in-session PR review, clock in with `--type review --pr <n> --head-sha
+<sha> --workflow <label>` and journal progress with `gitmoot workflow note
+<label> "..."`. `job list` and `job show` expose the resulting liveness hint as
+`review_status`, always alongside `review_status_grade: reported` and
+`review_status_authority: non_authoritative`. This is display-only,
+caller-reported activity: it does not satisfy, block, or otherwise feed the
+merge gate. Close the session job after posting the verdict.
+
 For template capture, phrases like "capture this session as a Gitmoot agent
 template", "turn this workflow into a Gitmoot template", or "draft a reusable
 agent template from this chat" mean read [TEMPLATE_CAPTURE.md](references/TEMPLATE_CAPTURE.md)
@@ -9687,7 +9767,24 @@ actionable remediation hint) and live-probes the Claude credential selected by
 `runtime-auth.env`, so a bad credential is caught before jobs stall. Run it
 after install and before starting the daemon. It also reports delegation
 worktree count and logical disk size, warning at 10 stale worktrees or 1 GB and
-distinguishing aged-final reclaimable owners from pinned non-final owners.
+distinguishing aged-final reclaimable owners from pinned non-final owners. A
+running job whose directly recorded runtime PID is confirmably dead is a
+required `stuck jobs` failure; legacy jobs with no recorded PID and hosts where
+process identity cannot be verified are neutral and produce no ghost-job
+finding.
+It also reports the SQLite auto-vacuum mode. New homes use bounded incremental
+reclaim automatically. A legacy home remains a non-blocking warning until an
+operator deliberately converts it during an idle maintenance window:
+
+```sh
+sqlite3 "$HOME/.gitmoot/gitmoot.db" \
+  'PRAGMA auto_vacuum=INCREMENTAL; VACUUM;'
+```
+
+The one-time command fully rewrites the database; the daemon never runs a full
+`VACUUM` automatically. `sqlite3` is an optional operator tool, not a Gitmoot
+runtime dependency. For a non-default home, use the exact path printed by
+`gitmoot doctor`.
 
 One-shot onboarding: `gitmoot setup` registers the repo and an agent in one
 command (`--repo owner/repo --agent <name> --runtime codex|claude|shell
@@ -9948,6 +10045,14 @@ For structured local state, use `gitmoot dashboard --json` or
 `gitmoot task list --repo owner/repo --json`. `gitmoot status --json` and
 `gitmoot task show` are not valid commands.
 
+`gitmoot daemon status` always prints the configured daemon log path. For a
+running daemon, it also compares that file's last write with the daemon's
+recorded start time. A missing file or an older last write produces a warning
+with both times and suggests
+`journalctl --user -u gitmoot-daemon -f` if the daemon runs under systemd.
+`gitmoot doctor` reports the same confirmed condition as a non-fatal
+`daemon log` check. Fresh, stopped, and indeterminate cases add no output.
+
 ### Build skew (upgraded but not restarted)
 
 The daemon is a long-lived process: replacing the binary does **not** change the
@@ -10053,6 +10158,31 @@ re-reads the `[daemon]` config section (`poll`, `workers`, `scheduler`,
 parallelism, `idle_grace_ticks`, `idle_max_multiplier`) live (#577) — no teardown, no dropped jobs, no environment
 re-inheritance. Values pinned by explicit launch flags win over the re-read
 config. Prefer SIGHUP over a restart when only tuning throughput.
+
+The default-on `[disk_guard]` section pauses normal queued-job dispatch when the
+filesystem holding the Gitmoot home and worktrees has less than either
+`min_free_bytes` (default `2147483648`, 2 GiB) or `min_free_percent` (default
+`5`) available. Both checks apply when both are non-zero, so the more
+conservative floor wins:
+
+```toml
+[disk_guard]
+enabled = true
+min_free_bytes = 2147483648
+min_free_percent = 5
+```
+
+The guard fails closed: an unreadable config, missing path, `statfs` error, or
+invalid filesystem measurement pauses dispatch instead of assuming the disk is
+healthy. Paused jobs remain `queued` and retry automatically on the next healthy
+daemon pass. The daemon writes a greppable
+`DISK GUARD REFUSED JOB DISPATCH` log and a
+`dispatch_refused_disk_guard` job event containing the measured free space,
+configured floors, and measured path. `gitmoot daemon status` always reports the
+current measurement and prints `UNHEALTHY, dispatch paused` when the measurement
+cannot be established or a floor is breached. The guard applies only to normal
+agent-job dispatch; daemon maintenance/reconciliation remains runnable so an
+internal reclaim pass can free space.
 
 Claude runtime auth is independent of daemon restarts. Use `gitmoot auth set
 claude` to rotate the owner-only `runtime-auth.env`; the next delivery observes
@@ -10830,8 +10960,9 @@ resolved role table.
 
 The registry uses `[org] enforce = "warn"|"block"` and
 `[org.roles."name"]` entries with `parent`, `scope`, `merge_rule`, an optional
-cosmetic `display_name`, and an optional `pane` Herdr binding (used by live
-presence and org event-rule wakes).
+cosmetic `display_name`, an optional `model` runtime pin, an optional per-role
+`recycle_after` duration override, and an optional `pane` Herdr binding (used by
+live presence and org event-rule wakes).
 The binding resolves as an exact live pane label first, then as a literal pane
 id; roles without a binding retain exact role-name-as-label presence lookup. There is
 exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
@@ -10844,8 +10975,27 @@ role's `pane` binding. `chart` and `status` also show a `⚠ flagged (N missed
 wakes)` marker once a role reaches the positive
 `[orchestrate].max_consecutive_missed_wakes` threshold; their JSON rows expose
 `missed_wakes`, `flagged`, and `flag_reason`. The threshold defaults to `0`, so
-flagging is off. Open escalations remain deferred to #1058's resolution and
-correlation contract.
+flagging is off. A missed-wake row more than 24 hours old is omitted from this
+flag calculation; its stored consecutive counter remains unchanged for the
+next real delivery attempt. `status --json` also exposes `active_jobs`, the live
+queued-plus-running job count attributed to the role through `ActingOrgRole`
+(#1057); it is distinct from daily or historical job counts. Escalations can be
+resolved with `gitmoot org escalate resolve`; correlation beyond the optional
+`--note` link remains deferred to #1058.
+
+For Claude-runtime jobs attributed with `ActingOrgRole`, an explicit provider
+weekly-quota rejection marks that role `unavailable` until the provider's
+stated reset time. `org status` prints `⚠ UNAVAILABLE`, `reason=quota`, and the
+UTC reset instant in the role detail; `org chart` appends the same warning, and
+their JSON rows expose `provider_state: "unavailable"`,
+`unavailable_reason`, and `unavailable_until`. New operator dispatches to the
+role are refused and already-queued jobs for it stay held. The incident sends
+one best-effort direct wake to the role's configured parent, then clears at the
+reset instant or on that role's first subsequent successful Claude-runtime job,
+whichever happens first. Success on another runtime cannot clear the Claude
+wall. If Claude supplies no parseable reset, Gitmoot uses the existing bounded
+15-minute quota fallback. Codex and Kimi quota-message detection are not part of
+this phase.
 
 The read-only Org page consumes `GET /api/org` for the store-backed role tree,
 health strip, typed escalations, and current signal feed, plus
@@ -10858,7 +11008,10 @@ is enabled; otherwise `detection_hint` explains why an empty signal feed is not
 evidence that every role is healthy. The enabled blocked-role evaluator also
 persists its latest Herdr snapshot for these endpoints. Only observations from
 the last five minutes are rendered as `blocked`, `working`, or `idle`; stale,
-missing, `done`, and `unknown` observations render as `never-seen`.
+missing, `done`, and `unknown` observations render as `never-seen`. An active
+provider quota incident renders separately as `unavailable`, including its
+reason and reset boundary in `presence_detail`; it is never collapsed into
+`never-seen`.
 
 **Session lifecycle (phase 3).** `[org] recycle_after = "24h"` (a duration,
 per-role overridable via `[org.roles."name"] recycle_after`) marks a role
@@ -10886,6 +11039,12 @@ configured `pane`. A pane binding and non-empty handoff are required. For safety
 recycle does not kill or send exit keys to the old agent: the pane must already
 be at its interactive shell prompt. The Herdr start wait is bounded to 30
 seconds; a failed start leaves the durable handoff note available for recovery.
+When a role configures `model`, recycle passes `--model <value>` to the successor
+only for the verified Herdr kinds `codex`, `claude`, and `kimi`; other accepted
+`--kind` values silently ignore the pin without an error or warning. Deploy this
+binary before adding the fail-closed field to config. Brief and chart surface
+the configured pin, but live-vs-pinned drift detection awaits a running-model
+signal from Herdr.
 
 Fresh local `agent ask`, `agent run`, `agent review`, `agent implement`,
 `orchestrate`, and `task run` dispatches accept `--org-role <name>` (or the
@@ -10902,22 +11061,48 @@ an ancestor of that role, never the same role or a sibling. The note uses the
 typed schema `[org:escalate to=<to> from=<from> wf=<workflow>] <question>`, has
 the from-role as author, and can be rendered as JSON with `--json`. It
 formalizes the earlier ad-hoc practice of typing escalations into notes or
-panes; there is no code-level marker to migrate. Phase 1a writes the typed
-note, which is visible with `workflow show`; structured escalation surfaces
-land with the org brief and active delivery/wake is phase 2. Pane/agent creation
-permissions and Herdr checks remain later work.
+panes; there is no code-level marker to migrate. The note and a `pending` wake
+outbox row commit atomically. With an opt-in `reply` rule, a daemon tick wakes
+the addressed role through its configured Herdr pane.
+
+`gitmoot org escalate resolve <escalation-note-id> [--by <role>] [--note
+<answer-note-id>] [--home <dir>]` appends a typed resolution marker to the same
+workflow journal. `--by` defaults to the escalation's target role, and `--note`
+optionally links the workflow note containing the answer. Resolved escalations
+are omitted from org dashboard projections while the original journal entry
+remains intact.
+
 Event-rule wakes are separately opt-in:
 
 ```sh
 gitmoot org events rule add --on attention --match owner/repo --wake maintainer
+gitmoot org events rule add --on blocked --repo tendwire --wake maintainer
+gitmoot org events rule add --on pane_input_pending --wake maintainer
+gitmoot org events rule add --on reply --wake maintainer
 gitmoot org events rule list
 gitmoot org events rule rm --home /alternate/home <rule-id>
 ```
 
-`--on` accepts `escalation`, `attention`, `guard`, `job-terminal`, or `blocked`.
+`--on` accepts `escalation`, `attention`, `guard`, `job-terminal`, `blocked`,
+`recycle-overdue`, `pane_input_pending`, or `reply`. `pane_input_pending` matches the
+`org.input_pending` event emitted when Herdr continuously reports
+`input_pending: true` for a role's pane longer than
+`[orchestrate].blocked_role_wake_after`; it re-nudges at most once per that
+interval while the dialog remains pending. The pending signal takes precedence
+over the pane's last `idle` or `working` activity status.
+`reply` matches durable batches of workflow notes and `kind=chat` messages
+addressed to the same role as `--wake`; non-triggering chat back-links such as
+`job_result` are excluded. The daemon coalesces a rolling five-second window
+into one prompt carrying `N new items, oldest id X`; separate roles and later
+windows stay separate. A later tick flushes the quiet tail without requiring
+another message.
+Every outbox row retains a queryable `pending`, `attempted`, `delivered`,
+`stalled`, or `failed` state, so never-attempted is not confused with success.
 `--match` is a case-insensitive substring matched independently against the
-event repo and job id; omit it to match every event of that kind. `--wake` must
-name a declared role whose config sets `pane = "<pane-id-or-label>"`. Gitmoot
+event repo and job id; omit it to match every event of that kind. `--repo` is a
+discoverable alias for the same substring filter, useful for repo-to-role
+routing. Pass only one of `--match` or `--repo`. `--wake` must name a declared
+role whose config sets `pane = "<pane-id-or-label>"`. Gitmoot
 first resolves the value as an exact pane label and otherwise uses it as a
 literal pane id. The daemon calls `herdr agent prompt <pane> <text> --wait --timeout
 8000` and treats delivered (`result.type = "agent_prompted"`, or a post-delivery
@@ -10925,7 +11110,8 @@ literal pane id. The daemon calls `herdr agent prompt <pane> <text> --wait --tim
 "agent_prompt_stalled"`). Stalls increment the role's consecutive missed-wake
 counter and delivery resets it; transport failures leave it unchanged. Rules,
 pane resolution, counter writes, and wakes are best-effort; with no rule rows
-this path is off.
+this path is off. Task episodes due in one evaluator pass produce one
+oldest-first digest event; blocked roles retain one event per role.
 
 ## External-coordinator workflow groups
 
@@ -10974,6 +11160,10 @@ gitmoot workflow close fable/dashboard-redesign --reason "Shipped and verified."
 best-effort token totals. Its JSON summary also includes the acknowledgment
 timestamps `last_failure_at`, `last_human_note_at`, and
 `last_merged_receipt_at`. `workflow show` merges jobs and notes chronologically.
+By default it keeps the newest 100 entries and displays that window oldest to
+newest; pass `--limit 0` for the complete timeline or a larger `--limit N` for
+a wider window. When rows are omitted, text mode prints the shown and total
+counts plus that guidance to stderr, while JSON includes `"truncated": true`.
 The read-only web dashboard shows labels as Galaxy hubs and provides a Workflows
 index plus a mission-log detail at `/workflows/<label>`. Workflows are `active`
 while queued/running, `recent` when no work is live but activity occurred within
@@ -11065,6 +11255,8 @@ gitmoot task run task-001 --repo owner/repo --owner lead --base main
 gitmoot task list --repo owner/repo
 gitmoot task list --repo owner/repo --state implementing --json
 gitmoot task dismiss task-001 --reason "abandoned experiment"
+gitmoot task resume-work task-001 --reason "review requires another fix pass"
+gitmoot task resume-work task-001 --reason "withdraw pending merge" --override-pending-human-decision
 gitmoot task events task-001 --json
 ```
 
@@ -11081,15 +11273,33 @@ operator`. Success preserves the branch and worktree, releases the branch lock
 best-effort, and appends `task_dismissed_manual` to `task events`. Repeating the
 command is an exit-0 no-op with `changed:false` in JSON.
 
+`task resume-work` is the explicit coordinator-only path for taking an orphaned
+`reviewing` or `ready_to_merge` task back into development, or for withdrawing a
+task from `awaiting_human_merge`. It requires `--reason`, refuses while any
+matching job or worktree process is live, transitions only those three states to
+`implementing`, preserves the branch lock, and records
+`task_resume_work_manual`. Resuming `awaiting_human_merge` additionally requires
+`--override-pending-human-decision`, because Gitmoot cannot observe whether a
+human is about to merge. The command is never called by daemon advancement or an
+autonomous retry path.
+
+Repeated coordinator use can still hand-recreate an uncapped review/fix loop;
+this command does not solve that separate #1142 problem. Its distinct event
+makes such manual re-entry measurable so the automatic round-cap design can
+account for it deliberately.
+
 `task events <id>` prints the append-only task lifecycle trail. Automatic stale
 dismissals use `task_dismissed_auto`; opt-in never-started-plan retirement uses
 `task_dismissed_planned_ttl`; explicit recovery and retry use `task_recovered`
 and `task_recovered_job_retry`. A clean closed-unmerged PR records
 `pr_closed_unmerged` while moving `pr_open`, `reviewing`, or
 `changes_requested` to `blocked`. Once advancement/delegation handling has no
-live successor, a terminal top-level implement job without a PR records
-`task_blocked_terminal_no_pr` for implemented success or
-`task_blocked_job_failed` for another terminal outcome and blocks the task.
+live successor, an implemented top-level job with no attached PR first checks
+for an existing open PR on the task branch. A match restores the task to
+`pr_open` and records `task_terminal_pushed_to_open_pr`; otherwise the task is
+blocked with `task_blocked_terminal_no_pr`, whose reason names the recoverable
+branch and recorded head SHA when available. Other terminal outcomes remain
+`task_blocked_job_failed`.
 
 ### Recover A Dead Implement
 
@@ -11125,6 +11335,12 @@ task with a preserved branch and worktree first moves to `implementing`, then to
 worktree allocation, review continuation, and task-state advancement never
 resurrect a dismissed task implicitly. Retrying one of its jobs explicitly
 restores the task first and records `task_recovered_job_retry`.
+
+If an existing task worktree has fallen off the resolved base lineage, Gitmoot
+re-cuts it only when it is clean. When it also has uncommitted changes, `task
+run`/`agent implement` preserve the worktree, move the task to `blocked`, and
+record `stale_worktree_dirty_blocked`; manually salvage, commit, stash, or clean
+the changes before retrying.
 
 Two refusals guard `task recover` (and the `task run` / `agent implement`
 restart that points to it):
@@ -11175,7 +11391,7 @@ PR-comment-only).
 
 ```sh
 gitmoot job list --repo owner/repo   # add --json for machine-readable rows
-gitmoot job show <job-id>            # add --json for the full job + why-stuck detail
+gitmoot job show <job-id>            # add --json for the full job + operational detail
 gitmoot job watch <job-id>
 gitmoot job watch <job-id> --transcript [--log-path <path>] [--runtime codex|claude|kimi|kimi-cli|shell]
 gitmoot job transcript <job-id> --export md|jsonl [--output <path>] [--log-path <path>] [--runtime codex|claude|kimi|kimi-cli|shell]
@@ -11190,6 +11406,21 @@ gitmoot job kill <root-job-id>
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 ```
+
+Terminal background `ask` and `review` jobs that ran in a throwaway read-only
+worktree preserve a bounded `git status --short` plus `git diff HEAD` snapshot
+before Gitmoot removes that worktree. `job show` prints the captured diff and
+`job list` adds a compact `DIFF:` badge. Their JSON forms expose
+`read_only_worktree_diff`, `read_only_worktree_diff_truncated`, and
+`read_only_worktree_diff_error`; the same durable fields are present under
+`job show --json`'s `payload`. Capture is capped at 4 MiB, and an oversized
+snapshot ends with an explicit omitted-byte marker instead of being silently
+cut. Git subprocesses and the wait for each index-file copy share a 10-second
+context: on expiry Gitmoot kills the subprocess or stops waiting for the copy.
+The operating system still owns cancellation of an in-progress filesystem
+syscall, so this is a bounded-wait guarantee rather than a promise that kernel
+I/O itself is cancelled. Failures are recorded and never prevent worktree
+removal.
 
 ### Evidence-graded proof manifests
 
@@ -11322,16 +11553,19 @@ spawning a runtime** — a clock-in / clock-out pair (plus a one-shot recorder):
 ```sh
 # Clock in: create a RUNNING, externally-driven job (no dispatch); prints its id.
 gitmoot job open --agent <name> --repo owner/repo --type ask|review|implement \
-                 [--title "..."] [--task <id>] [--pr <n>] [--json]
+                 [--title "..."] [--task <id>] [--pr <n>] [--head-sha <sha>] \
+                 [--workflow <label>] [--json]
 
 # Clock out: apply the result and move the job to its terminal state.
 gitmoot job close <id> --decision approved|changes_requested|blocked|implemented|failed|skipped \
-                 [--summary "..."] [--pr <n>] [--branch <name>] [--json]
+                 [--summary "..."] [--pr <n>] [--head-sha <sha>] \
+                 [--branch <name>] [--json]
 
 # One-shot post-hoc: create an already-terminal job (open + close in one).
 gitmoot job record --agent <name> --repo owner/repo --type ask|review|implement \
                  --decision <decision> [--title "..."] [--summary "..."] \
-                 [--task <id>] [--pr <n>] [--branch <name>] [--json]
+                 [--task <id>] [--pr <n>] [--head-sha <sha>] \
+                 [--branch <name>] [--json]
 ```
 
 An `externally_driven` job is created directly in `running` (it never queues, so
@@ -11347,6 +11581,29 @@ stays `running` (reaper-exempt) until you `job close --decision failed` or `job
 cancel <id>` it. A session job is never engine-executed, so `job retry` **refuses**
 it (retrying would re-queue it for a real runtime with an empty payload) — recover
 one by opening a fresh session job instead. The agent and repo must exist.
+
+For an in-session PR review, clock in before reading the diff and bind the
+display row to its exact head and workflow journal:
+
+```sh
+gitmoot job open --agent <name> --repo owner/repo --type review \
+  --pr <n> --head-sha <sha> --workflow <label>
+gitmoot workflow note <label> "reviewed tests and error paths"
+# Post the verdict, then:
+gitmoot job close <id> --decision approved|changes_requested|blocked \
+  --summary "..."
+```
+
+For a running externally-driven review, `job list` and `job show` derive
+`review_status: in_progress|stalled` from the newest workflow note, falling back
+to the job's creation time; the signal becomes stale after 20 minutes.
+`head_sha` is also exposed in text and JSON. Every review status is explicitly
+`review_status_grade: reported` and
+`review_status_authority: non_authoritative` (text lists use `REVIEW (reported;
+non-authoritative): ...`). Workflow notes are caller assertions, not
+system-observed reviewer attribution. These fields are display-only: they never
+satisfy, block, or otherwise feed the merge gate, and this feature never writes
+`tasks.state`.
 
 **Make in-chat / "here" work show on the dashboard.** The one-step default is
 `gitmoot agent prompt <agent-or-template> --record`: it opens the session job *as
@@ -11378,6 +11635,37 @@ deferral usually needs a human (a dirty or wrong-head checkout), the row/`job
 show` also carries a `suggested_action` naming the concrete fix. `gitmoot doctor`
 proactively validates `gh auth` (with an actionable remediation hint) and the
 Claude runtime token so a bad credential is caught before a job stalls on it.
+
+For a terminal (`succeeded`, `failed`, `blocked`, or `cancelled`) job whose
+recorded worktree still has a locally observable process, `job list` reports
+`LIVE PROCESS: worktree still has an active process` and `job show` prints the
+same detail as `process_active: worktree still has an active process`; their
+JSON forms carry `process_active: true`. The badge is omitted when no live
+process is observed, when local process liveness is unavailable, or while the
+job is still non-terminal.
+
+For an `implement` job, `job show` and `job list --json` expose Gitmoot's own
+post-agent delivery verdict as `delivery_status`: `delivered` means the job's
+result decision was `implemented` and either a completion marker is paired
+with a persisted non-zero pull request, or the job has no advance events at
+all and already carries a persisted non-zero pull request; `pending` means
+delivery is in flight or scheduled for retry, and `blocked` means the latest
+delivery attempt blocked. A completed advancement alone (e.g. an implemented
+result that produced no PR, or a non-`implemented` decision) does NOT count as
+delivered — the field is omitted in that case, never a false `delivered`. The
+field is derived at read time
+from the existing `advance_*` job events and pull-request payload; it is omitted
+for non-implement jobs and legacy/unknown states. This field, not the agent's
+free-text result summary, is authoritative about commit/push/PR delivery because
+Gitmoot performs that step after the agent turn ends.
+
+For a `running` job dispatched through a PID-aware runtime runner, the payload
+records `runtime_pid` plus a process-start identity. `job list --json` and `job
+show --json` derive `runtime_process_active`: `true` means that exact process is
+alive, `false` means it is confirmably gone (including PID reuse), and an omitted
+field means unknown because no PID/identity was recorded or process inspection
+is unavailable. This is direct per-job ground truth and is separate from the
+terminal worktree-scanning `process_active` badge above.
 
 Operational blockers auto-retry (#532): a delivery failure classified as an
 operational blocker — `runtime_auth`, `runtime_quota`, `network_outage`
@@ -15402,6 +15690,32 @@ path matches; then run `git -C <registered-checkout> worktree remove --force
 <path>` followed by `git -C <registered-checkout> worktree prune`. Never remove
 a worktree owned by a blocked, queued, or running job.
 
+## Shared Tool Cache (isolated worktrees)
+
+An isolated-worktree job (a per-job worktree under `$GITMOOT_HOME/worktrees/...`)
+gets `UV_CACHE_DIR`, `PIP_CACHE_DIR`, `npm_config_cache`, `GOCACHE`, and
+`GOMODCACHE` pointed at one shared, host-level directory (default
+`$GITMOOT_HOME/cache/tools`) instead of each isolated job re-materializing its
+own copy of immutable, content-addressed package caches inside its worktree —
+which otherwise grows unbounded with fleet lifetime and is deleted only when
+the reaper removes the worktree (#1113). Enabled by default; set `[cache]
+enabled = false` to opt out, or `[cache] dir = "/absolute/path"` to relocate it
+(must be absolute). The shared directory is created on first use and is never
+swept by worktree teardown. Non-isolated jobs (the persistent registered
+checkout) are unaffected — they do not duplicate caches per job.
+
+Codex is always sandboxed, so this also widens its `--add-dir` writable-path
+allowlist to the shared cache directory; Claude/Kimi `produce` jobs pick up the
+same grant through their existing Landlock write-allowlist. Non-produce
+Claude/Kimi and `shell` runtime jobs already run unsandboxed, so only the env
+redirect applies to them.
+
+A codex job gets neither the grant nor the env when its sandbox mode cannot
+reach the shared directory: a read-only/`auto`/unrecognized autonomy policy
+(codex never emits `--add-dir` there), or a chat seat (codex grants it
+workspace-write, but without ever populating `--add-dir` either). Those jobs
+keep the pre-#1113 behavior — no redirect, no in-worktree cache reuse.
+
 ---
 
 # Source: skills/gitmoot/references/RESULT_CONTRACT.md
@@ -15424,6 +15738,15 @@ truthful, and tied to work that actually happened.
   }
 }
 ```
+
+## Display-only in-session review state
+
+An inline PR review can be recorded with `job open --type review --pr <n>
+--head-sha <sha> --workflow <label>`, progress notes, and `job close`. The
+resulting `review_status` is always graded `reported` and labeled
+`non_authoritative`: note authorship is a caller assertion, not system-observed
+reviewer identity. It is an operator visibility hint only and never enters the
+merge gate or changes `tasks.state`.
 
 ## Findings
 
@@ -15938,6 +16261,16 @@ work was available. Produce remains a leaf, so its delegations are stripped.
 
 ## Reporting Rules
 
+- An implement agent's `summary` describes only what the agent observed during
+  its own turn. It is **not authoritative** about whether Gitmoot committed,
+  pushed, or opened a PR: that delivery step runs after the agent turn ends. A
+  coordinator deciding whether work was delivered must check `delivery_status`
+  from `gitmoot job show` / `job list --json`, the `advance_*` job events, or a
+  non-zero `pull_request` instead of trusting the agent's prose on this question.
+  For a fix-pass job, `delivery_status` and the latest advancement marker take
+  precedence over a pull-request number inherited when the job was dispatched.
+  An omitted `delivery_status` means unknown or not applicable, not "not
+  delivered."
 - Do not claim tests were run unless they were actually run.
 - Do not claim files were changed unless they were actually changed.
 - Use `needs` for missing credentials, unclear scope, unavailable tools, failing

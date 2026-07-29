@@ -698,7 +698,7 @@ func startSingleRepoWorkerLoop(ctx context.Context, interval time.Duration, stor
 		// the supervisor boundary, outside the repository tick, matching the
 		// multi-repo fleet loop.
 		if err := drainFleetReplyWakeOutbox(ctx, store, worker, now); err != nil {
-			return err
+			writeLine(stdout, "reply wake outbox drain unhealthy: %v", err)
 		}
 		// The checkout lock now guards the TICK (maintenance + claim/dispatch),
 		// not whole job runs: dispatched jobs execute on their own goroutines

@@ -206,6 +206,15 @@ FROM jobs INDEXED BY idx_jobs_workflow_id
 WHERE workflow_id != '' AND workflow_id = ?
 ORDER BY created_at DESC, id DESC LIMIT ?`
 
+// ListDetailedJobsByWorkflowSQL is the job-list variant of the workflow query.
+// Unlike workflow show's intentionally scalar projection above, job list needs
+// the payload and externally_driven bit to derive display-only operational
+// fields. It remains label-bounded and index-backed.
+const ListDetailedJobsByWorkflowSQL = `SELECT ` + jobColumns + `
+FROM jobs INDEXED BY idx_jobs_workflow_id
+WHERE workflow_id != '' AND workflow_id = ?
+ORDER BY created_at DESC, id DESC LIMIT ?`
+
 // ListWorkflowGraphJobsSQL is the workflow dashboard's bounded payload
 // projection. Unlike the scalar CLI list above, the workflow forest needs each
 // labeled job's payload to render titles, dependency edges, runtime overrides,
@@ -807,6 +816,24 @@ func (s *Store) ListJobsByWorkflow(ctx context.Context, workflowID string, limit
 	}
 	// The descending query makes LIMIT select the newest rows; restore the
 	// chronological order callers expect from this workflow timeline API.
+	slices.Reverse(jobs)
+	return jobs, nil
+}
+
+// ListDetailedJobsByWorkflow returns full job rows for the workflow-filtered
+// `job list` surface. Keep ListJobsByWorkflow scalar for workflow show: payloads
+// may contain large prompts/results that its timeline renderer does not use.
+func (s *Store) ListDetailedJobsByWorkflow(ctx context.Context, workflowID string, limit int) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, ListDetailedJobsByWorkflowSQL, workflowID, workflowQueryLimit(limit))
+	if err != nil {
+		return nil, err
+	}
+	jobs, err := scanJobs(rows)
+	if err != nil {
+		return nil, err
+	}
+	// Match ListJobsByWorkflow's chronological return contract after limiting
+	// the descending query to the newest rows.
 	slices.Reverse(jobs)
 	return jobs, nil
 }
