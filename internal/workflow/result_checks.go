@@ -45,8 +45,8 @@ func toDBResultCheckFailures(failed []ResultCheck) []db.ResultCheckFailure {
 type ResultCheckMode string
 
 const (
-	// ResultChecksOff disables the audit (byte-identical pre-#526 behavior). It is
-	// also the meaning of the empty zero value.
+	// ResultChecksOff disables the audit. It is also the meaning of the empty
+	// zero value. Engine observations are persisted independently of this policy.
 	ResultChecksOff ResultCheckMode = "off"
 	// ResultChecksWarn records failures as a job event + job-detail field + feed-
 	// forward row without failing the job.
@@ -98,13 +98,16 @@ type ResultCheck struct {
 }
 
 // ResultCheckInput carries the minimal job context the deterministic checks need
-// beyond the parsed result: the job action and whether the job is a coordinator
-// finalize continuation (payload.DelegationFinalize). Keeping this a small value
-// type makes the check set trivially unit-testable without a store or a job row.
+// beyond the parsed result: the job action, whether the job is a coordinator
+// finalize continuation (payload.DelegationFinalize), and the engine's persisted
+// observation of an implement worktree when one was available. Keeping this a
+// small value type makes the check set trivially unit-testable without a store or
+// a job row.
 type ResultCheckInput struct {
-	Action     string
-	IsFinalize bool
-	Result     AgentResult
+	Action      string
+	IsFinalize  bool
+	Result      AgentResult
+	Observation *ResultObservation
 }
 
 // minActionableAnswerChars is the floor below which an ask/finalize answer is
@@ -117,9 +120,9 @@ const minActionableAnswerChars = 3
 // RunResultChecks evaluates every deterministic check that applies to the given
 // action/result and returns them all (passing and failing), each with its binary
 // verdict and — when failing — an explanation. It performs NO LLM call and reads
-// only fields that exist on AgentResult (see internal/workflow/result.go), so it
-// is pure, fast, and side-effect-free. Callers that only care about failures use
-// FailedResultChecks.
+// only its value input (the claim plus an engine-owned worktree observation), so
+// it is pure, fast, and side-effect-free. Callers that only care about failures
+// use FailedResultChecks.
 func RunResultChecks(in ResultCheckInput) []ResultCheck {
 	action := strings.ToLower(strings.TrimSpace(in.Action))
 	r := in.Result
@@ -154,6 +157,23 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 				Pass:        madePass,
 				Explanation: explain(madePass, "the implement job reports decision \"implemented\" but changes_made[] is empty"),
 			})
+			if in.Observation != nil && in.Observation.Error == "" {
+				invalidBindings := invalidCapturedBindingClaims(in.Observation.Changes, in.Observation.TouchedFiles)
+				consistent := !in.Observation.Divergent && len(invalidBindings) == 0
+				checks = append(checks, ResultCheck{
+					ID:       "implement-changes-observed",
+					Action:   "implement",
+					Question: "Do the reported changes_made files match the files observed in the worktree diff?",
+					Pass:     consistent,
+					Explanation: explain(consistent, fmt.Sprintf(
+						"changes_made and the worktree diff diverge (claimed-only: %s; unclaimed diff files: %s; claims without a file path: %s; invalid captured path bindings: %s)",
+						displayPaths(in.Observation.ClaimedOnlyFiles),
+						displayPaths(in.Observation.UnclaimedFiles),
+						displayPaths(in.Observation.UnboundClaims),
+						displayPaths(invalidBindings),
+					)),
+				})
+			}
 			testsPass := len(r.TestsRun) > 0
 			checks = append(checks, ResultCheck{
 				ID:          "implement-tests-listed",
@@ -211,6 +231,13 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 	}
 
 	return checks
+}
+
+func displayPaths(paths []string) string {
+	if len(paths) == 0 {
+		return "none"
+	}
+	return strings.Join(paths, ", ")
 }
 
 // FailedResultChecks runs the audit and returns only the checks that failed, in

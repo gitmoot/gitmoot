@@ -393,6 +393,12 @@ type JobPayload struct {
 	CheckRetries     int          `json:"check_retries,omitempty"`
 	RawOutputs       []string     `json:"raw_outputs,omitempty"`
 	Result           *AgentResult `json:"result,omitempty"`
+	// ResultObservation records the engine-owned git diff of an implement
+	// worktree at result-persistence time and its bidirectional comparison with
+	// changes_made. It is recorded independently of result-check mode; the
+	// existing off/warn/block policy decides whether divergence is merely stored,
+	// surfaced, or blocks the terminal gate.
+	ResultObservation *ResultObservation `json:"result_observation,omitempty"`
 	// FailureDiagnostics captures process-level crash context when the runtime
 	// session ended WITHOUT producing a gitmoot_result envelope (#806): a phase
 	// marker (launched | streaming | result-parse), the exit code or signal, a
@@ -1267,15 +1273,17 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		result.HumanQuestions = nil
 	}
 	payload.Result = &result
-	// #526 deterministic binary-checklist audit of the parsed result. Off (the
-	// zero value and "off") => no checks run, no event, no payload field, no feed-
-	// forward row, so the terminal path is byte-identical. warn => failures are
-	// recorded (job event + job-detail field + feed-forward row) but the job still
-	// finishes on its own decision. block => a failure additionally routes the job
-	// down the same terminal path a malformed result takes (m.fail), reusing the
-	// contract-violation machinery. The audit itself is pure and LLM-free.
+	if strings.EqualFold(strings.TrimSpace(job.Type), "implement") {
+		payload.ResultObservation = observeResultChanges(ctx, payload.WorktreePath, result)
+	}
+	// #526 deterministic binary-checklist audit of the parsed result. The worktree
+	// observation above is recorded in every mode. Off (the zero value and "off")
+	// runs no checks and emits no failure; warn records failures (job event + job-
+	// detail field + feed-forward row) but preserves the result's decision; block
+	// additionally routes a failure down the same terminal path a malformed result
+	// takes (m.fail). The audit itself is pure and LLM-free.
 	if mode := normalizeResultCheckMode(m.resultCheckMode); mode != ResultChecksOff {
-		if failed := FailedResultChecks(ResultCheckInput{Action: job.Type, IsFinalize: payload.DelegationFinalize, Result: result}); len(failed) > 0 {
+		if failed := FailedResultChecks(ResultCheckInput{Action: job.Type, IsFinalize: payload.DelegationFinalize, Result: result, Observation: payload.ResultObservation}); len(failed) > 0 {
 			payload.ResultChecks = failed
 			summary := SummarizeResultChecks(failed)
 			// Surface in `gitmoot job events`/`job show`. Best-effort in block mode
