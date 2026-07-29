@@ -17,9 +17,178 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
+
+func TestBlockedEventProducesDurableWakeOutboxObligation(t *testing.T) {
+	store, deliverySink, wake, _ := replyWakeTestHarness(
+		t,
+		[]replyWakeTestRole{{name: "owner", pane: "w1:p1"}},
+	)
+	ctx := context.Background()
+	if err := store.AddEventRule(ctx, db.EventRule{
+		ID: "blocked-owner", OnKind: "blocked", WakeRole: "owner", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	event := events.NewEvent(
+		events.EventJobBlocked,
+		"job-blocked",
+		"root-blocked",
+		"owner/repo",
+		"blocked",
+		"needs operator input",
+		time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
+		workflow.RedactCommentText,
+	)
+	deliverySink.sink.Emit(ctx, event)
+
+	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("blocked durable obligations = %d, want 1: %+v", len(pending), pending)
+	}
+	if pending[0].SourceKind != "blocked" ||
+		pending[0].TargetRole != "owner" ||
+		pending[0].CoalesceKey != "blocked:owner" {
+		t.Fatalf("blocked durable obligation = %+v", pending[0])
+	}
+
+	drainReplyWakeAfterAllRowsAreDue(t, store, deliverySink)
+	if wake.promptCalls != 1 || !strings.Contains(wake.prompt, "gitmoot blocked event") {
+		t.Fatalf("blocked wake = calls=%d prompt=%q, want one blocked wake", wake.promptCalls, wake.prompt)
+	}
+	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
+	if err != nil || len(delivered) != 1 {
+		t.Fatalf("delivered blocked obligations = %+v, err=%v", delivered, err)
+	}
+}
+
+func TestWakeOutboxCoalescesPerKindAndRole(t *testing.T) {
+	store, deliverySink, wake, _ := replyWakeTestHarness(
+		t,
+		[]replyWakeTestRole{{name: "owner", pane: "w1:p1"}},
+	)
+	ctx := context.Background()
+	if err := store.AddEventRule(ctx, db.EventRule{
+		ID: "blocked-owner", OnKind: "blocked", WakeRole: "owner", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	for index := 0; index < 2; index++ {
+		event := events.NewEvent(
+			events.EventJobBlocked,
+			fmt.Sprintf("job-blocked-%d", index),
+			fmt.Sprintf("root-blocked-%d", index),
+			"owner/repo",
+			"blocked",
+			"needs operator input",
+			base.Add(time.Duration(index)*time.Second),
+			workflow.RedactCommentText,
+		)
+		deliverySink.sink.Emit(ctx, event)
+	}
+	if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID:      "release/coalesce-kinds",
+		Author:          "worker",
+		Body:            "reply for owner",
+		AddressedTarget: "owner",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 3 {
+		t.Fatalf("durable obligations = %d, want 3: %+v", len(pending), pending)
+	}
+	keysByKind := map[string]map[string]bool{}
+	for _, entry := range pending {
+		if keysByKind[entry.SourceKind] == nil {
+			keysByKind[entry.SourceKind] = map[string]bool{}
+		}
+		keysByKind[entry.SourceKind][entry.CoalesceKey] = true
+	}
+	if len(keysByKind["blocked"]) != 1 || !keysByKind["blocked"]["blocked:owner"] {
+		t.Fatalf("blocked coalesce keys = %v, want one blocked:owner key", keysByKind["blocked"])
+	}
+	if len(keysByKind[db.WakeOutboxSourceWorkflowNote]) != 1 ||
+		!keysByKind[db.WakeOutboxSourceWorkflowNote]["reply:owner"] {
+		t.Fatalf("reply coalesce keys = %v, want one reply:owner key", keysByKind[db.WakeOutboxSourceWorkflowNote])
+	}
+	if keysByKind["blocked"]["reply:owner"] {
+		t.Fatalf("blocked and reply obligations collided: %+v", pending)
+	}
+
+	drainReplyWakeAfterAllRowsAreDue(t, store, deliverySink)
+	if wake.promptCalls != 2 {
+		t.Fatalf("wake calls = %d, want one blocked and one reply wake: %q", wake.promptCalls, wake.prompts)
+	}
+	var blockedWakes, replyWakes int
+	for _, prompt := range wake.prompts {
+		switch {
+		case strings.Contains(prompt, "gitmoot blocked event"):
+			blockedWakes++
+		case strings.Contains(prompt, "gitmoot reply event"):
+			replyWakes++
+		}
+	}
+	if blockedWakes != 1 || replyWakes != 1 {
+		t.Fatalf("wake kinds = blocked:%d reply:%d, prompts=%q", blockedWakes, replyWakes, wake.prompts)
+	}
+}
+
+func TestWakeOutboxTickHealthIncludesBlockedAndEscalation(t *testing.T) {
+	store := daemonWorkerStore(t)
+	ctx := context.Background()
+	for _, rule := range []db.EventRule{
+		{ID: "blocked-owner", OnKind: "blocked", WakeRole: "owner", Enabled: true},
+		{ID: "escalation-owner", OnKind: "escalation", WakeRole: "owner", Enabled: true},
+	} {
+		if err := store.AddEventRule(ctx, rule); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sink := &eventRuleSink{store: store}
+	now := time.Now().UTC()
+	blocked := events.NewEvent(
+		events.EventJobBlocked, "job-blocked", "root-blocked", "owner/repo",
+		"blocked", "blocked", now, workflow.RedactCommentText,
+	)
+	escalation := events.NewEvent(
+		events.EventJobNeedsAttention, "job-escalated", "root-escalated", "owner/repo",
+		"awaiting_human", "answer required", now, workflow.RedactCommentText,
+	)
+	escalation.Cause = "escalation"
+	sink.Emit(ctx, blocked)
+	sink.Emit(ctx, escalation)
+
+	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("blocked/escalation obligations = %d, want 2: %+v", len(pending), pending)
+	}
+	kinds := map[string]bool{}
+	for _, entry := range pending {
+		kinds[entry.SourceKind] = true
+	}
+	if !kinds["blocked"] || !kinds["escalation"] {
+		t.Fatalf("pending source kinds = %v, want blocked and escalation", kinds)
+	}
+	if err := wakeOutboxObligationHealth(ctx, store, now.Add(-replyWakeAttemptedUnknownAfter)); err == nil ||
+		!strings.Contains(err.Error(), "pending=2") {
+		t.Fatalf("tick health = %v, want two outstanding obligations", err)
+	}
+}
 
 func TestReplyWakeOutboxDrainFailureDoesNotAbortRepoWork(t *testing.T) {
 	store := daemonWorkerStore(t)

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -60,9 +61,6 @@ func drainReplyWakeOutbox(ctx context.Context, store *db.Store, now time.Time, r
 
 	groups := make(map[string][]db.WakeOutboxObligation)
 	for _, entry := range obligations.Pending {
-		if !strings.HasPrefix(entry.CoalesceKey, db.WakeOutboxReplyCoalescePrefix) {
-			continue
-		}
 		key := strings.ToLower(strings.TrimSpace(entry.TargetRole)) + "\x00" + entry.CoalesceKey
 		groups[key] = append(groups[key], entry)
 	}
@@ -102,7 +100,10 @@ func drainReplyWakeOutbox(ctx context.Context, store *db.Store, now time.Time, r
 			}
 
 			batch := items[start:end]
-			event := replyWakeEvent(batch, now)
+			event, err := wakeOutboxEvent(batch, now)
+			if err != nil {
+				return err
+			}
 			// Authorization is deliberately batch-scoped and pre-claim. A rule
 			// removed while an earlier synchronous batch is delivering cannot
 			// authorize this later claim, and no post-claim rule read can strand
@@ -114,7 +115,8 @@ func drainReplyWakeOutbox(ctx context.Context, store *db.Store, now time.Time, r
 			if delivery.sink == nil {
 				break
 			}
-			if !hasMatchingReplyRule(delivery.rules, event) {
+			matchingRules := matchingWakeRules(delivery.rules, event)
+			if len(matchingRules) == 0 {
 				// Pending remains an explicit never-attempted state. A rule added
 				// later can deliver the same batch; nothing is silently erased.
 				break
@@ -129,8 +131,8 @@ func drainReplyWakeOutbox(ctx context.Context, store *db.Store, now time.Time, r
 			}
 			if claimed {
 				event.WakeOutboxIDs = ids
-				if err := emitReplyWakeOutboxEvent(ctx, delivery.sink, event, delivery.rules); err != nil {
-					return fmt.Errorf("emit claimed reply wake: %w", err)
+				if err := emitReplyWakeOutboxEvent(ctx, delivery.sink, event, matchingRules); err != nil {
+					return fmt.Errorf("emit claimed %s wake: %w", event.WakeKind, err)
 				}
 			}
 			start = end
@@ -167,37 +169,62 @@ func emitReplyWakeOutboxEvent(ctx context.Context, sink events.Sink, event event
 	return errors.New("wake outbox sink does not support synchronous delivery")
 }
 
-func replyWakeEvent(batch []db.WakeOutboxObligation, now time.Time) events.Event {
+func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Event, error) {
+	if len(batch) == 0 {
+		return events.Event{}, errors.New("wake outbox batch is empty")
+	}
 	oldest := batch[0]
 	role := strings.ToLower(strings.TrimSpace(oldest.TargetRole))
-	detail := fmt.Sprintf("%d new items, oldest id %s", len(batch), oldest.SourceID)
-	event := events.NewEvent(
-		events.EventOrgReply,
-		"org-reply:"+role,
-		oldest.SourceKind+":"+oldest.SourceID,
-		"",
-		db.WakeOutboxStateAttempted,
-		detail,
-		now,
-		workflow.RedactCommentText,
-	)
-	event.Cause = "addressed_note"
+	var event events.Event
+	var wakeKind string
+	switch oldest.SourceKind {
+	case db.WakeOutboxSourceWorkflowNote, db.WakeOutboxSourceChatMessage:
+		wakeKind = db.WakeOutboxKindReply
+		detail := fmt.Sprintf("%d new items, oldest id %s", len(batch), oldest.SourceID)
+		event = events.NewEvent(
+			events.EventOrgReply,
+			"org-reply:"+role,
+			oldest.SourceKind+":"+oldest.SourceID,
+			"",
+			db.WakeOutboxStateAttempted,
+			detail,
+			now,
+			workflow.RedactCommentText,
+		)
+		event.Cause = "addressed_note"
+	case db.WakeOutboxSourceBlocked:
+		wakeKind = db.WakeOutboxKindBlocked
+		if err := json.Unmarshal([]byte(oldest.SourceID), &event); err != nil {
+			return events.Event{}, fmt.Errorf("decode blocked wake outbox event for row %d: %w", oldest.ID, err)
+		}
+	case db.WakeOutboxSourceEscalation:
+		wakeKind = db.WakeOutboxKindEscalation
+		if err := json.Unmarshal([]byte(oldest.SourceID), &event); err != nil {
+			return events.Event{}, fmt.Errorf("decode escalation wake outbox event for row %d: %w", oldest.ID, err)
+		}
+	default:
+		return events.Event{}, fmt.Errorf(
+			"wake outbox row %d has unsupported source kind %q",
+			oldest.ID, oldest.SourceKind,
+		)
+	}
+	event.WakeKind = wakeKind
 	event.WakeTargetRole = role
-	return event
+	return event, nil
 }
 
 // Deliberately scope-blind pending a later durable-outbox slice: among enabled,
-// filter-matching reply rules, WakeRole == WakeTargetRole authorizes the claim.
-// An observer-scoped rule can therefore claim for its own addressed role, but
-// not for a different target.
-func hasMatchingReplyRule(rules []db.EventRule, event events.Event) bool {
+// filter-matching rules for the event's own kind, WakeRole == WakeTargetRole
+// authorizes the claim. An observer-scoped rule can therefore claim for its own
+// addressed role, but not for a different target.
+func matchingWakeRules(rules []db.EventRule, event events.Event) []db.EventRule {
 	for _, rule := range rules {
 		if rule.Enabled &&
-			strings.EqualFold(strings.TrimSpace(rule.OnKind), "reply") &&
+			strings.EqualFold(strings.TrimSpace(rule.OnKind), strings.TrimSpace(event.WakeKind)) &&
 			strings.EqualFold(strings.TrimSpace(rule.WakeRole), strings.TrimSpace(event.WakeTargetRole)) &&
 			eventRuleMatches(rule.MatchFilter, event) {
-			return true
+			return []db.EventRule{rule}
 		}
 	}
-	return false
+	return nil
 }

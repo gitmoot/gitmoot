@@ -26,9 +26,16 @@ const (
 const (
 	WakeOutboxDeliveryUnknownEventKind = "wake_delivery_unknown"
 
-	WakeOutboxSourceWorkflowNote  = "workflow_note"
-	WakeOutboxSourceChatMessage   = "chat_message"
-	WakeOutboxReplyCoalescePrefix = "reply:"
+	WakeOutboxKindReply      = "reply"
+	WakeOutboxKindBlocked    = "blocked"
+	WakeOutboxKindEscalation = "escalation"
+
+	WakeOutboxSourceWorkflowNote = "workflow_note"
+	WakeOutboxSourceChatMessage  = "chat_message"
+	WakeOutboxSourceBlocked      = WakeOutboxKindBlocked
+	WakeOutboxSourceEscalation   = WakeOutboxKindEscalation
+
+	WakeOutboxReplyCoalescePrefix = WakeOutboxKindReply + ":"
 )
 
 type wakeOutboxStateInterpretation uint8
@@ -101,7 +108,8 @@ func (p WakeOutboxObligationProjection) Len() int {
 
 func insertWorkflowNoteWakeOutboxTx(ctx context.Context, tx *sql.Tx, noteID int64, targetRole string) error {
 	if err := insertWakeOutboxTx(
-		ctx, tx, WakeOutboxSourceWorkflowNote, strconv.FormatInt(noteID, 10), targetRole,
+		ctx, tx, WakeOutboxSourceWorkflowNote, strconv.FormatInt(noteID, 10),
+		WakeOutboxKindReply, targetRole,
 	); err != nil {
 		return fmt.Errorf("insert workflow note wake outbox: %w", err)
 	}
@@ -119,14 +127,46 @@ func insertChatMessageWakeOutboxTx(ctx context.Context, tx *sql.Tx, messageID st
 			continue
 		}
 		seen[role] = struct{}{}
-		if err := insertWakeOutboxTx(ctx, tx, WakeOutboxSourceChatMessage, messageID, role); err != nil {
+		if err := insertWakeOutboxTx(
+			ctx, tx, WakeOutboxSourceChatMessage, messageID, WakeOutboxKindReply, role,
+		); err != nil {
 			return fmt.Errorf("insert chat message wake outbox: %w", err)
 		}
 	}
 	return nil
 }
 
-func insertWakeOutboxTx(ctx context.Context, tx *sql.Tx, sourceKind, sourceID, targetRole string) error {
+// InsertWakeOutbox persists one event as a durable obligation for each target
+// role. All rows share the event-kind coalescing namespace.
+func (s *Store) InsertWakeOutbox(
+	ctx context.Context,
+	sourceKind, sourceID, wakeKind string,
+	targetRoles []string,
+) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	seen := make(map[string]struct{}, len(targetRoles))
+	for _, targetRole := range targetRoles {
+		role := strings.ToLower(strings.TrimSpace(targetRole))
+		if role == "" {
+			continue
+		}
+		if _, exists := seen[role]; exists {
+			continue
+		}
+		seen[role] = struct{}{}
+		if err := insertWakeOutboxTx(ctx, tx, sourceKind, sourceID, wakeKind, role); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func insertWakeOutboxTx(ctx context.Context, tx *sql.Tx, sourceKind, sourceID, wakeKind, targetRole string) error {
 	sourceKind = strings.TrimSpace(sourceKind)
 	if sourceKind == "" {
 		return errors.New("wake outbox source kind is required")
@@ -139,17 +179,31 @@ func insertWakeOutboxTx(ctx context.Context, tx *sql.Tx, sourceKind, sourceID, t
 	if role == "" {
 		return errors.New("wake outbox target role is required")
 	}
-	_, err := tx.ExecContext(ctx, `
+	coalesceKey, err := wakeOutboxCoalesceKey(wakeKind, role)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
 INSERT INTO wake_outbox(source_kind, source_id, target_role, coalesce_key)
 VALUES (?, ?, ?, ?)`,
 		sourceKind,
 		sourceID,
 		role,
-		WakeOutboxReplyCoalescePrefix+role)
+		coalesceKey)
 	if err != nil {
 		return err
 	}
 	return nil
+}
+
+func wakeOutboxCoalesceKey(wakeKind, role string) (string, error) {
+	kind := strings.ToLower(strings.TrimSpace(wakeKind))
+	switch kind {
+	case WakeOutboxKindReply, WakeOutboxKindBlocked, WakeOutboxKindEscalation:
+	default:
+		return "", fmt.Errorf("unsupported wake outbox kind %q", wakeKind)
+	}
+	return kind + ":" + strings.ToLower(strings.TrimSpace(role)), nil
 }
 
 // ListWakeOutbox returns durable delivery rows in insertion order. An empty

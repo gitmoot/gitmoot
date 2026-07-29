@@ -21,7 +21,7 @@ type wakeTargetRoleProducer struct {
 }
 
 var wakeTargetRoleProducers = []wakeTargetRoleProducer{
-	{File: "internal/cli/reply_wake_outbox.go", Function: "replyWakeEvent", Kind: "reply"},
+	{File: "internal/cli/reply_wake_outbox.go", Function: "wakeOutboxEvent", Kind: "reply"},
 }
 
 func eventObserverDoctorCheck(paths config.Paths) (doctor.Check, bool) {

@@ -97,9 +97,9 @@ func TestClassifyEventRuleKinds(t *testing.T) {
 	}
 }
 
-func TestWakeTargetRoleHasExactlyOneProductionWriteInReplyWakeEvent(t *testing.T) {
+func TestWakeTargetRoleHasExactlyOneProductionWriteInWakeOutboxEvent(t *testing.T) {
 	writes := productionWakeTargetRoleWrites(t)
-	if got, want := fmt.Sprint(writes), "[internal/cli/reply_wake_outbox.go:replyWakeEvent]"; got != want {
+	if got, want := fmt.Sprint(writes), "[internal/cli/reply_wake_outbox.go:wakeOutboxEvent]"; got != want {
 		t.Fatalf("production WakeTargetRole writes = %s, want %s", got, want)
 	}
 	registryWrites := make([]wakeTargetRoleWrite, 0, len(wakeTargetRoleProducers))
@@ -117,9 +117,12 @@ func TestWakeTargetRoleHasExactlyOneProductionWriteInReplyWakeEvent(t *testing.T
 	if got, want := fmt.Sprint(registryWrites), fmt.Sprint(writes); got != want {
 		t.Fatalf("WakeTargetRole producer registry = %s, production writes = %s", got, want)
 	}
-	event := replyWakeEvent([]db.WakeOutboxObligation{{
+	event, err := wakeOutboxEvent([]db.WakeOutboxObligation{{
 		SourceKind: "workflow_note", SourceID: "note-1", TargetRole: "owner",
 	}}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if event.Type != events.EventOrgReply || strings.TrimSpace(event.WakeTargetRole) != "owner" {
 		t.Fatalf("reply wake event = {Type:%q WakeTargetRole:%q}, want org.reply addressed to owner", event.Type, event.WakeTargetRole)
 	}
@@ -285,9 +288,12 @@ pane="w1:p2"
 		{ID: "target", OnKind: "reply", WakeRole: "owner", Scope: db.EventRuleScopeAddressed, Enabled: true},
 		{ID: "target-duplicate", OnKind: "reply", WakeRole: "owner", Scope: db.EventRuleScopeAddressed, Enabled: true},
 	}
-	event := replyWakeEvent([]db.WakeOutboxObligation{{
+	event, err := wakeOutboxEvent([]db.WakeOutboxObligation{{
 		SourceKind: "workflow_note", SourceID: "note-1", TargetRole: "owner",
 	}}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := sink.evaluateRules(context.Background(), event, rules); err != nil {
 		t.Fatal(err)
 	}

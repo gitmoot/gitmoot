@@ -1349,21 +1349,25 @@ gitmoot org events rule rm --home /alternate/home <rule-id>
 `[orchestrate].blocked_role_wake_after`; it re-nudges at most once per that
 interval while the dialog remains pending. The pending signal takes precedence
 over the pane's last `idle` or `working` activity status.
-`reply` matches durable batches of workflow notes and `kind=chat` messages
-addressed to the same role as `--wake`; non-triggering chat back-links such as
-`job_result` are excluded. The daemon coalesces a rolling five-second window
-into one prompt carrying `N new items, oldest id X`; separate roles and later
-windows stay separate. A later tick flushes the quiet tail without requiring
-another message.
+`reply`, `blocked`, and `escalation` wakes use the durable wake outbox.
+`reply` matches workflow notes and `kind=chat` messages addressed to the same
+role as `--wake`; non-triggering chat back-links such as `job_result` are
+excluded. Reply rows commit atomically with their source note or chat message.
+Blocked and escalation rows are persisted synchronously by the event sink after
+the source transition; an insert failure is logged but cannot roll back the
+emitting job. The daemon coalesces a rolling five-second window per event kind
+and role. Reply prompts carry `N new items, oldest id X`; blocked and escalation
+events retain their redacted event detail. Different event kinds never share a
+coalescing key, and a later tick flushes a quiet tail without another event.
 Rules default to `--scope addressed`: when an event names a target role, only
 the matching addressed rule receives it. During rule evaluation,
 `--scope observer` exempts a rule from that addressee gate.
 Events without a target role keep matching both scopes exactly as before.
-For `reply`, durable-outbox claim authorization is scope-blind: among enabled,
-filter-matching reply rules, wake-role equality with the addressed target is the
-only routing condition. An observer-scoped reply rule is therefore delivered
-when its wake role equals the target; when it differs and no other target-role
-rule authorizes the batch, the batch remains pending.
+Durable-outbox claim authorization is scope-blind: among enabled,
+filter-matching rules for the event's own kind, wake-role equality with the
+addressed target is the only routing condition. An observer-scoped rule is
+therefore delivered when its wake role equals the target; when it differs and
+no other target-role rule authorizes the batch, the batch remains pending.
 `set-scope` changes an existing rule between `addressed` and `observer`.
 Upgrades preserve the existing global view by promoting non-reply rules with an
 empty match filter to `observer`; reply rules remain `addressed` because reply
@@ -1371,7 +1375,8 @@ already carries a target role. `gitmoot doctor` warns when an event kind with a
 production target-role writer has no enabled observer rule, including when the
 rule set is empty.
 Every outbox row retains a queryable `pending`, `attempted`, `delivered`,
-`stalled`, or `failed` state, so never-attempted is not confused with success.
+`stalled`, `failed`, or `delivery_unknown` state, so never-attempted is not
+confused with success and outstanding rows contribute to daemon tick health.
 `--match` is a case-insensitive substring matched independently against the
 event repo and job id; omit it to match every event of that kind. `--repo` is a
 discoverable alias for the same substring filter, useful for repo-to-role
@@ -1382,10 +1387,11 @@ literal pane id. The daemon calls `herdr agent prompt <pane> <text> --wait --tim
 8000` and treats delivered (`result.type = "agent_prompted"`, or a post-delivery
 `error.code = "timeout"`) apart from stalled (`error.code =
 "agent_prompt_stalled"`). Stalls increment the role's consecutive missed-wake
-counter and delivery resets it; transport failures leave it unchanged. Rules,
-pane resolution, counter writes, and wakes are best-effort; with no rule rows
-this path is off. Task episodes due in one evaluator pass produce one
-oldest-first digest event; blocked roles retain one event per role.
+counter and delivery resets it; transport failures leave it unchanged.
+`attention`, `guard`, `job-terminal`, `recycle-overdue`, and
+`pane_input_pending` wakes remain best-effort. With no rule rows this path is
+off. Task episodes due in one evaluator pass produce one oldest-first digest
+event; blocked roles retain one event per role.
 
 ## External-coordinator workflow groups
 
