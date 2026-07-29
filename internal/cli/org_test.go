@@ -1688,6 +1688,56 @@ func TestOrgEventRuleAddListRemoveAndValidation(t *testing.T) {
 	}
 }
 
+func TestOrgEventRuleSetScopeRoundTrip(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := runOrg([]string{"events", "rule", "add", "--home", home, "--on", "blocked", "--wake", "owner"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	id := strings.TrimSpace(strings.TrimPrefix(stdout.String(), "added "))
+	stdout.Reset()
+	stderr.Reset()
+	if code := runOrg([]string{"events", "rule", "set-scope", "--home", home, id, "observer"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("set-scope observer code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	if want := "updated " + id + " scope=observer\n"; stdout.String() != want {
+		t.Fatalf("set-scope output=%q, want %q", stdout.String(), want)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	rules, err := store.ListEventRules(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rules) != 1 || rules[0].Scope != db.EventRuleScopeObserver {
+		t.Fatalf("rules = %+v, want observer scope", rules)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := runOrg([]string{"events", "rule", "set-scope", "--home", home, id, "addressed"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("set-scope addressed code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	rules, err = store.ListEventRules(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rules) != 1 || rules[0].Scope != db.EventRuleScopeAddressed {
+		t.Fatalf("rules = %+v, want addressed scope", rules)
+	}
+}
+
 func TestOrgEventRuleRepoAliasUsesMatchFilter(t *testing.T) {
 	home, paths := setupOrgHome(t)
 	add := func(flagName string) string {

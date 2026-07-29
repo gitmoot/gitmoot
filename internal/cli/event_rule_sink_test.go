@@ -102,6 +102,21 @@ func TestWakeTargetRoleHasExactlyOneProductionWriteInReplyWakeEvent(t *testing.T
 	if got, want := fmt.Sprint(writes), "[internal/cli/reply_wake_outbox.go:replyWakeEvent]"; got != want {
 		t.Fatalf("production WakeTargetRole writes = %s, want %s", got, want)
 	}
+	registryWrites := make([]wakeTargetRoleWrite, 0, len(wakeTargetRoleProducers))
+	for _, producer := range wakeTargetRoleProducers {
+		registryWrites = append(registryWrites, wakeTargetRoleWrite{
+			file: producer.File, function: producer.Function,
+		})
+	}
+	sort.Slice(registryWrites, func(i, j int) bool {
+		if registryWrites[i].file != registryWrites[j].file {
+			return registryWrites[i].file < registryWrites[j].file
+		}
+		return registryWrites[i].function < registryWrites[j].function
+	})
+	if got, want := fmt.Sprint(registryWrites), fmt.Sprint(writes); got != want {
+		t.Fatalf("WakeTargetRole producer registry = %s, production writes = %s", got, want)
+	}
 	event := replyWakeEvent([]db.WakeOutboxObligation{{
 		SourceKind: "workflow_note", SourceID: "note-1", TargetRole: "owner",
 	}}, time.Now())

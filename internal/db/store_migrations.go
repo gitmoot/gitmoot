@@ -1848,4 +1848,16 @@ CREATE INDEX idx_wake_outbox_attempted
 ALTER TABLE event_rules ADD COLUMN scope TEXT NOT NULL DEFAULT 'addressed'
 	CHECK(scope IN ('addressed', 'observer'));
 	`,
+	// #1246 observer ordering guard. Existing non-reply catch-all rules are the
+	// global view of escalation/blocked and related undirected events. Promote
+	// them before any later producer can address those kinds. Reply remains
+	// addressed because it is already directed today, so changing it here would
+	// not be behavior-neutral. Append-only tail; migrations are positional.
+	`
+UPDATE event_rules
+SET scope = 'observer'
+WHERE scope = 'addressed'
+	AND on_kind <> 'reply'
+	AND TRIM(COALESCE(match_filter, '')) = '';
+	`,
 }

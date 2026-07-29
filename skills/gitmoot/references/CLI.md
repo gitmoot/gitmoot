@@ -1338,6 +1338,7 @@ gitmoot org events rule add --on pane_input_pending --wake maintainer
 gitmoot org events rule add --on reply --wake maintainer
 gitmoot org events rule add --on reply --wake operator --scope observer
 gitmoot org events rule list
+gitmoot org events rule set-scope --home /alternate/home <rule-id> observer
 gitmoot org events rule rm --home /alternate/home <rule-id>
 ```
 
@@ -1363,6 +1364,12 @@ filter-matching reply rules, wake-role equality with the addressed target is the
 only routing condition. An observer-scoped reply rule is therefore delivered
 when its wake role equals the target; when it differs and no other target-role
 rule authorizes the batch, the batch remains pending.
+`set-scope` changes an existing rule between `addressed` and `observer`.
+Upgrades preserve the existing global view by promoting non-reply rules with an
+empty match filter to `observer`; reply rules remain `addressed` because reply
+already carries a target role. `gitmoot doctor` warns when an event kind with a
+production target-role writer has no enabled observer rule, including when the
+rule set is empty.
 Every outbox row retains a queryable `pending`, `attempted`, `delivered`,
 `stalled`, or `failed` state, so never-attempted is not confused with success.
 `--match` is a case-insensitive substring matched independently against the
