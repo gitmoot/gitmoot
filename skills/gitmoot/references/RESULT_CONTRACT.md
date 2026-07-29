@@ -555,7 +555,10 @@ work was available. Produce remains a leaf, so its delegations are stripped.
   an engine-run implement job with an owned worktree records
   `payload.result_observation`: the files in `git diff HEAD` plus untracked
   files, each claim's path binding, claimed-only paths, and diff files no claim
-  mentions. A fully bound claim is graded `observed`, not `verified`: Gitmoot
+  mentions. A claim that names a repo-relative path is graded `observed` only
+  when that exact normalized path is in the diff. A unique-basename match may
+  assist an unqualified filename (one with no directory separator), but that
+  binding remains `reported`. Even an exact match is not `verified`: Gitmoot
   observed the path in the diff but did not prove the prose semantics.
 - Use `needs` for missing credentials, unclear scope, unavailable tools, failing
   external services, or required human decisions.

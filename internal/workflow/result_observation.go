@@ -28,6 +28,38 @@ type ChangeObservation struct {
 	Divergent    bool           `json:"divergent"`
 }
 
+// IsExactPathObserved reports whether an observed-grade entry binds every
+// normalized claimed path to that exact path in the worktree diff. It rejects
+// basename substitutions, including malformed observations persisted by older
+// engines, so downstream gates and proof projection do not manufacture
+// observed confidence from a different file with the same name.
+func (c ChangeObservation) IsExactPathObserved() bool {
+	if c.Grade != evidence.GradeObserved || c.Divergent ||
+		len(c.ClaimedFiles) == 0 || len(c.Observation) == 0 {
+		return false
+	}
+	claimed := sortedUniquePaths(c.ClaimedFiles)
+	observed := sortedUniquePaths(c.Observation)
+	if len(claimed) == 0 || len(claimed) != len(observed) {
+		return false
+	}
+	for i := range claimed {
+		if claimed[i] != observed[i] {
+			return false
+		}
+	}
+	fromClaim := claimFilePaths(c.Claim, observed)
+	if len(fromClaim) != len(claimed) {
+		return false
+	}
+	for i := range claimed {
+		if fromClaim[i] != claimed[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // ResultObservation is the persisted, read-only comparison between an
 // implement result's changes_made claims and the git diff at result-persistence
 // time. ClaimedOnlyFiles records over-claims; UnclaimedFiles records diff paths
@@ -138,6 +170,7 @@ func compareResultChanges(claims, touchedFiles []string) *ResultObservation {
 		claimedFiles := claimFilePaths(claim, touchedFiles)
 		observed := make([]string, 0, len(claimedFiles))
 		divergent := len(claimedFiles) == 0
+		exactPaths := len(claimedFiles) > 0
 		if divergent {
 			unboundClaims = append(unboundClaims, claim)
 		}
@@ -146,17 +179,21 @@ func compareResultChanges(claims, touchedFiles []string) *ResultObservation {
 			case hasPath(touched, claimed):
 				observed = append(observed, claimed)
 				covered[claimed] = struct{}{}
-			case len(byBase[path.Base(claimed)]) == 1:
-				match := byBase[path.Base(claimed)][0]
+			case !strings.Contains(claimed, "/") && len(byBase[claimed]) == 1:
+				// A unique basename can assist an unqualified filename claim, but
+				// it is not evidence that the agent named the observed repo path.
+				// Keep the binding reported rather than upgrading it to observed.
+				match := byBase[claimed][0]
 				observed = append(observed, match)
 				covered[match] = struct{}{}
+				exactPaths = false
 			default:
 				divergent = true
 				claimedOnly[claimed] = struct{}{}
 			}
 		}
 		grade := evidence.GradeReported
-		if !divergent {
+		if !divergent && exactPaths {
 			grade = evidence.GradeObserved
 		}
 		changes = append(changes, ChangeObservation{
@@ -277,4 +314,14 @@ func anyDivergentChange(changes []ChangeObservation) bool {
 		}
 	}
 	return false
+}
+
+func invalidObservedClaims(changes []ChangeObservation) []string {
+	var claims []string
+	for _, change := range changes {
+		if change.Grade == evidence.GradeObserved && !change.IsExactPathObserved() {
+			claims = append(claims, change.Claim)
+		}
+	}
+	return claims
 }

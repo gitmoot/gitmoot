@@ -36,6 +36,82 @@ func TestCompareResultChangesFlagsClaimedFileAbsentFromDiff(t *testing.T) {
 	}
 }
 
+func TestCompareResultChangesDoesNotRebindQualifiedClaimByBasename(t *testing.T) {
+	const claim = "updated docs/result_checks.go"
+	observation := compareResultChanges(
+		[]string{claim},
+		[]string{"internal/workflow/result_checks.go"},
+	)
+	if !observation.Divergent {
+		t.Fatal("qualified claim was silently rebound by basename instead of flagged")
+	}
+	if got, want := fmt.Sprint(observation.ClaimedOnlyFiles), "[docs/result_checks.go]"; got != want {
+		t.Fatalf("ClaimedOnlyFiles = %s, want %s", got, want)
+	}
+	if got, want := fmt.Sprint(observation.UnclaimedFiles), "[internal/workflow/result_checks.go]"; got != want {
+		t.Fatalf("UnclaimedFiles = %s, want %s", got, want)
+	}
+	change := observation.Changes[0]
+	if got := change.Grade; got != evidence.GradeReported {
+		t.Fatalf("qualified mismatched claim grade = %q, want reported", got)
+	}
+	if got := fmt.Sprint(change.Observation); got != "[]" {
+		t.Fatalf("qualified mismatched claim observation = %s, want []", got)
+	}
+	failed := failedIDs(ResultCheckInput{
+		Action: "implement",
+		Result: AgentResult{
+			Decision: "implemented", ChangesMade: []string{claim}, TestsRun: []string{"go test ./..."},
+		},
+		Observation: observation,
+	})
+	if _, ok := failed["implement-changes-observed"]; !ok {
+		t.Fatalf("qualified-path divergence was not readable by the result gate; failed=%v", keys(failed))
+	}
+}
+
+func TestCompareResultChangesKeepsUnqualifiedBasenameBindingReported(t *testing.T) {
+	const claim = "updated result_checks.go"
+	observation := compareResultChanges(
+		[]string{claim},
+		[]string{"internal/workflow/result_checks.go"},
+	)
+	if observation.Divergent {
+		t.Fatalf("unique unqualified filename should bind without divergence: %+v", observation)
+	}
+	change := observation.Changes[0]
+	if got := change.Grade; got != evidence.GradeReported {
+		t.Fatalf("basename-assisted claim grade = %q, want reported", got)
+	}
+	if got, want := fmt.Sprint(change.Observation), "[internal/workflow/result_checks.go]"; got != want {
+		t.Fatalf("basename-assisted observation = %s, want %s", got, want)
+	}
+}
+
+func TestRunResultChecksRejectsMismatchedObservedPathBinding(t *testing.T) {
+	const claim = "updated docs/result_checks.go"
+	observation := &ResultObservation{
+		Source:       ResultObservationSourceWorktreeDiff,
+		TouchedFiles: []string{"internal/workflow/result_checks.go"},
+		Changes: []ChangeObservation{{
+			Claim:        claim,
+			ClaimedFiles: []string{"docs/result_checks.go"},
+			Observation:  []string{"internal/workflow/result_checks.go"},
+			Grade:        evidence.GradeObserved,
+		}},
+	}
+	failed := failedIDs(ResultCheckInput{
+		Action: "implement",
+		Result: AgentResult{
+			Decision: "implemented", ChangesMade: []string{claim}, TestsRun: []string{"go test ./..."},
+		},
+		Observation: observation,
+	})
+	if _, ok := failed["implement-changes-observed"]; !ok {
+		t.Fatalf("mismatched observed binding was not rejected by the result gate; failed=%v", keys(failed))
+	}
+}
+
 func TestCompareResultChangesFlagsDiffFileNoClaimMentions(t *testing.T) {
 	observation := compareResultChanges(
 		[]string{"updated internal/workflow/claimed.go"},

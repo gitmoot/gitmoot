@@ -48,10 +48,13 @@ in `tests_run` unless they were actually run, and do not list files in
 in each `changes_made` entry. At result persistence, an engine-run implement job
 with an owned worktree records `payload.result_observation`: the files in
 `git diff HEAD` plus untracked files, each claim's path binding, claimed-only
-paths, and diff files no claim mentions. A fully bound claim is graded
-`observed`, not `verified`: Gitmoot observed the path in the diff but did not
-prove the prose semantics. Use `needs` for missing credentials, unclear scope,
-unavailable tools, failing external services, or required human decisions.
+paths, and diff files no claim mentions. A claim that names a repo-relative path
+is graded `observed` only when that exact normalized path is in the diff. A
+unique-basename match may assist an unqualified filename (one with no directory
+separator), but that binding remains `reported`. Even an exact match is not
+`verified`: Gitmoot observed the path in the diff but did not prove the prose
+semantics. Use `needs` for missing credentials, unclear scope, unavailable
+tools, failing external services, or required human decisions.
 Always redact secrets from summaries, findings, raw command output, and examples.
 
 ## Display-only in-session review state

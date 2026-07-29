@@ -324,10 +324,7 @@ func projectedChangeClaim(job db.Job, observation *workflow.ResultObservation, i
 		entry := observation.Changes[index]
 		if observation.Source == workflow.ResultObservationSourceWorktreeDiff &&
 			entry.Claim == change &&
-			entry.Grade == GradeObserved &&
-			!entry.Divergent &&
-			len(entry.ClaimedFiles) > 0 &&
-			len(entry.Observation) > 0 {
+			entry.IsExactPathObserved() {
 			return Claim{
 				Type: "change", Grade: GradeObserved, Source: observation.Source,
 				EvidenceRef: job.ID, AsOf: job.UpdatedAt,
