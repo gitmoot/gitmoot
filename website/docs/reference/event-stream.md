@@ -174,9 +174,15 @@ gitmoot org events rule add --on guard --match owner/repo --wake maintainer
 gitmoot org events rule add --on blocked --repo tendwire --wake maintainer
 gitmoot org events rule add --on pane_input_pending --wake maintainer
 gitmoot org events rule add --on reply --wake maintainer
+gitmoot org events rule add --on reply --wake operator --scope observer
 gitmoot org events rule list
 gitmoot org events rule rm <rule-id>
 ```
+
+Rules default to `--scope addressed`: when an event carries a target role, only
+the matching addressed rule receives it. `--scope observer` exempts a rule from
+that addressee gate and observes directed events regardless of target role.
+Events without a target role keep matching both scopes exactly as before.
 
 Kinds are `escalation`, `attention`, `guard`, `job-terminal`, `blocked`,
 `recycle-overdue`, `pane_input_pending`, and `reply`.

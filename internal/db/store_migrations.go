@@ -1841,4 +1841,11 @@ CREATE INDEX idx_wake_outbox_attempted
 	ON wake_outbox(attempted_at, id)
 	WHERE state = 'attempted';
 	`,
+	// #1246 event-rule routing scope. Existing rows are addressed rules: they
+	// retain the reply addressee restriction that already ships. Observer is an
+	// explicit opt-in exemption. Append-only tail; migrations are positional.
+	`
+ALTER TABLE event_rules ADD COLUMN scope TEXT NOT NULL DEFAULT 'addressed'
+	CHECK(scope IN ('addressed', 'observer'));
+	`,
 }

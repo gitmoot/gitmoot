@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gitmoot/gitmoot/internal/config"
@@ -87,6 +88,134 @@ func TestClassifyEventRuleKinds(t *testing.T) {
 				t.Fatalf("got %v want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestWakeTargetRoleIsPopulatedOnlyForOrgReply(t *testing.T) {
+	eventTypes := []events.EventType{
+		events.EventJobFinished,
+		events.EventJobFailed,
+		events.EventJobBlocked,
+		events.EventJobNeedsAttention,
+		events.EventJobDeferred,
+		events.EventOrgRecycleOverdue,
+		events.EventOrgInputPending,
+		events.EventOrgReply,
+		events.EventCandidateAwaitingPromotion,
+		events.EventCandidateAutoPromoted,
+		events.EventCandidateCanaryStarted,
+		events.EventCandidateRolledBack,
+		events.EventJobStarted,
+		events.EventDelegationEscalation,
+		events.EventDelegationFinalized,
+		events.EventOrchestrationFinished,
+	}
+	for _, eventType := range eventTypes {
+		t.Run(string(eventType), func(t *testing.T) {
+			event := events.NewEvent(eventType, "job-1", "root-1", "owner/repo", "status", "detail", time.Now(), nil)
+			if eventType == events.EventOrgReply {
+				event = replyWakeEvent([]db.WakeOutboxEntry{{
+					SourceKind: "workflow_note", SourceID: "note-1", TargetRole: "owner",
+				}}, time.Now())
+			}
+			target := strings.TrimSpace(event.WakeTargetRole)
+			if eventType == events.EventOrgReply {
+				if target != "owner" {
+					t.Fatalf("WakeTargetRole = %q, want owner", target)
+				}
+				return
+			}
+			if target != "" {
+				t.Fatalf("WakeTargetRole = %q, want empty", target)
+			}
+		})
+	}
+}
+
+func TestEventRuleAddresseeGateIsKindAgnosticAndObserverExempt(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configBody := `
+[org.roles."owner"]
+scope=["*"]
+pane="w1:p1"
+[org.roles."other"]
+parent="owner"
+scope=["*"]
+pane="w1:p2"
+[org.roles."auditor"]
+parent="owner"
+scope=["*"]
+pane="w1:p3"
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(configBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	wake := &fakeEventWake{}
+	sink := &eventRuleSink{store: store, home: home, wake: wake}
+	rules := []db.EventRule{
+		{ID: "target", OnKind: "escalation", WakeRole: "owner", Scope: db.EventRuleScopeAddressed, Enabled: true},
+		{ID: "wrong-target", OnKind: "escalation", WakeRole: "other", Scope: db.EventRuleScopeAddressed, Enabled: true},
+		{ID: "observer", OnKind: "escalation", WakeRole: "auditor", Scope: db.EventRuleScopeObserver, Enabled: true},
+	}
+	event := events.Event{
+		Type: events.EventJobNeedsAttention, Cause: "escalation",
+		JobID: "job-1", WakeTargetRole: "owner",
+	}
+	if err := sink.evaluateRules(context.Background(), event, rules); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(wake.panes, ","), "w1:p1,w1:p3"; got != want {
+		t.Fatalf("woken panes = %q, want %q", got, want)
+	}
+}
+
+func TestReplyObserverDoesNotConsumeAddressedTargetAttempt(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configBody := `
+[org.roles."owner"]
+scope=["*"]
+pane="w1:p1"
+[org.roles."auditor"]
+parent="owner"
+scope=["*"]
+pane="w1:p2"
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(configBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	wake := &fakeEventWake{}
+	sink := &eventRuleSink{store: store, home: home, wake: wake}
+	rules := []db.EventRule{
+		{ID: "observer", OnKind: "reply", WakeRole: "auditor", Scope: db.EventRuleScopeObserver, Enabled: true},
+		{ID: "target", OnKind: "reply", WakeRole: "owner", Scope: db.EventRuleScopeAddressed, Enabled: true},
+		{ID: "target-duplicate", OnKind: "reply", WakeRole: "owner", Scope: db.EventRuleScopeAddressed, Enabled: true},
+	}
+	event := replyWakeEvent([]db.WakeOutboxEntry{{
+		SourceKind: "workflow_note", SourceID: "note-1", TargetRole: "owner",
+	}}, time.Now())
+	if err := sink.evaluateRules(context.Background(), event, rules); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(wake.panes, ","), "w1:p2,w1:p1"; got != want {
+		t.Fatalf("woken panes = %q, want %q", got, want)
 	}
 }
 
