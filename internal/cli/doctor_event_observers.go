@@ -11,33 +11,46 @@ import (
 	"github.com/gitmoot/gitmoot/internal/doctor"
 )
 
-// wakeTargetRoleProducer records the production write site and the event-rule
-// kind it directs. An AST guard binds this registry to every production
+// wakeTargetRoleProducer records a production write site and derives every
+// event-rule kind it directs from that producer's source-kind definition. An
+// AST guard binds this registry to every production
 // WakeTargetRole assignment so a new producer cannot silently bypass doctor.
 type wakeTargetRoleProducer struct {
 	File     string
 	Function string
-	Kind     string
+	Kinds    func() []string
 }
 
 var wakeTargetRoleProducers = []wakeTargetRoleProducer{
-	{File: "internal/cli/reply_wake_outbox.go", Function: "wakeOutboxEvent", Kind: "reply"},
+	{
+		File:     "internal/cli/reply_wake_outbox.go",
+		Function: "wakeOutboxEvent",
+		Kinds:    wakeOutboxDirectedKinds,
+	},
 }
 
 func eventObserverDoctorCheck(paths config.Paths) (doctor.Check, bool) {
 	if strings.TrimSpace(paths.Database) == "" {
-		return doctor.Check{}, false
+		return unreadableEventObserverCheck("database path is empty"), true
 	}
 	store, err := db.OpenReadOnly(paths.Database)
 	if err != nil {
-		return doctor.Check{}, false
+		return unreadableEventObserverCheck(fmt.Sprintf("open event rule store: %v", err)), true
 	}
 	defer store.Close()
 	rules, err := store.ListEventRules(context.Background())
 	if err != nil {
-		return doctor.Check{}, false
+		return unreadableEventObserverCheck(fmt.Sprintf("list event rules: %v", err)), true
 	}
 	return buildEventObserverDoctorCheck(rules)
+}
+
+func unreadableEventObserverCheck(detail string) doctor.Check {
+	return doctor.Check{
+		Name:     "event observers",
+		Required: false,
+		Detail:   "observer coverage unverified: " + detail,
+	}
 }
 
 // buildEventObserverDoctorCheck stays silent only when every event kind with a
@@ -47,14 +60,16 @@ func buildEventObserverDoctorCheck(rules []db.EventRule) (doctor.Check, bool) {
 	covered := make(map[string]bool)
 	for _, rule := range rules {
 		if rule.Enabled && rule.Scope == db.EventRuleScopeObserver {
-			covered[strings.TrimSpace(rule.OnKind)] = true
+			covered[strings.ToLower(strings.TrimSpace(rule.OnKind))] = true
 		}
 	}
 	kinds := make(map[string]struct{})
 	for _, producer := range wakeTargetRoleProducers {
-		kind := strings.TrimSpace(producer.Kind)
-		if kind != "" {
-			kinds[kind] = struct{}{}
+		for _, rawKind := range producer.Kinds() {
+			kind := strings.ToLower(strings.TrimSpace(rawKind))
+			if kind != "" {
+				kinds[kind] = struct{}{}
+			}
 		}
 	}
 	missing := make([]string, 0, len(kinds))

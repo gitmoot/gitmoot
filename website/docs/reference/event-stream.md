@@ -195,6 +195,8 @@ empty match filter to `observer`; reply rules remain `addressed` because reply
 already carries a target role. `gitmoot doctor` warns when an event kind with a
 production target-role writer has no enabled observer rule, including when the
 rule set is empty.
+Filtered non-reply rules remain `addressed` after upgrade and must be promoted
+manually with `set-scope` when observer delivery is intended.
 
 Kinds are `escalation`, `attention`, `guard`, `job-terminal`, `blocked`,
 `recycle-overdue`, `pane_input_pending`, and `reply`.
