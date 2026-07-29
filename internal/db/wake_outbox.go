@@ -40,19 +40,18 @@ const (
 )
 
 type wakeOutboxStateDefinition struct {
-	state               string
-	class               wakeOutboxStateClass
-	obligationPredicate string
-	agedAttempt         bool
+	state       string
+	class       wakeOutboxStateClass
+	agedAttempt bool
 }
 
 var wakeOutboxStateDefinitions = [...]wakeOutboxStateDefinition{
-	{WakeOutboxStatePending, wakeOutboxStateObligation, "state = ?", false},
-	{WakeOutboxStateAttempted, wakeOutboxStateObligation, "(state = ? AND attempted_at IS NOT NULL AND attempted_at <= ?)", true},
-	{WakeOutboxStateDelivered, wakeOutboxStateTerminal, "", false},
-	{WakeOutboxStateStalled, wakeOutboxStateTerminal, "", false},
-	{WakeOutboxStateFailed, wakeOutboxStateTerminal, "", false},
-	{WakeOutboxStateDeliveryUnknown, wakeOutboxStateDeliveryUnknown, "", false},
+	{WakeOutboxStatePending, wakeOutboxStateObligation, false},
+	{WakeOutboxStateAttempted, wakeOutboxStateObligation, true},
+	{WakeOutboxStateDelivered, wakeOutboxStateTerminal, false},
+	{WakeOutboxStateStalled, wakeOutboxStateTerminal, false},
+	{WakeOutboxStateFailed, wakeOutboxStateTerminal, false},
+	{WakeOutboxStateDeliveryUnknown, wakeOutboxStateDeliveryUnknown, false},
 }
 
 // Opposing lengths make an unclassified state or a stray definition fail compilation.
@@ -361,11 +360,13 @@ func wakeOutboxObligationPredicate(attemptedBefore time.Time) (string, []any) {
 		if definition.class != wakeOutboxStateObligation {
 			continue
 		}
-		clauses = append(clauses, definition.obligationPredicate)
+		clause := "state = ?"
 		args = append(args, definition.state)
 		if definition.agedAttempt {
+			clause = "(state = ? AND attempted_at IS NOT NULL AND attempted_at <= ?)"
 			args = append(args, attemptedBefore.UTC().Format(BlockedEpisodeTimeLayout))
 		}
+		clauses = append(clauses, clause)
 	}
 	return strings.Join(clauses, " OR "), args
 }
