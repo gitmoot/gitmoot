@@ -202,9 +202,10 @@ func replyWakeEvent(batch []db.WakeOutboxEntry, now time.Time) events.Event {
 	return event
 }
 
-// Deliberately scope-blind pending a later durable-outbox slice: a reply batch
-// is claimable only when the addressed target's own enabled reply rule
-// authorizes it. Observer rules are evaluated only after that claim succeeds.
+// Deliberately scope-blind pending a later durable-outbox slice: among enabled,
+// filter-matching reply rules, WakeRole == WakeTargetRole authorizes the claim.
+// An observer-scoped rule can therefore claim for its own addressed role, but
+// not for a different target.
 func hasMatchingReplyRule(rules []db.EventRule, event events.Event) bool {
 	for _, rule := range rules {
 		if rule.Enabled &&
