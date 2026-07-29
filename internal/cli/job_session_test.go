@@ -127,8 +127,37 @@ func TestJobCloseAppliesDecision(t *testing.T) {
 	if payload.HeadSHA != "" {
 		t.Fatalf("gate-visible payload head SHA = %q, want empty (display plane must stay separate)", payload.HeadSHA)
 	}
+	if payload.ReviewStatusGrade != evidence.GradeReported {
+		t.Fatalf("stored review status grade = %q, want reported", payload.ReviewStatusGrade)
+	}
 	if got := loadSessionJobDisplayHeadSHA(context.Background(), store, opened.JobID); got != "close-head" {
 		t.Fatalf("display head SHA = %q, want close-head", got)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"job", "show", opened.JobID, "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("job show --json exit = %d, stderr=%s", code, stderr.String())
+	}
+	var shown jobShowOutput
+	if err := json.Unmarshal(stdout.Bytes(), &shown); err != nil {
+		t.Fatalf("decode job show JSON: %v (%s)", err, stdout.String())
+	}
+	if shown.ReviewStatusGrade != evidence.GradeReported {
+		t.Fatalf("job show review status grade = %q, want reported", shown.ReviewStatusGrade)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"job", "list", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("job list --json exit = %d, stderr=%s", code, stderr.String())
+	}
+	var listed []jobListEntry
+	if err := json.Unmarshal(stdout.Bytes(), &listed); err != nil {
+		t.Fatalf("decode job list JSON: %v (%s)", err, stdout.String())
+	}
+	if len(listed) != 1 || listed[0].ID != opened.JobID || listed[0].ReviewStatusGrade != evidence.GradeReported {
+		t.Fatalf("job list review = %+v, want closed review with reported grade", listed)
 	}
 }
 

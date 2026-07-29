@@ -39,7 +39,7 @@ func reportedReviewStatus(status string) reviewStatusDisplay {
 	}
 	return reviewStatusDisplay{
 		Status:    status,
-		Grade:     evidence.GradeReported,
+		Grade:     evidence.SessionReviewGrade,
 		Authority: reviewStatusAuthorityNonAuthoritative,
 	}
 }
@@ -47,18 +47,16 @@ func reportedReviewStatus(status string) reviewStatusDisplay {
 func deriveReviewStatuses(ctx context.Context, store *db.Store, jobs []db.Job, now time.Time) map[string]reviewStatusDisplay {
 	statuses := make(map[string]reviewStatusDisplay)
 	for _, job := range jobs {
-		if status := deriveReviewStatus(ctx, store, job, now); status.Status != "" || status.HeadSHA != "" {
+		if status := deriveReviewStatus(ctx, store, job, now); status.Status != "" || status.Grade != "" || status.HeadSHA != "" {
 			statuses[job.ID] = status
 		}
 	}
 	return statuses
 }
 
-// deriveReviewStatus projects a display-only liveness hint for running,
-// externally-driven reviews. Workflow notes are caller assertions, not observed
-// reviewer identity, so the result is always reported/non-authoritative and is
-// never suitable for merge policy. Every unknown is neutral: ineligible jobs, a
-// failed note lookup, or an unparseable/future timestamp omit the display.
+// deriveReviewStatus projects non-authoritative metadata for externally-driven
+// reviews. Running jobs derive a liveness hint; closed jobs expose the persisted
+// grade. Neither is suitable for merge policy.
 func deriveReviewStatus(ctx context.Context, store *db.Store, job db.Job, now time.Time) reviewStatusDisplay {
 	if store == nil ||
 		job.Type != "review" ||
@@ -67,6 +65,11 @@ func deriveReviewStatus(ctx context.Context, store *db.Store, job db.Job, now ti
 	}
 	display := reviewStatusDisplay{HeadSHA: loadSessionJobDisplayHeadSHA(ctx, store, job.ID)}
 	if job.State != string(workflow.JobRunning) {
+		payload, err := workflow.ParseJobPayload(job.Payload)
+		if err == nil && payload.ReviewStatusGrade != "" {
+			display.Grade = payload.ReviewStatusGrade
+			display.Authority = reviewStatusAuthorityNonAuthoritative
+		}
 		return display
 	}
 

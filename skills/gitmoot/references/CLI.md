@@ -1887,6 +1887,13 @@ system-observed reviewer attribution. These fields are display-only: they never
 satisfy, block, or otherwise feed the merge gate, and this feature never writes
 `tasks.state`.
 
+When an externally-driven review closes, its payload retains
+`review_status_grade: reported`; `job list --json` and `job show --json` continue
+to expose that field after the running liveness status ends. The grade is never
+`observed` or `verified` because both the reviewed head and verdict came from
+caller-supplied flags. This durable reported record is not merge-admissible
+evidence, and no merge gate consumes it.
+
 For a running engine-dispatched review with an isolated worktree, `job list`
 also samples the verified daemon's descendant process tree twice. A descendant
 whose cwd is that worktree (or a directory below it) yields

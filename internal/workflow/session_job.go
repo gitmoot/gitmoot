@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/evidence"
 )
 
 // SessionJobDisplayEventKind is a display-plane event. Merge policy must not
@@ -149,6 +150,9 @@ func (m Mailbox) CloseExternalJob(ctx context.Context, jobID string, result Agen
 	}
 	resultCopy := result
 	payload.Result = &resultCopy
+	if job.Type == "review" {
+		payload.ReviewStatusGrade = evidence.SessionReviewGrade
+	}
 	if prOverride > 0 {
 		payload.PullRequest = prOverride
 	}
