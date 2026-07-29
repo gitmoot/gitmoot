@@ -20,12 +20,44 @@ const (
 	// disappeared before recording whether Herdr accepted the wake. It is
 	// terminal and MUST NOT be retried blindly.
 	WakeOutboxStateDeliveryUnknown = "delivery_unknown"
+	wakeOutboxStateCount           = iota
+)
 
+const (
 	WakeOutboxDeliveryUnknownEventKind = "wake_delivery_unknown"
 
 	WakeOutboxSourceWorkflowNote  = "workflow_note"
 	WakeOutboxSourceChatMessage   = "chat_message"
 	WakeOutboxReplyCoalescePrefix = "reply:"
+)
+
+type wakeOutboxStateInterpretation uint8
+
+const (
+	wakeOutboxStatePendingObligation wakeOutboxStateInterpretation = iota
+	wakeOutboxStateAgedAttemptObligation
+	wakeOutboxStateTerminal
+	wakeOutboxStateDeliveryUnknown
+)
+
+type wakeOutboxStateDefinition struct {
+	state          string
+	interpretation wakeOutboxStateInterpretation
+}
+
+var wakeOutboxStateDefinitions = [...]wakeOutboxStateDefinition{
+	{WakeOutboxStatePending, wakeOutboxStatePendingObligation},
+	{WakeOutboxStateAttempted, wakeOutboxStateAgedAttemptObligation},
+	{WakeOutboxStateDelivered, wakeOutboxStateTerminal},
+	{WakeOutboxStateStalled, wakeOutboxStateTerminal},
+	{WakeOutboxStateFailed, wakeOutboxStateTerminal},
+	{WakeOutboxStateDeliveryUnknown, wakeOutboxStateDeliveryUnknown},
+}
+
+// Opposing lengths make an unclassified state or a stray definition fail compilation.
+var (
+	_ [wakeOutboxStateCount - len(wakeOutboxStateDefinitions)]struct{}
+	_ [len(wakeOutboxStateDefinitions) - wakeOutboxStateCount]struct{}
 )
 
 // WakeOutboxEntry is one durable delivery item. A pending row is positive,
@@ -43,6 +75,28 @@ type WakeOutboxEntry struct {
 	AttemptedAt  string `json:"attempted_at,omitempty"`
 	FinishedAt   string `json:"finished_at,omitempty"`
 	UpdatedAt    string `json:"updated_at"`
+}
+
+// WakeOutboxObligation is the row data needed to act on an outstanding wake.
+// State is deliberately absent: ListWakeOutboxObligations classifies it before
+// returning across the package boundary.
+type WakeOutboxObligation struct {
+	ID          int64
+	SourceKind  string
+	SourceID    string
+	TargetRole  string
+	CoalesceKey string
+	CreatedAt   string
+}
+
+// WakeOutboxObligationProjection exposes decisions, not persisted states.
+type WakeOutboxObligationProjection struct {
+	Pending       []WakeOutboxObligation
+	AgedAttempted []WakeOutboxObligation
+}
+
+func (p WakeOutboxObligationProjection) Len() int {
+	return len(p.Pending) + len(p.AgedAttempted)
 }
 
 func insertWorkflowNoteWakeOutboxTx(ctx context.Context, tx *sql.Tx, noteID int64, targetRole string) error {
@@ -137,21 +191,29 @@ FROM wake_outbox`
 // ListWakeOutboxObligations is the authoritative health projection for durable
 // wake delivery. Pending rows and attempted rows older than attemptedBefore are
 // the only non-terminal obligations; terminal outcomes never appear.
-func (s *Store) ListWakeOutboxObligations(ctx context.Context, attemptedBefore time.Time) ([]WakeOutboxEntry, error) {
-	rows, err := s.db.QueryContext(ctx, `
-SELECT id, source_kind, source_id, target_role, coalesce_key, state,
-	attempt_count, last_error, created_at, COALESCE(attempted_at, ''),
-	COALESCE(finished_at, ''), updated_at
-FROM wake_outbox
-WHERE state = 'pending'
-	OR (state = 'attempted' AND attempted_at IS NOT NULL AND attempted_at <= ?)
-ORDER BY created_at, id`,
-		attemptedBefore.UTC().Format(BlockedEpisodeTimeLayout))
+func (s *Store) ListWakeOutboxObligations(
+	ctx context.Context,
+	attemptedBefore time.Time,
+) (WakeOutboxObligationProjection, error) {
+	return listWakeOutboxObligations(ctx, s.db, attemptedBefore)
+}
+
+type wakeOutboxQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func listWakeOutboxObligations(
+	ctx context.Context,
+	queryer wakeOutboxQueryer,
+	attemptedBefore time.Time,
+) (WakeOutboxObligationProjection, error) {
+	query, args := wakeOutboxObligationQuery(attemptedBefore)
+	rows, err := queryer.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, err
+		return WakeOutboxObligationProjection{}, err
 	}
 	defer rows.Close()
-	out := []WakeOutboxEntry{}
+	out := WakeOutboxObligationProjection{}
 	for rows.Next() {
 		var entry WakeOutboxEntry
 		if err := rows.Scan(
@@ -160,11 +222,45 @@ ORDER BY created_at, id`,
 			&entry.LastError, &entry.CreatedAt, &entry.AttemptedAt,
 			&entry.FinishedAt, &entry.UpdatedAt,
 		); err != nil {
-			return nil, err
+			return WakeOutboxObligationProjection{}, err
 		}
-		out = append(out, entry)
+		obligation := WakeOutboxObligation{
+			ID: entry.ID, SourceKind: entry.SourceKind, SourceID: entry.SourceID,
+			TargetRole: entry.TargetRole, CoalesceKey: entry.CoalesceKey,
+			CreatedAt: entry.CreatedAt,
+		}
+		interpretation, ok := interpretWakeOutboxState(entry.State)
+		if !ok {
+			return WakeOutboxObligationProjection{}, fmt.Errorf(
+				"wake outbox obligation row has unclassified state %q", entry.State,
+			)
+		}
+		switch interpretation {
+		case wakeOutboxStatePendingObligation:
+			out.Pending = append(out.Pending, obligation)
+		case wakeOutboxStateAgedAttemptObligation:
+			out.AgedAttempted = append(out.AgedAttempted, obligation)
+		default:
+			return WakeOutboxObligationProjection{}, fmt.Errorf(
+				"wake outbox obligation query returned non-obligation state %q", entry.State,
+			)
+		}
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return WakeOutboxObligationProjection{}, err
+	}
+	return out, nil
+}
+
+func wakeOutboxObligationQuery(attemptedBefore time.Time) (string, []any) {
+	predicate, args := wakeOutboxObligationPredicate(attemptedBefore)
+	return `
+SELECT id, source_kind, source_id, target_role, coalesce_key, state,
+		attempt_count, last_error, created_at, COALESCE(attempted_at, ''),
+		COALESCE(finished_at, ''), updated_at
+FROM wake_outbox
+WHERE ` + predicate + `
+ORDER BY created_at, id`, args
 }
 
 // ExpireAgedWakeOutbox marks delivery-unknown rows terminal without re-emitting
@@ -287,9 +383,8 @@ WHERE state = 'pending' AND id IN (`, ids, at)
 // FinishWakeOutbox records the existing event-rule delivery classification for
 // every row in one attempted batch.
 func (s *Store) FinishWakeOutbox(ctx context.Context, ids []int64, state, detail string, at time.Time) error {
-	switch state {
-	case WakeOutboxStateDelivered, WakeOutboxStateStalled, WakeOutboxStateFailed:
-	default:
+	interpretation, ok := interpretWakeOutboxState(state)
+	if !ok || interpretation != wakeOutboxStateTerminal {
 		return fmt.Errorf("invalid terminal wake outbox state %q", state)
 	}
 	query, args, err := wakeOutboxIDUpdate(`
@@ -311,6 +406,40 @@ WHERE state = 'attempted' AND id IN (`, ids, at, state, strings.TrimSpace(detail
 		return fmt.Errorf("finish wake outbox updated %d rows, want %d", affected, len(ids))
 	}
 	return nil
+}
+
+func interpretWakeOutboxState(state string) (wakeOutboxStateInterpretation, bool) {
+	for _, definition := range wakeOutboxStateDefinitions {
+		if state == definition.state {
+			return definition.interpretation, true
+		}
+	}
+	return 0, false
+}
+
+func wakeOutboxObligationPredicate(attemptedBefore time.Time) (string, []any) {
+	var clauses []string
+	var args []any
+	for _, definition := range wakeOutboxStateDefinitions {
+		interpretation, ok := interpretWakeOutboxState(definition.state)
+		if !ok {
+			panic(fmt.Sprintf("wake outbox state %q has no interpretation", definition.state))
+		}
+		switch interpretation {
+		case wakeOutboxStatePendingObligation:
+			clauses = append(clauses, "state = ?")
+			args = append(args, definition.state)
+		case wakeOutboxStateAgedAttemptObligation:
+			clauses = append(clauses, "(state = ? AND attempted_at IS NOT NULL AND attempted_at <= ?)")
+			args = append(args, definition.state)
+			args = append(args, attemptedBefore.UTC().Format(BlockedEpisodeTimeLayout))
+		case wakeOutboxStateTerminal, wakeOutboxStateDeliveryUnknown:
+			continue
+		default:
+			panic(fmt.Sprintf("wake outbox state %q has invalid interpretation %d", definition.state, interpretation))
+		}
+	}
+	return strings.Join(clauses, " OR "), args
 }
 
 func wakeOutboxIDUpdate(prefix string, ids []int64, at time.Time, leading ...string) (string, []any, error) {
