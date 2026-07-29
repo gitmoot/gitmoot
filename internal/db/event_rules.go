@@ -67,6 +67,30 @@ func (s *Store) AddEventRule(ctx context.Context, rule EventRule) error {
 	return err
 }
 
+// UpdateEventRuleScope changes only the routing scope of an existing rule.
+func (s *Store) UpdateEventRuleScope(ctx context.Context, id string, scope EventRuleScope) error {
+	id = strings.TrimSpace(id)
+	scope = EventRuleScope(strings.ToLower(strings.TrimSpace(string(scope))))
+	if id == "" {
+		return errors.New("event rule id is required")
+	}
+	if scope != EventRuleScopeAddressed && scope != EventRuleScopeObserver {
+		return fmt.Errorf("event rule scope %q is invalid; want addressed or observer", scope)
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE event_rules SET scope = ? WHERE id = ?`, scope, id)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated == 0 {
+		return fmt.Errorf("event rule %q not found", id)
+	}
+	return nil
+}
+
 // ListEventRules returns all rules in stable creation/id order.
 func (s *Store) ListEventRules(ctx context.Context) ([]EventRule, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, on_kind, COALESCE(match_filter, ''), wake_role, scope, enabled, created_at

@@ -162,7 +162,7 @@ or `gitmoot task list --repo owner/repo --json` for imported task state. Use
 `gitmoot job list --repo owner/repo` for jobs, and use
 `gitmoot dashboard --json` only when a structured full dashboard snapshot is
 needed. Do not use nonexistent commands such as `gitmoot status --json` or
-`gitmoot task show`. Use `gitmoot org events rule add|list|rm` to manage opt-in
+`gitmoot task show`. Use `gitmoot org events rule add|list|set-scope|rm` to manage opt-in
 organization event wakes; add validates the event kind, target org role, and
 `addressed` (default) or `observer` scope. Use
 `gitmoot agent prompt <agent-or-template>` to import an

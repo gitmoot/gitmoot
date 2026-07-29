@@ -162,6 +162,40 @@ type synchronousWakeOutboxSink interface {
 	emitWakeOutbox(context.Context, events.Event, []db.EventRule) error
 }
 
+type wakeOutboxSourceKind struct {
+	sourceKind string
+	wakeKind   string
+}
+
+var wakeOutboxSourceKinds = []wakeOutboxSourceKind{
+	{sourceKind: db.WakeOutboxSourceWorkflowNote, wakeKind: db.WakeOutboxKindReply},
+	{sourceKind: db.WakeOutboxSourceChatMessage, wakeKind: db.WakeOutboxKindReply},
+	{sourceKind: db.WakeOutboxSourceBlocked, wakeKind: db.WakeOutboxKindBlocked},
+	{sourceKind: db.WakeOutboxSourceEscalation, wakeKind: db.WakeOutboxKindEscalation},
+}
+
+func wakeOutboxKindForSource(sourceKind string) (string, bool) {
+	for _, definition := range wakeOutboxSourceKinds {
+		if definition.sourceKind == sourceKind {
+			return definition.wakeKind, true
+		}
+	}
+	return "", false
+}
+
+func wakeOutboxDirectedKinds() []string {
+	unique := make(map[string]struct{})
+	for _, definition := range wakeOutboxSourceKinds {
+		unique[definition.wakeKind] = struct{}{}
+	}
+	kinds := make([]string, 0, len(unique))
+	for kind := range unique {
+		kinds = append(kinds, kind)
+	}
+	sort.Strings(kinds)
+	return kinds
+}
+
 func emitReplyWakeOutboxEvent(ctx context.Context, sink events.Sink, event events.Event, rules []db.EventRule) error {
 	if durable, ok := sink.(synchronousWakeOutboxSink); ok {
 		return durable.emitWakeOutbox(ctx, event, rules)
@@ -175,11 +209,16 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 	}
 	oldest := batch[0]
 	role := strings.ToLower(strings.TrimSpace(oldest.TargetRole))
+	wakeKind, ok := wakeOutboxKindForSource(oldest.SourceKind)
+	if !ok {
+		return events.Event{}, fmt.Errorf(
+			"wake outbox row %d has unsupported source kind %q",
+			oldest.ID, oldest.SourceKind,
+		)
+	}
 	var event events.Event
-	var wakeKind string
 	switch oldest.SourceKind {
 	case db.WakeOutboxSourceWorkflowNote, db.WakeOutboxSourceChatMessage:
-		wakeKind = db.WakeOutboxKindReply
 		detail := fmt.Sprintf("%d new items, oldest id %s", len(batch), oldest.SourceID)
 		event = events.NewEvent(
 			events.EventOrgReply,
@@ -193,12 +232,10 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 		)
 		event.Cause = "addressed_note"
 	case db.WakeOutboxSourceBlocked:
-		wakeKind = db.WakeOutboxKindBlocked
 		if err := json.Unmarshal([]byte(oldest.SourceID), &event); err != nil {
 			return events.Event{}, fmt.Errorf("decode blocked wake outbox event for row %d: %w", oldest.ID, err)
 		}
 	case db.WakeOutboxSourceEscalation:
-		wakeKind = db.WakeOutboxKindEscalation
 		if err := json.Unmarshal([]byte(oldest.SourceID), &event); err != nil {
 			return events.Event{}, fmt.Errorf("decode escalation wake outbox event for row %d: %w", oldest.ID, err)
 		}

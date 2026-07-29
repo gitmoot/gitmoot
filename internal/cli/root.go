@@ -191,6 +191,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	if check, ok := sqliteAutoVacuumDoctorCheck(paths); ok {
 		checks = append(checks, check)
 	}
+	if check, ok := eventObserverDoctorCheck(paths); ok {
+		checks = append(checks, check)
+	}
 	checks = append(checks, repoCheckoutDoctorChecks(paths)...)
 	if *jsonOutput {
 		type checkJSON struct {
