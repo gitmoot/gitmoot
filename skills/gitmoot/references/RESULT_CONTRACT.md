@@ -556,10 +556,12 @@ work was available. Produce remains a leaf, so its delegations are stripped.
   `payload.result_observation`: the files in `git diff HEAD` plus untracked
   files, each claim's path binding, claimed-only paths, and diff files no claim
   mentions. A claim that names a repo-relative path is graded `observed` only
-  when that exact normalized path is in the diff. A unique-basename match may
+  when both its claimed path and per-change observation bind to that exact
+  normalized path in `touched_files`. If capture membership is absent or
+  indeterminate, the grade remains `reported`. A unique-basename match may
   assist an unqualified filename (one with no directory separator), but that
-  binding remains `reported`. Even an exact match is not `verified`: Gitmoot
-  observed the path in the diff but did not prove the prose semantics.
+  binding also remains `reported`. Even an exact match is not `verified`:
+  Gitmoot observed the path in the diff but did not prove the prose semantics.
 - Use `needs` for missing credentials, unclear scope, unavailable tools, failing
   external services, or required human decisions.
 - Use `delegations` when another named Gitmoot agent should be invoked.

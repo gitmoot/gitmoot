@@ -112,6 +112,54 @@ func TestRunResultChecksRejectsMismatchedObservedPathBinding(t *testing.T) {
 	}
 }
 
+func TestRunResultChecksRejectsObservedBindingAbsentFromTouchedFiles(t *testing.T) {
+	const claim = "updated docs/result_checks.go"
+	observation := &ResultObservation{
+		Source:       ResultObservationSourceWorktreeDiff,
+		TouchedFiles: []string{"internal/workflow/result_checks.go"},
+		Changes: []ChangeObservation{{
+			Claim:        claim,
+			ClaimedFiles: []string{"docs/result_checks.go"},
+			Observation:  []string{"docs/result_checks.go"},
+			Grade:        evidence.GradeObserved,
+		}},
+	}
+	failed := failedIDs(ResultCheckInput{
+		Action: "implement",
+		Result: AgentResult{
+			Decision: "implemented", ChangesMade: []string{claim}, TestsRun: []string{"go test ./..."},
+		},
+		Observation: observation,
+	})
+	if _, ok := failed["implement-changes-observed"]; !ok {
+		t.Fatalf("observed binding absent from touched_files was not rejected by the result gate; failed=%v", keys(failed))
+	}
+}
+
+func TestRunResultChecksRejectsReportedBindingAbsentFromTouchedFiles(t *testing.T) {
+	const claim = "updated docs/result_checks.go"
+	observation := &ResultObservation{
+		Source:       ResultObservationSourceWorktreeDiff,
+		TouchedFiles: []string{"internal/workflow/result_checks.go"},
+		Changes: []ChangeObservation{{
+			Claim:        claim,
+			ClaimedFiles: []string{"docs/result_checks.go"},
+			Observation:  []string{"docs/result_checks.go"},
+			Grade:        evidence.GradeReported,
+		}},
+	}
+	failed := failedIDs(ResultCheckInput{
+		Action: "implement",
+		Result: AgentResult{
+			Decision: "implemented", ChangesMade: []string{claim}, TestsRun: []string{"go test ./..."},
+		},
+		Observation: observation,
+	})
+	if _, ok := failed["implement-changes-observed"]; !ok {
+		t.Fatalf("reported binding absent from touched_files was not rejected by the result gate; failed=%v", keys(failed))
+	}
+}
+
 func TestCompareResultChangesFlagsDiffFileNoClaimMentions(t *testing.T) {
 	observation := compareResultChanges(
 		[]string{"updated internal/workflow/claimed.go"},

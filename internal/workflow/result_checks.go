@@ -158,19 +158,19 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 				Explanation: explain(madePass, "the implement job reports decision \"implemented\" but changes_made[] is empty"),
 			})
 			if in.Observation != nil && in.Observation.Error == "" {
-				invalidObserved := invalidObservedClaims(in.Observation.Changes)
-				consistent := !in.Observation.Divergent && len(invalidObserved) == 0
+				invalidBindings := invalidCapturedBindingClaims(in.Observation.Changes, in.Observation.TouchedFiles)
+				consistent := !in.Observation.Divergent && len(invalidBindings) == 0
 				checks = append(checks, ResultCheck{
 					ID:       "implement-changes-observed",
 					Action:   "implement",
 					Question: "Do the reported changes_made files match the files observed in the worktree diff?",
 					Pass:     consistent,
 					Explanation: explain(consistent, fmt.Sprintf(
-						"changes_made and the worktree diff diverge (claimed-only: %s; unclaimed diff files: %s; claims without a file path: %s; invalid observed path bindings: %s)",
+						"changes_made and the worktree diff diverge (claimed-only: %s; unclaimed diff files: %s; claims without a file path: %s; invalid captured path bindings: %s)",
 						displayPaths(in.Observation.ClaimedOnlyFiles),
 						displayPaths(in.Observation.UnclaimedFiles),
 						displayPaths(in.Observation.UnboundClaims),
-						displayPaths(invalidObserved),
+						displayPaths(invalidBindings),
 					)),
 				})
 			}
