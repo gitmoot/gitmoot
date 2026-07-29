@@ -2,8 +2,15 @@ package cli
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
 	"encoding/json"
+	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/db"
 )
 
 // TestDoctorJSONOutput pins the fix for "gitmoot doctor --json advertised but
@@ -34,4 +41,160 @@ func TestDoctorJSONOutput(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestDoctorWarnsWhenDirectedEventKindHasNoObserverRule(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddEventRule(context.Background(), db.EventRule{
+		ID: "observer-reply", OnKind: "RePlY", WakeRole: "owner",
+		Scope: db.EventRuleScopeObserver, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddEventRule(context.Background(), db.EventRule{
+		ID: "addressed-blocked", OnKind: "blocked", WakeRole: "owner",
+		Scope: db.EventRuleScopeAddressed, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddEventRule(context.Background(), db.EventRule{
+		ID: "addressed-escalation", OnKind: "escalation", WakeRole: "owner",
+		Scope: db.EventRuleScopeAddressed, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	checks := runDoctorJSONChecks(t)
+	check, ok := doctorJSONCheckByName(checks, "event observers")
+	if !ok {
+		t.Fatalf("doctor checks = %#v, want event observers warning", checks)
+	}
+	detail := check["detail"].(string)
+	if check["status"] != "warn" ||
+		!strings.Contains(detail, "blocked, escalation") ||
+		strings.Contains(detail, "blocked, escalation, reply") {
+		t.Fatalf("event observers check = %#v, want blocked and escalation warning with reply covered", check)
+	}
+	t.Logf("reviewer probe: warned=true detail=%q", detail)
+
+	store, err = db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddEventRule(context.Background(), db.EventRule{
+		ID: "observer-blocked", OnKind: "blocked", WakeRole: "owner",
+		Scope: db.EventRuleScopeObserver, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddEventRule(context.Background(), db.EventRule{
+		ID: "observer-escalation", OnKind: "escalation", WakeRole: "owner",
+		Scope: db.EventRuleScopeObserver, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	checks = runDoctorJSONChecks(t)
+	if check, ok := doctorJSONCheckByName(checks, "event observers"); ok {
+		t.Fatalf("event observers check = %#v, want silence when every directed kind has an enabled observer", check)
+	}
+}
+
+func TestBuildEventObserverDoctorCheckWarnsForEachMissingDirectedKind(t *testing.T) {
+	kinds := []string{
+		db.WakeOutboxKindReply,
+		db.WakeOutboxKindBlocked,
+		db.WakeOutboxKindEscalation,
+	}
+	for _, missingKind := range kinds {
+		t.Run(missingKind, func(t *testing.T) {
+			rules := make([]db.EventRule, 0, len(kinds)-1)
+			for _, kind := range kinds {
+				if kind == missingKind {
+					continue
+				}
+				rules = append(rules, db.EventRule{
+					ID:      "observer-" + kind,
+					OnKind:  kind,
+					Scope:   db.EventRuleScopeObserver,
+					Enabled: true,
+				})
+			}
+			check, warned := buildEventObserverDoctorCheck(rules)
+			if !warned || check.OK || !strings.Contains(check.Detail, ": "+missingKind+" —") {
+				t.Fatalf("drop %s: warned=%v check=%#v, want warning naming only %s", missingKind, warned, check, missingKind)
+			}
+			t.Logf("drop %s: warned=%v detail=%q", missingKind, warned, check.Detail)
+		})
+	}
+}
+
+func TestEventObserverDoctorCheckWarnsWhenCoverageIsUnreadable(t *testing.T) {
+	t.Run("empty database path", func(t *testing.T) {
+		check, ok := eventObserverDoctorCheck(config.Paths{})
+		if !ok || check.OK || !strings.Contains(check.Detail, "database path is empty") {
+			t.Fatalf("check = %#v, ok = %v, want unverified warning", check, ok)
+		}
+	})
+
+	t.Run("open failure", func(t *testing.T) {
+		check, ok := eventObserverDoctorCheck(config.Paths{
+			Database: filepath.Join(t.TempDir(), "missing", "gitmoot.db"),
+		})
+		if !ok || check.OK || !strings.Contains(check.Detail, "open event rule store") {
+			t.Fatalf("check = %#v, ok = %v, want unverified warning", check, ok)
+		}
+	})
+
+	t.Run("list failure", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "gitmoot.db")
+		raw, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := raw.Exec(`CREATE TABLE unrelated (id TEXT PRIMARY KEY)`); err != nil {
+			t.Fatal(err)
+		}
+		if err := raw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		check, ok := eventObserverDoctorCheck(config.Paths{Database: path})
+		if !ok || check.OK || !strings.Contains(check.Detail, "list event rules") {
+			t.Fatalf("check = %#v, ok = %v, want unverified warning", check, ok)
+		}
+	})
+}
+
+func runDoctorJSONChecks(t *testing.T) []map[string]any {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	Run([]string{"doctor", "--json", "--repo", t.TempDir()}, &stdout, &stderr)
+	var checks []map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &checks); err != nil {
+		t.Fatalf("doctor --json: %v\nstdout=%q\nstderr=%q", err, stdout.String(), stderr.String())
+	}
+	return checks
+}
+
+func doctorJSONCheckByName(checks []map[string]any, name string) (map[string]any, bool) {
+	for _, check := range checks {
+		if check["name"] == name {
+			return check, true
+		}
+	}
+	return nil, false
 }

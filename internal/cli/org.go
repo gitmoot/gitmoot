@@ -129,6 +129,7 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org escalate resolve NOTE_ID [--by ROLE] [--note ANSWER_NOTE_ID] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org events rule add --on KIND [--match FILTER | --repo SUBSTRING] --wake ROLE [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org events rule list [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org events rule set-scope [--home DIR] ID observer|addressed")
 	fmt.Fprintln(w, "  gitmoot org events rule rm [--home DIR] ID")
 }
 
@@ -1132,7 +1133,7 @@ var eventRuleKinds = map[string]struct{}{
 
 func runOrgEvents(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprintln(stdout, "Usage:\n  gitmoot org events rule add --on <kind> [--match <filter> | --repo <substring>] --wake <role> [--home path]\n  gitmoot org events rule list [--home path]\n  gitmoot org events rule rm [--home path] <id>")
+		printOrgEventRuleUsage(stdout)
 		return 0
 	}
 	if args[0] != "rule" {
@@ -1140,7 +1141,7 @@ func runOrgEvents(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if len(args) == 1 || args[1] == "-h" || args[1] == "--help" {
-		fmt.Fprintln(stdout, "Usage:\n  gitmoot org events rule add --on <kind> [--match <filter> | --repo <substring>] --wake <role> [--home path]\n  gitmoot org events rule list [--home path]\n  gitmoot org events rule rm [--home path] <id>")
+		printOrgEventRuleUsage(stdout)
 		return 0
 	}
 	switch args[1] {
@@ -1148,12 +1149,22 @@ func runOrgEvents(args []string, stdout, stderr io.Writer) int {
 		return runOrgEventRuleAdd(args[2:], stdout, stderr)
 	case "list":
 		return runOrgEventRuleList(args[2:], stdout, stderr)
+	case "set-scope":
+		return runOrgEventRuleSetScope(args[2:], stdout, stderr)
 	case "rm":
 		return runOrgEventRuleRemove(args[2:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown org events rule command %q\n", args[1])
 		return 2
 	}
+}
+
+func printOrgEventRuleUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  gitmoot org events rule add --on <kind> [--match <filter> | --repo <substring>] --wake <role> [--scope addressed|observer] [--home path]")
+	fmt.Fprintln(w, "  gitmoot org events rule list [--home path]")
+	fmt.Fprintln(w, "  gitmoot org events rule set-scope [--home path] <id> observer|addressed")
+	fmt.Fprintln(w, "  gitmoot org events rule rm [--home path] <id>")
 }
 
 func runOrgEventRuleAdd(args []string, stdout, stderr io.Writer) int {
@@ -1260,6 +1271,36 @@ func runOrgEventRuleList(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "org events rule list: %v\n", err)
 		return 1
 	}
+	return 0
+}
+
+func runOrgEventRuleSetScope(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("org events rule set-scope", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 2 || strings.TrimSpace(fs.Arg(0)) == "" {
+		fmt.Fprintln(stderr, "org events rule set-scope requires a rule id and observer|addressed; place --home before the id")
+		return 2
+	}
+	id := strings.TrimSpace(fs.Arg(0))
+	scope := db.EventRuleScope(strings.ToLower(strings.TrimSpace(fs.Arg(1))))
+	if scope != db.EventRuleScopeAddressed && scope != db.EventRuleScopeObserver {
+		fmt.Fprintf(stderr, "unknown event rule scope %q; want addressed or observer\n", scope)
+		return 2
+	}
+	if err := withStore(*home, func(store *db.Store) error {
+		return store.UpdateEventRuleScope(context.Background(), id, scope)
+	}); err != nil {
+		fmt.Fprintf(stderr, "org events rule set-scope: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "updated %s scope=%s\n", id, scope)
 	return 0
 }
 
