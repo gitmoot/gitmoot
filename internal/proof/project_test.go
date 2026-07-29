@@ -91,6 +91,36 @@ func TestGradingReportedObservedVerified(t *testing.T) {
 	}
 }
 
+func TestProjectGradesDiffCorroboratedChangeObserved(t *testing.T) {
+	result := &workflow.AgentResult{
+		Decision: "implemented", Summary: "changed result checks",
+		ChangesMade: []string{"updated internal/workflow/result_checks.go"},
+	}
+	observation := &workflow.ResultObservation{
+		Source:       workflow.ResultObservationSourceWorktreeDiff,
+		TouchedFiles: []string{"internal/workflow/result_checks.go"},
+		Changes: []workflow.ChangeObservation{{
+			Claim:        result.ChangesMade[0],
+			ClaimedFiles: []string{"internal/workflow/result_checks.go"},
+			Observation:  []string{"internal/workflow/result_checks.go"},
+			Grade:        GradeObserved,
+			Divergent:    false,
+		}},
+		ClaimedOnlyFiles: []string{},
+		UnclaimedFiles:   []string{},
+		UnboundClaims:    []string{},
+		Divergent:        false,
+	}
+	payload := workflow.JobPayload{Repo: "owner/repo", Result: result, ResultObservation: observation}
+	root := db.Job{
+		ID: "observed-change", RootID: "observed-change", Agent: "implementer",
+		Type: "implement", State: "succeeded", UpdatedAt: "2026-07-29 12:00:00",
+		Payload: proofPayload(t, payload),
+	}
+	manifest := Project(root, []db.Job{root}, map[string]*workflow.AgentResult{root.ID: result}, nil, nil)
+	assertClaim(t, manifest, KindCommit, "change", GradeObserved)
+}
+
 func TestManifestContentAddressStable(t *testing.T) {
 	root, jobs, results, receipts, events := proofFixture(t, false)
 	first := Project(root, jobs, results, receipts, events)

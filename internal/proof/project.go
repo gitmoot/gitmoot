@@ -27,13 +27,14 @@ type PRReceipt struct {
 }
 
 type payloadProjection struct {
-	Repo               string                `json:"repo"`
-	PullRequest        int                   `json:"pull_request"`
-	HeadSHA            string                `json:"head_sha"`
-	WorkflowID         string                `json:"workflow_id"`
-	RuntimeOverride    string                `json:"runtime_override"`
-	RuntimeOverrideRef string                `json:"runtime_override_ref"`
-	Result             *workflow.AgentResult `json:"result"`
+	Repo               string                      `json:"repo"`
+	PullRequest        int                         `json:"pull_request"`
+	HeadSHA            string                      `json:"head_sha"`
+	WorkflowID         string                      `json:"workflow_id"`
+	RuntimeOverride    string                      `json:"runtime_override"`
+	RuntimeOverrideRef string                      `json:"runtime_override_ref"`
+	Result             *workflow.AgentResult       `json:"result"`
+	ResultObservation  *workflow.ResultObservation `json:"result_observation"`
 }
 
 type projector struct {
@@ -211,7 +212,7 @@ func (p *projector) factNodes(job db.Job, projection payloadProjection, result *
 		claims := make([]Claim, 0, len(result.ChangesMade)+1)
 		for i, change := range result.ChangesMade {
 			attrs[fmt.Sprintf("change.%d", i)] = change
-			claims = append(claims, reportedClaim("change", job, job.UpdatedAt))
+			claims = append(claims, projectedChangeClaim(job, projection.ResultObservation, i, change))
 		}
 		if job.ResultHash != "" {
 			matches := resultHashMatches(job.Payload, job.ResultHash)
@@ -316,6 +317,24 @@ func (p *projector) factNodes(job db.Job, projection payloadProjection, result *
 		}))
 	}
 	return children
+}
+
+func projectedChangeClaim(job db.Job, observation *workflow.ResultObservation, index int, change string) Claim {
+	if observation != nil && observation.Error == "" && index < len(observation.Changes) {
+		entry := observation.Changes[index]
+		if observation.Source == workflow.ResultObservationSourceWorktreeDiff &&
+			entry.Claim == change &&
+			entry.Grade == GradeObserved &&
+			!entry.Divergent &&
+			len(entry.ClaimedFiles) > 0 &&
+			len(entry.Observation) > 0 {
+			return Claim{
+				Type: "change", Grade: GradeObserved, Source: observation.Source,
+				EvidenceRef: job.ID, AsOf: job.UpdatedAt,
+			}
+		}
+	}
+	return reportedClaim("change", job, job.UpdatedAt)
 }
 
 func (p *projector) delegationNodes(parent db.Job, result *workflow.AgentResult) []string {

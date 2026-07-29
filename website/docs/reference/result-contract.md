@@ -44,10 +44,15 @@ The `decision` field reports the outcome of the job:
 
 The narrative and evidence fields are reporting-only. Do not claim tests were run
 in `tests_run` unless they were actually run, and do not list files in
-`changes_made` unless they were actually changed. Use `needs` for missing
-credentials, unclear scope, unavailable tools, failing external services, or
-required human decisions. Always redact secrets from summaries, findings, raw
-command output, and examples.
+`changes_made` unless they were actually changed. Name repo-relative file paths
+in each `changes_made` entry. At result persistence, an engine-run implement job
+with an owned worktree records `payload.result_observation`: the files in
+`git diff HEAD` plus untracked files, each claim's path binding, claimed-only
+paths, and diff files no claim mentions. A fully bound claim is graded
+`observed`, not `verified`: Gitmoot observed the path in the diff but did not
+prove the prose semantics. Use `needs` for missing credentials, unclear scope,
+unavailable tools, failing external services, or required human decisions.
+Always redact secrets from summaries, findings, raw command output, and examples.
 
 ## Display-only in-session review state
 
