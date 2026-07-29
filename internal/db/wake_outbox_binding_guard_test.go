@@ -15,14 +15,17 @@ import (
 )
 
 const wakeOutboxPredicateGenerator = "wakeOutboxObligationPredicate"
+const wakeOutboxStateDefinitionSource = "wakeOutboxStateDefinitions"
 
 type wakeOutboxBindingFunction struct {
 	decl *ast.FuncDecl
 }
 
 type wakeOutboxBindingAnalysis struct {
-	constructionSites map[string]struct{}
-	predicateBound    map[string]struct{}
+	constructionSites   map[string]struct{}
+	predicateBound      map[string]struct{}
+	predicateGenerators map[string]struct{}
+	definitionDerived   map[string]struct{}
 }
 
 func TestWakeOutboxObligationBindingIsTransitive(t *testing.T) {
@@ -30,6 +33,9 @@ func TestWakeOutboxObligationBindingIsTransitive(t *testing.T) {
 	files := wakeOutboxProductionFiles(t, dir)
 	analysis := analyzeWakeOutboxBinding(t, files)
 	if err := wakeOutboxBindingViolation(analysis); err != nil {
+		t.Fatal(err)
+	}
+	if err := wakeOutboxDerivationViolation(analysis); err != nil {
 		t.Fatal(err)
 	}
 
@@ -41,6 +47,13 @@ func TestWakeOutboxObligationBindingIsTransitive(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "construction/projection sites only") {
 		t.Fatalf("committed handwritten-query fixture violation = %v, want set mismatch", err)
+	}
+	err = wakeOutboxDerivationViolation(negative)
+	if err == nil {
+		t.Fatalf("committed handwritten-predicate fixture %s unexpectedly passed the derivation guard", fixture)
+	}
+	if !strings.Contains(err.Error(), "not derived from wakeOutboxStateDefinitions") {
+		t.Fatalf("committed handwritten-predicate fixture violation = %v, want derivation mismatch", err)
 	}
 }
 
@@ -119,8 +132,19 @@ func analyzeWakeOutboxBinding(t *testing.T, paths []string) wakeOutboxBindingAna
 	}
 
 	predicateBound := make(map[string]struct{})
+	predicateGenerators := make(map[string]struct{})
+	definitionDerived := make(map[string]struct{})
+	for _, generatorID := range idsByName[wakeOutboxPredicateGenerator] {
+		predicateGenerators[generatorID] = struct{}{}
+		if wakeOutboxReferencesIdentifier(
+			functions[generatorID].decl.Body,
+			wakeOutboxStateDefinitionSource,
+		) {
+			definitionDerived[generatorID] = struct{}{}
+		}
+	}
 	for id, functionCalls := range calls {
-		for _, generatorID := range idsByName[wakeOutboxPredicateGenerator] {
+		for generatorID := range predicateGenerators {
 			if _, ok := functionCalls[generatorID]; ok {
 				predicateBound[id] = struct{}{}
 			}
@@ -139,9 +163,24 @@ func analyzeWakeOutboxBinding(t *testing.T, paths []string) wakeOutboxBindingAna
 		}
 	}
 	return wakeOutboxBindingAnalysis{
-		constructionSites: constructionSites,
-		predicateBound:    predicateBound,
+		constructionSites:   constructionSites,
+		predicateBound:      predicateBound,
+		predicateGenerators: predicateGenerators,
+		definitionDerived:   definitionDerived,
 	}
+}
+
+func wakeOutboxReferencesIdentifier(node ast.Node, name string) bool {
+	found := false
+	ast.Inspect(node, func(node ast.Node) bool {
+		identifier, ok := node.(*ast.Ident)
+		if ok && identifier.Name == name {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func wakeOutboxFunctionID(function *ast.FuncDecl) string {
@@ -230,6 +269,24 @@ func wakeOutboxBindingViolation(analysis wakeOutboxBindingAnalysis) error {
 		"wake outbox obligation binding set mismatch: construction/projection sites only=%v; predicate-bound transitive callers only=%v",
 		onlyConstruction,
 		onlyPredicate,
+	)
+}
+
+func wakeOutboxDerivationViolation(analysis wakeOutboxBindingAnalysis) error {
+	if len(analysis.predicateGenerators) == 0 {
+		return fmt.Errorf("wake outbox obligation guard found no predicate generator")
+	}
+	notDerived := wakeOutboxSetDifference(
+		analysis.predicateGenerators,
+		analysis.definitionDerived,
+	)
+	if len(notDerived) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"wake outbox predicate generators %v are not derived from %s",
+		notDerived,
+		wakeOutboxStateDefinitionSource,
 	)
 }
 

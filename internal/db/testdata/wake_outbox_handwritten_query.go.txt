@@ -2,6 +2,31 @@ package db
 
 import "time"
 
+func wakeOutboxObligationPredicate(attemptedBefore time.Time) (string, []any) {
+	return "state = ? OR (state = ? AND attempted_at IS NOT NULL AND attempted_at <= ?)", []any{
+		WakeOutboxStatePending,
+		WakeOutboxStateAttempted,
+		attemptedBefore.UTC().Format(BlockedEpisodeTimeLayout),
+	}
+}
+
+func bodyMutantWakeOutboxObligationQuery(attemptedBefore time.Time) (string, []any) {
+	predicate, args := wakeOutboxObligationPredicate(attemptedBefore)
+	return `
+SELECT id, source_kind, source_id, target_role, coalesce_key, state,
+		attempt_count, last_error, created_at, COALESCE(attempted_at, ''),
+		COALESCE(finished_at, ''), updated_at
+FROM wake_outbox
+WHERE ` + predicate + `
+ORDER BY created_at, id`, args
+}
+
+func bodyMutantListWakeOutboxObligations() (WakeOutboxObligationProjection, error) {
+	query, args := bodyMutantWakeOutboxObligationQuery(time.Time{})
+	_, _ = query, args
+	return WakeOutboxObligationProjection{}, nil
+}
+
 func handwrittenWakeOutboxObligationQuery(attemptedBefore time.Time) (string, []any) {
 	return `
 SELECT id, source_kind, source_id, target_role, coalesce_key, state,
