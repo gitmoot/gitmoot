@@ -1336,6 +1336,7 @@ gitmoot org events rule add --on attention --match owner/repo --wake maintainer
 gitmoot org events rule add --on blocked --repo tendwire --wake maintainer
 gitmoot org events rule add --on pane_input_pending --wake maintainer
 gitmoot org events rule add --on reply --wake maintainer
+gitmoot org events rule add --on reply --wake operator --scope observer
 gitmoot org events rule list
 gitmoot org events rule rm --home /alternate/home <rule-id>
 ```
@@ -1353,6 +1354,15 @@ addressed to the same role as `--wake`; non-triggering chat back-links such as
 into one prompt carrying `N new items, oldest id X`; separate roles and later
 windows stay separate. A later tick flushes the quiet tail without requiring
 another message.
+Rules default to `--scope addressed`: when an event names a target role, only
+the matching addressed rule receives it. During rule evaluation,
+`--scope observer` exempts a rule from that addressee gate.
+Events without a target role keep matching both scopes exactly as before.
+For `reply`, durable-outbox claim authorization is scope-blind: among enabled,
+filter-matching reply rules, wake-role equality with the addressed target is the
+only routing condition. An observer-scoped reply rule is therefore delivered
+when its wake role equals the target; when it differs and no other target-role
+rule authorizes the batch, the batch remains pending.
 Every outbox row retains a queryable `pending`, `attempted`, `delivered`,
 `stalled`, or `failed` state, so never-attempted is not confused with success.
 `--match` is a case-insensitive substring matched independently against the
