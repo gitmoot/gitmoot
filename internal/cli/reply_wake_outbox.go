@@ -213,6 +213,10 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 	return event, nil
 }
 
+// Deliberately scope-blind pending a later durable-outbox slice: among enabled,
+// filter-matching rules for the event's own kind, WakeRole == WakeTargetRole
+// authorizes the claim. An observer-scoped rule can therefore claim for its own
+// addressed role, but not for a different target.
 func matchingWakeRules(rules []db.EventRule, event events.Event) []db.EventRule {
 	for _, rule := range rules {
 		if rule.Enabled &&

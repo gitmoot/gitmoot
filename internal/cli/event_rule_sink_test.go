@@ -2,11 +2,18 @@ package cli
 
 import (
 	"context"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gitmoot/gitmoot/internal/config"
@@ -87,6 +94,196 @@ func TestClassifyEventRuleKinds(t *testing.T) {
 				t.Fatalf("got %v want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestWakeTargetRoleHasExactlyOneProductionWriteInWakeOutboxEvent(t *testing.T) {
+	writes := productionWakeTargetRoleWrites(t)
+	if got, want := fmt.Sprint(writes), "[internal/cli/reply_wake_outbox.go:wakeOutboxEvent]"; got != want {
+		t.Fatalf("production WakeTargetRole writes = %s, want %s", got, want)
+	}
+	event, err := wakeOutboxEvent([]db.WakeOutboxObligation{{
+		SourceKind: "workflow_note", SourceID: "note-1", TargetRole: "owner",
+	}}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.Type != events.EventOrgReply || strings.TrimSpace(event.WakeTargetRole) != "owner" {
+		t.Fatalf("reply wake event = {Type:%q WakeTargetRole:%q}, want org.reply addressed to owner", event.Type, event.WakeTargetRole)
+	}
+}
+
+type wakeTargetRoleWrite struct {
+	file     string
+	function string
+}
+
+func (w wakeTargetRoleWrite) String() string {
+	return w.file + ":" + w.function
+}
+
+func productionWakeTargetRoleWrites(t *testing.T) []wakeTargetRoleWrite {
+	t.Helper()
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var writes []wakeTargetRoleWrite
+	err = filepath.WalkDir(root, func(filename string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(filename) != ".go" || strings.HasSuffix(filename, "_test.go") {
+			return nil
+		}
+		fset := token.NewFileSet()
+		parsed, err := parser.ParseFile(fset, filename, nil, 0)
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(root, filename)
+		if err != nil {
+			return err
+		}
+		for _, declaration := range parsed.Decls {
+			functionName := "<package>"
+			node := ast.Node(declaration)
+			if function, ok := declaration.(*ast.FuncDecl); ok {
+				if function.Body == nil {
+					continue
+				}
+				functionName = function.Name.Name
+				node = function.Body
+			}
+			ast.Inspect(node, func(node ast.Node) bool {
+				switch node := node.(type) {
+				case *ast.AssignStmt:
+					for _, expression := range node.Lhs {
+						selector, ok := expression.(*ast.SelectorExpr)
+						if ok && selector.Sel.Name == "WakeTargetRole" {
+							writes = append(writes, wakeTargetRoleWrite{
+								file: filepath.ToSlash(relative), function: functionName,
+							})
+						}
+					}
+				case *ast.KeyValueExpr:
+					key, ok := node.Key.(*ast.Ident)
+					if ok && key.Name == "WakeTargetRole" {
+						writes = append(writes, wakeTargetRoleWrite{
+							file: filepath.ToSlash(relative), function: functionName,
+						})
+					}
+				}
+				return true
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Slice(writes, func(i, j int) bool {
+		if writes[i].file != writes[j].file {
+			return writes[i].file < writes[j].file
+		}
+		return writes[i].function < writes[j].function
+	})
+	return writes
+}
+
+func TestEventRuleAddresseeGateIsKindAgnosticAndObserverExempt(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configBody := `
+[org.roles."owner"]
+scope=["*"]
+pane="w1:p1"
+[org.roles."other"]
+parent="owner"
+scope=["*"]
+pane="w1:p2"
+[org.roles."auditor"]
+parent="owner"
+scope=["*"]
+pane="w1:p3"
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(configBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	wake := &fakeEventWake{}
+	sink := &eventRuleSink{store: store, home: home, wake: wake}
+	rules := []db.EventRule{
+		{ID: "target", OnKind: "escalation", WakeRole: "owner", Scope: db.EventRuleScopeAddressed, Enabled: true},
+		{ID: "wrong-target", OnKind: "escalation", WakeRole: "other", Scope: db.EventRuleScopeAddressed, Enabled: true},
+		{ID: "observer", OnKind: "escalation", WakeRole: "auditor", Scope: db.EventRuleScopeObserver, Enabled: true},
+	}
+	event := events.Event{
+		Type: events.EventJobNeedsAttention, Cause: "escalation",
+		JobID: "job-1", WakeTargetRole: "owner",
+	}
+	if err := sink.evaluateRules(context.Background(), event, rules); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(wake.panes, ","), "w1:p1,w1:p3"; got != want {
+		t.Fatalf("woken panes = %q, want %q", got, want)
+	}
+}
+
+func TestReplyObserverDoesNotConsumeAddressedTargetAttempt(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configBody := `
+[org.roles."owner"]
+scope=["*"]
+pane="w1:p1"
+[org.roles."auditor"]
+parent="owner"
+scope=["*"]
+pane="w1:p2"
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(configBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	wake := &fakeEventWake{}
+	sink := &eventRuleSink{store: store, home: home, wake: wake}
+	rules := []db.EventRule{
+		{ID: "observer", OnKind: "reply", WakeRole: "auditor", Scope: db.EventRuleScopeObserver, Enabled: true},
+		{ID: "target", OnKind: "reply", WakeRole: "owner", Scope: db.EventRuleScopeAddressed, Enabled: true},
+		{ID: "target-duplicate", OnKind: "reply", WakeRole: "owner", Scope: db.EventRuleScopeAddressed, Enabled: true},
+	}
+	event, err := wakeOutboxEvent([]db.WakeOutboxObligation{{
+		SourceKind: "workflow_note", SourceID: "note-1", TargetRole: "owner",
+	}}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.evaluateRules(context.Background(), event, rules); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(wake.panes, ","), "w1:p2,w1:p1"; got != want {
+		t.Fatalf("woken panes = %q, want %q", got, want)
 	}
 }
 

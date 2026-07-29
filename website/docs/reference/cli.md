@@ -1215,6 +1215,7 @@ gitmoot org events rule add --on attention --match owner/repo --wake maintainer
 gitmoot org events rule add --on blocked --repo tendwire --wake maintainer
 gitmoot org events rule add --on pane_input_pending --wake maintainer
 gitmoot org events rule add --on reply --wake maintainer
+gitmoot org events rule add --on reply --wake operator --scope observer
 gitmoot org events rule list
 gitmoot org events rule rm --home /alternate/home <rule-id>
 ```
@@ -1236,6 +1237,15 @@ emitting job. The daemon coalesces a rolling five-second window per event kind
 and role. Reply prompts carry `N new items, oldest id X`; blocked and escalation
 events retain their redacted event detail. Different event kinds never share a
 coalescing key, and a later tick flushes a quiet tail without another event.
+Rules default to `--scope addressed`: when an event names a target role, only
+the matching addressed rule receives it. During rule evaluation,
+`--scope observer` exempts a rule from that addressee gate.
+Events without a target role keep matching both scopes exactly as before.
+Durable-outbox claim authorization is scope-blind: among enabled,
+filter-matching rules for the event's own kind, wake-role equality with the
+addressed target is the only routing condition. An observer-scoped rule is
+therefore delivered when its wake role equals the target; when it differs and
+no other target-role rule authorizes the batch, the batch remains pending.
 Every outbox row retains a queryable `pending`, `attempted`, `delivered`,
 `stalled`, `failed`, or `delivery_unknown` state, so never-attempted is not
 confused with success and outstanding rows contribute to daemon tick health.

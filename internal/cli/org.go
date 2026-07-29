@@ -1167,6 +1167,7 @@ func runOrgEventRuleAdd(args []string, stdout, stderr io.Writer) int {
 	match := fs.String("match", "", "case-insensitive substring matched against event repo or job id; empty matches all")
 	repo := fs.String("repo", "", "case-insensitive repo substring (alias for --match)")
 	wake := fs.String("wake", "", "organization role to wake")
+	scopeFlag := fs.String("scope", string(db.EventRuleScopeAddressed), "rule scope: addressed or observer")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -1185,6 +1186,11 @@ func runOrgEventRuleAdd(args []string, stdout, stderr io.Writer) int {
 	}
 	if repoFilter != "" {
 		matchFilter = repoFilter
+	}
+	scope := db.EventRuleScope(strings.ToLower(strings.TrimSpace(*scopeFlag)))
+	if scope != db.EventRuleScopeAddressed && scope != db.EventRuleScopeObserver {
+		fmt.Fprintf(stderr, "unknown event rule scope %q; want addressed or observer\n", scope)
+		return 2
 	}
 	kind := strings.ToLower(strings.TrimSpace(*onKind))
 	if _, ok := eventRuleKinds[kind]; !ok {
@@ -1216,7 +1222,7 @@ func runOrgEventRuleAdd(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "org events rule add: generate id: %v\n", err)
 		return 1
 	}
-	rule := db.EventRule{ID: id, OnKind: kind, MatchFilter: matchFilter, WakeRole: role.Name, Enabled: true}
+	rule := db.EventRule{ID: id, OnKind: kind, MatchFilter: matchFilter, WakeRole: role.Name, Scope: scope, Enabled: true}
 	if err := withStore(*home, func(store *db.Store) error {
 		return store.AddEventRule(context.Background(), rule)
 	}); err != nil {
@@ -1247,7 +1253,7 @@ func runOrgEventRuleList(args []string, stdout, stderr io.Writer) int {
 			return err
 		}
 		for _, rule := range rules {
-			fmt.Fprintf(stdout, "%s\ton=%s\tmatch=%s\twake=%s\tenabled=%t\n", rule.ID, rule.OnKind, rule.MatchFilter, rule.WakeRole, rule.Enabled)
+			fmt.Fprintf(stdout, "%s\ton=%s\tmatch=%s\twake=%s\tscope=%s\tenabled=%t\n", rule.ID, rule.OnKind, rule.MatchFilter, rule.WakeRole, rule.Scope, rule.Enabled)
 		}
 		return nil
 	}); err != nil {

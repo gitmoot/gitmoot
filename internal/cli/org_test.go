@@ -1648,7 +1648,7 @@ func TestOrgEventRuleAddListRemoveAndValidation(t *testing.T) {
 	if code := runOrg([]string{"events", "rule", "list", "--home", home}, &out, &errOut); code != 0 {
 		t.Fatalf("list code=%d out=%q err=%q", code, out.String(), errOut.String())
 	}
-	for _, want := range []string{id, "on=attention", "match=Acme/Widget", "wake=maintainer", "enabled=true"} {
+	for _, want := range []string{id, "on=attention", "match=Acme/Widget", "wake=maintainer", "scope=addressed", "enabled=true"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("list output %q missing %q", out.String(), want)
 		}
@@ -1665,7 +1665,7 @@ func TestOrgEventRuleAddListRemoveAndValidation(t *testing.T) {
 	}
 	out.Reset()
 	errOut.Reset()
-	if code := runOrg([]string{"events", "rule", "add", "--home", home, "--on", "reply", "--wake", "owner"}, &out, &errOut); code != 0 {
+	if code := runOrg([]string{"events", "rule", "add", "--home", home, "--on", "reply", "--wake", "owner", "--scope", "observer"}, &out, &errOut); code != 0 {
 		t.Fatalf("add reply code=%d out=%q err=%q", code, out.String(), errOut.String())
 	}
 
@@ -1673,6 +1673,10 @@ func TestOrgEventRuleAddListRemoveAndValidation(t *testing.T) {
 	errOut.Reset()
 	if code := runOrg([]string{"events", "rule", "add", "--on", "surprise", "--wake", "owner"}, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "unknown event rule kind") {
 		t.Fatalf("unknown kind code=%d err=%q", code, errOut.String())
+	}
+	errOut.Reset()
+	if code := runOrg([]string{"events", "rule", "add", "--home", home, "--on", "attention", "--wake", "owner", "--scope", "broadcast"}, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "unknown event rule scope") {
+		t.Fatalf("unknown scope code=%d err=%q", code, errOut.String())
 	}
 	errOut.Reset()
 	if code := runOrg([]string{"events", "rule", "add", "--home", home, "--on", "guard", "--wake", "unknown"}, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "unknown org role") {
