@@ -2,7 +2,9 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -11,11 +13,11 @@ import (
 
 func TestWakeOutboxStateClassificationIsExhaustive(t *testing.T) {
 	tests := []struct {
-		state string
-		class wakeOutboxStateClass
+		state          string
+		interpretation wakeOutboxStateInterpretation
 	}{
-		{WakeOutboxStatePending, wakeOutboxStateObligation},
-		{WakeOutboxStateAttempted, wakeOutboxStateObligation},
+		{WakeOutboxStatePending, wakeOutboxStatePendingObligation},
+		{WakeOutboxStateAttempted, wakeOutboxStateAgedAttemptObligation},
 		{WakeOutboxStateDelivered, wakeOutboxStateTerminal},
 		{WakeOutboxStateStalled, wakeOutboxStateTerminal},
 		{WakeOutboxStateFailed, wakeOutboxStateTerminal},
@@ -25,10 +27,87 @@ func TestWakeOutboxStateClassificationIsExhaustive(t *testing.T) {
 		t.Fatalf("classified states = %d, declared states = %d", len(tests), wakeOutboxStateCount)
 	}
 	for _, test := range tests {
-		class, ok := classifyWakeOutboxState(test.state)
-		if !ok || class != test.class {
-			t.Errorf("classifyWakeOutboxState(%q) = (%d, %v), want (%d, true)", test.state, class, ok, test.class)
+		interpretation, ok := interpretWakeOutboxState(test.state)
+		if !ok || interpretation != test.interpretation {
+			t.Errorf(
+				"interpretWakeOutboxState(%q) = (%d, %v), want (%d, true)",
+				test.state, interpretation, ok, test.interpretation,
+			)
 		}
+	}
+}
+
+type recordingWakeOutboxQueryer struct {
+	delegate wakeOutboxQueryer
+	query    string
+	args     []any
+}
+
+func (r *recordingWakeOutboxQueryer) QueryContext(
+	ctx context.Context,
+	query string,
+	args ...any,
+) (*sql.Rows, error) {
+	r.query = query
+	r.args = append([]any(nil), args...)
+	return r.delegate.QueryContext(ctx, query, args...)
+}
+
+func TestListWakeOutboxObligationsExecutesGeneratedQuery(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	attemptedBefore := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	recorder := &recordingWakeOutboxQueryer{delegate: store.db}
+
+	if _, err := listWakeOutboxObligations(ctx, recorder, attemptedBefore); err != nil {
+		t.Fatal(err)
+	}
+	wantQuery, wantArgs := wakeOutboxObligationQuery(attemptedBefore)
+	if recorder.query != wantQuery {
+		t.Errorf("executed query:\n%s\nwant generated query:\n%s", recorder.query, wantQuery)
+	}
+	if !reflect.DeepEqual(recorder.args, wantArgs) {
+		t.Errorf("executed args = %#v, want generated args %#v", recorder.args, wantArgs)
+	}
+}
+
+func TestListWakeOutboxObligationsClassifiesAllStates(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	attemptedBefore := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	states := []struct {
+		state       string
+		attemptedAt any
+	}{
+		{WakeOutboxStatePending, nil},
+		{WakeOutboxStateAttempted, attemptedBefore.Add(-time.Minute).Format(BlockedEpisodeTimeLayout)},
+		{WakeOutboxStateDelivered, nil},
+		{WakeOutboxStateStalled, nil},
+		{WakeOutboxStateFailed, nil},
+		{WakeOutboxStateDeliveryUnknown, nil},
+	}
+	for index, state := range states {
+		if _, err := store.db.ExecContext(ctx, `
+INSERT INTO wake_outbox(
+	source_kind, source_id, target_role, coalesce_key, state, attempted_at
+) VALUES ('test', ?, 'owner', 'reply:owner', ?, ?)`,
+			strconv.Itoa(index), state.state, state.attemptedAt,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	obligations, err := store.ListWakeOutboxObligations(ctx, attemptedBefore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, obligation := range obligations {
+		got = append(got, obligation.State)
+	}
+	want := []string{WakeOutboxStatePending, WakeOutboxStateAttempted}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("obligation states = %v, want %v", got, want)
 	}
 }
 
