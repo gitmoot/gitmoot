@@ -550,7 +550,18 @@ work was available. Produce remains a leaf, so its delegations are stripped.
   An omitted `delivery_status` means unknown or not applicable, not "not
   delivered."
 - Do not claim tests were run unless they were actually run.
-- Do not claim files were changed unless they were actually changed.
+- Do not claim files were changed unless they were actually changed. Name
+  repo-relative file paths in each `changes_made` entry. At result persistence,
+  an engine-run implement job with an owned worktree records
+  `payload.result_observation`: the files in `git diff HEAD` plus untracked
+  files, each claim's path binding, claimed-only paths, and diff files no claim
+  mentions. A claim that names a repo-relative path is graded `observed` only
+  when both its claimed path and per-change observation bind to that exact
+  normalized path in `touched_files`. If capture membership is absent or
+  indeterminate, the grade remains `reported`. A unique-basename match may
+  assist an unqualified filename (one with no directory separator), but that
+  binding also remains `reported`. Even an exact match is not `verified`:
+  Gitmoot observed the path in the diff but did not prove the prose semantics.
 - Use `needs` for missing credentials, unclear scope, unavailable tools, failing
   external services, or required human decisions.
 - Use `delegations` when another named Gitmoot agent should be invoked.

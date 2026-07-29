@@ -180,8 +180,8 @@ gitmoot org events rule rm <rule-id>
 ```
 
 Rules default to `--scope addressed`: when an event carries a target role, only
-the matching addressed rule receives it. `--scope observer` exempts a rule from
-that addressee gate and observes directed events regardless of target role.
+the matching addressed rule receives it. During rule evaluation,
+`--scope observer` exempts a rule from that addressee gate.
 Events without a target role keep matching both scopes exactly as before.
 For `reply`, durable-outbox claim authorization is scope-blind: among enabled,
 filter-matching reply rules, wake-role equality with the addressed target is the

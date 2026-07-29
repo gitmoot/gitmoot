@@ -40,16 +40,11 @@ func drainReplyWakeOutbox(ctx context.Context, store *db.Store, now time.Time, r
 	}
 	attemptedBefore := now.UTC().Add(-replyWakeAttemptedUnknownAfter)
 	obligations, err := store.ListWakeOutboxObligations(ctx, attemptedBefore)
-	if err != nil || len(obligations) == 0 {
+	if err != nil || obligations.Len() == 0 {
 		return err
 	}
 
-	agedAttempted := 0
-	for _, entry := range obligations {
-		if entry.State == db.WakeOutboxStateAttempted {
-			agedAttempted++
-		}
-	}
+	agedAttempted := len(obligations.AgedAttempted)
 	if agedAttempted > 0 {
 		expired, err := store.ExpireAgedWakeOutbox(ctx, attemptedBefore, now)
 		if err != nil {
@@ -63,11 +58,8 @@ func drainReplyWakeOutbox(ctx context.Context, store *db.Store, now time.Time, r
 		}
 	}
 
-	groups := make(map[string][]db.WakeOutboxEntry)
-	for _, entry := range obligations {
-		if entry.State != db.WakeOutboxStatePending {
-			continue
-		}
+	groups := make(map[string][]db.WakeOutboxObligation)
+	for _, entry := range obligations.Pending {
 		if !strings.HasPrefix(entry.CoalesceKey, db.WakeOutboxReplyCoalescePrefix) {
 			continue
 		}
@@ -152,16 +144,8 @@ func wakeOutboxObligationHealth(ctx context.Context, store *db.Store, attemptedB
 	if err != nil {
 		return fmt.Errorf("read wake outbox obligations: %w", err)
 	}
-	pending := 0
-	agedAttempted := 0
-	for _, entry := range obligations {
-		switch entry.State {
-		case db.WakeOutboxStatePending:
-			pending++
-		case db.WakeOutboxStateAttempted:
-			agedAttempted++
-		}
-	}
+	pending := len(obligations.Pending)
+	agedAttempted := len(obligations.AgedAttempted)
 	if pending == 0 && agedAttempted == 0 {
 		return nil
 	}
@@ -183,7 +167,7 @@ func emitReplyWakeOutboxEvent(ctx context.Context, sink events.Sink, event event
 	return errors.New("wake outbox sink does not support synchronous delivery")
 }
 
-func replyWakeEvent(batch []db.WakeOutboxEntry, now time.Time) events.Event {
+func replyWakeEvent(batch []db.WakeOutboxObligation, now time.Time) events.Event {
 	oldest := batch[0]
 	role := strings.ToLower(strings.TrimSpace(oldest.TargetRole))
 	detail := fmt.Sprintf("%d new items, oldest id %s", len(batch), oldest.SourceID)

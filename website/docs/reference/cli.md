@@ -1234,8 +1234,8 @@ into one prompt carrying `N new items, oldest id X`; separate roles and later
 windows stay separate. A later tick flushes the quiet tail without requiring
 another message.
 Rules default to `--scope addressed`: when an event names a target role, only
-the matching addressed rule receives it. `--scope observer` exempts a rule from
-that addressee gate, so it observes directed events regardless of target role.
+the matching addressed rule receives it. During rule evaluation,
+`--scope observer` exempts a rule from that addressee gate.
 Events without a target role keep matching both scopes exactly as before.
 For `reply`, durable-outbox claim authorization is scope-blind: among enabled,
 filter-matching reply rules, wake-role equality with the addressed target is the
@@ -1821,7 +1821,10 @@ contract-hygiene audit that catches results that are technically valid but vague
 or missing evidence. Each check is a yes/no question with an explanation:
 
 - **implement** — a result whose decision is `implemented` must list its
-  `changes_made` and its `tests_run`.
+  `changes_made` and its `tests_run`. When the engine owns a job worktree, it
+  also persists `payload.result_observation` from the worktree diff and fails
+  `implement-changes-observed` if a claim names a path absent from the diff, a
+  claim names no file path, or the diff contains a path no claim mentions.
 - **review** — a `changes_requested` review must carry `findings` (evidence).
 - **ask** — the answer (`summary`/`artifact_body`) must be non-empty and
   actionable.
@@ -1842,8 +1845,9 @@ result_checks = "warn"   # off | warn | block (default: warn)
   the web dashboard), but the job still finishes on its own decision.
 - `block` — a failing check additionally fails the job through the same terminal
   path a malformed result takes (opt-in, for strict workflows).
-- `off` — the audit is disabled entirely, restoring byte-identical pre-feature
-  behavior (no event, no payload field, no stored record).
+- `off` — the audit emits no check, event, or failure record. The worktree
+  observation is still persisted when available; recording evidence is
+  independent of whether a gate refuses it.
 
 A result that passes every applicable check records nothing, so the audit is
 quiet on healthy jobs. Failed checks are also stored durably for later SkillOpt
