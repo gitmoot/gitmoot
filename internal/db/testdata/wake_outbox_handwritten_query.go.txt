@@ -1,0 +1,23 @@
+package db
+
+import "time"
+
+func handwrittenWakeOutboxObligationQuery(attemptedBefore time.Time) (string, []any) {
+	return `
+SELECT id, source_kind, source_id, target_role, coalesce_key, state,
+		attempt_count, last_error, created_at, COALESCE(attempted_at, ''),
+		COALESCE(finished_at, ''), updated_at
+FROM wake_outbox
+WHERE state = ? OR (state = ? AND attempted_at IS NOT NULL AND attempted_at <= ?)
+ORDER BY created_at, id`, []any{
+			WakeOutboxStatePending,
+			WakeOutboxStateAttempted,
+			attemptedBefore.UTC().Format(BlockedEpisodeTimeLayout),
+		}
+}
+
+func handwrittenListWakeOutboxObligations() (WakeOutboxObligationProjection, error) {
+	query, args := handwrittenWakeOutboxObligationQuery(time.Time{})
+	_, _ = query, args
+	return WakeOutboxObligationProjection{}, nil
+}
