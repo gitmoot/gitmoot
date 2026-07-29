@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -32,9 +33,9 @@ type eventWakeClient interface {
 	ResolvePaneByLabel(context.Context, string) (string, bool)
 }
 
-// eventRuleSink decorates the existing outbound sink. Its rule work is detached
-// and timeout-bounded so a DB, config, or Herdr failure can never affect the job
-// emitting the event.
+// eventRuleSink decorates the existing outbound sink. Durable event families
+// persist their obligations before Emit returns; remaining rule work is detached
+// and timeout-bounded so delivery failures cannot fail the emitting job.
 type eventRuleSink struct {
 	inner events.Sink
 	store *db.Store
@@ -47,12 +48,47 @@ func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
 		return
 	}
 	events.EmitEvent(ctx, s.inner, event)
-	if s.store == nil || s.wake == nil {
+	if s.store == nil {
 		return
 	}
 	// Classify BEFORE spawning: the webhook's normal (non-classifiable) traffic
 	// never touches the wake path, so it costs no goroutine or context.
-	if len(classifyEventRuleKinds(event)) == 0 {
+	kinds := classifyEventRuleKinds(event)
+	if len(kinds) == 0 {
+		return
+	}
+	if wakeKind, durable := durableWakeKind(kinds); durable {
+		rules, err := s.store.ListEventRules(ctx)
+		if err != nil {
+			slog.Warn("org event rules list failed", "job_id", event.JobID, "error", err)
+			return
+		}
+		targetRoles, remainingRules := partitionDurableWakeRules(rules, kinds, wakeKind, event)
+		if len(targetRoles) > 0 {
+			payload, err := json.Marshal(event)
+			if err != nil {
+				slog.Warn("durable wake event encode failed", "job_id", event.JobID, "kind", wakeKind, "error", err)
+				return
+			}
+			if err := s.store.InsertWakeOutbox(
+				ctx, wakeKind, string(payload), wakeKind, targetRoles,
+			); err != nil {
+				slog.Warn("durable wake outbox insert failed", "job_id", event.JobID, "kind", wakeKind, "error", err)
+				return
+			}
+		}
+		if s.wake == nil || len(remainingRules) == 0 {
+			return
+		}
+		base := context.WithoutCancel(ctx)
+		go func() {
+			if err := s.evaluateSafely(base, event, remainingRules); err != nil {
+				slog.Warn("org event wake failed", "job_id", event.JobID, "error", err)
+			}
+		}()
+		return
+	}
+	if s.wake == nil {
 		return
 	}
 	// Detach from the emitting job's ctx (a cancelled job must never cancel a
@@ -64,6 +100,35 @@ func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
 			slog.Warn("org event wake failed", "job_id", event.JobID, "error", err)
 		}
 	}()
+}
+
+func durableWakeKind(kinds []string) (string, bool) {
+	for _, kind := range kinds {
+		switch kind {
+		case db.WakeOutboxKindBlocked, db.WakeOutboxKindEscalation:
+			return kind, true
+		}
+	}
+	return "", false
+}
+
+func partitionDurableWakeRules(
+	rules []db.EventRule,
+	kinds []string,
+	wakeKind string,
+	event events.Event,
+) (targetRoles []string, remaining []db.EventRule) {
+	for _, rule := range rules {
+		if !rule.Enabled || !containsEventRuleKind(kinds, rule.OnKind) || !eventRuleMatches(rule.MatchFilter, event) {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(rule.OnKind), wakeKind) {
+			targetRoles = append(targetRoles, rule.WakeRole)
+			continue
+		}
+		remaining = append(remaining, rule)
+	}
+	return targetRoles, remaining
 }
 
 // emitWakeOutbox evaluates one already-claimed durable wake synchronously. The

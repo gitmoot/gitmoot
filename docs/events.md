@@ -155,8 +155,8 @@ blocks or fails a job — this mirrors the `escalate_human` notifier contract:
   **dropped** and a single best-effort `event_sink_drop` job event is recorded
   locally (so a drop is observable without coupling delivery to the job).
 
-Webhook delivery has no outbox or retry. Addressed-message role wakes are the
-exception: their producer-agnostic SQL outbox is described below.
+Webhook delivery has no outbox or retry. Reply, blocked, and escalation role
+wakes are the exception: their producer-agnostic SQL outbox is described below.
 
 ## Organization event-rule wakes
 
@@ -202,26 +202,30 @@ observation, or once the subject stops matching for a short grace
 within that grace never resets it, and a later re-block starts a fresh episode.
 Each synthesized event's `detail` carries the stable since-time, so a re-nudge
 (same `job_id` + same since) is distinguishable from a fresh episode.
-`reply` consumes addressed workflow notes and `kind=chat` messages from the
-durable wake outbox and only wakes the role named by both the message and the
-rule. Non-triggering chat back-links such as `job_result` do not enter the
-outbox. The daemon uses rolling five-second windows per role: one wake carries
-`N new items, oldest id X`.
-Pending, attempted, delivered, stalled, and failed remain queryable per outbox
-row, so an escalation that was never attempted is distinct from a successful
-wake. A quiet burst tail is flushed by a later daemon tick; it does not require
-another note. If the outbox or its delivery rules cannot be queried, or an
-outbox row cannot be parsed or claimed, the worker tick fails and the existing
-recovering supervisor retries and escalates a persistent shared-store fault; an
-indeterminate drain is never reported as healthy.
+`reply`, `blocked`, and `escalation` consume durable wake-outbox obligations.
+Reply obligations come from addressed workflow notes and `kind=chat` messages
+and only wake the role named by both the message and the rule. Non-triggering
+chat back-links such as `job_result` do not enter the outbox. Blocked and
+escalation obligations retain the redacted source event. Reply rows commit in
+the source note/chat transaction. Blocked and escalation rows are synchronously
+persisted after the source transition; insert failure is logged but cannot roll
+back the emitting job. The daemon uses rolling five-second windows per event
+kind and role, so same-kind events coalesce while a blocked event and a reply for
+the same role remain separate.
+Pending, attempted, delivered, stalled, failed, and `delivery_unknown` remain
+queryable per outbox row, and outstanding obligations contribute to daemon tick
+health. A quiet burst tail is flushed by a later daemon tick; it does not require
+another event. If the outbox or its delivery rules cannot be queried, or an
+outbox row cannot be parsed or claimed, the drain is logged as unhealthy and
+retried on a later tick without aborting unrelated repository work.
 The wake role's config sets `pane = "<pane-id-or-label>"`: a value containing `:`
 is a `wX:pY` pane id used as-is, any other value is a pane label resolved to the
 current id at wake time (so a recycled pane is still reached). Wake delivery runs
 `herdr agent prompt <pane> <prompt> --wait --timeout 8000` and treats
 `result.type = "agent_prompted"` — and a post-delivery `error.code = "timeout"` —
 as delivered, `error.code = "agent_prompt_stalled"` as not delivered. Missing
-bindings, unavailable Herdr, stalls, and transport errors are swallowed after
-lightweight logging; they never block or fail a job.
+bindings, unavailable Herdr, stalls, and transport errors never block or fail
+the emitting job; durable outcomes remain recorded on their outbox rows.
 
 Each `agent_prompt_stalled` outcome increments a durable, consecutive counter
 for the wake role; a delivered prompt resets that role's counter. Transport
