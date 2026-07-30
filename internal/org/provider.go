@@ -49,11 +49,13 @@ type PaneBinding struct {
 	Detail string
 }
 
-// LivePane is the identity needed to verify that every labeled Herdr pane is
-// claimed by an organization role.
+// LivePane carries the live identity used by validation plus the two directories
+// Herdr reports for branch-safety checks when retiring a seat.
 type LivePane struct {
-	PaneID string
-	Label  string
+	PaneID        string
+	Label         string
+	CWD           string
+	ForegroundCWD string
 }
 
 type RecycleRequest struct {

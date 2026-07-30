@@ -47,6 +47,8 @@ type herdrOrgSnapshotResult struct {
 type herdrOrgPane struct {
 	PaneID            string                  `json:"pane_id"`
 	Label             string                  `json:"label"`
+	CWD               string                  `json:"cwd"`
+	ForegroundCWD     string                  `json:"foreground_cwd"`
 	AgentStatus       string                  `json:"agent_status"`
 	InputPending      bool                    `json:"input_pending"`
 	LastCompletedTurn *herdrCompletedTurnWire `json:"last_completed_turn"`
@@ -82,7 +84,10 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 	paneByID := map[string]herdrOrgPane{}
 	panes := make([]org.LivePane, 0, len(decoded.Result.Snapshot.Panes))
 	for _, pane := range decoded.Result.Snapshot.Panes {
-		panes = append(panes, org.LivePane{PaneID: pane.PaneID, Label: pane.Label})
+		panes = append(panes, org.LivePane{
+			PaneID: pane.PaneID, Label: pane.Label,
+			CWD: pane.CWD, ForegroundCWD: pane.ForegroundCWD,
+		})
 		// Mirror the wake resolver (herdr.go resolvePaneByLabel, which matches only
 		// `p.PaneID != ""`): a pane with an empty pane_id is not a resolvable
 		// target. Seeding it would collide every empty-id pane on the "" key of
