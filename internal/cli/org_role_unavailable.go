@@ -171,6 +171,9 @@ func (h quotaRoleUnavailableHooks) wakeParent(ctx context.Context, job db.Job, p
 		return h.wake.ResolvePaneByLabel(bounded, label)
 	})
 	if !ok {
+		if err := recordUnresolvedRoleWake(ctx, h.store, targetName); err != nil {
+			writeLine(h.stdout, "org role %s quota escalation unresolved wake counter failed for %s: %v", incident.Role, targetName, err)
+		}
 		writeLine(h.stdout, "org role %s quota escalation skipped: parent role %s has no pane", incident.Role, targetName)
 		return
 	}

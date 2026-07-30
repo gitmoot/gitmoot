@@ -6,18 +6,15 @@ import (
 )
 
 // ResolveRolePaneBinding resolves an OrgRole.Pane binding to a Herdr pane id.
-// A binding is treated as a pane label first and as a literal pane id when no
-// live pane has that label. Empty bindings do not resolve.
-func ResolveRolePaneBinding(ctx context.Context, binding string, resolveLabel func(context.Context, string) (string, bool)) (string, bool) {
+// The live resolver accepts either an exact pane label or a literal pane id.
+// Empty and non-live bindings do not resolve.
+func ResolveRolePaneBinding(ctx context.Context, binding string, resolveLivePane func(context.Context, string) (string, bool)) (string, bool) {
 	binding = strings.TrimSpace(binding)
 	if binding == "" {
 		return "", false
 	}
-	if resolved, found := resolveLabel(ctx, binding); found {
+	if resolved, found := resolveLivePane(ctx, binding); found {
 		return resolved, true
-	}
-	if strings.Contains(binding, ":") {
-		return binding, true
 	}
 	return "", false
 }

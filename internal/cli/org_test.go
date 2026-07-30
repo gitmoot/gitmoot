@@ -41,11 +41,25 @@ func TestOrgCommandAndAgentOrgRolePrecedence(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\n"), 0o600); err != nil {
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddEventRule(context.Background(), db.EventRule{ID: "owner-route", OnKind: "reply", WakeRole: "owner", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	withOrgProvider(t, orgFixtureProvider{snapshot: org.Snapshot{
+		PaneBindings: map[string]org.PaneBinding{"owner": {PaneID: "w1:p1"}},
+		Panes:        []org.LivePane{{PaneID: "w1:p1", Label: "owner"}},
+	}})
 	var out, errOut bytes.Buffer
-	if code := runOrg([]string{"validate", "--home", home}, &out, &errOut); code != 0 || out.String() != "ok 1 roles\n" {
+	if code := runOrg([]string{"validate", "--home", home}, &out, &errOut); code != 0 || out.String() != "ok 1 roles, 1 live panes, 1 enabled routes\n" {
 		t.Fatalf("validate code=%d out=%q err=%q", code, out.String(), errOut.String())
 	}
 	out.Reset()
@@ -60,6 +74,138 @@ func TestOrgCommandAndAgentOrgRolePrecedence(t *testing.T) {
 	options, ok = parseAgentAskOptions([]string{"--org-role", "flag-role", "agent", "message"}, &errOut)
 	if !ok || options.orgRole != "flag-role" {
 		t.Fatalf("flag options=%+v ok=%v", options, ok)
+	}
+}
+
+func TestOrgValidateAssertsLiveBindingsRoutesAndPaneClaims(t *testing.T) {
+	tests := []struct {
+		name          string
+		snapshot      org.Snapshot
+		routeRoles    []string
+		wantCode      int
+		wantOutput    []string
+		notWantOutput string
+	}{
+		{
+			name: "healthy",
+			snapshot: org.Snapshot{
+				PaneBindings: map[string]org.PaneBinding{
+					"owner": {PaneID: "w1:p1"}, "review": {PaneID: "w1:p2"},
+				},
+				Panes: []org.LivePane{{PaneID: "w1:p1", Label: "owner"}, {PaneID: "w1:p2", Label: "review"}},
+			},
+			routeRoles: []string{"owner", "review"},
+			wantOutput: []string{"ok 2 roles, 2 live panes, 2 enabled routes"},
+		},
+		{
+			name: "mutant unresolved role binding",
+			snapshot: org.Snapshot{
+				PaneBindings: map[string]org.PaneBinding{
+					"owner": {PaneID: "w1:p1"}, "review": {Detail: `no Herdr pane bound as "missing"`},
+				},
+				Panes: []org.LivePane{{PaneID: "w1:p1", Label: "owner"}},
+			},
+			routeRoles: []string{"owner", "review"},
+			wantCode:   1,
+			wantOutput: []string{
+				"unresolved_roles=1 roles_without_routes=0 unclaimed_labeled_panes=0",
+				`role review pane unresolved: no Herdr pane bound as "missing"`,
+				"paths=presence,event-wake,role-unavailable-nudge",
+			},
+			notWantOutput: "ok 2 roles",
+		},
+		{
+			name: "mutant last route removed",
+			snapshot: org.Snapshot{
+				PaneBindings: map[string]org.PaneBinding{
+					"owner": {PaneID: "w1:p1"}, "review": {PaneID: "w1:p2"},
+				},
+				Panes: []org.LivePane{{PaneID: "w1:p1", Label: "owner"}, {PaneID: "w1:p2", Label: "review"}},
+			},
+			routeRoles: []string{"owner"},
+			wantCode:   1,
+			wantOutput: []string{
+				"unresolved_roles=0 roles_without_routes=1 unclaimed_labeled_panes=0",
+				"role review has no enabled wake route",
+			},
+			notWantOutput: "ok 2 roles",
+		},
+		{
+			name: "mutant unclaimed labeled pane",
+			snapshot: org.Snapshot{
+				PaneBindings: map[string]org.PaneBinding{
+					"owner": {PaneID: "w1:p1"}, "review": {PaneID: "w1:p2"},
+				},
+				Panes: []org.LivePane{
+					{PaneID: "w1:p1", Label: "owner"}, {PaneID: "w1:p2", Label: "review"},
+					{PaneID: "w1:p3", Label: "orphan"},
+				},
+			},
+			routeRoles: []string{"owner", "review"},
+			wantCode:   1,
+			wantOutput: []string{
+				"unresolved_roles=0 roles_without_routes=0 unclaimed_labeled_panes=1",
+				`labeled pane "orphan" (w1:p3) is not claimed by an org role`,
+			},
+			notWantOutput: "ok 2 roles",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			home := t.TempDir()
+			paths := config.PathsForHome(home)
+			if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(paths.ConfigFile, []byte(`
+[org.roles."owner"]
+scope = ["*"]
+pane = "w1:p1"
+[org.roles."review"]
+parent = "owner"
+scope = ["gitmoot/*"]
+pane = "w1:p2"
+`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			store, err := db.Open(paths.Database)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for index, role := range test.routeRoles {
+				if err := store.AddEventRule(context.Background(), db.EventRule{
+					ID: fmt.Sprintf("route-%d", index), OnKind: "reply", WakeRole: role, Enabled: true,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.name == "mutant unresolved role binding" {
+				if err := store.IncrementRoleMissedWake(context.Background(), "review", time.Now()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			withOrgProvider(t, orgFixtureProvider{snapshot: test.snapshot})
+			var stdout, stderr bytes.Buffer
+			code := runOrg([]string{"validate", "--home", home}, &stdout, &stderr)
+			output := stdout.String() + stderr.String()
+			if test.wantCode != 0 {
+				t.Logf("validate failure output:\n%s", output)
+			}
+			if code != test.wantCode {
+				t.Fatalf("code = %d, want %d; output:\n%s", code, test.wantCode, output)
+			}
+			for _, want := range test.wantOutput {
+				if !strings.Contains(output, want) {
+					t.Fatalf("output missing %q:\n%s", want, output)
+				}
+			}
+			if test.notWantOutput != "" && strings.Contains(output, test.notWantOutput) {
+				t.Fatalf("output unexpectedly contains %q:\n%s", test.notWantOutput, output)
+			}
+		})
 	}
 }
 

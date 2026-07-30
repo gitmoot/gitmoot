@@ -246,11 +246,13 @@ health. A quiet burst tail is flushed by a later daemon tick; it does not requir
 another event. If the outbox or its delivery rules cannot be queried, or an
 outbox row cannot be parsed or claimed, the drain is logged as unhealthy and
 retried on a later tick without aborting unrelated repository work.
-The wake role's config sets `pane = "<pane-id-or-label>"`: a value containing `:`
-is a `wX:pY` pane id used as-is, any other value is a pane label resolved to the
-current id at wake time (so a recycled pane is still reached). The same explicit
-binding drives live org presence; an unset binding reports unknown presence and
-causes event wakes to be skipped with an observable log. Wake delivery runs
+The wake role's config sets `pane = "<pane-id-or-label>"`: a `wX:pY` value must
+name a currently live pane, while any other value is a unique pane label
+resolved to the current id at wake time (so a recycled pane is still reached).
+The same explicit binding drives live org presence; an unresolved binding
+reports unknown presence, skips the wake with an observable log, and increments
+the role's missed-wake counter. `gitmoot org validate` reports unresolved roles,
+roles without enabled wake routes, and unclaimed labeled panes. Wake delivery runs
 `herdr agent prompt <pane> <prompt> --wait --timeout 8000` and treats
 `result.type = "agent_prompted"` — and a post-delivery `error.code = "timeout"` —
 as delivered, `error.code = "agent_prompt_stalled"` as not delivered. Missing

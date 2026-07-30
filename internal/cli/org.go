@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -158,13 +159,108 @@ func runOrgValidateOrShow(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if args[0] == "validate" {
-		fmt.Fprintf(stdout, "ok %d roles\n", len(cfg.Roles()))
-		return 0
+		return runOrgValidateReality(context.Background(), paths, cfg, stdout, stderr)
 	}
 	for _, role := range cfg.Roles() {
 		fmt.Fprintf(stdout, "%s\tparent=%s\tscope=%s\tmerge_rule=%s\n", role.Name, role.Parent, strings.Join(role.Scope, ","), firstNonEmpty(role.MergeRule, "owner"))
 	}
 	return 0
+}
+
+type orgValidationSummary struct {
+	roles                int
+	livePanes            int
+	enabledRoutes        int
+	unresolvedRoles      int
+	rolesWithoutRoutes   int
+	unclaimedLabeledPane int
+}
+
+func runOrgValidateReality(ctx context.Context, paths config.Paths, cfg config.OrgConfig, stdout, stderr io.Writer) int {
+	snapshot, err := orgProviderSnapshot(ctx, cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "org validate: Herdr snapshot unavailable: %v\n", err)
+		return 1
+	}
+	store, err := db.OpenReadOnly(paths.Database)
+	if err != nil {
+		fmt.Fprintf(stderr, "org validate: open store: %v\n", err)
+		return 1
+	}
+	defer store.Close()
+	rules, err := store.ListEventRules(ctx)
+	if err != nil {
+		fmt.Fprintf(stderr, "org validate: list event routes: %v\n", err)
+		return 1
+	}
+	missedWakes, err := store.ListRoleMissedWakes(ctx)
+	if err != nil {
+		fmt.Fprintf(stderr, "org validate: list missed wakes: %v\n", err)
+		return 1
+	}
+
+	routesByRole := make(map[string]int)
+	enabledRoutes := 0
+	for _, rule := range rules {
+		if !rule.Enabled {
+			continue
+		}
+		enabledRoutes++
+		routesByRole[strings.ToLower(strings.TrimSpace(rule.WakeRole))]++
+	}
+	missedByRole := make(map[string]int, len(missedWakes))
+	for _, missed := range missedWakes {
+		missedByRole[strings.ToLower(strings.TrimSpace(missed.Role))] = missed.Consecutive
+	}
+	claimedPanes := make(map[string]string)
+	summary := orgValidationSummary{
+		roles: len(cfg.Roles()), livePanes: len(snapshot.Panes), enabledRoutes: enabledRoutes,
+	}
+	var issues []string
+	for _, role := range cfg.Roles() {
+		name := strings.ToLower(strings.TrimSpace(role.Name))
+		binding := snapshot.PaneBindings[name]
+		if strings.TrimSpace(binding.PaneID) == "" {
+			summary.unresolvedRoles++
+			detail := strings.TrimSpace(binding.Detail)
+			if detail == "" {
+				detail = "provider returned no binding decision"
+			}
+			issues = append(issues, fmt.Sprintf(
+				"role %s pane unresolved: %s (paths=presence,event-wake,role-unavailable-nudge missed_wakes=%d)",
+				role.Name, detail, missedByRole[name],
+			))
+		} else {
+			claimedPanes[binding.PaneID] = role.Name
+		}
+		if routesByRole[name] == 0 {
+			summary.rolesWithoutRoutes++
+			issues = append(issues, fmt.Sprintf("role %s has no enabled wake route", role.Name))
+		}
+	}
+	for _, pane := range snapshot.Panes {
+		if strings.TrimSpace(pane.Label) == "" {
+			continue
+		}
+		if _, claimed := claimedPanes[pane.PaneID]; claimed {
+			continue
+		}
+		summary.unclaimedLabeledPane++
+		issues = append(issues, fmt.Sprintf("labeled pane %q (%s) is not claimed by an org role", pane.Label, firstNonEmpty(pane.PaneID, "no pane id")))
+	}
+	sort.Strings(issues)
+	if len(issues) == 0 {
+		fmt.Fprintf(stdout, "ok %d roles, %d live panes, %d enabled routes\n", summary.roles, summary.livePanes, summary.enabledRoutes)
+		return 0
+	}
+	fmt.Fprintf(stderr,
+		"org validate: unresolved_roles=%d roles_without_routes=%d unclaimed_labeled_panes=%d\n",
+		summary.unresolvedRoles, summary.rolesWithoutRoutes, summary.unclaimedLabeledPane,
+	)
+	for _, issue := range issues {
+		fmt.Fprintf(stderr, "- %s\n", issue)
+	}
+	return 1
 }
 
 const starterOrgConfig = `

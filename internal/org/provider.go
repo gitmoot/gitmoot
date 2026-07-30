@@ -39,6 +39,21 @@ type Snapshot struct {
 	States          map[string]RoleLiveState `json:"states"`
 	ObservedAt      time.Time                `json:"observed_at"`
 	ProviderVersion string                   `json:"provider_version,omitempty"`
+	PaneBindings    map[string]PaneBinding   `json:"-"`
+	Panes           []LivePane               `json:"-"`
+}
+
+// PaneBinding records whether a configured role resolves to a live pane.
+type PaneBinding struct {
+	PaneID string
+	Detail string
+}
+
+// LivePane is the identity needed to verify that every labeled Herdr pane is
+// claimed by an organization role.
+type LivePane struct {
+	PaneID string
+	Label  string
 }
 
 type RecycleRequest struct {

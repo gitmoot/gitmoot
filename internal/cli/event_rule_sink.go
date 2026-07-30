@@ -209,6 +209,9 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 		}
 		pane, ok := s.resolveRolePane(ctx, cfg, rule.WakeRole)
 		if !ok {
+			if err := recordUnresolvedRoleWake(ctx, s.store, rule.WakeRole); err != nil {
+				slog.Warn("org event unresolved wake counter failed", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "error", err)
+			}
 			slog.Warn("org event wake skipped", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "reason", "role pane binding unresolved")
 			continue
 		}
@@ -270,6 +273,15 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 		return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "no matching reply rule or role binding", errors.New("no matching reply rule or role binding"))
 	}
 	return nil
+}
+
+func recordUnresolvedRoleWake(ctx context.Context, store *db.Store, role string) error {
+	if store == nil {
+		return nil
+	}
+	counterCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), eventRuleProbeTimeout)
+	defer cancel()
+	return store.IncrementRoleMissedWake(counterCtx, role, time.Now().UTC())
 }
 
 func (s *eventRuleSink) completeWakeOutbox(ctx context.Context, event events.Event, state, detail string, cause error) error {

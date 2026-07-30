@@ -2786,11 +2786,13 @@ health. A quiet burst tail is flushed by a later daemon tick; it does not requir
 another event. If the outbox or its delivery rules cannot be queried, or an
 outbox row cannot be parsed or claimed, the drain is logged as unhealthy and
 retried on a later tick without aborting unrelated repository work.
-The wake role's config sets `pane = "<pane-id-or-label>"`: a value containing `:`
-is a `wX:pY` pane id used as-is, any other value is a pane label resolved to the
-current id at wake time (so a recycled pane is still reached). The same explicit
-binding drives live org presence; an unset binding reports unknown presence and
-causes event wakes to be skipped with an observable log. Wake delivery runs
+The wake role's config sets `pane = "<pane-id-or-label>"`: a `wX:pY` value must
+name a currently live pane, while any other value is a unique pane label
+resolved to the current id at wake time (so a recycled pane is still reached).
+The same explicit binding drives live org presence; an unresolved binding
+reports unknown presence, skips the wake with an observable log, and increments
+the role's missed-wake counter. `gitmoot org validate` reports unresolved roles,
+roles without enabled wake routes, and unclaimed labeled panes. Wake delivery runs
 `herdr agent prompt <pane> <prompt> --wait --timeout 8000` and treats
 `result.type = "agent_prompted"` — and a post-delivery `error.code = "timeout"` —
 as delivered, `error.code = "agent_prompt_stalled"` as not delivered. Missing
@@ -11003,17 +11005,20 @@ gitmoot org status [--json]
 ```
 
 `gitmoot org validate [--home PATH]` validates the optional local `[org]`
-registry and prints its role count. `gitmoot org show [--home PATH]` prints the
-resolved role table.
+registry against the live Herdr snapshot and event-rule store. It fails when a
+role has no live pane, has no enabled wake route, or a labeled live pane is not
+claimed by any role; each failure includes category counts and a reason.
+`gitmoot org show [--home PATH]` prints the resolved role table.
 
 The registry uses `[org] enforce = "warn"|"block"` and
 `[org.roles."name"]` entries with `parent`, `scope`, `merge_rule`, an optional
 cosmetic `display_name`, an optional `model` runtime pin, an optional per-role
 `recycle_after` duration override, and an optional `pane` Herdr binding (used by
 live presence and org event-rule wakes).
-The binding resolves as an exact live pane label first, then as a literal pane
-id. Roles without a binding report unknown live presence, and event wakes for
-them are skipped with an observable log rather than inferred from a pane label. There is
+The binding resolves as a unique exact live pane label or a currently live
+literal pane id. Roles without a binding report unknown live presence, and event
+wakes for them are skipped with an observable log and increment the role's
+missed-wake counter rather than being inferred from a pane label. There is
 exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
 `owner/repo`, and each child scope must be covered by its parent. Malformed
 org configuration fails closed and loudly. `brief` records passive last-seen
