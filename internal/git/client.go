@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -16,6 +17,8 @@ type Client struct {
 	Runner subprocess.Runner
 	Dir    string
 }
+
+const maxGitErrorStderrRunes = 4096
 
 func (c Client) CreateBranch(ctx context.Context, branch string, base string) error {
 	if err := validateBranch(branch); err != nil {
@@ -185,7 +188,15 @@ func (c Client) RemoveWorktreeForce(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
-	_, err = c.run(ctx, "worktree", "remove", "--force", path)
+	result, err := c.run(ctx, "worktree", "remove", "--force", path)
+	if err == nil || !strings.Contains(strings.ToLower(result.Stderr), "is not a working tree") {
+		return err
+	}
+	owner, ownerErr := worktreeOwnerCheckout(path)
+	if ownerErr != nil || filepath.Clean(owner) == filepath.Clean(c.Dir) {
+		return err
+	}
+	_, err = (Client{Runner: c.Runner, Dir: owner}).run(ctx, "worktree", "remove", "--force", path)
 	return err
 }
 
@@ -557,9 +568,49 @@ func (c Client) run(ctx context.Context, args ...string) (subprocess.Result, err
 	}
 	result, err := runner.Run(ctx, c.Dir, "git", args...)
 	if err != nil {
+		if stderr := boundedGitErrorStderr(result.Stderr); stderr != "" {
+			return result, fmt.Errorf("git %s: %w (stderr: %s)", strings.Join(args, " "), err, stderr)
+		}
 		return result, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
 	return result, nil
+}
+
+func boundedGitErrorStderr(stderr string) string {
+	stderr = strings.TrimSpace(stderr)
+	runes := []rune(stderr)
+	if len(runes) <= maxGitErrorStderrRunes {
+		return stderr
+	}
+	return string(runes[:maxGitErrorStderrRunes]) + "..."
+}
+
+// worktreeOwnerCheckout resolves the repository that owns a linked worktree
+// from the worktree's gitdir pointer, even when Client.Dir is a different clone.
+func worktreeOwnerCheckout(path string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(path, ".git"))
+	if err != nil {
+		return "", err
+	}
+	line, _, _ := strings.Cut(strings.TrimSpace(string(data)), "\n")
+	gitDir, ok := strings.CutPrefix(strings.TrimSpace(line), "gitdir:")
+	if !ok {
+		return "", fmt.Errorf("worktree %s has no gitdir pointer", path)
+	}
+	gitDir = strings.TrimSpace(gitDir)
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(path, gitDir)
+	}
+	gitDir = filepath.Clean(gitDir)
+	worktreesDir := filepath.Dir(gitDir)
+	if filepath.Base(worktreesDir) != "worktrees" {
+		return "", fmt.Errorf("worktree %s has unexpected gitdir %s", path, gitDir)
+	}
+	commonDir := filepath.Dir(worktreesDir)
+	if filepath.Base(commonDir) == ".git" {
+		return filepath.Dir(commonDir), nil
+	}
+	return commonDir, nil
 }
 
 func validateBranch(branch string) error {
