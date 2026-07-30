@@ -209,6 +209,7 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 		}
 		pane, ok := s.resolveRolePane(ctx, cfg, rule.WakeRole)
 		if !ok {
+			slog.Warn("org event wake skipped", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "reason", "role pane binding unresolved")
 			continue
 		}
 		prompt := eventRuleWakePrompt(rule.OnKind, event)

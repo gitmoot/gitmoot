@@ -16,5 +16,8 @@ func ResolveRolePaneBinding(ctx context.Context, binding string, resolveLabel fu
 	if resolved, found := resolveLabel(ctx, binding); found {
 		return resolved, true
 	}
-	return binding, true
+	if strings.Contains(binding, ":") {
+		return binding, true
+	}
+	return "", false
 }

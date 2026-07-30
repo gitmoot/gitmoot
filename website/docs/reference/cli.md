@@ -1057,8 +1057,9 @@ The registry uses `[org] enforce = "warn"|"block"` and
 `[org.roles."name"]` entries with `parent`, `scope`, `merge_rule`, an optional
 cosmetic `display_name`, an optional `model` runtime pin, an optional per-role
 `recycle_after` duration override, and an optional `pane` Herdr binding. The
-binding resolves as an exact live pane label first, then as a literal pane id;
-roles without a binding retain exact role-name-as-label presence lookup. There
+binding resolves as an exact live pane label first, then as a literal pane id.
+Roles without a binding report unknown live presence, and event wakes for them
+are skipped with an observable log rather than inferred from a pane label. There
 is exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
 `owner/repo`. Malformed org configuration fails closed and loudly. `brief`
 records passive last-seen presence for its role and can render static context

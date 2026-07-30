@@ -35,9 +35,11 @@ func TestHerdrOrgProviderSnapshotMapping(t *testing.T) {
 ]}}}`, nil
 	}
 	provider := newHerdrOrgProvider(run, []config.OrgRole{
-		{Name: "owner"}, {Name: "review"}, {Name: "done"}, {Name: "idle"}, {Name: "future"},
-		{Name: "duplicate"}, {Name: "missing"}, {Name: "whitespace-label"}, {Name: "whitespace-status"},
-		{Name: "pending-working"}, {Name: "pending-idle"}, {Name: "pending-unknown"},
+		{Name: "owner", Pane: "owner"}, {Name: "review", Pane: "review"}, {Name: "done", Pane: "done"},
+		{Name: "idle", Pane: "idle"}, {Name: "future", Pane: "future"}, {Name: "duplicate", Pane: "duplicate"},
+		{Name: "missing", Pane: "missing"}, {Name: "whitespace-label", Pane: "whitespace-label"},
+		{Name: "whitespace-status", Pane: "whitespace-status"}, {Name: "pending-working", Pane: "pending-working"},
+		{Name: "pending-idle", Pane: "pending-idle"}, {Name: "pending-unknown", Pane: "pending-unknown"},
 	}, func() time.Time { return observed })
 	snapshot, err := provider.Snapshot(context.Background())
 	if err != nil {
@@ -72,6 +74,78 @@ func TestHerdrOrgProviderSnapshotMapping(t *testing.T) {
 		if activity := snapshot.States[role].Activity; activity != nil {
 			t.Errorf("activity[%s] = %+v, want absent", role, activity)
 		}
+	}
+}
+
+func TestHerdrOrgProviderPresenceWakePaneBindingParity(t *testing.T) {
+	const panes = `[
+{"pane_id":"w1:p1","label":"unique-label","agent_status":"working"},
+{"pane_id":"w1:p2","label":"duplicate-label","agent_status":"idle"},
+{"pane_id":"w1:p3","label":"duplicate-label","agent_status":"blocked"},
+{"pane_id":"w1:p4","label":"literal-label","agent_status":"done"},
+{"pane_id":"w1:p5","label":"empty-binding","agent_status":"working"}
+]`
+	run := func(_ context.Context, args ...string) (string, error) {
+		switch strings.Join(args, " ") {
+		case "api snapshot":
+			return `{"result":{"snapshot":{"version":"0.7.5","panes":` + panes + `}}}`, nil
+		case "pane list":
+			return `{"result":{"panes":` + panes + `}}`, nil
+		default:
+			t.Fatalf("unexpected Herdr args: %v", args)
+			return "", nil
+		}
+	}
+	client := herdrClient{run: run}
+	resolveWake := func(binding string) (string, bool) {
+		paneID, ok := config.ResolveRolePaneBinding(context.Background(), binding, func(_ context.Context, label string) (string, bool) {
+			resolved, found, err := client.resolvePaneByLabel(context.Background(), label)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !found {
+				return "", false
+			}
+			return resolved, true
+		})
+		return paneID, ok
+	}
+	tests := []struct {
+		name       string
+		binding    string
+		wantPane   string
+		wantState  org.LifecycleState
+		wantDetail string
+		wantOK     bool
+	}{
+		{name: "empty binding", binding: "", wantState: org.StateUnknown, wantDetail: "Herdr pane binding is unset"},
+		{name: "binding matching one label", binding: "unique-label", wantPane: "w1:p1", wantState: org.StateWorking, wantOK: true},
+		{name: "binding matching multiple labels", binding: "duplicate-label", wantState: org.StateUnknown},
+		{name: "literal pane id", binding: "w1:p4", wantPane: "w1:p4", wantState: org.StateDone, wantOK: true},
+		{name: "binding matching nothing", binding: "missing-label", wantState: org.StateUnknown},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot, err := newHerdrOrgProvider(run, []config.OrgRole{{
+				Name: "empty-binding", Pane: test.binding,
+			}}, time.Now).Snapshot(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			wakePane, wakeOK := resolveWake(test.binding)
+			if wakePane != test.wantPane || wakeOK != test.wantOK {
+				t.Fatalf("wake resolution = (%q, %t), want (%q, %t)", wakePane, wakeOK, test.wantPane, test.wantOK)
+			}
+			if got := snapshot.States["empty-binding"].State; got != test.wantState {
+				t.Fatalf("presence state = %q, want %q; wake resolution = (%q, %t)", got, test.wantState, wakePane, wakeOK)
+			}
+			if test.wantDetail != "" && snapshot.States["empty-binding"].Detail != test.wantDetail {
+				t.Fatalf("presence detail = %q, want %q", snapshot.States["empty-binding"].Detail, test.wantDetail)
+			}
+			if (snapshot.States["empty-binding"].State != org.StateUnknown) != wakeOK {
+				t.Fatalf("presence/wake parity: presence = %+v, wake resolution = (%q, %t)", snapshot.States["empty-binding"], wakePane, wakeOK)
+			}
+		})
 	}
 }
 
@@ -148,7 +222,7 @@ func TestHerdrOrgProviderSnapshotAbsentTurnIsOmitted(t *testing.T) {
 {"pane_id":"w1:p1","label":"owner","agent_status":"idle"}
 ]}}}`, nil
 	}
-	provider := newHerdrOrgProvider(run, []config.OrgRole{{Name: "owner"}}, time.Now)
+	provider := newHerdrOrgProvider(run, []config.OrgRole{{Name: "owner", Pane: "owner"}}, time.Now)
 	snapshot, err := provider.Snapshot(context.Background())
 	if err != nil {
 		t.Fatalf("Snapshot() error = %v", err)
@@ -175,7 +249,7 @@ func TestHerdrOrgProviderSnapshotPartialTurnIsAbsent(t *testing.T) {
 {"pane_id":"w1:p1","label":"owner","agent_status":"working","last_completed_turn":{"turn":1,"turn_epoch":2}}
 ]}}}`, nil
 	}
-	provider := newHerdrOrgProvider(run, []config.OrgRole{{Name: "owner"}}, time.Now)
+	provider := newHerdrOrgProvider(run, []config.OrgRole{{Name: "owner", Pane: "owner"}}, time.Now)
 	snapshot, err := provider.Snapshot(context.Background())
 	if err != nil {
 		t.Fatalf("Snapshot() error = %v", err)
@@ -205,7 +279,7 @@ func TestHerdrOrgProviderSnapshotInvalidTurnValuesAreAbsent(t *testing.T) {
 {"pane_id":"w1:p1","label":"owner","agent_status":"working","last_completed_turn":` + test.turn + `}
 ]}}}`, nil
 			}
-			provider := newHerdrOrgProvider(run, []config.OrgRole{{Name: "owner"}}, time.Now)
+			provider := newHerdrOrgProvider(run, []config.OrgRole{{Name: "owner", Pane: "owner"}}, time.Now)
 			snapshot, err := provider.Snapshot(context.Background())
 			if err != nil {
 				t.Fatalf("Snapshot() error = %v", err)
@@ -226,7 +300,7 @@ func TestHerdrOrgProviderSnapshotOversizedUint64TurnEpochFailsClosedPerPane(t *t
 ]}}}`, nil
 	}
 	provider := newHerdrOrgProvider(run, []config.OrgRole{
-		{Name: "oversized"}, {Name: "valid"}, {Name: "absent"},
+		{Name: "oversized", Pane: "oversized"}, {Name: "valid", Pane: "valid"}, {Name: "absent", Pane: "absent"},
 	}, time.Now)
 	snapshot, err := provider.Snapshot(context.Background())
 	if err != nil {

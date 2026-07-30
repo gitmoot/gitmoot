@@ -121,6 +121,7 @@ const herdrWakeTimeoutMS = 8000
 //   - error.code=agent_prompt_stalled (stderr, non-zero exit): submitted but no
 //     state change in herdr's effect window: not delivered, but a normal outcome,
 //     not a transport error.
+//
 // It reads the combined stream so the stderr envelopes above stay parseable.
 func (c herdrClient) agentPrompt(ctx context.Context, pane, prompt, until string) (delivered bool, stalled bool, err error) {
 	args := []string{"agent", "prompt", pane, prompt, "--wait", "--timeout", strconv.Itoa(herdrWakeTimeoutMS)}
@@ -296,7 +297,8 @@ func (c herdrClient) paneList(ctx context.Context) ([]string, error) {
 // resolvePaneByLabel returns the CURRENT pane id whose herdr label exactly equals
 // label. It is resolved at call (wake) time so a recycled pane's fresh id is
 // always used — the reason the org binding may name a stable label instead of a
-// wX:pY id. ok is false (with a nil error) when no live pane carries the label.
+// wX:pY id. ok is false (with a nil error) unless exactly one live pane carries
+// the label.
 func (c herdrClient) resolvePaneByLabel(ctx context.Context, label string) (string, bool, error) {
 	label = strings.TrimSpace(label)
 	if label == "" {
@@ -310,12 +312,16 @@ func (c herdrClient) resolvePaneByLabel(ctx context.Context, label string) (stri
 	if err := json.Unmarshal([]byte(out), &pl); err != nil {
 		return "", false, fmt.Errorf("parse pane list: %w", err)
 	}
+	resolved := ""
 	for _, p := range pl.Result.Panes {
 		if p.PaneID != "" && p.Label == label {
-			return p.PaneID, true, nil
+			if resolved != "" {
+				return "", false, nil
+			}
+			resolved = p.PaneID
 		}
 	}
-	return "", false, nil
+	return resolved, resolved != "", nil
 }
 
 // shortJobID trims a job id to the 8-char form used in the gm-<jobid8> agent
