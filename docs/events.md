@@ -240,7 +240,9 @@ outbox row cannot be parsed or claimed, the drain is logged as unhealthy and
 retried on a later tick without aborting unrelated repository work.
 The wake role's config sets `pane = "<pane-id-or-label>"`: a value containing `:`
 is a `wX:pY` pane id used as-is, any other value is a pane label resolved to the
-current id at wake time (so a recycled pane is still reached). Wake delivery runs
+current id at wake time (so a recycled pane is still reached). The same explicit
+binding drives live org presence; an unset binding reports unknown presence and
+causes event wakes to be skipped with an observable log. Wake delivery runs
 `herdr agent prompt <pane> <prompt> --wait --timeout 8000` and treats
 `result.type = "agent_prompted"` — and a post-delivery `error.code = "timeout"` —
 as delivered, `error.code = "agent_prompt_stalled"` as not delivered. Missing

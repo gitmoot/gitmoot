@@ -17,6 +17,7 @@ func TestResolveRolePaneBinding(t *testing.T) {
 		{name: "empty", binding: " \t ", wantPane: "", wantOK: false},
 		{name: "label resolves", binding: " coordinator ", resolutions: map[string]string{"coordinator": "w2:p5"}, wantPane: "w2:p5", wantOK: true},
 		{name: "unknown label is literal id", binding: "w1:p2", wantPane: "w1:p2", wantOK: true},
+		{name: "unknown label does not resolve", binding: "coordinator", wantPane: "", wantOK: false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
