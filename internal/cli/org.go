@@ -1030,6 +1030,7 @@ func runOrgEscalateResolve(args []string, stdout, stderr io.Writer) int {
 	}
 
 	var workflowID string
+	var unaddressedResolution bool
 	if err := withStore(*home, func(store *db.Store) error {
 		ctx := context.Background()
 		target, err := store.GetWorkflowNote(ctx, escalationNoteID)
@@ -1039,7 +1040,7 @@ func runOrgEscalateResolve(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
-		_, to, _, _, parsed := workflow.ParseOrgEscalateNote(target.Body)
+		asker, to, parsed := orgEscalationResolveParties(target.Body)
 		if !parsed {
 			return fmt.Errorf("note %d is not an org escalation", escalationNoteID)
 		}
@@ -1052,21 +1053,68 @@ func runOrgEscalateResolve(args []string, stdout, stderr io.Writer) int {
 			return fmt.Errorf("invalid resolving role %q", resolvedBy)
 		}
 		if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
-			WorkflowID: target.WorkflowID,
-			Author:     resolvedBy,
-			Body:       body,
-			Repo:       target.Repo,
+			WorkflowID:      target.WorkflowID,
+			Author:          resolvedBy,
+			Body:            body,
+			Repo:            target.Repo,
+			AddressedTarget: asker,
 		}); err != nil {
 			return err
 		}
 		workflowID = target.WorkflowID
+		unaddressedResolution = asker == ""
 		return nil
 	}); err != nil {
 		fmt.Fprintf(stderr, "org escalate resolve: %v\n", err)
 		return 1
 	}
+	if unaddressedResolution {
+		fmt.Fprintf(stderr, "org escalate resolve: warning: escalation note %d has no identifiable asker; resolution recorded without wake\n", escalationNoteID)
+	}
 	fmt.Fprintf(stdout, "resolved escalation %d in workflow %s\n", escalationNoteID, workflowID)
 	return 0
+}
+
+// orgEscalationResolveParties reads the asker and target from a typed
+// escalation. The strict parser owns the normal schema. The compatibility path
+// accepts only that same schema with its from field absent or empty, allowing a
+// legacy resolution to be recorded without inventing an addressed target.
+func orgEscalationResolveParties(body string) (asker, to string, ok bool) {
+	asker, to, _, _, ok = workflow.ParseOrgEscalateNote(body)
+	if ok {
+		return asker, to, true
+	}
+	if !strings.HasPrefix(body, workflow.OrgEscalatePrefix) {
+		return "", "", false
+	}
+	end := strings.IndexByte(body, ']')
+	if end < 0 {
+		return "", "", false
+	}
+	fields := strings.Fields(body[len(workflow.OrgEscalatePrefix):end])
+	withoutAsker := make([]string, 0, len(fields))
+	missingAsker := true
+	for _, field := range fields {
+		switch {
+		case field == "from=":
+			continue
+		case strings.HasPrefix(field, "from="):
+			missingAsker = false
+		}
+		withoutAsker = append(withoutAsker, field)
+	}
+	if !missingAsker || len(withoutAsker) != 2 {
+		return "", "", false
+	}
+	reconstructed := workflow.OrgEscalatePrefix +
+		strings.Join(withoutAsker, " ") +
+		" from=unidentified" +
+		body[end:]
+	_, to, _, _, ok = workflow.ParseOrgEscalateNote(reconstructed)
+	if !ok {
+		return "", "", false
+	}
+	return "", to, true
 }
 
 func orgEscalateResolveIDAndFlags(args []string) (string, []string, bool) {

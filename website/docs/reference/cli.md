@@ -1204,9 +1204,12 @@ the addressed role through its configured Herdr pane.
 `gitmoot org escalate resolve <escalation-note-id> [--by <role>] [--note
 <answer-note-id>] [--home <dir>]` appends a typed resolution marker to the same
 workflow journal. `--by` defaults to the escalation's target role, and `--note`
-optionally links the workflow note containing the answer. Resolved escalations
-are omitted from org dashboard projections while the original journal entry
-remains intact.
+optionally links the workflow note containing the answer. The resolution marker
+is addressed to the escalation's parsed asker and atomically records a pending
+reply wake-outbox row, so an opt-in `reply` rule wakes the asker. A legacy typed
+escalation with no identifiable asker still resolves, prints a warning, and
+records no invented target. Resolved escalations are omitted from org dashboard
+projections while the original journal entry remains intact.
 
 Event-rule wakes are separately opt-in:
 
