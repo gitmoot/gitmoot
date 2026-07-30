@@ -557,6 +557,9 @@ type tickCandidates struct {
 	reclaim         candidateMemo
 	agedReclaim     candidateMemo
 	skipAgedReclaim bool
+	// A best-effort reclaim failure stays outside tick health but must not advance
+	// the success cadence; the fresh per-tick carrier keeps that signal bounded.
+	agedReclaimFailed bool
 }
 
 // newTickCandidates is a package var (not a plain func) only so the once-per-tick
@@ -828,7 +831,8 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 		if ttl, err := resolveDelegationWorktreeTTL(filepath.Dir(store.DatabasePath())); err != nil {
 			writeLine(stdout, "delegation_worktree_ttl reclaim skipped: %v", err)
 		} else if err := reclaimAgedTerminalDelegationWorktrees(ctx, worker, repoFilter, rootFilter, tracker.checkoutHeld, cand, now, ttl); err != nil {
-			return err
+			cand.agedReclaimFailed = true
+			writeLine(stdout, "delegation_worktree_ttl reclaim failed: %v", err)
 		}
 	}
 	// Comment retries only post PR comments through the commenter — they never
@@ -858,7 +862,7 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	if err != nil {
 		return err
 	}
-	if ownsCandidates && cand.agedReclaim.done {
+	if ownsCandidates && cand.agedReclaim.done && !cand.agedReclaimFailed {
 		tracker.markAgedDelegationWorktreeReclaimSuccessful(now)
 	}
 	return nil
@@ -921,7 +925,7 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 			writeLine(stdout, "%s: worker tick error: %v", repo.FullName(), tickErr)
 		}
 	}
-	if failed == 0 && runAgedReclaim && cand.agedReclaim.done {
+	if failed == 0 && runAgedReclaim && cand.agedReclaim.done && !cand.agedReclaimFailed {
 		tracker.markAgedDelegationWorktreeReclaimSuccessful(now)
 	}
 	// Every enabled repo failing is the global-fault signal: return it so the
