@@ -154,6 +154,19 @@ func TestOrgEscalateResolveLifecycle(t *testing.T) {
 		store.Close()
 		t.Fatalf("resolution note = %+v, target = %+v", resolutions[0], target)
 	}
+	outbox, err := store.ListWakeOutbox(ctx, "")
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if len(outbox) != 1 ||
+		outbox[0].SourceKind != db.WakeOutboxSourceWorkflowNote ||
+		outbox[0].SourceID != fmt.Sprint(resolutions[0].ID) ||
+		outbox[0].TargetRole != "operator" ||
+		outbox[0].State != db.WakeOutboxStatePending {
+		store.Close()
+		t.Fatalf("resolution wake outbox = %+v, want stored pending workflow-note row source=%d addressed to operator", outbox, resolutions[0].ID)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -174,6 +187,49 @@ func TestOrgEscalateResolveLifecycle(t *testing.T) {
 				t.Fatalf("resolve code=%d out=%q err=%q, want %q", code, out.String(), errOut.String(), test.want)
 			}
 		})
+	}
+}
+
+func TestOrgEscalateResolveWithoutIdentifiableAskerRecordsObservableUnaddressedResolution(t *testing.T) {
+	home := writeOrgEscalateConfig(t)
+	store := openCLIJobStore(t, home)
+	ctx := context.Background()
+	target, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/legacy",
+		Author:     "legacy",
+		Body:       "[org:escalate to=owner wf=release/legacy] Need a decision.",
+		Repo:       "acme/widget",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runOrg([]string{"escalate", "resolve", fmt.Sprint(target.ID), "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("resolve code=%d out=%q err=%q, want resolution recorded", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "no identifiable asker") || !strings.Contains(stderr.String(), "recorded without wake") {
+		t.Fatalf("resolve stderr=%q, want observable unaddressed-resolution warning", stderr.String())
+	}
+	store = openCLIJobStore(t, home)
+	defer store.Close()
+	resolutions, err := store.ListWorkflowNotesByBodyPrefix(ctx, workflow.OrgEscalateResolvedPrefix, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resolutions) != 1 {
+		t.Fatalf("stored resolution notes = %+v, want one", resolutions)
+	}
+	outbox, err := store.ListWakeOutbox(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outbox) != 0 {
+		t.Fatalf("stored wake outbox = %+v, want no invented target", outbox)
 	}
 }
 
