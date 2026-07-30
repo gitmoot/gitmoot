@@ -117,6 +117,84 @@ func TestTeeRunnerRunEnvTeesAndInjects(t *testing.T) {
 	}
 }
 
+func TestTeeRunnerEnvInjectingRunnerStreamsEnvironmentAndPID(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell command differs on windows")
+	}
+
+	newRunner := func(out *bytes.Buffer) TeeRunner {
+		return TeeRunner{
+			Inner: EnvInjectingRunner{
+				Inner: GroupRunner{},
+				Env: []string{
+					"GITMOOT_INJECTED=wrapper",
+					"GITMOOT_SHARED=wrapper",
+				},
+			},
+			Out: out,
+		}
+	}
+	callEnv := []string{
+		"GITMOOT_CALL_ENV=call",
+		"GITMOOT_SHARED=call",
+	}
+
+	t.Run("RunEnv", func(t *testing.T) {
+		var tee bytes.Buffer
+		result, err := newRunner(&tee).RunEnv(
+			context.Background(),
+			"",
+			callEnv,
+			"sh",
+			"-c",
+			`printf '%s' "$GITMOOT_INJECTED:$GITMOOT_CALL_ENV:$GITMOOT_SHARED"`,
+		)
+		if err != nil {
+			t.Fatalf("TeeRunner.RunEnv: %v", err)
+		}
+		const want = "wrapper:call:call"
+		if result.Stdout != want || strings.TrimSuffix(tee.String(), "\n") != want {
+			t.Fatalf("stdout=%q tee=%q, want %q", result.Stdout, tee.String(), want)
+		}
+	})
+
+	t.Run("RunEnvWithPID", func(t *testing.T) {
+		var (
+			tee      bytes.Buffer
+			captured int
+		)
+		result, err := newRunner(&tee).RunEnvWithPID(
+			context.Background(),
+			"",
+			callEnv,
+			func(pid int) { captured = pid },
+			"sh",
+			"-c",
+			`printf '%s' "$GITMOOT_INJECTED:$GITMOOT_CALL_ENV:$GITMOOT_SHARED:$$"`,
+		)
+		if err != nil {
+			t.Fatalf("TeeRunner.RunEnvWithPID: %v", err)
+		}
+		fields := strings.Split(result.Stdout, ":")
+		if len(fields) != 4 {
+			t.Fatalf("stdout=%q, want injected env and child PID", result.Stdout)
+		}
+		if got := strings.Join(fields[:3], ":"); got != "wrapper:call:call" {
+			t.Fatalf("injected env = %q, want %q", got, "wrapper:call:call")
+		}
+		reported, err := strconv.Atoi(fields[3])
+		if err != nil {
+			t.Fatalf("parse child PID from stdout %q: %v", result.Stdout, err)
+		}
+		if captured <= 0 || captured != reported {
+			t.Fatalf("captured PID = %d, child reported %d", captured, reported)
+		}
+		if strings.TrimSuffix(tee.String(), "\n") != result.Stdout {
+			t.Fatalf("tee=%q, want stdout %q", tee.String(), result.Stdout)
+		}
+	})
+}
+
 // TestTeeRunnerNilOutDegradesToRun: a nil Out leaves behavior byte-identical to
 // the inner runner's plain Run — the tee is opt-in via a non-nil writer.
 func TestTeeRunnerNilOutDegradesToRun(t *testing.T) {

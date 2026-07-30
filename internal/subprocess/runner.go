@@ -208,6 +208,18 @@ func (r EnvInjectingRunner) Run(ctx context.Context, dir string, command string,
 	return Result{}, errors.New("environment-injecting runner inner does not support environment injection")
 }
 
+func (r EnvInjectingRunner) RunStream(ctx context.Context, dir string, out io.Writer, command string, args ...string) (Result, error) {
+	if inner, ok := r.inner().(EnvStreamRunner); ok {
+		return inner.RunEnvStream(ctx, dir, r.Env, out, command, args...)
+	}
+	if len(r.Env) == 0 {
+		if inner, ok := r.inner().(StreamRunner); ok {
+			return inner.RunStream(ctx, dir, out, command, args...)
+		}
+	}
+	return Result{}, errors.New("environment-injecting runner inner does not support environment streaming")
+}
+
 func (r EnvInjectingRunner) RunWithPID(ctx context.Context, dir string, onPID PIDCallback, command string, args ...string) (Result, error) {
 	if inner, ok := r.inner().(EnvPIDRunner); ok {
 		return inner.RunEnvWithPID(ctx, dir, r.Env, onPID, command, args...)
@@ -231,6 +243,19 @@ func (r EnvInjectingRunner) RunEnv(ctx context.Context, dir string, env []string
 	return Result{}, errors.New("environment-injecting runner inner does not support environment injection")
 }
 
+func (r EnvInjectingRunner) RunEnvStream(ctx context.Context, dir string, env []string, out io.Writer, command string, args ...string) (Result, error) {
+	merged := append(append([]string{}, r.Env...), env...)
+	if inner, ok := r.inner().(EnvStreamRunner); ok {
+		return inner.RunEnvStream(ctx, dir, merged, out, command, args...)
+	}
+	if len(merged) == 0 {
+		if inner, ok := r.inner().(StreamRunner); ok {
+			return inner.RunStream(ctx, dir, out, command, args...)
+		}
+	}
+	return Result{}, errors.New("environment-injecting runner inner does not support environment streaming")
+}
+
 func (r EnvInjectingRunner) RunEnvWithPID(ctx context.Context, dir string, env []string, onPID PIDCallback, command string, args ...string) (Result, error) {
 	merged := append(append([]string{}, r.Env...), env...)
 	if inner, ok := r.inner().(EnvPIDRunner); ok {
@@ -242,6 +267,19 @@ func (r EnvInjectingRunner) RunEnvWithPID(ctx context.Context, dir string, env [
 		}
 	}
 	return Result{}, errors.New("environment-injecting runner inner does not support environment PID capture")
+}
+
+func (r EnvInjectingRunner) RunEnvStreamWithPID(ctx context.Context, dir string, env []string, out io.Writer, onPID PIDCallback, command string, args ...string) (Result, error) {
+	merged := append(append([]string{}, r.Env...), env...)
+	if inner, ok := r.inner().(EnvPIDStreamRunner); ok {
+		return inner.RunEnvStreamWithPID(ctx, dir, merged, out, onPID, command, args...)
+	}
+	if len(merged) == 0 {
+		if inner, ok := r.inner().(PIDStreamRunner); ok {
+			return inner.RunStreamWithPID(ctx, dir, out, onPID, command, args...)
+		}
+	}
+	return Result{}, errors.New("environment-injecting runner inner does not support environment PID streaming")
 }
 
 func (r EnvInjectingRunner) LookPath(file string) (string, error) {
