@@ -92,6 +92,54 @@ func TestCaptureQuotaRoleUnavailableEscalatesOnceAndSuccessClears(t *testing.T) 
 	}
 }
 
+func TestQuotaRoleUnavailableNudgeCountsUnresolvedParentBinding(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(`
+[org.roles."owner"]
+scope = ["*"]
+pane = "missing-label"
+[org.roles."review"]
+parent = "owner"
+scope = ["gitmoot/*"]
+pane = "w1:p2"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var output bytes.Buffer
+	wake := &fakeEventWake{}
+	hooks := quotaRoleUnavailableHooks{store: store, home: home, stdout: &output, wake: wake}
+	hooks.wakeParent(
+		context.Background(),
+		db.Job{ID: "job-quota"},
+		workflow.JobPayload{Repo: "gitmoot/gitmoot", ActingOrgRole: "review"},
+		db.OrgRoleUnavailable{Role: "review", Until: time.Now().Add(time.Hour).Format(db.BlockedEpisodeTimeLayout)},
+		true,
+		true,
+	)
+	missed, err := store.ListRoleMissedWakes(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missed) != 1 || missed[0].Role != "owner" || missed[0].Consecutive != 1 {
+		t.Fatalf("unresolved parent missed wakes = %+v, want owner count 1", missed)
+	}
+	if !strings.Contains(output.String(), "parent role owner has no pane") {
+		t.Fatalf("output = %q", output.String())
+	}
+	if wake.promptCalls != 0 {
+		t.Fatalf("unresolved parent prompted %d times", wake.promptCalls)
+	}
+}
+
 func TestCaptureQuotaRoleUnavailableClaudeOnly(t *testing.T) {
 	store := daemonWorkerStore(t)
 	worker := jobWorker{Store: store}

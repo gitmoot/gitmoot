@@ -250,10 +250,9 @@ func (c *Cockpit) AgentPrompt(ctx context.Context, pane, prompt, until string) (
 	return c.client.agentPrompt(ctx, pane, prompt, until)
 }
 
-// ResolvePaneByLabel resolves a herdr pane label to its current pane id. It backs
-// the org event-rule role→pane binding when the configured value is a stable
-// label rather than a wX:pY id, so a recycled pane is still reached. It is
-// best-effort: any herdr error reports "not found" so a wake stays a no-op.
+// ResolvePaneByLabel resolves a Herdr pane binding (an exact label or literal
+// pane id) to its current live pane id. Stable labels keep reaching recycled
+// panes; stale literal ids fail. Any Herdr error reports "not found".
 func (c *Cockpit) ResolvePaneByLabel(ctx context.Context, label string) (string, bool) {
 	if c == nil {
 		return "", false

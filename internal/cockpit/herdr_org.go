@@ -80,7 +80,9 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 
 	labelToPaneIDs := map[string][]string{}
 	paneByID := map[string]herdrOrgPane{}
+	panes := make([]org.LivePane, 0, len(decoded.Result.Snapshot.Panes))
 	for _, pane := range decoded.Result.Snapshot.Panes {
+		panes = append(panes, org.LivePane{PaneID: pane.PaneID, Label: pane.Label})
 		// Mirror the wake resolver (herdr.go resolvePaneByLabel, which matches only
 		// `p.PaneID != ""`): a pane with an empty pane_id is not a resolvable
 		// target. Seeding it would collide every empty-id pane on the "" key of
@@ -93,17 +95,19 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 		}
 	}
 	states := make(map[string]org.RoleLiveState, len(p.roles))
+	bindings := make(map[string]org.PaneBinding, len(p.roles))
 	for _, role := range p.roles {
 		binding := strings.TrimSpace(role.Pane)
 		if binding == "" {
-			states[role.Name] = org.RoleLiveState{State: org.StateUnknown, Detail: "Herdr pane binding is unset"}
-			continue
-		}
-		if len(labelToPaneIDs[binding]) > 1 {
-			states[role.Name] = org.RoleLiveState{State: org.StateUnknown, Detail: fmt.Sprintf("multiple Herdr panes labeled %q", binding)}
+			detail := "Herdr pane binding is unset"
+			states[role.Name] = org.RoleLiveState{State: org.StateUnknown, Detail: detail}
+			bindings[role.Name] = org.PaneBinding{Detail: detail}
 			continue
 		}
 		paneID, _ := config.ResolveRolePaneBinding(ctx, binding, func(_ context.Context, label string) (string, bool) {
+			if _, present := paneByID[label]; present {
+				return label, true
+			}
 			ids := labelToPaneIDs[label]
 			if len(ids) == 1 {
 				return ids[0], true
@@ -112,16 +116,25 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 		})
 		pane, present := paneByID[paneID]
 		if !present {
-			states[role.Name] = org.RoleLiveState{State: org.StateUnknown, Detail: fmt.Sprintf("no Herdr pane bound as %q", binding)}
+			detail := fmt.Sprintf("no Herdr pane bound as %q", binding)
+			if len(labelToPaneIDs[binding]) > 1 {
+				detail = fmt.Sprintf("multiple Herdr panes labeled %q", binding)
+			}
+			states[role.Name] = org.RoleLiveState{State: org.StateUnknown, Detail: detail}
+			bindings[role.Name] = org.PaneBinding{Detail: detail}
 			continue
 		}
 		states[role.Name] = mapHerdrPaneState(pane)
+		bindings[role.Name] = org.PaneBinding{PaneID: paneID}
 	}
 	now := time.Now
 	if p.now != nil {
 		now = p.now
 	}
-	return org.Snapshot{States: states, ObservedAt: now().UTC(), ProviderVersion: version}, nil
+	return org.Snapshot{
+		States: states, ObservedAt: now().UTC(), ProviderVersion: version,
+		PaneBindings: bindings, Panes: panes,
+	}, nil
 }
 
 func mapHerdrCompletedTurn(turn *herdrCompletedTurnWire) *org.RoleActivity {

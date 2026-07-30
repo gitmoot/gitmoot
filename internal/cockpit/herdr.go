@@ -294,14 +294,12 @@ func (c herdrClient) paneList(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
-// resolvePaneByLabel returns the CURRENT pane id whose herdr label exactly equals
-// label. It is resolved at call (wake) time so a recycled pane's fresh id is
-// always used — the reason the org binding may name a stable label instead of a
-// wX:pY id. ok is false (with a nil error) unless exactly one live pane carries
-// the label.
-func (c herdrClient) resolvePaneByLabel(ctx context.Context, label string) (string, bool, error) {
-	label = strings.TrimSpace(label)
-	if label == "" {
+// resolvePaneByLabel returns the CURRENT pane id matching an exact label or
+// literal pane id. It is resolved at call (wake) time so stale and absent ids
+// fail while a recycled pane's stable label reaches its fresh id.
+func (c herdrClient) resolvePaneByLabel(ctx context.Context, binding string) (string, bool, error) {
+	binding = strings.TrimSpace(binding)
+	if binding == "" {
 		return "", false, nil
 	}
 	out, err := c.run(ctx, "pane", "list")
@@ -314,7 +312,10 @@ func (c herdrClient) resolvePaneByLabel(ctx context.Context, label string) (stri
 	}
 	resolved := ""
 	for _, p := range pl.Result.Panes {
-		if p.PaneID != "" && p.Label == label {
+		if p.PaneID == binding && p.PaneID != "" {
+			return p.PaneID, true, nil
+		}
+		if p.PaneID != "" && p.Label == binding {
 			if resolved != "" {
 				return "", false, nil
 			}

@@ -122,6 +122,7 @@ func TestHerdrOrgProviderPresenceWakePaneBindingParity(t *testing.T) {
 		{name: "binding matching one label", binding: "unique-label", wantPane: "w1:p1", wantState: org.StateWorking, wantOK: true},
 		{name: "binding matching multiple labels", binding: "duplicate-label", wantState: org.StateUnknown},
 		{name: "literal pane id", binding: "w1:p4", wantPane: "w1:p4", wantState: org.StateDone, wantOK: true},
+		{name: "absent literal pane id", binding: "w9:p9", wantState: org.StateUnknown},
 		{name: "binding matching nothing", binding: "missing-label", wantState: org.StateUnknown},
 	}
 	for _, test := range tests {

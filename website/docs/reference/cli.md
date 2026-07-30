@@ -1057,9 +1057,10 @@ The registry uses `[org] enforce = "warn"|"block"` and
 `[org.roles."name"]` entries with `parent`, `scope`, `merge_rule`, an optional
 cosmetic `display_name`, an optional `model` runtime pin, an optional per-role
 `recycle_after` duration override, and an optional `pane` Herdr binding. The
-binding resolves as an exact live pane label first, then as a literal pane id.
-Roles without a binding report unknown live presence, and event wakes for them
-are skipped with an observable log rather than inferred from a pane label. There
+binding resolves as a unique exact live pane label or a currently live literal
+pane id. Roles without a binding report unknown live presence, and event wakes
+for them are skipped with an observable log and increment the role's missed-wake
+counter rather than being inferred from a pane label. There
 is exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
 `owner/repo`. Malformed org configuration fails closed and loudly. `brief`
 records passive last-seen presence for its role and can render static context
@@ -1170,8 +1171,11 @@ event-rule wakes; exactly one parent-less role is required.
 Scope entries are `*`, `owner/*`, or exact `owner/name`, and child scope must be
 a subset of its parent.
 
-Use `gitmoot org validate` to validate the registry and `gitmoot org show` to
-view its roles. When enabled, fresh local `agent ask`, `agent run`, `agent
+Use `gitmoot org validate` to validate the registry against the live Herdr
+snapshot and event-rule store. It fails when a role has no live pane, has no
+enabled wake route, or a labeled live pane is not claimed by any role; each
+failure includes category counts and a reason. Use `gitmoot org show` to view
+the configured roles. When enabled, fresh local `agent ask`, `agent run`, `agent
 review`, `agent implement`, `orchestrate`, and `task run` dispatches require
 `--org-role <role>` (or `GITMOOT_ORG_ROLE`) and reject out-of-scope repositories
 at enqueue.

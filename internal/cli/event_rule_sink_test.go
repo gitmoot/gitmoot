@@ -65,6 +65,9 @@ func (f *fakeEventWake) AgentPrompt(_ context.Context, pane, prompt, until strin
 
 func (f *fakeEventWake) ResolvePaneByLabel(_ context.Context, label string) (string, bool) {
 	pane, ok := f.labelToPane[label]
+	if !ok && strings.Contains(label, ":") {
+		return label, true
+	}
 	return pane, ok
 }
 
@@ -210,6 +213,86 @@ func productionWakeTargetRoleWrites(t *testing.T) []wakeTargetRoleWrite {
 		return writes[i].function < writes[j].function
 	})
 	return writes
+}
+
+func TestRolePaneResolverHasAllThreeProductionCallSites(t *testing.T) {
+	calls := productionSelectorCallSites(t, "ResolveRolePaneBinding")
+	want := []wakeTargetRoleWrite{
+		{file: "internal/cli/event_rule_sink.go", function: "resolveRolePane"},
+		{file: "internal/cli/org_role_unavailable.go", function: "wakeParent"},
+		{file: "internal/cockpit/herdr_org.go", function: "Snapshot"},
+	}
+	sort.Slice(want, func(i, j int) bool {
+		if want[i].file != want[j].file {
+			return want[i].file < want[j].file
+		}
+		return want[i].function < want[j].function
+	})
+	if got, expected := fmt.Sprint(calls), fmt.Sprint(want); got != expected {
+		t.Fatalf("ResolveRolePaneBinding call sites = %s, want %s", got, expected)
+	}
+}
+
+func productionSelectorCallSites(t *testing.T, selectorName string) []wakeTargetRoleWrite {
+	t.Helper()
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls []wakeTargetRoleWrite
+	err = filepath.WalkDir(root, func(filename string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(filename) != ".go" || strings.HasSuffix(filename, "_test.go") {
+			return nil
+		}
+		fset := token.NewFileSet()
+		parsed, err := parser.ParseFile(fset, filename, nil, 0)
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(root, filename)
+		if err != nil {
+			return err
+		}
+		for _, declaration := range parsed.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Body == nil {
+				continue
+			}
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				selector, ok := call.Fun.(*ast.SelectorExpr)
+				if ok && selector.Sel.Name == selectorName {
+					calls = append(calls, wakeTargetRoleWrite{
+						file: filepath.ToSlash(relative), function: function.Name.Name,
+					})
+				}
+				return true
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Slice(calls, func(i, j int) bool {
+		if calls[i].file != calls[j].file {
+			return calls[i].file < calls[j].file
+		}
+		return calls[i].function < calls[j].function
+	})
+	return calls
 }
 
 func TestEventRuleAddresseeGateIsKindAgnosticAndObserverExempt(t *testing.T) {
@@ -400,6 +483,44 @@ func TestEventRuleEvaluatorResolvesPaneLabel(t *testing.T) {
 	sink.evaluate(context.Background(), events.Event{Type: events.EventJobBlocked, Cause: "merge_guard", JobID: "job-9"})
 	if wake.pane != "w2:p5" {
 		t.Fatalf("label did not resolve to live pane id: %+v", wake)
+	}
+}
+
+func TestEventRuleEvaluatorCountsUnresolvedRoleBinding(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"missing-label\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.AddEventRule(context.Background(), db.EventRule{
+		ID: "rule-unresolved", OnKind: "attention", WakeRole: "owner", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wake := &fakeEventWake{}
+	sink := &eventRuleSink{store: store, home: home, wake: wake}
+	if err := sink.evaluate(context.Background(), events.Event{
+		Type: events.EventJobNeedsAttention, Cause: "ask_gate", JobID: "job-unresolved",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	missed, err := store.ListRoleMissedWakes(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missed) != 1 || missed[0].Role != "owner" || missed[0].Consecutive != 1 {
+		t.Fatalf("unresolved binding missed wakes = %+v, want owner count 1", missed)
+	}
+	if wake.promptCalls != 0 {
+		t.Fatalf("unresolved binding prompted %d times", wake.promptCalls)
 	}
 }
 

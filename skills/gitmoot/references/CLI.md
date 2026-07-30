@@ -1212,17 +1212,20 @@ gitmoot org status [--json]
 ```
 
 `gitmoot org validate [--home PATH]` validates the optional local `[org]`
-registry and prints its role count. `gitmoot org show [--home PATH]` prints the
-resolved role table.
+registry against the live Herdr snapshot and event-rule store. It fails when a
+role has no live pane, has no enabled wake route, or a labeled live pane is not
+claimed by any role; each failure includes category counts and a reason.
+`gitmoot org show [--home PATH]` prints the resolved role table.
 
 The registry uses `[org] enforce = "warn"|"block"` and
 `[org.roles."name"]` entries with `parent`, `scope`, `merge_rule`, an optional
 cosmetic `display_name`, an optional `model` runtime pin, an optional per-role
 `recycle_after` duration override, and an optional `pane` Herdr binding (used by
 live presence and org event-rule wakes).
-The binding resolves as an exact live pane label first, then as a literal pane
-id. Roles without a binding report unknown live presence, and event wakes for
-them are skipped with an observable log rather than inferred from a pane label. There is
+The binding resolves as a unique exact live pane label or a currently live
+literal pane id. Roles without a binding report unknown live presence, and event
+wakes for them are skipped with an observable log and increment the role's
+missed-wake counter rather than being inferred from a pane label. There is
 exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
 `owner/repo`, and each child scope must be covered by its parent. Malformed
 org configuration fails closed and loudly. `brief` records passive last-seen
