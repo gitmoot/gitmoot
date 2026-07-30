@@ -645,7 +645,7 @@ func retryPendingJobAdvancements(ctx context.Context, worker jobWorker, repoFilt
 			continue
 		}
 		if err := worker.advanceJob(ctx, job); err != nil {
-			return err
+			writeLine(worker.Stdout, "job %s pending advancement retry failed: %v", job.ID, err)
 		}
 	}
 	return nil
@@ -703,7 +703,7 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 		}
 		engine := worker.WorkflowFactory(worker.delegationParentCheckout(ctx, job))
 		if err := engine.ReclaimTerminalDelegationWorktree(ctx, jobID); err != nil {
-			return err
+			writeLine(worker.Stdout, "job %s skipped delegation worktree reclaim failed: %v", job.ID, err)
 		}
 	}
 	return nil
@@ -819,6 +819,10 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	// on its own goroutine, so it still defers the whole block (matching main,
 	// where a live pool pass blocked the tick entirely).
 	if !tracker.poolRunning(repoFilter) {
+		// Boundary: candidate scans and store/global faults still return through
+		// these helpers and feed #555 escalation. Once a candidate is selected,
+		// its optional housekeeping operation logs and continues so one bad item
+		// can never prevent the dispatch below.
 		if err := retryPendingJobAdvancements(ctx, worker, repoFilter, rootFilter, tracker.checkoutHeld, cand); err != nil {
 			return err
 		}
@@ -1002,7 +1006,7 @@ func retryPendingJobComments(ctx context.Context, worker jobWorker, repoFilter s
 			agent = runtimeAgent(dbAgent)
 		}
 		if err := worker.postJobResultComment(ctx, job.ID, agent, "", nil); err != nil {
-			return err
+			writeLine(worker.Stdout, "job %s pending result comment retry failed: %v", job.ID, err)
 		}
 	}
 	return nil
