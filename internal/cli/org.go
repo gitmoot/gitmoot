@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -80,6 +82,12 @@ var newOrgProvider = func(roles []config.OrgRole) org.Provider { return cockpit.
 
 var orgDoctorRunner subprocess.Runner = subprocess.ExecRunner{}
 
+var orgSeatRunner subprocess.Runner = subprocess.ExecRunner{}
+
+var orgSeatBranchCheck = checkOrgSeatBranches
+
+var orgSeatClosePane = closeOrgSeatPane
+
 var orgRecycleAdvisoryWriter io.Writer = os.Stderr
 
 var orgRecycleOverdueEventWriter io.Writer = os.Stderr
@@ -110,6 +118,8 @@ func runOrg(args []string, stdout, stderr io.Writer) int {
 		return runOrgEscalate(args[1:], stdout, stderr)
 	case "events":
 		return runOrgEvents(args[1:], stdout, stderr)
+	case "seat":
+		return runOrgSeat(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown org command %q\n\n", args[0])
 		printOrgUsage(stderr)
@@ -126,12 +136,477 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org chart [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org status [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org recycle ROLE --kind KIND --handoff NOTE [--pane ID] [--json] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org seat add NAME --pane LABEL [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org escalate --to ROLE --workflow LABEL [--org-role ROLE] [--repo OWNER/REPO] [--json] [--home DIR] \"QUESTION\"")
 	fmt.Fprintln(w, "  gitmoot org escalate resolve NOTE_ID [--by ROLE] [--note ANSWER_NOTE_ID] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org events rule add --on KIND [--match FILTER | --repo SUBSTRING] --wake ROLE [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org events rule list [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org events rule set-scope [--home DIR] ID observer|addressed")
 	fmt.Fprintln(w, "  gitmoot org events rule rm [--home DIR] ID")
+}
+
+var orgSeatDefaultRouteKinds = []string{"blocked", "escalation", "reply"}
+
+const orgSeatExternalTimeout = 10 * time.Second
+
+func runOrgSeat(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		printOrgSeatUsage(stdout)
+		return 0
+	}
+	switch args[0] {
+	case "add":
+		return runOrgSeatAdd(args[1:], stdout, stderr)
+	case "rm":
+		return runOrgSeatRemove(args[1:], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "unknown org seat command %q\n", args[0])
+		printOrgSeatUsage(stderr)
+		return 2
+	}
+}
+
+func printOrgSeatUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  gitmoot org seat add NAME --pane LABEL [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--home DIR]")
+}
+
+func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("org seat add", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	paneFlag := fs.String("pane", "", "exact live Herdr pane label to claim")
+	nameArg, flagArgs := leadingOrgSeatName(args)
+	if err := fs.Parse(flagArgs); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if nameArg == "" {
+		if fs.NArg() != 1 {
+			fmt.Fprintln(stderr, "org seat add requires exactly one NAME")
+			return 2
+		}
+		nameArg = fs.Arg(0)
+	} else if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "org seat add requires exactly one NAME")
+		return 2
+	}
+	name := strings.ToLower(strings.TrimSpace(nameArg))
+	if !validOrgSeatName(name) {
+		fmt.Fprintf(stderr, "org seat add: invalid role name %q; use lowercase letters, digits, and hyphens\n", nameArg)
+		return 2
+	}
+	paneLabel := strings.TrimSpace(*paneFlag)
+	if paneLabel == "" {
+		fmt.Fprintln(stderr, "org seat add requires --pane with an exact live Herdr pane label")
+		return 2
+	}
+
+	paths, err := pathsFromFlag(*home)
+	if err != nil {
+		fmt.Fprintf(stderr, "org seat add: resolve paths: %v\n", err)
+		return 1
+	}
+	if err := config.Initialize(paths); err != nil {
+		fmt.Fprintf(stderr, "org seat add: initialize home: %v\n", err)
+		return 1
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		fmt.Fprintf(stderr, "org seat add: load org registry: %v\n", err)
+		return 1
+	}
+	ctx := context.Background()
+	snapshotCtx, cancel := context.WithTimeout(ctx, orgSeatExternalTimeout)
+	snapshot, err := orgProviderSnapshot(snapshotCtx, cfg)
+	cancel()
+	if err != nil {
+		fmt.Fprintf(stderr, "org seat add: inspect live Herdr panes: %v\n", err)
+		return 1
+	}
+	pane, err := uniqueOrgSeatPaneByLabel(snapshot.Panes, paneLabel)
+	if err != nil {
+		fmt.Fprintf(stderr, "org seat add: %v\n", err)
+		return 2
+	}
+	for roleName, binding := range snapshot.PaneBindings {
+		if roleName != name && strings.TrimSpace(binding.PaneID) == pane.PaneID {
+			fmt.Fprintf(stderr, "org seat add: pane %s (%q) is already claimed by role %q\n", pane.PaneID, paneLabel, roleName)
+			return 2
+		}
+	}
+
+	desired, roleExists, err := orgSeatDesiredRole(cfg, snapshot, name, paneLabel, pane.PaneID)
+	if err != nil {
+		fmt.Fprintf(stderr, "org seat add: %v\n", err)
+		return 2
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		fmt.Fprintf(stderr, "org seat add: open store: %v\n", err)
+		return 1
+	}
+	rules, err := store.ListEventRules(ctx)
+	if err != nil {
+		store.Close()
+		fmt.Fprintf(stderr, "org seat add: list event rules: %v\n", err)
+		return 1
+	}
+	expectedRules := orgSeatDefaultRules(name)
+	missingRules, existingRuleIDs, err := missingOrgSeatRules(expectedRules, rules)
+	if err != nil {
+		store.Close()
+		fmt.Fprintf(stderr, "org seat add: %v\n", err)
+		return 2
+	}
+	configEdit, roleCreated, err := config.UpsertOrgSeatRole(paths, desired)
+	if err != nil {
+		store.Close()
+		fmt.Fprintf(stderr, "org seat add: write role: %v\n", err)
+		return 1
+	}
+	if err := store.AddEventRules(ctx, missingRules); err != nil {
+		restoreErr := configEdit.Restore()
+		store.Close()
+		fmt.Fprintf(stderr, "org seat add: add wake routes: %v\n", errors.Join(err, restoreErr))
+		return 1
+	}
+	if err := store.Close(); err != nil {
+		fmt.Fprintf(stderr, "org seat add: close store: %v\n", err)
+		return 1
+	}
+
+	fmt.Fprintf(stdout, "pane %s claimed label=%q\n", pane.PaneID, paneLabel)
+	roleStatus := "existed"
+	if roleCreated || !roleExists {
+		roleStatus = "created"
+	} else if configEdit.Changed() {
+		roleStatus = "repaired"
+	}
+	fmt.Fprintf(stdout, "role %s %s pane=%q\n", name, roleStatus, desired.Pane)
+	for _, rule := range expectedRules {
+		status := "created"
+		if existingRuleIDs[rule.ID] {
+			status = "existed"
+		}
+		fmt.Fprintf(stdout, "route %s %s on=%s wake=%s scope=%s\n", rule.ID, status, rule.OnKind, rule.WakeRole, rule.Scope)
+	}
+	fresh, err := config.LoadOrg(paths)
+	if err != nil {
+		fmt.Fprintf(stderr, "org seat add: reload org registry: %v\n", err)
+		return 1
+	}
+	return runOrgValidateReality(ctx, paths, fresh, stdout, stderr)
+}
+
+func runOrgSeatRemove(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("org seat rm", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	nameArg, flagArgs := leadingOrgSeatName(args)
+	if err := fs.Parse(flagArgs); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if nameArg == "" {
+		if fs.NArg() != 1 {
+			fmt.Fprintln(stderr, "org seat rm requires exactly one NAME")
+			return 2
+		}
+		nameArg = fs.Arg(0)
+	} else if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "org seat rm requires exactly one NAME")
+		return 2
+	}
+	name := strings.ToLower(strings.TrimSpace(nameArg))
+	if !validOrgSeatName(name) {
+		fmt.Fprintf(stderr, "org seat rm: invalid role name %q\n", nameArg)
+		return 2
+	}
+	paths, err := pathsFromFlag(*home)
+	if err != nil {
+		fmt.Fprintf(stderr, "org seat rm: resolve paths: %v\n", err)
+		return 1
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		fmt.Fprintf(stderr, "org seat rm: load org registry: %v\n", err)
+		return 1
+	}
+	role, ok := cfg.Role(name)
+	if !ok {
+		fmt.Fprintf(stderr, "org seat rm: unknown org role %q\n", name)
+		return 2
+	}
+	if children := cfg.Children(name); len(children) != 0 {
+		names := make([]string, len(children))
+		for i, child := range children {
+			names[i] = child.Name
+		}
+		fmt.Fprintf(stderr, "org seat rm: role %q still parents %s\n", name, strings.Join(names, ", "))
+		return 2
+	}
+
+	ctx := context.Background()
+	snapshotCtx, cancel := context.WithTimeout(ctx, orgSeatExternalTimeout)
+	snapshot, err := orgProviderSnapshot(snapshotCtx, cfg)
+	cancel()
+	if err != nil {
+		fmt.Fprintf(stderr, "org seat rm: inspect live Herdr panes: %v\n", err)
+		return 1
+	}
+	binding := snapshot.PaneBindings[role.Name]
+	if strings.TrimSpace(binding.PaneID) == "" {
+		fmt.Fprintf(stderr, "org seat rm: role %q pane is unresolved: %s\n", role.Name, firstNonEmpty(binding.Detail, "no live pane binding"))
+		return 1
+	}
+	pane, ok := orgSeatPaneByID(snapshot.Panes, binding.PaneID)
+	if !ok {
+		fmt.Fprintf(stderr, "org seat rm: resolved pane %s is absent from the live snapshot\n", binding.PaneID)
+		return 1
+	}
+	if err := orgSeatBranchCheck(ctx, pane); err != nil {
+		fmt.Fprintf(stderr, "org seat rm: refusing to remove %q: %v\n", role.Name, err)
+		return 1
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		fmt.Fprintf(stderr, "org seat rm: open store: %v\n", err)
+		return 1
+	}
+	configEdit, _, err := config.RemoveOrgSeatRole(paths, role.Name)
+	if err != nil {
+		store.Close()
+		fmt.Fprintf(stderr, "org seat rm: remove role: %v\n", err)
+		return 1
+	}
+	removedRules, err := store.DeleteEventRulesForRole(ctx, role.Name)
+	if err != nil {
+		restoreErr := configEdit.Restore()
+		store.Close()
+		fmt.Fprintf(stderr, "org seat rm: remove wake routes: %v\n", errors.Join(err, restoreErr))
+		return 1
+	}
+	closeCtx, closeCancel := context.WithTimeout(ctx, orgSeatExternalTimeout)
+	closeErr := orgSeatClosePane(closeCtx, pane.PaneID)
+	closeCancel()
+	if closeErr != nil {
+		rulesRestoreErr := store.AddEventRules(ctx, removedRules)
+		configRestoreErr := configEdit.Restore()
+		store.Close()
+		fmt.Fprintf(stderr, "org seat rm: close pane %s: %v\n", pane.PaneID, errors.Join(closeErr, rulesRestoreErr, configRestoreErr))
+		return 1
+	}
+	if err := store.Close(); err != nil {
+		fmt.Fprintf(stderr, "org seat rm: close store: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "pane %s closed\n", pane.PaneID)
+	fmt.Fprintf(stdout, "role %s removed with %d wake routes\n", role.Name, len(removedRules))
+	fresh, err := config.LoadOrg(paths)
+	if err != nil {
+		fmt.Fprintf(stderr, "org seat rm: reload org registry: %v\n", err)
+		return 1
+	}
+	return runOrgValidateReality(ctx, paths, fresh, stdout, stderr)
+}
+
+func leadingOrgSeatName(args []string) (string, []string) {
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		return args[0], args[1:]
+	}
+	return "", args
+}
+
+func validOrgSeatName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func uniqueOrgSeatPaneByLabel(panes []org.LivePane, label string) (org.LivePane, error) {
+	var match org.LivePane
+	count := 0
+	for _, pane := range panes {
+		if pane.PaneID != "" && pane.Label == label {
+			match = pane
+			count++
+		}
+	}
+	switch count {
+	case 0:
+		return org.LivePane{}, fmt.Errorf("no live Herdr pane has exact label %q", label)
+	case 1:
+		return match, nil
+	default:
+		return org.LivePane{}, fmt.Errorf("%d live Herdr panes have label %q; refusing ambiguous adoption", count, label)
+	}
+}
+
+func orgSeatPaneByID(panes []org.LivePane, paneID string) (org.LivePane, bool) {
+	for _, pane := range panes {
+		if pane.PaneID == paneID {
+			return pane, true
+		}
+	}
+	return org.LivePane{}, false
+}
+
+func orgSeatDesiredRole(cfg config.OrgConfig, snapshot org.Snapshot, name, paneLabel, paneID string) (config.OrgRole, bool, error) {
+	if current, ok := cfg.Role(name); ok {
+		if strings.TrimSpace(current.Pane) == "" {
+			current.Pane = paneLabel
+			return current, true, nil
+		}
+		binding := snapshot.PaneBindings[current.Name]
+		if binding.PaneID != paneID {
+			return config.OrgRole{}, true, fmt.Errorf(
+				"role %q already binds %q (%s), not pane %s labeled %q",
+				current.Name, current.Pane, firstNonEmpty(binding.Detail, "resolved to "+binding.PaneID), paneID, paneLabel,
+			)
+		}
+		return current, true, nil
+	}
+	if name == "owner" {
+		if cfg.Enabled() {
+			return config.OrgRole{}, false, errors.New("owner role is missing from a non-empty registry")
+		}
+		return config.OrgRole{Name: name, Scope: []string{"*"}, MergeRule: "owner", Pane: paneLabel}, false, nil
+	}
+	owner, ok := cfg.Role("owner")
+	if !ok {
+		return config.OrgRole{}, false, errors.New("add the owner seat before child seats")
+	}
+	return config.OrgRole{
+		Name: name, Parent: owner.Name, Scope: append([]string(nil), owner.Scope...),
+		MergeRule: "owner", Pane: paneLabel,
+	}, false, nil
+}
+
+func orgSeatDefaultRules(role string) []db.EventRule {
+	rules := make([]db.EventRule, 0, len(orgSeatDefaultRouteKinds))
+	for _, kind := range orgSeatDefaultRouteKinds {
+		rules = append(rules, db.EventRule{
+			ID: "org-seat-" + role + "-" + kind, OnKind: kind, WakeRole: role,
+			Scope: db.EventRuleScopeAddressed, Enabled: true,
+		})
+	}
+	return rules
+}
+
+func missingOrgSeatRules(expected, current []db.EventRule) ([]db.EventRule, map[string]bool, error) {
+	byID := make(map[string]db.EventRule, len(current))
+	for _, rule := range current {
+		byID[rule.ID] = rule
+	}
+	missing := make([]db.EventRule, 0, len(expected))
+	existing := make(map[string]bool, len(expected))
+	for _, want := range expected {
+		got, ok := byID[want.ID]
+		if !ok {
+			missing = append(missing, want)
+			continue
+		}
+		if !sameOrgSeatRule(got, want) {
+			return nil, nil, fmt.Errorf("route id %q already exists with different semantics", want.ID)
+		}
+		existing[want.ID] = true
+	}
+	return missing, existing, nil
+}
+
+func sameOrgSeatRule(got, want db.EventRule) bool {
+	return strings.EqualFold(strings.TrimSpace(got.OnKind), want.OnKind) &&
+		strings.TrimSpace(got.MatchFilter) == want.MatchFilter &&
+		strings.EqualFold(strings.TrimSpace(got.WakeRole), want.WakeRole) &&
+		got.Scope == want.Scope && got.Enabled == want.Enabled
+}
+
+func closeOrgSeatPane(ctx context.Context, paneID string) error {
+	result, err := orgSeatRunner.Run(ctx, "", "herdr", "pane", "close", paneID)
+	if err == nil {
+		return nil
+	}
+	detail := strings.TrimSpace(result.Stderr)
+	if detail == "" {
+		return err
+	}
+	return fmt.Errorf("%w: %s", err, detail)
+}
+
+func checkOrgSeatBranches(ctx context.Context, pane org.LivePane) error {
+	directories := []string{strings.TrimSpace(pane.ForegroundCWD), strings.TrimSpace(pane.CWD)}
+	roots := map[string]struct{}{}
+	reported := 0
+	for _, directory := range directories {
+		if directory == "" {
+			continue
+		}
+		reported++
+		result, err := orgSeatRunner.Run(ctx, directory, "git", "rev-parse", "--show-toplevel")
+		if err != nil {
+			if strings.Contains(strings.ToLower(result.Stderr), "not a git repository") {
+				continue
+			}
+			return fmt.Errorf("inspect pane checkout %q: %w", directory, err)
+		}
+		root := strings.TrimSpace(result.Stdout)
+		if root == "" {
+			return fmt.Errorf("pane checkout %q returned an empty git root", directory)
+		}
+		roots[filepath.Clean(root)] = struct{}{}
+	}
+	if reported == 0 {
+		return fmt.Errorf("pane %s reports neither cwd nor foreground_cwd; branch safety is unverified", pane.PaneID)
+	}
+	if len(roots) == 0 {
+		return fmt.Errorf("pane %s reports no Git checkout; branch safety is unverified", pane.PaneID)
+	}
+	for root := range roots {
+		status, err := orgSeatRunner.Run(ctx, root, "git", "status", "--porcelain")
+		if err != nil {
+			return fmt.Errorf("inspect worktree %q: %w", root, err)
+		}
+		if dirty := strings.TrimSpace(status.Stdout); dirty != "" {
+			first, _, _ := strings.Cut(dirty, "\n")
+			return fmt.Errorf("checkout %s has uncommitted work (%s)", root, first)
+		}
+		branchResult, branchErr := orgSeatRunner.Run(ctx, root, "git", "symbolic-ref", "--quiet", "--short", "HEAD")
+		branch := strings.TrimSpace(branchResult.Stdout)
+		if branchErr != nil {
+			branch = "detached HEAD"
+		}
+		baseResult, baseErr := orgSeatRunner.Run(ctx, root, "git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+		base := strings.TrimSpace(baseResult.Stdout)
+		if baseErr != nil || base == "" {
+			if _, err := orgSeatRunner.Run(ctx, root, "git", "rev-parse", "--verify", "--quiet", "refs/remotes/origin/main"); err != nil {
+				return fmt.Errorf("checkout %s has no resolvable origin default branch; branch safety is unverified", root)
+			}
+			base = "origin/main"
+		}
+		_, err = orgSeatRunner.Run(ctx, root, "git", "merge-base", "--is-ancestor", "HEAD", base)
+		if err == nil {
+			continue
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return fmt.Errorf("checkout %s branch %s has commits not merged into %s", root, branch, base)
+		}
+		return fmt.Errorf("compare checkout %s branch %s with %s: %w", root, branch, base, err)
+	}
+	return nil
 }
 
 func runOrgValidateOrShow(args []string, stdout, stderr io.Writer) int {
