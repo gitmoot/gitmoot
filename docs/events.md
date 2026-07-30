@@ -233,9 +233,13 @@ pending reply obligation that wakes the asker. A legacy typed escalation with
 no identifiable asker still resolves, prints a warning, and records no invented
 target. Blocked and escalation rows are synchronously
 persisted after the source transition; insert failure is logged but cannot roll
-back the emitting job. The daemon uses rolling five-second windows per event
-kind and role, so same-kind events coalesce while a blocked event and a reply for
-the same role remain separate.
+back the emitting job. `gitmoot org escalate` addresses the same durable note
+and reply obligation upward to an ancestor or downward to a descendant. Upward
+questions remain escalations; downward questions are asks. Same-role questions
+are invalid, and peers are refused by a safe command-level default because no
+configurable peer-question policy exists. The daemon uses rolling five-second
+windows per event kind and role, so same-kind events coalesce while a blocked
+event and a reply for the same role remain separate.
 Pending, attempted, delivered, stalled, failed, and `delivery_unknown` remain
 queryable per outbox row, and outstanding obligations contribute to daemon tick
 health. A quiet burst tail is flushed by a later daemon tick; it does not require
