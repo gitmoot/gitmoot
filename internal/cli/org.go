@@ -972,8 +972,8 @@ func runOrgEscalate(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("org escalate", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	toFlag := fs.String("to", "", "ancestor role to escalate to")
-	workflowID := fs.String("workflow", "", "workflow label for the escalation note")
+	toFlag := fs.String("to", "", "ancestor or descendant role to ask")
+	workflowID := fs.String("workflow", "", "workflow label for the organization question note")
 	fromFlag := fs.String("org-role", "", "acting organization role")
 	repo := fs.String("repo", "", "repository binding for the escalation note")
 	jsonOutput := fs.Bool("json", false, "print the escalation as JSON")
@@ -1027,8 +1027,19 @@ func runOrgEscalate(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "unknown org role %q\n", to)
 		return 2
 	}
-	if !slices.Contains(cfg.Ancestors(from), to) {
-		fmt.Fprintf(stderr, "--to %q must be an ancestor of %q in the org hierarchy\n", to, from)
+	downwardAsk := false
+	switch {
+	case slices.Contains(cfg.Ancestors(from), to):
+		// Preserve the established upward escalation path.
+	case slices.Contains(cfg.Ancestors(to), from):
+		downwardAsk = true
+	case from == to:
+		fmt.Fprintf(stderr, "--to %q must differ from acting role %q\n", to, from)
+		return 2
+	default:
+		// There is no configured peer-question policy. Fail closed until one
+		// exists rather than inventing a cross-branch routing rule here.
+		fmt.Fprintln(stderr, "peer questions are not configurable and are refused")
 		return 2
 	}
 	label := strings.TrimSpace(*workflowID)
@@ -1075,7 +1086,11 @@ func runOrgEscalate(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	fmt.Fprintf(stdout, "escalated from %s to %s in workflow %s\n", from, to, label)
+	if downwardAsk {
+		fmt.Fprintf(stdout, "asked from %s to %s in workflow %s\n", from, to, label)
+	} else {
+		fmt.Fprintf(stdout, "escalated from %s to %s in workflow %s\n", from, to, label)
+	}
 	return 0
 }
 

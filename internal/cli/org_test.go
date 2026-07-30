@@ -244,6 +244,86 @@ func TestOrgEscalateWritesTypedWorkflowNote(t *testing.T) {
 	}
 }
 
+func TestOrgEscalateDescendantWritesAddressedQuestion(t *testing.T) {
+	home := writeOrgEscalateConfig(t)
+	store := openCLIJobStore(t, home)
+	seedCLIJob(t, store, db.Job{
+		ID: "downward-ask-job", Agent: "agent", Type: "ask", State: "queued",
+		Payload: `{"workflow_id":"release/downward"}`,
+	}, "queued")
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runOrg([]string{
+		"escalate", "--home", home, "--org-role", "owner", "--to", "operator",
+		"--workflow", "release/downward", "--repo", "acme/widget", "Can you verify the release?",
+	}, &stdout, &stderr)
+
+	store = openCLIJobStore(t, home)
+	defer store.Close()
+	ctx := context.Background()
+	notes, notesErr := store.ListWorkflowNotes(ctx, "release/downward", 0)
+	outbox, outboxErr := store.ListWakeOutbox(ctx, "")
+	if notesErr != nil || outboxErr != nil || len(notes) != 1 || len(outbox) != 1 {
+		t.Fatalf(
+			"stored descendant ask: notes=%+v notes_err=%v wake_outbox=%+v outbox_err=%v; run code=%d out=%q err=%q",
+			notes, notesErr, outbox, outboxErr, code, stdout.String(), stderr.String(),
+		)
+	}
+	wantBody := workflow.FormatOrgEscalateNote(
+		"owner", "operator", "release/downward", "Can you verify the release?",
+	)
+	if notes[0].Author != "owner" || notes[0].Body != wantBody || notes[0].Repo != "acme/widget" {
+		t.Fatalf("stored descendant note = %+v, want author=owner body=%q repo=acme/widget", notes[0], wantBody)
+	}
+	if outbox[0].SourceKind != db.WakeOutboxSourceWorkflowNote ||
+		outbox[0].SourceID != fmt.Sprint(notes[0].ID) ||
+		outbox[0].TargetRole != "operator" ||
+		outbox[0].State != db.WakeOutboxStatePending {
+		t.Fatalf(
+			"stored descendant wake outbox = %+v, want pending workflow-note row source=%d addressed to operator",
+			outbox, notes[0].ID,
+		)
+	}
+	if code != 0 || stdout.String() != "asked from owner to operator in workflow release/downward\n" || stderr.Len() != 0 {
+		t.Fatalf("descendant ask code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestOrgEscalateAncestorBehaviorRemainsEscalation(t *testing.T) {
+	home := writeOrgEscalateConfig(t)
+	store := openCLIJobStore(t, home)
+	seedCLIJob(t, store, db.Job{
+		ID: "upward-escalation-job", Agent: "agent", Type: "ask", State: "queued",
+		Payload: `{"workflow_id":"release/upward"}`,
+	}, "queued")
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runOrg([]string{
+		"escalate", "--home", home, "--org-role", "operator", "--to", "owner",
+		"--workflow", "release/upward", "May we ship?",
+	}, &stdout, &stderr)
+
+	store = openCLIJobStore(t, home)
+	defer store.Close()
+	notes, err := store.ListWorkflowNotes(context.Background(), "release/upward", 0)
+	if err != nil || len(notes) != 1 {
+		t.Fatalf("stored ancestor escalation notes=%+v err=%v; run code=%d out=%q err=%q", notes, err, code, stdout.String(), stderr.String())
+	}
+	wantBody := workflow.FormatOrgEscalateNote("operator", "owner", "release/upward", "May we ship?")
+	if notes[0].Author != "operator" || notes[0].Body != wantBody {
+		t.Fatalf("stored ancestor escalation = %+v, want author=operator body=%q", notes[0], wantBody)
+	}
+	if code != 0 || stdout.String() != "escalated from operator to owner in workflow release/upward\n" || stderr.Len() != 0 {
+		t.Fatalf("ancestor escalation code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+}
+
 func TestOrgEscalateResolveLifecycle(t *testing.T) {
 	home := writeOrgEscalateConfig(t)
 	store := openCLIJobStore(t, home)
@@ -453,9 +533,9 @@ func TestOrgEscalateValidation(t *testing.T) {
 		args []string
 		want string
 	}{
-		{name: "same role", args: []string{"--org-role", "operator", "--to", "operator", "--workflow", "release/one", "question"}, want: "must be an ancestor"},
+		{name: "same role", args: []string{"--org-role", "operator", "--to", "operator", "--workflow", "release/one", "question"}, want: "must differ from acting role"},
 		{name: "unknown target", args: []string{"--org-role", "operator", "--to", "missing", "--workflow", "release/one", "question"}, want: `unknown org role "missing"`},
-		{name: "sibling", args: []string{"--org-role", "operator", "--to", "auditor", "--workflow", "release/one", "question"}, want: "must be an ancestor"},
+		{name: "sibling", args: []string{"--org-role", "operator", "--to", "auditor", "--workflow", "release/one", "question"}, want: "peer questions are not configurable and are refused"},
 		{name: "unknown source", args: []string{"--org-role", "missing", "--to", "owner", "--workflow", "release/one", "question"}, want: `unknown org role "missing"`},
 		{name: "missing workflow", args: []string{"--org-role", "operator", "--to", "owner", "question"}, want: "requires --workflow"},
 		{name: "invalid workflow", args: []string{"--org-role", "operator", "--to", "owner", "--workflow", "Bad Label", "question"}, want: "invalid workflow id"},

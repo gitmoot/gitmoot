@@ -1314,17 +1314,20 @@ dispatch, stored as `acting_org_role` in the job payload for provenance, and
 its scope is enforced at enqueue. `[org] enforce = "block"` rejects violations;
 `"warn"` queues and records an `org_scope_violation` event.
 
-`gitmoot org escalate --to <ancestor-role> --workflow <label> [--org-role
+`gitmoot org escalate --to <role> --workflow <label> [--org-role
 <from-role>] [--repo <owner/repo>] "<question>"` records an escalation as a
 workflow journal note. The acting role comes from `--org-role` (which takes
-precedence) or `GITMOOT_ORG_ROLE`; it must be a configured role. `--to` must be
-an ancestor of that role, never the same role or a sibling. The note uses the
-typed schema `[org:escalate to=<to> from=<from> wf=<workflow>] <question>`, has
-the from-role as author, and can be rendered as JSON with `--json`. It
-formalizes the earlier ad-hoc practice of typing escalations into notes or
-panes; there is no code-level marker to migrate. The note and a `pending` wake
-outbox row commit atomically. With an opt-in `reply` rule, a daemon tick wakes
-the addressed role through its configured Herdr pane.
+precedence) or `GITMOOT_ORG_ROLE`; it must be a configured role. An ancestor
+target preserves the upward escalation behavior; a descendant target records a
+downward ask. Both directions use the same typed schema
+`[org:escalate to=<to> from=<from> wf=<workflow>] <question>`, set the from-role
+as author, and can be rendered as JSON with `--json`. The same role is invalid.
+Peer questions are refused by a safe command-level default because Gitmoot has
+no configurable peer-question policy. This formalizes the earlier ad-hoc
+practice of typing organization questions into notes or panes; there is no
+code-level marker to migrate. The note and a `pending` wake outbox row commit
+atomically. With an opt-in `reply` rule, a daemon tick wakes the addressed role
+through its configured Herdr pane.
 
 `gitmoot org escalate resolve <escalation-note-id> [--by <role>] [--note
 <answer-note-id>] [--home <dir>]` appends a typed resolution marker to the same
