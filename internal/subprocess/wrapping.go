@@ -141,6 +141,25 @@ func (r WrappingRunner) RunEnv(ctx context.Context, dir string, env []string, co
 	return r.inner().Run(ctx, dir, executable, wrapped...)
 }
 
+func (r WrappingRunner) RunEnvStream(ctx context.Context, dir string, env []string, out io.Writer, command string, args ...string) (Result, error) {
+	executable, wrapped, err := r.command(command, args)
+	if err != nil {
+		return Result{}, err
+	}
+	// Wrapper-owned values remain last, matching RunEnv, so callers cannot move
+	// mutable runtime state outside the paths granted to sandbox-exec.
+	merged := append(append([]string{}, env...), r.Env...)
+	if inner, ok := r.inner().(EnvStreamRunner); ok {
+		return inner.RunEnvStream(ctx, dir, merged, out, executable, wrapped...)
+	}
+	if len(merged) == 0 {
+		if inner, ok := r.inner().(StreamRunner); ok {
+			return inner.RunStream(ctx, dir, out, executable, wrapped...)
+		}
+	}
+	return Result{}, errors.New("wrapped streaming runner does not support environment injection")
+}
+
 func (r WrappingRunner) RunEnvWithPID(ctx context.Context, dir string, env []string, onPID PIDCallback, command string, args ...string) (Result, error) {
 	executable, wrapped, err := r.command(command, args)
 	if err != nil {
@@ -156,6 +175,23 @@ func (r WrappingRunner) RunEnvWithPID(ctx context.Context, dir string, env []str
 		}
 	}
 	return r.RunEnv(ctx, dir, env, command, args...)
+}
+
+func (r WrappingRunner) RunEnvStreamWithPID(ctx context.Context, dir string, env []string, out io.Writer, onPID PIDCallback, command string, args ...string) (Result, error) {
+	executable, wrapped, err := r.command(command, args)
+	if err != nil {
+		return Result{}, err
+	}
+	merged := append(append([]string{}, env...), r.Env...)
+	if inner, ok := r.inner().(EnvPIDStreamRunner); ok {
+		return inner.RunEnvStreamWithPID(ctx, dir, merged, out, onPID, executable, wrapped...)
+	}
+	if len(merged) == 0 {
+		if inner, ok := r.inner().(PIDStreamRunner); ok {
+			return inner.RunStreamWithPID(ctx, dir, out, onPID, executable, wrapped...)
+		}
+	}
+	return r.RunEnvStream(ctx, dir, env, out, command, args...)
 }
 
 func (r WrappingRunner) LookPath(file string) (string, error) {

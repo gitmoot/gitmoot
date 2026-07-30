@@ -1,9 +1,13 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/config"
@@ -164,6 +168,152 @@ func TestInjectDeliveryAdapterEnvRealSubprocess(t *testing.T) {
 	}
 	if result.Summary != "shared-cache-value" {
 		t.Fatalf("Summary = %q, want %q (injected env did not reach the subprocess)", result.Summary, "shared-cache-value")
+	}
+}
+
+func TestFreshIsolatedProduceRunnerStreamsInjectedEnvAndPID(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if err := writeRuntimeAuthFile(runtimeAuthFilePath(paths.Home), map[string]string{
+		runtime.ClaudeOAuthTokenEnv: testOAuthToken,
+	}); err != nil {
+		t.Fatalf("write runtime auth: %v", err)
+	}
+
+	checkout := t.TempDir()
+	payload := workflow.JobPayload{
+		Sender:       workflow.PipelineJobSender,
+		WorktreePath: checkout,
+	}
+	agent := runtime.Agent{
+		Name:      "scout",
+		Runtime:   runtime.ClaudeRuntime,
+		RepoScope: "owner/repo",
+	}
+	var progress bytes.Buffer
+	worker := defaultJobWorker(nil, io.Discard, home)
+
+	// This is the fresh pipeline-stage construction order in jobWorker.run:
+	// progress tee, produce sandbox, then isolated tool-cache env injection.
+	adapter, _, err := worker.buildSeatAwareAdapter(&agent, checkout, payload, &progress)
+	if err != nil {
+		t.Fatalf("buildSeatAwareAdapter: %v", err)
+	}
+	toolCacheEnv, err := applyIsolatedToolCacheGrants(paths, payload, &agent)
+	if err != nil {
+		t.Fatalf("applyIsolatedToolCacheGrants: %v", err)
+	}
+	adapter, err = wrapProduceSandboxAdapter("produce", agent, adapter)
+	if err != nil {
+		t.Fatalf("wrapProduceSandboxAdapter: %v", err)
+	}
+	adapter, err = injectDeliveryAdapterEnv(adapter, toolCacheEnv)
+	if err != nil {
+		t.Fatalf("injectDeliveryAdapterEnv: %v", err)
+	}
+
+	claude, ok := adapter.(runtime.ClaudeAdapter)
+	if !ok {
+		t.Fatalf("adapter = %T, want runtime.ClaudeAdapter", adapter)
+	}
+	shim := writeSandboxPassthrough(t)
+	claude.Runner = setSandboxWrapperExecutable(t, claude.Runner, shim)
+	envPIDRunner, ok := claude.Runner.(subprocess.EnvPIDRunner)
+	if !ok {
+		t.Fatalf("runner = %T, want subprocess.EnvPIDRunner", claude.Runner)
+	}
+
+	var captured int
+	result, err := envPIDRunner.RunEnvWithPID(
+		context.Background(),
+		checkout,
+		[]string{"GITMOOT_STAGE_ENV=stage"},
+		func(pid int) { captured = pid },
+		"sh",
+		"-c",
+		`printf '%s' "$GOCACHE:$GITMOOT_STAGE_ENV:$$"`,
+	)
+	if err != nil {
+		t.Fatalf("fresh isolated produce RunEnvWithPID: %v", err)
+	}
+	fields := strings.Split(result.Stdout, ":")
+	if len(fields) != 3 {
+		t.Fatalf("stdout = %q, want tool-cache env, stage env, and child PID", result.Stdout)
+	}
+	wantCache := filepath.Join(paths.Home, "cache", "tools", "go-build")
+	if fields[0] != wantCache || fields[1] != "stage" {
+		t.Fatalf("subprocess env = %q:%q, want %q:%q", fields[0], fields[1], wantCache, "stage")
+	}
+	reported, err := strconv.Atoi(fields[2])
+	if err != nil {
+		t.Fatalf("parse child PID from stdout %q: %v", result.Stdout, err)
+	}
+	if captured <= 0 || captured != reported {
+		t.Fatalf("captured PID = %d, child reported %d", captured, reported)
+	}
+	if !strings.Contains(progress.String(), result.Stdout) {
+		t.Fatalf("progress tee = %q, want subprocess output %q", progress.String(), result.Stdout)
+	}
+}
+
+func writeSandboxPassthrough(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "sandbox-passthrough")
+	body := "#!/bin/sh\n" +
+		"while [ \"$#\" -gt 0 ] && [ \"$1\" != \"--\" ]; do shift; done\n" +
+		"[ \"$1\" = \"--\" ] && shift\n" +
+		"exec \"$@\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
+		t.Fatalf("write sandbox passthrough: %v", err)
+	}
+	return path
+}
+
+func setSandboxWrapperExecutable(t *testing.T, runner subprocess.Runner, executable string) subprocess.Runner {
+	t.Helper()
+	switch r := runner.(type) {
+	case subprocess.EnvInjectingRunner:
+		r.Inner = setSandboxWrapperExecutable(t, r.Inner, executable)
+		return r
+	case *subprocess.EnvInjectingRunner:
+		copy := *r
+		copy.Inner = setSandboxWrapperExecutable(t, copy.Inner, executable)
+		return &copy
+	case subprocess.TeeRunner:
+		inner := subprocess.Runner(r.Inner)
+		configured := setSandboxWrapperExecutable(t, inner, executable)
+		stream, ok := configured.(subprocess.StreamRunner)
+		if !ok {
+			t.Fatalf("configured tee inner = %T, want subprocess.StreamRunner", configured)
+		}
+		r.Inner = stream
+		return r
+	case *subprocess.TeeRunner:
+		copy := *r
+		inner := subprocess.Runner(copy.Inner)
+		configured := setSandboxWrapperExecutable(t, inner, executable)
+		stream, ok := configured.(subprocess.StreamRunner)
+		if !ok {
+			t.Fatalf("configured tee inner = %T, want subprocess.StreamRunner", configured)
+		}
+		copy.Inner = stream
+		return &copy
+	case subprocess.WrappingRunner:
+		r.Executable = executable
+		r.Inner = setSandboxWrapperExecutable(t, r.Inner, executable)
+		return r
+	case *subprocess.WrappingRunner:
+		copy := *r
+		copy.Executable = executable
+		copy.Inner = setSandboxWrapperExecutable(t, copy.Inner, executable)
+		return &copy
+	default:
+		return runner
 	}
 }
 
