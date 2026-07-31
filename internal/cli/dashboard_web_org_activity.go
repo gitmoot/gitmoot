@@ -59,6 +59,8 @@ type dashboardFleetActivityRole struct {
 	CurrentTurn       *int64                        `json:"current_turn,omitempty"`
 	LastCompletedTurn *int64                        `json:"last_completed_turn,omitempty"`
 	LastCompletedAt   string                        `json:"last_completed_at,omitempty"`
+	TurnAgeAt         string                        `json:"turn_age_at,omitempty"`
+	TurnAgeBasis      string                        `json:"turn_age_basis,omitempty"`
 	Scope             []string                      `json:"scope"`
 	WakeRoutes        []dashboardFleetActivityRoute `json:"wake_routes"`
 }
@@ -150,20 +152,17 @@ func (d *webDataSource) fleetActivitySnapshot(ctx context.Context) (dashboardFle
 	if err != nil {
 		return dashboardFleetActivity{}, fmt.Errorf("load org registry: %w", err)
 	}
-	if !cfg.Enabled() {
-		return dashboardFleetActivity{
-			Source: dashboardFleetActivitySource{State: "up", Detail: "Organization registry is not configured"},
-			Roles:  []dashboardFleetActivityRole{},
-		}, nil
-	}
-
 	var live org.Snapshot
 	var sourceErr error
-	provider := newOrgProvider(cfg.Roles())
-	if provider == nil {
-		sourceErr = errors.New("Herdr organization provider is not configured")
+	if !cfg.Enabled() {
+		live.ObservedAt = time.Now().UTC()
 	} else {
-		live, sourceErr = provider.Snapshot(ctx)
+		provider := newOrgProvider(cfg.Roles())
+		if provider == nil {
+			sourceErr = errors.New("Herdr organization provider is not configured")
+		} else {
+			live, sourceErr = provider.Snapshot(ctx)
+		}
 	}
 	now := time.Now().UTC()
 	var out dashboardFleetActivity
@@ -172,6 +171,9 @@ func (d *webDataSource) fleetActivitySnapshot(ctx context.Context) (dashboardFle
 		out, buildErr = buildDashboardFleetActivity(ctx, cfg, live, sourceErr, store, now)
 		return buildErr
 	})
+	if err == nil && !cfg.Enabled() {
+		out.Source.Detail = "Organization registry is not configured"
+	}
 	return out, err
 }
 
@@ -277,6 +279,16 @@ func buildDashboardFleetActivity(
 				completedTurn := activity.Turn
 				item.LastCompletedTurn = &completedTurn
 				item.LastCompletedAt = activity.CompletedAt.UTC().Format(time.RFC3339)
+				item.TurnAgeAt = item.LastCompletedAt
+				switch item.Status {
+				case "working", "blocked", "input_pending":
+					// Herdr does not yet expose current_turn_started_unix_ms.
+					// The approved design uses the preceding completion as the
+					// explicit, best-available lower bound for the current age.
+					item.TurnAgeBasis = "current_inferred"
+				default:
+					item.TurnAgeBasis = "last_completed"
+				}
 			}
 			out.Summary.Sessions++
 			switch item.Status {

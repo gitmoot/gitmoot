@@ -53,22 +53,24 @@ const dashboardFleetActivityCSS = `
 .gmfa-state.working{border-radius:50%;background:#9ece6a;box-shadow:0 0 0 3px rgba(158,206,106,.12);animation:gmfa-pulse 1.8s ease-in-out infinite}
 .gmfa-state.idle{border:2px solid #7f86ae;border-radius:50%;background:transparent}
 .gmfa-state.done{border:2px solid #7aa2f7;border-radius:1px;background:rgba(122,162,247,.12)}
-.gmfa-state.blocked{width:10px;height:10px;border:2px solid #ff9e64;transform:rotate(45deg);background:rgba(255,158,100,.12)}
-.gmfa-state.input_pending{background:#e0af68;clip-path:polygon(50% 0,100% 100%,0 100%)}
+.gmfa-state.blocked{width:10px;height:10px;border:2px solid #ff9e64;transform:rotate(45deg);background:rgba(255,158,100,.12);animation:gmfa-hot 1s ease-in-out infinite}
+.gmfa-state.input_pending{background:#e0af68;clip-path:polygon(50% 0,100% 100%,0 100%);animation:gmfa-hot 1.2s ease-in-out infinite}
 .gmfa-state.no_session{border:1.5px dashed #8b90b8;border-radius:50%;background:transparent}
 .gmfa-state.source_down{border:1.5px solid #f7768e;border-radius:2px;background:repeating-linear-gradient(135deg,transparent 0 2px,#f7768e 2px 3px)}
 .gmfa-state.unknown{border:1.5px dotted #8b90b8;border-radius:50%}
 @keyframes gmfa-pulse{50%{box-shadow:0 0 0 6px rgba(158,206,106,0)}}
+@keyframes gmfa-hot{50%{filter:brightness(1.5);opacity:.58}}
 .gmfa-age{margin-left:auto;min-width:54px;text-align:right;color:#8b90b8;font:9px ui-monospace,SFMono-Regular,Consolas,monospace;font-variant-numeric:tabular-nums;white-space:nowrap}
 #org-root .org-node.gmfa-decorated .org-node-name{min-width:0}
 #org-root .org-node.gmfa-decorated .org-node-sub{color:#a8aecf;font-size:9px}
 .gmfa-node-meta{height:11px;overflow:hidden;text-overflow:ellipsis;color:#5f668f;font:8px/11px ui-monospace,SFMono-Regular,Consolas,monospace;text-transform:uppercase;white-space:nowrap}
 .org-canvas-svg path.gmfa-edge{transition:stroke .18s,stroke-width .18s,opacity .18s}
 .org-canvas-svg path.gmfa-edge.working{stroke:#7fae5f!important;stroke-width:2!important;stroke-dasharray:5 6;animation:gmfa-flow 1.1s linear infinite}
-.org-canvas-svg path.gmfa-edge.blocked,.org-canvas-svg path.gmfa-edge.input_pending{stroke:#d58d58!important;stroke-width:2.2!important}
+.org-canvas-svg path.gmfa-edge.blocked,.org-canvas-svg path.gmfa-edge.input_pending{stroke:#d58d58!important;stroke-width:2.2!important;animation:gmfa-hot-edge 1.15s ease-in-out infinite}
 .org-canvas-svg path.gmfa-edge.no_session{stroke:#6e7498!important;stroke-dasharray:2 6;opacity:.55}
 .org-canvas-svg path.gmfa-edge.source_down{stroke:#ad5d70!important;stroke-dasharray:3 4;opacity:.7}
 @keyframes gmfa-flow{to{stroke-dashoffset:-11}}
+@keyframes gmfa-hot-edge{50%{opacity:.48}}
 .gmfa-drawer-session{padding:12px;border:1px solid rgba(125,207,255,.16);border-radius:7px;background:rgba(125,207,255,.035)}
 .gmfa-drawer-session h3{margin:0 0 10px;color:#6f789f;font:500 9px ui-monospace,SFMono-Regular,Consolas,monospace;text-transform:uppercase}
 .gmfa-drawer-title{margin:0 0 12px;color:#eef0ff;font-size:13px;font-weight:600;line-height:1.45;overflow-wrap:anywhere}
@@ -104,7 +106,9 @@ const dashboardFleetActivityCSS = `
   .gmfa-drawer-session{background:rgba(62,132,177,.045);border-color:rgba(62,132,177,.2)}
 }
 @media(prefers-reduced-motion:reduce){
-  .gmfa-state.working,.org-canvas-svg path.gmfa-edge.working{animation:none}
+  .gmfa-state.working,.gmfa-state.blocked,.gmfa-state.input_pending,
+  .org-canvas-svg path.gmfa-edge.working,.org-canvas-svg path.gmfa-edge.blocked,
+  .org-canvas-svg path.gmfa-edge.input_pending{animation:none}
 }
 `
 
@@ -131,6 +135,14 @@ const dashboardFleetActivityJS = `
     if (seconds < 3600) return Math.floor(seconds / 60) + 'm';
     if (seconds < 86400) return Math.floor(seconds / 3600) + 'h';
     return Math.floor(seconds / 86400) + 'd';
+  }
+  function utcTime(value) {
+    const parsed = Date.parse(value || '');
+    if (!Number.isFinite(parsed)) return '';
+    const date = new Date(parsed);
+    return String(date.getUTCHours()).padStart(2, '0') + ':' +
+      String(date.getUTCMinutes()).padStart(2, '0') + ':' +
+      String(date.getUTCSeconds()).padStart(2, '0') + ' UTC';
   }
   function roleMap() {
     const out = {};
@@ -288,7 +300,11 @@ const dashboardFleetActivityJS = `
           age.className = 'gmfa-age';
           main.appendChild(age);
         }
-        setText(age, role.last_completed_at ? 'last ' + compactAge(role.last_completed_at) : 'last --');
+        const ageAt = role.turn_age_at || role.last_completed_at;
+        setText(age, ageAt ? compactAge(ageAt) : '--');
+        age.title = role.turn_age_basis === 'current_inferred'
+          ? 'Current-turn age inferred from the previous turn completion'
+          : (ageAt ? 'Age since the last completed turn' : 'Turn age unavailable');
       }
       const sub = node.querySelector('.org-node-sub');
       setText(sub, role.task_title || (status === 'source_down' ? 'Session source unavailable' : 'Task title unavailable'));
@@ -391,9 +407,16 @@ const dashboardFleetActivityJS = `
     grid.className = 'gmfa-drawer-grid';
     appendPair(grid, 'Status', labels[role.status] || role.status || 'unknown');
     appendPair(grid, 'Current turn', role.current_turn == null ? 'Unavailable' : String(role.current_turn));
+    const currentAge = role.turn_age_basis === 'current_inferred' && role.turn_age_at
+      ? compactAge(role.turn_age_at) + ' ago · inferred from previous completion'
+      : 'Unavailable while this session is not active';
+    appendPair(grid, 'Current-turn age', currentAge);
     const completed = [];
     if (role.last_completed_turn != null) completed.push('turn ' + role.last_completed_turn);
-    if (role.last_completed_at) completed.push(compactAge(role.last_completed_at) + ' ago');
+    if (role.last_completed_at) {
+      completed.push(utcTime(role.last_completed_at));
+      completed.push(compactAge(role.last_completed_at) + ' ago');
+    }
     appendPair(grid, 'Last completed', completed.length ? completed.join(' · ') : 'Unavailable');
     appendPair(grid, 'Agent / pane', [role.agent, role.pane_id].filter(Boolean).join(' · ') || 'No active session');
     appendPair(grid, 'Scope', Array.isArray(role.scope) && role.scope.length ? role.scope.join(', ') : 'None configured');

@@ -112,7 +112,9 @@ func TestDashboardFleetActivityProjectionDistinguishesLiveNoSessionAndSourceDown
 				owner := roles["owner"]
 				if owner.TaskTitle != "Implement dashboard activity" || owner.CurrentTurn == nil || *owner.CurrentTurn != 12 ||
 					owner.LastCompletedTurn == nil || *owner.LastCompletedTurn != 11 ||
-					owner.LastCompletedAt != completed.Format(time.RFC3339) || len(owner.WakeRoutes) != 1 {
+					owner.LastCompletedAt != completed.Format(time.RFC3339) ||
+					owner.TurnAgeAt != completed.Format(time.RFC3339) || owner.TurnAgeBasis != "current_inferred" ||
+					len(owner.WakeRoutes) != 1 {
 					t.Fatalf("owner activity = %+v", owner)
 				}
 				review := roles["review"]
@@ -122,6 +124,52 @@ func TestDashboardFleetActivityProjectionDistinguishesLiveNoSessionAndSourceDown
 				}
 			}
 		})
+	}
+}
+
+func TestDashboardFleetActivitySnapshotKeepsEngineCountsWithoutOrgRegistry(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for _, job := range []db.Job{
+		{ID: "running", Agent: "worker", Type: "ask", State: "running"},
+		{ID: "queued", Agent: "worker", Type: "ask", State: "queued"},
+	} {
+		if err := store.CreateJob(ctx, job); err != nil {
+			store.Close()
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/one", Author: "review",
+		Body: workflow.FormatOrgEscalateNote("review", "owner", "release/one", "Need a decision."),
+	}); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := (&webDataSource{home: home}).fleetActivitySnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Source.State != "up" || !strings.Contains(got.Source.Detail, "not configured") {
+		t.Fatalf("source = %+v", got.Source)
+	}
+	if got.Summary.JobsRunning != 1 || got.Summary.EscalationsOpen != 1 || got.Summary.Sessions != 0 {
+		t.Fatalf("summary = %+v", got.Summary)
+	}
+	if got.Roles == nil || len(got.Roles) != 0 {
+		t.Fatalf("roles = %#v, want []", got.Roles)
 	}
 }
 
@@ -258,7 +306,10 @@ func TestDashboardFleetActivityAssetsAreSelfContainedAndInjected(t *testing.T) {
 		},
 		{
 			path: "/assets/gitmoot-fleet-activity.js", contentType: "application/javascript",
-			contains: []string{"new EventSource('/api/fleet/activity/events')", "[data-org-node]", "decorateDrawer"},
+			contains: []string{
+				"new EventSource('/api/fleet/activity/events')", "[data-org-node]",
+				"decorateDrawer", "Current-turn age", "turn_age_basis",
+			},
 		},
 	}
 	for _, test := range tests {

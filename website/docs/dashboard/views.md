@@ -13,6 +13,11 @@ Overview is the operator-first landing page. It combines local Gitmoot state int
 five compact blocks without making GitHub requests or scanning job payloads on
 each refresh:
 
+- **Fleet activity strip** answers whether the host is busy even when session
+  work has no engine job: sessions working, live sessions, blocked/input-pending
+  sessions, running jobs, and unresolved escalations are counted separately.
+  It links each count to the relevant read-only view and labels Herdr-down and
+  healthy-with-no-sessions states rather than rendering either as zero silently.
 - **Needs you** collects stalled workflows, pull-request tasks awaiting merge,
   and blocked jobs. Stalled workflow cards include the coordinator pane,
   session id, and last journal note needed to resume in the right place.
@@ -28,6 +33,26 @@ each refresh:
 The page is read-only and polls every 12 seconds. Groom proposals appear only
 when Gitmoot has a cheap persisted proposal source; the server does not walk
 artifact directories during a dashboard request.
+
+## Org
+
+Route: `/org`
+
+Org preserves the role hierarchy as its primary tree canvas and decorates each
+fixed-height node with live Herdr session data: a shape-and-color status marker,
+the pane's stripped terminal title, and a tabular turn-age badge. Working,
+blocked, and input-pending states also use motion unless the browser requests
+reduced motion; edges inherit the child session state. Filtering dims unmatched
+nodes without replacing the tree, and a no-match filter explains why the canvas
+looks empty.
+
+Selecting a node opens the existing right-hand detail drawer while the tree
+remains visible. It shows the full task title, current turn and inferred age,
+last-completed turn and UTC time, agent/pane identity, role scope, and configured
+wake routes. Herdr currently lacks a current-turn start timestamp, so active-turn
+age is explicitly inferred from the preceding turn's completion. A role with no
+active agent session and an unavailable Herdr source are separate labeled
+states. Titles and statuses are shown, but transcript content is never exposed.
 
 ## Tasks
 
