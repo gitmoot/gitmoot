@@ -28,10 +28,13 @@ type OrgRole struct {
 // OrgConfig is the local organization registry. Its fields stay private so the
 // loader remains the single place that establishes its invariants.
 type OrgConfig struct {
-	enforce        string
-	recycleAfter   time.Duration
-	recycleEnforce string
-	roles          map[string]OrgRole
+	enforce            string
+	recycleAfter       time.Duration
+	recycleEnforce     string
+	directiveAckTTL    time.Duration
+	directiveDoneTTL   time.Duration
+	directiveMaxNudges int
+	roles              map[string]OrgRole
 }
 
 func (c OrgConfig) Enabled() bool { return len(c.roles) > 0 }
@@ -60,6 +63,24 @@ func (c OrgConfig) RecycleEnforce() string {
 		return "off"
 	}
 	return c.recycleEnforce
+}
+
+func (c OrgConfig) DirectiveAckTTL() time.Duration {
+	if c.directiveAckTTL <= 0 {
+		return 10 * time.Minute
+	}
+	return c.directiveAckTTL
+}
+
+func (c OrgConfig) DirectiveDoneTTL() time.Duration {
+	return c.directiveDoneTTL
+}
+
+func (c OrgConfig) DirectiveMaxNudges() int {
+	if c.directiveMaxNudges <= 0 {
+		return 3
+	}
+	return c.directiveMaxNudges
 }
 
 // Ancestors returns name's parent chain, nearest parent first. The cycle guard
@@ -154,6 +175,9 @@ func LoadOrg(paths Paths) (OrgConfig, error) {
 	seenEnforce := false
 	seenRecycleAfter := false
 	seenRecycleEnforce := false
+	seenDirectiveAckTTL := false
+	seenDirectiveDoneTTL := false
+	seenDirectiveMaxNudges := false
 	current := ""
 	inOrg := false
 	lines := strings.Split(string(content), "\n")
@@ -210,7 +234,8 @@ func LoadOrg(paths Paths) (OrgConfig, error) {
 		if current == "" {
 			// Recycle fields are binary-first: binaries predating this allowlist
 			// fail closed on a config that uses either field.
-			if key != "enforce" && key != "recycle_after" && key != "recycle_enforce" {
+			if key != "enforce" && key != "recycle_after" && key != "recycle_enforce" &&
+				key != "directive_ack_ttl" && key != "directive_done_ttl" && key != "directive_max_nudges" {
 				return OrgConfig{}, fmt.Errorf("unknown [org] field %q", key)
 			}
 			switch key {
@@ -244,6 +269,42 @@ func LoadOrg(paths Paths) (OrgConfig, error) {
 					return OrgConfig{}, fmt.Errorf("parse [org].recycle_enforce: %w", err)
 				}
 				cfg.recycleEnforce = v
+			case "directive_ack_ttl":
+				if seenDirectiveAckTTL {
+					return OrgConfig{}, fmt.Errorf("duplicate [org].directive_ack_ttl")
+				}
+				seenDirectiveAckTTL = true
+				v, err := parseOrgDuration(value)
+				if err != nil {
+					return OrgConfig{}, fmt.Errorf("parse [org].directive_ack_ttl: %w", err)
+				}
+				if v <= 0 {
+					return OrgConfig{}, fmt.Errorf("org directive_ack_ttl must be positive")
+				}
+				cfg.directiveAckTTL = v
+			case "directive_done_ttl":
+				if seenDirectiveDoneTTL {
+					return OrgConfig{}, fmt.Errorf("duplicate [org].directive_done_ttl")
+				}
+				seenDirectiveDoneTTL = true
+				v, err := parseOrgDuration(value)
+				if err != nil {
+					return OrgConfig{}, fmt.Errorf("parse [org].directive_done_ttl: %w", err)
+				}
+				cfg.directiveDoneTTL = v
+			case "directive_max_nudges":
+				if seenDirectiveMaxNudges {
+					return OrgConfig{}, fmt.Errorf("duplicate [org].directive_max_nudges")
+				}
+				seenDirectiveMaxNudges = true
+				v, err := strconv.Atoi(strings.TrimSpace(value))
+				if err != nil {
+					return OrgConfig{}, fmt.Errorf("parse [org].directive_max_nudges: expected integer")
+				}
+				if v <= 0 {
+					return OrgConfig{}, fmt.Errorf("org directive_max_nudges must be positive")
+				}
+				cfg.directiveMaxNudges = v
 			}
 			continue
 		}
@@ -423,6 +484,15 @@ func ValidateOrg(cfg OrgConfig) error {
 	}
 	if cfg.recycleAfter < 0 {
 		return fmt.Errorf("org recycle_after must not be negative")
+	}
+	if cfg.directiveAckTTL < 0 {
+		return fmt.Errorf("org directive_ack_ttl must not be negative")
+	}
+	if cfg.directiveDoneTTL < 0 {
+		return fmt.Errorf("org directive_done_ttl must not be negative")
+	}
+	if cfg.directiveMaxNudges < 0 {
+		return fmt.Errorf("org directive_max_nudges must not be negative")
 	}
 	if mode := cfg.RecycleEnforce(); mode != "off" && mode != "warn" && mode != "block" {
 		return fmt.Errorf("org recycle_enforce must be \"off\", \"warn\", or \"block\"")

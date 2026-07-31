@@ -19,6 +19,7 @@ import (
 const (
 	blockedRoleWakeInterval    = time.Minute
 	blockedRoleSnapshotTimeout = 5 * time.Second
+	directiveTTLSweepLimit     = 200
 	// blockedEpisodeStaleGap bounds how long a role episode survives without being
 	// re-observed blocked. Within it, a transient unknown/absent snapshot blip is
 	// tolerated (the accrued blocked duration is preserved); beyond it the subject is
@@ -36,6 +37,12 @@ type blockedRoleWakeDependencies struct {
 	availability blockedRoleAvailability
 	provider     func([]config.OrgRole) org.Provider
 	eventSink    func(context.Context, *db.Store, string) (events.Sink, error)
+	directives   directiveTTLDependencies
+}
+
+type directiveTTLDependencies struct {
+	list func(context.Context, *db.Store, int) ([]db.OrgDirectiveObligation, error)
+	mark func(context.Context, *db.Store, int64, int, string, time.Time) (int, bool, error)
 }
 
 func defaultBlockedRoleWakeDependencies() blockedRoleWakeDependencies {
@@ -44,6 +51,20 @@ func defaultBlockedRoleWakeDependencies() blockedRoleWakeDependencies {
 		provider:     cockpit.NewHerdrOrgProvider,
 		eventSink:    enabledBlockedSinceEventSink,
 	}
+}
+
+func (d directiveTTLDependencies) listOpen(ctx context.Context, store *db.Store, limit int) ([]db.OrgDirectiveObligation, error) {
+	if d.list != nil {
+		return d.list(ctx, store, limit)
+	}
+	return store.ListOpenOrgDirectiveObligations(ctx, limit)
+}
+
+func (d directiveTTLDependencies) markNudged(ctx context.Context, store *db.Store, item db.OrgDirectiveObligation, now time.Time) (int, bool, error) {
+	if d.mark != nil {
+		return d.mark(ctx, store, item.ID, item.NudgeCount, item.LastNudgedAt, now)
+	}
+	return store.MarkOrgDirectiveNudged(ctx, item.ID, item.NudgeCount, item.LastNudgedAt, now)
 }
 
 // enabledBlockedSinceEventSink preserves the blocked-since path's stricter
@@ -226,6 +247,20 @@ func runBlockedRoleWakeOnce(ctx context.Context, store *db.Store, home string, s
 		// common OSS/automated-user case — never probes herdr and never logs.
 		return
 	}
+	// Directive supervision shares this existing one-minute lane but does not
+	// depend on a Herdr snapshot. Resolve the event-rule guard first: with zero
+	// enabled rules, sink is nil and no directive query is issued (config-inert).
+	var sink events.Sink
+	if deps.eventSink != nil {
+		sink, err = deps.eventSink(ctx, store, home)
+		if err != nil {
+			writeLine(stdout, "org directive TTL event sink unavailable: %v", err)
+		} else if sink != nil {
+			if err := evaluateOrgDirectiveTTLs(ctx, store, sink, orgConfig, stdout, now.UTC(), deps.directives); err != nil {
+				writeLine(stdout, "org directive TTL evaluation failed: %v", err)
+			}
+		}
+	}
 	// Herdr reachability gates the snapshot that BOTH org live-presence and the
 	// blocked-role wake need. This return was previously silent, which made a
 	// broken /org page impossible to diagnose from daemon.log for a deployment
@@ -264,15 +299,7 @@ func runBlockedRoleWakeOnce(ctx context.Context, store *db.Store, home string, s
 	// Blocked-role WAKE evaluation is the opt-in half: only when a wake threshold
 	// is configured and the blocked-role event rule yields a sink.
 	wakeAfter := resolveBlockedRoleWakeAfter(home)
-	if wakeAfter <= 0 || deps.eventSink == nil {
-		return
-	}
-	sink, err := deps.eventSink(ctx, store, home)
-	if err != nil {
-		writeLine(stdout, "blocked_since role event sink unavailable: %v", err)
-		return
-	}
-	if sink == nil {
+	if wakeAfter <= 0 || sink == nil {
 		return
 	}
 	if err := evaluateBlockedRoleEpisodes(ctx, store, sink, snapshot, wakeAfter, stdout, now.UTC()); err != nil {
@@ -281,6 +308,90 @@ func runBlockedRoleWakeOnce(ctx context.Context, store *db.Store, home string, s
 	if err := evaluateInputPendingRoleEpisodes(ctx, store, sink, snapshot, wakeAfter, stdout, now.UTC()); err != nil {
 		writeLine(stdout, "input_pending role evaluation failed: %v", err)
 	}
+}
+
+func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.Sink, orgConfig config.OrgConfig, stdout io.Writer, now time.Time, deps directiveTTLDependencies) error {
+	if store == nil || sink == nil {
+		return nil
+	}
+	now = now.UTC()
+	items, err := deps.listOpen(ctx, store, directiveTTLSweepLimit)
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		from, to, _, _, ok := workflow.ParseOrgDirectiveNote(item.Body)
+		if !ok {
+			writeLine(stdout, "org directive %d TTL skipped: malformed directive marker", item.ID)
+			continue
+		}
+		anchor, ttl, phase, unacked, due := directiveTTLDue(item, orgConfig, now)
+		if !due {
+			continue
+		}
+		newCount, claimed, err := deps.markNudged(ctx, store, item, now)
+		if err != nil {
+			writeLine(stdout, "org directive %d nudge mark failed: %v", item.ID, err)
+			continue
+		}
+		if !claimed {
+			continue
+		}
+		events.EmitEvent(ctx, sink, buildDirectiveNudgeEvent(item, to, phase, anchor, ttl, newCount, now))
+		if unacked && newCount == orgConfig.DirectiveMaxNudges() {
+			events.EmitEvent(ctx, sink, buildDirectiveEscalationEvent(item, orgConfig, from, to, newCount, now))
+		}
+	}
+	return nil
+}
+
+func directiveTTLDue(item db.OrgDirectiveObligation, orgConfig config.OrgConfig, now time.Time) (anchor time.Time, ttl time.Duration, phase string, unacked, due bool) {
+	if strings.TrimSpace(item.AckedAt) == "" {
+		if item.NudgeCount >= orgConfig.DirectiveMaxNudges() {
+			return time.Time{}, 0, "", true, false
+		}
+		anchor = parseTranscriptStoreTime(item.CreatedAt)
+		ttl = orgConfig.DirectiveAckTTL()
+		phase = "acknowledgment"
+		unacked = true
+	} else {
+		anchor = parseTranscriptStoreTime(item.AckedAt)
+		ttl = orgConfig.DirectiveDoneTTL()
+		if item.DoneTTLOverrideSeconds >= 0 {
+			ttl = time.Duration(item.DoneTTLOverrideSeconds) * time.Second
+		}
+		phase = "completion"
+	}
+	if anchor.IsZero() || ttl <= 0 || now.Sub(anchor) <= ttl {
+		return anchor, ttl, phase, unacked, false
+	}
+	if lastText := strings.TrimSpace(item.LastNudgedAt); lastText != "" {
+		last := parseTranscriptStoreTime(lastText)
+		if last.IsZero() || now.Sub(last) <= ttl {
+			return anchor, ttl, phase, unacked, false
+		}
+	}
+	return anchor, ttl, phase, unacked, true
+}
+
+func buildDirectiveNudgeEvent(item db.OrgDirectiveObligation, target, phase string, anchor time.Time, ttl time.Duration, nudgeCount int, now time.Time) events.Event {
+	id := fmt.Sprint(item.ID)
+	detail := fmt.Sprintf("directive %s to %s awaits %s after %s; nudge %d", id, target, phase, now.Sub(anchor).Round(time.Second), nudgeCount)
+	ev := events.NewEvent(events.EventOrgDirective, id, db.WakeOutboxSourceWorkflowNote+":"+id, item.Repo, "overdue", detail, now, workflow.RedactCommentText)
+	ev.Cause = "directive_" + phase + "_overdue"
+	ev.WakeTargetRole = target
+	return ev
+}
+
+func buildDirectiveEscalationEvent(item db.OrgDirectiveObligation, orgConfig config.OrgConfig, sender, target string, nudgeCount int, now time.Time) events.Event {
+	id := fmt.Sprint(item.ID)
+	detail := fmt.Sprintf("directive %s to %s remains unacknowledged after %d nudges", id, target, nudgeCount)
+	ev := events.NewEvent(events.EventJobNeedsAttention, "org-directive:"+id, db.WakeOutboxSourceWorkflowNote+":"+id, item.Repo, "overdue", detail, now, workflow.RedactCommentText)
+	ev.Cause = "escalation"
+	if role, ok := orgConfig.Role(sender); ok {
+		ev.WakeTargetRole = role.Parent
+	}
+	return ev
 }
 
 func persistOrgRoleLivePresence(ctx context.Context, store *db.Store, snapshot org.Snapshot, stdout io.Writer) {

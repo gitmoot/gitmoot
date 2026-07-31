@@ -119,18 +119,31 @@ func TestEventRuleScopeMigrationDefaultsLegacyRowsToAddressed(t *testing.T) {
 
 func TestEventRuleCatchAllMigrationPromotesOnlyNonReplyRulesToObserver(t *testing.T) {
 	ctx := context.Background()
+	const (
+		wantBackfillMigration  = 107
+		wantDirectiveMigration = 108
+	)
 	var backfillMigration int
+	var directiveMigration int
 	for i, migration := range migrations {
 		if strings.Contains(migration, "scope = 'observer'") && strings.Contains(migration, "on_kind <> 'reply'") {
 			backfillMigration = i
-			break
+		}
+		if strings.Contains(migration, "directive_nudge_count") && strings.Contains(migration, "directive_last_nudged_at") {
+			directiveMigration = i
 		}
 	}
 	if backfillMigration == 0 {
 		t.Fatal("event rule observer catch-all migration not found")
 	}
-	if backfillMigration != len(migrations)-1 {
-		t.Fatalf("observer catch-all migration index=%d, want append-only tail index=%d", backfillMigration, len(migrations)-1)
+	if directiveMigration == 0 {
+		t.Fatal("directive supervision migration not found")
+	}
+	if backfillMigration != wantBackfillMigration {
+		t.Fatalf("observer catch-all migration index=%d, want preserved append-only index=%d", backfillMigration, wantBackfillMigration)
+	}
+	if directiveMigration != wantDirectiveMigration || directiveMigration != len(migrations)-1 {
+		t.Fatalf("directive supervision migration index=%d, want append-only tail index=%d (slice tail=%d)", directiveMigration, wantDirectiveMigration, len(migrations)-1)
 	}
 
 	raw, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "catch-all.db"))

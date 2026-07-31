@@ -23,6 +23,16 @@ type wakeTargetRoleProducer struct {
 
 var wakeTargetRoleProducers = []wakeTargetRoleProducer{
 	{
+		File:     "internal/cli/blocked_since.go",
+		Function: "buildDirectiveNudgeEvent",
+		Kinds:    directiveNudgeDirectedKinds,
+	},
+	{
+		File:     "internal/cli/blocked_since.go",
+		Function: "buildDirectiveEscalationEvent",
+		Kinds:    directiveEscalationDirectedKinds,
+	},
+	{
 		File:     "internal/cli/event_rule_sink.go",
 		Function: "addressBlockedEvent",
 		Kinds:    blockedWakeDirectedKinds,
@@ -42,6 +52,14 @@ var wakeTargetRoleProducers = []wakeTargetRoleProducer{
 		Function: "wakeOutboxEvent",
 		Kinds:    wakeOutboxDirectedKinds,
 	},
+}
+
+func directiveNudgeDirectedKinds() []string {
+	return []string{db.WakeOutboxKindDirective}
+}
+
+func directiveEscalationDirectedKinds() []string {
+	return []string{db.WakeOutboxKindEscalation}
 }
 
 func blockedWakeDirectedKinds() []string {

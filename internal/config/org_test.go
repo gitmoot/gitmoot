@@ -124,6 +124,48 @@ recycle_after = "0s"
 	}
 }
 
+func TestLoadOrgDirectiveTTLPolicy(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name       string
+		fields     string
+		wantAck    time.Duration
+		wantDone   time.Duration
+		wantNudges int
+		wantErr    string
+	}{
+		{name: "defaults", wantAck: 10 * time.Minute, wantNudges: 3},
+		{name: "configured", fields: "directive_ack_ttl = \"15m\"\ndirective_done_ttl = \"2h\"\ndirective_max_nudges = 5\n", wantAck: 15 * time.Minute, wantDone: 2 * time.Hour, wantNudges: 5},
+		{name: "done disabled", fields: "directive_done_ttl = \"0s\"\n", wantAck: 10 * time.Minute, wantNudges: 3},
+		{name: "ack must be positive", fields: "directive_ack_ttl = \"0s\"\n", wantErr: "directive_ack_ttl must be positive"},
+		{name: "nudges must be positive", fields: "directive_max_nudges = 0\n", wantErr: "directive_max_nudges must be positive"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := "[org]\n" + test.fields + "[org.roles.\"owner\"]\nscope=[\"*\"]\n"
+			if err := os.WriteFile(paths.ConfigFile, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadOrg(paths)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("LoadOrg() error = %v, want containing %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.DirectiveAckTTL() != test.wantAck || cfg.DirectiveDoneTTL() != test.wantDone || cfg.DirectiveMaxNudges() != test.wantNudges {
+				t.Fatalf("directive policy = ack %s done %s nudges %d", cfg.DirectiveAckTTL(), cfg.DirectiveDoneTTL(), cfg.DirectiveMaxNudges())
+			}
+		})
+	}
+}
+
 func TestLoadOrgRecycleAfterFailsClosed(t *testing.T) {
 	paths := PathsForHome(t.TempDir())
 	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
