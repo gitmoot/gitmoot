@@ -261,6 +261,11 @@ func (g PolicyMergeGate) gateMiss(reason string) MergeDecision {
 func (g PolicyMergeGate) reviewAndCIGateMiss(ctx context.Context, repo github.Repository, request MergeRequest, headSHA string) (pendingDecision MergeDecision, isPending bool, reason string, err error) {
 	var reasons []string
 	if reviewErr := g.ensureFinalReviewCaptured(ctx, request, headSHA); reviewErr != nil {
+		var pending mergePending
+		if errors.As(reviewErr, &pending) {
+			decision, dErr := g.pending(ctx, request, headSHA, pending.reason)
+			return decision, true, "", dErr
+		}
 		reasons = append(reasons, "review gate: "+reviewErr.Error()+" for head "+headSHA)
 	}
 	if ciErr := g.ensureStatuses(ctx, repo, int64(request.PullRequest), headSHA); ciErr != nil {
@@ -444,8 +449,8 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			implementingAgents[agent] = struct{}{}
 		}
 	}
-	// A round can order remediation, but it must not hide a blocking verdict
-	// captured at the head currently being evaluated.
+	// A round can order remediation, but it must not hide a blocking verdict or
+	// an unfinished reviewer slot captured at the head currently being evaluated.
 	type reviewAtHead struct {
 		job     db.Job
 		payload JobPayload
@@ -459,7 +464,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if err != nil {
 			return err
 		}
-		if !sameTask(current, payload) || payload.Result == nil {
+		if !sameTask(current, payload) {
 			continue
 		}
 		reviewHead := strings.TrimSpace(payload.HeadSHA)
@@ -468,14 +473,41 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		}
 		reviewsAtHead = append(reviewsAtHead, reviewAtHead{job: job, payload: payload})
 	}
+	latestReviewByReviewer := map[string]reviewAtHead{}
+	var reviewerOrder []string
+	for _, review := range reviewsAtHead {
+		reviewer := strings.TrimSpace(review.job.Agent)
+		latest, exists := latestReviewByReviewer[reviewer]
+		if !exists {
+			reviewerOrder = append(reviewerOrder, reviewer)
+			latestReviewByReviewer[reviewer] = review
+			continue
+		}
+		if reviewJobRecordedAfter(review.job, latest.job) {
+			latestReviewByReviewer[reviewer] = review
+		}
+	}
+	for _, reviewer := range reviewerOrder {
+		review := latestReviewByReviewer[reviewer]
+		switch JobState(review.job.State) {
+		case JobQueued, JobRunning:
+			return mergePending{reason: fmt.Sprintf("waiting for reviewer %s at evaluated head (job %s is %s)", reviewer, review.job.ID, review.job.State)}
+		case JobFailed, JobCancelled:
+			return fmt.Errorf("crashed reviewer %s at evaluated head (job %s is %s); requeue or reassign the review", reviewer, review.job.ID, review.job.State)
+		}
+	}
 	supersededReviewIDs := map[string]struct{}{}
 	for _, review := range reviewsAtHead {
+		if review.payload.Result == nil {
+			continue
+		}
 		reviewer := strings.TrimSpace(review.job.Agent)
 		if reviewer == "" {
 			continue
 		}
 		for _, candidate := range reviewsAtHead {
-			if strings.TrimSpace(candidate.job.Agent) == reviewer &&
+			if candidate.payload.Result != nil &&
+				strings.TrimSpace(candidate.job.Agent) == reviewer &&
 				isReviewReplacementDecision(candidate.payload.Result.Decision) &&
 				reviewJobRecordedAfter(candidate.job, review.job) {
 				supersededReviewIDs[review.job.ID] = struct{}{}
@@ -484,6 +516,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		}
 	}
 	for _, review := range reviewsAtHead {
+		if review.payload.Result == nil {
+			continue
+		}
 		if _, superseded := supersededReviewIDs[review.job.ID]; superseded {
 			continue
 		}
@@ -491,6 +526,45 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		case "changes_requested", "blocked", "failed":
 			return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", review.job.Agent)}
 		}
+	}
+	if len(latestReviewByReviewer) > 0 {
+		var selfApprovalReason string
+		var unknownImplementerReason string
+		var unattributedReviewerReason string
+		for _, reviewer := range reviewerOrder {
+			review := latestReviewByReviewer[reviewer]
+			if JobState(review.job.State) != JobSucceeded {
+				return fmt.Errorf("reviewer %s at evaluated head has unusable job state %s (job %s)", reviewer, review.job.State, review.job.ID)
+			}
+			if review.payload.Result == nil {
+				return fmt.Errorf("abstaining reviewer %s at evaluated head has no recognized decision (job %s); requeue or reassign the review", reviewer, review.job.ID)
+			}
+			switch review.payload.Result.Decision {
+			case "approved":
+				switch {
+				case reviewer == "":
+					if unattributedReviewerReason == "" {
+						unattributedReviewerReason = "latest review round's approval has no recorded reviewer author; an independent reviewer cannot be verified"
+					}
+				case len(implementingAgents) == 0:
+					if unknownImplementerReason == "" {
+						unknownImplementerReason = "latest review round's approval cannot be verified as independent because the implementing agent for this task could not be determined"
+					}
+				default:
+					if _, selfApproved := implementingAgents[reviewer]; selfApproved && selfApprovalReason == "" {
+						selfApprovalReason = fmt.Sprintf("latest review round's approval was authored by %s, the implementing agent; an independent reviewer is required", reviewer)
+					}
+				}
+			case "changes_requested", "blocked", "failed":
+				return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", reviewer)}
+			default:
+				return fmt.Errorf("abstaining reviewer %s at evaluated head returned unrecognized decision %q (job %s); requeue or reassign the review", reviewer, review.payload.Result.Decision, review.job.ID)
+			}
+		}
+		if reason := reviewAuthorshipFailureReason(selfApprovalReason, unknownImplementerReason, unattributedReviewerReason); reason != "" {
+			return errors.New(reason)
+		}
+		return nil
 	}
 	latest := ""
 	for _, job := range jobs {
