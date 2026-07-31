@@ -359,3 +359,72 @@ func TestInProcessPROpenHonoursBranchLockAcrossSessionBusyDelegation(t *testing.
 		}
 	}
 }
+
+// #1277 x #1236, the cross-product g7-review found by mutation — and the
+// highest-stakes cell in this whole change, because the failure mode is a MERGE
+// GATE RUN rather than a spurious review.
+//
+// The two fixes install two different fail-closed mechanisms in the same
+// function, and this is where they meet. When NO reviewer roster is configured,
+// HandlePullRequestOpened treats the PR as "no native review discipline" and runs
+// the MERGE GATE. The branch intent is what must return through the baseline
+// BEFORE that arm is reached. So if the lock fallback is ever narrowed to only
+// apply when a roster exists, an intent-bearing zero-roster PR stops being
+// suppressed and starts being MERGE-GATED — the intent inverts from "do not
+// review this" into "consider this for merge unreviewed".
+//
+// A ROSTER_ONLY_LOCK_FALLBACK mutant survived all nineteen fanout/PR-open/
+// implement/dispatchFix/preflight/zero-roster tests, so nothing pinned this.
+func TestBranchLockIntentSuppressesTheMergeGateWithNoConfiguredRoster(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	// Deliberately NO configured reviewers — this is the zero-roster arm.
+	engine.RequiredReviewers = nil
+	gate := &fakeMergeGate{decision: MergeDecision{Merged: true}}
+	engine.MergeGate = gate
+
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-15", Owner: "lead"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	// The branch carries the intent; the payload does not.
+	if err := store.SetBranchLockReviewFanout(ctx, "gitmoot/gitmoot", "task-15", true); err != nil {
+		t.Fatalf("SetBranchLockReviewFanout returned error: %v", err)
+	}
+	insertCompletedJob(t, store, db.Job{
+		ID:    "zero-roster-implement",
+		Agent: "lead",
+		Type:  "implement",
+	}, JobPayload{
+		Repo:                   "gitmoot/gitmoot",
+		Branch:                 "task-15",
+		PullRequest:            15,
+		HeadSHA:                "head015",
+		TaskID:                 "task-15",
+		LeadAgent:              "lead",
+		SkipNativeReviewFanout: false,
+		Result:                 &AgentResult{Decision: "implemented", Summary: "opened PR on an intent-bearing branch"},
+	})
+
+	// Assert on the gate BEFORE the advance error: when the intent is dropped the
+	// gate runs and its decision can itself error, which would otherwise mask the
+	// real defect behind a generic "merge gate rejected action". This regression
+	// has to name what went wrong, not merely go red.
+	advanceErr := engine.AdvanceJob(ctx, "zero-roster-implement")
+	if len(gate.requests) != 0 {
+		t.Fatalf("branch intent was dropped and let a zero-roster PR reach the merge gate: %+v", gate.requests)
+	}
+	if advanceErr != nil {
+		t.Fatalf("AdvanceJob returned error: %v", advanceErr)
+	}
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	for _, job := range jobs {
+		if job.Type == "review" {
+			t.Fatalf("expected no review jobs, found %+v", job)
+		}
+	}
+}
