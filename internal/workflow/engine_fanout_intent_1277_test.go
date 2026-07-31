@@ -294,3 +294,68 @@ func TestInProcessPROpenHonoursTheBranchLockIntent(t *testing.T) {
 		}
 	}
 }
+
+// #1277, the guard gap g7-review found by mutation. The branch-lock fallback
+// must hold across the engine's OWN identity rewrite, and the previous test only
+// covered the homogeneous case where the implement job's agent is also the lock
+// owner. A mutant narrowing the fallback to lock.Owner == job.Agent survived all
+// twelve fanout/PR-open/dispatchFix tests while being wrong for a shape the
+// engine actively supports.
+//
+// That shape is runtime_session_busy: when a runtime session is occupied the work
+// is delegated to a TEMPORARY WORKER, so job.Agent is the worker while the branch
+// lock is still owned by OriginalAgent — and it is OriginalAgent that
+// leadAgent-resolution restores. The branch carries the intent; the worker's
+// payload does not. Ownership must be irrelevant to reading it.
+func TestInProcessPROpenHonoursBranchLockAcrossSessionBusyDelegation(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "orig", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "temp-worker", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "reviewer", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	engine.RequiredReviewers = []string{"reviewer"}
+	gate := &fakeMergeGate{decision: MergeDecision{Reason: "ci is pending"}}
+	engine.MergeGate = gate
+
+	// The lock — and therefore the branch intent — belongs to the ORIGINAL agent.
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-14", Owner: "orig"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	if err := store.SetBranchLockReviewFanout(ctx, "gitmoot/gitmoot", "task-14", true); err != nil {
+		t.Fatalf("SetBranchLockReviewFanout returned error: %v", err)
+	}
+	// The advancing job is the DELEGATED temporary worker, carrying no intent of
+	// its own. LeadAgent is empty so the runtime_session_busy restore runs.
+	insertCompletedJob(t, store, db.Job{
+		ID:    "session-busy-implement",
+		Agent: "temp-worker",
+		Type:  "implement",
+	}, JobPayload{
+		Repo:                   "gitmoot/gitmoot",
+		Branch:                 "task-14",
+		PullRequest:            14,
+		HeadSHA:                "head789",
+		TaskID:                 "task-14",
+		LeadAgent:              "",
+		DelegationReason:       "runtime_session_busy",
+		DelegatedAgent:         "temp-worker",
+		OriginalAgent:          "orig",
+		SkipNativeReviewFanout: false,
+		Result:                 &AgentResult{Decision: "implemented", Summary: "delegated worker pushed the branch"},
+	})
+
+	if err := engine.AdvanceJob(ctx, "session-busy-implement"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	for _, job := range jobs {
+		if job.Type == "review" {
+			t.Fatalf("temporary worker re-armed fanout despite the original owner's branch intent: %+v", job)
+		}
+	}
+}
