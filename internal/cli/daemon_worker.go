@@ -334,7 +334,18 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
 	}
-	jobTimeout := effectiveJobTimeout(payload, managed)
+	timeoutResolution := resolveEffectiveJobTimeout(payload, managed)
+	jobTimeout := timeoutResolution.Timeout
+	if timeoutResolution.Clamped {
+		message := fmt.Sprintf("%s job_timeout %s exceeds [daemon].job_timeout_max %s; clamped to %s",
+			timeoutResolution.Source, timeoutResolution.Requested, timeoutResolution.Max, timeoutResolution.Timeout)
+		if eventErr := w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: job.ID, Kind: "job_timeout_clamped", Message: message}); eventErr != nil {
+			if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, eventErr); finishErr != nil {
+				return finishErr
+			}
+			return nil
+		}
+	}
 	// Size the runtime-session lease to jobTimeout PLUS a teardown grace so the
 	// lease strictly OUTLIVES the run-context deadline (armed at exactly jobTimeout
 	// below) and the terminal worktree teardown that runs while this lock is still
@@ -342,10 +353,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// expires; without the grace the lease would expire in the live-worker teardown
 	// window and the expired-lock reaper would requeue the still-'running' owner
 	// onto its dirty worktree — the #536 clobber. See runtimeLeaseTeardownGrace.
-	lockTTL := defaultDaemonRunningJobStaleAfter
-	if jobTimeout > 0 {
-		lockTTL = jobTimeout + runtimeLeaseTeardownGrace
-	}
+	lockTTL := jobTimeout + runtimeLeaseTeardownGrace
 	// SESSION SAFETY (#531): the lock is taken on the EFFECTIVE agent, so an
 	// overridden job locks the OVERRIDE runtime's session key and can never
 	// collide with (or occupy) the agent's default-runtime session lock.
@@ -587,8 +595,8 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			defer w.finalizeCockpitRootIfDone(cp, job, payload, meta.RootJobID)
 		}
 	}
-	if managed.OK {
-		if err := w.Store.MarkAgentInstanceRunning(ctx, agent.Name, time.Now().UTC(), managed.JobTimeout); err != nil {
+	if managed.Instance {
+		if err := w.Store.MarkAgentInstanceRunning(ctx, agent.Name, time.Now().UTC(), jobTimeout); err != nil {
 			if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
 				return finishErr
 			}
@@ -614,11 +622,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	runCtx, stopRun := w.runningJobContext(ctx, job.ID)
 	defer stopRun()
 	runStartedAt := time.Now().UTC()
-	if jobTimeout > 0 {
-		var cancel context.CancelFunc
-		runCtx, cancel = context.WithTimeout(runCtx, jobTimeout)
-		defer cancel()
-	}
+	var cancel context.CancelFunc
+	runCtx, cancel = context.WithTimeout(runCtx, jobTimeout)
+	defer cancel()
 	runDeadline, hasRunDeadline := runCtx.Deadline()
 	stopKillPending := func() {}
 	if hasRunDeadline {
@@ -1617,11 +1623,6 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		}
 		return fmt.Errorf("%w: %s", errRuntimeSessionBusy, waitMessage)
 	}
-	// A per-delegation timeout on the payload overrides the agent-type job
-	// timeout for both the lock TTL and the run deadline below.
-	if d, perr := time.ParseDuration(strings.TrimSpace(payload.JobTimeout)); perr == nil && d > 0 {
-		started.JobTimeout = d
-	}
 	payload.OriginalAgent = original.Name
 	payload.DelegatedAgent = started.Agent.Name
 	payload.DelegationReason = "runtime_session_busy"
@@ -1658,10 +1659,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	// Same lease-outlives-context invariant as run(): the temp-worker run context is
 	// armed at started.JobTimeout below, so the lease must be jobTimeout+grace to
 	// cover teardown and avoid the #536 live-worker reap+requeue window.
-	tempLockTTL := defaultDaemonRunningJobStaleAfter
-	if started.JobTimeout > 0 {
-		tempLockTTL = started.JobTimeout + runtimeLeaseTeardownGrace
-	}
+	tempLockTTL := started.JobTimeout + runtimeLeaseTeardownGrace
 	releaseLock, acquired, lockKey, ownerToken, err := acquireRuntimeSessionLock(ctx, w.Store, delegatedJob.ID, started.Agent, time.Now().UTC(), tempLockTTL)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, delegatedJob.ID, workflow.JobFailed, err); finishErr != nil {
@@ -1765,11 +1763,9 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	runCtx, stopRun := w.runningJobContext(ctx, job.ID)
 	defer stopRun()
 	runStartedAt := time.Now().UTC()
-	if started.JobTimeout > 0 {
-		var cancel context.CancelFunc
-		runCtx, cancel = context.WithTimeout(runCtx, started.JobTimeout)
-		defer cancel()
-	}
+	var cancel context.CancelFunc
+	runCtx, cancel = context.WithTimeout(runCtx, started.JobTimeout)
+	defer cancel()
 	runDeadline, hasRunDeadline := runCtx.Deadline()
 	stopKillPending := func() {}
 	if hasRunDeadline {
@@ -1914,13 +1910,16 @@ func compactMergeBackStrings(values []string) []string {
 
 func (w jobWorker) startTempWorker(ctx context.Context, job db.Job, payload workflow.JobPayload, original runtime.Agent, checkout string) (tempWorkerStartResult, error) {
 	idleTimeout := 20 * time.Minute
-	jobTimeout := defaultDaemonRunningJobStaleAfter
-	if managed, err := w.managedJobConfig(ctx, original.Name); err == nil && managed.OK {
-		idleTimeout = managed.IdleTimeout
-		jobTimeout = managed.JobTimeout
-	} else if err != nil {
+	managed, err := w.managedJobConfig(ctx, original.Name)
+	if err != nil {
 		return tempWorkerStartResult{}, err
 	}
+	if managed.OK {
+		idleTimeout = managed.IdleTimeout
+	}
+	// Resolve the same authority as the primary dispatch path so runtime-session
+	// contention cannot route a payload around the hard ceiling.
+	jobTimeout := effectiveJobTimeout(payload, managed)
 	tempAgent := original
 	tempAgent.Name = tempWorkerInstanceName(original.Name, job.ID)
 	tempAgent.RuntimeRef = ""
@@ -2149,29 +2148,72 @@ func tempWorkerInstanceName(agentName string, jobID string) string {
 }
 
 type managedJobRuntimeConfig struct {
-	OK          bool
-	JobTimeout  time.Duration
-	IdleTimeout time.Duration
+	OK                bool
+	Instance          bool
+	JobTimeout        time.Duration
+	IdleTimeout       time.Duration
+	JobTimeoutDefault time.Duration
+	JobTimeoutMax     time.Duration
 }
 
 func (w jobWorker) managedJobConfig(ctx context.Context, agentName string) (managedJobRuntimeConfig, error) {
-	instance, err := w.Store.GetAgentInstance(ctx, agentName)
+	runtimeConfig := managedJobRuntimeConfig{
+		JobTimeoutDefault: config.DefaultDaemonJobTimeoutDefault,
+		JobTimeoutMax:     config.DefaultDaemonJobTimeoutMax,
+	}
+	if w.ConfigHomeExplicit || strings.TrimSpace(w.ConfigHome) != "" {
+		paths, err := w.configPaths()
+		if err != nil {
+			return managedJobRuntimeConfig{}, err
+		}
+		daemonConfig, err := config.LoadDaemonRuntimeConfig(paths)
+		if err != nil {
+			return managedJobRuntimeConfig{}, err
+		}
+		runtimeConfig.JobTimeoutDefault, runtimeConfig.JobTimeoutMax = daemonConfig.JobTimeoutPolicy()
+	}
+
+	registered, err := w.Store.GetAgent(ctx, agentName)
 	if errors.Is(err, sql.ErrNoRows) {
-		return managedJobRuntimeConfig{}, nil
+		return runtimeConfig, nil
 	}
 	if err != nil {
 		return managedJobRuntimeConfig{}, err
 	}
-	configType := instance.Type
-	if original := originalAgentForTempWorkerType(instance.Type); original != "" {
-		originalInstance, err := w.Store.GetAgentInstance(ctx, original)
+	// A normal registered agent's stable name is also its [agents.<type>]
+	// enrollment key. A live instance row, when present, is an explicit override
+	// layer: managed/temp workers retain the type that created them even when their
+	// generated instance name differs.
+	configType := registered.Name
+	instance, err := w.Store.GetAgentInstance(ctx, agentName)
+	if err == nil {
+		runtimeConfig.Instance = true
+		configType = instance.Type
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return managedJobRuntimeConfig{}, err
+	}
+	if original := originalAgentForTempWorkerType(configType); original != "" {
+		// Ephemeral specs have no registered parent type by design; they inherit the
+		// daemon default while retaining their instance lifecycle row.
+		if original == ephemeralWorkerInstanceOrigin {
+			return runtimeConfig, nil
+		}
+		originalAgent, err := w.Store.GetAgent(ctx, original)
 		if errors.Is(err, sql.ErrNoRows) {
-			return managedJobRuntimeConfig{}, nil
+			return runtimeConfig, nil
 		}
 		if err != nil {
 			return managedJobRuntimeConfig{}, err
 		}
-		configType = originalInstance.Type
+		configType = originalAgent.Name
+		if originalInstance, instanceErr := w.Store.GetAgentInstance(ctx, original); instanceErr == nil {
+			configType = originalInstance.Type
+		} else if !errors.Is(instanceErr, sql.ErrNoRows) {
+			return managedJobRuntimeConfig{}, instanceErr
+		}
+	}
+	if !w.ConfigHomeExplicit && strings.TrimSpace(w.ConfigHome) == "" {
+		return runtimeConfig, nil
 	}
 	types, err := loadAgentTypeConfig(w.ConfigHome)
 	if err != nil {
@@ -2179,7 +2221,10 @@ func (w jobWorker) managedJobConfig(ctx context.Context, agentName string) (mana
 	}
 	agentType, ok := types[configType]
 	if !ok {
-		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %q not found for managed instance %s", configType, agentName)
+		if runtimeConfig.Instance {
+			return managedJobRuntimeConfig{}, fmt.Errorf("agent type %q not found for managed instance %s", configType, agentName)
+		}
+		return runtimeConfig, nil
 	}
 	jobTimeout, err := time.ParseDuration(agentType.JobTimeout)
 	if err != nil {
@@ -2195,26 +2240,52 @@ func (w jobWorker) managedJobConfig(ctx context.Context, agentName string) (mana
 	if idleTimeout <= 0 {
 		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %s idle_timeout must be positive", configType)
 	}
-	return managedJobRuntimeConfig{OK: true, JobTimeout: jobTimeout, IdleTimeout: idleTimeout}, nil
+	runtimeConfig.OK = true
+	runtimeConfig.JobTimeout = jobTimeout
+	runtimeConfig.IdleTimeout = idleTimeout
+	return runtimeConfig, nil
 }
 
-// effectiveJobTimeout returns the timeout to enforce for a job: the
-// per-delegation payload.JobTimeout when it parses to a positive duration,
-// otherwise the agent-type managed.JobTimeout, otherwise the daemon stale window
-// for unmanaged jobs (so an unmanaged job still has a watchdog, #555). This value
-// drives the run context deadline directly; the runtime-session lock TTL is this
-// value PLUS runtimeLeaseTeardownGrace (#536/#560) so the lease strictly outlives
-// the deadline and the terminal teardown — the lock cannot expire while the
-// worker is still finishing, which would otherwise let the reaper requeue a live
-// job onto its dirty worktree.
+type jobTimeoutResolution struct {
+	Timeout   time.Duration
+	Requested time.Duration
+	Max       time.Duration
+	Source    string
+	Clamped   bool
+}
+
+// effectiveJobTimeout returns the kill deadline selected by the independent
+// timeout authority. The stale-running threshold is deliberately absent: it is
+// only a crash/staleness predicate and can never become a run-context deadline.
 func effectiveJobTimeout(payload workflow.JobPayload, managed managedJobRuntimeConfig) time.Duration {
-	if d, err := time.ParseDuration(strings.TrimSpace(payload.JobTimeout)); err == nil && d > 0 {
-		return d
+	return resolveEffectiveJobTimeout(payload, managed).Timeout
+}
+
+func resolveEffectiveJobTimeout(payload workflow.JobPayload, managed managedJobRuntimeConfig) jobTimeoutResolution {
+	jobTimeoutDefault := managed.JobTimeoutDefault
+	if jobTimeoutDefault <= 0 {
+		jobTimeoutDefault = config.DefaultDaemonJobTimeoutDefault
 	}
+	jobTimeoutMax := managed.JobTimeoutMax
+	if jobTimeoutMax <= 0 {
+		jobTimeoutMax = config.DefaultDaemonJobTimeoutMax
+	}
+	requested := jobTimeoutDefault
+	source := "daemon default"
 	if managed.JobTimeout > 0 {
-		return managed.JobTimeout
+		requested = managed.JobTimeout
+		source = "agent type"
 	}
-	return daemonRunningJobStaleAfter
+	if d, err := time.ParseDuration(strings.TrimSpace(payload.JobTimeout)); err == nil && d > 0 {
+		requested = d
+		source = "payload"
+	}
+	resolution := jobTimeoutResolution{Timeout: requested, Requested: requested, Max: jobTimeoutMax, Source: source}
+	if requested > jobTimeoutMax {
+		resolution.Timeout = jobTimeoutMax
+		resolution.Clamped = true
+	}
+	return resolution
 }
 
 const jobKillPendingLead = 5 * time.Second
