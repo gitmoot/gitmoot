@@ -332,6 +332,148 @@ func TestDashboardCommsPageContract(t *testing.T) {
 	}
 }
 
+func TestDashboardCommsPageUsesDashboardShellAndFlowLayout(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	newDashboardWebHandler(&webDataSource{}).ServeHTTP(
+		recorder, httptest.NewRequest(http.MethodGet, "/comms", nil),
+	)
+	body := recorder.Body.String()
+	for _, test := range []struct {
+		name string
+		want string
+	}{
+		{name: "dashboard sidebar", want: `data-dashboard-sidebar`},
+		{name: "active Comms item", want: `href="/comms" aria-current="page"`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if !strings.Contains(body, test.want) {
+				t.Fatalf("GET /comms missing %q", test.want)
+			}
+		})
+	}
+	t.Run("mobile layout has no fixed rail inset", func(t *testing.T) {
+		if strings.Contains(body, "117px") {
+			t.Fatal("GET /comms still contains the hardcoded 117px mobile rail inset")
+		}
+	})
+}
+
+func TestDashboardCommsSidebarMatchesManifest(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	newDashboardWebHandler(&webDataSource{}).ServeHTTP(
+		recorder, httptest.NewRequest(http.MethodGet, "/comms", nil),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET /comms status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	got := dashboardCommsRenderedNav(t, recorder.Body.String())
+	if !reflect.DeepEqual(got, dashboardNavManifest) {
+		t.Fatalf("rendered Comms sidebar = %#v, want manifest %#v", got, dashboardNavManifest)
+	}
+}
+
+func TestDashboardSidebarManifestMatchesEmbeddedModule(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	newDashboardWebHandler(&webDataSource{}).ServeHTTP(
+		recorder, httptest.NewRequest(http.MethodGet, "/", nil),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET / status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	got := dashboardEmbeddedModuleNav(t, recorder.Body.String())
+	if !reflect.DeepEqual(got, dashboardNavManifest) {
+		t.Fatalf("embedded SPA sidebar = %#v, want manifest %#v", got, dashboardNavManifest)
+	}
+}
+
+func dashboardCommsRenderedNav(t *testing.T, body string) []dashboardNavItem {
+	t.Helper()
+	start := strings.Index(body, `<aside class="gm-sidebar"`)
+	if start < 0 {
+		t.Fatal("rendered Comms page has no dashboard sidebar")
+	}
+	end := strings.Index(body[start:], `</aside>`)
+	if end < 0 {
+		t.Fatal("rendered Comms sidebar has no closing tag")
+	}
+	sidebar := body[start : start+end]
+	tokens := regexp.MustCompile(`(?s)<div class="gm-nav-group">([^<]+)</div>|<a class="gm-nav-link(?: active)?" href="([^"]+)"(?: aria-current="page")?>.*?<span>([^<]+)</span></a>`).FindAllStringSubmatch(sidebar, -1)
+	items := make([]dashboardNavItem, 0, len(dashboardNavManifest))
+	group := ""
+	for _, token := range tokens {
+		if token[1] != "" {
+			group = token[1]
+			continue
+		}
+		items = append(items, dashboardNavItem{Href: token[2], Title: token[3], Group: group})
+	}
+	if len(items) == 0 {
+		t.Fatal("rendered Comms sidebar yielded zero navigation items")
+	}
+	return items
+}
+
+func dashboardEmbeddedModuleNav(t *testing.T, body string) []dashboardNavItem {
+	t.Helper()
+	start := strings.Index(body, `<aside style="{{ railStyle }}">`)
+	if start < 0 {
+		t.Fatal("embedded dashboard page has no primary sidebar")
+	}
+	end := strings.Index(body[start:], `<div style="margin-top:auto;`)
+	if end < 0 {
+		t.Fatal("embedded dashboard sidebar has no footer boundary")
+	}
+	lines := strings.Split(body[start:start+end], "\n")
+	groupPattern := regexp.MustCompile(`>(WORK|FLEET|INSIGHT|SYSTEM)</div>`)
+	actionPattern := regexp.MustCompile(`onClick="\{\{ show([A-Za-z]+) \}\}"`)
+	hrefPattern := regexp.MustCompile(`<a href="([^"]+)"`)
+	labelPattern := regexp.MustCompile(`<span style="flex:1">([^<]+)</span>`)
+	items := make([]dashboardNavItem, 0, len(dashboardNavManifest))
+	group := ""
+	for index, line := range lines {
+		if match := groupPattern.FindStringSubmatch(line); match != nil {
+			group = match[1]
+			continue
+		}
+		action := ""
+		href := ""
+		closing := ""
+		if match := actionPattern.FindStringSubmatch(line); match != nil {
+			action = match[1]
+			closing = `</div>`
+		} else if match := hrefPattern.FindStringSubmatch(line); match != nil {
+			href = match[1]
+			closing = `</a>`
+		} else {
+			continue
+		}
+		label := ""
+		for cursor := index; cursor < len(lines); cursor++ {
+			if match := labelPattern.FindStringSubmatch(lines[cursor]); match != nil {
+				label = match[1]
+			}
+			if strings.Contains(lines[cursor], closing) {
+				break
+			}
+		}
+		if action != "" {
+			route := strings.ToLower(action)
+			href = "/" + route
+			if route == "overview" {
+				href = "/"
+			}
+		}
+		if group == "" || href == "" || label == "" {
+			t.Fatalf("could not extract embedded nav item from line %q: group=%q href=%q label=%q", line, group, href, label)
+		}
+		items = append(items, dashboardNavItem{Href: href, Title: label, Group: group})
+	}
+	if len(items) == 0 {
+		t.Fatal("embedded dashboard sidebar yielded zero navigation items")
+	}
+	return items
+}
+
 func TestDashboardSidebarLinksCommsDirectlyAfterChat(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	newDashboardWebHandler(&webDataSource{}).ServeHTTP(

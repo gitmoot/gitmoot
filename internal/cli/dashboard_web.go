@@ -110,10 +110,50 @@ func newDashboardWebHandler(ds *webDataSource) http.Handler {
 const dashboardChatNavTail = `      <span style="{{ chatNavDotStyle }}"></span>
     </div>`
 
-const dashboardCommsNavItem = `    <a href="/comms" title="Org communication threads" style="display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;font-size:13.5px;font-weight:500;cursor:pointer;margin-top:2px;background:transparent;color:#a8aecf;border:1px solid transparent;box-shadow:none;position:relative;text-decoration:none">
+type dashboardNavItem struct {
+	Href  string
+	Title string
+	Group string
+}
+
+var dashboardNavManifest = []dashboardNavItem{
+	{Href: "/", Title: "Overview", Group: "WORK"},
+	{Href: "/tasks", Title: "Tasks", Group: "WORK"},
+	{Href: "/workflows", Title: "Workflows", Group: "WORK"},
+	{Href: "/jobs", Title: "Jobs", Group: "WORK"},
+	{Href: "/pipelines", Title: "Pipelines", Group: "WORK"},
+	{Href: "/agents", Title: "Agents", Group: "FLEET"},
+	{Href: "/org", Title: "Org", Group: "FLEET"},
+	{Href: "/chat", Title: "Chat", Group: "FLEET"},
+	{Href: "/comms", Title: "Comms", Group: "FLEET"},
+	{Href: "/brain", Title: "Brain", Group: "INSIGHT"},
+	{Href: "/galaxy", Title: "Galaxy", Group: "INSIGHT"},
+	{Href: "/charts", Title: "Charts", Group: "INSIGHT"},
+	{Href: "/learning", Title: "Learning", Group: "INSIGHT"},
+	{Href: "/attention", Title: "Needs a human", Group: "SYSTEM"},
+	{Href: "/health", Title: "Health", Group: "SYSTEM"},
+	{Href: "/config", Title: "Config", Group: "SYSTEM"},
+}
+
+func dashboardNavItemForHref(href string) (dashboardNavItem, bool) {
+	for _, item := range dashboardNavManifest {
+		if item.Href == href {
+			return item, true
+		}
+	}
+	return dashboardNavItem{}, false
+}
+
+func dashboardCommsSPAItem() string {
+	item, ok := dashboardNavItemForHref("/comms")
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf(`    <a href="%s" title="Org communication threads" style="display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;font-size:13.5px;font-weight:500;cursor:pointer;margin-top:2px;background:transparent;color:#a8aecf;border:1px solid transparent;box-shadow:none;position:relative;text-decoration:none">
       <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round"><path d="M4 5h12a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H9l-4 3v-3H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z"/><path d="M9 10h11a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-3l-3 2v-2"/></svg>
-      <span style="flex:1">Comms</span>
-    </a>`
+      <span style="flex:1">%s</span>
+    </a>`, item.Href, item.Title)
+}
 
 // withDashboardCommsNav adds the gitmoot-owned Comms route to the embedded
 // dashboard module's sidebar. Comms is a standalone read-only page, so the
@@ -140,7 +180,7 @@ func withDashboardCommsNav(next http.Handler) http.Handler {
 		if status == http.StatusOK && strings.Contains(w.Header().Get("Content-Type"), "text/html") {
 			anchor := []byte(dashboardChatNavTail)
 			if bytes.Contains(body, anchor) {
-				replacement := []byte(dashboardChatNavTail + "\n" + dashboardCommsNavItem)
+				replacement := []byte(dashboardChatNavTail + "\n" + dashboardCommsSPAItem())
 				body = bytes.Replace(body, anchor, replacement, 1)
 				w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 			}
