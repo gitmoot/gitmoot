@@ -69,7 +69,10 @@ type WorkflowNote struct {
 	Repo       string `json:"repo,omitempty"`
 	// AddressedTarget is write-only routing metadata. The CLI parses typed note
 	// bodies and sets it; db must not import workflow merely to rediscover it.
-	AddressedTarget     string `json:"-"`
+	AddressedTarget string `json:"-"`
+	// AddressedWakeKind selects the durable addressed-note route. Empty keeps
+	// the established reply route for every existing caller.
+	AddressedWakeKind   string `json:"-"`
 	MemoryObservationID int64  `json:"memory_observation_id,omitempty"`
 	CreatedAt           string `json:"created_at"`
 }
@@ -427,7 +430,11 @@ VALUES (?, ?, ?, ?, ?)`, note.WorkflowID, note.Author, note.Body, note.Repo, not
 		return 0, err
 	}
 	if note.AddressedTarget != "" {
-		if err := insertWorkflowNoteWakeOutboxTx(ctx, tx, noteID, note.AddressedTarget); err != nil {
+		wakeKind := note.AddressedWakeKind
+		if strings.TrimSpace(wakeKind) == "" {
+			wakeKind = WakeOutboxKindReply
+		}
+		if err := insertWorkflowNoteWakeOutboxTx(ctx, tx, noteID, note.AddressedTarget, wakeKind); err != nil {
 			return 0, err
 		}
 	}
@@ -757,6 +764,38 @@ FROM workflow_notes
 WHERE substr(body, 1, length(?)) = ?
 ORDER BY created_at DESC, id DESC
 LIMIT ?`, prefix, prefix, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	notes := []WorkflowNote{}
+	for rows.Next() {
+		var note WorkflowNote
+		if err := rows.Scan(&note.ID, &note.WorkflowID, &note.Author, &note.Body, &note.Repo, &note.MemoryObservationID, &note.CreatedAt); err != nil {
+			return nil, err
+		}
+		notes = append(notes, note)
+	}
+	return notes, rows.Err()
+}
+
+// ListUnacknowledgedOrgDirectives returns the oldest outstanding directives.
+// It is intentionally ASC and unbounded: a newer directive must never push the
+// oldest unacknowledged obligation out of a DESC+LIMIT window.
+func (s *Store) ListUnacknowledgedOrgDirectives(ctx context.Context, targetRole string) ([]WorkflowNote, error) {
+	targetRole = strings.ToLower(strings.TrimSpace(targetRole))
+	rows, err := s.db.QueryContext(ctx, `SELECT d.id, d.workflow_id, d.author, d.body, d.repo, d.memory_observation_id, d.created_at
+FROM workflow_notes d
+WHERE substr(d.body, 1, length('[org:directive ')) = '[org:directive '
+	AND (? = '' OR substr(d.body, 1, length('[org:directive to=' || ? || ' ')) = '[org:directive to=' || ? || ' ')
+	AND NOT EXISTS (
+		SELECT 1 FROM workflow_notes r
+		WHERE r.workflow_id = d.workflow_id AND (
+			substr(r.body, 1, length('[org:directive-ack id=' || d.id || ' ')) = '[org:directive-ack id=' || d.id || ' '
+			OR substr(r.body, 1, length('[org:directive-cancel id=' || d.id || ' ')) = '[org:directive-cancel id=' || d.id || ' '
+		)
+	)
+ORDER BY d.created_at ASC, d.id ASC`, targetRole, targetRole, targetRole)
 	if err != nil {
 		return nil, err
 	}

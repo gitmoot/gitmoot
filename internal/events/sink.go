@@ -67,6 +67,9 @@ const (
 	// EventOrgReply is emitted by the daemon for a durable, coalesced batch of
 	// notes addressed to one organization role.
 	EventOrgReply EventType = "org.reply"
+	// EventOrgDirective is emitted for an addressed directive wake. It remains
+	// separate from conversational replies so routing and coalescing cannot mix.
+	EventOrgDirective EventType = "org.directive"
 
 	// EventCandidateAwaitingPromotion is emitted once when a SkillOpt template
 	// candidate becomes PENDING (the post-import notify, #471): a new pending
