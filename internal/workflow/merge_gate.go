@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -449,6 +450,14 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			implementingAgents[agent] = struct{}{}
 		}
 	}
+	delegationChildrenByParent := make(map[string][]db.Job)
+	for _, job := range jobs {
+		parentID := strings.TrimSpace(job.ParentJobID)
+		if parentID == "" || strings.TrimSpace(job.DelegationID) == "" {
+			continue
+		}
+		delegationChildrenByParent[parentID] = append(delegationChildrenByParent[parentID], job)
+	}
 	// A round can order remediation, but it must not hide a blocking verdict or
 	// an unfinished reviewer slot captured at the head currently being evaluated.
 	type reviewAtHead struct {
@@ -541,6 +550,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			}
 			switch review.payload.Result.Decision {
 			case "approved":
+				if err := ensureDelegatedReviewEvidence(review.job, delegationChildrenByParent[review.job.ID]); err != nil {
+					return err
+				}
 				switch {
 				case reviewer == "":
 					if unattributedReviewerReason == "" {
@@ -654,6 +666,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		}
 		switch payload.Result.Decision {
 		case "approved":
+			if err := ensureDelegatedReviewEvidence(job, delegationChildrenByParent[job.ID]); err != nil {
+				return err
+			}
 			approved = true
 		case "changes_requested", "blocked", "failed":
 			// A captured blocking review is an authoritative template-quality rejection
@@ -670,6 +685,70 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		return errors.New("required reviewer approval is missing")
 	}
 	return nil
+}
+
+func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job) error {
+	if len(children) == 0 {
+		return nil
+	}
+	hasEvidence := false
+	var active []string
+	var noEvidence []string
+	var unrecognized []string
+	for _, child := range children {
+		childID := strings.TrimSpace(child.ID)
+		switch JobState(child.State) {
+		case JobQueued, JobRunning:
+			active = append(active, fmt.Sprintf("%s (%s)", childID, child.State))
+		case JobSucceeded:
+			payload, err := unmarshalPayload(child.Payload)
+			if err != nil {
+				unrecognized = append(unrecognized, fmt.Sprintf("%s (malformed result)", childID))
+				continue
+			}
+			decision := ""
+			if payload.Result != nil {
+				decision = strings.TrimSpace(payload.Result.Decision)
+			}
+			switch decision {
+			case "approved", "changes_requested", "blocked", "implemented", "failed":
+				hasEvidence = true
+			case "skipped":
+				noEvidence = append(noEvidence, fmt.Sprintf("%s (skipped)", childID))
+			default:
+				unrecognized = append(unrecognized, fmt.Sprintf("%s (unrecognized decision %q)", childID, decision))
+			}
+		case JobFailed, JobBlocked, JobCancelled:
+			noEvidence = append(noEvidence, fmt.Sprintf("%s (%s)", childID, child.State))
+		default:
+			unrecognized = append(unrecognized, fmt.Sprintf("%s (unrecognized state %q)", childID, child.State))
+		}
+	}
+	sort.Strings(active)
+	sort.Strings(noEvidence)
+	sort.Strings(unrecognized)
+	if len(unrecognized) > 0 {
+		return fmt.Errorf(
+			"delegated review parent %s has unrecognized delegation evidence (children: %s); rerun or repair the delegated review",
+			parent.ID,
+			strings.Join(unrecognized, ", "),
+		)
+	}
+	if hasEvidence {
+		return nil
+	}
+	if len(active) > 0 {
+		return mergePending{reason: fmt.Sprintf(
+			"waiting for delegated review parent %s to produce surviving evidence (active children: %s)",
+			parent.ID,
+			strings.Join(active, ", "),
+		)}
+	}
+	return fmt.Errorf(
+		"delegated review parent %s has no surviving delegation evidence (children: %s); rerun or repair the delegated review",
+		parent.ID,
+		strings.Join(noEvidence, ", "),
+	)
 }
 
 func reviewAuthorshipFailureReason(selfApproval string, unknownImplementer string, unattributedReviewer string) string {

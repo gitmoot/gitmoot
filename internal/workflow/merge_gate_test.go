@@ -101,6 +101,30 @@ func insertMergeGateReviewFixture(t *testing.T, store *db.Store, fixture mergeGa
 	}
 }
 
+func insertMergeGateDelegationChild(t *testing.T, store *db.Store, parentID, delegationID string, state JobState, result *AgentResult) {
+	t.Helper()
+	payload, err := marshalPayload(JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		PullRequest: 9,
+		TaskID:      "task-9",
+		Result:      result,
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload returned error: %v", err)
+	}
+	if err := store.CreateJobWithEvent(context.Background(), db.Job{
+		ID:           parentID + "/delegation/" + delegationID,
+		Agent:        delegationID,
+		Type:         "review",
+		State:        string(state),
+		Payload:      payload,
+		ParentJobID:  parentID,
+		DelegationID: delegationID,
+	}, db.JobEvent{Kind: string(state), Message: "delegation fixture state"}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+}
+
 func TestPolicyMergeGateMergesPassingPullRequest(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -2044,6 +2068,107 @@ func TestPolicyMergeGateIgnoresReviewJobsAtStaleHeadForQuorum(t *testing.T) {
 	}
 	if !decision.Merged {
 		t.Fatalf("decision = %+v, want stale-head failed review excluded from quorum", decision)
+	}
+}
+
+func TestPolicyMergeGateParksParentApprovalWhenDelegationChildrenFailed(t *testing.T) {
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	const parentID = "workflow-cdz4fabzacb4"
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: parentID, agent: "g6-review-sol", hasResult: true, decision: "approved",
+		recorded: "2026-07-31 12:00:00",
+	})
+	for _, delegationID := range []string{
+		"lens-anti-drift-correctness",
+		"lens-compile-exhaustiveness",
+		"lens-tests-regressions",
+	} {
+		insertMergeGateDelegationChild(t, store, parentID, delegationID, JobFailed, nil)
+	}
+
+	decision, err := gate.Evaluate(context.Background(), request)
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+		t.Fatalf("decision = %+v, want failed delegated review evidence parked", decision)
+	}
+	if !strings.Contains(decision.Reason, "delegated review parent "+parentID) {
+		t.Fatalf("decision reason = %q, want parent job id", decision.Reason)
+	}
+	for _, delegationID := range []string{
+		"lens-anti-drift-correctness",
+		"lens-compile-exhaustiveness",
+		"lens-tests-regressions",
+	} {
+		childID := parentID + "/delegation/" + delegationID
+		if !strings.Contains(decision.Reason, childID) {
+			t.Fatalf("decision reason = %q, want failed child %s", decision.Reason, childID)
+		}
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge calls = %+v, want none", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateAcceptsHeadlessIntegrationParentWhenDelegationChildrenSucceeded(t *testing.T) {
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	const parentID = "review-parent-healthy"
+	insertCompletedJob(t, store, db.Job{
+		ID:           parentID,
+		Agent:        "reviewer-a",
+		Type:         "review",
+		DelegationID: "verify-parent",
+	}, JobPayload{
+		Repo:         "gitmoot/gitmoot",
+		PullRequest:  9,
+		TaskID:       "task-9",
+		ReviewRound:  "review-1",
+		DelegationID: "verify-parent",
+		WorktreePath: "/tmp/gitmoot/integration-verify-parent",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "integration review synthesized surviving evidence",
+		},
+	})
+	for _, delegationID := range []string{"correctness", "compile", "tests"} {
+		insertMergeGateDelegationChild(t, store, parentID, delegationID, JobSucceeded, &AgentResult{
+			Decision: "approved",
+			Summary:  "delegated evidence survived",
+		})
+	}
+
+	decision, err := gate.Evaluate(context.Background(), request)
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.Merged {
+		t.Fatalf("decision = %+v, want healthy delegated review to merge", decision)
+	}
+	if len(gh.merges) != 1 {
+		t.Fatalf("merge calls = %+v, want one", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateLeavesOrdinaryReviewWithoutDelegationsUnaffected(t *testing.T) {
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-ordinary", agent: "reviewer-a", hasResult: true, decision: "approved",
+		recorded: "2026-07-31 12:00:00",
+	})
+
+	decision, err := gate.Evaluate(context.Background(), request)
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.Merged {
+		t.Fatalf("decision = %+v, want ordinary review to remain merge-admissible", decision)
+	}
+	if len(gh.merges) != 1 {
+		t.Fatalf("merge calls = %+v, want one", gh.merges)
 	}
 }
 
