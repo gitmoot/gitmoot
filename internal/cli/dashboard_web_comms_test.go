@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -348,6 +349,37 @@ func TestDashboardSidebarLinksCommsDirectlyAfterChat(t *testing.T) {
 	}
 	if !strings.Contains(body[comms:brain], `<span style="flex:1">Comms</span>`) {
 		t.Fatal("Comms sidebar link is missing its visible label")
+	}
+}
+
+func TestDashboardCommsNavNoAnchorPreservesResponse(t *testing.T) {
+	const body = "<!doctype html><html><body>no sidebar anchor</body></html>"
+	wantHeader := http.Header{
+		"Content-Length": {fmt.Sprint(len(body))},
+		"Content-Type":   {"text/html; charset=utf-8"},
+		"X-Upstream":     {"unchanged"},
+	}
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		for key, values := range wantHeader {
+			w.Header()[key] = append([]string(nil), values...)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(body))
+	})
+
+	recorder := httptest.NewRecorder()
+	withDashboardCommsNav(upstream).ServeHTTP(
+		recorder, httptest.NewRequest(http.MethodGet, "/", nil),
+	)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d, want %d", recorder.Code, http.StatusOK)
+	}
+	if got := recorder.Body.String(); got != body {
+		t.Fatalf("body=%q, want byte-identical %q", got, body)
+	}
+	if got := recorder.Header(); !reflect.DeepEqual(got, wantHeader) {
+		t.Fatalf("headers=%v, want unchanged %v", got, wantHeader)
 	}
 }
 

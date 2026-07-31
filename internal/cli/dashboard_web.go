@@ -138,9 +138,12 @@ func withDashboardCommsNav(next http.Handler) http.Handler {
 		}
 		body := buffered.body.Bytes()
 		if status == http.StatusOK && strings.Contains(w.Header().Get("Content-Type"), "text/html") {
-			replacement := []byte(dashboardChatNavTail + "\n" + dashboardCommsNavItem)
-			body = bytes.Replace(body, []byte(dashboardChatNavTail), replacement, 1)
-			w.Header().Del("Content-Length")
+			anchor := []byte(dashboardChatNavTail)
+			if bytes.Contains(body, anchor) {
+				replacement := []byte(dashboardChatNavTail + "\n" + dashboardCommsNavItem)
+				body = bytes.Replace(body, anchor, replacement, 1)
+				w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			}
 		}
 		w.WriteHeader(status)
 		_, _ = w.Write(body)
