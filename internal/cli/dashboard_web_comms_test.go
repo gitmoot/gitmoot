@@ -331,6 +331,26 @@ func TestDashboardCommsPageContract(t *testing.T) {
 	}
 }
 
+func TestDashboardSidebarLinksCommsDirectlyAfterChat(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	newDashboardWebHandler(&webDataSource{}).ServeHTTP(
+		recorder, httptest.NewRequest(http.MethodGet, "/", nil),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET / status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	chat := strings.Index(body, `<span style="flex:1">Chat</span>`)
+	comms := strings.Index(body, `href="/comms"`)
+	brain := strings.Index(body, `<span style="flex:1">Brain</span>`)
+	if chat < 0 || comms < 0 || brain < 0 || !(chat < comms && comms < brain) {
+		t.Fatalf("sidebar ordering chat=%d comms=%d brain=%d, want Chat < Comms < Brain", chat, comms, brain)
+	}
+	if !strings.Contains(body[comms:brain], `<span style="flex:1">Comms</span>`) {
+		t.Fatal("Comms sidebar link is missing its visible label")
+	}
+}
+
 const dashboardCommsPageHarness = `
 const fs = require('fs');
 const vm = require('vm');
