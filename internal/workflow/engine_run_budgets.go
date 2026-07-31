@@ -49,21 +49,19 @@ func (e Engine) RunJob(ctx context.Context, jobID string, agent runtime.Agent, a
 	return result, nil
 }
 
-// FinalizeTimedOutDelegationChild turns a delegation child that was killed by its
-// per-delegation timeout (or any runtime failure that left it JobRunning with no
-// parseable gitmoot_result) into a terminal FAILED child carrying a synthetic
-// failed result, then runs AdvanceJob so the parent's advanceDelegations applies
-// the delegation's retry/failure_policy/continuation. Without this a timeout kill
-// strands the child in JobRunning forever (Mailbox.Run errored, so RunJob returned
-// before AdvanceJob), and only the blind 30m stale-running recovery would re-queue
-// it, bypassing delegation.Retry and failure_policy.
+// FinalizeTimedOutJob turns any job killed by its run deadline into a terminal
+// FAILED job carrying a synthetic result and a job_timeout witness. Delegation
+// children additionally run AdvanceJob so retry/failure_policy/continuation still
+// apply. Top-level jobs deliberately stop after terminal persistence.
 //
-// It is a no-op (returns false) for a non-delegation job, a job that already left
-// JobRunning, or a job that already stored a result, so it is safe to call from
-// the daemon's run-error handler and idempotent under concurrent recovery. When
-// the synthetic failure blocks the parent task under block_parent, AdvanceJob
-// returns a BlockedError, which is propagated like the result-bearing path.
-func (e Engine) FinalizeTimedOutDelegationChild(ctx context.Context, jobID string, reason string) (bool, error) {
+// timeoutDetail is persisted verbatim and is expected to carry the effective
+// deadline, elapsed duration, and bounded stderr tail. The method is idempotent:
+// a result-bearing or non-failed terminal job is never rewritten.
+func (e Engine) FinalizeTimedOutJob(ctx context.Context, jobID string, reason string, timeoutDetail string) (bool, error) {
+	return e.finalizeTimedOutJob(ctx, jobID, reason, "job_timeout", timeoutDetail, false)
+}
+
+func (e Engine) finalizeTimedOutJob(ctx context.Context, jobID string, reason string, eventKind string, eventDetail string, delegationOnly bool) (bool, error) {
 	if err := e.validate(); err != nil {
 		return false, err
 	}
@@ -71,7 +69,7 @@ func (e Engine) FinalizeTimedOutDelegationChild(ctx context.Context, jobID strin
 	if err != nil {
 		return false, err
 	}
-	if strings.TrimSpace(payload.ParentJobID) == "" {
+	if delegationOnly && strings.TrimSpace(payload.ParentJobID) == "" {
 		return false, nil
 	}
 	// Already has a result -> the normal RunJob/AdvanceJob path handled it; nothing
@@ -110,10 +108,13 @@ func (e Engine) FinalizeTimedOutDelegationChild(ctx context.Context, jobID strin
 	}
 	if err := e.Store.AddJobEvent(ctx, db.JobEvent{
 		JobID:   jobID,
-		Kind:    "delegation_timeout_finalized",
-		Message: reason,
+		Kind:    eventKind,
+		Message: strings.TrimSpace(eventDetail),
 	}); err != nil {
 		return false, err
+	}
+	if strings.TrimSpace(payload.ParentJobID) == "" {
+		return true, nil
 	}
 	if err := e.AdvanceJob(ctx, jobID); err != nil {
 		return true, err
@@ -122,6 +123,12 @@ func (e Engine) FinalizeTimedOutDelegationChild(ctx context.Context, jobID strin
 		return true, err
 	}
 	return true, nil
+}
+
+// FinalizeTimedOutDelegationChild preserves the established engine API for
+// delegation callers while routing through the all-job terminalizer.
+func (e Engine) FinalizeTimedOutDelegationChild(ctx context.Context, jobID string, reason string) (bool, error) {
+	return e.finalizeTimedOutJob(ctx, jobID, reason, "delegation_timeout_finalized", reason, true)
 }
 
 func (e Engine) refreshJobPayload(ctx context.Context, jobID string) error {

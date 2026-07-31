@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/cockpit"
@@ -153,8 +154,15 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 	worker.WorkflowFactory = worker.defaultWorkflow
 	worker.AuthProbe = worker.defaultAuthProbe
 	worker.QuotaWake = newQuotaRoleUnavailableWakeClient()
+	recoverKillPendingAtWorkerStartup.Do(func() {
+		if err := recoverKillPendingJobs(context.Background(), store, stdout); err != nil {
+			writeLine(stdout, "job kill-pending recovery failed: %v", err)
+		}
+	})
 	return worker
 }
+
+var recoverKillPendingAtWorkerStartup sync.Once
 
 func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	payload, err := daemonJobPayload(job)
@@ -605,10 +613,16 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	engine.BlockerDeferrer = w.deferOperationalBlockerPreTerminal
 	runCtx, stopRun := w.runningJobContext(ctx, job.ID)
 	defer stopRun()
+	runStartedAt := time.Now().UTC()
 	if jobTimeout > 0 {
 		var cancel context.CancelFunc
 		runCtx, cancel = context.WithTimeout(runCtx, jobTimeout)
 		defer cancel()
+	}
+	runDeadline, hasRunDeadline := runCtx.Deadline()
+	stopKillPending := func() {}
+	if hasRunDeadline {
+		stopKillPending = armJobKillPending(w.Store, job.ID, runDeadline)
 	}
 	stopProgress := func() {}
 	if progressTracker != nil {
@@ -637,6 +651,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 	}
 	_, err = engine.RunJob(runCtx, job.ID, agent, adapter)
+	stopKillPending()
 	stopProgress()
 	if err != nil {
 		if quotaErr := w.quotaRoleUnavailableHooks().recordRuntimeOutcome(ctx, job, payload, agent, err, time.Now().UTC()); quotaErr != nil {
@@ -654,7 +669,13 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			writeLine(w.Stdout, "job %s deferred on operational blocker (pre-terminal): %v", job.ID, err)
 			return nil
 		}
-		if markErr := w.handleRunJobError(ctx, job.ID, err); markErr != nil {
+		var markErr error
+		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+			markErr = w.handleRunJobError(ctx, job.ID, context.DeadlineExceeded, jobTimeoutEvidence{Deadline: runDeadline, Started: runStartedAt})
+		} else {
+			markErr = w.handleRunJobError(ctx, job.ID, err)
+		}
+		if markErr != nil {
 			return markErr
 		}
 		if reconcileErr := engine.ReconcileTerminalDrivingJob(ctx, job.ID); reconcileErr != nil {
@@ -1743,18 +1764,31 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	}()
 	runCtx, stopRun := w.runningJobContext(ctx, job.ID)
 	defer stopRun()
+	runStartedAt := time.Now().UTC()
 	if started.JobTimeout > 0 {
 		var cancel context.CancelFunc
 		runCtx, cancel = context.WithTimeout(runCtx, started.JobTimeout)
 		defer cancel()
 	}
+	runDeadline, hasRunDeadline := runCtx.Deadline()
+	stopKillPending := func() {}
+	if hasRunDeadline {
+		stopKillPending = armJobKillPending(w.Store, delegatedJob.ID, runDeadline)
+	}
 	engine := w.WorkflowFactory(checkout)
 	_, err = engine.RunJob(runCtx, delegatedJob.ID, started.Agent, adapter)
+	stopKillPending()
 	if err != nil {
 		if quotaErr := w.quotaRoleUnavailableHooks().recordRuntimeOutcome(ctx, delegatedJob, payload, started.Agent, err, time.Now().UTC()); quotaErr != nil {
 			writeLine(w.Stdout, "job %s org-role quota unavailability capture failed: %v", delegatedJob.ID, quotaErr)
 		}
-		if markErr := w.handleRunJobError(ctx, delegatedJob.ID, err); markErr != nil {
+		var markErr error
+		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+			markErr = w.handleRunJobError(ctx, delegatedJob.ID, context.DeadlineExceeded, jobTimeoutEvidence{Deadline: runDeadline, Started: runStartedAt})
+		} else {
+			markErr = w.handleRunJobError(ctx, delegatedJob.ID, err)
+		}
+		if markErr != nil {
 			return markErr
 		}
 		if reconcileErr := engine.ReconcileTerminalDrivingJob(ctx, delegatedJob.ID); reconcileErr != nil {
@@ -2181,6 +2215,73 @@ func effectiveJobTimeout(payload workflow.JobPayload, managed managedJobRuntimeC
 		return managed.JobTimeout
 	}
 	return daemonRunningJobStaleAfter
+}
+
+const jobKillPendingLead = 5 * time.Second
+
+// armJobKillPending records intent before the run context expires. The callback
+// deliberately uses Background: the witness must survive the deadline it
+// predicts. A completed run stops the timer before terminal handling.
+func armJobKillPending(store *db.Store, jobID string, deadline time.Time) func() {
+	delay := time.Until(deadline) - jobKillPendingLead
+	if delay < 0 {
+		delay = 0
+	}
+	timer := time.AfterFunc(delay, func() {
+		message := fmt.Sprintf("deadline=%s", deadline.UTC().Format(time.RFC3339Nano))
+		_ = store.AddJobEvent(context.Background(), db.JobEvent{
+			JobID:   jobID,
+			Kind:    "job_kill_pending",
+			Message: message,
+		})
+	})
+	return func() { timer.Stop() }
+}
+
+// recoverKillPendingJobs is the startup anti-immortality pass. A running job
+// with a pre-kill witness but no terminal event consumed its deadline and the
+// daemon died during the kill unwind; it must be failed, never silently requeued.
+func recoverKillPendingJobs(ctx context.Context, store *db.Store, stdout io.Writer) error {
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		return err
+	}
+	for _, job := range jobs {
+		if job.State != string(workflow.JobRunning) {
+			continue
+		}
+		events, err := store.ListJobEvents(ctx, job.ID)
+		if err != nil {
+			return err
+		}
+		pending, terminalAfterPending := false, false
+		for _, event := range events {
+			switch event.Kind {
+			case "job_kill_pending":
+				pending = true
+				terminalAfterPending = false
+			case string(workflow.JobSucceeded), string(workflow.JobFailed), string(workflow.JobBlocked), string(workflow.JobCancelled), "job_timeout":
+				if pending {
+					terminalAfterPending = true
+				}
+			}
+		}
+		if !pending || terminalAfterPending {
+			continue
+		}
+		settled, err := store.TransitionJobStateWithEvent(ctx, job.ID, string(workflow.JobRunning), string(workflow.JobFailed), db.JobEvent{
+			JobID:   job.ID,
+			Kind:    string(workflow.JobFailed),
+			Message: "killed-by-deadline-unwitnessed",
+		})
+		if err != nil {
+			return err
+		}
+		if settled {
+			writeLine(stdout, "failed deadline-killed job %s after unwitnessed daemon shutdown", job.ID)
+		}
+	}
+	return nil
 }
 
 func originalAgentForTempWorkerType(typ string) string {

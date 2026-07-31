@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -103,7 +104,12 @@ func (w jobWorker) finalizePreflightDelegationChild(ctx context.Context, jobID s
 	return nil
 }
 
-func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, cause error) error {
+type jobTimeoutEvidence struct {
+	Deadline time.Time
+	Started  time.Time
+}
+
+func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, cause error, timeoutEvidence ...jobTimeoutEvidence) error {
 	latest, err := w.Store.GetJob(ctx, jobID)
 	if err != nil {
 		return err
@@ -154,6 +160,27 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, cause er
 		return err
 	}
 	payload, payloadErr := daemonJobPayload(latest)
+	if errors.Is(cause, context.DeadlineExceeded) || len(timeoutEvidence) > 0 {
+		evidence := jobTimeoutEvidence{}
+		if len(timeoutEvidence) > 0 {
+			evidence = timeoutEvidence[0]
+		}
+		finalized, finalizeErr := w.finalizeTimedOutJob(ctx, latest, payload, cause, evidence)
+		if finalizeErr != nil {
+			var awaiting workflow.AwaitingHumanError
+			if errors.As(finalizeErr, &awaiting) {
+				return nil
+			}
+			var blocked workflow.BlockedError
+			if errors.As(finalizeErr, &blocked) {
+				return nil
+			}
+			return finalizeErr
+		}
+		if finalized {
+			return nil
+		}
+	}
 	if payloadErr == nil && payload.Result != nil {
 		var awaiting workflow.AwaitingHumanError
 		if errors.As(cause, &awaiting) {
@@ -207,6 +234,32 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, cause er
 		return nil
 	}
 	return cause
+}
+
+func (w jobWorker) finalizeTimedOutJob(ctx context.Context, job db.Job, payload workflow.JobPayload, cause error, evidence jobTimeoutEvidence) (bool, error) {
+	deadline := evidence.Deadline.UTC()
+	elapsed := time.Duration(0)
+	if !evidence.Started.IsZero() {
+		elapsed = time.Since(evidence.Started).Round(time.Millisecond)
+	}
+	stderrTail := ""
+	if payload.FailureDiagnostics != nil {
+		stderrTail = payload.FailureDiagnostics.StderrTail
+	}
+	detailBytes, _ := json.Marshal(struct {
+		Deadline   string `json:"deadline"`
+		Elapsed    string `json:"elapsed"`
+		StderrTail string `json:"stderr_tail,omitempty"`
+	}{
+		Deadline:   deadline.Format(time.RFC3339Nano),
+		Elapsed:    elapsed.String(),
+		StderrTail: stderrTail,
+	})
+	reason := fmt.Sprintf("job %s exceeded its run deadline: %v", job.ID, cause)
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	engine := w.WorkflowFactory(w.delegationParentCheckout(writeCtx, job))
+	return engine.FinalizeTimedOutJob(writeCtx, job.ID, reason, string(detailBytes))
 }
 
 // finalizeTimedOutDelegationChild bridges the daemon run-error path into the

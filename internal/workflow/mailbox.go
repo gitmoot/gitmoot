@@ -1471,7 +1471,9 @@ func (m Mailbox) storeFailureDiagnostics(ctx context.Context, jobID string, payl
 		return
 	}
 	payload.FailureDiagnostics = diag
-	_ = m.savePayload(ctx, jobID, *payload)
+	writeCtx, cancel := terminalWriteContext(ctx)
+	defer cancel()
+	_ = m.savePayload(writeCtx, jobID, *payload)
 }
 
 // persistRefreshedRuntimeRef re-pins an agent that self-healed a dead session
@@ -1488,7 +1490,9 @@ func (m Mailbox) persistRefreshedRuntimeRef(ctx context.Context, jobID string, a
 }
 
 func (m Mailbox) finish(ctx context.Context, jobID string, state JobState, message string) error {
-	transitioned, err := m.Store.TransitionJobStateWithEvent(ctx, jobID, string(JobRunning), string(state), db.JobEvent{
+	writeCtx, cancel := terminalWriteContext(ctx)
+	defer cancel()
+	transitioned, err := m.Store.TransitionJobStateWithEvent(writeCtx, jobID, string(JobRunning), string(state), db.JobEvent{
 		JobID:   jobID,
 		Kind:    string(state),
 		Message: message,
@@ -1497,7 +1501,7 @@ func (m Mailbox) finish(ctx context.Context, jobID string, state JobState, messa
 		return err
 	}
 	if !transitioned {
-		latest, getErr := m.Store.GetJob(ctx, jobID)
+		latest, getErr := m.Store.GetJob(writeCtx, jobID)
 		if getErr != nil {
 			return getErr
 		}
@@ -1515,8 +1519,8 @@ func (m Mailbox) finish(ctx context.Context, jobID string, state JobState, messa
 	// byte-identical). The load failure degrades gracefully to an id-rooted emit
 	// rather than dropping the event or failing the finish.
 	if m.emitTerminal != nil {
-		payload := m.loadTerminalEmitPayload(ctx, jobID, message)
-		m.emitTerminal(ctx, jobID, state, payload)
+		payload := m.loadTerminalEmitPayload(writeCtx, jobID, message)
+		m.emitTerminal(writeCtx, jobID, state, payload)
 	}
 	return nil
 }
@@ -1543,11 +1547,13 @@ func (m Mailbox) loadTerminalEmitPayload(ctx context.Context, jobID, message str
 }
 
 func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobState, message string, payload JobPayload) error {
+	writeCtx, cancel := terminalWriteContext(ctx)
+	defer cancel()
 	encoded, err := marshalPayload(payload)
 	if err != nil {
 		return err
 	}
-	transitioned, err := m.Store.TransitionJobStatePayloadWithEvent(ctx, jobID, string(JobRunning), string(state), encoded, db.JobEvent{
+	transitioned, err := m.Store.TransitionJobStatePayloadWithEvent(writeCtx, jobID, string(JobRunning), string(state), encoded, db.JobEvent{
 		JobID:   jobID,
 		Kind:    string(state),
 		Message: message,
@@ -1560,7 +1566,7 @@ func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobS
 		return err
 	}
 	if !transitioned {
-		latest, getErr := m.Store.GetJob(ctx, jobID)
+		latest, getErr := m.Store.GetJob(writeCtx, jobID)
 		if getErr != nil {
 			return getErr
 		}
@@ -1570,7 +1576,7 @@ func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobS
 	// (#446). Gated on transitioned==true so a re-run never double-emits; nil-safe
 	// so the default (no EventSink) path is byte-identical.
 	if m.emitTerminal != nil {
-		m.emitTerminal(ctx, jobID, state, payload)
+		m.emitTerminal(writeCtx, jobID, state, payload)
 	}
 	// Record resumable gates for a blocked stage that carries a `needs` list (#682)
 	// so the blocker becomes actionable: `gitmoot job gates` lists them and clearing
@@ -1588,8 +1594,8 @@ func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobS
 	// pipeline advancer never folds, and a double execution once the run is
 	// properly resumed.
 	if state == JobBlocked && payload.Result != nil && len(payload.Result.Needs) > 0 && payload.Sender != PipelineJobSender {
-		if _, gateErr := m.Store.RecordJobGates(ctx, jobID, payload.Result.Needs); gateErr == nil {
-			_ = m.addEvent(ctx, jobID, "gates_recorded", fmt.Sprintf("recorded %d resumable gate(s) from needs", len(payload.Result.Needs)))
+		if _, gateErr := m.Store.RecordJobGates(writeCtx, jobID, payload.Result.Needs); gateErr == nil {
+			_ = m.addEvent(writeCtx, jobID, "gates_recorded", fmt.Sprintf("recorded %d resumable gate(s) from needs", len(payload.Result.Needs)))
 		}
 	}
 	return nil
@@ -1635,6 +1641,15 @@ func (m Mailbox) claim(ctx context.Context, job db.Job) error {
 
 func (m Mailbox) fail(ctx context.Context, jobID string, message string) error {
 	return m.finish(ctx, jobID, JobFailed, message)
+}
+
+const terminalWriteGrace = 30 * time.Second
+
+// terminalWriteContext detaches terminal persistence from the run deadline while
+// retaining values (including the runtime-session owner token), and bounds every
+// detached write so a stuck store can never hold the worker indefinitely.
+func terminalWriteContext(runCtx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(runCtx), terminalWriteGrace)
 }
 
 func (m Mailbox) addEvent(ctx context.Context, jobID string, kind string, message string) error {
