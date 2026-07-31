@@ -33,7 +33,7 @@ func TestLoadDaemonRuntimeConfigParsesFields(t *testing.T) {
 	if err := Initialize(paths); err != nil {
 		t.Fatalf("Initialize: %v", err)
 	}
-	writeConfig(t, paths, "[daemon]\npoll = \"45s\"\nworkers = 4\nscheduler = \"pool\"\nidle_grace_ticks = 5\nidle_max_multiplier = 8\n")
+	writeConfig(t, paths, "[daemon]\npoll = \"45s\"\nworkers = 4\nscheduler = \"pool\"\nidle_grace_ticks = 5\nidle_max_multiplier = 8\njob_timeout_default = \"3h\"\njob_timeout_max = \"6h\"\n")
 	cfg, err := LoadDaemonRuntimeConfig(paths)
 	if err != nil {
 		t.Fatalf("LoadDaemonRuntimeConfig: %v", err)
@@ -49,6 +49,16 @@ func TestLoadDaemonRuntimeConfigParsesFields(t *testing.T) {
 	}
 	if !cfg.IdleGraceTicksSet || cfg.IdleGraceTicks != 5 || !cfg.IdleMaxMultiplierSet || cfg.IdleMaxMultiplier != 8 {
 		t.Fatalf("idle cadence = %+v, want grace=5 max=8", cfg)
+	}
+	if gotDefault, gotMax := cfg.JobTimeoutPolicy(); gotDefault != 3*time.Hour || gotMax != 6*time.Hour {
+		t.Fatalf("job timeout policy = (%v, %v), want (3h, 6h)", gotDefault, gotMax)
+	}
+}
+
+func TestDaemonJobTimeoutPolicyDefaults(t *testing.T) {
+	gotDefault, gotMax := (DaemonRuntimeConfig{}).JobTimeoutPolicy()
+	if gotDefault != 4*time.Hour || gotMax != 8*time.Hour {
+		t.Fatalf("default job timeout policy = (%v, %v), want (4h, 8h)", gotDefault, gotMax)
 	}
 }
 
@@ -84,14 +94,19 @@ func TestLoadDaemonRuntimeConfigParallelSugar(t *testing.T) {
 
 func TestLoadDaemonRuntimeConfigRejectsBadValues(t *testing.T) {
 	cases := map[string]string{
-		"bad poll":               "[daemon]\npoll = \"nope\"\n",
-		"nonpositive poll":       "[daemon]\npoll = \"0s\"\n",
-		"bad workers":            "[daemon]\nworkers = 0\n",
-		"bad scheduler":          "[daemon]\nscheduler = \"turbo\"\n",
-		"parallel+workers":       "[daemon]\nparallel = 2\nworkers = 3\n",
-		"nonpositive parallel":   "[daemon]\nparallel = 0\n",
-		"nonpositive idle grace": "[daemon]\nidle_grace_ticks = 0\n",
-		"nonpositive idle max":   "[daemon]\nidle_max_multiplier = 0\n",
+		"bad poll":                "[daemon]\npoll = \"nope\"\n",
+		"nonpositive poll":        "[daemon]\npoll = \"0s\"\n",
+		"bad workers":             "[daemon]\nworkers = 0\n",
+		"bad scheduler":           "[daemon]\nscheduler = \"turbo\"\n",
+		"parallel+workers":        "[daemon]\nparallel = 2\nworkers = 3\n",
+		"nonpositive parallel":    "[daemon]\nparallel = 0\n",
+		"nonpositive idle grace":  "[daemon]\nidle_grace_ticks = 0\n",
+		"nonpositive idle max":    "[daemon]\nidle_max_multiplier = 0\n",
+		"bad job default":         "[daemon]\njob_timeout_default = \"nope\"\n",
+		"nonpositive job default": "[daemon]\njob_timeout_default = \"0s\"\n",
+		"bad job max":             "[daemon]\njob_timeout_max = \"nope\"\n",
+		"nonpositive job max":     "[daemon]\njob_timeout_max = \"0s\"\n",
+		"default exceeds max":     "[daemon]\njob_timeout_default = \"9h\"\njob_timeout_max = \"8h\"\n",
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {

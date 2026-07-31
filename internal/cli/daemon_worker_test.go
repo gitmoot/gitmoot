@@ -16,6 +16,16 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
+type timeoutCaptureAdapter struct {
+	deadline    time.Time
+	hasDeadline bool
+}
+
+func (a *timeoutCaptureAdapter) Deliver(ctx context.Context, _ runtime.Agent, _ runtime.Job) (runtime.Result, error) {
+	a.deadline, a.hasDeadline = ctx.Deadline()
+	return runtime.Result{Raw: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}, nil
+}
+
 func TestTempWorkerEligibleAllowsWritableImplementWithTaskWorktree(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
@@ -266,15 +276,234 @@ func TestEffectiveJobTimeout(t *testing.T) {
 		t.Fatalf("effectiveJobTimeout(zero payload) = %v, want 10m", got)
 	}
 
-	// With no managed config, an empty payload timeout falls back to the daemon
-	// stale window so an unmanaged job still has a watchdog.
-	if got := effectiveJobTimeout(workflow.JobPayload{}, managedJobRuntimeConfig{}); got != daemonRunningJobStaleAfter {
-		t.Fatalf("effectiveJobTimeout(unmanaged, empty) = %v, want %v", got, daemonRunningJobStaleAfter)
+	// With no agent-type config, the independent daemon kill default applies;
+	// stale-running detection is never reused as the deadline.
+	if got := effectiveJobTimeout(workflow.JobPayload{}, managedJobRuntimeConfig{}); got != config.DefaultDaemonJobTimeoutDefault {
+		t.Fatalf("effectiveJobTimeout(unmanaged, empty) = %v, want %v", got, config.DefaultDaemonJobTimeoutDefault)
 	}
 
 	// With no managed config, a valid payload timeout still applies.
 	if got := effectiveJobTimeout(workflow.JobPayload{JobTimeout: "45s"}, managedJobRuntimeConfig{}); got != 45*time.Second {
 		t.Fatalf("effectiveJobTimeout(unmanaged, payload) = %v, want 45s", got)
+	}
+
+	// Configured daemon authority replaces both defaults, and its maximum is a
+	// hard ceiling regardless of which higher-precedence source supplied the
+	// candidate duration.
+	authority := managedJobRuntimeConfig{JobTimeoutDefault: 3 * time.Hour, JobTimeoutMax: 6 * time.Hour}
+	if got := effectiveJobTimeout(workflow.JobPayload{}, authority); got != 3*time.Hour {
+		t.Fatalf("effectiveJobTimeout(configured default) = %v, want 3h", got)
+	}
+	resolution := resolveEffectiveJobTimeout(workflow.JobPayload{JobTimeout: "7h"}, authority)
+	if resolution.Timeout != 6*time.Hour || !resolution.Clamped || resolution.Source != "payload" {
+		t.Fatalf("resolveEffectiveJobTimeout(configured max) = %+v, want payload clamped to 6h", resolution)
+	}
+}
+
+func TestDaemonDispatchUsesRegisteredAgentTypeTimeoutWithoutInstance(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveAgentType(paths, config.AgentType{Name: "plain", Runtime: runtime.ShellRuntime, JobTimeout: "10m"}); err != nil {
+		t.Fatal(err)
+	}
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerAgent(t, store, "plain", runtime.ShellRuntime, "", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-plain-timeout", Agent: "plain", Action: "ask", Repo: "owner/repo", Branch: "main"})
+	job, err := store.GetJob(ctx, "job-plain-timeout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := &timeoutCaptureAdapter{}
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return t.TempDir(), nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) { return capture, nil }
+	started := time.Now()
+	if err := worker.run(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	assertCapturedTimeout(t, capture, started, 10*time.Minute)
+}
+
+func TestDaemonDispatchPlainAgentWithoutTypeConfigUsesDefaultTimeout(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir() // Intentionally has no config file or [agents.plain] block.
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerAgent(t, store, "plain", runtime.ShellRuntime, "", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-plain-default-timeout", Agent: "plain", Action: "ask", Repo: "owner/repo", Branch: "main"})
+	job, err := store.GetJob(ctx, "job-plain-default-timeout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := &timeoutCaptureAdapter{}
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return t.TempDir(), nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) { return capture, nil }
+	started := time.Now()
+	if err := worker.run(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != string(workflow.JobSucceeded) {
+		t.Fatalf("plain agent job state = %q, want succeeded with daemon default timeout", stored.State)
+	}
+	assertCapturedTimeout(t, capture, started, config.DefaultDaemonJobTimeoutDefault)
+}
+
+func TestManagedJobConfigLoadsDaemonTimeoutAuthority(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[daemon]\njob_timeout_default = \"3h\"\njob_timeout_max = \"6h\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerAgent(t, store, "plain", runtime.ShellRuntime, "", []string{"ask"}, "owner/repo")
+	got, err := (jobWorker{Store: store, ConfigHome: home, ConfigHomeExplicit: true}).managedJobConfig(ctx, "plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.JobTimeoutDefault != 3*time.Hour || got.JobTimeoutMax != 6*time.Hour {
+		t.Fatalf("managed job timeout authority = (%v, %v), want (3h, 6h)", got.JobTimeoutDefault, got.JobTimeoutMax)
+	}
+}
+
+func TestDaemonDispatchClampsPayloadTimeoutAndRecordsEvent(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerAgent(t, store, "plain", runtime.ShellRuntime, "", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-clamped-timeout", Agent: "plain", Action: "ask", Repo: "owner/repo", Branch: "main", JobTimeout: "12h"})
+	job, err := store.GetJob(ctx, "job-clamped-timeout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := &timeoutCaptureAdapter{}
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return t.TempDir(), nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) { return capture, nil }
+	started := time.Now()
+	if err := worker.run(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	assertCapturedTimeout(t, capture, started, 8*time.Hour)
+	events, err := store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var clampMessage string
+	for _, event := range events {
+		if event.Kind == "job_timeout_clamped" {
+			clampMessage = event.Message
+		}
+	}
+	if !strings.Contains(clampMessage, "12h") || !strings.Contains(clampMessage, "8h") {
+		t.Fatalf("job_timeout_clamped event = %q, want requested 12h and max 8h", clampMessage)
+	}
+}
+
+func TestDaemonDispatchInstanceTypeOverridesRegisteredTypeTimeout(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveAgentType(paths, config.AgentType{Name: "plain", Runtime: runtime.ShellRuntime, JobTimeout: "10m"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveAgentType(paths, config.AgentType{Name: "override", Runtime: runtime.ShellRuntime, JobTimeout: "20m"}); err != nil {
+		t.Fatal(err)
+	}
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerAgent(t, store, "plain", runtime.ShellRuntime, "", []string{"ask"}, "owner/repo")
+	now := time.Now().UTC()
+	if err := store.UpsertAgentInstance(ctx, db.AgentInstance{
+		Name: "plain", Type: "override", Runtime: runtime.ShellRuntime, RepoFullName: "owner/repo",
+		Role: "plain", Capabilities: []string{"ask"}, State: "idle",
+		CreatedAt: now.Format(time.RFC3339Nano), LastUsedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(time.Hour).Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-instance-timeout", Agent: "plain", Action: "ask", Repo: "owner/repo", Branch: "main"})
+	job, err := store.GetJob(ctx, "job-instance-timeout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := &timeoutCaptureAdapter{}
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return t.TempDir(), nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) { return capture, nil }
+	started := time.Now()
+	if err := worker.run(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	assertCapturedTimeout(t, capture, started, 20*time.Minute)
+}
+
+func TestDaemonJobTimeoutIsSeparateFromStaleDetection(t *testing.T) {
+	if !(daemonRunningJobStaleAfter < config.DefaultDaemonJobTimeoutDefault) {
+		t.Fatalf("stale_after = %v, kill default = %v; want stale_after < kill default", daemonRunningJobStaleAfter, config.DefaultDaemonJobTimeoutDefault)
+	}
+	if got := effectiveJobTimeout(workflow.JobPayload{}, managedJobRuntimeConfig{}); got == daemonRunningJobStaleAfter {
+		t.Fatalf("effectiveJobTimeout returned stale detector constant %v", got)
+	}
+
+	ctx := context.Background()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerAgent(t, store, "defaulted", runtime.ShellRuntime, "", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-default-timeout", Agent: "defaulted", Action: "ask", Repo: "owner/repo", Branch: "main"})
+	job, err := store.GetJob(ctx, "job-default-timeout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := &timeoutCaptureAdapter{}
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return t.TempDir(), nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) { return capture, nil }
+	started := time.Now()
+	if err := worker.run(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	assertCapturedTimeout(t, capture, started, config.DefaultDaemonJobTimeoutDefault)
+}
+
+func assertCapturedTimeout(t *testing.T, capture *timeoutCaptureAdapter, started time.Time, want time.Duration) {
+	t.Helper()
+	if !capture.hasDeadline {
+		t.Fatal("delivery context has no deadline")
+	}
+	got := capture.deadline.Sub(started)
+	if got < want-time.Second || got > want+time.Second {
+		t.Fatalf("delivery timeout = %v, want %v", got, want)
 	}
 }
 

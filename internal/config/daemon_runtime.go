@@ -11,6 +11,8 @@ import (
 const (
 	DefaultDaemonIdleGraceTicks    = 3
 	DefaultDaemonIdleMaxMultiplier = 4
+	DefaultDaemonJobTimeoutDefault = 4 * time.Hour
+	DefaultDaemonJobTimeoutMax     = 8 * time.Hour
 )
 
 // DaemonRuntimeConfig is the daemon's WARM-reloadable runtime settings, read from
@@ -53,6 +55,15 @@ type DaemonRuntimeConfig struct {
 	IdleGraceTicksSet    bool
 	IdleMaxMultiplier    int
 	IdleMaxMultiplierSet bool
+	// JobTimeoutDefault is the kill deadline for jobs without a positive payload
+	// or agent-type timeout. JobTimeoutMax is the hard ceiling for every effective
+	// timeout, preventing a delegation tree from granting itself an unbounded run.
+	// Both are read when a job is dispatched; changing either affects only jobs
+	// that have not started yet.
+	JobTimeoutDefault    time.Duration
+	JobTimeoutDefaultSet bool
+	JobTimeoutMax        time.Duration
+	JobTimeoutMaxSet     bool
 }
 
 // LoadDaemonRuntimeConfig parses the [daemon] section. A file with no [daemon]
@@ -132,6 +143,20 @@ func LoadDaemonRuntimeConfig(paths Paths) (DaemonRuntimeConfig, error) {
 			}
 			cfg.IdleMaxMultiplier = parsed
 			cfg.IdleMaxMultiplierSet = true
+		case "job_timeout_default":
+			parsed, err := parseConfigDuration(value)
+			if err != nil {
+				return DaemonRuntimeConfig{}, fmt.Errorf("parse [daemon].job_timeout_default: %w", err)
+			}
+			cfg.JobTimeoutDefault = parsed
+			cfg.JobTimeoutDefaultSet = true
+		case "job_timeout_max":
+			parsed, err := parseConfigDuration(value)
+			if err != nil {
+				return DaemonRuntimeConfig{}, fmt.Errorf("parse [daemon].job_timeout_max: %w", err)
+			}
+			cfg.JobTimeoutMax = parsed
+			cfg.JobTimeoutMaxSet = true
 		default:
 			// Unknown keys are ignored so the section can grow (e.g. #576 per-repo
 			// caps) without breaking older binaries.
@@ -189,5 +214,29 @@ func validateDaemonRuntimeConfig(cfg DaemonRuntimeConfig) error {
 	if cfg.IdleMaxMultiplierSet && cfg.IdleMaxMultiplier <= 0 {
 		return fmt.Errorf("[daemon].idle_max_multiplier must be positive")
 	}
+	if cfg.JobTimeoutDefaultSet && cfg.JobTimeoutDefault <= 0 {
+		return fmt.Errorf("[daemon].job_timeout_default must be positive")
+	}
+	if cfg.JobTimeoutMaxSet && cfg.JobTimeoutMax <= 0 {
+		return fmt.Errorf("[daemon].job_timeout_max must be positive")
+	}
+	jobTimeoutDefault, jobTimeoutMax := cfg.JobTimeoutPolicy()
+	if jobTimeoutDefault > jobTimeoutMax {
+		return fmt.Errorf("[daemon].job_timeout_default (%s) must not exceed [daemon].job_timeout_max (%s)", jobTimeoutDefault, jobTimeoutMax)
+	}
 	return nil
+}
+
+// JobTimeoutPolicy returns the effective daemon kill-deadline policy, applying
+// the safe defaults when either optional key is absent.
+func (cfg DaemonRuntimeConfig) JobTimeoutPolicy() (jobTimeoutDefault, jobTimeoutMax time.Duration) {
+	jobTimeoutDefault = DefaultDaemonJobTimeoutDefault
+	if cfg.JobTimeoutDefaultSet {
+		jobTimeoutDefault = cfg.JobTimeoutDefault
+	}
+	jobTimeoutMax = DefaultDaemonJobTimeoutMax
+	if cfg.JobTimeoutMaxSet {
+		jobTimeoutMax = cfg.JobTimeoutMax
+	}
+	return jobTimeoutDefault, jobTimeoutMax
 }

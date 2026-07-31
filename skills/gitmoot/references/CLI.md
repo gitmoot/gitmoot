@@ -410,6 +410,25 @@ repo's in-flight jobs (`0` or unset = use the global worker count), and an
 optional `scheduler = "pool"|"barrier"` overrides that repo's scheduler. The
 keys are re-read every tick, so edits apply live.
 
+Job kill deadlines are independent from stale-running detection. Configure the
+daemon defaults with:
+
+```toml
+[daemon]
+job_timeout_default = "4h"
+job_timeout_max = "8h"
+```
+
+The effective deadline resolves in this order: a positive `job_timeout` in the
+job payload, the registered agent type's `[agents.<type>].job_timeout`, then
+`job_timeout_default`. `job_timeout_max` is a hard ceiling (default `8h`); a
+larger request is clamped and the job receives a `job_timeout_clamped` event
+recording the requested and applied durations. This prevents a delegation tree
+from granting itself an unbounded run. These keys are read when a job dispatches,
+so edits affect newly started jobs without changing an in-flight deadline.
+The 30-minute stale-running threshold remains only a crash-detection predicate;
+it is never used as a job kill deadline.
+
 Reconfigure the running daemon without a restart: `kill -HUP <daemon-pid>`
 re-reads the `[daemon]` config section (`poll`, `workers`, `scheduler`,
 parallelism, `idle_grace_ticks`, `idle_max_multiplier`) live (#577) — no teardown, no dropped jobs, no environment

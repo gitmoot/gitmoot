@@ -101,6 +101,8 @@ artifact_blobs = %q
 # scheduler = "barrier"
 # idle_grace_ticks = 3       # consecutive all-304 polls before decay starts
 # idle_max_multiplier = 4   # 1 disables idle cadence decay
+# job_timeout_default = "4h" # kill deadline when payload and agent type omit one
+# job_timeout_max = "8h"     # hard ceiling; larger payload requests are clamped
 
 # [credentials] is OFF by default. When env_curation=true, only a pinned base
 # environment plus runtime-specific auth/state variables reaches runtime-agent
