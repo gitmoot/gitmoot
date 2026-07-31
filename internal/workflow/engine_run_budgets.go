@@ -441,6 +441,26 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 				leadAgent = payload.OriginalAgent
 			}
 		}
+		// Trigger 1 (in-process path): carry the implement job's
+		// skip_native_review_fanout onto the PR event, falling back to the BRANCH
+		// LOCK when the payload does not carry it.
+		//
+		// The lock fallback is what makes the intent genuinely branch-scoped. Until
+		// now the two PR-open triggers disagreed: the daemon PR-watcher read
+		// lock.SkipNativeReviewFanout, while this in-process trigger read only the
+		// payload — so an engine hop that lost the flag re-armed the fanout here even
+		// though the branch had already been told. dispatchFix is exactly that hop:
+		// it builds a PARENTLESS implement request with no SkipNativeReviewFanout, so
+		// it escapes the enqueue-chokepoint inheritance (which requires a parent) and
+		// its fix round re-armed review on a branch whose lock already read true.
+		// Reading the lock here closes that class for every parentless engine
+		// re-dispatch, present and future, without reaching into the constructors.
+		skipFanout := payload.SkipNativeReviewFanout
+		if !skipFanout && strings.TrimSpace(payload.Branch) != "" {
+			if lock, lockErr := e.Store.GetBranchLock(ctx, payload.Repo, payload.Branch); lockErr == nil && lock.SkipNativeReviewFanout {
+				skipFanout = true
+			}
+		}
 		event := PullRequestEvent{
 			Repo:              payload.Repo,
 			Branch:            payload.Branch,
@@ -452,9 +472,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 			LeadAgent:         leadAgent,
 			Sender:            job.Agent,
 			RequiredReviewers: e.requiredReviewers(payload),
-			// Trigger 1 (in-process path): carry the implement job's
-			// skip_native_review_fanout straight onto the PR event.
-			SkipReviewFanout: payload.SkipNativeReviewFanout,
+			SkipReviewFanout:  skipFanout,
 		}
 		// The branch-lock persist for the daemon's PR-watcher path (trigger 2) now
 		// happens above, before the no-PR early return, so it covers the PR arm and

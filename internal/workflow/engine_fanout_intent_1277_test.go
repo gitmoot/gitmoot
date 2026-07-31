@@ -237,3 +237,60 @@ func TestEnqueueWithoutParentDoesNotInventIntent(t *testing.T) {
 		t.Fatalf("a parentless root invented the intent: %+v", payload)
 	}
 }
+
+// #1277, the third escape g7-review reproduced. dispatchFix builds a PARENTLESS
+// implement request carrying neither ParentJobID nor SkipNativeReviewFanout, so
+// it slips past the enqueue-chokepoint inheritance (which requires a parent) and
+// its fix round re-armed the fanout — on a branch whose lock already read true.
+//
+// The root cause is an asymmetry between the two PR-open triggers: the daemon
+// PR-watcher read the branch lock, the in-process trigger read only the payload.
+// This pins the fix from the OUTSIDE — a payload with no intent, on a branch
+// whose lock carries it, must not fan out.
+func TestInProcessPROpenHonoursTheBranchLockIntent(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "reviewer", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	engine.RequiredReviewers = []string{"reviewer"}
+	gate := &fakeMergeGate{decision: MergeDecision{Reason: "ci is pending"}}
+	engine.MergeGate = gate
+
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-11", Owner: "lead"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	// The branch was already told, e.g. by the original intent-bearing implement.
+	if err := store.SetBranchLockReviewFanout(ctx, "gitmoot/gitmoot", "task-11", true); err != nil {
+		t.Fatalf("SetBranchLockReviewFanout returned error: %v", err)
+	}
+	// The fix-round job, as dispatchFix builds it: no intent, no parent.
+	insertCompletedJob(t, store, db.Job{
+		ID:    "fix-round-implement",
+		Agent: "lead",
+		Type:  "implement",
+	}, JobPayload{
+		Repo:                   "gitmoot/gitmoot",
+		Branch:                 "task-11",
+		PullRequest:            11,
+		HeadSHA:                "head456",
+		TaskID:                 "task-11",
+		LeadAgent:              "lead",
+		SkipNativeReviewFanout: false,
+		Result:                 &AgentResult{Decision: "implemented", Summary: "addressed requested changes"},
+	})
+
+	if err := engine.AdvanceJob(ctx, "fix-round-implement"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	for _, job := range jobs {
+		if job.Type == "review" {
+			t.Fatalf("parentless fix round re-armed native fanout despite the branch lock: %+v", job)
+		}
+	}
+}
