@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -449,6 +450,14 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			implementingAgents[agent] = struct{}{}
 		}
 	}
+	delegationChildrenByParent := make(map[string][]db.Job)
+	for _, job := range jobs {
+		parentID := strings.TrimSpace(job.ParentJobID)
+		if parentID == "" || strings.TrimSpace(job.DelegationID) == "" {
+			continue
+		}
+		delegationChildrenByParent[parentID] = append(delegationChildrenByParent[parentID], job)
+	}
 	// A round can order remediation, but it must not hide a blocking verdict or
 	// an unfinished reviewer slot captured at the head currently being evaluated.
 	type reviewAtHead struct {
@@ -541,6 +550,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			}
 			switch review.payload.Result.Decision {
 			case "approved":
+				if err := ensureDelegatedReviewEvidence(review.job, delegationChildrenByParent[review.job.ID]); err != nil {
+					return err
+				}
 				switch {
 				case reviewer == "":
 					if unattributedReviewerReason == "" {
@@ -654,6 +666,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		}
 		switch payload.Result.Decision {
 		case "approved":
+			if err := ensureDelegatedReviewEvidence(job, delegationChildrenByParent[job.ID]); err != nil {
+				return err
+			}
 			approved = true
 		case "changes_requested", "blocked", "failed":
 			// A captured blocking review is an authoritative template-quality rejection
@@ -670,6 +685,130 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		return errors.New("required reviewer approval is missing")
 	}
 	return nil
+}
+
+func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job) error {
+	if len(children) == 0 {
+		return nil
+	}
+	hasApproval := false
+	var blocking []string
+	var active []string
+	var crashed []string
+	var abstaining []string
+	var parked []string
+	var unrecognized []string
+	for _, child := range children {
+		childID := strings.TrimSpace(child.ID)
+		switch JobState(child.State) {
+		case JobQueued, JobRunning:
+			active = append(active, fmt.Sprintf("%s (%s)", childID, child.State))
+		case JobSucceeded:
+			payload, err := unmarshalPayload(child.Payload)
+			if err != nil {
+				unrecognized = append(unrecognized, fmt.Sprintf("%s (malformed result)", childID))
+				continue
+			}
+			if payload.Result == nil {
+				unrecognized = append(unrecognized, fmt.Sprintf("%s (nil result)", childID))
+				continue
+			}
+			decision := strings.TrimSpace(payload.Result.Decision)
+			switch decision {
+			case "approved":
+				hasApproval = true
+			case "changes_requested", "blocked", "failed":
+				blocking = append(blocking, fmt.Sprintf("%s (%s)", childID, decision))
+			case "skipped", "implemented":
+				abstaining = append(abstaining, fmt.Sprintf("%s (%s)", childID, decision))
+			default:
+				unrecognized = append(unrecognized, fmt.Sprintf("%s (unrecognized decision %q)", childID, decision))
+			}
+		case JobFailed, JobCancelled:
+			crashed = append(crashed, fmt.Sprintf("%s (%s)", childID, child.State))
+		case JobBlocked:
+			parked = append(parked, fmt.Sprintf("%s (%s)", childID, child.State))
+		default:
+			unrecognized = append(unrecognized, fmt.Sprintf("%s (unrecognized state %q)", childID, child.State))
+		}
+	}
+	sort.Strings(blocking)
+	sort.Strings(active)
+	sort.Strings(crashed)
+	sort.Strings(abstaining)
+	sort.Strings(parked)
+	sort.Strings(unrecognized)
+	details := make([]string, 0, 6)
+	if len(blocking) > 0 {
+		details = append(details, "blocking children: "+strings.Join(blocking, ", "))
+	}
+	if len(unrecognized) > 0 {
+		details = append(details, "unrecognized children: "+strings.Join(unrecognized, ", "))
+	}
+	if len(active) > 0 {
+		details = append(details, "active children: "+strings.Join(active, ", "))
+	}
+	if len(crashed) > 0 {
+		details = append(details, "crashed children: "+strings.Join(crashed, ", "))
+	}
+	if len(abstaining) > 0 {
+		details = append(details, "abstaining children: "+strings.Join(abstaining, ", "))
+	}
+	if len(parked) > 0 {
+		details = append(details, "parked children: "+strings.Join(parked, ", "))
+	}
+	reasonDetails := strings.Join(details, "; ")
+	// The first matching class decides the outcome; reasonDetails retains every
+	// lower-priority obligation so a winning class cannot hide its siblings.
+	if len(blocking) > 0 {
+		return mergeBlocked{reason: fmt.Sprintf(
+			"delegated review parent %s has blocking delegation evidence (%s)",
+			parent.ID,
+			reasonDetails,
+		)}
+	}
+	if len(unrecognized) > 0 {
+		return fmt.Errorf(
+			"delegated review parent %s has unrecognized delegation evidence (%s); rerun or repair the delegated review",
+			parent.ID,
+			reasonDetails,
+		)
+	}
+	if len(active) > 0 {
+		return mergePending{reason: fmt.Sprintf(
+			"waiting for delegated review parent %s to produce surviving evidence (%s)",
+			parent.ID,
+			reasonDetails,
+		)}
+	}
+	if len(crashed) > 0 {
+		return fmt.Errorf(
+			"delegated review parent %s has crashed delegation children (%s); rerun or repair the delegated review",
+			parent.ID,
+			reasonDetails,
+		)
+	}
+	if len(abstaining) > 0 {
+		return fmt.Errorf(
+			"delegated review parent %s has no surviving delegation evidence: abstaining delegation children (%s); rerun or repair the delegated review",
+			parent.ID,
+			reasonDetails,
+		)
+	}
+	if len(parked) > 0 {
+		return fmt.Errorf(
+			"delegated review parent %s has no surviving delegation evidence (%s); rerun or repair the delegated review",
+			parent.ID,
+			reasonDetails,
+		)
+	}
+	if hasApproval {
+		return nil
+	}
+	return fmt.Errorf(
+		"delegated review parent %s has no surviving delegation evidence; rerun or repair the delegated review",
+		parent.ID,
+	)
 }
 
 func reviewAuthorshipFailureReason(selfApproval string, unknownImplementer string, unattributedReviewer string) string {
