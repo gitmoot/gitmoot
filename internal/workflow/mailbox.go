@@ -485,6 +485,32 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		snapshot = *request.TemplateOverride
 	}
 
+	// #1277: inherit the skip-native-review-fanout intent from the parent job.
+	//
+	// Propagating the flag at each JobRequest construction site is whack-a-mole:
+	// there are nine of them in internal/workflow, none propagated it, and a
+	// review of the first attempt at this fix reproduced a live two-generation
+	// escape that the branch lock could NOT rescue — an intent-bearing ask
+	// coordinator delegates a review child, the normal continuation is enqueued
+	// (dropping the flag), and that continuation delegates the implement child
+	// which re-arms the fanout. No intent-bearing implement job had advanced yet,
+	// so nothing had published the intent onto the lock.
+	//
+	// Enqueue is the ONE chokepoint every request passes through, so inheriting
+	// here fixes the whole class instead of the instances, and the tenth
+	// construction site somebody adds next month inherits it for free. Only a
+	// request that does NOT already carry the intent and HAS a parent pays for the
+	// lookup, so root dispatches are untouched. Fails open: an unreadable parent
+	// leaves the request exactly as the caller built it.
+	skipNativeReviewFanout := request.SkipNativeReviewFanout
+	if !skipNativeReviewFanout && strings.TrimSpace(request.ParentJobID) != "" {
+		if parent, parentErr := m.Store.GetJob(ctx, strings.TrimSpace(request.ParentJobID)); parentErr == nil {
+			if parentPayload, parseErr := unmarshalPayload(parent.Payload); parseErr == nil && parentPayload.SkipNativeReviewFanout {
+				skipNativeReviewFanout = true
+			}
+		}
+	}
+
 	payload, err := marshalPayload(JobPayload{
 		Repo:                   request.Repo,
 		Branch:                 request.Branch,
@@ -544,7 +570,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		Cockpit:                request.Cockpit,
 		CockpitSession:         strings.TrimSpace(request.CockpitSession),
 		CockpitPaneKey:         strings.TrimSpace(request.CockpitPaneKey),
-		SkipNativeReviewFanout: request.SkipNativeReviewFanout,
+		SkipNativeReviewFanout: skipNativeReviewFanout,
 		ValidatedPullRequest:   request.ValidatedPullRequest,
 		Ephemeral:              request.Ephemeral,
 		HumanAnswer:            request.HumanAnswer,

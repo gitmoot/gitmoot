@@ -704,3 +704,190 @@ func TestBuildAskGateComment(t *testing.T) {
 		t.Fatalf("ask-gate comment parsed into %d command(s); want 0: %+v\nbody:\n%s", len(cmds), cmds, body)
 	}
 }
+
+// #1277, coverage axis: finalizerRan x executor-identity-differs.
+//
+// The write-ahead persist above closes the #390 TOCTOU — the daemon's PR-watcher
+// must never observe a PR for this branch with the skip flag still unwritten. It
+// is correctly IDENTITY-BLIND in production (daemon_workflow.go: `if
+// payload.SkipNativeReviewFanout`), but every committed finalizer fixture runs
+// with job.Agent == payload.LeadAgent, so nothing pinned that blindness.
+//
+// A FINALIZER_REQUIRES_EXECUTOR_IDENTITY mutant — adding
+// `&& payload.LeadAgent == job.Agent` to that condition — survived BOTH committed
+// finalizer tests and all three cells of the workflow-package mixed-identity
+// matrix. The shape it breaks is real: runtime_session_busy delegates execution
+// to a TEMPORARY WORKER, so job.Agent is the worker while LeadAgent and the branch
+// lock owner remain the original agent. Under the mutant the flag is not written
+// ahead, and the PR opens on a branch whose lock still reads false.
+//
+// Test-only guard: production behaviour is unchanged, this freezes it.
+func TestDaemonImplementationFinalizerPersistsSkipFanoutWhenExecutorIsDelegatedWorker(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	remoteDir := filepath.Join(home, "remote.git")
+	repoDir := filepath.Join(home, "repo")
+	runGit(t, home, "init", "--bare", remoteDir)
+	runGit(t, home, "clone", remoteDir, repoDir)
+	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, repoDir, "config", "user.name", "Gitmoot Test")
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "initial")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "push", "-u", "origin", "main")
+	runGit(t, repoDir, "switch", "-c", "task-busy")
+	if err := os.WriteFile(filepath.Join(repoDir, "feature.txt"), []byte("delegated work\n"), 0o644); err != nil {
+		t.Fatalf("write feature: %v", err)
+	}
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir, DefaultBranch: "main", PollInterval: "30s"}); err != nil {
+		t.Fatalf("UpsertRepo returned error: %v", err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-busy", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Task Busy", State: string(workflow.TaskImplementing), Branch: "task-busy", WorktreePath: repoDir}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	// The lock — and the branch — belong to the ORIGINAL agent, not the executor.
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: "task-busy", Owner: "lead"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	gh := &stubSkipFlagAtOpenGitHub{store: store, repo: "owner/repo", branch: "task-busy", pr: github.PullRequest{
+		Number:  8,
+		URL:     "https://github.com/owner/repo/pull/8",
+		State:   "open",
+		HeadRef: "task-busy",
+		BaseRef: "main",
+	}}
+	finalizer := daemonImplementationFinalizer{Store: store, GitHub: gh}
+	payload := workflow.JobPayload{
+		Repo:                   "owner/repo",
+		Branch:                 "task-busy",
+		GoalID:                 "goal-1",
+		TaskID:                 "task-busy",
+		TaskTitle:              "Task Busy",
+		LeadAgent:              "lead",
+		DelegationReason:       "runtime_session_busy",
+		DelegatedAgent:         "temp-worker",
+		OriginalAgent:          "lead",
+		SkipNativeReviewFanout: true,
+		Result:                 &workflow.AgentResult{Decision: "implemented", Summary: "delegated worker finished"},
+	}
+
+	// The EXECUTOR is the temporary worker; LeadAgent and the lock owner are not.
+	if _, err := finalizer.FinalizeImplementation(ctx, db.Job{ID: "job-busy", Agent: "temp-worker", Type: "implement"}, payload); err != nil {
+		t.Fatalf("FinalizeImplementation returned error: %v", err)
+	}
+	if !gh.opened {
+		t.Fatal("EnsurePullRequest was never called; cannot assert ordering")
+	}
+	if !gh.skipAtOpen {
+		t.Fatal("#390 regression: branch-lock skip flag was NOT persisted before the PR was opened")
+	}
+	lock, err := store.GetBranchLock(ctx, "owner/repo", "task-busy")
+	if err != nil {
+		t.Fatalf("GetBranchLock returned error: %v", err)
+	}
+	if !lock.SkipNativeReviewFanout {
+		t.Fatalf("expected lock.SkipNativeReviewFanout = true after finalize, got %+v", lock)
+	}
+}
+
+// #1277, coverage axis: finalizerRan x payload-intent-false x prearmed-lock-intent-true.
+//
+// This is the FINALIZER's mirror of the polarity already pinned on the engine
+// writer by TestEngineAdvanceImplementWithoutIntentDoesNotTouchTheLock. There are
+// TWO independent writers of the branch-lock intent — the engine's post-advance
+// write and this finalizer's write-ahead — and pinning one says nothing about the
+// other. A FINALIZER_EXTRA_DEFAULT_UPDATE mutant, calling
+// SetBranchLockReviewFanout unconditionally with the payload's own value
+// (including false), passed the ENTIRE committed finalizer family.
+//
+// It is wrong on a real #1277 path rather than a theoretical one. dispatchFix
+// creates a PARENTLESS implement job whose payload intent is FALSE while the
+// branch lock still holds TRUE — that is precisely the case the in-process lock
+// fallback exists to rescue. The finalizer runs BEFORE that fallback reads the
+// lock, so an unconditional false write ERASES the branch command in between,
+// and native review re-arms on a branch that was explicitly exempted.
+//
+// The lock must therefore be pre-armed true and survive a false-payload finalize
+// untouched: false-written and never-written are indistinguishable from a bare
+// boolean read, so preservation is the only assertion that separates them.
+//
+// Test-only guard: production behaviour is unchanged, this freezes it.
+func TestDaemonImplementationFinalizerPreservesPrearmedSkipFanoutWhenPayloadIsFalse(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	remoteDir := filepath.Join(home, "remote.git")
+	repoDir := filepath.Join(home, "repo")
+	runGit(t, home, "init", "--bare", remoteDir)
+	runGit(t, home, "clone", remoteDir, repoDir)
+	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, repoDir, "config", "user.name", "Gitmoot Test")
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "initial")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "push", "-u", "origin", "main")
+	runGit(t, repoDir, "switch", "-c", "task-fixround")
+	if err := os.WriteFile(filepath.Join(repoDir, "feature.txt"), []byte("fix round work\n"), 0o644); err != nil {
+		t.Fatalf("write feature: %v", err)
+	}
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir, DefaultBranch: "main", PollInterval: "30s"}); err != nil {
+		t.Fatalf("UpsertRepo returned error: %v", err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-fixround", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Fix Round", State: string(workflow.TaskImplementing), Branch: "task-fixround", WorktreePath: repoDir}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: "task-fixround", Owner: "lead"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	// The branch was exempted earlier in its life; the fix-round payload carries
+	// no intent of its own, exactly as dispatchFix builds it.
+	if err := store.SetBranchLockReviewFanout(ctx, "owner/repo", "task-fixround", true); err != nil {
+		t.Fatalf("SetBranchLockReviewFanout returned error: %v", err)
+	}
+	gh := &stubSkipFlagAtOpenGitHub{store: store, repo: "owner/repo", branch: "task-fixround", pr: github.PullRequest{
+		Number:  9,
+		URL:     "https://github.com/owner/repo/pull/9",
+		State:   "open",
+		HeadRef: "task-fixround",
+		BaseRef: "main",
+	}}
+	finalizer := daemonImplementationFinalizer{Store: store, GitHub: gh}
+	payload := workflow.JobPayload{
+		Repo:                   "owner/repo",
+		Branch:                 "task-fixround",
+		GoalID:                 "goal-1",
+		TaskID:                 "task-fixround",
+		TaskTitle:              "Fix Round",
+		LeadAgent:              "lead",
+		SkipNativeReviewFanout: false,
+		Result:                 &workflow.AgentResult{Decision: "implemented", Summary: "addressed requested changes"},
+	}
+
+	if _, err := finalizer.FinalizeImplementation(ctx, db.Job{ID: "job-fixround", Agent: "lead", Type: "implement"}, payload); err != nil {
+		t.Fatalf("FinalizeImplementation returned error: %v", err)
+	}
+	if !gh.opened {
+		t.Fatal("EnsurePullRequest was never called; cannot assert ordering")
+	}
+	if !gh.skipAtOpen {
+		t.Fatal("#390 regression: a false-payload finalize ERASED the branch intent before the PR was opened")
+	}
+	lock, err := store.GetBranchLock(ctx, "owner/repo", "task-fixround")
+	if err != nil {
+		t.Fatalf("GetBranchLock returned error: %v", err)
+	}
+	if !lock.SkipNativeReviewFanout {
+		t.Fatalf("a false-payload finalize cleared the pre-armed branch intent: %+v", lock)
+	}
+}
