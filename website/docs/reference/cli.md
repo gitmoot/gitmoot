@@ -1184,7 +1184,7 @@ at enqueue.
 
 `gitmoot org seat add <name> --pane <label> [--home DIR]` claims the one live
 Herdr pane with that exact label, writes or repairs the role's `pane` binding,
-and installs addressed `reply`, `blocked`, and `escalation` routes with stable
+and installs addressed `reply`, `blocked`, `directive`, and `escalation` routes with stable
 IDs `org-seat-<name>-<kind>`. Duplicate labels hard-fail instead of choosing a
 pane. New child seats inherit the `owner` role's scope and parent; an empty
 registry must add `owner` first. Re-running the command repairs missing owned
@@ -1200,7 +1200,7 @@ unreadable branch state also fails closed. A safe removal deletes the role and
 all of its wake routes, closes the pane, and then runs the same reality
 validation. Roles that still parent another role cannot be removed.
 
-The three provisioned routes are enabled, addressed, and have an empty match
+The four provisioned routes are enabled, addressed, and have an empty match
 filter. Remove one by its stable ID with `org events rule rm` to quiet that kind;
 this is destructive and re-running `seat add` recreates it. There is currently
 no non-destructive event-rule disable verb.
@@ -1242,6 +1242,19 @@ escalation with no identifiable asker still resolves, prints a warning, and
 records no invented target. Resolved escalations are omitted from org dashboard
 projections while the original journal entry remains intact.
 
+`gitmoot org directive send --to <role> --workflow <label> (--stdin | -F
+<file> | <text>) [--home <dir>]` writes a typed downward assignment from
+`GITMOOT_ORG_ROLE`. The sender must be an ancestor of the target; peer, upward,
+and same-role sends are refused. Its note and pending `directive:<role>` wake
+obligation commit atomically and never share reply coalescing. With no matching
+directive rule, the durable row stays pending without making the drain
+unhealthy.
+
+`gitmoot org directive ack <id> [--by <role>] [--home <dir>]` is restricted to
+the addressed target and records receipt, not completion. `gitmoot org
+directive cancel <id> [--by <role>] [--home <dir>]` is restricted to the sender.
+Both append typed markers to the directive's workflow journal.
+
 Event-rule wakes are separately opt-in:
 
 ```sh
@@ -1249,6 +1262,7 @@ gitmoot org events rule add --on attention --match owner/repo --wake maintainer
 gitmoot org events rule add --on blocked --repo tendwire --wake maintainer
 gitmoot org events rule add --on pane_input_pending --wake maintainer
 gitmoot org events rule add --on reply --wake maintainer
+gitmoot org events rule add --on directive --wake maintainer
 gitmoot org events rule add --on reply --wake operator --scope observer
 gitmoot org events rule list
 gitmoot org events rule set-scope --home /alternate/home <rule-id> observer
@@ -1256,7 +1270,7 @@ gitmoot org events rule rm --home /alternate/home <rule-id>
 ```
 
 `--on` accepts `escalation`, `attention`, `guard`, `job-terminal`, `blocked`,
-`recycle-overdue`, `pane_input_pending`, or `reply`. `pane_input_pending` matches the
+`recycle-overdue`, `pane_input_pending`, `reply`, or `directive`. `pane_input_pending` matches the
 `org.input_pending` event emitted when Herdr continuously reports
 `input_pending: true` for a role's pane longer than
 `[orchestrate].blocked_role_wake_after`; it re-nudges at most once per that

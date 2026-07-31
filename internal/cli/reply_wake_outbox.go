@@ -146,7 +146,16 @@ func wakeOutboxObligationHealth(ctx context.Context, store *db.Store, attemptedB
 	if err != nil {
 		return fmt.Errorf("read wake outbox obligations: %w", err)
 	}
-	pending := len(obligations.Pending)
+	pending := 0
+	for _, obligation := range obligations.Pending {
+		// Directives are config-inert by contract: without a matching rule their
+		// durable row remains pending for later configuration, not as a permanent
+		// daemon health error stream.
+		if strings.HasPrefix(strings.ToLower(obligation.CoalesceKey), db.WakeOutboxDirectiveCoalescePrefix) {
+			continue
+		}
+		pending++
+	}
 	agedAttempted := len(obligations.AgedAttempted)
 	if pending == 0 && agedAttempted == 0 {
 		return nil
@@ -174,7 +183,10 @@ var wakeOutboxSourceKinds = []wakeOutboxSourceKind{
 	{sourceKind: db.WakeOutboxSourceEscalation, wakeKind: db.WakeOutboxKindEscalation},
 }
 
-func wakeOutboxKindForSource(sourceKind string) (string, bool) {
+func wakeOutboxKindForSource(sourceKind, coalesceKey string) (string, bool) {
+	if sourceKind == db.WakeOutboxSourceWorkflowNote && strings.HasPrefix(strings.ToLower(coalesceKey), db.WakeOutboxDirectiveCoalescePrefix) {
+		return db.WakeOutboxKindDirective, true
+	}
 	for _, definition := range wakeOutboxSourceKinds {
 		if definition.sourceKind == sourceKind {
 			return definition.wakeKind, true
@@ -184,7 +196,7 @@ func wakeOutboxKindForSource(sourceKind string) (string, bool) {
 }
 
 func wakeOutboxDirectedKinds() []string {
-	unique := make(map[string]struct{})
+	unique := map[string]struct{}{db.WakeOutboxKindDirective: {}}
 	for _, definition := range wakeOutboxSourceKinds {
 		unique[definition.wakeKind] = struct{}{}
 	}
@@ -209,7 +221,7 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 	}
 	oldest := batch[0]
 	role := strings.ToLower(strings.TrimSpace(oldest.TargetRole))
-	wakeKind, ok := wakeOutboxKindForSource(oldest.SourceKind)
+	wakeKind, ok := wakeOutboxKindForSource(oldest.SourceKind, oldest.CoalesceKey)
 	if !ok {
 		return events.Event{}, fmt.Errorf(
 			"wake outbox row %d has unsupported source kind %q",
@@ -219,6 +231,21 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 	var event events.Event
 	switch oldest.SourceKind {
 	case db.WakeOutboxSourceWorkflowNote, db.WakeOutboxSourceChatMessage:
+		if wakeKind == db.WakeOutboxKindDirective {
+			detail := fmt.Sprintf("directive id %s for %s", oldest.SourceID, role)
+			event = events.NewEvent(
+				events.EventOrgDirective,
+				"org-directive:"+role,
+				oldest.SourceKind+":"+oldest.SourceID,
+				"",
+				db.WakeOutboxStateAttempted,
+				detail,
+				now,
+				workflow.RedactCommentText,
+			)
+			event.Cause = "addressed_directive"
+			break
+		}
 		detail := fmt.Sprintf("%d new items, oldest id %s", len(batch), oldest.SourceID)
 		event = events.NewEvent(
 			events.EventOrgReply,

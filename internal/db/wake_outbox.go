@@ -29,13 +29,15 @@ const (
 	WakeOutboxKindReply      = "reply"
 	WakeOutboxKindBlocked    = "blocked"
 	WakeOutboxKindEscalation = "escalation"
+	WakeOutboxKindDirective  = "directive"
 
 	WakeOutboxSourceWorkflowNote = "workflow_note"
 	WakeOutboxSourceChatMessage  = "chat_message"
 	WakeOutboxSourceBlocked      = WakeOutboxKindBlocked
 	WakeOutboxSourceEscalation   = WakeOutboxKindEscalation
 
-	WakeOutboxReplyCoalescePrefix = WakeOutboxKindReply + ":"
+	WakeOutboxReplyCoalescePrefix     = WakeOutboxKindReply + ":"
+	WakeOutboxDirectiveCoalescePrefix = WakeOutboxKindDirective + ":"
 )
 
 type wakeOutboxStateInterpretation uint8
@@ -106,10 +108,10 @@ func (p WakeOutboxObligationProjection) Len() int {
 	return len(p.Pending) + len(p.AgedAttempted)
 }
 
-func insertWorkflowNoteWakeOutboxTx(ctx context.Context, tx *sql.Tx, noteID int64, targetRole string) error {
+func insertWorkflowNoteWakeOutboxTx(ctx context.Context, tx *sql.Tx, noteID int64, targetRole, wakeKind string) error {
 	if err := insertWakeOutboxTx(
 		ctx, tx, WakeOutboxSourceWorkflowNote, strconv.FormatInt(noteID, 10),
-		WakeOutboxKindReply, targetRole,
+		wakeKind, targetRole,
 	); err != nil {
 		return fmt.Errorf("insert workflow note wake outbox: %w", err)
 	}
@@ -199,7 +201,7 @@ VALUES (?, ?, ?, ?)`,
 func wakeOutboxCoalesceKey(wakeKind, role string) (string, error) {
 	kind := strings.ToLower(strings.TrimSpace(wakeKind))
 	switch kind {
-	case WakeOutboxKindReply, WakeOutboxKindBlocked, WakeOutboxKindEscalation:
+	case WakeOutboxKindReply, WakeOutboxKindBlocked, WakeOutboxKindEscalation, WakeOutboxKindDirective:
 	default:
 		return "", fmt.Errorf("unsupported wake outbox kind %q", wakeKind)
 	}
