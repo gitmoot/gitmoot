@@ -1874,4 +1874,13 @@ CREATE INDEX idx_workflow_notes_directive_oldest
 	ON workflow_notes(created_at, id)
 	WHERE substr(body, 1, length('[org:directive ')) = '[org:directive ';
 	`,
+	// #1250 org attribution. The branch lock is the ONE durable carrier of the
+	// acting org role, read by BOTH PR-open triggers (in-process advance and the
+	// daemon PR-watcher) so they cannot drift — the same role branch_locks already
+	// plays for skip_native_review_fanout. Legacy rows backfill to '' , which IS
+	// the unattributed polarity: readers degrade to today's behaviour rather than
+	// failing, so a pre-migration lock never crashes or invents an attribution.
+	`
+ALTER TABLE branch_locks ADD COLUMN acting_org_role TEXT NOT NULL DEFAULT '';
+	`,
 }

@@ -926,6 +926,11 @@ func (d Daemon) handlePullRequestWorkflow(ctx context.Context, pull github.PullR
 		// skip flag onto the branch lock; honor it so the PR-watcher path skips
 		// the native review fanout too.
 		SkipReviewFanout: lock.SkipNativeReviewFanout,
+		// #1250 reader 2 of 2: the SAME lock row already fetched above also carries
+		// the acting org role, so this trigger and the in-process one attribute
+		// fanout children identically with zero extra queries. Empty is the legacy
+		// and undirected value; the fanout then behaves exactly as it does today.
+		ActingOrgRole: lock.ActingOrgRole,
 	})
 }
 

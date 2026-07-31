@@ -132,8 +132,14 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 	for _, reviewer := range reviewers {
 		request := JobRequest{
 			PolicyExempt: "exempt",
-			Agent:        reviewer,
-			Action:       "review",
+			// #1250: fanout children were enqueued with NO attribution — measured at
+			// 0 of 99 workflow-* jobs. An unattributed job's blocked event has no
+			// owner to wake (#1347), so a whole class of jobs could never route one.
+			// The role rides the event from the branch lock, one source for both
+			// triggers.
+			ActingOrgRole: event.ActingOrgRole,
+			Agent:         reviewer,
+			Action:        "review",
 			Repo:         event.Repo,
 			Branch:       event.Branch,
 			PullRequest:  event.PullRequest,

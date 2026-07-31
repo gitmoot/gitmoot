@@ -2947,3 +2947,76 @@ func hasDaemonJobEvent(events []db.JobEvent, kind string) bool {
 	}
 	return false
 }
+
+// #1250, READER 2 of 2: the daemon PR-watcher. It takes the acting org role from
+// the SAME branch lock row it already fetches for the skip flag — one durable
+// writer, two readers — so this trigger and the in-process advance attribute
+// native fanout children identically and cannot drift.
+//
+// Fanout children were previously enqueued with NO attribution (0 of 99 on the
+// live store), and attribution is the wake target role: an unattributed job's
+// blocked event has no owner to wake (#1347).
+func TestHandlePullRequestWorkflowAttributesFanoutChildrenFromBranchLock(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name: "lead", Role: "lead", Runtime: "codex", RuntimeRef: "last",
+		RepoScope: repo.FullName(), Capabilities: []string{"implement"},
+		AutonomyPolicy: "workspace-write", HealthStatus: "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent lead returned error: %v", err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name: "audit", Role: "reviewer", Runtime: "codex", RuntimeRef: "last",
+		RepoScope: repo.FullName(), Capabilities: []string{"review"},
+		AutonomyPolicy: "auto", HealthStatus: "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent audit returned error: %v", err)
+	}
+	// The branch was taken by an attributed dispatch; the lock carries the role.
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName:  repo.FullName(),
+		Branch:        "task-7",
+		Owner:         "lead",
+		ActingOrgRole: "gmc-fanout",
+	}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-007", GoalID: "goal-1", Title: "Task 7", State: string(workflow.TaskPlanned), Branch: "task-7"}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	client := &fakeGitHub{pulls: []github.PullRequest{}, comments: map[int64][]github.IssueComment{7: {}}}
+	engine := workflow.Engine{
+		Store: store,
+		JobID: func(request workflow.JobRequest) string {
+			parts := []string{request.Action, request.Agent, request.TaskID}
+			if request.ReviewRound != "" {
+				parts = append(parts, request.ReviewRound)
+			}
+			return strings.Join(parts, "-")
+		},
+	}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+
+	pull := github.PullRequest{
+		Number: 7, Title: "Task 7", State: "open",
+		URL:     "https://github.com/gitmoot/gitmoot/pull/7",
+		HeadRef: "task-7", BaseRef: "main", HeadSHA: "abc123",
+	}
+	if err := daemon.handlePullRequestWorkflow(ctx, pull, nil); err != nil {
+		t.Fatalf("handlePullRequestWorkflow returned error: %v", err)
+	}
+
+	job, err := store.GetJob(ctx, "review-audit-task-007-review-1")
+	if err != nil {
+		t.Fatalf("expected review job to be enqueued: %v", err)
+	}
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload returned error: %v", err)
+	}
+	if payload.ActingOrgRole != "gmc-fanout" {
+		t.Fatalf("daemon-trigger fanout child acting_org_role = %q, want %q; an unattributed fanout child has no owner to wake (#1347)", payload.ActingOrgRole, "gmc-fanout")
+	}
+}

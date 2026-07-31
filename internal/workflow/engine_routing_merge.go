@@ -403,7 +403,7 @@ func (e Engine) ensureAgentAllowedWithBranchOwner(ctx context.Context, request J
 			return e.block(ctx, ref, err.Error())
 		}
 		if request.Action == "implement" {
-			return e.ensureBranchLock(ctx, request.Repo, request.Branch, branchOwner, ref)
+			return e.ensureBranchLock(ctx, request.Repo, request.Branch, branchOwner, request.ActingOrgRole, ref)
 		}
 		return nil
 	}
@@ -441,18 +441,22 @@ func (e Engine) ensureAgentAllowedWithBranchOwner(ctx context.Context, request J
 		if err := runtime.ImplementWritePolicyError([]string{request.Action}, agent.AutonomyPolicy); err != nil {
 			return e.block(ctx, ref, err.Error())
 		}
-		if err := e.ensureBranchLock(ctx, request.Repo, request.Branch, branchOwner, ref); err != nil {
+		if err := e.ensureBranchLock(ctx, request.Repo, request.Branch, branchOwner, request.ActingOrgRole, ref); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (e Engine) ensureBranchLock(ctx context.Context, repo string, branch string, owner string, ref taskRef) error {
+// ensureBranchLock also STAMPS the acting org role onto the lock at creation
+// (#1250). This is the single writer of that attribution: it is captured when the
+// branch is taken and never rewritten, so both PR-open triggers read one value
+// and cannot drift. An empty role is legitimate and means unattributed.
+func (e Engine) ensureBranchLock(ctx context.Context, repo string, branch string, owner string, actingOrgRole string, ref taskRef) error {
 	if strings.TrimSpace(branch) == "" {
 		return e.block(ctx, ref, "branch lock rejected action: branch is required")
 	}
-	acquired, err := e.Store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo, Branch: branch, Owner: owner})
+	acquired, err := e.Store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo, Branch: branch, Owner: owner, ActingOrgRole: NormalizeActingOrgRole(actingOrgRole)})
 	if err != nil {
 		return err
 	}

@@ -670,7 +670,7 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 				Kind:    "delegation_worktree_skipped",
 				Message: fmt.Sprintf("delegation %q implement runs in the shared checkout on branch %s: per-delegation worktree isolation unavailable", request.DelegationID, request.Branch),
 			})
-			if err := e.ensureBranchLock(ctx, request.Repo, request.Branch, request.Agent, ref); err != nil {
+			if err := e.ensureBranchLock(ctx, request.Repo, request.Branch, request.Agent, request.ActingOrgRole, ref); err != nil {
 				return err
 			}
 		} else {
