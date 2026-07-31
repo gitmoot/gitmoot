@@ -574,7 +574,13 @@ gitmoot dashboard --web [--addr 127.0.0.1:8080]
 orchestration/delegation graph with run summaries and prompt/output inspection)
 until interrupted; `--addr` sets the listen address (default
 `127.0.0.1:8080`). Use it when the user wants a browser view of a running
-orchestration.
+orchestration. The Overview and Org pages also show the fleet activity strip:
+live Herdr sessions are counted separately from engine jobs and unresolved
+escalations. Org tree nodes retain the hierarchy while adding session status,
+terminal task title, turn age, and last-completed-turn detail. No session,
+Herdr unavailable, and an empty filter are distinct labeled states. One shared
+server-side poller feeds all viewers through `/api/fleet/activity/events`; the
+surface remains read-only and exposes no transcript content.
 
 In the one-shot styled output the dashboard leads with a "needs attention" block,
 colors and truncates long lists, and groups near-identical runtime sessions;
