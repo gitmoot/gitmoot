@@ -6,6 +6,7 @@ const (
 	OrgDirectivePrefix       = "[org:directive "
 	OrgDirectiveAckPrefix    = "[org:directive-ack "
 	OrgDirectiveCancelPrefix = "[org:directive-cancel "
+	OrgDirectiveDonePrefix   = "[org:directive-done "
 )
 
 func FormatOrgDirectiveNote(from, to, wf, directive string) string {
@@ -36,6 +37,14 @@ func FormatOrgDirectiveCancelNote(directiveID int64, by string) string {
 
 func ParseOrgDirectiveCancelNote(body string) (directiveID int64, by string, ok bool) {
 	return parseOrgDirectiveReceipt("directive-cancel", body)
+}
+
+func FormatOrgDirectiveDoneNote(directiveID int64, by string) string {
+	return formatOrgDirectiveReceipt("directive-done", directiveID, by)
+}
+
+func ParseOrgDirectiveDoneNote(body string) (directiveID int64, by string, ok bool) {
+	return parseOrgDirectiveReceipt("directive-done", body)
 }
 
 func formatOrgDirectiveReceipt(kind string, directiveID int64, by string) string {

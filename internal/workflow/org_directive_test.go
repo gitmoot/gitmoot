@@ -15,6 +15,7 @@ func TestOrgDirectiveNoteSchemas(t *testing.T) {
 	}{
 		{"ack", FormatOrgDirectiveAckNote(42, "worker"), ParseOrgDirectiveAckNote},
 		{"cancel", FormatOrgDirectiveCancelNote(42, "owner"), ParseOrgDirectiveCancelNote},
+		{"done", FormatOrgDirectiveDoneNote(42, "worker"), ParseOrgDirectiveDoneNote},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

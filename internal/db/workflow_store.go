@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -72,9 +73,25 @@ type WorkflowNote struct {
 	AddressedTarget string `json:"-"`
 	// AddressedWakeKind selects the durable addressed-note route. Empty keeps
 	// the established reply route for every existing caller.
-	AddressedWakeKind   string `json:"-"`
-	MemoryObservationID int64  `json:"memory_observation_id,omitempty"`
-	CreatedAt           string `json:"created_at"`
+	AddressedWakeKind string `json:"-"`
+	// DirectiveDoneTTLSeconds is evaluator-only metadata. When Set is false the
+	// row stores -1 and inherits [org].directive_done_ttl; zero explicitly turns
+	// completion nudges off for this directive.
+	DirectiveDoneTTLSeconds int64  `json:"-"`
+	DirectiveDoneTTLSet     bool   `json:"-"`
+	MemoryObservationID     int64  `json:"memory_observation_id,omitempty"`
+	CreatedAt               string `json:"created_at"`
+}
+
+// OrgDirectiveObligation is the evaluator projection for one open directive.
+// AckedAt is empty until a typed ack receipt exists. Cancelled and completed
+// directives are excluded by the query.
+type OrgDirectiveObligation struct {
+	WorkflowNote
+	AckedAt                string
+	NudgeCount             int
+	LastNudgedAt           string
+	DoneTTLOverrideSeconds int64
 }
 
 // WorkflowMeta is the latest external-coordinator handoff identity recorded for
@@ -419,9 +436,16 @@ func workflowMetaStatusTx(ctx context.Context, tx *sql.Tx, workflowID string) (s
 }
 
 func insertWorkflowNoteTx(ctx context.Context, tx *sql.Tx, note WorkflowNote) (int64, error) {
+	doneTTLSeconds := int64(-1)
+	if note.DirectiveDoneTTLSet {
+		if note.DirectiveDoneTTLSeconds < 0 {
+			return 0, fmt.Errorf("directive done TTL seconds must not be negative")
+		}
+		doneTTLSeconds = note.DirectiveDoneTTLSeconds
+	}
 	res, err := tx.ExecContext(ctx, `
-INSERT INTO workflow_notes(workflow_id, author, body, repo, memory_observation_id)
-VALUES (?, ?, ?, ?, ?)`, note.WorkflowID, note.Author, note.Body, note.Repo, note.MemoryObservationID)
+INSERT INTO workflow_notes(workflow_id, author, body, repo, memory_observation_id, directive_done_ttl_seconds)
+VALUES (?, ?, ?, ?, ?, ?)`, note.WorkflowID, note.Author, note.Body, note.Repo, note.MemoryObservationID, doneTTLSeconds)
 	if err != nil {
 		return 0, fmt.Errorf("insert workflow note: %w", err)
 	}
@@ -809,6 +833,78 @@ ORDER BY d.created_at ASC, d.id ASC`, targetRole, targetRole, targetRole)
 		notes = append(notes, note)
 	}
 	return notes, rows.Err()
+}
+
+// ListOpenOrgDirectiveObligations returns open directives oldest-first. The
+// bounded ASC window is deliberate: a DESC+LIMIT query would discard exactly
+// the oldest, most overdue obligations.
+func (s *Store) ListOpenOrgDirectiveObligations(ctx context.Context, limit int) ([]OrgDirectiveObligation, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 200
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT d.id, d.workflow_id, d.author, d.body, d.repo, d.memory_observation_id, d.created_at,
+	d.directive_nudge_count, d.directive_last_nudged_at, d.directive_done_ttl_seconds,
+	COALESCE((
+		SELECT MIN(a.created_at) FROM workflow_notes a
+		WHERE a.workflow_id = d.workflow_id
+			AND substr(a.body, 1, length('[org:directive-ack id=' || d.id || ' ')) = '[org:directive-ack id=' || d.id || ' '
+	), '')
+FROM workflow_notes d INDEXED BY idx_workflow_notes_directive_oldest
+WHERE substr(d.body, 1, length('[org:directive ')) = '[org:directive '
+	AND NOT EXISTS (
+		SELECT 1 FROM workflow_notes r
+		WHERE r.workflow_id = d.workflow_id AND (
+			substr(r.body, 1, length('[org:directive-cancel id=' || d.id || ' ')) = '[org:directive-cancel id=' || d.id || ' '
+			OR substr(r.body, 1, length('[org:directive-done id=' || d.id || ' ')) = '[org:directive-done id=' || d.id || ' '
+		)
+	)
+ORDER BY d.created_at ASC, d.id ASC
+LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	obligations := make([]OrgDirectiveObligation, 0)
+	for rows.Next() {
+		var item OrgDirectiveObligation
+		if err := rows.Scan(
+			&item.ID, &item.WorkflowID, &item.Author, &item.Body, &item.Repo,
+			&item.MemoryObservationID, &item.CreatedAt, &item.NudgeCount,
+			&item.LastNudgedAt, &item.DoneTTLOverrideSeconds, &item.AckedAt,
+		); err != nil {
+			return nil, err
+		}
+		obligations = append(obligations, item)
+	}
+	return obligations, rows.Err()
+}
+
+// MarkOrgDirectiveNudged atomically advances one persisted counter. The
+// expected values make a repeated or concurrent evaluator pass a no-op rather
+// than a duplicate wake.
+func (s *Store) MarkOrgDirectiveNudged(ctx context.Context, id int64, expectedCount int, expectedLastNudgedAt string, nudgedAt time.Time) (int, bool, error) {
+	stamp := nudgedAt.UTC().Format(time.RFC3339Nano)
+	result, err := s.db.ExecContext(ctx, `
+UPDATE workflow_notes
+SET directive_nudge_count = directive_nudge_count + 1,
+	directive_last_nudged_at = ?
+WHERE id = ?
+	AND directive_nudge_count = ?
+	AND directive_last_nudged_at = ?
+	AND substr(body, 1, length('[org:directive ')) = '[org:directive '`,
+		stamp, id, expectedCount, expectedLastNudgedAt)
+	if err != nil {
+		return expectedCount, false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return expectedCount, false, err
+	}
+	if affected == 0 {
+		return expectedCount, false, nil
+	}
+	return expectedCount + 1, true, nil
 }
 
 func (s *Store) ListWorkflowSummaries(ctx context.Context) ([]WorkflowSummary, error) {

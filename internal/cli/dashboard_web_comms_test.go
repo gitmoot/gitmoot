@@ -538,7 +538,7 @@ class ClassList {
   toggle(name){ if(this.values.has(name)){this.values.delete(name);return false;}this.values.add(name);return true; }
 }
 const elements = new Map(), threadButtons = [];
-let bodies = [], fetched = '';
+let bodies = [];
 class Element {
   constructor(id=''){
     this.id=id;this.value='';this.checked=id==='systems';this.dataset={};this.style={};
@@ -569,7 +569,7 @@ class Element {
   }
   get innerHTML(){return this._innerHTML;}
 }
-for(const id of ['search','from','to','resolution','date','systems','threads','messages','conversation-head','back','rail','conversation','open','all','theme']){
+for(const id of ['search','from','to','resolution','date','systems','threads','messages','conversation-head','back','rail','conversation','open','all','theme','dashboard-sidebar','mobile-menu','mobile-more','mobile-backdrop','daemon-state','daemon-label','daemon-status']){
   elements.set(id,new Element(id));
 }
 elements.get('all').classList.add('active');
@@ -579,7 +579,7 @@ global.document={
   getElementById:id=>elements.get(id)||null,
   querySelectorAll:selector=>selector==='[data-thread]'?threadButtons:selector==='.body'?bodies:[],
 };
-const saved=new Map();
+const saved=new Map(), fetched=[];
 global.localStorage={getItem:key=>saved.get(key)||null,setItem:(key,value)=>saved.set(key,value)};
 global.matchMedia=()=>({matches:false});
 global.location={
@@ -590,14 +590,16 @@ global.history={replaceState(){}};
 global.requestAnimationFrame=fn=>fn();
 global.setTimeout=fn=>{fn();return 0;};
 global.fetch=(url, options)=>{
-  fetched=String(url);
+  fetched.push(String(url));
   if(!options||options.cache!=='no-store')fail('fetch must disable caching');
+  if(String(url)==='/api/health')return Promise.resolve({ok:true,json:()=>Promise.resolve({daemon:{running:true}})});
   return Promise.resolve({ok:true,json:()=>Promise.resolve({threads:input.threads})});
 };
 vm.runInThisContext(input.script,{filename:'dashboard-comms-inline.js'});
 setImmediate(()=>{
   try{
-    if(fetched!=='/api/comms?note=42')fail('deep-link note was not passed to API: '+fetched);
+    if(!fetched.includes('/api/comms?note=42'))fail('deep-link note was not passed to API: '+fetched);
+    if(!fetched.includes('/api/health'))fail('daemon health was not loaded: '+fetched);
     const target=elements.get('note-42');
     if(!target||target.scrolled!==1)fail('deep-linked note was not scrolled into view');
 
@@ -623,6 +625,15 @@ setImmediate(()=>{
     elements.get('theme').onclick();
     if(documentElement.dataset.theme!=='light'||saved.get('gitmoot-comms-theme')!=='light'){
       fail('theme switch did not execute');
+    }
+
+    elements.get('mobile-menu').onclick();
+    if(!elements.get('dashboard-sidebar').classList.contains('mobile-open')||!elements.get('mobile-backdrop').classList.contains('mobile-open')){
+      fail('mobile dashboard navigation did not open');
+    }
+    elements.get('mobile-backdrop').onclick();
+    if(elements.get('dashboard-sidebar').classList.contains('mobile-open')||elements.get('mobile-backdrop').classList.contains('mobile-open')){
+      fail('mobile dashboard navigation did not close');
     }
     process.stdout.write('ok\n');
   }catch(error){console.error(error.stack||error);process.exitCode=1;}
