@@ -1956,6 +1956,37 @@ func TestPolicyMergeGateUsesLatestReviewJobPerReviewer(t *testing.T) {
 	}
 }
 
+func TestPolicyMergeGateLatestCrashOverridesStaleApproval(t *testing.T) {
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-z-stale-approved", agent: "reviewer-a",
+		hasResult: true, decision: "approved", recorded: "2026-07-31 12:00:00",
+	})
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-a-latest-failed", agent: "reviewer-a",
+		state: JobFailed, recorded: "2026-07-31 12:01:00",
+	})
+
+	decision, err := gate.Evaluate(context.Background(), request)
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+		t.Fatalf("decision = %+v, want latest crashed reviewer parked", decision)
+	}
+	if !strings.Contains(decision.Reason, "crashed reviewer reviewer-a") ||
+		!strings.Contains(decision.Reason, "review-a-latest-failed") {
+		t.Fatalf("decision reason = %q, want latest crashed reviewer and job", decision.Reason)
+	}
+	if strings.Contains(decision.Reason, "review-z-stale-approved") {
+		t.Fatalf("decision reason = %q, stale approval must not govern reviewer slot", decision.Reason)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge calls = %+v, want none", gh.merges)
+	}
+}
+
 func TestPolicyMergeGateRequeueClearsCrashedReviewerPark(t *testing.T) {
 	store, gh, gate, request := newMergeGateQuorumScenario(t)
 	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
