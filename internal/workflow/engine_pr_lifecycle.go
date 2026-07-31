@@ -37,6 +37,41 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 	if event.SkipReviewFanout {
 		return e.recordPullRequestBaseline(ctx, event)
 	}
+	// #1236: filter the roster down to agents that may actually review THIS head.
+	// Only runs when a roster was configured, so the unconfigured-repo arm below
+	// is reached exactly as before.
+	//
+	// The empty-roster arm below means "this repo has no native review
+	// discipline" and runs the MERGE GATE. A filtered roster must therefore never
+	// be allowed to collapse into it: a PR whose every configured reviewer turns
+	// out ineligible has to fail CLOSED — no reviews, and above all no merge gate
+	// — rather than inheriting unconfigured-repo behaviour and becoming eligible
+	// to merge with no review at all. That is why this returns rather than
+	// falling through.
+	if len(reviewers) > 0 {
+		eligible, dropped := e.eligibleReviewers(ctx, event.Repo, event.LeadAgent, reviewers)
+		if len(dropped) > 0 {
+			// Provenance: the fanout decision was previously silent, so the only way
+			// to notice a bad roster was to query the job table for workflow-* rows
+			// nobody dispatched (#1277, #1260).
+			_ = e.Store.AddTaskEvent(ctx, db.TaskEvent{
+				TaskID: event.TaskID,
+				Kind:   "review_fanout_roster_filtered",
+				Reason: fmt.Sprintf("pull request #%d at %s: enlisting [%s]; dropped %s",
+					event.PullRequest, event.HeadSHA, strings.Join(eligible, " "), strings.Join(dropped, "; ")),
+			})
+		}
+		if len(eligible) == 0 {
+			_ = e.Store.AddTaskEvent(ctx, db.TaskEvent{
+				TaskID: event.TaskID,
+				Kind:   "review_fanout_no_eligible_reviewer",
+				Reason: fmt.Sprintf("pull request #%d at %s: every configured reviewer was ineligible (%s); no review dispatched and the native merge gate was NOT run",
+					event.PullRequest, event.HeadSHA, strings.Join(dropped, "; ")),
+			})
+			return e.recordPullRequestBaseline(ctx, event)
+		}
+		reviewers = eligible
+	}
 	if len(reviewers) == 0 {
 		decision, err := e.runMergeGate(ctx, "", JobPayload{
 			Repo:        event.Repo,
@@ -527,6 +562,61 @@ func (e Engine) mergeGateReviewRequired(ctx context.Context, payload JobPayload)
 		}
 	}
 	return false, nil
+}
+
+// eligibleReviewers filters a configured reviewer roster down to the agents that
+// may actually review THIS head, and explains every drop so the fanout decision
+// stops being silent (#1236, #1277).
+//
+// Two filters, neither of which the fanout previously had:
+//
+//   - THE IMPLEMENTER IS NEVER A REVIEWER OF ITS OWN HEAD. event.LeadAgent
+//     identifies the implementer on both triggers — the implementing job's agent
+//     on the in-process path, the branch-lock owner on the daemon PR-watcher path
+//     — so one exclusion covers both. Reviewer identity distinct from implementer
+//     is already fleet doctrine; it belongs in the engine and not only in briefs,
+//     because the merge gate ignores verdict authorship (#1114) and a
+//     self-approval produced this way is indistinguishable from a real one.
+//   - THE ROSTER IS REPO-AWARE. The default roster is global config applied to
+//     every repo, so a seat scoped elsewhere was enlisted anyway — on dashboard
+//     PR #137 that was ["lead"], scoped to gitmoot/gitmoot. That fanout could not
+//     have produced a verdict, and worse, the off-scope reviewer BLOCKED the task
+//     at the dispatch preflight instead of being quietly skipped.
+//
+// It filters ONLY those two cases. Every other roster problem — an unsubscribed
+// name, a missing `review` capability — is left in the roster deliberately, so
+// the existing dispatch preflight still BLOCKS it exactly as before. That
+// distinction is the point: a name that resolves to nothing is a MISCONFIGURED
+// ROSTER and a human has to fix it, and silently dropping it would hide a typo
+// while quietly reducing review coverage. A reviewer that exists but is wrong
+// FOR THIS HEAD is not a misconfiguration — it is a correct global roster meeting
+// a specific PR — and that is what gets filtered.
+//
+// Note an unknown agent is indistinguishable from an off-scope one at
+// AgentCanAccessRepo (both return false, nil), so existence is checked first and
+// unknown names are KEPT for the preflight to reject.
+func (e Engine) eligibleReviewers(ctx context.Context, repo string, implementer string, reviewers []string) ([]string, []string) {
+	implementer = strings.TrimSpace(implementer)
+	eligible := make([]string, 0, len(reviewers))
+	dropped := make([]string, 0, len(reviewers))
+	for _, name := range reviewers {
+		if implementer != "" && name == implementer {
+			dropped = append(dropped, fmt.Sprintf("%s (implemented this head)", name))
+			continue
+		}
+		if _, err := e.Store.GetAgent(ctx, name); err != nil {
+			// Unknown or unreadable: keep it so the preflight blocks the task.
+			eligible = append(eligible, name)
+			continue
+		}
+		allowed, err := e.Store.AgentCanAccessRepo(ctx, name, repo)
+		if err == nil && !allowed {
+			dropped = append(dropped, fmt.Sprintf("%s (not scoped to %s)", name, repo))
+			continue
+		}
+		eligible = append(eligible, name)
+	}
+	return eligible, dropped
 }
 
 func (e Engine) recordPullRequestBaseline(ctx context.Context, event PullRequestEvent) error {
