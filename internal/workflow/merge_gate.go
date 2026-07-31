@@ -213,15 +213,6 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	if pr.Mergeable != nil && !*pr.Mergeable {
 		return g.block(ctx, request, headSHA, "pull request is not mergeable; rebase or update the branch", MergeBlockTransient)
 	}
-	if _, err := g.GitHub.CreateCommitStatus(ctx, github.CommitStatusInput{
-		Repo:        repo,
-		SHA:         headSHA,
-		State:       "success",
-		Context:     gitmootMergeGateContext,
-		Description: "Gitmoot merge gate passed",
-	}); err != nil {
-		return MergeDecision{}, err
-	}
 	result, err := executePullRequestMerge(ctx, g.GitHub, github.MergePullRequestInput{
 		Repo:            repo,
 		Number:          int64(request.PullRequest),
@@ -241,6 +232,15 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 		}
 		return g.pending(ctx, request, headSHA, reason)
 	}
+	// The merge is already durable. This status is observability and cannot
+	// retroactively turn a completed merge into an error.
+	_, _ = g.GitHub.CreateCommitStatus(ctx, github.CommitStatusInput{
+		Repo:        repo,
+		SHA:         headSHA,
+		State:       "success",
+		Context:     gitmootMergeGateContext,
+		Description: "Gitmoot merge gate passed",
+	})
 	return g.finishMerged(ctx, request, pr, strings.TrimSpace(result.SHA))
 }
 
