@@ -90,6 +90,7 @@ func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	mux.HandleFunc("GET /api/learning/knowledge", ds.handleLearningKnowledge)
 	mux.HandleFunc("GET /api/brain/events", ds.handleBrainEvents)
 	mux.HandleFunc("GET /api/brain/fact", ds.handleBrainFact)
+	registerDashboardCommsRoutes(mux, ds)
 	mux.HandleFunc("GET /api/fleet/activity", ds.handleFleetActivity)
 	mux.HandleFunc("GET /api/fleet/activity/events", ds.handleFleetActivityEvents)
 	mux.HandleFunc("GET /assets/gitmoot-fleet-activity.css", handleFleetActivityCSS)

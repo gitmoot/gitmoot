@@ -6830,8 +6830,9 @@ gitmoot dashboard serving read-only at http://127.0.0.1:8080 (Ctrl-C to stop)
 
 ## Routes
 
-The UI is a single-page app with client-side routing (the browser URL updates as
-you navigate, so every view is linkable and reloadable):
+The main UI is a single-page app with client-side routing (the browser URL
+updates as you navigate, so every view is linkable and reloadable). Comms is a
+self-contained read-only page served at its own route:
 
 | Route | View |
 | --- | --- |
@@ -6845,12 +6846,13 @@ you navigate, so every view is linkable and reloadable):
 | `/charts` | Charts — activity time series |
 | `/health` | Health — daemon status, totals, stuck jobs, locks, failures |
 | `/attention` | Needs a human — blocked gates, pending approvals, candidates |
+| `/comms` (or `/comms?note=<id>`) | Comms — org escalation conversations and engine markers |
 
 Unknown paths normalize back to `/`. Each view is backed by a small read-only
 JSON API (`/api/runs`, `/api/jobs`, `/api/agents`, `/api/agent/{name}`,
 `/api/charts`, `/api/health`, `/api/attention`, `/api/job/{id}/checks`,
-`/api/run/{id}/verdicts`, `/api/state`, `/api/job/{id}`, `/api/graph`) plus a
-Server-Sent Events stream at `/events`.
+`/api/run/{id}/verdicts`, `/api/state`, `/api/job/{id}`, `/api/graph`,
+`/api/comms`) plus a Server-Sent Events stream at `/events`.
 
 See [Dashboard Views](./views.md) for what each view shows.
 
@@ -6861,6 +6863,10 @@ The dashboard stays live without a manual reload:
 - **Graph** — the runs column reloads every **15s**; the selected run's graph
   streams over **SSE** (`/events?run=<id>`), so nodes change state as the
   orchestra runs (running nodes pulse).
+- **Fleet activity** — Overview and Org share one server-side Herdr poller and
+  receive changed snapshots over **SSE** (`/api/fleet/activity/events`).
+  Session counts are independent from engine-job and escalation counts; a
+  healthy source with no sessions is labeled differently from a source outage.
 - **Galaxy, Jobs, Agents, Charts, Health** — each polls its data every **12s**
   while it is the active view (background views do not poll).
 - **Health** additionally re-renders its relative-time cells every second, so
@@ -6882,8 +6888,9 @@ unchanged.
 ## Security
 
 The dashboard serves **private data**: job prompts, agent outputs, template
-bodies, repo names and lock owners are all visible to anyone who can reach the
-port. There is **no authentication** built in.
+bodies, repo names, lock owners, and org-note bodies shown in Comms are all
+visible to anyone who can reach the port. There is **no authentication** built
+in.
 
 By default `--web` binds to `127.0.0.1:8080`, reachable only from the local
 machine — keep it that way for normal use. If you must expose it beyond
@@ -6898,7 +6905,7 @@ proxy or a private tunnel). The dashboard trusts every request it receives.
 
 # Dashboard Views
 
-The web dashboard has fourteen views, reachable from the left nav rail (or the mobile
+The web dashboard has fifteen views, reachable from the left nav rail (or the mobile
 bottom tab bar). Each is described below with its screenshot. See
 [Dashboard Overview](./overview.md) for launching, routes, refresh cadences, and
 security.
@@ -6911,6 +6918,11 @@ Overview is the operator-first landing page. It combines local Gitmoot state int
 five compact blocks without making GitHub requests or scanning job payloads on
 each refresh:
 
+- **Fleet activity strip** answers whether the host is busy even when session
+  work has no engine job: sessions working, live sessions, blocked/input-pending
+  sessions, running jobs, and unresolved escalations are counted separately.
+  It links each count to the relevant read-only view and labels Herdr-down and
+  healthy-with-no-sessions states rather than rendering either as zero silently.
 - **Needs you** collects stalled workflows, pull-request tasks awaiting merge,
   and blocked jobs. Stalled workflow cards include the coordinator pane,
   session id, and last journal note needed to resume in the right place.
@@ -6926,6 +6938,26 @@ each refresh:
 The page is read-only and polls every 12 seconds. Groom proposals appear only
 when Gitmoot has a cheap persisted proposal source; the server does not walk
 artifact directories during a dashboard request.
+
+## Org
+
+Route: `/org`
+
+Org preserves the role hierarchy as its primary tree canvas and decorates each
+fixed-height node with live Herdr session data: a shape-and-color status marker,
+the pane's stripped terminal title, and a tabular turn-age badge. Working,
+blocked, and input-pending states also use motion unless the browser requests
+reduced motion; edges inherit the child session state. Filtering dims unmatched
+nodes without replacing the tree, and a no-match filter explains why the canvas
+looks empty.
+
+Selecting a node opens the existing right-hand detail drawer while the tree
+remains visible. It shows the full task title, current turn and inferred age,
+last-completed turn and UTC time, agent/pane identity, role scope, and configured
+wake routes. Herdr currently lacks a current-turn start timestamp, so active-turn
+age is explicitly inferred from the preceding turn's completion. A role with no
+active agent session and an unavailable Herdr source are separate labeled
+states. Titles and statuses are shown, but transcript content is never exposed.
 
 ## Tasks
 
@@ -7263,6 +7295,22 @@ compact human-action status to post into a thread. Two read-only endpoints expos
 them for bridge consumers: `GET /api/job/{id}/checks` (a job's failed result checks
 + policy mode) and `GET /api/run/{id}/verdicts` (a SkillOpt run's per-question
 binary verdicts with pass/fail counts).
+
+## Comms
+
+Route: `/comms` (or `/comms?note=<id>` to open a specific note)
+
+Comms is the read-only operator inbox for typed org escalations and workflow
+engine markers. It projects one conversation thread per workflow, keeps every
+unresolved obligation discoverable, and floats workflows with open escalations
+above resolved traffic. Search, role, resolution, date, and engine-marker
+filters narrow the conversations without mutating their source notes.
+
+Org-note bodies are operator-visible on this page. A note deep link selects its
+workflow, includes the requested note even when it is older than the ordinary
+per-thread payload window, and scrolls to the matching escalation, reply,
+resolution footer, or system marker. Comms is strictly read-only: resolve an
+escalation from the CLI with `gitmoot org escalate resolve`.
 
 ## Config
 
@@ -9453,7 +9501,10 @@ status, `gitmoot daemon status` for daemon state, `gitmoot agent list` and
 or `gitmoot task list --repo owner/repo --json` for imported task state. Use
 `gitmoot job list --repo owner/repo` for jobs, and use
 `gitmoot dashboard --json` only when a structured full dashboard snapshot is
-needed. Do not use nonexistent commands such as `gitmoot status --json` or
+needed. The read-only web dashboard's Overview and Org pages distinguish live
+Herdr session activity from engine jobs and label a missing session differently
+from an unavailable Herdr source. Do not use nonexistent commands such as
+`gitmoot status --json` or
 `gitmoot task show`. Use `gitmoot org events rule add|list|set-scope|rm` to manage opt-in
 organization event wakes; add validates the event kind, target org role, and
 `addressed` (default) or `observer` scope. Use
@@ -10367,7 +10418,19 @@ gitmoot dashboard --web [--addr 127.0.0.1:8080]
 orchestration/delegation graph with run summaries and prompt/output inspection)
 until interrupted; `--addr` sets the listen address (default
 `127.0.0.1:8080`). Use it when the user wants a browser view of a running
-orchestration.
+orchestration. The Overview and Org pages also show the fleet activity strip:
+live Herdr sessions are counted separately from engine jobs and unresolved
+escalations. Org tree nodes retain the hierarchy while adding session status,
+terminal task title, turn age, and last-completed-turn detail. No session,
+Herdr unavailable, and an empty filter are distinct labeled states. One shared
+server-side poller feeds all viewers through `/api/fleet/activity/events`; the
+surface remains read-only and exposes no transcript content.
+
+The web dashboard's `/comms` route is a read-only operator inbox for typed org
+escalations and workflow engine markers. Org-note bodies are operator-visible
+on this page. Open escalations float above resolved traffic, and `?note=<id>`
+deep-links to the note's workflow conversation. The page never resolves an
+escalation itself; use `gitmoot org escalate resolve` from the CLI.
 
 In the one-shot styled output the dashboard leads with a "needs attention" block,
 colors and truncates long lists, and groups near-identical runtime sessions;

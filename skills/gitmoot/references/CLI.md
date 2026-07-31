@@ -582,6 +582,12 @@ Herdr unavailable, and an empty filter are distinct labeled states. One shared
 server-side poller feeds all viewers through `/api/fleet/activity/events`; the
 surface remains read-only and exposes no transcript content.
 
+The web dashboard's `/comms` route is a read-only operator inbox for typed org
+escalations and workflow engine markers. Org-note bodies are operator-visible
+on this page. Open escalations float above resolved traffic, and `?note=<id>`
+deep-links to the note's workflow conversation. The page never resolves an
+escalation itself; use `gitmoot org escalate resolve` from the CLI.
+
 In the one-shot styled output the dashboard leads with a "needs attention" block,
 colors and truncates long lists, and groups near-identical runtime sessions;
 `--all` shows everything. `--watch` redraws on an interval (default 5s) and cannot

@@ -1,6 +1,6 @@
 # Dashboard Views
 
-The web dashboard has fourteen views, reachable from the left nav rail (or the mobile
+The web dashboard has fifteen views, reachable from the left nav rail (or the mobile
 bottom tab bar). Each is described below with its screenshot. See
 [Dashboard Overview](./overview.md) for launching, routes, refresh cadences, and
 security.
@@ -390,6 +390,22 @@ compact human-action status to post into a thread. Two read-only endpoints expos
 them for bridge consumers: `GET /api/job/{id}/checks` (a job's failed result checks
 + policy mode) and `GET /api/run/{id}/verdicts` (a SkillOpt run's per-question
 binary verdicts with pass/fail counts).
+
+## Comms
+
+Route: `/comms` (or `/comms?note=<id>` to open a specific note)
+
+Comms is the read-only operator inbox for typed org escalations and workflow
+engine markers. It projects one conversation thread per workflow, keeps every
+unresolved obligation discoverable, and floats workflows with open escalations
+above resolved traffic. Search, role, resolution, date, and engine-marker
+filters narrow the conversations without mutating their source notes.
+
+Org-note bodies are operator-visible on this page. A note deep link selects its
+workflow, includes the requested note even when it is older than the ordinary
+per-thread payload window, and scrolls to the matching escalation, reply,
+resolution footer, or system marker. Comms is strictly read-only: resolve an
+escalation from the CLI with `gitmoot org escalate resolve`.
 
 ## Config
 
