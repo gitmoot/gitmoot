@@ -562,6 +562,10 @@ func TestRunJobRunUsesDaemonWorkerInternals(t *testing.T) {
 	home := t.TempDir()
 	store := openCLIJobStore(t, home)
 	defer store.Close()
+	paths := config.PathsForHome(home)
+	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+"\n[transcripts]\nenabled = false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	checkout := t.TempDir()
 	runGit(t, checkout, "init")
 	runGit(t, checkout, "branch", "-m", "main")
