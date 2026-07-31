@@ -2417,6 +2417,169 @@ func TestPolicyMergeGateWaitsForActiveDelegationChild(t *testing.T) {
 	}
 }
 
+func TestPolicyMergeGateBlocksParentApprovalWhenDelegationChildRequestsChanges(t *testing.T) {
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	const (
+		parentID = "review-parent-blocking-child"
+		childID  = parentID + "/delegation/objector"
+	)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: parentID, agent: "reviewer-a", hasResult: true, decision: "approved",
+		recorded: "2026-07-31 12:00:00",
+	})
+	insertMergeGateDelegationChild(t, store, parentID, "objector", JobSucceeded, &AgentResult{
+		Decision: "changes_requested",
+		Summary:  "delegated review found a blocker",
+	})
+
+	decision, err := gate.Evaluate(context.Background(), request)
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+		t.Fatalf("decision = %+v, want blocking delegation verdict to stop merge", decision)
+	}
+	if !strings.Contains(decision.Reason, "blocking delegation evidence") ||
+		!strings.Contains(decision.Reason, childID+" (changes_requested)") {
+		t.Fatalf("decision reason = %q, want blocking child %s", decision.Reason, childID)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge calls = %+v, want none", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateParksParentApprovalWhenDelegationChildImplemented(t *testing.T) {
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	const (
+		parentID = "review-parent-implemented-child"
+		childID  = parentID + "/delegation/implementer"
+	)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: parentID, agent: "reviewer-a", hasResult: true, decision: "approved",
+		recorded: "2026-07-31 12:00:00",
+	})
+	insertMergeGateDelegationChild(t, store, parentID, "implementer", JobSucceeded, &AgentResult{
+		Decision: "implemented",
+		Summary:  "implementation is not review evidence",
+	})
+
+	decision, err := gate.Evaluate(context.Background(), request)
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+		t.Fatalf("decision = %+v, want implemented delegation result parked as abstention", decision)
+	}
+	if !strings.Contains(decision.Reason, "abstaining delegation children") ||
+		!strings.Contains(decision.Reason, childID+" (implemented)") {
+		t.Fatalf("decision reason = %q, want abstaining child %s", decision.Reason, childID)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge calls = %+v, want none", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateAcceptedDelegationChildDoesNotEraseAdverseSibling(t *testing.T) {
+	tests := []struct {
+		name            string
+		adverseState    JobState
+		adverseResult   *AgentResult
+		wantReasonClass string
+		wantDetail      string
+	}{
+		{
+			name:            "blocking",
+			adverseState:    JobSucceeded,
+			adverseResult:   &AgentResult{Decision: "changes_requested", Summary: "blocker"},
+			wantReasonClass: "blocking delegation evidence",
+			wantDetail:      "(changes_requested)",
+		},
+		{
+			name:            "crashed",
+			adverseState:    JobFailed,
+			wantReasonClass: "crashed delegation children",
+			wantDetail:      "(failed)",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store, gh, gate, request := newMergeGateQuorumScenario(t)
+			parentID := "review-parent-mixed-" + tc.name
+			adverseID := parentID + "/delegation/adverse"
+			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+				id: parentID, agent: "reviewer-a", hasResult: true, decision: "approved",
+				recorded: "2026-07-31 12:00:00",
+			})
+			insertMergeGateDelegationChild(t, store, parentID, "approved", JobSucceeded, &AgentResult{
+				Decision: "approved",
+				Summary:  "one child approved",
+			})
+			insertMergeGateDelegationChild(t, store, parentID, "adverse", tc.adverseState, tc.adverseResult)
+
+			decision, err := gate.Evaluate(context.Background(), request)
+
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+				t.Fatalf("decision = %+v, want adverse sibling to outrank accepted child", decision)
+			}
+			if !strings.Contains(decision.Reason, tc.wantReasonClass) ||
+				!strings.Contains(decision.Reason, adverseID+" "+tc.wantDetail) {
+				t.Fatalf("decision reason = %q, want adverse child %s", decision.Reason, adverseID)
+			}
+			if len(gh.merges) != 0 {
+				t.Fatalf("merge calls = %+v, want none", gh.merges)
+			}
+		})
+	}
+}
+
+func TestPolicyMergeGateWinningDelegationOutcomeNamesSubordinateObligations(t *testing.T) {
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	const (
+		parentID       = "review-parent-mixed-naming"
+		blockingID     = parentID + "/delegation/blocking"
+		unrecognizedID = parentID + "/delegation/unrecognized"
+	)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: parentID, agent: "reviewer-a", hasResult: true, decision: "approved",
+		recorded: "2026-07-31 12:00:00",
+	})
+	insertMergeGateDelegationChild(t, store, parentID, "blocking", JobSucceeded, &AgentResult{
+		Decision: "blocked",
+		Summary:  "delegated review blocked",
+	})
+	insertMergeGateDelegationChild(t, store, parentID, "unrecognized", JobSucceeded, &AgentResult{
+		Decision: "future-review-outcome",
+		Summary:  "unknown review outcome",
+	})
+
+	decision, err := gate.Evaluate(context.Background(), request)
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+		t.Fatalf("decision = %+v, want blocking outcome to win mixed delegation set", decision)
+	}
+	for _, want := range []string{
+		"blocking delegation evidence",
+		blockingID + " (blocked)",
+		"unrecognized children:",
+		unrecognizedID + ` (unrecognized decision "future-review-outcome")`,
+	} {
+		if !strings.Contains(decision.Reason, want) {
+			t.Fatalf("decision reason = %q, want %q", decision.Reason, want)
+		}
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge calls = %+v, want none", gh.merges)
+	}
+}
+
 func TestPolicyMergeGateLeavesOrdinaryReviewWithoutDelegationsUnaffected(t *testing.T) {
 	store, gh, gate, request := newMergeGateQuorumScenario(t)
 	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{

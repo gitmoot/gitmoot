@@ -691,9 +691,12 @@ func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job) error {
 	if len(children) == 0 {
 		return nil
 	}
-	hasEvidence := false
+	hasApproval := false
+	var blocking []string
 	var active []string
-	var noEvidence []string
+	var crashed []string
+	var abstaining []string
+	var parked []string
 	var unrecognized []string
 	for _, child := range children {
 		childID := strings.TrimSpace(child.ID)
@@ -706,48 +709,105 @@ func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job) error {
 				unrecognized = append(unrecognized, fmt.Sprintf("%s (malformed result)", childID))
 				continue
 			}
-			decision := ""
-			if payload.Result != nil {
-				decision = strings.TrimSpace(payload.Result.Decision)
+			if payload.Result == nil {
+				unrecognized = append(unrecognized, fmt.Sprintf("%s (nil result)", childID))
+				continue
 			}
+			decision := strings.TrimSpace(payload.Result.Decision)
 			switch decision {
-			case "approved", "changes_requested", "blocked", "implemented", "failed":
-				hasEvidence = true
-			case "skipped":
-				noEvidence = append(noEvidence, fmt.Sprintf("%s (skipped)", childID))
+			case "approved":
+				hasApproval = true
+			case "changes_requested", "blocked", "failed":
+				blocking = append(blocking, fmt.Sprintf("%s (%s)", childID, decision))
+			case "skipped", "implemented":
+				abstaining = append(abstaining, fmt.Sprintf("%s (%s)", childID, decision))
 			default:
 				unrecognized = append(unrecognized, fmt.Sprintf("%s (unrecognized decision %q)", childID, decision))
 			}
-		case JobFailed, JobBlocked, JobCancelled:
-			noEvidence = append(noEvidence, fmt.Sprintf("%s (%s)", childID, child.State))
+		case JobFailed, JobCancelled:
+			crashed = append(crashed, fmt.Sprintf("%s (%s)", childID, child.State))
+		case JobBlocked:
+			parked = append(parked, fmt.Sprintf("%s (%s)", childID, child.State))
 		default:
 			unrecognized = append(unrecognized, fmt.Sprintf("%s (unrecognized state %q)", childID, child.State))
 		}
 	}
+	sort.Strings(blocking)
 	sort.Strings(active)
-	sort.Strings(noEvidence)
+	sort.Strings(crashed)
+	sort.Strings(abstaining)
+	sort.Strings(parked)
 	sort.Strings(unrecognized)
+	details := make([]string, 0, 6)
+	if len(blocking) > 0 {
+		details = append(details, "blocking children: "+strings.Join(blocking, ", "))
+	}
+	if len(unrecognized) > 0 {
+		details = append(details, "unrecognized children: "+strings.Join(unrecognized, ", "))
+	}
+	if len(active) > 0 {
+		details = append(details, "active children: "+strings.Join(active, ", "))
+	}
+	if len(crashed) > 0 {
+		details = append(details, "crashed children: "+strings.Join(crashed, ", "))
+	}
+	if len(abstaining) > 0 {
+		details = append(details, "abstaining children: "+strings.Join(abstaining, ", "))
+	}
+	if len(parked) > 0 {
+		details = append(details, "parked children: "+strings.Join(parked, ", "))
+	}
+	reasonDetails := strings.Join(details, "; ")
+	// The first matching class decides the outcome; reasonDetails retains every
+	// lower-priority obligation so a winning class cannot hide its siblings.
+	if len(blocking) > 0 {
+		return mergeBlocked{reason: fmt.Sprintf(
+			"delegated review parent %s has blocking delegation evidence (%s)",
+			parent.ID,
+			reasonDetails,
+		)}
+	}
 	if len(unrecognized) > 0 {
 		return fmt.Errorf(
-			"delegated review parent %s has unrecognized delegation evidence (children: %s); rerun or repair the delegated review",
+			"delegated review parent %s has unrecognized delegation evidence (%s); rerun or repair the delegated review",
 			parent.ID,
-			strings.Join(unrecognized, ", "),
+			reasonDetails,
 		)
-	}
-	if hasEvidence {
-		return nil
 	}
 	if len(active) > 0 {
 		return mergePending{reason: fmt.Sprintf(
-			"waiting for delegated review parent %s to produce surviving evidence (active children: %s)",
+			"waiting for delegated review parent %s to produce surviving evidence (%s)",
 			parent.ID,
-			strings.Join(active, ", "),
+			reasonDetails,
 		)}
 	}
+	if len(crashed) > 0 {
+		return fmt.Errorf(
+			"delegated review parent %s has crashed delegation children (%s); rerun or repair the delegated review",
+			parent.ID,
+			reasonDetails,
+		)
+	}
+	if len(abstaining) > 0 {
+		return fmt.Errorf(
+			"delegated review parent %s has no surviving delegation evidence: abstaining delegation children (%s); rerun or repair the delegated review",
+			parent.ID,
+			reasonDetails,
+		)
+	}
+	if len(parked) > 0 {
+		return fmt.Errorf(
+			"delegated review parent %s has no surviving delegation evidence (%s); rerun or repair the delegated review",
+			parent.ID,
+			reasonDetails,
+		)
+	}
+	if hasApproval {
+		return nil
+	}
 	return fmt.Errorf(
-		"delegated review parent %s has no surviving delegation evidence (children: %s); rerun or repair the delegated review",
+		"delegated review parent %s has no surviving delegation evidence; rerun or repair the delegated review",
 		parent.ID,
-		strings.Join(noEvidence, ", "),
 	)
 }
 
