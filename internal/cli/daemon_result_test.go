@@ -2,10 +2,122 @@ package cli
 
 import (
 	"context"
+	"io"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
+
+type deadlineBlockingAdapter struct{}
+
+func (deadlineBlockingAdapter) Deliver(ctx context.Context, _ runtime.Agent, _ runtime.Job) (runtime.Result, error) {
+	<-ctx.Done()
+	return runtime.Result{
+		SessionDiag: &runtime.SessionDiag{Stderr: "runner stderr deadline-tail"},
+	}, ctx.Err()
+}
+
+func TestRunDeadlinePersistsTopLevelTimeoutEvidence(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "job-timeout", Agent: "audit", Action: "ask", Repo: "owner/repo",
+		Branch: "main", JobTimeout: "2s",
+	})
+	job, err := store.GetJob(ctx, "job-timeout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return t.TempDir(), nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return deadlineBlockingAdapter{}, nil
+	}
+
+	if err := worker.run(ctx, job); err != nil {
+		t.Fatalf("worker.run returned error: %v", err)
+	}
+	stored, err := store.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != string(workflow.JobFailed) {
+		t.Fatalf("stored job state = %q, want failed", stored.State)
+	}
+	events, err := store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var timeoutMessage string
+	for _, event := range events {
+		if event.Kind == "job_timeout" {
+			timeoutMessage = event.Message
+		}
+	}
+	if timeoutMessage == "" {
+		t.Fatalf("stored events = %+v, want job_timeout", events)
+	}
+	for _, want := range []string{`"deadline":`, `"elapsed":`, "deadline-tail"} {
+		if !strings.Contains(timeoutMessage, want) {
+			t.Fatalf("stored job_timeout = %q, want %q", timeoutMessage, want)
+		}
+	}
+}
+
+func TestRecoverKillPendingJobFailsInsteadOfRequeueing(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	for _, id := range []string{"job-witnessed", "job-no-witness"} {
+		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: id, Agent: "audit", Action: "review", Repo: "owner/repo"})
+		if claimed, err := store.ClaimRunningJob(ctx, id, string(workflow.JobQueued), string(workflow.JobRunning), db.JobEvent{Kind: string(workflow.JobRunning)}, 1, "boot"); err != nil || !claimed {
+			t.Fatalf("ClaimRunningJob(%s) claimed=%v err=%v", id, claimed, err)
+		}
+	}
+	// A prior attempt's terminal event must not mask a later attempt's fresh kill
+	// witness; recovery is ordered relative to the newest job_kill_pending event.
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: "job-witnessed", Kind: "job_kill_pending", Message: "prior deadline"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: "job-witnessed", Kind: string(workflow.JobFailed), Message: "prior attempt"}); err != nil {
+		t.Fatal(err)
+	}
+	stop := armJobKillPending(store, "job-witnessed", time.Now().Add(time.Second))
+	defer stop()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if event, found, err := store.GetLatestJobEventByKind(ctx, "job-witnessed", "job_kill_pending"); err != nil {
+			t.Fatal(err)
+		} else if found && strings.Contains(event.Message, "deadline=") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("job_kill_pending was not journaled before the deadline")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := recoverKillPendingJobs(ctx, store, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	witnessed, _ := store.GetJob(ctx, "job-witnessed")
+	if witnessed.State != string(workflow.JobFailed) {
+		t.Fatalf("witnessed job state = %q, want failed", witnessed.State)
+	}
+	events, _ := store.ListJobEvents(ctx, witnessed.ID)
+	if !daemonWorkerHasEvent(events, string(workflow.JobFailed)) || !strings.Contains(events[len(events)-1].Message, "killed-by-deadline-unwitnessed") {
+		t.Fatalf("witnessed job events = %+v, want terminal unwitnessed-deadline reason", events)
+	}
+	noWitness, _ := store.GetJob(ctx, "job-no-witness")
+	if noWitness.State != string(workflow.JobRunning) {
+		t.Fatalf("job without kill witness state = %q, want running", noWitness.State)
+	}
+}
 
 func TestHandleRunJobErrorTimedOutDelegationChildTriggersRetry(t *testing.T) {
 	ctx := context.Background()

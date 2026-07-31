@@ -16,6 +16,52 @@ import (
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
+func TestTerminalWriteContextSurvivesRunCancellationAndHasGraceDeadline(t *testing.T) {
+	runCtx, stopRun := context.WithCancel(context.Background())
+	stopRun()
+
+	writeCtx, cancel := terminalWriteContext(runCtx)
+	defer cancel()
+	if err := writeCtx.Err(); err != nil {
+		t.Fatalf("terminal write context inherited run cancellation: %v", err)
+	}
+	deadline, ok := writeCtx.Deadline()
+	if !ok {
+		t.Fatal("terminal write context has no grace deadline")
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 || remaining > terminalWriteGrace {
+		t.Fatalf("terminal write grace remaining = %v, want >0 and <=%v", remaining, terminalWriteGrace)
+	}
+}
+
+func TestMailboxFailPersistsAfterRunContextDeadline(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{Store: store}
+	job, err := mailbox.Enqueue(ctx, JobRequest{
+		ID: "job-terminal-write", Agent: "audit", Action: "review", Repo: "gitmoot/gitmoot",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mailbox.claim(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancelRun := context.WithCancel(ctx)
+	cancelRun()
+	if err := mailbox.fail(runCtx, job.ID, "deadline exceeded"); err != nil {
+		t.Fatalf("mailbox.fail on expired run context: %v", err)
+	}
+	stored, err := store.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != string(JobFailed) {
+		t.Fatalf("stored job state = %q, want failed", stored.State)
+	}
+}
+
 func TestMailboxEnqueueCreatesQueuedJobAndEvent(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
