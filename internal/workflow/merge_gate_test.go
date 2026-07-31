@@ -125,6 +125,27 @@ func insertMergeGateDelegationChild(t *testing.T, store *db.Store, parentID, del
 	}
 }
 
+func insertMergeGateHeadlessIntegrationParent(t *testing.T, store *db.Store, parentID string) {
+	t.Helper()
+	insertCompletedJob(t, store, db.Job{
+		ID:           parentID,
+		Agent:        "reviewer-a",
+		Type:         "review",
+		DelegationID: "verify-parent",
+	}, JobPayload{
+		Repo:         "gitmoot/gitmoot",
+		PullRequest:  9,
+		TaskID:       "task-9",
+		ReviewRound:  "review-1",
+		DelegationID: "verify-parent",
+		WorktreePath: "/tmp/gitmoot/integration-verify-parent",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "integration review synthesized delegated evidence",
+		},
+	})
+}
+
 func TestPolicyMergeGateMergesPassingPullRequest(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -2149,6 +2170,106 @@ func TestPolicyMergeGateAcceptsHeadlessIntegrationParentWhenDelegationChildrenSu
 	}
 	if len(gh.merges) != 1 {
 		t.Fatalf("merge calls = %+v, want one", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateFallbackParksHeadlessIntegrationParentWhenDelegationChildrenFailed(t *testing.T) {
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	const parentID = "review-parent-fallback-failed"
+	insertMergeGateHeadlessIntegrationParent(t, store, parentID)
+	for _, delegationID := range []string{"correctness", "compile", "tests"} {
+		insertMergeGateDelegationChild(t, store, parentID, delegationID, JobFailed, nil)
+	}
+
+	decision, err := gate.Evaluate(context.Background(), request)
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+		t.Fatalf("decision = %+v, want fallback approval with failed children parked", decision)
+	}
+	if !strings.Contains(decision.Reason, "delegated review parent "+parentID) {
+		t.Fatalf("decision reason = %q, want fallback parent job id", decision.Reason)
+	}
+	for _, delegationID := range []string{"correctness", "compile", "tests"} {
+		childID := parentID + "/delegation/" + delegationID
+		if !strings.Contains(decision.Reason, childID) {
+			t.Fatalf("decision reason = %q, want failed child %s", decision.Reason, childID)
+		}
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge calls = %+v, want none", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateParksHeadlessIntegrationParentWhenChildrenSkipped(t *testing.T) {
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	const parentID = "review-parent-skipped"
+	insertMergeGateHeadlessIntegrationParent(t, store, parentID)
+	for _, delegationID := range []string{"correctness", "compile", "tests"} {
+		insertMergeGateDelegationChild(t, store, parentID, delegationID, JobSucceeded, &AgentResult{
+			Decision: "skipped",
+			Summary:  "abstained",
+		})
+	}
+
+	decision, err := gate.Evaluate(context.Background(), request)
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+		t.Fatalf("decision = %+v, want all-skipped delegation evidence parked", decision)
+	}
+	if !strings.Contains(decision.Reason, "delegated review parent "+parentID) ||
+		!strings.Contains(decision.Reason, "(skipped)") {
+		t.Fatalf("decision reason = %q, want skipped children identified as no evidence", decision.Reason)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge calls = %+v, want none", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateRejectsUnrecognizedDelegationEvidence(t *testing.T) {
+	tests := []struct {
+		name     string
+		state    JobState
+		decision string
+	}{
+		{name: "state", state: JobState("paused"), decision: "approved"},
+		{name: "decision", state: JobSucceeded, decision: "future-review-outcome"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store, gh, gate, request := newMergeGateQuorumScenario(t)
+			parentID := "review-parent-unrecognized-" + tc.name
+			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+				id: parentID, agent: "reviewer-a", hasResult: true, decision: "approved",
+				recorded: "2026-07-31 12:00:00",
+			})
+			insertMergeGateDelegationChild(t, store, parentID, "unrecognized", tc.state, &AgentResult{
+				Decision: tc.decision,
+				Summary:  "synthetic unrecognized evidence",
+			})
+
+			decision, err := gate.Evaluate(context.Background(), request)
+
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+				t.Fatalf("decision = %+v, want unrecognized delegation evidence refused", decision)
+			}
+			childID := parentID + "/delegation/unrecognized"
+			if !strings.Contains(decision.Reason, "unrecognized delegation evidence") ||
+				!strings.Contains(decision.Reason, childID) {
+				t.Fatalf("decision reason = %q, want unrecognized child %s", decision.Reason, childID)
+			}
+			if len(gh.merges) != 0 {
+				t.Fatalf("merge calls = %+v, want none", gh.merges)
+			}
+		})
 	}
 }
 
