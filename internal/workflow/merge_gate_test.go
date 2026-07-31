@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -2577,6 +2578,224 @@ func TestPolicyMergeGateWinningDelegationOutcomeNamesSubordinateObligations(t *t
 	}
 	if len(gh.merges) != 0 {
 		t.Fatalf("merge calls = %+v, want none", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateDelegatedReviewEvidenceEnumeration(t *testing.T) {
+	type outcome string
+	const (
+		satisfies        outcome = "SAT"
+		waits            outcome = "WAIT"
+		blocks           outcome = "BLOCK"
+		parksCrashed     outcome = "PARK_C"
+		parksAbstaining  outcome = "PARK_A"
+		parksUnknown     outcome = "PARK_U"
+		parksCouldNotRun outcome = "PARK_STATE_BLOCKED_COULD_NOT_RUN"
+	)
+	type childFixture struct {
+		label     string
+		state     JobState
+		decision  string
+		nilResult bool
+		malformed bool
+	}
+	type enumerationRow struct {
+		id       string
+		children []childFixture
+		want     outcome
+	}
+
+	child := func(label string, state JobState, decision string) childFixture {
+		return childFixture{label: label, state: state, decision: decision}
+	}
+	sat := func(label string) childFixture {
+		return child(label, JobSucceeded, "approved")
+	}
+	wait := func(label string) childFixture {
+		return child(label, JobRunning, "")
+	}
+	block := func(label string) childFixture {
+		return child(label, JobSucceeded, "blocked")
+	}
+	unknown := func(label string) childFixture {
+		return child(label, JobSucceeded, "future-review-outcome")
+	}
+	crashed := func(label string) childFixture {
+		return child(label, JobFailed, "")
+	}
+	abstained := func(label string) childFixture {
+		return child(label, JobSucceeded, "implemented")
+	}
+	couldNotRun := func(label string) childFixture {
+		return child(label, JobBlocked, "")
+	}
+
+	rows := []enumerationRow{
+		{id: "H01_QUEUED", children: []childFixture{child("queued", JobQueued, "")}, want: waits},
+		{id: "H02_RUNNING", children: []childFixture{wait("running")}, want: waits},
+		{id: "H03_APPROVED", children: []childFixture{sat("approved")}, want: satisfies},
+		{id: "H04_CHANGES_REQUESTED", children: []childFixture{child("changes-requested", JobSucceeded, "changes_requested")}, want: blocks},
+		{id: "H05_DECISION_BLOCKED_REFUSED", children: []childFixture{block("decision-blocked-refused")}, want: blocks},
+		{id: "H06_DECISION_FAILED_REFUSED", children: []childFixture{child("decision-failed-refused", JobSucceeded, "failed")}, want: blocks},
+		{id: "H07_SKIPPED", children: []childFixture{child("skipped", JobSucceeded, "skipped")}, want: parksAbstaining},
+		{id: "H08_IMPLEMENTED", children: []childFixture{abstained("implemented")}, want: parksAbstaining},
+		{id: "H09_EMPTY_DECISION", children: []childFixture{child("empty-decision", JobSucceeded, "")}, want: parksUnknown},
+		{id: "H10_UNRECOGNIZED_DECISION", children: []childFixture{unknown("unrecognized-decision")}, want: parksUnknown},
+		{id: "H11_NIL_RESULT", children: []childFixture{{label: "nil-result", state: JobSucceeded, nilResult: true}}, want: parksUnknown},
+		{id: "H12_MALFORMED_PAYLOAD", children: []childFixture{{label: "malformed-payload", state: JobSucceeded, malformed: true}}, want: parksUnknown},
+		{id: "H13_STATE_FAILED_CRASHED", children: []childFixture{crashed("state-failed-crashed")}, want: parksCrashed},
+		{id: "H14_STATE_CANCELLED_CRASHED", children: []childFixture{child("state-cancelled-crashed", JobCancelled, "")}, want: parksCrashed},
+		{id: "H15_STATE_BLOCKED_COULD_NOT_RUN", children: []childFixture{couldNotRun("state-blocked-could-not-run")}, want: parksCouldNotRun},
+		{id: "H16_UNRECOGNIZED_STATE", children: []childFixture{child("unrecognized-state", JobState("paused"), "")}, want: parksUnknown},
+
+		{id: "M01_SAT_PLUS_WAIT", children: []childFixture{sat("sat"), wait("wait")}, want: waits},
+		{id: "M02_SAT_PLUS_BLOCK", children: []childFixture{sat("sat"), block("decision-blocked-refused")}, want: blocks},
+		{id: "M03_SAT_PLUS_PARK_U", children: []childFixture{sat("sat"), unknown("park-u")}, want: parksUnknown},
+		{id: "M04_SAT_PLUS_PARK_C", children: []childFixture{sat("sat"), crashed("park-c")}, want: parksCrashed},
+		{id: "M05_SAT_PLUS_PARK_A", children: []childFixture{sat("sat"), abstained("park-a")}, want: parksAbstaining},
+		{id: "M06_SAT_PLUS_STATE_BLOCKED_COULD_NOT_RUN", children: []childFixture{sat("sat"), couldNotRun("state-blocked-could-not-run")}, want: parksCouldNotRun},
+		{id: "M07_WAIT_PLUS_BLOCK", children: []childFixture{wait("wait"), block("decision-blocked-refused")}, want: blocks},
+		{id: "M08_WAIT_PLUS_PARK_U", children: []childFixture{wait("wait"), unknown("park-u")}, want: parksUnknown},
+		{id: "M09_WAIT_PLUS_PARK_C", children: []childFixture{wait("wait"), crashed("park-c")}, want: waits},
+		{id: "M10_WAIT_PLUS_PARK_A", children: []childFixture{wait("wait"), abstained("park-a")}, want: waits},
+		{id: "M11_WAIT_PLUS_STATE_BLOCKED_COULD_NOT_RUN", children: []childFixture{wait("wait"), couldNotRun("state-blocked-could-not-run")}, want: waits},
+		{id: "M12_BLOCK_PLUS_PARK_U", children: []childFixture{block("decision-blocked-refused"), unknown("park-u")}, want: blocks},
+		{id: "M13_BLOCK_PLUS_PARK_C", children: []childFixture{block("decision-blocked-refused"), crashed("park-c")}, want: blocks},
+		{id: "M14_BLOCK_PLUS_PARK_A", children: []childFixture{block("decision-blocked-refused"), abstained("park-a")}, want: blocks},
+		{id: "M15_BLOCK_PLUS_STATE_BLOCKED_COULD_NOT_RUN", children: []childFixture{block("decision-blocked-refused"), couldNotRun("state-blocked-could-not-run")}, want: blocks},
+		{id: "M16_PARK_U_PLUS_PARK_C", children: []childFixture{unknown("park-u"), crashed("park-c")}, want: parksUnknown},
+		{id: "M17_PARK_U_PLUS_PARK_A", children: []childFixture{unknown("park-u"), abstained("park-a")}, want: parksUnknown},
+		{id: "M18_PARK_U_PLUS_STATE_BLOCKED_COULD_NOT_RUN", children: []childFixture{unknown("park-u"), couldNotRun("state-blocked-could-not-run")}, want: parksUnknown},
+		{id: "M19_PARK_C_PLUS_PARK_A", children: []childFixture{crashed("park-c"), abstained("park-a")}, want: parksCrashed},
+		{id: "M20_PARK_C_PLUS_STATE_BLOCKED_COULD_NOT_RUN", children: []childFixture{crashed("park-c"), couldNotRun("state-blocked-could-not-run")}, want: parksCrashed},
+		{id: "M21_PARK_A_PLUS_STATE_BLOCKED_COULD_NOT_RUN", children: []childFixture{abstained("park-a"), couldNotRun("state-blocked-could-not-run")}, want: parksAbstaining},
+	}
+
+	linkages := []struct {
+		name         string
+		parent       bool
+		delegation   bool
+		wantExcluded bool
+	}{
+		{name: "FULL_PARENT_AND_DELEGATION", parent: true, delegation: true},
+		{name: "PARENT_ONLY_NO_DELEGATION", parent: true, wantExcluded: true},
+		{name: "NEITHER_PARENT_NOR_DELEGATION", wantExcluded: true},
+	}
+
+	for rowIndex, row := range rows {
+		row := row
+		t.Run(row.id, func(t *testing.T) {
+			for _, linkage := range linkages {
+				linkage := linkage
+				t.Run(linkage.name, func(t *testing.T) {
+					store, gh, gate, request := newMergeGateQuorumScenario(t)
+					parentID := fmt.Sprintf("review-parent-enumeration-%02d", rowIndex)
+					insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+						id: parentID, agent: "reviewer-a", hasResult: true, decision: "approved",
+						recorded: "2026-07-31 12:00:00",
+					})
+
+					var includedAdverseIDs []string
+					for childIndex, fixture := range row.children {
+						childID := fmt.Sprintf("%s/child/%02d-%s", parentID, childIndex, fixture.label)
+						payload := "{not-json"
+						jobType := "ask"
+						if !fixture.malformed {
+							var result *AgentResult
+							if !fixture.nilResult {
+								result = &AgentResult{Decision: fixture.decision, Summary: "enumerated delegation result"}
+							}
+							encoded, err := marshalPayload(JobPayload{
+								Repo:        "gitmoot/gitmoot",
+								PullRequest: 9,
+								TaskID:      "task-9",
+								Result:      result,
+							})
+							if err != nil {
+								t.Fatalf("marshalPayload returned error: %v", err)
+							}
+							payload = encoded
+							jobType = "review"
+						}
+
+						job := db.Job{
+							ID:      childID,
+							Agent:   fixture.label,
+							Type:    jobType,
+							State:   string(fixture.state),
+							Payload: payload,
+						}
+						if linkage.parent {
+							job.ParentJobID = parentID
+						}
+						if linkage.delegation {
+							job.DelegationID = fixture.label
+						}
+						if err := store.CreateJobWithEvent(context.Background(), job, db.JobEvent{
+							Kind: string(fixture.state), Message: "enumerated delegation fixture",
+						}); err != nil {
+							t.Fatalf("CreateJobWithEvent returned error: %v", err)
+						}
+						if !linkage.wantExcluded && !(fixture.state == JobSucceeded && fixture.decision == "approved") {
+							includedAdverseIDs = append(includedAdverseIDs, childID)
+						}
+					}
+
+					decision, err := gate.Evaluate(context.Background(), request)
+					if err != nil {
+						t.Fatalf("Evaluate returned error: %v", err)
+					}
+
+					want := row.want
+					if linkage.wantExcluded {
+						want = satisfies
+					}
+					switch want {
+					case satisfies:
+						if !decision.Merged || len(gh.merges) != 1 {
+							t.Fatalf("decision = %+v merge calls = %+v, want SAT", decision, gh.merges)
+						}
+					case waits:
+						if decision.Merged || decision.LeaveOpen || decision.EscalateMergeGateMiss ||
+							!strings.Contains(decision.Reason, "waiting for delegated review parent") {
+							t.Fatalf("decision = %+v, want WAIT", decision)
+						}
+					case blocks:
+						if decision.Merged || !decision.LeaveOpen || !decision.EscalateMergeGateMiss ||
+							!strings.Contains(decision.Reason, "blocking delegation evidence") {
+							t.Fatalf("decision = %+v, want BLOCK", decision)
+						}
+					case parksUnknown:
+						if decision.Merged || !decision.LeaveOpen || !decision.EscalateMergeGateMiss ||
+							!strings.Contains(decision.Reason, "unrecognized delegation evidence") {
+							t.Fatalf("decision = %+v, want PARK-U", decision)
+						}
+					case parksCrashed:
+						if decision.Merged || !decision.LeaveOpen || !decision.EscalateMergeGateMiss ||
+							!strings.Contains(decision.Reason, "crashed delegation children") {
+							t.Fatalf("decision = %+v, want PARK-C", decision)
+						}
+					case parksAbstaining:
+						if decision.Merged || !decision.LeaveOpen || !decision.EscalateMergeGateMiss ||
+							!strings.Contains(decision.Reason, "abstaining delegation children") {
+							t.Fatalf("decision = %+v, want PARK-A", decision)
+						}
+					case parksCouldNotRun:
+						if decision.Merged || !decision.LeaveOpen || !decision.EscalateMergeGateMiss ||
+							!strings.Contains(decision.Reason, "parked children:") {
+							t.Fatalf("decision = %+v, want PARK STATE_BLOCKED_COULD_NOT_RUN", decision)
+						}
+					default:
+						t.Fatalf("unknown expected outcome %q", want)
+					}
+					for _, childID := range includedAdverseIDs {
+						if !strings.Contains(decision.Reason, childID) {
+							t.Fatalf("decision reason = %q, want subordinate child %s", decision.Reason, childID)
+						}
+					}
+				})
+			}
+		})
 	}
 }
 
