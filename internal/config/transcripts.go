@@ -13,8 +13,8 @@ const (
 	DefaultTranscriptMaxTotalBytes = int64(2 * 1024 * 1024 * 1024)
 )
 
-// TranscriptsConfig controls opt-in raw runtime transcript retention. Invalid
-// or missing configuration always resolves to the safe disabled default.
+// TranscriptsConfig controls default-on raw runtime transcript retention.
+// Invalid or missing configuration resolves to safe bounded defaults.
 type TranscriptsConfig struct {
 	Enabled       bool
 	Retain        time.Duration

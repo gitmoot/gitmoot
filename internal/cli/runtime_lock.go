@@ -203,18 +203,18 @@ func runtimeSessionHeldByLiveOwner(ctx context.Context, store *db.Store, agent r
 
 // runtimeOwnerLeaseHeld reports whether the running job jobID still holds a
 // runtime-session lock whose LEASE has not elapsed (or whose owner is on an
-// unverifiable cross-host). It is the gate stale-running-job recovery consults so
-// a long-running job is not requeued while its real job timeout — encoded in the
-// lease — has not elapsed (#536).
+// unverifiable cross-host). Same-boot liveness uses this only for legacy rows
+// that predate persisted runtime PID identity; it keeps those rows from being
+// failed while their real job timeout — encoded in the lease — has not elapsed
+// (#536).
 //
 // It deliberately keys on the lease, NOT on owner-PID liveness: the lock records
 // the gitmoot DAEMON's PID, not the spawned runtime worker's, so on a daemon
 // restart the recorded PID is the dead prior daemon even while the reparented
-// worker is still progressing. Honoring the lease is therefore correct across a
-// restart and immune to PID reuse; see db.ResourceLockLiveness.LeaseHeld. A job
-// with no runtime lock (released on a normal terminal, or a non-resumable runtime)
-// is never lease-held, so it is recovered as before; once a lease expires
-// (recoverExpiredRuntimeSessionLocks reclaims it) the job is recovered too.
+// worker is still progressing. Honoring the lease is therefore correct and
+// immune to PID reuse; see db.ResourceLockLiveness.LeaseHeld. A job with no
+// runtime lock is never lease-held, so a legacy row still requires the longer
+// transcript-silence threshold before the liveness sweep can settle it.
 func runtimeOwnerLeaseHeld(ctx context.Context, store *db.Store, jobID string, now time.Time) (bool, error) {
 	thisHost, _ := os.Hostname()
 	// excludeOwnerToken is "" — recovery runs from a daemon tick/startup that holds

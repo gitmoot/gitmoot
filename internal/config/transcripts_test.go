@@ -31,7 +31,7 @@ max_total_bytes = 4096
 	}
 }
 
-func TestLoadTranscriptsConfigInvalidDegradesToDisabled(t *testing.T) {
+func TestLoadTranscriptsConfigInvalidDegradesToSafeDefaults(t *testing.T) {
 	for _, body := range []string{
 		"[transcripts]\nenabled = nope\n",
 		"[transcripts]\nenabled = true\nretain = \"0s\"\n",

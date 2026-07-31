@@ -144,8 +144,9 @@ runtime name is a config error surfaced by `gitmoot runtime list`.
 
 ## Transcript Retention
 
-Runtime transcript retention is opt-in and invalid or missing configuration
-fails closed to disabled capture:
+Runtime transcript retention is default-on. Every engine delivery appends its
+stdout and stderr to a private per-job log; set `enabled = false` only for an
+explicit opt-out. Missing or invalid configuration uses the safe defaults:
 
 ```toml
 [transcripts]
@@ -161,7 +162,8 @@ subprocess and therefore no log. A home-scoped sweep removes settled logs after
 `retain`, then evicts the oldest settled logs when the total exceeds
 `max_total_bytes`; queued/running jobs and recently finalized jobs are protected.
 Seat logs remain transient. Expect roughly 440 MB/week at this host's observed
-rate, though workload output varies.
+rate, though workload output varies. `retain` has a hard 24-hour floor; shorter
+or malformed retention falls back to the 168-hour default.
 
 Raw retained logs are mode `0600` and **unredacted on disk**. Treat the Gitmoot
 home as sensitive. JSONL exports redact known credential patterns best-effort,
@@ -324,6 +326,7 @@ daemon defaults with:
 [daemon]
 job_timeout_default = "4h"
 job_timeout_max = "8h"
+quiet_kill_after = "45m"
 ```
 
 The effective deadline resolves in this order: a positive `job_timeout` in the
@@ -333,14 +336,15 @@ larger request is clamped and the job receives a `job_timeout_clamped` event
 recording the requested and applied durations. This prevents a delegation tree
 from granting itself an unbounded run. These keys are read when a job dispatches,
 so edits affect newly started jobs without changing an in-flight deadline.
-The 30-minute stale-running threshold remains only a crash-detection predicate;
-it is never used as a job kill deadline.
+`quiet_kill_after` controls the transcript-silence leg of the liveness
+conjunction (default `45m`, hard floor `5m`). The 30-minute stale-running
+threshold remains only an age predicate; neither value is a job kill deadline.
 
 ### Reconfigure Without Restarting
 
 `kill -HUP <daemon-pid>` re-reads the `[daemon]` config section (`poll`,
-`workers`, `scheduler`, parallelism, `idle_grace_ticks`, and
-`idle_max_multiplier`) live (#577) — no teardown, no dropped
+`workers`, `scheduler`, parallelism, `idle_grace_ticks`,
+`idle_max_multiplier`, and `quiet_kill_after`) live (#577) — no teardown, no dropped
 jobs, no environment re-inheritance. Values pinned by explicit launch flags win
 over the re-read config. Prefer SIGHUP over a restart when only tuning
 throughput.
@@ -1833,20 +1837,30 @@ never emitted a valid envelope even after repair attempts — the job records
 **failure diagnostics** (#806): a `phase` marker (`launched` = died before any stdout,
 `streaming` = died mid-output, `result-parse` = every delivery completed but no
 valid envelope was found), the process `exit_code` **or** terminating `signal`,
-a **redacted** stderr tail (hard-capped at 2 KB; redaction runs over the full
+a **redacted** stderr tail (hard-capped at 4 KB; redaction runs over the full
 text with the same token-redaction rules as job comments *before* the tail is
 cut, so a secret can never leak partially), and the runtime session id when one
 is known. `gitmoot job show` prints a `failure_diagnostics:` block,
 `job show --json` carries `payload.failure_diagnostics`, and `gitmoot report
 bug` includes a "Failure diagnostics" section. Successful jobs never store one,
-and a retried job clears the previous run's crash report.
+and a retried job clears the previous run's crash report. Terminal `failed`
+events embed the same bounded, redacted stderr tail for durable triage.
 
-Jobs stuck in `running` are backstopped too: a running job with no lease
-progress past the staleness window (default 30m) is assumed orphaned by a dead
-worker and recovered/re-queued. The window is tunable via the
+Jobs stuck in `running` are backstopped too, but transcript silence alone never
+kills work. The recurring same-boot sweep moves `running` to `failed` only when
+all three facts agree: `updated_at` is frozen past the staleness window, the
+default-on job log is byte-identical across two sweeps and older than
+`[daemon].quiet_kill_after` (default 45m, minimum 5m), and the recorded runtime
+PID is dead. A live PID with the recorded `/proc` start-time identity is an
+absolute veto however quiet the log; a recycled PID records an identity-mismatch
+event and leaves the job running. Legacy rows without a runtime PID require
+twice the quiet threshold and no held runtime lease.
+
+The staleness age leg is tunable via the
 `GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value
 is 1m — below-1m, malformed, or non-positive values are rejected (with a
-one-time warning) in favor of the 30m default rather than clamped (#560).
+one-time warning) in favor of the 30m default rather than clamped (#560). It is a
+crash backstop, not a kill deadline.
 
 `gitmoot job kill <root-job-id>` is the operator kill switch for a runaway
 delegation tree: it terminates the tree identified by its **root** job id

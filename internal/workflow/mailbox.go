@@ -1626,7 +1626,7 @@ func terminalMessageWithDiagnostics(state JobState, message string, diag *Failur
 	if state != JobFailed || diag == nil || strings.TrimSpace(diag.StderrTail) == "" {
 		return message
 	}
-	return message + "\nstderr tail:\n" + diag.StderrTail
+	return RedactCommentText(message) + "\nstderr tail:\n" + diag.StderrTail
 }
 
 func (m Mailbox) ensureRunning(ctx context.Context, jobID string) error {

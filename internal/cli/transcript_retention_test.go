@@ -236,3 +236,31 @@ func TestRetainedTranscriptLogAppendPermissionsDisabledAndOpenFailure(t *testing
 		t.Fatalf("oversized filename open = file %v err %v, want fail-open signal", file, err)
 	}
 }
+
+func TestRetainedTranscriptLogDefaultOn(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	path, file, err := openRetainedTranscriptLog(home, "default-on")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file == nil || path != transcript.JobLogPath(paths.Logs, "default-on") {
+		t.Fatalf("default-on log = path %q file %v", path, file)
+	}
+	if _, err := file.WriteString("stdout and stderr stream\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 || info.Size() == 0 {
+		t.Fatalf("default-on log mode=%v size=%d", info.Mode().Perm(), info.Size())
+	}
+}

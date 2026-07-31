@@ -28,11 +28,10 @@ const defaultDaemonRunningJobStaleAfter = daemonRunningJobStaleAfter
 // daemonRunningJobStaleFloor is the smallest GITMOOT_STALE_RUNNING_AFTER we
 // honor. The stale-running window is a CRASH BACKSTOP, not a job timeout: it is
 // how long a job may sit in 'running' with no lease progress before the daemon
-// assumes the worker died and requeues it. A tiny value (e.g. 1s) turns that
-// backstop into an aggressive killer — especially for NON-resumable runtimes
-// (shell/no runtime-session lock) where runtimeOwnerLeaseHeld is always false,
-// so there is no lease to protect a live worker and the coarse threshold is the
-// ONLY gate. Sub-floor values are rejected in favor of the default (#560).
+// considers the worker for the stricter same-boot liveness conjunction. A tiny
+// value (e.g. 1s) would make the age leg meaningless, so sub-floor values are
+// rejected in favor of the default (#560). Transcript progress and runtime
+// process identity remain independent mandatory legs before any job is failed.
 const daemonRunningJobStaleFloor = 1 * time.Minute
 
 // runtimeLeaseTeardownGrace is added to a job's timeout when sizing its
@@ -754,9 +753,9 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 // then a BLOCKING runQueuedJobsForRepo dispatch. The supervisors pass a live
 // tracker (#562), which changes the tick to claim-and-dispatch-async:
 //
-//   - recovery scans skip jobs THIS process is running (an in-flight >30m job
-//     with no runtime lease — e.g. a shell-runtime job — must not be requeued
-//     out from under its own live worker by its own daemon's tick);
+//   - same-boot stale-job detection requires age, two frozen transcript samples,
+//     and dead runtime identity; a recorded live PID absolutely vetoes settlement,
+//     including for an in-flight >30m shell-runtime job with no runtime lease;
 //   - the expired runtime-lock reaper likewise skips locks owned by in-flight
 //     jobs (their goroutine is alive; releasing the lock could double-run the
 //     session);

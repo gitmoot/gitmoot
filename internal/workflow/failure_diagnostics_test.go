@@ -62,6 +62,14 @@ func TestMailboxRunCapturesCrashDiagnosticsOnNonZeroExit(t *testing.T) {
 	if !strings.Contains(diag.StderrTail, "[REDACTED]") {
 		t.Fatalf("stderr tail = %q, want the redaction marker", diag.StderrTail)
 	}
+	events, err := store.ListJobEvents(ctx, "job-crash")
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	failedMessage := events[len(events)-1].Message
+	if !strings.Contains(failedMessage, "stderr tail:") || !strings.Contains(failedMessage, "runtime exploded") || strings.Contains(failedMessage, "super-secret-crash-value") {
+		t.Fatalf("failed event diagnostics = %q", failedMessage)
+	}
 }
 
 func TestMailboxRunCrashDiagnosticsStreamingPhase(t *testing.T) {

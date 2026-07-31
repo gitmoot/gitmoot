@@ -218,18 +218,21 @@ func TestE2E560ExpiredLeaseRequeuesStuckWorker(t *testing.T) {
 }
 
 // TestE2E560SubFloorStaleWindowRejected pins the env floor (#560 finding 3):
-// GITMOOT_STALE_RUNNING_AFTER is a CRASH BACKSTOP, not a timeout, so a sub-floor
-// value must be rejected in favor of the default window rather than turned into an
-// aggressive killer. The danger is sharpest for NON-resumable runtimes (shell)
-// that hold no lease — there the coarse window is the ONLY gate, so a 1s window
-// would requeue a healthy worker on its next tick.
+// GITMOOT_STALE_RUNNING_AFTER is one crash-detection leg, not a timeout, so a
+// sub-floor value must be rejected in favor of the default window rather than
+// turned into an aggressive killer. Even after the age leg matures, missing
+// transcript and process evidence must leave the job running.
 func TestE2E560SubFloorStaleWindowRejected(t *testing.T) {
 	t.Setenv("GITMOOT_STALE_RUNNING_AFTER", "1s") // below the 1m floor
+	if got := configuredDaemonRunningJobStaleAfter(io.Discard); got != defaultDaemonRunningJobStaleAfter {
+		t.Fatalf("sub-floor stale window = %s, want default %s", got, defaultDaemonRunningJobStaleAfter)
+	}
 
 	seed := func(t *testing.T) (*db.Store, jobWorker, time.Time) {
 		store := daemonWorkerStore(t)
 		seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
-		// shell runtime => no runtime-session lease => the coarse window is the sole gate.
+		// A shell runtime has no runtime-session lease; the new liveness predicate
+		// must therefore stay fail-closed when transcript/PID evidence is absent.
 		seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
 		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 			ID: "job-x", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1,
@@ -240,9 +243,8 @@ func TestE2E560SubFloorStaleWindowRejected(t *testing.T) {
 		return store, defaultJobWorker(store, io.Discard), time.Now().UTC()
 	}
 
-	// A 5m-old running job: OLDER than the sub-floor 1s (which would requeue it) but
-	// well YOUNGER than the enforced 30m default (which leaves it running). Staying
-	// 'running' proves the 1s was rejected.
+	// A 5m-old running job is older than the rejected 1s value but younger than
+	// the enforced 30m default, so it remains outside the age candidate set.
 	t.Run("sub_floor_rejected_uses_default_window", func(t *testing.T) {
 		ctx := context.Background()
 		store, worker, now := seed(t)
@@ -258,9 +260,9 @@ func TestE2E560SubFloorStaleWindowRejected(t *testing.T) {
 		}
 	})
 
-	// Positive control: past the enforced 30m default the SAME job IS recovered, so
-	// the floor falls back to a real finite window, not an infinite one.
-	t.Run("default_window_still_recovers_when_truly_stale", func(t *testing.T) {
+	// Past the enforced 30m default, age alone is still insufficient: the new
+	// same-boot sweep requires frozen transcript bytes and process evidence too.
+	t.Run("default_window_is_not_an_age_only_killer", func(t *testing.T) {
 		ctx := context.Background()
 		store, worker, now := seed(t)
 		if err := runDaemonWorkerTickTracked(ctx, store, worker, 0, false, "owner/repo", "", io.Discard, now.Add(31*time.Minute), nil, nil); err != nil {
@@ -270,8 +272,8 @@ func TestE2E560SubFloorStaleWindowRejected(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetJob returned error: %v", err)
 		}
-		if job.State != string(workflow.JobQueued) {
-			t.Fatalf("job state at +31m = %q, want queued; the enforced default 30m window must still recover a truly-stale job", job.State)
+		if job.State != string(workflow.JobRunning) {
+			t.Fatalf("job state at +31m = %q, want running without transcript and process evidence", job.State)
 		}
 	})
 }
