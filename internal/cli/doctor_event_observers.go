@@ -33,6 +33,21 @@ var wakeTargetRoleProducers = []wakeTargetRoleProducer{
 		Kinds:    directiveEscalationDirectedKinds,
 	},
 	{
+		File:     "internal/cli/event_rule_sink.go",
+		Function: "addressBlockedEvent",
+		Kinds:    blockedWakeDirectedKinds,
+	},
+	{
+		File:     "internal/cli/event_sink.go",
+		Function: "emitDaemonTerminalEvent",
+		Kinds:    blockedWakeDirectedKinds,
+	},
+	{
+		File:     "internal/cli/blocked_since.go",
+		Function: "emitInputPendingEpisode",
+		Kinds:    inputPendingDirectedKinds,
+	},
+	{
 		File:     "internal/cli/reply_wake_outbox.go",
 		Function: "wakeOutboxEvent",
 		Kinds:    wakeOutboxDirectedKinds,
@@ -45,6 +60,14 @@ func directiveNudgeDirectedKinds() []string {
 
 func directiveEscalationDirectedKinds() []string {
 	return []string{db.WakeOutboxKindEscalation}
+}
+
+func blockedWakeDirectedKinds() []string {
+	return []string{db.WakeOutboxKindBlocked}
+}
+
+func inputPendingDirectedKinds() []string {
+	return []string{"pane_input_pending"}
 }
 
 func eventObserverDoctorCheck(paths config.Paths) (doctor.Check, bool) {

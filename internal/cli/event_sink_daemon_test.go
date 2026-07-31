@@ -109,6 +109,11 @@ func TestFinishQueuedJobEmitsJobBlocked(t *testing.T) {
 	if err := store.CreateJob(ctx, db.Job{ID: "queued-job", Agent: "coord", Type: "ask", State: string(workflow.JobQueued)}); err != nil {
 		t.Fatalf("CreateJob returned error: %v", err)
 	}
+	if err := store.UpdateJobPayload(ctx, "queued-job", mustJobPayload(t, workflow.JobPayload{
+		Repo: "gitmoot/gitmoot", ActingOrgRole: "gmc-gate",
+	})); err != nil {
+		t.Fatalf("UpdateJobPayload returned error: %v", err)
+	}
 	sink := &recordingSink{}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.EventSinkOverride = sink
@@ -118,6 +123,8 @@ func TestFinishQueuedJobEmitsJobBlocked(t *testing.T) {
 	}
 	if got := sink.byType(events.EventJobBlocked); len(got) != 1 {
 		t.Fatalf("job.blocked emissions = %d, want 1", len(got))
+	} else if got[0].WakeTargetRole != "gmc-gate" {
+		t.Fatalf("job.blocked wake target = %q, want recorded role gmc-gate", got[0].WakeTargetRole)
 	}
 }
 
