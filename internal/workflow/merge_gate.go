@@ -446,6 +446,11 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	}
 	// A round can order remediation, but it must not hide a blocking verdict
 	// captured at the head currently being evaluated.
+	type reviewAtHead struct {
+		job     db.Job
+		payload JobPayload
+	}
+	var reviewsAtHead []reviewAtHead
 	for _, job := range jobs {
 		if job.Type != "review" {
 			continue
@@ -457,12 +462,32 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if !sameTask(current, payload) || payload.Result == nil {
 			continue
 		}
-		if err := g.ensureReviewMatchesHead(payload, headSHA, job.Agent); err != nil {
+		reviewHead := strings.TrimSpace(payload.HeadSHA)
+		if reviewHead == "" || reviewHead != headSHA {
 			continue
 		}
-		switch payload.Result.Decision {
+		reviewsAtHead = append(reviewsAtHead, reviewAtHead{job: job, payload: payload})
+	}
+	supersededReviewIDs := map[string]struct{}{}
+	for _, review := range reviewsAtHead {
+		reviewer := strings.TrimSpace(review.job.Agent)
+		if reviewer == "" {
+			continue
+		}
+		for _, candidate := range reviewsAtHead {
+			if strings.TrimSpace(candidate.job.Agent) == reviewer && reviewJobRecordedAfter(candidate.job, review.job) {
+				supersededReviewIDs[review.job.ID] = struct{}{}
+				break
+			}
+		}
+	}
+	for _, review := range reviewsAtHead {
+		if _, superseded := supersededReviewIDs[review.job.ID]; superseded {
+			continue
+		}
+		switch review.payload.Result.Decision {
 		case "changes_requested", "blocked", "failed":
-			return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", job.Agent)}
+			return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", review.job.Agent)}
 		}
 	}
 	latest := ""
@@ -475,6 +500,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			return err
 		}
 		if !sameTask(current, payload) {
+			continue
+		}
+		if _, superseded := supersededReviewIDs[job.ID]; superseded {
 			continue
 		}
 		round := strings.TrimSpace(payload.ReviewRound)
@@ -510,6 +538,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			round = job.ID
 		}
 		if !sameTask(current, payload) || round != latest || payload.Result == nil {
+			continue
+		}
+		if _, superseded := supersededReviewIDs[job.ID]; superseded {
 			continue
 		}
 		if payload.Result.Decision == "approved" {
@@ -574,6 +605,25 @@ func reviewAuthorshipFailureReason(selfApproval string, unknownImplementer strin
 		}
 	}
 	return ""
+}
+
+func reviewJobRecordedAfter(left db.Job, right db.Job) bool {
+	if after, decided := recordedTimestampAfter(left.UpdatedAt, right.UpdatedAt); decided {
+		return after
+	}
+	if after, decided := recordedTimestampAfter(left.CreatedAt, right.CreatedAt); decided {
+		return after
+	}
+	return false
+}
+
+func recordedTimestampAfter(left string, right string) (after bool, decided bool) {
+	leftTime, leftOK := parseStoredJobTime(left)
+	rightTime, rightOK := parseStoredJobTime(right)
+	if !leftOK || !rightOK || leftTime.Equal(rightTime) {
+		return false, false
+	}
+	return leftTime.After(rightTime), true
 }
 
 func (g PolicyMergeGate) ensureBranchFresh(ctx context.Context, repo github.Repository, request MergeRequest, pr github.PullRequest, headSHA string) (MergeDecision, bool, error) {
