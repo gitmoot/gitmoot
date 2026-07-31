@@ -693,12 +693,14 @@ func scheduleOnePipeline(ctx context.Context, store *db.Store, rec db.Pipeline, 
 	return store.AdvancePipelineNextDue(ctx, rec.Name, nextDue)
 }
 
-// advancePipelineRuns is RunPipelineScanOnce's ADVANCE pass (#681): it advances
-// every in-flight (state='running') run once, so parked (blocked/failed) and
-// terminal runs consume zero compute. A per-run error is collected (first wins) but
-// never stops the remaining runs. Runs whose pipeline was removed, whose stored
-// spec no longer parses, or whose spec drifted (hash no longer matches the run's
-// snapshot) are skipped rather than executed against a changed spec.
+// advancePipelineRuns is RunPipelineScanOnce's ADVANCE/reconciliation sweep
+// (#681): every daemon tick re-reads the persisted jobs behind every in-flight
+// (state='running') run, so terminal job transitions that happened outside the
+// pipeline scanner still fold into stage/run rows. Parked (blocked/failed) and
+// terminal runs consume zero compute. A per-run error is collected (first wins)
+// but never stops the remaining runs. Runs whose pipeline was removed, whose
+// stored spec no longer parses, or whose spec drifted (hash no longer matches the
+// run's snapshot) are skipped rather than executed against a changed spec.
 func advancePipelineRuns(ctx context.Context, store *db.Store, enqueue PipelineStageEnqueuer, now time.Time) error {
 	runs, err := store.ListActivePipelineRuns(ctx)
 	if err != nil {
@@ -1388,6 +1390,17 @@ func orchestrateStageSettleOutcome(ctx context.Context, deps pipelineStageSettle
 			return false, "", "", nil, next, eventErr
 		}
 		return false, "", "", nil, nil, nil
+	}
+
+	// A failed or cancelled coordinator cannot produce a continuation later. Its
+	// persisted delegations describe work it intended to dispatch before the
+	// terminal transition; treating them as live would strand the stage and its run
+	// forever. Fold these honest terminal states immediately. Successful
+	// coordinators still take the continuation walk below.
+	if job.State == string(workflow.JobFailed) || job.State == string(workflow.JobCancelled) {
+		recordPipelineTerminalJobState(deps, job.State)
+		state, summary, needs = foldPipelineStageOutcome(spec.EffectiveSuccessDecisions(stage), job)
+		return true, state, summary, needs, nil, nil
 	}
 
 	// The frontier job is settled. If the engine minted a continuation for it, the

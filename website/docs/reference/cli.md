@@ -2201,7 +2201,7 @@ gitmoot memory ingest <path|dir> --agent NAME [--shared] [--repo owner/repo] [--
 gitmoot memory ingest sweep [--json]
 gitmoot memory observations [--agent NAME] [--provenance-prefix P] [--json]
 gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--to-shared] [--yes] [--json]
-gitmoot memory retire --provenance-prefix P [--agent NAME] [--dry-run] [--yes] [--json]
+gitmoot memory retire [--pending] --provenance-prefix P [--agent NAME] [--dry-run] [--yes] [--json]
 gitmoot memory promote --to-shared <id>... [--json]
 gitmoot memory links backfill [--dry-run] [--json]
 gitmoot memory links list <id> [--json]
@@ -2326,7 +2326,9 @@ optionally by `--agent NAME`, and is a dry run unless `--yes` is passed. Applyin
 the plan sets `retired_at` and `retired_reason` and removes the rows from FTS in
 the same transaction. Retired keys are not resurrected by ingest or collectors on
 re-ingest; only explicit human-controlled confirmation paths may revive a retired
-key.
+key. Add `--pending` to select and remove matching pending observation rows
+instead; this mode never reads or retires confirmed memories. Without
+`--pending`, pending observations are never selected.
 Ingested Markdown is an indirect-prompt-injection vector, so default installs keep
 it inert at `trust_mark = low` until a human confirms it; nothing reads
 `trust_mark` for a decision yet.

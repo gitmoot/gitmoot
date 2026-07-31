@@ -91,6 +91,62 @@ func oneDelegation() []workflow.Delegation {
 	return []workflow.Delegation{{ID: "leg", Agent: "worker", Action: "review", Prompt: "inspect"}}
 }
 
+func TestPipelineScanReconcilesCancelledOrchestrateStage(t *testing.T) {
+	store := pipelineAdvanceStore(t)
+	enqueue := testStageEnqueuer(store)
+	rec, spec := newTestPipeline(t, store, "orch", orchestrateWaitSpec)
+	now := time.Date(2026, 7, 31, 3, 30, 0, 0, time.UTC)
+
+	run := startTestRun(t, store, rec, spec, enqueue, now)
+	stage := stageRow(t, store, run.ID, "coord")
+	job, err := store.GetJob(context.Background(), stage.JobID)
+	if err != nil {
+		t.Fatalf("GetJob(%s): %v", stage.JobID, err)
+	}
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload(%s): %v", stage.JobID, err)
+	}
+	// Reproduce the live shape: the orchestrate coordinator recorded a fan-out,
+	// then the operator cancelled the stage job before a continuation existed.
+	payload.Result = &workflow.AgentResult{
+		Decision:    "approved",
+		Summary:     "coordinator dispatched review",
+		Delegations: oneDelegation(),
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal job payload: %v", err)
+	}
+	if err := store.UpdateJobPayload(context.Background(), job.ID, string(encoded)); err != nil {
+		t.Fatalf("UpdateJobPayload(%s): %v", job.ID, err)
+	}
+	if _, err := workflow.CancelJob(context.Background(), store, job.ID); err != nil {
+		t.Fatalf("CancelJob(%s): %v", job.ID, err)
+	}
+
+	if err := RunPipelineScanOnce(context.Background(), store, enqueue, now.Add(time.Minute)); err != nil {
+		t.Fatalf("RunPipelineScanOnce: %v", err)
+	}
+	gotRun, ok, err := store.GetPipelineRun(context.Background(), run.ID)
+	if err != nil || !ok {
+		t.Fatalf("GetPipelineRun(%s): ok=%v err=%v", run.ID, ok, err)
+	}
+	if gotRun.State != RunFailed {
+		t.Fatalf("reconciled run state = %q, want %q", gotRun.State, RunFailed)
+	}
+	if gotStage := stageRow(t, store, run.ID, "coord"); gotStage.State != StageFailed || gotStage.Summary != "stage job cancelled" {
+		t.Fatalf("reconciled stage = {state=%q summary=%q}, want failed cancellation", gotStage.State, gotStage.Summary)
+	}
+	gotPipeline, ok, err := store.GetPipeline(context.Background(), rec.Name)
+	if err != nil || !ok {
+		t.Fatalf("GetPipeline(%s): ok=%v err=%v", rec.Name, ok, err)
+	}
+	if gotPipeline.LastStatus != RunFailed {
+		t.Fatalf("pipeline last_status = %q, want %q", gotPipeline.LastStatus, RunFailed)
+	}
+}
+
 // TestOrchestrateStageFollowsContinuationChainAndFoldsTail is the full WAIT E2E: a
 // coordinator fans out (approved + delegations), a first continuation generation fans
 // out AGAIN, and only the second continuation is a zero-delegation synthesis TAIL. The
