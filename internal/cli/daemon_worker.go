@@ -2161,16 +2161,26 @@ func (w jobWorker) managedJobConfig(ctx context.Context, agentName string) (mana
 		JobTimeoutDefault: config.DefaultDaemonJobTimeoutDefault,
 		JobTimeoutMax:     config.DefaultDaemonJobTimeoutMax,
 	}
+	var paths config.Paths
+	configFilePresent := false
 	if w.ConfigHomeExplicit || strings.TrimSpace(w.ConfigHome) != "" {
-		paths, err := w.configPaths()
+		var err error
+		paths, err = w.configPaths()
 		if err != nil {
 			return managedJobRuntimeConfig{}, err
 		}
 		daemonConfig, err := config.LoadDaemonRuntimeConfig(paths)
-		if err != nil {
+		// ConfigHome also enables checkout isolation in tests and embedders; it
+		// does not prove that a config file or agent-type registry exists. Absence
+		// is the normal unmanaged case and falls through to the daemon defaults.
+		// A present-but-malformed file still returns its parse error below.
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return managedJobRuntimeConfig{}, err
 		}
-		runtimeConfig.JobTimeoutDefault, runtimeConfig.JobTimeoutMax = daemonConfig.JobTimeoutPolicy()
+		if err == nil {
+			configFilePresent = true
+			runtimeConfig.JobTimeoutDefault, runtimeConfig.JobTimeoutMax = daemonConfig.JobTimeoutPolicy()
+		}
 	}
 
 	registered, err := w.Store.GetAgent(ctx, agentName)
@@ -2212,18 +2222,17 @@ func (w jobWorker) managedJobConfig(ctx context.Context, agentName string) (mana
 			return managedJobRuntimeConfig{}, instanceErr
 		}
 	}
-	if !w.ConfigHomeExplicit && strings.TrimSpace(w.ConfigHome) == "" {
+	if !configFilePresent {
 		return runtimeConfig, nil
 	}
-	types, err := loadAgentTypeConfig(w.ConfigHome)
+	types, err := config.LoadAgentTypes(paths)
 	if err != nil {
 		return managedJobRuntimeConfig{}, err
 	}
 	agentType, ok := types[configType]
 	if !ok {
-		if runtimeConfig.Instance {
-			return managedJobRuntimeConfig{}, fmt.Errorf("agent type %q not found for managed instance %s", configType, agentName)
-		}
+		// Enrollment is optional for both stable agents and live instances. Keep
+		// Instance above for lifecycle updates, but use the daemon timeout default.
 		return runtimeConfig, nil
 	}
 	jobTimeout, err := time.ParseDuration(agentType.JobTimeout)

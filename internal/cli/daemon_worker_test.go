@@ -330,6 +330,36 @@ func TestDaemonDispatchUsesRegisteredAgentTypeTimeoutWithoutInstance(t *testing.
 	assertCapturedTimeout(t, capture, started, 10*time.Minute)
 }
 
+func TestDaemonDispatchPlainAgentWithoutTypeConfigUsesDefaultTimeout(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir() // Intentionally has no config file or [agents.plain] block.
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerAgent(t, store, "plain", runtime.ShellRuntime, "", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-plain-default-timeout", Agent: "plain", Action: "ask", Repo: "owner/repo", Branch: "main"})
+	job, err := store.GetJob(ctx, "job-plain-default-timeout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := &timeoutCaptureAdapter{}
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return t.TempDir(), nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) { return capture, nil }
+	started := time.Now()
+	if err := worker.run(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != string(workflow.JobSucceeded) {
+		t.Fatalf("plain agent job state = %q, want succeeded with daemon default timeout", stored.State)
+	}
+	assertCapturedTimeout(t, capture, started, config.DefaultDaemonJobTimeoutDefault)
+}
+
 func TestManagedJobConfigLoadsDaemonTimeoutAuthority(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
