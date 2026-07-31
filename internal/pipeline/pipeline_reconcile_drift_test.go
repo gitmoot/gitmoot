@@ -121,6 +121,96 @@ func TestPipelineScanReconcilesLiveCancelledRunAcrossSpecDrift(t *testing.T) {
 	}
 }
 
+// TestPipelineScanDoesNotSettleSpecDriftedLiveStages pins the destructive
+// polarity of the terminal-only reconciler. A drifted run may be inspected for
+// terminal evidence, but a queued or running stage backed by a live job must
+// remain in flight rather than falling through to a false successful settlement.
+func TestPipelineScanDoesNotSettleSpecDriftedLiveStages(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		stageState string
+		jobState   workflow.JobState
+	}{
+		{name: "running", stageState: StageRunning, jobState: workflow.JobRunning},
+		{name: "queued", stageState: StageQueued, jobState: workflow.JobQueued},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := pipelineAdvanceStore(t)
+			pipelineName := "drifted-live-" + tc.name
+			runID := "prun-drifted-live-" + tc.name
+			jobID := runID + "-work-a0"
+			startedAt := time.Date(2026, 7, 31, 9, 0, 0, 0, time.UTC)
+			scanAt := startedAt.Add(5 * time.Minute)
+
+			if err := store.CreateOrUpdatePipeline(ctx, db.Pipeline{
+				Name:       pipelineName,
+				Repo:       "owner/repo",
+				SpecYAML:   dreamingLiveCurrentSpec,
+				SpecHash:   "current-" + tc.name,
+				Enabled:    false,
+				LastRunID:  runID,
+				LastStatus: RunRunning,
+			}); err != nil {
+				t.Fatalf("CreateOrUpdatePipeline: %v", err)
+			}
+			if err := store.UpdatePipelineLastRun(ctx, pipelineName, runID, RunRunning, startedAt); err != nil {
+				t.Fatalf("UpdatePipelineLastRun: %v", err)
+			}
+			if err := store.CreatePipelineRun(ctx, db.PipelineRun{
+				ID:          runID,
+				Pipeline:    pipelineName,
+				Trigger:     "schedule",
+				PayloadJSON: "{}",
+				SpecHash:    "snapshot-" + tc.name,
+				State:       RunRunning,
+				StartedAt:   startedAt,
+			}); err != nil {
+				t.Fatalf("CreatePipelineRun: %v", err)
+			}
+			if err := store.CreatePipelineRunStage(ctx, db.PipelineRunStage{
+				RunID:     runID,
+				StageID:   "work",
+				State:     tc.stageState,
+				JobID:     jobID,
+				StartedAt: startedAt,
+			}); err != nil {
+				t.Fatalf("CreatePipelineRunStage: %v", err)
+			}
+			if err := store.CreateJobWithEvent(ctx, db.Job{
+				ID:      jobID,
+				Agent:   "worker",
+				Type:    "ask",
+				State:   string(tc.jobState),
+				Payload: `{"repo":"owner/repo","sender":"pipeline","root_job_id":"` + runID + `"}`,
+			}, db.JobEvent{JobID: jobID, Kind: string(tc.jobState), Message: "live job"}); err != nil {
+				t.Fatalf("CreateJobWithEvent: %v", err)
+			}
+
+			if err := RunPipelineScanOnce(ctx, store, testStageEnqueuer(store), scanAt); err != nil {
+				t.Fatalf("RunPipelineScanOnce: %v", err)
+			}
+			gotRun, ok, err := store.GetPipelineRun(ctx, runID)
+			if err != nil || !ok {
+				t.Fatalf("GetPipelineRun(%s): ok=%v err=%v", runID, ok, err)
+			}
+			if gotRun.State != RunRunning || !gotRun.FinishedAt.IsZero() {
+				t.Fatalf("spec-drifted %s stage settled run = {state=%q finished_at=%s}, want running with no finish", tc.stageState, gotRun.State, gotRun.FinishedAt)
+			}
+			if gotStage := stageRow(t, store, runID, "work"); gotStage.State != tc.stageState {
+				t.Fatalf("spec-drifted stage state = %q, want %q", gotStage.State, tc.stageState)
+			}
+			gotPipeline, ok, err := store.GetPipeline(ctx, pipelineName)
+			if err != nil || !ok {
+				t.Fatalf("GetPipeline(%s): ok=%v err=%v", pipelineName, ok, err)
+			}
+			if gotPipeline.LastStatus != RunRunning {
+				t.Fatalf("spec-drifted pipeline last_status = %q, want %q", gotPipeline.LastStatus, RunRunning)
+			}
+		})
+	}
+}
+
 func setDreamingLiveFixtureTimes(t *testing.T, store *db.Store, jobID string, createdAt, cancelledAt time.Time) {
 	t.Helper()
 	conn, err := sql.Open("sqlite", store.DatabasePath())
