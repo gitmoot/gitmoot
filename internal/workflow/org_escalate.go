@@ -12,39 +12,19 @@ const OrgEscalateResolvedPrefix = "[org:escalate-resolved "
 // schema. Invalid delimiter-bearing fields return an empty string; normal CLI
 // callers validate role and workflow values before reaching this helper.
 func FormatOrgEscalateNote(from, to, wf, question string) string {
-	if !validOrgEscalateField(from) || !validOrgEscalateField(to) || !validOrgEscalateField(wf) || strings.TrimSpace(question) == "" {
-		return ""
-	}
-	return OrgEscalatePrefix + "to=" + to + " from=" + from + " wf=" + wf + "] " + question
+	return formatAddressedOrgNote("escalate", []addressedOrgNoteField{
+		{key: "to", value: to}, {key: "from", value: from}, {key: "wf", value: wf},
+	}, question)
 }
 
 // ParseOrgEscalateNote decodes the typed escalation prefix. The first closing
 // bracket ends the key block, so brackets in the question are preserved.
 func ParseOrgEscalateNote(body string) (from, to, wf, question string, ok bool) {
-	if !strings.HasPrefix(body, OrgEscalatePrefix) {
+	values, question, ok := parseAddressedOrgNote("escalate", body)
+	if !ok || len(values) != 3 {
 		return "", "", "", "", false
-	}
-	end := strings.IndexByte(body, ']')
-	if end < 0 || end == len(OrgEscalatePrefix)-1 || end+1 >= len(body) || body[end+1] != ' ' {
-		return "", "", "", "", false
-	}
-	fields := strings.Fields(body[len(OrgEscalatePrefix):end])
-	if len(fields) != 3 {
-		return "", "", "", "", false
-	}
-	values := make(map[string]string, 3)
-	for _, field := range fields {
-		key, value, hasValue := strings.Cut(field, "=")
-		if !hasValue || (key != "to" && key != "from" && key != "wf") || !validOrgEscalateField(value) {
-			return "", "", "", "", false
-		}
-		if _, duplicate := values[key]; duplicate {
-			return "", "", "", "", false
-		}
-		values[key] = value
 	}
 	from, to, wf = values["from"], values["to"], values["wf"]
-	question = body[end+2:]
 	if from == "" || to == "" || wf == "" || strings.TrimSpace(question) == "" {
 		return "", "", "", "", false
 	}
@@ -57,36 +37,19 @@ func FormatOrgEscalateResolvedNote(escalationNoteID int64, resolvedBy string, an
 	if escalationNoteID <= 0 || !validOrgEscalateField(resolvedBy) {
 		return ""
 	}
-	body := OrgEscalateResolvedPrefix + "id=" + strconv.FormatInt(escalationNoteID, 10) + " by=" + resolvedBy
+	fields := []addressedOrgNoteField{{key: "id", value: strconv.FormatInt(escalationNoteID, 10)}, {key: "by", value: resolvedBy}}
 	if answerNoteID > 0 {
-		body += " note=" + strconv.FormatInt(answerNoteID, 10)
+		fields = append(fields, addressedOrgNoteField{key: "note", value: strconv.FormatInt(answerNoteID, 10)})
 	}
-	return body + "] resolved"
+	return formatAddressedOrgNote("escalate-resolved", fields, "resolved")
 }
 
 // ParseOrgEscalateResolvedNote decodes an escalation resolution marker.
 func ParseOrgEscalateResolvedNote(body string) (escalationNoteID int64, resolvedBy string, answerNoteID int64, ok bool) {
-	if !strings.HasPrefix(body, OrgEscalateResolvedPrefix) {
+	values, content, ok := parseAddressedOrgNote("escalate-resolved", body)
+	if !ok || content != "resolved" || len(values) < 2 || len(values) > 3 ||
+		(len(values) == 3 && values["note"] == "") {
 		return 0, "", 0, false
-	}
-	end := strings.IndexByte(body, ']')
-	if end < 0 || body[end:] != "] resolved" {
-		return 0, "", 0, false
-	}
-	fields := strings.Fields(body[len(OrgEscalateResolvedPrefix):end])
-	if len(fields) < 2 || len(fields) > 3 {
-		return 0, "", 0, false
-	}
-	values := make(map[string]string, 3)
-	for _, field := range fields {
-		key, value, hasValue := strings.Cut(field, "=")
-		if !hasValue || (key != "id" && key != "by" && key != "note") || value == "" {
-			return 0, "", 0, false
-		}
-		if _, duplicate := values[key]; duplicate {
-			return 0, "", 0, false
-		}
-		values[key] = value
 	}
 	if !validOrgEscalateField(values["by"]) || values["id"] == "" {
 		return 0, "", 0, false

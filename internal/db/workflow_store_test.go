@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -180,6 +181,41 @@ func TestListWorkflowNotesByBodyPrefix(t *testing.T) {
 	}
 	if len(handoffs) != 1 || handoffs[0].WorkflowID != "release/two" {
 		t.Fatalf("handoffs = %+v", handoffs)
+	}
+}
+
+func TestListUnacknowledgedOrgDirectivesKeepsOldestFirst(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	first, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: "release/directives", Author: "owner", Body: "[org:directive to=worker from=owner wf=release/directives] first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: "release/directives", Author: "owner", Body: "[org:directive to=worker from=owner wf=release/directives] second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: "release/directives", Author: "worker", Body: fmt.Sprintf("[org:directive-ack id=%d by=worker]", first.ID)}); err != nil {
+		t.Fatal(err)
+	}
+	third, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: "release/directives", Author: "owner", Body: "[org:directive to=worker from=owner wf=release/directives] third"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: "release/directives", Author: "owner", Body: "[org:directive to=worker from=owner wf=release/directives] cancelled"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: "release/directives", Author: "owner", Body: fmt.Sprintf("[org:directive-cancel id=%d by=owner]", cancelled.ID)}); err != nil {
+		t.Fatal(err)
+	}
+
+	notes, err := store.ListUnacknowledgedOrgDirectives(ctx, "worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(notes) != 2 || notes[0].ID != second.ID || notes[1].ID != third.ID {
+		t.Fatalf("unacknowledged directives = %+v, want ids [%d %d] oldest first", notes, second.ID, third.ID)
 	}
 }
 

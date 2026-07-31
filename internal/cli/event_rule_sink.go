@@ -191,7 +191,7 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 	if !ok {
 		return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "organization registry unavailable", errors.New("organization registry unavailable"))
 	}
-	isReply := event.Type == events.EventOrgReply
+	isAddressedNoteWake := event.Type == events.EventOrgReply || event.Type == events.EventOrgDirective
 	replyHandled := false
 	addressedReplyHandled := false
 	for _, rule := range rules {
@@ -202,7 +202,7 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 		// Preserve the existing one-attempt-per-target behavior for duplicate
 		// addressed reply rules while allowing every observer rule to see the
 		// directed event independently.
-		if isReply && !observer && addressedReplyHandled {
+		if isAddressedNoteWake && !observer && addressedReplyHandled {
 			continue
 		}
 		pane, ok := s.resolveRolePane(ctx, cfg, rule.WakeRole)
@@ -263,15 +263,15 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 		// A coalesced reply batch still gives its addressed target one attempt per
 		// window. Observer rules are independent copies and do not consume that
 		// target attempt.
-		if isReply {
+		if isAddressedNoteWake {
 			replyHandled = true
 			if !observer {
 				addressedReplyHandled = true
 			}
 		}
 	}
-	if isReply && !replyHandled {
-		return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "no matching reply rule or role binding", errors.New("no matching reply rule or role binding"))
+	if isAddressedNoteWake && !replyHandled {
+		return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "no matching addressed rule or role binding", errors.New("no matching addressed rule or role binding"))
 	}
 	return nil
 }
@@ -405,6 +405,8 @@ func classifyEventRuleKinds(event events.Event) []string {
 		return []string{"pane_input_pending"}
 	case events.EventOrgReply:
 		return []string{"reply"}
+	case events.EventOrgDirective:
+		return []string{"directive"}
 	}
 	return nil
 }
@@ -438,6 +440,13 @@ func eventRuleMatches(filter string, event events.Event) bool {
 }
 
 func eventRuleWakePrompt(kind string, event events.Event) string {
+	if strings.EqualFold(strings.TrimSpace(kind), db.WakeOutboxKindDirective) {
+		directiveID := strings.TrimPrefix(event.RootID, db.WakeOutboxSourceWorkflowNote+":")
+		return fmt.Sprintf(
+			"gitmoot directive %s for %s; acknowledge receipt with: gitmoot org directive ack %s --by %s",
+			directiveID, event.WakeTargetRole, directiveID, event.WakeTargetRole,
+		)
+	}
 	// event.Detail is already redacted + absolute-path-scrubbed by events.NewEvent,
 	// so it is used as-is here (only trimmed and rune-safe truncated for the arg).
 	detail := truncateForWake(strings.TrimSpace(event.Detail), 320)
