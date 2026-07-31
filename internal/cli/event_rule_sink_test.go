@@ -19,6 +19,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 type fakeEventWake struct {
@@ -102,7 +103,7 @@ func TestClassifyEventRuleKinds(t *testing.T) {
 
 func TestWakeTargetRoleHasExactlyOneProductionWriteInWakeOutboxEvent(t *testing.T) {
 	writes := productionWakeTargetRoleWrites(t)
-	if got, want := fmt.Sprint(writes), "[internal/cli/reply_wake_outbox.go:wakeOutboxEvent]"; got != want {
+	if got, want := fmt.Sprint(writes), "[internal/cli/blocked_since.go:emitInputPendingEpisode internal/cli/event_rule_sink.go:addressBlockedEvent internal/cli/event_sink.go:emitDaemonTerminalEvent internal/cli/reply_wake_outbox.go:wakeOutboxEvent]"; got != want {
 		t.Fatalf("production WakeTargetRole writes = %s, want %s", got, want)
 	}
 	registryWrites := make([]wakeTargetRoleWrite, 0, len(wakeTargetRoleProducers))
@@ -341,6 +342,121 @@ pane="w1:p3"
 	}
 }
 
+func TestAddresslessBlockedWakeMatchesObserversOnly(t *testing.T) {
+	store := daemonWorkerStore(t)
+	ctx := context.Background()
+	for _, rule := range []db.EventRule{
+		{ID: "addressed-uninvolved", OnKind: "blocked", WakeRole: "uninvolved", Scope: db.EventRuleScopeAddressed, Enabled: true},
+		{ID: "observer-jarvis", OnKind: "blocked", WakeRole: "jarvis", Scope: db.EventRuleScopeObserver, Enabled: true},
+		{ID: "observer-audit", OnKind: "blocked", WakeRole: "audit", Scope: db.EventRuleScopeObserver, Enabled: true},
+	} {
+		if err := store.AddEventRule(ctx, rule); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	(&eventRuleSink{store: store}).Emit(ctx, events.Event{
+		Type: events.EventJobBlocked, Cause: "blocked_since", JobID: "task-without-owner",
+	})
+
+	if got, want := pendingWakeTargetRoles(t, store), []string{"audit", "jarvis"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("address-less blocked wake targets = %v, want observer roles %v", got, want)
+	}
+}
+
+func TestBlockedWakeTargetsRecordedOrResolvedOwnerPlusObservers(t *testing.T) {
+	tests := []struct {
+		name        string
+		repo        string
+		jobRole     string
+		wantRoles   []string
+		wantTarget  string
+		useTerminal bool
+	}{
+		{name: "terminal uses recorded workflow role", repo: "gitmoot/gitmoot", jobRole: "lane", useTerminal: true, wantRoles: []string{"jarvis", "lane"}, wantTarget: "lane"},
+		{name: "blocked-since resolves repo owner", repo: "gitmoot/gitmoot", wantRoles: []string{"jarvis", "lane"}, wantTarget: "lane"},
+		{name: "repo without owner is observers only", repo: "unknown/repo", wantRoles: []string{"jarvis"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			home := t.TempDir()
+			paths := config.PathsForHome(home)
+			if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			const orgConfig = `
+[org.roles."owner"]
+scope=["gitmoot/*", "other/*", "oversight/*"]
+pane="w1:p1"
+[org.roles."lane"]
+parent="owner"
+scope=["gitmoot/gitmoot"]
+pane="w1:p2"
+[org.roles."other"]
+parent="owner"
+scope=["other/*"]
+pane="w1:p3"
+[org.roles."jarvis"]
+parent="owner"
+scope=["oversight/*"]
+pane="w1:p4"
+`
+			if err := os.WriteFile(paths.ConfigFile, []byte(orgConfig), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			store, err := db.Open(paths.Database)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			for _, rule := range []db.EventRule{
+				{ID: "addressed-lane", OnKind: "blocked", WakeRole: "lane", Scope: db.EventRuleScopeAddressed, Enabled: true},
+				{ID: "addressed-other", OnKind: "blocked", WakeRole: "other", Scope: db.EventRuleScopeAddressed, Enabled: true},
+				{ID: "observer-jarvis", OnKind: "blocked", WakeRole: "jarvis", Scope: db.EventRuleScopeObserver, Enabled: true},
+			} {
+				if err := store.AddEventRule(ctx, rule); err != nil {
+					t.Fatal(err)
+				}
+			}
+			recorded := &recordingSink{}
+			sink := &eventRuleSink{inner: recorded, store: store, home: home}
+			if test.useTerminal {
+				if err := store.CreateJob(ctx, db.Job{
+					ID: "blocked-job", Agent: "worker", Type: "ask", State: string(workflow.JobBlocked),
+					Payload: mustJobPayload(t, workflow.JobPayload{Repo: test.repo, ActingOrgRole: test.jobRole}),
+				}); err != nil {
+					t.Fatal(err)
+				}
+				emitDaemonTerminalEvent(ctx, sink, store, "blocked-job", events.EventJobBlocked, string(workflow.JobBlocked), "blocked")
+			} else {
+				sink.Emit(ctx, events.Event{Type: events.EventJobBlocked, Cause: "blocked_since", JobID: "blocked-task", Repo: test.repo})
+			}
+			if got := pendingWakeTargetRoles(t, store); !reflect.DeepEqual(got, test.wantRoles) {
+				t.Fatalf("blocked wake targets = %v, want %v", got, test.wantRoles)
+			}
+			gotEvents := recorded.byType(events.EventJobBlocked)
+			if len(gotEvents) != 1 || gotEvents[0].WakeTargetRole != test.wantTarget {
+				t.Fatalf("blocked event target = %+v, want %q", gotEvents, test.wantTarget)
+			}
+		})
+	}
+}
+
+func pendingWakeTargetRoles(t *testing.T, store *db.Store) []string {
+	t.Helper()
+	rows, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roles := make([]string, 0, len(rows))
+	for _, row := range rows {
+		roles = append(roles, row.TargetRole)
+	}
+	sort.Strings(roles)
+	return roles
+}
+
 func TestReplyObserverDoesNotConsumeAddressedTargetAttempt(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
@@ -416,7 +532,7 @@ func TestEventRuleEvaluatorResolvesPaneAndWakes(t *testing.T) {
 	}
 	wake := &fakeEventWake{}
 	sink := &eventRuleSink{store: store, home: home, wake: wake}
-	sink.evaluate(context.Background(), events.Event{Type: events.EventJobNeedsAttention, Cause: "ask_gate", Repo: "acme/widget", JobID: "job-1", Detail: "Please choose"})
+	sink.evaluate(context.Background(), events.Event{Type: events.EventJobNeedsAttention, Cause: "ask_gate", Repo: "acme/widget", JobID: "job-1", Detail: "Please choose", WakeTargetRole: "owner"})
 	if wake.availableCalls != 1 || wake.pane != "w1:p1" || wake.until != "" {
 		t.Fatalf("wake=%+v", wake)
 	}
@@ -445,7 +561,7 @@ func TestEventRuleWakeStallIncrementsAndDeliveryResetsCounter(t *testing.T) {
 	}
 	wake := &fakeEventWake{stalled: true}
 	sink := &eventRuleSink{store: store, home: home, wake: wake}
-	event := events.Event{Type: events.EventJobNeedsAttention, Cause: "ask_gate", JobID: "job-counter"}
+	event := events.Event{Type: events.EventJobNeedsAttention, Cause: "ask_gate", JobID: "job-counter", WakeTargetRole: "owner"}
 	sink.evaluate(ctx, event)
 	misses, err := store.ListRoleMissedWakes(ctx)
 	if err != nil || len(misses) != 1 || misses[0].Role != "owner" || misses[0].Consecutive != 1 {
@@ -480,7 +596,7 @@ func TestEventRuleEvaluatorResolvesPaneLabel(t *testing.T) {
 	}
 	wake := &fakeEventWake{labelToPane: map[string]string{"coordinator-a": "w2:p5"}}
 	sink := &eventRuleSink{store: store, home: home, wake: wake}
-	sink.evaluate(context.Background(), events.Event{Type: events.EventJobBlocked, Cause: "merge_guard", JobID: "job-9"})
+	sink.evaluate(context.Background(), events.Event{Type: events.EventJobBlocked, Cause: "merge_guard", JobID: "job-9", WakeTargetRole: "owner"})
 	if wake.pane != "w2:p5" {
 		t.Fatalf("label did not resolve to live pane id: %+v", wake)
 	}
@@ -508,7 +624,7 @@ func TestEventRuleEvaluatorCountsUnresolvedRoleBinding(t *testing.T) {
 	wake := &fakeEventWake{}
 	sink := &eventRuleSink{store: store, home: home, wake: wake}
 	if err := sink.evaluate(context.Background(), events.Event{
-		Type: events.EventJobNeedsAttention, Cause: "ask_gate", JobID: "job-unresolved",
+		Type: events.EventJobNeedsAttention, Cause: "ask_gate", JobID: "job-unresolved", WakeTargetRole: "owner",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -521,6 +637,47 @@ func TestEventRuleEvaluatorCountsUnresolvedRoleBinding(t *testing.T) {
 	}
 	if wake.promptCalls != 0 {
 		t.Fatalf("unresolved binding prompted %d times", wake.promptCalls)
+	}
+}
+
+func TestDurableWakeWithUnresolvedPaneParksAsStalled(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"missing-pane\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.AddEventRule(ctx, db.EventRule{
+		ID: "blocked-owner", OnKind: "blocked", WakeRole: "owner", Scope: db.EventRuleScopeAddressed, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ruleSink := &eventRuleSink{store: store, home: home, wake: &fakeEventWake{}}
+	ruleSink.Emit(ctx, events.Event{
+		Type: events.EventJobBlocked, Cause: "blocked_since", JobID: "blocked-task", Repo: "owner/repo", WakeTargetRole: "owner",
+	})
+	if err := drainReplyWakeAfterAllRowsAreDueResult(t, store, synchronousEventRuleTestSink{sink: ruleSink}); err != nil {
+		t.Fatalf("drain unresolved pane wake: %v", err)
+	}
+	stalled, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateStalled)
+	if err != nil || len(stalled) != 1 || stalled[0].TargetRole != "owner" || stalled[0].LastError != "role pane binding unresolved" {
+		t.Fatalf("stalled unresolved wake = %+v, err=%v", stalled, err)
+	}
+	failed, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateFailed)
+	if err != nil || len(failed) != 0 {
+		t.Fatalf("failed unresolved wake rows = %+v, err=%v", failed, err)
+	}
+	missed, err := store.ListRoleMissedWakes(ctx)
+	if err != nil || len(missed) != 1 || missed[0].Role != "owner" || missed[0].Consecutive != 1 {
+		t.Fatalf("unresolved wake counter = %+v, err=%v", missed, err)
 	}
 }
 
@@ -596,7 +753,7 @@ func TestEventRuleWakeFiresEachMatchingRule(t *testing.T) {
 	}
 	wake := &fakeEventWake{}
 	sink := &eventRuleSink{store: store, home: home, wake: wake}
-	sink.evaluate(context.Background(), events.Event{Type: events.EventJobBlocked, JobID: "job-1"})
+	sink.evaluate(context.Background(), events.Event{Type: events.EventJobBlocked, JobID: "job-1", WakeTargetRole: "owner"})
 	if wake.promptCalls != 2 {
 		t.Fatalf("want a wake for each of the 2 matching rules, got %d", wake.promptCalls)
 	}

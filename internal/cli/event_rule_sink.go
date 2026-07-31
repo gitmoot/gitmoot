@@ -13,6 +13,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 const (
@@ -47,6 +48,7 @@ func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
 	if s == nil {
 		return
 	}
+	event = s.addressBlockedEvent(ctx, event)
 	events.EmitEvent(ctx, s.inner, event)
 	if s.store == nil {
 		return
@@ -119,7 +121,7 @@ func partitionDurableWakeRules(
 	event events.Event,
 ) (targetRoles []string, remaining []db.EventRule) {
 	for _, rule := range rules {
-		if !rule.Enabled || !containsEventRuleKind(kinds, rule.OnKind) || !eventRuleMatches(rule.MatchFilter, event) {
+		if !rule.Enabled || !containsEventRuleKind(kinds, rule.OnKind) || !eventRuleMatches(rule.MatchFilter, event) || !eventRuleMatchesAddressee(rule, event) {
 			continue
 		}
 		if strings.EqualFold(strings.TrimSpace(rule.OnKind), wakeKind) {
@@ -190,17 +192,13 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 		return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "organization registry unavailable", errors.New("organization registry unavailable"))
 	}
 	isReply := event.Type == events.EventOrgReply
-	hasAddressee := strings.TrimSpace(event.WakeTargetRole) != ""
 	replyHandled := false
 	addressedReplyHandled := false
 	for _, rule := range rules {
-		if !rule.Enabled || !containsEventRuleKind(kinds, rule.OnKind) || !eventRuleMatches(rule.MatchFilter, event) {
+		if !rule.Enabled || !containsEventRuleKind(kinds, rule.OnKind) || !eventRuleMatches(rule.MatchFilter, event) || !eventRuleMatchesAddressee(rule, event) {
 			continue
 		}
 		observer := rule.Scope == db.EventRuleScopeObserver
-		if hasAddressee && !observer && !strings.EqualFold(strings.TrimSpace(rule.WakeRole), strings.TrimSpace(event.WakeTargetRole)) {
-			continue
-		}
 		// Preserve the existing one-attempt-per-target behavior for duplicate
 		// addressed reply rules while allowing every observer rule to see the
 		// directed event independently.
@@ -213,6 +211,9 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 				slog.Warn("org event unresolved wake counter failed", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "error", err)
 			}
 			slog.Warn("org event wake skipped", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "reason", "role pane binding unresolved")
+			if err := s.finishWakeOutbox(ctx, event, db.WakeOutboxStateStalled, "role pane binding unresolved"); err != nil {
+				return err
+			}
 			continue
 		}
 		prompt := eventRuleWakePrompt(rule.OnKind, event)
@@ -273,6 +274,47 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 		return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "no matching reply rule or role binding", errors.New("no matching reply rule or role binding"))
 	}
 	return nil
+}
+
+// eventRuleMatchesAddressee is the single scope gate shared by durable enqueue
+// and live evaluation. Addressed rules require positive target evidence;
+// observer rules deliberately retain fleet-wide oversight for address-less and
+// directed events alike.
+func eventRuleMatchesAddressee(rule db.EventRule, event events.Event) bool {
+	if rule.Scope == db.EventRuleScopeObserver {
+		return true
+	}
+	target := strings.TrimSpace(event.WakeTargetRole)
+	return target != "" && strings.EqualFold(strings.TrimSpace(rule.WakeRole), target)
+}
+
+// addressBlockedEvent enriches every blocked event at the event-sink source
+// boundary before webhook fanout or durable routing. Persisted job attribution
+// is the strongest ownership evidence; synthesized blocked-since events fall
+// back to the most-specific org role scoped to the event repository.
+func (s *eventRuleSink) addressBlockedEvent(ctx context.Context, event events.Event) events.Event {
+	if event.Type != events.EventJobBlocked || strings.TrimSpace(event.WakeTargetRole) != "" {
+		return event
+	}
+	targetRole := ""
+	if s.store != nil && strings.TrimSpace(event.JobID) != "" {
+		if job, err := s.store.GetJob(ctx, event.JobID); err == nil {
+			if payload, err := daemonJobPayload(job); err == nil {
+				if role := workflow.NormalizeActingOrgRole(payload.ActingOrgRole); role != "" {
+					targetRole = role
+				}
+			}
+		}
+	}
+	if targetRole == "" {
+		if cfg, ok := s.loadOrgConfig(); ok {
+			targetRole, _ = repoOrgOwner(cfg, event.Repo)
+		}
+	}
+	if targetRole != "" {
+		event.WakeTargetRole = targetRole
+	}
+	return event
 }
 
 func recordUnresolvedRoleWake(ctx context.Context, store *db.Store, role string) error {

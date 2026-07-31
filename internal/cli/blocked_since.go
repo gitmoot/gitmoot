@@ -441,6 +441,7 @@ func emitInputPendingEpisode(ctx context.Context, store *db.Store, sink events.S
 	detail := fmt.Sprintf("role %s input pending %s (since %s)", role, pendingFor.Round(time.Second), pendingSince.UTC().Format(time.RFC3339))
 	ev := events.NewEvent(events.EventOrgInputPending, subjectID, subjectID, "", string(org.StateInputPending), detail, now, workflow.RedactCommentText)
 	ev.Cause = "input_pending_since"
+	ev.WakeTargetRole = role
 	events.EmitEvent(ctx, sink, ev)
 	return nil
 }
