@@ -162,6 +162,83 @@ func TestMemoryRetireByProvenancePrefixDryRunApplyAndFTS(t *testing.T) {
 	}
 }
 
+func seedMemoryRetireTierGuards(t *testing.T) (string, *db.Store, int64, int64) {
+	t.Helper()
+	home, store := memoryTestHome(t)
+	ctx := context.Background()
+	owner := db.MemoryOwner{Kind: "agent", Ref: "dreamer"}
+	confirmedID, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
+		Owner: owner, Repo: "owner/repo", Scope: "repo", Key: "confirmed-keeper",
+		Content: "A confirmed keeper must remain isolated from pending retirement.", Provenance: "dream:2026-07-27/keeper",
+	})
+	if err != nil {
+		t.Fatalf("seed confirmed memory: %v", err)
+	}
+	pendingID, err := store.InsertMemoryObservation(ctx, db.MemoryObservation{
+		Owner: owner, Repo: "owner/repo", Scope: "repo", Key: "pending-noise",
+		Content: "A pending noisy observation.", Provenance: "dream:2026-07-27/noise", TrustMark: "normal",
+	})
+	if err != nil {
+		t.Fatalf("seed pending observation: %v", err)
+	}
+	return home, store, confirmedID, pendingID
+}
+
+func TestMemoryRetirePendingNeverTouchesConfirmed(t *testing.T) {
+	home, store, confirmedID, pendingID := seedMemoryRetireTierGuards(t)
+	code, out, errOut := runMemoryCapture(t, "retire", "--home", home,
+		"--pending", "--provenance-prefix", "dream:2026-07-27/", "--agent", "dreamer", "--dry-run", "--json")
+	if code != 0 {
+		t.Fatalf("pending retire dry-run exit %d: stdout=%s stderr=%s", code, out, errOut)
+	}
+	var preview memoryRetireResult
+	if err := json.Unmarshal([]byte(out), &preview); err != nil {
+		t.Fatalf("parse pending retire dry-run: %v (%s)", err, out)
+	}
+	if !preview.Pending || !preview.DryRun || preview.Selected != 1 || preview.Retired != 0 ||
+		len(preview.IDs) != 1 || preview.IDs[0] != pendingID {
+		t.Fatalf("pending retire dry-run = %+v, want one selected pending observation and no writes", preview)
+	}
+	if _, ok, err := store.GetMemoryObservationByID(context.Background(), pendingID); err != nil || !ok {
+		t.Fatalf("pending dry-run touched observation %d: ok=%v err=%v", pendingID, ok, err)
+	}
+
+	code, out, errOut = runMemoryCapture(t, "retire", "--home", home,
+		"--pending", "--provenance-prefix", "dream:2026-07-27/", "--agent", "dreamer", "--yes", "--json")
+	if code != 0 {
+		t.Fatalf("pending retire exit %d: stdout=%s stderr=%s", code, out, errOut)
+	}
+	confirmed, err := store.GetConfirmedMemoryByID(context.Background(), confirmedID)
+	if err != nil {
+		t.Fatalf("GetConfirmedMemoryByID(%d): %v", confirmedID, err)
+	}
+	if confirmed.RetiredAt != "" {
+		t.Fatalf("--pending retired confirmed memory %d at %q", confirmedID, confirmed.RetiredAt)
+	}
+	if _, ok, err := store.GetMemoryObservationByID(context.Background(), pendingID); err != nil || ok {
+		t.Fatalf("--pending left pending observation %d: ok=%v err=%v", pendingID, ok, err)
+	}
+}
+
+func TestMemoryRetireDefaultNeverTouchesPending(t *testing.T) {
+	home, store, confirmedID, pendingID := seedMemoryRetireTierGuards(t)
+	code, out, errOut := runMemoryCapture(t, "retire", "--home", home,
+		"--provenance-prefix", "dream:2026-07-27/", "--agent", "dreamer", "--yes", "--json")
+	if code != 0 {
+		t.Fatalf("confirmed retire exit %d: stdout=%s stderr=%s", code, out, errOut)
+	}
+	confirmed, err := store.GetConfirmedMemoryByID(context.Background(), confirmedID)
+	if err != nil {
+		t.Fatalf("GetConfirmedMemoryByID(%d): %v", confirmedID, err)
+	}
+	if confirmed.RetiredAt == "" {
+		t.Fatalf("default retire left confirmed memory %d active", confirmedID)
+	}
+	if _, ok, err := store.GetMemoryObservationByID(context.Background(), pendingID); err != nil || !ok {
+		t.Fatalf("default retire touched pending observation %d: ok=%v err=%v", pendingID, ok, err)
+	}
+}
+
 func TestMemoryRecallRanksAndFiltersConfirmedMemories(t *testing.T) {
 	home, store := memoryTestHome(t)
 	ctx := context.Background()

@@ -3051,6 +3051,87 @@ FROM memory_observations o`
 	return out, rows.Err()
 }
 
+// ListMemoryObservationsForRetire returns human-reviewable pending observations
+// whose provenance starts with prefix. A non-empty agentRef narrows to rows owned
+// or authored by that agent. Confirmed memories are a separate table and are
+// structurally outside this query.
+func (s *Store) ListMemoryObservationsForRetire(ctx context.Context, prefix, agentRef string) ([]MemoryObservation, error) {
+	return listMemoryObservationsForRetire(ctx, s.db, prefix, agentRef)
+}
+
+// RetireMemoryObservationsByProvenancePrefix removes matching pending
+// observations atomically. Pending observations have no active/retired state:
+// retirement is deletion of the unconfirmed evidence row. This method never
+// reads or writes confirmed_memories.
+func (s *Store) RetireMemoryObservationsByProvenancePrefix(ctx context.Context, prefix, agentRef string) ([]MemoryObservation, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := listMemoryObservationsForRetire(ctx, tx, prefix, agentRef)
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		result, err := tx.ExecContext(ctx, `DELETE FROM memory_observations WHERE id = ?`, row.ID)
+		if err != nil {
+			return nil, fmt.Errorf("retire pending observation %d: %w", row.ID, err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if affected != 1 {
+			return nil, fmt.Errorf("retire pending observation %d: row disappeared", row.ID)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func listMemoryObservationsForRetire(ctx context.Context, q rowsQuerier, prefix, agentRef string) ([]MemoryObservation, error) {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return nil, fmt.Errorf("provenance prefix is required")
+	}
+	where := []string{
+		"provenance LIKE ? ESCAPE '\\'",
+		"provenance NOT LIKE ? ESCAPE '\\'",
+	}
+	args := []any{likePrefix(prefix), likePrefix(MemoryDistillWitnessProvenancePrefix)}
+	if agentRef = strings.TrimSpace(agentRef); agentRef != "" {
+		where = append(where, "(owner_ref = ? OR author_ref = ?)")
+		args = append(args, agentRef, agentRef)
+	}
+	rows, err := q.QueryContext(ctx, `
+SELECT id, owner_kind, owner_ref, owner_version, author_ref, repo, scope, key, content,
+	provenance, trust_mark, source_job, created_at
+FROM memory_observations
+WHERE `+strings.Join(where, " AND ")+`
+ORDER BY created_at DESC, id DESC`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list pending observations by provenance prefix: %w", err)
+	}
+	defer rows.Close()
+	var out []MemoryObservation
+	for rows.Next() {
+		var observation MemoryObservation
+		var repo sql.NullString
+		if err := rows.Scan(&observation.ID, &observation.Owner.Kind, &observation.Owner.Ref,
+			&observation.Owner.Version, &observation.AuthorRef, &repo, &observation.Scope,
+			&observation.Key, &observation.Content, &observation.Provenance,
+			&observation.TrustMark, &observation.SourceJob, &observation.CreatedAt); err != nil {
+			return nil, err
+		}
+		observation.Repo = repo.String
+		out = append(out, observation)
+	}
+	return out, rows.Err()
+}
+
 // GetMemoryObservationByID returns a single pending observation by its row id,
 // or (zero, false, nil) when no such row exists. It backs `memory confirm <id>`.
 func (s *Store) GetMemoryObservationByID(ctx context.Context, id int64) (MemoryObservation, bool, error) {
