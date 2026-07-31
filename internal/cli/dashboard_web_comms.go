@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"net/http"
 	"sort"
 	"strconv"
@@ -94,7 +95,63 @@ func (d *webDataSource) handleCommsPage(w http.ResponseWriter, _ *http.Request) 
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_, _ = fmt.Fprint(w, dashboardCommsPage)
+	page := strings.Replace(dashboardCommsPage, dashboardCommsSidebarPlaceholder, renderDashboardCommsSidebar("/comms"), 1)
+	_, _ = fmt.Fprint(w, page)
+}
+
+const dashboardCommsSidebarPlaceholder = "<!-- gitmoot-dashboard-sidebar -->"
+
+func renderDashboardCommsSidebar(activeHref string) string {
+	var out strings.Builder
+	out.WriteString(`<aside class="gm-sidebar" data-dashboard-sidebar aria-label="Dashboard navigation">`)
+	group := ""
+	for _, item := range dashboardNavManifest {
+		if item.Group != group {
+			group = item.Group
+			fmt.Fprintf(&out, `<div class="gm-nav-group">%s</div>`, html.EscapeString(group))
+		}
+		className := "gm-nav-link"
+		current := ""
+		if item.Href == activeHref {
+			className += " active"
+			current = ` aria-current="page"`
+		}
+		fmt.Fprintf(&out, `<a class="%s" href="%s"%s>%s<span>%s</span></a>`,
+			className,
+			html.EscapeString(item.Href),
+			current,
+			dashboardCommsNavIcon(item.Href),
+			html.EscapeString(item.Title),
+		)
+	}
+	out.WriteString(`<div class="gm-sidebar-foot"><span class="live-dot"></span><span>local · dashboard</span></div></aside>`)
+	return out.String()
+}
+
+func dashboardCommsNavIcon(href string) string {
+	const generic = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="6"/></svg>`
+	icons := map[string]string{
+		"/":          `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="6" height="6" rx="1.4"/><rect x="14" y="4" width="6" height="6" rx="1.4"/><rect x="4" y="14" width="6" height="6" rx="1.4"/><rect x="14" y="14" width="6" height="6" rx="1.4"/></svg>`,
+		"/tasks":     `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M7 4v16M17 4v16M4 7h6M14 12h6M4 17h6"/><circle cx="7" cy="7" r="1.8"/><circle cx="17" cy="12" r="1.8"/><circle cx="7" cy="17" r="1.8"/></svg>`,
+		"/workflows": `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M7 4v16"/><circle cx="7" cy="7" r="2"/><circle cx="7" cy="13" r="2"/><circle cx="7" cy="19" r="2"/><path d="M11 7h8M11 13h6M11 19h8"/></svg>`,
+		"/jobs":      `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M8 6h11M8 12h11M8 18h11"/><circle cx="4" cy="6" r="1.1"/><circle cx="4" cy="12" r="1.1"/><circle cx="4" cy="18" r="1.1"/></svg>`,
+		"/pipelines": `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="5" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="18" cy="12" r="2"/><path d="M7 7l9 4M7 17l9-4"/></svg>`,
+		"/agents":    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="5" y="8" width="14" height="11" rx="2.5"/><path d="M12 8V5"/><circle cx="12" cy="3.6" r="1"/><path d="M9.6 13h.01M14.4 13h.01"/></svg>`,
+		"/org":       `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="9" y="3" width="6" height="5" rx="1.4"/><rect x="3" y="16" width="6" height="5" rx="1.4"/><rect x="15" y="16" width="6" height="5" rx="1.4"/><path d="M12 8v3.5M6 16v-2.5h12V16"/></svg>`,
+		"/chat":      `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 5h13a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H9l-4 3v-3H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z"/></svg>`,
+		"/comms":     `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 5h12a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H9l-4 3v-3H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z"/><path d="M9 10h11a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-3l-3 2v-2"/></svg>`,
+		"/brain":     `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="2.2"/><circle cx="5" cy="7" r="1.6"/><circle cx="19" cy="6" r="1.6"/><circle cx="18" cy="18" r="1.6"/><circle cx="6" cy="18" r="1.6"/><path d="M10.2 10.8 6.4 8M13.6 10.5 17.6 7.2M13.7 13.5l3.2 3.2M10.3 13.5l-3 3.2"/></svg>`,
+		"/galaxy":    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3l1.7 4.5L18 9l-4.3 1.5L12 15l-1.7-4.5L6 9l4.3-1.5z"/><circle cx="18.5" cy="17.5" r="1"/></svg>`,
+		"/charts":    `<svg viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="12" width="3.2" height="8" rx="1"/><rect x="10.4" y="7" width="3.2" height="13" rx="1"/><rect x="16.8" y="4" width="3.2" height="16" rx="1"/></svg>`,
+		"/learning":  `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3a6 6 0 0 0-3.5 10.9c.6.4.9 1 .9 1.6v.5h5.2v-.5c0-.6.3-1.2.9-1.6A6 6 0 0 0 12 3zM9.6 20h4.8M10.6 22h2.8"/></svg>`,
+		"/attention": `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0"/></svg>`,
+		"/health":    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 12h4l2-6 4 12 2-6h6"/></svg>`,
+		"/config":    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg>`,
+	}
+	if icon := icons[href]; icon != "" {
+		return icon
+	}
+	return generic
 }
 
 func (d *webDataSource) comms(ctx context.Context, requestedNoteID int64) (dashboardCommsResponse, error) {
@@ -332,29 +389,7 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
     <button class="theme" id="theme" type="button" aria-label="Toggle light and dark theme">◐</button>
   </header>
   <div class="gm-frame">
-    <aside class="gm-sidebar" data-dashboard-sidebar aria-label="Dashboard navigation">
-      <div class="gm-nav-group">WORK</div>
-      <a class="gm-nav-link" href="/" title="Fleet overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="6" height="6" rx="1.4"/><rect x="14" y="4" width="6" height="6" rx="1.4"/><rect x="4" y="14" width="6" height="6" rx="1.4"/><rect x="14" y="14" width="6" height="6" rx="1.4"/></svg><span>Overview</span></a>
-      <a class="gm-nav-link" href="/tasks" title="Task lifecycle board"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M7 4v16M17 4v16M4 7h6M14 12h6M4 17h6"/><circle cx="7" cy="7" r="1.8"/><circle cx="17" cy="12" r="1.8"/><circle cx="7" cy="17" r="1.8"/></svg><span>Tasks</span></a>
-      <a class="gm-nav-link" href="/workflows" title="Workflow mission logs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M7 4v16"/><circle cx="7" cy="7" r="2"/><circle cx="7" cy="13" r="2"/><circle cx="7" cy="19" r="2"/><path d="M11 7h8M11 13h6M11 19h8"/></svg><span>Workflows</span></a>
-      <a class="gm-nav-link" href="/jobs" title="All jobs across every run"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M8 6h11M8 12h11M8 18h11"/><circle cx="4" cy="6" r="1.1"/><circle cx="4" cy="12" r="1.1"/><circle cx="4" cy="18" r="1.1"/></svg><span>Jobs</span></a>
-      <a class="gm-nav-link" href="/pipelines" title="Declared pipelines and run history"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="5" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="18" cy="12" r="2"/><path d="M7 7l9 4M7 17l9-4"/></svg><span>Pipelines</span></a>
-      <div class="gm-nav-group">FLEET</div>
-      <a class="gm-nav-link" href="/agents" title="Registered agents"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="5" y="8" width="14" height="11" rx="2.5"/><path d="M12 8V5"/><circle cx="12" cy="3.6" r="1"/><path d="M9.6 13h.01M14.4 13h.01"/></svg><span>Agents</span></a>
-      <a class="gm-nav-link" href="/org" title="Fleet hierarchy and presence"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="9" y="3" width="6" height="5" rx="1.4"/><rect x="3" y="16" width="6" height="5" rx="1.4"/><rect x="15" y="16" width="6" height="5" rx="1.4"/><path d="M12 8v3.5M6 16v-2.5h12V16"/></svg><span>Org</span></a>
-      <a class="gm-nav-link" href="/chat" title="Agent chat threads"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 5h13a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H9l-4 3v-3H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z"/></svg><span>Chat</span></a>
-      <a href="/comms" aria-current="page" class="gm-nav-link active" title="Org communication threads"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 5h12a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H9l-4 3v-3H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z"/><path d="M9 10h11a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-3l-3 2v-2"/></svg><span>Comms</span></a>
-      <div class="gm-nav-group">INSIGHT</div>
-      <a class="gm-nav-link" href="/brain" title="Memory fact galaxy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="2.2"/><circle cx="5" cy="7" r="1.6"/><circle cx="19" cy="6" r="1.6"/><circle cx="18" cy="18" r="1.6"/><circle cx="6" cy="18" r="1.6"/><path d="M10.2 10.8 6.4 8M13.6 10.5 17.6 7.2M13.7 13.5l3.2 3.2M10.3 13.5l-3 3.2"/></svg><span>Brain</span></a>
-      <a class="gm-nav-link" href="/galaxy" title="Cross-run galaxy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3l1.7 4.5L18 9l-4.3 1.5L12 15l-1.7-4.5L6 9l4.3-1.5z"/><circle cx="18.5" cy="17.5" r="1"/></svg><span>Galaxy</span></a>
-      <a class="gm-nav-link" href="/charts" title="Charts across every run"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="12" width="3.2" height="8" rx="1"/><rect x="10.4" y="7" width="3.2" height="13" rx="1"/><rect x="16.8" y="4" width="3.2" height="16" rx="1"/></svg><span>Charts</span></a>
-      <a class="gm-nav-link" href="/learning" title="SkillOpt evolution"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3a6 6 0 0 0-3.5 10.9c.6.4.9 1 .9 1.6v.5h5.2v-.5c0-.6.3-1.2.9-1.6A6 6 0 0 0 12 3zM9.6 20h4.8M10.6 22h2.8"/></svg><span>Learning</span></a>
-      <div class="gm-nav-group">SYSTEM</div>
-      <a class="gm-nav-link" href="/attention" title="Needs a human"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0"/></svg><span>Needs a human</span></a>
-      <a class="gm-nav-link" href="/health" title="Daemon health and locks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 12h4l2-6 4 12 2-6h6"/></svg><span>Health</span></a>
-      <a class="gm-nav-link" href="/config" title="Effective configuration"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg><span>Config</span></a>
-      <div class="gm-sidebar-foot"><span class="live-dot"></span><span>local · dashboard</span></div>
-    </aside>
+    <!-- gitmoot-dashboard-sidebar -->
     <section class="gm-content">
       <section class="filters" aria-label="Comms filters">
         <input class="control search" id="search" type="search" placeholder="Search workflows, roles, bodies…" aria-label="Search comms">
