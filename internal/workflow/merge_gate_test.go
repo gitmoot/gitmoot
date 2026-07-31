@@ -2273,6 +2273,150 @@ func TestPolicyMergeGateRejectsUnrecognizedDelegationEvidence(t *testing.T) {
 	}
 }
 
+func TestPolicyMergeGateRejectsUnrecognizedDelegationEvidenceAlongsideHealthyChild(t *testing.T) {
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	const parentID = "review-parent-mixed-unrecognized"
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: parentID, agent: "reviewer-a", hasResult: true, decision: "approved",
+		recorded: "2026-07-31 12:00:00",
+	})
+	insertMergeGateDelegationChild(t, store, parentID, "healthy", JobSucceeded, &AgentResult{
+		Decision: "approved",
+		Summary:  "surviving delegated evidence",
+	})
+	insertMergeGateDelegationChild(t, store, parentID, "unrecognized", JobState("paused"), &AgentResult{
+		Decision: "approved",
+		Summary:  "unrecognized child state",
+	})
+
+	decision, err := gate.Evaluate(context.Background(), request)
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+		t.Fatalf("decision = %+v, want mixed unrecognized delegation evidence refused", decision)
+	}
+	unrecognizedChildID := parentID + "/delegation/unrecognized"
+	if !strings.Contains(decision.Reason, "unrecognized delegation evidence") ||
+		!strings.Contains(decision.Reason, unrecognizedChildID) {
+		t.Fatalf("decision reason = %q, want unrecognized child %s", decision.Reason, unrecognizedChildID)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge calls = %+v, want none", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateDoesNotCountNonDelegationChildAsEvidence(t *testing.T) {
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	const parentID = "review-parent-nondelegation-sibling"
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: parentID, agent: "reviewer-a", hasResult: true, decision: "approved",
+		recorded: "2026-07-31 12:00:00",
+	})
+	insertMergeGateDelegationChild(t, store, parentID, "skipped-delegation", JobSucceeded, &AgentResult{
+		Decision: "skipped",
+		Summary:  "delegated child abstained",
+	})
+	insertMergeGateDelegationChild(t, store, parentID, "", JobSucceeded, &AgentResult{
+		Decision: "approved",
+		Summary:  "ordinary child is not delegation evidence",
+	})
+
+	decision, err := gate.Evaluate(context.Background(), request)
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+		t.Fatalf("decision = %+v, want non-delegation child excluded from evidence", decision)
+	}
+	skippedChildID := parentID + "/delegation/skipped-delegation"
+	if !strings.Contains(decision.Reason, "no surviving delegation evidence") ||
+		!strings.Contains(decision.Reason, skippedChildID) {
+		t.Fatalf("decision reason = %q, want skipped delegated child %s", decision.Reason, skippedChildID)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge calls = %+v, want none", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateRejectsMalformedDelegationEvidence(t *testing.T) {
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	const (
+		parentID = "review-parent-malformed-child"
+		childID  = parentID + "/delegation/malformed"
+	)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: parentID, agent: "reviewer-a", hasResult: true, decision: "approved",
+		recorded: "2026-07-31 12:00:00",
+	})
+	if err := store.CreateJobWithEvent(context.Background(), db.Job{
+		ID:           childID,
+		Agent:        "malformed",
+		Type:         "ask",
+		State:        string(JobSucceeded),
+		Payload:      "{not-json",
+		ParentJobID:  parentID,
+		DelegationID: "malformed",
+	}, db.JobEvent{Kind: string(JobSucceeded), Message: "malformed delegation fixture"}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+
+	decision, err := gate.Evaluate(context.Background(), request)
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+		t.Fatalf("decision = %+v, want malformed delegation evidence refused", decision)
+	}
+	if !strings.Contains(decision.Reason, "unrecognized delegation evidence") ||
+		!strings.Contains(decision.Reason, childID+" (malformed result)") {
+		t.Fatalf("decision reason = %q, want malformed child %s", decision.Reason, childID)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge calls = %+v, want none", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateWaitsForActiveDelegationChild(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state JobState
+	}{
+		{name: "queued", state: JobQueued},
+		{name: "running", state: JobRunning},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, gh, gate, request := newMergeGateQuorumScenario(t)
+			parentID := "review-parent-active-" + tc.name
+			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+				id: parentID, agent: "reviewer-a", hasResult: true, decision: "approved",
+				recorded: "2026-07-31 12:00:00",
+			})
+			insertMergeGateDelegationChild(t, store, parentID, tc.name, tc.state, nil)
+
+			decision, err := gate.Evaluate(context.Background(), request)
+
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if decision.Merged || decision.LeaveOpen || decision.EscalateMergeGateMiss {
+				t.Fatalf("decision = %+v, want active delegation child to wait without escalating", decision)
+			}
+			childID := parentID + "/delegation/" + tc.name
+			if !strings.Contains(decision.Reason, "waiting for delegated review parent "+parentID) ||
+				!strings.Contains(decision.Reason, childID+" ("+string(tc.state)+")") {
+				t.Fatalf("decision reason = %q, want waiting reason with active child %s", decision.Reason, childID)
+			}
+			if len(gh.merges) != 0 {
+				t.Fatalf("merge calls = %+v, want none", gh.merges)
+			}
+		})
+	}
+}
+
 func TestPolicyMergeGateLeavesOrdinaryReviewWithoutDelegationsUnaffected(t *testing.T) {
 	store, gh, gate, request := newMergeGateQuorumScenario(t)
 	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
