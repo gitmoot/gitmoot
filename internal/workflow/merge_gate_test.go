@@ -1444,6 +1444,72 @@ func TestPolicyMergeGateUsesLatestNumericReviewRound(t *testing.T) {
 	}
 }
 
+func TestPolicyMergeGateBlocksAnyVerdictAtEvaluatedHeadBeforeRoundSelection(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		approvalRound string
+	}{
+		{
+			name: "empty rounds do not use job ID to mask objection",
+		},
+		{
+			name:          "numbered round does not mask unnumbered objection",
+			approvalRound: "review-2",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			basePayload := JobPayload{
+				Repo:        "gitmoot/gitmoot",
+				PullRequest: 9,
+				HeadSHA:     "head123",
+				TaskID:      "task-9",
+			}
+			implementPayload := basePayload
+			implementPayload.HeadSHA = ""
+			implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
+			insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: "implementer", Type: "implement"}, implementPayload)
+
+			objection := basePayload
+			objection.Result = &AgentResult{Decision: "changes_requested", Summary: "must fix"}
+			insertCompletedJob(t, store, db.Job{ID: "review-a-objection", Agent: "objector", Type: "review"}, objection)
+
+			approval := basePayload
+			approval.ReviewRound = tc.approvalRound
+			approval.Result = &AgentResult{Decision: "approved", Summary: "ready"}
+			insertCompletedJob(t, store, db.Job{ID: "review-z-approval", Agent: "approver", Type: "review"}, approval)
+
+			mergeable := true
+			gh := &fakeMergeGateGitHub{
+				pr: github.PullRequest{
+					Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+					HeadSHA: "head123", Mergeable: &mergeable,
+				},
+				status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+				checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+				mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+			}
+			gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+			decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+				t.Fatalf("decision = %+v, want objection to block merge", decision)
+			}
+			if !strings.Contains(decision.Reason, "blocking result from objector") {
+				t.Fatalf("decision reason = %q, want objector's blocking result", decision.Reason)
+			}
+			if len(gh.merges) != 0 {
+				t.Fatalf("merge calls = %+v, want none", gh.merges)
+			}
+		})
+	}
+}
+
 func TestPolicyMergeGateBlocksReviewForStaleHead(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

@@ -444,6 +444,27 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			implementingAgents[agent] = struct{}{}
 		}
 	}
+	// A round can order remediation, but it must not hide a blocking verdict
+	// captured at the head currently being evaluated.
+	for _, job := range jobs {
+		if job.Type != "review" {
+			continue
+		}
+		payload, err := unmarshalPayload(job.Payload)
+		if err != nil {
+			return err
+		}
+		if !sameTask(current, payload) || payload.Result == nil {
+			continue
+		}
+		if err := g.ensureReviewMatchesHead(payload, headSHA, job.Agent); err != nil {
+			continue
+		}
+		switch payload.Result.Decision {
+		case "changes_requested", "blocked", "failed":
+			return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", job.Agent)}
+		}
+	}
 	latest := ""
 	for _, job := range jobs {
 		if job.Type != "review" {
