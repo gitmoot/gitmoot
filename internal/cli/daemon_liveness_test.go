@@ -141,9 +141,8 @@ func TestDaemonLivenessSweepQuietThresholdVetoes(t *testing.T) {
 }
 
 func TestDaemonLivenessSweepPIDReuseIsIndeterminate(t *testing.T) {
-	ctx, paths, store, now, quiet := livenessTestJob(t, "reused", 4242)
+	ctx, paths, store, now, quiet := livenessTestJob(t, "reused", os.Getpid())
 	sweep := newDaemonLivenessSweep()
-	sweep.probe = func(int, string) runtimePIDState { return runtimePIDIdentityMismatch }
 	runLivenessSamples(t, sweep, ctx, store, paths, now, quiet)
 	job, err := store.GetJob(ctx, "reused")
 	if err != nil {
