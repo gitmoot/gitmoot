@@ -161,7 +161,10 @@ status, `gitmoot daemon status` for daemon state, `gitmoot agent list` and
 or `gitmoot task list --repo owner/repo --json` for imported task state. Use
 `gitmoot job list --repo owner/repo` for jobs, and use
 `gitmoot dashboard --json` only when a structured full dashboard snapshot is
-needed. Do not use nonexistent commands such as `gitmoot status --json` or
+needed. The read-only web dashboard's Overview and Org pages distinguish live
+Herdr session activity from engine jobs and label a missing session differently
+from an unavailable Herdr source. Do not use nonexistent commands such as
+`gitmoot status --json` or
 `gitmoot task show`. Use `gitmoot org events rule add|list|set-scope|rm` to manage opt-in
 organization event wakes; add validates the event kind, target org role, and
 `addressed` (default) or `observer` scope. Use

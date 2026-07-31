@@ -29,6 +29,78 @@ func insertIndependentMergeGateReview(t *testing.T, store *db.Store, reviewJob d
 	insertCompletedJob(t, store, reviewJob, reviewPayload)
 }
 
+type mergeGateReviewFixture struct {
+	id        string
+	agent     string
+	state     JobState
+	headSHA   string
+	decision  string
+	hasResult bool
+	recorded  string
+}
+
+func newMergeGateQuorumScenario(t *testing.T) (*db.Store, *fakeMergeGateGitHub, PolicyMergeGate, MergeRequest) {
+	t.Helper()
+	store := openEngineStore(t)
+	insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: "implementer", Type: "implement"}, JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		PullRequest: 9,
+		TaskID:      "task-9",
+		Result:      &AgentResult{Decision: "implemented", Summary: "implemented"},
+	})
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr: github.PullRequest{
+			Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+			HeadSHA: "head123", Mergeable: &mergeable,
+		},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+		checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+	}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+	request := MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"}
+	return store, gh, gate, request
+}
+
+func insertMergeGateReviewFixture(t *testing.T, store *db.Store, fixture mergeGateReviewFixture) {
+	t.Helper()
+	state := fixture.state
+	if state == "" {
+		state = JobSucceeded
+	}
+	headSHA := fixture.headSHA
+	if headSHA == "" {
+		headSHA = "head123"
+	}
+	payload := JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		PullRequest: 9,
+		HeadSHA:     headSHA,
+		TaskID:      "task-9",
+		ReviewRound: "review-1",
+	}
+	if fixture.hasResult {
+		payload.Result = &AgentResult{Decision: fixture.decision, Summary: "fixture verdict"}
+	}
+	encoded, err := marshalPayload(payload)
+	if err != nil {
+		t.Fatalf("marshalPayload returned error: %v", err)
+	}
+	if err := store.CreateJobWithEvent(context.Background(), db.Job{
+		ID:      fixture.id,
+		Agent:   fixture.agent,
+		Type:    "review",
+		State:   string(state),
+		Payload: encoded,
+	}, db.JobEvent{Kind: string(state), Message: "fixture state"}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	if fixture.recorded != "" {
+		setMergeGateJobTimestamps(t, store, fixture.id, fixture.recorded)
+	}
+}
+
 func TestPolicyMergeGateMergesPassingPullRequest(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -1444,6 +1516,583 @@ func TestPolicyMergeGateUsesLatestNumericReviewRound(t *testing.T) {
 	}
 }
 
+func TestPolicyMergeGateBlocksAnyVerdictAtEvaluatedHeadBeforeRoundSelection(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		approvalRound string
+	}{
+		{
+			name: "empty rounds do not use job ID to mask objection",
+		},
+		{
+			name:          "numbered round does not mask unnumbered objection",
+			approvalRound: "review-2",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			basePayload := JobPayload{
+				Repo:        "gitmoot/gitmoot",
+				PullRequest: 9,
+				HeadSHA:     "head123",
+				TaskID:      "task-9",
+			}
+			implementPayload := basePayload
+			implementPayload.HeadSHA = ""
+			implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
+			insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: "implementer", Type: "implement"}, implementPayload)
+
+			objection := basePayload
+			objection.Result = &AgentResult{Decision: "changes_requested", Summary: "must fix"}
+			insertCompletedJob(t, store, db.Job{ID: "review-a-objection", Agent: "objector", Type: "review"}, objection)
+
+			approval := basePayload
+			approval.ReviewRound = tc.approvalRound
+			approval.Result = &AgentResult{Decision: "approved", Summary: "ready"}
+			insertCompletedJob(t, store, db.Job{ID: "review-z-approval", Agent: "approver", Type: "review"}, approval)
+
+			mergeable := true
+			gh := &fakeMergeGateGitHub{
+				pr: github.PullRequest{
+					Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+					HeadSHA: "head123", Mergeable: &mergeable,
+				},
+				status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+				checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+				mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+			}
+			gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+			decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+				t.Fatalf("decision = %+v, want objection to block merge", decision)
+			}
+			if !strings.Contains(decision.Reason, "blocking result from objector") {
+				t.Fatalf("decision reason = %q, want objector's blocking result", decision.Reason)
+			}
+			if len(gh.merges) != 0 {
+				t.Fatalf("merge calls = %+v, want none", gh.merges)
+			}
+		})
+	}
+}
+
+func TestPolicyMergeGateSameReviewerLaterVerdictSupersedesObjection(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	basePayload := JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		PullRequest: 9,
+		HeadSHA:     "head123",
+		TaskID:      "task-9",
+	}
+	objection := basePayload
+	objection.Result = &AgentResult{Decision: "changes_requested", Summary: "must fix"}
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-z-objection", Agent: "reviewer", Type: "review"}, objection)
+	setMergeGateJobTimestamps(t, store, "review-z-objection", "2026-07-31 12:00:00")
+
+	approval := basePayload
+	approval.Result = &AgentResult{Decision: "approved", Summary: "objection resolved"}
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-a-approval", Agent: "reviewer", Type: "review"}, approval)
+	setMergeGateJobTimestamps(t, store, "review-a-approval", "2026-07-31 12:01:00")
+
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr: github.PullRequest{
+			Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+			HeadSHA: "head123", Mergeable: &mergeable,
+		},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+		checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+	}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.Merged {
+		t.Fatalf("decision = %+v, want later verdict from same reviewer to supersede objection", decision)
+	}
+}
+
+func TestPolicyMergeGateDifferentReviewerCannotSupersedeObjection(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	basePayload := JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		PullRequest: 9,
+		HeadSHA:     "head123",
+		TaskID:      "task-9",
+	}
+	objection := basePayload
+	objection.Result = &AgentResult{Decision: "changes_requested", Summary: "must fix"}
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-a-objection", Agent: "objector", Type: "review"}, objection)
+	setMergeGateJobTimestamps(t, store, "review-a-objection", "2026-07-31 12:00:00")
+
+	approval := basePayload
+	approval.Result = &AgentResult{Decision: "approved", Summary: "ready"}
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-z-approval", Agent: "approver", Type: "review"}, approval)
+	setMergeGateJobTimestamps(t, store, "review-z-approval", "2026-07-31 12:01:00")
+
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr: github.PullRequest{
+			Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+			HeadSHA: "head123", Mergeable: &mergeable,
+		},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+		checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+	}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+		t.Fatalf("decision = %+v, want different reviewer's objection to remain blocking", decision)
+	}
+	if !strings.Contains(decision.Reason, "blocking result from objector") {
+		t.Fatalf("decision reason = %q, want objector's blocking result", decision.Reason)
+	}
+}
+
+func TestPolicyMergeGateNonEvidenceVerdictDoesNotSupersedeObjection(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		decision string
+	}{
+		{name: "skipped", decision: "skipped"},
+		{name: "empty"},
+		{name: "unknown future decision", decision: "future_verdict"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			basePayload := JobPayload{
+				Repo:        "gitmoot/gitmoot",
+				PullRequest: 9,
+				HeadSHA:     "head123",
+				TaskID:      "task-9",
+				ReviewRound: "review-1",
+			}
+			objection := basePayload
+			objection.Result = &AgentResult{Decision: "changes_requested", Summary: "must fix"}
+			insertIndependentMergeGateReview(t, store, db.Job{ID: "review-objector-objection", Agent: "objector", Type: "review"}, objection)
+			setMergeGateJobTimestamps(t, store, "review-objector-objection", "2026-07-31 12:00:00")
+
+			nonEvidence := basePayload
+			nonEvidence.Result = &AgentResult{Decision: tc.decision, Summary: "no replacement evidence"}
+			insertIndependentMergeGateReview(t, store, db.Job{ID: "review-objector-later", Agent: "objector", Type: "review"}, nonEvidence)
+			setMergeGateJobTimestamps(t, store, "review-objector-later", "2026-07-31 12:01:00")
+
+			approval := basePayload
+			approval.Result = &AgentResult{Decision: "approved", Summary: "ready"}
+			insertIndependentMergeGateReview(t, store, db.Job{ID: "review-approver", Agent: "approver", Type: "review"}, approval)
+			setMergeGateJobTimestamps(t, store, "review-approver", "2026-07-31 12:02:00")
+
+			mergeable := true
+			gh := &fakeMergeGateGitHub{
+				pr: github.PullRequest{
+					Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+					HeadSHA: "head123", Mergeable: &mergeable,
+				},
+				status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+				checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+				mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+			}
+			gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+			decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+				t.Fatalf("decision = %+v, want non-evidence decision %q to leave objection blocking", decision, tc.decision)
+			}
+			if !strings.Contains(decision.Reason, "blocking result from objector") {
+				t.Fatalf("decision reason = %q, want objector's blocking result", decision.Reason)
+			}
+			if len(gh.merges) != 0 {
+				t.Fatalf("merge calls = %+v, want none", gh.merges)
+			}
+		})
+	}
+}
+
+func TestPolicyMergeGateWaitsForQueuedReviewAtEvaluatedHead(t *testing.T) {
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-approved", agent: "reviewer-a", hasResult: true, decision: "approved",
+		recorded: "2026-07-31 12:00:00",
+	})
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-queued", agent: "reviewer-b", state: JobQueued,
+		recorded: "2026-07-31 12:01:00",
+	})
+
+	decision, err := gate.Evaluate(context.Background(), request)
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if decision.Merged || decision.EscalateMergeGateMiss {
+		t.Fatalf("decision = %+v, want queued review to wait without escalating", decision)
+	}
+	if !strings.Contains(decision.Reason, "waiting for reviewer reviewer-b") ||
+		!strings.Contains(decision.Reason, "review-queued") {
+		t.Fatalf("decision reason = %q, want queued reviewer and job", decision.Reason)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge calls = %+v, want none", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateWaitsForRunningReviewAtEvaluatedHead(t *testing.T) {
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-approved", agent: "reviewer-a", hasResult: true, decision: "approved",
+		recorded: "2026-07-31 12:00:00",
+	})
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-running", agent: "reviewer-b", state: JobRunning,
+		recorded: "2026-07-31 12:01:00",
+	})
+
+	decision, err := gate.Evaluate(context.Background(), request)
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if decision.Merged || decision.EscalateMergeGateMiss {
+		t.Fatalf("decision = %+v, want running review to wait without escalating", decision)
+	}
+	if !strings.Contains(decision.Reason, "waiting for reviewer reviewer-b") ||
+		!strings.Contains(decision.Reason, "review-running") {
+		t.Fatalf("decision reason = %q, want running reviewer and job", decision.Reason)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge calls = %+v, want none", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateLatestQueuedReviewWaitsOverEarlierObjection(t *testing.T) {
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-objected", agent: "reviewer-a", hasResult: true, decision: "changes_requested",
+		recorded: "2026-07-31 12:00:00",
+	})
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-requeued", agent: "reviewer-a", state: JobQueued,
+		recorded: "2026-07-31 12:01:00",
+	})
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-other-approved", agent: "reviewer-b", hasResult: true, decision: "approved",
+		recorded: "2026-07-31 12:02:00",
+	})
+
+	decision, err := gate.Evaluate(context.Background(), request)
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if decision.Merged || decision.EscalateMergeGateMiss {
+		t.Fatalf("decision = %+v, want latest queued review to wait", decision)
+	}
+	if !strings.Contains(decision.Reason, "waiting for reviewer reviewer-a") ||
+		!strings.Contains(decision.Reason, "review-requeued") {
+		t.Fatalf("decision reason = %q, want latest queued reviewer and job", decision.Reason)
+	}
+	if strings.Contains(decision.Reason, "blocking result") {
+		t.Fatalf("decision reason = %q, stale objection must not override latest queued slot", decision.Reason)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge calls = %+v, want none", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateParksFailedReviewerAtEvaluatedHead(t *testing.T) {
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-approved", agent: "reviewer-a", hasResult: true, decision: "approved",
+		recorded: "2026-07-31 18:01:24",
+	})
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id:    "local-review-joltra-sol-review-18c723c7768aa61d",
+		agent: "joltra-sol-review", state: JobFailed,
+		recorded: "2026-07-31 18:11:56",
+	})
+
+	decision, err := gate.Evaluate(context.Background(), request)
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+		t.Fatalf("decision = %+v, want failed reviewer parked", decision)
+	}
+	if !strings.Contains(decision.Reason, "crashed reviewer joltra-sol-review") ||
+		!strings.Contains(decision.Reason, "local-review-joltra-sol-review-18c723c7768aa61d") {
+		t.Fatalf("decision reason = %q, want crashed reviewer and job", decision.Reason)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge calls = %+v, want none", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateParksCancelledReviewerAtEvaluatedHead(t *testing.T) {
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-approved", agent: "reviewer-a", hasResult: true, decision: "approved",
+		recorded: "2026-07-31 12:00:00",
+	})
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-cancelled", agent: "reviewer-b", state: JobCancelled,
+		recorded: "2026-07-31 12:01:00",
+	})
+
+	decision, err := gate.Evaluate(context.Background(), request)
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+		t.Fatalf("decision = %+v, want cancelled reviewer parked", decision)
+	}
+	if !strings.Contains(decision.Reason, "crashed reviewer reviewer-b") ||
+		!strings.Contains(decision.Reason, "review-cancelled") {
+		t.Fatalf("decision reason = %q, want crashed reviewer and cancelled job", decision.Reason)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge calls = %+v, want none", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateParksAbstainingReviewerAtEvaluatedHead(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		decision string
+	}{
+		{name: "skipped", decision: "skipped"},
+		{name: "unknown decision", decision: "future_unseen_verdict"},
+		{name: "empty decision"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, gh, gate, request := newMergeGateQuorumScenario(t)
+			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+				id: "review-approved", agent: "reviewer-a", hasResult: true, decision: "approved",
+				recorded: "2026-07-31 12:00:00",
+			})
+			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+				id: "review-abstained", agent: "reviewer-b", hasResult: true, decision: tc.decision,
+				recorded: "2026-07-31 12:01:00",
+			})
+
+			decision, err := gate.Evaluate(context.Background(), request)
+
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+				t.Fatalf("decision = %+v, want abstaining reviewer parked", decision)
+			}
+			if !strings.Contains(decision.Reason, "abstaining reviewer reviewer-b") ||
+				!strings.Contains(decision.Reason, "review-abstained") {
+				t.Fatalf("decision reason = %q, want abstaining reviewer and job", decision.Reason)
+			}
+			if strings.Contains(decision.Reason, "crashed reviewer") {
+				t.Fatalf("decision reason = %q, abstention must not use crash label", decision.Reason)
+			}
+			if len(gh.merges) != 0 {
+				t.Fatalf("merge calls = %+v, want none", gh.merges)
+			}
+		})
+	}
+}
+
+func TestPolicyMergeGateUsesLatestReviewJobPerReviewer(t *testing.T) {
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "workflow-1hulo51pzm01f", agent: "joltra-sol-review",
+		hasResult: true, decision: "approved", recorded: "2026-07-31 18:01:24",
+	})
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id:    "local-review-joltra-sol-review-18c723c7768aa61d",
+		agent: "joltra-sol-review", state: JobFailed, recorded: "2026-07-31 18:11:56",
+	})
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id:    "local-review-joltra-sol-review-18c7245ac25c6980",
+		agent: "joltra-sol-review", hasResult: true, decision: "changes_requested",
+		recorded: "2026-07-31 18:22:29",
+	})
+
+	decision, err := gate.Evaluate(context.Background(), request)
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+		t.Fatalf("decision = %+v, want latest changes_requested verdict to block", decision)
+	}
+	if !strings.Contains(decision.Reason, "blocking result from joltra-sol-review") {
+		t.Fatalf("decision reason = %q, want latest reviewer's blocking result", decision.Reason)
+	}
+	if strings.Contains(decision.Reason, "crashed reviewer") {
+		t.Fatalf("decision reason = %q, stale failed job must not park latest slot", decision.Reason)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge calls = %+v, want none", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateLatestCrashOverridesStaleApproval(t *testing.T) {
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-z-stale-approved", agent: "reviewer-a",
+		hasResult: true, decision: "approved", recorded: "2026-07-31 12:00:00",
+	})
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-a-latest-failed", agent: "reviewer-a",
+		state: JobFailed, recorded: "2026-07-31 12:01:00",
+	})
+
+	decision, err := gate.Evaluate(context.Background(), request)
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+		t.Fatalf("decision = %+v, want latest crashed reviewer parked", decision)
+	}
+	if !strings.Contains(decision.Reason, "crashed reviewer reviewer-a") ||
+		!strings.Contains(decision.Reason, "review-a-latest-failed") {
+		t.Fatalf("decision reason = %q, want latest crashed reviewer and job", decision.Reason)
+	}
+	if strings.Contains(decision.Reason, "review-z-stale-approved") {
+		t.Fatalf("decision reason = %q, stale approval must not govern reviewer slot", decision.Reason)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge calls = %+v, want none", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateRequeueClearsCrashedReviewerPark(t *testing.T) {
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-other-approved", agent: "reviewer-a", hasResult: true, decision: "approved",
+		recorded: "2026-07-31 12:00:00",
+	})
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-crashed", agent: "reviewer-b", state: JobFailed,
+		recorded: "2026-07-31 12:01:00",
+	})
+
+	parked, err := gate.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("first Evaluate returned error: %v", err)
+	}
+	if !parked.LeaveOpen || !parked.EscalateMergeGateMiss || parked.Merged {
+		t.Fatalf("first decision = %+v, want crashed reviewer parked", parked)
+	}
+	if !strings.Contains(parked.Reason, "crashed reviewer reviewer-b") ||
+		!strings.Contains(parked.Reason, "review-crashed") {
+		t.Fatalf("first decision reason = %q, want crashed reviewer and job", parked.Reason)
+	}
+
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-requeued-approved", agent: "reviewer-b", hasResult: true, decision: "approved",
+		recorded: "2026-07-31 12:02:00",
+	})
+	merged, err := gate.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("second Evaluate returned error: %v", err)
+	}
+	if !merged.Merged {
+		t.Fatalf("second decision = %+v, want later approval to clear reviewer slot", merged)
+	}
+	if len(gh.merges) != 1 {
+		t.Fatalf("merge calls = %+v, want one after requeue approval", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateIgnoresReviewJobsAtStaleHeadForQuorum(t *testing.T) {
+	store, _, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-current-approved", agent: "reviewer-a", hasResult: true, decision: "approved",
+		recorded: "2026-07-31 12:00:00",
+	})
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-stale-failed", agent: "reviewer-b", state: JobFailed, headSHA: "stale123",
+		recorded: "2026-07-31 12:01:00",
+	})
+
+	decision, err := gate.Evaluate(context.Background(), request)
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.Merged {
+		t.Fatalf("decision = %+v, want stale-head failed review excluded from quorum", decision)
+	}
+}
+
+func TestPolicyMergeGateHeadlessIntegrationObjectionDoesNotMatchEveryHead(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	headlessObjection := JobPayload{
+		Repo:         "gitmoot/gitmoot",
+		PullRequest:  9,
+		TaskID:       "task-9",
+		ReviewRound:  "review-1",
+		DelegationID: "verify-old",
+		WorktreePath: "/tmp/gitmoot/integration-verify-old",
+		Result:       &AgentResult{Decision: "changes_requested", Summary: "integration objection"},
+	}
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-headless-objection", Agent: "objector", Type: "review"}, headlessObjection)
+
+	currentApproval := JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		PullRequest: 9,
+		HeadSHA:     "head123",
+		TaskID:      "task-9",
+		ReviewRound: "review-2",
+		Result:      &AgentResult{Decision: "approved", Summary: "current head approved"},
+	}
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-current-approval", Agent: "approver", Type: "review"}, currentApproval)
+
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr: github.PullRequest{
+			Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+			HeadSHA: "head123", Mergeable: &mergeable,
+		},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+		checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+	}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.Merged {
+		t.Fatalf("decision = %+v, want headless integration objection excluded from strict-head pre-pass", decision)
+	}
+}
+
 func TestPolicyMergeGateBlocksReviewForStaleHead(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -1730,4 +2379,23 @@ func hasStatus(statuses []github.CommitStatusInput, context string, state string
 		}
 	}
 	return false
+}
+
+func setMergeGateJobTimestamps(t *testing.T, store *db.Store, jobID string, timestamp string) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("open store for timestamp update: %v", err)
+	}
+	defer raw.Close()
+	result, err := raw.ExecContext(context.Background(),
+		`UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`,
+		timestamp, timestamp, jobID)
+	if err != nil {
+		t.Fatalf("set job %s timestamps: %v", jobID, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil || affected != 1 {
+		t.Fatalf("set job %s timestamps affected=%d, err=%v; want 1", jobID, affected, err)
+	}
 }

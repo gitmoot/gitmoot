@@ -69,6 +69,10 @@ The dashboard stays live without a manual reload:
 - **Graph** — the runs column reloads every **15s**; the selected run's graph
   streams over **SSE** (`/events?run=<id>`), so nodes change state as the
   orchestra runs (running nodes pulse).
+- **Fleet activity** — Overview and Org share one server-side Herdr poller and
+  receive changed snapshots over **SSE** (`/api/fleet/activity/events`).
+  Session counts are independent from engine-job and escalation counts; a
+  healthy source with no sessions is labeled differently from a source outage.
 - **Galaxy, Jobs, Agents, Charts, Health** — each polls its data every **12s**
   while it is the active view (background views do not poll).
 - **Health** additionally re-renders its relative-time cells every second, so

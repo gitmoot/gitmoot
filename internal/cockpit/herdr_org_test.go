@@ -19,10 +19,10 @@ func TestHerdrOrgProviderSnapshotMapping(t *testing.T) {
 			t.Fatalf("args = %v", args)
 		}
 		return `{"result":{"snapshot":{"version":"0.7.5","panes":[
-{"pane_id":"w1:p1","label":"owner","agent_status":"working","last_completed_turn":{"turn":1,"turn_epoch":1785163074397066532,"completed_unix_ms":1785163510704}},
+	{"pane_id":"w1:p1","label":"owner","agent":"claude","agent_status":"working","terminal_title":"✳ Owner task","terminal_title_stripped":"Owner task","turn":2,"last_completed_turn":{"turn":1,"turn_epoch":1785163074397066532,"completed_unix_ms":1785163510704}},
 {"pane_id":"w1:p2","label":"review","agent_status":"blocked"},
 {"pane_id":"w1:p3","label":"done","agent_status":"done"},
-{"pane_id":"w1:p4","label":"idle","agent_status":"idle"},
+	{"pane_id":"w1:p4","label":"idle","agent":"codex","agent_status":"idle","terminal_title":"Idle task","turn":0},
 {"pane_id":"w1:p5","label":"future","agent_status":"paused"},
 {"pane_id":"w1:p6","label":"duplicate","agent_status":"working"},
 {"pane_id":"w1:p7","label":"duplicate","agent_status":"idle"},
@@ -61,6 +61,20 @@ func TestHerdrOrgProviderSnapshotMapping(t *testing.T) {
 	}
 	if _, inferred := snapshot.States["claude"]; inferred {
 		t.Fatal("provider inferred a runtime label that was not a configured role")
+	}
+	ownerSession, ok := snapshot.Sessions["owner"]
+	if !ok || ownerSession.PaneID != "w1:p1" || ownerSession.Agent != "claude" ||
+		ownerSession.TaskTitle != "Owner task" || ownerSession.CurrentTurn == nil || *ownerSession.CurrentTurn != 2 {
+		t.Fatalf("owner session = %+v, present=%t", ownerSession, ok)
+	}
+	idleSession, ok := snapshot.Sessions["idle"]
+	if !ok || idleSession.CurrentTurn == nil || *idleSession.CurrentTurn != 0 || idleSession.TaskTitle != "Idle task" {
+		t.Fatalf("idle session = %+v, present=%t", idleSession, ok)
+	}
+	for _, role := range []string{"review", "done", "future", "duplicate", "missing"} {
+		if session, present := snapshot.Sessions[role]; present {
+			t.Errorf("session[%s] = %+v, want absent", role, session)
+		}
 	}
 	ownerActivity := snapshot.States["owner"].Activity
 	if ownerActivity == nil {
