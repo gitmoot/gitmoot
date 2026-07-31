@@ -700,7 +700,10 @@ func scheduleOnePipeline(ctx context.Context, store *db.Store, rec db.Pipeline, 
 // terminal runs consume zero compute. A per-run error is collected (first wins)
 // but never stops the remaining runs. Runs whose pipeline was removed, whose
 // stored spec no longer parses, or whose spec drifted (hash no longer matches the
-// run's snapshot) are skipped rather than executed against a changed spec.
+// run's snapshot) are never executed against a changed spec. A drifted run still
+// gets a narrow terminal-only reconciliation pass: cancelled jobs are immutable
+// evidence of failure, and already-terminal stage rows can settle without
+// interpreting or launching the changed spec.
 func advancePipelineRuns(ctx context.Context, store *db.Store, enqueue PipelineStageEnqueuer, now time.Time) error {
 	runs, err := store.ListActivePipelineRuns(ctx)
 	if err != nil {
@@ -719,15 +722,20 @@ func advancePipelineRuns(ctx context.Context, store *db.Store, enqueue PipelineS
 		if !ok {
 			continue
 		}
-		spec, err := Load([]byte(rec.SpecYAML))
-		if err != nil {
+		// A run executes its SNAPSHOT: if the pipeline's spec was edited since the run
+		// was created, its hash no longer matches and we do NOT enqueue or interpret
+		// the changed DAG/commands. We can still fold a cancelled job (which is
+		// terminal independent of stage semantics) and settle a fully-terminal set of
+		// persisted stage rows. This is what lets old runs stop blocking schedules
+		// after their pipeline prompt/configuration was edited.
+		if strings.TrimSpace(rec.SpecHash) != strings.TrimSpace(run.SpecHash) {
+			if _, err := reconcileSpecDriftedTerminalRun(ctx, store, rec, run, now); err != nil && firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
-		// A run executes its SNAPSHOT: if the pipeline's spec was edited since the run
-		// was created, its hash no longer matches and we do NOT advance against the
-		// changed DAG/commands. Parking/repairing spec drift is a follow-up; skipping
-		// is safe (the run stays running and is left untouched).
-		if strings.TrimSpace(rec.SpecHash) != strings.TrimSpace(run.SpecHash) {
+		spec, err := Load([]byte(rec.SpecYAML))
+		if err != nil {
 			continue
 		}
 		if _, err := AdvancePipelineRun(ctx, store, enqueue, rec, spec, run, now); err != nil && firstErr == nil {
@@ -735,6 +743,115 @@ func advancePipelineRuns(ctx context.Context, store *db.Store, enqueue PipelineS
 		}
 	}
 	return firstErr
+}
+
+// reconcileSpecDriftedTerminalRun is deliberately weaker than AdvancePipelineRun:
+// it never reads stage definitions, enqueues work, retries a stage, or interprets
+// an agent decision. It only projects a cancelled job onto its persisted stage
+// row, then settles when every persisted row is already terminal. Cancellation
+// has one meaning for every stage kind, so this remains valid when the current
+// pipeline spec no longer matches the run's unavailable historical snapshot.
+func reconcileSpecDriftedTerminalRun(ctx context.Context, store *db.Store, rec db.Pipeline, run db.PipelineRun, now time.Time) (db.PipelineRun, error) {
+	rows, err := store.ListPipelineRunStages(ctx, run.ID)
+	if err != nil || len(rows) == 0 {
+		return run, err
+	}
+	jobIDs := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if (row.State == StageQueued || row.State == StageRunning) && strings.TrimSpace(row.JobID) != "" {
+			jobIDs = append(jobIDs, row.JobID)
+		}
+	}
+	events, err := loadPipelineJobEventSnapshot(ctx, store, jobIDs)
+	if err != nil {
+		return run, err
+	}
+	for i, row := range rows {
+		if (row.State != StageQueued && row.State != StageRunning) || strings.TrimSpace(row.JobID) == "" {
+			continue
+		}
+		job, err := store.GetJob(ctx, row.JobID)
+		if err != nil {
+			return run, err
+		}
+		if job.State != string(workflow.JobCancelled) {
+			continue
+		}
+		updated := row
+		updated.State = StageFailed
+		updated.Summary = "stage job cancelled"
+		updated.NeedsJSON = ""
+		updated.StartedAt, updated.FinishedAt, err = stampStageTimestampsFromJobEvents(
+			ctx, events, row.JobID, string(workflow.JobCancelled), now, row.StartedAt, true,
+		)
+		if err != nil {
+			return run, err
+		}
+		if err := persistPipelineStage(ctx, store, row, updated); err != nil {
+			return run, err
+		}
+		rows[i] = updated
+	}
+	settled, ok := computeSpecDriftedRunSettlement(rows, now)
+	if !ok {
+		return run, nil
+	}
+	return applyPipelineRunSettlement(ctx, store, rec, run, settled)
+}
+
+// computeSpecDriftedRunSettlement uses only terminal persisted stage states. Rows
+// come from ListPipelineRunStages in stage_id order, which gives a stable halt
+// stage without pretending that the current (drifted) spec's topology belongs to
+// the historical run. Empty, in-flight, pending, cancelled, and unknown sets do
+// not settle.
+func computeSpecDriftedRunSettlement(rows []db.PipelineRunStage, now time.Time) (pipelineRunSettlement, bool) {
+	if len(rows) == 0 {
+		return pipelineRunSettlement{}, false
+	}
+	var firstFailed, firstBlocked *db.PipelineRunStage
+	seenNeeds := make(map[string]struct{})
+	var blockedNeeds []string
+	for i := range rows {
+		row := &rows[i]
+		switch row.State {
+		case StageSucceeded, StageSkipped:
+		case StageFailed:
+			if firstFailed == nil {
+				firstFailed = row
+			}
+		case StageBlocked:
+			if firstBlocked == nil {
+				firstBlocked = row
+			}
+			for _, need := range decodePipelineNeeds(row.NeedsJSON) {
+				if _, exists := seenNeeds[need]; exists {
+					continue
+				}
+				seenNeeds[need] = struct{}{}
+				blockedNeeds = append(blockedNeeds, need)
+			}
+		default:
+			return pipelineRunSettlement{}, false
+		}
+	}
+	if firstFailed != nil {
+		return pipelineRunSettlement{
+			State:      RunFailed,
+			HaltStage:  firstFailed.StageID,
+			HaltReason: firstFailed.Summary,
+			FinishedAt: now,
+		}, true
+	}
+	if firstBlocked != nil {
+		return pipelineRunSettlement{
+			State:      RunBlocked,
+			HaltStage:  firstBlocked.StageID,
+			HaltReason: firstBlocked.Summary,
+			NeedsJSON:  marshalPipelineNeeds(blockedNeeds),
+			FinishedAt: now,
+		}, true
+	}
+	return pipelineRunSettlement{State: RunSucceeded, FinishedAt: now}, true
 }
 
 // AdvancePipelineRun is the per-run advancer (decision 6). It is a single
