@@ -103,6 +103,7 @@ artifact_blobs = %q
 # idle_max_multiplier = 4   # 1 disables idle cadence decay
 # job_timeout_default = "4h" # kill deadline when payload and agent type omit one
 # job_timeout_max = "8h"     # hard ceiling; larger payload requests are clamped
+# quiet_kill_after = "45m"   # liveness transcript-silence threshold; floor 5m
 
 # [credentials] is OFF by default. When env_curation=true, only a pinned base
 # environment plus runtime-specific auth/state variables reaches runtime-agent
@@ -119,11 +120,11 @@ artifact_blobs = %q
 # model_gateway_allow_hosts = ["api.anthropic.com"]
 # keychain_path = "" # default: <base-home>/.config/gitmoot/keychain.env
 
-# [transcripts] is OFF by default. When enabled, raw unredacted runtime output
+# [transcripts] is ON by default. Raw unredacted runtime output
 # is retained in 0600 per-job append logs for deterministic trajectory export.
 # retain and max_total_bytes bound home-scoped garbage collection.
 # [transcripts]
-# enabled = false
+# enabled = true
 # retain = "168h"
 # max_total_bytes = 2147483648
 

@@ -321,6 +321,7 @@ type JobPayload struct {
 	// dispatched through legacy/custom runners simply omit them.
 	RuntimePID          int    `json:"runtime_pid,omitempty"`
 	RuntimePIDStartTime string `json:"runtime_pid_start_time,omitempty"`
+	RuntimePGID         int    `json:"runtime_pgid,omitempty"`
 	// ReadOnlyWorktree marks a top-level read-only (ask) worktree allocated at
 	// dispatch time (#739): its WorktreePath is a throwaway detached committed-tip
 	// worktree with no DelegationID and no Branch. Additive/omitempty so a payload
@@ -1389,6 +1390,7 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		OnPID: func(pid int) {
 			payload.RuntimePID = pid
 			payload.RuntimePIDStartTime = RuntimeProcessIdentity(pid)
+			payload.RuntimePGID = RuntimeProcessGroupID(pid)
 			// Persist before the runner blocks so an independently invoked doctor
 			// can inspect the running job. Best-effort: observability must never
 			// turn a successful runtime start into a delivery failure.
@@ -1408,14 +1410,9 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		delivery.RuntimeDefaultEffort = m.RuntimeDefaultEffort(agent.Runtime)
 	}
 	result, err := adapter.Deliver(ctx, agent, delivery)
-	// The recorded identity describes only a process that is currently executing
-	// this delivery. Clear it immediately when Deliver returns, before parsing,
-	// retry backoff, or a produce check keeps the job legitimately running without
-	// a runtime subprocess. Best-effort persistence mirrors the start callback:
-	// observability must never change the delivery result.
-	payload.RuntimePID = 0
-	payload.RuntimePIDStartTime = ""
-	_ = m.savePayload(ctx, job.ID, *payload)
+	// Preserve the last runtime identity while the job remains running. The
+	// liveness sweep needs the exact process that produced the retained transcript;
+	// terminal transitions clear it atomically with settlement below.
 	// Record best-effort runtime token usage so the per-root delegation token
 	// budget (#338 Part B) can sum a tree's cost. Usage accounting must never fail
 	// a delivery, so every write error here is swallowed.
@@ -1492,11 +1489,24 @@ func (m Mailbox) persistRefreshedRuntimeRef(ctx context.Context, jobID string, a
 func (m Mailbox) finish(ctx context.Context, jobID string, state JobState, message string) error {
 	writeCtx, cancel := terminalWriteContext(ctx)
 	defer cancel()
-	transitioned, err := m.Store.TransitionJobStateWithEvent(writeCtx, jobID, string(JobRunning), string(state), db.JobEvent{
-		JobID:   jobID,
-		Kind:    string(state),
-		Message: message,
-	})
+	var transitioned bool
+	var err error
+	if job, loadErr := m.Store.GetJob(writeCtx, jobID); loadErr == nil {
+		if payload, payloadErr := unmarshalPayload(job.Payload); payloadErr == nil {
+			clearRuntimeIdentity(&payload)
+			message = terminalMessageWithDiagnostics(state, message, payload.FailureDiagnostics)
+			if encoded, encodeErr := marshalPayload(payload); encodeErr == nil {
+				transitioned, err = m.Store.TransitionJobStatePayloadWithEvent(writeCtx, jobID, string(JobRunning), string(state), encoded, db.JobEvent{
+					JobID: jobID, Kind: string(state), Message: message,
+				})
+			}
+		}
+	}
+	if err == nil && !transitioned {
+		transitioned, err = m.Store.TransitionJobStateWithEvent(writeCtx, jobID, string(JobRunning), string(state), db.JobEvent{
+			JobID: jobID, Kind: string(state), Message: message,
+		})
+	}
 	if err != nil {
 		return err
 	}
@@ -1549,6 +1559,8 @@ func (m Mailbox) loadTerminalEmitPayload(ctx context.Context, jobID, message str
 func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobState, message string, payload JobPayload) error {
 	writeCtx, cancel := terminalWriteContext(ctx)
 	defer cancel()
+	clearRuntimeIdentity(&payload)
+	message = terminalMessageWithDiagnostics(state, message, payload.FailureDiagnostics)
 	encoded, err := marshalPayload(payload)
 	if err != nil {
 		return err
@@ -1599,6 +1611,22 @@ func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobS
 		}
 	}
 	return nil
+}
+
+func clearRuntimeIdentity(payload *JobPayload) {
+	if payload == nil {
+		return
+	}
+	payload.RuntimePID = 0
+	payload.RuntimePIDStartTime = ""
+	payload.RuntimePGID = 0
+}
+
+func terminalMessageWithDiagnostics(state JobState, message string, diag *FailureDiagnostics) string {
+	if state != JobFailed || diag == nil || strings.TrimSpace(diag.StderrTail) == "" {
+		return message
+	}
+	return RedactCommentText(message) + "\nstderr tail:\n" + diag.StderrTail
 }
 
 func (m Mailbox) ensureRunning(ctx context.Context, jobID string) error {

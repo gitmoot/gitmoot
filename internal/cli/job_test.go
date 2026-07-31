@@ -559,9 +559,27 @@ func TestJobWatchTranscriptShellNoLLME2E(t *testing.T) {
 }
 
 func TestRunJobRunUsesDaemonWorkerInternals(t *testing.T) {
+	runJobRunLifecycleContract(t, false)
+}
+
+func TestRunJobRunTranscriptOffSwitch(t *testing.T) {
+	home := runJobRunLifecycleContract(t, true)
+	if _, err := os.Stat(filepath.Join(config.PathsForHome(home).Logs, "jobs")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("disabled transcript capture changed daemon lifecycle: %v", err)
+	}
+}
+
+func runJobRunLifecycleContract(t *testing.T, transcriptsDisabled bool) string {
+	t.Helper()
 	home := t.TempDir()
 	store := openCLIJobStore(t, home)
 	defer store.Close()
+	if transcriptsDisabled {
+		paths := config.PathsForHome(home)
+		if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+"\n[transcripts]\nenabled = false\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	checkout := t.TempDir()
 	runGit(t, checkout, "init")
 	runGit(t, checkout, "branch", "-m", "main")
@@ -591,9 +609,7 @@ func TestRunJobRunUsesDaemonWorkerInternals(t *testing.T) {
 	if job.State != string(workflow.JobSucceeded) || !strings.Contains(job.Payload, `"summary":"done"`) {
 		t.Fatalf("job after run = %+v", job)
 	}
-	if _, err := os.Stat(filepath.Join(config.PathsForHome(home).Logs, "jobs")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("disabled transcript capture changed daemon lifecycle: %v", err)
-	}
+	return home
 }
 
 func TestRunJobRunRefusesUnavailableRoleAndAllowsExpiredIncident(t *testing.T) {

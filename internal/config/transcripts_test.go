@@ -31,7 +31,7 @@ max_total_bytes = 4096
 	}
 }
 
-func TestLoadTranscriptsConfigInvalidDegradesToDisabled(t *testing.T) {
+func TestLoadTranscriptsConfigInvalidDegradesToSafeDefaults(t *testing.T) {
 	for _, body := range []string{
 		"[transcripts]\nenabled = nope\n",
 		"[transcripts]\nenabled = true\nretain = \"0s\"\n",
@@ -47,9 +47,24 @@ func TestLoadTranscriptsConfigInvalidDegradesToDisabled(t *testing.T) {
 			if err := os.WriteFile(paths.ConfigFile, []byte(body), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if got := LoadTranscriptsConfig(paths); got.Enabled || got.Retain != DefaultTranscriptRetain || got.MaxTotalBytes != DefaultTranscriptMaxTotalBytes {
-				t.Fatalf("invalid config = %+v, want disabled defaults", got)
+			if got := LoadTranscriptsConfig(paths); !got.Enabled || got.Retain != DefaultTranscriptRetain || got.MaxTotalBytes != DefaultTranscriptMaxTotalBytes {
+				t.Fatalf("invalid config = %+v, want default-on safe defaults", got)
 			}
 		})
+	}
+}
+
+func TestLoadTranscriptsConfigRetentionHas24HourFloor(t *testing.T) {
+	home := t.TempDir()
+	paths := PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[transcripts]\nenabled = true\nretain = \"23h59m\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := LoadTranscriptsConfig(paths)
+	if !got.Enabled || got.Retain != DefaultTranscriptRetain {
+		t.Fatalf("subfloor retain = %+v, want default retention", got)
 	}
 }

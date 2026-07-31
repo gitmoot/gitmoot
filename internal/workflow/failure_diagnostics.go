@@ -24,7 +24,7 @@ const (
 // MaxStderrTailBytes is the hard cap on the stored stderr tail. The tail is
 // redacted BEFORE it is cut (so a secret split by the cut can never leak) and
 // the stored string never exceeds this many bytes.
-const MaxStderrTailBytes = 2048
+const MaxStderrTailBytes = 4096
 
 // FailureDiagnostics captures process-level crash context for a job whose
 // runtime session ended WITHOUT producing a gitmoot_result envelope (#806).

@@ -26,8 +26,8 @@ const (
 	transcriptSweepDeleteLimit  = 256
 )
 
-// openRetainedTranscriptLog is side-effect-free while capture is disabled or
-// invalid. Enabled logs are canonical, private, and append-only across retries.
+// openRetainedTranscriptLog is side-effect-free when capture is explicitly
+// disabled. Enabled logs are canonical, private, and append-only across retries.
 func openRetainedTranscriptLog(home, jobID string) (string, *os.File, error) {
 	paths, err := pathsFromFlag(home)
 	if err != nil {

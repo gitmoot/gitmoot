@@ -3360,9 +3360,12 @@ func TestRecoverRunningJobsKeepsRecentRunningJobsOnStartup(t *testing.T) {
 	}
 }
 
-func TestRecoverRunningJobsUsesConfiguredStaleWindow(t *testing.T) {
+func TestDaemonLivenessAgeLegUsesConfiguredStaleWindow(t *testing.T) {
 	ctx := context.Background()
 	t.Setenv("GITMOOT_STALE_RUNNING_AFTER", "2m")
+	if got := configuredDaemonRunningJobStaleAfter(io.Discard); got != 2*time.Minute {
+		t.Fatalf("configured stale window = %s, want 2m", got)
+	}
 	store := daemonWorkerStore(t)
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-running", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
 	if err := store.UpdateJobState(ctx, "job-running", string(workflow.JobRunning)); err != nil {
@@ -3378,8 +3381,8 @@ func TestRecoverRunningJobsUsesConfiguredStaleWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetJob returned error: %v", err)
 	}
-	if job.State != string(workflow.JobQueued) {
-		t.Fatalf("job state = %q, want queued", job.State)
+	if job.State != string(workflow.JobRunning) {
+		t.Fatalf("job state = %q, want running without transcript and process evidence", job.State)
 	}
 }
 
@@ -3902,26 +3905,28 @@ func TestRecoverCancelledRunningJobsForRepoSkipsOtherRepos(t *testing.T) {
 	}
 }
 
-func TestDaemonWorkerTickRechecksStaleRunningJobs(t *testing.T) {
-	ctx := context.Background()
-	store := daemonWorkerStore(t)
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-running", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
-	if err := store.UpdateJobState(ctx, "job-running", string(workflow.JobRunning)); err != nil {
-		t.Fatalf("UpdateJobState returned error: %v", err)
+func TestDaemonWorkerTickRunsLivenessSweep(t *testing.T) {
+	ctx, paths, store, now, _ := livenessTestJob(t, "job-running", 4242)
+	t.Setenv("GITMOOT_STALE_RUNNING_AFTER", "1m")
+	if err := os.WriteFile(paths.ConfigFile, []byte("[daemon]\nquiet_kill_after = \"5m\"\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	worker := defaultJobWorker(store, io.Discard)
-	now := time.Now().UTC().Add(defaultDaemonRunningJobStaleAfter + time.Second)
+	worker := defaultJobWorker(store, io.Discard, filepath.Dir(paths.Home))
+	tracker := newInflightJobTracker(ctx)
+	tracker.liveness.probe = func(int, string) runtimePIDState { return runtimePIDDead }
 
-	if err := runDaemonWorkerTickTracked(ctx, store, worker, 0, false, "", "", io.Discard, now, nil, nil); err != nil {
-		t.Fatalf("runDaemonWorkerTickTracked returned error: %v", err)
+	for _, at := range []time.Time{now, now.Add(daemonWorkerLoopInterval)} {
+		if err := runDaemonWorkerTickTracked(ctx, store, worker, 0, false, "", "", io.Discard, at, tracker, nil); err != nil {
+			t.Fatalf("runDaemonWorkerTickTracked(%s): %v", at, err)
+		}
 	}
 
 	job, err := store.GetJob(ctx, "job-running")
 	if err != nil {
 		t.Fatalf("GetJob returned error: %v", err)
 	}
-	if job.State != string(workflow.JobQueued) {
-		t.Fatalf("job state = %q, want queued", job.State)
+	if job.State != string(workflow.JobFailed) {
+		t.Fatalf("job state = %q, want failed by production tick liveness sweep", job.State)
 	}
 }
 

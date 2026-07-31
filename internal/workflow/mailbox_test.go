@@ -120,7 +120,7 @@ func TestMailboxPersistsActingOrgRoleProvenance(t *testing.T) {
 	}
 }
 
-func TestMailboxPersistsRuntimePIDOnlyWhileDeliveryRuns(t *testing.T) {
+func TestMailboxPersistsRuntimeIdentityUntilTerminal(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	mailbox := Mailbox{Store: store}
@@ -140,8 +140,8 @@ func TestMailboxPersistsRuntimePIDOnlyWhileDeliveryRuns(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ParseJobPayload during delivery: %v", err)
 			}
-			if payload.RuntimePID != os.Getpid() || payload.RuntimePIDStartTime == "" {
-				t.Fatalf("runtime identity during delivery = pid %d start %q, want pid %d with starttime", payload.RuntimePID, payload.RuntimePIDStartTime, os.Getpid())
+			if payload.RuntimePID != os.Getpid() || payload.RuntimePIDStartTime == "" || payload.RuntimePGID <= 0 {
+				t.Fatalf("runtime identity during delivery = pid %d pgid %d start %q, want pid %d with process identity", payload.RuntimePID, payload.RuntimePGID, payload.RuntimePIDStartTime, os.Getpid())
 			}
 		},
 		outputs: []string{
@@ -159,12 +159,12 @@ func TestMailboxPersistsRuntimePIDOnlyWhileDeliveryRuns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseJobPayload: %v", err)
 	}
-	if payload.RuntimePID != 0 || payload.RuntimePIDStartTime != "" {
-		t.Fatalf("runtime identity after delivery = pid %d start %q, want cleared", payload.RuntimePID, payload.RuntimePIDStartTime)
+	if payload.RuntimePID != 0 || payload.RuntimePIDStartTime != "" || payload.RuntimePGID != 0 {
+		t.Fatalf("runtime identity after terminal = pid %d pgid %d start %q, want cleared", payload.RuntimePID, payload.RuntimePGID, payload.RuntimePIDStartTime)
 	}
 }
 
-func TestMailboxClearsRuntimePIDBeforeProduceCheck(t *testing.T) {
+func TestMailboxKeepsRuntimePIDThroughProduceCheckUntilTerminal(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	dir := t.TempDir()
@@ -207,11 +207,11 @@ func TestMailboxClearsRuntimePIDBeforeProduceCheck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseJobPayload during produce check: %v", err)
 	}
-	if stored.State != string(JobRunning) || payload.RuntimePID != 0 || payload.RuntimePIDStartTime != "" {
-		t.Fatalf("produce check window = state %q pid %d start %q, want running with no runtime identity", stored.State, payload.RuntimePID, payload.RuntimePIDStartTime)
+	if stored.State != string(JobRunning) || payload.RuntimePID != os.Getpid() || payload.RuntimePIDStartTime == "" {
+		t.Fatalf("produce check window = state %q pid %d start %q, want last runtime identity retained", stored.State, payload.RuntimePID, payload.RuntimePIDStartTime)
 	}
-	if live, known := RuntimeProcessLiveness(payload.RuntimePID, payload.RuntimePIDStartTime); live || known {
-		t.Fatalf("produce-check runtime liveness = (%v, %v), want neutral unknown", live, known)
+	if live, known := RuntimeProcessLiveness(payload.RuntimePID, payload.RuntimePIDStartTime); !live || !known {
+		t.Fatalf("produce-check runtime liveness = (%v, %v), want retained live identity", live, known)
 	}
 	if err := os.WriteFile(release, []byte("go"), 0o600); err != nil {
 		t.Fatalf("release produce check: %v", err)

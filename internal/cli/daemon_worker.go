@@ -476,7 +476,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			adapter = envAdapter
 		}
 	}
-	// Opt-in retained capture is attached to the already-composed adapter so
+	// Default-on retained capture is attached to the already-composed adapter so
 	// relay env, credential curation, gateway leases, Landlock, and pipeline
 	// progress all survive. Any open/composition failure is fail-open.
 	retainedLogPath, retainedLogFile, retainedLogErr := openRetainedTranscriptLog(w.ConfigHome, job.ID)
