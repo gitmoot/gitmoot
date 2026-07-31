@@ -411,6 +411,24 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 			}
 			payload = finalized
 		}
+		// #1277: publish the skip-native-review-fanout intent onto the BRANCH LOCK
+		// before the no-PR early return, so it is a property of the branch rather
+		// than of whoever opens the PR. The persist used to live inside the
+		// PullRequest > 0 arm below, which meant an implement job that carried the
+		// intent but did NOT open a PR left the lock reading skip=false — and a PR
+		// opened by hand on that branch minutes later re-armed the native fanout
+		// through the daemon's PR-watcher path (the measured #1275 arm: six review
+		// jobs, the implementer among them). Placed AFTER the finalizer block so it
+		// sees exactly the payload the PR path sees. The write is a bare UPDATE and
+		// never creates a lock, so it can neither establish nor transfer branch
+		// ownership; skipping it on the default (false) keeps the common path free
+		// of an extra UPDATE, since a freshly created lock already defaults to
+		// not-skip.
+		if payload.SkipNativeReviewFanout && !finalizerRan && strings.TrimSpace(payload.Branch) != "" {
+			if err := e.Store.SetBranchLockReviewFanout(ctx, payload.Repo, payload.Branch, true); err != nil {
+				return err
+			}
+		}
 		if payload.PullRequest <= 0 {
 			return e.recordImplementNoPRAdvance(ctx, job.ID, payload.Result.Decision)
 		}
@@ -438,18 +456,11 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 			// skip_native_review_fanout straight onto the PR event.
 			SkipReviewFanout: payload.SkipNativeReviewFanout,
 		}
-		// Persist the flag onto the branch lock for the daemon's PR-watcher path
-		// (trigger 2). When the finalizer ran it already wrote the flag BEFORE
-		// opening the PR (closing the #390 TOCTOU), so this write would be
-		// redundant; only the non-finalizer path (PR pre-attached, no managed
-		// worktree) reaches the PR with the flag unpersisted. Skipping the write on
-		// the common default (false) keeps that path free of an extra lock UPDATE —
-		// a freshly created lock already defaults to not-skip.
-		if payload.SkipNativeReviewFanout && !finalizerRan {
-			if err := e.Store.SetBranchLockReviewFanout(ctx, payload.Repo, payload.Branch, true); err != nil {
-				return err
-			}
-		}
+		// The branch-lock persist for the daemon's PR-watcher path (trigger 2) now
+		// happens above, before the no-PR early return, so it covers the PR arm and
+		// the no-PR arm alike. When the finalizer ran it already wrote the flag
+		// BEFORE opening the PR (closing the #390 TOCTOU), which is why both sites
+		// share the !finalizerRan guard.
 		return e.HandlePullRequestOpened(ctx, event)
 	case "review":
 		// A PR-less review (e.g. a review heartbeat enqueues Action="review" with
@@ -777,6 +788,16 @@ func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) 
 		// Inherit the coordinator's resolved risk tier (#650) so a high-risk lens
 		// child carries it for explainable escalation. Empty for every non-risk tree.
 		RiskTier: strings.TrimSpace(payload.RiskTier),
+		// #1277: inherit the skip-native-review-fanout intent. Without this the
+		// intent survived exactly one hop — the dispatched coordinator — and died
+		// at the first engine-initiated hop, so a coordinator dispatched with
+		// --skip-native-review-fanout that delegated its implement leg (the normal
+		// orchestration shape) produced a child with the flag cleared. That child
+		// opened the PR, the fanout re-armed, and it enlisted the implementer as a
+		// reviewer of its own head (#1236). The intent is an operator COMMAND about
+		// how this tree is reviewed, so it belongs to the whole tree, not to the one
+		// job that happened to receive the flag.
+		SkipNativeReviewFanout: payload.SkipNativeReviewFanout,
 		// Cockpit settings are inherited from the coordinator so every delegation
 		// subagent in one tree renders a pane under the same workspace/session.
 		Cockpit:        payload.Cockpit,
