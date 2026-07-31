@@ -49,8 +49,12 @@ type herdrOrgPane struct {
 	Label             string                  `json:"label"`
 	CWD               string                  `json:"cwd"`
 	ForegroundCWD     string                  `json:"foreground_cwd"`
+	Agent             string                  `json:"agent"`
 	AgentStatus       string                  `json:"agent_status"`
 	InputPending      bool                    `json:"input_pending"`
+	TerminalTitle     string                  `json:"terminal_title"`
+	TerminalTitleText string                  `json:"terminal_title_stripped"`
+	Turn              *json.Number            `json:"turn"`
 	LastCompletedTurn *herdrCompletedTurnWire `json:"last_completed_turn"`
 }
 
@@ -101,6 +105,7 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 	}
 	states := make(map[string]org.RoleLiveState, len(p.roles))
 	bindings := make(map[string]org.PaneBinding, len(p.roles))
+	sessions := make(map[string]org.SessionActivity, len(p.roles))
 	for _, role := range p.roles {
 		binding := strings.TrimSpace(role.Pane)
 		if binding == "" {
@@ -131,6 +136,18 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 		}
 		states[role.Name] = mapHerdrPaneState(pane)
 		bindings[role.Name] = org.PaneBinding{PaneID: paneID}
+		if strings.TrimSpace(pane.Agent) != "" {
+			title := strings.TrimSpace(pane.TerminalTitleText)
+			if title == "" {
+				title = strings.TrimSpace(pane.TerminalTitle)
+			}
+			sessions[role.Name] = org.SessionActivity{
+				PaneID:      paneID,
+				Agent:       strings.TrimSpace(pane.Agent),
+				TaskTitle:   title,
+				CurrentTurn: herdrTurnNumber(pane.Turn),
+			}
+		}
 	}
 	now := time.Now
 	if p.now != nil {
@@ -138,8 +155,19 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 	}
 	return org.Snapshot{
 		States: states, ObservedAt: now().UTC(), ProviderVersion: version,
-		PaneBindings: bindings, Panes: panes,
+		PaneBindings: bindings, Panes: panes, Sessions: sessions,
 	}, nil
+}
+
+func herdrTurnNumber(value *json.Number) *int64 {
+	if value == nil {
+		return nil
+	}
+	parsed, err := strconv.ParseInt(value.String(), 10, 64)
+	if err != nil || parsed < 0 {
+		return nil
+	}
+	return &parsed
 }
 
 func mapHerdrCompletedTurn(turn *herdrCompletedTurnWire) *org.RoleActivity {

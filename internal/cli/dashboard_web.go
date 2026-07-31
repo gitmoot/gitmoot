@@ -90,6 +90,10 @@ func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	mux.HandleFunc("GET /api/learning/knowledge", ds.handleLearningKnowledge)
 	mux.HandleFunc("GET /api/brain/events", ds.handleBrainEvents)
 	mux.HandleFunc("GET /api/brain/fact", ds.handleBrainFact)
+	mux.HandleFunc("GET /api/fleet/activity", ds.handleFleetActivity)
+	mux.HandleFunc("GET /api/fleet/activity/events", ds.handleFleetActivityEvents)
+	mux.HandleFunc("GET /assets/gitmoot-fleet-activity.css", handleFleetActivityCSS)
+	mux.HandleFunc("GET /assets/gitmoot-fleet-activity.js", handleFleetActivityJS)
 	// #958 single-label detail widening (no module cache policy for this route).
 	mux.HandleFunc("GET /api/workflow/{label}", ds.handleWorkflowAPI)
 	// Public pipeline receipts are deliberately narrow, read-only projections of
@@ -97,7 +101,7 @@ func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	// module fallback so no /api or module behavior changes.
 	mux.HandleFunc("GET /receipts/{id}", ds.handlePipelineReceipt)
 	mux.HandleFunc("GET /receipts/{id}/bundle", ds.handlePipelineReceiptBundle)
-	mux.Handle("/", dashboard.Serve(ds))
+	mux.Handle("/", withFleetActivityAssets(dashboard.Serve(ds)))
 	return mux
 }
 
@@ -180,10 +184,15 @@ type webDataSource struct {
 	registryMu sync.Mutex
 	pollers    map[string]*ssePoller
 
+	fleetMu     sync.Mutex
+	fleetPoller *fleetActivityPoller
+
 	// These hooks keep the shared-poller concurrency tests fast and
 	// deterministic. Production leaves them nil/zero.
 	sseState        func(context.Context, string) (dashboard.State, error)
 	ssePollInterval time.Duration
+	fleetSnapshot   func(context.Context) (dashboardFleetActivity, error)
+	fleetInterval   time.Duration
 
 	// mu guards the Health() caches below (Health can be called concurrently and
 	// its resolvers run in goroutines). Everything else on the source is stateless

@@ -36,11 +36,22 @@ type RoleActivity struct {
 }
 
 type Snapshot struct {
-	States          map[string]RoleLiveState `json:"states"`
-	ObservedAt      time.Time                `json:"observed_at"`
-	ProviderVersion string                   `json:"provider_version,omitempty"`
-	PaneBindings    map[string]PaneBinding   `json:"-"`
-	Panes           []LivePane               `json:"-"`
+	States          map[string]RoleLiveState   `json:"states"`
+	ObservedAt      time.Time                  `json:"observed_at"`
+	ProviderVersion string                     `json:"provider_version,omitempty"`
+	PaneBindings    map[string]PaneBinding     `json:"-"`
+	Panes           []LivePane                 `json:"-"`
+	Sessions        map[string]SessionActivity `json:"-"`
+}
+
+// SessionActivity is the live, non-durable session metadata Herdr reports for a
+// configured role. It stays separate from RoleLiveState because a live pane can
+// exist without an active agent session.
+type SessionActivity struct {
+	PaneID      string
+	Agent       string
+	TaskTitle   string
+	CurrentTurn *int64
 }
 
 // PaneBinding records whether a configured role resolves to a live pane.
