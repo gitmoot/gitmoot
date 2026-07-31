@@ -11266,10 +11266,11 @@ emitting job. The daemon coalesces a rolling five-second window per event kind
 and role. Reply prompts carry `N new items, oldest id X`; blocked and escalation
 events retain their redacted event detail. Different event kinds never share a
 coalescing key, and a later tick flushes a quiet tail without another event.
-Rules default to `--scope addressed`: when an event names a target role, only
-the matching addressed rule receives it. During rule evaluation,
-`--scope observer` exempts a rule from that addressee gate.
-Events without a target role keep matching both scopes exactly as before.
+Rules default to `--scope addressed`: an addressed rule is eligible only when
+the event names a target role and that role matches `--wake`.
+`--scope observer` exempts a rule from the addressee gate, so observers receive
+both directed events and events without a target; address-less events never
+broadcast to addressed rules.
 Durable-outbox claim authorization is scope-blind: among enabled,
 filter-matching rules for the event's own kind, wake-role equality with the
 addressed target is the only routing condition. An observer-scoped rule is

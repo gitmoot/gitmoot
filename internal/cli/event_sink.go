@@ -195,10 +195,12 @@ func emitDaemonTerminalEvent(ctx context.Context, sink events.Sink, store *db.St
 	}
 	repo := ""
 	rootID := jobID
+	wakeTargetRole := ""
 	if store != nil {
 		if job, err := store.GetJob(ctx, jobID); err == nil {
 			if payload, perr := daemonJobPayload(job); perr == nil {
 				repo = payload.Repo
+				wakeTargetRole = workflow.NormalizeActingOrgRole(payload.ActingOrgRole)
 				if strings.TrimSpace(payload.RootJobID) != "" {
 					rootID = payload.RootJobID
 				}
@@ -217,6 +219,9 @@ func emitDaemonTerminalEvent(ctx context.Context, sink events.Sink, store *db.St
 	)
 	if len(cause) > 0 {
 		event.Cause = strings.TrimSpace(cause[0])
+	}
+	if eventType == events.EventJobBlocked && wakeTargetRole != "" {
+		event.WakeTargetRole = wakeTargetRole
 	}
 	events.EmitEvent(ctx, sink, event)
 }

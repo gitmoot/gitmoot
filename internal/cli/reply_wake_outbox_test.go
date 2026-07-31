@@ -162,11 +162,13 @@ func TestWakeOutboxTickHealthIncludesBlockedAndEscalation(t *testing.T) {
 		events.EventJobBlocked, "job-blocked", "root-blocked", "owner/repo",
 		"blocked", "blocked", now, workflow.RedactCommentText,
 	)
+	blocked.WakeTargetRole = "owner"
 	escalation := events.NewEvent(
 		events.EventJobNeedsAttention, "job-escalated", "root-escalated", "owner/repo",
 		"awaiting_human", "answer required", now, workflow.RedactCommentText,
 	)
 	escalation.Cause = "escalation"
+	escalation.WakeTargetRole = "owner"
 	sink.Emit(ctx, blocked)
 	sink.Emit(ctx, escalation)
 

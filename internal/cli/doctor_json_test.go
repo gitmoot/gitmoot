@@ -83,9 +83,9 @@ func TestDoctorWarnsWhenDirectedEventKindHasNoObserverRule(t *testing.T) {
 	}
 	detail := check["detail"].(string)
 	if check["status"] != "warn" ||
-		!strings.Contains(detail, "blocked, directive, escalation") ||
+		!strings.Contains(detail, "blocked, directive, escalation, pane_input_pending") ||
 		strings.Contains(detail, "reply") {
-		t.Fatalf("event observers check = %#v, want blocked, directive, and escalation warning with reply covered", check)
+		t.Fatalf("event observers check = %#v, want blocked, directive, escalation, and pane_input_pending warning with reply covered", check)
 	}
 	t.Logf("reviewer probe: warned=true detail=%q", detail)
 
@@ -101,6 +101,12 @@ func TestDoctorWarnsWhenDirectedEventKindHasNoObserverRule(t *testing.T) {
 	}
 	if err := store.AddEventRule(context.Background(), db.EventRule{
 		ID: "observer-escalation", OnKind: "escalation", WakeRole: "owner",
+		Scope: db.EventRuleScopeObserver, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddEventRule(context.Background(), db.EventRule{
+		ID: "observer-pane-input", OnKind: "pane_input_pending", WakeRole: "owner",
 		Scope: db.EventRuleScopeObserver, Enabled: true,
 	}); err != nil {
 		t.Fatal(err)
@@ -125,6 +131,7 @@ func TestBuildEventObserverDoctorCheckWarnsForEachMissingDirectedKind(t *testing
 		db.WakeOutboxKindReply,
 		db.WakeOutboxKindBlocked,
 		db.WakeOutboxKindEscalation,
+		"pane_input_pending",
 		db.WakeOutboxKindDirective,
 	}
 	for _, missingKind := range kinds {

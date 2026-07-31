@@ -716,6 +716,17 @@ func loadMergeGateOrgConfig(home string) (config.OrgConfig, bool) {
 }
 
 func mergeGateEscalationFrom(cfg config.OrgConfig, repo string) string {
+	if owner, ok := repoOrgOwner(cfg, repo); ok {
+		return owner
+	}
+	parts := strings.Split(strings.TrimSpace(repo), "/")
+	if len(parts) == 2 && parts[1] != "" {
+		return parts[1]
+	}
+	return "gitmoot"
+}
+
+func repoOrgOwner(cfg config.OrgConfig, repo string) (string, bool) {
 	best, bestDepth := "", -1
 	for _, role := range cfg.Roles() {
 		if config.ScopeMatches(role.Scope, repo) {
@@ -724,14 +735,7 @@ func mergeGateEscalationFrom(cfg config.OrgConfig, repo string) string {
 			}
 		}
 	}
-	if best != "" {
-		return best
-	}
-	parts := strings.Split(strings.TrimSpace(repo), "/")
-	if len(parts) == 2 && parts[1] != "" {
-		return parts[1]
-	}
-	return "gitmoot"
+	return best, best != ""
 }
 
 func nativeMergeGateDisabled() bool {
