@@ -332,6 +332,32 @@ func TestDashboardCommsPageContract(t *testing.T) {
 	}
 }
 
+func TestDashboardCommsPageUsesDashboardShellAndFlowLayout(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	newDashboardWebHandler(&webDataSource{}).ServeHTTP(
+		recorder, httptest.NewRequest(http.MethodGet, "/comms", nil),
+	)
+	body := recorder.Body.String()
+	for _, test := range []struct {
+		name string
+		want string
+	}{
+		{name: "dashboard sidebar", want: `data-dashboard-sidebar`},
+		{name: "active Comms item", want: `href="/comms" aria-current="page"`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if !strings.Contains(body, test.want) {
+				t.Fatalf("GET /comms missing %q", test.want)
+			}
+		})
+	}
+	t.Run("mobile layout has no fixed rail inset", func(t *testing.T) {
+		if strings.Contains(body, "117px") {
+			t.Fatal("GET /comms still contains the hardcoded 117px mobile rail inset")
+		}
+	})
+}
+
 func TestDashboardSidebarLinksCommsDirectlyAfterChat(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	newDashboardWebHandler(&webDataSource{}).ServeHTTP(
