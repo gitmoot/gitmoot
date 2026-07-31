@@ -90,6 +90,7 @@ func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	mux.HandleFunc("GET /api/learning/knowledge", ds.handleLearningKnowledge)
 	mux.HandleFunc("GET /api/brain/events", ds.handleBrainEvents)
 	mux.HandleFunc("GET /api/brain/fact", ds.handleBrainFact)
+	registerDashboardCommsRoutes(mux, ds)
 	// #958 single-label detail widening (no module cache policy for this route).
 	mux.HandleFunc("GET /api/workflow/{label}", ds.handleWorkflowAPI)
 	// Public pipeline receipts are deliberately narrow, read-only projections of
