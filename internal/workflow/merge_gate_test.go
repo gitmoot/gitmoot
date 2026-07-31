@@ -1595,6 +1595,70 @@ func TestPolicyMergeGateDifferentReviewerCannotSupersedeObjection(t *testing.T) 
 	}
 }
 
+func TestPolicyMergeGateNonEvidenceVerdictDoesNotSupersedeObjection(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		decision string
+	}{
+		{name: "skipped", decision: "skipped"},
+		{name: "empty"},
+		{name: "unknown future decision", decision: "future_verdict"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			basePayload := JobPayload{
+				Repo:        "gitmoot/gitmoot",
+				PullRequest: 9,
+				HeadSHA:     "head123",
+				TaskID:      "task-9",
+				ReviewRound: "review-1",
+			}
+			objection := basePayload
+			objection.Result = &AgentResult{Decision: "changes_requested", Summary: "must fix"}
+			insertIndependentMergeGateReview(t, store, db.Job{ID: "review-objector-objection", Agent: "objector", Type: "review"}, objection)
+			setMergeGateJobTimestamps(t, store, "review-objector-objection", "2026-07-31 12:00:00")
+
+			nonEvidence := basePayload
+			nonEvidence.Result = &AgentResult{Decision: tc.decision, Summary: "no replacement evidence"}
+			insertIndependentMergeGateReview(t, store, db.Job{ID: "review-objector-later", Agent: "objector", Type: "review"}, nonEvidence)
+			setMergeGateJobTimestamps(t, store, "review-objector-later", "2026-07-31 12:01:00")
+
+			approval := basePayload
+			approval.Result = &AgentResult{Decision: "approved", Summary: "ready"}
+			insertIndependentMergeGateReview(t, store, db.Job{ID: "review-approver", Agent: "approver", Type: "review"}, approval)
+			setMergeGateJobTimestamps(t, store, "review-approver", "2026-07-31 12:02:00")
+
+			mergeable := true
+			gh := &fakeMergeGateGitHub{
+				pr: github.PullRequest{
+					Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+					HeadSHA: "head123", Mergeable: &mergeable,
+				},
+				status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+				checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+				mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+			}
+			gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+			decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+				t.Fatalf("decision = %+v, want non-evidence decision %q to leave objection blocking", decision, tc.decision)
+			}
+			if !strings.Contains(decision.Reason, "blocking result from objector") {
+				t.Fatalf("decision reason = %q, want objector's blocking result", decision.Reason)
+			}
+			if len(gh.merges) != 0 {
+				t.Fatalf("merge calls = %+v, want none", gh.merges)
+			}
+		})
+	}
+}
+
 func TestPolicyMergeGateHeadlessIntegrationObjectionDoesNotMatchEveryHead(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

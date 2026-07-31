@@ -475,7 +475,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			continue
 		}
 		for _, candidate := range reviewsAtHead {
-			if strings.TrimSpace(candidate.job.Agent) == reviewer && reviewJobRecordedAfter(candidate.job, review.job) {
+			if strings.TrimSpace(candidate.job.Agent) == reviewer &&
+				isReviewReplacementDecision(candidate.payload.Result.Decision) &&
+				reviewJobRecordedAfter(candidate.job, review.job) {
 				supersededReviewIDs[review.job.ID] = struct{}{}
 				break
 			}
@@ -615,6 +617,15 @@ func reviewJobRecordedAfter(left db.Job, right db.Job) bool {
 		return after
 	}
 	return false
+}
+
+func isReviewReplacementDecision(decision string) bool {
+	switch decision {
+	case "approved", "changes_requested", "blocked", "failed":
+		return true
+	default:
+		return false
+	}
 }
 
 func recordedTimestampAfter(left string, right string) (after bool, decided bool) {
