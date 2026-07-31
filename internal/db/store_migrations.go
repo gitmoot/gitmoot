@@ -1860,4 +1860,18 @@ WHERE scope = 'addressed'
 	AND on_kind <> 'reply'
 	AND TRIM(COALESCE(match_filter, '')) = '';
 	`,
+	// #1206/#1304 restart-safe directive supervision. The directive remains the
+	// original workflow_notes row; these additive columns persist evaluator
+	// cadence across daemon restarts. -1 means inherit the global done TTL, while
+	// 0 is an explicit per-directive disable.
+	`
+ALTER TABLE workflow_notes ADD COLUMN directive_done_ttl_seconds INTEGER NOT NULL DEFAULT -1
+	CHECK(directive_done_ttl_seconds >= -1);
+ALTER TABLE workflow_notes ADD COLUMN directive_nudge_count INTEGER NOT NULL DEFAULT 0
+	CHECK(directive_nudge_count >= 0);
+ALTER TABLE workflow_notes ADD COLUMN directive_last_nudged_at TEXT NOT NULL DEFAULT '';
+CREATE INDEX idx_workflow_notes_directive_oldest
+	ON workflow_notes(created_at, id)
+	WHERE substr(body, 1, length('[org:directive ')) = '[org:directive ';
+	`,
 }

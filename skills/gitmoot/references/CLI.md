@@ -1388,8 +1388,20 @@ the addressed target or one of its configured ancestors and records receipt,
 not completion. `gitmoot org directive cancel <id> [--by <role>] [--home
 <dir>]` is restricted to the sender. Both commands require an acting identity
 from `--by` or `GITMOOT_ORG_ROLE`; missing identity fails closed. They append
-typed markers to the directive's workflow journal; completion tracking belongs
-to the later directive-ledger slice.
+typed markers to the directive's workflow journal.
+
+The daemon evaluates directive TTLs on the existing one-minute org supervision
+lane. `[org].directive_ack_ttl` defaults to `10m`,
+`[org].directive_done_ttl` defaults to `0s` (completion nudges off), and
+`[org].directive_max_nudges` defaults to `3`. An unacknowledged directive is
+re-woken at most once per ack-TTL interval. When its persisted nudge count
+reaches the maximum, Gitmoot emits an escalation addressed to the sender's
+current parent in the org chart. Acknowledgment stops ack nudges; an acknowledged
+but unfinished directive is evaluated only when its completion TTL is enabled.
+An internal per-directive completion-TTL override, when present, takes
+precedence over the global value. Typed completion or cancellation receipts
+close the evaluator obligation. With no enabled org event rules, the lane is
+config-inert: it performs no directive scan and emits nothing.
 
 Event-rule wakes are separately opt-in:
 

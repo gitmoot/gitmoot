@@ -101,9 +101,9 @@ func TestClassifyEventRuleKinds(t *testing.T) {
 	}
 }
 
-func TestWakeTargetRoleHasExactlyOneProductionWriteInWakeOutboxEvent(t *testing.T) {
+func TestWakeTargetRoleProductionWritesMatchObserverRegistry(t *testing.T) {
 	writes := productionWakeTargetRoleWrites(t)
-	if got, want := fmt.Sprint(writes), "[internal/cli/reply_wake_outbox.go:wakeOutboxEvent]"; got != want {
+	if got, want := fmt.Sprint(writes), "[internal/cli/blocked_since.go:buildDirectiveEscalationEvent internal/cli/blocked_since.go:buildDirectiveNudgeEvent internal/cli/reply_wake_outbox.go:wakeOutboxEvent]"; got != want {
 		t.Fatalf("production WakeTargetRole writes = %s, want %s", got, want)
 	}
 	registryWrites := make([]wakeTargetRoleWrite, 0, len(wakeTargetRoleProducers))

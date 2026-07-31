@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -216,6 +217,66 @@ func TestListUnacknowledgedOrgDirectivesKeepsOldestFirst(t *testing.T) {
 	}
 	if len(notes) != 2 || notes[0].ID != second.ID || notes[1].ID != third.ID {
 		t.Fatalf("unacknowledged directives = %+v, want ids [%d %d] oldest first", notes, second.ID, third.ID)
+	}
+}
+
+func TestListOpenOrgDirectiveObligationsKeepsOldestAndPersistsNudges(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	insert := func(body string, doneTTLSeconds int64, set bool) WorkflowNote {
+		t.Helper()
+		note, err := store.InsertWorkflowNote(ctx, WorkflowNote{
+			WorkflowID: "release/ttl", Author: "owner", Body: body,
+			DirectiveDoneTTLSeconds: doneTTLSeconds, DirectiveDoneTTLSet: set,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return note
+	}
+	first := insert("[org:directive to=worker from=owner wf=release/ttl] first", 90, true)
+	second := insert("[org:directive to=worker from=owner wf=release/ttl] second", 0, false)
+	third := insert("[org:directive to=worker from=owner wf=release/ttl] third", 0, false)
+	done := insert("[org:directive to=worker from=owner wf=release/ttl] done", 0, false)
+	for id, createdAt := range map[int64]string{
+		first.ID:  "2026-07-01 00:00:00",
+		second.ID: "2026-07-02 00:00:00",
+		third.ID:  "2026-07-03 00:00:00",
+		done.ID:   "2026-07-04 00:00:00",
+	} {
+		if _, err := store.db.ExecContext(ctx, `UPDATE workflow_notes SET created_at = ? WHERE id = ?`, createdAt, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: "release/ttl", Author: "worker", Body: fmt.Sprintf("[org:directive-ack id=%d by=worker]", first.ID)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: "release/ttl", Author: "worker", Body: fmt.Sprintf("[org:directive-done id=%d by=worker]", done.ID)}); err != nil {
+		t.Fatal(err)
+	}
+
+	items, err := store.ListOpenOrgDirectiveObligations(ctx, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// MUTANT F6: ORDER BY created_at DESC drops first, the oldest obligation.
+	if len(items) != 2 || items[0].ID != first.ID || items[1].ID != second.ID {
+		t.Fatalf("open directives = %+v, want oldest ids [%d %d]", items, first.ID, second.ID)
+	}
+	if items[0].AckedAt == "" || items[0].DoneTTLOverrideSeconds != 90 {
+		t.Fatalf("first obligation = %+v, want ack plus 90s done override", items[0])
+	}
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	count, claimed, err := store.MarkOrgDirectiveNudged(ctx, first.ID, 0, "", now)
+	if err != nil || !claimed || count != 1 {
+		t.Fatalf("mark nudge = count %d claimed %v err %v", count, claimed, err)
+	}
+	if _, claimed, err := store.MarkOrgDirectiveNudged(ctx, first.ID, 0, "", now); err != nil || claimed {
+		t.Fatalf("stale nudge CAS claimed=%v err=%v", claimed, err)
+	}
+	items, err = store.ListOpenOrgDirectiveObligations(ctx, 1)
+	if err != nil || len(items) != 1 || items[0].NudgeCount != 1 || items[0].LastNudgedAt == "" {
+		t.Fatalf("persisted nudge = %+v err=%v", items, err)
 	}
 }
 

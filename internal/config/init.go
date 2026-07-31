@@ -607,6 +607,9 @@ path = ""
 # this phase (owner | self | none).
 # [org]
 # enforce = "block"
+# directive_ack_ttl = "10m"
+# directive_done_ttl = "0s" # disabled; a per-directive override takes precedence
+# directive_max_nudges = 3
 # [org.roles."owner"]
 # scope = ["*"]
 # merge_rule = "owner"
