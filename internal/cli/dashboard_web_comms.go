@@ -96,14 +96,16 @@ func (d *webDataSource) handleCommsPage(w http.ResponseWriter, _ *http.Request) 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	page := strings.Replace(dashboardCommsPage, dashboardCommsSidebarPlaceholder, renderDashboardCommsSidebar("/comms"), 1)
+	page = strings.Replace(page, dashboardCommsMobileNavPlaceholder, renderDashboardCommsMobileNav(), 1)
 	_, _ = fmt.Fprint(w, page)
 }
 
 const dashboardCommsSidebarPlaceholder = "<!-- gitmoot-dashboard-sidebar -->"
+const dashboardCommsMobileNavPlaceholder = "<!-- gitmoot-dashboard-mobile-nav -->"
 
 func renderDashboardCommsSidebar(activeHref string) string {
 	var out strings.Builder
-	out.WriteString(`<aside class="gm-sidebar" data-dashboard-sidebar aria-label="Dashboard navigation">`)
+	out.WriteString(`<aside class="gm-sidebar" id="dashboard-sidebar" data-dashboard-sidebar aria-label="Dashboard navigation">`)
 	group := ""
 	for _, item := range dashboardNavManifest {
 		if item.Group != group {
@@ -125,6 +127,26 @@ func renderDashboardCommsSidebar(activeHref string) string {
 		)
 	}
 	out.WriteString(`<div class="gm-sidebar-foot"><span class="live-dot"></span><span>local · dashboard</span></div></aside>`)
+	return out.String()
+}
+
+func renderDashboardCommsMobileNav() string {
+	manifestByHref := make(map[string]dashboardNavItem, len(dashboardNavManifest))
+	for _, item := range dashboardNavManifest {
+		manifestByHref[item.Href] = item
+	}
+	var out strings.Builder
+	out.WriteString(`<nav class="gm-mobile-nav" aria-label="Dashboard mobile navigation">`)
+	for _, href := range []string{"/", "/tasks", "/workflows", "/brain"} {
+		item := manifestByHref[href]
+		fmt.Fprintf(&out, `<a class="gm-mobile-item" href="%s">%s<span>%s</span></a>`,
+			html.EscapeString(item.Href),
+			dashboardCommsNavIcon(item.Href),
+			html.EscapeString(item.Title),
+		)
+	}
+	out.WriteString(`<button class="gm-mobile-item active" id="mobile-more" type="button" aria-label="Open dashboard navigation">`)
+	out.WriteString(`<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg><span>More</span></button></nav>`)
 	return out.String()
 }
 
@@ -353,14 +375,15 @@ const dashboardCommsPage = `<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Comms · gitmoot</title>
 <style>
-:root{color-scheme:dark;--bg:#07080f;--panel:#0f1120;--panel2:#151827;--line:rgba(160,168,220,.13);--text:#eef0ff;--muted:#a8aecf;--faint:#5a6088;--accent:#9ece6a;--loud:#ff9e64;--bubble:#18202e;--reply:#17271f;--shadow:0 18px 50px rgba(0,0,0,.22);--header:rgba(10,11,22,.96)}
-[data-theme="light"]{color-scheme:light;--bg:#f3f5f8;--panel:#fff;--panel2:#f8fafc;--line:#dce1e9;--text:#172033;--muted:#5e687b;--faint:#8790a0;--accent:#467a2b;--loud:#bd4b1c;--bubble:#eef3f9;--reply:#eef7ed;--shadow:0 16px 40px rgba(24,36,58,.1);--header:rgba(255,255,255,.96)}
-*{box-sizing:border-box}html{min-height:100%;margin:0}body{min-height:100%;margin:0;background:var(--bg);color:var(--text);font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow:auto}
+:root{color-scheme:dark;--bg:#07080f;--panel:#0a0b16;--panel2:#0f1120;--line:rgba(160,168,220,.13);--shell-line:rgba(160,168,220,.08);--text:#eef0ff;--muted:#a8aecf;--faint:#5a6088;--accent:#9ece6a;--loud:#ff9e64;--bubble:#18202e;--reply:#17271f;--shadow:0 18px 50px rgba(0,0,0,.22);--header:rgba(10,11,22,.62);--nav-active:#eef0ff;--nav-active-bg:rgba(187,154,247,.12);--nav-active-border:rgba(187,154,247,.26);--nav-active-shadow:rgba(187,154,247,.04);--mobile-nav:#7c83a8;--mobile-active:#cabff2;--mobile-active-bg:rgba(187,154,247,.11)}
+[data-theme="light"]{color-scheme:light;--bg:#f3f5f8;--panel:#fff;--panel2:#f8fafc;--line:#dce1e9;--shell-line:rgba(23,32,51,.1);--text:#172033;--muted:#5e687b;--faint:#8790a0;--accent:#467a2b;--loud:#bd4b1c;--bubble:#eef3f9;--reply:#eef7ed;--shadow:0 16px 40px rgba(24,36,58,.1);--header:rgba(255,255,255,.78);--nav-active:#32284b;--nav-active-bg:rgba(120,82,177,.11);--nav-active-border:rgba(120,82,177,.24);--nav-active-shadow:rgba(120,82,177,.04);--mobile-nav:#687087;--mobile-active:#674d91;--mobile-active-bg:rgba(120,82,177,.1)}
+*{box-sizing:border-box}html{height:100%;margin:0}body{height:100%;margin:0;background:var(--bg);color:var(--muted);font:14px Inter,Arial,sans-serif;overflow:hidden}
 button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{height:100vh;height:100dvh;min-height:620px;display:flex;flex-direction:column;background:var(--bg)}
-.gm-header{height:54px;flex:none;display:flex;align-items:center;gap:14px;padding:0 18px;border-bottom:1px solid var(--line);background:var(--header);backdrop-filter:blur(10px);position:relative;z-index:10}.brand{display:flex;align-items:center;gap:9px;color:var(--text);font-weight:750;text-decoration:none;font-size:18px}.brand img{display:block;border-radius:6px;box-shadow:0 0 20px color-mix(in srgb,var(--accent) 18%,transparent)}
-.crumb-divider{width:1px;height:20px;background:var(--line);flex:none}.crumb{display:flex;align-items:center;gap:9px;min-width:0;color:var(--faint);font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace}.crumb b{color:var(--text);font-weight:500}.spacer{flex:1}.live{display:flex;align-items:center;gap:7px;padding:5px 9px;border:1px solid var(--line);border-radius:7px;color:var(--muted);font:10.5px ui-monospace,SFMono-Regular,Menlo,monospace}.live-dot{width:6px;height:6px;border-radius:50%;background:var(--accent)}.navlink,.theme{border:1px solid var(--line);background:var(--panel2);border-radius:8px;padding:7px 10px;text-decoration:none;color:var(--muted)}
-.gm-frame{display:flex;flex:1;min-height:0;min-width:0}.gm-sidebar{width:216px;flex:none;min-height:0;overflow-y:auto;padding:12px 10px 0;border-right:1px solid var(--line);background:color-mix(in srgb,var(--panel) 88%,var(--bg));display:flex;flex-direction:column}.gm-nav-group{font:9.5px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.15em;color:var(--faint);padding:4px 10px 7px}.gm-nav-group:not(:first-child){padding-top:14px}.gm-nav-link{display:flex;align-items:center;gap:11px;padding:9px 11px;border:1px solid transparent;border-radius:9px;margin-top:2px;color:var(--muted);font-size:13.5px;font-weight:500;text-decoration:none;white-space:nowrap}.gm-nav-link:hover{background:color-mix(in srgb,var(--muted) 8%,transparent);color:var(--text)}.gm-nav-link.active{background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--accent);border-color:color-mix(in srgb,var(--accent) 30%,transparent);box-shadow:inset 3px 0 0 var(--accent)}.gm-nav-link svg{width:17px;height:17px;flex:none}.gm-sidebar-foot{margin-top:auto;padding:10px;border-top:1px solid var(--line);display:flex;align-items:center;gap:8px;color:var(--faint);font:10.5px ui-monospace,SFMono-Regular,Menlo,monospace}.gm-content{flex:1;min-width:0;min-height:0;display:flex;flex-direction:column}
-.filters{display:grid;grid-template-columns:minmax(160px,1fr) repeat(3,minmax(110px,160px)) minmax(130px,180px) auto;gap:8px;padding:10px 14px;border-bottom:1px solid var(--line);background:var(--panel2)}
+.gm-header{height:54px;flex:none;display:flex;align-items:center;gap:14px;padding:0 18px;border-bottom:1px solid var(--shell-line);background:var(--header);backdrop-filter:blur(10px);position:relative;z-index:50}.mobile-menu{display:none;place-items:center;width:28px;height:28px;flex:none;padding:0;border:0;background:transparent;color:#8b90b8}.mobile-menu svg{width:20px;height:20px}.brand{display:flex;align-items:center;gap:9px;flex:none;color:var(--text);text-decoration:none}.brand>span{font:700 18px "Space Grotesk",Arial,sans-serif;letter-spacing:0}.brand img{display:block;border-radius:6px;box-shadow:0 0 20px rgba(158,206,106,.18)}
+.crumb-divider{width:1px;height:20px;background:rgba(160,168,220,.14);flex:none}.crumb{display:flex;align-items:center;gap:9px;min-width:0;color:#868db5;font:12.5px "JetBrains Mono",monospace}.crumb b{color:var(--text);font-weight:400}.spacer{flex:1}.gm-header-actions{margin-left:auto;display:flex;align-items:center;gap:14px;flex:none}.gm-aplink{width:134.234px;display:flex;align-items:center;gap:6px;padding:5px 10px;border:1px solid rgba(160,168,220,.16);border-radius:7px;background:rgba(160,168,220,.06);color:#c7c9e5;font:600 12px/1 Inter,Arial,sans-serif}.daemon-label{color:var(--faint);white-space:nowrap;font:10.5px "JetBrains Mono",monospace}.daemon-state{width:67.922px;display:flex;align-items:center;gap:7px;padding:5px 11px;border:1px solid rgba(158,206,106,.24);border-radius:20px;background:rgba(158,206,106,.1)}.daemon-dot{width:7px;height:7px;border-radius:50%;flex:none;background:#9ece6a;box-shadow:0 0 10px rgba(158,206,106,.7)}.daemon-status{color:#c5f882;font:600 11px "JetBrains Mono",monospace;letter-spacing:.08em;white-space:nowrap}.daemon-state.down{width:120.281px;border-color:rgba(90,96,136,.32);background:rgba(90,96,136,.12)}.daemon-state.down .daemon-dot{background:#5a6088;box-shadow:none}.daemon-state.down .daemon-status{color:#868db5}.live-dot{width:6px;height:6px;border-radius:50%;background:var(--accent)}.navlink,.theme{border:1px solid var(--line);background:var(--panel2);border-radius:8px;padding:7px 10px;text-decoration:none;color:var(--muted)}
+.gm-frame{display:flex;flex:1;min-height:0;min-width:0}.gm-sidebar{width:216px;flex:none;min-height:0;overflow-y:auto;padding:18px 12px 14px;border-right:1px solid var(--shell-line);background:var(--panel);display:flex;flex-direction:column}.gm-nav-group{font:9.5px/11px "JetBrains Mono",monospace;letter-spacing:.15em;color:var(--faint);padding:4px 10px 7px}.gm-nav-group:not(:first-child){padding-top:16px}.gm-nav-link{display:flex;align-items:center;gap:11px;padding:9px 11px;border:1px solid transparent;border-radius:9px;margin-top:2px;color:var(--muted);font-size:13.5px;font-weight:500;text-decoration:none;white-space:nowrap}.gm-nav-link:hover{background:rgba(168,174,207,.08);color:var(--text)}.gm-nav-link.active{background:var(--nav-active-bg);color:var(--nav-active);border-color:var(--nav-active-border);box-shadow:0 0 0 1px var(--nav-active-shadow) inset}.gm-nav-link svg{width:17px;height:17px;flex:none}.gm-sidebar-foot{margin-top:auto;padding:10px;border-top:1px solid var(--line);display:flex;align-items:center;gap:8px;color:var(--faint);font:10.5px "JetBrains Mono",monospace}.gm-content{flex:1;min-width:0;min-height:0;display:flex;flex-direction:column}
+.gm-mobile-nav,.mobile-backdrop{display:none}
+.filters{display:grid;grid-template-columns:minmax(160px,1fr) repeat(3,minmax(110px,160px)) minmax(130px,180px) auto auto;gap:8px;padding:10px 14px;border-bottom:1px solid var(--line);background:var(--panel2)}
 .control{min-width:0;border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:8px 10px}.check{display:flex;align-items:center;gap:7px;padding:0 8px;color:var(--muted);white-space:nowrap}
 .workspace{flex:1;display:grid;grid-template-columns:minmax(260px,340px) minmax(0,1fr);min-height:0}.rail{border-right:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0}
 .railhead{padding:13px;border-bottom:1px solid var(--line)}.seg{display:flex;gap:5px}.seg button{flex:1;border:1px solid var(--line);background:var(--panel2);padding:7px;border-radius:7px;color:var(--muted)}.seg button.active{background:color-mix(in srgb,var(--accent) 15%,var(--panel2));color:var(--accent);border-color:color-mix(in srgb,var(--accent) 40%,var(--line))}
@@ -374,7 +397,7 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
 .state{margin:auto;max-width:480px;padding:44px;text-align:center;color:var(--muted)}.state strong{display:block;color:var(--text);font-size:17px;margin-bottom:7px}.source-down strong{color:var(--loud)}
 .comms-footer{min-height:36px;flex:none;display:flex;align-items:center;justify-content:center;border-top:1px solid var(--line);background:var(--panel);color:var(--faint);font-size:11px;padding:7px 12px;text-align:center}.pulse{width:7px;height:7px;border-radius:50%;background:var(--accent);margin-right:7px;flex:none}
 .focus{animation:flash 1.8s ease}@keyframes flash{0%,100%{outline:0 solid transparent}30%{outline:4px solid color-mix(in srgb,var(--accent) 30%,transparent)}}
-@media(max-width:820px){.shell{height:auto;min-height:100dvh}.gm-header{position:sticky;top:0}.live{display:none}.gm-frame{display:block}.gm-sidebar{width:100%;height:auto;display:flex;flex-direction:row;overflow-x:auto;overflow-y:hidden;padding:7px 8px;border-right:0;border-bottom:1px solid var(--line)}.gm-nav-group,.gm-sidebar-foot{display:none}.gm-nav-link{flex:none;margin:0 2px;padding:8px 10px}.gm-content{display:block}.filters{grid-template-columns:1fr 1fr}.filters .search{grid-column:1/-1}.workspace{display:block}.rail{position:static;min-height:0;border-right:0}.threads{overflow:visible}.rail.thread-open{display:none}.conversation{display:none}.conversation.thread-open{display:block}.conversation-head{padding:0 12px}.messages{overflow:visible;padding:16px 12px 34px}.mobile-back{display:inline-flex!important}.comms-footer{min-height:44px}}
+@media(max-width:820px){.shell{height:100dvh;min-height:0}.gm-header{position:relative}.mobile-menu{display:grid}.crumb>span{display:none}.gm-aplink,.daemon-label{display:none}.gm-frame{display:flex;min-height:0}.gm-sidebar{display:none;position:fixed;z-index:80;top:54px;bottom:60px;left:0;width:min(84vw,320px);padding:18px 12px 14px;border-right:1px solid var(--shell-line);box-shadow:18px 0 50px rgba(0,0,0,.35)}.gm-sidebar.mobile-open{display:flex}.mobile-backdrop.mobile-open{display:block;position:fixed;z-index:70;inset:54px 0 60px;background:rgba(0,0,0,.48)}.gm-content{display:flex;min-height:0;overflow:auto;padding-bottom:60px}.filters{grid-template-columns:1fr 1fr}.filters .search{grid-column:1/-1}.workspace{display:block;flex:1}.rail{position:static;min-height:0;border-right:0}.threads{overflow:visible}.rail.thread-open{display:none}.conversation{display:none}.conversation.thread-open{display:block}.conversation-head{padding:0 12px}.messages{overflow:visible;padding:16px 12px 34px}.mobile-back{display:inline-flex!important}.comms-footer{min-height:44px}.gm-mobile-nav{display:flex;position:fixed;z-index:60;left:0;right:0;bottom:0;height:calc(60px + env(safe-area-inset-bottom));padding-bottom:env(safe-area-inset-bottom);background:var(--panel);border-top:1px solid rgba(160,168,220,.1)}.gm-mobile-item{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;min-width:0;min-height:44px;padding:6px 0;border:0;background:transparent;color:var(--mobile-nav);text-decoration:none}.gm-mobile-item.active{color:var(--mobile-active);background:var(--mobile-active-bg)}.gm-mobile-item svg{width:20px;height:20px;flex:none}.gm-mobile-item span{font:500 9px/1 Inter,Arial,sans-serif;letter-spacing:.02em}}
 @media(min-width:821px){.mobile-back{display:none!important}}
 @media(prefers-reduced-motion:reduce){.messages{scroll-behavior:auto}.focus{animation:none;outline:3px solid color-mix(in srgb,var(--accent) 35%,transparent)}}
 </style>
@@ -382,12 +405,17 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
 <body>
 <main class="shell">
   <header class="gm-header">
+    <button class="mobile-menu" id="mobile-menu" type="button" aria-label="Open dashboard navigation"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
     <a class="brand" href="/"><img src="/logo.svg" width="22" height="22" alt="gitmoot"><span>gitmoot<span style="color:var(--accent)">.</span></span></a>
     <span class="crumb-divider"></span>
     <span class="crumb"><span>dashboard</span><span>›</span><b>Comms</b></span><span class="spacer"></span>
-    <span class="live"><span class="live-dot"></span>read-only</span>
-    <button class="theme" id="theme" type="button" aria-label="Toggle light and dark theme">◐</button>
+    <div class="gm-header-actions">
+      <span class="gm-aplink"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 13l7-9-1 6h4l-7 9 1-6z"/></svg><span>Activepieces</span><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 17L17 7M9 7h8v8"/></svg></span>
+      <span class="daemon-label" id="daemon-label">daemon</span>
+      <span class="daemon-state" id="daemon-state"><span class="daemon-dot"></span><span class="daemon-status" id="daemon-status">LIVE</span></span>
+    </div>
   </header>
+  <div class="mobile-backdrop" id="mobile-backdrop"></div>
   <div class="gm-frame">
     <!-- gitmoot-dashboard-sidebar -->
     <section class="gm-content">
@@ -398,6 +426,7 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
         <select class="control" id="resolution"><option value="">Any resolution</option><option value="open">Unresolved</option><option value="resolved">Resolved</option></select>
         <input class="control" id="date" type="date" aria-label="From date">
         <label class="check"><input id="systems" type="checkbox" checked> Engine markers</label>
+        <button class="theme" id="theme" type="button" aria-label="Toggle light and dark theme">◐</button>
       </section>
       <section class="workspace">
         <aside class="rail" id="rail">
@@ -412,6 +441,7 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
       <footer class="comms-footer"><span class="pulse"></span>Read-only org traffic · resolve escalations with <code style="margin-left:4px">gitmoot org escalate resolve</code></footer>
     </section>
   </div>
+  <!-- gitmoot-dashboard-mobile-nav -->
 </main>
 <script>
 (()=>{
@@ -468,9 +498,14 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
   ['search','from','to','resolution','date','systems'].forEach(id=>$(id).addEventListener(id==='search'?'input':'change',renderThreads));
   $('open').onclick=()=>{state.mode='open';$('open').classList.add('active');$('all').classList.remove('active');renderThreads()};
   $('all').onclick=()=>{state.mode='all';$('all').classList.add('active');$('open').classList.remove('active');renderThreads()};
-  const saved=localStorage.getItem('gitmoot-comms-theme'),preferred=matchMedia('(prefers-color-scheme: light)').matches?'light':'dark';
-  document.documentElement.dataset.theme=saved||preferred;
+  const saved=localStorage.getItem('gitmoot-comms-theme');
+  document.documentElement.dataset.theme=saved==='light'?'light':'dark';
   $('theme').onclick=()=>{const next=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=next;localStorage.setItem('gitmoot-comms-theme',next)};
+  const setDaemonState=running=>{$('daemon-state').classList.toggle('down',!running);$('daemon-label').textContent=running?'daemon':'';$('daemon-status').textContent=running?'LIVE':'daemon down'};
+  fetch('/api/health',{cache:'no-store'}).then(r=>r.ok?r.json():Promise.reject()).then(data=>setDaemonState(Boolean(data.daemon&&data.daemon.running))).catch(()=>setDaemonState(false));
+  const closeMobileNav=()=>{$('dashboard-sidebar').classList.remove('mobile-open');$('mobile-backdrop').classList.remove('mobile-open')};
+  const toggleMobileNav=()=>{$('dashboard-sidebar').classList.toggle('mobile-open');$('mobile-backdrop').classList.toggle('mobile-open')};
+  $('mobile-menu').onclick=toggleMobileNav;$('mobile-more').onclick=toggleMobileNav;$('mobile-backdrop').onclick=closeMobileNav;
   const p=new URLSearchParams(location.search),note=p.get('note')||(location.hash.match(/^#note-(\d+)$/)||[])[1],wanted=p.get('workflow');
   const api=new URL('/api/comms',location.origin);if(note)api.searchParams.set('note',note);
   fetch(api.pathname+api.search,{cache:'no-store'}).then(async r=>{if(!r.ok)throw new Error(await r.text());return r.json()}).then(data=>{
