@@ -82,9 +82,17 @@ func TestEngineAdvanceImplementPersistsSkipReviewFanoutWithoutPR(t *testing.T) {
 	}
 }
 
-// Guard the default: a job WITHOUT the intent must never write the flag onto a
-// branch lock, so the common path stays byte-identical.
-func TestEngineAdvanceImplementWithoutIntentLeavesLockUntouched(t *testing.T) {
+// Guard the default path, and make the guard LOAD-BEARING. An earlier version of
+// this test asserted only that the stored boolean was false, which an
+// EXTRA_DEFAULT_UPDATE mutant — one that always calls the setter, passing the
+// payload's own false — survived, because false-written and never-written look
+// identical from the boolean alone.
+//
+// Seeding the lock with skip=TRUE and advancing a job that carries NO intent
+// makes the two distinguishable without depending on timestamp granularity: if
+// the default path calls the setter at all it writes false and flips the lock,
+// so the mutant is killed by the assertion rather than by a clock.
+func TestEngineAdvanceImplementWithoutIntentDoesNotTouchTheLock(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
@@ -92,6 +100,10 @@ func TestEngineAdvanceImplementWithoutIntentLeavesLockUntouched(t *testing.T) {
 
 	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-8", Owner: "lead"}); err != nil || !acquired {
 		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	// Pre-arm the lock. A correct default path must leave this alone.
+	if err := store.SetBranchLockReviewFanout(ctx, "gitmoot/gitmoot", "task-8", true); err != nil {
+		t.Fatalf("SetBranchLockReviewFanout returned error: %v", err)
 	}
 	insertCompletedJob(t, store, db.Job{
 		ID:    "implement-job-plain",
@@ -113,7 +125,115 @@ func TestEngineAdvanceImplementWithoutIntentLeavesLockUntouched(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetBranchLock returned error: %v", err)
 	}
-	if lock.SkipNativeReviewFanout {
-		t.Fatalf("a job with no intent armed the skip flag: %+v", lock)
+	if !lock.SkipNativeReviewFanout {
+		t.Fatalf("the default path WROTE to the lock and cleared a pre-armed flag: %+v", lock)
+	}
+}
+
+// #1277, the escape g7-review reproduced against the first version of this fix.
+// The branch lock cannot rescue a multi-generation tree, because at the moment
+// the intent is dropped NO intent-bearing implement job has advanced yet, so
+// nothing has published the intent onto the lock.
+//
+// The path: an intent-bearing coordinator delegates a child; the child's
+// continuation is built by a constructor that does NOT set the flag (there are
+// nine such constructors and none set it); that continuation then delegates the
+// implement leg, which opens the PR and re-arms the fanout.
+//
+// Enqueue-time inheritance closes it for every constructor at once, which is why
+// the continuation request below deliberately leaves SkipNativeReviewFanout
+// unset — exactly as engine_continuation_synthesis.go builds it.
+func TestIntentSurvivesContinuationThenImplementChild(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coordinator", []string{"ask", "review"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "impl", []string{"implement"}, "gitmoot/gitmoot")
+	mailbox := Mailbox{Store: store}
+
+	root, err := mailbox.Enqueue(ctx, JobRequest{
+		ID:                     "root-coordinator",
+		Agent:                  "coordinator",
+		Action:                 "ask",
+		Repo:                   "gitmoot/gitmoot",
+		Branch:                 "task-9",
+		TaskID:                 "task-9",
+		Instructions:           "coordinate",
+		SkipNativeReviewFanout: true,
+	})
+	if err != nil {
+		t.Fatalf("Enqueue root returned error: %v", err)
+	}
+
+	// Generation 2: a continuation constructor that drops the flag.
+	continuation, err := mailbox.Enqueue(ctx, JobRequest{
+		ID:           "continuation-1",
+		Agent:        "coordinator",
+		Action:       "ask",
+		Repo:         "gitmoot/gitmoot",
+		Branch:       "task-9",
+		TaskID:       "task-9",
+		Instructions: "synthesize",
+		ParentJobID:  root.ID,
+	})
+	if err != nil {
+		t.Fatalf("Enqueue continuation returned error: %v", err)
+	}
+	continuationPayload, err := ParseJobPayload(continuation.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload(continuation) returned error: %v", err)
+	}
+	if !continuationPayload.SkipNativeReviewFanout {
+		t.Fatalf("continuation dropped the intent: %+v", continuationPayload)
+	}
+
+	// Generation 3: the implement child that would open the PR.
+	child, err := mailbox.Enqueue(ctx, JobRequest{
+		ID:           "implement-child",
+		Agent:        "impl",
+		Action:       "implement",
+		Repo:         "gitmoot/gitmoot",
+		Branch:       "task-9",
+		TaskID:       "task-9",
+		Instructions: "do the work",
+		ParentJobID:  continuation.ID,
+	})
+	if err != nil {
+		t.Fatalf("Enqueue implement child returned error: %v", err)
+	}
+	childPayload, err := ParseJobPayload(child.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload(child) returned error: %v", err)
+	}
+	if !childPayload.SkipNativeReviewFanout {
+		t.Fatalf("implement child after continuation re-armed native fanout: %+v", childPayload)
+	}
+}
+
+// A root dispatch with no intent and no parent must stay exactly as built — the
+// inheritance lookup must not invent an intent.
+func TestEnqueueWithoutParentDoesNotInventIntent(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "impl", []string{"implement"}, "gitmoot/gitmoot")
+	mailbox := Mailbox{Store: store}
+
+	job, err := mailbox.Enqueue(ctx, JobRequest{
+		ID:           "plain-root",
+		Agent:        "impl",
+		Action:       "implement",
+		Repo:         "gitmoot/gitmoot",
+		Branch:       "task-10",
+		TaskID:       "task-10",
+		Instructions: "do the work",
+	})
+	if err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+	payload, err := ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload returned error: %v", err)
+	}
+	if payload.SkipNativeReviewFanout {
+		t.Fatalf("a parentless root invented the intent: %+v", payload)
 	}
 }
