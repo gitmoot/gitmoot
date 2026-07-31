@@ -392,7 +392,7 @@ func TestRunMergeGateExplicitKillSwitchParksReviewedAndUnreviewedTasks(t *testin
 	}
 }
 
-func TestPolicyMergeGateHumanRequestBypassesKillSwitchAndMandatoryGate(t *testing.T) {
+func TestPolicyMergeGateHumanRequestRequiresFinalReview(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	mergeable := true
@@ -401,8 +401,102 @@ func TestPolicyMergeGateHumanRequestBypassesKillSwitchAndMandatoryGate(t *testin
 			Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
 			HeadSHA: "head123", Mergeable: &mergeable,
 		},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
 		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
-		noChecks:    true,
+	}
+	gate := PolicyMergeGate{
+		AutoMerge: false,
+		Store:     store,
+		GitHub:    gh,
+		Git:       &fakeMergeGateGit{clean: true},
+	}
+
+	decision, err := gate.Evaluate(ctx, MergeRequest{
+		Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+		HumanMergeRequested: true,
+	})
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+		t.Fatalf("decision = %+v, want escalating LeaveOpen", decision)
+	}
+	if !strings.Contains(decision.Reason, "final agent review is not captured") {
+		t.Fatalf("decision reason = %q, want missing final review", decision.Reason)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge calls = %+v, want none", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateHumanRequestRequiresPassingCI(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		Branch:      "task-9",
+		PullRequest: 9,
+		HeadSHA:     "head123",
+		TaskID:      "task-9",
+		ReviewRound: "review-1",
+		Result:      &AgentResult{Decision: "approved", Summary: "ready"},
+	})
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr: github.PullRequest{
+			Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+			HeadSHA: "head123", Mergeable: &mergeable,
+		},
+		status:      github.CombinedStatus{State: "success"},
+		checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "fail", State: "COMPLETED"}},
+		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+	}
+	gate := PolicyMergeGate{
+		AutoMerge: false,
+		Store:     store,
+		GitHub:    gh,
+		Git:       &fakeMergeGateGit{clean: true},
+	}
+
+	decision, err := gate.Evaluate(ctx, MergeRequest{
+		Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+		HumanMergeRequested: true,
+	})
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+		t.Fatalf("decision = %+v, want escalating LeaveOpen", decision)
+	}
+	if !strings.Contains(decision.Reason, "external CI") {
+		t.Fatalf("decision reason = %q, want external CI failure", decision.Reason)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge calls = %+v, want none", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateHumanRequestBypassesOnlyAutoMergePolicy(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		Branch:      "task-9",
+		PullRequest: 9,
+		HeadSHA:     "head123",
+		TaskID:      "task-9",
+		ReviewRound: "review-1",
+		Result:      &AgentResult{Decision: "approved", Summary: "ready"},
+	})
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr: github.PullRequest{
+			Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+			HeadSHA: "head123", Mergeable: &mergeable,
+		},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+		checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
 	}
 	gate := PolicyMergeGate{
 		AutoMerge: false,
@@ -421,8 +515,8 @@ func TestPolicyMergeGateHumanRequestBypassesKillSwitchAndMandatoryGate(t *testin
 	if !decision.Merged || decision.LeaveOpen || decision.EscalateMergeGateMiss {
 		t.Fatalf("decision = %+v", decision)
 	}
-	if gh.statusCalls != 0 || gh.checkCalls != 0 {
-		t.Fatalf("human override evaluated mandatory review/CI gate: status=%d checks=%d", gh.statusCalls, gh.checkCalls)
+	if gh.statusCalls != 1 || gh.checkCalls != 1 {
+		t.Fatalf("human request evidence calls: status=%d checks=%d, want 1 each", gh.statusCalls, gh.checkCalls)
 	}
 	if len(gh.merges) != 1 || gh.merges[0].MatchHeadCommit != "head123" {
 		t.Fatalf("merge calls = %+v", gh.merges)

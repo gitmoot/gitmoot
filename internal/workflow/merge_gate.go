@@ -127,7 +127,8 @@ type workflowAwareGitHub interface {
 
 func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (MergeDecision, error) {
 	// An explicit operator kill-switch must remain before validation and every
-	// GitHub/local-store operation.
+	// GitHub/local-store operation. An authenticated human merge request may
+	// override this policy, but not the independently verified evidence below.
 	if !g.AutoMerge && !request.HumanMergeRequested {
 		return MergeDecision{LeaveOpen: true, Reason: MergeLeaveOpenAutoMergeKillSwitchReason}, nil
 	}
@@ -149,7 +150,7 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	if headSHA == "" {
 		return g.gateMiss("pull request head SHA is missing"), nil
 	}
-	if !request.HumanMergeRequested && !pullRequestMerged(pr) && strings.TrimSpace(pr.State) != "closed" {
+	if !pullRequestMerged(pr) && strings.TrimSpace(pr.State) != "closed" {
 		pendingDecision, isPending, reason, err := g.reviewAndCIGateMiss(ctx, repo, request, headSHA)
 		if err != nil {
 			return MergeDecision{}, err
