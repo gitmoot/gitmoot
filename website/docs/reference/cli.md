@@ -1251,9 +1251,11 @@ directive rule, the durable row stays pending without making the drain
 unhealthy.
 
 `gitmoot org directive ack <id> [--by <role>] [--home <dir>]` is restricted to
-the addressed target and records receipt, not completion. `gitmoot org
-directive cancel <id> [--by <role>] [--home <dir>]` is restricted to the sender.
-Both append typed markers to the directive's workflow journal.
+the addressed target or one of its configured ancestors and records receipt,
+not completion. `gitmoot org directive cancel <id> [--by <role>] [--home
+<dir>]` is restricted to the sender. Both commands require an acting identity
+from `--by` or `GITMOOT_ORG_ROLE`; missing identity fails closed. They append
+typed markers to the directive's workflow journal.
 
 Event-rule wakes are separately opt-in:
 

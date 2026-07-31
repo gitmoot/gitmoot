@@ -184,6 +184,14 @@ func runOrgDirectiveReceipt(kind string, args []string, stdout, stderr io.Writer
 		fmt.Fprintf(stderr, "org directive %s: %v\n", kind, err)
 		return 1
 	}
+	by := strings.ToLower(strings.TrimSpace(*byFlag))
+	if by == "" {
+		by = strings.ToLower(strings.TrimSpace(os.Getenv("GITMOOT_ORG_ROLE")))
+	}
+	if by == "" {
+		fmt.Fprintf(stderr, "org directive %s: acting org role is required; pass --by or set GITMOOT_ORG_ROLE\n", kind)
+		return 1
+	}
 	var workflowID string
 	if err := withStore(*home, func(store *db.Store) error {
 		ctx := context.Background()
@@ -198,24 +206,13 @@ func runOrgDirectiveReceipt(kind string, args []string, stdout, stderr io.Writer
 		if !ok {
 			return fmt.Errorf("note %d is not an org directive", directiveID)
 		}
-		by := strings.ToLower(strings.TrimSpace(*byFlag))
-		if by == "" {
-			by = strings.ToLower(strings.TrimSpace(os.Getenv("GITMOOT_ORG_ROLE")))
-		}
-		if by == "" {
-			if kind == "ack" {
-				by = to
-			} else {
-				by = from
-			}
-		}
 		if _, ok := cfg.Role(by); !ok {
 			return fmt.Errorf("unknown org role %q", by)
 		}
 		var body string
 		if kind == "ack" {
-			if by != to {
-				return fmt.Errorf("role %q cannot acknowledge directive %d addressed to %q", by, directiveID, to)
+			if by != to && !slicesContains(cfg.Ancestors(to), by) {
+				return fmt.Errorf("role %q cannot acknowledge directive %d addressed to %q; only the target or an ancestor may acknowledge", by, directiveID, to)
 			}
 			body = workflow.FormatOrgDirectiveAckNote(directiveID, by)
 		} else {

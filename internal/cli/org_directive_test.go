@@ -98,6 +98,16 @@ func TestOrgDirectiveSendBodySourcesAndDirectionPolicy(t *testing.T) {
 	}
 }
 
+func TestOrgDirectiveSendRefusesUpward(t *testing.T) {
+	home := directiveTestHome(t)
+	t.Setenv("GITMOOT_ORG_ROLE", "worker")
+	var stdout, stderr bytes.Buffer
+	code := runOrg([]string{"directive", "send", "--home", home, "--to", "owner", "--workflow", "release/upward", "must fail"}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "peer and upward directives are refused") {
+		t.Fatalf("upward send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+}
+
 func TestOrgDirectiveAckAuthorizationAndUnackedQuery(t *testing.T) {
 	home := directiveTestHome(t)
 	t.Setenv("GITMOOT_ORG_ROLE", "owner")
@@ -136,6 +146,40 @@ func TestOrgDirectiveAckAuthorizationAndUnackedQuery(t *testing.T) {
 	if err != nil || len(unacked) != 0 {
 		t.Fatalf("unacked after ack=%+v err=%v", unacked, err)
 	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/ancestor-ack", "inspect another result"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("second send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	ancestorDirectiveID := strings.Fields(stdout.String())[2]
+	stdout.Reset()
+	stderr.Reset()
+	if code := runOrg([]string{"directive", "ack", ancestorDirectiveID, "--home", home, "--by", "owner"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("ancestor ack code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestOrgDirectiveReceiptRequiresActingRole(t *testing.T) {
+	home := directiveTestHome(t)
+	t.Setenv("GITMOOT_ORG_ROLE", "owner")
+	var stdout, stderr bytes.Buffer
+	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/actorless", "inspect the result"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	directiveID := strings.Fields(stdout.String())[2]
+	t.Setenv("GITMOOT_ORG_ROLE", "")
+
+	for _, kind := range []string{"ack", "cancel"} {
+		t.Run(kind, func(t *testing.T) {
+			stdout.Reset()
+			stderr.Reset()
+			code := runOrg([]string{"directive", kind, directiveID, "--home", home}, &stdout, &stderr)
+			if code != 1 || !strings.Contains(stderr.String(), "acting org role is required") {
+				t.Fatalf("actorless %s code=%d out=%q err=%q", kind, code, stdout.String(), stderr.String())
+			}
+		})
+	}
 }
 
 func TestOrgDirectiveCancelIsRestrictedToSender(t *testing.T) {
@@ -160,23 +204,30 @@ func TestOrgDirectiveCancelIsRestrictedToSender(t *testing.T) {
 
 func TestDirectiveWakeOutboxIsConfigInert(t *testing.T) {
 	home := directiveTestHome(t)
+	t.Setenv("GITMOOT_ORG_ROLE", "owner")
+	var stdout, stderr bytes.Buffer
+	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/inert", "act"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
 	store, err := db.Open(config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	directive, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
-		WorkflowID: "release/inert", Author: "owner", Body: workflow.FormatOrgDirectiveNote("owner", "worker", "release/inert", "act"),
-		AddressedTarget: "worker", AddressedWakeKind: db.WakeOutboxKindDirective,
-	})
-	if err != nil {
-		t.Fatal(err)
+	notes, err := store.ListWorkflowNotes(context.Background(), "release/inert", 0)
+	if err != nil || len(notes) != 1 {
+		t.Fatalf("stored directives=%+v err=%v", notes, err)
 	}
+	directive := notes[0]
 	wake := &fakeEventWake{}
 	deliverySink := synchronousEventRuleTestSink{sink: &eventRuleSink{store: store, home: home, wake: wake}}
 	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
-	if err != nil || len(pending) != 1 {
-		t.Fatalf("pending=%+v err=%v", pending, err)
+	if err != nil || len(pending) != 1 ||
+		pending[0].SourceKind != db.WakeOutboxSourceWorkflowNote ||
+		pending[0].SourceID != fmt.Sprint(directive.ID) ||
+		pending[0].TargetRole != "worker" ||
+		pending[0].CoalesceKey != db.WakeOutboxDirectiveCoalescePrefix+"worker" {
+		t.Fatalf("stored directive=%+v pending=%+v err=%v", directive, pending, err)
 	}
 	createdAt, _ := time.Parse(time.RFC3339Nano, pending[0].CreatedAt)
 
