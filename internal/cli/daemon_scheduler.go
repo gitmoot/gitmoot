@@ -783,7 +783,17 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 		cand.skipAgedReclaim = !tracker.agedDelegationWorktreeReclaimDue(now)
 	}
 	inflightIDs := tracker.inflightIDs()
-	if err := recoverRunningJobsBeforeForRepoSkipping(ctx, store, stdout, now, now.Add(-configuredDaemonRunningJobStaleAfter(stdout)), repoFilter, rootFilter, inflightIDs); err != nil {
+	paths, pathsErr := worker.configPaths()
+	if pathsErr != nil {
+		return pathsErr
+	}
+	staleAfter := configuredDaemonRunningJobStaleAfter(stdout)
+	quietAfter := configuredDaemonQuietKillAfter(worker.ConfigHome, stdout)
+	liveness := newDaemonLivenessSweep()
+	if tracker != nil && tracker.liveness != nil {
+		liveness = tracker.liveness
+	}
+	if err := liveness.sweepRunningJobLiveness(ctx, store, stdout, paths, now, staleAfter, quietAfter, repoFilter, rootFilter); err != nil {
 		return err
 	}
 	if err := recoverExpiredRuntimeSessionLocksSkipping(ctx, store, stdout, now, inflightIDs); err != nil {

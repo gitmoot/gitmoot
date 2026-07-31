@@ -84,6 +84,7 @@ type inflightJobTracker struct {
 	errs                         map[string][]error
 	foreignBootRecoveryAt        time.Time
 	agedDelegationWorktreeReapAt time.Time
+	liveness                     *daemonLivenessSweep
 }
 
 func newInflightJobTracker(ctx context.Context) *inflightJobTracker {
@@ -97,6 +98,7 @@ func newInflightJobTracker(ctx context.Context) *inflightJobTracker {
 		perRepo:   map[string]int{},
 		poolRuns:  map[string]bool{},
 		errs:      map[string][]error{},
+		liveness:  newDaemonLivenessSweep(),
 	}
 }
 

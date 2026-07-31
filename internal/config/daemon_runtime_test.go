@@ -107,6 +107,8 @@ func TestLoadDaemonRuntimeConfigRejectsBadValues(t *testing.T) {
 		"bad job max":             "[daemon]\njob_timeout_max = \"nope\"\n",
 		"nonpositive job max":     "[daemon]\njob_timeout_max = \"0s\"\n",
 		"default exceeds max":     "[daemon]\njob_timeout_default = \"9h\"\njob_timeout_max = \"8h\"\n",
+		"zero quiet kill":         "[daemon]\nquiet_kill_after = \"0s\"\n",
+		"subfloor quiet kill":     "[daemon]\nquiet_kill_after = \"4m59s\"\n",
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -119,6 +121,24 @@ func TestLoadDaemonRuntimeConfigRejectsBadValues(t *testing.T) {
 				t.Fatalf("expected error for %q", strings.TrimSpace(body))
 			}
 		})
+	}
+}
+
+func TestDaemonRuntimeQuietKillPolicyDefaultsAndLoads(t *testing.T) {
+	if got := (DaemonRuntimeConfig{}).QuietKillPolicy(); got != DefaultDaemonQuietKillAfter {
+		t.Fatalf("default quiet kill = %s, want %s", got, DefaultDaemonQuietKillAfter)
+	}
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	writeConfig(t, paths, "[daemon]\nquiet_kill_after = \"50m\"\n")
+	cfg, err := LoadDaemonRuntimeConfig(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.QuietKillPolicy(); got != 50*time.Minute {
+		t.Fatalf("configured quiet kill = %s, want 50m", got)
 	}
 }
 

@@ -192,6 +192,9 @@ func TestRetainedTranscriptLogAppendPermissionsDisabledAndOpenFailure(t *testing
 	if err := config.Initialize(paths); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+"\n[transcripts]\nenabled = false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if path, file, err := openRetainedTranscriptLog(home, "disabled"); err != nil || path != "" || file != nil {
 		t.Fatalf("disabled open = path %q file %v err %v", path, file, err)
 	}

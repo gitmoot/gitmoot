@@ -8,6 +8,7 @@ import (
 )
 
 const (
+	MinimumTranscriptRetain        = 24 * time.Hour
 	DefaultTranscriptRetain        = 168 * time.Hour
 	DefaultTranscriptMaxTotalBytes = int64(2 * 1024 * 1024 * 1024)
 )
@@ -22,15 +23,15 @@ type TranscriptsConfig struct {
 
 func DefaultTranscriptsConfig() TranscriptsConfig {
 	return TranscriptsConfig{
-		Enabled:       false,
+		Enabled:       true,
 		Retain:        DefaultTranscriptRetain,
 		MaxTotalBytes: DefaultTranscriptMaxTotalBytes,
 	}
 }
 
-// LoadTranscriptsConfig reads only [transcripts]. Capture is deliberately
-// fail-closed: a missing file/section, malformed value, non-positive retention,
-// or non-positive total cap returns the disabled defaults and never fails a job.
+// LoadTranscriptsConfig reads only [transcripts]. Capture is default-on so every
+// engine delivery has a durable liveness/forensics stream. A malformed section
+// falls back to the safe defaults; retention can never be configured below 24h.
 func LoadTranscriptsConfig(paths Paths) TranscriptsConfig {
 	fallback := DefaultTranscriptsConfig()
 	content, err := os.ReadFile(paths.ConfigFile)
@@ -87,7 +88,10 @@ func LoadTranscriptsConfig(paths Paths) TranscriptsConfig {
 			}
 		}
 	}
-	if !found || !valid || cfg.Retain <= 0 || cfg.MaxTotalBytes <= 0 {
+	if !found {
+		return fallback
+	}
+	if !valid || cfg.Retain < MinimumTranscriptRetain || cfg.MaxTotalBytes <= 0 {
 		return fallback
 	}
 	return cfg

@@ -13,6 +13,8 @@ const (
 	DefaultDaemonIdleMaxMultiplier = 4
 	DefaultDaemonJobTimeoutDefault = 4 * time.Hour
 	DefaultDaemonJobTimeoutMax     = 8 * time.Hour
+	DefaultDaemonQuietKillAfter    = 45 * time.Minute
+	MinimumDaemonQuietKillAfter    = 5 * time.Minute
 )
 
 // DaemonRuntimeConfig is the daemon's WARM-reloadable runtime settings, read from
@@ -64,6 +66,10 @@ type DaemonRuntimeConfig struct {
 	JobTimeoutDefaultSet bool
 	JobTimeoutMax        time.Duration
 	JobTimeoutMaxSet     bool
+	// QuietKillAfter is one leg of the same-boot liveness predicate. A recorded
+	// live runtime PID always vetoes reaping regardless of transcript silence.
+	QuietKillAfter    time.Duration
+	QuietKillAfterSet bool
 }
 
 // LoadDaemonRuntimeConfig parses the [daemon] section. A file with no [daemon]
@@ -157,6 +163,13 @@ func LoadDaemonRuntimeConfig(paths Paths) (DaemonRuntimeConfig, error) {
 			}
 			cfg.JobTimeoutMax = parsed
 			cfg.JobTimeoutMaxSet = true
+		case "quiet_kill_after":
+			parsed, err := parseConfigDuration(value)
+			if err != nil {
+				return DaemonRuntimeConfig{}, fmt.Errorf("parse [daemon].quiet_kill_after: %w", err)
+			}
+			cfg.QuietKillAfter = parsed
+			cfg.QuietKillAfterSet = true
 		default:
 			// Unknown keys are ignored so the section can grow (e.g. #576 per-repo
 			// caps) without breaking older binaries.
@@ -220,11 +233,22 @@ func validateDaemonRuntimeConfig(cfg DaemonRuntimeConfig) error {
 	if cfg.JobTimeoutMaxSet && cfg.JobTimeoutMax <= 0 {
 		return fmt.Errorf("[daemon].job_timeout_max must be positive")
 	}
+	if cfg.QuietKillAfterSet && cfg.QuietKillAfter < MinimumDaemonQuietKillAfter {
+		return fmt.Errorf("[daemon].quiet_kill_after must be at least %s", MinimumDaemonQuietKillAfter)
+	}
 	jobTimeoutDefault, jobTimeoutMax := cfg.JobTimeoutPolicy()
 	if jobTimeoutDefault > jobTimeoutMax {
 		return fmt.Errorf("[daemon].job_timeout_default (%s) must not exceed [daemon].job_timeout_max (%s)", jobTimeoutDefault, jobTimeoutMax)
 	}
 	return nil
+}
+
+// QuietKillPolicy returns the liveness sweep's quiet-output threshold.
+func (cfg DaemonRuntimeConfig) QuietKillPolicy() time.Duration {
+	if cfg.QuietKillAfterSet {
+		return cfg.QuietKillAfter
+	}
+	return DefaultDaemonQuietKillAfter
 }
 
 // JobTimeoutPolicy returns the effective daemon kill-deadline policy, applying

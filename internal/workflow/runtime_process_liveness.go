@@ -8,6 +8,25 @@ import (
 	"strings"
 )
 
+// RuntimeProcessGroupID returns the process group recorded for pid from Linux
+// /proc. It is observation-only in Slice C; group killing belongs to Slice D.
+func RuntimeProcessGroupID(pid int) int {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return 0
+	}
+	closeParen := strings.LastIndexByte(string(data), ')')
+	if closeParen < 0 {
+		return 0
+	}
+	fields := strings.Fields(string(data[closeParen+1:]))
+	if len(fields) <= 2 {
+		return 0
+	}
+	pgid, _ := strconv.Atoi(fields[2])
+	return pgid
+}
+
 // RuntimeProcessIdentity returns the Linux /proc starttime identity for pid.
 // Empty means the identity is unavailable. Starttime is stable for a process's
 // lifetime and changes when the kernel recycles a PID.
