@@ -2,10 +2,13 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,7 +16,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-const dashboardCommsDiscoveryLimit = 200
+const dashboardCommsMessagesPerThread = 200
 
 type dashboardCommsResponse struct {
 	GeneratedAt string                 `json:"generated_at"`
@@ -62,7 +65,16 @@ func registerDashboardCommsRoutes(mux *http.ServeMux, ds *webDataSource) {
 }
 
 func (d *webDataSource) handleCommsAPI(w http.ResponseWriter, r *http.Request) {
-	payload, err := d.comms(r.Context())
+	var requestedNoteID int64
+	if value := strings.TrimSpace(r.URL.Query().Get("note")); value != "" {
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || parsed <= 0 {
+			http.Error(w, "note must be a positive integer", http.StatusBadRequest)
+			return
+		}
+		requestedNoteID = parsed
+	}
+	payload, err := d.comms(r.Context(), requestedNoteID)
 	if err != nil {
 		http.Error(w, "comms source unavailable: "+err.Error(), http.StatusServiceUnavailable)
 		return
@@ -85,19 +97,28 @@ func (d *webDataSource) handleCommsPage(w http.ResponseWriter, _ *http.Request) 
 	_, _ = fmt.Fprint(w, dashboardCommsPage)
 }
 
-func (d *webDataSource) comms(ctx context.Context) (dashboardCommsResponse, error) {
+func (d *webDataSource) comms(ctx context.Context, requestedNoteID int64) (dashboardCommsResponse, error) {
 	out := dashboardCommsResponse{
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 		Threads:     []dashboardCommsThread{},
 	}
 	err := withStore(d.home, func(store *db.Store) error {
 		workflows := map[string]struct{}{}
-		for _, prefix := range []string{workflow.OrgEscalatePrefix, "[auto:pr:"} {
-			notes, err := store.ListWorkflowNotesByBodyPrefix(ctx, prefix, dashboardCommsDiscoveryLimit)
-			if err != nil {
+		summaries, err := store.ListWorkflowSummaries(ctx)
+		if err != nil {
+			return err
+		}
+		for _, summary := range summaries {
+			if id := strings.TrimSpace(summary.WorkflowID); id != "" {
+				workflows[id] = struct{}{}
+			}
+		}
+		if requestedNoteID > 0 {
+			note, err := store.GetWorkflowNote(ctx, requestedNoteID)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
-			for _, note := range notes {
+			if err == nil {
 				if id := strings.TrimSpace(note.WorkflowID); id != "" {
 					workflows[id] = struct{}{}
 				}
@@ -114,7 +135,7 @@ func (d *webDataSource) comms(ctx context.Context) (dashboardCommsResponse, erro
 				return err
 			}
 			if thread, ok := dashboardCommsProjectThread(id, notes); ok {
-				out.Threads = append(out.Threads, thread)
+				out.Threads = append(out.Threads, dashboardCommsBoundThread(thread, requestedNoteID))
 			}
 		}
 		return nil
@@ -134,6 +155,44 @@ func (d *webDataSource) comms(ctx context.Context) (dashboardCommsResponse, erro
 		return out.Threads[i].WorkflowID < out.Threads[j].WorkflowID
 	})
 	return out, nil
+}
+
+// dashboardCommsBoundThread bounds ordinary payload per workflow without ever
+// dropping an unresolved escalation or the note explicitly requested by a deep
+// link. Discovery and unresolved accounting happen before this projection, so a
+// noisy store cannot turn a note limit into a workflow or obligation limit.
+func dashboardCommsBoundThread(thread dashboardCommsThread, requestedNoteID int64) dashboardCommsThread {
+	if len(thread.Messages) <= dashboardCommsMessagesPerThread {
+		return thread
+	}
+	keep := make([]bool, len(thread.Messages))
+	ordinaryBudget := dashboardCommsMessagesPerThread
+	for i, message := range thread.Messages {
+		requested := message.ID == requestedNoteID ||
+			(message.Resolution != nil && message.Resolution.NoteID == requestedNoteID)
+		unresolved := message.Kind == "escalation" && message.Resolution == nil
+		if requested || unresolved {
+			keep[i] = true
+			if ordinaryBudget > 0 {
+				ordinaryBudget--
+			}
+		}
+	}
+	for i := len(thread.Messages) - 1; i >= 0 && ordinaryBudget > 0; i-- {
+		if keep[i] {
+			continue
+		}
+		keep[i] = true
+		ordinaryBudget--
+	}
+	messages := make([]dashboardCommsMessage, 0, dashboardCommsMessagesPerThread)
+	for i, message := range thread.Messages {
+		if keep[i] {
+			messages = append(messages, message)
+		}
+	}
+	thread.Messages = messages
+	return thread
 }
 
 func dashboardCommsProjectThread(workflowID string, notes []db.WorkflowNote) (dashboardCommsThread, bool) {
@@ -349,9 +408,10 @@ footer{display:flex;align-items:center;justify-content:center;border-top:1px sol
   const saved=localStorage.getItem('gitmoot-comms-theme'),preferred=matchMedia('(prefers-color-scheme: light)').matches?'light':'dark';
   document.documentElement.dataset.theme=saved||preferred;
   $('theme').onclick=()=>{const next=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=next;localStorage.setItem('gitmoot-comms-theme',next)};
-  fetch('/api/comms',{cache:'no-store'}).then(async r=>{if(!r.ok)throw new Error(await r.text());return r.json()}).then(data=>{
+  const p=new URLSearchParams(location.search),note=p.get('note')||(location.hash.match(/^#note-(\d+)$/)||[])[1],wanted=p.get('workflow');
+  const api=new URL('/api/comms',location.origin);if(note)api.searchParams.set('note',note);
+  fetch(api.pathname+api.search,{cache:'no-store'}).then(async r=>{if(!r.ok)throw new Error(await r.text());return r.json()}).then(data=>{
     state.data=Array.isArray(data.threads)?data.threads:[];roleOptions();
-    const p=new URLSearchParams(location.search),note=p.get('note')||(location.hash.match(/^#note-(\d+)$/)||[])[1],wanted=p.get('workflow');
     if(note){state.deep=String(note);const found=state.data.find(t=>t.messages.some(m=>String(m.id)===state.deep||(m.resolution&&String(m.resolution.note_id)===state.deep)));if(found)state.selected=found.workflow_id}
     if(!state.selected&&wanted&&state.data.some(t=>t.workflow_id===wanted))state.selected=wanted;
     if(!state.data.length){$('threads').innerHTML=stateBox('No org traffic yet','Typed escalations and engine markers will appear here when workflow notes are written.');$('messages').innerHTML=stateBox('Conversation is empty','There are no Comms threads to display.');return}

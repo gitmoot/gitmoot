@@ -36,8 +36,9 @@ gitmoot dashboard serving read-only at http://127.0.0.1:8080 (Ctrl-C to stop)
 
 ## Routes
 
-The UI is a single-page app with client-side routing (the browser URL updates as
-you navigate, so every view is linkable and reloadable):
+The main UI is a single-page app with client-side routing (the browser URL
+updates as you navigate, so every view is linkable and reloadable). Comms is a
+self-contained read-only page served at its own route:
 
 | Route | View |
 | --- | --- |
@@ -51,12 +52,13 @@ you navigate, so every view is linkable and reloadable):
 | `/charts` | Charts — activity time series |
 | `/health` | Health — daemon status, totals, stuck jobs, locks, failures |
 | `/attention` | Needs a human — blocked gates, pending approvals, candidates |
+| `/comms` (or `/comms?note=<id>`) | Comms — org escalation conversations and engine markers |
 
 Unknown paths normalize back to `/`. Each view is backed by a small read-only
 JSON API (`/api/runs`, `/api/jobs`, `/api/agents`, `/api/agent/{name}`,
 `/api/charts`, `/api/health`, `/api/attention`, `/api/job/{id}/checks`,
-`/api/run/{id}/verdicts`, `/api/state`, `/api/job/{id}`, `/api/graph`) plus a
-Server-Sent Events stream at `/events`.
+`/api/run/{id}/verdicts`, `/api/state`, `/api/job/{id}`, `/api/graph`,
+`/api/comms`) plus a Server-Sent Events stream at `/events`.
 
 See [Dashboard Views](./views.md) for what each view shows.
 
@@ -88,8 +90,9 @@ unchanged.
 ## Security
 
 The dashboard serves **private data**: job prompts, agent outputs, template
-bodies, repo names and lock owners are all visible to anyone who can reach the
-port. There is **no authentication** built in.
+bodies, repo names, lock owners, and org-note bodies shown in Comms are all
+visible to anyone who can reach the port. There is **no authentication** built
+in.
 
 By default `--web` binds to `127.0.0.1:8080`, reachable only from the local
 machine — keep it that way for normal use. If you must expose it beyond

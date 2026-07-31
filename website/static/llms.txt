@@ -38,8 +38,8 @@ full expanded context.
 
 ## Dashboard
 
-- [Dashboard Overview](https://gitmoot.io/docs/dashboard/overview): The read-only live web dashboard (`gitmoot dashboard --web [--addr host:port]`) over the local store — launching, the URL route table, auto-refresh cadences (12s polls, 15s runs, SSE per-run graph), mobile support, and the localhost-default/no-auth security model.
-- [Dashboard Views](https://gitmoot.io/docs/dashboard/views): The six views — Graph (per-run delegation DAG), Galaxy (whole-history force graph), Jobs (filterable table, 400-row cap), Agents (cards + detail with template prompt, version history, and per-version diff), Charts (7d/30d/90d/all series), and Health (daemon status, stuck jobs with reasons, locks, recent failures, delegation-worktree count and size).
+- [Dashboard Overview](https://gitmoot.io/docs/dashboard/overview): The read-only live web dashboard (`gitmoot dashboard --web [--addr host:port]`) over the local store — launching, the URL route table including `/comms`, auto-refresh cadences (12s polls, 15s runs, SSE per-run graph), mobile support, operator-visible private data, and the localhost-default/no-auth security model.
+- [Dashboard Views](https://gitmoot.io/docs/dashboard/views): The fifteen views, including Graph, Galaxy, Jobs, Pipelines, Workflows, Brain, Agents, Charts, Health, Attention, and Comms — the read-only org escalation inbox with complete unresolved-workflow discovery, note deep links, filters, and CLI-only resolution via `gitmoot org escalate resolve`.
 
 ## References
 
