@@ -167,6 +167,12 @@ implement-advance and the daemon's GitHub PR-watcher, so a PR opened either way
 stays free of native review fan-out. The flag defaults off; leaving it off keeps
 the full native review fan-out, byte-identical to prior behavior.
 
+Fresh implementation PRs opened by these engine paths are drafts by default.
+Pass `--ready` only when the PR should enter review and merge-gate processing
+immediately; `--draft` states the default explicitly. A forge-reported draft
+does not park its task at `awaiting_human_merge`, because no human merge decision
+has been requested yet.
+
 ## Ephemeral, leaf-only, bounded
 
 In all three recipes the delegations never set `agent`: `agent` and `ephemeral`

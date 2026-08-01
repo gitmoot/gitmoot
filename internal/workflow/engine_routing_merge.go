@@ -389,9 +389,9 @@ func (e Engine) ensureJobExecutorAllowed(ctx context.Context, job db.Job, payloa
 		// of the lock, on a payload that was carrying it the whole time.
 		ActingOrgRole: payload.ActingOrgRole,
 		Repo:          payload.Repo,
-		Sender:       payload.Sender,
-		Branch:       payload.Branch,
-		DelegationID: payload.DelegationID,
+		Sender:        payload.Sender,
+		Branch:        payload.Branch,
+		DelegationID:  payload.DelegationID,
 		// Carry the worker spec so an ephemeral child's executor check inherits the
 		// coordinator's repo scope (skip the registered-agent checks) instead of
 		// blocking on a synthetic agent name that no agent row backs.
@@ -489,6 +489,7 @@ func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string,
 		Repo:                payload.Repo,
 		Branch:              payload.Branch,
 		PullRequest:         payload.PullRequest,
+		PullRequestDraft:    payload.PullRequestDraft,
 		HeadSHA:             payload.HeadSHA,
 		TaskID:              payload.TaskID,
 		WorkflowID:          payload.WorkflowID,
@@ -500,6 +501,12 @@ func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string,
 		return MergeDecision{}, err
 	}
 	if decision.LeaveOpen {
+		// A draft is an author-controlled hold, not a pending human merge decision.
+		// Keep the task in its current lifecycle state so a later ready-for-review
+		// observation can re-drive the gate without an unresumable human-decision park.
+		if payload.PullRequestDraft {
+			return decision, nil
+		}
 		reason := strings.TrimSpace(decision.Reason)
 		if reason == "" {
 			reason = "merge requires a human action"

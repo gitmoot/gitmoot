@@ -789,6 +789,13 @@ branch mismatches, dirty/live worktrees, active implement jobs, and foreign
 branch locks still fail closed. The job keeps the PR number so finalization
 adopts the existing PR.
 
+Fresh implementation PRs opened by the engine are drafts by default. Dispatch
+with `--ready` only when the PR should enter review and merge-gate processing
+immediately; `--draft` records the default intent explicitly. While the forge
+reports the PR as draft, Gitmoot leaves the task in its current lifecycle state
+instead of parking it at `awaiting_human_merge`: a draft is an author hold, not
+a pending human merge decision.
+
 The daemon default is `--workers 1`. Users can raise it when jobs target
 different runtime sessions, managed agent types with `max_background` greater
 than one, or forkable temporary workers. By default `[parallel_sessions]` uses

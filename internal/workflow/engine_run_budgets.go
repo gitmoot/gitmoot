@@ -473,6 +473,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 			Repo:              payload.Repo,
 			Branch:            payload.Branch,
 			PullRequest:       payload.PullRequest,
+			PullRequestDraft:  payload.PullRequestDraft,
 			HeadSHA:           payload.HeadSHA,
 			GoalID:            payload.GoalID,
 			TaskID:            payload.TaskID,

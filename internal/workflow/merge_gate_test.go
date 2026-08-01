@@ -603,6 +603,49 @@ func TestRunMergeGateExplicitKillSwitchParksReviewedAndUnreviewedTasks(t *testin
 	}
 }
 
+func TestRunMergeGateDraftPullRequestDoesNotParkTaskAwaitingHumanMerge(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	const taskID = "task-draft"
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: taskID, RepoFullName: "owner/repo", Title: "Draft task",
+		State: string(TaskReadyToMerge), Branch: "task-draft",
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	engine := Engine{Store: store, MergeGate: PolicyMergeGate{AutoMerge: true, GitHub: &fakeMergeGateGitHub{}}}
+	payload := JobPayload{
+		Repo: "owner/repo", Branch: "task-draft", PullRequest: 17,
+		PullRequestDraft: true, TaskID: taskID, TaskTitle: "Draft task",
+	}
+
+	decision, err := engine.runMergeGate(ctx, "", payload, taskRef{
+		ID: taskID, Repo: "owner/repo", Title: "Draft task", Branch: "task-draft",
+	})
+	if err != nil {
+		t.Fatalf("runMergeGate: %v", err)
+	}
+	if !decision.LeaveOpen || decision.Reason != "pull request is draft" {
+		t.Fatalf("decision = %+v, want draft leave-open", decision)
+	}
+	task, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if task.State != string(TaskReadyToMerge) {
+		t.Fatalf("task state = %q, want %q", task.State, TaskReadyToMerge)
+	}
+	events, err := store.ListTaskEvents(ctx, taskID)
+	if err != nil {
+		t.Fatalf("ListTaskEvents: %v", err)
+	}
+	for _, event := range events {
+		if event.Kind == "task_awaiting_human_merge" {
+			t.Fatalf("draft PR created a pending-human-decision park: %+v", events)
+		}
+	}
+}
+
 func TestPolicyMergeGateHumanRequestRequiresFinalReview(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

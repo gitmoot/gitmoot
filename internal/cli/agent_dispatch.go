@@ -51,6 +51,7 @@ type localAgentDispatchRequest struct {
 	JobTimeout       time.Duration
 	TaskID           string
 	PullRequest      int
+	PullRequestReady bool
 	HeadSHA          string
 	// ImplementBase is the CLI/config worktree base for implement dispatches.
 	// Before the request can enqueue, it is resolved to a commit SHA and
@@ -290,6 +291,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		Repo:                   repo.FullName(),
 		Branch:                 firstNonEmpty(request.Branch, record.DefaultBranch),
 		PullRequest:            request.PullRequest,
+		PullRequestReady:       request.PullRequestReady,
 		HeadSHA:                request.HeadSHA,
 		GoalID:                 request.GoalID,
 		TaskID:                 request.TaskID,

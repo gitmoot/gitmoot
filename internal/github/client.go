@@ -76,6 +76,7 @@ type PullRequest struct {
 	State  string `json:"state"`
 	URL    string `json:"html_url"`
 	Merged bool   `json:"merged"`
+	Draft  bool   `json:"draft"`
 	// MergedAt is the PR's merge timestamp (RFC3339), or "" if not merged. It is
 	// additive (#467): the GitHub LIST endpoint (GET /pulls?state=closed) reports
 	// merged PRs as state="closed" and OMITS the top-level `merged` boolean —
@@ -130,6 +131,7 @@ func (p *PullRequest) UnmarshalJSON(data []byte) error {
 		State     string `json:"state"`
 		URL       string `json:"html_url"`
 		Merged    bool   `json:"merged"`
+		Draft     bool   `json:"draft"`
 		MergedAt  string `json:"merged_at"`
 		Body      string `json:"body"`
 		Mergeable *bool  `json:"mergeable"`
@@ -156,6 +158,7 @@ func (p *PullRequest) UnmarshalJSON(data []byte) error {
 	p.State = decoded.State
 	p.URL = decoded.URL
 	p.Merged = decoded.Merged
+	p.Draft = decoded.Draft
 	p.MergedAt = decoded.MergedAt
 	p.Body = decoded.Body
 	p.Mergeable = decoded.Mergeable
@@ -709,7 +712,7 @@ func (c *GhClient) GetOpenPullRequestByHead(ctx context.Context, repo Repository
 		"--head", head,
 		"--base", base,
 		"--state", "open",
-		"--json", "number,url,headRefOid,baseRefName,state",
+		"--json", "number,url,headRefOid,baseRefName,state,isDraft",
 	)
 	if err != nil {
 		return PullRequest{}, false, err
@@ -720,6 +723,7 @@ func (c *GhClient) GetOpenPullRequestByHead(ctx context.Context, repo Repository
 		HeadRefOid  string `json:"headRefOid"`
 		BaseRefName string `json:"baseRefName"`
 		State       string `json:"state"`
+		IsDraft     bool   `json:"isDraft"`
 	}
 	if err := json.Unmarshal([]byte(result.Stdout), &wire); err != nil {
 		return PullRequest{}, false, fmt.Errorf("decode gh pr list response: %w", err)
@@ -732,6 +736,7 @@ func (c *GhClient) GetOpenPullRequestByHead(ctx context.Context, repo Repository
 		Number:  w.Number,
 		URL:     w.URL,
 		State:   strings.ToLower(strings.TrimSpace(w.State)),
+		Draft:   w.IsDraft,
 		HeadRef: head,
 		HeadSHA: w.HeadRefOid,
 		BaseRef: w.BaseRefName,

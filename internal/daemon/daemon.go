@@ -937,6 +937,7 @@ func (d Daemon) handlePullRequestWorkflowChange(ctx context.Context, pull github
 		Repo:              d.Repo.FullName(),
 		Branch:            ref.branch,
 		PullRequest:       int(pull.Number),
+		PullRequestDraft:  pull.Draft,
 		HeadSHA:           pull.HeadSHA,
 		GoalID:            ref.goalID,
 		TaskID:            ref.id,
@@ -1036,15 +1037,16 @@ func (d Daemon) handleReadyToMergeWorkflow(ctx context.Context, pull github.Pull
 		branch = pull.HeadRef
 	}
 	return d.Workflow.HandlePullRequestReadyToMerge(ctx, workflow.PullRequestEvent{
-		Repo:        d.Repo.FullName(),
-		Branch:      branch,
-		PullRequest: int(pull.Number),
-		HeadSHA:     pull.HeadSHA,
-		GoalID:      task.GoalID,
-		TaskID:      task.ID,
-		TaskTitle:   task.Title,
-		LeadAgent:   leadAgent,
-		Sender:      "github",
+		Repo:             d.Repo.FullName(),
+		Branch:           branch,
+		PullRequest:      int(pull.Number),
+		PullRequestDraft: pull.Draft,
+		HeadSHA:          pull.HeadSHA,
+		GoalID:           task.GoalID,
+		TaskID:           task.ID,
+		TaskTitle:        task.Title,
+		LeadAgent:        leadAgent,
+		Sender:           "github",
 	})
 }
 
@@ -1992,6 +1994,7 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 		Repo:                d.Repo.FullName(),
 		Branch:              firstNonEmpty(task.Branch, pull.HeadRef),
 		PullRequest:         int(pull.Number),
+		PullRequestDraft:    pull.Draft,
 		HeadSHA:             pull.HeadSHA,
 		GoalID:              task.GoalID,
 		TaskID:              task.ID,

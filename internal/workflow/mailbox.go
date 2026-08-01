@@ -150,14 +150,17 @@ type JobRequest struct {
 	Repo           string
 	Branch         string
 	PullRequest    int
-	HeadSHA        string
-	GoalID         string
-	TaskID         string
-	TaskTitle      string
-	LeadAgent      string
-	Reviewers      []string
-	ReviewRound    string
-	Sender         string
+	// PullRequestReady opts an implementation PR out of the engine's
+	// draft-by-default policy. It is set only by an explicit ready dispatch.
+	PullRequestReady bool
+	HeadSHA          string
+	GoalID           string
+	TaskID           string
+	TaskTitle        string
+	LeadAgent        string
+	Reviewers        []string
+	ReviewRound      string
+	Sender           string
 	// ActingOrgRole attributes a fresh local dispatch to an organization role.
 	// It is persisted for audit provenance, then inherited by engine children.
 	ActingOrgRole string
@@ -287,9 +290,13 @@ type JobRequest struct {
 }
 
 type JobPayload struct {
-	Repo                  string   `json:"repo"`
-	Branch                string   `json:"branch"`
-	PullRequest           int      `json:"pull_request"`
+	Repo             string `json:"repo"`
+	Branch           string `json:"branch"`
+	PullRequest      int    `json:"pull_request"`
+	PullRequestReady bool   `json:"pull_request_ready,omitempty"`
+	// PullRequestDraft is the forge-observed state, kept separate from requested
+	// intent so routing decisions consume what the forge actually reports.
+	PullRequestDraft      bool     `json:"pull_request_draft,omitempty"`
 	HeadSHA               string   `json:"head_sha,omitempty"`
 	GoalID                string   `json:"goal_id,omitempty"`
 	TaskID                string   `json:"task_id"`
@@ -503,10 +510,16 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 	// lookup, so root dispatches are untouched. Fails open: an unreadable parent
 	// leaves the request exactly as the caller built it.
 	skipNativeReviewFanout := request.SkipNativeReviewFanout
-	if !skipNativeReviewFanout && strings.TrimSpace(request.ParentJobID) != "" {
+	pullRequestReady := request.PullRequestReady
+	if (!skipNativeReviewFanout || !pullRequestReady) && strings.TrimSpace(request.ParentJobID) != "" {
 		if parent, parentErr := m.Store.GetJob(ctx, strings.TrimSpace(request.ParentJobID)); parentErr == nil {
-			if parentPayload, parseErr := unmarshalPayload(parent.Payload); parseErr == nil && parentPayload.SkipNativeReviewFanout {
-				skipNativeReviewFanout = true
+			if parentPayload, parseErr := unmarshalPayload(parent.Payload); parseErr == nil {
+				if parentPayload.SkipNativeReviewFanout {
+					skipNativeReviewFanout = true
+				}
+				if parentPayload.PullRequestReady {
+					pullRequestReady = true
+				}
 			}
 		}
 	}
@@ -515,6 +528,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		Repo:                   request.Repo,
 		Branch:                 request.Branch,
 		PullRequest:            request.PullRequest,
+		PullRequestReady:       pullRequestReady,
 		HeadSHA:                request.HeadSHA,
 		GoalID:                 request.GoalID,
 		TaskID:                 request.TaskID,
