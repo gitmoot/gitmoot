@@ -24,10 +24,19 @@ A bare `@<agent>` mention works as the same command (#389):
 Mentions are also routed on **issue** comments when the daemon runs with
 `--watch-issues` (on issues only the `ask` action is acted on).
 
-The daemon polls GitHub, checks that comments are from users allowed to route
-work, queues jobs, invokes the selected agent runtime, and posts attributed
-results back to the PR. The selected agent's runtime can be `codex`, `claude`,
-`kimi` (Kimi Code CLI), or `kimi-cli` (the opt-in legacy Kimi CLI adapter).
+Before parsing, Gitmoot removes triple-backtick and tilde fenced code blocks and
+closed inline backtick spans (including single-backtick spans). GitHub must then
+report that the comment author currently has `write`, `maintain`, or `admin`
+repository permission; unauthorized addressed commands are rejected without
+parsing their command text. Ordinary prose and code examples produce no reply.
+An authorized malformed command still produces a visible routing error. An
+unclosed fenced code block treats the remainder of the comment as code, so any
+later command is ignored without a reply.
+
+The daemon polls GitHub, applies that author gate, queues jobs, invokes the
+selected agent runtime, and posts attributed results back to the PR. The
+selected agent's runtime can be `codex`, `claude`, `kimi` (Kimi Code CLI), or
+`kimi-cli` (the opt-in legacy Kimi CLI adapter).
 
 Expected result comments include the agent identity, runtime, the template when
 one is attached, and the job id:
@@ -65,4 +74,3 @@ silently ignored — always resume on the tree's open PR:
 See the [result contract](../reference/result-contract.md) for the
 `escalate_human` / ask-gate pause semantics, TTLs, and how a paused tree is
 surfaced under the dashboard's Attention page.
-

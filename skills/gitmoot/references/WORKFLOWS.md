@@ -112,6 +112,15 @@ gitmoot agent doctor reviewer
 /gitmoot reviewer review
 ```
 
+Gitmoot removes triple-backtick and tilde fenced code blocks plus closed inline
+backtick spans before considering comment commands. It then verifies through
+GitHub that the comment author currently has `write`, `maintain`, or `admin`
+permission on the repository before the remaining command text reaches the
+parser. Ordinary prose and code examples produce no Gitmoot reply; a malformed
+command from an authorized author produces a visible routing error. An unclosed
+fenced code block treats the remainder of the comment as code, so any later
+command is ignored without a reply.
+
 ```sh
 gitmoot job list --repo owner/repo
 gitmoot job show <job-id>
