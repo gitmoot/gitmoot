@@ -180,16 +180,21 @@ func TestParseCommandsMarkdownCodeEdges(t *testing.T) {
 	}
 }
 
-// TestHandleCommentUnrecognizedActionStaysSilent pins #1355: a line that is
-// addressed by shape but names no known action must produce no outbound comment
-// on either the PR or the issue path. The body is the real incident — a Swift
-// property wrapper outside any code fence, which parses as the mention form
-// `@<agent> <action>` with action "private(set)" — so before the fix Gitmoot
-// replied "unsupported command action" onto an unrelated repository.
+// TestHandleCommentUnrecognizedActionStaysSilent pins #1355: on the PR path, a
+// line that is addressed by shape but names no known action must produce no
+// outbound comment. The body is the real incident — a Swift property wrapper
+// outside any code fence, which parses as the mention form `@<agent> <action>`
+// with action "private(set)" — so before the fix Gitmoot replied "unsupported
+// command action" onto an unrelated repository.
 //
-// The final leg is the discriminator: a *recognized* action with a bad argument
+// The second leg is the discriminator: a *recognized* action with a bad argument
 // still gets a reply, so the fix suppresses parser noise rather than silencing
 // command feedback wholesale.
+//
+// There is deliberately no issue-path leg. handleIssueComment filters to
+// Action == "ask" before dispatching, so an unrecognized action is dropped
+// there and never reaches handleIssueAsk; asserting silence on that path would
+// certify the pre-existing filter, not this change.
 func TestHandleCommentUnrecognizedActionStaysSilent(t *testing.T) {
 	ctx := context.Background()
 	store, _, client, daemon := commentCommandFixture(t, ctx)
@@ -210,25 +215,50 @@ func TestHandleCommentUnrecognizedActionStaysSilent(t *testing.T) {
 		t.Fatalf("unrecognized action jobs = %+v, err=%v, want none", jobs, err)
 	}
 
-	issue := github.Issue{Number: 11, Title: "Camera state", State: "open"}
-	issueComment := github.IssueComment{
-		ID:     5148925001,
-		Author: "alice",
-		Body:   "@objc dynamic private(set) var retries = 0",
-	}
-	if err := daemon.handleIssueComment(ctx, issue, issueComment); err != nil {
-		t.Fatalf("handleIssueComment returned error: %v", err)
-	}
-	if len(client.posted) != 0 {
-		t.Fatalf("unrecognized action on an issue posted replies = %+v, want none", client.posted)
-	}
-
 	badArgument := github.IssueComment{ID: 5148925002, Author: "alice", Body: "@helper retry"}
 	if err := daemon.handleComment(ctx, pull, badArgument); err != nil {
 		t.Fatalf("handleComment(bad argument) returned error: %v", err)
 	}
 	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "requires a job id") {
 		t.Fatalf("recognized action with a bad argument replies = %+v, want one job-id error", client.posted)
+	}
+}
+
+// TestHandleCommentInlineSpanCannotRedirectCommand pins inline-span stripping
+// (#1365) with a fixture that actually exercises it. The first field is
+// `/gitmoot`, so isCommandAddressedLine accepts the line and it reaches the
+// parser either way — which is what the existing assertion in
+// TestParseCommandsMarkdownCodeEdges does not do, because its fixture line
+// begins with "Use" and so is never addressed at all.
+//
+// In the `/gitmoot ask <agent> …` form the agent is the third field, so a
+// quoted span sitting before the real agent name shifts it. Stripped, the
+// command dispatches to `helper`; unstripped, the agent resolves to the
+// backticked token and no job is created. The span therefore cannot change
+// which command runs.
+func TestHandleCommentInlineSpanCannotRedirectCommand(t *testing.T) {
+	ctx := context.Background()
+	store, repo, client, daemon := commentCommandFixture(t, ctx)
+	pull := github.PullRequest{Number: 10, Title: "Camera design", HeadRef: "camera-state"}
+	comment := github.IssueComment{
+		ID:     5148926000,
+		Author: "alice",
+		Body:   "/gitmoot ask `not-an-agent` helper inspect the state model",
+	}
+
+	if err := daemon.handleComment(ctx, pull, comment); err != nil {
+		t.Fatalf("handleComment returned error: %v", err)
+	}
+	wantID := jobID(repo, pull.Number, comment.ID, 0, "helper", "ask")
+	job, err := store.GetJob(ctx, wantID)
+	if err != nil {
+		t.Fatalf("GetJob(%q) returned error: %v — the inline span redirected the command", wantID, err)
+	}
+	if job.Agent != "helper" || job.Type != "ask" {
+		t.Fatalf("dispatched job = %+v, want ask/helper", job)
+	}
+	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "queued `ask` job") {
+		t.Fatalf("posted acknowledgements = %+v, want one queued-job reply", client.posted)
 	}
 }
 

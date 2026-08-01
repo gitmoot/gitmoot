@@ -1822,13 +1822,17 @@ An authorized malformed command still produces a visible routing error. An
 unclosed fenced code block treats the remainder of the comment as code, so any
 later command is ignored without a reply.
 
-A line that is addressed by shape but names an action Gitmoot does not
-implement produces **no reply** — it is recorded in the daemon log only. Source
-code reaches this path routinely, because a decorator or attribute line such as
-`@Published private(set) var state = .uninitialized` matches the
-`@<agent> <action>` mention form outside a code fence. A *recognized* action
-given a bad argument (for example `@helper retry` with no job id) still replies,
-so genuine command feedback is preserved.
+On a **pull request**, a line that is addressed by shape but names an action
+Gitmoot does not implement produces **no reply** — it is recorded in the daemon
+log instead. Source code reaches this path routinely, because a decorator or
+attribute line such as `@Published private(set) var state = .uninitialized`
+matches the `@<agent> <action>` mention form outside a code fence. A
+*recognized* action given a bad argument (for example `@helper retry` with no
+job id) still replies, so genuine command feedback is preserved.
+
+On an **issue**, only `ask` is acted on, so any other action — recognized or
+not — is dropped before dispatch with no reply **and no log entry**. When an
+issue comment appears to have been ignored, the daemon log will not explain it.
 
 ## Jobs And Locks
 
