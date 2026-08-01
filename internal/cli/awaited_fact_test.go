@@ -85,8 +85,8 @@ func TestAwaitedFactOutboxIsAddressedDeliveryWithoutReceiptCeremony(t *testing.T
 	if len(matching) != 1 || matching[0].ID != "lane" {
 		t.Fatalf("matching fact rules = %+v, want exact lane rule", matching)
 	}
-	if event.RootID != "awaited-fact:7" || strings.Contains(event.RootID, "{") {
-		t.Fatalf("fact root_id = %q, want short stable fact id", event.RootID)
+	if event.JobID != "awaited-fact:7" || event.RootID != "awaited-fact:7" || strings.Contains(event.JobID, "{") || strings.Contains(event.RootID, "{") {
+		t.Fatalf("fact job_id/root_id = %q/%q, want short stable fact ids without serialized payloads", event.JobID, event.RootID)
 	}
 	prompt := eventRuleWakePrompt("fact", event)
 	if !strings.Contains(prompt, "awaited fact for lane") || strings.Contains(prompt, " ack ") || strings.Contains(prompt, " done ") {
