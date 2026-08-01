@@ -16,8 +16,9 @@ import (
 // runtime-session lock attached to the failed owner — so it is reclaimed
 // regardless of lease. The daemon first records the evidence-bearing terminal
 // transition selected by ListRunningJobIDsFromForeignBoot; this method only
-// reclaims the lock row. Session-recorded jobs are excluded because they execute
-// outside the daemon. It returns the number of locks released.
+// reclaims the lock row. A session-recorded owner is excluded only while its job
+// is running outside the daemon; once the session row is terminal (or gone), its
+// stale lock is reclaimed too. It returns the number of locks released.
 //
 // It is a STRICT no-op when currentBootID is "" and, via the `!= ”` guard, never
 // reclaims an identity-less lock (a non-pid-stamping acquire or a legacy row),
@@ -31,7 +32,12 @@ func (s *Store) ReleaseRuntimeSessionLocksFromForeignBoot(ctx context.Context, c
 	}
 	result, err := s.db.ExecContext(ctx, `DELETE FROM resource_locks
 		WHERE resource_key LIKE ? AND owner_boot_id != '' AND owner_boot_id != ?
-		AND owner_job_id NOT LIKE 'session-%'`,
+		AND NOT EXISTS (
+			SELECT 1 FROM jobs
+			WHERE jobs.id = resource_locks.owner_job_id
+				AND jobs.state = 'running'
+				AND (jobs.externally_driven = 1 OR jobs.id LIKE 'session-%')
+		)`,
 		RuntimeSessionLockKeyPrefix+"%", currentBootID)
 	if err != nil {
 		return 0, err

@@ -3360,6 +3360,37 @@ func TestRecoverRunningJobsFailsStaleRunningJobsWithEvidence(t *testing.T) {
 	}
 }
 
+func TestRecoverRunningJobsContinuesPastCandidateLookupError(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	for _, id := range []string{"job-a-lookup-error", "job-b-survivor"} {
+		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: id, Agent: "audit", Action: "ask", Repo: "owner/repo"})
+		if err := store.UpdateJobState(ctx, id, string(workflow.JobRunning)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	getJob := func(ctx context.Context, id string) (db.Job, error) {
+		if id == "job-a-lookup-error" {
+			return db.Job{}, errors.New("injected row lookup failure")
+		}
+		return store.GetJob(ctx, id)
+	}
+
+	now := time.Now().UTC()
+	var output bytes.Buffer
+	if err := recoverRunningJobsBeforeForRepoSkippingWithGet(ctx, store, &output, now, now.Add(time.Second), "", "", nil, getJob); err != nil {
+		t.Fatalf("recoverRunningJobsBeforeForRepo returned error: %v", err)
+	}
+	lookupError, _ := store.GetJob(ctx, "job-a-lookup-error")
+	survivor, _ := store.GetJob(ctx, "job-b-survivor")
+	if lookupError.State != string(workflow.JobRunning) || survivor.State != string(workflow.JobFailed) {
+		t.Fatalf("states after per-item lookup error = errored:%q survivor:%q, want running/failed", lookupError.State, survivor.State)
+	}
+	if !strings.Contains(output.String(), "skipping candidate job-a-lookup-error") || !strings.Contains(output.String(), "injected row lookup failure") {
+		t.Fatalf("recovery output = %q, want recorded per-item lookup error", output.String())
+	}
+}
+
 func TestRecoverRunningJobsKeepsRecentRunningJobsOnStartup(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)

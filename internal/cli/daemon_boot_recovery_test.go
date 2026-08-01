@@ -1,7 +1,10 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -11,6 +14,40 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
+
+func TestRecoverForeignBootRunnersContinuesPastVanishedCandidate(t *testing.T) {
+	if db.BootID() == "" {
+		t.Skip("kernel boot id unavailable on this platform")
+	}
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	for _, id := range []string{"job-a-vanished", "job-b-survivor"} {
+		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: id, Agent: "audit", Action: "ask", Repo: "owner/repo"})
+		if claimed, err := store.ClaimRunningJob(ctx, id, string(workflow.JobQueued), string(workflow.JobRunning), db.JobEvent{Kind: string(workflow.JobRunning)}, 1, "prior-boot"); err != nil || !claimed {
+			t.Fatalf("ClaimRunningJob(%s) claimed=%v err=%v", id, claimed, err)
+		}
+	}
+
+	getJob := func(ctx context.Context, id string) (db.Job, error) {
+		if id == "job-a-vanished" {
+			return db.Job{}, sql.ErrNoRows
+		}
+		return store.GetJob(ctx, id)
+	}
+
+	var output bytes.Buffer
+	if err := recoverForeignBootRunnersWithGet(ctx, store, &output, getJob); err != nil {
+		t.Fatalf("recoverForeignBootRunners returned error: %v", err)
+	}
+	vanished, _ := store.GetJob(ctx, "job-a-vanished")
+	survivor, _ := store.GetJob(ctx, "job-b-survivor")
+	if vanished.State != string(workflow.JobRunning) || survivor.State != string(workflow.JobFailed) {
+		t.Fatalf("states after per-item lookup race = vanished:%q survivor:%q, want running/failed", vanished.State, survivor.State)
+	}
+	if !strings.Contains(output.String(), "skipping candidate job-a-vanished") || !strings.Contains(output.String(), "sql: no rows") {
+		t.Fatalf("recovery output = %q, want recorded vanished-candidate error", output.String())
+	}
+}
 
 // TestRecoverForeignBootRunnersFailsRebootedJobRegardlessOfLease is the AC2
 // fix: after a reboot a running job whose runtime-session lease is still in the
@@ -111,6 +148,15 @@ func TestDaemonRecoveryNeverTouchesSessionRecordedJobs(t *testing.T) {
 	}
 	if _, err := store.GetResourceLock(ctx, "runtime:codex:session-recorded"); err != nil {
 		t.Fatalf("session-recorded job lock was touched: %v", err)
+	}
+	if transitioned, err := store.TransitionJobStateWithEvent(ctx, id, string(workflow.JobRunning), string(workflow.JobCancelled), db.JobEvent{Kind: string(workflow.JobCancelled)}); err != nil || !transitioned {
+		t.Fatalf("terminal session transition=%v err=%v", transitioned, err)
+	}
+	if err := recoverExpiredRuntimeSessionLocks(ctx, store, io.Discard, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetResourceLock(ctx, "runtime:codex:session-recorded"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("terminal session lock error = %v, want reclaimed", err)
 	}
 }
 

@@ -1881,8 +1881,9 @@ crash backstop, not a kill deadline.
 As of #1308, daemon-owned jobs recovered after a restart are **failed, never
 silently requeued**. A changed Linux boot id, an expired runtime-session lease,
 or the three-leg stale liveness predicate produces a `job_recovery_failed` event
-that names the cause and elapsed time and carries the redacted last 4 KB of the
-retained job log when available. A startup row with `job_kill_pending` but no
+that names the cause and recovery age since the row's last durable update and
+carries the redacted last 4 KB of the retained job log when available. A startup
+row with `job_kill_pending` but no
 terminal event is likewise failed with the explicit reason `daemon died
 mid-kill`. Inspect the evidence, then use `gitmoot job retry <job-id>` when a
 rerun is appropriate. `session-*` jobs are unchanged because they execute

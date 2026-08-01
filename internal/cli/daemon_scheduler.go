@@ -219,6 +219,10 @@ func recoverExpiredRuntimeSessionLocks(ctx context.Context, store *db.Store, std
 // behavior — and never touches a SAME-boot owner, so a live in-process worker is
 // never double-run (the #536 protection is untouched).
 func recoverForeignBootRunners(ctx context.Context, store *db.Store, stdout io.Writer) error {
+	return recoverForeignBootRunnersWithGet(ctx, store, stdout, store.GetJob)
+}
+
+func recoverForeignBootRunnersWithGet(ctx context.Context, store *db.Store, stdout io.Writer, getJob func(context.Context, string) (db.Job, error)) error {
 	bootID := db.BootID()
 	if bootID == "" {
 		return nil
@@ -228,9 +232,10 @@ func recoverForeignBootRunners(ctx context.Context, store *db.Store, stdout io.W
 		return err
 	}
 	for _, id := range ids {
-		job, err := store.GetJob(ctx, id)
+		job, err := getJob(ctx, id)
 		if err != nil {
-			return err
+			writeLine(stdout, "foreign-boot recovery: skipping candidate %s after row lookup failed: %v", id, err)
+			continue
 		}
 		if _, err := failRecoveredRunningJob(ctx, store, stdout, time.Now().UTC(), job, "daemon restart: runner belonged to a previous host boot"); err != nil {
 			return err
@@ -289,7 +294,7 @@ func recoverExpiredRuntimeSessionLocksSkipping(ctx context.Context, store *db.St
 	}
 	for _, lock := range expiredRuntimeLocks {
 		owner := strings.TrimSpace(lock.OwnerJobID)
-		if owner == "" || skipOwners[owner] || strings.HasPrefix(owner, "session-") {
+		if owner == "" || skipOwners[owner] {
 			if owner != "" {
 				preserveOwners[owner] = true
 			}
@@ -301,6 +306,10 @@ func recoverExpiredRuntimeSessionLocksSkipping(ctx context.Context, store *db.St
 				continue
 			}
 			return err
+		}
+		if isSessionRecordedJob(job) && job.State == string(workflow.JobRunning) {
+			preserveOwners[owner] = true
+			continue
 		}
 		if _, err := failRecoveredRunningJob(ctx, store, stdout, now, job, "stale recovery: runtime session lock expired with no in-process worker"); err != nil {
 			return err
@@ -443,6 +452,10 @@ func recoverRunningJobsBeforeForRepo(ctx context.Context, store *db.Store, stdou
 // execution used to guarantee this by never scanning while a job ran; the async
 // dispatcher must guarantee it explicitly. A nil skip set is byte-identical.
 func recoverRunningJobsBeforeForRepoSkipping(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time, before time.Time, repoFilter string, rootFilter string, skipJobs map[string]bool) error {
+	return recoverRunningJobsBeforeForRepoSkippingWithGet(ctx, store, stdout, now, before, repoFilter, rootFilter, skipJobs, store.GetJob)
+}
+
+func recoverRunningJobsBeforeForRepoSkippingWithGet(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time, before time.Time, repoFilter string, rootFilter string, skipJobs map[string]bool, getJob func(context.Context, string) (db.Job, error)) error {
 	jobs, err := store.ListRunningJobsUpdatedBefore(ctx, before)
 	if err != nil {
 		return err
@@ -454,9 +467,10 @@ func recoverRunningJobsBeforeForRepoSkipping(ctx context.Context, store *db.Stor
 		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
 			continue
 		}
-		fresh, err := store.GetJob(ctx, job.ID)
+		fresh, err := getJob(ctx, job.ID)
 		if err != nil {
-			return err
+			writeLine(stdout, "stale-running recovery: skipping candidate %s after row lookup failed: %v", job.ID, err)
+			continue
 		}
 		if err := recoverRunningJobIfLeaseExpired(ctx, store, stdout, now, fresh); err != nil {
 			return err
@@ -544,6 +558,9 @@ func failRecoveredRunningJob(ctx context.Context, store *db.Store, stdout io.Wri
 }
 
 func recoveredJobElapsed(now time.Time, job db.Job) string {
+	// updated_at is the last durable row write, not an immutable claim timestamp.
+	// Report a conservative recovery age from that evidence rather than presenting
+	// it as total wall-clock execution time; created_at is only a legacy fallback.
 	started := parseJobTimeMillis(job.UpdatedAt)
 	if started == 0 {
 		if parsed, err := time.Parse("2006-01-02 15:04:05 -0700 MST", strings.TrimSpace(job.UpdatedAt)); err == nil {
