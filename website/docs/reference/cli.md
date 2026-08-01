@@ -1337,6 +1337,24 @@ precedence over the global value. Typed completion or cancellation receipts
 close the evaluator obligation. With no enabled org event rules, the lane is
 config-inert: it performs no directive scan and emits nothing.
 
+`gitmoot org await review --repo <owner/repo> --pr <number> --head <sha> --ttl
+<duration> [--role <role>] [--home <dir>]` registers a bounded durable interest
+in a review verdict. `--role` defaults to `GITMOOT_ORG_ROLE`; the role must exist
+in the organization chart, `--ttl` is mandatory, and the exact head SHA is part
+of the canonical subject key. Registration inserts the interest and rechecks
+already-committed review jobs in one transaction, so a verdict that lands while
+registration is starting is not missed. A later terminal review-job commit
+satisfies only the matching repository, PR, and head, then writes an addressed
+`fact:<role>` wake obligation.
+
+`gitmoot org await list [--role <role>] [--state waiting|satisfied|expired]
+[--json] [--home <dir>]` shows live and terminal subscriptions. The existing
+one-minute org supervision lane expires overdue waits, retains the row as a
+queryable `expired` terminal state, and addresses the expiry to the waiter's
+current parent (or the waiter itself for a root role). Fact wakes are delivery
+only: they require a `fact` event rule but create no acknowledgment or completion
+ceremony.
+
 Event-rule wakes are separately opt-in:
 
 ```sh
@@ -1345,6 +1363,7 @@ gitmoot org events rule add --on blocked --repo tendwire --wake maintainer
 gitmoot org events rule add --on pane_input_pending --wake maintainer
 gitmoot org events rule add --on reply --wake maintainer
 gitmoot org events rule add --on directive --wake maintainer
+gitmoot org events rule add --on fact --wake maintainer
 gitmoot org events rule add --on reply --wake operator --scope observer
 gitmoot org events rule list
 gitmoot org events rule set-scope --home /alternate/home <rule-id> observer
@@ -1352,13 +1371,13 @@ gitmoot org events rule rm --home /alternate/home <rule-id>
 ```
 
 `--on` accepts `escalation`, `attention`, `guard`, `job-terminal`, `blocked`,
-`recycle-overdue`, `pane_input_pending`, `reply`, or `directive`. `pane_input_pending` matches the
+`recycle-overdue`, `pane_input_pending`, `reply`, `directive`, or `fact`. `pane_input_pending` matches the
 `org.input_pending` event emitted when Herdr continuously reports
 `input_pending: true` for a role's pane longer than
 `[orchestrate].blocked_role_wake_after`; it re-nudges at most once per that
 interval while the dialog remains pending. The pending signal takes precedence
 over the pane's last `idle` or `working` activity status.
-`reply`, `blocked`, and `escalation` wakes use the durable wake outbox.
+`reply`, `blocked`, `escalation`, and `fact` wakes use the durable wake outbox.
 `reply` matches workflow notes and `kind=chat` messages addressed to the same
 role as `--wake`; non-triggering chat back-links such as `job_result` are
 excluded. Reply rows commit atomically with their source note or chat message.

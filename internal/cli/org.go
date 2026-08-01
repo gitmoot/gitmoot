@@ -118,6 +118,8 @@ func runOrg(args []string, stdout, stderr io.Writer) int {
 		return runOrgEscalate(args[1:], stdout, stderr)
 	case "directive":
 		return runOrgDirective(args[1:], stdout, stderr)
+	case "await":
+		return runOrgAwait(args[1:], stdout, stderr)
 	case "events":
 		return runOrgEvents(args[1:], stdout, stderr)
 	case "seat":
@@ -145,13 +147,15 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org directive send --to ROLE --workflow LABEL (--stdin | -F FILE | TEXT) [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org directive ack ID [--by ROLE] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org directive cancel ID [--by ROLE] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org await review --repo OWNER/REPO --pr NUMBER --head SHA --ttl DURATION [--role ROLE] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org await list [--role ROLE] [--state waiting|satisfied|expired] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org events rule add --on KIND [--match FILTER | --repo SUBSTRING] --wake ROLE [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org events rule list [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org events rule set-scope [--home DIR] ID observer|addressed")
 	fmt.Fprintln(w, "  gitmoot org events rule rm [--home DIR] ID")
 }
 
-var orgSeatDefaultRouteKinds = []string{"blocked", "directive", "escalation", "reply"}
+var orgSeatDefaultRouteKinds = []string{"blocked", "directive", "escalation", "fact", "reply"}
 
 const orgSeatExternalTimeout = 10 * time.Second
 
@@ -1769,6 +1773,7 @@ var eventRuleKinds = map[string]struct{}{
 	"pane_input_pending": {},
 	"reply":              {},
 	"directive":          {},
+	"fact":               {},
 }
 
 func runOrgEvents(args []string, stdout, stderr io.Writer) int {
@@ -1811,7 +1816,7 @@ func runOrgEventRuleAdd(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("org events rule add", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	onKind := fs.String("on", "", "event kind: escalation, attention, guard, job-terminal, blocked, recycle-overdue, pane_input_pending, reply, or directive")
+	onKind := fs.String("on", "", "event kind: escalation, attention, guard, job-terminal, blocked, recycle-overdue, pane_input_pending, reply, directive, or fact")
 	// V1 intentionally keeps matching simple and inspectable: one
 	// case-insensitive substring tested independently against repo and job id;
 	// an empty filter matches every event of the selected kind.
@@ -1845,7 +1850,7 @@ func runOrgEventRuleAdd(args []string, stdout, stderr io.Writer) int {
 	}
 	kind := strings.ToLower(strings.TrimSpace(*onKind))
 	if _, ok := eventRuleKinds[kind]; !ok {
-		fmt.Fprintf(stderr, "unknown event rule kind %q; want escalation, attention, guard, job-terminal, blocked, recycle-overdue, pane_input_pending, reply, or directive\n", kind)
+		fmt.Fprintf(stderr, "unknown event rule kind %q; want escalation, attention, guard, job-terminal, blocked, recycle-overdue, pane_input_pending, reply, directive, or fact\n", kind)
 		return 2
 	}
 	roleName := strings.ToLower(strings.TrimSpace(*wake))

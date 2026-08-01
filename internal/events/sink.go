@@ -70,6 +70,10 @@ const (
 	// EventOrgDirective is emitted for an addressed directive wake. It remains
 	// separate from conversational replies so routing and coalescing cannot mix.
 	EventOrgDirective EventType = "org.directive"
+	// EventOrgFact is emitted when a durable awaited fact is satisfied or its
+	// deadline expires. It is delivery-only: unlike a directive it creates no
+	// acknowledgement or completion obligation.
+	EventOrgFact EventType = "org.fact"
 
 	// EventCandidateAwaitingPromotion is emitted once when a SkillOpt template
 	// candidate becomes PENDING (the post-import notify, #471): a new pending

@@ -87,6 +87,7 @@ func TestClassifyEventRuleKinds(t *testing.T) {
 		{name: "pane input pending", event: events.Event{Type: events.EventOrgInputPending, Cause: "input_pending_since"}, want: []string{"pane_input_pending"}},
 		{name: "addressed reply", event: events.Event{Type: events.EventOrgReply, Cause: "addressed_note"}, want: []string{"reply"}},
 		{name: "addressed directive", event: events.Event{Type: events.EventOrgDirective, Cause: "addressed_directive"}, want: []string{"directive"}},
+		{name: "addressed awaited fact", event: events.Event{Type: events.EventOrgFact, Cause: "awaited_fact_satisfied"}, want: []string{"fact"}},
 		{name: "finished terminal", event: events.Event{Type: events.EventJobFinished}, want: []string{"job-terminal"}},
 		{name: "failed terminal", event: events.Event{Type: events.EventJobFailed, Cause: "unrelated"}, want: []string{"job-terminal"}},
 		{name: "plain blocked terminal and blocked", event: events.Event{Type: events.EventJobBlocked}, want: []string{"job-terminal", "blocked"}},
