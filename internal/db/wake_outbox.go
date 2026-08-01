@@ -168,6 +168,24 @@ func (s *Store) InsertWakeOutbox(
 	return tx.Commit()
 }
 
+// insertWakeOutboxTx writes one obligation row.
+//
+// INVARIANT ASYMMETRY, DOCUMENTED BECAUSE IT LOOKS LIKE AN INCONSISTENCY AND IS
+// NOT (#1352): DIRECTIVE ROWS KEY A PER-OBLIGATION STATE MACHINE — pending,
+// revivable from delivered — WHILE EVERY OTHER KIND KEYS AN EVENT.
+//
+// The table's implicit assumption is that source_id is event-unique, and every
+// other kind gets that free from serialized payloads. Directives alone carry a
+// LITERAL directive id, because the decoder (wakeOutboxEvent) renders source_id
+// straight into the command an operator reads back:
+// `gitmoot org directive ack <id>`. Storing a payload there instead produced
+// `ack {"schema_version":1,...}`.
+//
+// That literal id is STABLE ACROSS NAGS, so repeated nags are the SAME
+// obligation, not new ones — therefore REVIVE rather than insert. Do NOT "tidy"
+// the directive branch back to serialized payloads for uniformity: it would
+// restore uniqueness and silently recreate the malformed-command defect, which
+// cost three review rounds to find.
 func insertWakeOutboxTx(ctx context.Context, tx *sql.Tx, sourceKind, sourceID, wakeKind, targetRole string) error {
 	sourceKind = strings.TrimSpace(sourceKind)
 	if sourceKind == "" {
@@ -185,9 +203,35 @@ func insertWakeOutboxTx(ctx context.Context, tx *sql.Tx, sourceKind, sourceID, w
 	if err != nil {
 		return err
 	}
+	// #1352: UPSERT-REVIVE. (source_kind, source_id, target_role) IS THE
+	// OBLIGATION IDENTITY — that is what coalescing means — so a TTL nag is a
+	// RE-NOTIFICATION of a persisting obligation, not a new one. A plain INSERT
+	// made the initial directive wake and every later nag collide on UNIQUE.
+	//
+	// The three semantics, and each is deliberate:
+	//   - a DELIVERED row is REVIVED to pending: the obligation still stands and
+	//     needs saying again;
+	//   - an ALREADY-PENDING row is LEFT UNTOUCHED — there is nothing new to say,
+	//     which gives nag suppression for free (N nags -> ONE pending row);
+	//   - a SECOND ROW IS NEVER CREATED, so the row is shared obligation identity
+	//     rather than first-writer property.
+	//
+	// Safe because Emit (event_rule_sink.go) is the SINGLE production call site of
+	// InsertWakeOutbox: there are no divergent callers whose expectations these
+	// semantics could break. It also keeps the literal-id contract and UNIQUE both
+	// intact with no schema change.
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO wake_outbox(source_kind, source_id, target_role, coalesce_key)
-VALUES (?, ?, ?, ?)`,
+VALUES (?, ?, ?, ?)
+ON CONFLICT(source_kind, source_id, target_role) DO UPDATE SET
+	state = 'pending',
+	coalesce_key = excluded.coalesce_key,
+	attempt_count = 0,
+	last_error = '',
+	attempted_at = NULL,
+	finished_at = NULL,
+	updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE wake_outbox.state <> 'pending'`,
 		sourceKind,
 		sourceID,
 		role,

@@ -748,3 +748,90 @@ func TestDirectiveTTLSweepFallsBackToFullWindowOnCountError(t *testing.T) {
 		}
 	}
 }
+
+// #1352 — the NORMAL LIFECYCLE, which is the state production actually occupies
+// and the one the previous guard never entered. It started with NO original
+// directive row, so the initial-wake-then-nag collision could not appear.
+//
+// A COALESCED REPEAT IS A RE-ARM, NOT A VIOLATION: (source_kind, source_id,
+// target_role) is the obligation IDENTITY, so a TTL nag re-notifies a persisting
+// obligation rather than creating a new one.
+//
+// MUTANT: the pre-fix hard INSERT, which fails with
+// "UNIQUE constraint failed: wake_outbox.source_kind, wake_outbox.source_id,
+// wake_outbox.target_role".
+func TestDirectiveNagRevivesTheDeliveredWakeRowWithoutDuplicating(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.AddEventRule(ctx, db.EventRule{
+		ID: "probe-directive", OnKind: db.WakeOutboxKindDirective,
+		Scope: db.EventRuleScopeObserver, WakeRole: "owner", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sink := &eventRuleSink{store: store, home: home, wake: &fakeEventWake{}}
+
+	nag := func() events.Event {
+		e := events.NewEvent(
+			events.EventOrgDirective, "4242",
+			db.WakeOutboxSourceWorkflowNote+":4242", "gitmoot/gitmoot",
+			"overdue", "directive 4242 awaits completion", time.Now().UTC(),
+			workflow.RedactCommentText,
+		)
+		e.WakeTargetRole = "owner"
+		return e
+	}
+
+	// 1. The INITIAL directive wake — production always has this row.
+	sink.Emit(ctx, nag())
+	initial, err := store.ListWakeOutbox(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(initial) != 1 {
+		t.Fatalf("initial wake rows = %d, want 1", len(initial))
+	}
+
+	// 2. It gets DELIVERED.
+	if _, err := store.ClaimWakeOutbox(ctx, []int64{initial[0].ID}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishWakeOutbox(ctx, []int64{initial[0].ID}, db.WakeOutboxStateDelivered, "", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. A TTL nag fires against the SAME obligation. It must REVIVE, not reject.
+	sink.Emit(ctx, nag())
+	revived, err := store.ListWakeOutbox(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(revived) != 1 {
+		t.Fatalf("after the nag there are %d rows, want exactly 1 — the obligation identity must be shared, not duplicated", len(revived))
+	}
+	if revived[0].State != "pending" {
+		t.Fatalf("delivered row was not revived: state=%q, want pending", revived[0].State)
+	}
+
+	// 4. A SECOND nag while still pending changes nothing — nag suppression.
+	sink.Emit(ctx, nag())
+	after, err := store.ListWakeOutbox(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != 1 || after[0].State != "pending" {
+		t.Fatalf("second nag disturbed a pending obligation: rows=%d state=%q", len(after), after[0].State)
+	}
+}
