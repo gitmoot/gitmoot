@@ -568,3 +568,37 @@ func TestDirectiveNagOutboxShapeIsAcceptedByTheDrain(t *testing.T) {
 		t.Fatal("drain accepted source_kind=\"directive\"; this guard would not have caught the original defect")
 	}
 }
+
+// #1352 B1 — the polarity requirement checked BY QUERY, which is how it failed.
+// The previous round asserted the column was WRITTEN; the reviewer showed no
+// operator-facing reader consumes it, so an exhausted obligation was invisible
+// to the person who needs it. Comms builds threads from NOTES.
+//
+// THE MUTANT IS THE PREVIOUS BEHAVIOUR: stamp the column and write no marker.
+func TestDirectiveTTLExhaustionLeavesAnOperatorVisibleMarker(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, time.Minute, 2)
+	store := openDirectiveTTLStore(t, home)
+	defer store.Close()
+	note := seedDirectiveTTLNote(t, store, "will exhaust visibly", time.Minute, true)
+	acknowledgeDirectiveTTLNote(t, store, note)
+
+	base := time.Now().UTC().Add(10 * time.Minute)
+	for i := 0; i < 8; i++ {
+		if err := evaluateOrgDirectiveTTLs(ctx, store, &recordingSink{}, cfg, io.Discard, base.Add(time.Duration(i)*5*time.Minute), directiveTTLDependencies{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	notes, err := store.ListWorkflowNotes(ctx, note.WorkflowID, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range notes {
+		if parsed, _, ok := workflow.ParseOrgDirectiveExhaustedNote(n.Body); ok && parsed == note.ID {
+			return
+		}
+	}
+	t.Fatalf("exhaustion left no marker NOTE for directive %d: the column alone is invisible to Comms and to every operator-facing reader", note.ID)
+}

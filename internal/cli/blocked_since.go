@@ -399,6 +399,18 @@ func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.
 				if stamped, err := deps.markExhausted(ctx, store, item, now); err != nil {
 					writeLine(stdout, "org directive %d exhausted mark failed: %v", item.ID, err)
 				} else if stamped {
+					// #1352 B1: the COLUMN alone was invisible to operators — Comms
+					// builds threads from NOTES, so a column-only terminal state showed
+					// no thread at all. The marker is what makes exhaustion discoverable;
+					// the column stays for the evaluator's own reads.
+					if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+						WorkflowID: item.WorkflowID,
+						Author:     to,
+						Body:       workflow.FormatOrgDirectiveExhaustedNote(item.ID, to),
+						Repo:       item.Repo,
+					}); err != nil {
+						writeLine(stdout, "org directive %d exhausted marker note failed: %v", item.ID, err)
+					}
 					writeLine(stdout, "org directive %d %s ladder exhausted after %d nudges; obligation remains open and queryable", item.ID, phase, newCount)
 				}
 			}

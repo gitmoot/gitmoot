@@ -1287,13 +1287,12 @@ and never resets at acknowledgment, so one counter cannot bound both phases.
 Each phase caps at `directive_max_nudges`, emits **one** terminal escalation
 naming which obligation went unmet, and then stamps `directive_exhausted_at`.
 
-Exhaustion is terminal and is recorded on the directive row as
-`directive_exhausted_at`. **Scope of that visibility, stated precisely:** the
-stamp is exposed through the open-obligation listing the checker itself reads —
-it is queryable there, and the terminal escalation is emitted as an event — but
-it does **not** currently surface as a Comms thread, because Comms renders
-escalation *notes* and exhaustion writes a column. Do not rely on the Comms view
-to discover an exhausted obligation today.
+Exhaustion is terminal and leaves two records: `directive_exhausted_at` on the
+directive row for the evaluator's own reads, and an `[org:directive-exhausted ]`
+**marker note** in the directive's workflow journal. The marker is what makes the
+terminal state discoverable — ack, cancel and done are all marker notes, and the
+journal is what operator-facing readers consume, so a column-only terminal state
+would have been invisible to exactly the person who needs it.
 
 The stamp is **completion-phase only**. An acknowledgment ladder that exhausts
 does not terminate the directive: a late acknowledgment starts a fresh completion
