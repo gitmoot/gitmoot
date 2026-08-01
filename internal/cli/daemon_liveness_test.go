@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -99,7 +102,16 @@ func TestDaemonLivenessSweepDeadPIDFrozenLogFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	message := events[len(events)-1].Message
+	message := ""
+	for _, event := range events {
+		if event.Kind == jobRecoveryFailedEvent {
+			message = event.Message
+			break
+		}
+	}
+	if message == "" {
+		t.Fatalf("events = %+v, want terminal failed event", events)
+	}
 	for _, leg := range []string{"updated_at frozen", "job log byte-frozen", "runtime pid 4242 is dead"} {
 		if !strings.Contains(message, leg) {
 			t.Fatalf("failed event %q missing predicate leg %q", message, leg)
@@ -158,6 +170,155 @@ func TestDaemonLivenessSweepPIDReuseIsIndeterminate(t *testing.T) {
 	if len(events) != 1 || events[0].Kind != "job_liveness_identity_mismatch" || !strings.Contains(events[0].Message, "identity mismatch") {
 		t.Fatalf("identity mismatch events = %+v", events)
 	}
+}
+
+func TestDaemonLivenessSweepKillsRecordedProcessGroup(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "grandchild.pid")
+	cmd := exec.Command("sh", "-c", "sleep 300 & echo $! > "+pidFile+"; exit 0")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pgid := cmd.Process.Pid
+	defer func() {
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		_ = cmd.Wait()
+	}()
+
+	grandchild := waitForPIDFile(t, pidFile)
+	waitForProcessState(t, pgid, "Z")
+	identity := workflow.RuntimeProcessIdentity(pgid)
+	if identity == "" {
+		t.Fatal("group leader start-time identity is empty")
+	}
+
+	ctx, paths, store, now, quiet := livenessTestJob(t, "group-dead", pgid)
+	job, err := store.GetJob(ctx, "group-dead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload.RuntimePID = pgid
+	payload.RuntimePGID = pgid
+	payload.RuntimePIDStartTime = identity
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateJobPayload(ctx, job.ID, string(encoded)); err != nil {
+		t.Fatal(err)
+	}
+
+	runLivenessSamples(t, newDaemonLivenessSweep(), ctx, store, paths, now, quiet)
+	job, err = store.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.State != string(workflow.JobFailed) {
+		t.Fatalf("zombie-leader job state = %q, want failed", job.State)
+	}
+	waitForProcessGone(t, grandchild)
+}
+
+func TestDaemonLivenessSweepPGIDIdentityMismatchLeaksWithoutSignal(t *testing.T) {
+	cmd := exec.Command("sleep", "300")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pgid := cmd.Process.Pid
+	defer func() {
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		_ = cmd.Wait()
+	}()
+
+	ctx, paths, store, now, quiet := livenessTestJob(t, "pgid-reused", pgid)
+	sweep := newDaemonLivenessSweep()
+	sweep.probe = func(int, string) runtimePIDState { return runtimePIDDead }
+	runLivenessSamples(t, sweep, ctx, store, paths, now, quiet)
+
+	if err := syscall.Kill(pgid, 0); err != nil {
+		t.Fatalf("identity-mismatched group leader was signaled: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if state := runtimeProcessState(pgid); state == "" || state == "Z" {
+		t.Fatalf("identity-mismatched group leader state = %q, want live and unsignaled", state)
+	}
+	events, err := store.ListJobEvents(ctx, "pgid-reused")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range events {
+		if strings.Contains(event.Message, "pgid recycle suspected, orphans leaked") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("events = %+v, want pgid recycle suspected, orphans leaked", events)
+	}
+}
+
+func waitForPIDFile(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+			if parseErr == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("pid file %s was not written", path)
+	return 0
+}
+
+func waitForProcessState(t *testing.T, pid int, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+		if err == nil {
+			closeParen := strings.LastIndexByte(string(data), ')')
+			if closeParen >= 0 {
+				fields := strings.Fields(string(data[closeParen+1:]))
+				if len(fields) > 0 && fields[0] == want {
+					return
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("process %d did not reach state %s", pid, want)
+}
+
+func waitForProcessGone(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+		if os.IsNotExist(err) {
+			return
+		}
+		if err == nil {
+			closeParen := strings.LastIndexByte(string(data), ')')
+			if closeParen >= 0 {
+				fields := strings.Fields(string(data[closeParen+1:]))
+				if len(fields) > 0 && fields[0] == "Z" {
+					return
+				}
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("process %d survived process-group kill", pid)
 }
 
 func TestDaemonLivenessSweepLegacyNeedsDoubleQuietAndNoLease(t *testing.T) {

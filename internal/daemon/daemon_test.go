@@ -861,6 +861,96 @@ func TestPollOnceRetriesReadyToMergePullRequestWithoutHeadChange(t *testing.T) {
 	}
 }
 
+func TestPollOnceRetriesReadyToMergePullRequestDespiteConsecutiveChangedPolls(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-7",
+		RepoFullName: repo.FullName(),
+		GoalID:       "goal-1",
+		Title:        "Task 7",
+		State:        string(workflow.TaskReadyToMerge),
+		Branch:       "task-7",
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo.FullName(),
+		Number:       7,
+		URL:          "https://github.com/gitmoot/gitmoot/pull/7",
+		HeadBranch:   "task-7",
+		BaseBranch:   "main",
+		HeadSHA:      "current-head",
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+	payload, err := json.Marshal(workflow.JobPayload{
+		Repo:        repo.FullName(),
+		Branch:      "task-7",
+		PullRequest: 7,
+		HeadSHA:     "stale-head",
+		TaskID:      "task-7",
+		LeadAgent:   "lead",
+		Reviewers:   []string{"reviewer"},
+		ReviewRound: "review-1",
+		Result:      &workflow.AgentResult{Decision: "approved"},
+	})
+	if err != nil {
+		t.Fatalf("Marshal review payload returned error: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID:      "review-reviewer-task-7-review-1",
+		Agent:   "reviewer",
+		Type:    "review",
+		State:   string(workflow.JobSucceeded),
+		Payload: string(payload),
+	}, db.JobEvent{Kind: string(workflow.JobSucceeded), Message: "review completed on stale head"}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	pull := github.PullRequest{
+		Number:  7,
+		Title:   "Task 7",
+		State:   "open",
+		URL:     "https://github.com/gitmoot/gitmoot/pull/7",
+		HeadRef: "task-7",
+		BaseRef: "main",
+		HeadSHA: "current-head",
+	}
+	client := &fakeGitHub{
+		pulls:    []github.PullRequest{pull},
+		comments: map[int64][]github.IssueComment{7: {}},
+	}
+	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{Ready: true}}
+	engine := workflow.Engine{Store: store, MergeGate: gate}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+
+	for poll := 1; poll <= 2; poll++ {
+		changed, err := daemon.pullRequestChanged(ctx, pull, newReviewJobsMemo(store))
+		if err != nil {
+			t.Fatalf("poll %d pullRequestChanged returned error: %v", poll, err)
+		}
+		if !changed {
+			t.Fatalf("poll %d pullRequestChanged = false, want true from retained stale-head review", poll)
+		}
+		ready, err := daemon.pullRequestReadyToMerge(ctx, pull)
+		if err != nil {
+			t.Fatalf("poll %d pullRequestReadyToMerge returned error: %v", poll, err)
+		}
+		if !ready {
+			t.Fatalf("poll %d pullRequestReadyToMerge = false, want true", poll)
+		}
+		if err := daemon.PollOnce(ctx); err != nil {
+			t.Fatalf("poll %d PollOnce returned error: %v", poll, err)
+		}
+	}
+
+	if len(gate.requests) != 2 {
+		t.Fatalf("merge gate requests = %+v, want one for each changed poll", gate.requests)
+	}
+}
+
 func TestPollOnceDismissedEscalationDoesNotBlockEligibleMerge(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
