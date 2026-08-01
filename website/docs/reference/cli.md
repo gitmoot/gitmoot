@@ -1872,13 +1872,13 @@ twice the quiet threshold and no held runtime lease.
 On Linux, runtime commands start as the leader of a dedicated process group;
 the OnPID write persists that PID, its `/proc` start time, and the PGID before
 the runner waits. Context cancellation signals the whole group (TERM, then
-KILL), and the immediate child carries `PDEATHSIG=SIGKILL` so daemon death also
-reaps it. After a same-boot liveness verdict wins the `running` → `failed`
+KILL). After a same-boot liveness verdict wins the `running` → `failed`
 transition, cleanup signals the recorded negative PGID only when the current
 group leader still has the persisted start time. A mismatch sends no signal and
-records `pgid recycle suspected, orphans leaked`. A descendant that deliberately
-calls `setsid` escapes the recorded process group; reaping such escapees remains
-an explicit out-of-scope residual.
+records `pgid recycle suspected, orphans leaked`. Daemon death does not itself
+reap the process group. A descendant that deliberately calls `setsid` escapes
+the recorded process group; reaping such escapees remains an explicit
+out-of-scope residual.
 
 The staleness age leg is tunable via the
 `GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value

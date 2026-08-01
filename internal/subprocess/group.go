@@ -231,10 +231,7 @@ func RunGroupEnvStreamWithPID(ctx context.Context, dir string, extraEnv []string
 func newGroupCmd(ctx context.Context, dir string, command string, args []string) (*exec.Cmd, func()) {
 	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.Dir = dir
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid:   true,
-		Pdeathsig: syscall.SIGKILL,
-	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	var pgid int
 	cmd.Cancel = func() error {
