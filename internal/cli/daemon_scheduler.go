@@ -13,11 +13,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/transcript"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -42,11 +44,11 @@ const daemonRunningJobStaleFloor = 1 * time.Minute
 // this margin the lease would expire in the window [t0+jobTimeout,
 // t0+jobTimeout+teardown] while the worker is STILL ALIVE finishing — and
 // recoverExpiredRuntimeSessionLocks + DeleteExpiredResourceLocks (runtime:%
-// bypasses the not-running guard) would reap that live worker's lock and requeue
+// bypasses the not-running guard) would reap that live worker's lock and fail
 // its still-'running' owner, starting a SECOND worker on the dirty in-flight
 // worktree: the exact #536 clobber. With the grace a NORMALLY-terminating worker
 // always releases its lease before it expires; only a genuinely stuck/crashed
-// worker past jobTimeout+grace is reaped and requeued.
+// worker past jobTimeout+grace is reaped and failed with recovery evidence.
 const runtimeLeaseTeardownGrace = 2 * time.Minute
 
 const daemonJobCancelPollInterval = 250 * time.Millisecond
@@ -174,8 +176,8 @@ var staleFloorWarnOnce sync.Once
 // GITMOOT_STALE_RUNNING_AFTER, falling back to the default when unset, malformed,
 // non-positive, OR below daemonRunningJobStaleFloor. This is a CRASH BACKSTOP,
 // not a timeout: it bounds how long a job may sit 'running' with no lease
-// progress before the daemon assumes the worker crashed and requeues it. A
-// sub-floor value (e.g. 1s) would let the backstop requeue live workers — most
+// progress before the daemon checks whether the worker crashed and fails it. A
+// sub-floor value (e.g. 1s) would let the backstop fail live workers — most
 // dangerously for non-resumable runtimes that hold no lease — so it is rejected
 // with a one-time warning rather than honored (#560).
 func configuredDaemonRunningJobStaleAfter(stdout io.Writer) time.Duration {
@@ -209,9 +211,10 @@ func recoverExpiredRuntimeSessionLocks(ctx context.Context, store *db.Store, std
 // would otherwise keep the job "held" until it expired: the AC2 gap #536's lease
 // gate cannot close by itself).
 //
-// It requeues the foreign-boot running jobs (this covers non-resumable/shell jobs
-// too, which hold no lease at all) and reclaims the foreign-boot runtime-session
-// locks so a requeued resumable owner can re-acquire its session on re-dispatch.
+// It fails the foreign-boot running jobs (this covers non-resumable/shell jobs
+// too, which hold no lease at all) and reclaims their foreign-boot runtime-session
+// locks. Work consumed before a daemon restart is never silently run twice; an
+// operator can inspect the durable evidence and explicitly retry.
 // It is a STRICT no-op off Linux (BootID()=="") — preserving today's age/lease
 // behavior — and never touches a SAME-boot owner, so a live in-process worker is
 // never double-run (the #536 protection is untouched).
@@ -220,12 +223,18 @@ func recoverForeignBootRunners(ctx context.Context, store *db.Store, stdout io.W
 	if bootID == "" {
 		return nil
 	}
-	requeued, err := store.RequeueRunningJobsFromForeignBoot(ctx, bootID)
+	ids, err := store.ListRunningJobIDsFromForeignBoot(ctx, bootID)
 	if err != nil {
 		return err
 	}
-	for _, id := range requeued {
-		writeLine(stdout, "requeued running job %s claimed on a previous boot (host rebooted)", id)
+	for _, id := range ids {
+		job, err := store.GetJob(ctx, id)
+		if err != nil {
+			return err
+		}
+		if _, err := failRecoveredRunningJob(ctx, store, stdout, time.Now().UTC(), job, "daemon restart: runner belonged to a previous host boot"); err != nil {
+			return err
+		}
 	}
 	released, err := store.ReleaseRuntimeSessionLocksFromForeignBoot(ctx, bootID)
 	if err != nil {
@@ -254,7 +263,7 @@ func runForeignBootRecoveryOnce(ctx context.Context, store *db.Store, stdout io.
 
 // recoverExpiredRuntimeSessionLocksSkipping is recoverExpiredRuntimeSessionLocks
 // with an in-flight owner exclusion (#562): a lock whose owner job is currently
-// being run BY THIS PROCESS is neither requeued nor reaped even if its lease has
+// being run BY THIS PROCESS is neither failed nor reaped even if its lease has
 // expired — the owning goroutine is still alive (a ctx-deaf runtime overrunning
 // its timeout), and releasing its lock would let a second run of the same
 // session start beside it (the #536 hazard). A nil skip set is byte-identical
@@ -264,32 +273,40 @@ func recoverExpiredRuntimeSessionLocksSkipping(ctx context.Context, store *db.St
 	if err != nil {
 		return err
 	}
-	// Requeue owners BEFORE reaping the lock rows. An expired runtime lease means
+	// Fail owners BEFORE reaping the lock rows. An expired runtime lease means
 	// the job's real timeout + teardown grace has elapsed, so a still-'running'
 	// owner is genuinely stale (a normally-terminating worker releases its lock
 	// before the grace-padded lease expires — see runtimeLeaseTeardownGrace).
-	// Ordering requeue-then-delete keeps the two durable: if a mid-loop DB error
+	// Ordering fail-then-delete keeps the two durable: if a mid-loop DB error
 	// aborts the sweep, the un-processed locks are still expired and get retried
-	// next tick, instead of being deleted up front and losing the requeue signal
+	// next tick, instead of being deleted up front and losing the recovery signal
 	// (which would strand those owners as 'running' until the coarse 30m window).
-	// TransitionJobStateWithEvent is a no-op unless the owner is still 'running'.
-	for _, lock := range expiredRuntimeLocks {
-		if strings.TrimSpace(lock.OwnerJobID) == "" || skipOwners[lock.OwnerJobID] {
-			continue
-		}
-		recovered, err := store.TransitionJobStateWithEvent(ctx, lock.OwnerJobID, string(workflow.JobRunning), string(workflow.JobQueued), db.JobEvent{
-			JobID:   lock.OwnerJobID,
-			Kind:    string(workflow.JobQueued),
-			Message: "recovered running job after runtime session lock expired",
-		})
-		if err != nil {
-			return err
-		}
-		if recovered {
-			writeLine(stdout, "requeued running job %s after runtime session lock expired", lock.OwnerJobID)
+	preserveOwners := make(map[string]bool, len(skipOwners))
+	for owner, skip := range skipOwners {
+		if skip {
+			preserveOwners[owner] = true
 		}
 	}
-	deleted, err := store.DeleteExpiredResourceLocksExcludingOwners(ctx, now, sortedStringSetKeys(skipOwners))
+	for _, lock := range expiredRuntimeLocks {
+		owner := strings.TrimSpace(lock.OwnerJobID)
+		if owner == "" || skipOwners[owner] || strings.HasPrefix(owner, "session-") {
+			if owner != "" {
+				preserveOwners[owner] = true
+			}
+			continue
+		}
+		job, err := store.GetJob(ctx, owner)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return err
+		}
+		if _, err := failRecoveredRunningJob(ctx, store, stdout, now, job, "stale recovery: runtime session lock expired with no in-process worker"); err != nil {
+			return err
+		}
+	}
+	deleted, err := store.DeleteExpiredResourceLocksExcludingOwners(ctx, now, sortedStringSetKeys(preserveOwners))
 	if err != nil {
 		return err
 	}
@@ -431,13 +448,17 @@ func recoverRunningJobsBeforeForRepoSkipping(ctx context.Context, store *db.Stor
 		return err
 	}
 	for _, job := range jobs {
-		if skipJobs[job.ID] {
+		if skipJobs[job.ID] || isSessionRecordedJob(job) {
 			continue
 		}
 		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
 			continue
 		}
-		if err := recoverRunningJobIfLeaseExpired(ctx, store, stdout, now, job); err != nil {
+		fresh, err := store.GetJob(ctx, job.ID)
+		if err != nil {
+			return err
+		}
+		if err := recoverRunningJobIfLeaseExpired(ctx, store, stdout, now, fresh); err != nil {
 			return err
 		}
 	}
@@ -459,7 +480,7 @@ func recoverRunningJobIfLeaseExpired(ctx context.Context, store *db.Store, stdou
 	// restart (the lease survives in the DB) and immune to PID reuse. The trade-off:
 	// a genuinely-crashed worker whose daemon also died is recovered only once its
 	// lease expires (recoverExpiredRuntimeSessionLocks reclaims it, then a later
-	// tick requeues it) rather than at the 30m threshold — promptness traded for
+	// tick fails it) rather than at the 30m threshold — promptness traded for
 	// never failing live work, the unattended-reliability goal of #536.
 	leaseHeld, err := runtimeOwnerLeaseHeld(ctx, store, job.ID, now)
 	if err != nil {
@@ -468,18 +489,110 @@ func recoverRunningJobIfLeaseExpired(ctx context.Context, store *db.Store, stdou
 	if leaseHeld {
 		return nil
 	}
-	recovered, err := store.TransitionJobStateWithEvent(ctx, job.ID, string(workflow.JobRunning), string(workflow.JobQueued), db.JobEvent{
-		JobID:   job.ID,
-		Kind:    string(workflow.JobQueued),
-		Message: "recovered stale running job on daemon startup",
+	_, err = failRecoveredRunningJob(ctx, store, stdout, now, job, "daemon restart/stale recovery found no live runtime lease")
+	return err
+}
+
+const jobRecoveryFailedEvent = "job_recovery_failed"
+
+func isSessionRecordedJob(job db.Job) bool {
+	return job.ExternallyDriven || strings.HasPrefix(strings.TrimSpace(job.ID), "session-")
+}
+
+// failRecoveredRunningJob is the single terminal-write seam for daemon-owned
+// crash recovery. It preserves a bounded, redacted transcript tail and elapsed
+// time in both the payload and loud audit event, clears stale process identity,
+// releases locks, and refuses to touch externally recorded session jobs.
+func failRecoveredRunningJob(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time, job db.Job, cause string) (bool, error) {
+	if job.State != string(workflow.JobRunning) || isSessionRecordedJob(job) {
+		return false, nil
+	}
+	tail := recoveredJobLogTail(store, job.ID)
+	elapsed := recoveredJobElapsed(now, job)
+	cause = strings.TrimSpace(cause)
+	message := fmt.Sprintf("daemon recovery failed running job: cause=%s; elapsed=%s", cause, elapsed)
+	if tail != "" {
+		message += "\nlast log tail:\n" + tail
+	}
+
+	encoded := job.Payload
+	var payload workflow.JobPayload
+	if err := json.Unmarshal([]byte(job.Payload), &payload); err == nil {
+		payload.RuntimePID = 0
+		payload.RuntimePIDStartTime = ""
+		payload.RuntimePGID = 0
+		payload.FailureDiagnostics = &workflow.FailureDiagnostics{Phase: workflow.FailurePhaseRecovery, StderrTail: tail}
+		payload.Result = &workflow.AgentResult{
+			Decision: "failed", Summary: fmt.Sprintf("daemon recovery: %s (elapsed %s)", cause, elapsed),
+			Findings: []json.RawMessage{}, ChangesMade: []string{}, TestsRun: []string{}, Needs: []string{}, Delegations: []workflow.Delegation{},
+		}
+		if b, err := json.Marshal(payload); err == nil {
+			encoded = string(b)
+		}
+	}
+	transitioned, err := store.TransitionJobStatePayloadWithEvent(ctx, job.ID, string(workflow.JobRunning), string(workflow.JobFailed), encoded, db.JobEvent{
+		JobID: job.ID, Kind: jobRecoveryFailedEvent, Message: message,
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
-	if recovered {
-		writeLine(stdout, "requeued stale running job %s", job.ID)
+	if transitioned {
+		_, _ = store.DeleteResourceLocksByOwnerIfNotRunning(ctx, job.ID)
+		writeLine(stdout, "failed recovered running job %s: %s", job.ID, cause)
 	}
-	return nil
+	return transitioned, nil
+}
+
+func recoveredJobElapsed(now time.Time, job db.Job) string {
+	started := parseJobTimeMillis(job.UpdatedAt)
+	if started == 0 {
+		if parsed, err := time.Parse("2006-01-02 15:04:05 -0700 MST", strings.TrimSpace(job.UpdatedAt)); err == nil {
+			started = parsed.UnixMilli()
+		}
+	}
+	if started == 0 {
+		started = parseJobTimeMillis(job.CreatedAt)
+	}
+	if started == 0 {
+		return "unknown"
+	}
+	d := now.Sub(time.UnixMilli(started))
+	if d < 0 {
+		d = 0
+	}
+	return d.Round(time.Second).String()
+}
+
+func recoveredJobLogTail(store *db.Store, jobID string) string {
+	logsDir := filepath.Join(filepath.Dir(store.DatabasePath()), config.LogsDir)
+	f, err := os.Open(transcript.ResolveJobLogPath(logsDir, jobID))
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return ""
+	}
+	const scanBytes = 64 * 1024
+	start := info.Size() - scanBytes
+	if start < 0 {
+		start = 0
+	}
+	buf := make([]byte, info.Size()-start)
+	n, err := f.ReadAt(buf, start)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return ""
+	}
+	redacted := workflow.RedactCommentText(strings.TrimSpace(string(buf[:n])))
+	if len(redacted) <= workflow.MaxStderrTailBytes {
+		return redacted
+	}
+	cut := redacted[len(redacted)-workflow.MaxStderrTailBytes:]
+	for len(cut) > 0 && !utf8.RuneStart(cut[0]) {
+		cut = cut[1:]
+	}
+	return cut
 }
 
 // tickCandidates memoizes the four per-tick job-candidate GROUP BY queries

@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -169,27 +168,14 @@ func (s *daemonLivenessSweep) evaluate(ctx context.Context, store *db.Store, std
 
 	runtimePID := payload.RuntimePID
 	runtimeStart := payload.RuntimePIDStartTime
-	payload.RuntimePID = 0
-	payload.RuntimePIDStartTime = ""
-	payload.RuntimePGID = 0
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
 	processLeg := "legacy row has no runtime PID and holds no runtime lease"
 	if !legacy {
 		processLeg = fmt.Sprintf("runtime pid %d is dead (recorded starttime %s)", runtimePID, runtimeStart)
 	}
 	message := fmt.Sprintf("liveness predicate satisfied: updated_at frozen past %s; job log byte-frozen for %s across two samples; %s", staleAfter, requiredQuiet, processLeg)
-	transitioned, err := store.TransitionJobStatePayloadWithEvent(ctx, job.ID, string(workflow.JobRunning), string(workflow.JobFailed), string(encoded), db.JobEvent{
-		JobID: job.ID, Kind: string(workflow.JobFailed), Message: message,
-	})
+	_, err = failRecoveredRunningJob(ctx, store, stdout, now, job, message)
 	if err != nil {
 		return err
-	}
-	if transitioned {
-		_, _ = store.DeleteResourceLocksByOwnerIfNotRunning(ctx, job.ID)
-		writeLine(stdout, "failed stale running job %s: %s", job.ID, message)
 	}
 	s.forget(job.ID)
 	return nil

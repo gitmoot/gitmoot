@@ -265,6 +265,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	startDaemonZombieReaper(ctx, stdout)
 
 	// Off-by-default live-profiling listener (#1111). When --pprof-addr is set it
 	// serves net/http/pprof on a DEDICATED mux (never DefaultServeMux, so pprof can

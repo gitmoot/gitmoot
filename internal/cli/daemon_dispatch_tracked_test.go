@@ -240,9 +240,9 @@ func TestTrackedBarrierDefersToLivePoolPass(t *testing.T) {
 	tracker.drain(io.Discard, 5*time.Second)
 }
 
-// TestRecoverRunningJobsSkipsInFlightJobs pins the #562 self-requeue guard: a
+// TestRecoverRunningJobsSkipsInFlightJobs pins the #562 self-recovery guard: a
 // running job past the coarse stale window with NO runtime lease (e.g. a long
-// shell-runtime job) must NOT be requeued by its own daemon's recovery scan
+// shell-runtime job) must NOT be failed by its own daemon's recovery scan
 // while this process is still running it. Inline execution made that impossible
 // by construction; the tracked scan must skip in-flight IDs explicitly.
 func TestRecoverRunningJobsSkipsInFlightJobs(t *testing.T) {
@@ -264,10 +264,10 @@ func TestRecoverRunningJobsSkipsInFlightJobs(t *testing.T) {
 		t.Fatalf("GetJob: %v", err)
 	}
 	if job.State != string(workflow.JobRunning) {
-		t.Fatalf("in-flight job state = %q after recovery scan, want running (scan requeued live work)", job.State)
+		t.Fatalf("in-flight job state = %q after recovery scan, want running (scan failed live work)", job.State)
 	}
 
-	// Same scan without the skip (a genuinely crashed worker) -> requeued.
+	// Same scan without the skip (a genuinely crashed worker) -> failed.
 	if err := recoverRunningJobsBeforeForRepoSkipping(ctx, store, io.Discard, staleBy, staleBy, "owner/repo", "", nil); err != nil {
 		t.Fatalf("recoverRunningJobsBeforeForRepoSkipping(nil): %v", err)
 	}
@@ -275,14 +275,14 @@ func TestRecoverRunningJobsSkipsInFlightJobs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetJob: %v", err)
 	}
-	if job.State != string(workflow.JobQueued) {
-		t.Fatalf("stale job state = %q, want queued (crash recovery regressed)", job.State)
+	if job.State != string(workflow.JobFailed) {
+		t.Fatalf("stale job state = %q, want failed (crash recovery regressed)", job.State)
 	}
 }
 
 // TestExpiredRuntimeLockReaperSkipsInFlightOwners pins the companion guard: an
 // EXPIRED runtime-session lock whose owner is in flight in this process is
-// neither requeued nor reaped (its goroutine is alive; releasing the lock could
+// neither failed nor reaped (its goroutine is alive; releasing the lock could
 // double-run the session), while the same lock is recovered normally once the
 // owner is no longer in flight.
 func TestExpiredRuntimeLockReaperSkipsInFlightOwners(t *testing.T) {
@@ -310,18 +310,18 @@ func TestExpiredRuntimeLockReaperSkipsInFlightOwners(t *testing.T) {
 		t.Fatalf("recoverExpiredRuntimeSessionLocksSkipping: %v", err)
 	}
 	if job, _ := store.GetJob(ctx, "job-live"); job.State != string(workflow.JobRunning) {
-		t.Fatalf("in-flight owner state = %q, want running (reaper requeued live work)", job.State)
+		t.Fatalf("in-flight owner state = %q, want running (reaper failed live work)", job.State)
 	}
 	if _, err := store.GetResourceLock(ctx, "runtime:codex:session-live"); err != nil {
 		t.Fatalf("in-flight owner's lock was reaped: %v", err)
 	}
 
-	// Without the skip the normal recovery applies: owner requeued, lock reaped.
+	// Without the skip the normal recovery applies: owner failed, lock reaped.
 	if err := recoverExpiredRuntimeSessionLocksSkipping(ctx, store, io.Discard, now, nil); err != nil {
 		t.Fatalf("recoverExpiredRuntimeSessionLocksSkipping(nil): %v", err)
 	}
-	if job, _ := store.GetJob(ctx, "job-live"); job.State != string(workflow.JobQueued) {
-		t.Fatalf("stale owner state = %q, want queued", job.State)
+	if job, _ := store.GetJob(ctx, "job-live"); job.State != string(workflow.JobFailed) {
+		t.Fatalf("stale owner state = %q, want failed", job.State)
 	}
 	if _, err := store.GetResourceLock(ctx, "runtime:codex:session-live"); err == nil {
 		t.Fatalf("expired lock still present, want reaped")

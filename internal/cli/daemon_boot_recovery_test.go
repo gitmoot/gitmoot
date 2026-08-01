@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,12 +12,12 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// TestRecoverForeignBootRunnersRequeuesRebootedJobRegardlessOfLease is the AC2
+// TestRecoverForeignBootRunnersFailsRebootedJobRegardlessOfLease is the AC2
 // fix: after a reboot a running job whose runtime-session lease is still in the
 // future — the case #536's lease gate deliberately leaves "held" — must be
-// requeued immediately, and its stranded runtime lock reclaimed, because the boot
-// id proves the in-process worker died with the old boot.
-func TestRecoverForeignBootRunnersRequeuesRebootedJobRegardlessOfLease(t *testing.T) {
+// failed immediately with evidence, and its stranded runtime lock reclaimed,
+// because the boot id proves the in-process worker died with the old boot.
+func TestRecoverForeignBootRunnersFailsRebootedJobRegardlessOfLease(t *testing.T) {
 	if db.BootID() == "" {
 		t.Skip("kernel boot id unavailable on this platform")
 	}
@@ -51,11 +52,65 @@ func TestRecoverForeignBootRunnersRequeuesRebootedJobRegardlessOfLease(t *testin
 	if err != nil {
 		t.Fatalf("GetJob returned error: %v", err)
 	}
-	if job.State != string(workflow.JobQueued) {
-		t.Fatalf("job state = %q, want queued (rebooted job must recover regardless of lease)", job.State)
+	if job.State != string(workflow.JobFailed) {
+		t.Fatalf("job state = %q, want failed (rebooted job must settle regardless of lease)", job.State)
+	}
+	events, err := store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != jobRecoveryFailedEvent || !strings.Contains(last.Message, "previous host boot") {
+		t.Fatalf("recovery event = %+v, want loud previous-boot failure", last)
 	}
 	if _, err := store.GetResourceLock(ctx, "runtime:codex:reboot-session"); err == nil {
 		t.Fatal("prior-boot runtime lock was not reclaimed")
+	}
+}
+
+func TestDaemonRecoveryNeverTouchesSessionRecordedJobs(t *testing.T) {
+	if db.BootID() == "" {
+		t.Skip("kernel boot id unavailable on this platform")
+	}
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	id := "session-review-outside-daemon"
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: id, Agent: "audit", Action: "review", Repo: "owner/repo"})
+	if claimed, err := store.ClaimRunningJob(ctx, id, string(workflow.JobQueued), string(workflow.JobRunning), db.JobEvent{Kind: string(workflow.JobRunning)}, 1, "prior-boot"); err != nil || !claimed {
+		t.Fatalf("ClaimRunningJob claimed=%v err=%v", claimed, err)
+	}
+	now := time.Now().UTC()
+	backdateJobUpdatedAt(t, store.DatabasePath(), id, now.Add(-4*time.Hour))
+	if acquired, err := store.AcquireResourceLock(ctx, db.ResourceLock{
+		ResourceKey: "runtime:codex:session-recorded", OwnerJobID: id, OwnerToken: "tok", OwnerBootID: "prior-boot",
+		ExpiresAt: now.Add(-time.Hour).Format(time.RFC3339Nano),
+	}, now.Add(-2*time.Hour)); err != nil || !acquired {
+		t.Fatalf("AcquireResourceLock acquired=%v err=%v", acquired, err)
+	}
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: id, Kind: "job_kill_pending", Message: "deadline witness"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverForeignBootRunners(ctx, store, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverExpiredRuntimeSessionLocks(ctx, store, io.Discard, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverRunningJobsBeforeForRepo(ctx, store, io.Discard, now, now.Add(time.Second), "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverKillPendingJobs(ctx, store, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.GetJob(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.State != string(workflow.JobRunning) {
+		t.Fatalf("session-recorded job state = %q, want running", job.State)
+	}
+	if _, err := store.GetResourceLock(ctx, "runtime:codex:session-recorded"); err != nil {
+		t.Fatalf("session-recorded job lock was touched: %v", err)
 	}
 }
 

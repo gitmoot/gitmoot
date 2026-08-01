@@ -23,6 +23,7 @@ import (
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/transcript"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -3309,7 +3310,7 @@ func TestRunQueuedJobsSwallowsPostDeliveryBlockedWorkflow(t *testing.T) {
 	}
 }
 
-func TestRecoverRunningJobsRequeuesStaleRunningJobs(t *testing.T) {
+func TestRecoverRunningJobsFailsStaleRunningJobsWithEvidence(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-running", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
@@ -3318,6 +3319,14 @@ func TestRecoverRunningJobsRequeuesStaleRunningJobs(t *testing.T) {
 	}
 
 	now := time.Now().UTC()
+	backdateJobUpdatedAt(t, store.DatabasePath(), "job-running", now.Add(-2*time.Hour))
+	logPath := transcript.JobLogPath(filepath.Join(filepath.Dir(store.DatabasePath()), config.LogsDir), "job-running")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte("last runtime line before daemon restart\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := recoverRunningJobsBeforeForRepo(ctx, store, io.Discard, now, now.Add(time.Second), "", ""); err != nil {
 		t.Fatalf("recoverRunningJobsBeforeForRepo returned error: %v", err)
 	}
@@ -3326,15 +3335,28 @@ func TestRecoverRunningJobsRequeuesStaleRunningJobs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetJob returned error: %v", err)
 	}
-	if job.State != string(workflow.JobQueued) {
-		t.Fatalf("job state = %q, want queued", job.State)
+	if job.State != string(workflow.JobFailed) {
+		t.Fatalf("job state = %q, want failed", job.State)
+	}
+	var payload workflow.JobPayload
+	if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.FailureDiagnostics == nil || payload.FailureDiagnostics.Phase != workflow.FailurePhaseRecovery || !strings.Contains(payload.FailureDiagnostics.StderrTail, "last runtime line") {
+		t.Fatalf("failure diagnostics = %+v, want recovery phase with retained log tail", payload.FailureDiagnostics)
+	}
+	if payload.Result == nil || payload.Result.Decision != "failed" || !strings.Contains(payload.Result.Summary, "daemon restart") || !strings.Contains(payload.Result.Summary, "elapsed 2h") {
+		t.Fatalf("recovery result = %+v, want failed summary with cause and elapsed", payload.Result)
 	}
 	events, err := store.ListJobEvents(ctx, "job-running")
 	if err != nil {
 		t.Fatalf("ListJobEvents returned error: %v", err)
 	}
-	if !daemonWorkerHasEvent(events, string(workflow.JobQueued)) {
-		t.Fatalf("events = %+v, want queued recovery event", events)
+	last := events[len(events)-1]
+	for _, want := range []string{"daemon restart", "elapsed=2h", "last runtime line before daemon restart"} {
+		if last.Kind != "job_recovery_failed" || !strings.Contains(last.Message, want) {
+			t.Fatalf("recovery event = %+v, want kind job_recovery_failed containing %q", last, want)
+		}
 	}
 }
 
@@ -3386,7 +3408,7 @@ func TestDaemonLivenessAgeLegUsesConfiguredStaleWindow(t *testing.T) {
 	}
 }
 
-func TestRecoverExpiredRuntimeSessionLocksRequeuesOwnerBeforeGlobalStaleWindow(t *testing.T) {
+func TestRecoverExpiredRuntimeSessionLocksFailsOwnerBeforeGlobalStaleWindow(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-running", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1, JobTimeout: "10m"})
@@ -3425,8 +3447,8 @@ func TestRecoverExpiredRuntimeSessionLocksRequeuesOwnerBeforeGlobalStaleWindow(t
 	if err != nil {
 		t.Fatalf("GetJob after timeout returned error: %v", err)
 	}
-	if job.State != string(workflow.JobQueued) {
-		t.Fatalf("job state after job timeout = %q, want queued", job.State)
+	if job.State != string(workflow.JobFailed) {
+		t.Fatalf("job state after job timeout = %q, want failed", job.State)
 	}
 }
 
@@ -3597,7 +3619,7 @@ func TestRunDaemonWorkerTickBlockedTTLSweepsAgedBlockedJob(t *testing.T) {
 // TestRecoverRunningJobsHonorsLiveRuntimeLease is the #536 regression: a
 // long-running job (e.g. a 4h delegation) holds a runtime-session lock whose LEASE
 // reflects its real job timeout. The coarse `updated_at < before` staleness
-// threshold must NOT requeue such a job while its lease is unexpired — regardless
+// threshold must NOT fail such a job while its lease is unexpired — regardless
 // of the lock's owner PID. The lock records the gitmoot DAEMON's PID, not the
 // spawned runtime worker's, so on a daemon restart the recorded PID is the DEAD
 // prior daemon even while the reparented worker keeps running; keying recovery on
@@ -3605,7 +3627,7 @@ func TestRunDaemonWorkerTickBlockedTTLSweepsAgedBlockedJob(t *testing.T) {
 // has expired, or that holds no runtime lock at all, is still recovered.
 //
 // The "dead owner, unexpired lease" row is the daemon-restart scenario the recovery
-// is named for: it MUST stay running (a PID-liveness gate would wrongly requeue it
+// is named for: it MUST stay running (a PID-liveness gate would wrongly fail it
 // and fail the still-progressing worker — the original bug).
 func TestRecoverRunningJobsHonorsLiveRuntimeLease(t *testing.T) {
 	cases := []struct {
@@ -3617,9 +3639,9 @@ func TestRecoverRunningJobsHonorsLiveRuntimeLease(t *testing.T) {
 	}{
 		{name: "live owner unexpired lease stays running", acquireLock: true, ownerPID: int64(os.Getpid()), expiresIn: 4 * time.Hour, wantState: string(workflow.JobRunning)},
 		{name: "dead owner unexpired lease stays running (daemon restart)", acquireLock: true, ownerPID: 0, expiresIn: 4 * time.Hour, wantState: string(workflow.JobRunning)},
-		{name: "live owner expired lease recovers", acquireLock: true, ownerPID: int64(os.Getpid()), expiresIn: -time.Minute, wantState: string(workflow.JobQueued)},
-		{name: "dead owner expired lease recovers", acquireLock: true, ownerPID: 0, expiresIn: -time.Minute, wantState: string(workflow.JobQueued)},
-		{name: "no runtime lock recovers", acquireLock: false, wantState: string(workflow.JobQueued)},
+		{name: "live owner expired lease fails", acquireLock: true, ownerPID: int64(os.Getpid()), expiresIn: -time.Minute, wantState: string(workflow.JobFailed)},
+		{name: "dead owner expired lease fails", acquireLock: true, ownerPID: 0, expiresIn: -time.Minute, wantState: string(workflow.JobFailed)},
+		{name: "no runtime lock fails", acquireLock: false, wantState: string(workflow.JobFailed)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -3953,8 +3975,8 @@ func TestRecoverRunningJobsForRepoSkipsOtherRepos(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetJob job-b returned error: %v", err)
 	}
-	if jobA.State != string(workflow.JobQueued) {
-		t.Fatalf("job-a state = %q, want queued", jobA.State)
+	if jobA.State != string(workflow.JobFailed) {
+		t.Fatalf("job-a state = %q, want failed", jobA.State)
 	}
 	if jobB.State != string(workflow.JobRunning) {
 		t.Fatalf("job-b state = %q, want running", jobB.State)

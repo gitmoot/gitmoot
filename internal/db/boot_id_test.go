@@ -126,7 +126,7 @@ func TestClaimRunningJobStampsRunnerIdentity(t *testing.T) {
 	}
 }
 
-func TestRequeueRunningJobsFromForeignBoot(t *testing.T) {
+func TestListRunningJobIDsFromForeignBoot(t *testing.T) {
 	ctx := context.Background()
 	store := openBootTestStore(t)
 	// Three running jobs: one claimed on a foreign boot, one on the current boot,
@@ -145,12 +145,12 @@ func TestRequeueRunningJobsFromForeignBoot(t *testing.T) {
 		}
 	}
 
-	requeued, err := store.RequeueRunningJobsFromForeignBoot(ctx, "cur-boot")
+	foreign, err := store.ListRunningJobIDsFromForeignBoot(ctx, "cur-boot")
 	if err != nil {
-		t.Fatalf("RequeueRunningJobsFromForeignBoot returned error: %v", err)
+		t.Fatalf("ListRunningJobIDsFromForeignBoot returned error: %v", err)
 	}
-	if len(requeued) != 1 || requeued[0] != "job-foreign" {
-		t.Fatalf("requeued = %v, want [job-foreign]", requeued)
+	if len(foreign) != 1 || foreign[0] != "job-foreign" {
+		t.Fatalf("foreign = %v, want [job-foreign]", foreign)
 	}
 	assertState := func(id, want string) {
 		t.Helper()
@@ -162,31 +162,16 @@ func TestRequeueRunningJobsFromForeignBoot(t *testing.T) {
 			t.Fatalf("job %s state = %q, want %q", id, job.State, want)
 		}
 	}
-	assertState("job-foreign", "queued")
+	assertState("job-foreign", "running")
 	assertState("job-current", "running")
 	assertState("job-legacy", "running")
 
-	// The foreign-boot requeue must leave an audit event.
-	events, err := store.ListJobEvents(ctx, "job-foreign")
-	if err != nil {
-		t.Fatalf("ListJobEvents returned error: %v", err)
-	}
-	var sawQueued bool
-	for _, e := range events {
-		if e.Kind == "queued" && e.Message == "recovered running job claimed on a previous boot (host rebooted)" {
-			sawQueued = true
-		}
-	}
-	if !sawQueued {
-		t.Fatalf("events = %+v, want a previous-boot recovery event", events)
-	}
-
 	// An empty current boot id (non-Linux / unavailable) is a STRICT no-op: no job
 	// with a non-empty recorded boot is ever swept just because it differs from "".
-	if requeued, err := store.RequeueRunningJobsFromForeignBoot(ctx, ""); err != nil {
-		t.Fatalf("RequeueRunningJobsFromForeignBoot(\"\") returned error: %v", err)
-	} else if len(requeued) != 0 {
-		t.Fatalf("empty-boot requeue = %v, want none", requeued)
+	if foreign, err := store.ListRunningJobIDsFromForeignBoot(ctx, ""); err != nil {
+		t.Fatalf("ListRunningJobIDsFromForeignBoot(\"\") returned error: %v", err)
+	} else if len(foreign) != 0 {
+		t.Fatalf("empty-boot foreign jobs = %v, want none", foreign)
 	}
 	assertState("job-current", "running")
 }
