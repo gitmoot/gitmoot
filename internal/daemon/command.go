@@ -56,6 +56,10 @@ func prepareCommentCommandInput(body string) commentCommandInput {
 	input := commentCommandInput{lines: make([]commentCommandLine, 0, len(lines))}
 	var fence markdownFence
 	for _, line := range lines {
+		if isMarkdownIndentedCodeLine(line) {
+			input.lines = append(input.lines, commentCommandLine{})
+			continue
+		}
 		if fence.marker != 0 {
 			if isMarkdownFenceClose(line, fence) {
 				fence = markdownFence{}
@@ -76,6 +80,27 @@ func prepareCommentCommandInput(body string) commentCommandInput {
 		})
 	}
 	return input
+}
+
+// isMarkdownIndentedCodeLine recognizes CommonMark's older indented-code form.
+// Tabs advance to four-column stops, so a leading tab or spaces followed by a
+// tab can establish the same code indentation as four literal spaces.
+func isMarkdownIndentedCodeLine(line string) bool {
+	column := 0
+	for offset := 0; offset < len(line); offset++ {
+		switch line[offset] {
+		case ' ':
+			column++
+		case '\t':
+			column += 4 - column%4
+		default:
+			return false
+		}
+		if column >= 4 {
+			return true
+		}
+	}
+	return false
 }
 
 func parseCommentCommands(input commentCommandInput, parse func(string) (Command, bool)) []parsedCommentCommand {
