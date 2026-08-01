@@ -743,7 +743,7 @@ released best-effort. Manual and daemon transitions are audited as
 `task_dismissed_manual` and `task_dismissed_auto` in `gitmoot task events <id>`.
 
 Each repo poll reads a bounded oldest-first stale window and processes up to 20
-qualifying `implementing`/`blocked` tasks whose `updated_at` predates
+qualifying `implementing` tasks whose `updated_at` predates
 `[workflow].stale_task_ttl` (default `168h`; `"0"` disables the leg).
 `updated_at` is deliberately a conservative activity proxy, not proof of
 abandonment. A candidate is skipped for a live job, a same-repo open-PR branch,
@@ -752,6 +752,22 @@ mutation. A branchless candidate needs no remote lookup. Explicit `task
 recover` restores preserved artifacts through `implementing` to `pr_open`, or
 restores a branchless task to `planned`; job retry records its own recovery
 event. The server-side task board omits dismissed rows immediately.
+
+`blocked` and `awaiting_human_merge` use a separate evidence-based disposal
+ladder at that TTL: own PR merged -> `merged`; a later merged task/PR on the same
+referenced issue -> `superseded`; referenced issue/PR closed -> `superseded`;
+otherwise -> terminal `stranded`. Git ancestry is never evidence because a
+superseding branch need not be an ancestor of main. An open
+`awaiting_human_merge` PR stays protected and reaches `stranded` for human
+inspection. Every outcome records its tier and reason on the task; the stranded
+fallback writes at most one durable escalation, and an unavailable route is
+recorded without keeping the task alive. Query with `gitmoot task list --state
+stranded --json`.
+
+The periodic blocked-task alert is bounded independently: three
+interval-separated nudges, one terminal escalation, then no further alerts for
+that episode. Its persisted exhausted stamp does not dispose the task; disposal
+still requires the evidence ladder or its TTL fallback.
 
 Delegation worktrees use a separate default-on retention policy:
 `[workflow].delegation_worktree_ttl = "72h"` (`"0"` disables it). Only final

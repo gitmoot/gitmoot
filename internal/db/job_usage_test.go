@@ -163,17 +163,40 @@ CREATE TABLE repos (
 	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	PRIMARY KEY (owner, name)
 );
+-- A minimal tasks table at the pre-input_tokens shape. Its base and additive
+-- repo/worktree migrations are marked applied below, while the #1344 tail still
+-- needs the existing table and its index columns for the disposal ALTERs.
+CREATE TABLE tasks (
+	id TEXT PRIMARY KEY,
+	goal_id TEXT NOT NULL,
+	title TEXT NOT NULL,
+	state TEXT NOT NULL,
+	branch TEXT NOT NULL DEFAULT '',
+	repo_full_name TEXT NOT NULL DEFAULT '',
+	worktree_path TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 -- A minimal branch_locks table so the later #1250 acting_org_role ALTER ADD
 -- COLUMN that runs in this pass has its table; the real table was created by an
 -- earlier (here pre-seeded-as-applied) migration. NOTE for whoever appends the
 -- next migration: this fixture marks early migrations applied WITHOUT running
 -- them, so any tail migration that ALTERs an early-created table must add its
--- table here too — that is what the five entries above are.
+-- table here too.
 CREATE TABLE branch_locks (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	repo_full_name TEXT NOT NULL,
 	branch TEXT NOT NULL,
 	owner TEXT NOT NULL
+);
+-- A minimal org_blocked_episodes table at its base shape. That base migration
+-- is explicitly marked applied below so the #1344 tail exercises its ALTERs
+-- against a pre-existing table instead of trying to recreate it.
+CREATE TABLE org_blocked_episodes (
+	subject TEXT PRIMARY KEY,
+	blocked_since TEXT NOT NULL,
+	emitted_at TEXT,
+	updated_at TEXT NOT NULL
 );
 -- job_events as it existed at an earlier (here pre-seeded-as-applied) migration,
 -- so the #549 job_events index migration that runs in this pass has its table.
@@ -224,6 +247,7 @@ INSERT INTO jobs(id, agent, type, state, payload) VALUES ('old', 'w', 'ask', 'su
 	// new migrations never breaks this pin.
 	tokenMigrationVersion := -1
 	confirmedMemoryBaseVersion := -1
+	blockedEpisodesBaseVersion := -1
 	for i, m := range migrations {
 		if tokenMigrationVersion < 0 && strings.Contains(m, "input_tokens") {
 			tokenMigrationVersion = i + 1 // migration versions are 1-indexed
@@ -231,12 +255,18 @@ INSERT INTO jobs(id, agent, type, state, payload) VALUES ('old', 'w', 'ask', 'su
 		if strings.Contains(m, "CREATE TABLE confirmed_memories") {
 			confirmedMemoryBaseVersion = i + 1
 		}
+		if strings.Contains(m, "CREATE TABLE org_blocked_episodes") {
+			blockedEpisodesBaseVersion = i + 1
+		}
 	}
 	if tokenMigrationVersion < 1 {
 		t.Fatalf("could not locate the input_tokens migration")
 	}
 	if confirmedMemoryBaseVersion < 1 {
 		t.Fatalf("could not locate the confirmed-memory base migration")
+	}
+	if blockedEpisodesBaseVersion < 1 {
+		t.Fatalf("could not locate the org-blocked-episodes base migration")
 	}
 	for v := 1; v < tokenMigrationVersion; v++ {
 		if _, err := raw.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, 'seed')`, v); err != nil {
@@ -246,6 +276,11 @@ INSERT INTO jobs(id, agent, type, state, payload) VALUES ('old', 'w', 'ask', 'su
 	if confirmedMemoryBaseVersion >= tokenMigrationVersion {
 		if _, err := raw.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, 'seed')`, confirmedMemoryBaseVersion); err != nil {
 			t.Fatalf("seed confirmed-memory base migration v%d returned error: %v", confirmedMemoryBaseVersion, err)
+		}
+	}
+	if blockedEpisodesBaseVersion >= tokenMigrationVersion {
+		if _, err := raw.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, 'seed')`, blockedEpisodesBaseVersion); err != nil {
+			t.Fatalf("seed org-blocked-episodes base migration v%d returned error: %v", blockedEpisodesBaseVersion, err)
 		}
 	}
 	if err := raw.Close(); err != nil {

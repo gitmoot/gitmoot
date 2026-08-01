@@ -1922,4 +1922,21 @@ CREATE INDEX idx_awaited_facts_waiting_deadline
 	ON awaited_facts(deadline, id)
 	WHERE state = 'waiting';
 	`,
+	// #1344 evidence-based task disposal. The task columns keep the terminal
+	// outcome and notification-routing result queryable; the episode columns cap
+	// blocked alerts independently without disposing the task. Empty/zero defaults
+	// preserve every pre-migration row. Append-only tail; migrations are positional
+	// and this entry must never be inserted earlier in the slice.
+	`
+ALTER TABLE tasks ADD COLUMN disposal_tier TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN disposal_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN disposal_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN disposal_escalation_role TEXT NOT NULL DEFAULT '';
+ALTER TABLE org_blocked_episodes ADD COLUMN task_emit_count INTEGER NOT NULL DEFAULT 0
+	CHECK(task_emit_count >= 0);
+ALTER TABLE org_blocked_episodes ADD COLUMN task_exhausted_at TEXT NOT NULL DEFAULT '';
+CREATE INDEX idx_tasks_disposal_candidates
+	ON tasks(repo_full_name, state, updated_at, id)
+	WHERE state IN ('blocked', 'awaiting_human_merge');
+	`,
 }

@@ -116,10 +116,23 @@ first.
 `implementing` or `blocked` task. It refuses while a matching job or worktree
 process is live, preserves the branch and worktree, releases the branch lock
 best-effort, and records `task_dismissed_manual`. The daemon can record
-`task_dismissed_auto` for stale candidates using `updated_at` as a conservative
-activity proxy. Configure `[workflow].stale_task_ttl = "168h"` (the default), or
-set it to `"0"` to disable this poll leg. Candidates with a same-repo open PR,
-a remote branch, a live job, or an uncertain remote check are not dismissed.
+`task_dismissed_auto` for stale `implementing` candidates using `updated_at` as
+a conservative activity proxy. Configure `[workflow].stale_task_ttl = "168h"`
+(the default), or set it to `"0"` to disable this poll leg. Candidates with a
+same-repo open PR, a remote branch, a live job, or an uncertain remote check are
+not dismissed.
+
+The same TTL bounds `blocked` and `awaiting_human_merge` rows through a separate,
+evidence-based disposal pass. In order, an own merged PR produces `merged`; a
+later merged task or PR for the same referenced issue produces `superseded`; a
+closed referenced issue/PR produces `superseded`; and the bounded fallback is
+`stranded`. No tier uses git ancestry. An open `awaiting_human_merge` PR remains
+protected and falls to the visible `stranded` queue rather than being inferred
+complete. `task list --state stranded --json` exposes `disposal_tier`,
+`disposal_reason`, `disposed_at`, and the terminal escalation route.
+Separately, a continuous blocked episode emits at most three interval-spaced
+alerts plus one terminal escalation; alert exhaustion stays queryable and does
+not itself dispose the task.
 
 `task resume-work` is the coordinator-only, non-terminal exit from orphaned
 `reviewing`/`ready_to_merge` machinery back to `implementing`. It also supports

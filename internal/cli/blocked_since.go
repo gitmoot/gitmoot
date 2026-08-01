@@ -20,6 +20,10 @@ const (
 	blockedRoleWakeInterval    = time.Minute
 	blockedRoleSnapshotTimeout = 5 * time.Second
 	directiveTTLSweepLimit     = 200
+	// A blocked task gets a finite alert ladder independent of disposal. The
+	// third nudge also emits the one terminal escalation; the episode then stays
+	// queryable but silent until evidence disposal transitions the task itself.
+	blockedTaskMaxNudges = 3
 	// blockedEpisodeStaleGap bounds how long a role episode survives without being
 	// re-observed blocked. Within it, a transient unknown/absent snapshot blip is
 	// tolerated (the accrued blocked duration is preserved); beyond it the subject is
@@ -210,6 +214,7 @@ func evaluateBlockedTaskEpisodes(ctx context.Context, store *db.Store, sink even
 	}
 	taskPrefix := "task:" + strings.TrimSpace(repo) + ":"
 	var digestItems []blockedTaskDigestItem
+	var exhaustedItems []blockedTaskDigestItem
 	for _, episode := range episodes {
 		if !strings.HasPrefix(episode.Subject, taskPrefix) {
 			continue
@@ -227,6 +232,9 @@ func evaluateBlockedTaskEpisodes(ctx context.Context, store *db.Store, sink even
 		if !stale {
 			continue
 		}
+		if strings.TrimSpace(episode.TaskExhaustedAt) != "" {
+			continue
+		}
 		blockedSince, blockedFor, due, err := blockedEpisodeDue(episode, wakeAfter, now)
 		if err != nil {
 			writeLine(stdout, "blocked_since task %s emit failed: %v", taskID, err)
@@ -235,26 +243,32 @@ func evaluateBlockedTaskEpisodes(ctx context.Context, store *db.Store, sink even
 		if !due {
 			continue
 		}
-		if err := markBlockedEpisodeEmitted(ctx, store, episode, now); err != nil {
+		newCount, exhausted, err := store.MarkBlockedTaskEpisodeEmitted(ctx, episode.Subject,
+			episode.TaskEmitCount, blockedTaskMaxNudges, now)
+		if err != nil {
 			writeLine(stdout, "blocked_since task %s emit failed: %v", taskID, err)
 			continue
 		}
-		digestItems = append(digestItems, blockedTaskDigestItem{
+		if newCount == episode.TaskEmitCount {
+			continue
+		}
+		item := blockedTaskDigestItem{
 			taskID:       taskID,
 			blockedSince: blockedSince,
 			blockedFor:   blockedFor,
-		})
-	}
-	if len(digestItems) == 0 {
-		return nil
-	}
-	sort.Slice(digestItems, func(i, j int) bool {
-		if digestItems[i].blockedFor == digestItems[j].blockedFor {
-			return digestItems[i].taskID < digestItems[j].taskID
 		}
-		return digestItems[i].blockedFor > digestItems[j].blockedFor
-	})
-	events.EmitEvent(ctx, sink, buildBlockedTaskDigestEvent(repo, digestItems, now))
+		digestItems = append(digestItems, item)
+		if exhausted {
+			exhaustedItems = append(exhaustedItems, item)
+		}
+	}
+	if len(digestItems) > 0 {
+		sortBlockedTaskDigestItems(digestItems)
+		events.EmitEvent(ctx, sink, buildBlockedTaskDigestEvent(repo, digestItems, now))
+	}
+	for _, item := range exhaustedItems {
+		events.EmitEvent(ctx, sink, buildBlockedTaskAlertExhaustedEvent(repo, item, now))
+	}
 	return nil
 }
 
@@ -786,6 +800,15 @@ type blockedTaskDigestItem struct {
 	blockedFor   time.Duration
 }
 
+func sortBlockedTaskDigestItems(items []blockedTaskDigestItem) {
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].blockedFor == items[j].blockedFor {
+			return items[i].taskID < items[j].taskID
+		}
+		return items[i].blockedFor > items[j].blockedFor
+	})
+}
+
 func buildBlockedTaskDigestEvent(repo string, items []blockedTaskDigestItem, now time.Time) events.Event {
 	oldest := items[0]
 	suffix := ""
@@ -801,6 +824,15 @@ func buildBlockedTaskDigestEvent(repo string, items []blockedTaskDigestItem, now
 		len(items), oldest.blockedFor.Round(time.Second), oldest.blockedSince.UTC().Format(time.RFC3339), oldest.taskID, suffix)
 	ev := events.NewEvent(events.EventJobBlocked, oldest.taskID, oldest.taskID, repo, string(workflow.TaskBlocked), detail, now, workflow.RedactCommentText)
 	ev.Cause = "blocked_since"
+	return ev
+}
+
+func buildBlockedTaskAlertExhaustedEvent(repo string, item blockedTaskDigestItem, now time.Time) events.Event {
+	detail := fmt.Sprintf("task %s remains blocked after %d alerts over %s (since %s); alert ladder exhausted, task remains queryable pending evidence disposal",
+		item.taskID, blockedTaskMaxNudges, item.blockedFor.Round(time.Second), item.blockedSince.UTC().Format(time.RFC3339))
+	ev := events.NewEvent(events.EventJobNeedsAttention, item.taskID, item.taskID, repo,
+		string(workflow.TaskBlocked), detail, now, workflow.RedactCommentText)
+	ev.Cause = "escalation"
 	return ev
 }
 

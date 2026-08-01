@@ -52,6 +52,11 @@ var wakeTargetRoleProducers = []wakeTargetRoleProducer{
 		Function: "wakeOutboxEvent",
 		Kinds:    wakeOutboxDirectedKinds,
 	},
+	{
+		File:     "internal/daemon/task_disposal.go",
+		Function: "strandTask",
+		Kinds:    taskDisposalDirectedKinds,
+	},
 }
 
 func directiveNudgeDirectedKinds() []string {
@@ -68,6 +73,10 @@ func blockedWakeDirectedKinds() []string {
 
 func inputPendingDirectedKinds() []string {
 	return []string{"pane_input_pending"}
+}
+
+func taskDisposalDirectedKinds() []string {
+	return []string{db.WakeOutboxKindEscalation}
 }
 
 func wakeTargetRoleKinds() []string {
