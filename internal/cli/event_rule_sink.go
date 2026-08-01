@@ -84,11 +84,19 @@ func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
 			// unsupported wake kind. Derive-don't-restate: pass the kind, let the
 			// store build the key.
 			sourceKind := wakeKind
+			sourceID := string(payload)
 			if wakeKind == db.WakeOutboxKindDirective {
 				sourceKind = db.WakeOutboxSourceWorkflowNote
+				// #1352 F3: source_id must be the LITERAL DIRECTIVE ID. The decoder
+				// (wakeOutboxEvent) renders it straight into the operator's command —
+				// "directive id %s for %s" — so storing the serialized event here
+				// produced `gitmoot org directive ack {"schema_version":1,...}`
+				// instead of `... ack 4242`. The row inserted fine and the command it
+				// delivered was garbage: written correctly, read wrongly.
+				sourceID = strings.TrimSpace(event.JobID)
 			}
 			if err := s.store.InsertWakeOutbox(
-				ctx, sourceKind, string(payload), wakeKind, targetRoles,
+				ctx, sourceKind, sourceID, wakeKind, targetRoles,
 			); err != nil {
 				slog.Warn("durable wake outbox insert failed", "job_id", event.JobID, "kind", wakeKind, "error", err)
 				return

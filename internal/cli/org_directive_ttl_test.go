@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -685,10 +686,65 @@ func TestDirectiveNagInsertToDrainDelivers(t *testing.T) {
 		}
 	}
 
-	// DRAIN it. The defect surfaced here, not at insert.
+	// ASSERT WHAT ARRIVES. wakeOutboxEvent is the decoder that renders the row
+	// into the operator's command, so decoding the row the sink actually wrote is
+	// the READ side of this contract. An insertion-only check passed while the
+	// delivered command was garbage; this cannot.
+	batch := append(append([]db.WakeOutboxObligation{}, rows.Pending...), rows.AgedAttempted...)
+	decoded, err := wakeOutboxEvent(batch, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("decoder refused the row the sink wrote: %v", err)
+	}
+	if strings.Contains(decoded.Detail, "schema_version") || strings.Contains(decoded.Detail, "{") {
+		t.Fatalf("delivered command carries the SERIALIZED EVENT instead of the directive id: %q", decoded.Detail)
+	}
+	if !strings.Contains(decoded.Detail, "4242") {
+		t.Fatalf("delivered command does not name directive 4242: %q", decoded.Detail)
+	}
+
+	// And the drain must still accept it.
 	if err := drainReplyWakeOutbox(ctx, store, time.Now().UTC(), func(context.Context) (replyWakeDelivery, error) {
 		return replyWakeDelivery{sink: &recordingSink{}, rules: rules}, nil
 	}); err != nil && strings.Contains(err.Error(), "unsupported source kind") {
 		t.Fatalf("drain REFUSED the nag it was just handed: %v", err)
+	}
+
+}
+
+// #1352 F1 — the count-error FALLBACK, exercised rather than assumed. Changing
+// sweepWindow's fallback from 200 to 1 previously left all 17 directive tests
+// green: nothing drove the error path, so a regression could silently evaluate a
+// single obligation after a count failure.
+//
+// THE MUTANT IS A DEGRADED FALLBACK (return 1). This forces the count to fail and
+// requires the sweep to still evaluate the whole population.
+func TestDirectiveTTLSweepFallsBackToFullWindowOnCountError(t *testing.T) {
+	home := t.TempDir()
+	cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, 0, 3)
+	store := openDirectiveTTLStore(t, home)
+	defer store.Close()
+	var seeded []int64
+	for i := 0; i < 5; i++ {
+		seeded = append(seeded, seedDirectiveTTLNote(t, store, fmt.Sprintf("row %d", i), 0, false).ID)
+	}
+	sink := &recordingSink{}
+
+	deps := directiveTTLDependencies{
+		countOpen: func(ctx context.Context, s *db.Store) (int, error) {
+			return 0, errors.New("count failed")
+		},
+	}
+	if err := evaluateOrgDirectiveTTLs(context.Background(), store, sink, cfg, io.Discard, time.Now().UTC().Add(20*time.Minute), deps); err != nil {
+		t.Fatal(err)
+	}
+
+	woken := map[string]bool{}
+	for _, w := range sink.byType(events.EventOrgDirective) {
+		woken[w.JobID] = true
+	}
+	for _, id := range seeded {
+		if !woken[fmt.Sprint(id)] {
+			t.Fatalf("directive %d was not evaluated after a count error: the fallback window is degraded, not full (woken=%d of %d)", id, len(woken), len(seeded))
+		}
 	}
 }
