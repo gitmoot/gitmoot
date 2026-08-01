@@ -24,8 +24,9 @@ A bare `@<agent>` mention works as the same command (#389):
 Mentions are also routed on **issue** comments when the daemon runs with
 `--watch-issues` (on issues only the `ask` action is acted on).
 
-Before parsing, Gitmoot removes triple-backtick and tilde fenced code blocks and
-closed inline backtick spans (including single-backtick spans). GitHub must then
+Before parsing, Gitmoot removes triple-backtick and tilde fenced code blocks,
+four-space/tab-indented code blocks, and closed inline backtick spans (including
+single-backtick spans). GitHub must then
 report that the comment author currently has `write`, `maintain`, or `admin`
 repository permission; unauthorized addressed commands are rejected without
 parsing their command text. Ordinary prose and code examples produce no reply.

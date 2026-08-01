@@ -1840,8 +1840,9 @@ retry|continue|abort|answer` resumes a delegation tree paused by
 `references/RESULT_CONTRACT.md` for the pause/resume semantics (`answer` is
 PR-comment-only).
 
-Before parsing, Gitmoot removes triple-backtick and tilde fenced code blocks and
-closed inline backtick spans (including single-backtick spans). GitHub must then
+Before parsing, Gitmoot removes triple-backtick and tilde fenced code blocks,
+four-space/tab-indented code blocks, and closed inline backtick spans (including
+single-backtick spans). GitHub must then
 report that the comment author currently has `write`, `maintain`, or `admin`
 repository permission; unauthorized addressed commands are rejected without
 parsing their command text. Ordinary prose and code examples produce no reply.
