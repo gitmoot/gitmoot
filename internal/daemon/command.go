@@ -267,11 +267,20 @@ func ParseCommand(line string) (Command, bool) {
 	}
 }
 
+// ErrUnsupportedAction reports a line that parsed structurally as an addressed
+// command but names an action Gitmoot does not implement. Ordinary source code
+// reaches this path routinely: a decorator or attribute line such as
+// `@Published private(set) var state = .uninitialized` parses as the mention
+// form `@<agent> <action>`, yielding the action "private(set)". Callers must
+// log it and stay silent rather than reply on the thread — replying posts
+// Gitmoot's parser errors onto unrelated repositories (#1355).
+var ErrUnsupportedAction = errors.New("unsupported command action")
+
 func (c Command) Validate() error {
 	switch c.Action {
 	case "review", "implement", "ask", "status", "merge", "retry", "cancel", "help", "resume":
 	default:
-		return fmt.Errorf("unsupported command action %q", c.Action)
+		return fmt.Errorf("%w %q", ErrUnsupportedAction, c.Action)
 	}
 	if (c.Action == "retry" || c.Action == "cancel" || c.Action == "resume") && c.JobID == "" {
 		return fmt.Errorf("command %q requires a job id", c.Action)
