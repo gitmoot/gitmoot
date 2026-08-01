@@ -29,6 +29,12 @@ running job whose directly recorded runtime PID is confirmably dead is a
 required `stuck jobs` failure; legacy jobs with no recorded PID and hosts where
 process identity cannot be verified are neutral and produce no ghost-job
 finding.
+For organization roles with an effective `recycle_after`, doctor also reads the
+durable `org_role_presence.last_seen_at` signal. It warns when a specific role
+has never been observed or has been inactive past that bound; an unreadable,
+malformed, or future timestamp is reported as **unverified**, never healthy.
+This deterministic absence check does not enqueue an agent job and is separate
+from `gitmoot agent heartbeat`, whose configured schedules do enqueue jobs.
 It also reports the SQLite auto-vacuum mode. New homes use bounded incremental
 reclaim automatically. A legacy home remains a non-blocking warning until an
 operator deliberately converts it during an idle maintenance window:

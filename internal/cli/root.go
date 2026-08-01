@@ -194,6 +194,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	if check, ok := eventObserverDoctorCheck(paths); ok {
 		checks = append(checks, check)
 	}
+	if check, ok := orgRoleActivityDoctorCheck(paths); ok {
+		checks = append(checks, check)
+	}
 	checks = append(checks, repoCheckoutDoctorChecks(paths)...)
 	if *jsonOutput {
 		type checkJSON struct {
