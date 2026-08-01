@@ -20,9 +20,11 @@ const BlockedEpisodeTimeLayout = "2006-01-02T15:04:05.000000000Z"
 // interval while the condition persists (self-healing against a dropped wake)
 // rather than firing a single durable one-shot.
 type BlockedEpisode struct {
-	Subject      string `json:"subject"`
-	BlockedSince string `json:"blocked_since"`
-	EmittedAt    string `json:"emitted_at,omitempty"`
+	Subject         string `json:"subject"`
+	BlockedSince    string `json:"blocked_since"`
+	EmittedAt       string `json:"emitted_at,omitempty"`
+	TaskEmitCount   int    `json:"task_emit_count,omitempty"`
+	TaskExhaustedAt string `json:"task_exhausted_at,omitempty"`
 	// UpdatedAt is the last instant the subject matched its condition (refreshed on
 	// every UpsertBlockedEpisode). The role evaluator reaps an episode whose
 	// UpdatedAt has gone stale — the subject stopped matching — which
@@ -59,6 +61,31 @@ func (s *Store) MarkBlockedEpisodeEmitted(ctx context.Context, subject string, a
 	return err
 }
 
+// MarkBlockedTaskEpisodeEmitted advances the finite alert ladder for a task
+// episode. The count and exhaustion stamp are durable so daemon restarts cannot
+// reset the ladder. A previously exhausted or concurrently changed row is an
+// idempotent no-op.
+func (s *Store) MarkBlockedTaskEpisodeEmitted(ctx context.Context, subject string, expectedCount, maxEmits int, at time.Time) (int, bool, error) {
+	if maxEmits <= 0 {
+		return expectedCount, false, errors.New("blocked task max emits must be positive")
+	}
+	stamp := at.UTC().Format(BlockedEpisodeTimeLayout)
+	result, err := s.db.ExecContext(ctx, `UPDATE org_blocked_episodes
+		SET emitted_at = ?, updated_at = ?, task_emit_count = task_emit_count + 1,
+			task_exhausted_at = CASE WHEN task_emit_count + 1 >= ? THEN ? ELSE task_exhausted_at END
+		WHERE subject = ? AND task_emit_count = ? AND task_exhausted_at = ''`,
+		stamp, stamp, maxEmits, stamp, strings.TrimSpace(subject), expectedCount)
+	if err != nil {
+		return expectedCount, false, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed == 0 {
+		return expectedCount, false, err
+	}
+	newCount := expectedCount + 1
+	return newCount, newCount >= maxEmits, nil
+}
+
 // ClearBlockedEpisode closes a blocked episode. Deleting a missing row is an
 // idempotent no-op.
 func (s *Store) ClearBlockedEpisode(ctx context.Context, subject string) error {
@@ -68,7 +95,8 @@ func (s *Store) ClearBlockedEpisode(ctx context.Context, subject string) error {
 
 // ListBlockedEpisodes returns every open episode in stable subject order.
 func (s *Store) ListBlockedEpisodes(ctx context.Context) ([]BlockedEpisode, error) {
-	return s.queryBlockedEpisodes(ctx, `SELECT subject, blocked_since, COALESCE(emitted_at, ''), updated_at
+	return s.queryBlockedEpisodes(ctx, `SELECT subject, blocked_since, COALESCE(emitted_at, ''),
+			task_emit_count, task_exhausted_at, updated_at
 		FROM org_blocked_episodes ORDER BY subject`)
 }
 
@@ -81,7 +109,8 @@ func (s *Store) queryBlockedEpisodes(ctx context.Context, query string, args ...
 	result := []BlockedEpisode{}
 	for rows.Next() {
 		var episode BlockedEpisode
-		if err := rows.Scan(&episode.Subject, &episode.BlockedSince, &episode.EmittedAt, &episode.UpdatedAt); err != nil {
+		if err := rows.Scan(&episode.Subject, &episode.BlockedSince, &episode.EmittedAt,
+			&episode.TaskEmitCount, &episode.TaskExhaustedAt, &episode.UpdatedAt); err != nil {
 			return nil, err
 		}
 		result = append(result, episode)

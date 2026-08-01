@@ -749,10 +749,23 @@ first.
 `implementing` or `blocked` task. It refuses while a matching job or worktree
 process is live, preserves the branch and worktree, releases the branch lock
 best-effort, and records `task_dismissed_manual`. The daemon can record
-`task_dismissed_auto` for stale candidates using `updated_at` as a conservative
-activity proxy. Configure `[workflow].stale_task_ttl = "168h"` (the default), or
-set it to `"0"` to disable this poll leg. Candidates with a same-repo open PR,
-a remote branch, a live job, or an uncertain remote check are not dismissed.
+`task_dismissed_auto` for stale `implementing` candidates using `updated_at` as
+a conservative activity proxy. Configure `[workflow].stale_task_ttl = "168h"`
+(the default), or set it to `"0"` to disable this poll leg. Candidates with a
+same-repo open PR, a remote branch, a live job, or an uncertain remote check are
+not dismissed.
+
+The same TTL bounds `blocked` and `awaiting_human_merge` rows through a separate,
+evidence-based disposal pass. In order, an own merged PR produces `merged`; a
+later merged task or PR for the same referenced issue produces `superseded`; a
+closed referenced issue/PR produces `superseded`; and the bounded fallback is
+`stranded`. No tier uses git ancestry. An open `awaiting_human_merge` PR remains
+protected and falls to the visible `stranded` queue rather than being inferred
+complete. `task list --state stranded --json` exposes `disposal_tier`,
+`disposal_reason`, `disposed_at`, and the terminal escalation route.
+Separately, a continuous blocked episode emits at most three interval-spaced
+alerts plus one terminal escalation; alert exhaustion stays queryable and does
+not itself dispose the task.
 
 `task resume-work` is the coordinator-only, non-terminal exit from orphaned
 `reviewing`/`ready_to_merge` machinery back to `implementing`. It also supports
@@ -11551,6 +11564,7 @@ Start a task in its dedicated branch worktree and inspect task state:
 gitmoot task run task-001 --repo owner/repo --owner lead --base main
 gitmoot task list --repo owner/repo
 gitmoot task list --repo owner/repo --state implementing --json
+gitmoot task list --repo owner/repo --state stranded --json
 gitmoot task dismiss task-001 --reason "abandoned experiment"
 gitmoot task resume-work task-001 --reason "review requires another fix pass"
 gitmoot task resume-work task-001 --reason "withdraw pending merge" --override-pending-human-decision
@@ -11569,6 +11583,16 @@ the task worktree also blocks dismissal. The default reason is `dismissed by
 operator`. Success preserves the branch and worktree, releases the branch lock
 best-effort, and appends `task_dismissed_manual` to `task events`. Repeating the
 command is an exit-0 no-op with `changed:false` in JSON.
+
+Past `[workflow].stale_task_ttl`, blocked tasks are disposed by forge evidence:
+own merged PR (`merged`), later merged work on the same referenced issue
+(`superseded`), closed subject (`superseded`), then the bounded `stranded`
+fallback. The JSON list includes `disposal_tier`, `disposal_reason`,
+`disposed_at`, and `disposal_escalation_role`. The pass never uses branch
+ancestry, and an open `awaiting_human_merge` PR is not inferred complete.
+Blocked-task alerts have their own finite ladder: after three interval-spaced
+nudges Gitmoot emits one terminal escalation and stops nagging. The task remains
+queryable until the separate evidence-disposal pass transitions it.
 
 `task resume-work` is the explicit coordinator-only path for taking an orphaned
 `reviewing` or `ready_to_merge` task back into development, or for withdrawing a
@@ -11685,7 +11709,26 @@ retry|continue|abort|answer` resumes a delegation tree paused by
 PR-comment-only).
 
 Before parsing, Gitmoot removes triple-backtick and tilde fenced code blocks and
-closed inline backtick spans (including single-backtick spans). GitHub must then
+closed inline backtick spans (including single-backtick spans).
+
+**Symptom: my command in a bulleted list did nothing.** Any command line
+indented by four spaces or a tab is treated as code and will not run, including
+list-item continuation under a bullet or numbered item. For example, this
+command is ignored:
+
+```text
+- Please run:
+
+    @helper ask check the build
+```
+
+Put the command at column zero to run it:
+
+```text
+@helper ask check the build
+```
+
+GitHub must then
 report that the comment author currently has `write`, `maintain`, or `admin`
 repository permission; unauthorized addressed commands are rejected without
 parsing their command text. Ordinary prose and code examples produce no reply.
@@ -14707,7 +14750,7 @@ released best-effort. Manual and daemon transitions are audited as
 `task_dismissed_manual` and `task_dismissed_auto` in `gitmoot task events <id>`.
 
 Each repo poll reads a bounded oldest-first stale window and processes up to 20
-qualifying `implementing`/`blocked` tasks whose `updated_at` predates
+qualifying `implementing` tasks whose `updated_at` predates
 `[workflow].stale_task_ttl` (default `168h`; `"0"` disables the leg).
 `updated_at` is deliberately a conservative activity proxy, not proof of
 abandonment. A candidate is skipped for a live job, a same-repo open-PR branch,
@@ -14716,6 +14759,22 @@ mutation. A branchless candidate needs no remote lookup. Explicit `task
 recover` restores preserved artifacts through `implementing` to `pr_open`, or
 restores a branchless task to `planned`; job retry records its own recovery
 event. The server-side task board omits dismissed rows immediately.
+
+`blocked` and `awaiting_human_merge` use a separate evidence-based disposal
+ladder at that TTL: own PR merged -> `merged`; a later merged task/PR on the same
+referenced issue -> `superseded`; referenced issue/PR closed -> `superseded`;
+otherwise -> terminal `stranded`. Git ancestry is never evidence because a
+superseding branch need not be an ancestor of main. An open
+`awaiting_human_merge` PR stays protected and reaches `stranded` for human
+inspection. Every outcome records its tier and reason on the task; the stranded
+fallback writes at most one durable escalation, and an unavailable route is
+recorded without keeping the task alive. Query with `gitmoot task list --state
+stranded --json`.
+
+The periodic blocked-task alert is bounded independently: three
+interval-separated nudges, one terminal escalation, then no further alerts for
+that episode. Its persisted exhausted stamp does not dispose the task; disposal
+still requires the evidence ladder or its TTL fallback.
 
 Delegation worktrees use a separate default-on retention policy:
 `[workflow].delegation_worktree_ttl = "72h"` (`"0"` disables it). Only final

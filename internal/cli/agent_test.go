@@ -861,11 +861,12 @@ func TestPrepareLocalReviewDispatchRequestDoesNotReuseStaleReviewWorktree(t *tes
 	}
 }
 
-func TestPrepareLocalReviewWorktreeRejectsDismissedTask(t *testing.T) {
+func TestPrepareLocalReviewWorktreeRejectsDisposedTask(t *testing.T) {
 	for _, test := range []struct {
 		name       string
 		task       db.Task
 		setRequest func(*localAgentDispatchRequest)
+		wantError  []string
 	}{
 		{
 			name: "matching head worktree",
@@ -873,6 +874,7 @@ func TestPrepareLocalReviewWorktreeRejectsDismissedTask(t *testing.T) {
 			setRequest: func(request *localAgentDispatchRequest) {
 				request.Branch = "feature/review"
 			},
+			wantError: []string{"is dismissed", "task recover"},
 		},
 		{
 			name: "requested task upsert",
@@ -880,6 +882,23 @@ func TestPrepareLocalReviewWorktreeRejectsDismissedTask(t *testing.T) {
 			setRequest: func(request *localAgentDispatchRequest) {
 				request.TaskID = "dismissed-by-id"
 			},
+			wantError: []string{"is dismissed", "task recover"},
+		},
+		{
+			name: "superseded matching branch",
+			task: db.Task{ID: "superseded-by-branch", RepoFullName: "owner/repo", State: string(workflow.TaskSuperseded), Branch: "feature/review"},
+			setRequest: func(request *localAgentDispatchRequest) {
+				request.Branch = "feature/review"
+			},
+			wantError: []string{"is superseded", "successor task"},
+		},
+		{
+			name: "stranded requested task",
+			task: db.Task{ID: "stranded-by-id", RepoFullName: "owner/repo", State: string(workflow.TaskStranded)},
+			setRequest: func(request *localAgentDispatchRequest) {
+				request.TaskID = "stranded-by-id"
+			},
+			wantError: []string{"is stranded", "successor task"},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -907,11 +926,16 @@ func TestPrepareLocalReviewWorktreeRejectsDismissedTask(t *testing.T) {
 			_, _, err = prepareLocalReviewWorktree(ctx, store,
 				db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir},
 				github.Repository{Owner: "owner", Name: "repo"}, request)
-			if err == nil || !strings.Contains(err.Error(), "task "+test.task.ID+" is dismissed") || !strings.Contains(err.Error(), "task recover") {
+			if err == nil || !strings.Contains(err.Error(), "task "+test.task.ID) {
 				t.Fatalf("prepareLocalReviewWorktree error = %v", err)
 			}
+			for _, fragment := range test.wantError {
+				if !strings.Contains(err.Error(), fragment) {
+					t.Fatalf("prepareLocalReviewWorktree error = %v, want fragment %q", err, fragment)
+				}
+			}
 			stored, getErr := store.GetTask(ctx, test.task.ID)
-			if getErr != nil || stored.State != string(workflow.TaskDismissed) {
+			if getErr != nil || stored.State != test.task.State {
 				t.Fatalf("stored task=%+v err=%v", stored, getErr)
 			}
 		})

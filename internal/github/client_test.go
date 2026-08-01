@@ -402,6 +402,24 @@ func TestListIssuesFiltersOutPullRequests(t *testing.T) {
 	runner.wantArgs(t, 0, "api", "-i", "-X", "GET", "repos/gitmoot/gitmoot/issues", "-f", "state=open", "-f", "per_page=100")
 }
 
+func TestGetIssueReturnsCanonicalIssueAndRejectsPullRequest(t *testing.T) {
+	repo := Repository{Owner: "gitmoot", Name: "gitmoot"}
+	t.Run("issue", func(t *testing.T) {
+		runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"number":42,"title":"Task disposal","state":"closed","html_url":"https://github.com/gitmoot/gitmoot/issues/42"}`}}}
+		issue, err := (&GhClient{Runner: runner}).GetIssue(context.Background(), repo, 42)
+		if err != nil || issue.Number != 42 || issue.State != "closed" || issue.IsPullRequest {
+			t.Fatalf("GetIssue = %+v, err=%v", issue, err)
+		}
+		runner.wantArgs(t, 0, "api", "repos/gitmoot/gitmoot/issues/42")
+	})
+	t.Run("pull request", func(t *testing.T) {
+		runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"number":43,"state":"closed","pull_request":{"url":"https://api.github.com/repos/gitmoot/gitmoot/pulls/43"}}`}}}
+		if _, err := (&GhClient{Runner: runner}).GetIssue(context.Background(), repo, 43); err == nil || !strings.Contains(err.Error(), "pull request, not an issue") {
+			t.Fatalf("GetIssue(PR) error = %v", err)
+		}
+	})
+}
+
 func TestPreflightChecksGhAuthAndRepoAccess(t *testing.T) {
 	runner := &fakeRunner{
 		results: []subprocess.Result{

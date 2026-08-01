@@ -74,6 +74,48 @@ func TestHandleCommentAuthorizedCommandStillDispatches(t *testing.T) {
 	}
 }
 
+func TestHandleCommentAuthorizedIndentedCodeDoesNotDispatch(t *testing.T) {
+	tests := []struct {
+		name   string
+		indent string
+	}{
+		{name: "four spaces", indent: "    "},
+		{name: "tab", indent: "\t"},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, _, client, daemon := commentCommandFixture(t, ctx)
+			client.permissions = map[string]string{"alice": "write"}
+			var parsed []Command
+			daemon.parseCommentCommand = func(line string) (Command, bool) {
+				command, ok := ParseCommand(line)
+				if ok {
+					parsed = append(parsed, command)
+				}
+				return command, ok
+			}
+			pull := github.PullRequest{Number: 10, Title: "Camera design", HeadRef: "camera-state"}
+			comment := github.IssueComment{
+				ID:     int64(5148922250 + index),
+				Author: "alice",
+				Body: "/gitmoot status\n" + test.indent +
+					"@helper ask this indented code must not dispatch",
+			}
+
+			if err := daemon.handleComment(ctx, pull, comment); err != nil {
+				t.Fatalf("handleComment returned error: %v", err)
+			}
+			if len(parsed) != 1 || parsed[0].Action != "status" {
+				t.Fatalf("parsed commands = %+v, want only the unindented status command", parsed)
+			}
+			if jobs, err := store.ListJobs(ctx); err != nil || len(jobs) != 0 {
+				t.Fatalf("indented code jobs = %+v, err=%v, want none", jobs, err)
+			}
+		})
+	}
+}
+
 func TestHandleCommentMixedProseAndAddressedCommandPostsOnlyAck(t *testing.T) {
 	ctx := context.Background()
 	store, repo, client, daemon := commentCommandFixture(t, ctx)
