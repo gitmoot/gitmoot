@@ -152,6 +152,118 @@ func TestTaskDisposalClosedOwnPRDoesNotMasqueradeAsClosedIssue(t *testing.T) {
 	}
 }
 
+func TestTaskDisposalTier3UnresolvableSubjectsStrand(t *testing.T) {
+	tests := []struct {
+		name        string
+		subjectRepo string
+		issueErr    error
+	}{
+		{name: "invalid subject repository", subjectRepo: "not-a-repository"},
+		{name: "issue lookup error", subjectRepo: "owner/repo", issueErr: errors.New("forced issue lookup failure")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := testStore(t)
+			repo := github.Repository{Owner: "owner", Name: "repo"}
+			seedStaleRepo(t, store, repo)
+			candidate := db.StaleTaskCandidate{
+				ID: "tier3-unresolvable", RepoFullName: repo.FullName(), State: string(workflow.TaskBlocked),
+				UpdatedAt: time.Now().UTC().Add(-2 * time.Hour).Format("2006-01-02 15:04:05"),
+			}
+			if err := store.UpsertTask(ctx, db.Task{ID: candidate.ID, RepoFullName: repo.FullName(), State: candidate.State}); err != nil {
+				t.Fatal(err)
+			}
+			gh := &taskDisposalGitHub{
+				fakeGitHub: &fakeGitHub{}, issues: map[int64]github.Issue{1344: {Number: 1344, State: "open"}}, issueErr: test.issueErr,
+			}
+			d := Daemon{Repo: repo, Store: store, GitHub: gh, Now: futureClock}
+			err := d.disposeTaskCandidate(ctx, candidate, nil, map[string]taskDisposalEvidence{
+				candidate.ID: {subjectRepo: test.subjectRepo, subjectIssue: 1344},
+			}, nil, nil, config.OrgConfig{})
+			if err != nil {
+				t.Fatalf("disposeTaskCandidate error = %v", err)
+			}
+			got, err := store.GetTask(ctx, candidate.ID)
+			if err != nil || got.State != string(workflow.TaskStranded) ||
+				got.DisposalTier != taskDisposalTierStranded ||
+				!strings.Contains(got.DisposalReason, taskDisposalReasonUnavailable) {
+				t.Fatalf("stranded task = %+v, err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestTaskDisposalSuccessorTiming(t *testing.T) {
+	blockedAt := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name             string
+		successorState   workflow.TaskState
+		successorUpdated time.Time
+		pull             github.PullRequest
+		wantState        workflow.TaskState
+		wantTier         string
+	}{
+		{
+			name: "earlier merged task is not a successor", successorState: workflow.TaskMerged,
+			successorUpdated: blockedAt.Add(-time.Hour), wantState: workflow.TaskStranded, wantTier: taskDisposalTierStranded,
+		},
+		{
+			name: "earlier merged PR is not a successor", successorState: workflow.TaskImplementing,
+			successorUpdated: blockedAt.Add(time.Hour),
+			pull:             github.PullRequest{Number: 52, State: "closed", Merged: true, MergedAt: blockedAt.Add(-time.Hour).Format(time.RFC3339)},
+			wantState:        workflow.TaskStranded, wantTier: taskDisposalTierStranded,
+		},
+		{
+			name: "later merged PR supersedes", successorState: workflow.TaskImplementing,
+			successorUpdated: blockedAt.Add(time.Hour),
+			pull:             github.PullRequest{Number: 52, State: "closed", Merged: true, MergedAt: blockedAt.Add(2 * time.Hour).Format(time.RFC3339)},
+			wantState:        workflow.TaskSuperseded, wantTier: taskDisposalTierSuccessorMerged,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := testStore(t)
+			repo := github.Repository{Owner: "owner", Name: "repo"}
+			seedStaleRepo(t, store, repo)
+			candidate := db.StaleTaskCandidate{
+				ID: "original", RepoFullName: repo.FullName(), State: string(workflow.TaskBlocked),
+				UpdatedAt: blockedAt.Format("2006-01-02 15:04:05"),
+			}
+			if err := store.UpsertTask(ctx, db.Task{ID: candidate.ID, RepoFullName: repo.FullName(), State: candidate.State}); err != nil {
+				t.Fatal(err)
+			}
+			successor := db.Task{
+				ID: "successor", RepoFullName: repo.FullName(), State: string(test.successorState),
+				UpdatedAt: test.successorUpdated.Format("2006-01-02 15:04:05"),
+			}
+			pulls := map[int64]github.PullRequest{}
+			peerEvidence := taskDisposalEvidence{subjectRepo: repo.FullName(), subjectIssue: 1344}
+			if test.pull.Number > 0 {
+				pulls[test.pull.Number] = test.pull
+				peerEvidence.pullRequest = test.pull.Number
+			}
+			gh := &taskDisposalGitHub{
+				fakeGitHub: &fakeGitHub{pullsByNumber: pulls},
+				issues:     map[int64]github.Issue{1344: {Number: 1344, State: "open"}},
+			}
+			d := Daemon{Repo: repo, Store: store, GitHub: gh, Now: futureClock}
+			err := d.disposeTaskCandidate(ctx, candidate, []db.Task{successor}, map[string]taskDisposalEvidence{
+				candidate.ID: {subjectRepo: repo.FullName(), subjectIssue: 1344},
+				successor.ID: peerEvidence,
+			}, nil, nil, config.OrgConfig{})
+			if err != nil {
+				t.Fatalf("disposeTaskCandidate error = %v", err)
+			}
+			got, err := store.GetTask(ctx, candidate.ID)
+			if err != nil || got.State != string(test.wantState) || got.DisposalTier != test.wantTier {
+				t.Fatalf("disposed task = %+v, err=%v; want state=%s tier=%s", got, err, test.wantState, test.wantTier)
+			}
+		})
+	}
+}
+
 func TestTaskDisposalUnresolvableTerminatesAndPassContinues(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
@@ -182,6 +294,49 @@ func TestTaskDisposalUnresolvableTerminatesAndPassContinues(t *testing.T) {
 	later, _ := store.GetTask(ctx, "task-later")
 	if later.State != string(workflow.TaskSuperseded) {
 		t.Fatalf("later task was starved by prior failure: %+v", later)
+	}
+}
+
+func TestTaskDisposalCandidateErrorDoesNotAbortPass(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "owner", Name: "repo"}
+	seedStaleRepo(t, store, repo)
+	for _, task := range []db.Task{
+		{ID: "a-error", RepoFullName: repo.FullName(), State: string(workflow.TaskBlocked)},
+		{ID: "b-later", RepoFullName: repo.FullName(), State: string(workflow.TaskBlocked)},
+	} {
+		if err := store.UpsertTask(ctx, task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setTaskUpdatedAt(t, store, "a-error", time.Now().UTC().Add(-3*time.Hour))
+	setTaskUpdatedAt(t, store, "b-later", time.Now().UTC().Add(-2*time.Hour))
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`CREATE TRIGGER reject_first_task_disposal_event
+		BEFORE INSERT ON task_events
+		WHEN NEW.task_id = 'a-error'
+		BEGIN
+			SELECT RAISE(ABORT, 'forced candidate disposal failure');
+		END;`); err != nil {
+		t.Fatal(err)
+	}
+	gh := &taskDisposalGitHub{fakeGitHub: &fakeGitHub{}, issues: map[int64]github.Issue{}}
+	err = (Daemon{Repo: repo, Store: store, GitHub: gh, Now: futureClock}).reconcileTaskDisposals(ctx, time.Hour)
+	if err == nil || !strings.Contains(err.Error(), "forced candidate disposal failure") {
+		t.Fatalf("reconcileTaskDisposals error = %v", err)
+	}
+	failed, err := store.GetTask(ctx, "a-error")
+	if err != nil || failed.State != string(workflow.TaskBlocked) {
+		t.Fatalf("failed candidate = %+v, err=%v", failed, err)
+	}
+	later, err := store.GetTask(ctx, "b-later")
+	if err != nil || later.State != string(workflow.TaskStranded) || later.DisposalTier != taskDisposalTierStranded {
+		t.Fatalf("later candidate = %+v, err=%v; pass aborted after first error", later, err)
 	}
 }
 

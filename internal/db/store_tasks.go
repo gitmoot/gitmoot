@@ -499,7 +499,8 @@ func (s *Store) TransitionTaskStateWithEventIfNoActiveJob(ctx context.Context, t
 // DisposeTask atomically records an evidence-based terminal task disposition,
 // its audit event, and (when routable) the single durable terminal escalation.
 // Notification routing never controls whether the row terminates: an empty
-// escalation role is recorded on the task and the state transition still commits.
+// escalation role or failed escalation write is recorded on the task, and the
+// state transition still commits.
 func (s *Store) DisposeTask(ctx context.Context, taskID string, fromStates []string, to, tier, reason, escalationRole, escalationEvent string, at time.Time) (bool, string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -543,17 +544,47 @@ func (s *Store) DisposeTask(ctx context.Context, taskID string, fromStates []str
 		return false, current, err
 	}
 	if role := strings.ToLower(strings.TrimSpace(escalationRole)); role != "" {
+		var escalationErr error
 		if strings.TrimSpace(escalationEvent) == "" {
-			return false, current, errors.New("task disposal escalation event is required for a routed escalation")
+			escalationErr = errors.New("task disposal escalation event is required for a routed escalation")
+		} else {
+			escalationErr = insertTaskDisposalEscalationTx(ctx, tx, escalationEvent, role)
 		}
-		if err := insertWakeOutboxTx(ctx, tx, WakeOutboxSourceEscalation, escalationEvent, WakeOutboxKindEscalation, role); err != nil {
-			return false, current, err
+		if escalationErr != nil {
+			failureReason := strings.TrimSpace(reason) + "; escalation write failed: " + escalationErr.Error()
+			if _, err := tx.ExecContext(ctx, `UPDATE tasks SET disposal_reason = ? WHERE id = ?`, failureReason, strings.TrimSpace(taskID)); err != nil {
+				return false, current, err
+			}
+			if err := tx.Commit(); err != nil {
+				return false, current, err
+			}
+			return true, strings.TrimSpace(to), escalationErr
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, current, err
 	}
 	return true, strings.TrimSpace(to), nil
+}
+
+func insertTaskDisposalEscalationTx(ctx context.Context, tx *sql.Tx, event, role string) error {
+	const savepoint = "task_disposal_escalation"
+	if _, err := tx.ExecContext(ctx, "SAVEPOINT "+savepoint); err != nil {
+		return fmt.Errorf("start task disposal escalation savepoint: %w", err)
+	}
+	if err := insertWakeOutboxTx(ctx, tx, WakeOutboxSourceEscalation, event, WakeOutboxKindEscalation, role); err != nil {
+		if _, rollbackErr := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT "+savepoint); rollbackErr != nil {
+			return fmt.Errorf("insert task disposal escalation: %v; rollback savepoint: %w", err, rollbackErr)
+		}
+		if _, releaseErr := tx.ExecContext(ctx, "RELEASE SAVEPOINT "+savepoint); releaseErr != nil {
+			return fmt.Errorf("insert task disposal escalation: %v; release savepoint: %w", err, releaseErr)
+		}
+		return fmt.Errorf("insert task disposal escalation: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, "RELEASE SAVEPOINT "+savepoint); err != nil {
+		return fmt.Errorf("release task disposal escalation savepoint: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) transitionTaskStateWithEvent(ctx context.Context, taskID string, fromStates []string, to string, kind string, reason string, rejectActiveJob bool) (changed bool, observedState string, currentState string, err error) {
