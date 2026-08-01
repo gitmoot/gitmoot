@@ -75,6 +75,13 @@ func TestRunGroupNormalCompletionUnaffected(t *testing.T) {
 	}
 }
 
+func TestGroupCommandKillsImmediateChildWhenParentDies(t *testing.T) {
+	cmd, _ := newGroupCmd(context.Background(), "", "sh", []string{"-c", "exit 0"})
+	if cmd.SysProcAttr == nil || cmd.SysProcAttr.Pdeathsig != syscall.SIGKILL {
+		t.Fatalf("group command SysProcAttr = %+v, want Pdeathsig SIGKILL", cmd.SysProcAttr)
+	}
+}
+
 // TestRunGroupStreamTeesAndBuffers: the streaming group runner tees live to out
 // while returning the same buffered Result as RunGroup — the tee is additive.
 func TestRunGroupStreamTeesAndBuffers(t *testing.T) {

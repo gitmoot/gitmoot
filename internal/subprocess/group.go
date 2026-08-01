@@ -19,7 +19,8 @@ const groupKillGrace = 10 * time.Second
 // period). Plain exec.CommandContext only kills the immediate child, which
 // orphans grandchildren — runtime CLIs like codex/claude spawn helpers that
 // must die with the job. Used by the runtime adapters; short-lived tool calls
-// (gh, git) keep the plain ExecRunner.
+// (gh, git) keep the plain ExecRunner. A child that deliberately calls setsid
+// escapes both this group and its cleanup; that residual is out of scope.
 type GroupRunner struct {
 	// MaxOutputBytes, when positive, retains only the tail of stdout and stderr
 	// independently. Zero preserves the historical unbounded capture behavior.
@@ -230,7 +231,10 @@ func RunGroupEnvStreamWithPID(ctx context.Context, dir string, extraEnv []string
 func newGroupCmd(ctx context.Context, dir string, command string, args []string) (*exec.Cmd, func()) {
 	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.Dir = dir
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid:   true,
+		Pdeathsig: syscall.SIGKILL,
+	}
 
 	var pgid int
 	cmd.Cancel = func() error {
