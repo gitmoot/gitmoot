@@ -70,6 +70,24 @@ func inputPendingDirectedKinds() []string {
 	return []string{"pane_input_pending"}
 }
 
+func wakeTargetRoleKinds() []string {
+	kindSet := make(map[string]struct{})
+	for _, producer := range wakeTargetRoleProducers {
+		for _, rawKind := range producer.Kinds() {
+			kind := strings.ToLower(strings.TrimSpace(rawKind))
+			if kind != "" {
+				kindSet[kind] = struct{}{}
+			}
+		}
+	}
+	kinds := make([]string, 0, len(kindSet))
+	for kind := range kindSet {
+		kinds = append(kinds, kind)
+	}
+	sort.Strings(kinds)
+	return kinds
+}
+
 func eventObserverDoctorCheck(paths config.Paths) (doctor.Check, bool) {
 	if strings.TrimSpace(paths.Database) == "" {
 		return unreadableEventObserverCheck("database path is empty"), true
@@ -104,17 +122,9 @@ func buildEventObserverDoctorCheck(rules []db.EventRule) (doctor.Check, bool) {
 			covered[strings.ToLower(strings.TrimSpace(rule.OnKind))] = true
 		}
 	}
-	kinds := make(map[string]struct{})
-	for _, producer := range wakeTargetRoleProducers {
-		for _, rawKind := range producer.Kinds() {
-			kind := strings.ToLower(strings.TrimSpace(rawKind))
-			if kind != "" {
-				kinds[kind] = struct{}{}
-			}
-		}
-	}
+	kinds := wakeTargetRoleKinds()
 	missing := make([]string, 0, len(kinds))
-	for kind := range kinds {
+	for _, kind := range kinds {
 		if !covered[kind] {
 			missing = append(missing, kind)
 		}
@@ -122,7 +132,6 @@ func buildEventObserverDoctorCheck(rules []db.EventRule) (doctor.Check, bool) {
 	if len(missing) == 0 {
 		return doctor.Check{}, false
 	}
-	sort.Strings(missing)
 	return doctor.Check{
 		Name:     "event observers",
 		Required: false,

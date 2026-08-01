@@ -99,6 +99,9 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
 		return err
 	}
+	if err := resolveAwaitedReviewFactTx(ctx, tx, job.ID, job.Agent, job.Type, job.State, job.Payload, time.Now().UTC()); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -682,6 +685,13 @@ func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id strin
 			return false, err
 		}
 	}
+	var agent, jobType string
+	if err := tx.QueryRowContext(ctx, `SELECT agent, type FROM jobs WHERE id = ?`, id).Scan(&agent, &jobType); err != nil {
+		return false, err
+	}
+	if err := resolveAwaitedReviewFactTx(ctx, tx, id, agent, jobType, to, payload, time.Now().UTC()); err != nil {
+		return false, err
+	}
 	return true, tx.Commit()
 }
 
@@ -833,6 +843,13 @@ func (s *Store) UpdateJobPayloadAndStateWithEvent(ctx context.Context, id string
 		event.JobID = id
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+		return err
+	}
+	var agent, jobType string
+	if err := tx.QueryRowContext(ctx, `SELECT agent, type FROM jobs WHERE id = ?`, id).Scan(&agent, &jobType); err != nil {
+		return err
+	}
+	if err := resolveAwaitedReviewFactTx(ctx, tx, id, agent, jobType, state, payload, time.Now().UTC()); err != nil {
 		return err
 	}
 	return tx.Commit()

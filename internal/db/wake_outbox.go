@@ -30,14 +30,17 @@ const (
 	WakeOutboxKindBlocked    = "blocked"
 	WakeOutboxKindEscalation = "escalation"
 	WakeOutboxKindDirective  = "directive"
+	WakeOutboxKindFact       = "fact"
 
 	WakeOutboxSourceWorkflowNote = "workflow_note"
 	WakeOutboxSourceChatMessage  = "chat_message"
 	WakeOutboxSourceBlocked      = WakeOutboxKindBlocked
 	WakeOutboxSourceEscalation   = WakeOutboxKindEscalation
+	WakeOutboxSourceAwaitedFact  = "awaited_fact"
 
 	WakeOutboxReplyCoalescePrefix     = WakeOutboxKindReply + ":"
 	WakeOutboxDirectiveCoalescePrefix = WakeOutboxKindDirective + ":"
+	WakeOutboxFactCoalescePrefix      = WakeOutboxKindFact + ":"
 )
 
 type wakeOutboxStateInterpretation uint8
@@ -257,7 +260,7 @@ VALUES (?, ?, ?, ?)`,
 func wakeOutboxCoalesceKey(wakeKind, role string) (string, error) {
 	kind := strings.ToLower(strings.TrimSpace(wakeKind))
 	switch kind {
-	case WakeOutboxKindReply, WakeOutboxKindBlocked, WakeOutboxKindEscalation, WakeOutboxKindDirective:
+	case WakeOutboxKindReply, WakeOutboxKindBlocked, WakeOutboxKindEscalation, WakeOutboxKindDirective, WakeOutboxKindFact:
 	default:
 		return "", fmt.Errorf("unsupported wake outbox kind %q", wakeKind)
 	}

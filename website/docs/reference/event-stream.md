@@ -174,6 +174,7 @@ gitmoot org events rule add --on guard --match owner/repo --wake maintainer
 gitmoot org events rule add --on blocked --repo tendwire --wake maintainer
 gitmoot org events rule add --on pane_input_pending --wake maintainer
 gitmoot org events rule add --on reply --wake maintainer
+gitmoot org events rule add --on fact --wake maintainer
 gitmoot org events rule add --on reply --wake operator --scope observer
 gitmoot org events rule list
 gitmoot org events rule set-scope <rule-id> observer
@@ -190,6 +191,12 @@ addressed target is the only routing condition. An observer-scoped rule is
 therefore delivered when its wake role equals the target; when it differs and
 no other target-role rule authorizes the batch, the batch remains pending.
 `set-scope` changes an existing rule between `addressed` and `observer`.
+
+`org.fact` is the exact-targeted delivery event for a durable awaited fact. A
+fact rule wakes only the role named by the outbox row. Satisfaction and bounded
+expiry both use this event family; delivery creates no acknowledgment or
+completion obligation. Expired subscriptions remain queryable rather than being
+deleted or silently omitted.
 Upgrades preserve the existing global view by promoting non-reply rules with an
 empty match filter to `observer`; reply rules remain `addressed` because reply
 already carries a target role. `gitmoot doctor` warns when an event kind with a

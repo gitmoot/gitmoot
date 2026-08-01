@@ -139,7 +139,7 @@ func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
 func durableWakeKind(kinds []string) (string, bool) {
 	for _, kind := range kinds {
 		switch kind {
-		case db.WakeOutboxKindBlocked, db.WakeOutboxKindEscalation, db.WakeOutboxKindDirective:
+		case db.WakeOutboxKindBlocked, db.WakeOutboxKindEscalation, db.WakeOutboxKindDirective, db.WakeOutboxKindFact:
 			return kind, true
 		}
 	}
@@ -223,7 +223,7 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 	if !ok {
 		return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "organization registry unavailable", errors.New("organization registry unavailable"))
 	}
-	isAddressedNoteWake := event.Type == events.EventOrgReply || event.Type == events.EventOrgDirective
+	isAddressedNoteWake := event.Type == events.EventOrgReply || event.Type == events.EventOrgDirective || event.Type == events.EventOrgFact
 	replyHandled := false
 	addressedReplyHandled := false
 	for _, rule := range rules {
@@ -439,6 +439,8 @@ func classifyEventRuleKinds(event events.Event) []string {
 		return []string{"reply"}
 	case events.EventOrgDirective:
 		return []string{"directive"}
+	case events.EventOrgFact:
+		return []string{"fact"}
 	}
 	return nil
 }
@@ -478,6 +480,10 @@ func eventRuleWakePrompt(kind string, event events.Event) string {
 			"gitmoot directive %s for %s; acknowledge receipt with: gitmoot org directive ack %s --by %s",
 			directiveID, event.WakeTargetRole, directiveID, event.WakeTargetRole,
 		)
+	}
+	if strings.EqualFold(strings.TrimSpace(kind), db.WakeOutboxKindFact) {
+		detail := truncateForWake(strings.TrimSpace(event.Detail), 320)
+		return fmt.Sprintf("gitmoot awaited fact for %s: %s", event.WakeTargetRole, detail)
 	}
 	// event.Detail is already redacted + absolute-path-scrubbed by events.NewEvent,
 	// so it is used as-is here (only trimmed and rune-safe truncated for the arg).
