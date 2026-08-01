@@ -1883,4 +1883,16 @@ CREATE INDEX idx_workflow_notes_directive_oldest
 	`
 ALTER TABLE branch_locks ADD COLUMN acting_org_role TEXT NOT NULL DEFAULT '';
 	`,
+	// #1352 directive nudge ladder. directive_nudge_count is CUMULATIVE and is
+	// never reset at ack, so it cannot express a per-phase cap on its own — the
+	// completion phase gets its own counter. directive_exhausted_at is the
+	// TERMINAL, QUERYABLE state the ladder ends in: the row stays listed and
+	// visible with a stamp, rather than the obligation vanishing into silence.
+	// Both legacy defaults ('' and 0) mean "not yet", so pre-migration rows
+	// behave exactly as they do today.
+	`
+ALTER TABLE workflow_notes ADD COLUMN directive_done_nudge_count INTEGER NOT NULL DEFAULT 0
+	CHECK(directive_done_nudge_count >= 0);
+ALTER TABLE workflow_notes ADD COLUMN directive_exhausted_at TEXT NOT NULL DEFAULT '';
+	`,
 }

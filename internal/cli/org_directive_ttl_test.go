@@ -239,3 +239,209 @@ func TestDirectiveTTLEvaluatorIsConfigInertWithNoRules(t *testing.T) {
 		t.Fatalf("config-inert nudge_count = %d, want 0", got)
 	}
 }
+
+// #1352 DEFECT 1 — the acked-phase ladder was UNBOUNDED. The unacked branch
+// capped at DirectiveMaxNudges with one escalation; the acked-with-done-TTL
+// branch checked no max, so an acknowledged directive re-nudged forever.
+//
+// Behavioural, not transcriptional: this counts the wakes the evaluator actually
+// emits across many intervals, so it fails on the OBSERVED noise rather than on
+// any particular counter's value.
+func TestDirectiveTTLAckedPhaseLadderCapsAndStopsNudging(t *testing.T) {
+	home := t.TempDir()
+	cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, time.Minute, 3)
+	store := openDirectiveTTLStore(t, home)
+	defer store.Close()
+	note := seedDirectiveTTLNote(t, store, "acked and overdue", time.Minute, true)
+	acknowledgeDirectiveTTLNote(t, store, note)
+	sink := &recordingSink{}
+
+	base := time.Now().UTC().Add(10 * time.Minute)
+	// Ten intervals — far beyond the cap of 3.
+	for i := 0; i < 10; i++ {
+		if err := evaluateOrgDirectiveTTLs(context.Background(), store, sink, cfg, io.Discard, base.Add(time.Duration(i)*5*time.Minute), directiveTTLDependencies{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	wakes := sink.byType(events.EventOrgDirective)
+	if len(wakes) > 3 {
+		t.Fatalf("completion ladder emitted %d nudges over 10 intervals with max=3: the acked phase is unbounded", len(wakes))
+	}
+	if len(wakes) == 0 {
+		t.Fatal("completion ladder emitted nothing; the cap must bound the ladder, not delete it")
+	}
+}
+
+// #1352 DEFECT 1, THE POLARITY GUARD the issue demands explicitly: a capped
+// ladder must leave the obligation VISIBLE. Ending in silence would be worse
+// than nudging forever — the obligation would simply vanish from view while
+// remaining unmet.
+func TestDirectiveTTLExhaustedObligationStaysQueryable(t *testing.T) {
+	home := t.TempDir()
+	cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, time.Minute, 2)
+	store := openDirectiveTTLStore(t, home)
+	defer store.Close()
+	note := seedDirectiveTTLNote(t, store, "will exhaust", time.Minute, true)
+	acknowledgeDirectiveTTLNote(t, store, note)
+
+	base := time.Now().UTC().Add(10 * time.Minute)
+	for i := 0; i < 8; i++ {
+		if err := evaluateOrgDirectiveTTLs(context.Background(), store, &recordingSink{}, cfg, io.Discard, base.Add(time.Duration(i)*5*time.Minute), directiveTTLDependencies{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// STILL LISTED — the ladder ended in a queryable state, not in nothing.
+	item := readDirectiveTTLObligation(t, store, note.ID)
+	if strings.TrimSpace(item.ExhaustedAt) == "" {
+		t.Fatalf("ladder ended without stamping a terminal state: %+v", item)
+	}
+}
+
+// #1352 DEFECT 1 — the terminal escalation must fire, and fire ONCE, for the
+// completion phase. Before this the acked branch escalated never.
+func TestDirectiveTTLCompletionPhaseEscalatesOnceAtCap(t *testing.T) {
+	home := t.TempDir()
+	cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, time.Minute, 2)
+	store := openDirectiveTTLStore(t, home)
+	defer store.Close()
+	note := seedDirectiveTTLNote(t, store, "escalating completion", time.Minute, true)
+	acknowledgeDirectiveTTLNote(t, store, note)
+	sink := &recordingSink{}
+
+	base := time.Now().UTC().Add(10 * time.Minute)
+	for i := 0; i < 8; i++ {
+		if err := evaluateOrgDirectiveTTLs(context.Background(), store, sink, cfg, io.Discard, base.Add(time.Duration(i)*5*time.Minute), directiveTTLDependencies{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	escalations := sink.byType(events.EventJobNeedsAttention)
+	if len(escalations) != 1 {
+		t.Fatalf("completion escalations = %d, want exactly 1 terminal escalation", len(escalations))
+	}
+	if !strings.Contains(escalations[0].Detail, "incomplete") {
+		t.Fatalf("completion escalation says %q; it must name the COMPLETION obligation, not acknowledgment", escalations[0].Detail)
+	}
+}
+
+// #1352 DEFECT 2 — sweep-window starvation. The window was a fixed oldest-N, so
+// once N immortal rows occupied it (which defect 1 guaranteed) newer directives
+// were never evaluated at all. The window is now sized from the live population,
+// which is the remedy the blocked-task evaluator already uses.
+//
+// Behavioural: seed more open directives than the OLD fixed window would admit
+// for a newcomer, then require the newest one to still receive its nudge.
+func TestDirectiveTTLSweepDoesNotStarveNewerDirectives(t *testing.T) {
+	home := t.TempDir()
+	cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, 0, 3)
+	store := openDirectiveTTLStore(t, home)
+	defer store.Close()
+	for i := 0; i < 5; i++ {
+		seedDirectiveTTLNote(t, store, fmt.Sprintf("older %d", i), 0, false)
+	}
+	newest := seedDirectiveTTLNote(t, store, "newest", 0, false)
+	sink := &recordingSink{}
+
+	// A window of 1 models the starved case: without population sizing the
+	// newest directive can never be reached.
+	deps := directiveTTLDependencies{
+		countOpen: func(ctx context.Context, s *db.Store) (int, error) {
+			return s.CountOpenOrgDirectiveObligations(ctx)
+		},
+	}
+	if err := evaluateOrgDirectiveTTLs(context.Background(), store, sink, cfg, io.Discard, time.Now().UTC().Add(20*time.Minute), deps); err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, w := range sink.byType(events.EventOrgDirective) {
+		if w.JobID == fmt.Sprint(newest.ID) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the newest directive %d was never evaluated; the sweep window starves later ids", newest.ID)
+	}
+}
+
+// #1352 DEFECT 1, SITE-SPECIFIC guard for the completion CAP itself.
+//
+// My first attempt at pinning the cap was not load-bearing: removing the
+// DoneNudgeCount check left every guard green, because the exhausted STAMP also
+// halts the ladder, so the two mechanisms masked each other. The cap's real job
+// is FAIL-SAFE — it must bound the ladder even when the terminal stamp does not
+// land (a store error, a racing writer). That is the property this pins, and it
+// is the only condition under which the cap is observable on its own.
+func TestDirectiveTTLCompletionCapBoundsLadderEvenIfExhaustStampFails(t *testing.T) {
+	home := t.TempDir()
+	cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, time.Minute, 2)
+	store := openDirectiveTTLStore(t, home)
+	defer store.Close()
+	note := seedDirectiveTTLNote(t, store, "stamp keeps failing", time.Minute, true)
+	acknowledgeDirectiveTTLNote(t, store, note)
+	sink := &recordingSink{}
+
+	// The terminal stamp never lands. Only the counter cap can stop the ladder.
+	deps := directiveTTLDependencies{
+		exhaust: func(ctx context.Context, s *db.Store, id int64, at time.Time) (bool, error) {
+			return false, nil
+		},
+	}
+	base := time.Now().UTC().Add(10 * time.Minute)
+	for i := 0; i < 10; i++ {
+		if err := evaluateOrgDirectiveTTLs(context.Background(), store, sink, cfg, io.Discard, base.Add(time.Duration(i)*5*time.Minute), deps); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got := len(sink.byType(events.EventOrgDirective)); got > 2 {
+		t.Fatalf("with the terminal stamp failing, the ladder emitted %d nudges over 10 intervals at max=2: the completion CAP is not bounding it", got)
+	}
+}
+
+// #1352 — the evaluator's TERMINAL check, pinned independently of the store's.
+//
+// Exhaustion is enforced in two places: MarkOrgDirectiveDoneNudged refuses an
+// exhausted row, and directiveTTLDue returns not-due for one. The store refusal
+// MASKED the evaluator check, so removing the evaluator's terminal guard left
+// every test green. Both layers are wanted — the store is the atomic backstop,
+// the evaluator avoids the pointless claim — so each is pinned where the other
+// cannot cover for it. Here the store claim always succeeds, leaving the
+// evaluator as the only thing that can end the ladder.
+func TestDirectiveTTLExhaustedIsTerminalAtTheEvaluatorToo(t *testing.T) {
+	home := t.TempDir()
+	cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, time.Minute, 2)
+	store := openDirectiveTTLStore(t, home)
+	defer store.Close()
+	note := seedDirectiveTTLNote(t, store, "already exhausted", time.Minute, true)
+	acknowledgeDirectiveTTLNote(t, store, note)
+	if _, err := store.MarkOrgDirectiveExhausted(context.Background(), note.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	sink := &recordingSink{}
+
+	claims := 0
+	deps := directiveTTLDependencies{
+		// The store backstop is disabled: it always claims. Only the evaluator's
+		// terminal check can prevent a nudge now.
+		markDone: func(ctx context.Context, s *db.Store, id int64, expected int, last string, at time.Time) (int, bool, error) {
+			claims++
+			return expected + 1, true, nil
+		},
+	}
+	base := time.Now().UTC().Add(20 * time.Minute)
+	for i := 0; i < 5; i++ {
+		if err := evaluateOrgDirectiveTTLs(context.Background(), store, sink, cfg, io.Discard, base.Add(time.Duration(i)*5*time.Minute), deps); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if claims != 0 {
+		t.Fatalf("evaluator attempted %d claims on an EXHAUSTED obligation; the terminal state is not terminal without the store backstop", claims)
+	}
+	if got := len(sink.byType(events.EventOrgDirective)); got != 0 {
+		t.Fatalf("exhausted obligation still emitted %d nudges", got)
+	}
+}

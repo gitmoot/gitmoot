@@ -1280,6 +1280,25 @@ not completion. `gitmoot org directive cancel <id> [--by <role>] [--home
 from `--by` or `GITMOOT_ORG_ROLE`; missing identity fails closed. They append
 typed markers to the directive's workflow journal.
 
+The directive TTL checker nudges each phase on its own finite ladder. The
+acknowledgment phase counts with `directive_nudge_count` and the completion
+phase with `directive_done_nudge_count`, because the first counter is cumulative
+and never resets at acknowledgment, so one counter cannot bound both phases.
+Each phase caps at `directive_max_nudges`, emits **one** terminal escalation
+naming which obligation went unmet, and then stamps `directive_exhausted_at`.
+
+Exhaustion is **terminal but never silent**: the directive stays listed and
+queryable with a visible stamp, so an obligation that ended un-met remains
+discoverable rather than disappearing. Both the evaluator and the atomic nudge
+claim refuse an exhausted row, so a racing sweep cannot walk the terminal state
+back.
+
+The sweep window is sized from the count of currently open obligations rather
+than a fixed oldest-N, so a backlog of long-lived directives can no longer starve
+newer ones out of the window. TTL nags are delivered through the durable wake
+outbox with coalescing, like blocked and escalation wakes, rather than one live
+prompt per due directive per sweep.
+
 The daemon evaluates directive TTLs on the existing one-minute org supervision
 lane. `[org].directive_ack_ttl` defaults to `10m`,
 `[org].directive_done_ttl` defaults to `0s` (completion nudges off), and

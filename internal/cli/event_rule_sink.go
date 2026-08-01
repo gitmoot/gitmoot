@@ -104,10 +104,19 @@ func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
 	}()
 }
 
+// durableWakeKind selects the outbox kind for an event, or reports that the
+// event takes the live path.
+//
+// #1352: directive TTL nags are admitted. They were previously live-only, so
+// every due directive produced one prompt per sweep with no coalescing — a noise
+// factory at any directive volume, and the one wake class GUARANTEED to repeat
+// on a timer rather than on an external trigger. Routing them through the outbox
+// gives them the same batching every other recurring wake already has, and the
+// same durable record when delivery fails.
 func durableWakeKind(kinds []string) (string, bool) {
 	for _, kind := range kinds {
 		switch kind {
-		case db.WakeOutboxKindBlocked, db.WakeOutboxKindEscalation:
+		case db.WakeOutboxKindBlocked, db.WakeOutboxKindEscalation, db.WakeOutboxKindDirective:
 			return kind, true
 		}
 	}

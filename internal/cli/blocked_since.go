@@ -43,6 +43,11 @@ type blockedRoleWakeDependencies struct {
 type directiveTTLDependencies struct {
 	list func(context.Context, *db.Store, int) ([]db.OrgDirectiveObligation, error)
 	mark func(context.Context, *db.Store, int64, int, string, time.Time) (int, bool, error)
+	// #1352: the completion phase advances its OWN counter, and the ladder ends
+	// in a stamped terminal state rather than in silence.
+	markDone  func(context.Context, *db.Store, int64, int, string, time.Time) (int, bool, error)
+	exhaust   func(context.Context, *db.Store, int64, time.Time) (bool, error)
+	countOpen func(context.Context, *db.Store) (int, error)
 }
 
 func defaultBlockedRoleWakeDependencies() blockedRoleWakeDependencies {
@@ -65,6 +70,40 @@ func (d directiveTTLDependencies) markNudged(ctx context.Context, store *db.Stor
 		return d.mark(ctx, store, item.ID, item.NudgeCount, item.LastNudgedAt, now)
 	}
 	return store.MarkOrgDirectiveNudged(ctx, item.ID, item.NudgeCount, item.LastNudgedAt, now)
+}
+
+// markDoneNudged advances the COMPLETION-phase counter (#1352). Kept separate
+// from markNudged because the phases cap independently.
+func (d directiveTTLDependencies) markDoneNudged(ctx context.Context, store *db.Store, item db.OrgDirectiveObligation, now time.Time) (int, bool, error) {
+	if d.markDone != nil {
+		return d.markDone(ctx, store, item.ID, item.DoneNudgeCount, item.LastNudgedAt, now)
+	}
+	return store.MarkOrgDirectiveDoneNudged(ctx, item.ID, item.DoneNudgeCount, item.LastNudgedAt, now)
+}
+
+func (d directiveTTLDependencies) markExhausted(ctx context.Context, store *db.Store, item db.OrgDirectiveObligation, now time.Time) (bool, error) {
+	if d.exhaust != nil {
+		return d.exhaust(ctx, store, item.ID, now)
+	}
+	return store.MarkOrgDirectiveExhausted(ctx, item.ID, now)
+}
+
+// sweepWindow sizes the window from the LIVE POPULATION rather than a fixed
+// oldest-N (#1352). This is the remedy the blocked-task evaluator already uses;
+// a fixed window let immortal rows own it and starve newer directives forever.
+func (d directiveTTLDependencies) sweepWindow(ctx context.Context, store *db.Store) int {
+	count, err := func() (int, error) {
+		if d.countOpen != nil {
+			return d.countOpen(ctx, store)
+		}
+		return store.CountOpenOrgDirectiveObligations(ctx)
+	}()
+	if err != nil || count <= 0 {
+		// Fail toward the previous behaviour rather than toward sweeping nothing:
+		// a count error must not silently stop the checker.
+		return directiveTTLSweepLimit
+	}
+	return count
 }
 
 // enabledBlockedSinceEventSink preserves the blocked-since path's stricter
@@ -315,7 +354,7 @@ func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.
 		return nil
 	}
 	now = now.UTC()
-	items, err := deps.listOpen(ctx, store, directiveTTLSweepLimit)
+	items, err := deps.listOpen(ctx, store, deps.sweepWindow(ctx, store))
 	if err != nil {
 		return err
 	}
@@ -329,7 +368,14 @@ func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.
 		if !due {
 			continue
 		}
-		newCount, claimed, err := deps.markNudged(ctx, store, item, now)
+		// #1352: each phase advances its OWN counter, so each caps independently.
+		var newCount int
+		var claimed bool
+		if unacked {
+			newCount, claimed, err = deps.markNudged(ctx, store, item, now)
+		} else {
+			newCount, claimed, err = deps.markDoneNudged(ctx, store, item, now)
+		}
 		if err != nil {
 			writeLine(stdout, "org directive %d nudge mark failed: %v", item.ID, err)
 			continue
@@ -338,14 +384,29 @@ func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.
 			continue
 		}
 		events.EmitEvent(ctx, sink, buildDirectiveNudgeEvent(item, to, phase, anchor, ttl, newCount, now))
-		if unacked && newCount == orgConfig.DirectiveMaxNudges() {
-			events.EmitEvent(ctx, sink, buildDirectiveEscalationEvent(item, orgConfig, from, to, newCount, now))
+		// The ladder ends the same way in BOTH phases: one terminal escalation at
+		// the cap, then a stamped exhausted state. The acked phase previously had
+		// neither, so an acknowledged directive with a done TTL re-nudged forever.
+		if newCount >= orgConfig.DirectiveMaxNudges() {
+			events.EmitEvent(ctx, sink, buildDirectiveEscalationEvent(item, orgConfig, from, to, phase, newCount, now))
+			// Terminal, and deliberately NOT silent: the row stays listed with a
+			// visible stamp rather than the obligation disappearing.
+			if stamped, err := deps.markExhausted(ctx, store, item, now); err != nil {
+				writeLine(stdout, "org directive %d exhausted mark failed: %v", item.ID, err)
+			} else if stamped {
+				writeLine(stdout, "org directive %d %s ladder exhausted after %d nudges; obligation remains open and queryable", item.ID, phase, newCount)
+			}
 		}
 	}
 	return nil
 }
 
 func directiveTTLDue(item db.OrgDirectiveObligation, orgConfig config.OrgConfig, now time.Time) (anchor time.Time, ttl time.Duration, phase string, unacked, due bool) {
+	// #1352: a stamped-exhausted ladder is TERMINAL in either phase. The row is
+	// still listed and queryable; it is simply no longer due.
+	if strings.TrimSpace(item.ExhaustedAt) != "" {
+		return time.Time{}, 0, "", strings.TrimSpace(item.AckedAt) == "", false
+	}
 	if strings.TrimSpace(item.AckedAt) == "" {
 		if item.NudgeCount >= orgConfig.DirectiveMaxNudges() {
 			return time.Time{}, 0, "", true, false
@@ -355,6 +416,13 @@ func directiveTTLDue(item db.OrgDirectiveObligation, orgConfig config.OrgConfig,
 		phase = "acknowledgment"
 		unacked = true
 	} else {
+		// The completion phase caps on its OWN counter. This branch previously had
+		// NO max check at all, which is defect 1: an acknowledged directive with a
+		// done TTL re-nudged forever, and those immortal rows are also what starved
+		// the sweep window.
+		if item.DoneNudgeCount >= orgConfig.DirectiveMaxNudges() {
+			return time.Time{}, 0, "", false, false
+		}
 		anchor = parseTranscriptStoreTime(item.AckedAt)
 		ttl = orgConfig.DirectiveDoneTTL()
 		if item.DoneTTLOverrideSeconds >= 0 {
@@ -383,9 +451,15 @@ func buildDirectiveNudgeEvent(item db.OrgDirectiveObligation, target, phase stri
 	return ev
 }
 
-func buildDirectiveEscalationEvent(item db.OrgDirectiveObligation, orgConfig config.OrgConfig, sender, target string, nudgeCount int, now time.Time) events.Event {
+func buildDirectiveEscalationEvent(item db.OrgDirectiveObligation, orgConfig config.OrgConfig, sender, target, phase string, nudgeCount int, now time.Time) events.Event {
 	id := fmt.Sprint(item.ID)
-	detail := fmt.Sprintf("directive %s to %s remains unacknowledged after %d nudges", id, target, nudgeCount)
+	// #1352: both phases escalate now, so the detail must say WHICH obligation
+	// went unmet — "unacknowledged" would be wrong for a completion escalation.
+	unmet := "unacknowledged"
+	if phase == "completion" {
+		unmet = "incomplete"
+	}
+	detail := fmt.Sprintf("directive %s to %s remains %s after %d nudges; nudge ladder exhausted", id, target, unmet, nudgeCount)
 	ev := events.NewEvent(events.EventJobNeedsAttention, "org-directive:"+id, db.WakeOutboxSourceWorkflowNote+":"+id, item.Repo, "overdue", detail, now, workflow.RedactCommentText)
 	ev.Cause = "escalation"
 	if role, ok := orgConfig.Role(sender); ok {
