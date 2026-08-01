@@ -75,6 +75,10 @@ type Daemon struct {
 	// repository. When it turns on, only tasks parked by the auto-merge-disabled
 	// leave-open reason are re-armed. Nil preserves direct daemon users' behavior.
 	AutoMergeEnabled func(repo string) bool
+	// parseCommentCommand is an injectable test seam for proving that the
+	// system-verified author gate runs before untrusted comment text reaches the
+	// command parser. Nil uses ParseCommand.
+	parseCommentCommand func(string) (Command, bool)
 }
 
 // RemoteBranchChecker returns the subset of exact branch names present on
@@ -1475,8 +1479,8 @@ func (d Daemon) workflowReviewers(ctx context.Context) ([]string, error) {
 }
 
 func (d Daemon) handleComment(ctx context.Context, pull github.PullRequest, comment github.IssueComment) error {
-	commands := ParseCommands(comment.Body)
-	if len(commands) == 0 {
+	input := prepareCommentCommandInput(comment.Body)
+	if !input.addressed {
 		return nil
 	}
 
@@ -1499,8 +1503,15 @@ func (d Daemon) handleComment(ctx context.Context, pull github.PullRequest, comm
 		return d.markCommentSeen(ctx, pull, comment)
 	}
 
-	for sequence, command := range commands {
-		if err := d.handleCommand(ctx, pull, comment, sequence, command); err != nil {
+	commands := parseCommentCommands(input, d.commentCommandParser())
+	for sequence, parsed := range commands {
+		if parsed.err != nil {
+			if err := d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not route comment %d: %v.", comment.ID, parsed.err)); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := d.handleCommand(ctx, pull, comment, sequence, parsed.command); err != nil {
 			return err
 		}
 	}
@@ -1514,14 +1525,8 @@ func (d Daemon) handleComment(ctx context.Context, pull github.PullRequest, comm
 // ignored on issues). Non-ask commands never mark the comment seen, so a later
 // real ask in the same thread is still picked up.
 func (d Daemon) handleIssueComment(ctx context.Context, issue github.Issue, comment github.IssueComment) error {
-	commands := ParseCommands(comment.Body)
-	asks := make([]Command, 0, len(commands))
-	for _, command := range commands {
-		if command.Action == "ask" {
-			asks = append(asks, command)
-		}
-	}
-	if len(asks) == 0 {
+	input := prepareCommentCommandInput(comment.Body)
+	if !input.addressed {
 		return nil
 	}
 
@@ -1544,13 +1549,26 @@ func (d Daemon) handleIssueComment(ctx context.Context, issue github.Issue, comm
 		return d.markIssueCommentSeen(ctx, issue, comment)
 	}
 
-	for sequence, command := range commands {
-		if command.Action != "ask" {
+	commands := parseCommentCommands(input, d.commentCommandParser())
+	handled := false
+	for sequence, parsed := range commands {
+		if parsed.err != nil {
+			if err := d.ack(ctx, issue.Number, fmt.Sprintf("Gitmoot could not route comment %d: %v.", comment.ID, parsed.err)); err != nil {
+				return err
+			}
+			handled = true
 			continue
 		}
-		if err := d.handleIssueAsk(ctx, issue, comment, sequence, command); err != nil {
+		if parsed.command.Action != "ask" {
+			continue
+		}
+		if err := d.handleIssueAsk(ctx, issue, comment, sequence, parsed.command); err != nil {
 			return err
 		}
+		handled = true
+	}
+	if !handled {
+		return nil
 	}
 	return d.markIssueCommentSeen(ctx, issue, comment)
 }
@@ -1614,8 +1632,8 @@ func (d Daemon) handleIssueAsk(ctx context.Context, issue github.Issue, comment 
 }
 
 func (d Daemon) handleRecoveryComment(ctx context.Context, pull github.PullRequest, comment github.IssueComment) error {
-	commands := ParseCommands(comment.Body)
-	if len(commands) == 0 || !onlyJobRecoveryCommands(commands) {
+	input := prepareCommentCommandInput(comment.Body)
+	if !input.addressed {
 		return nil
 	}
 
@@ -1638,12 +1656,34 @@ func (d Daemon) handleRecoveryComment(ctx context.Context, pull github.PullReque
 		return d.markCommentSeen(ctx, pull, comment)
 	}
 
+	parsedCommands := parseCommentCommands(input, d.commentCommandParser())
+	commands := make([]Command, 0, len(parsedCommands))
+	for _, parsed := range parsedCommands {
+		if parsed.err != nil {
+			if err := d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not route comment %d: %v.", comment.ID, parsed.err)); err != nil {
+				return err
+			}
+			return d.markCommentSeen(ctx, pull, comment)
+		}
+		commands = append(commands, parsed.command)
+	}
+	if len(commands) == 0 || !onlyJobRecoveryCommands(commands) {
+		return nil
+	}
+
 	for sequence, command := range commands {
 		if err := d.handleCommand(ctx, pull, comment, sequence, command); err != nil {
 			return err
 		}
 	}
 	return d.markCommentSeen(ctx, pull, comment)
+}
+
+func (d Daemon) commentCommandParser() func(string) (Command, bool) {
+	if d.parseCommentCommand != nil {
+		return d.parseCommentCommand
+	}
+	return ParseCommand
 }
 
 func onlyJobRecoveryCommands(commands []Command) bool {
