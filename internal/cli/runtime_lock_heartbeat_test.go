@@ -94,8 +94,8 @@ func TestRuntimeSessionLockHeartbeatStoppedRunnerRecovers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetJob returned error: %v", err)
 	}
-	if job.State != string(workflow.JobQueued) {
-		t.Fatalf("job state = %q, want queued", job.State)
+	if job.State != string(workflow.JobFailed) {
+		t.Fatalf("job state = %q, want failed", job.State)
 	}
 	if _, err := store.GetResourceLock(ctx, lockKey); err != sql.ErrNoRows {
 		t.Fatalf("GetResourceLock after recovery error = %v, want sql.ErrNoRows", err)
@@ -175,8 +175,8 @@ func TestRuntimeSessionLockHeartbeatLeavesShellRecoveryUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetJob returned error: %v", err)
 	}
-	if job.State != string(workflow.JobQueued) {
-		t.Fatalf("job state = %q, want queued", job.State)
+	if job.State != string(workflow.JobFailed) {
+		t.Fatalf("job state = %q, want failed", job.State)
 	}
 }
 

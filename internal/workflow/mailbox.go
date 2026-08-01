@@ -406,7 +406,7 @@ type JobPayload struct {
 	ResultObservation *ResultObservation `json:"result_observation,omitempty"`
 	// FailureDiagnostics captures process-level crash context when the runtime
 	// session ended WITHOUT producing a gitmoot_result envelope (#806): a phase
-	// marker (launched | streaming | result-parse), the exit code or signal, a
+	// marker (launched | streaming | result-parse | recovery), the exit code or signal, a
 	// redacted stderr tail hard-capped at MaxStderrTailBytes, and the runtime
 	// session id when one is known. Additive/omitempty — a job that produced an
 	// envelope serializes byte-identically — and reset at the start of every run

@@ -30,6 +30,8 @@ func runOrgDirective(args []string, stdout, stderr io.Writer) int {
 		return runOrgDirectiveReceipt("ack", args[1:], stdout, stderr)
 	case "cancel":
 		return runOrgDirectiveReceipt("cancel", args[1:], stdout, stderr)
+	case "done":
+		return runOrgDirectiveReceipt("done", args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown org directive command %q\n", args[0])
 		printOrgDirectiveUsage(stderr)
@@ -42,7 +44,12 @@ func printOrgDirectiveUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org directive send --to ROLE --workflow LABEL (--stdin | -F FILE | TEXT) [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org directive ack ID [--by ROLE] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org directive cancel ID [--by ROLE] [--home DIR]")
-	fmt.Fprintln(w, "Acknowledgment records receipt, not completion; completion tracking is separate.")
+	fmt.Fprintln(w, "  gitmoot org directive done ID [--by ROLE] [--home DIR]")
+	fmt.Fprintln(w, "Acknowledgment records receipt and is open to the target or an ancestor.")
+	fmt.Fprintln(w, "`done` records COMPLETION and ends the obligation, including its TTL nudges;")
+	fmt.Fprintln(w, "it is restricted to the TARGET SUBTREE -- the addressed role or one below it.")
+	fmt.Fprintln(w, "Ancestors cannot complete (a sender is always an ancestor, so that would be")
+	fmt.Fprintln(w, "self-certification); they may cancel instead. Only the sender may cancel.")
 }
 
 func runOrgDirectiveSend(args []string, stdout, stderr io.Writer) int {
@@ -210,12 +217,31 @@ func runOrgDirectiveReceipt(kind string, args []string, stdout, stderr io.Writer
 			return fmt.Errorf("unknown org role %q", by)
 		}
 		var body string
-		if kind == "ack" {
+		switch kind {
+		case "ack":
+			// Receipt: the addressed target or one of its ancestors. Unchanged, and
+			// the wording is preserved byte-for-byte as an established contract.
 			if by != to && !slicesContains(cfg.Ancestors(to), by) {
 				return fmt.Errorf("role %q cannot acknowledge directive %d addressed to %q; only the target or an ancestor may acknowledge", by, directiveID, to)
 			}
 			body = workflow.FormatOrgDirectiveAckNote(directiveID, by)
-		} else {
+		case "done":
+			// #1352: COMPLETION AUTHORITY IS THE TARGET SUBTREE — the addressed role
+			// or someone BELOW it, who plausibly did the work.
+			//
+			// Ancestors are excluded deliberately, and this is the whole point. In a
+			// tree, `send` requires the sender to be an ancestor of the target, so
+			// permitting ancestors IS permitting the sender under another name: a
+			// role could issue a directive and then certify its own work as done.
+			// That is the self-approved merge this campaign exists to stop.
+			// Ancestors are not left without recourse — they hold `cancel`, and the
+			// two verbs mean different things: completion asserts the work HAPPENED,
+			// cancellation asserts it is no longer NEEDED.
+			if by != to && !slicesContains(cfg.Ancestors(by), to) {
+				return fmt.Errorf("role %q cannot record done for directive %d addressed to %q; completion is restricted to the target or a role below it — an ancestor may cancel instead", by, directiveID, to)
+			}
+			body = workflow.FormatOrgDirectiveDoneNote(directiveID, by)
+		default:
 			if by != from {
 				return fmt.Errorf("role %q cannot cancel directive %d sent by %q", by, directiveID, from)
 			}
@@ -233,8 +259,20 @@ func runOrgDirectiveReceipt(kind string, args []string, stdout, stderr io.Writer
 		fmt.Fprintf(stderr, "org directive %s: %v\n", kind, err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "%sed directive %d in workflow %s\n", kind, directiveID, workflowID)
+	fmt.Fprintf(stdout, "%s directive %d in workflow %s\n", orgDirectiveReceiptPastTense(kind), directiveID, workflowID)
 	return 0
+}
+
+// orgDirectiveReceiptPastTense renders the confirmation verb. The previous
+// "%sed" formatting would have produced "doneed" for the #1352 completion verb;
+// the ack/cancel wording is preserved byte-for-byte.
+func orgDirectiveReceiptPastTense(kind string) string {
+	switch kind {
+	case "done":
+		return "completed"
+	default:
+		return kind + "ed"
+	}
 }
 
 func orgDirectiveReceiptIDAndFlags(args []string) (string, []string, bool) {

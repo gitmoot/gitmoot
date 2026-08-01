@@ -477,11 +477,11 @@ func TestMailboxEnqueuePersistsEphemeralSpec(t *testing.T) {
 
 // TestMailboxClaimStampsRunnerBootID pins that the queued->running claim stamps
 // the claiming process's boot id (#651), routing through Store.ClaimRunningJob. It
-// asserts behaviorally via the foreign-boot requeue predicate: a claimed job looks
-// "same-boot" to the current boot (never requeued) but "foreign" to a different
-// boot id (requeued) — which can only hold if claim recorded a concrete, non-empty
+// asserts behaviorally via the foreign-boot recovery predicate: a claimed job looks
+// "same-boot" to the current boot but "foreign" to a different boot id — which
+// can only hold if claim recorded a concrete, non-empty
 // runner_boot_id. On the unpatched claim (plain TransitionJobStateWithEvent)
-// runner_boot_id stays empty and the foreign-boot requeue matches nothing, so this
+// runner_boot_id stays empty and the foreign-boot query matches nothing, so this
 // test fails without the fix.
 func TestMailboxClaimStampsRunnerBootID(t *testing.T) {
 	if db.BootID() == "" {
@@ -507,20 +507,20 @@ func TestMailboxClaimStampsRunnerBootID(t *testing.T) {
 	}
 
 	// Same boot: the claimed job is NOT foreign, so it is protected.
-	if requeued, err := store.RequeueRunningJobsFromForeignBoot(ctx, db.BootID()); err != nil {
-		t.Fatalf("RequeueRunningJobsFromForeignBoot(current) returned error: %v", err)
-	} else if len(requeued) != 0 {
-		t.Fatalf("same-boot requeue = %v, want none (claim must stamp the CURRENT boot)", requeued)
+	if foreign, err := store.ListRunningJobIDsFromForeignBoot(ctx, db.BootID()); err != nil {
+		t.Fatalf("ListRunningJobIDsFromForeignBoot(current) returned error: %v", err)
+	} else if len(foreign) != 0 {
+		t.Fatalf("same-boot foreign jobs = %v, want none (claim must stamp the CURRENT boot)", foreign)
 	}
 
 	// A different boot proves claim stamped a concrete boot id: the job now looks
-	// foreign and is requeued.
-	requeued, err := store.RequeueRunningJobsFromForeignBoot(ctx, "foreign-"+db.BootID())
+	// foreign and is selected for evidence-preserving terminal recovery.
+	foreign, err := store.ListRunningJobIDsFromForeignBoot(ctx, "foreign-"+db.BootID())
 	if err != nil {
-		t.Fatalf("RequeueRunningJobsFromForeignBoot(foreign) returned error: %v", err)
+		t.Fatalf("ListRunningJobIDsFromForeignBoot(foreign) returned error: %v", err)
 	}
-	if len(requeued) != 1 || requeued[0] != "job-claim" {
-		t.Fatalf("foreign-boot requeue = %v, want [job-claim] (claim must stamp runner_boot_id)", requeued)
+	if len(foreign) != 1 || foreign[0] != "job-claim" {
+		t.Fatalf("foreign-boot jobs = %v, want [job-claim] (claim must stamp runner_boot_id)", foreign)
 	}
 }
 

@@ -19,6 +19,9 @@ const (
 	// FailurePhaseResultParse: every delivery completed but no valid
 	// gitmoot_result envelope was found in the output, repairs included.
 	FailurePhaseResultParse = "result-parse"
+	// FailurePhaseRecovery: the daemon found a durable running row whose worker
+	// was proven gone during boot or stale-run recovery.
+	FailurePhaseRecovery = "recovery"
 )
 
 // MaxStderrTailBytes is the hard cap on the stored stderr tail. The tail is
@@ -27,7 +30,8 @@ const (
 const MaxStderrTailBytes = 4096
 
 // FailureDiagnostics captures process-level crash context for a job whose
-// runtime session ended WITHOUT producing a gitmoot_result envelope (#806).
+// runtime session ended WITHOUT producing a gitmoot_result envelope (#806), or
+// whose durable running row was terminally settled by daemon recovery (#1308).
 // It lives inside the job payload JSON (additive, omitempty) — no schema
 // change — and is cleared at the start of every run so a retried job never
 // carries a previous run's crash report. Successful jobs never store one.

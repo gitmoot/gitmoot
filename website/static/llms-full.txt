@@ -11258,6 +11258,50 @@ not completion. `gitmoot org directive cancel <id> [--by <role>] [--home
 from `--by` or `GITMOOT_ORG_ROLE`; missing identity fails closed. They append
 typed markers to the directive's workflow journal.
 
+`gitmoot org directive done <id> [--by <role>] [--home <dir>]` records
+COMPLETION and ends the obligation, including its TTL nudges. **Completion
+authority is the target subtree**: the addressed role, or a role below it in the
+chart — someone who plausibly did the work.
+
+**Ancestors cannot complete, and that exclusion is the point.** `send` requires
+the sender to be an ancestor of the target, so permitting ancestors would permit
+the sender under another name: a role could issue a directive and then certify
+its own work as done. Ancestors are not stranded — they hold `cancel`, and the
+two verbs assert different things. **Completion says the work happened;
+cancellation says it is no longer needed.**
+
+So the three verbs carry three different disciplines: `ack` is the target or an
+ancestor, `cancel` is the sender, and `done` is the target subtree.
+
+A completed directive stops being outstanding even when no acknowledgment was
+ever recorded, since completion is strictly stronger than receipt.
+
+The directive TTL checker nudges each phase on its own finite ladder. The
+acknowledgment phase counts with `directive_nudge_count` and the completion
+phase with `directive_done_nudge_count`, because the first counter is cumulative
+and never resets at acknowledgment, so one counter cannot bound both phases.
+Each phase caps at `directive_max_nudges`, emits **one** terminal escalation
+naming which obligation went unmet, and then stamps `directive_exhausted_at`.
+
+Exhaustion is terminal and leaves two records: `directive_exhausted_at` on the
+directive row for the evaluator's own reads, and an `[org:directive-exhausted ]`
+**marker note** in the directive's workflow journal. The marker is what makes the
+terminal state discoverable — ack, cancel and done are all marker notes, and the
+journal is what operator-facing readers consume, so a column-only terminal state
+would have been invisible to exactly the person who needs it.
+
+The stamp is **completion-phase only**. An acknowledgment ladder that exhausts
+does not terminate the directive: a late acknowledgment starts a fresh completion
+ladder, and the acknowledgment phase's own terminal condition is its counter
+reaching the cap. Both the evaluator and the atomic completion claim refuse an
+exhausted row, so a racing sweep cannot walk the terminal state back.
+
+The sweep window is sized from the count of currently open obligations rather
+than a fixed oldest-N, so a backlog of long-lived directives can no longer starve
+newer ones out of the window. TTL nags are delivered through the durable wake
+outbox with coalescing, like blocked and escalation wakes, rather than one live
+prompt per due directive per sweep.
+
 The daemon evaluates directive TTLs on the existing one-minute org supervision
 lane. `[org].directive_ack_ttl` defaults to `10m`,
 `[org].directive_done_ttl` defaults to `0s` (completion nudges off), and
@@ -11613,6 +11657,15 @@ retry|continue|abort|answer` resumes a delegation tree paused by
 `references/RESULT_CONTRACT.md` for the pause/resume semantics (`answer` is
 PR-comment-only).
 
+Before parsing, Gitmoot removes triple-backtick and tilde fenced code blocks and
+closed inline backtick spans (including single-backtick spans). GitHub must then
+report that the comment author currently has `write`, `maintain`, or `admin`
+repository permission; unauthorized addressed commands are rejected without
+parsing their command text. Ordinary prose and code examples produce no reply.
+An authorized malformed command still produces a visible routing error. An
+unclosed fenced code block treats the remainder of the comment as code, so any
+later command is ignored without a reply.
+
 ## Jobs And Locks
 
 ```sh
@@ -11934,7 +11987,8 @@ the CLI process crashed, exited non-zero, was signal-killed, or completed but
 never emitted a valid envelope even after repair attempts — the job records
 **failure diagnostics** (#806): a `phase` marker (`launched` = died before any
 stdout, `streaming` = died mid-output, `result-parse` = every delivery completed
-but no valid envelope was found), the process `exit_code` **or** terminating
+but no valid envelope was found, `recovery` = daemon recovery proved the durable
+runner was gone), the process `exit_code` **or** terminating
 `signal`, a **redacted** stderr tail (hard-capped at 4 KB; redaction runs over
 the full text with the same token-redaction rules as job comments *before* the
 tail is cut, so a secret can never leak partially), and the runtime session id
@@ -11969,12 +12023,28 @@ The staleness age leg is tunable via the
 `GITMOOT_STALE_RUNNING_AFTER` env var; the smallest honored value is 1m —
 below-1m, malformed, or non-positive values are rejected (with a one-time
 warning) in favor of the 30m default rather than clamped (#560). It is a crash
-backstop, not a kill deadline. After a **reboot** there is
-no wait at all — the daemon detects the changed kernel boot id and, on its next
-startup and every tick, immediately requeues every job claimed on a previous boot
-and reclaims its stranded `runtime:<rt>:<session>` lock, regardless of any
-unexpired lease (Linux only; elsewhere recovery falls back to the lease/age window;
-#651).
+backstop, not a kill deadline.
+
+### Migration note: daemon recovery now fails interrupted jobs
+
+As of #1308, daemon-owned jobs recovered after a restart are **failed, never
+silently requeued**. A changed Linux boot id, an expired runtime-session lease,
+or the three-leg stale liveness predicate produces a `job_recovery_failed` event
+that names the cause and recovery age since the row's last durable update and
+carries the redacted last 4 KB of the retained job log when available. A startup
+row with `job_kill_pending` but no
+terminal event is likewise failed with the explicit reason `daemon died
+mid-kill`. Inspect the evidence, then use `gitmoot job retry <job-id>` when a
+rerun is appropriate. `session-*` jobs are unchanged because they execute
+outside the daemon.
+
+**Configuration audit:** this migration makes no new config value load-bearing.
+`GITMOOT_STALE_RUNNING_AFTER` still controls the age leg and
+`[daemon].quiet_kill_after` still controls the byte-silence leg; only the final
+recovery action changed from implicit requeue to evidence-bearing failure. After
+a reboot there is no age wait: the daemon detects the changed kernel boot id on
+startup and each recovery sweep (Linux only; other platforms use lease/age
+recovery).
 
 `gitmoot job cancel <job-id>` is the single-job **abandon** verb. It dismisses a
 `queued`, `running`, **or `blocked`** job (a blocked job is one paused awaiting a
@@ -13966,6 +14036,15 @@ gitmoot agent doctor reviewer
 ```text
 /gitmoot reviewer review
 ```
+
+Gitmoot removes triple-backtick and tilde fenced code blocks plus closed inline
+backtick spans before considering comment commands. It then verifies through
+GitHub that the comment author currently has `write`, `maintain`, or `admin`
+permission on the repository before the remaining command text reaches the
+parser. Ordinary prose and code examples produce no Gitmoot reply; a malformed
+command from an authorized author produces a visible routing error. An unclosed
+fenced code block treats the remainder of the comment as code, so any later
+command is ignored without a reply.
 
 ```sh
 gitmoot job list --repo owner/repo
