@@ -126,7 +126,7 @@ func TestClaimRunningJobStampsRunnerIdentity(t *testing.T) {
 	}
 }
 
-func TestRequeueRunningJobsFromForeignBoot(t *testing.T) {
+func TestListRunningJobIDsFromForeignBoot(t *testing.T) {
 	ctx := context.Background()
 	store := openBootTestStore(t)
 	// Three running jobs: one claimed on a foreign boot, one on the current boot,
@@ -145,12 +145,12 @@ func TestRequeueRunningJobsFromForeignBoot(t *testing.T) {
 		}
 	}
 
-	requeued, err := store.RequeueRunningJobsFromForeignBoot(ctx, "cur-boot")
+	foreign, err := store.ListRunningJobIDsFromForeignBoot(ctx, "cur-boot")
 	if err != nil {
-		t.Fatalf("RequeueRunningJobsFromForeignBoot returned error: %v", err)
+		t.Fatalf("ListRunningJobIDsFromForeignBoot returned error: %v", err)
 	}
-	if len(requeued) != 1 || requeued[0] != "job-foreign" {
-		t.Fatalf("requeued = %v, want [job-foreign]", requeued)
+	if len(foreign) != 1 || foreign[0] != "job-foreign" {
+		t.Fatalf("foreign = %v, want [job-foreign]", foreign)
 	}
 	assertState := func(id, want string) {
 		t.Helper()
@@ -162,31 +162,16 @@ func TestRequeueRunningJobsFromForeignBoot(t *testing.T) {
 			t.Fatalf("job %s state = %q, want %q", id, job.State, want)
 		}
 	}
-	assertState("job-foreign", "queued")
+	assertState("job-foreign", "running")
 	assertState("job-current", "running")
 	assertState("job-legacy", "running")
 
-	// The foreign-boot requeue must leave an audit event.
-	events, err := store.ListJobEvents(ctx, "job-foreign")
-	if err != nil {
-		t.Fatalf("ListJobEvents returned error: %v", err)
-	}
-	var sawQueued bool
-	for _, e := range events {
-		if e.Kind == "queued" && e.Message == "recovered running job claimed on a previous boot (host rebooted)" {
-			sawQueued = true
-		}
-	}
-	if !sawQueued {
-		t.Fatalf("events = %+v, want a previous-boot recovery event", events)
-	}
-
 	// An empty current boot id (non-Linux / unavailable) is a STRICT no-op: no job
 	// with a non-empty recorded boot is ever swept just because it differs from "".
-	if requeued, err := store.RequeueRunningJobsFromForeignBoot(ctx, ""); err != nil {
-		t.Fatalf("RequeueRunningJobsFromForeignBoot(\"\") returned error: %v", err)
-	} else if len(requeued) != 0 {
-		t.Fatalf("empty-boot requeue = %v, want none", requeued)
+	if foreign, err := store.ListRunningJobIDsFromForeignBoot(ctx, ""); err != nil {
+		t.Fatalf("ListRunningJobIDsFromForeignBoot(\"\") returned error: %v", err)
+	} else if len(foreign) != 0 {
+		t.Fatalf("empty-boot foreign jobs = %v, want none", foreign)
 	}
 	assertState("job-current", "running")
 }
@@ -196,6 +181,15 @@ func TestReleaseRuntimeSessionLocksFromForeignBoot(t *testing.T) {
 	store := openBootTestStore(t)
 	now := time.Now().UTC()
 	future := now.Add(4 * time.Hour).Format(time.RFC3339Nano)
+	for _, id := range []string{"session-live", "session-terminal"} {
+		seedBootQueuedJob(t, store, id)
+		if claimed, err := store.ClaimRunningJob(ctx, id, "queued", "running", JobEvent{Kind: "running"}, 1234, "old-boot"); err != nil || !claimed {
+			t.Fatalf("ClaimRunningJob(%s) claimed=%v err=%v", id, claimed, err)
+		}
+	}
+	if transitioned, err := store.TransitionJobStateWithEvent(ctx, "session-terminal", "running", "cancelled", JobEvent{Kind: "cancelled"}); err != nil || !transitioned {
+		t.Fatalf("terminal session transition=%v err=%v", transitioned, err)
+	}
 
 	locks := []ResourceLock{
 		// Foreign-boot runtime lock with an UNEXPIRED lease: must be reclaimed
@@ -208,6 +202,10 @@ func TestReleaseRuntimeSessionLocksFromForeignBoot(t *testing.T) {
 		// Foreign-boot but NOT a runtime lock: must be kept (only runtime:% locks
 		// are reclaimed cross-boot by the daemon).
 		{ResourceKey: "skillopt-train-generation:s:i", OwnerJobID: "job-gen", OwnerToken: "t4", OwnerBootID: "old-boot", ExpiresAt: future},
+		// Running session jobs execute outside the daemon and remain protected.
+		{ResourceKey: "runtime:codex:session-live", OwnerJobID: "session-live", OwnerToken: "t5", OwnerBootID: "old-boot", ExpiresAt: future},
+		// Once the session row is terminal, its old-boot lock is stale and must go.
+		{ResourceKey: "runtime:codex:session-terminal", OwnerJobID: "session-terminal", OwnerToken: "t6", OwnerBootID: "old-boot", ExpiresAt: future},
 	}
 	for _, lock := range locks {
 		if acquired, err := store.AcquireResourceLock(ctx, lock, now); err != nil || !acquired {
@@ -219,8 +217,8 @@ func TestReleaseRuntimeSessionLocksFromForeignBoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReleaseRuntimeSessionLocksFromForeignBoot returned error: %v", err)
 	}
-	if released != 1 {
-		t.Fatalf("released = %d, want 1", released)
+	if released != 2 {
+		t.Fatalf("released = %d, want 2", released)
 	}
 	present := func(key string) bool {
 		t.Helper()
@@ -232,7 +230,10 @@ func TestReleaseRuntimeSessionLocksFromForeignBoot(t *testing.T) {
 	if present("runtime:codex:s-old") {
 		t.Fatal("foreign-boot runtime lock was not reclaimed")
 	}
-	for _, key := range []string{"runtime:codex:s-cur", "runtime:codex:s-legacy", "skillopt-train-generation:s:i"} {
+	if present("runtime:codex:session-terminal") {
+		t.Fatal("terminal session's foreign-boot runtime lock was not reclaimed")
+	}
+	for _, key := range []string{"runtime:codex:s-cur", "runtime:codex:s-legacy", "skillopt-train-generation:s:i", "runtime:codex:session-live"} {
 		if !present(key) {
 			t.Fatalf("lock %s was wrongly reclaimed", key)
 		}

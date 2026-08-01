@@ -163,13 +163,13 @@ func TestE2E560LeaseGraceGuardsTeardownWindow(t *testing.T) {
 	}
 }
 
-// TestE2E560ExpiredLeaseRequeuesStuckWorker proves crash recovery still works
+// TestE2E560ExpiredLeaseFailsStuckWorker proves crash recovery still works
 // after the grace is added: a genuinely stuck/crashed worker whose runtime lease
 // (sized jobTimeout+grace, as run() sizes it) has FULLY elapsed is promptly
-// requeued (running -> queued) and its expired lease reaped — well before the
+// failed (running -> failed) and its expired lease reaped — well before the
 // coarse 30m stale window. This is the #560 recovery path; without it a crashed
 // worker's owner would strand in 'running' until the coarse backstop.
-func TestE2E560ExpiredLeaseRequeuesStuckWorker(t *testing.T) {
+func TestE2E560ExpiredLeaseFailsStuckWorker(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
@@ -209,8 +209,8 @@ func TestE2E560ExpiredLeaseRequeuesStuckWorker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetJob returned error: %v", err)
 	}
-	if job.State != string(workflow.JobQueued) {
-		t.Fatalf("job state = %q, want queued; a crashed worker with a fully-expired lease must be requeued", job.State)
+	if job.State != string(workflow.JobFailed) {
+		t.Fatalf("job state = %q, want failed; a crashed worker with a fully-expired lease must settle", job.State)
 	}
 	if _, err := store.GetResourceLock(ctx, lockKey); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("GetResourceLock after expired-lease reap = %v, want sql.ErrNoRows", err)

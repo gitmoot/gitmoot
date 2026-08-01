@@ -110,7 +110,7 @@ func TestRecoverKillPendingJobFailsInsteadOfRequeueing(t *testing.T) {
 		t.Fatalf("witnessed job state = %q, want failed", witnessed.State)
 	}
 	events, _ := store.ListJobEvents(ctx, witnessed.ID)
-	if !daemonWorkerHasEvent(events, string(workflow.JobFailed)) || !strings.Contains(events[len(events)-1].Message, "killed-by-deadline-unwitnessed") {
+	if events[len(events)-1].Kind != jobRecoveryFailedEvent || !strings.Contains(events[len(events)-1].Message, "daemon died mid-kill") || !strings.Contains(events[len(events)-1].Message, "killed-by-deadline-unwitnessed") {
 		t.Fatalf("witnessed job events = %+v, want terminal unwitnessed-deadline reason", events)
 	}
 	noWitness, _ := store.GetJob(ctx, "job-no-witness")

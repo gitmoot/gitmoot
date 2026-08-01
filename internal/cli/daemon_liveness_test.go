@@ -104,7 +104,7 @@ func TestDaemonLivenessSweepDeadPIDFrozenLogFails(t *testing.T) {
 	}
 	message := ""
 	for _, event := range events {
-		if event.Kind == string(workflow.JobFailed) {
+		if event.Kind == jobRecoveryFailedEvent {
 			message = event.Message
 			break
 		}

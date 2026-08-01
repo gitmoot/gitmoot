@@ -2090,7 +2090,8 @@ the CLI process crashed, exited non-zero, was signal-killed, or completed but
 never emitted a valid envelope even after repair attempts — the job records
 **failure diagnostics** (#806): a `phase` marker (`launched` = died before any
 stdout, `streaming` = died mid-output, `result-parse` = every delivery completed
-but no valid envelope was found), the process `exit_code` **or** terminating
+but no valid envelope was found, `recovery` = daemon recovery proved the durable
+runner was gone), the process `exit_code` **or** terminating
 `signal`, a **redacted** stderr tail (hard-capped at 4 KB; redaction runs over
 the full text with the same token-redaction rules as job comments *before* the
 tail is cut, so a secret can never leak partially), and the runtime session id
@@ -2125,12 +2126,28 @@ The staleness age leg is tunable via the
 `GITMOOT_STALE_RUNNING_AFTER` env var; the smallest honored value is 1m —
 below-1m, malformed, or non-positive values are rejected (with a one-time
 warning) in favor of the 30m default rather than clamped (#560). It is a crash
-backstop, not a kill deadline. After a **reboot** there is
-no wait at all — the daemon detects the changed kernel boot id and, on its next
-startup and every tick, immediately requeues every job claimed on a previous boot
-and reclaims its stranded `runtime:<rt>:<session>` lock, regardless of any
-unexpired lease (Linux only; elsewhere recovery falls back to the lease/age window;
-#651).
+backstop, not a kill deadline.
+
+### Migration note: daemon recovery now fails interrupted jobs
+
+As of #1308, daemon-owned jobs recovered after a restart are **failed, never
+silently requeued**. A changed Linux boot id, an expired runtime-session lease,
+or the three-leg stale liveness predicate produces a `job_recovery_failed` event
+that names the cause and recovery age since the row's last durable update and
+carries the redacted last 4 KB of the retained job log when available. A startup
+row with `job_kill_pending` but no
+terminal event is likewise failed with the explicit reason `daemon died
+mid-kill`. Inspect the evidence, then use `gitmoot job retry <job-id>` when a
+rerun is appropriate. `session-*` jobs are unchanged because they execute
+outside the daemon.
+
+**Configuration audit:** this migration makes no new config value load-bearing.
+`GITMOOT_STALE_RUNNING_AFTER` still controls the age leg and
+`[daemon].quiet_kill_after` still controls the byte-silence leg; only the final
+recovery action changed from implicit requeue to evidence-bearing failure. After
+a reboot there is no age wait: the daemon detects the changed kernel boot id on
+startup and each recovery sweep (Linux only; other platforms use lease/age
+recovery).
 
 `gitmoot job cancel <job-id>` is the single-job **abandon** verb. It dismisses a
 `queued`, `running`, **or `blocked`** job (a blocked job is one paused awaiting a
