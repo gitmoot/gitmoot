@@ -1280,6 +1280,24 @@ not completion. `gitmoot org directive cancel <id> [--by <role>] [--home
 from `--by` or `GITMOOT_ORG_ROLE`; missing identity fails closed. They append
 typed markers to the directive's workflow journal.
 
+`gitmoot org directive done <id> [--by <role>] [--home <dir>]` records
+COMPLETION and ends the obligation, including its TTL nudges. **Completion
+authority is the target subtree**: the addressed role, or a role below it in the
+chart — someone who plausibly did the work.
+
+**Ancestors cannot complete, and that exclusion is the point.** `send` requires
+the sender to be an ancestor of the target, so permitting ancestors would permit
+the sender under another name: a role could issue a directive and then certify
+its own work as done. Ancestors are not stranded — they hold `cancel`, and the
+two verbs assert different things. **Completion says the work happened;
+cancellation says it is no longer needed.**
+
+So the three verbs carry three different disciplines: `ack` is the target or an
+ancestor, `cancel` is the sender, and `done` is the target subtree.
+
+A completed directive stops being outstanding even when no acknowledgment was
+ever recorded, since completion is strictly stronger than receipt.
+
 The daemon evaluates directive TTLs on the existing one-minute org supervision
 lane. `[org].directive_ack_ttl` defaults to `10m`,
 `[org].directive_done_ttl` defaults to `0s` (completion nudges off), and
