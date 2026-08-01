@@ -1421,11 +1421,19 @@ and never resets at acknowledgment, so one counter cannot bound both phases.
 Each phase caps at `directive_max_nudges`, emits **one** terminal escalation
 naming which obligation went unmet, and then stamps `directive_exhausted_at`.
 
-Exhaustion is **terminal but never silent**: the directive stays listed and
-queryable with a visible stamp, so an obligation that ended un-met remains
-discoverable rather than disappearing. Both the evaluator and the atomic nudge
-claim refuse an exhausted row, so a racing sweep cannot walk the terminal state
-back.
+Exhaustion is terminal and is recorded on the directive row as
+`directive_exhausted_at`. **Scope of that visibility, stated precisely:** the
+stamp is exposed through the open-obligation listing the checker itself reads —
+it is queryable there, and the terminal escalation is emitted as an event — but
+it does **not** currently surface as a Comms thread, because Comms renders
+escalation *notes* and exhaustion writes a column. Do not rely on the Comms view
+to discover an exhausted obligation today.
+
+The stamp is **completion-phase only**. An acknowledgment ladder that exhausts
+does not terminate the directive: a late acknowledgment starts a fresh completion
+ladder, and the acknowledgment phase's own terminal condition is its counter
+reaching the cap. Both the evaluator and the atomic completion claim refuse an
+exhausted row, so a racing sweep cannot walk the terminal state back.
 
 The sweep window is sized from the count of currently open obligations rather
 than a fixed oldest-N, so a backlog of long-lived directives can no longer starve

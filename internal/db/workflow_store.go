@@ -877,7 +877,11 @@ WHERE substr(d.body, 1, length('[org:directive ')) = '[org:directive '
 // unbounded acked-phase ladder guaranteed such rows existed. The bound here is
 // now a SAFETY CEILING against a pathological population, not the working limit.
 func (s *Store) ListOpenOrgDirectiveObligations(ctx context.Context, limit int) ([]OrgDirectiveObligation, error) {
-	if limit <= 0 || limit > directiveSweepCeiling {
+	// #1352 B3: NO CEILING on a caller-supplied window. The blocked-task remedy
+	// passes the full live population and clamps nothing; clamping to 200 meant a
+	// population of 201 still starved directive 201 forever, which is the very
+	// defect being fixed. Only an unset/invalid limit falls back to the default.
+	if limit <= 0 {
 		limit = directiveSweepCeiling
 	}
 	rows, err := s.db.QueryContext(ctx, `
@@ -935,7 +939,14 @@ WHERE id = ?
 	AND directive_done_nudge_count = ?
 	AND directive_last_nudged_at = ?
 	AND TRIM(directive_exhausted_at) = ''
-	AND substr(body, 1, length('[org:directive ')) = '[org:directive '`,
+	AND substr(body, 1, length('[org:directive ')) = '[org:directive '
+	AND NOT EXISTS (
+		SELECT 1 FROM workflow_notes r
+		WHERE r.workflow_id = workflow_notes.workflow_id AND (
+			substr(r.body, 1, length('[org:directive-cancel id=' || workflow_notes.id || ' ')) = '[org:directive-cancel id=' || workflow_notes.id || ' '
+			OR substr(r.body, 1, length('[org:directive-done id=' || workflow_notes.id || ' ')) = '[org:directive-done id=' || workflow_notes.id || ' '
+		)
+	)`,
 		stamp, id, expectedCount, expectedLastNudgedAt)
 	if err != nil {
 		return expectedCount, false, err

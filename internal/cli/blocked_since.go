@@ -389,12 +389,18 @@ func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.
 		// neither, so an acknowledged directive with a done TTL re-nudged forever.
 		if newCount >= orgConfig.DirectiveMaxNudges() {
 			events.EmitEvent(ctx, sink, buildDirectiveEscalationEvent(item, orgConfig, from, to, phase, newCount, now))
-			// Terminal, and deliberately NOT silent: the row stays listed with a
-			// visible stamp rather than the obligation disappearing.
-			if stamped, err := deps.markExhausted(ctx, store, item, now); err != nil {
-				writeLine(stdout, "org directive %d exhausted mark failed: %v", item.ID, err)
-			} else if stamped {
-				writeLine(stdout, "org directive %d %s ladder exhausted after %d nudges; obligation remains open and queryable", item.ID, phase, newCount)
+			// #1352 B2: the stamp is COMPLETION-ONLY. Stamping it for the
+			// acknowledgment phase terminated BOTH phases, so a directive that
+			// exhausted its ack ladder and was then acknowledged LATE could never
+			// start its completion ladder at all. The ack phase's terminal condition
+			// is its own counter at the cap — pre-existing, queryable, and it does
+			// not block the phase that follows it.
+			if !unacked {
+				if stamped, err := deps.markExhausted(ctx, store, item, now); err != nil {
+					writeLine(stdout, "org directive %d exhausted mark failed: %v", item.ID, err)
+				} else if stamped {
+					writeLine(stdout, "org directive %d %s ladder exhausted after %d nudges; obligation remains open and queryable", item.ID, phase, newCount)
+				}
 			}
 		}
 	}
@@ -402,10 +408,11 @@ func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.
 }
 
 func directiveTTLDue(item db.OrgDirectiveObligation, orgConfig config.OrgConfig, now time.Time) (anchor time.Time, ttl time.Duration, phase string, unacked, due bool) {
-	// #1352: a stamped-exhausted ladder is TERMINAL in either phase. The row is
-	// still listed and queryable; it is simply no longer due.
-	if strings.TrimSpace(item.ExhaustedAt) != "" {
-		return time.Time{}, 0, "", strings.TrimSpace(item.AckedAt) == "", false
+	// #1352 B2: the stamp is COMPLETION-phase terminal only. An unacknowledged
+	// directive is never gated by it, so a late ack starts a fresh completion
+	// ladder instead of inheriting the previous phase's terminal state.
+	if strings.TrimSpace(item.AckedAt) != "" && strings.TrimSpace(item.ExhaustedAt) != "" {
+		return time.Time{}, 0, "", false, false
 	}
 	if strings.TrimSpace(item.AckedAt) == "" {
 		if item.NudgeCount >= orgConfig.DirectiveMaxNudges() {

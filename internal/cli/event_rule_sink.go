@@ -72,8 +72,19 @@ func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
 				slog.Warn("durable wake event encode failed", "job_id", event.JobID, "kind", wakeKind, "error", err)
 				return
 			}
+			// #1352 B4: the drain (wakeOutboxKindForSource) recognises a directive
+			// wake as source_kind=workflow_note whose COALESCE KEY carries the
+			// directive prefix — that contract already existed. Inserting
+			// source_kind="directive" produced rows the drain rejected as an
+			// unsupported source kind, so admitting nags to the outbox without
+			// matching this shape moved the defect rather than fixing it.
+			sourceKind, coalesceKey := wakeKind, wakeKind
+			if wakeKind == db.WakeOutboxKindDirective {
+				sourceKind = db.WakeOutboxSourceWorkflowNote
+				coalesceKey = db.WakeOutboxDirectiveCoalescePrefix + strings.TrimSpace(event.JobID)
+			}
 			if err := s.store.InsertWakeOutbox(
-				ctx, wakeKind, string(payload), wakeKind, targetRoles,
+				ctx, sourceKind, string(payload), coalesceKey, targetRoles,
 			); err != nil {
 				slog.Warn("durable wake outbox insert failed", "job_id", event.JobID, "kind", wakeKind, "error", err)
 				return

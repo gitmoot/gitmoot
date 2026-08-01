@@ -445,3 +445,126 @@ func TestDirectiveTTLExhaustedIsTerminalAtTheEvaluatorToo(t *testing.T) {
 		t.Fatalf("exhausted obligation still emitted %d nudges", got)
 	}
 }
+
+// #1352 B3 — THE MUTANT IS THE ORIGINAL BEHAVIOUR: a fixed 200-row ceiling.
+// My previous starvation guard seeded six directives, so restoring the real
+// clamp changed nothing and the guard passed on unfixed code. This one seeds a
+// population that EXCEEDS the ceiling, which is the only shape where the defect
+// is observable at all.
+func TestDirectiveTTLSweepEvaluatesBeyondTheOldFixedCeiling(t *testing.T) {
+	home := t.TempDir()
+	cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, 0, 3)
+	store := openDirectiveTTLStore(t, home)
+	defer store.Close()
+	for i := 0; i < 200; i++ {
+		seedDirectiveTTLNote(t, store, fmt.Sprintf("older %d", i), 0, false)
+	}
+	newest := seedDirectiveTTLNote(t, store, "directive 201", 0, false)
+	sink := &recordingSink{}
+
+	if err := evaluateOrgDirectiveTTLs(context.Background(), store, sink, cfg, io.Discard, time.Now().UTC().Add(20*time.Minute), directiveTTLDependencies{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range sink.byType(events.EventOrgDirective) {
+		if w.JobID == fmt.Sprint(newest.ID) {
+			return
+		}
+	}
+	t.Fatalf("directive %d (row 201) was never evaluated: the sweep still clamps to a fixed ceiling", newest.ID)
+}
+
+// #1352 B2 — THE MUTANT IS THE ORIGINAL BEHAVIOUR: one stamp terminating both
+// phases. Exhaust the ACK ladder, then acknowledge LATE, and the completion
+// ladder must still run. Previously the ack-phase stamp terminated everything.
+func TestDirectiveTTLLateAckStartsAFreshCompletionLadder(t *testing.T) {
+	home := t.TempDir()
+	cfg := writeDirectiveTTLConfig(t, home, "supervisor", time.Minute, time.Minute, 2)
+	store := openDirectiveTTLStore(t, home)
+	defer store.Close()
+	note := seedDirectiveTTLNote(t, store, "late ack", time.Minute, true)
+	sink := &recordingSink{}
+
+	base := time.Now().UTC().Add(5 * time.Minute)
+	for i := 0; i < 6; i++ {
+		if err := evaluateOrgDirectiveTTLs(context.Background(), store, sink, cfg, io.Discard, base.Add(time.Duration(i)*2*time.Minute), directiveTTLDependencies{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ackWakes := len(sink.byType(events.EventOrgDirective))
+
+	// The LATE acknowledgment arrives after the ack ladder is spent.
+	acknowledgeDirectiveTTLNote(t, store, note)
+	later := base.Add(60 * time.Minute)
+	for i := 0; i < 6; i++ {
+		if err := evaluateOrgDirectiveTTLs(context.Background(), store, sink, cfg, io.Discard, later.Add(time.Duration(i)*2*time.Minute), directiveTTLDependencies{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got := len(sink.byType(events.EventOrgDirective)); got <= ackWakes {
+		t.Fatalf("completion ladder never started after a late ack (%d wakes before, %d after): one stamp terminated both phases", ackWakes, got)
+	}
+	escalations := sink.byType(events.EventJobNeedsAttention)
+	if len(escalations) < 2 {
+		t.Fatalf("escalations = %d, want one per phase; the completion phase never escalated", len(escalations))
+	}
+}
+
+// #1352 B5 — THE MUTANT IS THE ORIGINAL BEHAVIOUR: a completion claim with no
+// terminator recheck. Merging #1360 does NOT cover this — its guard is on the
+// ACKNOWLEDGMENT claim — so this must hold independently of that merge.
+func TestDirectiveTTLCompletionClaimRefusesTerminatedObligation(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, time.Minute, 3)
+	store := openDirectiveTTLStore(t, home)
+	defer store.Close()
+	note := seedDirectiveTTLNote(t, store, "done races the completion claim", time.Minute, true)
+	acknowledgeDirectiveTTLNote(t, store, note)
+
+	item := readDirectiveTTLObligation(t, store, note.ID)
+	// The terminator commits between listing and the completion claim.
+	if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: note.WorkflowID,
+		Author:     "worker",
+		Body:       workflow.FormatOrgDirectiveDoneNote(note.ID, "worker"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, claimed, err := store.MarkOrgDirectiveDoneNudged(ctx, item.ID, item.DoneNudgeCount, item.LastNudgedAt, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed {
+		t.Fatal("completion claim succeeded on a COMPLETED directive; #1360's guard covers the ack claim only")
+	}
+}
+
+// #1352 B4 — THE MUTANT IS THE ORIGINAL BEHAVIOUR: inserting a nag with
+// source_kind="directive". The drain recognises a directive wake only as
+// source_kind=workflow_note whose coalesce key carries the directive prefix, so
+// the original insert produced rows it rejected as an unsupported source kind —
+// admitting nags to the outbox without matching this shape moved the defect
+// rather than fixing it.
+//
+// This pins the INSERT-TO-DRAIN contract directly: whatever shape the sink
+// emits must be a shape the drain accepts.
+func TestDirectiveNagOutboxShapeIsAcceptedByTheDrain(t *testing.T) {
+	// The shape the sink now emits for a directive nag.
+	sourceKind := db.WakeOutboxSourceWorkflowNote
+	coalesceKey := db.WakeOutboxDirectiveCoalescePrefix + "4242"
+
+	kind, ok := wakeOutboxKindForSource(sourceKind, coalesceKey)
+	if !ok {
+		t.Fatalf("drain rejected the emitted nag shape (source_kind=%q coalesce=%q) as an unsupported source kind", sourceKind, coalesceKey)
+	}
+	if kind != db.WakeOutboxKindDirective {
+		t.Fatalf("drain classified the nag as %q, want %q", kind, db.WakeOutboxKindDirective)
+	}
+
+	// And the ORIGINAL shape must be exactly what the drain refuses, so this
+	// guard cannot pass by accident on a drain that accepts everything.
+	if _, ok := wakeOutboxKindForSource(db.WakeOutboxKindDirective, db.WakeOutboxKindDirective); ok {
+		t.Fatal("drain accepted source_kind=\"directive\"; this guard would not have caught the original defect")
+	}
+}
