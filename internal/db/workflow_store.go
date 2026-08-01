@@ -890,6 +890,15 @@ LIMIT ?`, limit)
 // MarkOrgDirectiveNudged atomically advances one persisted counter. The
 // expected values make a repeated or concurrent evaluator pass a no-op rather
 // than a duplicate wake.
+//
+// #1352: it is also the THIRD obligation-state site, and it must be terminator-
+// aware. ListOpenOrgDirectiveObligations can return an open row, a done or
+// cancel marker can commit in the gap, and the claim would still succeed —
+// after which evaluateOrgDirectiveTTLs emits a nudge for an obligation that has
+// already ended. Re-checking the terminators inside the SAME atomic UPDATE
+// closes that window: the claim is the last point before the wake, so it is the
+// correct place to enforce it. Cancel is included alongside done because it
+// carries the identical promise and the identical race.
 func (s *Store) MarkOrgDirectiveNudged(ctx context.Context, id int64, expectedCount int, expectedLastNudgedAt string, nudgedAt time.Time) (int, bool, error) {
 	stamp := nudgedAt.UTC().Format(time.RFC3339Nano)
 	result, err := s.db.ExecContext(ctx, `
@@ -899,7 +908,14 @@ SET directive_nudge_count = directive_nudge_count + 1,
 WHERE id = ?
 	AND directive_nudge_count = ?
 	AND directive_last_nudged_at = ?
-	AND substr(body, 1, length('[org:directive ')) = '[org:directive '`,
+	AND substr(body, 1, length('[org:directive ')) = '[org:directive '
+	AND NOT EXISTS (
+		SELECT 1 FROM workflow_notes r
+		WHERE r.workflow_id = workflow_notes.workflow_id AND (
+			substr(r.body, 1, length('[org:directive-cancel id=' || workflow_notes.id || ' ')) = '[org:directive-cancel id=' || workflow_notes.id || ' '
+			OR substr(r.body, 1, length('[org:directive-done id=' || workflow_notes.id || ' ')) = '[org:directive-done id=' || workflow_notes.id || ' '
+		)
+	)`,
 		stamp, id, expectedCount, expectedLastNudgedAt)
 	if err != nil {
 		return expectedCount, false, err

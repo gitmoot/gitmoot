@@ -339,6 +339,40 @@ func TestOrgDirectiveDoneVerbAuthorizationAndCompletion(t *testing.T) {
 		t.Fatalf("confirmation wording = %q, want \"completed directive\"", got)
 	}
 
+	// COMPLETION SEMANTICS, not just the exit code. Rewriting the done branch to
+	// write FormatOrgDirectiveAckNote left the earlier version of this test green:
+	// the CLI would report "completed" while persisting only RECEIPT, leaving the
+	// obligation open. Assert the persisted marker is a done marker naming this
+	// directive, and that no ack marker was written in its place.
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	id64, err := strconv.ParseInt(directiveID, 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notes, err := store.ListWorkflowNotes(context.Background(), "release/done", 100)
+	if err != nil {
+		t.Fatalf("ListWorkflowNotes returned error: %v", err)
+	}
+	doneMarkers, ackMarkers := 0, 0
+	for _, note := range notes {
+		if parsed, by, ok := workflow.ParseOrgDirectiveDoneNote(note.Body); ok && parsed == id64 {
+			if by != "worker" {
+				t.Fatalf("done marker recorded by %q, want worker", by)
+			}
+			doneMarkers++
+		}
+		if parsed, _, ok := workflow.ParseOrgDirectiveAckNote(note.Body); ok && parsed == id64 {
+			ackMarkers++
+		}
+	}
+	if doneMarkers != 1 || ackMarkers != 0 {
+		t.Fatalf("persisted markers: done=%d ack=%d — `done` must record COMPLETION, not receipt", doneMarkers, ackMarkers)
+	}
+
 	// An ancestor may complete on a second directive.
 	stdout.Reset()
 	stderr.Reset()
@@ -378,6 +412,24 @@ func TestOrgDirectiveDoneClearsUnackedListWithoutAck(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
+	// PRECONDITION. Without this the guard is vacuous: `AND 0` on the lister makes
+	// it semantically dead, every ID is absent, and an absence-only assertion stays
+	// green. Prove the directive IS listed before completion, so the test measures
+	// a TRANSITION rather than a permanent emptiness.
+	before, err := store.ListUnacknowledgedOrgDirectives(context.Background(), "worker")
+	if err != nil {
+		t.Fatalf("ListUnacknowledgedOrgDirectives (before) returned error: %v", err)
+	}
+	listedBefore := false
+	for _, note := range before {
+		if note.ID == directiveID {
+			listedBefore = true
+		}
+	}
+	if !listedBefore {
+		t.Fatalf("precondition failed: directive %d is not outstanding before completion; the lister is dead, not filtering (before=%+v)", directiveID, before)
+	}
+
 	// Write the completion marker directly: this guard is about the LISTER, so it
 	// must not depend on the CLI verb's behaviour.
 	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
@@ -395,6 +447,94 @@ func TestOrgDirectiveDoneClearsUnackedListWithoutAck(t *testing.T) {
 	for _, note := range unacked {
 		if note.ID == directiveID {
 			t.Fatalf("a completed directive still reads as outstanding with no ack recorded: %+v", note)
+		}
+	}
+}
+
+// #1352 SITE 3 of 3 (g7-review finding 2): the atomic nudge claim is a third
+// obligation-state site. ListOpenOrgDirectiveObligations can return an open row,
+// a terminator can commit in the gap, and MarkOrgDirectiveNudged would still
+// claim it — after which the evaluator emits a nudge for an obligation that has
+// already ended, so `done` did not reliably end TTL nudges as documented.
+//
+// This reproduces the exact race the reviewer probed: list -> insert terminator
+// -> claim. The claim must refuse.
+func TestOrgDirectiveNudgeClaimRefusesTerminatedObligation(t *testing.T) {
+	ctx := context.Background()
+	home := directiveTestHome(t)
+	t.Setenv("GITMOOT_ORG_ROLE", "owner")
+	var stdout, stderr bytes.Buffer
+	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/race", "race me"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("send code=%d err=%q", code, stderr.String())
+	}
+	directiveID, err := strconv.ParseInt(strings.Fields(stdout.String())[2], 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	// LIST: the evaluator observes the obligation as open.
+	open0, err := store.ListOpenOrgDirectiveObligations(ctx, 200)
+	if err != nil {
+		t.Fatalf("ListOpenOrgDirectiveObligations returned error: %v", err)
+	}
+	var item db.OrgDirectiveObligation
+	found := false
+	for _, o := range open0 {
+		if o.ID == directiveID {
+			item, found = o, true
+		}
+	}
+	if !found {
+		t.Fatalf("precondition failed: directive %d not returned as open", directiveID)
+	}
+
+	// The terminator commits in the gap between list and claim.
+	if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/race",
+		Author:     "worker",
+		Body:       workflow.FormatOrgDirectiveDoneNote(directiveID, "worker"),
+	}); err != nil {
+		t.Fatalf("insert done marker: %v", err)
+	}
+
+	// CLAIM: must refuse, or a nudge fires for a completed obligation.
+	_, claimed, err := store.MarkOrgDirectiveNudged(ctx, item.ID, item.NudgeCount, item.LastNudgedAt, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("MarkOrgDirectiveNudged returned error: %v", err)
+	}
+	if claimed {
+		t.Fatal("nudge claim succeeded on a COMPLETED directive; `done` does not end TTL nudges")
+	}
+
+	// And the claim must still work for an obligation that is genuinely open.
+	stdout.Reset()
+	stderr.Reset()
+	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/race2", "still open"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("second send code=%d err=%q", code, stderr.String())
+	}
+	openID, err := strconv.ParseInt(strings.Fields(stdout.String())[2], 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	open1, err := store.ListOpenOrgDirectiveObligations(ctx, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range open1 {
+		if o.ID != openID {
+			continue
+		}
+		_, ok, err := store.MarkOrgDirectiveNudged(ctx, o.ID, o.NudgeCount, o.LastNudgedAt, time.Now().UTC())
+		if err != nil {
+			t.Fatalf("MarkOrgDirectiveNudged (open) returned error: %v", err)
+		}
+		if !ok {
+			t.Fatal("terminator check refused a genuinely OPEN obligation; nudging is now dead")
 		}
 	}
 }

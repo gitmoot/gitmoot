@@ -1416,12 +1416,16 @@ typed markers to the directive's workflow journal.
 
 `gitmoot org directive done <id> [--by <role>] [--home <dir>]` records
 COMPLETION and ends the obligation, including its TTL nudges. It carries `ack`'s
-authorization discipline — the addressed target or one of its ancestors — because
-the role that owes the work, or an ancestor overseeing it, is who may declare it
-finished; the sender may `cancel` but may not mark another role's obligation
-complete on its behalf. A completed directive stops being outstanding even when
-no acknowledgment was ever recorded, since completion is strictly stronger than
-receipt.
+authorization discipline — the addressed target or one of its ancestors.
+
+This **includes the sender**: `send` requires the sender to be an ancestor of the
+target, so every valid sender is already authorized to acknowledge or complete.
+Ack's discipline and a sender exclusion cannot both hold, and the discipline is
+the rule — a parent completing an obligation it issued is oversight, not a
+loophole. `cancel` is the genuinely different rule: sender-only.
+
+A completed directive stops being outstanding even when no acknowledgment was
+ever recorded, since completion is strictly stronger than receipt.
 
 The daemon evaluates directive TTLs on the existing one-minute org supervision
 lane. `[org].directive_ack_ttl` defaults to `10m`,

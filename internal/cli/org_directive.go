@@ -47,7 +47,8 @@ func printOrgDirectiveUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org directive done ID [--by ROLE] [--home DIR]")
 	fmt.Fprintln(w, "Acknowledgment records receipt; `done` records COMPLETION and ends the")
 	fmt.Fprintln(w, "obligation, including its TTL nudges. Both are restricted to the target role")
-	fmt.Fprintln(w, "or an ancestor; only the sender may cancel.")
+	fmt.Fprintln(w, "or an ancestor -- which includes the sender, since a sender is always an")
+	fmt.Fprintln(w, "ancestor. Only the sender may cancel.")
 }
 
 func runOrgDirectiveSend(args []string, stdout, stderr io.Writer) int {
@@ -216,10 +217,16 @@ func runOrgDirectiveReceipt(kind string, args []string, stdout, stderr io.Writer
 		}
 		var body string
 		if kind == "ack" || kind == "done" {
-			// #1352: `done` carries ack's authorization discipline deliberately. The
-			// role that owes the work — or an ancestor overseeing it — is who may
-			// declare it finished; the SENDER may cancel but may not mark another
-			// role's obligation complete on its behalf.
+			// #1352: `done` carries ack's authorization discipline deliberately —
+			// the addressed target or one of its ancestors.
+			//
+			// NOTE, because the obvious reading is wrong: this DOES permit the
+			// sender. `send` requires the sender to be an ancestor of the target,
+			// so every valid sender is already an ancestor and is authorized here.
+			// Ack's discipline and a sender exclusion are mutually exclusive by
+			// construction; the discipline is what #1352 specifies, so a parent
+			// completing an obligation it issued is oversight, not a loophole.
+			// `cancel` remains sender-ONLY, which is a genuinely different rule.
 			if by != to && !slicesContains(cfg.Ancestors(to), by) {
 				// The ack wording is preserved byte-for-byte: it is an established
 				// user-facing contract with a test pinning it.
