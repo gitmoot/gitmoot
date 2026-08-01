@@ -295,9 +295,17 @@ func TestHighRiskFanoutAttributesLensChildren(t *testing.T) {
 	}
 }
 
-// #1250 finding 1, round 2 (g7-review). END-TO-END on the path that actually
-// runs: allocator-created BLANK lock -> role-bearing job persisted by Mailbox ->
-// executor preflight -> attributed lock.
+// #1250 finding 1, round 2 (g7-review). A FOCUSED PREFLIGHT INTEGRATION test —
+// deliberately not called end-to-end, because it constructs the JobPayload
+// directly rather than enqueueing through Mailbox. g7-review flagged the earlier
+// "END-TO-END" wording as an overstatement and was right: the name should say what
+// the test actually exercises, which is stored JobPayload -> executor
+// reconstruction -> ensureBranchLock -> Store.
+//
+// The other half of the seam (JobRequest -> Mailbox -> stored JobPayload) is bound
+// separately, and the reviewer's disposable probe composed both halves against
+// production; dropping the production line killed the composed probe and this
+// guard alike.
 //
 // The repair arm alone was not enough. ensureJobExecutorAllowed RECONSTRUCTS a
 // JobRequest to authorize the executor, and it omitted ActingOrgRole — so the
