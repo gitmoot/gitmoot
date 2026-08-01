@@ -72,8 +72,31 @@ func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
 				slog.Warn("durable wake event encode failed", "job_id", event.JobID, "kind", wakeKind, "error", err)
 				return
 			}
+			// #1352 B4: a directive nag is stored as source_kind=workflow_note,
+			// which is the shape the drain (wakeOutboxKindForSource) already
+			// recognises. ONLY the source kind is adjusted here.
+			//
+			// The COALESCE KEY IS THE STORE'S TO DERIVE — wakeOutboxCoalesceKey
+			// validates the kind and builds kind+":"+role. An earlier revision
+			// hand-built that key and passed it as the FOURTH argument, which is
+			// wakeKind, not a coalesce key; all three parameters are strings so the
+			// compiler could not see it, and the store rejected the key as an
+			// unsupported wake kind. Derive-don't-restate: pass the kind, let the
+			// store build the key.
+			sourceKind := wakeKind
+			sourceID := string(payload)
+			if wakeKind == db.WakeOutboxKindDirective {
+				sourceKind = db.WakeOutboxSourceWorkflowNote
+				// #1352 F3: source_id must be the LITERAL DIRECTIVE ID. The decoder
+				// (wakeOutboxEvent) renders it straight into the operator's command —
+				// "directive id %s for %s" — so storing the serialized event here
+				// produced `gitmoot org directive ack {"schema_version":1,...}`
+				// instead of `... ack 4242`. The row inserted fine and the command it
+				// delivered was garbage: written correctly, read wrongly.
+				sourceID = strings.TrimSpace(event.JobID)
+			}
 			if err := s.store.InsertWakeOutbox(
-				ctx, wakeKind, string(payload), wakeKind, targetRoles,
+				ctx, sourceKind, sourceID, wakeKind, targetRoles,
 			); err != nil {
 				slog.Warn("durable wake outbox insert failed", "job_id", event.JobID, "kind", wakeKind, "error", err)
 				return
@@ -104,10 +127,19 @@ func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
 	}()
 }
 
+// durableWakeKind selects the outbox kind for an event, or reports that the
+// event takes the live path.
+//
+// #1352: directive TTL nags are admitted. They were previously live-only, so
+// every due directive produced one prompt per sweep with no coalescing — a noise
+// factory at any directive volume, and the one wake class GUARANTEED to repeat
+// on a timer rather than on an external trigger. Routing them through the outbox
+// gives them the same batching every other recurring wake already has, and the
+// same durable record when delivery fails.
 func durableWakeKind(kinds []string) (string, bool) {
 	for _, kind := range kinds {
 		switch kind {
-		case db.WakeOutboxKindBlocked, db.WakeOutboxKindEscalation:
+		case db.WakeOutboxKindBlocked, db.WakeOutboxKindEscalation, db.WakeOutboxKindDirective:
 			return kind, true
 		}
 	}

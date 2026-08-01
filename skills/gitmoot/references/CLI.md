@@ -1432,6 +1432,32 @@ ancestor, `cancel` is the sender, and `done` is the target subtree.
 A completed directive stops being outstanding even when no acknowledgment was
 ever recorded, since completion is strictly stronger than receipt.
 
+The directive TTL checker nudges each phase on its own finite ladder. The
+acknowledgment phase counts with `directive_nudge_count` and the completion
+phase with `directive_done_nudge_count`, because the first counter is cumulative
+and never resets at acknowledgment, so one counter cannot bound both phases.
+Each phase caps at `directive_max_nudges`, emits **one** terminal escalation
+naming which obligation went unmet, and then stamps `directive_exhausted_at`.
+
+Exhaustion is terminal and leaves two records: `directive_exhausted_at` on the
+directive row for the evaluator's own reads, and an `[org:directive-exhausted ]`
+**marker note** in the directive's workflow journal. The marker is what makes the
+terminal state discoverable — ack, cancel and done are all marker notes, and the
+journal is what operator-facing readers consume, so a column-only terminal state
+would have been invisible to exactly the person who needs it.
+
+The stamp is **completion-phase only**. An acknowledgment ladder that exhausts
+does not terminate the directive: a late acknowledgment starts a fresh completion
+ladder, and the acknowledgment phase's own terminal condition is its counter
+reaching the cap. Both the evaluator and the atomic completion claim refuse an
+exhausted row, so a racing sweep cannot walk the terminal state back.
+
+The sweep window is sized from the count of currently open obligations rather
+than a fixed oldest-N, so a backlog of long-lived directives can no longer starve
+newer ones out of the window. TTL nags are delivered through the durable wake
+outbox with coalescing, like blocked and escalation wakes, rather than one live
+prompt per due directive per sweep.
+
 The daemon evaluates directive TTLs on the existing one-minute org supervision
 lane. `[org].directive_ack_ttl` defaults to `10m`,
 `[org].directive_done_ttl` defaults to `0s` (completion nudges off), and
