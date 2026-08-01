@@ -38,6 +38,26 @@ type blockedRoleWakeDependencies struct {
 	provider     func([]config.OrgRole) org.Provider
 	eventSink    func(context.Context, *db.Store, string) (events.Sink, error)
 	directives   directiveTTLDependencies
+	awaitedFacts awaitedFactTTLDependencies
+}
+
+type awaitedFactTTLDependencies struct {
+	list   func(context.Context, *db.Store, time.Time) ([]db.AwaitedFact, error)
+	expire func(context.Context, *db.Store, int64, string, time.Time) (bool, error)
+}
+
+func (d awaitedFactTTLDependencies) listDue(ctx context.Context, store *db.Store, now time.Time) ([]db.AwaitedFact, error) {
+	if d.list != nil {
+		return d.list(ctx, store, now)
+	}
+	return store.ListDueAwaitedFacts(ctx, now)
+}
+
+func (d awaitedFactTTLDependencies) markExpired(ctx context.Context, store *db.Store, id int64, target string, now time.Time) (bool, error) {
+	if d.expire != nil {
+		return d.expire(ctx, store, id, target, now)
+	}
+	return store.ExpireAwaitedFact(ctx, id, target, now)
 }
 
 type directiveTTLDependencies struct {
@@ -286,6 +306,9 @@ func runBlockedRoleWakeOnce(ctx context.Context, store *db.Store, home string, s
 		// common OSS/automated-user case — never probes herdr and never logs.
 		return
 	}
+	if err := evaluateAwaitedFactTTLs(ctx, store, orgConfig, stdout, now.UTC(), deps.awaitedFacts); err != nil {
+		writeLine(stdout, "awaited fact TTL evaluation failed: %v", err)
+	}
 	// Directive supervision shares this existing one-minute lane but does not
 	// depend on a Herdr snapshot. Resolve the event-rule guard first: with zero
 	// enabled rules, sink is nil and no directive query is issued (config-inert).
@@ -347,6 +370,42 @@ func runBlockedRoleWakeOnce(ctx context.Context, store *db.Store, home string, s
 	if err := evaluateInputPendingRoleEpisodes(ctx, store, sink, snapshot, wakeAfter, stdout, now.UTC()); err != nil {
 		writeLine(stdout, "input_pending role evaluation failed: %v", err)
 	}
+}
+
+func evaluateAwaitedFactTTLs(ctx context.Context, store *db.Store, orgConfig config.OrgConfig, stdout io.Writer, now time.Time, deps awaitedFactTTLDependencies) error {
+	if store == nil {
+		return nil
+	}
+	items, err := deps.listDue(ctx, store, now.UTC())
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		role, ok := orgConfig.Role(item.WaiterRole)
+		target := item.WaiterRole
+		if ok {
+			target = strings.TrimSpace(role.Parent)
+		} else {
+			// Seat removal cannot remove the wait's termination bound. Preserve the
+			// exact removed-role address so delivery failure remains separately
+			// observable while the subscription itself becomes terminal/queryable.
+			writeLine(stdout, "awaited fact %d waiter role %q is no longer configured; expiring with wake still addressed to that role", item.ID, item.WaiterRole)
+		}
+		if target == "" {
+			// A root wait still terminates visibly. With no parent available, wake
+			// the root itself rather than turning expiry into silence.
+			target = item.WaiterRole
+		}
+		expired, err := deps.markExpired(ctx, store, item.ID, target, now.UTC())
+		if err != nil {
+			writeLine(stdout, "awaited fact %d expiry failed: %v", item.ID, err)
+			continue
+		}
+		if expired {
+			writeLine(stdout, "awaited fact %d expired; escalation addressed to %s", item.ID, target)
+		}
+	}
+	return nil
 }
 
 func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.Sink, orgConfig config.OrgConfig, stdout io.Writer, now time.Time, deps directiveTTLDependencies) error {

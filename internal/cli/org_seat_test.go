@@ -69,8 +69,9 @@ func TestOrgSeatAddEndsGreenOnRealityValidation(t *testing.T) {
 		"route org-seat-worker-blocked created",
 		"route org-seat-worker-directive created",
 		"route org-seat-worker-escalation created",
+		"route org-seat-worker-fact created",
 		"route org-seat-worker-reply created",
-		"ok 2 roles, 2 live panes, 5 enabled routes",
+		"ok 2 roles, 2 live panes, 6 enabled routes",
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("seat add output missing %q:\n%s", want, stdout.String())
@@ -85,8 +86,8 @@ func TestOrgSeatAddEndsGreenOnRealityValidation(t *testing.T) {
 		t.Fatalf("worker role = %+v, present=%t", worker, ok)
 	}
 	rules := listOrgSeatTestRules(t, paths)
-	if len(rules) != 5 {
-		t.Fatalf("event rules = %+v, want owner route plus four worker routes", rules)
+	if len(rules) != 6 {
+		t.Fatalf("event rules = %+v, want owner route plus five worker routes", rules)
 	}
 
 	// Re-running add is the repair path and must not duplicate owned routes.
@@ -94,11 +95,11 @@ func TestOrgSeatAddEndsGreenOnRealityValidation(t *testing.T) {
 	stderr.Reset()
 	code = runOrg([]string{"seat", "add", "worker", "--pane", "Worker", "--home", home}, &stdout, &stderr)
 	if code != 0 || !strings.Contains(stdout.String(), "route org-seat-worker-reply existed") ||
-		!strings.Contains(stdout.String(), "ok 2 roles, 2 live panes, 5 enabled routes") {
+		!strings.Contains(stdout.String(), "ok 2 roles, 2 live panes, 6 enabled routes") {
 		t.Fatalf("second seat add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
-	if got := len(listOrgSeatTestRules(t, paths)); got != 5 {
-		t.Fatalf("event rules after repair = %d, want 5", got)
+	if got := len(listOrgSeatTestRules(t, paths)); got != 6 {
+		t.Fatalf("event rules after repair = %d, want 6", got)
 	}
 }
 
@@ -176,7 +177,7 @@ func TestOrgSeatRemoveRefusesUnshippedBranchWork(t *testing.T) {
 	if _, ok := cfg.Role("worker"); !ok {
 		t.Fatal("branch-check mutant removed worker role")
 	}
-	if got := len(listOrgSeatTestRules(t, paths)); got != 5 {
+	if got := len(listOrgSeatTestRules(t, paths)); got != 6 {
 		t.Fatalf("branch refusal changed routes: %d", got)
 	}
 }
@@ -219,7 +220,7 @@ func TestOrgSeatRemoveClosesPaneAndEndsWithValidation(t *testing.T) {
 	}
 	for _, want := range []string{
 		"pane w1:p2 closed",
-		"role worker removed with 4 wake routes",
+		"role worker removed with 5 wake routes",
 		"ok 1 roles, 1 live panes, 1 enabled routes",
 	} {
 		if !strings.Contains(stdout.String(), want) {
@@ -262,8 +263,8 @@ func TestOrgSeatRemoveRestoresOwnedStateWhenPaneCloseFails(t *testing.T) {
 	if _, ok := cfg.Role("worker"); !ok {
 		t.Fatal("worker role was not restored after pane-close failure")
 	}
-	if got := len(listOrgSeatTestRules(t, paths)); got != 5 {
-		t.Fatalf("routes after pane-close rollback = %d, want 5", got)
+	if got := len(listOrgSeatTestRules(t, paths)); got != 6 {
+		t.Fatalf("routes after pane-close rollback = %d, want 6", got)
 	}
 }
 

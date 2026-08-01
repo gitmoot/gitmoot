@@ -1895,4 +1895,31 @@ ALTER TABLE workflow_notes ADD COLUMN directive_done_nudge_count INTEGER NOT NUL
 	CHECK(directive_done_nudge_count >= 0);
 ALTER TABLE workflow_notes ADD COLUMN directive_exhausted_at TEXT NOT NULL DEFAULT '';
 	`,
+	// #1368 durable awaited facts. A waiting row is the subscription; satisfied
+	// and expired are terminal, queryable outcomes. The partial unique index
+	// prevents duplicate live interests while allowing a later bounded wait for
+	// the same subject after an earlier terminal outcome. Append-only tail;
+	// migrations are positional.
+	`
+CREATE TABLE awaited_facts (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	waiter_role TEXT NOT NULL,
+	subject_kind TEXT NOT NULL,
+	subject_key TEXT NOT NULL,
+	deadline TEXT NOT NULL,
+	state TEXT NOT NULL DEFAULT 'waiting'
+		CHECK(state IN ('waiting', 'satisfied', 'expired')),
+	resolution_detail TEXT NOT NULL DEFAULT '',
+	satisfied_at TEXT NOT NULL DEFAULT '',
+	expired_at TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX idx_awaited_facts_live_subject
+	ON awaited_facts(waiter_role, subject_kind, subject_key)
+	WHERE state = 'waiting';
+CREATE INDEX idx_awaited_facts_waiting_deadline
+	ON awaited_facts(deadline, id)
+	WHERE state = 'waiting';
+	`,
 }
