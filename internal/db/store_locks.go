@@ -305,8 +305,23 @@ func (s *Store) CreateLock(ctx context.Context, lock BranchLock) (bool, error) {
 	// #1250: the acting org role is written HERE and only here — one writer, two
 	// readers. Attribution belongs to the branch's ownership event, so it is
 	// captured when the branch is taken and never rewritten afterwards.
-	result, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO branch_locks(repo_full_name, branch, owner, acting_org_role, updated_at)
-		VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)`, lock.RepoFullName, lock.Branch, lock.Owner, strings.TrimSpace(lock.ActingOrgRole))
+	// The ON CONFLICT arm is deliberately NOT a second writer: it is the SAME
+	// writer completing a row it already created. Worktree allocation
+	// (AllocateTaskWorktree / AllocateDelegationWorktree) creates the lock BEFORE
+	// the role-aware ensureBranchLock runs on the same dispatch, so a plain INSERT
+	// OR IGNORE froze the blank attribution forever and the "single writer" claim
+	// was false. Filling is restricted to the SAME OWNER and to a currently BLANK
+	// role, so a role is never overwritten and one owner can never relabel
+	// another's branch. Reacquisition by a different owner still goes through
+	// release + fresh insert, which replaces owner and attribution together.
+	result, err := s.db.ExecContext(ctx, `INSERT INTO branch_locks(repo_full_name, branch, owner, acting_org_role, updated_at)
+		VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(repo_full_name, branch) DO UPDATE SET
+			acting_org_role = excluded.acting_org_role,
+			updated_at = CURRENT_TIMESTAMP
+		WHERE branch_locks.owner = excluded.owner
+			AND TRIM(branch_locks.acting_org_role) = ''
+			AND TRIM(excluded.acting_org_role) <> ''`, lock.RepoFullName, lock.Branch, lock.Owner, strings.TrimSpace(lock.ActingOrgRole))
 	if err != nil {
 		return false, err
 	}
@@ -327,7 +342,7 @@ func (s *Store) GetBranchLock(ctx context.Context, repoFullName string, branch s
 }
 
 func (s *Store) ListBranchLocks(ctx context.Context, repoFullName string) ([]BranchLock, error) {
-	query := `SELECT repo_full_name, branch, owner, skip_native_review_fanout FROM branch_locks`
+	query := `SELECT repo_full_name, branch, owner, skip_native_review_fanout, acting_org_role FROM branch_locks`
 	args := []any{}
 	if strings.TrimSpace(repoFullName) != "" {
 		query += ` WHERE repo_full_name = ?`
@@ -343,7 +358,7 @@ func (s *Store) ListBranchLocks(ctx context.Context, repoFullName string) ([]Bra
 	var locks []BranchLock
 	for rows.Next() {
 		var lock BranchLock
-		if err := rows.Scan(&lock.RepoFullName, &lock.Branch, &lock.Owner, &lock.SkipNativeReviewFanout); err != nil {
+		if err := rows.Scan(&lock.RepoFullName, &lock.Branch, &lock.Owner, &lock.SkipNativeReviewFanout, &lock.ActingOrgRole); err != nil {
 			return nil, err
 		}
 		locks = append(locks, lock)
@@ -371,7 +386,7 @@ func parseStoredTimestamp(s string) time.Time {
 // stranded-lock detection, #617) do not have to widen the lean BranchLock struct
 // every read path already scans.
 func (s *Store) ListBranchLocksWithAge(ctx context.Context, repoFullName string) ([]BranchLockInfo, error) {
-	query := `SELECT repo_full_name, branch, owner, skip_native_review_fanout, created_at, updated_at FROM branch_locks`
+	query := `SELECT repo_full_name, branch, owner, skip_native_review_fanout, acting_org_role, created_at, updated_at FROM branch_locks`
 	args := []any{}
 	if strings.TrimSpace(repoFullName) != "" {
 		query += ` WHERE repo_full_name = ?`
@@ -388,7 +403,7 @@ func (s *Store) ListBranchLocksWithAge(ctx context.Context, repoFullName string)
 	for rows.Next() {
 		var info BranchLockInfo
 		var createdAt, updatedAt string
-		if err := rows.Scan(&info.RepoFullName, &info.Branch, &info.Owner, &info.SkipNativeReviewFanout, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&info.RepoFullName, &info.Branch, &info.Owner, &info.SkipNativeReviewFanout, &info.ActingOrgRole, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 		info.CreatedAt = parseStoredTimestamp(createdAt)

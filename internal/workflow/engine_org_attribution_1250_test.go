@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -141,5 +142,155 @@ func assertFanoutChildRole(t *testing.T, ctx context.Context, store *db.Store, w
 	}
 	if !found {
 		t.Fatal("no review job was enqueued; cannot assert attribution")
+	}
+}
+
+// #1250 finding 1 (g7-review). The "single writer" claim was FALSE as first
+// written. Worktree allocation (AllocateTaskWorktree / AllocateDelegationWorktree)
+// creates the branch lock BEFORE the role-aware ensureBranchLock runs on the same
+// dispatch, and because CreateLock was INSERT OR IGNORE the blank attribution was
+// frozen forever — the role-bearing caller could never repair it.
+//
+// The fix keeps ONE writer and lets it COMPLETE a row it already created:
+// same-owner, blank-only fill. This models the real sequence.
+func TestBlankLockFromWorktreeAllocationIsRepairedByTheRoleAwarePath(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+
+	// Step 1: worktree allocation takes the branch with no role available.
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName: "gitmoot/gitmoot", Branch: "task-23", Owner: "lead",
+	}); err != nil || !acquired {
+		t.Fatalf("AcquireLock (worktree) returned acquired=%v err=%v", acquired, err)
+	}
+	// Step 2: the role-aware path runs for the SAME dispatch and owner.
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName: "gitmoot/gitmoot", Branch: "task-23", Owner: "lead", ActingOrgRole: "gmc-fanout",
+	}); err != nil || !acquired {
+		t.Fatalf("AcquireLock (role-aware) returned acquired=%v err=%v", acquired, err)
+	}
+
+	lock, err := store.GetBranchLock(ctx, "gitmoot/gitmoot", "task-23")
+	if err != nil {
+		t.Fatalf("GetBranchLock returned error: %v", err)
+	}
+	if lock.ActingOrgRole != "gmc-fanout" {
+		t.Fatalf("fresh worktree lock preempted attribution: acting_org_role=%q, want gmc-fanout", lock.ActingOrgRole)
+	}
+	if lock.Owner != "lead" {
+		t.Fatalf("repair changed the owner: %+v", lock)
+	}
+}
+
+// The repair must never RELABEL: an existing non-blank role is not overwritten,
+// and a different owner cannot fill another owner's blank. Without these the
+// blank-fill would be a genuine second writer rather than the same one finishing.
+func TestLockAttributionRepairNeverRelabels(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName: "gitmoot/gitmoot", Branch: "task-24", Owner: "lead", ActingOrgRole: "gmc-fanout",
+	}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	// Same owner, different role: must NOT overwrite an existing attribution.
+	if _, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName: "gitmoot/gitmoot", Branch: "task-24", Owner: "lead", ActingOrgRole: "gmc-gate",
+	}); err != nil {
+		t.Fatalf("AcquireLock returned error: %v", err)
+	}
+	lock, err := store.GetBranchLock(ctx, "gitmoot/gitmoot", "task-24")
+	if err != nil {
+		t.Fatalf("GetBranchLock returned error: %v", err)
+	}
+	if lock.ActingOrgRole != "gmc-fanout" {
+		t.Fatalf("an existing attribution was overwritten: %+v", lock)
+	}
+
+	// Different owner against a BLANK lock: must not fill it.
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName: "gitmoot/gitmoot", Branch: "task-25", Owner: "lead",
+	}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	if _, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName: "gitmoot/gitmoot", Branch: "task-25", Owner: "other", ActingOrgRole: "gmc-gate",
+	}); err != nil {
+		t.Fatalf("AcquireLock returned error: %v", err)
+	}
+	other, err := store.GetBranchLock(ctx, "gitmoot/gitmoot", "task-25")
+	if err != nil {
+		t.Fatalf("GetBranchLock returned error: %v", err)
+	}
+	if other.ActingOrgRole != "" {
+		t.Fatalf("a different owner relabelled a blank lock: %+v", other)
+	}
+}
+
+// #1250 finding 3 (g7-review). The list projections omitted the column, so
+// callers received a structurally valid but FALSELY BLANK lock — worse than a
+// missing field, because it reads as "unattributed" rather than "not loaded".
+func TestBranchLockListProjectionsCarryAttribution(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName: "gitmoot/gitmoot", Branch: "task-list-probe", Owner: "lead", ActingOrgRole: "gmc-fanout",
+	}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	locks, err := store.ListBranchLocks(ctx, "gitmoot/gitmoot")
+	if err != nil {
+		t.Fatalf("ListBranchLocks returned error: %v", err)
+	}
+	if len(locks) != 1 || locks[0].ActingOrgRole != "gmc-fanout" {
+		t.Fatalf("ListBranchLocks = %+v, want acting_org_role gmc-fanout", locks)
+	}
+	infos, err := store.ListBranchLocksWithAge(ctx, "gitmoot/gitmoot")
+	if err != nil {
+		t.Fatalf("ListBranchLocksWithAge returned error: %v", err)
+	}
+	if len(infos) != 1 || infos[0].ActingOrgRole != "gmc-fanout" {
+		t.Fatalf("ListBranchLocksWithAge = %+v, want acting_org_role gmc-fanout", infos)
+	}
+}
+
+// #1250 finding 2 (g7-review). The risk-tiered path diverts BEFORE the ordinary
+// attributed request loop, so the whole high-risk branch was unattributed.
+func TestHighRiskFanoutAttributesLensChildren(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "sec", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	engine.RiskTiersEnabled = true
+
+	event := highRiskEvent()
+	event.ActingOrgRole = "gmc-fanout"
+	if err := engine.HandlePullRequestOpened(ctx, event); err != nil {
+		t.Fatalf("HandlePullRequestOpened returned error: %v", err)
+	}
+
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	lenses := 0
+	for _, job := range jobs {
+		if !strings.Contains(job.ID, "/delegation/") {
+			continue
+		}
+		lenses++
+		payload, err := ParseJobPayload(job.Payload)
+		if err != nil {
+			t.Fatalf("ParseJobPayload returned error: %v", err)
+		}
+		if payload.ActingOrgRole != "gmc-fanout" {
+			t.Fatalf("high-risk lens %q acting_org_role = %q, want gmc-fanout", job.ID, payload.ActingOrgRole)
+		}
+	}
+	if lenses == 0 {
+		t.Fatal("no lens children were enqueued; cannot assert attribution")
 	}
 }

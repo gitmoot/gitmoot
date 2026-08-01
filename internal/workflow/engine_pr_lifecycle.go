@@ -213,8 +213,12 @@ func (e Engine) dispatchHighRiskReview(ctx context.Context, event PullRequestEve
 	}
 
 	coordPayload := JobPayload{
-		Repo:        event.Repo,
-		Branch:      event.Branch,
+		// #1250: the high-risk path diverts BEFORE the ordinary attributed request
+		// loop, so without this the lens children inherit an empty coordinator
+		// payload and the whole risk-tiered branch stays unattributed.
+		ActingOrgRole: event.ActingOrgRole,
+		Repo:          event.Repo,
+		Branch:        event.Branch,
 		PullRequest: event.PullRequest,
 		HeadSHA:     event.HeadSHA,
 		GoalID:      event.GoalID,
