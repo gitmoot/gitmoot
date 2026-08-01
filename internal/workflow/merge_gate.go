@@ -133,6 +133,9 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	if !g.AutoMerge && !request.HumanMergeRequested {
 		return MergeDecision{LeaveOpen: true, Reason: MergeLeaveOpenAutoMergeKillSwitchReason}, nil
 	}
+	if request.PullRequestDraftUnknown {
+		return MergeDecision{LeaveOpen: true, Reason: "pull request draft state is unknown"}, nil
+	}
 	if request.PullRequestDraft {
 		return MergeDecision{LeaveOpen: true, Reason: "pull request is draft"}, nil
 	}

@@ -486,25 +486,27 @@ func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string,
 		return MergeDecision{}, err
 	}
 	decision, err := e.MergeGate.Evaluate(ctx, MergeRequest{
-		Repo:                payload.Repo,
-		Branch:              payload.Branch,
-		PullRequest:         payload.PullRequest,
-		PullRequestDraft:    payload.PullRequestDraft,
-		HeadSHA:             payload.HeadSHA,
-		TaskID:              payload.TaskID,
-		WorkflowID:          payload.WorkflowID,
-		Reviewer:            reviewer,
-		ReviewOptional:      !reviewRequired,
-		HumanMergeRequested: humanMergeRequested,
+		Repo:                    payload.Repo,
+		Branch:                  payload.Branch,
+		PullRequest:             payload.PullRequest,
+		PullRequestDraft:        payload.PullRequestDraft,
+		PullRequestDraftUnknown: payload.PullRequestDraftUnknown,
+		HeadSHA:                 payload.HeadSHA,
+		TaskID:                  payload.TaskID,
+		WorkflowID:              payload.WorkflowID,
+		Reviewer:                reviewer,
+		ReviewOptional:          !reviewRequired,
+		HumanMergeRequested:     humanMergeRequested,
 	})
 	if err != nil {
 		return MergeDecision{}, err
 	}
 	if decision.LeaveOpen {
 		// A draft is an author-controlled hold, not a pending human merge decision.
-		// Keep the task in its current lifecycle state so a later ready-for-review
-		// observation can re-drive the gate without an unresumable human-decision park.
-		if payload.PullRequestDraft {
+		// Unknown draft state also fails toward NOT parking: parking requires a
+		// classifier-gated override to escape, while leaving the task active is
+		// recoverable when a later forge observation supplies the missing state.
+		if payload.PullRequestDraft || payload.PullRequestDraftUnknown {
 			return decision, nil
 		}
 		reason := strings.TrimSpace(decision.Reason)

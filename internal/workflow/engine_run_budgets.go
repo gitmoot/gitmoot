@@ -470,19 +470,20 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 			}
 		}
 		event := PullRequestEvent{
-			Repo:              payload.Repo,
-			Branch:            payload.Branch,
-			PullRequest:       payload.PullRequest,
-			PullRequestDraft:  payload.PullRequestDraft,
-			HeadSHA:           payload.HeadSHA,
-			GoalID:            payload.GoalID,
-			TaskID:            payload.TaskID,
-			TaskTitle:         payload.TaskTitle,
-			LeadAgent:         leadAgent,
-			Sender:            job.Agent,
-			RequiredReviewers: e.requiredReviewers(payload),
-			SkipReviewFanout:  skipFanout,
-			ActingOrgRole:     actingOrgRole,
+			Repo:                    payload.Repo,
+			Branch:                  payload.Branch,
+			PullRequest:             payload.PullRequest,
+			PullRequestDraft:        payload.PullRequestDraft,
+			PullRequestDraftUnknown: payload.PullRequestDraftUnknown,
+			HeadSHA:                 payload.HeadSHA,
+			GoalID:                  payload.GoalID,
+			TaskID:                  payload.TaskID,
+			TaskTitle:               payload.TaskTitle,
+			LeadAgent:               leadAgent,
+			Sender:                  job.Agent,
+			RequiredReviewers:       e.requiredReviewers(payload),
+			SkipReviewFanout:        skipFanout,
+			ActingOrgRole:           actingOrgRole,
 		}
 		// The branch-lock persist for the daemon's PR-watcher path (trigger 2) now
 		// happens above, before the no-PR early return, so it covers the PR arm and

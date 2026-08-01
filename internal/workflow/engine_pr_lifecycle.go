@@ -74,15 +74,16 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 	}
 	if len(reviewers) == 0 {
 		decision, err := e.runMergeGate(ctx, "", JobPayload{
-			Repo:             event.Repo,
-			Branch:           event.Branch,
-			PullRequest:      event.PullRequest,
-			PullRequestDraft: event.PullRequestDraft,
-			HeadSHA:          event.HeadSHA,
-			GoalID:           event.GoalID,
-			TaskID:           event.TaskID,
-			TaskTitle:        event.TaskTitle,
-			LeadAgent:        event.LeadAgent,
+			Repo:                    event.Repo,
+			Branch:                  event.Branch,
+			PullRequest:             event.PullRequest,
+			PullRequestDraft:        event.PullRequestDraft,
+			PullRequestDraftUnknown: event.PullRequestDraftUnknown,
+			HeadSHA:                 event.HeadSHA,
+			GoalID:                  event.GoalID,
+			TaskID:                  event.TaskID,
+			TaskTitle:               event.TaskTitle,
+			LeadAgent:               event.LeadAgent,
 		}, ref)
 		if err != nil {
 			return err
@@ -279,16 +280,17 @@ func (e Engine) HandlePullRequestReadyToMerge(ctx context.Context, event PullReq
 	_, _ = RecordPullRequestWorkflowTransition(ctx, e.Store, event, PullRequestJournalReady)
 	ref := taskRefFromPullRequest(event)
 	_, err := e.runMergeGateWithHumanMerge(ctx, "", JobPayload{
-		Repo:             event.Repo,
-		Branch:           event.Branch,
-		PullRequest:      event.PullRequest,
-		PullRequestDraft: event.PullRequestDraft,
-		HeadSHA:          event.HeadSHA,
-		GoalID:           event.GoalID,
-		TaskID:           event.TaskID,
-		TaskTitle:        event.TaskTitle,
-		LeadAgent:        event.LeadAgent,
-		Reviewers:        compactStrings(append([]string{}, event.RequiredReviewers...)),
+		Repo:                    event.Repo,
+		Branch:                  event.Branch,
+		PullRequest:             event.PullRequest,
+		PullRequestDraft:        event.PullRequestDraft,
+		PullRequestDraftUnknown: event.PullRequestDraftUnknown,
+		HeadSHA:                 event.HeadSHA,
+		GoalID:                  event.GoalID,
+		TaskID:                  event.TaskID,
+		TaskTitle:               event.TaskTitle,
+		LeadAgent:               event.LeadAgent,
+		Reviewers:               compactStrings(append([]string{}, event.RequiredReviewers...)),
 	}, ref, event.HumanMergeRequested)
 	return err
 }

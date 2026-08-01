@@ -934,17 +934,18 @@ func (d Daemon) handlePullRequestWorkflowChange(ctx context.Context, pull github
 	}
 	mergeReadinessHandled := len(reviewers) == 0 && !lock.SkipNativeReviewFanout
 	err = d.Workflow.HandlePullRequestOpened(ctx, workflow.PullRequestEvent{
-		Repo:              d.Repo.FullName(),
-		Branch:            ref.branch,
-		PullRequest:       int(pull.Number),
-		PullRequestDraft:  pull.Draft,
-		HeadSHA:           pull.HeadSHA,
-		GoalID:            ref.goalID,
-		TaskID:            ref.id,
-		TaskTitle:         ref.title,
-		LeadAgent:         lock.Owner,
-		Sender:            "github",
-		RequiredReviewers: reviewers,
+		Repo:                    d.Repo.FullName(),
+		Branch:                  ref.branch,
+		PullRequest:             int(pull.Number),
+		PullRequestDraft:        pull.Draft,
+		PullRequestDraftUnknown: pull.DraftUnknown,
+		HeadSHA:                 pull.HeadSHA,
+		GoalID:                  ref.goalID,
+		TaskID:                  ref.id,
+		TaskTitle:               ref.title,
+		LeadAgent:               lock.Owner,
+		Sender:                  "github",
+		RequiredReviewers:       reviewers,
 		// Trigger 2 (daemon path): the implement-job advancement persisted the
 		// skip flag onto the branch lock; honor it so the PR-watcher path skips
 		// the native review fanout too.
@@ -1037,16 +1038,17 @@ func (d Daemon) handleReadyToMergeWorkflow(ctx context.Context, pull github.Pull
 		branch = pull.HeadRef
 	}
 	return d.Workflow.HandlePullRequestReadyToMerge(ctx, workflow.PullRequestEvent{
-		Repo:             d.Repo.FullName(),
-		Branch:           branch,
-		PullRequest:      int(pull.Number),
-		PullRequestDraft: pull.Draft,
-		HeadSHA:          pull.HeadSHA,
-		GoalID:           task.GoalID,
-		TaskID:           task.ID,
-		TaskTitle:        task.Title,
-		LeadAgent:        leadAgent,
-		Sender:           "github",
+		Repo:                    d.Repo.FullName(),
+		Branch:                  branch,
+		PullRequest:             int(pull.Number),
+		PullRequestDraft:        pull.Draft,
+		PullRequestDraftUnknown: pull.DraftUnknown,
+		HeadSHA:                 pull.HeadSHA,
+		GoalID:                  task.GoalID,
+		TaskID:                  task.ID,
+		TaskTitle:               task.Title,
+		LeadAgent:               leadAgent,
+		Sender:                  "github",
 	})
 }
 
@@ -1991,18 +1993,19 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 		return err
 	}
 	err = d.Workflow.HandlePullRequestReadyToMerge(ctx, workflow.PullRequestEvent{
-		Repo:                d.Repo.FullName(),
-		Branch:              firstNonEmpty(task.Branch, pull.HeadRef),
-		PullRequest:         int(pull.Number),
-		PullRequestDraft:    pull.Draft,
-		HeadSHA:             pull.HeadSHA,
-		GoalID:              task.GoalID,
-		TaskID:              task.ID,
-		TaskTitle:           task.Title,
-		LeadAgent:           leadAgent,
-		Sender:              comment.Author,
-		RequiredReviewers:   reviewers,
-		HumanMergeRequested: true,
+		Repo:                    d.Repo.FullName(),
+		Branch:                  firstNonEmpty(task.Branch, pull.HeadRef),
+		PullRequest:             int(pull.Number),
+		PullRequestDraft:        pull.Draft,
+		PullRequestDraftUnknown: pull.DraftUnknown,
+		HeadSHA:                 pull.HeadSHA,
+		GoalID:                  task.GoalID,
+		TaskID:                  task.ID,
+		TaskTitle:               task.Title,
+		LeadAgent:               leadAgent,
+		Sender:                  comment.Author,
+		RequiredReviewers:       reviewers,
+		HumanMergeRequested:     true,
 	})
 	if err != nil {
 		var blocked workflow.BlockedError
