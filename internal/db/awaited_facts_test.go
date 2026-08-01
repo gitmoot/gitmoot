@@ -48,11 +48,21 @@ func subscribeReviewFact(t *testing.T, store *Store, role, repo string, pullRequ
 }
 
 func TestSubscribeAwaitedFactRechecksConcurrentProducerCommit(t *testing.T) {
-	store := openAwaitedFactTestStore(t)
+	path := filepath.Join(t.TempDir(), "gitmoot.db")
+	producerStore, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open producer store: %v", err)
+	}
+	t.Cleanup(func() { _ = producerStore.Close() })
+	subscriberStore, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open subscriber store: %v", err)
+	}
+	t.Cleanup(func() { _ = subscriberStore.Close() })
 	ctx := context.Background()
 	payload := awaitedReviewPayload(t, "acme/widget", 42, "head-race", "approved", "review-race")
 
-	producer, err := store.db.BeginTx(ctx, nil)
+	producer, err := producerStore.db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatalf("BeginTx producer: %v", err)
 	}
@@ -77,7 +87,7 @@ VALUES ('review-race', 'reviewer', 'review', 'succeeded', ?, 'review-race', 'rev
 			}{err: keyErr}
 			return
 		}
-		fact, subscribeErr := store.SubscribeAwaitedFact(ctx, AwaitedFactSubscription{
+		fact, subscribeErr := subscriberStore.SubscribeAwaitedFact(ctx, AwaitedFactSubscription{
 			WaiterRole: "lane", SubjectKind: AwaitedFactSubjectReviewVerdict,
 			SubjectKey: key, Deadline: time.Now().UTC().Add(time.Hour),
 		})
@@ -90,7 +100,7 @@ VALUES ('review-race', 'reviewer', 'review', 'succeeded', ?, 'review-race', 'rev
 	select {
 	case result := <-completed:
 		t.Fatalf("subscription completed before producer commit: fact=%+v err=%v", result.fact, result.err)
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(150 * time.Millisecond):
 	}
 	if err := producer.Commit(); err != nil {
 		t.Fatalf("commit producer verdict: %v", err)
@@ -101,6 +111,23 @@ VALUES ('review-race', 'reviewer', 'review', 'succeeded', ?, 'review-race', 'rev
 	}
 	if result.fact.State != AwaitedFactStateSatisfied {
 		t.Fatalf("subscription state = %q, want %q after fact committed before registration completed", result.fact.State, AwaitedFactStateSatisfied)
+	}
+}
+
+func TestSubscribeAwaitedFactRecheckRejectsOldHead(t *testing.T) {
+	store := openAwaitedFactTestStore(t)
+	ctx := context.Background()
+	oldPayload := awaitedReviewPayload(t, "acme/widget", 45, "old-head-a", "approved", "review-already-done")
+	if err := store.CreateJobWithEvent(ctx, Job{
+		ID: "review-already-done", Agent: "reviewer", Type: "review",
+		State: "succeeded", Payload: oldPayload,
+	}, JobEvent{Kind: "succeeded", Message: "approved old head"}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+
+	fact := subscribeReviewFact(t, store, "lane", "acme/widget", 45, "new-head-b")
+	if fact.State != AwaitedFactStateWaiting {
+		t.Fatalf("new-head subscription state = %q with old verdict already committed; want waiting", fact.State)
 	}
 }
 

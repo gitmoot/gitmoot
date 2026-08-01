@@ -276,10 +276,11 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 		if len(batch) > 1 {
 			detail = fmt.Sprintf("%d awaited facts ready; oldest: %s", len(batch), detail)
 		}
+		factID := fmt.Sprintf("awaited-fact:%d", payload.ID)
 		event = events.NewEvent(
 			events.EventOrgFact,
-			fmt.Sprintf("awaited-fact:%d", payload.ID),
-			oldest.SourceKind+":"+oldest.SourceID,
+			factID,
+			factID,
 			"",
 			payload.State,
 			detail,

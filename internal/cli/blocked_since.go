@@ -382,15 +382,19 @@ func evaluateAwaitedFactTTLs(ctx context.Context, store *db.Store, orgConfig con
 	}
 	for _, item := range items {
 		role, ok := orgConfig.Role(item.WaiterRole)
-		if !ok {
-			writeLine(stdout, "awaited fact %d expiry skipped: waiter role %q is not configured", item.ID, item.WaiterRole)
-			continue
+		target := item.WaiterRole
+		if ok {
+			target = strings.TrimSpace(role.Parent)
+		} else {
+			// Seat removal cannot remove the wait's termination bound. Preserve the
+			// exact removed-role address so delivery failure remains separately
+			// observable while the subscription itself becomes terminal/queryable.
+			writeLine(stdout, "awaited fact %d waiter role %q is no longer configured; expiring with wake still addressed to that role", item.ID, item.WaiterRole)
 		}
-		target := strings.TrimSpace(role.Parent)
 		if target == "" {
 			// A root wait still terminates visibly. With no parent available, wake
 			// the root itself rather than turning expiry into silence.
-			target = role.Name
+			target = item.WaiterRole
 		}
 		expired, err := deps.markExpired(ctx, store, item.ID, target, now.UTC())
 		if err != nil {

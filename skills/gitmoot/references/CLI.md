@@ -1485,9 +1485,11 @@ satisfies only the matching repository, PR, and head, then writes an addressed
 [--json] [--home <dir>]` shows live and terminal subscriptions. The existing
 one-minute org supervision lane expires overdue waits, retains the row as a
 queryable `expired` terminal state, and addresses the expiry to the waiter's
-current parent (or the waiter itself for a root role). Fact wakes are delivery
-only: they require a `fact` event rule but create no acknowledgment or completion
-ceremony.
+current parent (or the waiter itself for a root role). If the waiter role was
+removed from the chart, expiry still becomes terminal and the wake retains the
+removed role as its exact address, leaving delivery failure observable instead
+of making the wait immortal. Fact wakes are delivery only: they require a `fact`
+event rule but create no acknowledgment or completion ceremony.
 
 Event-rule wakes are separately opt-in:
 

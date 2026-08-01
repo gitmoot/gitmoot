@@ -85,9 +85,71 @@ func TestAwaitedFactOutboxIsAddressedDeliveryWithoutReceiptCeremony(t *testing.T
 	if len(matching) != 1 || matching[0].ID != "lane" {
 		t.Fatalf("matching fact rules = %+v, want exact lane rule", matching)
 	}
+	if event.RootID != "awaited-fact:7" || strings.Contains(event.RootID, "{") {
+		t.Fatalf("fact root_id = %q, want short stable fact id", event.RootID)
+	}
 	prompt := eventRuleWakePrompt("fact", event)
 	if !strings.Contains(prompt, "awaited fact for lane") || strings.Contains(prompt, " ack ") || strings.Contains(prompt, " done ") {
 		t.Fatalf("fact prompt = %q, want delivery-only prompt without receipt ceremony", prompt)
+	}
+}
+
+func TestAwaitedFactExpiryTerminatesWhenWaiterRoleWasRemoved(t *testing.T) {
+	root := t.TempDir()
+	paths := config.PathsForHome(root)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		t.Fatalf("LoadOrg: %v", err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	key, err := db.ReviewVerdictSubjectKey("acme/widget", 48, "head-removed-role")
+	if err != nil {
+		t.Fatalf("ReviewVerdictSubjectKey: %v", err)
+	}
+	deadline := time.Now().UTC().Add(time.Minute)
+	fact, err := store.SubscribeAwaitedFact(context.Background(), db.AwaitedFactSubscription{
+		WaiterRole: "removed-lane", SubjectKind: db.AwaitedFactSubjectReviewVerdict,
+		SubjectKey: key, Deadline: deadline,
+	})
+	if err != nil {
+		t.Fatalf("SubscribeAwaitedFact: %v", err)
+	}
+	var log bytes.Buffer
+	for tick := 1; tick <= 3; tick++ {
+		if err := evaluateAwaitedFactTTLs(context.Background(), store, cfg, &log, deadline.Add(time.Duration(tick)*time.Minute), awaitedFactTTLDependencies{}); err != nil {
+			t.Fatalf("evaluateAwaitedFactTTLs tick %d: %v", tick, err)
+		}
+	}
+	if got := strings.Count(log.String(), "is no longer configured"); got != 1 {
+		t.Fatalf("removed-role expiry log count = %d, want one terminal transition; log=%q", got, log.String())
+	}
+	expired, err := store.ListAwaitedFacts(context.Background(), "removed-lane", db.AwaitedFactStateExpired)
+	if err != nil {
+		t.Fatalf("ListAwaitedFacts expired: %v", err)
+	}
+	waiting, err := store.ListAwaitedFacts(context.Background(), "removed-lane", db.AwaitedFactStateWaiting)
+	if err != nil {
+		t.Fatalf("ListAwaitedFacts waiting: %v", err)
+	}
+	if len(expired) != 1 || expired[0].ID != fact.ID || len(waiting) != 0 {
+		t.Fatalf("after three ticks expired=%+v waiting=%+v, want one queryable terminal row and no immortal wait", expired, waiting)
+	}
+	outbox, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
+	if err != nil {
+		t.Fatalf("ListWakeOutbox: %v", err)
+	}
+	if len(outbox) != 1 || outbox[0].TargetRole != "removed-lane" {
+		t.Fatalf("removed-role expiry outbox = %+v, want one exact unroutable address", outbox)
 	}
 }
 
