@@ -169,13 +169,18 @@ type Goal struct {
 }
 
 type Task struct {
-	ID           string
-	RepoFullName string
-	GoalID       string
-	Title        string
-	State        string
-	Branch       string
-	WorktreePath string
+	ID                     string
+	RepoFullName           string
+	GoalID                 string
+	Title                  string
+	State                  string
+	Branch                 string
+	WorktreePath           string
+	UpdatedAt              string
+	DisposalTier           string
+	DisposalReason         string
+	DisposedAt             string
+	DisposalEscalationRole string
 }
 
 // TaskEvent is one append-only task lifecycle transition. FromState and

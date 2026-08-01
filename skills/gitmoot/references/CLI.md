@@ -1701,6 +1701,7 @@ Start a task in its dedicated branch worktree and inspect task state:
 gitmoot task run task-001 --repo owner/repo --owner lead --base main
 gitmoot task list --repo owner/repo
 gitmoot task list --repo owner/repo --state implementing --json
+gitmoot task list --repo owner/repo --state stranded --json
 gitmoot task dismiss task-001 --reason "abandoned experiment"
 gitmoot task resume-work task-001 --reason "review requires another fix pass"
 gitmoot task resume-work task-001 --reason "withdraw pending merge" --override-pending-human-decision
@@ -1719,6 +1720,16 @@ the task worktree also blocks dismissal. The default reason is `dismissed by
 operator`. Success preserves the branch and worktree, releases the branch lock
 best-effort, and appends `task_dismissed_manual` to `task events`. Repeating the
 command is an exit-0 no-op with `changed:false` in JSON.
+
+Past `[workflow].stale_task_ttl`, blocked tasks are disposed by forge evidence:
+own merged PR (`merged`), later merged work on the same referenced issue
+(`superseded`), closed subject (`superseded`), then the bounded `stranded`
+fallback. The JSON list includes `disposal_tier`, `disposal_reason`,
+`disposed_at`, and `disposal_escalation_role`. The pass never uses branch
+ancestry, and an open `awaiting_human_merge` PR is not inferred complete.
+Blocked-task alerts have their own finite ladder: after three interval-spaced
+nudges Gitmoot emits one terminal escalation and stops nagging. The task remains
+queryable until the separate evidence-disposal pass transitions it.
 
 `task resume-work` is the explicit coordinator-only path for taking an orphaned
 `reviewing` or `ready_to_merge` task back into development, or for withdrawing a

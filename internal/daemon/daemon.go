@@ -124,6 +124,15 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	if err := d.rearmAutoMergeDisabledTasks(ctx); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	// Disposal is independent of repository admission. Run it before the open-PR
+	// listing so an unavailable forge cannot bypass an already-expired task's
+	// terminal bound; the per-item evaluator records "subject unavailable".
+	paths := config.Paths{ConfigFile: filepath.Join(filepath.Dir(d.Store.DatabasePath()), config.ConfigName)}
+	if disposalTTL, err := config.LoadStaleTaskTTL(paths); err != nil {
+		d.logf("task disposal skipped for %s: %v", d.Repo.FullName(), err)
+	} else if err := d.reconcileTaskDisposals(ctx, disposalTTL); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	pulls, err := d.GitHub.ListPullRequests(ctx, d.Repo, "open")
 	if err != nil {
 		return err
@@ -265,7 +274,7 @@ func (d Daemon) reconcileStaleTasks(ctx context.Context, openBranches map[string
 	}
 	return d.reconcileTaskTTL(ctx, openBranches, taskTTLReconcilePolicy{
 		ttl:          staleTTL,
-		states:       []string{string(workflow.TaskImplementing), string(workflow.TaskBlocked)},
+		states:       []string{string(workflow.TaskImplementing)},
 		eventKind:    "task_dismissed_auto",
 		reasonPrefix: "stale task auto-dismissed",
 		logLabel:     "stale task reconciler",

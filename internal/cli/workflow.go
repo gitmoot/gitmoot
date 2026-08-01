@@ -279,13 +279,17 @@ func printTaskUsage(w io.Writer) {
 }
 
 type taskListOutput struct {
-	ID           string `json:"id"`
-	Repo         string `json:"repo"`
-	GoalID       string `json:"goal_id"`
-	Title        string `json:"title"`
-	State        string `json:"state"`
-	Branch       string `json:"branch"`
-	WorktreePath string `json:"worktree_path"`
+	ID                     string `json:"id"`
+	Repo                   string `json:"repo"`
+	GoalID                 string `json:"goal_id"`
+	Title                  string `json:"title"`
+	State                  string `json:"state"`
+	Branch                 string `json:"branch"`
+	WorktreePath           string `json:"worktree_path"`
+	DisposalTier           string `json:"disposal_tier,omitempty"`
+	DisposalReason         string `json:"disposal_reason,omitempty"`
+	DisposedAt             string `json:"disposed_at,omitempty"`
+	DisposalEscalationRole string `json:"disposal_escalation_role,omitempty"`
 }
 
 func runTaskList(args []string, stdout, stderr io.Writer) int {
@@ -332,13 +336,17 @@ func runTaskList(args []string, stdout, stderr io.Writer) int {
 			continue
 		}
 		outputs = append(outputs, taskListOutput{
-			ID:           task.ID,
-			Repo:         task.RepoFullName,
-			GoalID:       task.GoalID,
-			Title:        task.Title,
-			State:        task.State,
-			Branch:       task.Branch,
-			WorktreePath: task.WorktreePath,
+			ID:                     task.ID,
+			Repo:                   task.RepoFullName,
+			GoalID:                 task.GoalID,
+			Title:                  task.Title,
+			State:                  task.State,
+			Branch:                 task.Branch,
+			WorktreePath:           task.WorktreePath,
+			DisposalTier:           task.DisposalTier,
+			DisposalReason:         task.DisposalReason,
+			DisposedAt:             task.DisposedAt,
+			DisposalEscalationRole: task.DisposalEscalationRole,
 		})
 	}
 	if *jsonOutput {
@@ -795,6 +803,8 @@ func taskStateOwner(state string) string {
 		owner = "the human merge decision"
 	case workflow.TaskMerged:
 		owner = "the terminal merge record"
+	case workflow.TaskSuperseded, workflow.TaskStranded:
+		owner = "the terminal disposal record"
 	case workflow.TaskAwaitingHuman:
 		owner = "the explicit human-resume machinery"
 	case workflow.TaskDismissed:

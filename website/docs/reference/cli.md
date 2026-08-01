@@ -1510,6 +1510,7 @@ Start a task in its dedicated branch worktree and inspect task state:
 gitmoot task run task-001 --repo owner/repo --owner lead --base main
 gitmoot task list --repo owner/repo
 gitmoot task list --repo owner/repo --state implementing --json
+gitmoot task list --repo owner/repo --state stranded --json
 gitmoot task dismiss task-001 --reason "abandoned experiment"
 gitmoot task resume-work task-001 --reason "review requires another fix pass"
 gitmoot task resume-work task-001 --reason "withdraw pending merge" --override-pending-human-decision
@@ -1530,6 +1531,17 @@ including daemon `task_dismissed_auto`, opt-in
 `task_dismissed_planned_ttl`, closed-unmerged `pr_closed_unmerged`, terminal
 top-level implement triage (`task_blocked_terminal_no_pr` or
 `task_blocked_job_failed`), and explicit recovery events.
+
+Past `[workflow].stale_task_ttl`, blocked tasks follow an evidence ladder: own
+merged PR (`merged`), later merged work on the same referenced issue
+(`superseded`), closed subject (`superseded`), then terminal `stranded`. No tier
+uses git ancestry. An open `awaiting_human_merge` PR remains protected and lands
+in the visible `stranded` queue. JSON task rows expose `disposal_tier`,
+`disposal_reason`, `disposed_at`, and `disposal_escalation_role`; an unroutable
+terminal escalation is recorded without keeping the task alive.
+The blocked-task alert has a separate finite ladder: three interval-spaced
+nudges, one terminal escalation, then no further alerts while the task remains
+queryable. Only the evidence-disposal pass transitions task state.
 
 `task resume-work` is an explicit coordinator-only return to development from
 `reviewing`, `ready_to_merge`, or `awaiting_human_merge`. It requires `--reason`,
@@ -1590,7 +1602,7 @@ record `stale_worktree_dirty_blocked`; manually salvage, commit, stash, or clean
 the changes before retrying.
 
 The daemon reads a bounded oldest-first stale window and processes up to 20
-qualifying `implementing`/`blocked` tasks per repo poll.
+qualifying `implementing` tasks per repo poll.
 `[workflow].stale_task_ttl = "168h"` is the default and `"0"` disables the leg.
 `updated_at` is a conservative activity proxy. Live jobs, same-repo open-PR
 branches, branches still present on `origin`, and remote-check uncertainty all

@@ -185,6 +185,57 @@ func TestEvaluateBlockedTaskEpisodesSingleTaskUsesOneItemDigest(t *testing.T) {
 	}
 }
 
+func TestEvaluateBlockedTaskEpisodesCapsAlertsWithoutDisposingTask(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	repo := "owner/repo"
+	taskID := "task-exhausted-alerts"
+	wakeAfter := time.Hour
+	firstSweep := time.Now().UTC().Truncate(time.Second).Add(2 * time.Hour)
+	blockedSince := firstSweep.Add(-8 * time.Hour)
+	if err := store.UpsertTask(ctx, db.Task{ID: taskID, RepoFullName: repo, State: string(workflow.TaskBlocked)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertBlockedEpisode(ctx, taskEpisodeSubject(repo, taskID), blockedSince, blockedSince); err != nil {
+		t.Fatal(err)
+	}
+
+	sink := &recordingSink{}
+	for pass := 0; pass < blockedTaskMaxNudges+1; pass++ {
+		now := firstSweep.Add(time.Duration(pass) * (wakeAfter + time.Second))
+		if err := evaluateBlockedTaskEpisodes(ctx, store, sink, repo, wakeAfter, io.Discard, now); err != nil {
+			t.Fatalf("evaluateBlockedTaskEpisodes(pass %d) error = %v", pass+1, err)
+		}
+	}
+	if got := len(sink.byType(events.EventJobBlocked)); got != blockedTaskMaxNudges {
+		t.Fatalf("job.blocked nudges = %d, want capped %d", got, blockedTaskMaxNudges)
+	}
+	escalations := sink.byType(events.EventJobNeedsAttention)
+	if len(escalations) != 1 {
+		t.Fatalf("terminal escalations = %d, want 1", len(escalations))
+	}
+	if ev := escalations[0]; ev.Cause != "escalation" || ev.JobID != taskID ||
+		ev.RootID != taskID || !strings.Contains(ev.Detail, "alert ladder exhausted") ||
+		!strings.Contains(ev.Detail, taskID) {
+		t.Fatalf("terminal escalation = %+v", ev)
+	}
+
+	episodes, err := store.ListBlockedEpisodes(ctx)
+	if err != nil || len(episodes) != 1 {
+		t.Fatalf("blocked episodes = %+v, err=%v", episodes, err)
+	}
+	if got := episodes[0].TaskEmitCount; got != blockedTaskMaxNudges {
+		t.Fatalf("task_emit_count = %d, want %d", got, blockedTaskMaxNudges)
+	}
+	if episodes[0].TaskExhaustedAt == "" {
+		t.Fatal("task_exhausted_at is empty; exhausted alert ladder is not queryable")
+	}
+	blocked, err := store.ListTasksByRepoState(ctx, repo, string(workflow.TaskBlocked))
+	if err != nil || len(blocked) != 1 || blocked[0].ID != taskID {
+		t.Fatalf("blocked tasks after alert exhaustion = %+v, err=%v", blocked, err)
+	}
+}
+
 type fakeBlockedRoleAvailability struct {
 	available bool
 	calls     int

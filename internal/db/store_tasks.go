@@ -218,11 +218,20 @@ func (s *Store) UpsertTask(ctx context.Context, task Task) error {
 	return upsertTask(ctx, s.db, task)
 }
 
-// UpsertTaskUnlessState applies the normal task upsert unless an existing row
-// is currently in forbiddenState. The predicate lives on the conflict UPDATE so
+// UpsertTaskUnlessStates applies the normal task upsert unless an existing row
+// is currently in a forbidden state. The predicate lives on the conflict UPDATE so
 // callers that must not resurrect a terminal task remain safe if its state
 // changes after their initial read.
-func (s *Store) UpsertTaskUnlessState(ctx context.Context, task Task, forbiddenState string) (bool, error) {
+func (s *Store) UpsertTaskUnlessStates(ctx context.Context, task Task, forbiddenStates []string) (bool, error) {
+	if len(forbiddenStates) == 0 {
+		return false, errors.New("at least one forbidden task state is required")
+	}
+	placeholders := make([]string, 0, len(forbiddenStates))
+	args := []any{task.ID, task.RepoFullName, task.GoalID, task.Title, task.State, task.Branch, task.WorktreePath}
+	for _, state := range forbiddenStates {
+		placeholders = append(placeholders, "?")
+		args = append(args, strings.TrimSpace(state))
+	}
 	result, err := s.db.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, worktree_path, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET
@@ -236,9 +245,7 @@ func (s *Store) UpsertTaskUnlessState(ctx context.Context, task Task, forbiddenS
 				ELSE tasks.worktree_path
 			END,
 			updated_at = CURRENT_TIMESTAMP
-		WHERE tasks.state <> ?`,
-		task.ID, task.RepoFullName, task.GoalID, task.Title, task.State, task.Branch, task.WorktreePath,
-		strings.TrimSpace(forbiddenState))
+		WHERE tasks.state NOT IN (`+strings.Join(placeholders, ",")+`)`, args...)
 	if err != nil {
 		return false, err
 	}
@@ -489,6 +496,66 @@ func (s *Store) TransitionTaskStateWithEventIfNoActiveJob(ctx context.Context, t
 	return changed, currentState, err
 }
 
+// DisposeTask atomically records an evidence-based terminal task disposition,
+// its audit event, and (when routable) the single durable terminal escalation.
+// Notification routing never controls whether the row terminates: an empty
+// escalation role is recorded on the task and the state transition still commits.
+func (s *Store) DisposeTask(ctx context.Context, taskID string, fromStates []string, to, tier, reason, escalationRole, escalationEvent string, at time.Time) (bool, string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, "", err
+	}
+	defer tx.Rollback()
+
+	var current string
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM tasks WHERE id = ?`, strings.TrimSpace(taskID)).Scan(&current); err != nil {
+		return false, "", err
+	}
+	allowed := false
+	for _, state := range fromStates {
+		if current == strings.TrimSpace(state) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return false, current, tx.Commit()
+	}
+	stamp := at.UTC().Format(time.RFC3339Nano)
+	result, err := tx.ExecContext(ctx, `UPDATE tasks
+		SET state = ?, disposal_tier = ?, disposal_reason = ?, disposal_at = ?,
+			disposal_escalation_role = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ? AND state = ?`,
+		strings.TrimSpace(to), strings.TrimSpace(tier), strings.TrimSpace(reason), stamp,
+		strings.ToLower(strings.TrimSpace(escalationRole)), strings.TrimSpace(taskID), current)
+	if err != nil {
+		return false, current, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, current, err
+	}
+	if affected != 1 {
+		return false, current, tx.Commit()
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO task_events(task_id, kind, from_state, to_state, reason)
+		VALUES (?, ?, ?, ?, ?)`, strings.TrimSpace(taskID), "task_disposed_"+strings.TrimSpace(tier), current, strings.TrimSpace(to), strings.TrimSpace(reason)); err != nil {
+		return false, current, err
+	}
+	if role := strings.ToLower(strings.TrimSpace(escalationRole)); role != "" {
+		if strings.TrimSpace(escalationEvent) == "" {
+			return false, current, errors.New("task disposal escalation event is required for a routed escalation")
+		}
+		if err := insertWakeOutboxTx(ctx, tx, WakeOutboxSourceEscalation, escalationEvent, WakeOutboxKindEscalation, role); err != nil {
+			return false, current, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, current, err
+	}
+	return true, strings.TrimSpace(to), nil
+}
+
 func (s *Store) transitionTaskStateWithEvent(ctx context.Context, taskID string, fromStates []string, to string, kind string, reason string, rejectActiveJob bool) (changed bool, observedState string, currentState string, err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -575,14 +642,16 @@ func activeJobMatchingTaskTx(ctx context.Context, tx *sql.Tx, taskID string, rep
 
 func scanTask(row interface{ Scan(dest ...any) error }) (Task, error) {
 	var task Task
-	if err := row.Scan(&task.ID, &task.RepoFullName, &task.GoalID, &task.Title, &task.State, &task.Branch, &task.WorktreePath); err != nil {
+	if err := row.Scan(&task.ID, &task.RepoFullName, &task.GoalID, &task.Title, &task.State, &task.Branch, &task.WorktreePath,
+		&task.UpdatedAt, &task.DisposalTier, &task.DisposalReason, &task.DisposedAt, &task.DisposalEscalationRole); err != nil {
 		return Task{}, err
 	}
 	return task, nil
 }
 
 func taskSelectSQL() string {
-	return `SELECT id, repo_full_name, goal_id, title, state, branch, worktree_path`
+	return `SELECT id, repo_full_name, goal_id, title, state, branch, worktree_path, updated_at,
+		disposal_tier, disposal_reason, disposal_at, disposal_escalation_role`
 }
 
 func (s *Store) UpsertPullRequest(ctx context.Context, pr PullRequest) error {

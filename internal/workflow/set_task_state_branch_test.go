@@ -86,3 +86,33 @@ func TestSetTaskStateCannotResurrectDismissedTask(t *testing.T) {
 		t.Fatalf("task resurrected to %s", task.State)
 	}
 }
+
+func TestSetTaskStateCannotResurrectEvidenceDisposedTask(t *testing.T) {
+	for _, terminal := range []TaskState{TaskSuperseded, TaskStranded} {
+		t.Run(string(terminal), func(t *testing.T) {
+			store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			branch := "feature/" + string(terminal)
+			if err := store.UpsertTask(ctx, db.Task{ID: "canonical", RepoFullName: "owner/repo", State: string(terminal), Branch: branch}); err != nil {
+				t.Fatal(err)
+			}
+			engine := Engine{Store: store}
+			for _, ref := range []taskRef{
+				{ID: "canonical", Repo: "owner/repo", Branch: branch},
+				{ID: "late-review", Repo: "owner/repo", Branch: branch},
+			} {
+				if err := engine.setTaskState(ctx, ref, TaskReviewing); err == nil || !strings.Contains(err.Error(), string(terminal)) {
+					t.Fatalf("setTaskState(%+v) error = %v", ref, err)
+				}
+			}
+			stored, _ := store.GetTask(ctx, "canonical")
+			if stored.State != string(terminal) {
+				t.Fatalf("task resurrected to %s", stored.State)
+			}
+		})
+	}
+}

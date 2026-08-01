@@ -654,6 +654,23 @@ func (c *GhClient) ListIssues(ctx context.Context, repo Repository, state string
 	return filtered, nil
 }
 
+// GetIssue returns one canonical issue row. It is intentionally a concrete
+// capability rather than part of Client: task disposal discovers it through a
+// narrow optional interface, avoiding a repository-wide widening of test fakes.
+func (c *GhClient) GetIssue(ctx context.Context, repo Repository, number int64) (Issue, error) {
+	if number <= 0 {
+		return Issue{}, fmt.Errorf("issue number must be positive")
+	}
+	var issue Issue
+	if err := c.apiJSON(ctx, false, &issue, endpoint(repo, "issues", number)); err != nil {
+		return Issue{}, err
+	}
+	if issue.IsPullRequest {
+		return Issue{}, fmt.Errorf("%s#%d is a pull request, not an issue", repo.FullName(), number)
+	}
+	return issue, nil
+}
+
 func (c *GhClient) GetPullRequest(ctx context.Context, repo Repository, number int64) (PullRequest, error) {
 	return c.getPullRequest(ctx, repo, number)
 }
