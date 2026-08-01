@@ -122,6 +122,11 @@ func TestEventRuleCatchAllMigrationPromotesOnlyNonReplyRulesToObserver(t *testin
 	const (
 		wantBackfillMigration  = 107
 		wantDirectiveMigration = 108
+		// #1250 appended acting_org_role at 109. The append-only rule (#1265) freezes
+		// EARLIER indices; it does not freeze which migration happens to be last, so
+		// this pins both existing indices AND that the new tail is the expected one —
+		// a reorder still fails, an append does not.
+		wantActingOrgRoleMigration = 109
 	)
 	var backfillMigration int
 	var directiveMigration int
@@ -142,8 +147,17 @@ func TestEventRuleCatchAllMigrationPromotesOnlyNonReplyRulesToObserver(t *testin
 	if backfillMigration != wantBackfillMigration {
 		t.Fatalf("observer catch-all migration index=%d, want preserved append-only index=%d", backfillMigration, wantBackfillMigration)
 	}
-	if directiveMigration != wantDirectiveMigration || directiveMigration != len(migrations)-1 {
-		t.Fatalf("directive supervision migration index=%d, want append-only tail index=%d (slice tail=%d)", directiveMigration, wantDirectiveMigration, len(migrations)-1)
+	if directiveMigration != wantDirectiveMigration {
+		t.Fatalf("directive supervision migration index=%d, want preserved append-only index=%d", directiveMigration, wantDirectiveMigration)
+	}
+	// Pin the INDEX, never the tail. #1265 freezes where existing migrations sit;
+	// it says nothing about which one happens to be last, so a future append must
+	// stay green while any reorder goes red.
+	if len(migrations) <= wantActingOrgRoleMigration {
+		t.Fatalf("acting_org_role migration index=%d is beyond the slice (len=%d)", wantActingOrgRoleMigration, len(migrations))
+	}
+	if !strings.Contains(migrations[wantActingOrgRoleMigration], "acting_org_role") {
+		t.Fatalf("migration %d is not the acting_org_role migration (#1250) — existing migrations must never be reordered (#1265)", wantActingOrgRoleMigration)
 	}
 
 	raw, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "catch-all.db"))

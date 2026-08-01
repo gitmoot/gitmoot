@@ -455,10 +455,18 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 		// its fix round re-armed review on a branch whose lock already read true.
 		// Reading the lock here closes that class for every parentless engine
 		// re-dispatch, present and future, without reaching into the constructors.
+		// #1250 reader 1 of 2: the acting org role comes from the SAME branch lock,
+		// so this trigger and the daemon PR-watcher cannot disagree about who owns
+		// the work. Empty stays empty (unattributed), which is both the legacy value
+		// and the correct value for an undirected dispatch.
 		skipFanout := payload.SkipNativeReviewFanout
-		if !skipFanout && strings.TrimSpace(payload.Branch) != "" {
-			if lock, lockErr := e.Store.GetBranchLock(ctx, payload.Repo, payload.Branch); lockErr == nil && lock.SkipNativeReviewFanout {
-				skipFanout = true
+		actingOrgRole := ""
+		if strings.TrimSpace(payload.Branch) != "" {
+			if lock, lockErr := e.Store.GetBranchLock(ctx, payload.Repo, payload.Branch); lockErr == nil {
+				if lock.SkipNativeReviewFanout {
+					skipFanout = true
+				}
+				actingOrgRole = lock.ActingOrgRole
 			}
 		}
 		event := PullRequestEvent{
@@ -473,6 +481,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 			Sender:            job.Agent,
 			RequiredReviewers: e.requiredReviewers(payload),
 			SkipReviewFanout:  skipFanout,
+			ActingOrgRole:     actingOrgRole,
 		}
 		// The branch-lock persist for the daemon's PR-watcher path (trigger 2) now
 		// happens above, before the no-PR early return, so it covers the PR arm and

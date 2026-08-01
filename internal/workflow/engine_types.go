@@ -189,6 +189,13 @@ type PullRequestEvent struct {
 	LeadAgent         string
 	Sender            string
 	RequiredReviewers []string
+	// ActingOrgRole is the org attribution carried from the branch lock (#1250).
+	// BOTH PR-open triggers read it from that one durable source, so native review
+	// fanout children inherit an attribution instead of being enqueued
+	// unattributed — and an unattributed job's blocked event has no owner to wake
+	// (#1347). Empty means unattributed, which is also the legacy value for locks
+	// predating the migration: the fanout then behaves exactly as it does today.
+	ActingOrgRole string
 	// HumanMergeRequested records an explicit authorized @gitmoot merge command.
 	// It permits the native policy gate to merge even when automatic merging is
 	// disabled for the repository; ordinary daemon advancement leaves this false.

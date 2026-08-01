@@ -520,6 +520,13 @@ type BranchLock struct {
 	Branch                 string
 	Owner                  string
 	SkipNativeReviewFanout bool
+	// ActingOrgRole is the org role attributed to the agent that took this branch
+	// (#1250). Written ONCE at lock creation and read by both PR-open triggers, so
+	// native review fanout children inherit an attribution instead of being
+	// enqueued unattributed — an unattributed job's blocked event has no owner to
+	// wake (#1347). Empty means unattributed, which is both the legacy value for
+	// pre-migration locks and the correct value for an undirected dispatch.
+	ActingOrgRole string
 }
 
 type BranchLockEvent struct {

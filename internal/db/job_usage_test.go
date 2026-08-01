@@ -163,6 +163,18 @@ CREATE TABLE repos (
 	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	PRIMARY KEY (owner, name)
 );
+-- A minimal branch_locks table so the later #1250 acting_org_role ALTER ADD
+-- COLUMN that runs in this pass has its table; the real table was created by an
+-- earlier (here pre-seeded-as-applied) migration. NOTE for whoever appends the
+-- next migration: this fixture marks early migrations applied WITHOUT running
+-- them, so any tail migration that ALTERs an early-created table must add its
+-- table here too — that is what the five entries above are.
+CREATE TABLE branch_locks (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	repo_full_name TEXT NOT NULL,
+	branch TEXT NOT NULL,
+	owner TEXT NOT NULL
+);
 -- job_events as it existed at an earlier (here pre-seeded-as-applied) migration,
 -- so the #549 job_events index migration that runs in this pass has its table.
 CREATE TABLE job_events (
