@@ -29,7 +29,9 @@ closed inline backtick spans (including single-backtick spans). GitHub must then
 report that the comment author currently has `write`, `maintain`, or `admin`
 repository permission; unauthorized addressed commands are rejected without
 parsing their command text. Ordinary prose and code examples produce no reply.
-An authorized malformed command still produces a visible routing error.
+An authorized malformed command still produces a visible routing error. An
+unclosed fenced code block treats the remainder of the comment as code, so any
+later command is ignored without a reply.
 
 The daemon polls GitHub, applies that author gate, queues jobs, invokes the
 selected agent runtime, and posts attributed results back to the PR. The

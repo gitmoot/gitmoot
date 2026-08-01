@@ -71,7 +71,7 @@ func TestParseCommandMentionForm(t *testing.T) {
 }
 
 func TestParseCommandsOnlyReturnsGitmootLines(t *testing.T) {
-	commands := ParseCommands("hello\n/gitmoot status\n/gitmoot merge when ready\nthanks")
+	commands := ParseCommandsWithoutAuthorization("hello\n/gitmoot status\n/gitmoot merge when ready\nthanks")
 	if len(commands) != 2 {
 		t.Fatalf("commands length = %d, want 2", len(commands))
 	}

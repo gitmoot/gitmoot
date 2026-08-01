@@ -74,6 +74,32 @@ func TestHandleCommentAuthorizedCommandStillDispatches(t *testing.T) {
 	}
 }
 
+func TestHandleCommentMixedProseAndAddressedCommandPostsOnlyAck(t *testing.T) {
+	ctx := context.Background()
+	store, repo, client, daemon := commentCommandFixture(t, ctx)
+	pull := github.PullRequest{Number: 10, Title: "Camera design", HeadRef: "camera-state"}
+	comment := github.IssueComment{
+		ID:     5148922500,
+		Author: "alice",
+		Body: strings.Join([]string{
+			"Here is my reasoning about the state model.",
+			"@helper ask inspect the state model",
+			"Thanks, that should cover it.",
+		}, "\n"),
+	}
+
+	if err := daemon.handleComment(ctx, pull, comment); err != nil {
+		t.Fatalf("handleComment returned error: %v", err)
+	}
+	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "queued `ask` job") {
+		t.Fatalf("posted comments = %+v, want exactly one queued-job acknowledgement", client.posted)
+	}
+	wantID := jobID(repo, pull.Number, comment.ID, 0, "helper", "ask")
+	if _, err := store.GetJob(ctx, wantID); err != nil {
+		t.Fatalf("GetJob(%q) returned error: %v", wantID, err)
+	}
+}
+
 func TestHandleCommentUnauthorizedRejectedBeforeParse(t *testing.T) {
 	ctx := context.Background()
 	store, repo, client, daemon := commentCommandFixture(t, ctx)
@@ -144,11 +170,11 @@ func TestParseCommandsMarkdownCodeEdges(t *testing.T) {
 		"```text",
 		"/gitmoot ask helper unclosed fence",
 	}, "\n")
-	if commands := ParseCommands(body); len(commands) != 0 {
+	if commands := ParseCommandsWithoutAuthorization(body); len(commands) != 0 {
 		t.Fatalf("fenced edge cases parsed commands = %+v, want none", commands)
 	}
 
-	commands := ParseCommands("Use `/gitmoot ask helper inline` as documentation.\n/gitmoot status")
+	commands := ParseCommandsWithoutAuthorization("Use `/gitmoot ask helper inline` as documentation.\n/gitmoot status")
 	if len(commands) != 1 || commands[0].Action != "status" {
 		t.Fatalf("inline stripping commands = %+v, want only status", commands)
 	}

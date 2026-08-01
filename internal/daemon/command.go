@@ -33,7 +33,10 @@ type commentCommandInput struct {
 	addressed bool
 }
 
-func ParseCommands(body string) []Command {
+// ParseCommandsWithoutAuthorization sanitizes and parses addressed command
+// lines without checking repository permission. Production comment handlers
+// must authorize the author before calling the underlying parser.
+func ParseCommandsWithoutAuthorization(body string) []Command {
 	input := prepareCommentCommandInput(body)
 	var commands []Command
 	for _, parsed := range parseCommentCommands(input, ParseCommand) {
