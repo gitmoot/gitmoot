@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -37,17 +39,21 @@ type livenessLogSample struct {
 // daemonLivenessSweep retains one prior transcript observation per candidate.
 // A single stat can never turn temporary silence into a terminal verdict.
 type daemonLivenessSweep struct {
-	mu      sync.Mutex
-	samples map[string]livenessLogSample
-	stat    func(string) (os.FileInfo, error)
-	probe   func(int, string) runtimePIDState
+	mu       sync.Mutex
+	samples  map[string]livenessLogSample
+	stat     func(string) (os.FileInfo, error)
+	probe    func(int, string) runtimePIDState
+	identity func(int) string
+	signal   func(int, syscall.Signal) error
 }
 
 func newDaemonLivenessSweep() *daemonLivenessSweep {
 	return &daemonLivenessSweep{
-		samples: make(map[string]livenessLogSample),
-		stat:    os.Stat,
-		probe:   probeRuntimePID,
+		samples:  make(map[string]livenessLogSample),
+		stat:     os.Stat,
+		probe:    probeRuntimePID,
+		identity: workflow.RuntimeProcessIdentity,
+		signal:   syscall.Kill,
 	}
 }
 
@@ -72,7 +78,29 @@ func probeRuntimePID(pid int, recordedIdentity string) runtimePIDState {
 	if current != strings.TrimSpace(recordedIdentity) {
 		return runtimePIDIdentityMismatch
 	}
+	// A zombie still answers kill(0), but it cannot produce work. Its /proc
+	// identity remains available until reaped, which lets the liveness verdict
+	// safely kill any surviving members of its recorded process group.
+	if runtimeProcessState(pid) == "Z" {
+		return runtimePIDDead
+	}
 	return runtimePIDLive
+}
+
+func runtimeProcessState(pid int) string {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return ""
+	}
+	closeParen := strings.LastIndexByte(string(data), ')')
+	if closeParen < 0 {
+		return ""
+	}
+	fields := strings.Fields(string(data[closeParen+1:]))
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
 }
 
 func configuredDaemonQuietKillAfter(home string, stdout io.Writer) time.Duration {
@@ -145,7 +173,7 @@ func (s *daemonLivenessSweep) evaluate(ctx context.Context, store *db.Store, std
 				_ = store.AddJobEvent(ctx, db.JobEvent{
 					JobID: job.ID,
 					Kind:  "job_liveness_identity_mismatch",
-					Message: fmt.Sprintf("identity mismatch: runtime pid %d no longer has recorded starttime %s; job left running",
+					Message: fmt.Sprintf("identity mismatch: pgid recycle suspected, orphans leaked; runtime pid %d no longer has recorded starttime %s; no process-group signal sent; job left running",
 						payload.RuntimePID, payload.RuntimePIDStartTime),
 				})
 				previous.identityReported = true
@@ -169,6 +197,7 @@ func (s *daemonLivenessSweep) evaluate(ctx context.Context, store *db.Store, std
 
 	runtimePID := payload.RuntimePID
 	runtimeStart := payload.RuntimePIDStartTime
+	runtimePGID := payload.RuntimePGID
 	payload.RuntimePID = 0
 	payload.RuntimePIDStartTime = ""
 	payload.RuntimePGID = 0
@@ -188,11 +217,47 @@ func (s *daemonLivenessSweep) evaluate(ctx context.Context, store *db.Store, std
 		return err
 	}
 	if transitioned {
+		if !legacy {
+			s.killRecordedRuntimeGroup(ctx, store, job.ID, runtimePID, runtimePGID, runtimeStart)
+		}
 		_, _ = store.DeleteResourceLocksByOwnerIfNotRunning(ctx, job.ID)
 		writeLine(stdout, "failed stale running job %s: %s", job.ID, message)
 	}
 	s.forget(job.ID)
 	return nil
+}
+
+// killRecordedRuntimeGroup runs only after this sweep wins the running->failed
+// transition. RuntimePIDStartTime belongs to the immediate child, which is also
+// the group leader because GroupRunner uses Setpgid. Requiring both IDs to match
+// and re-reading the leader identity immediately before kill(-pgid) prevents a
+// recycled PGID from targeting an unrelated process tree.
+func (s *daemonLivenessSweep) killRecordedRuntimeGroup(ctx context.Context, store *db.Store, jobID string, runtimePID, runtimePGID int, recordedIdentity string) {
+	recordedIdentity = strings.TrimSpace(recordedIdentity)
+	currentIdentity := ""
+	if s.identity != nil && runtimePGID > 0 {
+		currentIdentity = strings.TrimSpace(s.identity(runtimePGID))
+	}
+	if runtimePGID <= 0 || runtimePID != runtimePGID || recordedIdentity == "" || currentIdentity != recordedIdentity {
+		_ = store.AddJobEvent(ctx, db.JobEvent{
+			JobID: jobID,
+			Kind:  "job_liveness_pgid_recycle_suspected",
+			Message: fmt.Sprintf("pgid recycle suspected, orphans leaked: pid=%d pgid=%d recorded_starttime=%q current_leader_starttime=%q; no process-group signal sent",
+				runtimePID, runtimePGID, recordedIdentity, currentIdentity),
+		})
+		return
+	}
+	if s.signal == nil {
+		return
+	}
+	if err := s.signal(-runtimePGID, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		_ = store.AddJobEvent(ctx, db.JobEvent{
+			JobID: jobID,
+			Kind:  "job_liveness_group_kill_failed",
+			Message: fmt.Sprintf("process-group kill failed for pgid %d after verified leader identity: %v; orphans may remain",
+				runtimePGID, err),
+		})
+	}
 }
 
 func (s *daemonLivenessSweep) previousStable(jobID string, info os.FileInfo, now time.Time) (livenessLogSample, bool) {

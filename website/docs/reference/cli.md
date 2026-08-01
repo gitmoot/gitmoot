@@ -1869,6 +1869,17 @@ absolute veto however quiet the log; a recycled PID records an identity-mismatch
 event and leaves the job running. Legacy rows without a runtime PID require
 twice the quiet threshold and no held runtime lease.
 
+On Linux, runtime commands start as the leader of a dedicated process group;
+the OnPID write persists that PID, its `/proc` start time, and the PGID before
+the runner waits. Context cancellation signals the whole group (TERM, then
+KILL). After a same-boot liveness verdict wins the `running` → `failed`
+transition, cleanup signals the recorded negative PGID only when the current
+group leader still has the persisted start time. A mismatch sends no signal and
+records `pgid recycle suspected, orphans leaked`. Daemon death does not itself
+reap the process group. A descendant that deliberately calls `setsid` escapes
+the recorded process group; reaping such escapees remains an explicit
+out-of-scope residual.
+
 The staleness age leg is tunable via the
 `GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value
 is 1m — below-1m, malformed, or non-positive values are rejected (with a
