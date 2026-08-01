@@ -806,6 +806,12 @@ LIMIT ?`, prefix, prefix, limit)
 // ListUnacknowledgedOrgDirectives returns the oldest outstanding directives.
 // It is intentionally ASC and unbounded: a newer directive must never push the
 // oldest unacknowledged obligation out of a DESC+LIMIT window.
+//
+// #1352: `done` terminates the obligation even when no ack was ever recorded.
+// Completion is strictly stronger than receipt — once the work is finished the
+// receipt question is moot — so a completed directive must not keep reading as
+// outstanding here. Before the `done` VERB shipped this was unreachable in
+// practice, because only a hand-written marker note could produce the state.
 func (s *Store) ListUnacknowledgedOrgDirectives(ctx context.Context, targetRole string) ([]WorkflowNote, error) {
 	targetRole = strings.ToLower(strings.TrimSpace(targetRole))
 	rows, err := s.db.QueryContext(ctx, `SELECT d.id, d.workflow_id, d.author, d.body, d.repo, d.memory_observation_id, d.created_at
@@ -817,6 +823,7 @@ WHERE substr(d.body, 1, length('[org:directive ')) = '[org:directive '
 		WHERE r.workflow_id = d.workflow_id AND (
 			substr(r.body, 1, length('[org:directive-ack id=' || d.id || ' ')) = '[org:directive-ack id=' || d.id || ' '
 			OR substr(r.body, 1, length('[org:directive-cancel id=' || d.id || ' ')) = '[org:directive-cancel id=' || d.id || ' '
+			OR substr(r.body, 1, length('[org:directive-done id=' || d.id || ' ')) = '[org:directive-done id=' || d.id || ' '
 		)
 	)
 ORDER BY d.created_at ASC, d.id ASC`, targetRole, targetRole, targetRole)

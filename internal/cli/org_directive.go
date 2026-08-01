@@ -30,6 +30,8 @@ func runOrgDirective(args []string, stdout, stderr io.Writer) int {
 		return runOrgDirectiveReceipt("ack", args[1:], stdout, stderr)
 	case "cancel":
 		return runOrgDirectiveReceipt("cancel", args[1:], stdout, stderr)
+	case "done":
+		return runOrgDirectiveReceipt("done", args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown org directive command %q\n", args[0])
 		printOrgDirectiveUsage(stderr)
@@ -42,7 +44,10 @@ func printOrgDirectiveUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org directive send --to ROLE --workflow LABEL (--stdin | -F FILE | TEXT) [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org directive ack ID [--by ROLE] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org directive cancel ID [--by ROLE] [--home DIR]")
-	fmt.Fprintln(w, "Acknowledgment records receipt, not completion; completion tracking is separate.")
+	fmt.Fprintln(w, "  gitmoot org directive done ID [--by ROLE] [--home DIR]")
+	fmt.Fprintln(w, "Acknowledgment records receipt; `done` records COMPLETION and ends the")
+	fmt.Fprintln(w, "obligation, including its TTL nudges. Both are restricted to the target role")
+	fmt.Fprintln(w, "or an ancestor; only the sender may cancel.")
 }
 
 func runOrgDirectiveSend(args []string, stdout, stderr io.Writer) int {
@@ -210,11 +215,24 @@ func runOrgDirectiveReceipt(kind string, args []string, stdout, stderr io.Writer
 			return fmt.Errorf("unknown org role %q", by)
 		}
 		var body string
-		if kind == "ack" {
+		if kind == "ack" || kind == "done" {
+			// #1352: `done` carries ack's authorization discipline deliberately. The
+			// role that owes the work — or an ancestor overseeing it — is who may
+			// declare it finished; the SENDER may cancel but may not mark another
+			// role's obligation complete on its behalf.
 			if by != to && !slicesContains(cfg.Ancestors(to), by) {
-				return fmt.Errorf("role %q cannot acknowledge directive %d addressed to %q; only the target or an ancestor may acknowledge", by, directiveID, to)
+				// The ack wording is preserved byte-for-byte: it is an established
+				// user-facing contract with a test pinning it.
+				if kind == "ack" {
+					return fmt.Errorf("role %q cannot acknowledge directive %d addressed to %q; only the target or an ancestor may acknowledge", by, directiveID, to)
+				}
+				return fmt.Errorf("role %q cannot record done for directive %d addressed to %q; only the target or an ancestor may complete it", by, directiveID, to)
 			}
-			body = workflow.FormatOrgDirectiveAckNote(directiveID, by)
+			if kind == "ack" {
+				body = workflow.FormatOrgDirectiveAckNote(directiveID, by)
+			} else {
+				body = workflow.FormatOrgDirectiveDoneNote(directiveID, by)
+			}
 		} else {
 			if by != from {
 				return fmt.Errorf("role %q cannot cancel directive %d sent by %q", by, directiveID, from)
@@ -233,8 +251,20 @@ func runOrgDirectiveReceipt(kind string, args []string, stdout, stderr io.Writer
 		fmt.Fprintf(stderr, "org directive %s: %v\n", kind, err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "%sed directive %d in workflow %s\n", kind, directiveID, workflowID)
+	fmt.Fprintf(stdout, "%s directive %d in workflow %s\n", orgDirectiveReceiptPastTense(kind), directiveID, workflowID)
 	return 0
+}
+
+// orgDirectiveReceiptPastTense renders the confirmation verb. The previous
+// "%sed" formatting would have produced "doneed" for the #1352 completion verb;
+// the ack/cancel wording is preserved byte-for-byte.
+func orgDirectiveReceiptPastTense(kind string) string {
+	switch kind {
+	case "done":
+		return "completed"
+	default:
+		return kind + "ed"
+	}
 }
 
 func orgDirectiveReceiptIDAndFlags(args []string) (string, []string, bool) {

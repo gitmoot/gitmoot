@@ -1280,6 +1280,15 @@ not completion. `gitmoot org directive cancel <id> [--by <role>] [--home
 from `--by` or `GITMOOT_ORG_ROLE`; missing identity fails closed. They append
 typed markers to the directive's workflow journal.
 
+`gitmoot org directive done <id> [--by <role>] [--home <dir>]` records
+COMPLETION and ends the obligation, including its TTL nudges. It carries `ack`'s
+authorization discipline — the addressed target or one of its ancestors — because
+the role that owes the work, or an ancestor overseeing it, is who may declare it
+finished; the sender may `cancel` but may not mark another role's obligation
+complete on its behalf. A completed directive stops being outstanding even when
+no acknowledgment was ever recorded, since completion is strictly stronger than
+receipt.
+
 The daemon evaluates directive TTLs on the existing one-minute org supervision
 lane. `[org].directive_ack_ttl` defaults to `10m`,
 `[org].directive_done_ttl` defaults to `0s` (completion nudges off), and

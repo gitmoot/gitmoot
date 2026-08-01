@@ -304,3 +304,97 @@ func TestDirectiveWakeOutboxUsesSeparateCoalesceNamespace(t *testing.T) {
 		t.Fatalf("directive wake calls=%d prompts=%q", wake.promptCalls, wake.prompts)
 	}
 }
+
+// #1352 SITE 1 of 2: the `done` VERB and its authorization. Completion previously
+// had no CLI surface at all — the persistence layer (FormatOrgDirectiveDoneNote,
+// the sweep's NOT EXISTS on [org:directive-done) was already built and simply
+// unexposed, so completing a directive meant hand-writing a raw marker note.
+//
+// `done` carries ACK's discipline, not cancel's: the role that owes the work, or
+// an ancestor overseeing it, declares it finished. The sender may cancel but may
+// not mark another role's obligation complete on its behalf.
+func TestOrgDirectiveDoneVerbAuthorizationAndCompletion(t *testing.T) {
+	home := directiveTestHome(t)
+	t.Setenv("GITMOOT_ORG_ROLE", "owner")
+	var stdout, stderr bytes.Buffer
+	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/done", "finish the thing"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("send code=%d err=%q", code, stderr.String())
+	}
+	directiveID := strings.Fields(stdout.String())[2]
+
+	// A peer with no relationship to the target cannot complete it.
+	stdout.Reset()
+	stderr.Reset()
+	if code := runOrg([]string{"directive", "done", directiveID, "--home", home, "--by", "peer"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "cannot record done") {
+		t.Fatalf("unauthorized done code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+
+	// The target may. The confirmation must read "completed", not "doneed".
+	stdout.Reset()
+	stderr.Reset()
+	if code := runOrg([]string{"directive", "done", directiveID, "--home", home, "--by", "worker"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("done code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	if got := stdout.String(); !strings.Contains(got, "completed directive") || strings.Contains(got, "doneed") {
+		t.Fatalf("confirmation wording = %q, want \"completed directive\"", got)
+	}
+
+	// An ancestor may complete on a second directive.
+	stdout.Reset()
+	stderr.Reset()
+	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/done-ancestor", "and this one"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("second send code=%d err=%q", code, stderr.String())
+	}
+	secondID := strings.Fields(stdout.String())[2]
+	stdout.Reset()
+	stderr.Reset()
+	if code := runOrg([]string{"directive", "done", secondID, "--home", home, "--by", "owner"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("ancestor done code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+// #1352 SITE 2 of 2: the lister gap the verb EXPOSES. `done` terminates the
+// obligation even with NO prior ack, so a completed-but-never-acked directive
+// must stop reading as outstanding. Before the verb shipped this was unreachable
+// in practice, which is why it survived.
+//
+// Deliberately a SEPARATE guard from the verb test: mutating the CLI verb must
+// not fail this one, and mutating the lister must not fail that one — otherwise
+// the two are one aggregate wearing two names.
+func TestOrgDirectiveDoneClearsUnackedListWithoutAck(t *testing.T) {
+	home := directiveTestHome(t)
+	t.Setenv("GITMOOT_ORG_ROLE", "owner")
+	var stdout, stderr bytes.Buffer
+	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/done-noack", "do it"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("send code=%d err=%q", code, stderr.String())
+	}
+	directiveID, err := strconv.ParseInt(strings.Fields(stdout.String())[2], 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	// Write the completion marker directly: this guard is about the LISTER, so it
+	// must not depend on the CLI verb's behaviour.
+	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+		WorkflowID: "release/done-noack",
+		Author:     "worker",
+		Body:       workflow.FormatOrgDirectiveDoneNote(directiveID, "worker"),
+	}); err != nil {
+		t.Fatalf("insert done marker: %v", err)
+	}
+
+	unacked, err := store.ListUnacknowledgedOrgDirectives(context.Background(), "worker")
+	if err != nil {
+		t.Fatalf("ListUnacknowledgedOrgDirectives returned error: %v", err)
+	}
+	for _, note := range unacked {
+		if note.ID == directiveID {
+			t.Fatalf("a completed directive still reads as outstanding with no ack recorded: %+v", note)
+		}
+	}
+}
