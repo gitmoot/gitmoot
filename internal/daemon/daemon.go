@@ -145,13 +145,15 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		mergeReadinessHandled := false
 		if changed {
-			if err := d.handlePullRequestWorkflow(ctx, pull, reviewMemo); err != nil {
+			if handled, err := d.handlePullRequestWorkflowChange(ctx, pull, reviewMemo); err != nil {
 				if firstErr == nil {
 					firstErr = err
 				}
 				changed = false
 			} else {
+				mergeReadinessHandled = handled
 				merged, err := d.pullRequestStoredMerged(ctx, pull)
 				if err != nil {
 					return err
@@ -165,7 +167,13 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 			if err := d.recordPullRequest(ctx, pull); err != nil {
 				return err
 			}
-		} else {
+		}
+		// Change routing and merge eligibility are independent. A retained stale
+		// review can keep routing "changed" after its job is terminal, while a
+		// ready task still needs its gate re-evaluated on every poll (#1336).
+		// HandlePullRequestOpened runs the gate itself when no reviewers are
+		// configured; avoid evaluating it twice in that one composition.
+		if !mergeReadinessHandled {
 			retry, err := d.pullRequestReadyToMerge(ctx, pull)
 			if err != nil {
 				return err
@@ -883,18 +891,27 @@ func (d Daemon) pullRequestStoredMerged(ctx context.Context, pull github.PullReq
 }
 
 func (d Daemon) handlePullRequestWorkflow(ctx context.Context, pull github.PullRequest, memo *reviewJobsMemo) error {
+	_, err := d.handlePullRequestWorkflowChange(ctx, pull, memo)
+	return err
+}
+
+// handlePullRequestWorkflowChange reports whether HandlePullRequestOpened
+// evaluated merge readiness itself. That happens only for the configured
+// no-reviewer path; PollOnce uses the signal to avoid an immediate duplicate
+// evaluation while independently checking every other ready task.
+func (d Daemon) handlePullRequestWorkflowChange(ctx context.Context, pull github.PullRequest, memo *reviewJobsMemo) (bool, error) {
 	if d.Workflow == nil {
-		return nil
+		return false, nil
 	}
 	if err := d.supersedeStaleReviewJobs(ctx, pull, memo); err != nil {
-		return err
+		return false, err
 	}
 	lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), pull.HeadRef)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil
+			return false, nil
 		}
-		return err
+		return false, err
 	}
 	ref := workflowTaskRef{
 		id:     pull.HeadRef,
@@ -909,13 +926,14 @@ func (d Daemon) handlePullRequestWorkflow(ctx context.Context, pull github.PullR
 			ref.branch = task.Branch
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
-		return err
+		return false, err
 	}
 	reviewers, err := d.workflowReviewers(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
-	return d.Workflow.HandlePullRequestOpened(ctx, workflow.PullRequestEvent{
+	mergeReadinessHandled := len(reviewers) == 0 && !lock.SkipNativeReviewFanout
+	err = d.Workflow.HandlePullRequestOpened(ctx, workflow.PullRequestEvent{
 		Repo:              d.Repo.FullName(),
 		Branch:            ref.branch,
 		PullRequest:       int(pull.Number),
@@ -936,6 +954,7 @@ func (d Daemon) handlePullRequestWorkflow(ctx context.Context, pull github.PullR
 		// and undirected value; the fanout then behaves exactly as it does today.
 		ActingOrgRole: lock.ActingOrgRole,
 	})
+	return mergeReadinessHandled, err
 }
 
 func (d Daemon) supersedeStaleReviewJobs(ctx context.Context, pull github.PullRequest, memo *reviewJobsMemo) error {
