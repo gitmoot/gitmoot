@@ -1597,6 +1597,11 @@ func (d Daemon) handleIssueComment(ctx context.Context, issue github.Issue, comm
 // issue-comment job id (so issue jobs never collide with PR jobs) and empty
 // branch/HeadSHA.
 func (d Daemon) handleIssueAsk(ctx context.Context, issue github.Issue, comment github.IssueComment, sequence int, command Command) error {
+	// Validate is still load-bearing here for the empty-agent case
+	// (`/gitmoot ask @ something` parses with Agent == ""), but it can never
+	// return ErrUnsupportedAction: handleIssueComment filters to
+	// Action == "ask" before dispatching, and "ask" is an allowed action. An
+	// unrecognized action on an issue is dropped at that filter instead (#1355).
 	if err := command.Validate(); err != nil {
 		return d.ack(ctx, issue.Number, fmt.Sprintf("Gitmoot could not route comment %d: %v.", comment.ID, err))
 	}
@@ -1716,6 +1721,11 @@ func onlyJobRecoveryCommands(commands []Command) bool {
 
 func (d Daemon) handleCommand(ctx context.Context, pull github.PullRequest, comment github.IssueComment, sequence int, command Command) error {
 	if err := command.Validate(); err != nil {
+		if errors.Is(err, ErrUnsupportedAction) {
+			d.logf("comment %d on %s#%d addressed Gitmoot but names no known action, ignoring: %v",
+				comment.ID, d.Repo.FullName(), pull.Number, err)
+			return nil
+		}
 		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not route comment %d: %v.", comment.ID, err))
 	}
 	switch command.Action {
