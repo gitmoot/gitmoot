@@ -45,10 +45,11 @@ func printOrgDirectiveUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org directive ack ID [--by ROLE] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org directive cancel ID [--by ROLE] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org directive done ID [--by ROLE] [--home DIR]")
-	fmt.Fprintln(w, "Acknowledgment records receipt; `done` records COMPLETION and ends the")
-	fmt.Fprintln(w, "obligation, including its TTL nudges. Both are restricted to the target role")
-	fmt.Fprintln(w, "or an ancestor -- which includes the sender, since a sender is always an")
-	fmt.Fprintln(w, "ancestor. Only the sender may cancel.")
+	fmt.Fprintln(w, "Acknowledgment records receipt and is open to the target or an ancestor.")
+	fmt.Fprintln(w, "`done` records COMPLETION and ends the obligation, including its TTL nudges;")
+	fmt.Fprintln(w, "it is restricted to the TARGET SUBTREE -- the addressed role or one below it.")
+	fmt.Fprintln(w, "Ancestors cannot complete (a sender is always an ancestor, so that would be")
+	fmt.Fprintln(w, "self-certification); they may cancel instead. Only the sender may cancel.")
 }
 
 func runOrgDirectiveSend(args []string, stdout, stderr io.Writer) int {
@@ -216,31 +217,31 @@ func runOrgDirectiveReceipt(kind string, args []string, stdout, stderr io.Writer
 			return fmt.Errorf("unknown org role %q", by)
 		}
 		var body string
-		if kind == "ack" || kind == "done" {
-			// #1352: `done` carries ack's authorization discipline deliberately —
-			// the addressed target or one of its ancestors.
-			//
-			// NOTE, because the obvious reading is wrong: this DOES permit the
-			// sender. `send` requires the sender to be an ancestor of the target,
-			// so every valid sender is already an ancestor and is authorized here.
-			// Ack's discipline and a sender exclusion are mutually exclusive by
-			// construction; the discipline is what #1352 specifies, so a parent
-			// completing an obligation it issued is oversight, not a loophole.
-			// `cancel` remains sender-ONLY, which is a genuinely different rule.
+		switch kind {
+		case "ack":
+			// Receipt: the addressed target or one of its ancestors. Unchanged, and
+			// the wording is preserved byte-for-byte as an established contract.
 			if by != to && !slicesContains(cfg.Ancestors(to), by) {
-				// The ack wording is preserved byte-for-byte: it is an established
-				// user-facing contract with a test pinning it.
-				if kind == "ack" {
-					return fmt.Errorf("role %q cannot acknowledge directive %d addressed to %q; only the target or an ancestor may acknowledge", by, directiveID, to)
-				}
-				return fmt.Errorf("role %q cannot record done for directive %d addressed to %q; only the target or an ancestor may complete it", by, directiveID, to)
+				return fmt.Errorf("role %q cannot acknowledge directive %d addressed to %q; only the target or an ancestor may acknowledge", by, directiveID, to)
 			}
-			if kind == "ack" {
-				body = workflow.FormatOrgDirectiveAckNote(directiveID, by)
-			} else {
-				body = workflow.FormatOrgDirectiveDoneNote(directiveID, by)
+			body = workflow.FormatOrgDirectiveAckNote(directiveID, by)
+		case "done":
+			// #1352: COMPLETION AUTHORITY IS THE TARGET SUBTREE — the addressed role
+			// or someone BELOW it, who plausibly did the work.
+			//
+			// Ancestors are excluded deliberately, and this is the whole point. In a
+			// tree, `send` requires the sender to be an ancestor of the target, so
+			// permitting ancestors IS permitting the sender under another name: a
+			// role could issue a directive and then certify its own work as done.
+			// That is the self-approved merge this campaign exists to stop.
+			// Ancestors are not left without recourse — they hold `cancel`, and the
+			// two verbs mean different things: completion asserts the work HAPPENED,
+			// cancellation asserts it is no longer NEEDED.
+			if by != to && !slicesContains(cfg.Ancestors(by), to) {
+				return fmt.Errorf("role %q cannot record done for directive %d addressed to %q; completion is restricted to the target or a role below it — an ancestor may cancel instead", by, directiveID, to)
 			}
-		} else {
+			body = workflow.FormatOrgDirectiveDoneNote(directiveID, by)
+		default:
 			if by != from {
 				return fmt.Errorf("role %q cannot cancel directive %d sent by %q", by, directiveID, from)
 			}

@@ -34,6 +34,10 @@ pane="worker-pane"
 parent="owner"
 scope=["*"]
 pane="peer-pane"
+[org.roles."helper"]
+parent="worker"
+scope=["*"]
+pane="helper-pane"
 `
 	if err := os.WriteFile(paths.ConfigFile, []byte(configBody), 0o600); err != nil {
 		t.Fatal(err)
@@ -373,17 +377,75 @@ func TestOrgDirectiveDoneVerbAuthorizationAndCompletion(t *testing.T) {
 		t.Fatalf("persisted markers: done=%d ack=%d — `done` must record COMPLETION, not receipt", doneMarkers, ackMarkers)
 	}
 
-	// An ancestor may complete on a second directive.
+	// A role BELOW the target may complete — someone who plausibly did the work.
 	stdout.Reset()
 	stderr.Reset()
-	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/done-ancestor", "and this one"}, &stdout, &stderr); code != 0 {
+	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/done-subtree", "and this one"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("second send code=%d err=%q", code, stderr.String())
 	}
 	secondID := strings.Fields(stdout.String())[2]
 	stdout.Reset()
 	stderr.Reset()
-	if code := runOrg([]string{"directive", "done", secondID, "--home", home, "--by", "owner"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("ancestor done code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	if code := runOrg([]string{"directive", "done", secondID, "--home", home, "--by", "helper"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("subtree done code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+// #1352, the finding that survived round 1 and is the reason the predicate
+// changed: SENDER COMPLETION MUST BE REFUSED.
+//
+// MUTANT = the previous behaviour (ancestor-permission). In a tree, `send`
+// requires the sender to be an ancestor of the target, so permitting ancestors
+// IS permitting the sender under another name — a role could issue a directive
+// and then certify its own work as done. That is the self-approved merge.
+//
+// Ancestors keep `cancel`, which asserts something different: not that the work
+// happened, but that it is no longer needed.
+func TestOrgDirectiveDoneRefusesSenderAndAncestors(t *testing.T) {
+	home := directiveTestHome(t)
+	t.Setenv("GITMOOT_ORG_ROLE", "owner")
+	var stdout, stderr bytes.Buffer
+	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/no-self-complete", "do the work"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("send code=%d err=%q", code, stderr.String())
+	}
+	directiveID := strings.Fields(stdout.String())[2]
+
+	// The SENDER — necessarily an ancestor — must not be able to complete it.
+	stdout.Reset()
+	stderr.Reset()
+	code := runOrg([]string{"directive", "done", directiveID, "--home", home, "--by", "owner"}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("the SENDER completed its own directive: self-certification is exactly what this predicate forbids (out=%q)", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "cannot record done") || !strings.Contains(stderr.String(), "an ancestor may cancel instead") {
+		t.Fatalf("refusal must name the alternative verb; err=%q", stderr.String())
+	}
+
+	// And no completion marker may have been persisted by the refused attempt.
+	store, err := db.Open(config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	id64, err := strconv.ParseInt(directiveID, 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notes, err := store.ListWorkflowNotes(context.Background(), "release/no-self-complete", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, note := range notes {
+		if parsed, _, ok := workflow.ParseOrgDirectiveDoneNote(note.Body); ok && parsed == id64 {
+			t.Fatalf("a refused sender completion still persisted a done marker: %q", note.Body)
+		}
+	}
+
+	// The ancestor's real recourse still works: it may CANCEL.
+	stdout.Reset()
+	stderr.Reset()
+	if code := runOrg([]string{"directive", "cancel", directiveID, "--home", home, "--by", "owner"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("ancestor cancel code=%d err=%q; excluding ancestors from done must not strand them", code, stderr.String())
 	}
 }
 
