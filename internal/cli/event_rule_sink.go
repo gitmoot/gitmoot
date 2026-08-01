@@ -72,19 +72,23 @@ func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
 				slog.Warn("durable wake event encode failed", "job_id", event.JobID, "kind", wakeKind, "error", err)
 				return
 			}
-			// #1352 B4: the drain (wakeOutboxKindForSource) recognises a directive
-			// wake as source_kind=workflow_note whose COALESCE KEY carries the
-			// directive prefix — that contract already existed. Inserting
-			// source_kind="directive" produced rows the drain rejected as an
-			// unsupported source kind, so admitting nags to the outbox without
-			// matching this shape moved the defect rather than fixing it.
-			sourceKind, coalesceKey := wakeKind, wakeKind
+			// #1352 B4: a directive nag is stored as source_kind=workflow_note,
+			// which is the shape the drain (wakeOutboxKindForSource) already
+			// recognises. ONLY the source kind is adjusted here.
+			//
+			// The COALESCE KEY IS THE STORE'S TO DERIVE — wakeOutboxCoalesceKey
+			// validates the kind and builds kind+":"+role. An earlier revision
+			// hand-built that key and passed it as the FOURTH argument, which is
+			// wakeKind, not a coalesce key; all three parameters are strings so the
+			// compiler could not see it, and the store rejected the key as an
+			// unsupported wake kind. Derive-don't-restate: pass the kind, let the
+			// store build the key.
+			sourceKind := wakeKind
 			if wakeKind == db.WakeOutboxKindDirective {
 				sourceKind = db.WakeOutboxSourceWorkflowNote
-				coalesceKey = db.WakeOutboxDirectiveCoalescePrefix + strings.TrimSpace(event.JobID)
 			}
 			if err := s.store.InsertWakeOutbox(
-				ctx, sourceKind, string(payload), coalesceKey, targetRoles,
+				ctx, sourceKind, string(payload), wakeKind, targetRoles,
 			); err != nil {
 				slog.Warn("durable wake outbox insert failed", "job_id", event.JobID, "kind", wakeKind, "error", err)
 				return

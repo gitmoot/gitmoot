@@ -602,3 +602,93 @@ func TestDirectiveTTLExhaustionLeavesAnOperatorVisibleMarker(t *testing.T) {
 	}
 	t.Fatalf("exhaustion left no marker NOTE for directive %d: the column alone is invisible to Comms and to every operator-facing reader", note.ID)
 }
+
+// #1352 B4 — THE FULL INSERT-TO-DRAIN PROBE, pointed at the PRODUCTION ENTRY
+// POINT. This is the shape g7-review ran to find the blocker; it failed with:
+//
+//	wake outbox row 1 has unsupported source kind "directive"
+//
+// My first attempt drove evaluateRules directly and never inserted. That was the
+// wrong seam, not a code defect: the durable insert lives in Emit, and every
+// in-file caller of evaluateRules is DOWNSTREAM of it — the only direct callers
+// are tests, so no production path bypasses the outbox. Driving Emit exercises
+// the real path.
+//
+// THE MUTANT IS THE PRE-FIX BEHAVIOUR: source_kind="directive" on the insert.
+// It checks BOTH ENDS AGREE by feeding the row the SINK ACTUALLY WROTE into the
+// drain's own classifier, so a rename satisfying only one end still fails.
+func TestDirectiveNagInsertToDrainDelivers(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// ONE OBSERVER rule, seeded directly in the TEST home store. Observer scope is
+	// deliberate: eventRuleMatchesAddressee short-circuits true for it, keeping the
+	// ADDRESSING logic out of a probe whose subject is DURABLE DELIVERY. It also
+	// sidesteps the trap that a nudge addresses the TARGET while an escalation
+	// addresses the sender's PARENT, so a single addressed rule satisfies one path
+	// and silently starves the other — no targetRoles, no insert, no error.
+	if err := store.AddEventRule(ctx, db.EventRule{
+		ID:      "probe-directive",
+		OnKind:  db.WakeOutboxKindDirective,
+		WakeRole: "owner",
+		Scope:   db.EventRuleScopeObserver,
+		Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rules, err := store.ListEventRules(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rules) == 0 {
+		t.Fatal("fixture seeded no event rule")
+	}
+
+	// INSERT through the production entry point, with the real nag event shape.
+	sink := &eventRuleSink{store: store, home: home, wake: &fakeEventWake{}}
+	nag := events.NewEvent(
+		events.EventOrgDirective, "4242",
+		db.WakeOutboxSourceWorkflowNote+":4242", "gitmoot/gitmoot",
+		"overdue", "directive 4242 to owner awaits completion", time.Now().UTC(),
+		workflow.RedactCommentText,
+	)
+	nag.WakeTargetRole = "owner"
+	sink.Emit(ctx, nag)
+
+	rows, err := store.ListWakeOutboxObligations(ctx, time.Now().UTC().Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows.Len() == 0 {
+		t.Fatal("no wake outbox row was inserted; the nag never reached the outbox")
+	}
+
+	// BOTH ENDS AGREE, checked against the row the SINK actually wrote.
+	for _, row := range append(append([]db.WakeOutboxObligation{}, rows.Pending...), rows.AgedAttempted...) {
+		kind, ok := wakeOutboxKindForSource(row.SourceKind, row.CoalesceKey)
+		if !ok {
+			t.Fatalf("drain refuses the row the sink wrote: unsupported source kind %q (coalesce %q)", row.SourceKind, row.CoalesceKey)
+		}
+		if kind != db.WakeOutboxKindDirective {
+			t.Fatalf("row the sink wrote classifies as %q, want %q", kind, db.WakeOutboxKindDirective)
+		}
+	}
+
+	// DRAIN it. The defect surfaced here, not at insert.
+	if err := drainReplyWakeOutbox(ctx, store, time.Now().UTC(), func(context.Context) (replyWakeDelivery, error) {
+		return replyWakeDelivery{sink: &recordingSink{}, rules: rules}, nil
+	}); err != nil && strings.Contains(err.Error(), "unsupported source kind") {
+		t.Fatalf("drain REFUSED the nag it was just handed: %v", err)
+	}
+}
