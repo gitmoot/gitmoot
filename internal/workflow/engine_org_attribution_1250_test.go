@@ -294,3 +294,51 @@ func TestHighRiskFanoutAttributesLensChildren(t *testing.T) {
 		t.Fatal("no lens children were enqueued; cannot assert attribution")
 	}
 }
+
+// #1250 finding 1, round 2 (g7-review). END-TO-END on the path that actually
+// runs: allocator-created BLANK lock -> role-bearing job persisted by Mailbox ->
+// executor preflight -> attributed lock.
+//
+// The repair arm alone was not enough. ensureJobExecutorAllowed RECONSTRUCTS a
+// JobRequest to authorize the executor, and it omitted ActingOrgRole — so the
+// sole writer received an empty role and correctly refused to fill. The
+// attribution died one call short of the lock, on a payload carrying it the whole
+// time. My own site audit had flagged that reconstruction as a miss and dismissed
+// it as "preflight-only, harmless"; it is the only path that reaches the lock for
+// task-run and isolated delegation work.
+func TestExecutorPreflightAttributesTheAllocatorCreatedLock(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+
+	// Step 1: the worktree allocator takes the branch with no role in hand.
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName: "gitmoot/gitmoot", Branch: "task-26", Owner: "lead",
+	}); err != nil || !acquired {
+		t.Fatalf("AcquireLock (allocator) returned acquired=%v err=%v", acquired, err)
+	}
+
+	// Step 2: a role-bearing implement job, as Mailbox persists it.
+	payload := JobPayload{
+		Repo:          "gitmoot/gitmoot",
+		Branch:        "task-26",
+		TaskID:        "task-26",
+		LeadAgent:     "lead",
+		ActingOrgRole: "gmc-fanout",
+	}
+	job := db.Job{ID: "executor-preflight-job", Agent: "lead", Type: "implement"}
+
+	// Step 3: the executor preflight — the path that actually reaches the writer.
+	if err := engine.ensureJobExecutorAllowed(ctx, job, payload, taskRefFromPayload(payload)); err != nil {
+		t.Fatalf("ensureJobExecutorAllowed returned error: %v", err)
+	}
+
+	lock, err := store.GetBranchLock(ctx, "gitmoot/gitmoot", "task-26")
+	if err != nil {
+		t.Fatalf("GetBranchLock returned error: %v", err)
+	}
+	if lock.ActingOrgRole != "gmc-fanout" {
+		t.Fatalf("executor preflight left allocator lock unattributed: %+v", lock)
+	}
+}

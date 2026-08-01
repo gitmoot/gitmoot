@@ -379,9 +379,16 @@ func (e Engine) ensureJobExecutorAllowed(ctx context.Context, job db.Job, payloa
 		allowMissingCapability = true
 	}
 	return e.ensureAgentAllowedWithBranchOwner(ctx, JobRequest{
-		Agent:        authorizationAgent,
-		Action:       job.Type,
-		Repo:         payload.Repo,
+		Agent:  authorizationAgent,
+		Action: job.Type,
+		// #1250: the executor preflight is the path that actually reaches
+		// ensureBranchLock for a task-run or isolated-delegation job, and the
+		// allocator has already created that lock BLANK. Reconstructing the request
+		// without the role meant the sole writer was handed an empty value and
+		// correctly refused to fill — so the attribution died here, one call short
+		// of the lock, on a payload that was carrying it the whole time.
+		ActingOrgRole: payload.ActingOrgRole,
+		Repo:          payload.Repo,
 		Sender:       payload.Sender,
 		Branch:       payload.Branch,
 		DelegationID: payload.DelegationID,
