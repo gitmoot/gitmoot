@@ -174,10 +174,12 @@ func (s *Store) InsertWakeOutbox(
 // NOT (#1352): DIRECTIVE ROWS KEY A PER-OBLIGATION STATE MACHINE — pending,
 // revivable from delivered — WHILE EVERY OTHER KIND KEYS AN EVENT.
 //
-// The table's implicit assumption is that source_id is event-unique, and every
-// other kind gets that free from serialized payloads. Directives alone carry a
-// LITERAL directive id, because the decoder (wakeOutboxEvent) renders source_id
-// straight into the command an operator reads back:
+// The table's implicit assumption is that source_id is event-unique. AT
+// event_rule_sink.go — and only there — the non-directive kinds get that free
+// from serialized payloads; this is NOT a property of the table, since the
+// workflow-note and chat-message writers pass their own source ids. Directives
+// alone carry a LITERAL directive id, because the decoder (wakeOutboxEvent)
+// renders source_id straight into the command an operator reads back:
 // `gitmoot org directive ack <id>`. Storing a payload there instead produced
 // `ack {"schema_version":1,...}`.
 //
@@ -203,24 +205,25 @@ func insertWakeOutboxTx(ctx context.Context, tx *sql.Tx, sourceKind, sourceID, w
 	if err != nil {
 		return err
 	}
-	// #1352: UPSERT-REVIVE. (source_kind, source_id, target_role) IS THE
-	// OBLIGATION IDENTITY — that is what coalescing means — so a TTL nag is a
-	// RE-NOTIFICATION of a persisting obligation, not a new one. A plain INSERT
-	// made the initial directive wake and every later nag collide on UNIQUE.
+	// #1352: REVIVE SEMANTICS BIND TO THE DIRECTIVE BRANCH ONLY. The other two
+	// writers on this generic seam — workflow-note insertion and chat-message
+	// insertion — keep HARD-INSERT semantics, untouched.
 	//
-	// The three semantics, and each is deliberate:
-	//   - a DELIVERED row is REVIVED to pending: the obligation still stands and
-	//     needs saying again;
-	//   - an ALREADY-PENDING row is LEFT UNTOUCHED — there is nothing new to say,
-	//     which gives nag suppression for free (N nags -> ONE pending row);
-	//   - a SECOND ROW IS NEVER CREATED, so the row is shared obligation identity
-	//     rather than first-writer property.
+	// The reasoning is obligation-specific: directive rows key a PER-OBLIGATION
+	// STATE MACHINE, while every other kind keys an EVENT. Extending revive to
+	// chat messages and workflow notes would apply an obligation semantic to
+	// things that are not obligations.
 	//
-	// Safe because Emit (event_rule_sink.go) is the SINGLE production call site of
-	// InsertWakeOutbox: there are no divergent callers whose expectations these
-	// semantics could break. It also keeps the literal-id contract and UNIQUE both
-	// intact with no schema change.
-	_, err = tx.ExecContext(ctx, `
+	// SCOPE OF THE SAFETY ARGUMENT, stated precisely because a looser version was
+	// wrong: Store.InsertWakeOutbox has ONE production caller (Emit in
+	// event_rule_sink.go). This generic seam has THREE production paths, so the
+	// single-caller argument covers the OUTER function only — which is why the
+	// upsert is scoped to the directive kind here rather than applied to the seam.
+	if strings.EqualFold(strings.TrimSpace(wakeKind), WakeOutboxKindDirective) {
+		// A DELIVERED row REVIVES to pending — the obligation still stands. An
+		// ALREADY-PENDING row is LEFT UNTOUCHED (nothing new to say), which gives
+		// nag suppression for free. A second row is never created.
+		_, err = tx.ExecContext(ctx, `
 INSERT INTO wake_outbox(source_kind, source_id, target_role, coalesce_key)
 VALUES (?, ?, ?, ?)
 ON CONFLICT(source_kind, source_id, target_role) DO UPDATE SET
@@ -232,10 +235,19 @@ ON CONFLICT(source_kind, source_id, target_role) DO UPDATE SET
 	finished_at = NULL,
 	updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 WHERE wake_outbox.state <> 'pending'`,
-		sourceKind,
-		sourceID,
-		role,
-		coalesceKey)
+			sourceKind,
+			sourceID,
+			role,
+			coalesceKey)
+	} else {
+		_, err = tx.ExecContext(ctx, `
+INSERT INTO wake_outbox(source_kind, source_id, target_role, coalesce_key)
+VALUES (?, ?, ?, ?)`,
+			sourceKind,
+			sourceID,
+			role,
+			coalesceKey)
+	}
 	if err != nil {
 		return err
 	}

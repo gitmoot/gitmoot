@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -749,17 +750,19 @@ func TestDirectiveTTLSweepFallsBackToFullWindowOnCountError(t *testing.T) {
 	}
 }
 
-// #1352 — the NORMAL LIFECYCLE, which is the state production actually occupies
-// and the one the previous guard never entered. It started with NO original
-// directive row, so the initial-wake-then-nag collision could not appear.
+// #1352 — the NORMAL LIFECYCLE across BOTH PRODUCTION WRITERS, asserting
+// IDENTITY rather than count.
 //
-// A COALESCED REPEAT IS A RE-ARM, NOT A VIOLATION: (source_kind, source_id,
-// target_role) is the obligation IDENTITY, so a TTL nag re-notifies a persisting
-// obligation rather than creating a new one.
+// The previous guard built its initial row by calling the TTL sink itself, so it
+// never exercised the directive-send writer, and it asserted only ROW COUNT and
+// STATE. Two semantic mutants survived that: dropping the WHERE clause (an
+// unconditional update that disturbs a pending row) and INSERT OR REPLACE (which
+// keeps the count at one while REPLACING row id 1 with id 2). COUNT CANNOT
+// DISTINGUISH A REVIVED ROW FROM A RECREATED ONE — only the id can.
 //
-// MUTANT: the pre-fix hard INSERT, which fails with
-// "UNIQUE constraint failed: wake_outbox.source_kind, wake_outbox.source_id,
-// wake_outbox.target_role".
+// So: initial row via `org directive send` (writer 1, the workflow-note path),
+// nag via the TTL sink (writer 2), then assert a STABLE ROW ID and, for a
+// repeat against a pending row, UNCHANGED FIELDS.
 func TestDirectiveNagRevivesTheDeliveredWakeRowWithoutDuplicating(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
@@ -767,9 +770,10 @@ func TestDirectiveNagRevivesTheDeliveredWakeRowWithoutDuplicating(t *testing.T) 
 	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n[org.roles.\"worker\"]\nparent=\"owner\"\nscope=[\"*\"]\npane=\"w1:p2\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("GITMOOT_ORG_ROLE", "owner")
 	store, err := db.Open(paths.Database)
 	if err != nil {
 		t.Fatal(err)
@@ -777,61 +781,83 @@ func TestDirectiveNagRevivesTheDeliveredWakeRowWithoutDuplicating(t *testing.T) 
 	defer store.Close()
 	if err := store.AddEventRule(ctx, db.EventRule{
 		ID: "probe-directive", OnKind: db.WakeOutboxKindDirective,
-		Scope: db.EventRuleScopeObserver, WakeRole: "owner", Enabled: true,
+		Scope: db.EventRuleScopeObserver, WakeRole: "worker", Enabled: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	sink := &eventRuleSink{store: store, home: home, wake: &fakeEventWake{}}
 
-	nag := func() events.Event {
-		e := events.NewEvent(
-			events.EventOrgDirective, "4242",
-			db.WakeOutboxSourceWorkflowNote+":4242", "gitmoot/gitmoot",
-			"overdue", "directive 4242 awaits completion", time.Now().UTC(),
-			workflow.RedactCommentText,
-		)
-		e.WakeTargetRole = "owner"
-		return e
+	// WRITER 1: the directive-send path commits the note and its pending wake
+	// obligation together. This is the row production actually starts from.
+	var out, errOut bytes.Buffer
+	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/revive", "do the thing"}, &out, &errOut); code != 0 {
+		t.Fatalf("send code=%d err=%q", code, errOut.String())
 	}
+	directiveID := strings.Fields(out.String())[2]
 
-	// 1. The INITIAL directive wake — production always has this row.
-	sink.Emit(ctx, nag())
 	initial, err := store.ListWakeOutbox(ctx, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(initial) != 1 {
-		t.Fatalf("initial wake rows = %d, want 1", len(initial))
+		t.Fatalf("directive send produced %d wake rows, want 1", len(initial))
 	}
+	originalID := initial[0].ID
 
-	// 2. It gets DELIVERED.
-	if _, err := store.ClaimWakeOutbox(ctx, []int64{initial[0].ID}, time.Now().UTC()); err != nil {
+	// Deliver it, following the real state machine.
+	if _, err := store.ClaimWakeOutbox(ctx, []int64{originalID}, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.FinishWakeOutbox(ctx, []int64{initial[0].ID}, db.WakeOutboxStateDelivered, "", time.Now().UTC()); err != nil {
+	if err := store.FinishWakeOutbox(ctx, []int64{originalID}, db.WakeOutboxStateDelivered, "", time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 
-	// 3. A TTL nag fires against the SAME obligation. It must REVIVE, not reject.
+	// WRITER 2: a TTL nag for the SAME obligation.
+	sink := &eventRuleSink{store: store, home: home, wake: &fakeEventWake{}}
+	nag := func() events.Event {
+		e := events.NewEvent(
+			events.EventOrgDirective, directiveID,
+			db.WakeOutboxSourceWorkflowNote+":"+directiveID, "gitmoot/gitmoot",
+			"overdue", "directive "+directiveID+" awaits completion", time.Now().UTC(),
+			workflow.RedactCommentText,
+		)
+		e.WakeTargetRole = "worker"
+		return e
+	}
 	sink.Emit(ctx, nag())
+
 	revived, err := store.ListWakeOutbox(ctx, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(revived) != 1 {
-		t.Fatalf("after the nag there are %d rows, want exactly 1 — the obligation identity must be shared, not duplicated", len(revived))
+		t.Fatalf("after the nag there are %d rows, want 1", len(revived))
+	}
+	// IDENTITY. Under INSERT OR REPLACE the count stays 1 and the ID changes,
+	// which is a recreated obligation wearing a revived one's costume.
+	if revived[0].ID != originalID {
+		t.Fatalf("obligation row was REPLACED (id %d -> %d), not revived: identity must survive a nag", originalID, revived[0].ID)
 	}
 	if revived[0].State != "pending" {
-		t.Fatalf("delivered row was not revived: state=%q, want pending", revived[0].State)
+		t.Fatalf("delivered row was not revived: state=%q", revived[0].State)
 	}
 
-	// 4. A SECOND nag while still pending changes nothing — nag suppression.
+	// A repeat against an ALREADY-PENDING row must change nothing at all.
+	before := revived[0]
+	// updated_at has millisecond precision, so two emits inside one millisecond
+	// would be indistinguishable and an unconditional update would slip through.
+	// This sleep is what makes the no-touch assertion DETERMINISTIC rather than
+	// a race the mutant can win.
+	time.Sleep(5 * time.Millisecond)
 	sink.Emit(ctx, nag())
 	after, err := store.ListWakeOutbox(ctx, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(after) != 1 || after[0].State != "pending" {
-		t.Fatalf("second nag disturbed a pending obligation: rows=%d state=%q", len(after), after[0].State)
+	if len(after) != 1 || after[0].ID != originalID {
+		t.Fatalf("second nag disturbed obligation identity: rows=%d id=%d want id=%d", len(after), after[0].ID, originalID)
+	}
+	if after[0].UpdatedAt != before.UpdatedAt || after[0].State != before.State || after[0].AttemptCount != before.AttemptCount {
+		t.Fatalf("second nag TOUCHED a pending row: updated_at %q->%q state %q->%q attempts %d->%d — there is nothing new to say",
+			before.UpdatedAt, after[0].UpdatedAt, before.State, after[0].State, before.AttemptCount, after[0].AttemptCount)
 	}
 }
