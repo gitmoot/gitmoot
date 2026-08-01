@@ -1598,6 +1598,11 @@ func (d Daemon) handleIssueComment(ctx context.Context, issue github.Issue, comm
 // branch/HeadSHA.
 func (d Daemon) handleIssueAsk(ctx context.Context, issue github.Issue, comment github.IssueComment, sequence int, command Command) error {
 	if err := command.Validate(); err != nil {
+		if errors.Is(err, ErrUnsupportedAction) {
+			d.logf("comment %d on %s#%d addressed Gitmoot but names no known action, ignoring: %v",
+				comment.ID, d.Repo.FullName(), issue.Number, err)
+			return nil
+		}
 		return d.ack(ctx, issue.Number, fmt.Sprintf("Gitmoot could not route comment %d: %v.", comment.ID, err))
 	}
 	agent, err := d.Store.GetAgent(ctx, command.Agent)
@@ -1716,6 +1721,11 @@ func onlyJobRecoveryCommands(commands []Command) bool {
 
 func (d Daemon) handleCommand(ctx context.Context, pull github.PullRequest, comment github.IssueComment, sequence int, command Command) error {
 	if err := command.Validate(); err != nil {
+		if errors.Is(err, ErrUnsupportedAction) {
+			d.logf("comment %d on %s#%d addressed Gitmoot but names no known action, ignoring: %v",
+				comment.ID, d.Repo.FullName(), pull.Number, err)
+			return nil
+		}
 		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not route comment %d: %v.", comment.ID, err))
 	}
 	switch command.Action {

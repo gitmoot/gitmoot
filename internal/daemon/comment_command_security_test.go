@@ -180,6 +180,58 @@ func TestParseCommandsMarkdownCodeEdges(t *testing.T) {
 	}
 }
 
+// TestHandleCommentUnrecognizedActionStaysSilent pins #1355: a line that is
+// addressed by shape but names no known action must produce no outbound comment
+// on either the PR or the issue path. The body is the real incident — a Swift
+// property wrapper outside any code fence, which parses as the mention form
+// `@<agent> <action>` with action "private(set)" — so before the fix Gitmoot
+// replied "unsupported command action" onto an unrelated repository.
+//
+// The final leg is the discriminator: a *recognized* action with a bad argument
+// still gets a reply, so the fix suppresses parser noise rather than silencing
+// command feedback wholesale.
+func TestHandleCommentUnrecognizedActionStaysSilent(t *testing.T) {
+	ctx := context.Background()
+	store, _, client, daemon := commentCommandFixture(t, ctx)
+	pull := github.PullRequest{Number: 10, Title: "Camera design", HeadRef: "camera-state"}
+
+	comment := github.IssueComment{
+		ID:     5148925000,
+		Author: "alice",
+		Body:   "@Published private(set) var state = .uninitialized",
+	}
+	if err := daemon.handleComment(ctx, pull, comment); err != nil {
+		t.Fatalf("handleComment returned error: %v", err)
+	}
+	if len(client.posted) != 0 {
+		t.Fatalf("unrecognized action on a PR posted replies = %+v, want none", client.posted)
+	}
+	if jobs, err := store.ListJobs(ctx); err != nil || len(jobs) != 0 {
+		t.Fatalf("unrecognized action jobs = %+v, err=%v, want none", jobs, err)
+	}
+
+	issue := github.Issue{Number: 11, Title: "Camera state", State: "open"}
+	issueComment := github.IssueComment{
+		ID:     5148925001,
+		Author: "alice",
+		Body:   "@objc dynamic private(set) var retries = 0",
+	}
+	if err := daemon.handleIssueComment(ctx, issue, issueComment); err != nil {
+		t.Fatalf("handleIssueComment returned error: %v", err)
+	}
+	if len(client.posted) != 0 {
+		t.Fatalf("unrecognized action on an issue posted replies = %+v, want none", client.posted)
+	}
+
+	badArgument := github.IssueComment{ID: 5148925002, Author: "alice", Body: "@helper retry"}
+	if err := daemon.handleComment(ctx, pull, badArgument); err != nil {
+		t.Fatalf("handleComment(bad argument) returned error: %v", err)
+	}
+	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "requires a job id") {
+		t.Fatalf("recognized action with a bad argument replies = %+v, want one job-id error", client.posted)
+	}
+}
+
 func commentCommandFixture(t *testing.T, ctx context.Context) (*db.Store, github.Repository, *fakeGitHub, Daemon) {
 	t.Helper()
 	store := testStore(t)
