@@ -117,7 +117,11 @@ backtick spans before considering comment commands. It then verifies through
 GitHub that the comment author currently has `write`, `maintain`, or `admin`
 permission on the repository before the remaining command text reaches the
 parser. Ordinary prose and code examples produce no Gitmoot reply; a malformed
-command from an authorized author produces a visible routing error. An unclosed
+command from an authorized author produces a visible routing error. A line that
+is addressed by shape but names an unimplemented action — as source code does
+routinely, since `@Published private(set) var state = .uninitialized` matches
+the `@<agent> <action>` form — produces no reply at all and is logged instead,
+while a recognized action with a bad argument still replies. An unclosed
 fenced code block treats the remainder of the comment as code, so any later
 command is ignored without a reply.
 
