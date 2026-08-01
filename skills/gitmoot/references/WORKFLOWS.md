@@ -32,6 +32,7 @@ gitmoot workflow describe release-42 "Validate and ship release 42."
 gitmoot workflow note release-42 "Kickoff." --author operator --status "Release checks running"
 gitmoot workflow note release-42 "Canary passed." --author operator --remember
 gitmoot workflow show release-42
+gitmoot workflow close release-42 --reason "Release 42 shipped and verified."
 ```
 
 `description` is the stable human "what/why" line. Gitmoot seeds it on the first
@@ -188,6 +189,56 @@ Use the Gitmoot planner here. Write a task-by-task implementation plan for this 
 
 If the user asks for a standard goal file, read the canonical goal template and
 write the goal file. Do not create a goal file unless explicitly requested.
+
+## Plan-Gated Implement
+
+Gate implementation on an approved plan when the change is non-trivial. The
+gate composes existing primitives — an ask job, a workflow note, an org
+directive — so it works unchanged on Codex, Claude, and Kimi seats, and the
+approval survives restarts because every step is durable state rather than
+conversation.
+
+```sh
+# 1. Plan, read-only. No file changes, no implement dispatches.
+gitmoot agent ask planner-agent --repo owner/repo --workflow feature-42 \
+  "Write a task-by-task implementation plan for <feature>."
+
+# 2. Record the plan. The printed entry id is the plan-id.
+gitmoot workflow note feature-42 "PLAN: <the complete plan text>"
+# The note must contain the complete plan — it is the text the approval
+# binds to and the fence the implementer is held inside.
+# -> noted workflow feature-42 as entry 1234
+
+# 3. Approve explicitly (org mode). Approval never comes from silence:
+#    the directive is tracked, TTL-nudged, and visible until completed.
+GITMOOT_ORG_ROLE=<approver-role> gitmoot org directive send \
+  --to implementer-role --workflow feature-42 \
+  "approved: implement plan 1234 as written; the plan is the scope fence"
+
+# 4. Implement, quoting the approved plan-id.
+gitmoot agent implement builder --repo owner/repo --workflow feature-42 \
+  "Implement plan 1234 (workflow note in feature-42). Stay inside it; work
+   outside the plan needs an amended plan and a fresh approval."
+
+# 5. Completion ends the obligation; merge closes the workflow — in this
+#    order: a `done` posted after `close` reopens the workflow, because
+#    any note into a closed workflow does.
+gitmoot org directive done <directive-id> --by implementer-role
+gitmoot workflow close feature-42 --reason "Plan 1234 implemented and merged."
+```
+
+Outside org mode, step 3 is an explicit human approval message referencing the
+plan-id; the rest is unchanged. A coordinator may waive the gate for trivial
+mechanical fixes by writing "plan-waived" in the dispatch prompt — the waiver
+is deliberate and visible, never implied. Under this convention every
+implement dispatch prompt carries either a plan-id or the literal
+"plan-waived"; a dispatch with neither is out of contract. Prefer this
+durable handshake over an
+interactive plan-approval prompt for any unattended seat: a session blocked on
+an in-pane approval modal reports idle, runs no job, and escalates nothing, so
+every fleet channel reads it as healthy while it waits. The `planner` template knows this
+handshake: in coordinator mode it posts its plan as a workflow note, reports
+the plan-id, and stops until an approval referencing that id arrives.
 
 ## Current-Chat Custom Agent Prompt
 

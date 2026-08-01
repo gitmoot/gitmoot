@@ -17,7 +17,7 @@ full expanded context.
 - [Install](https://gitmoot.io/docs/getting-started/install): Install and verify Gitmoot.
 - [Quick Start](https://gitmoot.io/docs/getting-started/quick-start): Ask an agent to install Gitmoot, register a repo, start a planner, and route work.
 - [PR Comment Workflow](https://gitmoot.io/docs/workflows/pr-comment-workflow): Route auditable work from GitHub comments — `/gitmoot` commands, bare `@agent` mentions, and resuming paused orchestrations.
-- [Planner And Goal Workflow](https://gitmoot.io/docs/workflows/planner-goal-workflow): Create structured plans and goal files.
+- [Planner And Goal Workflow](https://gitmoot.io/docs/workflows/planner-goal-workflow): Create structured plans and goal files; plan-gated implement holds implementation until a recorded plan is explicitly approved.
 - [Template Capture Workflow](https://gitmoot.io/docs/workflows/template-capture-workflow): Turn a current chat workflow into a reviewed reusable template, and back templates up to a GitHub repo (publish/pull).
 - [Review Agent Workflow](https://gitmoot.io/docs/workflows/review-agent-workflow): Register a strict review-only agent and route PR reviews to it.
 - [Coordinator Recipes Workflow](https://gitmoot.io/docs/workflows/coordinator-recipes-workflow): One-command orchestras via `orchestrate --recipe review-panel|decompose-and-verify|verifier` with ephemeral workers.

@@ -79,6 +79,17 @@ When asked to write the goal file:
 Do not implement the planned feature unless the user explicitly asks after the
 plan and goal file are complete.
 
+## Plan Approval Gate (Coordinator Mode)
+
+When you plan under a coordinator or an org workflow, the plan is not finished
+until it is recorded and approved. Post the completed plan with
+`gitmoot workflow note <label> "..."`, report the entry id the CLI prints as
+the plan-id, and STOP. Do not implement and do not emit implement delegations
+until an explicit approval referencing that plan-id reaches you — in org mode
+an `org directive`, otherwise an explicit human approval. Approval is never
+inferred from silence. Work outside the approved plan needs an amended plan
+and a fresh approval, not silent expansion.
+
 ## Coordinator Delegations
 
 When you run as a managed coordinator agent, you orchestrate an orchestra of
@@ -108,13 +119,15 @@ succeeded. Once all top-level delegations reach a terminal state, Gitmoot
 enqueues one coordinator continuation job so you can synthesize the results.
 
 See `references/RESULT_CONTRACT.md` for the full field reference. Example
-coordinator result that delegates two flat parallel jobs to different agents:
+coordinator result that delegates two flat parallel jobs to different
+agents (it assumes the plan was already approved — or plan-waived — per
+the Plan Approval Gate above):
 
 ```json
 {
   "gitmoot_result": {
     "decision": "approved",
-    "summary": "Plan ready; delegating implementation and review.",
+    "summary": "Approved plan 1234 received; delegating implementation and review.",
     "findings": [],
     "changes_made": [],
     "tests_run": [],
@@ -124,7 +137,7 @@ coordinator result that delegates two flat parallel jobs to different agents:
         "id": "build-api",
         "agent": "backend-coder",
         "action": "implement",
-        "prompt": "Implement the REST API described in the plan."
+        "prompt": "Implement approved plan 1234: the REST API it describes."
       },
       {
         "id": "review-plan",
