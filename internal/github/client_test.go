@@ -1056,7 +1056,7 @@ func TestCreatePullRequestFetchesCreatedPR(t *testing.T) {
 	runner := &fakeRunner{
 		results: []subprocess.Result{
 			{Stdout: "https://github.com/gitmoot/gitmoot/pull/7\n"},
-			{Stdout: `{"number": 7, "title": "Task 7", "state": "open", "html_url": "https://github.com/gitmoot/gitmoot/pull/7", "head": {"ref": "task-7", "sha": "abc123"}, "base": {"ref": "main"}}`},
+			{Stdout: `{"number": 7, "title": "Task 7", "state": "open", "draft": true, "html_url": "https://github.com/gitmoot/gitmoot/pull/7", "head": {"ref": "task-7", "sha": "abc123"}, "base": {"ref": "main"}}`},
 		},
 	}
 	client := GhClient{Runner: runner}
@@ -1067,12 +1067,13 @@ func TestCreatePullRequestFetchesCreatedPR(t *testing.T) {
 		Body:  "body",
 		Head:  "task-7",
 		Base:  "main",
+		Draft: true,
 	})
 
 	if err != nil {
 		t.Fatalf("CreatePullRequest returned error: %v", err)
 	}
-	if pr.Number != 7 || pr.HeadSHA != "abc123" {
+	if pr.Number != 7 || pr.HeadSHA != "abc123" || !pr.Draft {
 		t.Fatalf("pr = %+v", pr)
 	}
 	runner.wantArgs(t, 0,
@@ -1082,6 +1083,7 @@ func TestCreatePullRequestFetchesCreatedPR(t *testing.T) {
 		"--body", "body",
 		"--head", "task-7",
 		"--base", "main",
+		"--draft",
 	)
 	runner.wantArgs(t, 1, "api", "repos/gitmoot/gitmoot/pulls/7")
 }
@@ -1091,14 +1093,14 @@ func TestGetOpenPullRequestByHead(t *testing.T) {
 
 	t.Run("found", func(t *testing.T) {
 		runner := &fakeRunner{results: []subprocess.Result{
-			{Stdout: `[{"number":7,"url":"https://github.com/gitmoot/gitmoot/pull/7","headRefOid":"abc123","baseRefName":"main","state":"OPEN"}]`},
+			{Stdout: `[{"number":7,"url":"https://github.com/gitmoot/gitmoot/pull/7","headRefOid":"abc123","baseRefName":"main","state":"OPEN","isDraft":true}]`},
 		}}
 		client := GhClient{Runner: runner}
 		pr, ok, err := client.GetOpenPullRequestByHead(context.Background(), repo, "task-7", "main")
 		if err != nil || !ok {
 			t.Fatalf("GetOpenPullRequestByHead = (%+v, %v, %v), want found", pr, ok, err)
 		}
-		if pr.Number != 7 || pr.HeadSHA != "abc123" || pr.BaseRef != "main" || pr.HeadRef != "task-7" || pr.State != "open" {
+		if pr.Number != 7 || pr.HeadSHA != "abc123" || pr.BaseRef != "main" || pr.HeadRef != "task-7" || pr.State != "open" || !pr.Draft {
 			t.Fatalf("pr = %+v", pr)
 		}
 		runner.wantArgs(t, 0,
@@ -1107,7 +1109,7 @@ func TestGetOpenPullRequestByHead(t *testing.T) {
 			"--head", "task-7",
 			"--base", "main",
 			"--state", "open",
-			"--json", "number,url,headRefOid,baseRefName,state",
+			"--json", "number,url,headRefOid,baseRefName,state,isDraft",
 		)
 	})
 
@@ -1141,7 +1143,7 @@ func TestEnsurePullRequest(t *testing.T) {
 		if len(runner.calls) != 1 {
 			t.Fatalf("calls = %v, want exactly the query call", runner.calls)
 		}
-		runner.wantArgs(t, 0, "pr", "list", "--repo", "gitmoot/gitmoot", "--head", "task-7", "--base", "main", "--state", "open", "--json", "number,url,headRefOid,baseRefName,state")
+		runner.wantArgs(t, 0, "pr", "list", "--repo", "gitmoot/gitmoot", "--head", "task-7", "--base", "main", "--state", "open", "--json", "number,url,headRefOid,baseRefName,state,isDraft")
 	})
 
 	t.Run("creates when absent", func(t *testing.T) {
@@ -1158,7 +1160,7 @@ func TestEnsurePullRequest(t *testing.T) {
 		if pr.Number != 11 || pr.HeadSHA != "sha11" {
 			t.Fatalf("pr = %+v", pr)
 		}
-		runner.wantArgs(t, 0, "pr", "list", "--repo", "gitmoot/gitmoot", "--head", "task-7", "--base", "main", "--state", "open", "--json", "number,url,headRefOid,baseRefName,state")
+		runner.wantArgs(t, 0, "pr", "list", "--repo", "gitmoot/gitmoot", "--head", "task-7", "--base", "main", "--state", "open", "--json", "number,url,headRefOid,baseRefName,state,isDraft")
 		runner.wantArgs(t, 1, "pr", "create", "--repo", "gitmoot/gitmoot", "--title", "Task 7", "--body", "body", "--head", "task-7", "--base", "main")
 	})
 

@@ -150,14 +150,17 @@ type JobRequest struct {
 	Repo           string
 	Branch         string
 	PullRequest    int
-	HeadSHA        string
-	GoalID         string
-	TaskID         string
-	TaskTitle      string
-	LeadAgent      string
-	Reviewers      []string
-	ReviewRound    string
-	Sender         string
+	// PullRequestReady opts an implementation PR out of the engine's
+	// draft-by-default policy. It is set only by an explicit ready dispatch.
+	PullRequestReady bool
+	HeadSHA          string
+	GoalID           string
+	TaskID           string
+	TaskTitle        string
+	LeadAgent        string
+	Reviewers        []string
+	ReviewRound      string
+	Sender           string
 	// ActingOrgRole attributes a fresh local dispatch to an organization role.
 	// It is persisted for audit provenance, then inherited by engine children.
 	ActingOrgRole string
@@ -287,33 +290,38 @@ type JobRequest struct {
 }
 
 type JobPayload struct {
-	Repo                  string   `json:"repo"`
-	Branch                string   `json:"branch"`
-	PullRequest           int      `json:"pull_request"`
-	HeadSHA               string   `json:"head_sha,omitempty"`
-	GoalID                string   `json:"goal_id,omitempty"`
-	TaskID                string   `json:"task_id"`
-	TaskTitle             string   `json:"task_title"`
-	LeadAgent             string   `json:"lead_agent,omitempty"`
-	Reviewers             []string `json:"reviewers,omitempty"`
-	ReviewRound           string   `json:"review_round,omitempty"`
-	Sender                string   `json:"sender"`
-	ActingOrgRole         string   `json:"acting_org_role,omitempty"`
-	Instructions          string   `json:"instructions"`
-	Constraints           []string `json:"constraints"`
-	ParentJobID           string   `json:"parent_job_id,omitempty"`
-	DelegationID          string   `json:"delegation_id,omitempty"`
-	DelegationDepth       int      `json:"delegation_depth,omitempty"`
-	DelegatedBy           string   `json:"delegated_by,omitempty"`
-	RootJobID             string   `json:"root_job_id,omitempty"`
-	Deps                  []string `json:"deps,omitempty"`
-	JobTimeout            string   `json:"job_timeout,omitempty"`
-	RetryCount            int      `json:"retry_count,omitempty"`
-	Fingerprint           string   `json:"fingerprint,omitempty"`
-	FailurePolicy         string   `json:"failure_policy,omitempty"`
-	SynthesisRule         string   `json:"synthesis_rule,omitempty"`
-	DelegationArtifactDir string   `json:"delegation_artifact_dir,omitempty"`
-	WorktreePath          string   `json:"worktree_path,omitempty"`
+	Repo             string `json:"repo"`
+	Branch           string `json:"branch"`
+	PullRequest      int    `json:"pull_request"`
+	PullRequestReady bool   `json:"pull_request_ready,omitempty"`
+	// PullRequestDraft is the forge-observed state, kept separate from requested
+	// intent so routing decisions consume what the forge actually reports.
+	PullRequestDraft        bool     `json:"pull_request_draft,omitempty"`
+	PullRequestDraftUnknown bool     `json:"pull_request_draft_unknown,omitempty"`
+	HeadSHA                 string   `json:"head_sha,omitempty"`
+	GoalID                  string   `json:"goal_id,omitempty"`
+	TaskID                  string   `json:"task_id"`
+	TaskTitle               string   `json:"task_title"`
+	LeadAgent               string   `json:"lead_agent,omitempty"`
+	Reviewers               []string `json:"reviewers,omitempty"`
+	ReviewRound             string   `json:"review_round,omitempty"`
+	Sender                  string   `json:"sender"`
+	ActingOrgRole           string   `json:"acting_org_role,omitempty"`
+	Instructions            string   `json:"instructions"`
+	Constraints             []string `json:"constraints"`
+	ParentJobID             string   `json:"parent_job_id,omitempty"`
+	DelegationID            string   `json:"delegation_id,omitempty"`
+	DelegationDepth         int      `json:"delegation_depth,omitempty"`
+	DelegatedBy             string   `json:"delegated_by,omitempty"`
+	RootJobID               string   `json:"root_job_id,omitempty"`
+	Deps                    []string `json:"deps,omitempty"`
+	JobTimeout              string   `json:"job_timeout,omitempty"`
+	RetryCount              int      `json:"retry_count,omitempty"`
+	Fingerprint             string   `json:"fingerprint,omitempty"`
+	FailurePolicy           string   `json:"failure_policy,omitempty"`
+	SynthesisRule           string   `json:"synthesis_rule,omitempty"`
+	DelegationArtifactDir   string   `json:"delegation_artifact_dir,omitempty"`
+	WorktreePath            string   `json:"worktree_path,omitempty"`
 	// RuntimePID is the exact subprocess started by the runtime runner for the
 	// current delivery. RuntimePIDStartTime is Linux /proc starttime field 22,
 	// captured at the same moment so liveness checks cannot mistake a recycled
@@ -503,10 +511,16 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 	// lookup, so root dispatches are untouched. Fails open: an unreadable parent
 	// leaves the request exactly as the caller built it.
 	skipNativeReviewFanout := request.SkipNativeReviewFanout
-	if !skipNativeReviewFanout && strings.TrimSpace(request.ParentJobID) != "" {
+	pullRequestReady := request.PullRequestReady
+	if (!skipNativeReviewFanout || !pullRequestReady) && strings.TrimSpace(request.ParentJobID) != "" {
 		if parent, parentErr := m.Store.GetJob(ctx, strings.TrimSpace(request.ParentJobID)); parentErr == nil {
-			if parentPayload, parseErr := unmarshalPayload(parent.Payload); parseErr == nil && parentPayload.SkipNativeReviewFanout {
-				skipNativeReviewFanout = true
+			if parentPayload, parseErr := unmarshalPayload(parent.Payload); parseErr == nil {
+				if parentPayload.SkipNativeReviewFanout {
+					skipNativeReviewFanout = true
+				}
+				if parentPayload.PullRequestReady {
+					pullRequestReady = true
+				}
 			}
 		}
 	}
@@ -515,6 +529,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		Repo:                   request.Repo,
 		Branch:                 request.Branch,
 		PullRequest:            request.PullRequest,
+		PullRequestReady:       pullRequestReady,
 		HeadSHA:                request.HeadSHA,
 		GoalID:                 request.GoalID,
 		TaskID:                 request.TaskID,

@@ -2,6 +2,7 @@ package github
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -76,6 +77,11 @@ type PullRequest struct {
 	State  string `json:"state"`
 	URL    string `json:"html_url"`
 	Merged bool   `json:"merged"`
+	Draft  bool   `json:"draft"`
+	// DraftUnknown distinguishes a forge response that omitted draft (or returned
+	// null) from an explicit draft:false. The zero value preserves existing
+	// programmatic PullRequest literals as confirmed non-draft observations.
+	DraftUnknown bool `json:"-"`
 	// MergedAt is the PR's merge timestamp (RFC3339), or "" if not merged. It is
 	// additive (#467): the GitHub LIST endpoint (GET /pulls?state=closed) reports
 	// merged PRs as state="closed" and OMITS the top-level `merged` boolean —
@@ -125,15 +131,16 @@ func (p PullRequest) LabelNames() []string {
 
 func (p *PullRequest) UnmarshalJSON(data []byte) error {
 	type wire struct {
-		Number    int64  `json:"number"`
-		Title     string `json:"title"`
-		State     string `json:"state"`
-		URL       string `json:"html_url"`
-		Merged    bool   `json:"merged"`
-		MergedAt  string `json:"merged_at"`
-		Body      string `json:"body"`
-		Mergeable *bool  `json:"mergeable"`
-		MergeSHA  string `json:"merge_commit_sha"`
+		Number    int64           `json:"number"`
+		Title     string          `json:"title"`
+		State     string          `json:"state"`
+		URL       string          `json:"html_url"`
+		Merged    bool            `json:"merged"`
+		Draft     json.RawMessage `json:"draft"`
+		MergedAt  string          `json:"merged_at"`
+		Body      string          `json:"body"`
+		Mergeable *bool           `json:"mergeable"`
+		MergeSHA  string          `json:"merge_commit_sha"`
 		Head      struct {
 			Ref  string `json:"ref"`
 			SHA  string `json:"sha"`
@@ -151,11 +158,17 @@ func (p *PullRequest) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		return err
 	}
+	draft, draftUnknown, err := decodeOptionalBool(decoded.Draft)
+	if err != nil {
+		return fmt.Errorf("decode pull request draft: %w", err)
+	}
 	p.Number = decoded.Number
 	p.Title = decoded.Title
 	p.State = decoded.State
 	p.URL = decoded.URL
 	p.Merged = decoded.Merged
+	p.Draft = draft
+	p.DraftUnknown = draftUnknown
 	p.MergedAt = decoded.MergedAt
 	p.Body = decoded.Body
 	p.Mergeable = decoded.Mergeable
@@ -170,6 +183,20 @@ func (p *PullRequest) UnmarshalJSON(data []byte) error {
 	p.BaseSHA = decoded.Base.SHA
 	p.Labels = decoded.Labels
 	return nil
+}
+
+func decodeOptionalBool(raw json.RawMessage) (value bool, unknown bool, err error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return false, true, nil
+	}
+	if bytes.Equal(trimmed, []byte("null")) {
+		return false, true, nil
+	}
+	if err := json.Unmarshal(trimmed, &value); err != nil {
+		return false, false, err
+	}
+	return value, false, nil
 }
 
 type IssueComment struct {
@@ -726,7 +753,7 @@ func (c *GhClient) GetOpenPullRequestByHead(ctx context.Context, repo Repository
 		"--head", head,
 		"--base", base,
 		"--state", "open",
-		"--json", "number,url,headRefOid,baseRefName,state",
+		"--json", "number,url,headRefOid,baseRefName,state,isDraft",
 	)
 	if err != nil {
 		return PullRequest{}, false, err
@@ -737,6 +764,7 @@ func (c *GhClient) GetOpenPullRequestByHead(ctx context.Context, repo Repository
 		HeadRefOid  string `json:"headRefOid"`
 		BaseRefName string `json:"baseRefName"`
 		State       string `json:"state"`
+		IsDraft     bool   `json:"isDraft"`
 	}
 	if err := json.Unmarshal([]byte(result.Stdout), &wire); err != nil {
 		return PullRequest{}, false, fmt.Errorf("decode gh pr list response: %w", err)
@@ -749,6 +777,7 @@ func (c *GhClient) GetOpenPullRequestByHead(ctx context.Context, repo Repository
 		Number:  w.Number,
 		URL:     w.URL,
 		State:   strings.ToLower(strings.TrimSpace(w.State)),
+		Draft:   w.IsDraft,
 		HeadRef: head,
 		HeadSHA: w.HeadRefOid,
 		BaseRef: w.BaseRefName,

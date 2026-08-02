@@ -860,6 +860,7 @@ gitmoot agent run reviewer --repo owner/repo --pr 12 --background "Review this P
 gitmoot agent run lead --repo owner/repo --action implement --pr 12 "Fix findings on the existing PR."
 gitmoot agent review reviewer --repo owner/repo --pr 12 "Review this PR."
 gitmoot agent implement lead --repo owner/repo --task task-001 "Implement this task."
+gitmoot agent implement lead --repo owner/repo --task task-001 --ready "Implement and open the PR ready for review."
 gitmoot agent implement lead --repo owner/repo --pr 12 "Fix findings on the existing PR."
 gitmoot agent implement lead --repo owner/repo --task task-002 --base origin/main "Implement from current origin/main."
 gitmoot agent ask project-planner --repo owner/repo "Return the plan status."
@@ -876,6 +877,14 @@ has a separate meaning: it selects a managed agent type. The flags can be used
 together. Invalid actions and contradictions are rejected before enqueue;
 notably, `--action review` requires `--pr`, while `--action implement --pr` is
 the explicit existing-PR fix-pass route.
+
+New implementation PRs opened by the engine are drafts by default. Use
+`--ready` on `agent run`, `agent implement`, or `orchestrate` to opt into an
+immediately merge-gate-eligible PR once review evidence is satisfied; `--draft`
+states the safe default explicitly. A draft PR does not move its task to
+`awaiting_human_merge`, because
+no human merge decision has been requested. Marking the PR ready lets normal
+merge-gate advancement resume.
 
 For `agent implement --pr <number>` (or the equivalent `agent run --action
 implement --pr <number>`), Gitmoot resolves the PR and reuses its existing task

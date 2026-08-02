@@ -420,11 +420,13 @@ func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Contex
 		Body:  finalizerPullRequestBody(job, payload, task),
 		Head:  task.Branch,
 		Base:  base,
+		Draft: !payload.PullRequestReady,
 	})
 	if err != nil {
 		return payload, workflow.BlockedError{Reason: "open implementation PR failed: " + err.Error()}
 	}
 	payload.PullRequest = int(pr.Number)
+	payload.PullRequestDraft = pr.Draft
 	payload.Branch = task.Branch
 	payload.HeadSHA = firstNonEmpty(pr.HeadSHA, head)
 	if payload.TaskTitle == "" {

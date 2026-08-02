@@ -384,6 +384,8 @@ type agentRunOptions struct {
 	session                string
 	taskID                 string
 	prNumber               int
+	pullRequestReady       bool
+	pullRequestMode        string
 	headSHA                string
 	base                   string
 	branch                 string
@@ -549,6 +551,10 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 		fmt.Fprintf(stderr, "%s: %v\n", errLabel, err)
 		return localAgentJobOutput{}, 2
 	}
+	if options.pullRequestMode != "" && action != "implement" {
+		fmt.Fprintf(stderr, "%s: --%s is only supported when routing to implement\n", errLabel, options.pullRequestMode)
+		return localAgentJobOutput{}, 2
+	}
 	dispatchCtx := context.Background()
 	var stopSignals context.CancelFunc
 	if !options.background {
@@ -558,34 +564,7 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 	var output localAgentJobOutput
 	if err := withStore(options.home, func(store *db.Store) error {
 		var err error
-		output, err = dispatchLocalAgentJob(dispatchCtx, store, localAgentDispatchRequest{
-			RepoFlag:               options.repo,
-			Agent:                  options.agent,
-			Action:                 action,
-			Instructions:           options.message,
-			Background:             options.background,
-			Type:                   options.typeName,
-			Model:                  options.model,
-			Effort:                 options.effort,
-			WorkflowID:             options.workflowID,
-			ActingOrgRole:          options.orgRole,
-			OperatorOrigin:         true,
-			Runtime:                options.runtime,
-			RuntimeSession:         options.session,
-			Home:                   options.home,
-			TaskID:                 options.taskID,
-			PullRequest:            options.prNumber,
-			HeadSHA:                options.headSHA,
-			ImplementBase:          options.base,
-			Branch:                 options.branch,
-			Cockpit:                options.cockpit,
-			CockpitSession:         options.cockpitSession,
-			SkipNativeReviewFanout: options.skipNativeReviewFanout,
-			Recipe:                 options.recipe,
-			SelectedAction:         action,
-			SelectedActionReason:   reason,
-			ExecutionPath:          executionPath,
-		})
+		output, err = dispatchLocalAgentJob(dispatchCtx, store, localAgentDispatchRequestFromOptions(options, action, reason, executionPath))
 		return err
 	}); err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", errLabel, err)
@@ -615,6 +594,38 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 		fmt.Fprintf(stderr, "%s: advance warning: %s\n", errLabel, output.AdvanceError)
 	}
 	return output, 0
+}
+
+func localAgentDispatchRequestFromOptions(options agentRunOptions, action, reason, executionPath string) localAgentDispatchRequest {
+	return localAgentDispatchRequest{
+		RepoFlag:               options.repo,
+		Agent:                  options.agent,
+		Action:                 action,
+		Instructions:           options.message,
+		Background:             options.background,
+		Type:                   options.typeName,
+		Model:                  options.model,
+		Effort:                 options.effort,
+		WorkflowID:             options.workflowID,
+		ActingOrgRole:          options.orgRole,
+		OperatorOrigin:         true,
+		Runtime:                options.runtime,
+		RuntimeSession:         options.session,
+		Home:                   options.home,
+		TaskID:                 options.taskID,
+		PullRequest:            options.prNumber,
+		PullRequestReady:       options.pullRequestReady,
+		HeadSHA:                options.headSHA,
+		ImplementBase:          options.base,
+		Branch:                 options.branch,
+		Cockpit:                options.cockpit,
+		CockpitSession:         options.cockpitSession,
+		SkipNativeReviewFanout: options.skipNativeReviewFanout,
+		Recipe:                 options.recipe,
+		SelectedAction:         action,
+		SelectedActionReason:   reason,
+		ExecutionPath:          executionPath,
+	}
 }
 
 // agentRunCommandLabel is how a parse/usage error names the command. The agent
@@ -649,6 +660,14 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.cockpit = true
 		case arg == "--skip-native-review-fanout":
 			options.skipNativeReviewFanout = true
+		case arg == "--draft" || arg == "--ready":
+			mode := strings.TrimPrefix(arg, "--")
+			if options.pullRequestMode != "" && options.pullRequestMode != mode {
+				fmt.Fprintf(stderr, "%s: --draft and --ready are mutually exclusive\n", label)
+				return agentRunOptions{}, false
+			}
+			options.pullRequestMode = mode
+			options.pullRequestReady = mode == "ready"
 		case arg == "--type" || arg == "--action" || arg == "--model" || arg == "--effort" || arg == "--workflow" || arg == "--org-role" || arg == "--runtime" || arg == "--session" || arg == "--repo" || arg == "--home" || arg == "--task" || arg == "--pr" || arg == "--head-sha" || arg == "--base" || arg == "--branch" || arg == "--cockpit-session" || arg == "--recipe":
 			if index+1 >= len(args) {
 				fmt.Fprintf(stderr, "%s requires a value for %s\n", label, arg)
@@ -854,17 +873,20 @@ func printAgentRunUsage(w io.Writer, command string) {
 	fmt.Fprintln(w, "Usage:")
 	switch command {
 	case "orchestrate":
-		fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--recipe id] [--cockpit] [--cockpit-session name] [--skip-native-review-fanout] [--home path] [--json]")
+		fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--draft|--ready] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--recipe id] [--cockpit] [--cockpit-session name] [--skip-native-review-fanout] [--home path] [--json]")
 	case "review":
 		fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--home path] [--json]")
 	case "implement":
-		fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--base ref] [--head-sha sha] [--branch branch] [--background] [--type type] [--action implement] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--skip-native-review-fanout] [--home path] [--json]")
+		fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--base ref] [--head-sha sha] [--branch branch] [--draft|--ready] [--background] [--type type] [--action implement] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--skip-native-review-fanout] [--home path] [--json]")
 	default:
-		fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--base ref] [--branch branch] [--background] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--recipe id] [--skip-native-review-fanout] [--home path] [--json]")
+		fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--base ref] [--branch branch] [--draft|--ready] [--background] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--recipe id] [--skip-native-review-fanout] [--home path] [--json]")
 	}
 	if command == "implement" || command == "run" {
 		fmt.Fprintln(w, "  --base <ref> selects the starting commit for implement worktrees; origin/* refs are fetched before resolution.")
 		fmt.Fprintln(w, "  On implement, --head-sha is a compatibility alias for --base. Different values are rejected.")
+	}
+	if command == "implement" || command == "run" || command == "orchestrate" {
+		fmt.Fprintln(w, "  Implementation PRs open as drafts by default. Use --ready to opt into immediate merge-gate eligibility.")
 	}
 	printAgentRuntimeOverrideHelp(w)
 }
