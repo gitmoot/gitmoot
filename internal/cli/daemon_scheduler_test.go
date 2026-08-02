@@ -2310,7 +2310,7 @@ func TestRunQueuedJobsFailsReviewOnWrongCheckoutBranchBeforeDelivery(t *testing.
 // A wrong-checkout-HEAD review pre-flight is a checkout_contention (#532 slice C):
 // it DEFERS (queued with a suggested_action) instead of failing terminally, since
 // the checkout may just be mid-sync — pre-flight still stops delivery.
-func TestRunQueuedJobsDefersReviewOnWrongCheckoutHeadBeforeDelivery(t *testing.T) {
+func TestRunQueuedJobsFailsReviewOnWrongCheckoutHeadBeforeDelivery(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	checkout := t.TempDir()
@@ -2346,15 +2346,24 @@ func TestRunQueuedJobsDefersReviewOnWrongCheckoutHeadBeforeDelivery(t *testing.T
 	if err != nil {
 		t.Fatalf("GetJob returned error: %v", err)
 	}
-	if job.State != string(workflow.JobQueued) {
-		t.Fatalf("job state = %q, want queued (checkout_contention deferral)", job.State)
+	// POLICY REVERSED (#1415). This test previously asserted the review DEFERRED as
+	// checkout_contention. The axis it covered -- "a wrong-head review pre-flight stops
+	// delivery and records an operator-facing outcome" -- is preserved below; what
+	// changed is the OUTCOME, deliberately.
+	//
+	// A review head mismatch is DETERMINISTIC: nothing changes between attempts, so the
+	// retry ladder could only spend the budget and surface blocker_retries_exhausted
+	// instead of the real cause. It is terminal now. The implement path's "not job head"
+	// mismatch is NOT affected and still defers -- see the sibling PR-scoped-ask test.
+	if job.State == string(workflow.JobQueued) {
+		t.Fatalf("job state = %q; a deterministic review head mismatch must not enter the retry ladder", job.State)
 	}
 	payload, err := daemonJobPayload(job)
 	if err != nil {
 		t.Fatalf("payload: %v", err)
 	}
-	if payload.BlockerClass != string(blockerClassCheckoutContention) || strings.TrimSpace(payload.BlockerSuggestedAction) == "" {
-		t.Fatalf("wrong-head review did not defer as checkout_contention with an action: %+v", payload)
+	if strings.TrimSpace(payload.BlockerClass) != "" || strings.TrimSpace(payload.BlockerRetryAt) != "" {
+		t.Fatalf("terminal review head mismatch was stamped for retry: %+v", payload)
 	}
 }
 

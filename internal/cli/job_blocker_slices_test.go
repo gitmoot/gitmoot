@@ -25,7 +25,10 @@ func TestClassifyCheckoutContention(t *testing.T) {
 	}{
 		{"branch lock self-heals", errors.New("branch main is locked by other-worker, not me"), checkoutContentionLock, false},
 		{"dirty checkout needs a human", errors.New("checkout /x has uncommitted changes"), checkoutContentionDirty, true},
-		{"wrong head (review) needs a human", errors.New("checkout head is abc, not review job head def"), checkoutContentionDirty, true},
+		// #1415: a REVIEW head mismatch is deterministic -- terminal, not contention. The
+		// implement path's "not job head" stays contention (next row), which is what makes
+		// this a SPLIT rather than a relabel.
+		{"wrong head (review) is terminal", errors.New("checkout head is abc, not review job head def"), checkoutContentionTerminal, true},
 		{"wrong head (job) needs a human", errors.New("checkout head is abc, not job head def"), checkoutContentionDirty, true},
 		// The branch-identity guard is a routing/config mismatch, NOT contention.
 		{"wrong branch is not contention", errors.New("checkout branch is main, not job branch feat/x"), checkoutContentionNone, false},
