@@ -55,8 +55,8 @@ flowchart TD
   SkillOpt --> Optimizer[gitmoot-skillopt]
 ```
 
-Codex, Claude Code, and Kimi Code are the runtimes Gitmoot can start or
-subscribe; shell is subscribe-only.
+Codex, Claude Code, Kimi Code, omp, and the legacy `kimi-cli` are the runtimes
+Gitmoot can start or subscribe; shell is subscribe-only.
 
 Use the docs here for the human workflow; agents have the index callout above.
 

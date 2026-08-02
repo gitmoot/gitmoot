@@ -1,6 +1,6 @@
 # Runtime Adapter Authoring
 
-Gitmoot treats Codex, Claude Code, Kimi Code, and shell commands as runtime
+Gitmoot treats Codex, Claude Code, Kimi Code, omp, and shell commands as runtime
 adapters behind one interface. Workflow, daemon, and GitHub code should stay
 runtime-neutral.
 
@@ -53,7 +53,9 @@ type Agent struct {
 `RuntimeRef` is runtime-specific. Codex accepts a session UUID, thread name, or
 `last`. Claude accepts a UUID or `last`. Kimi accepts a Kimi session id of the
 form `session_<uuid>` or empty. Kimi CLI (legacy, `kimi-cli`) accepts a session
-UUID or empty. Shell uses the configured command.
+UUID or empty. omp accepts a session UUID or `fresh:<suffix>` — never `last`,
+because it never resumes — and its adapter also accepts an empty reference,
+since delivery ignores the value entirely. Shell uses the configured command.
 `TemplateID` is Gitmoot-owned metadata. Adapters do not fetch or interpret template
 content; Gitmoot snapshots cached template instructions into the rendered prompt
 before delivery.
@@ -116,6 +118,35 @@ kimi --print -p '<prompt>' --output-format stream-json
 It is intentionally a separate runtime name so the default `kimi` (Kimi Code)
 path is never probed or changed; choose `kimi` unless you specifically run the
 legacy CLI. The two count as the same runtime family for cross-family review.
+
+omp (oh-my-pi) startup and every later job run the SAME argument vector — one
+builder, so no flag can appear on one path and go missing on the other:
+
+```sh
+omp -p --mode=json --approval-mode=yolo --no-session \
+    [--add-dir <path>]… [--model <M>] [--thinking <level>] [--max-time <s>] \
+    [@<staged>/prompt.md] -- '<single prompt token>'
+```
+
+Startup stores the session id from the NDJSON header line, but delivery never
+uses it: omp is stateless in v1 and never passes `--resume`, `--continue`, or
+`--fork`. That is a correctness requirement, not a simplification —
+`switchToResumedProject` sets the project directory to the *resumed* session's
+cwd and overwrites the parsed `--cwd`, so a resumed job would edit the previous
+worktree while the job's own worktree stayed clean: a green job with an empty
+diff. Two more properties an adapter author has to keep in mind here:
+
+- **Exit code 0 is not success.** omp's `process.exit(1)` for a model error is
+  inside an `if (mode === "text")` branch, so a failed turn exits 0 under
+  `--mode=json`. Success is derived from the stream (assistant `stopReason`, a
+  terminal `agent_end`, a closed retry saga, non-empty assistant text).
+- **Usage is per assistant message**, spelled `input`/`output` (not
+  `input_tokens`/`output_tokens`), and is summed across the run.
+
+omp advertises `review`, `implement`, and `ask` — not `produce`, whose Landlock
+wrapper interaction with omp's Bun binary is unprobed. The behavioral contract
+in full (policies, retries, credentials, transcripts, cross-family) is in the
+[Runtime Adapters reference](https://gitmoot.io/docs/reference/runtime-adapters).
 
 Shell adapters do not support `agent start`; register shell commands with
 `agent subscribe`.

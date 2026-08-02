@@ -62,9 +62,12 @@ const (
 	// ompMaxTimeDeadlineFraction is the share of the context's remaining time
 	// handed to omp's own `--max-time` budget. omp treats it as a hard deadline and
 	// flushes a normal NDJSON envelope when it trips, whereas gitmoot's context
-	// deadline SIGKILLs the process group and loses every byte of output. Leaving
-	// 10% of the budget to omp's own shutdown means the job reports what it did
-	// instead of dying silently.
+	// deadline SIGKILLs the process group MID-STREAM. The bytes already written are
+	// not lost (subprocess buffers stdout/stderr and returns them alongside the
+	// error, and omp emits every non-agent_end event eagerly), but the TERMINAL
+	// agent_end never arrives, so parseOmpStreamJSON fails the run as truncated.
+	// Leaving 10% of the budget to omp's own shutdown means the job reports what it
+	// did instead of failing on a partial envelope.
 	ompMaxTimeDeadlineFraction = 0.9
 )
 
@@ -332,7 +335,9 @@ func (a OmpAdapter) preflight() error {
 //     would brick the runtime rather than restrict it. Omitting the flag instead
 //     would inherit whatever tools.approvalMode the host config carries, which is
 //     not deterministic across machines. read-only stays enforced Gitmoot-side by
-//     readOnlyImplementationBlocked (the kimi precedent) with Landlock underneath.
+//     readOnlyImplementationBlocked (the kimi precedent) and by NOTHING ELSE: the
+//     Landlock wrapper selects by runtime NAME and wraps only claude/kimi (both
+//     call sites in cli/daemon_worker.go), so no omp process is ever confined.
 //   - `--no-session` keeps the run in memory: no per-worktree session .jsonl
 //     accretion, and nothing to accidentally resume (v1 never resumes).
 //   - the prompt is exactly ONE token after `--`: multiple positionals become
@@ -358,9 +363,11 @@ func ompArgs(agent Agent, model string, thinking string, maxTime string, attachA
 
 // ompWorkspaceArgs grants the agent's produce paths as additional workspace roots,
 // writable first then readable — the same ordering kimi uses. These are
-// cooperative visibility hints for omp's own file layer; Gitmoot's Landlock
-// wrapper remains the enforcement boundary, and the read-only subset stays
-// read-only there.
+// cooperative visibility hints for omp's own file layer and NOT an enforcement
+// boundary: --add-dir does not make the readable subset read-only, and omp gets no
+// Landlock confinement underneath either (that wrapper selects by runtime name and
+// wraps only claude/kimi). readOnlyImplementationBlocked is the ONLY gate that
+// keeps a read-only omp agent from writing.
 func ompWorkspaceArgs(agent Agent) []string {
 	var args []string
 	for _, path := range agent.WritablePaths {

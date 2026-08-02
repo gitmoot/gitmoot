@@ -1,9 +1,9 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, daemon jobs, stuck jobs, branch locks, agent templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, pipelines, native chat and moots, memory curation, routing telemetry, event webhooks, the web dashboard, runtime metadata, and Codex, Claude Code, or Kimi Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, daemon jobs, stuck jobs, branch locks, agent templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, pipelines, native chat and moots, memory curation, routing telemetry, event webhooks, the web dashboard, runtime metadata, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
 version: 0.1.0
 license: Apache-2.0
-compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
+compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, Kimi Code, or omp.
 metadata:
   gitmoot-version: "0.8.8"
   source: "gitmoot/gitmoot"
@@ -28,7 +28,7 @@ This root `SKILL.md` is kept as a raw compatibility entrypoint for agents and
 Gitmoot is a local-first coordinator for AI agents working across repositories,
 goals, reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
-background daemon checks, Codex, Claude Code, or Kimi Code agent startup,
+background daemon checks, Codex, Claude Code, Kimi Code, or omp agent startup,
 structured implementation plans, standard goal files, agent template workflows,
 template capture, custom prompt agents, job status, branch lock inspection,
 declarative pipelines, native agent chat threads, bounded moots, agent memory,
@@ -71,10 +71,16 @@ The daemon default is `--workers 1`; raise it only for independent runtime
 sessions or managed agent types with `max_background` greater than one.
 
 For runtime selection, `gitmoot agent start <name> --runtime <runtime>` accepts
-`codex`, `claude`, `kimi`, or `kimi-cli` (the opt-in legacy Kimi CLI adapter).
-Kimi Code is a first-class runtime adapter alongside Codex and Claude Code. To
-use it, run `kimi login`, then restart the Gitmoot daemon so it inherits the
-session. `agent subscribe` additionally accepts `--runtime shell`, whose
+`codex`, `claude`, `kimi`, `kimi-cli` (the opt-in legacy Kimi CLI adapter), or
+`omp`. Kimi Code is a first-class runtime adapter alongside Codex and Claude
+Code. To use it, run `kimi login`, then restart the Gitmoot daemon so it inherits
+the session. `omp` is the oh-my-pi CLI, a multi-provider routing harness:
+authenticate it once (interactively, via a provider key in the daemon
+environment, or through an auth broker) and restart the daemon so it inherits the
+credential. omp holds `review`/`implement`/`ask` but not `produce`, runs a fresh
+session per job and never resumes, and its implement jobs get a loud
+cross-family-review refusal because an opaque router has no model family.
+`agent subscribe` additionally accepts `--runtime shell`, whose
 session is a command (for deterministic tests).
 
 For Gitmoot health or status questions, run the relevant read-only Gitmoot CLI

@@ -55,7 +55,7 @@ the block and its comments.
 | `interval`       | yes      | —       | Go duration (e.g. `24h`, `1h30m`). Validated at load.        |
 | `jitter`         | no       | `0s`    | Random `[0, jitter]` added to each `next_due` to de-thunder. |
 | `action`         | no       | `ask`   | `ask` (read-only analysis), `review` (read-only PR/code review; needs the `review` capability), or `implement` (write; **policy-gated** — see below). |
-| `runtime`        | no       | —       | Optional per-heartbeat runtime override (`codex`/`claude`/`kimi`); runs the scheduled job on that runtime (fresh session) instead of the agent default. Empty ⇒ agent default. |
+| `runtime`        | no       | —       | Optional per-heartbeat runtime override (`codex`/`claude`/`kimi`/`omp` today — the set is derived from the adapter registry minus `shell` and legacy `kimi-cli`, so a newly registered runtime joins it); runs the scheduled job on that runtime (fresh session) instead of the agent default. Empty ⇒ agent default. |
 | `prompt`         | yes      | —       | Instructions passed to the agent.                            |
 | `max_concurrent` | no       | `1`     | Overlap cap; a new run is skipped while this many are active.|
 

@@ -369,14 +369,27 @@ func ValidateAgent(agent Agent) error {
 	// omp is STATELESS (OmpAdapter never resumes), so "last" — the resume grammar
 	// the other runtimes accept — is rejected here rather than silently stored on a
 	// registration it can never honor. The grammar mirrors OmpAdapter.Validate EXCEPT
-	// that this registration door additionally requires a NON-EMPTY ref:
-	// validateAgentFields(agent, true) runs above, BEFORE this clause, and has
-	// already rejected an empty ref, so the clause is never reached with one and
-	// must not promise "or empty". The accepts-empty contract lives on
-	// OmpAdapter.Validate, which guards both the Start and the Deliver path: it
-	// never calls validateAgentFields at all, running ompAgentFieldChecks — which
-	// carries no requireRuntimeRef clause — instead, so a stateless omp job that
-	// legitimately carries no ref is still accepted there.
+	// in two ways, and this door is the STRICTER one on both:
+	//
+	//  1. It additionally requires a NON-EMPTY ref. validateAgentFields(agent, true)
+	//     runs above, BEFORE this clause, and has already rejected an empty ref, so
+	//     the clause is never reached with one and must not promise "or empty". The
+	//     accepts-empty contract lives on OmpAdapter.Validate, which guards both the
+	//     Start and the Deliver path: it never calls validateAgentFields at all,
+	//     running ompAgentFieldChecks — which carries no requireRuntimeRef clause —
+	//     instead, so a stateless omp job that legitimately carries no ref is still
+	//     accepted there.
+	//  2. It matches the RAW field, while OmpAdapter.Validate TRIMS the ref first
+	//     (`ref := strings.TrimSpace(agent.RuntimeRef)`) and matches that. So a ref
+	//     with surrounding whitespace — " <uuid> " — is REJECTED here and ACCEPTED
+	//     there; the two are not byte-for-byte mirrors. validateAgentFields' own
+	//     TrimSpace does not close that gap: it trims only for the EMPTINESS test and
+	//     never rewrites the field. That is deliberate rather than an oversight. The
+	//     claude and kimi clauses immediately above test their raw fields the same
+	//     way, and the CLI stores the flag value untrimmed (runAgentSubscribe assigns
+	//     `RuntimeRef: *session`), so the raw string is what actually lands in the
+	//     agent record — refusing to register a ref whose stored form is not a ref is
+	//     the honest behavior for a registration door.
 	if agent.Runtime == OmpRuntime && agent.RuntimeRef != "" && !isUUID(agent.RuntimeRef) && !IsFreshRef(agent.RuntimeRef) {
 		return fmt.Errorf("omp runtime reference %q must be an omp session UUID or fresh:<suffix>", agent.RuntimeRef)
 	}
