@@ -54,10 +54,8 @@ func TestC1MeasurementEngineDispatchedImplementerIdentity(t *testing.T) {
 		{name: "after_C1", implementTaskID: stableFirst, reviewTaskID: stableSecond, wantAgents: 1, wantFailClosed: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			collectionProbe := evaluateC1GateScenario(t, tc.implementTaskID, tc.reviewTaskID, oldHead, newHead, tc.reviewTaskID, "implementer", true)
-			implementingAgents := observedC1ImplementingAgentCount(t, collectionProbe)
 			decision := evaluateC1GateScenario(t, tc.implementTaskID, tc.reviewTaskID, oldHead, newHead, tc.reviewTaskID, "reviewer", true)
-			failClosed := decision.LeaveOpen && strings.Contains(decision.Reason, "implementing agent for this task could not be determined")
+			implementingAgents, failClosed := observedC1ImplementerResolution(t, decision)
 			if implementingAgents != tc.wantAgents || failClosed != tc.wantFailClosed {
 				t.Fatalf("implementingAgents=%d failClosed=%v decision=%+v; want agents=%d failClosed=%v", implementingAgents, failClosed, decision, tc.wantAgents, tc.wantFailClosed)
 			}
@@ -72,16 +70,16 @@ func TestC1MeasurementEngineDispatchedImplementerIdentity(t *testing.T) {
 	}
 }
 
-func observedC1ImplementingAgentCount(t *testing.T, decision workflow.MergeDecision) int {
+func observedC1ImplementerResolution(t *testing.T, decision workflow.MergeDecision) (int, bool) {
 	t.Helper()
 	switch {
-	case strings.Contains(decision.Reason, "approval was authored by implementer, the implementing agent"):
-		return 1
-	case strings.Contains(decision.Reason, "implementing agent for this task could not be determined"):
-		return 0
+	case decision.Ready && decision.Merged && !decision.LeaveOpen && !decision.EscalateMergeGateMiss && !decision.Deferred:
+		return 1, false
+	case !decision.Ready && !decision.Merged && decision.LeaveOpen && decision.EscalateMergeGateMiss && !decision.Deferred:
+		return 0, true
 	default:
-		t.Fatalf("gate decision did not expose the seeded implementer's collection membership: %+v", decision)
-		return 0
+		t.Fatalf("gate decision did not expose a structured implementer-resolution outcome: %+v", decision)
+		return 0, false
 	}
 }
 

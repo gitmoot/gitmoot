@@ -378,9 +378,9 @@ func TestPolicyMergeGateRejectsUnverifiableReviewAuthorship(t *testing.T) {
 			wantReason:        "approval has no recorded reviewer author; an independent reviewer cannot be verified",
 		},
 		{
-			name:          "unknown implementer",
+			name:          "no implement job",
 			reviewerAgent: "audit",
-			wantReason:    "approval cannot be verified as independent because the implementing agent for this task could not be determined",
+			wantReason:    "no implement job is recorded for this task",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -428,6 +428,135 @@ func TestPolicyMergeGateRejectsUnverifiableReviewAuthorship(t *testing.T) {
 			}
 			if len(gh.merges) != 0 {
 				t.Fatalf("unverifiable approval issued merge: %+v", gh.merges)
+			}
+		})
+	}
+}
+
+func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
+	type seedImplementJobs func(*testing.T, *db.Store, JobPayload)
+	sites := []struct {
+		name       string
+		reviewHead string
+	}{
+		{name: "current_head", reviewHead: "head123"},
+		{name: "legacy_round", reviewHead: "old123"},
+	}
+	causes := []struct {
+		name             string
+		seed             seedImplementJobs
+		omitUnrelatedJob bool
+		want             []string
+		doNotWant        []string
+	}{
+		{
+			name:             "zero_implement_jobs_anywhere",
+			omitUnrelatedJob: true,
+			want: []string{
+				"no implement job is recorded for this task",
+				"coordinator bridge",
+				"gitmoot job show <job-id>",
+				"gitmoot workflow note",
+			},
+			doNotWant: []string{"implemented in a pane"},
+		},
+		{
+			name: "no_implement_job",
+			want: []string{
+				"no implement job is recorded for this task",
+				"coordinator bridge",
+				"gitmoot job show <job-id>",
+				"gitmoot workflow note",
+			},
+			doNotWant: []string{"implemented in a pane"},
+		},
+		{
+			name: "task_identity_mismatch",
+			seed: func(t *testing.T, store *db.Store, payload JobPayload) {
+				payload.TaskID = "different-task"
+				insertCompletedJob(t, store, db.Job{ID: "implement-mismatch", Agent: "implementer", Type: "implement"}, payload)
+			},
+			want: []string{"none match this task identity", "stable-task-identity regression"},
+		},
+		{
+			name: "empty_implement_agent",
+			seed: func(t *testing.T, store *db.Store, payload JobPayload) {
+				insertCompletedJob(t, store, db.Job{ID: "implement-empty-agent", Type: "implement"}, payload)
+			},
+			want: []string{"matches this task but has no recorded agent", "attribution data anomaly"},
+		},
+		{
+			name: "malformed_implement_payload",
+			seed: func(t *testing.T, store *db.Store, _ JobPayload) {
+				if err := store.CreateJobWithEvent(context.Background(), db.Job{
+					ID: "implement-malformed", Agent: "implementer", Type: "implement", State: string(JobSucceeded), Payload: "{",
+				}, db.JobEvent{Kind: string(JobSucceeded), Message: "done"}); err != nil {
+					t.Fatalf("CreateJobWithEvent returned error: %v", err)
+				}
+			},
+			want: []string{"implement job has a malformed payload", "corrupt-record anomaly"},
+		},
+	}
+
+	for _, site := range sites {
+		t.Run(site.name, func(t *testing.T) {
+			for _, cause := range causes {
+				t.Run(cause.name, func(t *testing.T) {
+					ctx := context.Background()
+					store := openEngineStore(t)
+					basePayload := JobPayload{
+						Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+						Result: &AgentResult{Decision: "implemented", Summary: "implemented"},
+					}
+					if !cause.omitUnrelatedJob {
+						unrelatedPayload := basePayload
+						unrelatedPayload.Repo = "other/repo"
+						unrelatedPayload.PullRequest = 99
+						unrelatedPayload.TaskID = "other-task"
+						insertCompletedJob(t, store, db.Job{ID: "unrelated-implement", Agent: "other", Type: "implement"}, unrelatedPayload)
+					}
+					if cause.seed != nil {
+						cause.seed(t, store, basePayload)
+					}
+					reviewPayload := basePayload
+					reviewPayload.HeadSHA = site.reviewHead
+					reviewPayload.ReviewRound = "review-1"
+					reviewPayload.Result = &AgentResult{Decision: "approved", Summary: "approved"}
+					insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, reviewPayload)
+
+					mergeable := true
+					gh := &fakeMergeGateGitHub{
+						pr: github.PullRequest{
+							Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+							HeadSHA: "head123", Mergeable: &mergeable,
+						},
+						status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+						checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+						mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+					}
+					gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+					decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+					if err != nil {
+						t.Fatalf("Evaluate returned error: %v", err)
+					}
+					if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Ready || decision.Merged {
+						t.Fatalf("decision = %+v, want fail-closed escalating LeaveOpen", decision)
+					}
+					if len(gh.merges) != 0 {
+						t.Fatalf("unverifiable approval issued merge: %+v", gh.merges)
+					}
+					for _, want := range cause.want {
+						if !strings.Contains(decision.Reason, want) {
+							t.Errorf("decision reason = %q, want named evidence/remedy %q", decision.Reason, want)
+						}
+					}
+					for _, doNotWant := range cause.doNotWant {
+						if strings.Contains(decision.Reason, doNotWant) {
+							t.Errorf("decision reason inferred unobserved workflow %q: %q", doNotWant, decision.Reason)
+						}
+					}
+				})
 			}
 		})
 	}

@@ -1197,6 +1197,14 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    PR branch with the expected head SHA and leaves the merge gate pending so the
    daemon can reload the new head and checks on a later poll tick.
 
+   When review independence cannot be verified, the decline names the observed
+   cause: no implement job for the task, task-identity mismatch, a matching job
+   with no agent, or a malformed implement payload. All four remain fail-closed.
+   For the no-job case, the coordinator bridge is to inspect the exact-head
+   engine review with `gitmoot job show <job-id>`, confirm the implementer from
+   the pane session, and journal both facts with `gitmoot workflow note`. The
+   journal is an operator record, never an attestation consumed by the gate.
+
    When a head reports **no** external CI at all (zero commit-statuses and zero
    check-runs), Gitmoot does not conclude "this repo has no CI" from a single
    observation — GitHub Actions creates a check-run a few seconds after a push,
@@ -15888,6 +15896,15 @@ not escalate. A human GitHub merge is reconciled normally, while `@gitmoot merge
 is an explicit authorized merge request. Turning `auto_merge` back on re-arms
 only tasks parked for this exact kill-switch reason.
 Pipeline `allow_auto_merge` remains a separate double-keyed mechanism.
+
+When review independence cannot be verified, the merge gate names the evidence
+it observed: no implement job for the task, implement jobs that do not match the
+task identity, a matching implement job with no agent, or a malformed implement
+payload. All four remain fail-closed. For the no-job case, use the **coordinator
+bridge**: inspect the engine review job with `gitmoot job show <job-id>` and
+confirm its agent and decision at the exact head, confirm the implementer from
+the pane session, then journal both facts with `gitmoot workflow note`. That
+journal is an operator record only; it is not an attestation or merge-gate input.
 
 ### No external CI: grace window, not instant pass (#596)
 

@@ -2078,6 +2078,15 @@ review and green SHA-scoped commit statuses/check-runs. A miss parks the task as
 `[repos."owner/repo".merge_gate] auto_merge = false` as an explicit kill-switch;
 that deliberate hold does not escalate. Pipeline `allow_auto_merge` is independent.
 
+When review independence cannot be verified, the merge gate names the evidence
+it observed: no implement job for the task, implement jobs that do not match the
+task identity, a matching implement job with no agent, or a malformed implement
+payload. All four remain fail-closed. For the no-job case, use the **coordinator
+bridge**: inspect the engine review job with `gitmoot job show <job-id>` and
+confirm its agent and decision at the exact head, confirm the implementer from
+the pane session, then journal both facts with `gitmoot workflow note`. That
+journal is an operator record only; it is not an attestation or merge-gate input.
+
 Merge-gate retries are automatic while the daemon is running. Retryable states,
 such as a busy base-branch merge queue or a GitHub branch update in progress,
 are retried on the next daemon poll tick. The default poll interval is `30s`
