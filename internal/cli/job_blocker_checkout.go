@@ -50,6 +50,16 @@ const (
 	checkoutContentionNone checkoutContentionKind = iota
 	checkoutContentionLock
 	checkoutContentionDirty
+	// checkoutContentionTerminal is a checkout pre-flight failure that CANNOT change
+	// between attempts. It is split out of the contention kinds because the retry
+	// ladder acts on exactly one property -- "is this expected to resolve on its own?"
+	// -- and a head mismatch answers no while the other two answer yes. A class whose
+	// members disagree about a property the system acts on is a defect even when every
+	// member is individually correct (#1381).
+	//
+	// It has ONE consumer behaviour: do not retry. Adding a member here that wants a
+	// backoff, or resume eligibility, would reintroduce the mixed class.
+	checkoutContentionTerminal
 )
 
 // checkoutLockBaseBackoff / checkoutLockMaxBackoff bound the SHORT exponential
@@ -85,7 +95,10 @@ func classifyCheckoutContention(cause error) (checkoutContentionKind, string) {
 	case strings.Contains(text, "has uncommitted changes"):
 		return checkoutContentionDirty, "the registered checkout has uncommitted changes; commit, stash, or discard them (git checkout -- .) so the job's pre-flight can pass, then it auto-retries"
 	case strings.Contains(text, "checkout head is"):
-		return checkoutContentionDirty, "the registered checkout is on the wrong commit; sync it to the head the job expects (git fetch && git reset --hard <sha>), then it auto-retries"
+		// DETERMINISTIC: nothing changes between attempts, so the ladder can only
+		// delay the same failure while spending the budget -- and the operator then
+		// sees blocker_retries_exhausted instead of the actual cause.
+		return checkoutContentionTerminal, "the review worktree is on the wrong commit and this will not resolve on its own; re-dispatch the review at the intended head"
 	}
 	return checkoutContentionNone, ""
 }
@@ -113,6 +126,14 @@ func checkoutLockBackoff(attempt int) time.Duration {
 func (w jobWorker) deferCheckoutContention(ctx context.Context, job db.Job, payload workflow.JobPayload, cause error) (bool, error) {
 	kind, action := classifyCheckoutContention(cause)
 	if kind == checkoutContentionNone {
+		return false, nil
+	}
+	// A terminal kind must NOT enter the ladder. Adding a case to an enum does not add
+	// a branch: without this exit the new member falls through to the shared path
+	// below, receives checkoutDirtyBackoff, and is stamped BlockerClass =
+	// checkout_contention -- re-entering the very class it was split out of, carrying a
+	// retry time for something that can never succeed on retry.
+	if kind == checkoutContentionTerminal {
 		return false, nil
 	}
 	// Delegation children keep the DAG's own routing (finishQueuedJob →

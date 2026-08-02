@@ -317,10 +317,41 @@ func (w jobWorker) validateReviewCheckout(ctx context.Context, payload workflow.
 	if err != nil {
 		return err
 	}
-	if head != expectedHead {
+	// Compare by RESOLVED COMMIT, not as literal strings. HeadSHA always returns the
+	// full 40-char rev-parse, while expectedHead is whatever the dispatch stored --
+	// commonly an abbreviated --head-sha. A literal comparison rejects an abbreviation
+	// against the very commit it names, and because review_head_resynced overwrote the
+	// head before this guard ran on a reused worktree, that has never been visible.
+	if !sameCommit(ctx, git, head, expectedHead) {
 		return fmt.Errorf("checkout head is %s, not review job head %s", head, expectedHead)
 	}
 	return nil
+}
+
+// sameCommit reports whether two revisions name the same commit, tolerating an
+// abbreviated SHA on either side.
+//
+// A revision that cannot be resolved is NOT the same commit: resolution failure is
+// evidence that safety is unknown, and this guard's whole purpose is to refuse when it
+// cannot prove the checkout matches. Falling through to "equal" on an unresolvable
+// revision would be absence-reads-as-permission.
+func sameCommit(ctx context.Context, git gitutil.Client, a, b string) bool {
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	if a == "" || b == "" {
+		return false
+	}
+	if strings.EqualFold(a, b) {
+		return true
+	}
+	resolvedA, err := git.RevParse(ctx, a+"^{commit}")
+	if err != nil {
+		return false
+	}
+	resolvedB, err := git.RevParse(ctx, b+"^{commit}")
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(resolvedA), strings.TrimSpace(resolvedB))
 }
 
 // isReviewHeadMismatch reports whether a checkout pre-flight error is specifically
