@@ -672,9 +672,19 @@ func routeSelectedMessage(request localAgentDispatchRequest) string {
 }
 
 func validateLocalReviewLeadAtDispatch(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string) (localAgentDispatchRequest, error) {
+	typeName := strings.TrimSpace(request.Type)
+	if typeName != "" {
+		exists, err := managedAgentTypeExists(request.Home, typeName)
+		if err != nil {
+			return localAgentDispatchRequest{}, err
+		}
+		if !exists {
+			return localAgentDispatchRequest{}, forcedManagedAgentTypeNotFoundError(typeName)
+		}
+	}
 	leadName := strings.TrimSpace(request.LeadAgent)
 	if leadName == "" {
-		if typeName := strings.TrimSpace(request.Type); typeName != "" {
+		if typeName != "" {
 			return localAgentDispatchRequest{}, fmt.Errorf("review dispatch through managed type %q requires --lead naming a registered implementer", typeName)
 		}
 		leadName = strings.TrimSpace(request.Agent)

@@ -890,6 +890,12 @@ explicit implementer. Managed-type review dispatches also require an explicit
 DB-backed lead. `--lead` is rejected when `agent run` resolves to ask or
 implement, and is not accepted by `agent implement` or `orchestrate`.
 
+This dispatch-time lead validation applies only to local CLI reviews started by
+`gitmoot agent review` or review-resolved `gitmoot agent run`. Reviews routed
+from PR comments continue to validate their fix target when the workflow
+advances until [gitmoot#1433](https://github.com/gitmoot/gitmoot/issues/1433)
+adds the corresponding ingress preflight.
+
 New implementation PRs opened by the engine are drafts by default. Use
 `--ready` on `agent run`, `agent implement`, or `orchestrate` to opt into an
 immediately merge-gate-eligible PR once review evidence is satisfied; `--draft`
