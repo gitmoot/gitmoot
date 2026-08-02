@@ -84,6 +84,59 @@ func TestDispatchPromptHeadWarningReachesOperator(t *testing.T) {
 	}
 }
 
+// TestDispatchEmitsNoWarningWhenThePromptAgreesWithTheHead is the NEGATIVE integration case,
+// and it is the only thing here that binds the durable event to a genuine SCAN.
+//
+// Review showed both substrings of the durable message are synthesizable: replacing the
+// scanner call with one unconditional message built from request.Instructions plus the literal
+// "Gitmoot will use dispatch head" compiled and left all four guards green. Every existing
+// guard exercises a prompt that SHOULD warn, so a mutant that always warns satisfies all of
+// them. Cardinality and message shape cannot distinguish "scanned and found a contradiction"
+// from "emitted regardless".
+//
+// A prompt whose commit token EQUALS the dispatch head is resolvable, traversed, and correctly
+// silent. An unconditional emitter fails here and nowhere else.
+func TestDispatchEmitsNoWarningWhenThePromptAgreesWithTheHead(t *testing.T) {
+	checkout, _, head, _ := promptHeadWarningRepository(t)
+	store, home := blockerE2EHome(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "responder", runtime.ShellRuntime, "printf '%s' '{}'", []string{"ask"}, "owner/repo")
+
+	var stdout, stderr bytes.Buffer
+	output, exit := dispatchAgentCommand(agentRunOptions{
+		home:       home,
+		repo:       "owner/repo",
+		agent:      "responder",
+		message:    "Use head " + head[:8] + " for this analysis.",
+		background: true,
+	}, "ask", "explicit", "agent_run", &stdout, &stderr)
+	if exit != 0 {
+		t.Fatalf("dispatchAgentCommand exit = %d, stderr=%s", exit, stderr.String())
+	}
+
+	// PREMISE: the token must be RESOLVABLE, or this proves only that unresolvable tokens
+	// are skipped -- a different and much weaker statement.
+	if resolved := promptHeadWarnings(t, checkout, "Divergent "+strings.Repeat("f", 40)+".", head); len(resolved) != 0 {
+		t.Fatalf("premise: an unresolvable token warned (%v); this fixture cannot isolate the agreeing-token case", resolved)
+	}
+	if len(promptHeadWarnings(t, checkout, "See "+head[:8]+".", head)) != 0 {
+		t.Fatal("premise: the scanner warned on a token EQUAL to the dispatch head, so this test cannot show silence is conditional")
+	}
+
+	if got := strings.Count(stderr.String(), "agent ask: warning:"); got != 0 {
+		t.Fatalf("operator warnings = %d, want 0: the prompt AGREES with the dispatch head; stderr=%q", got, stderr.String())
+	}
+	events, err := store.ListJobEvents(context.Background(), output.JobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	for _, event := range events {
+		if event.Kind == "prompt_head_warning" {
+			t.Fatalf("durable prompt_head_warning emitted for a prompt that agrees with the head (message=%q); the emit is unconditional, not the product of a scan", event.Message)
+		}
+	}
+}
+
 func TestPromptHeadWarningUsesInequalityNotReachability(t *testing.T) {
 	checkout, ancestor, head, _ := promptHeadWarningRepository(t)
 	warnings := promptHeadWarnings(t, checkout, "The reviewed head was "+ancestor[:8]+".", head)
@@ -131,17 +184,44 @@ func TestPromptHeadWarningIgnoresMutationRestoreHashes(t *testing.T) {
 	// So the control is now positional: the SAME divergent token is placed FIRST, in the
 	// MIDDLE and LAST, and each placement must produce exactly one warning. Any mutant that
 	// samples a fixed position instead of traversing fails at least two of the three.
+	// The placements vary BOTH the divergent token's position AND the total token count.
+	// Position alone was not enough: every fixture happened to hold exactly five
+	// commit-shaped tokens, so a scanner capped to the first five compiled and left all four
+	// guards green -- the control was pinned to the fixture's WIDTH, not to traversal. Widths
+	// here are 3, 7 and 13, so any fixed cap misses at least one placement.
+	//
+	// Each placement also asserts the warning NAMES THE DIVERGENT TOKEN. Counting one warning
+	// proves cardinality only: a mutant that reported tokens[0] instead of the unequal token
+	// still produced exactly one warning per placement and passed everything. With one
+	// divergent commit in the fixture the count LOOKS causal and is not.
+	// Distinct 64-char HEX strings. An earlier version built these as
+	// strings.Repeat(string(rune('a'+i)), 64), which silently stopped being
+	// commit-shaped at i=6 ('g' is not hex) -- the width premise below caught it.
+	filler := make([]string, 0, 12)
+	for i := 0; i < 12; i++ {
+		filler = append(filler, fmt.Sprintf("%064x", i+1))
+	}
 	for _, placement := range []struct {
 		name   string
 		prompt string
+		tokens int
 	}{
-		{name: "first", prompt: "See " + divergent[:8] + ". " + prompt},
-		{name: "middle", prompt: fmt.Sprintf("Head %s. Restore hashes: %s %s. See %s. And %s.", head, hashes[0], hashes[1], divergent[:8], hashes[2])},
-		{name: "last", prompt: prompt + " See also " + divergent[:8] + "."},
+		{name: "first-of-3", tokens: 3, prompt: fmt.Sprintf("See %s. Head %s. Hash %s.", divergent[:8], head, filler[0])},
+		{name: "middle-of-7", tokens: 7, prompt: fmt.Sprintf("Head %s. Hashes %s %s %s. See %s. And %s %s.", head, filler[0], filler[1], filler[2], divergent[:8], filler[3], filler[4])},
+		{name: "last-of-13", tokens: 13, prompt: fmt.Sprintf("Head %s. Hashes %s %s %s %s %s %s %s %s %s %s %s. Finally %s.",
+			head, filler[0], filler[1], filler[2], filler[3], filler[4], filler[5], filler[6], filler[7], filler[8], filler[9], filler[10], divergent[:8])},
 	} {
+		// PREMISE: the fixture really has the width it claims, so "a cap misses this one"
+		// is a measured fact rather than an assumption about how the prompt renders.
+		if got := len(promptCommitTokenRE.FindAllString(placement.prompt, -1)); got != placement.tokens {
+			t.Fatalf("control (%s): prompt holds %d commit-shaped tokens, want %d; the width premise does not hold so a cap mutant may not be exercised", placement.name, got, placement.tokens)
+		}
 		live := promptHeadWarnings(t, checkout, placement.prompt, head)
 		if len(live) != 1 {
-			t.Fatalf("control (%s placement): the scanner produced %d warnings, want 1; a scanner that samples one position is not traversing the prompt", placement.name, len(live))
+			t.Fatalf("control (%s): the scanner produced %d warnings, want 1; a scanner that samples a fixed position or caps its token count is not traversing the prompt", placement.name, len(live))
+		}
+		if !strings.Contains(live[0], divergent[:8]) {
+			t.Fatalf("control (%s): warning %q does not name the DIVERGENT token %s; one warning proves cardinality, not that the right commit was identified", placement.name, live[0], divergent[:8])
 		}
 	}
 
