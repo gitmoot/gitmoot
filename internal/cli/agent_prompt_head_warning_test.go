@@ -33,6 +33,31 @@ func TestDispatchPromptHeadWarningReachesOperator(t *testing.T) {
 	if got := strings.Count(stderr.String(), "agent ask: warning:"); got != 1 {
 		t.Fatalf("operator warnings = %d, want 1; stderr=%q", got, stderr.String())
 	}
+
+	// AND THE DURABLE SURFACE. stderr reaches only an operator watching the dispatch;
+	// a BACKGROUND job's warning is read later, from job events. Asserting stderr alone
+	// left the emit unguarded: deleting the AddJobEvent call compiled and all four C4a
+	// tests still passed, because DispatchWarning kept stderr intact.
+	jobs, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	if len(jobs) == 0 {
+		t.Fatal("no job was created, so this test cannot observe the durable warning")
+	}
+	events, err := store.ListJobEvents(context.Background(), jobs[0].ID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	durable := 0
+	for _, event := range events {
+		if event.Kind == "prompt_head_warning" {
+			durable++
+		}
+	}
+	if durable != 1 {
+		t.Fatalf("durable prompt_head_warning events = %d, want 1; the background operator surface is unguarded", durable)
+	}
 }
 
 func TestPromptHeadWarningUsesInequalityNotReachability(t *testing.T) {
@@ -44,9 +69,40 @@ func TestPromptHeadWarningUsesInequalityNotReachability(t *testing.T) {
 }
 
 func TestPromptHeadWarningIgnoresMutationRestoreHashes(t *testing.T) {
-	checkout, _, head, _ := promptHeadWarningRepository(t)
-	prompt := fmt.Sprintf(`Head %s. Restore hashes: %s %s %s.`, head,
-		strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64))
+	checkout, _, head, divergent := promptHeadWarningRepository(t)
+	hashes := []string{strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64)}
+	prompt := fmt.Sprintf(`Head %s. Restore hashes: %s %s %s.`, head, hashes[0], hashes[1], hashes[2])
+
+	// ASSERT THE PREMISE. "Zero warnings" is trivially true when there are no restore
+	// hashes to ignore: replacing all three with "No restore hashes." left this test
+	// green, so it could not witness the behaviour it names.
+	for _, hash := range hashes {
+		// Assert the PROPERTY, not the presence. Checking `strings.Contains(prompt, hash)`
+		// follows the mutant: replacing the hashes with "No restore hashes." leaves them
+		// present in the prompt, so that check passes and the premise is not established.
+		// What matters is that each is a 64-char hex string -- a mutation-hygiene restore
+		// hash -- because that is the shape the scanner must decline to warn about.
+		if len(hash) != 64 {
+			t.Fatalf("premise not established: %q is %d chars, not a 64-char restore hash", hash, len(hash))
+		}
+		for _, r := range hash {
+			if !strings.ContainsRune("0123456789abcdefABCDEF", r) {
+				t.Fatalf("premise not established: %q is not hex, so it is not a restore hash", hash)
+			}
+		}
+		if !strings.Contains(prompt, hash) {
+			t.Fatalf("premise not established: prompt does not contain %s...", hash[:8])
+		}
+	}
+
+	// AND PROVE THE SCANNER IS LIVE ON THIS PROMPT. Without this, zero could mean
+	// "hashes correctly ignored" or "scanning never happened" -- the same prompt with a
+	// real divergent commit token MUST warn.
+	live := promptHeadWarnings(t, checkout, prompt+" See also "+divergent[:8]+".", head)
+	if len(live) != 1 {
+		t.Fatalf("control: the scanner produced %d warnings on this prompt shape, want 1; zero below would prove nothing", len(live))
+	}
+
 	if warnings := promptHeadWarnings(t, checkout, prompt, head); len(warnings) != 0 {
 		t.Fatalf("mutation-hygiene prompt warnings = %d, want 0: %v", len(warnings), warnings)
 	}
