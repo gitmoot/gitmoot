@@ -903,6 +903,17 @@ before a job is enqueued. `--base HEAD` explicitly follows the registered
 checkout's current commit. On implement, `--head-sha <sha>` is a compatibility
 alias for `--base <sha>`; passing both with different values is an error.
 
+A PR review reuses one worktree per repository and pull request, so a later
+review round runs in the same checkout as the first. Gitmoot re-points that
+worktree at the requested head before each dispatch and verifies the result, so
+a second round reviews the second head rather than the commit the worktree was
+created at. If the worktree holds uncommitted changes and is not already at the
+requested head, the dispatch fails instead of discarding them — resolve or
+remove the changes and dispatch again. A worktree that is already at the
+requested head is left untouched; if it also carries uncommitted changes, that
+is recorded as a `review_worktree_dirty_at_head` task event rather than
+blocking, so "correct head" never silently means "correct head plus edits".
+
 Set a default for implement dispatches in `config.toml`:
 
 ```toml

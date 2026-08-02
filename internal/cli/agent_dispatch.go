@@ -737,6 +737,8 @@ func prepareLocalReviewWorktree(ctx context.Context, store *db.Store, record db.
 				return localAgentDispatchRequest{}, "", fmt.Errorf("create PR review worktree after fetch: %w", retryErr)
 			}
 		}
+	} else if err := resyncReviewWorktreeHead(ctx, store, record, request, taskID, path); err != nil {
+		return localAgentDispatchRequest{}, "", err
 	}
 	task := db.Task{
 		ID:           taskID,
@@ -763,6 +765,79 @@ func prepareLocalReviewWorktree(ctx context.Context, store *db.Store, record db.
 	request.GoalID = task.GoalID
 	request.TaskTitle = task.Title
 	return request, path, nil
+}
+
+// resyncReviewWorktreeHead points an already-existing PR review worktree at the
+// requested head.
+//
+// The review task id is repo-stable (#1354 C1), so the worktree path no longer
+// varies with the head. Before that change a new head produced a new path, and
+// the creation branch above checked out the requested commit implicitly every
+// round -- freshness was a side effect of the head being an identity component.
+// Removing the head from the identity removed that guarantee with nothing
+// asserting it, because while the path varied it could not fail. This function
+// is the explicit replacement (#1415).
+//
+// It refuses rather than repairs whenever it cannot prove the outcome: an
+// unclean worktree is never reset over, and a checkout that does not land on the
+// requested head is an error rather than a warning.
+func resyncReviewWorktreeHead(ctx context.Context, store *db.Store, record db.Repo, request localAgentDispatchRequest, taskID, path string) error {
+	head := strings.TrimSpace(request.HeadSHA)
+	if head == "" {
+		// No requested head. Preserve the pre-#1415 behaviour rather than turning
+		// a dispatch that works today into a hard failure, and keep head
+		// RESOLUTION out of the worktree layer -- that coupling is what #1354 C1
+		// removed and this fix must not reintroduce.
+		return nil
+	}
+	checkout := gitutil.Client{Dir: record.CheckoutPath}
+	current, err := checkout.HeadSHAAt(ctx, path)
+	if err != nil {
+		return fmt.Errorf("resolve existing PR review worktree head: %w", err)
+	}
+	clean, err := checkout.WorktreeCleanAt(ctx, path)
+	if err != nil {
+		return fmt.Errorf("inspect existing PR review worktree: %w", err)
+	}
+	if strings.EqualFold(strings.TrimSpace(current), head) {
+		if !clean {
+			// Already the right commit, so there is nothing to re-sync and nothing
+			// worth blocking over -- but "correct head" must never quietly mean
+			// "correct head plus someone's edits". Record it so the reviewer's
+			// tree state is queryable afterwards.
+			_ = store.AddTaskEvent(ctx, db.TaskEvent{
+				TaskID: taskID,
+				Kind:   "review_worktree_dirty_at_head",
+				Reason: fmt.Sprintf("review worktree %s is at the requested head %s but has uncommitted changes", path, head),
+			})
+		}
+		return nil
+	}
+	if !clean {
+		return fmt.Errorf("review worktree %s is at %s, not the requested head %s, and has uncommitted changes; resolve or remove them before dispatching this review", path, current, head)
+	}
+	worktree := gitutil.Client{Dir: path}
+	if err := worktree.CheckoutDetach(ctx, head); err != nil {
+		if fetchErr := checkout.FetchPullRequest(ctx, "origin", request.PullRequest); fetchErr != nil {
+			return fmt.Errorf("re-sync PR review worktree to head %s: %w; fetch PR ref: %v", head, err, fetchErr)
+		}
+		if retryErr := worktree.CheckoutDetach(ctx, head); retryErr != nil {
+			return fmt.Errorf("re-sync PR review worktree to head %s after fetch: %w", head, retryErr)
+		}
+	}
+	synced, err := checkout.HeadSHAAt(ctx, path)
+	if err != nil {
+		return fmt.Errorf("verify re-synced PR review worktree head: %w", err)
+	}
+	if !strings.EqualFold(strings.TrimSpace(synced), head) {
+		return fmt.Errorf("review worktree %s is at %s after re-sync, want %s", path, synced, head)
+	}
+	_ = store.AddTaskEvent(ctx, db.TaskEvent{
+		TaskID: taskID,
+		Kind:   "review_worktree_head_resynced",
+		Reason: fmt.Sprintf("review worktree %s re-synced from %s to requested head %s", path, current, head),
+	})
+	return nil
 }
 
 func dismissedReviewTaskError(taskID string) error {
