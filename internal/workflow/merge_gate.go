@@ -155,7 +155,11 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	}
 	headSHA := strings.TrimSpace(pr.HeadSHA)
 	if headSHA == "" {
-		return g.gateMiss(GateMissReason("merge gate", "pull request head SHA is missing", "")), nil
+		reason, reasonErr := GateMissReason("merge gate", "pull request head SHA is missing", "")
+		if reasonErr != nil {
+			return MergeDecision{}, reasonErr
+		}
+		return g.gateMiss(reason), nil
 	}
 	if !pullRequestMerged(pr) && strings.TrimSpace(pr.State) != "closed" {
 		pendingDecision, isPending, reason, err := g.reviewAndCIGateMiss(ctx, repo, request, headSHA)
@@ -277,7 +281,11 @@ func (g PolicyMergeGate) reviewAndCIGateMiss(ctx context.Context, repo github.Re
 			decision, dErr := g.pending(ctx, request, headSHA, pending.reason)
 			return decision, true, MergeReason{}, dErr
 		}
-		miss = miss.WithGateMiss("review gate", reviewErr.Error(), headSHA)
+		var missErr error
+		miss, missErr = miss.WithGateMiss("review gate", reviewErr.Error(), headSHA)
+		if missErr != nil {
+			return MergeDecision{}, false, MergeReason{}, missErr
+		}
 	}
 	if ciErr := g.ensureStatuses(ctx, repo, int64(request.PullRequest), headSHA); ciErr != nil {
 		var pending mergePending
@@ -285,7 +293,11 @@ func (g PolicyMergeGate) reviewAndCIGateMiss(ctx context.Context, repo github.Re
 			decision, dErr := g.pending(ctx, request, headSHA, pending.reason)
 			return decision, true, MergeReason{}, dErr
 		}
-		miss = miss.WithGateMiss("CI gate", ciErr.Error(), headSHA)
+		var missErr error
+		miss, missErr = miss.WithGateMiss("CI gate", ciErr.Error(), headSHA)
+		if missErr != nil {
+			return MergeDecision{}, false, MergeReason{}, missErr
+		}
 	}
 	return MergeDecision{}, false, miss, nil
 }

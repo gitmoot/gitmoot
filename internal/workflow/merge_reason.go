@@ -1,6 +1,9 @@
 package workflow
 
-import "strings"
+import (
+	"errors"
+	"strings"
+)
 
 // MergeReason is the operator-facing reason of a merge-gate decision, carried as a VALUE
 // rather than as prose.
@@ -52,12 +55,12 @@ func PlainReason(text string) MergeReason {
 // GateMissReason composes an operator instruction from its parts. Multiple misses accumulate,
 // so a decision failing both the review and CI gates renders as one sentence per gate without
 // any caller concatenating them.
-func GateMissReason(gate, cause, head string) MergeReason {
+func GateMissReason(gate, cause, head string) (MergeReason, error) {
 	return MergeReason{}.WithGateMiss(gate, cause, head)
 }
 
 // WithGateMiss returns a copy carrying one more unsatisfied gate.
-func (r MergeReason) WithGateMiss(gate, cause, head string) MergeReason {
+func (r MergeReason) WithGateMiss(gate, cause, head string) (MergeReason, error) {
 	miss := gateMiss{
 		gate:  strings.TrimSpace(gate),
 		cause: strings.TrimSpace(cause),
@@ -71,16 +74,18 @@ func (r MergeReason) WithGateMiss(gate, cause, head string) MergeReason {
 		// stop text being appended to an operator instruction; shipping a path where
 		// the instruction can be empty is the same defect pointed the other way.
 		//
-		// Refuse loudly here rather than relying on producers happening to pass
-		// nonblank labels. That accidental safety is exactly what this campaign has
-		// spent the day removing: a property nobody chose, no test protects, and the
-		// next producer breaks without noticing.
-		panic("workflow: MergeReason.WithGateMiss requires a gate or a cause; an all-blank miss is a caller defect")
+		// Refuse rather than relying on producers happening to pass nonblank labels --
+		// that accidental safety is what this campaign has been removing. Return an
+		// ERROR, not a panic: the merge gate runs inside the daemon's PollOnce, which
+		// has NO recover(), so a panic here terminates an unattended daemon instead of
+		// rejecting one merge decision. A caller defect must surface as a refused
+		// decision, not as an outage.
+		return MergeReason{}, errors.New("merge reason: a gate miss requires a gate or a cause; an all-blank miss is a caller defect")
 	}
 	next := MergeReason{plain: r.plain, misses: make([]gateMiss, 0, len(r.misses)+1)}
 	next.misses = append(next.misses, r.misses...)
 	next.misses = append(next.misses, miss)
-	return next
+	return next, nil
 }
 
 // IsZero reports whether the decision carries no reason at all.
