@@ -9576,11 +9576,28 @@ can discover Gitmoot through an installed runtime plugin. Use
 adds the resolved `.gitmoot` home to the sandbox on Linux, macOS, and Windows.
 Use `gitmoot goal template` when
 writing a standard task-by-task goal file. Use `gitmoot workflow list`, `gitmoot
-workflow show`, `gitmoot workflow describe`, and `gitmoot workflow note` to
+workflow show`, `gitmoot workflow describe`, `gitmoot workflow note`, and
+`gitmoot workflow close` to
 inspect external-coordinator workflow groups, set their stable description, add
-verbatim journal entries, set a manual status escape hatch, and optionally stage
-a note in persistent memory. Linked PR lifecycle transitions also add deduped
-`daemon` journal notes and advance live status. Jobs join a group through
+verbatim journal entries, set a manual status escape hatch, optionally stage
+a note in persistent memory, and end a finished group. Workflow hygiene:
+`describe` a workflow at first use and `close` it (with `--reason`) when its
+work merges or completes — never-closed workflows accumulate and bury live
+work in the dashboard's active buckets and every workflow-picking surface. Linked PR lifecycle transitions also add deduped
+`daemon` journal notes and advance live status.
+In org mode, obligations and questions have a full lifecycle and closing it is
+part of the work: `gitmoot org directive send --to <role> --workflow <label>`
+mints a tracked, TTL-nudged obligation; `org directive ack <id>` records
+RECEIPT only; `org directive done <id>` records COMPLETION and ends the
+obligation with its nudges (target subtree only — the sender cancels with
+`org directive cancel` instead). Finished work left un-`done` stays an outstanding
+obligation on every owed-work surface (and, where completion TTLs are
+enabled, keeps nudging — and finally escalating — over work that was
+already delivered). Symmetrically, answer an
+escalation on its merits and then close it with
+`gitmoot org escalate resolve <note-id> [--by <role>]` — an
+answered-but-unresolved escalation stays on every owed-work surface and camouflages real
+blocks. Jobs join a group through
 `--workflow <label>` on agent
 ask/run/review/implement, orchestrate, or `job open`; orchestration descendants
 inherit the label automatically. Use
@@ -9675,6 +9692,40 @@ For current-chat template capture, read
 For the canonical goal prompt template, read
 [GOAL_TEMPLATE.md](references/GOAL_TEMPLATE.md) only when the user asks for a
 goal file.
+
+## Plan-Gated Implementation
+
+For non-trivial implementation work, default to a plan-gated flow: plan first,
+get the plan approved explicitly, then implement against the approved plan. The
+gate is a convention over existing primitives, so it works unchanged on Codex,
+Claude, and Kimi seats.
+
+1. **Plan read-only.** Produce a decision-complete plan with `gitmoot agent
+   ask` (or the `planner` template, or a session job opened with `--type ask`).
+   No file changes, no implement dispatches.
+2. **Record the plan.** Post it with `gitmoot workflow note <label> "..."` and
+   keep the entry id the CLI prints — that id is the plan-id.
+3. **Stop.** Approval is an explicit act, never inferred from silence. In org
+   mode the approver sends `gitmoot org directive send --to <role> --workflow
+   <label> "approved: implement plan <plan-id> …"`; outside org mode an
+   explicit human approval message referencing the plan-id serves the same
+   role.
+4. **Implement quoting the plan-id.** The approved plan is the scope fence:
+   work outside it needs an amended plan and a fresh approval, not silent
+   expansion.
+5. **Close the loop.** The implementer marks the approval directive `done`
+   when the work lands, and the workflow is `close`d when the PR merges.
+
+A coordinator may waive the gate for trivial mechanical fixes by writing
+"plan-waived" in the dispatch prompt. Claude Code seats may additionally use
+the harness's own plan mode, but only when the approver is present at that
+session: an interactive plan-approval prompt blocks invisibly — the session
+appears idle, no job runs, and nothing escalates — so an unattended seat must
+use the durable convention above, which is the runtime-neutral form and always
+applies. Under this convention every implement dispatch prompt carries either
+a plan-id or the literal "plan-waived"; a dispatch with neither is out of
+contract. See WORKFLOWS.md § Plan-Gated Implement for the full command
+sequence.
 
 ## Agent Job Contract
 
@@ -9786,6 +9837,17 @@ When asked to write the goal file:
 Do not implement the planned feature unless the user explicitly asks after the
 plan and goal file are complete.
 
+## Plan Approval Gate (Coordinator Mode)
+
+When you plan under a coordinator or an org workflow, the plan is not finished
+until it is recorded and approved. Post the completed plan with
+`gitmoot workflow note <label> "..."`, report the entry id the CLI prints as
+the plan-id, and STOP. Do not implement and do not emit implement delegations
+until an explicit approval referencing that plan-id reaches you — in org mode
+an `org directive`, otherwise an explicit human approval. Approval is never
+inferred from silence. Work outside the approved plan needs an amended plan
+and a fresh approval, not silent expansion.
+
 ## Coordinator Delegations
 
 When you run as a managed coordinator agent, you orchestrate an orchestra of
@@ -9815,13 +9877,15 @@ succeeded. Once all top-level delegations reach a terminal state, Gitmoot
 enqueues one coordinator continuation job so you can synthesize the results.
 
 See `references/RESULT_CONTRACT.md` for the full field reference. Example
-coordinator result that delegates two flat parallel jobs to different agents:
+coordinator result that delegates two flat parallel jobs to different
+agents (it assumes the plan was already approved — or plan-waived — per
+the Plan Approval Gate above):
 
 ```json
 {
   "gitmoot_result": {
     "decision": "approved",
-    "summary": "Plan ready; delegating implementation and review.",
+    "summary": "Approved plan 1234 received; delegating implementation and review.",
     "findings": [],
     "changes_made": [],
     "tests_run": [],
@@ -9831,7 +9895,7 @@ coordinator result that delegates two flat parallel jobs to different agents:
         "id": "build-api",
         "agent": "backend-coder",
         "action": "implement",
-        "prompt": "Implement the REST API described in the plan."
+        "prompt": "Implement approved plan 1234: the REST API it describes."
       },
       {
         "id": "review-plan",
@@ -14048,6 +14112,7 @@ gitmoot workflow describe release-42 "Validate and ship release 42."
 gitmoot workflow note release-42 "Kickoff." --author operator --status "Release checks running"
 gitmoot workflow note release-42 "Canary passed." --author operator --remember
 gitmoot workflow show release-42
+gitmoot workflow close release-42 --reason "Release 42 shipped and verified."
 ```
 
 `description` is the stable human "what/why" line. Gitmoot seeds it on the first
@@ -14204,6 +14269,56 @@ Use the Gitmoot planner here. Write a task-by-task implementation plan for this 
 
 If the user asks for a standard goal file, read the canonical goal template and
 write the goal file. Do not create a goal file unless explicitly requested.
+
+## Plan-Gated Implement
+
+Gate implementation on an approved plan when the change is non-trivial. The
+gate composes existing primitives — an ask job, a workflow note, an org
+directive — so it works unchanged on Codex, Claude, and Kimi seats, and the
+approval survives restarts because every step is durable state rather than
+conversation.
+
+```sh
+# 1. Plan, read-only. No file changes, no implement dispatches.
+gitmoot agent ask planner-agent --repo owner/repo --workflow feature-42 \
+  "Write a task-by-task implementation plan for <feature>."
+
+# 2. Record the plan. The printed entry id is the plan-id.
+gitmoot workflow note feature-42 "PLAN: <the complete plan text>"
+# The note must contain the complete plan — it is the text the approval
+# binds to and the fence the implementer is held inside.
+# -> noted workflow feature-42 as entry 1234
+
+# 3. Approve explicitly (org mode). Approval never comes from silence:
+#    the directive is tracked, TTL-nudged, and visible until completed.
+GITMOOT_ORG_ROLE=<approver-role> gitmoot org directive send \
+  --to implementer-role --workflow feature-42 \
+  "approved: implement plan 1234 as written; the plan is the scope fence"
+
+# 4. Implement, quoting the approved plan-id.
+gitmoot agent implement builder --repo owner/repo --workflow feature-42 \
+  "Implement plan 1234 (workflow note in feature-42). Stay inside it; work
+   outside the plan needs an amended plan and a fresh approval."
+
+# 5. Completion ends the obligation; merge closes the workflow — in this
+#    order: a `done` posted after `close` reopens the workflow, because
+#    any note into a closed workflow does.
+gitmoot org directive done <directive-id> --by implementer-role
+gitmoot workflow close feature-42 --reason "Plan 1234 implemented and merged."
+```
+
+Outside org mode, step 3 is an explicit human approval message referencing the
+plan-id; the rest is unchanged. A coordinator may waive the gate for trivial
+mechanical fixes by writing "plan-waived" in the dispatch prompt — the waiver
+is deliberate and visible, never implied. Under this convention every
+implement dispatch prompt carries either a plan-id or the literal
+"plan-waived"; a dispatch with neither is out of contract. Prefer this
+durable handshake over an
+interactive plan-approval prompt for any unattended seat: a session blocked on
+an in-pane approval modal reports idle, runs no job, and escalates nothing, so
+every fleet channel reads it as healthy while it waits. The `planner` template knows this
+handshake: in coordinator mode it posts its plan as a workflow note, reports
+the plan-id, and stops until an approval referencing that id arrives.
 
 ## Current-Chat Custom Agent Prompt
 

@@ -223,11 +223,28 @@ can discover Gitmoot through an installed runtime plugin. Use
 adds the resolved `.gitmoot` home to the sandbox on Linux, macOS, and Windows.
 Use `gitmoot goal template` when
 writing a standard task-by-task goal file. Use `gitmoot workflow list`, `gitmoot
-workflow show`, `gitmoot workflow describe`, and `gitmoot workflow note` to
+workflow show`, `gitmoot workflow describe`, `gitmoot workflow note`, and
+`gitmoot workflow close` to
 inspect external-coordinator workflow groups, set their stable description, add
-verbatim journal entries, set a manual status escape hatch, and optionally stage
-a note in persistent memory. Linked PR lifecycle transitions also add deduped
-`daemon` journal notes and advance live status. Jobs join a group through
+verbatim journal entries, set a manual status escape hatch, optionally stage
+a note in persistent memory, and end a finished group. Workflow hygiene:
+`describe` a workflow at first use and `close` it (with `--reason`) when its
+work merges or completes — never-closed workflows accumulate and bury live
+work in the dashboard's active buckets and every workflow-picking surface. Linked PR lifecycle transitions also add deduped
+`daemon` journal notes and advance live status.
+In org mode, obligations and questions have a full lifecycle and closing it is
+part of the work: `gitmoot org directive send --to <role> --workflow <label>`
+mints a tracked, TTL-nudged obligation; `org directive ack <id>` records
+RECEIPT only; `org directive done <id>` records COMPLETION and ends the
+obligation with its nudges (target subtree only — the sender cancels with
+`org directive cancel` instead). Finished work left un-`done` stays an outstanding
+obligation on every owed-work surface (and, where completion TTLs are
+enabled, keeps nudging — and finally escalating — over work that was
+already delivered). Symmetrically, answer an
+escalation on its merits and then close it with
+`gitmoot org escalate resolve <note-id> [--by <role>]` — an
+answered-but-unresolved escalation stays on every owed-work surface and camouflages real
+blocks. Jobs join a group through
 `--workflow <label>` on agent
 ask/run/review/implement, orchestrate, or `job open`; orchestration descendants
 inherit the label automatically. Use
@@ -322,6 +339,40 @@ For current-chat template capture, read
 For the canonical goal prompt template, read
 [GOAL_TEMPLATE.md](references/GOAL_TEMPLATE.md) only when the user asks for a
 goal file.
+
+## Plan-Gated Implementation
+
+For non-trivial implementation work, default to a plan-gated flow: plan first,
+get the plan approved explicitly, then implement against the approved plan. The
+gate is a convention over existing primitives, so it works unchanged on Codex,
+Claude, and Kimi seats.
+
+1. **Plan read-only.** Produce a decision-complete plan with `gitmoot agent
+   ask` (or the `planner` template, or a session job opened with `--type ask`).
+   No file changes, no implement dispatches.
+2. **Record the plan.** Post it with `gitmoot workflow note <label> "..."` and
+   keep the entry id the CLI prints — that id is the plan-id.
+3. **Stop.** Approval is an explicit act, never inferred from silence. In org
+   mode the approver sends `gitmoot org directive send --to <role> --workflow
+   <label> "approved: implement plan <plan-id> …"`; outside org mode an
+   explicit human approval message referencing the plan-id serves the same
+   role.
+4. **Implement quoting the plan-id.** The approved plan is the scope fence:
+   work outside it needs an amended plan and a fresh approval, not silent
+   expansion.
+5. **Close the loop.** The implementer marks the approval directive `done`
+   when the work lands, and the workflow is `close`d when the PR merges.
+
+A coordinator may waive the gate for trivial mechanical fixes by writing
+"plan-waived" in the dispatch prompt. Claude Code seats may additionally use
+the harness's own plan mode, but only when the approver is present at that
+session: an interactive plan-approval prompt blocks invisibly — the session
+appears idle, no job runs, and nothing escalates — so an unattended seat must
+use the durable convention above, which is the runtime-neutral form and always
+applies. Under this convention every implement dispatch prompt carries either
+a plan-id or the literal "plan-waived"; a dispatch with neither is out of
+contract. See WORKFLOWS.md § Plan-Gated Implement for the full command
+sequence.
 
 ## Agent Job Contract
 

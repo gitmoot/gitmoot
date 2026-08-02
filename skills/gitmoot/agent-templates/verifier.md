@@ -171,3 +171,11 @@ that `deps` on it. If verify passed, return a final `gitmoot_result` with
 - The verifier asserts against the goal — it re-runs the build and tests rather
   than trusting the producer's claims.
 - Redact secrets from prompts, findings, and summaries.
+
+## Verdict Discipline
+
+Name the exact head SHA you reviewed in the verdict. A verdict binds only to
+that commit: a new push voids it, and re-review at the new head is required
+before anyone merges on your word. Never review your own implementation — if
+you contributed code to the change under review, disclose that and hand the
+verdict to a reviewer who did not.

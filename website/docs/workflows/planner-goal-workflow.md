@@ -69,3 +69,32 @@ closed-unmerged PR blocks linked `pr_open`, `reviewing`, and
 job that finishes advancement/delegation with no PR or live successor also
 blocks the task, while delegation children and queued continuations remain under
 their existing workflow owner.
+
+## Plan-Gated Implement
+
+For non-trivial changes, gate implementation on an approved plan. The gate
+composes existing primitives — an ask job, a workflow note, an org directive —
+so it works on every runtime and survives restarts as durable state:
+
+```sh
+# 1. Plan read-only, then record it; the printed entry id is the plan-id.
+gitmoot agent ask project-planner --repo owner/repo --workflow feature-42 "Write the plan."
+gitmoot workflow note feature-42 "PLAN: <the plan>"        # -> entry 1234
+
+# 2. Approve explicitly — a tracked, TTL-nudged obligation, never silence.
+GITMOOT_ORG_ROLE=<approver-role> gitmoot org directive send \
+  --to implementer-role --workflow feature-42 \
+  "approved: implement plan 1234 as written; the plan is the scope fence"
+
+# 3. Implement quoting the plan-id; complete and close when merged.
+gitmoot agent implement builder --repo owner/repo --workflow feature-42 "Implement plan 1234."
+gitmoot org directive done <directive-id> --by implementer-role
+gitmoot workflow close feature-42 --reason "Plan 1234 implemented and merged."
+```
+
+Outside org mode, the approval is an explicit human message referencing the
+plan-id. A coordinator may waive the gate for trivial mechanical fixes by
+writing "plan-waived" in the dispatch prompt; the waiver is deliberate and
+visible, never implied. Prefer this durable handshake for any unattended
+agent: a session blocked on an interactive plan-approval prompt appears
+idle, runs no job, and escalates nothing.
