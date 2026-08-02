@@ -42,6 +42,10 @@ one is attached, and the job id:
 The `Template` line is present only when the job ran with a template. The body
 then continues with the `Decision` and `Summary`, plus any `Findings`,
 `Changes Made`, `Tests Run`, `Needs`, and `Delegations` the agent reported.
+If post-delivery workflow advancement is blocked, the durable job state and the
+comment both report `blocked` rather than repeating an agent's earlier
+`implemented` decision. The original summary remains visible and the block
+reason appears under `Diagnostics`.
 
 Use `gitmoot job list --repo owner/repo` and
 `gitmoot events --repo owner/repo` to inspect routing state.
@@ -65,4 +69,3 @@ silently ignored — always resume on the tree's open PR:
 See the [result contract](../reference/result-contract.md) for the
 `escalate_human` / ask-gate pause semantics, TTLs, and how a paused tree is
 surfaced under the dashboard's Attention page.
-

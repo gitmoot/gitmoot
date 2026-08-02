@@ -1769,6 +1769,11 @@ retry|continue|abort|answer` resumes a delegation tree paused by
 `references/RESULT_CONTRACT.md` for the pause/resume semantics (`answer` is
 PR-comment-only).
 
+If post-delivery workflow advancement is blocked, Gitmoot records the job as
+`blocked` and the attributed result comment reports `Decision: blocked`, even
+when the agent originally returned `implemented`. The agent's summary remains
+visible, and the advancement failure appears under `Diagnostics`.
+
 ## Jobs And Locks
 
 ```sh

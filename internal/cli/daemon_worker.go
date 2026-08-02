@@ -2449,6 +2449,9 @@ func (w jobWorker) jobNeedsAdvanceRetry(ctx context.Context, jobID string) (bool
 		case "advance_started", "advance_retry":
 			needsRetry = true
 		case "advance_completed", "advance_retried", "advance_blocked", "advance_retry_skipped":
+			// The defect is not that advance_blocked stops retries; stopping retries is
+			// all this classification does. The blocked outcome is settled separately
+			// and must never be converted back into a retry.
 			needsRetry = false
 		case "retry_queued":
 			needsRetry = false
@@ -2509,7 +2512,7 @@ func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 		}
 		var blocked workflow.BlockedError
 		if errors.As(err, &blocked) {
-			return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_blocked", Message: err.Error()})
+			return w.settleBlockedAdvancement(ctx, job.ID, err)
 		}
 		return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry failed: "+err.Error())
 	}

@@ -192,7 +192,7 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, cause er
 		}
 		var blocked workflow.BlockedError
 		if errors.As(cause, &blocked) {
-			return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: latest.ID, Kind: "advance_blocked", Message: cause.Error()})
+			return w.settleBlockedAdvancement(ctx, latest.ID, cause)
 		}
 		if err := w.recordPostDeliveryWorkflowError(ctx, latest, cause); err != nil {
 			return err
@@ -299,6 +299,39 @@ func (w jobWorker) recordPostDeliveryWorkflowError(ctx context.Context, job db.J
 		"post-delivery workflow error; advancement will retry from stored result: "+cause.Error())
 }
 
+func (w jobWorker) settleBlockedAdvancement(ctx context.Context, jobID string, cause error) error {
+	message := cause.Error()
+	latest, err := w.Store.GetJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if latest.State == string(workflow.JobBlocked) {
+		return w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_blocked", Message: message})
+	}
+	transitioned, err := w.Store.TransitionJobStateWithEvent(ctx, jobID, latest.State, string(workflow.JobBlocked), db.JobEvent{
+		JobID:   jobID,
+		Kind:    "advance_blocked",
+		Message: message,
+	})
+	if err != nil {
+		return err
+	}
+	if transitioned {
+		emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, events.EventJobBlocked, string(workflow.JobBlocked), message, "advance_blocked")
+		return nil
+	}
+	// A concurrent terminal transition is already a non-success outcome. Preserve
+	// it and keep the blocked advancement queryable without overwriting its state.
+	latest, err = w.Store.GetJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if latest.State == string(workflow.JobSucceeded) {
+		return fmt.Errorf("record blocked advancement for job %s: succeeded state did not transition", jobID)
+	}
+	return w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_blocked", Message: message})
+}
+
 func (w jobWorker) postJobResultComment(ctx context.Context, jobID string, agent runtime.Agent, _ string, cause error) error {
 	job, payload, err := daemonWorkerJobPayload(ctx, w.Store, jobID)
 	if err != nil {
@@ -332,8 +365,12 @@ func (w jobWorker) postJobResultComment(ctx context.Context, jobID string, agent
 	if err != nil {
 		return err
 	}
+	advanceBlocked, err := w.jobAdvanceBlocked(ctx, job.ID)
+	if err != nil {
+		return err
+	}
 	diagnostic := jobResultDiagnostic(cause)
-	if diagnostic == "" && payload.Result == nil {
+	if diagnostic == "" && (payload.Result == nil || advanceBlocked) {
 		diagnostic = w.storedJobFailureDiagnostic(ctx, job)
 	}
 	body := workflow.RenderJobResultComment(workflow.JobResultComment{
@@ -342,7 +379,7 @@ func (w jobWorker) postJobResultComment(ctx context.Context, jobID string, agent
 		JobID:      job.ID,
 		JobState:   job.State,
 		Payload:    payload,
-		Result:     payload.Result,
+		Result:     outwardJobResult(payload.Result, advanceBlocked),
 		Diagnostic: diagnostic,
 	})
 	if _, err := w.CommenterFactory("").PostIssueComment(ctx, repo, int64(payload.PullRequest), body); err != nil {
@@ -399,7 +436,7 @@ func (w jobWorker) postChatThreadResult(ctx context.Context, job db.Job, payload
 		JobID:      job.ID,
 		JobState:   job.State,
 		Payload:    payload,
-		Result:     payload.Result,
+		Result:     outwardJobResult(payload.Result, job.State == string(workflow.JobBlocked)),
 		Diagnostic: diagnostic,
 	})
 	if _, err := w.Store.AddChatMessage(ctx, db.ChatMessage{
@@ -480,11 +517,29 @@ func (w jobWorker) storedJobFailureDiagnostic(ctx context.Context, job db.Job) s
 	}
 	for i := len(events) - 1; i >= 0; i-- {
 		event := events[i]
-		if event.Kind == job.State && strings.TrimSpace(event.Message) != "" {
+		if (event.Kind == job.State || job.State == string(workflow.JobBlocked) && event.Kind == "advance_blocked") && strings.TrimSpace(event.Message) != "" {
 			return event.Message
 		}
 	}
 	return ""
+}
+
+func outwardJobResult(result *workflow.AgentResult, advanceBlocked bool) *workflow.AgentResult {
+	if result == nil || !advanceBlocked {
+		return result
+	}
+	blocked := *result
+	blocked.Decision = string(workflow.JobBlocked)
+	return &blocked
+}
+
+func (w jobWorker) jobAdvanceBlocked(ctx context.Context, jobID string) (bool, error) {
+	events, err := w.Store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	latest, ok := latestDeliveryStatusEvent(events)
+	return ok && latest.Kind == "advance_blocked", nil
 }
 
 func daemonWorkerJobPayload(ctx context.Context, store *db.Store, jobID string) (db.Job, workflow.JobPayload, error) {
