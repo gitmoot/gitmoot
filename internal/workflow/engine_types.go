@@ -179,16 +179,20 @@ func terminalEventType(state JobState) (events.EventType, bool) {
 }
 
 type PullRequestEvent struct {
-	Repo              string
-	Branch            string
-	PullRequest       int
-	HeadSHA           string
-	GoalID            string
-	TaskID            string
-	TaskTitle         string
-	LeadAgent         string
-	Sender            string
-	RequiredReviewers []string
+	Repo        string
+	Branch      string
+	PullRequest int
+	// PullRequestDraft is the forge-observed draft state. Draft PRs are not
+	// merge-gate eligible and do not represent a pending human merge decision.
+	PullRequestDraft        bool
+	PullRequestDraftUnknown bool
+	HeadSHA                 string
+	GoalID                  string
+	TaskID                  string
+	TaskTitle               string
+	LeadAgent               string
+	Sender                  string
+	RequiredReviewers       []string
 	// ActingOrgRole is the org attribution carried from the branch lock (#1250).
 	// BOTH PR-open triggers read it from that one durable source, so native review
 	// fanout children inherit an attribution instead of being enqueued
@@ -241,14 +245,16 @@ type RevertEvent struct {
 }
 
 type MergeRequest struct {
-	Repo           string
-	Branch         string
-	PullRequest    int
-	HeadSHA        string
-	TaskID         string
-	WorkflowID     string
-	Reviewer       string
-	ReviewOptional bool
+	Repo                    string
+	Branch                  string
+	PullRequest             int
+	PullRequestDraft        bool
+	PullRequestDraftUnknown bool
+	HeadSHA                 string
+	TaskID                  string
+	WorkflowID              string
+	Reviewer                string
+	ReviewOptional          bool
 	// HumanMergeRequested is an explicit, authorized human instruction. It is
 	// evaluated inside PolicyMergeGate, never by a caller-side bypass.
 	HumanMergeRequested bool

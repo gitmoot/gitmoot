@@ -133,3 +133,11 @@ a new high-risk area the panel did not cover.
 - This recipe is review-only. Do not request implement work or mutate files.
 - Keep each lens prompt narrow so panelists stay independent.
 - Redact secrets from prompts, findings, and summaries.
+
+## Verdict Discipline
+
+Name the exact head SHA you reviewed in the verdict. A verdict binds only to
+that commit: a new push voids it, and re-review at the new head is required
+before anyone merges on your word. Never review your own implementation — if
+you contributed code to the change under review, disclose that and hand the
+verdict to a reviewer who did not.

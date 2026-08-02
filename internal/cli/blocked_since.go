@@ -20,6 +20,10 @@ const (
 	blockedRoleWakeInterval    = time.Minute
 	blockedRoleSnapshotTimeout = 5 * time.Second
 	directiveTTLSweepLimit     = 200
+	// A blocked task gets a finite alert ladder independent of disposal. The
+	// third nudge also emits the one terminal escalation; the episode then stays
+	// queryable but silent until evidence disposal transitions the task itself.
+	blockedTaskMaxNudges = 3
 	// blockedEpisodeStaleGap bounds how long a role episode survives without being
 	// re-observed blocked. Within it, a transient unknown/absent snapshot blip is
 	// tolerated (the accrued blocked duration is preserved); beyond it the subject is
@@ -38,11 +42,36 @@ type blockedRoleWakeDependencies struct {
 	provider     func([]config.OrgRole) org.Provider
 	eventSink    func(context.Context, *db.Store, string) (events.Sink, error)
 	directives   directiveTTLDependencies
+	awaitedFacts awaitedFactTTLDependencies
+}
+
+type awaitedFactTTLDependencies struct {
+	list   func(context.Context, *db.Store, time.Time) ([]db.AwaitedFact, error)
+	expire func(context.Context, *db.Store, int64, string, time.Time) (bool, error)
+}
+
+func (d awaitedFactTTLDependencies) listDue(ctx context.Context, store *db.Store, now time.Time) ([]db.AwaitedFact, error) {
+	if d.list != nil {
+		return d.list(ctx, store, now)
+	}
+	return store.ListDueAwaitedFacts(ctx, now)
+}
+
+func (d awaitedFactTTLDependencies) markExpired(ctx context.Context, store *db.Store, id int64, target string, now time.Time) (bool, error) {
+	if d.expire != nil {
+		return d.expire(ctx, store, id, target, now)
+	}
+	return store.ExpireAwaitedFact(ctx, id, target, now)
 }
 
 type directiveTTLDependencies struct {
 	list func(context.Context, *db.Store, int) ([]db.OrgDirectiveObligation, error)
 	mark func(context.Context, *db.Store, int64, int, string, time.Time) (int, bool, error)
+	// #1352: the completion phase advances its OWN counter, and the ladder ends
+	// in a stamped terminal state rather than in silence.
+	markDone  func(context.Context, *db.Store, int64, int, string, time.Time) (int, bool, error)
+	exhaust   func(context.Context, *db.Store, int64, time.Time) (bool, error)
+	countOpen func(context.Context, *db.Store) (int, error)
 }
 
 func defaultBlockedRoleWakeDependencies() blockedRoleWakeDependencies {
@@ -65,6 +94,40 @@ func (d directiveTTLDependencies) markNudged(ctx context.Context, store *db.Stor
 		return d.mark(ctx, store, item.ID, item.NudgeCount, item.LastNudgedAt, now)
 	}
 	return store.MarkOrgDirectiveNudged(ctx, item.ID, item.NudgeCount, item.LastNudgedAt, now)
+}
+
+// markDoneNudged advances the COMPLETION-phase counter (#1352). Kept separate
+// from markNudged because the phases cap independently.
+func (d directiveTTLDependencies) markDoneNudged(ctx context.Context, store *db.Store, item db.OrgDirectiveObligation, now time.Time) (int, bool, error) {
+	if d.markDone != nil {
+		return d.markDone(ctx, store, item.ID, item.DoneNudgeCount, item.LastNudgedAt, now)
+	}
+	return store.MarkOrgDirectiveDoneNudged(ctx, item.ID, item.DoneNudgeCount, item.LastNudgedAt, now)
+}
+
+func (d directiveTTLDependencies) markExhausted(ctx context.Context, store *db.Store, item db.OrgDirectiveObligation, now time.Time) (bool, error) {
+	if d.exhaust != nil {
+		return d.exhaust(ctx, store, item.ID, now)
+	}
+	return store.MarkOrgDirectiveExhausted(ctx, item.ID, now)
+}
+
+// sweepWindow sizes the window from the LIVE POPULATION rather than a fixed
+// oldest-N (#1352). This is the remedy the blocked-task evaluator already uses;
+// a fixed window let immortal rows own it and starve newer directives forever.
+func (d directiveTTLDependencies) sweepWindow(ctx context.Context, store *db.Store) int {
+	count, err := func() (int, error) {
+		if d.countOpen != nil {
+			return d.countOpen(ctx, store)
+		}
+		return store.CountOpenOrgDirectiveObligations(ctx)
+	}()
+	if err != nil || count <= 0 {
+		// Fail toward the previous behaviour rather than toward sweeping nothing:
+		// a count error must not silently stop the checker.
+		return directiveTTLSweepLimit
+	}
+	return count
 }
 
 // enabledBlockedSinceEventSink preserves the blocked-since path's stricter
@@ -151,6 +214,7 @@ func evaluateBlockedTaskEpisodes(ctx context.Context, store *db.Store, sink even
 	}
 	taskPrefix := "task:" + strings.TrimSpace(repo) + ":"
 	var digestItems []blockedTaskDigestItem
+	var exhaustedItems []blockedTaskDigestItem
 	for _, episode := range episodes {
 		if !strings.HasPrefix(episode.Subject, taskPrefix) {
 			continue
@@ -168,6 +232,9 @@ func evaluateBlockedTaskEpisodes(ctx context.Context, store *db.Store, sink even
 		if !stale {
 			continue
 		}
+		if strings.TrimSpace(episode.TaskExhaustedAt) != "" {
+			continue
+		}
 		blockedSince, blockedFor, due, err := blockedEpisodeDue(episode, wakeAfter, now)
 		if err != nil {
 			writeLine(stdout, "blocked_since task %s emit failed: %v", taskID, err)
@@ -176,26 +243,32 @@ func evaluateBlockedTaskEpisodes(ctx context.Context, store *db.Store, sink even
 		if !due {
 			continue
 		}
-		if err := markBlockedEpisodeEmitted(ctx, store, episode, now); err != nil {
+		newCount, exhausted, err := store.MarkBlockedTaskEpisodeEmitted(ctx, episode.Subject,
+			episode.TaskEmitCount, blockedTaskMaxNudges, now)
+		if err != nil {
 			writeLine(stdout, "blocked_since task %s emit failed: %v", taskID, err)
 			continue
 		}
-		digestItems = append(digestItems, blockedTaskDigestItem{
+		if newCount == episode.TaskEmitCount {
+			continue
+		}
+		item := blockedTaskDigestItem{
 			taskID:       taskID,
 			blockedSince: blockedSince,
 			blockedFor:   blockedFor,
-		})
-	}
-	if len(digestItems) == 0 {
-		return nil
-	}
-	sort.Slice(digestItems, func(i, j int) bool {
-		if digestItems[i].blockedFor == digestItems[j].blockedFor {
-			return digestItems[i].taskID < digestItems[j].taskID
 		}
-		return digestItems[i].blockedFor > digestItems[j].blockedFor
-	})
-	events.EmitEvent(ctx, sink, buildBlockedTaskDigestEvent(repo, digestItems, now))
+		digestItems = append(digestItems, item)
+		if exhausted {
+			exhaustedItems = append(exhaustedItems, item)
+		}
+	}
+	if len(digestItems) > 0 {
+		sortBlockedTaskDigestItems(digestItems)
+		events.EmitEvent(ctx, sink, buildBlockedTaskDigestEvent(repo, digestItems, now))
+	}
+	for _, item := range exhaustedItems {
+		events.EmitEvent(ctx, sink, buildBlockedTaskAlertExhaustedEvent(repo, item, now))
+	}
 	return nil
 }
 
@@ -246,6 +319,9 @@ func runBlockedRoleWakeOnce(ctx context.Context, store *db.Store, home string, s
 		// daemon). Checking this FIRST means a herdr-less/no-org deployment — the
 		// common OSS/automated-user case — never probes herdr and never logs.
 		return
+	}
+	if err := evaluateAwaitedFactTTLs(ctx, store, orgConfig, stdout, now.UTC(), deps.awaitedFacts); err != nil {
+		writeLine(stdout, "awaited fact TTL evaluation failed: %v", err)
 	}
 	// Directive supervision shares this existing one-minute lane but does not
 	// depend on a Herdr snapshot. Resolve the event-rule guard first: with zero
@@ -310,12 +386,48 @@ func runBlockedRoleWakeOnce(ctx context.Context, store *db.Store, home string, s
 	}
 }
 
+func evaluateAwaitedFactTTLs(ctx context.Context, store *db.Store, orgConfig config.OrgConfig, stdout io.Writer, now time.Time, deps awaitedFactTTLDependencies) error {
+	if store == nil {
+		return nil
+	}
+	items, err := deps.listDue(ctx, store, now.UTC())
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		role, ok := orgConfig.Role(item.WaiterRole)
+		target := item.WaiterRole
+		if ok {
+			target = strings.TrimSpace(role.Parent)
+		} else {
+			// Seat removal cannot remove the wait's termination bound. Preserve the
+			// exact removed-role address so delivery failure remains separately
+			// observable while the subscription itself becomes terminal/queryable.
+			writeLine(stdout, "awaited fact %d waiter role %q is no longer configured; expiring with wake still addressed to that role", item.ID, item.WaiterRole)
+		}
+		if target == "" {
+			// A root wait still terminates visibly. With no parent available, wake
+			// the root itself rather than turning expiry into silence.
+			target = item.WaiterRole
+		}
+		expired, err := deps.markExpired(ctx, store, item.ID, target, now.UTC())
+		if err != nil {
+			writeLine(stdout, "awaited fact %d expiry failed: %v", item.ID, err)
+			continue
+		}
+		if expired {
+			writeLine(stdout, "awaited fact %d expired; escalation addressed to %s", item.ID, target)
+		}
+	}
+	return nil
+}
+
 func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.Sink, orgConfig config.OrgConfig, stdout io.Writer, now time.Time, deps directiveTTLDependencies) error {
 	if store == nil || sink == nil {
 		return nil
 	}
 	now = now.UTC()
-	items, err := deps.listOpen(ctx, store, directiveTTLSweepLimit)
+	items, err := deps.listOpen(ctx, store, deps.sweepWindow(ctx, store))
 	if err != nil {
 		return err
 	}
@@ -329,7 +441,14 @@ func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.
 		if !due {
 			continue
 		}
-		newCount, claimed, err := deps.markNudged(ctx, store, item, now)
+		// #1352: each phase advances its OWN counter, so each caps independently.
+		var newCount int
+		var claimed bool
+		if unacked {
+			newCount, claimed, err = deps.markNudged(ctx, store, item, now)
+		} else {
+			newCount, claimed, err = deps.markDoneNudged(ctx, store, item, now)
+		}
 		if err != nil {
 			writeLine(stdout, "org directive %d nudge mark failed: %v", item.ID, err)
 			continue
@@ -338,14 +457,48 @@ func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.
 			continue
 		}
 		events.EmitEvent(ctx, sink, buildDirectiveNudgeEvent(item, to, phase, anchor, ttl, newCount, now))
-		if unacked && newCount == orgConfig.DirectiveMaxNudges() {
-			events.EmitEvent(ctx, sink, buildDirectiveEscalationEvent(item, orgConfig, from, to, newCount, now))
+		// The ladder ends the same way in BOTH phases: one terminal escalation at
+		// the cap, then a stamped exhausted state. The acked phase previously had
+		// neither, so an acknowledged directive with a done TTL re-nudged forever.
+		if newCount >= orgConfig.DirectiveMaxNudges() {
+			events.EmitEvent(ctx, sink, buildDirectiveEscalationEvent(item, orgConfig, from, to, phase, newCount, now))
+			// #1352 B2: the stamp is COMPLETION-ONLY. Stamping it for the
+			// acknowledgment phase terminated BOTH phases, so a directive that
+			// exhausted its ack ladder and was then acknowledged LATE could never
+			// start its completion ladder at all. The ack phase's terminal condition
+			// is its own counter at the cap — pre-existing, queryable, and it does
+			// not block the phase that follows it.
+			if !unacked {
+				if stamped, err := deps.markExhausted(ctx, store, item, now); err != nil {
+					writeLine(stdout, "org directive %d exhausted mark failed: %v", item.ID, err)
+				} else if stamped {
+					// #1352 B1: the COLUMN alone was invisible to operators — Comms
+					// builds threads from NOTES, so a column-only terminal state showed
+					// no thread at all. The marker is what makes exhaustion discoverable;
+					// the column stays for the evaluator's own reads.
+					if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+						WorkflowID: item.WorkflowID,
+						Author:     to,
+						Body:       workflow.FormatOrgDirectiveExhaustedNote(item.ID, to),
+						Repo:       item.Repo,
+					}); err != nil {
+						writeLine(stdout, "org directive %d exhausted marker note failed: %v", item.ID, err)
+					}
+					writeLine(stdout, "org directive %d %s ladder exhausted after %d nudges; obligation remains open and queryable", item.ID, phase, newCount)
+				}
+			}
 		}
 	}
 	return nil
 }
 
 func directiveTTLDue(item db.OrgDirectiveObligation, orgConfig config.OrgConfig, now time.Time) (anchor time.Time, ttl time.Duration, phase string, unacked, due bool) {
+	// #1352 B2: the stamp is COMPLETION-phase terminal only. An unacknowledged
+	// directive is never gated by it, so a late ack starts a fresh completion
+	// ladder instead of inheriting the previous phase's terminal state.
+	if strings.TrimSpace(item.AckedAt) != "" && strings.TrimSpace(item.ExhaustedAt) != "" {
+		return time.Time{}, 0, "", false, false
+	}
 	if strings.TrimSpace(item.AckedAt) == "" {
 		if item.NudgeCount >= orgConfig.DirectiveMaxNudges() {
 			return time.Time{}, 0, "", true, false
@@ -355,6 +508,13 @@ func directiveTTLDue(item db.OrgDirectiveObligation, orgConfig config.OrgConfig,
 		phase = "acknowledgment"
 		unacked = true
 	} else {
+		// The completion phase caps on its OWN counter. This branch previously had
+		// NO max check at all, which is defect 1: an acknowledged directive with a
+		// done TTL re-nudged forever, and those immortal rows are also what starved
+		// the sweep window.
+		if item.DoneNudgeCount >= orgConfig.DirectiveMaxNudges() {
+			return time.Time{}, 0, "", false, false
+		}
 		anchor = parseTranscriptStoreTime(item.AckedAt)
 		ttl = orgConfig.DirectiveDoneTTL()
 		if item.DoneTTLOverrideSeconds >= 0 {
@@ -383,9 +543,15 @@ func buildDirectiveNudgeEvent(item db.OrgDirectiveObligation, target, phase stri
 	return ev
 }
 
-func buildDirectiveEscalationEvent(item db.OrgDirectiveObligation, orgConfig config.OrgConfig, sender, target string, nudgeCount int, now time.Time) events.Event {
+func buildDirectiveEscalationEvent(item db.OrgDirectiveObligation, orgConfig config.OrgConfig, sender, target, phase string, nudgeCount int, now time.Time) events.Event {
 	id := fmt.Sprint(item.ID)
-	detail := fmt.Sprintf("directive %s to %s remains unacknowledged after %d nudges", id, target, nudgeCount)
+	// #1352: both phases escalate now, so the detail must say WHICH obligation
+	// went unmet — "unacknowledged" would be wrong for a completion escalation.
+	unmet := "unacknowledged"
+	if phase == "completion" {
+		unmet = "incomplete"
+	}
+	detail := fmt.Sprintf("directive %s to %s remains %s after %d nudges; nudge ladder exhausted", id, target, unmet, nudgeCount)
 	ev := events.NewEvent(events.EventJobNeedsAttention, "org-directive:"+id, db.WakeOutboxSourceWorkflowNote+":"+id, item.Repo, "overdue", detail, now, workflow.RedactCommentText)
 	ev.Cause = "escalation"
 	if role, ok := orgConfig.Role(sender); ok {
@@ -634,6 +800,15 @@ type blockedTaskDigestItem struct {
 	blockedFor   time.Duration
 }
 
+func sortBlockedTaskDigestItems(items []blockedTaskDigestItem) {
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].blockedFor == items[j].blockedFor {
+			return items[i].taskID < items[j].taskID
+		}
+		return items[i].blockedFor > items[j].blockedFor
+	})
+}
+
 func buildBlockedTaskDigestEvent(repo string, items []blockedTaskDigestItem, now time.Time) events.Event {
 	oldest := items[0]
 	suffix := ""
@@ -649,6 +824,15 @@ func buildBlockedTaskDigestEvent(repo string, items []blockedTaskDigestItem, now
 		len(items), oldest.blockedFor.Round(time.Second), oldest.blockedSince.UTC().Format(time.RFC3339), oldest.taskID, suffix)
 	ev := events.NewEvent(events.EventJobBlocked, oldest.taskID, oldest.taskID, repo, string(workflow.TaskBlocked), detail, now, workflow.RedactCommentText)
 	ev.Cause = "blocked_since"
+	return ev
+}
+
+func buildBlockedTaskAlertExhaustedEvent(repo string, item blockedTaskDigestItem, now time.Time) events.Event {
+	detail := fmt.Sprintf("task %s remains blocked after %d alerts over %s (since %s); alert ladder exhausted, task remains queryable pending evidence disposal",
+		item.taskID, blockedTaskMaxNudges, item.blockedFor.Round(time.Second), item.blockedSince.UTC().Format(time.RFC3339))
+	ev := events.NewEvent(events.EventJobNeedsAttention, item.taskID, item.taskID, repo,
+		string(workflow.TaskBlocked), detail, now, workflow.RedactCommentText)
+	ev.Cause = "escalation"
 	return ev
 }
 

@@ -181,6 +181,7 @@ var wakeOutboxSourceKinds = []wakeOutboxSourceKind{
 	{sourceKind: db.WakeOutboxSourceChatMessage, wakeKind: db.WakeOutboxKindReply},
 	{sourceKind: db.WakeOutboxSourceBlocked, wakeKind: db.WakeOutboxKindBlocked},
 	{sourceKind: db.WakeOutboxSourceEscalation, wakeKind: db.WakeOutboxKindEscalation},
+	{sourceKind: db.WakeOutboxSourceAwaitedFact, wakeKind: db.WakeOutboxKindFact},
 }
 
 func wakeOutboxKindForSource(sourceKind, coalesceKey string) (string, bool) {
@@ -266,6 +267,27 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 		if err := json.Unmarshal([]byte(oldest.SourceID), &event); err != nil {
 			return events.Event{}, fmt.Errorf("decode escalation wake outbox event for row %d: %w", oldest.ID, err)
 		}
+	case db.WakeOutboxSourceAwaitedFact:
+		var payload db.AwaitedFactWakePayload
+		if err := json.Unmarshal([]byte(oldest.SourceID), &payload); err != nil {
+			return events.Event{}, fmt.Errorf("decode awaited fact wake outbox event for row %d: %w", oldest.ID, err)
+		}
+		detail := fmt.Sprintf("awaited %s %s for %s is %s", payload.SubjectKind, payload.SubjectKey, payload.WaiterRole, payload.State)
+		if len(batch) > 1 {
+			detail = fmt.Sprintf("%d awaited facts ready; oldest: %s", len(batch), detail)
+		}
+		factID := fmt.Sprintf("awaited-fact:%d", payload.ID)
+		event = events.NewEvent(
+			events.EventOrgFact,
+			factID,
+			factID,
+			"",
+			payload.State,
+			detail,
+			now,
+			workflow.RedactCommentText,
+		)
+		event.Cause = "awaited_fact_" + payload.State
 	default:
 		return events.Event{}, fmt.Errorf(
 			"wake outbox row %d has unsupported source kind %q",

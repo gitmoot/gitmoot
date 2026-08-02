@@ -86,12 +86,22 @@ type WorkflowNote struct {
 // OrgDirectiveObligation is the evaluator projection for one open directive.
 // AckedAt is empty until a typed ack receipt exists. Cancelled and completed
 // directives are excluded by the query.
+// directiveSweepCeiling is a SAFETY ceiling on the sweep window, not the working
+// limit — callers size the window from the live population (#1352).
+const directiveSweepCeiling = 200
+
 type OrgDirectiveObligation struct {
 	WorkflowNote
 	AckedAt                string
 	NudgeCount             int
 	LastNudgedAt           string
 	DoneTTLOverrideSeconds int64
+	// #1352: the completion phase counts separately, because NudgeCount is
+	// cumulative across both phases and never resets at ack. ExhaustedAt is the
+	// terminal stamp — non-empty means the ladder ended and the obligation is
+	// parked but still VISIBLE in this list.
+	DoneNudgeCount int
+	ExhaustedAt    string
 }
 
 // WorkflowMeta is the latest external-coordinator handoff identity recorded for
@@ -806,6 +816,12 @@ LIMIT ?`, prefix, prefix, limit)
 // ListUnacknowledgedOrgDirectives returns the oldest outstanding directives.
 // It is intentionally ASC and unbounded: a newer directive must never push the
 // oldest unacknowledged obligation out of a DESC+LIMIT window.
+//
+// #1352: `done` terminates the obligation even when no ack was ever recorded.
+// Completion is strictly stronger than receipt — once the work is finished the
+// receipt question is moot — so a completed directive must not keep reading as
+// outstanding here. Before the `done` VERB shipped this was unreachable in
+// practice, because only a hand-written marker note could produce the state.
 func (s *Store) ListUnacknowledgedOrgDirectives(ctx context.Context, targetRole string) ([]WorkflowNote, error) {
 	targetRole = strings.ToLower(strings.TrimSpace(targetRole))
 	rows, err := s.db.QueryContext(ctx, `SELECT d.id, d.workflow_id, d.author, d.body, d.repo, d.memory_observation_id, d.created_at
@@ -817,6 +833,7 @@ WHERE substr(d.body, 1, length('[org:directive ')) = '[org:directive '
 		WHERE r.workflow_id = d.workflow_id AND (
 			substr(r.body, 1, length('[org:directive-ack id=' || d.id || ' ')) = '[org:directive-ack id=' || d.id || ' '
 			OR substr(r.body, 1, length('[org:directive-cancel id=' || d.id || ' ')) = '[org:directive-cancel id=' || d.id || ' '
+			OR substr(r.body, 1, length('[org:directive-done id=' || d.id || ' ')) = '[org:directive-done id=' || d.id || ' '
 		)
 	)
 ORDER BY d.created_at ASC, d.id ASC`, targetRole, targetRole, targetRole)
@@ -835,16 +852,49 @@ ORDER BY d.created_at ASC, d.id ASC`, targetRole, targetRole, targetRole)
 	return notes, rows.Err()
 }
 
+// CountOpenOrgDirectiveObligations returns how many directives are currently
+// open, using the SAME open-predicate as ListOpenOrgDirectiveObligations.
+//
+// #1352: it exists so the sweep window can be bounded by the LIVE POPULATION
+// rather than a fixed oldest-N. This is the remedy the blocked-task evaluator
+// already applies (it bounds its stale projection to len(blockedTasks)); a
+// second, different mechanism would be worse than reusing the one that works.
+func (s *Store) CountOpenOrgDirectiveObligations(ctx context.Context) (int, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM workflow_notes d
+WHERE substr(d.body, 1, length('[org:directive ')) = '[org:directive '
+	AND NOT EXISTS (
+		SELECT 1 FROM workflow_notes r
+		WHERE r.workflow_id = d.workflow_id AND (
+			substr(r.body, 1, length('[org:directive-cancel id=' || d.id || ' ')) = '[org:directive-cancel id=' || d.id || ' '
+			OR substr(r.body, 1, length('[org:directive-done id=' || d.id || ' ')) = '[org:directive-done id=' || d.id || ' '
+		)
+	)`).Scan(&count)
+	return count, err
+}
+
 // ListOpenOrgDirectiveObligations returns open directives oldest-first. The
 // bounded ASC window is deliberate: a DESC+LIMIT query would discard exactly
 // the oldest, most overdue obligations.
+//
+// #1352: the CALLER sizes the window from the live population. A fixed oldest-N
+// starved newer directives forever once N immortal rows occupied it — and the
+// unbounded acked-phase ladder guaranteed such rows existed. The bound here is
+// now a SAFETY CEILING against a pathological population, not the working limit.
 func (s *Store) ListOpenOrgDirectiveObligations(ctx context.Context, limit int) ([]OrgDirectiveObligation, error) {
-	if limit <= 0 || limit > 200 {
-		limit = 200
+	// #1352 B3: NO CEILING on a caller-supplied window. The blocked-task remedy
+	// passes the full live population and clamps nothing; clamping to 200 meant a
+	// population of 201 still starved directive 201 forever, which is the very
+	// defect being fixed. Only an unset/invalid limit falls back to the default.
+	if limit <= 0 {
+		limit = directiveSweepCeiling
 	}
 	rows, err := s.db.QueryContext(ctx, `
 SELECT d.id, d.workflow_id, d.author, d.body, d.repo, d.memory_observation_id, d.created_at,
 	d.directive_nudge_count, d.directive_last_nudged_at, d.directive_done_ttl_seconds,
+	d.directive_done_nudge_count, d.directive_exhausted_at,
 	COALESCE((
 		SELECT MIN(a.created_at) FROM workflow_notes a
 		WHERE a.workflow_id = d.workflow_id
@@ -871,7 +921,8 @@ LIMIT ?`, limit)
 		if err := rows.Scan(
 			&item.ID, &item.WorkflowID, &item.Author, &item.Body, &item.Repo,
 			&item.MemoryObservationID, &item.CreatedAt, &item.NudgeCount,
-			&item.LastNudgedAt, &item.DoneTTLOverrideSeconds, &item.AckedAt,
+			&item.LastNudgedAt, &item.DoneTTLOverrideSeconds,
+			&item.DoneNudgeCount, &item.ExhaustedAt, &item.AckedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -880,9 +931,78 @@ LIMIT ?`, limit)
 	return obligations, rows.Err()
 }
 
+// MarkOrgDirectiveDoneNudged is MarkOrgDirectiveNudged for the COMPLETION phase
+// (#1352). The completion phase counts separately because directive_nudge_count
+// is cumulative across both phases and never resets at ack, so one shared
+// counter cannot express a per-phase cap. It also refuses an already-exhausted
+// row, so the terminal state cannot be walked back by a racing sweep.
+func (s *Store) MarkOrgDirectiveDoneNudged(ctx context.Context, id int64, expectedCount int, expectedLastNudgedAt string, nudgedAt time.Time) (int, bool, error) {
+	stamp := nudgedAt.UTC().Format(time.RFC3339Nano)
+	result, err := s.db.ExecContext(ctx, `
+UPDATE workflow_notes
+SET directive_done_nudge_count = directive_done_nudge_count + 1,
+	directive_last_nudged_at = ?
+WHERE id = ?
+	AND directive_done_nudge_count = ?
+	AND directive_last_nudged_at = ?
+	AND TRIM(directive_exhausted_at) = ''
+	AND substr(body, 1, length('[org:directive ')) = '[org:directive '
+	AND NOT EXISTS (
+		SELECT 1 FROM workflow_notes r
+		WHERE r.workflow_id = workflow_notes.workflow_id AND (
+			substr(r.body, 1, length('[org:directive-cancel id=' || workflow_notes.id || ' ')) = '[org:directive-cancel id=' || workflow_notes.id || ' '
+			OR substr(r.body, 1, length('[org:directive-done id=' || workflow_notes.id || ' ')) = '[org:directive-done id=' || workflow_notes.id || ' '
+		)
+	)`,
+		stamp, id, expectedCount, expectedLastNudgedAt)
+	if err != nil {
+		return expectedCount, false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return expectedCount, false, err
+	}
+	if affected == 0 {
+		return expectedCount, false, nil
+	}
+	return expectedCount + 1, true, nil
+}
+
+// MarkOrgDirectiveExhausted stamps the TERMINAL state of the nudge ladder
+// (#1352). Deliberately a stamp on the directive row rather than a deletion or
+// an exclusion: the obligation stays LISTED and queryable, carrying visible
+// evidence that it ended un-completed. A ladder ending in silence would be worse
+// than one that never stopped. Idempotent — the first stamp wins.
+func (s *Store) MarkOrgDirectiveExhausted(ctx context.Context, id int64, at time.Time) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+UPDATE workflow_notes
+SET directive_exhausted_at = ?
+WHERE id = ?
+	AND TRIM(directive_exhausted_at) = ''
+	AND substr(body, 1, length('[org:directive ')) = '[org:directive '`,
+		at.UTC().Format(time.RFC3339Nano), id)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
+}
+
 // MarkOrgDirectiveNudged atomically advances one persisted counter. The
 // expected values make a repeated or concurrent evaluator pass a no-op rather
 // than a duplicate wake.
+//
+// #1352: it is also the THIRD obligation-state site, and it must be terminator-
+// aware. ListOpenOrgDirectiveObligations can return an open row, a done or
+// cancel marker can commit in the gap, and the claim would still succeed —
+// after which evaluateOrgDirectiveTTLs emits a nudge for an obligation that has
+// already ended. Re-checking the terminators inside the SAME atomic UPDATE
+// closes that window: the claim is the last point before the wake, so it is the
+// correct place to enforce it. Cancel is included alongside done because it
+// carries the identical promise and the identical race.
 func (s *Store) MarkOrgDirectiveNudged(ctx context.Context, id int64, expectedCount int, expectedLastNudgedAt string, nudgedAt time.Time) (int, bool, error) {
 	stamp := nudgedAt.UTC().Format(time.RFC3339Nano)
 	result, err := s.db.ExecContext(ctx, `
@@ -892,7 +1012,14 @@ SET directive_nudge_count = directive_nudge_count + 1,
 WHERE id = ?
 	AND directive_nudge_count = ?
 	AND directive_last_nudged_at = ?
-	AND substr(body, 1, length('[org:directive ')) = '[org:directive '`,
+	AND substr(body, 1, length('[org:directive ')) = '[org:directive '
+	AND NOT EXISTS (
+		SELECT 1 FROM workflow_notes r
+		WHERE r.workflow_id = workflow_notes.workflow_id AND (
+			substr(r.body, 1, length('[org:directive-cancel id=' || workflow_notes.id || ' ')) = '[org:directive-cancel id=' || workflow_notes.id || ' '
+			OR substr(r.body, 1, length('[org:directive-done id=' || workflow_notes.id || ' ')) = '[org:directive-done id=' || workflow_notes.id || ' '
+		)
+	)`,
 		stamp, id, expectedCount, expectedLastNudgedAt)
 	if err != nil {
 		return expectedCount, false, err

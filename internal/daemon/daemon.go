@@ -75,6 +75,10 @@ type Daemon struct {
 	// repository. When it turns on, only tasks parked by the auto-merge-disabled
 	// leave-open reason are re-armed. Nil preserves direct daemon users' behavior.
 	AutoMergeEnabled func(repo string) bool
+	// parseCommentCommand is an injectable test seam for proving that the
+	// system-verified author gate runs before untrusted comment text reaches the
+	// command parser. Nil uses ParseCommand.
+	parseCommentCommand func(string) (Command, bool)
 }
 
 // RemoteBranchChecker returns the subset of exact branch names present on
@@ -118,6 +122,15 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	}
 	var firstErr error
 	if err := d.rearmAutoMergeDisabledTasks(ctx); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	// Disposal is independent of repository admission. Run it before the open-PR
+	// listing so an unavailable forge cannot bypass an already-expired task's
+	// terminal bound; the per-item evaluator records "subject unavailable".
+	paths := config.Paths{ConfigFile: filepath.Join(filepath.Dir(d.Store.DatabasePath()), config.ConfigName)}
+	if disposalTTL, err := config.LoadStaleTaskTTL(paths); err != nil {
+		d.logf("task disposal skipped for %s: %v", d.Repo.FullName(), err)
+	} else if err := d.reconcileTaskDisposals(ctx, disposalTTL); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	pulls, err := d.GitHub.ListPullRequests(ctx, d.Repo, "open")
@@ -261,7 +274,7 @@ func (d Daemon) reconcileStaleTasks(ctx context.Context, openBranches map[string
 	}
 	return d.reconcileTaskTTL(ctx, openBranches, taskTTLReconcilePolicy{
 		ttl:          staleTTL,
-		states:       []string{string(workflow.TaskImplementing), string(workflow.TaskBlocked)},
+		states:       []string{string(workflow.TaskImplementing)},
 		eventKind:    "task_dismissed_auto",
 		reasonPrefix: "stale task auto-dismissed",
 		logLabel:     "stale task reconciler",
@@ -930,16 +943,18 @@ func (d Daemon) handlePullRequestWorkflowChange(ctx context.Context, pull github
 	}
 	mergeReadinessHandled := len(reviewers) == 0 && !lock.SkipNativeReviewFanout
 	err = d.Workflow.HandlePullRequestOpened(ctx, workflow.PullRequestEvent{
-		Repo:              d.Repo.FullName(),
-		Branch:            ref.branch,
-		PullRequest:       int(pull.Number),
-		HeadSHA:           pull.HeadSHA,
-		GoalID:            ref.goalID,
-		TaskID:            ref.id,
-		TaskTitle:         ref.title,
-		LeadAgent:         lock.Owner,
-		Sender:            "github",
-		RequiredReviewers: reviewers,
+		Repo:                    d.Repo.FullName(),
+		Branch:                  ref.branch,
+		PullRequest:             int(pull.Number),
+		PullRequestDraft:        pull.Draft,
+		PullRequestDraftUnknown: pull.DraftUnknown,
+		HeadSHA:                 pull.HeadSHA,
+		GoalID:                  ref.goalID,
+		TaskID:                  ref.id,
+		TaskTitle:               ref.title,
+		LeadAgent:               lock.Owner,
+		Sender:                  "github",
+		RequiredReviewers:       reviewers,
 		// Trigger 2 (daemon path): the implement-job advancement persisted the
 		// skip flag onto the branch lock; honor it so the PR-watcher path skips
 		// the native review fanout too.
@@ -1032,15 +1047,17 @@ func (d Daemon) handleReadyToMergeWorkflow(ctx context.Context, pull github.Pull
 		branch = pull.HeadRef
 	}
 	return d.Workflow.HandlePullRequestReadyToMerge(ctx, workflow.PullRequestEvent{
-		Repo:        d.Repo.FullName(),
-		Branch:      branch,
-		PullRequest: int(pull.Number),
-		HeadSHA:     pull.HeadSHA,
-		GoalID:      task.GoalID,
-		TaskID:      task.ID,
-		TaskTitle:   task.Title,
-		LeadAgent:   leadAgent,
-		Sender:      "github",
+		Repo:                    d.Repo.FullName(),
+		Branch:                  branch,
+		PullRequest:             int(pull.Number),
+		PullRequestDraft:        pull.Draft,
+		PullRequestDraftUnknown: pull.DraftUnknown,
+		HeadSHA:                 pull.HeadSHA,
+		GoalID:                  task.GoalID,
+		TaskID:                  task.ID,
+		TaskTitle:               task.Title,
+		LeadAgent:               leadAgent,
+		Sender:                  "github",
 	})
 }
 
@@ -1494,8 +1511,8 @@ func (d Daemon) workflowReviewers(ctx context.Context) ([]string, error) {
 }
 
 func (d Daemon) handleComment(ctx context.Context, pull github.PullRequest, comment github.IssueComment) error {
-	commands := ParseCommands(comment.Body)
-	if len(commands) == 0 {
+	input := prepareCommentCommandInput(comment.Body)
+	if !input.addressed {
 		return nil
 	}
 
@@ -1518,8 +1535,15 @@ func (d Daemon) handleComment(ctx context.Context, pull github.PullRequest, comm
 		return d.markCommentSeen(ctx, pull, comment)
 	}
 
-	for sequence, command := range commands {
-		if err := d.handleCommand(ctx, pull, comment, sequence, command); err != nil {
+	commands := parseCommentCommands(input, d.commentCommandParser())
+	for sequence, parsed := range commands {
+		if parsed.err != nil {
+			if err := d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not route comment %d: %v.", comment.ID, parsed.err)); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := d.handleCommand(ctx, pull, comment, sequence, parsed.command); err != nil {
 			return err
 		}
 	}
@@ -1533,14 +1557,8 @@ func (d Daemon) handleComment(ctx context.Context, pull github.PullRequest, comm
 // ignored on issues). Non-ask commands never mark the comment seen, so a later
 // real ask in the same thread is still picked up.
 func (d Daemon) handleIssueComment(ctx context.Context, issue github.Issue, comment github.IssueComment) error {
-	commands := ParseCommands(comment.Body)
-	asks := make([]Command, 0, len(commands))
-	for _, command := range commands {
-		if command.Action == "ask" {
-			asks = append(asks, command)
-		}
-	}
-	if len(asks) == 0 {
+	input := prepareCommentCommandInput(comment.Body)
+	if !input.addressed {
 		return nil
 	}
 
@@ -1563,13 +1581,26 @@ func (d Daemon) handleIssueComment(ctx context.Context, issue github.Issue, comm
 		return d.markIssueCommentSeen(ctx, issue, comment)
 	}
 
-	for sequence, command := range commands {
-		if command.Action != "ask" {
+	commands := parseCommentCommands(input, d.commentCommandParser())
+	handled := false
+	for sequence, parsed := range commands {
+		if parsed.err != nil {
+			if err := d.ack(ctx, issue.Number, fmt.Sprintf("Gitmoot could not route comment %d: %v.", comment.ID, parsed.err)); err != nil {
+				return err
+			}
+			handled = true
 			continue
 		}
-		if err := d.handleIssueAsk(ctx, issue, comment, sequence, command); err != nil {
+		if parsed.command.Action != "ask" {
+			continue
+		}
+		if err := d.handleIssueAsk(ctx, issue, comment, sequence, parsed.command); err != nil {
 			return err
 		}
+		handled = true
+	}
+	if !handled {
+		return nil
 	}
 	return d.markIssueCommentSeen(ctx, issue, comment)
 }
@@ -1579,6 +1610,11 @@ func (d Daemon) handleIssueComment(ctx context.Context, issue github.Issue, comm
 // issue-comment job id (so issue jobs never collide with PR jobs) and empty
 // branch/HeadSHA.
 func (d Daemon) handleIssueAsk(ctx context.Context, issue github.Issue, comment github.IssueComment, sequence int, command Command) error {
+	// Validate is still load-bearing here for the empty-agent case
+	// (`/gitmoot ask @ something` parses with Agent == ""), but it can never
+	// return ErrUnsupportedAction: handleIssueComment filters to
+	// Action == "ask" before dispatching, and "ask" is an allowed action. An
+	// unrecognized action on an issue is dropped at that filter instead (#1355).
 	if err := command.Validate(); err != nil {
 		return d.ack(ctx, issue.Number, fmt.Sprintf("Gitmoot could not route comment %d: %v.", comment.ID, err))
 	}
@@ -1633,8 +1669,8 @@ func (d Daemon) handleIssueAsk(ctx context.Context, issue github.Issue, comment 
 }
 
 func (d Daemon) handleRecoveryComment(ctx context.Context, pull github.PullRequest, comment github.IssueComment) error {
-	commands := ParseCommands(comment.Body)
-	if len(commands) == 0 || !onlyJobRecoveryCommands(commands) {
+	input := prepareCommentCommandInput(comment.Body)
+	if !input.addressed {
 		return nil
 	}
 
@@ -1657,12 +1693,34 @@ func (d Daemon) handleRecoveryComment(ctx context.Context, pull github.PullReque
 		return d.markCommentSeen(ctx, pull, comment)
 	}
 
+	parsedCommands := parseCommentCommands(input, d.commentCommandParser())
+	commands := make([]Command, 0, len(parsedCommands))
+	for _, parsed := range parsedCommands {
+		if parsed.err != nil {
+			if err := d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not route comment %d: %v.", comment.ID, parsed.err)); err != nil {
+				return err
+			}
+			return d.markCommentSeen(ctx, pull, comment)
+		}
+		commands = append(commands, parsed.command)
+	}
+	if len(commands) == 0 || !onlyJobRecoveryCommands(commands) {
+		return nil
+	}
+
 	for sequence, command := range commands {
 		if err := d.handleCommand(ctx, pull, comment, sequence, command); err != nil {
 			return err
 		}
 	}
 	return d.markCommentSeen(ctx, pull, comment)
+}
+
+func (d Daemon) commentCommandParser() func(string) (Command, bool) {
+	if d.parseCommentCommand != nil {
+		return d.parseCommentCommand
+	}
+	return ParseCommand
 }
 
 func onlyJobRecoveryCommands(commands []Command) bool {
@@ -1676,6 +1734,11 @@ func onlyJobRecoveryCommands(commands []Command) bool {
 
 func (d Daemon) handleCommand(ctx context.Context, pull github.PullRequest, comment github.IssueComment, sequence int, command Command) error {
 	if err := command.Validate(); err != nil {
+		if errors.Is(err, ErrUnsupportedAction) {
+			d.logf("comment %d on %s#%d addressed Gitmoot but names no known action, ignoring: %v",
+				comment.ID, d.Repo.FullName(), pull.Number, err)
+			return nil
+		}
 		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not route comment %d: %v.", comment.ID, err))
 	}
 	switch command.Action {
@@ -1939,17 +2002,19 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 		return err
 	}
 	err = d.Workflow.HandlePullRequestReadyToMerge(ctx, workflow.PullRequestEvent{
-		Repo:                d.Repo.FullName(),
-		Branch:              firstNonEmpty(task.Branch, pull.HeadRef),
-		PullRequest:         int(pull.Number),
-		HeadSHA:             pull.HeadSHA,
-		GoalID:              task.GoalID,
-		TaskID:              task.ID,
-		TaskTitle:           task.Title,
-		LeadAgent:           leadAgent,
-		Sender:              comment.Author,
-		RequiredReviewers:   reviewers,
-		HumanMergeRequested: true,
+		Repo:                    d.Repo.FullName(),
+		Branch:                  firstNonEmpty(task.Branch, pull.HeadRef),
+		PullRequest:             int(pull.Number),
+		PullRequestDraft:        pull.Draft,
+		PullRequestDraftUnknown: pull.DraftUnknown,
+		HeadSHA:                 pull.HeadSHA,
+		GoalID:                  task.GoalID,
+		TaskID:                  task.ID,
+		TaskTitle:               task.Title,
+		LeadAgent:               leadAgent,
+		Sender:                  comment.Author,
+		RequiredReviewers:       reviewers,
+		HumanMergeRequested:     true,
 	})
 	if err != nil {
 		var blocked workflow.BlockedError

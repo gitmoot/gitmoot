@@ -57,6 +57,7 @@ func TestOpenMigratesSchema(t *testing.T) {
 		"merge_gate_ci_observations",
 		"job_gates",
 		"wake_outbox",
+		"awaited_facts",
 	} {
 		ok, err := store.HasTable(ctx, table)
 		if err != nil {

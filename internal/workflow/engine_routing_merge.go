@@ -389,9 +389,9 @@ func (e Engine) ensureJobExecutorAllowed(ctx context.Context, job db.Job, payloa
 		// of the lock, on a payload that was carrying it the whole time.
 		ActingOrgRole: payload.ActingOrgRole,
 		Repo:          payload.Repo,
-		Sender:       payload.Sender,
-		Branch:       payload.Branch,
-		DelegationID: payload.DelegationID,
+		Sender:        payload.Sender,
+		Branch:        payload.Branch,
+		DelegationID:  payload.DelegationID,
 		// Carry the worker spec so an ephemeral child's executor check inherits the
 		// coordinator's repo scope (skip the registered-agent checks) instead of
 		// blocking on a synthetic agent name that no agent row backs.
@@ -486,20 +486,29 @@ func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string,
 		return MergeDecision{}, err
 	}
 	decision, err := e.MergeGate.Evaluate(ctx, MergeRequest{
-		Repo:                payload.Repo,
-		Branch:              payload.Branch,
-		PullRequest:         payload.PullRequest,
-		HeadSHA:             payload.HeadSHA,
-		TaskID:              payload.TaskID,
-		WorkflowID:          payload.WorkflowID,
-		Reviewer:            reviewer,
-		ReviewOptional:      !reviewRequired,
-		HumanMergeRequested: humanMergeRequested,
+		Repo:                    payload.Repo,
+		Branch:                  payload.Branch,
+		PullRequest:             payload.PullRequest,
+		PullRequestDraft:        payload.PullRequestDraft,
+		PullRequestDraftUnknown: payload.PullRequestDraftUnknown,
+		HeadSHA:                 payload.HeadSHA,
+		TaskID:                  payload.TaskID,
+		WorkflowID:              payload.WorkflowID,
+		Reviewer:                reviewer,
+		ReviewOptional:          !reviewRequired,
+		HumanMergeRequested:     humanMergeRequested,
 	})
 	if err != nil {
 		return MergeDecision{}, err
 	}
 	if decision.LeaveOpen {
+		// A draft is an author-controlled hold, not a pending human merge decision.
+		// Unknown draft state also fails toward NOT parking: parking requires a
+		// classifier-gated override to escape, while leaving the task active is
+		// recoverable when a later forge observation supplies the missing state.
+		if payload.PullRequestDraft || payload.PullRequestDraftUnknown {
+			return decision, nil
+		}
 		reason := strings.TrimSpace(decision.Reason)
 		if reason == "" {
 			reason = "merge requires a human action"

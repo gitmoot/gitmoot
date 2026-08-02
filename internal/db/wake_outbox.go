@@ -30,14 +30,17 @@ const (
 	WakeOutboxKindBlocked    = "blocked"
 	WakeOutboxKindEscalation = "escalation"
 	WakeOutboxKindDirective  = "directive"
+	WakeOutboxKindFact       = "fact"
 
 	WakeOutboxSourceWorkflowNote = "workflow_note"
 	WakeOutboxSourceChatMessage  = "chat_message"
 	WakeOutboxSourceBlocked      = WakeOutboxKindBlocked
 	WakeOutboxSourceEscalation   = WakeOutboxKindEscalation
+	WakeOutboxSourceAwaitedFact  = "awaited_fact"
 
 	WakeOutboxReplyCoalescePrefix     = WakeOutboxKindReply + ":"
 	WakeOutboxDirectiveCoalescePrefix = WakeOutboxKindDirective + ":"
+	WakeOutboxFactCoalescePrefix      = WakeOutboxKindFact + ":"
 )
 
 type wakeOutboxStateInterpretation uint8
@@ -168,6 +171,26 @@ func (s *Store) InsertWakeOutbox(
 	return tx.Commit()
 }
 
+// insertWakeOutboxTx writes one obligation row.
+//
+// INVARIANT ASYMMETRY, DOCUMENTED BECAUSE IT LOOKS LIKE AN INCONSISTENCY AND IS
+// NOT (#1352): DIRECTIVE ROWS KEY A PER-OBLIGATION STATE MACHINE — pending,
+// revivable from delivered — WHILE EVERY OTHER KIND KEYS AN EVENT.
+//
+// The table's implicit assumption is that source_id is event-unique. AT
+// event_rule_sink.go — and only there — the non-directive kinds get that free
+// from serialized payloads; this is NOT a property of the table, since the
+// workflow-note and chat-message writers pass their own source ids. Directives
+// alone carry a LITERAL directive id, because the decoder (wakeOutboxEvent)
+// renders source_id straight into the command an operator reads back:
+// `gitmoot org directive ack <id>`. Storing a payload there instead produced
+// `ack {"schema_version":1,...}`.
+//
+// That literal id is STABLE ACROSS NAGS, so repeated nags are the SAME
+// obligation, not new ones — therefore REVIVE rather than insert. Do NOT "tidy"
+// the directive branch back to serialized payloads for uniformity: it would
+// restore uniqueness and silently recreate the malformed-command defect, which
+// cost three review rounds to find.
 func insertWakeOutboxTx(ctx context.Context, tx *sql.Tx, sourceKind, sourceID, wakeKind, targetRole string) error {
 	sourceKind = strings.TrimSpace(sourceKind)
 	if sourceKind == "" {
@@ -185,13 +208,49 @@ func insertWakeOutboxTx(ctx context.Context, tx *sql.Tx, sourceKind, sourceID, w
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `
+	// #1352: REVIVE SEMANTICS BIND TO THE DIRECTIVE BRANCH ONLY. The other two
+	// writers on this generic seam — workflow-note insertion and chat-message
+	// insertion — keep HARD-INSERT semantics, untouched.
+	//
+	// The reasoning is obligation-specific: directive rows key a PER-OBLIGATION
+	// STATE MACHINE, while every other kind keys an EVENT. Extending revive to
+	// chat messages and workflow notes would apply an obligation semantic to
+	// things that are not obligations.
+	//
+	// SCOPE OF THE SAFETY ARGUMENT, stated precisely because a looser version was
+	// wrong: Store.InsertWakeOutbox has ONE production caller (Emit in
+	// event_rule_sink.go). This generic seam has THREE production paths, so the
+	// single-caller argument covers the OUTER function only — which is why the
+	// upsert is scoped to the directive kind here rather than applied to the seam.
+	if strings.EqualFold(strings.TrimSpace(wakeKind), WakeOutboxKindDirective) {
+		// A DELIVERED row REVIVES to pending — the obligation still stands. An
+		// ALREADY-PENDING row is LEFT UNTOUCHED (nothing new to say), which gives
+		// nag suppression for free. A second row is never created.
+		_, err = tx.ExecContext(ctx, `
+INSERT INTO wake_outbox(source_kind, source_id, target_role, coalesce_key)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(source_kind, source_id, target_role) DO UPDATE SET
+	state = 'pending',
+	coalesce_key = excluded.coalesce_key,
+	attempt_count = 0,
+	last_error = '',
+	attempted_at = NULL,
+	finished_at = NULL,
+	updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE wake_outbox.state <> 'pending'`,
+			sourceKind,
+			sourceID,
+			role,
+			coalesceKey)
+	} else {
+		_, err = tx.ExecContext(ctx, `
 INSERT INTO wake_outbox(source_kind, source_id, target_role, coalesce_key)
 VALUES (?, ?, ?, ?)`,
-		sourceKind,
-		sourceID,
-		role,
-		coalesceKey)
+			sourceKind,
+			sourceID,
+			role,
+			coalesceKey)
+	}
 	if err != nil {
 		return err
 	}
@@ -201,7 +260,7 @@ VALUES (?, ?, ?, ?)`,
 func wakeOutboxCoalesceKey(wakeKind, role string) (string, error) {
 	kind := strings.ToLower(strings.TrimSpace(wakeKind))
 	switch kind {
-	case WakeOutboxKindReply, WakeOutboxKindBlocked, WakeOutboxKindEscalation, WakeOutboxKindDirective:
+	case WakeOutboxKindReply, WakeOutboxKindBlocked, WakeOutboxKindEscalation, WakeOutboxKindDirective, WakeOutboxKindFact:
 	default:
 		return "", fmt.Errorf("unsupported wake outbox kind %q", wakeKind)
 	}

@@ -749,10 +749,23 @@ first.
 `implementing` or `blocked` task. It refuses while a matching job or worktree
 process is live, preserves the branch and worktree, releases the branch lock
 best-effort, and records `task_dismissed_manual`. The daemon can record
-`task_dismissed_auto` for stale candidates using `updated_at` as a conservative
-activity proxy. Configure `[workflow].stale_task_ttl = "168h"` (the default), or
-set it to `"0"` to disable this poll leg. Candidates with a same-repo open PR,
-a remote branch, a live job, or an uncertain remote check are not dismissed.
+`task_dismissed_auto` for stale `implementing` candidates using `updated_at` as
+a conservative activity proxy. Configure `[workflow].stale_task_ttl = "168h"`
+(the default), or set it to `"0"` to disable this poll leg. Candidates with a
+same-repo open PR, a remote branch, a live job, or an uncertain remote check are
+not dismissed.
+
+The same TTL bounds `blocked` and `awaiting_human_merge` rows through a separate,
+evidence-based disposal pass. In order, an own merged PR produces `merged`; a
+later merged task or PR for the same referenced issue produces `superseded`; a
+closed referenced issue/PR produces `superseded`; and the bounded fallback is
+`stranded`. No tier uses git ancestry. An open `awaiting_human_merge` PR remains
+protected and falls to the visible `stranded` queue rather than being inferred
+complete. `task list --state stranded --json` exposes `disposal_tier`,
+`disposal_reason`, `disposed_at`, and the terminal escalation route.
+Separately, a continuous blocked episode emits at most three interval-spaced
+alerts plus one terminal escalation; alert exhaustion stays queryable and does
+not itself dispose the task.
 
 `task resume-work` is the coordinator-only, non-terminal exit from orphaned
 `reviewing`/`ready_to_merge` machinery back to `implementing`. It also supports
@@ -1183,6 +1196,14 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    base branch because another PR merged first, Gitmoot asks GitHub to update the
    PR branch with the expected head SHA and leaves the merge gate pending so the
    daemon can reload the new head and checks on a later poll tick.
+
+   When review independence cannot be verified, the decline names the observed
+   cause: no implement job for the task, task-identity mismatch, a matching job
+   with no agent, or a malformed implement payload. All four remain fail-closed.
+   For the no-job case, the coordinator bridge is to inspect the exact-head
+   engine review with `gitmoot job show <job-id>`, confirm the implementer from
+   the pane session, and journal both facts with `gitmoot workflow note`. The
+   journal is an operator record, never an attestation consumed by the gate.
 
    When a head reports **no** external CI at all (zero commit-statuses and zero
    check-runs), Gitmoot does not conclude "this repo has no CI" from a single
@@ -9563,11 +9584,28 @@ can discover Gitmoot through an installed runtime plugin. Use
 adds the resolved `.gitmoot` home to the sandbox on Linux, macOS, and Windows.
 Use `gitmoot goal template` when
 writing a standard task-by-task goal file. Use `gitmoot workflow list`, `gitmoot
-workflow show`, `gitmoot workflow describe`, and `gitmoot workflow note` to
+workflow show`, `gitmoot workflow describe`, `gitmoot workflow note`, and
+`gitmoot workflow close` to
 inspect external-coordinator workflow groups, set their stable description, add
-verbatim journal entries, set a manual status escape hatch, and optionally stage
-a note in persistent memory. Linked PR lifecycle transitions also add deduped
-`daemon` journal notes and advance live status. Jobs join a group through
+verbatim journal entries, set a manual status escape hatch, optionally stage
+a note in persistent memory, and end a finished group. Workflow hygiene:
+`describe` a workflow at first use and `close` it (with `--reason`) when its
+work merges or completes — never-closed workflows accumulate and bury live
+work in the dashboard's active buckets and every workflow-picking surface. Linked PR lifecycle transitions also add deduped
+`daemon` journal notes and advance live status.
+In org mode, obligations and questions have a full lifecycle and closing it is
+part of the work: `gitmoot org directive send --to <role> --workflow <label>`
+mints a tracked, TTL-nudged obligation; `org directive ack <id>` records
+RECEIPT only; `org directive done <id>` records COMPLETION and ends the
+obligation with its nudges (target subtree only — the sender cancels with
+`org directive cancel` instead). Finished work left un-`done` stays an outstanding
+obligation on every owed-work surface (and, where completion TTLs are
+enabled, keeps nudging — and finally escalating — over work that was
+already delivered). Symmetrically, answer an
+escalation on its merits and then close it with
+`gitmoot org escalate resolve <note-id> [--by <role>]` — an
+answered-but-unresolved escalation stays on every owed-work surface and camouflages real
+blocks. Jobs join a group through
 `--workflow <label>` on agent
 ask/run/review/implement, orchestrate, or `job open`; orchestration descendants
 inherit the label automatically. Use
@@ -9662,6 +9700,40 @@ For current-chat template capture, read
 For the canonical goal prompt template, read
 [GOAL_TEMPLATE.md](references/GOAL_TEMPLATE.md) only when the user asks for a
 goal file.
+
+## Plan-Gated Implementation
+
+For non-trivial implementation work, default to a plan-gated flow: plan first,
+get the plan approved explicitly, then implement against the approved plan. The
+gate is a convention over existing primitives, so it works unchanged on Codex,
+Claude, and Kimi seats.
+
+1. **Plan read-only.** Produce a decision-complete plan with `gitmoot agent
+   ask` (or the `planner` template, or a session job opened with `--type ask`).
+   No file changes, no implement dispatches.
+2. **Record the plan.** Post it with `gitmoot workflow note <label> "..."` and
+   keep the entry id the CLI prints — that id is the plan-id.
+3. **Stop.** Approval is an explicit act, never inferred from silence. In org
+   mode the approver sends `gitmoot org directive send --to <role> --workflow
+   <label> "approved: implement plan <plan-id> …"`; outside org mode an
+   explicit human approval message referencing the plan-id serves the same
+   role.
+4. **Implement quoting the plan-id.** The approved plan is the scope fence:
+   work outside it needs an amended plan and a fresh approval, not silent
+   expansion.
+5. **Close the loop.** The implementer marks the approval directive `done`
+   when the work lands, and the workflow is `close`d when the PR merges.
+
+A coordinator may waive the gate for trivial mechanical fixes by writing
+"plan-waived" in the dispatch prompt. Claude Code seats may additionally use
+the harness's own plan mode, but only when the approver is present at that
+session: an interactive plan-approval prompt blocks invisibly — the session
+appears idle, no job runs, and nothing escalates — so an unattended seat must
+use the durable convention above, which is the runtime-neutral form and always
+applies. Under this convention every implement dispatch prompt carries either
+a plan-id or the literal "plan-waived"; a dispatch with neither is out of
+contract. See WORKFLOWS.md § Plan-Gated Implement for the full command
+sequence.
 
 ## Agent Job Contract
 
@@ -9773,6 +9845,17 @@ When asked to write the goal file:
 Do not implement the planned feature unless the user explicitly asks after the
 plan and goal file are complete.
 
+## Plan Approval Gate (Coordinator Mode)
+
+When you plan under a coordinator or an org workflow, the plan is not finished
+until it is recorded and approved. Post the completed plan with
+`gitmoot workflow note <label> "..."`, report the entry id the CLI prints as
+the plan-id, and STOP. Do not implement and do not emit implement delegations
+until an explicit approval referencing that plan-id reaches you — in org mode
+an `org directive`, otherwise an explicit human approval. Approval is never
+inferred from silence. Work outside the approved plan needs an amended plan
+and a fresh approval, not silent expansion.
+
 ## Coordinator Delegations
 
 When you run as a managed coordinator agent, you orchestrate an orchestra of
@@ -9802,13 +9885,15 @@ succeeded. Once all top-level delegations reach a terminal state, Gitmoot
 enqueues one coordinator continuation job so you can synthesize the results.
 
 See `references/RESULT_CONTRACT.md` for the full field reference. Example
-coordinator result that delegates two flat parallel jobs to different agents:
+coordinator result that delegates two flat parallel jobs to different
+agents (it assumes the plan was already approved — or plan-waived — per
+the Plan Approval Gate above):
 
 ```json
 {
   "gitmoot_result": {
     "decision": "approved",
-    "summary": "Plan ready; delegating implementation and review.",
+    "summary": "Approved plan 1234 received; delegating implementation and review.",
     "findings": [],
     "changes_made": [],
     "tests_run": [],
@@ -9818,7 +9903,7 @@ coordinator result that delegates two flat parallel jobs to different agents:
         "id": "build-api",
         "agent": "backend-coder",
         "action": "implement",
-        "prompt": "Implement the REST API described in the plan."
+        "prompt": "Implement approved plan 1234: the REST API it describes."
       },
       {
         "id": "review-plan",
@@ -9873,6 +9958,12 @@ running job whose directly recorded runtime PID is confirmably dead is a
 required `stuck jobs` failure; legacy jobs with no recorded PID and hosts where
 process identity cannot be verified are neutral and produce no ghost-job
 finding.
+For organization roles with an effective `recycle_after`, doctor also reads the
+durable `org_role_presence.last_seen_at` signal. It warns when a specific role
+has never been observed or has been inactive past that bound; an unreadable,
+malformed, or future timestamp is reported as **unverified**, never healthy.
+This deterministic absence check does not enqueue an agent job and is separate
+from `gitmoot agent heartbeat`, whose configured schedules do enqueue jobs.
 It also reports the SQLite auto-vacuum mode. New homes use bounded incremental
 reclaim automatically. A legacy home remains a non-blocking warning until an
 operator deliberately converts it during an idle maintenance window:
@@ -10698,6 +10789,7 @@ gitmoot agent run reviewer --repo owner/repo --pr 12 --background "Review this P
 gitmoot agent run lead --repo owner/repo --action implement --pr 12 "Fix findings on the existing PR."
 gitmoot agent review reviewer --repo owner/repo --pr 12 "Review this PR."
 gitmoot agent implement lead --repo owner/repo --task task-001 "Implement this task."
+gitmoot agent implement lead --repo owner/repo --task task-001 --ready "Implement and open the PR ready for review."
 gitmoot agent implement lead --repo owner/repo --pr 12 "Fix findings on the existing PR."
 gitmoot agent implement lead --repo owner/repo --task task-002 --base origin/main "Implement from current origin/main."
 gitmoot agent ask project-planner --repo owner/repo "Return the plan status."
@@ -10714,6 +10806,22 @@ has a separate meaning: it selects a managed agent type. The flags can be used
 together. Invalid actions and contradictions are rejected before enqueue;
 notably, `--action review` requires `--pr`, while `--action implement --pr` is
 the explicit existing-PR fix-pass route.
+
+Before delivery, these dispatch commands scan commit-shaped tokens in the
+prompt against the target repository. If a token resolves to a commit other
+than the dispatch head, Gitmoot prints an advisory warning such as
+`prompt references commit <referenced>, but the dispatch head is <head>; Gitmoot
+will use dispatch head <head>`. The job still runs because prompts may
+legitimately discuss historical commits. Hex strings that do not resolve to a
+commit, including mutation-hygiene SHA-256 restore hashes, do not warn.
+
+New implementation PRs opened by the engine are drafts by default. Use
+`--ready` on `agent run`, `agent implement`, or `orchestrate` to opt into an
+immediately merge-gate-eligible PR once review evidence is satisfied; `--draft`
+states the safe default explicitly. A draft PR does not move its task to
+`awaiting_human_merge`, because
+no human merge decision has been requested. Marking the PR ready lets normal
+merge-gate advancement resume.
 
 For `agent implement --pr <number>` (or the equivalent `agent run --action
 implement --pr <number>`), Gitmoot resolves the PR and reuses its existing task
@@ -11258,6 +11366,50 @@ not completion. `gitmoot org directive cancel <id> [--by <role>] [--home
 from `--by` or `GITMOOT_ORG_ROLE`; missing identity fails closed. They append
 typed markers to the directive's workflow journal.
 
+`gitmoot org directive done <id> [--by <role>] [--home <dir>]` records
+COMPLETION and ends the obligation, including its TTL nudges. **Completion
+authority is the target subtree**: the addressed role, or a role below it in the
+chart — someone who plausibly did the work.
+
+**Ancestors cannot complete, and that exclusion is the point.** `send` requires
+the sender to be an ancestor of the target, so permitting ancestors would permit
+the sender under another name: a role could issue a directive and then certify
+its own work as done. Ancestors are not stranded — they hold `cancel`, and the
+two verbs assert different things. **Completion says the work happened;
+cancellation says it is no longer needed.**
+
+So the three verbs carry three different disciplines: `ack` is the target or an
+ancestor, `cancel` is the sender, and `done` is the target subtree.
+
+A completed directive stops being outstanding even when no acknowledgment was
+ever recorded, since completion is strictly stronger than receipt.
+
+The directive TTL checker nudges each phase on its own finite ladder. The
+acknowledgment phase counts with `directive_nudge_count` and the completion
+phase with `directive_done_nudge_count`, because the first counter is cumulative
+and never resets at acknowledgment, so one counter cannot bound both phases.
+Each phase caps at `directive_max_nudges`, emits **one** terminal escalation
+naming which obligation went unmet, and then stamps `directive_exhausted_at`.
+
+Exhaustion is terminal and leaves two records: `directive_exhausted_at` on the
+directive row for the evaluator's own reads, and an `[org:directive-exhausted ]`
+**marker note** in the directive's workflow journal. The marker is what makes the
+terminal state discoverable — ack, cancel and done are all marker notes, and the
+journal is what operator-facing readers consume, so a column-only terminal state
+would have been invisible to exactly the person who needs it.
+
+The stamp is **completion-phase only**. An acknowledgment ladder that exhausts
+does not terminate the directive: a late acknowledgment starts a fresh completion
+ladder, and the acknowledgment phase's own terminal condition is its counter
+reaching the cap. Both the evaluator and the atomic completion claim refuse an
+exhausted row, so a racing sweep cannot walk the terminal state back.
+
+The sweep window is sized from the count of currently open obligations rather
+than a fixed oldest-N, so a backlog of long-lived directives can no longer starve
+newer ones out of the window. TTL nags are delivered through the durable wake
+outbox with coalescing, like blocked and escalation wakes, rather than one live
+prompt per due directive per sweep.
+
 The daemon evaluates directive TTLs on the existing one-minute org supervision
 lane. `[org].directive_ack_ttl` defaults to `10m`,
 `[org].directive_done_ttl` defaults to `0s` (completion nudges off), and
@@ -11271,6 +11423,26 @@ precedence over the global value. Typed completion or cancellation receipts
 close the evaluator obligation. With no enabled org event rules, the lane is
 config-inert: it performs no directive scan and emits nothing.
 
+`gitmoot org await review --repo <owner/repo> --pr <number> --head <sha> --ttl
+<duration> [--role <role>] [--home <dir>]` registers a bounded durable interest
+in a review verdict. `--role` defaults to `GITMOOT_ORG_ROLE`; the role must exist
+in the organization chart, `--ttl` is mandatory, and the exact head SHA is part
+of the canonical subject key. Registration inserts the interest and rechecks
+already-committed review jobs in one transaction, so a verdict that lands while
+registration is starting is not missed. A later terminal review-job commit
+satisfies only the matching repository, PR, and head, then writes an addressed
+`fact:<role>` wake obligation.
+
+`gitmoot org await list [--role <role>] [--state waiting|satisfied|expired]
+[--json] [--home <dir>]` shows live and terminal subscriptions. The existing
+one-minute org supervision lane expires overdue waits, retains the row as a
+queryable `expired` terminal state, and addresses the expiry to the waiter's
+current parent (or the waiter itself for a root role). If the waiter role was
+removed from the chart, expiry still becomes terminal and the wake retains the
+removed role as its exact address, leaving delivery failure observable instead
+of making the wait immortal. Fact wakes are delivery only: they require a `fact`
+event rule but create no acknowledgment or completion ceremony.
+
 Event-rule wakes are separately opt-in:
 
 ```sh
@@ -11279,6 +11451,7 @@ gitmoot org events rule add --on blocked --repo tendwire --wake maintainer
 gitmoot org events rule add --on pane_input_pending --wake maintainer
 gitmoot org events rule add --on reply --wake maintainer
 gitmoot org events rule add --on directive --wake maintainer
+gitmoot org events rule add --on fact --wake maintainer
 gitmoot org events rule add --on reply --wake operator --scope observer
 gitmoot org events rule list
 gitmoot org events rule set-scope --home /alternate/home <rule-id> observer
@@ -11286,13 +11459,13 @@ gitmoot org events rule rm --home /alternate/home <rule-id>
 ```
 
 `--on` accepts `escalation`, `attention`, `guard`, `job-terminal`, `blocked`,
-`recycle-overdue`, `pane_input_pending`, `reply`, or `directive`. `pane_input_pending` matches the
+`recycle-overdue`, `pane_input_pending`, `reply`, `directive`, or `fact`. `pane_input_pending` matches the
 `org.input_pending` event emitted when Herdr continuously reports
 `input_pending: true` for a role's pane longer than
 `[orchestrate].blocked_role_wake_after`; it re-nudges at most once per that
 interval while the dialog remains pending. The pending signal takes precedence
 over the pane's last `idle` or `working` activity status.
-`reply`, `blocked`, and `escalation` wakes use the durable wake outbox.
+`reply`, `blocked`, `escalation`, and `fact` wakes use the durable wake outbox.
 `reply` matches workflow notes and `kind=chat` messages addressed to the same
 role as `--wake`; non-triggering chat back-links such as `job_result` are
 excluded. Reply rows commit atomically with their source note or chat message.
@@ -11480,6 +11653,7 @@ Start a task in its dedicated branch worktree and inspect task state:
 gitmoot task run task-001 --repo owner/repo --owner lead --base main
 gitmoot task list --repo owner/repo
 gitmoot task list --repo owner/repo --state implementing --json
+gitmoot task list --repo owner/repo --state stranded --json
 gitmoot task dismiss task-001 --reason "abandoned experiment"
 gitmoot task resume-work task-001 --reason "review requires another fix pass"
 gitmoot task resume-work task-001 --reason "withdraw pending merge" --override-pending-human-decision
@@ -11498,6 +11672,16 @@ the task worktree also blocks dismissal. The default reason is `dismissed by
 operator`. Success preserves the branch and worktree, releases the branch lock
 best-effort, and appends `task_dismissed_manual` to `task events`. Repeating the
 command is an exit-0 no-op with `changed:false` in JSON.
+
+Past `[workflow].stale_task_ttl`, blocked tasks are disposed by forge evidence:
+own merged PR (`merged`), later merged work on the same referenced issue
+(`superseded`), closed subject (`superseded`), then the bounded `stranded`
+fallback. The JSON list includes `disposal_tier`, `disposal_reason`,
+`disposed_at`, and `disposal_escalation_role`. The pass never uses branch
+ancestry, and an open `awaiting_human_merge` PR is not inferred complete.
+Blocked-task alerts have their own finite ladder: after three interval-spaced
+nudges Gitmoot emits one terminal escalation and stops nagging. The task remains
+queryable until the separate evidence-disposal pass transitions it.
 
 `task resume-work` is the explicit coordinator-only path for taking an orphaned
 `reviewing` or `ready_to_merge` task back into development, or for withdrawing a
@@ -11612,6 +11796,46 @@ retry|continue|abort|answer` resumes a delegation tree paused by
 `escalate_human` or an ask-gate `human_questions` pause — see
 `references/RESULT_CONTRACT.md` for the pause/resume semantics (`answer` is
 PR-comment-only).
+
+Before parsing, Gitmoot removes triple-backtick and tilde fenced code blocks and
+closed inline backtick spans (including single-backtick spans).
+
+**Symptom: my command in a bulleted list did nothing.** Any command line
+indented by four spaces or a tab is treated as code and will not run, including
+list-item continuation under a bullet or numbered item. For example, this
+command is ignored:
+
+```text
+- Please run:
+
+    @helper ask check the build
+```
+
+Put the command at column zero to run it:
+
+```text
+@helper ask check the build
+```
+
+GitHub must then
+report that the comment author currently has `write`, `maintain`, or `admin`
+repository permission; unauthorized addressed commands are rejected without
+parsing their command text. Ordinary prose and code examples produce no reply.
+An authorized malformed command still produces a visible routing error. An
+unclosed fenced code block treats the remainder of the comment as code, so any
+later command is ignored without a reply.
+
+On a **pull request**, a line that is addressed by shape but names an action
+Gitmoot does not implement produces **no reply** — it is recorded in the daemon
+log instead. Source code reaches this path routinely, because a decorator or
+attribute line such as `@Published private(set) var state = .uninitialized`
+matches the `@<agent> <action>` mention form outside a code fence. A
+*recognized* action given a bad argument (for example `@helper retry` with no
+job id) still replies, so genuine command feedback is preserved.
+
+On an **issue**, only `ask` is acted on, so any other action — recognized or
+not — is dropped before dispatch with no reply **and no log entry**. When an
+issue comment appears to have been ignored, the daemon log will not explain it.
 
 ## Jobs And Locks
 
@@ -11934,7 +12158,8 @@ the CLI process crashed, exited non-zero, was signal-killed, or completed but
 never emitted a valid envelope even after repair attempts — the job records
 **failure diagnostics** (#806): a `phase` marker (`launched` = died before any
 stdout, `streaming` = died mid-output, `result-parse` = every delivery completed
-but no valid envelope was found), the process `exit_code` **or** terminating
+but no valid envelope was found, `recovery` = daemon recovery proved the durable
+runner was gone), the process `exit_code` **or** terminating
 `signal`, a **redacted** stderr tail (hard-capped at 4 KB; redaction runs over
 the full text with the same token-redaction rules as job comments *before* the
 tail is cut, so a secret can never leak partially), and the runtime session id
@@ -11969,12 +12194,28 @@ The staleness age leg is tunable via the
 `GITMOOT_STALE_RUNNING_AFTER` env var; the smallest honored value is 1m —
 below-1m, malformed, or non-positive values are rejected (with a one-time
 warning) in favor of the 30m default rather than clamped (#560). It is a crash
-backstop, not a kill deadline. After a **reboot** there is
-no wait at all — the daemon detects the changed kernel boot id and, on its next
-startup and every tick, immediately requeues every job claimed on a previous boot
-and reclaims its stranded `runtime:<rt>:<session>` lock, regardless of any
-unexpired lease (Linux only; elsewhere recovery falls back to the lease/age window;
-#651).
+backstop, not a kill deadline.
+
+### Migration note: daemon recovery now fails interrupted jobs
+
+As of #1308, daemon-owned jobs recovered after a restart are **failed, never
+silently requeued**. A changed Linux boot id, an expired runtime-session lease,
+or the three-leg stale liveness predicate produces a `job_recovery_failed` event
+that names the cause and recovery age since the row's last durable update and
+carries the redacted last 4 KB of the retained job log when available. A startup
+row with `job_kill_pending` but no
+terminal event is likewise failed with the explicit reason `daemon died
+mid-kill`. Inspect the evidence, then use `gitmoot job retry <job-id>` when a
+rerun is appropriate. `session-*` jobs are unchanged because they execute
+outside the daemon.
+
+**Configuration audit:** this migration makes no new config value load-bearing.
+`GITMOOT_STALE_RUNNING_AFTER` still controls the age leg and
+`[daemon].quiet_kill_after` still controls the byte-silence leg; only the final
+recovery action changed from implicit requeue to evidence-bearing failure. After
+a reboot there is no age wait: the daemon detects the changed kernel boot id on
+startup and each recovery sweep (Linux only; other platforms use lease/age
+recovery).
 
 `gitmoot job cancel <job-id>` is the single-job **abandon** verb. It dismisses a
 `queued`, `running`, **or `blocked`** job (a blocked job is one paused awaiting a
@@ -13887,6 +14128,7 @@ gitmoot workflow describe release-42 "Validate and ship release 42."
 gitmoot workflow note release-42 "Kickoff." --author operator --status "Release checks running"
 gitmoot workflow note release-42 "Canary passed." --author operator --remember
 gitmoot workflow show release-42
+gitmoot workflow close release-42 --reason "Release 42 shipped and verified."
 ```
 
 `description` is the stable human "what/why" line. Gitmoot seeds it on the first
@@ -13967,6 +14209,21 @@ gitmoot agent doctor reviewer
 /gitmoot reviewer review
 ```
 
+Gitmoot removes triple-backtick and tilde fenced code blocks plus closed inline
+backtick spans before considering comment commands. It then verifies through
+GitHub that the comment author currently has `write`, `maintain`, or `admin`
+permission on the repository before the remaining command text reaches the
+parser. Ordinary prose and code examples produce no Gitmoot reply; a malformed
+command from an authorized author produces a visible routing error. On a pull
+request, a line that is addressed by shape but names an unimplemented action —
+as source code does routinely, since `@Published private(set) var state =
+.uninitialized` matches the `@<agent> <action>` form — produces no reply at all
+and is logged instead, while a recognized action with a bad argument still
+replies. On an issue only `ask` is acted on, so any other action is dropped
+before dispatch with no reply and no log entry. An unclosed
+fenced code block treats the remainder of the comment as code, so any later
+command is ignored without a reply.
+
 ```sh
 gitmoot job list --repo owner/repo
 gitmoot job show <job-id>
@@ -14028,6 +14285,56 @@ Use the Gitmoot planner here. Write a task-by-task implementation plan for this 
 
 If the user asks for a standard goal file, read the canonical goal template and
 write the goal file. Do not create a goal file unless explicitly requested.
+
+## Plan-Gated Implement
+
+Gate implementation on an approved plan when the change is non-trivial. The
+gate composes existing primitives — an ask job, a workflow note, an org
+directive — so it works unchanged on Codex, Claude, and Kimi seats, and the
+approval survives restarts because every step is durable state rather than
+conversation.
+
+```sh
+# 1. Plan, read-only. No file changes, no implement dispatches.
+gitmoot agent ask planner-agent --repo owner/repo --workflow feature-42 \
+  "Write a task-by-task implementation plan for <feature>."
+
+# 2. Record the plan. The printed entry id is the plan-id.
+gitmoot workflow note feature-42 "PLAN: <the complete plan text>"
+# The note must contain the complete plan — it is the text the approval
+# binds to and the fence the implementer is held inside.
+# -> noted workflow feature-42 as entry 1234
+
+# 3. Approve explicitly (org mode). Approval never comes from silence:
+#    the directive is tracked, TTL-nudged, and visible until completed.
+GITMOOT_ORG_ROLE=<approver-role> gitmoot org directive send \
+  --to implementer-role --workflow feature-42 \
+  "approved: implement plan 1234 as written; the plan is the scope fence"
+
+# 4. Implement, quoting the approved plan-id.
+gitmoot agent implement builder --repo owner/repo --workflow feature-42 \
+  "Implement plan 1234 (workflow note in feature-42). Stay inside it; work
+   outside the plan needs an amended plan and a fresh approval."
+
+# 5. Completion ends the obligation; merge closes the workflow — in this
+#    order: a `done` posted after `close` reopens the workflow, because
+#    any note into a closed workflow does.
+gitmoot org directive done <directive-id> --by implementer-role
+gitmoot workflow close feature-42 --reason "Plan 1234 implemented and merged."
+```
+
+Outside org mode, step 3 is an explicit human approval message referencing the
+plan-id; the rest is unchanged. A coordinator may waive the gate for trivial
+mechanical fixes by writing "plan-waived" in the dispatch prompt — the waiver
+is deliberate and visible, never implied. Under this convention every
+implement dispatch prompt carries either a plan-id or the literal
+"plan-waived"; a dispatch with neither is out of contract. Prefer this
+durable handshake over an
+interactive plan-approval prompt for any unattended seat: a session blocked on
+an in-pane approval modal reports idle, runs no job, and escalates nothing, so
+every fleet channel reads it as healthy while it waits. The `planner` template knows this
+handshake: in coordinator mode it posts its plan as a workflow note, reports
+the plan-id, and stops until an approval referencing that id arrives.
 
 ## Current-Chat Custom Agent Prompt
 
@@ -14583,7 +14890,7 @@ released best-effort. Manual and daemon transitions are audited as
 `task_dismissed_manual` and `task_dismissed_auto` in `gitmoot task events <id>`.
 
 Each repo poll reads a bounded oldest-first stale window and processes up to 20
-qualifying `implementing`/`blocked` tasks whose `updated_at` predates
+qualifying `implementing` tasks whose `updated_at` predates
 `[workflow].stale_task_ttl` (default `168h`; `"0"` disables the leg).
 `updated_at` is deliberately a conservative activity proxy, not proof of
 abandonment. A candidate is skipped for a live job, a same-repo open-PR branch,
@@ -14592,6 +14899,22 @@ mutation. A branchless candidate needs no remote lookup. Explicit `task
 recover` restores preserved artifacts through `implementing` to `pr_open`, or
 restores a branchless task to `planned`; job retry records its own recovery
 event. The server-side task board omits dismissed rows immediately.
+
+`blocked` and `awaiting_human_merge` use a separate evidence-based disposal
+ladder at that TTL: own PR merged -> `merged`; a later merged task/PR on the same
+referenced issue -> `superseded`; referenced issue/PR closed -> `superseded`;
+otherwise -> terminal `stranded`. Git ancestry is never evidence because a
+superseding branch need not be an ancestor of main. An open
+`awaiting_human_merge` PR stays protected and reaches `stranded` for human
+inspection. Every outcome records its tier and reason on the task; the stranded
+fallback writes at most one durable escalation, and an unavailable route is
+recorded without keeping the task alive. Query with `gitmoot task list --state
+stranded --json`.
+
+The periodic blocked-task alert is bounded independently: three
+interval-separated nudges, one terminal escalation, then no further alerts for
+that episode. Its persisted exhausted stamp does not dispose the task; disposal
+still requires the evidence ladder or its TTL fallback.
 
 Delegation worktrees use a separate default-on retention policy:
 `[workflow].delegation_worktree_ttl = "72h"` (`"0"` disables it). Only final
@@ -14628,6 +14951,13 @@ without widening the predicate shared by `task recover`; review/merge states,
 branch mismatches, dirty/live worktrees, active implement jobs, and foreign
 branch locks still fail closed. The job keeps the PR number so finalization
 adopts the existing PR.
+
+Fresh implementation PRs opened by the engine are drafts by default. Dispatch
+with `--ready` only when the PR should enter review and merge-gate processing
+immediately; `--draft` records the default intent explicitly. While the forge
+reports the PR as draft, Gitmoot leaves the task in its current lifecycle state
+instead of parking it at `awaiting_human_merge`: a draft is an author hold, not
+a pending human merge decision.
 
 The daemon default is `--workers 1`. Users can raise it when jobs target
 different runtime sessions, managed agent types with `max_background` greater
@@ -15574,6 +15904,15 @@ not escalate. A human GitHub merge is reconciled normally, while `@gitmoot merge
 is an explicit authorized merge request. Turning `auto_merge` back on re-arms
 only tasks parked for this exact kill-switch reason.
 Pipeline `allow_auto_merge` remains a separate double-keyed mechanism.
+
+When review independence cannot be verified, the merge gate names the evidence
+it observed: no implement job for the task, implement jobs that do not match the
+task identity, a matching implement job with no agent, or a malformed implement
+payload. All four remain fail-closed. For the no-job case, use the **coordinator
+bridge**: inspect the engine review job with `gitmoot job show <job-id>` and
+confirm its agent and decision at the exact head, confirm the implementer from
+the pane session, then journal both facts with `gitmoot workflow note`. That
+journal is an operator record only; it is not an attestation or merge-gate input.
 
 ### No external CI: grace window, not instant pass (#596)
 
