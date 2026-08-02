@@ -709,7 +709,7 @@ func prepareLocalReviewWorktree(ctx context.Context, store *db.Store, record db.
 	}
 	taskID := strings.TrimSpace(request.TaskID)
 	if taskID == "" {
-		taskID = fmt.Sprintf("review-pr-%d-%s", request.PullRequest, shortHash(repo.FullName()+"\x00"+request.HeadSHA))
+		taskID = fmt.Sprintf("review-pr-%d-%s", request.PullRequest, shortHash(repo.FullName()))
 	}
 	if existing, err := store.GetTask(ctx, taskID); err == nil {
 		if existing.State == string(workflow.TaskDismissed) {
