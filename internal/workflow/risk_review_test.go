@@ -6,6 +6,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/gitmoot/gitmoot/internal/db"
 )
 
 func highRiskEvent() PullRequestEvent {
@@ -81,6 +83,38 @@ func TestHighRiskPRFansOutLensReviewers(t *testing.T) {
 	// The single-review job the routine path would have created must NOT exist.
 	if jobExists(t, store, "review-audit-task-7-review-1") {
 		t.Fatal("high-risk path must NOT enqueue the single native review job")
+	}
+}
+
+// TestHighRiskReviewLoopBlocksBeforeCoordinator kills a guard placed below the
+// risk-tier diversion. A stable exact-head verdict must block before either the
+// synthetic coordinator or any lens review job is created.
+func TestHighRiskReviewLoopBlocksBeforeCoordinator(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "sec", []string{"review"}, "gitmoot/gitmoot")
+	insertCompletedJob(t, store, db.Job{ID: "prior-high-risk-review", Agent: "audit", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, HeadSHA: "high-head",
+		TaskID: "task-7", ReviewRound: "review-1", Result: &AgentResult{Decision: "changes_requested"},
+	})
+	engine := testEngine(store)
+	engine.RiskTiersEnabled = true
+	event := highRiskEvent()
+	event.HeadSHA = "high-head"
+	before := reviewJobCount(t, store)
+
+	err := engine.HandlePullRequestOpened(ctx, event)
+	var blocked BlockedError
+	if !errors.As(err, &blocked) || !strings.Contains(blocked.Reason, "review loop detected") {
+		t.Fatalf("error = %v, want review-loop BlockedError", err)
+	}
+	if got := reviewJobCount(t, store); got != before {
+		t.Fatalf("review job count = %d, want unchanged %d", got, before)
+	}
+	if jobExists(t, store, "review-coordinator/task-7/review-1") {
+		t.Fatal("high-risk coordinator was created before review-loop refusal")
 	}
 }
 

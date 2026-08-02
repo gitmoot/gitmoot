@@ -595,7 +595,7 @@ func isTerminalJobEvent(kind string) bool {
 func isPriorityDiagnosticEvent(kind string) bool {
 	switch strings.TrimSpace(kind) {
 	case "malformed_output", "repair_retry", "permission_blocked", "comment_post_failed",
-		"advance_blocked", "advance_retry", "runtime_lock_wait", "cancel_settled":
+		"advance_blocked", "advance_retry", "runtime_lock_wait", "cancel_settled", "review_loop_detected":
 		return true
 	default:
 		return false
@@ -606,7 +606,7 @@ func isDiagnosticEvent(kind string) bool {
 	switch strings.TrimSpace(kind) {
 	case string(workflow.JobFailed), string(workflow.JobBlocked), string(workflow.JobCancelled),
 		"malformed_output", "repair_retry", "permission_blocked", "comment_post_failed",
-		"advance_blocked", "advance_retry", "runtime_lock_wait", "cancel_settled":
+		"advance_blocked", "advance_retry", "runtime_lock_wait", "cancel_settled", "review_loop_detected":
 		return true
 	default:
 		return strings.Contains(kind, "fail") || strings.Contains(kind, "error") || strings.Contains(kind, "blocked")

@@ -2445,7 +2445,7 @@ func (w jobWorker) jobNeedsAdvanceRetry(ctx context.Context, jobID string) (bool
 		switch event.Kind {
 		case "advance_started", "advance_retry":
 			needsRetry = true
-		case "advance_completed", "advance_retried", "advance_blocked", "advance_retry_skipped":
+		case "advance_completed", "advance_retried", "advance_blocked", "advance_retry_skipped", workflow.ReviewLoopDetectedEventKind:
 			needsRetry = false
 		case "retry_queued":
 			needsRetry = false

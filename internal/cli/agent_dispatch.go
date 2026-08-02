@@ -664,18 +664,22 @@ func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, rec
 	if request.PullRequest <= 0 {
 		return localAgentDispatchRequest{}, "", errors.New("agent review requires --pr number")
 	}
-	if strings.TrimSpace(request.Branch) != "" && strings.TrimSpace(request.HeadSHA) != "" {
-		return prepareLocalReviewWorktree(ctx, store, record, repo, request)
+	if strings.TrimSpace(request.Branch) == "" || strings.TrimSpace(request.HeadSHA) == "" {
+		pr, err := newAgentDispatchGitHubClient(record.CheckoutPath).GetPullRequest(ctx, repo, int64(request.PullRequest))
+		if err != nil {
+			return localAgentDispatchRequest{}, "", fmt.Errorf("resolve pull request #%d: %w", request.PullRequest, err)
+		}
+		if strings.TrimSpace(request.Branch) == "" {
+			request.Branch = pr.HeadRef
+		}
+		if strings.TrimSpace(request.HeadSHA) == "" {
+			request.HeadSHA = pr.HeadSHA
+		}
 	}
-	pr, err := newAgentDispatchGitHubClient(record.CheckoutPath).GetPullRequest(ctx, repo, int64(request.PullRequest))
-	if err != nil {
-		return localAgentDispatchRequest{}, "", fmt.Errorf("resolve pull request #%d: %w", request.PullRequest, err)
-	}
-	if strings.TrimSpace(request.Branch) == "" {
-		request.Branch = pr.HeadRef
-	}
-	if strings.TrimSpace(request.HeadSHA) == "" {
-		request.HeadSHA = pr.HeadSHA
+	if match, detected, err := workflow.DetectReviewLoop(ctx, store, repo.FullName(), request.PullRequest, request.HeadSHA); err != nil {
+		return localAgentDispatchRequest{}, "", err
+	} else if detected {
+		return localAgentDispatchRequest{}, "", errors.New(match.Reason())
 	}
 	return prepareLocalReviewWorktree(ctx, store, record, repo, request)
 }

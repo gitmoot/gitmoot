@@ -102,6 +102,19 @@ gitmoot agent start reviewer --runtime codex --repo owner/repo --role reviewer -
 gitmoot agent doctor reviewer
 ```
 
+Local `agent review` / review-resolved `agent run` and native engine review
+fan-out enforce an exact-head loop guard before a new review job or review
+worktree is created. A
+homogeneous succeeded decision history for `(repo, PR, head_sha)` is refused and
+emits one `review_loop_detected` event on the matched succeeded job; the CLI
+hard-errors while the engine blocks the task. A new commit or mixed decisions at
+one head proceeds. The loop guard permits an empty engine event only before any
+succeeded history exists; local CLI preparation still requires a concrete head.
+The old verdict is evidence for escalation, never a cached response.
+This exact decision-bearing key replaces no round counter: #1419's panel
+explicitly rejected that instrument. Direct PR-comment ingress is unchanged in
+this safe half and remains #1433 work.
+
 ## Review Agent From A PR Comment
 
 1. Register a reviewer agent for the target repo.
