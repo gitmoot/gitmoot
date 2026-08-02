@@ -155,7 +155,7 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	}
 	headSHA := strings.TrimSpace(pr.HeadSHA)
 	if headSHA == "" {
-		return g.gateMiss(PlainReason("pull request head SHA is missing")), nil
+		return g.gateMiss(GateMissReason("merge gate", "pull request head SHA is missing", "")), nil
 	}
 	if !pullRequestMerged(pr) && strings.TrimSpace(pr.State) != "closed" {
 		pendingDecision, isPending, reason, err := g.reviewAndCIGateMiss(ctx, repo, request, headSHA)
@@ -252,7 +252,11 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 }
 
 func (g PolicyMergeGate) gateMiss(reason MergeReason) MergeDecision {
-	return MergeDecision{LeaveOpen: true, EscalateMergeGateMiss: true, Reason: reason}
+	// The kind IS the escalation signal: a gate miss escalates because it is one.
+	// EscalateMergeGateMiss used to say the same thing a second time, and at :158 the
+	// two had already drifted apart -- which is what two representations of one fact
+	// always eventually do (#1381).
+	return MergeDecision{LeaveOpen: true, Reason: reason}
 }
 
 // reviewAndCIGateMiss evaluates the exact-head review-clean and CI-green gate,

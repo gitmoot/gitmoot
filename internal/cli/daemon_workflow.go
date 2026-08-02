@@ -653,7 +653,7 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 	// never sees the driver. Keep it that way: never call the gate from within a
 	// still-running job's own execution.
 	decision, err := gate.Evaluate(ctx, request)
-	if err != nil || !decision.EscalateMergeGateMiss {
+	if err != nil || !decision.Reason.IsGateMiss() {
 		return decision, err
 	}
 	if err := g.escalateMergeGateMiss(ctx, request, decision.Reason); err != nil {
@@ -666,6 +666,12 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 // site, so it takes the MergeReason VALUE and performs the single Render itself -- the caller
 // never holds prose it could append to (#1381, site 7 of the append class).
 func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request workflow.MergeRequest, reason workflow.MergeReason) error {
+	// Never escalate an empty operator instruction. FormatOrgEscalateNote renders a
+	// blank body as a valid header-only note, so a zero reason reaching here becomes a
+	// durable escalation that tells the operator nothing (#1381 P1b).
+	if reason.IsZero() {
+		return errors.New("merge-gate escalation requires a reason; refusing to journal an empty operator instruction")
+	}
 	label := strings.TrimSpace(request.WorkflowID)
 	if label == "" {
 		resolved, err := g.Store.WorkflowIDForPullRequest(ctx, request.Repo, request.PullRequest, request.Branch)

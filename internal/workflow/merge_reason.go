@@ -64,7 +64,18 @@ func (r MergeReason) WithGateMiss(gate, cause, head string) MergeReason {
 		head:  strings.TrimSpace(head),
 	}
 	if miss.gate == "" && miss.cause == "" {
-		return r
+		// A blank gate AND blank cause is a CALLER DEFECT, not a value. Silently
+		// returning the receiver produced a zero MergeReason that rendered to "",
+		// which daemon_workflow accepted and FormatOrgEscalateNote turned into a
+		// header-only escalation -- an EMPTY operator instruction. This type exists to
+		// stop text being appended to an operator instruction; shipping a path where
+		// the instruction can be empty is the same defect pointed the other way.
+		//
+		// Refuse loudly here rather than relying on producers happening to pass
+		// nonblank labels. That accidental safety is exactly what this campaign has
+		// spent the day removing: a property nobody chose, no test protects, and the
+		// next producer breaks without noticing.
+		panic("workflow: MergeReason.WithGateMiss requires a gate or a cause; an all-blank miss is a caller defect")
 	}
 	next := MergeReason{plain: r.plain, misses: make([]gateMiss, 0, len(r.misses)+1)}
 	next.misses = append(next.misses, r.misses...)

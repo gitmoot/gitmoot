@@ -73,9 +73,9 @@ func TestC1MeasurementEngineDispatchedImplementerIdentity(t *testing.T) {
 func observedC1ImplementerResolution(t *testing.T, decision workflow.MergeDecision) (int, bool) {
 	t.Helper()
 	switch {
-	case decision.Ready && decision.Merged && !decision.LeaveOpen && !decision.EscalateMergeGateMiss && !decision.Deferred:
+	case decision.Ready && decision.Merged && !decision.LeaveOpen && !decision.Reason.IsGateMiss() && !decision.Deferred:
 		return 1, false
-	case !decision.Ready && !decision.Merged && decision.LeaveOpen && decision.EscalateMergeGateMiss && !decision.Deferred:
+	case !decision.Ready && !decision.Merged && decision.LeaveOpen && decision.Reason.IsGateMiss() && !decision.Deferred:
 		return 0, true
 	default:
 		t.Fatalf("gate decision did not expose a structured implementer-resolution outcome: %+v", decision)

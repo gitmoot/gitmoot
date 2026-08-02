@@ -145,7 +145,7 @@ scope = ["owner/repo"]
 		if err != nil {
 			t.Fatalf("Evaluate attempt %d: %v", attempt+1, err)
 		}
-		if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || !strings.Contains(decision.Reason.Render(), "final agent review is not captured") {
+		if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || !strings.Contains(decision.Reason.Render(), "final agent review is not captured") {
 			t.Fatalf("decision = %+v", decision)
 		}
 	}
@@ -176,7 +176,7 @@ func TestDaemonMergeGateKillSwitchDoesNotEscalate(t *testing.T) {
 		t.Fatal(err)
 	}
 	decision, err := (daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout, Home: paths.Home}).Evaluate(context.Background(), request)
-	if err != nil || !decision.LeaveOpen || decision.EscalateMergeGateMiss {
+	if err != nil || !decision.LeaveOpen || decision.Reason.IsGateMiss() {
 		t.Fatalf("decision = %+v, err=%v", decision, err)
 	}
 	notes, err := store.ListWorkflowNotes(context.Background(), request.WorkflowID, 0)
