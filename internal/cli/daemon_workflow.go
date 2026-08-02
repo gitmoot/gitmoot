@@ -305,17 +305,17 @@ func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Contex
 		return workflow.JobPayload{}, errors.New("implementation finalizer store is required")
 	}
 	if strings.TrimSpace(payload.TaskID) == "" {
-		return payload, workflow.BlockedError{Reason: "implemented job has no task id; cannot finalize branch and PR"}
+		return payload, blockedResultDelivery("implemented job has no task id; cannot finalize branch and PR")
 	}
 	task, err := f.Store.GetTask(ctx, payload.TaskID)
 	if err != nil {
 		return payload, fmt.Errorf("load task %s for implementation finalizer: %w", payload.TaskID, err)
 	}
 	if strings.TrimSpace(task.WorktreePath) == "" {
-		return payload, workflow.BlockedError{Reason: "implemented task has no worktree path; rerun through gitmoot task run or gitmoot agent implement"}
+		return payload, blockedResultDelivery("implemented task has no worktree path; rerun through gitmoot task run or gitmoot agent implement")
 	}
 	if strings.TrimSpace(task.Branch) == "" {
-		return payload, workflow.BlockedError{Reason: "implemented task has no branch; cannot push or open PR"}
+		return payload, blockedResultDelivery("implemented task has no branch; cannot push or open PR")
 	}
 	git := gitutil.Client{Dir: task.WorktreePath}
 	branch, err := git.CurrentBranch(ctx)
@@ -323,7 +323,7 @@ func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Contex
 		return payload, fmt.Errorf("resolve implementation branch: %w", err)
 	}
 	if branch != task.Branch {
-		return payload, workflow.BlockedError{Reason: fmt.Sprintf("implemented task worktree is on branch %s, not %s", branch, task.Branch)}
+		return payload, blockedResultDelivery(fmt.Sprintf("implemented task worktree is on branch %s, not %s", branch, task.Branch))
 	}
 	validatedPR, hasValidatedPR, err := f.revalidateImplementationPullRequest(ctx, payload, task)
 	if err != nil {
@@ -361,12 +361,12 @@ func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Contex
 				payload.Branch = task.Branch
 				return payload, nil
 			}
-			return payload, workflow.BlockedError{Reason: "implemented job produced no changes in the task worktree"}
+			return payload, blockedResultDelivery("implemented job produced no changes in the task worktree")
 		}
 	} else {
 		message := "Gitmoot implement " + task.ID
 		if err := git.CommitAll(ctx, message); err != nil {
-			return payload, workflow.BlockedError{Reason: "commit implementation changes failed: " + err.Error()}
+			return payload, blockedResultDelivery("commit implementation changes failed: " + err.Error())
 		}
 	}
 	head, err := git.HeadSHA(ctx)
@@ -374,7 +374,7 @@ func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Contex
 		return payload, fmt.Errorf("resolve implementation head after commit: %w", err)
 	}
 	if err := git.PushBranch(ctx, "origin", task.Branch); err != nil {
-		return payload, workflow.BlockedError{Reason: "push implementation branch failed: " + err.Error()}
+		return payload, blockedResultDelivery("push implementation branch failed: " + err.Error())
 	}
 	if hasValidatedPR {
 		return f.adoptValidatedImplementationPullRequest(ctx, payload, task, validatedPR, head)
@@ -422,7 +422,7 @@ func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Contex
 		Base:  base,
 	})
 	if err != nil {
-		return payload, workflow.BlockedError{Reason: "open implementation PR failed: " + err.Error()}
+		return payload, blockedResultDelivery("open implementation PR failed: " + err.Error())
 	}
 	payload.PullRequest = int(pr.Number)
 	payload.Branch = task.Branch
@@ -462,7 +462,7 @@ func (f daemonImplementationFinalizer) revalidateImplementationPullRequest(ctx c
 		return github.PullRequest{}, false, nil
 	}
 	if payload.PullRequest <= 0 {
-		return github.PullRequest{}, false, workflow.BlockedError{Reason: "validated implementation payload has no pull request number"}
+		return github.PullRequest{}, false, blockedResultDelivery("validated implementation payload has no pull request number")
 	}
 	repo, err := daemon.ParseRepository(payload.Repo)
 	if err != nil {
@@ -473,18 +473,22 @@ func (f daemonImplementationFinalizer) revalidateImplementationPullRequest(ctx c
 		return github.PullRequest{}, false, fmt.Errorf("revalidate fix-pass pull request #%d: %w", payload.PullRequest, err)
 	}
 	if pr.Number != int64(payload.PullRequest) {
-		return github.PullRequest{}, false, workflow.BlockedError{Reason: fmt.Sprintf("fix-pass pull request revalidation returned #%d, want #%d", pr.Number, payload.PullRequest)}
+		return github.PullRequest{}, false, blockedResultDelivery(fmt.Sprintf("fix-pass pull request revalidation returned #%d, want #%d", pr.Number, payload.PullRequest))
 	}
 	if pr.Merged || strings.TrimSpace(pr.MergedAt) != "" || !strings.EqualFold(strings.TrimSpace(pr.State), "open") {
-		return github.PullRequest{}, false, workflow.BlockedError{Reason: fmt.Sprintf("fix-pass pull request #%d is no longer open", payload.PullRequest)}
+		return github.PullRequest{}, false, blockedResultDelivery(fmt.Sprintf("fix-pass pull request #%d is no longer open", payload.PullRequest))
 	}
 	if strings.TrimSpace(pr.HeadRef) != task.Branch {
-		return github.PullRequest{}, false, workflow.BlockedError{Reason: fmt.Sprintf("fix-pass pull request #%d now targets head branch %s, not task branch %s", payload.PullRequest, firstNonEmpty(pr.HeadRef, "<missing>"), task.Branch)}
+		return github.PullRequest{}, false, blockedResultDelivery(fmt.Sprintf("fix-pass pull request #%d now targets head branch %s, not task branch %s", payload.PullRequest, firstNonEmpty(pr.HeadRef, "<missing>"), task.Branch))
 	}
 	if headRepo := strings.TrimSpace(pr.HeadRepoFullName); headRepo != "" && !strings.EqualFold(headRepo, payload.Repo) {
-		return github.PullRequest{}, false, workflow.BlockedError{Reason: fmt.Sprintf("fix-pass pull request #%d head belongs to %s, not %s", payload.PullRequest, headRepo, payload.Repo)}
+		return github.PullRequest{}, false, blockedResultDelivery(fmt.Sprintf("fix-pass pull request #%d head belongs to %s, not %s", payload.PullRequest, headRepo, payload.Repo))
 	}
 	return pr, true, nil
+}
+
+func blockedResultDelivery(reason string) workflow.BlockedError {
+	return workflow.BlockedError{Reason: reason, ResultDeliveryFailed: true}
 }
 
 func (f daemonImplementationFinalizer) adoptValidatedImplementationPullRequest(ctx context.Context, payload workflow.JobPayload, task db.Task, pr github.PullRequest, head string) (workflow.JobPayload, error) {

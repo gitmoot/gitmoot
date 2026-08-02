@@ -192,7 +192,7 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, cause er
 		}
 		var blocked workflow.BlockedError
 		if errors.As(cause, &blocked) {
-			return w.settleBlockedAdvancement(ctx, latest.ID, cause)
+			return w.recordBlockedAdvancement(ctx, latest.ID, cause, blocked)
 		}
 		if err := w.recordPostDeliveryWorkflowError(ctx, latest, cause); err != nil {
 			return err
@@ -299,6 +299,13 @@ func (w jobWorker) recordPostDeliveryWorkflowError(ctx context.Context, job db.J
 		"post-delivery workflow error; advancement will retry from stored result: "+cause.Error())
 }
 
+func (w jobWorker) recordBlockedAdvancement(ctx context.Context, jobID string, cause error, blocked workflow.BlockedError) error {
+	if blocked.ResultDeliveryFailed {
+		return w.settleBlockedAdvancement(ctx, jobID, cause)
+	}
+	return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_blocked", Message: cause.Error()})
+}
+
 func (w jobWorker) settleBlockedAdvancement(ctx context.Context, jobID string, cause error) error {
 	message := cause.Error()
 	latest, err := w.Store.GetJob(ctx, jobID)
@@ -369,8 +376,9 @@ func (w jobWorker) postJobResultComment(ctx context.Context, jobID string, agent
 	if err != nil {
 		return err
 	}
+	resultDeliveryBlocked := resultDeliveryFailed(cause) || job.State == string(workflow.JobBlocked) && advanceBlocked
 	diagnostic := jobResultDiagnostic(cause)
-	if diagnostic == "" && (payload.Result == nil || advanceBlocked) {
+	if diagnostic == "" && (payload.Result == nil || resultDeliveryBlocked) {
 		diagnostic = w.storedJobFailureDiagnostic(ctx, job)
 	}
 	body := workflow.RenderJobResultComment(workflow.JobResultComment{
@@ -379,7 +387,7 @@ func (w jobWorker) postJobResultComment(ctx context.Context, jobID string, agent
 		JobID:      job.ID,
 		JobState:   job.State,
 		Payload:    payload,
-		Result:     outwardJobResult(payload.Result, advanceBlocked),
+		Result:     outwardJobResult(payload.Result, resultDeliveryBlocked),
 		Diagnostic: diagnostic,
 	})
 	if _, err := w.CommenterFactory("").PostIssueComment(ctx, repo, int64(payload.PullRequest), body); err != nil {
@@ -531,6 +539,11 @@ func outwardJobResult(result *workflow.AgentResult, advanceBlocked bool) *workfl
 	blocked := *result
 	blocked.Decision = string(workflow.JobBlocked)
 	return &blocked
+}
+
+func resultDeliveryFailed(cause error) bool {
+	var blocked workflow.BlockedError
+	return errors.As(cause, &blocked) && blocked.ResultDeliveryFailed
 }
 
 func (w jobWorker) jobAdvanceBlocked(ctx context.Context, jobID string) (bool, error) {

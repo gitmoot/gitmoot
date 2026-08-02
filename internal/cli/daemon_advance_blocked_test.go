@@ -41,7 +41,7 @@ func TestBlockedAdvancePostsBlockedDecision(t *testing.T) {
 func TestRetryBlockedAdvanceSettlesQueriedJobState(t *testing.T) {
 	job, _, events := runRetryBlockedAdvance(t)
 	if job.State != string(workflow.JobBlocked) {
-		t.Fatalf("queried retry job state = %q, want blocked", job.State)
+		t.Fatalf("queried retry job state = %q, want blocked; events=%+v", job.State, events)
 	}
 	if !daemonWorkerHasEvent(events, "advance_blocked") {
 		t.Fatalf("retry events = %+v, want advance_blocked", events)
@@ -94,11 +94,11 @@ func TestBlockedAdvanceDoesNotAbortQueuedJobPass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetJob(b-healthy) returned error: %v", err)
 	}
-	if blocked.State != string(workflow.JobBlocked) {
-		t.Fatalf("blocked job state = %q, want blocked", blocked.State)
-	}
 	if healthy.State != string(workflow.JobSucceeded) {
 		t.Fatalf("other job state = %q, want succeeded in the same pass (pass error: %v)", healthy.State, runErr)
+	}
+	if blocked.State != string(workflow.JobBlocked) {
+		t.Fatalf("blocked job state = %q, want blocked", blocked.State)
 	}
 	if runErr != nil {
 		t.Fatalf("runQueuedJobsForRepo returned error after processing other jobs: %v", runErr)
@@ -136,20 +136,29 @@ func runRetryBlockedAdvance(t *testing.T) (db.Job, string, []db.JobEvent) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	checkout := t.TempDir()
+	runGit(t, checkout, "init")
+	configureTestGit(t, checkout)
+	if err := os.WriteFile(filepath.Join(checkout, "README.md"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("write retry fixture README: %v", err)
+	}
+	runGit(t, checkout, "add", "README.md")
+	runGit(t, checkout, "commit", "-m", "base")
+	runGit(t, checkout, "branch", "-M", "task-implement")
+	runGit(t, checkout, "remote", "add", "origin", "https://github.com/owner/repo.git")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "reviewer", runtime.ShellRuntime, "unused", []string{"review"}, "owner/repo")
-	if err := store.UpsertTask(ctx, db.Task{ID: "task-review", RepoFullName: "owner/repo", Title: "Review", State: string(workflow.TaskReviewing), Branch: "task-review"}); err != nil {
+	seedDaemonWorkerAgent(t, store, "lead", runtime.ShellRuntime, "unused", []string{"implement"}, "owner/repo")
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-implement", RepoFullName: "owner/repo", Title: "Implement", State: string(workflow.TaskImplementing), Branch: "task-implement", WorktreePath: checkout}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
 	payload, err := json.Marshal(workflow.JobPayload{
-		Repo: "owner/repo", Branch: "task-review", PullRequest: 9, TaskID: "task-review", HeadSHA: strings.Repeat("a", 40),
-		Result: &workflow.AgentResult{Decision: "approved", Summary: "review approved"},
+		Repo: "owner/repo", Branch: "task-implement", PullRequest: 9, TaskID: "task-implement", HeadSHA: strings.Repeat("a", 40),
+		Result: &workflow.AgentResult{Decision: "implemented", Summary: "implementation complete"},
 	})
 	if err != nil {
 		t.Fatalf("Marshal returned error: %v", err)
 	}
-	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "job-retry-blocked", Agent: "reviewer", Type: "review", State: string(workflow.JobSucceeded), Payload: string(payload)}, db.JobEvent{
-		JobID: "job-retry-blocked", Kind: string(workflow.JobSucceeded), Message: "review result stored",
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "job-retry-blocked", Agent: "lead", Type: "implement", State: string(workflow.JobSucceeded), Payload: string(payload)}, db.JobEvent{
+		JobID: "job-retry-blocked", Kind: string(workflow.JobSucceeded), Message: "implementation result stored",
 	}); err != nil {
 		t.Fatalf("CreateJobWithEvent returned error: %v", err)
 	}
@@ -162,13 +171,13 @@ func runRetryBlockedAdvance(t *testing.T) (db.Job, string, []db.JobEvent) {
 		return checkout, nil
 	}
 	worker.WorkflowFactory = func(string) workflow.Engine {
-		return workflow.Engine{Store: store, MergeGate: &cliWorkerFakeMergeGate{err: workflow.BlockedError{Reason: "review advancement blocked"}}}
+		return workflow.Engine{Store: store, ImplementationFinalizer: selectiveBlockedFinalizer{blockedJobID: "job-retry-blocked"}}
 	}
 	worker.CommenterFactory = func(string) github.Client { return comments }
 	if err := retryPendingJobAdvancements(ctx, worker, "", "", nil, newTickCandidates(store)); err != nil {
 		t.Fatalf("retryPendingJobAdvancements returned error: %v", err)
 	}
-	if err := worker.postJobResultComment(ctx, "job-retry-blocked", runtime.Agent{Name: "reviewer", Runtime: runtime.ShellRuntime}, checkout, nil); err != nil {
+	if err := worker.postJobResultComment(ctx, "job-retry-blocked", runtime.Agent{Name: "lead", Runtime: runtime.ShellRuntime}, checkout, nil); err != nil {
 		t.Fatalf("postJobResultComment returned error: %v", err)
 	}
 	job, err := store.GetJob(ctx, "job-retry-blocked")
@@ -187,7 +196,7 @@ func runRetryBlockedAdvance(t *testing.T) (db.Job, string, []db.JobEvent) {
 
 func (f selectiveBlockedFinalizer) FinalizeImplementation(_ context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
 	if job.ID == f.blockedJobID {
-		return payload, workflow.BlockedError{Reason: "push implementation branch failed: non-fast-forward"}
+		return payload, blockedResultDelivery("push implementation branch failed: non-fast-forward")
 	}
 	return payload, nil
 }
