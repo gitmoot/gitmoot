@@ -20,7 +20,7 @@ func TestDispatchPromptHeadWarningReachesOperator(t *testing.T) {
 	seedDaemonWorkerAgent(t, store, "responder", runtime.ShellRuntime, "printf '%s' '{}'", []string{"ask"}, "owner/repo")
 
 	var stdout, stderr bytes.Buffer
-	_, exit := dispatchAgentCommand(agentRunOptions{
+	output, exit := dispatchAgentCommand(agentRunOptions{
 		home:       home,
 		repo:       "owner/repo",
 		agent:      "responder",
@@ -34,10 +34,19 @@ func TestDispatchPromptHeadWarningReachesOperator(t *testing.T) {
 		t.Fatalf("operator warnings = %d, want 1; stderr=%q", got, stderr.String())
 	}
 
-	// AND THE DURABLE SURFACE. stderr reaches only an operator watching the dispatch;
-	// a BACKGROUND job's warning is read later, from job events. Asserting stderr alone
-	// left the emit unguarded: deleting the AddJobEvent call compiled and all four C4a
-	// tests still passed, because DispatchWarning kept stderr intact.
+	// AND THE DURABLE SURFACE, BOUND TO THE JOB THE OPERATOR WAS HANDED. stderr reaches
+	// only someone watching the dispatch; a BACKGROUND job's warning is read later, from
+	// job events -- and the operator finds those events using the JobID this call RETURNED,
+	// which is what the printed `gitmoot job watch <id>` command carries.
+	//
+	// An earlier version queried ListJobs()[0] and discarded the returned output. That made
+	// the assertion true of "some job in the store" rather than of THIS job: a mutant
+	// returning job.ID + "-wrong" persisted the event on the real row, passed, and would
+	// have sent the operator to a job id that does not exist. With one job in the store the
+	// two readings coincide, which is exactly what made the gap invisible.
+	if strings.TrimSpace(output.JobID) == "" {
+		t.Fatal("dispatch returned no JobID, so the operator has no handle to read the durable warning with")
+	}
 	jobs, err := store.ListJobs(context.Background())
 	if err != nil {
 		t.Fatalf("ListJobs returned error: %v", err)
@@ -45,18 +54,33 @@ func TestDispatchPromptHeadWarningReachesOperator(t *testing.T) {
 	if len(jobs) == 0 {
 		t.Fatal("no job was created, so this test cannot observe the durable warning")
 	}
-	events, err := store.ListJobEvents(context.Background(), jobs[0].ID)
+	// The returned handle must name a job that EXISTS. Reading events for an unknown id
+	// returns an empty slice, not an error, so without this the count assertion below would
+	// report "0 events" and read as a missing emit rather than a bad handle.
+	if _, err := store.GetJob(context.Background(), output.JobID); err != nil {
+		t.Fatalf("GetJob(%q) returned error: %v; the returned JobID does not name a real job", output.JobID, err)
+	}
+	events, err := store.ListJobEvents(context.Background(), output.JobID)
 	if err != nil {
 		t.Fatalf("ListJobEvents returned error: %v", err)
 	}
 	durable := 0
+	var durableMessage string
 	for _, event := range events {
 		if event.Kind == "prompt_head_warning" {
 			durable++
+			durableMessage = event.Message
 		}
 	}
 	if durable != 1 {
-		t.Fatalf("durable prompt_head_warning events = %d, want 1; the background operator surface is unguarded", durable)
+		t.Fatalf("durable prompt_head_warning events on job %s = %d, want 1; the background operator surface is unguarded", output.JobID, durable)
+	}
+	// And the stored message must carry the contradiction, not merely the kind. A kind-only
+	// assertion is satisfied by an empty message, which tells a later reader nothing.
+	for _, required := range []string{divergent[:8], "Gitmoot will use dispatch head"} {
+		if !strings.Contains(durableMessage, required) {
+			t.Fatalf("durable warning %q does not contain %q", durableMessage, required)
+		}
 	}
 }
 
@@ -95,12 +119,30 @@ func TestPromptHeadWarningIgnoresMutationRestoreHashes(t *testing.T) {
 		}
 	}
 
-	// AND PROVE THE SCANNER IS LIVE ON THIS PROMPT. Without this, zero could mean
-	// "hashes correctly ignored" or "scanning never happened" -- the same prompt with a
-	// real divergent commit token MUST warn.
-	live := promptHeadWarnings(t, checkout, prompt+" See also "+divergent[:8]+".", head)
-	if len(live) != 1 {
-		t.Fatalf("control: the scanner produced %d warnings on this prompt shape, want 1; zero below would prove nothing", len(live))
+	// AND PROVE THE SCANNER IS LIVE ON THIS PROMPT, AT EVERY TOKEN POSITION.
+	//
+	// A single control appending the divergent token to the END of the prompt was not
+	// enough, and the way it failed is worth stating: a scanner mutated to examine only
+	// tokens[len(tokens)-1:] compiled and left ALL FOUR of this file's tests green. In the
+	// control the divergent token IS the last token, so it warned; in the baseline the last
+	// token is a restore hash, so it did not. Both assertions were satisfied by a scanner
+	// that reads exactly one token, which is not a scanner.
+	//
+	// So the control is now positional: the SAME divergent token is placed FIRST, in the
+	// MIDDLE and LAST, and each placement must produce exactly one warning. Any mutant that
+	// samples a fixed position instead of traversing fails at least two of the three.
+	for _, placement := range []struct {
+		name   string
+		prompt string
+	}{
+		{name: "first", prompt: "See " + divergent[:8] + ". " + prompt},
+		{name: "middle", prompt: fmt.Sprintf("Head %s. Restore hashes: %s %s. See %s. And %s.", head, hashes[0], hashes[1], divergent[:8], hashes[2])},
+		{name: "last", prompt: prompt + " See also " + divergent[:8] + "."},
+	} {
+		live := promptHeadWarnings(t, checkout, placement.prompt, head)
+		if len(live) != 1 {
+			t.Fatalf("control (%s placement): the scanner produced %d warnings, want 1; a scanner that samples one position is not traversing the prompt", placement.name, len(live))
+		}
 	}
 
 	if warnings := promptHeadWarnings(t, checkout, prompt, head); len(warnings) != 0 {
