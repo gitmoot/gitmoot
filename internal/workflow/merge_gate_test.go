@@ -443,15 +443,17 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 		{name: "legacy_round", reviewHead: "old123"},
 	}
 	causes := []struct {
-		name             string
-		seed             seedImplementJobs
-		omitUnrelatedJob bool
-		want             []string
-		doNotWant        []string
+		name               string
+		seed               seedImplementJobs
+		omitUnrelatedJob   bool
+		bridgePrecondition bool
+		want               []string
+		doNotWant          []string
 	}{
 		{
-			name:             "zero_implement_jobs_anywhere",
-			omitUnrelatedJob: true,
+			name:               "zero_implement_jobs_anywhere",
+			omitUnrelatedJob:   true,
+			bridgePrecondition: true,
 			want: []string{
 				"no implement job is recorded for this task",
 				"coordinator bridge",
@@ -461,7 +463,8 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 			doNotWant: []string{"implemented in a pane"},
 		},
 		{
-			name: "no_implement_job",
+			name:               "no_implement_job",
+			bridgePrecondition: true,
 			want: []string{
 				"no implement job is recorded for this task",
 				"coordinator bridge",
@@ -556,7 +559,46 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 							t.Errorf("decision reason inferred unobserved workflow %q: %q", doNotWant, decision.Reason)
 						}
 					}
+					if cause.bridgePrecondition {
+						assertCoordinatorBridgeRefusalPrecondition(t, decision.Reason)
+					}
 				})
+			}
+		})
+	}
+}
+
+func assertCoordinatorBridgeRefusalPrecondition(t *testing.T, reason string) {
+	t.Helper()
+	lower := strings.ToLower(reason)
+	hasRefusal := strings.Contains(lower, "do not bridge") || strings.Contains(lower, "must not bridge")
+	if !strings.Contains(lower, "independent approval") || !strings.Contains(lower, "exact head") || !hasRefusal {
+		t.Fatalf("coordinator bridge remedy must refuse bridging without an independent exact-head approval: %q", reason)
+	}
+}
+
+func TestImplementerAttributionAnomalyDeclinesRemainByteStable(t *testing.T) {
+	wants := map[string]struct {
+		got  string
+		want string
+	}{
+		"task mismatch": {
+			got:  mismatchedImplementTaskAttributionReason,
+			want: "latest review round's approval cannot be verified as independent: implement jobs are recorded, but none match this task identity; this is an attribution anomaly and may indicate a stable-task-identity regression",
+		},
+		"empty agent": {
+			got:  emptyImplementAgentAttributionReason,
+			want: "latest review round's approval cannot be verified as independent: an implement job matches this task but has no recorded agent; this is an attribution data anomaly",
+		},
+		"malformed payload": {
+			got:  malformedImplementPayloadAttributionReason,
+			want: "latest review round's approval cannot be verified as independent: an implement job has a malformed payload, so attribution for this task cannot be verified; this is a corrupt-record anomaly",
+		},
+	}
+	for name, check := range wants {
+		t.Run(name, func(t *testing.T) {
+			if check.got != check.want {
+				t.Fatalf("decline = %q, want byte-identical %q", check.got, check.want)
 			}
 		})
 	}

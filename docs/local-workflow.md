@@ -567,10 +567,12 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    When review independence cannot be verified, the decline names the observed
    cause: no implement job for the task, task-identity mismatch, a matching job
    with no agent, or a malformed implement payload. All four remain fail-closed.
-   For the no-job case, the coordinator bridge is to inspect the exact-head
-   engine review with `gitmoot job show <job-id>`, confirm the implementer from
-   the pane session, and journal both facts with `gitmoot workflow note`. The
-   journal is an operator record, never an attestation consumed by the gate.
+   For the no-job case, first confirm that an independent approval exists at the
+   PR's exact current head. If it does not, do not use the coordinator bridge.
+   If it does, inspect that engine review with `gitmoot job show <job-id>`,
+   confirm the implementer from the pane session, and journal both facts with
+   `gitmoot workflow note`. The journal is an operator record, never an
+   attestation consumed by the gate.
 
    When a head reports **no** external CI at all (zero commit-statuses and zero
    check-runs), Gitmoot does not conclude "this repo has no CI" from a single

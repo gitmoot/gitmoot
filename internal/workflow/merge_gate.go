@@ -802,7 +802,7 @@ func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job) error {
 }
 
 const (
-	noImplementJobAttributionReason            = "latest review round's approval cannot be verified as independent: no implement job is recorded for this task. Use the coordinator bridge: read the engine review job's agent identity and decision at the exact head with gitmoot job show <job-id>, confirm the implementer identity from the pane session, journal both with gitmoot workflow note, then merge the lane"
+	noImplementJobAttributionReason            = "latest review round's approval cannot be verified as independent: no implement job is recorded for this task. Use the coordinator bridge only as follows: step 1, confirm an independent approval exists at this exact head; if it does not, do not bridge. If it does, read the engine review job's agent identity and decision at that head with gitmoot job show <job-id>, confirm the implementer identity from the pane session, journal both with gitmoot workflow note, then merge the lane"
 	mismatchedImplementTaskAttributionReason   = "latest review round's approval cannot be verified as independent: implement jobs are recorded, but none match this task identity; this is an attribution anomaly and may indicate a stable-task-identity regression"
 	emptyImplementAgentAttributionReason       = "latest review round's approval cannot be verified as independent: an implement job matches this task but has no recorded agent; this is an attribution data anomaly"
 	malformedImplementPayloadAttributionReason = "latest review round's approval cannot be verified as independent: an implement job has a malformed payload, so attribution for this task cannot be verified; this is a corrupt-record anomaly"
