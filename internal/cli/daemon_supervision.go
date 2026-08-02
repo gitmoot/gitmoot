@@ -256,6 +256,12 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		writeLine(stdout, "default memory pipeline install disabled: %s", heartbeatPathsErr)
 	}
 	sqliteMaintenance := &sqliteMaintenanceState{}
+	// Bounds the poll-error diagnostics below. The poll interval has no minimum, so a
+	// persistently failing poll would otherwise write an unbounded, perfectly repetitive
+	// stream into the operator's one log -- a diagnostic that drowns the log is a different
+	// way of being unobservable. Keyed on the CAUSE, so a NEW failure is never suppressed by
+	// a running window.
+	pollErrors := newPollErrorReporter(pollErrorReportWindow)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -284,7 +290,9 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		if checkoutLock.TryLock() {
 			if !tracker.busy(d.Repo.FullName()) {
 				if err := runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollOnce); err != nil {
-					writeLine(stdout, "poll error: %s", err)
+					if pollErrors.shouldReport("poll: "+err.Error(), time.Now().UTC()) {
+						writeLine(stdout, "poll error: %s", err)
+					}
 				}
 				polledFull = true
 			}
@@ -292,7 +300,9 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		}
 		if !polledFull {
 			if err := runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollRecoveryCommandsOnce); err != nil {
-				writeLine(stdout, "recovery poll error: %s", err)
+				if pollErrors.shouldReport("recovery: "+err.Error(), time.Now().UTC()) {
+					writeLine(stdout, "recovery poll error: %s", err)
+				}
 			}
 		}
 		if heartbeatPathsErr == nil {
@@ -1299,4 +1309,44 @@ func shorterWait(current time.Duration, candidate time.Duration, set *bool) time
 		return candidate
 	}
 	return current
+}
+
+// pollErrorReportWindow bounds how often an IDENTICAL poll failure is written to the
+// operator's log. It is long relative to any sane poll interval and short relative to how long
+// an operator would tolerate silence about an ongoing fault.
+const pollErrorReportWindow = 5 * time.Minute
+
+// pollErrorReporter rate-limits repeated poll diagnostics.
+//
+// It keys on the CAUSE rather than on time alone. Suppressing by time would swallow a second,
+// DIFFERENT failure that arrives inside a running window -- converting a bounded diagnostic
+// into a lost one, which is the defect this reporting exists to fix, pointed the other way.
+// The first occurrence of any cause is always reported, so a failure's onset is never hidden.
+type pollErrorReporter struct {
+	window time.Duration
+	cause  string
+	last   time.Time
+}
+
+func newPollErrorReporter(window time.Duration) *pollErrorReporter {
+	if window <= 0 {
+		window = pollErrorReportWindow
+	}
+	return &pollErrorReporter{window: window}
+}
+
+func (r *pollErrorReporter) shouldReport(cause string, now time.Time) bool {
+	if r == nil {
+		return true
+	}
+	if cause != r.cause {
+		r.cause = cause
+		r.last = now
+		return true
+	}
+	if now.Sub(r.last) < r.window {
+		return false
+	}
+	r.last = now
+	return true
 }
