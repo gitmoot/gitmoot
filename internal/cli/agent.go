@@ -168,6 +168,9 @@ func runAgentAsk(args []string, stdout, stderr io.Writer) int {
 			SelectedActionReason: "explicit agent ask",
 			ExecutionPath:        "agent_ask",
 			JSONOutput:           options.jsonOutput,
+			DispatchWarning: func(warning string) {
+				fmt.Fprintf(stderr, "agent ask: warning: %s\n", warning)
+			},
 		})
 		return err
 	}); err != nil {
@@ -585,6 +588,9 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 			SelectedAction:         action,
 			SelectedActionReason:   reason,
 			ExecutionPath:          executionPath,
+			DispatchWarning: func(warning string) {
+				fmt.Fprintf(stderr, "%s: warning: %s\n", errLabel, warning)
+			},
 		})
 		return err
 	}); err != nil {
