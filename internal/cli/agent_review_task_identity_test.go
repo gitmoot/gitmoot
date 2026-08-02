@@ -19,7 +19,7 @@ func TestStableReviewTaskIdentityLetsSecondRoundVerdictReachGate(t *testing.T) {
 	firstTaskID := mintC1ReviewTaskID(t, repoDir, oldHead)
 	secondTaskID := mintC1ReviewTaskID(t, repoDir, newHead)
 
-	decision := evaluateC1GateScenario(t, firstTaskID, secondTaskID, oldHead, newHead, firstTaskID, true)
+	decision := evaluateC1GateScenario(t, firstTaskID, secondTaskID, oldHead, newHead, firstTaskID, "reviewer", true)
 	if !decision.Merged {
 		t.Fatalf("second-round verdict did not reach first-round task: first=%q second=%q decision=%+v", firstTaskID, secondTaskID, decision)
 	}
@@ -27,7 +27,7 @@ func TestStableReviewTaskIdentityLetsSecondRoundVerdictReachGate(t *testing.T) {
 
 func TestStableReviewTaskIdentityKeepsHeadRoundIsolation(t *testing.T) {
 	const stableTaskID = "review-pr-17-stable"
-	decision := evaluateC1GateScenario(t, stableTaskID, stableTaskID, "old-head", "new-head", stableTaskID, false)
+	decision := evaluateC1GateScenario(t, stableTaskID, stableTaskID, "old-head", "new-head", stableTaskID, "reviewer", false)
 	if !decision.LeaveOpen || decision.Merged || !strings.Contains(decision.Reason, "different head SHA") {
 		t.Fatalf("wrong-head verdict was not rejected by the head comparison: %+v", decision)
 	}
@@ -35,6 +35,9 @@ func TestStableReviewTaskIdentityKeepsHeadRoundIsolation(t *testing.T) {
 
 func TestC1MeasurementEngineDispatchedImplementerIdentity(t *testing.T) {
 	repoDir, oldHead, newHead := c1ReviewRepository(t)
+	if oldHead == newHead {
+		t.Fatalf("measurement requires different heads, both were %q", oldHead)
+	}
 	stableFirst := mintC1ReviewTaskID(t, repoDir, oldHead)
 	stableSecond := mintC1ReviewTaskID(t, repoDir, newHead)
 	legacyFirst := fmt.Sprintf("review-pr-%d-%s", 17, shortHash("owner/repo\x00"+oldHead))
@@ -51,11 +54,9 @@ func TestC1MeasurementEngineDispatchedImplementerIdentity(t *testing.T) {
 		{name: "after_C1", implementTaskID: stableFirst, reviewTaskID: stableSecond, wantAgents: 1, wantFailClosed: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			decision := evaluateC1GateScenario(t, tc.implementTaskID, tc.reviewTaskID, oldHead, newHead, tc.reviewTaskID, true)
-			implementingAgents := 0
-			if tc.implementTaskID == tc.reviewTaskID {
-				implementingAgents = 1
-			}
+			collectionProbe := evaluateC1GateScenario(t, tc.implementTaskID, tc.reviewTaskID, oldHead, newHead, tc.reviewTaskID, "implementer", true)
+			implementingAgents := observedC1ImplementingAgentCount(t, collectionProbe)
+			decision := evaluateC1GateScenario(t, tc.implementTaskID, tc.reviewTaskID, oldHead, newHead, tc.reviewTaskID, "reviewer", true)
 			failClosed := decision.LeaveOpen && strings.Contains(decision.Reason, "implementing agent for this task could not be determined")
 			if implementingAgents != tc.wantAgents || failClosed != tc.wantFailClosed {
 				t.Fatalf("implementingAgents=%d failClosed=%v decision=%+v; want agents=%d failClosed=%v", implementingAgents, failClosed, decision, tc.wantAgents, tc.wantFailClosed)
@@ -66,8 +67,21 @@ func TestC1MeasurementEngineDispatchedImplementerIdentity(t *testing.T) {
 			if !tc.wantFailClosed && !decision.Merged {
 				t.Fatalf("independent review did not merge after implementer resolution: %+v", decision)
 			}
-			t.Logf("implementingAgents=%d independence_fail_closed=%v", implementingAgents, failClosed)
+			t.Logf("old_head=%s new_head=%s implementingAgents=%d independence_fail_closed=%v", oldHead, newHead, implementingAgents, failClosed)
 		})
+	}
+}
+
+func observedC1ImplementingAgentCount(t *testing.T, decision workflow.MergeDecision) int {
+	t.Helper()
+	switch {
+	case strings.Contains(decision.Reason, "approval was authored by implementer, the implementing agent"):
+		return 1
+	case strings.Contains(decision.Reason, "implementing agent for this task could not be determined"):
+		return 0
+	default:
+		t.Fatalf("gate decision did not expose the seeded implementer's collection membership: %+v", decision)
+		return 0
 	}
 }
 
@@ -118,7 +132,7 @@ func mintC1ReviewTaskID(t *testing.T, repoDir string, headSHA string) string {
 	return request.TaskID
 }
 
-func evaluateC1GateScenario(t *testing.T, implementTaskID string, reviewTaskID string, oldHead string, newHead string, gateTaskID string, includeCurrentReview bool) workflow.MergeDecision {
+func evaluateC1GateScenario(t *testing.T, implementTaskID string, reviewTaskID string, oldHead string, newHead string, gateTaskID string, reviewerAgent string, includeCurrentReview bool) workflow.MergeDecision {
 	t.Helper()
 	store, checkout, gh, request := daemonMergeGateActiveJobFixture(t, false)
 	gh.pr.HeadSHA = newHead
@@ -131,14 +145,14 @@ func evaluateC1GateScenario(t *testing.T, implementTaskID string, reviewTaskID s
 		Result: &workflow.AgentResult{Decision: "implemented", Summary: "implemented"},
 	})
 	seedDaemonMergeGateJob(t, store, db.Job{
-		ID: "review-round-one", Agent: "reviewer", Type: "review", State: string(workflow.JobSucceeded),
+		ID: "review-round-one", Agent: reviewerAgent, Type: "review", State: string(workflow.JobSucceeded),
 	}, workflow.JobPayload{
 		Repo: "owner/repo", Branch: "fix-round", PullRequest: 17, HeadSHA: oldHead, TaskID: implementTaskID,
 		ReviewRound: "review-1", Result: &workflow.AgentResult{Decision: "approved", Summary: "round one approved"},
 	})
 	if includeCurrentReview {
 		seedDaemonMergeGateJob(t, store, db.Job{
-			ID: "review-round-two", Agent: "reviewer", Type: "review", State: string(workflow.JobSucceeded),
+			ID: "review-round-two", Agent: reviewerAgent, Type: "review", State: string(workflow.JobSucceeded),
 		}, workflow.JobPayload{
 			Repo: "owner/repo", Branch: "fix-round", PullRequest: 17, HeadSHA: newHead, TaskID: reviewTaskID,
 			ReviewRound: "review-2", Result: &workflow.AgentResult{Decision: "approved", Summary: "round two approved"},
