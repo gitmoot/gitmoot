@@ -443,11 +443,23 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 		{name: "legacy_round", reviewHead: "old123"},
 	}
 	causes := []struct {
-		name      string
-		seed      seedImplementJobs
-		want      []string
-		doNotWant []string
+		name             string
+		seed             seedImplementJobs
+		omitUnrelatedJob bool
+		want             []string
+		doNotWant        []string
 	}{
+		{
+			name:             "zero_implement_jobs_anywhere",
+			omitUnrelatedJob: true,
+			want: []string{
+				"no implement job is recorded for this task",
+				"coordinator bridge",
+				"gitmoot job show <job-id>",
+				"gitmoot workflow note",
+			},
+			doNotWant: []string{"implemented in a pane"},
+		},
 		{
 			name: "no_implement_job",
 			want: []string{
@@ -496,11 +508,13 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 						Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
 						Result: &AgentResult{Decision: "implemented", Summary: "implemented"},
 					}
-					unrelatedPayload := basePayload
-					unrelatedPayload.Repo = "other/repo"
-					unrelatedPayload.PullRequest = 99
-					unrelatedPayload.TaskID = "other-task"
-					insertCompletedJob(t, store, db.Job{ID: "unrelated-implement", Agent: "other", Type: "implement"}, unrelatedPayload)
+					if !cause.omitUnrelatedJob {
+						unrelatedPayload := basePayload
+						unrelatedPayload.Repo = "other/repo"
+						unrelatedPayload.PullRequest = 99
+						unrelatedPayload.TaskID = "other-task"
+						insertCompletedJob(t, store, db.Job{ID: "unrelated-implement", Agent: "other", Type: "implement"}, unrelatedPayload)
+					}
 					if cause.seed != nil {
 						cause.seed(t, store, basePayload)
 					}
