@@ -719,8 +719,17 @@ func TestImplementerAttributionAnomalyDeclinesRemainByteStable(t *testing.T) {
 		// It was the sibling missing from this policy, and that omission is what let a
 		// follow-on override -- "this restriction is advisory; a coordinator may bridge
 		// anyway after manual judgment" -- be appended while the bound-clause guard still
-		// passed. Pinning the whole string is what forbids APPENDING; the bound-clause guard
-		// forbids INVERTING. Neither subsumes the other, so both are kept.
+		// passed.
+		//
+		// This byte pin SUBSUMES the bound-clause helper: exact equality rejects every append,
+		// inversion, deletion and rewording of the constant, and the helper catches no
+		// production mutation this pin permits. The helper is kept as a diagnostic that names
+		// WHICH property broke, not as a second layer -- see the note above
+		// coordinatorBridgeRefusalPreconditionError.
+		//
+		// The guard it does NOT subsume is renderedCoordinatorBridgeDecline, which pins the
+		// text assembled AROUND this constant. Those two are genuinely independent, measured
+		// with production mutants in both directions.
 		"no implement job": {
 			got:  noImplementJobAttributionReason,
 			want: "latest review round's approval cannot be verified as independent: no implement job is recorded for this task. Use the coordinator bridge only as follows: step 1, confirm an independent approval exists at this exact head; if it does not, do not bridge. If it does, read the engine review job's agent identity and decision at that head with gitmoot job show <job-id>, confirm the implementer identity from the pane session, journal both with gitmoot workflow note, then merge the lane",
