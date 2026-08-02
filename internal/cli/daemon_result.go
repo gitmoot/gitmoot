@@ -192,7 +192,7 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, cause er
 		}
 		var blocked workflow.BlockedError
 		if errors.As(cause, &blocked) {
-			return w.recordBlockedAdvancement(ctx, latest.ID, cause, blocked)
+			return w.recordBlockedAdvancement(ctx, latest.ID, latest.State, cause, blocked)
 		}
 		if err := w.recordPostDeliveryWorkflowError(ctx, latest, cause); err != nil {
 			return err
@@ -299,14 +299,23 @@ func (w jobWorker) recordPostDeliveryWorkflowError(ctx context.Context, job db.J
 		"post-delivery workflow error; advancement will retry from stored result: "+cause.Error())
 }
 
-func (w jobWorker) recordBlockedAdvancement(ctx context.Context, jobID string, cause error, blocked workflow.BlockedError) error {
+func (w jobWorker) recordBlockedAdvancement(ctx context.Context, jobID string, observedState string, cause error, blocked workflow.BlockedError) error {
 	if blocked.ResultDeliveryFailed {
-		return w.settleBlockedAdvancement(ctx, jobID, cause)
+		return w.settleBlockedAdvancement(ctx, jobID, observedState, cause)
 	}
 	return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_blocked", Message: cause.Error()})
 }
 
-func (w jobWorker) settleBlockedAdvancement(ctx context.Context, jobID string, cause error) error {
+// settleBlockedAdvancement records a delivery-failed advancement as the job's terminal
+// blocked outcome.
+//
+// observedState is the state this advancement SAW when it began. The CAS is anchored to it
+// rather than to whatever the row holds now, because an operator's retry can move the job
+// failed -> queued underneath a slow advancement. RetryJob has already cleared Result by then,
+// so overwriting that fresh lifecycle with blocked strands it: no result, plus an
+// advance_blocked event that clears needsRetry and prevents any further advancement.
+// Anchoring the CAS makes the stale write lose instead of win.
+func (w jobWorker) settleBlockedAdvancement(ctx context.Context, jobID string, observedState string, cause error) error {
 	message := cause.Error()
 	latest, err := w.Store.GetJob(ctx, jobID)
 	if err != nil {
@@ -315,7 +324,7 @@ func (w jobWorker) settleBlockedAdvancement(ctx context.Context, jobID string, c
 	if latest.State == string(workflow.JobBlocked) {
 		return w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_blocked", Message: message})
 	}
-	transitioned, err := w.Store.TransitionJobStateWithEvent(ctx, jobID, latest.State, string(workflow.JobBlocked), db.JobEvent{
+	transitioned, err := w.Store.TransitionJobStateWithEvent(ctx, jobID, observedState, string(workflow.JobBlocked), db.JobEvent{
 		JobID:   jobID,
 		Kind:    "advance_blocked",
 		Message: message,
@@ -327,8 +336,6 @@ func (w jobWorker) settleBlockedAdvancement(ctx context.Context, jobID string, c
 		emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, events.EventJobBlocked, string(workflow.JobBlocked), message, "advance_blocked")
 		return nil
 	}
-	// A concurrent terminal transition is already a non-success outcome. Preserve
-	// it and keep the blocked advancement queryable without overwriting its state.
 	latest, err = w.Store.GetJob(ctx, jobID)
 	if err != nil {
 		return err
@@ -336,7 +343,16 @@ func (w jobWorker) settleBlockedAdvancement(ctx context.Context, jobID string, c
 	if latest.State == string(workflow.JobSucceeded) {
 		return fmt.Errorf("record blocked advancement for job %s: succeeded state did not transition", jobID)
 	}
-	return w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_blocked", Message: message})
+	if latest.State == string(workflow.JobBlocked) {
+		// A concurrent settlement already reached the same terminal outcome.
+		return w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_blocked", Message: message})
+	}
+	// The job is on a NEW lifecycle: something re-queued it while this advancement was in
+	// flight, so this verdict describes the PREVIOUS one. Do not write advance_blocked here --
+	// it would contradict the live lifecycle and suppress its advancement. Record the
+	// superseded settlement under a kind jobNeedsAdvanceRetry does not classify, so it stays
+	// queryable without steering retry.
+	return w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_blocked_superseded", Message: message})
 }
 
 func (w jobWorker) postJobResultComment(ctx context.Context, jobID string, agent runtime.Agent, _ string, cause error) error {

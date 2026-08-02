@@ -112,18 +112,132 @@ func TestBlockedAdvanceIsNotRetried(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Marshal returned error: %v", err)
 	}
+	// Seed advance_started FIRST so the retry state is genuinely TRUE when advance_blocked
+	// arrives. Starting from advance_blocked alone proved nothing: needsRetry already
+	// defaults false, so the assertion passed whether or not advance_blocked was classified
+	// at all -- removing it from the reset arm left this green. This ordering makes the
+	// guard bind the RESET, which is what it claims.
 	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "blocked-no-retry", Agent: "lead", Type: "implement", State: string(workflow.JobBlocked), Payload: string(payload)}, db.JobEvent{
-		JobID: "blocked-no-retry", Kind: "advance_blocked", Message: "push rejected",
+		JobID: "blocked-no-retry", Kind: "advance_started", Message: "advance began",
 	}); err != nil {
 		t.Fatalf("CreateJobWithEvent returned error: %v", err)
 	}
 	worker := defaultJobWorker(store, io.Discard)
+
+	// Control: with only advance_started the job MUST be classified for retry. Without it the
+	// test cannot distinguish "the reset worked" from "nothing ever set it".
 	needsRetry, err := worker.jobNeedsAdvanceRetry(ctx, "blocked-no-retry")
 	if err != nil {
 		t.Fatalf("jobNeedsAdvanceRetry returned error: %v", err)
 	}
+	if !needsRetry {
+		t.Fatal("advance_started did not set the retry state, so this test cannot prove advance_blocked clears it")
+	}
+
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: "blocked-no-retry", Kind: "advance_blocked", Message: "push rejected"}); err != nil {
+		t.Fatalf("AddJobEvent returned error: %v", err)
+	}
+	needsRetry, err = worker.jobNeedsAdvanceRetry(ctx, "blocked-no-retry")
+	if err != nil {
+		t.Fatalf("jobNeedsAdvanceRetry returned error: %v", err)
+	}
 	if needsRetry {
-		t.Fatal("advance_blocked was classified for retry")
+		t.Fatal("advance_blocked did not clear the retry state set by advance_started")
+	}
+}
+
+// TestGenericBlockedAdvanceLeavesTerminalStateAndDecisionUnchanged binds the FALSE side of
+// ResultDeliveryFailed: settlement must fire ONLY for delivery failures, and every other
+// BlockedError must keep the pre-existing behaviour.
+//
+// Without this, a mutant that settles unconditionally left every other guard in this file
+// green, because they all exercise the delivery-failed side.
+func TestGenericBlockedAdvanceLeavesTerminalStateAndDecisionUnchanged(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	payload, err := json.Marshal(workflow.JobPayload{Result: &workflow.AgentResult{Decision: "implemented", Summary: "done"}})
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "generic-block", Agent: "lead", Type: "implement", State: string(workflow.JobSucceeded), Payload: string(payload)}, db.JobEvent{
+		JobID: "generic-block", Kind: "advance_started", Message: "advance began",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	worker := defaultJobWorker(store, io.Discard)
+
+	generic := workflow.BlockedError{Reason: "downstream precondition not met"}
+	if err := worker.recordBlockedAdvancement(ctx, "generic-block", string(workflow.JobSucceeded), generic, generic); err != nil {
+		t.Fatalf("recordBlockedAdvancement returned error: %v", err)
+	}
+
+	after, err := store.GetJob(ctx, "generic-block")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if after.State != string(workflow.JobSucceeded) {
+		t.Fatalf("generic block changed terminal state to %q, want it left at succeeded", after.State)
+	}
+	var stored workflow.JobPayload
+	if err := json.Unmarshal([]byte(after.Payload), &stored); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if stored.Result == nil || stored.Result.Decision != "implemented" {
+		t.Fatalf("generic block changed the outward decision to %+v, want implemented", stored.Result)
+	}
+}
+
+// TestBlockedSettlementDoesNotOverwriteConcurrentRetry is the concurrency guard. An operator
+// retry can move a job failed -> queued underneath a slow advancement, and RetryJob clears
+// Result -- so a settlement that CASes from the CURRENT row strands the fresh lifecycle with
+// no result plus an advance_blocked event that suppresses further advancement.
+//
+// The settlement must CAS from the state it OBSERVED, and lose.
+func TestBlockedSettlementDoesNotOverwriteConcurrentRetry(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	payload, err := json.Marshal(workflow.JobPayload{Result: &workflow.AgentResult{Decision: "implemented", Summary: "done"}})
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "retry-race", Agent: "lead", Type: "implement", State: string(workflow.JobFailed), Payload: string(payload)}, db.JobEvent{
+		JobID: "retry-race", Kind: "advance_started", Message: "advance began",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+
+	// The advancement observed the job as failed...
+	observed := string(workflow.JobFailed)
+
+	// ...then an operator retry wins the race and re-queues it.
+	if _, err := store.TransitionJobStateWithEvent(ctx, "retry-race", string(workflow.JobFailed), string(workflow.JobQueued), db.JobEvent{
+		JobID: "retry-race", Kind: "retry_queued", Message: "operator retry",
+	}); err != nil {
+		t.Fatalf("retry transition returned error: %v", err)
+	}
+
+	worker := defaultJobWorker(store, io.Discard)
+	deliveryFailed := workflow.BlockedError{Reason: "result delivery failed", ResultDeliveryFailed: true}
+	if err := worker.recordBlockedAdvancement(ctx, "retry-race", observed, deliveryFailed, deliveryFailed); err != nil {
+		t.Fatalf("recordBlockedAdvancement returned error: %v", err)
+	}
+
+	after, err := store.GetJob(ctx, "retry-race")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if after.State != string(workflow.JobQueued) {
+		t.Fatalf("state after manual retry won = %q, want queued (a stale settlement overwrote a live lifecycle)", after.State)
+	}
+
+	jobEvents, err := store.ListJobEvents(ctx, "retry-race")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	for _, event := range jobEvents {
+		if event.Kind == "advance_blocked" {
+			t.Fatal("stale settlement wrote advance_blocked onto a re-queued job, suppressing its advancement")
+		}
 	}
 }
 

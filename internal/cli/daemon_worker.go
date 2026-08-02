@@ -2509,7 +2509,7 @@ func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 		}
 		var blocked workflow.BlockedError
 		if errors.As(err, &blocked) {
-			return w.recordBlockedAdvancement(ctx, job.ID, err, blocked)
+			return w.recordBlockedAdvancement(ctx, job.ID, job.State, err, blocked)
 		}
 		return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry failed: "+err.Error())
 	}
