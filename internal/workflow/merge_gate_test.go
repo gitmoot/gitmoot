@@ -561,6 +561,7 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 					}
 					if cause.bridgePrecondition {
 						assertCoordinatorBridgeRefusalPrecondition(t, decision.Reason)
+						assertRenderedCoordinatorBridgeDecline(t, decision.Reason, "head123")
 					}
 				})
 			}
@@ -577,8 +578,49 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 // observe that both words occur somewhere in the sentence.
 const boundCoordinatorBridgeRefusal = "confirm an independent approval exists at this exact head; if it does not, do not bridge"
 
+// renderedCoordinatorBridgeDecline is the COMPLETE operator-facing text of the
+// no-implement-job decline, wrapper included.
+//
+// Pinning the constant is not sufficient. The reason an operator actually reads is assembled
+// AROUND the constant in reviewAndCIGateMiss -- "review gate: " + err + " for head " + sha --
+// so text added at the renderer ("this restriction is advisory, so a coordinator may bridge
+// anyway after manual judgment") leaves noImplementJobAttributionReason byte-identical and
+// every constant-level guard green while changing what the reader is told to do.
+//
+// This pins what is READ, not what is stored.
+//
+// DO NOT "improve" this by inlining the constant's text as a literal. Composing the expectation
+// FROM noImplementJobAttributionReason is deliberate: it holds the WRAPPER fixed while letting
+// the payload vary, which is exactly what makes this guard independent of the byte pin in
+// TestImplementerAttributionAnomalyDeclinesRemainByteStable. Measured with production mutants in
+// both directions:
+//
+//	append at the RENDERER  -> this guard FAILS (both cause paths); the byte pin passes
+//	append inside the CONSTANT -> the byte pin FAILS; this guard passes (both sides move together)
+//
+// A hardcoded literal here would catch constant mutations too and collapse the two guards into
+// one aggregate wearing two names, which is the thing this file keeps having to relearn.
+func renderedCoordinatorBridgeDecline(headSHA string) string {
+	return "review gate: " + noImplementJobAttributionReason + " for head " + headSHA
+}
+
+func assertRenderedCoordinatorBridgeDecline(t *testing.T, reason, headSHA string) {
+	t.Helper()
+	if want := renderedCoordinatorBridgeDecline(headSHA); reason != want {
+		t.Fatalf("rendered operator-facing decline =\n  %q\nwant byte-identical\n  %q", reason, want)
+	}
+}
+
 // coordinatorBridgeRefusalPreconditionError reports why a coordinator-bridge remedy fails to
 // bind its refusal to its own precondition, or nil when it binds correctly.
+//
+// NOTE ON REDUNDANCY, recorded rather than quietly kept: against production-string mutations
+// this helper is SUBSUMED by the byte pin in TestImplementerAttributionAnomalyDeclinesRemainByteStable
+// -- exact equality already rejects every append, inversion, deletion and rewording of the
+// constant, and this helper catches no production mutation the byte pin permits. It is retained
+// as a focused diagnostic that names WHICH property broke, not as an independent layer. An
+// earlier revision of this file claimed the two were independent; that claim was wrong, because
+// the run that "proved" it mutated this guard rather than production.
 //
 // It is a function returning an error rather than a t.Fatalf helper so that the guard itself
 // can be mutation-tested: TestCoordinatorBridgeRefusalPreconditionRejectsSemanticInversion
