@@ -185,7 +185,8 @@ func TestAwaitedFactOldHeadDoesNotSatisfyNewHead(t *testing.T) {
 // TestSucceededReviewVerdictsFiltersCanonicalRows pins the pure read used by
 // review-loop admission. It kills mutants that query payload-only repo/PR,
 // include unfinished/non-review jobs, accept malformed results, or lose the
-// deterministic newest-first ordering.
+// deterministic updated_at DESC, id DESC ordering. The explicit timestamps
+// below kill mutants that drop either ordering term.
 func TestSucceededReviewVerdictsFiltersCanonicalRows(t *testing.T) {
 	store := openAwaitedFactTestStore(t)
 	ctx := context.Background()
@@ -219,6 +220,22 @@ func TestSucceededReviewVerdictsFiltersCanonicalRows(t *testing.T) {
 	seed("no-result", "audit", "review", "succeeded", "acme/widget", 52,
 		`{"repo":"acme/widget","pull_request":52,"head_sha":"head-a"}`)
 
+	// Make timestamp order conflict with id order: valid-a is newer despite its
+	// lower-sorting id. Keep columns-win and valid-z tied so id DESC remains the
+	// required deterministic tie-break (valid-z was inserted after columns-win).
+	for _, fixture := range []struct {
+		id        string
+		updatedAt string
+	}{
+		{id: "valid-a", updatedAt: "2026-08-02 03:00:00"},
+		{id: "columns-win", updatedAt: "2026-08-02 02:00:00"},
+		{id: "valid-z", updatedAt: "2026-08-02 02:00:00"},
+	} {
+		if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET updated_at = ? WHERE id = ?`, fixture.updatedAt, fixture.id); err != nil {
+			t.Fatalf("set updated_at for %s: %v", fixture.id, err)
+		}
+	}
+
 	got, err := store.SucceededReviewVerdicts(ctx, " ACME/WIDGET ", 52)
 	if err != nil {
 		t.Fatalf("SucceededReviewVerdicts: %v", err)
@@ -226,11 +243,11 @@ func TestSucceededReviewVerdictsFiltersCanonicalRows(t *testing.T) {
 	if len(got) != 3 {
 		t.Fatalf("verdicts = %+v, want exactly the three rows selected by denormalized repo/PR", got)
 	}
-	if got[0].JobID != "valid-z" || got[0].Agent != "audit-z" || got[0].HeadSHA != "head-a" || got[0].Decision != "changes_requested" {
+	if got[0].JobID != "valid-a" || got[0].Agent != "audit-a" || got[0].HeadSHA != "head-a" || got[0].Decision != "approved" {
 		t.Fatalf("newest verdict = %+v", got[0])
 	}
-	if got[1].JobID != "valid-a" || got[1].HeadSHA != "head-a" || got[1].Decision != "approved" {
-		t.Fatalf("older verdict = %+v", got[1])
+	if got[1].JobID != "valid-z" || got[1].HeadSHA != "head-a" || got[1].Decision != "changes_requested" {
+		t.Fatalf("equal-timestamp id-desc verdict = %+v", got[1])
 	}
 	if got[2].JobID != "columns-win" || got[2].HeadSHA != "head-columns" || got[2].Decision != "approved" {
 		t.Fatalf("denormalized-column verdict = %+v", got[2])
