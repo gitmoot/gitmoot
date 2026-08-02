@@ -3276,7 +3276,7 @@ func TestRunQueuedJobsSwallowsPostDeliveryBlockedWorkflow(t *testing.T) {
 		TaskID:      "task-1",
 		HeadSHA:     strings.Repeat("a", 40),
 	})
-	gate := &cliWorkerFakeMergeGate{decision: workflow.MergeDecision{Ready: false, Reason: "ci pending"}}
+	gate := &cliWorkerFakeMergeGate{decision: workflow.MergeDecision{Ready: false, Reason: workflow.PlainReason("ci pending")}}
 	adapter := &cliWorkerFakeAdapter{
 		output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 	}

@@ -582,7 +582,7 @@ func TestDaemonMergeGateCanBeDisabledByEnvironment(t *testing.T) {
 	if decision.Ready {
 		t.Fatalf("decision.Ready = true, want disabled gate to block")
 	}
-	if !strings.Contains(decision.Reason, "GITMOOT_DISABLE_NATIVE_MERGE_GATE") {
+	if !strings.Contains(decision.Reason.Render(), "GITMOOT_DISABLE_NATIVE_MERGE_GATE") {
 		t.Fatalf("decision reason = %q", decision.Reason)
 	}
 }

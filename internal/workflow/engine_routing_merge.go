@@ -509,7 +509,7 @@ func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string,
 		if payload.PullRequestDraft || payload.PullRequestDraftUnknown {
 			return decision, nil
 		}
-		reason := strings.TrimSpace(decision.Reason)
+		reason := decision.Reason.Render()
 		if reason == "" {
 			reason = "merge requires a human action"
 		}
@@ -527,7 +527,7 @@ func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string,
 			// blocked, failed, or harvested.
 			return decision, e.setTaskState(ctx, ref, TaskReadyToMerge)
 		}
-		reason := strings.TrimSpace(decision.Reason)
+		reason := decision.Reason.Render()
 		if reason == "" {
 			reason = "merge gate rejected action"
 		}

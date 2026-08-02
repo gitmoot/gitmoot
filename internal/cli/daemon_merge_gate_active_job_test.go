@@ -65,8 +65,8 @@ func TestDaemonMergeGateHoldsWhileImplementJobActiveOnBranch(t *testing.T) {
 		t.Fatalf("active-job decision = %+v, want transient deferred not-ready hold", decision)
 	}
 	for _, want := range []string{"active implement job fix-round-running", "branch fix-round"} {
-		if !strings.Contains(decision.Reason, want) {
-			t.Fatalf("hold reason %q does not contain %q", decision.Reason, want)
+		if !strings.Contains(decision.Reason.Render(), want) {
+			t.Fatalf("hold reason %q does not contain %q", decision.Reason.Render(), want)
 		}
 	}
 	if len(gh.mergeInputs) != 0 {
@@ -145,7 +145,7 @@ scope = ["owner/repo"]
 		if err != nil {
 			t.Fatalf("Evaluate attempt %d: %v", attempt+1, err)
 		}
-		if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || !strings.Contains(decision.Reason, "final agent review is not captured") {
+		if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || !strings.Contains(decision.Reason.Render(), "final agent review is not captured") {
 			t.Fatalf("decision = %+v", decision)
 		}
 	}

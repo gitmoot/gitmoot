@@ -1197,7 +1197,7 @@ func TestPollOnceRetriesReadyToMergePullRequestAfterBranchUpdateHeadChange(t *te
 		}},
 		comments: map[int64][]github.IssueComment{7: {}},
 	}
-	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{Ready: true, Reason: "branch update requested"}}
+	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{Ready: true, Reason: workflow.PlainReason("branch update requested")}}
 	engine := workflow.Engine{Store: store, MergeGate: gate}
 	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
 

@@ -45,7 +45,7 @@ func TestDaemonUnknownDraftPolarityDoesNotParkTask(t *testing.T) {
 	store, repo, pull := setupDaemonDraftPropagationTest(t, workflow.TaskReadyToMerge)
 	pull.Draft = false
 	pull.DraftUnknown = true
-	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{LeaveOpen: true, Reason: "human merge required"}}
+	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{LeaveOpen: true, Reason: workflow.PlainReason("human merge required")}}
 	engine := workflow.Engine{Store: store, MergeGate: gate}
 	daemon := Daemon{Repo: repo, Store: store, GitHub: &fakeGitHub{}, Workflow: &engine}
 
@@ -80,7 +80,7 @@ func (g *draftKnowledgeGate) Evaluate(_ context.Context, request workflow.MergeR
 	if request.PullRequestDraftUnknown {
 		return workflow.MergeDecision{Ready: true}, nil
 	}
-	return workflow.MergeDecision{LeaveOpen: true, Reason: "human merge required"}, nil
+	return workflow.MergeDecision{LeaveOpen: true, Reason: workflow.PlainReason("human merge required")}, nil
 }
 
 func decodeDaemonDraftPull(t *testing.T, draftJSON string) github.PullRequest {

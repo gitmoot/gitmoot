@@ -523,7 +523,7 @@ func TestEngineHandlePullRequestOpenedRunsMergeGateWithoutReviewers(t *testing.T
 	store := openEngineStore(t)
 	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
-	gate := &fakeMergeGate{decision: MergeDecision{Reason: "ci is pending"}}
+	gate := &fakeMergeGate{decision: MergeDecision{Reason: PlainReason("ci is pending")}}
 	engine.MergeGate = gate
 
 	err := engine.HandlePullRequestOpened(ctx, PullRequestEvent{
@@ -649,7 +649,7 @@ func TestEngineAdvanceImplementPersistsSkipReviewFanoutOntoLock(t *testing.T) {
 	store := openEngineStore(t)
 	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
-	gate := &fakeMergeGate{decision: MergeDecision{Reason: "ci is pending"}}
+	gate := &fakeMergeGate{decision: MergeDecision{Reason: PlainReason("ci is pending")}}
 	engine.MergeGate = gate
 	// A branch lock owned by the lead must exist for the setter to flip.
 	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-7", Owner: "lead"}); err != nil || !acquired {
@@ -1119,7 +1119,7 @@ func TestEngineRunJobWrapsPostSuccessAdvanceError(t *testing.T) {
 	engine := testEngine(store)
 	// A pending (not-ready) merge gate blocks the no-reviewers tail -> AdvanceJob
 	// returns a BlockedError AFTER the result is stored.
-	engine.MergeGate = &fakeMergeGate{decision: MergeDecision{Reason: "ci is pending"}}
+	engine.MergeGate = &fakeMergeGate{decision: MergeDecision{Reason: PlainReason("ci is pending")}}
 	agent := runtime.Agent{Name: "lead", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "lead"}
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"implemented","summary":"opened PR","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
@@ -2121,7 +2121,7 @@ func TestEngineAdvanceReviewApprovalBlocksOnMergeGateRejection(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	engine := testEngine(store)
-	engine.MergeGate = &fakeMergeGate{decision: MergeDecision{Reason: "checks are pending"}}
+	engine.MergeGate = &fakeMergeGate{decision: MergeDecision{Reason: PlainReason("checks are pending")}}
 	insertCompletedJob(t, store, db.Job{
 		ID:    "review-job",
 		Agent: "audit",

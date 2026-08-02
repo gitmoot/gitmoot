@@ -131,13 +131,13 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	// GitHub/local-store operation. An authenticated human merge request may
 	// override this policy, but not the independently verified evidence below.
 	if !g.AutoMerge && !request.HumanMergeRequested {
-		return MergeDecision{LeaveOpen: true, Reason: MergeLeaveOpenAutoMergeKillSwitchReason}, nil
+		return MergeDecision{LeaveOpen: true, Reason: PlainReason(MergeLeaveOpenAutoMergeKillSwitchReason)}, nil
 	}
 	if request.PullRequestDraftUnknown {
-		return MergeDecision{LeaveOpen: true, Reason: "pull request draft state is unknown"}, nil
+		return MergeDecision{LeaveOpen: true, Reason: PlainReason("pull request draft state is unknown")}, nil
 	}
 	if request.PullRequestDraft {
-		return MergeDecision{LeaveOpen: true, Reason: "pull request is draft"}, nil
+		return MergeDecision{LeaveOpen: true, Reason: PlainReason("pull request is draft")}, nil
 	}
 	if err := g.validate(); err != nil {
 		return MergeDecision{}, err
@@ -155,7 +155,7 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	}
 	headSHA := strings.TrimSpace(pr.HeadSHA)
 	if headSHA == "" {
-		return g.gateMiss("pull request head SHA is missing"), nil
+		return g.gateMiss(PlainReason("pull request head SHA is missing")), nil
 	}
 	if !pullRequestMerged(pr) && strings.TrimSpace(pr.State) != "closed" {
 		pendingDecision, isPending, reason, err := g.reviewAndCIGateMiss(ctx, repo, request, headSHA)
@@ -169,7 +169,7 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 			// and escalating.
 			return pendingDecision, nil
 		}
-		if reason != "" {
+		if !reason.IsZero() {
 			return g.gateMiss(reason), nil
 		}
 	}
@@ -251,8 +251,8 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	return g.finishMerged(ctx, request, pr, strings.TrimSpace(result.SHA))
 }
 
-func (g PolicyMergeGate) gateMiss(reason string) MergeDecision {
-	return MergeDecision{LeaveOpen: true, EscalateMergeGateMiss: true, Reason: strings.TrimSpace(reason)}
+func (g PolicyMergeGate) gateMiss(reason MergeReason) MergeDecision {
+	return MergeDecision{LeaveOpen: true, EscalateMergeGateMiss: true, Reason: reason}
 }
 
 // reviewAndCIGateMiss evaluates the exact-head review-clean and CI-green gate,
@@ -265,25 +265,25 @@ func (g PolicyMergeGate) gateMiss(reason string) MergeDecision {
 // A non-empty reason with isPending=false means review and/or CI were evaluated
 // to completion and at least one is missing, stale, or failed - the caller
 // escalates. Both zero-value means the gate is clean.
-func (g PolicyMergeGate) reviewAndCIGateMiss(ctx context.Context, repo github.Repository, request MergeRequest, headSHA string) (pendingDecision MergeDecision, isPending bool, reason string, err error) {
-	var reasons []string
+func (g PolicyMergeGate) reviewAndCIGateMiss(ctx context.Context, repo github.Repository, request MergeRequest, headSHA string) (pendingDecision MergeDecision, isPending bool, reason MergeReason, err error) {
+	var miss MergeReason
 	if reviewErr := g.ensureFinalReviewCaptured(ctx, request, headSHA); reviewErr != nil {
 		var pending mergePending
 		if errors.As(reviewErr, &pending) {
 			decision, dErr := g.pending(ctx, request, headSHA, pending.reason)
-			return decision, true, "", dErr
+			return decision, true, MergeReason{}, dErr
 		}
-		reasons = append(reasons, "review gate: "+reviewErr.Error()+" for head "+headSHA)
+		miss = miss.WithGateMiss("review gate", reviewErr.Error(), headSHA)
 	}
 	if ciErr := g.ensureStatuses(ctx, repo, int64(request.PullRequest), headSHA); ciErr != nil {
 		var pending mergePending
 		if errors.As(ciErr, &pending) {
 			decision, dErr := g.pending(ctx, request, headSHA, pending.reason)
-			return decision, true, "", dErr
+			return decision, true, MergeReason{}, dErr
 		}
-		reasons = append(reasons, "CI gate: "+ciErr.Error()+" for head "+headSHA)
+		miss = miss.WithGateMiss("CI gate", ciErr.Error(), headSHA)
 	}
-	return MergeDecision{}, false, strings.Join(reasons, "; "), nil
+	return MergeDecision{}, false, miss, nil
 }
 
 // executePullRequestMerge is the single low-level GitHub merge path shared by
@@ -339,7 +339,7 @@ func (g PolicyMergeGate) finishMerged(ctx context.Context, request MergeRequest,
 		reason = "merged with post-merge warnings: " + strings.Join(postMergeWarnings, "; ")
 		_ = g.Store.UpsertMergeGate(ctx, db.MergeGate{RepoFullName: request.Repo, PullRequest: int64(request.PullRequest), State: "merged", Reason: reason})
 	}
-	return MergeDecision{Ready: true, Merged: true, MergeCommitSHA: mergeSHA, Reason: reason}, nil
+	return MergeDecision{Ready: true, Merged: true, MergeCommitSHA: mergeSHA, Reason: PlainReason(reason)}, nil
 }
 
 func (g PolicyMergeGate) cleanupTaskWorktree(ctx context.Context, request MergeRequest, headBranch string) error {
@@ -1260,7 +1260,7 @@ func (g PolicyMergeGate) block(ctx context.Context, request MergeRequest, sha st
 			return MergeDecision{}, err
 		}
 	}
-	return MergeDecision{Reason: reason, BlockClass: class}, nil
+	return MergeDecision{Reason: PlainReason(reason), BlockClass: class}, nil
 }
 
 func (g PolicyMergeGate) pending(ctx context.Context, request MergeRequest, sha string, reason string) (MergeDecision, error) {
@@ -1282,7 +1282,7 @@ func (g PolicyMergeGate) pending(ctx context.Context, request MergeRequest, sha 
 			return MergeDecision{}, err
 		}
 	}
-	return MergeDecision{Ready: true, Reason: reason}, nil
+	return MergeDecision{Ready: true, Reason: PlainReason(reason)}, nil
 }
 
 func commitStatusDescription(description string) string {

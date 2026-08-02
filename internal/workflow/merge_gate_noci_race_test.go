@@ -56,7 +56,7 @@ func TestPolicyMergeGateZeroExternalCIDefersWithinGraceWindow(t *testing.T) {
 			t.Fatalf("Evaluate attempt %d: %v", attempt+1, err)
 		}
 		if decision.LeaveOpen || decision.EscalateMergeGateMiss || !decision.Ready || decision.Merged ||
-			!strings.Contains(decision.Reason, "waiting to confirm no external CI") {
+			!strings.Contains(decision.Reason.Render(), "waiting to confirm no external CI") {
 			t.Fatalf("decision attempt %d = %+v, want a non-escalating grace-window defer", attempt+1, decision)
 		}
 	}

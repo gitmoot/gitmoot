@@ -264,7 +264,9 @@ type MergeDecision struct {
 	Ready          bool
 	Merged         bool
 	MergeCommitSHA string
-	Reason         string
+	// Reason is a VALUE, not prose: see MergeReason. Carrying parts means no consumer
+	// holds a string it can append an instruction onto (#1381).
+	Reason         MergeReason
 	// LeaveOpen is a terminal-ish native merge-gate outcome: the pull request is
 	// deliberately left for a human action. It is distinct from Deferred, which
 	// must be retried automatically, and from a blocked quality/process failure.

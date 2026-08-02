@@ -17,7 +17,7 @@ func TestPolicyMergeGateUnknownDraftLeavesOpenBeforeForgeAccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || decision.Reason != "pull request draft state is unknown" {
+	if !decision.LeaveOpen || decision.Reason.Render() != "pull request draft state is unknown" {
 		t.Fatalf("decision = %+v, want unknown-draft leave-open", decision)
 	}
 	if gh.getCalls != 0 {

@@ -598,7 +598,7 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 	if nativeMergeGateDisabled() {
 		return workflow.MergeDecision{
 			Ready:  false,
-			Reason: "native Gitmoot merge gate disabled by GITMOOT_DISABLE_NATIVE_MERGE_GATE; use external gate",
+			Reason: workflow.PlainReason("native Gitmoot merge gate disabled by GITMOOT_DISABLE_NATIVE_MERGE_GATE; use external gate"),
 		}, nil
 	}
 	// Never make a merge-or-human decision while a job still owns this branch.
@@ -614,7 +614,7 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 			Ready:      false,
 			Merged:     false,
 			Deferred:   true,
-			Reason:     fmt.Sprintf("active %s job %s in flight on branch %s; holding merge until it settles", active.Type, active.ID, request.Branch),
+			Reason:     workflow.PlainReason(fmt.Sprintf("active %s job %s in flight on branch %s; holding merge until it settles", active.Type, active.ID, request.Branch)),
 			BlockClass: workflow.MergeBlockTransient,
 		}, nil
 	}
@@ -662,7 +662,10 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 	return decision, nil
 }
 
-func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request workflow.MergeRequest, reason string) error {
+// escalateMergeGateMiss writes the durable, operator-read escalation note. It is a DELIVERY
+// site, so it takes the MergeReason VALUE and performs the single Render itself -- the caller
+// never holds prose it could append to (#1381, site 7 of the append class).
+func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request workflow.MergeRequest, reason workflow.MergeReason) error {
 	label := strings.TrimSpace(request.WorkflowID)
 	if label == "" {
 		resolved, err := g.Store.WorkflowIDForPullRequest(ctx, request.Repo, request.PullRequest, request.Branch)
@@ -682,7 +685,7 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 	}
 	cfg, _ := loadMergeGateOrgConfig(g.Home)
 	from := mergeGateEscalationFrom(cfg, request.Repo)
-	body := workflow.FormatOrgEscalateNote(from, "jarvis", label, reason)
+	body := workflow.FormatOrgEscalateNote(from, "jarvis", label, reason.Render())
 	if body == "" {
 		return errors.New("format merge-gate escalation note")
 	}

@@ -119,7 +119,7 @@ func TestEngineHarvestsBlockedOutcomeOnce(t *testing.T) {
 	store := openEngineStore(t)
 	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
-	engine.MergeGate = &fakeMergeGate{decision: MergeDecision{Reason: "external CI failed", BlockClass: MergeBlockQuality}}
+	engine.MergeGate = &fakeMergeGate{decision: MergeDecision{Reason: PlainReason("external CI failed"), BlockClass: MergeBlockQuality}}
 	harvester := &recordingHarvester{}
 	engine.OutcomeHarvester = harvester
 	seedImplementJobForHarvest(t, store)
@@ -162,7 +162,7 @@ func TestEngineSkipsTransientBlockHarvest(t *testing.T) {
 	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
 	engine.MergeGate = &fakeMergeGate{decision: MergeDecision{
-		Reason:     "pull request is not mergeable; rebase or update the branch",
+		Reason:     PlainReason("pull request is not mergeable; rebase or update the branch"),
 		BlockClass: MergeBlockTransient,
 	}}
 	harvester := &recordingHarvester{}
@@ -203,7 +203,7 @@ func TestRunMergeGateDeferredLeavesTaskReadyToMerge(t *testing.T) {
 	}
 	engine := testEngine(store)
 	engine.MergeGate = &fakeMergeGate{decision: MergeDecision{
-		Ready: false, Deferred: true, Reason: "active implement job in flight",
+		Ready: false, Deferred: true, Reason: PlainReason("active implement job in flight"),
 		BlockClass: MergeBlockTransient,
 	}}
 	harvester := &recordingHarvester{}
@@ -243,7 +243,7 @@ func TestRunMergeGateDeferredParksPullRequestOpenTaskAtReadyToMerge(t *testing.T
 	}
 	engine := testEngine(store)
 	engine.MergeGate = &fakeMergeGate{decision: MergeDecision{
-		Ready: false, Deferred: true, Reason: "active implement job in flight",
+		Ready: false, Deferred: true, Reason: PlainReason("active implement job in flight"),
 		BlockClass: MergeBlockTransient,
 	}}
 
@@ -274,7 +274,7 @@ func TestRunMergeGateNonDeferredNotReadyStillBlocks(t *testing.T) {
 	}
 	engine := testEngine(store)
 	engine.MergeGate = &fakeMergeGate{decision: MergeDecision{
-		Ready: false, Reason: "external CI failed", BlockClass: MergeBlockQuality,
+		Ready: false, Reason: PlainReason("external CI failed"), BlockClass: MergeBlockQuality,
 	}}
 
 	decision, err := engine.runMergeGate(ctx, "", JobPayload{

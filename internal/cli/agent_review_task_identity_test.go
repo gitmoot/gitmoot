@@ -28,7 +28,7 @@ func TestStableReviewTaskIdentityLetsSecondRoundVerdictReachGate(t *testing.T) {
 func TestStableReviewTaskIdentityKeepsHeadRoundIsolation(t *testing.T) {
 	const stableTaskID = "review-pr-17-stable"
 	decision := evaluateC1GateScenario(t, stableTaskID, stableTaskID, "old-head", "new-head", stableTaskID, "reviewer", false)
-	if !decision.LeaveOpen || decision.Merged || !strings.Contains(decision.Reason, "different head SHA") {
+	if !decision.LeaveOpen || decision.Merged || !strings.Contains(decision.Reason.Render(), "different head SHA") {
 		t.Fatalf("wrong-head verdict was not rejected by the head comparison: %+v", decision)
 	}
 }
