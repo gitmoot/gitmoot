@@ -568,12 +568,90 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 	}
 }
 
+// boundCoordinatorBridgeRefusal is the clause the remedy must carry verbatim: the
+// precondition and the refusal bound to that precondition FAILING, as one span.
+//
+// It is pinned as a contiguous clause rather than as separate tokens on purpose. The remedy
+// is operator-facing instruction text -- whoever reads it treats it as the system telling
+// them what to do -- so the guard has to bind the prohibition to the condition, not merely
+// observe that both words occur somewhere in the sentence.
+const boundCoordinatorBridgeRefusal = "confirm an independent approval exists at this exact head; if it does not, do not bridge"
+
+// coordinatorBridgeRefusalPreconditionError reports why a coordinator-bridge remedy fails to
+// bind its refusal to its own precondition, or nil when it binds correctly.
+//
+// It is a function returning an error rather than a t.Fatalf helper so that the guard itself
+// can be mutation-tested: TestCoordinatorBridgeRefusalPreconditionRejectsSemanticInversion
+// feeds it texts that must be rejected. A guard that cannot be shown to fail is not a guard.
+func coordinatorBridgeRefusalPreconditionError(reason string) error {
+	if !strings.Contains(strings.ToLower(reason), boundCoordinatorBridgeRefusal) {
+		return fmt.Errorf("coordinator bridge remedy must bind its refusal to its precondition as one clause (%q): %q",
+			boundCoordinatorBridgeRefusal, reason)
+	}
+	return nil
+}
+
 func assertCoordinatorBridgeRefusalPrecondition(t *testing.T, reason string) {
 	t.Helper()
-	lower := strings.ToLower(reason)
-	hasRefusal := strings.Contains(lower, "do not bridge") || strings.Contains(lower, "must not bridge")
-	if !strings.Contains(lower, "independent approval") || !strings.Contains(lower, "exact head") || !hasRefusal {
-		t.Fatalf("coordinator bridge remedy must refuse bridging without an independent exact-head approval: %q", reason)
+	if err := coordinatorBridgeRefusalPreconditionError(reason); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCoordinatorBridgeRefusalPreconditionRejectsSemanticInversion pins the guard against the
+// texts that motivated it. Each case retains every token the previous bag-of-words check
+// looked for -- "independent approval", "exact head", "do not bridge" -- while permitting or
+// failing to forbid the unsafe action, so each one PASSED that check.
+func TestCoordinatorBridgeRefusalPreconditionRejectsSemanticInversion(t *testing.T) {
+	cases := []struct {
+		name   string
+		reason string
+	}{
+		{
+			// The review finding on #1412, verbatim in shape: the refusal survives as a
+			// token but is re-scoped onto an unrelated condition, and the real precondition
+			// is inverted into permission.
+			name: "refusal rescoped and precondition inverted",
+			reason: "latest review round's approval cannot be verified as independent: no implement job is recorded for this task. " +
+				"Use the coordinator bridge only as follows: step 1, confirm an independent approval exists at this exact head; " +
+				"if it does not, bridge anyway; do not bridge only when the pane identity is unavailable",
+		},
+		{
+			// Both halves present, never joined: the reader is told the precondition and,
+			// separately, that bridging is sometimes refused -- but not that one implies the other.
+			name: "precondition and refusal present but unbound",
+			reason: "latest review round's approval cannot be verified as independent: no implement job is recorded for this task. " +
+				"An independent approval at this exact head is relevant here. Do not bridge without care",
+		},
+		{
+			// Refusal stated before the precondition it is supposed to depend on.
+			name: "refusal precedes its precondition",
+			reason: "latest review round's approval cannot be verified as independent: do not bridge. " +
+				"Separately, confirm an independent approval exists at this exact head",
+		},
+		{
+			// The precondition is weakened from the exact head to any head.
+			name: "precondition drops the exact head",
+			reason: "latest review round's approval cannot be verified as independent: no implement job is recorded for this task. " +
+				"Use the coordinator bridge only as follows: step 1, confirm an independent approval exists; " +
+				"if it does not, do not bridge",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := coordinatorBridgeRefusalPreconditionError(tc.reason); err == nil {
+				t.Fatalf("guard accepted a remedy that does not bind its refusal to its precondition: %q", tc.reason)
+			}
+		})
+	}
+}
+
+// TestCoordinatorBridgeRefusalPreconditionAcceptsShippedRemedy is the positive half: the guard
+// must still accept the text actually shipped, so the negative cases above cannot be satisfied
+// by a guard that rejects everything.
+func TestCoordinatorBridgeRefusalPreconditionAcceptsShippedRemedy(t *testing.T) {
+	if err := coordinatorBridgeRefusalPreconditionError(noImplementJobAttributionReason); err != nil {
+		t.Fatalf("guard rejected the shipped coordinator bridge remedy: %v", err)
 	}
 }
 
