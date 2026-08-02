@@ -47,7 +47,7 @@ func TestStaleTaskReconcilerDecisions(t *testing.T) {
 		{name: "open PR branch", state: workflow.TaskImplementing, branch: "feature/one", open: true},
 		{name: "remote present", state: workflow.TaskImplementing, branch: "feature/one", remote: true, wantCalls: 1},
 		{name: "remote absent", state: workflow.TaskImplementing, branch: "feature/one", wantDismiss: true, wantCalls: 1, wantReason: "refs/heads/feature/one absent"},
-		{name: "blocked remote absent", state: workflow.TaskBlocked, branch: "feature/blocked", wantDismiss: true, wantCalls: 1, wantReason: "refs/heads/feature/blocked absent"},
+		{name: "blocked is owned by evidence disposal", state: workflow.TaskBlocked, branch: "feature/blocked"},
 		{name: "empty branch", state: workflow.TaskImplementing, wantDismiss: true, wantReason: "empty branch"},
 		{name: "live job", state: workflow.TaskImplementing, branch: "feature/live", live: true},
 	}
@@ -169,7 +169,7 @@ func TestStaleTaskReconcilerLogsTickCounts(t *testing.T) {
 	if err := d.reconcileStaleTasks(ctx, map[string]struct{}{}); err != nil {
 		t.Fatal(err)
 	}
-	if len(logs) != 1 || logs[0] != "stale task reconciler for owner/repo: candidates=3 checked=3 dismissed=2" {
+	if len(logs) != 1 || logs[0] != "stale task reconciler for owner/repo: candidates=2 checked=2 dismissed=1" {
 		t.Fatalf("logs = %v", logs)
 	}
 }

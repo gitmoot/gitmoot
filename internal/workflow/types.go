@@ -10,6 +10,8 @@ const (
 	TaskChangesRequested TaskState = "changes_requested"
 	TaskReadyToMerge     TaskState = "ready_to_merge"
 	TaskMerged           TaskState = "merged"
+	TaskSuperseded       TaskState = "superseded"
+	TaskStranded         TaskState = "stranded"
 	TaskBlocked          TaskState = "blocked"
 	// TaskAwaitingHumanMerge parks an otherwise-ready pull request for a human
 	// merge. It is intentionally distinct from TaskBlocked and TaskAwaitingHuman:
@@ -24,6 +26,18 @@ const (
 	// it via `/gitmoot resume <jobID> retry|continue|abort`.
 	TaskAwaitingHuman TaskState = "awaiting_human"
 )
+
+// IsDisposedTaskState reports terminal disposal outcomes that ordinary workflow
+// advancement must never resurrect. Dismissed retains its explicit recovery
+// path; superseded and stranded are evidence/audit outcomes requiring a new task.
+func IsDisposedTaskState(state string) bool {
+	switch TaskState(state) {
+	case TaskDismissed, TaskSuperseded, TaskStranded:
+		return true
+	default:
+		return false
+	}
+}
 
 type JobState string
 

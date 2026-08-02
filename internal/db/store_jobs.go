@@ -99,6 +99,9 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
 		return err
 	}
+	if err := resolveAwaitedReviewFactTx(ctx, tx, job.ID, job.Agent, job.Type, job.State, job.Payload, time.Now().UTC()); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -618,78 +621,30 @@ func (s *Store) ClaimRunningJob(ctx context.Context, id string, from string, to 
 	return true, tx.Commit()
 }
 
-// RequeueRunningJobsFromForeignBoot requeues (running->queued) every running job
-// whose recorded runner_boot_id proves it was claimed on a PREVIOUS boot of this
-// host (#651): the host has since rebooted, so its in-process worker is
-// definitively dead and the job must be re-dispatched immediately — regardless of
-// any unexpired runtime-session lease, which survives a reboot in the DB and would
-// otherwise keep the job "held" until it expired (the AC2 gap this closes). Each
-// requeue appends a job_event for the audit trail. It returns the ids actually
-// requeued so the daemon can log them.
-//
-// It is a STRICT no-op when currentBootID is "" (a non-Linux host or a boot id
-// that could not be read): with no boot identity there is nothing to compare
-// against, so behavior is byte-identical to before this feature. The `!= ”`
-// guard likewise never touches identity-less legacy rows (pre-upgrade running
-// jobs), leaving them to the existing age/lease recovery. It NEVER touches a
-// same-boot job — same-boot liveness stays governed by the age/lease gate, so no
-// live in-process worker is ever double-run.
-func (s *Store) RequeueRunningJobsFromForeignBoot(ctx context.Context, currentBootID string) ([]string, error) {
+// ListRunningJobIDsFromForeignBoot returns running jobs whose recorded runner
+// belongs to a previous host boot. It does not change state: daemon recovery
+// owns the terminal policy and records the evidence-bearing transition.
+func (s *Store) ListRunningJobIDsFromForeignBoot(ctx context.Context, currentBootID string) ([]string, error) {
 	currentBootID = strings.TrimSpace(currentBootID)
 	if currentBootID == "" {
 		return nil, nil
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM jobs
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM jobs
 		WHERE state = 'running' AND runner_boot_id != '' AND runner_boot_id != ?
 		ORDER BY id`, currentBootID)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 	var ids []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			rows.Close()
 			return nil, err
 		}
 		ids = append(ids, id)
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, err
-	}
-	rows.Close()
-
-	requeued := make([]string, 0, len(ids))
-	for _, id := range ids {
-		res, err := tx.ExecContext(ctx, `UPDATE jobs SET state = 'queued', updated_at = CURRENT_TIMESTAMP
-			WHERE id = ? AND state = 'running' AND runner_boot_id != '' AND runner_boot_id != ?`, id, currentBootID)
-		if err != nil {
-			return nil, err
-		}
-		affected, err := res.RowsAffected()
-		if err != nil {
-			return nil, err
-		}
-		if affected == 0 {
-			continue
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
-			id, "queued", "recovered running job claimed on a previous boot (host rebooted)"); err != nil {
-			return nil, err
-		}
-		requeued = append(requeued, id)
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return requeued, nil
+	return ids, rows.Err()
 }
 
 func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id string, from string, to string, payload string, event JobEvent, extraEvents ...JobEvent) (bool, error) {
@@ -729,6 +684,13 @@ func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id strin
 		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, extra.JobID, extra.Kind, extra.Message); err != nil {
 			return false, err
 		}
+	}
+	var agent, jobType string
+	if err := tx.QueryRowContext(ctx, `SELECT agent, type FROM jobs WHERE id = ?`, id).Scan(&agent, &jobType); err != nil {
+		return false, err
+	}
+	if err := resolveAwaitedReviewFactTx(ctx, tx, id, agent, jobType, to, payload, time.Now().UTC()); err != nil {
+		return false, err
 	}
 	return true, tx.Commit()
 }
@@ -881,6 +843,13 @@ func (s *Store) UpdateJobPayloadAndStateWithEvent(ctx context.Context, id string
 		event.JobID = id
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+		return err
+	}
+	var agent, jobType string
+	if err := tx.QueryRowContext(ctx, `SELECT agent, type FROM jobs WHERE id = ?`, id).Scan(&agent, &jobType); err != nil {
+		return err
+	}
+	if err := resolveAwaitedReviewFactTx(ctx, tx, id, agent, jobType, state, payload, time.Now().UTC()); err != nil {
 		return err
 	}
 	return tx.Commit()

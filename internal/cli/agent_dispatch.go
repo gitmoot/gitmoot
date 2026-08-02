@@ -51,6 +51,7 @@ type localAgentDispatchRequest struct {
 	JobTimeout       time.Duration
 	TaskID           string
 	PullRequest      int
+	PullRequestReady bool
 	HeadSHA          string
 	// ImplementBase is the CLI/config worktree base for implement dispatches.
 	// Before the request can enqueue, it is resolved to a commit SHA and
@@ -290,6 +291,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		Repo:                   repo.FullName(),
 		Branch:                 firstNonEmpty(request.Branch, record.DefaultBranch),
 		PullRequest:            request.PullRequest,
+		PullRequestReady:       request.PullRequestReady,
 		HeadSHA:                request.HeadSHA,
 		GoalID:                 request.GoalID,
 		TaskID:                 request.TaskID,
@@ -684,8 +686,8 @@ func prepareLocalReviewWorktree(ctx context.Context, store *db.Store, record db.
 	}
 	if strings.TrimSpace(request.Branch) != "" {
 		if task, err := store.GetTaskByRepoBranch(ctx, repo.FullName(), request.Branch); err == nil {
-			if task.State == string(workflow.TaskDismissed) {
-				return localAgentDispatchRequest{}, "", dismissedReviewTaskError(task.ID)
+			if workflow.IsDisposedTaskState(task.State) {
+				return localAgentDispatchRequest{}, "", disposedReviewTaskError(task)
 			}
 			if strings.TrimSpace(task.WorktreePath) != "" {
 				head, headErr := (gitutil.Client{Dir: task.WorktreePath}).HeadSHA(ctx)
@@ -709,11 +711,11 @@ func prepareLocalReviewWorktree(ctx context.Context, store *db.Store, record db.
 	}
 	taskID := strings.TrimSpace(request.TaskID)
 	if taskID == "" {
-		taskID = fmt.Sprintf("review-pr-%d-%s", request.PullRequest, shortHash(repo.FullName()+"\x00"+request.HeadSHA))
+		taskID = fmt.Sprintf("review-pr-%d-%s", request.PullRequest, shortHash(repo.FullName()))
 	}
 	if existing, err := store.GetTask(ctx, taskID); err == nil {
-		if existing.State == string(workflow.TaskDismissed) {
-			return localAgentDispatchRequest{}, "", dismissedReviewTaskError(existing.ID)
+		if workflow.IsDisposedTaskState(existing.State) {
+			return localAgentDispatchRequest{}, "", disposedReviewTaskError(existing)
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return localAgentDispatchRequest{}, "", err
@@ -744,12 +746,18 @@ func prepareLocalReviewWorktree(ctx context.Context, store *db.Store, record db.
 		State:        string(workflow.TaskReviewing),
 		WorktreePath: path,
 	}
-	updated, err := store.UpsertTaskUnlessState(ctx, task, string(workflow.TaskDismissed))
+	updated, err := store.UpsertTaskUnlessStates(ctx, task, []string{
+		string(workflow.TaskDismissed), string(workflow.TaskSuperseded), string(workflow.TaskStranded),
+	})
 	if err != nil {
 		return localAgentDispatchRequest{}, "", err
 	}
 	if !updated {
-		return localAgentDispatchRequest{}, "", dismissedReviewTaskError(task.ID)
+		existing, loadErr := store.GetTask(ctx, task.ID)
+		if loadErr != nil {
+			return localAgentDispatchRequest{}, "", loadErr
+		}
+		return localAgentDispatchRequest{}, "", disposedReviewTaskError(existing)
 	}
 	request.TaskID = task.ID
 	request.GoalID = task.GoalID
@@ -759,6 +767,13 @@ func prepareLocalReviewWorktree(ctx context.Context, store *db.Store, record db.
 
 func dismissedReviewTaskError(taskID string) error {
 	return fmt.Errorf("task %s is dismissed; run task recover first", taskID)
+}
+
+func disposedReviewTaskError(task db.Task) error {
+	if task.State == string(workflow.TaskDismissed) {
+		return dismissedReviewTaskError(task.ID)
+	}
+	return fmt.Errorf("task %s is %s; create a successor task before dispatching another review", task.ID, task.State)
 }
 
 func prepareLocalImplementDispatchRequest(ctx context.Context, store *db.Store, record db.Repo, repo github.Repository, request localAgentDispatchRequest) (db.Task, localAgentDispatchRequest, error) {

@@ -133,6 +133,12 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	if !g.AutoMerge && !request.HumanMergeRequested {
 		return MergeDecision{LeaveOpen: true, Reason: MergeLeaveOpenAutoMergeKillSwitchReason}, nil
 	}
+	if request.PullRequestDraftUnknown {
+		return MergeDecision{LeaveOpen: true, Reason: "pull request draft state is unknown"}, nil
+	}
+	if request.PullRequestDraft {
+		return MergeDecision{LeaveOpen: true, Reason: "pull request is draft"}, nil
+	}
 	if err := g.validate(); err != nil {
 		return MergeDecision{}, err
 	}
@@ -431,25 +437,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		return err
 	}
 	current := JobPayload{Repo: request.Repo, PullRequest: request.PullRequest, TaskID: request.TaskID}
-	implementingAgents := map[string]struct{}{}
-	for _, job := range jobs {
-		if job.Type != "implement" {
-			continue
-		}
-		payload, err := unmarshalPayload(job.Payload)
-		if err != nil {
-			// A malformed implement record cannot prove authorship for this
-			// task, but it also must not block unrelated merge gates.
-			continue
-		}
-		if !sameTask(current, payload) {
-			continue
-		}
-		agent := strings.TrimSpace(job.Agent)
-		if agent != "" {
-			implementingAgents[agent] = struct{}{}
-		}
-	}
+	implementerAttribution := collectImplementerAttribution(jobs, current)
+	implementingAgents := implementerAttribution.agents
+	missingImplementerReason := implementerAttribution.failureReason()
 	delegationChildrenByParent := make(map[string][]db.Job)
 	for _, job := range jobs {
 		parentID := strings.TrimSpace(job.ParentJobID)
@@ -560,7 +550,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 					}
 				case len(implementingAgents) == 0:
 					if unknownImplementerReason == "" {
-						unknownImplementerReason = "latest review round's approval cannot be verified as independent because the implementing agent for this task could not be determined"
+						unknownImplementerReason = missingImplementerReason
 					}
 				default:
 					if _, selfApproved := implementingAgents[reviewer]; selfApproved && selfApprovalReason == "" {
@@ -641,7 +631,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 				continue
 			case len(implementingAgents) == 0:
 				if unknownImplementerReason == "" {
-					unknownImplementerReason = "latest review round's approval cannot be verified as independent because the implementing agent for this task could not be determined"
+					unknownImplementerReason = missingImplementerReason
 				}
 				continue
 			default:
@@ -809,6 +799,68 @@ func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job) error {
 		"delegated review parent %s has no surviving delegation evidence; rerun or repair the delegated review",
 		parent.ID,
 	)
+}
+
+const (
+	noImplementJobAttributionReason            = "latest review round's approval cannot be verified as independent: no implement job is recorded for this task. Use the coordinator bridge: read the engine review job's agent identity and decision at the exact head with gitmoot job show <job-id>, confirm the implementer identity from the pane session, journal both with gitmoot workflow note, then merge the lane"
+	mismatchedImplementTaskAttributionReason   = "latest review round's approval cannot be verified as independent: implement jobs are recorded, but none match this task identity; this is an attribution anomaly and may indicate a stable-task-identity regression"
+	emptyImplementAgentAttributionReason       = "latest review round's approval cannot be verified as independent: an implement job matches this task but has no recorded agent; this is an attribution data anomaly"
+	malformedImplementPayloadAttributionReason = "latest review round's approval cannot be verified as independent: an implement job has a malformed payload, so attribution for this task cannot be verified; this is a corrupt-record anomaly"
+)
+
+type implementerAttributionEvidence struct {
+	agents              map[string]struct{}
+	sawImplementJob     bool
+	sawTaskMismatch     bool
+	sawEmptyAgent       bool
+	sawMalformedPayload bool
+}
+
+func collectImplementerAttribution(jobs []db.Job, current JobPayload) implementerAttributionEvidence {
+	evidence := implementerAttributionEvidence{agents: make(map[string]struct{})}
+	for _, job := range jobs {
+		if job.Type != "implement" {
+			continue
+		}
+		evidence.sawImplementJob = true
+		payload, err := unmarshalPayload(job.Payload)
+		if err != nil {
+			evidence.sawMalformedPayload = true
+			continue
+		}
+		if !sameTask(current, payload) {
+			if current.Repo != "" && current.Repo == payload.Repo &&
+				current.PullRequest > 0 && current.PullRequest == payload.PullRequest {
+				evidence.sawTaskMismatch = true
+			}
+			continue
+		}
+		agent := strings.TrimSpace(job.Agent)
+		if agent == "" {
+			evidence.sawEmptyAgent = true
+			continue
+		}
+		evidence.agents[agent] = struct{}{}
+	}
+	return evidence
+}
+
+func (e implementerAttributionEvidence) failureReason() string {
+	if len(e.agents) > 0 {
+		return ""
+	}
+	switch {
+	case e.sawMalformedPayload:
+		return malformedImplementPayloadAttributionReason
+	case e.sawEmptyAgent:
+		return emptyImplementAgentAttributionReason
+	case e.sawTaskMismatch:
+		return mismatchedImplementTaskAttributionReason
+	case !e.sawImplementJob:
+		return noImplementJobAttributionReason
+	default:
+		return noImplementJobAttributionReason
+	}
 }
 
 func reviewAuthorshipFailureReason(selfApproval string, unknownImplementer string, unattributedReviewer string) string {

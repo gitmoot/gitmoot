@@ -178,6 +178,9 @@ func (e Engine) AllocateTaskWorktree(ctx context.Context, request TaskWorktreeRe
 	if task.State == string(TaskDismissed) {
 		return db.Task{}, fmt.Errorf("task %s is dismissed; recover it explicitly before allocating a worktree", request.TaskID)
 	}
+	if task.State == string(TaskSuperseded) || task.State == string(TaskStranded) {
+		return db.Task{}, fmt.Errorf("task %s is %s; create a successor task before allocating a worktree", request.TaskID, task.State)
+	}
 	if task.State == string(TaskAwaitingHumanMerge) {
 		return db.Task{}, fmt.Errorf("task %s is awaiting a human merge decision; resolve it before allocating a worktree", request.TaskID)
 	}

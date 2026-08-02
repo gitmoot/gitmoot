@@ -665,7 +665,7 @@ func TestBuildEscalationCommentIsNotParsedAsCommand(t *testing.T) {
 
 	// And end-to-end: the daemon's own parser yields no command at all for the
 	// notification body, so the daemon never acks it as an (un)routable command.
-	if cmds := daemon.ParseCommands(body); len(cmds) != 0 {
+	if cmds := daemon.ParseCommandsWithoutAuthorization(body); len(cmds) != 0 {
 		t.Fatalf("escalation comment parsed into %d command(s); want 0: %+v\nbody:\n%s", len(cmds), cmds, body)
 	}
 }
@@ -700,7 +700,7 @@ func TestBuildAskGateComment(t *testing.T) {
 		t.Fatalf("ask-gate comment must NOT offer the failure verbs; body:\n%s", body)
 	}
 	// Same command-injection guard as the failure comment.
-	if cmds := daemon.ParseCommands(body); len(cmds) != 0 {
+	if cmds := daemon.ParseCommandsWithoutAuthorization(body); len(cmds) != 0 {
 		t.Fatalf("ask-gate comment parsed into %d command(s); want 0: %+v\nbody:\n%s", len(cmds), cmds, body)
 	}
 }

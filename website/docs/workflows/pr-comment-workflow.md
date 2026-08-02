@@ -24,10 +24,50 @@ A bare `@<agent>` mention works as the same command (#389):
 Mentions are also routed on **issue** comments when the daemon runs with
 `--watch-issues` (on issues only the `ask` action is acted on).
 
-The daemon polls GitHub, checks that comments are from users allowed to route
-work, queues jobs, invokes the selected agent runtime, and posts attributed
-results back to the PR. The selected agent's runtime can be `codex`, `claude`,
-`kimi` (Kimi Code CLI), or `kimi-cli` (the opt-in legacy Kimi CLI adapter).
+Before parsing, Gitmoot removes triple-backtick and tilde fenced code blocks and
+closed inline backtick spans (including single-backtick spans).
+
+**Symptom: my command in a bulleted list did nothing.** Any command line
+indented by four spaces or a tab is treated as code and will not run, including
+list-item continuation under a bullet or numbered item. For example, this
+command is ignored:
+
+```text
+- Please run:
+
+    @helper ask check the build
+```
+
+Put the command at column zero to run it:
+
+```text
+@helper ask check the build
+```
+
+GitHub must then
+report that the comment author currently has `write`, `maintain`, or `admin`
+repository permission; unauthorized addressed commands are rejected without
+parsing their command text. Ordinary prose and code examples produce no reply.
+An authorized malformed command still produces a visible routing error. An
+unclosed fenced code block treats the remainder of the comment as code, so any
+later command is ignored without a reply.
+
+On a **pull request**, a line that is addressed by shape but names an action
+Gitmoot does not implement produces **no reply** — it is recorded in the daemon
+log instead. Source code reaches this path routinely, because a decorator or
+attribute line such as `@Published private(set) var state = .uninitialized`
+matches the `@<agent> <action>` mention form outside a code fence. A
+*recognized* action given a bad argument (for example `@helper retry` with no
+job id) still replies, so genuine command feedback is preserved.
+
+On an **issue**, only `ask` is acted on, so any other action — recognized or
+not — is dropped before dispatch with no reply **and no log entry**. When an
+issue comment appears to have been ignored, the daemon log will not explain it.
+
+The daemon polls GitHub, applies that author gate, queues jobs, invokes the
+selected agent runtime, and posts attributed results back to the PR. The
+selected agent's runtime can be `codex`, `claude`, `kimi` (Kimi Code CLI), or
+`kimi-cli` (the opt-in legacy Kimi CLI adapter).
 
 Expected result comments include the agent identity, runtime, the template when
 one is attached, and the job id:

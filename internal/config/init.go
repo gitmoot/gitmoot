@@ -43,8 +43,9 @@ artifact_blobs = %q
 # default, or "HEAD" to follow the registered checkout. With no value, implement
 # follows checkout HEAD and guards stale non-default checkouts. result_checks is
 # off | warn | block and defaults to warn when omitted. stale_task_ttl is the
-# conservative updated_at age after which abandoned implementing/blocked tasks
-# may be auto-dismissed; it defaults to 168h and "0" disables that reconciler.
+# conservative updated_at age after which abandoned implementing tasks are
+# branch-cleaned and blocked/awaiting_human_merge tasks are evidence-disposed
+# to a terminal state; it defaults to 168h and "0" disables those reconcilers.
 # delegation_worktree_ttl defaults to 72h and bounds terminal-job worktree
 # retention; terminal owners cannot resume, so this safe cleanup is default-on.
 # Set it to "0" to disable the TTL reclaim pass.

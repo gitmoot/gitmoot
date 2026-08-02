@@ -116,10 +116,23 @@ first.
 `implementing` or `blocked` task. It refuses while a matching job or worktree
 process is live, preserves the branch and worktree, releases the branch lock
 best-effort, and records `task_dismissed_manual`. The daemon can record
-`task_dismissed_auto` for stale candidates using `updated_at` as a conservative
-activity proxy. Configure `[workflow].stale_task_ttl = "168h"` (the default), or
-set it to `"0"` to disable this poll leg. Candidates with a same-repo open PR,
-a remote branch, a live job, or an uncertain remote check are not dismissed.
+`task_dismissed_auto` for stale `implementing` candidates using `updated_at` as
+a conservative activity proxy. Configure `[workflow].stale_task_ttl = "168h"`
+(the default), or set it to `"0"` to disable this poll leg. Candidates with a
+same-repo open PR, a remote branch, a live job, or an uncertain remote check are
+not dismissed.
+
+The same TTL bounds `blocked` and `awaiting_human_merge` rows through a separate,
+evidence-based disposal pass. In order, an own merged PR produces `merged`; a
+later merged task or PR for the same referenced issue produces `superseded`; a
+closed referenced issue/PR produces `superseded`; and the bounded fallback is
+`stranded`. No tier uses git ancestry. An open `awaiting_human_merge` PR remains
+protected and falls to the visible `stranded` queue rather than being inferred
+complete. `task list --state stranded --json` exposes `disposal_tier`,
+`disposal_reason`, `disposed_at`, and the terminal escalation route.
+Separately, a continuous blocked episode emits at most three interval-spaced
+alerts plus one terminal escalation; alert exhaustion stays queryable and does
+not itself dispose the task.
 
 `task resume-work` is the coordinator-only, non-terminal exit from orphaned
 `reviewing`/`ready_to_merge` machinery back to `implementing`. It also supports
@@ -550,6 +563,14 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    base branch because another PR merged first, Gitmoot asks GitHub to update the
    PR branch with the expected head SHA and leaves the merge gate pending so the
    daemon can reload the new head and checks on a later poll tick.
+
+   When review independence cannot be verified, the decline names the observed
+   cause: no implement job for the task, task-identity mismatch, a matching job
+   with no agent, or a malformed implement payload. All four remain fail-closed.
+   For the no-job case, the coordinator bridge is to inspect the exact-head
+   engine review with `gitmoot job show <job-id>`, confirm the implementer from
+   the pane session, and journal both facts with `gitmoot workflow note`. The
+   journal is an operator record, never an attestation consumed by the gate.
 
    When a head reports **no** external CI at all (zero commit-statuses and zero
    check-runs), Gitmoot does not conclude "this repo has no CI" from a single

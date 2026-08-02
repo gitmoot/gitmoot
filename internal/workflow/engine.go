@@ -393,8 +393,8 @@ func (e Engine) setTaskState(ctx context.Context, ref taskRef, state TaskState) 
 		return err
 	}
 	if err == nil {
-		if existing.State == string(TaskDismissed) && state != TaskDismissed {
-			return fmt.Errorf("task %s is dismissed; workflow advancement cannot move it to %s", existing.ID, state)
+		if IsDisposedTaskState(existing.State) && existing.State != string(state) {
+			return fmt.Errorf("task %s is %s; workflow advancement cannot move it to %s", existing.ID, existing.State, state)
 		}
 		if task.GoalID == "" {
 			task.GoalID = existing.GoalID
@@ -422,8 +422,8 @@ func (e Engine) setTaskState(ctx context.Context, ref taskRef, state TaskState) 
 			return berr
 		}
 		if berr == nil && byBranch.ID != task.ID {
-			if byBranch.State == string(TaskDismissed) && state != TaskDismissed {
-				return fmt.Errorf("task %s is dismissed; workflow advancement cannot move it to %s", byBranch.ID, state)
+			if IsDisposedTaskState(byBranch.State) && byBranch.State != string(state) {
+				return fmt.Errorf("task %s is %s; workflow advancement cannot move it to %s", byBranch.ID, byBranch.State, state)
 			}
 			byBranch.State = string(state)
 			return e.Store.UpsertTask(ctx, byBranch)

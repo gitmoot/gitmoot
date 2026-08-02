@@ -7,6 +7,7 @@ const (
 	OrgDirectiveAckPrefix    = "[org:directive-ack "
 	OrgDirectiveCancelPrefix = "[org:directive-cancel "
 	OrgDirectiveDonePrefix   = "[org:directive-done "
+	OrgDirectiveExhaustedPrefix = "[org:directive-exhausted "
 )
 
 func FormatOrgDirectiveNote(from, to, wf, directive string) string {
@@ -37,6 +38,19 @@ func FormatOrgDirectiveCancelNote(directiveID int64, by string) string {
 
 func ParseOrgDirectiveCancelNote(body string) (directiveID int64, by string, ok bool) {
 	return parseOrgDirectiveReceipt("directive-cancel", body)
+}
+
+// FormatOrgDirectiveExhaustedNote records that a nudge ladder ran to its cap
+// without the obligation being met (#1352). It is a MARKER NOTE rather than only
+// a column because ack, cancel, done and escalate are all notes and Comms builds
+// its threads from notes — a column-only terminal state was the anomaly, and
+// invisible to the operator who needs it most.
+func FormatOrgDirectiveExhaustedNote(directiveID int64, by string) string {
+	return formatOrgDirectiveReceipt("directive-exhausted", directiveID, by)
+}
+
+func ParseOrgDirectiveExhaustedNote(body string) (directiveID int64, by string, ok bool) {
+	return parseOrgDirectiveReceipt("directive-exhausted", body)
 }
 
 func FormatOrgDirectiveDoneNote(directiveID int64, by string) string {

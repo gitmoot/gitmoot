@@ -82,6 +82,7 @@ func TestEventTypeEnumValues(t *testing.T) {
 		EventOrgInputPending:            "org.input_pending",
 		EventOrgReply:                   "org.reply",
 		EventOrgDirective:               "org.directive",
+		EventOrgFact:                    "org.fact",
 		EventCandidateAwaitingPromotion: "candidate.awaiting_promotion",
 		EventCandidateAutoPromoted:      "candidate.auto_promoted",
 		EventJobStarted:                 "job.started",

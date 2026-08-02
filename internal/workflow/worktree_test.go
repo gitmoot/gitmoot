@@ -134,6 +134,27 @@ func TestEngineAllocateTaskWorktreeRejectsDismissedTask(t *testing.T) {
 	}
 }
 
+func TestEngineAllocateTaskWorktreeRejectsEvidenceDisposedTask(t *testing.T) {
+	for _, terminal := range []TaskState{TaskSuperseded, TaskStranded} {
+		t.Run(string(terminal), func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			branch := "feature/" + string(terminal)
+			if err := store.UpsertTask(ctx, db.Task{ID: "task-terminal", RepoFullName: "owner/repo", State: string(terminal), Branch: branch, WorktreePath: "/tmp/preserved"}); err != nil {
+				t.Fatal(err)
+			}
+			manager := &fakeWorktreeManager{}
+			_, err := testEngine(store).AllocateTaskWorktree(ctx, TaskWorktreeRequest{Home: t.TempDir(), Repo: "owner/repo", TaskID: "task-terminal", Branch: branch, Owner: "lead"}, manager)
+			if err == nil || !strings.Contains(err.Error(), string(terminal)) {
+				t.Fatalf("AllocateTaskWorktree error = %v", err)
+			}
+			if len(manager.calls) != 0 {
+				t.Fatalf("manager calls = %+v", manager.calls)
+			}
+		})
+	}
+}
+
 func TestEngineAllocateTaskWorktreeRejectsAwaitingHumanMergeTask(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

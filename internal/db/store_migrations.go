@@ -1883,4 +1883,60 @@ CREATE INDEX idx_workflow_notes_directive_oldest
 	`
 ALTER TABLE branch_locks ADD COLUMN acting_org_role TEXT NOT NULL DEFAULT '';
 	`,
+	// #1352 directive nudge ladder. directive_nudge_count is CUMULATIVE and is
+	// never reset at ack, so it cannot express a per-phase cap on its own — the
+	// completion phase gets its own counter. directive_exhausted_at is the
+	// TERMINAL, QUERYABLE state the ladder ends in: the row stays listed and
+	// visible with a stamp, rather than the obligation vanishing into silence.
+	// Both legacy defaults ('' and 0) mean "not yet", so pre-migration rows
+	// behave exactly as they do today.
+	`
+ALTER TABLE workflow_notes ADD COLUMN directive_done_nudge_count INTEGER NOT NULL DEFAULT 0
+	CHECK(directive_done_nudge_count >= 0);
+ALTER TABLE workflow_notes ADD COLUMN directive_exhausted_at TEXT NOT NULL DEFAULT '';
+	`,
+	// #1368 durable awaited facts. A waiting row is the subscription; satisfied
+	// and expired are terminal, queryable outcomes. The partial unique index
+	// prevents duplicate live interests while allowing a later bounded wait for
+	// the same subject after an earlier terminal outcome. Append-only tail;
+	// migrations are positional.
+	`
+CREATE TABLE awaited_facts (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	waiter_role TEXT NOT NULL,
+	subject_kind TEXT NOT NULL,
+	subject_key TEXT NOT NULL,
+	deadline TEXT NOT NULL,
+	state TEXT NOT NULL DEFAULT 'waiting'
+		CHECK(state IN ('waiting', 'satisfied', 'expired')),
+	resolution_detail TEXT NOT NULL DEFAULT '',
+	satisfied_at TEXT NOT NULL DEFAULT '',
+	expired_at TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX idx_awaited_facts_live_subject
+	ON awaited_facts(waiter_role, subject_kind, subject_key)
+	WHERE state = 'waiting';
+CREATE INDEX idx_awaited_facts_waiting_deadline
+	ON awaited_facts(deadline, id)
+	WHERE state = 'waiting';
+	`,
+	// #1344 evidence-based task disposal. The task columns keep the terminal
+	// outcome and notification-routing result queryable; the episode columns cap
+	// blocked alerts independently without disposing the task. Empty/zero defaults
+	// preserve every pre-migration row. Append-only tail; migrations are positional
+	// and this entry must never be inserted earlier in the slice.
+	`
+ALTER TABLE tasks ADD COLUMN disposal_tier TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN disposal_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN disposal_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN disposal_escalation_role TEXT NOT NULL DEFAULT '';
+ALTER TABLE org_blocked_episodes ADD COLUMN task_emit_count INTEGER NOT NULL DEFAULT 0
+	CHECK(task_emit_count >= 0);
+ALTER TABLE org_blocked_episodes ADD COLUMN task_exhausted_at TEXT NOT NULL DEFAULT '';
+CREATE INDEX idx_tasks_disposal_candidates
+	ON tasks(repo_full_name, state, updated_at, id)
+	WHERE state IN ('blocked', 'awaiting_human_merge');
+	`,
 }

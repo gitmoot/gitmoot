@@ -2327,7 +2327,7 @@ func recoverKillPendingJobs(ctx context.Context, store *db.Store, stdout io.Writ
 		return err
 	}
 	for _, job := range jobs {
-		if job.State != string(workflow.JobRunning) {
+		if job.State != string(workflow.JobRunning) || isSessionRecordedJob(job) {
 			continue
 		}
 		events, err := store.ListJobEvents(ctx, job.ID)
@@ -2349,11 +2349,8 @@ func recoverKillPendingJobs(ctx context.Context, store *db.Store, stdout io.Writ
 		if !pending || terminalAfterPending {
 			continue
 		}
-		settled, err := store.TransitionJobStateWithEvent(ctx, job.ID, string(workflow.JobRunning), string(workflow.JobFailed), db.JobEvent{
-			JobID:   job.ID,
-			Kind:    string(workflow.JobFailed),
-			Message: "killed-by-deadline-unwitnessed",
-		})
+		settled, err := failRecoveredRunningJob(ctx, store, stdout, time.Now().UTC(), job,
+			"daemon died mid-kill after job_kill_pending witness (killed-by-deadline-unwitnessed)")
 		if err != nil {
 			return err
 		}

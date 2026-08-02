@@ -71,12 +71,38 @@ func TestParseCommandMentionForm(t *testing.T) {
 }
 
 func TestParseCommandsOnlyReturnsGitmootLines(t *testing.T) {
-	commands := ParseCommands("hello\n/gitmoot status\n/gitmoot merge when ready\nthanks")
+	commands := ParseCommandsWithoutAuthorization("hello\n/gitmoot status\n/gitmoot merge when ready\nthanks")
 	if len(commands) != 2 {
 		t.Fatalf("commands length = %d, want 2", len(commands))
 	}
 	if commands[0].Action != "status" || commands[1].Action != "merge" || commands[1].Instructions != "when ready" {
 		t.Fatalf("commands = %+v", commands)
+	}
+}
+
+func TestParseCommandsIgnoreIndentedCodeBlocks(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       string
+		wantAction string
+	}{
+		{name: "four spaces", body: "    ```\n    /gitmoot status"},
+		{name: "tab", body: "\t```\n\t/gitmoot status"},
+		{name: "unindented command", body: "/gitmoot status", wantAction: "status"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			commands := ParseCommandsWithoutAuthorization(test.body)
+			if test.wantAction == "" {
+				if len(commands) != 0 {
+					t.Fatalf("commands = %+v, want none", commands)
+				}
+				return
+			}
+			if len(commands) != 1 || commands[0].Action != test.wantAction {
+				t.Fatalf("commands = %+v, want one %s command", commands, test.wantAction)
+			}
+		})
 	}
 }
 
