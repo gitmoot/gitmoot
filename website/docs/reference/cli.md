@@ -730,13 +730,19 @@ together. Invalid actions and contradictions are rejected before enqueue;
 notably, `--action review` requires `--pr`, while `--action implement --pr` is
 the explicit existing-PR fix-pass route.
 
-Before delivery, these dispatch commands scan commit-shaped tokens in the
-prompt against the target repository. If a token resolves to a commit other
-than the dispatch head, Gitmoot prints an advisory warning such as
+Before delivery, these dispatch commands scan commit-shaped tokens against the
+target repository. If a token resolves to a commit other than the dispatch head,
+Gitmoot prints an advisory warning such as
 `prompt references commit <referenced>, but the dispatch head is <head>; Gitmoot
 will use dispatch head <head>`. The job still runs because prompts may
 legitimately discuss historical commits. Hex strings that do not resolve to a
 commit, including mutation-hygiene SHA-256 restore hashes, do not warn.
+
+**The scan covers the instructions you pass on the command line, and nothing
+else.** Text contributed by a recipe template (`--recipe`) or by the selected
+agent's own template is not scanned, so a stale commit cited inside a template
+body dispatches with no warning. If you drive dispatches through templates,
+treat this warning as covering your instructions only.
 
 New implementation PRs opened by the engine are drafts by default. Use
 `--ready` on `agent run`, `agent implement`, or `orchestrate` to opt into an
