@@ -109,7 +109,19 @@ func (d Daemon) Run(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		_ = d.PollOnce(ctx)
+		// Continuing past a poll error is deliberate and pinned by
+		// TestRunContinuesAfterPollError: one bad tick must not stop the watcher.
+		// REPORTING it is equally deliberate. A discarded error made this loop
+		// indistinguishable from a healthy one, which is tolerable while every error is
+		// transient and self-describing elsewhere -- and stops being tolerable the moment
+		// a CALLER DEFECT can reach here. #1381 made the merge gate REFUSE a malformed
+		// gate miss instead of panicking, exactly so an unattended daemon survives it; a
+		// refusal nobody can observe converts that panic into silence, which is the worse
+		// of the two. The task stays retryable and fails identically every interval with
+		// nothing emitted anywhere. Log it and keep polling.
+		if err := d.PollOnce(ctx); err != nil {
+			d.logf("poll error: %v", err)
+		}
 		if err := d.sleep(ctx, interval); err != nil {
 			return err
 		}

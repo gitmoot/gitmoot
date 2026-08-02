@@ -269,16 +269,31 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		// mid-poll) AND an idle tracker (excludes already in-flight jobs, which
 		// the tick no longer holds the lock for while they run, #562). Otherwise
 		// fall back to the recovery-command-only poll, exactly as before.
+		//
+		// Both polls REPORT their error and keep looping, matching every other
+		// housekeeping step in this loop (auto-settle, reaper, heartbeat scan) instead of
+		// discarding it. Single-repo mode was the ONE supervisor where a PollOnce failure
+		// produced no log line, no escalation note and no persisted LastError; the
+		// registered-repo supervisor already surfaces and persists both. That gap only
+		// became load-bearing when a CALLER DEFECT could reach here: #1381 made the merge
+		// gate REFUSE a malformed gate miss rather than panic, so an unattended daemon
+		// survives it -- and an unobservable refusal is that panic traded for silence,
+		// which is the worse of the two. The task stays retryable and fails identically
+		// every interval with nothing emitted anywhere.
 		polledFull := false
 		if checkoutLock.TryLock() {
 			if !tracker.busy(d.Repo.FullName()) {
-				_ = runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollOnce)
+				if err := runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollOnce); err != nil {
+					writeLine(stdout, "poll error: %s", err)
+				}
 				polledFull = true
 			}
 			checkoutLock.Unlock()
 		}
 		if !polledFull {
-			_ = runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollRecoveryCommandsOnce)
+			if err := runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollRecoveryCommandsOnce); err != nil {
+				writeLine(stdout, "recovery poll error: %s", err)
+			}
 		}
 		if heartbeatPathsErr == nil {
 			if err := runWorkflowAutoSettleOnce(ctx, heartbeatPaths, store, time.Now().UTC(), stdout); err != nil {

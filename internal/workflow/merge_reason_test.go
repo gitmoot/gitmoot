@@ -10,7 +10,20 @@ import (
 // renders to "" and reaches a durable escalation as a header-only note.
 //
 // Asserting only "the result is zero" would be an outcome assertion satisfied by the old
-// silent-drop behaviour too. Requiring the panic pins that the constructor DECIDED.
+// silent-drop behaviour too. Requiring a NON-NIL ERROR that names the caller defect is what
+// pins that the constructor DECIDED.
+//
+// This test also carries the DAEMON-SAFETY axis that a separate TestWithGateMissDoesNotPanic
+// used to claim. That test was deleted as one guard wearing two names: restoring the
+// production panic killed BOTH of them, so no mutant ever told them apart. The axis survives
+// here by construction -- this test CALLS the constructor and asserts on its returned values,
+// which a panicking implementation cannot satisfy.
+//
+// What the deleted test could NOT cover, and what actually protects the daemon, is a property
+// of the CALLER rather than of this constructor: the refusal must be reported and polling must
+// continue. That is asserted where it lives, in the supervisor guards, and it is a genuinely
+// independent observable because a caller that silently discards the error passes every
+// assertion in this file.
 func TestWithGateMissRefusesAnAllBlankMiss(t *testing.T) {
 	reason, err := GateMissReason("   ", "\t", "head123")
 	if err == nil {
@@ -22,21 +35,6 @@ func TestWithGateMissRefusesAnAllBlankMiss(t *testing.T) {
 	// And it must not hand back a half-built value the caller could still deliver.
 	if !reason.IsZero() {
 		t.Fatalf("refused construction still returned a usable reason: %+v", reason)
-	}
-}
-
-// TestWithGateMissDoesNotPanic pins the DAEMON-SAFETY property, not merely the refusal:
-// the merge gate runs inside PollOnce, which has no recover(), so a panic here would
-// terminate an unattended daemon instead of rejecting one merge decision. A caller defect
-// must surface as a refused decision, never as an outage.
-func TestWithGateMissDoesNotPanic(t *testing.T) {
-	defer func() {
-		if r := recover(); r != nil {
-			t.Fatalf("an all-blank miss PANICKED (%v); the daemon's PollOnce has no recover()", r)
-		}
-	}()
-	if _, err := GateMissReason("", "", ""); err == nil {
-		t.Fatal("expected a refusal error")
 	}
 }
 
