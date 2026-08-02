@@ -27,6 +27,19 @@ Ask it from a PR comment:
 The thermo template is review-only. Route implementation work to a separate agent
 with `implement` capability and normal branch-lock protection.
 
+For a local review, name that implementer explicitly:
+
+```sh
+gitmoot agent review thermo-review --repo owner/repo --pr 12 --lead lead "Review this PR."
+```
+
+Gitmoot validates the lead's agents-database row before it creates the review
+job: the lead must exist, have access to the repository, hold `implement`, and
+use a write-granting policy. If the review returns `changes_requested`, its fix
+job targets the lead while the reviewer stays read-only. Omitting `--lead`
+checks the reviewer as the fallback implementer and therefore refuses a strict
+review-only agent before spending a review session.
+
 ## Risk-Tiered Adaptive Review
 
 Gitmoot can scale review depth to a change's blast radius through the
@@ -62,4 +75,3 @@ dashboard.
 With the `[review]` section absent or `risk_tiers_enabled` off, PR review is
 byte-for-byte the single-reviewer path. The competition tier (two independent
 implementations plus a judge) is a planned follow-up.
-

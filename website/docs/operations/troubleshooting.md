@@ -11,6 +11,27 @@ gitmoot daemon status
 Most Gitmoot failures come from one of four places: the installed binary, GitHub
 CLI auth, runtime/plugin discovery, or a local daemon/job/lock state.
 
+## Local Review Lead Is Refused
+
+Symptom: `gitmoot agent review` or a review-resolved `gitmoot agent run` refuses
+before creating a job because the lead is missing, cannot access the repo,
+lacks `implement`, or has a non-write autonomy policy.
+
+Likely cause: a review-only agent was dispatched without `--lead`, or the named
+implementer is not dispatchable from its agents-database row.
+
+Fix: keep the reviewer read-only and name a separate registered implementer:
+
+```sh
+gitmoot agent review reviewer --repo owner/repo --pr 12 --lead implementer "Review this PR."
+gitmoot agent show implementer
+gitmoot agent repos implementer
+```
+
+The implementer must be allowed on the repo, hold `implement`, and use
+`workspace-write` or `danger-full-access`. Do not grant implementation access to
+the reviewer merely to bypass the preflight.
+
 ## Install Script Failed
 
 Symptom: `curl -fsSL https://gitmoot.io/install.sh | sh` exits before
