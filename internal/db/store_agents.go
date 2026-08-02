@@ -47,15 +47,17 @@ func (s *Store) UpsertAgent(ctx context.Context, agent Agent) error {
 	return tx.Commit()
 }
 
-// UpdateAgentRuntime switches a registered agent's runtime (codex or claude),
-// preserving its role, capabilities, repo scope, template, and policy. The warm
+// UpdateAgentRuntime switches a registered agent's runtime (codex, claude, kimi,
+// or omp — the allow-list below; kimi-cli is missing from it and is flagged, not
+// fixed, in #1428), preserving its role, capabilities, repo scope, template, and
+// policy. The warm
 // runtime_ref is cleared because it is bound to the old runtime — the next job
 // starts a fresh session for the new runtime. The old agent_instance, if any,
 // idle-expires on its own.
 func (s *Store) UpdateAgentRuntime(ctx context.Context, name, runtime string) error {
 	runtime = strings.TrimSpace(runtime)
-	if runtime != "codex" && runtime != "claude" && runtime != "kimi" {
-		return fmt.Errorf("unknown runtime %q (want codex, claude, or kimi)", runtime)
+	if runtime != "codex" && runtime != "claude" && runtime != "kimi" && runtime != "omp" {
+		return fmt.Errorf("unknown runtime %q (want codex, claude, kimi, or omp)", runtime)
 	}
 	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, model, effort, capabilities_json, autonomy_policy, health_status, preset_delivery
 		FROM agents WHERE name = ?`, name)

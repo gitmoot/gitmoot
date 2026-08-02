@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -97,6 +98,55 @@ func reviewerFamily(runtimeName string) string {
 	return r
 }
 
+// unmappedFamilyIsRefusal splits the ONE unknown-family branch into its two very
+// different causes, because collapsing them is what makes an unmapped runtime
+// invisible:
+//
+//   - An UNRECOVERABLE family (empty string: a deleted/migrated agent whose runtime
+//     could not be read back, see resolveImplementerRuntime) — or any name Gitmoot
+//     cannot dispatch at all — is the historical SKIP-not-guess case. Nothing was
+//     configured wrong; there is simply nothing to reason about. Stays silent.
+//   - A DISPATCHABLE Gitmoot runtime with no crossFamilyRotation entry is a GAP.
+//     Its implement work merges with NO cross-family review at all, and today that
+//     looks exactly like "no reviewer was authed": ok=false, no error, no row, no
+//     event. This is the case omp (#1428) creates on purpose — omp is a multi-
+//     provider ROUTING harness whose resolved provider is opaque, so mapping it to
+//     a family would manufacture false diversity the merge gate would then trust.
+//     Refusing LOUDLY is the honest third option: no review row is written either
+//     way, but the caller gets an error it records as a cross_family_review_failed
+//     job event instead of silence.
+//
+// shell is excluded from the loud branch by name: it runs no model, so it HAS no
+// model family and "no cross-family reviewer" is its definition, not a gap.
+//
+// The comparisons here are EXACT, deliberately, because they must agree with the
+// crossFamilyRotation lookup in pickCrossFamilyReviewer, which is an exact map
+// index. A case-EqualFold match here would widen the loud branch past the silent
+// one: "Codex" misses the rotation map, so it would reach this predicate, match
+// case-insensitively, and emit a refusal event asserting codex has no family
+// mapping — a false statement about a mapped runtime, where the pre-#1428 behavior
+// was a silent skip. Registered runtimes only ever arrive through the
+// case-sensitive Factory, so the exact form is also the only one that can be a real
+// gap.
+func unmappedFamilyIsRefusal(family string) bool {
+	if family == "" || family == runtime.ShellRuntime {
+		return false
+	}
+	for _, name := range runtime.SupportedRuntimes() {
+		if name == family {
+			return true
+		}
+	}
+	return false
+}
+
+// unmappedFamilyRefusal is the loud refusal itself. It names the runtime, states
+// the consequence (no cross-family review at all), and names both real remedies so
+// the event is actionable rather than merely noisy.
+func unmappedFamilyRefusal(implementerRuntime string) error {
+	return fmt.Errorf("no cross-family reviewer for runtime %q: it is a dispatchable Gitmoot runtime with no model-family mapping, so its implement work would merge with NO cross-family review; either declare its provider family (crossFamilyRotation + crossFamilyJuryUniverse) or route its implement jobs to a mapped runtime", implementerRuntime)
+}
+
 // reviewCapability is the capability a registered agent must declare to be picked
 // as a cross-family reviewer.
 const reviewCapability = "review"
@@ -157,10 +207,22 @@ func PickCrossFamilyReviewer(ctx context.Context, store AgentLister, implementer
 // then skips the review entirely (no review row). implementerRuntime that is not
 // a known family (e.g. an unrecoverable/migrated agent) yields ok=false too, so a
 // possibly-same-family review is never emitted by accident.
+//
+// One unknown-family case is LOUD instead of silent: a DISPATCHABLE Gitmoot runtime
+// with no crossFamilyRotation entry (omp, #1428) returns an ERROR. No review row is
+// written either way, but the caller records the refusal (the engine writes a
+// cross_family_review_failed job event) rather than leaving an unreviewable runtime
+// indistinguishable from an unauthed one. See unmappedFamilyIsRefusal.
 func pickCrossFamilyReviewer(ctx context.Context, store AgentLister, implementerRuntime string, repo string, authedRuntimes map[string]bool) (CrossFamilyReviewer, bool, error) {
 	implementerRuntime = strings.TrimSpace(implementerRuntime)
 	family := reviewerFamily(implementerRuntime)
 	if _, known := crossFamilyRotation[family]; !known {
+		// A dispatchable runtime with no family mapping is a GAP, not an absence:
+		// refuse LOUDLY (see unmappedFamilyIsRefusal) so the caller records it instead
+		// of writing nothing and looking identical to "nobody was authed".
+		if unmappedFamilyIsRefusal(family) {
+			return CrossFamilyReviewer{}, false, unmappedFamilyRefusal(implementerRuntime)
+		}
 		// Unknown/unrecoverable implementer family: skip rather than guess and risk a
 		// silent same-family review (#469 risk note: SKIP-not-guess).
 		return CrossFamilyReviewer{}, false, nil

@@ -2630,6 +2630,8 @@ func buildRuntimeAdapter(home string, agent runtime.Agent, checkout string, runn
 		adapter = runtime.KimiAdapter{Dir: checkout, Runner: runner}
 	case runtime.KimiCLIRuntime:
 		adapter = runtime.KimiCLIAdapter{Dir: checkout, Runner: runner}
+	case runtime.OmpRuntime:
+		adapter = runtime.OmpAdapter{Dir: checkout, Runner: runner}
 	case runtime.ShellRuntime:
 		adapter = runtime.ShellAdapter{Dir: checkout, Runner: runner}
 	default:

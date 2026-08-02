@@ -305,6 +305,8 @@ func (f Factory) Adapter(name string) (Adapter, error) {
 		return KimiAdapter{Runner: f.Runner}, nil
 	case KimiCLIRuntime:
 		return KimiCLIAdapter{Runner: f.Runner}, nil
+	case OmpRuntime:
+		return OmpAdapter{Runner: f.Runner}, nil
 	case ShellRuntime:
 		return ShellAdapter{Runner: f.Runner}, nil
 	default:
@@ -363,6 +365,20 @@ func ValidateAgent(agent Agent) error {
 	}
 	if isKimiRuntime(agent.Runtime) && agent.RuntimeRef != "" && !isKimiSessionID(agent.RuntimeRef) && !IsFreshRef(agent.RuntimeRef) {
 		return fmt.Errorf("kimi runtime reference %q must be a Kimi session id, fresh:<suffix>, or empty", agent.RuntimeRef)
+	}
+	// omp is STATELESS (OmpAdapter never resumes), so "last" — the resume grammar
+	// the other runtimes accept — is rejected here rather than silently stored on a
+	// registration it can never honor. The grammar mirrors OmpAdapter.Validate EXCEPT
+	// that this registration door additionally requires a NON-EMPTY ref:
+	// validateAgentFields(agent, true) runs above, BEFORE this clause, and has
+	// already rejected an empty ref, so the clause is never reached with one and
+	// must not promise "or empty". The accepts-empty contract lives on
+	// OmpAdapter.Validate, which guards both the Start and the Deliver path: it
+	// never calls validateAgentFields at all, running ompAgentFieldChecks — which
+	// carries no requireRuntimeRef clause — instead, so a stateless omp job that
+	// legitimately carries no ref is still accepted there.
+	if agent.Runtime == OmpRuntime && agent.RuntimeRef != "" && !isUUID(agent.RuntimeRef) && !IsFreshRef(agent.RuntimeRef) {
+		return fmt.Errorf("omp runtime reference %q must be an omp session UUID or fresh:<suffix>", agent.RuntimeRef)
 	}
 	return nil
 }

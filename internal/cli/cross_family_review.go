@@ -102,10 +102,20 @@ func (d *crossFamilyReviewDispatcher) Review(ctx context.Context, implementJob d
 }
 
 // resolveImplementerRuntime recovers the implement job's runtime family from its
-// payload (an ephemeral spec's runtime) or its registered agent. An unrecoverable
-// family yields "" so pickCrossFamilyReviewer SKIPs rather than risk a silent
-// same-family review (#469 risk: SKIP-not-guess).
+// per-job --runtime override, else its payload (an ephemeral spec's runtime), else
+// its registered agent. An unrecoverable family yields "" so pickCrossFamilyReviewer
+// SKIPs rather than risk a silent same-family review (#469 risk: SKIP-not-guess).
+//
+// The override is consulted FIRST, matching resolveTranscriptRuntime (job.go): a
+// per-job --runtime override (#531) is the runtime that ACTUALLY ran the implement
+// job, so reading the agent's registered default here attributes the diff to a
+// family that never executed it. For an omp override that misattribution is not
+// merely cosmetic — it routes the job around omp's loud refusal (#1428) and lets
+// the merge gate trust a cross-family review of an opaque-provider run.
 func (d *crossFamilyReviewDispatcher) resolveImplementerRuntime(ctx context.Context, job db.Job, payload workflow.JobPayload) string {
+	if override := strings.TrimSpace(payload.RuntimeOverride); override != "" {
+		return override
+	}
 	if payload.Ephemeral != nil && strings.TrimSpace(payload.Ephemeral.Runtime) != "" {
 		return strings.TrimSpace(payload.Ephemeral.Runtime)
 	}
