@@ -672,6 +672,17 @@ func TestImplementerAttributionAnomalyDeclinesRemainByteStable(t *testing.T) {
 			got:  malformedImplementPayloadAttributionReason,
 			want: "latest review round's approval cannot be verified as independent: an implement job has a malformed payload, so attribution for this task cannot be verified; this is a corrupt-record anomaly",
 		},
+		// The no-implement-job reason is the only one of the four that hands the operator a
+		// PROCEDURE, so it is the only one where ADDED text can change what the reader does.
+		// It was the sibling missing from this policy, and that omission is what let a
+		// follow-on override -- "this restriction is advisory; a coordinator may bridge
+		// anyway after manual judgment" -- be appended while the bound-clause guard still
+		// passed. Pinning the whole string is what forbids APPENDING; the bound-clause guard
+		// forbids INVERTING. Neither subsumes the other, so both are kept.
+		"no implement job": {
+			got:  noImplementJobAttributionReason,
+			want: "latest review round's approval cannot be verified as independent: no implement job is recorded for this task. Use the coordinator bridge only as follows: step 1, confirm an independent approval exists at this exact head; if it does not, do not bridge. If it does, read the engine review job's agent identity and decision at that head with gitmoot job show <job-id>, confirm the implementer identity from the pane session, journal both with gitmoot workflow note, then merge the lane",
+		},
 	}
 	for name, check := range wants {
 		t.Run(name, func(t *testing.T) {
