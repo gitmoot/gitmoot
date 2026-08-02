@@ -1939,4 +1939,28 @@ CREATE INDEX idx_tasks_disposal_candidates
 	ON tasks(repo_full_name, state, updated_at, id)
 	WHERE state IN ('blocked', 'awaiting_human_merge');
 	`,
+
+	// lifecycle_generation is a MONOTONIC counter identifying one RUN of a job
+	// (#1407). A job's state is a VALUE that recurs, so it cannot identify a run:
+	// failed -> queued -> running -> failed returns the string to its old value,
+	// and an in-flight advancement holding a result from the PREVIOUS run then
+	// wins a compare-and-swap against a lifecycle it never observed. That is ABA,
+	// and no amount of care at the reading sites repairs it, because the value
+	// being compared is genuinely equal.
+	//
+	// Every transition INTO queued starts a new run, so the counter is bumped by
+	// the state-writing UPDATEs themselves rather than by their callers. That is
+	// the whole reason it lives here: the set of CALLERS that re-queue a job is
+	// open and grows, while the set of SQL statements that write jobs.state is
+	// closed and lives in one file. A guard defined against an open set decays
+	// silently as the set widens; this one cannot.
+	//
+	// DEFAULT 0 preserves every pre-migration row: existing jobs start at
+	// generation 0 and take their first bump on their next re-queue. Append-only
+	// tail; migrations are positional and this entry must never be inserted
+	// earlier in the slice.
+	`
+ALTER TABLE jobs ADD COLUMN lifecycle_generation INTEGER NOT NULL DEFAULT 0
+	CHECK(lifecycle_generation >= 0);
+	`,
 }

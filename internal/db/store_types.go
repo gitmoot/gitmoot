@@ -283,6 +283,21 @@ type Job struct {
 	// Defaults false, so every engine-driven job and the whole normal dispatch/
 	// reaper path is byte-identical. Populated by GetJob/ListJobs.
 	ExternallyDriven bool
+	// LifecycleGeneration is a MONOTONIC counter identifying one RUN of this job
+	// (#1407). It is advanced by the store's state-writing UPDATEs on every
+	// transition INTO queued, never by a caller.
+	//
+	// It exists because State cannot identify a run: a state is a VALUE that
+	// recurs, so failed -> queued -> running -> failed returns State to its old
+	// string and a compare-and-swap anchored on State alone succeeds against a
+	// lifecycle the writer never observed. Any verdict formed about a SPECIFIC
+	// run -- a settlement carrying a result from that run -- must be anchored on
+	// this field, via TransitionJobStateWithEventAtGeneration.
+	//
+	// Rows created before the column existed read 0 and take their first bump on
+	// their next re-queue, so a comparison is meaningful from the first retry
+	// onward without any backfill.
+	LifecycleGeneration int64
 	// UpdatedAt is populated by ListJobs (for age display in the dashboard);
 	// other readers may leave it zero.
 	UpdatedAt string

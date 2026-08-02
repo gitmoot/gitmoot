@@ -192,7 +192,7 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, cause er
 		}
 		var blocked workflow.BlockedError
 		if errors.As(cause, &blocked) {
-			return w.recordBlockedAdvancement(ctx, latest.ID, latest.State, cause, blocked)
+			return w.recordBlockedAdvancement(ctx, latest.ID, observedJobLifecycle(latest), cause, blocked)
 		}
 		if err := w.recordPostDeliveryWorkflowError(ctx, latest, cause); err != nil {
 			return err
@@ -299,9 +299,34 @@ func (w jobWorker) recordPostDeliveryWorkflowError(ctx context.Context, job db.J
 		"post-delivery workflow error; advancement will retry from stored result: "+cause.Error())
 }
 
-func (w jobWorker) recordBlockedAdvancement(ctx context.Context, jobID string, observedState string, cause error, blocked workflow.BlockedError) error {
+// jobLifecycle identifies the ONE RUN of a job that an advancement observed, as the pair
+// (state, generation) read from the same row at the same instant.
+//
+// The state alone cannot do this. A state is a VALUE that recurs, so an operator retry
+// running failed -> queued -> running -> failed returns the string to exactly what a slow
+// advancement observed, and that advancement's compare-and-swap then succeeds against a
+// lifecycle it never saw. That is ABA, and it is not fixable by comparing more carefully:
+// the two values are genuinely equal. Only a monotonic token distinguishes them, so the
+// generation travels WITH the state everywhere the state is used as an anchor.
+type jobLifecycle struct {
+	state      string
+	generation int64
+}
+
+func observedJobLifecycle(job db.Job) jobLifecycle {
+	return jobLifecycle{state: job.State, generation: job.LifecycleGeneration}
+}
+
+// matches reports whether the row read back is still the run this lifecycle identified.
+// Both components must agree: an equal state at a LATER generation is the ABA case, and an
+// equal generation is what makes the state comparison meaningful at all.
+func (l jobLifecycle) matches(job db.Job) bool {
+	return job.State == l.state && job.LifecycleGeneration == l.generation
+}
+
+func (w jobWorker) recordBlockedAdvancement(ctx context.Context, jobID string, observed jobLifecycle, cause error, blocked workflow.BlockedError) error {
 	if blocked.ResultDeliveryFailed {
-		return w.settleBlockedAdvancement(ctx, jobID, observedState, cause)
+		return w.settleBlockedAdvancement(ctx, jobID, observed, cause)
 	}
 	return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_blocked", Message: cause.Error()})
 }
@@ -309,22 +334,38 @@ func (w jobWorker) recordBlockedAdvancement(ctx context.Context, jobID string, o
 // settleBlockedAdvancement records a delivery-failed advancement as the job's terminal
 // blocked outcome.
 //
-// observedState is the state this advancement SAW when it began. The CAS is anchored to it
-// rather than to whatever the row holds now, because an operator's retry can move the job
-// failed -> queued underneath a slow advancement. RetryJob has already cleared Result by then,
-// so overwriting that fresh lifecycle with blocked strands it: no result, plus an
-// advance_blocked event that clears needsRetry and prevents any further advancement.
-// Anchoring the CAS makes the stale write lose instead of win.
-func (w jobWorker) settleBlockedAdvancement(ctx context.Context, jobID string, observedState string, cause error) error {
+// observed is the lifecycle this advancement SAW when it began. Every decision below is
+// anchored to it rather than to whatever the row holds now, because an operator's retry can
+// move the job failed -> queued underneath a slow advancement. RetryJob has already cleared
+// Result by then, so overwriting that fresh lifecycle with blocked strands it: no result,
+// plus an advance_blocked event that clears needsRetry and prevents any further advancement.
+//
+// All THREE outcomes are anchored, not just the CAS, because a returning state fools each of
+// them the same way:
+//
+//	blocked     - a NEW lifecycle that itself ended blocked is not "the same terminal
+//	              outcome, concurrently reached"; writing advance_blocked onto it attributes
+//	              this run's verdict to a different one.
+//	succeeded   - a NEW lifecycle that succeeded is not a contradiction to report as an
+//	              error; this advancement simply lost its race and has nothing to say.
+//	anything    - the CAS itself, which is where the stale write would actually land.
+//
+// So the generation is checked FIRST, once, and a mismatch short-circuits every arm: if the
+// run moved on, this verdict describes the previous one and the only correct action is to
+// record that fact without steering the live lifecycle.
+func (w jobWorker) settleBlockedAdvancement(ctx context.Context, jobID string, observed jobLifecycle, cause error) error {
 	message := cause.Error()
 	latest, err := w.Store.GetJob(ctx, jobID)
 	if err != nil {
 		return err
 	}
+	if latest.LifecycleGeneration != observed.generation {
+		return w.recordSupersededSettlement(ctx, jobID, message)
+	}
 	if latest.State == string(workflow.JobBlocked) {
 		return w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_blocked", Message: message})
 	}
-	transitioned, err := w.Store.TransitionJobStateWithEvent(ctx, jobID, observedState, string(workflow.JobBlocked), db.JobEvent{
+	transitioned, err := w.Store.TransitionJobStateWithEventAtGeneration(ctx, jobID, observed.state, observed.generation, string(workflow.JobBlocked), db.JobEvent{
 		JobID:   jobID,
 		Kind:    "advance_blocked",
 		Message: message,
@@ -340,18 +381,30 @@ func (w jobWorker) settleBlockedAdvancement(ctx context.Context, jobID string, o
 	if err != nil {
 		return err
 	}
+	if latest.LifecycleGeneration != observed.generation {
+		// The job is on a NEW lifecycle: something re-queued it while this advancement was
+		// in flight, so this verdict describes the PREVIOUS one.
+		return w.recordSupersededSettlement(ctx, jobID, message)
+	}
 	if latest.State == string(workflow.JobSucceeded) {
 		return fmt.Errorf("record blocked advancement for job %s: succeeded state did not transition", jobID)
 	}
 	if latest.State == string(workflow.JobBlocked) {
-		// A concurrent settlement already reached the same terminal outcome.
+		// A concurrent settlement of the SAME run already reached the same terminal
+		// outcome -- same generation, so this is genuinely a duplicate and not a
+		// later run that happens to have ended blocked too.
 		return w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_blocked", Message: message})
 	}
-	// The job is on a NEW lifecycle: something re-queued it while this advancement was in
-	// flight, so this verdict describes the PREVIOUS one. Do not write advance_blocked here --
-	// it would contradict the live lifecycle and suppress its advancement. Record the
-	// superseded settlement under a kind jobNeedsAdvanceRetry does not classify, so it stays
-	// queryable without steering retry.
+	// Same generation but a different state: the run moved on WITHIN its own lifecycle
+	// while this advancement was in flight. Record it the same way -- this verdict is no
+	// longer the live one and must not steer retry.
+	return w.recordSupersededSettlement(ctx, jobID, message)
+}
+
+// recordSupersededSettlement records a settlement whose lifecycle has moved on. The kind is
+// deliberately one jobNeedsAdvanceRetry does not classify, so the record stays queryable
+// without clearing needsRetry on a lifecycle it does not describe.
+func (w jobWorker) recordSupersededSettlement(ctx context.Context, jobID string, message string) error {
 	return w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_blocked_superseded", Message: message})
 }
 
