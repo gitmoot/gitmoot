@@ -340,9 +340,6 @@ func sameCommit(ctx context.Context, git gitutil.Client, a, b string) bool {
 	if a == "" || b == "" {
 		return false
 	}
-	if strings.EqualFold(a, b) {
-		return true
-	}
 	resolvedA, err := git.RevParse(ctx, a+"^{commit}")
 	if err != nil {
 		return false

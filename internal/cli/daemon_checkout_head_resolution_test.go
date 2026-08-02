@@ -158,3 +158,36 @@ func TestContentionMembersStillRetry(t *testing.T) {
 		})
 	}
 }
+
+// TestReviewCheckoutRejectsAnAbbreviatedDifferentCommit is the NEGATIVE CONTROL for the
+// abbreviation path. Without it, a mutant accepting EVERY seven-character expected revision
+// left all three comparison guards green -- the positive case alone cannot tell "resolved and
+// matched" from "was short, so accepted".
+func TestReviewCheckoutRejectsAnAbbreviatedDifferentCommit(t *testing.T) {
+	dir, other, head := headResolutionRepo(t)
+	abbreviatedOther := other[:7]
+	if abbreviatedOther == head[:7] {
+		t.Skip("the two commits share a 7-char prefix; this fixture cannot discriminate")
+	}
+	worker := defaultJobWorker(daemonWorkerStore(t), nil)
+	payload := workflow.JobPayload{PullRequest: 17, HeadSHA: abbreviatedOther}
+	if err := worker.validateReviewCheckout(context.Background(), payload, dir); err == nil {
+		t.Fatalf("abbreviated OTHER commit %s was accepted; abbreviation is not a licence to match", abbreviatedOther)
+	}
+}
+
+// TestSameCommitRefusesEqualUnresolvableRevisions pins the CONTRACT the helper documents:
+// an unresolvable revision is not a match, even when both sides are textually identical.
+//
+// A disposable probe failed here before the fix -- "equal unresolved revisions were accepted
+// without resolution" -- because an equality fast path ran ahead of resolution. It was
+// unreachable from the only caller, which is exactly why it needed a direct test: the caller
+// was lucky, the helper was wrong, and the next caller inherits the contract, not the luck.
+func TestSameCommitRefusesEqualUnresolvableRevisions(t *testing.T) {
+	dir, _, _ := headResolutionRepo(t)
+	git := gitutil.Client{Dir: dir}
+	const garbage = "not-a-revision-at-all"
+	if sameCommit(context.Background(), git, garbage, garbage) {
+		t.Fatal("two equal UNRESOLVABLE revisions were accepted as the same commit; the contract says an unresolvable revision is not a match")
+	}
+}
