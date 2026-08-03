@@ -71,8 +71,18 @@ func TestEveryJobStateWriteBumpsTheLifecycleGeneration(t *testing.T) {
 			return err
 		}
 		if info.IsDir() {
+			// Skip repository-local, GITIGNORED artifact roots. Review found this walk
+			// failing on .gitmoot/evals/pr1411-pinned-.../internal/db/session_job_test.go --
+			// a PINNED SNAPSHOT of this very PR, whose old raw UPDATE the guard then
+			// reported as a live violation, and whose nested store_jobs.go inflated the
+			// counts. A guard whose result depends on which throwaway artifacts happen to
+			// exist locally is state-dependent and false-red, which is worse than the gap it
+			// closes: it fails for a reader who has done nothing wrong.
+			//
+			// These are the gitignored local-only roots AGENTS.md documents (/GOALS/,
+			// /repos/, /dist/, /.gitmoot/evals/) plus the usual build output.
 			switch info.Name() {
-			case ".git", "node_modules", "dist", "build":
+			case ".git", ".gitmoot", "node_modules", "dist", "build", "repos", "GOALS", "evals":
 				return filepath.SkipDir
 			}
 			return nil
@@ -92,15 +102,21 @@ func TestEveryJobStateWriteBumpsTheLifecycleGeneration(t *testing.T) {
 		rel = filepath.ToSlash(rel)
 		for _, loc := range jobStateWritePattern.FindAllStringIndex(text, -1) {
 			found[rel]++
-			// The bump is concatenated directly into the SQL immediately after the state
-			// assignment, so a tight window is faithful: in every legitimate statement the
-			// fragment appears within ~30 characters. 400 keeps multi-line formatting valid
-			// without letting an unrelated later statement's fragment vouch for this one.
-			end := loc[0] + 400
-			if end > len(text) {
-				end = len(text)
-			}
-			if !strings.Contains(text[loc[0]:end], "bumpLifecycleGenerationSQL") {
+			// STATEMENT-AWARE, not a byte window. A 400-character window was defeatable:
+			// review removed the bump from UpdateJobState and the NEXT legitimate statement's
+			// fragment fell inside the window and vouched for the broken one -- count still 8,
+			// every guard green. Proximity is not association.
+			//
+			// The association used instead is structural. The matched text sits inside a
+			// backtick SQL literal, and a legitimate statement closes that literal and
+			// concatenates the fragment immediately:
+			//
+			//	`UPDATE jobs SET state = ?, ` + bumpLifecycleGenerationSQL + `, updated_at ...`
+			//
+			// So the fragment must follow THIS literal's closing backtick, separated only by
+			// whitespace and the concatenation operator. A neighbour's fragment cannot satisfy
+			// that, because it is not adjacent to this literal's close.
+			if !bumpFollowsSQLLiteral(text, loc[0]) {
 				excerptEnd := loc[0] + 120
 				if excerptEnd > len(text) {
 					excerptEnd = len(text)
@@ -128,6 +144,24 @@ func TestEveryJobStateWriteBumpsTheLifecycleGeneration(t *testing.T) {
 			renderJobStateCounts(found), renderJobStateCounts(jobStateWriteAllowlist))
 	}
 }
+
+// bumpFollowsSQLLiteral reports whether the SQL literal containing the match at `at` is
+// immediately followed by a concatenation of the shared bump fragment.
+//
+// It walks to the END of the backtick literal the match sits in, then requires the very next
+// non-blank tokens to be `+ bumpLifecycleGenerationSQL`. That ties the fragment to ONE
+// statement instead of to a neighbourhood.
+func bumpFollowsSQLLiteral(text string, at int) bool {
+	close := strings.IndexByte(text[at:], '`')
+	if close < 0 {
+		return false
+	}
+	return bumpConcatenation.MatchString(text[at+close+1:])
+}
+
+// bumpConcatenation matches only at the START of the remainder, so nothing further along the
+// file can satisfy it.
+var bumpConcatenation = regexp.MustCompile("\\A\\s*\\+\\s*bumpLifecycleGenerationSQL")
 
 func sameJobStateCounts(got, want map[string]int) bool {
 	if len(got) != len(want) {
