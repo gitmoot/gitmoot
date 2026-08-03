@@ -264,6 +264,7 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	// One episode PER POLL MODE, with the routing owned by the reporters object rather than by
 	// these call sites (#1381 review).
 	pollErrors := newPollErrorReporters(pollErrorReportWindow)
+	fullPollRunner, recoveryPollRunner := pollErrors.runners(d)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -298,13 +299,13 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		polledFull := false
 		if checkoutLock.TryLock() {
 			if !tracker.busy(d.Repo.FullName()) {
-				pollErrors.pollAndReport(ctx, fullPoll, daemonPollTimeout, d.PollOnce, stdout, "poll error")
+				fullPollRunner.run(ctx, daemonPollTimeout, stdout)
 				polledFull = true
 			}
 			checkoutLock.Unlock()
 		}
 		if !polledFull {
-			pollErrors.pollAndReport(ctx, recoveryPoll, daemonPollTimeout, d.PollRecoveryCommandsOnce, stdout, "recovery poll error")
+			recoveryPollRunner.run(ctx, daemonPollTimeout, stdout)
 		}
 		if heartbeatPathsErr == nil {
 			if err := runWorkflowAutoSettleOnce(ctx, heartbeatPaths, store, time.Now().UTC(), stdout); err != nil {
@@ -1412,31 +1413,69 @@ func (r *pollErrorReporters) shouldReport(mode pollMode, cause string, now time.
 	return r.byMode[mode].shouldReport(cause, now)
 }
 
-// pollAndReport runs one poll and routes its outcome to that mode's episode.
+// boundPoll pairs a poll MODE with the poll function and label that belong to it, so a caller
+// cannot combine them wrongly.
 //
-// It exists to make a specific mutant UNWRITABLE. Review found that with separate
-// shouldReport(mode) and recordSuccess(mode) calls in each branch, the mode appeared TWICE per
-// branch and the two could disagree: changing the recovery branch's recordSuccess(recoveryPoll)
-// to recordSuccess(fullPoll) compiled and survived every guard, recreating exactly the
-// cross-mode episode clearing this design was introduced to stop.
+// Four rounds of this PR tried to guard the wiring and failed. Round 3 guarded daemon.Run, which
+// has no production callers. Round 4 guarded reporters the test itself constructed. Round 5
+// collapsed shouldReport/recordSuccess into one call so the mode was supplied once -- and review
+// showed that was still not enough: changing ONLY the recovery call site's mode to fullPoll
+// compiled and survived every guard. My comment then called that "a consistent misattribution
+// rather than a silent cross-mode reset". THAT WAS WRONG, and review said so: recovery failures
+// then share the FULL reporter, so an unrelated successful full poll clears the ongoing recovery
+// episode -- exactly the original defect, reached by a different route.
 //
-// That was the THIRD time on this PR that a guard covered the reporters and missed the WIRING.
-// Testing harder was not working, so the mode is now supplied ONCE and both outcomes derive from
-// it. A caller can still pass the wrong mode, but then the failure AND success route together --
-// a consistent misattribution rather than a silent cross-mode reset, and a far more visible one.
+// So the mode no longer selects anything at the call site. It selects EVERYTHING, here, once:
+// the poll function, the label and the episode are all derived from it. A mutant that changes a
+// call site's mode now changes WHICH POLL RUNS, which is directly observable.
+type boundPoll struct {
+	mode      pollMode
+	poll      func(context.Context) error
+	label     string
+	reporters *pollErrorReporters
+}
+
+// bind derives the poll function and label from the mode. This switch is the ONLY place the
+// three are associated, so they cannot drift apart at a call site.
+func (r *pollErrorReporters) bind(mode pollMode, d daemon.Daemon) boundPoll {
+	switch mode {
+	case recoveryPoll:
+		return boundPoll{mode: mode, poll: d.PollRecoveryCommandsOnce, label: "recovery poll error", reporters: r}
+	default:
+		return boundPoll{mode: fullPoll, poll: d.PollOnce, label: "poll error", reporters: r}
+	}
+}
+
+// runners returns the full and recovery runners, in that order.
 //
-// HONEST LIMIT: this removes one mutant by construction; it does not make caller routing
-// verifiable from outside the supervisor, whose lock and tracker are function-local.
-func (r *pollErrorReporters) pollAndReport(ctx context.Context, mode pollMode, timeout time.Duration, poll func(context.Context) error, stdout io.Writer, label string) {
-	if err := runDaemonPollWithTimeout(ctx, timeout, poll); err != nil {
-		if r.shouldReport(mode, err.Error(), time.Now().UTC()) {
-			writeLine(stdout, "%s: %s", label, err)
+// It exists so the binding is made in ONE place a test can drive. Review defeated the previous
+// shape by changing only the recovery call site's bind(recoveryPoll, d) to bind(fullPoll, d):
+// that compiled, recovery failures then shared the FULL reporter, and an unrelated successful
+// full poll cleared the ongoing recovery episode -- the original defect by another route. No
+// guard saw it, because the supervisor's recovery branch is unreachable from a test: whether it
+// runs depends on a checkout lock and an in-flight tracker that are both function-local.
+//
+// RESIDUAL, stated precisely because the previous attempt at this sentence was wrong. The
+// untested surface is now exactly one line: the supervisor's destructuring of this call. Swapping
+// the two returned values there would still mis-route, and no external test can observe it for
+// the reason above. Everything else -- which mode binds which poll, which label, which episode --
+// is asserted. That is a reduction from "any call site can mis-bind" to "one assignment could be
+// transposed", not a closure, and it should not be described as one.
+func (r *pollErrorReporters) runners(d daemon.Daemon) (full boundPoll, recovery boundPoll) {
+	return r.bind(fullPoll, d), r.bind(recoveryPoll, d)
+}
+
+// run executes the bound poll and routes its outcome to that mode's episode.
+func (b boundPoll) run(ctx context.Context, timeout time.Duration, stdout io.Writer) {
+	if err := runDaemonPollWithTimeout(ctx, timeout, b.poll); err != nil {
+		if b.reporters.shouldReport(b.mode, err.Error(), time.Now().UTC()) {
+			writeLine(stdout, "%s: %s", b.label, err)
 		}
 		return
 	}
 	// A clean poll ENDS this mode's episode. Without it a fault that recovers and returns is
 	// reported once and then suppressed, which is worse than the unbounded stream it replaced.
-	r.recordSuccess(mode)
+	b.reporters.recordSuccess(b.mode)
 }
 
 // recordSuccess ends ONLY the episode of the mode that succeeded.

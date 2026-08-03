@@ -119,7 +119,7 @@ waitForPolls:
 		select {
 		case supervisorErr = <-done:
 		case <-time.After(3 * time.Minute):
-			t.Fatal("supervisor goroutine never terminated after cancellation; it is leaking into store teardown")
+			t.Fatal("supervisor did not terminate within three minutes of cancellation; it is leaking into store teardown")
 		}
 	}
 	if supervisorErr != nil && !errors.Is(supervisorErr, context.Canceled) {
@@ -216,47 +216,64 @@ func TestPollErrorReportersAreIndependentPerMode(t *testing.T) {
 	}
 }
 
-// TestPollAndReportRoutesOutcomesToOneEpisode drives the ROUTING FUNCTION production uses, so a
-// mode carried into the failure path and the success path can no longer disagree.
+// TestBoundPollDerivesEverythingFromItsMode is the OBSERVABLE recovery-path guard review asked
+// for, and it closes the route the previous fix left open.
 //
-// Review defeated the previous guard with a mutant that changed only the recovery branch's
-// recordSuccess(recoveryPoll) to recordSuccess(fullPoll). The guard drove pollErrorReporters
-// directly with enum values the TEST supplied, so it never observed the call site's choice. That
-// was the third time on this PR a guard covered the reporters and missed the wiring.
+// Round 5 collapsed shouldReport/recordSuccess into one call so the mode was supplied once.
+// Review showed that was still not enough: changing ONLY the recovery call site's mode to
+// fullPoll compiled and survived every guard. My comment called that "a consistent
+// misattribution rather than a silent cross-mode reset" -- WRONG, and review said so. Recovery
+// failures then share the FULL reporter, so an unrelated successful full poll clears the ongoing
+// recovery episode: the original defect, reached by another route.
 //
-// pollAndReport now takes the mode ONCE, so that mutant cannot be written. This exercises it end
-// to end: a failing poll must report into its own episode, and a succeeding poll must clear only
-// its own.
-func TestPollAndReportRoutesOutcomesToOneEpisode(t *testing.T) {
+// So the mode now selects the poll FUNCTION and the label too. Mutating a call site's mode
+// changes which work runs, which this guard observes directly.
+func TestBoundPollDerivesEverythingFromItsMode(t *testing.T) {
+	r := newPollErrorReporters(time.Hour)
+	// Drive the same constructor the supervisor uses, in the same order, so a transposition
+	// inside it is caught here rather than being invisible behind a function-local branch.
+	full, recovery := r.runners(daemon.Daemon{})
+
+	if full.mode != fullPoll || recovery.mode != recoveryPoll {
+		t.Fatalf("bind returned modes full=%v recovery=%v", full.mode, recovery.mode)
+	}
+	if full.label != "poll error" || recovery.label != "recovery poll error" {
+		t.Fatalf("labels are not derived from the mode: full=%q recovery=%q", full.label, recovery.label)
+	}
+	// The bound functions must DIFFER. A bind returning the same poll for both modes would
+	// satisfy mode and label while running the wrong work -- the failure this guard exists for.
+	if fmt.Sprintf("%p", full.poll) == fmt.Sprintf("%p", recovery.poll) {
+		t.Fatal("both modes bound the SAME poll function; the mode does not select the work")
+	}
+}
+
+func TestBoundPollRoutesOutcomesToOneEpisode(t *testing.T) {
 	fail := func(context.Context) error { return errors.New("boom") }
 	ok := func(context.Context) error { return nil }
-
 	r := newPollErrorReporters(time.Hour)
 	var out strings.Builder
 
-	// A recovery failure opens the RECOVERY episode.
-	r.pollAndReport(context.Background(), recoveryPoll, time.Minute, fail, &out, "recovery poll error")
+	failRecovery := boundPoll{mode: recoveryPoll, poll: fail, label: "recovery poll error", reporters: r}
+	okFull := boundPoll{mode: fullPoll, poll: ok, label: "poll error", reporters: r}
+	okRecovery := boundPoll{mode: recoveryPoll, poll: ok, label: "recovery poll error", reporters: r}
+
+	failRecovery.run(context.Background(), time.Minute, &out)
 	if !strings.Contains(out.String(), "recovery poll error: boom") {
 		t.Fatalf("first recovery failure was not reported; got %q", out.String())
 	}
 
-	// A FULL poll now SUCCEEDS. Under the defect this cleared recovery's episode too.
-	r.pollAndReport(context.Background(), fullPoll, time.Minute, ok, &out, "poll error")
-
-	// The same recovery failure must still be suppressed: recovery never succeeded.
+	okFull.run(context.Background(), time.Minute, &out)
 	before := out.Len()
-	r.pollAndReport(context.Background(), recoveryPoll, time.Minute, fail, &out, "recovery poll error")
+	failRecovery.run(context.Background(), time.Minute, &out)
 	if out.Len() != before {
-		t.Fatalf("a FULL-poll success cleared the RECOVERY episode: the repeat re-reported as a fresh onset.\nstdout=%q", out.String())
+		t.Fatalf("a FULL-poll success cleared the RECOVERY episode; the repeat re-reported as a fresh onset.\nstdout=%q", out.String())
 	}
 
-	// And a recovery SUCCESS must end recovery's own episode, or "routes to one episode" would
-	// be satisfied by a reporter that never resets -- the onset-hiding defect this replaced.
-	r.pollAndReport(context.Background(), recoveryPoll, time.Minute, ok, &out, "recovery poll error")
+	okRecovery.run(context.Background(), time.Minute, &out)
 	before = out.Len()
-	r.pollAndReport(context.Background(), recoveryPoll, time.Minute, fail, &out, "recovery poll error")
+	failRecovery.run(context.Background(), time.Minute, &out)
 	if out.Len() == before {
-		t.Fatal("a recovery success did not end the recovery episode; the recurrence after recovery must report")
+		t.Fatal("a recovery success did not end the recovery episode; the recurrence must report")
 	}
 }
 
