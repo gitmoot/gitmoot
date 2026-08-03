@@ -325,6 +325,8 @@ func TestRunAgentReviewRequeuesQueuedJobWhenRuntimeSessionBusy(t *testing.T) {
 		"--role", "reviewer",
 		"--repo", "owner/repo",
 		"--capability", "review",
+		"--capability", "implement",
+		"--policy", "workspace-write",
 	}, &stdout, &stderr); code != 0 {
 		t.Fatalf("subscribe reviewer exit code = %d, stderr=%s", code, stderr.String())
 	}
