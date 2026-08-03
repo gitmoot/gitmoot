@@ -34,6 +34,7 @@ var stuckReasonEventKinds = []string{
 	"delegation_retry",
 	"delegation_escalation_retry",
 	"delegation_loop_detected",
+	workflow.ReviewLoopDetectedEventKind,
 	"delegation_width_exceeded",
 	"delegation_depth_exceeded",
 	"delegation_walltime_exceeded",

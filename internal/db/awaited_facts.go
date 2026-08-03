@@ -198,6 +198,67 @@ type reviewVerdictPayload struct {
 	} `json:"result"`
 }
 
+// SucceededReviewVerdict is the minimal immutable evidence needed to decide
+// whether a review dispatch would repeat a stable verdict at an unchanged head.
+// It deliberately carries no result body: callers may use the prior verdict to
+// refuse and escalate, but never to serve a cached review result.
+type SucceededReviewVerdict struct {
+	JobID    string
+	Agent    string
+	HeadSHA  string
+	Decision string
+}
+
+// SucceededReviewVerdicts returns valid succeeded review verdicts for repo/PR,
+// newest first. Head SHA and decision live only in the JSON payload, so they are
+// decoded and filtered in Go rather than pretending jobs has indexed columns for
+// them. This is a pure read: unlike SubscribeAwaitedFact it creates no durable
+// interest or other state.
+func (s *Store) SucceededReviewVerdicts(ctx context.Context, repo string, pullRequest int) ([]SucceededReviewVerdict, error) {
+	repo = strings.ToLower(strings.TrimSpace(repo))
+	if repo == "" {
+		return nil, errors.New("review verdict repo is required")
+	}
+	if pullRequest <= 0 {
+		return nil, errors.New("review verdict pull request must be positive")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, agent, payload
+FROM jobs
+WHERE type = 'review' AND state = 'succeeded' AND lower(repo) = ? AND pull_request = ?
+ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	verdicts := make([]SucceededReviewVerdict, 0)
+	for rows.Next() {
+		var jobID, agent, payload string
+		if err := rows.Scan(&jobID, &agent, &payload); err != nil {
+			return nil, err
+		}
+		var decoded reviewVerdictPayload
+		if err := json.Unmarshal([]byte(payload), &decoded); err != nil || decoded.Result == nil {
+			continue
+		}
+		decision := strings.ToLower(strings.TrimSpace(decoded.Result.Decision))
+		if decision == "" {
+			continue
+		}
+		verdicts = append(verdicts, SucceededReviewVerdict{
+			JobID:    strings.TrimSpace(jobID),
+			Agent:    strings.TrimSpace(agent),
+			HeadSHA:  strings.ToLower(strings.TrimSpace(decoded.HeadSHA)),
+			Decision: decision,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return verdicts, nil
+}
+
 type reviewVerdictObservation struct {
 	repo, headSHA, detail string
 	pullRequest           int

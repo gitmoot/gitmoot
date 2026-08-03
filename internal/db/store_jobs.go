@@ -1086,7 +1086,8 @@ func (s *Store) LatestAdvancementMarker(ctx context.Context, jobID string) (stri
 	err := s.db.QueryRowContext(ctx, `SELECT kind FROM job_events
 		WHERE job_id = ? AND kind IN (
 			'advance_started', 'advance_retry', 'advance_completed',
-			'advance_retried', 'advance_blocked', 'advance_retry_skipped', 'retry_queued')
+			'advance_retried', 'advance_blocked', 'advance_retry_skipped', 'retry_queued',
+			'review_loop_detected')
 		ORDER BY id DESC LIMIT 1`, jobID).Scan(&kind)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
@@ -1313,7 +1314,8 @@ const (
 		  AND id IN (
 			SELECT MAX(id) FROM job_events
 			WHERE kind IN ('advance_started', 'advance_retry', 'advance_completed',
-			               'advance_retried', 'advance_blocked', 'advance_retry_skipped', 'retry_queued')
+			               'advance_retried', 'advance_blocked', 'advance_retry_skipped', 'retry_queued',
+			               'review_loop_detected')
 			GROUP BY job_id
 		)
 		ORDER BY job_id`

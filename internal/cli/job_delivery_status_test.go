@@ -196,6 +196,7 @@ func TestDeriveJobDeliveryStatusLatestMarkerWinsAndUnknownStaysSilent(t *testing
 		{name: "implemented no PR stays unknown after generic completion", decision: "implemented", events: []db.JobEvent{{Kind: "advance_started"}, {Kind: "advance_skipped_no_pr"}, {Kind: "advance_completed"}}},
 		{name: "retry queued suppresses stale pending", decision: "implemented", events: []db.JobEvent{{Kind: "advance_retry"}, {Kind: "retry_queued"}}},
 		{name: "awaiting human stays unknown", decision: "implemented", events: []db.JobEvent{{Kind: "advance_retry"}, {Kind: "advance_awaiting_human"}}},
+		{name: "review loop suppresses stale pending", decision: "implemented", events: []db.JobEvent{{Kind: "advance_retry"}, {Kind: workflow.ReviewLoopDetectedEventKind}}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

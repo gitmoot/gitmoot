@@ -150,7 +150,7 @@ func advancementPending(events []db.JobEvent) bool {
 		case "advance_started", "advance_retry":
 			pending = true
 			seen = true
-		case "advance_completed", "advance_retried", "advance_blocked", "advance_retry_skipped", "retry_queued":
+		case "advance_completed", "advance_retried", "advance_blocked", "advance_retry_skipped", "retry_queued", ReviewLoopDetectedEventKind:
 			pending = false
 			seen = true
 		}
