@@ -15,12 +15,33 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
+// finishQueuedJob closes a job that is queued NOW, for callers with no earlier run to be stale
+// against -- the ~22 pre-flight sites, which act on a job they just admitted.
 func (w jobWorker) finishQueuedJob(ctx context.Context, jobID string, state workflow.JobState, cause error) error {
-	transitioned, err := w.Store.TransitionJobStateWithEvent(ctx, jobID, string(workflow.JobQueued), string(state), db.JobEvent{
+	return w.finishQueuedJobAtGeneration(ctx, jobID, -1, state, cause)
+}
+
+// finishQueuedJobAtGeneration is the ANCHORED form: atGeneration >= 0 makes the transition
+// atomic in (state, generation), so a verdict formed about an earlier run cannot close a newer
+// one that merely happens to be queued again.
+//
+// It is a separate entry point rather than a threaded parameter on all 23 call sites because the
+// pre-flight callers have no prior run to be stale against -- adding an argument they must pass
+// -1 to would be 22 chances to pass the wrong thing for one site that needs it. The stale-
+// sensitive caller is handleRunJobError, and it is the only one that anchors.
+func (w jobWorker) finishQueuedJobAtGeneration(ctx context.Context, jobID string, atGeneration int64, state workflow.JobState, cause error) error {
+	event := db.JobEvent{
 		JobID:   jobID,
 		Kind:    string(state),
 		Message: cause.Error(),
-	})
+	}
+	var transitioned bool
+	var err error
+	if atGeneration >= 0 {
+		transitioned, err = w.Store.TransitionJobStateWithEventAtGeneration(ctx, jobID, string(workflow.JobQueued), atGeneration, string(state), event)
+	} else {
+		transitioned, err = w.Store.TransitionJobStateWithEvent(ctx, jobID, string(workflow.JobQueued), string(state), event)
+	}
 	if err != nil {
 		return err
 	}
@@ -135,7 +156,7 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, observed
 	if latest.Type == "implement" && runtimePermissionFailure(cause) {
 		payload, payloadErr := daemonJobPayload(latest)
 		if payloadErr != nil || payload.Result == nil {
-			transitioned, err := markJobPermissionBlocked(ctx, w.Store, jobID)
+			transitioned, err := markJobPermissionBlockedAtGeneration(ctx, w.Store, jobID, observed.generation)
 			if err != nil {
 				return err
 			}
@@ -171,7 +192,10 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, observed
 		if errors.As(cause, &blocked) {
 			state = workflow.JobBlocked
 		}
-		return w.finishQueuedJob(ctx, jobID, state, cause)
+		// ANCHORED. The generation check above is a FAST PATH that avoids pointless work; it
+		// guarantees nothing, because a retry can be claimed between that read and this
+		// write. The guarantee lives here, in the atomic (state, generation) CAS.
+		return w.finishQueuedJobAtGeneration(ctx, jobID, observed.generation, state, cause)
 	}
 	if latest.State == string(workflow.JobCancelled) {
 		_, err := workflow.SettleCancelledRunningJob(ctx, w.Store, latest.ID, "cancelled job worker settled")

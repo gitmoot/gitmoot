@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -742,27 +743,15 @@ func TestRunErrorFromAPreviousRunDoesNotClobberARetriedJob(t *testing.T) {
 	}
 	observed := observedJobLifecycle(before)
 
-	// It fails, and while its error is in flight an operator retry completes: the job goes
-	// terminal and is re-queued at a NEW generation with its result cleared.
-	if _, err := store.TransitionJobState(ctx, "clobber", string(workflow.JobRunning), string(workflow.JobFailed)); err != nil {
-		t.Fatalf("TransitionJobState returned error: %v", err)
-	}
-	if _, err := store.TransitionJobState(ctx, "clobber", string(workflow.JobFailed), string(workflow.JobQueued)); err != nil {
-		t.Fatalf("TransitionJobState returned error: %v", err)
-	}
-
-	// PREMISE: the row must genuinely be queued at a MOVED generation, or this fixture is not
-	// the interleaving it names.
-	armed, err := store.GetJob(ctx, "clobber")
-	if err != nil {
-		t.Fatalf("GetJob returned error: %v", err)
-	}
-	if armed.State != string(workflow.JobQueued) {
-		t.Fatalf("fixture state = %q, want queued", armed.State)
-	}
-	if armed.LifecycleGeneration == observed.generation {
-		t.Fatalf("generation did not advance (%d); this fixture does not exercise the stale-run path", armed.LifecycleGeneration)
-	}
+	// A full retry lifecycle runs and returns the job to the SAME state the stale run
+	// observed, at a NEWER generation.
+	//
+	// The first version of this test used running -> queued: two DIFFERENT states, so a
+	// state-only comparison passed it too and it did not enforce the property it named.
+	// Same-state / different-generation is the only fixture that discriminates a generation
+	// anchor from a state one.
+	_ = observed
+	observed = seedSameStateNewerGeneration(t, store, "clobber", workflow.JobRunning)
 
 	worker := defaultJobWorker(store, io.Discard)
 	deliveryFailed := workflow.BlockedError{Reason: "result delivery failed", ResultDeliveryFailed: true}
@@ -774,7 +763,102 @@ func TestRunErrorFromAPreviousRunDoesNotClobberARetriedJob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetJob returned error: %v", err)
 	}
+	if after.State != string(workflow.JobRunning) {
+		t.Fatalf("state = %q, want running: a PREVIOUS run's failure settled a job that had already been retried", after.State)
+	}
+}
+
+// seedSameStateNewerGeneration returns a job to the SAME state it started in, at a NEWER
+// generation, and returns the lifecycle a stale run observed.
+//
+// Same-state / different-generation is the ONLY discriminating fixture. Round 7's guard used
+// running -> queued: two DIFFERENT states, so a state-only comparison passed it too and the test
+// did not enforce the property it named. That is the discriminator rule this campaign has applied
+// to other people's guards throughout, missed in my own one round after writing ABA guards that
+// do it correctly.
+func seedSameStateNewerGeneration(t *testing.T, store *db.Store, jobID string, state workflow.JobState) jobLifecycle {
+	t.Helper()
+	ctx := context.Background()
+	before, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	observed := observedJobLifecycle(before)
+	for _, step := range [][2]string{
+		{string(state), string(workflow.JobFailed)},
+		{string(workflow.JobFailed), string(workflow.JobQueued)},
+		{string(workflow.JobQueued), string(state)},
+	} {
+		if step[0] == step[1] {
+			continue
+		}
+		transitioned, err := store.TransitionJobState(ctx, jobID, step[0], step[1])
+		if err != nil {
+			t.Fatalf("TransitionJobState(%s->%s) returned error: %v", step[0], step[1], err)
+		}
+		if !transitioned {
+			t.Fatalf("TransitionJobState(%s->%s) did not transition; fixture did not arm", step[0], step[1])
+		}
+	}
+	armed, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if armed.State != observed.state {
+		t.Fatalf("fixture state = %q, want it RETURNED to %q -- a different state does not discriminate a generation anchor from a state one", armed.State, observed.state)
+	}
+	if armed.LifecycleGeneration == observed.generation {
+		t.Fatalf("generation did not advance (%d); this fixture is not testing an anchor", armed.LifecycleGeneration)
+	}
+	return observed
+}
+
+// TestPermissionBlockDoesNotBlockANewerRun anchors WRITER 1 (markJobPermissionBlocked).
+//
+// Review reproduced this one: the state-only CAS accepted a NEWER run's `running` and blocked it,
+// giving new run state = "blocked", want running.
+func TestPermissionBlockDoesNotBlockANewerRun(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "perm-aba", Agent: "lead", Type: "implement", State: string(workflow.JobRunning), Payload: "{}"}, db.JobEvent{
+		JobID: "perm-aba", Kind: "running", Message: "job started",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	observed := seedSameStateNewerGeneration(t, store, "perm-aba", workflow.JobRunning)
+
+	if _, err := markJobPermissionBlockedAtGeneration(ctx, store, "perm-aba", observed.generation); err != nil {
+		t.Fatalf("markJobPermissionBlockedAtGeneration returned error: %v", err)
+	}
+	after, err := store.GetJob(ctx, "perm-aba")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if after.State != string(workflow.JobRunning) {
+		t.Fatalf("state = %q, want running: a permission verdict from a PREVIOUS run blocked a newer one", after.State)
+	}
+}
+
+// TestFinishQueuedJobDoesNotCloseANewerRun anchors WRITER 2 (finishQueuedJob).
+func TestFinishQueuedJobDoesNotCloseANewerRun(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "queued-aba", Agent: "lead", Type: "implement", State: string(workflow.JobQueued), Payload: "{}"}, db.JobEvent{
+		JobID: "queued-aba", Kind: "queued", Message: "job queued",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	observed := seedSameStateNewerGeneration(t, store, "queued-aba", workflow.JobQueued)
+
+	worker := defaultJobWorker(store, io.Discard)
+	if err := worker.finishQueuedJobAtGeneration(ctx, "queued-aba", observed.generation, workflow.JobFailed, errors.New("stale run failure")); err != nil {
+		t.Fatalf("finishQueuedJobAtGeneration returned error: %v", err)
+	}
+	after, err := store.GetJob(ctx, "queued-aba")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
 	if after.State != string(workflow.JobQueued) {
-		t.Fatalf("state = %q, want queued: a PREVIOUS run's failure settled a job that had already been retried", after.State)
+		t.Fatalf("state = %q, want queued: a failure from a PREVIOUS run closed a newer one", after.State)
 	}
 }

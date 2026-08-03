@@ -25,11 +25,40 @@ func readOnlyImplementationBlocked(jobType string, agent runtime.Agent) bool {
 	return !runtime.PolicyGrantsImplementWrite(agent.AutonomyPolicy)
 }
 
-func markJobPermissionBlocked(ctx context.Context, store *db.Store, jobID string) (bool, error) {
+// markJobPermissionBlocked blocks a job for a permission failure.
+//
+// atGeneration, when non-negative, pins the LIFECYCLE this verdict was formed about, and the
+// transition is then atomic in (state, generation). Dispatch-time callers pass -1: they are
+// acting on a job they just created, so there is no earlier run to be stale against.
+//
+// The anchored form exists because a check-then-act is not enough (#1407). handleRunJobError
+// re-reads the row and checks the generation, but a retry can be claimed in the window between
+// that read and this write; the state-only CAS below then accepts the NEWER run's `running` and
+// blocks it. Review reproduced exactly that: new run state = "blocked", want running. The
+// guarantee has to live in the WRITE, not in a preceding read.
+func markJobPermissionBlockedAtGeneration(ctx context.Context, store *db.Store, jobID string, atGeneration int64) (bool, error) {
 	if store == nil {
 		return false, errors.New("job store is required")
 	}
 	for _, from := range []workflow.JobState{workflow.JobQueued, workflow.JobRunning, workflow.JobFailed} {
+		event := db.JobEvent{
+			JobID:   jobID,
+			Kind:    string(workflow.JobBlocked),
+			Message: agentPermissionBlockedMessage,
+		}
+		if atGeneration >= 0 {
+			transitioned, err := store.TransitionJobStateWithEventAtGeneration(ctx, jobID, string(from), atGeneration, string(workflow.JobBlocked), event)
+			if err != nil {
+				return false, err
+			}
+			if transitioned {
+				if err := store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "permission_blocked", Message: agentPermissionBlockedMessage}); err != nil {
+					return false, err
+				}
+				return true, nil
+			}
+			continue
+		}
 		transitioned, err := store.TransitionJobStateWithEvent(ctx, jobID, string(from), string(workflow.JobBlocked), db.JobEvent{
 			JobID:   jobID,
 			Kind:    string(workflow.JobBlocked),
@@ -46,6 +75,13 @@ func markJobPermissionBlocked(ctx context.Context, store *db.Store, jobID string
 		}
 	}
 	return false, nil
+}
+
+// markJobPermissionBlocked is the UNANCHORED form, for callers with no earlier run to be stale
+// against (dispatch time, where the job was just created). It is a DISTINCT NAME rather than a
+// default argument so an anchored call site cannot silently become unanchored by dropping one.
+func markJobPermissionBlocked(ctx context.Context, store *db.Store, jobID string) (bool, error) {
+	return markJobPermissionBlockedAtGeneration(ctx, store, jobID, -1)
 }
 
 func runtimePermissionFailure(err error) bool {
