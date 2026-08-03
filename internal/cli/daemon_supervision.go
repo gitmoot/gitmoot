@@ -1471,6 +1471,8 @@ func (r *pollErrorReporters) bind(mode pollMode, d daemon.Daemon) boundPoll {
 // That is the THIRD residual claim I have written here and had disproved -- after "consistent
 // misattribution" and "only the destructuring line is untested". The pattern is not that the
 // claims were unlucky; it is that I asserted the limits of my own guards without testing them.
+// TestSupervisorBusyBranchRunsTheRecoveryPoll reaches the fallback by making the tracker busy
+// with a live shell job and kills a mutant that points that branch at the full runner.
 func (r *pollErrorReporters) runners(d daemon.Daemon) (full boundPoll, recovery boundPoll) {
 	return r.bind(fullPoll, d), r.bind(recoveryPoll, d)
 }
