@@ -238,6 +238,67 @@ func ompAgentEndWithTelemetry(input, output int) string {
 		input, output, input+output) + "\n"
 }
 
+// ompUndecodableMessageEnd is the row that made this whole rule necessary: VALID
+// JSON, type "message_end" — a type this parser reads — whose per-message usage
+// block reports `input` as a STRING. omp's own union types it as a number, so this
+// is exactly the provider/envelope drift that shows up first in the field, and
+// encoding/json fails the line as a whole. The message it hides is a FAILED final
+// turn (stopReason error, a 529), which is why skipping the line silently turns the
+// run into a success carrying whatever the PREVIOUS turn happened to say.
+func ompUndecodableMessageEnd() string {
+	return `{"type":"message_end","message":{"role":"assistant","content":[],` +
+		`"usage":{"input":"7","output":0,"totalTokens":7},"stopReason":"error",` +
+		`"errorMessage":"overloaded_error","errorStatus":529}}` + "\n"
+}
+
+// ompStringContentMessageEnd is the row rule 6 must NOT fail on: a message_end for a
+// NON-assistant message whose `content` is a bare STRING. omp's unions permit it —
+// UserMessage and DeveloperMessage type content as `string | (TextContent |
+// ImageContent)[]` (packages/ai/src/types.ts:803-805, :817-819) and
+// CustomMessageContent is the same union (coding-agent/src/session/messages.ts:314) —
+// and omp really writes these on the print-mode wire: emitInputMessages pushes
+// {message_start, message_end} for EVERY input/aside/steer/custom message of a turn
+// (agent-loop.ts:938-943) and json mode prints every event verbatim
+// (print-mode.ts:173-176). Go's []ompContentPart cannot decode a string, so each of
+// these lines is valid JSON of a LOAD-BEARING type whose payload FAILS to decode,
+// while being a row rule 2's role filter drops unread. Failing them would turn
+// healthy runs into envelope-drift errors.
+func ompStringContentMessageEnd(role, customType, content string) string {
+	custom := ""
+	if customType != "" {
+		custom = fmt.Sprintf(`"customType":%s,"display":false,"attribution":"agent",`, ompJSONString(customType))
+	}
+	return fmt.Sprintf(`{"type":"message_end","message":{"role":%s,%s"content":%s,"timestamp":1785737730821}}`,
+		ompJSONString(role), custom, ompJSONString(content)) + "\n"
+}
+
+// ompRolelessUndecodableMessageEnd is an undecodable message_end whose message object
+// carries NO role at all: the discriminator that decides whether this parser would
+// have read the row is itself missing, on a row it could not read.
+func ompRolelessUndecodableMessageEnd() string {
+	return `{"type":"message_end","message":{"content":"the content drifted to a string",` +
+		`"usage":{"input":"7","output":0},"stopReason":"error","errorMessage":"overloaded_error"}}` + "\n"
+}
+
+// ompUnreadableRoleMessageEnd is the harder shape: `message` is not an object at all,
+// so no probe can recover a role from it.
+func ompUnreadableRoleMessageEnd() string {
+	return `{"type":"message_end","message":"the whole payload drifted to a string"}` + "\n"
+}
+
+// ompUndecodableRows is one valid-JSON, undecodable line per LOAD-BEARING event
+// type, each a plausible drift of a field this parser really reads: a numeric
+// session id, a stringified per-message usage count, a structured finalError, a
+// stringified retry verdict, a stringified isTerminal. Keyed by event type so the
+// table test can enumerate ompLoadBearingEventTypes and demand one per member.
+var ompUndecodableRows = map[string]string{
+	"session":          `{"type":"session","version":3,"id":42,"cwd":"/repo"}` + "\n",
+	"message_end":      ompUndecodableMessageEnd(),
+	"auto_retry_start": `{"type":"auto_retry_start","attempt":2,"maxAttempts":10,"finalError":{"code":529}}` + "\n",
+	"auto_retry_end":   `{"type":"auto_retry_end","success":"false","attempt":3}` + "\n",
+	"agent_end":        `{"type":"agent_end","messages":[],"isTerminal":"true"}` + "\n",
+}
+
 func ompJSONString(value string) string {
 	encoded, err := json.Marshal(value)
 	if err != nil {
@@ -1612,6 +1673,307 @@ func TestParseOmpStreamJSONIgnoresUnknownEvents(t *testing.T) {
 	}
 }
 
+// TestParseOmpStreamJSONUndecodableKnownEventFailsRun pins rule 6's narrow half.
+// The fixture is the one the adversarial review found: an earlier assistant turn
+// that SPOKE, then a FAILED message_end the parser cannot decode (valid JSON, a
+// type it reads, a usage block whose `input` drifted to a string), then a terminal
+// agent_end. Every other envelope rule passes, so an unconditional "unparseable
+// lines are skipped" makes this run a SUCCESS whose Summary is the earlier turn's
+// work note — the stale-text false green the truncation rules exist to refuse,
+// arriving through the decoder instead of through stopReason.
+//
+// Kills: reverting the skip to unconditional; failing without NAMING the event type
+// (the operator's only lead on which part of the envelope drifted); and returning
+// the pre-failure text alongside the error.
+//
+// The complements below are the other half of the same needle: forward
+// compatibility is for rows this parser does not read, so an unknown type stays
+// skipped EVEN WHEN it fails to decode, and a line that is not valid JSON at all
+// stays skipped even when it looks like a known type. A fix that fails on any
+// decode error would pass the first assertion and break both of those.
+func TestParseOmpStreamJSONUndecodableKnownEventFailsRun(t *testing.T) {
+	stdout := ompHeaderLine(ompFixtureSessionID) +
+		ompAssistantEnd("Let me read the file first.", 12, 3) +
+		ompUndecodableMessageEnd() +
+		ompAgentEnd()
+	text, sessionID, usage, err := parseOmpStreamJSON(stdout)
+	if err == nil {
+		t.Fatalf("parseOmpStreamJSON accepted a stream whose message_end could not be decoded (text=%q)", text)
+	}
+	if !strings.Contains(err.Error(), "message_end") {
+		t.Fatalf("error %q must NAME the undecodable event type: it is the operator's only lead on which row drifted", err.Error())
+	}
+	if text != "" {
+		t.Fatalf("text = %q, want none: that sentence was written BEFORE the row the parser could not read, so it is not the run's answer", text)
+	}
+	// Diagnostics survive the failure: the parser keeps scanning past the bad row
+	// instead of bailing, so the header id and the usage the decodable messages
+	// prove was billed are still reported (a failed run is still billed).
+	if sessionID != ompFixtureSessionID {
+		t.Fatalf("sessionID = %q, want the header id %q to survive the failure", sessionID, ompFixtureSessionID)
+	}
+	if usage.InputTokens != 12 || usage.OutputTokens != 3 {
+		t.Fatalf("usage = %d/%d, want 12/3: the tokens the decodable messages proved were billed", usage.InputTokens, usage.OutputTokens)
+	}
+
+	// Every load-bearing type, not just the one the review happened to find. The
+	// loop enumerates ompLoadBearingEventTypes itself, so a type added to that set
+	// without a fixture here fails instead of shipping unexercised.
+	t.Run("every load-bearing event type", func(t *testing.T) {
+		if len(ompUndecodableRows) != len(ompLoadBearingEventTypes) {
+			t.Fatalf("ompUndecodableRows covers %d types, ompLoadBearingEventTypes has %d: every load-bearing type needs a fixture",
+				len(ompUndecodableRows), len(ompLoadBearingEventTypes))
+		}
+		for eventType := range ompLoadBearingEventTypes {
+			row, ok := ompUndecodableRows[eventType]
+			if !ok {
+				t.Fatalf("no undecodable fixture for load-bearing event type %q", eventType)
+			}
+			t.Run(eventType, func(t *testing.T) {
+				stream := ompHeaderLine(ompFixtureSessionID) +
+					ompAssistantEnd("stale", 1, 1) + row + ompAgentEnd()
+				text, _, _, err := parseOmpStreamJSON(stream)
+				if err == nil {
+					t.Fatalf("parseOmpStreamJSON accepted an undecodable %s row (text=%q)", eventType, text)
+				}
+				if !strings.Contains(err.Error(), eventType) {
+					t.Fatalf("error %q must name the undecodable event type %q", err.Error(), eventType)
+				}
+				if text != "" {
+					t.Fatalf("text = %q, want none when a %s row could not be read", text, eventType)
+				}
+			})
+		}
+	})
+
+	// The ROLE half of the same needle, and the false RED this rule can produce if it
+	// only looks at the type. message_end is load-bearing only for ASSISTANT messages
+	// (rule 2's filter); omp emits one for every user, developer and custom message of
+	// a turn as well, their content is legally a bare string, and Go cannot decode a
+	// string into []ompContentPart. So these rows are valid JSON of a load-bearing
+	// TYPE that fail to decode while being rows this parser would never have read —
+	// failing them reports a COMPLETE run as envelope drift and throws its answer
+	// away, the mirror image of the stale-text false green above.
+	//
+	// Kills: dropping the role probe (every one of these healthy streams fails).
+	t.Run("a non-assistant message_end with string content is skipped", func(t *testing.T) {
+		rows := map[string]string{
+			"user":                   ompStringContentMessageEnd("user", "", "review the diff on this branch"),
+			"developer":              ompStringContentMessageEnd("developer", "", "<system-reminder>stay on task</system-reminder>"),
+			"custom plan-mode":       ompStringContentMessageEnd("custom", "plan-mode-context", "<plan-mode>write PLAN.md before editing</plan-mode>"),
+			"custom lsp late diag":   ompStringContentMessageEnd("custom", "lsp-late-diagnostic", "internal/runtime/omp.go:12:2: declared and not used: x"),
+			"custom todo reminder":   ompStringContentMessageEnd("custom", "todo-error-reminder", "the todo list still has open items"),
+			"custom thinking loop":   ompStringContentMessageEnd("custom", "thinking-loop-redirect", "you have been thinking in circles; act"),
+			"custom goal-mode ctx":   ompStringContentMessageEnd("custom", "goal-mode-context", "the active goal is: ship the adapter"),
+			"custom vibe-mode ctx":   ompStringContentMessageEnd("custom", "vibe-mode-context", "keep a todo list as you go"),
+			"custom live delegation": ompStringContentMessageEnd("custom", "live-delegation", "the voice model asked for a refactor"),
+		}
+		var everyRow string
+		for name, row := range rows {
+			everyRow += row
+			t.Run(name, func(t *testing.T) {
+				// The fixture must really be undecodable, or this subtest silently
+				// stops exercising the classifier at all.
+				var event ompStreamEvent
+				if err := json.Unmarshal([]byte(strings.TrimSpace(row)), &event); err == nil {
+					t.Fatalf("fixture decodes cleanly and so no longer reaches rule 6: %s", row)
+				}
+				stdout := ompHeaderLine(ompFixtureSessionID) + row +
+					ompAssistantEnd("done", 2, 1) + ompAgentEnd()
+				text, sessionID, usage, err := parseOmpStreamJSON(stdout)
+				if err != nil {
+					t.Fatalf("parseOmpStreamJSON: %v (this message_end is a row rule 2's role filter drops unread, so rule 6 must skip it instead of failing a healthy run)", err)
+				}
+				if text != "done" {
+					t.Fatalf("text = %q, want %q: the assistant DID answer", text, "done")
+				}
+				if sessionID != ompFixtureSessionID {
+					t.Fatalf("sessionID = %q, want %q", sessionID, ompFixtureSessionID)
+				}
+				if usage.InputTokens != 2 || usage.OutputTokens != 1 {
+					t.Fatalf("usage = %d/%d, want 2/1", usage.InputTokens, usage.OutputTokens)
+				}
+			})
+		}
+		// A real turn carries several of them at once (a prelude, a steer, a late
+		// diagnostic), so the whole set has to pass together, not just one at a time.
+		t.Run("all of them in one turn", func(t *testing.T) {
+			stdout := ompHeaderLine(ompFixtureSessionID) + everyRow +
+				ompAssistantEnd("done", 2, 1) + ompAgentEnd()
+			text, _, _, err := parseOmpStreamJSON(stdout)
+			if err != nil {
+				t.Fatalf("parseOmpStreamJSON: %v (a turn's worth of non-assistant message_end rows must not fail the run)", err)
+			}
+			if text != "done" {
+				t.Fatalf("text = %q, want %q", text, "done")
+			}
+		})
+	})
+
+	// The complement that keeps the role probe from becoming a way OUT of rule 6: the
+	// role is the discriminator, so a row that lost the discriminator too is fatal.
+	// Fail-closed, because "some other role, skip it" would be a guess read out of a
+	// payload the parser just admitted it could not read.
+	//
+	// Kills: skipping when the role is unreadable or absent.
+	t.Run("an undecodable message_end with no readable role still fails", func(t *testing.T) {
+		rows := map[string]string{
+			"role field absent":        ompRolelessUndecodableMessageEnd(),
+			"message is not an object": ompUnreadableRoleMessageEnd(),
+		}
+		for name, row := range rows {
+			t.Run(name, func(t *testing.T) {
+				stdout := ompHeaderLine(ompFixtureSessionID) +
+					ompAssistantEnd("Let me read the file first.", 12, 3) + row + ompAgentEnd()
+				text, _, _, err := parseOmpStreamJSON(stdout)
+				if err == nil {
+					t.Fatalf("parseOmpStreamJSON accepted a message_end it could not decode AND could not attribute to a role (text=%q)", text)
+				}
+				if !strings.Contains(err.Error(), "message_end") {
+					t.Fatalf("error %q must NAME the undecodable event type", err.Error())
+				}
+				if text != "" {
+					t.Fatalf("text = %q, want none: it predates the row the parser could not read", text)
+				}
+			})
+		}
+	})
+
+	// Ordering, not just outcome: the unreadable row is the report even when the
+	// stream ALSO said, in a row that decoded fine, that a turn failed. The decode
+	// failure is the more actionable fact (envelope drift an operator must fix) and it
+	// makes the other verdict provisional — the unread row may itself have been the
+	// real cause, or the recovery.
+	//
+	// Kills: moving the undecodable return below the turnFailed one.
+	t.Run("an unreadable row outranks a failure the stream reported", func(t *testing.T) {
+		stdout := ompHeaderLine(ompFixtureSessionID) +
+			ompFailedAssistantEnd("error", "overloaded_error", 529) +
+			ompUndecodableRows["agent_end"] +
+			ompAgentEnd()
+		text, _, _, err := parseOmpStreamJSON(stdout)
+		if err == nil {
+			t.Fatalf("parseOmpStreamJSON accepted a stream with an undecodable agent_end (text=%q)", text)
+		}
+		if !strings.Contains(err.Error(), "could not decode") {
+			t.Fatalf("error %q must report the row the parser could not read, not a verdict derived from the rows it could", err.Error())
+		}
+		if strings.Contains(err.Error(), "omp turn failed") {
+			t.Fatalf("error %q is the stopReason verdict: a stream carrying an unreadable load-bearing row cannot report that verdict as THE cause", err.Error())
+		}
+	})
+
+	// The parser keeps scanning past an unreadable row instead of bailing on it, so
+	// the session id and the usage arriving AFTER it still get reported. A failed run
+	// is still billed, and its id is how an operator finds the session to reconcile.
+	// The bad row is FIRST here on purpose: with it last, bailing and continuing are
+	// indistinguishable.
+	//
+	// Kills: returning immediately from the undecodable branch.
+	t.Run("diagnostics survive a bad row anywhere in the stream", func(t *testing.T) {
+		stdout := ompUndecodableMessageEnd() +
+			ompHeaderLine(ompFixtureSessionID) +
+			ompAssistantEnd("done", 12, 3) +
+			ompAgentEnd()
+		text, sessionID, usage, err := parseOmpStreamJSON(stdout)
+		if err == nil {
+			t.Fatalf("parseOmpStreamJSON accepted a stream whose FIRST row could not be decoded (text=%q)", text)
+		}
+		if text != "" {
+			t.Fatalf("text = %q, want none", text)
+		}
+		if sessionID != ompFixtureSessionID {
+			t.Fatalf("sessionID = %q, want the header id %q: the parser stopped reading at the bad row", sessionID, ompFixtureSessionID)
+		}
+		if usage.InputTokens != 12 || usage.OutputTokens != 3 {
+			t.Fatalf("usage = %d/%d, want 12/3: the tokens billed AFTER the bad row are still billed", usage.InputTokens, usage.OutputTokens)
+		}
+	})
+
+	// First-wins across undecodable rows. A second drift is usually the first one
+	// again a few rows later; the earliest is where the envelope actually moved and
+	// the only one an operator can start from.
+	//
+	// Kills: latching the LAST undecodable row instead of the first.
+	t.Run("two undecodable rows report the FIRST", func(t *testing.T) {
+		stdout := ompHeaderLine(ompFixtureSessionID) +
+			ompUndecodableRows["session"] +
+			ompAssistantEnd("stale", 1, 1) +
+			ompUndecodableRows["agent_end"] +
+			ompAgentEnd()
+		_, _, _, err := parseOmpStreamJSON(stdout)
+		if err == nil {
+			t.Fatalf("parseOmpStreamJSON accepted a stream with two undecodable load-bearing rows")
+		}
+		if !strings.Contains(err.Error(), "carried a session event") {
+			t.Fatalf("error %q must report the FIRST unreadable row (the session header), not a later one", err.Error())
+		}
+		if strings.Contains(err.Error(), "agent_end") {
+			t.Fatalf("error %q reports the LAST unreadable row: the first is where the envelope moved", err.Error())
+		}
+	})
+
+	// The forward-compat half of rule 6, and the reason this is not "fail on any
+	// decode error": omp keeps adding event types (auto_compaction_*, model_changed,
+	// notice), their payloads are shapes this struct never modelled, and a run that
+	// this parser read completely must not fail because a row it ignores moved.
+	t.Run("an unknown type that fails to decode is still skipped", func(t *testing.T) {
+		stdout := ompHeaderLine(ompFixtureSessionID) +
+			`{"type":"auto_compaction_start","isTerminal":"soon","telemetry":"pending"}` + "\n" +
+			`{"type":"model_changed","success":"maybe","id":7}` + "\n" +
+			ompAssistantEnd("done", 2, 1) + ompAgentEnd()
+		text, _, usage, err := parseOmpStreamJSON(stdout)
+		if err != nil {
+			t.Fatalf("parseOmpStreamJSON: %v (an unknown event type must stay forward-compatible even when its payload does not decode)", err)
+		}
+		if text != "done" {
+			t.Fatalf("text = %q, want %q", text, "done")
+		}
+		if usage.InputTokens != 2 || usage.OutputTokens != 1 {
+			t.Fatalf("usage = %d/%d, want 2/1", usage.InputTokens, usage.OutputTokens)
+		}
+	})
+
+	// Garbage tolerance is unchanged, deliberately, even for a line that LOOKS like
+	// a known type: a row that is not valid JSON has no reliable type to read, and
+	// half-written tails and stray log lines are the shapes that produce it. The
+	// classification is made from the line's own contents, not from a substring.
+	t.Run("a line that is not valid JSON at all is still skipped", func(t *testing.T) {
+		stdout := ompHeaderLine(ompFixtureSessionID) +
+			`{"type":"message_end","message":{"role":"assistant","content":[` + "\n" +
+			"omp: warning printed onto stdout\n" +
+			ompAssistantEnd("done", 2, 1) + ompAgentEnd()
+		text, _, _, err := parseOmpStreamJSON(stdout)
+		if err != nil {
+			t.Fatalf("parseOmpStreamJSON: %v (a line that is not valid JSON stays skipped under rule 6)", err)
+		}
+		if text != "done" {
+			t.Fatalf("text = %q, want %q", text, "done")
+		}
+	})
+
+	// The symptom the review actually reported, at the boundary that ships it: the
+	// stale sentence must never reach a job's Summary, and the whole stream stays as
+	// evidence so the drifted row can be read by hand.
+	t.Run("Deliver never answers with the pre-failure sentence", func(t *testing.T) {
+		runner := &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}}
+		result, err := (OmpAdapter{Runner: runner, Dir: "/repo"}).
+			Deliver(context.Background(), ompTestAgent(), Job{Prompt: "review this"})
+		if err == nil {
+			t.Fatalf("Deliver succeeded on a stream with an undecodable message_end: %+v", result)
+		}
+		if result.Summary != "" {
+			t.Fatalf("Summary = %q, want none: that sentence predates the row the parser could not read", result.Summary)
+		}
+		if result.Raw != stdout {
+			t.Fatalf("Raw = %q, want the whole stream as evidence for the envelope drift", result.Raw)
+		}
+		if result.InputTokens != 12 || result.OutputTokens != 3 {
+			t.Fatalf("usage = %d/%d, want 12/3: a failed run is still billed", result.InputTokens, result.OutputTokens)
+		}
+	})
+}
+
 // TestParseOmpStreamJSONRequiresTerminal is the loud-drift guard: no agent_end
 // means the CLI died mid-stream or the envelope moved. Kills: treating that as an
 // empty success, AND deleting this guard in favour of the isTerminal one — no
@@ -2257,9 +2619,16 @@ func TestOmpStartReturnsUsableRef(t *testing.T) {
 
 	// The session header is the ONLY channel that reports a finished print-mode
 	// run's id, so a stream without one leaves the registration with no reference
-	// at all. Kills: registering an omp agent whose RuntimeRef is silently empty.
+	// at all. Kills: registering an omp agent whose RuntimeRef is silently empty,
+	// AND handing back the parsed assistant text as Raw on this failure. The
+	// missing header is an ENVELOPE defect, so the envelope is the evidence: the
+	// raw stdout is the only thing that shows which line omp wrote first, and the
+	// two failure returns above this one (non-zero exit, parse error) already
+	// answer with raw stdout. A sentence lifted out of a stream whose id is gone
+	// diagnoses nothing.
 	t.Run("a stream with no session header is rejected", func(t *testing.T) {
-		headerless := &fakeRunner{results: []subprocess.Result{{Stdout: ompAssistantEnd("hi", 1, 1) + ompAgentEnd()}}}
+		stdout := ompAssistantEnd("hi", 1, 1) + ompAgentEnd()
+		headerless := &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}}
 		result, err := (OmpAdapter{Runner: headerless, Dir: "/repo"}).
 			Start(context.Background(), StartRequest{Agent: agent, Prompt: "introduce yourself"})
 		if err == nil {
@@ -2270,6 +2639,9 @@ func TestOmpStartReturnsUsableRef(t *testing.T) {
 		}
 		if result.RuntimeRef != "" {
 			t.Fatalf("RuntimeRef = %q, want none when the header was missing", result.RuntimeRef)
+		}
+		if result.Raw != stdout {
+			t.Fatalf("Raw = %q, want the FULL stdout %q: the diagnostic envelope, not the parsed content", result.Raw, stdout)
 		}
 	})
 

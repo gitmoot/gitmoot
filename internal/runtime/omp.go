@@ -129,8 +129,14 @@ func (a OmpAdapter) Start(ctx context.Context, request StartRequest) (StartResul
 	// print-mode run, so a missing one leaves the registration with no reference at
 	// all. Fail loudly here rather than register an agent whose ref is empty for a
 	// reason nobody can reconstruct later.
+	//
+	// Raw is the RAW STDOUT on this path, matching the two failure returns above and
+	// the Deliver contract: the failure is about the ENVELOPE, so the envelope is the
+	// evidence. Handing back the parsed assistant text instead would throw away the
+	// only thing that can explain a missing header — which line omp actually wrote
+	// first — and leave the operator a sentence from a run whose id is gone.
 	if sessionID == "" {
-		return StartResult{Raw: content}, errors.New("omp stream carried no session header id; cannot register a runtime reference")
+		return StartResult{Raw: result.Stdout}, errors.New("omp stream carried no session header id; cannot register a runtime reference")
 	}
 	return StartResult{RuntimeRef: sessionID, Raw: content}, nil
 }
@@ -487,8 +493,120 @@ func ompAttachedPromptPointer() string {
 // default to 0 when the stream reports no usage at all.
 type ompUsage = StreamUsage
 
+// ompLoadBearingEventTypes is the CLOSED set of event types parseOmpStreamJSON
+// actually READS. It exists so rule 6 can tell a row this parser depends on from a
+// row it merely tolerates: an unknown type is forward-compat and stays skipped even
+// when its payload will not decode, while an undecodable row of one of THESE types
+// fails the run (see ompUndecodableEventType).
+//
+// This map GATES the dispatch in parseOmpStreamJSON instead of merely describing it:
+// the loop consults it before the switch, so the two cannot drift in the dangerous
+// direction. A case added to that switch without an entry here is UNREACHABLE — its
+// behaviour is simply absent, which the first test exercising it reports — rather
+// than working on the happy path and going silently missing on envelope drift, which
+// is the defect this map exists to close. That is a structural property of the
+// dispatch, not a behavioural one, so no test is claimed for it.
+//
+// The opposite direction is NOT structural and is not claimed to be: an entry here
+// with no case in the switch would fail runs over a row nobody reads, and nothing
+// detects it. What IS enforced is fixture parity —
+// TestParseOmpStreamJSONUndecodableKnownEventFailsRun enumerates this map and demands
+// an undecodable fixture per member — so a new entry cannot land unexercised.
+var ompLoadBearingEventTypes = map[string]struct{}{
+	"session":          {},
+	"message_end":      {},
+	"auto_retry_start": {},
+	"auto_retry_end":   {},
+	"agent_end":        {},
+}
+
+// ompEventTypeProbe re-reads ONLY the `type` field of a line whose full decode into
+// ompStreamEvent failed. Declaring one field is the point: encoding/json skips every
+// other field WITHOUT type-checking it, so this probe cannot fail for the reason the
+// full decode did, and it succeeds for any valid JSON object carrying a string type.
+type ompEventTypeProbe struct {
+	Type string `json:"type"`
+}
+
+// ompMessageRoleProbe re-reads ONLY message.role, by the same one-field trick. The
+// role is message_end's SECOND discriminator: it decides whether this parser would
+// have read the row at all (rule 2). Message is a pointer, and its role a plain
+// string, so "no message object at all" and "an object with no role" are both
+// distinguishable from a role that is actually there.
+type ompMessageRoleProbe struct {
+	Message *struct {
+		Role string `json:"role"`
+	} `json:"message"`
+}
+
+// ompUndecodableEventType classifies a line whose decode into ompStreamEvent FAILED.
+// It returns the line's event type and true only when that type is one this parser
+// reads AND the row is one this parser would have read; ("", false) means the line is
+// not valid JSON at all, or carries a type this parser never looks at, or is a
+// message_end whose role puts it outside what the parser reads — all SKIPPED under
+// rule 6, which covers exactly the rows this parser does not read.
+//
+// message_end is the one load-bearing type with that second discriminator, and the
+// role check is not an optimization — without it rule 6 fails HEALTHY runs. omp emits
+// message_end for every input, aside, steer and custom message of a turn as well as
+// for assistant ones (agent-loop.ts:938-943 emitInputMessages, written verbatim to
+// stdout in json mode by print-mode.ts:173-176), and those payloads legitimately do
+// not decode here: UserMessage, DeveloperMessage and CustomMessageContent all type
+// content as `string | (TextContent | ImageContent)[]` (packages/ai/src/types.ts:
+// 803-805 and 817-819, session/messages.ts:314) while this adapter declares
+// []ompContentPart, so a plain-string content is an UnmarshalTypeError on a row
+// NOTHING here reads. Such rows are routine — plan/goal/vibe-mode preludes, todo
+// reminders, late LSP diagnostics, thinking-loop redirects — so failing them would
+// report complete runs as envelope drift and discard their answers: the exact mirror
+// of the false green rule 6 exists to close.
+//
+// Both discriminators are re-read through their own probe rather than taken from the
+// partially filled event struct. Against encoding/json today that is a distinction
+// with no behavioural difference — the decoder records an UnmarshalTypeError and keeps
+// going, so the struct a failed decode leaves behind normally carries these fields
+// anyway, and no test in this package can tell the two readings apart. The probes are
+// still preferred because their contract is legible from their declarations (one
+// field; nothing else is even type-checked) whereas the struct's depends on decoder
+// internals. No guard is claimed for that preference.
+func ompUndecodableEventType(line string) (string, bool) {
+	var probe ompEventTypeProbe
+	if err := json.Unmarshal([]byte(line), &probe); err != nil {
+		return "", false
+	}
+	if _, ok := ompLoadBearingEventTypes[probe.Type]; !ok {
+		return "", false
+	}
+	if probe.Type == "message_end" && !ompUndecodableMessageEndWasRead(line) {
+		return "", false
+	}
+	return probe.Type, true
+}
+
+// ompUndecodableMessageEndWasRead reports whether an undecodable message_end row is
+// one parseOmpStreamJSON would have READ — that is, an ASSISTANT message.
+//
+// It fails CLOSED on an unreadable discriminator: a `message` that is not an object,
+// or an object carrying no role at all, counts as read. Rule 6 is the admission that
+// a row could not be decoded, and answering "some other role, skip it" out of a
+// payload that would not decode is exactly the guess the rule refuses — a drifted
+// assistant row that also lost its role must not be able to buy silence with the
+// second defect. This is deliberately stricter than the decodable path, which skips a
+// roleless message_end under rule 2's filter: there the row WAS read and its role
+// really is absent, here nothing about the row is established.
+func ompUndecodableMessageEndWasRead(line string) bool {
+	var probe ompMessageRoleProbe
+	if err := json.Unmarshal([]byte(line), &probe); err != nil {
+		return true
+	}
+	if probe.Message == nil || probe.Message.Role == "" {
+		return true
+	}
+	return probe.Message.Role == "assistant"
+}
+
 // ompStreamEvent is the verified subset of one `omp -p --mode=json` stdout line.
-// Unknown fields and unknown event types are ignored by design (see
+// Unknown FIELDS are ignored by design, and so are whole lines of an unknown event
+// type; a line of a KNOWN type that fails to decode is not (see rule 6 on
 // parseOmpStreamJSON).
 type ompStreamEvent struct {
 	Type string `json:"type"`
@@ -599,8 +717,25 @@ type ompTelemetryUsage struct {
 //     final stopReason of "toolUse" or "length", which mean the run was CUT
 //     rather than finished (see the truncation note below). Neither one may fall
 //     back to an earlier turn's sentence.
-//  6. unknown event types and unparseable lines are SKIPPED, so new omp event types
-//     (auto_compaction_*, model_changed, notice, …) are forward-compatible.
+//  6. FORWARD COMPATIBILITY COVERS THE ROWS THIS PARSER DOES NOT READ, and only
+//     those. A line that is not valid JSON at all is SKIPPED (garbage on the wire
+//     — a stray log line, a half-written tail — is not evidence about the run),
+//     and so is a valid-JSON line whose type this parser never looks at
+//     (auto_compaction_*, model_changed, notice, …), whether or not its payload
+//     would decode — as is a message_end this parser would have filtered out anyway,
+//     since role, not just type, decides what rule 2 reads (omp emits message_end for
+//     user/developer/custom messages whose content is a bare string, which cannot
+//     decode here and never could be read here either; see ompUndecodableEventType).
+//     But a line whose type IS load-bearing here — session, message_end,
+//     auto_retry_start, auto_retry_end, agent_end, the closed set in
+//     ompLoadBearingEventTypes — and whose payload FAILS to decode is an ERROR
+//     naming that type. The parser was supposed to read that row, so its verdict,
+//     its text and its usage are all unknown, and a stream with an unreadable
+//     load-bearing row cannot be trusted to report SUCCESS. Skipping one is what
+//     makes a failed final message_end whose usage block drifted (a provider that
+//     starts reporting `usage.input` as a string) disappear from the stream and
+//     hands the PREVIOUS turn's sentence back as the run's answer — the same
+//     stale-text false green rule 5 and the TRUNCATION note exist to refuse.
 //  7. a retry saga still OPEN at end of stream — an auto_retry_start with no
 //     auto_retry_end after it — is an ERROR. The state machine ended in a
 //     non-terminal retry state, which means the process died mid-retry; "a retry
@@ -735,6 +870,16 @@ func parseOmpStreamJSON(output string) (string, string, ompUsage, error) {
 		turnFailed    bool
 		retryPending  bool
 		gaveUp        bool
+		// undecodable is the FIRST load-bearing row this parser could not read
+		// (rule 6) — first, not last, because a later drift is usually the same
+		// drift again and the earliest one is where an operator has to look
+		// ("two undecodable rows report the FIRST" pins it). It is a latch of its
+		// own rather than a firstErr/turnFailed pair on purpose: the
+		// content-carrying recovery clause below may clear a failure the stream
+		// REPORTED, but it may not clear the parser's own admission that it could
+		// not read a row — the recovery evidence and the unread row are not even
+		// about the same event.
+		undecodable error
 	)
 	for rest := output; rest != ""; {
 		var line string
@@ -748,6 +893,33 @@ func parseOmpStreamJSON(output string) (string, string, ompUsage, error) {
 		}
 		var event ompStreamEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			// Rule 6, the narrow half: a row this parser READS that it cannot decode
+			// is a failure, not forward compatibility. Everything else — garbage, any
+			// unknown type, and a message_end whose role puts it outside rule 2's
+			// filter — is still skipped.
+			eventType, loadBearing := ompUndecodableEventType(line)
+			if !loadBearing {
+				continue
+			}
+			if undecodable == nil {
+				undecodable = fmt.Errorf(
+					"omp stream carried a %s event this parser could not decode (envelope drift): %w — %s is load-bearing here, so the verdict, answer and usage that row carried are all unknown and the stream cannot be trusted to report success",
+					eventType, err, eventType)
+			}
+			// Keep scanning rather than bailing: the run is already lost, but the
+			// session id and the usage the decodable messages prove were billed are
+			// still worth reporting (see the FAILED RUN IS STILL BILLED note on
+			// Deliver) — including the ones that come AFTER the bad row, which is
+			// what "diagnostics survive a bad row anywhere in the stream" pins.
+			continue
+		}
+		// The classifier set gates the dispatch, so the switch below cannot acquire a
+		// case that rule 6 does not know about: an unlisted case is unreachable rather
+		// than silently-skipped-when-undecodable (see ompLoadBearingEventTypes). This
+		// is a structural constraint and behaviour-preserving by construction — an
+		// event type with no case is a no-op either way — so there is no mutant to
+		// kill here, and none is claimed.
+		if _, loadBearing := ompLoadBearingEventTypes[event.Type]; !loadBearing {
 			continue
 		}
 		switch event.Type {
@@ -843,6 +1015,16 @@ func parseOmpStreamJSON(output string) (string, string, ompUsage, error) {
 	if rollupCount > 0 && rollupCount == agentEndCount &&
 		rollup.InputTokens >= summed.InputTokens && rollup.OutputTokens >= summed.OutputTokens {
 		usage = rollup
+	}
+	// An unreadable load-bearing row is reported BEFORE any verdict derived from the
+	// readable ones — the ordering matters and is pinned ("an unreadable row outranks
+	// a failure the stream reported"). Every rule below reasons about what the stream
+	// said; this one says a piece of the stream could not be read at all, which is the
+	// newer and more actionable fact (envelope drift an operator must fix) and the one
+	// that makes the other verdicts provisional — the unread row may itself have been
+	// the failure, the answer, or the terminal settle.
+	if undecodable != nil {
+		return "", sessionID, usage, undecodable
 	}
 	if turnFailed {
 		return "", sessionID, usage, firstErr
