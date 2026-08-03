@@ -216,6 +216,94 @@ func TestPollErrorReportersAreIndependentPerMode(t *testing.T) {
 	}
 }
 
+// pollDiscriminatingFakeGitHub distinguishes the FULL poll from the RECOVERY poll by a call only
+// the full poll makes. With WatchIssues=true, PollOnce calls ListIssues and
+// PollRecoveryCommandsOnce does not, so ListIssues being reached proves which runner the idle
+// branch executed.
+type pollDiscriminatingFakeGitHub struct {
+	github.NoopClient
+	mu     sync.Mutex
+	issues int
+	pulls  int
+}
+
+func (f *pollDiscriminatingFakeGitHub) ListPullRequests(context.Context, github.Repository, string) ([]github.PullRequest, error) {
+	f.mu.Lock()
+	f.pulls++
+	f.mu.Unlock()
+	return nil, nil
+}
+
+func (f *pollDiscriminatingFakeGitHub) ListIssues(context.Context, github.Repository, string) ([]github.Issue, error) {
+	f.mu.Lock()
+	f.issues++
+	f.mu.Unlock()
+	return nil, nil
+}
+
+func (f *pollDiscriminatingFakeGitHub) issueCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.issues
+}
+
+// TestSupervisorIdleBranchRunsTheFullPoll is the SUPERVISOR-PATH guard, and it closes a residual
+// I twice described wrongly.
+//
+// Round 5 I called a call-site mode error "consistent misattribution"; review showed it
+// re-shared the reporter and recreated the original defect. Round 6 I said the untested surface
+// was "exactly one line -- the destructuring -- and no external test can observe it". Review
+// showed that is ALSO wrong: swapping the destructuring makes the ordinary IDLE branch execute
+// PollRecoveryCommandsOnce, set polledFull, and silently skip PollOnce and all full
+// reconciliation. That is observable, because with WatchIssues=true only PollOnce reaches
+// ListIssues.
+//
+// Two wrong residual claims in two rounds is the actual lesson here: I asserted the limits of my
+// own guard without testing them, twice, while asking reviewers to test everything else.
+func TestSupervisorIdleBranchRunsTheFullPoll(t *testing.T) {
+	store, home := blockerE2EHome(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
+	client := &pollDiscriminatingFakeGitHub{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var mu sync.Mutex
+	var out strings.Builder
+	sink := writerFunc(func(p []byte) (int, error) {
+		mu.Lock()
+		out.Write(p)
+		mu.Unlock()
+		return len(p), nil
+	})
+
+	live := newDaemonReloadableConfig(200*time.Millisecond, 1, false)
+	d := daemon.Daemon{
+		Repo:         github.Repository{Owner: "owner", Name: "repo"},
+		Store:        store,
+		GitHub:       client,
+		PollInterval: 200 * time.Millisecond,
+		WatchIssues:  true,
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- runSingleRepoSupervisor(ctx, home, d, store, live, "", sink) }()
+
+	deadline := time.After(45 * time.Second)
+	for client.issueCalls() == 0 {
+		select {
+		case <-done:
+			t.Fatal("supervisor returned before the idle branch ran a full poll")
+		case <-deadline:
+			cancel()
+			t.Fatalf("the idle branch never reached ListIssues: it ran the RECOVERY poll instead of the full poll, silently skipping PollOnce and all full reconciliation")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+}
+
 // TestBoundPollDerivesEverythingFromItsMode is the OBSERVABLE recovery-path guard review asked
 // for, and it closes the route the previous fix left open.
 //

@@ -1455,12 +1455,21 @@ func (r *pollErrorReporters) bind(mode pollMode, d daemon.Daemon) boundPoll {
 // guard saw it, because the supervisor's recovery branch is unreachable from a test: whether it
 // runs depends on a checkout lock and an in-flight tracker that are both function-local.
 //
-// RESIDUAL, stated precisely because the previous attempt at this sentence was wrong. The
-// untested surface is now exactly one line: the supervisor's destructuring of this call. Swapping
-// the two returned values there would still mis-route, and no external test can observe it for
-// the reason above. Everything else -- which mode binds which poll, which label, which episode --
-// is asserted. That is a reduction from "any call site can mis-bind" to "one assignment could be
-// transposed", not a closure, and it should not be described as one.
+// RESIDUAL. I have now stated this limit wrongly TWICE, so it is written narrowly and only
+// covers what is actually tested.
+//
+// First I claimed a wrong call-site mode was "consistent misattribution"; review showed it
+// re-shares the full reporter and recreates the original defect. Then I claimed the untested
+// surface was "one line -- the destructuring -- and no external test can observe it"; review
+// showed swapping it makes the IDLE branch run the recovery poll and silently skip PollOnce and
+// all full reconciliation, which IS observable. TestSupervisorIdleBranchRunsTheFullPoll now
+// observes it, via WatchIssues: only PollOnce reaches ListIssues.
+//
+// WHAT REMAINS UNGUARDED, exactly: the FALLBACK branch's choice of runner. It executes only when
+// the checkout lock is held or the in-flight tracker is busy, both function-local, so no external
+// test reaches it. A mutant pointing that branch at the full runner would run the
+// checkout-mutating poll precisely when recovery-only behaviour was required. That is a real,
+// unguarded path and it is named here rather than described as closed.
 func (r *pollErrorReporters) runners(d daemon.Daemon) (full boundPoll, recovery boundPoll) {
 	return r.bind(fullPoll, d), r.bind(recoveryPoll, d)
 }
