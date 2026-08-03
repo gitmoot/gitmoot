@@ -1797,6 +1797,9 @@ func TestEngineHandlePullRequestOpenedCreatesNewReviewRoundForUpdates(t *testing
 		LeadAgent:         "lead",
 		RequiredReviewers: []string{"audit"},
 	}
+	// Empty-head dispatch remains allowed before any succeeded review evidence
+	// exists. Both jobs below stay queued, preserving the pre-#1427 escalating-
+	// round contract while the fail-closed post-success case is pinned separately.
 
 	if err := engine.HandlePullRequestOpened(ctx, event); err != nil {
 		t.Fatalf("first HandlePullRequestOpened returned error: %v", err)
@@ -1807,6 +1810,121 @@ func TestEngineHandlePullRequestOpenedCreatesNewReviewRoundForUpdates(t *testing
 
 	mustJob(t, store, "review-audit-task-7-review-1")
 	mustJob(t, store, "review-audit-task-7-review-2")
+}
+
+// TestEngineReviewLoopBlocksStableVerdictBeforeDispatch kills the unguarded
+// restore mutant and an event-only mutant: the second dispatch must block the
+// task and leave the review JOB COUNT unchanged, not merely emit an event.
+func TestEngineReviewLoopBlocksStableVerdictBeforeDispatch(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
+	insertCompletedJob(t, store, db.Job{ID: "prior-review", Agent: "audit", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, HeadSHA: "head-a",
+		TaskID: "task-7", ReviewRound: "review-1",
+		Result: &AgentResult{Decision: "changes_requested", Summary: "fix it"},
+	})
+	engine := testEngine(store)
+	event := PullRequestEvent{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, HeadSHA: "head-a",
+		TaskID: "task-7", TaskTitle: "Workflow Engine", LeadAgent: "lead",
+		RequiredReviewers: []string{"audit"},
+	}
+
+	before := reviewJobCount(t, store)
+	for attempt := 0; attempt < 2; attempt++ {
+		err := engine.HandlePullRequestOpened(ctx, event)
+		var blocked BlockedError
+		if !errors.As(err, &blocked) || !strings.Contains(blocked.Reason, "review loop detected") {
+			t.Fatalf("attempt %d error = %v, want review-loop BlockedError", attempt+1, err)
+		}
+		if got := reviewJobCount(t, store); got != before {
+			t.Fatalf("attempt %d review job count = %d, want unchanged %d", attempt+1, got, before)
+		}
+	}
+	assertTaskState(t, store, "task-7", TaskBlocked)
+	if got := countJobEvents(t, store, "prior-review", ReviewLoopDetectedEventKind); got != 1 {
+		t.Fatalf("review_loop_detected events = %d, want one idempotent claim", got)
+	}
+}
+
+// TestEngineReviewLoopAllowsNewHead kills a repo/PR-only suppression mutant: a
+// real new commit must create the next review job.
+func TestEngineReviewLoopAllowsNewHead(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
+	insertCompletedJob(t, store, db.Job{ID: "prior-review", Agent: "audit", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, HeadSHA: "head-a",
+		TaskID: "task-7", ReviewRound: "review-1", Result: &AgentResult{Decision: "changes_requested"},
+	})
+	engine := testEngine(store)
+	if err := engine.HandlePullRequestOpened(ctx, PullRequestEvent{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, HeadSHA: "head-b",
+		TaskID: "task-7", LeadAgent: "lead", RequiredReviewers: []string{"audit"},
+	}); err != nil {
+		t.Fatalf("new-head dispatch: %v", err)
+	}
+	if got := reviewJobCount(t, store); got != 2 {
+		t.Fatalf("review job count = %d, want prior plus new-head review", got)
+	}
+}
+
+// TestEngineReviewLoopAllowsMixedDecisionsAtSameHead kills a decision-blind
+// mutant. A verdict flip is unstable evidence and must not freeze progress.
+func TestEngineReviewLoopAllowsMixedDecisionsAtSameHead(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
+	for _, prior := range []struct{ id, round, decision string }{
+		{id: "prior-approved", round: "review-1", decision: "approved"},
+		{id: "prior-changes", round: "review-2", decision: "changes_requested"},
+	} {
+		insertCompletedJob(t, store, db.Job{ID: prior.id, Agent: "historical", Type: "review"}, JobPayload{
+			Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, HeadSHA: "head-a",
+			TaskID: "task-7", ReviewRound: prior.round, Result: &AgentResult{Decision: prior.decision},
+		})
+	}
+	engine := testEngine(store)
+	if err := engine.HandlePullRequestOpened(ctx, PullRequestEvent{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, HeadSHA: "head-a",
+		TaskID: "task-7", LeadAgent: "lead", RequiredReviewers: []string{"audit"},
+	}); err != nil {
+		t.Fatalf("mixed-decision dispatch: %v", err)
+	}
+	if got := reviewJobCount(t, store); got != 3 {
+		t.Fatalf("review job count = %d, want two historical plus one new review", got)
+	}
+}
+
+// TestEngineReviewLoopEmptyHeadFailsClosedAfterSucceededHistory kills the
+// manual-retry fail-open mutant without rejecting the first-ever empty-head
+// dispatch pinned above.
+func TestEngineReviewLoopEmptyHeadFailsClosedAfterSucceededHistory(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
+	insertCompletedJob(t, store, db.Job{ID: "prior-review", Agent: "audit", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, HeadSHA: "known-head",
+		TaskID: "task-7", ReviewRound: "review-1", Result: &AgentResult{Decision: "changes_requested"},
+	})
+	engine := testEngine(store)
+	before := reviewJobCount(t, store)
+	err := engine.HandlePullRequestOpened(ctx, PullRequestEvent{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7,
+		TaskID: "task-7", LeadAgent: "lead", RequiredReviewers: []string{"audit"},
+	})
+	var blocked BlockedError
+	if !errors.As(err, &blocked) || !strings.Contains(blocked.Reason, "head SHA is empty") {
+		t.Fatalf("error = %v, want empty-head review-loop BlockedError", err)
+	}
+	if got := reviewJobCount(t, store); got != before {
+		t.Fatalf("review job count = %d, want unchanged %d", got, before)
+	}
 }
 
 func TestEngineHandlePullRequestOpenedIsIdempotentAfterDelegatedReview(t *testing.T) {
@@ -2999,6 +3117,21 @@ func countJobEvents(t *testing.T, store *db.Store, jobID, kind string) int {
 	count := 0
 	for _, event := range events {
 		if event.Kind == kind {
+			count++
+		}
+	}
+	return count
+}
+
+func reviewJobCount(t *testing.T, store *db.Store) int {
+	t.Helper()
+	jobs, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	count := 0
+	for _, job := range jobs {
+		if job.Type == "review" {
 			count++
 		}
 	}

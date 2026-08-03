@@ -181,3 +181,75 @@ func TestAwaitedFactOldHeadDoesNotSatisfyNewHead(t *testing.T) {
 		t.Fatalf("new-head subscription state = %q after old-head verdict, want waiting", got.State)
 	}
 }
+
+// TestSucceededReviewVerdictsFiltersCanonicalRows pins the pure read used by
+// review-loop admission. It kills mutants that query payload-only repo/PR,
+// include unfinished/non-review jobs, accept malformed results, or lose the
+// deterministic updated_at DESC, id DESC ordering. The explicit timestamps
+// below kill mutants that drop either ordering term.
+func TestSucceededReviewVerdictsFiltersCanonicalRows(t *testing.T) {
+	store := openAwaitedFactTestStore(t)
+	ctx := context.Background()
+	seed := func(id, agent, jobType, state, repo string, pr int, payload string) {
+		t.Helper()
+		if err := store.CreateJob(ctx, Job{ID: id, Agent: agent, Type: jobType, State: state, Payload: payload}); err != nil {
+			t.Fatalf("CreateJob(%s): %v", id, err)
+		}
+		// Deliberately control the denormalized filter columns independently from
+		// payload repo/PR so a payload-only query mutant cannot survive.
+		if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET repo = ?, pull_request = ? WHERE id = ?`, repo, pr, id); err != nil {
+			t.Fatalf("project job identity(%s): %v", id, err)
+		}
+	}
+
+	seed("columns-win", "audit-columns", "review", "succeeded", "acme/widget", 52,
+		awaitedReviewPayload(t, "other/payload", 999, "head-columns", "approved", "columns-win"))
+	seed("valid-a", "audit-a", "review", "succeeded", "Acme/Widget", 52,
+		awaitedReviewPayload(t, "Acme/Widget", 52, "HEAD-A", " APPROVED ", "valid-a"))
+	seed("valid-z", "audit-z", "review", "succeeded", "acme/widget", 52,
+		awaitedReviewPayload(t, "acme/widget", 52, "head-a", "changes_requested", "valid-z"))
+	seed("wrong-pr", "audit", "review", "succeeded", "acme/widget", 53,
+		awaitedReviewPayload(t, "acme/widget", 53, "head-a", "approved", "wrong-pr"))
+	seed("wrong-repo", "audit", "review", "succeeded", "acme/other", 52,
+		awaitedReviewPayload(t, "acme/widget", 52, "head-a", "approved", "wrong-repo"))
+	seed("running", "audit", "review", "running", "acme/widget", 52,
+		awaitedReviewPayload(t, "acme/widget", 52, "head-a", "approved", "running"))
+	seed("implement", "audit", "implement", "succeeded", "acme/widget", 52,
+		awaitedReviewPayload(t, "acme/widget", 52, "head-a", "approved", "implement"))
+	seed("malformed", "audit", "review", "succeeded", "acme/widget", 52, "{")
+	seed("no-result", "audit", "review", "succeeded", "acme/widget", 52,
+		`{"repo":"acme/widget","pull_request":52,"head_sha":"head-a"}`)
+
+	// Make timestamp order conflict with id order: valid-a is newer despite its
+	// lower-sorting id. Keep columns-win and valid-z tied so id DESC remains the
+	// required deterministic tie-break (valid-z was inserted after columns-win).
+	for _, fixture := range []struct {
+		id        string
+		updatedAt string
+	}{
+		{id: "valid-a", updatedAt: "2026-08-02 03:00:00"},
+		{id: "columns-win", updatedAt: "2026-08-02 02:00:00"},
+		{id: "valid-z", updatedAt: "2026-08-02 02:00:00"},
+	} {
+		if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET updated_at = ? WHERE id = ?`, fixture.updatedAt, fixture.id); err != nil {
+			t.Fatalf("set updated_at for %s: %v", fixture.id, err)
+		}
+	}
+
+	got, err := store.SucceededReviewVerdicts(ctx, " ACME/WIDGET ", 52)
+	if err != nil {
+		t.Fatalf("SucceededReviewVerdicts: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("verdicts = %+v, want exactly the three rows selected by denormalized repo/PR", got)
+	}
+	if got[0].JobID != "valid-a" || got[0].Agent != "audit-a" || got[0].HeadSHA != "head-a" || got[0].Decision != "approved" {
+		t.Fatalf("newest verdict = %+v", got[0])
+	}
+	if got[1].JobID != "valid-z" || got[1].HeadSHA != "head-a" || got[1].Decision != "changes_requested" {
+		t.Fatalf("equal-timestamp id-desc verdict = %+v", got[1])
+	}
+	if got[2].JobID != "columns-win" || got[2].HeadSHA != "head-columns" || got[2].Decision != "approved" {
+		t.Fatalf("denormalized-column verdict = %+v", got[2])
+	}
+}

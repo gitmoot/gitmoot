@@ -102,6 +102,19 @@ gitmoot agent start reviewer --runtime codex --repo owner/repo --role reviewer -
 gitmoot agent doctor reviewer
 ```
 
+Local `agent review` / review-resolved `agent run` and native engine review
+fan-out enforce an exact-head loop guard before a new review job or review
+worktree is created. A
+homogeneous succeeded decision history for `(repo, PR, head_sha)` is refused and
+emits one `review_loop_detected` event on the matched succeeded job; the CLI
+hard-errors while the engine blocks the task. A new commit or mixed decisions at
+one head proceeds. The loop guard permits an empty engine event only before any
+succeeded history exists; local CLI preparation still requires a concrete head.
+The old verdict is evidence for escalation, never a cached response.
+This exact decision-bearing key replaces no round counter: #1419's panel
+explicitly rejected that instrument. Direct PR-comment ingress is unchanged in
+this safe half and remains #1433 work.
+
 ## Review Agent From A PR Comment
 
 1. Register a reviewer agent for the target repo.
@@ -143,6 +156,18 @@ or request implementation capability.
 gitmoot agent template update thermo-nuclear-code-quality-review
 gitmoot agent start thermo-review --runtime codex --repo owner/repo --template thermo-nuclear-code-quality-review --start-daemon
 ```
+
+For a local dispatch, pair that reviewer with the registered implementer that
+should receive a `changes_requested` fix pass:
+
+```sh
+gitmoot agent review thermo-review --repo owner/repo --pr 12 --lead lead "Review this PR."
+```
+
+Gitmoot refuses the dispatch before creating a review job when the lead is
+missing, cannot access the repo, lacks `implement`, or has a non-write policy.
+Do not grant `implement` to the reviewer merely to satisfy this check; keep the
+reviewer read-only and name the separate implementer with `--lead`.
 
 PR comment:
 

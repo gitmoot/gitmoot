@@ -152,6 +152,17 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			return localAgentJobOutput{}, err
 		}
 	}
+	// A review that may return changes_requested must name a fix target that can
+	// actually implement before Gitmoot spends a review session. Validate the
+	// agents-table row here, before repo/task/worktree mutation, managed-agent
+	// provisioning, enqueue, or runtime delivery. The workflow preflight remains
+	// the universal defense for later policy changes.
+	if request.Action == "review" {
+		request, err = validateLocalReviewLeadAtDispatch(ctx, store, request, repo.FullName())
+		if err != nil {
+			return localAgentJobOutput{}, err
+		}
+	}
 	if request.Action == "implement" {
 		paths, err := pathsFromFlag(request.Home)
 		if err != nil {
@@ -660,22 +671,71 @@ func routeSelectedMessage(request localAgentDispatchRequest) string {
 	return message
 }
 
+func validateLocalReviewLeadAtDispatch(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string) (localAgentDispatchRequest, error) {
+	typeName := strings.TrimSpace(request.Type)
+	if typeName != "" {
+		exists, err := managedAgentTypeExists(request.Home, typeName)
+		if err != nil {
+			return localAgentDispatchRequest{}, err
+		}
+		if !exists {
+			return localAgentDispatchRequest{}, forcedManagedAgentTypeNotFoundError(typeName)
+		}
+	}
+	leadName := strings.TrimSpace(request.LeadAgent)
+	if leadName == "" {
+		if typeName != "" {
+			return localAgentDispatchRequest{}, fmt.Errorf("review dispatch through managed type %q requires --lead naming a registered implementer", typeName)
+		}
+		leadName = strings.TrimSpace(request.Agent)
+	}
+	lead, err := store.GetAgent(ctx, leadName)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			if strings.TrimSpace(request.LeadAgent) == "" {
+				return localAgentDispatchRequest{}, fmt.Errorf("agent %q not found; review dispatch requires --lead naming a registered implementer", leadName)
+			}
+			return localAgentDispatchRequest{}, fmt.Errorf("review lead %q is not subscribed; --lead must name a registered implementer", leadName)
+		}
+		return localAgentDispatchRequest{}, err
+	}
+	allowed, err := store.AgentCanAccessRepo(ctx, lead.Name, repo)
+	if err != nil {
+		return localAgentDispatchRequest{}, err
+	}
+	if !allowed {
+		return localAgentDispatchRequest{}, fmt.Errorf("review lead %q is not allowed on %q", lead.Name, repo)
+	}
+	if !agentHasCapability(lead.Capabilities, "implement") {
+		return localAgentDispatchRequest{}, fmt.Errorf("review lead %q lacks implement capability; --lead must name an implementation-capable agent", lead.Name)
+	}
+	if err := runtime.ImplementWritePolicyError(lead.Capabilities, lead.AutonomyPolicy); err != nil {
+		return localAgentDispatchRequest{}, fmt.Errorf("review lead %q: %w", lead.Name, err)
+	}
+	request.LeadAgent = lead.Name
+	return request, nil
+}
+
 func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, record db.Repo, repo github.Repository, request localAgentDispatchRequest) (localAgentDispatchRequest, string, error) {
 	if request.PullRequest <= 0 {
 		return localAgentDispatchRequest{}, "", errors.New("agent review requires --pr number")
 	}
-	if strings.TrimSpace(request.Branch) != "" && strings.TrimSpace(request.HeadSHA) != "" {
-		return prepareLocalReviewWorktree(ctx, store, record, repo, request)
+	if strings.TrimSpace(request.Branch) == "" || strings.TrimSpace(request.HeadSHA) == "" {
+		pr, err := newAgentDispatchGitHubClient(record.CheckoutPath).GetPullRequest(ctx, repo, int64(request.PullRequest))
+		if err != nil {
+			return localAgentDispatchRequest{}, "", fmt.Errorf("resolve pull request #%d: %w", request.PullRequest, err)
+		}
+		if strings.TrimSpace(request.Branch) == "" {
+			request.Branch = pr.HeadRef
+		}
+		if strings.TrimSpace(request.HeadSHA) == "" {
+			request.HeadSHA = pr.HeadSHA
+		}
 	}
-	pr, err := newAgentDispatchGitHubClient(record.CheckoutPath).GetPullRequest(ctx, repo, int64(request.PullRequest))
-	if err != nil {
-		return localAgentDispatchRequest{}, "", fmt.Errorf("resolve pull request #%d: %w", request.PullRequest, err)
-	}
-	if strings.TrimSpace(request.Branch) == "" {
-		request.Branch = pr.HeadRef
-	}
-	if strings.TrimSpace(request.HeadSHA) == "" {
-		request.HeadSHA = pr.HeadSHA
+	if match, detected, err := workflow.DetectReviewLoop(ctx, store, repo.FullName(), request.PullRequest, request.HeadSHA); err != nil {
+		return localAgentDispatchRequest{}, "", err
+	} else if detected {
+		return localAgentDispatchRequest{}, "", errors.New(match.Reason())
 	}
 	return prepareLocalReviewWorktree(ctx, store, record, repo, request)
 }

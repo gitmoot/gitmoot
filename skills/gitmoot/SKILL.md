@@ -176,13 +176,24 @@ locks, commits, pushes, PRs, and workflow advancement. Add `--action
 ask|review|implement` when that job action must be explicit; `--type` is
 independent and selects a managed agent type, not an action. Use
 `gitmoot agent ask <agent> --repo owner/repo "..."` only for
-analysis, planning, or questions. Use `gitmoot agent review <agent> --repo
-owner/repo --pr <number> "..."` for PR review decisions and `gitmoot agent
+analysis, planning, or questions. Use `gitmoot agent review <reviewer> --repo
+owner/repo --pr <number> --lead <implementer> "..."` for PR review decisions;
+the lead must be a registered, repo-allowed agent with `implement` capability
+and a write-granting policy so requested changes can route to it. Use `gitmoot agent
 implement <agent> --repo owner/repo --task <task-id> "..."` for file changes.
 For a fix pass on an existing open PR, use `agent implement --pr <number>` (or
 `agent run --action implement --pr <number>`); Gitmoot validates that the PR is
 open, belongs to the same repository, and matches the existing task branch
 before reusing its task worktree and PR.
+Before local review dispatch or native engine review fan-out, Gitmoot refuses a
+homogeneous succeeded decision repeated at the exact same repo/PR/head, emits
+`review_loop_detected` on the matched succeeded job, and hard-errors (CLI) or
+blocks (engine). New heads and mixed same-head decisions proceed; the loop guard
+allows an empty engine event only before succeeded history exists, while local
+CLI preparation still requires a concrete head. Treat the old verdict only as
+escalation evidence—never return it as a cached review result. This exact key is
+used instead of a round counter because #1419's panel rejected round-based
+instruments. Direct PR-comment ingress remains separate #1433 work.
 Add `--background` only when the user wants a queued background job.
 
 Orchestrate (Orchestra): when the user says "orchestrate …" or "spin up an

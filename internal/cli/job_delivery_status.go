@@ -26,6 +26,7 @@ var deliveryStatusEventKinds = []string{
 	"advance_retry_skipped",
 	"advance_awaiting_human",
 	"retry_queued",
+	workflow.ReviewLoopDetectedEventKind,
 }
 
 // deriveJobDeliveryStatus reports Gitmoot's own post-agent delivery status for

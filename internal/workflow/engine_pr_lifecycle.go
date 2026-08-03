@@ -93,6 +93,15 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 		}
 		return e.recordPullRequestBaseline(ctx, event)
 	}
+	reviewRound, err := e.nextReviewRound(ctx, event)
+	if err != nil {
+		return err
+	}
+	if match, detected, err := DetectReviewLoop(ctx, e.Store, event.Repo, event.PullRequest, event.HeadSHA); err != nil {
+		return err
+	} else if detected {
+		return e.block(ctx, ref, match.Reason())
+	}
 	// Opt-in risk-tiered adaptive review (#650). When RiskTiersEnabled, classify
 	// the PR (label > path > default). A `high` tier replaces the single native
 	// fan-out with a refutation-lens delegation batch synthesized by the EXISTING
@@ -123,12 +132,8 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 		}
 		classification := ClassifyRisk(e.HighRiskPaths, e.RiskLabelHigh, e.RiskLabelRoutine, labels, changedPaths)
 		if classification.Tier == RiskTierHigh {
-			return e.dispatchHighRiskReview(ctx, event, reviewers, classification, ref)
+			return e.dispatchHighRiskReview(ctx, event, reviewers, classification, reviewRound, ref)
 		}
-	}
-	reviewRound, err := e.nextReviewRound(ctx, event)
-	if err != nil {
-		return err
 	}
 	requests := make([]JobRequest, 0, len(reviewers))
 	for _, reviewer := range reviewers {
@@ -193,11 +198,7 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 // from the stable review round for this head SHA, and the lens children are
 // review jobs the daemon's PR-watcher routing already recognizes, so a re-poll at
 // the same head never re-dispatches.
-func (e Engine) dispatchHighRiskReview(ctx context.Context, event PullRequestEvent, reviewers []string, classification RiskClassification, ref taskRef) error {
-	round, err := e.nextReviewRound(ctx, event)
-	if err != nil {
-		return err
-	}
+func (e Engine) dispatchHighRiskReview(ctx context.Context, event PullRequestEvent, reviewers []string, classification RiskClassification, round string, ref taskRef) error {
 	coordID := "review-coordinator/" + event.Branch + "/" + round
 	if _, err := e.Store.GetJob(ctx, coordID); err == nil {
 		// Already dispatched for this head SHA/round: idempotent no-op.

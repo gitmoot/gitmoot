@@ -2445,10 +2445,16 @@ func (w jobWorker) jobNeedsAdvanceRetry(ctx context.Context, jobID string) (bool
 		switch event.Kind {
 		case "advance_started", "advance_retry":
 			needsRetry = true
-		case "advance_completed", "advance_retried", "advance_blocked", "advance_retry_skipped":
+		case "advance_completed", "advance_retried", "advance_blocked", "advance_retry_skipped", workflow.ReviewLoopDetectedEventKind:
 			// The defect is not that advance_blocked stops retries; stopping retries is
 			// all this classification does. The blocked outcome is settled separately
 			// and must never be converted back into a retry.
+			//
+			// advance_blocked_superseded is deliberately ABSENT from this arm (#1407): a
+			// settlement describing a PREVIOUS run must not cancel the current run's
+			// pending advancement. TestSupersededSettlementDoesNotClearPendingAdvanceRetry
+			// pins that, and it is the reason adding a kind here is never a mechanical
+			// edit -- each entry silences a retry.
 			needsRetry = false
 		case "retry_queued":
 			needsRetry = false

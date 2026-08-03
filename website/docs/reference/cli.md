@@ -708,9 +708,9 @@ Delegate to a registered agent from the current local chat:
 ```sh
 gitmoot agent run project-planner --repo owner/repo "Return the plan status."
 gitmoot agent run lead --repo owner/repo --task task-001 --background "Implement this task."
-gitmoot agent run reviewer --repo owner/repo --pr 12 --background "Review this PR."
+gitmoot agent run reviewer --repo owner/repo --pr 12 --lead lead --background "Review this PR."
 gitmoot agent run lead --repo owner/repo --action implement --pr 12 "Fix findings on the existing PR."
-gitmoot agent review reviewer --repo owner/repo --pr 12 "Review this PR."
+gitmoot agent review reviewer --repo owner/repo --pr 12 --lead lead "Review this PR."
 gitmoot agent implement lead --repo owner/repo --task task-001 "Implement this task."
 gitmoot agent implement lead --repo owner/repo --task task-001 --ready "Implement and open the PR ready for review."
 gitmoot agent implement lead --repo owner/repo --pr 12 "Fix findings on the existing PR."
@@ -729,6 +729,43 @@ has a separate meaning: it selects a managed agent type. The flags can be used
 together. Invalid actions and contradictions are rejected before enqueue;
 notably, `--action review` requires `--pr`, while `--action implement --pr` is
 the explicit existing-PR fix-pass route.
+
+Review admission is evidence-gated before Gitmoot creates a new review job.
+For local `agent review` / `agent run` requests that resolve to review, and for
+native engine review fan-out, Gitmoot reads succeeded review jobs for the same
+repository and pull request. If every succeeded verdict at the requested exact
+head agrees on one decision, dispatch is refused: the local CLI returns a hard
+error, the engine blocks the task, and the matched succeeded job receives one
+idempotent `review_loop_detected` event. A new head proceeds, and mixed decisions
+at one head also proceed because the earlier claim is unstable. The loop guard
+allows an empty head only before any succeeded review history exists for that
+repo/PR; after that it fails closed until the caller supplies the current head.
+The local CLI's existing worktree preparation still requires it to resolve a
+concrete head before dispatch. The prior verdict is escalation evidence only and
+is never served as the new result.
+
+This exact `(repo, PR, head_sha, decision)` evidence key is intentional: the
+#1419 review panel rejected round counters and other instruments, so this guard
+does not infer a loop from a numeric threshold. Direct PR-comment review ingress
+is unchanged here and remains advance-time guarded until #1433; cached-verdict
+serving remains out of scope for #1415/#1423.
+Local review dispatches accept `--lead <implementer>` on `agent review` and on
+`agent run` when it resolves to review. A `changes_requested` verdict routes its
+fix job to that lead, not to the reviewer. Before creating a review job or
+starting its runtime session, Gitmoot loads the lead from the agents database
+and requires that it exist, can access the repository, has `implement`
+capability, and uses a write-granting policy (`workspace-write` or
+`danger-full-access`). Without `--lead`, the reviewer is the fallback lead and
+must pass the same checks; a strict review-only agent therefore needs an
+explicit implementer. Managed-type review dispatches also require an explicit
+DB-backed lead. `--lead` is rejected when `agent run` resolves to ask or
+implement, and is not accepted by `agent implement` or `orchestrate`.
+
+This dispatch-time lead validation applies only to local CLI reviews started by
+`gitmoot agent review` or review-resolved `gitmoot agent run`. Reviews routed
+from PR comments continue to validate their fix target when the workflow
+advances until [gitmoot#1433](https://github.com/gitmoot/gitmoot/issues/1433)
+adds the corresponding ingress preflight.
 
 New implementation PRs opened by the engine are drafts by default. Use
 `--ready` on `agent run`, `agent implement`, or `orchestrate` to opt into an
