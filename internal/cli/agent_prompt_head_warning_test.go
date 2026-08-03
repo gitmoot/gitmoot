@@ -97,7 +97,7 @@ func TestDispatchPromptHeadWarningReachesOperator(t *testing.T) {
 // A prompt whose commit token EQUALS the dispatch head is resolvable, traversed, and correctly
 // silent. An unconditional emitter fails here and nowhere else.
 func TestDispatchEmitsNoWarningWhenThePromptAgreesWithTheHead(t *testing.T) {
-	checkout, _, head, _ := promptHeadWarningRepository(t)
+	checkout, _, head, divergent := promptHeadWarningRepository(t)
 	store, home := blockerE2EHome(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 	seedDaemonWorkerAgent(t, store, "responder", runtime.ShellRuntime, "printf '%s' '{}'", []string{"ask"}, "owner/repo")
@@ -114,13 +114,42 @@ func TestDispatchEmitsNoWarningWhenThePromptAgreesWithTheHead(t *testing.T) {
 		t.Fatalf("dispatchAgentCommand exit = %d, stderr=%s", exit, stderr.String())
 	}
 
-	// PREMISE: the token must be RESOLVABLE, or this proves only that unresolvable tokens
-	// are skipped -- a different and much weaker statement.
-	if resolved := promptHeadWarnings(t, checkout, "Divergent "+strings.Repeat("f", 40)+".", head); len(resolved) != 0 {
-		t.Fatalf("premise: an unresolvable token warned (%v); this fixture cannot isolate the agreeing-token case", resolved)
+	// PREMISE, THROUGH THE DISPATCH PATH ITSELF. The earlier version established its premises
+	// by calling promptHeadWarnings directly -- which proves the HELPER is live and says
+	// nothing about whether THIS dispatch ran it. Review demonstrated the gap: replacing the
+	// dispatch's message with an empty string left the test green, because the premise checks
+	// never went through dispatchAgentCommand at all.
+	//
+	// So the control is a SECOND dispatch, same command, same store and home, differing only
+	// in that its prompt contains a DIVERGENT token. If that one warns and this one does not,
+	// the dispatch's own scan path is armed and its silence above is conditional rather than
+	// absent.
+	var ctlOut, ctlErr bytes.Buffer
+	control, ctlExit := dispatchAgentCommand(agentRunOptions{
+		home:       home,
+		repo:       "owner/repo",
+		agent:      "responder",
+		message:    "Use head " + divergent[:8] + " for this analysis.",
+		background: true,
+	}, "ask", "explicit", "agent_run", &ctlOut, &ctlErr)
+	if ctlExit != 0 {
+		t.Fatalf("control dispatch exit = %d, stderr=%s", ctlExit, ctlErr.String())
 	}
-	if len(promptHeadWarnings(t, checkout, "See "+head[:8]+".", head)) != 0 {
-		t.Fatal("premise: the scanner warned on a token EQUAL to the dispatch head, so this test cannot show silence is conditional")
+	if got := strings.Count(ctlErr.String(), "agent ask: warning:"); got != 1 {
+		t.Fatalf("control dispatch warnings = %d, want 1; the DISPATCH path does not scan at all, so the silence asserted below proves nothing; stderr=%q", got, ctlErr.String())
+	}
+	controlEvents, err := store.ListJobEvents(context.Background(), control.JobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	controlDurable := 0
+	for _, event := range controlEvents {
+		if event.Kind == "prompt_head_warning" {
+			controlDurable++
+		}
+	}
+	if controlDurable != 1 {
+		t.Fatalf("control dispatch durable events = %d, want 1; the durable emit is not reached from this path", controlDurable)
 	}
 
 	if got := strings.Count(stderr.String(), "agent ask: warning:"); got != 0 {
@@ -133,6 +162,104 @@ func TestDispatchEmitsNoWarningWhenThePromptAgreesWithTheHead(t *testing.T) {
 	for _, event := range events {
 		if event.Kind == "prompt_head_warning" {
 			t.Fatalf("durable prompt_head_warning emitted for a prompt that agrees with the head (message=%q); the emit is unconditional, not the product of a scan", event.Message)
+		}
+	}
+}
+
+// promptHeadWarningRepositoryWithDivergents builds the same fixture plus n ADDITIONAL divergent
+// commits, each on its own branch off the ancestor.
+//
+// One divergent commit is what made traversal and identity inseparable: with a single unequal
+// token, "one warning" and "the right warning" are the same observation, so a scanner that
+// traversed everything but reused the first divergent label passed every guard. Several
+// divergent commits split those properties apart -- the count constrains traversal, the set of
+// named tokens constrains identity, and neither implies the other.
+func promptHeadWarningRepositoryWithDivergents(t *testing.T, n int) (checkout string, head string, divergents []string) {
+	t.Helper()
+	checkout, ancestor, head, first := promptHeadWarningRepository(t)
+	divergents = append(divergents, first)
+	for i := 0; i < n; i++ {
+		branch := fmt.Sprintf("divergent-%d", i)
+		runGit(t, checkout, "checkout", "-b", branch, ancestor)
+		writePromptHeadFixture(t, checkout, fmt.Sprintf("divergent %d\n", i), branch)
+		divergents = append(divergents, promptHeadFixtureSHA(t, checkout))
+		runGit(t, checkout, "checkout", "main")
+	}
+	return checkout, head, divergents
+}
+
+// TestPromptHeadWarningTraversesEveryTokenAndNamesEachOne is the traversal + identity guard,
+// and it replaces a control that review showed was enumerable twice over.
+//
+// The previous version placed ONE divergent token at indexes 0, 4 and 12 -- all EVEN -- so a
+// scanner reading every other token survived all three. It also claimed "any fixed cap misses a
+// placement", which was simply false: a cap above 13 survived. That claim is withdrawn. A finite
+// set of placements can never rule out every fixed cap, so this guard stops trying to and
+// constrains the property directly instead.
+//
+// With SIX divergent commits interleaved among non-commit filler at both odd and even indexes:
+//
+//	COUNT      constrains traversal  - a cap at any n < 6 divergents, or every-other-token
+//	                                   sampling, yields fewer than six warnings.
+//	NAMED SET  constrains identity   - a scanner that traverses fully but reuses one label
+//	                                   still yields six warnings, and fails here.
+//
+// Those are the two mutants review demonstrated surviving, and they fail for different reasons,
+// which is the point: the old fixture could not tell them apart.
+func TestPromptHeadWarningTraversesEveryTokenAndNamesEachOne(t *testing.T) {
+	checkout, head, divergents := promptHeadWarningRepositoryWithDivergents(t, 5)
+	if len(divergents) != 6 {
+		t.Fatalf("fixture built %d divergent commits, want 6", len(divergents))
+	}
+
+	// Interleave the divergent tokens with resolvable-shaped but unresolvable filler so the
+	// divergent indexes are NOT all of one parity -- the defect that let every-other-token
+	// sampling survive.
+	var b strings.Builder
+	fmt.Fprintf(&b, "Dispatch head %s. ", head)
+	for i, d := range divergents {
+		fmt.Fprintf(&b, "ref %s ", d[:8])
+		if i%2 == 0 {
+			fmt.Fprintf(&b, "pad %064x ", i+1)
+		}
+	}
+	prompt := b.String()
+
+	// PREMISE: the divergent tokens really do land at both parities, or the fixture does not
+	// exercise the sampler it claims to.
+	tokens := promptCommitTokenRE.FindAllString(prompt, -1)
+	even, odd := 0, 0
+	for i, tok := range tokens {
+		for _, d := range divergents {
+			if tok == d[:8] {
+				if i%2 == 0 {
+					even++
+				} else {
+					odd++
+				}
+			}
+		}
+	}
+	if even == 0 || odd == 0 {
+		t.Fatalf("divergent tokens sit at even=%d odd=%d indexes; both parities are required or every-other-token sampling is not exercised", even, odd)
+	}
+
+	warnings := promptHeadWarnings(t, checkout, prompt, head)
+	if len(warnings) != len(divergents) {
+		t.Fatalf("warnings = %d, want %d (one per divergent commit): a scanner that caps its token count or samples positions cannot produce them all.\nprompt=%q\nwarnings=%v", len(warnings), len(divergents), prompt, warnings)
+	}
+
+	// IDENTITY: every divergent token is named exactly once. A full traversal that reuses one
+	// label produces the right COUNT and the wrong SET.
+	for _, d := range divergents {
+		named := 0
+		for _, w := range warnings {
+			if strings.Contains(w, d[:8]) {
+				named++
+			}
+		}
+		if named != 1 {
+			t.Fatalf("divergent %s named in %d warnings, want exactly 1: the count is right but the warnings do not identify their own commits.\nwarnings=%v", d[:8], named, warnings)
 		}
 	}
 }
