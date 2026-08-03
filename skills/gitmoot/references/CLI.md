@@ -947,7 +947,10 @@ repo/PR; after that it fails closed until the caller supplies the current head.
 The local CLI still requires a concrete head before dispatch. Each admitted
 local review gets its own detached, read-only per-job worktree at that exact
 commit; the stable per-PR Task row remains lifecycle metadata and no longer owns
-the review checkout. The requested `head_sha` stays on the job payload. Review
+the review checkout. Consequently, `gitmoot task list` shows an empty worktree
+column for review Task rows. This is expected: each review job owns its own path,
+so there is no single Task-level worktree path to display. The requested
+`head_sha` stays on the job payload. Review
 allocation fails closed rather than falling back to the registered checkout,
 and dispatch refuses before Task mutation when the Gitmoot filesystem has less
 than 5 GiB free or free-space measurement is unavailable. The prior verdict is
