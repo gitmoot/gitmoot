@@ -114,18 +114,18 @@ func c1ReviewRepository(t *testing.T) (repoDir string, oldHead string, newHead s
 
 func mintC1ReviewTaskID(t *testing.T, repoDir string, headSHA string) string {
 	t.Helper()
+	_ = repoDir
 	home := t.TempDir()
 	store := openCLIJobStore(t, home)
 	t.Cleanup(func() { _ = store.Close() })
-	request, _, err := prepareLocalReviewWorktree(
+	request, err := prepareLocalReviewTask(
 		context.Background(),
 		store,
-		db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir},
 		github.Repository{Owner: "owner", Name: "repo"},
 		localAgentDispatchRequest{Home: home, PullRequest: 17, HeadSHA: headSHA},
 	)
 	if err != nil {
-		t.Fatalf("prepareLocalReviewWorktree(%s): %v", headSHA, err)
+		t.Fatalf("prepareLocalReviewTask(%s): %v", headSHA, err)
 	}
 	return request.TaskID
 }

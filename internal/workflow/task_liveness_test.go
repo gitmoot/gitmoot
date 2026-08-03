@@ -364,7 +364,7 @@ func TestFindLiveTaskJobFindsLegacyJobAfterRepoBackfill(t *testing.T) {
 }
 
 func TestJobKeepsTaskLiveTable(t *testing.T) {
-	completionMarkers := []string{"advance_completed", "advance_retried", "advance_blocked", "advance_retry_skipped", "retry_queued"}
+	completionMarkers := []string{"advance_completed", "advance_retried", "advance_blocked", "advance_retry_skipped", "retry_queued", ReviewLoopDetectedEventKind}
 	type testCase struct {
 		name   string
 		state  JobState

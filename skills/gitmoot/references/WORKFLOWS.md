@@ -102,6 +102,21 @@ gitmoot agent start reviewer --runtime codex --repo owner/repo --role reviewer -
 gitmoot agent doctor reviewer
 ```
 
+Local `agent review` / review-resolved `agent run` and native engine review
+fan-out enforce an exact-head loop guard before a new review job is created. An
+homogeneous succeeded decision history for `(repo, PR, head_sha)` is refused and
+emits one `review_loop_detected` event on the matched succeeded job; the CLI
+hard-errors while the engine blocks the task. A new commit or mixed decisions at
+one head proceeds. The loop guard permits an empty engine event only before any
+succeeded history exists; local CLI preparation still requires a concrete head.
+The old verdict is evidence for escalation, never a cached response. An admitted
+local review then receives a per-job detached read-only worktree at the requested
+head. Allocation is fail-closed and requires a measurable 5 GiB free-space floor;
+the stable Task row remains lifecycle identity rather than a shared checkout.
+This exact decision-bearing key replaces no round counter: #1419's panel
+explicitly rejected that instrument. Direct PR-comment ingress is unchanged in
+this safe half and remains #1433 work.
+
 ## Review Agent From A PR Comment
 
 1. Register a reviewer agent for the target repo.
@@ -143,6 +158,18 @@ or request implementation capability.
 gitmoot agent template update thermo-nuclear-code-quality-review
 gitmoot agent start thermo-review --runtime codex --repo owner/repo --template thermo-nuclear-code-quality-review --start-daemon
 ```
+
+For a local dispatch, pair that reviewer with the registered implementer that
+should receive a `changes_requested` fix pass:
+
+```sh
+gitmoot agent review thermo-review --repo owner/repo --pr 12 --lead lead "Review this PR."
+```
+
+Gitmoot refuses the dispatch before creating a review job when the lead is
+missing, cannot access the repo, lacks `implement`, or has a non-write policy.
+Do not grant `implement` to the reviewer merely to satisfy this check; keep the
+reviewer read-only and name the separate implementer with `--lead`.
 
 PR comment:
 
@@ -989,21 +1016,23 @@ Each child job carries job-tree linkage fields — `parent_job_id`,
 can be traced back to its parent, its originating delegation, and the root of the
 tree. See `RESULT_CONTRACT.md` for the full delegation field reference.
 
-**Contended read-only jobs run at the committed tip.** When a same-repo read-only
-(`ask`/`review`) job would otherwise serialize on the shared checkout — a
-coordinator emits **two or more** read-only siblings, or two-plus
-independently-fired top-level read-only jobs land on one repo — Gitmoot
-auto-isolates each into a detached `git worktree` at the **committed tip** of the
-base branch so they run in parallel. That worktree does **not** contain gitignored
+**Read-only jobs use action-specific refs.** Every top-level local `review` gets
+an owned detached worktree at its requested PR head, even when it carries a
+stable Task ID or runs foreground. That exact-head allocation is correctness and
+fails the dispatch closed. A background taskless `ask` keeps the existing
+committed-tip, fail-open isolation; task-bearing and foreground asks keep their
+existing checkout behavior. Delegation/pool read-only isolation still applies
+when same-repo readers contend.
+
+These detached worktrees do **not** contain gitignored
 paths (e.g. vendored clones under `repos/**`) or any uncommitted working-tree
 changes, so an analysis/research leg cannot see the operator's live working tree
-there. Every auto-isolated job's prompt now carries a note with the canonical
+there. Committed-tip ask/delegation isolation carries a note with the canonical
 base-checkout absolute path so a worker whose sandbox can read it (e.g. codex)
-reaches the real tree instead of reporting a working-tree feature as absent. A
-**single**, uncontended read-only job stays in the shared base checkout and sees
-everything, so for whole-working-tree analysis (auditing gitignored vendored
-repos, or in-flight uncommitted WIP) either keep the job uncontended or pass an
-**absolute** path to the file/dir under analysis.
+reaches the real tree instead of reporting a working-tree feature as absent.
+Review deliberately keeps its exact-head binding and does not add that
+committed-tip context note. For whole-working-tree ask analysis, use a foreground
+or task-bearing ask, or pass an **absolute** path to the file/dir under analysis.
 
 ## Coordinator-Owned Review
 
@@ -1122,6 +1151,7 @@ retains a private per-job append log even when no cockpit exists; seat logs stay
 transient. Codex JSONL is readable live. Kimi stream-json is turn-buffered (and
 kimi-code 0.19.2 emits no usage). Claude currently emits one final JSON envelope,
 so its pane remains quiet until completion and then shows final text and usage.
+omp's NDJSON passes through undecoded, so its pane shows raw stream lines.
 Shell output is redacted raw passthrough. Unknown or malformed lines fail open
 one line at a time; a fatal renderer exit falls back externally to `tail -F`.
 Verified Codex command/file-change events and Kimi function tool calls/results

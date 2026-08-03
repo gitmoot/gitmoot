@@ -33,6 +33,12 @@ func TestLatestAdvancementMarker(t *testing.T) {
 	if k, err := store.LatestAdvancementMarker(ctx, "j1"); err != nil || k != "advance_retried" {
 		t.Fatalf("latest after resolve = %q, %v; want advance_retried", k, err)
 	}
+	if err := store.AddJobEvent(ctx, JobEvent{JobID: "j1", Kind: "review_loop_detected", Message: "same verdict"}); err != nil {
+		t.Fatal(err)
+	}
+	if k, err := store.LatestAdvancementMarker(ctx, "j1"); err != nil || k != "review_loop_detected" {
+		t.Fatalf("latest after review loop = %q, %v; want review_loop_detected", k, err)
+	}
 }
 
 // TestAdvanceRetryCollapseMigration proves the one-time heal migration collapses a

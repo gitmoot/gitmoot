@@ -1451,9 +1451,7 @@ func (r *pollErrorReporters) bind(mode pollMode, d daemon.Daemon) boundPoll {
 // It exists so the binding is made in ONE place a test can drive. Review defeated the previous
 // shape by changing only the recovery call site's bind(recoveryPoll, d) to bind(fullPoll, d):
 // that compiled, recovery failures then shared the FULL reporter, and an unrelated successful
-// full poll cleared the ongoing recovery episode -- the original defect by another route. No
-// guard saw it, because the supervisor's recovery branch is unreachable from a test: whether it
-// runs depends on a checkout lock and an in-flight tracker that are both function-local.
+// full poll cleared the ongoing recovery episode -- the original defect by another route.
 //
 // RESIDUAL. I have now stated this limit wrongly TWICE, so it is written narrowly and only
 // covers what is actually tested.

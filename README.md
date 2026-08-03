@@ -68,7 +68,8 @@ gitmoot agent start frontend-reviewer --runtime codex --repo owner/repo --templa
 
 Codex agents can set a default reasoning effort with `--effort`, and individual
 jobs can override it with the same flag. Gitmoot forwards the free-form value as
-`-c model_reasoning_effort=<value>`; Claude and Kimi ignore it.
+`-c model_reasoning_effort=<value>`; omp receives it as `--thinking <level>` when
+it names one of omp's accepted levels; Claude and Kimi ignore it.
 
 ### Agents that evolve themselves with SkillOpt
 
@@ -103,12 +104,13 @@ flowchart LR
     D --> E["Codex"]
     D --> F["Claude Code"]
     D --> G["Kimi Code"]
-    D --> H["shell"]
-    E & F & G & H --> I["branches · commits<br/>reviews · PR comments"]
+    D --> H["omp"]
+    D --> J["shell"]
+    E & F & G & H & J --> I["branches · commits<br/>reviews · PR comments"]
     I --> A
 ```
 
-The core primitive is a runtime-neutral Gitmoot agent. Codex, Claude Code, and Kimi Code are adapters behind one internal contract; local SQLite is the source of truth, and GitHub is the collaboration surface.
+The core primitive is a runtime-neutral Gitmoot agent. Codex, Claude Code, Kimi Code, and omp are adapters behind one internal contract; local SQLite is the source of truth, and GitHub is the collaboration surface.
 
 Gitmoot is also agent-native from the first minute: you don't have to install it yourself. Paste this into your coding agent and let it do the setup:
 
@@ -138,6 +140,7 @@ gitmoot setup --repo owner/repo --path . --agent helper --runtime claude --sessi
 | Codex | `--runtime codex` | plans, implements, reviews |
 | Claude Code | `--runtime claude` | `--session last` reuses your login |
 | Kimi Code | `--runtime kimi` | `kimi login` first, then restart the daemon |
+| omp | `--runtime omp` | multi-provider router; fresh session per job, never resumes |
 | Shell | `--runtime shell` | deterministic command runtime: CI-style jobs, no LLM |
 
 Your agent can also drive Gitmoot on your behalf: `gitmoot plugin install claude` (or `codex`) packages the Gitmoot Agent Skill into the runtime's plugin system, so your agent discovers the commands, registers repos, subscribes other agents, and launches orchestrations for you. Agents start from the [llms.txt index](https://gitmoot.io/llms.txt).

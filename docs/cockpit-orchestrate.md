@@ -27,7 +27,8 @@ job watch --transcript`. With opt-in `[transcripts]`, a universal per-job tee is
 retained independently of cockpit; seat logs stay transient. Codex JSONL is readable live. Kimi stream-json is turn-buffered,
 and kimi-code 0.19.2 emits no usage. Claude currently emits one final JSON
 envelope, so its pane remains quiet until completion and then shows final text
-and usage. Shell output is redacted raw passthrough. Unknown or malformed lines
+and usage. omp's NDJSON passes through undecoded, so its pane shows raw stream
+lines. Shell output is redacted raw passthrough. Unknown or malformed lines
 degrade individually to redacted bounded raw output; a fatal renderer exit or
 panic falls back externally to `tail -F`. The tee bytes, runtime result parsing,
 and pipeline progress stream are unchanged.

@@ -181,14 +181,19 @@ prompt = "Fix the top lint error."
 // TestHeartbeatRuntimesExcludesShell asserts the per-heartbeat runtime allow-list
 // is derived from the adapter registry but never offers shell (heartbeats mint a
 // fresh session; shell sessions are whole commands) nor kimi-cli (the legacy Kimi
-// CLI), so the accepted set equals the documented codex|claude|kimi (#611).
+// CLI), so the accepted set equals the documented codex|claude|kimi|omp (#611).
+// omp joins by DERIVATION when it is registered (#1428) and that is correct: a
+// heartbeat mints a fresh session, which is the only thing stateless omp can do.
+// The consequence is deliberate and must be stated in the PR: the moment omp is
+// registered, enabled heartbeats can dispatch to it — and therefore to whatever
+// credential its profile resolves.
 func TestHeartbeatRuntimesExcludesShell(t *testing.T) {
 	for _, rt := range HeartbeatRuntimes() {
 		if rt == "shell" || rt == "kimi-cli" {
 			t.Fatalf("HeartbeatRuntimes must not include %q: %v", rt, HeartbeatRuntimes())
 		}
 	}
-	if got, want := strings.Join(HeartbeatRuntimes(), "|"), "codex|claude|kimi"; got != want {
+	if got, want := strings.Join(HeartbeatRuntimes(), "|"), "codex|claude|kimi|omp"; got != want {
 		t.Fatalf("HeartbeatRuntimes = %q, want %q (accepted must equal the documented set)", got, want)
 	}
 	if !HeartbeatRuntimeSupported("codex") || !HeartbeatRuntimeSupported("") {

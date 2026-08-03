@@ -1902,6 +1902,11 @@ func TestManagedRuntimeDeliveriesThreadAgentEnv(t *testing.T) {
 			agent: Agent{Name: "seat", Role: "reviewer", Runtime: KimiCLIRuntime, RuntimeRef: "session_" + session, RepoScope: "gitmoot/gitmoot"},
 			build: func(r subprocess.Runner) Adapter { return KimiCLIAdapter{Runner: r} },
 		},
+		{
+			name: "omp", output: ompStreamOK,
+			agent: Agent{Name: "seat", Role: "reviewer", Runtime: OmpRuntime, RuntimeRef: session, RepoScope: "gitmoot/gitmoot"},
+			build: func(r subprocess.Runner) Adapter { return OmpAdapter{Runner: r} },
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2041,6 +2046,11 @@ func TestDeliverReportsPIDWhenRunnerSupportsCapability(t *testing.T) {
 			name:    "kimi-cli",
 			adapter: KimiCLIAdapter{Runner: &pidFakeRunner{fakeRunner: &fakeRunner{results: []subprocess.Result{{Stdout: `{"role":"assistant","content":"done"}` + "\n"}}}, pid: wantPID}},
 			agent:   Agent{Name: "kimi-cli", Role: "implementer", Runtime: KimiCLIRuntime, RuntimeRef: FreshRefForJob("pid-kimi-cli"), RepoScope: "gitmoot/gitmoot"},
+		},
+		{
+			name:    "omp",
+			adapter: OmpAdapter{Runner: &pidFakeRunner{fakeRunner: &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}}, pid: wantPID}},
+			agent:   Agent{Name: "omp", Role: "implementer", Runtime: OmpRuntime, RuntimeRef: FreshRefForJob("pid-omp"), RepoScope: "gitmoot/gitmoot"},
 		},
 	}
 	for _, tc := range tests {

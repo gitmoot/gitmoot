@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -11,6 +14,8 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // writerFunc adapts a func to io.Writer so the test can observe the supervisor's stdout as it
@@ -247,6 +252,19 @@ func (f *pollDiscriminatingFakeGitHub) issueCalls() int {
 	return f.issues
 }
 
+func (f *pollDiscriminatingFakeGitHub) pullCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pulls
+}
+
+func (f *pollDiscriminatingFakeGitHub) resetCalls() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.issues = 0
+	f.pulls = 0
+}
+
 // TestSupervisorIdleBranchRunsTheFullPoll is the SUPERVISOR-PATH guard, and it closes a residual
 // I twice described wrongly.
 //
@@ -299,6 +317,79 @@ func TestSupervisorIdleBranchRunsTheFullPoll(t *testing.T) {
 			t.Fatalf("the idle branch never reached ListIssues: it ran the RECOVERY poll instead of the full poll, silently skipping PollOnce and all full reconciliation")
 		case <-time.After(20 * time.Millisecond):
 		}
+	}
+	cancel()
+	<-done
+}
+
+// TestSupervisorBusyBranchRunsTheRecoveryPoll drives the fallback through the real supervisor.
+// A live shell job makes the function-local tracker busy; while it remains busy, a recovery poll
+// must list pull requests without reaching the full poll's issue scan.
+func TestSupervisorBusyBranchRunsTheRecoveryPoll(t *testing.T) {
+	store, home := blockerE2EHome(t)
+	const repo = "owner/repo"
+	seedDaemonWorkerRepo(t, store, repo, createDaemonWorkerGitCheckout(t, "main"))
+
+	stateDir := t.TempDir()
+	started := filepath.Join(stateDir, "started")
+	release := filepath.Join(stateDir, "release")
+	script := fmt.Sprintf(
+		`printf started > %q; while [ ! -e %q ]; do sleep 0.05; done; printf '%%s\n' '{"gitmoot_result":{"decision":"approved","summary":"released","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`,
+		started,
+		release,
+	)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, script, []string{"ask"}, repo)
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "busy-poll-job", Agent: "audit", Action: "ask", Repo: repo, Branch: "main",
+	})
+
+	client := &pollDiscriminatingFakeGitHub{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	live := newDaemonReloadableConfig(200*time.Millisecond, 1, false)
+	d := daemon.Daemon{
+		Repo:         github.Repository{Owner: "owner", Name: "repo"},
+		Store:        store,
+		GitHub:       client,
+		PollInterval: 200 * time.Millisecond,
+		WatchIssues:  true,
+	}
+	done := make(chan error, 1)
+	go func() { done <- runSingleRepoSupervisor(ctx, home, d, store, live, "", io.Discard) }()
+
+	if !waitForCondition(t, 10*time.Second, func() bool {
+		_, err := os.Stat(started)
+		return err == nil
+	}) {
+		cancel()
+		<-done
+		t.Fatal("long-running shell job never started; the tracker was not made busy")
+	}
+
+	// Let any full poll selected before the tracker became busy finish, then measure only the
+	// fallback interval. The job remains blocked until release is created below.
+	time.Sleep(2 * d.PollInterval)
+	client.resetCalls()
+	if !waitForCondition(t, 5*time.Second, func() bool { return client.pullCalls() > 0 }) {
+		cancel()
+		<-done
+		t.Fatal("busy supervisor never ran the recovery fallback's pull-request scan")
+	}
+	// PollOnce reaches ListIssues after its pull-request scan. Give a wrong full runner enough
+	// time to complete before asserting that only recovery work ran.
+	time.Sleep(2 * d.PollInterval)
+	if got := client.issueCalls(); got != 0 {
+		cancel()
+		<-done
+		t.Fatalf("busy fallback ListIssues calls = %d, want 0: ran full PollOnce instead of PollRecoveryCommandsOnce", got)
+	}
+
+	if err := os.WriteFile(release, []byte("release\n"), 0o600); err != nil {
+		t.Fatalf("release shell job: %v", err)
+	}
+	if got := waitForJobState(t, store, "busy-poll-job", string(workflow.JobSucceeded), 10*time.Second); got != string(workflow.JobSucceeded) {
+		t.Fatalf("busy-poll-job state = %q after release, want succeeded", got)
 	}
 	cancel()
 	<-done

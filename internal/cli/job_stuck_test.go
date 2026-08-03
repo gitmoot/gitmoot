@@ -102,6 +102,13 @@ func TestDeriveStuckReason(t *testing.T) {
 			wantReason: "retrying: attempt 2 of 3",
 		},
 		{
+			name:       "review loop event surfaces blocked reason",
+			job:        blocked,
+			event:      db.JobEvent{Kind: workflow.ReviewLoopDetectedEventKind, Message: "same verdict at unchanged head"},
+			hasEvent:   true,
+			wantReason: "blocked: same verdict at unchanged head",
+		},
+		{
 			name:       "blocked with no reason event still explained",
 			job:        blocked,
 			hasEvent:   false,

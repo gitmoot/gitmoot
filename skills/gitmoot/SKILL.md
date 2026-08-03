@@ -1,8 +1,8 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, pipelines, email/Activepieces pipeline triggers via the localhost bridge, routing telemetry, event webhooks, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, or Kimi Code runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, pipelines, email/Activepieces pipeline triggers via the localhost bridge, routing telemetry, event webhooks, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
 license: Apache-2.0
-compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, or Kimi Code.
+compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, Kimi Code, or omp.
 metadata:
   gitmoot-version: "0.8.8"
   source: "gitmoot/gitmoot"
@@ -13,7 +13,7 @@ metadata:
 Gitmoot is a local-first coordinator for AI agents working across repositories,
 goals, reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
-background daemon checks, Codex, Claude Code, or Kimi Code agent startup, structured
+background daemon checks, Codex, Claude Code, Kimi Code, or omp agent startup, structured
 implementation plans, standard goal files, agent template workflows, custom
 prompt agents, template capture, native agent chat threads, job status, or branch
 lock inspection. When the user wants agents and humans to converse in a durable
@@ -176,13 +176,24 @@ locks, commits, pushes, PRs, and workflow advancement. Add `--action
 ask|review|implement` when that job action must be explicit; `--type` is
 independent and selects a managed agent type, not an action. Use
 `gitmoot agent ask <agent> --repo owner/repo "..."` only for
-analysis, planning, or questions. Use `gitmoot agent review <agent> --repo
-owner/repo --pr <number> "..."` for PR review decisions and `gitmoot agent
+analysis, planning, or questions. Use `gitmoot agent review <reviewer> --repo
+owner/repo --pr <number> --lead <implementer> "..."` for PR review decisions;
+the lead must be a registered, repo-allowed agent with `implement` capability
+and a write-granting policy so requested changes can route to it. Use `gitmoot agent
 implement <agent> --repo owner/repo --task <task-id> "..."` for file changes.
 For a fix pass on an existing open PR, use `agent implement --pr <number>` (or
 `agent run --action implement --pr <number>`); Gitmoot validates that the PR is
 open, belongs to the same repository, and matches the existing task branch
 before reusing its task worktree and PR.
+Before local review dispatch or native engine review fan-out, Gitmoot refuses a
+homogeneous succeeded decision repeated at the exact same repo/PR/head, emits
+`review_loop_detected` on the matched succeeded job, and hard-errors (CLI) or
+blocks (engine). New heads and mixed same-head decisions proceed; the loop guard
+allows an empty engine event only before succeeded history exists, while local
+CLI preparation still requires a concrete head. Treat the old verdict only as
+escalation evidence—never return it as a cached review result. This exact key is
+used instead of a round counter because #1419's panel rejected round-based
+instruments. Direct PR-comment ingress remains separate #1433 work.
 Add `--background` only when the user wants a queued background job.
 
 Orchestrate (Orchestra): when the user says "orchestrate …" or "spin up an
@@ -208,13 +219,22 @@ runtime's configured `[runtimes.<name>].default_model`, then the runtime CLI's o
 default. Codex agents, jobs, delegations, and ephemeral worker specs can likewise
 set reasoning effort with `--effort` or the `effort` field. Job/delegation effort
 overrides agent/worker effort, then `[runtimes.codex].default_effort`, and Gitmoot
-forwards the free-form value as `-c model_reasoning_effort=<value>`. Claude and
-Kimi ignore effort. Use
+forwards the free-form value as `-c model_reasoning_effort=<value>`. omp receives
+effort as `--thinking <level>` when the value is one of
+`off|minimal|low|medium|high|xhigh|max|auto`, and no flag at all otherwise.
+Claude and Kimi ignore effort. The `omp` runtime is a multi-provider **routing
+harness**, so a few of its properties differ from the vendor CLIs and are worth
+saying out loud before routing work to it: it holds `review`/`implement`/`ask`
+but not `produce`, every job runs a fresh session (it never resumes), read-only
+is enforced Gitmoot-side rather than by the runtime's approval flag, and its
+implement jobs get a LOUD cross-family-review refusal instead of a silent skip
+because an opaque router has no model family (see CLI.md § Agent Setup). Use
 `gitmoot runtime list` to inspect each built-in runtime's resolved metadata:
 capabilities, default model/effort, known models, and the token-usage source.
 Operators can override a built-in runtime's
 metadata without recompiling via a `[runtimes.<name>]` config section — `default_model`
-retargets delivery and `default_effort` selects Codex effort, while
+retargets delivery and `default_effort` selects Codex effort and omp's
+`--thinking` level, while
 `models`/`capabilities` stay advisory (see CLI.md
 § Runtime Metadata Registry). Use
 `gitmoot plugin doctor` when checking whether Codex, Claude Code, or Kimi Code
@@ -345,7 +365,7 @@ goal file.
 For non-trivial implementation work, default to a plan-gated flow: plan first,
 get the plan approved explicitly, then implement against the approved plan. The
 gate is a convention over existing primitives, so it works unchanged on Codex,
-Claude, and Kimi seats.
+Claude, Kimi, and omp seats.
 
 1. **Plan read-only.** Produce a decision-complete plan with `gitmoot agent
    ask` (or the `planner` template, or a session job opened with `--type ask`).

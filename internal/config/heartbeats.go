@@ -28,9 +28,10 @@ type Heartbeat struct {
 	// Runtime, when non-empty, runs this heartbeat's job through the named runtime
 	// instead of the target agent's registered default runtime (#611, reusing the
 	// per-job override machinery from #531). It is OPTIONAL: an empty Runtime leaves
-	// every existing heartbeat byte-identical and runs on the agent default. Only a
-	// resumable runtime (codex/claude/kimi) is allowed — a heartbeat mints a fresh
-	// session, and shell sessions are whole commands, so shell is rejected.
+	// every existing heartbeat byte-identical and runs on the agent default. The
+	// allowed set is HeartbeatRuntimes() — derived from the adapter registry, today
+	// codex/claude/kimi/omp — a heartbeat mints a fresh session, and shell sessions
+	// are whole commands, so shell is rejected.
 	Runtime string
 }
 
@@ -116,16 +117,21 @@ func HeartbeatActionSupported(action string) bool {
 }
 
 // HeartbeatRuntimes lists the runtimes a per-heartbeat runtime override may name
-// (#611): the resumable runtimes the adapter Factory supports EXCEPT shell (a
-// heartbeat mints a fresh session, and shell sessions are whole commands, not
-// resumable sessions) and kimi-cli (the legacy Kimi CLI; gitmoot targets kimi-code
-// via the `kimi` runtime). The result — codex|claude|kimi — is the SINGLE source of
+// (#611): the runtimes the adapter Factory supports EXCEPT shell (a heartbeat mints
+// a fresh session, and shell sessions are whole commands, not resumable sessions)
+// and kimi-cli (the legacy Kimi CLI; gitmoot targets kimi-code via the `kimi`
+// runtime). The result — codex|claude|kimi|omp today — is the SINGLE source of
 // truth that the CLI usage/flag help and the docs advertise, so accepted ==
 // documented (the rest is derived from runtime.SupportedRuntimes so the set stays
-// in lockstep with the adapter registry).
+// in lockstep with the adapter registry). That derivation is why registering a
+// runtime is enough to make enabled heartbeats able to dispatch to it: omp (#1428)
+// joined this set without a line changing here.
 func HeartbeatRuntimes() []string {
-	allowed := make([]string, 0, 3)
-	for _, name := range runtime.SupportedRuntimes() {
+	// Size from the registry, not a literal: the old cap of 3 predated omp and the
+	// set grows whenever a runtime is registered.
+	names := runtime.SupportedRuntimes()
+	allowed := make([]string, 0, len(names))
+	for _, name := range names {
 		if name == runtime.ShellRuntime || name == runtime.KimiCLIRuntime {
 			continue
 		}
@@ -135,8 +141,8 @@ func HeartbeatRuntimes() []string {
 }
 
 // HeartbeatRuntimeSupported reports whether rt is a valid per-heartbeat runtime
-// override (a resumable runtime, never shell). The empty string is valid: it
-// means "no override; run on the agent default".
+// override (a runtime in HeartbeatRuntimes(), never shell). The empty string is
+// valid: it means "no override; run on the agent default".
 func HeartbeatRuntimeSupported(rt string) bool {
 	rt = strings.TrimSpace(rt)
 	if rt == "" {
@@ -264,9 +270,10 @@ func validateHeartbeat(entry Heartbeat) error {
 	if !HeartbeatActionSupported(entry.Action) {
 		return fmt.Errorf("heartbeat [agents.%s.heartbeats.%s]: unsupported action %q; supported actions are %s", entry.Agent, entry.Name, entry.Action, strings.Join(HeartbeatActions(), ", "))
 	}
-	// A per-heartbeat runtime override (#611) must name a resumable runtime the
-	// adapter Factory supports (codex/claude/kimi), never shell. An empty runtime is
-	// valid and means "run on the agent default" (the byte-identical default).
+	// A per-heartbeat runtime override (#611) must name a runtime in
+	// HeartbeatRuntimes() — derived from the adapter Factory, today
+	// codex/claude/kimi/omp — never shell. An empty runtime is valid and means "run
+	// on the agent default" (the byte-identical default).
 	if !HeartbeatRuntimeSupported(entry.Runtime) {
 		return fmt.Errorf("heartbeat [agents.%s.heartbeats.%s]: unsupported runtime %q; supported runtimes are %s", entry.Agent, entry.Name, entry.Runtime, strings.Join(HeartbeatRuntimes(), ", "))
 	}

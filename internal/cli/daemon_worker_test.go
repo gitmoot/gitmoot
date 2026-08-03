@@ -221,6 +221,26 @@ func TestJobNeedsAdvanceRetryResetsAfterJobRetry(t *testing.T) {
 	}
 }
 
+func TestJobNeedsAdvanceRetryStopsAtReviewLoopDetected(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	if err := store.CreateJob(ctx, db.Job{ID: "job-review-loop", Agent: "audit", Type: "review", State: string(workflow.JobSucceeded), Payload: `{"repo":"owner/repo"}`}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	for _, kind := range []string{"advance_retry", workflow.ReviewLoopDetectedEventKind} {
+		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: "job-review-loop", Kind: kind, Message: kind}); err != nil {
+			t.Fatalf("AddJobEvent(%s): %v", kind, err)
+		}
+	}
+	needsRetry, err := defaultJobWorker(store, io.Discard).jobNeedsAdvanceRetry(ctx, "job-review-loop")
+	if err != nil {
+		t.Fatalf("jobNeedsAdvanceRetry: %v", err)
+	}
+	if needsRetry {
+		t.Fatal("jobNeedsAdvanceRetry returned true after review_loop_detected")
+	}
+}
+
 // TestJobWorkerResolveRepoSchedulerFallsBackToGlobal pins the resolver's
 // fail-safe defaults (#576): an implicit config home, an empty repo filter, and
 // an unmatched repo all return the global limit and the worker's UsePool

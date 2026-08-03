@@ -2445,7 +2445,7 @@ func (w jobWorker) jobNeedsAdvanceRetry(ctx context.Context, jobID string) (bool
 		switch event.Kind {
 		case "advance_started", "advance_retry":
 			needsRetry = true
-		case "advance_completed", "advance_retried", "advance_blocked", "advance_retry_skipped":
+		case "advance_completed", "advance_retried", "advance_blocked", "advance_retry_skipped", workflow.ReviewLoopDetectedEventKind:
 			needsRetry = false
 		case "retry_queued":
 			needsRetry = false
@@ -2630,6 +2630,8 @@ func buildRuntimeAdapter(home string, agent runtime.Agent, checkout string, runn
 		adapter = runtime.KimiAdapter{Dir: checkout, Runner: runner}
 	case runtime.KimiCLIRuntime:
 		adapter = runtime.KimiCLIAdapter{Dir: checkout, Runner: runner}
+	case runtime.OmpRuntime:
+		adapter = runtime.OmpAdapter{Dir: checkout, Runner: runner}
 	case runtime.ShellRuntime:
 		adapter = runtime.ShellAdapter{Dir: checkout, Runner: runner}
 	default:

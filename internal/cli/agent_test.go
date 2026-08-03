@@ -707,7 +707,7 @@ func TestWorkflowOrchestrationGuardAllowsCommitQuestions(t *testing.T) {
 	}
 }
 
-func TestPrepareLocalReviewDispatchRequestCreatesReviewWorktree(t *testing.T) {
+func TestPrepareLocalReviewDispatchRequestCreatesBranchlessReviewTask(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
 	repoDir := t.TempDir()
@@ -742,7 +742,7 @@ func TestPrepareLocalReviewDispatchRequestCreatesReviewWorktree(t *testing.T) {
 		t.Fatalf("UpsertTask(implement): %v", err)
 	}
 	record := db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: repoDir}
-	request, checkout, err := prepareLocalReviewDispatchRequest(ctx, store, record, github.Repository{Owner: "owner", Name: "repo"}, localAgentDispatchRequest{
+	request, err := prepareLocalReviewDispatchRequest(ctx, store, record, github.Repository{Owner: "owner", Name: "repo"}, localAgentDispatchRequest{
 		Home:         home,
 		Agent:        "audit",
 		Action:       "review",
@@ -754,15 +754,8 @@ func TestPrepareLocalReviewDispatchRequestCreatesReviewWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepareLocalReviewDispatchRequest returned error: %v", err)
 	}
-	if request.TaskID == "" || checkout == "" {
-		t.Fatalf("request.TaskID=%q checkout=%q", request.TaskID, checkout)
-	}
-	reviewHead, err := (gitutil.Client{Dir: checkout}).HeadSHA(ctx)
-	if err != nil {
-		t.Fatalf("review HeadSHA returned error: %v", err)
-	}
-	if reviewHead != head {
-		t.Fatalf("review worktree head = %q, want %q", reviewHead, head)
+	if request.TaskID == "" {
+		t.Fatal("request.TaskID is empty")
 	}
 	branch, err := (gitutil.Client{Dir: repoDir}).CurrentBranch(ctx)
 	if err != nil {
@@ -775,8 +768,8 @@ func TestPrepareLocalReviewDispatchRequestCreatesReviewWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTask returned error: %v", err)
 	}
-	if task.WorktreePath != checkout || task.State != string(workflow.TaskReviewing) {
-		t.Fatalf("task = %+v, checkout=%q", task, checkout)
+	if task.WorktreePath != "" || task.State != string(workflow.TaskReviewing) {
+		t.Fatalf("task = %+v, want reviewing lifecycle row with no shared worktree", task)
 	}
 	if task.ID == "implement-12" || task.Branch != "" {
 		t.Fatalf("review task = %+v, want distinct branchless review-pr task", task)
@@ -787,7 +780,7 @@ func TestPrepareLocalReviewDispatchRequestCreatesReviewWorktree(t *testing.T) {
 	}
 }
 
-func TestPrepareLocalReviewDispatchRequestDoesNotReuseStaleReviewWorktree(t *testing.T) {
+func TestPrepareLocalReviewDispatchRequestDoesNotBindStaleReviewTask(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
 	repoDir := t.TempDir()
@@ -830,7 +823,7 @@ func TestPrepareLocalReviewDispatchRequestDoesNotReuseStaleReviewWorktree(t *tes
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
 	record := db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: repoDir}
-	request, checkout, err := prepareLocalReviewDispatchRequest(ctx, store, record, github.Repository{Owner: "owner", Name: "repo"}, localAgentDispatchRequest{
+	request, err := prepareLocalReviewDispatchRequest(ctx, store, record, github.Repository{Owner: "owner", Name: "repo"}, localAgentDispatchRequest{
 		Home:         home,
 		Agent:        "audit",
 		Action:       "review",
@@ -842,15 +835,8 @@ func TestPrepareLocalReviewDispatchRequestDoesNotReuseStaleReviewWorktree(t *tes
 	if err != nil {
 		t.Fatalf("prepareLocalReviewDispatchRequest returned error: %v", err)
 	}
-	if checkout == staleWorktree || request.TaskID == "stale-review" {
-		t.Fatalf("reused stale checkout=%q taskID=%q", checkout, request.TaskID)
-	}
-	reviewHead, err := (gitutil.Client{Dir: checkout}).HeadSHA(ctx)
-	if err != nil {
-		t.Fatalf("review HeadSHA returned error: %v", err)
-	}
-	if reviewHead != newHead {
-		t.Fatalf("review worktree head = %q, want %q", reviewHead, newHead)
+	if request.TaskID == "stale-review" {
+		t.Fatalf("reused stale taskID=%q", request.TaskID)
 	}
 	staleHead, err := (gitutil.Client{Dir: staleWorktree}).HeadSHA(ctx)
 	if err != nil {
@@ -861,7 +847,7 @@ func TestPrepareLocalReviewDispatchRequestDoesNotReuseStaleReviewWorktree(t *tes
 	}
 }
 
-func TestPrepareLocalReviewWorktreeRejectsDisposedTask(t *testing.T) {
+func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 	for _, test := range []struct {
 		name       string
 		task       db.Task
@@ -923,15 +909,14 @@ func TestPrepareLocalReviewWorktreeRejectsDisposedTask(t *testing.T) {
 			}
 			request := localAgentDispatchRequest{Home: home, PullRequest: 12, HeadSHA: head}
 			test.setRequest(&request)
-			_, _, err = prepareLocalReviewWorktree(ctx, store,
-				db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir},
+			_, err = prepareLocalReviewTask(ctx, store,
 				github.Repository{Owner: "owner", Name: "repo"}, request)
 			if err == nil || !strings.Contains(err.Error(), "task "+test.task.ID) {
-				t.Fatalf("prepareLocalReviewWorktree error = %v", err)
+				t.Fatalf("prepareLocalReviewTask error = %v", err)
 			}
 			for _, fragment := range test.wantError {
 				if !strings.Contains(err.Error(), fragment) {
-					t.Fatalf("prepareLocalReviewWorktree error = %v, want fragment %q", err, fragment)
+					t.Fatalf("prepareLocalReviewTask error = %v, want fragment %q", err, fragment)
 				}
 			}
 			stored, getErr := store.GetTask(ctx, test.task.ID)
@@ -942,7 +927,7 @@ func TestPrepareLocalReviewWorktreeRejectsDisposedTask(t *testing.T) {
 	}
 }
 
-func TestPrepareLocalReviewWorktreeReusesNonDismissedMatchingHead(t *testing.T) {
+func TestPrepareLocalReviewTaskReusesNonDismissedMatchingHead(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
 	repoDir := t.TempDir()
@@ -964,15 +949,14 @@ func TestPrepareLocalReviewWorktreeReusesNonDismissedMatchingHead(t *testing.T) 
 	}); err != nil {
 		t.Fatal(err)
 	}
-	request, checkout, err := prepareLocalReviewWorktree(ctx, store,
-		db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir},
+	request, err := prepareLocalReviewTask(ctx, store,
 		github.Repository{Owner: "owner", Name: "repo"},
 		localAgentDispatchRequest{Home: home, PullRequest: 12, Branch: "feature/review", HeadSHA: head})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if request.TaskID != "reviewing-task" || request.GoalID != "goal-1" || request.TaskTitle != "Review" || checkout != repoDir {
-		t.Fatalf("request=%+v checkout=%q", request, checkout)
+	if request.TaskID != "reviewing-task" || request.GoalID != "goal-1" || request.TaskTitle != "Review" {
+		t.Fatalf("request=%+v", request)
 	}
 	task, err := store.GetTask(ctx, "reviewing-task")
 	if err != nil || task.State != string(workflow.TaskReviewing) {
@@ -1890,7 +1874,7 @@ func TestRunAgentTypeSetRejectsNonStartableRuntime(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("agent type set shell exit code = %d, want 2", code)
 	}
-	if !strings.Contains(stderr.String(), "managed agent types support codex, claude, kimi, or kimi-cli") {
+	if !strings.Contains(stderr.String(), "managed agent types support codex, claude, kimi, kimi-cli, or omp") {
 		t.Fatalf("stderr = %q", stderr.String())
 	}
 }

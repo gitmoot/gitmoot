@@ -4442,7 +4442,7 @@ func referenceJobNeedsAdvanceRetry(kinds []string) bool {
 		switch kind {
 		case "advance_started", "advance_retry":
 			needsRetry = true
-		case "advance_completed", "advance_retried", "advance_blocked", "advance_retry_skipped":
+		case "advance_completed", "advance_retried", "advance_blocked", "advance_retry_skipped", "review_loop_detected":
 			needsRetry = false
 		case "retry_queued":
 			needsRetry = false
@@ -4483,6 +4483,7 @@ func TestJobIDsWithPendingAdvanceRetry(t *testing.T) {
 		{name: "started then blocked", events: []string{"advance_started", "advance_blocked"}, wantPending: false},
 		{name: "started then retry skipped", events: []string{"advance_started", "advance_retry_skipped"}, wantPending: false},
 		{name: "started then retry_queued 602 reset", events: []string{"advance_started", "retry_queued"}, wantPending: false},
+		{name: "started then review loop detected", events: []string{"advance_started", "review_loop_detected"}, wantPending: false},
 		{name: "completed then started reopened pending", events: []string{"advance_completed", "advance_started"}, wantPending: true},
 		{name: "started trailing noise ignored still pending", events: []string{"advance_started", "queued", "route_selected"}, wantPending: true},
 		{name: "completed trailing noise ignored not pending", events: []string{"advance_started", "advance_completed", "queued", "succeeded"}, wantPending: false},
@@ -4585,7 +4586,7 @@ func TestJobIDsWithPendingRetryMutationGuard(t *testing.T) {
 
 	advKinds := []string{
 		"advance_started", "advance_retry", "advance_completed", "advance_retried",
-		"advance_blocked", "advance_retry_skipped", "retry_queued",
+		"advance_blocked", "advance_retry_skipped", "retry_queued", "review_loop_detected",
 		"queued", "route_selected", "blocker_deferred", // noise
 	}
 	cmtKinds := []string{

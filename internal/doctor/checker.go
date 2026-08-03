@@ -124,6 +124,7 @@ func (c Checker) GlobalChecks(ctx context.Context) []Check {
 		c.command(ctx, runner, "codex", true, "--version"),
 		c.command(ctx, runner, "claude", false, "--help"),
 		c.command(ctx, runner, "kimi", false, "--version"),
+		c.command(ctx, runner, "omp", false, "--version"),
 	}
 	// The daemon is what actually runs Claude background jobs, so report its auth
 	// state first when it can be detected (issue #427). The shell-local check

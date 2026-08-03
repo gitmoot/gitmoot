@@ -33,10 +33,12 @@ gitmoot plugin doctor
 gitmoot agent template list
 gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 gitmoot agent template update thermo-nuclear-code-quality-review
-gitmoot agent start <name> --runtime codex|claude|kimi --repo owner/repo --path . --template thermo-nuclear-code-quality-review --start-daemon
-gitmoot agent subscribe <name> --runtime codex|claude|kimi|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
+gitmoot agent start <name> --runtime codex|claude|kimi|kimi-cli|omp --repo owner/repo --path . --template thermo-nuclear-code-quality-review --start-daemon
+gitmoot agent subscribe <name> --runtime codex|claude|kimi|kimi-cli|omp|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
 gitmoot agent run <name> "message" --repo owner/repo [--task task-id] [--pr number] [--background]
-gitmoot agent review <name> "message" --repo owner/repo --pr number [--background]
+gitmoot agent review <name> "message" --repo owner/repo --pr number [--background] # exact-head loop guard applies
+gitmoot agent run <name> "message" --repo owner/repo [--task task-id] [--pr number] [--lead implementer] [--background]
+gitmoot agent review <name> "message" --repo owner/repo --pr number [--lead implementer] [--background]
 gitmoot agent implement <name> "message" --repo owner/repo [--task task-id] [--background]
 gitmoot agent ask <name> "message" --repo owner/repo
 gitmoot agent ask <name> --background --repo owner/repo "message"
@@ -73,6 +75,14 @@ gitmoot daemon start --repo owner/repo --poll 30s --workers 1
 gitmoot daemon start
 gitmoot daemon status
 ```
+
+`--lead` is valid only for review-resolved `agent review` and `agent run`
+dispatches. Gitmoot loads that lead from the agents database before creating the
+review job and requires repo access, `implement` capability, and a
+write-granting autonomy policy. A `changes_requested` verdict then creates its
+fix job for the lead while the review job remains assigned to the reviewer.
+Without `--lead`, the reviewer is checked as the fallback lead, so a review-only
+agent must be paired explicitly with a separate implementer.
 
 Transcript retention is opt-in through `[transcripts] enabled = true` with a
 default `retain = "168h"` and `max_total_bytes = 2147483648`. It captures
@@ -201,6 +211,18 @@ owner/repo "..."`. `agent run` routes to `ask`, `review`, or `implement` from
 explicit flags and message intent. Use `agent ask` only for analysis, planning,
 or questions; use `agent review` for a PR review decision; use `agent implement`
 for code, docs, tests, or file edits.
+
+Local review dispatch and native engine review fan-out refuse a repeated stable
+verdict at an unchanged PR head before creating another review job. Gitmoot
+records one `review_loop_detected` event on the matched succeeded review; the CLI
+hard-errors and the engine blocks the task. New commits and mixed decisions at
+the same head proceed. The loop guard permits an empty engine event only before
+any succeeded history exists, then fails closed; the local CLI still resolves a
+concrete head before worktree creation. The old verdict is never returned as a
+cached result.
+The key is exact evidence `(repo, PR, head_sha, decision)`, not a round counter:
+#1419's review panel rejected round-based instruments. Direct PR-comment ingress
+is unchanged by this safe half and remains tracked separately in #1433.
 
 ## Execution Model
 
@@ -523,8 +545,11 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
 
    Implement jobs require the agent to hold the branch lock. Review and ask jobs
    are routed through the runtime adapter and must return the `gitmoot_result`
-   JSON contract. Jobs tied to a task worktree use that worktree for validation;
-   jobs without a task worktree use the registered checkout.
+   JSON contract. A newly dispatched local review always owns a detached
+   read-only per-job worktree at its requested head; its stable Task row tracks
+   lifecycle only. Review allocation fails closed and requires a measurable
+   5 GiB free-space floor. Other jobs tied to a task worktree use that worktree;
+   jobs without an owned or task worktree use the registered checkout.
 
    For a local chat ask that should not go through a PR comment, call the same
    registered agent directly:

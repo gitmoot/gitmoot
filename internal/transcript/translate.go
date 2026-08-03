@@ -38,12 +38,34 @@ func newTranslator(runtimeName string, now func() time.Time) (Translator, error)
 		return &claudeTranslator{}, nil
 	case gitmootruntime.KimiRuntime, gitmootruntime.KimiCLIRuntime:
 		return &kimiTranslator{now: now, tools: make(map[string]pendingTool)}, nil
+	case gitmootruntime.OmpRuntime:
+		return ompTranslator{}, nil
 	case gitmootruntime.ShellRuntime:
 		return shellTranslator{}, nil
 	default:
 		return nil, fmt.Errorf("unsupported transcript runtime %q", runtimeName)
 	}
 }
+
+// ompTranslator is a deliberate PASSTHROUGH, not omp's real translator (#1428):
+// omp's NDJSON is retained verbatim by transcript retention, and decoding it into
+// tool/usage events is a named follow-up. Passing the raw lines through is the
+// honest interim rather than leaving omp with no case at all, because the default
+// branch does not merely degrade one command:
+//
+//   - `job watch --transcript` and `job transcript <id>` would ERROR outright even
+//     though the bytes are on disk, and
+//   - `job transcript --all` would ABORT THE WHOLE BATCH — exportAllJobTranscripts
+//     builds a snapshot translator per job inside its loop and returns the error,
+//     so ONE omp job in the store breaks the export of every other job, mid-stream,
+//     after partial output was already written.
+//
+// omp was the first dispatchable runtime that would have had no case here; every
+// registered runtime must keep one (TestEveryRegisteredRuntimeHasATranslator).
+type ompTranslator struct{}
+
+func (ompTranslator) Translate(line string) []Event { return rawEvent(line) }
+func (ompTranslator) Flush() []Event                { return nil }
 
 type pendingTool struct {
 	name         string
