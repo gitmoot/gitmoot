@@ -677,9 +677,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 		var markErr error
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			markErr = w.handleRunJobError(ctx, job.ID, context.DeadlineExceeded, jobTimeoutEvidence{Deadline: runDeadline, Started: runStartedAt})
+			markErr = w.handleRunJobError(ctx, job.ID, observedJobLifecycle(job), context.DeadlineExceeded, jobTimeoutEvidence{Deadline: runDeadline, Started: runStartedAt})
 		} else {
-			markErr = w.handleRunJobError(ctx, job.ID, err)
+			markErr = w.handleRunJobError(ctx, job.ID, observedJobLifecycle(job), err)
 		}
 		if markErr != nil {
 			return markErr
@@ -1780,9 +1780,9 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		}
 		var markErr error
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			markErr = w.handleRunJobError(ctx, delegatedJob.ID, context.DeadlineExceeded, jobTimeoutEvidence{Deadline: runDeadline, Started: runStartedAt})
+			markErr = w.handleRunJobError(ctx, delegatedJob.ID, observedJobLifecycle(delegatedJob), context.DeadlineExceeded, jobTimeoutEvidence{Deadline: runDeadline, Started: runStartedAt})
 		} else {
-			markErr = w.handleRunJobError(ctx, delegatedJob.ID, err)
+			markErr = w.handleRunJobError(ctx, delegatedJob.ID, observedJobLifecycle(delegatedJob), err)
 		}
 		if markErr != nil {
 			return markErr

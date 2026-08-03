@@ -109,10 +109,28 @@ type jobTimeoutEvidence struct {
 	Started  time.Time
 }
 
-func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, cause error, timeoutEvidence ...jobTimeoutEvidence) error {
+// handleRunJobError settles a failed RUN. observed is the lifecycle of the run that produced
+// cause, so a verdict from a finished run cannot be applied to a newer one.
+//
+// The generation is checked ONCE, before every state fast path, because each of those paths
+// re-reads the row and acts on whatever it finds. Review reproduced the reachable interleaving:
+// RunJob produces an old run's ResultDeliveryFailed BlockedError, an operator retries the
+// terminal job (clearing its result and moving it to queued at a NEWER generation), and the
+// queued fast path then flips that fresh row to blocked -- state=blocked at generation 1 where
+// queued at generation 1 was correct.
+//
+// That is the same ABA this PR exists to close, in a path the first fix did not anchor. Anchoring
+// only the settlement was anchoring one door of a room with several.
+func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, observed jobLifecycle, cause error, timeoutEvidence ...jobTimeoutEvidence) error {
 	latest, err := w.Store.GetJob(ctx, jobID)
 	if err != nil {
 		return err
+	}
+	if latest.LifecycleGeneration != observed.generation {
+		// A NEW run owns this job now. This error describes the previous one, so record it
+		// without steering the live lifecycle -- the same treatment settleBlockedAdvancement
+		// gives a superseded verdict, and for the same reason.
+		return w.recordSupersededSettlement(ctx, jobID, cause.Error())
 	}
 	if latest.Type == "implement" && runtimePermissionFailure(cause) {
 		payload, payloadErr := daemonJobPayload(latest)

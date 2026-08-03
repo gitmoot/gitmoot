@@ -710,3 +710,71 @@ func configureTestGit(t *testing.T, dir string) {
 func resultJSON(decision string) string {
 	return `{"gitmoot_result":{"decision":"` + decision + `","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
 }
+
+// TestRunErrorFromAPreviousRunDoesNotClobberARetriedJob is the regression guard for the ABA hole
+// review found in handleRunJobError -- and it is a PRODUCTION defect, not a test gap.
+//
+// The reachable interleaving: RunJob produces an old run's ResultDeliveryFailed BlockedError; an
+// operator retries the terminal job, clearing its result and moving it to queued at a NEWER
+// generation; handleRunJobError then re-reads that fresh row, sees `queued`, and its queued fast
+// path flips it to blocked. The retried job is left terminal with no result -- exactly the
+// stranding this PR exists to stop, reached through a path the first fix did not anchor.
+//
+// Anchoring only settleBlockedAdvancement was anchoring one door of a room with several. The
+// generation is now checked once, before every state fast path.
+func TestRunErrorFromAPreviousRunDoesNotClobberARetriedJob(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	payload, err := json.Marshal(workflow.JobPayload{Result: &workflow.AgentResult{Decision: "implemented", Summary: "done"}})
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "clobber", Agent: "lead", Type: "implement", State: string(workflow.JobRunning), Payload: string(payload)}, db.JobEvent{
+		JobID: "clobber", Kind: "running", Message: "job started",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+
+	// The run that is about to fail observed THIS lifecycle.
+	before, err := store.GetJob(ctx, "clobber")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	observed := observedJobLifecycle(before)
+
+	// It fails, and while its error is in flight an operator retry completes: the job goes
+	// terminal and is re-queued at a NEW generation with its result cleared.
+	if _, err := store.TransitionJobState(ctx, "clobber", string(workflow.JobRunning), string(workflow.JobFailed)); err != nil {
+		t.Fatalf("TransitionJobState returned error: %v", err)
+	}
+	if _, err := store.TransitionJobState(ctx, "clobber", string(workflow.JobFailed), string(workflow.JobQueued)); err != nil {
+		t.Fatalf("TransitionJobState returned error: %v", err)
+	}
+
+	// PREMISE: the row must genuinely be queued at a MOVED generation, or this fixture is not
+	// the interleaving it names.
+	armed, err := store.GetJob(ctx, "clobber")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if armed.State != string(workflow.JobQueued) {
+		t.Fatalf("fixture state = %q, want queued", armed.State)
+	}
+	if armed.LifecycleGeneration == observed.generation {
+		t.Fatalf("generation did not advance (%d); this fixture does not exercise the stale-run path", armed.LifecycleGeneration)
+	}
+
+	worker := defaultJobWorker(store, io.Discard)
+	deliveryFailed := workflow.BlockedError{Reason: "result delivery failed", ResultDeliveryFailed: true}
+	if err := worker.handleRunJobError(ctx, "clobber", observed, deliveryFailed); err != nil {
+		t.Fatalf("stale run error returned an error instead of standing down: %v", err)
+	}
+
+	after, err := store.GetJob(ctx, "clobber")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if after.State != string(workflow.JobQueued) {
+		t.Fatalf("state = %q, want queued: a PREVIOUS run's failure settled a job that had already been retried", after.State)
+	}
+}

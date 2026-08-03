@@ -183,8 +183,11 @@ func bumpFollowsSQLLiteral(text string, at int) bool {
 // Without the trailing boundary, `bumpLifecycleGenerationSQL[:0]` satisfied the match while
 // contributing an EMPTY string to the SQL -- valid, bump-free, and green. A prefix match is not
 // a use of the fragment. The next character must not continue the identifier or subscript,
-// slice, or call it.
-var bumpConcatenation = regexp.MustCompile("\\A\\s*\\+\\s*bumpLifecycleGenerationSQL($|[^A-Za-z0-9_.\\[(])")
+// slice, or call it -- and the trailing token must be the CONCATENATION OPERATOR, not merely a
+// non-identifier character. A broad negative class still accepted whitespace, so
+// `bumpLifecycleGenerationSQL [:0]` with the preceding comma removed produced valid, bump-free
+// SQL and passed. Requiring `+` next means the fragment must actually be joined into the query.
+var bumpConcatenation = regexp.MustCompile("\\A\\s*\\+\\s*bumpLifecycleGenerationSQL\\s*(\\+|$)")
 
 func sameJobStateCounts(got, want map[string]int) bool {
 	if len(got) != len(want) {
