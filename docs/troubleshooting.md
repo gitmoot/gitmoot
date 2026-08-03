@@ -284,7 +284,12 @@ Fixes:
   `gitmoot agent template diff <custom-id>` and `gitmoot agent template update <custom-id>`
   after editing the file.
 - The thermo template is review-only. Remove `--capability implement` and route
-  implementation work to a separate implementation-capable agent.
+  local review fix passes to a separate implementation-capable agent with
+  `gitmoot agent review thermo-review --repo owner/repo --pr <number> --lead <implementer> "Review this PR."`
+- If local review dispatch says the lead is missing, repo-ineligible, lacks
+  `implement`, or has a non-write policy, correct the named implementer's agents
+  database row or choose another lead. Gitmoot refuses before creating the
+  review job; do not loosen the reviewer's capability or sandbox.
 
 ## Claude Code
 

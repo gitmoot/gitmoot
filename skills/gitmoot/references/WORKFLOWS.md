@@ -157,6 +157,18 @@ gitmoot agent template update thermo-nuclear-code-quality-review
 gitmoot agent start thermo-review --runtime codex --repo owner/repo --template thermo-nuclear-code-quality-review --start-daemon
 ```
 
+For a local dispatch, pair that reviewer with the registered implementer that
+should receive a `changes_requested` fix pass:
+
+```sh
+gitmoot agent review thermo-review --repo owner/repo --pr 12 --lead lead "Review this PR."
+```
+
+Gitmoot refuses the dispatch before creating a review job when the lead is
+missing, cannot access the repo, lacks `implement`, or has a non-write policy.
+Do not grant `implement` to the reviewer merely to satisfy this check; keep the
+reviewer read-only and name the separate implementer with `--lead`.
+
 PR comment:
 
 ```text

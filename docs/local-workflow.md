@@ -37,6 +37,8 @@ gitmoot agent start <name> --runtime codex|claude|kimi --repo owner/repo --path 
 gitmoot agent subscribe <name> --runtime codex|claude|kimi|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
 gitmoot agent run <name> "message" --repo owner/repo [--task task-id] [--pr number] [--background]
 gitmoot agent review <name> "message" --repo owner/repo --pr number [--background] # exact-head loop guard applies
+gitmoot agent run <name> "message" --repo owner/repo [--task task-id] [--pr number] [--lead implementer] [--background]
+gitmoot agent review <name> "message" --repo owner/repo --pr number [--lead implementer] [--background]
 gitmoot agent implement <name> "message" --repo owner/repo [--task task-id] [--background]
 gitmoot agent ask <name> "message" --repo owner/repo
 gitmoot agent ask <name> --background --repo owner/repo "message"
@@ -73,6 +75,14 @@ gitmoot daemon start --repo owner/repo --poll 30s --workers 1
 gitmoot daemon start
 gitmoot daemon status
 ```
+
+`--lead` is valid only for review-resolved `agent review` and `agent run`
+dispatches. Gitmoot loads that lead from the agents database before creating the
+review job and requires repo access, `implement` capability, and a
+write-granting autonomy policy. A `changes_requested` verdict then creates its
+fix job for the lead while the review job remains assigned to the reviewer.
+Without `--lead`, the reviewer is checked as the fallback lead, so a review-only
+agent must be paired explicitly with a separate implementer.
 
 Transcript retention is opt-in through `[transcripts] enabled = true` with a
 default `retain = "168h"` and `max_total_bytes = 2147483648`. It captures
