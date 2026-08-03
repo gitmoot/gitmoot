@@ -590,9 +590,17 @@ func ompUndecodableEventType(line string) (string, bool) {
 // a row could not be decoded, and answering "some other role, skip it" out of a
 // payload that would not decode is exactly the guess the rule refuses — a drifted
 // assistant row that also lost its role must not be able to buy silence with the
-// second defect. This is deliberately stricter than the decodable path, which skips a
-// roleless message_end under rule 2's filter: there the row WAS read and its role
-// really is absent, here nothing about the row is established.
+// second defect.
+//
+// This used to be documented here as deliberately STRICTER than the decodable path,
+// "which skips a roleless message_end under rule 2's filter: there the row WAS read
+// and its role really is absent". That claim is OVERRULED — the g7 delta review at
+// cb34f666 disproved it by probe. A decodable row's absent role is not read either,
+// it is FILLED IN by encoding/json's zero value, and a failed assistant message_end
+// with role:null (or no role member, or no message member) took exactly the silence
+// this function refuses, through the decoder rather than around it. The two paths now
+// agree: a role that is there and is not "assistant" skips, a role that is not there
+// fails (parseOmpStreamJSON's message_end case, ompRolelessMessageEndError).
 func ompUndecodableMessageEndWasRead(line string) bool {
 	var probe ompMessageRoleProbe
 	if err := json.Unmarshal([]byte(line), &probe); err != nil {
@@ -602,6 +610,154 @@ func ompUndecodableMessageEndWasRead(line string) bool {
 		return true
 	}
 	return probe.Message.Role == "assistant"
+}
+
+// ompUnreadableRowError classifies a line whose decode into ompStreamEvent FAILED and
+// returns the error to REPORT, or nil when rule 6 skips the line. It is the whole of
+// rule 6's failing half for lines the decoder rejected, and it splits on one question
+// the decoder already answered: is the line valid JSON at all?
+//
+//   - VALID JSON that failed to decode has FIELDS, so it is classified from them
+//     (ompUndecodableEventType): the type this parser reads, and for message_end the
+//     role that decides whether it would have read the row.
+//   - NOT VALID JSON has no fields to read — the line was cut, interleaved with
+//     another writer, or is not a row at all — so the only reading left is the text
+//     itself (ompMalformedAssistantMessageEnd), and that reading is deliberately
+//     narrow: it fails ONLY on a fragment that still identifies an assistant
+//     message_end.
+//
+// The split is load-bearing, not tidiness, and the reason is PRECEDENCE: where the
+// structure survived, the row's own `type` field is present and authoritative, and a
+// substring scan cannot improve on it — it can only overrule it. A marker matched in
+// raw text says nothing about WHOSE field it is (a value, a key, a nested object),
+// while the row's `type` already answers the only question rule 6 asks: would this
+// parser have read the row. So structure wins wherever structure is left, and the
+// raw-text reading applies only where there is none.
+//
+// The rationale previously stated here was different and is WITHDRAWN: it claimed an
+// unknown-type row "may legitimately CARRY message rows inside it — an auto-compaction
+// handoff re-serializes what it summarized". Checked against omp at 06343fef4: the
+// session-level arms of the AgentSessionEvent union (agent-session-events.ts:12-64,
+// ending at goal_updated) plus the core AgentEvent members the union pulls in via
+// its Exclude arm (packages/agent/src/types.ts) were read. auto_compaction_end's
+// CompactionResult names only string/number scalars — though its `details?: T`
+// (T = unknown) and `preserveData` members are unconstrained, so the claim that
+// carries this branch is the PRECEDENCE rule above, not any payload-shape guarantee.
+// agent_end carries `messages: AgentMessage[]`, and a message is keyed by `role` —
+// the custom kinds add `customType`, none of them a `type` (messages.ts:852-908) —
+// so no verified omp event nests a serialized `{"type":"message_end",...}` row. The
+// fixture pinning this branch is therefore a CONSTRUCTED row, not an observed one,
+// and it pins the precedence rule above rather than a shape omp emits.
+//
+// What the split does NOT buy, stated plainly: on the invalid-JSON side there is no
+// structure to appeal to, so a cut row of ANY type that carries both markers fails
+// the run — including, if such a row ever existed, the cut variant of the nested
+// shape just withdrawn. That asymmetry is the price of a last-resort reading, and it
+// is why identification demands BOTH markers rather than either one (see
+// ompMalformedAssistantMessageEnd).
+func ompUnreadableRowError(line string, decodeErr error) error {
+	if !json.Valid([]byte(line)) {
+		if !ompMalformedAssistantMessageEnd(line) {
+			return nil
+		}
+		return fmt.Errorf(
+			"omp stream carried a MALFORMED assistant message_end (envelope drift): the line is not valid JSON (%w) yet still identifies itself as one, carrying a \"type\" of message_end and a \"role\" of assistant — so an assistant turn's verdict, answer and usage are all unknown and the stream cannot be trusted to report success",
+			decodeErr)
+	}
+	eventType, loadBearing := ompUndecodableEventType(line)
+	if !loadBearing {
+		return nil
+	}
+	return fmt.Errorf(
+		"omp stream carried a %s event this parser could not decode (envelope drift): %w — %s is load-bearing here, so the verdict, answer and usage that row carried are all unknown and the stream cannot be trusted to report success",
+		eventType, decodeErr, eventType)
+}
+
+// ompMalformedAssistantMessageEnd reports whether a line that is NOT valid JSON still
+// identifies itself as the one row whose loss is invisible to every other rule: an
+// ASSISTANT message_end.
+//
+// The g7 delta review at cb34f666 found the gap by probe. A row cut mid-write is not
+// garbage in the sense rule 6 means: when it is the FINAL assistant message_end of an
+// otherwise complete run, the terminal agent_end still arrives (the cut is upstream of
+// it), so rule 4 sees an agent_end, rule 7 sees no open saga, and rule 5 reads the
+// PREVIOUS turn's sentence as the run's answer. Nothing else catches it, which is why
+// the earlier deliberate seam — "a line that is not valid JSON is always skipped" —
+// could not stand.
+//
+// Both markers are required, and both are matched on the raw text, so WHERE the line
+// was cut does not matter: `"type"` must identify message_end and `"role"` must
+// identify assistant. One marker alone is not identification — a truncated agent_end
+// re-serializes the whole transcript and carries assistant roles inside it, a
+// message_end cut before its role could be any role, and a stray log line is neither —
+// and failing on those would turn omp's own stdout warnings into failed jobs.
+//
+// That leaves ONE residual, stated rather than hidden: a line cut before its role
+// reaches the wire is still skipped, so an assistant message_end truncated that early
+// can still take an earlier turn's sentence with it. Closing it would mean failing on
+// every fragment that merely LOOKS like a message_end, and omp writes a message_end
+// for every tool result and every input message of a turn — the cure would fail
+// healthy runs far more often than the disease corrupts them. The line is drawn at
+// identification, not suspicion.
+func ompMalformedAssistantMessageEnd(line string) bool {
+	return ompRawFieldIs(line, "type", "message_end") &&
+		ompRawFieldIs(line, "role", "assistant")
+}
+
+// ompRawFieldIs reports whether the raw text of a line shows `"<field>": "<value>"`
+// anywhere in it. It is a LAST RESORT reading used only on lines encoding/json
+// rejected outright (see ompUnreadableRowError), so it cannot lean on structure: it
+// scans every occurrence of the key, since a cut line may repeat it or carry it
+// nested, and a match anywhere is what "identifiable" means here.
+//
+// A JSON string cannot contain a raw `"` — the encoder escapes it as `\"` — so a
+// value quoted inside some other string's TEXT cannot produce a match: the bytes
+// preceding the key would be `\"` rather than `"`. That is what keeps a tool result
+// whose output happens to quote a message_end from being mistaken for one.
+//
+// Three precision claims are made above and all three are now pinned by fixtures
+// (TestOmpRawFieldIsPrecision) rather than asserted: scan-all — a key occurrence that
+// is not a field does not end the search, because a cut line may carry the key as
+// some other field's value before the real one; colon-required — a key merely
+// ADJACENT to the value is not a field, so a fragment whose colons did not survive
+// stays skipped; and value-at-head — the value must begin right after the colon, so a
+// row that merely NAMES message_end somewhere later (a notice, a diagnostic) is not
+// one. Each was an unpinned claim until the g7 verification at cb34f666 mutated it
+// and nothing failed; the loose readings move lines between "skipped" and "failed
+// job" in both directions, which is why they are pinned at the helper AND at the
+// stream.
+func ompRawFieldIs(line, field, value string) bool {
+	key := `"` + field + `"`
+	want := `"` + value + `"`
+	for rest := line; ; {
+		idx := strings.Index(rest, key)
+		if idx < 0 {
+			return false
+		}
+		rest = rest[idx+len(key):]
+		after := strings.TrimLeft(rest, " \t")
+		if !strings.HasPrefix(after, ":") {
+			continue
+		}
+		if strings.HasPrefix(strings.TrimLeft(after[1:], " \t"), want) {
+			return true
+		}
+	}
+}
+
+// ompRolelessMessageEndError is the verdict on a message_end that DECODED and still
+// cannot be attributed to a role: role null, role absent, or no message member at all.
+//
+// Rule 2 filters on role, and encoding/json fills a missing string with "" — so
+// without this the filter would read a zero value as "some other role" and skip the
+// row. That is the same guess ompUndecodableMessageEndWasRead refuses on the
+// undecodable path, arriving through the decoder instead of around it: a FAILED
+// assistant turn whose role also went missing would vanish from the stream, every
+// other envelope rule would still pass, and the run would report SUCCESS carrying the
+// sentence an EARLIER turn wrote. Fail closed instead — the role is a load-bearing
+// discriminator, and a load-bearing field that is gone is envelope drift.
+func ompRolelessMessageEndError() error {
+	return errors.New("omp stream carried a message_end with no role (envelope drift): message.role is the discriminator that decides whether this parser reads the row at all, and a row without one cannot be shown to be a non-assistant message — a FAILED assistant turn that also lost its role would otherwise be filtered out as \"some other role\" and hand an earlier turn's sentence back as the run's answer")
 }
 
 // ompStreamEvent is the verified subset of one `omp -p --mode=json` stdout line.
@@ -699,7 +855,12 @@ type ompTelemetryUsage struct {
 //     across events — usage is per assistant message, not per run) and keeps the
 //     FINAL assistant message's text from its content parts of type "text" — the
 //     final one, NOT the last non-empty one (rule 5). The role filter is
-//     mandatory: message_end also fires for user and tool-result messages.
+//     mandatory: message_end also fires for user and tool-result messages. It
+//     filters on a role that is THERE: a message_end that decoded but carries NO
+//     role — role null, role absent, or no message object at all — is drift on a
+//     load-bearing type and fails the run under rule 6, because "not assistant" out
+//     of a field Go zero-valued is a guess, not a reading (see
+//     ompRolelessMessageEndError).
 //  3. an assistant stopReason of "error" or "aborted" — omp's own definition of a
 //     retryable failed tail, turn-recovery.ts:84 — marks the turn failed, even
 //     on exit 0, and so does omp's own giving-up verdict (auto_retry_end with
@@ -719,23 +880,34 @@ type ompTelemetryUsage struct {
 //     back to an earlier turn's sentence.
 //  6. FORWARD COMPATIBILITY COVERS THE ROWS THIS PARSER DOES NOT READ, and only
 //     those. A line that is not valid JSON at all is SKIPPED (garbage on the wire
-//     — a stray log line, a half-written tail — is not evidence about the run),
-//     and so is a valid-JSON line whose type this parser never looks at
+//     — a stray log line, a half-written tail — is not evidence about the run)
+//     UNLESS the fragment still IDENTIFIES itself as a row this parser reads: a
+//     `"type"` of message_end together with a `"role"` of assistant, matched at
+//     substring level so the point where the line was cut does not matter (see
+//     ompMalformedAssistantMessageEnd). That row fails the run — nothing else on
+//     the stream covers it, because a mid-stream cut leaves the terminal agent_end
+//     intact and rules 4 and 7 never fire. Skipped too is a valid-JSON line whose
+//     type this parser never looks at
 //     (auto_compaction_*, model_changed, notice, …), whether or not its payload
-//     would decode — as is a message_end this parser would have filtered out anyway,
-//     since role, not just type, decides what rule 2 reads (omp emits message_end for
-//     user/developer/custom messages whose content is a bare string, which cannot
-//     decode here and never could be read here either; see ompUndecodableEventType).
+//     would decode — as is a message_end this parser would have filtered out anyway
+//     ON A ROLE IT COULD READ, since role, not just type, decides what rule 2 reads
+//     (omp emits message_end for user/developer/custom messages whose content is a
+//     bare string, which cannot decode here and never could be read here either; see
+//     ompUndecodableEventType).
 //     But a line whose type IS load-bearing here — session, message_end,
 //     auto_retry_start, auto_retry_end, agent_end, the closed set in
 //     ompLoadBearingEventTypes — and whose payload FAILS to decode is an ERROR
-//     naming that type. The parser was supposed to read that row, so its verdict,
+//     naming that type, and so is a message_end that DECODED while carrying no role
+//     at all (rule 2). The parser was supposed to read that row, so its verdict,
 //     its text and its usage are all unknown, and a stream with an unreadable
 //     load-bearing row cannot be trusted to report SUCCESS. Skipping one is what
 //     makes a failed final message_end whose usage block drifted (a provider that
 //     starts reporting `usage.input` as a string) disappear from the stream and
 //     hands the PREVIOUS turn's sentence back as the run's answer — the same
-//     stale-text false green rule 5 and the TRUNCATION note exist to refuse.
+//     stale-text false green rule 5 and the TRUNCATION note exist to refuse. Each
+//     of the three shapes this rule fails on is a row this parser was GOING to read
+//     and then could not: an undecodable payload, an unattributable role, a line cut
+//     mid-write. None of them is forward compatibility.
 //  7. a retry saga still OPEN at end of stream — an auto_retry_start with no
 //     auto_retry_end after it — is an ERROR. The state machine ended in a
 //     non-terminal retry state, which means the process died mid-retry; "a retry
@@ -870,16 +1042,26 @@ func parseOmpStreamJSON(output string) (string, string, ompUsage, error) {
 		turnFailed    bool
 		retryPending  bool
 		gaveUp        bool
-		// undecodable is the FIRST load-bearing row this parser could not read
-		// (rule 6) — first, not last, because a later drift is usually the same
-		// drift again and the earliest one is where an operator has to look
-		// ("two undecodable rows report the FIRST" pins it). It is a latch of its
-		// own rather than a firstErr/turnFailed pair on purpose: the
-		// content-carrying recovery clause below may clear a failure the stream
-		// REPORTED, but it may not clear the parser's own admission that it could
-		// not read a row — the recovery evidence and the unread row are not even
-		// about the same event.
-		undecodable error
+		// unreadable is the FIRST load-bearing row this parser could not read
+		// (rule 6) in ANY of its three shapes — an undecodable payload, a
+		// message_end with no attributable role, a line cut mid-write that still
+		// identifies an assistant message_end. First, not last, because a later
+		// drift is usually the same drift again and the earliest one is where an
+		// operator has to look.
+		//
+		// Two guards enforce that, one per arm, and each needs its own fixture:
+		// "two undecodable rows report the FIRST" covers only the undecodable arm
+		// (two rows of the SAME shape produce identical text, so they cannot tell
+		// first-wins from last-wins on the OTHER arm at all). The roleless arm's
+		// guard is pinned by "the FIRST unreadable row wins ACROSS shapes", which
+		// mixes a malformed row with a roleless one in both orders — the only
+		// stream shape that can distinguish them.
+		// It is a latch of its own rather than a firstErr/turnFailed pair on
+		// purpose: the content-carrying recovery clause below may clear a failure
+		// the stream REPORTED, but it may not clear the parser's own admission that
+		// it could not read a row — the recovery evidence and the unread row are not
+		// even about the same event.
+		unreadable error
 	)
 	for rest := output; rest != ""; {
 		var line string
@@ -893,18 +1075,12 @@ func parseOmpStreamJSON(output string) (string, string, ompUsage, error) {
 		}
 		var event ompStreamEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			// Rule 6, the narrow half: a row this parser READS that it cannot decode
-			// is a failure, not forward compatibility. Everything else — garbage, any
-			// unknown type, and a message_end whose role puts it outside rule 2's
-			// filter — is still skipped.
-			eventType, loadBearing := ompUndecodableEventType(line)
-			if !loadBearing {
-				continue
-			}
-			if undecodable == nil {
-				undecodable = fmt.Errorf(
-					"omp stream carried a %s event this parser could not decode (envelope drift): %w — %s is load-bearing here, so the verdict, answer and usage that row carried are all unknown and the stream cannot be trusted to report success",
-					eventType, err, eventType)
+			// Rule 6, the narrow half: a row this parser READS that it cannot read is
+			// a failure, not forward compatibility. Everything else — unidentifiable
+			// garbage, any unknown type, and a message_end whose role puts it outside
+			// rule 2's filter — is still skipped (ompUnreadableRowError).
+			if rowErr := ompUnreadableRowError(line, err); rowErr != nil && unreadable == nil {
+				unreadable = rowErr
 			}
 			// Keep scanning rather than bailing: the run is already lost, but the
 			// session id and the usage the decodable messages prove were billed are
@@ -929,7 +1105,19 @@ func parseOmpStreamJSON(output string) (string, string, ompUsage, error) {
 			}
 		case "message_end":
 			message := event.Message
-			if message == nil || message.Role != "assistant" {
+			// The role has to be READ before it can filter. A message_end that
+			// decoded while carrying no role — role null, role absent, or no message
+			// member at all — is drift on a load-bearing type, and treating the zero
+			// value encoding/json left behind as "some other role" is what lets a
+			// FAILED assistant turn disappear and an earlier turn's sentence stand as
+			// the run's answer (see ompRolelessMessageEndError).
+			if message == nil || message.Role == "" {
+				if unreadable == nil {
+					unreadable = ompRolelessMessageEndError()
+				}
+				continue
+			}
+			if message.Role != "assistant" {
 				continue
 			}
 			if message.Usage != nil {
@@ -1023,8 +1211,8 @@ func parseOmpStreamJSON(output string) (string, string, ompUsage, error) {
 	// newer and more actionable fact (envelope drift an operator must fix) and the one
 	// that makes the other verdicts provisional — the unread row may itself have been
 	// the failure, the answer, or the terminal settle.
-	if undecodable != nil {
-		return "", sessionID, usage, undecodable
+	if unreadable != nil {
+		return "", sessionID, usage, unreadable
 	}
 	if turnFailed {
 		return "", sessionID, usage, firstErr
@@ -1065,15 +1253,38 @@ func parseOmpStreamJSON(output string) (string, string, ompUsage, error) {
 // error/aborted have already failed the run by the time this is asked, so the two
 // truncating values are the whole remainder that is not "stop":
 //
-//   - "toolUse" — the agent loop was still calling tools. A run that finishes
-//     answers with "stop"; omp only leaves a toolUse tail behind when it stops
-//     scheduling tools, which is what its deadline check does (agent-loop.ts:
-//     1283-1286 clears hasMoreToolCalls when the deadline has passed) before
-//     settling terminally. This is the shape --max-time produces.
-//   - "length" — the provider hit its output cap mid-message. omp continues only
-//     when the truncated message left runnable tool calls AND the deadline has not
-//     passed (agent-loop.ts:1352-1354); otherwise the loop ends here and whatever
-//     text the message carries is half a sentence, not a verdict.
+//   - "toolUse" — the agent loop was still calling tools. This is the shape
+//     --max-time produces: agent-loop.ts:1281-1286 computes hasMoreToolCalls =
+//     runnableStop && toolCalls.length > 0 and then clears it once the deadline has
+//     passed, so the loop exits on a toolUse tail and settles terminally.
+//   - "length" — the provider hit its output cap mid-message. omp never continues
+//     past it: continuation is gated on runnableStop, which agent-loop.ts:1280
+//     computes as stopReason "toolUse" or "stop" — "length" is neither, so
+//     hasMoreToolCalls is false (:1281), the loop ends here, and whatever text the
+//     message carries is half a sentence, not a verdict.
+//
+// The "toolUse" arm is deliberately WIDER than omp's own reading, and this is the
+// one place this parser knowingly overrules the runtime rather than following it.
+// omp settles a toolUse stop as COMPLETE — no retry, no recovery — as soon as the
+// message carries a toolCall block OR any non-whitespace text: turn-recovery.ts's
+// #isEmptyAssistantStop (:554), case "toolUse", returns false in exactly those
+// cases, and the unexpected-stop classifier never sees the row either (it returns
+// false unless stopReason === "stop", unexpected-stop-classifier.ts:35-36 — a
+// toolUse tail is outside its whole domain). The shape is reachable, not
+// theoretical: the Cursor exec channel stamps kCursorExecResolved on the toolCall
+// blocks it already executed and agent-loop.ts:1276-1279 filters those out of
+// `toolCalls`, so hasMoreToolCalls goes false while the message still carries text
+// and the run ends with a terminal agent_end. A final toolUse message with real
+// text is therefore a run omp itself considers finished, and this parser fails it.
+//
+// That is a ruled tradeoff, not an oversight (#1428 delta review). A false RED
+// costs one retry of a job; a false GREEN costs a wrong merge verdict — and the two
+// cannot be told apart from the wire, because "Let me read the file first." and a
+// finished review's verdict are the same bytes to this parser: narration and an
+// answer are indistinguishable once the stopReason says the loop was still calling
+// tools. Nothing is destroyed by the choice: Deliver returns the whole stream as the
+// job's Raw output on every failure path, so the discarded text survives as evidence
+// and an operator can read it by hand.
 //
 // An EMPTY stopReason is deliberately NOT truncation. The field is required on
 // omp's AssistantMessage, so an empty one means envelope drift, and drift must not

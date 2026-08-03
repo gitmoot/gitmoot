@@ -127,8 +127,22 @@ returning an empty success:
   run — an empty review must never read as "nothing to flag" — and so does a
   final `stopReason` of `toolUse` or `length` (see
   [Truncation](#truncation-is-not-an-answer));
-- unknown event types and unparseable lines are skipped, so new omp event kinds
-  stay forward-compatible.
+- forward compatibility covers the rows the parser does **not** read, and only
+  those. Unknown event types stay skipped whether or not their payload decodes,
+  so new omp event kinds keep working, and so does a `message_end` whose role
+  puts it outside the assistant filter (omp emits one for every user, developer
+  and custom message of a turn, and their content is legally a bare string). But
+  a row the parser was going to read and then could not fails the run, naming the
+  shape: a load-bearing event (`session`, `message_end`, `auto_retry_start`,
+  `auto_retry_end`, `agent_end`) whose payload does not decode; a `message_end`
+  that decodes carrying **no role at all** (role is the discriminator that
+  decides whether the parser reads the row, so a zero-valued one is a guess, not
+  a reading); and a syntactically malformed line that still identifies itself as
+  an assistant `message_end` (a `"type"` of `message_end` **and** a `"role"` of
+  `assistant`). Each of those shapes would otherwise delete a failed final turn
+  from the stream and hand an *earlier* turn's sentence back as the run's answer.
+  Garbage that identifies nothing — a stray log line, a half-written tail
+  carrying only one of those two markers — is still skipped.
 
 Stdout is preserved as the job's raw output on every failure path, and the
 summary is the final assistant text, never the NDJSON envelope.
@@ -152,10 +166,19 @@ happened to carry text. A truncated run fails, and the error says `TRUNCATED`:
   `length` (the provider cut the message mid-sentence), even when that message
   carries text.
 
+The `toolUse` rule is deliberately **wider than omp's own reading**, and it is the
+one place the adapter overrules the runtime: omp settles a `toolUse` stop as
+complete as soon as the message carries a tool call *or* any non-whitespace text,
+so a final `toolUse` message with real text is a run omp considers finished and
+Gitmoot fails anyway. The tradeoff is chosen, not overlooked — a false red costs
+one retry of a job, a false green costs a wrong merge verdict, and the two cannot
+be told apart on the wire, because a work note ("Let me read the file first.") and
+a finished review's verdict are the same bytes to the parser.
+
 The rule this replaces would have answered such a job with whatever the run said
-*before* the cut — a work note like "Let me read the file first." reported as a
-review's verdict. A partial answer is a failure with the evidence preserved in
-raw output, never a success.
+*before* the cut — that work note reported as a review's verdict. A partial answer
+is a failure, never a success, and nothing is thrown away by that: the whole
+stream, including the text the rule discarded, is kept as the job's raw output.
 
 ### Retries and terminal state
 

@@ -143,8 +143,20 @@ diff. Two more properties an adapter author has to keep in mind here:
   a **final** assistant message that actually answered — not merely some earlier
   message that carried text. A run cut off by `--max-time` or by the provider's
   output cap ends with a complete envelope and no answer, and fails as truncated.
+  The `toolUse` half of that rule is deliberately wider than omp's own reading —
+  omp settles a text-carrying `toolUse` stop as complete, and Gitmoot still fails
+  it, because narration and an answer are the same bytes on the wire and a needless
+  retry is cheaper than a wrong merge verdict. The discarded text is preserved in
+  the job's raw output.
 - **Usage is per assistant message**, spelled `input`/`output` (not
   `input_tokens`/`output_tokens`), and is summed across the run.
+- **Skipping a row you were going to read is a false green.** Unknown event types
+  stay skipped for forward compatibility, but a row the parser reads and then
+  cannot read fails the run instead: a load-bearing event whose payload does not
+  decode, a `message_end` that decodes with no role at all, and a malformed line
+  that still identifies itself as an assistant `message_end`. Each of those would
+  otherwise delete a failed final turn from the stream and report an *earlier*
+  turn's sentence as the job's answer.
 
 omp advertises `review`, `implement`, and `ask` — not `produce`, whose Landlock
 wrapper interaction with omp's Bun binary is unprobed. The behavioral contract

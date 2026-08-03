@@ -286,6 +286,40 @@ func ompUnreadableRoleMessageEnd() string {
 	return `{"type":"message_end","message":"the whole payload drifted to a string"}` + "\n"
 }
 
+// ompDecodableFailedMessageEndWithoutRole is the bypass the g7 delta review probed at
+// cb34f666, and it is NOT an undecodable row: content is a real part array, usage is
+// numeric, stopReason is "error" — the whole payload decodes cleanly — but the role is
+// null or missing, so Go zero-values ompStreamMessage.Role to "". roleField is the
+// literal role member to splice in (`"role":null,`, or "" for a row that omits it).
+//
+// A row like this never reaches the undecodable classifier at all, and rule 2's
+// `Role != "assistant"` filter reads the zero value as "some other role": a FAILED
+// assistant turn shaped this way is skipped, every other envelope rule still passes,
+// and the run reports SUCCESS carrying whatever an EARLIER turn happened to say.
+func ompDecodableFailedMessageEndWithoutRole(roleField string) string {
+	return fmt.Sprintf(`{"type":"message_end","message":{%s"content":[],"usage":{"input":9,"output":0,"totalTokens":9},`+
+		`"stopReason":"error","errorMessage":"overloaded_error","errorStatus":529}}`, roleField) + "\n"
+}
+
+// ompDecodableMessageEndWithoutMessage is the third shape of that same bypass: a
+// message_end whose `message` member is gone entirely. It decodes (unknown fields are
+// ignored and a missing pointer is nil), so it too skips the undecodable classifier
+// while carrying no discriminator at all.
+func ompDecodableMessageEndWithoutMessage() string {
+	return `{"type":"message_end","timestamp":1785737730821}` + "\n"
+}
+
+// ompMalformedAssistantMessageEndLine is a SYNTACTICALLY malformed message_end: the
+// line was cut mid-write (an interleaved writer, a partial flush, a crash between
+// chunks) so it is not valid JSON at all — yet the surviving prefix still IDENTIFIES
+// the row, carrying a `"type"` of message_end and a `"role"` of assistant. When it is
+// the FINAL assistant message of a run whose terminal agent_end still arrives, the
+// missing-agent_end rules never fire and skipping it hands the previous turn's
+// sentence back as the run's answer.
+func ompMalformedAssistantMessageEndLine() string {
+	return `{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"the answer wa` + "\n"
+}
+
 // ompUndecodableRows is one valid-JSON, undecodable line per LOAD-BEARING event
 // type, each a plausible drift of a field this parser really reads: a numeric
 // session id, a stringified per-message usage count, a structured finalError, a
@@ -1932,24 +1966,148 @@ func TestParseOmpStreamJSONUndecodableKnownEventFailsRun(t *testing.T) {
 		if usage.InputTokens != 2 || usage.OutputTokens != 1 {
 			t.Fatalf("usage = %d/%d, want 2/1", usage.InputTokens, usage.OutputTokens)
 		}
+
+		// The substring identification below is a LAST RESORT for lines that are not
+		// valid JSON, and it must stay one. The rule under test is PRECEDENCE: this row
+		// kept its structure, so its own `type` field answers the only question rule 6
+		// asks — would this parser have read the row — and a marker matched in raw text
+		// must not be allowed to overrule that answer.
+		//
+		// The fixture is CONSTRUCTED, and this comment says so rather than implying
+		// otherwise: no verified omp event nests a serialized `{"type":"message_end",...}`
+		// row (checked at 06343fef4 — CompactionResult's named members are scalars,
+		// though its `details`/`preserveData` are unconstrained; agent_end carries
+		// AgentMessage[] whose members have a role but no per-message `type`). An
+		// earlier version of this comment justified the split by an auto-compaction
+		// handoff "re-serializing what it summarized"; that shape was not found, and
+		// the split stands on precedence, not on any payload-shape guarantee.
+		//
+		// Kills: running the marker scan on every line instead of only on the ones
+		// that are not valid JSON.
+		t.Run("an unknown type carrying a nested assistant message_end is still skipped", func(t *testing.T) {
+			row := `{"type":"auto_compaction_end","isTerminal":"soon","summarized":[` +
+				`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"stale"}]}}]}`
+			// PREMISE: valid JSON (so the field-level classifier is the one that
+			// applies) whose payload still fails to decode (so it reaches rule 6 at
+			// all). A fixture that lost either property stops exercising the boundary.
+			if !json.Valid([]byte(row)) {
+				t.Fatalf("fixture is not valid JSON, so it no longer probes the valid-JSON side of the boundary: %s", row)
+			}
+			var event ompStreamEvent
+			if err := json.Unmarshal([]byte(row), &event); err == nil {
+				t.Fatalf("fixture decodes cleanly and so no longer reaches rule 6: %s", row)
+			}
+			stdout := ompHeaderLine(ompFixtureSessionID) + row + "\n" +
+				ompAssistantEnd("done", 2, 1) + ompAgentEnd()
+			text, _, _, err := parseOmpStreamJSON(stdout)
+			if err != nil {
+				t.Fatalf("parseOmpStreamJSON: %v (an unknown type is classified from its own `type` field, not from message rows nested inside it)", err)
+			}
+			if text != "done" {
+				t.Fatalf("text = %q, want %q", text, "done")
+			}
+		})
 	})
 
-	// Garbage tolerance is unchanged, deliberately, even for a line that LOOKS like
-	// a known type: a row that is not valid JSON has no reliable type to read, and
-	// half-written tails and stray log lines are the shapes that produce it. The
-	// classification is made from the line's own contents, not from a substring.
-	t.Run("a line that is not valid JSON at all is still skipped", func(t *testing.T) {
-		stdout := ompHeaderLine(ompFixtureSessionID) +
-			`{"type":"message_end","message":{"role":"assistant","content":[` + "\n" +
-			"omp: warning printed onto stdout\n" +
-			ompAssistantEnd("done", 2, 1) + ompAgentEnd()
-		text, _, _, err := parseOmpStreamJSON(stdout)
-		if err != nil {
-			t.Fatalf("parseOmpStreamJSON: %v (a line that is not valid JSON stays skipped under rule 6)", err)
-		}
-		if text != "done" {
-			t.Fatalf("text = %q, want %q", text, "done")
-		}
+	// Garbage tolerance, and the ONE exception the g7 delta review at cb34f666
+	// carved out of it.
+	//
+	// THIS OVERRULES the seam this subtest used to pin ("a line that is not valid
+	// JSON at all is still skipped", explicitly including a TRUNCATED message_end
+	// line). That was a design guess — a malformed row has no reliable type to read,
+	// and the missing-agent_end rules were expected to cover whatever it cost — and a
+	// probe beat it: a row cut MID-STREAM leaves the terminal agent_end intact, so
+	// rule 4 never fires, and no other rule sees the row at all. A malformed FINAL
+	// assistant message_end therefore just disappears and the run reports SUCCESS
+	// carrying the sentence an EARLIER turn wrote. Review evidence outranks the guess,
+	// so the seam is now closed for exactly the rows the fragment still IDENTIFIES: a
+	// `"type"` of message_end AND a `"role"` of assistant, matched at substring level
+	// so the point where the line was cut does not matter.
+	//
+	// Everything else still skips. A stray log line or a half-written tail carrying
+	// only ONE of those markers really is not evidence about the run, and failing on
+	// it would turn omp's own warnings on stdout into failed jobs.
+	t.Run("a line that is not valid JSON at all", func(t *testing.T) {
+		// Kills: dropping the marker scan (this stream reports the stale sentence as
+		// the run's answer again).
+		t.Run("a malformed assistant message_end FAILS", func(t *testing.T) {
+			row := ompMalformedAssistantMessageEndLine()
+			// PREMISE: the row really is syntactically malformed. A fixture that
+			// became valid JSON would be exercising the decodable path instead.
+			if json.Valid([]byte(strings.TrimSpace(row))) {
+				t.Fatalf("fixture is valid JSON, so it no longer probes the malformed path: %s", row)
+			}
+			stdout := ompHeaderLine(ompFixtureSessionID) +
+				ompAssistantEnd("Let me read the file first.", 12, 3) + row + ompAgentEnd()
+			text, sessionID, usage, err := parseOmpStreamJSON(stdout)
+			if err == nil {
+				t.Fatalf("parseOmpStreamJSON accepted a malformed assistant message_end (text=%q): the terminal agent_end is intact, so nothing else on this stream catches it", text)
+			}
+			if !strings.Contains(err.Error(), "message_end") {
+				t.Fatalf("error %q must NAME the shape (a malformed assistant message_end)", err.Error())
+			}
+			if !strings.Contains(strings.ToLower(err.Error()), "malformed") {
+				t.Fatalf("error %q must say the row was MALFORMED, not merely undecodable: the operator has to look for a cut line, not a drifted field", err.Error())
+			}
+			if text != "" {
+				t.Fatalf("text = %q, want none: that sentence was written BEFORE the row that was cut", text)
+			}
+			if sessionID != ompFixtureSessionID {
+				t.Fatalf("sessionID = %q, want the header id %q to survive the failure", sessionID, ompFixtureSessionID)
+			}
+			if usage.InputTokens != 12 || usage.OutputTokens != 3 {
+				t.Fatalf("usage = %d/%d, want 12/3: a failed run is still billed", usage.InputTokens, usage.OutputTokens)
+			}
+		})
+
+		// Kills: failing on ANY line that is not valid JSON. Each fragment below is
+		// missing one of the two markers, and every one of them is a shape omp's real
+		// stdout produces — a warning printed onto the stream, and a large line cut at
+		// a point that leaves only part of its identity behind.
+		t.Run("unidentifiable garbage is still skipped", func(t *testing.T) {
+			fragments := map[string]string{
+				"a stray log line":                            "omp: warning printed onto stdout",
+				"a message_end cut before the role":           `{"type":"message_end","message":{"role":"toolRes`,
+				"an assistant fragment with no type marker":   `"role":"assistant","content":[{"type":"text","text":"half a li`,
+				"an agent_end transcript cut mid-message":     `{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","content":[{"type":"text","text":"do`,
+				"a message_end cut before the role is quoted": `{"type":"message_end","message":{"role`,
+			}
+			var everyFragment string
+			for name, fragment := range fragments {
+				everyFragment += fragment + "\n"
+				t.Run(name, func(t *testing.T) {
+					// PREMISE: really not valid JSON, or this is not garbage
+					// tolerance being tested.
+					if json.Valid([]byte(fragment)) {
+						t.Fatalf("fixture is valid JSON, so it no longer probes garbage tolerance: %s", fragment)
+					}
+					stdout := ompHeaderLine(ompFixtureSessionID) + fragment + "\n" +
+						ompAssistantEnd("done", 2, 1) + ompAgentEnd()
+					text, _, usage, err := parseOmpStreamJSON(stdout)
+					if err != nil {
+						t.Fatalf("parseOmpStreamJSON: %v (a fragment carrying only one of the two markers is not evidence about the run and stays skipped under rule 6)", err)
+					}
+					if text != "done" {
+						t.Fatalf("text = %q, want %q: the assistant DID answer", text, "done")
+					}
+					if usage.InputTokens != 2 || usage.OutputTokens != 1 {
+						t.Fatalf("usage = %d/%d, want 2/1", usage.InputTokens, usage.OutputTokens)
+					}
+				})
+			}
+			// A messy stream carries several at once, so they have to pass together.
+			t.Run("all of them in one stream", func(t *testing.T) {
+				stdout := ompHeaderLine(ompFixtureSessionID) + everyFragment +
+					ompAssistantEnd("done", 2, 1) + ompAgentEnd()
+				text, _, _, err := parseOmpStreamJSON(stdout)
+				if err != nil {
+					t.Fatalf("parseOmpStreamJSON: %v (a stream's worth of unidentifiable garbage must not fail the run)", err)
+				}
+				if text != "done" {
+					t.Fatalf("text = %q, want %q", text, "done")
+				}
+			})
+		})
 	})
 
 	// The symptom the review actually reported, at the boundary that ships it: the
@@ -1972,6 +2130,301 @@ func TestParseOmpStreamJSONUndecodableKnownEventFailsRun(t *testing.T) {
 			t.Fatalf("usage = %d/%d, want 12/3: a failed run is still billed", result.InputTokens, result.OutputTokens)
 		}
 	})
+}
+
+// TestParseOmpStreamJSONMessageEndWithoutRoleFailsRun closes the bypass the g7 delta
+// review probed at cb34f666, on the DECODABLE side of rule 6. A message_end whose role
+// is null, absent, or whose whole `message` member is gone DECODES — encoding/json
+// zero-values Role to "" — so it never reaches the undecodable classifier at all, and
+// rule 2's `Role != "assistant"` filter reads that zero value as "some other role" and
+// skips the row. A FAILED assistant turn shaped that way vanishes from the stream while
+// every other envelope rule still passes, and the run reports SUCCESS carrying the
+// sentence an EARLIER turn wrote: the same stale-text false green rule 5 and the
+// undecodable rule refuse, arriving through a zero value instead of a decode error.
+//
+// This OVERRULES the claim the earlier comment on ompUndecodableMessageEndWasRead made
+// for this path — "there the row WAS read and its role really is absent". A probe beat
+// that guess: nothing about the role was READ, it was FILLED IN, and an absent role is
+// absent evidence on either path. Both now fail closed.
+//
+// The premise is BOUND, not assumed: every fixture is asserted to decode cleanly, to be
+// a message_end, and to leave an empty Role — so a fixture that drifted into the
+// undecodable path would fail here instead of quietly re-testing the rule next door
+// (which passes already, and would hide the loss of this one).
+//
+// Kills: restoring the `message == nil || message.Role != "assistant"` skip.
+func TestParseOmpStreamJSONMessageEndWithoutRoleFailsRun(t *testing.T) {
+	rows := map[string]string{
+		"role is null":          ompDecodableFailedMessageEndWithoutRole(`"role":null,`),
+		"role field absent":     ompDecodableFailedMessageEndWithoutRole(""),
+		"message member absent": ompDecodableMessageEndWithoutMessage(),
+	}
+	for name, row := range rows {
+		t.Run(name, func(t *testing.T) {
+			var event ompStreamEvent
+			if err := json.Unmarshal([]byte(strings.TrimSpace(row)), &event); err != nil {
+				t.Fatalf("fixture does not decode (%v), so it exercises the undecodable classifier instead of the zero-value role this test is about: %s", err, row)
+			}
+			if event.Type != "message_end" {
+				t.Fatalf("fixture type = %q, want message_end: %s", event.Type, row)
+			}
+			if event.Message != nil && event.Message.Role != "" {
+				t.Fatalf("fixture role = %q, want the zero value: the bypass under test is a role Go FILLED IN, not one the row carried", event.Message.Role)
+			}
+			stdout := ompHeaderLine(ompFixtureSessionID) +
+				ompAssistantEnd("Let me read the file first.", 12, 3) + row + ompAgentEnd()
+			text, sessionID, usage, err := parseOmpStreamJSON(stdout)
+			if err == nil {
+				t.Fatalf("parseOmpStreamJSON accepted a message_end with no role (text=%q): a failed assistant turn shaped this way resurrects the earlier turn's work note as the run's answer", text)
+			}
+			if !strings.Contains(err.Error(), "message_end") {
+				t.Fatalf("error %q must NAME the shape (a message_end with no role): it is the operator's only lead on which row drifted", err.Error())
+			}
+			if !strings.Contains(err.Error(), "role") {
+				t.Fatalf("error %q must say the ROLE is what is missing, not merely that some row failed", err.Error())
+			}
+			if text != "" {
+				t.Fatalf("text = %q, want none: that sentence was written BEFORE the row this parser could not attribute", text)
+			}
+			if sessionID != ompFixtureSessionID {
+				t.Fatalf("sessionID = %q, want the header id %q to survive the failure", sessionID, ompFixtureSessionID)
+			}
+			if usage.InputTokens != 12 || usage.OutputTokens != 3 {
+				t.Fatalf("usage = %d/%d, want 12/3: the tokens the attributable messages proved were billed", usage.InputTokens, usage.OutputTokens)
+			}
+		})
+	}
+
+	// The symptom at the boundary that ships it: the stale sentence must never reach
+	// a job's Summary, and a failed run is still billed.
+	t.Run("Deliver never answers with the pre-failure sentence", func(t *testing.T) {
+		stdout := ompHeaderLine(ompFixtureSessionID) +
+			ompAssistantEnd("Let me read the file first.", 12, 3) +
+			ompDecodableFailedMessageEndWithoutRole(`"role":null,`) + ompAgentEnd()
+		runner := &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}}
+		result, err := (OmpAdapter{Runner: runner, Dir: "/repo"}).
+			Deliver(context.Background(), ompTestAgent(), Job{Prompt: "review this"})
+		if err == nil {
+			t.Fatalf("Deliver succeeded on a stream whose failed assistant message_end lost its role: %+v", result)
+		}
+		if result.Summary != "" {
+			t.Fatalf("Summary = %q, want none: that sentence predates the row this parser could not attribute", result.Summary)
+		}
+		if result.Raw != stdout {
+			t.Fatalf("Raw = %q, want the whole stream as evidence for the envelope drift", result.Raw)
+		}
+		if result.InputTokens != 12 || result.OutputTokens != 3 {
+			t.Fatalf("usage = %d/%d, want 12/3: a failed run is still billed", result.InputTokens, result.OutputTokens)
+		}
+	})
+
+	// First-wins ACROSS shapes, which is the ONLY way to pin the roleless arm's own
+	// latch guard. Two roleless rows produce the same sentence, so a stream carrying
+	// two of them cannot tell "keep the first" from "overwrite with the last" — the
+	// same-shape subtest next door ("two undecodable rows report the FIRST") covers
+	// the undecodable arm and nothing else. A stream that MIXES shapes can, and it has
+	// to hold in BOTH orders: each order exercises a different one of the two guards.
+	//
+	// This is diagnostic ordering, not a verdict — either error fails the run — but the
+	// first drift is where the envelope actually moved and a later one is usually its
+	// wake, so reporting the wrong one sends an operator to the wrong row.
+	//
+	// Kills: dropping `if unreadable == nil` on the roleless path (last-wins), and
+	// dropping it on the undecodable path.
+	t.Run("the FIRST unreadable row wins ACROSS shapes", func(t *testing.T) {
+		malformed := ompMalformedAssistantMessageEndLine()
+		roleless := ompDecodableFailedMessageEndWithoutRole(`"role":null,`)
+		// PREMISE: the two fixtures really do take the two DIFFERENT arms. If either
+		// drifted to the other arm this would silently become a same-shape stream,
+		// which is exactly the stream that cannot distinguish the mutant.
+		if json.Valid([]byte(strings.TrimSpace(malformed))) {
+			t.Fatalf("malformed fixture is valid JSON, so both rows now take the same arm: %s", malformed)
+		}
+		var event ompStreamEvent
+		if err := json.Unmarshal([]byte(strings.TrimSpace(roleless)), &event); err != nil {
+			t.Fatalf("roleless fixture does not decode (%v), so both rows now take the same arm: %s", err, roleless)
+		}
+		orders := []struct {
+			name    string
+			first   string
+			second  string
+			wants   string
+			refuses string
+		}{
+			{name: "malformed first", first: malformed, second: roleless, wants: "MALFORMED", refuses: "no role"},
+			{name: "roleless first", first: roleless, second: malformed, wants: "no role", refuses: "MALFORMED"},
+		}
+		for _, order := range orders {
+			t.Run(order.name, func(t *testing.T) {
+				stdout := ompHeaderLine(ompFixtureSessionID) +
+					ompAssistantEnd("Let me read the file first.", 12, 3) +
+					order.first + order.second + ompAgentEnd()
+				text, _, _, err := parseOmpStreamJSON(stdout)
+				if err == nil {
+					t.Fatalf("parseOmpStreamJSON accepted a stream carrying two unreadable rows (text=%q)", text)
+				}
+				if !strings.Contains(err.Error(), order.wants) {
+					t.Fatalf("error %q must report the FIRST unreadable row (the %s one)", err.Error(), order.name)
+				}
+				if strings.Contains(err.Error(), order.refuses) {
+					t.Fatalf("error %q reports the SECOND unreadable row: the first is where the envelope moved", err.Error())
+				}
+			})
+		}
+	})
+
+	// A message_end whose role is THERE and is not assistant stays skipped: this rule
+	// closes a bypass, it does not widen rule 2's filter into "every message_end is
+	// load-bearing". omp emits one for every tool result and every input message of a
+	// turn, so failing those would fail every healthy run.
+	//
+	// Kills: failing on any message_end that is not an assistant message.
+	t.Run("a message_end whose role is present and not assistant is still skipped", func(t *testing.T) {
+		stdout := ompHeaderLine(ompFixtureSessionID) +
+			ompToolResultEnd() +
+			ompAssistantEnd("done", 2, 1) +
+			ompAbortedToolResultEnd("aborted", "Deadline exceeded") +
+			ompAgentEnd()
+		text, _, usage, err := parseOmpStreamJSON(stdout)
+		if err != nil {
+			t.Fatalf("parseOmpStreamJSON: %v (a message_end with a readable non-assistant role is a row rule 2 drops unread)", err)
+		}
+		if text != "done" {
+			t.Fatalf("text = %q, want %q", text, "done")
+		}
+		if usage.InputTokens != 2 || usage.OutputTokens != 1 {
+			t.Fatalf("usage = %d/%d, want 2/1: the tool-result rows' absurd counts must stay out of the bill", usage.InputTokens, usage.OutputTokens)
+		}
+	})
+}
+
+// TestOmpRawFieldIsPrecision pins the three precision guarantees ompRawFieldIs's doc
+// claims — every occurrence of the key is scanned, the key must be followed by a
+// colon, and the value must follow that colon immediately. None of the three had a
+// detector before this test: the g7 verification at cb34f666 mutated each separately
+// and all three survived the whole suite. That matters because ompRawFieldIs is the
+// SOLE gate deciding whether a corrupt line fails a job — each loose reading is a
+// silent move of the line between "skipped fragment" and "failed run".
+//
+// They survived because realistic omp fragments always put `"type"` and `"role"`
+// first inside their own object, so no fixture built from real shapes separates the
+// loose readings from the tight one. The fragments below are deliberately awkward
+// bytes: that is this function's entire input domain — it runs only on lines
+// encoding/json has already rejected, i.e. on cut, glued and interleaved text where
+// no ordering is guaranteed.
+//
+// Each subtest asserts the helper's verdict AND the consequence on a whole stream,
+// since a guarantee that does not change a run's outcome is not worth claiming.
+func TestOmpRawFieldIsPrecision(t *testing.T) {
+	// Kills: matching the value ANYWHERE after the colon (Contains) rather than at
+	// its head.
+	t.Run("the value must follow the colon immediately", func(t *testing.T) {
+		// A row ABOUT a message_end is not a message_end. Its own `"type"` says
+		// what it is, and the marker text appears later as another field's VALUE —
+		// so a reading that accepts the value anywhere after the colon fails this
+		// healthy run over a diagnostic line.
+		fragment := `{"type":"notice","droppedEvent":"message_end","role":"assistant","detail":"the writer lost a chun`
+		ompAssertFragmentIsRaw(t, fragment)
+		if ompRawFieldIs(fragment, "type", "message_end") {
+			t.Fatalf("ompRawFieldIs matched a value that is not this key's value: this row's type is notice, and message_end is some other field's content")
+		}
+		// The OTHER marker really is present, so the type marker is the only thing
+		// keeping this line skipped — without that assertion the subtest could pass
+		// for the wrong reason.
+		if !ompRawFieldIs(fragment, "role", "assistant") {
+			t.Fatalf("fixture no longer carries the role marker, so the type marker is no longer the only thing under test: %s", fragment)
+		}
+		if ompMalformedAssistantMessageEnd(fragment) {
+			t.Fatalf("a notice row that merely NAMES message_end must not identify as one")
+		}
+		ompAssertFragmentSkipped(t, fragment)
+	})
+
+	// Kills: stopping at the first occurrence of the key that is not followed by a
+	// colon (`return false` instead of `continue`).
+	t.Run("every occurrence of the key is scanned", func(t *testing.T) {
+		// The row's own `"role":"assistant"` is preceded by the WORD role appearing
+		// as a tool argument's value. A scan that gives up at the first occurrence
+		// never reaches the real field, the cut assistant message_end goes
+		// unidentified, and the stale-sentence bypass reopens.
+		fragment := `{"type":"message_end","message":{"content":[{"type":"toolCall","toolName":"edit",` +
+			`"args":{"field":"role"}}],"role":"assistant","stopReason":"err`
+		ompAssertFragmentIsRaw(t, fragment)
+		if !ompRawFieldIs(fragment, "role", "assistant") {
+			t.Fatalf("ompRawFieldIs stopped at an occurrence of the key that is not a field: a cut line may carry the key as a value or nested, and the real field comes later")
+		}
+		if !ompMalformedAssistantMessageEnd(fragment) {
+			t.Fatalf("fragment carries both markers and must identify as a malformed assistant message_end")
+		}
+		ompAssertFragmentFailsRun(t, fragment)
+	})
+
+	// Kills: dropping the colon requirement (a key adjacent to the value matches).
+	t.Run("the key must be followed by a colon", func(t *testing.T) {
+		// A fragment whose colons did not survive is not a field-carrying row; it is
+		// two strings next to each other, and identification here is drawn at
+		// evidence, not resemblance (see ompMalformedAssistantMessageEnd's residual).
+		// Pinning the skip is pinning that line: a reading that ignores the colon
+		// turns any line that merely mentions both words in order into a failed job.
+		fragment := `{"type" "message_end","message":{"role" "assistant","content":[{"type" "tex`
+		ompAssertFragmentIsRaw(t, fragment)
+		if ompRawFieldIs(fragment, "type", "message_end") {
+			t.Fatalf("ompRawFieldIs matched a key that is not followed by a colon: adjacency is not a field")
+		}
+		if ompRawFieldIs(fragment, "role", "assistant") {
+			t.Fatalf("ompRawFieldIs matched a key that is not followed by a colon: adjacency is not a field")
+		}
+		if ompMalformedAssistantMessageEnd(fragment) {
+			t.Fatalf("a fragment with no surviving field structure must stay skipped")
+		}
+		ompAssertFragmentSkipped(t, fragment)
+	})
+}
+
+// ompAssertFragmentIsRaw binds the premise every subtest above depends on: these
+// fragments only ever reach ompRawFieldIs because the decoder rejected them outright.
+// A fixture that became valid JSON would be classified from its fields instead, and
+// the subtest would stop exercising the raw-text reading at all.
+func ompAssertFragmentIsRaw(t *testing.T, fragment string) {
+	t.Helper()
+	if json.Valid([]byte(fragment)) {
+		t.Fatalf("fixture is valid JSON, so it never reaches the raw-text reading under test: %s", fragment)
+	}
+}
+
+// ompAssertFragmentSkipped runs a fragment through a stream that is otherwise healthy
+// and demands the run still answers: the consequence of a false RED here is a
+// completed job reported as envelope drift.
+func ompAssertFragmentSkipped(t *testing.T, fragment string) {
+	t.Helper()
+	stdout := ompHeaderLine(ompFixtureSessionID) + fragment + "\n" +
+		ompAssistantEnd("done", 2, 1) + ompAgentEnd()
+	text, _, _, err := parseOmpStreamJSON(stdout)
+	if err != nil {
+		t.Fatalf("parseOmpStreamJSON: %v (this fragment identifies nothing, so rule 6 must skip it instead of failing a healthy run)", err)
+	}
+	if text != "done" {
+		t.Fatalf("text = %q, want %q: the assistant DID answer", text, "done")
+	}
+}
+
+// ompAssertFragmentFailsRun is the mirror: a fragment that DOES identify an assistant
+// message_end must fail the run, and the earlier turn's sentence must not survive as
+// the answer — the terminal agent_end is intact, so no other rule catches this.
+func ompAssertFragmentFailsRun(t *testing.T, fragment string) {
+	t.Helper()
+	stdout := ompHeaderLine(ompFixtureSessionID) +
+		ompAssistantEnd("Let me read the file first.", 12, 3) + fragment + "\n" + ompAgentEnd()
+	text, _, _, err := parseOmpStreamJSON(stdout)
+	if err == nil {
+		t.Fatalf("parseOmpStreamJSON accepted a stream whose final assistant message_end was cut (text=%q)", text)
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "malformed") {
+		t.Fatalf("error %q must report the row as MALFORMED", err.Error())
+	}
+	if text != "" {
+		t.Fatalf("text = %q, want none: that sentence was written BEFORE the row that was cut", text)
+	}
 }
 
 // TestParseOmpStreamJSONRequiresTerminal is the loud-drift guard: no agent_end
