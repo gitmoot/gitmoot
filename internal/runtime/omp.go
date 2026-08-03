@@ -226,8 +226,18 @@ func (a OmpAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, 
 	// Parse before branching on err: the header id is worth capturing for the
 	// session diagnostics even when the process itself failed.
 	content, sessionID, usage, parseErr := parseOmpStreamJSON(result.Stdout)
+	// A FAILED RUN IS STILL BILLED, on this path as much as on the parse-error path
+	// below: a run that spent 400k tokens and then died on a non-zero exit (an OOM
+	// kill, a crashed Bun binary, a SIGKILLed process group) spent them for real, and
+	// reporting 0/0 would hide the most expensive failures from every spend audit.
+	// The usage is whatever the partial stream proved before the process went down.
 	if err != nil {
-		return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, sessionID)}, ompCommandError(result, err)
+		return Result{
+			Raw:          result.Stdout + result.Stderr,
+			InputTokens:  usage.InputTokens,
+			OutputTokens: usage.OutputTokens,
+			SessionDiag:  newSessionDiag(result, err, sessionID),
+		}, ompCommandError(result, err)
 	}
 	// EXIT 0 IS NOT SUCCESS for omp under --mode=json: its process.exit(1) on a
 	// model error lives inside an `if (mode === "text")` branch, so a failed turn
@@ -569,8 +579,9 @@ type ompTelemetryUsage struct {
 //     print-mode run has for it).
 //  2. `message_end` with message.role=="assistant" accumulates usage (SUMMED
 //     across events — usage is per assistant message, not per run) and keeps the
-//     last non-empty text from the content parts of type "text". The role filter
-//     is mandatory: message_end also fires for user and tool-result messages.
+//     FINAL assistant message's text from its content parts of type "text" — the
+//     final one, NOT the last non-empty one (rule 5). The role filter is
+//     mandatory: message_end also fires for user and tool-result messages.
 //  3. an assistant stopReason of "error" or "aborted" — omp's own definition of a
 //     retryable failed tail, turn-recovery.ts:84 — marks the turn failed, even
 //     on exit 0, and so does omp's own giving-up verdict (auto_retry_end with
@@ -583,8 +594,11 @@ type ompTelemetryUsage struct {
 //     an "empty but successful" result would be a lie. A LAST agent_end tagged
 //     isTerminal:false is the same class of failure — the stream stopped between
 //     continuations — and errors too.
-//  5. empty assistant text is an ERROR — an empty review must never read as
-//     "nothing to flag".
+//  5. the FINAL assistant message must BE the answer. Empty text there is an
+//     ERROR — an empty review must never read as "nothing to flag" — and so is a
+//     final stopReason of "toolUse" or "length", which mean the run was CUT
+//     rather than finished (see the truncation note below). Neither one may fall
+//     back to an earlier turn's sentence.
 //  6. unknown event types and unparseable lines are SKIPPED, so new omp event types
 //     (auto_compaction_*, model_changed, notice, …) are forward-compatible.
 //  7. a retry saga still OPEN at end of stream — an auto_retry_start with no
@@ -641,6 +655,31 @@ type ompTelemetryUsage struct {
 // names the api key can no longer drive isOmpAuthFailure into telling operators to
 // fix a credential that works. First-wins still holds WITHIN one unrecovered saga.
 //
+// ONE EXCEPTION to the clear: a failure SET by auto_retry_end{success:false} —
+// omp's own giving-up verdict — is latched (gaveUp) and no later content can clear
+// it. A run omp itself declared lost cannot be talked back into success by a
+// message that arrives afterwards, and the sentence such a message would hand back
+// is the same stale text this whole section exists to refuse. This guard is LATENT
+// against omp v17.2.4: every success:false emitter in turn-recovery.ts (:257-261,
+// :527-541, :1462-1470, :1490-1495, :1512-1520, :1541) is immediately followed by
+// `return false` and a settled turn, so no post-give-up assistant message_end can
+// reach this parser today. It is here because the SET is a binding rule, and a rule
+// that can be silently un-set is not one.
+//
+// TRUNCATION: a run can be cut off while every envelope rule above still passes,
+// and this adapter MANUFACTURES the shape that does it. ompMaxTimeArg puts
+// --max-time on every daemon-dispatched job (the daemon wraps each job in a
+// context deadline), and when omp's own deadline trips inside the tool loop it
+// clears hasMoreToolCalls (agent-loop.ts:1283-1286), pairs each pending tool call
+// with a synthetic `aborted` TOOL RESULT (:1349-1366, filtered out here by the role
+// check) and calls endAgentStream, which writes a TERMINAL agent_end (:1398-1400).
+// The provider's output cap does the same via stopReason "length" (:1352). Nothing
+// on that wire carries an error stopReason: the run is envelope-perfect and simply
+// never answered. That is why rule 5 reads the FINAL assistant message rather than
+// the last one that happened to carry text — keeping a mid-run "Let me read the
+// file first." and reporting it as the job's Summary is precisely the stale-text
+// false green ompAssistantCarriesRealContent refuses on the failure-clearing path.
+//
 // agent_end.telemetry.usage (OTEL-only) can REPLACE the per-message sum, but only
 // when it is demonstrably not an undercount. The rollup is per-agentLoop-invocation,
 // not per-run (telemetry.ts:400-412: "Constructed once per `agentLoop` invocation",
@@ -679,8 +718,14 @@ type ompTelemetryUsage struct {
 // usage already parsed.
 func parseOmpStreamJSON(output string) (string, string, ompUsage, error) {
 	var (
-		sessionID     string
-		text          string
+		sessionID string
+		// finalText/finalStop describe the LAST assistant message_end on the wire —
+		// the only one that can be the run's answer. sawText remembers whether ANY
+		// assistant message carried text, purely so a truncated run can be told apart
+		// from a run that never spoke at all when the failure is reported.
+		finalText     string
+		finalStop     string
+		sawText       bool
 		summed        ompUsage
 		rollup        ompUsage
 		rollupCount   int
@@ -689,6 +734,7 @@ func parseOmpStreamJSON(output string) (string, string, ompUsage, error) {
 		firstErr      error
 		turnFailed    bool
 		retryPending  bool
+		gaveUp        bool
 	)
 	for rest := output; rest != ""; {
 		var line string
@@ -723,18 +769,29 @@ func parseOmpStreamJSON(output string) (string, string, ompUsage, error) {
 					firstErr = err
 				}
 				turnFailed = true
-			} else if ompAssistantCarriesRealContent(message) {
+			} else if !gaveUp && ompAssistantCarriesRealContent(message) {
 				// The run moved past the failure under its own power, and PROVED it by
 				// producing something: a content-less stop is one of omp's own failure
 				// shapes, not a recovery (see the retry note on parseOmpStreamJSON).
 				// The recovered saga's error goes with it — the next failure, if any,
 				// is a different cause and reports itself.
+				//
+				// gaveUp is the one failure this cannot reach: omp already announced it
+				// was giving up, and a verdict the RUNTIME ITSELF issued is not something
+				// a later message gets to overturn (see the exception note above — latent
+				// against v17.2.4, deliberate all the same).
 				turnFailed = false
 				firstErr = nil
 			}
-			if content := ompAssistantText(message); content != "" {
-				text = content
+			// The FINAL assistant message REPLACES whatever an earlier one said, even
+			// with nothing — carrying the last non-empty text forward is what turns a
+			// truncated run into a false green (see the TRUNCATION note above).
+			content := ompAssistantText(message)
+			if strings.TrimSpace(content) != "" {
+				sawText = true
 			}
+			finalText = content
+			finalStop = message.StopReason
 		case "auto_retry_start":
 			// The saga is now OPEN and stays open until omp closes it. Nothing else
 			// may clear this: a recovered assistant message is followed by the closing
@@ -756,6 +813,9 @@ func parseOmpStreamJSON(output string) (string, string, ompUsage, error) {
 			// emit. An absent success field is an UNKNOWN verdict and changes neither.
 			if event.Success != nil && !*event.Success {
 				turnFailed = true
+				// LATCHED, not merely set: this verdict is omp's own, and the
+				// content-carrying clause above may not clear it.
+				gaveUp = true
 				if firstErr == nil {
 					firstErr = ompRetryGaveUpError(event.FinalError)
 				}
@@ -801,10 +861,48 @@ func parseOmpStreamJSON(output string) (string, string, ompUsage, error) {
 	if retryPending {
 		return "", sessionID, usage, errors.New("omp stream ended with a retry saga still open (an auto_retry_start with no auto_retry_end after it): the CLI died mid-retry, so the run neither recovered nor reported a verdict")
 	}
-	if strings.TrimSpace(text) == "" {
+	// The envelope and the retry state machine are settled; what is left is whether
+	// the run actually ANSWERED. Both checks below read the FINAL assistant message
+	// only: an earlier turn's sentence was written before the cut, so handing it back
+	// as the job's Summary is the stale-text false green (see TRUNCATION above).
+	if ompStopReasonIsTruncation(finalStop) {
+		return "", sessionID, usage, fmt.Errorf("omp run was TRUNCATED: its final assistant message stopped on %q instead of \"stop\", so the run was cut mid-work (Gitmoot's --max-time deadline for the job, or the provider's output cap) and never wrote a final answer", finalStop)
+	}
+	if strings.TrimSpace(finalText) == "" {
+		if sawText {
+			return "", sessionID, usage, errors.New("omp run was TRUNCATED: its final assistant message carried no text (a tool call it never got to answer, or a content-less stop), so the only text on the stream was written BEFORE the run was cut — and that is not the run's answer")
+		}
 		return "", sessionID, usage, errors.New("omp stream carried no assistant text")
 	}
-	return text, sessionID, usage, nil
+	return finalText, sessionID, usage, nil
+}
+
+// ompStopReasonIsTruncation reports whether a FINAL assistant stopReason means the
+// run was CUT rather than finished. omp's stopReason union is closed — "stop" |
+// "length" | "toolUse" | "error" | "aborted" (packages/ai/src/types.ts:792) — and
+// error/aborted have already failed the run by the time this is asked, so the two
+// truncating values are the whole remainder that is not "stop":
+//
+//   - "toolUse" — the agent loop was still calling tools. A run that finishes
+//     answers with "stop"; omp only leaves a toolUse tail behind when it stops
+//     scheduling tools, which is what its deadline check does (agent-loop.ts:
+//     1283-1286 clears hasMoreToolCalls when the deadline has passed) before
+//     settling terminally. This is the shape --max-time produces.
+//   - "length" — the provider hit its output cap mid-message. omp continues only
+//     when the truncated message left runnable tool calls AND the deadline has not
+//     passed (agent-loop.ts:1352-1354); otherwise the loop ends here and whatever
+//     text the message carries is half a sentence, not a verdict.
+//
+// An EMPTY stopReason is deliberately NOT truncation. The field is required on
+// omp's AssistantMessage, so an empty one means envelope drift, and drift must not
+// fail every run: the terminal-text rule still has to be satisfied, which is the
+// check that matters for an answer. This mirrors the absent-isTerminal handling.
+func ompStopReasonIsTruncation(stopReason string) bool {
+	switch stopReason {
+	case "length", "toolUse":
+		return true
+	}
+	return false
 }
 
 // ompAssistantText concatenates the text parts of one assistant message, ignoring

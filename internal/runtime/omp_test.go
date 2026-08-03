@@ -32,12 +32,48 @@ func ompHeaderLine(id string) string {
 }
 
 // ompAssistantEnd builds an assistant message_end event carrying text and the
-// per-message usage block (note the input/output spelling omp uses there).
+// per-message usage block (note the input/output spelling omp uses there). Its
+// stopReason is "stop": the one a run that FINISHED reports.
 func ompAssistantEnd(text string, input, output int) string {
+	return ompAssistantEndStopping(text, "stop", input, output)
+}
+
+// ompAssistantEndStopping is ompAssistantEnd with the stopReason under test. omp's
+// union is closed — "stop" | "length" | "toolUse" | "error" | "aborted"
+// (packages/ai/src/types.ts:792) — and "length" is the provider's output cap
+// cutting a message mid-sentence, which is an ANSWER ONLY IF you ignore that it
+// was cut.
+func ompAssistantEndStopping(text string, stopReason string, input, output int) string {
 	return fmt.Sprintf(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":%s}],`+
-		`"usage":{"input":%d,"output":%d,"cacheRead":0,"cacheWrite":0,"totalTokens":%d},"stopReason":"stop",`+
+		`"usage":{"input":%d,"output":%d,"cacheRead":0,"cacheWrite":0,"totalTokens":%d},"stopReason":%s,`+
 		`"api":"anthropic-messages","provider":"anthropic","model":"claude-opus-4"}}`,
-		ompJSONString(text), input, output, input+output) + "\n"
+		ompJSONString(text), input, output, input+output, ompJSONString(stopReason)) + "\n"
+}
+
+// ompTextThenToolCallAssistantEnd is the turn that SPOKE and then called a tool:
+// the shape a --max-time trip freezes in place. omp clears hasMoreToolCalls when
+// the deadline has passed (agent-loop.ts:1283-1286) and settles the run terminally,
+// so this message can be the LAST assistant message on a perfectly-formed stream
+// while its sentence is a work note ("Let me read the file first.") rather than the
+// job's answer.
+func ompTextThenToolCallAssistantEnd(text string, stopReason string, input, output int) string {
+	return fmt.Sprintf(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":%s},`+
+		`{"type":"toolCall","toolCallId":"c1","toolName":"read","args":{"path":"/repo/a.go"}}],`+
+		`"usage":{"input":%d,"output":%d,"totalTokens":%d},"stopReason":%s}}`,
+		ompJSONString(text), input, output, input+output, ompJSONString(stopReason)) + "\n"
+}
+
+// ompAbortedToolResultEnd is the SYNTHETIC tool result omp pairs with every tool
+// call a non-runnable turn left behind (agent-loop.ts:1349-1366): skipReason
+// "aborted" with "Deadline exceeded" when the deadline tripped, "length" when the
+// provider's output cap truncated the tool call. Its role is toolResult, so this
+// parser's role filter drops it — it is on the wire here because a truncated stream
+// really carries it, and because it is the ONLY place the word "aborted" appears on
+// that wire: the assistant messages' own stopReason never says so.
+func ompAbortedToolResultEnd(skipReason string, errorText string) string {
+	return fmt.Sprintf(`{"type":"message_end","message":{"role":"toolResult","toolCallId":"c1","skipReason":%s,`+
+		`"content":[{"type":"text","text":%s}],"isError":true}}`,
+		ompJSONString(skipReason), ompJSONString(errorText)) + "\n"
 }
 
 // ompAssistantEndNoUsage is the same event from a provider that reports no usage.
@@ -178,8 +214,19 @@ func ompWhitespaceAssistantEnd(stopReason string) string {
 // REAL content by omp's classifier (a toolCall makes both a "stop" and a "toolUse"
 // non-empty), and therefore real recovery here.
 func ompToolCallAssistantEnd() string {
-	return `{"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","toolCallId":"c1",` +
-		`"toolName":"read","args":{"path":"/repo/a.go"}}],"usage":{"input":8,"output":3,"totalTokens":11},"stopReason":"toolUse"}}` + "\n"
+	return ompToolCallAssistantEndStopping("toolUse")
+}
+
+// ompToolCallAssistantEndStopping is the same turn with the stopReason the provider
+// reported. Both values are runnable for omp — `runnableStop = stopReason ===
+// "toolUse" || stopReason === "stop"` (agent-loop.ts:1281) — so a provider that
+// reports "stop" alongside tool calls produces a tool-calling turn whose stopReason
+// is byte-identical to a FINISHED run's. When the deadline stops the loop there,
+// nothing but the missing text distinguishes the truncation.
+func ompToolCallAssistantEndStopping(stopReason string) string {
+	return fmt.Sprintf(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","toolCallId":"c1",`+
+		`"toolName":"read","args":{"path":"/repo/a.go"}}],"usage":{"input":8,"output":3,"totalTokens":11},"stopReason":%s}}`,
+		ompJSONString(stopReason)) + "\n"
 }
 
 // ompAgentEndWithTelemetry is the agent_end omp emits when an OTEL telemetry
@@ -496,6 +543,148 @@ func TestOmpDeliverEmptyAssistantTextIsError(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestOmpDeliverTruncatedRunNeverAnswersWithEarlierText is the TERMINAL half of the
+// stale-text rule, and the one this adapter manufactures work for itself: a run that
+// was CUT must never be answered with a sentence it wrote before the cut.
+//
+// The trigger is ompMaxTimeArg. Every daemon-dispatched job carries a context
+// deadline, so every job gets --max-time floor(0.9 x remaining), and omp treats it
+// as a HARD deadline INSIDE the tool loop: hasMoreToolCalls is cleared
+// (agent-loop.ts:1283-1286), each pending tool call is paired with a synthetic
+// `aborted` tool result (:1349-1366), and endAgentStream writes a TERMINAL agent_end
+// (:1398-1400). The provider's output cap produces the same shape via stopReason
+// "length" (:1352). So the envelope is perfect — one terminal agent_end, no error
+// stopReason, no open saga — and the ONLY evidence of the cut is that the last
+// assistant message never answered.
+//
+// Kills, one per shape:
+//   - tracking the last NON-EMPTY assistant text instead of the FINAL message's
+//     (the first case: its stopReason is the same "stop" a finished run reports, so
+//     nothing else in the parser can fail it);
+//   - dropping "toolUse"/"length" from ompStopReasonIsTruncation (the cases whose
+//     final message DOES carry text — the terminal-text rule passes them).
+func TestOmpDeliverTruncatedRunNeverAnswersWithEarlierText(t *testing.T) {
+	const stale = "Let me read the file first."
+	cases := []struct {
+		name       string
+		stdout     string
+		wantInput  int
+		wantOutput int
+		why        string
+	}{
+		{
+			// Only the terminal-TEXT rule can fail this stream: its final stopReason is
+			// "stop", which a finished run also reports.
+			name: "final turn is a tool call it never got to answer",
+			stdout: ompHeaderLine(ompFixtureSessionID) +
+				ompAssistantEnd(stale, 17, 8) +
+				ompToolResultEnd() +
+				ompToolCallAssistantEndStopping("stop") +
+				ompAbortedToolResultEnd("aborted", "Deadline exceeded") +
+				ompAgentEnd(),
+			wantInput: 25, wantOutput: 11,
+			why: "the run stopped holding a tool call, so the earlier work note is all it ever said",
+		},
+		{
+			// The reviewer's reproduction, verbatim in shape: two tool-calling turns, the
+			// second carrying no text at all.
+			name: "deadline trips mid tool loop (the --max-time shape)",
+			stdout: ompHeaderLine(ompFixtureSessionID) +
+				ompTextThenToolCallAssistantEnd(stale, "toolUse", 17, 8) +
+				ompToolResultEnd() +
+				ompToolCallAssistantEndStopping("toolUse") +
+				ompAbortedToolResultEnd("aborted", "Deadline exceeded") +
+				ompAgentEnd(),
+			wantInput: 25, wantOutput: 11,
+			why: "omp's own deadline stopped the loop and settled the run terminally",
+		},
+		{
+			// Final message CARRIES text: the terminal-text rule passes it, so only the
+			// stopReason rule stands between a half-sentence and the job's Summary.
+			name: "deadline trips on a turn that spoke before calling its tool",
+			stdout: ompHeaderLine(ompFixtureSessionID) +
+				ompAssistantEnd(stale, 17, 8) +
+				ompToolResultEnd() +
+				ompTextThenToolCallAssistantEnd("Now let me check the tests.", "toolUse", 6, 4) +
+				ompAbortedToolResultEnd("aborted", "Deadline exceeded") +
+				ompAgentEnd(),
+			wantInput: 23, wantOutput: 12,
+			why: "a work note plus a tool call is not a verdict, however recent it is",
+		},
+		{
+			name: "provider output cap truncates the final message mid-sentence",
+			stdout: ompHeaderLine(ompFixtureSessionID) +
+				ompAssistantEnd(stale, 17, 8) +
+				ompToolResultEnd() +
+				ompAssistantEndStopping("The review found three issues. The first is th", "length", 6, 4000) +
+				ompAgentEnd(),
+			wantInput: 23, wantOutput: 4008,
+			why: "half a sentence is not the answer, and it is the LAST thing the run said",
+		},
+		{
+			name: "output cap truncates a tool call, leaving no text at all",
+			stdout: ompHeaderLine(ompFixtureSessionID) +
+				ompAssistantEnd(stale, 17, 8) +
+				ompToolCallAssistantEndStopping("length") +
+				ompAbortedToolResultEnd("length", "tool call truncated by the output cap") +
+				ompAgentEnd(),
+			wantInput: 25, wantOutput: 11,
+			why: "the cap cut the tool call itself, so the loop ended with nothing said",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := OmpAdapter{
+				Runner: &fakeRunner{results: []subprocess.Result{{Stdout: tc.stdout}}},
+				Dir:    "/repo",
+			}.Deliver(context.Background(), ompTestAgent(), Job{Prompt: "review"})
+			if err == nil {
+				t.Fatalf("Deliver reported a truncated run as success (%s): %+v", tc.why, result)
+			}
+			if result.Summary != "" {
+				t.Fatalf("Summary = %q: %s — a sentence written BEFORE the cut is never the job's answer", result.Summary, tc.why)
+			}
+			if strings.Contains(err.Error(), stale) {
+				t.Fatalf("error %q hands back the stale mid-run sentence as the cause", err.Error())
+			}
+			if !strings.Contains(err.Error(), "TRUNCATED") {
+				t.Fatalf("error %q must NAME truncation: an operator reading it has to see the run was cut, not that it misbehaved", err.Error())
+			}
+			// A truncated run burned every token it burned. This is the failure mode
+			// --max-time creates on the most expensive jobs, so reporting 0/0 here would
+			// hide exactly the spend worth auditing.
+			if result.InputTokens != tc.wantInput || result.OutputTokens != tc.wantOutput {
+				t.Fatalf("usage = %d/%d, want %d/%d: a truncated run is still billed",
+					result.InputTokens, result.OutputTokens, tc.wantInput, tc.wantOutput)
+			}
+			if result.Raw != tc.stdout {
+				t.Fatalf("Raw = %q, want the stdout evidence", result.Raw)
+			}
+		})
+	}
+
+	// The complement, so the rule above cannot be satisfied by failing every
+	// tool-using run: a run that called tools and THEN answered is a success, and its
+	// answer is the final message's text.
+	t.Run("a run that answers after its tool loop still succeeds", func(t *testing.T) {
+		stdout := ompHeaderLine(ompFixtureSessionID) +
+			ompTextThenToolCallAssistantEnd(stale, "toolUse", 17, 8) +
+			ompToolResultEnd() +
+			ompAssistantEnd("no blocking issues", 6, 4) +
+			ompAgentEnd()
+		result, err := OmpAdapter{
+			Runner: &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}},
+			Dir:    "/repo",
+		}.Deliver(context.Background(), ompTestAgent(), Job{Prompt: "review"})
+		if err != nil {
+			t.Fatalf("Deliver failed a run that finished its tool loop and answered: %v", err)
+		}
+		if result.Summary != "no blocking issues" {
+			t.Fatalf("Summary = %q, want the FINAL assistant text", result.Summary)
+		}
+	})
 }
 
 // TestOmpDeliverUsageSums proves usage is SUMMED across assistant messages and
@@ -1105,6 +1294,63 @@ func TestOmpDeliverContentlessAssistantTurnDoesNotClearAFailure(t *testing.T) {
 	})
 }
 
+// TestOmpDeliverGiveUpVerdictSurvivesLaterContent pins the other direction of the
+// same rule: auto_retry_end{success:false} SETS a failure (amendment 1, condition
+// 1(a)), and a SET that a later message can silently un-set is not a rule at all.
+// omp announced it was giving up; a content-carrying assistant message that arrives
+// afterwards does not overturn the runtime's own verdict, and the sentence it would
+// hand back is the same stale text every other rule in this section refuses.
+//
+// LATENT against omp v17.2.4, deliberately: every success:false emitter in
+// turn-recovery.ts (:257-261, :527-541, :1462-1470, :1490-1495, :1512-1520, :1541)
+// is immediately followed by `return false` and a settled turn, so no post-give-up
+// assistant message_end can reach the parser today. The guard exists so a future
+// emitter ordering cannot quietly convert a given-up run into a success — which is
+// exactly what this fixture asks it to do. Kills: dropping the gaveUp latch from
+// the recovery clause.
+func TestOmpDeliverGiveUpVerdictSurvivesLaterContent(t *testing.T) {
+	const finalError = "gave up after 10 attempts: upstream is overloaded"
+	const late = "here is your answer"
+	stdout := ompHeaderLine(ompFixtureSessionID) +
+		ompAutoRetryStart(1, "Overloaded") +
+		ompAutoRetryEndFinal(10, finalError) +
+		ompAssistantEnd(late, 12, 6) +
+		ompAgentEnd()
+	result, err := OmpAdapter{
+		Runner: &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}},
+		Dir:    "/repo",
+	}.Deliver(context.Background(), ompTestAgent(), Job{Prompt: "review"})
+	if err == nil {
+		t.Fatalf("Deliver let a later message overturn omp's own giving-up verdict: %+v", result)
+	}
+	if !strings.Contains(err.Error(), finalError) {
+		t.Fatalf("error %q must carry omp's finalError: it is the run's cause", err.Error())
+	}
+	if result.Summary != "" {
+		t.Fatalf("Summary = %q: a run omp declared lost has no answer", result.Summary)
+	}
+	if strings.Contains(err.Error(), late) {
+		t.Fatalf("error %q reports the post-verdict message as the cause", err.Error())
+	}
+	// Non-vacuity: the very same late message DOES clear an ordinary provider failure
+	// (that is TestOmpDeliverRecoveredRetryIsNotAFailure's contract). If this half
+	// ever fails, the fixture stopped being a recovery-shaped message and the test
+	// above proves nothing about the latch.
+	recovered := ompHeaderLine(ompFixtureSessionID) +
+		ompFailedAssistantEnd("error", "Overloaded", 529) +
+		ompAutoRetryStart(1, "Overloaded") +
+		ompAssistantEnd(late, 12, 6) +
+		ompAutoRetryEnd(true, 1) +
+		ompAgentEnd()
+	okResult, okErr := OmpAdapter{
+		Runner: &fakeRunner{results: []subprocess.Result{{Stdout: recovered}}},
+		Dir:    "/repo",
+	}.Deliver(context.Background(), ompTestAgent(), Job{Prompt: "review"})
+	if okErr != nil || okResult.Summary != late {
+		t.Fatalf("the same message must still clear an ordinary failure: err=%v summary=%q", okErr, okResult.Summary)
+	}
+}
+
 // TestOmpAssistantContentClassifierMirrorsOmp pins the recovery predicate directly,
 // because in a well-formed stream a later text message would clear the failure
 // anyway and hide which clause did the work. Kills: dropping the toolCall clause
@@ -1416,9 +1662,15 @@ func TestOmpDeliverMalformedEnvelope(t *testing.T) {
 }
 
 // TestOmpDeliverNonZeroExit: a real process failure must surface stderr AND keep
-// the session diagnostics, including the header id the run did manage to print.
+// the session diagnostics, including the header id the run did manage to print —
+// AND the usage the partial stream already proved. A run that spent 1234/567 tokens
+// and then died (an OOM kill, a crashed Bun binary, a SIGKILLed process group) spent
+// them for real; 0/0 would hide the most expensive failures from a spend audit and
+// contradict the parse-error path three lines below it, which books the same numbers
+// for the same reason. Kills: dropping InputTokens/OutputTokens from the err != nil
+// return.
 func TestOmpDeliverNonZeroExit(t *testing.T) {
-	stdout := ompHeaderLine(ompFixtureSessionID)
+	stdout := ompHeaderLine(ompFixtureSessionID) + ompAssistantEnd("partial work before the crash", 1234, 567)
 	runner := &fakeRunner{
 		results: []subprocess.Result{{Stdout: stdout, Stderr: "omp: provider request failed"}},
 		errs:    []error{errors.New("exit status 1")},
@@ -1433,6 +1685,10 @@ func TestOmpDeliverNonZeroExit(t *testing.T) {
 	}
 	if result.Raw != stdout+"omp: provider request failed" {
 		t.Fatalf("Raw = %q, want stdout+stderr on the failure path", result.Raw)
+	}
+	if result.InputTokens != 1234 || result.OutputTokens != 567 {
+		t.Fatalf("usage = %d/%d, want 1234/567: the tokens the run burned before the process died were still billed",
+			result.InputTokens, result.OutputTokens)
 	}
 	diag := result.SessionDiag
 	if diag == nil {

@@ -73,7 +73,9 @@ Each fixed element is load-bearing:
   a normal NDJSON envelope, whereas Gitmoot's own context deadline kills the
   process group mid-stream: the partial NDJSON is still captured as the job's
   raw output, but the terminal `agent_end` never arrives, so the run fails as
-  truncated instead of reporting what it did.
+  truncated instead of reporting what it did. The `--max-time` trip is the
+  quieter of the two, because the envelope it leaves behind is *complete* — see
+  [Truncation](#truncation-is-not-an-answer) for how it is caught anyway.
 - The prompt is exactly **one** argv token after `--`. Multiple positionals
   would become multiple separately billed turns, a prompt starting with `-`
   would be read as an unknown flag (exit 2), and one starting with `@` would be
@@ -113,18 +115,47 @@ Under `--mode=json` omp's `process.exit(1)` for a model error lives inside an
 parse-derived from the NDJSON stream, and every rule fails loudly rather than
 returning an empty success:
 
-- an assistant `stopReason` of `error` or `aborted` fails the run even on exit 0;
+- an assistant `stopReason` of `error` or `aborted` fails the run even on exit 0
+  **when it is still unrecovered at end of stream** (see [Retries and terminal
+  state](#retries-and-terminal-state) — omp retries transient failures on the
+  same stream, so the first errored turn is not the run's verdict);
 - no `agent_end` event anywhere fails the run (the CLI died mid-stream, or the
   envelope drifted past recognition);
 - a final `agent_end` tagged `isTerminal: false` fails the run (the stream
   stopped between scheduled continuations);
-- empty assistant text fails the run — an empty review must never read as
-  "nothing to flag";
+- the **final** assistant message must be the answer: empty text there fails the
+  run — an empty review must never read as "nothing to flag" — and so does a
+  final `stopReason` of `toolUse` or `length` (see
+  [Truncation](#truncation-is-not-an-answer));
 - unknown event types and unparseable lines are skipped, so new omp event kinds
   stay forward-compatible.
 
 Stdout is preserved as the job's raw output on every failure path, and the
 summary is the final assistant text, never the NDJSON envelope.
+
+### Truncation is not an answer
+
+A run can be **cut off** while every rule above still passes, and the adapter
+creates the conditions for it itself: `--max-time` rides on every
+daemon-dispatched job, and omp enforces that deadline *inside* its tool loop. It
+stops scheduling tools, pairs each pending tool call with a synthetic `aborted`
+tool result, and closes the run with a **terminal** `agent_end`. Nothing on that
+wire carries an error `stopReason`. The provider's output cap does the same thing
+via `stopReason: "length"`.
+
+So the parser reads the **final** assistant message rather than the last one that
+happened to carry text. A truncated run fails, and the error says `TRUNCATED`:
+
+- a final message with no text — it was holding a tool call it never got to
+  answer;
+- a final `stopReason` of `toolUse` (the loop was still calling tools) or
+  `length` (the provider cut the message mid-sentence), even when that message
+  carries text.
+
+The rule this replaces would have answered such a job with whatever the run said
+*before* the cut — a work note like "Let me read the file first." reported as a
+review's verdict. A partial answer is a failure with the evidence preserved in
+raw output, never a success.
 
 ### Retries and terminal state
 
@@ -144,7 +175,10 @@ job and discard its answer. The rules the parser applies:
 - `auto_retry_end` with `success: false` is omp giving up, so it **sets** a
   failure in its own right; when nothing earlier in the saga carried a cause, its
   `finalError` becomes the cause (that is the entire failure signal for a saga
-  whose every message carried a non-error stop reason).
+  whose every message carried a non-error stop reason). That failure is
+  **latched**: a content-carrying message arriving afterwards does not clear it,
+  because a verdict the runtime issued about itself is not something a later
+  message gets to overturn.
 - A retry saga still **open** at end of stream — an `auto_retry_start` with no
   `auto_retry_end` after it — fails closed. The state machine ended mid-retry;
   "a retry was pending" is never "the error was being handled".
@@ -158,11 +192,11 @@ other adapter here uses.) The `agent_end.telemetry` rollup exists only when omp
 runs under an OTEL telemetry config; it is preferred over the sum only when
 every `agent_end` carried one **and** it is at least the per-message sum on both
 axes, because the sum is a lower bound on what the run was billed. Usage from a
-failed run is still reported on the exit-0 path — the dominant one here, since a
-failed omp turn exits 0 — because omp retries a failed turn and every attempt is
-billed. A run that ends on a **non-zero exit** (including a process group killed
-on Gitmoot's own deadline) currently reports `0`/`0`: read that zero as "not
-counted", not as "not spent", when auditing spend on failed jobs.
+**failed** run is reported on every path — the exit-0 one (the dominant failure
+here, since a failed omp turn exits 0) and the non-zero exit alike, including a
+process group killed on Gitmoot's own deadline. It is whatever the stream proved
+before the run died, so read it as a **floor**: a process killed mid-stream may
+have been billed for a message whose `message_end` never reached stdout.
 
 ### Autonomy policies
 
@@ -212,8 +246,16 @@ would then trust. The consequence is stated out loud rather than hidden: an omp
 implement job's cross-family review is **refused loudly** — the engine records a
 `cross_family_review_failed` job event naming the runtime and both real remedies
 — instead of silently skipping, which used to look identical to "no reviewer was
-authenticated". No review row is written either way. Per-seat provider
-declaration is the sound fix and is tracked as issue #1436.
+authenticated". No review row is written either way.
+
+The exclusion is **symmetric**. A registered omp seat that declares the `review`
+capability is dropped from the reviewer candidate set too, so it is never
+returned as another runtime's cross-family reviewer: refusing omp as an
+implementer while selecting it as a reviewer would manufacture the same false
+diversity from the other direction. Selection falls through to the family
+rotation, and then to the same-family fallback (tagged so it weights below a
+genuine cross-family review). Per-seat provider declaration is the sound fix and
+is tracked as issue #1436.
 
 ### Transcripts
 

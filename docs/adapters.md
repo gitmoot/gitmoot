@@ -138,8 +138,11 @@ diff. Two more properties an adapter author has to keep in mind here:
 
 - **Exit code 0 is not success.** omp's `process.exit(1)` for a model error is
   inside an `if (mode === "text")` branch, so a failed turn exits 0 under
-  `--mode=json`. Success is derived from the stream (assistant `stopReason`, a
-  terminal `agent_end`, a closed retry saga, non-empty assistant text).
+  `--mode=json`. Success is derived from the stream: an unrecovered assistant
+  `stopReason` at end of stream, a terminal `agent_end`, a closed retry saga, and
+  a **final** assistant message that actually answered — not merely some earlier
+  message that carried text. A run cut off by `--max-time` or by the provider's
+  output cap ends with a complete envelope and no answer, and fails as truncated.
 - **Usage is per assistant message**, spelled `input`/`output` (not
   `input_tokens`/`output_tokens`), and is summed across the run.
 

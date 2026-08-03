@@ -685,8 +685,10 @@ the daemon runs under. What that changes in practice:
   `fresh:<suffix>`, never `last`.
 - **Exit code 0 is not success.** Under `--mode=json` omp exits 0 even on a
   failed turn, so Gitmoot decides success by parsing the NDJSON stream; an empty
-  answer, a truncated stream, or one that ends mid-retry fails loudly rather than
-  reporting an empty success.
+  answer, a truncated stream, one that ends mid-retry, or a run **cut off
+  mid-work** — by the `--max-time` deadline or the provider's output cap, where
+  the envelope is complete and only the final answer is missing — fails loudly
+  rather than reporting an empty success.
 - **All four `--policy` values pass the same explicit `--approval-mode=yolo`,**
   because omp's undeclared tools default to the `exec` tier and `always-ask`
   would make every headless tool call throw. Read-only stays enforced
@@ -695,8 +697,9 @@ the daemon runs under. What that changes in practice:
 - **omp is in no cross-family group.** An omp implement job's cross-family
   review is refused *loudly* (a `cross_family_review_failed` job event) instead
   of silently skipped, because scoring an opaque router as a model family would
-  manufacture diversity the merge gate would trust. Per-seat provider
-  declaration is issue #1436.
+  manufacture diversity the merge gate would trust. The exclusion runs both ways:
+  a registered omp seat is never selected as another runtime's cross-family
+  reviewer either. Per-seat provider declaration is issue #1436.
 - **Authentication is per profile.** Authenticate omp once interactively, export
   the provider key the daemon should use, or point it at an auth broker; then
   restart the Gitmoot daemon so it inherits the credential. The daemon must also

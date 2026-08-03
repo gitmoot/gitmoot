@@ -140,6 +140,40 @@ func unmappedFamilyIsRefusal(family string) bool {
 	return false
 }
 
+// unmappedReviewerIsExcluded is the REVIEWER-side mirror of unmappedFamilyIsRefusal
+// (#1428), and it is keyed on exactly the same predicate so the two halves cannot
+// drift apart: a candidate reviewer whose own family has no crossFamilyRotation
+// entry AND is a dispatchable Gitmoot runtime is dropped from the candidate set.
+// Today that set is precisely {omp}, pinned by
+// TestCrossFamilyRefusalKeysOffDispatchabilityNotTheNameOmp.
+//
+// Why it must exist at all: family COMPARISON is only meaningful between families
+// the rotation knows. An omp seat's resolved provider is opaque, so returning one as
+// a DIFFERENT family from a claude implementer (SelfFamily=false) records an omp run
+// routed to Anthropic as genuine diversity, and the merge gate and auto-trace then
+// trust the same model reviewing itself under another name. Refusing omp as an
+// IMPLEMENTER while still selecting it as a REVIEWER would leave that hole open from
+// the other side.
+//
+// The two cases the predicate deliberately does NOT exclude are the same two the
+// refusal stays silent for, for the same reasons:
+//
+//   - shell runs NO model. A shell "reviewer" is a deterministic script, not a
+//     correlated judge, so it cannot self-prefer — and it is the no-LLM review E2E
+//     seam this repo deliberately builds engine tests on. Whether a script may
+//     stand in for a model family at all is a separate question from #1428's, and
+//     answering it here would silently delete those E2Es.
+//   - An empty or unrecognized runtime name is the historical SKIP-not-guess case:
+//     nothing was configured wrong, and narrowing candidate selection for names
+//     Gitmoot never dispatches would change behavior no finding is about.
+func unmappedReviewerIsExcluded(runtimeName string) bool {
+	family := reviewerFamily(runtimeName)
+	if _, mapped := crossFamilyRotation[family]; mapped {
+		return false
+	}
+	return unmappedFamilyIsRefusal(family)
+}
+
 // unmappedFamilyRefusal is the loud refusal itself. It names the runtime, states
 // the consequence (no cross-family review at all), and names both real remedies so
 // the event is actionable rather than merely noisy.
@@ -213,6 +247,12 @@ func PickCrossFamilyReviewer(ctx context.Context, store AgentLister, implementer
 // written either way, but the caller records the refusal (the engine writes a
 // cross_family_review_failed job event) rather than leaving an unreviewable runtime
 // indistinguishable from an unauthed one. See unmappedFamilyIsRefusal.
+//
+// The same exclusion applies on the REVIEWER side, one layer down: listReviewAgents
+// drops every candidate whose own family has no rotation entry, so an unmapped seat
+// can never be returned as the cross-family (SelfFamily=false) reviewer of a mapped
+// implementer. Refusing omp as an implementer while selecting it as a reviewer would
+// manufacture the same false diversity from the other direction.
 func pickCrossFamilyReviewer(ctx context.Context, store AgentLister, implementerRuntime string, repo string, authedRuntimes map[string]bool) (CrossFamilyReviewer, bool, error) {
 	implementerRuntime = strings.TrimSpace(implementerRuntime)
 	family := reviewerFamily(implementerRuntime)
@@ -377,6 +417,22 @@ func PickCrossFamilyJury(ctx context.Context, store AgentLister, implementerRunt
 // different repo, and an empty-scope agent the convention would deny is not
 // silently treated as global. A per-agent access error fails soft (the agent is
 // dropped from the candidate set) rather than failing the whole selection.
+//
+// Candidates the family structure cannot name are dropped here, per
+// unmappedReviewerIsExcluded — the reviewer-side half of the implementer-side
+// refusal (#1428), keyed on the same predicate so the halves cannot drift apart.
+//
+// Dropping, rather than the loud refusal the implementer side gets, is the honest
+// handling for a REVIEWER: an unmapped implementer's work merges with no review at
+// all, which is a gap worth an event, whereas an unmapped reviewer is simply not a
+// candidate — selection continues to the rotation and then to the same-family
+// fallback, each of which is a reviewer whose family Gitmoot can actually name. The
+// caller can tell the two apart because ok=false with no error still means "nobody
+// available", exactly as it did before.
+//
+// PickCrossFamilyJury reads the same list, where this filter is a NO-OP by
+// construction: that picker only ever matches candidates against
+// crossFamilyJuryUniverse, which an excluded family is not in.
 func listReviewAgents(ctx context.Context, store AgentLister, repo string) ([]db.Agent, error) {
 	if store == nil {
 		return nil, nil
@@ -389,6 +445,9 @@ func listReviewAgents(ctx context.Context, store AgentLister, repo string) ([]db
 	var out []db.Agent
 	for _, agent := range all {
 		if !contains(agent.Capabilities, reviewCapability) {
+			continue
+		}
+		if unmappedReviewerIsExcluded(agent.Runtime) {
 			continue
 		}
 		allowed, err := store.AgentCanAccessRepo(ctx, agent.Name, repo)
