@@ -1463,10 +1463,6 @@ func (r *pollErrorReporters) bind(mode pollMode, d daemon.Daemon) boundPoll {
 // all full reconciliation, which IS observable. TestSupervisorIdleBranchRunsTheFullPoll now
 // observes it, via WatchIssues: only PollOnce reaches ListIssues.
 //
-// WHAT REMAINS UNGUARDED: the FALLBACK branch's choice of runner. A mutant pointing it at the
-// full runner would run the checkout-mutating poll precisely when recovery-only behaviour was
-// required.
-//
 // THE REACHABILITY CLAIM THAT USED TO BE HERE WAS FALSE. It said the branch is unreachable from
 // an external test because the checkout lock and in-flight tracker are function-local. Review
 // disproved it by seeding a long-running shell job to make the tracker busy, reaching the
@@ -1475,9 +1471,6 @@ func (r *pollErrorReporters) bind(mode pollMode, d daemon.Daemon) boundPoll {
 // That is the THIRD residual claim I have written here and had disproved -- after "consistent
 // misattribution" and "only the destructuring line is untested". The pattern is not that the
 // claims were unlucky; it is that I asserted the limits of my own guards without testing them.
-// So this comment now states only what is MEASURED: the branch is unguarded, and it is
-// externally reachable by making the tracker busy. The guard is owed, and its technique is
-// known.
 func (r *pollErrorReporters) runners(d daemon.Daemon) (full boundPoll, recovery boundPoll) {
 	return r.bind(fullPoll, d), r.bind(recoveryPoll, d)
 }
