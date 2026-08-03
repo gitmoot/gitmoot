@@ -127,8 +127,24 @@ func TestListQueuedJobsSkipsExternallyDriven(t *testing.T) {
 	if err := store.CreateExternallyDrivenJobWithEvent(ctx, Job{ID: "session-forced-queued", Agent: "lead", Type: "implement", State: "running"}, JobEvent{Kind: "running", Message: "job started"}); err != nil {
 		t.Fatalf("CreateExternallyDrivenJobWithEvent returned error: %v", err)
 	}
-	if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET state = 'queued' WHERE id = 'session-forced-queued'`); err != nil {
+	// Routed through UpdateJobState rather than a raw UPDATE. The raw write bypassed
+	// bumpLifecycleGenerationSQL, moving a job running -> queued while leaving its
+	// lifecycle generation at 0 (#1407) -- a row the store's own writers cannot produce,
+	// and a direct counter-example to the claim that every entry into queued advances the
+	// generation. The selector assertion below passes either way, which is exactly why it
+	// went unnoticed: the fixture proved its own point while quietly violating a different
+	// invariant.
+	if err := store.UpdateJobState(ctx, "session-forced-queued", "queued"); err != nil {
 		t.Fatalf("force queued returned error: %v", err)
+	}
+	// And the fixture now demonstrably obeys the invariant it used to break, so this stops
+	// being an assertion about tidiness and becomes one about the seam.
+	forced, err := store.GetJob(ctx, "session-forced-queued")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if forced.LifecycleGeneration != 1 {
+		t.Fatalf("forced-queued job generation = %d, want 1: this fixture reached queued without advancing the lifecycle, which no store writer can do", forced.LifecycleGeneration)
 	}
 
 	got, err := store.ListQueuedJobs(ctx)
