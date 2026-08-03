@@ -61,25 +61,25 @@ Parallelism under `pool` is bounded by **two** independent locks:
 
 1. **Checkout lock (per worktree).** Jobs run concurrently only when they have
    distinct checkout keys. Delegation / orchestra `implement` children already get
-   their own worktree from the workflow engine, so they parallelize; read-only
-   `ask`/`review` jobs can be auto-isolated into an ephemeral detached worktree. A
+   their own worktree from the workflow engine, so they parallelize. Every local
+   `review` gets a detached per-job worktree at its requested head; background
+   taskless `ask` jobs can be auto-isolated at checkout `HEAD`. A
    plain, top-level same-repo `implement` job with no worktree still shares the
    `repo:<repo>` key and serializes even under `pool`.
 
-   **Auto-isolated read-only worktrees are the committed tip.** An auto-isolated
-   read-only worktree is a detached `git worktree add` at the **committed tip** of
-   the base branch, so it does **not** contain gitignored paths (e.g. vendored
+   **Read-only refs depend on the action.** Review uses its exact requested head,
+   preserves that head in the payload, and fails dispatch closed if allocation
+   fails. Ask/delegation isolation uses the **committed tip** and remains fail-open
+   where it is only a parallelism optimization. Detached worktrees do **not**
+   contain gitignored paths (e.g. vendored
    clones under `repos/**`) or any uncommitted working-tree changes. Isolation only
-   kicks in when a same-repo read-only job is **contended** — a fan-out of **two or
-   more** read-only siblings, or two-plus independently-fired top-level `ask`/`review`
-   jobs on one repo; a **single**, uncontended read-only job stays in the shared
-   base checkout and sees everything. Every auto-isolated job's prompt now carries a
+   applies to asks when same-repo readers are **contended**; a task-bearing or
+   foreground ask keeps its existing checkout. Committed-tip isolated asks carry a
    note with the canonical base-checkout absolute path, so a worker whose sandbox
    can read it (e.g. codex) reaches the real tree instead of reporting a
-   working-tree feature as missing. For whole-working-tree analysis that must see
-   gitignored or uncommitted state, either keep the job uncontended (a lone
-   read-only job stays in the base checkout) or pass an **absolute** path to the
-   file/dir under analysis.
+   working-tree feature as missing. Exact-head review does not add that note. For
+   whole-working-tree ask analysis, use a foreground or task-bearing ask, or pass
+   an **absolute** path to the file/dir under analysis.
 2. **Runtime session lock (`runtime:<runtime>:<ref>`).** Two jobs that use the
    **same** agent/runtime session serialize on the session lock even when their
    checkouts differ. So same-repo parallelism is bounded by **distinct runtime

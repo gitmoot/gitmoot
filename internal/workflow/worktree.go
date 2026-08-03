@@ -466,12 +466,12 @@ func (e Engine) AllocateDelegationWorktree(ctx context.Context, request Delegati
 
 // ReadOnlyWorktreeDispatchLockWaitBudget bounds how long the SCHEDULER-LOOP
 // read-only worktree allocators (#739 dispatch-time isolation and the reactive
-// pool-isolation dispatcher) wait for the checkout mutation lock before failing
-// open. They run synchronously on the per-repo dispatch/poll loop, so the full
+// pool-isolation dispatcher) wait for the checkout mutation lock. They run
+// synchronously on the per-repo dispatch/poll loop, so the full
 // checkoutMutationWaitTimeout (2m) would stall that repo's dispatch AND reap for up
-// to two minutes whenever a same-repo merge gate holds the lock. Isolation is a
-// throughput optimization, not correctness: a miss just serializes the seat (which
-// the next tick retries), so a short, bounded wait is the right trade.
+// to two minutes whenever a same-repo merge gate holds the lock. Ask and pool
+// isolation fail open because they are throughput optimizations; review fails
+// closed because exact-head isolation is correctness. Both need a short bound.
 const ReadOnlyWorktreeDispatchLockWaitBudget = 5 * time.Second
 
 // AllocateReadOnlyWorktree is the shared, package-level primitive that creates a
@@ -495,9 +495,9 @@ const ReadOnlyWorktreeDispatchLockWaitBudget = 5 * time.Second
 // allocation and the reactive pool-isolation dispatcher — run SYNCHRONOUSLY on the
 // per-repo dispatch/poll loop, so they pass the much shorter
 // ReadOnlyWorktreeDispatchLockWaitBudget: under merge-gate lock contention the full
-// 2-minute wait would freeze that repo's whole dispatch+reap loop, and isolation is
-// a fail-open throughput optimization (a miss just serializes the seat, which the
-// next tick retries) — never worth stalling the scheduler.
+// 2-minute wait would freeze that repo's whole dispatch+reap loop. Ask and pool
+// isolation are fail-open throughput optimizations; exact-head review allocation
+// uses the same bounded primitive but its caller fails the dispatch closed.
 func AllocateReadOnlyWorktree(ctx context.Context, store *db.Store, home string, repo string, checkout string, pathParent string, pathSegment string, retryAttempt int, baseBranch string, lockWaitBudget time.Duration, manager ReadOnlyWorktreeManager) (string, error) {
 	if store == nil {
 		return "", errors.New("read-only worktree store is required")

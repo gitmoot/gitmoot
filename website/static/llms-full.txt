@@ -1187,8 +1187,11 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
 
    Implement jobs require the agent to hold the branch lock. Review and ask jobs
    are routed through the runtime adapter and must return the `gitmoot_result`
-   JSON contract. Jobs tied to a task worktree use that worktree for validation;
-   jobs without a task worktree use the registered checkout.
+   JSON contract. A newly dispatched local review always owns a detached
+   read-only per-job worktree at its requested head; its stable Task row tracks
+   lifecycle only. Review allocation fails closed and requires a measurable
+   5 GiB free-space floor. Other jobs tied to a task worktree use that worktree;
+   jobs without an owned or task worktree use the registered checkout.
 
    For a local chat ask that should not go through a PR comment, call the same
    registered agent directly:
@@ -4541,25 +4544,25 @@ Parallelism under `pool` is bounded by **two** independent locks:
 
 1. **Checkout lock (per worktree).** Jobs run concurrently only when they have
    distinct checkout keys. Delegation / orchestra `implement` children already get
-   their own worktree from the workflow engine, so they parallelize; read-only
-   `ask`/`review` jobs can be auto-isolated into an ephemeral detached worktree. A
+   their own worktree from the workflow engine, so they parallelize. Every local
+   `review` gets a detached per-job worktree at its requested head; background
+   taskless `ask` jobs can be auto-isolated at checkout `HEAD`. A
    plain, top-level same-repo `implement` job with no worktree still shares the
    `repo:<repo>` key and serializes even under `pool`.
 
-   **Auto-isolated read-only worktrees are the committed tip.** An auto-isolated
-   read-only worktree is a detached `git worktree add` at the **committed tip** of
-   the base branch, so it does **not** contain gitignored paths (e.g. vendored
+   **Read-only refs depend on the action.** Review uses its exact requested head,
+   preserves that head in the payload, and fails dispatch closed if allocation
+   fails. Ask/delegation isolation uses the **committed tip** and remains fail-open
+   where it is only a parallelism optimization. Detached worktrees do **not**
+   contain gitignored paths (e.g. vendored
    clones under `repos/**`) or any uncommitted working-tree changes. Isolation only
-   kicks in when a same-repo read-only job is **contended** — a fan-out of **two or
-   more** read-only siblings, or two-plus independently-fired top-level `ask`/`review`
-   jobs on one repo; a **single**, uncontended read-only job stays in the shared
-   base checkout and sees everything. Every auto-isolated job's prompt now carries a
+   applies to asks when same-repo readers are **contended**; a task-bearing or
+   foreground ask keeps its existing checkout. Committed-tip isolated asks carry a
    note with the canonical base-checkout absolute path, so a worker whose sandbox
    can read it (e.g. codex) reaches the real tree instead of reporting a
-   working-tree feature as missing. For whole-working-tree analysis that must see
-   gitignored or uncommitted state, either keep the job uncontended (a lone
-   read-only job stays in the base checkout) or pass an **absolute** path to the
-   file/dir under analysis.
+   working-tree feature as missing. Exact-head review does not add that note. For
+   whole-working-tree ask analysis, use a foreground or task-bearing ask, or pass
+   an **absolute** path to the file/dir under analysis.
 2. **Runtime session lock (`runtime:<runtime>:<ref>`).** Two jobs that use the
    **same** agent/runtime session serialize on the session lock even when their
    checkouts differ. So same-repo parallelism is bounded by **distinct runtime
@@ -10976,9 +10979,17 @@ idempotent `review_loop_detected` event. A new head proceeds, and mixed decision
 at one head also proceed because the earlier claim is unstable. The loop guard
 allows an empty head only before any succeeded review history exists for that
 repo/PR; after that it fails closed until the caller supplies the current head.
-The local CLI's existing worktree preparation still requires it to resolve a
-concrete head before dispatch. The prior verdict is escalation evidence only and
-is never served as the new result.
+The local CLI still requires a concrete head before dispatch. Each admitted
+local review gets its own detached, read-only per-job worktree at that exact
+commit; the stable per-PR Task row remains lifecycle metadata and no longer owns
+the review checkout. Consequently, `gitmoot task list` shows an empty worktree
+column for review Task rows. This is expected: each review job owns its own path,
+so there is no single Task-level worktree path to display. The requested
+`head_sha` stays on the job payload. Review
+allocation fails closed rather than falling back to the registered checkout,
+and dispatch refuses before Task mutation when the Gitmoot filesystem has less
+than 5 GiB free or free-space measurement is unavailable. The prior verdict is
+escalation evidence only and is never served as the new result.
 
 This exact `(repo, PR, head_sha, decision)` evidence key is intentional: the
 #1419 review panel rejected round counters and other instruments, so this guard
@@ -11004,7 +11015,9 @@ advances until [gitmoot#1433](https://github.com/gitmoot/gitmoot/issues/1433)
 adds the corresponding ingress preflight.
 
 Before delivery, these dispatch commands scan commit-shaped tokens against the
-target repository. If a token resolves to a commit other than the dispatch head,
+target repository. Ask and implement preserve their existing scanner input;
+review scans its newly allocated exact-head worktree with the requested head
+still bound. If a token resolves to a commit other than the dispatch head,
 Gitmoot prints an advisory warning such as
 `prompt references commit <referenced>, but the dispatch head is <head>; Gitmoot
 will use dispatch head <head>`. The job still runs because prompts may
@@ -11121,15 +11134,14 @@ line in human output. Genuine non-terminal failures (the job did not reach
 `succeeded`) still exit non-zero as before. A normal success with no advance error
 is byte-identical to prior behavior — no `advance_error` field is emitted.
 
-**Review resilience under branch churn.** A review job is pinned to the PR head
-SHA it was queued against; in an active dev loop the branch often advances (a new
-commit is pushed) before the queued review runs, leaving the registered checkout
-on a newer head. Rather than failing the review on that head-SHA mismatch, Gitmoot
-**re-syncs** it: when the PR is still **open**, the review is re-targeted to the
-checkout's current head — reviewing the newest commit is exactly what a human
-reviewer does — and a `review_head_resynced` job event records the old→new head.
-The mismatch is only allowed to fail cleanly when the PR is **closed/merged** (a
-stale review of a dead PR is not useful) or when the checkout is dirty. Relatedly,
+**Review resilience under branch churn.** Newly dispatched local reviews are
+pinned to the requested PR head in a per-job worktree, so a later branch push or
+registered-checkout movement cannot change what they review. The daemon keeps
+the older re-sync behavior only for legacy/fallback review jobs that lack an
+owned read-only worktree: when their shared checkout advances and the PR remains
+open on the same branch, it re-targets the payload and records
+`review_head_resynced`; closed/merged, dirty, or wrong-branch checkouts fail.
+Relatedly,
 when a foreground `agent review` finds the agent's serialized runtime session
 **busy**, the review is now **left queued** for the daemon to run when the session
 frees (a `requeued_runtime_busy` event is recorded) instead of being cancelled and
@@ -14413,14 +14425,16 @@ gitmoot agent doctor reviewer
 ```
 
 Local `agent review` / review-resolved `agent run` and native engine review
-fan-out enforce an exact-head loop guard before a new review job or review
-worktree is created. A
+fan-out enforce an exact-head loop guard before a new review job is created. An
 homogeneous succeeded decision history for `(repo, PR, head_sha)` is refused and
 emits one `review_loop_detected` event on the matched succeeded job; the CLI
 hard-errors while the engine blocks the task. A new commit or mixed decisions at
 one head proceeds. The loop guard permits an empty engine event only before any
 succeeded history exists; local CLI preparation still requires a concrete head.
-The old verdict is evidence for escalation, never a cached response.
+The old verdict is evidence for escalation, never a cached response. An admitted
+local review then receives a per-job detached read-only worktree at the requested
+head. Allocation is fail-closed and requires a measurable 5 GiB free-space floor;
+the stable Task row remains lifecycle identity rather than a shared checkout.
 This exact decision-bearing key replaces no round counter: #1419's panel
 explicitly rejected that instrument. Direct PR-comment ingress is unchanged in
 this safe half and remains #1433 work.
@@ -15324,21 +15338,23 @@ Each child job carries job-tree linkage fields — `parent_job_id`,
 can be traced back to its parent, its originating delegation, and the root of the
 tree. See `RESULT_CONTRACT.md` for the full delegation field reference.
 
-**Contended read-only jobs run at the committed tip.** When a same-repo read-only
-(`ask`/`review`) job would otherwise serialize on the shared checkout — a
-coordinator emits **two or more** read-only siblings, or two-plus
-independently-fired top-level read-only jobs land on one repo — Gitmoot
-auto-isolates each into a detached `git worktree` at the **committed tip** of the
-base branch so they run in parallel. That worktree does **not** contain gitignored
+**Read-only jobs use action-specific refs.** Every top-level local `review` gets
+an owned detached worktree at its requested PR head, even when it carries a
+stable Task ID or runs foreground. That exact-head allocation is correctness and
+fails the dispatch closed. A background taskless `ask` keeps the existing
+committed-tip, fail-open isolation; task-bearing and foreground asks keep their
+existing checkout behavior. Delegation/pool read-only isolation still applies
+when same-repo readers contend.
+
+These detached worktrees do **not** contain gitignored
 paths (e.g. vendored clones under `repos/**`) or any uncommitted working-tree
 changes, so an analysis/research leg cannot see the operator's live working tree
-there. Every auto-isolated job's prompt now carries a note with the canonical
+there. Committed-tip ask/delegation isolation carries a note with the canonical
 base-checkout absolute path so a worker whose sandbox can read it (e.g. codex)
-reaches the real tree instead of reporting a working-tree feature as absent. A
-**single**, uncontended read-only job stays in the shared base checkout and sees
-everything, so for whole-working-tree analysis (auditing gitignored vendored
-repos, or in-flight uncommitted WIP) either keep the job uncontended or pass an
-**absolute** path to the file/dir under analysis.
+reaches the real tree instead of reporting a working-tree feature as absent.
+Review deliberately keeps its exact-head binding and does not add that
+committed-tip context note. For whole-working-tree ask analysis, use a foreground
+or task-bearing ask, or pass an **absolute** path to the file/dir under analysis.
 
 ## Coordinator-Owned Review
 
@@ -16519,6 +16535,13 @@ continuing would require credentials or destructive operations the user did not
 approve.
 
 ## Delegation Worktree Reclaim
+
+Local review dispatches use the same owned read-only-worktree lifecycle as
+read-only delegations, but allocate at the requested PR head rather than
+checkout `HEAD`. The dispatch keeps `head_sha` in the payload and fails closed
+if allocation, the pull-ref retry, or the 5 GiB free-space preflight fails. The
+stable review Task row does not own this checkout. Background taskless asks keep
+their separate fail-open committed-tip isolation policy.
 
 The daemon force-reclaims a recorded delegation/read-only worktree only when its
 owning job is final (`succeeded`, `failed`, or `cancelled`) and its terminal

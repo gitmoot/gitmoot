@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -26,6 +25,16 @@ var newAgentDispatchGitHubClient = func(checkout string) github.Client {
 }
 
 var localAgentDispatchRuntimeAdapterFor = runtimeAdapterFor
+
+var dispatchPromptHeadContradictionWarnings = promptHeadContradictionWarnings
+
+var allocateDispatchReadOnlyWorktree = workflow.AllocateReadOnlyWorktree
+
+var fetchDispatchReviewPullRequest = func(ctx context.Context, git gitutil.Client, pullRequest int) error {
+	return git.FetchPullRequest(ctx, "origin", pullRequest)
+}
+
+const reviewReadOnlyWorktreeMinFreeBytes uint64 = 5 << 30
 
 type localAgentDispatchRequest struct {
 	RepoFlag       string
@@ -247,14 +256,13 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	}
 	switch request.Action {
 	case "review":
-		var checkout string
-		var err error
-		request, checkout, err = prepareLocalReviewDispatchRequest(ctx, store, record, repo, request)
-		if err != nil {
+		if err := reviewReadOnlyWorktreeCapacity(request.Home); err != nil {
 			return localAgentJobOutput{}, err
 		}
-		if strings.TrimSpace(checkout) != "" {
-			checkoutPath = checkout
+		var err error
+		request, err = prepareLocalReviewDispatchRequest(ctx, store, record, repo, request)
+		if err != nil {
+			return localAgentJobOutput{}, err
 		}
 	case "implement":
 		var task db.Task
@@ -267,7 +275,14 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			checkoutPath = task.WorktreePath
 		}
 	}
-	promptHeadWarnings := promptHeadContradictionWarnings(ctx, gitutil.Client{Dir: checkoutPath}, request.Instructions, request.HeadSHA)
+	var promptHeadWarnings []string
+	if request.Action != "review" {
+		// Keep ask and implement on the pre-allocation scanner seam: ask must scan
+		// the canonical checkout with its inherited dispatch head before its
+		// committed-tip worktree clears that head. Only review scans its newly
+		// allocated exact-head checkout below.
+		promptHeadWarnings = dispatchPromptHeadContradictionWarnings(ctx, gitutil.Client{Dir: checkoutPath}, request.Instructions, request.HeadSHA)
+	}
 	// A --recipe routes this coordinator to a named built-in recipe template's
 	// prompt (resolved from the installed-template store) without rebinding the
 	// agent; the override is captured into the job payload at enqueue time.
@@ -279,27 +294,35 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		}
 		recipeTemplate = &tmpl
 	}
-	// #739: give a BACKGROUND read-only (ask) job its own detached committed-tip
-	// worktree BEFORE enqueue — the proven read-only delegation fan-out shape — so
+	// Give an eligible read-only job its own detached worktree BEFORE enqueue so
 	// its checkout key is worktree:<path> (queuedJobCheckoutKey) and same-repo
 	// seats (moot, chat-task, autorespond, `agent ask --background`) run
 	// concurrently instead of serializing on the shared repo:<repo> key. Foreground
-	// asks run inline and never serialize, so they are left untouched. Review is
-	// excluded because it already carries a per-PR task worktree (TaskID set) that
-	// keys it off its own worktree. FAIL-OPEN: on any allocation failure the job is
-	// enqueued unchanged (shared checkout, serialized) with a loud skip event —
-	// dispatch never fails for a lost-parallelism optimization.
+	// asks run inline and never serialize, so they are left untouched. Ask remains
+	// FAIL-OPEN because its isolation is a throughput optimization. Review is
+	// FAIL-CLOSED because falling back to its shared checkout would review a commit
+	// other than the requested head.
 	jobID := localAgentJobID(request.Action, agent.Name)
 	readOnlyWorktreePath, readOnlyWorktreeErr := maybeAllocateDispatchReadOnlyWorktree(ctx, store, request, repo.FullName(), record.CheckoutPath, jobID)
+	if request.Action == "review" {
+		if readOnlyWorktreeErr != nil {
+			return localAgentJobOutput{}, fmt.Errorf("allocate exact-head review worktree: %w", readOnlyWorktreeErr)
+		}
+		if strings.TrimSpace(readOnlyWorktreePath) == "" {
+			return localAgentJobOutput{}, errors.New("allocate exact-head review worktree: no worktree was allocated")
+		}
+		checkoutPath = readOnlyWorktreePath
+		promptHeadWarnings = dispatchPromptHeadContradictionWarnings(ctx, gitutil.Client{Dir: checkoutPath}, request.Instructions, request.HeadSHA)
+	}
 	if readOnlyWorktreePath != "" {
-		// The detached worktree is the committed tip of the checkout HEAD, which may
-		// have advanced past any inherited HeadSHA. Clear it so the job validates
-		// against its own fresh worktree HEAD (matching the delegation path). The
-		// worktree omits gitignored (repos/**) and uncommitted working-tree files, so
-		// point the job at the canonical base checkout for those (#654).
-		request.HeadSHA = ""
-		if note := workflow.ReadOnlyWorktreeContextNote(record.CheckoutPath); note != "" {
-			request.Instructions += note
+		if request.Action != "review" {
+			// An ask worktree is the committed tip of checkout HEAD, which may have
+			// advanced past its inherited HeadSHA. Review is different: its worktree
+			// was allocated at that exact SHA, so the binding must remain in payload.
+			request.HeadSHA = ""
+			if note := workflow.ReadOnlyWorktreeContextNote(record.CheckoutPath); note != "" {
+				request.Instructions += note
+			}
 		}
 	}
 	job, err := (workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(request.Home), RuntimeDefaultModel: runtimeDefaultModelResolver(request.Home), RequireWorkflowPolicy: requireWorkflowPolicyResolver(request.Home), OrgPolicy: orgPolicy}).Enqueue(ctx, workflow.JobRequest{
@@ -765,14 +788,14 @@ func validateLocalReviewLeadAtDispatch(ctx context.Context, store *db.Store, req
 	return request, nil
 }
 
-func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, record db.Repo, repo github.Repository, request localAgentDispatchRequest) (localAgentDispatchRequest, string, error) {
+func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, record db.Repo, repo github.Repository, request localAgentDispatchRequest) (localAgentDispatchRequest, error) {
 	if request.PullRequest <= 0 {
-		return localAgentDispatchRequest{}, "", errors.New("agent review requires --pr number")
+		return localAgentDispatchRequest{}, errors.New("agent review requires --pr number")
 	}
 	if strings.TrimSpace(request.Branch) == "" || strings.TrimSpace(request.HeadSHA) == "" {
 		pr, err := newAgentDispatchGitHubClient(record.CheckoutPath).GetPullRequest(ctx, repo, int64(request.PullRequest))
 		if err != nil {
-			return localAgentDispatchRequest{}, "", fmt.Errorf("resolve pull request #%d: %w", request.PullRequest, err)
+			return localAgentDispatchRequest{}, fmt.Errorf("resolve pull request #%d: %w", request.PullRequest, err)
 		}
 		if strings.TrimSpace(request.Branch) == "" {
 			request.Branch = pr.HeadRef
@@ -782,41 +805,37 @@ func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, rec
 		}
 	}
 	if match, detected, err := workflow.DetectReviewLoop(ctx, store, repo.FullName(), request.PullRequest, request.HeadSHA); err != nil {
-		return localAgentDispatchRequest{}, "", err
+		return localAgentDispatchRequest{}, err
 	} else if detected {
-		return localAgentDispatchRequest{}, "", errors.New(match.Reason())
+		return localAgentDispatchRequest{}, errors.New(match.Reason())
 	}
-	return prepareLocalReviewWorktree(ctx, store, record, repo, request)
+	return prepareLocalReviewTask(ctx, store, repo, request)
 }
 
-func prepareLocalReviewWorktree(ctx context.Context, store *db.Store, record db.Repo, repo github.Repository, request localAgentDispatchRequest) (localAgentDispatchRequest, string, error) {
+func prepareLocalReviewTask(ctx context.Context, store *db.Store, repo github.Repository, request localAgentDispatchRequest) (localAgentDispatchRequest, error) {
 	if strings.TrimSpace(request.HeadSHA) == "" {
-		return localAgentDispatchRequest{}, "", errors.New("agent review requires a pull request head SHA")
+		return localAgentDispatchRequest{}, errors.New("agent review requires a pull request head SHA")
 	}
 	if strings.TrimSpace(request.Branch) != "" {
 		if task, err := store.GetTaskByRepoBranch(ctx, repo.FullName(), request.Branch); err == nil {
 			if workflow.IsDisposedTaskState(task.State) {
-				return localAgentDispatchRequest{}, "", disposedReviewTaskError(task)
+				return localAgentDispatchRequest{}, disposedReviewTaskError(task)
 			}
 			if strings.TrimSpace(task.WorktreePath) != "" {
 				head, headErr := (gitutil.Client{Dir: task.WorktreePath}).HeadSHA(ctx)
 				if headErr != nil {
-					return localAgentDispatchRequest{}, "", headErr
+					return localAgentDispatchRequest{}, headErr
 				}
 				if head == request.HeadSHA {
 					request.TaskID = task.ID
 					request.GoalID = firstNonEmpty(request.GoalID, task.GoalID)
 					request.TaskTitle = firstNonEmpty(request.TaskTitle, task.Title)
-					return request, task.WorktreePath, nil
+					return request, nil
 				}
 			}
 		} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return localAgentDispatchRequest{}, "", err
+			return localAgentDispatchRequest{}, err
 		}
-	}
-	paths, err := initializedPaths(request.Home)
-	if err != nil {
-		return localAgentDispatchRequest{}, "", err
 	}
 	taskID := strings.TrimSpace(request.TaskID)
 	if taskID == "" {
@@ -824,28 +843,10 @@ func prepareLocalReviewWorktree(ctx context.Context, store *db.Store, record db.
 	}
 	if existing, err := store.GetTask(ctx, taskID); err == nil {
 		if workflow.IsDisposedTaskState(existing.State) {
-			return localAgentDispatchRequest{}, "", disposedReviewTaskError(existing)
+			return localAgentDispatchRequest{}, disposedReviewTaskError(existing)
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
-		return localAgentDispatchRequest{}, "", err
-	}
-	path, err := workflow.TaskWorktreePath(paths.Home, repo.FullName(), taskID)
-	if err != nil {
-		return localAgentDispatchRequest{}, "", err
-	}
-	if _, err := os.Stat(path); err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return localAgentDispatchRequest{}, "", err
-		}
-		git := gitutil.Client{Dir: record.CheckoutPath}
-		if err := git.AddDetachedWorktree(ctx, path, request.HeadSHA); err != nil {
-			if fetchErr := git.FetchPullRequest(ctx, "origin", request.PullRequest); fetchErr != nil {
-				return localAgentDispatchRequest{}, "", fmt.Errorf("create PR review worktree: %w; fetch PR ref: %v", err, fetchErr)
-			}
-			if retryErr := git.AddDetachedWorktree(ctx, path, request.HeadSHA); retryErr != nil {
-				return localAgentDispatchRequest{}, "", fmt.Errorf("create PR review worktree after fetch: %w", retryErr)
-			}
-		}
+		return localAgentDispatchRequest{}, err
 	}
 	task := db.Task{
 		ID:           taskID,
@@ -853,25 +854,24 @@ func prepareLocalReviewWorktree(ctx context.Context, store *db.Store, record db.
 		GoalID:       firstNonEmpty(request.GoalID, "local-review"),
 		Title:        firstNonEmpty(request.TaskTitle, fmt.Sprintf("Review PR #%d", request.PullRequest)),
 		State:        string(workflow.TaskReviewing),
-		WorktreePath: path,
 	}
 	updated, err := store.UpsertTaskUnlessStates(ctx, task, []string{
 		string(workflow.TaskDismissed), string(workflow.TaskSuperseded), string(workflow.TaskStranded),
 	})
 	if err != nil {
-		return localAgentDispatchRequest{}, "", err
+		return localAgentDispatchRequest{}, err
 	}
 	if !updated {
 		existing, loadErr := store.GetTask(ctx, task.ID)
 		if loadErr != nil {
-			return localAgentDispatchRequest{}, "", loadErr
+			return localAgentDispatchRequest{}, loadErr
 		}
-		return localAgentDispatchRequest{}, "", disposedReviewTaskError(existing)
+		return localAgentDispatchRequest{}, disposedReviewTaskError(existing)
 	}
 	request.TaskID = task.ID
 	request.GoalID = task.GoalID
 	request.TaskTitle = task.Title
-	return request, path, nil
+	return request, nil
 }
 
 func dismissedReviewTaskError(taskID string) error {
@@ -1612,33 +1612,29 @@ func localAgentJobID(action string, agent string) string {
 
 // dispatchReadOnlyWorktreeEligible reports whether a dispatch should allocate a
 // dedicated detached committed-tip worktree for read-only isolation (#739). It is
-// true ONLY for a BACKGROUND read-only (ask/review) job that does not already
-// carry a task worktree: a foreground ask runs inline and never serializes, and a
-// job with a TaskID (every `agent review`, which prepares a per-PR worktree
-// upstream) is already keyed off its own worktree. Mirrors poolIsolationEligible.
+// true for every review and only a BACKGROUND ask without a TaskID. Review task
+// identity is durable lifecycle metadata, not checkout ownership; each review
+// job needs its own exact-head worktree. A foreground ask runs inline, and a
+// task-bearing ask preserves its existing checkout behavior.
 func dispatchReadOnlyWorktreeEligible(request localAgentDispatchRequest) bool {
-	if !request.Background {
-		return false
-	}
 	switch strings.TrimSpace(request.Action) {
-	case "ask", "review":
+	case "review":
+		return true
+	case "ask":
+		return request.Background && strings.TrimSpace(request.TaskID) == ""
 	default:
 		return false
 	}
-	return strings.TrimSpace(request.TaskID) == ""
 }
 
 // maybeAllocateDispatchReadOnlyWorktree allocates a throwaway detached
 // committed-tip worktree for an eligible background read-only job so it is born
 // with a distinct worktree:<path> checkout key (#739). It resolves the ref to the
-// checkout HEAD (always resolvable — the researchers' diagnostic showed the
-// stale-branch ref is a red herring; the real trigger was the reactive path being
-// headroom-gated and silent) via the shared workflow.AllocateReadOnlyWorktree
-// primitive, holding the checkout mutation lock. It is FAIL-OPEN: it returns
-// ("", nil) when the job is ineligible or the checkout is unknown, and ("", err)
-// on a genuine allocation failure so the caller enqueues unchanged and emits a
-// loud skip event. The manager is the checkout-bound gitutil.Client, exactly as
-// the reactive pool-isolation path builds it.
+// checkout HEAD for ask and to HeadSHA for review via the shared
+// workflow.AllocateReadOnlyWorktree primitive, holding the checkout mutation
+// lock. Ask remains fail-open at the call site. Review retries after fetching the
+// PR ref for a cold checkout, then fails closed at the call site rather than
+// falling back to the stale shared checkout.
 func maybeAllocateDispatchReadOnlyWorktree(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string, checkout string, jobID string) (string, error) {
 	if !dispatchReadOnlyWorktreeEligible(request) {
 		return "", nil
@@ -1650,11 +1646,44 @@ func maybeAllocateDispatchReadOnlyWorktree(ctx context.Context, store *db.Store,
 	if err != nil {
 		return "", err
 	}
-	// Ref defaults to HEAD (baseBranch left empty): a committed-tip worktree that is
-	// always resolvable, avoiding the stale current-branch fragility the researchers
-	// flagged. The #654 context note points the job at the canonical checkout for
-	// uncommitted/gitignored paths.
-	return workflow.AllocateReadOnlyWorktree(ctx, store, paths.Home, repo, checkout, jobID, "readonly-seat", 0, "", workflow.ReadOnlyWorktreeDispatchLockWaitBudget, gitutil.Client{Dir: checkout})
+	baseRef := ""
+	if strings.TrimSpace(request.Action) == "review" {
+		baseRef = strings.TrimSpace(request.HeadSHA)
+		if baseRef == "" {
+			return "", errors.New("review read-only worktree requires a head SHA")
+		}
+	}
+	git := gitutil.Client{Dir: checkout}
+	path, err := allocateDispatchReadOnlyWorktree(ctx, store, paths.Home, repo, checkout, jobID, "readonly-seat", 0, baseRef, workflow.ReadOnlyWorktreeDispatchLockWaitBudget, git)
+	if err == nil || strings.TrimSpace(request.Action) != "review" {
+		return path, err
+	}
+	// A cold checkout may not have the PR commit object even though the forge
+	// supplied its SHA. Preserve the existing pull/<n>/head fetch fallback before
+	// refusing the dispatch.
+	if fetchErr := fetchDispatchReviewPullRequest(ctx, git, request.PullRequest); fetchErr != nil {
+		return "", fmt.Errorf("allocate review worktree: %w; fetch PR ref: %v", err, fetchErr)
+	}
+	path, retryErr := allocateDispatchReadOnlyWorktree(ctx, store, paths.Home, repo, checkout, jobID, "readonly-seat", 0, baseRef, workflow.ReadOnlyWorktreeDispatchLockWaitBudget, git)
+	if retryErr != nil {
+		return "", fmt.Errorf("allocate review worktree after fetch: %w", retryErr)
+	}
+	return path, nil
+}
+
+func reviewReadOnlyWorktreeCapacity(home string) error {
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return err
+	}
+	usage, err := measureDiskGuardFilesystem(paths.Home)
+	if err != nil {
+		return fmt.Errorf("review worktree capacity is unknown: %w", err)
+	}
+	if usage.FreeBytes < reviewReadOnlyWorktreeMinFreeBytes {
+		return fmt.Errorf("review worktree requires at least %d free bytes; %d available", reviewReadOnlyWorktreeMinFreeBytes, usage.FreeBytes)
+	}
+	return nil
 }
 
 func printLocalAgentJobOutput(stdout io.Writer, output localAgentJobOutput) {

@@ -545,8 +545,11 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
 
    Implement jobs require the agent to hold the branch lock. Review and ask jobs
    are routed through the runtime adapter and must return the `gitmoot_result`
-   JSON contract. Jobs tied to a task worktree use that worktree for validation;
-   jobs without a task worktree use the registered checkout.
+   JSON contract. A newly dispatched local review always owns a detached
+   read-only per-job worktree at its requested head; its stable Task row tracks
+   lifecycle only. Review allocation fails closed and requires a measurable
+   5 GiB free-space floor. Other jobs tied to a task worktree use that worktree;
+   jobs without an owned or task worktree use the registered checkout.
 
    For a local chat ask that should not go through a PR comment, call the same
    registered agent directly:

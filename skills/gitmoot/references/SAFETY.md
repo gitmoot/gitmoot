@@ -427,6 +427,13 @@ approve.
 
 ## Delegation Worktree Reclaim
 
+Local review dispatches use the same owned read-only-worktree lifecycle as
+read-only delegations, but allocate at the requested PR head rather than
+checkout `HEAD`. The dispatch keeps `head_sha` in the payload and fails closed
+if allocation, the pull-ref retry, or the 5 GiB free-space preflight fails. The
+stable review Task row does not own this checkout. Background taskless asks keep
+their separate fail-open committed-tip isolation policy.
+
 The daemon force-reclaims a recorded delegation/read-only worktree only when its
 owning job is final (`succeeded`, `failed`, or `cancelled`) and its terminal
 `updated_at` is older than `[workflow].delegation_worktree_ttl` (default `72h`;
