@@ -293,6 +293,11 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 					if pollErrors.shouldReport("poll: "+err.Error(), time.Now().UTC()) {
 						writeLine(stdout, "poll error: %s", err)
 					}
+				} else {
+					// A clean poll ENDS the episode. Without this a fault that recovers
+					// and returns is reported once and then silently suppressed, which
+					// is worse than the unbounded stream it replaced.
+					pollErrors.recordSuccess()
 				}
 				polledFull = true
 			}
@@ -1316,37 +1321,97 @@ func shorterWait(current time.Duration, candidate time.Duration, set *bool) time
 // an operator would tolerate silence about an ongoing fault.
 const pollErrorReportWindow = 5 * time.Minute
 
+// pollErrorReporterTrackedCauses caps how many distinct causes are remembered, so a cause whose
+// text varies on every occurrence cannot grow this map without bound.
+const pollErrorReporterTrackedCauses = 32
+
+// pollErrorReporterBurst is the hard ceiling on emissions per window ACROSS ALL causes. Keying
+// per cause bounds each cause; it does not bound their number. An error whose text embeds a
+// timestamp or SHA makes every occurrence a new key, so per-cause limiting alone degrades to no
+// limiting at all -- which is the flood this exists to stop.
+const pollErrorReporterBurst = 6
+
 // pollErrorReporter rate-limits repeated poll diagnostics.
 //
-// It keys on the CAUSE rather than on time alone. Suppressing by time would swallow a second,
-// DIFFERENT failure that arrives inside a running window -- converting a bounded diagnostic
-// into a lost one, which is the defect this reporting exists to fix, pointed the other way.
-// The first occurrence of any cause is always reported, so a failure's onset is never hidden.
+// The first version remembered only the IMMEDIATELY PREVIOUS cause, which failed three ways
+// review demonstrated: A/B/A/B emitted every occurrence despite a stated once-per-cause window;
+// dynamic error text was unbounded for the same reason; and A/success/A SUPPRESSED the onset of
+// a genuinely new incident, because a single slot cannot distinguish "still failing" from
+// "failed, recovered, failed again". The third is the serious one -- a limiter added to stop a
+// flood was hiding an onset, the exact failure it claimed to be designed against.
+//
+// Three mechanisms, because the three failures are independent:
+//
+//	PER-CAUSE WINDOW - each distinct cause reports at most once per window, so alternating
+//	                   causes no longer defeat the limit.
+//	RESET ON SUCCESS - a successful poll clears the episode, so a recurrence AFTER recovery is
+//	                   a new incident and reports immediately. Silence must never outlive the
+//	                   failure that justified it.
+//	GLOBAL BURST     - a ceiling across all causes per window, because per-cause keying cannot
+//	                   bound a cause whose text is different every time.
+//
+// It is not safe for concurrent use and does not need to be: it is owned by one supervisor
+// loop, which polls sequentially.
 type pollErrorReporter struct {
-	window time.Duration
-	cause  string
-	last   time.Time
+	window      time.Duration
+	seen        map[string]time.Time
+	windowStart time.Time
+	emitted     int
 }
 
 func newPollErrorReporter(window time.Duration) *pollErrorReporter {
 	if window <= 0 {
 		window = pollErrorReportWindow
 	}
-	return &pollErrorReporter{window: window}
+	return &pollErrorReporter{window: window, seen: make(map[string]time.Time)}
+}
+
+// recordSuccess clears the episode. A cause seen before a success and again after it describes
+// a NEW incident, and reporting only the first would tell an operator the fault ended when it
+// did not.
+func (r *pollErrorReporter) recordSuccess() {
+	if r == nil {
+		return
+	}
+	r.seen = make(map[string]time.Time)
+	r.emitted = 0
+	r.windowStart = time.Time{}
 }
 
 func (r *pollErrorReporter) shouldReport(cause string, now time.Time) bool {
 	if r == nil {
 		return true
 	}
-	if cause != r.cause {
-		r.cause = cause
-		r.last = now
-		return true
+	if r.windowStart.IsZero() || now.Sub(r.windowStart) >= r.window {
+		r.windowStart = now
+		r.emitted = 0
 	}
-	if now.Sub(r.last) < r.window {
+	if last, ok := r.seen[cause]; ok && now.Sub(last) < r.window {
 		return false
 	}
-	r.last = now
+	if r.emitted >= pollErrorReporterBurst {
+		// Bounded even for ever-changing text. Deliberately silent rather than emitting a
+		// "suppressed N" line: that line is itself per-window output and would reintroduce
+		// the unbounded stream in a thinner disguise.
+		return false
+	}
+	if len(r.seen) >= pollErrorReporterTrackedCauses {
+		r.evictOldest()
+	}
+	r.seen[cause] = now
+	r.emitted++
 	return true
+}
+
+func (r *pollErrorReporter) evictOldest() {
+	oldestKey := ""
+	var oldest time.Time
+	for k, v := range r.seen {
+		if oldestKey == "" || v.Before(oldest) {
+			oldestKey, oldest = k, v
+		}
+	}
+	if oldestKey != "" {
+		delete(r.seen, oldestKey)
+	}
 }

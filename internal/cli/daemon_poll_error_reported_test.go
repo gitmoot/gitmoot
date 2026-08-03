@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -63,12 +64,12 @@ func TestSingleRepoSupervisorReportsPollErrorAndKeepsPolling(t *testing.T) {
 		return len(p), nil
 	})
 
-	live := newDaemonReloadableConfig(10*time.Millisecond, 1, false)
+	live := newDaemonReloadableConfig(200*time.Millisecond, 1, false)
 	d := daemon.Daemon{
 		Repo:         github.Repository{Owner: "owner", Name: "repo"},
 		Store:        store,
 		GitHub:       client,
-		PollInterval: 10 * time.Millisecond,
+		PollInterval: 200 * time.Millisecond,
 	}
 
 	done := make(chan error, 1)
@@ -90,13 +91,20 @@ func TestSingleRepoSupervisorReportsPollErrorAndKeepsPolling(t *testing.T) {
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
-	// Cancel and stop observing. This test deliberately does NOT assert the supervisor
-	// returns promptly: shutdown drains the in-flight tracker and the worker loop, which is a
-	// separate property with its own timeouts, and folding it in here would make this guard
-	// slow and flaky for a fact it does not claim. Both assertions below were established
-	// while the loop was running.
+	// Cancel, then JOIN. The previous version cancelled and never received from done, which
+	// left the supervisor goroutine running into the temp-store teardown -- a test leaking
+	// work into another test's environment.
+	//
+	// The join is lifecycle cleanup, not an assertion about shutdown LATENCY: draining the
+	// in-flight tracker and worker loop is a separate property with its own timeouts, and this
+	// guard does not claim it. The bound is generous for that reason, and both assertions
+	// below were established while the loop was still running.
 	cancel()
-	_ = done
+	select {
+	case <-done:
+	case <-time.After(90 * time.Second):
+		t.Error("supervisor goroutine did not exit within 90s of cancellation; it is leaking into store teardown")
+	}
 
 	mu.Lock()
 	got := out.String()
@@ -136,6 +144,88 @@ func (f *countingPollFakeGitHub) calls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.n
+}
+
+// TestSupervisorPollErrorReporterBoundsWithoutHidingAnOnset pins all three failures review
+// found in the first limiter, as separate cases, because they are independent and a single
+// "the limiter works" assertion answers none of them.
+func TestSupervisorPollErrorReporterBoundsWithoutHidingAnOnset(t *testing.T) {
+	base := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+
+	t.Run("identical cause is limited, first is always reported", func(t *testing.T) {
+		r := newPollErrorReporter(time.Minute)
+		if !r.shouldReport("rate limited", base) {
+			t.Fatal("the FIRST occurrence was suppressed; an operator must always see a failure's onset")
+		}
+		if r.shouldReport("rate limited", base.Add(59*time.Second)) {
+			t.Fatal("an identical cause inside the window was reported; a persistent failure floods the log")
+		}
+		if !r.shouldReport("rate limited", base.Add(time.Minute)) {
+			t.Fatal("an identical cause was still suppressed AFTER the window; the failure would go silent while still happening")
+		}
+	})
+
+	t.Run("alternating causes do not defeat the window", func(t *testing.T) {
+		// The first limiter remembered only the PREVIOUS cause, so A/B/A/B emitted every
+		// occurrence -- the limit existed in name only for the commonest real pattern, two
+		// interleaved faults.
+		r := newPollErrorReporter(time.Minute)
+		if !r.shouldReport("A", base) || !r.shouldReport("B", base) {
+			t.Fatal("first occurrences of A and B must both report")
+		}
+		if r.shouldReport("A", base.Add(time.Second)) {
+			t.Fatal("cause A reported again inside its window because B intervened; the limiter is single-slot")
+		}
+		if r.shouldReport("B", base.Add(2*time.Second)) {
+			t.Fatal("cause B reported again inside its window because A intervened; the limiter is single-slot")
+		}
+	})
+
+	t.Run("a success ends the episode so a recurrence is a new onset", func(t *testing.T) {
+		// The dangerous one. A/success/A is a fault that recovered and RETURNED. Suppressing
+		// the second A tells the operator the incident ended when a new one had begun.
+		r := newPollErrorReporter(time.Hour)
+		if !r.shouldReport("flaky remote", base) {
+			t.Fatal("first occurrence suppressed")
+		}
+		r.recordSuccess()
+		if !r.shouldReport("flaky remote", base.Add(time.Second)) {
+			t.Fatal("a recurrence AFTER a successful poll was suppressed: a limiter meant to bound a flood is hiding the onset of a new incident")
+		}
+	})
+
+	t.Run("ever-changing cause text is still bounded", func(t *testing.T) {
+		// Per-cause keying bounds each cause and says nothing about their NUMBER. An error
+		// embedding a timestamp or SHA makes every occurrence a new key, so per-cause
+		// limiting alone degrades to no limiting -- exactly the flood being fixed.
+		r := newPollErrorReporter(time.Hour)
+		reported := 0
+		for i := 0; i < 500; i++ {
+			if r.shouldReport(fmt.Sprintf("transient failure at seq %d", i), base.Add(time.Duration(i)*time.Millisecond)) {
+				reported++
+			}
+		}
+		if reported > pollErrorReporterBurst {
+			t.Fatalf("emitted %d lines for 500 distinct causes in one window, want at most %d; unique text defeats the limit entirely", reported, pollErrorReporterBurst)
+		}
+		if reported == 0 {
+			t.Fatal("emitted nothing at all; a bound that reports nothing is not a bound, it is silence")
+		}
+		// And the burst must REFILL, or a fault that changes text is permanently muted.
+		if !r.shouldReport("a later distinct failure", base.Add(2*time.Hour)) {
+			t.Fatal("the global burst never refilled; after one noisy window the operator is muted forever")
+		}
+	})
+
+	t.Run("tracked causes are bounded", func(t *testing.T) {
+		r := newPollErrorReporter(time.Hour)
+		for i := 0; i < 500; i++ {
+			r.shouldReport(fmt.Sprintf("cause %d", i), base.Add(time.Duration(i)*time.Millisecond))
+		}
+		if len(r.seen) > pollErrorReporterTrackedCauses {
+			t.Fatalf("tracking %d causes, want at most %d; the map grows without bound on varying text", len(r.seen), pollErrorReporterTrackedCauses)
+		}
+	})
 }
 
 // TestSupervisorPollErrorReporterRateLimitsRepeats bounds the MEDIUM finding.
