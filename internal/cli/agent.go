@@ -168,6 +168,9 @@ func runAgentAsk(args []string, stdout, stderr io.Writer) int {
 			SelectedActionReason: "explicit agent ask",
 			ExecutionPath:        "agent_ask",
 			JSONOutput:           options.jsonOutput,
+			DispatchWarning: func(warning string) {
+				fmt.Fprintf(stderr, "agent ask: warning: %s\n", warning)
+			},
 		})
 		return err
 	}); err != nil {
@@ -569,7 +572,13 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 	var output localAgentJobOutput
 	if err := withStore(options.home, func(store *db.Store) error {
 		var err error
-		output, err = dispatchLocalAgentJob(dispatchCtx, store, localAgentDispatchRequestFromOptions(options, action, reason, executionPath))
+		request := localAgentDispatchRequestFromOptions(options, action, reason, executionPath)
+		// C4a: the dispatch surface warns when the prompt cites a commit other than
+		// the dispatch head. Set after the helper so main's extraction is preserved.
+		request.DispatchWarning = func(warning string) {
+			fmt.Fprintf(stderr, "%s: warning: %s\n", errLabel, warning)
+		}
+		output, err = dispatchLocalAgentJob(dispatchCtx, store, request)
 		return err
 	}); err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", errLabel, err)

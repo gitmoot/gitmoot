@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -87,7 +88,12 @@ type localAgentDispatchRequest struct {
 	// "[live A/B] ..." to the JSON object and break parsing) and never runs the
 	// second challenger Deliver, falling through to the plain single ask.
 	JSONOutput bool
+	// DispatchWarning surfaces advisory pre-delivery checks to the operator. It
+	// is deliberately not persisted in the job payload.
+	DispatchWarning func(string)
 }
+
+var promptCommitTokenRE = regexp.MustCompile(`\b[0-9a-fA-F]{7,64}\b`)
 
 type localAgentJobOutput struct {
 	JobID                string                `json:"job_id"`
@@ -261,6 +267,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			checkoutPath = task.WorktreePath
 		}
 	}
+	promptHeadWarnings := promptHeadContradictionWarnings(ctx, gitutil.Client{Dir: checkoutPath}, request.Instructions, request.HeadSHA)
 	// A --recipe routes this coordinator to a named built-in recipe template's
 	// prompt (resolved from the installed-template store) without rebinding the
 	// agent; the override is captured into the job payload at enqueue time.
@@ -343,6 +350,12 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	}
 	if err := releaseReservation(ctx); err != nil {
 		return localAgentJobOutput{}, err
+	}
+	for _, warning := range promptHeadWarnings {
+		_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "prompt_head_warning", Message: warning})
+		if request.DispatchWarning != nil {
+			request.DispatchWarning(warning)
+		}
 	}
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "route_selected", Message: routeSelectedMessage(request)}); err != nil {
 		return localAgentJobOutput{}, err
@@ -534,6 +547,42 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		return localAgentJobOutput{}, err
 	}
 	return buildLocalAgentJobOutput(latest, request)
+}
+
+func promptHeadContradictionWarnings(ctx context.Context, git gitutil.Client, prompt string, dispatchHead string) []string {
+	if strings.TrimSpace(prompt) == "" {
+		return nil
+	}
+	headRef := strings.TrimSpace(dispatchHead)
+	if headRef == "" {
+		headRef = "HEAD"
+	}
+	resolvedHead, err := git.RevParse(ctx, headRef+"^{commit}")
+	if err != nil {
+		return nil
+	}
+
+	warnings := make([]string, 0)
+	seenCommits := make(map[string]struct{})
+	for _, token := range promptCommitTokenRE.FindAllString(prompt, -1) {
+		resolvedToken, err := git.RevParse(ctx, token+"^{commit}")
+		if err != nil {
+			continue
+		}
+		resolvedToken = strings.ToLower(strings.TrimSpace(resolvedToken))
+		if _, seen := seenCommits[resolvedToken]; seen {
+			continue
+		}
+		seenCommits[resolvedToken] = struct{}{}
+		// Compare identity directly, not reachability: cdd6598a is an ancestor of
+		// d8c17db0, which is exactly why it looked plausible and why an is-ancestor
+		// check would have waved it through.
+		if strings.EqualFold(resolvedToken, resolvedHead) {
+			continue
+		}
+		warnings = append(warnings, fmt.Sprintf("prompt references commit %s, but the dispatch head is %s; Gitmoot will use dispatch head %s", token, resolvedHead, resolvedHead))
+	}
+	return warnings
 }
 
 // foregroundAskTimeoutError turns a JobTimeout-driven context cancel into an
