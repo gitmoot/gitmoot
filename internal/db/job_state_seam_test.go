@@ -30,6 +30,20 @@ var jobStateWritePattern = regexp.MustCompile(`(?is)UPDATE\s+jobs\s+SET\s+state`
 // relocated statement lowers one -- so every change to the seam becomes a deliberate edit here
 // with a reason attached. That makes this a change-detector by design; the alternative, measured
 // twice on this PR, is a guard that silently stops constraining the thing it names.
+// ignoredWalkRoots are the repository-relative directories excluded from the scan: the
+// gitignored local-only roots AGENTS.md documents, plus build output and VCS metadata. Matching
+// is exact and top-level, so a package that merely SHARES one of these names is still scanned.
+var ignoredWalkRoots = map[string]bool{
+	".git":          true,
+	".gitmoot":      true,
+	"node_modules":  true,
+	"dist":          true,
+	"build":         true,
+	"repos":         true,
+	"GOALS":         true,
+	"website/build": true,
+}
+
 var jobStateWriteAllowlist = map[string]int{
 	"internal/db/store_jobs.go": 8,
 }
@@ -71,18 +85,22 @@ func TestEveryJobStateWriteBumpsTheLifecycleGeneration(t *testing.T) {
 			return err
 		}
 		if info.IsDir() {
-			// Skip repository-local, GITIGNORED artifact roots. Review found this walk
-			// failing on .gitmoot/evals/pr1411-pinned-.../internal/db/session_job_test.go --
-			// a PINNED SNAPSHOT of this very PR, whose old raw UPDATE the guard then
-			// reported as a live violation, and whose nested store_jobs.go inflated the
-			// counts. A guard whose result depends on which throwaway artifacts happen to
-			// exist locally is state-dependent and false-red, which is worse than the gap it
-			// closes: it fails for a reader who has done nothing wrong.
+			// Skip gitignored artifact roots BY REPOSITORY-RELATIVE PATH, never by directory
+			// NAME at arbitrary depth.
 			//
-			// These are the gitignored local-only roots AGENTS.md documents (/GOALS/,
-			// /repos/, /dist/, /.gitmoot/evals/) plus the usual build output.
-			switch info.Name() {
-			case ".git", ".gitmoot", "node_modules", "dist", "build", "repos", "GOALS", "evals":
+			// Two review findings shaped this. First, walking them at all made the guard
+			// state-dependent: it failed on .gitmoot/evals/pr1411-pinned-.../session_job_test.go
+			// -- a PINNED SNAPSHOT of this very PR -- reporting its superseded raw UPDATE as a
+			// live violation, with the nested store_jobs.go inflating the counts. A reader who
+			// had done nothing wrong would get a red blaming them for a throwaway artifact.
+			//
+			// Second, pruning by NAME then blinded the guard to legitimate packages: a writer
+			// added under internal/repos was invisible, while the identical writer under
+			// internal/repository was caught. "repos", "GOALS", "dist" and "evals" are ordinary
+			// identifiers and will be package names somewhere. Only the TOP-LEVEL roots
+			// AGENTS.md documents as gitignored are skipped.
+			rel, relErr := filepath.Rel(root, path)
+			if relErr == nil && ignoredWalkRoots[filepath.ToSlash(rel)] {
 				return filepath.SkipDir
 			}
 			return nil
@@ -160,8 +178,13 @@ func bumpFollowsSQLLiteral(text string, at int) bool {
 }
 
 // bumpConcatenation matches only at the START of the remainder, so nothing further along the
-// file can satisfy it.
-var bumpConcatenation = regexp.MustCompile("\\A\\s*\\+\\s*bumpLifecycleGenerationSQL")
+// file can satisfy it, AND requires the fragment to be the COMPLETE identifier.
+//
+// Without the trailing boundary, `bumpLifecycleGenerationSQL[:0]` satisfied the match while
+// contributing an EMPTY string to the SQL -- valid, bump-free, and green. A prefix match is not
+// a use of the fragment. The next character must not continue the identifier or subscript,
+// slice, or call it.
+var bumpConcatenation = regexp.MustCompile("\\A\\s*\\+\\s*bumpLifecycleGenerationSQL($|[^A-Za-z0-9_.\\[(])")
 
 func sameJobStateCounts(got, want map[string]int) bool {
 	if len(got) != len(want) {
