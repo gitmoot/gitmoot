@@ -944,9 +944,14 @@ idempotent `review_loop_detected` event. A new head proceeds, and mixed decision
 at one head also proceed because the earlier claim is unstable. The loop guard
 allows an empty head only before any succeeded review history exists for that
 repo/PR; after that it fails closed until the caller supplies the current head.
-The local CLI's existing worktree preparation still requires it to resolve a
-concrete head before dispatch. The prior verdict is escalation evidence only and
-is never served as the new result.
+The local CLI still requires a concrete head before dispatch. Each admitted
+local review gets its own detached, read-only per-job worktree at that exact
+commit; the stable per-PR Task row remains lifecycle metadata and no longer owns
+the review checkout. The requested `head_sha` stays on the job payload. Review
+allocation fails closed rather than falling back to the registered checkout,
+and dispatch refuses before Task mutation when the Gitmoot filesystem has less
+than 5 GiB free or free-space measurement is unavailable. The prior verdict is
+escalation evidence only and is never served as the new result.
 
 This exact `(repo, PR, head_sha, decision)` evidence key is intentional: the
 #1419 review panel rejected round counters and other instruments, so this guard
@@ -972,7 +977,9 @@ advances until [gitmoot#1433](https://github.com/gitmoot/gitmoot/issues/1433)
 adds the corresponding ingress preflight.
 
 Before delivery, these dispatch commands scan commit-shaped tokens against the
-target repository. If a token resolves to a commit other than the dispatch head,
+target repository. Ask and implement preserve their existing scanner input;
+review scans its newly allocated exact-head worktree with the requested head
+still bound. If a token resolves to a commit other than the dispatch head,
 Gitmoot prints an advisory warning such as
 `prompt references commit <referenced>, but the dispatch head is <head>; Gitmoot
 will use dispatch head <head>`. The job still runs because prompts may
@@ -1089,15 +1096,14 @@ line in human output. Genuine non-terminal failures (the job did not reach
 `succeeded`) still exit non-zero as before. A normal success with no advance error
 is byte-identical to prior behavior — no `advance_error` field is emitted.
 
-**Review resilience under branch churn.** A review job is pinned to the PR head
-SHA it was queued against; in an active dev loop the branch often advances (a new
-commit is pushed) before the queued review runs, leaving the registered checkout
-on a newer head. Rather than failing the review on that head-SHA mismatch, Gitmoot
-**re-syncs** it: when the PR is still **open**, the review is re-targeted to the
-checkout's current head — reviewing the newest commit is exactly what a human
-reviewer does — and a `review_head_resynced` job event records the old→new head.
-The mismatch is only allowed to fail cleanly when the PR is **closed/merged** (a
-stale review of a dead PR is not useful) or when the checkout is dirty. Relatedly,
+**Review resilience under branch churn.** Newly dispatched local reviews are
+pinned to the requested PR head in a per-job worktree, so a later branch push or
+registered-checkout movement cannot change what they review. The daemon keeps
+the older re-sync behavior only for legacy/fallback review jobs that lack an
+owned read-only worktree: when their shared checkout advances and the PR remains
+open on the same branch, it re-targets the payload and records
+`review_head_resynced`; closed/merged, dirty, or wrong-branch checkouts fail.
+Relatedly,
 when a foreground `agent review` finds the agent's serialized runtime session
 **busy**, the review is now **left queued** for the daemon to run when the session
 frees (a `requeued_runtime_busy` event is recorded) instead of being cancelled and

@@ -345,14 +345,14 @@ func TestCLIReviewLoopAllowsNewHeadAndMixedDecisions(t *testing.T) {
 		fixture := newCLIReviewLoopFixture(t)
 		seedCLIReviewLoopVerdict(t, fixture.store, "prior-review", "old-head", "changes_requested")
 		head := strings.TrimSpace(runGitOutput(t, fixture.checkout, "rev-parse", "HEAD"))
-		_, checkout, err := prepareLocalReviewDispatchRequest(context.Background(), fixture.store, fixture.record, fixture.repo, localAgentDispatchRequest{
+		request, err := prepareLocalReviewDispatchRequest(context.Background(), fixture.store, fixture.record, fixture.repo, localAgentDispatchRequest{
 			PullRequest: 227, Branch: "main", HeadSHA: head, Home: fixture.home,
 		})
 		if err != nil {
 			t.Fatalf("new-head prepare: %v", err)
 		}
-		if strings.TrimSpace(checkout) == "" {
-			t.Fatal("new-head prepare did not create/reuse a review worktree")
+		if strings.TrimSpace(request.TaskID) == "" {
+			t.Fatal("new-head prepare did not bind a review task")
 		}
 	})
 
@@ -361,14 +361,14 @@ func TestCLIReviewLoopAllowsNewHeadAndMixedDecisions(t *testing.T) {
 		head := strings.TrimSpace(runGitOutput(t, fixture.checkout, "rev-parse", "HEAD"))
 		seedCLIReviewLoopVerdict(t, fixture.store, "prior-approved", head, "approved")
 		seedCLIReviewLoopVerdict(t, fixture.store, "prior-changes", head, "changes_requested")
-		_, checkout, err := prepareLocalReviewDispatchRequest(context.Background(), fixture.store, fixture.record, fixture.repo, localAgentDispatchRequest{
+		request, err := prepareLocalReviewDispatchRequest(context.Background(), fixture.store, fixture.record, fixture.repo, localAgentDispatchRequest{
 			PullRequest: 227, Branch: "main", HeadSHA: head, Home: fixture.home,
 		})
 		if err != nil {
 			t.Fatalf("mixed-decision prepare: %v", err)
 		}
-		if strings.TrimSpace(checkout) == "" {
-			t.Fatal("mixed-decision prepare did not create/reuse a review worktree")
+		if strings.TrimSpace(request.TaskID) == "" {
+			t.Fatal("mixed-decision prepare did not bind a review task")
 		}
 	})
 }
