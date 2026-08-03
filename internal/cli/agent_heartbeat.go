@@ -46,7 +46,13 @@ func runAgentHeartbeat(args []string, stdout, stderr io.Writer) int {
 
 func printAgentHeartbeatUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot agent heartbeat add <agent> <name> --repo owner/repo --interval 24h --prompt \"...\" [--action ask|review|implement] [--runtime codex|claude|kimi] [--jitter 15m] [--max-concurrent 1] [--enabled]")
+	// The --runtime roster is DERIVED from config.HeartbeatRuntimes(), the same
+	// source the validator at runAgentHeartbeatAdd checks against, so help and
+	// accepted can never disagree. They did: HeartbeatRuntimes is derived from the
+	// adapter registry, so registering omp (#1428) widened it to codex|claude|kimi|omp
+	// while a hard-coded banner still denied omp existed.
+	fmt.Fprintf(w, "  gitmoot agent heartbeat add <agent> <name> --repo owner/repo --interval 24h --prompt \"...\" [--action %s] [--runtime %s] [--jitter 15m] [--max-concurrent 1] [--enabled]\n",
+		strings.Join(config.HeartbeatActions(), "|"), strings.Join(config.HeartbeatRuntimes(), "|"))
 	fmt.Fprintln(w, "  gitmoot agent heartbeat list [--agent <agent>]")
 	fmt.Fprintln(w, "  gitmoot agent heartbeat show <agent> <name>")
 	fmt.Fprintln(w, "  gitmoot agent heartbeat enable <agent> <name>")
@@ -62,7 +68,7 @@ func runAgentHeartbeatAdd(args []string, stdout, stderr io.Writer) int {
 	interval := fs.String("interval", "", "schedule interval, e.g. 24h (required)")
 	prompt := fs.String("prompt", "", "instructions the heartbeat sends the agent (required)")
 	action := fs.String("action", "ask", "heartbeat action: ask, review, or implement (implement is policy-gated)")
-	runtimeOverride := fs.String("runtime", "", "run this heartbeat on a specific runtime (codex|claude|kimi) instead of the agent default")
+	runtimeOverride := fs.String("runtime", "", fmt.Sprintf("run this heartbeat on a specific runtime (%s) instead of the agent default", strings.Join(config.HeartbeatRuntimes(), "|")))
 	jitter := fs.String("jitter", "", "random delay added to each interval, e.g. 15m (default 0s)")
 	maxConcurrent := fs.Int("max-concurrent", 1, "maximum concurrent jobs for this heartbeat")
 	enabled := fs.Bool("enabled", false, "enable the heartbeat immediately (default disabled)")

@@ -47,7 +47,49 @@ var curatedRuntimeEnvNames = map[string][]string{
 	runtime.ClaudeRuntime:  {"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CONFIG_DIR"},
 	runtime.KimiRuntime:    {},
 	runtime.KimiCLIRuntime: {},
-	runtime.ShellRuntime:   {},
+	// omp is a multi-provider ROUTING harness, so its curated set is ROUTING
+	// PLUMBING ONLY — which profile to run under, where the coding-agent state
+	// lives, which model each routing tier resolves to, and the optional auth
+	// broker endpoint. NO raw provider key (ANTHROPIC_*, OPENAI_*, GEMINI_*, the
+	// other 38) is listed on purpose.
+	//
+	// Scope of that claim, precisely: WHEN `[credentials] env_curation = true`,
+	// curation is fail-closed, so an unlisted name is dropped from the child env and
+	// a raw provider key can only reach omp through omp's own profile auth storage
+	// or an EXPLICIT credentials env_passthrough entry — the owner's lever, an act,
+	// not an inheritance. WITH CURATION OFF — which is the DEFAULT, `[credentials]`
+	// ships commented out (internal/config/init.go) and curatedJobRunner returns a
+	// nil runner below — this map is never consulted and omp inherits the daemon's
+	// whole environment, including any ambient ANTHROPIC_*/OPENAI_* keys, exactly
+	// like every other runtime. Curation is the owner's opt-in, not a property of
+	// registering omp.
+	//
+	// One deliberate exception even under curation: the OMP_AUTH_BROKER_* pair below
+	// IS a credential-acquisition path, not just plumbing. omp's
+	// resolveAuthBrokerConfig keys on exactly OMP_AUTH_BROKER_URL +
+	// OMP_AUTH_BROKER_TOKEN and then discovers a BROKER-BACKED auth storage instead
+	// of the local store, so an operator who exports that pair for the daemon has
+	// omp authenticate through the broker with no further act. It is listed on
+	// purpose (broker mode is how a fleet supplies omp auth without scattering raw
+	// keys), and the pair is INDIVISIBLE: omp throws when the URL is set and no
+	// token is available, so dropping only the token converts an inherited URL into
+	// a hard omp failure. Drop BOTH (and let env_passthrough carry them) if the
+	// owner wants omp strictly fail-closed.
+	//
+	// Caveat worth stating where the plumbing lives: `--profile` selects omp's
+	// auth/state store, it does NOT isolate process env, so a passthrough'd key is
+	// visible to every omp profile this daemon runs.
+	runtime.OmpRuntime: {
+		"OMP_PROFILE",
+		"PI_PROFILE",
+		"PI_CODING_AGENT_DIR",
+		"PI_SMOL_MODEL",
+		"PI_SLOW_MODEL",
+		"PI_PLAN_MODEL",
+		"OMP_AUTH_BROKER_URL",
+		"OMP_AUTH_BROKER_TOKEN",
+	},
+	runtime.ShellRuntime: {},
 }
 
 func curatedJobRunner(home string, runtimeName string) (subprocess.Runner, error) {

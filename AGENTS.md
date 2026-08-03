@@ -15,9 +15,10 @@ single static Go binary plus a background daemon; workflow state lives in local
 SQLite (the **modernc pure-Go** driver — no cgo). The single static binary with
 **zero runtime dependencies** is a core invariant.
 
-It drives four runtimes (`codex`, `claude`, `kimi`, `shell`). `agent start`
-supports codex/claude/kimi; `shell` is a subscribe-only command runtime used
-mainly to drive engine-feature E2Es with no LLM.
+It drives five runtimes (`codex`, `claude`, `kimi`, `omp`, `shell`; plus the
+legacy `kimi-cli`). `agent start` supports codex/claude/kimi/omp; `shell` is a
+subscribe-only command runtime used mainly to drive engine-feature E2Es with no
+LLM.
 
 ## Build, test, and verify (the gate)
 
@@ -138,7 +139,7 @@ boundary — component tests miss the home double-resolution bug class (#446/#45
 - `internal/daemon/` — the PR-watcher daemon package (poll/resume/revert logic).
 - `internal/workflow/` — the job/delegation engine, mailbox, memory controller,
   and the `gitmoot_result` contract.
-- `internal/runtime/` — the Codex/Claude/Kimi/shell adapters.
+- `internal/runtime/` — the Codex/Claude/Kimi/omp/shell adapters.
 - `internal/skillopt/` — the template auto-optimization loop.
 - `internal/config/` — config loaders (`init.go` holds the `DefaultConfig`
   template + per-section loaders).
@@ -231,11 +232,12 @@ portable code behavior.
 
 ## Agent jobs & the result contract
 
-gitmoot runs agents through registered runtimes — **Codex, Claude Code, and Kimi
-Code** (`gitmoot agent start --runtime codex|claude|kimi`). Jobs return a
-`gitmoot_result` JSON object, and agents can fan work out via a validated
-`delegations[]` DAG with a coordinator continuation job (the **Orchestra**
-pattern), bounded by depth, a per-root job budget, and loop detection.
+gitmoot runs agents through registered runtimes — **Codex, Claude Code, Kimi
+Code, and omp** (`gitmoot agent start --runtime codex|claude|kimi|kimi-cli|omp`).
+Jobs return a `gitmoot_result` JSON object, and agents can fan work out via a
+validated `delegations[]` DAG with a coordinator continuation job (the
+**Orchestra** pattern), bounded by depth, a per-root job budget, and loop
+detection.
 `gitmoot orchestrate <agent> "..." [--repo R]` is sugar for
 `gitmoot agent run <agent> --background "..."`. Contracts:
 

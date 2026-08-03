@@ -22,7 +22,9 @@ func runSetup(args []string, stdout, stderr io.Writer) int {
 	repoFlag := fs.String("repo", "", "repo scope as owner/repo")
 	path := fs.String("path", ".", "local checkout path")
 	agentName := fs.String("agent", "", "agent name to subscribe")
-	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, or shell")
+	// Enumerated from the adapter registry (as printAgentRuntimeOverrideHelp does),
+	// never hard-coded: the literal list here had already gone stale before #1428.
+	runtimeName := fs.String("runtime", "", fmt.Sprintf("agent runtime: %s", strings.Join(runtime.SupportedRuntimes(), "|")))
 	session := fs.String("session", "", "runtime session reference, last, or shell command")
 	role := fs.String("role", "agent", "agent role")
 	startDaemon := fs.Bool("start-daemon", false, "start the background daemon after setup")

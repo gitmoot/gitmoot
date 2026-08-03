@@ -134,6 +134,17 @@ Runtime-specific additions are:
 - Codex: `CODEX_HOME`
 - Claude Code: `CLAUDE_CONFIG_DIR`; the managed auth overlay is appended from
   `runtime-auth.env` after the curated base.
+- omp: routing plumbing only — `OMP_PROFILE`, `PI_PROFILE`,
+  `PI_CODING_AGENT_DIR`, `PI_SMOL_MODEL`, `PI_SLOW_MODEL`, `PI_PLAN_MODEL`,
+  `OMP_AUTH_BROKER_URL`, `OMP_AUTH_BROKER_TOKEN` — and **no** raw provider key,
+  so under curation a provider key reaches omp only through omp's own profile
+  auth storage or an explicit `env_passthrough` entry. Two caveats: the
+  `OMP_AUTH_BROKER_URL` / `OMP_AUTH_BROKER_TOKEN` pair is **indivisible** (omp
+  throws when the URL is set and no token is available, so dropping only the
+  token turns an inherited URL into a hard failure — drop both if you want omp
+  strictly fail-closed), and `--profile` selects omp's auth/state store without
+  isolating process environment, so a passed-through key is visible to every omp
+  profile this daemon runs.
 - Kimi Code, legacy `kimi-cli`, and shell: no additions. Shell stage variables,
   chat-relay variables, pipeline metadata, and the upstream-context file variable
   are job-owned injections and are appended after the curated base.

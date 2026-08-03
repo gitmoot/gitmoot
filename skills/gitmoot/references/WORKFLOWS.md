@@ -1147,6 +1147,7 @@ retains a private per-job append log even when no cockpit exists; seat logs stay
 transient. Codex JSONL is readable live. Kimi stream-json is turn-buffered (and
 kimi-code 0.19.2 emits no usage). Claude currently emits one final JSON envelope,
 so its pane remains quiet until completion and then shows final text and usage.
+omp's NDJSON passes through undecoded, so its pane shows raw stream lines.
 Shell output is redacted raw passthrough. Unknown or malformed lines fail open
 one line at a time; a fatal renderer exit falls back externally to `tail -F`.
 Verified Codex command/file-change events and Kimi function tool calls/results
