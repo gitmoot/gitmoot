@@ -192,20 +192,27 @@ func promptHeadWarningRepositoryWithDivergents(t *testing.T, n int) (checkout st
 // and it replaces a control that review showed was enumerable twice over.
 //
 // The previous version placed ONE divergent token at indexes 0, 4 and 12 -- all EVEN -- so a
-// scanner reading every other token survived all three. It also claimed "any fixed cap misses a
-// placement", which was simply false: a cap above 13 survived. That claim is withdrawn. A finite
-// set of placements can never rule out every fixed cap, so this guard stops trying to and
-// constrains the property directly instead.
+// scanner reading every other token survived all three, and it claimed "any fixed cap misses a
+// placement", which a cap above 13 disproved.
 //
-// With SIX divergent commits interleaved among non-commit filler at both odd and even indexes:
+// SCOPE OF THIS GUARD, stated exactly, because the replacement claim was ALSO too strong and was
+// caught a second time. With SIX divergent commits interleaved among non-commit filler at both
+// odd and even indexes:
 //
 //	COUNT      constrains traversal  - a cap at any n < 6 divergents, or every-other-token
 //	                                   sampling, yields fewer than six warnings.
 //	NAMED SET  constrains identity   - a scanner that traverses fully but reuses one label
 //	                                   still yields six warnings, and fails here.
 //
-// Those are the two mutants review demonstrated surviving, and they fail for different reasons,
-// which is the point: the old fixture could not tell them apart.
+// Those are the two mutants review demonstrated surviving, and they fail for DIFFERENT reasons,
+// which is the point: with one divergent commit, count and identity are the same observation and
+// the old fixture could not tell them apart.
+//
+// WHAT IT DOES NOT ESTABLISH: that arbitrary positional sampling is excluded. A mutant reading
+// exactly the six indexes these divergents occupy produces exactly six warnings naming exactly
+// the six right commits and PASSES. No finite fixture can rule that out, and pretending otherwise
+// is how this file has now over-claimed twice. General traversal is not provable by example; what
+// is provable is that these six positions and the measured mutant families are covered.
 func TestPromptHeadWarningTraversesEveryTokenAndNamesEachOne(t *testing.T) {
 	checkout, head, divergents := promptHeadWarningRepositoryWithDivergents(t, 5)
 	if len(divergents) != 6 {
@@ -246,7 +253,7 @@ func TestPromptHeadWarningTraversesEveryTokenAndNamesEachOne(t *testing.T) {
 
 	warnings := promptHeadWarnings(t, checkout, prompt, head)
 	if len(warnings) != len(divergents) {
-		t.Fatalf("warnings = %d, want %d (one per divergent commit): a scanner that caps its token count or samples positions cannot produce them all.\nprompt=%q\nwarnings=%v", len(warnings), len(divergents), prompt, warnings)
+		t.Fatalf("warnings = %d, want %d (one per divergent commit): the scanner missed at least one of THESE six divergent positions.\nThis constrains the six positions below and the measured every-other-token and cap-below-six mutants. It does NOT exclude positional sampling in general -- a mutant reading exactly these six indexes passes, and a finite fixture cannot rule that out.\nprompt=%q\nwarnings=%v", len(warnings), len(divergents), prompt, warnings)
 	}
 
 	// IDENTITY: every divergent token is named exactly once. A full traversal that reuses one
@@ -315,7 +322,10 @@ func TestPromptHeadWarningIgnoresMutationRestoreHashes(t *testing.T) {
 	// Position alone was not enough: every fixture happened to hold exactly five
 	// commit-shaped tokens, so a scanner capped to the first five compiled and left all four
 	// guards green -- the control was pinned to the fixture's WIDTH, not to traversal. Widths
-	// here are 3, 7 and 13, so any fixed cap misses at least one placement.
+	// here are 3, 7 and 13, so a cap at or below 12 misses at least one placement. A cap ABOVE
+	// 13 survives, and no finite set of widths can exclude one -- that limit is stated rather
+	// than papered over, because the earlier version of this comment claimed "any fixed cap
+	// misses a placement" and review disproved it.
 	//
 	// Each placement also asserts the warning NAMES THE DIVERGENT TOKEN. Counting one warning
 	// proves cardinality only: a mutant that reported tokens[0] instead of the unequal token
