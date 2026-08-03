@@ -298,28 +298,13 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		polledFull := false
 		if checkoutLock.TryLock() {
 			if !tracker.busy(d.Repo.FullName()) {
-				if err := runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollOnce); err != nil {
-					if pollErrors.shouldReport(fullPoll, err.Error(), time.Now().UTC()) {
-						writeLine(stdout, "poll error: %s", err)
-					}
-				} else {
-					// A clean poll ENDS this mode's episode. Without it a fault that
-					// recovers and returns is reported once and then suppressed, which
-					// is worse than the unbounded stream it replaced.
-					pollErrors.recordSuccess(fullPoll)
-				}
+				pollErrors.pollAndReport(ctx, fullPoll, daemonPollTimeout, d.PollOnce, stdout, "poll error")
 				polledFull = true
 			}
 			checkoutLock.Unlock()
 		}
 		if !polledFull {
-			if err := runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollRecoveryCommandsOnce); err != nil {
-				if pollErrors.shouldReport(recoveryPoll, err.Error(), time.Now().UTC()) {
-					writeLine(stdout, "recovery poll error: %s", err)
-				}
-			} else {
-				pollErrors.recordSuccess(recoveryPoll)
-			}
+			pollErrors.pollAndReport(ctx, recoveryPoll, daemonPollTimeout, d.PollRecoveryCommandsOnce, stdout, "recovery poll error")
 		}
 		if heartbeatPathsErr == nil {
 			if err := runWorkflowAutoSettleOnce(ctx, heartbeatPaths, store, time.Now().UTC(), stdout); err != nil {
@@ -1425,6 +1410,33 @@ func (r *pollErrorReporters) shouldReport(mode pollMode, cause string, now time.
 		return true
 	}
 	return r.byMode[mode].shouldReport(cause, now)
+}
+
+// pollAndReport runs one poll and routes its outcome to that mode's episode.
+//
+// It exists to make a specific mutant UNWRITABLE. Review found that with separate
+// shouldReport(mode) and recordSuccess(mode) calls in each branch, the mode appeared TWICE per
+// branch and the two could disagree: changing the recovery branch's recordSuccess(recoveryPoll)
+// to recordSuccess(fullPoll) compiled and survived every guard, recreating exactly the
+// cross-mode episode clearing this design was introduced to stop.
+//
+// That was the THIRD time on this PR that a guard covered the reporters and missed the WIRING.
+// Testing harder was not working, so the mode is now supplied ONCE and both outcomes derive from
+// it. A caller can still pass the wrong mode, but then the failure AND success route together --
+// a consistent misattribution rather than a silent cross-mode reset, and a far more visible one.
+//
+// HONEST LIMIT: this removes one mutant by construction; it does not make caller routing
+// verifiable from outside the supervisor, whose lock and tracker are function-local.
+func (r *pollErrorReporters) pollAndReport(ctx context.Context, mode pollMode, timeout time.Duration, poll func(context.Context) error, stdout io.Writer, label string) {
+	if err := runDaemonPollWithTimeout(ctx, timeout, poll); err != nil {
+		if r.shouldReport(mode, err.Error(), time.Now().UTC()) {
+			writeLine(stdout, "%s: %s", label, err)
+		}
+		return
+	}
+	// A clean poll ENDS this mode's episode. Without it a fault that recovers and returns is
+	// reported once and then suppressed, which is worse than the unbounded stream it replaced.
+	r.recordSuccess(mode)
 }
 
 // recordSuccess ends ONLY the episode of the mode that succeeded.

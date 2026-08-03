@@ -75,14 +75,16 @@ func TestSingleRepoSupervisorReportsPollErrorAndKeepsPolling(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- runSingleRepoSupervisor(ctx, home, d, store, live, "", sink) }()
 
-	// Wait for the poll to run twice WITHOUT ever receiving from done. The previous version
-	// selected on done inside this loop, so it could consume the sole value here and leave the
-	// join below waiting for a second value that can never arrive -- that, not ambient load,
-	// is why the targeted test took 90s. I diagnosed it as package contention and wrote that
-	// wrong cause into a comment; review found the real one.
+	// Wait for the poll to run twice. This loop DOES select on done -- the fix was not to stop
+	// receiving, it was to RECORD that the sole value was consumed so the join below skips its
+	// own receive. `supervised` is that record, and it guarantees exactly one receive across
+	// the test.
 	//
-	// `supervised` records whether the goroutine has already returned, so exactly one receive
-	// happens across the whole test.
+	// The earlier version received here and unconditionally received AGAIN in the join, so a
+	// supervisor returning early left the join waiting forever for a second value that never
+	// comes. That, not ambient package load, is why the targeted test took 90s -- I diagnosed
+	// it as contention and wrote that wrong cause into a comment. A later comment then said
+	// this loop "never receives", which was also untrue. This is the accurate description.
 	var supervised bool
 	var supervisorErr error
 	deadline := time.After(45 * time.Second)
@@ -103,13 +105,15 @@ waitForPolls:
 	}
 
 	// JOIN, and REQUIRE termination. The goroutine must not outlive the test into store
-	// teardown. Logging on timeout, as the previous version did, only REPORTS the leak -- the
+	// teardown; logging on timeout, as an earlier version did, only REPORTS the leak when the
 	// finding asked for it to be prevented.
 	//
-	// The bound is generous and is not a latency assertion: shutdown drains the in-flight
-	// tracker and the worker loop, a separate property with its own timeouts that this guard
-	// does not claim. It fails only if the goroutine never terminates at all, which is the
-	// leak itself rather than a threshold.
+	// STATED HONESTLY: three minutes IS a wall-clock shutdown-latency contract. Any finite
+	// deadline is. The previous comment claimed it "fails only if the goroutine never
+	// terminates", which is not something a timeout can distinguish, and review said so. The
+	// contract is: this supervisor finishes shutting down within three minutes of cancellation,
+	// roughly twelve times the 15s in-flight drain budget and far above anything observed. If
+	// it is ever exceeded on a healthy machine, investigate shutdown rather than raise this.
 	cancel()
 	if !supervised {
 		select {
@@ -209,6 +213,50 @@ func TestPollErrorReportersAreIndependentPerMode(t *testing.T) {
 	r.recordSuccess(recoveryPoll)
 	if !r.shouldReport(recoveryPoll, "R", base.Add(5*time.Second)) {
 		t.Fatal("a recovery success did not end the recovery episode")
+	}
+}
+
+// TestPollAndReportRoutesOutcomesToOneEpisode drives the ROUTING FUNCTION production uses, so a
+// mode carried into the failure path and the success path can no longer disagree.
+//
+// Review defeated the previous guard with a mutant that changed only the recovery branch's
+// recordSuccess(recoveryPoll) to recordSuccess(fullPoll). The guard drove pollErrorReporters
+// directly with enum values the TEST supplied, so it never observed the call site's choice. That
+// was the third time on this PR a guard covered the reporters and missed the wiring.
+//
+// pollAndReport now takes the mode ONCE, so that mutant cannot be written. This exercises it end
+// to end: a failing poll must report into its own episode, and a succeeding poll must clear only
+// its own.
+func TestPollAndReportRoutesOutcomesToOneEpisode(t *testing.T) {
+	fail := func(context.Context) error { return errors.New("boom") }
+	ok := func(context.Context) error { return nil }
+
+	r := newPollErrorReporters(time.Hour)
+	var out strings.Builder
+
+	// A recovery failure opens the RECOVERY episode.
+	r.pollAndReport(context.Background(), recoveryPoll, time.Minute, fail, &out, "recovery poll error")
+	if !strings.Contains(out.String(), "recovery poll error: boom") {
+		t.Fatalf("first recovery failure was not reported; got %q", out.String())
+	}
+
+	// A FULL poll now SUCCEEDS. Under the defect this cleared recovery's episode too.
+	r.pollAndReport(context.Background(), fullPoll, time.Minute, ok, &out, "poll error")
+
+	// The same recovery failure must still be suppressed: recovery never succeeded.
+	before := out.Len()
+	r.pollAndReport(context.Background(), recoveryPoll, time.Minute, fail, &out, "recovery poll error")
+	if out.Len() != before {
+		t.Fatalf("a FULL-poll success cleared the RECOVERY episode: the repeat re-reported as a fresh onset.\nstdout=%q", out.String())
+	}
+
+	// And a recovery SUCCESS must end recovery's own episode, or "routes to one episode" would
+	// be satisfied by a reporter that never resets -- the onset-hiding defect this replaced.
+	r.pollAndReport(context.Background(), recoveryPoll, time.Minute, ok, &out, "recovery poll error")
+	before = out.Len()
+	r.pollAndReport(context.Background(), recoveryPoll, time.Minute, fail, &out, "recovery poll error")
+	if out.Len() == before {
+		t.Fatal("a recovery success did not end the recovery episode; the recurrence after recovery must report")
 	}
 }
 
