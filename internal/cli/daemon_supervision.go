@@ -261,7 +261,9 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	// stream into the operator's one log -- a diagnostic that drowns the log is a different
 	// way of being unobservable. Keyed on the CAUSE, so a NEW failure is never suppressed by
 	// a running window.
-	pollErrors := newPollErrorReporter(pollErrorReportWindow)
+	// One episode PER POLL MODE, with the routing owned by the reporters object rather than by
+	// these call sites (#1381 review).
+	pollErrors := newPollErrorReporters(pollErrorReportWindow)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -286,18 +288,25 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		// survives it -- and an unobservable refusal is that panic traded for silence,
 		// which is the worse of the two. The task stays retryable and fails identically
 		// every interval with nothing emitted anywhere.
+		//
+		// Each poll MODE owns its own episode. A single shared reporter meant a successful
+		// FULL poll called recordSuccess and cleared every recorded cause, including the
+		// recovery path's -- so recovery-fails-R, unrelated-full-succeeds, recovery-fails-R
+		// re-emitted R as a fresh onset although recovery never succeeded, and repeated
+		// busy/idle alternation walked around the global burst ceiling entirely. A success
+		// may only end the episode it actually belongs to.
 		polledFull := false
 		if checkoutLock.TryLock() {
 			if !tracker.busy(d.Repo.FullName()) {
 				if err := runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollOnce); err != nil {
-					if pollErrors.shouldReport("poll: "+err.Error(), time.Now().UTC()) {
+					if pollErrors.shouldReport(fullPoll, err.Error(), time.Now().UTC()) {
 						writeLine(stdout, "poll error: %s", err)
 					}
 				} else {
-					// A clean poll ENDS the episode. Without this a fault that recovers
-					// and returns is reported once and then silently suppressed, which
+					// A clean poll ENDS this mode's episode. Without it a fault that
+					// recovers and returns is reported once and then suppressed, which
 					// is worse than the unbounded stream it replaced.
-					pollErrors.recordSuccess()
+					pollErrors.recordSuccess(fullPoll)
 				}
 				polledFull = true
 			}
@@ -305,9 +314,11 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		}
 		if !polledFull {
 			if err := runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollRecoveryCommandsOnce); err != nil {
-				if pollErrors.shouldReport("recovery: "+err.Error(), time.Now().UTC()) {
+				if pollErrors.shouldReport(recoveryPoll, err.Error(), time.Now().UTC()) {
 					writeLine(stdout, "recovery poll error: %s", err)
 				}
+			} else {
+				pollErrors.recordSuccess(recoveryPoll)
 			}
 		}
 		if heartbeatPathsErr == nil {
@@ -1376,6 +1387,52 @@ func (r *pollErrorReporter) recordSuccess() {
 	r.seen = make(map[string]time.Time)
 	r.emitted = 0
 	r.windowStart = time.Time{}
+}
+
+// pollMode names which poll produced a diagnostic. The full poll and the recovery poll fail for
+// different reasons and recover independently, so they are separate episodes.
+type pollMode int
+
+const (
+	fullPoll pollMode = iota
+	recoveryPoll
+)
+
+// pollErrorReporters owns one reporter per mode AND the routing between them.
+//
+// It exists because review found a WIRING defect, not a type defect: a single shared reporter
+// meant a successful full poll cleared the recovery path's episode, so recovery-fails-R,
+// full-succeeds, recovery-fails-R re-emitted R as a fresh onset although recovery never
+// succeeded. The reporters were individually correct the whole time.
+//
+// Keeping the routing inside one testable object is deliberate. Two loose reporters in the
+// supervisor put the decision in the call site, where a test that drives the reporters directly
+// cannot observe it -- which is exactly how the first attempt to guard this passed against the
+// defect it was written for.
+type pollErrorReporters struct {
+	byMode map[pollMode]*pollErrorReporter
+}
+
+func newPollErrorReporters(window time.Duration) *pollErrorReporters {
+	return &pollErrorReporters{byMode: map[pollMode]*pollErrorReporter{
+		fullPoll:     newPollErrorReporter(window),
+		recoveryPoll: newPollErrorReporter(window),
+	}}
+}
+
+func (r *pollErrorReporters) shouldReport(mode pollMode, cause string, now time.Time) bool {
+	if r == nil {
+		return true
+	}
+	return r.byMode[mode].shouldReport(cause, now)
+}
+
+// recordSuccess ends ONLY the episode of the mode that succeeded.
+func (r *pollErrorReporters) recordSuccess(mode pollMode) {
+	if r == nil {
+		return
+	}
+	r.byMode[mode].recordSuccess()
 }
 
 func (r *pollErrorReporter) shouldReport(cause string, now time.Time) bool {
