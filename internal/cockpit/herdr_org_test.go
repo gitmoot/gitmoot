@@ -389,6 +389,12 @@ func TestHerdrOrgProviderRecycleCommand(t *testing.T) {
 			want:  []string{"agent", "start", "owner", "--kind", "kimi", "--pane", "w1:p2", "--timeout", "30000", "--", "--model", "k2", "role: owner\n\nhandoff: ship it"},
 		},
 		{
+			name:  "pinned model applies for omp",
+			kind:  "omp",
+			model: "claude-opus-5",
+			want:  []string{"agent", "start", "owner", "--kind", "omp", "--pane", "w1:p2", "--timeout", "30000", "--", "--model", "claude-opus-5", "role: owner\n\nhandoff: ship it"},
+		},
+		{
 			name:  "pinned model ignored for an unverified kind",
 			kind:  "gemini",
 			model: "sonnet",
