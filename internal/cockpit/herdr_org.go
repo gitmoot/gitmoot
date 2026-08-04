@@ -231,11 +231,13 @@ func (p *herdrOrgProvider) Recycle(ctx context.Context, req org.RecycleRequest) 
 
 // herdrKindSupportsModelFlag reports whether the named herdr agent kind's CLI
 // is verified to accept a startup `-m/--model <value>` flag. Restricted to
-// gitmoot's own three driven runtimes (codex, claude, kimi) — herdr supports
-// many more kinds, but their model-flag support has not been checked.
+// gitmoot's own driven runtimes (codex, claude, kimi, omp — omp verified
+// against omp 17.2.4, whose CLI accepts `--model=<value>` with fuzzy matching,
+// #1467) — herdr supports many more kinds, but their model-flag support has
+// not been checked.
 func herdrKindSupportsModelFlag(kind string) bool {
 	switch kind {
-	case "codex", "claude", "kimi":
+	case "codex", "claude", "kimi", "omp":
 		return true
 	default:
 		return false
