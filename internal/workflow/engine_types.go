@@ -266,7 +266,7 @@ type MergeDecision struct {
 	MergeCommitSHA string
 	// Reason is a VALUE, not prose: see MergeReason. Carrying parts means no consumer
 	// holds a string it can append an instruction onto (#1381).
-	Reason         MergeReason
+	Reason MergeReason
 	// LeaveOpen is a terminal-ish native merge-gate outcome: the pull request is
 	// deliberately left for a human action. It is distinct from Deferred, which
 	// must be retried automatically, and from a blocked quality/process failure.
@@ -317,6 +317,19 @@ type MergeGate interface {
 type ImplementationFinalizer interface {
 	FinalizeImplementation(ctx context.Context, job db.Job, payload JobPayload) (JobPayload, error)
 }
+
+type FixWorktreeRequest struct {
+	JobID  string
+	Repo   string
+	Branch string
+}
+
+type FixWorktreeAllocation struct {
+	Path    string
+	Created bool
+}
+
+type FixWorktreeAllocator func(context.Context, FixWorktreeRequest) (FixWorktreeAllocation, error)
 
 // EscalationRequest carries the context the EscalationNotifier needs to notify a
 // human that a delegation tree has paused awaiting their decision (#340).

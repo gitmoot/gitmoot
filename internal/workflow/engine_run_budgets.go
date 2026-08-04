@@ -155,7 +155,7 @@ func (e Engine) recordImplementNoPRAdvance(ctx context.Context, jobID, decision 
 	})
 }
 
-func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
+func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	if err := e.validate(); err != nil {
 		return err
 	}
@@ -205,6 +205,16 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 	// below (the delegation DAG early-returns for policy-handled failures and
 	// pending retries). No-op for jobs that did not allocate a read-only worktree.
 	defer e.cleanupReadOnlyDelegationWorktree(ctx, jobID, job.Type, payload)
+	// A review fix owns an independent writable clone, not a linked delegation
+	// worktree. Remove only that clone after SUCCESSFUL advancement; a finalizer or
+	// store error can leave the clone holding the only committed fix, and the daemon
+	// may convert that result into a resumable blocked job. The real task branch is
+	// never deleted or unlocked by this cleanup.
+	defer func() {
+		if retErr == nil {
+			e.cleanupFixWorktree(ctx, jobID, job.Type, payload)
+		}
+	}()
 
 	// An implement delegation child runs in a per-delegation worktree on its own
 	// gitmoot-delegation-* branch; tear both down once the child is terminal so they

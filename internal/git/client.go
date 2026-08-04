@@ -32,6 +32,21 @@ func (c Client) CreateBranch(ctx context.Context, branch string, base string) er
 	return err
 }
 
+// CheckoutBranchAt attaches HEAD to branch at ref, replacing a copied local
+// branch when necessary. It is intended for a fresh independent clone whose refs
+// were copied from the registered checkout but whose writable fix branch must be
+// reset to the just-fetched forge head.
+func (c Client) CheckoutBranchAt(ctx context.Context, branch string, ref string) error {
+	if err := validateBranch(branch); err != nil {
+		return err
+	}
+	if err := validateRef(ref); err != nil {
+		return err
+	}
+	_, err := c.run(ctx, "checkout", "-B", branch, ref)
+	return err
+}
+
 func (c Client) AddWorktree(ctx context.Context, branch string, path string, base string) error {
 	if err := validateBranch(branch); err != nil {
 		return err
@@ -121,6 +136,22 @@ func (c Client) RemoveRemote(ctx context.Context, name string) error {
 		return fmt.Errorf("remote name %q must not start with '-'", name)
 	}
 	_, err := c.run(ctx, "remote", "remove", name)
+	return err
+}
+
+func (c Client) SetRemoteURL(ctx context.Context, name string, url string) error {
+	name = strings.TrimSpace(name)
+	url = strings.TrimSpace(url)
+	if name == "" {
+		return errors.New("remote name is required")
+	}
+	if strings.HasPrefix(name, "-") || strings.ContainsAny(name, " \t\r\n") {
+		return fmt.Errorf("remote name %q is invalid", name)
+	}
+	if url == "" {
+		return errors.New("remote URL is required")
+	}
+	_, err := c.run(ctx, "remote", "set-url", name, url)
 	return err
 }
 
@@ -415,6 +446,21 @@ func (c Client) absoluteGitPath(path string) (string, error) {
 
 func (c Client) OriginRemote(ctx context.Context) (string, error) {
 	result, err := c.run(ctx, "remote", "get-url", "origin")
+	if err != nil {
+		return "", err
+	}
+	remote := strings.TrimSpace(result.Stdout)
+	if remote == "" {
+		return "", errors.New("origin remote is empty")
+	}
+	return remote, nil
+}
+
+// OriginRemoteConfigured returns the literal configured origin URL without Git's
+// url.*.insteadOf rewrite. A disposable clone must preserve the forge-facing URL
+// in its own config even when the source checkout rewrites transport locally.
+func (c Client) OriginRemoteConfigured(ctx context.Context) (string, error) {
+	result, err := c.run(ctx, "config", "--get", "remote.origin.url")
 	if err != nil {
 		return "", err
 	}

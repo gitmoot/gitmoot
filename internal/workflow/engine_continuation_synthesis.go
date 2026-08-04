@@ -1556,5 +1556,6 @@ func (e Engine) implementationNeedsFinalizer(ctx context.Context, payload JobPay
 	if err != nil {
 		return false
 	}
-	return strings.TrimSpace(task.WorktreePath) != ""
+	return strings.TrimSpace(task.WorktreePath) != "" ||
+		(payload.FixWorktree && strings.TrimSpace(payload.WorktreePath) != "")
 }

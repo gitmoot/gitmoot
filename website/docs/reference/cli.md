@@ -821,6 +821,15 @@ from PR comments continue to validate their fix target when the workflow
 advances until [gitmoot#1433](https://github.com/gitmoot/gitmoot/issues/1433)
 adds the corresponding ingress preflight.
 
+When an engine review returns `changes_requested`, its implement fix job gets an
+independent writable per-job clone checked out on the task branch at the fetched
+remote head. It does not execute in the review Task's empty worktree path or the
+registered checkout, so it cannot interleave with an operator's uncommitted
+files. Allocation fails closed before enqueue; there is no registered-checkout
+fallback. The clone stays attached to the real branch so the fix can commit and
+push, then terminal cleanup (with the delegation-worktree TTL as a backstop)
+removes only the clone.
+
 Before delivery, these dispatch commands scan commit-shaped tokens against the
 target repository. Ask and implement preserve their existing scanner input;
 review scans its newly allocated exact-head worktree with the requested head

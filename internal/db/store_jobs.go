@@ -1412,7 +1412,7 @@ func (s *Store) JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) 
 }
 
 // JobIDsWithAgedTerminalDelegationWorktree returns final jobs whose recorded
-// delegation/read-only worktree has outlived cutoff and has no successful
+// delegation/read-only/fix worktree has outlived cutoff and has no successful
 // cleanup event. Unlike the pending-marker query above, this deliberately finds
 // crash-window leftovers that never got far enough to emit a cleanup-skipped
 // marker. Blocked is excluded: it is resumable and therefore still owns its
@@ -1445,7 +1445,8 @@ func (s *Store) JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cu
 			       unixepoch(COALESCE(NULLIF(updated_at, ''), created_at)) AS ts,
 			       json_extract(payload, '$.worktree_path') AS worktree_path,
 			       COALESCE(json_extract(payload, '$.delegation_id'), '') AS delegation_id,
-			       COALESCE(json_extract(payload, '$.read_only_worktree'), 0) AS read_only_worktree
+			       COALESCE(json_extract(payload, '$.read_only_worktree'), 0) AS read_only_worktree,
+			       COALESCE(json_extract(payload, '$.fix_worktree'), 0) AS fix_worktree
 			FROM jobs
 			WHERE json_valid(payload)
 		)
@@ -1454,7 +1455,7 @@ func (s *Store) JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cu
 		WHERE j.state IN ('succeeded', 'failed', 'cancelled')
 		  AND j.ts <= unixepoch(?)
 		  AND COALESCE(j.worktree_path, '') <> ''
-		  AND (j.delegation_id <> '' OR j.read_only_worktree = 1)
+		  AND (j.delegation_id <> '' OR j.read_only_worktree = 1 OR j.fix_worktree = 1)
 		  AND NOT EXISTS (
 			SELECT 1 FROM job_wt owner
 			WHERE owner.id <> j.id

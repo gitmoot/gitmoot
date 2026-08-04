@@ -436,6 +436,13 @@ if allocation, the pull-ref retry, or the 5 GiB free-space preflight fails. The
 stable review Task row does not own this checkout. Background taskless asks keep
 their separate fail-open committed-tip isolation policy.
 
+An engine-dispatched `changes_requested` fix uses a different owned shape: an
+independent writable clone attached to the real task branch at its fetched
+remote head. Dispatch fails closed if that clone cannot be allocated; it never
+falls back to the registered checkout. Terminal cleanup removes the independent
+clone without deleting the task branch or releasing its task branch lock, and
+the same TTL candidate pass reclaims crash-window leftovers.
+
 The daemon force-reclaims a recorded delegation/read-only worktree only when its
 owning job is final (`succeeded`, `failed`, or `cancelled`) and its terminal
 `updated_at` is older than `[workflow].delegation_worktree_ttl` (default `72h`;
@@ -455,6 +462,11 @@ when the current state is `succeeded`, `failed`, or `cancelled` and the exact
 path matches; then run `git -C <registered-checkout> worktree remove --force
 <path>` followed by `git -C <registered-checkout> worktree prune`. Never remove
 a worktree owned by a blocked, queued, or running job.
+
+Fix-round clones live under `$GITMOOT_HOME/worktrees/*/fixes/*` and have their
+own `.git` directory. After proving the exact `payload.worktree_path` belongs to
+a final job, remove that directory directly; do not run registered-checkout
+`git worktree remove`, and do not delete the task branch.
 
 ## Shared Tool Cache (isolated worktrees)
 

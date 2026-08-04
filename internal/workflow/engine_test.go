@@ -1357,6 +1357,13 @@ func TestEngineAdvanceReviewChangesRequestedDispatchesFix(t *testing.T) {
 	if !strings.Contains(job.Payload, "fix edge case") {
 		t.Fatalf("fix job payload = %s", job.Payload)
 	}
+	payload, err := ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload: %v", err)
+	}
+	if !payload.FixWorktree || strings.TrimSpace(payload.WorktreePath) == "" {
+		t.Fatalf("fix job payload lacks per-job writable worktree: %+v", payload)
+	}
 }
 
 func TestEngineAdvancePipelineReviewIsReportOnly(t *testing.T) {
@@ -2337,6 +2344,9 @@ func testEngine(store *db.Store) Engine {
 				parts = append(parts, request.ReviewRound)
 			}
 			return strings.Join(parts, "-")
+		},
+		FixWorktreeAllocator: func(_ context.Context, request FixWorktreeRequest) (FixWorktreeAllocation, error) {
+			return FixWorktreeAllocation{Path: filepath.Join(os.TempDir(), "gitmoot-test-fixes", request.JobID)}, nil
 		},
 		// Run the detached cross-family review leg SYNCHRONOUSLY in tests so its
 		// dispatch + harvest are deterministic; production defaults to a goroutine.
