@@ -63,7 +63,11 @@ Parallelism under `pool` is bounded by **two** independent locks:
    distinct checkout keys. Delegation / orchestra `implement` children already get
    their own worktree from the workflow engine, so they parallelize. Every local
    `review` gets a detached per-job worktree at its requested head; background
-   taskless `ask` jobs can be auto-isolated at checkout `HEAD`. A
+   taskless `ask` jobs can be auto-isolated at checkout `HEAD`. An engine review
+   that requests changes dispatches its fix into an independent writable
+   per-job clone attached to the task branch at its fetched remote head; failure
+   to allocate refuses the dispatch instead of falling back to the registered
+   checkout. A
    plain, top-level same-repo `implement` job with no worktree still shares the
    `repo:<repo>` key and serializes even under `pool`.
 
@@ -201,7 +205,9 @@ agent-owned `gh` processes are outside it.
 ## Not yet automatic (follow-ups)
 
 - **Top-level `implement` auto-isolation.** `pool` does not auto-isolate plain
-  same-repo `implement` jobs into worktrees — only read-only `ask`/`review` jobs.
+  same-repo `implement` jobs into worktrees. The engine's review-fix path is the
+  narrow writable exception; read-only `ask`/`review` jobs have their separate
+  isolation paths.
   Parallelizing independent top-level `implement` jobs via the daemon needs
   implement-eligible auto-isolation (a real branch worktree + branch-lock handling
   + a worktree cap and disposal sweep); intentionally deferred.

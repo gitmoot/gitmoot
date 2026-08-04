@@ -192,6 +192,11 @@ type JobRequest struct {
 	// TOP-LEVEL read-only worktree that has no DelegationID. Additive/omitempty:
 	// false leaves the enqueued payload byte-identical.
 	ReadOnlyWorktree bool
+	// FixWorktree marks an engine-dispatched review fix whose WorktreePath is an
+	// independent writable clone checked out on Branch. It is distinct from both
+	// detached read-only worktrees and linked delegation worktrees because its
+	// terminal cleanup removes only the clone, never the real task branch.
+	FixWorktree bool
 	// IsolateShellStage is an enqueue-only marker for a non-service pipeline shell
 	// stage that opted into a detached read-only worktree. It is consumed before
 	// payload persistence; false preserves the legacy shared-checkout request.
@@ -337,6 +342,10 @@ type JobPayload struct {
 	// dispose top-level read-only worktrees that the DelegationID-gated read-only
 	// delegation cleanup would otherwise orphan.
 	ReadOnlyWorktree bool `json:"read_only_worktree,omitempty"`
+	// FixWorktree marks a per-job writable clone allocated for a review fix round.
+	// The clone owns its git directory, is attached to Branch, and is reclaimed by
+	// the delegation-worktree TTL machinery without deleting that real branch.
+	FixWorktree bool `json:"fix_worktree,omitempty"`
 	// ReadOnlyWorktreeDiff durably preserves the bounded `git status --short` +
 	// `git diff HEAD` snapshot collected immediately before a terminal ask/review
 	// worktree is removed. Truncated is explicit when the snapshot exceeded the
@@ -555,6 +564,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		DelegationArtifactDir:  request.DelegationArtifactDir,
 		WorktreePath:           request.WorktreePath,
 		ReadOnlyWorktree:       request.ReadOnlyWorktree,
+		FixWorktree:            request.FixWorktree,
 		TemplateID:             snapshot.ID,
 		TemplateResolvedCommit: snapshot.ResolvedCommit,
 		TemplateContent:        snapshot.Content,

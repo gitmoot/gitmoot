@@ -110,6 +110,23 @@ func (w jobWorker) defaultCheckout(ctx context.Context, job db.Job, payload work
 }
 
 func (w jobWorker) resolveJobCheckout(ctx context.Context, job db.Job, payload workflow.JobPayload) (string, error) {
+	if payload.FixWorktree {
+		checkout, err := normalizeTaskWorktreePath(payload.WorktreePath)
+		if err != nil {
+			return "", err
+		}
+		if checkout == "" {
+			return "", errors.New("review fix job has no allocated worktree path")
+		}
+		repo, err := daemon.ParseRepository(payload.Repo)
+		if err != nil {
+			return "", err
+		}
+		if err := preflightDaemonRepoCheckout(ctx, repo, checkout); err != nil {
+			return "", err
+		}
+		return checkout, nil
+	}
 	repoRecord, err := w.Store.GetRepo(ctx, payload.Repo)
 	if err != nil {
 		return "", err
@@ -215,6 +232,27 @@ func normalizeTaskWorktreePath(path string) (string, error) {
 
 func (w jobWorker) validateTargetCheckout(ctx context.Context, payload workflow.JobPayload, checkout string) error {
 	git := gitutil.Client{Dir: checkout}
+	// A fix-round checkout is an independent writable clone attached to the real
+	// task branch. Its allocator bound HEAD to the fetched branch tip at dispatch;
+	// validate branch identity and cleanliness here without comparing the inherited
+	// review HeadSHA, which may legitimately predate that fetched tip.
+	if payload.FixWorktree {
+		branch, err := git.CurrentBranch(ctx)
+		if err != nil {
+			return err
+		}
+		if branch != payload.Branch {
+			return fmt.Errorf("checkout branch is %s, not job branch %s", branch, payload.Branch)
+		}
+		clean, err := git.WorktreeClean(ctx)
+		if err != nil {
+			return err
+		}
+		if !clean {
+			return fmt.Errorf("checkout %s has uncommitted changes", checkout)
+		}
+		return nil
+	}
 	// A delegation worktree child runs in a gitmoot-managed worktree. An implement
 	// child is on its delegation branch (created off the parent base, whose tip may
 	// have advanced past the inherited HeadSHA — so its HeadSHA check is skipped),

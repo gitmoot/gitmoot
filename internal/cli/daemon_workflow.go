@@ -166,6 +166,9 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 		engine.Home = home
 		engine.DelegationCheckout = checkout
 		engine.DelegationWorktrees = gitutil.Client{Dir: checkout}
+		engine.FixWorktreeAllocator = func(ctx context.Context, request workflow.FixWorktreeRequest) (workflow.FixWorktreeAllocation, error) {
+			return allocateFixWorktree(ctx, store, home, checkout, request)
+		}
 	}
 	return engine
 }
@@ -311,13 +314,17 @@ func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Contex
 	if err != nil {
 		return payload, fmt.Errorf("load task %s for implementation finalizer: %w", payload.TaskID, err)
 	}
-	if strings.TrimSpace(task.WorktreePath) == "" {
+	worktreePath := strings.TrimSpace(task.WorktreePath)
+	if payload.FixWorktree {
+		worktreePath = strings.TrimSpace(payload.WorktreePath)
+	}
+	if worktreePath == "" {
 		return payload, blockedResultDelivery("implemented task has no worktree path; rerun through gitmoot task run or gitmoot agent implement")
 	}
 	if strings.TrimSpace(task.Branch) == "" {
 		return payload, blockedResultDelivery("implemented task has no branch; cannot push or open PR")
 	}
-	git := gitutil.Client{Dir: task.WorktreePath}
+	git := gitutil.Client{Dir: worktreePath}
 	branch, err := git.CurrentBranch(ctx)
 	if err != nil {
 		return payload, fmt.Errorf("resolve implementation branch: %w", err)
@@ -325,7 +332,7 @@ func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Contex
 	if branch != task.Branch {
 		return payload, blockedResultDelivery(fmt.Sprintf("implemented task worktree is on branch %s, not %s", branch, task.Branch))
 	}
-	validatedPR, hasValidatedPR, err := f.revalidateImplementationPullRequest(ctx, payload, task)
+	validatedPR, hasValidatedPR, err := f.revalidateImplementationPullRequest(ctx, payload, task, worktreePath)
 	if err != nil {
 		return payload, err
 	}
@@ -414,10 +421,10 @@ func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Contex
 	// adopts an out-of-band/concurrent open PR for this head (and survives the 422
 	// "already exists" create race) instead of erroring, so a benign race no longer
 	// blocks the implementation after the work already landed.
-	pr, err := f.githubClient(task.WorktreePath).EnsurePullRequest(ctx, github.CreatePullRequestInput{
+	pr, err := f.githubClient(worktreePath).EnsurePullRequest(ctx, github.CreatePullRequestInput{
 		Repo:  repo,
 		Title: finalizerPullRequestTitle(task),
-		Body:  finalizerPullRequestBody(job, payload, task),
+		Body:  finalizerPullRequestBody(job, payload, task, worktreePath),
 		Head:  task.Branch,
 		Base:  base,
 		Draft: !payload.PullRequestReady,
@@ -459,7 +466,7 @@ func (f daemonImplementationFinalizer) githubClient(checkout string) github.Clie
 	return f.GitHub
 }
 
-func (f daemonImplementationFinalizer) revalidateImplementationPullRequest(ctx context.Context, payload workflow.JobPayload, task db.Task) (github.PullRequest, bool, error) {
+func (f daemonImplementationFinalizer) revalidateImplementationPullRequest(ctx context.Context, payload workflow.JobPayload, task db.Task, worktreePath string) (github.PullRequest, bool, error) {
 	if !payload.ValidatedPullRequest {
 		return github.PullRequest{}, false, nil
 	}
@@ -470,7 +477,7 @@ func (f daemonImplementationFinalizer) revalidateImplementationPullRequest(ctx c
 	if err != nil {
 		return github.PullRequest{}, false, err
 	}
-	pr, err := f.githubClient(task.WorktreePath).GetPullRequest(ctx, repo, int64(payload.PullRequest))
+	pr, err := f.githubClient(worktreePath).GetPullRequest(ctx, repo, int64(payload.PullRequest))
 	if err != nil {
 		return github.PullRequest{}, false, fmt.Errorf("revalidate fix-pass pull request #%d: %w", payload.PullRequest, err)
 	}
@@ -541,7 +548,7 @@ func finalizerPullRequestTitle(task db.Task) string {
 	return "Gitmoot: " + title
 }
 
-func finalizerPullRequestBody(job db.Job, payload workflow.JobPayload, task db.Task) string {
+func finalizerPullRequestBody(job db.Job, payload workflow.JobPayload, task db.Task, worktreePath string) string {
 	summary := ""
 	if payload.Result != nil {
 		summary = strings.TrimSpace(payload.Result.Summary)
@@ -554,7 +561,7 @@ func finalizerPullRequestBody(job db.Job, payload workflow.JobPayload, task db.T
 		AgentNames:      []string{job.Agent},
 		What:            summary,
 		Why:             "Gitmoot finalized this implementation from a task worktree.",
-		Changes:         []string{"Committed changes from " + task.WorktreePath},
+		Changes:         []string{"Committed changes from " + worktreePath},
 		Results:         finalizerResults(payload),
 		Risk:            "Review the generated diff before merging.",
 		RawReviewOutput: rawFinalizerOutput(payload),
@@ -805,6 +812,9 @@ func refreshDaemonJobPayload(ctx context.Context, store *db.Store, checkout stri
 }
 
 func payloadHasTaskWorktree(ctx context.Context, store *db.Store, payload workflow.JobPayload) bool {
+	if payload.FixWorktree && strings.TrimSpace(payload.WorktreePath) != "" {
+		return true
+	}
 	if store == nil {
 		return false
 	}

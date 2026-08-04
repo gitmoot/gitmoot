@@ -30,6 +30,12 @@ type Engine struct {
 	JobID                   func(JobRequest) string
 	PayloadRefresher        func(context.Context, db.Job, JobPayload) (JobPayload, error)
 	ImplementationFinalizer ImplementationFinalizer
+	// FixWorktreeAllocator provisions a writable, branch-attached checkout for an
+	// engine-dispatched review fix before that job is enqueued. Unlike read-only
+	// review isolation, allocation is fail-closed: without this checkout the only
+	// fallback is the registered checkout, where a fix can overwrite a human's
+	// uncommitted work (#1462).
+	FixWorktreeAllocator FixWorktreeAllocator
 	// EscalationNotifier is the injected, best-effort seam (mirroring
 	// ImplementationFinalizer) the engine calls when a delegation fails under the
 	// escalate_human failure_policy and the tree pauses awaiting a human (#340).

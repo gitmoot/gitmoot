@@ -11,15 +11,11 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 )
 
-// recordReadOnlyWorktreeReclaimOnAbort marks a job's dispatch-allocated read-only
-// worktree (#739) for daemon reclaim when the job is ABORTED (cancel / kill /
-// supersede) instead of running to a terminal AdvanceJob. On main, reactive
-// worktrees were allocated at RUN time, so a queued job carried none; #739 now
-// allocates the worktree at DISPATCH (before enqueue), so a queued read-only ask
-// owns a detached worktree on disk. An abort bypasses the engine's deferred
-// cleanupReadOnlyDelegationWorktree, and neither the advance-retry pass (no advance
-// marker) nor the reclaim pass (no cleanup marker) would otherwise dispose it — it
-// leaks permanently, accumulating one worktree per aborted ask.
+// recordReadOnlyWorktreeReclaimOnAbort marks a job's dispatch-allocated
+// read-only or fix worktree for daemon reclaim when the job is ABORTED (cancel /
+// kill / supersede) instead of running to a terminal AdvanceJob. These
+// worktrees exist before enqueue, so an abort bypasses their deferred terminal
+// cleanup; without the marker they would leak permanently.
 //
 // This is store-only and best-effort, exactly like the sibling branch-lock release
 // on the same abort paths: it writes the delegation_worktree_cleanup_skipped marker
@@ -29,7 +25,7 @@ import (
 // blocked ask whose run already disposed it) is not turned into a permanent,
 // never-reconciled reclaim candidate.
 func recordReadOnlyWorktreeReclaimOnAbort(ctx context.Context, store *db.Store, job db.Job, payload JobPayload) {
-	if !isReadOnlyDelegationWorktree(job.Type, payload) {
+	if !isReadOnlyDelegationWorktree(job.Type, payload) && !isFixWorktree(job.Type, payload) {
 		return
 	}
 	path := strings.TrimSpace(payload.WorktreePath)
@@ -42,7 +38,7 @@ func recordReadOnlyWorktreeReclaimOnAbort(ctx context.Context, store *db.Store, 
 	_ = store.AddJobEvent(ctx, db.JobEvent{
 		JobID:   job.ID,
 		Kind:    "delegation_worktree_cleanup_skipped",
-		Message: fmt.Sprintf("read-only worktree %s preserved for daemon reclaim: job aborted (%s) before its terminal cleanup ran (#739)", path, job.State),
+		Message: fmt.Sprintf("dispatch worktree %s preserved for daemon reclaim: job aborted (%s) before its terminal cleanup ran", path, job.State),
 	})
 }
 

@@ -111,6 +111,12 @@ func checkoutLockBackoff(attempt int) time.Duration {
 // the caller skips finishQueuedJob. Every non-matching / excluded / budget-spent
 // case returns false so the existing terminal path runs unchanged.
 func (w jobWorker) deferCheckoutContention(ctx context.Context, job db.Job, payload workflow.JobPayload, cause error) (bool, error) {
+	// A fix round has no shared-checkout fallback: allocation already succeeded
+	// before enqueue, and any later checkout failure must settle visibly rather
+	// than masquerade as contention in a registered checkout it never uses.
+	if payload.FixWorktree {
+		return false, nil
+	}
 	kind, action := classifyCheckoutContention(cause)
 	if kind == checkoutContentionNone {
 		return false, nil
