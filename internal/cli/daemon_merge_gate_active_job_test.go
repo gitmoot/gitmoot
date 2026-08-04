@@ -140,6 +140,7 @@ scope = ["owner/repo"]
 		t.Fatalf("LoadOrg: %v", err)
 	}
 	gate := daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout, Home: paths.Home}
+	renderedReason := ""
 	for attempt := 0; attempt < 2; attempt++ {
 		decision, err := gate.Evaluate(context.Background(), request)
 		if err != nil {
@@ -148,19 +149,45 @@ scope = ["owner/repo"]
 		if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || !strings.Contains(decision.Reason.Render(), "final agent review is not captured") {
 			t.Fatalf("decision = %+v", decision)
 		}
+		if got := decision.Reason.Render(); renderedReason == "" {
+			renderedReason = got
+		} else if got != renderedReason {
+			t.Fatalf("rendered reason changed across idempotent evaluations: first=%q attempt_%d=%q", renderedReason, attempt+1, got)
+		}
 	}
 	notes, err := store.ListWorkflowNotes(context.Background(), request.WorkflowID, 0)
 	if err != nil || len(notes) != 1 {
 		t.Fatalf("notes = %+v, err=%v; want one escalation", notes, err)
 	}
 	from, to, wf, question, ok := workflow.ParseOrgEscalateNote(notes[0].Body)
-	if !ok || from != "worker" || to != "jarvis" || wf != request.WorkflowID || !strings.Contains(question, "final agent review is not captured") {
+	if !ok || from != "worker" || to != "jarvis" || wf != request.WorkflowID || question != renderedReason {
 		t.Fatalf("escalation = from=%q to=%q wf=%q question=%q ok=%v", from, to, wf, question, ok)
 	}
 	outbox, err := store.ListWakeOutbox(context.Background(), "")
 	if err != nil || len(outbox) != 1 || outbox[0].State != db.WakeOutboxStatePending ||
 		outbox[0].TargetRole != "jarvis" || outbox[0].SourceID != fmt.Sprint(notes[0].ID) {
 		t.Fatalf("merge-gate wake outbox = %+v, err=%v", outbox, err)
+	}
+}
+
+func TestDaemonMergeGateEmptyReasonRefusesEscalation(t *testing.T) {
+	store := daemonWorkerStore(t)
+	const workflowID = "goal-empty-reason"
+
+	err := (daemonMergeGate{Store: store}).escalateMergeGateMiss(
+		context.Background(),
+		workflow.MergeRequest{Repo: "owner/repo", WorkflowID: workflowID},
+		workflow.MergeReason{},
+	)
+	notes, notesErr := store.ListWorkflowNotes(context.Background(), workflowID, 0)
+	if notesErr != nil {
+		t.Fatalf("ListWorkflowNotes: %v", notesErr)
+	}
+	if len(notes) != 0 {
+		t.Fatalf("empty reason wrote %d workflow note(s), want none: %+v", len(notes), notes)
+	}
+	if err == nil || !strings.Contains(err.Error(), "refusing to journal an empty operator instruction") {
+		t.Fatalf("error = %v, want explicit empty-reason refusal", err)
 	}
 }
 
