@@ -716,6 +716,46 @@ func isReadOnlyDelegationWorktree(jobType string, payload JobPayload) bool {
 		readOnlyDelegationAction(jobType)
 }
 
+func isFixWorktree(jobType string, payload JobPayload) bool {
+	return jobType == "implement" && payload.FixWorktree &&
+		strings.TrimSpace(payload.WorktreePath) != ""
+}
+
+// cleanupFixWorktree removes an engine-dispatched review fix's independent
+// writable clone. It deliberately does not use RemoveWorktreeForce, delete the
+// payload branch, or release its task branch lock: the clone has its own .git and
+// payload.Branch is the real lane branch that the finalizer just pushed.
+func (e Engine) cleanupFixWorktree(ctx context.Context, jobID string, jobType string, payload JobPayload) {
+	if !isFixWorktree(jobType, payload) {
+		return
+	}
+	if strings.TrimSpace(e.Home) == "" {
+		return
+	}
+	if skip, reason := e.cleanupBlockedByLiveOwner(ctx, jobID, payload); skip {
+		e.recordCleanupSkippedOnce(ctx, jobID, payload, reason)
+		return
+	}
+	opCtx := context.WithoutCancel(ctx)
+	path := strings.TrimSpace(payload.WorktreePath)
+	expected, err := FixWorktreePath(e.Home, payload.Repo, jobID)
+	if err != nil || filepath.Clean(path) != filepath.Clean(expected) {
+		e.recordCleanupSkippedOnce(opCtx, jobID, payload, "path is not the job's managed fix-worktree path")
+		return
+	}
+	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
+		return
+	} else if statErr != nil {
+		e.recordCleanupSkippedOnce(opCtx, jobID, payload, fmt.Sprintf("inspect failed: %v", statErr))
+		return
+	}
+	if err := os.RemoveAll(path); err != nil {
+		e.recordCleanupSkippedOnce(opCtx, jobID, payload, fmt.Sprintf("remove failed: %v", err))
+		return
+	}
+	_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_removed", Message: fmt.Sprintf("fix worktree %s removed", path)})
+}
+
 // cleanupReadOnlyDelegationWorktree disposes the detached worktree allocated for
 // a read-only delegation child once the child job is terminal. It is best-effort
 // and idempotent: a missing worktree (already removed on a prior advance, or
@@ -1045,10 +1085,11 @@ func (e Engine) ReclaimTerminalDelegationWorktree(ctx context.Context, jobID str
 	}
 	e.cleanupImplementDelegationWorktree(ctx, jobID, job.Type, payload)
 	e.cleanupReadOnlyDelegationWorktree(ctx, jobID, job.Type, payload)
+	e.cleanupFixWorktree(ctx, jobID, job.Type, payload)
 	return nil
 }
 
-// ReclaimAgedTerminalDelegationWorktree force-removes a delegation/read-only
+// ReclaimAgedTerminalDelegationWorktree force-removes a delegation/read-only/fix
 // worktree only when the owning job is FINAL and its terminal updated_at is at
 // or before cutoff. This is the crash-window backstop: unlike the ordinary
 // cleanup path it intentionally bypasses dirty/unprovable-content and stale
@@ -1074,7 +1115,8 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktree(ctx context.Context, jobID
 	}
 	readOnly := isReadOnlyDelegationWorktree(job.Type, payload)
 	implement := isImplementDelegationWorktree(job.Type, payload)
-	if !readOnly && !implement {
+	fix := isFixWorktree(job.Type, payload)
+	if !readOnly && !implement && !fix {
 		return nil
 	}
 	// A deterministic path can appear in more than one historical row. Never let
@@ -1102,13 +1144,26 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktree(ctx context.Context, jobID
 			return nil
 		}
 	}
+	path := strings.TrimSpace(payload.WorktreePath)
+	if fix {
+		expected, err := FixWorktreePath(e.Home, payload.Repo, jobID)
+		if err != nil || filepath.Clean(path) != filepath.Clean(expected) {
+			return fmt.Errorf("refusing TTL reclaim for unmanaged fix worktree %s", path)
+		}
+		if err := os.RemoveAll(path); err != nil {
+			return fmt.Errorf("remove aged terminal fix worktree %s: %w", path, err)
+		}
+		return e.Store.AddJobEvent(context.WithoutCancel(ctx), db.JobEvent{
+			JobID: jobID, Kind: "delegation_worktree_reclaimed_ttl",
+			Message: fmt.Sprintf("aged terminal fix worktree %s removed after TTL", path),
+		})
+	}
 	manager, ok := e.DelegationWorktrees.(ReadOnlyWorktreeManager)
 	if !ok || manager == nil {
 		return errors.New("delegation worktree manager cannot force-remove worktrees")
 	}
 
 	opCtx := context.WithoutCancel(ctx)
-	path := strings.TrimSpace(payload.WorktreePath)
 	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(opCtx, e.Store, e.DelegationCheckout, "worktree-ttl-reclaim:"+jobID, time.Now().UTC())
 	if err != nil {
 		return fmt.Errorf("lock checkout for TTL worktree reclaim: %w", err)
@@ -1510,6 +1565,26 @@ func DelegationWorktreePath(home string, repo string, parentJobID string, delega
 		base = filepath.Join(base, "retry", strconv.Itoa(retryAttempt))
 	}
 	return base, nil
+}
+
+// FixWorktreePath builds the deterministic path for an engine-dispatched review
+// fix's independent writable clone. The job id makes ownership per-job while the
+// dedicated "fixes" segment keeps cleanup distinct from linked delegation
+// worktrees, whose synthetic branches are deleted at terminal state.
+func FixWorktreePath(home string, repo string, jobID string) (string, error) {
+	home = strings.TrimSpace(home)
+	if home == "" {
+		return "", errors.New("fix worktree home is required")
+	}
+	repoSegment, err := taskWorktreeRepoSegment(repo)
+	if err != nil {
+		return "", err
+	}
+	jobSegment, err := taskWorktreePathSegment(jobID, "job id")
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "worktrees", repoSegment, "fixes", jobSegment), nil
 }
 
 func taskWorktreeRepoSegment(repo string) (string, error) {

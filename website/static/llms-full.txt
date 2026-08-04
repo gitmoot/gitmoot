@@ -4548,7 +4548,11 @@ Parallelism under `pool` is bounded by **two** independent locks:
    distinct checkout keys. Delegation / orchestra `implement` children already get
    their own worktree from the workflow engine, so they parallelize. Every local
    `review` gets a detached per-job worktree at its requested head; background
-   taskless `ask` jobs can be auto-isolated at checkout `HEAD`. A
+   taskless `ask` jobs can be auto-isolated at checkout `HEAD`. An engine review
+   that requests changes dispatches its fix into an independent writable
+   per-job clone attached to the task branch at its fetched remote head; failure
+   to allocate refuses the dispatch instead of falling back to the registered
+   checkout. A
    plain, top-level same-repo `implement` job with no worktree still shares the
    `repo:<repo>` key and serializes even under `pool`.
 
@@ -4686,7 +4690,9 @@ agent-owned `gh` processes are outside it.
 ## Not yet automatic (follow-ups)
 
 - **Top-level `implement` auto-isolation.** `pool` does not auto-isolate plain
-  same-repo `implement` jobs into worktrees — only read-only `ask`/`review` jobs.
+  same-repo `implement` jobs into worktrees. The engine's review-fix path is the
+  narrow writable exception; read-only `ask`/`review` jobs have their separate
+  isolation paths.
   Parallelizing independent top-level `implement` jobs via the daemon needs
   implement-eligible auto-isolation (a real branch worktree + branch-lock handling
   + a worktree cap and disposal sweep); intentionally deferred.
@@ -11016,6 +11022,15 @@ from PR comments continue to validate their fix target when the workflow
 advances until [gitmoot#1433](https://github.com/gitmoot/gitmoot/issues/1433)
 adds the corresponding ingress preflight.
 
+When an engine review returns `changes_requested`, its implement fix job gets an
+independent writable per-job clone checked out on the task branch at the fetched
+remote head. It does not execute in the review Task's empty worktree path or the
+registered checkout, so it cannot interleave with an operator's uncommitted
+files. Allocation fails closed before enqueue; there is no registered-checkout
+fallback. The clone stays attached to the real branch so the fix can commit and
+push, then terminal cleanup (with the delegation-worktree TTL as a backstop)
+removes only the clone.
+
 Before delivery, these dispatch commands scan commit-shaped tokens against the
 target repository. Ask and implement preserve their existing scanner input;
 review scans its newly allocated exact-head worktree with the requested head
@@ -16555,6 +16570,13 @@ if allocation, the pull-ref retry, or the 5 GiB free-space preflight fails. The
 stable review Task row does not own this checkout. Background taskless asks keep
 their separate fail-open committed-tip isolation policy.
 
+An engine-dispatched `changes_requested` fix uses a different owned shape: an
+independent writable clone attached to the real task branch at its fetched
+remote head. Dispatch fails closed if that clone cannot be allocated; it never
+falls back to the registered checkout. Terminal cleanup removes the independent
+clone without deleting the task branch or releasing its task branch lock, and
+the same TTL candidate pass reclaims crash-window leftovers.
+
 The daemon force-reclaims a recorded delegation/read-only worktree only when its
 owning job is final (`succeeded`, `failed`, or `cancelled`) and its terminal
 `updated_at` is older than `[workflow].delegation_worktree_ttl` (default `72h`;
@@ -16574,6 +16596,11 @@ when the current state is `succeeded`, `failed`, or `cancelled` and the exact
 path matches; then run `git -C <registered-checkout> worktree remove --force
 <path>` followed by `git -C <registered-checkout> worktree prune`. Never remove
 a worktree owned by a blocked, queued, or running job.
+
+Fix-round clones live under `$GITMOOT_HOME/worktrees/*/fixes/*` and have their
+own `.git` directory. After proving the exact `payload.worktree_path` belongs to
+a final job, remove that directory directly; do not run registered-checkout
+`git worktree remove`, and do not delete the task branch.
 
 ## Shared Tool Cache (isolated worktrees)
 

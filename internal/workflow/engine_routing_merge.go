@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -89,7 +90,38 @@ func (e Engine) dispatchFix(ctx context.Context, reviewer string, payload JobPay
 			result.Summary,
 		),
 	}
-	return e.dispatch(ctx, request, ref)
+	if request.ID == "" {
+		request.ID = e.jobID(request)
+	}
+	if err := e.ensureAgentAllowed(ctx, request, ref); err != nil {
+		return err
+	}
+	// Fail closed at the dispatch site. Falling through here would enqueue the fix
+	// with no WorktreePath, which resolves to the registered checkout and permits a
+	// concurrent agent to overwrite the lane owner's uncommitted work (#1462).
+	if e.FixWorktreeAllocator == nil {
+		return errors.New("review fix dispatch requires a writable per-job worktree allocator")
+	}
+	allocation, err := e.FixWorktreeAllocator(ctx, FixWorktreeRequest{
+		JobID:  request.ID,
+		Repo:   request.Repo,
+		Branch: request.Branch,
+	})
+	if err != nil {
+		return fmt.Errorf("allocate review fix worktree: %w", err)
+	}
+	request.WorktreePath = strings.TrimSpace(allocation.Path)
+	if request.WorktreePath == "" {
+		return errors.New("review fix worktree allocator returned an empty path")
+	}
+	request.FixWorktree = true
+	if err := e.enqueue(ctx, request); err != nil {
+		if allocation.Created {
+			_ = os.RemoveAll(request.WorktreePath)
+		}
+		return err
+	}
+	return nil
 }
 
 func (e Engine) leadAgent(ctx context.Context, payload JobPayload) (string, error) {
@@ -321,6 +353,7 @@ func payloadMatchesRequest(payload JobPayload, request JobRequest) bool {
 		payload.Instructions == request.Instructions &&
 		payload.WorkflowID == request.WorkflowID &&
 		payload.WorktreePath == request.WorktreePath &&
+		payload.FixWorktree == request.FixWorktree &&
 		payloadDelegationMatchesRequest(payload, request) &&
 		equalStrings(payload.Reviewers, compactStrings(request.Reviewers)) &&
 		equalStrings(payload.Constraints, compactStrings(request.Constraints))

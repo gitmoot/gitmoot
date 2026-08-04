@@ -43,6 +43,7 @@ func TestJobIDsWithAgedTerminalDelegationWorktree(t *testing.T) {
 	}{
 		{id: "aged-delegation", state: "succeeded", payload: wt("/wt/a", `"delegation_id":"d1"`), updated: old, want: true},
 		{id: "aged-readonly", state: "failed", payload: wt("/wt/f", `"read_only_worktree":true`), updated: old, want: true},
+		{id: "aged-fix", state: "failed", payload: wt("/wt/fix", `"fix_worktree":true`), updated: old, want: true},
 		// owned-by-active shares /wt/b with a still-running owner -> not reclaimable.
 		{id: "owned-by-active", state: "cancelled", payload: wt("/wt/b", `"delegation_id":"d2"`), updated: old, want: false},
 		{id: "active-owner", state: "running", payload: wt("/wt/b", `"delegation_id":"d2b"`), updated: recent, want: false},
