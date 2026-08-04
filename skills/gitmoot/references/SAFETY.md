@@ -55,11 +55,13 @@ Pipeline `allow_auto_merge` remains a separate double-keyed mechanism.
 When review independence cannot be verified, the merge gate names the evidence
 it observed: no implement job for the task, implement jobs that do not match the
 task identity, a matching implement job with no agent, or a malformed implement
-payload. All four remain fail-closed. For the no-job case, use the **coordinator
-bridge**: inspect the engine review job with `gitmoot job show <job-id>` and
-confirm its agent and decision at the exact head, confirm the implementer from
-the pane session, then journal both facts with `gitmoot workflow note`. That
-journal is an operator record only; it is not an attestation or merge-gate input.
+payload. All four remain fail-closed. For the no-job case, first confirm that an
+independent approval exists at the PR's exact current head. If it does not, do
+not use the **coordinator bridge**. If it does, inspect that engine review job
+with `gitmoot job show <job-id>`, confirm its agent and decision, confirm the
+implementer from the pane session, then journal both facts with `gitmoot
+workflow note`. That journal is an operator record only; it is not an
+attestation or merge-gate input.
 
 ### No external CI: grace window, not instant pass (#596)
 
@@ -426,6 +428,13 @@ continuing would require credentials or destructive operations the user did not
 approve.
 
 ## Delegation Worktree Reclaim
+
+Local review dispatches use the same owned read-only-worktree lifecycle as
+read-only delegations, but allocate at the requested PR head rather than
+checkout `HEAD`. The dispatch keeps `head_sha` in the payload and fails closed
+if allocation, the pull-ref retry, or the 5 GiB free-space preflight fails. The
+stable review Task row does not own this checkout. Background taskless asks keep
+their separate fail-open committed-tip isolation policy.
 
 The daemon force-reclaims a recorded delegation/read-only worktree only when its
 owning job is final (`succeeded`, `failed`, or `cancelled`) and its terminal

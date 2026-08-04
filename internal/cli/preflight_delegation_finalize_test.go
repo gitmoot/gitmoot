@@ -373,7 +373,7 @@ func TestPreflightCancelledChildIsNotForceFinalized(t *testing.T) {
 
 	// finishQueuedJob attempts queued→failed; the child is already cancelled, so
 	// the transition does not fire and the finalize is skipped.
-	if err := h.worker.finishQueuedJob(ctx, "parent-job/delegation/api", workflow.JobFailed, errors.New("pre-flight failure after cancel")); err != nil {
+	if err := h.worker.finishQueuedJob(ctx, mustWorkerJob(t, h.store, "parent-job/delegation/api"), workflow.JobFailed, errors.New("pre-flight failure after cancel")); err != nil {
 		t.Fatalf("finishQueuedJob returned error: %v", err)
 	}
 
@@ -415,7 +415,7 @@ func TestFinishQueuedJobNonDelegationUnaffected(t *testing.T) {
 		return workflow.Engine{}
 	}
 
-	if err := worker.finishQueuedJob(ctx, "ask-job", workflow.JobFailed, errors.New("pre-flight failure")); err != nil {
+	if err := worker.finishQueuedJob(ctx, mustWorkerJob(t, store, "ask-job"), workflow.JobFailed, errors.New("pre-flight failure")); err != nil {
 		t.Fatalf("finishQueuedJob returned error: %v", err)
 	}
 	job := mustWorkerJob(t, store, "ask-job")

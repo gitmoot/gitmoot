@@ -98,7 +98,7 @@ snippet with `--config-snippet`.
 
 ## Runtime Metadata Registry
 
-Gitmoot drives four built-in runtimes (`codex`, `claude`, `kimi`, plus the
+Gitmoot drives five built-in runtimes (`codex`, `claude`, `kimi`, `omp`, plus the
 subscribe-only `shell`; the legacy `kimi-cli` is also compiled in). Each carries
 declarative metadata — advertised capabilities, a default model, an advisory list
 of known-valid models, and a descriptor of where token usage is read from. Inspect
@@ -127,7 +127,11 @@ Two fields are **behavioral**. `default_model` is the model fallback when neithe
 the agent nor the job pins `--model`: agent/job `--model`, then `default_model`,
 then the runtime CLI's own default. `default_effort` follows the same precedence
 after job/agent `--effort`; for Codex, Gitmoot emits
-`-c model_reasoning_effort=<value>`. Claude and Kimi do not expose a reasoning
+`-c model_reasoning_effort=<value>`, and for omp it becomes `--thinking <level>`
+whenever the resolved value is one of omp's accepted levels
+(`off|minimal|low|medium|high|xhigh|max|auto`) — anything else is **dropped**, so
+a typo falls back to omp's own default instead of silently downgrading the seat.
+Claude and Kimi do not expose a reasoning
 effort argument, so the resolved value is a no-op for those adapters. Every other
 field is **inspection-only**, surfaced by `gitmoot runtime list`
 but changing nothing at runtime: `models` is **advisory** (Gitmoot never rejects a
@@ -217,7 +221,17 @@ daemon environment exactly as before. With it enabled, the base allowlist is:
 
 Codex additionally receives `CODEX_HOME`. Claude receives `CLAUDE_CONFIG_DIR`;
 its three managed auth names are then resolved from `runtime-auth.env` at the
-adapter seam described above. Kimi, legacy `kimi-cli`, and shell add nothing.
+adapter seam described above. omp receives **routing plumbing only** —
+`OMP_PROFILE`, `PI_PROFILE`, `PI_CODING_AGENT_DIR`, `PI_SMOL_MODEL`,
+`PI_SLOW_MODEL`, `PI_PLAN_MODEL`, `OMP_AUTH_BROKER_URL`, and
+`OMP_AUTH_BROKER_TOKEN` — and **no** raw provider key, so under curation a
+provider key reaches omp only through omp's own profile auth storage or an
+explicit `env_passthrough` entry. Two caveats: the broker URL/token pair is
+**indivisible** (omp throws when the URL is set and no token is available, so
+dropping only the token turns an inherited URL into a hard failure), and
+`--profile` selects omp's auth/state store without isolating process
+environment, so a passed-through key is visible to every omp profile this daemon
+runs. Kimi, legacy `kimi-cli`, and shell add nothing.
 Gitmoot-owned relay, shell-stage, pipeline, and upstream-file variables are
 appended after the base and remain available.
 
@@ -285,6 +299,10 @@ Claude may write its runtime-owned `$HOME/.claude` state and
 `$XDG_CACHE_HOME/claude-cli-nodejs` cache; wrapped Kimi may write its runtime-owned
 `$HOME/.kimi-code` state. Apart from runtime state/cache and standard device nodes,
 only declared data paths, the disposable workdir, and temp roots are writable.
+`omp` never reaches this wrapper: it is applied by runtime **name**, to Claude
+and Kimi only. omp also does not advertise the `produce` capability, because its
+Bun binary's Landlock interaction is unprobed and advertising an unproven
+capability would turn an unknown into a silent stage failure.
 
 ## Repo And Daemon Status
 
@@ -736,8 +754,8 @@ runners or ephemeral workers. Every successful start prints one memory status
 line: `memory: on`, `memory: off (enable with --memory)`, or `memory: enrolled
 but globally disabled by [memory].disabled`.
 
-`--runtime` accepts `codex`, `claude`, `kimi`, or `kimi-cli`. `kimi` is the
-current Kimi Code CLI (the default choice); `kimi-cli` is the opt-in legacy
+`--runtime` accepts `codex`, `claude`, `kimi`, `kimi-cli`, or `omp`. `kimi` is
+the current Kimi Code CLI (the default choice); `kimi-cli` is the opt-in legacy
 Kimi CLI adapter (#546) — the two are the same runtime *family* for
 cross-family review purposes. For either, run `kimi login` first and restart
 the Gitmoot daemon so it inherits the session. `agent subscribe` additionally
@@ -745,20 +763,58 @@ accepts `--runtime shell`, the deterministic no-LLM adapter whose `--session`
 is a **command** (the job prompt arrives as `$1`; stdout must carry the
 `gitmoot_result` envelope) — the workhorse for deterministic E2E tests.
 
+`omp` is the oh-my-pi CLI (#1428): a multi-provider **routing harness** rather
+than one vendor's CLI, so which provider answers is a property of the omp profile
+the daemon runs under. Practical consequences worth knowing before you register
+an omp seat:
+
+- **Capabilities are `review`, `implement`, `ask` — not `produce`** (its Bun
+  binary's Landlock interaction is unprobed).
+- **Every job is a fresh session.** omp is stateless in v1 and never resumes:
+  `omp --resume` relocates the working directory to the previous session's cwd
+  and overwrites `--cwd`, so a resumed job would edit the *old* worktree and
+  leave the job's own worktree clean — a green job with an empty diff. A
+  `--session` ref may be a session UUID or `fresh:<suffix>`, never `last`.
+- **Exit code 0 is not success.** In `--mode=json` omp exits 0 even on a failed
+  turn, so Gitmoot decides success by parsing the NDJSON stream, and an empty
+  assistant answer, a stream that ends mid-retry, or a run **cut off mid-work**
+  fails loudly rather than reporting an empty success. The cut-off case is the
+  quiet one: when the `--max-time` deadline or the provider's output cap stops
+  the run, the envelope is complete and only the final answer is missing, so the
+  parser reads the FINAL assistant message rather than the last one that carried
+  text — an earlier work note is never handed back as the job's answer.
+- **All four `--policy` values pass the same explicit `--approval-mode=yolo`.**
+  omp's undeclared tools default to the `exec` tier, so `always-ask` would make
+  every headless tool call throw. Read-only stays enforced Gitmoot-side (the
+  same fail-closed implement refusal Kimi uses), not by the runtime flag.
+- **omp is in no cross-family group.** An omp implement job's cross-family
+  review is *refused loudly* (a `cross_family_review_failed` job event) rather
+  than silently skipped, because scoring an opaque router as a family would
+  manufacture diversity the merge gate would trust. The exclusion is symmetric: a
+  registered omp seat is never picked as another runtime's cross-family reviewer
+  either. Per-seat provider declaration is issue #1436.
+- **Authentication is per profile.** Authenticate omp once interactively (or
+  export the provider key the daemon should use, or point it at an auth broker),
+  then restart the Gitmoot daemon so it inherits the credential. The daemon must
+  also see the binary: its `PATH` comes from the systemd EnvironmentFile, not a
+  login shell.
+
 `agent start`, `agent subscribe`, and `agent type set` accept an optional
 `--model <name>` flag that sets the agent's default runtime model. It is a
-free-form, runtime-scoped string (a Codex, Claude Code, or Kimi Code model name)
-with no allow-list; both `--model X` and `--model=X` are accepted. A per-job
-`--model` (or a delegation's `model` field) overrides this default, and an
-omitted model preserves the runtime's own default. The same default can be set
-in config under `[agents.<type>].model`.
+free-form, runtime-scoped string (a Codex, Claude Code, Kimi Code, or omp
+model name) with no allow-list; both `--model X` and `--model=X` are accepted.
+A per-job `--model` (or a delegation's `model` field) overrides this default,
+and an omitted model preserves the runtime's own default. The same default can
+be set in config under `[agents.<type>].model`.
 
 The same commands accept `--effort <value>` as the agent's default reasoning
 effort, and `agent run`, `ask`, `implement`, `review`, and `orchestrate` accept it
 as a per-job override. The resolution order mirrors model selection: job effort,
 agent effort, `[runtimes.<runtime>].default_effort`, then no explicit override.
 Values are free-form pass-through strings. Codex receives
-`-c model_reasoning_effort=<value>`; Claude and Kimi ignore the setting.
+`-c model_reasoning_effort=<value>`; omp receives `--thinking <level>` when the
+resolved value is one of `off|minimal|low|medium|high|xhigh|max|auto` and no flag
+at all otherwise; Claude and Kimi ignore the setting.
 
 `agent start` and `agent subscribe` accept `--policy` (default `auto`). The policy
 maps to the runtime permission mode and decides what a headless job may do:
@@ -802,7 +858,7 @@ agents default to `full`. It controls how the agent's installed preset
 |---|---|
 | `full` (default) | always inline the full preset prompt every job — the pre-existing behavior, byte-identical |
 | `referenced` | send a short "use your installed `<preset>` preset (commit `<c>`)" reference INSTEAD of the whole body, but only when Gitmoot has recorded that the exact resumed session already loaded the same preset at the same commit; any doubt (new/`last`/fresh session, unknown session, changed commit) falls back to full |
-| `auto` | like `referenced`, and ADDITIONALLY only when the runtime persists sessions (`codex`/`claude`); `shell`/`kimi`/custom always send full |
+| `auto` | like `referenced`, and ADDITIONALLY only when the runtime persists sessions (`codex`/`claude`); `shell`/`kimi`/`omp`/custom always send full |
 
 The optimization is correctness-first and additive: the job payload **always**
 snapshots the exact preset id, resolved commit, and content regardless of mode
@@ -888,9 +944,17 @@ idempotent `review_loop_detected` event. A new head proceeds, and mixed decision
 at one head also proceed because the earlier claim is unstable. The loop guard
 allows an empty head only before any succeeded review history exists for that
 repo/PR; after that it fails closed until the caller supplies the current head.
-The local CLI's existing worktree preparation still requires it to resolve a
-concrete head before dispatch. The prior verdict is escalation evidence only and
-is never served as the new result.
+The local CLI still requires a concrete head before dispatch. Each admitted
+local review gets its own detached, read-only per-job worktree at that exact
+commit; the stable per-PR Task row remains lifecycle metadata and no longer owns
+the review checkout. Consequently, `gitmoot task list` shows an empty worktree
+column for review Task rows. This is expected: each review job owns its own path,
+so there is no single Task-level worktree path to display. The requested
+`head_sha` stays on the job payload. Review
+allocation fails closed rather than falling back to the registered checkout,
+and dispatch refuses before Task mutation when the Gitmoot filesystem has less
+than 5 GiB free or free-space measurement is unavailable. The prior verdict is
+escalation evidence only and is never served as the new result.
 
 This exact `(repo, PR, head_sha, decision)` evidence key is intentional: the
 #1419 review panel rejected round counters and other instruments, so this guard
@@ -914,6 +978,22 @@ This dispatch-time lead validation applies only to local CLI reviews started by
 from PR comments continue to validate their fix target when the workflow
 advances until [gitmoot#1433](https://github.com/gitmoot/gitmoot/issues/1433)
 adds the corresponding ingress preflight.
+
+Before delivery, these dispatch commands scan commit-shaped tokens against the
+target repository. Ask and implement preserve their existing scanner input;
+review scans its newly allocated exact-head worktree with the requested head
+still bound. If a token resolves to a commit other than the dispatch head,
+Gitmoot prints an advisory warning such as
+`prompt references commit <referenced>, but the dispatch head is <head>; Gitmoot
+will use dispatch head <head>`. The job still runs because prompts may
+legitimately discuss historical commits. Hex strings that do not resolve to a
+commit, including mutation-hygiene SHA-256 restore hashes, do not warn.
+
+**The scan covers the instructions you pass on the command line, and nothing
+else.** Text contributed by a recipe template (`--recipe`) or by the selected
+agent's own template is not scanned, so a stale commit cited inside a template
+body dispatches with no warning. If you drive dispatches through templates,
+treat this warning as covering your instructions only.
 
 New implementation PRs opened by the engine are drafts by default. Use
 `--ready` on `agent run`, `agent implement`, or `orchestrate` to opt into an
@@ -957,8 +1037,8 @@ count and offers both explicit choices: `--base origin/<default>` or
 `gitmoot agent run`, `ask`, `implement`, and `review` (and `orchestrate`) accept
 an optional `--model <name>` flag that pins the runtime model for that one job,
 overriding the agent's configured default. It is a free-form, runtime-scoped
-string (a Codex, Claude Code, or Kimi Code model name) with no allow-list; an
-omitted `--model` leaves the agent's default model in effect. Both `--model X`
+string (a Codex, Claude Code, Kimi Code, or omp model name) with no allow-list;
+an omitted `--model` leaves the agent's default model in effect. Both `--model X`
 and `--model=X` are accepted.
 
 `--effort <value>` and `--effort=<value>` select reasoning effort for one job
@@ -966,13 +1046,14 @@ with the same job-over-agent-over-registry precedence. Gitmoot does not validate
 an allow-list; Codex validates the forwarded value.
 
 The same commands accept an optional per-job `--runtime
-codex|claude|kimi|kimi-cli|shell` override: that ONE job runs through the named
-runtime while the agent's registered default runtime stays untouched (`agent
-show` is unchanged afterwards). An overridden job never resumes — and never
-writes back to — the agent's default-runtime session: it runs on a fresh
+codex|claude|kimi|kimi-cli|omp|shell` override: that ONE job runs through the
+named runtime while the agent's registered default runtime stays untouched
+(`agent show` is unchanged afterwards). An overridden job never resumes — and
+never writes back to — the agent's default-runtime session: it runs on a fresh
 session of the override runtime, or on an explicit `--session <ref>` (a
-Codex/Claude session id, a Kimi session id, or — required for `shell` — a
-command; `last` is rejected because it resumes whichever session is most
+Codex/Claude session id, a Kimi session id, an omp session UUID or
+`fresh:<suffix>`, or — required for `shell` — a command; `last` is rejected
+because it resumes whichever session is most
 recent rather than a concrete one), and its runtime-session lock names the
 override runtime so it cannot collide with the default session's lock. Model
 rule: `--model` combined with `--runtime` is interpreted for the OVERRIDE
@@ -990,6 +1071,9 @@ generations:
 # Retry a hard review through Claude without re-registering the reviewer:
 gitmoot agent review reviewer --repo owner/repo --pr 123 "Re-review this PR." --runtime claude
 gitmoot agent ask reviewer "Compare the approaches." --repo owner/repo --runtime kimi --model kimi-k2
+
+# Route one job through omp's router; --effort becomes omp's --thinking level:
+gitmoot agent ask reviewer "Summarize the risk in this diff." --repo owner/repo --runtime omp --effort high
 ```
 
 `gitmoot orchestrate`, `agent run`, and `agent implement` also accept an optional
@@ -1015,15 +1099,14 @@ line in human output. Genuine non-terminal failures (the job did not reach
 `succeeded`) still exit non-zero as before. A normal success with no advance error
 is byte-identical to prior behavior — no `advance_error` field is emitted.
 
-**Review resilience under branch churn.** A review job is pinned to the PR head
-SHA it was queued against; in an active dev loop the branch often advances (a new
-commit is pushed) before the queued review runs, leaving the registered checkout
-on a newer head. Rather than failing the review on that head-SHA mismatch, Gitmoot
-**re-syncs** it: when the PR is still **open**, the review is re-targeted to the
-checkout's current head — reviewing the newest commit is exactly what a human
-reviewer does — and a `review_head_resynced` job event records the old→new head.
-The mismatch is only allowed to fail cleanly when the PR is **closed/merged** (a
-stale review of a dead PR is not useful) or when the checkout is dirty. Relatedly,
+**Review resilience under branch churn.** Newly dispatched local reviews are
+pinned to the requested PR head in a per-job worktree, so a later branch push or
+registered-checkout movement cannot change what they review. The daemon keeps
+the older re-sync behavior only for legacy/fallback review jobs that lack an
+owned read-only worktree: when their shared checkout advances and the PR remains
+open on the same branch, it re-targets the payload and records
+`review_head_resynced`; closed/merged, dirty, or wrong-branch checkouts fail.
+Relatedly,
 when a foreground `agent review` finds the agent's serialized runtime session
 **busy**, the review is now **left queued** for the daemon to run when the session
 frees (a `requeued_runtime_busy` event is recorded) instead of being cancelled and
@@ -1114,8 +1197,11 @@ the **policy-gated** write action `implement` — it only runs for an agent that
 holds the `implement` capability AND a write-granting policy (`--policy
 workspace-write` or `danger-full-access`); otherwise it is refused at `add` and
 no-op'd (`last_status = policy_readonly`) by the daemon scan. An optional
-`--runtime codex|claude|kimi` runs the scheduled job on that runtime (fresh
-session) instead of the agent default. `gitmoot daemon status` surfaces each
+`--runtime codex|claude|kimi|omp` runs the scheduled job on that runtime (fresh
+session) instead of the agent default — the accepted set is derived from the
+adapter registry, so `omp` joined it the moment the runtime was registered, and
+an enabled heartbeat pointed at omp will spend whatever credential its profile
+resolves. `gitmoot daemon status` surfaces each
 schedule's last-run/next-due/last-status. See `docs/heartbeats.md` for the full
 reference.
 
@@ -1950,8 +2036,8 @@ successfully delivered job's terminal result.
 gitmoot job list --repo owner/repo   # add --json for machine-readable rows
 gitmoot job show <job-id>            # add --json for the full job + operational detail
 gitmoot job watch <job-id>
-gitmoot job watch <job-id> --transcript [--log-path <path>] [--runtime codex|claude|kimi|kimi-cli|shell]
-gitmoot job transcript <job-id> --export md|jsonl [--output <path>] [--log-path <path>] [--runtime codex|claude|kimi|kimi-cli|shell]
+gitmoot job watch <job-id> --transcript [--log-path <path>] [--runtime codex|claude|kimi|kimi-cli|omp|shell]
+gitmoot job transcript <job-id> --export md|jsonl [--output <path>] [--log-path <path>] [--runtime codex|claude|kimi|kimi-cli|omp|shell]
 gitmoot job transcript --all [--state succeeded,failed] [--since 720h] --export jsonl [--output <path>]
 gitmoot job events <job-id>
 gitmoot job retry <job-id>
@@ -2053,7 +2139,12 @@ runtime override wins over the registered agent runtime.
 Fidelity follows each runtime's actual output contract: Codex JSONL renders
 live; Kimi stream-json is turn-buffered and kimi-code 0.19.2 reports no usage;
 Claude emits only its final JSON envelope, so its transcript remains quiet until
-completion; shell output passes through as redacted raw lines. Usage is labeled
+completion; shell output passes through as redacted raw lines. omp's NDJSON is
+retained verbatim and currently passes through **undecoded** — every row carries
+the transcript kind `raw`, and omp's own `type` discriminator survives only
+inside each row's raw JSON text, so an export offers no per-event kinds; a
+translator that lifts tool calls and usage out of the stream is a named
+follow-up. Usage is labeled
 `latest reported usage` because resumed Codex counts can be session-cumulative.
 Malformed or unknown lines degrade individually to redacted capped raw output
 without stopping later lines.

@@ -15,20 +15,20 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// finishQueuedJob closes a job that is queued NOW, for callers with no earlier run to be stale
-// against -- the ~22 pre-flight sites, which act on a job they just admitted.
-func (w jobWorker) finishQueuedJob(ctx context.Context, jobID string, state workflow.JobState, cause error) error {
-	return w.finishQueuedJobAtGeneration(ctx, jobID, -1, state, cause)
+// finishQueuedJob closes the admitted lifecycle when it is still queued. Every
+// pre-flight caller passes the db.Job it admitted so the state transition is
+// atomic in both the job id and that row's lifecycle generation.
+func (w jobWorker) finishQueuedJob(ctx context.Context, job db.Job, state workflow.JobState, cause error) error {
+	return w.finishQueuedJobAtGeneration(ctx, job.ID, job.LifecycleGeneration, state, cause)
 }
 
 // finishQueuedJobAtGeneration is the ANCHORED form: atGeneration >= 0 makes the transition
 // atomic in (state, generation), so a verdict formed about an earlier run cannot close a newer
 // one that merely happens to be queued again.
 //
-// It is a separate entry point rather than a threaded parameter on all 23 call sites because the
-// pre-flight callers have no prior run to be stale against -- adding an argument they must pass
-// -1 to would be 22 chances to pass the wrong thing for one site that needs it. The stale-
-// sensitive caller is handleRunJobError, and it is the only one that anchors.
+// handleRunJobError passes the lifecycle it observed before execution. Pre-flight
+// callers reach this through finishQueuedJob, which derives the generation from
+// their admitted db.Job without a second, non-atomic read.
 func (w jobWorker) finishQueuedJobAtGeneration(ctx context.Context, jobID string, atGeneration int64, state workflow.JobState, cause error) error {
 	event := db.JobEvent{
 		JobID:   jobID,
@@ -67,10 +67,10 @@ func (w jobWorker) finishQueuedJobAtGeneration(ctx context.Context, jobID string
 	// advanceDelegations never runs for the child and its failure_policy
 	// (escalate_human / block_parent / continue / escalate) never fires (#409).
 	//
-	// finishQueuedJob is the single choke point all ~12 direct
-	// finishQueuedJob(JobFailed) sites (and handleRunJobError's JobQueued branch)
-	// funnel through, so finalizing here covers every pre-flight failure exactly
-	// once. Gate on a genuine queued→(failed|blocked) transition + a delegation
+	// finishQueuedJobAtGeneration is the shared implementation all 19 pre-flight
+	// finishQueuedJob sites and handleRunJobError's queued branch funnel through,
+	// so finalizing here covers every pre-flight failure exactly once. Gate on a
+	// genuine queued→(failed|blocked) transition + a delegation
 	// child with no stored result, so non-delegation jobs (PR/issue asks) are
 	// byte-identical and an already-terminal/cancelled child is never
 	// force-finalized.

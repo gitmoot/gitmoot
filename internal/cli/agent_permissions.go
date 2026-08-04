@@ -25,11 +25,9 @@ func readOnlyImplementationBlocked(jobType string, agent runtime.Agent) bool {
 	return !runtime.PolicyGrantsImplementWrite(agent.AutonomyPolicy)
 }
 
-// markJobPermissionBlocked blocks a job for a permission failure.
-//
-// atGeneration, when non-negative, pins the LIFECYCLE this verdict was formed about, and the
-// transition is then atomic in (state, generation). Dispatch-time callers pass -1: they are
-// acting on a job they just created, so there is no earlier run to be stale against.
+// markJobPermissionBlockedAtGeneration blocks a job for a permission failure.
+// atGeneration pins the lifecycle this verdict was formed about, making the
+// transition atomic in both state and generation.
 //
 // The anchored form exists because a check-then-act is not enough (#1407). handleRunJobError
 // re-reads the row and checks the generation, but a retry can be claimed in the window between
@@ -77,11 +75,11 @@ func markJobPermissionBlockedAtGeneration(ctx context.Context, store *db.Store, 
 	return false, nil
 }
 
-// markJobPermissionBlocked is the UNANCHORED form, for callers with no earlier run to be stale
-// against (dispatch time, where the job was just created). It is a DISTINCT NAME rather than a
-// default argument so an anchored call site cannot silently become unanchored by dropping one.
-func markJobPermissionBlocked(ctx context.Context, store *db.Store, jobID string) (bool, error) {
-	return markJobPermissionBlockedAtGeneration(ctx, store, jobID, -1)
+// markJobPermissionBlocked derives the atomic-write anchor from the admitted
+// row. Callers must retain that row rather than re-read before writing: a queued
+// cancellation and retry can produce the same state at a newer generation.
+func markJobPermissionBlocked(ctx context.Context, store *db.Store, job db.Job) (bool, error) {
+	return markJobPermissionBlockedAtGeneration(ctx, store, job.ID, job.LifecycleGeneration)
 }
 
 func runtimePermissionFailure(err error) bool {

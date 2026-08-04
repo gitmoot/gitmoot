@@ -33,8 +33,8 @@ gitmoot plugin doctor
 gitmoot agent template list
 gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 gitmoot agent template update thermo-nuclear-code-quality-review
-gitmoot agent start <name> --runtime codex|claude|kimi --repo owner/repo --path . --template thermo-nuclear-code-quality-review --start-daemon
-gitmoot agent subscribe <name> --runtime codex|claude|kimi|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
+gitmoot agent start <name> --runtime codex|claude|kimi|kimi-cli|omp --repo owner/repo --path . --template thermo-nuclear-code-quality-review --start-daemon
+gitmoot agent subscribe <name> --runtime codex|claude|kimi|kimi-cli|omp|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
 gitmoot agent run <name> "message" --repo owner/repo [--task task-id] [--pr number] [--background]
 gitmoot agent review <name> "message" --repo owner/repo --pr number [--background] # exact-head loop guard applies
 gitmoot agent run <name> "message" --repo owner/repo [--task task-id] [--pr number] [--lead implementer] [--background]
@@ -545,8 +545,11 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
 
    Implement jobs require the agent to hold the branch lock. Review and ask jobs
    are routed through the runtime adapter and must return the `gitmoot_result`
-   JSON contract. Jobs tied to a task worktree use that worktree for validation;
-   jobs without a task worktree use the registered checkout.
+   JSON contract. A newly dispatched local review always owns a detached
+   read-only per-job worktree at its requested head; its stable Task row tracks
+   lifecycle only. Review allocation fails closed and requires a measurable
+   5 GiB free-space floor. Other jobs tied to a task worktree use that worktree;
+   jobs without an owned or task worktree use the registered checkout.
 
    For a local chat ask that should not go through a PR comment, call the same
    registered agent directly:
@@ -589,10 +592,12 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    When review independence cannot be verified, the decline names the observed
    cause: no implement job for the task, task-identity mismatch, a matching job
    with no agent, or a malformed implement payload. All four remain fail-closed.
-   For the no-job case, the coordinator bridge is to inspect the exact-head
-   engine review with `gitmoot job show <job-id>`, confirm the implementer from
-   the pane session, and journal both facts with `gitmoot workflow note`. The
-   journal is an operator record, never an attestation consumed by the gate.
+   For the no-job case, first confirm that an independent approval exists at the
+   PR's exact current head. If it does not, do not use the coordinator bridge.
+   If it does, inspect that engine review with `gitmoot job show <job-id>`,
+   confirm the implementer from the pane session, and journal both facts with
+   `gitmoot workflow note`. The journal is an operator record, never an
+   attestation consumed by the gate.
 
    When a head reports **no** external CI at all (zero commit-statuses and zero
    check-runs), Gitmoot does not conclude "this repo has no CI" from a single

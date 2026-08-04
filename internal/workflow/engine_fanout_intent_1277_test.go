@@ -254,7 +254,7 @@ func TestInProcessPROpenHonoursTheBranchLockIntent(t *testing.T) {
 	seedAgent(t, store, "reviewer", []string{"review"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
 	engine.RequiredReviewers = []string{"reviewer"}
-	gate := &fakeMergeGate{decision: MergeDecision{Reason: "ci is pending"}}
+	gate := &fakeMergeGate{decision: MergeDecision{Reason: PlainReason("ci is pending")}}
 	engine.MergeGate = gate
 
 	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-11", Owner: "lead"}); err != nil || !acquired {
@@ -315,7 +315,7 @@ func TestInProcessPROpenHonoursBranchLockAcrossSessionBusyDelegation(t *testing.
 	seedAgent(t, store, "reviewer", []string{"review"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
 	engine.RequiredReviewers = []string{"reviewer"}
-	gate := &fakeMergeGate{decision: MergeDecision{Reason: "ci is pending"}}
+	gate := &fakeMergeGate{decision: MergeDecision{Reason: PlainReason("ci is pending")}}
 	engine.MergeGate = gate
 
 	// The lock — and therefore the branch intent — belongs to the ORIGINAL agent.
@@ -546,7 +546,7 @@ func TestMixedIdentityFanoutIntentMatrix(t *testing.T) {
 			seedAgent(t, store, "temp-worker", []string{"implement"}, repo)
 			engine := testEngine(store)
 			engine.RequiredReviewers = tc.roster
-			gate := &fakeMergeGate{decision: MergeDecision{Reason: "ci is pending"}}
+			gate := &fakeMergeGate{decision: MergeDecision{Reason: PlainReason("ci is pending")}}
 			engine.MergeGate = gate
 
 			if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo, Branch: tc.branch, Owner: tc.lockOwner}); err != nil || !acquired {

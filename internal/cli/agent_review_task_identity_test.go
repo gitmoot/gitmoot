@@ -28,7 +28,7 @@ func TestStableReviewTaskIdentityLetsSecondRoundVerdictReachGate(t *testing.T) {
 func TestStableReviewTaskIdentityKeepsHeadRoundIsolation(t *testing.T) {
 	const stableTaskID = "review-pr-17-stable"
 	decision := evaluateC1GateScenario(t, stableTaskID, stableTaskID, "old-head", "new-head", stableTaskID, "reviewer", false)
-	if !decision.LeaveOpen || decision.Merged || !strings.Contains(decision.Reason, "different head SHA") {
+	if !decision.LeaveOpen || decision.Merged || !strings.Contains(decision.Reason.Render(), "different head SHA") {
 		t.Fatalf("wrong-head verdict was not rejected by the head comparison: %+v", decision)
 	}
 }
@@ -73,9 +73,9 @@ func TestC1MeasurementEngineDispatchedImplementerIdentity(t *testing.T) {
 func observedC1ImplementerResolution(t *testing.T, decision workflow.MergeDecision) (int, bool) {
 	t.Helper()
 	switch {
-	case decision.Ready && decision.Merged && !decision.LeaveOpen && !decision.EscalateMergeGateMiss && !decision.Deferred:
+	case decision.Ready && decision.Merged && !decision.LeaveOpen && !decision.Reason.IsGateMiss() && !decision.Deferred:
 		return 1, false
-	case !decision.Ready && !decision.Merged && decision.LeaveOpen && decision.EscalateMergeGateMiss && !decision.Deferred:
+	case !decision.Ready && !decision.Merged && decision.LeaveOpen && decision.Reason.IsGateMiss() && !decision.Deferred:
 		return 0, true
 	default:
 		t.Fatalf("gate decision did not expose a structured implementer-resolution outcome: %+v", decision)
@@ -114,18 +114,18 @@ func c1ReviewRepository(t *testing.T) (repoDir string, oldHead string, newHead s
 
 func mintC1ReviewTaskID(t *testing.T, repoDir string, headSHA string) string {
 	t.Helper()
+	_ = repoDir
 	home := t.TempDir()
 	store := openCLIJobStore(t, home)
 	t.Cleanup(func() { _ = store.Close() })
-	request, _, err := prepareLocalReviewWorktree(
+	request, err := prepareLocalReviewTask(
 		context.Background(),
 		store,
-		db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir},
 		github.Repository{Owner: "owner", Name: "repo"},
 		localAgentDispatchRequest{Home: home, PullRequest: 17, HeadSHA: headSHA},
 	)
 	if err != nil {
-		t.Fatalf("prepareLocalReviewWorktree(%s): %v", headSHA, err)
+		t.Fatalf("prepareLocalReviewTask(%s): %v", headSHA, err)
 	}
 	return request.TaskID
 }

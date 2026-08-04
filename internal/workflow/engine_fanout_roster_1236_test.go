@@ -144,7 +144,7 @@ func TestFanoutUnconfiguredRosterStillRunsTheMergeGate(t *testing.T) {
 	store := openEngineStore(t)
 	seedAgent(t, store, "impl", []string{"implement"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
-	gate := &fakeMergeGate{decision: MergeDecision{Reason: "ci is pending"}}
+	gate := &fakeMergeGate{decision: MergeDecision{Reason: PlainReason("ci is pending")}}
 	engine.MergeGate = gate
 
 	// The gate's "ci is pending" decision blocks the task, so an error here is

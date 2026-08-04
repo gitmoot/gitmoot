@@ -12,7 +12,7 @@ import (
 func TestDaemonPullRequestOpenedDraftDoesNotParkTask(t *testing.T) {
 	ctx := context.Background()
 	store, repo, pull := setupDaemonDraftPropagationTest(t, workflow.TaskPlanned)
-	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{LeaveOpen: true, Reason: "human merge required"}}
+	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{LeaveOpen: true, Reason: workflow.PlainReason("human merge required")}}
 	engine := workflow.Engine{Store: store, MergeGate: gate}
 	daemon := Daemon{Repo: repo, Store: store, Workflow: &engine}
 
@@ -25,7 +25,7 @@ func TestDaemonPullRequestOpenedDraftDoesNotParkTask(t *testing.T) {
 func TestDaemonReadyToMergeDraftDoesNotParkTask(t *testing.T) {
 	ctx := context.Background()
 	store, repo, pull := setupDaemonDraftPropagationTest(t, workflow.TaskReadyToMerge)
-	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{LeaveOpen: true, Reason: "human merge required"}}
+	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{LeaveOpen: true, Reason: workflow.PlainReason("human merge required")}}
 	engine := workflow.Engine{Store: store, MergeGate: gate}
 	daemon := Daemon{Repo: repo, Store: store, Workflow: &engine}
 
@@ -38,7 +38,7 @@ func TestDaemonReadyToMergeDraftDoesNotParkTask(t *testing.T) {
 func TestDaemonMergeCommandDraftDoesNotParkTask(t *testing.T) {
 	ctx := context.Background()
 	store, repo, pull := setupDaemonDraftPropagationTest(t, workflow.TaskReadyToMerge)
-	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{LeaveOpen: true, Reason: "human merge required"}}
+	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{LeaveOpen: true, Reason: workflow.PlainReason("human merge required")}}
 	engine := workflow.Engine{Store: store, MergeGate: gate}
 	client := &fakeGitHub{}
 	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}

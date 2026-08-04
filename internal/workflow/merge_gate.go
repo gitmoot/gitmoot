@@ -131,13 +131,13 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	// GitHub/local-store operation. An authenticated human merge request may
 	// override this policy, but not the independently verified evidence below.
 	if !g.AutoMerge && !request.HumanMergeRequested {
-		return MergeDecision{LeaveOpen: true, Reason: MergeLeaveOpenAutoMergeKillSwitchReason}, nil
+		return MergeDecision{LeaveOpen: true, Reason: PlainReason(MergeLeaveOpenAutoMergeKillSwitchReason)}, nil
 	}
 	if request.PullRequestDraftUnknown {
-		return MergeDecision{LeaveOpen: true, Reason: "pull request draft state is unknown"}, nil
+		return MergeDecision{LeaveOpen: true, Reason: PlainReason("pull request draft state is unknown")}, nil
 	}
 	if request.PullRequestDraft {
-		return MergeDecision{LeaveOpen: true, Reason: "pull request is draft"}, nil
+		return MergeDecision{LeaveOpen: true, Reason: PlainReason("pull request is draft")}, nil
 	}
 	if err := g.validate(); err != nil {
 		return MergeDecision{}, err
@@ -155,7 +155,11 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	}
 	headSHA := strings.TrimSpace(pr.HeadSHA)
 	if headSHA == "" {
-		return g.gateMiss("pull request head SHA is missing"), nil
+		reason, reasonErr := GateMissReason("merge gate", "pull request head SHA is missing", "")
+		if reasonErr != nil {
+			return MergeDecision{}, reasonErr
+		}
+		return g.gateMiss(reason), nil
 	}
 	if !pullRequestMerged(pr) && strings.TrimSpace(pr.State) != "closed" {
 		pendingDecision, isPending, reason, err := g.reviewAndCIGateMiss(ctx, repo, request, headSHA)
@@ -169,7 +173,7 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 			// and escalating.
 			return pendingDecision, nil
 		}
-		if reason != "" {
+		if !reason.IsZero() {
 			return g.gateMiss(reason), nil
 		}
 	}
@@ -251,8 +255,12 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	return g.finishMerged(ctx, request, pr, strings.TrimSpace(result.SHA))
 }
 
-func (g PolicyMergeGate) gateMiss(reason string) MergeDecision {
-	return MergeDecision{LeaveOpen: true, EscalateMergeGateMiss: true, Reason: strings.TrimSpace(reason)}
+func (g PolicyMergeGate) gateMiss(reason MergeReason) MergeDecision {
+	// The kind IS the escalation signal: a gate miss escalates because it is one.
+	// EscalateMergeGateMiss used to say the same thing a second time, and at :158 the
+	// two had already drifted apart -- which is what two representations of one fact
+	// always eventually do (#1381).
+	return MergeDecision{LeaveOpen: true, Reason: reason}
 }
 
 // reviewAndCIGateMiss evaluates the exact-head review-clean and CI-green gate,
@@ -265,25 +273,33 @@ func (g PolicyMergeGate) gateMiss(reason string) MergeDecision {
 // A non-empty reason with isPending=false means review and/or CI were evaluated
 // to completion and at least one is missing, stale, or failed - the caller
 // escalates. Both zero-value means the gate is clean.
-func (g PolicyMergeGate) reviewAndCIGateMiss(ctx context.Context, repo github.Repository, request MergeRequest, headSHA string) (pendingDecision MergeDecision, isPending bool, reason string, err error) {
-	var reasons []string
+func (g PolicyMergeGate) reviewAndCIGateMiss(ctx context.Context, repo github.Repository, request MergeRequest, headSHA string) (pendingDecision MergeDecision, isPending bool, reason MergeReason, err error) {
+	var miss MergeReason
 	if reviewErr := g.ensureFinalReviewCaptured(ctx, request, headSHA); reviewErr != nil {
 		var pending mergePending
 		if errors.As(reviewErr, &pending) {
 			decision, dErr := g.pending(ctx, request, headSHA, pending.reason)
-			return decision, true, "", dErr
+			return decision, true, MergeReason{}, dErr
 		}
-		reasons = append(reasons, "review gate: "+reviewErr.Error()+" for head "+headSHA)
+		var missErr error
+		miss, missErr = miss.WithGateMiss("review gate", reviewErr.Error(), headSHA)
+		if missErr != nil {
+			return MergeDecision{}, false, MergeReason{}, missErr
+		}
 	}
 	if ciErr := g.ensureStatuses(ctx, repo, int64(request.PullRequest), headSHA); ciErr != nil {
 		var pending mergePending
 		if errors.As(ciErr, &pending) {
 			decision, dErr := g.pending(ctx, request, headSHA, pending.reason)
-			return decision, true, "", dErr
+			return decision, true, MergeReason{}, dErr
 		}
-		reasons = append(reasons, "CI gate: "+ciErr.Error()+" for head "+headSHA)
+		var missErr error
+		miss, missErr = miss.WithGateMiss("CI gate", ciErr.Error(), headSHA)
+		if missErr != nil {
+			return MergeDecision{}, false, MergeReason{}, missErr
+		}
 	}
-	return MergeDecision{}, false, strings.Join(reasons, "; "), nil
+	return MergeDecision{}, false, miss, nil
 }
 
 // executePullRequestMerge is the single low-level GitHub merge path shared by
@@ -339,7 +355,7 @@ func (g PolicyMergeGate) finishMerged(ctx context.Context, request MergeRequest,
 		reason = "merged with post-merge warnings: " + strings.Join(postMergeWarnings, "; ")
 		_ = g.Store.UpsertMergeGate(ctx, db.MergeGate{RepoFullName: request.Repo, PullRequest: int64(request.PullRequest), State: "merged", Reason: reason})
 	}
-	return MergeDecision{Ready: true, Merged: true, MergeCommitSHA: mergeSHA, Reason: reason}, nil
+	return MergeDecision{Ready: true, Merged: true, MergeCommitSHA: mergeSHA, Reason: PlainReason(reason)}, nil
 }
 
 func (g PolicyMergeGate) cleanupTaskWorktree(ctx context.Context, request MergeRequest, headBranch string) error {
@@ -802,7 +818,7 @@ func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job) error {
 }
 
 const (
-	noImplementJobAttributionReason            = "latest review round's approval cannot be verified as independent: no implement job is recorded for this task. Use the coordinator bridge: read the engine review job's agent identity and decision at the exact head with gitmoot job show <job-id>, confirm the implementer identity from the pane session, journal both with gitmoot workflow note, then merge the lane"
+	noImplementJobAttributionReason            = "latest review round's approval cannot be verified as independent: no implement job is recorded for this task. Use the coordinator bridge only as follows: step 1, confirm an independent approval exists at this exact head; if it does not, do not bridge. If it does, read the engine review job's agent identity and decision at that head with gitmoot job show <job-id>, confirm the implementer identity from the pane session, journal both with gitmoot workflow note, then merge the lane"
 	mismatchedImplementTaskAttributionReason   = "latest review round's approval cannot be verified as independent: implement jobs are recorded, but none match this task identity; this is an attribution anomaly and may indicate a stable-task-identity regression"
 	emptyImplementAgentAttributionReason       = "latest review round's approval cannot be verified as independent: an implement job matches this task but has no recorded agent; this is an attribution data anomaly"
 	malformedImplementPayloadAttributionReason = "latest review round's approval cannot be verified as independent: an implement job has a malformed payload, so attribution for this task cannot be verified; this is a corrupt-record anomaly"
@@ -1260,7 +1276,7 @@ func (g PolicyMergeGate) block(ctx context.Context, request MergeRequest, sha st
 			return MergeDecision{}, err
 		}
 	}
-	return MergeDecision{Reason: reason, BlockClass: class}, nil
+	return MergeDecision{Reason: PlainReason(reason), BlockClass: class}, nil
 }
 
 func (g PolicyMergeGate) pending(ctx context.Context, request MergeRequest, sha string, reason string) (MergeDecision, error) {
@@ -1282,7 +1298,7 @@ func (g PolicyMergeGate) pending(ctx context.Context, request MergeRequest, sha 
 			return MergeDecision{}, err
 		}
 	}
-	return MergeDecision{Ready: true, Reason: reason}, nil
+	return MergeDecision{Ready: true, Reason: PlainReason(reason)}, nil
 }
 
 func commitStatusDescription(description string) string {

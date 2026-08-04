@@ -91,7 +91,7 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 
 func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude|kimi --repo owner/repo [--path .] [--template <template-id>] [--model model] [--effort effort] [--start-daemon]")
+	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude|kimi|kimi-cli|omp --repo owner/repo [--path .] [--template <template-id>] [--model model] [--effort effort] [--start-daemon]")
 	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--lead implementer] [--head-sha sha] [--base ref] [--branch branch] [--background] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
@@ -102,8 +102,8 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot agent template list|show|add|draft|validate|update|diff ...")
 	fmt.Fprintln(w, "  gitmoot agent prompt <agent-or-template> [--json] [--record [--repo owner/repo] [--type ask|review|implement]]")
 	fmt.Fprintln(w, "  gitmoot agent gc")
-	fmt.Fprintln(w, "  gitmoot agent subscribe <name> --runtime codex|claude|kimi|shell --session <id|name|last|command> --role <role> [--repo owner/repo...] [--model model] [--effort effort] [--preset-delivery full|referenced|auto] --capability <capability>")
-	fmt.Fprintln(w, "    Codex sessions may use a UUID, thread name, or last. Claude sessions may use a UUID or last. Kimi sessions may use a Kimi session id. Shell sessions are commands.")
+	fmt.Fprintln(w, "  gitmoot agent subscribe <name> --runtime codex|claude|kimi|kimi-cli|omp|shell --session <id|name|last|command> --role <role> [--repo owner/repo...] [--model model] [--effort effort] [--preset-delivery full|referenced|auto] --capability <capability>")
+	fmt.Fprintln(w, "    Codex sessions may use a UUID, thread name, or last. Claude sessions may use a UUID or last. Kimi sessions may use a Kimi session id. Omp sessions may use a UUID or fresh:<suffix> — never last, because omp never resumes. Shell sessions are commands.")
 	fmt.Fprintln(w, "  gitmoot agent update <name> --preset-delivery full|referenced|auto")
 	fmt.Fprintln(w, "  gitmoot agent allow <name> --repo owner/repo")
 	fmt.Fprintln(w, "  gitmoot agent deny <name> --repo owner/repo")
@@ -168,6 +168,9 @@ func runAgentAsk(args []string, stdout, stderr io.Writer) int {
 			SelectedActionReason: "explicit agent ask",
 			ExecutionPath:        "agent_ask",
 			JSONOutput:           options.jsonOutput,
+			DispatchWarning: func(warning string) {
+				fmt.Fprintf(stderr, "agent ask: warning: %s\n", warning)
+			},
 		})
 		return err
 	}); err != nil {
@@ -569,7 +572,13 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 	var output localAgentJobOutput
 	if err := withStore(options.home, func(store *db.Store) error {
 		var err error
-		output, err = dispatchLocalAgentJob(dispatchCtx, store, localAgentDispatchRequestFromOptions(options, action, reason, executionPath))
+		request := localAgentDispatchRequestFromOptions(options, action, reason, executionPath)
+		// C4a: the dispatch surface warns when the prompt cites a commit other than
+		// the dispatch head. Set after the helper so main's extraction is preserved.
+		request.DispatchWarning = func(warning string) {
+			fmt.Fprintf(stderr, "%s: warning: %s\n", errLabel, warning)
+		}
+		output, err = dispatchLocalAgentJob(dispatchCtx, store, request)
 		return err
 	}); err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", errLabel, err)
@@ -1140,7 +1149,7 @@ func printAgentTypeUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot agent type list")
 	fmt.Fprintln(w, "  gitmoot agent type show <type>")
-	fmt.Fprintln(w, "  gitmoot agent type set <type> --runtime codex|claude|kimi --template <template-id> --model <model> --effort <effort> --policy workspace-write --max-background 2 --idle-timeout 20m")
+	fmt.Fprintln(w, "  gitmoot agent type set <type> --runtime codex|claude|kimi|kimi-cli|omp --template <template-id> --model <model> --effort <effort> --policy workspace-write --max-background 2 --idle-timeout 20m")
 }
 
 func runAgentTypeList(args []string, stdout, stderr io.Writer) int {
@@ -1215,7 +1224,7 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("agent type set", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, kimi, or kimi-cli")
+	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, kimi, kimi-cli, or omp")
 	templateID := fs.String("template", "", "agent template")
 	model := fs.String("model", "", "default runtime model for this agent type")
 	effort := fs.String("effort", "", "default reasoning effort for this agent type")
@@ -1268,7 +1277,7 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if entry.Runtime == runtime.ShellRuntime {
-		fmt.Fprintln(stderr, "invalid runtime: managed agent types support codex, claude, kimi, or kimi-cli")
+		fmt.Fprintln(stderr, "invalid runtime: managed agent types support codex, claude, kimi, kimi-cli, or omp")
 		return 2
 	}
 	if strings.TrimSpace(*templateID) != "" {
@@ -1428,7 +1437,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("agent start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, kimi, or kimi-cli")
+	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, kimi, kimi-cli, or omp")
 	repoFlag := fs.String("repo", "", "allowed repo as owner/repo")
 	path := fs.String("path", ".", "local checkout path")
 	role := fs.String("role", "", "agent role")
@@ -1648,7 +1657,7 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("agent subscribe", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, kimi, kimi-cli, or shell")
+	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, kimi, kimi-cli, omp, or shell")
 	session := fs.String("session", "", "runtime session reference, last, or shell command")
 	role := fs.String("role", "", "agent role")
 	templateID := fs.String("template", "", "agent template")
@@ -1959,6 +1968,8 @@ func runtimeStartAdapter(factory runtime.Factory, runtimeName string, checkout s
 		return runtime.KimiAdapter{Runner: factory.Runner, Dir: checkout}, nil
 	case runtime.KimiCLIRuntime:
 		return runtime.KimiCLIAdapter{Runner: factory.Runner, Dir: checkout}, nil
+	case runtime.OmpRuntime:
+		return runtime.OmpAdapter{Runner: factory.Runner, Dir: checkout}, nil
 	case runtime.ShellRuntime:
 		return runtime.ShellAdapter{Runner: factory.Runner, Dir: checkout}, nil
 	default:

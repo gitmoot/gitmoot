@@ -736,13 +736,6 @@ func TestRunErrorFromAPreviousRunDoesNotClobberARetriedJob(t *testing.T) {
 		t.Fatalf("CreateJobWithEvent returned error: %v", err)
 	}
 
-	// The run that is about to fail observed THIS lifecycle.
-	before, err := store.GetJob(ctx, "clobber")
-	if err != nil {
-		t.Fatalf("GetJob returned error: %v", err)
-	}
-	observed := observedJobLifecycle(before)
-
 	// A full retry lifecycle runs and returns the job to the SAME state the stale run
 	// observed, at a NEWER generation.
 	//
@@ -750,8 +743,7 @@ func TestRunErrorFromAPreviousRunDoesNotClobberARetriedJob(t *testing.T) {
 	// state-only comparison passed it too and it did not enforce the property it named.
 	// Same-state / different-generation is the only fixture that discriminates a generation
 	// anchor from a state one.
-	_ = observed
-	observed = seedSameStateNewerGeneration(t, store, "clobber", workflow.JobRunning)
+	observed := seedSameStateNewerGeneration(t, store, "clobber", workflow.JobRunning)
 
 	worker := defaultJobWorker(store, io.Discard)
 	deliveryFailed := workflow.BlockedError{Reason: "result delivery failed", ResultDeliveryFailed: true}
@@ -784,20 +776,33 @@ func seedSameStateNewerGeneration(t *testing.T, store *db.Store, jobID string, s
 		t.Fatalf("GetJob returned error: %v", err)
 	}
 	observed := observedJobLifecycle(before)
-	for _, step := range [][2]string{
-		{string(state), string(workflow.JobFailed)},
-		{string(workflow.JobFailed), string(workflow.JobQueued)},
-		{string(workflow.JobQueued), string(state)},
-	} {
-		if step[0] == step[1] {
-			continue
-		}
-		transitioned, err := store.TransitionJobState(ctx, jobID, step[0], step[1])
+	if state != workflow.JobQueued && state != workflow.JobRunning {
+		t.Fatalf("seedSameStateNewerGeneration state = %q, want queued or running", state)
+	}
+	if _, err := workflow.CancelJob(ctx, store, jobID); err != nil {
+		t.Fatalf("CancelJob returned error: %v", err)
+	}
+	if state == workflow.JobRunning {
+		settled, err := workflow.SettleCancelledRunningJob(ctx, store, jobID, "stale generation fixture settled the cancelled run")
 		if err != nil {
-			t.Fatalf("TransitionJobState(%s->%s) returned error: %v", step[0], step[1], err)
+			t.Fatalf("SettleCancelledRunningJob returned error: %v", err)
 		}
-		if !transitioned {
-			t.Fatalf("TransitionJobState(%s->%s) did not transition; fixture did not arm", step[0], step[1])
+		if !settled {
+			t.Fatal("SettleCancelledRunningJob did not settle the cancelled run")
+		}
+	}
+	if _, err := workflow.RetryJob(ctx, store, jobID); err != nil {
+		t.Fatalf("RetryJob returned error: %v", err)
+	}
+	if state == workflow.JobRunning {
+		claimed, err := store.ClaimRunningJob(ctx, jobID, string(workflow.JobQueued), string(workflow.JobRunning), db.JobEvent{
+			JobID: jobID, Kind: string(workflow.JobRunning), Message: "retried job admitted by generation fixture",
+		}, 0, "")
+		if err != nil {
+			t.Fatalf("ClaimRunningJob returned error: %v", err)
+		}
+		if !claimed {
+			t.Fatal("ClaimRunningJob did not admit the retried job")
 		}
 	}
 	armed, err := store.GetJob(ctx, jobID)
@@ -825,10 +830,14 @@ func TestPermissionBlockDoesNotBlockANewerRun(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("CreateJobWithEvent returned error: %v", err)
 	}
+	admitted := mustWorkerJob(t, store, "perm-aba")
 	observed := seedSameStateNewerGeneration(t, store, "perm-aba", workflow.JobRunning)
+	if admitted.LifecycleGeneration != observed.generation {
+		t.Fatalf("admitted generation = %d, observed generation = %d", admitted.LifecycleGeneration, observed.generation)
+	}
 
-	if _, err := markJobPermissionBlockedAtGeneration(ctx, store, "perm-aba", observed.generation); err != nil {
-		t.Fatalf("markJobPermissionBlockedAtGeneration returned error: %v", err)
+	if _, err := markJobPermissionBlocked(ctx, store, admitted); err != nil {
+		t.Fatalf("markJobPermissionBlocked returned error: %v", err)
 	}
 	after, err := store.GetJob(ctx, "perm-aba")
 	if err != nil {
@@ -848,11 +857,15 @@ func TestFinishQueuedJobDoesNotCloseANewerRun(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("CreateJobWithEvent returned error: %v", err)
 	}
+	admitted := mustWorkerJob(t, store, "queued-aba")
 	observed := seedSameStateNewerGeneration(t, store, "queued-aba", workflow.JobQueued)
+	if admitted.LifecycleGeneration != observed.generation {
+		t.Fatalf("admitted generation = %d, observed generation = %d", admitted.LifecycleGeneration, observed.generation)
+	}
 
 	worker := defaultJobWorker(store, io.Discard)
-	if err := worker.finishQueuedJobAtGeneration(ctx, "queued-aba", observed.generation, workflow.JobFailed, errors.New("stale run failure")); err != nil {
-		t.Fatalf("finishQueuedJobAtGeneration returned error: %v", err)
+	if err := worker.finishQueuedJob(ctx, admitted, workflow.JobFailed, errors.New("stale run failure")); err != nil {
+		t.Fatalf("finishQueuedJob returned error: %v", err)
 	}
 	after, err := store.GetJob(ctx, "queued-aba")
 	if err != nil {

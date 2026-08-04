@@ -256,6 +256,15 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		writeLine(stdout, "default memory pipeline install disabled: %s", heartbeatPathsErr)
 	}
 	sqliteMaintenance := &sqliteMaintenanceState{}
+	// Bounds the poll-error diagnostics below. The poll interval has no minimum, so a
+	// persistently failing poll would otherwise write an unbounded, perfectly repetitive
+	// stream into the operator's one log -- a diagnostic that drowns the log is a different
+	// way of being unobservable. Keyed on the CAUSE, so a NEW failure is never suppressed by
+	// a running window.
+	// One episode PER POLL MODE, with the routing owned by the reporters object rather than by
+	// these call sites (#1381 review).
+	pollErrors := newPollErrorReporters(pollErrorReportWindow)
+	fullPollRunner, recoveryPollRunner := pollErrors.runners(d)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -269,16 +278,34 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		// mid-poll) AND an idle tracker (excludes already in-flight jobs, which
 		// the tick no longer holds the lock for while they run, #562). Otherwise
 		// fall back to the recovery-command-only poll, exactly as before.
+		//
+		// Both polls REPORT their error and keep looping, matching every other
+		// housekeeping step in this loop (auto-settle, reaper, heartbeat scan) instead of
+		// discarding it. Single-repo mode was the ONE supervisor where a PollOnce failure
+		// produced no log line, no escalation note and no persisted LastError; the
+		// registered-repo supervisor already surfaces and persists both. That gap only
+		// became load-bearing when a CALLER DEFECT could reach here: #1381 made the merge
+		// gate REFUSE a malformed gate miss rather than panic, so an unattended daemon
+		// survives it -- and an unobservable refusal is that panic traded for silence,
+		// which is the worse of the two. The task stays retryable and fails identically
+		// every interval with nothing emitted anywhere.
+		//
+		// Each poll MODE owns its own episode. A single shared reporter meant a successful
+		// FULL poll called recordSuccess and cleared every recorded cause, including the
+		// recovery path's -- so recovery-fails-R, unrelated-full-succeeds, recovery-fails-R
+		// re-emitted R as a fresh onset although recovery never succeeded, and repeated
+		// busy/idle alternation walked around the global burst ceiling entirely. A success
+		// may only end the episode it actually belongs to.
 		polledFull := false
 		if checkoutLock.TryLock() {
 			if !tracker.busy(d.Repo.FullName()) {
-				_ = runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollOnce)
+				fullPollRunner.run(ctx, daemonPollTimeout, stdout)
 				polledFull = true
 			}
 			checkoutLock.Unlock()
 		}
 		if !polledFull {
-			_ = runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollRecoveryCommandsOnce)
+			recoveryPollRunner.run(ctx, daemonPollTimeout, stdout)
 		}
 		if heartbeatPathsErr == nil {
 			if err := runWorkflowAutoSettleOnce(ctx, heartbeatPaths, store, time.Now().UTC(), stdout); err != nil {
@@ -1284,4 +1311,227 @@ func shorterWait(current time.Duration, candidate time.Duration, set *bool) time
 		return candidate
 	}
 	return current
+}
+
+// pollErrorReportWindow bounds how often an IDENTICAL poll failure is written to the
+// operator's log. It is long relative to any sane poll interval and short relative to how long
+// an operator would tolerate silence about an ongoing fault.
+const pollErrorReportWindow = 5 * time.Minute
+
+// pollErrorReporterTrackedCauses caps how many distinct causes are remembered, so a cause whose
+// text varies on every occurrence cannot grow this map without bound.
+const pollErrorReporterTrackedCauses = 32
+
+// pollErrorReporterBurst is the hard ceiling on emissions per window ACROSS ALL causes. Keying
+// per cause bounds each cause; it does not bound their number. An error whose text embeds a
+// timestamp or SHA makes every occurrence a new key, so per-cause limiting alone degrades to no
+// limiting at all -- which is the flood this exists to stop.
+const pollErrorReporterBurst = 6
+
+// pollErrorReporter rate-limits repeated poll diagnostics.
+//
+// The first version remembered only the IMMEDIATELY PREVIOUS cause, which failed three ways
+// review demonstrated: A/B/A/B emitted every occurrence despite a stated once-per-cause window;
+// dynamic error text was unbounded for the same reason; and A/success/A SUPPRESSED the onset of
+// a genuinely new incident, because a single slot cannot distinguish "still failing" from
+// "failed, recovered, failed again". The third is the serious one -- a limiter added to stop a
+// flood was hiding an onset, the exact failure it claimed to be designed against.
+//
+// Three mechanisms, because the three failures are independent:
+//
+//	PER-CAUSE WINDOW - each distinct cause reports at most once per window, so alternating
+//	                   causes no longer defeat the limit.
+//	RESET ON SUCCESS - a successful poll clears the episode, so a recurrence AFTER recovery is
+//	                   a new incident and reports immediately. Silence must never outlive the
+//	                   failure that justified it.
+//	GLOBAL BURST     - a ceiling across all causes per window, because per-cause keying cannot
+//	                   bound a cause whose text is different every time.
+//
+// It is not safe for concurrent use and does not need to be: it is owned by one supervisor
+// loop, which polls sequentially.
+type pollErrorReporter struct {
+	window      time.Duration
+	seen        map[string]time.Time
+	windowStart time.Time
+	emitted     int
+}
+
+func newPollErrorReporter(window time.Duration) *pollErrorReporter {
+	if window <= 0 {
+		window = pollErrorReportWindow
+	}
+	return &pollErrorReporter{window: window, seen: make(map[string]time.Time)}
+}
+
+// recordSuccess clears the episode. A cause seen before a success and again after it describes
+// a NEW incident, and reporting only the first would tell an operator the fault ended when it
+// did not.
+func (r *pollErrorReporter) recordSuccess() {
+	if r == nil {
+		return
+	}
+	r.seen = make(map[string]time.Time)
+	r.emitted = 0
+	r.windowStart = time.Time{}
+}
+
+// pollMode names which poll produced a diagnostic. The full poll and the recovery poll fail for
+// different reasons and recover independently, so they are separate episodes.
+type pollMode int
+
+const (
+	fullPoll pollMode = iota
+	recoveryPoll
+)
+
+// pollErrorReporters owns one reporter per mode AND the routing between them.
+//
+// It exists because review found a WIRING defect, not a type defect: a single shared reporter
+// meant a successful full poll cleared the recovery path's episode, so recovery-fails-R,
+// full-succeeds, recovery-fails-R re-emitted R as a fresh onset although recovery never
+// succeeded. The reporters were individually correct the whole time.
+//
+// Keeping the routing inside one testable object is deliberate. Two loose reporters in the
+// supervisor put the decision in the call site, where a test that drives the reporters directly
+// cannot observe it -- which is exactly how the first attempt to guard this passed against the
+// defect it was written for.
+type pollErrorReporters struct {
+	byMode map[pollMode]*pollErrorReporter
+}
+
+func newPollErrorReporters(window time.Duration) *pollErrorReporters {
+	return &pollErrorReporters{byMode: map[pollMode]*pollErrorReporter{
+		fullPoll:     newPollErrorReporter(window),
+		recoveryPoll: newPollErrorReporter(window),
+	}}
+}
+
+func (r *pollErrorReporters) shouldReport(mode pollMode, cause string, now time.Time) bool {
+	if r == nil {
+		return true
+	}
+	return r.byMode[mode].shouldReport(cause, now)
+}
+
+// boundPoll pairs a poll MODE with the poll function and label that belong to it, so a caller
+// cannot combine them wrongly.
+//
+// Four rounds of this PR tried to guard the wiring and failed. Round 3 guarded daemon.Run, which
+// has no production callers. Round 4 guarded reporters the test itself constructed. Round 5
+// collapsed shouldReport/recordSuccess into one call so the mode was supplied once -- and review
+// showed that was still not enough: changing ONLY the recovery call site's mode to fullPoll
+// compiled and survived every guard. My comment then called that "a consistent misattribution
+// rather than a silent cross-mode reset". THAT WAS WRONG, and review said so: recovery failures
+// then share the FULL reporter, so an unrelated successful full poll clears the ongoing recovery
+// episode -- exactly the original defect, reached by a different route.
+//
+// So the mode no longer selects anything at the call site. It selects EVERYTHING, here, once:
+// the poll function, the label and the episode are all derived from it. A mutant that changes a
+// call site's mode now changes WHICH POLL RUNS, which is directly observable.
+type boundPoll struct {
+	mode      pollMode
+	poll      func(context.Context) error
+	label     string
+	reporters *pollErrorReporters
+}
+
+// bind derives the poll function and label from the mode. This switch is the ONLY place the
+// three are associated, so they cannot drift apart at a call site.
+func (r *pollErrorReporters) bind(mode pollMode, d daemon.Daemon) boundPoll {
+	switch mode {
+	case recoveryPoll:
+		return boundPoll{mode: mode, poll: d.PollRecoveryCommandsOnce, label: "recovery poll error", reporters: r}
+	default:
+		return boundPoll{mode: fullPoll, poll: d.PollOnce, label: "poll error", reporters: r}
+	}
+}
+
+// runners returns the full and recovery runners, in that order.
+//
+// It exists so the binding is made in ONE place a test can drive. Review defeated the previous
+// shape by changing only the recovery call site's bind(recoveryPoll, d) to bind(fullPoll, d):
+// that compiled, recovery failures then shared the FULL reporter, and an unrelated successful
+// full poll cleared the ongoing recovery episode -- the original defect by another route.
+//
+// RESIDUAL. I have now stated this limit wrongly TWICE, so it is written narrowly and only
+// covers what is actually tested.
+//
+// First I claimed a wrong call-site mode was "consistent misattribution"; review showed it
+// re-shares the full reporter and recreates the original defect. Then I claimed the untested
+// surface was "one line -- the destructuring -- and no external test can observe it"; review
+// showed swapping it makes the IDLE branch run the recovery poll and silently skip PollOnce and
+// all full reconciliation, which IS observable. TestSupervisorIdleBranchRunsTheFullPoll now
+// observes it, via WatchIssues: only PollOnce reaches ListIssues.
+//
+// THE REACHABILITY CLAIM THAT USED TO BE HERE WAS FALSE. It said the branch is unreachable from
+// an external test because the checkout lock and in-flight tracker are function-local. Review
+// disproved it by seeding a long-running shell job to make the tracker busy, reaching the
+// fallback 5/5 times, and killing a mutant every guard in this package survived.
+//
+// That is the THIRD residual claim I have written here and had disproved -- after "consistent
+// misattribution" and "only the destructuring line is untested". The pattern is not that the
+// claims were unlucky; it is that I asserted the limits of my own guards without testing them.
+// TestSupervisorBusyBranchRunsTheRecoveryPoll reaches the fallback by making the tracker busy
+// with a live shell job and kills a mutant that points that branch at the full runner.
+func (r *pollErrorReporters) runners(d daemon.Daemon) (full boundPoll, recovery boundPoll) {
+	return r.bind(fullPoll, d), r.bind(recoveryPoll, d)
+}
+
+// run executes the bound poll and routes its outcome to that mode's episode.
+func (b boundPoll) run(ctx context.Context, timeout time.Duration, stdout io.Writer) {
+	if err := runDaemonPollWithTimeout(ctx, timeout, b.poll); err != nil {
+		if b.reporters.shouldReport(b.mode, err.Error(), time.Now().UTC()) {
+			writeLine(stdout, "%s: %s", b.label, err)
+		}
+		return
+	}
+	// A clean poll ENDS this mode's episode. Without it a fault that recovers and returns is
+	// reported once and then suppressed, which is worse than the unbounded stream it replaced.
+	b.reporters.recordSuccess(b.mode)
+}
+
+// recordSuccess ends ONLY the episode of the mode that succeeded.
+func (r *pollErrorReporters) recordSuccess(mode pollMode) {
+	if r == nil {
+		return
+	}
+	r.byMode[mode].recordSuccess()
+}
+
+func (r *pollErrorReporter) shouldReport(cause string, now time.Time) bool {
+	if r == nil {
+		return true
+	}
+	if r.windowStart.IsZero() || now.Sub(r.windowStart) >= r.window {
+		r.windowStart = now
+		r.emitted = 0
+	}
+	if last, ok := r.seen[cause]; ok && now.Sub(last) < r.window {
+		return false
+	}
+	if r.emitted >= pollErrorReporterBurst {
+		// Bounded even for ever-changing text. Deliberately silent rather than emitting a
+		// "suppressed N" line: that line is itself per-window output and would reintroduce
+		// the unbounded stream in a thinner disguise.
+		return false
+	}
+	if len(r.seen) >= pollErrorReporterTrackedCauses {
+		r.evictOldest()
+	}
+	r.seen[cause] = now
+	r.emitted++
+	return true
+}
+
+func (r *pollErrorReporter) evictOldest() {
+	oldestKey := ""
+	var oldest time.Time
+	for k, v := range r.seen {
+		if oldestKey == "" || v.Before(oldest) {
+			oldestKey, oldest = k, v
+		}
+	}
+	if oldestKey != "" {
+		delete(r.seen, oldestKey)
+	}
 }

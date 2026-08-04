@@ -167,7 +167,7 @@ var recoverKillPendingAtWorkerStartup sync.Once
 func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	payload, err := daemonJobPayload(job)
 	if err != nil {
-		return w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err)
+		return w.finishQueuedJob(ctx, job, workflow.JobFailed, err)
 	}
 	// An ephemeral child carries an inline worker spec instead of a
 	// pre-registered agent. Materialize a throwaway agent + runtime session
@@ -179,7 +179,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "ephemeral_worker_failed", Message: err.Error()}); eventErr != nil {
 				return eventErr
 			}
-			if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
+			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 				return finishErr
 			}
 			_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, "", err)
@@ -191,7 +191,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	dbAgent, err := w.Store.GetAgent(ctx, job.Agent)
 	if err != nil {
-		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, "", err)
@@ -215,7 +215,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if overridden {
 		agent = applyJobRuntimeOverride(agent, payload)
 		if err := runtime.ValidateAgent(agent); err != nil {
-			if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
+			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 				return finishErr
 			}
 			_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
@@ -227,14 +227,14 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	if err := w.produceDispatchError(job.Type, agent); err != nil {
 		w.recordProduceSandboxDiagnostic(ctx, job.ID, job.Type, agent)
-		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobBlocked, err); finishErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, err); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
 		return nil
 	}
 	if readOnlyImplementationBlocked(job.Type, agent) {
-		transitioned, err := markJobPermissionBlocked(ctx, w.Store, job.ID)
+		transitioned, err := markJobPermissionBlocked(ctx, w.Store, job)
 		if err != nil {
 			return err
 		}
@@ -285,7 +285,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 				writeLine(w.Stdout, "job %s deferred on checkout contention: %v", job.ID, err)
 				return nil
 			}
-			if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
+			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 				return finishErr
 			}
 			_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
@@ -320,7 +320,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		defer w.RelayServer.ReleaseSeat(relayToken)
 	}
 	if err != nil {
-		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
@@ -328,7 +328,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	managed, err := w.managedJobConfig(ctx, agent.Name)
 	if err != nil {
-		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
@@ -340,7 +340,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		message := fmt.Sprintf("%s job_timeout %s exceeds [daemon].job_timeout_max %s; clamped to %s",
 			timeoutResolution.Source, timeoutResolution.Requested, timeoutResolution.Max, timeoutResolution.Timeout)
 		if eventErr := w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: job.ID, Kind: "job_timeout_clamped", Message: message}); eventErr != nil {
-			if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, eventErr); finishErr != nil {
+			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, eventErr); finishErr != nil {
 				return finishErr
 			}
 			return nil
@@ -374,7 +374,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		releaseLock, acquired, lockKey, ownerToken, err = acquireJobRuntimeSessionLock(ctx, w.Store, job.ID, agent, overridden, time.Now().UTC(), lockTTL)
 	}
 	if err != nil {
-		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
@@ -384,7 +384,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		message := fmt.Sprintf("runtime session %s is busy", lockKey)
 		policy, policyErr := w.parallelSessionPolicy()
 		if policyErr != nil {
-			if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, policyErr); finishErr != nil {
+			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, policyErr); finishErr != nil {
 				return finishErr
 			}
 			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, policyErr)
@@ -442,7 +442,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// waited cannot inherit stale grants. The adapter is then rebuilt in-place with
 	// sandbox-exec as the innermost runner for Claude/Kimi produce only.
 	if err := applyProduceRuntimeGrants(ctx, w.Store, w.ConfigHome, job, payload, &agent); err != nil {
-		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
@@ -463,7 +463,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	adapter, err = wrapProduceSandboxAdapter(job.Type, agent, adapter)
 	if err != nil {
-		if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
@@ -597,7 +597,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	if managed.Instance {
 		if err := w.Store.MarkAgentInstanceRunning(ctx, agent.Name, time.Now().UTC(), jobTimeout); err != nil {
-			if finishErr := w.finishQueuedJob(ctx, job.ID, workflow.JobFailed, err); finishErr != nil {
+			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 				return finishErr
 			}
 			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
@@ -1649,7 +1649,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	}
 	adapter, err := w.AdapterFactory(started.Agent, checkout)
 	if err != nil {
-		if finishErr := w.finishQueuedJob(ctx, delegatedJob.ID, workflow.JobFailed, err); finishErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, delegatedJob, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
@@ -1662,7 +1662,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	tempLockTTL := started.JobTimeout + runtimeLeaseTeardownGrace
 	releaseLock, acquired, lockKey, ownerToken, err := acquireRuntimeSessionLock(ctx, w.Store, delegatedJob.ID, started.Agent, time.Now().UTC(), tempLockTTL)
 	if err != nil {
-		if finishErr := w.finishQueuedJob(ctx, delegatedJob.ID, workflow.JobFailed, err); finishErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, delegatedJob, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
@@ -1698,7 +1698,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	// and Landlock adapter wrapping as the primary worker path. Without this seam,
 	// runtime-session contention could route Claude/Kimi around the launch sandbox.
 	if err := applyProduceRuntimeGrants(ctx, w.Store, w.ConfigHome, delegatedJob, payload, &started.Agent); err != nil {
-		if finishErr := w.finishQueuedJob(ctx, delegatedJob.ID, workflow.JobFailed, err); finishErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, delegatedJob, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
@@ -1717,7 +1717,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	}
 	adapter, err = wrapProduceSandboxAdapter(delegatedJob.Type, started.Agent, adapter)
 	if err != nil {
-		if finishErr := w.finishQueuedJob(ctx, delegatedJob.ID, workflow.JobFailed, err); finishErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, delegatedJob, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
@@ -1749,7 +1749,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	}
 	adapter = wrapManagedWorktreeRuntimeEnv(payload, adapter)
 	if err := w.Store.MarkAgentInstanceRunning(ctx, started.Agent.Name, time.Now().UTC(), started.JobTimeout); err != nil {
-		if finishErr := w.finishQueuedJob(ctx, delegatedJob.ID, workflow.JobFailed, err); finishErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, delegatedJob, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
@@ -2639,6 +2639,8 @@ func buildRuntimeAdapter(home string, agent runtime.Agent, checkout string, runn
 		adapter = runtime.KimiAdapter{Dir: checkout, Runner: runner}
 	case runtime.KimiCLIRuntime:
 		adapter = runtime.KimiCLIAdapter{Dir: checkout, Runner: runner}
+	case runtime.OmpRuntime:
+		adapter = runtime.OmpAdapter{Dir: checkout, Runner: runner}
 	case runtime.ShellRuntime:
 		adapter = runtime.ShellAdapter{Dir: checkout, Runner: runner}
 	default:

@@ -254,6 +254,26 @@ func TestUpdateAgentRuntime(t *testing.T) {
 		got.AutonomyPolicy != "auto" || strings.Join(got.Capabilities, ",") != "implement,review" {
 		t.Fatalf("switch runtime altered preserved fields: %+v", got)
 	}
+
+	// omp is in the allow-list too (#1428). Re-warm the ref first so the clear is a
+	// real observation and not vacuously satisfied by the claude switch above.
+	if err := store.UpdateAgentRuntimeRef(ctx, "worker", "sess-def"); err != nil {
+		t.Fatalf("re-warm runtime_ref: %v", err)
+	}
+	if err := store.UpdateAgentRuntime(ctx, "worker", "omp"); err != nil {
+		t.Fatalf("switch runtime to omp: %v", err)
+	}
+	got, err = store.GetAgent(ctx, "worker")
+	if err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	if got.Runtime != "omp" {
+		t.Fatalf("runtime = %q, want omp", got.Runtime)
+	}
+	// omp is stateless, so the old runtime's warm ref is doubly meaningless here.
+	if got.RuntimeRef != "" {
+		t.Fatalf("runtime_ref = %q, want cleared on the omp switch", got.RuntimeRef)
+	}
 }
 
 func TestLatestJobEvents(t *testing.T) {

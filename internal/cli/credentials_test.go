@@ -44,6 +44,17 @@ func TestCuratedRuntimeBaseEnvPinnedPolicy(t *testing.T) {
 		"ANTHROPIC_API_KEY=anthropic", "ANTHROPIC_AUTH_TOKEN=anthropic-auth", "CLAUDE_CONFIG_DIR=/claude", "CODEX_HOME=/codex",
 		"GH_TOKEN=gh", "GITHUB_TOKEN=github", "GH_ENTERPRISE_TOKEN=gh-enterprise", "GITHUB_ENTERPRISE_TOKEN=github-enterprise", "GH_HOST=example", "SSH_AUTH_SOCK=/ssh",
 		"GOCACHE=/go-cache", "NPM_TOKEN=npm", "UNLISTED=no",
+		// omp routing plumbing (allowed for omp only) alongside two RAW PROVIDER KEYS
+		// that must be dropped for EVERY runtime including omp (#1428): with curation
+		// ENABLED — which this test's cfg sets, and which is NOT the shipped default —
+		// a raw provider key reaches omp only through its profile auth storage or an
+		// explicit env_passthrough entry, never by ambient inheritance. The
+		// OMP_AUTH_BROKER_* pair below is the one deliberately-inherited auth path
+		// (broker-mode auth, plan-sanctioned); it is a credential route, not plumbing.
+		"OMP_PROFILE=seat", "PI_PROFILE=seat", "PI_CODING_AGENT_DIR=/omp/state",
+		"PI_SMOL_MODEL=smol", "PI_SLOW_MODEL=slow", "PI_PLAN_MODEL=plan",
+		"OMP_AUTH_BROKER_URL=https://broker", "OMP_AUTH_BROKER_TOKEN=broker-token",
+		"OPENAI_API_KEY=openai", "ANTHROPIC_OAUTH_TOKEN=anthropic-oauth",
 	}
 	tests := []struct {
 		runtime string
@@ -53,6 +64,15 @@ func TestCuratedRuntimeBaseEnvPinnedPolicy(t *testing.T) {
 		{runtime: runtime.ClaudeRuntime, want: []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR", "GH_CONFIG_DIR", "GH_PROMPT_DISABLED", "GOCACHE", "HOME", "LC_ALL", "NPM_TOKEN", "PATH"}},
 		{runtime: runtime.KimiRuntime, want: []string{"GH_CONFIG_DIR", "GH_PROMPT_DISABLED", "GOCACHE", "HOME", "LC_ALL", "NPM_TOKEN", "PATH"}},
 		{runtime: runtime.KimiCLIRuntime, want: []string{"GH_CONFIG_DIR", "GH_PROMPT_DISABLED", "GOCACHE", "HOME", "LC_ALL", "NPM_TOKEN", "PATH"}},
+		// omp gets ROUTING PLUMBING ONLY plus the OMP_AUTH_BROKER_* pair (broker-mode
+		// auth, inherited by design). OPENAI_API_KEY and ANTHROPIC_OAUTH_TOKEN sit in
+		// environ and are absent here: that absence is the no-raw-provider-key pin, and
+		// it holds only while env_curation is on (the cfg below turns it on).
+		{runtime: runtime.OmpRuntime, want: []string{
+			"GH_CONFIG_DIR", "GH_PROMPT_DISABLED", "GOCACHE", "HOME", "LC_ALL", "NPM_TOKEN",
+			"OMP_AUTH_BROKER_TOKEN", "OMP_AUTH_BROKER_URL", "OMP_PROFILE", "PATH",
+			"PI_CODING_AGENT_DIR", "PI_PLAN_MODEL", "PI_PROFILE", "PI_SLOW_MODEL", "PI_SMOL_MODEL",
+		}},
 		{runtime: runtime.ShellRuntime, want: []string{"GH_CONFIG_DIR", "GH_PROMPT_DISABLED", "GOCACHE", "HOME", "LC_ALL", "NPM_TOKEN", "PATH"}},
 	}
 	cfg := config.CredentialsConfig{EnvCuration: true, EnvPassthrough: []string{"GOCACHE", "NPM_*"}, GitHub: config.CredentialsGitHubDeny}
@@ -69,7 +89,7 @@ func TestCuratedRuntimeBaseEnvPinnedPolicy(t *testing.T) {
 func TestCuratedRuntimeBaseEnvGitHubInherit(t *testing.T) {
 	cfg := config.CredentialsConfig{EnvCuration: true, GitHub: config.CredentialsGitHubInherit}
 	want := []string{"PATH=/bin", "GH_TOKEN=one", "GITHUB_TOKEN=two", "GH_HOST=three"}
-	for _, runtimeName := range []string{runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime, runtime.KimiCLIRuntime, runtime.ShellRuntime} {
+	for _, runtimeName := range []string{runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime, runtime.KimiCLIRuntime, runtime.OmpRuntime, runtime.ShellRuntime} {
 		t.Run(runtimeName, func(t *testing.T) {
 			got := curatedRuntimeBaseEnv(cfg, runtimeName, []string{"PATH=/bin", "GH_TOKEN=one", "GITHUB_TOKEN=two", "GH_HOST=three"}, "")
 			if !reflect.DeepEqual(got, want) {

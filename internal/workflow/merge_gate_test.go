@@ -420,10 +420,10 @@ func TestPolicyMergeGateRejectsUnverifiableReviewAuthorship(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Evaluate returned error: %v", err)
 			}
-			if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Ready || decision.Merged {
+			if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Ready || decision.Merged {
 				t.Fatalf("decision = %+v, want escalating LeaveOpen", decision)
 			}
-			if !strings.Contains(decision.Reason, tc.wantReason) {
+			if !strings.Contains(decision.Reason.Render(), tc.wantReason) {
 				t.Fatalf("decision reason = %q, want %q", decision.Reason, tc.wantReason)
 			}
 			if len(gh.merges) != 0 {
@@ -443,15 +443,17 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 		{name: "legacy_round", reviewHead: "old123"},
 	}
 	causes := []struct {
-		name             string
-		seed             seedImplementJobs
-		omitUnrelatedJob bool
-		want             []string
-		doNotWant        []string
+		name               string
+		seed               seedImplementJobs
+		omitUnrelatedJob   bool
+		bridgePrecondition bool
+		want               []string
+		doNotWant          []string
 	}{
 		{
-			name:             "zero_implement_jobs_anywhere",
-			omitUnrelatedJob: true,
+			name:               "zero_implement_jobs_anywhere",
+			omitUnrelatedJob:   true,
+			bridgePrecondition: true,
 			want: []string{
 				"no implement job is recorded for this task",
 				"coordinator bridge",
@@ -461,7 +463,8 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 			doNotWant: []string{"implemented in a pane"},
 		},
 		{
-			name: "no_implement_job",
+			name:               "no_implement_job",
+			bridgePrecondition: true,
 			want: []string{
 				"no implement job is recorded for this task",
 				"coordinator bridge",
@@ -540,23 +543,202 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 					if err != nil {
 						t.Fatalf("Evaluate returned error: %v", err)
 					}
-					if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Ready || decision.Merged {
+					if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Ready || decision.Merged {
 						t.Fatalf("decision = %+v, want fail-closed escalating LeaveOpen", decision)
 					}
 					if len(gh.merges) != 0 {
 						t.Fatalf("unverifiable approval issued merge: %+v", gh.merges)
 					}
 					for _, want := range cause.want {
-						if !strings.Contains(decision.Reason, want) {
+						if !strings.Contains(decision.Reason.Render(), want) {
 							t.Errorf("decision reason = %q, want named evidence/remedy %q", decision.Reason, want)
 						}
 					}
 					for _, doNotWant := range cause.doNotWant {
-						if strings.Contains(decision.Reason, doNotWant) {
+						if strings.Contains(decision.Reason.Render(), doNotWant) {
 							t.Errorf("decision reason inferred unobserved workflow %q: %q", doNotWant, decision.Reason)
 						}
 					}
+					if cause.bridgePrecondition {
+						assertCoordinatorBridgeRefusalPrecondition(t, decision.Reason.Render())
+						assertRenderedCoordinatorBridgeDecline(t, decision.Reason.Render(), "head123")
+					}
 				})
+			}
+		})
+	}
+}
+
+// boundCoordinatorBridgeRefusal is the clause the remedy must carry verbatim: the
+// precondition and the refusal bound to that precondition FAILING, as one span.
+//
+// It is pinned as a contiguous clause rather than as separate tokens on purpose. The remedy
+// is operator-facing instruction text -- whoever reads it treats it as the system telling
+// them what to do -- so the guard has to bind the prohibition to the condition, not merely
+// observe that both words occur somewhere in the sentence.
+const boundCoordinatorBridgeRefusal = "confirm an independent approval exists at this exact head; if it does not, do not bridge"
+
+// renderedCoordinatorBridgeDecline is the COMPLETE operator-facing text of the
+// no-implement-job decline, wrapper included.
+//
+// Pinning the constant is not sufficient. The reason an operator actually reads is assembled
+// AROUND the constant in reviewAndCIGateMiss -- "review gate: " + err + " for head " + sha --
+// so text added at the renderer ("this restriction is advisory, so a coordinator may bridge
+// anyway after manual judgment") leaves noImplementJobAttributionReason byte-identical and
+// every constant-level guard green while changing what the reader is told to do.
+//
+// This pins what is READ, not what is stored.
+//
+// DO NOT "improve" this by inlining the constant's text as a literal. Composing the expectation
+// FROM noImplementJobAttributionReason is deliberate: it holds the WRAPPER fixed while letting
+// the payload vary, which is exactly what makes this guard independent of the byte pin in
+// TestImplementerAttributionAnomalyDeclinesRemainByteStable. Measured with production mutants in
+// both directions:
+//
+//	append at the RENDERER  -> this guard FAILS (both cause paths); the byte pin passes
+//	append inside the CONSTANT -> the byte pin FAILS; this guard passes (both sides move together)
+//
+// A hardcoded literal here would catch constant mutations too and collapse the two guards into
+// one aggregate wearing two names, which is the thing this file keeps having to relearn.
+func renderedCoordinatorBridgeDecline(headSHA string) string {
+	return "review gate: " + noImplementJobAttributionReason + " for head " + headSHA
+}
+
+func assertRenderedCoordinatorBridgeDecline(t *testing.T, reason, headSHA string) {
+	t.Helper()
+	if want := renderedCoordinatorBridgeDecline(headSHA); reason != want {
+		t.Fatalf("rendered operator-facing decline =\n  %q\nwant byte-identical\n  %q", reason, want)
+	}
+}
+
+// coordinatorBridgeRefusalPreconditionError reports why a coordinator-bridge remedy fails to
+// bind its refusal to its own precondition, or nil when it binds correctly.
+//
+// NOTE ON REDUNDANCY, recorded rather than quietly kept: against production-string mutations
+// this helper is SUBSUMED by the byte pin in TestImplementerAttributionAnomalyDeclinesRemainByteStable
+// -- exact equality already rejects every append, inversion, deletion and rewording of the
+// constant, and this helper catches no production mutation the byte pin permits. It is retained
+// as a focused diagnostic that names WHICH property broke, not as an independent layer. An
+// earlier revision of this file claimed the two were independent; that claim was wrong, because
+// the run that "proved" it mutated this guard rather than production.
+//
+// It is a function returning an error rather than a t.Fatalf helper so that the guard itself
+// can be mutation-tested: TestCoordinatorBridgeRefusalPreconditionRejectsSemanticInversion
+// feeds it texts that must be rejected. A guard that cannot be shown to fail is not a guard.
+func coordinatorBridgeRefusalPreconditionError(reason string) error {
+	if !strings.Contains(strings.ToLower(reason), boundCoordinatorBridgeRefusal) {
+		return fmt.Errorf("coordinator bridge remedy must bind its refusal to its precondition as one clause (%q): %q",
+			boundCoordinatorBridgeRefusal, reason)
+	}
+	return nil
+}
+
+func assertCoordinatorBridgeRefusalPrecondition(t *testing.T, reason string) {
+	t.Helper()
+	if err := coordinatorBridgeRefusalPreconditionError(reason); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCoordinatorBridgeRefusalPreconditionRejectsSemanticInversion pins the guard against the
+// texts that motivated it. Each case retains every token the previous bag-of-words check
+// looked for -- "independent approval", "exact head", "do not bridge" -- while permitting or
+// failing to forbid the unsafe action, so each one PASSED that check.
+func TestCoordinatorBridgeRefusalPreconditionRejectsSemanticInversion(t *testing.T) {
+	cases := []struct {
+		name   string
+		reason string
+	}{
+		{
+			// The review finding on #1412, verbatim in shape: the refusal survives as a
+			// token but is re-scoped onto an unrelated condition, and the real precondition
+			// is inverted into permission.
+			name: "refusal rescoped and precondition inverted",
+			reason: "latest review round's approval cannot be verified as independent: no implement job is recorded for this task. " +
+				"Use the coordinator bridge only as follows: step 1, confirm an independent approval exists at this exact head; " +
+				"if it does not, bridge anyway; do not bridge only when the pane identity is unavailable",
+		},
+		{
+			// Both halves present, never joined: the reader is told the precondition and,
+			// separately, that bridging is sometimes refused -- but not that one implies the other.
+			name: "precondition and refusal present but unbound",
+			reason: "latest review round's approval cannot be verified as independent: no implement job is recorded for this task. " +
+				"An independent approval at this exact head is relevant here. Do not bridge without care",
+		},
+		{
+			// Refusal stated before the precondition it is supposed to depend on.
+			name: "refusal precedes its precondition",
+			reason: "latest review round's approval cannot be verified as independent: do not bridge. " +
+				"Separately, confirm an independent approval exists at this exact head",
+		},
+		{
+			// The precondition is weakened from the exact head to any head.
+			name: "precondition drops the exact head",
+			reason: "latest review round's approval cannot be verified as independent: no implement job is recorded for this task. " +
+				"Use the coordinator bridge only as follows: step 1, confirm an independent approval exists; " +
+				"if it does not, do not bridge",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := coordinatorBridgeRefusalPreconditionError(tc.reason); err == nil {
+				t.Fatalf("guard accepted a remedy that does not bind its refusal to its precondition: %q", tc.reason)
+			}
+		})
+	}
+}
+
+// TestCoordinatorBridgeRefusalPreconditionAcceptsShippedRemedy is the positive half: the guard
+// must still accept the text actually shipped, so the negative cases above cannot be satisfied
+// by a guard that rejects everything.
+func TestCoordinatorBridgeRefusalPreconditionAcceptsShippedRemedy(t *testing.T) {
+	if err := coordinatorBridgeRefusalPreconditionError(noImplementJobAttributionReason); err != nil {
+		t.Fatalf("guard rejected the shipped coordinator bridge remedy: %v", err)
+	}
+}
+
+func TestImplementerAttributionAnomalyDeclinesRemainByteStable(t *testing.T) {
+	wants := map[string]struct {
+		got  string
+		want string
+	}{
+		"task mismatch": {
+			got:  mismatchedImplementTaskAttributionReason,
+			want: "latest review round's approval cannot be verified as independent: implement jobs are recorded, but none match this task identity; this is an attribution anomaly and may indicate a stable-task-identity regression",
+		},
+		"empty agent": {
+			got:  emptyImplementAgentAttributionReason,
+			want: "latest review round's approval cannot be verified as independent: an implement job matches this task but has no recorded agent; this is an attribution data anomaly",
+		},
+		"malformed payload": {
+			got:  malformedImplementPayloadAttributionReason,
+			want: "latest review round's approval cannot be verified as independent: an implement job has a malformed payload, so attribution for this task cannot be verified; this is a corrupt-record anomaly",
+		},
+		// The no-implement-job reason is the only one of the four that hands the operator a
+		// PROCEDURE, so it is the only one where ADDED text can change what the reader does.
+		// It was the sibling missing from this policy, and that omission is what let a
+		// follow-on override -- "this restriction is advisory; a coordinator may bridge
+		// anyway after manual judgment" -- be appended while the bound-clause guard still
+		// passed.
+		//
+		// This byte pin SUBSUMES the bound-clause helper: exact equality rejects every append,
+		// inversion, deletion and rewording of the constant, and the helper catches no
+		// production mutation this pin permits. The helper is kept as a diagnostic that names
+		// WHICH property broke, not as a second layer -- see the note above
+		// coordinatorBridgeRefusalPreconditionError.
+		//
+		// The guard it does NOT subsume is renderedCoordinatorBridgeDecline, which pins the
+		// text assembled AROUND this constant. Those two are genuinely independent, measured
+		// with production mutants in both directions.
+		"no implement job": {
+			got:  noImplementJobAttributionReason,
+			want: "latest review round's approval cannot be verified as independent: no implement job is recorded for this task. Use the coordinator bridge only as follows: step 1, confirm an independent approval exists at this exact head; if it does not, do not bridge. If it does, read the engine review job's agent identity and decision at that head with gitmoot job show <job-id>, confirm the implementer identity from the pane session, journal both with gitmoot workflow note, then merge the lane",
+		},
+	}
+	for name, check := range wants {
+		t.Run(name, func(t *testing.T) {
+			if check.got != check.want {
+				t.Fatalf("decline = %q, want byte-identical %q", check.got, check.want)
 			}
 		})
 	}
@@ -602,13 +784,13 @@ func TestPolicyMergeGatePreservesSelfApprovalReasonWhenHeadMismatchSortsFirst(t 
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Ready || decision.Merged {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Ready || decision.Merged {
 		t.Fatalf("decision = %+v, want escalating LeaveOpen", decision)
 	}
-	if !strings.Contains(decision.Reason, "approval was authored by sol, the implementing agent") {
+	if !strings.Contains(decision.Reason.Render(), "approval was authored by sol, the implementing agent") {
 		t.Fatalf("decision reason lost self-approval cause: %q", decision.Reason)
 	}
-	if strings.Contains(decision.Reason, "different head SHA") {
+	if strings.Contains(decision.Reason.Render(), "different head SHA") {
 		t.Fatalf("incidental stale-head error replaced self-approval cause: %q", decision.Reason)
 	}
 }
@@ -653,13 +835,13 @@ func TestPolicyMergeGatePreservesSelfApprovalReasonWhenSelfApprovalSortsFirst(t 
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Ready || decision.Merged {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Ready || decision.Merged {
 		t.Fatalf("decision = %+v, want escalating LeaveOpen", decision)
 	}
-	if !strings.Contains(decision.Reason, "approval was authored by sol, the implementing agent") {
+	if !strings.Contains(decision.Reason.Render(), "approval was authored by sol, the implementing agent") {
 		t.Fatalf("decision reason lost self-approval cause: %q", decision.Reason)
 	}
-	if strings.Contains(decision.Reason, "different head SHA") {
+	if strings.Contains(decision.Reason.Render(), "different head SHA") {
 		t.Fatalf("incidental stale-head error replaced self-approval cause: %q", decision.Reason)
 	}
 }
@@ -674,7 +856,7 @@ func TestPolicyMergeGateExplicitKillSwitchLeavesOpenWithoutGitHubCalls(t *testin
 		if err != nil {
 			t.Fatalf("Evaluate attempt %d: %v", attempt+1, err)
 		}
-		if !decision.LeaveOpen || decision.Ready || decision.Merged || decision.Deferred || decision.Reason != MergeLeaveOpenAutoMergeKillSwitchReason {
+		if !decision.LeaveOpen || decision.Ready || decision.Merged || decision.Deferred || decision.Reason.Render() != MergeLeaveOpenAutoMergeKillSwitchReason {
 			t.Fatalf("decision attempt %d = %+v", attempt+1, decision)
 		}
 	}
@@ -713,7 +895,7 @@ func TestRunMergeGateExplicitKillSwitchParksReviewedAndUnreviewedTasks(t *testin
 				if err != nil {
 					t.Fatalf("runMergeGate attempt %d: %v", attempt+1, err)
 				}
-				if !decision.LeaveOpen || decision.Reason != MergeLeaveOpenAutoMergeKillSwitchReason {
+				if !decision.LeaveOpen || decision.Reason.Render() != MergeLeaveOpenAutoMergeKillSwitchReason {
 					t.Fatalf("decision attempt %d = %+v", attempt+1, decision)
 				}
 			}
@@ -754,7 +936,7 @@ func TestRunMergeGateDraftPullRequestDoesNotParkTaskAwaitingHumanMerge(t *testin
 	if err != nil {
 		t.Fatalf("runMergeGate: %v", err)
 	}
-	if !decision.LeaveOpen || decision.Reason != "pull request is draft" {
+	if !decision.LeaveOpen || decision.Reason.Render() != "pull request is draft" {
 		t.Fatalf("decision = %+v, want draft leave-open", decision)
 	}
 	task, err := store.GetTask(ctx, taskID)
@@ -801,10 +983,10 @@ func TestPolicyMergeGateHumanRequestRequiresFinalReview(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 		t.Fatalf("decision = %+v, want escalating LeaveOpen", decision)
 	}
-	if !strings.Contains(decision.Reason, "final agent review is not captured") {
+	if !strings.Contains(decision.Reason.Render(), "final agent review is not captured") {
 		t.Fatalf("decision reason = %q, want missing final review", decision.Reason)
 	}
 	if len(gh.merges) != 0 {
@@ -848,10 +1030,10 @@ func TestPolicyMergeGateHumanRequestRequiresPassingCI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 		t.Fatalf("decision = %+v, want escalating LeaveOpen", decision)
 	}
-	if !strings.Contains(decision.Reason, "external CI") {
+	if !strings.Contains(decision.Reason.Render(), "external CI") {
 		t.Fatalf("decision reason = %q, want external CI failure", decision.Reason)
 	}
 	if len(gh.merges) != 0 {
@@ -895,7 +1077,7 @@ func TestPolicyMergeGateHumanRequestBypassesOnlyAutoMergePolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
 	}
-	if !decision.Merged || decision.LeaveOpen || decision.EscalateMergeGateMiss {
+	if !decision.Merged || decision.LeaveOpen || decision.Reason.IsGateMiss() {
 		t.Fatalf("decision = %+v", decision)
 	}
 	if gh.statusCalls != 1 || gh.checkCalls != 1 {
@@ -945,7 +1127,7 @@ END`); err != nil {
 	if err != nil {
 		t.Fatalf("finishMerged returned journal error: %v", err)
 	}
-	if !decision.Ready || !decision.Merged || decision.MergeCommitSHA != "merge123" || decision.Reason != "merged" {
+	if !decision.Ready || !decision.Merged || decision.MergeCommitSHA != "merge123" || decision.Reason.Render() != "merged" {
 		t.Fatalf("decision changed by journal failure: %+v", decision)
 	}
 	pr, err := store.GetPullRequest(ctx, "gitmoot/gitmoot", 9)
@@ -994,7 +1176,7 @@ func TestPolicyMergeGateCleansTaskWorktreeAfterMerge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.Merged || decision.Reason != "merged" {
+	if !decision.Merged || decision.Reason.Render() != "merged" {
 		t.Fatalf("decision = %+v", decision)
 	}
 	if len(cleaner.removed) != 1 || cleaner.removed[0] != "/tmp/gitmoot/worktrees/gitmoot--gitmoot/task-9" {
@@ -1041,7 +1223,7 @@ func TestPolicyMergeGateReportsWorktreeCleanupWarning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.Merged || !strings.Contains(decision.Reason, "cleanup task worktree") {
+	if !decision.Merged || !strings.Contains(decision.Reason.Render(), "cleanup task worktree") {
 		t.Fatalf("decision = %+v, want cleanup warning", decision)
 	}
 	task, err := store.GetTask(ctx, "task-9")
@@ -1085,7 +1267,7 @@ func TestPolicyMergeGateDoesNotCleanWorktreeForMismatchedTaskBranch(t *testing.T
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.Merged || !strings.Contains(decision.Reason, "task task-8 branch is task-8") {
+	if !decision.Merged || !strings.Contains(decision.Reason.Render(), "task task-8 branch is task-8") {
 		t.Fatalf("decision = %+v, want branch mismatch cleanup warning", decision)
 	}
 	if len(cleaner.removed) != 0 {
@@ -1266,7 +1448,7 @@ func TestPolicyMergeGateBlocksDirtyWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if decision.Ready || !strings.Contains(decision.Reason, "worktree") {
+	if decision.Ready || !strings.Contains(decision.Reason.Render(), "worktree") {
 		t.Fatalf("decision = %+v", decision)
 	}
 	if len(gh.merges) != 0 {
@@ -1303,7 +1485,7 @@ func TestPolicyMergeGateBlocksFailedExternalCI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if decision.Ready || !strings.Contains(decision.Reason, "external CI") {
+	if decision.Ready || !strings.Contains(decision.Reason.Render(), "external CI") {
 		t.Fatalf("decision = %+v", decision)
 	}
 	if len(gh.merges) != 0 {
@@ -1342,7 +1524,7 @@ func TestPolicyMergeGateTruncatesLongStatusDescriptions(t *testing.T) {
 	if decision.Ready {
 		t.Fatalf("decision = %+v", decision)
 	}
-	if !decision.LeaveOpen || !strings.Contains(decision.Reason, "not successful") {
+	if !decision.LeaveOpen || !strings.Contains(decision.Reason.Render(), "not successful") {
 		t.Fatalf("decision = %+v, want informative leave-open gate miss", decision)
 	}
 }
@@ -1401,7 +1583,7 @@ func TestPolicyMergeGateUpdatesStaleBranchAndStaysPending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.Ready || decision.Merged || !strings.Contains(decision.Reason, "branch update") {
+	if !decision.Ready || decision.Merged || !strings.Contains(decision.Reason.Render(), "branch update") {
 		t.Fatalf("decision = %+v", decision)
 	}
 	if len(gh.merges) != 0 {
@@ -1440,7 +1622,7 @@ func TestPolicyMergeGateBlocksStaleBranchUpdateConflict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if decision.Ready || !strings.Contains(decision.Reason, "conflicts with main") {
+	if decision.Ready || !strings.Contains(decision.Reason.Render(), "conflicts with main") {
 		t.Fatalf("decision = %+v", decision)
 	}
 	if !hasStatus(gh.statuses, gitmootMergeGateContext, "failure") {
@@ -1479,7 +1661,7 @@ func TestPolicyMergeGateKeepsStaleHeadRacePending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.Ready || decision.Merged || !strings.Contains(decision.Reason, "head changed") {
+	if !decision.Ready || decision.Merged || !strings.Contains(decision.Reason.Render(), "head changed") {
 		t.Fatalf("decision = %+v", decision)
 	}
 	if !hasStatus(gh.statuses, gitmootMergeGateContext, "pending") {
@@ -1518,7 +1700,7 @@ func TestPolicyMergeGateKeepsMergeQueueBusyPending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.Ready || decision.Merged || !strings.Contains(decision.Reason, "merge queue") {
+	if !decision.Ready || decision.Merged || !strings.Contains(decision.Reason.Render(), "merge queue") {
 		t.Fatalf("decision = %+v", decision)
 	}
 	if len(gh.merges) != 0 {
@@ -1553,7 +1735,7 @@ func TestPolicyMergeGateKeepsPendingCIReadyToRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.Ready || decision.Merged || !strings.Contains(decision.Reason, "pending") {
+	if !decision.Ready || decision.Merged || !strings.Contains(decision.Reason.Render(), "pending") {
 		t.Fatalf("decision = %+v", decision)
 	}
 	if len(gh.merges) != 0 {
@@ -1592,7 +1774,7 @@ func TestPolicyMergeGateKeepsQueuedMergePending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.Ready || decision.Merged || !strings.Contains(decision.Reason, "pending") {
+	if !decision.Ready || decision.Merged || !strings.Contains(decision.Reason.Render(), "pending") {
 		t.Fatalf("decision = %+v", decision)
 	}
 	if _, err := store.GetBranchLock(ctx, "gitmoot/gitmoot", "task-9"); err != nil {
@@ -1622,7 +1804,7 @@ func TestPolicyMergeGateReviewOptionalDoesNotBypassMandatoryReview(t *testing.T)
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || !strings.Contains(decision.Reason, "final agent review is not captured") {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || !strings.Contains(decision.Reason.Render(), "final agent review is not captured") {
 		t.Fatalf("decision = %+v, want mandatory review gate miss", decision)
 	}
 	if len(gh.merges) != 0 {
@@ -1686,7 +1868,7 @@ func TestPolicyMergeGateBlocksClosedUnmergedPullRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if decision.Ready || !strings.Contains(decision.Reason, "closed") {
+	if decision.Ready || !strings.Contains(decision.Reason.Render(), "closed") {
 		t.Fatalf("decision = %+v", decision)
 	}
 	if len(gh.merges) != 0 {
@@ -1787,10 +1969,10 @@ func TestPolicyMergeGateBlocksAnyVerdictAtEvaluatedHeadBeforeRoundSelection(t *t
 			if err != nil {
 				t.Fatalf("Evaluate returned error: %v", err)
 			}
-			if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+			if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 				t.Fatalf("decision = %+v, want objection to block merge", decision)
 			}
-			if !strings.Contains(decision.Reason, "blocking result from objector") {
+			if !strings.Contains(decision.Reason.Render(), "blocking result from objector") {
 				t.Fatalf("decision reason = %q, want objector's blocking result", decision.Reason)
 			}
 			if len(gh.merges) != 0 {
@@ -1877,10 +2059,10 @@ func TestPolicyMergeGateDifferentReviewerCannotSupersedeObjection(t *testing.T) 
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 		t.Fatalf("decision = %+v, want different reviewer's objection to remain blocking", decision)
 	}
-	if !strings.Contains(decision.Reason, "blocking result from objector") {
+	if !strings.Contains(decision.Reason.Render(), "blocking result from objector") {
 		t.Fatalf("decision reason = %q, want objector's blocking result", decision.Reason)
 	}
 }
@@ -1936,10 +2118,10 @@ func TestPolicyMergeGateNonEvidenceVerdictDoesNotSupersedeObjection(t *testing.T
 			if err != nil {
 				t.Fatalf("Evaluate returned error: %v", err)
 			}
-			if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+			if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 				t.Fatalf("decision = %+v, want non-evidence decision %q to leave objection blocking", decision, tc.decision)
 			}
-			if !strings.Contains(decision.Reason, "blocking result from objector") {
+			if !strings.Contains(decision.Reason.Render(), "blocking result from objector") {
 				t.Fatalf("decision reason = %q, want objector's blocking result", decision.Reason)
 			}
 			if len(gh.merges) != 0 {
@@ -1965,11 +2147,11 @@ func TestPolicyMergeGateWaitsForQueuedReviewAtEvaluatedHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if decision.Merged || decision.EscalateMergeGateMiss {
+	if decision.Merged || decision.Reason.IsGateMiss() {
 		t.Fatalf("decision = %+v, want queued review to wait without escalating", decision)
 	}
-	if !strings.Contains(decision.Reason, "waiting for reviewer reviewer-b") ||
-		!strings.Contains(decision.Reason, "review-queued") {
+	if !strings.Contains(decision.Reason.Render(), "waiting for reviewer reviewer-b") ||
+		!strings.Contains(decision.Reason.Render(), "review-queued") {
 		t.Fatalf("decision reason = %q, want queued reviewer and job", decision.Reason)
 	}
 	if len(gh.merges) != 0 {
@@ -1993,11 +2175,11 @@ func TestPolicyMergeGateWaitsForRunningReviewAtEvaluatedHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if decision.Merged || decision.EscalateMergeGateMiss {
+	if decision.Merged || decision.Reason.IsGateMiss() {
 		t.Fatalf("decision = %+v, want running review to wait without escalating", decision)
 	}
-	if !strings.Contains(decision.Reason, "waiting for reviewer reviewer-b") ||
-		!strings.Contains(decision.Reason, "review-running") {
+	if !strings.Contains(decision.Reason.Render(), "waiting for reviewer reviewer-b") ||
+		!strings.Contains(decision.Reason.Render(), "review-running") {
 		t.Fatalf("decision reason = %q, want running reviewer and job", decision.Reason)
 	}
 	if len(gh.merges) != 0 {
@@ -2025,14 +2207,14 @@ func TestPolicyMergeGateLatestQueuedReviewWaitsOverEarlierObjection(t *testing.T
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if decision.Merged || decision.EscalateMergeGateMiss {
+	if decision.Merged || decision.Reason.IsGateMiss() {
 		t.Fatalf("decision = %+v, want latest queued review to wait", decision)
 	}
-	if !strings.Contains(decision.Reason, "waiting for reviewer reviewer-a") ||
-		!strings.Contains(decision.Reason, "review-requeued") {
+	if !strings.Contains(decision.Reason.Render(), "waiting for reviewer reviewer-a") ||
+		!strings.Contains(decision.Reason.Render(), "review-requeued") {
 		t.Fatalf("decision reason = %q, want latest queued reviewer and job", decision.Reason)
 	}
-	if strings.Contains(decision.Reason, "blocking result") {
+	if strings.Contains(decision.Reason.Render(), "blocking result") {
 		t.Fatalf("decision reason = %q, stale objection must not override latest queued slot", decision.Reason)
 	}
 	if len(gh.merges) != 0 {
@@ -2057,11 +2239,11 @@ func TestPolicyMergeGateParksFailedReviewerAtEvaluatedHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 		t.Fatalf("decision = %+v, want failed reviewer parked", decision)
 	}
-	if !strings.Contains(decision.Reason, "crashed reviewer joltra-sol-review") ||
-		!strings.Contains(decision.Reason, "local-review-joltra-sol-review-18c723c7768aa61d") {
+	if !strings.Contains(decision.Reason.Render(), "crashed reviewer joltra-sol-review") ||
+		!strings.Contains(decision.Reason.Render(), "local-review-joltra-sol-review-18c723c7768aa61d") {
 		t.Fatalf("decision reason = %q, want crashed reviewer and job", decision.Reason)
 	}
 	if len(gh.merges) != 0 {
@@ -2085,11 +2267,11 @@ func TestPolicyMergeGateParksCancelledReviewerAtEvaluatedHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 		t.Fatalf("decision = %+v, want cancelled reviewer parked", decision)
 	}
-	if !strings.Contains(decision.Reason, "crashed reviewer reviewer-b") ||
-		!strings.Contains(decision.Reason, "review-cancelled") {
+	if !strings.Contains(decision.Reason.Render(), "crashed reviewer reviewer-b") ||
+		!strings.Contains(decision.Reason.Render(), "review-cancelled") {
 		t.Fatalf("decision reason = %q, want crashed reviewer and cancelled job", decision.Reason)
 	}
 	if len(gh.merges) != 0 {
@@ -2122,14 +2304,14 @@ func TestPolicyMergeGateParksAbstainingReviewerAtEvaluatedHead(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Evaluate returned error: %v", err)
 			}
-			if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+			if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 				t.Fatalf("decision = %+v, want abstaining reviewer parked", decision)
 			}
-			if !strings.Contains(decision.Reason, "abstaining reviewer reviewer-b") ||
-				!strings.Contains(decision.Reason, "review-abstained") {
+			if !strings.Contains(decision.Reason.Render(), "abstaining reviewer reviewer-b") ||
+				!strings.Contains(decision.Reason.Render(), "review-abstained") {
 				t.Fatalf("decision reason = %q, want abstaining reviewer and job", decision.Reason)
 			}
-			if strings.Contains(decision.Reason, "crashed reviewer") {
+			if strings.Contains(decision.Reason.Render(), "crashed reviewer") {
 				t.Fatalf("decision reason = %q, abstention must not use crash label", decision.Reason)
 			}
 			if len(gh.merges) != 0 {
@@ -2160,13 +2342,13 @@ func TestPolicyMergeGateUsesLatestReviewJobPerReviewer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 		t.Fatalf("decision = %+v, want latest changes_requested verdict to block", decision)
 	}
-	if !strings.Contains(decision.Reason, "blocking result from joltra-sol-review") {
+	if !strings.Contains(decision.Reason.Render(), "blocking result from joltra-sol-review") {
 		t.Fatalf("decision reason = %q, want latest reviewer's blocking result", decision.Reason)
 	}
-	if strings.Contains(decision.Reason, "crashed reviewer") {
+	if strings.Contains(decision.Reason.Render(), "crashed reviewer") {
 		t.Fatalf("decision reason = %q, stale failed job must not park latest slot", decision.Reason)
 	}
 	if len(gh.merges) != 0 {
@@ -2190,14 +2372,14 @@ func TestPolicyMergeGateLatestCrashOverridesStaleApproval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 		t.Fatalf("decision = %+v, want latest crashed reviewer parked", decision)
 	}
-	if !strings.Contains(decision.Reason, "crashed reviewer reviewer-a") ||
-		!strings.Contains(decision.Reason, "review-a-latest-failed") {
+	if !strings.Contains(decision.Reason.Render(), "crashed reviewer reviewer-a") ||
+		!strings.Contains(decision.Reason.Render(), "review-a-latest-failed") {
 		t.Fatalf("decision reason = %q, want latest crashed reviewer and job", decision.Reason)
 	}
-	if strings.Contains(decision.Reason, "review-z-stale-approved") {
+	if strings.Contains(decision.Reason.Render(), "review-z-stale-approved") {
 		t.Fatalf("decision reason = %q, stale approval must not govern reviewer slot", decision.Reason)
 	}
 	if len(gh.merges) != 0 {
@@ -2220,11 +2402,11 @@ func TestPolicyMergeGateRequeueClearsCrashedReviewerPark(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Evaluate returned error: %v", err)
 	}
-	if !parked.LeaveOpen || !parked.EscalateMergeGateMiss || parked.Merged {
+	if !parked.LeaveOpen || !parked.Reason.IsGateMiss() || parked.Merged {
 		t.Fatalf("first decision = %+v, want crashed reviewer parked", parked)
 	}
-	if !strings.Contains(parked.Reason, "crashed reviewer reviewer-b") ||
-		!strings.Contains(parked.Reason, "review-crashed") {
+	if !strings.Contains(parked.Reason.Render(), "crashed reviewer reviewer-b") ||
+		!strings.Contains(parked.Reason.Render(), "review-crashed") {
 		t.Fatalf("first decision reason = %q, want crashed reviewer and job", parked.Reason)
 	}
 
@@ -2285,10 +2467,10 @@ func TestPolicyMergeGateParksParentApprovalWhenDelegationChildrenFailed(t *testi
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 		t.Fatalf("decision = %+v, want failed delegated review evidence parked", decision)
 	}
-	if !strings.Contains(decision.Reason, "delegated review parent "+parentID) {
+	if !strings.Contains(decision.Reason.Render(), "delegated review parent "+parentID) {
 		t.Fatalf("decision reason = %q, want parent job id", decision.Reason)
 	}
 	for _, delegationID := range []string{
@@ -2297,7 +2479,7 @@ func TestPolicyMergeGateParksParentApprovalWhenDelegationChildrenFailed(t *testi
 		"lens-tests-regressions",
 	} {
 		childID := parentID + "/delegation/" + delegationID
-		if !strings.Contains(decision.Reason, childID) {
+		if !strings.Contains(decision.Reason.Render(), childID) {
 			t.Fatalf("decision reason = %q, want failed child %s", decision.Reason, childID)
 		}
 	}
@@ -2359,15 +2541,15 @@ func TestPolicyMergeGateFallbackParksHeadlessIntegrationParentWhenDelegationChil
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 		t.Fatalf("decision = %+v, want fallback approval with failed children parked", decision)
 	}
-	if !strings.Contains(decision.Reason, "delegated review parent "+parentID) {
+	if !strings.Contains(decision.Reason.Render(), "delegated review parent "+parentID) {
 		t.Fatalf("decision reason = %q, want fallback parent job id", decision.Reason)
 	}
 	for _, delegationID := range []string{"correctness", "compile", "tests"} {
 		childID := parentID + "/delegation/" + delegationID
-		if !strings.Contains(decision.Reason, childID) {
+		if !strings.Contains(decision.Reason.Render(), childID) {
 			t.Fatalf("decision reason = %q, want failed child %s", decision.Reason, childID)
 		}
 	}
@@ -2392,11 +2574,11 @@ func TestPolicyMergeGateParksHeadlessIntegrationParentWhenChildrenSkipped(t *tes
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 		t.Fatalf("decision = %+v, want all-skipped delegation evidence parked", decision)
 	}
-	if !strings.Contains(decision.Reason, "delegated review parent "+parentID) ||
-		!strings.Contains(decision.Reason, "(skipped)") {
+	if !strings.Contains(decision.Reason.Render(), "delegated review parent "+parentID) ||
+		!strings.Contains(decision.Reason.Render(), "(skipped)") {
 		t.Fatalf("decision reason = %q, want skipped children identified as no evidence", decision.Reason)
 	}
 	if len(gh.merges) != 0 {
@@ -2431,12 +2613,12 @@ func TestPolicyMergeGateRejectsUnrecognizedDelegationEvidence(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Evaluate returned error: %v", err)
 			}
-			if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+			if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 				t.Fatalf("decision = %+v, want unrecognized delegation evidence refused", decision)
 			}
 			childID := parentID + "/delegation/unrecognized"
-			if !strings.Contains(decision.Reason, "unrecognized delegation evidence") ||
-				!strings.Contains(decision.Reason, childID) {
+			if !strings.Contains(decision.Reason.Render(), "unrecognized delegation evidence") ||
+				!strings.Contains(decision.Reason.Render(), childID) {
 				t.Fatalf("decision reason = %q, want unrecognized child %s", decision.Reason, childID)
 			}
 			if len(gh.merges) != 0 {
@@ -2467,12 +2649,12 @@ func TestPolicyMergeGateRejectsUnrecognizedDelegationEvidenceAlongsideHealthyChi
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 		t.Fatalf("decision = %+v, want mixed unrecognized delegation evidence refused", decision)
 	}
 	unrecognizedChildID := parentID + "/delegation/unrecognized"
-	if !strings.Contains(decision.Reason, "unrecognized delegation evidence") ||
-		!strings.Contains(decision.Reason, unrecognizedChildID) {
+	if !strings.Contains(decision.Reason.Render(), "unrecognized delegation evidence") ||
+		!strings.Contains(decision.Reason.Render(), unrecognizedChildID) {
 		t.Fatalf("decision reason = %q, want unrecognized child %s", decision.Reason, unrecognizedChildID)
 	}
 	if len(gh.merges) != 0 {
@@ -2501,12 +2683,12 @@ func TestPolicyMergeGateDoesNotCountNonDelegationChildAsEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 		t.Fatalf("decision = %+v, want non-delegation child excluded from evidence", decision)
 	}
 	skippedChildID := parentID + "/delegation/skipped-delegation"
-	if !strings.Contains(decision.Reason, "no surviving delegation evidence") ||
-		!strings.Contains(decision.Reason, skippedChildID) {
+	if !strings.Contains(decision.Reason.Render(), "no surviving delegation evidence") ||
+		!strings.Contains(decision.Reason.Render(), skippedChildID) {
 		t.Fatalf("decision reason = %q, want skipped delegated child %s", decision.Reason, skippedChildID)
 	}
 	if len(gh.merges) != 0 {
@@ -2541,11 +2723,11 @@ func TestPolicyMergeGateRejectsMalformedDelegationEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 		t.Fatalf("decision = %+v, want malformed delegation evidence refused", decision)
 	}
-	if !strings.Contains(decision.Reason, "unrecognized delegation evidence") ||
-		!strings.Contains(decision.Reason, childID+" (malformed result)") {
+	if !strings.Contains(decision.Reason.Render(), "unrecognized delegation evidence") ||
+		!strings.Contains(decision.Reason.Render(), childID+" (malformed result)") {
 		t.Fatalf("decision reason = %q, want malformed child %s", decision.Reason, childID)
 	}
 	if len(gh.merges) != 0 {
@@ -2575,12 +2757,12 @@ func TestPolicyMergeGateWaitsForActiveDelegationChild(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Evaluate returned error: %v", err)
 			}
-			if decision.Merged || decision.LeaveOpen || decision.EscalateMergeGateMiss {
+			if decision.Merged || decision.LeaveOpen || decision.Reason.IsGateMiss() {
 				t.Fatalf("decision = %+v, want active delegation child to wait without escalating", decision)
 			}
 			childID := parentID + "/delegation/" + tc.name
-			if !strings.Contains(decision.Reason, "waiting for delegated review parent "+parentID) ||
-				!strings.Contains(decision.Reason, childID+" ("+string(tc.state)+")") {
+			if !strings.Contains(decision.Reason.Render(), "waiting for delegated review parent "+parentID) ||
+				!strings.Contains(decision.Reason.Render(), childID+" ("+string(tc.state)+")") {
 				t.Fatalf("decision reason = %q, want waiting reason with active child %s", decision.Reason, childID)
 			}
 			if len(gh.merges) != 0 {
@@ -2610,11 +2792,11 @@ func TestPolicyMergeGateBlocksParentApprovalWhenDelegationChildRequestsChanges(t
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 		t.Fatalf("decision = %+v, want blocking delegation verdict to stop merge", decision)
 	}
-	if !strings.Contains(decision.Reason, "blocking delegation evidence") ||
-		!strings.Contains(decision.Reason, childID+" (changes_requested)") {
+	if !strings.Contains(decision.Reason.Render(), "blocking delegation evidence") ||
+		!strings.Contains(decision.Reason.Render(), childID+" (changes_requested)") {
 		t.Fatalf("decision reason = %q, want blocking child %s", decision.Reason, childID)
 	}
 	if len(gh.merges) != 0 {
@@ -2642,11 +2824,11 @@ func TestPolicyMergeGateParksParentApprovalWhenDelegationChildImplemented(t *tes
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 		t.Fatalf("decision = %+v, want implemented delegation result parked as abstention", decision)
 	}
-	if !strings.Contains(decision.Reason, "abstaining delegation children") ||
-		!strings.Contains(decision.Reason, childID+" (implemented)") {
+	if !strings.Contains(decision.Reason.Render(), "abstaining delegation children") ||
+		!strings.Contains(decision.Reason.Render(), childID+" (implemented)") {
 		t.Fatalf("decision reason = %q, want abstaining child %s", decision.Reason, childID)
 	}
 	if len(gh.merges) != 0 {
@@ -2696,11 +2878,11 @@ func TestPolicyMergeGateAcceptedDelegationChildDoesNotEraseAdverseSibling(t *tes
 			if err != nil {
 				t.Fatalf("Evaluate returned error: %v", err)
 			}
-			if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+			if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 				t.Fatalf("decision = %+v, want adverse sibling to outrank accepted child", decision)
 			}
-			if !strings.Contains(decision.Reason, tc.wantReasonClass) ||
-				!strings.Contains(decision.Reason, adverseID+" "+tc.wantDetail) {
+			if !strings.Contains(decision.Reason.Render(), tc.wantReasonClass) ||
+				!strings.Contains(decision.Reason.Render(), adverseID+" "+tc.wantDetail) {
 				t.Fatalf("decision reason = %q, want adverse child %s", decision.Reason, adverseID)
 			}
 			if len(gh.merges) != 0 {
@@ -2735,7 +2917,7 @@ func TestPolicyMergeGateWinningDelegationOutcomeNamesSubordinateObligations(t *t
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || decision.Merged {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 		t.Fatalf("decision = %+v, want blocking outcome to win mixed delegation set", decision)
 	}
 	for _, want := range []string{
@@ -2744,7 +2926,7 @@ func TestPolicyMergeGateWinningDelegationOutcomeNamesSubordinateObligations(t *t
 		"unrecognized children:",
 		unrecognizedID + ` (unrecognized decision "future-review-outcome")`,
 	} {
-		if !strings.Contains(decision.Reason, want) {
+		if !strings.Contains(decision.Reason.Render(), want) {
 			t.Fatalf("decision reason = %q, want %q", decision.Reason, want)
 		}
 	}
@@ -2928,40 +3110,40 @@ func TestPolicyMergeGateDelegatedReviewEvidenceEnumeration(t *testing.T) {
 							t.Fatalf("decision = %+v merge calls = %+v, want SAT", decision, gh.merges)
 						}
 					case waits:
-						if decision.Merged || decision.LeaveOpen || decision.EscalateMergeGateMiss ||
-							!strings.Contains(decision.Reason, "waiting for delegated review parent") {
+						if decision.Merged || decision.LeaveOpen || decision.Reason.IsGateMiss() ||
+							!strings.Contains(decision.Reason.Render(), "waiting for delegated review parent") {
 							t.Fatalf("decision = %+v, want WAIT", decision)
 						}
 					case blocks:
-						if decision.Merged || !decision.LeaveOpen || !decision.EscalateMergeGateMiss ||
-							!strings.Contains(decision.Reason, "blocking delegation evidence") {
+						if decision.Merged || !decision.LeaveOpen || !decision.Reason.IsGateMiss() ||
+							!strings.Contains(decision.Reason.Render(), "blocking delegation evidence") {
 							t.Fatalf("decision = %+v, want BLOCK", decision)
 						}
 					case parksUnknown:
-						if decision.Merged || !decision.LeaveOpen || !decision.EscalateMergeGateMiss ||
-							!strings.Contains(decision.Reason, "unrecognized delegation evidence") {
+						if decision.Merged || !decision.LeaveOpen || !decision.Reason.IsGateMiss() ||
+							!strings.Contains(decision.Reason.Render(), "unrecognized delegation evidence") {
 							t.Fatalf("decision = %+v, want PARK-U", decision)
 						}
 					case parksCrashed:
-						if decision.Merged || !decision.LeaveOpen || !decision.EscalateMergeGateMiss ||
-							!strings.Contains(decision.Reason, "crashed delegation children") {
+						if decision.Merged || !decision.LeaveOpen || !decision.Reason.IsGateMiss() ||
+							!strings.Contains(decision.Reason.Render(), "crashed delegation children") {
 							t.Fatalf("decision = %+v, want PARK-C", decision)
 						}
 					case parksAbstaining:
-						if decision.Merged || !decision.LeaveOpen || !decision.EscalateMergeGateMiss ||
-							!strings.Contains(decision.Reason, "abstaining delegation children") {
+						if decision.Merged || !decision.LeaveOpen || !decision.Reason.IsGateMiss() ||
+							!strings.Contains(decision.Reason.Render(), "abstaining delegation children") {
 							t.Fatalf("decision = %+v, want PARK-A", decision)
 						}
 					case parksCouldNotRun:
-						if decision.Merged || !decision.LeaveOpen || !decision.EscalateMergeGateMiss ||
-							!strings.Contains(decision.Reason, "parked children:") {
+						if decision.Merged || !decision.LeaveOpen || !decision.Reason.IsGateMiss() ||
+							!strings.Contains(decision.Reason.Render(), "parked children:") {
 							t.Fatalf("decision = %+v, want PARK STATE_BLOCKED_COULD_NOT_RUN", decision)
 						}
 					default:
 						t.Fatalf("unknown expected outcome %q", want)
 					}
 					for _, childID := range includedAdverseIDs {
-						if !strings.Contains(decision.Reason, childID) {
+						if !strings.Contains(decision.Reason.Render(), childID) {
 							t.Fatalf("decision reason = %q, want subordinate child %s", decision.Reason, childID)
 						}
 					}
@@ -3060,7 +3242,7 @@ func TestPolicyMergeGateBlocksReviewForStaleHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || !strings.Contains(decision.Reason, "different head SHA") {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || !strings.Contains(decision.Reason.Render(), "different head SHA") {
 		t.Fatalf("decision = %+v", decision)
 	}
 	if gh.prCheckCalls != 0 || len(gh.checkRefs) != 1 || gh.checkRefs[0] != "head123" {
@@ -3102,7 +3284,7 @@ func TestPolicyMergeGateBlocksLegacyReviewWithoutHeadSHA(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.EscalateMergeGateMiss || !strings.Contains(decision.Reason, "does not record a head SHA") {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || !strings.Contains(decision.Reason.Render(), "does not record a head SHA") {
 		t.Fatalf("decision = %+v", decision)
 	}
 }
@@ -3186,7 +3368,7 @@ func TestPolicyMergeGateBlocksDelegationReviewForMismatchedHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if decision.Ready || !strings.Contains(decision.Reason, "different head SHA") {
+	if decision.Ready || !strings.Contains(decision.Reason.Render(), "different head SHA") {
 		t.Fatalf("delegation review with mismatched head was not rejected: decision = %+v", decision)
 	}
 }
@@ -3206,7 +3388,7 @@ func TestPolicyMergeGateBlocksMissingFinalReview(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if decision.Ready || !strings.Contains(decision.Reason, "review") {
+	if decision.Ready || !strings.Contains(decision.Reason.Render(), "review") {
 		t.Fatalf("decision = %+v", decision)
 	}
 }
