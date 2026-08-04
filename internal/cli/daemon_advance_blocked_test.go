@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -873,5 +874,51 @@ func TestFinishQueuedJobDoesNotCloseANewerRun(t *testing.T) {
 	}
 	if after.State != string(workflow.JobQueued) {
 		t.Fatalf("state = %q, want queued: a failure from a PREVIOUS run closed a newer one", after.State)
+	}
+}
+
+// TestTempWorkerPreflightFailureUsesAdmittedGeneration binds the temp-worker
+// caller to the row admitted by runWithTempWorker. DelegateQueuedJob updates the
+// queued row in place, but a later GetJob can observe a cancel/retry generation
+// that this run never admitted and therefore must not own.
+func TestTempWorkerPreflightFailureUsesAdmittedGeneration(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.CodexRuntime, "session-1", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "temp-preflight-aba", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main",
+	})
+
+	admitted := mustWorkerJob(t, store, "temp-preflight-aba")
+	observed := seedSameStateNewerGeneration(t, store, admitted.ID, workflow.JobQueued)
+	if admitted.LifecycleGeneration != observed.generation {
+		t.Fatalf("admitted generation = %d, observed generation = %d", admitted.LifecycleGeneration, observed.generation)
+	}
+	payload, err := daemonJobPayload(admitted)
+	if err != nil {
+		t.Fatalf("daemonJobPayload returned error: %v", err)
+	}
+	dbAgent, err := store.GetAgent(ctx, admitted.Agent)
+	if err != nil {
+		t.Fatalf("GetAgent returned error: %v", err)
+	}
+
+	worker := defaultJobWorker(store, io.Discard)
+	worker.StartAdapterFactory = func(string, string) (runtime.Adapter, error) {
+		return &cliWorkerFakeAdapter{startRuntimeRef: "550e8400-e29b-41d4-a716-446655440777"}, nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return nil, errors.New("temp-worker adapter preflight failed")
+	}
+	if err := worker.runWithTempWorker(ctx, admitted, payload, runtimeAgent(dbAgent), t.TempDir(), config.ParallelSessionPolicy{}, "test contention"); err != nil {
+		t.Fatalf("runWithTempWorker returned error: %v", err)
+	}
+
+	after := mustWorkerJob(t, store, admitted.ID)
+	if after.State != string(workflow.JobQueued) {
+		t.Fatalf("state = %q, want queued: temp-worker preflight from a PREVIOUS admission closed a newer run", after.State)
+	}
+	if after.LifecycleGeneration == admitted.LifecycleGeneration {
+		t.Fatalf("generation = %d, want newer than admitted generation", after.LifecycleGeneration)
 	}
 }

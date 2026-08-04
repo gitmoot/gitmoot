@@ -1647,9 +1647,13 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	if err != nil {
 		return err
 	}
+	// delegatedJob carries the temp agent and rewritten payload. It is not an
+	// admission token: this read can observe a cancel/retry generation that raced
+	// after job was admitted. Every pre-flight terminal write below therefore
+	// remains anchored to job, while runtime work uses delegatedJob's metadata.
 	adapter, err := w.AdapterFactory(started.Agent, checkout)
 	if err != nil {
-		if finishErr := w.finishQueuedJob(ctx, delegatedJob, workflow.JobFailed, err); finishErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
@@ -1662,7 +1666,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	tempLockTTL := started.JobTimeout + runtimeLeaseTeardownGrace
 	releaseLock, acquired, lockKey, ownerToken, err := acquireRuntimeSessionLock(ctx, w.Store, delegatedJob.ID, started.Agent, time.Now().UTC(), tempLockTTL)
 	if err != nil {
-		if finishErr := w.finishQueuedJob(ctx, delegatedJob, workflow.JobFailed, err); finishErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
@@ -1698,7 +1702,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	// and Landlock adapter wrapping as the primary worker path. Without this seam,
 	// runtime-session contention could route Claude/Kimi around the launch sandbox.
 	if err := applyProduceRuntimeGrants(ctx, w.Store, w.ConfigHome, delegatedJob, payload, &started.Agent); err != nil {
-		if finishErr := w.finishQueuedJob(ctx, delegatedJob, workflow.JobFailed, err); finishErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
@@ -1717,7 +1721,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	}
 	adapter, err = wrapProduceSandboxAdapter(delegatedJob.Type, started.Agent, adapter)
 	if err != nil {
-		if finishErr := w.finishQueuedJob(ctx, delegatedJob, workflow.JobFailed, err); finishErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
@@ -1749,7 +1753,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	}
 	adapter = wrapManagedWorktreeRuntimeEnv(payload, adapter)
 	if err := w.Store.MarkAgentInstanceRunning(ctx, started.Agent.Name, time.Now().UTC(), started.JobTimeout); err != nil {
-		if finishErr := w.finishQueuedJob(ctx, delegatedJob, workflow.JobFailed, err); finishErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
