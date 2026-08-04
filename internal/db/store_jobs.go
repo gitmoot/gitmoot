@@ -185,9 +185,9 @@ func (s *Store) IsRootJobKilled(ctx context.Context, rootID string) (bool, error
 }
 
 func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, workflow_id, root_killed, input_tokens, output_tokens, updated_at, created_at, externally_driven FROM jobs WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, workflow_id, root_killed, input_tokens, output_tokens, updated_at, created_at, externally_driven, lifecycle_generation FROM jobs WHERE id = ?`, id)
 	var job Job
-	if err := row.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.WorkflowID, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ExternallyDriven); err != nil {
+	if err := row.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.WorkflowID, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ExternallyDriven, &job.LifecycleGeneration); err != nil {
 		return Job{}, err
 	}
 	return job, nil
@@ -196,7 +196,7 @@ func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
 // jobColumns is the shared core projection ListJobs and ListJobsByType both
 // read, kept as one const so their SELECT lists and scanJobs order cannot drift.
 // Workflow-only scalar projections are selected by ListJobsByWorkflow.
-const jobColumns = `id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, workflow_id, root_killed, input_tokens, output_tokens, updated_at, created_at, externally_driven`
+const jobColumns = `id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, workflow_id, root_killed, input_tokens, output_tokens, updated_at, created_at, externally_driven, lifecycle_generation`
 
 const listJobsByStateSQL = `SELECT ` + jobColumns + ` FROM jobs WHERE state = ? ORDER BY updated_at, id`
 
@@ -208,7 +208,7 @@ func scanJobs(rows *sql.Rows) ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.WorkflowID, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ExternallyDriven); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.WorkflowID, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ExternallyDriven, &job.LifecycleGeneration); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -538,8 +538,28 @@ func (s *Store) ListRunningJobsUpdatedBefore(ctx context.Context, before time.Ti
 	return jobs, rows.Err()
 }
 
+// bumpLifecycleGenerationSQL is a SET-clause fragment that advances a job's
+// lifecycle generation whenever the write moves it INTO queued from some other
+// state (#1407). It takes ONE bound argument: the destination state, which every
+// caller already has to hand.
+//
+// It is a shared fragment rather than seven hand-written CASE expressions for the
+// same reason the counter lives in SQL rather than in the callers: a rule copied
+// N times is N chances to copy it wrong, and the copies drift independently. Every
+// statement below that assigns jobs.state embeds this fragment, with no per-site
+// reasoning about whether that particular statement "can" reach queued -- deciding
+// per site is exactly how a policy ends up documented at five call sites and
+// violated at three of them.
+//
+// `state` inside the CASE reads the row's PRE-UPDATE value: SQLite evaluates
+// SET-clause expressions against the original row, so the comparison sees the
+// state being left, not the one being written. The `state <> 'queued'` term makes
+// the bump idempotent -- a queued -> queued write is not a new run and must not
+// invalidate an in-flight advancement's anchor.
+const bumpLifecycleGenerationSQL = `lifecycle_generation = lifecycle_generation + (CASE WHEN ? = 'queued' AND state <> 'queued' THEN 1 ELSE 0 END)`
+
 func (s *Store) UpdateJobState(ctx context.Context, id string, state string) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, state, id)
+	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, state, state, id)
 	if err != nil {
 		return err
 	}
@@ -547,7 +567,7 @@ func (s *Store) UpdateJobState(ctx context.Context, id string, state string) err
 }
 
 func (s *Store) TransitionJobState(ctx context.Context, id string, from string, to string) (bool, error) {
-	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, id, from)
+	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, to, id, from)
 	if err != nil {
 		return false, err
 	}
@@ -565,7 +585,46 @@ func (s *Store) TransitionJobStateWithEvent(ctx context.Context, id string, from
 	}
 	defer tx.Rollback()
 
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, id, from)
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, to, id, from)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, tx.Commit()
+	}
+	if event.JobID == "" {
+		event.JobID = id
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+// TransitionJobStateWithEventAtGeneration is TransitionJobStateWithEvent whose
+// compare-and-swap additionally pins the job's LIFECYCLE GENERATION (#1407).
+//
+// TransitionJobStateWithEvent anchors on the state string alone, which cannot
+// distinguish "still the run I observed" from "a later run that happens to have
+// reached the same state again". A caller settling a verdict it formed about a
+// SPECIFIC run must use this instead: the generation only ever moves forward, so
+// a stale settlement loses the CAS rather than overwriting a live lifecycle.
+//
+// It returns false, with no event written, when the row is not in `from` state OR
+// not at `fromGeneration` -- the caller cannot tell the two apart from the return
+// value alone and should re-read the row to classify what happened.
+func (s *Store) TransitionJobStateWithEventAtGeneration(ctx context.Context, id string, from string, fromGeneration int64, to string, event JobEvent) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND lifecycle_generation = ?`, to, to, id, from, fromGeneration)
 	if err != nil {
 		return false, err
 	}
@@ -601,7 +660,7 @@ func (s *Store) ClaimRunningJob(ctx context.Context, id string, from string, to 
 	}
 	defer tx.Rollback()
 
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, runner_pid = ?, runner_boot_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, runnerPID, strings.TrimSpace(runnerBootID), id, from)
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, runner_pid = ?, runner_boot_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, to, runnerPID, strings.TrimSpace(runnerBootID), id, from)
 	if err != nil {
 		return false, err
 	}
@@ -655,8 +714,8 @@ func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id strin
 	defer tx.Rollback()
 
 	projection := jobProjectionFromPayload(payload)
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND workflow_id = ?`,
-		to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND workflow_id = ?`,
+		to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
 		projection.BlockerSuggestedAction, id, from, projection.WorkflowID)
 	if err != nil {
 		return false, err
@@ -727,8 +786,8 @@ func (s *Store) TransitionJobStatePayloadWithEventAndTaskTransition(ctx context.
 	}
 
 	projection := jobProjectionFromPayload(payload)
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND workflow_id = ?`,
-		to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND workflow_id = ?`,
+		to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
 		projection.BlockerSuggestedAction, id, from, projection.WorkflowID)
 	if err != nil {
 		return false, err
@@ -823,8 +882,8 @@ func (s *Store) UpdateJobPayloadAndStateWithEvent(ctx context.Context, id string
 	}
 	defer tx.Rollback()
 	projection := jobProjectionFromPayload(payload)
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND workflow_id = ?`,
-		state, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND workflow_id = ?`,
+		state, state, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
 		projection.BlockerSuggestedAction, id, projection.WorkflowID)
 	if err != nil {
 		return err

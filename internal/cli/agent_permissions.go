@@ -25,11 +25,38 @@ func readOnlyImplementationBlocked(jobType string, agent runtime.Agent) bool {
 	return !runtime.PolicyGrantsImplementWrite(agent.AutonomyPolicy)
 }
 
-func markJobPermissionBlocked(ctx context.Context, store *db.Store, jobID string) (bool, error) {
+// markJobPermissionBlockedAtGeneration blocks a job for a permission failure.
+// atGeneration pins the lifecycle this verdict was formed about, making the
+// transition atomic in both state and generation.
+//
+// The anchored form exists because a check-then-act is not enough (#1407). handleRunJobError
+// re-reads the row and checks the generation, but a retry can be claimed in the window between
+// that read and this write; the state-only CAS below then accepts the NEWER run's `running` and
+// blocks it. Review reproduced exactly that: new run state = "blocked", want running. The
+// guarantee has to live in the WRITE, not in a preceding read.
+func markJobPermissionBlockedAtGeneration(ctx context.Context, store *db.Store, jobID string, atGeneration int64) (bool, error) {
 	if store == nil {
 		return false, errors.New("job store is required")
 	}
 	for _, from := range []workflow.JobState{workflow.JobQueued, workflow.JobRunning, workflow.JobFailed} {
+		event := db.JobEvent{
+			JobID:   jobID,
+			Kind:    string(workflow.JobBlocked),
+			Message: agentPermissionBlockedMessage,
+		}
+		if atGeneration >= 0 {
+			transitioned, err := store.TransitionJobStateWithEventAtGeneration(ctx, jobID, string(from), atGeneration, string(workflow.JobBlocked), event)
+			if err != nil {
+				return false, err
+			}
+			if transitioned {
+				if err := store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "permission_blocked", Message: agentPermissionBlockedMessage}); err != nil {
+					return false, err
+				}
+				return true, nil
+			}
+			continue
+		}
 		transitioned, err := store.TransitionJobStateWithEvent(ctx, jobID, string(from), string(workflow.JobBlocked), db.JobEvent{
 			JobID:   jobID,
 			Kind:    string(workflow.JobBlocked),
@@ -46,6 +73,13 @@ func markJobPermissionBlocked(ctx context.Context, store *db.Store, jobID string
 		}
 	}
 	return false, nil
+}
+
+// markJobPermissionBlocked derives the atomic-write anchor from the admitted
+// row. Callers must retain that row rather than re-read before writing: a queued
+// cancellation and retry can produce the same state at a newer generation.
+func markJobPermissionBlocked(ctx context.Context, store *db.Store, job db.Job) (bool, error) {
+	return markJobPermissionBlockedAtGeneration(ctx, store, job.ID, job.LifecycleGeneration)
 }
 
 func runtimePermissionFailure(err error) bool {

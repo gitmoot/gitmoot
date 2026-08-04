@@ -2023,6 +2023,13 @@ On an **issue**, only `ask` is acted on, so any other action — recognized or
 not — is dropped before dispatch with no reply **and no log entry**. When an
 issue comment appears to have been ignored, the daemon log will not explain it.
 
+If delivery of a stored result fails during workflow advancement, Gitmoot
+records the job as `blocked` and the attributed result comment reports
+`Decision: blocked`, even when the agent originally returned `implemented`.
+The agent's summary remains visible, and the delivery failure appears under
+`Diagnostics`. A downstream precondition such as pending CI does not replace a
+successfully delivered job's terminal result.
+
 ## Jobs And Locks
 
 ```sh

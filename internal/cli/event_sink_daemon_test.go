@@ -81,7 +81,7 @@ func TestFinishQueuedJobEmitsJobFailed(t *testing.T) {
 	worker := defaultJobWorker(store, io.Discard)
 	worker.EventSinkOverride = sink
 
-	if err := worker.finishQueuedJob(ctx, "queued-job", workflow.JobFailed, errors.New("preflight check failed")); err != nil {
+	if err := worker.finishQueuedJob(ctx, mustWorkerJob(t, store, "queued-job"), workflow.JobFailed, errors.New("preflight check failed")); err != nil {
 		t.Fatalf("finishQueuedJob returned error: %v", err)
 	}
 
@@ -118,7 +118,7 @@ func TestFinishQueuedJobEmitsJobBlocked(t *testing.T) {
 	worker := defaultJobWorker(store, io.Discard)
 	worker.EventSinkOverride = sink
 
-	if err := worker.finishQueuedJob(ctx, "queued-job", workflow.JobBlocked, errors.New("missing capability")); err != nil {
+	if err := worker.finishQueuedJob(ctx, mustWorkerJob(t, store, "queued-job"), workflow.JobBlocked, errors.New("missing capability")); err != nil {
 		t.Fatalf("finishQueuedJob returned error: %v", err)
 	}
 	if got := sink.byType(events.EventJobBlocked); len(got) != 1 {
@@ -138,7 +138,7 @@ func TestFinishQueuedJobNilSinkIsByteIdentical(t *testing.T) {
 	}
 	worker := defaultJobWorker(store, io.Discard) // no EventSinkOverride; home unset -> nil sink
 
-	if err := worker.finishQueuedJob(ctx, "queued-job", workflow.JobFailed, errors.New("boom")); err != nil {
+	if err := worker.finishQueuedJob(ctx, mustWorkerJob(t, store, "queued-job"), workflow.JobFailed, errors.New("boom")); err != nil {
 		t.Fatalf("finishQueuedJob returned error: %v", err)
 	}
 	job, err := store.GetJob(ctx, "queued-job")
@@ -164,7 +164,7 @@ func TestFinishQueuedJobNoTransitionDoesNotEmit(t *testing.T) {
 	worker := defaultJobWorker(store, io.Discard)
 	worker.EventSinkOverride = sink
 
-	if err := worker.finishQueuedJob(ctx, "done-job", workflow.JobFailed, errors.New("boom")); err != nil {
+	if err := worker.finishQueuedJob(ctx, mustWorkerJob(t, store, "done-job"), workflow.JobFailed, errors.New("boom")); err != nil {
 		t.Fatalf("finishQueuedJob returned error: %v", err)
 	}
 	if sink.count() != 0 {

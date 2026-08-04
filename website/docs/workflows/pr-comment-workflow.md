@@ -82,6 +82,11 @@ one is attached, and the job id:
 The `Template` line is present only when the job ran with a template. The body
 then continues with the `Decision` and `Summary`, plus any `Findings`,
 `Changes Made`, `Tests Run`, `Needs`, and `Delegations` the agent reported.
+If delivery of a stored result fails during workflow advancement, the durable
+job state and comment both report `blocked` rather than repeating an agent's
+earlier `implemented` decision. The original summary remains visible and the
+delivery failure appears under `Diagnostics`. A downstream precondition such as
+pending CI does not replace a successfully delivered job's terminal result.
 
 Use `gitmoot job list --repo owner/repo` and
 `gitmoot events --repo owner/repo` to inspect routing state.

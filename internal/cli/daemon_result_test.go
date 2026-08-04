@@ -135,7 +135,7 @@ func TestHandleRunJobErrorTimedOutDelegationChildTriggersRetry(t *testing.T) {
 
 	// The daemon's run-error path must turn the timeout kill into a terminal
 	// failed child AND drive the parent DAG so the delegation's retry fires.
-	if err := worker.handleRunJobError(ctx, childID, context.DeadlineExceeded); err != nil {
+	if err := worker.handleRunJobError(ctx, childID, observedJobLifecycleForTest(t, store, childID), context.DeadlineExceeded); err != nil {
 		t.Fatalf("handleRunJobError returned error: %v", err)
 	}
 
@@ -180,7 +180,7 @@ func TestHandleRunJobErrorTimedOutDelegationChildBlocksParentWhenNoRetry(t *test
 
 	// handleRunJobError swallows the BlockedError (the child is finalized and the
 	// DAG advanced), returning nil for a clean terminal outcome.
-	if err := worker.handleRunJobError(ctx, childID, context.DeadlineExceeded); err != nil {
+	if err := worker.handleRunJobError(ctx, childID, observedJobLifecycleForTest(t, store, childID), context.DeadlineExceeded); err != nil {
 		t.Fatalf("handleRunJobError returned error: %v", err)
 	}
 
@@ -216,7 +216,7 @@ func TestHandleRunJobErrorTimedOutDelegationChildEnqueuesContinuationOnContinueP
 	childID := "parent-job/delegation/api"
 	markDelegationChildTimedOut(t, store, childID)
 
-	if err := worker.handleRunJobError(ctx, childID, context.DeadlineExceeded); err != nil {
+	if err := worker.handleRunJobError(ctx, childID, observedJobLifecycleForTest(t, store, childID), context.DeadlineExceeded); err != nil {
 		t.Fatalf("handleRunJobError returned error: %v", err)
 	}
 
@@ -232,4 +232,15 @@ func TestHandleRunJobErrorTimedOutDelegationChildEnqueuesContinuationOnContinueP
 	if !daemonWorkerHasEvent(events, "delegation_continuation_enqueued") {
 		t.Fatalf("parent events = %+v, want delegation_continuation_enqueued", events)
 	}
+}
+
+// observedJobLifecycleForTest reads the row a test just seeded and returns its lifecycle, so a
+// test settles the run it actually created rather than a hard-coded generation.
+func observedJobLifecycleForTest(t *testing.T, store *db.Store, jobID string) jobLifecycle {
+	t.Helper()
+	job, err := store.GetJob(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("GetJob(%s) returned error: %v", jobID, err)
+	}
+	return observedJobLifecycle(job)
 }

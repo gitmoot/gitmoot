@@ -533,6 +533,11 @@ func (e Engine) harvestOutcome(ctx context.Context, job db.Job, payload JobPaylo
 
 type BlockedError struct {
 	Reason string
+	// ResultDeliveryFailed distinguishes a job whose stored result did not reach
+	// its required delivery surface (commit, push, or PR) from a downstream
+	// workflow precondition such as pending CI. Only the former invalidates the
+	// job's terminal result and outward decision.
+	ResultDeliveryFailed bool
 }
 
 func (e BlockedError) Error() string {
