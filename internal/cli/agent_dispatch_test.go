@@ -596,6 +596,7 @@ func TestReviewDispatchLeadRoutesChangesRequestedFixToImplementer(t *testing.T) 
 			store := openCLIJobStore(t, home)
 			defer store.Close()
 			checkout := createDaemonWorkerGitCheckout(t, "main")
+			makeReviewFixOriginFetchable(t, checkout, "feature/review")
 			seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 			seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 			seedDaemonWorkerAgentWithPolicy(t, store, "implementer", runtime.ShellRuntime, "true", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
@@ -657,6 +658,22 @@ func TestReviewDispatchLeadRoutesChangesRequestedFixToImplementer(t *testing.T) 
 			}
 		})
 	}
+}
+
+func makeReviewFixOriginFetchable(t *testing.T, checkout, branch string) {
+	t.Helper()
+	remote := filepath.Join(t.TempDir(), "origin.git")
+	runDaemonWorkerGit(t, checkout, "init", "--bare", remote)
+	runDaemonWorkerGit(t, checkout, "push", remote, "HEAD:refs/heads/"+branch)
+	runDaemonWorkerGit(t, checkout, "remote", "set-url", "origin", "git@github.com:owner/repo.git")
+	ssh := filepath.Join(t.TempDir(), "git-ssh")
+	if err := os.WriteFile(ssh, []byte("#!/bin/sh\nexec git-upload-pack \"$GITMOOT_TEST_FIX_REMOTE\"\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile git-ssh: %v", err)
+	}
+	// Preserve a GitHub-shaped origin for checkout validation while routing the
+	// fixture's SSH upload-pack transport to a local bare repository.
+	t.Setenv("GITMOOT_TEST_FIX_REMOTE", remote)
+	t.Setenv("GIT_SSH_COMMAND", ssh)
 }
 
 type reviewLeadRefusalFixture struct {
