@@ -1199,7 +1199,7 @@ required Herdr provider (`>=0.7.5`) with:
 
 ```sh
 gitmoot org init
-gitmoot org brief --role owner [--json]
+gitmoot org brief [--role owner] [--json]
 gitmoot org chart [--json]
 gitmoot org status [--json]
 ```
@@ -1214,6 +1214,7 @@ for them are skipped with an observable log and increment the role's missed-wake
 counter rather than being inferred from a pane label. There
 is exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
 `owner/repo`. Malformed org configuration fails closed and loudly. `brief`
+defaults `--role` to `GITMOOT_ORG_ROLE`, with an explicit flag taking precedence,
 records passive last-seen presence for its role and can render static context
 with provider state `unknown` during an outage; `chart` and `status` require a
 live compatible Herdr snapshot. When configured,

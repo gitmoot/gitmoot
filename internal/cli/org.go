@@ -871,7 +871,7 @@ func runOrgBrief(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("org brief", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	roleName := fs.String("role", "", "organization role to brief")
+	roleName := fs.String("role", strings.TrimSpace(os.Getenv("GITMOOT_ORG_ROLE")), "organization role to brief")
 	jsonOutput := fs.Bool("json", false, "print JSON")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

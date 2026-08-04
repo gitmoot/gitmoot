@@ -859,6 +859,61 @@ func TestRunOrgBriefChartStatusAndPresence(t *testing.T) {
 	}
 }
 
+func TestRunOrgBriefRoleResolution(t *testing.T) {
+	withOrgProvider(t, orgFixtureProvider{snapshot: org.Snapshot{States: map[string]org.RoleLiveState{}}})
+	tests := []struct {
+		name       string
+		envRole    string
+		flagRole   string
+		wantRole   string
+		wantCode   int
+		wantStderr string
+	}{
+		{name: "env_fallback", envRole: "review", wantRole: "review"},
+		{name: "flag_precedence", envRole: "owner", flagRole: "review", wantRole: "review"},
+		{name: "missing_role", wantCode: 2, wantStderr: "org brief requires --role NAME\n"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			home, paths := setupOrgHome(t)
+			t.Setenv("GITMOOT_ORG_ROLE", test.envRole)
+			args := []string{"org", "brief", "--home", home, "--json"}
+			if test.flagRole != "" {
+				args = append(args, "--role", test.flagRole)
+			}
+			var stdout, stderr bytes.Buffer
+			if code := Run(args, &stdout, &stderr); code != test.wantCode {
+				t.Fatalf("brief code = %d, want %d; stderr=%q", code, test.wantCode, stderr.String())
+			}
+			if test.wantCode != 0 {
+				if stderr.String() != test.wantStderr {
+					t.Fatalf("brief stderr = %q, want %q", stderr.String(), test.wantStderr)
+				}
+				return
+			}
+			var brief orgBriefOutput
+			if err := json.Unmarshal(stdout.Bytes(), &brief); err != nil {
+				t.Fatalf("decode brief: %v; output=%s", err, stdout.String())
+			}
+			if brief.Role != test.wantRole {
+				t.Fatalf("brief role = %q, want %q", brief.Role, test.wantRole)
+			}
+			store, err := db.Open(paths.Database)
+			if err != nil {
+				t.Fatal(err)
+			}
+			presence, err := store.ListOrgRolePresence(context.Background())
+			_ = store.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(presence) != 1 || presence[0].Role != test.wantRole || presence[0].LastCommand != "org brief" {
+				t.Fatalf("presence = %+v, want one %s org brief stamp", presence, test.wantRole)
+			}
+		})
+	}
+}
+
 func TestRunOrgBriefAndChartSurfaceModelPin(t *testing.T) {
 	home, paths := setupOrgHome(t)
 	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
