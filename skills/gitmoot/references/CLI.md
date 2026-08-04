@@ -1389,7 +1389,7 @@ required Herdr provider (`>=0.7.5`) with:
 
 ```sh
 gitmoot org init
-gitmoot org brief --role owner [--json]
+gitmoot org brief [--role owner] [--json]
 gitmoot org chart [--json]
 gitmoot org status [--json]
 ```
@@ -1398,6 +1398,7 @@ gitmoot org status [--json]
 registry against the live Herdr snapshot and event-rule store. It fails when a
 role has no live pane, has no enabled wake route, or a labeled live pane is not
 claimed by any role; each failure includes category counts and a reason.
+`org brief --role` defaults to `GITMOOT_ORG_ROLE`; an explicit flag wins.
 `gitmoot org show [--home PATH]` prints the resolved role table.
 
 `gitmoot org seat add <name> --pane <label> [--home DIR]` claims the one live
