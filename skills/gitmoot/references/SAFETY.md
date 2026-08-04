@@ -55,11 +55,13 @@ Pipeline `allow_auto_merge` remains a separate double-keyed mechanism.
 When review independence cannot be verified, the merge gate names the evidence
 it observed: no implement job for the task, implement jobs that do not match the
 task identity, a matching implement job with no agent, or a malformed implement
-payload. All four remain fail-closed. For the no-job case, use the **coordinator
-bridge**: inspect the engine review job with `gitmoot job show <job-id>` and
-confirm its agent and decision at the exact head, confirm the implementer from
-the pane session, then journal both facts with `gitmoot workflow note`. That
-journal is an operator record only; it is not an attestation or merge-gate input.
+payload. All four remain fail-closed. For the no-job case, first confirm that an
+independent approval exists at the PR's exact current head. If it does not, do
+not use the **coordinator bridge**. If it does, inspect that engine review job
+with `gitmoot job show <job-id>`, confirm its agent and decision, confirm the
+implementer from the pane session, then journal both facts with `gitmoot
+workflow note`. That journal is an operator record only; it is not an
+attestation or merge-gate input.
 
 ### No external CI: grace window, not instant pass (#596)
 

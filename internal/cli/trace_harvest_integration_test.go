@@ -395,7 +395,7 @@ func TestTraceHarvestFullChainBlockedQuality(t *testing.T) {
 	store := openTraceChainStore(t)
 	version := installChainTemplate(t, store, "planner")
 	gate := &stubMergeGate{decision: workflow.MergeDecision{
-		Reason:     "external CI failed",
+		Reason:     workflow.PlainReason("external CI failed"),
 		BlockClass: workflow.MergeBlockQuality,
 	}}
 	engine := chainEngine(store, gate)
