@@ -20,6 +20,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/permissionpolicy"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/sandbox"
@@ -191,6 +192,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	dbAgent, err := w.Store.GetAgent(ctx, job.Agent)
 	if err != nil {
+		if _, warningErr := permissionpolicy.RecordWarning(ctx, w.Store, job, runtime.Agent{Name: job.Agent}, permissionpolicy.StaticProvider{Property: runtime.PermissionPolicyUnresolved}, time.Now()); warningErr != nil {
+			writeLine(w.Stdout, "job %s permission-policy observation failed: %v", job.ID, warningErr)
+		}
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
@@ -325,6 +329,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
+	}
+	if _, warningErr := permissionpolicy.RecordWarning(ctx, w.Store, job, agent, adapter, time.Now()); warningErr != nil {
+		writeLine(w.Stdout, "job %s permission-policy observation failed: %v", job.ID, warningErr)
 	}
 	managed, err := w.managedJobConfig(ctx, agent.Name)
 	if err != nil {

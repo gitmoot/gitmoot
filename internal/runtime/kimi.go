@@ -89,6 +89,10 @@ type KimiAdapter struct {
 
 func (a KimiAdapter) Name() string { return KimiRuntime }
 
+func (a KimiAdapter) PermissionPolicyApplication(Agent) PermissionPolicyApplication {
+	return PermissionPolicyNotApplied
+}
+
 func (a KimiAdapter) Start(ctx context.Context, request StartRequest) (StartResult, error) {
 	if err := validateStartRequest(request.Agent, a.Name(), request.Prompt); err != nil {
 		return StartResult{}, err
@@ -205,6 +209,10 @@ type KimiCLIAdapter struct {
 }
 
 func (a KimiCLIAdapter) Name() string { return KimiCLIRuntime }
+
+func (a KimiCLIAdapter) PermissionPolicyApplication(Agent) PermissionPolicyApplication {
+	return PermissionPolicyNotApplied
+}
 
 func (a KimiCLIAdapter) Start(ctx context.Context, request StartRequest) (StartResult, error) {
 	if err := validateStartRequest(request.Agent, a.Name(), request.Prompt); err != nil {

@@ -937,16 +937,17 @@ func (s registeredRepoSchedule) ensure() registeredRepoSchedule {
 }
 
 type registeredRepoPoller struct {
-	Store                  *db.Store
-	Workers                int
-	DryRun                 bool
-	Stdout                 io.Writer
-	RecoveryOnly           bool
-	WatchIssues            bool
-	EscalationTTL          time.Duration
-	RevertDetectionEnabled bool
-	AutoMergeEnabled       func(repo string) bool
-	CheckoutLocks          *repoCheckoutLocks
+	Store                   *db.Store
+	Workers                 int
+	DryRun                  bool
+	Stdout                  io.Writer
+	RecoveryOnly            bool
+	WatchIssues             bool
+	EscalationTTL           time.Duration
+	RevertDetectionEnabled  bool
+	ObservePermissionPolicy bool
+	AutoMergeEnabled        func(repo string) bool
+	CheckoutLocks           *repoCheckoutLocks
 	// Inflight is the supervisor's in-flight job tracker (#562). A repo with
 	// dispatched jobs still running gets the recovery-command-only poll: a full
 	// PollOnce may mutate the shared checkout, which used to be excluded by the
@@ -976,16 +977,17 @@ type registeredRepoPoller struct {
 // leaves ArtifactRoot/Home/EventSink unset.
 func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdout io.Writer, rawHome, resolvedRoot string) registeredRepoPoller {
 	return registeredRepoPoller{
-		Store:                  store,
-		Workers:                workers,
-		DryRun:                 dryRun,
-		Stdout:                 stdout,
-		EscalationTTL:          resolveEscalationTTL(rawHome),
-		RevertDetectionEnabled: resolveRevertDetectionEnabled(rawHome),
-		AutoMergeEnabled:       autoMergeEnabledResolver(rawHome),
-		IdleGraceTicks:         config.DefaultDaemonIdleGraceTicks,
-		IdleMaxMultiplier:      config.DefaultDaemonIdleMaxMultiplier,
-		GitHubClient:           func(checkout string) github.Client { return github.NewClient(checkout) },
+		Store:                   store,
+		Workers:                 workers,
+		DryRun:                  dryRun,
+		Stdout:                  stdout,
+		EscalationTTL:           resolveEscalationTTL(rawHome),
+		RevertDetectionEnabled:  resolveRevertDetectionEnabled(rawHome),
+		ObservePermissionPolicy: resolvePermissionPolicyObservationEnabled(rawHome),
+		AutoMergeEnabled:        autoMergeEnabledResolver(rawHome),
+		IdleGraceTicks:          config.DefaultDaemonIdleGraceTicks,
+		IdleMaxMultiplier:       config.DefaultDaemonIdleMaxMultiplier,
+		GitHubClient:            func(checkout string) github.Client { return github.NewClient(checkout) },
 		WorkflowFactory: func(store *db.Store, gh github.Client, checkout string) *workflow.Engine {
 			engine := daemonWorkflowEngine(store, gh, checkout, resolvedRoot)
 			// Apply only the escalate_human notifier handle from policy (#340),
@@ -1219,14 +1221,15 @@ func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, 
 		recoveryOnly = true
 	}
 	d := daemon.Daemon{
-		Repo:                   repo,
-		Store:                  store,
-		GitHub:                 gh,
-		Workflow:               engine,
-		WatchIssues:            p.WatchIssues,
-		EscalationTTL:          p.EscalationTTL,
-		RevertDetectionEnabled: p.RevertDetectionEnabled,
-		AutoMergeEnabled:       p.AutoMergeEnabled,
+		Repo:                    repo,
+		Store:                   store,
+		GitHub:                  gh,
+		Workflow:                engine,
+		WatchIssues:             p.WatchIssues,
+		EscalationTTL:           p.EscalationTTL,
+		RevertDetectionEnabled:  p.RevertDetectionEnabled,
+		ObservePermissionPolicy: p.ObservePermissionPolicy,
+		AutoMergeEnabled:        p.AutoMergeEnabled,
 	}
 	// Bound the poll the same way the single-repo supervisor does (#555 / #536):
 	// this call runs while HOLDING the per-repo checkout lock (deferred Unlock

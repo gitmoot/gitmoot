@@ -826,6 +826,24 @@ maps to the runtime permission mode and decides what a headless job may do:
 | `danger-full-access` | `bypassPermissions` | full implementation: file writes plus Bash |
 | `auto` (default) | *(no flag)* | non-deterministic — inherited from ambient Claude config |
 
+Gitmoot also records **permission-policy instrumentation** for engine-dispatched
+jobs. Each adapter derives one of `applied`, `widened`, or `not-applied` while it
+builds argv; a missing agent row is `unresolved`. `not-applied` means only that
+Gitmoot supplied no permission-policy flag. It does **not** mean the process was
+unsandboxed: host runtime configuration may still constrain it, and Gitmoot does
+not read that configuration. `not-applied` and `unresolved` produce a structured
+`permission_policy_not_applied` job event, coalesced once per
+`(agent, runtime, policy)` per 24-hour window. This is visibility, not protection:
+the warning never refuses, blocks, or changes a job.
+
+The live-fleet ratchet is off by default. Set
+`[daemon].permission_policy_observation_enabled = true` to record the first
+home-store baseline and compare later daemon ticks against it. Growth emits a
+`permission_policy_baseline_exceeded` event naming the new agent configurations;
+improvement lowers the stored baseline. `gitmoot doctor` reports current,
+baseline, and delta. This baseline intentionally lives in the Gitmoot home store,
+not in source control or CI, because only that store contains the fleet inventory.
+
 Because of this, an agent that carries the `implement` capability **must** be
 started/subscribed with a write policy. Gitmoot fails closed: `--capability
 implement` with `auto`/empty or `read-only` is refused at `agent start`, `agent

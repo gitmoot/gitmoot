@@ -33,7 +33,7 @@ func TestLoadDaemonRuntimeConfigParsesFields(t *testing.T) {
 	if err := Initialize(paths); err != nil {
 		t.Fatalf("Initialize: %v", err)
 	}
-	writeConfig(t, paths, "[daemon]\npoll = \"45s\"\nworkers = 4\nscheduler = \"pool\"\nidle_grace_ticks = 5\nidle_max_multiplier = 8\njob_timeout_default = \"3h\"\njob_timeout_max = \"6h\"\n")
+	writeConfig(t, paths, "[daemon]\npoll = \"45s\"\nworkers = 4\nscheduler = \"pool\"\nidle_grace_ticks = 5\nidle_max_multiplier = 8\njob_timeout_default = \"3h\"\njob_timeout_max = \"6h\"\npermission_policy_observation_enabled = true\n")
 	cfg, err := LoadDaemonRuntimeConfig(paths)
 	if err != nil {
 		t.Fatalf("LoadDaemonRuntimeConfig: %v", err)
@@ -52,6 +52,9 @@ func TestLoadDaemonRuntimeConfigParsesFields(t *testing.T) {
 	}
 	if gotDefault, gotMax := cfg.JobTimeoutPolicy(); gotDefault != 3*time.Hour || gotMax != 6*time.Hour {
 		t.Fatalf("job timeout policy = (%v, %v), want (3h, 6h)", gotDefault, gotMax)
+	}
+	if !cfg.PermissionPolicyObservationEnabledSet || !cfg.PermissionPolicyObservationEnabled {
+		t.Fatalf("permission-policy observation = %+v, want explicitly enabled", cfg)
 	}
 }
 

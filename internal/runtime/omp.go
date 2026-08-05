@@ -104,6 +104,10 @@ type OmpAdapter struct {
 
 func (a OmpAdapter) Name() string { return OmpRuntime }
 
+func (a OmpAdapter) PermissionPolicyApplication(Agent) PermissionPolicyApplication {
+	return PermissionPolicyNotApplied
+}
+
 func (a OmpAdapter) Start(ctx context.Context, request StartRequest) (StartResult, error) {
 	if err := a.validateStart(request); err != nil {
 		return StartResult{}, err

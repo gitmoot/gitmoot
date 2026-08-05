@@ -395,15 +395,16 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		wireReviewRiskSignals(&engine, gh)
 		fmt.Fprintf(stdout, "watching %s every %s\n", repo.FullName(), poll.String())
 		return runSingleRepoSupervisor(ctx, *home, daemon.Daemon{
-			Repo:                   repo,
-			PollInterval:           *poll,
-			Store:                  store,
-			GitHub:                 gh,
-			Workflow:               &engine,
-			WatchIssues:            *watchIssues,
-			EscalationTTL:          resolveEscalationTTL(*home),
-			RevertDetectionEnabled: resolveRevertDetectionEnabled(*home),
-			AutoMergeEnabled:       autoMergeEnabledResolver(*home),
+			Repo:                    repo,
+			PollInterval:            *poll,
+			Store:                   store,
+			GitHub:                  gh,
+			Workflow:                &engine,
+			WatchIssues:             *watchIssues,
+			EscalationTTL:           resolveEscalationTTL(*home),
+			RevertDetectionEnabled:  resolveRevertDetectionEnabled(*home),
+			ObservePermissionPolicy: resolvePermissionPolicyObservationEnabled(*home),
+			AutoMergeEnabled:        autoMergeEnabledResolver(*home),
 		}, store, live, session, stdout)
 	})
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

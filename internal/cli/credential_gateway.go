@@ -66,6 +66,10 @@ type modelGatewayRuntimeAdapter struct {
 	runner *credgw.Runner
 }
 
+func (a modelGatewayRuntimeAdapter) PermissionPolicyApplication(agent runtime.Agent) runtime.PermissionPolicyApplication {
+	return runtime.ResolvePermissionPolicyApplication(a.Adapter, agent)
+}
+
 func (a modelGatewayRuntimeAdapter) Start(ctx context.Context, request runtime.StartRequest) (runtime.StartResult, error) {
 	lease, err := a.runner.NewLease(modelGatewayLeaseID("start-"+request.Agent.Name, ""))
 	if err != nil {

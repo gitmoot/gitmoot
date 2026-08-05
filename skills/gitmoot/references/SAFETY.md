@@ -129,6 +129,25 @@ Two consequences matter for implementation jobs:
   stays gated strictly behind explicit `danger-full-access`; a git worktree is not
   a sandbox, so Bash there still reaches the whole machine.
 
+### Permission-policy visibility is instrumentation, not protection
+
+For engine dispatch, Gitmoot records what permission-policy argv it supplied:
+`applied`, `widened`, `not-applied`, or `unresolved` when the agent row is gone.
+The result is derived by the argv builder itself. A `not-applied` warning means
+Gitmoot supplied no policy flag; it does not claim the job was unsandboxed, since
+ambient runtime configuration may still constrain it. Warnings are structured,
+coalesced per agent configuration, and never refuse or block work. Interactive
+coordinator sessions are outside this engine-dispatch instrumentation.
+
+#### Shell runtime risk acceptance (2026-08-05)
+
+An operator-authored shell command is accepted as an explicit daemon-permission
+risk: the `shell` adapter has no policy flag to apply, and the command runs with
+the daemon's host permissions. Its warning records this dated acceptance. That
+acceptance is provenance-specific, not a blanket exemption for the `shell`
+label: a shell session that invokes a model CLI such as `claude -p` or `codex
+exec` remains `not-applied` without the acceptance reference.
+
 ### Fail-closed implement guard
 
 Because of the above, Gitmoot **refuses** an agent (or ephemeral worker) that
