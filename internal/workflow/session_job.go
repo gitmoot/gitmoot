@@ -19,6 +19,15 @@ type SessionJobDisplayEvent struct {
 	HeadSHA string `json:"head_sha"`
 }
 
+// ExternalJobUsage is caller-reported evidence for externally driven work. Zero
+// values preserve the historical empty-model, zero-token session row exactly;
+// callers must not infer or default evidence the external session did not report.
+type ExternalJobUsage struct {
+	Model        string
+	InputTokens  int
+	OutputTokens int
+}
+
 func sessionJobDisplayEvent(jobID, headSHA string) (db.JobEvent, bool) {
 	headSHA = strings.TrimSpace(headSHA)
 	if headSHA == "" {
@@ -82,6 +91,7 @@ func (m Mailbox) OpenExternalJob(ctx context.Context, request JobRequest) (db.Jo
 		Sender:                 firstNonEmptyString(request.Sender, "session"),
 		Instructions:           request.Instructions,
 		WorkflowID:             strings.TrimSpace(request.WorkflowID),
+		ParentJobID:            strings.TrimSpace(request.ParentJobID),
 		TemplateID:             snapshot.ID,
 		TemplateResolvedCommit: snapshot.ResolvedCommit,
 		TemplateContent:        snapshot.Content,
@@ -96,6 +106,7 @@ func (m Mailbox) OpenExternalJob(ctx context.Context, request JobRequest) (db.Jo
 		Type:             request.Action,
 		State:            string(JobRunning),
 		Payload:          payload,
+		ParentJobID:      strings.TrimSpace(request.ParentJobID),
 		ExternallyDriven: true,
 	}
 	events := []db.JobEvent{{
@@ -126,6 +137,14 @@ func (m Mailbox) OpenExternalJob(ctx context.Context, request JobRequest) (db.Jo
 // externally_driven, else a clear error is returned (double-close, closing an
 // engine job, or an unknown id all fail cleanly).
 func (m Mailbox) CloseExternalJob(ctx context.Context, jobID string, result AgentResult, prOverride int, headSHAOverride, branchOverride string) (db.Job, error) {
+	return m.CloseExternalJobWithUsage(ctx, jobID, result, prOverride, headSHAOverride, branchOverride, ExternalJobUsage{})
+}
+
+// CloseExternalJobWithUsage closes an external job and records only the model
+// and token evidence explicitly supplied by its caller. The evidence and terminal
+// transition share one transaction, so a terminal session row cannot lose usage
+// that was part of the accepted close operation.
+func (m Mailbox) CloseExternalJobWithUsage(ctx context.Context, jobID string, result AgentResult, prOverride int, headSHAOverride, branchOverride string, usage ExternalJobUsage) (db.Job, error) {
 	if m.Store == nil {
 		return db.Job{}, errors.New("mailbox store is required")
 	}
@@ -169,11 +188,12 @@ func (m Mailbox) CloseExternalJob(ctx context.Context, jobID string, result Agen
 	if displayEvent, ok := sessionJobDisplayEvent(jobID, headSHAOverride); ok {
 		extraEvents = append(extraEvents, displayEvent)
 	}
-	transitioned, err := m.Store.TransitionJobStatePayloadWithEvent(ctx, jobID, string(JobRunning), string(state), encoded, db.JobEvent{
-		JobID:   jobID,
-		Kind:    string(state),
-		Message: fmt.Sprintf("job %s", state),
-	}, extraEvents...)
+	transitioned, err := m.Store.TransitionJobStatePayloadUsageWithEvent(ctx, jobID, string(JobRunning), string(state), encoded,
+		strings.TrimSpace(usage.Model), usage.InputTokens, usage.OutputTokens, db.JobEvent{
+			JobID:   jobID,
+			Kind:    string(state),
+			Message: fmt.Sprintf("job %s", state),
+		}, extraEvents...)
 	if err != nil {
 		return db.Job{}, err
 	}
@@ -205,4 +225,10 @@ func (e Engine) OpenExternalJob(ctx context.Context, request JobRequest) (db.Job
 // See Mailbox.CloseExternalJob.
 func (e Engine) CloseExternalJob(ctx context.Context, jobID string, result AgentResult, prOverride int, headSHAOverride, branchOverride string) (db.Job, error) {
 	return e.mailbox().CloseExternalJob(ctx, jobID, result, prOverride, headSHAOverride, branchOverride)
+}
+
+// CloseExternalJobWithUsage closes a session job with explicit caller-reported
+// model and token evidence. See Mailbox.CloseExternalJobWithUsage.
+func (e Engine) CloseExternalJobWithUsage(ctx context.Context, jobID string, result AgentResult, prOverride int, headSHAOverride, branchOverride string, usage ExternalJobUsage) (db.Job, error) {
+	return e.mailbox().CloseExternalJobWithUsage(ctx, jobID, result, prOverride, headSHAOverride, branchOverride, usage)
 }

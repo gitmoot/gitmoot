@@ -2211,19 +2211,22 @@ spawning a runtime** — a clock-in / clock-out pair (plus a one-shot recorder):
 ```sh
 # Clock in: create a RUNNING, externally-driven job (no dispatch); prints its id.
 gitmoot job open --agent <name> --repo owner/repo --type ask|review|implement \
-                 [--title "..."] [--task <id>] [--pr <n>] [--head-sha <sha>] \
+                 [--title "..."] [--task <id>] [--parent-job-id <id>] \
+                 [--pr <n>] [--head-sha <sha>] \
                  [--workflow <label>] [--json]
 
 # Clock out: apply the result and move the job to its terminal state.
 gitmoot job close <id> --decision approved|changes_requested|blocked|implemented|failed|skipped \
                  [--summary "..."] [--pr <n>] [--head-sha <sha>] \
-                 [--branch <name>] [--json]
+                 [--branch <name>] [--model <name>] \
+                 [--input-tokens <n>] [--output-tokens <n>] [--json]
 
 # One-shot post-hoc: create an already-terminal job (open + close in one).
 gitmoot job record --agent <name> --repo owner/repo --type ask|review|implement \
                  --decision <decision> [--title "..."] [--summary "..."] \
-                 [--task <id>] [--pr <n>] [--head-sha <sha>] \
-                 [--branch <name>] [--json]
+                 [--task <id>] [--parent-job-id <id>] [--pr <n>] \
+                 [--head-sha <sha>] [--branch <name>] [--model <name>] \
+                 [--input-tokens <n>] [--output-tokens <n>] [--json]
 ```
 
 An `externally_driven` job is created directly in `running` (it never queues, so
@@ -2239,6 +2242,16 @@ stays `running` (reaper-exempt) until you `job close --decision failed` or `job
 cancel <id>` it. A session job is never engine-executed, so `job retry` **refuses**
 it (retrying would re-queue it for a real runtime with an empty payload) — recover
 one by opening a fresh session job instead. The agent and repo must exist.
+`--parent-job-id` must name an existing job. Model and token values are
+caller-reported evidence: Gitmoot records only values supplied explicitly to
+`close` or `record`, and leaves the model empty and token counts zero when they
+are omitted.
+
+For a seat's internal fan-out, the recording convention is to use the seat's
+registered agent name, link each recorded unit to the seat job with
+`--parent-job-id`, and give it a descriptive `--title`. This is a convention,
+not an enforced identity or spawn relationship; the CLI validates only that the
+agent and parent job exist.
 
 For an in-session PR review, clock in before reading the diff and bind the
 display row to its exact head and workflow journal:

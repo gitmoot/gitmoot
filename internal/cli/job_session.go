@@ -46,6 +46,7 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 	typeName := fs.String("type", "", "job type: "+strings.Join(workflow.DelegationActions, "|"))
 	title := fs.String("title", "", "optional human title for the job")
 	task := fs.String("task", "", "optional task id to associate")
+	parentJobID := fs.String("parent-job-id", "", "optional existing parent job id")
 	pr := fs.Int("pr", 0, "optional pull request number")
 	headSHA := fs.String("head-sha", "", "optional pull request head SHA")
 	workflowID := fs.String("workflow", "", "external-coordinator workflow label")
@@ -83,6 +84,9 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
+		if err := validateSessionParentJob(context.Background(), store, *parentJobID); err != nil {
+			return err
+		}
 		engine := sessionWorkflowEngine(store, paths.Home)
 		job, err := engine.OpenExternalJob(context.Background(), workflow.JobRequest{
 			ID:          sessionJobID(action, *agent),
@@ -91,6 +95,7 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 			Repo:        fullName,
 			TaskID:      strings.TrimSpace(*task),
 			TaskTitle:   strings.TrimSpace(*title),
+			ParentJobID: strings.TrimSpace(*parentJobID),
 			PullRequest: *pr,
 			HeadSHA:     strings.TrimSpace(*headSHA),
 			Sender:      "session",
@@ -127,6 +132,9 @@ func runJobClose(args []string, stdout, stderr io.Writer) int {
 	pr := fs.Int("pr", 0, "optional pull request number to record")
 	headSHA := fs.String("head-sha", "", "optional pull request head SHA to record")
 	branch := fs.String("branch", "", "optional branch to record")
+	model := fs.String("model", "", "optional model used for the session work")
+	inputTokens := fs.Int("input-tokens", 0, "input tokens used by the session work")
+	outputTokens := fs.Int("output-tokens", 0, "output tokens used by the session work")
 	jsonOutput := fs.Bool("json", false, "print the closed job as JSON")
 	// The job id is positional and precedes the flags (`job close <id> --decision
 	// …`), so pull it off args[0] before flag.Parse (which stops at the first
@@ -156,14 +164,22 @@ func runJobClose(args []string, stdout, stderr io.Writer) int {
 	if !validateSessionDecision(*decision, stderr) {
 		return 2
 	}
+	if *inputTokens < 0 || *outputTokens < 0 {
+		fmt.Fprintln(stderr, "job close: --input-tokens and --output-tokens must be non-negative")
+		return 2
+	}
 
 	var out jobSessionOutput
 	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
 		engine := sessionWorkflowEngine(store, paths.Home)
-		job, err := engine.CloseExternalJob(context.Background(), jobID, workflow.AgentResult{
+		job, err := engine.CloseExternalJobWithUsage(context.Background(), jobID, workflow.AgentResult{
 			Decision: *decision,
 			Summary:  strings.TrimSpace(*summary),
-		}, *pr, *headSHA, *branch)
+		}, *pr, *headSHA, *branch, workflow.ExternalJobUsage{
+			Model:        strings.TrimSpace(*model),
+			InputTokens:  *inputTokens,
+			OutputTokens: *outputTokens,
+		})
 		if err != nil {
 			return err
 		}
@@ -200,9 +216,13 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 	title := fs.String("title", "", "optional human title for the job")
 	summary := fs.String("summary", "", "optional result summary")
 	task := fs.String("task", "", "optional task id to associate")
+	parentJobID := fs.String("parent-job-id", "", "optional existing parent job id")
 	pr := fs.Int("pr", 0, "optional pull request number")
 	headSHA := fs.String("head-sha", "", "optional pull request head SHA")
 	branch := fs.String("branch", "", "optional branch to record")
+	model := fs.String("model", "", "optional model used for the session work")
+	inputTokens := fs.Int("input-tokens", 0, "input tokens used by the session work")
+	outputTokens := fs.Int("output-tokens", 0, "output tokens used by the session work")
 	jsonOutput := fs.Bool("json", false, "print the recorded job as JSON")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -225,11 +245,18 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 	if !validateSessionDecision(*decision, stderr) {
 		return 2
 	}
+	if *inputTokens < 0 || *outputTokens < 0 {
+		fmt.Fprintln(stderr, "job record: --input-tokens and --output-tokens must be non-negative")
+		return 2
+	}
 
 	var out jobSessionOutput
 	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
 		fullName, err := validateSessionAgentRepo(context.Background(), store, *agent, *repo)
 		if err != nil {
+			return err
+		}
+		if err := validateSessionParentJob(context.Background(), store, *parentJobID); err != nil {
 			return err
 		}
 		engine := sessionWorkflowEngine(store, paths.Home)
@@ -240,6 +267,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 			Repo:        fullName,
 			TaskID:      strings.TrimSpace(*task),
 			TaskTitle:   strings.TrimSpace(*title),
+			ParentJobID: strings.TrimSpace(*parentJobID),
 			PullRequest: *pr,
 			HeadSHA:     strings.TrimSpace(*headSHA),
 			Sender:      "session",
@@ -247,10 +275,14 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
-		job, err := engine.CloseExternalJob(context.Background(), opened.ID, workflow.AgentResult{
+		job, err := engine.CloseExternalJobWithUsage(context.Background(), opened.ID, workflow.AgentResult{
 			Decision: *decision,
 			Summary:  strings.TrimSpace(*summary),
-		}, *pr, *headSHA, *branch)
+		}, *pr, *headSHA, *branch, workflow.ExternalJobUsage{
+			Model:        strings.TrimSpace(*model),
+			InputTokens:  *inputTokens,
+			OutputTokens: *outputTokens,
+		})
 		if err != nil {
 			return err
 		}
@@ -322,6 +354,23 @@ func validateSessionAgentRepo(ctx context.Context, store *db.Store, agentName, r
 		return "", err
 	}
 	return validateSessionRepo(ctx, store, repoFlag)
+}
+
+// validateSessionParentJob keeps the optional parent link factual: a supplied id
+// must name a row already present in the same store. Empty preserves the
+// historical unparented session-job path.
+func validateSessionParentJob(ctx context.Context, store *db.Store, parentJobID string) error {
+	parentJobID = strings.TrimSpace(parentJobID)
+	if parentJobID == "" {
+		return nil
+	}
+	if _, err := store.GetJob(ctx, parentJobID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("parent job %q not found", parentJobID)
+		}
+		return err
+	}
+	return nil
 }
 
 // validateSessionRepo confirms the repo is a well-formed owner/repo that gitmoot
