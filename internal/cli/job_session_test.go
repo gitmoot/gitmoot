@@ -29,8 +29,62 @@ func seedSessionAgentRepo(t *testing.T, store *db.Store) {
 		RepoScope:    "owner/repo",
 		Capabilities: []string{"ask", "review", "implement"},
 		HealthStatus: "ok",
+		Model:        "configured-default-must-not-be-recorded",
 	}); err != nil {
 		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+}
+
+func TestJobOpenAndRecordPersistParentJobID(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args func(home string) []string
+	}{
+		{
+			name: "open",
+			args: func(home string) []string {
+				return []string{"job", "open", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "ask", "--parent-job-id", "parent-job", "--json"}
+			},
+		},
+		{
+			name: "record",
+			args: func(home string) []string {
+				return []string{"job", "record", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "ask", "--decision", "approved", "--parent-job-id", "parent-job", "--json"}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			store := openCLIJobStore(t, home)
+			defer store.Close()
+			seedSessionAgentRepo(t, store)
+			if err := store.CreateJob(context.Background(), db.Job{ID: "parent-job", Agent: "lead", Type: "ask", State: string(workflow.JobSucceeded)}); err != nil {
+				t.Fatalf("CreateJob(parent) returned error: %v", err)
+			}
+
+			var stdout, stderr bytes.Buffer
+			if code := Run(tc.args(home), &stdout, &stderr); code != 0 {
+				t.Fatalf("%s exit = %d, stderr=%s", tc.name, code, stderr.String())
+			}
+			var out jobSessionOutput
+			if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+				t.Fatalf("decode %s JSON: %v (%s)", tc.name, err, stdout.String())
+			}
+			stored, err := store.GetJob(context.Background(), out.JobID)
+			if err != nil {
+				t.Fatalf("GetJob returned error: %v", err)
+			}
+			if stored.ParentJobID != "parent-job" {
+				t.Fatalf("parent_job_id = %q, want parent-job", stored.ParentJobID)
+			}
+			payload, err := workflow.ParseJobPayload(stored.Payload)
+			if err != nil {
+				t.Fatalf("ParseJobPayload returned error: %v", err)
+			}
+			if payload.ParentJobID != "parent-job" {
+				t.Fatalf("payload parent_job_id = %q, want parent-job", payload.ParentJobID)
+			}
+		})
 	}
 }
 
@@ -158,6 +212,130 @@ func TestJobCloseAppliesDecision(t *testing.T) {
 	}
 	if len(listed) != 1 || listed[0].ID != opened.JobID || listed[0].ReviewStatusGrade != evidence.GradeReported {
 		t.Fatalf("job list review = %+v, want closed review with reported grade", listed)
+	}
+}
+
+func TestJobCloseAndRecordPersistUsageEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(t *testing.T, home string) string
+	}{
+		{
+			name: "close",
+			run: func(t *testing.T, home string) string {
+				t.Helper()
+				var stdout, stderr bytes.Buffer
+				if code := Run([]string{"job", "open", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "ask", "--json"}, &stdout, &stderr); code != 0 {
+					t.Fatalf("job open exit = %d, stderr=%s", code, stderr.String())
+				}
+				var opened jobSessionOutput
+				if err := json.Unmarshal(stdout.Bytes(), &opened); err != nil {
+					t.Fatalf("decode open JSON: %v", err)
+				}
+				if code := Run([]string{"job", "close", opened.JobID, "--home", home, "--decision", "approved", "--model", "reported-model", "--input-tokens", "123", "--output-tokens", "45"}, &bytes.Buffer{}, &stderr); code != 0 {
+					t.Fatalf("job close exit = %d, stderr=%s", code, stderr.String())
+				}
+				return opened.JobID
+			},
+		},
+		{
+			name: "record",
+			run: func(t *testing.T, home string) string {
+				t.Helper()
+				var stdout, stderr bytes.Buffer
+				if code := Run([]string{"job", "record", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "ask", "--decision", "approved", "--model", "reported-model", "--input-tokens", "123", "--output-tokens", "45", "--json"}, &stdout, &stderr); code != 0 {
+					t.Fatalf("job record exit = %d, stderr=%s", code, stderr.String())
+				}
+				var recorded jobSessionOutput
+				if err := json.Unmarshal(stdout.Bytes(), &recorded); err != nil {
+					t.Fatalf("decode record JSON: %v", err)
+				}
+				return recorded.JobID
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			store := openCLIJobStore(t, home)
+			defer store.Close()
+			seedSessionAgentRepo(t, store)
+			jobID := tc.run(t, home)
+			stored, err := store.GetJob(context.Background(), jobID)
+			if err != nil {
+				t.Fatalf("GetJob returned error: %v", err)
+			}
+			if stored.Model != "reported-model" || stored.InputTokens != 123 || stored.OutputTokens != 45 {
+				t.Fatalf("usage evidence = model %q tokens %d/%d, want reported-model 123/45", stored.Model, stored.InputTokens, stored.OutputTokens)
+			}
+		})
+	}
+}
+
+func TestJobSessionOmittedEvidencePreservesEmptyDefaultsAndEvents(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	seedSessionAgentRepo(t, store)
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"job", "open", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "ask", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("job open exit = %d, stderr=%s", code, stderr.String())
+	}
+	var opened jobSessionOutput
+	if err := json.Unmarshal(stdout.Bytes(), &opened); err != nil {
+		t.Fatalf("decode open JSON: %v", err)
+	}
+	if code := Run([]string{"job", "close", opened.JobID, "--home", home, "--decision", "approved"}, &bytes.Buffer{}, &stderr); code != 0 {
+		t.Fatalf("job close exit = %d, stderr=%s", code, stderr.String())
+	}
+	stored, err := store.GetJob(context.Background(), opened.JobID)
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if stored.Model != "" || stored.InputTokens != 0 || stored.OutputTokens != 0 || stored.ParentJobID != "" {
+		t.Fatalf("omitted evidence changed row: model=%q tokens=%d/%d parent=%q", stored.Model, stored.InputTokens, stored.OutputTokens, stored.ParentJobID)
+	}
+	events, err := store.ListJobEvents(context.Background(), opened.JobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if len(events) != 2 || events[0].Kind != "running" || events[0].Message != "job started (externally driven session)" || events[1].Kind != "succeeded" || events[1].Message != "job succeeded" {
+		t.Fatalf("omitted evidence changed events: %+v", events)
+	}
+}
+
+func TestJobSessionUnknownParentRefusedWithoutCreatingRow(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args func(home string) []string
+	}{
+		{"open", func(home string) []string {
+			return []string{"job", "open", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "ask", "--parent-job-id", "missing-parent"}
+		}},
+		{"record", func(home string) []string {
+			return []string{"job", "record", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "ask", "--decision", "approved", "--parent-job-id", "missing-parent"}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			store := openCLIJobStore(t, home)
+			defer store.Close()
+			seedSessionAgentRepo(t, store)
+			var stdout, stderr bytes.Buffer
+			if code := Run(tc.args(home), &stdout, &stderr); code != 1 {
+				t.Fatalf("%s exit = %d, want 1; stderr=%s", tc.name, code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), `parent job "missing-parent" not found`) {
+				t.Fatalf("%s stderr = %q, want clear unknown-parent refusal", tc.name, stderr.String())
+			}
+			jobs, err := store.ListJobs(context.Background())
+			if err != nil {
+				t.Fatalf("ListJobs returned error: %v", err)
+			}
+			if len(jobs) != 0 {
+				t.Fatalf("unknown parent created jobs: %+v", jobs)
+			}
+		})
 	}
 }
 
@@ -433,11 +611,11 @@ func TestJobCloseDoubleCloseFails(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &opened); err != nil {
 		t.Fatalf("decode open JSON: %v", err)
 	}
-	if code := Run([]string{"job", "close", opened.JobID, "--home", home, "--decision", "approved"}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
+	if code := Run([]string{"job", "close", opened.JobID, "--home", home, "--decision", "approved", "--model", "first-model", "--input-tokens", "1", "--output-tokens", "2"}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
 		t.Fatalf("first close failed")
 	}
 	stderr.Reset()
-	if code := Run([]string{"job", "close", opened.JobID, "--home", home, "--decision", "approved"}, &bytes.Buffer{}, &stderr); code != 1 {
+	if code := Run([]string{"job", "close", opened.JobID, "--home", home, "--decision", "approved", "--model", "second-model", "--input-tokens", "3", "--output-tokens", "4"}, &bytes.Buffer{}, &stderr); code != 1 {
 		t.Fatalf("second close exit = %d, want 1", code)
 	}
 	if !strings.Contains(stderr.String(), "already been closed") {

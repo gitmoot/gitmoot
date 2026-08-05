@@ -242,11 +242,15 @@ func TestCloseExternalJobErrors(t *testing.T) {
 	}
 
 	// Engine (non-session) job cannot be closed.
-	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "engine-job", Agent: "lead", Type: "ask", State: string(JobRunning)}, db.JobEvent{Kind: string(JobRunning), Message: "job started"}); err != nil {
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "engine-job", Agent: "lead", Type: "ask", State: string(JobRunning), Payload: `{}`}, db.JobEvent{Kind: string(JobRunning), Message: "job started"}); err != nil {
 		t.Fatalf("CreateJobWithEvent returned error: %v", err)
 	}
-	if _, err := mb.CloseExternalJob(ctx, "engine-job", AgentResult{Decision: "approved"}, 0, "", ""); err == nil || !strings.Contains(err.Error(), "not a session job") {
+	if _, err := mb.CloseExternalJobWithUsage(ctx, "engine-job", AgentResult{Decision: "approved"}, 0, "", "", ExternalJobUsage{Model: "must-not-land", InputTokens: 7, OutputTokens: 9}); err == nil || !strings.Contains(err.Error(), "not a session job") {
 		t.Fatalf("CloseExternalJob(engine job) err = %v, want not-a-session-job", err)
+	}
+	engineJob := mustJob(t, store, "engine-job")
+	if engineJob.Model != "" || engineJob.InputTokens != 0 || engineJob.OutputTokens != 0 || engineJob.State != string(JobRunning) {
+		t.Fatalf("refused engine close changed job: %+v", engineJob)
 	}
 
 	// Open then close, then double-close.

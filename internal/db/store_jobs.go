@@ -754,6 +754,65 @@ func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id strin
 	return true, tx.Commit()
 }
 
+// TransitionJobStatePayloadUsageWithEvent atomically closes externally driven
+// work with the model and token evidence supplied by its caller. It mirrors
+// TransitionJobStatePayloadWithEvent's state/payload/event behavior while keeping
+// the usage write in the same transaction. Negative token values are clamped to
+// zero defensively; the CLI rejects them before reaching this layer.
+func (s *Store) TransitionJobStatePayloadUsageWithEvent(ctx context.Context, id string, from string, to string, payload string, model string, inputTokens int, outputTokens int, event JobEvent, extraEvents ...JobEvent) (bool, error) {
+	if inputTokens < 0 {
+		inputTokens = 0
+	}
+	if outputTokens < 0 {
+		outputTokens = 0
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	projection := jobProjectionFromPayload(payload)
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, model = ?, input_tokens = ?, output_tokens = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND workflow_id = ?`,
+		to, to, payload, strings.TrimSpace(model), inputTokens, outputTokens, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest,
+		projection.BlockerRetryAt, projection.BlockerSuggestedAction, id, from, projection.WorkflowID)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		if err := rejectWorkflowIDMismatch(ctx, tx, id, projection.WorkflowID); err != nil {
+			return false, err
+		}
+		return false, tx.Commit()
+	}
+	if event.JobID == "" {
+		event.JobID = id
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+		return false, err
+	}
+	for _, extra := range extraEvents {
+		if extra.JobID == "" {
+			extra.JobID = id
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, extra.JobID, extra.Kind, extra.Message); err != nil {
+			return false, err
+		}
+	}
+	var agent, jobType string
+	if err := tx.QueryRowContext(ctx, `SELECT agent, type FROM jobs WHERE id = ?`, id).Scan(&agent, &jobType); err != nil {
+		return false, err
+	}
+	if err := resolveAwaitedReviewFactTx(ctx, tx, id, agent, jobType, to, payload, time.Now().UTC()); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
 // TransitionJobStatePayloadWithEventAndTaskTransition is the retry path's
 // cross-row transaction: a dismissed task is explicitly recovered before its
 // job is re-queued, and either both lifecycle events commit or neither does.

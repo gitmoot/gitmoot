@@ -76,9 +76,9 @@ func printJobUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot job cancel <id>")
 	fmt.Fprintln(w, "  gitmoot job cancel --state blocked [--older-than 168h|7d] [--repo owner/repo] [--agent name] [--yes]")
 	fmt.Fprintln(w, "  gitmoot job kill <root-job-id>")
-	fmt.Fprintf(w, "  gitmoot job open --agent name --repo owner/repo --type %s [--title ...] [--task id] [--pr n] [--head-sha sha] [--workflow label] [--json]\n", strings.Join(workflow.DelegationActions, "|"))
-	fmt.Fprintf(w, "  gitmoot job close <id> --decision %s [--summary ...] [--pr n] [--head-sha sha] [--branch name] [--json]\n", strings.Join(workflow.ResultDecisions, "|"))
-	fmt.Fprintf(w, "  gitmoot job record --agent name --repo owner/repo --type %s --decision ... [--title ...] [--summary ...] [--task id] [--pr n] [--head-sha sha] [--branch name] [--json]\n", strings.Join(workflow.DelegationActions, "|"))
+	fmt.Fprintf(w, "  gitmoot job open --agent name --repo owner/repo --type %s [--title ...] [--task id] [--parent-job-id id] [--pr n] [--head-sha sha] [--workflow label] [--json]\n", strings.Join(workflow.DelegationActions, "|"))
+	fmt.Fprintf(w, "  gitmoot job close <id> --decision %s [--summary ...] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]\n", strings.Join(workflow.ResultDecisions, "|"))
+	fmt.Fprintf(w, "  gitmoot job record --agent name --repo owner/repo --type %s --decision ... [--title ...] [--summary ...] [--task id] [--parent-job-id id] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]\n", strings.Join(workflow.DelegationActions, "|"))
 }
 
 func runJobList(args []string, stdout, stderr io.Writer) int {
