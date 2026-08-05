@@ -105,3 +105,27 @@ func TestWarningCoalescesPerAgentConfigWindow(t *testing.T) {
 		}
 	}
 }
+
+func TestInventoryLabelsMissingAgentAsUnresolved(t *testing.T) {
+	ctx := context.Background()
+	store := observationStore(t)
+	if err := store.CreateJob(ctx, db.Job{
+		ID:    "missing-agent-job",
+		Agent: "deleted-agent",
+		Type:  "ask",
+		State: "queued",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	configs, err := Inventory(ctx, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(configs) != 1 {
+		t.Fatalf("inventory = %#v, want one missing-agent config", configs)
+	}
+	if got := configs[0]; got.Agent != "deleted-agent" || got.Runtime != "" || got.Policy != "" || got.Property != runtime.PermissionPolicyUnresolved {
+		t.Fatalf("missing-agent config = %#v, want agent deleted-agent with unknown runtime and policy and property %q", got, runtime.PermissionPolicyUnresolved)
+	}
+}

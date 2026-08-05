@@ -311,7 +311,7 @@ type PermissionPolicyApplicationProvider interface {
 	PermissionPolicyApplication(agent Agent) PermissionPolicyApplication
 }
 
-// ResolvePermissionPolicyApplication asks the adapter that builds argv instead
+// DeclaredPermissionPolicyApplication asks the adapter that builds argv instead
 // of maintaining a runtime-name roster beside it. A future adapter that gains a
 // real mapping changes its declaration, and every consumer follows automatically.
 func DeclaredPermissionPolicyApplication(adapter any, agent Agent) (PermissionPolicyApplication, bool) {
@@ -327,6 +327,8 @@ func DeclaredPermissionPolicyApplication(adapter any, agent Agent) (PermissionPo
 	}
 }
 
+// ResolvePermissionPolicyApplication returns the adapter's declaration and
+// defaults adapters without one to not-applied.
 func ResolvePermissionPolicyApplication(adapter any, agent Agent) PermissionPolicyApplication {
 	property, ok := DeclaredPermissionPolicyApplication(adapter, agent)
 	if !ok {
