@@ -105,6 +105,7 @@ artifact_blobs = %q
 # job_timeout_default = "4h" # kill deadline when payload and agent type omit one
 # job_timeout_max = "8h"     # hard ceiling; larger payload requests are clamped
 # quiet_kill_after = "45m"   # liveness transcript-silence threshold; floor 5m
+# permission_policy_observation_enabled = false # live-store #1484 ratchet; off by default
 
 # [credentials] is OFF by default. When env_curation=true, only a pinned base
 # environment plus runtime-specific auth/state variables reaches runtime-agent

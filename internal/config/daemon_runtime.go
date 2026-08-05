@@ -70,6 +70,10 @@ type DaemonRuntimeConfig struct {
 	// live runtime PID always vetoes reaping regardless of transcript silence.
 	QuietKillAfter    time.Duration
 	QuietKillAfterSet bool
+	// PermissionPolicyObservationEnabled arms #1484's live-store ratchet. It is
+	// off by default; the disabled daemon path performs no inventory read.
+	PermissionPolicyObservationEnabled    bool
+	PermissionPolicyObservationEnabledSet bool
 }
 
 // LoadDaemonRuntimeConfig parses the [daemon] section. A file with no [daemon]
@@ -170,6 +174,13 @@ func LoadDaemonRuntimeConfig(paths Paths) (DaemonRuntimeConfig, error) {
 			}
 			cfg.QuietKillAfter = parsed
 			cfg.QuietKillAfterSet = true
+		case "permission_policy_observation_enabled":
+			parsed, err := parseConfigBool(value)
+			if err != nil {
+				return DaemonRuntimeConfig{}, fmt.Errorf("parse [daemon].permission_policy_observation_enabled: %w", err)
+			}
+			cfg.PermissionPolicyObservationEnabled = parsed
+			cfg.PermissionPolicyObservationEnabledSet = true
 		default:
 			// Unknown keys are ignored so the section can grow (e.g. #576 per-repo
 			// caps) without breaking older binaries.

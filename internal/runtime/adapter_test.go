@@ -758,14 +758,14 @@ func TestCodexSandboxArgsProduceGrants(t *testing.T) {
 		WritablePaths:  []string{"/data/one", "/data/two"},
 		ProduceNetwork: true,
 	}
-	args := codexSandboxArgs(agent, "")
+	args, _ := codexSandboxArgs(agent, "")
 	want := []string{"--sandbox", "workspace-write", "--add-dir", "/data/one", "--add-dir", "/data/two", "-c", "sandbox_workspace_write.network_access=true"}
 	if !reflect.DeepEqual(args, want) {
 		t.Fatalf("codexSandboxArgs = %v, want %v", args, want)
 	}
 	danger := agent
 	danger.AutonomyPolicy = AutonomyPolicyDangerFullAccess
-	if got := codexSandboxArgs(danger, ""); !reflect.DeepEqual(got, []string{"--sandbox", "danger-full-access"}) {
+	if got, _ := codexSandboxArgs(danger, ""); !reflect.DeepEqual(got, []string{"--sandbox", "danger-full-access"}) {
 		t.Fatalf("danger-full-access produce args = %v, want no leaked grants", got)
 	}
 	for _, runtimeName := range []string{CodexRuntime, ClaudeRuntime, KimiRuntime} {
@@ -781,13 +781,28 @@ func TestCodexSandboxArgsProduceGrants(t *testing.T) {
 	}
 }
 
+func TestCodexReadOnlyChatSeatReportsWidenedFromBuiltArgv(t *testing.T) {
+	agent := Agent{AutonomyPolicy: AutonomyPolicyReadOnly, ChatSeat: true}
+	args, property := codexSandboxArgs(agent, "")
+	if property != PermissionPolicyWidened {
+		t.Fatalf("permission-policy application = %q, want widened", property)
+	}
+	if !reflect.DeepEqual(args, []string{"--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"}) {
+		t.Fatalf("chat-seat argv = %v, want workspace-write plus network", args)
+	}
+	if declared := ResolvePermissionPolicyApplication(CodexAdapter{}, agent); declared != PermissionPolicyWidened {
+		t.Fatalf("adapter-declared permission-policy application = %q, want widened", declared)
+	}
+}
+
 func TestClaudeKimiProducePermissionArgs(t *testing.T) {
 	agent := Agent{
 		AutonomyPolicy: AutonomyPolicyWorkspaceWrite,
 		ReadablePaths:  []string{"/input/one"},
 		WritablePaths:  []string{"/data/one", " ", "/data/two"},
 	}
-	if got, want := claudePermissionArgs(agent), []string{"--permission-mode", "acceptEdits", "--add-dir", "/data/one", "--add-dir", "/data/two", "--add-dir", "/input/one"}; !reflect.DeepEqual(got, want) {
+	if got, _ := claudePermissionArgs(agent); !reflect.DeepEqual(got, []string{"--permission-mode", "acceptEdits", "--add-dir", "/data/one", "--add-dir", "/data/two", "--add-dir", "/input/one"}) {
+		want := []string{"--permission-mode", "acceptEdits", "--add-dir", "/data/one", "--add-dir", "/data/two", "--add-dir", "/input/one"}
 		t.Fatalf("claudePermissionArgs = %v, want %v", got, want)
 	}
 	if got, want := kimiPermissionArgs(agent), []string{"--add-dir", "/data/one", "--add-dir", "/data/two", "--add-dir", "/input/one"}; !reflect.DeepEqual(got, want) {
@@ -796,7 +811,8 @@ func TestClaudeKimiProducePermissionArgs(t *testing.T) {
 	withoutPaths := agent
 	withoutPaths.ReadablePaths = nil
 	withoutPaths.WritablePaths = nil
-	if got, want := claudePermissionArgs(withoutPaths), []string{"--permission-mode", "acceptEdits"}; !reflect.DeepEqual(got, want) {
+	if got, _ := claudePermissionArgs(withoutPaths); !reflect.DeepEqual(got, []string{"--permission-mode", "acceptEdits"}) {
+		want := []string{"--permission-mode", "acceptEdits"}
 		t.Fatalf("non-produce Claude args = %v, want %v", got, want)
 	}
 	if got := kimiPermissionArgs(withoutPaths); got != nil {

@@ -291,6 +291,52 @@ type Adapter interface {
 	Capabilities(ctx context.Context) ([]string, error)
 }
 
+// PermissionPolicyApplication is the adapter-declared relationship between an
+// agent's stored autonomy policy and the permission argv the adapter builds.
+// It reports only what gitmoot put on argv; it does not infer ambient runtime
+// configuration or claim what the subprocess ultimately enforced.
+type PermissionPolicyApplication string
+
+const (
+	PermissionPolicyApplied    PermissionPolicyApplication = "applied"
+	PermissionPolicyWidened    PermissionPolicyApplication = "widened"
+	PermissionPolicyNotApplied PermissionPolicyApplication = "not-applied"
+	PermissionPolicyUnresolved PermissionPolicyApplication = "unresolved"
+)
+
+// PermissionPolicyApplicationProvider is optional so delivery-only test and
+// plugin adapters remain source-compatible. Every built-in runtime implements
+// it; consumers must treat an adapter without the declaration as not-applied.
+type PermissionPolicyApplicationProvider interface {
+	PermissionPolicyApplication(agent Agent) PermissionPolicyApplication
+}
+
+// DeclaredPermissionPolicyApplication asks the adapter that builds argv instead
+// of maintaining a runtime-name roster beside it. A future adapter that gains a
+// real mapping changes its declaration, and every consumer follows automatically.
+func DeclaredPermissionPolicyApplication(adapter any, agent Agent) (PermissionPolicyApplication, bool) {
+	provider, ok := adapter.(PermissionPolicyApplicationProvider)
+	if !ok {
+		return "", false
+	}
+	switch property := provider.PermissionPolicyApplication(agent); property {
+	case PermissionPolicyApplied, PermissionPolicyWidened, PermissionPolicyNotApplied, PermissionPolicyUnresolved:
+		return property, true
+	default:
+		return PermissionPolicyNotApplied, true
+	}
+}
+
+// ResolvePermissionPolicyApplication returns the adapter's declaration and
+// defaults adapters without one to not-applied.
+func ResolvePermissionPolicyApplication(adapter any, agent Agent) PermissionPolicyApplication {
+	property, ok := DeclaredPermissionPolicyApplication(adapter, agent)
+	if !ok {
+		return PermissionPolicyNotApplied
+	}
+	return property
+}
+
 type Factory struct {
 	Runner subprocess.Runner
 }
@@ -532,11 +578,17 @@ type CodexAdapter struct {
 
 func (a CodexAdapter) Name() string { return CodexRuntime }
 
+func (a CodexAdapter) PermissionPolicyApplication(agent Agent) PermissionPolicyApplication {
+	_, property := codexSandboxArgs(agent, a.Dir)
+	return property
+}
+
 func (a CodexAdapter) Start(ctx context.Context, request StartRequest) (StartResult, error) {
 	if err := validateStartRequest(request.Agent, a.Name(), request.Prompt); err != nil {
 		return StartResult{}, err
 	}
-	args := append([]string{"exec"}, codexSandboxArgs(request.Agent, a.Dir)...)
+	sandboxArgs, _ := codexSandboxArgs(request.Agent, a.Dir)
+	args := append([]string{"exec"}, sandboxArgs...)
 	if request.Agent.Model != "" {
 		args = append(args, "--model", request.Agent.Model)
 	}
@@ -627,7 +679,8 @@ func (a CodexAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 // ("instructions are read from stdin"). Routing oversize prompts through stdin is
 // deferred to a follow-up; #723 fixes kimi, which offers no stdin/file channel.
 func codexDeliverArgs(agent Agent, dir, prompt, model string, effort string, jsonOutput bool) []string {
-	args := append([]string{"exec"}, codexSandboxArgs(agent, dir)...)
+	sandboxArgs, _ := codexSandboxArgs(agent, dir)
+	args := append([]string{"exec"}, sandboxArgs...)
 	if jsonOutput {
 		args = append(args, "--json")
 	}
@@ -813,7 +866,7 @@ func effectiveEffort(agent Agent, job Job) string {
 	return strings.TrimSpace(job.RuntimeDefaultEffort)
 }
 
-func codexSandboxArgs(agent Agent, workdir string) []string {
+func codexSandboxArgs(agent Agent, workdir string) ([]string, PermissionPolicyApplication) {
 	// #732: a moot/chat seat must reach the daemon chat-relay unix socket, but a
 	// codex read-only sandbox blocks the connect() syscall itself (empirically
 	// probed on codex-cli 0.142.4 bubblewrap+seccomp). Dispatch the seat with
@@ -823,13 +876,14 @@ func codexSandboxArgs(agent Agent, workdir string) []string {
 	// (does not depend on the operator's global ~/.codex/config.toml). A seat's
 	// whole job is chat, not git, so it takes no #805 gitdir grant.
 	if agent.ChatSeat {
-		return []string{"--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"}
+		return []string{"--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"}, PermissionPolicyWidened
 	}
 	switch NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
 	case AutonomyPolicyReadOnly:
-		return []string{"--sandbox", "read-only"}
+		return []string{"--sandbox", "read-only"}, PermissionPolicyApplied
 	case AutonomyPolicyWorkspaceWrite:
 		args := []string{"--sandbox", "workspace-write"}
+		property := PermissionPolicyApplied
 		// #805: a linked-worktree checkout keeps its real git metadata under the
 		// main repo's .git/worktrees/<name>, OUTSIDE workspace-write's writable
 		// roots, so every metadata-writing git operation (status refresh, add,
@@ -842,22 +896,25 @@ func codexSandboxArgs(agent Agent, workdir string) []string {
 		// byte-identical.
 		if gitdir := linkedWorktreeGitDir(workdir); gitdir != "" {
 			args = append(args, "--add-dir", gitdir)
+			property = PermissionPolicyWidened
 		}
 		for _, path := range agent.WritablePaths {
 			if path = strings.TrimSpace(path); path != "" {
 				args = append(args, "--add-dir", path)
+				property = PermissionPolicyWidened
 			}
 		}
 		if agent.ProduceNetwork {
 			args = append(args, "-c", "sandbox_workspace_write.network_access=true")
+			property = PermissionPolicyWidened
 		}
-		return args
+		return args, property
 	case AutonomyPolicyDangerFullAccess:
 		// Full access is already unrestricted. Produce-only workspace grants and
 		// network configuration must not leak into this policy's argv.
-		return []string{"--sandbox", "danger-full-access"}
+		return []string{"--sandbox", "danger-full-access"}, PermissionPolicyApplied
 	default:
-		return nil
+		return nil, PermissionPolicyNotApplied
 	}
 }
 
@@ -940,6 +997,11 @@ type ClaudeAdapter struct {
 
 func (a ClaudeAdapter) Name() string { return ClaudeRuntime }
 
+func (a ClaudeAdapter) PermissionPolicyApplication(agent Agent) PermissionPolicyApplication {
+	_, property := claudePermissionArgs(agent)
+	return property
+}
+
 func (a ClaudeAdapter) Start(ctx context.Context, request StartRequest) (StartResult, error) {
 	if err := validateStartRequest(request.Agent, a.Name(), request.Prompt); err != nil {
 		return StartResult{}, err
@@ -948,7 +1010,7 @@ func (a ClaudeAdapter) Start(ctx context.Context, request StartRequest) (StartRe
 	if err != nil {
 		return StartResult{}, err
 	}
-	args := claudePermissionArgs(request.Agent)
+	args, _ := claudePermissionArgs(request.Agent)
 	if request.Agent.Model != "" {
 		args = append(args, "--model", request.Agent.Model)
 	}
@@ -1263,7 +1325,7 @@ func isClaude401SocketClosed(result subprocess.Result, err error) bool {
 // preserves per-agent isolation rather than collapsing onto the shared --continue
 // path.
 func claudeFreshSessionArgs(agent Agent, prompt string, model string, sessionID string) []string {
-	args := claudePermissionArgs(agent)
+	args, _ := claudePermissionArgs(agent)
 	if model != "" {
 		args = append(args, "--model", model)
 	}
@@ -1331,6 +1393,10 @@ type ShellAdapter struct {
 }
 
 func (a ShellAdapter) Name() string { return ShellRuntime }
+
+func (a ShellAdapter) PermissionPolicyApplication(Agent) PermissionPolicyApplication {
+	return PermissionPolicyNotApplied
+}
 
 func (a ShellAdapter) Start(ctx context.Context, request StartRequest) (StartResult, error) {
 	if err := validateStartRequest(request.Agent, a.Name(), request.Prompt); err != nil {
@@ -1700,7 +1766,7 @@ func newUUID() (string, error) {
 // is supplied. Routing oversize prompts through stdin is deferred to a follow-up;
 // #723 fixes kimi, which offers no stdin/file channel.
 func claudeArgs(agent Agent, prompt string, jsonOutput bool, model string) []string {
-	args := claudePermissionArgs(agent)
+	args, _ := claudePermissionArgs(agent)
 	if model != "" {
 		args = append(args, "--model", model)
 	}
@@ -1716,19 +1782,26 @@ func claudeArgs(agent Agent, prompt string, jsonOutput bool, model string) []str
 	return append(args, "--", prompt)
 }
 
-func claudePermissionArgs(agent Agent) []string {
+func claudePermissionArgs(agent Agent) ([]string, PermissionPolicyApplication) {
 	var args []string
+	property := PermissionPolicyNotApplied
 	switch NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
 	case AutonomyPolicyReadOnly:
 		args = []string{"--permission-mode", "plan"}
+		property = PermissionPolicyApplied
 	case AutonomyPolicyWorkspaceWrite:
 		args = []string{"--permission-mode", "acceptEdits"}
+		property = PermissionPolicyApplied
 	case AutonomyPolicyDangerFullAccess:
 		args = []string{"--permission-mode", "bypassPermissions"}
+		property = PermissionPolicyApplied
 	}
 	for _, path := range agent.WritablePaths {
 		if path = strings.TrimSpace(path); path != "" {
 			args = append(args, "--add-dir", path)
+			if property == PermissionPolicyApplied && NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) != AutonomyPolicyDangerFullAccess {
+				property = PermissionPolicyWidened
+			}
 		}
 	}
 	for _, path := range agent.ReadablePaths {
@@ -1736,9 +1809,12 @@ func claudePermissionArgs(agent Agent) []string {
 			// Claude's --add-dir is the Read-tool visibility gate. Landlock is
 			// the enforcement boundary that keeps this subset read-only.
 			args = append(args, "--add-dir", path)
+			if property == PermissionPolicyApplied && NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) != AutonomyPolicyDangerFullAccess {
+				property = PermissionPolicyWidened
+			}
 		}
 	}
-	return args
+	return args, property
 }
 
 func isClaudeJSONUnsupported(result subprocess.Result) bool {

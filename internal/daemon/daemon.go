@@ -71,6 +71,9 @@ type Daemon struct {
 	// Default false is a CHEAP SHORT-CIRCUIT: PollOnce parses NO PR body and fires
 	// nothing, so the off path is byte-identical (no new GitHub reads, no new work).
 	RevertDetectionEnabled bool
+	// ObservePermissionPolicy opts this daemon into the live-store
+	// #1484 ratchet. False is a cheap short-circuit with no inventory query.
+	ObservePermissionPolicy bool
 	// AutoMergeEnabled resolves the current native auto_merge policy for this
 	// repository. When it turns on, only tasks parked by the auto-merge-disabled
 	// leave-open reason are re-armed. Nil preserves direct daemon users' behavior.
@@ -225,6 +228,13 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	// fires the corrective harvest best-effort; an error never aborts the poll.
 	if d.RevertDetectionEnabled {
 		if err := d.harvestRevertsOnce(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	// Permission-policy visibility is warn-only and best-effort. An observation
+	// error contributes to firstErr but never aborts the remaining poll chain.
+	if d.ObservePermissionPolicy {
+		if err := d.reconcilePermissionPolicyObservation(ctx); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

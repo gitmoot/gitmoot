@@ -20,6 +20,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/permissionpolicy"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/sandbox"
@@ -42,6 +43,7 @@ type jobWorker struct {
 	// still pass the raw --home so the config is actually found.
 	ConfigHome         string
 	ConfigHomeExplicit bool
+	AgentLookup        func(context.Context, string) (db.Agent, error)
 	AdapterFactory     func(runtime.Agent, string) (workflow.DeliveryAdapter, error)
 	// OutputAdapterFactory rebuilds a production runtime adapter around the one
 	// shared live-output writer used by pipeline progress and cockpit. Tests that
@@ -189,8 +191,15 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		// returns; uses a background context so cleanup survives ctx cancel.
 		defer w.cleanupTempWorker(context.Background(), job.Agent)
 	}
-	dbAgent, err := w.Store.GetAgent(ctx, job.Agent)
+	dbAgent, err := w.lookupAgent(ctx, job.Agent)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			if _, warningErr := permissionpolicy.RecordWarning(ctx, w.Store, job, runtime.Agent{Name: job.Agent}, permissionpolicy.StaticProvider{Property: runtime.PermissionPolicyUnresolved}, time.Now()); warningErr != nil {
+				writeLine(w.Stdout, "job %s permission-policy observation failed: %v", job.ID, warningErr)
+			}
+		} else {
+			writeLine(w.Stdout, "job %s permission-policy observation skipped: agent lookup failed: %v", job.ID, err)
+		}
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
@@ -325,6 +334,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
+	}
+	if _, warningErr := permissionpolicy.RecordWarning(ctx, w.Store, job, agent, adapter, time.Now()); warningErr != nil {
+		writeLine(w.Stdout, "job %s permission-policy observation failed: %v", job.ID, warningErr)
 	}
 	managed, err := w.managedJobConfig(ctx, agent.Name)
 	if err != nil {
@@ -707,6 +719,13 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	_ = w.postJobResultComment(ctx, job.ID, agent, checkout, nil)
 	writeLine(w.Stdout, "job %s completed", job.ID)
 	return nil
+}
+
+func (w jobWorker) lookupAgent(ctx context.Context, name string) (db.Agent, error) {
+	if w.AgentLookup != nil {
+		return w.AgentLookup(ctx, name)
+	}
+	return w.Store.GetAgent(ctx, name)
 }
 
 // applyProduceRuntimeGrants performs the final delivery-time path check and only
