@@ -45,7 +45,10 @@ var ignoredWalkRoots = map[string]bool{
 }
 
 var jobStateWriteAllowlist = map[string]int{
-	"internal/db/store_jobs.go": 8,
+	// The ninth writer closes externally driven session work with caller-supplied
+	// model and token evidence in one transaction, and carries the shared
+	// bumpLifecycleGenerationSQL fragment like every other state assignment.
+	"internal/db/store_jobs.go": 9,
 }
 
 // TestEveryJobStateWriteBumpsTheLifecycleGeneration enforces the seam #1407's design rests on.
