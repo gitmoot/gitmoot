@@ -136,8 +136,9 @@ For engine dispatch, Gitmoot records what permission-policy argv it supplied:
 The result is derived by the argv builder itself. A `not-applied` warning means
 Gitmoot supplied no policy flag; it does not claim the job was unsandboxed, since
 ambient runtime configuration may still constrain it. Warnings are structured,
-coalesced per agent configuration, and never refuse or block work. Interactive
-coordinator sessions are outside this engine-dispatch instrumentation.
+coalesced per agent configuration and capability, and never refuse or block
+work. Interactive coordinator sessions are outside this engine-dispatch
+instrumentation.
 
 #### Shell runtime risk acceptance (2026-08-05)
 

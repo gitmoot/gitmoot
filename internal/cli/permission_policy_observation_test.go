@@ -1,9 +1,12 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/config"
@@ -150,5 +153,66 @@ func TestPermissionPolicyDoctorReportsLiveDelta(t *testing.T) {
 	check, ok := permissionPolicyObservationDoctorCheck(paths)
 	if !ok || check.OK || check.Detail != "current=1 baseline=0 delta=+1" {
 		t.Fatalf("doctor check = %#v, present=%t", check, ok)
+	}
+}
+
+func TestPermissionPolicyDoctorRejectsEqualCountChurn(t *testing.T) {
+	ctx := context.Background()
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := permissionpolicy.Keys([]permissionpolicy.Config{
+		{Agent: "baseline-a", Runtime: runtime.ShellRuntime, Policy: runtime.AutonomyPolicyAuto, Property: runtime.PermissionPolicyNotApplied},
+		{Agent: "baseline-b", Runtime: runtime.ShellRuntime, Policy: runtime.AutonomyPolicyAuto, Property: runtime.PermissionPolicyNotApplied},
+		{Agent: "baseline-c", Runtime: runtime.ShellRuntime, Policy: runtime.AutonomyPolicyAuto, Property: runtime.PermissionPolicyNotApplied},
+	})
+	if _, _, err := store.InitializePermissionPolicyObservationBaseline(ctx, baseline); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"new-x", "new-y", "new-z"} {
+		if err := store.UpsertAgent(ctx, db.Agent{Name: name, Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", AutonomyPolicy: runtime.AutonomyPolicyAuto, Capabilities: []string{"ask"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	check, ok := permissionPolicyObservationDoctorCheck(paths)
+	if !ok || check.OK || check.Detail != "current=3 baseline=3 delta=+0" {
+		t.Fatalf("doctor equal-count churn check = %#v, present=%t; new configs must not report OK", check, ok)
+	}
+}
+
+func TestPermissionPolicyTransientAgentLookupDoesNotClaimUnresolved(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerAgent(t, store, "policy-agent", runtime.ShellRuntime, "printf done", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "transient-lookup-job", Agent: "policy-agent", Action: "ask", Repo: "owner/repo", Branch: "main"})
+	job, err := store.GetJob(ctx, "transient-lookup-job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookupErr := errors.New("database is locked")
+	var output bytes.Buffer
+	worker := defaultJobWorker(store, &output)
+	worker.AgentLookup = func(context.Context, string) (db.Agent, error) {
+		return db.Agent{}, lookupErr
+	}
+	if err := worker.run(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range mustListJobEvents(t, store, job.ID) {
+		if event.Kind == permissionpolicy.WarningEventKind {
+			t.Fatalf("transient agent lookup wrote unresolved claim: %s", event.Message)
+		}
+	}
+	if !strings.Contains(output.String(), "permission-policy observation skipped: agent lookup failed: database is locked") {
+		t.Fatalf("worker output = %q, want transient lookup failure log", output.String())
 	}
 }

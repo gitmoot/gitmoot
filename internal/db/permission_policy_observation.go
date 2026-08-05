@@ -72,17 +72,23 @@ func (s *Store) InitializePermissionPolicyObservationBaseline(ctx context.Contex
 	return baseline, ok && affected == 1, err
 }
 
-// LowerPermissionPolicyObservationBaseline is the one-way ratchet. A lower live
-// count advances the baseline; equal or larger counts leave it untouched.
-func (s *Store) LowerPermissionPolicyObservationBaseline(ctx context.Context, configs []string) (bool, error) {
+// LowerPermissionPolicyObservationBaseline is the one-way ratchet. The caller
+// supplies the baseline it compared so a concurrent update cannot absorb a
+// config that was not in that recorded set.
+func (s *Store) LowerPermissionPolicyObservationBaseline(ctx context.Context, previous, configs []string) (bool, error) {
+	previous = normalizePermissionPolicyConfigs(previous)
 	configs = normalizePermissionPolicyConfigs(configs)
 	raw, err := json.Marshal(configs)
 	if err != nil {
 		return false, err
 	}
+	previousRaw, err := json.Marshal(previous)
+	if err != nil {
+		return false, err
+	}
 	result, err := s.db.ExecContext(ctx, `UPDATE permission_policy_observation_baseline
 		SET affected_count = ?, configs_json = ?, updated_at = CURRENT_TIMESTAMP
-		WHERE id = 1 AND affected_count > ?`, len(configs), string(raw), len(configs))
+		WHERE id = 1 AND configs_json = ?`, len(configs), string(raw), string(previousRaw))
 	if err != nil {
 		return false, err
 	}
@@ -90,16 +96,16 @@ func (s *Store) LowerPermissionPolicyObservationBaseline(ctx context.Context, co
 	return affected == 1, err
 }
 
-// ClaimPermissionPolicyWarning atomically coalesces a warning by agent-config
-// and window and writes the winning job event in the same transaction.
-func (s *Store) ClaimPermissionPolicyWarning(ctx context.Context, agent, runtimeName, policy, windowStart string, event JobEvent) (bool, error) {
+// ClaimPermissionPolicyWarning atomically coalesces a warning by agent-config,
+// capability, and window and writes the winning job event in the same transaction.
+func (s *Store) ClaimPermissionPolicyWarning(ctx context.Context, agent, runtimeName, policy, capability, windowStart string, event JobEvent) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO permission_policy_warning_claims(agent, runtime, policy, window_start, job_id)
-		VALUES (?, ?, ?, ?, ?)`, agent, runtimeName, policy, windowStart, event.JobID)
+	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO permission_policy_warning_claims(agent, runtime, policy, capability, window_start, job_id)
+		VALUES (?, ?, ?, ?, ?, ?)`, agent, runtimeName, policy, capability, windowStart, event.JobID)
 	if err != nil {
 		return false, err
 	}

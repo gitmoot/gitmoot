@@ -129,3 +129,61 @@ func TestInventoryLabelsMissingAgentAsUnresolved(t *testing.T) {
 		t.Fatalf("missing-agent config = %#v, want agent deleted-agent with unknown runtime and policy and property %q", got, runtime.PermissionPolicyUnresolved)
 	}
 }
+
+func TestWarningCoalescesSeparatelyByCapability(t *testing.T) {
+	store := observationStore(t)
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	agent := runtime.Agent{Name: "same", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", AutonomyPolicy: runtime.AutonomyPolicyAuto}
+	for _, job := range []db.Job{
+		{ID: "ask-job", Agent: agent.Name, Type: "ask"},
+		{ID: "implement-job", Agent: agent.Name, Type: "implement"},
+	} {
+		warned, err := RecordWarning(context.Background(), store, job, agent, StaticProvider{Property: runtime.PermissionPolicyNotApplied}, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !warned {
+			t.Fatalf("%s warning was coalesced across capability", job.Type)
+		}
+		if got := warningFor(t, store, job.ID).Capability; got != job.Type {
+			t.Fatalf("warning capability = %q, want %q", got, job.Type)
+		}
+	}
+}
+
+func TestInventoryLabelsUnknownRuntimeAsUnresolvedAndContinues(t *testing.T) {
+	ctx := context.Background()
+	store := observationStore(t)
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name: "stale-runtime", Runtime: "removed-runtime", AutonomyPolicy: runtime.AutonomyPolicyReadOnly,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	configs, err := Inventory(ctx, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(configs) != 1 {
+		t.Fatalf("inventory = %#v, want one unresolved runtime config", configs)
+	}
+	if got := configs[0]; got.Agent != "stale-runtime" || got.Runtime != "removed-runtime" || got.Policy != runtime.AutonomyPolicyReadOnly || got.Property != runtime.PermissionPolicyUnresolved {
+		t.Fatalf("unknown-runtime config = %#v, want unresolved with the stored identity", got)
+	}
+}
+
+func TestRecordWarningDefaultsUndeclaredAdapterToNotApplied(t *testing.T) {
+	store := observationStore(t)
+	job := db.Job{ID: "undeclared-job", Agent: "plugin-agent", Type: "ask"}
+	agent := runtime.Agent{Name: job.Agent, Runtime: "plugin", AutonomyPolicy: runtime.AutonomyPolicyReadOnly}
+	warned, err := RecordWarning(context.Background(), store, job, agent, struct{}{}, time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !warned {
+		t.Fatal("adapter without a permission-policy declaration emitted no warning")
+	}
+	if got := warningFor(t, store, job.ID).Property; got != runtime.PermissionPolicyNotApplied {
+		t.Fatalf("undeclared adapter property = %q, want %q", got, runtime.PermissionPolicyNotApplied)
+	}
+}

@@ -1966,7 +1966,7 @@ ALTER TABLE jobs ADD COLUMN lifecycle_generation INTEGER NOT NULL DEFAULT 0
 	// #1484 permission-policy visibility. The singleton baseline lives beside the
 	// live agent inventory it measures; CI has no home-scoped fleet and therefore
 	// cannot honestly own this value. Warning claims make the per-agent-config
-	// window coalescing atomic across concurrent workers.
+	// and capability window coalescing atomic across concurrent workers.
 	`
 CREATE TABLE permission_policy_observation_baseline (
 	id INTEGER PRIMARY KEY CHECK(id = 1),
@@ -1979,10 +1979,11 @@ CREATE TABLE permission_policy_warning_claims (
 	agent TEXT NOT NULL,
 	runtime TEXT NOT NULL,
 	policy TEXT NOT NULL,
+	capability TEXT NOT NULL,
 	window_start TEXT NOT NULL,
 	job_id TEXT NOT NULL,
 	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-	PRIMARY KEY(agent, runtime, policy, window_start)
+	PRIMARY KEY(agent, runtime, policy, capability, window_start)
 );
 	`,
 }

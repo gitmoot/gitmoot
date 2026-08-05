@@ -13,7 +13,7 @@ type permissionPolicyBaselineEvent struct {
 	Baseline int      `json:"baseline"`
 	Current  int      `json:"current"`
 	Delta    int      `json:"delta"`
-	Configs  []string `json:"configs,omitempty"`
+	Configs  []string `json:"configs"`
 }
 
 func (d Daemon) reconcilePermissionPolicyObservation(ctx context.Context) error {
@@ -31,27 +31,28 @@ func (d Daemon) reconcilePermissionPolicyObservation(ctx context.Context) error 
 			Baseline: len(keys), Current: len(keys), Delta: 0, Configs: describePermissionPolicyKeys(keys),
 		})
 	}
-	if len(keys) < baseline.AffectedCount {
-		lowered, err := d.Store.LowerPermissionPolicyObservationBaseline(ctx, keys)
+	newConfigs := permissionpolicy.NewSinceBaseline(configs, baseline.Configs)
+	if len(newConfigs) > 0 {
+		return addPermissionPolicyObservationEvent(ctx, d.Store, permissionpolicy.BaselineGrowthEventKind, permissionPolicyBaselineEvent{
+			Baseline: baseline.AffectedCount,
+			Current:  len(keys),
+			Delta:    len(keys) - baseline.AffectedCount,
+			Configs:  newConfigs,
+		})
+	}
+	if len(keys) < len(baseline.Configs) {
+		lowered, err := d.Store.LowerPermissionPolicyObservationBaseline(ctx, baseline.Configs, keys)
 		if err != nil {
 			return fmt.Errorf("lower permission-policy baseline: %w", err)
 		}
 		if lowered {
 			return addPermissionPolicyObservationEvent(ctx, d.Store, permissionpolicy.BaselineLoweredEventKind, permissionPolicyBaselineEvent{
-				Baseline: baseline.AffectedCount, Current: len(keys), Delta: len(keys) - baseline.AffectedCount,
+				Baseline: baseline.AffectedCount, Current: len(keys), Delta: len(keys) - baseline.AffectedCount, Configs: newConfigs,
 			})
 		}
 		return nil
 	}
-	if len(keys) <= baseline.AffectedCount {
-		return nil
-	}
-	return addPermissionPolicyObservationEvent(ctx, d.Store, permissionpolicy.BaselineGrowthEventKind, permissionPolicyBaselineEvent{
-		Baseline: baseline.AffectedCount,
-		Current:  len(keys),
-		Delta:    len(keys) - baseline.AffectedCount,
-		Configs:  permissionpolicy.NewSinceBaseline(configs, baseline.Configs),
-	})
+	return nil
 }
 
 func addPermissionPolicyObservationEvent(ctx context.Context, store *db.Store, kind string, event permissionPolicyBaselineEvent) error {

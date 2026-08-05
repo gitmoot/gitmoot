@@ -40,8 +40,9 @@ home-store baseline, and the delta. This is instrumentation, not protection:
 `not-applied` means Gitmoot supplied no permission-policy flag, not that the job
 was unsandboxed. Arm the off-by-default daemon ratchet with
 `[daemon].permission_policy_observation_enabled = true`; its first live tick
-records the baseline, later growth emits a structured event naming the new agent
-configurations, and improvement lowers the baseline.
+records the baseline, any newly introduced configuration emits a structured
+event even if the total is unchanged or lower, and only a strict subset lowers
+the baseline.
 It also reports the SQLite auto-vacuum mode. New homes use bounded incremental
 reclaim automatically. A legacy home remains a non-blocking warning until an
 operator deliberately converts it during an idle maintenance window:
@@ -631,10 +632,10 @@ For engine-dispatched jobs, adapters also declare `applied`, `widened`, or
 `not-applied` as a by-product of building argv; a missing agent row is
 `unresolved`. `not-applied` and `unresolved` emit a structured, warn-only job
 event with runtime, policy, capability, job id, property, and agent name,
-coalesced once per agent configuration per 24-hour window. The job still runs.
-Ambient runtime config may provide a sandbox Gitmoot cannot observe, so this
-event never claims the process was unsandboxed. Interactive coordinator sessions
-are unaffected.
+coalesced once per agent configuration and capability per 24-hour window. The
+job still runs. Ambient runtime config may provide a sandbox Gitmoot cannot
+observe, so this event never claims the process was unsandboxed. Interactive
+coordinator sessions are unaffected.
 
 Because of this, an agent that carries the `implement` capability **must** be
 started/subscribed with a write policy. Gitmoot fails closed: `--capability

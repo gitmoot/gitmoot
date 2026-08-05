@@ -32,8 +32,9 @@ func permissionPolicyObservationDoctorCheck(paths config.Paths) (doctor.Check, b
 		}, true
 	}
 	delta := len(configs) - baseline.AffectedCount
+	newConfigs := permissionpolicy.NewSinceBaseline(configs, baseline.Configs)
 	return doctor.Check{
-		Name: "permission-policy observation", OK: delta <= 0, Required: false,
+		Name: "permission-policy observation", OK: delta <= 0 && len(newConfigs) == 0, Required: false,
 		Detail: fmt.Sprintf("current=%d baseline=%d delta=%+d", len(configs), baseline.AffectedCount, delta),
 	}, true
 }

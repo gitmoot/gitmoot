@@ -79,7 +79,12 @@ func Inventory(ctx context.Context, store *db.Store) ([]Config, error) {
 		}
 		adapter, err := factory.Adapter(agent.Runtime)
 		if err != nil {
-			return nil, fmt.Errorf("resolve permission-policy adapter for agent %q: %w", agent.Name, err)
+			configs = append(configs, Config{
+				Agent: agent.Name, Runtime: agent.Runtime,
+				Policy:   runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy),
+				Property: runtime.PermissionPolicyUnresolved,
+			})
+			continue
 		}
 		property := Resolve(adapter, agent)
 		if property == runtime.PermissionPolicyNotApplied {
@@ -119,7 +124,7 @@ func NewSinceBaseline(current []Config, baseline []string) []string {
 	for _, key := range baseline {
 		known[key] = struct{}{}
 	}
-	var result []string
+	result := make([]string, 0)
 	for _, config := range current {
 		if _, ok := known[config.Key()]; !ok {
 			result = append(result, config.String())
@@ -132,10 +137,7 @@ func NewSinceBaseline(current []Config, baseline []string) []string {
 // or delivery control flow. FOR READ-ONLY WORK, REFUSING THE JOB IS NOT
 // ENFORCEMENT; THE DEFECT IS THAT IT RUNS UNENFORCED.
 func RecordWarning(ctx context.Context, store *db.Store, job db.Job, agent runtime.Agent, adapter any, now time.Time) (bool, error) {
-	property, declared := runtime.DeclaredPermissionPolicyApplication(adapter, agent)
-	if !declared {
-		return false, nil
-	}
+	property := Resolve(adapter, agent)
 	if property != runtime.PermissionPolicyNotApplied && property != runtime.PermissionPolicyUnresolved {
 		return false, nil
 	}
@@ -155,7 +157,7 @@ func RecordWarning(ctx context.Context, store *db.Store, job db.Job, agent runti
 		return false, err
 	}
 	windowStart := now.UTC().Truncate(WarningWindow).Format(time.RFC3339)
-	return store.ClaimPermissionPolicyWarning(ctx, warning.Agent, warning.Runtime, warning.Policy, windowStart, db.JobEvent{
+	return store.ClaimPermissionPolicyWarning(ctx, warning.Agent, warning.Runtime, warning.Policy, warning.Capability, windowStart, db.JobEvent{
 		JobID: job.ID, Kind: WarningEventKind, Message: string(raw),
 	})
 }

@@ -3,6 +3,8 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -66,4 +68,104 @@ func TestPermissionPolicyObservationBaselineRatchetsDownAndWarnsOnGrowth(t *test
 	if err != nil || !ok || baseline.AffectedCount != 0 {
 		t.Fatalf("lowered baseline = %#v, ok=%t, err=%v", baseline, ok, err)
 	}
+}
+
+func TestPermissionPolicyObservationDoesNotLowerAcrossNewConfigs(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	upsert := func(name string) {
+		t.Helper()
+		if err := store.UpsertAgent(ctx, db.Agent{Name: name, Runtime: "shell", RuntimeRef: "printf ok", AutonomyPolicy: "auto", Capabilities: []string{"ask"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	baselineNames := []string{"baseline-a", "baseline-b", "baseline-c", "baseline-d", "baseline-e", "baseline-f", "baseline-g", "baseline-h", "baseline-i", "baseline-j"}
+	for _, name := range baselineNames {
+		upsert(name)
+	}
+	d := Daemon{Store: store}
+	if err := d.reconcilePermissionPolicyObservation(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range baselineNames[:4] {
+		removed, err := store.RemoveAgent(ctx, name)
+		if err != nil || !removed {
+			t.Fatalf("RemoveAgent(%q) = %t, %v", name, removed, err)
+		}
+	}
+	for _, name := range []string{"new-x", "new-y", "new-z"} {
+		upsert(name)
+	}
+
+	if err := d.reconcilePermissionPolicyObservation(ctx); err != nil {
+		t.Fatal(err)
+	}
+	baseline, ok, err := store.PermissionPolicyObservationBaseline(ctx)
+	if err != nil || !ok || baseline.AffectedCount != 10 {
+		t.Fatalf("baseline after 10 -> 9 churn = %#v, ok=%t, err=%v; new configs must not be absorbed by a lower count", baseline, ok, err)
+	}
+	event := permissionPolicyObservationEventOfKind(t, store, permissionpolicy.BaselineGrowthEventKind)
+	if event.Baseline != 10 || event.Current != 9 || event.Delta != -1 {
+		t.Fatalf("new-config event = %#v, want baseline=10 current=9 delta=-1", event)
+	}
+	for _, name := range []string{"new-x", "new-y", "new-z"} {
+		if !strings.Contains(strings.Join(event.Configs, "\n"), fmt.Sprintf("agent=%q", name)) {
+			t.Fatalf("new-config event = %#v, want reported agent %q", event, name)
+		}
+	}
+}
+
+func TestPermissionPolicyObservationReportsEqualCountChurn(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	upsert := func(name string) {
+		t.Helper()
+		if err := store.UpsertAgent(ctx, db.Agent{Name: name, Runtime: "shell", RuntimeRef: "printf ok", AutonomyPolicy: "auto", Capabilities: []string{"ask"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{"baseline-a", "baseline-b", "baseline-c"} {
+		upsert(name)
+	}
+	d := Daemon{Store: store}
+	if err := d.reconcilePermissionPolicyObservation(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"baseline-a", "baseline-b", "baseline-c"} {
+		removed, err := store.RemoveAgent(ctx, name)
+		if err != nil || !removed {
+			t.Fatalf("RemoveAgent(%q) = %t, %v", name, removed, err)
+		}
+	}
+	for _, name := range []string{"new-x", "new-y", "new-z"} {
+		upsert(name)
+	}
+
+	if err := d.reconcilePermissionPolicyObservation(ctx); err != nil {
+		t.Fatal(err)
+	}
+	event := permissionPolicyObservationEventOfKind(t, store, permissionpolicy.BaselineGrowthEventKind)
+	if event.Baseline != 3 || event.Current != 3 || event.Delta != 0 || len(event.Configs) != 3 {
+		t.Fatalf("equal-count churn event = %#v, want three new configs at 3 -> 3", event)
+	}
+}
+
+func permissionPolicyObservationEventOfKind(t *testing.T, store *db.Store, kind string) permissionPolicyBaselineEvent {
+	t.Helper()
+	events, err := store.ListJobEvents(context.Background(), permissionpolicy.ObservationJobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind != kind {
+			continue
+		}
+		var decoded permissionPolicyBaselineEvent
+		if err := json.Unmarshal([]byte(event.Message), &decoded); err != nil {
+			t.Fatal(err)
+		}
+		return decoded
+	}
+	t.Fatalf("permission-policy observation event %q was not emitted", kind)
+	return permissionPolicyBaselineEvent{}
 }
