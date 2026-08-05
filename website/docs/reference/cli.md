@@ -42,7 +42,10 @@ was unsandboxed. Arm the off-by-default daemon ratchet with
 `[daemon].permission_policy_observation_enabled = true`; its first live tick
 records the baseline, any newly introduced configuration emits a structured
 event even if the total is unchanged or lower, and only a strict subset lowers
-the baseline.
+the baseline. The ratchet contains only fixable live agent configurations.
+Historical jobs whose agent identity no longer resolves are excluded and appear
+on a separate healthy doctor line; observation events carry the same residue as
+`unresolved_job_agents`.
 It also reports the SQLite auto-vacuum mode. New homes use bounded incremental
 reclaim automatically. A legacy home remains a non-blocking warning until an
 operator deliberately converts it during an idle maintenance window:
@@ -629,9 +632,10 @@ maps to the runtime permission mode and decides what a headless job may do:
 | `auto` (default) | *(no flag)* | non-deterministic — inherited from ambient Claude config |
 
 For engine-dispatched jobs, adapters also declare `applied`, `widened`, or
-`not-applied` as a by-product of building argv; a missing agent row is
-`unresolved`. `not-applied` and `unresolved` emit a structured, warn-only job
-event with runtime, policy, capability, job id, property, and agent name,
+`not-applied` as a by-product of building argv. A live agent whose runtime does
+not resolve is `unresolved`; a missing agent row also produces an `unresolved`
+warning for that individual job. Both properties emit a structured, warn-only
+job event with runtime, policy, capability, job id, property, and agent name,
 coalesced once per agent configuration and capability per 24-hour window. The
 job still runs. Ambient runtime config may provide a sandbox Gitmoot cannot
 observe, so this event never claims the process was unsandboxed. Interactive

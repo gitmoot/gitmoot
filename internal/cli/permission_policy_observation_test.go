@@ -189,6 +189,45 @@ func TestPermissionPolicyDoctorRejectsEqualCountChurn(t *testing.T) {
 	}
 }
 
+func TestPermissionPolicyDoctorReportsUnresolvedHistoryWithoutGatingRatchet(t *testing.T) {
+	ctx := context.Background()
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{Name: "live-auto", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", AutonomyPolicy: runtime.AutonomyPolicyAuto, Capabilities: []string{"ask"}}); err != nil {
+		t.Fatal(err)
+	}
+	configs, err := permissionpolicy.Inventory(ctx, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.InitializePermissionPolicyObservationBaseline(ctx, permissionpolicy.Keys(configs)); err != nil {
+		t.Fatal(err)
+	}
+	for _, agent := range []string{"ephemeral-history-a", "ephemeral-history-b"} {
+		if err := store.CreateJob(ctx, db.Job{ID: "job-" + agent, Agent: agent, Type: "ask", State: "succeeded"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ratchet, ok := permissionPolicyObservationDoctorCheck(paths)
+	if !ok || !ratchet.OK || ratchet.Detail != "current=1 baseline=1 delta=+0" {
+		t.Fatalf("ratchet doctor check = %#v, present=%t; unresolved history must not gate OK", ratchet, ok)
+	}
+	history, ok := permissionPolicyUnresolvedJobHistoryDoctorCheck(paths)
+	if !ok || !history.OK || history.Name != "permission-policy unresolved job history" || history.Detail != "count=2; historical jobs excluded from the live remediation baseline" {
+		t.Fatalf("unresolved-history doctor check = %#v, present=%t", history, ok)
+	}
+}
+
 func TestPermissionPolicyTransientAgentLookupDoesNotClaimUnresolved(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)

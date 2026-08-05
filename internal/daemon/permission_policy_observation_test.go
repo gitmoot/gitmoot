@@ -150,6 +150,67 @@ func TestPermissionPolicyObservationReportsEqualCountChurn(t *testing.T) {
 	}
 }
 
+func TestPermissionPolicyObservationJobHistoryDoesNotJamLowering(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	for _, name := range []string{"keep-auto", "fix-auto"} {
+		if err := store.UpsertAgent(ctx, db.Agent{Name: name, Runtime: "shell", RuntimeRef: "printf ok", AutonomyPolicy: "auto", Capabilities: []string{"ask"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d := Daemon{Store: store}
+	if err := d.reconcilePermissionPolicyObservation(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for index, agent := range []string{"ephemeral-history-a", "ephemeral-history-b"} {
+		if err := store.CreateJob(ctx, db.Job{ID: fmt.Sprintf("history-job-%d", index), Agent: agent, Type: "ask", State: "succeeded"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	removed, err := store.RemoveAgent(ctx, "fix-auto")
+	if err != nil || !removed {
+		t.Fatalf("RemoveAgent(fix-auto) = %t, %v", removed, err)
+	}
+
+	if err := d.reconcilePermissionPolicyObservation(ctx); err != nil {
+		t.Fatal(err)
+	}
+	baseline, ok, err := store.PermissionPolicyObservationBaseline(ctx)
+	if err != nil || !ok || baseline.AffectedCount != 1 {
+		t.Fatalf("baseline with unresolved job history = %#v, ok=%t, err=%v; live remediation must still lower", baseline, ok, err)
+	}
+	event := permissionPolicyObservationEventOfKind(t, store, permissionpolicy.BaselineLoweredEventKind)
+	if event.UnresolvedJobAgents != 2 {
+		t.Fatalf("lowered event unresolved_job_agents = %d, want 2 reported outside the baseline", event.UnresolvedJobAgents)
+	}
+}
+
+func TestPermissionPolicyObservationLoweredEventNamesRemediatedConfigs(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	for _, name := range []string{"keep-auto", "fixed-auto"} {
+		if err := store.UpsertAgent(ctx, db.Agent{Name: name, Runtime: "shell", RuntimeRef: "printf ok", AutonomyPolicy: "auto", Capabilities: []string{"ask"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d := Daemon{Store: store}
+	if err := d.reconcilePermissionPolicyObservation(ctx); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := store.RemoveAgent(ctx, "fixed-auto")
+	if err != nil || !removed {
+		t.Fatalf("RemoveAgent(fixed-auto) = %t, %v", removed, err)
+	}
+	if err := d.reconcilePermissionPolicyObservation(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	event := permissionPolicyObservationEventOfKind(t, store, permissionpolicy.BaselineLoweredEventKind)
+	if len(event.Configs) != 1 || !strings.Contains(event.Configs[0], `agent="fixed-auto"`) {
+		t.Fatalf("lowered event configs = %v, want the remediated fixed-auto config", event.Configs)
+	}
+}
+
 func permissionPolicyObservationEventOfKind(t *testing.T, store *db.Store, kind string) permissionPolicyBaselineEvent {
 	t.Helper()
 	events, err := store.ListJobEvents(context.Background(), permissionpolicy.ObservationJobID)

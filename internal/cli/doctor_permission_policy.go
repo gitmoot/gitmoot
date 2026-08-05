@@ -38,3 +38,22 @@ func permissionPolicyObservationDoctorCheck(paths config.Paths) (doctor.Check, b
 		Detail: fmt.Sprintf("current=%d baseline=%d delta=%+d", len(configs), baseline.AffectedCount, delta),
 	}, true
 }
+
+func permissionPolicyUnresolvedJobHistoryDoctorCheck(paths config.Paths) (doctor.Check, bool) {
+	store, err := db.OpenReadOnly(paths.Database)
+	if err != nil {
+		return doctor.Check{}, false
+	}
+	defer store.Close()
+	unresolved, err := store.ListUnresolvedJobAgents(context.Background())
+	if err != nil {
+		return doctor.Check{
+			Name: "permission-policy unresolved job history", Required: false,
+			Detail: fmt.Sprintf("history read failed: %v", err),
+		}, true
+	}
+	return doctor.Check{
+		Name: "permission-policy unresolved job history", OK: true, Required: false,
+		Detail: fmt.Sprintf("count=%d; historical jobs excluded from the live remediation baseline", len(unresolved)),
+	}, true
+}

@@ -106,7 +106,7 @@ func TestWarningCoalescesPerAgentConfigWindow(t *testing.T) {
 	}
 }
 
-func TestInventoryLabelsMissingAgentAsUnresolved(t *testing.T) {
+func TestInventoryExcludesMissingAgentJobHistory(t *testing.T) {
 	ctx := context.Background()
 	store := observationStore(t)
 	if err := store.CreateJob(ctx, db.Job{
@@ -122,11 +122,15 @@ func TestInventoryLabelsMissingAgentAsUnresolved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(configs) != 1 {
-		t.Fatalf("inventory = %#v, want one missing-agent config", configs)
+	if len(configs) != 0 {
+		t.Fatalf("inventory = %#v, want missing-agent job history excluded from the live remediation set", configs)
 	}
-	if got := configs[0]; got.Agent != "deleted-agent" || got.Runtime != "" || got.Policy != "" || got.Property != runtime.PermissionPolicyUnresolved {
-		t.Fatalf("missing-agent config = %#v, want agent deleted-agent with unknown runtime and policy and property %q", got, runtime.PermissionPolicyUnresolved)
+	unresolved, err := store.ListUnresolvedJobAgents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unresolved) != 1 || unresolved[0] != "deleted-agent" {
+		t.Fatalf("unresolved job history = %v, want deleted-agent reported separately", unresolved)
 	}
 }
 

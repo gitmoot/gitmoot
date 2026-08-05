@@ -62,9 +62,10 @@ func Resolve(adapter any, agent runtime.Agent) runtime.PermissionPolicyApplicati
 	return runtime.ResolvePermissionPolicyApplication(adapter, agent)
 }
 
-// Inventory resolves declarations through adapters, never through a parallel
-// runtime/policy table. The unresolved set is durable job evidence whose agent
-// row has disappeared, so runtime and policy intentionally remain unknown.
+// Inventory resolves fixable live agent configurations through adapters, never
+// through a parallel runtime/policy table. Missing-agent job history is reported
+// separately because durable historical rows cannot be remediated by changing a
+// live agent configuration.
 func Inventory(ctx context.Context, store *db.Store) ([]Config, error) {
 	agents, err := store.ListAgents(ctx)
 	if err != nil {
@@ -90,13 +91,6 @@ func Inventory(ctx context.Context, store *db.Store) ([]Config, error) {
 		if property == runtime.PermissionPolicyNotApplied {
 			configs = append(configs, Config{Agent: agent.Name, Runtime: agent.Runtime, Policy: runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy), Property: property})
 		}
-	}
-	unresolved, err := store.ListUnresolvedJobAgents(ctx)
-	if err != nil {
-		return nil, err
-	}
-	for _, agent := range unresolved {
-		configs = append(configs, Config{Agent: agent, Property: runtime.PermissionPolicyUnresolved})
 	}
 	sort.Slice(configs, func(i, j int) bool { return configs[i].Key() < configs[j].Key() })
 	return configs, nil
@@ -131,6 +125,22 @@ func NewSinceBaseline(current []Config, baseline []string) []string {
 		}
 	}
 	return result
+}
+
+// RemovedFromBaseline describes recorded configurations absent from the current
+// live inventory so a lowering event names the remediations it represents.
+func RemovedFromBaseline(current []Config, baseline []string) []string {
+	present := make(map[string]struct{}, len(current))
+	for _, config := range current {
+		present[config.Key()] = struct{}{}
+	}
+	removed := make([]string, 0)
+	for _, key := range baseline {
+		if _, ok := present[key]; !ok {
+			removed = append(removed, DecodeKey(key))
+		}
+	}
+	return removed
 }
 
 // RecordWarning records warn-only dispatch evidence. It never changes job state
@@ -169,6 +179,10 @@ func shellRiskAccepted(agent runtime.Agent) bool {
 	return strings.TrimSpace(agent.RuntimeRef) != ""
 }
 
+// invokesModelCLI is advisory-only provenance recognition for attaching the
+// shell risk-acceptance reference. Wrappers, renamed binaries, and indirect
+// launchers can evade it; a miss leaves the warning intact and only omits that
+// reference, so this heuristic must never become load-bearing.
 func invokesModelCLI(command string) bool {
 	for _, field := range strings.Fields(command) {
 		field = strings.Trim(field, "'\"`;|&(){}[]")
