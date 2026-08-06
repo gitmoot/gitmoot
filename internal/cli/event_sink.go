@@ -136,9 +136,10 @@ func loadEventsPolicy(home string) (config.EventsPolicy, error) {
 }
 
 // resolveConfigFile resolves the gitmoot config.toml for a `home` that may be
-// EITHER an already-resolved <home>/.gitmoot ROOT or a RAW --home, returning ""
-// for an empty home. It is the single, side-effect-free home->config.toml
-// resolver shared by the daemon's read-only policy loaders (loadEventsPolicy,
+// EITHER an already-resolved <home>/.gitmoot ROOT or a RAW --home. An empty
+// home resolves through config.DefaultPaths, matching the CLI's omitted --home
+// behavior. It is the single, side-effect-free home->config.toml resolver
+// shared by the daemon's read-only policy loaders (loadEventsPolicy,
 // resolveEscalationTTL).
 //
 // On main the daemon's engine wiring (daemonWorkflowEngine -> daemonEventSink)
@@ -156,7 +157,11 @@ func loadEventsPolicy(home string) (config.EventsPolicy, error) {
 func resolveConfigFile(home string) string {
 	home = strings.TrimSpace(home)
 	if home == "" {
-		return ""
+		paths, err := config.DefaultPaths()
+		if err != nil {
+			return ""
+		}
+		return paths.ConfigFile
 	}
 	cfg := filepath.Join(home, config.ConfigName)
 	if _, err := os.Stat(cfg); err != nil {
