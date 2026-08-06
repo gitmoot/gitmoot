@@ -16,8 +16,9 @@ import (
 type contractProbeRunner struct {
 	path string
 
-	mu        sync.Mutex
-	helpCalls int
+	mu               sync.Mutex
+	helpCalls        int
+	firstHelpTimeout bool
 }
 
 func (r *contractProbeRunner) LookPath(string) (string, error) {
@@ -27,7 +28,7 @@ func (r *contractProbeRunner) LookPath(string) (string, error) {
 	return r.path, nil
 }
 
-func (r *contractProbeRunner) Run(_ context.Context, _ string, command string, args ...string) (subprocess.Result, error) {
+func (r *contractProbeRunner) Run(ctx context.Context, _ string, command string, args ...string) (subprocess.Result, error) {
 	content, err := os.ReadFile(command)
 	if err != nil {
 		return subprocess.Result{}, err
@@ -39,8 +40,13 @@ func (r *contractProbeRunner) Run(_ context.Context, _ string, command string, a
 	if len(args) == 1 && args[0] == "--help" {
 		r.mu.Lock()
 		r.helpCalls++
+		helpCall := r.helpCalls
+		firstHelpTimeout := r.firstHelpTimeout
 		r.mu.Unlock()
 		switch {
+		case firstHelpTimeout && helpCall == 1:
+			<-ctx.Done()
+			return subprocess.Result{}, ctx.Err()
 		case strings.Contains(mode, "unparseable"):
 			return subprocess.Result{Stdout: "???\n"}, nil
 		case strings.Contains(mode, "unsupported"):
@@ -131,6 +137,22 @@ func TestRuntimePreflightCachesUnchangedBinaryIdentity(t *testing.T) {
 	}
 	if got := runner.calls(); got != 1 {
 		t.Fatalf("help probes = %d, want one cached probe", got)
+	}
+}
+
+func TestRuntimePreflightDoesNotCacheUnknownProbe(t *testing.T) {
+	checker, runner, _ := newContractCheckerForTest(t, "supported")
+	runner.firstHelpTimeout = true
+	checker.Timeout = time.Millisecond
+	agent := Agent{Name: "legacy", Runtime: KimiCLIRuntime}
+	if got := checker.Check(context.Background(), agent).State; got != RuntimeContractUnknown {
+		t.Fatalf("first state = %q, want unknown", got)
+	}
+	if got := checker.Check(context.Background(), agent).State; got != RuntimeContractSupported {
+		t.Fatalf("second state = %q, want supported after retry", got)
+	}
+	if got := runner.calls(); got != 2 {
+		t.Fatalf("help probes = %d, want 2 after unknown result", got)
 	}
 }
 

@@ -150,10 +150,14 @@ contract against the installed CLI. Required argv flags are read from bounded
 argv that triggers them. Results are `supported`, `unsupported`, or `unknown`:
 only a positively `unsupported` contract blocks; missing binaries, timeouts, and
 unparseable help are `unknown`, emit `runtime_contract_unknown`, and still run.
-Probe results are cached by resolved executable path, size, and mtime, so an
-in-place CLI update is checked on the next dispatch. `gitmoot doctor` reports
-each built-in runtime's current contract status, installed version, answering
-instrument, and exact missing flag or precondition.
+Only parsed help results are cached, by resolved executable path, size, and
+mtime; unknown probes retry on the next dispatch, while an in-place CLI update
+invalidates a successful cached result. `gitmoot doctor --json` reports the
+tri-state value in `state` alongside status, installed version, answering
+instrument, and exact missing flag or precondition. Doctor probes its own
+foreground `PATH`, which can differ from the daemon's EnvironmentFile `PATH`;
+compare the reported `resolved_path` with the daemon's executable resolution
+before treating the foreground verdict as the daemon's.
 
 ## Runtime Ambient Credential Hygiene
 

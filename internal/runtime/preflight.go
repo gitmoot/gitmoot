@@ -250,9 +250,14 @@ func (c *RuntimeContractChecker) probeBinary(ctx context.Context, binary string)
 		return probe
 	}
 	probe = c.runBinaryProbe(ctx, resolved)
-	c.mu.Lock()
-	c.cache[identity] = probe
-	c.mu.Unlock()
+	// Unknown is a transient observation, not a durable capability verdict. A
+	// timeout or unparseable response must be retried on the next dispatch rather
+	// than disabling preflight until the executable identity changes.
+	if probe.helpParsed {
+		c.mu.Lock()
+		c.cache[identity] = probe
+		c.mu.Unlock()
+	}
 	return probe
 }
 

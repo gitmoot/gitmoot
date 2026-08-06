@@ -1807,6 +1807,18 @@ var claudeRuntimeContract = RuntimeContract{
 			Policies: []string{AutonomyPolicyReadOnly, AutonomyPolicyWorkspaceWrite, AutonomyPolicyDangerFullAccess},
 		},
 		{
+			// #1499 measured Claude 2.1.223 with the exact argv this adapter emits:
+			//
+			//   claude --permission-mode bypassPermissions -p ok --output-format json
+			//     euid 0: rc=1, "--dangerously-skip-permissions cannot be used with root/sudo privileges"
+			//   setpriv --reuid 65534 --regid 65534 --clear-groups claude --permission-mode bypassPermissions -p ok --output-format json
+			//     euid 65534: no root refusal; the command reaches the API and returns a JSON envelope
+			//
+			// The refusal misleadingly names --dangerously-skip-permissions, a flag
+			// Gitmoot does not pass, even though --permission-mode bypassPermissions
+			// triggers it. This cannot be reduced to a cheap capability probe:
+			// `claude --permission-mode bypassPermissions --version` exits 0 under
+			// root, so re-verification requires the real prompt command above.
 			Kind:     RuntimeRequirementNonRootEUID,
 			Name:     "precondition effective uid != 0 for --permission-mode bypassPermissions",
 			Flag:     "--permission-mode bypassPermissions",

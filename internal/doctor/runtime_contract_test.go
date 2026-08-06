@@ -26,6 +26,9 @@ func TestCheckRuntimeContractPreservesTriState(t *testing.T) {
 			if check.OK != test.wantOK || !strings.Contains(check.Detail, test.wantDetail) {
 				t.Fatalf("check = %+v, want OK=%v detail containing %q", check, test.wantOK, test.wantDetail)
 			}
+			if check.State != string(test.state) {
+				t.Fatalf("state = %q, want %q", check.State, test.state)
+			}
 		})
 	}
 }

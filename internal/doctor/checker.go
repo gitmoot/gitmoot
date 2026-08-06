@@ -20,6 +20,9 @@ type Check struct {
 	OK       bool
 	Required bool
 	Detail   string
+	// State is populated when a check has a structured domain state whose
+	// distinctions are not represented by OK/status alone.
+	State string
 }
 
 type BuildInfo struct {
@@ -170,7 +173,7 @@ func (c Checker) GlobalChecks(ctx context.Context) []Check {
 // unknown are warnings because the runtimes are optional doctor dependencies;
 // dispatch itself blocks only unsupported.
 func CheckRuntimeContract(result runtime.RuntimeContractResult) Check {
-	check := Check{Name: "contract " + result.Runtime, OK: result.State == runtime.RuntimeContractSupported}
+	check := Check{Name: "contract " + result.Runtime, OK: result.State == runtime.RuntimeContractSupported, State: string(result.State)}
 	switch result.State {
 	case runtime.RuntimeContractSupported:
 		check.Detail = fmt.Sprintf("supported (version %s; instrument %s)", result.Version, result.Instrument)

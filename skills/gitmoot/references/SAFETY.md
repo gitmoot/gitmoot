@@ -160,9 +160,14 @@ blocks with the runtime, installed version, exact requirement, and remedy. A
 missing binary, timeout, unparseable help, or undecidable precondition is
 `unknown`: Gitmoot records that fact and dispatches anyway. This fail-open
 unknown state is deliberate; inability to inspect a CLI is not proof that the
-CLI rejected the contract. Claude's `--permission-mode bypassPermissions`
-contract includes the upstream root/sudo refusal without changing argv or
-attempting an escape.
+CLI rejected the contract. Unknown binary probes are not cached and retry on
+the next dispatch; successful probes cache by resolved path, size, and mtime.
+Claude 2.1.223 refuses Gitmoot's exact `--permission-mode bypassPermissions`
+prompt invocation under effective uid 0, while misleadingly reporting the
+failure as `--dangerously-skip-permissions`; the precondition changes no argv
+and attempts no escape. Doctor uses the foreground process's `PATH`, so compare
+its reported `resolved_path` with the daemon EnvironmentFile's `PATH` when they
+may resolve different binaries.
 
 #### Shell runtime risk acceptance (2026-08-05)
 

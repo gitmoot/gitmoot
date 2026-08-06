@@ -169,10 +169,14 @@ contract against the installed CLI. Required argv flags come from bounded
 argv that triggers them. Results are `supported`, `unsupported`, or `unknown`.
 Only a positive `unsupported` result blocks. Missing binaries, timeouts, and
 unparseable help are `unknown`, produce a `runtime_contract_unknown` event, and
-still dispatch. The probe cache is keyed by resolved path, size, and mtime, so an
-updated binary is rechecked on its next use. `gitmoot doctor` reports every
-built-in runtime's status, installed version, answering instrument, and exact
-missing flag or precondition.
+still dispatch. Only parsed help results are cached, keyed by resolved path,
+size, and mtime; unknown probes retry on the next dispatch, while an updated
+binary invalidates a successful cached result. `gitmoot doctor --json` reports
+the tri-state value in `state` alongside every built-in runtime's status,
+installed version, answering instrument, and exact missing flag or precondition.
+Doctor probes its foreground `PATH`, which can differ from the daemon's
+EnvironmentFile `PATH`; compare the reported `resolved_path` with the daemon's
+executable resolution before treating the foreground verdict as the daemon's.
 
 ## Transcript Retention
 
