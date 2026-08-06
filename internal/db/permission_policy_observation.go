@@ -17,6 +17,15 @@ type PermissionPolicyObservationBaseline struct {
 	UpdatedAt     string
 }
 
+type PermissionPolicyWarningClaim struct {
+	Agent       string
+	Runtime     string
+	Policy      string
+	Capability  string
+	WindowStart string
+	JobID       string
+}
+
 func normalizePermissionPolicyConfigs(configs []string) []string {
 	set := make(map[string]struct{}, len(configs))
 	for _, config := range configs {
@@ -120,6 +129,44 @@ func (s *Store) ClaimPermissionPolicyWarning(ctx context.Context, agent, runtime
 		return false, err
 	}
 	return true, tx.Commit()
+}
+
+// UpdateClaimedPermissionPolicyWarning updates the existing coalesced warning
+// event in place. The claim join prevents a caller from attaching effects to an
+// unrelated event that merely shares the same job id and kind.
+func (s *Store) UpdateClaimedPermissionPolicyWarning(ctx context.Context, jobID, kind, message string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE job_events
+		SET message = ?
+		WHERE id = (
+			SELECT e.id
+			FROM job_events e
+			JOIN permission_policy_warning_claims c ON c.job_id = e.job_id
+			WHERE e.job_id = ? AND e.kind = ?
+			ORDER BY e.id ASC
+			LIMIT 1
+		)`, message, jobID, kind)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	return affected == 1, err
+}
+
+// LatestPermissionPolicyWarningClaim resolves the newest coalesced observation
+// for an agent configuration. It is the query seam for effect measurements;
+// effects remain attached to the R1 claim/event rather than a parallel store.
+func (s *Store) LatestPermissionPolicyWarningClaim(ctx context.Context, agent, runtimeName, policy string) (PermissionPolicyWarningClaim, bool, error) {
+	var claim PermissionPolicyWarningClaim
+	err := s.db.QueryRowContext(ctx, `SELECT agent, runtime, policy, capability, window_start, job_id
+		FROM permission_policy_warning_claims
+		WHERE agent = ? AND runtime = ? AND policy = ?
+		ORDER BY window_start DESC, rowid DESC
+		LIMIT 1`, agent, runtimeName, policy).Scan(
+		&claim.Agent, &claim.Runtime, &claim.Policy, &claim.Capability, &claim.WindowStart, &claim.JobID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PermissionPolicyWarningClaim{}, false, nil
+	}
+	return claim, err == nil, err
 }
 
 // ListUnresolvedJobAgents returns durable job identities that no longer resolve

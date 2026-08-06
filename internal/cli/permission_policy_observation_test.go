@@ -33,11 +33,19 @@ func (a *permissionPolicyTestAdapter) Deliver(context.Context, runtime.Agent, ru
 }
 
 func runPermissionPolicyJob(t *testing.T, property runtime.PermissionPolicyApplication) (*db.Store, db.Job, *permissionPolicyTestAdapter) {
+	return runPermissionPolicyJobWithEffectGit(t, property, nil)
+}
+
+func runPermissionPolicyJobWithEffectGit(t *testing.T, property runtime.PermissionPolicyApplication, effectGit func(string) permissionpolicy.EffectGit) (*db.Store, db.Job, *permissionPolicyTestAdapter) {
+	return runPermissionPolicyJobWithPayload(t, property, effectGit, "main", 0)
+}
+
+func runPermissionPolicyJobWithPayload(t *testing.T, property runtime.PermissionPolicyApplication, effectGit func(string) permissionpolicy.EffectGit, branch string, pullRequest int) (*db.Store, db.Job, *permissionPolicyTestAdapter) {
 	t.Helper()
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	seedDaemonWorkerAgent(t, store, "policy-agent", runtime.ShellRuntime, "printf done", []string{"ask"}, "owner/repo")
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "policy-job", Agent: "policy-agent", Action: "ask", Repo: "owner/repo", Branch: "main"})
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "policy-job", Agent: "policy-agent", Action: "ask", Repo: "owner/repo", Branch: branch, PullRequest: pullRequest})
 	job, err := store.GetJob(ctx, "policy-job")
 	if err != nil {
 		t.Fatal(err)
@@ -48,6 +56,7 @@ func runPermissionPolicyJob(t *testing.T, property runtime.PermissionPolicyAppli
 		return t.TempDir(), nil
 	}
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) { return adapter, nil }
+	worker.PermissionPolicyEffectGit = effectGit
 	if err := worker.run(ctx, job); err != nil {
 		t.Fatal(err)
 	}

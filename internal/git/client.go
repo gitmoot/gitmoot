@@ -488,7 +488,7 @@ func (c Client) WorktreeCleanAt(ctx context.Context, path string) (bool, error) 
 }
 
 func (c Client) StatusPorcelain(ctx context.Context) (string, error) {
-	result, err := c.run(ctx, "status", "--porcelain")
+	result, err := c.run(ctx, "--no-optional-locks", "status", "--porcelain")
 	if err != nil {
 		return "", err
 	}

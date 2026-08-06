@@ -66,6 +66,18 @@ func TestClientUsesSharedSubprocessRunner(t *testing.T) {
 	runner.wantArgs(t, 8, "git", "pull", "--ff-only", "origin", "main")
 }
 
+func TestClientStatusPorcelainDisablesOptionalLocks(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: " M file.go\n"}}}
+	status, err := (Client{Runner: runner, Dir: "/repo"}).StatusPorcelain(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "M file.go" {
+		t.Fatalf("status = %q, want trimmed porcelain output", status)
+	}
+	runner.wantArgs(t, 0, "git", "--no-optional-locks", "status", "--porcelain")
+}
+
 func TestClientIsLinkedWorktree(t *testing.T) {
 	tests := []struct {
 		name       string
