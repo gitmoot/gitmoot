@@ -120,6 +120,46 @@ func TestPermissionPolicyEffectCapturePreservesUnknownPushState(t *testing.T) {
 	}
 }
 
+func TestPermissionPolicyEffectCapturePreservesBranchlessPushUnknown(t *testing.T) {
+	git := &permissionPolicyEffectGitFake{}
+	store, job, _ := runPermissionPolicyJobWithPayload(t, runtime.PermissionPolicyNotApplied, func(string) permissionpolicy.EffectGit { return git }, "", 0)
+	effects := permissionPolicyEffectWarning(t, store, job.ID).Effects
+	if effects == nil || effects.BranchPushed != nil || effects.BranchPushedInstrument != permissionpolicy.PushInstrumentPayload {
+		t.Fatalf("effects = %#v, want branch_pushed=null instrument=%q", effects, permissionpolicy.PushInstrumentPayload)
+	}
+	if got := fmt.Sprint(git.calls); got != "[status]" {
+		t.Fatalf("git calls = %s, want status only without an invented branch probe", got)
+	}
+}
+
+func TestPermissionPolicyEffectCaptureNamesPullRequestPayloadFact(t *testing.T) {
+	store, job, _ := runPermissionPolicyJobWithPayload(t, runtime.PermissionPolicyNotApplied, func(string) permissionpolicy.EffectGit {
+		return &permissionPolicyEffectGitFake{}
+	}, "main", 42)
+	events := mustListJobEvents(t, store, job.ID)
+	for _, event := range events {
+		if event.Kind != permissionpolicy.WarningEventKind {
+			continue
+		}
+		var warning map[string]any
+		if err := json.Unmarshal([]byte(event.Message), &warning); err != nil {
+			t.Fatal(err)
+		}
+		effects, ok := warning["effects"].(map[string]any)
+		if !ok {
+			t.Fatalf("warning effects = %#v, want object", warning["effects"])
+		}
+		if effects["payload_had_pull_request"] != true {
+			t.Fatalf("effects = %#v, want payload_had_pull_request=true", effects)
+		}
+		if _, exists := effects["pr_opened"]; exists {
+			t.Fatalf("effects = %#v, pr_opened overstates the payload observation", effects)
+		}
+		return
+	}
+	t.Fatal("permission-policy warning not found")
+}
+
 func TestPermissionPolicyEffectsRemainAttachedToQueryableObservation(t *testing.T) {
 	git := &permissionPolicyEffectGitFake{remote: map[string]struct{}{"main": {}}}
 	store, job, _ := runPermissionPolicyJobWithEffectGit(t, runtime.PermissionPolicyNotApplied, func(string) permissionpolicy.EffectGit { return git })

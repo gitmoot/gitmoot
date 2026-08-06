@@ -641,13 +641,16 @@ job still runs. Ambient runtime config may provide a sandbox Gitmoot cannot
 observe, so this event never claims the process was unsandboxed. Interactive
 coordinator sessions are unaffected.
 
-At job completion, the winning coalesced event is updated in place with
-`checkout_dirty`, `branch_pushed`, and `pr_opened`. Git-derived booleans are
+At job completion, the one winning sampled job for the coalescing window is
+updated in place with `checkout_dirty`, `branch_pushed`, and
+`payload_had_pull_request`. Git-derived booleans are
 `null` when the observer could not determine them, and
 `branch_pushed_instrument` identifies the local-upstream check, the `ls-remote`
-fallback, a branchless payload, or an unavailable answer. This is effect
-measurement only: capture errors are logged and never change job state or
-delivery.
+fallback, a branchless payload, or an unavailable answer.
+`payload_had_pull_request` says only that the payload already carried a PR
+number at capture; it does not attribute opening that PR to the sampled job.
+This is effect measurement only: capture errors are logged and never change job
+state or delivery.
 
 Because of this, an agent that carries the `implement` capability **must** be
 started/subscribed with a write policy. Gitmoot fails closed: `--capability

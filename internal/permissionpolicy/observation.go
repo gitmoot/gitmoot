@@ -67,7 +67,7 @@ type Effects struct {
 	CheckoutDirty          *bool  `json:"checkout_dirty"`
 	BranchPushed           *bool  `json:"branch_pushed"`
 	BranchPushedInstrument string `json:"branch_pushed_instrument"`
-	PROpened               bool   `json:"pr_opened"`
+	PayloadHadPullRequest  bool   `json:"payload_had_pull_request"`
 }
 
 type EffectGit interface {
@@ -215,7 +215,7 @@ func RecordEffects(ctx context.Context, store *db.Store, jobID, checkout, branch
 		return false, nil
 	}
 
-	effects := Effects{PROpened: pullRequest > 0, BranchPushedInstrument: PushInstrumentUnavailable}
+	effects := Effects{PayloadHadPullRequest: pullRequest > 0, BranchPushedInstrument: PushInstrumentUnavailable}
 	var captureErrs []error
 	if git != nil && strings.TrimSpace(checkout) != "" {
 		status, statusErr := git.StatusPorcelain(ctx)
@@ -227,7 +227,6 @@ func RecordEffects(ctx context.Context, store *db.Store, jobID, checkout, branch
 
 		branch = strings.TrimSpace(branch)
 		if branch == "" {
-			effects.BranchPushed = boolPointer(false)
 			effects.BranchPushedInstrument = PushInstrumentPayload
 		} else if _, localErr := git.BehindCount(ctx, "origin/"+branch); localErr == nil {
 			// A successful rev-list proves the local remote-tracking branch exists.
