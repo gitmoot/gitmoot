@@ -160,8 +160,8 @@ blocks with the runtime, installed version, exact requirement, and remedy. A
 missing binary, timeout, unparseable help, or undecidable precondition is
 `unknown`: Gitmoot records that fact and dispatches anyway. This fail-open
 unknown state is deliberate; inability to inspect a CLI is not proof that the
-CLI rejected the contract. Unknown binary probes are not cached and retry on
-the next dispatch; successful probes cache by resolved path, size, and mtime.
+CLI rejected the contract. Unknown binary probes use a 60-second cache TTL;
+successful probes cache by resolved path, size, and mtime without a TTL.
 Claude 2.1.223 refuses Gitmoot's exact `--permission-mode bypassPermissions`
 prompt invocation under effective uid 0, while misleadingly reporting the
 failure as `--dangerously-skip-permissions`; the precondition changes no argv

@@ -1807,16 +1807,23 @@ var claudeRuntimeContract = RuntimeContract{
 			Policies: []string{AutonomyPolicyReadOnly, AutonomyPolicyWorkspaceWrite, AutonomyPolicyDangerFullAccess},
 		},
 		{
-			// #1499 measured Claude 2.1.223 with the exact argv this adapter emits:
+			// #1499 measured Claude 2.1.223 with the exact argv this adapter emits.
+			// The discriminator is the root/sudo message, not rc=1: the other rc=1
+			// results reached the API and received the account's quota 429.
 			//
 			//   claude --permission-mode bypassPermissions -p ok --output-format json
 			//     euid 0: rc=1, "--dangerously-skip-permissions cannot be used with root/sudo privileges"
+			//   claude --permission-mode acceptEdits -p ok --output-format json
+			//     euid 0: rc=1, no root refusal; the command reaches the API
+			//   claude -p ok --output-format json
+			//     euid 0: rc=1, no root refusal; the command reaches the API
 			//   setpriv --reuid 65534 --regid 65534 --clear-groups claude --permission-mode bypassPermissions -p ok --output-format json
 			//     euid 65534: no root refusal; the command reaches the API and returns a JSON envelope
 			//
-			// The refusal misleadingly names --dangerously-skip-permissions, a flag
-			// Gitmoot does not pass, even though --permission-mode bypassPermissions
-			// triggers it. This cannot be reduced to a cheap capability probe:
+			// The refusal requires the conjunction of euid 0 and bypassPermissions;
+			// neither condition alone triggers it. The refusal misleadingly names
+			// --dangerously-skip-permissions, a flag Gitmoot does not pass.
+			// This cannot be reduced to a cheap capability probe:
 			// `claude --permission-mode bypassPermissions --version` exits 0 under
 			// root, so re-verification requires the real prompt command above.
 			Kind:     RuntimeRequirementNonRootEUID,

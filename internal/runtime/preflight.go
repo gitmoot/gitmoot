@@ -97,6 +97,13 @@ type binaryProbe struct {
 	detail     string
 }
 
+type binaryProbeCacheEntry struct {
+	probe     binaryProbe
+	expiresAt time.Time
+}
+
+const unknownBinaryProbeTTL = time.Minute
+
 // RuntimeContractChecker probes lazily and caches by executable identity. A CLI
 // update changes path, size, or mtime and therefore forces the next dispatch to
 // ask the new binary again.
@@ -105,9 +112,10 @@ type RuntimeContractChecker struct {
 	Registry     Registry
 	Timeout      time.Duration
 	EffectiveUID func() (int, bool)
+	now          func() time.Time
 
 	mu    sync.Mutex
-	cache map[binaryIdentity]binaryProbe
+	cache map[binaryIdentity]binaryProbeCacheEntry
 }
 
 func NewRuntimeContractChecker(runner subprocess.Runner, registry Registry) *RuntimeContractChecker {
@@ -121,7 +129,8 @@ func NewRuntimeContractChecker(runner subprocess.Runner, registry Registry) *Run
 		EffectiveUID: func() (int, bool) {
 			return os.Geteuid(), true
 		},
-		cache: make(map[binaryIdentity]binaryProbe),
+		now:   time.Now,
+		cache: make(map[binaryIdentity]binaryProbeCacheEntry),
 	}
 }
 
@@ -243,21 +252,32 @@ func (c *RuntimeContractChecker) probeBinary(ctx context.Context, binary string)
 		return binaryProbe{path: resolved, version: "unknown", instrument: "binary-identity", detail: fmt.Sprintf("stat executable identity: %v", err)}
 	}
 	identity := binaryIdentity{Path: resolved, Size: info.Size(), ModTimeUnixNS: info.ModTime().UnixNano()}
+	now := time.Now
+	if c.now != nil {
+		now = c.now
+	}
+	checkedAt := now()
 	c.mu.Lock()
-	probe, ok := c.cache[identity]
+	entry, ok := c.cache[identity]
+	if ok && !entry.expiresAt.IsZero() && !checkedAt.Before(entry.expiresAt) {
+		delete(c.cache, identity)
+		ok = false
+	}
 	c.mu.Unlock()
 	if ok {
-		return probe
+		return entry.probe
 	}
-	probe = c.runBinaryProbe(ctx, resolved)
-	// Unknown is a transient observation, not a durable capability verdict. A
-	// timeout or unparseable response must be retried on the next dispatch rather
-	// than disabling preflight until the executable identity changes.
-	if probe.helpParsed {
-		c.mu.Lock()
-		c.cache[identity] = probe
-		c.mu.Unlock()
+	probe := c.runBinaryProbe(ctx, resolved)
+	entry = binaryProbeCacheEntry{probe: probe}
+	if !probe.helpParsed {
+		// Unknown is transient, but a timed-out or unparseable help response should
+		// not impose the full probe cost on every dispatch. Retry it after a short
+		// bounded interval.
+		entry.expiresAt = now().Add(unknownBinaryProbeTTL)
 	}
+	c.mu.Lock()
+	c.cache[identity] = entry
+	c.mu.Unlock()
 	return probe
 }
 

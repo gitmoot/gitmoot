@@ -128,31 +128,46 @@ func TestRuntimePreflightReprobesChangedBinaryIdentity(t *testing.T) {
 
 func TestRuntimePreflightCachesUnchangedBinaryIdentity(t *testing.T) {
 	checker, runner, _ := newContractCheckerForTest(t, "supported")
+	now := time.Unix(1_700_000_000, 0)
+	checker.now = func() time.Time { return now }
 	agent := Agent{Name: "legacy", Runtime: KimiCLIRuntime}
-	for i := 0; i < 2; i++ {
-		result := checker.Check(context.Background(), agent)
-		if result.State != RuntimeContractSupported || result.Instrument != "binary-help" {
-			t.Fatalf("check %d result = %#v, want supported from binary-help", i+1, result)
-		}
+	result := checker.Check(context.Background(), agent)
+	if result.State != RuntimeContractSupported || result.Instrument != "binary-help" {
+		t.Fatalf("first result = %#v, want supported from binary-help", result)
+	}
+	now = now.Add(2 * unknownBinaryProbeTTL)
+	result = checker.Check(context.Background(), agent)
+	if result.State != RuntimeContractSupported || result.Instrument != "binary-help" {
+		t.Fatalf("second result = %#v, want supported from binary-help", result)
 	}
 	if got := runner.calls(); got != 1 {
-		t.Fatalf("help probes = %d, want one cached probe", got)
+		t.Fatalf("help probes = %d, want successful probe cached without TTL", got)
 	}
 }
 
-func TestRuntimePreflightDoesNotCacheUnknownProbe(t *testing.T) {
+func TestRuntimePreflightCachesUnknownProbeUntilTTL(t *testing.T) {
 	checker, runner, _ := newContractCheckerForTest(t, "supported")
 	runner.firstHelpTimeout = true
 	checker.Timeout = time.Millisecond
+	now := time.Unix(1_700_000_000, 0)
+	checker.now = func() time.Time { return now }
 	agent := Agent{Name: "legacy", Runtime: KimiCLIRuntime}
 	if got := checker.Check(context.Background(), agent).State; got != RuntimeContractUnknown {
 		t.Fatalf("first state = %q, want unknown", got)
 	}
+	now = now.Add(unknownBinaryProbeTTL - time.Second)
+	if got := checker.Check(context.Background(), agent).State; got != RuntimeContractUnknown {
+		t.Fatalf("within-TTL state = %q, want cached unknown", got)
+	}
+	if got := runner.calls(); got != 1 {
+		t.Fatalf("within-TTL help probes = %d, want 1", got)
+	}
+	now = now.Add(time.Second)
 	if got := checker.Check(context.Background(), agent).State; got != RuntimeContractSupported {
 		t.Fatalf("second state = %q, want supported after retry", got)
 	}
 	if got := runner.calls(); got != 2 {
-		t.Fatalf("help probes = %d, want 2 after unknown result", got)
+		t.Fatalf("post-TTL help probes = %d, want 2", got)
 	}
 }
 
