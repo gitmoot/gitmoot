@@ -98,6 +98,10 @@ type jobWorker struct {
 	PipelineProgressThreshold time.Duration
 	PipelineProgressInterval  time.Duration
 	ProgressTickSource        func(context.Context, time.Duration, time.Duration) <-chan time.Time
+	// PermissionPolicyEffectGit injects the existing git observation primitives.
+	// It is consulted only for a claimed not-applied observation; nil selects the
+	// checkout-bound production client.
+	PermissionPolicyEffectGit func(string) permissionpolicy.EffectGit
 }
 
 // eventSink resolves the best-effort outbound event Sink (#446) for the
@@ -194,8 +198,12 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	dbAgent, err := w.lookupAgent(ctx, job.Agent)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			if _, warningErr := permissionpolicy.RecordWarning(ctx, w.Store, job, runtime.Agent{Name: job.Agent}, permissionpolicy.StaticProvider{Property: runtime.PermissionPolicyUnresolved}, time.Now()); warningErr != nil {
+			warned, warningErr := permissionpolicy.RecordWarning(ctx, w.Store, job, runtime.Agent{Name: job.Agent}, permissionpolicy.StaticProvider{Property: runtime.PermissionPolicyUnresolved}, time.Now())
+			if warningErr != nil {
 				writeLine(w.Stdout, "job %s permission-policy observation failed: %v", job.ID, warningErr)
+			}
+			if warned {
+				defer w.capturePermissionPolicyEffects(context.Background(), job.ID, strings.TrimSpace(payload.WorktreePath))
 			}
 		} else {
 			writeLine(w.Stdout, "job %s permission-policy observation skipped: agent lookup failed: %v", job.ID, err)
@@ -335,8 +343,12 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
 	}
-	if _, warningErr := permissionpolicy.RecordWarning(ctx, w.Store, job, agent, adapter, time.Now()); warningErr != nil {
+	warningRecorded, warningErr := permissionpolicy.RecordWarning(ctx, w.Store, job, agent, adapter, time.Now())
+	if warningErr != nil {
 		writeLine(w.Stdout, "job %s permission-policy observation failed: %v", job.ID, warningErr)
+	}
+	if warningRecorded {
+		defer w.capturePermissionPolicyEffects(context.Background(), job.ID, checkout)
 	}
 	managed, err := w.managedJobConfig(ctx, agent.Name)
 	if err != nil {
@@ -408,7 +420,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "temp_worker_eligible", Message: eligibleMessage}); eventErr != nil {
 				return eventErr
 			}
-			return w.runWithTempWorker(ctx, job, payload, agent, checkout, policy, eligibleMessage)
+			return w.runWithTempWorker(ctx, job, payload, agent, checkout, policy, eligibleMessage, warningRecorded)
 		} else if strings.TrimSpace(eligibility.Reason) != "" {
 			message = fmt.Sprintf("%s; temp worker ineligible: %s", message, eligibility.Reason)
 		}
@@ -624,6 +636,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	writeLine(w.Stdout, "running job %s for %s in %s", job.ID, agent.Name, payload.Repo)
 	adapter = pipeline.WrapPipelineEnvDeliveryAdapter(w.Store, w.ConfigHome, payload, adapter)
 	adapter = wrapManagedWorktreeRuntimeEnv(payload, adapter)
+	if warningRecorded {
+		adapter = w.observePermissionPolicyEffects(adapter, job.ID, checkout)
+	}
 	engine := w.WorkflowFactory(checkout)
 	// Wire the PRE-TERMINAL operational-blocker deferrer (#532 slice E) on the LIVE
 	// worker (not the WorkflowFactory-captured copy) so it observes this worker's
@@ -1624,7 +1639,7 @@ type tempWorkerStartResult struct {
 	JobTimeout  time.Duration
 }
 
-func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload workflow.JobPayload, original runtime.Agent, checkout string, policy config.ParallelSessionPolicy, reason string) error {
+func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload workflow.JobPayload, original runtime.Agent, checkout string, policy config.ParallelSessionPolicy, reason string, observePermissionPolicy bool) error {
 	started, err := w.startTempWorker(ctx, job, payload, original, checkout)
 	if err != nil {
 		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "temp_worker_failed", Message: err.Error()}); eventErr != nil {
@@ -1793,6 +1808,9 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	stopKillPending := func() {}
 	if hasRunDeadline {
 		stopKillPending = armJobKillPending(w.Store, delegatedJob.ID, runDeadline)
+	}
+	if observePermissionPolicy {
+		adapter = w.observePermissionPolicyEffects(adapter, delegatedJob.ID, checkout)
 	}
 	engine := w.WorkflowFactory(checkout)
 	_, err = engine.RunJob(runCtx, delegatedJob.ID, started.Agent, adapter)

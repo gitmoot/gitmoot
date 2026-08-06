@@ -3,6 +3,7 @@ package permissionpolicy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -48,6 +49,31 @@ type Warning struct {
 	Agent          string                              `json:"agent"`
 	Warning        string                              `json:"warning"`
 	RiskAcceptance string                              `json:"risk_acceptance,omitempty"`
+	Effects        *Effects                            `json:"effects,omitempty"`
+}
+
+const (
+	PushInstrumentLocalUpstream = "local-upstream"
+	PushInstrumentLSRemote      = "ls-remote"
+	PushInstrumentPayload       = "payload"
+	PushInstrumentUnavailable   = "unavailable"
+)
+
+// Effects are observed repository outcomes attached to the coalesced R1
+// warning. Nil booleans mean the observer could not determine the fact; they
+// are deliberately serialized as null rather than omitted or collapsed to
+// false.
+type Effects struct {
+	CheckoutDirty          *bool  `json:"checkout_dirty"`
+	BranchPushed           *bool  `json:"branch_pushed"`
+	BranchPushedInstrument string `json:"branch_pushed_instrument"`
+	PROpened               bool   `json:"pr_opened"`
+}
+
+type EffectGit interface {
+	StatusPorcelain(context.Context) (string, error)
+	BehindCount(context.Context, string) (int, error)
+	RemoteBranches(context.Context, []string) (map[string]struct{}, error)
 }
 
 type StaticProvider struct {
@@ -170,6 +196,65 @@ func RecordWarning(ctx context.Context, store *db.Store, job db.Job, agent runti
 	return store.ClaimPermissionPolicyWarning(ctx, warning.Agent, warning.Runtime, warning.Policy, warning.Capability, windowStart, db.JobEvent{
 		JobID: job.ID, Kind: WarningEventKind, Message: string(raw),
 	})
+}
+
+// RecordEffects attaches completion-time repository observations to the
+// existing coalesced warning event. It never creates a second observation. A
+// partial capture is still persisted with null for unknown facts, and the
+// returned error is advisory so callers can log it without changing job state.
+func RecordEffects(ctx context.Context, store *db.Store, jobID, checkout, branch string, pullRequest int, git EffectGit) (bool, error) {
+	event, ok, err := store.GetEarliestJobEventByKind(ctx, jobID, WarningEventKind)
+	if err != nil || !ok {
+		return false, err
+	}
+	var warning Warning
+	if err := json.Unmarshal([]byte(event.Message), &warning); err != nil {
+		return false, fmt.Errorf("decode permission-policy warning: %w", err)
+	}
+	if warning.Effects != nil {
+		return false, nil
+	}
+
+	effects := Effects{PROpened: pullRequest > 0, BranchPushedInstrument: PushInstrumentUnavailable}
+	var captureErrs []error
+	if git != nil && strings.TrimSpace(checkout) != "" {
+		status, statusErr := git.StatusPorcelain(ctx)
+		if statusErr != nil {
+			captureErrs = append(captureErrs, fmt.Errorf("inspect checkout status: %w", statusErr))
+		} else {
+			effects.CheckoutDirty = boolPointer(strings.TrimSpace(status) != "")
+		}
+
+		branch = strings.TrimSpace(branch)
+		if branch == "" {
+			effects.BranchPushed = boolPointer(false)
+			effects.BranchPushedInstrument = PushInstrumentPayload
+		} else if _, localErr := git.BehindCount(ctx, "origin/"+branch); localErr == nil {
+			// A successful rev-list proves the local remote-tracking branch exists.
+			// It answers whether this branch has been pushed at least once without a
+			// network round trip; the record names that local instrument explicitly.
+			effects.BranchPushed = boolPointer(true)
+			effects.BranchPushedInstrument = PushInstrumentLocalUpstream
+		} else if remote, remoteErr := git.RemoteBranches(ctx, []string{branch}); remoteErr != nil {
+			captureErrs = append(captureErrs, fmt.Errorf("inspect remote branch after local upstream lookup failed: %w", remoteErr))
+		} else {
+			_, exists := remote[branch]
+			effects.BranchPushed = boolPointer(exists)
+			effects.BranchPushedInstrument = PushInstrumentLSRemote
+		}
+	}
+
+	warning.Effects = &effects
+	raw, err := json.Marshal(warning)
+	if err != nil {
+		return false, errors.Join(append(captureErrs, err)...)
+	}
+	updated, updateErr := store.UpdateClaimedPermissionPolicyWarning(ctx, jobID, WarningEventKind, string(raw))
+	return updated, errors.Join(append(captureErrs, updateErr)...)
+}
+
+func boolPointer(value bool) *bool {
+	return &value
 }
 
 func shellRiskAccepted(agent runtime.Agent) bool {

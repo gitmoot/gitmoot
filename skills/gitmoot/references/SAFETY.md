@@ -140,6 +140,15 @@ coalesced per agent configuration and capability, and never refuse or block
 work. Interactive coordinator sessions are outside this engine-dispatch
 instrumentation.
 
+For the coalesced `not-applied` or `unresolved` sample, Gitmoot also records
+completion-time repository effects on that same warning: whether the checkout
+was dirty, whether the branch was observed on origin, and whether the payload
+carried an open pull request. A nullable git-derived value means the observer
+could not determine the fact, not `false`; the push instrument distinguishes a
+local upstream answer from an `ls-remote` fallback. This remains measurement,
+not enforcement. Capture failure cannot fail, block, retry, or otherwise alter
+the observed job.
+
 #### Shell runtime risk acceptance (2026-08-05)
 
 An operator-authored shell command is accepted as an explicit daemon-permission

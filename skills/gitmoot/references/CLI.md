@@ -836,7 +836,12 @@ constrain it, and Gitmoot does not read that configuration. `not-applied` and
 `unresolved` produce a structured `permission_policy_not_applied` job event,
 coalesced once per `(agent, runtime, policy, capability)` per 24-hour window.
 This is visibility, not protection: the warning never refuses, blocks, or
-changes a job.
+changes a job. At completion, the winning observation is updated in place with
+`checkout_dirty`, `branch_pushed`, and `pr_opened`. Git-derived booleans are
+`null` when Gitmoot could not determine them; `branch_pushed_instrument` records
+whether the answer came from the local upstream, `ls-remote`, the branchless
+payload, or remained unavailable. Capture failures are logged and never change
+the job outcome.
 
 The live-fleet ratchet is off by default. Set
 `[daemon].permission_policy_observation_enabled = true` to record the first
