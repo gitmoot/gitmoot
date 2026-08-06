@@ -661,6 +661,16 @@ func (a CodexAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 	return parsed, nil
 }
 
+var codexRuntimeContract = RuntimeContract{
+	Binary: "codex",
+	Requirements: []RuntimeRequirement{{
+		Kind: RuntimeRequirementFlag, Name: "flag --sandbox", Flag: "--sandbox",
+		Source:   "internal/runtime/adapter.go::codexSandboxArgs",
+		Remedy:   "install a Codex CLI that lists --sandbox, or run this policy on a runtime whose installed CLI satisfies its declared contract",
+		Policies: []string{AutonomyPolicyReadOnly, AutonomyPolicyWorkspaceWrite, AutonomyPolicyDangerFullAccess}, ChatSeat: true,
+	}},
+}
+
 // codexDeliverArgs builds the `codex exec` argument vector for a Deliver call.
 // dir is the adapter's working directory (the job checkout); when it is a linked
 // git worktree and the sandbox is workspace-write, codexSandboxArgs grants the
@@ -1782,6 +1792,31 @@ func claudeArgs(agent Agent, prompt string, jsonOutput bool, model string) []str
 	return append(args, "--", prompt)
 }
 
+var claudeRuntimeContract = RuntimeContract{
+	Binary: "claude",
+	Requirements: []RuntimeRequirement{
+		{
+			Kind: RuntimeRequirementFlag, Name: "flag -p", Flag: "-p",
+			Source: "internal/runtime/adapter.go::claudeArgs",
+			Remedy: "install a Claude CLI that lists -p, or run the job on a runtime whose installed CLI satisfies its declared contract",
+		},
+		{
+			Kind: RuntimeRequirementFlag, Name: "flag --permission-mode", Flag: "--permission-mode",
+			Source:   "internal/runtime/adapter.go::claudePermissionArgs",
+			Remedy:   "install a Claude CLI that lists --permission-mode, or run this policy on a runtime whose installed CLI satisfies its declared contract",
+			Policies: []string{AutonomyPolicyReadOnly, AutonomyPolicyWorkspaceWrite, AutonomyPolicyDangerFullAccess},
+		},
+		{
+			Kind:     RuntimeRequirementNonRootEUID,
+			Name:     "precondition effective uid != 0 for --permission-mode bypassPermissions",
+			Flag:     "--permission-mode bypassPermissions",
+			Source:   "internal/runtime/adapter.go::claudePermissionArgs",
+			Remedy:   "run Claude danger-full-access as a non-root user, or choose an autonomy policy the installed Claude CLI permits under this user",
+			Policies: []string{AutonomyPolicyDangerFullAccess}, Instrument: "effective-uid",
+		},
+	},
+}
+
 func claudePermissionArgs(agent Agent) ([]string, PermissionPolicyApplication) {
 	var args []string
 	property := PermissionPolicyNotApplied
@@ -1793,6 +1828,9 @@ func claudePermissionArgs(agent Agent) ([]string, PermissionPolicyApplication) {
 		args = []string{"--permission-mode", "acceptEdits"}
 		property = PermissionPolicyApplied
 	case AutonomyPolicyDangerFullAccess:
+		// Upstream refusal, Claude 2.1.223: "--dangerously-skip-permissions cannot
+		// be used with root/sudo privileges". The runtime contract above keeps
+		// this environmental precondition beside the argv that triggers it.
 		args = []string{"--permission-mode", "bypassPermissions"}
 		property = PermissionPolicyApplied
 	}

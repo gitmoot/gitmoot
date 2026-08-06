@@ -93,6 +93,10 @@ type jobWorker struct {
 	// produce stages. nil selects sandbox.SandboxProbe; tests inject deterministic
 	// supported/unsupported results without depending on the test binary's argv.
 	SandboxProbe func() sandbox.ProbeResult
+	// RuntimePreflight evaluates the installed CLI contract immediately before
+	// checkout/adapter construction. nil keeps hand-built test workers unchanged;
+	// defaultJobWorker wires the process-wide identity cache.
+	RuntimePreflight func(context.Context, runtime.Agent) runtime.RuntimeContractResult
 	// Progress timing seams keep unit/E2E tests deterministic and short. Zero/nil
 	// values select the package defaults and real timer implementation.
 	PipelineProgressThreshold time.Duration
@@ -159,6 +163,7 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 	worker.CheckoutValidator = worker.defaultCheckout
 	worker.WorkflowFactory = worker.defaultWorkflow
 	worker.AuthProbe = worker.defaultAuthProbe
+	worker.RuntimePreflight = runtime.DefaultRuntimeContractChecker().Check
 	worker.QuotaWake = newQuotaRoleUnavailableWakeClient()
 	recoverKillPendingAtWorkerStartup.Do(func() {
 		if err := recoverKillPendingJobs(context.Background(), store, stdout); err != nil {
@@ -241,6 +246,20 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	if !overridden {
 		agent = scopeRegisteredFreshRefForJob(agent, job.ID)
+	}
+	if result, checked := w.runtimeContractPreflight(ctx, agent); checked {
+		if err := runtime.RuntimeContractDispatchError(agent, result); err != nil {
+			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, err); finishErr != nil {
+				return finishErr
+			}
+			_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
+			return nil
+		}
+		if result.State == runtime.RuntimeContractUnknown {
+			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "runtime_contract_unknown", Message: runtime.RuntimeContractEventMessage(job.ID, agent, result)}); eventErr != nil {
+				writeLine(w.Stdout, "job %s runtime_contract_unknown event failed: %v", job.ID, eventErr)
+			}
+		}
 	}
 	if err := w.produceDispatchError(job.Type, agent); err != nil {
 		w.recordProduceSandboxDiagnostic(ctx, job.ID, job.Type, agent)
@@ -734,6 +753,13 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	_ = w.postJobResultComment(ctx, job.ID, agent, checkout, nil)
 	writeLine(w.Stdout, "job %s completed", job.ID)
 	return nil
+}
+
+func (w jobWorker) runtimeContractPreflight(ctx context.Context, agent runtime.Agent) (runtime.RuntimeContractResult, bool) {
+	if w.RuntimePreflight == nil {
+		return runtime.RuntimeContractResult{}, false
+	}
+	return w.RuntimePreflight(ctx, agent), true
 }
 
 func (w jobWorker) lookupAgent(ctx context.Context, name string) (db.Agent, error) {

@@ -150,6 +150,20 @@ distinguishes a local upstream answer from an `ls-remote` fallback. This remains
 measurement, not enforcement. Capture failure cannot fail, block, retry, or
 otherwise alter the observed job.
 
+### Runtime contract preflight
+
+Engine jobs also pass a lazy installed-runtime contract preflight before launch.
+Adapter metadata declares the exact CLI flags its argv uses, while environmental
+refusals live beside the triggering argv. A parsed help document that omits a
+required flag, or a definitively failed precondition, is `unsupported` and
+blocks with the runtime, installed version, exact requirement, and remedy. A
+missing binary, timeout, unparseable help, or undecidable precondition is
+`unknown`: Gitmoot records that fact and dispatches anyway. This fail-open
+unknown state is deliberate; inability to inspect a CLI is not proof that the
+CLI rejected the contract. Claude's `--permission-mode bypassPermissions`
+contract includes the upstream root/sudo refusal without changing argv or
+attempting an escape.
+
 #### Shell runtime risk acceptance (2026-08-05)
 
 An operator-authored shell command is accepted as an explicit daemon-permission

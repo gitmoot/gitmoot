@@ -161,6 +161,10 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	stuckStatus := stuckJobsStatus(paths)
 	logStatus := daemonLogStatus(paths)
 	probeRunner, authState, authSource, authErr := runtimeJobRunnerWithAuth("", runtime.ClaudeRuntime, nil)
+	contractResults := make([]runtime.RuntimeContractResult, 0, len(runtime.BuiltinRuntimeRegistry().All()))
+	for _, meta := range runtime.BuiltinRuntimeRegistry().All() {
+		contractResults = append(contractResults, runtime.DefaultRuntimeContractChecker().Inspect(context.Background(), meta.Name))
+	}
 	checker := doctor.Checker{
 		Dir:               *repoDir,
 		LiveProbe:         true,
@@ -173,6 +177,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		Build:             &buildStatus,
 		StuckJobs:         stuckStatus,
 		LogStatus:         &logStatus,
+		RuntimeContracts:  contractResults,
 	}
 	checks := checker.Run(context.Background())
 	// #631: surface a stale backlog of blocked jobs (each paused awaiting a human)
