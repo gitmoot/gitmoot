@@ -650,7 +650,9 @@ mean-of-dimensions path, and written as a **third** `FeedbackEvent` in the SAME
 distinct item id (`checker#<repo>#<pr>`), so it **coexists with** both the
 verifiable floor (`gitmoot-auto`) and the cross-family review (`gitmoot-review`)
 instead of overwriting either. The optional `[skillopt].deterministic_checkers`
-comma list selects which run (default `diff_size` only).
+TOML string array selects which run (default `["diff_size"]`). Legacy bare comma
+lists remain readable but are deprecated; quoted whole lists and unknown checker
+names fail config loading rather than silently dropping checks.
 
 These dimensions are **objective and un-gameable** (tool-measured, not estimated),
 tagged `objective = true` on the eval item (alongside the projected `checker_score`

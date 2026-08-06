@@ -120,6 +120,56 @@ func TestAgentHeartbeatAddPreservesAgentType(t *testing.T) {
 	}
 }
 
+func TestAgentHeartbeatAddAcceptsLegacyDeterministicCheckers(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	const legacy = "deterministic_checkers = diff_size,duplication,lint,complexity"
+	contents, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	contents = append(contents, []byte("\n[skillopt]\n"+legacy+"\n")...)
+	if err := os.WriteFile(paths.ConfigFile, contents, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "heartbeat", "add", "probe", "compat",
+		"--home", home, "--repo", "gitmoot/gitmoot", "--interval", "1h", "--prompt", "check config grammar",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("heartbeat add exit=%d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "configured heartbeat probe/compat") {
+		t.Fatalf("stdout=%q", stdout.String())
+	}
+	after, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		t.Fatalf("read updated config: %v", err)
+	}
+	if count := strings.Count(string(after), legacy); count != 1 {
+		t.Fatalf("legacy checker syntax count = %d, want 1; config:\n%s", count, after)
+	}
+	policy, err := config.LoadSkillOptPolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadSkillOptPolicy: %v", err)
+	}
+	want := []string{"diff_size", "duplication", "lint", "complexity"}
+	got := policy.ResolvedDeterministicCheckers()
+	if len(got) != len(want) {
+		t.Fatalf("resolved checkers = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("resolved checkers = %v, want %v", got, want)
+		}
+	}
+}
+
 // TestAgentHeartbeatAddReviewRejectsMissingCapability proves the write path
 // refuses a review heartbeat for an agent lacking the review capability.
 func TestAgentHeartbeatAddReviewRejectsMissingCapability(t *testing.T) {

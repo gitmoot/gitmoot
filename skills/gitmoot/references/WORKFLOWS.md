@@ -582,7 +582,7 @@ auto_trace_enabled = true              # off by default
 cross_family_review_enabled = false    # off by default; also needs auto_trace_enabled
 revert_detection_enabled = true        # unset = on when auto_trace_enabled; set false to opt out (#467)
 deterministic_checkers_enabled = false # off by default; also needs auto_trace_enabled (#485)
-deterministic_checkers = diff_size     # optional comma list; default = diff_size only
+deterministic_checkers = ["diff_size"] # optional TOML array; default = diff_size only
 ```
 
 With `auto_trace_enabled = true`, a merge (passing CI vs. empty-gate), a
@@ -640,8 +640,10 @@ patches; always available, no tool/checkout needed), normalizes each to `[0,1]`,
 and writes a **third** `FeedbackEvent` in the SAME `auto-trace:<version>` run under
 the fixed `gitmoot-checker` reviewer sentinel + a distinct item id
 (`checker#<repo>#<pr>`), so it coexists with both the verifiable floor and the
-cross-family review. The `deterministic_checkers` comma list selects which run
-(default `diff_size` only). It is **fail-safe**: a missing tool, no checkout, a
+cross-family review. The `deterministic_checkers` TOML string array selects which
+run (default `diff_size` only). Legacy bare comma lists remain readable but are
+deprecated; quoted whole lists and unknown checker names fail config loading
+rather than silently dropping checks. It is **fail-safe**: a missing tool, no checkout, a
 tool error, or a timeout SKIPS that one dimension (never the harvest, never the
 merge); an all-skipped run writes no row. The dimensions are objective and
 un-gameable, tagged `objective = true`, additive (`contract_version` stays `1`),

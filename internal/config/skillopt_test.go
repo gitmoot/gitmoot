@@ -2,6 +2,8 @@ package config
 
 import (
 	"os"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -428,6 +430,63 @@ deterministic_checkers = diff_size, duplication ,lint
 		if got[i] != want[i] {
 			t.Fatalf("resolved checkers[%d] = %q, want %q (got %v)", i, got[i], want[i], got)
 		}
+	}
+}
+
+func TestLoadSkillOptPolicyDeterministicCheckerListGrammar(t *testing.T) {
+	want := []string{"diff_size", "duplication", "lint", "complexity"}
+	for _, tc := range []struct {
+		name    string
+		value   string
+		wantErr string
+	}{
+		{name: "legacy bare", value: `diff_size, duplication, lint, complexity`},
+		{name: "canonical array", value: `["diff_size", "duplication", "lint", "complexity"]`},
+		{name: "quoted whole", value: `"diff_size, duplication, lint, complexity"`, wantErr: "quoted checker lists"},
+		{name: "single quoted whole", value: `'diff_size, duplication, lint, complexity'`, wantErr: "quoted checker lists"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			paths := PathsForHome(t.TempDir())
+			if err := Initialize(paths); err != nil {
+				t.Fatalf("Initialize: %v", err)
+			}
+			contents := DefaultConfig(paths) + "\n[skillopt]\ndeterministic_checkers = " + tc.value + "\n"
+			if err := os.WriteFile(paths.ConfigFile, []byte(contents), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			policy, err := LoadSkillOptPolicy(paths)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("LoadSkillOptPolicy error = %v, want containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LoadSkillOptPolicy: %v", err)
+			}
+			got := policy.ResolvedDeterministicCheckers()
+			if !slices.Equal(got, want) {
+				t.Fatalf("resolved checkers = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestLoadSkillOptPolicyRejectsUnknownDeterministicChecker(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	contents := DefaultConfig(paths) + `
+[skillopt]
+deterministic_checkers = ["diff_size", "typo_checker"]
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	_, err := LoadSkillOptPolicy(paths)
+	if err == nil || !strings.Contains(err.Error(), `unknown deterministic checker "typo_checker"`) {
+		t.Fatalf("LoadSkillOptPolicy error = %v, want offending checker name", err)
 	}
 }
 

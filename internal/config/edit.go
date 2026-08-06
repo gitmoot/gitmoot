@@ -7,7 +7,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/creachadair/tomledit"
 	"github.com/creachadair/tomledit/parser"
 )
 
@@ -28,10 +27,13 @@ func SetConfigScalar(paths Paths, keyPath []string, value ConfigScalar) error {
 	if err != nil {
 		return err
 	}
-	doc, err := tomledit.Parse(strings.NewReader(string(original)))
+	editedSection := strings.Join(keyPath[:len(keyPath)-1], ".")
+	preserveLegacy := editedSection != "skillopt" || keyPath[len(keyPath)-1] != "deterministic_checkers"
+	editable, err := parseEditableConfig(original, editedSection, preserveLegacy)
 	if err != nil {
-		return fmt.Errorf("parse config: %w", err)
+		return err
 	}
+	doc := editable.doc
 	entry := doc.First(keyPath...)
 	if entry == nil || entry.KeyValue == nil {
 		return fmt.Errorf("config key %q not found", strings.Join(keyPath, "."))
@@ -46,12 +48,12 @@ func SetConfigScalar(paths Paths, keyPath []string, value ConfigScalar) error {
 	parsed.Trailer = entry.Value.Trailer
 	entry.Value = parsed
 
-	var buf strings.Builder
-	if err := tomledit.Format(&buf, doc); err != nil {
-		return fmt.Errorf("format config: %w", err)
+	updated, err := editable.format()
+	if err != nil {
+		return err
 	}
 
-	if err := writeConfigAtomic(paths.ConfigFile, []byte(buf.String())); err != nil {
+	if err := writeConfigAtomic(paths.ConfigFile, updated); err != nil {
 		return err
 	}
 	// Validate through the real parsers; restore the original on any failure so

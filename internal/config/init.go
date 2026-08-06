@@ -380,11 +380,14 @@ path = ""
 #     fails the harvest or blocks the merge; an all-skipped run writes no row.
 #     diff_size is pure-Go and always available; tool dims appear only when their
 #     binary AND a checkout are present. Off ⇒ byte-identical. Promotion stays MANUAL.
-#   deterministic_checkers (#485): optional comma list selecting which checkers run
-#     when enabled (diff_size,duplication,lint,complexity). UNSET/empty ⇒ the safe
+#   deterministic_checkers (#485): optional TOML string array selecting which
+#     checkers run when enabled (diff_size,duplication,lint,complexity). The legacy
+#     bare comma list remains readable but is deprecated. Quoted whole lists and
+#     unknown checker names fail config loading instead of silently disabling checks.
+#     UNSET/empty ⇒ the safe
 #     default (diff_size only) so a tool-less host runs the always-available metric
 #     and never a heavy tool. Narrow it to run only the cheap dims, or widen it to
-#     opt heavy tools (jscpd/golangci-lint) in. An unknown name is ignored.
+#     opt heavy tools (jscpd/golangci-lint) in.
 #   hard_verifiers_enabled (#474): OFF by default; requires auto_trace AND at least one
 #     hard_verifier_commands line. When true, a MERGED implement job runs the configured
 #     build/test/lint COMMANDS in a FRESH clean sandbox checkout at the merged head (an
@@ -449,7 +452,7 @@ path = ""
 # cross_family_review_enabled = false
 # revert_detection_enabled = true
 # deterministic_checkers_enabled = false
-# deterministic_checkers = diff_size
+# deterministic_checkers = ["diff_size"]
 # hard_verifiers_enabled = false
 # hard_verifier_commands = go build ./...
 # hard_verifier_commands = go test ./...
