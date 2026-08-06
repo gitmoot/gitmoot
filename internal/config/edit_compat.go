@@ -43,7 +43,8 @@ func normalizeLegacyDeterministicCheckerLines(contents string) (string, []legacy
 	section := ""
 	occurrence := 0
 	var legacyLines []legacyConfigLine
-	for i, raw := range lines {
+	for i := 0; i < len(lines); i++ {
+		raw := lines[i]
 		line := strings.TrimSpace(stripConfigComment(raw))
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			section = strings.TrimSpace(line[1 : len(line)-1])
@@ -56,13 +57,15 @@ func normalizeLegacyDeterministicCheckerLines(contents string) (string, []legacy
 		if !ok || strings.TrimSpace(key) != "deterministic_checkers" {
 			continue
 		}
-		names, err := parseDeterministicCheckerList(strings.TrimSpace(value))
+		value, end := joinDeterministicCheckerArrayValue(lines, i, strings.TrimSpace(value))
+		names, err := parseDeterministicCheckerList(value)
 		if err != nil {
 			return "", nil, fmt.Errorf("parse [skillopt].deterministic_checkers: %w", err)
 		}
 		trimmed := strings.TrimSpace(value)
 		if strings.HasPrefix(trimmed, "[") {
 			occurrence++
+			i = end
 			continue
 		}
 		equals := strings.IndexByte(raw, '=')

@@ -1006,7 +1006,9 @@ func LoadSkillOptPolicy(paths Paths) (SkillOptPolicy, error) {
 	}
 	policy := DefaultSkillOptPolicy()
 	current := false
-	for _, raw := range strings.Split(string(content), "\n") {
+	lines := strings.Split(string(content), "\n")
+	for i := 0; i < len(lines); i++ {
+		raw := lines[i]
 		line := strings.TrimSpace(stripConfigComment(raw))
 		if line == "" {
 			continue
@@ -1023,8 +1025,13 @@ func LoadSkillOptPolicy(paths Paths) (SkillOptPolicy, error) {
 		if !ok {
 			continue
 		}
-		if err := applySkillOptPolicyField(&policy, strings.TrimSpace(key), strings.TrimSpace(value)); err != nil {
-			return SkillOptPolicy{}, fmt.Errorf("parse [skillopt].%s: %w", strings.TrimSpace(key), err)
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "deterministic_checkers" {
+			value, i = joinDeterministicCheckerArrayValue(lines, i, value)
+		}
+		if err := applySkillOptPolicyField(&policy, key, value); err != nil {
+			return SkillOptPolicy{}, fmt.Errorf("parse [skillopt].%s: %w", key, err)
 		}
 	}
 	return policy, nil
@@ -1230,7 +1237,7 @@ func parseDeterministicCheckerList(value string) ([]string, error) {
 	case value == "":
 		return nil, nil
 	case strings.HasPrefix(value, "["):
-		checkers, err = parseConfigStringArray(value)
+		checkers, err = parseDeterministicCheckerArray(value)
 	case strings.HasPrefix(value, "\"") || strings.HasPrefix(value, "'"):
 		return nil, fmt.Errorf("quoted checker lists are invalid; use a TOML array such as [\"diff_size\", \"lint\"]")
 	default:
@@ -1245,6 +1252,51 @@ func parseDeterministicCheckerList(value string) ([]string, error) {
 		}
 	}
 	return checkers, nil
+}
+
+func joinDeterministicCheckerArrayValue(lines []string, start int, value string) (string, int) {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "[") || strings.HasSuffix(value, "]") {
+		return value, start
+	}
+	parts := []string{value}
+	end := start
+	for i := start + 1; i < len(lines); i++ {
+		end = i
+		part := strings.TrimSpace(stripConfigComment(lines[i]))
+		if part == "" {
+			continue
+		}
+		parts = append(parts, part)
+		if strings.HasSuffix(part, "]") {
+			break
+		}
+	}
+	return strings.Join(parts, " "), end
+}
+
+func parseDeterministicCheckerArray(value string) ([]string, error) {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "[") || !strings.HasSuffix(value, "]") {
+		return nil, fmt.Errorf("expected string array")
+	}
+	inner := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(value, "["), "]"))
+	if inner == "" {
+		return nil, nil
+	}
+	parts := strings.Split(inner, ",")
+	values := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if strings.TrimSpace(part) == "" {
+			continue
+		}
+		parsed, err := parseConfigString(part)
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, parsed)
+	}
+	return compactConfigStrings(values), nil
 }
 
 func validDeterministicChecker(name string) bool {

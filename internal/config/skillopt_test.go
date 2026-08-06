@@ -434,14 +434,23 @@ deterministic_checkers = diff_size, duplication ,lint
 }
 
 func TestLoadSkillOptPolicyDeterministicCheckerListGrammar(t *testing.T) {
-	want := []string{"diff_size", "duplication", "lint", "complexity"}
+	all := []string{"diff_size", "duplication", "lint", "complexity"}
 	for _, tc := range []struct {
-		name    string
-		value   string
-		wantErr string
+		name          string
+		value         string
+		after         string
+		want          []string
+		wantAutoTrace bool
+		wantErr       string
 	}{
-		{name: "legacy bare", value: `diff_size, duplication, lint, complexity`},
-		{name: "canonical array", value: `["diff_size", "duplication", "lint", "complexity"]`},
+		{name: "legacy bare", value: `diff_size, duplication, lint, complexity`, want: all},
+		{name: "canonical array", value: `["diff_size", "duplication", "lint", "complexity"]`, want: all},
+		{name: "single-line trailing comma", value: `["diff_size", "duplication", "lint", "complexity",]`, want: all},
+		{name: "multi-line array", value: "[\n  \"diff_size\",\n  \"duplication\",\n  \"lint\",\n  \"complexity\"\n]", want: all},
+		{name: "multi-line trailing comma", value: "[\n  \"diff_size\",\n  \"duplication\",\n  \"lint\",\n  \"complexity\",\n]", want: all},
+		{name: "empty multi-line array", value: "[\n\n]", want: DefaultDeterministicCheckers},
+		{name: "multi-line comment", value: "[\n  \"diff_size\",\n  # retained TOML comment\n  \"duplication\",\n  \"lint\",\n  \"complexity\",\n]", want: all},
+		{name: "following key is not swallowed", value: "[\n  \"diff_size\",\n  \"duplication\",\n  \"lint\",\n  \"complexity\",\n]", after: "auto_trace_enabled = true\n", want: all, wantAutoTrace: true},
 		{name: "quoted whole", value: `"diff_size, duplication, lint, complexity"`, wantErr: "quoted checker lists"},
 		{name: "single quoted whole", value: `'diff_size, duplication, lint, complexity'`, wantErr: "quoted checker lists"},
 	} {
@@ -450,7 +459,7 @@ func TestLoadSkillOptPolicyDeterministicCheckerListGrammar(t *testing.T) {
 			if err := Initialize(paths); err != nil {
 				t.Fatalf("Initialize: %v", err)
 			}
-			contents := DefaultConfig(paths) + "\n[skillopt]\ndeterministic_checkers = " + tc.value + "\n"
+			contents := DefaultConfig(paths) + "\n[skillopt]\ndeterministic_checkers = " + tc.value + "\n" + tc.after
 			if err := os.WriteFile(paths.ConfigFile, []byte(contents), 0o600); err != nil {
 				t.Fatalf("write config: %v", err)
 			}
@@ -465,8 +474,11 @@ func TestLoadSkillOptPolicyDeterministicCheckerListGrammar(t *testing.T) {
 				t.Fatalf("LoadSkillOptPolicy: %v", err)
 			}
 			got := policy.ResolvedDeterministicCheckers()
-			if !slices.Equal(got, want) {
-				t.Fatalf("resolved checkers = %v, want %v", got, want)
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("resolved checkers = %v, want %v", got, tc.want)
+			}
+			if policy.AutoTraceEnabled != tc.wantAutoTrace {
+				t.Fatalf("auto_trace_enabled = %v, want %v", policy.AutoTraceEnabled, tc.wantAutoTrace)
 			}
 		})
 	}

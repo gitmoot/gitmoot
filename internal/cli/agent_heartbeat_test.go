@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -167,6 +168,50 @@ func TestAgentHeartbeatAddAcceptsLegacyDeterministicCheckers(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("resolved checkers = %v, want %v", got, want)
 		}
+	}
+}
+
+func TestAgentHeartbeatAddAcceptsMultilineDeterministicCheckers(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	contents, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	contents = append(contents, []byte(`
+[skillopt]
+deterministic_checkers = [
+  "diff_size",
+  "duplication",
+  "lint",
+  "complexity",
+]
+`)...)
+	if err := os.WriteFile(paths.ConfigFile, contents, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "heartbeat", "add", "probe", "multiline",
+		"--home", home, "--repo", "gitmoot/gitmoot", "--interval", "1h", "--prompt", "check multiline grammar",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("heartbeat add exit=%d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "configured heartbeat probe/multiline") {
+		t.Fatalf("stdout=%q", stdout.String())
+	}
+	policy, err := config.LoadSkillOptPolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadSkillOptPolicy: %v", err)
+	}
+	want := []string{"diff_size", "duplication", "lint", "complexity"}
+	if got := policy.ResolvedDeterministicCheckers(); !slices.Equal(got, want) {
+		t.Fatalf("resolved checkers = %v, want %v", got, want)
 	}
 }
 
