@@ -133,31 +133,39 @@ func TestPermissionPolicyEffectCapturePreservesBranchlessPushUnknown(t *testing.
 }
 
 func TestPermissionPolicyEffectCaptureNamesPullRequestPayloadFact(t *testing.T) {
-	store, job, _ := runPermissionPolicyJobWithPayload(t, runtime.PermissionPolicyNotApplied, func(string) permissionpolicy.EffectGit {
-		return &permissionPolicyEffectGitFake{}
-	}, "main", 42)
-	events := mustListJobEvents(t, store, job.ID)
-	for _, event := range events {
-		if event.Kind != permissionpolicy.WarningEventKind {
-			continue
-		}
-		var warning map[string]any
-		if err := json.Unmarshal([]byte(event.Message), &warning); err != nil {
-			t.Fatal(err)
-		}
-		effects, ok := warning["effects"].(map[string]any)
-		if !ok {
-			t.Fatalf("warning effects = %#v, want object", warning["effects"])
-		}
-		if effects["payload_had_pull_request"] != true {
-			t.Fatalf("effects = %#v, want payload_had_pull_request=true", effects)
-		}
-		if _, exists := effects["pr_opened"]; exists {
-			t.Fatalf("effects = %#v, pr_opened overstates the payload observation", effects)
-		}
-		return
+	for _, tc := range []struct {
+		name        string
+		pullRequest int
+		want        bool
+	}{{"present", 42, true}, {"absent", 0, false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, job, _ := runPermissionPolicyJobWithPayload(t, runtime.PermissionPolicyNotApplied, func(string) permissionpolicy.EffectGit {
+				return &permissionPolicyEffectGitFake{}
+			}, "main", tc.pullRequest)
+			for _, event := range mustListJobEvents(t, store, job.ID) {
+				if event.Kind != permissionpolicy.WarningEventKind {
+					continue
+				}
+				var warning map[string]any
+				if err := json.Unmarshal([]byte(event.Message), &warning); err != nil {
+					t.Fatal(err)
+				}
+				effects, ok := warning["effects"].(map[string]any)
+				if !ok {
+					t.Fatalf("warning effects = %#v, want object", warning["effects"])
+				}
+				got, exists := effects["payload_had_pull_request"]
+				if !exists || got != tc.want {
+					t.Fatalf("effects = %#v, want present payload_had_pull_request=%t", effects, tc.want)
+				}
+				if _, exists := effects["pr_opened"]; exists {
+					t.Fatalf("effects = %#v, pr_opened overstates the payload observation", effects)
+				}
+				return
+			}
+			t.Fatal("permission-policy warning not found")
+		})
 	}
-	t.Fatal("permission-policy warning not found")
 }
 
 func TestPermissionPolicyEffectsRemainAttachedToQueryableObservation(t *testing.T) {
