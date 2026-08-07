@@ -299,8 +299,10 @@ quality, the checker runs plain external **tools** that *measure* it exactly:
 - **`complexity`** — over-threshold function count via `gocyclo`.
 
 Each tool dimension is normalized to `[0,1]` (fewer issues → higher). The optional
-`[skillopt].deterministic_checkers` comma list selects which run (default:
-`diff_size` only); widen it to opt heavy tools in. The dimensions map to
+`[skillopt].deterministic_checkers` TOML string array selects which run (default:
+`["diff_size"]`); widen it to opt heavy tools in. Legacy bare comma lists remain
+readable but are deprecated. Quoted whole lists and unknown checker names fail
+config loading rather than silently dropping checks. The dimensions map to
 `dimension_scores`, are fused by the **mean-of-dimensions** path, and are written as
 a **third** `FeedbackEvent` in the SAME `auto-trace:<version>` run under a distinct
 item id (`checker#<repo>#<pr>`) and the fixed `gitmoot-checker` reviewer sentinel —

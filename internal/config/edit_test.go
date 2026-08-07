@@ -108,6 +108,21 @@ func TestSetConfigScalarRevertsOnInvalidResult(t *testing.T) {
 	}
 }
 
+// TestValidateConfigFilePinsIndirectSkillOptPolicyCoverage pins the intentional
+// transitive dependency validateConfigFile -> LoadSkillOptABPolicy ->
+// LoadSkillOptPolicy. If the AB loader is later split or inlined, this guard must
+// fail rather than silently orphan validation for the rest of [skillopt].
+func TestValidateConfigFilePinsIndirectSkillOptPolicyCoverage(t *testing.T) {
+	paths := editTestPaths(t, editFixture+`
+[skillopt]
+deterministic_checkers = ["diff_size", "orphaned_checker"]
+`)
+	err := validateConfigFile(paths)
+	if err == nil || !strings.Contains(err.Error(), `unknown deterministic checker "orphaned_checker"`) {
+		t.Fatalf("validateConfigFile error = %v, want transitive checker validation", err)
+	}
+}
+
 func TestSetConfigScalarPreservesTrailingComment(t *testing.T) {
 	fixture := "[agents.planner]\nmax_background = 4 # ops cap, do not exceed\n"
 	paths := editTestPaths(t, fixture)

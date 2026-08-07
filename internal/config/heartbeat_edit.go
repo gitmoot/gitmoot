@@ -32,10 +32,12 @@ func SaveHeartbeat(paths Paths, entry Heartbeat) error {
 	if err != nil {
 		return err
 	}
-	doc, err := tomledit.Parse(strings.NewReader(string(original)))
+	editedSection := strings.Join([]string{"agents", entry.Agent, "heartbeats", entry.Name}, ".")
+	editable, err := parseEditableConfig(original, editedSection, true)
 	if err != nil {
-		return fmt.Errorf("parse config: %w", err)
+		return err
 	}
+	doc := editable.doc
 	tableName := parser.Key{"agents", entry.Agent, "heartbeats", entry.Name}
 	section := findSection(doc, tableName)
 	// Field order mirrors the documented config example so a freshly written block
@@ -92,7 +94,7 @@ func SaveHeartbeat(paths Paths, entry Heartbeat) error {
 			removeSectionScalar(section, "runtime")
 		}
 	}
-	return formatAndValidateConfig(paths, doc, original)
+	return formatAndValidateConfig(paths, editable, original)
 }
 
 // SetHeartbeatEnabled flips just the `enabled` flag of an existing heartbeat via
@@ -140,10 +142,12 @@ func RemoveHeartbeat(paths Paths, agent, name string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	doc, err := tomledit.Parse(strings.NewReader(string(original)))
+	editedSection := strings.Join([]string{"agents", agent, "heartbeats", name}, ".")
+	editable, err := parseEditableConfig(original, editedSection, true)
 	if err != nil {
-		return false, fmt.Errorf("parse config: %w", err)
+		return false, err
 	}
+	doc := editable.doc
 	entry := doc.First("agents", agent, "heartbeats", name)
 	if entry == nil || !entry.IsSection() {
 		return false, nil
@@ -151,7 +155,7 @@ func RemoveHeartbeat(paths Paths, agent, name string) (bool, error) {
 	if !entry.Remove() {
 		return false, nil
 	}
-	if err := formatAndValidateConfig(paths, doc, original); err != nil {
+	if err := formatAndValidateConfig(paths, editable, original); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -230,12 +234,12 @@ func removeSectionScalar(section *tomledit.Section, key string) bool {
 // formatAndValidateConfig serializes doc, writes it atomically, then re-validates
 // through every Load* parser; on any validation failure it restores original so a
 // malformed write can never wedge the daemon. It mirrors SetConfigScalar's tail.
-func formatAndValidateConfig(paths Paths, doc *tomledit.Document, original []byte) error {
-	var buf strings.Builder
-	if err := tomledit.Format(&buf, doc); err != nil {
-		return fmt.Errorf("format config: %w", err)
+func formatAndValidateConfig(paths Paths, editable editableConfig, original []byte) error {
+	updated, err := editable.format()
+	if err != nil {
+		return err
 	}
-	if err := writeConfigAtomic(paths.ConfigFile, []byte(buf.String())); err != nil {
+	if err := writeConfigAtomic(paths.ConfigFile, updated); err != nil {
 		return err
 	}
 	if err := validateConfigFile(paths); err != nil {

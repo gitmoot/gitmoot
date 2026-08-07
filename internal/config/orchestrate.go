@@ -1006,7 +1006,9 @@ func LoadSkillOptPolicy(paths Paths) (SkillOptPolicy, error) {
 	}
 	policy := DefaultSkillOptPolicy()
 	current := false
-	for _, raw := range strings.Split(string(content), "\n") {
+	lines := strings.Split(string(content), "\n")
+	for i := 0; i < len(lines); i++ {
+		raw := lines[i]
 		line := strings.TrimSpace(stripConfigComment(raw))
 		if line == "" {
 			continue
@@ -1023,8 +1025,13 @@ func LoadSkillOptPolicy(paths Paths) (SkillOptPolicy, error) {
 		if !ok {
 			continue
 		}
-		if err := applySkillOptPolicyField(&policy, strings.TrimSpace(key), strings.TrimSpace(value)); err != nil {
-			return SkillOptPolicy{}, fmt.Errorf("parse [skillopt].%s: %w", strings.TrimSpace(key), err)
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "deterministic_checkers" {
+			value, i = joinDeterministicCheckerArrayValue(lines, i, value)
+		}
+		if err := applySkillOptPolicyField(&policy, key, value); err != nil {
+			return SkillOptPolicy{}, fmt.Errorf("parse [skillopt].%s: %w", key, err)
 		}
 	}
 	return policy, nil
@@ -1145,8 +1152,9 @@ func applySkillOptPolicyField(policy *SkillOptPolicy, key string, value string) 
 		policy.DeterministicCheckers = parsed
 		return err
 	case "deterministic_checkers":
-		policy.DeterministicCheckerList = parseDeterministicCheckerList(value)
-		return nil
+		parsed, err := parseDeterministicCheckerList(value)
+		policy.DeterministicCheckerList = parsed
+		return err
 	case "hard_verifiers_enabled":
 		parsed, err := strconv.ParseBool(value)
 		policy.HardVerifiers = parsed
@@ -1215,13 +1223,89 @@ func applySkillOptPolicyField(policy *SkillOptPolicy, key string, value string) 
 }
 
 // parseDeterministicCheckerList parses the [skillopt].deterministic_checkers
-// per-checker selector — a plain comma list like "diff_size,duplication" — into a
-// trimmed, non-empty slice (#485). An empty value (or one with only blanks) yields
-// nil so ResolvedDeterministicCheckers falls back to the safe default set. It never
-// errors: an unknown name is simply ignored downstream (best-effort), so a typo
-// degrades to fewer dimensions rather than failing the daemon's config load.
-func parseDeterministicCheckerList(value string) []string {
-	return parseConfigStringList(value)
+// per-checker selector. TOML string arrays are canonical; the historical bare
+// comma list remains a compatibility read. Quoted whole-list values are rejected
+// because they previously split into corrupted checker names, and every resolved
+// name is validated so a typo cannot silently disable a checker.
+func parseDeterministicCheckerList(value string) ([]string, error) {
+	value = strings.TrimSpace(value)
+	var (
+		checkers []string
+		err      error
+	)
+	switch {
+	case value == "":
+		return nil, nil
+	case strings.HasPrefix(value, "["):
+		checkers, err = parseDeterministicCheckerArray(value)
+	case strings.HasPrefix(value, "\"") || strings.HasPrefix(value, "'"):
+		return nil, fmt.Errorf("quoted checker lists are invalid; use a TOML array such as [\"diff_size\", \"lint\"]")
+	default:
+		checkers = parseConfigStringList(value)
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, checker := range checkers {
+		if !validDeterministicChecker(checker) {
+			return nil, fmt.Errorf("unknown deterministic checker %q", checker)
+		}
+	}
+	return checkers, nil
+}
+
+func joinDeterministicCheckerArrayValue(lines []string, start int, value string) (string, int) {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "[") || strings.HasSuffix(value, "]") {
+		return value, start
+	}
+	parts := []string{value}
+	end := start
+	for i := start + 1; i < len(lines); i++ {
+		end = i
+		part := strings.TrimSpace(stripConfigComment(lines[i]))
+		if part == "" {
+			continue
+		}
+		parts = append(parts, part)
+		if strings.HasSuffix(part, "]") {
+			break
+		}
+	}
+	return strings.Join(parts, " "), end
+}
+
+func parseDeterministicCheckerArray(value string) ([]string, error) {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "[") || !strings.HasSuffix(value, "]") {
+		return nil, fmt.Errorf("expected string array")
+	}
+	inner := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(value, "["), "]"))
+	if inner == "" {
+		return nil, nil
+	}
+	parts := strings.Split(inner, ",")
+	values := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if strings.TrimSpace(part) == "" {
+			continue
+		}
+		parsed, err := parseConfigString(part)
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, parsed)
+	}
+	return compactConfigStrings(values), nil
+}
+
+func validDeterministicChecker(name string) bool {
+	switch name {
+	case "diff_size", "duplication", "lint", "complexity":
+		return true
+	default:
+		return false
+	}
 }
 
 // parseConfigStringList parses a plain comma list (e.g. "a, b ,c") into a
