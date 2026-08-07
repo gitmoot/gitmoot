@@ -254,6 +254,14 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if readOnlyImplementationBlocked(request.Action, effectiveAgent) {
 		return enqueuePermissionBlockedLocalAgentJob(ctx, store, request, repo.FullName(), record.DefaultBranch, agent.Name, overrideRuntime, overrideRef, orgPolicy)
 	}
+	var foregroundContract *runtime.RuntimeContractResult
+	if !request.Background {
+		result := localRuntimeContractPreflight(ctx, effectiveAgent)
+		if err := runtime.RuntimeContractDispatchError(effectiveAgent, result); err != nil {
+			return localAgentJobOutput{}, err
+		}
+		foregroundContract = &result
+	}
 	switch request.Action {
 	case "review":
 		if err := reviewReadOnlyWorktreeCapacity(request.Home); err != nil {
@@ -370,6 +378,9 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			_ = gitutil.Client{Dir: record.CheckoutPath}.RemoveWorktreeForce(context.WithoutCancel(ctx), readOnlyWorktreePath)
 		}
 		return localAgentJobOutput{}, err
+	}
+	if foregroundContract != nil && foregroundContract.State == runtime.RuntimeContractUnknown {
+		_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "runtime_contract_unknown", Message: runtime.RuntimeContractEventMessage(job.ID, effectiveAgent, *foregroundContract)})
 	}
 	if err := releaseReservation(ctx); err != nil {
 		return localAgentJobOutput{}, err
@@ -571,6 +582,8 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	}
 	return buildLocalAgentJobOutput(latest, request)
 }
+
+var localRuntimeContractPreflight = runtime.DefaultRuntimeContractChecker().Check
 
 func promptHeadContradictionWarnings(ctx context.Context, git gitutil.Client, prompt string, dispatchHead string) []string {
 	if strings.TrimSpace(prompt) == "" {

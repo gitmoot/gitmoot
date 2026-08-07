@@ -52,6 +52,87 @@ func TestRunQueuedJobsExecutesShellAdapterSuccess(t *testing.T) {
 	}
 }
 
+func TestRuntimePreflightUnknownRecordsEventAndDispatches(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, `printf '%s\n' '{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`, []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-runtime-unknown", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main"})
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.RuntimePreflight = func(context.Context, runtime.Agent) runtime.RuntimeContractResult {
+		return runtime.RuntimeContractResult{Runtime: runtime.ShellRuntime, Version: "unknown", State: runtime.RuntimeContractUnknown, Instrument: "binary-help"}
+	}
+
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+	job, err := store.GetJob(ctx, "job-runtime-unknown")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.State != string(workflow.JobSucceeded) {
+		t.Fatalf("job state = %q, want succeeded", job.State)
+	}
+	events, err := store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !daemonWorkerHasEvent(events, "runtime_contract_unknown") {
+		t.Fatalf("events = %+v, want runtime_contract_unknown", events)
+	}
+}
+
+func TestRuntimePreflightUnsupportedBlocksBeforeCheckout(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "true", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-runtime-unsupported", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main"})
+	worker := defaultJobWorker(store, io.Discard)
+	checkoutCalls := 0
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		checkoutCalls++
+		return "", nil
+	}
+	worker.RuntimePreflight = func(context.Context, runtime.Agent) runtime.RuntimeContractResult {
+		return runtime.RuntimeContractResult{
+			Runtime: runtime.ShellRuntime, Version: "stub 1.2.3", State: runtime.RuntimeContractUnsupported, Instrument: "binary-help",
+			Requirements: []runtime.RuntimeRequirementResult{{Kind: runtime.RuntimeRequirementFlag, Name: "flag --required", Flag: "--required", Source: "internal/runtime/test::args", Remedy: "install a compatible runtime", State: runtime.RuntimeContractUnsupported, Instrument: "binary-help"}},
+		}
+	}
+
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+	job, err := store.GetJob(ctx, "job-runtime-unsupported")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.State != string(workflow.JobBlocked) {
+		t.Fatalf("job state = %q, want blocked", job.State)
+	}
+	if checkoutCalls != 0 {
+		t.Fatalf("checkout calls = %d, want 0", checkoutCalls)
+	}
+	events, err := store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range events {
+		if strings.Contains(event.Message, "--required") && strings.Contains(event.Message, "stub 1.2.3") && strings.Contains(event.Message, "remedy") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("events = %+v, want greppable preflight error", events)
+	}
+}
+
 func TestRunQueuedJobsMarksShellAdapterFailure(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)

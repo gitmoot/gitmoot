@@ -20,6 +20,9 @@ type Check struct {
 	OK       bool
 	Required bool
 	Detail   string
+	// State is populated when a check has a structured domain state whose
+	// distinctions are not represented by OK/status alone.
+	State string
 }
 
 type BuildInfo struct {
@@ -103,6 +106,9 @@ type Checker struct {
 	// LogStatus is supplied by the one-shot CLI. Nil omits the check for callers
 	// such as the continuously refreshed terminal dashboard.
 	LogStatus *DaemonLogStatus
+	// RuntimeContracts are supplied by the one-shot CLI after its lazy installed
+	// binary probes. Dashboard callers leave this empty and spawn no probes.
+	RuntimeContracts []runtime.RuntimeContractResult
 }
 
 // Run returns the global (cwd-independent) checks followed by the per-repo
@@ -149,6 +155,9 @@ func (c Checker) GlobalChecks(ctx context.Context) []Check {
 			checks = append(checks, check)
 		}
 	}
+	for _, result := range c.RuntimeContracts {
+		checks = append(checks, CheckRuntimeContract(result))
+	}
 	if strings.TrimSpace(c.Paths.ConfigFile) != "" {
 		cfg, err := config.LoadOrg(c.Paths)
 		if err != nil {
@@ -158,6 +167,30 @@ func (c Checker) GlobalChecks(ctx context.Context) []Check {
 		}
 	}
 	return checks
+}
+
+// CheckRuntimeContract surfaces all three preflight states. Unsupported and
+// unknown are warnings because the runtimes are optional doctor dependencies;
+// dispatch itself blocks only unsupported.
+func CheckRuntimeContract(result runtime.RuntimeContractResult) Check {
+	check := Check{Name: "contract " + result.Runtime, OK: result.State == runtime.RuntimeContractSupported, State: string(result.State)}
+	switch result.State {
+	case runtime.RuntimeContractSupported:
+		check.Detail = fmt.Sprintf("supported (version %s; instrument %s)", result.Version, result.Instrument)
+	case runtime.RuntimeContractUnsupported:
+		check.Detail = fmt.Sprintf("contract-violated (version %s; instrument %s)", result.Version, result.Instrument)
+		for _, requirement := range result.Requirements {
+			if requirement.State == runtime.RuntimeContractUnsupported {
+				check.Detail += ": " + requirement.Name + " required by " + requirement.Source
+				break
+			}
+		}
+	case runtime.RuntimeContractUnknown:
+		check.Detail = fmt.Sprintf("unknown (version %s; instrument %s); dispatch remains fail-open", result.Version, result.Instrument)
+	default:
+		check.Detail = "unknown contract state; dispatch remains fail-open"
+	}
+	return check
 }
 
 // CheckStuckJobs reports running jobs whose directly recorded runtime process

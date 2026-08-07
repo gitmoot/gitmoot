@@ -364,6 +364,16 @@ func (a OmpAdapter) preflight() error {
 //     multiple sequential (separately billed) turns, a prompt starting with `-` is
 //     read as an unknown flag and exits 2, and one starting with `@` is read as a
 //     file attachment. `--` disables all of that for the value that follows.
+var ompRuntimeContract = RuntimeContract{
+	Binary: "omp",
+	Requirements: []RuntimeRequirement{
+		{Kind: RuntimeRequirementFlag, Name: "flag -p", Flag: "-p", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists -p, or run the job on a runtime whose installed CLI satisfies its declared contract"},
+		{Kind: RuntimeRequirementFlag, Name: "flag --mode", Flag: "--mode", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --mode, or run the job on a runtime whose installed CLI satisfies its declared contract"},
+		{Kind: RuntimeRequirementFlag, Name: "flag --approval-mode", Flag: "--approval-mode", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --approval-mode, or run the job on a runtime whose installed CLI satisfies its declared contract"},
+		{Kind: RuntimeRequirementFlag, Name: "flag --no-session", Flag: "--no-session", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --no-session, or run the job on a runtime whose installed CLI satisfies its declared contract"},
+	},
+}
+
 func ompArgs(agent Agent, model string, thinking string, maxTime string, attachArgs []string, prompt string) []string {
 	args := []string{"-p", "--mode=json", "--approval-mode=yolo", "--no-session"}
 	args = append(args, ompWorkspaceArgs(agent)...)

@@ -299,6 +299,23 @@ func (a KimiCLIAdapter) newRuntimeRef() (string, error) {
 	return newUUID()
 }
 
+var kimiRuntimeContract = RuntimeContract{
+	Binary: "kimi",
+	Requirements: []RuntimeRequirement{
+		{Kind: RuntimeRequirementFlag, Name: "flag -p", Flag: "-p", Source: "internal/runtime/kimi.go::KimiAdapter.Deliver", Remedy: "install a Kimi CLI that lists -p, or run the job on a runtime whose installed CLI satisfies its declared contract"},
+		{Kind: RuntimeRequirementFlag, Name: "flag --output-format", Flag: "--output-format", Source: "internal/runtime/kimi.go::KimiAdapter.Deliver", Remedy: "install a Kimi CLI that lists --output-format, or run the job on a runtime whose installed CLI satisfies its declared contract"},
+	},
+}
+
+var kimiCLIRuntimeContract = RuntimeContract{
+	Binary: "kimi",
+	Requirements: []RuntimeRequirement{
+		{Kind: RuntimeRequirementFlag, Name: "flag --print", Flag: "--print", Source: "internal/runtime/kimi.go::kimiCLIPromptArgs", Remedy: "install a Kimi CLI that lists --print, or run the job on a runtime whose installed CLI satisfies its declared contract"},
+		{Kind: RuntimeRequirementFlag, Name: "flag -p", Flag: "-p", Source: "internal/runtime/kimi.go::kimiCLIPromptArgs", Remedy: "install a Kimi CLI that lists -p, or run the job on a runtime whose installed CLI satisfies its declared contract"},
+		{Kind: RuntimeRequirementFlag, Name: "flag --output-format", Flag: "--output-format", Source: "internal/runtime/kimi.go::kimiCLIPromptArgs", Remedy: "install a Kimi CLI that lists --output-format, or run the job on a runtime whose installed CLI satisfies its declared contract"},
+	},
+}
+
 // kimiCLIPromptArgs builds the legacy kimi-cli `--print -p` argument vector.
 // promptArg and extraArgs are the values already produced by kimiPromptDelivery
 // (the verbatim prompt with no extra args for normal sizes, or the argv-safe

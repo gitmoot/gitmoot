@@ -163,6 +163,21 @@ A `[runtimes.<name>]` section can only tweak a **built-in** runtime's metadata; 
 cannot add a new first-class runtime (that requires a code change). An unknown
 runtime name is a config error surfaced by `gitmoot runtime list`.
 
+Before an engine job launches, Gitmoot lazily checks the compiled runtime
+contract against the installed CLI. Required argv flags come from bounded
+`<binary> --help` probes; environmental restrictions are declared beside the
+argv that triggers them. Results are `supported`, `unsupported`, or `unknown`.
+Only a positive `unsupported` result blocks. Missing binaries, timeouts, and
+unparseable help are `unknown`, produce a `runtime_contract_unknown` event, and
+still dispatch. Parsed help results are cached by resolved path, size, and mtime;
+unknown results use a 60-second TTL before probing again, while an updated binary
+immediately invalidates either cached result. `gitmoot doctor --json` reports
+the tri-state value in `state` alongside every built-in runtime's status,
+installed version, answering instrument, and exact missing flag or precondition.
+Doctor probes its foreground `PATH`, which can differ from the daemon's
+EnvironmentFile `PATH`; compare the reported `resolved_path` with the daemon's
+executable resolution before treating the foreground verdict as the daemon's.
+
 ## Transcript Retention
 
 Runtime transcript retention is default-on. Every engine delivery appends its

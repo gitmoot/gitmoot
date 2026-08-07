@@ -18,8 +18,10 @@ import (
 // (SupportedRuntimes) and surfaced by `gitmoot runtime list`. Two fields are
 // behavioral: DefaultModel is consulted at delivery as the model fallback when
 // neither the agent nor the job pins a --model (#652), and DefaultEffort is the
-// analogous reasoning-effort fallback. Every other field is inspection-only, so
-// seeding it (from the built-in defaults below or from
+// analogous reasoning-effort fallback. Contract is also behavioral, but unlike
+// those two operator-configurable values it is immutable compiled metadata that
+// describes the argv builder. Every other field is inspection-only, so seeding
+// it (from the built-in defaults below or from
 // operator config) is byte-identical at runtime. In particular Models is advisory:
 // Gitmoot never REJECTS a --model based on it, so populating it cannot change how a
 // job is delivered.
@@ -62,6 +64,9 @@ type RuntimeMetadata struct {
 	UsageSource string
 	// Description is a one-line summary of the runtime for the `runtime list` view.
 	Description string
+	// Contract declares the installed CLI interface the adapter's argv requires.
+	// Operator metadata overrides cannot change it: this is compiled behavior.
+	Contract RuntimeContract
 }
 
 // clone returns a deep copy so a caller can never mutate the built-in registry
@@ -70,6 +75,7 @@ func (m RuntimeMetadata) clone() RuntimeMetadata {
 	out := m
 	out.Capabilities = append([]string(nil), m.Capabilities...)
 	out.Models = append([]string(nil), m.Models...)
+	out.Contract = m.Contract.clone()
 	return out
 }
 
@@ -128,6 +134,7 @@ func newBuiltinRegistry() Registry {
 			Capabilities: []string{"review", "implement", "ask", "produce"},
 			UsageSource:  "codex `exec --json` turn.completed usage (session-cumulative on a resumed thread)",
 			Description:  "OpenAI Codex CLI (exec/resume, sandbox policy, session index)",
+			Contract:     codexRuntimeContract,
 		},
 		{
 			Name:         ClaudeRuntime,
@@ -135,6 +142,7 @@ func newBuiltinRegistry() Registry {
 			Capabilities: []string{"review", "implement", "ask", "produce"},
 			UsageSource:  "claude `--output-format json` result envelope usage object",
 			Description:  "Anthropic Claude Code CLI (session-id/resume, permission modes, transient-retry)",
+			Contract:     claudeRuntimeContract,
 		},
 		{
 			Name:         KimiRuntime,
@@ -142,6 +150,7 @@ func newBuiltinRegistry() Registry {
 			Capabilities: []string{"review", "implement", "ask", "produce"},
 			UsageSource:  "kimi `--output-format stream-json` usage event (kimi-code 0.19.2 emits none -> 0)",
 			Description:  "Kimi Code CLI (prompt mode, stream-json, per-job fresh session)",
+			Contract:     kimiRuntimeContract,
 		},
 		{
 			Name:         KimiCLIRuntime,
@@ -149,6 +158,7 @@ func newBuiltinRegistry() Registry {
 			Capabilities: []string{"review", "implement", "ask"},
 			UsageSource:  "kimi `--print` `--output-format stream-json` usage event (legacy kimi-cli)",
 			Description:  "Legacy kimi-cli runtime (--print prompt mode; same model family as kimi)",
+			Contract:     kimiCLIRuntimeContract,
 		},
 		{
 			Name:         OmpRuntime,
@@ -156,6 +166,7 @@ func newBuiltinRegistry() Registry {
 			Capabilities: []string{"review", "implement", "ask"},
 			UsageSource:  "omp `-p --mode=json` assistant message_end usage input/output, SUMMED across the run (the OTEL-only agent_end.telemetry rollup replaces the sum only when every agent_end carried one and it is >= that sum)",
 			Description:  "oh-my-pi CLI v17.2.4 (multi-provider routing harness; NDJSON print mode, stateless fresh session per job)",
+			Contract:     ompRuntimeContract,
 		},
 		{
 			Name:         ShellRuntime,

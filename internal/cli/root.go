@@ -161,6 +161,10 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	stuckStatus := stuckJobsStatus(paths)
 	logStatus := daemonLogStatus(paths)
 	probeRunner, authState, authSource, authErr := runtimeJobRunnerWithAuth("", runtime.ClaudeRuntime, nil)
+	contractResults := make([]runtime.RuntimeContractResult, 0, len(runtime.BuiltinRuntimeRegistry().All()))
+	for _, meta := range runtime.BuiltinRuntimeRegistry().All() {
+		contractResults = append(contractResults, runtime.DefaultRuntimeContractChecker().Inspect(context.Background(), meta.Name))
+	}
 	checker := doctor.Checker{
 		Dir:               *repoDir,
 		LiveProbe:         true,
@@ -173,6 +177,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		Build:             &buildStatus,
 		StuckJobs:         stuckStatus,
 		LogStatus:         &logStatus,
+		RuntimeContracts:  contractResults,
 	}
 	checks := checker.Run(context.Background())
 	// #631: surface a stale backlog of blocked jobs (each paused awaiting a human)
@@ -211,6 +216,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 			OK       bool   `json:"ok"`
 			Required bool   `json:"required"`
 			Detail   string `json:"detail"`
+			State    string `json:"state,omitempty"`
 		}
 		out := make([]checkJSON, 0, len(checks))
 		for _, check := range checks {
@@ -222,7 +228,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 					status = "warn"
 				}
 			}
-			out = append(out, checkJSON{Name: check.Name, Status: status, OK: check.OK, Required: check.Required, Detail: check.Detail})
+			out = append(out, checkJSON{Name: check.Name, Status: status, OK: check.OK, Required: check.Required, Detail: check.Detail, State: check.State})
 		}
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")

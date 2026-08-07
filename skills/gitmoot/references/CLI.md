@@ -144,6 +144,21 @@ A `[runtimes.<name>]` section can only tweak a **built-in** runtime's metadata; 
 cannot add a new first-class runtime (that requires a code change). An unknown
 runtime name is a config error surfaced by `gitmoot runtime list`.
 
+Before an engine job launches, Gitmoot lazily checks the compiled runtime
+contract against the installed CLI. Required argv flags are read from bounded
+`<binary> --help` probes and environmental restrictions are declared beside the
+argv that triggers them. Results are `supported`, `unsupported`, or `unknown`:
+only a positively `unsupported` contract blocks; missing binaries, timeouts, and
+unparseable help are `unknown`, emit `runtime_contract_unknown`, and still run.
+Parsed help results are cached by resolved executable path, size, and mtime;
+unknown results use a 60-second TTL before probing again, while an in-place CLI
+update immediately invalidates either cached result. `gitmoot doctor --json`
+reports the tri-state value in `state` alongside status, installed version,
+answering instrument, and exact missing flag or precondition. Doctor probes its
+own foreground `PATH`, which can differ from the daemon's EnvironmentFile
+`PATH`; compare the reported `resolved_path` with the daemon's executable
+resolution before treating the foreground verdict as the daemon's.
+
 ## Runtime Ambient Credential Hygiene
 
 Claude runtime auth has one authoritative source:

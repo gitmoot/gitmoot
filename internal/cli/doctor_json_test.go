@@ -15,7 +15,7 @@ import (
 
 // TestDoctorJSONOutput pins the fix for "gitmoot doctor --json advertised but
 // rejected": doctor now accepts --json and emits the checks as a JSON array (each
-// with name/status/ok/required/detail) instead of erroring with
+// with name/status/ok/required/detail and contract checks with state) instead of erroring with
 // "flag provided but not defined: -json".
 func TestDoctorJSONOutput(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
@@ -40,6 +40,21 @@ func TestDoctorJSONOutput(t *testing.T) {
 				t.Errorf("doctor --json check missing key %q: %v", k, c)
 			}
 		}
+	}
+	contractChecks := 0
+	for _, check := range checks {
+		name, _ := check["name"].(string)
+		if !strings.HasPrefix(name, "contract ") {
+			continue
+		}
+		contractChecks++
+		state, ok := check["state"].(string)
+		if !ok || (state != "supported" && state != "unsupported" && state != "unknown") {
+			t.Errorf("doctor --json contract check has no structured tri-state: %v", check)
+		}
+	}
+	if contractChecks == 0 {
+		t.Fatal("doctor --json produced no runtime contract checks")
 	}
 }
 
