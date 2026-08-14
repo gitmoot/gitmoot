@@ -386,8 +386,10 @@ func assertNoForbiddenOmpFlags(t *testing.T, argv []string) {
 		}
 	}
 	// Every omp argv, plan or not, carries the explicit yolo approval mode: plan
-	// mode is workflow shape, the approval mode is write permission, and omp bricks
-	// headlessly under always-ask.
+	// mode is workflow shape, the approval mode is write permission, and the flag is
+	// pinned for DETERMINISM (omitting it inherits the host config). It is NOT
+	// pinned because always-ask is unusable — that claim was measured and refuted;
+	// see the ompRuntimeContract comment.
 	if got := ompCountToken(argv, "--approval-mode=yolo"); got != 1 {
 		t.Fatalf("--approval-mode=yolo appears %d times, want exactly 1: %v", got, argv)
 	}
@@ -626,10 +628,11 @@ func TestOmpDeliverIsSessionless(t *testing.T) {
 // TestOmpPlanArgv pins the plan-mode argv byte for byte on BOTH sides of the
 // if-and-only-if: a job that asked for nothing gets no plan flag, a plan job gets
 // --plan-yolo, and a pinned execution model gets --plan-yolo-into directly after
-// it. --approval-mode=yolo survives every variant — plan mode is workflow shape,
-// the approval mode is write permission, and mapping one onto the other would
-// brick the runtime under always-ask. Result.PlanMode is asserted alongside so
-// the durable evidence cannot drift from the argv it describes.
+// it. --approval-mode=yolo survives every variant — plan mode is workflow shape
+// and the approval mode is write permission, two separate things, and the flag is
+// pinned for determinism rather than because always-ask would break omp (measured
+// and refuted; see the ompRuntimeContract comment). Result.PlanMode is asserted
+// alongside so the durable evidence cannot drift from the argv it describes.
 func TestOmpPlanArgv(t *testing.T) {
 	base := []string{"omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session"}
 	cases := []struct {
@@ -870,8 +873,14 @@ func TestOmpDeliverRejectsPlanIntoWithoutPlan(t *testing.T) {
 }
 
 func TestOmpDeliverRejectsMalformedPlanInto(t *testing.T) {
-	for _, target := range []string{"x --add-dir /etc", "--model", "provider/model\nnext"} {
-		t.Run(strings.ReplaceAll(target, "\n", "_newline_"), func(t *testing.T) {
+	// "provider/model\x07bell" and "\x00" carry a control character that is NOT
+	// whitespace, so they are the only inputs here for which the IsControl half of
+	// the predicate is the DECIDING one. Without them, deleting `|| IsControl(r)`
+	// compiled and left the whole suite green — the previous \n case satisfies
+	// IsSpace first, so the branch looked covered and was not. A control character
+	// in a model selector reaches argv, and argv reaches execve.
+	for _, target := range []string{"x --add-dir /etc", "--model", "provider/model\nnext", "provider/model\x07bell", "\x00"} {
+		t.Run(strings.NewReplacer("\n", "_newline_", "\x07", "_bell_", "\x00", "_nul_").Replace(target), func(t *testing.T) {
 			runner := &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}}
 			adapter := OmpAdapter{Runner: runner, Dir: "/repo"}
 			_, err := adapter.Deliver(context.Background(), ompTestAgent(), Job{Prompt: "work", Plan: true, PlanInto: target})

@@ -206,11 +206,13 @@ type Result struct {
 	SessionEphemeral bool
 	// PlanMode is the adapter's own evidence of the plan shape it DISPATCHED, so a
 	// reader can tell a plan run from a normal one without re-deriving it from the
-	// argv: "" for a normal run, PlanModeDescriptor's "plan" for a bare plan run,
-	// or "plan-into:<model>" when the execution phase was pinned. Adapters that
-	// cannot honour plan mode never set it (the dispatch layer rejects the request
-	// before they are reached), and it is populated on failure returns too — a
-	// plan run that died is still a plan run.
+	// argv: "" for a normal run, "plan-into:<model>" when Gitmoot resolved the
+	// execution target, and "plan-into:<runtime-default>" when it could not. There
+	// is deliberately no bare "plan" value — the execution phase always runs on some
+	// model, and a value that declined to say which is the ambiguity this field
+	// exists to remove. Adapters that cannot honour plan mode never set it (the
+	// dispatch layer rejects the request before they are reached), and it is
+	// populated on failure returns too — a plan run that died is still a plan run.
 	PlanMode string
 	// SessionDiag carries process-level diagnostics for the runtime CLI run
 	// backing this delivery (#806). Adapters populate it best-effort on every

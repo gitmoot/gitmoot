@@ -378,9 +378,12 @@ type JobPayload struct {
 	Model                         string              `json:"model,omitempty"`
 	Effort                        string              `json:"effort,omitempty"`
 	// Plan / PlanInto are the requested plan mode (#1479); PlanMode is the
-	// resolved EVIDENCE the adapter reported after dispatch ("plan",
-	// "plan-into:<model>", or absent for a normal run), so a reader can tell a plan
-	// run from a normal one without re-deriving it from the runtime's argv. All
+	// resolved EVIDENCE the adapter reported after dispatch —
+	// "plan-into:<model>", "plan-into:<runtime-default>", or absent for a normal
+	// run — so a reader can tell a plan run from a normal one without re-deriving it
+	// from the runtime's argv. There is no bare "plan" value: the bare-request case
+	// renders "plan-into:<runtime-default>", which is the value an operator will
+	// actually see most often. All
 	// three are additive/omitempty: a payload without plan mode serializes
 	// byte-identically.
 	Plan                          bool                `json:"plan,omitempty"`
