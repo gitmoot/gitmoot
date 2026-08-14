@@ -360,23 +360,23 @@ type JobPayload struct {
 	// capture bound; Error is the durable failure marker when capture itself
 	// failed. All fields are additive/omitempty so jobs without isolated
 	// read-only worktrees serialize unchanged.
-	ReadOnlyWorktreeDiff          string              `json:"read_only_worktree_diff,omitempty"`
-	ReadOnlyWorktreeDiffTruncated bool                `json:"read_only_worktree_diff_truncated,omitempty"`
-	ReadOnlyWorktreeDiffError     string              `json:"read_only_worktree_diff_error,omitempty"`
-	TemplateID                    string              `json:"template_id,omitempty"`
-	TemplateResolvedCommit        string              `json:"template_resolved_commit,omitempty"`
-	TemplateContent               string              `json:"template_content,omitempty"`
-	OriginalAgent                 string              `json:"original_agent,omitempty"`
-	DelegatedAgent                string              `json:"delegated_agent,omitempty"`
-	DelegationReason              string              `json:"delegation_reason,omitempty"`
-	RecentDelegationHashes        []string            `json:"recent_delegation_hashes,omitempty"`
-	DelegationRepeatCount         int                 `json:"delegation_repeat_count,omitempty"`
-	NonProgressStreak             int                 `json:"non_progress_streak,omitempty"`
-	LastProgressDigest            string              `json:"last_progress_digest,omitempty"`
-	VerifyAttempt                 int                 `json:"verify_attempt,omitempty"`
-	DelegationFinalize            bool                `json:"delegation_finalize,omitempty"`
-	Model                         string              `json:"model,omitempty"`
-	Effort                        string              `json:"effort,omitempty"`
+	ReadOnlyWorktreeDiff          string   `json:"read_only_worktree_diff,omitempty"`
+	ReadOnlyWorktreeDiffTruncated bool     `json:"read_only_worktree_diff_truncated,omitempty"`
+	ReadOnlyWorktreeDiffError     string   `json:"read_only_worktree_diff_error,omitempty"`
+	TemplateID                    string   `json:"template_id,omitempty"`
+	TemplateResolvedCommit        string   `json:"template_resolved_commit,omitempty"`
+	TemplateContent               string   `json:"template_content,omitempty"`
+	OriginalAgent                 string   `json:"original_agent,omitempty"`
+	DelegatedAgent                string   `json:"delegated_agent,omitempty"`
+	DelegationReason              string   `json:"delegation_reason,omitempty"`
+	RecentDelegationHashes        []string `json:"recent_delegation_hashes,omitempty"`
+	DelegationRepeatCount         int      `json:"delegation_repeat_count,omitempty"`
+	NonProgressStreak             int      `json:"non_progress_streak,omitempty"`
+	LastProgressDigest            string   `json:"last_progress_digest,omitempty"`
+	VerifyAttempt                 int      `json:"verify_attempt,omitempty"`
+	DelegationFinalize            bool     `json:"delegation_finalize,omitempty"`
+	Model                         string   `json:"model,omitempty"`
+	Effort                        string   `json:"effort,omitempty"`
 	// Plan / PlanInto are the requested plan mode (#1479); PlanMode is the
 	// resolved EVIDENCE the adapter reported after dispatch —
 	// "plan-into:<model>", "plan-into:<runtime-default>", or absent for a normal
@@ -386,29 +386,29 @@ type JobPayload struct {
 	// actually see most often. All
 	// three are additive/omitempty: a payload without plan mode serializes
 	// byte-identically.
-	Plan                          bool                `json:"plan,omitempty"`
-	PlanInto                      string              `json:"plan_into,omitempty"`
-	PlanMode                      string              `json:"plan_mode,omitempty"`
-	WorkflowID                    string              `json:"workflow_id,omitempty"`
-	RuntimeOverride               string              `json:"runtime_override,omitempty"`
-	RuntimeOverrideRef            string              `json:"runtime_override_ref,omitempty"`
-	ShellEnv                      []string            `json:"shell_env,omitempty"`
-	PipelineInputEnv              []string            `json:"pipeline_input_env,omitempty"`
-	PipelineName                  string              `json:"pipeline_name,omitempty"`
-	PipelineKeyAgent              string              `json:"pipeline_key_agent,omitempty"`
-	PipelineKeyAccess             []PipelineKeyAccess `json:"pipeline_key_access,omitempty"`
-	PipelineEnvFile               string              `json:"pipeline_env_file,omitempty"`
-	PipelineEnvKeys               []string            `json:"pipeline_env_keys,omitempty"`
-	PipelineEnv                   map[string]string   `json:"pipeline_env,omitempty"`
-	ShellUpstreamContext          string              `json:"shell_upstream_context,omitempty"`
-	Phase                         string              `json:"phase,omitempty"`
-	Cockpit                       bool                `json:"cockpit,omitempty"`
-	CockpitSession                string              `json:"cockpit_session,omitempty"`
-	CockpitPaneKey                string              `json:"cockpit_pane_key,omitempty"`
-	SkipNativeReviewFanout        bool                `json:"skip_native_review_fanout,omitempty"`
-	ValidatedPullRequest          bool                `json:"validated_pull_request,omitempty"`
-	Ephemeral                     *EphemeralSpec      `json:"ephemeral,omitempty"`
-	HumanAnswer                   string              `json:"human_answer,omitempty"`
+	Plan                   bool                `json:"plan,omitempty"`
+	PlanInto               string              `json:"plan_into,omitempty"`
+	PlanMode               string              `json:"plan_mode,omitempty"`
+	WorkflowID             string              `json:"workflow_id,omitempty"`
+	RuntimeOverride        string              `json:"runtime_override,omitempty"`
+	RuntimeOverrideRef     string              `json:"runtime_override_ref,omitempty"`
+	ShellEnv               []string            `json:"shell_env,omitempty"`
+	PipelineInputEnv       []string            `json:"pipeline_input_env,omitempty"`
+	PipelineName           string              `json:"pipeline_name,omitempty"`
+	PipelineKeyAgent       string              `json:"pipeline_key_agent,omitempty"`
+	PipelineKeyAccess      []PipelineKeyAccess `json:"pipeline_key_access,omitempty"`
+	PipelineEnvFile        string              `json:"pipeline_env_file,omitempty"`
+	PipelineEnvKeys        []string            `json:"pipeline_env_keys,omitempty"`
+	PipelineEnv            map[string]string   `json:"pipeline_env,omitempty"`
+	ShellUpstreamContext   string              `json:"shell_upstream_context,omitempty"`
+	Phase                  string              `json:"phase,omitempty"`
+	Cockpit                bool                `json:"cockpit,omitempty"`
+	CockpitSession         string              `json:"cockpit_session,omitempty"`
+	CockpitPaneKey         string              `json:"cockpit_pane_key,omitempty"`
+	SkipNativeReviewFanout bool                `json:"skip_native_review_fanout,omitempty"`
+	ValidatedPullRequest   bool                `json:"validated_pull_request,omitempty"`
+	Ephemeral              *EphemeralSpec      `json:"ephemeral,omitempty"`
+	HumanAnswer            string              `json:"human_answer,omitempty"`
 	// ThreadID / ChatMessageID back-link a chat-promoted job (#534) to its origin
 	// message. Additive/omitempty: a non-chat job serializes byte-identically.
 	ThreadID      string `json:"thread_id,omitempty"`

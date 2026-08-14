@@ -3705,10 +3705,10 @@ func TestOmpPlanRejectsMalformedResolvedTarget(t *testing.T) {
 func TestOmpPlanTargetPreservesRoleAlias(t *testing.T) {
 	for _, tc := range []struct{ model, into, want string }{
 		{into: "@smol", want: "@smol"},
-		{model: "@smol", want: "@smol"},                     // alias arriving via the model fallback
-		{model: "@smol", into: "@fast", want: "@fast"},       // explicit target still wins
+		{model: "@smol", want: "@smol"},                // alias arriving via the model fallback
+		{model: "@smol", into: "@fast", want: "@fast"}, // explicit target still wins
 		{model: "openai/gpt-5.5", want: "openai/gpt-5.5"},
-		{model: "  @smol  ", want: "@smol"},                  // trimmed, not stripped
+		{model: "  @smol  ", want: "@smol"}, // trimmed, not stripped
 	} {
 		if got := ompPlanTarget(tc.model, tc.into); got != tc.want {
 			t.Fatalf("ompPlanTarget(%q, %q) = %q, want %q", tc.model, tc.into, got, tc.want)
