@@ -263,3 +263,34 @@ func TestCheckShimIsPlanFalse(t *testing.T) {
 		t.Fatalf("a plan request evaluated %d requirements, no more than the non-plan %d: the plan scoping is inert, so this test could not detect a regression", len(planned.Requirements), len(shim.Requirements))
 	}
 }
+
+// TestInspectSkipsPlanScopedRequirements pins doctor's question. Inspect answers
+// "can this host run this runtime", and an omp that predates --plan-yolo runs every
+// ordinary job fine — the dispatch preflight scopes those flags to plan requests.
+// Before this, Inspect evaluated them unconditionally and reported the omp contract
+// UNSUPPORTED on such a host, so doctor and the dispatch gate disagreed about the
+// same machine and the remedy told operators to upgrade a CLI they did not need.
+// A red that is not a defect teaches people to ignore the instrument.
+func TestInspectSkipsPlanScopedRequirements(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "omp")
+	if err := os.WriteFile(path, []byte("omp-without-plan"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	checker := NewRuntimeContractChecker(&contractProbeRunner{path: path}, BuiltinRuntimeRegistry())
+
+	inspected := checker.Inspect(context.Background(), OmpRuntime)
+	if inspected.State != RuntimeContractSupported {
+		t.Fatalf("doctor Inspect state = %q on an omp that runs ordinary jobs fine, want supported: doctor must not report an optional-capability gap as a broken runtime", inspected.State)
+	}
+	for _, req := range inspected.Requirements {
+		if strings.HasPrefix(req.Flag, "--plan-yolo") {
+			t.Fatalf("Inspect evaluated plan-scoped requirement %q; doctor must skip request-scoped capabilities", req.Flag)
+		}
+	}
+	// The capability gap is still discoverable — at the one place it is required.
+	agent := Agent{Name: "seat", Runtime: OmpRuntime, AutonomyPolicy: AutonomyPolicyWorkspaceWrite}
+	planned := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{Plan: true})
+	if planned.State != RuntimeContractUnsupported {
+		t.Fatalf("a PLAN request on the same host = %q, want unsupported: skipping the flag in doctor must not skip it at dispatch", planned.State)
+	}
+}
