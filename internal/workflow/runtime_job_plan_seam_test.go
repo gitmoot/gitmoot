@@ -276,6 +276,31 @@ func functionSymbol(function *ast.FuncDecl) string {
 // which reaches the same field and looked like nothing. Recognising one spelling of
 // a write is exactly the defect this helper was added to fix, so it must not
 // reproduce it one level down. Deref, address-of and parens are all peeled.
+// planAssignTarget peels parens, pointer derefs and address-of from an assignment
+// target and returns the plan-field selector underneath, or nil.
+func planAssignTarget(expr ast.Expr) *ast.SelectorExpr {
+	for {
+		switch e := expr.(type) {
+		case *ast.ParenExpr:
+			expr = e.X
+		case *ast.StarExpr:
+			expr = e.X
+		case *ast.UnaryExpr:
+			if e.Op != token.AND {
+				return nil
+			}
+			expr = e.X
+		case *ast.SelectorExpr:
+			if e.Sel != nil && (e.Sel.Name == "Plan" || e.Sel.Name == "PlanInto") {
+				return e
+			}
+			return nil
+		default:
+			return nil
+		}
+	}
+}
+
 // planAssignSelectors renders each plan-field assignment target as receiver.field,
 // so an exemption can name one write instead of silencing a whole function. A target
 // whose receiver is not a plain identifier renders as "?.field", which cannot match
@@ -283,8 +308,13 @@ func functionSymbol(function *ast.FuncDecl) string {
 func planAssignSelectors(assign *ast.AssignStmt) []string {
 	var selectors []string
 	for _, target := range assign.Lhs {
-		selector, ok := target.(*ast.SelectorExpr)
-		if !ok || !selectorNamesPlanField(selector) {
+		// PEEL the same wrappers selectorNamesPlanField peels. Demanding a bare
+		// SelectorExpr here silently bypassed that logic — a compiled
+		// `*(&delivery.Plan) = true` passed the census while the peeler's own tests
+		// stayed green, so my refactor dropped live coverage and left a dead test
+		// asserting it. The header claimed no such assignment existed.
+		selector := planAssignTarget(target)
+		if selector == nil {
 			continue
 		}
 		receiver := identName(selector.X)
@@ -887,6 +917,29 @@ func TestPlanFieldCensusWiresEveryArm(t *testing.T) {
 			rel:  "internal/cli/skillopt_trainrun_tui.go",
 			src:  "var runSkillOptTrainRunConfirmTUI = func() { var deps, delivery struct{ Plan bool }; deps.Plan = true; delivery.Plan = true; _, _ = deps, delivery }",
 			want: []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"},
+		},
+		{
+			// PIN the qualified allowlisted alias target branch.
+			// The harness aliases 'workflow' to censusshim on purpose, so the qualified
+			// allowlisted target is spelled through the import that resolves: runtime.
+			name: "alias to a QUALIFIED allowlisted type is reported",
+			rel:  "internal/cli/x.go",
+			src:  "type JobPayload = runtime.RuntimeContractRequest\nfunc f() { _ = 0 }",
+			want: []string{"internal/cli/x.go::type JobPayload"},
+		},
+		{
+			// PIN the bare allowlisted alias target branch.
+			name: "alias to a BARE allowlisted type is reported",
+			rel:  "internal/runtime/x.go",
+			src:  "type JobPayload = RuntimeContractRequest\nfunc f() { _ = 0 }",
+			want: []string{"internal/runtime/x.go::type JobPayload"},
+		},
+		{
+			// PIN the wrapper-aware assignment target: `*(&x.Plan) = true` is a write.
+			name: "wrapped selector assignment is reported",
+			rel:  "internal/cli/x.go",
+			src:  "func f() { var j runtime.Job; *(&j.Plan) = true; _ = j }",
+			want: []string{"internal/cli/x.go::f"},
 		},
 		{
 			name: "clean file reports nothing",
