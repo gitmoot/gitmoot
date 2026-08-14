@@ -19,13 +19,22 @@ import (
 // pointed out it claimed them three lines above the list of constructions the census
 // is known to miss, which is the overclaim this file exists to not commit.
 //
+// SCOPE OF THE WALK: every package-scope declaration and every function body,
+// including function literals held in package-level vars. An earlier version read
+// only FuncDecl bodies, so a reviewer's `var _ = runtime.Job{Plan: true}` and a
+// package-level func literal assigning job.PlanInto both compiled green while the
+// header claimed no such construction existed.
+//
 // WHAT IT ACTUALLY PROVES, with every exemption named:
 //
 //   - No composite literal setting Plan or PlanInto BY KEY exists outside
 //     Mailbox.deliver, EXCEPT literals whose type is on planFieldAllowlist and
 //     resolves to its owning package (five shapes that legitimately carry such a
 //     field, listed there with reasons).
-//   - No assignment to a .Plan or .PlanInto selector exists outside Mailbox.deliver.
+//   - No assignment to a .Plan or .PlanInto selector exists outside Mailbox.deliver,
+//     EXCEPT symbols in planAssignExemptions. This arm matches a selector NAME and has
+//     no type information, so it cannot tell whose Plan field it sees; each exemption
+//     is named there with a reason.
 //   - No declaration BORROWING an allowlisted type name exists outside its owner,
 //     EXCEPT a non-alias definition of an unrelated type, and EXCEPT an alias whose
 //     target planCarryingTarget cannot see as plan-carrying. Both exceptions are
@@ -96,6 +105,19 @@ func TestRuntimeJobPlanFieldsHaveSingleGatedProducer(t *testing.T) {
 // census while the helper's own unit test stayed green — a test of a helper proves
 // the helper, not that anything CALLS it. TestPlanFieldCensusWiresEveryArm pins the
 // wiring, so deleting an arm now fails a test instead of going quiet.
+// planAssignExemptions names symbols whose `.Plan` / `.PlanInto` assignment is not a
+// runtime.Job write. The assignment arm matches a SELECTOR NAME and has no type
+// information, so unlike the composite-literal arm it cannot tell whose Plan field it
+// is looking at. Widening the walk to package-scope initializers surfaced this one
+// immediately, which is the arm's limit doing its job: an exemption here is a
+// maintainer decision with a diff and a reason, never a silent skip.
+var planAssignExemptions = map[string]string{
+	// deps.Plan is a *tui.TrainRunPlan for the SkillOpt confirm screen — a UI plan
+	// object, unrelated to runtime plan mode. Lives inside a package-level var holding
+	// a func literal, which is why the body-only walk never saw it.
+	"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI": "tui.TrainRunPlan, not runtime plan mode",
+}
+
 func planFieldProducersInFile(rel string, parsed *ast.File) []string {
 	var got []string
 	pkgPath := planFieldPackagePath(rel)
@@ -116,21 +138,22 @@ func planFieldProducersInFile(rel string, parsed *ast.File) []string {
 			}
 		}
 	}
-	for _, declaration := range parsed.Decls {
-		function, ok := declaration.(*ast.FuncDecl)
-		if !ok || function.Body == nil {
-			continue
-		}
-		ast.Inspect(function.Body, func(node ast.Node) bool {
+	// One inspector, driven over EVERY declaration's expressions rather than only
+	// function bodies. A reviewer compiled three package-scope probes that the
+	// body-only walk left green: `var _ = runtime.Job{Plan: true}`, a package-level
+	// function literal assigning job.PlanInto, and one declaring
+	// `type JobPayload = runtime.Job`. None were among the documented limits, so the
+	// header's three guarantees were false as written — a walker that reads only
+	// bodies cannot claim "no ... exists".
+	inspect := func(node ast.Node, symbol string) {
+		ast.Inspect(node, func(node ast.Node) bool {
 			switch n := node.(type) {
 			case *ast.CompositeLit:
 				// FAIL-CLOSED. This used to ask "is the literal's type runtime.Job?"
 				// and return false when it could not tell — so every type spelling
 				// the matcher did not recognise was silently exempt. Three review
 				// rounds walked past it that way, most recently with
-				// `type X = runtime.Job` (a plain refactor idiom, not an exotic act):
-				// the matcher compares the type NAME syntactically, so an alias under
-				// any other name was invisible and hasPlanField was never consulted.
+				// `type X = runtime.Job` (a plain refactor idiom, not an exotic act).
 				//
 				// The question is inverted: ANY composite literal that sets Plan or
 				// PlanInto is reported unless its type is on an explicit allowlist of
@@ -139,7 +162,7 @@ func planFieldProducersInFile(rel string, parsed *ast.File) []string {
 				// safe direction: the failure mode becomes "the census names something
 				// you must add to the allowlist", not "the census went quiet".
 				if hasPlanField(n) && !planFieldTypeIsAllowlisted(n.Type, pkgPath, imports) {
-					got = append(got, filepath.ToSlash(rel)+"::"+functionSymbol(function))
+					got = append(got, filepath.ToSlash(rel)+"::"+symbol)
 				}
 			case *ast.AssignStmt:
 				// job.Plan = true — the composite-literal scan alone missed this, and
@@ -147,22 +170,50 @@ func planFieldProducersInFile(rel string, parsed *ast.File) []string {
 				// delivered it straight past the mailbox gate while this test still
 				// passed. A seam guard that recognises only one syntax for writing a
 				// field is not a seam guard.
-				if assignsPlanField(n) {
-					got = append(got, filepath.ToSlash(rel)+"::"+functionSymbol(function))
+				if entry := filepath.ToSlash(rel) + "::" + symbol; assignsPlanField(n) {
+					if _, exempt := planAssignExemptions[entry]; !exempt {
+						got = append(got, entry)
+					}
 				}
 			case *ast.TypeSpec:
-				// A function-local `type JobPayload = runtime.Job` SHADOWS the real
-				// type, so a bare literal under that name satisfies the owning-package
-				// test above and would be exempt while producing a genuine
-				// runtime.Job. Declaring an allowlisted name anywhere inside a body is
-				// therefore reported: the allowlist grants exemption to five specific
-				// types, not to their spellings.
+				// A body-scoped `type JobPayload = runtime.Job` SHADOWS the real type,
+				// so a bare literal under that name satisfies the owning-package test
+				// and would be exempt while producing a genuine runtime.Job.
 				if declaresAllowlistedName(n, pkgPath, true, imports) {
-					got = append(got, filepath.ToSlash(rel)+"::"+functionSymbol(function))
+					got = append(got, filepath.ToSlash(rel)+"::"+symbol)
 				}
 			}
 			return true
 		})
+	}
+	for _, declaration := range parsed.Decls {
+		switch decl := declaration.(type) {
+		case *ast.FuncDecl:
+			if decl.Body != nil {
+				inspect(decl.Body, functionSymbol(decl))
+			}
+		case *ast.GenDecl:
+			// var/const initializers at package scope, including any function literal
+			// inside them. TYPE specs are handled by the pass above, which uses the
+			// package-scope rule; re-inspecting them here would apply the body rule and
+			// report the five canonical declarations.
+			if decl.Tok == token.TYPE {
+				continue
+			}
+			for _, spec := range decl.Specs {
+				value, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				name := "package-scope"
+				if len(value.Names) > 0 {
+					name = "var " + value.Names[0].Name
+				}
+				for _, expression := range value.Values {
+					inspect(expression, name)
+				}
+			}
+		}
 	}
 	return got
 }
