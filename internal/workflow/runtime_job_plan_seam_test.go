@@ -37,7 +37,7 @@ import (
 //     resolves to its owning package (five shapes that legitimately carry such a
 //     field, listed there with reasons).
 //   - No assignment to a .Plan or .PlanInto selector exists outside Mailbox.deliver,
-//     EXCEPT symbols in planAssignExemptions. This arm matches a selector NAME and has
+//     EXCEPT the exact WRITES named in planAssignExemptions, keyed file::symbol::receiver.field. This arm matches a selector NAME and has
 //     no type information, so it cannot tell whose Plan field it sees; each exemption
 //     is named there with a reason.
 //   - No declaration BORROWING an allowlisted type name exists outside its owner,
@@ -326,39 +326,13 @@ func planAssignSelectors(assign *ast.AssignStmt) []string {
 	return selectors
 }
 
-func assignsPlanField(assign *ast.AssignStmt) bool {
-	for _, lhs := range assign.Lhs {
-		if selectorNamesPlanField(lhs) {
-			return true
-		}
-	}
-	return false
-}
-
-// selectorNamesPlanField peels *, & and ( ) wrappers off an expression and reports
-// whether what remains selects Plan or PlanInto.
-func selectorNamesPlanField(expr ast.Expr) bool {
-	for {
-		switch e := expr.(type) {
-		case *ast.ParenExpr:
-			expr = e.X
-		case *ast.StarExpr:
-			expr = e.X
-		case *ast.UnaryExpr:
-			if e.Op != token.AND {
-				return false
-			}
-			expr = e.X
-		case *ast.SelectorExpr:
-			return e.Sel != nil && (e.Sel.Name == "Plan" || e.Sel.Name == "PlanInto")
-		default:
-			return false
-		}
-	}
-}
-
 // TestAssignsPlanFieldArmsTheCensus makes the assignment detector's RESULT
-// load-bearing. The census test alone did not: mutations making assignsPlanField
+// load-bearing — and it drives the function PRODUCTION CALLS. It used to exercise
+// assignsPlanField/selectorNamesPlanField, which my round-15 fix orphaned by adding a
+// SECOND peeler for the production path: both reviewers found these thirteen fixtures
+// had become false assurance, and codex proved it by regressing production to the
+// first LHS only while all three census tests stayed green. The duplicate is deleted;
+// planAssignSelectors is the only assignment detector, so a mutation to it fails here. The census test alone did not: mutations making assignsPlanField
 // always return false, or dropping PlanInto recognition, both left it green,
 // because no fixture in the tree exercised the assignment path. A detector nobody
 // tests is a detector that silently stops detecting — which is precisely how the
@@ -367,11 +341,20 @@ func selectorNamesPlanField(expr ast.Expr) bool {
 //
 // Each case is parsed from source, so the fixtures are the real syntax a producer
 // would write rather than hand-built AST nodes that could drift from the parser.
+func assignsPlanField(assign *ast.AssignStmt) bool {
+	return len(planAssignSelectors(assign)) > 0
+}
+
 func TestAssignsPlanFieldArmsTheCensus(t *testing.T) {
 	cases := []struct {
 		src  string
 		want bool
 	}{
+		// The plan write is NOT the first LHS. Without this, restricting production to
+		// assign.Lhs[:1] survived every fixture — the multi-LHS cases all happened to put
+		// the plan field first, so they proved nothing about the loop.
+		{"var x int; var j runtime.Job; x, j.Plan = 1, true; _, _ = x, j", true},
+		{"var x, y int; x, y = 1, 2; _, _ = x, y", false},
 		{"job.Plan = true", true},
 		{"job.PlanInto = x", true},
 		{"delivery.Plan, delivery.PlanInto = a, b", true},
