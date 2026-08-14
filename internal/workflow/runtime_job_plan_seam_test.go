@@ -66,6 +66,22 @@ func planFieldProducersInFile(rel string, parsed *ast.File) []string {
 	var got []string
 	pkgPath := planFieldPackagePath(rel)
 	imports := planFieldImportPaths(parsed)
+	// PACKAGE-LEVEL type declarations first. Two reviewers independently found this
+	// hole: the loop below only walks FuncDecl bodies, so `type JobPayload =
+	// runtime.Job` at package scope — plain or generic — never reached the TypeSpec arm,
+	// and an unkeyed positional literal of it compiled straight past the census.
+	for _, declaration := range parsed.Decls {
+		general, ok := declaration.(*ast.GenDecl)
+		if !ok || general.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range general.Specs {
+			typed, ok := spec.(*ast.TypeSpec)
+			if ok && declaresAllowlistedName(typed, pkgPath, false) {
+				got = append(got, filepath.ToSlash(rel)+"::type "+typed.Name.Name)
+			}
+		}
+	}
 	for _, declaration := range parsed.Decls {
 		function, ok := declaration.(*ast.FuncDecl)
 		if !ok || function.Body == nil {
@@ -107,7 +123,7 @@ func planFieldProducersInFile(rel string, parsed *ast.File) []string {
 				// runtime.Job. Declaring an allowlisted name anywhere inside a body is
 				// therefore reported: the allowlist grants exemption to five specific
 				// types, not to their spellings.
-				if declaresAllowlistedName(n, pkgPath) {
+				if declaresAllowlistedName(n, pkgPath, true) {
 					got = append(got, filepath.ToSlash(rel)+"::"+functionSymbol(function))
 				}
 			}
@@ -330,7 +346,7 @@ func planFieldImportPaths(parsed *ast.File) map[string]string {
 // bare literal under that name passes the owning-package test while producing a
 // genuine runtime.Job. The exemption belongs to five specific types, not to their
 // spellings, so any body-scoped declaration of one of those names is reported.
-func declaresAllowlistedName(spec *ast.TypeSpec, pkgPath string) bool {
+func declaresAllowlistedName(spec *ast.TypeSpec, pkgPath string, bodyScoped bool) bool {
 	if spec == nil || spec.Name == nil {
 		return false
 	}
@@ -338,8 +354,11 @@ func declaresAllowlistedName(spec *ast.TypeSpec, pkgPath string) bool {
 	if !listed {
 		return false
 	}
-	// INSIDE the owning package, any declaration of the name shadows the real type.
-	if pkgPath == owner {
+	// INSIDE the owning package, a BODY-SCOPED declaration shadows the real type — and
+	// only a body-scoped one. At package scope inside the owner the declaration IS the
+	// canonical type: reporting it made the census name its own five allowlisted types
+	// as producers. Scope is part of the rule, not an implementation detail.
+	if bodyScoped && pkgPath == owner {
 		return true
 	}
 	// OUTSIDE it, only an ALIAS (`type X = Y`, spec.Assign set) is reported. That
@@ -352,7 +371,36 @@ func declaresAllowlistedName(spec *ast.TypeSpec, pkgPath string) bool {
 	// to and is reported wherever it appears; a fresh `type JobRequest struct{ Value
 	// string }` defines something unrelated that merely reuses a name, carries no plan
 	// field, and is the innocent case a second reviewer found over-reported.
-	return spec.Assign.IsValid()
+	return spec.Assign.IsValid() && planCarryingTarget(spec.Type)
+}
+
+// planCarryingTarget reports whether an alias target is a type that can carry plan
+// fields, i.e. runtime.Job itself or an allowlisted shape. A reviewer showed the
+// unrestricted alias rule reporting `type JobPayload = string` in internal/cli as a
+// plan producer: an alias to something that has no plan field borrows a NAME but not
+// an identity, and reporting it fails innocent code for a spelling.
+func planCarryingTarget(expr ast.Expr) bool {
+	switch typed := expr.(type) {
+	case *ast.StarExpr:
+		return planCarryingTarget(typed.X)
+	case *ast.IndexExpr: // generic instantiation, e.g. Wrapper[runtime.Job]
+		return planCarryingTarget(typed.X)
+	case *ast.SelectorExpr:
+		if _, listed := planFieldAllowlist[typed.Sel.Name]; listed {
+			return true
+		}
+		return typed.Sel.Name == "Job"
+	case *ast.Ident:
+		if _, listed := planFieldAllowlist[typed.Name]; listed {
+			return true
+		}
+		return typed.Name == "Job"
+	default:
+		// Cannot name the target: fail CLOSED for an allowlisted NAME, because that is
+		// the borrowed-identity case, and an unnameable target is exactly where a
+		// producer would hide.
+		return true
+	}
 }
 
 // planFieldTypeIsAllowlisted reports whether a composite literal's type is one of
@@ -542,7 +590,7 @@ func TestDeclaresAllowlistedNameArmsTheShadowBranch(t *testing.T) {
 		}
 		var got bool
 		ast.Inspect(file, func(n ast.Node) bool {
-			if spec, ok := n.(*ast.TypeSpec); ok && declaresAllowlistedName(spec, planFieldPackagePath(tc.pkg)) {
+			if spec, ok := n.(*ast.TypeSpec); ok && declaresAllowlistedName(spec, planFieldPackagePath(tc.pkg), true) {
 				got = true
 			}
 			return true
@@ -599,6 +647,75 @@ func TestPlanFieldCensusWiresEveryArm(t *testing.T) {
 			name: "import-alias arm",
 			rel:  "internal/workflow/x.go",
 			src:  "func f() { _ = workflow.JobPayload{Plan: true} }",
+			want: []string{"internal/workflow/x.go::f"},
+		},
+		{
+			// PACKAGE-LEVEL arm. Two reviewers found this hole; four mutations survived
+			// until these fixtures existed, because the wiring test only drove bodies.
+			name: "package-level ALIAS outside the owner is reported",
+			rel:  "internal/cli/x.go",
+			src:  "type JobPayload = runtime.Job\nfunc f() { _ = 0 }",
+			want: []string{"internal/cli/x.go::type JobPayload"},
+		},
+		{
+			name: "package-level generic alias is reported",
+			rel:  "internal/cli/x.go",
+			src:  "type JobPayload[T any] = runtime.Job\nfunc f() { _ = 0 }",
+			want: []string{"internal/cli/x.go::type JobPayload"},
+		},
+		{
+			// The canonical declarations live at package scope INSIDE their owner; an
+			// earlier version of this arm reported all five as producers.
+			name: "package-level DEFINITION inside the owner is not reported",
+			rel:  "internal/workflow/x.go",
+			src:  "type JobPayload struct{ Plan bool }\nfunc f() { _ = 0 }",
+			want: nil,
+		},
+		{
+			// ALIAS TARGET. An alias to something with no plan field borrows a name, not
+			// an identity — reporting it failed innocent code for a spelling.
+			name: "alias to a non-plan-carrying target is not reported",
+			rel:  "internal/cli/x.go",
+			src:  "type JobRequest = string\nfunc f() { _ = 0 }",
+			want: nil,
+		},
+		{
+			name: "body-scoped alias to a non-plan target is not reported",
+			rel:  "internal/cli/x.go",
+			src:  "func f() { type JobPayload = string; _ = 0 }",
+			want: nil,
+		},
+		{
+			// Bare-Ident target: inside package runtime the plan-carrying type is spelled
+			// `Job`, with no qualifier. Nothing covered the Ident arm until this case.
+			name: "alias to a BARE plan-carrying Ident is reported",
+			rel:  "internal/runtime/x.go",
+			src:  "type JobPayload = Job\nfunc f() { _ = 0 }",
+			want: []string{"internal/runtime/x.go::type JobPayload"},
+		},
+		{
+			// Generic INSTANTIATION as the alias target: the target is an IndexExpr and
+			// unwraps to the type being instantiated. My first version of this fixture
+			// expected Wrapper[runtime.Job] to be reported and it was WRONG — that alias
+			// targets Wrapper, which carries no plan field. The instantiated type is what
+			// decides, so a generic Job does report and a wrapper around one does not.
+			name: "alias to a generic PLAN type is reported",
+			rel:  "internal/cli/x.go",
+			src:  "type JobPayload = runtime.Job[string]\nfunc f() { _ = 0 }",
+			want: []string{"internal/cli/x.go::type JobPayload"},
+		},
+		{
+			name: "alias to a generic WRAPPER around a plan type is not reported",
+			rel:  "internal/cli/x.go",
+			src:  "type JobPayload = Wrapper[runtime.Job]\nfunc f() { _ = 0 }",
+			want: nil,
+		},
+		{
+			// Body-scoped DEFINITION inside the owner: shadows the canonical type without
+			// being an alias, so only the scope rule can catch it.
+			name: "body-scoped definition INSIDE the owner is reported",
+			rel:  "internal/workflow/x.go",
+			src:  "func f() { type JobPayload struct{ Plan bool }; _ = 0 }",
 			want: []string{"internal/workflow/x.go::f"},
 		},
 		{
