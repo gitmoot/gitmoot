@@ -49,6 +49,8 @@ func (r *contractProbeRunner) Run(ctx context.Context, _ string, command string,
 			return subprocess.Result{}, ctx.Err()
 		case strings.Contains(mode, "unparseable"):
 			return subprocess.Result{Stdout: "???\n"}, nil
+		case strings.Contains(mode, "omp-without-plan"):
+			return subprocess.Result{Stdout: "Usage: omp [options]\n  -p, --print\n  --mode=<value>\n  --approval-mode=<value>\n  --no-session\n"}, nil
 		case strings.Contains(mode, "unsupported"):
 			return subprocess.Result{Stdout: "Usage: kimi [options]\n  --prompt\n  --output-format\n"}, nil
 		default:
@@ -102,6 +104,30 @@ func TestRuntimePreflightUnsupportedErrorNamesRequiredFlag(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q does not contain %q", err, want)
 		}
+	}
+}
+
+func TestRuntimePreflightScopesOmpPlanFlagsToPlanJobs(t *testing.T) {
+	checker, _, _ := newContractCheckerForTest(t, "omp-without-plan")
+	agent := Agent{Name: "planner", Runtime: OmpRuntime, AutonomyPolicy: AutonomyPolicyAuto}
+
+	normal := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{})
+	if normal.State != RuntimeContractSupported {
+		t.Fatalf("normal job state = %q, want supported without optional plan flags: %#v", normal.State, normal)
+	}
+	for _, requirement := range normal.Requirements {
+		if strings.HasPrefix(requirement.Flag, "--plan-yolo") {
+			t.Fatalf("normal job evaluated request-scoped requirement %#v", requirement)
+		}
+	}
+
+	plan := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{Plan: true})
+	if plan.State != RuntimeContractUnsupported {
+		t.Fatalf("plan job state = %q, want unsupported when plan flags are absent: %#v", plan.State, plan)
+	}
+	err := RuntimeContractDispatchError(agent, plan)
+	if err == nil || !strings.Contains(err.Error(), "--plan-yolo") {
+		t.Fatalf("plan job error = %v, want missing plan flag named", err)
 	}
 }
 
@@ -205,4 +231,66 @@ func TestRuntimePreflightHonorsDeclaredPrecondition(t *testing.T) {
 func registryWithContractForTest(name string, contract RuntimeContract) Registry {
 	meta := RuntimeMetadata{Name: name, Dispatchable: true, Contract: contract}
 	return Registry{order: []string{name}, entries: map[string]RuntimeMetadata{name: meta}}
+}
+
+// TestCheckShimIsPlanFalse pins the legacy 2-arg Check shim to its one meaning: a
+// NON-plan delivery. It is a shim over CheckRequest, and an untested shim is how a
+// caller silently acquires the wrong contract — the foreground dispatch preflight
+// relies on it, so if Check ever stopped implying Plan:false a plan request would
+// dispatch with its flags unverified: a guard failing silently instead of loudly.
+//
+// The omp contract is used because it is the only one carrying PlanMode-scoped
+// requirements, and a stub help that omits the plan flags is what makes the two
+// answers differ at all.
+func TestCheckShimIsPlanFalse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "omp")
+	if err := os.WriteFile(path, []byte("omp-without-plan"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	checker := NewRuntimeContractChecker(&contractProbeRunner{path: path}, BuiltinRuntimeRegistry())
+	agent := Agent{Name: "seat", Runtime: OmpRuntime, AutonomyPolicy: AutonomyPolicyWorkspaceWrite}
+
+	shim := checker.Check(context.Background(), agent)
+	explicit := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{Plan: false})
+	if shim.State != explicit.State {
+		t.Fatalf("Check state = %q but CheckRequest{Plan:false} = %q: the shim must mean exactly a non-plan delivery", shim.State, explicit.State)
+	}
+	if len(shim.Requirements) != len(explicit.Requirements) {
+		t.Fatalf("Check evaluated %d requirements, CheckRequest{Plan:false} evaluated %d", len(shim.Requirements), len(explicit.Requirements))
+	}
+	planned := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{Plan: true})
+	if len(planned.Requirements) <= len(shim.Requirements) {
+		t.Fatalf("a plan request evaluated %d requirements, no more than the non-plan %d: the plan scoping is inert, so this test could not detect a regression", len(planned.Requirements), len(shim.Requirements))
+	}
+}
+
+// TestInspectSkipsPlanScopedRequirements pins doctor's question. Inspect answers
+// "can this host run this runtime", and an omp that predates --plan-yolo runs every
+// ordinary job fine — the dispatch preflight scopes those flags to plan requests.
+// Before this, Inspect evaluated them unconditionally and reported the omp contract
+// UNSUPPORTED on such a host, so doctor and the dispatch gate disagreed about the
+// same machine and the remedy told operators to upgrade a CLI they did not need.
+// A red that is not a defect teaches people to ignore the instrument.
+func TestInspectSkipsPlanScopedRequirements(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "omp")
+	if err := os.WriteFile(path, []byte("omp-without-plan"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	checker := NewRuntimeContractChecker(&contractProbeRunner{path: path}, BuiltinRuntimeRegistry())
+
+	inspected := checker.Inspect(context.Background(), OmpRuntime)
+	if inspected.State != RuntimeContractSupported {
+		t.Fatalf("doctor Inspect state = %q on an omp that runs ordinary jobs fine, want supported: doctor must not report an optional-capability gap as a broken runtime", inspected.State)
+	}
+	for _, req := range inspected.Requirements {
+		if strings.HasPrefix(req.Flag, "--plan-yolo") {
+			t.Fatalf("Inspect evaluated plan-scoped requirement %q; doctor must skip request-scoped capabilities", req.Flag)
+		}
+	}
+	// The capability gap is still discoverable — at the one place it is required.
+	agent := Agent{Name: "seat", Runtime: OmpRuntime, AutonomyPolicy: AutonomyPolicyWorkspaceWrite}
+	planned := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{Plan: true})
+	if planned.State != RuntimeContractUnsupported {
+		t.Fatalf("a PLAN request on the same host = %q, want unsupported: skipping the flag in doctor must not skip it at dispatch", planned.State)
+	}
 }

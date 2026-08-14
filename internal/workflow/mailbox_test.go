@@ -1940,6 +1940,8 @@ type fakeDelivery struct {
 	shellEnvs             [][]string
 	agentEnvs             [][]string
 	shellUpstreamContexts []string
+	plans                 []bool
+	planIntos             []string
 	onDeliver             func()
 	pid                   int
 	err                   error
@@ -1955,6 +1957,8 @@ func (f *fakeDelivery) Deliver(_ context.Context, agent runtime.Agent, job runti
 	f.shellEnvs = append(f.shellEnvs, append([]string(nil), job.ShellEnv...))
 	f.agentEnvs = append(f.agentEnvs, append([]string(nil), job.AgentEnv...))
 	f.shellUpstreamContexts = append(f.shellUpstreamContexts, job.ShellUpstreamContext)
+	f.plans = append(f.plans, job.Plan)
+	f.planIntos = append(f.planIntos, job.PlanInto)
 	if f.pid > 0 && job.OnPID != nil {
 		job.OnPID(f.pid)
 	}
@@ -1962,10 +1966,20 @@ func (f *fakeDelivery) Deliver(_ context.Context, agent runtime.Agent, job runti
 		f.onDeliver()
 	}
 	if f.err != nil {
-		return runtime.Result{}, f.err
+		// A REAL adapter populates plan evidence on its FAILURE returns too — omp
+		// sets Result.PlanMode on both the non-zero-exit and parse-error paths,
+		// because a plan run that died is still a plan run. Returning a zero Result
+		// here made the mailbox's write-before-the-error-branch behaviour
+		// unobservable, so a mutation that recorded evidence only on success could
+		// not be killed by any test. The double has to honour the contract it
+		// stands in for.
+		return runtime.Result{PlanMode: runtime.PlanModeDescriptor(job.Plan, job.PlanInto)}, f.err
 	}
 	index := len(f.prompts) - 1
 	result := runtime.Result{}
+	// Stand in for a plan-capable adapter: report the shape that was dispatched.
+	// A job without plan mode yields "", so every non-plan test is unchanged.
+	result.PlanMode = runtime.PlanModeDescriptor(job.Plan, job.PlanInto)
 	if index >= len(f.outputs) {
 		return result, nil
 	}

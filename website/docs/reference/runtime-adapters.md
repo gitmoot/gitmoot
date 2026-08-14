@@ -54,6 +54,7 @@ Every delivery — and `agent start` — builds one argument vector:
 ```sh
 omp -p --mode=json --approval-mode=yolo --no-session \
     [--add-dir <path>]… [--model <M>] [--thinking <level>] [--max-time <s>] \
+    [--plan-yolo [--plan-yolo-into <M>]] \
     [@<staged>/prompt.md] -- '<single prompt token>'
 ```
 
@@ -80,6 +81,9 @@ Each fixed element is load-bearing:
   would become multiple separately billed turns, a prompt starting with `-`
   would be read as an unknown flag (exit 2), and one starting with `@` would be
   read as a file attachment. `--` disables all of that for the value after it.
+- `--plan-yolo` appears **if and only if** the job asked for plan mode, and
+  `--plan-yolo-into <M>` only alongside it. See
+  [Plan mode](#plan-mode) below.
 
 The adapter resolves `omp` on `PATH` *before* spawning anything, so a daemon
 that cannot see the binary reports a PATH problem instead of a parse error.
@@ -231,12 +235,25 @@ have been billed for a message whose `message_end` never reached stdout.
 | `auto` (default) | `--approval-mode=yolo` | same |
 
 Every policy passes the **same explicit** `--approval-mode=yolo`, and that is
-deliberate. omp's default tool tier is `exec` and its read/grep/ls tools declare
-no tier at all, so under `always-ask` every headless tool call throws ("requires
-approval but no interactive UI available") — a policy-to-approval mapping would
-brick the runtime rather than restrict it. Omitting the flag instead would
-inherit whatever approval mode the host config carries, which is not
-deterministic across machines.
+deliberate — for **determinism**, not because a policy mapping is impossible.
+Omitting the flag would inherit whatever approval mode the host config carries,
+which is not deterministic across machines.
+
+:::caution Corrected
+An earlier version of this page claimed that `always-ask` "would brick the runtime
+rather than restrict it", because omp's read/grep/ls tools declare no permission
+tier and every headless call would throw. **That was wrong.** Measured against
+omp 17.2.4 headless with stdin closed and no host pre-approvals: `read`, `grep`
+and read-on-a-directory all succeed (`isError:false`); `bash` and `write` return
+`isError:true` with *"requires approval but no interactive UI available"* and the
+write does not land; the process still exits `0` with a full `agent_end` envelope
+the adapter parses. So `always-ask` **restricts** omp to read-only tools and
+terminates cleanly — which is what a read-only policy wants. omp 17.2.4 has no
+`ls` tool at all. Mapping autonomy policy onto `--approval-mode` remains an open
+option for [#1479](https://github.com/gitmoot/gitmoot/issues/1479); it is simply
+not what the adapter does today, and this page must not be cited as a reason it
+cannot be.
+:::
 
 Read-only therefore stays enforced **Gitmoot-side**, exactly as it is for Kimi:
 the `implement` **capability** is refused at `agent start` and `agent subscribe`
@@ -248,11 +265,52 @@ by runtime **name** and wraps only Claude and Kimi, so no omp process is ever
 confined by it. omp separately does not advertise `produce`, which is why it
 never reaches the produce-stage wrapper either.)
 
-omp ships a `--plan-yolo` mode; the v1 adapter never passes it. When a
-plan-first omp runtime does land it will be a **separate** registered runtime,
-and it is worth stating plainly that `--plan-yolo` auto-approves the *model's
-own* plan. That is plan-first discipline inside one run; it is **not** Gitmoot's
-plan gate, where approval remains an explicit human act.
+### Plan mode
+
+omp ships a `--plan-yolo` mode and the adapter passes it — but only when the job
+asks for it. A job payload carrying `plan: true` runs
+`--plan-yolo`; adding `plan_into: "<model>"` also emits
+`--plan-yolo-into <model>`, pinning the model the execution phase runs on (omp's
+declared default target is the `smol` role). `plan_into` must be one non-flag
+model selector without internal whitespace or control characters. An unpaired
+or malformed target is rejected before dispatch.
+
+Plan mode is **workflow shape** — plan first, then auto-execute — and it is a
+separate field from the autonomy policy so the two are not conflated into one
+overloaded knob. **Separate is not independent:** plan mode ends in an
+implementation phase, and upstream omp *adds* the `write` tool to the active set
+while plan mode is armed rather than removing it. A plan request is therefore a
+**write request**, and the dispatch gate requires the same write-granting policy
+(`workspace-write` or `danger-full-access`) that an `implement` job requires. A
+plan-mode job on an `auto`/empty or `read-only` seat is refused — without that
+check, plan mode was a write bypass, because the implement-job gate keys on job
+type and never sees an `ask` job carrying a plan.
+
+On `omp/17.2.4`, `omp --version && omp --help` declares that `--plan-yolo` starts
+in read-only plan mode, auto-approves the model's plan on its first resolve call,
+then executes it, and that `--plan-yolo-into` selects the execution model. That is
+omp's versioned CLI declaration; the tool-set behavior above is what its source
+actually does. `--approval-mode` stays `yolo` for plan and non-plan runs alike.
+
+**The execution phase is a model switch.** Left unset, omp resolves
+`--plan-yolo-into` to its cheap `@smol` role, so the job's model would plan and a
+different model would write the code. Gitmoot therefore resolves the target
+itself: an explicit `plan_into` wins, otherwise the job's effective model carries
+through. The payload's `plan_mode` records the resolved target —
+`plan-into:<model>`, or `plan-into:<runtime-default>` in the one case where no
+model is resolvable — so the evidence always says which model implemented, and
+never a bare `plan` that cannot.
+
+Only the omp runtime implements plan mode. A plan request routed to any other
+runtime **fails loudly at dispatch** instead of quietly running as an ordinary
+implementation. Runtime preflight evaluates the two plan flags only for a plan
+request, so an older omp CLI that lacks those optional flags can still run
+ordinary non-plan jobs.
+
+Note that this is omp's plan-first discipline *inside one run*. Gitmoot's own plan
+step is separate and, per the owner ruling of 2026-08-14, **also auto-executes**:
+a plan proceeds into its implementation and stops only when it needs a
+confirmation or an answer from its parent seat or the owner.
 
 ### Capabilities
 

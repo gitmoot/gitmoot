@@ -63,7 +63,10 @@ func TestRuntimePreflightUnknownRecordsEventAndDispatches(t *testing.T) {
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return checkout, nil
 	}
-	worker.RuntimePreflight = func(context.Context, runtime.Agent) runtime.RuntimeContractResult {
+	worker.RuntimePreflight = func(_ context.Context, _ runtime.Agent, request runtime.RuntimeContractRequest) runtime.RuntimeContractResult {
+		if request.Plan {
+			t.Fatalf("ordinary preflight request = %#v, want no plan mode", request)
+		}
 		return runtime.RuntimeContractResult{Runtime: runtime.ShellRuntime, Version: "unknown", State: runtime.RuntimeContractUnknown, Instrument: "binary-help"}
 	}
 
@@ -91,14 +94,17 @@ func TestRuntimePreflightUnsupportedBlocksBeforeCheckout(t *testing.T) {
 	store := daemonWorkerStore(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
 	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "true", []string{"ask"}, "owner/repo")
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-runtime-unsupported", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main"})
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-runtime-unsupported", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", Plan: true, PlanInto: "@smol"})
 	worker := defaultJobWorker(store, io.Discard)
 	checkoutCalls := 0
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		checkoutCalls++
 		return "", nil
 	}
-	worker.RuntimePreflight = func(context.Context, runtime.Agent) runtime.RuntimeContractResult {
+	worker.RuntimePreflight = func(_ context.Context, _ runtime.Agent, request runtime.RuntimeContractRequest) runtime.RuntimeContractResult {
+		if !request.Plan {
+			t.Fatalf("preflight request = %#v, want plan mode threaded from payload", request)
+		}
 		return runtime.RuntimeContractResult{
 			Runtime: runtime.ShellRuntime, Version: "stub 1.2.3", State: runtime.RuntimeContractUnsupported, Instrument: "binary-help",
 			Requirements: []runtime.RuntimeRequirementResult{{Kind: runtime.RuntimeRequirementFlag, Name: "flag --required", Flag: "--required", Source: "internal/runtime/test::args", Remedy: "install a compatible runtime", State: runtime.RuntimeContractUnsupported, Instrument: "binary-help"}},

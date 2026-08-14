@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
@@ -120,7 +121,10 @@ func (a OmpAdapter) Start(ctx context.Context, request StartRequest) (StartResul
 		return StartResult{}, err
 	}
 	defer cleanup()
-	args := ompArgs(request.Agent, request.Agent.Model, ompThinkingLevel(request.Agent.Effort), ompMaxTimeArg(ctx), attachArgs, promptArg)
+	// Start never carries a plan request: it registers a seat, it does not run a
+	// brief. The primitives are passed explicitly so the single argv builder has no
+	// implicit default to drift from.
+	args := ompArgs(request.Agent, request.Agent.Model, ompThinkingLevel(request.Agent.Effort), ompMaxTimeArg(ctx), false, "", attachArgs, promptArg)
 	result, err := a.runner().Run(ctx, a.Dir, "omp", args...)
 	if err != nil {
 		return StartResult{Raw: result.Stdout + result.Stderr}, ompCommandError(result, err)
@@ -206,6 +210,26 @@ func (a OmpAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, 
 	if err := a.Validate(ctx, agent); err != nil {
 		return Result{}, err
 	}
+	// Plan shape is validated before the PATH preflight: it is a property of the
+	// REQUEST, so it is wrong for its diagnosis to depend on whether omp happens to
+	// be installed.
+	//
+	// The pairing check is about the REQUEST (plan_into without plan is a malformed
+	// ask), so it takes the request field. The character check is about the RESOLVED
+	// target, because carrying the job's effective model into --plan-yolo-into moved
+	// a SECOND value into that argv slot: a plan job with Model "--add-dir=/"
+	// produced `--model --add-dir=/ --plan-yolo --plan-yolo-into --add-dir=/`.
+	// Hardening one input and routing another into the same position is not
+	// hardening. They are separate calls because the resolved target is non-empty
+	// for ordinary non-plan jobs too, where the pairing rule must NOT fire.
+	if err := ompValidatePlan(job.Plan, job.PlanInto); err != nil {
+		return Result{}, err
+	}
+	if job.Plan {
+		if err := ompValidatePlanTarget(ompPlanTarget(EffectiveModel(agent, job), job.PlanInto)); err != nil {
+			return Result{}, err
+		}
+	}
 	// PATH preflight before anything else runs: the daemon's PATH comes from its
 	// systemd EnvironmentFile, so "works in my shell" is not evidence the daemon
 	// can spawn omp. Failing here means ZERO subprocesses ran and the operator gets
@@ -222,7 +246,11 @@ func (a OmpAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, 
 		return Result{}, err
 	}
 	defer cleanup()
-	args := ompArgs(agent, EffectiveModel(agent, job), ompThinkingLevel(effectiveEffort(agent, job)), ompMaxTimeArg(ctx), attachArgs, promptArg)
+	// Evidence and argv resolve the SAME target through the same function, so the
+	// recorded plan_mode can never disagree with the model the run actually used.
+	effModel := EffectiveModel(agent, job)
+	planMode := PlanModeDescriptor(job.Plan, ompPlanTarget(effModel, job.PlanInto))
+	args := ompArgs(agent, effModel, ompThinkingLevel(effectiveEffort(agent, job)), ompMaxTimeArg(ctx), job.Plan, job.PlanInto, attachArgs, promptArg)
 	// STDIN INVARIANT: omp's CLI reads stdin to EOF for every non-protocol mode,
 	// including --mode=json (main.ts:1209 calls readPipedInput, main.ts:191-207 does
 	// `await Bun.stdin.text()` whenever `process.stdin.isTTY === false`). It is safe
@@ -246,6 +274,7 @@ func (a OmpAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, 
 			Raw:          result.Stdout + result.Stderr,
 			InputTokens:  usage.InputTokens,
 			OutputTokens: usage.OutputTokens,
+			PlanMode:     planMode,
 			SessionDiag:  newSessionDiag(result, err, sessionID),
 		}, ompCommandError(result, err)
 	}
@@ -265,6 +294,7 @@ func (a OmpAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, 
 			Raw:          result.Stdout,
 			InputTokens:  usage.InputTokens,
 			OutputTokens: usage.OutputTokens,
+			PlanMode:     planMode,
 			SessionDiag:  newSessionDiag(result, nil, sessionID),
 		}, ompCommandError(result, parseErr)
 	}
@@ -273,6 +303,7 @@ func (a OmpAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, 
 		Summary:      strings.TrimSpace(content),
 		InputTokens:  usage.InputTokens,
 		OutputTokens: usage.OutputTokens,
+		PlanMode:     planMode,
 		SessionDiag:  newSessionDiag(result, nil, sessionID),
 	}, nil
 }
@@ -341,29 +372,51 @@ func (a OmpAdapter) preflight() error {
 // path and go missing on the other. Shape (asserted byte-for-byte in tests):
 //
 //	omp -p --mode=json --approval-mode=yolo --no-session [--add-dir <p>]…
-//	    [--model <M>] [--thinking <lvl>] [--max-time <s>] [@<staged>/prompt.md]
+//	    [--model <M>] [--thinking <lvl>] [--max-time <s>]
+//	    [--plan-yolo [--plan-yolo-into <M>]] [@<staged>/prompt.md]
 //	    -- <single prompt token>
 //
 // Every fixed element is load-bearing:
 //
 //   - `-p --mode=json` selects print mode with the NDJSON envelope this adapter
 //     parses; without --mode=json omp prints prose and every job fails extraction.
-//   - `--approval-mode=yolo` is passed EXPLICITLY for every autonomy policy. omp's
-//     default tool tier is "exec" and its read/grep/ls tools declare no tier at
-//     all, so under `always-ask` every headless tool call THROWS ("requires
-//     approval but no interactive UI available") — a policy-to-approval mapping
-//     would brick the runtime rather than restrict it. Omitting the flag instead
+//   - `--approval-mode=yolo` is passed EXPLICITLY for every autonomy policy, for
+//     DETERMINISM, not because a policy mapping is impossible. Omitting the flag
 //     would inherit whatever tools.approvalMode the host config carries, which is
-//     not deterministic across machines. read-only stays enforced Gitmoot-side by
-//     readOnlyImplementationBlocked (the kimi precedent) and by NOTHING ELSE: the
-//     Landlock wrapper selects by runtime NAME and wraps only claude/kimi (both
-//     call sites in cli/daemon_worker.go), so no omp process is ever confined.
+//     not deterministic across machines.
+//     A previous version of this comment claimed always-ask would "brick the
+//     runtime" because read/grep/ls declare no tier and every headless call
+//     throws. That was WRONG and is corrected here against a measurement of the
+//     pinned CLI (omp 17.2.4, headless, stdin closed, no host pre-approvals):
+//     read, grep and read-on-a-directory all return isError:false and SUCCEED;
+//     bash and write return isError:true with "requires approval but no
+//     interactive UI available" and the write does not land; the process still
+//     exits 0 with a full agent_end envelope this adapter parses. So always-ask
+//     RESTRICTS omp to read-only tools and terminates cleanly — which is exactly
+//     what a read-only autonomy policy wants. omp 17.2.4 has no `ls` tool at all.
+//     Mapping autonomy policy onto --approval-mode is therefore a live option for
+//     #1479's dispatch-surface question, not a foreclosed one; it is simply not
+//     done here, and this comment must not be cited as a reason it cannot be.
+//     Today read-only stays enforced Gitmoot-side by readOnlyImplementationBlocked
+//     (the kimi precedent) and by NOTHING ELSE: the Landlock wrapper selects by
+//     runtime NAME and wraps only claude/kimi (both call sites in
+//     cli/daemon_worker.go), so no omp process is ever confined.
 //   - `--no-session` keeps the run in memory: no per-worktree session .jsonl
 //     accretion, and nothing to accidentally resume (v1 never resumes).
 //   - the prompt is exactly ONE token after `--`: multiple positionals become
 //     multiple sequential (separately billed) turns, a prompt starting with `-` is
 //     read as an unknown flag and exits 2, and one starting with `@` is read as a
 //     file attachment. `--` disables all of that for the value that follows.
+//   - `--plan-yolo` is emitted IF AND ONLY IF the job asked for plan mode. It is
+//     ORTHOGONAL to --approval-mode: plan mode is workflow shape while approval mode
+//     controls tool approval. omp/17.2.4's `omp --help` DECLARES that --plan-yolo
+//     starts read-only, auto-approves the model's plan on its first resolve call and
+//     then executes it; Gitmoot cannot observe those internal transitions. The same
+//     help declares `--plan-yolo-into <M>` as the execution model selector with the
+//     "smol" role as its default. ompValidatePlan rejects malformed or unpaired
+//     targets BEFORE any subprocess, and a plan request aimed at a runtime
+//     SupportsPlanMode rejects never reaches an argv at all. A silent downgrade to
+//     a normal run is the defect this ordering exists to prevent.
 var ompRuntimeContract = RuntimeContract{
 	Binary: "omp",
 	Requirements: []RuntimeRequirement{
@@ -371,10 +424,58 @@ var ompRuntimeContract = RuntimeContract{
 		{Kind: RuntimeRequirementFlag, Name: "flag --mode", Flag: "--mode", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --mode, or run the job on a runtime whose installed CLI satisfies its declared contract"},
 		{Kind: RuntimeRequirementFlag, Name: "flag --approval-mode", Flag: "--approval-mode", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --approval-mode, or run the job on a runtime whose installed CLI satisfies its declared contract"},
 		{Kind: RuntimeRequirementFlag, Name: "flag --no-session", Flag: "--no-session", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --no-session, or run the job on a runtime whose installed CLI satisfies its declared contract"},
+		{Kind: RuntimeRequirementFlag, Name: "flag --plan-yolo", Flag: "--plan-yolo", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --plan-yolo, or run the job on a runtime whose installed CLI satisfies its declared contract", PlanMode: true},
+		{Kind: RuntimeRequirementFlag, Name: "flag --plan-yolo-into", Flag: "--plan-yolo-into", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --plan-yolo-into, or run the job on a runtime whose installed CLI satisfies its declared contract", PlanMode: true},
 	},
 }
 
-func ompArgs(agent Agent, model string, thinking string, maxTime string, attachArgs []string, prompt string) []string {
+// ompValidatePlan rejects a plan REQUEST shape omp's CLI cannot honour BEFORE any
+// subprocess runs. `--plan-yolo-into` without `--plan-yolo` makes omp exit
+// non-zero with no NDJSON envelope at all, which this adapter would diagnose as a
+// truncated stream — the wrong cause for a request shape we can reject here with
+// the actual fix. It also rejects a malformed requested target early, so the
+// operator hears about the field they actually set.
+func ompValidatePlan(plan bool, planInto string) error {
+	into := strings.TrimSpace(planInto)
+	if into != "" && !plan {
+		return fmt.Errorf("omp plan target %q requires plan mode: --plan-yolo-into is only accepted alongside --plan-yolo (set plan on the job, or drop plan_into)", into)
+	}
+	return ompValidatePlanTarget(into)
+}
+
+// ompValidatePlanTarget rejects any value that would land at the --plan-yolo-into
+// argv position. It is applied to the RESOLVED target, not only to a caller's
+// plan_into, because the resolver falls back to the job's effective model — so a
+// model value reaches a flag-value slot and inherits this slot's rules. A leading
+// `-` would be read as a flag by a stricter parser than today's; whitespace or a
+// control character in a model selector reaches execve.
+func ompValidatePlanTarget(target string) error {
+	into := strings.TrimSpace(target)
+	if into == "" {
+		return nil
+	}
+	if strings.HasPrefix(into, "-") || strings.IndexFunc(into, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}) >= 0 {
+		return fmt.Errorf("omp plan target %q is invalid: the plan execution target must be one non-flag model selector without whitespace or control characters (for example @smol or provider/model). It is either the job's plan_into or, when that is unset, the job's effective model — correct whichever is set", into)
+	}
+	return nil
+}
+
+// ompPlanTarget resolves the model the plan's EXECUTION phase runs on: an explicit
+// plan_into if the caller set one, otherwise the job's effective model so the pin
+// governs the phase that writes the code. Both empty leaves the flag off and omp
+// falls back to its own "@smol" default — the one case Gitmoot cannot name, and the
+// reason PlanModeDescriptor reports "plan-into:<runtime-default>" there instead of
+// claiming a target it did not choose.
+func ompPlanTarget(model string, planInto string) string {
+	if into := strings.TrimSpace(planInto); into != "" {
+		return into
+	}
+	return strings.TrimSpace(model)
+}
+
+func ompArgs(agent Agent, model string, thinking string, maxTime string, plan bool, planInto string, attachArgs []string, prompt string) []string {
 	args := []string{"-p", "--mode=json", "--approval-mode=yolo", "--no-session"}
 	args = append(args, ompWorkspaceArgs(agent)...)
 	if model != "" {
@@ -386,6 +487,23 @@ func ompArgs(agent Agent, model string, thinking string, maxTime string, attachA
 	if maxTime != "" {
 		args = append(args, "--max-time", maxTime)
 	}
+	// Plan mode is opt-in and never inferred: no plan request, no flag, so a normal
+	// run's argv stays byte-identical.
+	//
+	// THE EXECUTION PHASE IS A MODEL SWITCH, so --plan-yolo-into is resolved here
+	// rather than left to omp. Upstream takes `parsed.planYoloInto ?? "@smol"` and
+	// pins the implementing phase to it (main.ts:1030-1042 -> setModelTemporary),
+	// so a bare --plan-yolo means the job's model plans and omp's cheap smol role
+	// writes the diff — the job's pin silently not applying to the phase that
+	// produces the change, and Result.PlanMode unable to say which model did. An
+	// explicit plan_into always wins; otherwise the job's effective model carries
+	// through, so plan mode changes the workflow shape and nothing else.
+	if plan {
+		args = append(args, "--plan-yolo")
+		if into := ompPlanTarget(model, planInto); into != "" {
+			args = append(args, "--plan-yolo-into", into)
+		}
+	}
 	// Attachments must precede `--`; everything after it is message text.
 	args = append(args, attachArgs...)
 	return append(args, "--", prompt)
@@ -396,8 +514,13 @@ func ompArgs(agent Agent, model string, thinking string, maxTime string, attachA
 // cooperative visibility hints for omp's own file layer and NOT an enforcement
 // boundary: --add-dir does not make the readable subset read-only, and omp gets no
 // Landlock confinement underneath either (that wrapper selects by runtime name and
-// wraps only claude/kimi). readOnlyImplementationBlocked is the ONLY gate that
-// keeps a read-only omp agent from writing.
+// wraps only claude/kimi). TWO gates keep a read-only omp agent from writing, and
+// they cover disjoint job shapes: readOnlyImplementationBlocked refuses an
+// implement-typed job (it returns false for every other type), and the mailbox
+// plan gate refuses a plan-mode job of ANY type. Before that second gate existed,
+// an `ask` job carrying plan was a write bypass on a read-only seat — plan mode
+// auto-executes and upstream adds the write tool — so if you add a third path that
+// can end in a write, it needs its own gate here; neither existing one will cover it.
 func ompWorkspaceArgs(agent Agent) []string {
 	var args []string
 	for _, path := range agent.WritablePaths {

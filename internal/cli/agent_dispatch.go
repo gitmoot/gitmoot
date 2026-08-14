@@ -583,7 +583,21 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	return buildLocalAgentJobOutput(latest, request)
 }
 
-var localRuntimeContractPreflight = runtime.DefaultRuntimeContractChecker().Check
+// localRuntimeContractPreflight is the FOREGROUND dispatch preflight. It is
+// request-shaped on purpose, matching the daemon worker's RuntimePreflight, so the
+// repo has ONE shape for one decision rather than two: the daemon threads
+// payload.Plan, and this must thread the request's plan the moment a CLI surface
+// can carry one.
+//
+// The empty request is correct TODAY and only today: no CLI flag reaches plan mode
+// (gitmoot#1425 owes that surface), so a foreground dispatch can never be a plan
+// request. When #1425 lands `--plan`, this call MUST pass it — otherwise the plan
+// flags are dispatched to an omp CLI whose support was never verified, and the
+// guard fails silently rather than loudly. That is the whole failure mode this
+// contract exists to prevent, so it is named here at the call site.
+var localRuntimeContractPreflight = func(ctx context.Context, agent runtime.Agent) runtime.RuntimeContractResult {
+	return runtime.DefaultRuntimeContractChecker().CheckRequest(ctx, agent, runtime.RuntimeContractRequest{Plan: false})
+}
 
 func promptHeadContradictionWarnings(ctx context.Context, git gitutil.Client, prompt string, dispatchHead string) []string {
 	if strings.TrimSpace(prompt) == "" {

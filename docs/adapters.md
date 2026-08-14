@@ -125,8 +125,27 @@ builder, so no flag can appear on one path and go missing on the other:
 ```sh
 omp -p --mode=json --approval-mode=yolo --no-session \
     [--add-dir <path>]… [--model <M>] [--thinking <level>] [--max-time <s>] \
+    [--plan-yolo [--plan-yolo-into <M>]] \
     [@<staged>/prompt.md] -- '<single prompt token>'
 ```
+
+`--plan-yolo` appears if and only if the job asked for plan mode (`plan` /
+`plan_into` on the job payload), with `--plan-yolo-into` pinning the model the
+execution phase runs on. `plan_into` must be one non-flag model selector with no
+internal whitespace or control characters. It is orthogonal to
+`--approval-mode`, which stays `yolo` for every job, plan or not. `plan_into`
+without `plan`, malformed targets, and a plan request routed to any non-omp
+runtime are refused before dispatch — a plan-gated brief never silently
+degrades into an ordinary implementation. Runtime preflight requires the two
+plan flags only for plan requests; an ordinary omp job does not require them.
+
+This behavior description is grounded in a versioned CLI declaration, not an
+internal transition Gitmoot can observe. On `omp/17.2.4`, run
+`omp --version && omp --help`: the help declares that `--plan-yolo` starts in
+read-only plan mode, auto-approves the model's plan on its first resolve call,
+then executes it, and that `--plan-yolo-into` selects the execution model with
+the `smol` role as the default. Gitmoot verifies the installed flags and records
+the requested plan shape; it cannot verify omp's internal phase transitions.
 
 Startup stores the session id from the NDJSON header line, but delivery never
 uses it: omp is stateless in v1 and never passes `--resume`, `--continue`, or

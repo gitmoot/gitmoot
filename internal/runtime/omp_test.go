@@ -362,11 +362,18 @@ func ompTestAgent() Agent {
 // overwrites the parsed --cwd), so a job would edit the previous worktree and
 // leave its own clean; --session-dir would accrete per-worktree session state for
 // a runtime that never resumes; --yolo/--auto-approve are the aliases the explicit
-// --approval-mode replaces; --plan-yolo is a separate runtime, not a v1 flag; and
-// --profile is deferred until per-seat isolation is designed.
+// --approval-mode replaces; and --profile is deferred until per-seat isolation is
+// designed.
+//
+// --plan-yolo is deliberately ABSENT from this list and is NOT unguarded: a
+// blanket ban would be weaker than what the adapter now owes. It is governed by
+// assertOmpPlanArgv's IF-AND-ONLY-IF assertion instead, which subsumes the ban
+// (no plan request => the flag must not appear in any spelling) and additionally
+// catches the two failures a ban cannot see: a plan request whose flag went
+// MISSING, and a plan run that lost --approval-mode=yolo.
 var ompForbiddenFlags = []string{
 	"--resume", "--continue", "--fork", "--session-dir",
-	"--yolo", "--auto-approve", "--plan-yolo", "--profile",
+	"--yolo", "--auto-approve", "--profile",
 }
 
 func assertNoForbiddenOmpFlags(t *testing.T, argv []string) {
@@ -377,6 +384,62 @@ func assertNoForbiddenOmpFlags(t *testing.T, argv []string) {
 				t.Fatalf("argv carries forbidden flag %q: %v", forbidden, argv)
 			}
 		}
+	}
+	// Every omp argv, plan or not, carries the explicit yolo approval mode: plan
+	// mode is workflow shape, the approval mode is write permission, and the flag is
+	// pinned for DETERMINISM (omitting it inherits the host config). It is NOT
+	// pinned because always-ask is unusable — that claim was measured and refuted;
+	// see the ompRuntimeContract comment.
+	if got := ompCountToken(argv, "--approval-mode=yolo"); got != 1 {
+		t.Fatalf("--approval-mode=yolo appears %d times, want exactly 1: %v", got, argv)
+	}
+}
+
+// assertOmpPlanArgv is the plan-mode IF-AND-ONLY-IF guard: --plan-yolo appears
+// exactly when the job asked for plan mode and NEVER otherwise, --plan-yolo-into
+// appears exactly when a target is resolvable, it carries that target, it directly
+// follows --plan-yolo (omp only accepts the pair), and neither flag ever shows up
+// in an `=` spelling the adapter does not emit. --approval-mode=yolo is
+// re-asserted on both sides so plan mode can never be mistaken for an approval
+// setting.
+//
+// wantTarget is what the CALLER expects, stated independently rather than
+// recomputed through ompPlanTarget: a test that asks production for the answer it
+// is checking passes through any change to the resolution rule — including the
+// silent-@smol behaviour this guard now exists to prevent.
+func assertOmpPlanArgv(t *testing.T, argv []string, plan bool, wantTarget string) {
+	t.Helper()
+	wantTarget = strings.TrimSpace(wantTarget)
+	wantPlan, wantInto := 0, 0
+	if plan {
+		wantPlan = 1
+		if wantTarget != "" {
+			wantInto = 1
+		}
+	}
+	for _, arg := range argv {
+		if strings.HasPrefix(arg, "--plan-yolo") && arg != "--plan-yolo" && arg != "--plan-yolo-into" {
+			t.Fatalf("argv carries an unrecognized plan flag spelling %q: %v", arg, argv)
+		}
+	}
+	if got := ompCountToken(argv, "--plan-yolo"); got != wantPlan {
+		t.Fatalf("--plan-yolo appears %d times, want %d (plan=%v): %v", got, wantPlan, plan, argv)
+	}
+	if got := ompCountToken(argv, "--plan-yolo-into"); got != wantInto {
+		t.Fatalf("--plan-yolo-into appears %d times, want %d (plan=%v target=%q): %v", got, wantInto, plan, wantTarget, argv)
+	}
+	if wantInto == 1 {
+		if got := ompFlagValue(argv, "--plan-yolo-into"); got != wantTarget {
+			t.Fatalf("--plan-yolo-into = %q, want %q: %v", got, wantTarget, argv)
+		}
+		for i, arg := range argv {
+			if arg == "--plan-yolo-into" && (i == 0 || argv[i-1] != "--plan-yolo") {
+				t.Fatalf("--plan-yolo-into must directly follow --plan-yolo (omp rejects it alone): %v", argv)
+			}
+		}
+	}
+	if got := ompCountToken(argv, "--approval-mode=yolo"); got != 1 {
+		t.Fatalf("--approval-mode=yolo appears %d times, want exactly 1 (plan=%v): %v", got, plan, argv)
 	}
 }
 
@@ -539,6 +602,8 @@ func TestOmpDeliverNeverResumes(t *testing.T) {
 			}
 			for _, call := range runner.calls {
 				assertNoForbiddenOmpFlags(t, call)
+				// No plan was requested, so no plan flag may exist in any spelling.
+				assertOmpPlanArgv(t, call, false, "")
 			}
 		})
 	}
@@ -557,6 +622,336 @@ func TestOmpDeliverIsSessionless(t *testing.T) {
 		t.Fatalf("--no-session appears %d times, want exactly 1: %v", got, argv)
 	}
 	assertNoForbiddenOmpFlags(t, argv)
+	assertOmpPlanArgv(t, argv, false, "")
+}
+
+// TestOmpPlanArgv pins the plan-mode argv byte for byte on BOTH sides of the
+// if-and-only-if: a job that asked for nothing gets no plan flag, a plan job gets
+// --plan-yolo, and a pinned execution model gets --plan-yolo-into directly after
+// it. --approval-mode=yolo survives every variant — plan mode is workflow shape
+// and the approval mode is write permission, two separate things, and the flag is
+// pinned for determinism rather than because always-ask would break omp (measured
+// and refuted; see the ompRuntimeContract comment). Result.PlanMode is asserted
+// alongside so the durable evidence cannot drift from the argv it describes.
+func TestOmpPlanArgv(t *testing.T) {
+	base := []string{"omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session"}
+	cases := []struct {
+		name         string
+		job          Job
+		wantTail     []string
+		wantPlanMode string
+	}{
+		{
+			name:     "no plan request emits no plan flag",
+			job:      Job{Prompt: "work"},
+			wantTail: []string{"--", "work"},
+		},
+		{
+			// A bare plan request with no model anywhere is the ONE case Gitmoot
+			// cannot name a target for, so the flag stays off and omp applies its
+			// own default. The evidence says so rather than claiming a pin.
+			name:         "plan with no model resolvable leaves the target to the runtime",
+			job:          Job{Prompt: "work", Plan: true},
+			wantTail:     []string{"--plan-yolo", "--", "work"},
+			wantPlanMode: "plan-into:<runtime-default>",
+		},
+		{
+			// THE REGRESSION GUARD: the execution phase is a model switch, so a
+			// job's pin must reach it. Before this, a bare --plan-yolo let omp
+			// resolve @smol and the cheap default wrote the diff while the pinned
+			// model only planned.
+			name:         "the job model carries into the execution phase when plan_into is absent",
+			job:          Job{Prompt: "work", Model: "openai/gpt-5.5", Plan: true},
+			wantTail:     []string{"--model", "openai/gpt-5.5", "--plan-yolo", "--plan-yolo-into", "openai/gpt-5.5", "--", "work"},
+			wantPlanMode: "plan-into:openai/gpt-5.5",
+		},
+		{
+			name:         "plan_into pins the execution model immediately after --plan-yolo",
+			job:          Job{Prompt: "work", Plan: true, PlanInto: "@smol"},
+			wantTail:     []string{"--plan-yolo", "--plan-yolo-into", "@smol", "--", "work"},
+			wantPlanMode: "plan-into:@smol",
+		},
+		{
+			// An explicit plan_into always wins over the job's model: the caller
+			// asking for a cheap executor is a choice, not an accident.
+			name:         "an explicit plan_into overrides the job model",
+			job:          Job{Prompt: "work", Model: "openai/gpt-5.5", Plan: true, PlanInto: "@smol"},
+			wantTail:     []string{"--model", "openai/gpt-5.5", "--plan-yolo", "--plan-yolo-into", "@smol", "--", "work"},
+			wantPlanMode: "plan-into:@smol",
+		},
+		{
+			name:         "a blank plan_into falls through to the job model, not to the runtime default",
+			job:          Job{Prompt: "work", Model: "openai/gpt-5.5", Plan: true, PlanInto: "   "},
+			wantTail:     []string{"--model", "openai/gpt-5.5", "--plan-yolo", "--plan-yolo-into", "openai/gpt-5.5", "--", "work"},
+			wantPlanMode: "plan-into:openai/gpt-5.5",
+		},
+		{
+			// The documented order: model/thinking first, then the plan pair, then
+			// the prompt. A plan flag that drifted after `--` would be read as
+			// message text and the run would silently be a normal one.
+			name:         "plan follows model and effort in the documented order",
+			job:          Job{Prompt: "work", Model: "openai/gpt-5.5", Effort: "high", Plan: true, PlanInto: "anthropic/claude-haiku-4"},
+			wantTail:     []string{"--model", "openai/gpt-5.5", "--thinking", "high", "--plan-yolo", "--plan-yolo-into", "anthropic/claude-haiku-4", "--", "work"},
+			wantPlanMode: "plan-into:anthropic/claude-haiku-4",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}}
+			adapter := OmpAdapter{Runner: runner, Dir: "/repo"}
+			result, err := adapter.Deliver(context.Background(), ompTestAgent(), tc.job)
+			if err != nil {
+				t.Fatalf("Deliver: %v", err)
+			}
+			want := append(append([]string(nil), base...), tc.wantTail...)
+			runner.want(t, 0, want...)
+			// The target the argv must carry is read back out of the evidence string
+			// each case already declares, so argv and plan_mode are checked against
+			// ONE stated expectation instead of two that could drift apart.
+			wantTarget := strings.TrimPrefix(tc.wantPlanMode, "plan-into:")
+			if wantTarget == tc.wantPlanMode || wantTarget == "<runtime-default>" {
+				wantTarget = ""
+			}
+			assertOmpPlanArgv(t, runner.calls[0], tc.job.Plan, wantTarget)
+			assertNoForbiddenOmpFlags(t, runner.calls[0])
+			if result.PlanMode != tc.wantPlanMode {
+				t.Fatalf("Result.PlanMode = %q, want %q", result.PlanMode, tc.wantPlanMode)
+			}
+		})
+	}
+}
+
+// TestOmpPlanEvidenceSurvivesFailure closes surviving mutant M8: dropping
+// `PlanMode: planMode` from BOTH failure returns left the whole suite green, even
+// though three separate comments in this codebase insist "a plan run that died is
+// still a plan run". The only test reading Result.PlanMode fed a healthy stream in
+// every case, so the two error returns were never observed. A plan run's evidence
+// matters MOST when it failed — that is when someone asks what was dispatched.
+func TestOmpPlanEvidenceSurvivesFailure(t *testing.T) {
+	job := Job{Prompt: "work", Model: "openai/gpt-5.5", Plan: true, PlanInto: "@smol"}
+	const want = "plan-into:@smol"
+	t.Run("non-zero exit still reports the plan shape", func(t *testing.T) {
+		runner := &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}, errs: []error{errors.New("exit status 1")}}
+		adapter := OmpAdapter{Runner: runner, Dir: "/repo"}
+		result, err := adapter.Deliver(context.Background(), ompTestAgent(), job)
+		if err == nil {
+			t.Fatal("Deliver succeeded on a failing runner")
+		}
+		if result.PlanMode != want {
+			t.Fatalf("Result.PlanMode on the non-zero-exit return = %q, want %q", result.PlanMode, want)
+		}
+	})
+	t.Run("an unparseable stream still reports the plan shape", func(t *testing.T) {
+		runner := &fakeRunner{results: []subprocess.Result{{Stdout: "not ndjson at all\n"}}}
+		adapter := OmpAdapter{Runner: runner, Dir: "/repo"}
+		result, err := adapter.Deliver(context.Background(), ompTestAgent(), job)
+		if err == nil {
+			t.Fatal("Deliver succeeded on an unparseable stream")
+		}
+		if result.PlanMode != want {
+			t.Fatalf("Result.PlanMode on the parse-error return = %q, want %q", result.PlanMode, want)
+		}
+	})
+}
+
+// TestOmpPlanPairPrecedesAttachment closes surviving mutant M18: moving the whole
+// plan block after the attachment append left the suite green, because every
+// byte-exact case used a short prompt and so never staged one. The documented argv
+// shape puts the plan pair BEFORE the attachment, and omp reads a `@`-prefixed
+// token as a file only when it was not already consumed as a flag value — so the
+// ordering is load-bearing, not cosmetic.
+func TestOmpPlanPairPrecedesAttachment(t *testing.T) {
+	argv := ompArgs(Agent{}, "openai/gpt-5.5", "", "", true, "@smol", []string{"@/staged/prompt.md"}, "work")
+	planAt, attachAt := -1, -1
+	for i, a := range argv {
+		if a == "--plan-yolo" && planAt < 0 {
+			planAt = i
+		}
+		if a == "@/staged/prompt.md" {
+			attachAt = i
+		}
+	}
+	if planAt < 0 || attachAt < 0 {
+		t.Fatalf("expected both a plan flag and a staged attachment: %v", argv)
+	}
+	if planAt > attachAt {
+		t.Fatalf("plan pair must precede the staged attachment (omp only reads @tokens it did not consume as a flag value): %v", argv)
+	}
+}
+
+// TestOmpPlanValidationPrecedesPreflight closes surviving mutant M12: moving the
+// ompValidatePlan call after the PATH preflight left the suite green, because the
+// test runner's LookPath always succeeds so the ordering was unobservable. Plan
+// shape is a property of the REQUEST, so its diagnosis must not depend on whether
+// omp happens to be installed — an operator with a malformed plan_into on a host
+// without omp should be told about the plan_into.
+func TestOmpPlanValidationPrecedesPreflight(t *testing.T) {
+	adapter := OmpAdapter{Runner: &lookPathFailRunner{}, Dir: "/repo"}
+	_, err := adapter.Deliver(context.Background(), ompTestAgent(), Job{Prompt: "work", Plan: true, PlanInto: "--add-dir=/"})
+	if err == nil {
+		t.Fatal("Deliver accepted a malformed plan target")
+	}
+	if !strings.Contains(err.Error(), "plan target") {
+		t.Fatalf("with omp absent AND a malformed plan target, the error must name the plan target, got: %v", err)
+	}
+}
+
+// lookPathFailRunner reports omp as absent so the PATH preflight would fail if it
+// ran first.
+type lookPathFailRunner struct{ fakeRunner }
+
+func (r *lookPathFailRunner) LookPath(string) (string, error) {
+	return "", errors.New("executable file not found in $PATH")
+}
+
+// TestOmpArgsPlanIffAcrossShapes runs the if-and-only-if guard over the whole
+// primitive matrix the argv builder accepts. It is the "never otherwise" half:
+// no combination of model, effort, workspace grants, max-time, or attachments may
+// conjure a plan flag, and none may swallow one that was asked for.
+func TestOmpArgsPlanIffAcrossShapes(t *testing.T) {
+	agents := map[string]Agent{
+		"bare":   {},
+		"grants": {WritablePaths: []string{"/work/out"}, ReadablePaths: []string{"/inputs"}},
+	}
+	extras := map[string][]string{
+		"no attachment": nil,
+		"attachment":    {"@/staged/prompt.md"},
+	}
+	for agentName, agent := range agents {
+		for extraName, attach := range extras {
+			for _, model := range []string{"", "openai/gpt-5.5"} {
+				for _, thinking := range []string{"", "high"} {
+					for _, maxTime := range []string{"", "600"} {
+						for _, plan := range []bool{false, true} {
+							for _, into := range []string{"", "@smol"} {
+								if !plan && into != "" {
+									continue // rejected before dispatch; not representable
+								}
+								argv := append([]string{"omp"}, ompArgs(agent, model, thinking, maxTime, plan, into, attach, "work")...)
+								// The rule, restated here rather than borrowed from
+								// production: an explicit plan_into wins, else the
+								// job's model carries into the execution phase, else
+								// no flag and omp picks. Stating it independently is
+								// what makes this a check and not an echo.
+								wantTarget := into
+								if wantTarget == "" {
+									wantTarget = model
+								}
+								assertOmpPlanArgv(t, argv, plan, wantTarget)
+								assertNoForbiddenOmpFlags(t, argv)
+								if got := argv[len(argv)-2]; got != "--" {
+									t.Fatalf("%s/%s: prompt is not the single token after `--`: %v", agentName, extraName, argv)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestOmpDeliverRejectsPlanIntoWithoutPlan: upstream omp only accepts
+// --plan-yolo-into alongside --plan-yolo, so the unpaired shape is refused HERE,
+// before any subprocess, with the fix in the message. Silently dropping the
+// target — or shipping the flag alone and letting omp exit non-zero with no
+// envelope, which this adapter would diagnose as a truncated stream — are both
+// worse than a named rejection.
+func TestOmpDeliverRejectsPlanIntoWithoutPlan(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}}
+	adapter := OmpAdapter{Runner: runner, Dir: "/repo"}
+	_, err := adapter.Deliver(context.Background(), ompTestAgent(), Job{Prompt: "work", PlanInto: "@smol"})
+	if err == nil {
+		t.Fatal("Deliver accepted plan_into without plan")
+	}
+	if !strings.Contains(err.Error(), "--plan-yolo-into") || !strings.Contains(err.Error(), "--plan-yolo") {
+		t.Fatalf("error must name both flags so the fix is obvious, got: %v", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("rejected plan shape still ran %d subprocess(es): %v", len(runner.calls), runner.calls)
+	}
+}
+
+func TestOmpDeliverRejectsMalformedPlanInto(t *testing.T) {
+	// "provider/model\x07bell" and "\x00" carry a control character that is NOT
+	// whitespace, so they are the only inputs here for which the IsControl half of
+	// the predicate is the DECIDING one. Without them, deleting `|| IsControl(r)`
+	// compiled and left the whole suite green — the previous \n case satisfies
+	// IsSpace first, so the branch looked covered and was not. A control character
+	// in a model selector reaches argv, and argv reaches execve.
+	for _, target := range []string{"x --add-dir /etc", "--model", "provider/model\nnext", "provider/model\x07bell", "\x00"} {
+		t.Run(strings.NewReplacer("\n", "_newline_", "\x07", "_bell_", "\x00", "_nul_").Replace(target), func(t *testing.T) {
+			runner := &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}}
+			adapter := OmpAdapter{Runner: runner, Dir: "/repo"}
+			_, err := adapter.Deliver(context.Background(), ompTestAgent(), Job{Prompt: "work", Plan: true, PlanInto: target})
+			if err == nil {
+				t.Fatalf("Deliver accepted malformed plan_into %q", target)
+			}
+			for _, want := range []string{"omp plan target", "one non-flag model selector", "plan_into"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not contain %q", err, want)
+				}
+			}
+			if len(runner.calls) != 0 {
+				t.Fatalf("rejected plan target still ran %d subprocess(es): %v", len(runner.calls), runner.calls)
+			}
+		})
+	}
+}
+
+// TestOmpStartNeverPlans: Start registers a seat, it does not run a brief, so its
+// argv must never carry a plan flag no matter what the agent looks like.
+func TestOmpStartNeverPlans(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}}
+	adapter := OmpAdapter{Runner: runner, Dir: "/repo"}
+	agent := ompTestAgent()
+	agent.RuntimeRef = ""
+	if _, err := adapter.Start(context.Background(), StartRequest{Agent: agent, Prompt: "introduce yourself"}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	assertOmpPlanArgv(t, runner.calls[0], false, "")
+	assertNoForbiddenOmpFlags(t, runner.calls[0])
+}
+
+// TestSupportsPlanMode pins the closed set. omp is the only runtime with the
+// flag; every other runtime must be rejected at dispatch rather than run a
+// plan-gated brief as an ordinary implementation.
+func TestSupportsPlanMode(t *testing.T) {
+	if !SupportsPlanMode(OmpRuntime) || !SupportsPlanMode("  "+OmpRuntime+"  ") {
+		t.Fatal("omp must support plan mode")
+	}
+	for _, name := range []string{CodexRuntime, ClaudeRuntime, KimiRuntime, KimiCLIRuntime, ShellRuntime, "", "bogus"} {
+		if SupportsPlanMode(name) {
+			t.Fatalf("runtime %q must not claim plan mode", name)
+		}
+	}
+}
+
+// TestPlanModeDescriptor pins the durable evidence strings a reader sees instead
+// of re-deriving plan mode from an argv.
+func TestPlanModeDescriptor(t *testing.T) {
+	cases := []struct {
+		plan bool
+		into string
+		want string
+	}{
+		{plan: false, into: "", want: ""},
+		{plan: false, into: "@smol", want: ""},
+		// Plan mode ALWAYS executes on some model, so the evidence never says a
+		// bare "plan": either Gitmoot resolved the target and names it, or it did
+		// not and says the runtime chose. A bare "plan" would let a diff written
+		// by the runtime's cheap default look identical to one written by the
+		// pinned model — the exact ambiguity this string exists to remove.
+		{plan: true, into: "", want: "plan-into:<runtime-default>"},
+		{plan: true, into: "  ", want: "plan-into:<runtime-default>"},
+		{plan: true, into: " @smol ", want: "plan-into:@smol"},
+		{plan: true, into: "openai/gpt-5.5", want: "plan-into:openai/gpt-5.5"},
+	}
+	for _, tc := range cases {
+		if got := PlanModeDescriptor(tc.plan, tc.into); got != tc.want {
+			t.Fatalf("PlanModeDescriptor(%v, %q) = %q, want %q", tc.plan, tc.into, got, tc.want)
+		}
+	}
 }
 
 // TestOmpDeliverStopReasonErrorFailsOnExitZero is the omp landmine: under
@@ -2674,9 +3069,11 @@ func TestOmpSummaryIsFinalAssistantTextNotEnvelope(t *testing.T) {
 }
 
 // TestOmpPolicyArgs: every autonomy policy produces the SAME explicit
-// --approval-mode=yolo. Kills: mapping read-only onto always-ask (under which
-// every headless tool call throws, bricking the runtime) and dropping the flag
-// (which inherits the host's tools.approvalMode). Read-only is enforced
+// --approval-mode=yolo. Kills: mapping read-only onto always-ask, and dropping
+// the flag (which inherits the host's tools.approvalMode). The flag is pinned for
+// DETERMINISM, not because always-ask would break omp — that claim was measured
+// and refuted (see the ompRuntimeContract comment: read/grep succeed, only
+// bash/write are refused, exit 0 with a full agent_end). Read-only is enforced
 // Gitmoot-side, not by omp's approval tier.
 func TestOmpPolicyArgs(t *testing.T) {
 	policies := []string{
@@ -3250,4 +3647,84 @@ func TestOmpHealthUsesLiveCheckPrompt(t *testing.T) {
 		t.Fatalf("Health: %v", err)
 	}
 	runner.want(t, 0, "omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session", "--", OmpLiveCheckPrompt)
+}
+
+// TestOmpPlanRejectsMalformedResolvedTarget closes the argv-injection BLOCKER that
+// the model-pin fix itself opened. ompValidatePlan hardened the caller's plan_into;
+// the fix then routed the job's effective model into that same --plan-yolo-into
+// slot without extending the guard, so Job{Plan:true, Model:"--add-dir=/"} produced
+// `--model --add-dir=/ --plan-yolo --plan-yolo-into --add-dir=/`. Hardening one
+// input and routing a second into the same position is not hardening.
+//
+// The non-plan half matters as much: a model value only inherits the flag-value
+// slot's rules when it is actually going there, so ordinary jobs with the same
+// model must still dispatch.
+func TestOmpPlanRejectsMalformedResolvedTarget(t *testing.T) {
+	for _, model := range []string{"--add-dir=/", "provider/model next", "provider/model\x07bell", "-p"} {
+		t.Run("plan+"+strings.NewReplacer(" ", "_", "\x07", "_bell_").Replace(model), func(t *testing.T) {
+			runner := &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}}
+			adapter := OmpAdapter{Runner: runner, Dir: "/repo"}
+			_, err := adapter.Deliver(context.Background(), ompTestAgent(), Job{Prompt: "work", Model: model, Plan: true})
+			if err == nil {
+				t.Fatalf("plan job with model %q was accepted; the model reaches the --plan-yolo-into slot", model)
+			}
+			if !strings.Contains(err.Error(), "plan execution target") {
+				t.Fatalf("error does not name the plan execution target: %v", err)
+			}
+			if len(runner.calls) != 0 {
+				t.Fatalf("rejected plan target still ran a subprocess: %v", runner.calls)
+			}
+		})
+		t.Run("nonplan+"+strings.NewReplacer(" ", "_", "\x07", "_bell_").Replace(model), func(t *testing.T) {
+			runner := &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}}
+			adapter := OmpAdapter{Runner: runner, Dir: "/repo"}
+			if _, err := adapter.Deliver(context.Background(), ompTestAgent(), Job{Prompt: "work", Model: model}); err != nil {
+				t.Fatalf("NON-plan job with model %q was refused: the plan-slot rule must not police --model. err=%v", model, err)
+			}
+		})
+	}
+	// The agent-level model reaches the same slot through EffectiveModel.
+	t.Run("agent model reaches the slot too", func(t *testing.T) {
+		runner := &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}}
+		adapter := OmpAdapter{Runner: runner, Dir: "/repo"}
+		agent := ompTestAgent()
+		agent.Model = "--add-dir=/"
+		if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "work", Plan: true}); err == nil {
+			t.Fatal("plan job with a malformed AGENT model was accepted")
+		}
+	})
+}
+
+// TestOmpPlanTargetPreservesRoleAlias closes a surviving mutant: stripping a
+// leading "@" inside ompPlanTarget compiled and every plan test still passed,
+// because the fallback cases all used a plain provider/model value. omp resolves
+// "@smol" as a ROLE ALIAS (expandRoleAlias) and a bare "smol" is not the same
+// selector — a silent strip would repoint the execution phase at a model the
+// caller never named, which is the exact class of defect the pin fix exists to
+// close, reintroduced one layer down.
+func TestOmpPlanTargetPreservesRoleAlias(t *testing.T) {
+	for _, tc := range []struct{ model, into, want string }{
+		{into: "@smol", want: "@smol"},
+		{model: "@smol", want: "@smol"},                // alias arriving via the model fallback
+		{model: "@smol", into: "@fast", want: "@fast"}, // explicit target still wins
+		{model: "openai/gpt-5.5", want: "openai/gpt-5.5"},
+		{model: "  @smol  ", want: "@smol"}, // trimmed, not stripped
+	} {
+		if got := ompPlanTarget(tc.model, tc.into); got != tc.want {
+			t.Fatalf("ompPlanTarget(%q, %q) = %q, want %q", tc.model, tc.into, got, tc.want)
+		}
+	}
+	// End to end: the alias must survive into argv and into the evidence.
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}}
+	adapter := OmpAdapter{Runner: runner, Dir: "/repo"}
+	result, err := adapter.Deliver(context.Background(), ompTestAgent(), Job{Prompt: "work", Model: "@smol", Plan: true})
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	if got := ompFlagValue(runner.calls[0], "--plan-yolo-into"); got != "@smol" {
+		t.Fatalf("--plan-yolo-into = %q, want %q: the role alias must reach omp intact", got, "@smol")
+	}
+	if result.PlanMode != "plan-into:@smol" {
+		t.Fatalf("Result.PlanMode = %q, want %q", result.PlanMode, "plan-into:@smol")
+	}
 }

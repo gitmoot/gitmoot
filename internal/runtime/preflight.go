@@ -33,13 +33,17 @@ const (
 
 // RuntimeRequirement declares one fact an adapter's argv depends on.
 type RuntimeRequirement struct {
-	Kind       RuntimeRequirementKind
-	Name       string
-	Flag       string
-	Source     string
-	Remedy     string
-	Policies   []string
-	ChatSeat   bool
+	Kind     RuntimeRequirementKind
+	Name     string
+	Flag     string
+	Source   string
+	Remedy   string
+	Policies []string
+	ChatSeat bool
+	// PlanMode scopes a requirement to deliveries whose request enables plan
+	// mode. It is request-scoped rather than inferred from the agent: older CLIs
+	// that lack an optional plan flag must still run ordinary jobs.
+	PlanMode   bool
 	Instrument string
 }
 
@@ -48,6 +52,13 @@ type RuntimeRequirement struct {
 type RuntimeContract struct {
 	Binary       string
 	Requirements []RuntimeRequirement
+}
+
+// RuntimeContractRequest carries only request-scoped axes that select adapter
+// argv requirements. It is deliberately not runtime.Job: constructing the job
+// delivered to an adapter remains the mailbox gate's single responsibility.
+type RuntimeContractRequest struct {
+	Plan bool
 }
 
 func (c RuntimeContract) clone() RuntimeContract {
@@ -138,22 +149,42 @@ var defaultRuntimeContractChecker = NewRuntimeContractChecker(subprocess.GroupRu
 
 func DefaultRuntimeContractChecker() *RuntimeContractChecker { return defaultRuntimeContractChecker }
 
-// Check evaluates only requirements used by this agent's concrete argv.
+// Check evaluates requirements used by an ordinary, non-plan delivery.
 func (c *RuntimeContractChecker) Check(ctx context.Context, agent Agent) RuntimeContractResult {
+	return c.CheckRequest(ctx, agent, RuntimeContractRequest{})
+}
+
+// CheckRequest evaluates only requirements used by this agent and request's
+// concrete argv. Request-scoped features must not be inferred from static agent
+// metadata.
+func (c *RuntimeContractChecker) CheckRequest(ctx context.Context, agent Agent, request RuntimeContractRequest) RuntimeContractResult {
 	meta, ok := c.registry().Metadata(agent.Runtime)
 	if !ok {
 		return RuntimeContractResult{Runtime: agent.Runtime, Version: "unknown", State: RuntimeContractUnknown, Instrument: "runtime-registry"}
 	}
-	return c.check(ctx, meta, func(req RuntimeRequirement) bool { return requirementApplies(req, agent) })
+	return c.check(ctx, meta, func(req RuntimeRequirement) bool { return requirementApplies(req, agent, request) })
 }
 
-// Inspect evaluates every declared requirement for a runtime for doctor.
+// Inspect evaluates a runtime's requirements for doctor. It deliberately SKIPS
+// request-scoped requirements (PlanMode), because doctor answers "can this host
+// run this runtime", not "could this host serve every optional capability".
+//
+// Including them made doctor cry wolf: on a host whose omp predates --plan-yolo,
+// Inspect reported the omp contract UNSUPPORTED even though every ordinary omp job
+// dispatches and runs — the dispatch preflight scopes those flags to plan requests,
+// so the two instruments disagreed about the same host. The operator-facing remedy
+// then told them to install a newer CLI they did not need, which is worse than
+// silence: a red that is not a defect teaches people to ignore the instrument.
+//
+// A host that cannot serve plan mode learns it when a plan job is refused, loudly,
+// naming the flag. That refusal is the right place for it, because it is the only
+// place the capability is actually required.
 func (c *RuntimeContractChecker) Inspect(ctx context.Context, runtimeName string) RuntimeContractResult {
 	meta, ok := c.registry().Metadata(runtimeName)
 	if !ok {
 		return RuntimeContractResult{Runtime: runtimeName, Version: "unknown", State: RuntimeContractUnknown, Instrument: "runtime-registry"}
 	}
-	return c.check(ctx, meta, func(RuntimeRequirement) bool { return true })
+	return c.check(ctx, meta, func(req RuntimeRequirement) bool { return !req.PlanMode })
 }
 
 func (c *RuntimeContractChecker) registry() Registry {
@@ -320,7 +351,10 @@ func (c *RuntimeContractChecker) runBinaryProbe(ctx context.Context, path string
 	return probe
 }
 
-func requirementApplies(req RuntimeRequirement, agent Agent) bool {
+func requirementApplies(req RuntimeRequirement, agent Agent, request RuntimeContractRequest) bool {
+	if req.PlanMode && !request.Plan {
+		return false
+	}
 	if req.ChatSeat && agent.ChatSeat {
 		return true
 	}

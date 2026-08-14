@@ -113,6 +113,17 @@ type Job struct {
 	PullRequest int
 	Model       string
 	Effort      string
+	// Plan and PlanInto request PLAN MODE for this delivery: the runtime plans the
+	// work first and then AUTO-EXECUTES that plan, instead of implementing straight
+	// from the prompt. They are PRIMITIVES on purpose — the workflow layer resolves
+	// them from JobPayload exactly the way it resolves Model/Effort, so
+	// internal/runtime never learns the payload type. PlanInto names the model the
+	// execution phase runs on and REQUIRES Plan; the pair is rejected before any
+	// subprocess otherwise. Only the runtimes SupportsPlanMode reports can honour
+	// them — a plan request routed anywhere else fails loudly at dispatch rather
+	// than silently degrading to a normal run.
+	Plan     bool
+	PlanInto string
 	// ShellEnv is an exact list of KEY=value trigger inputs and stage metadata
 	// injected into shell-stage subprocesses. Other runtimes ignore it; ordinary
 	// shell jobs leave it empty.
@@ -193,6 +204,16 @@ type Result struct {
 	// self-heal path (a genuinely dead pinned session, replaced permanently) leaves
 	// this false so its re-pin IS persisted.
 	SessionEphemeral bool
+	// PlanMode is the adapter's own evidence of the plan shape it DISPATCHED, so a
+	// reader can tell a plan run from a normal one without re-deriving it from the
+	// argv: "" for a normal run, "plan-into:<model>" when Gitmoot resolved the
+	// execution target, and "plan-into:<runtime-default>" when it could not. There
+	// is deliberately no bare "plan" value — the execution phase always runs on some
+	// model, and a value that declined to say which is the ambiguity this field
+	// exists to remove. Adapters that cannot honour plan mode never set it (the
+	// dispatch layer rejects the request before they are reached), and it is
+	// populated on failure returns too — a plan run that died is still a plan run.
+	PlanMode string
 	// SessionDiag carries process-level diagnostics for the runtime CLI run
 	// backing this delivery (#806). Adapters populate it best-effort on every
 	// Deliver return that actually ran a CLI process — success and failure alike —
@@ -508,6 +529,50 @@ func NormalizeStoredAutonomyPolicy(policy string) string {
 		return AutonomyPolicyAuto
 	}
 	return normalized
+}
+
+// SupportsPlanMode reports whether a runtime's CLI can honour a plan-mode job
+// (Job.Plan / Job.PlanInto). Plan mode is WORKFLOW SHAPE — plan first, then
+// auto-execute the plan — and is a SEPARATE FIELD from the autonomy policy so the
+// two are not conflated into one overloaded knob (#1420's defect).
+//
+// SEPARATE IS NOT INDEPENDENT, and an earlier version of this doc got that wrong
+// twice. It called plan mode "orthogonal to write permission" and justified that
+// by claiming an autonomy-policy-to-approval-mode mapping "would brick the
+// runtime". Both are false: measured against omp 17.2.4, always-ask restricts omp
+// to read-only tools and exits cleanly (see the ompRuntimeContract comment), and
+// upstream plan mode ADDS the write tool to the active set rather than removing
+// it. Plan mode ends in an implementation phase, so a plan request is a WRITE
+// REQUEST and the dispatch gate requires the same write-granting policy an
+// implement job requires.
+//
+// omp is the only runtime with the flag today (`--plan-yolo`). The set is closed
+// on purpose: the dispatch layer refuses a plan request aimed anywhere else, so a
+// runtime that grows the capability must be added HERE and taught to emit its own
+// flag in the same change. Failing loudly beats a plan-gated brief silently
+// running as an ordinary implementation.
+func SupportsPlanMode(runtimeName string) bool {
+	return strings.TrimSpace(runtimeName) == OmpRuntime
+}
+
+// PlanModeDescriptor renders the resolved plan shape as the durable evidence
+// string carried by Result.PlanMode: "" when plan mode is off, "plan-into:<model>"
+// when the execution phase is pinned to a model, and "plan-into:<runtime-default>"
+// when it is not — because the execution phase ALWAYS runs on some model, and the
+// evidence has to say whether Gitmoot chose it. Callers pass the RESOLVED target,
+// not the raw request field: a bare "plan" would let a run whose diff was written
+// by the runtime's cheap default look identical to one written by the pinned
+// model, which is the ambiguity this string exists to remove. A planInto without
+// plan is not representable — it is rejected before dispatch — so an unset plan
+// always renders "".
+func PlanModeDescriptor(plan bool, planInto string) string {
+	if !plan {
+		return ""
+	}
+	if into := strings.TrimSpace(planInto); into != "" {
+		return "plan-into:" + into
+	}
+	return "plan-into:<runtime-default>"
 }
 
 // ImplementWritePolicyGuidance is the single, actionable message emitted whenever
