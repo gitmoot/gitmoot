@@ -371,10 +371,8 @@ func TestSemanticPlanCensusCompiledFixtures(t *testing.T) {
 // semantic census resolves every producer to runtime.Job.
 func TestSemanticPlanCensusPredecessorBypassLanes(t *testing.T) {
 	lanes := []struct {
-		name        string
-		files       map[string]string
-		assertShape func(*testing.T, string)
-		want        []string
+		name  string
+		files map[string]string
 	}{
 		{
 			name: "alias chains",
@@ -414,12 +412,6 @@ import "github.com/gitmoot/gitmoot/internal/workflow"
 func AliasCrossPackage() { _ = workflow.DelegationTimeoutDefaults{Plan: true} }
 `,
 			},
-			want: []string{
-				"internal/consumer/alias_cross_package_b.go::AliasCrossPackage",
-				"internal/workflow/alias_cross_file_b.go::AliasCrossFile",
-				"internal/workflow/alias_same.go::AliasSameFile",
-			},
-			assertShape: assertSemanticPlanAliasFixtureShape,
 		},
 		{
 			name: "generic embedding",
@@ -440,8 +432,6 @@ var runSkillOptTrainRunConfirmTUI = func() {
 }
 `,
 			},
-			assertShape: assertSemanticPlanGenericFixtureShape,
-			want:        []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"},
 		},
 		{
 			name: "unkeyed positional",
@@ -455,12 +445,6 @@ func UnkeyedSlice() { _ = []runtime.Job{{"", true, ""}} }
 func UnkeyedMap() { _ = map[string]runtime.Job{"job": {"", true, "@smol"}} }
 `,
 			},
-			want: []string{
-				"internal/workflow/unkeyed.go::UnkeyedDirect",
-				"internal/workflow/unkeyed.go::UnkeyedMap",
-				"internal/workflow/unkeyed.go::UnkeyedSlice",
-			},
-			assertShape: assertSemanticPlanUnkeyedFixtureShape,
 		},
 		{
 			name: "pointer from call",
@@ -477,27 +461,42 @@ var runSkillOptTrainRunConfirmTUI = func() {
 }
 `,
 			},
-			assertShape: assertSemanticPlanPointerFixtureShape,
-			want:        []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"},
 		},
 	}
 	for _, lane := range lanes {
 		t.Run(lane.name, func(t *testing.T) {
 			root := writeSemanticPlanFixtureModule(t, lane.files)
-			lane.assertShape(t, root)
+			want := assertSemanticPlanFixtureShape(t, root, lane.name)
 			got, err := planCensusLoadInContext(root, planCensusBuildContext{name: "host-default"}, "./...")
 			if err != nil {
 				t.Fatalf("load compiled lane: %v", err)
 			}
 			t.Logf("semantic producers: %v", got)
-			if !slices.Equal(got, lane.want) {
-				t.Fatalf("semantic producers = %v, want exactly %v", got, lane.want)
+			if !slices.Equal(got, want) {
+				t.Fatalf("semantic producers = %v, want exactly %v", got, want)
 			}
 		})
 	}
 }
 
-func assertSemanticPlanAliasFixtureShape(t *testing.T, root string) {
+func assertSemanticPlanFixtureShape(t *testing.T, root, lane string) []string {
+	t.Helper()
+	switch lane {
+	case "alias chains":
+		return assertSemanticPlanAliasFixtureShape(t, root)
+	case "generic embedding":
+		return assertSemanticPlanGenericFixtureShape(t, root)
+	case "unkeyed positional":
+		return assertSemanticPlanUnkeyedFixtureShape(t, root)
+	case "pointer from call":
+		return assertSemanticPlanPointerFixtureShape(t, root)
+	default:
+		t.Fatalf("unknown semantic plan fixture lane %q", lane)
+		return nil
+	}
+}
+
+func assertSemanticPlanAliasFixtureShape(t *testing.T, root string) []string {
 	t.Helper()
 	cases := []struct {
 		file   string
@@ -521,9 +520,14 @@ func assertSemanticPlanAliasFixtureShape(t *testing.T, root string) {
 	if !semanticPlanFixtureHasCompositeType(consumer, "workflow.DelegationTimeoutDefaults") {
 		t.Error("cross-package alias fixture no longer constructs workflow.DelegationTimeoutDefaults")
 	}
+	return []string{
+		"internal/consumer/alias_cross_package_b.go::AliasCrossPackage",
+		"internal/workflow/alias_cross_file_b.go::AliasCrossFile",
+		"internal/workflow/alias_same.go::AliasSameFile",
+	}
 }
 
-func assertSemanticPlanGenericFixtureShape(t *testing.T, root string) {
+func assertSemanticPlanGenericFixtureShape(t *testing.T, root string) []string {
 	t.Helper()
 	file := parseSemanticPlanFixture(t, root, "internal/cli/skillopt_trainrun_tui.go")
 	carrier := semanticPlanFixtureTypeSpec(file, "genericCarrier")
@@ -547,36 +551,26 @@ func assertSemanticPlanGenericFixtureShape(t *testing.T, root string) {
 	if !found {
 		t.Fatal("generic fixture deps must be declared as genericAlias[string]")
 	}
+	return []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"}
 }
 
-func assertSemanticPlanUnkeyedFixtureShape(t *testing.T, root string) {
+func assertSemanticPlanUnkeyedFixtureShape(t *testing.T, root string) []string {
 	t.Helper()
 	file := parseSemanticPlanFixture(t, root, "internal/workflow/unkeyed.go")
 	for _, name := range []string{"UnkeyedDirect", "UnkeyedSlice", "UnkeyedMap"} {
 		function := semanticPlanFixtureFunction(file, name)
-		found := false
-		if function != nil {
-			ast.Inspect(function.Body, func(node ast.Node) bool {
-				literal, ok := node.(*ast.CompositeLit)
-				if !ok || len(literal.Elts) != 3 {
-					return true
-				}
-				for _, element := range literal.Elts {
-					if _, keyed := element.(*ast.KeyValueExpr); keyed {
-						return true
-					}
-				}
-				found = true
-				return false
-			})
-		}
-		if !found {
+		if !semanticPlanFixtureHasUnkeyedLiteral(function) {
 			t.Errorf("%s must retain a three-element unkeyed positional literal", name)
 		}
 	}
+	return []string{
+		"internal/workflow/unkeyed.go::UnkeyedDirect",
+		"internal/workflow/unkeyed.go::UnkeyedMap",
+		"internal/workflow/unkeyed.go::UnkeyedSlice",
+	}
 }
 
-func assertSemanticPlanPointerFixtureShape(t *testing.T, root string) {
+func assertSemanticPlanPointerFixtureShape(t *testing.T, root string) []string {
 	t.Helper()
 	file := parseSemanticPlanFixture(t, root, "internal/cli/skillopt_trainrun_tui.go")
 	jobPtr := semanticPlanFixtureFunction(file, "jobPtr")
@@ -587,28 +581,11 @@ func assertSemanticPlanPointerFixtureShape(t *testing.T, root string) {
 	if !ok || semanticPlanFixtureExprName(pointer.X) != "runtime.Job" {
 		t.Fatal("pointer fixture jobPtr must return *runtime.Job")
 	}
-	hasCallOrigin := false
-	hasPlanWrite := false
-	ast.Inspect(file, func(node ast.Node) bool {
-		assignment, ok := node.(*ast.AssignStmt)
-		if !ok || len(assignment.Lhs) != 1 || len(assignment.Rhs) != 1 {
-			return true
-		}
-		if assignment.Tok == token.DEFINE {
-			name, nameOK := assignment.Lhs[0].(*ast.Ident)
-			call, callOK := assignment.Rhs[0].(*ast.CallExpr)
-			hasCallOrigin = nameOK && name.Name == "deps" && callOK && semanticPlanFixtureExprName(call.Fun) == "jobPtr"
-		}
-		selector, selectorOK := assignment.Lhs[0].(*ast.SelectorExpr)
-		if selectorOK {
-			receiver, receiverOK := selector.X.(*ast.Ident)
-			hasPlanWrite = hasPlanWrite || receiverOK && receiver.Name == "deps" && selector.Sel.Name == "Plan"
-		}
-		return true
-	})
+	hasCallOrigin, hasPlanWrite := semanticPlanFixturePointerWrite(file)
 	if !hasCallOrigin || !hasPlanWrite {
 		t.Fatalf("pointer fixture call origin = %v, Plan write = %v; want both", hasCallOrigin, hasPlanWrite)
 	}
+	return []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"}
 }
 
 func parseSemanticPlanFixture(t *testing.T, root, name string) *ast.File {
@@ -653,6 +630,50 @@ func semanticPlanFixtureFunction(file *ast.File, name string) *ast.FuncDecl {
 		}
 	}
 	return nil
+}
+
+func semanticPlanFixtureHasUnkeyedLiteral(function *ast.FuncDecl) bool {
+	if function == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		literal, ok := node.(*ast.CompositeLit)
+		if !ok || len(literal.Elts) != 3 {
+			return true
+		}
+		for _, element := range literal.Elts {
+			if _, keyed := element.(*ast.KeyValueExpr); keyed {
+				return true
+			}
+		}
+		found = true
+		return false
+	})
+	return found
+}
+
+func semanticPlanFixturePointerWrite(file *ast.File) (bool, bool) {
+	hasCallOrigin := false
+	hasPlanWrite := false
+	ast.Inspect(file, func(node ast.Node) bool {
+		assignment, ok := node.(*ast.AssignStmt)
+		if !ok || len(assignment.Lhs) != 1 || len(assignment.Rhs) != 1 {
+			return true
+		}
+		if assignment.Tok == token.DEFINE {
+			name, nameOK := assignment.Lhs[0].(*ast.Ident)
+			call, callOK := assignment.Rhs[0].(*ast.CallExpr)
+			hasCallOrigin = nameOK && name.Name == "deps" && callOK && semanticPlanFixtureExprName(call.Fun) == "jobPtr"
+		}
+		selector, selectorOK := assignment.Lhs[0].(*ast.SelectorExpr)
+		if selectorOK {
+			receiver, receiverOK := selector.X.(*ast.Ident)
+			hasPlanWrite = hasPlanWrite || receiverOK && receiver.Name == "deps" && selector.Sel.Name == "Plan"
+		}
+		return true
+	})
+	return hasCallOrigin, hasPlanWrite
 }
 
 func semanticPlanFixtureHasCompositeType(file *ast.File, want string) bool {
@@ -818,10 +839,9 @@ func assertPlanCensusAbsent(t *testing.T, got []string, suffix string) {
 	}
 }
 
-// TestSemanticPlanCensusHelperCallGraph proves every semantic predicate remains
-// reachable from the real module census. It deliberately starts from
-// TestRuntimeJobPlanFieldsHaveSingleGatedProducer rather than from fixture tests:
-// a helper wired only to its own test is an inert guard.
+// TestSemanticPlanCensusHelperCallGraph proves every helper remains reachable
+// from the entry point whose behavior it supports. Coverage is fail-closed: a
+// newly declared function must become reachable or gain a reviewed exemption.
 func TestSemanticPlanCensusHelperCallGraph(t *testing.T) {
 	parsed, err := parser.ParseFile(token.NewFileSet(), "runtime_job_plan_seam_test.go", nil, 0)
 	if err != nil {
@@ -851,20 +871,52 @@ func TestSemanticPlanCensusHelperCallGraph(t *testing.T) {
 			return true
 		})
 	}
-	reachable := map[string]bool{}
-	queue := []string{"TestRuntimeJobPlanFieldsHaveSingleGatedProducer"}
-	for len(queue) > 0 {
-		name := queue[0]
-		queue = queue[1:]
-		if reachable[name] {
-			continue
+	reachableFrom := func(root string) map[string]bool {
+		reachable := map[string]bool{}
+		queue := []string{root}
+		for len(queue) > 0 {
+			name := queue[0]
+			queue = queue[1:]
+			if reachable[name] {
+				continue
+			}
+			reachable[name] = true
+			queue = append(queue, graph[name]...)
 		}
-		reachable[name] = true
-		queue = append(queue, graph[name]...)
+		return reachable
+	}
+	productionReachable := reachableFrom("TestRuntimeJobPlanFieldsHaveSingleGatedProducer")
+	fixtureReachable := reachableFrom("TestSemanticPlanCensusPredecessorBypassLanes")
+
+	// These are independent test entry points or shared assertion utilities, not
+	// helpers in either guarded execution graph. Every exemption is named so a
+	// new function fails by default and stale exemptions also fail.
+	exemptions := map[string]string{
+		"TestSemanticPlanCensusCompiledFixtures":          "independent compiled-fixture acceptance test",
+		"TestSemanticPlanCensusBuildContextScope":         "independent build-tag scope test",
+		"TestSemanticPlanCensusReleaseContexts":           "independent release-matrix contract test",
+		"TestSemanticPlanCensusReleaseContextApplication": "independent release-context application test",
+		"TestSemanticPlanCensusRejectsPackageErrors":      "independent package-error refusal test",
+		"TestSemanticPlanCensusHelperCallGraph":           "the call-graph guard itself",
+		"assertPlanCensusProducers":                       "shared assertion used by independent acceptance tests",
+		"assertPlanCensusAbsent":                          "shared assertion used by independent acceptance tests",
 	}
 	for name := range functions {
-		if strings.HasPrefix(name, "planCensus") && !reachable[name] {
-			t.Errorf("semantic census helper %s is unreachable from the real census entry point", name)
+		if productionReachable[name] || fixtureReachable[name] {
+			continue
+		}
+		if reason, exempt := exemptions[name]; !exempt {
+			t.Errorf("function %s is unreachable from both guarded entry points and has no exemption", name)
+		} else if strings.TrimSpace(reason) == "" {
+			t.Errorf("function %s has an empty call-graph exemption", name)
+		}
+	}
+	for name := range exemptions {
+		if _, exists := functions[name]; !exists {
+			t.Errorf("call-graph exemption %s names no declared function", name)
+		}
+		if productionReachable[name] || fixtureReachable[name] {
+			t.Errorf("call-graph exemption %s is stale because the function is reachable", name)
 		}
 	}
 }
