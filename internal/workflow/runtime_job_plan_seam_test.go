@@ -335,12 +335,24 @@ func declaresAllowlistedName(spec *ast.TypeSpec, pkgPath string) bool {
 		return false
 	}
 	owner, listed := planFieldAllowlist[spec.Name.Name]
-	// Only inside the OWNING package. A reviewer showed the unrestricted form failing
-	// the census on a compiled internal/cli helper declaring an unrelated
-	// `JobRequest struct{ Value string }` — no plan field, no relation to runtime.Job.
-	// Outside the owner a bare literal is already reported by the package test above,
-	// so the shadow arm adds nothing there and only blocks innocent code.
-	return listed && pkgPath == owner
+	if !listed {
+		return false
+	}
+	// INSIDE the owning package, any declaration of the name shadows the real type.
+	if pkgPath == owner {
+		return true
+	}
+	// OUTSIDE it, only an ALIAS (`type X = Y`, spec.Assign set) is reported. That
+	// distinction is load-bearing in both directions, and a reviewer found the
+	// fail-open half as a BLOCKER: restricting this arm to the owning package assumed
+	// the composite-literal arm would catch the rest, but hasPlanField only recognises
+	// KEYED elements — so a real internal/cli file declaring `type JobPayload =
+	// runtime.Job` and returning an UNKEYED positional literal with Plan set compiled
+	// green past both arms. An alias borrows an identity the census grants exemptions
+	// to and is reported wherever it appears; a fresh `type JobRequest struct{ Value
+	// string }` defines something unrelated that merely reuses a name, carries no plan
+	// field, and is the innocent case a second reviewer found over-reported.
+	return spec.Assign.IsValid()
 }
 
 // planFieldTypeIsAllowlisted reports whether a composite literal's type is one of
@@ -515,7 +527,13 @@ func TestDeclaresAllowlistedNameArmsTheShadowBranch(t *testing.T) {
 		{"local definition, not an alias, still borrows the name", "internal/cli/x.go", "type groomApplyResult struct{ Plan bool }", true},
 		// OVER-REPORT CONTROL. The unrestricted form failed the census on a compiled
 		// internal/cli helper declaring an unrelated JobRequest with no plan field.
-		{"allowlisted name declared OUTSIDE its owning package", "internal/cli/x.go", "type JobRequest struct{ Value string }", false},
+		{"innocent REDEFINITION outside the owner is not reported", "internal/cli/x.go", "type JobRequest struct{ Value string }", false},
+		// BLOCKER CONTROL. Restricting this arm to the owning package assumed the
+		// composite-literal arm covered the rest; it only sees KEYED elements, so an
+		// UNKEYED positional literal of an outside-the-owner alias compiled green past
+		// both. An alias is reported wherever it appears.
+		{"ALIAS outside the owning package is reported", "internal/cli/x.go", "type JobPayload = runtime.Job", true},
+		{"alias of a second allowlisted name, outside the owner", "internal/other/x.go", "type JobRequest = runtime.Job", true},
 		{"unrelated local type", "internal/workflow/x.go", "type somethingElse = runtime.Job", false},
 	} {
 		file, err := parser.ParseFile(token.NewFileSet(), "x.go", "package workflow\nfunc f() {\n"+tc.src+"\n_ = 0\n}\n", 0)
@@ -558,6 +576,18 @@ func TestPlanFieldCensusWiresEveryArm(t *testing.T) {
 			rel:  "internal/cli/x.go",
 			src:  "func f() { var j runtime.Job; j.Plan = true; _ = j }",
 			want: []string{"internal/cli/x.go::f"},
+		},
+		{
+			name: "shadow arm, ALIAS outside the owning package (the BLOCKER)",
+			rel:  "internal/cli/x.go",
+			src:  "func f() { type JobPayload = runtime.Job; _ = 0 }",
+			want: []string{"internal/cli/x.go::f"},
+		},
+		{
+			name: "shadow arm, innocent redefinition outside the owner",
+			rel:  "internal/cli/x.go",
+			src:  "func f() { type JobRequest struct{ Value string }; _ = 0 }",
+			want: nil,
 		},
 		{
 			name: "shadow arm, inside the owning package",
