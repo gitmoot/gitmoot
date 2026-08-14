@@ -100,8 +100,6 @@ func shouldSkipPlanProducerDir(rel string) bool {
 	return base == ".git" || base == ".gitmoot" || base == "node_modules" || base == "build" || base == "dist" || base == "repos" || base == "GOALS"
 }
 
-
-
 func hasPlanField(literal *ast.CompositeLit) bool {
 	for _, element := range literal.Elts {
 		field, ok := element.(*ast.KeyValueExpr)
@@ -234,18 +232,29 @@ func TestAssignsPlanFieldArmsTheCensus(t *testing.T) {
 // as a census failure naming itself — a maintainer then decides whether it belongs
 // here. Adding a name to this list is a deliberate act with a diff; being invisible
 // to the census was not.
-var planFieldAllowlist = map[string]bool{
-	"JobPayload":             true, // internal/workflow/mailbox.go — the persisted payload
-	"JobRequest":             true, // internal/workflow/mailbox.go — the enqueue request
-	"RuntimeContractRequest": true, // internal/runtime/preflight.go — preflight scoping
+// planFieldAllowlist maps a type to the PACKAGE that owns it. Keying on the bare
+// type name was itself fail-open: a reviewer showed that `other.JobPayload{Plan:true}`
+// was exempted, and `type JobPayload = runtime.Job` in any other package would be
+// too — recreating the very type-alias bypass this inversion was written to close,
+// now under five borrowed names. The qualifier is part of the identity, so it is part
+// of the key.
+//
+// This is an ALLOWLIST on purpose. The design before the inversion asked "is this a
+// runtime.Job?" and exempted everything it could not identify; three review rounds
+// walked past it with a spelling it did not know. Defaulting to REPORTED means a new
+// type, a rename or an alias names itself in a census failure and a maintainer
+// decides. Adding an entry here is a deliberate act with a diff; being invisible was
+// not.
+var planFieldAllowlist = map[string]string{
+	"JobPayload":             "workflow", // internal/workflow/mailbox.go — the persisted payload
+	"JobRequest":             "workflow", // internal/workflow/mailbox.go — the enqueue request
+	"RuntimeContractRequest": "runtime",  // internal/runtime/preflight.go — preflight scoping
 	// Surfaced BY the inversion, and exactly the decision it exists to force: both
 	// have a field literally named Plan that has nothing to do with plan mode.
 	// groomApplyResult.Plan is a plan-file PATH (string); DelegationTimeoutDefaults.Plan
-	// is a DURATION. The old name-plus-type matcher never saw either, because it only
-	// looked at runtime.Job; the new one sees every Plan field and asks. Listing them
-	// here is a deliberate act with a diff, which is the point.
-	"groomApplyResult":           true, // internal/cli/memory_groom.go — Plan is a file path
-	"DelegationTimeoutDefaults":  true, // internal/workflow — Plan is a timeout duration
+	// is a DURATION. The pre-inversion matcher never saw either.
+	"groomApplyResult":          "cli",      // internal/cli/memory_groom.go — Plan is a file path
+	"DelegationTimeoutDefaults": "workflow", // internal/workflow — Plan is a timeout duration
 }
 
 // planFieldTypeIsAllowlisted reports whether a composite literal's type is one of
@@ -254,18 +263,33 @@ var planFieldAllowlist = map[string]bool{
 func planFieldTypeIsAllowlisted(expr ast.Expr, pkgName string) bool {
 	switch typed := expr.(type) {
 	case *ast.SelectorExpr:
-		// pkg.Type{...} — judge on the type name; a qualified runtime.Job is
-		// deliberately absent from the allowlist and therefore reported.
-		return planFieldAllowlist[typed.Sel.Name]
+		// pkg.Type{...}. The QUALIFIER must be the package that owns the type — an
+		// import alias is compared by its local name, which is the strongest check a
+		// source-level census can make without full type resolution. A same-named
+		// type from any other package is reported, so a borrowed name cannot buy an
+		// exemption.
+		qualifier, ok := typed.X.(*ast.Ident)
+		if !ok {
+			return false
+		}
+		owner, listed := planFieldAllowlist[typed.Sel.Name]
+		return listed && qualifier.Name == owner
 	case *ast.Ident:
-		return planFieldAllowlist[typed.Name]
-	case *ast.StarExpr:
-		return planFieldTypeIsAllowlisted(typed.X, pkgName)
-	case *ast.ParenExpr:
-		return planFieldTypeIsAllowlisted(typed.X, pkgName)
+		// Bare Type{...} — only exempt when the FILE's package is the owning one.
+		owner, listed := planFieldAllowlist[typed.Name]
+		return listed && pkgName == owner
+	// No *ast.StarExpr or *ast.ParenExpr case: Go has no syntax that puts either in
+	// CompositeLit.Type. '&runtime.Job{...}' parses the & OUTSIDE the literal, so the
+	// type is still a SelectorExpr, and element literals inside a slice or map carry
+	// ArrayType, MapType or a nil type. Both branches existed here and were dead:
+	// mutating them to return true changed no test, not because they were untested
+	// but because nothing can reach them. Verified with a parser probe over
+	// &runtime.Job{...}, []*runtime.Job{{...}} and map[string]*runtime.Job{...}.
+	// Dead code in a fail-closed predicate is worse than absent code — it invites
+	// the reader to believe a case is handled.
 	default:
-		// Unnamed, generic-instantiated, array/map element literals and anything
-		// else the walk cannot name: NOT allowlisted. Fail closed.
+		// Unnamed, generic-instantiated, array/map element literals and anything else
+		// the walk cannot name: NOT allowlisted. Fail closed.
 		return false
 	}
 }
@@ -290,6 +314,22 @@ func TestPlanFieldCensusFailsClosedOnUnknownTypes(t *testing.T) {
 		{"allowlisted request", "_ = JobRequest{PlanInto: \"x\"}", false},
 		{"allowlisted qualified", "_ = runtime.RuntimeContractRequest{Plan: true}", false},
 		{"no plan field at all", "_ = runtime.Job{Prompt: \"x\"}", false},
+		// SAME-NAME IMPOSTOR CONTROLS. Keying the allowlist on the bare type name was
+		// fail-open: a borrowed name from any other package bought an exemption, which
+		// recreated the type-alias bypass under five allowlisted names. The qualifier
+		// is now part of the identity, so each of these must be REPORTED.
+		{"impostor: foreign JobPayload", "_ = other.JobPayload{Plan: true}", true},
+		{"impostor: foreign JobRequest", "_ = shim.JobRequest{PlanInto: \"x\"}", true},
+		{"impostor: foreign RuntimeContractRequest", "_ = fake.RuntimeContractRequest{Plan: true}", true},
+		{"impostor: foreign groomApplyResult", "_ = other.groomApplyResult{Plan: true}", true},
+		{"impostor: bare allowlisted name in the WRONG package", "_ = RuntimeContractRequest{Plan: true}", true},
+		{"correct qualifier still exempt", "_ = workflow.JobPayload{Plan: true}", false},
+		// DEFAULT-BRANCH CONTROLS. A reviewer showed that making the default branch
+		// return true survived the earlier fixtures, because none of them reached it:
+		// every case named a type. These do, so the fail-closed default is now armed.
+		{"generic instantiation", "_ = Wrapper[runtime.Job]{Plan: true}", true},
+		{"map element literal", "_ = map[string]runtime.Job{\"k\": {Plan: true}}", true},
+		{"slice element literal", "_ = []runtime.Job{{PlanInto: \"x\"}}", true},
 	}
 	for _, tc := range cases {
 		file, err := parser.ParseFile(token.NewFileSet(), "x.go", "package workflow\nfunc f() {\n"+tc.src+"\n}\n", 0)
