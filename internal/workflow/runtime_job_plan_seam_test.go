@@ -333,16 +333,6 @@ func TestSemanticPlanCensusCompiledFixtures(t *testing.T) {
 		t.Fatalf("load compiled semantic census fixtures: %v", err)
 	}
 
-	t.Run("alias type identity", func(t *testing.T) {
-		assertPlanCensusProducers(t, got,
-			"internal/workflow/testdata/semantic_plan_census/producer/alias_same.go::AliasSameFile",
-			"internal/workflow/testdata/semantic_plan_census/producer/alias_cross_file_b.go::AliasCrossFile",
-			"internal/workflow/testdata/semantic_plan_census/producer/producer.go::AliasCrossPackage",
-		)
-		assertPlanCensusAbsent(t, got, "::AliasSameFileControl")
-		assertPlanCensusAbsent(t, got, "::AliasCrossFileControl")
-		assertPlanCensusAbsent(t, got, "::AliasCrossPackageControl")
-	})
 	t.Run("keyed PlanInto", func(t *testing.T) {
 		assertPlanCensusProducers(t, got,
 			"internal/workflow/testdata/semantic_plan_census/producer/producer.go::KeyedPlanInto",
@@ -356,27 +346,13 @@ func TestSemanticPlanCensusCompiledFixtures(t *testing.T) {
 		)
 		assertPlanCensusAbsent(t, got, "::UnkeyedPositionalControl")
 	})
-	t.Run("generic embedding", func(t *testing.T) {
-		assertPlanCensusProducers(t, got,
-			"internal/workflow/testdata/semantic_plan_census/producer/producer.go::GenericEmbedding",
-		)
-		assertPlanCensusAbsent(t, got, "::GenericEmbeddingControl")
-	})
 	t.Run("struct copy is a documented limit", func(t *testing.T) {
 		assertPlanCensusAbsent(t, got, "::StructCopyLimit")
 	})
 	t.Run("reflection is a documented limit", func(t *testing.T) {
 		assertPlanCensusAbsent(t, got, "::ReflectionLimit")
 	})
-	// The predecessor's selector-name matcher already found the three positive
-	// pointer forms. The semantic improvement on this axis is receiver identity:
-	// the unrelated pointer must stay absent without an exemption.
-	t.Run("pointer receiver identity", func(t *testing.T) {
-		assertPlanCensusProducers(t, got,
-			"internal/workflow/testdata/semantic_plan_census/producer/producer.go::PointerFromCall",
-			"internal/workflow/testdata/semantic_plan_census/producer/producer.go::PointerFromCallMultiLHS",
-			"internal/workflow/testdata/semantic_plan_census/producer/producer.go::PointerFromCallWrapped",
-		)
+	t.Run("unrelated pointer receiver", func(t *testing.T) {
 		assertPlanCensusAbsent(t, got, "::UnrelatedPointerFromCall")
 	})
 	t.Run("unrelated controls", func(t *testing.T) {
@@ -387,6 +363,164 @@ func TestSemanticPlanCensusCompiledFixtures(t *testing.T) {
 			"internal/workflow/testdata/semantic_plan_census/producer/producer.go::var PackageLevelPlan",
 		)
 	})
+}
+
+// TestSemanticPlanCensusPredecessorBypassLanes plants each acceptance lane in
+// its own compiled module. Their package paths and symbol names are intentional:
+// the syntactic census at 1f384083 misses each module independently, while the
+// semantic census resolves every producer to runtime.Job.
+func TestSemanticPlanCensusPredecessorBypassLanes(t *testing.T) {
+	lanes := []struct {
+		name  string
+		files map[string]string
+		want  []string
+	}{
+		{
+			name: "alias chains",
+			files: map[string]string{
+				"internal/workflow/alias_same.go": `package workflow
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+type sameFileAlias = runtime.Job
+type JobPayload = sameFileAlias
+
+func AliasSameFile() { _ = JobPayload{Plan: true} }
+`,
+				"internal/workflow/alias_cross_file_a.go": `package workflow
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+type crossFileAlias = runtime.Job
+`,
+				"internal/workflow/alias_cross_file_b.go": `package workflow
+
+type JobRequest = crossFileAlias
+
+func AliasCrossFile() { _ = JobRequest{PlanInto: "@smol"} }
+`,
+				"internal/workflow/alias_cross_package_a.go": `package workflow
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+type crossPackageAlias = runtime.Job
+type DelegationTimeoutDefaults = crossPackageAlias
+`,
+				"internal/consumer/alias_cross_package_b.go": `package consumer
+
+import "github.com/gitmoot/gitmoot/internal/workflow"
+
+func AliasCrossPackage() { _ = workflow.DelegationTimeoutDefaults{Plan: true} }
+`,
+			},
+			want: []string{
+				"internal/consumer/alias_cross_package_b.go::AliasCrossPackage",
+				"internal/workflow/alias_cross_file_b.go::AliasCrossFile",
+				"internal/workflow/alias_same.go::AliasSameFile",
+			},
+		},
+		{
+			name: "generic embedding",
+			files: map[string]string{
+				"internal/cli/skillopt_trainrun_tui.go": `package cli
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+type genericCarrier[T any] struct {
+	runtime.Job
+	Value T
+}
+type genericAlias[T any] = genericCarrier[T]
+
+var runSkillOptTrainRunConfirmTUI = func() {
+	var deps genericAlias[string]
+	deps.Plan = true
+}
+`,
+			},
+			want: []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"},
+		},
+		{
+			name: "unkeyed positional",
+			files: map[string]string{
+				"internal/workflow/unkeyed.go": `package workflow
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+func UnkeyedDirect() { _ = runtime.Job{"", true, ""} }
+func UnkeyedSlice() { _ = []runtime.Job{{"", true, ""}} }
+func UnkeyedMap() { _ = map[string]runtime.Job{"job": {"", true, "@smol"}} }
+`,
+			},
+			want: []string{
+				"internal/workflow/unkeyed.go::UnkeyedDirect",
+				"internal/workflow/unkeyed.go::UnkeyedMap",
+				"internal/workflow/unkeyed.go::UnkeyedSlice",
+			},
+		},
+		{
+			name: "pointer from call",
+			files: map[string]string{
+				"internal/cli/skillopt_trainrun_tui.go": `package cli
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+func jobPtr() *runtime.Job { return new(runtime.Job) }
+
+var runSkillOptTrainRunConfirmTUI = func() {
+	deps := jobPtr()
+	deps.Plan = true
+}
+`,
+			},
+			want: []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"},
+		},
+	}
+	for _, lane := range lanes {
+		t.Run(lane.name, func(t *testing.T) {
+			root := writeSemanticPlanFixtureModule(t, lane.files)
+			got, err := planCensusLoadInContext(root, planCensusBuildContext{name: "host-default"}, "./...")
+			if err != nil {
+				t.Fatalf("load compiled lane: %v", err)
+			}
+			t.Logf("semantic producers: %v", got)
+			if !slices.Equal(got, lane.want) {
+				t.Fatalf("semantic producers = %v, want exactly %v", got, lane.want)
+			}
+		})
+	}
+}
+
+func writeSemanticPlanFixtureModule(t *testing.T, files map[string]string) string {
+	t.Helper()
+	root := t.TempDir()
+	common := map[string]string{
+		"go.mod": `module github.com/gitmoot/gitmoot
+
+go 1.26.0
+`,
+		"internal/runtime/job.go": `package runtime
+
+type Job struct {
+	Value string
+	Plan bool
+	PlanInto string
+}
+`,
+	}
+	for name, content := range files {
+		common[name] = content
+	}
+	for name, content := range common {
+		path := filepath.Join(root, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("create fixture directory for %s: %v", name, err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatalf("write fixture %s: %v", name, err)
+		}
+	}
+	return root
 }
 
 func TestSemanticPlanCensusBuildContextScope(t *testing.T) {
@@ -429,6 +563,25 @@ func TestSemanticPlanCensusReleaseContexts(t *testing.T) {
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("release census contexts = %v, want %v", got, want)
+	}
+}
+
+// TestSemanticPlanCensusReleaseContextApplication proves the context list is
+// not merely labels around repeated host-context loads. This compiled producer
+// is selected only when GOOS=linux and GOARCH=arm64 reach packages.Load.
+func TestSemanticPlanCensusReleaseContextApplication(t *testing.T) {
+	root := filepath.Clean(filepath.Join("..", ".."))
+	want := "internal/workflow/testdata/semantic_plan_census/producer/linux_arm64_plan.go::LinuxARM64BuildContext"
+	for _, buildContext := range planCensusReleaseBuildContexts {
+		got, err := planCensusLoadInContext(root, buildContext, "./internal/workflow/testdata/semantic_plan_census/producer")
+		if err != nil {
+			t.Fatalf("load %s fixture context: %v", buildContext.name, err)
+		}
+		hasProducer := slices.Contains(got, want)
+		wantProducer := buildContext.name == "linux/arm64"
+		if hasProducer != wantProducer {
+			t.Errorf("%s producers = %v, LinuxARM64BuildContext present = %v, want %v", buildContext.name, got, hasProducer, wantProducer)
+		}
 	}
 }
 
