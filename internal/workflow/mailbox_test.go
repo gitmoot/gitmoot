@@ -1940,6 +1940,8 @@ type fakeDelivery struct {
 	shellEnvs             [][]string
 	agentEnvs             [][]string
 	shellUpstreamContexts []string
+	plans                 []bool
+	planIntos             []string
 	onDeliver             func()
 	pid                   int
 	err                   error
@@ -1955,6 +1957,8 @@ func (f *fakeDelivery) Deliver(_ context.Context, agent runtime.Agent, job runti
 	f.shellEnvs = append(f.shellEnvs, append([]string(nil), job.ShellEnv...))
 	f.agentEnvs = append(f.agentEnvs, append([]string(nil), job.AgentEnv...))
 	f.shellUpstreamContexts = append(f.shellUpstreamContexts, job.ShellUpstreamContext)
+	f.plans = append(f.plans, job.Plan)
+	f.planIntos = append(f.planIntos, job.PlanInto)
 	if f.pid > 0 && job.OnPID != nil {
 		job.OnPID(f.pid)
 	}
@@ -1966,6 +1970,9 @@ func (f *fakeDelivery) Deliver(_ context.Context, agent runtime.Agent, job runti
 	}
 	index := len(f.prompts) - 1
 	result := runtime.Result{}
+	// Stand in for a plan-capable adapter: report the shape that was dispatched.
+	// A job without plan mode yields "", so every non-plan test is unchanged.
+	result.PlanMode = runtime.PlanModeDescriptor(job.Plan, job.PlanInto)
 	if index >= len(f.outputs) {
 		return result, nil
 	}

@@ -120,7 +120,10 @@ func (a OmpAdapter) Start(ctx context.Context, request StartRequest) (StartResul
 		return StartResult{}, err
 	}
 	defer cleanup()
-	args := ompArgs(request.Agent, request.Agent.Model, ompThinkingLevel(request.Agent.Effort), ompMaxTimeArg(ctx), attachArgs, promptArg)
+	// Start never carries a plan request: it registers a seat, it does not run a
+	// brief. The primitives are passed explicitly so the single argv builder has no
+	// implicit default to drift from.
+	args := ompArgs(request.Agent, request.Agent.Model, ompThinkingLevel(request.Agent.Effort), ompMaxTimeArg(ctx), false, "", attachArgs, promptArg)
 	result, err := a.runner().Run(ctx, a.Dir, "omp", args...)
 	if err != nil {
 		return StartResult{Raw: result.Stdout + result.Stderr}, ompCommandError(result, err)
@@ -206,6 +209,12 @@ func (a OmpAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, 
 	if err := a.Validate(ctx, agent); err != nil {
 		return Result{}, err
 	}
+	// Plan shape is validated before the PATH preflight: it is a property of the
+	// REQUEST, so it is wrong for its diagnosis to depend on whether omp happens to
+	// be installed.
+	if err := ompValidatePlan(job.Plan, job.PlanInto); err != nil {
+		return Result{}, err
+	}
 	// PATH preflight before anything else runs: the daemon's PATH comes from its
 	// systemd EnvironmentFile, so "works in my shell" is not evidence the daemon
 	// can spawn omp. Failing here means ZERO subprocesses ran and the operator gets
@@ -222,7 +231,8 @@ func (a OmpAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, 
 		return Result{}, err
 	}
 	defer cleanup()
-	args := ompArgs(agent, EffectiveModel(agent, job), ompThinkingLevel(effectiveEffort(agent, job)), ompMaxTimeArg(ctx), attachArgs, promptArg)
+	planMode := PlanModeDescriptor(job.Plan, job.PlanInto)
+	args := ompArgs(agent, EffectiveModel(agent, job), ompThinkingLevel(effectiveEffort(agent, job)), ompMaxTimeArg(ctx), job.Plan, job.PlanInto, attachArgs, promptArg)
 	// STDIN INVARIANT: omp's CLI reads stdin to EOF for every non-protocol mode,
 	// including --mode=json (main.ts:1209 calls readPipedInput, main.ts:191-207 does
 	// `await Bun.stdin.text()` whenever `process.stdin.isTTY === false`). It is safe
@@ -246,6 +256,7 @@ func (a OmpAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, 
 			Raw:          result.Stdout + result.Stderr,
 			InputTokens:  usage.InputTokens,
 			OutputTokens: usage.OutputTokens,
+			PlanMode:     planMode,
 			SessionDiag:  newSessionDiag(result, err, sessionID),
 		}, ompCommandError(result, err)
 	}
@@ -265,6 +276,7 @@ func (a OmpAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, 
 			Raw:          result.Stdout,
 			InputTokens:  usage.InputTokens,
 			OutputTokens: usage.OutputTokens,
+			PlanMode:     planMode,
 			SessionDiag:  newSessionDiag(result, nil, sessionID),
 		}, ompCommandError(result, parseErr)
 	}
@@ -273,6 +285,7 @@ func (a OmpAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, 
 		Summary:      strings.TrimSpace(content),
 		InputTokens:  usage.InputTokens,
 		OutputTokens: usage.OutputTokens,
+		PlanMode:     planMode,
 		SessionDiag:  newSessionDiag(result, nil, sessionID),
 	}, nil
 }
@@ -341,7 +354,8 @@ func (a OmpAdapter) preflight() error {
 // path and go missing on the other. Shape (asserted byte-for-byte in tests):
 //
 //	omp -p --mode=json --approval-mode=yolo --no-session [--add-dir <p>]…
-//	    [--model <M>] [--thinking <lvl>] [--max-time <s>] [@<staged>/prompt.md]
+//	    [--model <M>] [--thinking <lvl>] [--max-time <s>]
+//	    [--plan-yolo [--plan-yolo-into <M>]] [@<staged>/prompt.md]
 //	    -- <single prompt token>
 //
 // Every fixed element is load-bearing:
@@ -364,6 +378,16 @@ func (a OmpAdapter) preflight() error {
 //     multiple sequential (separately billed) turns, a prompt starting with `-` is
 //     read as an unknown flag and exits 2, and one starting with `@` is read as a
 //     file attachment. `--` disables all of that for the value that follows.
+//   - `--plan-yolo` is emitted IF AND ONLY IF the job asked for plan mode. It is
+//     ORTHOGONAL to --approval-mode: plan mode is workflow shape (plan first, then
+//     AUTO-EXECUTE the plan), the approval mode is write permission, and --plan-yolo
+//     starts read-only and auto-approves the model's own plan on its first resolve
+//     call. `--plan-yolo-into <M>` pins the model the execution phase runs on and is
+//     only accepted alongside --plan-yolo (omp's own default target is the "smol"
+//     role); ompValidatePlan rejects the unpaired form BEFORE any subprocess, and a
+//     plan request aimed at a runtime SupportsPlanMode rejects never reaches an argv
+//     at all. A silent downgrade to a normal run is the defect this ordering exists
+//     to prevent.
 var ompRuntimeContract = RuntimeContract{
 	Binary: "omp",
 	Requirements: []RuntimeRequirement{
@@ -371,10 +395,24 @@ var ompRuntimeContract = RuntimeContract{
 		{Kind: RuntimeRequirementFlag, Name: "flag --mode", Flag: "--mode", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --mode, or run the job on a runtime whose installed CLI satisfies its declared contract"},
 		{Kind: RuntimeRequirementFlag, Name: "flag --approval-mode", Flag: "--approval-mode", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --approval-mode, or run the job on a runtime whose installed CLI satisfies its declared contract"},
 		{Kind: RuntimeRequirementFlag, Name: "flag --no-session", Flag: "--no-session", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --no-session, or run the job on a runtime whose installed CLI satisfies its declared contract"},
+		{Kind: RuntimeRequirementFlag, Name: "flag --plan-yolo", Flag: "--plan-yolo", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --plan-yolo, or run the job on a runtime whose installed CLI satisfies its declared contract"},
+		{Kind: RuntimeRequirementFlag, Name: "flag --plan-yolo-into", Flag: "--plan-yolo-into", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --plan-yolo-into, or run the job on a runtime whose installed CLI satisfies its declared contract"},
 	},
 }
 
-func ompArgs(agent Agent, model string, thinking string, maxTime string, attachArgs []string, prompt string) []string {
+// ompValidatePlan rejects a plan request omp's CLI cannot honour BEFORE any
+// subprocess runs. `--plan-yolo-into` without `--plan-yolo` makes omp exit
+// non-zero with no NDJSON envelope at all, which this adapter would diagnose as a
+// truncated stream — the wrong cause for a request shape we can reject here with
+// the actual fix.
+func ompValidatePlan(plan bool, planInto string) error {
+	if into := strings.TrimSpace(planInto); into != "" && !plan {
+		return fmt.Errorf("omp plan target %q requires plan mode: --plan-yolo-into is only accepted alongside --plan-yolo (set plan on the job, or drop plan_into)", into)
+	}
+	return nil
+}
+
+func ompArgs(agent Agent, model string, thinking string, maxTime string, plan bool, planInto string, attachArgs []string, prompt string) []string {
 	args := []string{"-p", "--mode=json", "--approval-mode=yolo", "--no-session"}
 	args = append(args, ompWorkspaceArgs(agent)...)
 	if model != "" {
@@ -385,6 +423,15 @@ func ompArgs(agent Agent, model string, thinking string, maxTime string, attachA
 	}
 	if maxTime != "" {
 		args = append(args, "--max-time", maxTime)
+	}
+	// Plan mode is opt-in and never inferred: no plan request, no flag, so a normal
+	// run's argv stays byte-identical. --plan-yolo-into is meaningless on its own
+	// (ompValidatePlan already refused that shape) and so is nested under it here.
+	if plan {
+		args = append(args, "--plan-yolo")
+		if into := strings.TrimSpace(planInto); into != "" {
+			args = append(args, "--plan-yolo-into", into)
+		}
 	}
 	// Attachments must precede `--`; everything after it is message text.
 	args = append(args, attachArgs...)

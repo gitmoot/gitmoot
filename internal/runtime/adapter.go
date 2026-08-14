@@ -113,6 +113,17 @@ type Job struct {
 	PullRequest int
 	Model       string
 	Effort      string
+	// Plan and PlanInto request PLAN MODE for this delivery: the runtime plans the
+	// work first and then AUTO-EXECUTES that plan, instead of implementing straight
+	// from the prompt. They are PRIMITIVES on purpose — the workflow layer resolves
+	// them from JobPayload exactly the way it resolves Model/Effort, so
+	// internal/runtime never learns the payload type. PlanInto names the model the
+	// execution phase runs on and REQUIRES Plan; the pair is rejected before any
+	// subprocess otherwise. Only the runtimes SupportsPlanMode reports can honour
+	// them — a plan request routed anywhere else fails loudly at dispatch rather
+	// than silently degrading to a normal run.
+	Plan     bool
+	PlanInto string
 	// ShellEnv is an exact list of KEY=value trigger inputs and stage metadata
 	// injected into shell-stage subprocesses. Other runtimes ignore it; ordinary
 	// shell jobs leave it empty.
@@ -193,6 +204,14 @@ type Result struct {
 	// self-heal path (a genuinely dead pinned session, replaced permanently) leaves
 	// this false so its re-pin IS persisted.
 	SessionEphemeral bool
+	// PlanMode is the adapter's own evidence of the plan shape it DISPATCHED, so a
+	// reader can tell a plan run from a normal one without re-deriving it from the
+	// argv: "" for a normal run, PlanModeDescriptor's "plan" for a bare plan run,
+	// or "plan-into:<model>" when the execution phase was pinned. Adapters that
+	// cannot honour plan mode never set it (the dispatch layer rejects the request
+	// before they are reached), and it is populated on failure returns too — a
+	// plan run that died is still a plan run.
+	PlanMode string
 	// SessionDiag carries process-level diagnostics for the runtime CLI run
 	// backing this delivery (#806). Adapters populate it best-effort on every
 	// Deliver return that actually ran a CLI process — success and failure alike —
@@ -508,6 +527,37 @@ func NormalizeStoredAutonomyPolicy(policy string) string {
 		return AutonomyPolicyAuto
 	}
 	return normalized
+}
+
+// SupportsPlanMode reports whether a runtime's CLI can honour a plan-mode job
+// (Job.Plan / Job.PlanInto). Plan mode is WORKFLOW SHAPE — plan first, then
+// auto-execute the plan — and is deliberately ORTHOGONAL to the autonomy policy,
+// which is write permission: conflating the two would repeat #1420's
+// overloaded-field defect and, on omp specifically, mapping it onto
+// --approval-mode would brick the runtime (see the ompRuntimeContract comment).
+//
+// omp is the only runtime with the flag today (`--plan-yolo`). The set is closed
+// on purpose: the dispatch layer refuses a plan request aimed anywhere else, so a
+// runtime that grows the capability must be added HERE and taught to emit its own
+// flag in the same change. Failing loudly beats a plan-gated brief silently
+// running as an ordinary implementation.
+func SupportsPlanMode(runtimeName string) bool {
+	return strings.TrimSpace(runtimeName) == OmpRuntime
+}
+
+// PlanModeDescriptor renders the resolved plan shape as the durable evidence
+// string carried by Result.PlanMode: "" when plan mode is off, "plan" for a bare
+// plan run, and "plan-into:<model>" when the execution phase is pinned to a
+// specific model. A planInto without plan is not representable — it is rejected
+// before dispatch — so an unset plan always renders "".
+func PlanModeDescriptor(plan bool, planInto string) string {
+	if !plan {
+		return ""
+	}
+	if into := strings.TrimSpace(planInto); into != "" {
+		return "plan-into:" + into
+	}
+	return "plan"
 }
 
 // ImplementWritePolicyGuidance is the single, actionable message emitted whenever

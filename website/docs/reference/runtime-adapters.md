@@ -54,6 +54,7 @@ Every delivery — and `agent start` — builds one argument vector:
 ```sh
 omp -p --mode=json --approval-mode=yolo --no-session \
     [--add-dir <path>]… [--model <M>] [--thinking <level>] [--max-time <s>] \
+    [--plan-yolo [--plan-yolo-into <M>]] \
     [@<staged>/prompt.md] -- '<single prompt token>'
 ```
 
@@ -80,6 +81,9 @@ Each fixed element is load-bearing:
   would become multiple separately billed turns, a prompt starting with `-`
   would be read as an unknown flag (exit 2), and one starting with `@` would be
   read as a file attachment. `--` disables all of that for the value after it.
+- `--plan-yolo` appears **if and only if** the job asked for plan mode, and
+  `--plan-yolo-into <M>` only alongside it. See
+  [Plan mode](#plan-mode) below.
 
 The adapter resolves `omp` on `PATH` *before* spawning anything, so a daemon
 that cannot see the binary reports a PATH problem instead of a parse error.
@@ -248,11 +252,29 @@ by runtime **name** and wraps only Claude and Kimi, so no omp process is ever
 confined by it. omp separately does not advertise `produce`, which is why it
 never reaches the produce-stage wrapper either.)
 
-omp ships a `--plan-yolo` mode; the v1 adapter never passes it. When a
-plan-first omp runtime does land it will be a **separate** registered runtime,
-and it is worth stating plainly that `--plan-yolo` auto-approves the *model's
-own* plan. That is plan-first discipline inside one run; it is **not** Gitmoot's
-plan gate, where approval remains an explicit human act.
+### Plan mode
+
+omp ships a `--plan-yolo` mode and the adapter passes it — but only when the job
+asks for it. A job payload carrying `plan: true` runs
+`--plan-yolo`; adding `plan_into: "<model>"` also emits
+`--plan-yolo-into <model>`, pinning the model the execution phase runs on (omp's
+own default target is the `smol` role). `plan_into` without `plan` is rejected
+before dispatch, because omp only accepts the pair.
+
+Plan mode is **workflow shape**, not permission: omp starts read-only,
+auto-approves the *model's own* plan on its first resolve call, and then
+**auto-executes** it. `--approval-mode` is untouched and stays `yolo` for plan
+and non-plan runs alike — mapping plan mode onto the approval tier would brick
+the runtime rather than restrict it.
+
+Only the omp runtime implements plan mode. A plan request routed to any other
+runtime **fails loudly at dispatch** instead of quietly running as an ordinary
+implementation, and the resolved shape is echoed into the job payload as
+`plan_mode` (`plan` or `plan-into:<model>`) so a reader can tell a plan run from
+a normal one without re-deriving it from the argv.
+
+Note that this is omp's plan-first discipline *inside one run*; it is **not**
+Gitmoot's plan gate, where approval remains an explicit human act.
 
 ### Capabilities
 

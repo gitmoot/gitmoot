@@ -212,6 +212,14 @@ type JobRequest struct {
 	DelegationFinalize     bool
 	Model                  string
 	Effort                 string
+	// Plan and PlanInto request PLAN MODE for this job (#1479): the runtime plans
+	// the work first and then AUTO-EXECUTES that plan. PlanInto pins the model the
+	// execution phase runs on and REQUIRES Plan. Both are rejected at the enqueue
+	// chokepoint when the shape is impossible and again at dispatch when the
+	// effective runtime cannot honour them, so a plan-gated brief never runs as an
+	// ordinary implementation by accident.
+	Plan     bool
+	PlanInto string
 	// WorkflowID groups jobs started by an external coordinator. Empty preserves
 	// the legacy payload byte-for-byte; non-empty values are inherited by every
 	// delegation child and continuation in the coordination tree.
@@ -369,6 +377,15 @@ type JobPayload struct {
 	DelegationFinalize            bool                `json:"delegation_finalize,omitempty"`
 	Model                         string              `json:"model,omitempty"`
 	Effort                        string              `json:"effort,omitempty"`
+	// Plan / PlanInto are the requested plan mode (#1479); PlanMode is the
+	// resolved EVIDENCE the adapter reported after dispatch ("plan",
+	// "plan-into:<model>", or absent for a normal run), so a reader can tell a plan
+	// run from a normal one without re-deriving it from the runtime's argv. All
+	// three are additive/omitempty: a payload without plan mode serializes
+	// byte-identically.
+	Plan                          bool                `json:"plan,omitempty"`
+	PlanInto                      string              `json:"plan_into,omitempty"`
+	PlanMode                      string              `json:"plan_mode,omitempty"`
 	WorkflowID                    string              `json:"workflow_id,omitempty"`
 	RuntimeOverride               string              `json:"runtime_override,omitempty"`
 	RuntimeOverrideRef            string              `json:"runtime_override_ref,omitempty"`
@@ -579,6 +596,8 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		DelegationFinalize:     request.DelegationFinalize,
 		Model:                  request.Model,
 		Effort:                 request.Effort,
+		Plan:                   request.Plan,
+		PlanInto:               strings.TrimSpace(request.PlanInto),
 		WorkflowID:             strings.TrimSpace(request.WorkflowID),
 		RuntimeOverride:        strings.TrimSpace(request.RuntimeOverride),
 		RuntimeOverrideRef:     strings.TrimSpace(request.RuntimeOverrideRef),
@@ -1426,6 +1445,21 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 	} else {
 		agentEnv = append(agentEnv, payload.PipelineInputEnv...)
 	}
+	// PLAN GATE (#1479), against the EFFECTIVE runtime — after any #531 per-job
+	// override has been applied to the agent. A plan request the runtime cannot
+	// honour FAILS the delivery here: dropping the flag and running normally would
+	// silently turn a plan-gated brief into an ordinary implementation, with the
+	// only evidence being an argv nobody reads. The unpaired plan_into shape is
+	// re-checked because a payload can reach delivery without passing through
+	// Enqueue (re-enqueues, hand-repaired rows).
+	if payload.Plan || strings.TrimSpace(payload.PlanInto) != "" {
+		if !payload.Plan {
+			return "", "", false, nil, errors.New("job plan_into requires plan mode; set plan on the job or drop plan_into")
+		}
+		if !runtime.SupportsPlanMode(agent.Runtime) {
+			return "", "", false, nil, planDispatchError(agent.Runtime, payload.Plan, payload.PlanInto)
+		}
+	}
 	delivery := runtime.Job{
 		ID:                   job.ID,
 		AgentName:            agent.Name,
@@ -1435,6 +1469,8 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		PullRequest:          payload.PullRequest,
 		Model:                payload.Model,
 		Effort:               payload.Effort,
+		Plan:                 payload.Plan,
+		PlanInto:             payload.PlanInto,
 		ShellEnv:             shellEnv,
 		AgentEnv:             agentEnv,
 		ShellUpstreamContext: payload.ShellUpstreamContext,
@@ -1461,6 +1497,11 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		delivery.RuntimeDefaultEffort = m.RuntimeDefaultEffort(agent.Runtime)
 	}
 	result, err := adapter.Deliver(ctx, agent, delivery)
+	// Record the adapter's own evidence of the plan shape it dispatched, so a
+	// reader can tell a plan run from a normal one without re-deriving it from the
+	// argv. Written before the error branch: a plan run that failed is still a plan
+	// run, and that is exactly when the evidence matters.
+	payload.PlanMode = result.PlanMode
 	// Preserve the last runtime identity while the job remains running. The
 	// liveness sweep needs the exact process that produced the retained transcript;
 	// terminal transitions clear it atomically with settlement below.
@@ -1794,7 +1835,48 @@ func validateJobRequest(request JobRequest) error {
 	if err := validatePipelineInputEnv(request.PipelineInputEnv); err != nil {
 		return err
 	}
+	if err := validateJobPlanRequest(request); err != nil {
+		return err
+	}
 	return validateJobRuntimeOverrideRequest(request)
+}
+
+// validateJobPlanRequest rejects an impossible plan request (#1479) at the
+// enqueue chokepoint, BEFORE a job row exists, so every producer fails fast with
+// an actionable error instead of enqueuing a job whose plan intent the worker
+// would have to drop. Two shapes are impossible:
+//
+//   - plan_into without plan: upstream omp only accepts --plan-yolo-into
+//     alongside --plan-yolo, so this exits non-zero at the CLI with no envelope.
+//   - a plan aimed at an EXPLICIT runtime override whose runtime has no plan mode:
+//     the requested runtime is already known here, so the refusal need not wait
+//     for dispatch.
+//
+// The agent's own default runtime is NOT resolvable in this pure check (it needs
+// the store), so the authoritative runtime gate is planDispatchError, applied in
+// deliver against the EFFECTIVE runtime. Both must exist: this one is earlier,
+// that one is complete.
+func validateJobPlanRequest(request JobRequest) error {
+	planInto := strings.TrimSpace(request.PlanInto)
+	if !request.Plan {
+		if planInto != "" {
+			return errors.New("job plan_into requires plan mode; set plan on the job or drop plan_into")
+		}
+		return nil
+	}
+	if override := strings.TrimSpace(request.RuntimeOverride); override != "" && !runtime.SupportsPlanMode(override) {
+		return planDispatchError(override, request.Plan, planInto)
+	}
+	return nil
+}
+
+// planDispatchError is the single message for "this runtime cannot honour a plan
+// request". Proceeding as a normal run instead would turn a plan-gated brief into
+// a silent ordinary implementation, which is the exact defect #1479 exists to
+// remove, so the job fails loudly rather than quietly losing its shape.
+func planDispatchError(runtimeName string, plan bool, planInto string) error {
+	return fmt.Errorf("runtime %q cannot honour plan mode (%s): only the omp runtime implements it; drop plan from the job or route it to an omp seat",
+		strings.TrimSpace(runtimeName), runtime.PlanModeDescriptor(plan, planInto))
 }
 
 var pipelineInputEnvNamePattern = regexp.MustCompile(`^GITMOOT_INPUT_[A-Z][A-Z0-9_]*$`)

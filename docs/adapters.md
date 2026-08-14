@@ -125,8 +125,17 @@ builder, so no flag can appear on one path and go missing on the other:
 ```sh
 omp -p --mode=json --approval-mode=yolo --no-session \
     [--add-dir <path>]… [--model <M>] [--thinking <level>] [--max-time <s>] \
+    [--plan-yolo [--plan-yolo-into <M>]] \
     [@<staged>/prompt.md] -- '<single prompt token>'
 ```
+
+`--plan-yolo` appears if and only if the job asked for plan mode (`plan` /
+`plan_into` on the job payload): omp plans the work first and then
+auto-executes that plan, with `--plan-yolo-into` pinning the model the execution
+phase runs on. It is orthogonal to `--approval-mode`, which stays `yolo` for
+every job, plan or not. `plan_into` without `plan` and a plan request routed to
+any non-omp runtime are both refused before dispatch — a plan-gated brief never
+silently degrades into an ordinary implementation.
 
 Startup stores the session id from the NDJSON header line, but delivery never
 uses it: omp is stateless in v1 and never passes `--resume`, `--continue`, or
