@@ -1966,7 +1966,14 @@ func (f *fakeDelivery) Deliver(_ context.Context, agent runtime.Agent, job runti
 		f.onDeliver()
 	}
 	if f.err != nil {
-		return runtime.Result{}, f.err
+		// A REAL adapter populates plan evidence on its FAILURE returns too — omp
+		// sets Result.PlanMode on both the non-zero-exit and parse-error paths,
+		// because a plan run that died is still a plan run. Returning a zero Result
+		// here made the mailbox's write-before-the-error-branch behaviour
+		// unobservable, so a mutation that recorded evidence only on success could
+		// not be killed by any test. The double has to honour the contract it
+		// stands in for.
+		return runtime.Result{PlanMode: runtime.PlanModeDescriptor(job.Plan, job.PlanInto)}, f.err
 	}
 	index := len(f.prompts) - 1
 	result := runtime.Result{}

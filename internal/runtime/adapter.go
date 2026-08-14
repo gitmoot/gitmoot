@@ -531,10 +531,18 @@ func NormalizeStoredAutonomyPolicy(policy string) string {
 
 // SupportsPlanMode reports whether a runtime's CLI can honour a plan-mode job
 // (Job.Plan / Job.PlanInto). Plan mode is WORKFLOW SHAPE — plan first, then
-// auto-execute the plan — and is deliberately ORTHOGONAL to the autonomy policy,
-// which is write permission: conflating the two would repeat #1420's
-// overloaded-field defect and, on omp specifically, mapping it onto
-// --approval-mode would brick the runtime (see the ompRuntimeContract comment).
+// auto-execute the plan — and is a SEPARATE FIELD from the autonomy policy so the
+// two are not conflated into one overloaded knob (#1420's defect).
+//
+// SEPARATE IS NOT INDEPENDENT, and an earlier version of this doc got that wrong
+// twice. It called plan mode "orthogonal to write permission" and justified that
+// by claiming an autonomy-policy-to-approval-mode mapping "would brick the
+// runtime". Both are false: measured against omp 17.2.4, always-ask restricts omp
+// to read-only tools and exits cleanly (see the ompRuntimeContract comment), and
+// upstream plan mode ADDS the write tool to the active set rather than removing
+// it. Plan mode ends in an implementation phase, so a plan request is a WRITE
+// REQUEST and the dispatch gate requires the same write-granting policy an
+// implement job requires.
 //
 // omp is the only runtime with the flag today (`--plan-yolo`). The set is closed
 // on purpose: the dispatch layer refuses a plan request aimed anywhere else, so a
@@ -546,10 +554,15 @@ func SupportsPlanMode(runtimeName string) bool {
 }
 
 // PlanModeDescriptor renders the resolved plan shape as the durable evidence
-// string carried by Result.PlanMode: "" when plan mode is off, "plan" for a bare
-// plan run, and "plan-into:<model>" when the execution phase is pinned to a
-// specific model. A planInto without plan is not representable — it is rejected
-// before dispatch — so an unset plan always renders "".
+// string carried by Result.PlanMode: "" when plan mode is off, "plan-into:<model>"
+// when the execution phase is pinned to a model, and "plan-into:<runtime-default>"
+// when it is not — because the execution phase ALWAYS runs on some model, and the
+// evidence has to say whether Gitmoot chose it. Callers pass the RESOLVED target,
+// not the raw request field: a bare "plan" would let a run whose diff was written
+// by the runtime's cheap default look identical to one written by the pinned
+// model, which is the ambiguity this string exists to remove. A planInto without
+// plan is not representable — it is rejected before dispatch — so an unset plan
+// always renders "".
 func PlanModeDescriptor(plan bool, planInto string) string {
 	if !plan {
 		return ""
@@ -557,7 +570,7 @@ func PlanModeDescriptor(plan bool, planInto string) string {
 	if into := strings.TrimSpace(planInto); into != "" {
 		return "plan-into:" + into
 	}
-	return "plan"
+	return "plan-into:<runtime-default>"
 }
 
 // ImplementWritePolicyGuidance is the single, actionable message emitted whenever

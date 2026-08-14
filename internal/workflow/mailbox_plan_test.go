@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -37,11 +38,20 @@ func TestMailboxEnqueueRejectsImpossiblePlanRequest(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, err := mailbox.Enqueue(ctx, tc.request)
+			// The ID is derived from the case name because `cases` is a map and Go
+			// randomises map iteration: a shared ID on a shared store meant that
+			// when the guard actually regressed, one subtest reported the other's
+			// leftover row (or a UNIQUE-constraint error) and the diagnosis landed
+			// on the wrong plan shape in ~1 run in 5. It never flaked while green,
+			// so CI hid it — the failure message was unreliable at the one moment
+			// it mattered.
+			request := tc.request
+			request.ID = "job-plan-bad-" + strings.ReplaceAll(name, " ", "-")
+			_, err := mailbox.Enqueue(ctx, request)
 			if err == nil || !strings.Contains(err.Error(), tc.wantText) {
 				t.Fatalf("Enqueue error = %v, want one containing %q", err, tc.wantText)
 			}
-			if _, getErr := store.GetJob(ctx, tc.request.ID); getErr == nil {
+			if _, getErr := store.GetJob(ctx, request.ID); getErr == nil {
 				t.Fatal("rejected plan request still created a job row")
 			}
 		})
@@ -118,9 +128,37 @@ func TestMailboxDeliverPlanGate(t *testing.T) {
 		})
 	}
 
+	// THE BYPASS THIS GATE EXISTS TO CLOSE. readOnlyImplementationBlocked keys on
+	// job type == "implement" and returns false for everything else, so before the
+	// write-policy check a read-only seat refused an implement job would accept an
+	// `ask` job carrying plan and write code anyway — plan mode auto-executes and
+	// upstream omp adds the write tool to the active set. Every non-write policy
+	// spelling is exercised because the empty and "auto" cases are the ones a seat
+	// actually lands in by default, not the explicit read-only one.
+	for _, policy := range []string{"", "auto", runtime.AutonomyPolicyReadOnly} {
+		t.Run("a plan job is refused on a seat without write policy "+policy, func(t *testing.T) {
+			adapter := &fakeDelivery{outputs: []string{planResultJSON}}
+			agent := runtime.Agent{Name: "seat", Role: "implementer", Runtime: runtime.OmpRuntime, RepoScope: "o/r", AutonomyPolicy: policy}
+			payload := JobPayload{Plan: true}
+			_, _, _, _, err := mailbox.deliver(ctx, adapter, agent, job, &payload, "work")
+			if err == nil || !strings.Contains(err.Error(), "does not grant write") {
+				t.Fatalf("policy %q: deliver error = %v, want a write-policy refusal", policy, err)
+			}
+			if len(adapter.prompts) != 0 {
+				t.Fatalf("policy %q: refused plan request still reached the adapter: %v", policy, adapter.prompts)
+			}
+			if payload.PlanMode != "" {
+				t.Fatalf("policy %q: refused plan request recorded evidence %q", policy, payload.PlanMode)
+			}
+		})
+	}
+
 	t.Run("an omp seat delivers with the plan primitives intact", func(t *testing.T) {
 		adapter := &fakeDelivery{outputs: []string{planResultJSON}}
-		agent := runtime.Agent{Name: "seat", Role: "implementer", Runtime: runtime.OmpRuntime, RepoScope: "o/r"}
+		// workspace-write is REQUIRED for a plan job now, not incidental scenery: a
+		// plan ends in an implementation phase, so the happy path must name the
+		// policy that authorises the write it will perform.
+		agent := runtime.Agent{Name: "seat", Role: "implementer", Runtime: runtime.OmpRuntime, RepoScope: "o/r", AutonomyPolicy: runtime.AutonomyPolicyWorkspaceWrite}
 		payload := JobPayload{Plan: true, PlanInto: "@smol"}
 		if _, _, _, _, err := mailbox.deliver(ctx, adapter, agent, job, &payload, "work"); err != nil {
 			t.Fatalf("deliver returned error: %v", err)
@@ -130,6 +168,24 @@ func TestMailboxDeliverPlanGate(t *testing.T) {
 		}
 		if payload.PlanMode != "plan-into:@smol" {
 			t.Fatalf("payload plan_mode = %q, want %q", payload.PlanMode, "plan-into:@smol")
+		}
+	})
+
+	// Closes surviving mutant M15: gating the payload write on `err == nil` left
+	// the suite green, because every plan test used a delivery that always
+	// succeeds. The comment above that write exists solely to justify recording
+	// evidence BEFORE the error branch — "a plan run that failed is still a plan
+	// run, and that is exactly when the evidence matters" — and nothing tested it.
+	// This is the same contract as the adapter-side failure returns, one layer up.
+	t.Run("a failed plan delivery still records the plan evidence", func(t *testing.T) {
+		adapter := &fakeDelivery{outputs: []string{planResultJSON}, err: errors.New("runtime died mid-run")}
+		agent := runtime.Agent{Name: "seat", Role: "implementer", Runtime: runtime.OmpRuntime, RepoScope: "o/r", AutonomyPolicy: runtime.AutonomyPolicyWorkspaceWrite}
+		payload := JobPayload{Plan: true, PlanInto: "@smol"}
+		if _, _, _, _, err := mailbox.deliver(ctx, adapter, agent, job, &payload, "work"); err == nil {
+			t.Fatal("deliver succeeded against a failing adapter")
+		}
+		if payload.PlanMode != "plan-into:@smol" {
+			t.Fatalf("payload plan_mode after a FAILED plan run = %q, want %q: the evidence matters most when the run died", payload.PlanMode, "plan-into:@smol")
 		}
 	})
 
@@ -164,7 +220,7 @@ func TestMailboxRunPersistsPlanEvidence(t *testing.T) {
 		t.Fatalf("Enqueue returned error: %v", err)
 	}
 	adapter := &fakeDelivery{outputs: []string{planResultJSON}}
-	agent := runtime.Agent{Name: "planner", Role: "implementer", Runtime: runtime.OmpRuntime, RuntimeRef: "fresh:plan-seat", RepoScope: "owner/repo"}
+	agent := runtime.Agent{Name: "planner", Role: "implementer", Runtime: runtime.OmpRuntime, RuntimeRef: "fresh:plan-seat", RepoScope: "owner/repo", AutonomyPolicy: runtime.AutonomyPolicyWorkspaceWrite}
 	if _, err := mailbox.Run(ctx, "job-plan-run", agent, adapter); err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}

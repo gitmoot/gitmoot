@@ -1459,6 +1459,19 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		if !runtime.SupportsPlanMode(agent.Runtime) {
 			return "", "", false, nil, planDispatchError(agent.Runtime, payload.Plan, payload.PlanInto)
 		}
+		// A PLAN REQUEST IS A WRITE REQUEST. Plan mode ends in an implementation
+		// phase — upstream omp auto-approves the plan and switches into executing
+		// it, ADDING the write tool to the active set — so it needs the same policy
+		// an implement job needs. Without this, plan mode is a bypass: the only
+		// Gitmoot-side write gate (readOnlyImplementationBlocked) keys on
+		// job type == "implement" and returns false for everything else, so a
+		// read-only seat refused an implement job would accept an `ask` job
+		// carrying plan and write code anyway. Checked here rather than only at
+		// enqueue because the policy lives on the agent row the delivery resolved,
+		// and because a payload can reach delivery without passing Enqueue.
+		if !runtime.PolicyGrantsImplementWrite(agent.AutonomyPolicy) {
+			return "", "", false, nil, fmt.Errorf("agent %q has autonomy policy %q, which does not grant write: a plan-mode job ends in an implementation phase, so it requires the same policy an implement job requires (set the agent's policy to workspace-write or drop plan from the job)", agent.Name, runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy))
+		}
 	}
 	delivery := runtime.Job{
 		ID:                   job.ID,
@@ -1874,9 +1887,18 @@ func validateJobPlanRequest(request JobRequest) error {
 // request". Proceeding as a normal run instead would turn a plan-gated brief into
 // a silent ordinary implementation, which is the exact defect #1479 exists to
 // remove, so the job fails loudly rather than quietly losing its shape.
+// planDispatchError describes the REQUEST as the operator wrote it, deliberately
+// not via runtime.PlanModeDescriptor. That helper renders the RESOLVED evidence of
+// a run and names a runtime default when Gitmoot did not pick a target — true for
+// a dispatched omp run, nonsense in a refusal aimed at a runtime that has no plan
+// mode and therefore no default. The operator needs to see what they asked for.
 func planDispatchError(runtimeName string, plan bool, planInto string) error {
+	shape := "plan"
+	if into := strings.TrimSpace(planInto); into != "" {
+		shape = "plan-into:" + into
+	}
 	return fmt.Errorf("runtime %q cannot honour plan mode (%s): only the omp runtime implements it; drop plan from the job or route it to an omp seat",
-		strings.TrimSpace(runtimeName), runtime.PlanModeDescriptor(plan, planInto))
+		strings.TrimSpace(runtimeName), shape)
 }
 
 var pipelineInputEnvNamePattern = regexp.MustCompile(`^GITMOOT_INPUT_[A-Z][A-Z0-9_]*$`)
