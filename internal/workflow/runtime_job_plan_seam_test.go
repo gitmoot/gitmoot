@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -43,6 +44,8 @@ func TestRuntimeJobPlanFieldsHaveSingleGatedProducer(t *testing.T) {
 		if err != nil {
 			return err
 		}
+		pkgPath := planFieldPackagePath(rel)
+		imports := planFieldImportPaths(parsed)
 		for _, declaration := range parsed.Decls {
 			function, ok := declaration.(*ast.FuncDecl)
 			if !ok || function.Body == nil {
@@ -65,7 +68,7 @@ func TestRuntimeJobPlanFieldsHaveSingleGatedProducer(t *testing.T) {
 					// an alias now defaults to REPORTED. That is noisier and it is the
 					// safe direction: the failure mode becomes "the census names something
 					// you must add to the allowlist", not "the census went quiet".
-					if hasPlanField(n) && !planFieldTypeIsAllowlisted(n.Type, parsed.Name.Name) {
+					if hasPlanField(n) && !planFieldTypeIsAllowlisted(n.Type, pkgPath, imports) {
 						got = append(got, filepath.ToSlash(rel)+"::"+functionSymbol(function))
 					}
 				case *ast.AssignStmt:
@@ -75,6 +78,16 @@ func TestRuntimeJobPlanFieldsHaveSingleGatedProducer(t *testing.T) {
 					// passed. A seam guard that recognises only one syntax for writing a
 					// field is not a seam guard.
 					if assignsPlanField(n) {
+						got = append(got, filepath.ToSlash(rel)+"::"+functionSymbol(function))
+					}
+				case *ast.TypeSpec:
+					// A function-local `type JobPayload = runtime.Job` SHADOWS the real
+					// type, so a bare literal under that name satisfies the owning-package
+					// test above and would be exempt while producing a genuine
+					// runtime.Job. Declaring an allowlisted name anywhere inside a body is
+					// therefore reported: the allowlist grants exemption to five specific
+					// types, not to their spellings.
+					if declaresAllowlistedName(n) {
 						got = append(got, filepath.ToSlash(rel)+"::"+functionSymbol(function))
 					}
 				}
@@ -232,52 +245,110 @@ func TestAssignsPlanFieldArmsTheCensus(t *testing.T) {
 // as a census failure naming itself — a maintainer then decides whether it belongs
 // here. Adding a name to this list is a deliberate act with a diff; being invisible
 // to the census was not.
-// planFieldAllowlist maps a type to the PACKAGE that owns it. Keying on the bare
-// type name was itself fail-open: a reviewer showed that `other.JobPayload{Plan:true}`
-// was exempted, and `type JobPayload = runtime.Job` in any other package would be
-// too — recreating the very type-alias bypass this inversion was written to close,
-// now under five borrowed names. The qualifier is part of the identity, so it is part
-// of the key.
+// planFieldAllowlist maps a type to the IMPORT PATH of the package that owns it.
+// Keying on the bare type name was fail-open (`other.JobPayload{Plan:true}` was
+// exempt); keying on the qualifier's LOCAL name was still fail-open, because an
+// import alias is an arbitrary local name a producer chooses for itself:
 //
-// This is an ALLOWLIST on purpose. The design before the inversion asked "is this a
-// runtime.Job?" and exempted everything it could not identify; three review rounds
-// walked past it with a spelling it did not know. Defaulting to REPORTED means a new
-// type, a rename or an alias names itself in a census failure and a maintainer
-// decides. Adding an entry here is a deliberate act with a diff; being invisible was
-// not.
+//	import workflow "github.com/gitmoot/gitmoot/internal/censusshim" // type JobPayload = runtime.Job
+//	_ = workflow.JobPayload{Plan: true}                              // exempt, and a real producer
+//
+// A reviewer built exactly that as compiled code in the tree and the census stayed
+// green. The remedy needs no type resolution: parsed.Imports already maps every
+// qualifier to its import PATH, so identity is available for the asking. A
+// qualifier that cannot be resolved to a path is NOT allowlisted, so an unusual
+// import form costs a census failure rather than an exemption.
 var planFieldAllowlist = map[string]string{
-	"JobPayload":             "workflow", // internal/workflow/mailbox.go — the persisted payload
-	"JobRequest":             "workflow", // internal/workflow/mailbox.go — the enqueue request
-	"RuntimeContractRequest": "runtime",  // internal/runtime/preflight.go — preflight scoping
+	"JobPayload":             "github.com/gitmoot/gitmoot/internal/workflow", // mailbox.go — the persisted payload
+	"JobRequest":             "github.com/gitmoot/gitmoot/internal/workflow", // mailbox.go — the enqueue request
+	"RuntimeContractRequest": "github.com/gitmoot/gitmoot/internal/runtime",  // preflight.go — preflight scoping
 	// Surfaced BY the inversion, and exactly the decision it exists to force: both
 	// have a field literally named Plan that has nothing to do with plan mode.
 	// groomApplyResult.Plan is a plan-file PATH (string); DelegationTimeoutDefaults.Plan
 	// is a DURATION. The pre-inversion matcher never saw either.
-	"groomApplyResult":          "cli",      // internal/cli/memory_groom.go — Plan is a file path
-	"DelegationTimeoutDefaults": "workflow", // internal/workflow — Plan is a timeout duration
+	"groomApplyResult":          "github.com/gitmoot/gitmoot/internal/cli",      // memory_groom.go — Plan is a file path
+	"DelegationTimeoutDefaults": "github.com/gitmoot/gitmoot/internal/workflow", // Plan is a timeout duration
+}
+
+// planFieldModulePath is this module's path, so a file's own package identity can be
+// derived from its position in the tree without loading type information.
+const planFieldModulePath = "github.com/gitmoot/gitmoot"
+
+// planFieldPackagePath returns the import path of the package containing a file at
+// repo-relative path rel.
+func planFieldPackagePath(rel string) string {
+	dir := filepath.ToSlash(filepath.Dir(rel))
+	if dir == "." {
+		return planFieldModulePath
+	}
+	return planFieldModulePath + "/" + dir
+}
+
+// planFieldImportPaths maps each qualifier a file can write to the import path it
+// resolves to. A dot-import has no qualifier and is deliberately absent, so a bare
+// name arriving that way is checked against the file's OWN package and reported. A
+// named import uses its alias; otherwise the path's last element is the qualifier,
+// which is wrong only when a package name differs from its directory — and that
+// case fails CLOSED, because the qualifier then resolves to nothing.
+func planFieldImportPaths(parsed *ast.File) map[string]string {
+	paths := make(map[string]string, len(parsed.Imports))
+	for _, spec := range parsed.Imports {
+		path, err := strconv.Unquote(spec.Path.Value)
+		if err != nil {
+			continue
+		}
+		name := ""
+		if spec.Name != nil {
+			name = spec.Name.Name
+		} else if index := strings.LastIndex(path, "/"); index >= 0 {
+			name = path[index+1:]
+		} else {
+			name = path
+		}
+		// No skip for "." or "_": neither is a legal selector qualifier, so a dot- or
+		// blank-import entry can never be looked up. A guard for it was untestable by
+		// construction — the same dead-branch shape as the deleted StarExpr case.
+		paths[name] = path
+	}
+	return paths
+}
+
+// declaresAllowlistedName reports whether a type declaration borrows an allowlisted
+// name. A function-local `type JobPayload = runtime.Job` shadows the real type, so a
+// bare literal under that name passes the owning-package test while producing a
+// genuine runtime.Job. The exemption belongs to five specific types, not to their
+// spellings, so any body-scoped declaration of one of those names is reported.
+func declaresAllowlistedName(spec *ast.TypeSpec) bool {
+	if spec == nil || spec.Name == nil {
+		return false
+	}
+	_, listed := planFieldAllowlist[spec.Name.Name]
+	return listed
 }
 
 // planFieldTypeIsAllowlisted reports whether a composite literal's type is one of
 // the shapes allowed to carry plan fields without being a census producer. An
-// unrecognised or unnamed type is NOT allowlisted, so it is reported.
-func planFieldTypeIsAllowlisted(expr ast.Expr, pkgName string) bool {
+// unrecognised or unnamed type is NOT allowlisted, so it is reported. pkgPath is the
+// import path of the file's own package and imports maps its qualifiers to paths.
+func planFieldTypeIsAllowlisted(expr ast.Expr, pkgPath string, imports map[string]string) bool {
 	switch typed := expr.(type) {
 	case *ast.SelectorExpr:
-		// pkg.Type{...}. The QUALIFIER must be the package that owns the type — an
-		// import alias is compared by its local name, which is the strongest check a
-		// source-level census can make without full type resolution. A same-named
-		// type from any other package is reported, so a borrowed name cannot buy an
-		// exemption.
+		// pkg.Type{...}. The qualifier is a LOCAL name the producer chooses, so it is
+		// resolved through the file's imports to a package PATH before comparison. An
+		// alias that borrows the owner's name (`import workflow ".../censusshim"`)
+		// therefore buys nothing, and a qualifier absent from the import table — a
+		// package whose name differs from its directory, say — resolves to "" and is
+		// reported rather than assumed.
 		qualifier, ok := typed.X.(*ast.Ident)
 		if !ok {
 			return false
 		}
 		owner, listed := planFieldAllowlist[typed.Sel.Name]
-		return listed && qualifier.Name == owner
+		return listed && imports[qualifier.Name] == owner
 	case *ast.Ident:
-		// Bare Type{...} — only exempt when the FILE's package is the owning one.
+		// Bare Type{...} — only exempt when the FILE's own package owns the name.
 		owner, listed := planFieldAllowlist[typed.Name]
-		return listed && pkgName == owner
+		return listed && pkgPath == owner
 	// No *ast.StarExpr or *ast.ParenExpr case: Go has no syntax that puts either in
 	// CompositeLit.Type. '&runtime.Job{...}' parses the & OUTSIDE the literal, so the
 	// type is still a SelectorExpr, and element literals inside a slice or map carry
@@ -299,53 +370,130 @@ func planFieldTypeIsAllowlisted(expr ast.Expr, pkgName string) bool {
 // spelling that bypasses the census must also bypass this test — which is the
 // property the three earlier bypasses all lacked.
 func TestPlanFieldCensusFailsClosedOnUnknownTypes(t *testing.T) {
+	const defaultImports = "import (\n\t\"github.com/gitmoot/gitmoot/internal/runtime\"\n\tworkflow \"github.com/gitmoot/gitmoot/internal/workflow\"\n)\n"
 	cases := []struct {
-		name string
-		src  string
-		want bool // want == reported by the census
+		name    string
+		imports string // when empty, defaultImports; a case owns its import block so the
+		pkg     string // qualifier resolution under test is the file's own, not a fixed map;
+		src     string // pkg is the file's repo-relative path, defaulting to the owning one
+		want    bool   // want == reported by the census
 	}{
-		{"qualified runtime.Job", "_ = runtime.Job{Plan: true}", true},
-		{"TYPE ALIAS — the round-5 bypass", "_ = censusJobAlias{Plan: true, PlanInto: \"@smol\"}", true},
-		{"alias of an alias", "_ = deeperAlias{PlanInto: \"x\"}", true},
-		{"bare Ident under dot-import", "_ = Job{Plan: true}", true},
-		{"pointer literal", "_ = &runtime.Job{Plan: true}", true},
-		{"unknown local type", "_ = someShim{Plan: true}", true},
-		{"allowlisted payload", "_ = JobPayload{Plan: true}", false},
-		{"allowlisted request", "_ = JobRequest{PlanInto: \"x\"}", false},
-		{"allowlisted qualified", "_ = runtime.RuntimeContractRequest{Plan: true}", false},
-		{"no plan field at all", "_ = runtime.Job{Prompt: \"x\"}", false},
+		{"qualified runtime.Job", "", "", "_ = runtime.Job{Plan: true}", true},
+		{"TYPE ALIAS — the round-5 bypass", "", "", "_ = censusJobAlias{Plan: true, PlanInto: \"@smol\"}", true},
+		{"alias of an alias", "", "", "_ = deeperAlias{PlanInto: \"x\"}", true},
+		{"bare Ident under dot-import", "", "", "_ = Job{Plan: true}", true},
+		{"pointer literal", "", "", "_ = &runtime.Job{Plan: true}", true},
+		{"unknown local type", "", "", "_ = someShim{Plan: true}", true},
+		{"allowlisted payload", "", "", "_ = JobPayload{Plan: true}", false},
+		{"allowlisted request", "", "", "_ = JobRequest{PlanInto: \"x\"}", false},
+		{"allowlisted qualified", "", "", "_ = runtime.RuntimeContractRequest{Plan: true}", false},
+		{"no plan field at all", "", "", "_ = runtime.Job{Prompt: \"x\"}", false},
 		// SAME-NAME IMPOSTOR CONTROLS. Keying the allowlist on the bare type name was
 		// fail-open: a borrowed name from any other package bought an exemption, which
 		// recreated the type-alias bypass under five allowlisted names. The qualifier
 		// is now part of the identity, so each of these must be REPORTED.
-		{"impostor: foreign JobPayload", "_ = other.JobPayload{Plan: true}", true},
-		{"impostor: foreign JobRequest", "_ = shim.JobRequest{PlanInto: \"x\"}", true},
-		{"impostor: foreign RuntimeContractRequest", "_ = fake.RuntimeContractRequest{Plan: true}", true},
-		{"impostor: foreign groomApplyResult", "_ = other.groomApplyResult{Plan: true}", true},
-		{"impostor: bare allowlisted name in the WRONG package", "_ = RuntimeContractRequest{Plan: true}", true},
-		{"correct qualifier still exempt", "_ = workflow.JobPayload{Plan: true}", false},
+		{"impostor: foreign JobPayload", "", "", "_ = other.JobPayload{Plan: true}", true},
+		{"impostor: foreign JobRequest", "", "", "_ = shim.JobRequest{PlanInto: \"x\"}", true},
+		{"impostor: foreign RuntimeContractRequest", "", "", "_ = fake.RuntimeContractRequest{Plan: true}", true},
+		{"impostor: foreign groomApplyResult", "", "", "_ = other.groomApplyResult{Plan: true}", true},
+		{"impostor: bare allowlisted name in the WRONG package", "", "", "_ = RuntimeContractRequest{Plan: true}", true},
+		{"correct qualifier still exempt", "", "", "_ = workflow.JobPayload{Plan: true}", false},
 		// DEFAULT-BRANCH CONTROLS. A reviewer showed that making the default branch
 		// return true survived the earlier fixtures, because none of them reached it:
 		// every case named a type. These do, so the fail-closed default is now armed.
-		{"generic instantiation", "_ = Wrapper[runtime.Job]{Plan: true}", true},
-		{"map element literal", "_ = map[string]runtime.Job{\"k\": {Plan: true}}", true},
-		{"slice element literal", "_ = []runtime.Job{{PlanInto: \"x\"}}", true},
+		{"generic instantiation", "", "", "_ = Wrapper[runtime.Job]{Plan: true}", true},
+		{"map element literal", "", "", "_ = map[string]runtime.Job{\"k\": {Plan: true}}", true},
+		{"slice element literal", "", "", "_ = []runtime.Job{{PlanInto: \"x\"}}", true},
+		// IMPORT-ALIAS IDENTITY. Comparing the qualifier's LOCAL name was still
+		// fail-open: the alias is chosen by the producer, so borrowing the owner's name
+		// bought the exemption back. A reviewer proved it with compiled code in the
+		// tree. Identity is the import PATH, and these three fix the meaning of that.
+		{
+			name:    "alias BORROWING the owner's name is reported",
+			imports: "import workflow \"github.com/gitmoot/gitmoot/internal/censusshim\"\n",
+			pkg:     "",
+			src:     "_ = workflow.JobPayload{Plan: true}",
+			want:    true,
+		},
+		{
+			name:    "legitimate differing alias for the real owner stays exempt",
+			imports: "import wf \"github.com/gitmoot/gitmoot/internal/workflow\"\n",
+			pkg:     "",
+			src:     "_ = wf.JobPayload{Plan: true}",
+			want:    false,
+		},
+		{
+			name:    "dot-import into a NON-owning package is reported",
+			imports: "import . \"github.com/gitmoot/gitmoot/internal/workflow\"\n",
+			pkg:     "internal/cli/x.go",
+			src:     "_ = JobPayload{Plan: true}",
+			want:    true,
+		},
+		{
+			name:    "qualifier absent from the import table is reported",
+			imports: "import \"github.com/gitmoot/gitmoot/internal/runtime\"\n",
+			pkg:     "",
+			src:     "_ = workflow.JobPayload{Plan: true}",
+			want:    true,
+		},
 	}
 	for _, tc := range cases {
-		file, err := parser.ParseFile(token.NewFileSet(), "x.go", "package workflow\nfunc f() {\n"+tc.src+"\n}\n", 0)
+		imports := tc.imports
+		if imports == "" {
+			imports = defaultImports
+		}
+		pkg := tc.pkg
+		if pkg == "" {
+			pkg = "internal/workflow/x.go"
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), "x.go", "package workflow\n"+imports+"func f() {\n"+tc.src+"\n}\n", 0)
 		if err != nil {
 			t.Fatalf("%s: parse: %v", tc.name, err)
 		}
+		// The predicate runs against the fixture's OWN resolved imports, so a fixture
+		// cannot pass by borrowing a map the production walk would never build.
+		resolved := planFieldImportPaths(file)
 		var reported bool
 		ast.Inspect(file, func(n ast.Node) bool {
 			lit, ok := n.(*ast.CompositeLit)
-			if ok && hasPlanField(lit) && !planFieldTypeIsAllowlisted(lit.Type, "workflow") {
+			if ok && hasPlanField(lit) && !planFieldTypeIsAllowlisted(lit.Type, planFieldPackagePath(pkg), resolved) {
 				reported = true
 			}
 			return true
 		})
 		if reported != tc.want {
 			t.Fatalf("%s: reported=%v, want %v (src: %s)", tc.name, reported, tc.want, tc.src)
+		}
+	}
+}
+
+// TestDeclaresAllowlistedNameArmsTheShadowBranch pins the local-shadow arm of the
+// census. Without a fixture the branch is an assertion about a defect nobody
+// reproduced; with one, deleting it fails a test rather than going quiet.
+func TestDeclaresAllowlistedNameArmsTheShadowBranch(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		src  string
+		want bool
+	}{
+		{"local alias shadowing an allowlisted name", "type JobPayload = runtime.Job", true},
+		{"local alias of a second allowlisted name", "type JobRequest = runtime.Job", true},
+		{"local definition, not an alias, still borrows the name", "type groomApplyResult struct{ Plan bool }", true},
+		{"unrelated local type", "type somethingElse = runtime.Job", false},
+	} {
+		file, err := parser.ParseFile(token.NewFileSet(), "x.go", "package workflow\nfunc f() {\n"+tc.src+"\n_ = 0\n}\n", 0)
+		if err != nil {
+			t.Fatalf("%s: parse: %v", tc.name, err)
+		}
+		var got bool
+		ast.Inspect(file, func(n ast.Node) bool {
+			if spec, ok := n.(*ast.TypeSpec); ok && declaresAllowlistedName(spec) {
+				got = true
+			}
+			return true
+		})
+		if got != tc.want {
+			t.Fatalf("%s: declaresAllowlistedName = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }
