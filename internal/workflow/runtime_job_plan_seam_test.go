@@ -7,7 +7,6 @@ import (
 	"io/fs"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 )
@@ -44,8 +43,6 @@ func TestRuntimeJobPlanFieldsHaveSingleGatedProducer(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		runtimeAliases, dotRuntime := runtimeImportAliases(parsed)
-		inRuntimePackage := parsed.Name.Name == "runtime" && strings.HasPrefix(filepath.ToSlash(rel), "internal/runtime/")
 		for _, declaration := range parsed.Decls {
 			function, ok := declaration.(*ast.FuncDecl)
 			if !ok || function.Body == nil {
@@ -54,8 +51,21 @@ func TestRuntimeJobPlanFieldsHaveSingleGatedProducer(t *testing.T) {
 			ast.Inspect(function.Body, func(node ast.Node) bool {
 				switch n := node.(type) {
 				case *ast.CompositeLit:
-					// runtime.Job{..., Plan: true, ...}
-					if isRuntimeJobType(n.Type, runtimeAliases, dotRuntime, inRuntimePackage) && hasPlanField(n) {
+					// FAIL-CLOSED. This used to ask "is the literal's type runtime.Job?"
+					// and return false when it could not tell — so every type spelling
+					// the matcher did not recognise was silently exempt. Three review
+					// rounds walked past it that way, most recently with
+					// `type X = runtime.Job` (a plain refactor idiom, not an exotic act):
+					// the matcher compares the type NAME syntactically, so an alias under
+					// any other name was invisible and hasPlanField was never consulted.
+					//
+					// The question is inverted: ANY composite literal that sets Plan or
+					// PlanInto is reported unless its type is on an explicit allowlist of
+					// types that legitimately carry those fields. A new type, a rename, or
+					// an alias now defaults to REPORTED. That is noisier and it is the
+					// safe direction: the failure mode becomes "the census names something
+					// you must add to the allowlist", not "the census went quiet".
+					if hasPlanField(n) && !planFieldTypeIsAllowlisted(n.Type, parsed.Name.Name) {
 						got = append(got, filepath.ToSlash(rel)+"::"+functionSymbol(function))
 					}
 				case *ast.AssignStmt:
@@ -90,38 +100,7 @@ func shouldSkipPlanProducerDir(rel string) bool {
 	return base == ".git" || base == ".gitmoot" || base == "node_modules" || base == "build" || base == "dist" || base == "repos" || base == "GOALS"
 }
 
-func runtimeImportAliases(file *ast.File) (map[string]bool, bool) {
-	aliases := map[string]bool{}
-	dot := false
-	for _, imported := range file.Imports {
-		path, err := strconv.Unquote(imported.Path.Value)
-		if err != nil || path != "github.com/gitmoot/gitmoot/internal/runtime" {
-			continue
-		}
-		name := "runtime"
-		if imported.Name != nil {
-			name = imported.Name.Name
-		}
-		if name == "." {
-			dot = true
-		} else if name != "_" {
-			aliases[name] = true
-		}
-	}
-	return aliases, dot
-}
 
-func isRuntimeJobType(expr ast.Expr, aliases map[string]bool, dotRuntime, inRuntimePackage bool) bool {
-	switch typed := expr.(type) {
-	case *ast.SelectorExpr:
-		alias, ok := typed.X.(*ast.Ident)
-		return ok && aliases[alias.Name] && typed.Sel.Name == "Job"
-	case *ast.Ident:
-		return typed.Name == "Job" && (dotRuntime || inRuntimePackage)
-	default:
-		return false
-	}
-}
 
 func hasPlanField(literal *ast.CompositeLit) bool {
 	for _, element := range literal.Elts {
@@ -239,6 +218,94 @@ func TestAssignsPlanFieldArmsTheCensus(t *testing.T) {
 		})
 		if got != tc.want {
 			t.Fatalf("assignsPlanField(%q) = %v, want %v", tc.src, got, tc.want)
+		}
+	}
+}
+
+// planFieldAllowlist names the types that legitimately carry Plan/PlanInto and are
+// NOT a delivered runtime.Job: the payload and request shapes the mailbox itself
+// owns, plus the runtime's own request struct. Everything else that sets those
+// fields is reported by the census.
+//
+// This is an ALLOWLIST on purpose. The previous design asked "is this a
+// runtime.Job?" and exempted everything it could not identify, which is fail-open:
+// three review rounds bypassed it with a spelling it did not know, most recently a
+// type alias. Inverting the default means a new type, a rename or an alias shows up
+// as a census failure naming itself — a maintainer then decides whether it belongs
+// here. Adding a name to this list is a deliberate act with a diff; being invisible
+// to the census was not.
+var planFieldAllowlist = map[string]bool{
+	"JobPayload":             true, // internal/workflow/mailbox.go — the persisted payload
+	"JobRequest":             true, // internal/workflow/mailbox.go — the enqueue request
+	"RuntimeContractRequest": true, // internal/runtime/preflight.go — preflight scoping
+	// Surfaced BY the inversion, and exactly the decision it exists to force: both
+	// have a field literally named Plan that has nothing to do with plan mode.
+	// groomApplyResult.Plan is a plan-file PATH (string); DelegationTimeoutDefaults.Plan
+	// is a DURATION. The old name-plus-type matcher never saw either, because it only
+	// looked at runtime.Job; the new one sees every Plan field and asks. Listing them
+	// here is a deliberate act with a diff, which is the point.
+	"groomApplyResult":           true, // internal/cli/memory_groom.go — Plan is a file path
+	"DelegationTimeoutDefaults":  true, // internal/workflow — Plan is a timeout duration
+}
+
+// planFieldTypeIsAllowlisted reports whether a composite literal's type is one of
+// the shapes allowed to carry plan fields without being a census producer. An
+// unrecognised or unnamed type is NOT allowlisted, so it is reported.
+func planFieldTypeIsAllowlisted(expr ast.Expr, pkgName string) bool {
+	switch typed := expr.(type) {
+	case *ast.SelectorExpr:
+		// pkg.Type{...} — judge on the type name; a qualified runtime.Job is
+		// deliberately absent from the allowlist and therefore reported.
+		return planFieldAllowlist[typed.Sel.Name]
+	case *ast.Ident:
+		return planFieldAllowlist[typed.Name]
+	case *ast.StarExpr:
+		return planFieldTypeIsAllowlisted(typed.X, pkgName)
+	case *ast.ParenExpr:
+		return planFieldTypeIsAllowlisted(typed.X, pkgName)
+	default:
+		// Unnamed, generic-instantiated, array/map element literals and anything
+		// else the walk cannot name: NOT allowlisted. Fail closed.
+		return false
+	}
+}
+
+// TestPlanFieldCensusFailsClosedOnUnknownTypes proves the inversion. Each fixture is
+// parsed from source and run through the same predicates the census uses, so a
+// spelling that bypasses the census must also bypass this test — which is the
+// property the three earlier bypasses all lacked.
+func TestPlanFieldCensusFailsClosedOnUnknownTypes(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want bool // want == reported by the census
+	}{
+		{"qualified runtime.Job", "_ = runtime.Job{Plan: true}", true},
+		{"TYPE ALIAS — the round-5 bypass", "_ = censusJobAlias{Plan: true, PlanInto: \"@smol\"}", true},
+		{"alias of an alias", "_ = deeperAlias{PlanInto: \"x\"}", true},
+		{"bare Ident under dot-import", "_ = Job{Plan: true}", true},
+		{"pointer literal", "_ = &runtime.Job{Plan: true}", true},
+		{"unknown local type", "_ = someShim{Plan: true}", true},
+		{"allowlisted payload", "_ = JobPayload{Plan: true}", false},
+		{"allowlisted request", "_ = JobRequest{PlanInto: \"x\"}", false},
+		{"allowlisted qualified", "_ = runtime.RuntimeContractRequest{Plan: true}", false},
+		{"no plan field at all", "_ = runtime.Job{Prompt: \"x\"}", false},
+	}
+	for _, tc := range cases {
+		file, err := parser.ParseFile(token.NewFileSet(), "x.go", "package workflow\nfunc f() {\n"+tc.src+"\n}\n", 0)
+		if err != nil {
+			t.Fatalf("%s: parse: %v", tc.name, err)
+		}
+		var reported bool
+		ast.Inspect(file, func(n ast.Node) bool {
+			lit, ok := n.(*ast.CompositeLit)
+			if ok && hasPlanField(lit) && !planFieldTypeIsAllowlisted(lit.Type, "workflow") {
+				reported = true
+			}
+			return true
+		})
+		if reported != tc.want {
+			t.Fatalf("%s: reported=%v, want %v (src: %s)", tc.name, reported, tc.want, tc.src)
 		}
 	}
 }
