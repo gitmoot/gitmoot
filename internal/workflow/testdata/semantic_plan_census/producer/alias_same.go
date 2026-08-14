@@ -4,7 +4,12 @@ import "github.com/gitmoot/gitmoot/internal/runtime"
 
 type sameFileAlias = runtime.Job
 type sameFileOther = sameFileAlias
+type sameFileUnrelated struct{ Plan bool }
 
 func AliasSameFile() {
-	_ = sameFileOther{"", "", "", "", "", 0, "", "", true, "", nil, nil, "", "", "", nil}
+	_ = sameFileOther{Plan: true}
+}
+
+func AliasSameFileControl() {
+	_ = sameFileUnrelated{Plan: true}
 }

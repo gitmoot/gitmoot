@@ -6,6 +6,7 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -17,9 +18,27 @@ import (
 
 const runtimePackagePath = "github.com/gitmoot/gitmoot/internal/runtime"
 
+type planCensusBuildContext struct {
+	name   string
+	goos   string
+	goarch string
+	tags   []string
+}
+
+var planCensusReleaseBuildContexts = []planCensusBuildContext{
+	{name: "linux/amd64", goos: "linux", goarch: "amd64"},
+	{name: "linux/arm64", goos: "linux", goarch: "arm64"},
+	{name: "darwin/amd64", goos: "darwin", goarch: "amd64"},
+	{name: "darwin/arm64", goos: "darwin", goarch: "arm64"},
+}
+
 // TestRuntimeJobPlanFieldsHaveSingleGatedProducer is a semantic regression
-// guard on the deliver-time plan gate. It type-checks every non-test package in
-// the module, resolves runtime.Job once, and reports:
+// guard on the deliver-time plan gate. It type-checks the non-test packages
+// selected by `./...` in every GOOS/GOARCH context built by release.yml, with
+// CGO disabled and custom build tags pinned empty. Like `go list ./...`, that
+// scope excludes testdata, nested modules, test files, and files guarded by
+// custom tags; fixture tests below make those boundaries explicit. For each
+// release context it resolves runtime.Job once and reports:
 //
 //   - composite literals that initialize runtime.Job.Plan or PlanInto, including
 //     aliases, alias chains, omitted element types, and unkeyed positional forms;
@@ -33,22 +52,29 @@ const runtimePackagePath = "github.com/gitmoot/gitmoot/internal/runtime"
 // explicit negative assertions so they cannot be mistaken for covered cases.
 func TestRuntimeJobPlanFieldsHaveSingleGatedProducer(t *testing.T) {
 	root := filepath.Clean(filepath.Join("..", ".."))
-	started := time.Now()
-	got, err := planCensusLoad(root, "./...")
-	if err != nil {
-		t.Fatalf("load semantic runtime.Job plan census: %v", err)
+	totalStarted := time.Now()
+	for _, buildContext := range planCensusReleaseBuildContexts {
+		t.Run(buildContext.name, func(t *testing.T) {
+			started := time.Now()
+			got, err := planCensusLoadInContext(root, buildContext, "./...")
+			if err != nil {
+				t.Fatalf("load semantic runtime.Job plan census: %v", err)
+			}
+			t.Logf("semantic runtime.Job plan census wall time: %s", time.Since(started).Round(time.Millisecond))
+			want := []string{"internal/workflow/mailbox.go::Mailbox.deliver"}
+			if !slices.Equal(got, want) {
+				t.Fatalf("runtime.Job plan producers = %v, want exactly %v; route every producer through the deliver-time plan gate", got, want)
+			}
+		})
 	}
-	t.Logf("semantic runtime.Job plan census wall time: %s", time.Since(started).Round(time.Millisecond))
-	want := []string{"internal/workflow/mailbox.go::Mailbox.deliver"}
-	if !slices.Equal(got, want) {
-		t.Fatalf("runtime.Job plan producers = %v, want exactly %v; route every producer through the deliver-time plan gate", got, want)
-	}
+	t.Logf("all release-context semantic census wall time: %s", time.Since(totalStarted).Round(time.Millisecond))
 }
 
-// planCensusLoad is the sole loading and scanning entry point used by both the
-// real census and the compiled fixtures. Tests never call lower-level predicates
-// directly, so a helper can pass only while it remains wired into the real path.
-func planCensusLoad(root string, patterns ...string) ([]string, error) {
+// planCensusLoadInContext is the sole loading and scanning entry point used by
+// both the real census and the compiled fixtures. Tests never call lower-level
+// predicates directly, so a helper can pass only while it remains wired into
+// the real path.
+func planCensusLoadInContext(root string, buildContext planCensusBuildContext, patterns ...string) ([]string, error) {
 	absoluteRoot, err := filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("resolve census root: %w", err)
@@ -61,7 +87,20 @@ func planCensusLoad(root string, patterns ...string) ([]string, error) {
 		packages.NeedTypes |
 		packages.NeedSyntax |
 		packages.NeedTypesInfo
-	loaded, err := packages.Load(&packages.Config{Mode: mode, Dir: absoluteRoot, Tests: false}, patterns...)
+	config := &packages.Config{
+		Mode:       mode,
+		Dir:        absoluteRoot,
+		Tests:      false,
+		BuildFlags: []string{"-tags=" + strings.Join(buildContext.tags, ",")},
+	}
+	if buildContext.goos != "" || buildContext.goarch != "" {
+		config.Env = planCensusEnvironment(
+			"GOOS="+buildContext.goos,
+			"GOARCH="+buildContext.goarch,
+			"CGO_ENABLED=0",
+		)
+	}
+	loaded, err := packages.Load(config, patterns...)
 	if err != nil {
 		return nil, err
 	}
@@ -73,6 +112,22 @@ func planCensusLoad(root string, patterns ...string) ([]string, error) {
 		return nil, err
 	}
 	return planCensusProducers(absoluteRoot, loaded, job), nil
+}
+
+func planCensusEnvironment(overrides ...string) []string {
+	overridden := make(map[string]struct{}, len(overrides))
+	for _, override := range overrides {
+		name, _, _ := strings.Cut(override, "=")
+		overridden[name] = struct{}{}
+	}
+	environment := make([]string, 0, len(os.Environ())+len(overrides))
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if _, replace := overridden[name]; !replace {
+			environment = append(environment, entry)
+		}
+	}
+	return append(environment, overrides...)
 }
 
 func planCensusPackageErrors(loaded []*packages.Package) error {
@@ -273,17 +328,20 @@ func planCensusFunctionSymbol(function *ast.FuncDecl) string {
 
 func TestSemanticPlanCensusCompiledFixtures(t *testing.T) {
 	root := filepath.Clean(filepath.Join("..", ".."))
-	got, err := planCensusLoad(root, "./internal/workflow/testdata/semantic_plan_census/...")
+	got, err := planCensusLoadInContext(root, planCensusBuildContext{name: "host-default"}, "./internal/workflow/testdata/semantic_plan_census/...")
 	if err != nil {
 		t.Fatalf("load compiled semantic census fixtures: %v", err)
 	}
 
-	t.Run("alias chains", func(t *testing.T) {
+	t.Run("alias type identity", func(t *testing.T) {
 		assertPlanCensusProducers(t, got,
 			"internal/workflow/testdata/semantic_plan_census/producer/alias_same.go::AliasSameFile",
 			"internal/workflow/testdata/semantic_plan_census/producer/alias_cross_file_b.go::AliasCrossFile",
 			"internal/workflow/testdata/semantic_plan_census/producer/producer.go::AliasCrossPackage",
 		)
+		assertPlanCensusAbsent(t, got, "::AliasSameFileControl")
+		assertPlanCensusAbsent(t, got, "::AliasCrossFileControl")
+		assertPlanCensusAbsent(t, got, "::AliasCrossPackageControl")
 	})
 	t.Run("keyed PlanInto", func(t *testing.T) {
 		assertPlanCensusProducers(t, got,
@@ -296,11 +354,13 @@ func TestSemanticPlanCensusCompiledFixtures(t *testing.T) {
 			"internal/workflow/testdata/semantic_plan_census/producer/producer.go::UnkeyedSlice",
 			"internal/workflow/testdata/semantic_plan_census/producer/producer.go::UnkeyedMap",
 		)
+		assertPlanCensusAbsent(t, got, "::UnkeyedPositionalControl")
 	})
 	t.Run("generic embedding", func(t *testing.T) {
 		assertPlanCensusProducers(t, got,
 			"internal/workflow/testdata/semantic_plan_census/producer/producer.go::GenericEmbedding",
 		)
+		assertPlanCensusAbsent(t, got, "::GenericEmbeddingControl")
 	})
 	t.Run("struct copy is a documented limit", func(t *testing.T) {
 		assertPlanCensusAbsent(t, got, "::StructCopyLimit")
@@ -308,7 +368,10 @@ func TestSemanticPlanCensusCompiledFixtures(t *testing.T) {
 	t.Run("reflection is a documented limit", func(t *testing.T) {
 		assertPlanCensusAbsent(t, got, "::ReflectionLimit")
 	})
-	t.Run("pointer from a call", func(t *testing.T) {
+	// The predecessor's selector-name matcher already found the three positive
+	// pointer forms. The semantic improvement on this axis is receiver identity:
+	// the unrelated pointer must stay absent without an exemption.
+	t.Run("pointer receiver identity", func(t *testing.T) {
 		assertPlanCensusProducers(t, got,
 			"internal/workflow/testdata/semantic_plan_census/producer/producer.go::PointerFromCall",
 			"internal/workflow/testdata/semantic_plan_census/producer/producer.go::PointerFromCallMultiLHS",
@@ -324,6 +387,63 @@ func TestSemanticPlanCensusCompiledFixtures(t *testing.T) {
 			"internal/workflow/testdata/semantic_plan_census/producer/producer.go::var PackageLevelPlan",
 		)
 	})
+}
+
+func TestSemanticPlanCensusBuildContextScope(t *testing.T) {
+	root := filepath.Clean(filepath.Join("..", ".."))
+	pattern := "./internal/workflow/testdata/semantic_plan_census/producer"
+	t.Setenv("GOFLAGS", strings.TrimSpace(os.Getenv("GOFLAGS")+" -tags=plan_census_tagged_fixture"))
+
+	got, err := planCensusLoadInContext(root, planCensusBuildContext{name: "host-default"}, pattern)
+	if err != nil {
+		t.Fatalf("load fixture in pinned default context: %v", err)
+	}
+	assertPlanCensusAbsent(t, got, "::TaggedBuildContext")
+
+	got, err = planCensusLoadInContext(root, planCensusBuildContext{
+		name: "tagged-fixture",
+		tags: []string{"plan_census_tagged_fixture"},
+	}, pattern)
+	if err != nil {
+		t.Fatalf("load fixture in explicit tagged context: %v", err)
+	}
+	assertPlanCensusProducers(t, got,
+		"internal/workflow/testdata/semantic_plan_census/producer/tagged_plan.go::TaggedBuildContext",
+	)
+}
+
+// TestSemanticPlanCensusReleaseContexts pins the contexts audited by the real
+// census to the target matrix in .github/workflows/release.yml. The production
+// loop and this contract are deliberately separate: deleting a context from the
+// loop's input must fail instead of silently narrowing the guarantee.
+func TestSemanticPlanCensusReleaseContexts(t *testing.T) {
+	var got []string
+	for _, buildContext := range planCensusReleaseBuildContexts {
+		got = append(got, fmt.Sprintf("%s:%s/%s:tags=%s", buildContext.name, buildContext.goos, buildContext.goarch, strings.Join(buildContext.tags, ",")))
+	}
+	want := []string{
+		"linux/amd64:linux/amd64:tags=",
+		"linux/arm64:linux/arm64:tags=",
+		"darwin/amd64:darwin/amd64:tags=",
+		"darwin/arm64:darwin/arm64:tags=",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("release census contexts = %v, want %v", got, want)
+	}
+}
+
+func TestSemanticPlanCensusRejectsPackageErrors(t *testing.T) {
+	root := filepath.Clean(filepath.Join("..", ".."))
+	_, err := planCensusLoadInContext(root, planCensusBuildContext{
+		name: "load-error-fixture",
+		tags: []string{"plan_census_load_error"},
+	}, "./internal/workflow/testdata/semantic_plan_census/loaderror")
+	if err == nil {
+		t.Fatal("semantic census accepted a package with a type-check error")
+	}
+	if !strings.Contains(err.Error(), "undefined: planCensusUndefinedSymbol") {
+		t.Fatalf("semantic census error = %q, want undefined fixture symbol", err)
+	}
 }
 
 func assertPlanCensusProducers(t *testing.T, got []string, wants ...string) {

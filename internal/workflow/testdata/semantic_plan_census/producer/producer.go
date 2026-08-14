@@ -10,7 +10,11 @@ import (
 )
 
 func AliasCrossPackage() {
-	_ = crossalias.Alias{"", "", "", "", "", 0, "", "", true, "", nil, nil, "", "", "", nil}
+	_ = crossalias.Alias{Plan: true}
+}
+
+func AliasCrossPackageControl() {
+	_ = crossalias.Unrelated{Plan: true}
 }
 
 func KeyedPlanInto() {
@@ -31,16 +35,33 @@ func UnkeyedMap() {
 	_ = map[string]runtime.Job{"job": {"", "", "", "", "", 0, "", "", true, "@smol", nil, nil, "", "", "", nil}}
 }
 
+type unrelatedPositional struct {
+	A, B, C, D, E string
+	F             int
+	G, H          string
+	Plan          bool
+}
+
+func UnkeyedPositionalControl() {
+	_ = unrelatedPositional{"", "", "", "", "", 0, "", "", true}
+}
+
 type genericCarrier[T any] struct {
 	runtime.Job
 	Value T
 }
 
 type genericAlias[T any] = genericCarrier[T]
-type genericJobAlias = runtime.Job
 
 func GenericEmbedding() {
-	value := genericAlias[string]{genericJobAlias{"", "", "", "", "", 0, "", "", true, "", nil, nil, "", "", "", nil}, "value"}
+	var value genericAlias[string]
+	value.Plan = true
+	_ = value
+}
+
+func GenericEmbeddingControl() {
+	var value struct{ Plan bool }
+	value.Plan = true
 	_ = value
 }
 

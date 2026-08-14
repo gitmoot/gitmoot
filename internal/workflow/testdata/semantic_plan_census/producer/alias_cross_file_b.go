@@ -1,7 +1,12 @@
 package producer
 
 type crossFileOther = crossFileAlias
+type crossFileUnrelated struct{ Plan bool }
 
 func AliasCrossFile() {
-	_ = crossFileOther{"", "", "", "", "", 0, "", "", true, "@smol", nil, nil, "", "", "", nil}
+	_ = crossFileOther{PlanInto: "@smol"}
+}
+
+func AliasCrossFileControl() {
+	_ = crossFileUnrelated{Plan: true}
 }
