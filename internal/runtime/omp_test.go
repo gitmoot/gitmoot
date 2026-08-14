@@ -3069,9 +3069,11 @@ func TestOmpSummaryIsFinalAssistantTextNotEnvelope(t *testing.T) {
 }
 
 // TestOmpPolicyArgs: every autonomy policy produces the SAME explicit
-// --approval-mode=yolo. Kills: mapping read-only onto always-ask (under which
-// every headless tool call throws, bricking the runtime) and dropping the flag
-// (which inherits the host's tools.approvalMode). Read-only is enforced
+// --approval-mode=yolo. Kills: mapping read-only onto always-ask, and dropping
+// the flag (which inherits the host's tools.approvalMode). The flag is pinned for
+// DETERMINISM, not because always-ask would break omp — that claim was measured
+// and refuted (see the ompRuntimeContract comment: read/grep succeed, only
+// bash/write are refused, exit 0 with a full agent_end). Read-only is enforced
 // Gitmoot-side, not by omp's approval tier.
 func TestOmpPolicyArgs(t *testing.T) {
 	policies := []string{
@@ -3645,4 +3647,84 @@ func TestOmpHealthUsesLiveCheckPrompt(t *testing.T) {
 		t.Fatalf("Health: %v", err)
 	}
 	runner.want(t, 0, "omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session", "--", OmpLiveCheckPrompt)
+}
+
+// TestOmpPlanRejectsMalformedResolvedTarget closes the argv-injection BLOCKER that
+// the model-pin fix itself opened. ompValidatePlan hardened the caller's plan_into;
+// the fix then routed the job's effective model into that same --plan-yolo-into
+// slot without extending the guard, so Job{Plan:true, Model:"--add-dir=/"} produced
+// `--model --add-dir=/ --plan-yolo --plan-yolo-into --add-dir=/`. Hardening one
+// input and routing a second into the same position is not hardening.
+//
+// The non-plan half matters as much: a model value only inherits the flag-value
+// slot's rules when it is actually going there, so ordinary jobs with the same
+// model must still dispatch.
+func TestOmpPlanRejectsMalformedResolvedTarget(t *testing.T) {
+	for _, model := range []string{"--add-dir=/", "provider/model next", "provider/model\x07bell", "-p"} {
+		t.Run("plan+"+strings.NewReplacer(" ", "_", "\x07", "_bell_").Replace(model), func(t *testing.T) {
+			runner := &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}}
+			adapter := OmpAdapter{Runner: runner, Dir: "/repo"}
+			_, err := adapter.Deliver(context.Background(), ompTestAgent(), Job{Prompt: "work", Model: model, Plan: true})
+			if err == nil {
+				t.Fatalf("plan job with model %q was accepted; the model reaches the --plan-yolo-into slot", model)
+			}
+			if !strings.Contains(err.Error(), "plan execution target") {
+				t.Fatalf("error does not name the plan execution target: %v", err)
+			}
+			if len(runner.calls) != 0 {
+				t.Fatalf("rejected plan target still ran a subprocess: %v", runner.calls)
+			}
+		})
+		t.Run("nonplan+"+strings.NewReplacer(" ", "_", "\x07", "_bell_").Replace(model), func(t *testing.T) {
+			runner := &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}}
+			adapter := OmpAdapter{Runner: runner, Dir: "/repo"}
+			if _, err := adapter.Deliver(context.Background(), ompTestAgent(), Job{Prompt: "work", Model: model}); err != nil {
+				t.Fatalf("NON-plan job with model %q was refused: the plan-slot rule must not police --model. err=%v", model, err)
+			}
+		})
+	}
+	// The agent-level model reaches the same slot through EffectiveModel.
+	t.Run("agent model reaches the slot too", func(t *testing.T) {
+		runner := &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}}
+		adapter := OmpAdapter{Runner: runner, Dir: "/repo"}
+		agent := ompTestAgent()
+		agent.Model = "--add-dir=/"
+		if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "work", Plan: true}); err == nil {
+			t.Fatal("plan job with a malformed AGENT model was accepted")
+		}
+	})
+}
+
+// TestOmpPlanTargetPreservesRoleAlias closes a surviving mutant: stripping a
+// leading "@" inside ompPlanTarget compiled and every plan test still passed,
+// because the fallback cases all used a plain provider/model value. omp resolves
+// "@smol" as a ROLE ALIAS (expandRoleAlias) and a bare "smol" is not the same
+// selector — a silent strip would repoint the execution phase at a model the
+// caller never named, which is the exact class of defect the pin fix exists to
+// close, reintroduced one layer down.
+func TestOmpPlanTargetPreservesRoleAlias(t *testing.T) {
+	for _, tc := range []struct{ model, into, want string }{
+		{into: "@smol", want: "@smol"},
+		{model: "@smol", want: "@smol"},                     // alias arriving via the model fallback
+		{model: "@smol", into: "@fast", want: "@fast"},       // explicit target still wins
+		{model: "openai/gpt-5.5", want: "openai/gpt-5.5"},
+		{model: "  @smol  ", want: "@smol"},                  // trimmed, not stripped
+	} {
+		if got := ompPlanTarget(tc.model, tc.into); got != tc.want {
+			t.Fatalf("ompPlanTarget(%q, %q) = %q, want %q", tc.model, tc.into, got, tc.want)
+		}
+	}
+	// End to end: the alias must survive into argv and into the evidence.
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}}
+	adapter := OmpAdapter{Runner: runner, Dir: "/repo"}
+	result, err := adapter.Deliver(context.Background(), ompTestAgent(), Job{Prompt: "work", Model: "@smol", Plan: true})
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	if got := ompFlagValue(runner.calls[0], "--plan-yolo-into"); got != "@smol" {
+		t.Fatalf("--plan-yolo-into = %q, want %q: the role alias must reach omp intact", got, "@smol")
+	}
+	if result.PlanMode != "plan-into:@smol" {
+		t.Fatalf("Result.PlanMode = %q, want %q", result.PlanMode, "plan-into:@smol")
+	}
 }

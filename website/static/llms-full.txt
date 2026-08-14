@@ -10863,9 +10863,11 @@ an omp seat:
   parser reads the FINAL assistant message rather than the last one that carried
   text — an earlier work note is never handed back as the job's answer.
 - **All four `--policy` values pass the same explicit `--approval-mode=yolo`.**
-  omp's undeclared tools default to the `exec` tier, so `always-ask` would make
-  every headless tool call throw. Read-only stays enforced Gitmoot-side (the
-  same fail-closed implement refusal Kimi uses), not by the runtime flag.
+  for determinism — omitting the flag inherits the host's `tools.approvalMode`.
+  NOT because `always-ask` is unusable: measured on omp 17.2.4 headless,
+  read/grep/glob succeed, only bash/write are refused, and the process exits 0
+  with a full `agent_end`. Read-only stays enforced Gitmoot-side (the same
+  fail-closed implement refusal Kimi uses), not by the runtime flag.
 - **omp is in no cross-family group.** An omp implement job's cross-family
   review is *refused loudly* (a `cross_family_review_failed` job event) rather
   than silently skipped, because scoring an opaque router as a family would

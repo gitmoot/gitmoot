@@ -738,10 +738,15 @@ the daemon runs under. What that changes in practice:
   the envelope is complete and only the final answer is missing — fails loudly
   rather than reporting an empty success.
 - **All four `--policy` values pass the same explicit `--approval-mode=yolo`,**
-  because omp's undeclared tools default to the `exec` tier and `always-ask`
-  would make every headless tool call throw. Read-only stays enforced
-  Gitmoot-side (the same fail-closed implement refusal Kimi uses), not by the
-  runtime flag.
+  for **determinism** — omitting the flag would inherit whatever
+  `tools.approvalMode` the host config carries. It is *not* because `always-ask`
+  is unusable: measured on omp 17.2.4 headless, `read`/`grep`/`glob` succeed and
+  only `bash`/`write` are refused, and the process exits 0 with a full
+  `agent_end`, so `always-ask` **restricts** omp rather than breaking it. Mapping
+  autonomy policy onto the approval mode therefore remains an open option
+  (gitmoot#1479); it is simply not what the adapter does today. Read-only stays
+  enforced Gitmoot-side (the same fail-closed implement refusal Kimi uses), not by
+  the runtime flag.
 - **omp is in no cross-family group.** An omp implement job's cross-family
   review is refused *loudly* (a `cross_family_review_failed` job event) instead
   of silently skipped, because scoring an opaque router as a model family would

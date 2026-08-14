@@ -52,11 +52,22 @@ func TestRuntimeJobPlanFieldsHaveSingleGatedProducer(t *testing.T) {
 				continue
 			}
 			ast.Inspect(function.Body, func(node ast.Node) bool {
-				literal, ok := node.(*ast.CompositeLit)
-				if !ok || !isRuntimeJobType(literal.Type, runtimeAliases, dotRuntime, inRuntimePackage) || !hasPlanField(literal) {
-					return true
+				switch n := node.(type) {
+				case *ast.CompositeLit:
+					// runtime.Job{..., Plan: true, ...}
+					if isRuntimeJobType(n.Type, runtimeAliases, dotRuntime, inRuntimePackage) && hasPlanField(n) {
+						got = append(got, filepath.ToSlash(rel)+"::"+functionSymbol(function))
+					}
+				case *ast.AssignStmt:
+					// job.Plan = true — the composite-literal scan alone missed this, and
+					// a compiled mutant that built a runtime.Job then set Plan AFTERWARDS
+					// delivered it straight past the mailbox gate while this test still
+					// passed. A seam guard that recognises only one syntax for writing a
+					// field is not a seam guard.
+					if assignsPlanField(n) {
+						got = append(got, filepath.ToSlash(rel)+"::"+functionSymbol(function))
+					}
 				}
-				got = append(got, filepath.ToSlash(rel)+"::"+functionSymbol(function))
 				return true
 			})
 		}
@@ -138,4 +149,22 @@ func functionSymbol(function *ast.FuncDecl) string {
 		return name.Name + "." + function.Name.Name
 	}
 	return function.Name.Name
+}
+
+// assignsPlanField reports whether a statement writes Plan or PlanInto through a
+// selector, e.g. `job.Plan = true` or `delivery.PlanInto = x`. The composite-literal
+// scan alone left this syntax invisible, so a producer could construct a
+// runtime.Job, set the plan primitives on the next line, and never appear in the
+// seam census the test exists to pin.
+func assignsPlanField(assign *ast.AssignStmt) bool {
+	for _, lhs := range assign.Lhs {
+		selector, ok := lhs.(*ast.SelectorExpr)
+		if !ok {
+			continue
+		}
+		if selector.Sel != nil && (selector.Sel.Name == "Plan" || selector.Sel.Name == "PlanInto") {
+			return true
+		}
+	}
+	return false
 }

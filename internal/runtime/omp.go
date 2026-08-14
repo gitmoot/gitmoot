@@ -213,8 +213,22 @@ func (a OmpAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, 
 	// Plan shape is validated before the PATH preflight: it is a property of the
 	// REQUEST, so it is wrong for its diagnosis to depend on whether omp happens to
 	// be installed.
+	//
+	// The pairing check is about the REQUEST (plan_into without plan is a malformed
+	// ask), so it takes the request field. The character check is about the RESOLVED
+	// target, because carrying the job's effective model into --plan-yolo-into moved
+	// a SECOND value into that argv slot: a plan job with Model "--add-dir=/"
+	// produced `--model --add-dir=/ --plan-yolo --plan-yolo-into --add-dir=/`.
+	// Hardening one input and routing another into the same position is not
+	// hardening. They are separate calls because the resolved target is non-empty
+	// for ordinary non-plan jobs too, where the pairing rule must NOT fire.
 	if err := ompValidatePlan(job.Plan, job.PlanInto); err != nil {
 		return Result{}, err
+	}
+	if job.Plan {
+		if err := ompValidatePlanTarget(ompPlanTarget(EffectiveModel(agent, job), job.PlanInto)); err != nil {
+			return Result{}, err
+		}
 	}
 	// PATH preflight before anything else runs: the daemon's PATH comes from its
 	// systemd EnvironmentFile, so "works in my shell" is not evidence the daemon
@@ -415,20 +429,35 @@ var ompRuntimeContract = RuntimeContract{
 	},
 }
 
-// ompValidatePlan rejects a plan request omp's CLI cannot honour BEFORE any
+// ompValidatePlan rejects a plan REQUEST shape omp's CLI cannot honour BEFORE any
 // subprocess runs. `--plan-yolo-into` without `--plan-yolo` makes omp exit
 // non-zero with no NDJSON envelope at all, which this adapter would diagnose as a
 // truncated stream — the wrong cause for a request shape we can reject here with
-// the actual fix.
+// the actual fix. It also rejects a malformed requested target early, so the
+// operator hears about the field they actually set.
 func ompValidatePlan(plan bool, planInto string) error {
 	into := strings.TrimSpace(planInto)
 	if into != "" && !plan {
 		return fmt.Errorf("omp plan target %q requires plan mode: --plan-yolo-into is only accepted alongside --plan-yolo (set plan on the job, or drop plan_into)", into)
 	}
-	if into != "" && (strings.HasPrefix(into, "-") || strings.IndexFunc(into, func(r rune) bool {
+	return ompValidatePlanTarget(into)
+}
+
+// ompValidatePlanTarget rejects any value that would land at the --plan-yolo-into
+// argv position. It is applied to the RESOLVED target, not only to a caller's
+// plan_into, because the resolver falls back to the job's effective model — so a
+// model value reaches a flag-value slot and inherits this slot's rules. A leading
+// `-` would be read as a flag by a stricter parser than today's; whitespace or a
+// control character in a model selector reaches execve.
+func ompValidatePlanTarget(target string) error {
+	into := strings.TrimSpace(target)
+	if into == "" {
+		return nil
+	}
+	if strings.HasPrefix(into, "-") || strings.IndexFunc(into, func(r rune) bool {
 		return unicode.IsSpace(r) || unicode.IsControl(r)
-	}) >= 0) {
-		return fmt.Errorf("omp plan target %q is invalid: plan_into must be one non-flag model selector without whitespace or control characters (for example @smol or provider/model); correct it or drop plan_into", into)
+	}) >= 0 {
+		return fmt.Errorf("omp plan target %q is invalid: the plan execution target must be one non-flag model selector without whitespace or control characters (for example @smol or provider/model). It is either the job's plan_into or, when that is unset, the job's effective model — correct whichever is set", into)
 	}
 	return nil
 }
