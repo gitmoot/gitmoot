@@ -44,56 +44,7 @@ func TestRuntimeJobPlanFieldsHaveSingleGatedProducer(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		pkgPath := planFieldPackagePath(rel)
-		imports := planFieldImportPaths(parsed)
-		for _, declaration := range parsed.Decls {
-			function, ok := declaration.(*ast.FuncDecl)
-			if !ok || function.Body == nil {
-				continue
-			}
-			ast.Inspect(function.Body, func(node ast.Node) bool {
-				switch n := node.(type) {
-				case *ast.CompositeLit:
-					// FAIL-CLOSED. This used to ask "is the literal's type runtime.Job?"
-					// and return false when it could not tell — so every type spelling
-					// the matcher did not recognise was silently exempt. Three review
-					// rounds walked past it that way, most recently with
-					// `type X = runtime.Job` (a plain refactor idiom, not an exotic act):
-					// the matcher compares the type NAME syntactically, so an alias under
-					// any other name was invisible and hasPlanField was never consulted.
-					//
-					// The question is inverted: ANY composite literal that sets Plan or
-					// PlanInto is reported unless its type is on an explicit allowlist of
-					// types that legitimately carry those fields. A new type, a rename, or
-					// an alias now defaults to REPORTED. That is noisier and it is the
-					// safe direction: the failure mode becomes "the census names something
-					// you must add to the allowlist", not "the census went quiet".
-					if hasPlanField(n) && !planFieldTypeIsAllowlisted(n.Type, pkgPath, imports) {
-						got = append(got, filepath.ToSlash(rel)+"::"+functionSymbol(function))
-					}
-				case *ast.AssignStmt:
-					// job.Plan = true — the composite-literal scan alone missed this, and
-					// a compiled mutant that built a runtime.Job then set Plan AFTERWARDS
-					// delivered it straight past the mailbox gate while this test still
-					// passed. A seam guard that recognises only one syntax for writing a
-					// field is not a seam guard.
-					if assignsPlanField(n) {
-						got = append(got, filepath.ToSlash(rel)+"::"+functionSymbol(function))
-					}
-				case *ast.TypeSpec:
-					// A function-local `type JobPayload = runtime.Job` SHADOWS the real
-					// type, so a bare literal under that name satisfies the owning-package
-					// test above and would be exempt while producing a genuine
-					// runtime.Job. Declaring an allowlisted name anywhere inside a body is
-					// therefore reported: the allowlist grants exemption to five specific
-					// types, not to their spellings.
-					if declaresAllowlistedName(n) {
-						got = append(got, filepath.ToSlash(rel)+"::"+functionSymbol(function))
-					}
-				}
-				return true
-			})
-		}
+		got = append(got, planFieldProducersInFile(rel, parsed)...)
 		return nil
 	})
 	if err != nil {
@@ -103,6 +54,67 @@ func TestRuntimeJobPlanFieldsHaveSingleGatedProducer(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Fatalf("runtime.Job plan producers = %v, want exactly %v; route every producer through the deliver-time plan gate", got, want)
 	}
+}
+
+// planFieldProducersInFile is the census's per-file scan, extracted so a test can
+// drive it directly. A reviewer showed why that matters: the compiled mutation
+// `if false && declaresAllowlistedName(n)` disconnected the shadow arm from the
+// census while the helper's own unit test stayed green — a test of a helper proves
+// the helper, not that anything CALLS it. TestPlanFieldCensusWiresEveryArm pins the
+// wiring, so deleting an arm now fails a test instead of going quiet.
+func planFieldProducersInFile(rel string, parsed *ast.File) []string {
+	var got []string
+	pkgPath := planFieldPackagePath(rel)
+	imports := planFieldImportPaths(parsed)
+	for _, declaration := range parsed.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Body == nil {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			switch n := node.(type) {
+			case *ast.CompositeLit:
+				// FAIL-CLOSED. This used to ask "is the literal's type runtime.Job?"
+				// and return false when it could not tell — so every type spelling
+				// the matcher did not recognise was silently exempt. Three review
+				// rounds walked past it that way, most recently with
+				// `type X = runtime.Job` (a plain refactor idiom, not an exotic act):
+				// the matcher compares the type NAME syntactically, so an alias under
+				// any other name was invisible and hasPlanField was never consulted.
+				//
+				// The question is inverted: ANY composite literal that sets Plan or
+				// PlanInto is reported unless its type is on an explicit allowlist of
+				// types that legitimately carry those fields. A new type, a rename, or
+				// an alias now defaults to REPORTED. That is noisier and it is the
+				// safe direction: the failure mode becomes "the census names something
+				// you must add to the allowlist", not "the census went quiet".
+				if hasPlanField(n) && !planFieldTypeIsAllowlisted(n.Type, pkgPath, imports) {
+					got = append(got, filepath.ToSlash(rel)+"::"+functionSymbol(function))
+				}
+			case *ast.AssignStmt:
+				// job.Plan = true — the composite-literal scan alone missed this, and
+				// a compiled mutant that built a runtime.Job then set Plan AFTERWARDS
+				// delivered it straight past the mailbox gate while this test still
+				// passed. A seam guard that recognises only one syntax for writing a
+				// field is not a seam guard.
+				if assignsPlanField(n) {
+					got = append(got, filepath.ToSlash(rel)+"::"+functionSymbol(function))
+				}
+			case *ast.TypeSpec:
+				// A function-local `type JobPayload = runtime.Job` SHADOWS the real
+				// type, so a bare literal under that name satisfies the owning-package
+				// test above and would be exempt while producing a genuine
+				// runtime.Job. Declaring an allowlisted name anywhere inside a body is
+				// therefore reported: the allowlist grants exemption to five specific
+				// types, not to their spellings.
+				if declaresAllowlistedName(n, pkgPath) {
+					got = append(got, filepath.ToSlash(rel)+"::"+functionSymbol(function))
+				}
+			}
+			return true
+		})
+	}
+	return got
 }
 
 func shouldSkipPlanProducerDir(rel string) bool {
@@ -318,12 +330,17 @@ func planFieldImportPaths(parsed *ast.File) map[string]string {
 // bare literal under that name passes the owning-package test while producing a
 // genuine runtime.Job. The exemption belongs to five specific types, not to their
 // spellings, so any body-scoped declaration of one of those names is reported.
-func declaresAllowlistedName(spec *ast.TypeSpec) bool {
+func declaresAllowlistedName(spec *ast.TypeSpec, pkgPath string) bool {
 	if spec == nil || spec.Name == nil {
 		return false
 	}
-	_, listed := planFieldAllowlist[spec.Name.Name]
-	return listed
+	owner, listed := planFieldAllowlist[spec.Name.Name]
+	// Only inside the OWNING package. A reviewer showed the unrestricted form failing
+	// the census on a compiled internal/cli helper declaring an unrelated
+	// `JobRequest struct{ Value string }` — no plan field, no relation to runtime.Job.
+	// Outside the owner a bare literal is already reported by the package test above,
+	// so the shadow arm adds nothing there and only blocks innocent code.
+	return listed && pkgPath == owner
 }
 
 // planFieldTypeIsAllowlisted reports whether a composite literal's type is one of
@@ -430,6 +447,22 @@ func TestPlanFieldCensusFailsClosedOnUnknownTypes(t *testing.T) {
 			want:    true,
 		},
 		{
+			// Full-path identity, not the last element: another module may own a
+			// directory called workflow, and comparing basenames would exempt it.
+			name:    "same basename at a DIFFERENT module path is reported",
+			imports: "import workflow \"github.com/other/project/internal/workflow\"\n",
+			src:     "_ = workflow.JobPayload{Plan: true}",
+			want:    true,
+		},
+		{
+			// The Ident arm needs the same distinction: a file whose OWN package merely
+			// ends in "workflow" does not own internal/workflow's types.
+			name: "bare name in a package sharing only the basename is reported",
+			pkg:  "internal/other/workflow/x.go",
+			src:  "_ = JobPayload{Plan: true}",
+			want: true,
+		},
+		{
 			name:    "qualifier absent from the import table is reported",
 			imports: "import \"github.com/gitmoot/gitmoot/internal/runtime\"\n",
 			pkg:     "",
@@ -473,13 +506,17 @@ func TestPlanFieldCensusFailsClosedOnUnknownTypes(t *testing.T) {
 func TestDeclaresAllowlistedNameArmsTheShadowBranch(t *testing.T) {
 	for _, tc := range []struct {
 		name string
+		pkg  string
 		src  string
 		want bool
 	}{
-		{"local alias shadowing an allowlisted name", "type JobPayload = runtime.Job", true},
-		{"local alias of a second allowlisted name", "type JobRequest = runtime.Job", true},
-		{"local definition, not an alias, still borrows the name", "type groomApplyResult struct{ Plan bool }", true},
-		{"unrelated local type", "type somethingElse = runtime.Job", false},
+		{"local alias shadowing an allowlisted name", "internal/workflow/x.go", "type JobPayload = runtime.Job", true},
+		{"local alias of a second allowlisted name", "internal/workflow/x.go", "type JobRequest = runtime.Job", true},
+		{"local definition, not an alias, still borrows the name", "internal/cli/x.go", "type groomApplyResult struct{ Plan bool }", true},
+		// OVER-REPORT CONTROL. The unrestricted form failed the census on a compiled
+		// internal/cli helper declaring an unrelated JobRequest with no plan field.
+		{"allowlisted name declared OUTSIDE its owning package", "internal/cli/x.go", "type JobRequest struct{ Value string }", false},
+		{"unrelated local type", "internal/workflow/x.go", "type somethingElse = runtime.Job", false},
 	} {
 		file, err := parser.ParseFile(token.NewFileSet(), "x.go", "package workflow\nfunc f() {\n"+tc.src+"\n_ = 0\n}\n", 0)
 		if err != nil {
@@ -487,13 +524,68 @@ func TestDeclaresAllowlistedNameArmsTheShadowBranch(t *testing.T) {
 		}
 		var got bool
 		ast.Inspect(file, func(n ast.Node) bool {
-			if spec, ok := n.(*ast.TypeSpec); ok && declaresAllowlistedName(spec) {
+			if spec, ok := n.(*ast.TypeSpec); ok && declaresAllowlistedName(spec, planFieldPackagePath(tc.pkg)) {
 				got = true
 			}
 			return true
 		})
 		if got != tc.want {
 			t.Fatalf("%s: declaresAllowlistedName = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestPlanFieldCensusWiresEveryArm pins that the census REACHES each arm, which the
+// per-helper tests cannot show. A reviewer disconnected the shadow arm with
+// `if false && declaresAllowlistedName(n)` and all three existing tests stayed green:
+// a helper test proves the helper, never the call. Each case below fails if its arm
+// is unwired, so an arm cannot be deleted or short-circuited silently.
+func TestPlanFieldCensusWiresEveryArm(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rel  string
+		src  string
+		want []string
+	}{
+		{
+			name: "composite-literal arm",
+			rel:  "internal/cli/x.go",
+			src:  "func f() { _ = runtime.Job{Plan: true} }",
+			want: []string{"internal/cli/x.go::f"},
+		},
+		{
+			name: "assignment arm",
+			rel:  "internal/cli/x.go",
+			src:  "func f() { var j runtime.Job; j.Plan = true; _ = j }",
+			want: []string{"internal/cli/x.go::f"},
+		},
+		{
+			name: "shadow arm, inside the owning package",
+			rel:  "internal/workflow/x.go",
+			src:  "func f() { type JobPayload = runtime.Job; _ = 0 }",
+			want: []string{"internal/workflow/x.go::f"},
+		},
+		{
+			name: "import-alias arm",
+			rel:  "internal/workflow/x.go",
+			src:  "func f() { _ = workflow.JobPayload{Plan: true} }",
+			want: []string{"internal/workflow/x.go::f"},
+		},
+		{
+			name: "clean file reports nothing",
+			rel:  "internal/cli/x.go",
+			src:  "func f() { _ = runtime.Job{Prompt: \"x\"} }",
+			want: nil,
+		},
+	} {
+		const imports = "import (\n\t\"github.com/gitmoot/gitmoot/internal/runtime\"\n\tworkflow \"github.com/gitmoot/gitmoot/internal/censusshim\"\n)\n"
+		file, err := parser.ParseFile(token.NewFileSet(), "x.go", "package p\n"+imports+tc.src+"\n", 0)
+		if err != nil {
+			t.Fatalf("%s: parse: %v", tc.name, err)
+		}
+		got := planFieldProducersInFile(tc.rel, file)
+		if !slices.Equal(got, tc.want) {
+			t.Fatalf("%s: producers = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }
