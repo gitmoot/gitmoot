@@ -258,20 +258,27 @@ omp ships a `--plan-yolo` mode and the adapter passes it — but only when the j
 asks for it. A job payload carrying `plan: true` runs
 `--plan-yolo`; adding `plan_into: "<model>"` also emits
 `--plan-yolo-into <model>`, pinning the model the execution phase runs on (omp's
-own default target is the `smol` role). `plan_into` without `plan` is rejected
-before dispatch, because omp only accepts the pair.
+declared default target is the `smol` role). `plan_into` must be one non-flag
+model selector without internal whitespace or control characters. An unpaired
+or malformed target is rejected before dispatch.
 
-Plan mode is **workflow shape**, not permission: omp starts read-only,
-auto-approves the *model's own* plan on its first resolve call, and then
-**auto-executes** it. `--approval-mode` is untouched and stays `yolo` for plan
-and non-plan runs alike — mapping plan mode onto the approval tier would brick
-the runtime rather than restrict it.
+Plan mode is **workflow shape**, not permission. On `omp/17.2.4`, the
+reproducible check `omp --version && omp --help` declares that `--plan-yolo`
+starts in read-only plan mode, auto-approves the model's plan on its first
+resolve call, then executes it, and that `--plan-yolo-into` selects the execution
+model. This is omp's versioned CLI declaration, not internal behavior Gitmoot
+can observe. Gitmoot verifies that the installed binary lists the flags and
+records the requested plan shape. `--approval-mode` is untouched and stays
+`yolo` for plan and non-plan runs alike — mapping plan mode onto the approval
+tier would brick the runtime rather than restrict it.
 
 Only the omp runtime implements plan mode. A plan request routed to any other
 runtime **fails loudly at dispatch** instead of quietly running as an ordinary
 implementation, and the resolved shape is echoed into the job payload as
 `plan_mode` (`plan` or `plan-into:<model>`) so a reader can tell a plan run from
-a normal one without re-deriving it from the argv.
+a normal one without re-deriving it from the argv. Runtime preflight evaluates
+the two plan flags only for a plan request, so an older omp CLI that lacks those
+optional flags can still run ordinary non-plan jobs.
 
 Note that this is omp's plan-first discipline *inside one run*; it is **not**
 Gitmoot's plan gate, where approval remains an explicit human act.

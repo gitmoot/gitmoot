@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
@@ -379,15 +380,15 @@ func (a OmpAdapter) preflight() error {
 //     read as an unknown flag and exits 2, and one starting with `@` is read as a
 //     file attachment. `--` disables all of that for the value that follows.
 //   - `--plan-yolo` is emitted IF AND ONLY IF the job asked for plan mode. It is
-//     ORTHOGONAL to --approval-mode: plan mode is workflow shape (plan first, then
-//     AUTO-EXECUTE the plan), the approval mode is write permission, and --plan-yolo
-//     starts read-only and auto-approves the model's own plan on its first resolve
-//     call. `--plan-yolo-into <M>` pins the model the execution phase runs on and is
-//     only accepted alongside --plan-yolo (omp's own default target is the "smol"
-//     role); ompValidatePlan rejects the unpaired form BEFORE any subprocess, and a
-//     plan request aimed at a runtime SupportsPlanMode rejects never reaches an argv
-//     at all. A silent downgrade to a normal run is the defect this ordering exists
-//     to prevent.
+//     ORTHOGONAL to --approval-mode: plan mode is workflow shape while approval mode
+//     controls tool approval. omp/17.2.4's `omp --help` DECLARES that --plan-yolo
+//     starts read-only, auto-approves the model's plan on its first resolve call and
+//     then executes it; Gitmoot cannot observe those internal transitions. The same
+//     help declares `--plan-yolo-into <M>` as the execution model selector with the
+//     "smol" role as its default. ompValidatePlan rejects malformed or unpaired
+//     targets BEFORE any subprocess, and a plan request aimed at a runtime
+//     SupportsPlanMode rejects never reaches an argv at all. A silent downgrade to
+//     a normal run is the defect this ordering exists to prevent.
 var ompRuntimeContract = RuntimeContract{
 	Binary: "omp",
 	Requirements: []RuntimeRequirement{
@@ -395,8 +396,8 @@ var ompRuntimeContract = RuntimeContract{
 		{Kind: RuntimeRequirementFlag, Name: "flag --mode", Flag: "--mode", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --mode, or run the job on a runtime whose installed CLI satisfies its declared contract"},
 		{Kind: RuntimeRequirementFlag, Name: "flag --approval-mode", Flag: "--approval-mode", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --approval-mode, or run the job on a runtime whose installed CLI satisfies its declared contract"},
 		{Kind: RuntimeRequirementFlag, Name: "flag --no-session", Flag: "--no-session", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --no-session, or run the job on a runtime whose installed CLI satisfies its declared contract"},
-		{Kind: RuntimeRequirementFlag, Name: "flag --plan-yolo", Flag: "--plan-yolo", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --plan-yolo, or run the job on a runtime whose installed CLI satisfies its declared contract"},
-		{Kind: RuntimeRequirementFlag, Name: "flag --plan-yolo-into", Flag: "--plan-yolo-into", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --plan-yolo-into, or run the job on a runtime whose installed CLI satisfies its declared contract"},
+		{Kind: RuntimeRequirementFlag, Name: "flag --plan-yolo", Flag: "--plan-yolo", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --plan-yolo, or run the job on a runtime whose installed CLI satisfies its declared contract", PlanMode: true},
+		{Kind: RuntimeRequirementFlag, Name: "flag --plan-yolo-into", Flag: "--plan-yolo-into", Source: "internal/runtime/omp.go::ompArgs", Remedy: "install an omp CLI that lists --plan-yolo-into, or run the job on a runtime whose installed CLI satisfies its declared contract", PlanMode: true},
 	},
 }
 
@@ -406,8 +407,14 @@ var ompRuntimeContract = RuntimeContract{
 // truncated stream — the wrong cause for a request shape we can reject here with
 // the actual fix.
 func ompValidatePlan(plan bool, planInto string) error {
-	if into := strings.TrimSpace(planInto); into != "" && !plan {
+	into := strings.TrimSpace(planInto)
+	if into != "" && !plan {
 		return fmt.Errorf("omp plan target %q requires plan mode: --plan-yolo-into is only accepted alongside --plan-yolo (set plan on the job, or drop plan_into)", into)
+	}
+	if into != "" && (strings.HasPrefix(into, "-") || strings.IndexFunc(into, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}) >= 0) {
+		return fmt.Errorf("omp plan target %q is invalid: plan_into must be one non-flag model selector without whitespace or control characters (for example @smol or provider/model); correct it or drop plan_into", into)
 	}
 	return nil
 }

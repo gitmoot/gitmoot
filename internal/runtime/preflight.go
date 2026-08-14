@@ -33,13 +33,17 @@ const (
 
 // RuntimeRequirement declares one fact an adapter's argv depends on.
 type RuntimeRequirement struct {
-	Kind       RuntimeRequirementKind
-	Name       string
-	Flag       string
-	Source     string
-	Remedy     string
-	Policies   []string
-	ChatSeat   bool
+	Kind     RuntimeRequirementKind
+	Name     string
+	Flag     string
+	Source   string
+	Remedy   string
+	Policies []string
+	ChatSeat bool
+	// PlanMode scopes a requirement to deliveries whose request enables plan
+	// mode. It is request-scoped rather than inferred from the agent: older CLIs
+	// that lack an optional plan flag must still run ordinary jobs.
+	PlanMode   bool
 	Instrument string
 }
 
@@ -48,6 +52,13 @@ type RuntimeRequirement struct {
 type RuntimeContract struct {
 	Binary       string
 	Requirements []RuntimeRequirement
+}
+
+// RuntimeContractRequest carries only request-scoped axes that select adapter
+// argv requirements. It is deliberately not runtime.Job: constructing the job
+// delivered to an adapter remains the mailbox gate's single responsibility.
+type RuntimeContractRequest struct {
+	Plan bool
 }
 
 func (c RuntimeContract) clone() RuntimeContract {
@@ -138,13 +149,20 @@ var defaultRuntimeContractChecker = NewRuntimeContractChecker(subprocess.GroupRu
 
 func DefaultRuntimeContractChecker() *RuntimeContractChecker { return defaultRuntimeContractChecker }
 
-// Check evaluates only requirements used by this agent's concrete argv.
+// Check evaluates requirements used by an ordinary, non-plan delivery.
 func (c *RuntimeContractChecker) Check(ctx context.Context, agent Agent) RuntimeContractResult {
+	return c.CheckRequest(ctx, agent, RuntimeContractRequest{})
+}
+
+// CheckRequest evaluates only requirements used by this agent and request's
+// concrete argv. Request-scoped features must not be inferred from static agent
+// metadata.
+func (c *RuntimeContractChecker) CheckRequest(ctx context.Context, agent Agent, request RuntimeContractRequest) RuntimeContractResult {
 	meta, ok := c.registry().Metadata(agent.Runtime)
 	if !ok {
 		return RuntimeContractResult{Runtime: agent.Runtime, Version: "unknown", State: RuntimeContractUnknown, Instrument: "runtime-registry"}
 	}
-	return c.check(ctx, meta, func(req RuntimeRequirement) bool { return requirementApplies(req, agent) })
+	return c.check(ctx, meta, func(req RuntimeRequirement) bool { return requirementApplies(req, agent, request) })
 }
 
 // Inspect evaluates every declared requirement for a runtime for doctor.
@@ -320,7 +338,10 @@ func (c *RuntimeContractChecker) runBinaryProbe(ctx context.Context, path string
 	return probe
 }
 
-func requirementApplies(req RuntimeRequirement, agent Agent) bool {
+func requirementApplies(req RuntimeRequirement, agent Agent, request RuntimeContractRequest) bool {
+	if req.PlanMode && !request.Plan {
+		return false
+	}
 	if req.ChatSeat && agent.ChatSeat {
 		return true
 	}

@@ -49,6 +49,8 @@ func (r *contractProbeRunner) Run(ctx context.Context, _ string, command string,
 			return subprocess.Result{}, ctx.Err()
 		case strings.Contains(mode, "unparseable"):
 			return subprocess.Result{Stdout: "???\n"}, nil
+		case strings.Contains(mode, "omp-without-plan"):
+			return subprocess.Result{Stdout: "Usage: omp [options]\n  -p, --print\n  --mode=<value>\n  --approval-mode=<value>\n  --no-session\n"}, nil
 		case strings.Contains(mode, "unsupported"):
 			return subprocess.Result{Stdout: "Usage: kimi [options]\n  --prompt\n  --output-format\n"}, nil
 		default:
@@ -102,6 +104,30 @@ func TestRuntimePreflightUnsupportedErrorNamesRequiredFlag(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q does not contain %q", err, want)
 		}
+	}
+}
+
+func TestRuntimePreflightScopesOmpPlanFlagsToPlanJobs(t *testing.T) {
+	checker, _, _ := newContractCheckerForTest(t, "omp-without-plan")
+	agent := Agent{Name: "planner", Runtime: OmpRuntime, AutonomyPolicy: AutonomyPolicyAuto}
+
+	normal := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{})
+	if normal.State != RuntimeContractSupported {
+		t.Fatalf("normal job state = %q, want supported without optional plan flags: %#v", normal.State, normal)
+	}
+	for _, requirement := range normal.Requirements {
+		if strings.HasPrefix(requirement.Flag, "--plan-yolo") {
+			t.Fatalf("normal job evaluated request-scoped requirement %#v", requirement)
+		}
+	}
+
+	plan := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{Plan: true})
+	if plan.State != RuntimeContractUnsupported {
+		t.Fatalf("plan job state = %q, want unsupported when plan flags are absent: %#v", plan.State, plan)
+	}
+	err := RuntimeContractDispatchError(agent, plan)
+	if err == nil || !strings.Contains(err.Error(), "--plan-yolo") {
+		t.Fatalf("plan job error = %v, want missing plan flag named", err)
 	}
 }
 

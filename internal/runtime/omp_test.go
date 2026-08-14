@@ -743,6 +743,27 @@ func TestOmpDeliverRejectsPlanIntoWithoutPlan(t *testing.T) {
 	}
 }
 
+func TestOmpDeliverRejectsMalformedPlanInto(t *testing.T) {
+	for _, target := range []string{"x --add-dir /etc", "--model", "provider/model\nnext"} {
+		t.Run(strings.ReplaceAll(target, "\n", "_newline_"), func(t *testing.T) {
+			runner := &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}}
+			adapter := OmpAdapter{Runner: runner, Dir: "/repo"}
+			_, err := adapter.Deliver(context.Background(), ompTestAgent(), Job{Prompt: "work", Plan: true, PlanInto: target})
+			if err == nil {
+				t.Fatalf("Deliver accepted malformed plan_into %q", target)
+			}
+			for _, want := range []string{"omp plan target", "one non-flag model selector", "plan_into"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not contain %q", err, want)
+				}
+			}
+			if len(runner.calls) != 0 {
+				t.Fatalf("rejected plan target still ran %d subprocess(es): %v", len(runner.calls), runner.calls)
+			}
+		})
+	}
+}
+
 // TestOmpStartNeverPlans: Start registers a seat, it does not run a brief, so its
 // argv must never carry a plan flag no matter what the agent looks like.
 func TestOmpStartNeverPlans(t *testing.T) {

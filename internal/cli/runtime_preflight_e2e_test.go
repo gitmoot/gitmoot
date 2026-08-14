@@ -127,7 +127,7 @@ func runRuntimePreflightStubJob(t *testing.T, rawHome string, checker *runtime.R
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return checkout, nil
 	}
-	worker.RuntimePreflight = checker.Check
+	worker.RuntimePreflight = checker.CheckRequest
 	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("run queued job: %v", err)
 	}

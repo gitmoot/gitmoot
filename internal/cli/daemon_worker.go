@@ -96,7 +96,7 @@ type jobWorker struct {
 	// RuntimePreflight evaluates the installed CLI contract immediately before
 	// checkout/adapter construction. nil keeps hand-built test workers unchanged;
 	// defaultJobWorker wires the process-wide identity cache.
-	RuntimePreflight func(context.Context, runtime.Agent) runtime.RuntimeContractResult
+	RuntimePreflight func(context.Context, runtime.Agent, runtime.RuntimeContractRequest) runtime.RuntimeContractResult
 	// Progress timing seams keep unit/E2E tests deterministic and short. Zero/nil
 	// values select the package defaults and real timer implementation.
 	PipelineProgressThreshold time.Duration
@@ -163,7 +163,7 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 	worker.CheckoutValidator = worker.defaultCheckout
 	worker.WorkflowFactory = worker.defaultWorkflow
 	worker.AuthProbe = worker.defaultAuthProbe
-	worker.RuntimePreflight = runtime.DefaultRuntimeContractChecker().Check
+	worker.RuntimePreflight = runtime.DefaultRuntimeContractChecker().CheckRequest
 	worker.QuotaWake = newQuotaRoleUnavailableWakeClient()
 	recoverKillPendingAtWorkerStartup.Do(func() {
 		if err := recoverKillPendingJobs(context.Background(), store, stdout); err != nil {
@@ -247,7 +247,8 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if !overridden {
 		agent = scopeRegisteredFreshRefForJob(agent, job.ID)
 	}
-	if result, checked := w.runtimeContractPreflight(ctx, agent); checked {
+	preflightRequest := runtime.RuntimeContractRequest{Plan: payload.Plan}
+	if result, checked := w.runtimeContractPreflight(ctx, agent, preflightRequest); checked {
 		if err := runtime.RuntimeContractDispatchError(agent, result); err != nil {
 			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, err); finishErr != nil {
 				return finishErr
@@ -755,11 +756,11 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	return nil
 }
 
-func (w jobWorker) runtimeContractPreflight(ctx context.Context, agent runtime.Agent) (runtime.RuntimeContractResult, bool) {
+func (w jobWorker) runtimeContractPreflight(ctx context.Context, agent runtime.Agent, request runtime.RuntimeContractRequest) (runtime.RuntimeContractResult, bool) {
 	if w.RuntimePreflight == nil {
 		return runtime.RuntimeContractResult{}, false
 	}
-	return w.RuntimePreflight(ctx, agent), true
+	return w.RuntimePreflight(ctx, agent, request), true
 }
 
 func (w jobWorker) lookupAgent(ctx context.Context, name string) (db.Agent, error) {
