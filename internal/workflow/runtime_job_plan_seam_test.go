@@ -25,6 +25,11 @@ import (
 // package-level func literal assigning job.PlanInto both compiled green while the
 // header claimed no such construction existed.
 //
+// WHAT THE WALK SKIPS, so the claims below are read correctly: _test.go files, and
+// the directories shouldSkipPlanProducerDir names (.git, .gitmoot, node_modules,
+// build, dist, repos, GOALS). The claims are about NON-TEST production source only —
+// the plan tests themselves contain keyed runtime.Job{Plan: true} literals by design.
+//
 // WHAT IT ACTUALLY PROVES, with every exemption named:
 //
 //   - No composite literal setting Plan or PlanInto BY KEY exists outside
@@ -115,7 +120,7 @@ var planAssignExemptions = map[string]string{
 	// deps.Plan is a *tui.TrainRunPlan for the SkillOpt confirm screen — a UI plan
 	// object, unrelated to runtime plan mode. Lives inside a package-level var holding
 	// a func literal, which is why the body-only walk never saw it.
-	"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI": "tui.TrainRunPlan, not runtime plan mode",
+	"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI::deps.Plan": "tui.TrainRunPlan, not runtime plan mode",
 }
 
 func planFieldProducersInFile(rel string, parsed *ast.File) []string {
@@ -170,10 +175,15 @@ func planFieldProducersInFile(rel string, parsed *ast.File) []string {
 				// delivered it straight past the mailbox gate while this test still
 				// passed. A seam guard that recognises only one syntax for writing a
 				// field is not a seam guard.
-				if entry := filepath.ToSlash(rel) + "::" + symbol; assignsPlanField(n) {
-					if _, exempt := planAssignExemptions[entry]; !exempt {
-						got = append(got, entry)
+				// Keyed on the exact RECEIVER.FIELD, never the enclosing symbol: two
+				// reviewers each planted a real `delivery.Plan = true` beside the
+				// innocent `deps.Plan` in the same function and the census stayed green,
+				// so a symbol-wide exemption hid every future genuine write in it.
+				for _, selector := range planAssignSelectors(n) {
+					if _, exempt := planAssignExemptions[filepath.ToSlash(rel)+"::"+symbol+"::"+selector]; exempt {
+						continue
 					}
+					got = append(got, filepath.ToSlash(rel)+"::"+symbol)
 				}
 			case *ast.TypeSpec:
 				// A body-scoped `type JobPayload = runtime.Job` SHADOWS the real type,
@@ -266,6 +276,26 @@ func functionSymbol(function *ast.FuncDecl) string {
 // which reaches the same field and looked like nothing. Recognising one spelling of
 // a write is exactly the defect this helper was added to fix, so it must not
 // reproduce it one level down. Deref, address-of and parens are all peeled.
+// planAssignSelectors renders each plan-field assignment target as receiver.field,
+// so an exemption can name one write instead of silencing a whole function. A target
+// whose receiver is not a plain identifier renders as "?.field", which cannot match
+// an exemption key and is therefore reported.
+func planAssignSelectors(assign *ast.AssignStmt) []string {
+	var selectors []string
+	for _, target := range assign.Lhs {
+		selector, ok := target.(*ast.SelectorExpr)
+		if !ok || !selectorNamesPlanField(selector) {
+			continue
+		}
+		receiver := identName(selector.X)
+		if receiver == "" {
+			receiver = "?"
+		}
+		selectors = append(selectors, receiver+"."+selector.Sel.Name)
+	}
+	return selectors
+}
+
 func assignsPlanField(assign *ast.AssignStmt) bool {
 	for _, lhs := range assign.Lhs {
 		if selectorNamesPlanField(lhs) {
@@ -834,6 +864,29 @@ func TestPlanFieldCensusWiresEveryArm(t *testing.T) {
 			rel:  "internal/cli/x.go",
 			src:  "type JobPayload = *runtime.Job\nfunc f() { _ = 0 }",
 			want: []string{"internal/cli/x.go::type JobPayload"},
+		},
+		{
+			// PACKAGE-SCOPE INITIALIZER arm, pinned. Both round-14 reviewers reverted this
+			// arm to a body-only walk with one line and every test stayed green, which
+			// silently reinstated a BLOCKER-class hole.
+			name: "package-level keyed literal is reported",
+			rel:  "internal/cli/x.go",
+			src:  "var zzV = runtime.Job{Plan: true}",
+			want: []string{"internal/cli/x.go::var zzV"},
+		},
+		{
+			name: "package-level func literal assigning PlanInto is reported",
+			rel:  "internal/cli/x.go",
+			src:  "var zzF = func() { var j runtime.Job; j.PlanInto = \"@smol\"; _ = j }",
+			want: []string{"internal/cli/x.go::var zzF"},
+		},
+		{
+			// The exemption must name ONE write, not a whole function: a genuine
+			// assignment beside an exempt one must still be reported.
+			name: "unexempt selector beside an exempt one is still reported",
+			rel:  "internal/cli/skillopt_trainrun_tui.go",
+			src:  "var runSkillOptTrainRunConfirmTUI = func() { var deps, delivery struct{ Plan bool }; deps.Plan = true; delivery.Plan = true; _, _ = deps, delivery }",
+			want: []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"},
 		},
 		{
 			name: "clean file reports nothing",
