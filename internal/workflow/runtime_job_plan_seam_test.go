@@ -156,15 +156,89 @@ func functionSymbol(function *ast.FuncDecl) string {
 // scan alone left this syntax invisible, so a producer could construct a
 // runtime.Job, set the plan primitives on the next line, and never appear in the
 // seam census the test exists to pin.
+//
+// The LHS is UNWRAPPED before matching. A first version compared the bare node to
+// *ast.SelectorExpr, and a reviewer walked straight past it with
+// `*(&delivery.Plan) = true` — an ast.StarExpr wrapping a unary & of the selector,
+// which reaches the same field and looked like nothing. Recognising one spelling of
+// a write is exactly the defect this helper was added to fix, so it must not
+// reproduce it one level down. Deref, address-of and parens are all peeled.
 func assignsPlanField(assign *ast.AssignStmt) bool {
 	for _, lhs := range assign.Lhs {
-		selector, ok := lhs.(*ast.SelectorExpr)
-		if !ok {
-			continue
-		}
-		if selector.Sel != nil && (selector.Sel.Name == "Plan" || selector.Sel.Name == "PlanInto") {
+		if selectorNamesPlanField(lhs) {
 			return true
 		}
 	}
 	return false
+}
+
+// selectorNamesPlanField peels *, & and ( ) wrappers off an expression and reports
+// whether what remains selects Plan or PlanInto.
+func selectorNamesPlanField(expr ast.Expr) bool {
+	for {
+		switch e := expr.(type) {
+		case *ast.ParenExpr:
+			expr = e.X
+		case *ast.StarExpr:
+			expr = e.X
+		case *ast.UnaryExpr:
+			if e.Op != token.AND {
+				return false
+			}
+			expr = e.X
+		case *ast.SelectorExpr:
+			return e.Sel != nil && (e.Sel.Name == "Plan" || e.Sel.Name == "PlanInto")
+		default:
+			return false
+		}
+	}
+}
+
+// TestAssignsPlanFieldArmsTheCensus makes the assignment detector's RESULT
+// load-bearing. The census test alone did not: mutations making assignsPlanField
+// always return false, or dropping PlanInto recognition, both left it green,
+// because no fixture in the tree exercised the assignment path. A detector nobody
+// tests is a detector that silently stops detecting — which is precisely how the
+// composite-literal-only version survived until a reviewer mutated production code
+// to walk past it.
+//
+// Each case is parsed from source, so the fixtures are the real syntax a producer
+// would write rather than hand-built AST nodes that could drift from the parser.
+func TestAssignsPlanFieldArmsTheCensus(t *testing.T) {
+	cases := []struct {
+		src  string
+		want bool
+	}{
+		{"job.Plan = true", true},
+		{"job.PlanInto = x", true},
+		{"delivery.Plan, delivery.PlanInto = a, b", true},
+		{"p.Plan = true", true},
+		// The forms a reviewer used to bypass the first version.
+		{"*(&delivery.Plan) = true", true},
+		{"*pj.PlanInto = s", true},
+		{"(delivery.Plan) = true", true},
+		{"*(&(delivery.PlanInto)) = s", true},
+		// Must NOT fire: unrelated fields, and a plan-shaped name that is not a field write.
+		{"job.Model = m", false},
+		{"job.Prompt = p", false},
+		{"Plan = true", false},
+		{"m[\"Plan\"] = true", false},
+		{"job.PlanModeSomething = x", false},
+	}
+	for _, tc := range cases {
+		file, err := parser.ParseFile(token.NewFileSet(), "x.go", "package p\nfunc f() {\n"+tc.src+"\n}\n", 0)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.src, err)
+		}
+		var got bool
+		ast.Inspect(file, func(n ast.Node) bool {
+			if assign, ok := n.(*ast.AssignStmt); ok && assignsPlanField(assign) {
+				got = true
+			}
+			return true
+		})
+		if got != tc.want {
+			t.Fatalf("assignsPlanField(%q) = %v, want %v", tc.src, got, tc.want)
+		}
+	}
 }

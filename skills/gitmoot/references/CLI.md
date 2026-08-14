@@ -808,7 +808,6 @@ an omp seat:
   (gitmoot#1479); it is simply not what the adapter does today. Read-only stays
   enforced Gitmoot-side (the same fail-closed implement refusal Kimi uses), not by
   the runtime flag.
-  same fail-closed implement refusal Kimi uses), not by the runtime flag.
 - **omp is in no cross-family group.** An omp implement job's cross-family
   review is *refused loudly* (a `cross_family_review_failed` job event) rather
   than silently skipped, because scoring an opaque router as a family would
