@@ -12,14 +12,27 @@ import (
 	"testing"
 )
 
-// TestRuntimeJobPlanFieldsHaveSingleGatedProducer pins the source-level reason
-// the deliver-time plan gate is complete: Mailbox.deliver is the only production
-// code that may construct a runtime.Job carrying Plan or PlanInto, and the gate is
-// immediately above that literal. A new adapter entry path must deliberately join
-// this gate instead of silently creating a second door.
-// MEASURED LIMITS OF THIS CENSUS, stated because a guard that overclaims is worse
-// than one with a documented edge. Every item below was demonstrated by a reviewer
-// with REAL COMPILED CODE that this census left green, over four review rounds:
+// TestRuntimeJobPlanFieldsHaveSingleGatedProducer is a REGRESSION guard on the
+// deliver-time plan gate. It does NOT prove the gate complete, and it does not prove
+// that Mailbox.deliver is the only code that can construct a runtime.Job carrying
+// Plan or PlanInto. An earlier version of this comment claimed both; a reviewer
+// pointed out it claimed them three lines above the list of constructions the census
+// is known to miss, which is the overclaim this file exists to not commit.
+//
+// WHAT IT ACTUALLY PROVES, with every exemption named:
+//
+//   - No composite literal setting Plan or PlanInto BY KEY exists outside
+//     Mailbox.deliver, EXCEPT literals whose type is on planFieldAllowlist and
+//     resolves to its owning package (five shapes that legitimately carry such a
+//     field, listed there with reasons).
+//   - No assignment to a .Plan or .PlanInto selector exists outside Mailbox.deliver.
+//   - No declaration BORROWING an allowlisted type name exists outside its owner,
+//     EXCEPT a non-alias definition of an unrelated type, and EXCEPT an alias whose
+//     target planCarryingTarget cannot see as plan-carrying. Both exceptions are
+//     deliberate: they were measured as false positives on innocent code.
+//
+// WHAT IT DOES NOT PROVE — each demonstrated by a reviewer with REAL COMPILED CODE
+// that this census left green, over four rounds, and tracked on #1513:
 //
 //   - ALIAS CHAINS. `Alias = runtime.Job` then `JobPayload = Alias` is not followed:
 //     planCarryingTarget classifies a target by its immediate spelling only. Same-file,
@@ -33,11 +46,11 @@ import (
 //
 // THE COMMON CAUSE IS NOT A MISSING SPELLING. Following type identity across aliases,
 // packages and generic instantiations requires a repository declaration index or
-// go/types; this census is syntactic. Four rounds of adding one more spelling each
-// time produced one more bypass each time, which is the evidence for that claim
-// rather than an opinion about it. What this census DOES prove is narrow and real:
-// no KEYED plan-field literal, no post-construction plan-field assignment, and no
-// allowlisted-name alias declaration exists outside the single sanctioned producer.
+// go/types; this census is syntactic. Seven rounds of adding one more spelling each
+// produced one more bypass each, which is evidence for that claim rather than an
+// opinion about it. So a new adapter entry path should deliberately join the gate
+// above Mailbox.deliver's literal — this test raises the cost of a second door, it
+// does not lock it.
 func TestRuntimeJobPlanFieldsHaveSingleGatedProducer(t *testing.T) {
 	t.Parallel()
 	root := filepath.Clean(filepath.Join("..", ".."))
@@ -745,6 +758,31 @@ func TestPlanFieldCensusWiresEveryArm(t *testing.T) {
 			rel:  "internal/workflow/x.go",
 			src:  "func f() { type JobPayload struct{ Plan bool }; _ = 0 }",
 			want: []string{"internal/workflow/x.go::f"},
+		},
+		{
+			// PIN the import-path identity rule: reverting the selector test to a bare
+			// `Sel.Name == "Job"` survived every fixture until this case existed, which
+			// would restore the exact db.Job false positive this delta closed.
+			name: "alias to a FOREIGN Job is not reported",
+			rel:  "internal/cli/x.go",
+			src:  "type JobPayload = db.Job\nfunc f() { _ = 0 }",
+			want: nil,
+		},
+		{
+			// PIN the unnameable-target default: flipping it back to true survived, and
+			// would restore the anonymous-struct false positive.
+			name: "alias to an anonymous struct is not reported",
+			rel:  "internal/cli/x.go",
+			src:  "type JobPayload = struct{ Value string }\nfunc f() { _ = 0 }",
+			want: nil,
+		},
+		{
+			// PIN the StarExpr unwrap: disabling it survived, and a pointer alias to the
+			// real type is a genuine borrowed identity.
+			name: "POINTER alias to the plan type is reported",
+			rel:  "internal/cli/x.go",
+			src:  "type JobPayload = *runtime.Job\nfunc f() { _ = 0 }",
+			want: []string{"internal/cli/x.go::type JobPayload"},
 		},
 		{
 			name: "clean file reports nothing",
