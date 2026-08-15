@@ -426,6 +426,21 @@ func TestClientRemoteBranchesBatchesExactRefs(t *testing.T) {
 	}
 }
 
+func TestClientRemoteRefSHA(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "abc123\trefs/pull/17/head\n"}, {}}}
+	client := Client{Runner: runner, Dir: "/repo"}
+	sha, found, err := client.RemoteRefSHA(context.Background(), "origin", "refs/pull/17/head")
+	if err != nil || !found || sha != "abc123" {
+		t.Fatalf("RemoteRefSHA(present) = %q, %t, %v", sha, found, err)
+	}
+	sha, found, err = client.RemoteRefSHA(context.Background(), "origin", "refs/pull/18/head")
+	if err != nil || found || sha != "" {
+		t.Fatalf("RemoteRefSHA(absent) = %q, %t, %v", sha, found, err)
+	}
+	runner.wantArgs(t, 0, "git", "ls-remote", "origin", "refs/pull/17/head")
+	runner.wantArgs(t, 1, "git", "ls-remote", "origin", "refs/pull/18/head")
+}
+
 func TestClientHeadSHA(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "abc123\n"}}}
 	sha, err := (Client{Runner: runner, Dir: "/repo"}).HeadSHA(context.Background())
@@ -545,6 +560,50 @@ func TestClientIsAncestor(t *testing.T) {
 	if _, err := client.IsAncestor(ctx, "missing-ref", sibling); err == nil {
 		t.Fatal("IsAncestor accepted an invalid ref")
 	}
+}
+
+func TestClientCommitExistsDistinguishesMissingObject(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	ctx := context.Background()
+	dir := t.TempDir()
+	runGit(t, dir, "init", "-b", "main")
+	runGit(t, dir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, dir, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	runGit(t, dir, "add", "README.md")
+	runGit(t, dir, "commit", "-m", "initial")
+	client := Client{Dir: dir}
+	head, err := client.HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("HeadSHA: %v", err)
+	}
+	if present, err := client.CommitExists(ctx, head); err != nil || !present {
+		t.Fatalf("CommitExists(present) = %t, %v", present, err)
+	}
+	if present, err := client.CommitExists(ctx, strings.Repeat("0", 40)); err != nil || present {
+		t.Fatalf("CommitExists(missing) = %t, %v", present, err)
+	}
+}
+
+func TestClientCommitExistsPropagatesRepositoryFailure(t *testing.T) {
+	runner := &fakeRunner{errs: []error{errors.New("object database unavailable")}}
+	present, err := (Client{Runner: runner, Dir: "/repo"}).CommitExists(context.Background(), "deadbeef")
+	if err == nil || present {
+		t.Fatalf("CommitExists(repository failure) = %t, %v", present, err)
+	}
+	runner.wantArgs(t, 0, "git", "rev-parse", "--verify", "--quiet", "deadbeef^{commit}")
+}
+
+func TestClientCheckObjectConnectivityPropagatesFailure(t *testing.T) {
+	runner := &fakeRunner{errs: []error{errors.New("broken object graph")}}
+	if err := (Client{Runner: runner, Dir: "/repo"}).CheckObjectConnectivity(context.Background()); err == nil {
+		t.Fatal("CheckObjectConnectivity accepted a repository failure")
+	}
+	runner.wantArgs(t, 0, "git", "fsck", "--connectivity-only")
 }
 
 func TestClientCreateBranchSmoke(t *testing.T) {

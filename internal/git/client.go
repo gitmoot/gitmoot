@@ -201,6 +201,42 @@ func (c Client) RemoteBranches(ctx context.Context, branches []string) (map[stri
 	return out, nil
 }
 
+// RemoteRefSHA resolves one exact advertised ref without mutating local refs or
+// the object database. The boolean is false when the remote answered
+// successfully but did not advertise the requested ref.
+func (c Client) RemoteRefSHA(ctx context.Context, remote, ref string) (string, bool, error) {
+	remote = strings.TrimSpace(remote)
+	if remote == "" {
+		remote = "origin"
+	}
+	if strings.HasPrefix(remote, "-") || strings.ContainsAny(remote, " \t\r\n") {
+		return "", false, fmt.Errorf("remote %q is invalid", remote)
+	}
+	ref = strings.TrimSpace(ref)
+	if err := validateRef(ref); err != nil {
+		return "", false, err
+	}
+	result, err := c.run(ctx, "ls-remote", remote, ref)
+	if err != nil {
+		return "", false, err
+	}
+	var sha string
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if len(fields) != 2 || fields[1] != ref {
+			return "", false, fmt.Errorf("git ls-remote returned malformed result %q for %s", line, ref)
+		}
+		if sha != "" && !strings.EqualFold(sha, fields[0]) {
+			return "", false, fmt.Errorf("git ls-remote returned conflicting SHAs for %s", ref)
+		}
+		sha = fields[0]
+	}
+	return sha, sha != "", nil
+}
+
 func (c Client) RemoveWorktree(ctx context.Context, path string) error {
 	path, err := validateWorktreePath(path)
 	if err != nil {
@@ -547,6 +583,33 @@ func (c Client) RevParse(ctx context.Context, rev string) (string, error) {
 		return "", errors.New("git revision SHA is empty")
 	}
 	return sha, nil
+}
+
+// CommitExists reports whether rev resolves to a commit in the local object
+// database. A missing object is an ordinary false result; repository failures
+// remain errors so callers do not misdiagnose corruption as an unfetched ref.
+func (c Client) CommitExists(ctx context.Context, rev string) (bool, error) {
+	rev = strings.TrimSpace(rev)
+	if err := validateRef(rev); err != nil {
+		return false, err
+	}
+	_, err := c.run(ctx, "rev-parse", "--verify", "--quiet", rev+"^{commit}")
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
+}
+
+// CheckObjectConnectivity verifies that every object reachable from a local ref
+// is present. It is intentionally read-only and distinguishes a healthy clone
+// missing an unreferenced dispatch commit from a damaged repository graph.
+func (c Client) CheckObjectConnectivity(ctx context.Context) error {
+	_, err := c.run(ctx, "fsck", "--connectivity-only")
+	return err
 }
 
 // IsAncestor reports whether ancestor is reachable from descendant. Git uses

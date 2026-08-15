@@ -393,16 +393,50 @@ func implementationFinalizationTargetFor(ctx context.Context, store *db.Store, j
 		if err != nil {
 			return implementationFinalizationTarget{}, fmt.Errorf("resolve implementation worktree HEAD: %w", err)
 		}
+		dispatchHeadPresent, err := git.CommitExists(ctx, expectedHead)
+		if err != nil {
+			return implementationFinalizationTarget{}, fmt.Errorf("inspect implementation dispatch head %s: %w", expectedHead, err)
+		}
+		if !dispatchHeadPresent {
+			if err := git.CheckObjectConnectivity(ctx); err != nil {
+				return implementationFinalizationTarget{}, fmt.Errorf("verify implementation worktree object connectivity: %w", err)
+			}
+			remoteRef := "refs/heads/" + task.Branch
+			remoteLabel := fmt.Sprintf("branch %s", task.Branch)
+			if payload.PullRequest > 0 {
+				remoteRef = fmt.Sprintf("refs/pull/%d/head", payload.PullRequest)
+				remoteLabel = fmt.Sprintf("pull request #%d", payload.PullRequest)
+			}
+			remoteHead, found, err := git.RemoteRefSHA(ctx, "origin", remoteRef)
+			if err != nil {
+				return implementationFinalizationTarget{}, fmt.Errorf("resolve current %s head from origin: %w", remoteLabel, err)
+			}
+			quotedHead := shellQuote(expectedHead, "posix")
+			if found && strings.EqualFold(remoteHead, expectedHead) {
+				return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
+					"implementation task %s worktree %q is missing dispatch head object %s, but origin %s still advertises it; run `git -C %q fetch origin %s`, verify with `git -C %q cat-file -e %s^{commit}`, then run `git -C %q reset --hard %s` and `gitmoot job retry %s`",
+					task.ID, worktreePath, expectedHead, remoteRef, worktreePath, shellQuote(remoteRef, "posix"),
+					worktreePath, quotedHead, worktreePath, quotedHead, shellQuote(job.ID, "posix"),
+				))
+			}
+			if found {
+				return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
+					"implementation task %s worktree %q is missing frozen dispatch head %s, and origin %s now points to %s; the frozen job cannot be recovered by fetch/reset and must not be retried; dispatch a new fix job against current head %s",
+					task.ID, worktreePath, expectedHead, remoteRef, remoteHead, remoteHead,
+				))
+			}
+			return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
+				"implementation task %s worktree %q is missing frozen dispatch head %s, and origin no longer advertises %s; no fetch/reset remedy exists for this frozen job; refresh %s metadata and dispatch a new fix job against its current head",
+				task.ID, worktreePath, expectedHead, remoteRef, remoteLabel,
+			))
+		}
 		recovery := fmt.Sprintf(
 			"inspect or stash local changes, then run `git -C %q fetch origin %s` and `git -C %q reset --hard %s` before retrying",
 			worktreePath, task.Branch, worktreePath, expectedHead,
 		)
 		currentIncludesDispatchHead, err := git.IsAncestor(ctx, expectedHead, head)
 		if err != nil {
-			return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
-				"implementation task %s worktree %q cannot compare current HEAD %s with dispatch head %s (%v); %s",
-				task.ID, worktreePath, head, expectedHead, err, recovery,
-			))
+			return implementationFinalizationTarget{}, fmt.Errorf("compare implementation worktree HEAD %s with dispatch head %s: %w", head, expectedHead, err)
 		}
 		if !currentIncludesDispatchHead {
 			return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(

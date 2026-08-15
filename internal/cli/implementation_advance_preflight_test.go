@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -67,7 +69,6 @@ func TestAdvanceImplementationPreflightBlocksBeforeModelAndKeepsResultHonest(t *
 		wantCondition string
 	}{
 		{mode: "stale", wantCondition: "stale or divergent"},
-		{mode: "unfetched-stale", wantCondition: "cannot compare"},
 		{mode: "divergent", wantCondition: "stale or divergent"},
 	} {
 		t.Run(test.mode, func(t *testing.T) {
@@ -102,6 +103,66 @@ func TestAdvanceImplementationPreflightBlocksBeforeModelAndKeepsResultHonest(t *
 	}
 }
 
+func TestAdvanceImplementationPreflightFetchesAdvertisedMissingDispatchHead(t *testing.T) {
+	result := runAdvanceImplementationPreflightFixture(t, "unfetched-stale")
+	for _, want := range []string{
+		"task-1514", result.fixWorktree, "missing dispatch head object " + result.expectedHead,
+		"origin refs/pull/1514/head still advertises it",
+		"fetch origin refs/pull/1514/head",
+		"cat-file -e " + result.expectedHead + "^{commit}",
+		"reset --hard " + result.expectedHead,
+		"gitmoot job retry advance-fix-unfetched-stale",
+	} {
+		if !strings.Contains(result.message, want) {
+			t.Fatalf("blocked message missing %q: %s", want, result.message)
+		}
+	}
+	if !result.remedyCleared {
+		t.Fatal("advertised dispatch-head remedy did not clear the preflight refusal")
+	}
+}
+
+func TestAdvanceImplementationPreflightRequiresRedispatchWhenFrozenHeadMoved(t *testing.T) {
+	result := runAdvanceImplementationPreflightFixture(t, "force-pushed-away")
+	for _, want := range []string{
+		"task-1514", result.fixWorktree, "missing frozen dispatch head " + result.expectedHead,
+		"origin refs/pull/1514/head now points to " + result.refreshedHead,
+		"cannot be recovered by fetch/reset", "must not be retried",
+		"dispatch a new fix job against current head " + result.refreshedHead,
+	} {
+		if !strings.Contains(result.message, want) {
+			t.Fatalf("blocked message missing %q: %s", want, result.message)
+		}
+	}
+	if !result.freshMetadataCleared {
+		t.Fatal("re-dispatch against refreshed pull request metadata did not clear the preflight refusal")
+	}
+	if !result.obsoleteRecoveryRejected || !result.exactFetchRejected {
+		t.Fatalf("force-pushed fixture obsolete recovery rejected=%t exact fetch rejected=%t, want both true", result.obsoleteRecoveryRejected, result.exactFetchRejected)
+	}
+}
+
+func TestAdvanceImplementationPreflightReturnsInfrastructureErrorForCorruptObjectGraph(t *testing.T) {
+	result := runAdvanceImplementationPreflightFixture(t, "corrupt-object")
+	if result.runErr == nil {
+		t.Fatal("corrupt object graph returned nil worker error")
+	}
+	for _, want := range []string{"validate implementation target before model run", "verify implementation worktree object connectivity", "git fsck --connectivity-only"} {
+		if !strings.Contains(result.runErr.Error(), want) {
+			t.Fatalf("infrastructure error missing %q: %v", want, result.runErr)
+		}
+	}
+	if result.adapterCalls != 0 {
+		t.Fatalf("adapter calls = %d, want zero for corrupt repository", result.adapterCalls)
+	}
+	if result.jobState == string(workflow.JobBlocked) {
+		t.Fatalf("corrupt repository settled terminally blocked: state=%s", result.jobState)
+	}
+	if result.message != "" {
+		t.Fatalf("corrupt repository emitted operator recovery message %q", result.message)
+	}
+}
+
 func TestAdvanceImplementationPreflightRejectsMissingHeadBeforeModel(t *testing.T) {
 	result := runAdvanceImplementationPreflightFixture(t, "missing-head")
 	for _, want := range []string{
@@ -111,6 +172,9 @@ func TestAdvanceImplementationPreflightRejectsMissingHeadBeforeModel(t *testing.
 		if !strings.Contains(result.message, want) {
 			t.Fatalf("blocked message missing %q: %s", want, result.message)
 		}
+	}
+	if !result.remedyCleared {
+		t.Fatal("fresh dispatch-head metadata did not clear the missing-head refusal")
 	}
 }
 
@@ -155,6 +219,12 @@ type advanceImplementationPreflightResult struct {
 	adapterCalls  int
 	jobState      string
 	remedyCleared bool
+	runErr        error
+	refreshedHead string
+
+	freshMetadataCleared     bool
+	obsoleteRecoveryRejected bool
+	exactFetchRejected       bool
 }
 
 func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advanceImplementationPreflightResult {
@@ -174,6 +244,7 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 	runDaemonWorkerGit(t, filepath.Dir(fixWorktree), "clone", "--branch", branch, remote, fixWorktree)
 	configureTestGit(t, fixWorktree)
 	expectedHead := oldHead
+	refreshedHead := ""
 	wantBlocked := true
 	switch mode {
 	case "stale":
@@ -185,12 +256,31 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 		runDaemonWorkerGit(t, registered, "commit", "--allow-empty", "-m", "advance reviewed branch")
 		runDaemonWorkerGit(t, registered, "push", "origin", branch)
 		expectedHead = strings.TrimSpace(runGitOutput(t, registered, "rev-parse", "HEAD"))
+		runDaemonWorkerGit(t, remote, "update-ref", "refs/pull/1514/head", expectedHead)
+	case "force-pushed-away":
+		runDaemonWorkerGit(t, registered, "commit", "--allow-empty", "-m", "frozen dispatch head")
+		runDaemonWorkerGit(t, registered, "push", "origin", branch)
+		expectedHead = strings.TrimSpace(runGitOutput(t, registered, "rev-parse", "HEAD"))
+		runDaemonWorkerGit(t, registered, "reset", "--hard", oldHead)
+		runDaemonWorkerGit(t, registered, "commit", "--allow-empty", "-m", "replacement pull request head")
+		refreshedHead = strings.TrimSpace(runGitOutput(t, registered, "rev-parse", "HEAD"))
+		runDaemonWorkerGit(t, registered, "push", "--force", "origin", branch)
+		runDaemonWorkerGit(t, remote, "update-ref", "refs/pull/1514/head", refreshedHead)
+		runDaemonWorkerGit(t, remote, "reflog", "expire", "--expire=now", "--all")
+		runDaemonWorkerGit(t, remote, "gc", "--prune=now")
 	case "divergent":
 		runDaemonWorkerGit(t, registered, "commit", "--allow-empty", "-m", "advance reviewed branch")
 		runDaemonWorkerGit(t, registered, "push", "origin", branch)
 		expectedHead = strings.TrimSpace(runGitOutput(t, registered, "rev-parse", "HEAD"))
 		runDaemonWorkerGit(t, fixWorktree, "fetch", "origin", branch)
 		runDaemonWorkerGit(t, fixWorktree, "commit", "--allow-empty", "-m", "divergent local fix")
+	case "corrupt-object":
+		blob := strings.TrimSpace(runGitOutput(t, fixWorktree, "rev-parse", "HEAD:README.md"))
+		objectPath := filepath.Join(fixWorktree, ".git", "objects", blob[:2], blob[2:])
+		if err := os.Remove(objectPath); err != nil {
+			t.Fatalf("remove reachable blob object %s: %v", objectPath, err)
+		}
+		expectedHead = strings.Repeat("f", 40)
 	case "missing-head":
 		runDaemonWorkerGit(t, registered, "commit", "--allow-empty", "-m", "advance branch without head evidence")
 		runDaemonWorkerGit(t, registered, "push", "origin", branch)
@@ -241,14 +331,22 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 	if err != nil {
 		t.Fatalf("GetJob before run: %v", err)
 	}
-	if err := worker.run(ctx, job); err != nil {
-		t.Fatalf("worker.run returned error: %v", err)
+	runErr := worker.run(ctx, job)
+	if runErr != nil && mode != "corrupt-object" {
+		t.Fatalf("worker.run returned error: %v", runErr)
+	}
+	if runErr == nil && mode == "corrupt-object" {
+		t.Fatal("worker.run accepted a corrupt object graph")
 	}
 	after, err := store.GetJob(ctx, job.ID)
 	if err != nil {
 		t.Fatalf("GetJob after run: %v", err)
 	}
-	if wantBlocked {
+	if mode == "corrupt-object" {
+		if adapter.calls != 0 {
+			t.Fatalf("adapter calls = %d, want zero for infrastructure refusal", adapter.calls)
+		}
+	} else if wantBlocked {
 		if adapter.calls != 0 {
 			t.Fatalf("adapter calls = %d, want zero: checkout preflight must run before the model", adapter.calls)
 		}
@@ -279,7 +377,10 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 		}
 	}
 	remedyCleared := false
-	if mode == "stale" || mode == "unfetched-stale" || mode == "divergent" {
+	freshMetadataCleared := false
+	obsoleteRecoveryRejected := false
+	exactFetchRejected := false
+	if mode == "stale" || mode == "divergent" {
 		runDaemonWorkerGit(t, fixWorktree, "fetch", "origin", branch)
 		runDaemonWorkerGit(t, fixWorktree, "reset", "--hard", expectedHead)
 		payload, err := daemonJobPayload(after)
@@ -290,10 +391,59 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 			t.Fatalf("documented reset remedy did not clear preflight: %v", err)
 		}
 		remedyCleared = true
+	} else if mode == "unfetched-stale" {
+		runDaemonWorkerGit(t, fixWorktree, "fetch", "origin", "refs/pull/1514/head")
+		runDaemonWorkerGit(t, fixWorktree, "cat-file", "-e", expectedHead+"^{commit}")
+		runDaemonWorkerGit(t, fixWorktree, "reset", "--hard", expectedHead)
+		payload, err := daemonJobPayload(after)
+		if err != nil {
+			t.Fatalf("daemonJobPayload after advertised-head remedy: %v", err)
+		}
+		if _, err := implementationFinalizationTargetFor(ctx, store, after, payload, implementationFinalizationBeforeRun); err != nil {
+			t.Fatalf("advertised dispatch-head remedy did not clear preflight: %v", err)
+		}
+		remedyCleared = true
+	} else if mode == "force-pushed-away" {
+		runDaemonWorkerGit(t, fixWorktree, "fetch", "origin", branch)
+		obsoleteReset := exec.Command("git", "reset", "--hard", expectedHead)
+		obsoleteReset.Dir = fixWorktree
+		if output, err := obsoleteReset.CombinedOutput(); err == nil {
+			t.Fatalf("obsolete branch fetch/reset unexpectedly recovered force-pushed-away head; output=%s", output)
+		}
+		obsoleteRecoveryRejected = true
+		exactFetch := exec.Command("git", "fetch", "origin", expectedHead)
+		exactFetch.Dir = fixWorktree
+		if output, err := exactFetch.CombinedOutput(); err == nil {
+			t.Fatalf("force-pushed-away dispatch object unexpectedly remained fetchable; output=%s", output)
+		}
+		exactFetchRejected = true
+		runDaemonWorkerGit(t, fixWorktree, "fetch", "origin", "refs/pull/1514/head")
+		runDaemonWorkerGit(t, fixWorktree, "reset", "--hard", "FETCH_HEAD")
+		payload, err := daemonJobPayload(after)
+		if err != nil {
+			t.Fatalf("daemonJobPayload after metadata refresh: %v", err)
+		}
+		payload.HeadSHA = refreshedHead
+		if _, err := implementationFinalizationTargetFor(ctx, store, after, payload, implementationFinalizationBeforeRun); err != nil {
+			t.Fatalf("re-dispatch against refreshed pull request metadata did not clear preflight: %v", err)
+		}
+		freshMetadataCleared = true
+	} else if mode == "missing-head" {
+		payload, err := daemonJobPayload(after)
+		if err != nil {
+			t.Fatalf("daemonJobPayload after missing-head refusal: %v", err)
+		}
+		payload.HeadSHA = currentHead
+		if _, err := implementationFinalizationTargetFor(ctx, store, after, payload, implementationFinalizationBeforeRun); err != nil {
+			t.Fatalf("fresh dispatch head did not clear missing-head preflight: %v", err)
+		}
+		remedyCleared = true
 	}
 	return advanceImplementationPreflightResult{
 		message: message, currentHead: currentHead, expectedHead: expectedHead, fixWorktree: fixWorktree,
 		adapterCalls: adapter.calls, jobState: after.State, remedyCleared: remedyCleared,
+		runErr: runErr, refreshedHead: refreshedHead, freshMetadataCleared: freshMetadataCleared,
+		obsoleteRecoveryRejected: obsoleteRecoveryRejected, exactFetchRejected: exactFetchRejected,
 	}
 }
 
@@ -416,6 +566,9 @@ func TestImplementationFinalizationTargetAcceptsCompleteTarget(t *testing.T) {
 	}
 	if target.Task.ID != "task-ok" || target.WorktreePath != worktree {
 		t.Fatalf("target = %+v, want task-ok and fix worktree", target)
+	}
+	if got := strings.TrimSpace(runGitOutput(t, worktree, "rev-parse", "HEAD")); got != head {
+		t.Fatalf("complete-target fixture HEAD = %s, want exact dispatch head %s", got, head)
 	}
 }
 
