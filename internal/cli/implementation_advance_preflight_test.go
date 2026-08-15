@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"path/filepath"
@@ -60,14 +61,48 @@ func TestImplementationFinalizationTargetRejectsEveryMissingField(t *testing.T) 
 }
 
 func TestAdvanceImplementationPreflightBlocksBeforeModelAndKeepsResultHonest(t *testing.T) {
-	result := runAdvanceImplementationPreflightFixture(t, "stale")
+	for _, mode := range []string{"stale", "divergent"} {
+		t.Run(mode, func(t *testing.T) {
+			result := runAdvanceImplementationPreflightFixture(t, mode)
+			for _, want := range []string{
+				"task-1514", "stale or divergent", result.currentHead, result.expectedHead, result.fixWorktree,
+				"fetch origin feature/semantic-census",
+				"reset --hard " + result.expectedHead,
+			} {
+				if !strings.Contains(result.message, want) {
+					t.Fatalf("blocked message missing %q: %s", want, result.message)
+				}
+			}
+			if !result.remedyCleared {
+				t.Fatal("documented reset remedy did not clear the preflight refusal")
+			}
+		})
+	}
+}
+
+func TestAdvanceImplementationPreflightRejectsMissingHeadBeforeModel(t *testing.T) {
+	result := runAdvanceImplementationPreflightFixture(t, "missing-head")
 	for _, want := range []string{
-		"task-1514", "stale", result.oldHead, result.expectedHead, result.fixWorktree,
-		"fetch origin refs/pull/1514/head", "reset --hard FETCH_HEAD",
+		"task-1514", result.fixWorktree, "no dispatch head SHA", "pull request #1514",
+		"--task task-1514", "--pr 1514", "--branch feature/semantic-census", "--head-sha <sha>",
 	} {
 		if !strings.Contains(result.message, want) {
 			t.Fatalf("blocked message missing %q: %s", want, result.message)
 		}
+	}
+}
+
+func TestAdvanceImplementationPreflightAllowsCheckoutAheadOfDispatchHead(t *testing.T) {
+	result := runAdvanceImplementationPreflightFixture(t, "ahead")
+	if result.currentHead == result.expectedHead {
+		t.Fatalf("ahead fixture current head = dispatch head %s", result.currentHead)
+	}
+	runDaemonWorkerGit(t, result.fixWorktree, "merge-base", "--is-ancestor", result.expectedHead, result.currentHead)
+	if result.adapterCalls != 1 {
+		t.Fatalf("adapter calls = %d, want one for checkout ahead of frozen dispatch head", result.adapterCalls)
+	}
+	if result.jobState != string(workflow.JobFailed) {
+		t.Fatalf("job state = %q, want failed result from invoked adapter", result.jobState)
 	}
 }
 
@@ -91,10 +126,13 @@ func TestAdvanceImplementationPreflightRejectsDetachedAndWrongBranchBeforeModel(
 }
 
 type advanceImplementationPreflightResult struct {
-	message      string
-	oldHead      string
-	expectedHead string
-	fixWorktree  string
+	message       string
+	currentHead   string
+	expectedHead  string
+	fixWorktree   string
+	adapterCalls  int
+	jobState      string
+	remedyCleared bool
 }
 
 func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advanceImplementationPreflightResult {
@@ -113,11 +151,26 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 	fixWorktree := filepath.Join(t.TempDir(), "fix-worktree")
 	runDaemonWorkerGit(t, filepath.Dir(fixWorktree), "clone", "--branch", branch, remote, fixWorktree)
 	expectedHead := oldHead
+	wantBlocked := true
 	switch mode {
 	case "stale":
 		runDaemonWorkerGit(t, registered, "commit", "--allow-empty", "-m", "advance reviewed branch")
 		runDaemonWorkerGit(t, registered, "push", "origin", branch)
 		expectedHead = strings.TrimSpace(runGitOutput(t, registered, "rev-parse", "HEAD"))
+		runDaemonWorkerGit(t, fixWorktree, "fetch", "origin", branch)
+	case "divergent":
+		runDaemonWorkerGit(t, registered, "commit", "--allow-empty", "-m", "advance reviewed branch")
+		runDaemonWorkerGit(t, registered, "push", "origin", branch)
+		expectedHead = strings.TrimSpace(runGitOutput(t, registered, "rev-parse", "HEAD"))
+		runDaemonWorkerGit(t, fixWorktree, "fetch", "origin", branch)
+		runDaemonWorkerGit(t, fixWorktree, "commit", "--allow-empty", "-m", "divergent local fix")
+	case "missing-head":
+		runDaemonWorkerGit(t, registered, "commit", "--allow-empty", "-m", "advance branch without head evidence")
+		runDaemonWorkerGit(t, registered, "push", "origin", branch)
+		expectedHead = ""
+	case "ahead":
+		runDaemonWorkerGit(t, fixWorktree, "commit", "--allow-empty", "-m", "newer local fix")
+		wantBlocked = false
 	case "detached":
 		runDaemonWorkerGit(t, fixWorktree, "checkout", "--detach", oldHead)
 	case "wrong-branch":
@@ -125,6 +178,7 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 	default:
 		t.Fatalf("unknown fixture mode %q", mode)
 	}
+	currentHead := strings.TrimSpace(runGitOutput(t, fixWorktree, "rev-parse", "HEAD"))
 	seedDaemonWorkerRepo(t, store, "owner/repo", registered)
 	seedDaemonWorkerAgent(t, store, "lead", runtime.ShellRuntime, "unused", []string{"implement"}, "owner/repo")
 	if err := store.UpsertTask(ctx, db.Task{
@@ -136,13 +190,18 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: branch, Owner: "lead"}); err != nil || !acquired {
 		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
 	}
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
-		ID: "advance-fix-" + mode, Agent: "lead", Action: "implement", Repo: "owner/repo",
-		Branch: branch, PullRequest: 1514, HeadSHA: expectedHead, TaskID: "task-1514",
-		WorktreePath: fixWorktree, FixWorktree: true,
-	})
+	jobID := "advance-fix-" + mode
+	if mode == "missing-head" {
+		enqueueAdvanceCreatedHeadlessFixJob(t, store, jobID, branch, fixWorktree)
+	} else {
+		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+			ID: jobID, Agent: "lead", Action: "implement", Repo: "owner/repo",
+			Branch: branch, PullRequest: 1514, HeadSHA: expectedHead, TaskID: "task-1514",
+			WorktreePath: fixWorktree, FixWorktree: true,
+		})
+	}
 	beforeRemote := strings.TrimSpace(runGitOutput(t, registered, "ls-remote", "origin", "refs/heads/"+branch))
-	adapter := &cliWorkerFakeAdapter{output: resultJSON("implemented")}
+	adapter := &cliWorkerFakeAdapter{output: resultJSON("failed")}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return fixWorktree, nil
@@ -151,29 +210,33 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 		return adapter, nil
 	}
 	worker.WorkflowFactory = func(string) workflow.Engine { return workflow.Engine{Store: store} }
-	job, err := store.GetJob(ctx, "advance-fix-"+mode)
+	job, err := store.GetJob(ctx, jobID)
 	if err != nil {
 		t.Fatalf("GetJob before run: %v", err)
 	}
 	if err := worker.run(ctx, job); err != nil {
 		t.Fatalf("worker.run returned error: %v", err)
 	}
-	if adapter.calls != 0 {
-		t.Fatalf("adapter calls = %d, want zero: checkout preflight must run before the model", adapter.calls)
-	}
 	after, err := store.GetJob(ctx, job.ID)
 	if err != nil {
 		t.Fatalf("GetJob after run: %v", err)
 	}
-	if after.State != string(workflow.JobBlocked) {
-		t.Fatalf("job state = %q, want blocked", after.State)
-	}
-	payload, err := daemonJobPayload(after)
-	if err != nil {
-		t.Fatalf("daemonJobPayload returned error: %v", err)
-	}
-	if payload.Result != nil {
-		t.Fatalf("preflight-blocked payload result = %+v, want nil", payload.Result)
+	if wantBlocked {
+		if adapter.calls != 0 {
+			t.Fatalf("adapter calls = %d, want zero: checkout preflight must run before the model", adapter.calls)
+		}
+		if after.State != string(workflow.JobBlocked) {
+			t.Fatalf("job state = %q, want blocked", after.State)
+		}
+		payload, err := daemonJobPayload(after)
+		if err != nil {
+			t.Fatalf("daemonJobPayload returned error: %v", err)
+		}
+		if payload.Result != nil {
+			t.Fatalf("preflight-blocked payload result = %+v, want nil", payload.Result)
+		}
+	} else if adapter.calls != 1 {
+		t.Fatalf("adapter calls = %d, want one: checkout includes the dispatch head", adapter.calls)
 	}
 	if got := strings.TrimSpace(runGitOutput(t, registered, "ls-remote", "origin", "refs/heads/"+branch)); got != beforeRemote {
 		t.Fatalf("remote head changed from %q to %q despite preflight refusal", beforeRemote, got)
@@ -188,7 +251,76 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 			message = event.Message
 		}
 	}
-	return advanceImplementationPreflightResult{message: message, oldHead: oldHead, expectedHead: expectedHead, fixWorktree: fixWorktree}
+	remedyCleared := false
+	if mode == "stale" || mode == "divergent" {
+		runDaemonWorkerGit(t, fixWorktree, "fetch", "origin", branch)
+		runDaemonWorkerGit(t, fixWorktree, "reset", "--hard", expectedHead)
+		payload, err := daemonJobPayload(after)
+		if err != nil {
+			t.Fatalf("daemonJobPayload after remedy: %v", err)
+		}
+		if _, err := implementationFinalizationTargetFor(ctx, store, after, payload, implementationFinalizationBeforeRun); err != nil {
+			t.Fatalf("documented reset remedy did not clear preflight: %v", err)
+		}
+		remedyCleared = true
+	}
+	return advanceImplementationPreflightResult{
+		message: message, currentHead: currentHead, expectedHead: expectedHead, fixWorktree: fixWorktree,
+		adapterCalls: adapter.calls, jobState: after.State, remedyCleared: remedyCleared,
+	}
+}
+
+func enqueueAdvanceCreatedHeadlessFixJob(t *testing.T, store *db.Store, jobID, branch, fixWorktree string) {
+	t.Helper()
+	ctx := context.Background()
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"review"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "headless-review", Agent: "audit", Action: "review", Repo: "owner/repo",
+		Branch: branch, PullRequest: 1514, TaskID: "task-1514", LeadAgent: "lead",
+	})
+	review, err := store.GetJob(ctx, "headless-review")
+	if err != nil {
+		t.Fatalf("GetJob(headless-review): %v", err)
+	}
+	payload, err := daemonJobPayload(review)
+	if err != nil {
+		t.Fatalf("daemonJobPayload(headless-review): %v", err)
+	}
+	payload.Result = &workflow.AgentResult{Decision: "changes_requested", Summary: "fix the headless review"}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal headless review payload: %v", err)
+	}
+	if err := store.UpdateJobPayload(ctx, review.ID, string(encoded)); err != nil {
+		t.Fatalf("UpdateJobPayload(headless-review): %v", err)
+	}
+	if err := store.UpdateJobState(ctx, review.ID, string(workflow.JobSucceeded)); err != nil {
+		t.Fatalf("UpdateJobState(headless-review): %v", err)
+	}
+	engine := workflow.Engine{
+		Store: store,
+		JobID: func(workflow.JobRequest) string { return jobID },
+		RequireWorkflowPolicy: func(string) workflow.RequireWorkflowPolicy {
+			return workflow.RequireWorkflowPolicy{Enabled: true, Mode: "strict"}
+		},
+		FixWorktreeAllocator: func(context.Context, workflow.FixWorktreeRequest) (workflow.FixWorktreeAllocation, error) {
+			return workflow.FixWorktreeAllocation{Path: fixWorktree}, nil
+		},
+	}
+	if err := engine.AdvanceJob(ctx, review.ID); err != nil {
+		t.Fatalf("AdvanceJob(headless-review): %v", err)
+	}
+	fix, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob(%s): %v", jobID, err)
+	}
+	fixPayload, err := daemonJobPayload(fix)
+	if err != nil {
+		t.Fatalf("daemonJobPayload(%s): %v", jobID, err)
+	}
+	if !fixPayload.FixWorktree || fixPayload.WorktreePath != fixWorktree || strings.TrimSpace(fixPayload.HeadSHA) != "" {
+		t.Fatalf("advance-created fix payload = %+v, want headless dedicated fix worktree", fixPayload)
+	}
 }
 
 func TestOrdinaryImplementationSkipsAdvanceFinalizationPreflight(t *testing.T) {
@@ -248,13 +380,57 @@ func TestImplementationFinalizationTargetAcceptsCompleteTarget(t *testing.T) {
 	if err := store.UpsertTask(ctx, db.Task{ID: "task-ok", RepoFullName: "owner/repo", Branch: "feature/ok", WorktreePath: worktree}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
+	head := strings.TrimSpace(runGitOutput(t, worktree, "rev-parse", "HEAD"))
 	target, err := implementationFinalizationTargetFor(ctx, store, db.Job{ID: "advance-ok", Agent: "lead", Type: "implement"}, workflow.JobPayload{
-		Repo: "owner/repo", Branch: "feature/ok", TaskID: "task-ok", FixWorktree: true, WorktreePath: worktree,
+		Repo: "owner/repo", Branch: "feature/ok", HeadSHA: head, TaskID: "task-ok", FixWorktree: true, WorktreePath: worktree,
 	}, implementationFinalizationBeforeRun)
 	if err != nil {
 		t.Fatalf("implementationFinalizationTargetFor returned error: %v", err)
 	}
 	if target.Task.ID != "task-ok" || target.WorktreePath != worktree {
 		t.Fatalf("target = %+v, want task-ok and fix worktree", target)
+	}
+}
+
+func TestImplementationFinalizationTargetClassifiesBranchLookupByPhase(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	worktree := t.TempDir()
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-branch-error", RepoFullName: "owner/repo", Branch: "feature/fix", WorktreePath: worktree}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	payload := workflow.JobPayload{Repo: "owner/repo", TaskID: "task-branch-error", FixWorktree: true, WorktreePath: worktree}
+	job := db.Job{ID: "advance-branch-error", Agent: "lead", Type: "implement"}
+
+	for _, test := range []struct {
+		name        string
+		phase       implementationFinalizationPhase
+		wantBlocked bool
+	}{
+		{name: "before run blocks", phase: implementationFinalizationBeforeRun, wantBlocked: true},
+		{name: "after run retries", phase: implementationFinalizationAfterRun, wantBlocked: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := implementationFinalizationTargetFor(ctx, store, job, payload, test.phase)
+			if err == nil {
+				t.Fatal("implementationFinalizationTargetFor returned nil error")
+			}
+			var blocked workflow.BlockedError
+			if got := errors.As(err, &blocked); got != test.wantBlocked {
+				t.Fatalf("BlockedError = %t, want %t: %v", got, test.wantBlocked, err)
+			}
+			if !test.wantBlocked && !strings.Contains(err.Error(), "resolve implementation branch") {
+				t.Fatalf("after-run error = %q, want retryable branch-resolution context", err)
+			}
+		})
+	}
+}
+
+func TestImplementationFinalizationTargetRejectsUnsetPhase(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	_, err := implementationFinalizationTargetFor(ctx, store, db.Job{ID: "advance-unset"}, workflow.JobPayload{}, implementationFinalizationPhaseUnset)
+	if err == nil || !strings.Contains(err.Error(), "finalization phase 0 is invalid") {
+		t.Fatalf("implementationFinalizationTargetFor error = %v, want invalid zero phase", err)
 	}
 }
