@@ -150,6 +150,7 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 	oldHead := strings.TrimSpace(runGitOutput(t, registered, "rev-parse", "HEAD"))
 	fixWorktree := filepath.Join(t.TempDir(), "fix-worktree")
 	runDaemonWorkerGit(t, filepath.Dir(fixWorktree), "clone", "--branch", branch, remote, fixWorktree)
+	configureTestGit(t, fixWorktree)
 	expectedHead := oldHead
 	wantBlocked := true
 	switch mode {
