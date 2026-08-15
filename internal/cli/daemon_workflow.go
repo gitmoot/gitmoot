@@ -308,10 +308,17 @@ type implementationFinalizationTarget struct {
 	WorktreePath string
 }
 
+type implementationFinalizationPhase uint8
+
+const (
+	implementationFinalizationAfterRun implementationFinalizationPhase = iota
+	implementationFinalizationBeforeRun
+)
+
 // implementationFinalizationTargetFor resolves the durable task fields required
 // to deliver an implementation. The advance preflight and the finalizer both
 // call this predicate so an early refusal cannot drift from the late backstop.
-func implementationFinalizationTargetFor(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload) (implementationFinalizationTarget, error) {
+func implementationFinalizationTargetFor(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload, phase implementationFinalizationPhase) (implementationFinalizationTarget, error) {
 	if store == nil {
 		return implementationFinalizationTarget{}, errors.New("implementation finalizer store is required")
 	}
@@ -351,24 +358,43 @@ func implementationFinalizationTargetFor(ctx context.Context, store *db.Store, j
 			task.ID, task.ID, payload.Repo, job.Agent, branch,
 		))
 	}
+	git := gitutil.Client{Dir: worktreePath}
+	branch, err := git.CurrentBranch(ctx)
+	if err != nil {
+		return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
+			"implementation task %s worktree %q has no usable current branch (%v); expected branch %s; refusing to run or deliver from an unverifiable checkout",
+			task.ID, worktreePath, err, task.Branch,
+		))
+	}
+	if branch != task.Branch {
+		return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
+			"implementation task %s worktree %q is on branch %s, not %s; refusing to run or deliver from the wrong checkout",
+			task.ID, worktreePath, branch, task.Branch,
+		))
+	}
+	if phase == implementationFinalizationBeforeRun && strings.TrimSpace(payload.HeadSHA) != "" {
+		head, err := git.HeadSHA(ctx)
+		if err != nil {
+			return implementationFinalizationTarget{}, fmt.Errorf("resolve implementation worktree HEAD: %w", err)
+		}
+		if !strings.EqualFold(strings.TrimSpace(head), strings.TrimSpace(payload.HeadSHA)) {
+			return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
+				"implementation task %s worktree %q is stale at %s, expected dispatch head %s; inspect or stash local changes, then run `git -C %q fetch origin refs/pull/%d/head` and `git -C %q reset --hard FETCH_HEAD` before retrying",
+				task.ID, worktreePath, head, payload.HeadSHA, worktreePath, payload.PullRequest, worktreePath,
+			))
+		}
+	}
 	return implementationFinalizationTarget{Task: task, WorktreePath: worktreePath}, nil
 }
 
 func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
-	target, err := implementationFinalizationTargetFor(ctx, f.Store, job, payload)
+	target, err := implementationFinalizationTargetFor(ctx, f.Store, job, payload, implementationFinalizationAfterRun)
 	if err != nil {
 		return payload, err
 	}
 	task := target.Task
 	worktreePath := target.WorktreePath
 	git := gitutil.Client{Dir: worktreePath}
-	branch, err := git.CurrentBranch(ctx)
-	if err != nil {
-		return payload, fmt.Errorf("resolve implementation branch: %w", err)
-	}
-	if branch != task.Branch {
-		return payload, blockedResultDelivery(fmt.Sprintf("implemented task worktree is on branch %s, not %s", branch, task.Branch))
-	}
 	validatedPR, hasValidatedPR, err := f.revalidateImplementationPullRequest(ctx, payload, task, worktreePath)
 	if err != nil {
 		return payload, err

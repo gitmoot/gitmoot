@@ -47,7 +47,7 @@ func TestImplementationFinalizationTargetRejectsEveryMissingField(t *testing.T) 
 					t.Fatalf("UpsertTask returned error: %v", err)
 				}
 			}
-			_, err := implementationFinalizationTargetFor(ctx, store, db.Job{ID: "advance-fix", Agent: "lead", Type: "implement"}, test.payload)
+			_, err := implementationFinalizationTargetFor(ctx, store, db.Job{ID: "advance-fix", Agent: "lead", Type: "implement"}, test.payload, implementationFinalizationBeforeRun)
 			var blocked workflow.BlockedError
 			if !errors.As(err, &blocked) || !blocked.ResultDeliveryFailed {
 				t.Fatalf("error = %v, want result-delivery BlockedError", err)
@@ -60,35 +60,88 @@ func TestImplementationFinalizationTargetRejectsEveryMissingField(t *testing.T) 
 }
 
 func TestAdvanceImplementationPreflightBlocksBeforeModelAndKeepsResultHonest(t *testing.T) {
+	result := runAdvanceImplementationPreflightFixture(t, "stale")
+	for _, want := range []string{
+		"task-1514", "stale", result.oldHead, result.expectedHead, result.fixWorktree,
+		"fetch origin refs/pull/1514/head", "reset --hard FETCH_HEAD",
+	} {
+		if !strings.Contains(result.message, want) {
+			t.Fatalf("blocked message missing %q: %s", want, result.message)
+		}
+	}
+}
+
+func TestAdvanceImplementationPreflightRejectsDetachedAndWrongBranchBeforeModel(t *testing.T) {
+	for _, mode := range []string{"detached", "wrong-branch"} {
+		t.Run(mode, func(t *testing.T) {
+			result := runAdvanceImplementationPreflightFixture(t, mode)
+			for _, want := range []string{"task-1514", result.fixWorktree, "feature/semantic-census"} {
+				if !strings.Contains(result.message, want) {
+					t.Fatalf("blocked message missing %q: %s", want, result.message)
+				}
+			}
+			if mode == "detached" && !strings.Contains(result.message, "current git branch is empty") {
+				t.Fatalf("detached message = %q", result.message)
+			}
+			if mode == "wrong-branch" && !strings.Contains(result.message, "wrong-branch") {
+				t.Fatalf("wrong-branch message = %q", result.message)
+			}
+		})
+	}
+}
+
+type advanceImplementationPreflightResult struct {
+	message      string
+	oldHead      string
+	expectedHead string
+	fixWorktree  string
+}
+
+func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advanceImplementationPreflightResult {
+	t.Helper()
 	ctx := context.Background()
+	const branch = "feature/semantic-census"
 	store := daemonWorkerStore(t)
 	registered := createDaemonWorkerGitCheckout(t, "main")
 	remote := filepath.Join(t.TempDir(), "remote.git")
 	runDaemonWorkerGit(t, filepath.Dir(remote), "init", "--bare", remote)
 	runDaemonWorkerGit(t, registered, "remote", "set-url", "origin", remote)
 	runDaemonWorkerGit(t, registered, "push", "-u", "origin", "main")
-	staleTaskWorktree := filepath.Join(t.TempDir(), "stale-task")
-	runDaemonWorkerGit(t, registered, "worktree", "add", "--detach", staleTaskWorktree, "HEAD")
-	runDaemonWorkerGit(t, registered, "commit", "--allow-empty", "-m", "advance remote past stale task worktree")
-	runDaemonWorkerGit(t, registered, "push", "origin", "main")
-	fixWorktree := t.TempDir()
+	runDaemonWorkerGit(t, registered, "switch", "-c", branch)
+	runDaemonWorkerGit(t, registered, "push", "-u", "origin", branch)
+	oldHead := strings.TrimSpace(runGitOutput(t, registered, "rev-parse", "HEAD"))
+	fixWorktree := filepath.Join(t.TempDir(), "fix-worktree")
+	runDaemonWorkerGit(t, filepath.Dir(fixWorktree), "clone", "--branch", branch, remote, fixWorktree)
+	expectedHead := oldHead
+	switch mode {
+	case "stale":
+		runDaemonWorkerGit(t, registered, "commit", "--allow-empty", "-m", "advance reviewed branch")
+		runDaemonWorkerGit(t, registered, "push", "origin", branch)
+		expectedHead = strings.TrimSpace(runGitOutput(t, registered, "rev-parse", "HEAD"))
+	case "detached":
+		runDaemonWorkerGit(t, fixWorktree, "checkout", "--detach", oldHead)
+	case "wrong-branch":
+		runDaemonWorkerGit(t, fixWorktree, "switch", "-c", "wrong-branch")
+	default:
+		t.Fatalf("unknown fixture mode %q", mode)
+	}
 	seedDaemonWorkerRepo(t, store, "owner/repo", registered)
 	seedDaemonWorkerAgent(t, store, "lead", runtime.ShellRuntime, "unused", []string{"implement"}, "owner/repo")
 	if err := store.UpsertTask(ctx, db.Task{
 		ID: "task-1514", RepoFullName: "owner/repo", State: string(workflow.TaskChangesRequested),
-		WorktreePath: staleTaskWorktree,
+		Branch: branch, WorktreePath: registered,
 	}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: "feature/semantic-census", Owner: "lead"}); err != nil || !acquired {
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: branch, Owner: "lead"}); err != nil || !acquired {
 		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
 	}
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
-		ID: "advance-fix", Agent: "lead", Action: "implement", Repo: "owner/repo",
-		Branch: "feature/semantic-census", PullRequest: 1514, TaskID: "task-1514",
+		ID: "advance-fix-" + mode, Agent: "lead", Action: "implement", Repo: "owner/repo",
+		Branch: branch, PullRequest: 1514, HeadSHA: expectedHead, TaskID: "task-1514",
 		WorktreePath: fixWorktree, FixWorktree: true,
 	})
-	beforeRemote := strings.TrimSpace(runGitOutput(t, registered, "ls-remote", "origin", "refs/heads/main"))
+	beforeRemote := strings.TrimSpace(runGitOutput(t, registered, "ls-remote", "origin", "refs/heads/"+branch))
 	adapter := &cliWorkerFakeAdapter{output: resultJSON("implemented")}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
@@ -98,8 +151,7 @@ func TestAdvanceImplementationPreflightBlocksBeforeModelAndKeepsResultHonest(t *
 		return adapter, nil
 	}
 	worker.WorkflowFactory = func(string) workflow.Engine { return workflow.Engine{Store: store} }
-
-	job, err := store.GetJob(ctx, "advance-fix")
+	job, err := store.GetJob(ctx, "advance-fix-"+mode)
 	if err != nil {
 		t.Fatalf("GetJob before run: %v", err)
 	}
@@ -107,7 +159,7 @@ func TestAdvanceImplementationPreflightBlocksBeforeModelAndKeepsResultHonest(t *
 		t.Fatalf("worker.run returned error: %v", err)
 	}
 	if adapter.calls != 0 {
-		t.Fatalf("adapter calls = %d, want zero: preflight must run before the model", adapter.calls)
+		t.Fatalf("adapter calls = %d, want zero: checkout preflight must run before the model", adapter.calls)
 	}
 	after, err := store.GetJob(ctx, job.ID)
 	if err != nil {
@@ -121,9 +173,9 @@ func TestAdvanceImplementationPreflightBlocksBeforeModelAndKeepsResultHonest(t *
 		t.Fatalf("daemonJobPayload returned error: %v", err)
 	}
 	if payload.Result != nil {
-		t.Fatalf("preflight-blocked payload result = %+v, want nil (nothing ran or delivered)", payload.Result)
+		t.Fatalf("preflight-blocked payload result = %+v, want nil", payload.Result)
 	}
-	if got := strings.TrimSpace(runGitOutput(t, registered, "ls-remote", "origin", "refs/heads/main")); got != beforeRemote {
+	if got := strings.TrimSpace(runGitOutput(t, registered, "ls-remote", "origin", "refs/heads/"+branch)); got != beforeRemote {
 		t.Fatalf("remote head changed from %q to %q despite preflight refusal", beforeRemote, got)
 	}
 	events, err := store.ListJobEvents(ctx, job.ID)
@@ -136,15 +188,7 @@ func TestAdvanceImplementationPreflightBlocksBeforeModelAndKeepsResultHonest(t *
 			message = event.Message
 		}
 	}
-	for _, want := range []string{
-		"task-1514", "no branch", staleTaskWorktree,
-		"fetch origin refs/pull/1514/head", "reset --hard FETCH_HEAD",
-		"--task task-1514", "--branch feature/semantic-census",
-	} {
-		if !strings.Contains(message, want) {
-			t.Fatalf("blocked message missing %q: %s", want, message)
-		}
-	}
+	return advanceImplementationPreflightResult{message: message, oldHead: oldHead, expectedHead: expectedHead, fixWorktree: fixWorktree}
 }
 
 func TestOrdinaryImplementationSkipsAdvanceFinalizationPreflight(t *testing.T) {
@@ -200,16 +244,17 @@ func TestDaemonImplementationFinalizerKeepsMissingBranchBackstop(t *testing.T) {
 func TestImplementationFinalizationTargetAcceptsCompleteTarget(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
-	if err := store.UpsertTask(ctx, db.Task{ID: "task-ok", RepoFullName: "owner/repo", Branch: "feature/ok", WorktreePath: "/task/worktree"}); err != nil {
+	worktree := createDaemonWorkerGitCheckout(t, "feature/ok")
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-ok", RepoFullName: "owner/repo", Branch: "feature/ok", WorktreePath: worktree}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
 	target, err := implementationFinalizationTargetFor(ctx, store, db.Job{ID: "advance-ok", Agent: "lead", Type: "implement"}, workflow.JobPayload{
-		Repo: "owner/repo", Branch: "feature/ok", TaskID: "task-ok", FixWorktree: true, WorktreePath: "/fix/worktree",
-	})
+		Repo: "owner/repo", Branch: "feature/ok", TaskID: "task-ok", FixWorktree: true, WorktreePath: worktree,
+	}, implementationFinalizationBeforeRun)
 	if err != nil {
 		t.Fatalf("implementationFinalizationTargetFor returned error: %v", err)
 	}
-	if target.Task.ID != "task-ok" || target.WorktreePath != "/fix/worktree" {
+	if target.Task.ID != "task-ok" || target.WorktreePath != worktree {
 		t.Fatalf("target = %+v, want task-ok and fix worktree", target)
 	}
 }

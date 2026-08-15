@@ -407,20 +407,11 @@ func (w jobWorker) settleBlockedAdvancement(ctx context.Context, jobID string, o
 	if latest.State == string(workflow.JobBlocked) {
 		return w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_blocked", Message: message})
 	}
-	payload, err := daemonJobPayload(latest)
-	if err != nil {
-		return err
-	}
-	if payload.Result != nil {
-		blocked := *payload.Result
-		blocked.Decision = string(workflow.JobBlocked)
-		payload.Result = &blocked
-	}
-	encoded, err := json.Marshal(payload)
+	encoded, err := payloadWithBlockedResultDecision(latest.Payload)
 	if err != nil {
 		return fmt.Errorf("encode blocked advancement result: %w", err)
 	}
-	transitioned, err := w.Store.TransitionJobStatePayloadWithEventAtGeneration(ctx, jobID, observed.state, observed.generation, string(workflow.JobBlocked), string(encoded), db.JobEvent{
+	transitioned, err := w.Store.TransitionJobStatePayloadWithEventAtGeneration(ctx, jobID, observed.state, observed.generation, string(workflow.JobBlocked), encoded, db.JobEvent{
 		JobID:   jobID,
 		Kind:    "advance_blocked",
 		Message: message,
@@ -454,6 +445,41 @@ func (w jobWorker) settleBlockedAdvancement(ctx context.Context, jobID string, o
 	// while this advancement was in flight. Record it the same way -- this verdict is no
 	// longer the live one and must not steer retry.
 	return w.recordSupersededSettlement(ctx, jobID, message)
+}
+
+// payloadWithBlockedResultDecision patches the one claim settlement owns while
+// retaining additive and legacy payload members it does not understand. Stored
+// job payloads are an evolving envelope; decoding through JobPayload and
+// marshaling it back would erase unknown evidence during an unrelated state
+// transition.
+func payloadWithBlockedResultDecision(payload string) (string, error) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(payload), &envelope); err != nil {
+		return "", err
+	}
+	resultRaw, ok := envelope["result"]
+	if !ok || len(resultRaw) == 0 || strings.TrimSpace(string(resultRaw)) == "null" {
+		return payload, nil
+	}
+	var result map[string]json.RawMessage
+	if err := json.Unmarshal(resultRaw, &result); err != nil {
+		return "", fmt.Errorf("parse result: %w", err)
+	}
+	decision, err := json.Marshal(string(workflow.JobBlocked))
+	if err != nil {
+		return "", err
+	}
+	result["decision"] = decision
+	encodedResult, err := json.Marshal(result)
+	if err != nil {
+		return "", err
+	}
+	envelope["result"] = encodedResult
+	encoded, err := json.Marshal(envelope)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
 }
 
 // recordSupersededSettlement records a settlement whose lifecycle has moved on. The kind is

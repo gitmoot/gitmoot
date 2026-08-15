@@ -186,7 +186,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// and must not inherit this delivery gate. Check the same durable target the
 	// finalizer will use before agent lookup, checkout setup, or adapter delivery.
 	if job.Type == "implement" && payload.FixWorktree {
-		if _, err := implementationFinalizationTargetFor(ctx, w.Store, job, payload); err != nil {
+		if _, err := implementationFinalizationTargetFor(ctx, w.Store, job, payload, implementationFinalizationBeforeRun); err != nil {
 			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, err); finishErr != nil {
 				return finishErr
 			}
