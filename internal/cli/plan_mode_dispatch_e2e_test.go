@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -60,6 +62,52 @@ func TestPlanModeDaemonDispatchE2E(t *testing.T) {
 		}
 		if payload.PlanMode != "plan-into:<runtime-default>" {
 			t.Fatalf("persisted plan_mode = %q, want %q; argv=%v", payload.PlanMode, "plan-into:<runtime-default>", argv)
+		}
+	})
+
+	t.Run("unsupported explicit runtime override is rejected before enqueue", func(t *testing.T) {
+		ctx := context.Background()
+		rawHome := filepath.Join(root, "override-home")
+		paths, err := pathsFromFlag(rawHome)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(paths.Home, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		store, err := db.Open(paths.Database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		checkout := filepath.Join(rawHome, "checkout")
+		if err := os.MkdirAll(checkout, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+		seedDaemonWorkerAgentWithPolicy(t, store, "planner", runtime.OmpRuntime, "fresh:plan-e2e", []string{"ask"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
+
+		const jobID = "plan-shell-override"
+		_, err = (workflow.Mailbox{Store: store}).Enqueue(ctx, workflow.JobRequest{
+			ID:                 jobID,
+			Agent:              "planner",
+			Action:             "ask",
+			Repo:               "owner/repo",
+			Branch:             "main",
+			Plan:               true,
+			RuntimeOverride:    runtime.ShellRuntime,
+			RuntimeOverrideRef: "true",
+		})
+		if err == nil {
+			t.Fatal("enqueue accepted a plan job with an unsupported shell runtime override")
+		}
+		for _, want := range []string{`runtime "shell" cannot honour plan mode`, "only the omp runtime implements it"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("enqueue error %q does not contain %q", err, want)
+			}
+		}
+		if _, getErr := store.GetJob(ctx, jobID); !errors.Is(getErr, sql.ErrNoRows) {
+			t.Fatalf("rejected override created a job row: GetJob error = %v, want sql.ErrNoRows", getErr)
 		}
 	})
 
