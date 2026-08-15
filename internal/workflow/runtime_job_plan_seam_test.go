@@ -466,7 +466,10 @@ var runSkillOptTrainRunConfirmTUI = func() {
 	for _, lane := range lanes {
 		t.Run(lane.name, func(t *testing.T) {
 			root := writeSemanticPlanFixtureModule(t, lane.files)
-			want := assertSemanticPlanFixtureShape(t, root, lane.name)
+			want, err := semanticPlanFixtureExpectedProducers(root, lane.name)
+			if err != nil {
+				t.Fatalf("validate %s fixture mechanism: %v", lane.name, err)
+			}
 			got, err := planCensusLoadInContext(root, planCensusBuildContext{name: "host-default"}, "./...")
 			if err != nil {
 				t.Fatalf("load compiled lane: %v", err)
@@ -479,26 +482,186 @@ var runSkillOptTrainRunConfirmTUI = func() {
 	}
 }
 
-func assertSemanticPlanFixtureShape(t *testing.T, root, lane string) []string {
-	t.Helper()
-	switch lane {
-	case "alias chains":
-		return assertSemanticPlanAliasFixtureShape(t, root)
-	case "generic embedding":
-		return assertSemanticPlanGenericFixtureShape(t, root)
-	case "unkeyed positional":
-		return assertSemanticPlanUnkeyedFixtureShape(t, root)
-	case "pointer from call":
-		return assertSemanticPlanPointerFixtureShape(t, root)
-	default:
-		t.Fatalf("unknown semantic plan fixture lane %q", lane)
-		return nil
+// TestSemanticPlanCensusRejectsDecoupledFixtures keeps each premise check tied
+// to the exact producer the semantic census reports. Every fixture below still
+// contains that producer, but no longer uses the mechanism its lane promises.
+func TestSemanticPlanCensusRejectsDecoupledFixtures(t *testing.T) {
+	tests := []struct {
+		name      string
+		lane      string
+		files     map[string]string
+		want      []string
+		wantError string
+	}{
+		{
+			name: "alias chain retained only as a decoy",
+			lane: "alias chains",
+			files: map[string]string{
+				"internal/workflow/alias_same.go": `package workflow
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+type sameFileAlias = runtime.Job
+type JobPayload = sameFileAlias
+
+func AliasSameFile() { _ = runtime.Job{Plan: true} }
+`,
+				"internal/workflow/alias_cross_file_a.go": `package workflow
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+type crossFileAlias = runtime.Job
+`,
+				"internal/workflow/alias_cross_file_b.go": `package workflow
+
+type JobRequest = crossFileAlias
+
+func AliasCrossFile() { _ = JobRequest{PlanInto: "@smol"} }
+`,
+				"internal/workflow/alias_cross_package_a.go": `package workflow
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+type crossPackageAlias = runtime.Job
+type DelegationTimeoutDefaults = crossPackageAlias
+`,
+				"internal/consumer/alias_cross_package_b.go": `package consumer
+
+import "github.com/gitmoot/gitmoot/internal/workflow"
+
+func AliasCrossPackage() { _ = workflow.DelegationTimeoutDefaults{Plan: true} }
+`,
+			},
+			want: []string{
+				"internal/consumer/alias_cross_package_b.go::AliasCrossPackage",
+				"internal/workflow/alias_cross_file_b.go::AliasCrossFile",
+				"internal/workflow/alias_same.go::AliasSameFile",
+			},
+			wantError: "AliasSameFile must construct JobPayload directly",
+		},
+		{
+			name: "generic carrier retained only as a decoy",
+			lane: "generic embedding",
+			files: map[string]string{
+				"internal/cli/skillopt_trainrun_tui.go": `package cli
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+type genericCarrier[T any] struct {
+	runtime.Job
+	Value T
+}
+type genericAlias[T any] = runtime.Job
+
+var runSkillOptTrainRunConfirmTUI = func() {
+	var deps genericAlias[string]
+	deps.Plan = true
+}
+`,
+			},
+			want:      []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"},
+			wantError: "genericAlias must target genericCarrier[T]",
+		},
+		{
+			name: "generic carrier type-parameter assertion disabled",
+			lane: "generic embedding",
+			files: map[string]string{
+				"internal/cli/skillopt_trainrun_tui.go": `package cli
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+type genericCarrier[T, U any] struct {
+	runtime.Job
+	Value T
+}
+type genericAlias[T any] = genericCarrier[T, string]
+
+var runSkillOptTrainRunConfirmTUI = func() {
+	var deps genericAlias[string]
+	deps.Plan = true
+}
+`,
+			},
+			want:      []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"},
+			wantError: "generic fixture carrier must retain one type parameter",
+		},
+		{
+			name: "unkeyed literal retained only as an unrelated decoy",
+			lane: "unkeyed positional",
+			files: map[string]string{
+				"internal/workflow/unkeyed.go": `package workflow
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+func UnkeyedDirect() { _ = runtime.Job{Plan: true}; _ = [3]bool{false, true, false} }
+func UnkeyedSlice() { _ = []runtime.Job{{"", true, ""}} }
+func UnkeyedMap() { _ = map[string]runtime.Job{"job": {"", true, "@smol"}} }
+`,
+			},
+			want: []string{
+				"internal/workflow/unkeyed.go::UnkeyedDirect",
+				"internal/workflow/unkeyed.go::UnkeyedMap",
+				"internal/workflow/unkeyed.go::UnkeyedSlice",
+			},
+			wantError: "UnkeyedDirect must retain its direct runtime.Job positional literal",
+		},
+		{
+			name: "pointer call retained only in an unrelated function",
+			lane: "pointer from call",
+			files: map[string]string{
+				"internal/cli/skillopt_trainrun_tui.go": `package cli
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+func jobPtr() *runtime.Job { return new(runtime.Job) }
+func pointerCallDecoy() { _ = jobPtr() }
+
+var runSkillOptTrainRunConfirmTUI = func() {
+	deps := new(runtime.Job)
+	deps.Plan = true
+}
+`,
+			},
+			want:      []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"},
+			wantError: "pointer fixture call origin = false",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := writeSemanticPlanFixtureModule(t, test.files)
+			if _, err := semanticPlanFixtureExpectedProducers(root, test.lane); err == nil {
+				t.Fatalf("%s mechanism validator accepted a decoupled fixture", test.lane)
+			} else if !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("mechanism error = %q, want %q", err, test.wantError)
+			}
+			got, err := planCensusLoadInContext(root, planCensusBuildContext{name: "host-default"}, "./...")
+			if err != nil {
+				t.Fatalf("load decoupled fixture: %v", err)
+			}
+			if !slices.Equal(got, test.want) {
+				t.Fatalf("decoupled semantic producers = %v, want exactly %v", got, test.want)
+			}
+		})
 	}
 }
 
-func assertSemanticPlanAliasFixtureShape(t *testing.T, root string) []string {
-	t.Helper()
-	cases := []struct {
+func semanticPlanFixtureExpectedProducers(root, lane string) ([]string, error) {
+	switch lane {
+	case "alias chains":
+		return semanticPlanAliasFixtureProducers(root)
+	case "generic embedding":
+		return semanticPlanGenericFixtureProducers(root)
+	case "unkeyed positional":
+		return semanticPlanUnkeyedFixtureProducers(root)
+	case "pointer from call":
+		return semanticPlanPointerFixtureProducers(root)
+	default:
+		return nil, fmt.Errorf("unknown semantic plan fixture lane %q", lane)
+	}
+}
+
+func semanticPlanAliasFixtureProducers(root string) ([]string, error) {
+	aliases := []struct {
 		file   string
 		name   string
 		target string
@@ -510,92 +673,144 @@ func assertSemanticPlanAliasFixtureShape(t *testing.T, root string) []string {
 		{"internal/workflow/alias_cross_package_a.go", "crossPackageAlias", "runtime.Job"},
 		{"internal/workflow/alias_cross_package_a.go", "DelegationTimeoutDefaults", "crossPackageAlias"},
 	}
-	for _, check := range cases {
-		file := parseSemanticPlanFixture(t, root, check.file)
+	for _, check := range aliases {
+		file, err := parseSemanticPlanFixture(root, check.file)
+		if err != nil {
+			return nil, err
+		}
 		if got := semanticPlanFixtureAliasTarget(file, check.name); got != check.target {
-			t.Errorf("%s alias %s target = %q, want %q", check.file, check.name, got, check.target)
+			return nil, fmt.Errorf("%s alias %s target = %q, want %q", check.file, check.name, got, check.target)
 		}
 	}
-	consumer := parseSemanticPlanFixture(t, root, "internal/consumer/alias_cross_package_b.go")
-	if !semanticPlanFixtureHasCompositeType(consumer, "workflow.DelegationTimeoutDefaults") {
-		t.Error("cross-package alias fixture no longer constructs workflow.DelegationTimeoutDefaults")
+	producers := []struct {
+		file     string
+		function string
+		literal  string
+	}{
+		{"internal/workflow/alias_same.go", "AliasSameFile", "JobPayload"},
+		{"internal/workflow/alias_cross_file_b.go", "AliasCrossFile", "JobRequest"},
+		{"internal/consumer/alias_cross_package_b.go", "AliasCrossPackage", "workflow.DelegationTimeoutDefaults"},
+	}
+	for _, producer := range producers {
+		file, err := parseSemanticPlanFixture(root, producer.file)
+		if err != nil {
+			return nil, err
+		}
+		function := semanticPlanFixtureFunction(file, producer.function)
+		if function == nil || !semanticPlanFixtureHasCompositeType(function, producer.literal) {
+			return nil, fmt.Errorf("%s::%s must construct %s directly", producer.file, producer.function, producer.literal)
+		}
 	}
 	return []string{
 		"internal/consumer/alias_cross_package_b.go::AliasCrossPackage",
 		"internal/workflow/alias_cross_file_b.go::AliasCrossFile",
 		"internal/workflow/alias_same.go::AliasSameFile",
-	}
+	}, nil
 }
 
-func assertSemanticPlanGenericFixtureShape(t *testing.T, root string) []string {
-	t.Helper()
-	file := parseSemanticPlanFixture(t, root, "internal/cli/skillopt_trainrun_tui.go")
+func semanticPlanGenericFixtureProducers(root string) ([]string, error) {
+	file, err := parseSemanticPlanFixture(root, "internal/cli/skillopt_trainrun_tui.go")
+	if err != nil {
+		return nil, err
+	}
 	carrier := semanticPlanFixtureTypeSpec(file, "genericCarrier")
 	if carrier == nil || carrier.TypeParams == nil || carrier.TypeParams.NumFields() != 1 {
-		t.Fatal("generic fixture carrier must retain one type parameter")
+		return nil, fmt.Errorf("generic fixture carrier must retain one type parameter")
 	}
 	structure, ok := carrier.Type.(*ast.StructType)
 	if !ok || !semanticPlanFixtureStructEmbeds(structure, "runtime.Job") {
-		t.Fatal("generic fixture carrier must embed runtime.Job")
+		return nil, fmt.Errorf("generic fixture carrier must embed runtime.Job")
 	}
-	found := false
-	ast.Inspect(file, func(node ast.Node) bool {
+	alias := semanticPlanFixtureTypeSpec(file, "genericAlias")
+	indexed, ok := aliasTypeIndex(alias)
+	if !ok || semanticPlanFixtureExprName(indexed.X) != "genericCarrier" || semanticPlanFixtureExprName(indexed.Index) != "T" {
+		return nil, fmt.Errorf("genericAlias must target genericCarrier[T]")
+	}
+	function := semanticPlanFixtureVarFunction(file, "runSkillOptTrainRunConfirmTUI")
+	if function == nil {
+		return nil, fmt.Errorf("reported generic producer must remain a package-level function variable")
+	}
+	hasDeclaration := false
+	hasPlanWrite := false
+	ast.Inspect(function.Body, func(node ast.Node) bool {
 		value, ok := node.(*ast.ValueSpec)
-		if !ok || len(value.Names) != 1 || value.Names[0].Name != "deps" {
-			return true
+		if ok && len(value.Names) == 1 && value.Names[0].Name == "deps" {
+			indexed, indexOK := value.Type.(*ast.IndexExpr)
+			hasDeclaration = indexOK && semanticPlanFixtureExprName(indexed.X) == "genericAlias" && semanticPlanFixtureExprName(indexed.Index) == "string"
 		}
-		indexed, ok := value.Type.(*ast.IndexExpr)
-		found = ok && semanticPlanFixtureExprName(indexed.X) == "genericAlias" && semanticPlanFixtureExprName(indexed.Index) == "string"
-		return !found
+		assignment, ok := node.(*ast.AssignStmt)
+		if ok && len(assignment.Lhs) == 1 {
+			selector, selectorOK := assignment.Lhs[0].(*ast.SelectorExpr)
+			if selectorOK {
+				receiver, receiverOK := selector.X.(*ast.Ident)
+				hasPlanWrite = hasPlanWrite || receiverOK && receiver.Name == "deps" && selector.Sel.Name == "Plan"
+			}
+		}
+		return true
 	})
-	if !found {
-		t.Fatal("generic fixture deps must be declared as genericAlias[string]")
+	if !hasDeclaration || !hasPlanWrite {
+		return nil, fmt.Errorf("reported generic producer deps declaration = %v, Plan write = %v; want both", hasDeclaration, hasPlanWrite)
 	}
-	return []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"}
+	return []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"}, nil
 }
 
-func assertSemanticPlanUnkeyedFixtureShape(t *testing.T, root string) []string {
-	t.Helper()
-	file := parseSemanticPlanFixture(t, root, "internal/workflow/unkeyed.go")
-	for _, name := range []string{"UnkeyedDirect", "UnkeyedSlice", "UnkeyedMap"} {
-		function := semanticPlanFixtureFunction(file, name)
-		if !semanticPlanFixtureHasUnkeyedLiteral(function) {
-			t.Errorf("%s must retain a three-element unkeyed positional literal", name)
+func semanticPlanUnkeyedFixtureProducers(root string) ([]string, error) {
+	file, err := parseSemanticPlanFixture(root, "internal/workflow/unkeyed.go")
+	if err != nil {
+		return nil, err
+	}
+	producers := []struct {
+		name  string
+		shape string
+	}{
+		{"UnkeyedDirect", "direct"},
+		{"UnkeyedSlice", "slice"},
+		{"UnkeyedMap", "map"},
+	}
+	for _, producer := range producers {
+		function := semanticPlanFixtureFunction(file, producer.name)
+		if !semanticPlanFixtureHasUnkeyedJobLiteral(function, producer.shape) {
+			return nil, fmt.Errorf("%s must retain its %s runtime.Job positional literal", producer.name, producer.shape)
 		}
 	}
 	return []string{
 		"internal/workflow/unkeyed.go::UnkeyedDirect",
 		"internal/workflow/unkeyed.go::UnkeyedMap",
 		"internal/workflow/unkeyed.go::UnkeyedSlice",
-	}
+	}, nil
 }
 
-func assertSemanticPlanPointerFixtureShape(t *testing.T, root string) []string {
-	t.Helper()
-	file := parseSemanticPlanFixture(t, root, "internal/cli/skillopt_trainrun_tui.go")
+func semanticPlanPointerFixtureProducers(root string) ([]string, error) {
+	file, err := parseSemanticPlanFixture(root, "internal/cli/skillopt_trainrun_tui.go")
+	if err != nil {
+		return nil, err
+	}
 	jobPtr := semanticPlanFixtureFunction(file, "jobPtr")
 	if jobPtr == nil || jobPtr.Type.Results == nil || len(jobPtr.Type.Results.List) != 1 {
-		t.Fatal("pointer fixture must declare jobPtr with one result")
+		return nil, fmt.Errorf("pointer fixture must declare jobPtr with one result")
 	}
 	pointer, ok := jobPtr.Type.Results.List[0].Type.(*ast.StarExpr)
 	if !ok || semanticPlanFixtureExprName(pointer.X) != "runtime.Job" {
-		t.Fatal("pointer fixture jobPtr must return *runtime.Job")
+		return nil, fmt.Errorf("pointer fixture jobPtr must return *runtime.Job")
 	}
-	hasCallOrigin, hasPlanWrite := semanticPlanFixturePointerWrite(file)
+	function := semanticPlanFixtureVarFunction(file, "runSkillOptTrainRunConfirmTUI")
+	if function == nil {
+		return nil, fmt.Errorf("reported pointer producer must remain a package-level function variable")
+	}
+	hasCallOrigin, hasPlanWrite := semanticPlanFixturePointerWrite(function)
 	if !hasCallOrigin || !hasPlanWrite {
-		t.Fatalf("pointer fixture call origin = %v, Plan write = %v; want both", hasCallOrigin, hasPlanWrite)
+		return nil, fmt.Errorf("pointer fixture call origin = %v, Plan write = %v; want both", hasCallOrigin, hasPlanWrite)
 	}
-	return []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"}
+	return []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"}, nil
 }
 
-func parseSemanticPlanFixture(t *testing.T, root, name string) *ast.File {
-	t.Helper()
+func parseSemanticPlanFixture(root, name string) (*ast.File, error) {
 	path := filepath.Join(root, filepath.FromSlash(name))
 	parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
 	if err != nil {
-		t.Fatalf("parse fixture %s: %v", name, err)
+		return nil, fmt.Errorf("parse fixture %s: %w", name, err)
 	}
-	return parsed
+	return parsed, nil
 }
 
 func semanticPlanFixtureAliasTarget(file *ast.File, name string) string {
@@ -622,6 +837,14 @@ func semanticPlanFixtureTypeSpec(file *ast.File, name string) *ast.TypeSpec {
 	return nil
 }
 
+func aliasTypeIndex(alias *ast.TypeSpec) (*ast.IndexExpr, bool) {
+	if alias == nil || !alias.Assign.IsValid() || alias.TypeParams == nil || alias.TypeParams.NumFields() != 1 {
+		return nil, false
+	}
+	indexed, ok := alias.Type.(*ast.IndexExpr)
+	return indexed, ok
+}
+
 func semanticPlanFixtureFunction(file *ast.File, name string) *ast.FuncDecl {
 	for _, declaration := range file.Decls {
 		function, ok := declaration.(*ast.FuncDecl)
@@ -632,31 +855,79 @@ func semanticPlanFixtureFunction(file *ast.File, name string) *ast.FuncDecl {
 	return nil
 }
 
-func semanticPlanFixtureHasUnkeyedLiteral(function *ast.FuncDecl) bool {
+func semanticPlanFixtureVarFunction(file *ast.File, name string) *ast.FuncLit {
+	for _, declaration := range file.Decls {
+		general, ok := declaration.(*ast.GenDecl)
+		if !ok || general.Tok != token.VAR {
+			continue
+		}
+		for _, specification := range general.Specs {
+			value, ok := specification.(*ast.ValueSpec)
+			if !ok || len(value.Names) != 1 || value.Names[0].Name != name || len(value.Values) != 1 {
+				continue
+			}
+			function, _ := value.Values[0].(*ast.FuncLit)
+			return function
+		}
+	}
+	return nil
+}
+
+func semanticPlanFixtureHasUnkeyedJobLiteral(function *ast.FuncDecl, shape string) bool {
 	if function == nil {
 		return false
 	}
 	found := false
 	ast.Inspect(function.Body, func(node ast.Node) bool {
 		literal, ok := node.(*ast.CompositeLit)
-		if !ok || len(literal.Elts) != 3 {
+		if !ok {
 			return true
 		}
-		for _, element := range literal.Elts {
-			if _, keyed := element.(*ast.KeyValueExpr); keyed {
-				return true
+		switch shape {
+		case "direct":
+			found = semanticPlanFixtureExprName(literal.Type) == "runtime.Job" && semanticPlanFixtureIsUnkeyedThree(literal)
+		case "slice":
+			array, arrayOK := literal.Type.(*ast.ArrayType)
+			if arrayOK && array.Len == nil && semanticPlanFixtureExprName(array.Elt) == "runtime.Job" {
+				for _, element := range literal.Elts {
+					inner, innerOK := element.(*ast.CompositeLit)
+					found = found || innerOK && semanticPlanFixtureIsUnkeyedThree(inner)
+				}
+			}
+		case "map":
+			mapped, mapOK := literal.Type.(*ast.MapType)
+			if mapOK && semanticPlanFixtureExprName(mapped.Key) == "string" && semanticPlanFixtureExprName(mapped.Value) == "runtime.Job" {
+				for _, element := range literal.Elts {
+					entry, entryOK := element.(*ast.KeyValueExpr)
+					if !entryOK {
+						continue
+					}
+					inner, innerOK := entry.Value.(*ast.CompositeLit)
+					found = found || innerOK && semanticPlanFixtureIsUnkeyedThree(inner)
+				}
 			}
 		}
-		found = true
-		return false
+		return !found
 	})
 	return found
 }
 
-func semanticPlanFixturePointerWrite(file *ast.File) (bool, bool) {
+func semanticPlanFixtureIsUnkeyedThree(literal *ast.CompositeLit) bool {
+	if len(literal.Elts) != 3 {
+		return false
+	}
+	for _, element := range literal.Elts {
+		if _, keyed := element.(*ast.KeyValueExpr); keyed {
+			return false
+		}
+	}
+	return true
+}
+
+func semanticPlanFixturePointerWrite(node ast.Node) (bool, bool) {
 	hasCallOrigin := false
 	hasPlanWrite := false
-	ast.Inspect(file, func(node ast.Node) bool {
+	ast.Inspect(node, func(node ast.Node) bool {
 		assignment, ok := node.(*ast.AssignStmt)
 		if !ok || len(assignment.Lhs) != 1 || len(assignment.Rhs) != 1 {
 			return true
@@ -676,9 +947,9 @@ func semanticPlanFixturePointerWrite(file *ast.File) (bool, bool) {
 	return hasCallOrigin, hasPlanWrite
 }
 
-func semanticPlanFixtureHasCompositeType(file *ast.File, want string) bool {
+func semanticPlanFixtureHasCompositeType(node ast.Node, want string) bool {
 	found := false
-	ast.Inspect(file, func(node ast.Node) bool {
+	ast.Inspect(node, func(node ast.Node) bool {
 		literal, ok := node.(*ast.CompositeLit)
 		if ok && semanticPlanFixtureExprName(literal.Type) == want {
 			found = true
@@ -893,6 +1164,7 @@ func TestSemanticPlanCensusHelperCallGraph(t *testing.T) {
 	// new function fails by default and stale exemptions also fail.
 	exemptions := map[string]string{
 		"TestSemanticPlanCensusCompiledFixtures":          "independent compiled-fixture acceptance test",
+		"TestSemanticPlanCensusRejectsDecoupledFixtures":  "negative controls for fixture mechanism validators",
 		"TestSemanticPlanCensusBuildContextScope":         "independent build-tag scope test",
 		"TestSemanticPlanCensusReleaseContexts":           "independent release-matrix contract test",
 		"TestSemanticPlanCensusReleaseContextApplication": "independent release-context application test",
