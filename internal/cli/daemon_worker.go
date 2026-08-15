@@ -19,6 +19,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
+	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/permissionpolicy"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
@@ -187,8 +188,17 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// finalizer will use before agent lookup, checkout setup, or adapter delivery.
 	if job.Type == "implement" && payload.FixWorktree {
 		if _, err := implementationFinalizationTargetFor(ctx, w.Store, job, payload, implementationFinalizationBeforeRun); err != nil {
+			err = fmt.Errorf("validate implementation target before model run: %w", err)
+			var corruption *gitutil.ObjectConnectivityError
+			if errors.As(err, &corruption) {
+				if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+					return finishErr
+				}
+				_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, strings.TrimSpace(payload.WorktreePath), err)
+				return nil
+			}
 			if !resultDeliveryFailed(err) {
-				return fmt.Errorf("validate implementation target before model run: %w", err)
+				return err
 			}
 			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, err); finishErr != nil {
 				return finishErr

@@ -20,6 +20,16 @@ type Client struct {
 
 const maxGitErrorStderrRunes = 4096
 
+// ObjectConnectivityError means git fsck completed and reported a broken
+// reachable object graph. Process-launch failures and context cancellation are
+// deliberately not classified as corruption.
+type ObjectConnectivityError struct {
+	Err error
+}
+
+func (e *ObjectConnectivityError) Error() string { return e.Err.Error() }
+func (e *ObjectConnectivityError) Unwrap() error { return e.Err }
+
 func (c Client) CreateBranch(ctx context.Context, branch string, base string) error {
 	if err := validateBranch(branch); err != nil {
 		return err
@@ -199,42 +209,6 @@ func (c Client) RemoteBranches(ctx context.Context, branches []string) (map[stri
 		}
 	}
 	return out, nil
-}
-
-// RemoteRefSHA resolves one exact advertised ref without mutating local refs or
-// the object database. The boolean is false when the remote answered
-// successfully but did not advertise the requested ref.
-func (c Client) RemoteRefSHA(ctx context.Context, remote, ref string) (string, bool, error) {
-	remote = strings.TrimSpace(remote)
-	if remote == "" {
-		remote = "origin"
-	}
-	if strings.HasPrefix(remote, "-") || strings.ContainsAny(remote, " \t\r\n") {
-		return "", false, fmt.Errorf("remote %q is invalid", remote)
-	}
-	ref = strings.TrimSpace(ref)
-	if err := validateRef(ref); err != nil {
-		return "", false, err
-	}
-	result, err := c.run(ctx, "ls-remote", remote, ref)
-	if err != nil {
-		return "", false, err
-	}
-	var sha string
-	for _, line := range strings.Split(result.Stdout, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
-		}
-		if len(fields) != 2 || fields[1] != ref {
-			return "", false, fmt.Errorf("git ls-remote returned malformed result %q for %s", line, ref)
-		}
-		if sha != "" && !strings.EqualFold(sha, fields[0]) {
-			return "", false, fmt.Errorf("git ls-remote returned conflicting SHAs for %s", ref)
-		}
-		sha = fields[0]
-	}
-	return sha, sha != "", nil
 }
 
 func (c Client) RemoveWorktree(ctx context.Context, path string) error {
@@ -609,6 +583,13 @@ func (c Client) CommitExists(ctx context.Context, rev string) (bool, error) {
 // missing an unreferenced dispatch commit from a damaged repository graph.
 func (c Client) CheckObjectConnectivity(ctx context.Context) error {
 	_, err := c.run(ctx, "fsck", "--connectivity-only")
+	if err == nil {
+		return nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return &ObjectConnectivityError{Err: err}
+	}
 	return err
 }
 

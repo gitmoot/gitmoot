@@ -426,21 +426,6 @@ func TestClientRemoteBranchesBatchesExactRefs(t *testing.T) {
 	}
 }
 
-func TestClientRemoteRefSHA(t *testing.T) {
-	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "abc123\trefs/pull/17/head\n"}, {}}}
-	client := Client{Runner: runner, Dir: "/repo"}
-	sha, found, err := client.RemoteRefSHA(context.Background(), "origin", "refs/pull/17/head")
-	if err != nil || !found || sha != "abc123" {
-		t.Fatalf("RemoteRefSHA(present) = %q, %t, %v", sha, found, err)
-	}
-	sha, found, err = client.RemoteRefSHA(context.Background(), "origin", "refs/pull/18/head")
-	if err != nil || found || sha != "" {
-		t.Fatalf("RemoteRefSHA(absent) = %q, %t, %v", sha, found, err)
-	}
-	runner.wantArgs(t, 0, "git", "ls-remote", "origin", "refs/pull/17/head")
-	runner.wantArgs(t, 1, "git", "ls-remote", "origin", "refs/pull/18/head")
-}
-
 func TestClientHeadSHA(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "abc123\n"}}}
 	sha, err := (Client{Runner: runner, Dir: "/repo"}).HeadSHA(context.Background())
@@ -600,8 +585,13 @@ func TestClientCommitExistsPropagatesRepositoryFailure(t *testing.T) {
 
 func TestClientCheckObjectConnectivityPropagatesFailure(t *testing.T) {
 	runner := &fakeRunner{errs: []error{errors.New("broken object graph")}}
-	if err := (Client{Runner: runner, Dir: "/repo"}).CheckObjectConnectivity(context.Background()); err == nil {
+	err := (Client{Runner: runner, Dir: "/repo"}).CheckObjectConnectivity(context.Background())
+	if err == nil {
 		t.Fatal("CheckObjectConnectivity accepted a repository failure")
+	}
+	var corruption *ObjectConnectivityError
+	if errors.As(err, &corruption) {
+		t.Fatalf("process infrastructure failure classified as object corruption: %v", err)
 	}
 	runner.wantArgs(t, 0, "git", "fsck", "--connectivity-only")
 }
