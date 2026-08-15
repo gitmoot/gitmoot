@@ -1,256 +1,318 @@
 package workflow
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"io/fs"
+	"go/types"
+	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"golang.org/x/tools/go/packages"
 )
 
-// TestRuntimeJobPlanFieldsHaveSingleGatedProducer is a REGRESSION guard on the
-// deliver-time plan gate. It does NOT prove the gate complete, and it does not prove
-// that Mailbox.deliver is the only code that can construct a runtime.Job carrying
-// Plan or PlanInto. An earlier version of this comment claimed both; a reviewer
-// pointed out it claimed them three lines above the list of constructions the census
-// is known to miss, which is the overclaim this file exists to not commit.
+const runtimePackagePath = "github.com/gitmoot/gitmoot/internal/runtime"
+
+type planCensusBuildContext struct {
+	name   string
+	goos   string
+	goarch string
+	tags   []string
+}
+
+var planCensusReleaseBuildContexts = []planCensusBuildContext{
+	{name: "linux/amd64", goos: "linux", goarch: "amd64"},
+	{name: "linux/arm64", goos: "linux", goarch: "arm64"},
+	{name: "darwin/amd64", goos: "darwin", goarch: "amd64"},
+	{name: "darwin/arm64", goos: "darwin", goarch: "arm64"},
+}
+
+// TestRuntimeJobPlanFieldsHaveSingleGatedProducer is a semantic regression
+// guard on the deliver-time plan gate. It type-checks the non-test packages
+// selected by `./...` in every GOOS/GOARCH context built by release.yml, with
+// CGO disabled and custom build tags pinned empty. Like `go list ./...`, that
+// scope excludes testdata, nested modules, test files, and files guarded by
+// custom tags; fixture tests below make those boundaries explicit. For each
+// release context it resolves runtime.Job once and reports:
 //
-// SCOPE OF THE WALK: every package-scope declaration and every function body,
-// including function literals held in package-level vars. An earlier version read
-// only FuncDecl bodies, so a reviewer's `var _ = runtime.Job{Plan: true}` and a
-// package-level func literal assigning job.PlanInto both compiled green while the
-// header claimed no such construction existed.
+//   - composite literals that initialize runtime.Job.Plan or PlanInto, including
+//     aliases, alias chains, omitted element types, and unkeyed positional forms;
+//   - assignments whose resolved field object is runtime.Job.Plan or PlanInto,
+//     including promoted fields and receivers returned by calls.
 //
-// WHAT THE WALK SKIPS, so the claims below are read correctly: _test.go files, and
-// the directories shouldSkipPlanProducerDir names (.git, .gitmoot, node_modules,
-// build, dist, repos, GOALS). The claims are about NON-TEST production source only —
-// the plan tests themselves contain keyed runtime.Job{Plan: true} literals by design.
-//
-// WHAT IT ACTUALLY PROVES, with every exemption named:
-//
-//   - No composite literal setting Plan or PlanInto BY KEY exists outside
-//     Mailbox.deliver, EXCEPT literals whose type is on planFieldAllowlist and
-//     resolves to its owning package (five shapes that legitimately carry such a
-//     field, listed there with reasons).
-//   - No assignment to a .Plan or .PlanInto selector exists outside Mailbox.deliver,
-//     EXCEPT the exact WRITES named in planAssignExemptions, keyed file::symbol::receiver.field. This arm matches a selector NAME and has
-//     no type information, so it cannot tell whose Plan field it sees; each exemption
-//     is named there with a reason.
-//   - No declaration BORROWING an allowlisted type name exists outside its owner,
-//     EXCEPT a non-alias definition of an unrelated type, and EXCEPT an alias whose
-//     target planCarryingTarget cannot see as plan-carrying. Both exceptions are
-//     deliberate: they were measured as false positives on innocent code.
-//
-// WHAT IT DOES NOT PROVE — each demonstrated by a reviewer with REAL COMPILED CODE
-// that this census left green, over four rounds, and tracked on #1513:
-//
-//   - ALIAS CHAINS. `Alias = runtime.Job` then `JobPayload = Alias` is not followed:
-//     planCarryingTarget classifies a target by its immediate spelling only. Same-file,
-//     cross-file and cross-package chains all pass.
-//   - UNKEYED CONSTRUCTION. hasPlanField reads KeyValueExpr elements, so a positional
-//     `runtime.Job{..., true, ...}` sets Plan invisibly, with or without an alias.
-//     Nested positional literals behave the same.
-//   - GENERIC EMBEDDING. A generic type embedding runtime.Job, aliased and constructed
-//     positionally, is missed: IndexExpr resolution examines only the base name.
-//   - STRUCT COPY and REFLECTION, accepted from the first round.
-//
-// THE COMMON CAUSE IS NOT A MISSING SPELLING. Following type identity across aliases,
-// packages and generic instantiations requires a repository declaration index or
-// go/types; this census is syntactic. Seven rounds of adding one more spelling each
-// produced one more bypass each, which is evidence for that claim rather than an
-// opinion about it. So a new adapter entry path should deliberately join the gate
-// above Mailbox.deliver's literal — this test raises the cost of a second door, it
-// does not lock it.
+// The guard intentionally does not claim to detect value flow through a plain
+// struct copy: `j2 := j1` writes no field the type checker can attribute. It also
+// cannot interpret reflection such as FieldByName("Plan"); that target exists only
+// as runtime data. TestSemanticPlanCensusCompiledFixtures keeps both limits as
+// explicit negative assertions so they cannot be mistaken for covered cases.
 func TestRuntimeJobPlanFieldsHaveSingleGatedProducer(t *testing.T) {
-	t.Parallel()
 	root := filepath.Clean(filepath.Join("..", ".."))
-	want := []string{"internal/workflow/mailbox.go::Mailbox.deliver"}
-	var got []string
-	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() {
-			if shouldSkipPlanProducerDir(rel) {
-				return filepath.SkipDir
+	totalStarted := time.Now()
+	for _, buildContext := range planCensusReleaseBuildContexts {
+		t.Run(buildContext.name, func(t *testing.T) {
+			started := time.Now()
+			got, err := planCensusLoadInContext(root, buildContext, "./...")
+			if err != nil {
+				t.Fatalf("load semantic runtime.Job plan census: %v", err)
 			}
-			return nil
-		}
-		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-			return nil
-		}
-		fset := token.NewFileSet()
-		parsed, err := parser.ParseFile(fset, path, nil, 0)
-		if err != nil {
-			return err
-		}
-		got = append(got, planFieldProducersInFile(rel, parsed)...)
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("scan runtime.Job plan producers: %v", err)
-	}
-	slices.Sort(got)
-	if !slices.Equal(got, want) {
-		t.Fatalf("runtime.Job plan producers = %v, want exactly %v; route every producer through the deliver-time plan gate", got, want)
-	}
-}
-
-// planFieldProducersInFile is the census's per-file scan, extracted so a test can
-// drive it directly. A reviewer showed why that matters: the compiled mutation
-// `if false && declaresAllowlistedName(n)` disconnected the shadow arm from the
-// census while the helper's own unit test stayed green — a test of a helper proves
-// the helper, not that anything CALLS it. TestPlanFieldCensusWiresEveryArm pins the
-// wiring, so deleting an arm now fails a test instead of going quiet.
-// planAssignExemptions names symbols whose `.Plan` / `.PlanInto` assignment is not a
-// runtime.Job write. The assignment arm matches a SELECTOR NAME and has no type
-// information, so unlike the composite-literal arm it cannot tell whose Plan field it
-// is looking at. Widening the walk to package-scope initializers surfaced this one
-// immediately, which is the arm's limit doing its job: an exemption here is a
-// maintainer decision with a diff and a reason, never a silent skip.
-var planAssignExemptions = map[string]string{
-	// deps.Plan is a *tui.TrainRunPlan for the SkillOpt confirm screen — a UI plan
-	// object, unrelated to runtime plan mode. Lives inside a package-level var holding
-	// a func literal, which is why the body-only walk never saw it.
-	"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI::deps.Plan": "tui.TrainRunPlan, not runtime plan mode",
-}
-
-func planFieldProducersInFile(rel string, parsed *ast.File) []string {
-	var got []string
-	pkgPath := planFieldPackagePath(rel)
-	imports := planFieldImportPaths(parsed)
-	// PACKAGE-LEVEL type declarations first. Two reviewers independently found this
-	// hole: the loop below only walks FuncDecl bodies, so `type JobPayload =
-	// runtime.Job` at package scope — plain or generic — never reached the TypeSpec arm,
-	// and an unkeyed positional literal of it compiled straight past the census.
-	for _, declaration := range parsed.Decls {
-		general, ok := declaration.(*ast.GenDecl)
-		if !ok || general.Tok != token.TYPE {
-			continue
-		}
-		for _, spec := range general.Specs {
-			typed, ok := spec.(*ast.TypeSpec)
-			if ok && declaresAllowlistedName(typed, pkgPath, false, imports) {
-				got = append(got, filepath.ToSlash(rel)+"::type "+typed.Name.Name)
+			t.Logf("semantic runtime.Job plan census wall time: %s", time.Since(started).Round(time.Millisecond))
+			want := []string{"internal/workflow/mailbox.go::Mailbox.deliver"}
+			if !slices.Equal(got, want) {
+				t.Fatalf("runtime.Job plan producers = %v, want exactly %v; route every producer through the deliver-time plan gate", got, want)
 			}
-		}
-	}
-	// One inspector, driven over EVERY declaration's expressions rather than only
-	// function bodies. A reviewer compiled three package-scope probes that the
-	// body-only walk left green: `var _ = runtime.Job{Plan: true}`, a package-level
-	// function literal assigning job.PlanInto, and one declaring
-	// `type JobPayload = runtime.Job`. None were among the documented limits, so the
-	// header's three guarantees were false as written — a walker that reads only
-	// bodies cannot claim "no ... exists".
-	inspect := func(node ast.Node, symbol string) {
-		ast.Inspect(node, func(node ast.Node) bool {
-			switch n := node.(type) {
-			case *ast.CompositeLit:
-				// FAIL-CLOSED. This used to ask "is the literal's type runtime.Job?"
-				// and return false when it could not tell — so every type spelling
-				// the matcher did not recognise was silently exempt. Three review
-				// rounds walked past it that way, most recently with
-				// `type X = runtime.Job` (a plain refactor idiom, not an exotic act).
-				//
-				// The question is inverted: ANY composite literal that sets Plan or
-				// PlanInto is reported unless its type is on an explicit allowlist of
-				// types that legitimately carry those fields. A new type, a rename, or
-				// an alias now defaults to REPORTED. That is noisier and it is the
-				// safe direction: the failure mode becomes "the census names something
-				// you must add to the allowlist", not "the census went quiet".
-				if hasPlanField(n) && !planFieldTypeIsAllowlisted(n.Type, pkgPath, imports) {
-					got = append(got, filepath.ToSlash(rel)+"::"+symbol)
-				}
-			case *ast.AssignStmt:
-				// job.Plan = true — the composite-literal scan alone missed this, and
-				// a compiled mutant that built a runtime.Job then set Plan AFTERWARDS
-				// delivered it straight past the mailbox gate while this test still
-				// passed. A seam guard that recognises only one syntax for writing a
-				// field is not a seam guard.
-				// Keyed on the exact RECEIVER.FIELD, never the enclosing symbol: two
-				// reviewers each planted a real `delivery.Plan = true` beside the
-				// innocent `deps.Plan` in the same function and the census stayed green,
-				// so a symbol-wide exemption hid every future genuine write in it.
-				for _, selector := range planAssignSelectors(n) {
-					if _, exempt := planAssignExemptions[filepath.ToSlash(rel)+"::"+symbol+"::"+selector]; exempt {
-						continue
-					}
-					got = append(got, filepath.ToSlash(rel)+"::"+symbol)
-				}
-			case *ast.TypeSpec:
-				// A body-scoped `type JobPayload = runtime.Job` SHADOWS the real type,
-				// so a bare literal under that name satisfies the owning-package test
-				// and would be exempt while producing a genuine runtime.Job.
-				if declaresAllowlistedName(n, pkgPath, true, imports) {
-					got = append(got, filepath.ToSlash(rel)+"::"+symbol)
-				}
-			}
-			return true
 		})
 	}
-	for _, declaration := range parsed.Decls {
-		switch decl := declaration.(type) {
-		case *ast.FuncDecl:
-			if decl.Body != nil {
-				inspect(decl.Body, functionSymbol(decl))
+	t.Logf("all release-context semantic census wall time: %s", time.Since(totalStarted).Round(time.Millisecond))
+}
+
+// planCensusLoadInContext is the sole loading and scanning entry point used by
+// both the real census and the compiled fixtures. Tests never call lower-level
+// predicates directly, so a helper can pass only while it remains wired into
+// the real path.
+func planCensusLoadInContext(root string, buildContext planCensusBuildContext, patterns ...string) ([]string, error) {
+	absoluteRoot, err := filepath.Abs(root)
+	if err != nil {
+		return nil, fmt.Errorf("resolve census root: %w", err)
+	}
+	mode := packages.NeedName |
+		packages.NeedFiles |
+		packages.NeedCompiledGoFiles |
+		packages.NeedImports |
+		packages.NeedDeps |
+		packages.NeedTypes |
+		packages.NeedSyntax |
+		packages.NeedTypesInfo
+	config := &packages.Config{
+		Mode:       mode,
+		Dir:        absoluteRoot,
+		Tests:      false,
+		BuildFlags: []string{"-tags=" + strings.Join(buildContext.tags, ",")},
+	}
+	if buildContext.goos != "" || buildContext.goarch != "" {
+		config.Env = planCensusEnvironment(
+			"GOOS="+buildContext.goos,
+			"GOARCH="+buildContext.goarch,
+			"CGO_ENABLED=0",
+		)
+	}
+	loaded, err := packages.Load(config, patterns...)
+	if err != nil {
+		return nil, err
+	}
+	if err := planCensusPackageErrors(loaded); err != nil {
+		return nil, err
+	}
+	job, err := planCensusResolveJob(loaded)
+	if err != nil {
+		return nil, err
+	}
+	return planCensusProducers(absoluteRoot, loaded, job), nil
+}
+
+func planCensusEnvironment(overrides ...string) []string {
+	overridden := make(map[string]struct{}, len(overrides))
+	for _, override := range overrides {
+		name, _, _ := strings.Cut(override, "=")
+		overridden[name] = struct{}{}
+	}
+	environment := make([]string, 0, len(os.Environ())+len(overrides))
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if _, replace := overridden[name]; !replace {
+			environment = append(environment, entry)
+		}
+	}
+	return append(environment, overrides...)
+}
+
+func planCensusPackageErrors(loaded []*packages.Package) error {
+	var messages []string
+	packages.Visit(loaded, nil, func(pkg *packages.Package) {
+		for _, loadErr := range pkg.Errors {
+			messages = append(messages, loadErr.Error())
+		}
+	})
+	if len(messages) == 0 {
+		return nil
+	}
+	slices.Sort(messages)
+	return fmt.Errorf("type-check packages:\n%s", strings.Join(messages, "\n"))
+}
+
+type planCensusJobType struct {
+	typ          types.Type
+	fields       map[*types.Var]struct{}
+	fieldIndexes map[int]struct{}
+}
+
+func planCensusResolveJob(loaded []*packages.Package) (planCensusJobType, error) {
+	var runtimePkg *packages.Package
+	packages.Visit(loaded, nil, func(pkg *packages.Package) {
+		if pkg.PkgPath == runtimePackagePath {
+			runtimePkg = pkg
+		}
+	})
+	if runtimePkg == nil || runtimePkg.Types == nil {
+		return planCensusJobType{}, fmt.Errorf("%s was not loaded", runtimePackagePath)
+	}
+	object := runtimePkg.Types.Scope().Lookup("Job")
+	if object == nil {
+		return planCensusJobType{}, fmt.Errorf("%s.Job was not found", runtimePackagePath)
+	}
+	jobType := object.Type()
+	structure, ok := types.Unalias(jobType).Underlying().(*types.Struct)
+	if !ok {
+		return planCensusJobType{}, fmt.Errorf("%s.Job has type %T, want struct", runtimePackagePath, types.Unalias(jobType).Underlying())
+	}
+	job := planCensusJobType{
+		typ:          jobType,
+		fields:       make(map[*types.Var]struct{}, 2),
+		fieldIndexes: make(map[int]struct{}, 2),
+	}
+	for index := 0; index < structure.NumFields(); index++ {
+		field := structure.Field(index)
+		if field.Name() == "Plan" || field.Name() == "PlanInto" {
+			job.fields[field] = struct{}{}
+			job.fieldIndexes[index] = struct{}{}
+		}
+	}
+	if len(job.fields) != 2 {
+		return planCensusJobType{}, fmt.Errorf("%s.Job plan fields = %d, want Plan and PlanInto", runtimePackagePath, len(job.fields))
+	}
+	return job, nil
+}
+
+func planCensusProducers(root string, loaded []*packages.Package, job planCensusJobType) []string {
+	producers := make(map[string]struct{})
+	for _, pkg := range loaded {
+		for _, file := range pkg.Syntax {
+			filename := pkg.Fset.Position(file.Pos()).Filename
+			rel, err := filepath.Rel(root, filename)
+			if err != nil {
+				rel = filename
 			}
-		case *ast.GenDecl:
-			// var/const initializers at package scope, including any function literal
-			// inside them. TYPE specs are handled by the pass above, which uses the
-			// package-scope rule; re-inspecting them here would apply the body rule and
-			// report the five canonical declarations.
-			if decl.Tok == token.TYPE {
-				continue
-			}
-			for _, spec := range decl.Specs {
-				value, ok := spec.(*ast.ValueSpec)
-				if !ok {
-					continue
-				}
-				name := "package-scope"
-				if len(value.Names) > 0 {
-					name = "var " + value.Names[0].Name
-				}
-				for _, expression := range value.Values {
-					inspect(expression, name)
+			rel = filepath.ToSlash(rel)
+			for _, declaration := range file.Decls {
+				switch declaration := declaration.(type) {
+				case *ast.FuncDecl:
+					if declaration.Body != nil && planCensusNodeWritesPlan(pkg.TypesInfo, declaration.Body, job) {
+						producers[rel+"::"+planCensusFunctionSymbol(declaration)] = struct{}{}
+					}
+				case *ast.GenDecl:
+					if declaration.Tok == token.TYPE {
+						continue
+					}
+					for _, specification := range declaration.Specs {
+						value, ok := specification.(*ast.ValueSpec)
+						if !ok {
+							continue
+						}
+						name := "package-scope"
+						if len(value.Names) > 0 {
+							name = "var " + value.Names[0].Name
+						}
+						for _, expression := range value.Values {
+							if planCensusNodeWritesPlan(pkg.TypesInfo, expression, job) {
+								producers[rel+"::"+name] = struct{}{}
+							}
+						}
+					}
 				}
 			}
 		}
 	}
-	return got
+	result := make([]string, 0, len(producers))
+	for producer := range producers {
+		result = append(result, producer)
+	}
+	slices.Sort(result)
+	return result
 }
 
-func shouldSkipPlanProducerDir(rel string) bool {
-	if rel == "." {
+func planCensusNodeWritesPlan(info *types.Info, node ast.Node, job planCensusJobType) bool {
+	writes := false
+	ast.Inspect(node, func(node ast.Node) bool {
+		if writes {
+			return false
+		}
+		switch node := node.(type) {
+		case *ast.CompositeLit:
+			writes = planCensusLiteralWritesPlan(info, node, job)
+		case *ast.AssignStmt:
+			writes = planCensusAssignmentWritesPlan(info, node, job)
+		}
+		return !writes
+	})
+	return writes
+}
+
+func planCensusLiteralWritesPlan(info *types.Info, literal *ast.CompositeLit, job planCensusJobType) bool {
+	if !types.Identical(info.TypeOf(literal), job.typ) {
 		return false
 	}
-	base := filepath.Base(rel)
-	return base == ".git" || base == ".gitmoot" || base == "node_modules" || base == "build" || base == "dist" || base == "repos" || base == "GOALS"
-}
-
-func hasPlanField(literal *ast.CompositeLit) bool {
-	for _, element := range literal.Elts {
-		field, ok := element.(*ast.KeyValueExpr)
-		if !ok {
+	for index, element := range literal.Elts {
+		if keyed, ok := element.(*ast.KeyValueExpr); ok {
+			identifier, ok := keyed.Key.(*ast.Ident)
+			if !ok {
+				continue
+			}
+			field, ok := info.Uses[identifier].(*types.Var)
+			if _, planField := job.fields[field]; ok && planField {
+				return true
+			}
 			continue
 		}
-		name, ok := field.Key.(*ast.Ident)
-		if ok && (name.Name == "Plan" || name.Name == "PlanInto") {
+		if _, planField := job.fieldIndexes[index]; planField {
 			return true
 		}
 	}
 	return false
 }
 
-func functionSymbol(function *ast.FuncDecl) string {
+func planCensusAssignmentWritesPlan(info *types.Info, assignment *ast.AssignStmt, job planCensusJobType) bool {
+	for _, target := range assignment.Lhs {
+		selector := planCensusAssignedSelector(target)
+		if selector == nil {
+			continue
+		}
+		selection := info.Selections[selector]
+		if selection == nil {
+			continue
+		}
+		field, ok := selection.Obj().(*types.Var)
+		if _, planField := job.fields[field]; ok && planField {
+			return true
+		}
+	}
+	return false
+}
+
+func planCensusAssignedSelector(expression ast.Expr) *ast.SelectorExpr {
+	for {
+		switch current := expression.(type) {
+		case *ast.ParenExpr:
+			expression = current.X
+		case *ast.StarExpr:
+			expression = current.X
+		case *ast.UnaryExpr:
+			if current.Op != token.AND {
+				return nil
+			}
+			expression = current.X
+		case *ast.SelectorExpr:
+			return current
+		default:
+			return nil
+		}
+	}
+}
+
+func planCensusFunctionSymbol(function *ast.FuncDecl) string {
 	if function.Recv == nil || len(function.Recv.List) == 0 {
 		return function.Name.Name
 	}
@@ -264,681 +326,869 @@ func functionSymbol(function *ast.FuncDecl) string {
 	return function.Name.Name
 }
 
-// assignsPlanField reports whether a statement writes Plan or PlanInto through a
-// selector, e.g. `job.Plan = true` or `delivery.PlanInto = x`. The composite-literal
-// scan alone left this syntax invisible, so a producer could construct a
-// runtime.Job, set the plan primitives on the next line, and never appear in the
-// seam census the test exists to pin.
-//
-// The LHS is UNWRAPPED before matching. A first version compared the bare node to
-// *ast.SelectorExpr, and a reviewer walked straight past it with
-// `*(&delivery.Plan) = true` — an ast.StarExpr wrapping a unary & of the selector,
-// which reaches the same field and looked like nothing. Recognising one spelling of
-// a write is exactly the defect this helper was added to fix, so it must not
-// reproduce it one level down. Deref, address-of and parens are all peeled.
-// planAssignTarget peels parens, pointer derefs and address-of from an assignment
-// target and returns the plan-field selector underneath, or nil.
-func planAssignTarget(expr ast.Expr) *ast.SelectorExpr {
-	for {
-		switch e := expr.(type) {
-		case *ast.ParenExpr:
-			expr = e.X
-		case *ast.StarExpr:
-			expr = e.X
-		case *ast.UnaryExpr:
-			if e.Op != token.AND {
-				return nil
-			}
-			expr = e.X
-		case *ast.SelectorExpr:
-			if e.Sel != nil && (e.Sel.Name == "Plan" || e.Sel.Name == "PlanInto") {
-				return e
-			}
-			return nil
-		default:
-			return nil
-		}
+func TestSemanticPlanCensusCompiledFixtures(t *testing.T) {
+	root := filepath.Clean(filepath.Join("..", ".."))
+	got, err := planCensusLoadInContext(root, planCensusBuildContext{name: "host-default"}, "./internal/workflow/testdata/semantic_plan_census/...")
+	if err != nil {
+		t.Fatalf("load compiled semantic census fixtures: %v", err)
 	}
+
+	t.Run("keyed PlanInto", func(t *testing.T) {
+		assertPlanCensusProducers(t, got,
+			"internal/workflow/testdata/semantic_plan_census/producer/producer.go::KeyedPlanInto",
+		)
+	})
+	t.Run("unkeyed positional", func(t *testing.T) {
+		assertPlanCensusProducers(t, got,
+			"internal/workflow/testdata/semantic_plan_census/producer/producer.go::UnkeyedDirect",
+			"internal/workflow/testdata/semantic_plan_census/producer/producer.go::UnkeyedSlice",
+			"internal/workflow/testdata/semantic_plan_census/producer/producer.go::UnkeyedMap",
+		)
+		assertPlanCensusAbsent(t, got, "::UnkeyedPositionalControl")
+	})
+	t.Run("struct copy is a documented limit", func(t *testing.T) {
+		assertPlanCensusAbsent(t, got, "::StructCopyLimit")
+	})
+	t.Run("reflection is a documented limit", func(t *testing.T) {
+		assertPlanCensusAbsent(t, got, "::ReflectionLimit")
+	})
+	t.Run("unrelated pointer receiver", func(t *testing.T) {
+		assertPlanCensusAbsent(t, got, "::UnrelatedPointerFromCall")
+	})
+	t.Run("unrelated controls", func(t *testing.T) {
+		assertPlanCensusAbsent(t, got, "::Controls")
+	})
+	t.Run("package-level initializer", func(t *testing.T) {
+		assertPlanCensusProducers(t, got,
+			"internal/workflow/testdata/semantic_plan_census/producer/producer.go::var PackageLevelPlan",
+		)
+	})
 }
 
-// planAssignSelectors renders each plan-field assignment target as receiver.field,
-// so an exemption can name one write instead of silencing a whole function. A target
-// whose receiver is not a plain identifier renders as "?.field", which cannot match
-// an exemption key and is therefore reported.
-func planAssignSelectors(assign *ast.AssignStmt) []string {
-	var selectors []string
-	for _, target := range assign.Lhs {
-		// PEEL the same wrappers selectorNamesPlanField peels. Demanding a bare
-		// SelectorExpr here silently bypassed that logic — a compiled
-		// `*(&delivery.Plan) = true` passed the census while the peeler's own tests
-		// stayed green, so my refactor dropped live coverage and left a dead test
-		// asserting it. The header claimed no such assignment existed.
-		selector := planAssignTarget(target)
-		if selector == nil {
-			continue
-		}
-		receiver := identName(selector.X)
-		if receiver == "" {
-			receiver = "?"
-		}
-		selectors = append(selectors, receiver+"."+selector.Sel.Name)
-	}
-	return selectors
-}
-
-// TestAssignsPlanFieldArmsTheCensus makes the assignment detector's RESULT
-// load-bearing — and it drives the function PRODUCTION CALLS. It used to exercise
-// assignsPlanField/selectorNamesPlanField, which my round-15 fix orphaned by adding a
-// SECOND peeler for the production path: both reviewers found these thirteen fixtures
-// had become false assurance, and codex proved it by regressing production to the
-// first LHS only while all three census tests stayed green. The duplicate is deleted;
-// planAssignSelectors is the only assignment detector, so a mutation to it fails here. The census test alone did not: mutations making assignsPlanField
-// always return false, or dropping PlanInto recognition, both left it green,
-// because no fixture in the tree exercised the assignment path. A detector nobody
-// tests is a detector that silently stops detecting — which is precisely how the
-// composite-literal-only version survived until a reviewer mutated production code
-// to walk past it.
-//
-// Each case is parsed from source, so the fixtures are the real syntax a producer
-// would write rather than hand-built AST nodes that could drift from the parser.
-func assignsPlanField(assign *ast.AssignStmt) bool {
-	return len(planAssignSelectors(assign)) > 0
-}
-
-func TestAssignsPlanFieldArmsTheCensus(t *testing.T) {
-	cases := []struct {
-		src  string
-		want bool
+// TestSemanticPlanCensusPredecessorBypassLanes plants each acceptance lane in
+// its own compiled module. Their package paths and symbol names are intentional:
+// the syntactic census at 1f384083 misses each module independently, while the
+// semantic census resolves every producer to runtime.Job.
+func TestSemanticPlanCensusPredecessorBypassLanes(t *testing.T) {
+	lanes := []struct {
+		name  string
+		files map[string]string
 	}{
-		// The plan write is NOT the first LHS. Without this, restricting production to
-		// assign.Lhs[:1] survived every fixture — the multi-LHS cases all happened to put
-		// the plan field first, so they proved nothing about the loop.
-		{"var x int; var j runtime.Job; x, j.Plan = 1, true; _, _ = x, j", true},
-		{"var x, y int; x, y = 1, 2; _, _ = x, y", false},
-		{"job.Plan = true", true},
-		{"job.PlanInto = x", true},
-		{"delivery.Plan, delivery.PlanInto = a, b", true},
-		{"p.Plan = true", true},
-		// The forms a reviewer used to bypass the first version.
-		{"*(&delivery.Plan) = true", true},
-		{"*pj.PlanInto = s", true},
-		{"(delivery.Plan) = true", true},
-		{"*(&(delivery.PlanInto)) = s", true},
-		// Must NOT fire: unrelated fields, and a plan-shaped name that is not a field write.
-		{"job.Model = m", false},
-		{"job.Prompt = p", false},
-		{"Plan = true", false},
-		{"m[\"Plan\"] = true", false},
-		{"job.PlanModeSomething = x", false},
+		{
+			name: "alias chains",
+			files: map[string]string{
+				"internal/workflow/alias_same.go": `package workflow
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+type sameFileAlias = runtime.Job
+type JobPayload = sameFileAlias
+
+func AliasSameFile() { _ = JobPayload{Plan: true} }
+`,
+				"internal/workflow/alias_cross_file_a.go": `package workflow
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+type crossFileAlias = runtime.Job
+`,
+				"internal/workflow/alias_cross_file_b.go": `package workflow
+
+type JobRequest = crossFileAlias
+
+func AliasCrossFile() { _ = JobRequest{PlanInto: "@smol"} }
+`,
+				"internal/workflow/alias_cross_package_a.go": `package workflow
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+type crossPackageAlias = runtime.Job
+type DelegationTimeoutDefaults = crossPackageAlias
+`,
+				"internal/consumer/alias_cross_package_b.go": `package consumer
+
+import "github.com/gitmoot/gitmoot/internal/workflow"
+
+func AliasCrossPackage() { _ = workflow.DelegationTimeoutDefaults{Plan: true} }
+`,
+			},
+		},
+		{
+			name: "generic embedding",
+			files: map[string]string{
+				"internal/cli/skillopt_trainrun_tui.go": `package cli
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+type genericCarrier[T any] struct {
+	runtime.Job
+	Value T
+}
+type genericAlias[T any] = genericCarrier[T]
+
+var runSkillOptTrainRunConfirmTUI = func() {
+	var deps genericAlias[string]
+	deps.Plan = true
+}
+`,
+			},
+		},
+		{
+			name: "unkeyed positional",
+			files: map[string]string{
+				"internal/workflow/unkeyed.go": `package workflow
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+func UnkeyedDirect() { _ = runtime.Job{"", true, ""} }
+func UnkeyedSlice() { _ = []runtime.Job{{"", true, ""}} }
+func UnkeyedMap() { _ = map[string]runtime.Job{"job": {"", true, "@smol"}} }
+`,
+			},
+		},
+		{
+			name: "pointer from call",
+			files: map[string]string{
+				"internal/cli/skillopt_trainrun_tui.go": `package cli
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+func jobPtr() *runtime.Job { return new(runtime.Job) }
+
+var runSkillOptTrainRunConfirmTUI = func() {
+	deps := jobPtr()
+	deps.Plan = true
+}
+`,
+			},
+		},
 	}
-	for _, tc := range cases {
-		file, err := parser.ParseFile(token.NewFileSet(), "x.go", "package p\nfunc f() {\n"+tc.src+"\n}\n", 0)
-		if err != nil {
-			t.Fatalf("parse %q: %v", tc.src, err)
-		}
-		var got bool
-		ast.Inspect(file, func(n ast.Node) bool {
-			if assign, ok := n.(*ast.AssignStmt); ok && assignsPlanField(assign) {
-				got = true
+	for _, lane := range lanes {
+		t.Run(lane.name, func(t *testing.T) {
+			root := writeSemanticPlanFixtureModule(t, lane.files)
+			want, err := semanticPlanFixtureExpectedProducers(root, lane.name)
+			if err != nil {
+				t.Fatalf("validate %s fixture mechanism: %v", lane.name, err)
 			}
-			return true
+			got, err := planCensusLoadInContext(root, planCensusBuildContext{name: "host-default"}, "./...")
+			if err != nil {
+				t.Fatalf("load compiled lane: %v", err)
+			}
+			t.Logf("semantic producers: %v", got)
+			if !slices.Equal(got, want) {
+				t.Fatalf("semantic producers = %v, want exactly %v", got, want)
+			}
 		})
-		if got != tc.want {
-			t.Fatalf("assignsPlanField(%q) = %v, want %v", tc.src, got, tc.want)
+	}
+}
+
+// TestSemanticPlanCensusRejectsDecoupledFixtures keeps each premise check tied
+// to the exact producer the semantic census reports. Every fixture below still
+// contains that producer, but no longer uses the mechanism its lane promises.
+func TestSemanticPlanCensusRejectsDecoupledFixtures(t *testing.T) {
+	tests := []struct {
+		name      string
+		lane      string
+		files     map[string]string
+		want      []string
+		wantError string
+	}{
+		{
+			name: "alias chain retained only as a decoy",
+			lane: "alias chains",
+			files: map[string]string{
+				"internal/workflow/alias_same.go": `package workflow
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+type sameFileAlias = runtime.Job
+type JobPayload = sameFileAlias
+
+func AliasSameFile() { _ = runtime.Job{Plan: true} }
+`,
+				"internal/workflow/alias_cross_file_a.go": `package workflow
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+type crossFileAlias = runtime.Job
+`,
+				"internal/workflow/alias_cross_file_b.go": `package workflow
+
+type JobRequest = crossFileAlias
+
+func AliasCrossFile() { _ = JobRequest{PlanInto: "@smol"} }
+`,
+				"internal/workflow/alias_cross_package_a.go": `package workflow
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+type crossPackageAlias = runtime.Job
+type DelegationTimeoutDefaults = crossPackageAlias
+`,
+				"internal/consumer/alias_cross_package_b.go": `package consumer
+
+import "github.com/gitmoot/gitmoot/internal/workflow"
+
+func AliasCrossPackage() { _ = workflow.DelegationTimeoutDefaults{Plan: true} }
+`,
+			},
+			want: []string{
+				"internal/consumer/alias_cross_package_b.go::AliasCrossPackage",
+				"internal/workflow/alias_cross_file_b.go::AliasCrossFile",
+				"internal/workflow/alias_same.go::AliasSameFile",
+			},
+			wantError: "AliasSameFile must construct JobPayload directly",
+		},
+		{
+			name: "generic carrier retained only as a decoy",
+			lane: "generic embedding",
+			files: map[string]string{
+				"internal/cli/skillopt_trainrun_tui.go": `package cli
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+type genericCarrier[T any] struct {
+	runtime.Job
+	Value T
+}
+type genericAlias[T any] = runtime.Job
+
+var runSkillOptTrainRunConfirmTUI = func() {
+	var deps genericAlias[string]
+	deps.Plan = true
+}
+`,
+			},
+			want:      []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"},
+			wantError: "genericAlias must target genericCarrier[T]",
+		},
+		{
+			name: "generic carrier type-parameter assertion disabled",
+			lane: "generic embedding",
+			files: map[string]string{
+				"internal/cli/skillopt_trainrun_tui.go": `package cli
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+type genericCarrier[T, U any] struct {
+	runtime.Job
+	Value T
+}
+type genericAlias[T any] = genericCarrier[T, string]
+
+var runSkillOptTrainRunConfirmTUI = func() {
+	var deps genericAlias[string]
+	deps.Plan = true
+}
+`,
+			},
+			want:      []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"},
+			wantError: "generic fixture carrier must retain one type parameter",
+		},
+		{
+			name: "unkeyed literal retained only as an unrelated decoy",
+			lane: "unkeyed positional",
+			files: map[string]string{
+				"internal/workflow/unkeyed.go": `package workflow
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+func UnkeyedDirect() { _ = runtime.Job{Plan: true}; _ = [3]bool{false, true, false} }
+func UnkeyedSlice() { _ = []runtime.Job{{"", true, ""}} }
+func UnkeyedMap() { _ = map[string]runtime.Job{"job": {"", true, "@smol"}} }
+`,
+			},
+			want: []string{
+				"internal/workflow/unkeyed.go::UnkeyedDirect",
+				"internal/workflow/unkeyed.go::UnkeyedMap",
+				"internal/workflow/unkeyed.go::UnkeyedSlice",
+			},
+			wantError: "UnkeyedDirect must retain its direct runtime.Job positional literal",
+		},
+		{
+			name: "pointer call retained only in an unrelated function",
+			lane: "pointer from call",
+			files: map[string]string{
+				"internal/cli/skillopt_trainrun_tui.go": `package cli
+
+import "github.com/gitmoot/gitmoot/internal/runtime"
+
+func jobPtr() *runtime.Job { return new(runtime.Job) }
+func pointerCallDecoy() { _ = jobPtr() }
+
+var runSkillOptTrainRunConfirmTUI = func() {
+	deps := new(runtime.Job)
+	deps.Plan = true
+}
+`,
+			},
+			want:      []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"},
+			wantError: "pointer fixture call origin = false",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := writeSemanticPlanFixtureModule(t, test.files)
+			if _, err := semanticPlanFixtureExpectedProducers(root, test.lane); err == nil {
+				t.Fatalf("%s mechanism validator accepted a decoupled fixture", test.lane)
+			} else if !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("mechanism error = %q, want %q", err, test.wantError)
+			}
+			got, err := planCensusLoadInContext(root, planCensusBuildContext{name: "host-default"}, "./...")
+			if err != nil {
+				t.Fatalf("load decoupled fixture: %v", err)
+			}
+			if !slices.Equal(got, test.want) {
+				t.Fatalf("decoupled semantic producers = %v, want exactly %v", got, test.want)
+			}
+		})
+	}
+}
+
+func semanticPlanFixtureExpectedProducers(root, lane string) ([]string, error) {
+	switch lane {
+	case "alias chains":
+		return semanticPlanAliasFixtureProducers(root)
+	case "generic embedding":
+		return semanticPlanGenericFixtureProducers(root)
+	case "unkeyed positional":
+		return semanticPlanUnkeyedFixtureProducers(root)
+	case "pointer from call":
+		return semanticPlanPointerFixtureProducers(root)
+	default:
+		return nil, fmt.Errorf("unknown semantic plan fixture lane %q", lane)
+	}
+}
+
+func semanticPlanAliasFixtureProducers(root string) ([]string, error) {
+	aliases := []struct {
+		file   string
+		name   string
+		target string
+	}{
+		{"internal/workflow/alias_same.go", "sameFileAlias", "runtime.Job"},
+		{"internal/workflow/alias_same.go", "JobPayload", "sameFileAlias"},
+		{"internal/workflow/alias_cross_file_a.go", "crossFileAlias", "runtime.Job"},
+		{"internal/workflow/alias_cross_file_b.go", "JobRequest", "crossFileAlias"},
+		{"internal/workflow/alias_cross_package_a.go", "crossPackageAlias", "runtime.Job"},
+		{"internal/workflow/alias_cross_package_a.go", "DelegationTimeoutDefaults", "crossPackageAlias"},
+	}
+	for _, check := range aliases {
+		file, err := parseSemanticPlanFixture(root, check.file)
+		if err != nil {
+			return nil, err
+		}
+		if got := semanticPlanFixtureAliasTarget(file, check.name); got != check.target {
+			return nil, fmt.Errorf("%s alias %s target = %q, want %q", check.file, check.name, got, check.target)
 		}
 	}
-}
-
-// planFieldAllowlist names the types that legitimately carry Plan/PlanInto and are
-// NOT a delivered runtime.Job: the payload and request shapes the mailbox itself
-// owns, plus the runtime's own request struct. Everything else that sets those
-// fields is reported by the census.
-//
-// This is an ALLOWLIST on purpose. The previous design asked "is this a
-// runtime.Job?" and exempted everything it could not identify, which is fail-open:
-// three review rounds bypassed it with a spelling it did not know, most recently a
-// type alias. Inverting the default means a new type, a rename or an alias shows up
-// as a census failure naming itself — a maintainer then decides whether it belongs
-// here. Adding a name to this list is a deliberate act with a diff; being invisible
-// to the census was not.
-// planFieldAllowlist maps a type to the IMPORT PATH of the package that owns it.
-// Keying on the bare type name was fail-open (`other.JobPayload{Plan:true}` was
-// exempt); keying on the qualifier's LOCAL name was still fail-open, because an
-// import alias is an arbitrary local name a producer chooses for itself:
-//
-//	import workflow "github.com/gitmoot/gitmoot/internal/censusshim" // type JobPayload = runtime.Job
-//	_ = workflow.JobPayload{Plan: true}                              // exempt, and a real producer
-//
-// A reviewer built exactly that as compiled code in the tree and the census stayed
-// green. The remedy needs no type resolution: parsed.Imports already maps every
-// qualifier to its import PATH, so identity is available for the asking. A
-// qualifier that cannot be resolved to a path is NOT allowlisted, so an unusual
-// import form costs a census failure rather than an exemption.
-var planFieldAllowlist = map[string]string{
-	"JobPayload":             "github.com/gitmoot/gitmoot/internal/workflow", // mailbox.go — the persisted payload
-	"JobRequest":             "github.com/gitmoot/gitmoot/internal/workflow", // mailbox.go — the enqueue request
-	"RuntimeContractRequest": "github.com/gitmoot/gitmoot/internal/runtime",  // preflight.go — preflight scoping
-	// Surfaced BY the inversion, and exactly the decision it exists to force: both
-	// have a field literally named Plan that has nothing to do with plan mode.
-	// groomApplyResult.Plan is a plan-file PATH (string); DelegationTimeoutDefaults.Plan
-	// is a DURATION. The pre-inversion matcher never saw either.
-	"groomApplyResult":          "github.com/gitmoot/gitmoot/internal/cli",      // memory_groom.go — Plan is a file path
-	"DelegationTimeoutDefaults": "github.com/gitmoot/gitmoot/internal/workflow", // Plan is a timeout duration
-}
-
-// planFieldModulePath is this module's path, so a file's own package identity can be
-// derived from its position in the tree without loading type information.
-const planFieldModulePath = "github.com/gitmoot/gitmoot"
-
-// planFieldPackagePath returns the import path of the package containing a file at
-// repo-relative path rel.
-func planFieldPackagePath(rel string) string {
-	dir := filepath.ToSlash(filepath.Dir(rel))
-	if dir == "." {
-		return planFieldModulePath
+	producers := []struct {
+		file     string
+		function string
+		literal  string
+	}{
+		{"internal/workflow/alias_same.go", "AliasSameFile", "JobPayload"},
+		{"internal/workflow/alias_cross_file_b.go", "AliasCrossFile", "JobRequest"},
+		{"internal/consumer/alias_cross_package_b.go", "AliasCrossPackage", "workflow.DelegationTimeoutDefaults"},
 	}
-	return planFieldModulePath + "/" + dir
+	for _, producer := range producers {
+		file, err := parseSemanticPlanFixture(root, producer.file)
+		if err != nil {
+			return nil, err
+		}
+		function := semanticPlanFixtureFunction(file, producer.function)
+		if function == nil || !semanticPlanFixtureHasCompositeType(function, producer.literal) {
+			return nil, fmt.Errorf("%s::%s must construct %s directly", producer.file, producer.function, producer.literal)
+		}
+	}
+	return []string{
+		"internal/consumer/alias_cross_package_b.go::AliasCrossPackage",
+		"internal/workflow/alias_cross_file_b.go::AliasCrossFile",
+		"internal/workflow/alias_same.go::AliasSameFile",
+	}, nil
 }
 
-// planFieldImportPaths maps each qualifier a file can write to the import path it
-// resolves to. A dot-import has no qualifier and is deliberately absent, so a bare
-// name arriving that way is checked against the file's OWN package and reported. A
-// named import uses its alias; otherwise the path's last element is the qualifier,
-// which is wrong only when a package name differs from its directory — and that
-// case fails CLOSED, because the qualifier then resolves to nothing.
-func planFieldImportPaths(parsed *ast.File) map[string]string {
-	paths := make(map[string]string, len(parsed.Imports))
-	for _, spec := range parsed.Imports {
-		path, err := strconv.Unquote(spec.Path.Value)
-		if err != nil {
+func semanticPlanGenericFixtureProducers(root string) ([]string, error) {
+	file, err := parseSemanticPlanFixture(root, "internal/cli/skillopt_trainrun_tui.go")
+	if err != nil {
+		return nil, err
+	}
+	carrier := semanticPlanFixtureTypeSpec(file, "genericCarrier")
+	if carrier == nil || carrier.TypeParams == nil || carrier.TypeParams.NumFields() != 1 {
+		return nil, fmt.Errorf("generic fixture carrier must retain one type parameter")
+	}
+	structure, ok := carrier.Type.(*ast.StructType)
+	if !ok || !semanticPlanFixtureStructEmbeds(structure, "runtime.Job") {
+		return nil, fmt.Errorf("generic fixture carrier must embed runtime.Job")
+	}
+	alias := semanticPlanFixtureTypeSpec(file, "genericAlias")
+	indexed, ok := aliasTypeIndex(alias)
+	if !ok || semanticPlanFixtureExprName(indexed.X) != "genericCarrier" || semanticPlanFixtureExprName(indexed.Index) != "T" {
+		return nil, fmt.Errorf("genericAlias must target genericCarrier[T]")
+	}
+	function := semanticPlanFixtureVarFunction(file, "runSkillOptTrainRunConfirmTUI")
+	if function == nil {
+		return nil, fmt.Errorf("reported generic producer must remain a package-level function variable")
+	}
+	hasDeclaration := false
+	hasPlanWrite := false
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		value, ok := node.(*ast.ValueSpec)
+		if ok && len(value.Names) == 1 && value.Names[0].Name == "deps" {
+			indexed, indexOK := value.Type.(*ast.IndexExpr)
+			hasDeclaration = indexOK && semanticPlanFixtureExprName(indexed.X) == "genericAlias" && semanticPlanFixtureExprName(indexed.Index) == "string"
+		}
+		assignment, ok := node.(*ast.AssignStmt)
+		if ok && len(assignment.Lhs) == 1 {
+			selector, selectorOK := assignment.Lhs[0].(*ast.SelectorExpr)
+			if selectorOK {
+				receiver, receiverOK := selector.X.(*ast.Ident)
+				hasPlanWrite = hasPlanWrite || receiverOK && receiver.Name == "deps" && selector.Sel.Name == "Plan"
+			}
+		}
+		return true
+	})
+	if !hasDeclaration || !hasPlanWrite {
+		return nil, fmt.Errorf("reported generic producer deps declaration = %v, Plan write = %v; want both", hasDeclaration, hasPlanWrite)
+	}
+	return []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"}, nil
+}
+
+func semanticPlanUnkeyedFixtureProducers(root string) ([]string, error) {
+	file, err := parseSemanticPlanFixture(root, "internal/workflow/unkeyed.go")
+	if err != nil {
+		return nil, err
+	}
+	producers := []struct {
+		name  string
+		shape string
+	}{
+		{"UnkeyedDirect", "direct"},
+		{"UnkeyedSlice", "slice"},
+		{"UnkeyedMap", "map"},
+	}
+	for _, producer := range producers {
+		function := semanticPlanFixtureFunction(file, producer.name)
+		if !semanticPlanFixtureHasUnkeyedJobLiteral(function, producer.shape) {
+			return nil, fmt.Errorf("%s must retain its %s runtime.Job positional literal", producer.name, producer.shape)
+		}
+	}
+	return []string{
+		"internal/workflow/unkeyed.go::UnkeyedDirect",
+		"internal/workflow/unkeyed.go::UnkeyedMap",
+		"internal/workflow/unkeyed.go::UnkeyedSlice",
+	}, nil
+}
+
+func semanticPlanPointerFixtureProducers(root string) ([]string, error) {
+	file, err := parseSemanticPlanFixture(root, "internal/cli/skillopt_trainrun_tui.go")
+	if err != nil {
+		return nil, err
+	}
+	jobPtr := semanticPlanFixtureFunction(file, "jobPtr")
+	if jobPtr == nil || jobPtr.Type.Results == nil || len(jobPtr.Type.Results.List) != 1 {
+		return nil, fmt.Errorf("pointer fixture must declare jobPtr with one result")
+	}
+	pointer, ok := jobPtr.Type.Results.List[0].Type.(*ast.StarExpr)
+	if !ok || semanticPlanFixtureExprName(pointer.X) != "runtime.Job" {
+		return nil, fmt.Errorf("pointer fixture jobPtr must return *runtime.Job")
+	}
+	function := semanticPlanFixtureVarFunction(file, "runSkillOptTrainRunConfirmTUI")
+	if function == nil {
+		return nil, fmt.Errorf("reported pointer producer must remain a package-level function variable")
+	}
+	hasCallOrigin, hasPlanWrite := semanticPlanFixturePointerWrite(function)
+	if !hasCallOrigin || !hasPlanWrite {
+		return nil, fmt.Errorf("pointer fixture call origin = %v, Plan write = %v; want both", hasCallOrigin, hasPlanWrite)
+	}
+	return []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"}, nil
+}
+
+func parseSemanticPlanFixture(root, name string) (*ast.File, error) {
+	path := filepath.Join(root, filepath.FromSlash(name))
+	parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		return nil, fmt.Errorf("parse fixture %s: %w", name, err)
+	}
+	return parsed, nil
+}
+
+func semanticPlanFixtureAliasTarget(file *ast.File, name string) string {
+	typed := semanticPlanFixtureTypeSpec(file, name)
+	if typed == nil || !typed.Assign.IsValid() {
+		return ""
+	}
+	return semanticPlanFixtureExprName(typed.Type)
+}
+
+func semanticPlanFixtureTypeSpec(file *ast.File, name string) *ast.TypeSpec {
+	for _, declaration := range file.Decls {
+		general, ok := declaration.(*ast.GenDecl)
+		if !ok || general.Tok != token.TYPE {
 			continue
 		}
-		name := ""
-		if spec.Name != nil {
-			name = spec.Name.Name
-		} else if index := strings.LastIndex(path, "/"); index >= 0 {
-			name = path[index+1:]
-		} else {
-			name = path
+		for _, specification := range general.Specs {
+			typed, ok := specification.(*ast.TypeSpec)
+			if ok && typed.Name.Name == name {
+				return typed
+			}
 		}
-		// No skip for "." or "_": neither is a legal selector qualifier, so a dot- or
-		// blank-import entry can never be looked up. A guard for it was untestable by
-		// construction — the same dead-branch shape as the deleted StarExpr case.
-		paths[name] = path
 	}
-	return paths
+	return nil
 }
 
-// declaresAllowlistedName reports whether a type declaration borrows an allowlisted
-// name. A function-local `type JobPayload = runtime.Job` shadows the real type, so a
-// bare literal under that name passes the owning-package test while producing a
-// genuine runtime.Job. The exemption belongs to five specific types, not to their
-// spellings, so any body-scoped declaration of one of those names is reported.
-func declaresAllowlistedName(spec *ast.TypeSpec, pkgPath string, bodyScoped bool, imports map[string]string) bool {
-	if spec == nil || spec.Name == nil {
+func aliasTypeIndex(alias *ast.TypeSpec) (*ast.IndexExpr, bool) {
+	if alias == nil || !alias.Assign.IsValid() || alias.TypeParams == nil || alias.TypeParams.NumFields() != 1 {
+		return nil, false
+	}
+	indexed, ok := alias.Type.(*ast.IndexExpr)
+	return indexed, ok
+}
+
+func semanticPlanFixtureFunction(file *ast.File, name string) *ast.FuncDecl {
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if ok && function.Name.Name == name {
+			return function
+		}
+	}
+	return nil
+}
+
+func semanticPlanFixtureVarFunction(file *ast.File, name string) *ast.FuncLit {
+	for _, declaration := range file.Decls {
+		general, ok := declaration.(*ast.GenDecl)
+		if !ok || general.Tok != token.VAR {
+			continue
+		}
+		for _, specification := range general.Specs {
+			value, ok := specification.(*ast.ValueSpec)
+			if !ok || len(value.Names) != 1 || value.Names[0].Name != name || len(value.Values) != 1 {
+				continue
+			}
+			function, _ := value.Values[0].(*ast.FuncLit)
+			return function
+		}
+	}
+	return nil
+}
+
+func semanticPlanFixtureHasUnkeyedJobLiteral(function *ast.FuncDecl, shape string) bool {
+	if function == nil {
 		return false
 	}
-	owner, listed := planFieldAllowlist[spec.Name.Name]
-	if !listed {
-		return false
-	}
-	// INSIDE the owning package, a BODY-SCOPED declaration shadows the real type — and
-	// only a body-scoped one. At package scope inside the owner the declaration IS the
-	// canonical type: reporting it made the census name its own five allowlisted types
-	// as producers. Scope is part of the rule, not an implementation detail.
-	if bodyScoped && pkgPath == owner {
-		return true
-	}
-	// OUTSIDE it, only an ALIAS (`type X = Y`, spec.Assign set) is reported. That
-	// distinction is load-bearing in both directions, and a reviewer found the
-	// fail-open half as a BLOCKER: restricting this arm to the owning package assumed
-	// the composite-literal arm would catch the rest, but hasPlanField only recognises
-	// KEYED elements — so a real internal/cli file declaring `type JobPayload =
-	// runtime.Job` and returning an UNKEYED positional literal with Plan set compiled
-	// green past both arms. An alias borrows an identity the census grants exemptions
-	// to and is reported wherever it appears; a fresh `type JobRequest struct{ Value
-	// string }` defines something unrelated that merely reuses a name, carries no plan
-	// field, and is the innocent case a second reviewer found over-reported.
-	return spec.Assign.IsValid() && planCarryingTarget(spec.Type, imports)
-}
-
-// identName returns the identifier spelling of a qualifier, or "" when it is not a
-// plain identifier — the only shape a package qualifier can legally take.
-func identName(expr ast.Expr) string {
-	if ident, ok := expr.(*ast.Ident); ok {
-		return ident.Name
-	}
-	return ""
-}
-
-// planCarryingTarget reports whether an alias target is a type that can carry plan
-// fields, i.e. runtime.Job itself or an allowlisted shape. A reviewer showed the
-// unrestricted alias rule reporting `type JobPayload = string` in internal/cli as a
-// plan producer: an alias to something that has no plan field borrows a NAME but not
-// an identity, and reporting it fails innocent code for a spelling.
-func planCarryingTarget(expr ast.Expr, imports map[string]string) bool {
-	switch typed := expr.(type) {
-	case *ast.StarExpr:
-		return planCarryingTarget(typed.X, imports)
-	case *ast.IndexExpr:
-		// A generic instantiation resolves to the type being instantiated. NOTE the
-		// measured limit: a generic type EMBEDDING runtime.Job is not reached, because
-		// only the base name is examined.
-		return planCarryingTarget(typed.X, imports)
-	case *ast.SelectorExpr:
-		// Package identity, not the spelling. Classifying every selector ending in Job
-		// as plan-carrying reported a compiled `type JobPayload = db.Job`, which cannot
-		// carry a runtime plan field — measured, so "conservative" was really noisy.
-		path := imports[identName(typed.X)]
-		if owner, listed := planFieldAllowlist[typed.Sel.Name]; listed && path == owner {
-			return true
-		}
-		return typed.Sel.Name == "Job" && path == "github.com/gitmoot/gitmoot/internal/runtime"
-	case *ast.Ident:
-		if _, listed := planFieldAllowlist[typed.Name]; listed {
-			return true
-		}
-		return typed.Name == "Job"
-	default:
-		// An unnameable target — an anonymous struct, a func type, a channel — is not
-		// runtime.Job and cannot carry its plan fields. Defaulting to true here reported
-		// a compiled `type JobPayload = struct{ Value string }`, so the "fail-closed"
-		// claim was observably noise rather than caution. The genuine fail-closed
-		// default lives in planFieldTypeIsAllowlisted, on the LITERAL's type.
-		return false
-	}
-}
-
-// planFieldTypeIsAllowlisted reports whether a composite literal's type is one of
-// the shapes allowed to carry plan fields without being a census producer. An
-// unrecognised or unnamed type is NOT allowlisted, so it is reported. pkgPath is the
-// import path of the file's own package and imports maps its qualifiers to paths.
-func planFieldTypeIsAllowlisted(expr ast.Expr, pkgPath string, imports map[string]string) bool {
-	switch typed := expr.(type) {
-	case *ast.SelectorExpr:
-		// pkg.Type{...}. The qualifier is a LOCAL name the producer chooses, so it is
-		// resolved through the file's imports to a package PATH before comparison. An
-		// alias that borrows the owner's name (`import workflow ".../censusshim"`)
-		// therefore buys nothing, and a qualifier absent from the import table — a
-		// package whose name differs from its directory, say — resolves to "" and is
-		// reported rather than assumed.
-		qualifier, ok := typed.X.(*ast.Ident)
+	found := false
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		literal, ok := node.(*ast.CompositeLit)
 		if !ok {
+			return true
+		}
+		switch shape {
+		case "direct":
+			found = semanticPlanFixtureExprName(literal.Type) == "runtime.Job" && semanticPlanFixtureIsUnkeyedThree(literal)
+		case "slice":
+			array, arrayOK := literal.Type.(*ast.ArrayType)
+			if arrayOK && array.Len == nil && semanticPlanFixtureExprName(array.Elt) == "runtime.Job" {
+				for _, element := range literal.Elts {
+					inner, innerOK := element.(*ast.CompositeLit)
+					found = found || innerOK && semanticPlanFixtureIsUnkeyedThree(inner)
+				}
+			}
+		case "map":
+			mapped, mapOK := literal.Type.(*ast.MapType)
+			if mapOK && semanticPlanFixtureExprName(mapped.Key) == "string" && semanticPlanFixtureExprName(mapped.Value) == "runtime.Job" {
+				for _, element := range literal.Elts {
+					entry, entryOK := element.(*ast.KeyValueExpr)
+					if !entryOK {
+						continue
+					}
+					inner, innerOK := entry.Value.(*ast.CompositeLit)
+					found = found || innerOK && semanticPlanFixtureIsUnkeyedThree(inner)
+				}
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+func semanticPlanFixtureIsUnkeyedThree(literal *ast.CompositeLit) bool {
+	if len(literal.Elts) != 3 {
+		return false
+	}
+	for _, element := range literal.Elts {
+		if _, keyed := element.(*ast.KeyValueExpr); keyed {
 			return false
 		}
-		owner, listed := planFieldAllowlist[typed.Sel.Name]
-		return listed && imports[qualifier.Name] == owner
+	}
+	return true
+}
+
+func semanticPlanFixturePointerWrite(node ast.Node) (bool, bool) {
+	hasCallOrigin := false
+	hasPlanWrite := false
+	ast.Inspect(node, func(node ast.Node) bool {
+		assignment, ok := node.(*ast.AssignStmt)
+		if !ok || len(assignment.Lhs) != 1 || len(assignment.Rhs) != 1 {
+			return true
+		}
+		if assignment.Tok == token.DEFINE {
+			name, nameOK := assignment.Lhs[0].(*ast.Ident)
+			call, callOK := assignment.Rhs[0].(*ast.CallExpr)
+			hasCallOrigin = nameOK && name.Name == "deps" && callOK && semanticPlanFixtureExprName(call.Fun) == "jobPtr"
+		}
+		selector, selectorOK := assignment.Lhs[0].(*ast.SelectorExpr)
+		if selectorOK {
+			receiver, receiverOK := selector.X.(*ast.Ident)
+			hasPlanWrite = hasPlanWrite || receiverOK && receiver.Name == "deps" && selector.Sel.Name == "Plan"
+		}
+		return true
+	})
+	return hasCallOrigin, hasPlanWrite
+}
+
+func semanticPlanFixtureHasCompositeType(node ast.Node, want string) bool {
+	found := false
+	ast.Inspect(node, func(node ast.Node) bool {
+		literal, ok := node.(*ast.CompositeLit)
+		if ok && semanticPlanFixtureExprName(literal.Type) == want {
+			found = true
+			return false
+		}
+		return !found
+	})
+	return found
+}
+
+func semanticPlanFixtureStructEmbeds(structure *ast.StructType, want string) bool {
+	for _, field := range structure.Fields.List {
+		if len(field.Names) == 0 && semanticPlanFixtureExprName(field.Type) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func semanticPlanFixtureExprName(expression ast.Expr) string {
+	switch expression := expression.(type) {
 	case *ast.Ident:
-		// Bare Type{...} — only exempt when the FILE's own package owns the name.
-		owner, listed := planFieldAllowlist[typed.Name]
-		return listed && pkgPath == owner
-	// No *ast.StarExpr or *ast.ParenExpr case: Go has no syntax that puts either in
-	// CompositeLit.Type. '&runtime.Job{...}' parses the & OUTSIDE the literal, so the
-	// type is still a SelectorExpr, and element literals inside a slice or map carry
-	// ArrayType, MapType or a nil type. Both branches existed here and were dead:
-	// mutating them to return true changed no test, not because they were untested
-	// but because nothing can reach them. Verified with a parser probe over
-	// &runtime.Job{...}, []*runtime.Job{{...}} and map[string]*runtime.Job{...}.
-	// Dead code in a fail-closed predicate is worse than absent code — it invites
-	// the reader to believe a case is handled.
+		return expression.Name
+	case *ast.SelectorExpr:
+		prefix := semanticPlanFixtureExprName(expression.X)
+		if prefix == "" {
+			return expression.Sel.Name
+		}
+		return prefix + "." + expression.Sel.Name
 	default:
-		// Unnamed, generic-instantiated, array/map element literals and anything else
-		// the walk cannot name: NOT allowlisted. Fail closed.
-		return false
+		return ""
 	}
 }
 
-// TestPlanFieldCensusFailsClosedOnUnknownTypes proves the inversion. Each fixture is
-// parsed from source and run through the same predicates the census uses, so a
-// spelling that bypasses the census must also bypass this test — which is the
-// property the three earlier bypasses all lacked.
-func TestPlanFieldCensusFailsClosedOnUnknownTypes(t *testing.T) {
-	const defaultImports = "import (\n\t\"github.com/gitmoot/gitmoot/internal/runtime\"\n\tworkflow \"github.com/gitmoot/gitmoot/internal/workflow\"\n)\n"
-	cases := []struct {
-		name    string
-		imports string // when empty, defaultImports; a case owns its import block so the
-		pkg     string // qualifier resolution under test is the file's own, not a fixed map;
-		src     string // pkg is the file's repo-relative path, defaulting to the owning one
-		want    bool   // want == reported by the census
-	}{
-		{"qualified runtime.Job", "", "", "_ = runtime.Job{Plan: true}", true},
-		{"TYPE ALIAS — the round-5 bypass", "", "", "_ = censusJobAlias{Plan: true, PlanInto: \"@smol\"}", true},
-		{"alias of an alias", "", "", "_ = deeperAlias{PlanInto: \"x\"}", true},
-		{"bare Ident under dot-import", "", "", "_ = Job{Plan: true}", true},
-		{"pointer literal", "", "", "_ = &runtime.Job{Plan: true}", true},
-		{"unknown local type", "", "", "_ = someShim{Plan: true}", true},
-		{"allowlisted payload", "", "", "_ = JobPayload{Plan: true}", false},
-		{"allowlisted request", "", "", "_ = JobRequest{PlanInto: \"x\"}", false},
-		{"allowlisted qualified", "", "", "_ = runtime.RuntimeContractRequest{Plan: true}", false},
-		{"no plan field at all", "", "", "_ = runtime.Job{Prompt: \"x\"}", false},
-		// SAME-NAME IMPOSTOR CONTROLS. Keying the allowlist on the bare type name was
-		// fail-open: a borrowed name from any other package bought an exemption, which
-		// recreated the type-alias bypass under five allowlisted names. The qualifier
-		// is now part of the identity, so each of these must be REPORTED.
-		{"impostor: foreign JobPayload", "", "", "_ = other.JobPayload{Plan: true}", true},
-		{"impostor: foreign JobRequest", "", "", "_ = shim.JobRequest{PlanInto: \"x\"}", true},
-		{"impostor: foreign RuntimeContractRequest", "", "", "_ = fake.RuntimeContractRequest{Plan: true}", true},
-		{"impostor: foreign groomApplyResult", "", "", "_ = other.groomApplyResult{Plan: true}", true},
-		{"impostor: bare allowlisted name in the WRONG package", "", "", "_ = RuntimeContractRequest{Plan: true}", true},
-		{"correct qualifier still exempt", "", "", "_ = workflow.JobPayload{Plan: true}", false},
-		// DEFAULT-BRANCH CONTROLS. A reviewer showed that making the default branch
-		// return true survived the earlier fixtures, because none of them reached it:
-		// every case named a type. These do, so the fail-closed default is now armed.
-		{"generic instantiation", "", "", "_ = Wrapper[runtime.Job]{Plan: true}", true},
-		{"map element literal", "", "", "_ = map[string]runtime.Job{\"k\": {Plan: true}}", true},
-		{"slice element literal", "", "", "_ = []runtime.Job{{PlanInto: \"x\"}}", true},
-		// IMPORT-ALIAS IDENTITY. Comparing the qualifier's LOCAL name was still
-		// fail-open: the alias is chosen by the producer, so borrowing the owner's name
-		// bought the exemption back. A reviewer proved it with compiled code in the
-		// tree. Identity is the import PATH, and these three fix the meaning of that.
-		{
-			name:    "alias BORROWING the owner's name is reported",
-			imports: "import workflow \"github.com/gitmoot/gitmoot/internal/censusshim\"\n",
-			pkg:     "",
-			src:     "_ = workflow.JobPayload{Plan: true}",
-			want:    true,
-		},
-		{
-			name:    "legitimate differing alias for the real owner stays exempt",
-			imports: "import wf \"github.com/gitmoot/gitmoot/internal/workflow\"\n",
-			pkg:     "",
-			src:     "_ = wf.JobPayload{Plan: true}",
-			want:    false,
-		},
-		{
-			name:    "dot-import into a NON-owning package is reported",
-			imports: "import . \"github.com/gitmoot/gitmoot/internal/workflow\"\n",
-			pkg:     "internal/cli/x.go",
-			src:     "_ = JobPayload{Plan: true}",
-			want:    true,
-		},
-		{
-			// Full-path identity, not the last element: another module may own a
-			// directory called workflow, and comparing basenames would exempt it.
-			name:    "same basename at a DIFFERENT module path is reported",
-			imports: "import workflow \"github.com/other/project/internal/workflow\"\n",
-			src:     "_ = workflow.JobPayload{Plan: true}",
-			want:    true,
-		},
-		{
-			// The Ident arm needs the same distinction: a file whose OWN package merely
-			// ends in "workflow" does not own internal/workflow's types.
-			name: "bare name in a package sharing only the basename is reported",
-			pkg:  "internal/other/workflow/x.go",
-			src:  "_ = JobPayload{Plan: true}",
-			want: true,
-		},
-		{
-			name:    "qualifier absent from the import table is reported",
-			imports: "import \"github.com/gitmoot/gitmoot/internal/runtime\"\n",
-			pkg:     "",
-			src:     "_ = workflow.JobPayload{Plan: true}",
-			want:    true,
-		},
+func writeSemanticPlanFixtureModule(t *testing.T, files map[string]string) string {
+	t.Helper()
+	root := t.TempDir()
+	common := map[string]string{
+		"go.mod": `module github.com/gitmoot/gitmoot
+
+go 1.26.0
+`,
+		"internal/runtime/job.go": `package runtime
+
+type Job struct {
+	Value string
+	Plan bool
+	PlanInto string
+}
+`,
 	}
-	for _, tc := range cases {
-		imports := tc.imports
-		if imports == "" {
-			imports = defaultImports
+	for name, content := range files {
+		common[name] = content
+	}
+	for name, content := range common {
+		path := filepath.Join(root, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("create fixture directory for %s: %v", name, err)
 		}
-		pkg := tc.pkg
-		if pkg == "" {
-			pkg = "internal/workflow/x.go"
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatalf("write fixture %s: %v", name, err)
 		}
-		file, err := parser.ParseFile(token.NewFileSet(), "x.go", "package workflow\n"+imports+"func f() {\n"+tc.src+"\n}\n", 0)
+	}
+	return root
+}
+
+func TestSemanticPlanCensusBuildContextScope(t *testing.T) {
+	root := filepath.Clean(filepath.Join("..", ".."))
+	pattern := "./internal/workflow/testdata/semantic_plan_census/producer"
+	t.Setenv("GOFLAGS", strings.TrimSpace(os.Getenv("GOFLAGS")+" -tags=plan_census_tagged_fixture"))
+
+	got, err := planCensusLoadInContext(root, planCensusBuildContext{name: "host-default"}, pattern)
+	if err != nil {
+		t.Fatalf("load fixture in pinned default context: %v", err)
+	}
+	assertPlanCensusAbsent(t, got, "::TaggedBuildContext")
+
+	got, err = planCensusLoadInContext(root, planCensusBuildContext{
+		name: "tagged-fixture",
+		tags: []string{"plan_census_tagged_fixture"},
+	}, pattern)
+	if err != nil {
+		t.Fatalf("load fixture in explicit tagged context: %v", err)
+	}
+	assertPlanCensusProducers(t, got,
+		"internal/workflow/testdata/semantic_plan_census/producer/tagged_plan.go::TaggedBuildContext",
+	)
+}
+
+// TestSemanticPlanCensusReleaseContexts pins the contexts audited by the real
+// census to the target matrix in .github/workflows/release.yml. The production
+// loop and this contract are deliberately separate: deleting a context from the
+// loop's input must fail instead of silently narrowing the guarantee.
+func TestSemanticPlanCensusReleaseContexts(t *testing.T) {
+	var got []string
+	for _, buildContext := range planCensusReleaseBuildContexts {
+		got = append(got, fmt.Sprintf("%s:%s/%s:tags=%s", buildContext.name, buildContext.goos, buildContext.goarch, strings.Join(buildContext.tags, ",")))
+	}
+	want := []string{
+		"linux/amd64:linux/amd64:tags=",
+		"linux/arm64:linux/arm64:tags=",
+		"darwin/amd64:darwin/amd64:tags=",
+		"darwin/arm64:darwin/arm64:tags=",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("release census contexts = %v, want %v", got, want)
+	}
+}
+
+// TestSemanticPlanCensusReleaseContextApplication proves the context list is
+// not merely labels around repeated host-context loads. This compiled producer
+// is selected only when GOOS=linux and GOARCH=arm64 reach packages.Load.
+func TestSemanticPlanCensusReleaseContextApplication(t *testing.T) {
+	root := filepath.Clean(filepath.Join("..", ".."))
+	want := "internal/workflow/testdata/semantic_plan_census/producer/linux_arm64_plan.go::LinuxARM64BuildContext"
+	for _, buildContext := range planCensusReleaseBuildContexts {
+		got, err := planCensusLoadInContext(root, buildContext, "./internal/workflow/testdata/semantic_plan_census/producer")
 		if err != nil {
-			t.Fatalf("%s: parse: %v", tc.name, err)
+			t.Fatalf("load %s fixture context: %v", buildContext.name, err)
 		}
-		// The predicate runs against the fixture's OWN resolved imports, so a fixture
-		// cannot pass by borrowing a map the production walk would never build.
-		resolved := planFieldImportPaths(file)
-		var reported bool
-		ast.Inspect(file, func(n ast.Node) bool {
-			lit, ok := n.(*ast.CompositeLit)
-			if ok && hasPlanField(lit) && !planFieldTypeIsAllowlisted(lit.Type, planFieldPackagePath(pkg), resolved) {
-				reported = true
+		hasProducer := slices.Contains(got, want)
+		wantProducer := buildContext.name == "linux/arm64"
+		if hasProducer != wantProducer {
+			t.Errorf("%s producers = %v, LinuxARM64BuildContext present = %v, want %v", buildContext.name, got, hasProducer, wantProducer)
+		}
+	}
+}
+
+func TestSemanticPlanCensusRejectsPackageErrors(t *testing.T) {
+	root := filepath.Clean(filepath.Join("..", ".."))
+	_, err := planCensusLoadInContext(root, planCensusBuildContext{
+		name: "load-error-fixture",
+		tags: []string{"plan_census_load_error"},
+	}, "./internal/workflow/testdata/semantic_plan_census/loaderror")
+	if err == nil {
+		t.Fatal("semantic census accepted a package with a type-check error")
+	}
+	if !strings.Contains(err.Error(), "undefined: planCensusUndefinedSymbol") {
+		t.Fatalf("semantic census error = %q, want undefined fixture symbol", err)
+	}
+}
+
+func assertPlanCensusProducers(t *testing.T, got []string, wants ...string) {
+	t.Helper()
+	for _, want := range wants {
+		if !slices.Contains(got, want) {
+			t.Errorf("producers = %v, want %s", got, want)
+		}
+	}
+}
+
+func assertPlanCensusAbsent(t *testing.T, got []string, suffix string) {
+	t.Helper()
+	for _, producer := range got {
+		if strings.HasSuffix(producer, suffix) {
+			t.Errorf("producers = %v, did not want suffix %s", got, suffix)
+		}
+	}
+}
+
+// TestSemanticPlanCensusHelperCallGraph proves every helper remains reachable
+// from the entry point whose behavior it supports. Coverage is fail-closed: a
+// newly declared function must become reachable or gain a reviewed exemption.
+func TestSemanticPlanCensusHelperCallGraph(t *testing.T) {
+	parsed, err := parser.ParseFile(token.NewFileSet(), "runtime_job_plan_seam_test.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	functions := map[string]*ast.FuncDecl{}
+	graph := map[string][]string{}
+	for _, declaration := range parsed.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		functions[function.Name.Name] = function
+	}
+	for name, function := range functions {
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			called, ok := call.Fun.(*ast.Ident)
+			if ok {
+				if _, local := functions[called.Name]; local {
+					graph[name] = append(graph[name], called.Name)
+				}
 			}
 			return true
 		})
-		if reported != tc.want {
-			t.Fatalf("%s: reported=%v, want %v (src: %s)", tc.name, reported, tc.want, tc.src)
-		}
 	}
-}
-
-// TestDeclaresAllowlistedNameArmsTheShadowBranch pins the local-shadow arm of the
-// census. Without a fixture the branch is an assertion about a defect nobody
-// reproduced; with one, deleting it fails a test rather than going quiet.
-func TestDeclaresAllowlistedNameArmsTheShadowBranch(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		pkg  string
-		src  string
-		want bool
-	}{
-		{"local alias shadowing an allowlisted name", "internal/workflow/x.go", "type JobPayload = runtime.Job", true},
-		{"local alias of a second allowlisted name", "internal/workflow/x.go", "type JobRequest = runtime.Job", true},
-		{"local definition, not an alias, still borrows the name", "internal/cli/x.go", "type groomApplyResult struct{ Plan bool }", true},
-		// OVER-REPORT CONTROL. The unrestricted form failed the census on a compiled
-		// internal/cli helper declaring an unrelated JobRequest with no plan field.
-		{"innocent REDEFINITION outside the owner is not reported", "internal/cli/x.go", "type JobRequest struct{ Value string }", false},
-		// BLOCKER CONTROL. Restricting this arm to the owning package assumed the
-		// composite-literal arm covered the rest; it only sees KEYED elements, so an
-		// UNKEYED positional literal of an outside-the-owner alias compiled green past
-		// both. An alias is reported wherever it appears.
-		{"ALIAS outside the owning package is reported", "internal/cli/x.go", "type JobPayload = runtime.Job", true},
-		{"alias of a second allowlisted name, outside the owner", "internal/other/x.go", "type JobRequest = runtime.Job", true},
-		{"unrelated local type", "internal/workflow/x.go", "type somethingElse = runtime.Job", false},
-	} {
-		file, err := parser.ParseFile(token.NewFileSet(), "x.go", "package workflow\nfunc f() {\n"+tc.src+"\n_ = 0\n}\n", 0)
-		if err != nil {
-			t.Fatalf("%s: parse: %v", tc.name, err)
-		}
-		var got bool
-		ast.Inspect(file, func(n ast.Node) bool {
-			if spec, ok := n.(*ast.TypeSpec); ok && declaresAllowlistedName(spec, planFieldPackagePath(tc.pkg), true, map[string]string{"runtime": "github.com/gitmoot/gitmoot/internal/runtime"}) {
-				got = true
+	reachableFrom := func(root string) map[string]bool {
+		reachable := map[string]bool{}
+		queue := []string{root}
+		for len(queue) > 0 {
+			name := queue[0]
+			queue = queue[1:]
+			if reachable[name] {
+				continue
 			}
-			return true
-		})
-		if got != tc.want {
-			t.Fatalf("%s: declaresAllowlistedName = %v, want %v", tc.name, got, tc.want)
+			reachable[name] = true
+			queue = append(queue, graph[name]...)
+		}
+		return reachable
+	}
+	productionReachable := reachableFrom("TestRuntimeJobPlanFieldsHaveSingleGatedProducer")
+	fixtureReachable := reachableFrom("TestSemanticPlanCensusPredecessorBypassLanes")
+
+	// These are independent test entry points or shared assertion utilities, not
+	// helpers in either guarded execution graph. Every exemption is named so a
+	// new function fails by default and stale exemptions also fail.
+	exemptions := map[string]string{
+		"TestSemanticPlanCensusCompiledFixtures":          "independent compiled-fixture acceptance test",
+		"TestSemanticPlanCensusRejectsDecoupledFixtures":  "negative controls for fixture mechanism validators",
+		"TestSemanticPlanCensusBuildContextScope":         "independent build-tag scope test",
+		"TestSemanticPlanCensusReleaseContexts":           "independent release-matrix contract test",
+		"TestSemanticPlanCensusReleaseContextApplication": "independent release-context application test",
+		"TestSemanticPlanCensusRejectsPackageErrors":      "independent package-error refusal test",
+		"TestSemanticPlanCensusHelperCallGraph":           "the call-graph guard itself",
+		"assertPlanCensusProducers":                       "shared assertion used by independent acceptance tests",
+		"assertPlanCensusAbsent":                          "shared assertion used by independent acceptance tests",
+	}
+	for name := range functions {
+		if productionReachable[name] || fixtureReachable[name] {
+			continue
+		}
+		if reason, exempt := exemptions[name]; !exempt {
+			t.Errorf("function %s is unreachable from both guarded entry points and has no exemption", name)
+		} else if strings.TrimSpace(reason) == "" {
+			t.Errorf("function %s has an empty call-graph exemption", name)
 		}
 	}
-}
-
-// TestPlanFieldCensusWiresEveryArm pins that the census REACHES each arm, which the
-// per-helper tests cannot show. A reviewer disconnected the shadow arm with
-// `if false && declaresAllowlistedName(n)` and all three existing tests stayed green:
-// a helper test proves the helper, never the call. Each case below fails if its arm
-// is unwired, so an arm cannot be deleted or short-circuited silently.
-func TestPlanFieldCensusWiresEveryArm(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		rel  string
-		src  string
-		want []string
-	}{
-		{
-			name: "composite-literal arm",
-			rel:  "internal/cli/x.go",
-			src:  "func f() { _ = runtime.Job{Plan: true} }",
-			want: []string{"internal/cli/x.go::f"},
-		},
-		{
-			name: "assignment arm",
-			rel:  "internal/cli/x.go",
-			src:  "func f() { var j runtime.Job; j.Plan = true; _ = j }",
-			want: []string{"internal/cli/x.go::f"},
-		},
-		{
-			name: "shadow arm, ALIAS outside the owning package (the BLOCKER)",
-			rel:  "internal/cli/x.go",
-			src:  "func f() { type JobPayload = runtime.Job; _ = 0 }",
-			want: []string{"internal/cli/x.go::f"},
-		},
-		{
-			name: "shadow arm, innocent redefinition outside the owner",
-			rel:  "internal/cli/x.go",
-			src:  "func f() { type JobRequest struct{ Value string }; _ = 0 }",
-			want: nil,
-		},
-		{
-			name: "shadow arm, inside the owning package",
-			rel:  "internal/workflow/x.go",
-			src:  "func f() { type JobPayload = runtime.Job; _ = 0 }",
-			want: []string{"internal/workflow/x.go::f"},
-		},
-		{
-			name: "import-alias arm",
-			rel:  "internal/workflow/x.go",
-			src:  "func f() { _ = workflow.JobPayload{Plan: true} }",
-			want: []string{"internal/workflow/x.go::f"},
-		},
-		{
-			// PACKAGE-LEVEL arm. Two reviewers found this hole; four mutations survived
-			// until these fixtures existed, because the wiring test only drove bodies.
-			name: "package-level ALIAS outside the owner is reported",
-			rel:  "internal/cli/x.go",
-			src:  "type JobPayload = runtime.Job\nfunc f() { _ = 0 }",
-			want: []string{"internal/cli/x.go::type JobPayload"},
-		},
-		{
-			name: "package-level generic alias is reported",
-			rel:  "internal/cli/x.go",
-			src:  "type JobPayload[T any] = runtime.Job\nfunc f() { _ = 0 }",
-			want: []string{"internal/cli/x.go::type JobPayload"},
-		},
-		{
-			// The canonical declarations live at package scope INSIDE their owner; an
-			// earlier version of this arm reported all five as producers.
-			name: "package-level DEFINITION inside the owner is not reported",
-			rel:  "internal/workflow/x.go",
-			src:  "type JobPayload struct{ Plan bool }\nfunc f() { _ = 0 }",
-			want: nil,
-		},
-		{
-			// ALIAS TARGET. An alias to something with no plan field borrows a name, not
-			// an identity — reporting it failed innocent code for a spelling.
-			name: "alias to a non-plan-carrying target is not reported",
-			rel:  "internal/cli/x.go",
-			src:  "type JobRequest = string\nfunc f() { _ = 0 }",
-			want: nil,
-		},
-		{
-			name: "body-scoped alias to a non-plan target is not reported",
-			rel:  "internal/cli/x.go",
-			src:  "func f() { type JobPayload = string; _ = 0 }",
-			want: nil,
-		},
-		{
-			// Bare-Ident target: inside package runtime the plan-carrying type is spelled
-			// `Job`, with no qualifier. Nothing covered the Ident arm until this case.
-			name: "alias to a BARE plan-carrying Ident is reported",
-			rel:  "internal/runtime/x.go",
-			src:  "type JobPayload = Job\nfunc f() { _ = 0 }",
-			want: []string{"internal/runtime/x.go::type JobPayload"},
-		},
-		{
-			name: "alias to a generic WRAPPER around a plan type is not reported",
-			rel:  "internal/cli/x.go",
-			src:  "type JobPayload = Wrapper[runtime.Job]\nfunc f() { _ = 0 }",
-			want: nil,
-		},
-		{
-			// Body-scoped DEFINITION inside the owner: shadows the canonical type without
-			// being an alias, so only the scope rule can catch it.
-			name: "body-scoped definition INSIDE the owner is reported",
-			rel:  "internal/workflow/x.go",
-			src:  "func f() { type JobPayload struct{ Plan bool }; _ = 0 }",
-			want: []string{"internal/workflow/x.go::f"},
-		},
-		{
-			// PIN the import-path identity rule: reverting the selector test to a bare
-			// `Sel.Name == "Job"` survived every fixture until this case existed, which
-			// would restore the exact db.Job false positive this delta closed.
-			name: "alias to a FOREIGN Job is not reported",
-			rel:  "internal/cli/x.go",
-			src:  "type JobPayload = db.Job\nfunc f() { _ = 0 }",
-			want: nil,
-		},
-		{
-			// PIN the unnameable-target default: flipping it back to true survived, and
-			// would restore the anonymous-struct false positive.
-			name: "alias to an anonymous struct is not reported",
-			rel:  "internal/cli/x.go",
-			src:  "type JobPayload = struct{ Value string }\nfunc f() { _ = 0 }",
-			want: nil,
-		},
-		{
-			// PIN the StarExpr unwrap: disabling it survived, and a pointer alias to the
-			// real type is a genuine borrowed identity.
-			name: "POINTER alias to the plan type is reported",
-			rel:  "internal/cli/x.go",
-			src:  "type JobPayload = *runtime.Job\nfunc f() { _ = 0 }",
-			want: []string{"internal/cli/x.go::type JobPayload"},
-		},
-		{
-			// PACKAGE-SCOPE INITIALIZER arm, pinned. Both round-14 reviewers reverted this
-			// arm to a body-only walk with one line and every test stayed green, which
-			// silently reinstated a BLOCKER-class hole.
-			name: "package-level keyed literal is reported",
-			rel:  "internal/cli/x.go",
-			src:  "var zzV = runtime.Job{Plan: true}",
-			want: []string{"internal/cli/x.go::var zzV"},
-		},
-		{
-			name: "package-level func literal assigning PlanInto is reported",
-			rel:  "internal/cli/x.go",
-			src:  "var zzF = func() { var j runtime.Job; j.PlanInto = \"@smol\"; _ = j }",
-			want: []string{"internal/cli/x.go::var zzF"},
-		},
-		{
-			// The exemption must name ONE write, not a whole function: a genuine
-			// assignment beside an exempt one must still be reported.
-			name: "unexempt selector beside an exempt one is still reported",
-			rel:  "internal/cli/skillopt_trainrun_tui.go",
-			src:  "var runSkillOptTrainRunConfirmTUI = func() { var deps, delivery struct{ Plan bool }; deps.Plan = true; delivery.Plan = true; _, _ = deps, delivery }",
-			want: []string{"internal/cli/skillopt_trainrun_tui.go::var runSkillOptTrainRunConfirmTUI"},
-		},
-		{
-			// PIN the qualified allowlisted alias target branch.
-			// The harness aliases 'workflow' to censusshim on purpose, so the qualified
-			// allowlisted target is spelled through the import that resolves: runtime.
-			name: "alias to a QUALIFIED allowlisted type is reported",
-			rel:  "internal/cli/x.go",
-			src:  "type JobPayload = runtime.RuntimeContractRequest\nfunc f() { _ = 0 }",
-			want: []string{"internal/cli/x.go::type JobPayload"},
-		},
-		{
-			// PIN the bare allowlisted alias target branch.
-			name: "alias to a BARE allowlisted type is reported",
-			rel:  "internal/runtime/x.go",
-			src:  "type JobPayload = RuntimeContractRequest\nfunc f() { _ = 0 }",
-			want: []string{"internal/runtime/x.go::type JobPayload"},
-		},
-		{
-			// PIN the wrapper-aware assignment target: `*(&x.Plan) = true` is a write.
-			name: "wrapped selector assignment is reported",
-			rel:  "internal/cli/x.go",
-			src:  "func f() { var j runtime.Job; *(&j.Plan) = true; _ = j }",
-			want: []string{"internal/cli/x.go::f"},
-		},
-		{
-			name: "clean file reports nothing",
-			rel:  "internal/cli/x.go",
-			src:  "func f() { _ = runtime.Job{Prompt: \"x\"} }",
-			want: nil,
-		},
-	} {
-		const imports = "import (\n\t\"github.com/gitmoot/gitmoot/internal/runtime\"\n\tworkflow \"github.com/gitmoot/gitmoot/internal/censusshim\"\n)\n"
-		file, err := parser.ParseFile(token.NewFileSet(), "x.go", "package p\n"+imports+tc.src+"\n", 0)
-		if err != nil {
-			t.Fatalf("%s: parse: %v", tc.name, err)
+	for name := range exemptions {
+		if _, exists := functions[name]; !exists {
+			t.Errorf("call-graph exemption %s names no declared function", name)
 		}
-		got := planFieldProducersInFile(tc.rel, file)
-		if !slices.Equal(got, tc.want) {
-			t.Fatalf("%s: producers = %v, want %v", tc.name, got, tc.want)
+		if productionReachable[name] || fixtureReachable[name] {
+			t.Errorf("call-graph exemption %s is stale because the function is reachable", name)
 		}
 	}
 }
