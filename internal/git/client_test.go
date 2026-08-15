@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
@@ -594,6 +595,144 @@ func TestClientCheckObjectConnectivityPropagatesFailure(t *testing.T) {
 		t.Fatalf("process infrastructure failure classified as object corruption: %v", err)
 	}
 	runner.wantArgs(t, 0, "git", "fsck", "--connectivity-only")
+}
+
+func TestClientCheckObjectConnectivityClassifiesReportedCorruption(t *testing.T) {
+	installGitConnectivityStub(t, `
+printf '%s\n' 'broken link from tree 1111111111111111111111111111111111111111' >&2
+printf '%s\n' 'missing blob 2222222222222222222222222222222222222222' >&2
+exit 1
+`)
+	err := (Client{Dir: t.TempDir()}).CheckObjectConnectivity(context.Background())
+	var corruption *ObjectConnectivityError
+	if !errors.As(err, &corruption) {
+		t.Fatalf("reported connectivity failure = %v, want ObjectConnectivityError", err)
+	}
+}
+
+func TestClientCheckObjectConnectivityDoesNotClassifyCancellation(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "started")
+	t.Setenv("GITMOOT_TEST_MARKER", marker)
+	installGitConnectivityStub(t, `
+printf '%s\n' 'missing blob 2222222222222222222222222222222222222222' >&2
+: > "$GITMOOT_TEST_MARKER"
+exec sleep 30
+`)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	workDir := t.TempDir()
+	go func() {
+		done <- (Client{Dir: workDir}).CheckObjectConnectivity(ctx)
+	}()
+	waitForFile(t, marker)
+	cancel()
+	err := <-done
+	if err == nil {
+		t.Fatal("cancelled connectivity check returned nil")
+	}
+	var corruption *ObjectConnectivityError
+	if errors.As(err, &corruption) {
+		t.Fatalf("cancelled connectivity check classified as corruption: %v", err)
+	}
+}
+
+func TestClientCheckObjectConnectivityDoesNotClassifyCanceledContextAfterOrdinaryExit(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "exit 1")
+	exitErr := cmd.Run()
+	var processExit *exec.ExitError
+	if !errors.As(exitErr, &processExit) || !processExit.ProcessState.Exited() {
+		t.Fatalf("fixture error = %v, want ordinary process exit", exitErr)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	runner := &fakeRunner{
+		results: []subprocess.Result{{Stderr: "missing blob 2222222222222222222222222222222222222222\n"}},
+		errs:    []error{exitErr},
+	}
+	err := (Client{Runner: runner, Dir: t.TempDir()}).CheckObjectConnectivity(ctx)
+	var corruption *ObjectConnectivityError
+	if errors.As(err, &corruption) {
+		t.Fatalf("cancelled context with ordinary process exit classified as corruption: %v", err)
+	}
+}
+
+func TestClientCheckObjectConnectivityDoesNotClassifySignal(t *testing.T) {
+	installGitConnectivityStub(t, `
+printf '%s\n' 'missing blob 2222222222222222222222222222222222222222' >&2
+kill -KILL $$
+`)
+	err := (Client{Dir: t.TempDir()}).CheckObjectConnectivity(context.Background())
+	if err == nil {
+		t.Fatal("signal-terminated connectivity check returned nil")
+	}
+	var corruption *ObjectConnectivityError
+	if errors.As(err, &corruption) {
+		t.Fatalf("signal-terminated connectivity check classified as corruption: %v", err)
+	}
+}
+
+func TestClientCheckObjectConnectivityRequiresCorruptionDiagnostic(t *testing.T) {
+	installGitConnectivityStub(t, `
+printf '%s\n' 'fatal: temporary process resource failure' >&2
+exit 1
+`)
+	err := (Client{Dir: t.TempDir()}).CheckObjectConnectivity(context.Background())
+	if err == nil {
+		t.Fatal("ordinary infrastructure failure returned nil")
+	}
+	var corruption *ObjectConnectivityError
+	if errors.As(err, &corruption) {
+		t.Fatalf("ordinary infrastructure failure classified as corruption: %v", err)
+	}
+}
+
+func TestReportsObjectConnectivityFailure(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		stdout string
+		stderr string
+		want   bool
+	}{
+		{name: "broken link", stderr: "broken link from tree abc", want: true},
+		{name: "missing blob", stderr: "missing blob abc", want: true},
+		{name: "missing tree", stderr: "missing tree abc", want: true},
+		{name: "missing commit", stderr: "missing commit abc", want: true},
+		{name: "missing tag", stderr: "missing tag abc", want: true},
+		{name: "invalid ref", stderr: "error: refs/heads/main: invalid sha1 pointer abc", want: true},
+		{name: "corrupt object", stderr: "fatal: loose object abc is corrupt", want: true},
+		{name: "empty object file", stderr: "error: object file abc is empty", want: true},
+		{name: "stdout diagnostic", stdout: "MISSING BLOB abc", want: true},
+		{name: "ordinary failure", stderr: "fatal: temporary process resource failure"},
+		{name: "empty report"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := reportsObjectConnectivityFailure(test.stdout, test.stderr); got != test.want {
+				t.Fatalf("reportsObjectConnectivityFailure(%q, %q) = %t, want %t", test.stdout, test.stderr, got, test.want)
+			}
+		})
+	}
+}
+
+func installGitConnectivityStub(t *testing.T, body string) {
+	t.Helper()
+	binDir := t.TempDir()
+	path := filepath.Join(binDir, "git")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		t.Fatalf("write git stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", path)
 }
 
 func TestClientCreateBranchSmoke(t *testing.T) {

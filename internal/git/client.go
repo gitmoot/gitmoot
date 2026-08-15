@@ -20,9 +20,9 @@ type Client struct {
 
 const maxGitErrorStderrRunes = 4096
 
-// ObjectConnectivityError means git fsck completed and reported a broken
-// reachable object graph. Process-launch failures and context cancellation are
-// deliberately not classified as corruption.
+// ObjectConnectivityError means git fsck exited normally and reported a broken
+// reachable object graph. Process-launch failures, cancellation, and signals
+// are deliberately not classified as corruption.
 type ObjectConnectivityError struct {
 	Err error
 }
@@ -582,15 +582,36 @@ func (c Client) CommitExists(ctx context.Context, rev string) (bool, error) {
 // is present. It is intentionally read-only and distinguishes a healthy clone
 // missing an unreferenced dispatch commit from a damaged repository graph.
 func (c Client) CheckObjectConnectivity(ctx context.Context) error {
-	_, err := c.run(ctx, "fsck", "--connectivity-only")
+	result, err := c.run(ctx, "fsck", "--connectivity-only")
 	if err == nil {
 		return nil
 	}
+	if ctx.Err() != nil {
+		return err
+	}
 	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
+	if errors.As(err, &exitErr) && exitErr.ProcessState != nil && exitErr.ProcessState.Exited() && reportsObjectConnectivityFailure(result.Stdout, result.Stderr) {
 		return &ObjectConnectivityError{Err: err}
 	}
 	return err
+}
+
+func reportsObjectConnectivityFailure(stdout, stderr string) bool {
+	report := strings.ToLower(stdout + "\n" + stderr)
+	for _, marker := range []string{
+		"broken link from ",
+		"missing blob ",
+		"missing tree ",
+		"missing commit ",
+		"missing tag ",
+		"invalid sha1 pointer ",
+		" is corrupt",
+	} {
+		if strings.Contains(report, marker) {
+			return true
+		}
+	}
+	return strings.Contains(report, "object file ") && strings.Contains(report, " is empty")
 }
 
 // IsAncestor reports whether ancestor is reachable from descendant. Git uses
