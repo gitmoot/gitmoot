@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -61,11 +62,18 @@ func TestImplementationFinalizationTargetRejectsEveryMissingField(t *testing.T) 
 }
 
 func TestAdvanceImplementationPreflightBlocksBeforeModelAndKeepsResultHonest(t *testing.T) {
-	for _, mode := range []string{"stale", "divergent"} {
-		t.Run(mode, func(t *testing.T) {
-			result := runAdvanceImplementationPreflightFixture(t, mode)
+	for _, test := range []struct {
+		mode          string
+		wantCondition string
+	}{
+		{mode: "stale", wantCondition: "stale or divergent"},
+		{mode: "unfetched-stale", wantCondition: "cannot compare"},
+		{mode: "divergent", wantCondition: "stale or divergent"},
+	} {
+		t.Run(test.mode, func(t *testing.T) {
+			result := runAdvanceImplementationPreflightFixture(t, test.mode)
 			for _, want := range []string{
-				"task-1514", "stale or divergent", result.currentHead, result.expectedHead, result.fixWorktree,
+				"task-1514", test.wantCondition, result.currentHead, result.expectedHead, result.fixWorktree,
 				"fetch origin feature/semantic-census",
 				"reset --hard " + result.expectedHead,
 			} {
@@ -75,6 +83,20 @@ func TestAdvanceImplementationPreflightBlocksBeforeModelAndKeepsResultHonest(t *
 			}
 			if !result.remedyCleared {
 				t.Fatal("documented reset remedy did not clear the preflight refusal")
+			}
+			if test.mode == "divergent" {
+				git := gitutil.Client{Dir: result.fixWorktree}
+				currentAncestorDispatch, err := git.IsAncestor(context.Background(), result.currentHead, result.expectedHead)
+				if err != nil {
+					t.Fatalf("compare divergent current head with dispatch head: %v", err)
+				}
+				dispatchAncestorCurrent, err := git.IsAncestor(context.Background(), result.expectedHead, result.currentHead)
+				if err != nil {
+					t.Fatalf("compare divergent dispatch head with current head: %v", err)
+				}
+				if currentAncestorDispatch || dispatchAncestorCurrent {
+					t.Fatalf("divergent fixture ancestry current->dispatch=%t dispatch->current=%t, want neither", currentAncestorDispatch, dispatchAncestorCurrent)
+				}
 			}
 		})
 	}
@@ -159,6 +181,10 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 		runDaemonWorkerGit(t, registered, "push", "origin", branch)
 		expectedHead = strings.TrimSpace(runGitOutput(t, registered, "rev-parse", "HEAD"))
 		runDaemonWorkerGit(t, fixWorktree, "fetch", "origin", branch)
+	case "unfetched-stale":
+		runDaemonWorkerGit(t, registered, "commit", "--allow-empty", "-m", "advance reviewed branch")
+		runDaemonWorkerGit(t, registered, "push", "origin", branch)
+		expectedHead = strings.TrimSpace(runGitOutput(t, registered, "rev-parse", "HEAD"))
 	case "divergent":
 		runDaemonWorkerGit(t, registered, "commit", "--allow-empty", "-m", "advance reviewed branch")
 		runDaemonWorkerGit(t, registered, "push", "origin", branch)
@@ -253,7 +279,7 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 		}
 	}
 	remedyCleared := false
-	if mode == "stale" || mode == "divergent" {
+	if mode == "stale" || mode == "unfetched-stale" || mode == "divergent" {
 		runDaemonWorkerGit(t, fixWorktree, "fetch", "origin", branch)
 		runDaemonWorkerGit(t, fixWorktree, "reset", "--hard", expectedHead)
 		payload, err := daemonJobPayload(after)

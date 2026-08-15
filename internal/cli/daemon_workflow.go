@@ -393,14 +393,21 @@ func implementationFinalizationTargetFor(ctx context.Context, store *db.Store, j
 		if err != nil {
 			return implementationFinalizationTarget{}, fmt.Errorf("resolve implementation worktree HEAD: %w", err)
 		}
+		recovery := fmt.Sprintf(
+			"inspect or stash local changes, then run `git -C %q fetch origin %s` and `git -C %q reset --hard %s` before retrying",
+			worktreePath, task.Branch, worktreePath, expectedHead,
+		)
 		currentIncludesDispatchHead, err := git.IsAncestor(ctx, expectedHead, head)
 		if err != nil {
-			return implementationFinalizationTarget{}, fmt.Errorf("compare implementation worktree HEAD %s with dispatch head %s: %w", head, expectedHead, err)
+			return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
+				"implementation task %s worktree %q cannot compare current HEAD %s with dispatch head %s (%v); %s",
+				task.ID, worktreePath, head, expectedHead, err, recovery,
+			))
 		}
 		if !currentIncludesDispatchHead {
 			return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
-				"implementation task %s worktree %q is stale or divergent at %s, expected dispatch head %s; inspect or stash local changes, then run `git -C %q fetch origin %s` and `git -C %q reset --hard %s` before retrying",
-				task.ID, worktreePath, head, expectedHead, worktreePath, task.Branch, worktreePath, expectedHead,
+				"implementation task %s worktree %q is stale or divergent at %s, expected dispatch head %s; %s",
+				task.ID, worktreePath, head, expectedHead, recovery,
 			))
 		}
 	}
