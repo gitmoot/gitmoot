@@ -644,6 +644,50 @@ func (s *Store) TransitionJobStateWithEventAtGeneration(ctx context.Context, id 
 	return true, tx.Commit()
 }
 
+// TransitionJobStatePayloadWithEventAtGeneration atomically settles one
+// observed lifecycle while replacing its payload. It is the payload-writing
+// counterpart of TransitionJobStateWithEventAtGeneration: a stale run loses the
+// compare-and-swap instead of rewriting the result of a newer lifecycle.
+func (s *Store) TransitionJobStatePayloadWithEventAtGeneration(ctx context.Context, id string, from string, fromGeneration int64, to string, payload string, event JobEvent) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	projection := jobProjectionFromPayload(payload)
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND lifecycle_generation = ? AND workflow_id = ?`,
+		to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+		projection.BlockerSuggestedAction, id, from, fromGeneration, projection.WorkflowID)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		if err := rejectWorkflowIDMismatch(ctx, tx, id, projection.WorkflowID); err != nil {
+			return false, err
+		}
+		return false, tx.Commit()
+	}
+	if event.JobID == "" {
+		event.JobID = id
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+		return false, err
+	}
+	var agent, jobType string
+	if err := tx.QueryRowContext(ctx, `SELECT agent, type FROM jobs WHERE id = ?`, id).Scan(&agent, &jobType); err != nil {
+		return false, err
+	}
+	if err := resolveAwaitedReviewFactTx(ctx, tx, id, agent, jobType, to, payload, time.Now().UTC()); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
 // ClaimRunningJob is TransitionJobStateWithEvent specialized for the queued->
 // running CLAIM, additionally stamping the claiming process's identity
 // (runner_pid, runner_boot_id) in the SAME atomic UPDATE (#651). runner_pid is

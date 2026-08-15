@@ -407,7 +407,20 @@ func (w jobWorker) settleBlockedAdvancement(ctx context.Context, jobID string, o
 	if latest.State == string(workflow.JobBlocked) {
 		return w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_blocked", Message: message})
 	}
-	transitioned, err := w.Store.TransitionJobStateWithEventAtGeneration(ctx, jobID, observed.state, observed.generation, string(workflow.JobBlocked), db.JobEvent{
+	payload, err := daemonJobPayload(latest)
+	if err != nil {
+		return err
+	}
+	if payload.Result != nil {
+		blocked := *payload.Result
+		blocked.Decision = string(workflow.JobBlocked)
+		payload.Result = &blocked
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode blocked advancement result: %w", err)
+	}
+	transitioned, err := w.Store.TransitionJobStatePayloadWithEventAtGeneration(ctx, jobID, observed.state, observed.generation, string(workflow.JobBlocked), string(encoded), db.JobEvent{
 		JobID:   jobID,
 		Kind:    "advance_blocked",
 		Message: message,

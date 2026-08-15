@@ -40,6 +40,23 @@ func TestBlockedAdvancePostsBlockedDecision(t *testing.T) {
 	}
 }
 
+func TestBlockedAdvancePersistsBlockedDecision(t *testing.T) {
+	job, _, _ := runNonFastForwardBlockedAdvance(t)
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatalf("daemonJobPayload returned error: %v", err)
+	}
+	if payload.Result == nil {
+		t.Fatal("blocked advancement has no persisted result")
+	}
+	if payload.Result.Decision != string(workflow.JobBlocked) {
+		t.Fatalf("persisted decision = %q, want blocked", payload.Result.Decision)
+	}
+	if payload.Result.Summary != "done" {
+		t.Fatalf("persisted summary = %q, want original model summary retained", payload.Result.Summary)
+	}
+}
+
 func TestRetryBlockedAdvanceSettlesQueriedJobState(t *testing.T) {
 	job, _, events := runRetryBlockedAdvance(t)
 	if job.State != string(workflow.JobBlocked) {

@@ -303,27 +303,64 @@ type daemonImplementationFinalizer struct {
 	FallbackCheckout string
 }
 
-func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
-	if f.Store == nil {
-		return workflow.JobPayload{}, errors.New("implementation finalizer store is required")
+type implementationFinalizationTarget struct {
+	Task         db.Task
+	WorktreePath string
+}
+
+// implementationFinalizationTargetFor resolves the durable task fields required
+// to deliver an implementation. The advance preflight and the finalizer both
+// call this predicate so an early refusal cannot drift from the late backstop.
+func implementationFinalizationTargetFor(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload) (implementationFinalizationTarget, error) {
+	if store == nil {
+		return implementationFinalizationTarget{}, errors.New("implementation finalizer store is required")
 	}
-	if strings.TrimSpace(payload.TaskID) == "" {
-		return payload, blockedResultDelivery("implemented job has no task id; cannot finalize branch and PR")
+	taskID := strings.TrimSpace(payload.TaskID)
+	if taskID == "" {
+		return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
+			"implementation job %s has no task id; cannot deliver a branch or pull request; rerun through `gitmoot task run <task-id> --repo %s --owner %s --branch <branch>` or `gitmoot agent implement %s \"Implement the task.\" --repo %s --task <task-id> --branch <branch>`",
+			job.ID, payload.Repo, job.Agent, job.Agent, payload.Repo,
+		))
 	}
-	task, err := f.Store.GetTask(ctx, payload.TaskID)
+	task, err := store.GetTask(ctx, taskID)
 	if err != nil {
-		return payload, fmt.Errorf("load task %s for implementation finalizer: %w", payload.TaskID, err)
+		return implementationFinalizationTarget{}, fmt.Errorf("load task %s for implementation finalizer: %w", taskID, err)
 	}
 	worktreePath := strings.TrimSpace(task.WorktreePath)
 	if payload.FixWorktree {
 		worktreePath = strings.TrimSpace(payload.WorktreePath)
 	}
 	if worktreePath == "" {
-		return payload, blockedResultDelivery("implemented task has no worktree path; rerun through gitmoot task run or gitmoot agent implement")
+		branch := firstNonEmpty(strings.TrimSpace(task.Branch), strings.TrimSpace(payload.Branch), "<branch>")
+		return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
+			"implementation task %s has no worktree path; cannot deliver a branch or pull request; rerun with `gitmoot task run %s --repo %s --owner %s --branch %s`",
+			task.ID, task.ID, payload.Repo, job.Agent, branch,
+		))
 	}
 	if strings.TrimSpace(task.Branch) == "" {
-		return payload, blockedResultDelivery("implemented task has no branch; cannot push or open PR")
+		branch := firstNonEmpty(strings.TrimSpace(payload.Branch), "<branch>")
+		if payload.PullRequest > 0 {
+			recoveryWorktree := firstNonEmpty(strings.TrimSpace(task.WorktreePath), worktreePath)
+			return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
+				"implementation task %s has no branch; cannot push or open a pull request; inspect or stash local changes, then run `git -C %q fetch origin refs/pull/%d/head` and `git -C %q reset --hard FETCH_HEAD`; retry with `gitmoot agent implement %s \"Address the requested changes.\" --repo %s --task %s --pr %d --branch %s`",
+				task.ID, recoveryWorktree, payload.PullRequest, recoveryWorktree, job.Agent, payload.Repo, task.ID, payload.PullRequest, branch,
+			))
+		}
+		return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
+			"implementation task %s has no branch; cannot push or open a pull request; inspect or stash local changes, then rerun with `gitmoot task run %s --repo %s --owner %s --branch %s`",
+			task.ID, task.ID, payload.Repo, job.Agent, branch,
+		))
 	}
+	return implementationFinalizationTarget{Task: task, WorktreePath: worktreePath}, nil
+}
+
+func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
+	target, err := implementationFinalizationTargetFor(ctx, f.Store, job, payload)
+	if err != nil {
+		return payload, err
+	}
+	task := target.Task
+	worktreePath := target.WorktreePath
 	git := gitutil.Client{Dir: worktreePath}
 	branch, err := git.CurrentBranch(ctx)
 	if err != nil {
