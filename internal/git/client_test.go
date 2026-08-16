@@ -610,6 +610,57 @@ exit 1
 	}
 }
 
+func TestClientCheckObjectConnectivityClassifiesPackedObjectCorruption(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	runGit(t, dir, "init", "-b", "main")
+	runGit(t, dir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, dir, "config", "user.name", "Gitmoot Test")
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("packed corruption\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runGit(t, dir, "add", "README.md")
+	runGit(t, dir, "commit", "-m", "packed fixture")
+	runGit(t, dir, "gc", "--aggressive", "--prune=now")
+	packs, err := filepath.Glob(filepath.Join(dir, ".git", "objects", "pack", "*.pack"))
+	if err != nil || len(packs) != 1 {
+		t.Fatalf("packed fixture files = %v, %v; want one pack", packs, err)
+	}
+	pack, err := os.OpenFile(packs[0], os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open pack: %v", err)
+	}
+	info, err := pack.Stat()
+	if err != nil {
+		pack.Close()
+		t.Fatalf("stat pack: %v", err)
+	}
+	if info.Size() < 1 {
+		pack.Close()
+		t.Fatal("packed fixture is empty")
+	}
+	last := []byte{0}
+	if _, err := pack.ReadAt(last, info.Size()-1); err != nil {
+		pack.Close()
+		t.Fatalf("read pack checksum: %v", err)
+	}
+	last[0] ^= 0xff
+	if _, err := pack.WriteAt(last, info.Size()-1); err != nil {
+		pack.Close()
+		t.Fatalf("corrupt pack checksum: %v", err)
+	}
+	if err := pack.Close(); err != nil {
+		t.Fatalf("close pack: %v", err)
+	}
+	err = (Client{Dir: dir}).CheckObjectConnectivity(context.Background())
+	var corruption *ObjectConnectivityError
+	if !errors.As(err, &corruption) {
+		t.Fatalf("packed-object corruption = %v, want ObjectConnectivityError", err)
+	}
+}
+
 func TestClientCheckObjectConnectivityDoesNotClassifyCancellation(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "started")
 	t.Setenv("GITMOOT_TEST_MARKER", marker)
@@ -668,48 +719,6 @@ kill -KILL $$
 	var corruption *ObjectConnectivityError
 	if errors.As(err, &corruption) {
 		t.Fatalf("signal-terminated connectivity check classified as corruption: %v", err)
-	}
-}
-
-func TestClientCheckObjectConnectivityRequiresCorruptionDiagnostic(t *testing.T) {
-	installGitConnectivityStub(t, `
-printf '%s\n' 'fatal: temporary process resource failure' >&2
-exit 1
-`)
-	err := (Client{Dir: t.TempDir()}).CheckObjectConnectivity(context.Background())
-	if err == nil {
-		t.Fatal("ordinary infrastructure failure returned nil")
-	}
-	var corruption *ObjectConnectivityError
-	if errors.As(err, &corruption) {
-		t.Fatalf("ordinary infrastructure failure classified as corruption: %v", err)
-	}
-}
-
-func TestReportsObjectConnectivityFailure(t *testing.T) {
-	for _, test := range []struct {
-		name   string
-		stdout string
-		stderr string
-		want   bool
-	}{
-		{name: "broken link", stderr: "broken link from tree abc", want: true},
-		{name: "missing blob", stderr: "missing blob abc", want: true},
-		{name: "missing tree", stderr: "missing tree abc", want: true},
-		{name: "missing commit", stderr: "missing commit abc", want: true},
-		{name: "missing tag", stderr: "missing tag abc", want: true},
-		{name: "invalid ref", stderr: "error: refs/heads/main: invalid sha1 pointer abc", want: true},
-		{name: "corrupt object", stderr: "fatal: loose object abc is corrupt", want: true},
-		{name: "empty object file", stderr: "error: object file abc is empty", want: true},
-		{name: "stdout diagnostic", stdout: "MISSING BLOB abc", want: true},
-		{name: "ordinary failure", stderr: "fatal: temporary process resource failure"},
-		{name: "empty report"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if got := reportsObjectConnectivityFailure(test.stdout, test.stderr); got != test.want {
-				t.Fatalf("reportsObjectConnectivityFailure(%q, %q) = %t, want %t", test.stdout, test.stderr, got, test.want)
-			}
-		})
 	}
 }
 

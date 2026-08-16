@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -150,6 +151,22 @@ func TestAdvanceImplementationPreflightFailsCorruptObjectGraphPermanently(t *tes
 	}
 }
 
+func TestAdvanceImplementationPreflightKeepsSignalTerminatedFSCKRetryable(t *testing.T) {
+	result := runAdvanceImplementationPreflightFixture(t, "signal-fsck")
+	if result.runErr == nil || !strings.Contains(result.runErr.Error(), "signal: killed") {
+		t.Fatalf("signal-terminated fsck error = %v, want retryable signal error", result.runErr)
+	}
+	if result.adapterCalls != 0 {
+		t.Fatalf("adapter calls = %d, want zero after fsck infrastructure failure", result.adapterCalls)
+	}
+	if result.jobState != string(workflow.JobQueued) {
+		t.Fatalf("signal-terminated fsck state=%s, want queued for retry", result.jobState)
+	}
+	if result.failureMessage != "" || result.message != "" {
+		t.Fatalf("signal-terminated fsck settled terminally: failed=%q blocked=%q", result.failureMessage, result.message)
+	}
+}
+
 func TestAdvanceImplementationPreflightRejectsMissingHeadBeforeModel(t *testing.T) {
 	result := runAdvanceImplementationPreflightFixture(t, "missing-head")
 	for _, want := range []string{
@@ -255,6 +272,9 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 			t.Fatalf("remove reachable blob object %s: %v", objectPath, err)
 		}
 		expectedHead = strings.Repeat("f", 40)
+	case "signal-fsck":
+		expectedHead = strings.Repeat("f", 40)
+		installSignalKillingGitStub(t)
 	case "missing-head":
 		runDaemonWorkerGit(t, registered, "commit", "--allow-empty", "-m", "advance branch without head evidence")
 		runDaemonWorkerGit(t, registered, "push", "origin", branch)
@@ -323,8 +343,11 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 	} else {
 		runErr = worker.run(ctx, job)
 	}
-	if runErr != nil {
+	if runErr != nil && mode != "signal-fsck" {
 		t.Fatalf("worker.run returned error: %v", runErr)
+	}
+	if runErr == nil && mode == "signal-fsck" {
+		t.Fatal("signal-terminated fsck returned nil")
 	}
 	after, err := store.GetJob(ctx, job.ID)
 	if err != nil {
@@ -344,6 +367,13 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 		}
 		if healthyAdapter.calls != 1 {
 			t.Fatalf("healthy adapter calls = %d, want one in same scheduler pass", healthyAdapter.calls)
+		}
+	} else if mode == "signal-fsck" {
+		if adapter.calls != 0 {
+			t.Fatalf("adapter calls = %d, want zero for retryable fsck failure", adapter.calls)
+		}
+		if after.State != string(workflow.JobQueued) {
+			t.Fatalf("job state = %q, want queued for retryable fsck failure", after.State)
 		}
 	} else if wantBlocked {
 		if adapter.calls != 0 {
@@ -419,6 +449,27 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 		runErr: runErr, failureMessage: failureMessage, healthyState: healthyState,
 		healthyCalls: healthyAdapter.calls, secondPassErr: secondPassErr,
 	}
+}
+
+func installSignalKillingGitStub(t *testing.T) {
+	t.Helper()
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("resolve real git: %v", err)
+	}
+	binDir := t.TempDir()
+	stub := filepath.Join(binDir, "git")
+	script := `#!/bin/sh
+if [ "$1" = "fsck" ]; then
+  kill -KILL $$
+fi
+exec "$GITMOOT_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatalf("write signal-killing git stub: %v", err)
+	}
+	t.Setenv("GITMOOT_REAL_GIT", realGit)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
 func enqueueAdvanceCreatedHeadlessFixJob(t *testing.T, store *db.Store, jobID, branch, fixWorktree string) {
