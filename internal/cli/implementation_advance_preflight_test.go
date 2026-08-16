@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
@@ -136,6 +137,15 @@ func TestAdvanceImplementationPreflightBoundsPersistentErrorsAcrossTicks(t *test
 		if got := result.attempts[tick]; got != tick+1 {
 			t.Fatalf("tick %d durable attempts = %d, want %d", tick+1, got, tick+1)
 		}
+		if tick < 2 {
+			retryAt, err := time.Parse(time.RFC3339Nano, result.retryAts[tick])
+			if err != nil {
+				t.Fatalf("tick %d retry time %q: %v", tick+1, result.retryAts[tick], err)
+			}
+			if !retryAt.After(result.tickStarted[tick]) {
+				t.Fatalf("tick %d retry time %s is not after scheduler start %s", tick+1, retryAt, result.tickStarted[tick])
+			}
+		}
 	}
 	for _, want := range []string{
 		"implementation preflight retry bound exhausted after 3 attempts",
@@ -151,6 +161,88 @@ func TestAdvanceImplementationPreflightBoundsPersistentErrorsAcrossTicks(t *test
 	}
 	if result.healthyState != string(workflow.JobSucceeded) || result.healthyCalls != 1 {
 		t.Fatalf("healthy sibling state=%s calls=%d, want succeeded once in the first batch", result.healthyState, result.healthyCalls)
+	}
+}
+
+func TestImplementationPreflightRetrySharesLifetimeBoundAcrossBlockerClasses(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	raw := `{"repo":"owner/repo","task_id":"task-1514","worktree_path":"/tmp/fix","pull_request":1514}`
+	if err := store.CreateJob(ctx, db.Job{ID: "alternating-blockers", Agent: "lead", Type: "implement", State: string(workflow.JobQueued), Payload: raw}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	worker := defaultJobWorker(store, io.Discard)
+	job, payload, err := daemonWorkerJobPayload(ctx, store, "alternating-blockers")
+	if err != nil {
+		t.Fatalf("load initial job: %v", err)
+	}
+	if err := worker.retryImplementationPreflight(ctx, job, payload, errors.New("preflight one")); err != nil {
+		t.Fatalf("first preflight retry: %v", err)
+	}
+	job, payload, err = daemonWorkerJobPayload(ctx, store, job.ID)
+	if err != nil {
+		t.Fatalf("load after first preflight: %v", err)
+	}
+	if payload.BlockerAttempts != 1 {
+		t.Fatalf("first preflight attempts = %d, want 1", payload.BlockerAttempts)
+	}
+	transitioned, err := store.TransitionJobState(ctx, job.ID, string(workflow.JobQueued), string(workflow.JobRunning))
+	if err != nil || !transitioned {
+		t.Fatalf("queue job for operational blocker: transitioned=%t err=%v", transitioned, err)
+	}
+	deferred, err := worker.deferOperationalBlockerPreTerminal(ctx, job.ID, workflow.DeliveryError{Err: errors.New("rate limit reached; try again in 30 seconds")})
+	if err != nil || !deferred {
+		t.Fatalf("operational blocker: deferred=%t err=%v", deferred, err)
+	}
+	job, payload, err = daemonWorkerJobPayload(ctx, store, job.ID)
+	if err != nil {
+		t.Fatalf("load after operational blocker: %v", err)
+	}
+	if payload.BlockerAttempts != 2 || payload.BlockerClass != string(blockerClassRuntimeQuota) {
+		t.Fatalf("operational blocker = class %q attempts %d, want runtime_quota/2", payload.BlockerClass, payload.BlockerAttempts)
+	}
+	if err := worker.retryImplementationPreflight(ctx, job, payload, errors.New("preflight two")); err != nil {
+		t.Fatalf("second preflight retry: %v", err)
+	}
+	job, payload, err = daemonWorkerJobPayload(ctx, store, job.ID)
+	if err != nil {
+		t.Fatalf("load after exhausted preflight: %v", err)
+	}
+	if payload.BlockerAttempts != 3 || job.State != string(workflow.JobFailed) {
+		t.Fatalf("final preflight = attempts %d state %s, want 3/failed", payload.BlockerAttempts, job.State)
+	}
+}
+
+func TestImplementationPreflightRetryPreservesUnknownAndLegacyPayloadFields(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	raw := `{"repo":"owner/repo","task_id":"task-1514","worktree_path":"/tmp/fix","pull_request":1514,"future_evidence":{"proof":true},"preset_id":"legacy-preset"}`
+	if err := store.CreateJob(ctx, db.Job{ID: "preflight-envelope", Agent: "lead", Type: "implement", State: string(workflow.JobQueued), Payload: raw}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	worker := defaultJobWorker(store, io.Discard)
+	job, payload, err := daemonWorkerJobPayload(ctx, store, "preflight-envelope")
+	if err != nil {
+		t.Fatalf("load initial job: %v", err)
+	}
+	if err := worker.retryImplementationPreflight(ctx, job, payload, errors.New("temporary git failure")); err != nil {
+		t.Fatalf("retryImplementationPreflight returned error: %v", err)
+	}
+	after, err := store.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(after.Payload), &envelope); err != nil {
+		t.Fatalf("unmarshal stored payload: %v", err)
+	}
+	for key, want := range map[string]string{
+		"future_evidence": `{"proof":true}`,
+		"preset_id":       `"legacy-preset"`,
+	} {
+		if got := string(envelope[key]); got != want {
+			t.Fatalf("stored %s = %s, want %s", key, got, want)
+		}
 	}
 }
 
@@ -232,6 +324,8 @@ type advanceImplementationPreflightResult struct {
 	healthyCalls   int
 	tickErrors     []error
 	attempts       []int
+	retryAts       []string
+	tickStarted    []time.Time
 }
 
 func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advanceImplementationPreflightResult {
@@ -339,6 +433,7 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 		return adapter, nil
 	}
 	worker.WorkflowFactory = func(string) workflow.Engine { return workflow.Engine{Store: store} }
+	worker.UsePool = mode == "persistent-preflight-error"
 	job, err := store.GetJob(ctx, jobID)
 	if err != nil {
 		t.Fatalf("GetJob before run: %v", err)
@@ -346,12 +441,15 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 	var runErr error
 	var tickErrors []error
 	var attempts []int
+	var retryAts []string
+	var tickStarted []time.Time
 	if mode == "persistent-preflight-error" || mode == "transient-preflight-error" {
 		ticks := 3
 		if mode == "transient-preflight-error" {
 			ticks = 2
 		}
 		for tick := 0; tick < ticks; tick++ {
+			tickStarted = append(tickStarted, time.Now().UTC())
 			tickErrors = append(tickErrors, runQueuedJobsForRepo(ctx, worker, 1, "", ""))
 			observed, err := store.GetJob(ctx, jobID)
 			if err != nil {
@@ -362,6 +460,7 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 				t.Fatalf("daemonJobPayload after tick %d: %v", tick+1, err)
 			}
 			attempts = append(attempts, observedPayload.BlockerAttempts)
+			retryAts = append(retryAts, observedPayload.BlockerRetryAt)
 			if tick == 0 && mode == "transient-preflight-error" {
 				restorePreflightFixture()
 			}
@@ -467,6 +566,7 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 		adapterCalls: adapter.calls, jobState: after.State, remedyCleared: remedyCleared,
 		runErr: runErr, failureMessage: failureMessage, healthyState: healthyState,
 		healthyCalls: healthyAdapter.calls, tickErrors: tickErrors, attempts: attempts,
+		retryAts: retryAts, tickStarted: tickStarted,
 	}
 }
 

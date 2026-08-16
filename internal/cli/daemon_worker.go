@@ -779,10 +779,7 @@ const implementationPreflightRetryDelay = time.Second
 
 func (w jobWorker) retryImplementationPreflight(ctx context.Context, job db.Job, payload workflow.JobPayload, cause error) error {
 	const class = "implementation_preflight"
-	attempt := 1
-	if payload.BlockerClass == class {
-		attempt = payload.BlockerAttempts + 1
-	}
+	attempt := payload.BlockerAttempts + 1
 	payload.BlockerClass = class
 	payload.BlockerAttempts = attempt
 	payload.BlockerPreDelivery = true
@@ -791,7 +788,7 @@ func (w jobWorker) retryImplementationPreflight(ctx context.Context, job db.Job,
 	if attempt < implementationPreflightAttemptLimit {
 		payload.BlockerRetryAt = time.Now().UTC().Add(implementationPreflightRetryDelay).Format(time.RFC3339Nano)
 	}
-	encoded, err := json.Marshal(payload)
+	encoded, err := payloadWithImplementationPreflightRetry(job.Payload, payload)
 	if err != nil {
 		return err
 	}
@@ -800,7 +797,7 @@ func (w jobWorker) retryImplementationPreflight(ctx context.Context, job db.Job,
 	if attempt >= implementationPreflightAttemptLimit {
 		kind = blockerExhaustedEventKind
 	}
-	transitioned, err := w.Store.TransitionJobStatePayloadWithEventAtGeneration(ctx, job.ID, string(workflow.JobQueued), job.LifecycleGeneration, string(workflow.JobQueued), string(encoded), db.JobEvent{JobID: job.ID, Kind: kind, Message: message})
+	transitioned, err := w.Store.TransitionJobStatePayloadWithEventAtGeneration(ctx, job.ID, string(workflow.JobQueued), job.LifecycleGeneration, string(workflow.JobQueued), encoded, db.JobEvent{JobID: job.ID, Kind: kind, Message: message})
 	if err != nil || !transitioned {
 		return err
 	}
@@ -814,6 +811,42 @@ func (w jobWorker) retryImplementationPreflight(ctx context.Context, job db.Job,
 	}
 	_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, strings.TrimSpace(payload.WorktreePath), exhausted)
 	return nil
+}
+
+// payloadWithImplementationPreflightRetry updates only the retry fields this
+// preflight owns; the stored payload may contain newer or legacy evidence.
+func payloadWithImplementationPreflightRetry(raw string, payload workflow.JobPayload) (string, error) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
+		return "", err
+	}
+	owned := map[string]any{
+		"blocker_class":        payload.BlockerClass,
+		"blocker_attempts":     payload.BlockerAttempts,
+		"blocker_pre_delivery": payload.BlockerPreDelivery,
+	}
+	for key, value := range owned {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return "", err
+		}
+		envelope[key] = encoded
+	}
+	if payload.BlockerRetryAt == "" {
+		delete(envelope, "blocker_retry_at")
+	} else {
+		encoded, err := json.Marshal(payload.BlockerRetryAt)
+		if err != nil {
+			return "", err
+		}
+		envelope["blocker_retry_at"] = encoded
+	}
+	delete(envelope, "blocker_suggested_action")
+	encoded, err := json.Marshal(envelope)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
 }
 
 func (w jobWorker) runtimeContractPreflight(ctx context.Context, agent runtime.Agent, request runtime.RuntimeContractRequest) (runtime.RuntimeContractResult, bool) {
