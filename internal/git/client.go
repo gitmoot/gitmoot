@@ -20,16 +20,6 @@ type Client struct {
 
 const maxGitErrorStderrRunes = 4096
 
-// ObjectConnectivityError means git fsck exited normally and reported a broken
-// reachable object graph. Process-launch failures, cancellation, and signals
-// are deliberately not classified as corruption.
-type ObjectConnectivityError struct {
-	Err error
-}
-
-func (e *ObjectConnectivityError) Error() string { return e.Err.Error() }
-func (e *ObjectConnectivityError) Unwrap() error { return e.Err }
-
 func (c Client) CreateBranch(ctx context.Context, branch string, base string) error {
 	if err := validateBranch(branch); err != nil {
 		return err
@@ -576,27 +566,6 @@ func (c Client) CommitExists(ctx context.Context, rev string) (bool, error) {
 		return false, nil
 	}
 	return false, err
-}
-
-// CheckObjectConnectivity verifies that every object reachable from a local ref
-// is present. It is intentionally read-only and distinguishes a healthy clone
-// missing an unreferenced dispatch commit from a damaged repository graph.
-func (c Client) CheckObjectConnectivity(ctx context.Context) error {
-	_, err := c.run(ctx, "fsck", "--connectivity-only")
-	if err == nil {
-		return nil
-	}
-	if ctx.Err() != nil {
-		return err
-	}
-	var exitErr *exec.ExitError
-	// This is a fixed, valid fsck invocation. A normal nonzero exit is Git's
-	// integrity result; its human-readable diagnostics vary by object storage,
-	// Git version, and locale and are not a stable classification boundary.
-	if errors.As(err, &exitErr) && exitErr.ProcessState != nil && exitErr.ProcessState.Exited() {
-		return &ObjectConnectivityError{Err: err}
-	}
-	return err
 }
 
 // IsAncestor reports whether ancestor is reachable from descendant. Git uses

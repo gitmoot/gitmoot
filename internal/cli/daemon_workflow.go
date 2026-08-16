@@ -398,9 +398,6 @@ func implementationFinalizationTargetFor(ctx context.Context, store *db.Store, j
 			return implementationFinalizationTarget{}, fmt.Errorf("inspect implementation dispatch head %s: %w", expectedHead, err)
 		}
 		if !dispatchHeadPresent {
-			if err := git.CheckObjectConnectivity(ctx); err != nil {
-				return implementationFinalizationTarget{}, fmt.Errorf("verify implementation worktree object connectivity: %w", err)
-			}
 			return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
 				"implementation task %s worktree %q is missing dispatch head object %s locally; this preflight cannot verify that object against origin without remote I/O and will not guess a fetch/reset remedy; dispatch a new fix job against pull request #%d's current head",
 				task.ID, worktreePath, expectedHead, payload.PullRequest,

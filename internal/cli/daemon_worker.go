@@ -19,7 +19,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
-	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/permissionpolicy"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
@@ -189,16 +188,8 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if job.Type == "implement" && payload.FixWorktree {
 		if _, err := implementationFinalizationTargetFor(ctx, w.Store, job, payload, implementationFinalizationBeforeRun); err != nil {
 			err = fmt.Errorf("validate implementation target before model run: %w", err)
-			var corruption *gitutil.ObjectConnectivityError
-			if errors.As(err, &corruption) {
-				if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
-					return finishErr
-				}
-				_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, strings.TrimSpace(payload.WorktreePath), err)
-				return nil
-			}
 			if !resultDeliveryFailed(err) {
-				return err
+				return w.retryImplementationPreflight(ctx, job, payload, err)
 			}
 			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, err); finishErr != nil {
 				return finishErr
@@ -780,6 +771,48 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	_ = w.postJobResultComment(ctx, job.ID, agent, checkout, nil)
 	writeLine(w.Stdout, "job %s completed", job.ID)
+	return nil
+}
+
+const implementationPreflightAttemptLimit = 3
+const implementationPreflightRetryDelay = time.Second
+
+func (w jobWorker) retryImplementationPreflight(ctx context.Context, job db.Job, payload workflow.JobPayload, cause error) error {
+	const class = "implementation_preflight"
+	attempt := 1
+	if payload.BlockerClass == class {
+		attempt = payload.BlockerAttempts + 1
+	}
+	payload.BlockerClass = class
+	payload.BlockerAttempts = attempt
+	payload.BlockerPreDelivery = true
+	payload.BlockerRetryAt = ""
+	payload.BlockerSuggestedAction = ""
+	if attempt < implementationPreflightAttemptLimit {
+		payload.BlockerRetryAt = time.Now().UTC().Add(implementationPreflightRetryDelay).Format(time.RFC3339Nano)
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	message := fmt.Sprintf("implementation preflight attempt %d/%d failed: %v", attempt, implementationPreflightAttemptLimit, cause)
+	kind := blockerDeferredEventKind
+	if attempt >= implementationPreflightAttemptLimit {
+		kind = blockerExhaustedEventKind
+	}
+	transitioned, err := w.Store.TransitionJobStatePayloadWithEventAtGeneration(ctx, job.ID, string(workflow.JobQueued), job.LifecycleGeneration, string(workflow.JobQueued), string(encoded), db.JobEvent{JobID: job.ID, Kind: kind, Message: message})
+	if err != nil || !transitioned {
+		return err
+	}
+	if attempt < implementationPreflightAttemptLimit {
+		emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, job.ID, events.EventJobDeferred, string(workflow.JobQueued), message)
+		return nil
+	}
+	exhausted := fmt.Errorf("implementation preflight retry bound exhausted after %d attempts for task %s in worktree %q: %w; no in-place recovery is available; dispatch a fresh fix job against pull request #%d's current head", implementationPreflightAttemptLimit, payload.TaskID, payload.WorktreePath, cause, payload.PullRequest)
+	if err := w.finishQueuedJob(ctx, job, workflow.JobFailed, exhausted); err != nil {
+		return err
+	}
+	_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, strings.TrimSpace(payload.WorktreePath), exhausted)
 	return nil
 }
 

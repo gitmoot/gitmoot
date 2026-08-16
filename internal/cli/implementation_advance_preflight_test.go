@@ -124,46 +124,49 @@ func TestAdvanceImplementationPreflightCannotVerifyMissingDispatchObjectRemotely
 	}
 }
 
-func TestAdvanceImplementationPreflightFailsCorruptObjectGraphPermanently(t *testing.T) {
-	result := runAdvanceImplementationPreflightFixture(t, "corrupt-object")
-	if result.runErr != nil {
-		t.Fatalf("corrupt object graph aborted scheduler: %v", result.runErr)
+func TestAdvanceImplementationPreflightBoundsPersistentErrorsAcrossTicks(t *testing.T) {
+	result := runAdvanceImplementationPreflightFixture(t, "persistent-preflight-error")
+	if len(result.tickErrors) != 3 {
+		t.Fatalf("tick count = %d, want 3", len(result.tickErrors))
 	}
-	for _, want := range []string{"validate implementation target before model run", "verify implementation worktree object connectivity", "git fsck --connectivity-only"} {
-		if !strings.Contains(result.failureMessage, want) {
-			t.Fatalf("terminal corruption error missing %q: %s", want, result.failureMessage)
+	for tick, err := range result.tickErrors {
+		if err != nil {
+			t.Fatalf("tick %d aborted batch: %v", tick+1, err)
+		}
+		if got := result.attempts[tick]; got != tick+1 {
+			t.Fatalf("tick %d durable attempts = %d, want %d", tick+1, got, tick+1)
 		}
 	}
-	if result.adapterCalls != 0 {
-		t.Fatalf("adapter calls = %d, want zero for corrupt repository", result.adapterCalls)
+	for _, want := range []string{
+		"implementation preflight retry bound exhausted after 3 attempts",
+		"task task-1514", result.fixWorktree, "compare implementation worktree HEAD",
+		"no in-place recovery is available", "dispatch a fresh fix job against pull request #1514's current head",
+	} {
+		if !strings.Contains(result.failureMessage, want) {
+			t.Fatalf("exhaustion message missing %q: %s", want, result.failureMessage)
+		}
 	}
-	if result.jobState != string(workflow.JobFailed) {
-		t.Fatalf("corrupt repository state=%s, want failed so it cannot requeue", result.jobState)
+	if result.adapterCalls != 0 || result.jobState != string(workflow.JobFailed) {
+		t.Fatalf("persistent preflight error calls=%d state=%s, want zero and failed", result.adapterCalls, result.jobState)
 	}
 	if result.healthyState != string(workflow.JobSucceeded) || result.healthyCalls != 1 {
-		t.Fatalf("healthy job state=%s calls=%d, want succeeded with one call in the same batch", result.healthyState, result.healthyCalls)
-	}
-	if result.secondPassErr != nil || result.healthyCalls != 1 || result.adapterCalls != 0 {
-		t.Fatalf("second pass err=%v corrupt calls=%d healthy calls=%d, want no re-selection", result.secondPassErr, result.adapterCalls, result.healthyCalls)
-	}
-	if result.message != "" {
-		t.Fatalf("corrupt repository emitted operator recovery message %q", result.message)
+		t.Fatalf("healthy sibling state=%s calls=%d, want succeeded once in the first batch", result.healthyState, result.healthyCalls)
 	}
 }
 
-func TestAdvanceImplementationPreflightKeepsSignalTerminatedFSCKRetryable(t *testing.T) {
-	result := runAdvanceImplementationPreflightFixture(t, "signal-fsck")
-	if result.runErr == nil || !strings.Contains(result.runErr.Error(), "signal: killed") {
-		t.Fatalf("signal-terminated fsck error = %v, want retryable signal error", result.runErr)
+func TestAdvanceImplementationPreflightRetriesTransientErrorThenProceeds(t *testing.T) {
+	result := runAdvanceImplementationPreflightFixture(t, "transient-preflight-error")
+	if len(result.tickErrors) != 2 || result.tickErrors[0] != nil || result.tickErrors[1] != nil {
+		t.Fatalf("tick errors = %v, want two non-aborting ticks", result.tickErrors)
 	}
-	if result.adapterCalls != 0 {
-		t.Fatalf("adapter calls = %d, want zero after fsck infrastructure failure", result.adapterCalls)
+	if len(result.attempts) != 2 || result.attempts[0] != 1 || result.attempts[1] != 1 {
+		t.Fatalf("durable attempts = %v, want [1 1] after recovery (state=%s blocked=%q failed=%q)", result.attempts, result.jobState, result.message, result.failureMessage)
 	}
-	if result.jobState != string(workflow.JobQueued) {
-		t.Fatalf("signal-terminated fsck state=%s, want queued for retry", result.jobState)
+	if result.adapterCalls != 1 {
+		t.Fatalf("adapter calls = %d, want one after transient preflight error cleared (state=%s attempts=%v failure=%q ticks=%v)", result.adapterCalls, result.jobState, result.attempts, result.failureMessage, result.tickErrors)
 	}
-	if result.failureMessage != "" || result.message != "" {
-		t.Fatalf("signal-terminated fsck settled terminally: failed=%q blocked=%q", result.failureMessage, result.message)
+	if result.healthyState != string(workflow.JobSucceeded) || result.healthyCalls != 1 {
+		t.Fatalf("healthy sibling state=%s calls=%d, want succeeded once while peer retried", result.healthyState, result.healthyCalls)
 	}
 }
 
@@ -227,7 +230,8 @@ type advanceImplementationPreflightResult struct {
 	failureMessage string
 	healthyState   string
 	healthyCalls   int
-	secondPassErr  error
+	tickErrors     []error
+	attempts       []int
 }
 
 func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advanceImplementationPreflightResult {
@@ -247,6 +251,8 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 	runDaemonWorkerGit(t, filepath.Dir(fixWorktree), "clone", "--branch", branch, remote, fixWorktree)
 	configureTestGit(t, fixWorktree)
 	expectedHead := oldHead
+	currentHead := ""
+	var restorePreflightFixture func()
 	wantBlocked := true
 	switch mode {
 	case "stale":
@@ -265,16 +271,16 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 		expectedHead = strings.TrimSpace(runGitOutput(t, registered, "rev-parse", "HEAD"))
 		runDaemonWorkerGit(t, fixWorktree, "fetch", "origin", branch)
 		runDaemonWorkerGit(t, fixWorktree, "commit", "--allow-empty", "-m", "divergent local fix")
-	case "corrupt-object":
-		blob := strings.TrimSpace(runGitOutput(t, fixWorktree, "rev-parse", "HEAD:README.md"))
-		objectPath := filepath.Join(fixWorktree, ".git", "objects", blob[:2], blob[2:])
-		if err := os.Remove(objectPath); err != nil {
-			t.Fatalf("remove reachable blob object %s: %v", objectPath, err)
+	case "persistent-preflight-error":
+		currentHead = oldHead
+		restorePreflightFixture = breakGitBranchTip(t, fixWorktree, branch)
+	case "transient-preflight-error":
+		if os.Geteuid() == 0 {
+			currentHead = oldHead
+			restorePreflightFixture = breakGitBranchTip(t, fixWorktree, branch)
+		} else {
+			currentHead, restorePreflightFixture = makePackedCurrentCommitInaccessible(t, fixWorktree, oldHead)
 		}
-		expectedHead = strings.Repeat("f", 40)
-	case "signal-fsck":
-		expectedHead = strings.Repeat("f", 40)
-		installSignalKillingGitStub(t)
 	case "missing-head":
 		runDaemonWorkerGit(t, registered, "commit", "--allow-empty", "-m", "advance branch without head evidence")
 		runDaemonWorkerGit(t, registered, "push", "origin", branch)
@@ -289,7 +295,9 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 	default:
 		t.Fatalf("unknown fixture mode %q", mode)
 	}
-	currentHead := strings.TrimSpace(runGitOutput(t, fixWorktree, "rev-parse", "HEAD"))
+	if currentHead == "" {
+		currentHead = strings.TrimSpace(runGitOutput(t, fixWorktree, "rev-parse", "HEAD"))
+	}
 	seedDaemonWorkerRepo(t, store, "owner/repo", registered)
 	seedDaemonWorkerAgent(t, store, "lead", runtime.ShellRuntime, "unused", []string{"implement"}, "owner/repo")
 	if err := store.UpsertTask(ctx, db.Task{
@@ -311,10 +319,10 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 			WorktreePath: fixWorktree, FixWorktree: true,
 		})
 	}
-	if mode == "corrupt-object" {
+	if mode == "persistent-preflight-error" || mode == "transient-preflight-error" {
 		seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
 		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
-			ID: "z-healthy-after-corruption", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main",
+			ID: "z-healthy-after-preflight-error", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main",
 		})
 	}
 	beforeRemote := strings.TrimSpace(runGitOutput(t, registered, "ls-remote", "origin", "refs/heads/"+branch))
@@ -336,46 +344,57 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 		t.Fatalf("GetJob before run: %v", err)
 	}
 	var runErr error
-	var secondPassErr error
-	if mode == "corrupt-object" {
-		runErr = runQueuedJobsForRepo(ctx, worker, 1, "", "")
-		secondPassErr = runQueuedJobsForRepo(ctx, worker, 1, "", "")
+	var tickErrors []error
+	var attempts []int
+	if mode == "persistent-preflight-error" || mode == "transient-preflight-error" {
+		ticks := 3
+		if mode == "transient-preflight-error" {
+			ticks = 2
+		}
+		for tick := 0; tick < ticks; tick++ {
+			tickErrors = append(tickErrors, runQueuedJobsForRepo(ctx, worker, 1, "", ""))
+			observed, err := store.GetJob(ctx, jobID)
+			if err != nil {
+				t.Fatalf("GetJob after tick %d: %v", tick+1, err)
+			}
+			observedPayload, err := daemonJobPayload(observed)
+			if err != nil {
+				t.Fatalf("daemonJobPayload after tick %d: %v", tick+1, err)
+			}
+			attempts = append(attempts, observedPayload.BlockerAttempts)
+			if tick == 0 && mode == "transient-preflight-error" {
+				restorePreflightFixture()
+			}
+			if observed.State == string(workflow.JobQueued) {
+				expireImplementationPreflightHold(t, store, observed)
+			}
+		}
 	} else {
 		runErr = worker.run(ctx, job)
-	}
-	if runErr != nil && mode != "signal-fsck" {
-		t.Fatalf("worker.run returned error: %v", runErr)
-	}
-	if runErr == nil && mode == "signal-fsck" {
-		t.Fatal("signal-terminated fsck returned nil")
+		if runErr != nil {
+			t.Fatalf("worker.run returned error: %v", runErr)
+		}
 	}
 	after, err := store.GetJob(ctx, job.ID)
 	if err != nil {
 		t.Fatalf("GetJob after run: %v", err)
 	}
 	healthyState := ""
-	if mode == "corrupt-object" {
-		healthy, err := store.GetJob(ctx, "z-healthy-after-corruption")
+	if mode == "persistent-preflight-error" || mode == "transient-preflight-error" {
+		healthy, err := store.GetJob(ctx, "z-healthy-after-preflight-error")
 		if err != nil {
-			t.Fatalf("GetJob(z-healthy-after-corruption): %v", err)
+			t.Fatalf("GetJob(z-healthy-after-preflight-error): %v", err)
 		}
 		healthyState = healthy.State
 	}
-	if mode == "corrupt-object" {
+	if mode == "persistent-preflight-error" {
 		if adapter.calls != 0 {
 			t.Fatalf("adapter calls = %d, want zero for infrastructure refusal", adapter.calls)
 		}
 		if healthyAdapter.calls != 1 {
 			t.Fatalf("healthy adapter calls = %d, want one in same scheduler pass", healthyAdapter.calls)
 		}
-	} else if mode == "signal-fsck" {
-		if adapter.calls != 0 {
-			t.Fatalf("adapter calls = %d, want zero for retryable fsck failure", adapter.calls)
-		}
-		if after.State != string(workflow.JobQueued) {
-			t.Fatalf("job state = %q, want queued for retryable fsck failure", after.State)
-		}
-	} else if wantBlocked {
+	} else if wantBlocked && mode != "transient-preflight-error" {
 		if adapter.calls != 0 {
 			t.Fatalf("adapter calls = %d, want zero: checkout preflight must run before the model", adapter.calls)
 		}
@@ -389,7 +408,7 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 		if payload.Result != nil {
 			t.Fatalf("preflight-blocked payload result = %+v, want nil", payload.Result)
 		}
-	} else if adapter.calls != 1 {
+	} else if mode != "transient-preflight-error" && adapter.calls != 1 {
 		t.Fatalf("adapter calls = %d, want one: checkout includes the dispatch head", adapter.calls)
 	}
 	if got := strings.TrimSpace(runGitOutput(t, registered, "ls-remote", "origin", "refs/heads/"+branch)); got != beforeRemote {
@@ -447,29 +466,115 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 		message: message, currentHead: currentHead, expectedHead: expectedHead, fixWorktree: fixWorktree,
 		adapterCalls: adapter.calls, jobState: after.State, remedyCleared: remedyCleared,
 		runErr: runErr, failureMessage: failureMessage, healthyState: healthyState,
-		healthyCalls: healthyAdapter.calls, secondPassErr: secondPassErr,
+		healthyCalls: healthyAdapter.calls, tickErrors: tickErrors, attempts: attempts,
 	}
 }
 
-func installSignalKillingGitStub(t *testing.T) {
+func breakGitBranchTip(t *testing.T, worktree, branch string) func() {
 	t.Helper()
-	realGit, err := exec.LookPath("git")
+	refPath := filepath.Join(worktree, ".git", "refs", "heads", filepath.FromSlash(branch))
+	original, err := os.ReadFile(refPath)
 	if err != nil {
-		t.Fatalf("resolve real git: %v", err)
+		t.Fatalf("read branch tip: %v", err)
 	}
-	binDir := t.TempDir()
-	stub := filepath.Join(binDir, "git")
-	script := `#!/bin/sh
-if [ "$1" = "fsck" ]; then
-  kill -KILL $$
-fi
-exec "$GITMOOT_REAL_GIT" "$@"
-`
-	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
-		t.Fatalf("write signal-killing git stub: %v", err)
+	info, err := os.Stat(refPath)
+	if err != nil {
+		t.Fatalf("stat branch tip: %v", err)
 	}
-	t.Setenv("GITMOOT_REAL_GIT", realGit)
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if err := os.WriteFile(refPath, []byte(strings.Repeat("f", 40)+"\n"), info.Mode().Perm()); err != nil {
+		t.Fatalf("install broken branch tip: %v", err)
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		if err := os.WriteFile(refPath, original, info.Mode().Perm()); err != nil {
+			t.Fatalf("restore branch tip: %v", err)
+		}
+	}
+	t.Cleanup(restore)
+	return restore
+}
+
+func makePackedCurrentCommitInaccessible(t *testing.T, worktree, dispatchHead string) (string, func()) {
+	t.Helper()
+	cmd := exec.Command("git", "cat-file", "commit", dispatchHead)
+	cmd.Dir = worktree
+	commit, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("read dispatch commit before packing: %v", err)
+	}
+	runDaemonWorkerGit(t, worktree, "commit", "--allow-empty", "-m", "packed current head")
+	currentHead := strings.TrimSpace(runGitOutput(t, worktree, "rev-parse", "HEAD"))
+	runDaemonWorkerGit(t, worktree, "gc", "--aggressive", "--prune=now")
+	packDir := filepath.Join(worktree, ".git", "objects", "pack")
+	savedPackDir := packDir + ".preflight-fixture"
+	if err := os.Rename(packDir, savedPackDir); err != nil {
+		t.Fatalf("hide packed objects while rehydrating dispatch commit: %v", err)
+	}
+	if err := os.Mkdir(packDir, 0o755); err != nil {
+		t.Fatalf("create temporary pack directory: %v", err)
+	}
+	commitFile := filepath.Join(t.TempDir(), "dispatch.commit")
+	if err := os.WriteFile(commitFile, commit, 0o644); err != nil {
+		t.Fatalf("write dispatch commit fixture: %v", err)
+	}
+	if got := strings.TrimSpace(runGitOutput(t, worktree, "hash-object", "-t", "commit", "-w", commitFile)); got != dispatchHead {
+		t.Fatalf("rehydrated dispatch commit = %s, want %s", got, dispatchHead)
+	}
+	if err := os.Remove(packDir); err != nil {
+		t.Fatalf("remove temporary pack directory: %v", err)
+	}
+	if err := os.Rename(savedPackDir, packDir); err != nil {
+		t.Fatalf("restore packed objects: %v", err)
+	}
+	packs, err := filepath.Glob(filepath.Join(packDir, "*.pack"))
+	if err != nil || len(packs) == 0 {
+		t.Fatalf("packed current-head fixture = %v, %v", packs, err)
+	}
+	modes := make([]os.FileMode, len(packs))
+	for i, pack := range packs {
+		info, err := os.Stat(pack)
+		if err != nil {
+			t.Fatalf("stat pack %s: %v", pack, err)
+		}
+		modes[i] = info.Mode().Perm()
+		if err := os.Chmod(pack, 0); err != nil {
+			t.Fatalf("make pack inaccessible: %v", err)
+		}
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		for i, pack := range packs {
+			if err := os.Chmod(pack, modes[i]); err != nil {
+				t.Fatalf("restore pack access: %v", err)
+			}
+		}
+	}
+	t.Cleanup(restore)
+	return currentHead, restore
+}
+
+func expireImplementationPreflightHold(t *testing.T, store *db.Store, job db.Job) {
+	t.Helper()
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatalf("daemonJobPayload before next simulated tick: %v", err)
+	}
+	payload.BlockerRetryAt = "2000-01-01T00:00:00Z"
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload before next simulated tick: %v", err)
+	}
+	if err := store.UpdateJobPayload(context.Background(), job.ID, string(encoded)); err != nil {
+		t.Fatalf("expire preflight retry hold before next simulated tick: %v", err)
+	}
 }
 
 func enqueueAdvanceCreatedHeadlessFixJob(t *testing.T, store *db.Store, jobID, branch, fixWorktree string) {
