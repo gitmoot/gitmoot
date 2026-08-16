@@ -53,7 +53,11 @@ func TestFixWorktreeFinalizerDeliversPayloadBranchWhenTaskHasNone(t *testing.T) 
 	// The review task legitimately owns no branch; it only points at the
 	// registered checkout. The fix payload carries both the fix worktree and
 	// the branch.
-	if err := store.UpsertTask(ctx, db.Task{ID: "review-pr-1523-deadbeef", RepoFullName: "owner/repo", WorktreePath: registered}); err != nil {
+	reviewTask := db.Task{ID: "review-pr-1523-deadbeef", RepoFullName: "owner/repo", WorktreePath: registered}
+	if strings.TrimSpace(reviewTask.Branch) != "" {
+		t.Fatalf("review task branch = %q, want empty so the payload override is required", reviewTask.Branch)
+	}
+	if err := store.UpsertTask(ctx, reviewTask); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
 	// An open pull request record lets the finalizer adopt it instead of
@@ -162,12 +166,15 @@ func TestImplementationFinalizationTargetOrdinaryJobTaskBranchWins(t *testing.T)
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	worktree := createDaemonWorkerGitCheckout(t, "feature/task-branch")
-	if err := store.UpsertTask(ctx, db.Task{ID: "task-ordinary", RepoFullName: "owner/repo", Branch: "feature/task-branch", WorktreePath: worktree}); err != nil {
+	task := db.Task{ID: "task-ordinary", RepoFullName: "owner/repo", Branch: "feature/task-branch", WorktreePath: worktree}
+	payload := workflow.JobPayload{Repo: "owner/repo", Branch: "feature/payload-branch", TaskID: task.ID}
+	if payload.Branch == task.Branch {
+		t.Fatalf("ordinary fixture branches are equal at %q; payload must conflict so task precedence is observable", task.Branch)
+	}
+	if err := store.UpsertTask(ctx, task); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
-	target, err := implementationFinalizationTargetFor(ctx, store, db.Job{ID: "ordinary", Agent: "lead", Type: "implement"}, workflow.JobPayload{
-		Repo: "owner/repo", Branch: "feature/payload-branch", TaskID: "task-ordinary",
-	}, implementationFinalizationAfterRun)
+	target, err := implementationFinalizationTargetFor(ctx, store, db.Job{ID: "ordinary", Agent: "lead", Type: "implement"}, payload, implementationFinalizationAfterRun)
 	if err != nil {
 		t.Fatalf("implementationFinalizationTargetFor returned error: %v", err)
 	}
@@ -187,10 +194,11 @@ func TestImplementationFinalizationTargetRefusesCheckoutOffResolvedBranch(t *tes
 	store := daemonWorkerStore(t)
 	worktree := createDaemonWorkerGitCheckout(t, "feature/task-branch")
 	for _, test := range []struct {
-		name    string
-		task    db.Task
-		payload workflow.JobPayload
-		want    []string
+		name           string
+		task           db.Task
+		payload        workflow.JobPayload
+		want           []string
+		branchlessTask bool
 	}{
 		{
 			// Risk 1: the payload branch is wrong for this checkout even
@@ -213,10 +221,14 @@ func TestImplementationFinalizationTargetRefusesCheckoutOffResolvedBranch(t *tes
 				Repo: "owner/repo", Branch: "feature/payload-branch", TaskID: "task-guard-2",
 				FixWorktree: true, WorktreePath: worktree,
 			},
-			want: []string{"is on branch feature/task-branch, not feature/payload-branch", "refusing to run or deliver from the wrong checkout"},
+			want:           []string{"is on branch feature/task-branch, not feature/payload-branch", "refusing to run or deliver from the wrong checkout"},
+			branchlessTask: true,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			if test.branchlessTask && strings.TrimSpace(test.task.Branch) != "" {
+				t.Fatalf("task branch = %q, want empty so the branchless-task guard lane remains distinct", test.task.Branch)
+			}
 			if err := store.UpsertTask(ctx, test.task); err != nil {
 				t.Fatalf("UpsertTask returned error: %v", err)
 			}
@@ -242,15 +254,22 @@ func TestImplementationFinalizationTargetFixWorktreeOverridesAreSymmetric(t *tes
 	store := daemonWorkerStore(t)
 	realWorktree := createDaemonWorkerGitCheckout(t, "feature/fix")
 	staleWorktree := t.TempDir() // not a git checkout at all
-	if err := store.UpsertTask(ctx, db.Task{
+	staleTask := db.Task{
 		ID: "task-stale", RepoFullName: "owner/repo",
 		Branch: "feature/stale", WorktreePath: staleWorktree,
-	}); err != nil {
-		t.Fatalf("UpsertTask returned error: %v", err)
 	}
 	payload := workflow.JobPayload{
 		Repo: "owner/repo", Branch: "feature/fix", TaskID: "task-stale",
 		FixWorktree: true, WorktreePath: realWorktree,
+	}
+	if staleTask.Branch == payload.Branch {
+		t.Fatalf("stale task branch = payload branch %q; branch override is no longer required by the fixture", payload.Branch)
+	}
+	if staleTask.WorktreePath == payload.WorktreePath {
+		t.Fatalf("stale task worktree = payload worktree %q; worktree override is no longer required by the fixture", payload.WorktreePath)
+	}
+	if err := store.UpsertTask(ctx, staleTask); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
 	}
 	job := db.Job{ID: "symmetry", Agent: "lead", Type: "implement"}
 
