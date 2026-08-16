@@ -284,6 +284,91 @@ func TestEffectiveRuntimePersistenceFailureBlocksDaemonExecution(t *testing.T) {
 	}
 }
 
+// TestEffectiveRuntimePersistenceFailureBlocksForegroundExecutionDurably pins
+// the retained foreground backstop. Foreground enqueue normally stores the
+// resolved runtime atomically, but a malformed/concurrently changed stored row
+// can still make the pre-run reread fail; that failure must settle the queued
+// job before returning so a later daemon tick cannot execute it.
+func TestEffectiveRuntimePersistenceFailureBlocksForegroundExecutionDurably(t *testing.T) {
+	ctx := context.Background()
+	marker := filepath.Join(t.TempDir(), "must-not-run-foreground-backstop")
+	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
+
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("open raw sqlite: %v", err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`CREATE TRIGGER corrupt_foreground_effective_runtime_payload
+		AFTER INSERT ON jobs
+		WHEN instr(NEW.payload, '"effective_runtime"') > 0
+		BEGIN
+			UPDATE jobs SET payload = 'null' WHERE id = NEW.id;
+		END`); err != nil {
+		t.Fatalf("create corruption trigger: %v", err)
+	}
+
+	var out, errBuf bytes.Buffer
+	code := Run([]string{
+		"agent", "ask", "shell-asker", "do not run with malformed runtime evidence",
+		"--home", home,
+		"--repo", "owner/repo",
+		"--json",
+	}, &out, &errBuf)
+	if code == 0 {
+		t.Fatalf("foreground ask exit = 0 with stored payload corrupted, output=%s", out.String())
+	}
+	if !strings.Contains(errBuf.String(), "job payload must be a JSON object") {
+		t.Fatalf("foreground error = %q, want malformed stored-payload cause", errBuf.String())
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("adapter ran after the foreground persistence backstop failed (marker err=%v)", err)
+	}
+
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("jobs = %d, want exactly the dispatched job", len(jobs))
+	}
+	job := jobs[0]
+	if job.State != string(workflow.JobFailed) {
+		t.Fatalf("job state = %q, want failed before return", job.State)
+	}
+	events, err := store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	var failedEvent string
+	for _, event := range events {
+		if event.Kind == string(workflow.JobFailed) {
+			failedEvent = event.Message
+		}
+	}
+	if !strings.Contains(failedEvent, "job payload must be a JSON object") {
+		t.Fatalf("failed event = %q, want persistence cause", failedEvent)
+	}
+
+	if _, err := raw.Exec(`DROP TRIGGER corrupt_foreground_effective_runtime_payload`); err != nil {
+		t.Fatalf("drop corruption trigger: %v", err)
+	}
+	worker := defaultJobWorker(store, io.Discard, home)
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, time.Now().UTC(), nil, nil); err != nil {
+		t.Fatalf("worker tick: %v", err)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("daemon executed the durably failed foreground job (marker err=%v)", err)
+	}
+	after, err := store.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("GetJob(after tick): %v", err)
+	}
+	if after.State != string(workflow.JobFailed) {
+		t.Fatalf("job state after tick = %q, want failed", after.State)
+	}
+}
+
 // TestForegroundEffectiveRuntimePersistsAtomicallyWithEnqueue closes the last
 // foreground fail-stop gap (#1528): even if both a later effective-runtime
 // update and queued->failed settlement are unavailable, the job never depends
