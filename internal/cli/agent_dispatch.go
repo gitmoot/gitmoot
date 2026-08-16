@@ -517,7 +517,26 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	// Persist the effective runtime BEFORE the run so the terminal payload —
 	// the record SucceededReviewVerdicts decodes — carries it (#1528).
 	if err := persistJobEffectiveRuntime(ctx, store, job.ID, effectiveAgent.Runtime); err != nil {
-		return localAgentJobOutput{}, err
+		// Fail-stop DURABLY, matching the daemon worker's finishQueuedJob
+		// (#1528 review): returning the error alone leaves the job QUEUED, so
+		// the next daemon tick would execute it later — without its effective
+		// runtime recorded, the exact attribution hole this change exists to
+		// close. Settle queued→failed so no tick can ever claim it. The two
+		// run sites differ deliberately in mechanism, not in outcome: the
+		// daemon anchors the lifecycle generation, emits its terminal event,
+		// and finalizes delegation children, none of which applies here — a
+		// foreground job is top-level (delegation children only ever run in
+		// the daemon), the caller observes the error synchronously, and the
+		// still-held session lock is released by the defer above.
+		settleErr := fmt.Errorf("persist effective runtime before execution: %w", err)
+		if _, transErr := store.TransitionJobStateWithEvent(ctx, job.ID, string(workflow.JobQueued), string(workflow.JobFailed), db.JobEvent{
+			JobID:   job.ID,
+			Kind:    string(workflow.JobFailed),
+			Message: settleErr.Error(),
+		}); transErr != nil {
+			return localAgentJobOutput{}, fmt.Errorf("%w (additionally failed to settle the queued job: %v)", settleErr, transErr)
+		}
+		return localAgentJobOutput{}, settleErr
 	}
 	// Journal runtime selection for every job. Only a real per-job override is
 	// labelled runtime_override; default selection uses effective_runtime.

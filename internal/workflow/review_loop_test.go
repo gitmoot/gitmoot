@@ -291,6 +291,14 @@ func TestDetectReviewLoopUnknownFamilyFailsClosed(t *testing.T) {
 		if _, err := store.GetAgent(ctx, "ghost-requester-batch"); err == nil {
 			t.Fatal("fixture weakened: ghost-requester-batch must be ABSENT from the registry")
 		}
+		// Pin the anchor the ordering cases below lean on: without the ghost,
+		// the batch PROVABLY brings a new family and is allowed — the unknown
+		// requester is the ONLY thing refusing.
+		if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-c", []string{"gm-review-kimi"}); err != nil {
+			t.Fatalf("DetectReviewLoop(known-only baseline): %v", err)
+		} else if detected {
+			t.Fatal("fixture weakened: the known-new requester alone must be ALLOWED, or this case cannot isolate the unknown's refusal")
+		}
 		match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-c", []string{"ghost-requester-batch", "gm-review-kimi"})
 		if err != nil {
 			t.Fatalf("DetectReviewLoop: %v", err)
@@ -300,6 +308,60 @@ func TestDetectReviewLoopUnknownFamilyFailsClosed(t *testing.T) {
 		}
 		if match.Family != "" {
 			t.Fatalf("mixed unknown batch must use the fail-closed refusal, got family %q", match.Family)
+		}
+	})
+
+	// Ordering cases (#1528 review): the original defect was order-dependent,
+	// so the fail-closed boundary must be order-INDEPENDENT. Each case pins the
+	// same anchor — the known requesters alone would be ALLOWED — so an
+	// "allow immediately on the first known-new family" implementation goes
+	// red here instead of surviving.
+	t.Run("mixed requester batch unknown LAST", func(t *testing.T) {
+		seedReviewLoopAgent(t, store, "g7-review-last", "codex", "gpt-5.6-sol")
+		seedReviewLoopVerdict(t, store, "prior-review-last", "g7-review-last", "head-d", "approved", "codex")
+		if _, err := store.GetAgent(ctx, "ghost-requester-last"); err == nil {
+			t.Fatal("fixture weakened: ghost-requester-last must be ABSENT from the registry")
+		}
+		if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-d", []string{"gm-review-kimi"}); err != nil {
+			t.Fatalf("DetectReviewLoop(known-only baseline): %v", err)
+		} else if detected {
+			t.Fatal("fixture weakened: the known-new requester alone must be ALLOWED, or this case cannot isolate the unknown's refusal")
+		}
+		match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-d", []string{"gm-review-kimi", "ghost-requester-last"})
+		if err != nil {
+			t.Fatalf("DetectReviewLoop: %v", err)
+		}
+		if !detected {
+			t.Fatal("an unresolved requester in LAST position must still fail closed; an allow-on-first-known-new implementation passes for the wrong reason")
+		}
+		if match.Family != "" {
+			t.Fatalf("unknown-last batch must use the fail-closed refusal, got family %q", match.Family)
+		}
+	})
+
+	t.Run("mixed requester batch unknown BETWEEN two resolvable requesters", func(t *testing.T) {
+		seedReviewLoopAgent(t, store, "g7-review-between", "codex", "gpt-5.6-sol")
+		seedReviewLoopAgent(t, store, "gm-review-opus-between", "claude", "claude-opus-4-8")
+		seedReviewLoopVerdict(t, store, "prior-review-between", "g7-review-between", "head-e", "approved", "codex")
+		if _, err := store.GetAgent(ctx, "ghost-requester-between"); err == nil {
+			t.Fatal("fixture weakened: ghost-requester-between must be ABSENT from the registry")
+		}
+		// Baseline: BOTH flanking requesters are resolvable, and kimi is a
+		// provably NEW family — without the ghost the batch is allowed.
+		if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-e", []string{"gm-review-kimi", "gm-review-opus-between"}); err != nil {
+			t.Fatalf("DetectReviewLoop(known-only baseline): %v", err)
+		} else if detected {
+			t.Fatal("fixture weakened: the two resolvable requesters alone must be ALLOWED, or this case cannot isolate the unknown's refusal")
+		}
+		match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-e", []string{"gm-review-kimi", "ghost-requester-between", "gm-review-opus-between"})
+		if err != nil {
+			t.Fatalf("DetectReviewLoop: %v", err)
+		}
+		if !detected {
+			t.Fatal("an unresolved requester BETWEEN two resolvable ones must still fail closed; an allow-on-first-known-new implementation passes for the wrong reason")
+		}
+		if match.Family != "" {
+			t.Fatalf("unknown-between batch must use the fail-closed refusal, got family %q", match.Family)
 		}
 	})
 }

@@ -118,6 +118,24 @@ func TestPersistJobEffectiveRuntimePreservesUnknownPayloadFields(t *testing.T) {
 		t.Fatalf("CreateJobWithEvent: %v", err)
 	}
 
+	// PIN the fixture's distinguishing property: the seed payload must NOT
+	// already carry effective_runtime. A fixture that pre-contains the value
+	// turns persistJobEffectiveRuntime into a no-op, and this test would pass
+	// green without the envelope update ever executing — testing nothing.
+	// Read the STORED row (not the literal above) so a seed-time mutation is
+	// caught too.
+	seeded, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob(seeded): %v", err)
+	}
+	var seededEnvelope map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(seeded.Payload), &seededEnvelope); err != nil {
+		t.Fatalf("decode seeded envelope: %v", err)
+	}
+	if _, present := seededEnvelope["effective_runtime"]; present {
+		t.Fatalf("fixture weakened: seed payload already carries effective_runtime=%s; persistence would be a no-op", seededEnvelope["effective_runtime"])
+	}
+
 	if err := persistJobEffectiveRuntime(ctx, store, jobID, runtime.ShellRuntime); err != nil {
 		t.Fatalf("persistJobEffectiveRuntime: %v", err)
 	}
@@ -262,5 +280,95 @@ func TestEffectiveRuntimePersistenceFailureBlocksDaemonExecution(t *testing.T) {
 	}
 	if parsed.EffectiveRuntime != "" {
 		t.Fatalf("effective_runtime = %q after rejected write, want empty", parsed.EffectiveRuntime)
+	}
+}
+
+// TestEffectiveRuntimePersistenceFailureBlocksForegroundExecutionDurably is the
+// FOREGROUND half of the fail-stop (#1528 review): `agent ask` with the
+// effective-runtime write forced to fail must not run the adapter AND must
+// leave the job ineligible for later daemon execution — a queued job a tick
+// can pick up is relabelled, not stopped. The trigger is installed BEFORE the
+// dispatch and matches any payload write carrying effective_runtime (the
+// fixture's payload starts without it, so the persist write is the only
+// possible fire), because the job ID does not exist until Run enqueues it.
+func TestEffectiveRuntimePersistenceFailureBlocksForegroundExecutionDurably(t *testing.T) {
+	ctx := context.Background()
+	marker := filepath.Join(t.TempDir(), "must-not-run-foreground")
+	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
+
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("open raw sqlite: %v", err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`CREATE TRIGGER reject_effective_runtime_update_foreground
+		BEFORE UPDATE OF payload ON jobs
+		WHEN instr(NEW.payload, '"effective_runtime"') > 0
+		BEGIN
+			SELECT RAISE(FAIL, 'forced effective runtime write failure');
+		END`); err != nil {
+		t.Fatalf("create rejection trigger: %v", err)
+	}
+
+	var out, errBuf bytes.Buffer
+	code := Run([]string{
+		"agent", "ask", "shell-asker", "do not run after a persistence failure",
+		"--home", home,
+		"--repo", "owner/repo",
+		"--json",
+	}, &out, &errBuf)
+	if code == 0 {
+		t.Fatalf("foreground ask exit = 0 with the write forced to fail, stderr=%s", errBuf.String())
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("adapter ran after effective-runtime persistence failed (marker err=%v)", err)
+	}
+
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("jobs = %d, want exactly the one dispatched job", len(jobs))
+	}
+	job := jobs[0]
+	if job.State != string(workflow.JobFailed) {
+		t.Fatalf("job state = %q, want failed — a queued job is relabelled, not stopped", job.State)
+	}
+	// Anchor: the write was genuinely ATTEMPTED and rejected — the settle
+	// event carries the trigger's own RAISE message. Without this, an earlier
+	// unrelated failure would pass the state check for the wrong reason.
+	events, err := store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	var settleEvent string
+	for _, event := range events {
+		if event.Kind == string(workflow.JobFailed) {
+			settleEvent = event.Message
+		}
+	}
+	if !strings.Contains(settleEvent, "forced effective runtime write failure") {
+		t.Fatalf("settle event %q must carry the forced write failure; the persist write may never have run", settleEvent)
+	}
+
+	// The durable half: clear the failure and run a REAL daemon tick. The job
+	// must stay failed and the adapter must still not run.
+	if _, err := raw.Exec(`DROP TRIGGER reject_effective_runtime_update_foreground`); err != nil {
+		t.Fatalf("drop rejection trigger: %v", err)
+	}
+	worker := defaultJobWorker(store, io.Discard, home)
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, time.Now().UTC(), nil, nil); err != nil {
+		t.Fatalf("worker tick: %v", err)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("daemon tick executed a job whose persistence had failed (marker err=%v)", err)
+	}
+	after, err := store.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("GetJob(after tick): %v", err)
+	}
+	if after.State != string(workflow.JobFailed) {
+		t.Fatalf("job state after tick = %q, want failed", after.State)
 	}
 }
