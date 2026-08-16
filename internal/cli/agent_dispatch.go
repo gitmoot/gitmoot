@@ -333,6 +333,16 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			}
 		}
 	}
+	// A foreground dispatch already knows the runtime it will execute. Persist it
+	// in the initial job insert so recording cannot fail separately and leave a
+	// daemon-claimable queued row. Background jobs deliberately omit it here: the
+	// daemon records the runtime selected when execution actually starts. A review
+	// deferred after enqueue by runtime contention is likewise refreshed by the
+	// daemon before that later execution.
+	effectiveRuntimeAtEnqueue := ""
+	if !request.Background {
+		effectiveRuntimeAtEnqueue = effectiveAgent.Runtime
+	}
 	job, err := (workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(request.Home), RuntimeDefaultModel: runtimeDefaultModelResolver(request.Home), RequireWorkflowPolicy: requireWorkflowPolicyResolver(request.Home), OrgPolicy: orgPolicy}).Enqueue(ctx, workflow.JobRequest{
 		ID:                     jobID,
 		Agent:                  agent.Name,
@@ -356,6 +366,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		WorkflowID:             request.WorkflowID,
 		RuntimeOverride:        overrideRuntime,
 		RuntimeOverrideRef:     overrideRef,
+		EffectiveRuntime:       effectiveRuntimeAtEnqueue,
 		Cockpit:                request.Cockpit,
 		CockpitSession:         request.CockpitSession,
 		SkipNativeReviewFanout: request.SkipNativeReviewFanout,
@@ -514,8 +525,10 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}
-	// Persist the effective runtime BEFORE the run so the terminal payload —
-	// the record SucceededReviewVerdicts decodes — carries it (#1528).
+	// Verify/backfill the effective runtime BEFORE the run so the terminal payload
+	// carries it. Foreground enqueue normally made this a no-op atomically with job
+	// creation; the failure settlement remains a defensive guard for malformed or
+	// concurrently changed rows.
 	if err := persistJobEffectiveRuntime(ctx, store, job.ID, effectiveAgent.Runtime); err != nil {
 		// Fail-stop DURABLY, matching the daemon worker's finishQueuedJob
 		// (#1528 review): returning the error alone leaves the job QUEUED, so

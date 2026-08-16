@@ -231,6 +231,10 @@ type JobRequest struct {
 	// the engine never persists a refreshed session ref for an overridden job.
 	RuntimeOverride    string
 	RuntimeOverrideRef string
+	// EffectiveRuntime may be set when the caller intends to execute an already-
+	// resolved runtime inline. Background callers leave it empty; a foreground
+	// job later deferred to a worker is re-recorded at actual execution time.
+	EffectiveRuntime string
 	// ShellEnv carries pipeline trigger inputs and stage metadata as exact
 	// KEY=value entries to a shell runtime job. It is empty for every non-pipeline
 	// and non-shell job.
@@ -392,9 +396,9 @@ type JobPayload struct {
 	WorkflowID         string `json:"workflow_id,omitempty"`
 	RuntimeOverride    string `json:"runtime_override,omitempty"`
 	RuntimeOverrideRef string `json:"runtime_override_ref,omitempty"`
-	// EffectiveRuntime is the runtime the job actually ran on, persisted by the
+	// EffectiveRuntime is the runtime selected before delivery, persisted by the
 	// dispatch/worker for EVERY job (#1528) — not only --runtime overrides — so
-	// engine-side consumers (the review-loop family resolver, and later the
+	// succeeded-job consumers (the review-loop family resolver, and later the
 	// merge gate) read a field instead of parsing the runtime_override event
 	// sentence. Additive/omitempty: payloads predating #1528 simply omit it and
 	// the resolver falls back to the agent registry default.
@@ -611,6 +615,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		WorkflowID:             strings.TrimSpace(request.WorkflowID),
 		RuntimeOverride:        strings.TrimSpace(request.RuntimeOverride),
 		RuntimeOverrideRef:     strings.TrimSpace(request.RuntimeOverrideRef),
+		EffectiveRuntime:       strings.TrimSpace(request.EffectiveRuntime),
 		ShellEnv:               append([]string(nil), request.ShellEnv...),
 		PipelineInputEnv:       append([]string(nil), request.PipelineInputEnv...),
 		PipelineName:           strings.TrimSpace(request.PipelineName),
