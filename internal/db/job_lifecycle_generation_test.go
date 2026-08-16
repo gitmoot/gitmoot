@@ -6,6 +6,8 @@ import (
 	"testing"
 )
 
+var _ func(*Store, context.Context, string, string, int64, string, string, JobEvent, ...JobEvent) (bool, error) = (*Store).TransitionJobStatePayloadWithEventAtGeneration
+
 func openLifecycleGenerationStore(t *testing.T) *Store {
 	t.Helper()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
