@@ -356,6 +356,14 @@ func implementationFinalizationTargetFor(ctx context.Context, store *db.Store, j
 	// same value — the comparison is what makes a wrong payload branch fail
 	// closed against the checkout's actual branch instead of silently
 	// delivering to the wrong branch.
+	//
+	// The unconditional FixWorktree override depends on the producer side:
+	// allocateFixWorktree (fix_worktree.go) hard-errors "fix worktree branch
+	// is required" on a blank branch before dispatchFix ever sets
+	// FixWorktree=true, so a fix job cannot reach this predicate with an empty
+	// payload.Branch that would clobber a valid task.Branch.
+	// TestAllocateFixWorktreeRejectsBlankBranch enforces that guard; if it
+	// fails, re-check this override before trusting it.
 	branchName := strings.TrimSpace(task.Branch)
 	if payload.FixWorktree {
 		branchName = strings.TrimSpace(payload.Branch)
