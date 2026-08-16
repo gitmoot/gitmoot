@@ -628,11 +628,24 @@ func TestClientCheckObjectConnectivityClassifiesPackedObjectCorruption(t *testin
 	if err != nil || len(packs) != 1 {
 		t.Fatalf("packed fixture files = %v, %v; want one pack", packs, err)
 	}
+	info, err := os.Stat(packs[0])
+	if err != nil {
+		t.Fatalf("stat pack: %v", err)
+	}
+	originalMode := info.Mode().Perm()
+	if err := os.Chmod(packs[0], originalMode|0o200); err != nil {
+		t.Fatalf("make pack writable: %v", err)
+	}
+	defer func() {
+		if err := os.Chmod(packs[0], originalMode); err != nil {
+			t.Errorf("restore pack mode: %v", err)
+		}
+	}()
 	pack, err := os.OpenFile(packs[0], os.O_RDWR, 0)
 	if err != nil {
 		t.Fatalf("open pack: %v", err)
 	}
-	info, err := pack.Stat()
+	info, err = pack.Stat()
 	if err != nil {
 		pack.Close()
 		t.Fatalf("stat pack: %v", err)
@@ -653,6 +666,9 @@ func TestClientCheckObjectConnectivityClassifiesPackedObjectCorruption(t *testin
 	}
 	if err := pack.Close(); err != nil {
 		t.Fatalf("close pack: %v", err)
+	}
+	if err := os.Chmod(packs[0], originalMode); err != nil {
+		t.Fatalf("restore pack mode before fsck: %v", err)
 	}
 	err = (Client{Dir: dir}).CheckObjectConnectivity(context.Background())
 	var corruption *ObjectConnectivityError
