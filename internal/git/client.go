@@ -549,6 +549,25 @@ func (c Client) RevParse(ctx context.Context, rev string) (string, error) {
 	return sha, nil
 }
 
+// CommitExists reports whether rev resolves to a commit in the local object
+// database. A missing object is an ordinary false result; repository failures
+// remain errors so callers do not misdiagnose corruption as an unfetched ref.
+func (c Client) CommitExists(ctx context.Context, rev string) (bool, error) {
+	rev = strings.TrimSpace(rev)
+	if err := validateRef(rev); err != nil {
+		return false, err
+	}
+	_, err := c.run(ctx, "rev-parse", "--verify", "--quiet", rev+"^{commit}")
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
+}
+
 // IsAncestor reports whether ancestor is reachable from descendant. Git uses
 // exit status 1 for the ordinary "not an ancestor" result; every other failure
 // remains an error so invalid refs and repository failures fail closed.

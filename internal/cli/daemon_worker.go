@@ -180,6 +180,24 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if err != nil {
 		return w.finishQueuedJob(ctx, job, workflow.JobFailed, err)
 	}
+	// Review-to-fix jobs are the implementation jobs created by workflow
+	// advancement. They are explicitly marked FixWorktree; ordinary task runs,
+	// local implement dispatches, and delegation legs may legitimately be PR-less
+	// and must not inherit this delivery gate. Check the same durable target the
+	// finalizer will use before agent lookup, checkout setup, or adapter delivery.
+	if job.Type == "implement" && payload.FixWorktree {
+		if _, err := implementationFinalizationTargetFor(ctx, w.Store, job, payload, implementationFinalizationBeforeRun); err != nil {
+			err = fmt.Errorf("validate implementation target before model run: %w", err)
+			if !resultDeliveryFailed(err) {
+				return w.retryImplementationPreflight(ctx, job, payload, err)
+			}
+			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, err); finishErr != nil {
+				return finishErr
+			}
+			_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, "", err)
+			return nil
+		}
+	}
 	// An ephemeral child carries an inline worker spec instead of a
 	// pre-registered agent. Materialize a throwaway agent + runtime session
 	// from the spec before the normal flow runs (which assumes the agent
@@ -754,6 +772,96 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	_ = w.postJobResultComment(ctx, job.ID, agent, checkout, nil)
 	writeLine(w.Stdout, "job %s completed", job.ID)
 	return nil
+}
+
+const implementationPreflightAttemptLimit = 3
+const implementationPreflightRetryDelay = time.Second
+
+func (w jobWorker) retryImplementationPreflight(ctx context.Context, job db.Job, payload workflow.JobPayload, cause error) error {
+	const class = "implementation_preflight"
+	alreadyExhausted := payload.BlockerClass == class && payload.BlockerAttempts >= implementationPreflightAttemptLimit
+	attempt := payload.BlockerAttempts + 1
+	if attempt > implementationPreflightAttemptLimit {
+		attempt = implementationPreflightAttemptLimit
+	}
+	payload.BlockerClass = class
+	payload.BlockerAttempts = attempt
+	payload.BlockerPreDelivery = true
+	payload.BlockerRetryAt = ""
+	payload.BlockerSuggestedAction = ""
+	if attempt < implementationPreflightAttemptLimit {
+		payload.BlockerRetryAt = time.Now().UTC().Add(implementationPreflightRetryDelay).Format(time.RFC3339Nano)
+	}
+	encoded, err := payloadWithImplementationPreflightRetry(job.Payload, payload)
+	if err != nil {
+		return err
+	}
+	message := fmt.Sprintf("implementation preflight attempt %d/%d failed: %v", attempt, implementationPreflightAttemptLimit, cause)
+	if attempt < implementationPreflightAttemptLimit {
+		transitioned, err := w.Store.TransitionJobStatePayloadWithEventAtGeneration(ctx, job.ID, string(workflow.JobQueued), job.LifecycleGeneration, string(workflow.JobQueued), encoded, db.JobEvent{JobID: job.ID, Kind: blockerDeferredEventKind, Message: message})
+		if err != nil || !transitioned {
+			return err
+		}
+		emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, job.ID, events.EventJobDeferred, string(workflow.JobQueued), message)
+		return nil
+	}
+	exhausted := fmt.Errorf("automatic implementation preflight retries exhausted after %d attempts for task %s in worktree %q: %w; inspect and repair the worktree, then run `gitmoot job retry %s`; if the dispatch metadata is stale, dispatch a fresh fix job against pull request #%d's current head", implementationPreflightAttemptLimit, payload.TaskID, payload.WorktreePath, cause, job.ID, payload.PullRequest)
+	firstEvent := db.JobEvent{JobID: job.ID, Kind: blockerExhaustedEventKind, Message: exhausted.Error()}
+	additionalEvents := []db.JobEvent{
+		{JobID: job.ID, Kind: string(workflow.JobFailed), Message: exhausted.Error()},
+	}
+	if alreadyExhausted {
+		firstEvent = additionalEvents[0]
+		additionalEvents = nil
+	}
+	transitioned, err := w.Store.TransitionJobStatePayloadWithEventAtGeneration(ctx, job.ID, string(workflow.JobQueued), job.LifecycleGeneration, string(workflow.JobFailed), encoded, firstEvent, additionalEvents...)
+	if err != nil {
+		return err
+	}
+	if !transitioned {
+		return nil
+	}
+	if err := w.afterQueuedJobTransition(ctx, job.ID, workflow.JobFailed, exhausted, true); err != nil {
+		return err
+	}
+	_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, strings.TrimSpace(payload.WorktreePath), exhausted)
+	return nil
+}
+
+// payloadWithImplementationPreflightRetry updates only the retry fields this
+// preflight owns; the stored payload may contain newer or legacy evidence.
+func payloadWithImplementationPreflightRetry(raw string, payload workflow.JobPayload) (string, error) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
+		return "", err
+	}
+	owned := map[string]any{
+		"blocker_class":        payload.BlockerClass,
+		"blocker_attempts":     payload.BlockerAttempts,
+		"blocker_pre_delivery": payload.BlockerPreDelivery,
+	}
+	for key, value := range owned {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return "", err
+		}
+		envelope[key] = encoded
+	}
+	if payload.BlockerRetryAt == "" {
+		delete(envelope, "blocker_retry_at")
+	} else {
+		encoded, err := json.Marshal(payload.BlockerRetryAt)
+		if err != nil {
+			return "", err
+		}
+		envelope["blocker_retry_at"] = encoded
+	}
+	delete(envelope, "blocker_suggested_action")
+	encoded, err := json.Marshal(envelope)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
 }
 
 func (w jobWorker) runtimeContractPreflight(ctx context.Context, agent runtime.Agent, request runtime.RuntimeContractRequest) (runtime.RuntimeContractResult, bool) {

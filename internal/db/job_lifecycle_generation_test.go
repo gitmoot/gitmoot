@@ -6,6 +6,8 @@ import (
 	"testing"
 )
 
+var _ func(*Store, context.Context, string, string, int64, string, string, JobEvent, ...JobEvent) (bool, error) = (*Store).TransitionJobStatePayloadWithEventAtGeneration
+
 func openLifecycleGenerationStore(t *testing.T) *Store {
 	t.Helper()
 	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
@@ -175,5 +177,53 @@ func TestTransitionJobStateWithEventAtGenerationRefusesStaleGeneration(t *testin
 	}
 	if live.State != "blocked" {
 		t.Fatalf("state after accepted CAS = %q, want blocked", live.State)
+	}
+}
+
+func TestTransitionJobStatePayloadWithEventAtGenerationAnchorsPayload(t *testing.T) {
+	ctx := context.Background()
+	store := openLifecycleGenerationStore(t)
+	if err := store.CreateJob(ctx, Job{ID: "payload-cas", Agent: "lead", Type: "implement", State: "queued", Payload: `{"result":{"decision":"implemented"}}`}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	for _, step := range [][2]string{
+		{"queued", "running"}, {"running", "failed"}, {"failed", "queued"},
+		{"queued", "running"}, {"running", "failed"},
+	} {
+		if _, err := store.TransitionJobState(ctx, "payload-cas", step[0], step[1]); err != nil {
+			t.Fatalf("TransitionJobState(%s->%s) returned error: %v", step[0], step[1], err)
+		}
+	}
+
+	stalePayload := `{"result":{"decision":"blocked","summary":"stale"}}`
+	transitioned, err := store.TransitionJobStatePayloadWithEventAtGeneration(ctx, "payload-cas", "failed", 0, "blocked", stalePayload, JobEvent{Kind: "advance_blocked", Message: "stale"})
+	if err != nil {
+		t.Fatalf("stale transition returned error: %v", err)
+	}
+	if transitioned {
+		t.Fatal("stale generation replaced the live payload")
+	}
+	afterStale, err := store.GetJob(ctx, "payload-cas")
+	if err != nil {
+		t.Fatalf("GetJob after stale transition: %v", err)
+	}
+	if afterStale.Payload == stalePayload {
+		t.Fatal("stale generation wrote its payload despite losing the CAS")
+	}
+
+	livePayload := `{"result":{"decision":"blocked","summary":"live"}}`
+	transitioned, err = store.TransitionJobStatePayloadWithEventAtGeneration(ctx, "payload-cas", "failed", 1, "blocked", livePayload, JobEvent{Kind: "advance_blocked", Message: "live"})
+	if err != nil {
+		t.Fatalf("live transition returned error: %v", err)
+	}
+	if !transitioned {
+		t.Fatal("current generation did not settle")
+	}
+	afterLive, err := store.GetJob(ctx, "payload-cas")
+	if err != nil {
+		t.Fatalf("GetJob after live transition: %v", err)
+	}
+	if afterLive.State != "blocked" || afterLive.Payload != livePayload {
+		t.Fatalf("live settlement = state %q payload %q, want blocked and replacement payload", afterLive.State, afterLive.Payload)
 	}
 }

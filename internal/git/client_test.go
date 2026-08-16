@@ -547,6 +547,42 @@ func TestClientIsAncestor(t *testing.T) {
 	}
 }
 
+func TestClientCommitExistsDistinguishesMissingObject(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	ctx := context.Background()
+	dir := t.TempDir()
+	runGit(t, dir, "init", "-b", "main")
+	runGit(t, dir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, dir, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	runGit(t, dir, "add", "README.md")
+	runGit(t, dir, "commit", "-m", "initial")
+	client := Client{Dir: dir}
+	head, err := client.HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("HeadSHA: %v", err)
+	}
+	if present, err := client.CommitExists(ctx, head); err != nil || !present {
+		t.Fatalf("CommitExists(present) = %t, %v", present, err)
+	}
+	if present, err := client.CommitExists(ctx, strings.Repeat("0", 40)); err != nil || present {
+		t.Fatalf("CommitExists(missing) = %t, %v", present, err)
+	}
+}
+
+func TestClientCommitExistsPropagatesRepositoryFailure(t *testing.T) {
+	runner := &fakeRunner{errs: []error{errors.New("object database unavailable")}}
+	present, err := (Client{Runner: runner, Dir: "/repo"}).CommitExists(context.Background(), "deadbeef")
+	if err == nil || present {
+		t.Fatalf("CommitExists(repository failure) = %t, %v", present, err)
+	}
+	runner.wantArgs(t, 0, "git", "rev-parse", "--verify", "--quiet", "deadbeef^{commit}")
+}
+
 func TestClientCreateBranchSmoke(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")

@@ -40,6 +40,97 @@ func TestBlockedAdvancePostsBlockedDecision(t *testing.T) {
 	}
 }
 
+func TestBlockedAdvancePersistsBlockedDecision(t *testing.T) {
+	job, _, _ := runNonFastForwardBlockedAdvance(t)
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatalf("daemonJobPayload returned error: %v", err)
+	}
+	if payload.Result == nil {
+		t.Fatal("blocked advancement has no persisted result")
+	}
+	if payload.Result.Decision != string(workflow.JobBlocked) {
+		t.Fatalf("persisted decision = %q, want blocked", payload.Result.Decision)
+	}
+	if payload.Result.Summary != "done" {
+		t.Fatalf("persisted summary = %q, want original model summary retained", payload.Result.Summary)
+	}
+}
+
+func TestBlockedAdvancePreservesUnknownAndLegacyPayloadFields(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	raw := `{
+		"repo":"owner/repo",
+		"preset_id":"legacy-template",
+		"preset_resolved_commit":"abc123",
+		"preset_content":"legacy body",
+		"future_evidence":{"kind":"future","values":[1,2]},
+		"result":{"decision":"implemented","summary":"model summary","future_result":{"score":7}}
+	}`
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: "blocked-preserves-payload", Agent: "lead", Type: "implement",
+		State: string(workflow.JobSucceeded), Payload: raw,
+	}, db.JobEvent{Kind: string(workflow.JobSucceeded), Message: "model completed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	job, err := store.GetJob(ctx, "blocked-preserves-payload")
+	if err != nil {
+		t.Fatalf("GetJob before settlement: %v", err)
+	}
+	worker := defaultJobWorker(store, io.Discard)
+	if err := worker.settleBlockedAdvancement(ctx, job.ID, observedJobLifecycle(job), blockedResultDelivery("pull request creation failed")); err != nil {
+		t.Fatalf("settleBlockedAdvancement returned error: %v", err)
+	}
+	job, err = store.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("GetJob after settlement: %v", err)
+	}
+	if job.State != string(workflow.JobBlocked) {
+		t.Fatalf("job state = %q, want blocked", job.State)
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(job.Payload), &envelope); err != nil {
+		t.Fatalf("decode settled payload: %v", err)
+	}
+	for key, want := range map[string]string{
+		"preset_id":              `"legacy-template"`,
+		"preset_resolved_commit": `"abc123"`,
+		"preset_content":         `"legacy body"`,
+		"future_evidence":        `{"kind":"future","values":[1,2]}`,
+	} {
+		assertEquivalentJSON(t, key, envelope[key], want)
+	}
+	var result map[string]json.RawMessage
+	if err := json.Unmarshal(envelope["result"], &result); err != nil {
+		t.Fatalf("decode settled result: %v", err)
+	}
+	for key, want := range map[string]string{
+		"decision":      `"blocked"`,
+		"summary":       `"model summary"`,
+		"future_result": `{"score":7}`,
+	} {
+		assertEquivalentJSON(t, "result."+key, result[key], want)
+	}
+}
+
+func assertEquivalentJSON(t *testing.T, field string, got json.RawMessage, want string) {
+	t.Helper()
+	var gotValue any
+	if err := json.Unmarshal(got, &gotValue); err != nil {
+		t.Fatalf("decode %s: %v (raw %q)", field, err, got)
+	}
+	var wantValue any
+	if err := json.Unmarshal([]byte(want), &wantValue); err != nil {
+		t.Fatalf("decode expected %s: %v", field, err)
+	}
+	gotJSON, _ := json.Marshal(gotValue)
+	wantJSON, _ := json.Marshal(wantValue)
+	if string(gotJSON) != string(wantJSON) {
+		t.Fatalf("%s = %s, want %s", field, gotJSON, wantJSON)
+	}
+}
+
 func TestRetryBlockedAdvanceSettlesQueriedJobState(t *testing.T) {
 	job, _, events := runRetryBlockedAdvance(t)
 	if job.State != string(workflow.JobBlocked) {
