@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/events"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -169,6 +171,12 @@ func TestAdvanceImplementationPreflightBoundsPersistentErrorsAcrossTicks(t *test
 	if result.exhaustedEvents != 1 || result.deferredEvents != 2 {
 		t.Fatalf("retry event kinds exhausted=%d deferred=%d, want 1/2", result.exhaustedEvents, result.deferredEvents)
 	}
+	if got, want := strings.Join(result.retryEventKinds, ","), strings.Join([]string{blockerDeferredEventKind, blockerDeferredEventKind, blockerExhaustedEventKind, string(workflow.JobFailed)}, ","); got != want {
+		t.Fatalf("retry event order = %s, want %s", got, want)
+	}
+	if result.failedEmissions != 1 {
+		t.Fatalf("job.failed emissions = %d, want 1", result.failedEmissions)
+	}
 	if result.blockerSuggestedActionPresent {
 		t.Fatal("stale blocker_suggested_action survived in persisted payload")
 	}
@@ -210,12 +218,145 @@ func TestImplementationPreflightExhaustionReselectionIsIdempotent(t *testing.T) 
 	if after.State != string(workflow.JobFailed) || parsed.BlockerAttempts != implementationPreflightAttemptLimit {
 		t.Fatalf("settled state=%s attempts=%d, want failed/%d", after.State, parsed.BlockerAttempts, implementationPreflightAttemptLimit)
 	}
-	events, err := store.ListJobEvents(ctx, job.ID)
+	jobEvents, err := store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if got := countJobEventsByKind(jobEvents, blockerExhaustedEventKind); got != 1 {
+		t.Fatalf("exhausted events = %d, want 1", got)
+	}
+}
+
+func TestImplementationPreflightStaleGenerationHasNoTerminalSideEffects(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	payload := workflow.JobPayload{
+		Repo: "owner/repo", PullRequest: 1514, TaskID: "task-1514", WorktreePath: "/tmp/fix",
+		BlockerAttempts: implementationPreflightAttemptLimit - 1,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	const jobID = "stale-preflight-generation"
+	if err := store.CreateJob(ctx, db.Job{ID: jobID, Agent: "lead", Type: "implement", State: string(workflow.JobQueued), Payload: string(encoded)}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	staleJob, stalePayload, err := daemonWorkerJobPayload(ctx, store, jobID)
+	if err != nil {
+		t.Fatalf("load stale lifecycle: %v", err)
+	}
+	transitioned, err := store.TransitionJobState(ctx, jobID, string(workflow.JobQueued), string(workflow.JobFailed))
+	if err != nil || !transitioned {
+		t.Fatalf("settle old lifecycle: transitioned=%t err=%v", transitioned, err)
+	}
+	current, err := workflow.RetryJob(ctx, store, jobID)
+	if err != nil {
+		t.Fatalf("RetryJob returned error: %v", err)
+	}
+	comments := &cliPollFakeGitHub{}
+	sink := &recordingSink{}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CommenterFactory = func(string) github.Client { return comments }
+	worker.EventSinkOverride = sink
+	if err := worker.retryImplementationPreflight(ctx, staleJob, stalePayload, errors.New("stale lifecycle failure")); err != nil {
+		t.Fatalf("stale retryImplementationPreflight returned error: %v", err)
+	}
+	after, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if after.State != string(workflow.JobQueued) || after.LifecycleGeneration != current.LifecycleGeneration {
+		t.Fatalf("current lifecycle changed: state=%s generation=%d, want queued/%d", after.State, after.LifecycleGeneration, current.LifecycleGeneration)
+	}
+	if len(comments.posted) != 0 {
+		t.Fatalf("stale lifecycle posted %d result comments", len(comments.posted))
+	}
+	if got := len(sink.byType(events.EventJobFailed)); got != 0 {
+		t.Fatalf("stale lifecycle emitted %d job.failed events", got)
+	}
+	jobEvents, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if got := countJobEventsByKind(jobEvents, "comment_posted"); got != 0 {
+		t.Fatalf("stale lifecycle reserved %d result comments", got)
+	}
+}
+
+func TestImplementationPreflightExhaustionDeduplicatesWithinLifecycle(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	payload := workflow.JobPayload{
+		Repo: "owner/repo", PullRequest: 1514, TaskID: "task-1514", WorktreePath: "/tmp/fix",
+		BlockerAttempts: implementationPreflightAttemptLimit - 1,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	const jobID = "two-preflight-lifecycles"
+	if err := store.CreateJob(ctx, db.Job{ID: jobID, Agent: "lead", Type: "implement", State: string(workflow.JobQueued), Payload: string(encoded)}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	worker := defaultJobWorker(store, io.Discard)
+	job, parsed, err := daemonWorkerJobPayload(ctx, store, jobID)
+	if err != nil {
+		t.Fatalf("load first lifecycle: %v", err)
+	}
+	if err := worker.retryImplementationPreflight(ctx, job, parsed, errors.New("first lifecycle failure")); err != nil {
+		t.Fatalf("exhaust first lifecycle: %v", err)
+	}
+	if _, err := workflow.RetryJob(ctx, store, jobID); err != nil {
+		t.Fatalf("RetryJob returned error: %v", err)
+	}
+	for attempt := 1; attempt <= implementationPreflightAttemptLimit; attempt++ {
+		job, parsed, err = daemonWorkerJobPayload(ctx, store, jobID)
+		if err != nil {
+			t.Fatalf("load second lifecycle attempt %d: %v", attempt, err)
+		}
+		if err := worker.retryImplementationPreflight(ctx, job, parsed, fmt.Errorf("second lifecycle failure %d", attempt)); err != nil {
+			t.Fatalf("second lifecycle attempt %d: %v", attempt, err)
+		}
+	}
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if got := countJobEventsByKind(events, blockerExhaustedEventKind); got != 2 {
+		t.Fatalf("exhausted events across two lifecycles = %d, want 2", got)
+	}
+}
+
+func TestImplementationPreflightExhaustionDoesNotDeduplicateOtherBlockerClass(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	payload := workflow.JobPayload{
+		Repo: "owner/repo", PullRequest: 1514, TaskID: "task-1514", WorktreePath: "/tmp/fix",
+		BlockerClass: string(blockerClassRuntimeQuota), BlockerAttempts: implementationPreflightAttemptLimit,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	const jobID = "cross-class-preflight-exhaustion"
+	if err := store.CreateJob(ctx, db.Job{ID: jobID, Agent: "lead", Type: "implement", State: string(workflow.JobQueued), Payload: string(encoded)}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	worker := defaultJobWorker(store, io.Discard)
+	job, parsed, err := daemonWorkerJobPayload(ctx, store, jobID)
+	if err != nil {
+		t.Fatalf("load queued job: %v", err)
+	}
+	if err := worker.retryImplementationPreflight(ctx, job, parsed, errors.New("cross-class exhaustion")); err != nil {
+		t.Fatalf("retryImplementationPreflight returned error: %v", err)
+	}
+	events, err := store.ListJobEvents(ctx, jobID)
 	if err != nil {
 		t.Fatalf("ListJobEvents returned error: %v", err)
 	}
 	if got := countJobEventsByKind(events, blockerExhaustedEventKind); got != 1 {
-		t.Fatalf("exhausted events = %d, want 1", got)
+		t.Fatalf("cross-class exhausted events = %d, want 1", got)
 	}
 }
 
@@ -388,6 +529,8 @@ type advanceImplementationPreflightResult struct {
 	exhaustedEvents               int
 	deferredEvents                int
 	blockerSuggestedActionPresent bool
+	failedEmissions               int
+	retryEventKinds               []string
 }
 
 func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advanceImplementationPreflightResult {
@@ -513,6 +656,8 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 		return adapter, nil
 	}
 	worker.WorkflowFactory = func(string) workflow.Engine { return workflow.Engine{Store: store} }
+	sink := &recordingSink{}
+	worker.EventSinkOverride = sink
 	worker.UsePool = mode == "persistent-preflight-error"
 	job, err := store.GetJob(ctx, jobID)
 	if err != nil {
@@ -598,7 +743,7 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 	if got := strings.TrimSpace(runGitOutput(t, registered, "ls-remote", "origin", "refs/heads/"+branch)); got != beforeRemote {
 		t.Fatalf("remote head changed from %q to %q despite preflight refusal", beforeRemote, got)
 	}
-	events, err := store.ListJobEvents(ctx, job.ID)
+	jobEvents, err := store.ListJobEvents(ctx, job.ID)
 	if err != nil {
 		t.Fatalf("ListJobEvents returned error: %v", err)
 	}
@@ -606,7 +751,8 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 	failureMessage := ""
 	exhaustedEvents := 0
 	deferredEvents := 0
-	for _, event := range events {
+	var retryEventKinds []string
+	for _, event := range jobEvents {
 		if event.Kind == string(workflow.JobBlocked) {
 			message = event.Message
 		}
@@ -618,6 +764,9 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 		}
 		if event.Kind == blockerDeferredEventKind {
 			deferredEvents++
+		}
+		if event.Kind == blockerDeferredEventKind || event.Kind == blockerExhaustedEventKind || event.Kind == string(workflow.JobFailed) {
+			retryEventKinds = append(retryEventKinds, event.Kind)
 		}
 	}
 	remedyCleared := false
@@ -676,6 +825,8 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 		retryAts: retryAts, tickStarted: tickStarted, deliveredPrompts: append([]string(nil), adapter.prompts...),
 		exhaustedEvents: exhaustedEvents, deferredEvents: deferredEvents,
 		blockerSuggestedActionPresent: blockerSuggestedActionPresent,
+		failedEmissions:               len(sink.byType(events.EventJobFailed)),
+		retryEventKinds:               retryEventKinds,
 	}
 }
 

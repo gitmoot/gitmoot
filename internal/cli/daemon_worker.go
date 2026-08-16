@@ -779,6 +779,7 @@ const implementationPreflightRetryDelay = time.Second
 
 func (w jobWorker) retryImplementationPreflight(ctx context.Context, job db.Job, payload workflow.JobPayload, cause error) error {
 	const class = "implementation_preflight"
+	alreadyExhausted := payload.BlockerClass == class && payload.BlockerAttempts >= implementationPreflightAttemptLimit
 	attempt := payload.BlockerAttempts + 1
 	if attempt > implementationPreflightAttemptLimit {
 		attempt = implementationPreflightAttemptLimit
@@ -805,39 +806,26 @@ func (w jobWorker) retryImplementationPreflight(ctx context.Context, job db.Job,
 		return nil
 	}
 	exhausted := fmt.Errorf("automatic implementation preflight retries exhausted after %d attempts for task %s in worktree %q: %w; inspect and repair the worktree, then run `gitmoot job retry %s`; if the dispatch metadata is stale, dispatch a fresh fix job against pull request #%d's current head", implementationPreflightAttemptLimit, payload.TaskID, payload.WorktreePath, cause, job.ID, payload.PullRequest)
-	alreadyRecorded, err := w.jobHasEventKind(ctx, job.ID, blockerExhaustedEventKind)
-	if err != nil {
-		return err
-	}
-	eventsToRecord := []db.JobEvent{
-		{JobID: job.ID, Kind: blockerExhaustedEventKind, Message: exhausted.Error()},
+	firstEvent := db.JobEvent{JobID: job.ID, Kind: blockerExhaustedEventKind, Message: exhausted.Error()}
+	additionalEvents := []db.JobEvent{
 		{JobID: job.ID, Kind: string(workflow.JobFailed), Message: exhausted.Error()},
 	}
-	if alreadyRecorded {
-		eventsToRecord = eventsToRecord[1:]
+	if alreadyExhausted {
+		firstEvent = additionalEvents[0]
+		additionalEvents = nil
 	}
-	transitioned, err := w.Store.TransitionJobStatePayloadWithEventAtGeneration(ctx, job.ID, string(workflow.JobQueued), job.LifecycleGeneration, string(workflow.JobFailed), encoded, eventsToRecord...)
+	transitioned, err := w.Store.TransitionJobStatePayloadWithEventAtGeneration(ctx, job.ID, string(workflow.JobQueued), job.LifecycleGeneration, string(workflow.JobFailed), encoded, firstEvent, additionalEvents...)
 	if err != nil {
 		return err
 	}
-	if err := w.afterQueuedJobTransition(ctx, job.ID, workflow.JobFailed, exhausted, transitioned); err != nil {
+	if !transitioned {
+		return nil
+	}
+	if err := w.afterQueuedJobTransition(ctx, job.ID, workflow.JobFailed, exhausted, true); err != nil {
 		return err
 	}
 	_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, strings.TrimSpace(payload.WorktreePath), exhausted)
 	return nil
-}
-
-func (w jobWorker) jobHasEventKind(ctx context.Context, jobID, kind string) (bool, error) {
-	events, err := w.Store.ListJobEvents(ctx, jobID)
-	if err != nil {
-		return false, err
-	}
-	for _, event := range events {
-		if event.Kind == kind {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 // payloadWithImplementationPreflightRetry updates only the retry fields this

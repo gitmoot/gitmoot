@@ -645,11 +645,11 @@ func (s *Store) TransitionJobStateWithEventAtGeneration(ctx context.Context, id 
 }
 
 // TransitionJobStatePayloadWithEventAtGeneration atomically settles one
-// observed lifecycle while replacing its payload and recording zero or more
-// events. As the payload-writing counterpart of
+// observed lifecycle while replacing its payload and recording its required
+// event plus any additional events. As the payload-writing counterpart of
 // TransitionJobStateWithEventAtGeneration, a stale run loses the compare-and-swap
 // instead of rewriting the result of a newer lifecycle.
-func (s *Store) TransitionJobStatePayloadWithEventAtGeneration(ctx context.Context, id string, from string, fromGeneration int64, to string, payload string, events ...JobEvent) (bool, error) {
+func (s *Store) TransitionJobStatePayloadWithEventAtGeneration(ctx context.Context, id string, from string, fromGeneration int64, to string, payload string, event JobEvent, additionalEvents ...JobEvent) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -673,11 +673,17 @@ func (s *Store) TransitionJobStatePayloadWithEventAtGeneration(ctx context.Conte
 		}
 		return false, tx.Commit()
 	}
-	for _, event := range events {
-		if event.JobID == "" {
-			event.JobID = id
+	if event.JobID == "" {
+		event.JobID = id
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+		return false, err
+	}
+	for _, additional := range additionalEvents {
+		if additional.JobID == "" {
+			additional.JobID = id
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, additional.JobID, additional.Kind, additional.Message); err != nil {
 			return false, err
 		}
 	}
