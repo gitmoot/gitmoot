@@ -1,10 +1,13 @@
 package cli
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
+	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -153,11 +156,45 @@ func isolatedShellStageRuntimeSessionKey(payload workflow.JobPayload, jobID stri
 
 // jobRuntimeOverrideEventMessage renders the runtime_override job event that
 // exposes the effective runtime (and the session lock it ran under) in job
-// history.
+// history. Since #1528 the event is journalled for EVERY job — not only
+// overridden ones — so the family a job ran on survives in engine-readable
+// history even when no override was supplied.
 func jobRuntimeOverrideEventMessage(defaultRuntime string, effective runtime.Agent, lockKey string) string {
 	message := fmt.Sprintf("job runs on runtime %s (agent default %s)", effective.Runtime, defaultRuntime)
 	if strings.TrimSpace(lockKey) != "" {
 		message += "; session lock " + lockKey
 	}
 	return message
+}
+
+// persistJobEffectiveRuntime records the runtime a job is about to run on
+// STRUCTURALLY on the job payload (#1528), so engine-side consumers — the
+// review-loop family resolver now, the merge gate in the #1531 round — read a
+// field instead of parsing the runtime_override event sentence. The payload is
+// RE-READ from the store rather than trusting the caller's in-memory copy:
+// earlier run-phase steps (e.g. the checkout head re-sync) persist their own
+// payload updates, and encoding a stale copy would clobber them. No-op when
+// the stored payload already carries the same value.
+func persistJobEffectiveRuntime(ctx context.Context, store *db.Store, jobID string, effectiveRuntime string) error {
+	effective := strings.TrimSpace(effectiveRuntime)
+	if effective == "" {
+		return nil
+	}
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		return err
+	}
+	if payload.EffectiveRuntime == effective {
+		return nil
+	}
+	payload.EffectiveRuntime = effective
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return store.UpdateJobPayload(ctx, jobID, string(encoded))
 }

@@ -386,12 +386,19 @@ type JobPayload struct {
 	// actually see most often. All
 	// three are additive/omitempty: a payload without plan mode serializes
 	// byte-identically.
-	Plan                   bool                `json:"plan,omitempty"`
-	PlanInto               string              `json:"plan_into,omitempty"`
-	PlanMode               string              `json:"plan_mode,omitempty"`
-	WorkflowID             string              `json:"workflow_id,omitempty"`
-	RuntimeOverride        string              `json:"runtime_override,omitempty"`
-	RuntimeOverrideRef     string              `json:"runtime_override_ref,omitempty"`
+	Plan               bool   `json:"plan,omitempty"`
+	PlanInto           string `json:"plan_into,omitempty"`
+	PlanMode           string `json:"plan_mode,omitempty"`
+	WorkflowID         string `json:"workflow_id,omitempty"`
+	RuntimeOverride    string `json:"runtime_override,omitempty"`
+	RuntimeOverrideRef string `json:"runtime_override_ref,omitempty"`
+	// EffectiveRuntime is the runtime the job actually ran on, persisted by the
+	// dispatch/worker for EVERY job (#1528) — not only --runtime overrides — so
+	// engine-side consumers (the review-loop family resolver, and later the
+	// merge gate) read a field instead of parsing the runtime_override event
+	// sentence. Additive/omitempty: payloads predating #1528 simply omit it and
+	// the resolver falls back to the agent registry default.
+	EffectiveRuntime       string              `json:"effective_runtime,omitempty"`
 	ShellEnv               []string            `json:"shell_env,omitempty"`
 	PipelineInputEnv       []string            `json:"pipeline_input_env,omitempty"`
 	PipelineName           string              `json:"pipeline_name,omitempty"`

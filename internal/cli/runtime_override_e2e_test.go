@@ -106,6 +106,10 @@ func assertRuntimeOverrideInvariants(t *testing.T, store *db.Store, home string,
 	if payload.RuntimeOverride != runtime.ShellRuntime {
 		t.Fatalf("payload runtime_override = %q, want shell", payload.RuntimeOverride)
 	}
+	// ... and records it STRUCTURALLY for engine-side consumers (#1528).
+	if payload.EffectiveRuntime != runtime.ShellRuntime {
+		t.Fatalf("payload effective_runtime = %q, want shell (#1528)", payload.EffectiveRuntime)
+	}
 
 	// The runtime-session lock key named the OVERRIDE runtime, never codex.
 	events, err := store.ListJobEvents(ctx, jobID)

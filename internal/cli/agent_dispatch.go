@@ -495,10 +495,12 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			_ = retainedLogFile.Close()
 		}
 	}
-	if overrideRuntime != "" {
-		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "runtime_override", Message: jobRuntimeOverrideEventMessage(agent.Runtime, effectiveAgent, lockKey)}); err != nil {
-			return localAgentJobOutput{}, err
-		}
+	// Journal the effective runtime for EVERY job, not only overridden ones
+	// (#1528): the runtime_override event for history, and the payload field
+	// (below, before the run) so engine-side consumers read a field instead of
+	// parsing a sentence.
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "runtime_override", Message: jobRuntimeOverrideEventMessage(agent.Runtime, effectiveAgent, lockKey)}); err != nil {
+		return localAgentJobOutput{}, err
 	}
 	runCtx := ctx
 	if managed.OK {
@@ -517,6 +519,11 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	}
 	payload, err := daemonJobPayload(job)
 	if err != nil {
+		return localAgentJobOutput{}, err
+	}
+	// Persist the effective runtime BEFORE the run so the terminal payload —
+	// the record SucceededReviewVerdicts decodes — carries it (#1528).
+	if err := persistJobEffectiveRuntime(ctx, store, job.ID, effectiveAgent.Runtime); err != nil {
 		return localAgentJobOutput{}, err
 	}
 	quotaHooks := newQuotaRoleUnavailableHooks(store, request.Home, io.Discard)
@@ -831,7 +838,7 @@ func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, rec
 			request.HeadSHA = pr.HeadSHA
 		}
 	}
-	if match, detected, err := workflow.DetectReviewLoop(ctx, store, repo.FullName(), request.PullRequest, request.HeadSHA); err != nil {
+	if match, detected, err := workflow.DetectReviewLoop(ctx, store, repo.FullName(), request.PullRequest, request.HeadSHA, request.Agent); err != nil {
 		return localAgentDispatchRequest{}, err
 	} else if detected {
 		return localAgentDispatchRequest{}, errors.New(match.Reason())

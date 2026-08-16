@@ -1,0 +1,167 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/workflow"
+)
+
+// Effective-runtime recording E2Es (#1528): a job dispatched with NO --runtime
+// override must STILL record the runtime it ran on — structurally on the job
+// payload (payload.effective_runtime, the field the review-loop family
+// resolver reads) and in the journal (the runtime_override job event). Before
+// #1528 the event was emitted only for overridden jobs, so a default-runtime
+// job's family survived only in the posted PR comment — a record no
+// engine-side check can read. Deterministic, NO-LLM, offline: the agent's
+// DEFAULT runtime is shell, so no override flag is involved at all.
+
+// effectiveRuntimeE2EHome registers "shell-asker" whose DEFAULT runtime is
+// shell; RuntimeRef carries the fixture script, so a plain `agent ask` runs
+// the script with no --runtime/--session flags.
+func effectiveRuntimeE2EHome(t *testing.T, script string) (string, *db.Store) {
+	t.Helper()
+	home, _, store := heartbeatLoopE2EHome(t)
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	if err := store.UpsertAgent(context.Background(), db.Agent{
+		Name:           "shell-asker",
+		Role:           "worker",
+		Runtime:        runtime.ShellRuntime,
+		RuntimeRef:     script,
+		RepoScope:      "owner/repo",
+		Capabilities:   []string{"ask"},
+		AutonomyPolicy: runtime.AutonomyPolicyAuto,
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	return home, store
+}
+
+// assertEffectiveRuntimeRecordedWithoutOverride holds the shared post-run
+// assertions for both the foreground and daemon paths.
+func assertEffectiveRuntimeRecordedWithoutOverride(t *testing.T, store *db.Store, jobID string, marker string) {
+	t.Helper()
+	ctx := context.Background()
+
+	// The shell fixture really ran and the job reached terminal succeeded.
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("shell fixture did not run (marker missing): %v", err)
+	}
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob(%s): %v", jobID, err)
+	}
+	if job.State != string(workflow.JobSucceeded) {
+		t.Fatalf("job state = %q, want succeeded", job.State)
+	}
+
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload: %v", err)
+	}
+	// PIN the fixture: this job carried NO override — the distinguishing
+	// property of this test. A fixture that silently grew an override would
+	// pass while testing nothing.
+	if payload.RuntimeOverride != "" {
+		t.Fatalf("fixture weakened: payload runtime_override = %q, want empty (this test is the NO-override case)", payload.RuntimeOverride)
+	}
+	// Structural record: the effective runtime survives into the TERMINAL
+	// payload — the exact record SucceededReviewVerdicts decodes.
+	if payload.EffectiveRuntime != runtime.ShellRuntime {
+		t.Fatalf("payload effective_runtime = %q, want shell recorded for a default-runtime job (#1528)", payload.EffectiveRuntime)
+	}
+
+	// Journal record: the runtime_override event is emitted for EVERY job now,
+	// not only overridden ones.
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	var runtimeEvent string
+	for _, event := range events {
+		if event.Kind == "runtime_override" {
+			runtimeEvent = event.Message
+		}
+	}
+	if runtimeEvent == "" {
+		t.Fatalf("expected a runtime_override job event for a NO-override job, got %+v", events)
+	}
+	if !strings.Contains(runtimeEvent, "job runs on runtime shell (agent default shell)") {
+		t.Fatalf("runtime_override event %q must expose the effective runtime for a default-runtime job", runtimeEvent)
+	}
+}
+
+// TestEffectiveRuntimeRecordedWithoutOverrideForegroundE2E drives the real CLI
+// foreground path: `agent ask` with NO --runtime on a shell-default agent.
+func TestEffectiveRuntimeRecordedWithoutOverrideForegroundE2E(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "shell-default-ran")
+	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
+
+	var out, errBuf bytes.Buffer
+	code := Run([]string{
+		"agent", "ask", "shell-asker", "what is the state of the repo?",
+		"--home", home,
+		"--repo", "owner/repo",
+		"--json",
+	}, &out, &errBuf)
+	if code != 0 {
+		t.Fatalf("agent ask exit = %d, stderr=%s", code, errBuf.String())
+	}
+	var output localAgentJobOutput
+	if err := json.Unmarshal(out.Bytes(), &output); err != nil {
+		t.Fatalf("parse ask output %q: %v", out.String(), err)
+	}
+	if output.State != string(workflow.JobSucceeded) {
+		t.Fatalf("foreground ask state = %q, want succeeded", output.State)
+	}
+	assertEffectiveRuntimeRecordedWithoutOverride(t, store, output.JobID, marker)
+}
+
+// TestEffectiveRuntimeRecordedWithoutOverrideDaemonE2E drives the DAEMON path:
+// a background job with no override, claimed and run by the REAL worker tick.
+func TestEffectiveRuntimeRecordedWithoutOverrideDaemonE2E(t *testing.T) {
+	ctx := context.Background()
+	marker := filepath.Join(t.TempDir(), "shell-default-ran-daemon")
+	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
+
+	var out, errBuf bytes.Buffer
+	code := Run([]string{
+		"agent", "ask", "shell-asker", "what is the state of the repo?",
+		"--home", home,
+		"--repo", "owner/repo",
+		"--background",
+		"--json",
+	}, &out, &errBuf)
+	if code != 0 {
+		t.Fatalf("agent ask --background exit = %d, stderr=%s", code, errBuf.String())
+	}
+	var output localAgentJobOutput
+	if err := json.Unmarshal(out.Bytes(), &output); err != nil {
+		t.Fatalf("parse ask output %q: %v", out.String(), err)
+	}
+	if output.State != string(workflow.JobQueued) {
+		t.Fatalf("background ask state = %q, want queued", output.State)
+	}
+	// Nothing ran at enqueue time: the fixture must not have executed yet.
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("shell fixture ran at enqueue time (err=%v)", err)
+	}
+
+	worker := defaultJobWorker(store, io.Discard, home)
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, time.Now().UTC(), nil, nil); err != nil {
+		t.Fatalf("worker tick: %v", err)
+	}
+	assertEffectiveRuntimeRecordedWithoutOverride(t, store, output.JobID, marker)
+}

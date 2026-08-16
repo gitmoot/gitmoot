@@ -493,11 +493,15 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// path below, both of which derive from this ctx.
 	ctx = workflow.WithRuntimeSelfOwnerToken(ctx, ownerToken)
 	// Expose the effective runtime (and the session lock it runs under) in job
-	// history so an overridden background job is observable (#531).
-	if overridden {
-		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "runtime_override", Message: jobRuntimeOverrideEventMessage(defaultRuntime, agent, lockKey)}); eventErr != nil {
-			writeLine(w.Stdout, "job %s runtime_override event failed: %v", job.ID, eventErr)
-		}
+	// history for EVERY job, not only overridden ones (#1528): the review-loop
+	// family resolver prefers this recorded runtime over the registry default,
+	// and jobs without it leave their family only in the posted PR comment — a
+	// record no engine-side check can read.
+	if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "runtime_override", Message: jobRuntimeOverrideEventMessage(defaultRuntime, agent, lockKey)}); eventErr != nil {
+		writeLine(w.Stdout, "job %s runtime_override event failed: %v", job.ID, eventErr)
+	}
+	if persistErr := persistJobEffectiveRuntime(ctx, w.Store, job.ID, agent.Runtime); persistErr != nil {
+		writeLine(w.Stdout, "job %s effective-runtime persistence failed: %v", job.ID, persistErr)
 	}
 	// This is the last filesystem authorization check before adapter delivery.
 	// It runs after runtime-session admission so a symlink retargeted while the job
