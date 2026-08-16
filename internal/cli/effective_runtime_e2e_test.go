@@ -369,6 +369,134 @@ func TestEffectiveRuntimePersistenceFailureBlocksForegroundExecutionDurably(t *t
 	}
 }
 
+func TestEffectiveRuntimePersistenceFailureReportsForegroundSettlementFailure(t *testing.T) {
+	t.Run("lost state CAS", func(t *testing.T) {
+		ctx := context.Background()
+		marker := filepath.Join(t.TempDir(), "must-not-run-after-cas-loss")
+		home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
+
+		raw, err := sql.Open("sqlite", store.DatabasePath())
+		if err != nil {
+			t.Fatalf("open raw sqlite: %v", err)
+		}
+		defer raw.Close()
+		if _, err := raw.Exec(`CREATE TRIGGER move_foreground_job_before_failed_settlement
+			AFTER INSERT ON jobs
+			WHEN instr(NEW.payload, '"effective_runtime"') > 0
+			BEGIN
+				UPDATE jobs SET payload = 'null', state = 'running' WHERE id = NEW.id;
+			END`); err != nil {
+			t.Fatalf("create state-change trigger: %v", err)
+		}
+
+		var out, errBuf bytes.Buffer
+		code := Run([]string{
+			"agent", "ask", "shell-asker", "do not run after losing the settlement CAS",
+			"--home", home,
+			"--repo", "owner/repo",
+			"--json",
+		}, &out, &errBuf)
+		if code == 0 {
+			t.Fatalf("foreground ask exit = 0 after settlement CAS loss, output=%s", out.String())
+		}
+		if !strings.Contains(errBuf.String(), "job payload must be a JSON object") {
+			t.Fatalf("foreground error = %q, want malformed stored-payload cause", errBuf.String())
+		}
+		if !strings.Contains(errBuf.String(), `lost the queued-to-failed state CAS; current job state is "running"`) {
+			t.Fatalf("foreground error = %q, want explicit settlement CAS-loss diagnostic", errBuf.String())
+		}
+		if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("adapter ran after the foreground persistence backstop failed (marker err=%v)", err)
+		}
+
+		jobs, err := store.ListJobs(ctx)
+		if err != nil {
+			t.Fatalf("ListJobs: %v", err)
+		}
+		if len(jobs) != 1 {
+			t.Fatalf("jobs = %d, want exactly the dispatched job", len(jobs))
+		}
+		if jobs[0].State != string(workflow.JobRunning) {
+			t.Fatalf("job state = %q, want trigger-proven running CAS competitor", jobs[0].State)
+		}
+		events, err := store.ListJobEvents(ctx, jobs[0].ID)
+		if err != nil {
+			t.Fatalf("ListJobEvents: %v", err)
+		}
+		for _, event := range events {
+			if event.Kind == string(workflow.JobFailed) {
+				t.Fatalf("failed event emitted despite lost settlement CAS: %+v", event)
+			}
+		}
+	})
+
+	t.Run("transition error", func(t *testing.T) {
+		ctx := context.Background()
+		marker := filepath.Join(t.TempDir(), "must-not-run-after-transition-error")
+		home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
+
+		raw, err := sql.Open("sqlite", store.DatabasePath())
+		if err != nil {
+			t.Fatalf("open raw sqlite: %v", err)
+		}
+		defer raw.Close()
+		if _, err := raw.Exec(`CREATE TRIGGER corrupt_payload_before_foreground_settlement_error
+			AFTER INSERT ON jobs
+			WHEN instr(NEW.payload, '"effective_runtime"') > 0
+			BEGIN
+				UPDATE jobs SET payload = 'null' WHERE id = NEW.id;
+			END;
+			CREATE TRIGGER reject_foreground_settlement_transition
+			BEFORE UPDATE OF state ON jobs
+			WHEN OLD.state = 'queued' AND NEW.state = 'failed'
+			BEGIN
+				SELECT RAISE(FAIL, 'forced foreground settlement transition error');
+			END`); err != nil {
+			t.Fatalf("create persistence and settlement triggers: %v", err)
+		}
+
+		var out, errBuf bytes.Buffer
+		code := Run([]string{
+			"agent", "ask", "shell-asker", "do not run after a settlement transition error",
+			"--home", home,
+			"--repo", "owner/repo",
+			"--json",
+		}, &out, &errBuf)
+		if code == 0 {
+			t.Fatalf("foreground ask exit = 0 after settlement transition error, output=%s", out.String())
+		}
+		if !strings.Contains(errBuf.String(), "job payload must be a JSON object") {
+			t.Fatalf("foreground error = %q, want malformed stored-payload cause", errBuf.String())
+		}
+		if !strings.Contains(errBuf.String(), "forced foreground settlement transition error") {
+			t.Fatalf("foreground error = %q, want settlement transition error", errBuf.String())
+		}
+		if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("adapter ran after the foreground persistence backstop failed (marker err=%v)", err)
+		}
+
+		jobs, err := store.ListJobs(ctx)
+		if err != nil {
+			t.Fatalf("ListJobs: %v", err)
+		}
+		if len(jobs) != 1 {
+			t.Fatalf("jobs = %d, want exactly the dispatched job", len(jobs))
+		}
+		if jobs[0].State != string(workflow.JobQueued) {
+			t.Fatalf("job state = %q, want queued after rejected settlement transition", jobs[0].State)
+		}
+		events, err := store.ListJobEvents(ctx, jobs[0].ID)
+		if err != nil {
+			t.Fatalf("ListJobEvents: %v", err)
+		}
+		for _, event := range events {
+			if event.Kind == string(workflow.JobFailed) {
+				t.Fatalf("failed event emitted despite rejected settlement transition: %+v", event)
+			}
+		}
+	})
+}
+
 // TestForegroundEffectiveRuntimePersistsAtomicallyWithEnqueue closes the last
 // foreground fail-stop gap (#1528): even if both a later effective-runtime
 // update and queued->failed settlement are unavailable, the job never depends

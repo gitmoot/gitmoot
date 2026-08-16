@@ -542,12 +542,20 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		// the daemon), the caller observes the error synchronously, and the
 		// still-held session lock is released by the defer above.
 		settleErr := fmt.Errorf("persist effective runtime before execution: %w", err)
-		if _, transErr := store.TransitionJobStateWithEvent(ctx, job.ID, string(workflow.JobQueued), string(workflow.JobFailed), db.JobEvent{
+		transitioned, transErr := store.TransitionJobStateWithEvent(ctx, job.ID, string(workflow.JobQueued), string(workflow.JobFailed), db.JobEvent{
 			JobID:   job.ID,
 			Kind:    string(workflow.JobFailed),
 			Message: settleErr.Error(),
-		}); transErr != nil {
+		})
+		if transErr != nil {
 			return localAgentJobOutput{}, fmt.Errorf("%w (additionally failed to settle the queued job: %v)", settleErr, transErr)
+		}
+		if !transitioned {
+			current, currentErr := store.GetJob(ctx, job.ID)
+			if currentErr != nil {
+				return localAgentJobOutput{}, fmt.Errorf("%w (additionally lost the queued-to-failed state CAS and could not read the current job state: %v)", settleErr, currentErr)
+			}
+			return localAgentJobOutput{}, fmt.Errorf("%w (additionally lost the queued-to-failed state CAS; current job state is %q)", settleErr, current.State)
 		}
 		return localAgentJobOutput{}, settleErr
 	}
