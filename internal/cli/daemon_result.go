@@ -45,6 +45,10 @@ func (w jobWorker) finishQueuedJobAtGeneration(ctx context.Context, jobID string
 	if err != nil {
 		return err
 	}
+	return w.afterQueuedJobTransition(ctx, jobID, state, cause, transitioned)
+}
+
+func (w jobWorker) afterQueuedJobTransition(ctx context.Context, jobID string, state workflow.JobState, cause error, transitioned bool) error {
 	if transitioned {
 		writeLine(w.Stdout, "job %s %s: %v", jobID, state, cause)
 		// Best-effort outbound emit (#446) for a DAEMON-owned pre-flight terminal

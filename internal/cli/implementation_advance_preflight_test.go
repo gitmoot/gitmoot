@@ -145,12 +145,16 @@ func TestAdvanceImplementationPreflightBoundsPersistentErrorsAcrossTicks(t *test
 			if !retryAt.After(result.tickStarted[tick]) {
 				t.Fatalf("tick %d retry time %s is not after scheduler start %s", tick+1, retryAt, result.tickStarted[tick])
 			}
+			if hold := retryAt.Sub(result.tickStarted[tick]); hold < time.Second {
+				t.Fatalf("tick %d retry hold = %s, want at least %s", tick+1, hold, time.Second)
+			}
 		}
 	}
 	for _, want := range []string{
-		"implementation preflight retry bound exhausted after 3 attempts",
+		"automatic implementation preflight retries exhausted after 3 attempts",
 		"task task-1514", result.fixWorktree, "compare implementation worktree HEAD",
-		"no in-place recovery is available", "dispatch a fresh fix job against pull request #1514's current head",
+		"inspect and repair the worktree", "gitmoot job retry advance-fix-persistent-preflight-error",
+		"dispatch a fresh fix job against pull request #1514's current head",
 	} {
 		if !strings.Contains(result.failureMessage, want) {
 			t.Fatalf("exhaustion message missing %q: %s", want, result.failureMessage)
@@ -161,6 +165,57 @@ func TestAdvanceImplementationPreflightBoundsPersistentErrorsAcrossTicks(t *test
 	}
 	if result.healthyState != string(workflow.JobSucceeded) || result.healthyCalls != 1 {
 		t.Fatalf("healthy sibling state=%s calls=%d, want succeeded once in the first batch", result.healthyState, result.healthyCalls)
+	}
+	if result.exhaustedEvents != 1 || result.deferredEvents != 2 {
+		t.Fatalf("retry event kinds exhausted=%d deferred=%d, want 1/2", result.exhaustedEvents, result.deferredEvents)
+	}
+	if result.blockerSuggestedActionPresent {
+		t.Fatal("stale blocker_suggested_action survived in persisted payload")
+	}
+	if !result.remedyCleared {
+		t.Fatal("repair plus job retry did not clear the exhausted preflight refusal")
+	}
+}
+
+func TestImplementationPreflightExhaustionReselectionIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	payload := workflow.JobPayload{
+		Repo: "owner/repo", TaskID: "task-1514", WorktreePath: "/tmp/fix", PullRequest: 1514,
+		BlockerClass: "implementation_preflight", BlockerAttempts: implementationPreflightAttemptLimit,
+		BlockerPreDelivery: true,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "exhausted-reselection", Agent: "lead", Type: "implement", State: string(workflow.JobQueued), Payload: string(encoded)}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: "exhausted-reselection", Kind: blockerExhaustedEventKind, Message: "recorded before interruption"}); err != nil {
+		t.Fatalf("AddJobEvent returned error: %v", err)
+	}
+	worker := defaultJobWorker(store, io.Discard)
+	job, parsed, err := daemonWorkerJobPayload(ctx, store, "exhausted-reselection")
+	if err != nil {
+		t.Fatalf("load queued exhausted job: %v", err)
+	}
+	if err := worker.retryImplementationPreflight(ctx, job, parsed, errors.New("persistent git failure")); err != nil {
+		t.Fatalf("retryImplementationPreflight returned error: %v", err)
+	}
+	after, parsed, err := daemonWorkerJobPayload(ctx, store, job.ID)
+	if err != nil {
+		t.Fatalf("load settled job: %v", err)
+	}
+	if after.State != string(workflow.JobFailed) || parsed.BlockerAttempts != implementationPreflightAttemptLimit {
+		t.Fatalf("settled state=%s attempts=%d, want failed/%d", after.State, parsed.BlockerAttempts, implementationPreflightAttemptLimit)
+	}
+	events, err := store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if got := countJobEventsByKind(events, blockerExhaustedEventKind); got != 1 {
+		t.Fatalf("exhausted events = %d, want 1", got)
 	}
 }
 
@@ -260,6 +315,9 @@ func TestAdvanceImplementationPreflightRetriesTransientErrorThenProceeds(t *test
 	if result.healthyState != string(workflow.JobSucceeded) || result.healthyCalls != 1 {
 		t.Fatalf("healthy sibling state=%s calls=%d, want succeeded once while peer retried", result.healthyState, result.healthyCalls)
 	}
+	if len(result.deliveredPrompts) != 1 || strings.Contains(result.deliveredPrompts[0], "NOTE (operational retry") {
+		t.Fatalf("pre-delivery retry prompt carried side-effect reconciliation: %q", result.deliveredPrompts)
+	}
 }
 
 func TestAdvanceImplementationPreflightRejectsMissingHeadBeforeModel(t *testing.T) {
@@ -311,21 +369,25 @@ func TestAdvanceImplementationPreflightRejectsDetachedAndWrongBranchBeforeModel(
 }
 
 type advanceImplementationPreflightResult struct {
-	message        string
-	currentHead    string
-	expectedHead   string
-	fixWorktree    string
-	adapterCalls   int
-	jobState       string
-	remedyCleared  bool
-	runErr         error
-	failureMessage string
-	healthyState   string
-	healthyCalls   int
-	tickErrors     []error
-	attempts       []int
-	retryAts       []string
-	tickStarted    []time.Time
+	message                       string
+	currentHead                   string
+	expectedHead                  string
+	fixWorktree                   string
+	adapterCalls                  int
+	jobState                      string
+	remedyCleared                 bool
+	runErr                        error
+	failureMessage                string
+	healthyState                  string
+	healthyCalls                  int
+	tickErrors                    []error
+	attempts                      []int
+	retryAts                      []string
+	tickStarted                   []time.Time
+	deliveredPrompts              []string
+	exhaustedEvents               int
+	deferredEvents                int
+	blockerSuggestedActionPresent bool
 }
 
 func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advanceImplementationPreflightResult {
@@ -419,6 +481,24 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 			ID: "z-healthy-after-preflight-error", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main",
 		})
 	}
+	if mode == "persistent-preflight-error" {
+		seeded, err := store.GetJob(ctx, jobID)
+		if err != nil {
+			t.Fatalf("GetJob before stale-action seed: %v", err)
+		}
+		seededPayload, err := daemonJobPayload(seeded)
+		if err != nil {
+			t.Fatalf("daemonJobPayload before stale-action seed: %v", err)
+		}
+		seededPayload.BlockerSuggestedAction = "stale checkout remedy"
+		encoded, err := json.Marshal(seededPayload)
+		if err != nil {
+			t.Fatalf("marshal stale-action seed: %v", err)
+		}
+		if err := store.UpdateJobPayload(ctx, jobID, string(encoded)); err != nil {
+			t.Fatalf("UpdateJobPayload stale-action seed: %v", err)
+		}
+	}
 	beforeRemote := strings.TrimSpace(runGitOutput(t, registered, "ls-remote", "origin", "refs/heads/"+branch))
 	adapter := &cliWorkerFakeAdapter{output: resultJSON("failed")}
 	healthyAdapter := &cliWorkerFakeAdapter{output: resultJSON("approved")}
@@ -478,6 +558,11 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 	if err != nil {
 		t.Fatalf("GetJob after run: %v", err)
 	}
+	var persistedEnvelope map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(after.Payload), &persistedEnvelope); err != nil {
+		t.Fatalf("unmarshal persisted payload: %v", err)
+	}
+	_, blockerSuggestedActionPresent := persistedEnvelope["blocker_suggested_action"]
 	healthyState := ""
 	if mode == "persistent-preflight-error" || mode == "transient-preflight-error" {
 		healthy, err := store.GetJob(ctx, "z-healthy-after-preflight-error")
@@ -519,12 +604,20 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 	}
 	message := ""
 	failureMessage := ""
+	exhaustedEvents := 0
+	deferredEvents := 0
 	for _, event := range events {
 		if event.Kind == string(workflow.JobBlocked) {
 			message = event.Message
 		}
 		if event.Kind == string(workflow.JobFailed) {
 			failureMessage = event.Message
+		}
+		if event.Kind == blockerExhaustedEventKind {
+			exhaustedEvents++
+		}
+		if event.Kind == blockerDeferredEventKind {
+			deferredEvents++
 		}
 	}
 	remedyCleared := false
@@ -560,14 +653,40 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 			t.Fatalf("fresh dispatch head did not clear missing-head preflight: %v", err)
 		}
 		remedyCleared = true
+	} else if mode == "persistent-preflight-error" {
+		restorePreflightFixture()
+		retried, err := workflow.RetryJob(ctx, store, job.ID)
+		if err != nil {
+			t.Fatalf("retry repaired exhausted job: %v", err)
+		}
+		retriedPayload, err := daemonJobPayload(retried)
+		if err != nil {
+			t.Fatalf("daemonJobPayload after retry: %v", err)
+		}
+		if _, err := implementationFinalizationTargetFor(ctx, store, retried, retriedPayload, implementationFinalizationBeforeRun); err != nil {
+			t.Fatalf("repair plus job retry did not clear preflight: %v", err)
+		}
+		remedyCleared = true
 	}
 	return advanceImplementationPreflightResult{
 		message: message, currentHead: currentHead, expectedHead: expectedHead, fixWorktree: fixWorktree,
 		adapterCalls: adapter.calls, jobState: after.State, remedyCleared: remedyCleared,
 		runErr: runErr, failureMessage: failureMessage, healthyState: healthyState,
 		healthyCalls: healthyAdapter.calls, tickErrors: tickErrors, attempts: attempts,
-		retryAts: retryAts, tickStarted: tickStarted,
+		retryAts: retryAts, tickStarted: tickStarted, deliveredPrompts: append([]string(nil), adapter.prompts...),
+		exhaustedEvents: exhaustedEvents, deferredEvents: deferredEvents,
+		blockerSuggestedActionPresent: blockerSuggestedActionPresent,
 	}
+}
+
+func countJobEventsByKind(events []db.JobEvent, kind string) int {
+	count := 0
+	for _, event := range events {
+		if event.Kind == kind {
+			count++
+		}
+	}
+	return count
 }
 
 func breakGitBranchTip(t *testing.T, worktree, branch string) func() {
