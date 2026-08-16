@@ -60,7 +60,7 @@ func (m ReviewLoopMatch) Reason() string {
 //
 // On a match, the event is claimed against the matched succeeded job. No new
 // review job is created, and no prior result is returned to the caller.
-func DetectReviewLoop(ctx context.Context, store *db.Store, repo string, pullRequest int, headSHA string, requestingAgents ...string) (ReviewLoopMatch, bool, error) {
+func DetectReviewLoop(ctx context.Context, store *db.Store, repo string, pullRequest int, headSHA string, requestingAgents []string) (ReviewLoopMatch, bool, error) {
 	repo = strings.ToLower(strings.TrimSpace(repo))
 	headSHA = strings.ToLower(strings.TrimSpace(headSHA))
 	verdicts, err := store.SucceededReviewVerdicts(ctx, repo, pullRequest)
@@ -136,40 +136,38 @@ func DetectReviewLoop(ctx context.Context, store *db.Store, repo string, pullReq
 // names a represented requesting family for the refusal message when one could
 // be resolved; it stays empty for the fail-closed unknown case.
 func requestingFamilyRepresented(ctx context.Context, store *db.Store, matched []db.SucceededReviewVerdict, requestingAgents []string) (bool, string, error) {
-	families := make([]string, len(matched))
-	known := make([]bool, len(matched))
-	for i, verdict := range matched {
+	representedFamilies := make(map[string]struct{}, len(matched))
+	for _, verdict := range matched {
 		family, ok, err := ResolveRuntimeFamily(ctx, store, verdict.Agent, verdict.EffectiveRuntime)
 		if err != nil {
-			return false, "", err
+			return true, "", err
 		}
-		families[i], known[i] = family, ok
+		if !ok {
+			return true, "", nil
+		}
+		representedFamilies[family] = struct{}{}
 	}
-	family := ""
+
+	requestingFamilies := make([]string, 0, len(requestingAgents))
 	for _, requester := range requestingAgents {
 		requesterFamily, ok, err := ResolveRuntimeFamily(ctx, store, requester, "")
 		if err != nil {
-			return false, "", err
+			return true, "", err
 		}
 		if !ok {
-			continue
+			return true, "", nil
 		}
-		provablyNew := true
-		for i := range matched {
-			if !known[i] {
-				provablyNew = false
-				continue
-			}
-			if families[i] == requesterFamily {
-				provablyNew = false
-				if family == "" {
-					family = requesterFamily
-				}
-			}
-		}
-		if provablyNew {
+		requestingFamilies = append(requestingFamilies, requesterFamily)
+	}
+
+	representedFamily := ""
+	for _, requesterFamily := range requestingFamilies {
+		if _, represented := representedFamilies[requesterFamily]; !represented {
 			return false, "", nil
 		}
+		if representedFamily == "" {
+			representedFamily = requesterFamily
+		}
 	}
-	return true, family, nil
+	return true, representedFamily, nil
 }

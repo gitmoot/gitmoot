@@ -154,11 +154,21 @@ func isolatedShellStageRuntimeSessionKey(payload workflow.JobPayload, jobID stri
 	return "runtime:" + runtime.ShellRuntime + ":job:" + shortHash(id), true
 }
 
-// jobRuntimeOverrideEventMessage renders the runtime_override job event that
-// exposes the effective runtime (and the session lock it ran under) in job
-// history. Since #1528 the event is journalled for EVERY job — not only
-// overridden ones — so the family a job ran on survives in engine-readable
-// history even when no override was supplied.
+// Runtime selection is journalled for every job so the family a job ran on
+// survives in engine-readable history. A real override retains the established
+// runtime_override kind; default selection uses effective_runtime.
+const (
+	effectiveRuntimeEventKind = "effective_runtime"
+	runtimeOverrideEventKind  = "runtime_override"
+)
+
+func jobRuntimeEventKind(overridden bool) string {
+	if overridden {
+		return runtimeOverrideEventKind
+	}
+	return effectiveRuntimeEventKind
+}
+
 func jobRuntimeOverrideEventMessage(defaultRuntime string, effective runtime.Agent, lockKey string) string {
 	message := fmt.Sprintf("job runs on runtime %s (agent default %s)", effective.Runtime, defaultRuntime)
 	if strings.TrimSpace(lockKey) != "" {
@@ -184,15 +194,28 @@ func persistJobEffectiveRuntime(ctx context.Context, store *db.Store, jobID stri
 	if err != nil {
 		return err
 	}
-	payload, err := workflow.ParseJobPayload(job.Payload)
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(job.Payload), &envelope); err != nil {
+		return err
+	}
+	if envelope == nil {
+		return errors.New("job payload must be a JSON object")
+	}
+	var recorded string
+	if raw, ok := envelope["effective_runtime"]; ok {
+		if err := json.Unmarshal(raw, &recorded); err != nil {
+			return fmt.Errorf("decode effective_runtime: %w", err)
+		}
+	}
+	if strings.TrimSpace(recorded) == effective {
+		return nil
+	}
+	encodedRuntime, err := json.Marshal(effective)
 	if err != nil {
 		return err
 	}
-	if payload.EffectiveRuntime == effective {
-		return nil
-	}
-	payload.EffectiveRuntime = effective
-	encoded, err := json.Marshal(payload)
+	envelope["effective_runtime"] = encodedRuntime
+	encoded, err := json.Marshal(envelope)
 	if err != nil {
 		return err
 	}

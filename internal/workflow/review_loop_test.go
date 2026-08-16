@@ -8,6 +8,8 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 )
 
+var _ func(context.Context, *db.Store, string, int, string, []string) (ReviewLoopMatch, bool, error) = DetectReviewLoop
+
 // Review-loop family-count tests (#1528). The guard must count DISTINCT
 // REVIEWER FAMILIES at the head, not agreement among whoever happened to run.
 // Every test pins the fixture property it is named for — asserted or derived
@@ -79,7 +81,7 @@ func TestDetectReviewLoopSameFamilySameHeadRefused(t *testing.T) {
 	seedReviewLoopAgent(t, store, "g7-review", "codex", "gpt-5.6-sol")
 	seedReviewLoopVerdict(t, store, "prior-review", "g7-review", "head-a", "approved", "codex")
 
-	match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", "g7-review")
+	match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"})
 	if err != nil {
 		t.Fatalf("DetectReviewLoop: %v", err)
 	}
@@ -129,7 +131,7 @@ func TestDetectReviewLoopUnrepresentedFamilyAllowed(t *testing.T) {
 		t.Fatalf("fixture weakened: %s and %s must be different runtime families", holder.Name, requester.Name)
 	}
 
-	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", "gm-review-kimi"); err != nil {
+	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"gm-review-kimi"}); err != nil {
 		t.Fatalf("DetectReviewLoop: %v", err)
 	} else if detected {
 		t.Fatal("a review from an unrepresented family is new information; the guard must allow it")
@@ -165,7 +167,7 @@ func TestDetectReviewLoopDifferentNameSameFamilyRefused(t *testing.T) {
 			holder.Runtime, holder.Model, requester.Runtime, requester.Model)
 	}
 
-	match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", "af-review-sol")
+	match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"af-review-sol"})
 	if err != nil {
 		t.Fatalf("DetectReviewLoop: %v", err)
 	}
@@ -205,7 +207,7 @@ func TestDetectReviewLoopMixedDecisionsAllowed(t *testing.T) {
 
 	// The requester's family (claude) IS represented at the head; only the
 	// mixed decisions may allow this.
-	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", "gm-review-opus"); err != nil {
+	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"gm-review-opus"}); err != nil {
 		t.Fatalf("DetectReviewLoop: %v", err)
 	} else if detected {
 		t.Fatal("mixed decisions at the head must still proceed; the earlier claim is unstable")
@@ -219,7 +221,7 @@ func TestDetectReviewLoopEmptyHeadRule(t *testing.T) {
 	store := openEngineStore(t)
 	seedReviewLoopAgent(t, store, "gm-review-kimi", "kimi", "kimi-for-coding")
 
-	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "", "gm-review-kimi"); err != nil {
+	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "", []string{"gm-review-kimi"}); err != nil {
 		t.Fatalf("DetectReviewLoop(empty, no history): %v", err)
 	} else if detected {
 		t.Fatal("empty head with no succeeded history must proceed")
@@ -229,7 +231,7 @@ func TestDetectReviewLoopEmptyHeadRule(t *testing.T) {
 	// through once history exists: the empty head cannot prove a new commit.
 	seedReviewLoopAgent(t, store, "gm-review-opus", "claude", "claude-opus-4-8")
 	seedReviewLoopVerdict(t, store, "prior-review", "gm-review-opus", "head-a", "approved", "claude")
-	match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "", "gm-review-kimi")
+	match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "", []string{"gm-review-kimi"})
 	if err != nil {
 		t.Fatalf("DetectReviewLoop(empty, with history): %v", err)
 	}
@@ -255,7 +257,7 @@ func TestDetectReviewLoopUnknownFamilyFailsClosed(t *testing.T) {
 		if _, err := store.GetAgent(ctx, "ghost"); err == nil {
 			t.Fatal("fixture weakened: ghost must be ABSENT from the registry")
 		}
-		match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", "gm-review-kimi")
+		match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"gm-review-kimi"})
 		if err != nil {
 			t.Fatalf("DetectReviewLoop: %v", err)
 		}
@@ -276,10 +278,28 @@ func TestDetectReviewLoopUnknownFamilyFailsClosed(t *testing.T) {
 		if _, err := store.GetAgent(ctx, "ghost-requester"); err == nil {
 			t.Fatal("fixture weakened: ghost-requester must be ABSENT from the registry")
 		}
-		if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-b", "ghost-requester"); err != nil {
+		if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-b", []string{"ghost-requester"}); err != nil {
 			t.Fatalf("DetectReviewLoop: %v", err)
 		} else if !detected {
 			t.Fatal("a requester whose family cannot be determined cannot prove new information; must fail closed")
+		}
+	})
+
+	t.Run("mixed requester batch with unknown family", func(t *testing.T) {
+		seedReviewLoopAgent(t, store, "g7-review-batch", "codex", "gpt-5.6-sol")
+		seedReviewLoopVerdict(t, store, "prior-review-batch", "g7-review-batch", "head-c", "approved", "codex")
+		if _, err := store.GetAgent(ctx, "ghost-requester-batch"); err == nil {
+			t.Fatal("fixture weakened: ghost-requester-batch must be ABSENT from the registry")
+		}
+		match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-c", []string{"ghost-requester-batch", "gm-review-kimi"})
+		if err != nil {
+			t.Fatalf("DetectReviewLoop: %v", err)
+		}
+		if !detected {
+			t.Fatal("one known-new requester must not hide an unresolved requester in the same batch")
+		}
+		if match.Family != "" {
+			t.Fatalf("mixed unknown batch must use the fail-closed refusal, got family %q", match.Family)
 		}
 	})
 }
