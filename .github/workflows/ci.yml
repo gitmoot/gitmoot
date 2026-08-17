@@ -153,7 +153,7 @@ jobs:
       # internal/cli already burns 482.8s on a green main, so a normal PR that adds
       # tests there crosses the ceiling and CI reports `panic: test timed out` under
       # the name of whichever test happened to be running — an innocent one. The
-      # -race gate has always been explicit (35m); this is the lane that was not.
+      # -race gate has always been explicit (20m); this is the lane that was not.
       - name: Test
         run: go test -timeout 25m ./...
 
