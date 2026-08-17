@@ -100,6 +100,14 @@ type localAgentDispatchRequest struct {
 	// DispatchWarning surfaces advisory pre-delivery checks to the operator. It
 	// is deliberately not persisted in the job payload.
 	DispatchWarning func(string)
+	// ReviewTaskHeadDivergence, when non-empty, records that a review rebound to
+	// the task owning (repo, branch) even though that task's registered checkout
+	// HEAD differs from the requested head (#1530): a fix-worktree leg pushed the
+	// branch from an independent clone and left the registered checkout behind.
+	// dispatchLocalAgentJob records it as a review_task_head_divergence job event
+	// once the job row exists, so the rebind stays visible instead of silent. It
+	// is set by prepareLocalReviewTask and never persisted in the job payload.
+	ReviewTaskHeadDivergence string
 }
 
 var promptCommitTokenRE = regexp.MustCompile(`\b[0-9a-fA-F]{7,64}\b`)
@@ -404,6 +412,14 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	}
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "route_selected", Message: routeSelectedMessage(request)}); err != nil {
 		return localAgentJobOutput{}, err
+	}
+	// #1530: a review that rebound to the branch-owning task despite a diverged
+	// registered-checkout HEAD must stay visible — a silent rebind would hide the
+	// exact state #1530 is about. The event names both SHAs.
+	if divergence := strings.TrimSpace(request.ReviewTaskHeadDivergence); divergence != "" {
+		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "review_task_head_divergence", Message: divergence}); err != nil {
+			return localAgentJobOutput{}, err
+		}
 	}
 	// Emit the #739 read-only isolation outcome now that the job row exists (job
 	// events carry a JobID FK). Allocated → observable worktree:<path> key; a
@@ -864,13 +880,31 @@ func prepareLocalReviewTask(ctx context.Context, store *db.Store, repo github.Re
 				if headErr != nil {
 					return localAgentDispatchRequest{}, headErr
 				}
-				if head == request.HeadSHA {
-					request.TaskID = task.ID
-					request.GoalID = firstNonEmpty(request.GoalID, task.GoalID)
-					request.TaskTitle = firstNonEmpty(request.TaskTitle, task.Title)
-					return request, nil
+				if head != request.HeadSHA {
+					// #1530: the disk-HEAD comparison was a proxy for "same unit of
+					// work", but the engine advances and deletes worktrees
+					// independently of the task row — a fix-worktree leg pushes the
+					// branch from an independent clone and leaves the registered
+					// checkout legitimately behind. A review never reads this
+					// checkout (it runs in its own exact-head read-only worktree),
+					// so the task owning (repo, branch) IS the same unit of work:
+					// bind attribution to it and record the divergence, rather
+					// than minting a review-pr-* identity the merge gate cannot
+					// attribute to any implement job. This rebind affects review
+					// attribution ONLY: every implement path that consumes
+					// task.WorktreePath re-validates the checkout independently
+					// (validateFixPassTaskWorktreeHead at dispatch, and the daemon
+					// pre-flight "checkout head is ..." guard deferred by the
+					// checkout-contention classifier).
+					request.ReviewTaskHeadDivergence = fmt.Sprintf(
+						"review rebound to task %s owning branch %s although its registered checkout HEAD %s differs from the requested head %s (#1530); the review runs in an exact-head read-only worktree, so the rebind affects attribution only",
+						task.ID, request.Branch, head, request.HeadSHA)
 				}
 			}
+			request.TaskID = task.ID
+			request.GoalID = firstNonEmpty(request.GoalID, task.GoalID)
+			request.TaskTitle = firstNonEmpty(request.TaskTitle, task.Title)
+			return request, nil
 		} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return localAgentDispatchRequest{}, err
 		}

@@ -162,3 +162,212 @@ func evaluateC1GateScenario(t *testing.T, implementTaskID string, reviewTaskID s
 	}
 	return decision
 }
+
+// #1530 acceptance 2 + 5, driven through the REAL dispatch path
+// (dispatchLocalAgentJob): a review dispatched at a head the branch-owning
+// task's registered checkout has NOT reached must still bind to that task,
+// record a review_task_head_divergence job event naming BOTH SHAs, and mint no
+// review-pr-* identity. The matching-head subtest pins the unchanged case: a
+// bind without divergence records no event.
+func TestDispatchReviewRebindsOwningTaskOnHeadDivergence(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		diverged      bool
+		wantEvent     bool
+		wantEventSHAa string // filled from fixture heads
+		wantEventSHAb string
+	}{
+		{name: "diverged head binds and records the divergence", diverged: true, wantEvent: true},
+		{name: "matching head binds without a divergence event", diverged: false, wantEvent: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, home := blockerE2EHome(t)
+			checkout, firstHead, secondHead := readonlyReviewWorktreeGitCheckout(t)
+			seedReviewDispatchFixture(t, store, checkout)
+			replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+				return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+			})
+			// The implement task owns (repo, branch); its registered checkout is a
+			// worktree pinned at the FIRST head — the strand a fix-worktree leg
+			// leaves behind when it pushes from an independent clone.
+			taskWorktree := filepath.Join(t.TempDir(), "task-worktree")
+			runGit(t, checkout, "worktree", "add", "--detach", taskWorktree, firstHead)
+			if got := readonlyWorktreeHead(t, taskWorktree); got != firstHead || firstHead == secondHead {
+				t.Fatalf("fixture pin failed: task worktree head=%q first=%q second=%q", got, firstHead, secondHead)
+			}
+			if err := store.UpsertTask(ctx, db.Task{
+				ID: "adhoc-impl", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Implement the fix",
+				State: string(workflow.TaskPullRequestOpen), Branch: "feature/review", WorktreePath: taskWorktree,
+			}); err != nil {
+				t.Fatalf("UpsertTask: %v", err)
+			}
+			dispatchHead := firstHead
+			if tc.diverged {
+				dispatchHead = secondHead
+			}
+			out, err := dispatchLocalAgentJob(ctx, store, reviewDispatchRequest(home, dispatchHead))
+			if err != nil {
+				t.Fatalf("dispatchLocalAgentJob: %v", err)
+			}
+			job, err := store.GetJob(ctx, out.JobID)
+			if err != nil {
+				t.Fatalf("GetJob: %v", err)
+			}
+			payload, err := daemonJobPayload(job)
+			if err != nil {
+				t.Fatalf("daemonJobPayload: %v", err)
+			}
+			if payload.TaskID != "adhoc-impl" {
+				t.Fatalf("review payload TaskID=%q, want rebound to the branch-owning task %q", payload.TaskID, "adhoc-impl")
+			}
+			events, err := store.ListJobEvents(ctx, job.ID)
+			if err != nil {
+				t.Fatalf("ListJobEvents: %v", err)
+			}
+			divergence := ""
+			for _, event := range events {
+				if event.Kind == "review_task_head_divergence" {
+					divergence = event.Message
+				}
+			}
+			if !tc.wantEvent {
+				if divergence != "" {
+					t.Fatalf("matching-head bind recorded a divergence event %q; want none", divergence)
+				}
+			} else {
+				for _, fragment := range []string{"adhoc-impl", firstHead, secondHead} {
+					if !strings.Contains(divergence, fragment) {
+						t.Fatalf("divergence event = %q, want it to name %q", divergence, fragment)
+					}
+				}
+			}
+			tasks, err := store.ListTasks(ctx)
+			if err != nil {
+				t.Fatalf("ListTasks: %v", err)
+			}
+			for _, task := range tasks {
+				if strings.HasPrefix(task.ID, "review-pr-") {
+					t.Fatalf("minted a fresh review identity %q despite the owning-task rebind", task.ID)
+				}
+			}
+		})
+	}
+}
+
+// #1530 acceptance 6: the measured strand end to end on an isolated home with
+// the shell runtime. A fix-worktree implement leg pushes the PR branch from an
+// independent clone (through the real implementation finalizer) and the clone is
+// removed; the implement task's registered checkout stays behind. The next
+// review must bind to the implement task — not mint review-pr-* — so the merge
+// gate can attribute it.
+func TestFixWorktreeStrandReviewBindsImplementTaskE2E(t *testing.T) {
+	ctx := context.Background()
+	store, home := blockerE2EHome(t)
+	const branch = "feature/fix-strand"
+	registered := createDaemonWorkerGitCheckout(t, "main")
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	runDaemonWorkerGit(t, filepath.Dir(remote), "init", "--bare", remote)
+	// origin stays the GitHub remote (dispatch repo resolution requires it); the
+	// bare repo stands in for the forge and is reached through a second remote.
+	runDaemonWorkerGit(t, registered, "remote", "add", "forge", remote)
+	runDaemonWorkerGit(t, registered, "switch", "-c", branch)
+	runDaemonWorkerGit(t, registered, "push", "-u", "forge", branch)
+	runDaemonWorkerGit(t, registered, "switch", "main")
+	strandedHead := strings.TrimSpace(runGitOutput(t, registered, "rev-parse", "forge/"+branch))
+	// The implement task's registered checkout: a linked worktree on the PR
+	// branch at the pre-fix head.
+	taskWorktree := filepath.Join(t.TempDir(), "task-worktree")
+	runDaemonWorkerGit(t, registered, "worktree", "add", taskWorktree, branch)
+	seedReviewDispatchFixture(t, store, registered)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "adhoc-impl", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Implement the fix",
+		State: string(workflow.TaskPullRequestOpen), Branch: branch, WorktreePath: taskWorktree,
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: "owner/repo", Number: 1530, URL: "https://example.invalid/pull/1530",
+		HeadBranch: branch, BaseBranch: "main", State: "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest: %v", err)
+	}
+	// The fix-worktree leg: an independent clone that commits and pushes through
+	// the real finalizer, then is removed — exactly the engine's
+	// delegation_worktree_removed cleanup. Nothing advances the task's
+	// registered checkout.
+	fixWorktree := filepath.Join(t.TempDir(), "fix-worktree")
+	runDaemonWorkerGit(t, filepath.Dir(fixWorktree), "clone", "--branch", branch, remote, fixWorktree)
+	configureTestGit(t, fixWorktree)
+	if err := os.WriteFile(filepath.Join(fixWorktree, "fix.txt"), []byte("fix\n"), 0o644); err != nil {
+		t.Fatalf("write fix change: %v", err)
+	}
+	if _, err := (daemonImplementationFinalizer{Store: store, GitHub: github.NoopClient{}}).FinalizeImplementation(
+		ctx, db.Job{ID: "fix-leg", Agent: "implementer", Type: "implement"}, workflow.JobPayload{
+			Repo: "owner/repo", Branch: branch, PullRequest: 1530, TaskID: "adhoc-impl",
+			FixWorktree: true, WorktreePath: fixWorktree,
+			Result: &workflow.AgentResult{Decision: "implemented"},
+		}); err != nil {
+		t.Fatalf("FinalizeImplementation (fix-worktree leg): %v", err)
+	}
+	advancedHead := lsRemoteHead(t, registered, "forge", branch)
+	if advancedHead == "" || advancedHead == strandedHead {
+		t.Fatalf("fix leg did not advance the branch: remote head=%q stranded=%q", advancedHead, strandedHead)
+	}
+	if err := os.RemoveAll(fixWorktree); err != nil {
+		t.Fatalf("remove fix worktree: %v", err)
+	}
+	// Fixture pin: the registered checkout is genuinely stranded BEHIND the PR
+	// head. Without this the rebind below is vacuous.
+	if got := readonlyWorktreeHead(t, taskWorktree); got != strandedHead {
+		t.Fatalf("registered checkout moved: head=%q, want stranded at %q", got, strandedHead)
+	}
+	// Make the advanced head reachable from the registered checkout so the
+	// exact-head review worktree allocation can resolve it.
+	runDaemonWorkerGit(t, registered, "fetch", "forge")
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+	})
+
+	out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
+		RepoFlag: "owner/repo", Agent: "reviewer", LeadAgent: "implementer",
+		Action: "review", Instructions: "Review the advanced head.", Background: true,
+		PullRequest: 1530, Branch: branch, HeadSHA: advancedHead, Home: home,
+	})
+	if err != nil {
+		t.Fatalf("dispatchLocalAgentJob: %v", err)
+	}
+	job, err := store.GetJob(ctx, out.JobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatalf("daemonJobPayload: %v", err)
+	}
+	if payload.TaskID != "adhoc-impl" {
+		t.Fatalf("review payload TaskID=%q, want the implement task %q; a review-pr-* mint is the #1530 defect", payload.TaskID, "adhoc-impl")
+	}
+	events, err := store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	divergence := ""
+	for _, event := range events {
+		if event.Kind == "review_task_head_divergence" {
+			divergence = event.Message
+		}
+	}
+	for _, fragment := range []string{"adhoc-impl", strandedHead, advancedHead} {
+		if !strings.Contains(divergence, fragment) {
+			t.Fatalf("divergence event = %q, want it to name %q", divergence, fragment)
+		}
+	}
+	// The merge gate can now attribute the review round to the implement job:
+	// with the rebound identity at the advanced head, the independence check
+	// resolves the implementer and merges.
+	decision := evaluateC1GateScenario(t, payload.TaskID, payload.TaskID, strandedHead, advancedHead, payload.TaskID, "reviewer", true)
+	if !decision.Merged {
+		t.Fatalf("merge gate could not attribute the rebound review: %+v", decision)
+	}
+}

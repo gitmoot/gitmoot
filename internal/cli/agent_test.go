@@ -707,7 +707,7 @@ func TestWorkflowOrchestrationGuardAllowsCommitQuestions(t *testing.T) {
 	}
 }
 
-func TestPrepareLocalReviewDispatchRequestCreatesBranchlessReviewTask(t *testing.T) {
+func TestPrepareLocalReviewDispatchRequestBindsBranchOwningTaskWithoutWorktree(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
 	repoDir := t.TempDir()
@@ -735,9 +735,9 @@ func TestPrepareLocalReviewDispatchRequestCreatesBranchlessReviewTask(t *testing
 
 	store := openCLIJobStore(t, home)
 	defer store.Close()
-	// An implement task may already own the PR head branch. Review task creation
-	// must keep its branch empty rather than violate tasks(repo,branch)'s partial
-	// unique index or overwrite the canonical implement task.
+	// An implement task may already own the PR head branch. The review must bind
+	// to it (#1530) — never mint a second task row for the same (repo, branch),
+	// which the tasks(repo,branch) partial unique index would reject anyway.
 	if err := store.UpsertTask(ctx, db.Task{ID: "implement-12", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Implement PR #12", State: string(workflow.TaskImplementing), Branch: "feature/review"}); err != nil {
 		t.Fatalf("UpsertTask(implement): %v", err)
 	}
@@ -754,8 +754,16 @@ func TestPrepareLocalReviewDispatchRequestCreatesBranchlessReviewTask(t *testing
 	if err != nil {
 		t.Fatalf("prepareLocalReviewDispatchRequest returned error: %v", err)
 	}
-	if request.TaskID == "" {
-		t.Fatal("request.TaskID is empty")
+	if request.TaskID != "implement-12" {
+		t.Fatalf("request.TaskID = %q, want bound to the branch-owning task %q", request.TaskID, "implement-12")
+	}
+	if request.GoalID != "goal-1" || request.TaskTitle != "Implement PR #12" {
+		t.Fatalf("rebind dropped task metadata: request=%+v", request)
+	}
+	// No worktree means no disk HEAD to compare, so there is no divergence to
+	// record — the note is specifically for a stranded registered checkout.
+	if request.ReviewTaskHeadDivergence != "" {
+		t.Fatalf("worktree-less bind recorded a divergence note %q; want none", request.ReviewTaskHeadDivergence)
 	}
 	branch, err := (gitutil.Client{Dir: repoDir}).CurrentBranch(ctx)
 	if err != nil {
@@ -764,15 +772,13 @@ func TestPrepareLocalReviewDispatchRequestCreatesBranchlessReviewTask(t *testing
 	if branch != "main" {
 		t.Fatalf("registered checkout branch = %q, want main", branch)
 	}
-	task, err := store.GetTask(ctx, request.TaskID)
+	// No review-pr-* row minted; the implement task row is untouched.
+	tasks, err := store.ListTasks(ctx)
 	if err != nil {
-		t.Fatalf("GetTask returned error: %v", err)
+		t.Fatalf("ListTasks returned error: %v", err)
 	}
-	if task.WorktreePath != "" || task.State != string(workflow.TaskReviewing) {
-		t.Fatalf("task = %+v, want reviewing lifecycle row with no shared worktree", task)
-	}
-	if task.ID == "implement-12" || task.Branch != "" {
-		t.Fatalf("review task = %+v, want distinct branchless review-pr task", task)
+	if len(tasks) != 1 || tasks[0].ID != "implement-12" {
+		t.Fatalf("tasks = %+v, want only the pre-existing implement task", tasks)
 	}
 	implementTask, err := store.GetTask(ctx, "implement-12")
 	if err != nil || implementTask.State != string(workflow.TaskImplementing) || implementTask.Branch != "feature/review" {
@@ -780,7 +786,7 @@ func TestPrepareLocalReviewDispatchRequestCreatesBranchlessReviewTask(t *testing
 	}
 }
 
-func TestPrepareLocalReviewDispatchRequestDoesNotBindStaleReviewTask(t *testing.T) {
+func TestPrepareLocalReviewDispatchRequestBindsTaskWithStaleCheckout(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
 	repoDir := t.TempDir()
@@ -835,15 +841,40 @@ func TestPrepareLocalReviewDispatchRequestDoesNotBindStaleReviewTask(t *testing.
 	if err != nil {
 		t.Fatalf("prepareLocalReviewDispatchRequest returned error: %v", err)
 	}
-	if request.TaskID == "stale-review" {
-		t.Fatalf("reused stale taskID=%q", request.TaskID)
-	}
+	// Fixture pin: the registered checkout must genuinely sit BEHIND the
+	// requested head (the fix-worktree strand), or this test proves nothing.
 	staleHead, err := (gitutil.Client{Dir: staleWorktree}).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("stale HeadSHA returned error: %v", err)
 	}
-	if staleHead != oldHead {
-		t.Fatalf("stale worktree head = %q, want %q", staleHead, oldHead)
+	if staleHead != oldHead || staleHead == newHead {
+		t.Fatalf("fixture not stranded: stale worktree head = %q, want %q behind requested %q", staleHead, oldHead, newHead)
+	}
+	// #1530: the task owning (repo, branch) is the same unit of work even when
+	// its registered checkout is behind — bind to it, never mint review-pr-*.
+	if request.TaskID != "stale-review" {
+		t.Fatalf("request.TaskID=%q, want rebound to the branch-owning task %q", request.TaskID, "stale-review")
+	}
+	if request.GoalID != "goal-1" || request.TaskTitle != "Stale review" {
+		t.Fatalf("rebind dropped task metadata: request=%+v", request)
+	}
+	divergence := request.ReviewTaskHeadDivergence
+	for _, fragment := range []string{"stale-review", oldHead, newHead} {
+		if !strings.Contains(divergence, fragment) {
+			t.Fatalf("divergence note = %q, want it to name %q", divergence, fragment)
+		}
+	}
+	tasks, err := store.ListTasks(ctx)
+	if err != nil {
+		t.Fatalf("ListTasks returned error: %v", err)
+	}
+	for _, task := range tasks {
+		if strings.HasPrefix(task.ID, "review-pr-") {
+			t.Fatalf("minted a fresh review identity %q despite the owning task rebound", task.ID)
+		}
+	}
+	if len(tasks) != 1 || tasks[0].ID != "stale-review" {
+		t.Fatalf("tasks=%+v, want only the pre-existing owning task", tasks)
 	}
 }
 
@@ -859,6 +890,17 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 			task: db.Task{ID: "dismissed-by-branch", RepoFullName: "owner/repo", State: string(workflow.TaskDismissed), Branch: "feature/review"},
 			setRequest: func(request *localAgentDispatchRequest) {
 				request.Branch = "feature/review"
+			},
+			wantError: []string{"is dismissed", "task recover"},
+		},
+		{
+			// #1530: the rebind-on-divergence must NOT precede the disposal
+			// refusal — a disposed task is refused whether or not the heads match.
+			name: "diverged head worktree",
+			task: db.Task{ID: "dismissed-diverged-by-branch", RepoFullName: "owner/repo", State: string(workflow.TaskDismissed), Branch: "feature/review"},
+			setRequest: func(request *localAgentDispatchRequest) {
+				request.Branch = "feature/review"
+				request.HeadSHA = strings.Repeat("0", 40)
 			},
 			wantError: []string{"is dismissed", "task recover"},
 		},
@@ -958,9 +1000,53 @@ func TestPrepareLocalReviewTaskReusesNonDismissedMatchingHead(t *testing.T) {
 	if request.TaskID != "reviewing-task" || request.GoalID != "goal-1" || request.TaskTitle != "Review" {
 		t.Fatalf("request=%+v", request)
 	}
+	if request.ReviewTaskHeadDivergence != "" {
+		t.Fatalf("matching-head bind recorded a divergence note %q; divergence is only for a mismatched head", request.ReviewTaskHeadDivergence)
+	}
 	task, err := store.GetTask(ctx, "reviewing-task")
 	if err != nil || task.State != string(workflow.TaskReviewing) {
 		t.Fatalf("task=%+v err=%v", task, err)
+	}
+}
+
+// #1530 acceptance 3: mint review-pr-%d-%s ONLY when no task owns (repo,
+// branch). This test fails if the rebind widens past the owning-task condition
+// (e.g. binding when GetTaskByRepoBranch found nothing).
+func TestPrepareLocalReviewTaskMintsIdentityWhenNoTaskOwnsBranch(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, repoDir, "config", "user.name", "Gitmoot")
+	writeFile(t, filepath.Join(repoDir, "README.md"), "review\n")
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "review head")
+	head, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	// A task on a DIFFERENT branch must not capture this review's identity.
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "other-branch-task", RepoFullName: "owner/repo", State: string(workflow.TaskImplementing),
+		Branch: "feature/other", WorktreePath: repoDir,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request, err := prepareLocalReviewTask(ctx, store,
+		github.Repository{Owner: "owner", Name: "repo"},
+		localAgentDispatchRequest{Home: home, PullRequest: 12, Branch: "feature/review", HeadSHA: head})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantID := fmt.Sprintf("review-pr-%d-%s", 12, shortHash("owner/repo"))
+	if request.TaskID != wantID {
+		t.Fatalf("request.TaskID=%q, want minted %q when no task owns the branch", request.TaskID, wantID)
+	}
+	if request.ReviewTaskHeadDivergence != "" {
+		t.Fatalf("mint path recorded a divergence note %q; no owning task means no rebind", request.ReviewTaskHeadDivergence)
 	}
 }
 
