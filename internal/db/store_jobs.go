@@ -74,7 +74,7 @@ func (s *Store) CreateJob(ctx context.Context, job Job) error {
 	return err
 }
 
-func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent) error {
+func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent, additionalEvents ...JobEvent) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -98,6 +98,12 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
 		return err
+	}
+	for _, additional := range additionalEvents {
+		additional.JobID = job.ID
+		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, additional.JobID, additional.Kind, additional.Message); err != nil {
+			return err
+		}
 	}
 	if err := resolveAwaitedReviewFactTx(ctx, tx, job.ID, job.Agent, job.Type, job.State, job.Payload, time.Now().UTC()); err != nil {
 		return err
