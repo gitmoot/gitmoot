@@ -52,7 +52,7 @@ func TestForegroundRuntimePreflightUnknownRecordsAndDispatches(t *testing.T) {
 	t.Cleanup(func() { localRuntimeContractPreflight = previousPreflight })
 	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}
 	previousAdapter := localAgentDispatchRuntimeAdapterFor
-	localAgentDispatchRuntimeAdapterFor = func(string, string, string) (runtime.Adapter, error) { return adapter, nil }
+	localAgentDispatchRuntimeAdapterFor = func(string, runtime.Agent, string) (runtime.Adapter, error) { return adapter, nil }
 	t.Cleanup(func() { localAgentDispatchRuntimeAdapterFor = previousAdapter })
 
 	out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{RepoFlag: "owner/repo", Agent: "responder", Action: "ask", Instructions: "hello", Home: home})

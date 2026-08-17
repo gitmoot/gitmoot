@@ -484,7 +484,7 @@ pane = "w1:p2"
 
 	championAdapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"Champion answer.","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}
 	previousAdapterFactory := localAgentDispatchRuntimeAdapterFor
-	localAgentDispatchRuntimeAdapterFor = func(string, string, string) (runtime.Adapter, error) {
+	localAgentDispatchRuntimeAdapterFor = func(string, runtime.Agent, string) (runtime.Adapter, error) {
 		return championAdapter, nil
 	}
 	t.Cleanup(func() { localAgentDispatchRuntimeAdapterFor = previousAdapterFactory })

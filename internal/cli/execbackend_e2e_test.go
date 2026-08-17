@@ -246,6 +246,45 @@ func TestExecBackendUnknownFailsLoudForegroundE2E(t *testing.T) {
 	}
 }
 
+// TestExecBackendResolvedNonLocalCannotRunLocallyForegroundE2E models the P2
+// boundary after resolution has accepted a real remote backend. Until that
+// backend has an explicit foreground adapter arm, dispatch must fail rather
+// than invoke the legacy local factory and report a false success.
+func TestExecBackendResolvedNonLocalCannotRunLocallyForegroundE2E(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "must-not-run-resolved-remote")
+	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
+
+	previousResolver := localAgentDispatchExecBackendFor
+	localAgentDispatchExecBackendFor = func(string) (execbackend.Backend, error) {
+		return execbackend.Backend("p2-probe"), nil
+	}
+	t.Cleanup(func() { localAgentDispatchExecBackendFor = previousResolver })
+
+	var out, errBuf bytes.Buffer
+	code := Run([]string{
+		"agent", "ask", "shell-asker", "resolved backend foreground probe",
+		"--home", home,
+		"--repo", "owner/repo",
+		"--json",
+	}, &out, &errBuf)
+	if code == 0 {
+		t.Fatalf("foreground ask exit = 0, output=%s; resolved non-local backend ran locally", out.String())
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("foreground adapter ran locally for a resolved non-local backend (marker err=%v)", err)
+	}
+	if got := errBuf.String(); !strings.Contains(got, `"p2-probe"`) || !strings.Contains(got, "no foreground adapter implementation") {
+		t.Fatalf("foreground error = %q, want resolved backend and missing implementation named", got)
+	}
+	jobs, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("jobs = %+v, want no enqueued row after missing foreground implementation refusal", jobs)
+	}
+}
+
 // TestExecBackendOverrideResolutionDaemonE2E covers the per-job override
 // field: an unknown override fails loud (naming the override source) even
 // with no [remote_exec] section, and an explicit "local" override resolves to

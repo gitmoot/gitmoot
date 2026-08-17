@@ -171,7 +171,7 @@ func TestForegroundDispatchCapturesQuotaFailureAndClearsOnSuccess(t *testing.T) 
 
 	adapter := &cliWorkerFakeAdapter{err: errors.New("API error: You've hit your weekly limit - resets Jul 28, 1am (Europe/Berlin)")}
 	previousAdapterFactory := localAgentDispatchRuntimeAdapterFor
-	localAgentDispatchRuntimeAdapterFor = func(string, string, string) (runtime.Adapter, error) {
+	localAgentDispatchRuntimeAdapterFor = func(string, runtime.Agent, string) (runtime.Adapter, error) {
 		return adapter, nil
 	}
 	t.Cleanup(func() { localAgentDispatchRuntimeAdapterFor = previousAdapterFactory })
