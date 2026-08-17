@@ -284,6 +284,84 @@ func TestEffectiveRuntimePersistenceFailureBlocksDaemonExecution(t *testing.T) {
 	}
 }
 
+func TestEffectiveRuntimeNullPayloadBlocksDaemonExecution(t *testing.T) {
+	ctx := context.Background()
+	marker := filepath.Join(t.TempDir(), "must-not-run-null-payload")
+	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
+
+	var out, errBuf bytes.Buffer
+	code := Run([]string{
+		"agent", "ask", "shell-asker", "do not run with a null payload envelope",
+		"--home", home,
+		"--repo", "owner/repo",
+		"--background",
+		"--json",
+	}, &out, &errBuf)
+	if code != 0 {
+		t.Fatalf("agent ask --background exit = %d, stderr=%s", code, errBuf.String())
+	}
+	var output localAgentJobOutput
+	if err := json.Unmarshal(out.Bytes(), &output); err != nil {
+		t.Fatalf("parse ask output %q: %v", out.String(), err)
+	}
+	if output.State != string(workflow.JobQueued) {
+		t.Fatalf("background ask state = %q, want queued", output.State)
+	}
+	admitted, err := store.GetJob(ctx, output.JobID)
+	if err != nil {
+		t.Fatalf("GetJob(admitted): %v", err)
+	}
+	if admitted.Payload == "null" {
+		t.Fatal("fixture admitted an already-null payload; worker input must retain the valid dispatch envelope")
+	}
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("open raw sqlite: %v", err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`UPDATE jobs SET payload = 'null' WHERE id = ?`, output.JobID); err != nil {
+		t.Fatalf("corrupt stored payload: %v", err)
+	}
+	seeded, err := store.GetJob(ctx, output.JobID)
+	if err != nil {
+		t.Fatalf("GetJob(before worker run): %v", err)
+	}
+	if seeded.Payload != "null" {
+		t.Fatalf("fixture payload = %q, want JSON null to reach the nil-envelope guard", seeded.Payload)
+	}
+
+	worker := defaultJobWorker(store, io.Discard, home)
+	if err := worker.run(ctx, admitted); err != nil {
+		t.Fatalf("worker run: %v", err)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("adapter ran after null-payload persistence failed (marker err=%v)", err)
+	}
+	job, err := store.GetJob(ctx, output.JobID)
+	if err != nil {
+		t.Fatalf("GetJob(after tick): %v", err)
+	}
+	if job.State != string(workflow.JobFailed) {
+		t.Fatalf("job state = %q, want failed before adapter execution", job.State)
+	}
+	events, err := store.ListJobEvents(ctx, output.JobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	var failedEvent string
+	for _, event := range events {
+		if event.Kind == string(workflow.JobFailed) {
+			failedEvent = event.Message
+		}
+		if event.Kind == effectiveRuntimeEventKind {
+			t.Fatalf("effective-runtime event emitted despite null-payload fail-stop: %+v", event)
+		}
+	}
+	if !strings.Contains(failedEvent, "persist effective runtime before execution: job payload must be a JSON object") {
+		t.Fatalf("failed event = %q, want null-envelope persistence cause", failedEvent)
+	}
+}
+
 // TestForegroundEffectiveRuntimePersistsAtomicallyWithEnqueue closes the last
 // foreground fail-stop gap (#1528): even when a later effective-runtime
 // backfill is unavailable, the job never depends on it because its already-
