@@ -42,9 +42,9 @@ func TestImplementationFinalizationTargetRejectsEveryMissingField(t *testing.T) 
 		},
 		{
 			name:    "branch",
-			payload: workflow.JobPayload{Repo: "owner/repo", Branch: "feature/fix", PullRequest: 1514, TaskID: "task-1", FixWorktree: true, WorktreePath: "/tmp/fix"},
+			payload: workflow.JobPayload{Repo: "owner/repo", PullRequest: 1514, TaskID: "task-1", FixWorktree: true, WorktreePath: "/tmp/fix"},
 			task:    &db.Task{ID: "task-1", RepoFullName: "owner/repo", WorktreePath: "/tmp/stale-task"},
-			want:    "no branch",
+			want:    "carries no payload branch",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -1040,12 +1040,12 @@ func TestDaemonImplementationFinalizerKeepsMissingBranchBackstop(t *testing.T) {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
 	payload := workflow.JobPayload{
-		Repo: "owner/repo", Branch: "feature/fix", PullRequest: 12, TaskID: "task-backstop",
+		Repo: "owner/repo", PullRequest: 12, TaskID: "task-backstop",
 		FixWorktree: true, WorktreePath: t.TempDir(), Result: &workflow.AgentResult{Decision: "implemented"},
 	}
 	_, err := (daemonImplementationFinalizer{Store: store, GitHub: github.NoopClient{}}).FinalizeImplementation(ctx, db.Job{ID: "late-backstop", Agent: "lead", Type: "implement"}, payload)
 	var blocked workflow.BlockedError
-	if !errors.As(err, &blocked) || !blocked.ResultDeliveryFailed || !strings.Contains(err.Error(), "no branch") {
+	if !errors.As(err, &blocked) || !blocked.ResultDeliveryFailed || !strings.Contains(err.Error(), "carries no payload branch") {
 		t.Fatalf("FinalizeImplementation error = %v, want delivery-blocked missing-branch backstop", err)
 	}
 }
@@ -1079,7 +1079,7 @@ func TestImplementationFinalizationTargetClassifiesBranchLookupByPhase(t *testin
 	if err := store.UpsertTask(ctx, db.Task{ID: "task-branch-error", RepoFullName: "owner/repo", Branch: "feature/fix", WorktreePath: worktree}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
-	payload := workflow.JobPayload{Repo: "owner/repo", TaskID: "task-branch-error", FixWorktree: true, WorktreePath: worktree}
+	payload := workflow.JobPayload{Repo: "owner/repo", Branch: "feature/fix", TaskID: "task-branch-error", FixWorktree: true, WorktreePath: worktree}
 	job := db.Job{ID: "advance-branch-error", Agent: "lead", Type: "implement"}
 
 	for _, test := range []struct {

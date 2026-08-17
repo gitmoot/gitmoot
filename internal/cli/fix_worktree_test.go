@@ -81,6 +81,27 @@ func (f fixWorktreeFixture) allocate(t *testing.T, jobID string) workflow.FixWor
 	return allocation
 }
 
+// #1523 (review follow-up): the finalizer's branch resolution in
+// implementationFinalizationTargetFor unconditionally overrides the delivery
+// branch with payload.Branch for a FixWorktree job. That override is only safe
+// because this producer-side guard hard-errors on a blank branch BEFORE
+// dispatchFix ever sets FixWorktree=true — otherwise an empty payload.Branch
+// would clobber a valid task.Branch and newly refuse work that previously
+// succeeded. This test asserts the rejection by its observable behaviour so
+// removing the guard breaks here instead of silently widening the predicate's
+// exposure.
+func TestAllocateFixWorktreeRejectsBlankBranch(t *testing.T) {
+	store := daemonWorkerStore(t)
+	for _, branch := range []string{"", "   "} {
+		_, err := allocateFixWorktree(context.Background(), store, t.TempDir(), t.TempDir(), workflow.FixWorktreeRequest{
+			JobID: "fix-blank-branch", Repo: "owner/repo", Branch: branch,
+		})
+		if err == nil || !strings.Contains(err.Error(), "fix worktree branch is required") {
+			t.Fatalf("allocateFixWorktree with branch %q: err = %v, want \"fix worktree branch is required\"", branch, err)
+		}
+	}
+}
+
 func TestReviewFixRunsInPerJobBranchWorktree(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixWorktreeFixture(t)

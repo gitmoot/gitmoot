@@ -319,6 +319,13 @@ const (
 // implementationFinalizationTargetFor resolves the durable task fields required
 // to deliver an implementation. The advance preflight and the finalizer both
 // call this predicate so an early refusal cannot drift from the late backstop.
+//
+// The delivery branch is resolved once, with the same FixWorktree override the
+// worktree path uses: for a fix job the PAYLOAD owns the branch — advance-created
+// fix jobs bind to the reviewing job's task, and review tasks (review-pr-<n>-<hash>)
+// legitimately carry no branch (#1523) — while for any other job the TASK owns it.
+// The returned task copy carries the resolved branch so the finalizer pushes and
+// opens the pull request for exactly the branch this predicate validated.
 func implementationFinalizationTargetFor(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload, phase implementationFinalizationPhase) (implementationFinalizationTarget, error) {
 	switch phase {
 	case implementationFinalizationBeforeRun, implementationFinalizationAfterRun:
@@ -343,6 +350,24 @@ func implementationFinalizationTargetFor(ctx context.Context, store *db.Store, j
 	if payload.FixWorktree {
 		worktreePath = strings.TrimSpace(payload.WorktreePath)
 	}
+	// One resolved branch, used at both branch sites below: a FixWorktree job
+	// takes the payload's branch, any other job takes the task's. The
+	// missing-branch refusal and the current-branch comparison must read the
+	// same value — the comparison is what makes a wrong payload branch fail
+	// closed against the checkout's actual branch instead of silently
+	// delivering to the wrong branch.
+	//
+	// The unconditional FixWorktree override depends on the producer side:
+	// allocateFixWorktree (fix_worktree.go) hard-errors "fix worktree branch
+	// is required" on a blank branch before dispatchFix ever sets
+	// FixWorktree=true, so a fix job cannot reach this predicate with an empty
+	// payload.Branch that would clobber a valid task.Branch.
+	// TestAllocateFixWorktreeRejectsBlankBranch enforces that guard; if it
+	// fails, re-check this override before trusting it.
+	branchName := strings.TrimSpace(task.Branch)
+	if payload.FixWorktree {
+		branchName = strings.TrimSpace(payload.Branch)
+	}
 	if worktreePath == "" {
 		branch := firstNonEmpty(strings.TrimSpace(task.Branch), strings.TrimSpace(payload.Branch), "<branch>")
 		return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
@@ -350,35 +375,42 @@ func implementationFinalizationTargetFor(ctx context.Context, store *db.Store, j
 			task.ID, task.ID, payload.Repo, job.Agent, branch,
 		))
 	}
-	if strings.TrimSpace(task.Branch) == "" {
-		branch := firstNonEmpty(strings.TrimSpace(payload.Branch), "<branch>")
+	if branchName == "" {
+		advice := firstNonEmpty(strings.TrimSpace(payload.Branch), strings.TrimSpace(task.Branch), "<branch>")
+		// Name the source the resolution actually consulted so the refusal is
+		// true for the case that produced it: a fix job resolves the branch
+		// from its payload, any other job from the task.
+		missing := fmt.Sprintf("implementation task %s has no branch", task.ID)
+		if payload.FixWorktree {
+			missing = fmt.Sprintf("implementation fix job for task %s carries no payload branch", task.ID)
+		}
 		if payload.PullRequest > 0 {
 			recoveryWorktree := firstNonEmpty(strings.TrimSpace(task.WorktreePath), worktreePath)
 			return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
-				"implementation task %s has no branch; cannot push or open a pull request; inspect or stash local changes, then run `git -C %q fetch origin refs/pull/%d/head` and `git -C %q reset --hard FETCH_HEAD`; retry with `gitmoot agent implement %s \"Address the requested changes.\" --repo %s --task %s --pr %d --branch %s`",
-				task.ID, recoveryWorktree, payload.PullRequest, recoveryWorktree, job.Agent, payload.Repo, task.ID, payload.PullRequest, branch,
+				"%s; cannot push or open a pull request; inspect or stash local changes, then run `git -C %q fetch origin refs/pull/%d/head` and `git -C %q reset --hard FETCH_HEAD`; retry with `gitmoot agent implement %s \"Address the requested changes.\" --repo %s --task %s --pr %d --branch %s`",
+				missing, recoveryWorktree, payload.PullRequest, recoveryWorktree, job.Agent, payload.Repo, task.ID, payload.PullRequest, advice,
 			))
 		}
 		return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
-			"implementation task %s has no branch; cannot push or open a pull request; inspect or stash local changes, then rerun with `gitmoot task run %s --repo %s --owner %s --branch %s`",
-			task.ID, task.ID, payload.Repo, job.Agent, branch,
+			"%s; cannot push or open a pull request; inspect or stash local changes, then rerun with `gitmoot task run %s --repo %s --owner %s --branch %s`",
+			missing, task.ID, payload.Repo, job.Agent, advice,
 		))
 	}
 	git := gitutil.Client{Dir: worktreePath}
-	branch, err := git.CurrentBranch(ctx)
+	currentBranch, err := git.CurrentBranch(ctx)
 	if err != nil {
 		if phase == implementationFinalizationAfterRun {
 			return implementationFinalizationTarget{}, fmt.Errorf("resolve implementation branch: %w", err)
 		}
 		return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
 			"implementation task %s worktree %q has no usable current branch (%v); expected branch %s; refusing to run or deliver from an unverifiable checkout",
-			task.ID, worktreePath, err, task.Branch,
+			task.ID, worktreePath, err, branchName,
 		))
 	}
-	if branch != task.Branch {
+	if currentBranch != branchName {
 		return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
 			"implementation task %s worktree %q is on branch %s, not %s; refusing to run or deliver from the wrong checkout",
-			task.ID, worktreePath, branch, task.Branch,
+			task.ID, worktreePath, currentBranch, branchName,
 		))
 	}
 	if phase == implementationFinalizationBeforeRun {
@@ -386,7 +418,7 @@ func implementationFinalizationTargetFor(ctx context.Context, store *db.Store, j
 		if expectedHead == "" {
 			return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
 				"implementation task %s fix worktree %q has no dispatch head SHA; cannot prove the checkout is current before running the model; refresh pull request #%d metadata and retry with `gitmoot agent implement %s \"Address the requested changes.\" --repo %s --task %s --pr %d --branch %s --head-sha <sha>`",
-				task.ID, worktreePath, payload.PullRequest, job.Agent, payload.Repo, task.ID, payload.PullRequest, task.Branch,
+				task.ID, worktreePath, payload.PullRequest, job.Agent, payload.Repo, task.ID, payload.PullRequest, branchName,
 			))
 		}
 		head, err := git.HeadSHA(ctx)
@@ -405,7 +437,7 @@ func implementationFinalizationTargetFor(ctx context.Context, store *db.Store, j
 		}
 		recovery := fmt.Sprintf(
 			"inspect or stash local changes, then run `git -C %q fetch origin %s` and `git -C %q reset --hard %s` before retrying",
-			worktreePath, task.Branch, worktreePath, expectedHead,
+			worktreePath, branchName, worktreePath, expectedHead,
 		)
 		currentIncludesDispatchHead, err := git.IsAncestor(ctx, expectedHead, head)
 		if err != nil {
@@ -418,6 +450,11 @@ func implementationFinalizationTargetFor(ctx context.Context, store *db.Store, j
 			))
 		}
 	}
+	// Hand the finalizer the resolved branch: the returned task copy carries
+	// branchName so every downstream delivery step (push, pull request,
+	// payload) targets exactly the branch validated above, even when the
+	// stored task legitimately owns none (#1523).
+	task.Branch = branchName
 	return implementationFinalizationTarget{Task: task, WorktreePath: worktreePath}, nil
 }
 
