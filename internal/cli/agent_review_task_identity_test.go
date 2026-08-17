@@ -298,6 +298,13 @@ func TestDispatchReviewDivergenceEventFailureRollsBackEnqueue(t *testing.T) {
 	if len(jobs) != 0 {
 		t.Fatalf("required divergence event failure left runnable jobs: %+v", jobs)
 	}
+	var eventCount int
+	if err := raw.QueryRow(`SELECT COUNT(*) FROM job_events`).Scan(&eventCount); err != nil {
+		t.Fatalf("count job events after rollback: %v", err)
+	}
+	if eventCount != 0 {
+		t.Fatalf("required divergence event failure left %d partial audit events; want 0", eventCount)
+	}
 }
 
 // #1530 acceptance 6: the measured strand end to end on an isolated home with
