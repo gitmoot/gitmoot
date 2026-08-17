@@ -14,6 +14,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -421,5 +422,16 @@ func TestExecBackendCompositionPreservedForLocal(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), `"e2b"`) || !strings.Contains(err.Error(), "allowed: local") {
 		t.Fatalf("composition-site error = %q, want the value AND the allowed set", err)
+	}
+
+	// Advertising a name is not an implementation. A future registry edit that
+	// omits the composition arm must fail here instead of inheriting Local.
+	originalAllowed := append([]string(nil), execbackend.AllowedNames...)
+	execbackend.AllowedNames = append(execbackend.AllowedNames, "future-remote")
+	t.Cleanup(func() { execbackend.AllowedNames = originalAllowed })
+	bad.ExecBackend = "future-remote"
+	_, err = buildRuntimeAdapter("", bad, work, nil)
+	if err == nil || !strings.Contains(err.Error(), `"future-remote"`) || !strings.Contains(err.Error(), "advertised but not implemented") {
+		t.Fatalf("advertised-without-implementation composition error = %v, want loud refusal", err)
 	}
 }

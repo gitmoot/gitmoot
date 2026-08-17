@@ -77,7 +77,7 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 }
 
 func validateRemoteExecConfig(cfg RemoteExecConfig) error {
-	if _, err := execbackend.Parse(cfg.Backend); err != nil {
+	if _, err := execbackend.ParseImplemented(cfg.Backend); err != nil {
 		return fmt.Errorf("unsupported [remote_exec].backend: %w", err)
 	}
 	return nil

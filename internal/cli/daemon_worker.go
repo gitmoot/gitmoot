@@ -2857,7 +2857,7 @@ func buildRuntimeAdapter(home string, agent runtime.Agent, checkout string, runn
 	// at the composition site too, so a selector bypass can never silently
 	// mis-compose a runner.
 	if agent.ExecBackend != "" {
-		if _, err := execbackend.Parse(agent.ExecBackend); err != nil {
+		if _, err := execbackend.ParseImplemented(agent.ExecBackend); err != nil {
 			return nil, err
 		}
 	}

@@ -80,3 +80,19 @@ func TestAllowedNamesMatchesParse(t *testing.T) {
 		t.Fatalf("unknown-backend error = %v, want the rendered AllowedNames set", err)
 	}
 }
+
+func TestAdvertisedBackendWithoutImplementationFailsLoud(t *testing.T) {
+	original := append([]string(nil), AllowedNames...)
+	defer func() { AllowedNames = original }()
+	AllowedNames = append(AllowedNames, "future-remote")
+
+	if backend, err := Parse("future-remote"); err != nil || backend != Backend("future-remote") {
+		t.Fatalf("Parse(advertised future backend) = %q, %v; want advertised name accepted", backend, err)
+	}
+	if _, err := ParseImplemented("future-remote"); err == nil || !strings.Contains(err.Error(), `"future-remote"`) || !strings.Contains(err.Error(), "advertised but not implemented") {
+		t.Fatalf("ParseImplemented(advertised future backend) error = %v, want loud missing-implementation error", err)
+	}
+	if _, err := Resolve("future-remote", nil); err == nil || !strings.Contains(err.Error(), "advertised but not implemented") {
+		t.Fatalf("Resolve(advertised future backend) error = %v, want loud missing-implementation error", err)
+	}
+}

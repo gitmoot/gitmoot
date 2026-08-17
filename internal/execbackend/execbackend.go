@@ -58,13 +58,30 @@ func Parse(value string) (Backend, error) {
 	return "", UnknownError(trimmed)
 }
 
+// ParseImplemented validates both halves of the selector contract: the name
+// must be advertised and this binary must have an execution implementation for
+// it. Keeping this switch explicit prevents a newly advertised backend from
+// inheriting Local's runner composition by omission.
+func ParseImplemented(value string) (Backend, error) {
+	backend, err := Parse(value)
+	if err != nil {
+		return "", err
+	}
+	switch backend {
+	case Local:
+		return backend, nil
+	default:
+		return "", fmt.Errorf("execution backend %q is advertised but not implemented", backend)
+	}
+}
+
 // Resolve picks the effective backend for one job. A present per-job override
 // wins even when its value is blank, which then fails loudly. A nil override
 // means absent. Empty configBackend is the absent-config default and resolves
 // to Local; config loaders reject an explicitly configured blank before here.
 func Resolve(configBackend string, jobOverride *string) (Backend, error) {
 	if jobOverride != nil {
-		backend, err := Parse(*jobOverride)
+		backend, err := ParseImplemented(*jobOverride)
 		if err != nil {
 			return "", fmt.Errorf("invalid exec_backend job override: %w", err)
 		}
@@ -73,5 +90,5 @@ func Resolve(configBackend string, jobOverride *string) (Backend, error) {
 	if strings.TrimSpace(configBackend) == "" {
 		configBackend = string(Local)
 	}
-	return Parse(configBackend)
+	return ParseImplemented(configBackend)
 }

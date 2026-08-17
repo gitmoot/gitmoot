@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 )
 
 func remoteExecTestPaths(t *testing.T, content string) Paths {
@@ -71,6 +73,18 @@ func TestLoadRemoteExecConfigExplicitBlankFailsLoud(t *testing.T) {
 		if !strings.Contains(err.Error(), "[remote_exec].backend") || !strings.Contains(err.Error(), `unknown execution backend ""`) || !strings.Contains(err.Error(), "allowed: local") {
 			t.Fatalf("explicit blank backend %q error = %q, want key + blank value + allowed set", value, err)
 		}
+	}
+}
+
+func TestLoadRemoteExecConfigAdvertisedWithoutImplementationFailsLoud(t *testing.T) {
+	original := append([]string(nil), execbackend.AllowedNames...)
+	defer func() { execbackend.AllowedNames = original }()
+	execbackend.AllowedNames = append(execbackend.AllowedNames, "future-remote")
+
+	paths := remoteExecTestPaths(t, "[remote_exec]\nbackend = \"future-remote\"\n")
+	_, err := LoadRemoteExecConfig(paths)
+	if err == nil || !strings.Contains(err.Error(), `"future-remote"`) || !strings.Contains(err.Error(), "advertised but not implemented") {
+		t.Fatalf("advertised future backend error = %v, want loud missing-implementation error", err)
 	}
 }
 
