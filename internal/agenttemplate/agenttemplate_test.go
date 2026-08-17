@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/skills"
 )
@@ -156,7 +157,7 @@ func TestEmbeddedBuiltinTemplatesParseAndValidate(t *testing.T) {
 
 func TestUpdatePlannerTemplate(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -308,7 +309,7 @@ func TestValidateID(t *testing.T) {
 
 func TestAddLocalInstallsCustomTemplate(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -337,7 +338,7 @@ func TestAddLocalInstallsCustomTemplate(t *testing.T) {
 
 func TestAddLocalRejectsInvalidInputs(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -377,7 +378,7 @@ func TestAddLocalRejectsInvalidInputs(t *testing.T) {
 
 func TestUpdateLocalRefreshesFromStoredPath(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -444,7 +445,7 @@ func TestIsRemoteGatesOnRealOwnerRepo(t *testing.T) {
 
 func TestAddRemoteInstallsAndUpdatesFetchedTemplate(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -481,7 +482,7 @@ func TestAddRemoteInstallsAndUpdatesFetchedTemplate(t *testing.T) {
 
 func TestAddRemoteRejectsInvalidInputs(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -510,7 +511,7 @@ func TestAddRemoteRejectsInvalidInputs(t *testing.T) {
 
 func TestUpdateRemoteRejectsLocalRow(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -523,7 +524,7 @@ func TestUpdateRemoteRejectsLocalRow(t *testing.T) {
 
 func TestExportReconstructsStoredTemplate(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

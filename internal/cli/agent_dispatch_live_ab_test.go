@@ -11,6 +11,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -57,7 +58,7 @@ func liveABFixture(t *testing.T, championPulls int) (string, *db.Store, localAge
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

@@ -12,7 +12,7 @@ import (
 
 func openMemTestStore(t *testing.T) *Store {
 	t.Helper()
-	store, err := Open(filepath.Join(t.TempDir(), "memory.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "memory.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

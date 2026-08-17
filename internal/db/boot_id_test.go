@@ -28,7 +28,7 @@ func TestBootIDStableAndCached(t *testing.T) {
 
 func openBootTestStore(t *testing.T) *Store {
 	t.Helper()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

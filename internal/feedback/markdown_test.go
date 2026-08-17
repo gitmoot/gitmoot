@@ -11,11 +11,12 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/artifact"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 func TestMarkdownCollectorWriteAndImportPacket(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -387,7 +388,7 @@ items:
 
 func TestMarkdownCollectorRejectsInvalidFeedback(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -460,7 +461,7 @@ func TestMarkdownCollectorRejectsInvalidFeedback(t *testing.T) {
 
 func TestMarkdownCollectorRejectsIncompleteABItems(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -483,7 +484,7 @@ func TestMarkdownCollectorRejectsIncompleteABItems(t *testing.T) {
 
 func TestMarkdownCollectorRejectsIdenticalABItems(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -587,7 +588,7 @@ func TestMarkdownCollectorLinksPreviewBundleWithURL(t *testing.T) {
 
 func TestMarkdownCollectorRejectsPacketWithoutStoredRun(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -609,7 +610,7 @@ func TestMarkdownCollectorRejectsPacketWithoutStoredRun(t *testing.T) {
 
 func TestMarkdownCollectorUsesCollisionSafeItemFilenames(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -689,7 +690,7 @@ func TestOptionReferenceLabelsPreviewDeploymentStatus(t *testing.T) {
 func setupMarkdownRankedFeedbackRun(t *testing.T, runID string) (*db.Store, artifact.Store) {
 	t.Helper()
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

@@ -12,6 +12,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/memory"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -125,7 +126,7 @@ func TestProjectMemoryHarvestResultOnlySummaryAndFindingsWithinCap(t *testing.T)
 
 func TestHarvestObservationDedupAndMetadata(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "harvest.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "harvest.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +163,7 @@ func TestHarvestObservationDedupAndMetadata(t *testing.T) {
 
 func harvestObservationForContent(t *testing.T, content string) db.MemoryObservation {
 	t.Helper()
-	store, err := db.Open(filepath.Join(t.TempDir(), "harvest-key.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "harvest-key.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +233,7 @@ func TestAutoConfirmEligibleProvenanceFailClosed(t *testing.T) {
 		}
 	}
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "autoconfirm.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "autoconfirm.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +253,7 @@ func TestAutoConfirmEligibleProvenanceFailClosed(t *testing.T) {
 
 func newMemoryHarvestSweepStore(t *testing.T) *db.Store {
 	t.Helper()
-	store, err := db.Open(filepath.Join(t.TempDir(), "harvest-sweep.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "harvest-sweep.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +381,7 @@ func TestDaemonMemoryHarvestLineOffAndUncertain(t *testing.T) {
 	if got := daemonMemoryHarvestLine(paths, home); got != "" {
 		t.Fatalf("off status line=%q, want absent", got)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}

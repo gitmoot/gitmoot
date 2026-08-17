@@ -12,6 +12,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/artifact"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/skillopt"
 )
 
@@ -21,7 +22,7 @@ func TestSkillOptReviewCreateAndStatus(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -65,7 +66,7 @@ func TestSkillOptReviewCreateAndStatus(t *testing.T) {
 		t.Fatalf("review create stdout = %q", stdout.String())
 	}
 
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open after create returned error: %v", err)
 	}
@@ -158,7 +159,7 @@ func TestSkillOptReviewItemAddStoresArtifacts(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -209,7 +210,7 @@ func TestSkillOptReviewItemAddStoresArtifacts(t *testing.T) {
 		t.Fatalf("review item add stdout = %q", stdout.String())
 	}
 
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open after item add returned error: %v", err)
 	}
@@ -281,7 +282,7 @@ func TestSkillOptRankedReviewItemAddAndMarkdownExport(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -307,7 +308,7 @@ func TestSkillOptRankedReviewItemAddAndMarkdownExport(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("skillopt review create exit code = %d, stderr=%s", code, stderr.String())
 	}
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open before preseeded review item returned error: %v", err)
 	}
@@ -349,7 +350,7 @@ func TestSkillOptRankedReviewItemAddAndMarkdownExport(t *testing.T) {
 	if code == 0 || !strings.Contains(stderr.String(), "missing.md") {
 		t.Fatalf("ranked item add with missing option: code=%d stderr=%s", code, stderr.String())
 	}
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open after failed ranked item add returned error: %v", err)
 	}
@@ -421,7 +422,7 @@ func TestSkillOptRankedReviewItemAddAndMarkdownExport(t *testing.T) {
 		t.Fatalf("ranked run accepted A/B artifacts: code=%d stderr=%s", code, stderr.String())
 	}
 
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open after ranked item add returned error: %v", err)
 	}
@@ -526,7 +527,7 @@ func TestSkillOptHumanFeedbackTrialSmoke(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -703,7 +704,7 @@ items:
 		t.Fatalf("candidate reject stdout = %q", stdout.String())
 	}
 
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open after trial smoke returned error: %v", err)
 	}
@@ -737,7 +738,7 @@ func TestSkillOptReviewItemAddRejectsInvalidInputs(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -840,7 +841,7 @@ func TestSkillOptReviewStatusRequiresExportableArtifacts(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -909,7 +910,7 @@ func TestSkillOptReviewStatusShowsRankedPairwisePreferences(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1034,7 +1035,7 @@ func TestSkillOptReviewStatusRequiresExportableMetadata(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1130,7 +1131,7 @@ func TestSkillOptReviewStatusRequiresFeedbackForEveryItem(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -111,7 +112,7 @@ func runRuntimePreflightStubJob(t *testing.T, rawHome string, checker *runtime.R
 	if err := os.MkdirAll(paths.Home, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}

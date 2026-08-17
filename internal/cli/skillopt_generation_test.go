@@ -13,6 +13,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/artifact"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/skillopt"
@@ -63,7 +64,7 @@ func TestSkillOptTrainContinueGeneratesOptionsWithCurrentSkill(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -313,7 +314,7 @@ func TestSkillOptTrainGenerationStampsCorrelationIDs(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -449,7 +450,7 @@ func TestSkillOptTrainContinueGeneratesRequiredVuePreviewBundles(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -643,7 +644,7 @@ func TestSkillOptTrainContinueRetriesInvalidRequiredVuePreviewOption(t *testing.
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -776,7 +777,7 @@ func TestSkillOptTrainContinueAllowsOptionalVuePreviewFallback(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -923,7 +924,7 @@ func TestSkillOptTrainContinueFailsRequiredVuePreviewForProseOutput(t *testing.T
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1028,7 +1029,7 @@ func TestSkillOptTrainContinueRejectsNonImplementedGenerationResult(t *testing.T
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1121,7 +1122,7 @@ func TestSkillOptTrainContinueRecoversCompleteGeneratedOptions(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1408,7 +1409,7 @@ func TestSkillOptTrainContinueUsesManagedGeneratorConcurrency(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1486,7 +1487,7 @@ func TestSkillOptTrainContinueUsesRegisteredWorkspaceRepoCheckout(t *testing.T) 
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1604,7 +1605,7 @@ func TestSkillOptTrainContinueGeneratesValidateArtifacts(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1719,7 +1720,7 @@ func TestSkillOptTrainContinueRecordsGenerationFailureWithoutOptions(t *testing.
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

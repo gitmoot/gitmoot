@@ -13,6 +13,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/skillopt"
 )
 
@@ -119,7 +120,7 @@ func TestSkillOptTrainInitCreatesScaffold(t *testing.T) {
 	if !strings.Contains(string(reviewItems), "item-001") || !strings.Contains(string(reviewItems), "item-002") {
 		t.Fatalf("review-items.yml = %q", string(reviewItems))
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open store returned error: %v", err)
 	}
@@ -208,7 +209,7 @@ func TestSkillOptTrainInitCompletesFromPromptAnswers(t *testing.T) {
 	if strings.TrimSpace(string(task)) != "Improve planner summaries." {
 		t.Fatalf("task.md = %q", string(task))
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open store returned error: %v", err)
 	}
@@ -242,7 +243,7 @@ func TestSkillOptTrainInitWizardConfirm(t *testing.T) {
 			if err := config.Initialize(paths); err != nil {
 				t.Fatalf("Initialize returned error: %v", err)
 			}
-			store, err := db.Open(paths.Database)
+			store, err := dbtest.Open(t, paths.Database)
 			if err != nil {
 				t.Fatalf("Open returned error: %v", err)
 			}
@@ -284,7 +285,7 @@ func TestSkillOptTrainInitWizardCompletesFromStdin(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -335,7 +336,7 @@ func TestSkillOptTrainInitWizardCompletesFromInteractiveAnswers(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -673,7 +674,7 @@ func TestSkillOptTrainInitClearsInvalidPromptAnswers(t *testing.T) {
 	if !strings.Contains(stderr.String(), "review-repo") {
 		t.Fatalf("stderr missing review repo validation error: %s", stderr.String())
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open store returned error: %v", err)
 	}
@@ -726,7 +727,7 @@ func TestSkillOptTrainInitKeepsPromptAnswersForExplicitFlagErrors(t *testing.T) 
 	if code != 2 {
 		t.Fatalf("explicit invalid preview init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open store returned error: %v", err)
 	}
@@ -771,7 +772,7 @@ func TestSkillOptTrainInitFullyFlaggedBypassesPromptCreation(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("train init exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open store returned error: %v", err)
 	}

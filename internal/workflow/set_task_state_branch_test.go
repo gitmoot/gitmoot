@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 // TestSetTaskStateBranchConflict pins the fix for the reported
@@ -16,7 +17,7 @@ import (
 // a transient failure), it must advance the branch's canonical task in place rather than
 // crash on the tasks(repo_full_name, branch) partial-unique index.
 func TestSetTaskStateBranchConflict(t *testing.T) {
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
@@ -62,7 +63,7 @@ func TestSetTaskStateBranchConflict(t *testing.T) {
 }
 
 func TestSetTaskStateCannotResurrectDismissedTask(t *testing.T) {
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +91,7 @@ func TestSetTaskStateCannotResurrectDismissedTask(t *testing.T) {
 func TestSetTaskStateCannotResurrectEvidenceDisposedTask(t *testing.T) {
 	for _, terminal := range []TaskState{TaskSuperseded, TaskStranded} {
 		t.Run(string(terminal), func(t *testing.T) {
-			store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+			store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 			if err != nil {
 				t.Fatal(err)
 			}

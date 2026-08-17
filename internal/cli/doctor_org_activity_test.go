@@ -9,6 +9,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 func TestBuildOrgRoleActivityDoctorCheckClassifiesAbsence(t *testing.T) {
@@ -95,7 +96,7 @@ func TestDoctorOrgRoleActivityWarnsAtOperatorArtifact(t *testing.T) {
 		t.Fatal(err)
 	}
 	appendOrgActivityTestConfig(t, paths)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}

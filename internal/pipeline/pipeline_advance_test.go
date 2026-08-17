@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -20,7 +21,7 @@ import (
 // is the honest test double; it never touches a user home.
 func pipelineAdvanceStore(t *testing.T) *db.Store {
 	t.Helper()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}

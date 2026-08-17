@@ -13,6 +13,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	gmruntime "github.com/gitmoot/gitmoot/internal/runtime"
 )
 
@@ -68,7 +69,7 @@ func TestClaudeCredEnvFromLookupNoCredentialSkips(t *testing.T) {
 
 func TestBuildSnapshotCountsRepoLocalState(t *testing.T) {
 	paths := testPaths(t)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

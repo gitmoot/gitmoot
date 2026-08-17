@@ -9,6 +9,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 type fakeStore struct {
@@ -343,7 +344,7 @@ func TestTrainInitProgressHeader(t *testing.T) {
 // drive real SQL and observe an external answer, one prompt at a time.
 func TestTrainInitPromptCmdsAgainstRealStore(t *testing.T) {
 	t.Parallel()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 type fakeRemoteSource struct {
@@ -40,7 +40,7 @@ func outcomeByID(results []PullResult) map[string]PullResult {
 }
 
 func TestPullListsInstallsSkipsAndNoOps(t *testing.T) {
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestPullListsInstallsSkipsAndNoOps(t *testing.T) {
 }
 
 func TestPullDryRunWritesNothing(t *testing.T) {
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestPullDryRunWritesNothing(t *testing.T) {
 }
 
 func TestPullReportsPerFileFailureAndContinues(t *testing.T) {
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestPullReportsPerFileFailureAndContinues(t *testing.T) {
 }
 
 func TestPullRejectsMalformedRepo(t *testing.T) {
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

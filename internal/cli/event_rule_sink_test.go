@@ -18,6 +18,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -320,7 +321,7 @@ pane="w1:p3"
 	if err := os.WriteFile(paths.ConfigFile, []byte(configBody), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,7 +407,7 @@ pane="w1:p4"
 			if err := os.WriteFile(paths.ConfigFile, []byte(orgConfig), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			store, err := db.Open(paths.Database)
+			store, err := dbtest.Open(t, paths.Database)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -477,7 +478,7 @@ pane="w1:p2"
 	if err := os.WriteFile(paths.ConfigFile, []byte(configBody), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -524,7 +525,7 @@ func TestEventRuleEvaluatorResolvesPaneAndWakes(t *testing.T) {
 	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,7 +553,7 @@ func TestEventRuleWakeStallIncrementsAndDeliveryResetsCounter(t *testing.T) {
 	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -588,7 +589,7 @@ func TestEventRuleEvaluatorResolvesPaneLabel(t *testing.T) {
 	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"coordinator-a\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -613,7 +614,7 @@ func TestEventRuleEvaluatorCountsUnresolvedRoleBinding(t *testing.T) {
 	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"missing-label\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -651,7 +652,7 @@ func TestDurableWakeWithUnresolvedPaneParksAsStalled(t *testing.T) {
 	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"missing-pane\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -684,7 +685,7 @@ func TestDurableWakeWithUnresolvedPaneParksAsStalled(t *testing.T) {
 }
 
 func TestEventRuleEvaluatorZeroRulesDoesNotProbeHerdr(t *testing.T) {
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -705,7 +706,7 @@ func TestDaemonEventSinkRuleOnlyActivationAndRemoval(t *testing.T) {
 	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -740,7 +741,7 @@ func TestEventRuleWakeFiresEachMatchingRule(t *testing.T) {
 	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}

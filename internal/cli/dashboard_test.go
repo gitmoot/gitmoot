@@ -14,6 +14,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/cli/style"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
@@ -29,7 +30,7 @@ func dashboardTestHome(t *testing.T) string {
 
 func seedDashboardPrompt(t *testing.T, home, id, question string, choices []string) {
 	t.Helper()
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -122,7 +123,7 @@ func TestDashboardAnswerResolvesPromptThroughSharedAPI(t *testing.T) {
 		t.Fatalf("answered prompt should not remain pending:\n%s", stdout.String())
 	}
 	// The prompt is resolved through the same store API interactive answer uses.
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -145,7 +146,7 @@ func TestDashboardAnswerRejectsInvalidChoiceAndKeepsPrompt(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("invalid dashboard answer exit code = %d, want 1; stderr=%s", code, stderr.String())
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -167,7 +168,7 @@ func TestDashboardWithoutAnswerDoesNotMutate(t *testing.T) {
 	if code := Run([]string{"dashboard", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("dashboard exit code = %d, stderr=%s", code, stderr.String())
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -193,7 +194,7 @@ func TestDashboardDismissDeletesPrompt(t *testing.T) {
 	if !strings.Contains(stdout.String(), "pending_prompts: 0") {
 		t.Fatalf("dismissed prompt should not remain pending:\n%s", stdout.String())
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -465,7 +466,7 @@ func TestDashboardSessionStale(t *testing.T) {
 // as a plainly-live "running" session.
 func TestDashboardFlagsPhantomRunningSession(t *testing.T) {
 	home := dashboardTestHome(t)
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -520,7 +521,7 @@ func TestDashboardFlagsPhantomRunningSession(t *testing.T) {
 // (within-)lease and a held runtime:<rt>:<ref> session lock owned by ownerPID.
 func seedAgentInstanceWithLock(t *testing.T, home, name, ref string, ownerPID int64) {
 	t.Helper()
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -571,7 +572,7 @@ func TestRunningSessionStaleWithinLeaseDeadLock(t *testing.T) {
 	seedAgentInstanceWithLock(t, home, "researcher-bg-crashed", "ref-crashed", deadPID(t))
 	seedAgentInstanceWithLock(t, home, "researcher-bg-live", "ref-live", int64(os.Getpid()))
 
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -632,7 +633,7 @@ func TestDashboardFlagsWithinLeasePhantomViaDeadLock(t *testing.T) {
 
 func TestDashboardRendersActiveJobsSection(t *testing.T) {
 	home := dashboardTestHome(t)
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

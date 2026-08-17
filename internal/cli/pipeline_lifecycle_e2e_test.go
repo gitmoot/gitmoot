@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 )
 
@@ -78,7 +79,7 @@ func TestPipelineRestartRecoversE2E(t *testing.T) {
 	}
 
 	// --- Phase 2: RESTART — a fresh instance re-opens the same DB ----------------
-	store2, err := db.Open(paths.Database)
+	store2, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
 	}

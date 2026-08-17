@@ -13,6 +13,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/org"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -49,7 +50,7 @@ pane = "w1:p2"
 
 func TestCaptureQuotaRoleUnavailableEscalatesOnceAndSuccessClears(t *testing.T) {
 	home, paths := setupQuotaUnavailableOrgHome(t)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +110,7 @@ pane = "w1:p2"
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +157,7 @@ func TestCaptureQuotaRoleUnavailableClaudeOnly(t *testing.T) {
 
 func TestForegroundDispatchCapturesQuotaFailureAndClearsOnSuccess(t *testing.T) {
 	home, paths := setupQuotaUnavailableOrgHome(t)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +223,7 @@ func TestForegroundDispatchCapturesQuotaFailureAndClearsOnSuccess(t *testing.T) 
 
 func TestSuccessfulJobOnlyClearsQuotaRoleUnavailableForSameRuntime(t *testing.T) {
 	home, paths := setupQuotaUnavailableOrgHome(t)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +273,7 @@ func TestSuccessfulJobOnlyClearsQuotaRoleUnavailableForSameRuntime(t *testing.T)
 
 func TestTempWorkerDispatchCapturesQuotaFailureAndClearsOnSuccess(t *testing.T) {
 	home, paths := setupQuotaUnavailableOrgHome(t)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +347,7 @@ func TestTempWorkerDispatchCapturesQuotaFailureAndClearsOnSuccess(t *testing.T) 
 
 func TestValidateAndTouchActingOrgRoleRefusesUnavailableAndClearsExpired(t *testing.T) {
 	home, paths := setupQuotaUnavailableOrgHome(t)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,7 +403,7 @@ func TestRunTaskRunRefusesUnavailableRoleBeforeWorktreeAllocation(t *testing.T) 
 	runGit(t, checkout, "-c", "user.name=Gitmoot Test", "-c", "user.email=gitmoot@example.com", "commit", "-m", "initial")
 	withWorkingDirectory(t, checkout)
 
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -425,7 +426,7 @@ func TestRunTaskRunRefusesUnavailableRoleBeforeWorktreeAllocation(t *testing.T) 
 		!strings.Contains(stderr.String(), "dispatch refused") {
 		t.Fatalf("task run unavailable: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -483,7 +484,7 @@ func TestListPendingQueuedJobsHoldsUnavailableRole(t *testing.T) {
 
 func TestOrgStatusUnavailableOverlay(t *testing.T) {
 	_, paths := setupQuotaUnavailableOrgHome(t)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}

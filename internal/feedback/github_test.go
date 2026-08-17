@@ -9,6 +9,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/artifact"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
 )
 
@@ -743,7 +744,7 @@ func setupGitHubRankedFeedbackRun(t *testing.T, runID string, targetRepo string)
 func setupGitHubRankedFeedbackRunWithItem(t *testing.T, runID string, itemID string, targetRepo string) (*db.Store, artifact.Store) {
 	t.Helper()
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -819,7 +820,7 @@ func setupGitHubFeedbackRun(t *testing.T, runID string, targetRepo string) (*db.
 func setupGitHubFeedbackRunWithItem(t *testing.T, runID string, itemID string, targetRepo string) (*db.Store, artifact.Store) {
 	t.Helper()
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

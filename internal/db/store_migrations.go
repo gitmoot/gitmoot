@@ -2,10 +2,28 @@ package db
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
 )
+
+// SchemaMigrationFingerprint identifies the exact ordered migration set. Test
+// schema templates use it in their cache key so a migration edit cannot reuse
+// a stale database from an earlier test run.
+func SchemaMigrationFingerprint() string {
+	hash := sha256.New()
+	for _, migration := range migrations {
+		_, _ = hash.Write([]byte(migration))
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+// SchemaMigrationCount returns the number of migrations in the current schema.
+func SchemaMigrationCount() int {
+	return len(migrations)
+}
 
 func (s *Store) Migrate(ctx context.Context) error {
 	for version, migration := range migrations {

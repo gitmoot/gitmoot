@@ -13,6 +13,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -22,6 +23,13 @@ func TestForeignBootRecoveryLoopIndependentOfSlowPollInterval(t *testing.T) {
 	paths := config.PathsForHome(home)
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatalf("preseed migrated store: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close preseeded store: %v", err)
 	}
 
 	const slowPollInterval = 5 * time.Minute
@@ -112,7 +120,7 @@ func TestPollRegisteredReposHonorsPerRepoIntervals(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -171,7 +179,7 @@ func TestPollRegisteredReposRoutesEachRepoWithOwnGitHubClient(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -271,7 +279,7 @@ func TestPollRegisteredReposBacksOffFailedRepoWithoutStoppingOthers(t *testing.T
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -346,7 +354,7 @@ func TestPollRegisteredReposAdaptiveIdleCadence(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,7 +414,7 @@ func TestPollRegisteredReposIdleErrorBackoffTakesPrecedence(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -442,7 +450,7 @@ func TestPollRegisteredReposQueuedJobPromotesImmediately(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -487,7 +495,7 @@ func TestPollRegisteredReposQueuedJobDoesNotOverrideErrorBackoff(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -530,7 +538,7 @@ func TestPollRegisteredReposBusyRepoAtBaseCadenceKeepsInterval(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -571,7 +579,7 @@ func TestPollRegisteredReposTreats304AsSuccess(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}

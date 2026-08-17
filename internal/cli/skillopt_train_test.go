@@ -14,6 +14,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/skillopt"
 )
 
@@ -23,7 +24,7 @@ func TestSkillOptTrainStartRequiresWorkspaceRepo(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -60,7 +61,7 @@ func TestSkillOptTrainStartRequiresWorkspaceRepo(t *testing.T) {
 	if !strings.Contains(stderr.String(), "requires --workspace-repo") {
 		t.Fatalf("missing workspace-repo error = %q", stderr.String())
 	}
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open after failed start returned error: %v", err)
 	}
@@ -76,7 +77,7 @@ func TestSkillOptTrainStartStatusAndStop(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -145,7 +146,7 @@ func TestSkillOptTrainStartStatusAndStop(t *testing.T) {
 			t.Fatalf("dry-run stdout missing %q:\n%s", want, stdout.String())
 		}
 	}
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open after dry-run returned error: %v", err)
 	}
@@ -242,7 +243,7 @@ func TestSkillOptTrainStartStatusAndStop(t *testing.T) {
 	if !strings.Contains(stdout.String(), "expected_review_repo: owner/previews") {
 		t.Fatalf("train start stdout missing expected review repo: %q", stdout.String())
 	}
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open after start returned error: %v", err)
 	}
@@ -314,7 +315,7 @@ func TestSkillOptTrainStartStatusAndStop(t *testing.T) {
 	if !strings.Contains(stderr.String(), "already exists") {
 		t.Fatalf("duplicate train start stderr = %q", stderr.String())
 	}
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open after duplicate start returned error: %v", err)
 	}
@@ -354,7 +355,7 @@ func TestSkillOptTrainStartStatusAndStop(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize before eval-run collision returned error: %v", err)
 	}
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open before eval-run collision returned error: %v", err)
 	}
@@ -499,7 +500,7 @@ func TestSkillOptTrainStartStatusAndStop(t *testing.T) {
 		t.Fatalf("continue stderr = %q", stderr.String())
 	}
 
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open for terminal stop returned error: %v", err)
 	}
@@ -530,7 +531,7 @@ func TestSkillOptTrainStartStatusAndStop(t *testing.T) {
 	if !strings.Contains(stderr.String(), "terminal") {
 		t.Fatalf("terminal stop stderr = %q", stderr.String())
 	}
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open after terminal stop returned error: %v", err)
 	}
@@ -583,7 +584,7 @@ func TestSkillOptTrainStartLoadsInitConfig(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("train start --config exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open store returned error: %v", err)
 	}
@@ -659,7 +660,7 @@ func TestSkillOptTrainStartConfigPreviewModeOverrideDisablesVue(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("train start --config --preview-mode none exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open store returned error: %v", err)
 	}
@@ -713,7 +714,7 @@ func TestSkillOptTrainStartConfigPreviewFlagsOverrideNone(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("train start --config --preview-repo exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open store returned error: %v", err)
 	}
@@ -767,7 +768,7 @@ func TestSkillOptTrainStartConfigRepoOverrideDrivesVuePreviewRepo(t *testing.T) 
 	if code != 0 {
 		t.Fatalf("train start --config --repo exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open store returned error: %v", err)
 	}
@@ -817,7 +818,7 @@ func TestSkillOptTrainStatusGeneratedProgressUsesCurrentIteration(t *testing.T) 
 }
 
 func TestSkillOptTrainStatusVerboseUsesCurrentIterationMetadata(t *testing.T) {
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -859,7 +860,7 @@ func TestSkillOptTrainStatusVerboseUsesCurrentIterationMetadata(t *testing.T) {
 }
 
 func TestSkillOptTrainStatusItemsReportsABLabels(t *testing.T) {
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1003,7 +1004,7 @@ func TestSkillOptTrainStartRejectsTooFewItemsAndWarnsOnHomogeneousItems(t *testi
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1175,7 +1176,7 @@ func TestSkillOptTrainGeneratingOptionsPhase(t *testing.T) {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
 	ctx := context.Background()
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

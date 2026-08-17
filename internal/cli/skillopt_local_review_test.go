@@ -9,6 +9,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/artifact"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/skillopt"
 )
@@ -26,7 +27,7 @@ func seedSkillOptTrainOptionsGeneratedForReview(t *testing.T, includeFeedback bo
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

@@ -13,6 +13,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
@@ -1902,7 +1903,7 @@ func TestMailboxRunSkipsRepairAfterCancellation(t *testing.T) {
 
 func openTestStore(t *testing.T) *db.Store {
 	t.Helper()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

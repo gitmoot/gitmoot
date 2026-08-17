@@ -12,6 +12,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/org"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -277,7 +278,7 @@ blocked_role_wake_after = "1h"
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,7 +378,7 @@ pane = "Gitmoot"
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -432,7 +433,7 @@ func TestRunBlockedRoleWakeOnceSkipsSilentlyWithNoOrgRolesConfigured(t *testing.
 	if err := config.Initialize(paths); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -726,7 +727,7 @@ func TestPaneInputPendingRuleObservationWakesAndTracksDelivery(t *testing.T) {
 		t.Fatalf("add pane_input_pending rule code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -14,6 +14,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/cockpit"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/transcript"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -815,7 +816,7 @@ func seedJobCancelBulkFixtures(t *testing.T, home string) {
 
 func jobStateForTest(t *testing.T, home, id string) string {
 	t.Helper()
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -989,7 +990,7 @@ func openCLIJobStore(t *testing.T, home string) *db.Store {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

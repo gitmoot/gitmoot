@@ -11,7 +11,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/daemon"
-	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
 )
 
@@ -97,7 +97,7 @@ func TestEnsureSkillOptTrainRepoCreatesMissing(t *testing.T) {
 	if !strings.Contains(out.String(), "created_repo: o/missing") {
 		t.Fatalf("expected created_repo line: %q", out.String())
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestProvisionTrainGenerationRepo(t *testing.T) {
 		t.Fatalf("expected one create + one clone, got created=%v cloned=%v", fake.created, fake.cloned)
 	}
 
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

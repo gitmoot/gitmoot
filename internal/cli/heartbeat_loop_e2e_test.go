@@ -10,6 +10,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -27,7 +28,7 @@ func heartbeatLoopE2EHome(t *testing.T) (string, config.Paths, *db.Store) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -166,7 +167,7 @@ func TestHeartbeatLoopFullChainE2E(t *testing.T) {
 	// regression behind that constraint). A restart within the SAME due window must
 	// NOT re-fire: the dedup lives in the PERSISTED next_due, still one interval
 	// ahead of now0.
-	restartStore, err := db.Open(paths.Database)
+	restartStore, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("reopen store for restart: %v", err)
 	}

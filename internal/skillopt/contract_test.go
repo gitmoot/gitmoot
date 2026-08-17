@@ -15,11 +15,12 @@ import (
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/artifact"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 func TestImportCandidatePackageWithOptionsRejectsNoCandidateMetadata(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -55,7 +56,7 @@ func TestImportCandidatePackageWithOptionsRejectsNoCandidateMetadata(t *testing.
 
 func TestExportTrainingPackage(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -139,7 +140,7 @@ func TestExportTrainingPackage(t *testing.T) {
 
 func TestExportTrainingPackageIncludesPreferredGateMetadata(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -196,7 +197,7 @@ func TestExportTrainingPackageIncludesPreferredGateMetadata(t *testing.T) {
 
 func TestExportTrainingPackagePreservesEvaluatorMode(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -239,7 +240,7 @@ func TestExportTrainingPackagePreservesEvaluatorMode(t *testing.T) {
 
 func TestExportTrainingPackagePreservesEvaluatorConfigNumberFidelity(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -278,7 +279,7 @@ func TestExportTrainingPackagePreservesEvaluatorConfigNumberFidelity(t *testing.
 
 func TestExportTrainingPackageCarriesJudgePromptTemplates(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -359,7 +360,7 @@ func TestExportTrainingPackageCarriesJudgePromptTemplates(t *testing.T) {
 
 func TestExportTrainingPackageJudgePromptTemplatesAbsentIsBackwardCompatible(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -435,7 +436,7 @@ func TestEvaluatorJudgeConfigJudgePromptConfigIgnoresMalformedShapes(t *testing.
 
 func TestExportTrainingPackageBuildsEvaluatorProfileFromMetadata(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -688,7 +689,7 @@ func TestEvaluatorProfileAndFailurePacketContractsRoundTrip(t *testing.T) {
 
 func TestExportTrainingPackageIncludesRankedExplorationFeedback(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -841,7 +842,7 @@ func TestReviewIssueFromSourceURLSupportsIssueAndPullTargets(t *testing.T) {
 
 func TestImportCandidatePackageWithArtifacts(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -956,7 +957,7 @@ func TestImportCandidatePackageArtifactValidationFailsBeforeCandidateState(t *te
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
-			store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+			store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 			if err != nil {
 				t.Fatalf("Open returned error: %v", err)
 			}
@@ -1011,7 +1012,7 @@ func TestImportCandidatePackageArtifactValidationFailsBeforeCandidateState(t *te
 
 func TestImportCandidatePackageRejectsDuplicateCandidateArtifactIDs(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1055,7 +1056,7 @@ func TestImportCandidatePackageRejectsDuplicateCandidateArtifactIDs(t *testing.T
 
 func TestImportCandidatePackageRejectsExistingCandidateArtifactID(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1578,7 +1579,7 @@ func TestProjectSignalDoesNotChangeWirePackages(t *testing.T) {
 // TestExportAutoTraceRunFeedbackSource.
 func TestHumanRunFeedbackContextByteIdentical(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1642,7 +1643,7 @@ func TestHumanRunFeedbackContextByteIdentical(t *testing.T) {
 // contract field or ContractVersion change (#465).
 func TestExportAutoTraceRunFeedbackSource(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

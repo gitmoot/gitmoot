@@ -20,6 +20,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -3695,7 +3696,7 @@ func TestRunDaemonWorkerTickBlockedTTLSweepsAgedBlockedJob(t *testing.T) {
 	if err := os.WriteFile(paths.ConfigFile, []byte("[orchestrate]\nblocked_ttl = \"1h\"\n"), 0o600); err != nil {
 		t.Fatalf("write config returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

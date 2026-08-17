@@ -17,6 +17,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/buildinfo"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/update"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -26,7 +27,7 @@ import (
 // delegation graph to build from.
 func seedWebDashboardTree(t *testing.T, home string) {
 	t.Helper()
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -423,7 +424,7 @@ func TestWebDataSourceGraph(t *testing.T) {
 	seedWebDashboardTree(t, home)
 	// A second job in a different repo, so the repo filter has something to hide
 	// and Repos has more than one entry.
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -595,7 +596,7 @@ func TestWebDataSourceJobs(t *testing.T) {
 	seedWebDashboardTree(t, home)
 
 	// Give one job real token usage (CreateJob defaults tokens to 0).
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -693,7 +694,7 @@ func TestWebDataSourceJobs(t *testing.T) {
 // spec rather than the registry.
 func TestWebDataSourceJobsEphemeralRuntime(t *testing.T) {
 	home := dashboardTestHome(t)
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -765,7 +766,7 @@ func TestSplitRepoScope(t *testing.T) {
 // first (never-active last).
 func TestWebDataSourceAgents(t *testing.T) {
 	home := dashboardTestHome(t)
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -1072,7 +1073,7 @@ func TestHealthStuckSince(t *testing.T) {
 // lock.
 func seedHealthHome(t *testing.T, home string) {
 	t.Helper()
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -1221,7 +1222,7 @@ func TestWebDataSourceHealthDaemonRunning(t *testing.T) {
 // and the pending v2 version id.
 func seedTemplatedAgent(t *testing.T, home string) (v1ID, v2ID string) {
 	t.Helper()
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -1582,7 +1583,7 @@ func TestWebDataSourceAgentConfigAndMemory(t *testing.T) {
 		t.Fatalf("SaveAgentType plain-agent: %v", err)
 	}
 
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

@@ -80,6 +80,37 @@ func TestOpenMigratesSchema(t *testing.T) {
 	}
 }
 
+func TestOpenAlreadyMigratedConfiguresSQLiteWithoutMigrating(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenAlreadyMigrated(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("OpenAlreadyMigrated returned error: %v", err)
+	}
+	defer store.Close()
+
+	var busyTimeout int
+	if err := store.db.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil {
+		t.Fatalf("PRAGMA busy_timeout returned error: %v", err)
+	}
+	if busyTimeout != sqliteBusyTimeoutMillis {
+		t.Fatalf("busy_timeout = %d, want %d", busyTimeout, sqliteBusyTimeoutMillis)
+	}
+	var journalMode string
+	if err := store.db.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&journalMode); err != nil {
+		t.Fatalf("PRAGMA journal_mode returned error: %v", err)
+	}
+	if journalMode != "wal" {
+		t.Fatalf("journal_mode = %q, want wal", journalMode)
+	}
+	migrated, err := store.HasTable(ctx, "schema_migrations")
+	if err != nil {
+		t.Fatalf("HasTable(schema_migrations) returned error: %v", err)
+	}
+	if migrated {
+		t.Fatal("OpenAlreadyMigrated unexpectedly ran migrations")
+	}
+}
+
 func TestOpenConfiguresSQLiteContentionPragmas(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gitmoot.db")
 	store, err := Open(path)

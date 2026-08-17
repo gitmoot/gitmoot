@@ -10,6 +10,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/cli/tui"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -359,7 +360,7 @@ func TestDashboardTUIDepsActions(t *testing.T) {
 		t.Fatalf("Dismiss: %v", err)
 	}
 
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -391,7 +392,7 @@ func TestDashboardCreateAgentWithPrompt(t *testing.T) {
 		t.Fatalf("CreateAgentWithPrompt: %v", err)
 	}
 
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -418,7 +419,7 @@ func TestDashboardCreateAgentWithPrompt(t *testing.T) {
 // deletes the agents it can and skips any with a queued/running job.
 func TestDashboardTUIDeleteAgentsSkipsActive(t *testing.T) {
 	home := dashboardTestHome(t)
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -443,7 +444,7 @@ func TestDashboardTUIDeleteAgentsSkipsActive(t *testing.T) {
 		t.Fatalf("deleted=%d skipped=%v, want 1 / [a2]", deleted, skipped)
 	}
 
-	store2, err := db.Open(config.PathsForHome(home).Database)
+	store2, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

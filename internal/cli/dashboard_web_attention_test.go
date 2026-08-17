@@ -10,6 +10,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -20,7 +21,7 @@ import (
 // SkillOpt run with binary verdicts.
 func seedAttentionHome(t *testing.T, home string) {
 	t.Helper()
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

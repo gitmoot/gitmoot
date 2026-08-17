@@ -10,6 +10,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/org"
 )
 
@@ -38,7 +39,7 @@ func TestStoreOrgLiveSourcePersistedFreshness(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			_, paths := setupOrgHome(t)
-			store, err := db.Open(paths.Database)
+			store, err := dbtest.Open(t, paths.Database)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -89,7 +90,7 @@ func TestLoadOrgSharedStateMissedWakeAgeOut(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +154,7 @@ recycle_after = "1ns"
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
