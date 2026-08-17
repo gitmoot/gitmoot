@@ -192,16 +192,20 @@ func storedJobPayloadEnvelope(ctx context.Context, store *db.Store, jobID string
 	return envelope, nil
 }
 
-func effectiveRuntimeFromEnvelope(envelope map[string]json.RawMessage) (string, bool, error) {
-	raw, present := envelope["effective_runtime"]
+func runtimeFieldFromEnvelope(envelope map[string]json.RawMessage, field string) (string, bool, error) {
+	raw, present := envelope[field]
 	if !present {
 		return "", false, nil
 	}
 	var recorded string
 	if err := json.Unmarshal(raw, &recorded); err != nil {
-		return "", true, fmt.Errorf("decode effective_runtime: %w", err)
+		return "", true, fmt.Errorf("decode %s: %w", field, err)
 	}
 	return strings.TrimSpace(recorded), true, nil
+}
+
+func effectiveRuntimeFromEnvelope(envelope map[string]json.RawMessage) (string, bool, error) {
+	return runtimeFieldFromEnvelope(envelope, "effective_runtime")
 }
 
 func validateStoredJobEffectiveRuntime(ctx context.Context, store *db.Store, jobID string, effectiveRuntime string) error {
@@ -225,6 +229,13 @@ func validateStoredJobEffectiveRuntime(ctx context.Context, store *db.Store, job
 	}
 	if recorded != effective {
 		return fmt.Errorf("stored job payload effective_runtime %q does not match execution runtime %q", recorded, effective)
+	}
+	override, overridePresent, err := runtimeFieldFromEnvelope(envelope, "runtime_override")
+	if err != nil {
+		return err
+	}
+	if overridePresent && override != "" && override != effective {
+		return fmt.Errorf("stored job payload runtime_override %q does not match execution runtime %q", override, effective)
 	}
 	return nil
 }

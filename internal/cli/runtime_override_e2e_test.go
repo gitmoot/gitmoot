@@ -195,29 +195,41 @@ func TestRuntimeOverrideForegroundShellE2E(t *testing.T) {
 
 func TestRuntimeOverrideForegroundStoredEffectiveRuntimeFailsClosed(t *testing.T) {
 	tests := []struct {
-		name        string
-		updateExpr  string
-		wantError   string
-		wantPresent bool
-		wantStored  string
+		name         string
+		updateExpr   string
+		wantError    string
+		wantPresent  bool
+		wantStored   string
+		wantOverride string
 	}{
 		{
-			name:       "missing",
-			updateExpr: `json_remove(payload, '$.effective_runtime')`,
-			wantError:  "stored job payload is missing effective_runtime",
+			name:         "missing",
+			updateExpr:   `json_remove(payload, '$.effective_runtime')`,
+			wantError:    "stored job payload is missing effective_runtime",
+			wantOverride: runtime.ShellRuntime,
 		},
 		{
-			name:        "empty",
-			updateExpr:  `json_set(payload, '$.effective_runtime', '')`,
-			wantError:   "stored job payload effective_runtime is empty",
-			wantPresent: true,
+			name:         "empty",
+			updateExpr:   `json_set(payload, '$.effective_runtime', '')`,
+			wantError:    "stored job payload effective_runtime is empty",
+			wantPresent:  true,
+			wantOverride: runtime.ShellRuntime,
 		},
 		{
-			name:        "mismatch",
-			updateExpr:  `json_set(payload, '$.effective_runtime', 'codex')`,
-			wantError:   `stored job payload effective_runtime "codex" does not match execution runtime "shell"`,
-			wantPresent: true,
-			wantStored:  runtime.CodexRuntime,
+			name:         "effective_runtime_mismatch",
+			updateExpr:   `json_set(payload, '$.effective_runtime', 'codex')`,
+			wantError:    `stored job payload effective_runtime "codex" does not match execution runtime "shell"`,
+			wantPresent:  true,
+			wantStored:   runtime.CodexRuntime,
+			wantOverride: runtime.ShellRuntime,
+		},
+		{
+			name:         "runtime_override_mismatch",
+			updateExpr:   `json_set(payload, '$.runtime_override', 'codex')`,
+			wantError:    `stored job payload runtime_override "codex" does not match execution runtime "shell"`,
+			wantPresent:  true,
+			wantStored:   runtime.ShellRuntime,
+			wantOverride: runtime.CodexRuntime,
 		},
 	}
 	for _, tc := range tests {
@@ -288,6 +300,13 @@ func TestRuntimeOverrideForegroundStoredEffectiveRuntimeFailsClosed(t *testing.T
 				if stored != tc.wantStored {
 					t.Fatalf("stored effective_runtime = %q, want %q", stored, tc.wantStored)
 				}
+			}
+			var storedOverride string
+			if err := json.Unmarshal(envelope["runtime_override"], &storedOverride); err != nil {
+				t.Fatalf("decode stored runtime_override: %v", err)
+			}
+			if storedOverride != tc.wantOverride {
+				t.Fatalf("stored runtime_override = %q, want %q", storedOverride, tc.wantOverride)
 			}
 			events, err := store.ListJobEvents(ctx, job.ID)
 			if err != nil {
