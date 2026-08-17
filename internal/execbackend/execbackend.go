@@ -29,9 +29,8 @@ const (
 )
 
 // AllowedNames is the canonical allowed set of backend names, in the order
-// error messages render them. Keep it in sync with the Parse switch — both
-// are single-sourced here so a P2+ backend adds exactly one case and one
-// entry.
+// error messages render them. Parse accepts names exclusively from this list,
+// so a backend cannot be accepted without also being advertised.
 var AllowedNames = []string{string(Local)}
 
 // Allowed renders the allowed set for error messages (e.g. "local").
@@ -46,33 +45,33 @@ func UnknownError(value string) error {
 	return fmt.Errorf("unknown execution backend %q (allowed: %s)", value, Allowed())
 }
 
-// Parse validates one backend name. An empty (or whitespace-only) value
-// resolves to Local — the absent-config/absent-override default. Any
-// non-empty value outside the allowed set fails loud; there is no silent
-// fallback.
+// Parse validates one explicitly supplied backend name. Empty and
+// whitespace-only values are invalid; callers represent an absent selector
+// separately and apply Local as the default before calling Parse.
 func Parse(value string) (Backend, error) {
 	trimmed := strings.TrimSpace(value)
-	if trimmed == "" {
-		return Local, nil
+	for _, allowed := range AllowedNames {
+		if trimmed == allowed {
+			return Backend(trimmed), nil
+		}
 	}
-	switch Backend(trimmed) {
-	case Local:
-		return Local, nil
-	default:
-		return "", UnknownError(trimmed)
-	}
+	return "", UnknownError(trimmed)
 }
 
-// Resolve picks the effective backend for one job: a non-empty per-job
-// override wins over the config-file value; both empty means Local. The
-// override is validated with the same fail-loud rule as the config value.
-func Resolve(configBackend, jobOverride string) (Backend, error) {
-	if strings.TrimSpace(jobOverride) != "" {
-		backend, err := Parse(jobOverride)
+// Resolve picks the effective backend for one job. A present per-job override
+// wins even when its value is blank, which then fails loudly. A nil override
+// means absent. Empty configBackend is the absent-config default and resolves
+// to Local; config loaders reject an explicitly configured blank before here.
+func Resolve(configBackend string, jobOverride *string) (Backend, error) {
+	if jobOverride != nil {
+		backend, err := Parse(*jobOverride)
 		if err != nil {
 			return "", fmt.Errorf("invalid exec_backend job override: %w", err)
 		}
 		return backend, nil
+	}
+	if strings.TrimSpace(configBackend) == "" {
+		configBackend = string(Local)
 	}
 	return Parse(configBackend)
 }

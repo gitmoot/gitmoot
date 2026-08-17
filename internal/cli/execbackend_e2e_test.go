@@ -158,12 +158,19 @@ func TestExecBackendLocalExplicitDaemonE2E(t *testing.T) {
 // backend — "e2b" (not implemented until P5) and the typo "loca" — FAILS LOUD
 // at dispatch naming the value AND the allowed set; the job never runs.
 func TestExecBackendUnknownFailsLoudDaemonE2E(t *testing.T) {
-	for _, value := range []string{"e2b", "loca"} {
-		t.Run(value, func(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{name: "e2b", value: "e2b"},
+		{name: "typo", value: "loca"},
+		{name: "explicit blank", value: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			marker := filepath.Join(t.TempDir(), "must-not-run")
 			home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
-			execBackendAppendConfig(t, home, "\n[remote_exec]\nbackend = \""+value+"\"\n")
+			execBackendAppendConfig(t, home, "\n[remote_exec]\nbackend = \""+tc.value+"\"\n")
 			jobID := execBackendDispatchAsk(t, home)
 			execBackendRunOneTick(t, home, store)
 
@@ -192,8 +199,8 @@ func TestExecBackendUnknownFailsLoudDaemonE2E(t *testing.T) {
 			}
 			// The loud error must name the offending value AND the allowed set
 			// AND its config source — not just be a non-zero exit.
-			if !strings.Contains(failedMessage, `"`+value+`"`) {
-				t.Fatalf("failed event = %q, want it to name %q", failedMessage, value)
+			if !strings.Contains(failedMessage, `"`+tc.value+`"`) {
+				t.Fatalf("failed event = %q, want it to name %q", failedMessage, tc.value)
 			}
 			if !strings.Contains(failedMessage, "allowed: local") {
 				t.Fatalf("failed event = %q, want the allowed set named", failedMessage)
@@ -249,13 +256,47 @@ func TestExecBackendOverrideResolutionDaemonE2E(t *testing.T) {
 		}
 	})
 
+	t.Run("explicit blank override fails loud", func(t *testing.T) {
+		marker := filepath.Join(t.TempDir(), "must-not-run-override-blank")
+		home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
+		const jobID = "exec-backend-override-blank"
+		if err := store.CreateJobWithEvent(ctx, db.Job{
+			ID: jobID, Agent: "shell-asker", Type: "ask", State: string(workflow.JobQueued),
+			Payload: `{"repo":"owner/repo","sender":"local","instructions":"probe","exec_backend":""}`,
+		}, db.JobEvent{JobID: jobID, Kind: string(workflow.JobQueued), Message: "queued"}); err != nil {
+			t.Fatalf("CreateJobWithEvent: %v", err)
+		}
+		job, err := store.GetJob(ctx, jobID)
+		if err != nil {
+			t.Fatalf("GetJob: %v", err)
+		}
+		worker := defaultJobWorker(store, io.Discard, home)
+		if err := worker.run(ctx, job); err != nil {
+			t.Fatalf("worker run: %v", err)
+		}
+		if _, err := os.Stat(marker); !os.IsNotExist(err) {
+			t.Fatalf("adapter ran with an explicit blank override (marker err=%v)", err)
+		}
+		after, err := store.GetJob(ctx, jobID)
+		if err != nil {
+			t.Fatalf("GetJob(after): %v", err)
+		}
+		if after.State != string(workflow.JobFailed) {
+			t.Fatalf("job state = %q, want failed", after.State)
+		}
+		failedMessages := execBackendEvents(t, store, jobID)
+		if len(failedMessages) == 0 || !strings.Contains(failedMessages[len(failedMessages)-1], `unknown execution backend ""`) {
+			t.Fatalf("failed events = %q, want the explicit blank override named", failedMessages)
+		}
+	})
+
 	t.Run("explicit local override passes through", func(t *testing.T) {
 		marker := filepath.Join(t.TempDir(), "shell-ran-override-local")
 		home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
 		const jobID = "exec-backend-override-local"
 		if err := store.CreateJobWithEvent(ctx, db.Job{
 			ID: jobID, Agent: "shell-asker", Type: "ask", State: string(workflow.JobQueued),
-			Payload: `{"repo":"owner/repo","sender":"local","instructions":"probe","exec_backend":"local"}`,
+			Payload: `{"repo":"owner/repo","sender":"local","instructions":"probe","exec_backend":"local","future_dispatch":{"mode":"isolated"}}`,
 		}, db.JobEvent{JobID: jobID, Kind: string(workflow.JobQueued), Message: "queued"}); err != nil {
 			t.Fatalf("CreateJobWithEvent: %v", err)
 		}
@@ -276,6 +317,13 @@ func TestExecBackendOverrideResolutionDaemonE2E(t *testing.T) {
 		}
 		if after.State != string(workflow.JobSucceeded) {
 			t.Fatalf("job state = %q, want succeeded", after.State)
+		}
+		var envelope map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(after.Payload), &envelope); err != nil {
+			t.Fatalf("decode payload after execution: %v", err)
+		}
+		if got := string(envelope["future_dispatch"]); got != `{"mode":"isolated"}` {
+			t.Fatalf("future_dispatch after execution = %s, want preserved unknown member; payload=%s", got, after.Payload)
 		}
 	})
 }

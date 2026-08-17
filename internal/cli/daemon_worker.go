@@ -275,7 +275,8 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// WrappingRunner → adapter, GroupRunner{} innermost). An unknown value
 	// fails the job LOUDLY here, before any checkout/adapter work — never a
 	// silent fallback.
-	execBackend, err := w.resolveExecBackend(payload.ExecBackend)
+	jobExecBackend, jobExecBackendPresent := payload.ExecBackendOverride()
+	execBackend, err := w.resolveExecBackend(jobExecBackend, jobExecBackendPresent)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
@@ -1291,7 +1292,7 @@ func (w jobWorker) parallelSessionPolicy() (config.ParallelSessionPolicy, error)
 // plumbing. A missing config file or section resolves to local; an unknown
 // value (config or override) is a hard error naming the value and the allowed
 // set — the fail-loud contract, never a silent fallback.
-func (w jobWorker) resolveExecBackend(jobOverride string) (execbackend.Backend, error) {
+func (w jobWorker) resolveExecBackend(jobOverride string, jobOverridePresent bool) (execbackend.Backend, error) {
 	cfg := config.DefaultRemoteExecConfig()
 	if w.ConfigHomeExplicit || strings.TrimSpace(w.ConfigHome) != "" {
 		paths, err := w.configPaths()
@@ -1308,7 +1309,10 @@ func (w jobWorker) resolveExecBackend(jobOverride string) (execbackend.Backend, 
 			return "", fmt.Errorf("load [remote_exec] config: %w", loadErr)
 		}
 	}
-	return execbackend.Resolve(cfg.Backend, jobOverride)
+	if jobOverridePresent {
+		return execbackend.Resolve(cfg.Backend, &jobOverride)
+	}
+	return execbackend.Resolve(cfg.Backend, nil)
 }
 
 // repoConcurrency loads the per-repo [repos."owner/repo"] scheduler overrides
@@ -2852,8 +2856,10 @@ func buildRuntimeAdapter(home string, agent runtime.Agent, checkout string, runn
 	// position, and GroupRunner{} stays innermost. Any other value fails loud
 	// at the composition site too, so a selector bypass can never silently
 	// mis-compose a runner.
-	if _, err := execbackend.Parse(agent.ExecBackend); err != nil {
-		return nil, err
+	if agent.ExecBackend != "" {
+		if _, err := execbackend.Parse(agent.ExecBackend); err != nil {
+			return nil, err
+		}
 	}
 	var err error
 	runner, err = runtimeJobRunner(home, agent.Runtime, runner)

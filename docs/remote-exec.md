@@ -21,7 +21,9 @@ identically. Gitmoot reads this section when it dispatches a job; it is not
 cached and needs no SIGHUP wiring.
 
 A job payload's `exec_backend` field overrides the config value for that one
-job.
+job. When either selector is explicitly present its value must be non-blank;
+an absent selector defaults to `local`, while `backend = ""` or an explicit
+`"exec_backend":""` fails loudly.
 
 Any value outside the allowed set — currently only `local` — **fails the job
 loudly at dispatch**: the failure names the offending value and the allowed

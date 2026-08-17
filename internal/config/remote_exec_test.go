@@ -61,6 +61,19 @@ func TestLoadRemoteExecConfigUnknownFailsLoud(t *testing.T) {
 	}
 }
 
+func TestLoadRemoteExecConfigExplicitBlankFailsLoud(t *testing.T) {
+	for _, value := range []string{"", "   "} {
+		paths := remoteExecTestPaths(t, "[remote_exec]\nbackend = \""+value+"\"\n")
+		_, err := LoadRemoteExecConfig(paths)
+		if err == nil {
+			t.Fatalf("explicit blank backend %q loaded, want a loud error", value)
+		}
+		if !strings.Contains(err.Error(), "[remote_exec].backend") || !strings.Contains(err.Error(), `unknown execution backend ""`) || !strings.Contains(err.Error(), "allowed: local") {
+			t.Fatalf("explicit blank backend %q error = %q, want key + blank value + allowed set", value, err)
+		}
+	}
+}
+
 func TestLoadRemoteExecConfigIgnoresUnknownKeysAndOtherSections(t *testing.T) {
 	// A foreign "backend" key outside [remote_exec] must NOT be picked up, and
 	// unknown keys inside the section stay forward-compatible.
