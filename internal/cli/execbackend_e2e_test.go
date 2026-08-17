@@ -213,6 +213,39 @@ func TestExecBackendUnknownFailsLoudDaemonE2E(t *testing.T) {
 	}
 }
 
+// TestExecBackendUnknownFailsLoudForegroundE2E pins the synchronous dispatch
+// boundary: foreground jobs never reach jobWorker.run, so they must resolve the
+// configured backend before enqueue or adapter execution.
+func TestExecBackendUnknownFailsLoudForegroundE2E(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "must-not-run-foreground")
+	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
+	execBackendAppendConfig(t, home, "\n[remote_exec]\nbackend = \"e2b\"\n")
+
+	var out, errBuf bytes.Buffer
+	code := Run([]string{
+		"agent", "ask", "shell-asker", "exec backend foreground probe",
+		"--home", home,
+		"--repo", "owner/repo",
+		"--json",
+	}, &out, &errBuf)
+	if code == 0 {
+		t.Fatalf("foreground ask exit = 0, output=%s; want loud backend refusal", out.String())
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("foreground adapter ran with an unknown backend (marker err=%v)", err)
+	}
+	if got := errBuf.String(); !strings.Contains(got, `"e2b"`) || !strings.Contains(got, "allowed: local") || !strings.Contains(got, "[remote_exec].backend") {
+		t.Fatalf("foreground error = %q, want config source + value + allowed set", got)
+	}
+	jobs, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("jobs = %+v, want no enqueued row after foreground preflight refusal", jobs)
+	}
+}
+
 // TestExecBackendOverrideResolutionDaemonE2E covers the per-job override
 // field: an unknown override fails loud (naming the override source) even
 // with no [remote_exec] section, and an explicit "local" override resolves to
