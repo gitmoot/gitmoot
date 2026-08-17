@@ -1,10 +1,13 @@
 package cli
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
+	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -151,13 +154,88 @@ func isolatedShellStageRuntimeSessionKey(payload workflow.JobPayload, jobID stri
 	return "runtime:" + runtime.ShellRuntime + ":job:" + shortHash(id), true
 }
 
-// jobRuntimeOverrideEventMessage renders the runtime_override job event that
-// exposes the effective runtime (and the session lock it ran under) in job
-// history.
+// Runtime selection is journalled for every job so the family a job ran on
+// survives in engine-readable history. A real override retains the established
+// runtime_override kind; default selection uses effective_runtime.
+const (
+	effectiveRuntimeEventKind = "effective_runtime"
+	runtimeOverrideEventKind  = "runtime_override"
+)
+
+func jobRuntimeEventKind(overridden bool) string {
+	if overridden {
+		return runtimeOverrideEventKind
+	}
+	return effectiveRuntimeEventKind
+}
+
 func jobRuntimeOverrideEventMessage(defaultRuntime string, effective runtime.Agent, lockKey string) string {
 	message := fmt.Sprintf("job runs on runtime %s (agent default %s)", effective.Runtime, defaultRuntime)
 	if strings.TrimSpace(lockKey) != "" {
 		message += "; session lock " + lockKey
 	}
 	return message
+}
+
+func storedJobPayloadEnvelope(ctx context.Context, store *db.Store, jobID string) (map[string]json.RawMessage, error) {
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(job.Payload), &envelope); err != nil {
+		return nil, err
+	}
+	if envelope == nil {
+		return nil, errors.New("job payload must be a JSON object")
+	}
+	return envelope, nil
+}
+
+func effectiveRuntimeFromEnvelope(envelope map[string]json.RawMessage) (string, bool, error) {
+	raw, present := envelope["effective_runtime"]
+	if !present {
+		return "", false, nil
+	}
+	var recorded string
+	if err := json.Unmarshal(raw, &recorded); err != nil {
+		return "", true, fmt.Errorf("decode effective_runtime: %w", err)
+	}
+	return strings.TrimSpace(recorded), true, nil
+}
+
+// persistJobEffectiveRuntime records the runtime a job is about to run on
+// STRUCTURALLY on the job payload (#1528), so engine-side consumers — the
+// review-loop family resolver now, the merge gate in the #1531 round — read a
+// field instead of parsing the runtime_override event sentence. The payload is
+// RE-READ from the store rather than trusting the caller's in-memory copy:
+// earlier run-phase steps (e.g. the checkout head re-sync) persist their own
+// payload updates, and encoding a stale copy would clobber them. No-op when
+// the stored payload already carries the same value.
+func persistJobEffectiveRuntime(ctx context.Context, store *db.Store, jobID string, effectiveRuntime string) error {
+	effective := strings.TrimSpace(effectiveRuntime)
+	if effective == "" {
+		return nil
+	}
+	envelope, err := storedJobPayloadEnvelope(ctx, store, jobID)
+	if err != nil {
+		return err
+	}
+	recorded, _, err := effectiveRuntimeFromEnvelope(envelope)
+	if err != nil {
+		return err
+	}
+	if recorded == effective {
+		return nil
+	}
+	encodedRuntime, err := json.Marshal(effective)
+	if err != nil {
+		return err
+	}
+	envelope["effective_runtime"] = encodedRuntime
+	encoded, err := json.Marshal(envelope)
+	if err != nil {
+		return err
+	}
+	return store.UpdateJobPayload(ctx, jobID, string(encoded))
 }

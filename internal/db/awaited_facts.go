@@ -193,7 +193,11 @@ type reviewVerdictPayload struct {
 	Repo        string `json:"repo"`
 	PullRequest int    `json:"pull_request"`
 	HeadSHA     string `json:"head_sha"`
-	Result      *struct {
+	// EffectiveRuntime is the runtime the review job actually ran on (#1528),
+	// persisted by dispatch for every job. Empty for jobs predating #1528; the
+	// review-loop family resolver then falls back to the agent registry default.
+	EffectiveRuntime string `json:"effective_runtime"`
+	Result           *struct {
 		Decision string `json:"decision"`
 	} `json:"result"`
 }
@@ -207,6 +211,10 @@ type SucceededReviewVerdict struct {
 	Agent    string
 	HeadSHA  string
 	Decision string
+	// EffectiveRuntime is the runtime the review job ran on, when the dispatch
+	// recorded it (#1528). Empty for jobs that predate that recording; callers
+	// resolving a runtime family fall back to the agent registry default.
+	EffectiveRuntime string
 }
 
 // SucceededReviewVerdicts returns valid succeeded review verdicts for repo/PR,
@@ -247,10 +255,11 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 			continue
 		}
 		verdicts = append(verdicts, SucceededReviewVerdict{
-			JobID:    strings.TrimSpace(jobID),
-			Agent:    strings.TrimSpace(agent),
-			HeadSHA:  strings.ToLower(strings.TrimSpace(decoded.HeadSHA)),
-			Decision: decision,
+			JobID:            strings.TrimSpace(jobID),
+			Agent:            strings.TrimSpace(agent),
+			HeadSHA:          strings.ToLower(strings.TrimSpace(decoded.HeadSHA)),
+			Decision:         decision,
+			EffectiveRuntime: strings.ToLower(strings.TrimSpace(decoded.EffectiveRuntime)),
 		})
 	}
 	if err := rows.Err(); err != nil {

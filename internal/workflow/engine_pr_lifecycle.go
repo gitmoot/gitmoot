@@ -97,7 +97,7 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 	if err != nil {
 		return err
 	}
-	if match, detected, err := DetectReviewLoop(ctx, e.Store, event.Repo, event.PullRequest, event.HeadSHA); err != nil {
+	if match, detected, err := DetectReviewLoop(ctx, e.Store, event.Repo, event.PullRequest, event.HeadSHA, reviewers); err != nil {
 		return err
 	} else if detected {
 		return e.block(ctx, ref, match.Reason())

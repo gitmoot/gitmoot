@@ -492,12 +492,19 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// owner held it (#536 / #478). Covers RunJob and the handleRunJobError finalize
 	// path below, both of which derive from this ctx.
 	ctx = workflow.WithRuntimeSelfOwnerToken(ctx, ownerToken)
-	// Expose the effective runtime (and the session lock it runs under) in job
-	// history so an overridden background job is observable (#531).
-	if overridden {
-		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "runtime_override", Message: jobRuntimeOverrideEventMessage(defaultRuntime, agent, lockKey)}); eventErr != nil {
-			writeLine(w.Stdout, "job %s runtime_override event failed: %v", job.ID, eventErr)
+	if persistErr := persistJobEffectiveRuntime(ctx, w.Store, job.ID, agent.Runtime); persistErr != nil {
+		err := fmt.Errorf("persist effective runtime before execution: %w", persistErr)
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
 		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
+		return nil
+	}
+	// Expose the effective runtime (and the session lock it runs under) in job
+	// history for every job. Only an actual override uses runtime_override;
+	// default selection is recorded as effective_runtime.
+	if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: jobRuntimeEventKind(overridden), Message: jobRuntimeOverrideEventMessage(defaultRuntime, agent, lockKey)}); eventErr != nil {
+		writeLine(w.Stdout, "job %s effective-runtime event failed: %v", job.ID, eventErr)
 	}
 	// This is the last filesystem authorization check before adapter delivery.
 	// It runs after runtime-session admission so a symlink retargeted while the job

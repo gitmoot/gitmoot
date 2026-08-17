@@ -106,6 +106,10 @@ func assertRuntimeOverrideInvariants(t *testing.T, store *db.Store, home string,
 	if payload.RuntimeOverride != runtime.ShellRuntime {
 		t.Fatalf("payload runtime_override = %q, want shell", payload.RuntimeOverride)
 	}
+	// ... and records it STRUCTURALLY for engine-side consumers (#1528).
+	if payload.EffectiveRuntime != runtime.ShellRuntime {
+		t.Fatalf("payload effective_runtime = %q, want shell (#1528)", payload.EffectiveRuntime)
+	}
 
 	// The runtime-session lock key named the OVERRIDE runtime, never codex.
 	events, err := store.ListJobEvents(ctx, jobID)
@@ -189,9 +193,6 @@ func TestRuntimeOverrideForegroundShellE2E(t *testing.T) {
 	assertRuntimeOverrideInvariants(t, store, home, output.JobID, marker)
 }
 
-// TestRuntimeOverrideDaemonBackgroundShellE2E drives the DAEMON path: the CLI
-// enqueues a background job whose payload carries the override, and the REAL
-// worker tick claims + runs it through the shell adapter.
 func TestRuntimeOverrideDaemonBackgroundShellE2E(t *testing.T) {
 	ctx := context.Background()
 	home, store, _ := runtimeOverrideE2EHome(t)

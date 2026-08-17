@@ -333,6 +333,16 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			}
 		}
 	}
+	// A foreground dispatch already knows the runtime it will execute. Persist it
+	// in the initial job insert so recording cannot fail separately and leave a
+	// daemon-claimable queued row. Background jobs deliberately omit it here: the
+	// daemon records the runtime selected when execution actually starts. A review
+	// deferred after enqueue by runtime contention is likewise refreshed by the
+	// daemon before that later execution.
+	effectiveRuntimeAtEnqueue := ""
+	if !request.Background {
+		effectiveRuntimeAtEnqueue = effectiveAgent.Runtime
+	}
 	job, err := (workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(request.Home), RuntimeDefaultModel: runtimeDefaultModelResolver(request.Home), RequireWorkflowPolicy: requireWorkflowPolicyResolver(request.Home), OrgPolicy: orgPolicy}).Enqueue(ctx, workflow.JobRequest{
 		ID:                     jobID,
 		Agent:                  agent.Name,
@@ -356,6 +366,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		WorkflowID:             request.WorkflowID,
 		RuntimeOverride:        overrideRuntime,
 		RuntimeOverrideRef:     overrideRef,
+		EffectiveRuntime:       effectiveRuntimeAtEnqueue,
 		Cockpit:                request.Cockpit,
 		CockpitSession:         request.CockpitSession,
 		SkipNativeReviewFanout: request.SkipNativeReviewFanout,
@@ -495,11 +506,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			_ = retainedLogFile.Close()
 		}
 	}
-	if overrideRuntime != "" {
-		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "runtime_override", Message: jobRuntimeOverrideEventMessage(agent.Runtime, effectiveAgent, lockKey)}); err != nil {
-			return localAgentJobOutput{}, err
-		}
-	}
 	runCtx := ctx
 	if managed.OK {
 		now := time.Now().UTC()
@@ -517,6 +523,11 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	}
 	payload, err := daemonJobPayload(job)
 	if err != nil {
+		return localAgentJobOutput{}, err
+	}
+	// Journal runtime selection for every job. Only a real per-job override is
+	// labelled runtime_override; default selection uses effective_runtime.
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: jobRuntimeEventKind(overrideRuntime != ""), Message: jobRuntimeOverrideEventMessage(agent.Runtime, effectiveAgent, lockKey)}); err != nil {
 		return localAgentJobOutput{}, err
 	}
 	quotaHooks := newQuotaRoleUnavailableHooks(store, request.Home, io.Discard)
@@ -831,7 +842,7 @@ func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, rec
 			request.HeadSHA = pr.HeadSHA
 		}
 	}
-	if match, detected, err := workflow.DetectReviewLoop(ctx, store, repo.FullName(), request.PullRequest, request.HeadSHA); err != nil {
+	if match, detected, err := workflow.DetectReviewLoop(ctx, store, repo.FullName(), request.PullRequest, request.HeadSHA, []string{request.Agent}); err != nil {
 		return localAgentDispatchRequest{}, err
 	} else if detected {
 		return localAgentDispatchRequest{}, errors.New(match.Reason())
