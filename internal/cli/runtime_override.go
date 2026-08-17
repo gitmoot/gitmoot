@@ -177,6 +177,58 @@ func jobRuntimeOverrideEventMessage(defaultRuntime string, effective runtime.Age
 	return message
 }
 
+func storedJobPayloadEnvelope(ctx context.Context, store *db.Store, jobID string) (map[string]json.RawMessage, error) {
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(job.Payload), &envelope); err != nil {
+		return nil, err
+	}
+	if envelope == nil {
+		return nil, errors.New("job payload must be a JSON object")
+	}
+	return envelope, nil
+}
+
+func effectiveRuntimeFromEnvelope(envelope map[string]json.RawMessage) (string, bool, error) {
+	raw, present := envelope["effective_runtime"]
+	if !present {
+		return "", false, nil
+	}
+	var recorded string
+	if err := json.Unmarshal(raw, &recorded); err != nil {
+		return "", true, fmt.Errorf("decode effective_runtime: %w", err)
+	}
+	return strings.TrimSpace(recorded), true, nil
+}
+
+func validateStoredJobEffectiveRuntime(ctx context.Context, store *db.Store, jobID string, effectiveRuntime string) error {
+	effective := strings.TrimSpace(effectiveRuntime)
+	if effective == "" {
+		return errors.New("execution runtime is empty")
+	}
+	envelope, err := storedJobPayloadEnvelope(ctx, store, jobID)
+	if err != nil {
+		return err
+	}
+	recorded, present, err := effectiveRuntimeFromEnvelope(envelope)
+	if err != nil {
+		return err
+	}
+	if !present {
+		return errors.New("stored job payload is missing effective_runtime")
+	}
+	if recorded == "" {
+		return errors.New("stored job payload effective_runtime is empty")
+	}
+	if recorded != effective {
+		return fmt.Errorf("stored job payload effective_runtime %q does not match execution runtime %q", recorded, effective)
+	}
+	return nil
+}
+
 // persistJobEffectiveRuntime records the runtime a job is about to run on
 // STRUCTURALLY on the job payload (#1528), so engine-side consumers — the
 // review-loop family resolver now, the merge gate in the #1531 round — read a
@@ -190,24 +242,15 @@ func persistJobEffectiveRuntime(ctx context.Context, store *db.Store, jobID stri
 	if effective == "" {
 		return nil
 	}
-	job, err := store.GetJob(ctx, jobID)
+	envelope, err := storedJobPayloadEnvelope(ctx, store, jobID)
 	if err != nil {
 		return err
 	}
-	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(job.Payload), &envelope); err != nil {
+	recorded, _, err := effectiveRuntimeFromEnvelope(envelope)
+	if err != nil {
 		return err
 	}
-	if envelope == nil {
-		return errors.New("job payload must be a JSON object")
-	}
-	var recorded string
-	if raw, ok := envelope["effective_runtime"]; ok {
-		if err := json.Unmarshal(raw, &recorded); err != nil {
-			return fmt.Errorf("decode effective_runtime: %w", err)
-		}
-	}
-	if strings.TrimSpace(recorded) == effective {
+	if recorded == effective {
 		return nil
 	}
 	encodedRuntime, err := json.Marshal(effective)

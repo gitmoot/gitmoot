@@ -525,6 +525,21 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}
+	if err := validateStoredJobEffectiveRuntime(ctx, store, job.ID, effectiveAgent.Runtime); err != nil {
+		validationErr := fmt.Errorf("validate effective runtime before foreground execution: %w", err)
+		settler := jobWorker{Store: store, Stdout: io.Discard, ConfigHome: request.Home, ConfigHomeExplicit: true}
+		if settleErr := settler.finishQueuedJob(ctx, job, workflow.JobFailed, validationErr); settleErr != nil {
+			return localAgentJobOutput{}, fmt.Errorf("%w (additionally failed to settle the foreground job: %v)", validationErr, settleErr)
+		}
+		settled, settleErr := store.GetJob(ctx, job.ID)
+		if settleErr != nil {
+			return localAgentJobOutput{}, fmt.Errorf("%w (additionally could not verify foreground settlement: %v)", validationErr, settleErr)
+		}
+		if settled.State != string(workflow.JobFailed) {
+			return localAgentJobOutput{}, fmt.Errorf("%w (foreground settlement did not apply; current job state is %q)", validationErr, settled.State)
+		}
+		return localAgentJobOutput{}, validationErr
+	}
 	// Journal runtime selection for every job. Only a real per-job override is
 	// labelled runtime_override; default selection uses effective_runtime.
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: jobRuntimeEventKind(overrideRuntime != ""), Message: jobRuntimeOverrideEventMessage(agent.Runtime, effectiveAgent, lockKey)}); err != nil {

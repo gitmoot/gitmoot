@@ -193,6 +193,122 @@ func TestRuntimeOverrideForegroundShellE2E(t *testing.T) {
 	assertRuntimeOverrideInvariants(t, store, home, output.JobID, marker)
 }
 
+func TestRuntimeOverrideForegroundStoredEffectiveRuntimeFailsClosed(t *testing.T) {
+	tests := []struct {
+		name        string
+		updateExpr  string
+		wantError   string
+		wantPresent bool
+		wantStored  string
+	}{
+		{
+			name:       "missing",
+			updateExpr: `json_remove(payload, '$.effective_runtime')`,
+			wantError:  "stored job payload is missing effective_runtime",
+		},
+		{
+			name:        "empty",
+			updateExpr:  `json_set(payload, '$.effective_runtime', '')`,
+			wantError:   "stored job payload effective_runtime is empty",
+			wantPresent: true,
+		},
+		{
+			name:        "mismatch",
+			updateExpr:  `json_set(payload, '$.effective_runtime', 'codex')`,
+			wantError:   `stored job payload effective_runtime "codex" does not match execution runtime "shell"`,
+			wantPresent: true,
+			wantStored:  runtime.CodexRuntime,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			home, store, _ := runtimeOverrideE2EHome(t)
+			marker := filepath.Join(t.TempDir(), "shell-override-must-not-run")
+			script := runtimeOverrideShellScript(marker)
+
+			raw, err := sql.Open("sqlite", store.DatabasePath())
+			if err != nil {
+				t.Fatalf("open raw sqlite: %v", err)
+			}
+			defer raw.Close()
+			trigger := fmt.Sprintf(`CREATE TRIGGER corrupt_foreground_effective_runtime
+				AFTER INSERT ON jobs
+				WHEN json_extract(NEW.payload, '$.runtime_override') = 'shell'
+				BEGIN
+					UPDATE jobs SET payload = %s WHERE id = NEW.id;
+				END`, tc.updateExpr)
+			if _, err := raw.Exec(trigger); err != nil {
+				t.Fatalf("create effective-runtime corruption trigger: %v", err)
+			}
+
+			var out, errBuf bytes.Buffer
+			code := Run([]string{
+				"agent", "ask", "maintainer", "do not run with corrupted runtime evidence",
+				"--home", home,
+				"--repo", "owner/repo",
+				"--runtime", "shell",
+				"--session", script,
+				"--json",
+			}, &out, &errBuf)
+			if code == 0 {
+				t.Fatalf("foreground ask exit = 0 with %s runtime evidence, output=%s", tc.name, out.String())
+			}
+			if !strings.Contains(errBuf.String(), tc.wantError) {
+				t.Fatalf("foreground error = %q, want %q", errBuf.String(), tc.wantError)
+			}
+			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("shell override ran with %s runtime evidence (marker err=%v)", tc.name, err)
+			}
+
+			jobs, err := store.ListJobs(ctx)
+			if err != nil {
+				t.Fatalf("ListJobs: %v", err)
+			}
+			if len(jobs) != 1 {
+				t.Fatalf("jobs = %d, want exactly the foreground job", len(jobs))
+			}
+			job := jobs[0]
+			if job.State != string(workflow.JobFailed) {
+				t.Fatalf("job state = %q, want failed before shell execution", job.State)
+			}
+			var envelope map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(job.Payload), &envelope); err != nil {
+				t.Fatalf("decode stored payload: %v", err)
+			}
+			rawRuntime, present := envelope["effective_runtime"]
+			if present != tc.wantPresent {
+				t.Fatalf("effective_runtime present = %v, want %v; payload=%s", present, tc.wantPresent, job.Payload)
+			}
+			if present {
+				var stored string
+				if err := json.Unmarshal(rawRuntime, &stored); err != nil {
+					t.Fatalf("decode stored effective_runtime: %v", err)
+				}
+				if stored != tc.wantStored {
+					t.Fatalf("stored effective_runtime = %q, want %q", stored, tc.wantStored)
+				}
+			}
+			events, err := store.ListJobEvents(ctx, job.ID)
+			if err != nil {
+				t.Fatalf("ListJobEvents: %v", err)
+			}
+			var failedEvent string
+			for _, event := range events {
+				if event.Kind == string(workflow.JobFailed) {
+					failedEvent = event.Message
+				}
+				if event.Kind == runtimeOverrideEventKind {
+					t.Fatalf("runtime override was journaled despite pre-execution refusal: %+v", event)
+				}
+			}
+			if !strings.Contains(failedEvent, tc.wantError) {
+				t.Fatalf("failed event = %q, want attributed error %q", failedEvent, tc.wantError)
+			}
+		})
+	}
+}
+
 // TestRuntimeOverrideDaemonBackgroundShellE2E drives the DAEMON path: the CLI
 // enqueues a background job whose payload carries the override, and the REAL
 // worker tick claims + runs it through the shell adapter.
