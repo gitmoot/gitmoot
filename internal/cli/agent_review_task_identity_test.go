@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -252,6 +253,50 @@ func TestDispatchReviewRebindsOwningTaskOnHeadDivergence(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDispatchReviewDivergenceEventFailureRollsBackEnqueue(t *testing.T) {
+	ctx := context.Background()
+	store, home := blockerE2EHome(t)
+	checkout, firstHead, secondHead := readonlyReviewWorktreeGitCheckout(t)
+	seedReviewDispatchFixture(t, store, checkout)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+	})
+	taskWorktree := filepath.Join(t.TempDir(), "task-worktree")
+	runGit(t, checkout, "worktree", "add", "--detach", taskWorktree, firstHead)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "adhoc-impl", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Implement the fix",
+		State: string(workflow.TaskPullRequestOpen), Branch: "feature/review", WorktreePath: taskWorktree,
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("open raw sqlite: %v", err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`CREATE TRIGGER reject_review_task_head_divergence
+		BEFORE INSERT ON job_events
+		WHEN NEW.kind = 'review_task_head_divergence'
+		BEGIN
+			SELECT RAISE(FAIL, 'forced divergence event failure');
+		END`); err != nil {
+		t.Fatalf("create divergence event rejection trigger: %v", err)
+	}
+
+	out, err := dispatchLocalAgentJob(ctx, store, reviewDispatchRequest(home, secondHead))
+	if err == nil || !strings.Contains(err.Error(), "forced divergence event failure") {
+		t.Fatalf("dispatchLocalAgentJob output=%+v err=%v, want required-event failure", out, err)
+	}
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("required divergence event failure left runnable jobs: %+v", jobs)
 	}
 }
 

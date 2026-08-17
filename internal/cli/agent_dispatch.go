@@ -104,9 +104,10 @@ type localAgentDispatchRequest struct {
 	// the task owning (repo, branch) even though that task's registered checkout
 	// HEAD differs from the requested head (#1530): a fix-worktree leg pushed the
 	// branch from an independent clone and left the registered checkout behind.
-	// dispatchLocalAgentJob records it as a review_task_head_divergence job event
-	// once the job row exists, so the rebind stays visible instead of silent. It
-	// is set by prepareLocalReviewTask and never persisted in the job payload.
+	// dispatchLocalAgentJob inserts it atomically with the queued job as a
+	// review_task_head_divergence event, so a runnable review can never exist
+	// without the required audit. It is set by prepareLocalReviewTask and never
+	// persisted in the job payload.
 	ReviewTaskHeadDivergence string
 }
 
@@ -351,6 +352,10 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if !request.Background {
 		effectiveRuntimeAtEnqueue = effectiveAgent.Runtime
 	}
+	var requiredEvents []db.JobEvent
+	if divergence := strings.TrimSpace(request.ReviewTaskHeadDivergence); divergence != "" {
+		requiredEvents = append(requiredEvents, db.JobEvent{Kind: "review_task_head_divergence", Message: divergence})
+	}
 	job, err := (workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(request.Home), RuntimeDefaultModel: runtimeDefaultModelResolver(request.Home), RequireWorkflowPolicy: requireWorkflowPolicyResolver(request.Home), OrgPolicy: orgPolicy}).Enqueue(ctx, workflow.JobRequest{
 		ID:                     jobID,
 		Agent:                  agent.Name,
@@ -375,6 +380,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		RuntimeOverride:        overrideRuntime,
 		RuntimeOverrideRef:     overrideRef,
 		EffectiveRuntime:       effectiveRuntimeAtEnqueue,
+		RequiredEvents:         requiredEvents,
 		Cockpit:                request.Cockpit,
 		CockpitSession:         request.CockpitSession,
 		SkipNativeReviewFanout: request.SkipNativeReviewFanout,
@@ -412,14 +418,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	}
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "route_selected", Message: routeSelectedMessage(request)}); err != nil {
 		return localAgentJobOutput{}, err
-	}
-	// #1530: a review that rebound to the branch-owning task despite a diverged
-	// registered-checkout HEAD must stay visible — a silent rebind would hide the
-	// exact state #1530 is about. The event names both SHAs.
-	if divergence := strings.TrimSpace(request.ReviewTaskHeadDivergence); divergence != "" {
-		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "review_task_head_divergence", Message: divergence}); err != nil {
-			return localAgentJobOutput{}, err
-		}
 	}
 	// Emit the #739 read-only isolation outcome now that the job row exists (job
 	// events carry a JobID FK). Allocated → observable worktree:<path> key; a

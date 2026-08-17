@@ -235,6 +235,10 @@ type JobRequest struct {
 	// resolved runtime inline. Background callers leave it empty; a foreground
 	// job later deferred to a worker is re-recorded at actual execution time.
 	EffectiveRuntime string
+	// RequiredEvents are inserted in the same transaction as the queued job and
+	// its standard queued event. Enqueue fails and rolls back the job if any
+	// required audit event cannot be persisted.
+	RequiredEvents []db.JobEvent
 	// ShellEnv carries pipeline trigger inputs and stage metadata as exact
 	// KEY=value entries to a shell runtime job. It is empty for every non-pipeline
 	// and non-shell job.
@@ -663,7 +667,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 	if err != nil {
 		return db.Job{}, err
 	}
-	if err := m.Store.CreateJobWithEvent(ctx, job, db.JobEvent{JobID: job.ID, Kind: string(JobQueued), Message: "job queued"}); err != nil {
+	if err := m.Store.CreateJobWithEvent(ctx, job, db.JobEvent{JobID: job.ID, Kind: string(JobQueued), Message: "job queued"}, request.RequiredEvents...); err != nil {
 		return db.Job{}, err
 	}
 	if autolabeled {
