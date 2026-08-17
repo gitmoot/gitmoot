@@ -122,6 +122,19 @@ artifact_blobs = %q
 # model_gateway_allow_hosts = ["api.anthropic.com"]
 # keychain_path = "" # default: <base-home>/.config/gitmoot/keychain.env
 
+# [remote_exec] selects the execution backend — WHERE a job's runtime
+# subprocess executes (#1535 contract, #1536). "local" is the default and the
+# only implemented backend: a byte-for-byte passthrough to the existing runner
+# composition (subprocess GroupRunner innermost; credential-gateway and
+# Landlock produce wrappers unchanged). With no [remote_exec] section behavior
+# is byte-identical. Any other value FAILS THE JOB LOUDLY at dispatch naming
+# the value and the allowed set — there is no silent fallback. A job payload's
+# exec_backend field overrides this per job. This is NOT the Landlock local
+# confinement surface (internal/sandbox, the "sandbox" CLI, agent path
+# grants), which is unrelated.
+# [remote_exec]
+# backend = "local"
+
 # [transcripts] is ON by default. Raw unredacted runtime output
 # is retained in 0600 per-job append logs for deterministic trajectory export.
 # retain and max_total_bytes bound home-scoped garbage collection.

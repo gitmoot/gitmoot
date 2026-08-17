@@ -396,6 +396,12 @@ type JobPayload struct {
 	WorkflowID         string `json:"workflow_id,omitempty"`
 	RuntimeOverride    string `json:"runtime_override,omitempty"`
 	RuntimeOverrideRef string `json:"runtime_override_ref,omitempty"`
+	// ExecBackend is the per-job execution-backend override (#1536 P1): when
+	// set it wins over the [remote_exec].backend config value at dispatch.
+	// "local" (the only implemented backend) is a byte-for-byte passthrough;
+	// any other value fails the job LOUDLY at dispatch. Additive/omitempty so
+	// a payload without it serializes byte-identically.
+	ExecBackend string `json:"exec_backend,omitempty"`
 	// EffectiveRuntime is the runtime selected before delivery, persisted by the
 	// dispatch/worker for EVERY job (#1528) — not only --runtime overrides — so
 	// succeeded-job consumers (the review-loop family resolver, and later the

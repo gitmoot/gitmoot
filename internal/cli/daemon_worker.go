@@ -19,6 +19,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/permissionpolicy"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
@@ -265,6 +266,24 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if !overridden {
 		agent = scopeRegisteredFreshRefForJob(agent, job.ID)
 	}
+	// Execution-backend resolution (#1536 P1): [remote_exec].backend plus the
+	// payload's exec_backend override decide WHERE this job's runtime
+	// subprocess executes. "local" — the default and only implemented backend —
+	// is a byte-for-byte passthrough: the selection is stamped on the agent so
+	// it reaches the runner-composition chain, and that chain composes in the
+	// exact pre-#1536 order (runtimeJobRunner/credgw → maybe Landlock
+	// WrappingRunner → adapter, GroupRunner{} innermost). An unknown value
+	// fails the job LOUDLY here, before any checkout/adapter work — never a
+	// silent fallback.
+	execBackend, err := w.resolveExecBackend(payload.ExecBackend)
+	if err != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
+		return nil
+	}
+	agent.ExecBackend = string(execBackend)
 	preflightRequest := runtime.RuntimeContractRequest{Plan: payload.Plan}
 	if result, checked := w.runtimeContractPreflight(ctx, agent, preflightRequest); checked {
 		if err := runtime.RuntimeContractDispatchError(agent, result); err != nil {
@@ -1263,6 +1282,33 @@ func (w jobWorker) parallelSessionPolicy() (config.ParallelSessionPolicy, error)
 		return config.ParallelSessionPolicy{}, err
 	}
 	return config.LoadParallelSessionPolicy(paths)
+}
+
+// resolveExecBackend resolves the effective execution backend for one job
+// (#1536 P1): the optional [remote_exec] section (default "local") overridden
+// by the payload's exec_backend field. It is read per dispatch — like
+// [credentials] — so a config edit takes effect without daemon reload
+// plumbing. A missing config file or section resolves to local; an unknown
+// value (config or override) is a hard error naming the value and the allowed
+// set — the fail-loud contract, never a silent fallback.
+func (w jobWorker) resolveExecBackend(jobOverride string) (execbackend.Backend, error) {
+	cfg := config.DefaultRemoteExecConfig()
+	if w.ConfigHomeExplicit || strings.TrimSpace(w.ConfigHome) != "" {
+		paths, err := w.configPaths()
+		if err != nil {
+			return "", err
+		}
+		loaded, loadErr := config.LoadRemoteExecConfig(paths)
+		switch {
+		case loadErr == nil:
+			cfg = loaded
+		case errors.Is(loadErr, os.ErrNotExist):
+			// No config file: the local default applies.
+		default:
+			return "", fmt.Errorf("load [remote_exec] config: %w", loadErr)
+		}
+	}
+	return execbackend.Resolve(cfg.Backend, jobOverride)
 }
 
 // repoConcurrency loads the per-repo [repos."owner/repo"] scheduler overrides
@@ -2799,6 +2845,16 @@ func (w jobWorker) buildSeatAwareAdapter(agent *runtime.Agent, checkout string, 
 // wrappers still append their environment last and preserve result capture,
 // cancellation, and live output.
 func buildRuntimeAdapter(home string, agent runtime.Agent, checkout string, runner subprocess.Runner) (workflow.DeliveryAdapter, error) {
+	// #1536 P1: the execution-backend decision reaches the composition chain
+	// here. "local" (and an unstamped agent, which resolves to local) runs the
+	// legacy pipeline below UNCHANGED — the selector adds no wrapper, so credgw
+	// stays returned and type-assertable, the Landlock WrappingRunner keeps its
+	// position, and GroupRunner{} stays innermost. Any other value fails loud
+	// at the composition site too, so a selector bypass can never silently
+	// mis-compose a runner.
+	if _, err := execbackend.Parse(agent.ExecBackend); err != nil {
+		return nil, err
+	}
 	var err error
 	runner, err = runtimeJobRunner(home, agent.Runtime, runner)
 	if err != nil {
