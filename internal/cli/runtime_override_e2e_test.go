@@ -195,16 +195,18 @@ func TestRuntimeOverrideForegroundShellE2E(t *testing.T) {
 
 func TestRuntimeOverrideForegroundStoredEffectiveRuntimeFailsClosed(t *testing.T) {
 	tests := []struct {
-		name           string
-		updateExpr     string
-		wantError      string
-		wantPresent    bool
-		wantStored     string
-		wantOverride   string
-		bumpGeneration bool
-		rejectFailed   bool
-		wantState      workflow.JobState
-		wantErrorExtra string
+		name                        string
+		updateExpr                  string
+		wantError                   string
+		wantPresent                 bool
+		wantStored                  string
+		wantOverride                string
+		bumpGeneration              bool
+		rejectFailed                bool
+		suppressTerminalTransitions bool
+		wantSuppressed              bool
+		wantState                   workflow.JobState
+		wantErrorExtra              string
 	}{
 		{
 			name:         "missing",
@@ -256,6 +258,16 @@ func TestRuntimeOverrideForegroundStoredEffectiveRuntimeFailsClosed(t *testing.T
 			wantState:      workflow.JobBlocked,
 			wantErrorExtra: "forced foreground failed settlement rejection",
 		},
+		{
+			name:                        "terminal_transitions_do_not_apply",
+			updateExpr:                  `json_remove(payload, '$.effective_runtime')`,
+			wantError:                   "stored job payload is missing effective_runtime",
+			wantOverride:                runtime.ShellRuntime,
+			suppressTerminalTransitions: true,
+			wantSuppressed:              true,
+			wantState:                   workflow.JobQueued,
+			wantErrorExtra:              "daemon dispatch suppressed",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -290,6 +302,16 @@ func TestRuntimeOverrideForegroundStoredEffectiveRuntimeFailsClosed(t *testing.T
 						SELECT RAISE(FAIL, 'forced foreground failed settlement rejection');
 					END`); err != nil {
 					t.Fatalf("create failed-settlement rejection trigger: %v", err)
+				}
+			}
+			if tc.suppressTerminalTransitions {
+				if _, err := raw.Exec(`CREATE TRIGGER suppress_foreground_terminal_transitions
+					BEFORE UPDATE OF state ON jobs
+					WHEN OLD.state = 'queued' AND NEW.state IN ('failed', 'blocked')
+					BEGIN
+						SELECT RAISE(IGNORE);
+					END`); err != nil {
+					t.Fatalf("create terminal-transition suppression trigger: %v", err)
 				}
 			}
 
@@ -361,6 +383,7 @@ func TestRuntimeOverrideForegroundStoredEffectiveRuntimeFailsClosed(t *testing.T
 				t.Fatalf("ListJobEvents: %v", err)
 			}
 			var terminalEvent string
+			var suppressionEvent string
 			for _, event := range events {
 				if event.Kind == string(tc.wantState) {
 					terminalEvent = event.Message
@@ -368,21 +391,37 @@ func TestRuntimeOverrideForegroundStoredEffectiveRuntimeFailsClosed(t *testing.T
 				if event.Kind == runtimeOverrideEventKind {
 					t.Fatalf("runtime override was journaled despite pre-execution refusal: %+v", event)
 				}
+				if event.Kind == foregroundRuntimeDispatchSuppressedEventKind {
+					suppressionEvent = event.Message
+				}
 			}
-			if !strings.Contains(terminalEvent, tc.wantError) {
-				t.Fatalf("terminal event = %q, want attributed error %q", terminalEvent, tc.wantError)
-			}
-			if tc.wantErrorExtra != "" && !strings.Contains(terminalEvent, tc.wantErrorExtra) {
-				t.Fatalf("terminal event = %q, want settlement diagnostic %q", terminalEvent, tc.wantErrorExtra)
+			if tc.wantSuppressed {
+				if !strings.Contains(suppressionEvent, tc.wantError) || !strings.Contains(suppressionEvent, tc.wantErrorExtra) {
+					t.Fatalf("suppression event = %q, want validation %q and diagnostic %q", suppressionEvent, tc.wantError, tc.wantErrorExtra)
+				}
+			} else {
+				if !strings.Contains(terminalEvent, tc.wantError) {
+					t.Fatalf("terminal event = %q, want attributed error %q", terminalEvent, tc.wantError)
+				}
+				if tc.wantErrorExtra != "" && !strings.Contains(terminalEvent, tc.wantErrorExtra) {
+					t.Fatalf("terminal event = %q, want settlement diagnostic %q", terminalEvent, tc.wantErrorExtra)
+				}
 			}
 
-			if tc.rejectFailed {
+			if tc.rejectFailed || tc.wantSuppressed {
 				queued, err := store.ListQueuedJobs(ctx)
 				if err != nil {
 					t.Fatalf("ListQueuedJobs: %v", err)
 				}
 				if len(queued) != 0 {
 					t.Fatalf("failed-settlement fallback left daemon-claimable jobs: %+v", queued)
+				}
+				queuedCount, err := store.CountQueuedJobsForRepo(ctx, "owner/repo")
+				if err != nil {
+					t.Fatalf("CountQueuedJobsForRepo: %v", err)
+				}
+				if queuedCount != 0 {
+					t.Fatalf("queued count = %d, want suppressed refusal excluded", queuedCount)
 				}
 				worker := defaultJobWorker(store, io.Discard, home)
 				if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, time.Now().UTC(), nil, nil); err != nil {
@@ -393,6 +432,64 @@ func TestRuntimeOverrideForegroundStoredEffectiveRuntimeFailsClosed(t *testing.T
 				}
 			}
 		})
+	}
+}
+
+func TestRuntimeOverrideForegroundRuntimeEvidenceRepairedBeforeSettlementContinues(t *testing.T) {
+	ctx := context.Background()
+	home, store, _ := runtimeOverrideE2EHome(t)
+	marker := filepath.Join(t.TempDir(), "shell-override-ran-after-repair")
+	script := runtimeOverrideShellScript(marker)
+
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("open raw sqlite: %v", err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`CREATE TRIGGER strip_foreground_effective_runtime
+		AFTER INSERT ON jobs
+		WHEN json_extract(NEW.payload, '$.runtime_override') = 'shell'
+		BEGIN
+			UPDATE jobs SET payload = json_remove(payload, '$.effective_runtime') WHERE id = NEW.id;
+		END;
+		CREATE TRIGGER repair_foreground_effective_runtime_before_settlement
+		BEFORE UPDATE OF state ON jobs
+		WHEN OLD.state = 'queued' AND NEW.state = 'failed'
+		BEGIN
+			UPDATE jobs SET payload = json_set(payload, '$.effective_runtime', 'shell') WHERE id = OLD.id;
+			SELECT RAISE(IGNORE);
+		END`); err != nil {
+		t.Fatalf("create runtime-evidence repair triggers: %v", err)
+	}
+
+	var out, errBuf bytes.Buffer
+	code := Run([]string{
+		"agent", "ask", "maintainer", "run after stored runtime evidence is repaired",
+		"--home", home,
+		"--repo", "owner/repo",
+		"--runtime", "shell",
+		"--session", script,
+		"--json",
+	}, &out, &errBuf)
+	if code != 0 {
+		t.Fatalf("foreground ask exit = %d after evidence repair, stderr=%s", code, errBuf.String())
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("shell override did not run after evidence repair: %v", err)
+	}
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].State != string(workflow.JobSucceeded) {
+		t.Fatalf("jobs = %+v, want one succeeded foreground job", jobs)
+	}
+	payload, err := workflow.ParseJobPayload(jobs[0].Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload: %v", err)
+	}
+	if payload.EffectiveRuntime != runtime.ShellRuntime || payload.RuntimeOverride != runtime.ShellRuntime {
+		t.Fatalf("runtime evidence = effective %q override %q, want shell/shell", payload.EffectiveRuntime, payload.RuntimeOverride)
 	}
 }
 

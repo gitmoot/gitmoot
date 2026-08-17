@@ -242,6 +242,25 @@ func validateStoredJobEffectiveRuntime(ctx context.Context, store *db.Store, job
 }
 
 const foregroundRuntimeSettlementAttempts = 3
+const foregroundRuntimeDispatchSuppressedEventKind = "foreground_runtime_dispatch_suppressed"
+
+func suppressForegroundRuntimeDispatch(ctx context.Context, store *db.Store, jobID string, cause error) error {
+	message := fmt.Sprintf("%v (automatic terminal settlement did not apply; daemon dispatch suppressed)", cause)
+	suppressed, err := store.SuppressJobDispatchWithEvent(ctx, jobID, db.JobEvent{
+		JobID:   jobID,
+		Kind:    foregroundRuntimeDispatchSuppressedEventKind,
+		Message: message,
+	})
+	if err != nil {
+		return fmt.Errorf("%w (additionally failed to suppress daemon dispatch: %v)", cause, err)
+	}
+	if suppressed {
+		return errors.New(message)
+	}
+	// The suppression write only declines rows that have already left queued or
+	// running. Such a row cannot match either daemon claim predicate for this run.
+	return fmt.Errorf("%w (job left the claimable states before dispatch suppression)", cause)
+}
 
 // settleForegroundRuntimeValidationFailure makes a pre-execution refusal
 // durable. A lifecycle CAS loss is retried only after the newer queued row is
@@ -257,21 +276,21 @@ func settleForegroundRuntimeValidationFailure(ctx context.Context, store *db.Sto
 		if settleErr := settler.finishQueuedJob(ctx, current, workflow.JobFailed, cause); settleErr != nil {
 			blockedCause := fmt.Errorf("%w (failed settlement unavailable: %v)", cause, settleErr)
 			if blockedErr := settler.finishQueuedJob(ctx, current, workflow.JobBlocked, blockedCause); blockedErr != nil {
-				return fmt.Errorf("%w (additionally failed to settle the foreground job as blocked: %v)", blockedCause, blockedErr)
+				return suppressForegroundRuntimeDispatch(ctx, store, current.ID, fmt.Errorf("%w (additionally failed to settle the foreground job as blocked: %v)", blockedCause, blockedErr))
 			}
 			blocked, readErr := store.GetJob(ctx, current.ID)
 			if readErr != nil {
-				return fmt.Errorf("%w (additionally could not verify blocked foreground settlement: %v)", blockedCause, readErr)
+				return suppressForegroundRuntimeDispatch(ctx, store, current.ID, fmt.Errorf("%w (additionally could not verify blocked foreground settlement: %v)", blockedCause, readErr))
 			}
 			if blocked.State != string(workflow.JobBlocked) {
-				return fmt.Errorf("%w (blocked foreground settlement did not apply; current job state is %q)", blockedCause, blocked.State)
+				return suppressForegroundRuntimeDispatch(ctx, store, current.ID, fmt.Errorf("%w (blocked foreground settlement did not apply; current job state is %q)", blockedCause, blocked.State))
 			}
 			return blockedCause
 		}
 
 		settled, readErr := store.GetJob(ctx, current.ID)
 		if readErr != nil {
-			return fmt.Errorf("%w (additionally could not verify foreground settlement: %v)", cause, readErr)
+			return suppressForegroundRuntimeDispatch(ctx, store, current.ID, fmt.Errorf("%w (additionally could not verify foreground settlement: %v)", cause, readErr))
 		}
 		if settled.State == string(workflow.JobFailed) {
 			return cause
@@ -281,7 +300,7 @@ func settleForegroundRuntimeValidationFailure(ctx context.Context, store *db.Sto
 		}
 		freshValidationErr := validateStoredJobEffectiveRuntime(ctx, store, settled.ID, effectiveRuntime)
 		if freshValidationErr == nil {
-			return fmt.Errorf("%w (stored runtime evidence changed before settlement; current lifecycle remains queued)", cause)
+			return nil
 		}
 		cause = fmt.Errorf("validate effective runtime before foreground execution: %w", freshValidationErr)
 		current = settled
@@ -289,14 +308,14 @@ func settleForegroundRuntimeValidationFailure(ctx context.Context, store *db.Sto
 
 	blockedCause := fmt.Errorf("%w (failed settlement lost %d lifecycle comparisons)", cause, foregroundRuntimeSettlementAttempts)
 	if blockedErr := settler.finishQueuedJob(ctx, current, workflow.JobBlocked, blockedCause); blockedErr != nil {
-		return fmt.Errorf("%w (additionally failed to settle the foreground job as blocked: %v)", blockedCause, blockedErr)
+		return suppressForegroundRuntimeDispatch(ctx, store, current.ID, fmt.Errorf("%w (additionally failed to settle the foreground job as blocked: %v)", blockedCause, blockedErr))
 	}
 	blocked, readErr := store.GetJob(ctx, current.ID)
 	if readErr != nil {
-		return fmt.Errorf("%w (additionally could not verify blocked foreground settlement: %v)", blockedCause, readErr)
+		return suppressForegroundRuntimeDispatch(ctx, store, current.ID, fmt.Errorf("%w (additionally could not verify blocked foreground settlement: %v)", blockedCause, readErr))
 	}
 	if blocked.State != string(workflow.JobBlocked) {
-		return fmt.Errorf("%w (blocked foreground settlement did not apply; current job state is %q)", blockedCause, blocked.State)
+		return suppressForegroundRuntimeDispatch(ctx, store, current.ID, fmt.Errorf("%w (blocked foreground settlement did not apply; current job state is %q)", blockedCause, blocked.State))
 	}
 	return blockedCause
 }
