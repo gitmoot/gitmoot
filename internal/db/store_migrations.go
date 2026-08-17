@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -13,8 +14,17 @@ import (
 // schema templates use it in their cache key so a migration edit cannot reuse
 // a stale database from an earlier test run.
 func SchemaMigrationFingerprint() string {
+	return schemaMigrationFingerprint(migrations)
+}
+
+func schemaMigrationFingerprint(ordered []string) string {
 	hash := sha256.New()
-	for _, migration := range migrations {
+	var framing [8]byte
+	binary.BigEndian.PutUint64(framing[:], uint64(len(ordered)))
+	_, _ = hash.Write(framing[:])
+	for _, migration := range ordered {
+		binary.BigEndian.PutUint64(framing[:], uint64(len(migration)))
+		_, _ = hash.Write(framing[:])
 		_, _ = hash.Write([]byte(migration))
 	}
 	return hex.EncodeToString(hash.Sum(nil))

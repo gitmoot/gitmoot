@@ -30,7 +30,8 @@ store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 
 `dbtest.Open` builds one fully migrated template, checkpoints its WAL, and
 copies the resulting database into each test's private path. The template name
-contains a SHA-256 fingerprint of the ordered migration strings. Test binaries
+contains a SHA-256 fingerprint of the count and length-prefixed ordered
+migration strings. Test binaries
 can therefore share the cache, while any migration edit selects a new template.
 Each test still owns its database file and can change its rows without affecting
 another test.
