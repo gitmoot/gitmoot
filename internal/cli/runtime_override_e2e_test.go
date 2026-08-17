@@ -195,18 +195,23 @@ func TestRuntimeOverrideForegroundShellE2E(t *testing.T) {
 
 func TestRuntimeOverrideForegroundStoredEffectiveRuntimeFailsClosed(t *testing.T) {
 	tests := []struct {
-		name         string
-		updateExpr   string
-		wantError    string
-		wantPresent  bool
-		wantStored   string
-		wantOverride string
+		name           string
+		updateExpr     string
+		wantError      string
+		wantPresent    bool
+		wantStored     string
+		wantOverride   string
+		bumpGeneration bool
+		rejectFailed   bool
+		wantState      workflow.JobState
+		wantErrorExtra string
 	}{
 		{
 			name:         "missing",
 			updateExpr:   `json_remove(payload, '$.effective_runtime')`,
 			wantError:    "stored job payload is missing effective_runtime",
 			wantOverride: runtime.ShellRuntime,
+			wantState:    workflow.JobFailed,
 		},
 		{
 			name:         "empty",
@@ -214,6 +219,7 @@ func TestRuntimeOverrideForegroundStoredEffectiveRuntimeFailsClosed(t *testing.T
 			wantError:    "stored job payload effective_runtime is empty",
 			wantPresent:  true,
 			wantOverride: runtime.ShellRuntime,
+			wantState:    workflow.JobFailed,
 		},
 		{
 			name:         "effective_runtime_mismatch",
@@ -222,6 +228,7 @@ func TestRuntimeOverrideForegroundStoredEffectiveRuntimeFailsClosed(t *testing.T
 			wantPresent:  true,
 			wantStored:   runtime.CodexRuntime,
 			wantOverride: runtime.ShellRuntime,
+			wantState:    workflow.JobFailed,
 		},
 		{
 			name:         "runtime_override_mismatch",
@@ -230,6 +237,24 @@ func TestRuntimeOverrideForegroundStoredEffectiveRuntimeFailsClosed(t *testing.T
 			wantPresent:  true,
 			wantStored:   runtime.ShellRuntime,
 			wantOverride: runtime.CodexRuntime,
+			wantState:    workflow.JobFailed,
+		},
+		{
+			name:           "lifecycle_generation_changed",
+			updateExpr:     `json_remove(payload, '$.effective_runtime')`,
+			wantError:      "stored job payload is missing effective_runtime",
+			wantOverride:   runtime.ShellRuntime,
+			bumpGeneration: true,
+			wantState:      workflow.JobFailed,
+		},
+		{
+			name:           "failed_transition_rejected",
+			updateExpr:     `json_remove(payload, '$.effective_runtime')`,
+			wantError:      "stored job payload is missing effective_runtime",
+			wantOverride:   runtime.ShellRuntime,
+			rejectFailed:   true,
+			wantState:      workflow.JobBlocked,
+			wantErrorExtra: "forced foreground failed settlement rejection",
 		},
 	}
 	for _, tc := range tests {
@@ -244,14 +269,28 @@ func TestRuntimeOverrideForegroundStoredEffectiveRuntimeFailsClosed(t *testing.T
 				t.Fatalf("open raw sqlite: %v", err)
 			}
 			defer raw.Close()
+			generationUpdate := ""
+			if tc.bumpGeneration {
+				generationUpdate = ", lifecycle_generation = lifecycle_generation + 1"
+			}
 			trigger := fmt.Sprintf(`CREATE TRIGGER corrupt_foreground_effective_runtime
 				AFTER INSERT ON jobs
 				WHEN json_extract(NEW.payload, '$.runtime_override') = 'shell'
 				BEGIN
-					UPDATE jobs SET payload = %s WHERE id = NEW.id;
-				END`, tc.updateExpr)
+					UPDATE jobs SET payload = %s%s WHERE id = NEW.id;
+				END`, tc.updateExpr, generationUpdate)
 			if _, err := raw.Exec(trigger); err != nil {
 				t.Fatalf("create effective-runtime corruption trigger: %v", err)
+			}
+			if tc.rejectFailed {
+				if _, err := raw.Exec(`CREATE TRIGGER reject_foreground_failed_settlement
+					BEFORE UPDATE OF state ON jobs
+					WHEN OLD.state = 'queued' AND NEW.state = 'failed'
+					BEGIN
+						SELECT RAISE(FAIL, 'forced foreground failed settlement rejection');
+					END`); err != nil {
+					t.Fatalf("create failed-settlement rejection trigger: %v", err)
+				}
 			}
 
 			var out, errBuf bytes.Buffer
@@ -269,6 +308,12 @@ func TestRuntimeOverrideForegroundStoredEffectiveRuntimeFailsClosed(t *testing.T
 			if !strings.Contains(errBuf.String(), tc.wantError) {
 				t.Fatalf("foreground error = %q, want %q", errBuf.String(), tc.wantError)
 			}
+			if tc.wantErrorExtra != "" && !strings.Contains(errBuf.String(), tc.wantErrorExtra) {
+				t.Fatalf("foreground error = %q, want additional settlement diagnostic %q", errBuf.String(), tc.wantErrorExtra)
+			}
+			if tc.rejectFailed && !strings.Contains(errBuf.String(), "failed settlement unavailable:") {
+				t.Fatalf("foreground error = %q, want failed-settlement fallback classification", errBuf.String())
+			}
 			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("shell override ran with %s runtime evidence (marker err=%v)", tc.name, err)
 			}
@@ -281,8 +326,11 @@ func TestRuntimeOverrideForegroundStoredEffectiveRuntimeFailsClosed(t *testing.T
 				t.Fatalf("jobs = %d, want exactly the foreground job", len(jobs))
 			}
 			job := jobs[0]
-			if job.State != string(workflow.JobFailed) {
-				t.Fatalf("job state = %q, want failed before shell execution", job.State)
+			if job.State != string(tc.wantState) {
+				t.Fatalf("job state = %q, want %s before shell execution", job.State, tc.wantState)
+			}
+			if tc.bumpGeneration && job.LifecycleGeneration < 1 {
+				t.Fatalf("lifecycle generation = %d, want fixture-proven generation bump", job.LifecycleGeneration)
 			}
 			var envelope map[string]json.RawMessage
 			if err := json.Unmarshal([]byte(job.Payload), &envelope); err != nil {
@@ -312,17 +360,37 @@ func TestRuntimeOverrideForegroundStoredEffectiveRuntimeFailsClosed(t *testing.T
 			if err != nil {
 				t.Fatalf("ListJobEvents: %v", err)
 			}
-			var failedEvent string
+			var terminalEvent string
 			for _, event := range events {
-				if event.Kind == string(workflow.JobFailed) {
-					failedEvent = event.Message
+				if event.Kind == string(tc.wantState) {
+					terminalEvent = event.Message
 				}
 				if event.Kind == runtimeOverrideEventKind {
 					t.Fatalf("runtime override was journaled despite pre-execution refusal: %+v", event)
 				}
 			}
-			if !strings.Contains(failedEvent, tc.wantError) {
-				t.Fatalf("failed event = %q, want attributed error %q", failedEvent, tc.wantError)
+			if !strings.Contains(terminalEvent, tc.wantError) {
+				t.Fatalf("terminal event = %q, want attributed error %q", terminalEvent, tc.wantError)
+			}
+			if tc.wantErrorExtra != "" && !strings.Contains(terminalEvent, tc.wantErrorExtra) {
+				t.Fatalf("terminal event = %q, want settlement diagnostic %q", terminalEvent, tc.wantErrorExtra)
+			}
+
+			if tc.rejectFailed {
+				queued, err := store.ListQueuedJobs(ctx)
+				if err != nil {
+					t.Fatalf("ListQueuedJobs: %v", err)
+				}
+				if len(queued) != 0 {
+					t.Fatalf("failed-settlement fallback left daemon-claimable jobs: %+v", queued)
+				}
+				worker := defaultJobWorker(store, io.Discard, home)
+				if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, time.Now().UTC(), nil, nil); err != nil {
+					t.Fatalf("worker tick after blocked fallback: %v", err)
+				}
+				if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("daemon executed blocked foreground refusal (marker err=%v)", err)
+				}
 			}
 		})
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -238,6 +239,66 @@ func validateStoredJobEffectiveRuntime(ctx context.Context, store *db.Store, job
 		return fmt.Errorf("stored job payload runtime_override %q does not match execution runtime %q", override, effective)
 	}
 	return nil
+}
+
+const foregroundRuntimeSettlementAttempts = 3
+
+// settleForegroundRuntimeValidationFailure makes a pre-execution refusal
+// durable. A lifecycle CAS loss is retried only after the newer queued row is
+// re-read and independently fails the same validation. If SQLite rejects the
+// failed transition itself, blocked is the truthful terminal fallback: the job
+// did not run, remains manually retryable, and cannot be claimed by the daemon.
+func settleForegroundRuntimeValidationFailure(ctx context.Context, store *db.Store, home string, admitted db.Job, effectiveRuntime string, validationErr error) error {
+	settler := jobWorker{Store: store, Stdout: io.Discard, ConfigHome: home, ConfigHomeExplicit: true}
+	current := admitted
+	cause := validationErr
+
+	for attempt := 0; attempt < foregroundRuntimeSettlementAttempts; attempt++ {
+		if settleErr := settler.finishQueuedJob(ctx, current, workflow.JobFailed, cause); settleErr != nil {
+			blockedCause := fmt.Errorf("%w (failed settlement unavailable: %v)", cause, settleErr)
+			if blockedErr := settler.finishQueuedJob(ctx, current, workflow.JobBlocked, blockedCause); blockedErr != nil {
+				return fmt.Errorf("%w (additionally failed to settle the foreground job as blocked: %v)", blockedCause, blockedErr)
+			}
+			blocked, readErr := store.GetJob(ctx, current.ID)
+			if readErr != nil {
+				return fmt.Errorf("%w (additionally could not verify blocked foreground settlement: %v)", blockedCause, readErr)
+			}
+			if blocked.State != string(workflow.JobBlocked) {
+				return fmt.Errorf("%w (blocked foreground settlement did not apply; current job state is %q)", blockedCause, blocked.State)
+			}
+			return blockedCause
+		}
+
+		settled, readErr := store.GetJob(ctx, current.ID)
+		if readErr != nil {
+			return fmt.Errorf("%w (additionally could not verify foreground settlement: %v)", cause, readErr)
+		}
+		if settled.State == string(workflow.JobFailed) {
+			return cause
+		}
+		if settled.State != string(workflow.JobQueued) {
+			return fmt.Errorf("%w (foreground settlement lost to concurrent state %q)", cause, settled.State)
+		}
+		freshValidationErr := validateStoredJobEffectiveRuntime(ctx, store, settled.ID, effectiveRuntime)
+		if freshValidationErr == nil {
+			return fmt.Errorf("%w (stored runtime evidence changed before settlement; current lifecycle remains queued)", cause)
+		}
+		cause = fmt.Errorf("validate effective runtime before foreground execution: %w", freshValidationErr)
+		current = settled
+	}
+
+	blockedCause := fmt.Errorf("%w (failed settlement lost %d lifecycle comparisons)", cause, foregroundRuntimeSettlementAttempts)
+	if blockedErr := settler.finishQueuedJob(ctx, current, workflow.JobBlocked, blockedCause); blockedErr != nil {
+		return fmt.Errorf("%w (additionally failed to settle the foreground job as blocked: %v)", blockedCause, blockedErr)
+	}
+	blocked, readErr := store.GetJob(ctx, current.ID)
+	if readErr != nil {
+		return fmt.Errorf("%w (additionally could not verify blocked foreground settlement: %v)", blockedCause, readErr)
+	}
+	if blocked.State != string(workflow.JobBlocked) {
+		return fmt.Errorf("%w (blocked foreground settlement did not apply; current job state is %q)", blockedCause, blocked.State)
+	}
+	return blockedCause
 }
 
 // persistJobEffectiveRuntime records the runtime a job is about to run on
