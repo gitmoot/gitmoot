@@ -149,8 +149,13 @@ jobs:
       - name: Race partition script
         run: scripts/partition-race-tests_test.sh
 
+      # An explicit timeout, not Go's implicit 10m-per-package default (#1549).
+      # internal/cli already burns 482.8s on a green main, so a normal PR that adds
+      # tests there crosses the ceiling and CI reports `panic: test timed out` under
+      # the name of whichever test happened to be running — an innocent one. The
+      # -race gate has always been explicit (35m); this is the lane that was not.
       - name: Test
-        run: go test ./...
+        run: go test -timeout 25m ./...
 
   race-build:
     name: race build (internal/${{ matrix.package }})
