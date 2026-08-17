@@ -276,7 +276,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// fails the job LOUDLY here, before any checkout/adapter work — never a
 	// silent fallback.
 	jobExecBackend, jobExecBackendPresent := payload.ExecBackendOverride()
-	execBackend, err := w.resolveExecBackend(jobExecBackend, jobExecBackendPresent)
+	execBackend, err := daemonJobExecBackendFor(w, jobExecBackend, jobExecBackendPresent)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
@@ -387,9 +387,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	var adapter workflow.DeliveryAdapter
 	var relayToken string
 	if progressTracker != nil {
-		adapter, relayToken, err = w.buildSeatAwareAdapter(&agent, checkout, payload, progressTracker)
+		adapter, relayToken, err = w.buildSeatAwareAdapterForBackend(execBackend, &agent, checkout, payload, progressTracker)
 	} else {
-		adapter, relayToken, err = w.buildSeatAwareAdapter(&agent, checkout, payload)
+		adapter, relayToken, err = w.buildSeatAwareAdapterForBackend(execBackend, &agent, checkout, payload)
 	}
 	if relayToken != "" {
 		defer w.RelayServer.ReleaseSeat(relayToken)
@@ -1313,6 +1313,10 @@ func (w jobWorker) resolveExecBackend(jobOverride string, jobOverridePresent boo
 		return execbackend.Resolve(cfg.Backend, &jobOverride)
 	}
 	return execbackend.Resolve(cfg.Backend, nil)
+}
+
+var daemonJobExecBackendFor = func(w jobWorker, jobOverride string, jobOverridePresent bool) (execbackend.Backend, error) {
+	return w.resolveExecBackend(jobOverride, jobOverridePresent)
 }
 
 // repoConcurrency loads the per-repo [repos."owner/repo"] scheduler overrides
@@ -2807,6 +2811,30 @@ func (w jobWorker) outputAdapter(agent runtime.Agent, checkout string, out io.Wr
 // and drop the env runner — never fires for a seat. If that ever changes, thread
 // the relay env into the cockpit rebuild too.
 func (w jobWorker) buildSeatAwareAdapter(agent *runtime.Agent, checkout string, payload workflow.JobPayload, output ...io.Writer) (workflow.DeliveryAdapter, string, error) {
+	backend := execbackend.Local
+	if strings.TrimSpace(agent.ExecBackend) != "" {
+		resolved, err := execbackend.ParseImplemented(agent.ExecBackend)
+		if err != nil {
+			return nil, "", err
+		}
+		backend = resolved
+	}
+	return w.buildSeatAwareAdapterForBackend(backend, agent, checkout, payload, output...)
+}
+
+// buildSeatAwareAdapterForBackend consumes the already-resolved backend at the
+// daemon's adapter boundary. Adding a name to the selector's implemented set is
+// insufficient: a new backend must add its own arm here before it can execute.
+func (w jobWorker) buildSeatAwareAdapterForBackend(backend execbackend.Backend, agent *runtime.Agent, checkout string, payload workflow.JobPayload, output ...io.Writer) (workflow.DeliveryAdapter, string, error) {
+	switch backend {
+	case execbackend.Local:
+		return w.buildLocalSeatAwareAdapter(agent, checkout, payload, output...)
+	default:
+		return nil, "", fmt.Errorf("execution backend %q has no daemon adapter implementation", backend)
+	}
+}
+
+func (w jobWorker) buildLocalSeatAwareAdapter(agent *runtime.Agent, checkout string, payload workflow.JobPayload, output ...io.Writer) (workflow.DeliveryAdapter, string, error) {
 	if w.RelayServer == nil || !payload.MootSeat || strings.TrimSpace(payload.ThreadID) == "" {
 		if len(output) > 0 && output[0] != nil && w.OutputAdapterFactory != nil {
 			adapter, err := w.OutputAdapterFactory(*agent, checkout, output[0])

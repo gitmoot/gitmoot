@@ -285,6 +285,43 @@ func TestExecBackendResolvedNonLocalCannotRunLocallyForegroundE2E(t *testing.T) 
 	}
 }
 
+// TestExecBackendResolvedNonLocalCannotRunLocallyDaemonE2E models the same P2
+// boundary in the claiming worker. Resolution may accept a future backend, but
+// the daemon must not run it until that backend has an explicit adapter arm.
+func TestExecBackendResolvedNonLocalCannotRunLocallyDaemonE2E(t *testing.T) {
+	ctx := context.Background()
+	marker := filepath.Join(t.TempDir(), "must-not-run-resolved-remote-daemon")
+	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
+	jobID := execBackendDispatchAsk(t, home)
+
+	previousResolver := daemonJobExecBackendFor
+	daemonJobExecBackendFor = func(jobWorker, string, bool) (execbackend.Backend, error) {
+		return execbackend.Backend("p2-probe"), nil
+	}
+	t.Cleanup(func() { daemonJobExecBackendFor = previousResolver })
+
+	execBackendRunOneTick(t, home, store)
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("daemon adapter ran locally for a resolved non-local backend (marker err=%v)", err)
+	}
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if job.State != string(workflow.JobFailed) {
+		t.Fatalf("job state = %q, want failed", job.State)
+	}
+	for _, event := range execBackendEventKinds(t, store, jobID) {
+		if event == string(workflow.JobRunning) {
+			t.Fatalf("job reached running for a resolved non-local backend")
+		}
+	}
+	failedMessages := execBackendEvents(t, store, jobID)
+	if len(failedMessages) != 1 || !strings.Contains(failedMessages[0], `"p2-probe"`) || !strings.Contains(failedMessages[0], "no daemon adapter implementation") {
+		t.Fatalf("failed events = %q, want resolved backend and missing daemon implementation named", failedMessages)
+	}
+}
+
 // TestExecBackendOverrideResolutionDaemonE2E covers the per-job override
 // field: an unknown override fails loud (naming the override source) even
 // with no [remote_exec] section, and an explicit "local" override resolves to
