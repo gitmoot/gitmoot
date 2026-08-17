@@ -525,12 +525,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}
-	if err := validateStoredJobEffectiveRuntime(ctx, store, job.ID, effectiveAgent.Runtime); err != nil {
-		validationErr := fmt.Errorf("validate effective runtime before foreground execution: %w", err)
-		if settleErr := settleForegroundRuntimeValidationFailure(ctx, store, request.Home, job, effectiveAgent.Runtime, validationErr); settleErr != nil {
-			return localAgentJobOutput{}, settleErr
-		}
-	}
 	// Journal runtime selection for every job. Only a real per-job override is
 	// labelled runtime_override; default selection uses effective_runtime.
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: jobRuntimeEventKind(overrideRuntime != ""), Message: jobRuntimeOverrideEventMessage(agent.Runtime, effectiveAgent, lockKey)}); err != nil {

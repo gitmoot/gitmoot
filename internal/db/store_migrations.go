@@ -1986,13 +1986,4 @@ CREATE TABLE permission_policy_warning_claims (
 	PRIMARY KEY(agent, runtime, policy, capability, window_start)
 );
 	`,
-	// #1528 fail-closed foreground dispatch. A pre-execution runtime-evidence
-	// refusal normally settles terminal, but state transitions can lose a CAS or
-	// be rejected independently of other writes. dispatch_suppressed is the
-	// durable, state-independent backstop used by queue selectors. Default 0 keeps
-	// all existing rows and dispatch behavior unchanged; explicit retry clears it.
-	`
-ALTER TABLE jobs ADD COLUMN dispatch_suppressed INTEGER NOT NULL DEFAULT 0
-	CHECK(dispatch_suppressed IN (0, 1));
-	`,
 }

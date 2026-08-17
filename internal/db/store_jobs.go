@@ -372,7 +372,7 @@ func (s *Store) SumJobTokensByRoot(ctx context.Context, rootID string) (int, err
 // PRODUCTION text rather than a hand-copied duplicate — a change to this query is then
 // what the test actually asserts a plan for.
 const listQueuedJobsSQL = `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens
-		FROM jobs WHERE state = 'queued' AND externally_driven = 0 AND dispatch_suppressed = 0 ORDER BY created_at, rowid`
+		FROM jobs WHERE state = 'queued' AND externally_driven = 0 ORDER BY created_at, rowid`
 
 // ListQueuedJobs returns the queued jobs in created_at (then rowid) order. The
 // state predicate is the SQL literal 'queued' — not a bound parameter — so SQLite
@@ -407,45 +407,13 @@ func (s *Store) ListQueuedJobs(ctx context.Context) ([]Job, error) {
 	return jobs, rows.Err()
 }
 
-// SuppressJobDispatchWithEvent makes a queued or already-claimed running job
-// ineligible for future daemon dispatch without relying on another state
-// transition. The bit survives requeueing; an explicit retry transition clears
-// it when the operator starts a fresh lifecycle.
-func (s *Store) SuppressJobDispatchWithEvent(ctx context.Context, id string, event JobEvent) (bool, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback()
-
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET dispatch_suppressed = 1, updated_at = CURRENT_TIMESTAMP
-		WHERE id = ? AND state IN ('queued', 'running')`, id)
-	if err != nil {
-		return false, err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	if affected == 0 {
-		return false, tx.Commit()
-	}
-	if event.JobID == "" {
-		event.JobID = id
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
-		return false, err
-	}
-	return true, tx.Commit()
-}
-
 // CountQueuedJobsForRepo returns the queued engine-owned jobs targeting repo.
 // The literal queued predicate lets SQLite use idx_jobs_queued_created; repo is
 // then a residual filter over the normally small queued set.
 func (s *Store) CountQueuedJobsForRepo(ctx context.Context, repo string) (int, error) {
 	var count int
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs
-		WHERE state = 'queued' AND externally_driven = 0 AND dispatch_suppressed = 0 AND repo = ?`, strings.TrimSpace(repo)).Scan(&count)
+		WHERE state = 'queued' AND externally_driven = 0 AND repo = ?`, strings.TrimSpace(repo)).Scan(&count)
 	return count, err
 }
 
@@ -799,8 +767,8 @@ func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id strin
 	defer tx.Rollback()
 
 	projection := jobProjectionFromPayload(payload)
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, dispatch_suppressed = CASE WHEN ? = 'queued' THEN 0 ELSE dispatch_suppressed END, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND workflow_id = ?`,
-		to, to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND workflow_id = ?`,
+		to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
 		projection.BlockerSuggestedAction, id, from, projection.WorkflowID)
 	if err != nil {
 		return false, err
@@ -930,8 +898,8 @@ func (s *Store) TransitionJobStatePayloadWithEventAndTaskTransition(ctx context.
 	}
 
 	projection := jobProjectionFromPayload(payload)
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, dispatch_suppressed = CASE WHEN ? = 'queued' THEN 0 ELSE dispatch_suppressed END, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND workflow_id = ?`,
-		to, to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND workflow_id = ?`,
+		to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
 		projection.BlockerSuggestedAction, id, from, projection.WorkflowID)
 	if err != nil {
 		return false, err

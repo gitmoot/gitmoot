@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -193,131 +192,16 @@ func storedJobPayloadEnvelope(ctx context.Context, store *db.Store, jobID string
 	return envelope, nil
 }
 
-func runtimeFieldFromEnvelope(envelope map[string]json.RawMessage, field string) (string, bool, error) {
-	raw, present := envelope[field]
+func effectiveRuntimeFromEnvelope(envelope map[string]json.RawMessage) (string, bool, error) {
+	raw, present := envelope["effective_runtime"]
 	if !present {
 		return "", false, nil
 	}
 	var recorded string
 	if err := json.Unmarshal(raw, &recorded); err != nil {
-		return "", true, fmt.Errorf("decode %s: %w", field, err)
+		return "", true, fmt.Errorf("decode effective_runtime: %w", err)
 	}
 	return strings.TrimSpace(recorded), true, nil
-}
-
-func effectiveRuntimeFromEnvelope(envelope map[string]json.RawMessage) (string, bool, error) {
-	return runtimeFieldFromEnvelope(envelope, "effective_runtime")
-}
-
-func validateStoredJobEffectiveRuntime(ctx context.Context, store *db.Store, jobID string, effectiveRuntime string) error {
-	effective := strings.TrimSpace(effectiveRuntime)
-	if effective == "" {
-		return errors.New("execution runtime is empty")
-	}
-	envelope, err := storedJobPayloadEnvelope(ctx, store, jobID)
-	if err != nil {
-		return err
-	}
-	recorded, present, err := effectiveRuntimeFromEnvelope(envelope)
-	if err != nil {
-		return err
-	}
-	if !present {
-		return errors.New("stored job payload is missing effective_runtime")
-	}
-	if recorded == "" {
-		return errors.New("stored job payload effective_runtime is empty")
-	}
-	if recorded != effective {
-		return fmt.Errorf("stored job payload effective_runtime %q does not match execution runtime %q", recorded, effective)
-	}
-	override, overridePresent, err := runtimeFieldFromEnvelope(envelope, "runtime_override")
-	if err != nil {
-		return err
-	}
-	if overridePresent && override != "" && override != effective {
-		return fmt.Errorf("stored job payload runtime_override %q does not match execution runtime %q", override, effective)
-	}
-	return nil
-}
-
-const foregroundRuntimeSettlementAttempts = 3
-const foregroundRuntimeDispatchSuppressedEventKind = "foreground_runtime_dispatch_suppressed"
-
-func suppressForegroundRuntimeDispatch(ctx context.Context, store *db.Store, jobID string, cause error) error {
-	message := fmt.Sprintf("%v (automatic terminal settlement did not apply; daemon dispatch suppressed)", cause)
-	suppressed, err := store.SuppressJobDispatchWithEvent(ctx, jobID, db.JobEvent{
-		JobID:   jobID,
-		Kind:    foregroundRuntimeDispatchSuppressedEventKind,
-		Message: message,
-	})
-	if err != nil {
-		return fmt.Errorf("%w (additionally failed to suppress daemon dispatch: %v)", cause, err)
-	}
-	if suppressed {
-		return errors.New(message)
-	}
-	// The suppression write only declines rows that have already left queued or
-	// running. Such a row cannot match either daemon claim predicate for this run.
-	return fmt.Errorf("%w (job left the claimable states before dispatch suppression)", cause)
-}
-
-// settleForegroundRuntimeValidationFailure makes a pre-execution refusal
-// durable. A lifecycle CAS loss is retried only after the newer queued row is
-// re-read and independently fails the same validation. If SQLite rejects the
-// failed transition itself, blocked is the truthful terminal fallback: the job
-// did not run, remains manually retryable, and cannot be claimed by the daemon.
-func settleForegroundRuntimeValidationFailure(ctx context.Context, store *db.Store, home string, admitted db.Job, effectiveRuntime string, validationErr error) error {
-	settler := jobWorker{Store: store, Stdout: io.Discard, ConfigHome: home, ConfigHomeExplicit: true}
-	current := admitted
-	cause := validationErr
-
-	for attempt := 0; attempt < foregroundRuntimeSettlementAttempts; attempt++ {
-		if settleErr := settler.finishQueuedJob(ctx, current, workflow.JobFailed, cause); settleErr != nil {
-			blockedCause := fmt.Errorf("%w (failed settlement unavailable: %v)", cause, settleErr)
-			if blockedErr := settler.finishQueuedJob(ctx, current, workflow.JobBlocked, blockedCause); blockedErr != nil {
-				return suppressForegroundRuntimeDispatch(ctx, store, current.ID, fmt.Errorf("%w (additionally failed to settle the foreground job as blocked: %v)", blockedCause, blockedErr))
-			}
-			blocked, readErr := store.GetJob(ctx, current.ID)
-			if readErr != nil {
-				return suppressForegroundRuntimeDispatch(ctx, store, current.ID, fmt.Errorf("%w (additionally could not verify blocked foreground settlement: %v)", blockedCause, readErr))
-			}
-			if blocked.State != string(workflow.JobBlocked) {
-				return suppressForegroundRuntimeDispatch(ctx, store, current.ID, fmt.Errorf("%w (blocked foreground settlement did not apply; current job state is %q)", blockedCause, blocked.State))
-			}
-			return blockedCause
-		}
-
-		settled, readErr := store.GetJob(ctx, current.ID)
-		if readErr != nil {
-			return suppressForegroundRuntimeDispatch(ctx, store, current.ID, fmt.Errorf("%w (additionally could not verify foreground settlement: %v)", cause, readErr))
-		}
-		if settled.State == string(workflow.JobFailed) {
-			return cause
-		}
-		if settled.State != string(workflow.JobQueued) {
-			return fmt.Errorf("%w (foreground settlement lost to concurrent state %q)", cause, settled.State)
-		}
-		freshValidationErr := validateStoredJobEffectiveRuntime(ctx, store, settled.ID, effectiveRuntime)
-		if freshValidationErr == nil {
-			return nil
-		}
-		cause = fmt.Errorf("validate effective runtime before foreground execution: %w", freshValidationErr)
-		current = settled
-	}
-
-	blockedCause := fmt.Errorf("%w (failed settlement lost %d lifecycle comparisons)", cause, foregroundRuntimeSettlementAttempts)
-	if blockedErr := settler.finishQueuedJob(ctx, current, workflow.JobBlocked, blockedCause); blockedErr != nil {
-		return suppressForegroundRuntimeDispatch(ctx, store, current.ID, fmt.Errorf("%w (additionally failed to settle the foreground job as blocked: %v)", blockedCause, blockedErr))
-	}
-	blocked, readErr := store.GetJob(ctx, current.ID)
-	if readErr != nil {
-		return suppressForegroundRuntimeDispatch(ctx, store, current.ID, fmt.Errorf("%w (additionally could not verify blocked foreground settlement: %v)", blockedCause, readErr))
-	}
-	if blocked.State != string(workflow.JobBlocked) {
-		return suppressForegroundRuntimeDispatch(ctx, store, current.ID, fmt.Errorf("%w (blocked foreground settlement did not apply; current job state is %q)", blockedCause, blocked.State))
-	}
-	return blockedCause
 }
 
 // persistJobEffectiveRuntime records the runtime a job is about to run on
