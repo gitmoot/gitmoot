@@ -226,17 +226,21 @@ func TestDispatchReviewRebindsOwningTaskOnHeadDivergence(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ListJobEvents: %v", err)
 			}
-			divergence := ""
+			var divergenceEvents []db.JobEvent
 			for _, event := range events {
 				if event.Kind == "review_task_head_divergence" {
-					divergence = event.Message
+					divergenceEvents = append(divergenceEvents, event)
 				}
 			}
 			if !tc.wantEvent {
-				if divergence != "" {
-					t.Fatalf("matching-head bind recorded a divergence event %q; want none", divergence)
+				if len(divergenceEvents) != 0 {
+					t.Fatalf("matching-head bind recorded divergence events %+v; want none", divergenceEvents)
 				}
 			} else {
+				if len(divergenceEvents) != 1 {
+					t.Fatalf("diverged-head bind recorded %d divergence events; want 1: %+v", len(divergenceEvents), divergenceEvents)
+				}
+				divergence := divergenceEvents[0].Message
 				for _, fragment := range []string{"adhoc-impl", firstHead, secondHead} {
 					if !strings.Contains(divergence, fragment) {
 						t.Fatalf("divergence event = %q, want it to name %q", divergence, fragment)
