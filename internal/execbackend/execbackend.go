@@ -8,9 +8,12 @@
 // nil → runtimeJobRunner/credgw → maybe Landlock WrappingRunner → adapter,
 // with subprocess.GroupRunner{} innermost). The job-scoped
 // Provision/SyncIn/Exec/Collect/Destroy lifecycle from the P0 contract lands
-// with the first real backend (P2); this package only names the selector and
-// guarantees selection NEVER falls back silently: an unknown value is always a
-// loud error naming the offending value and the allowed set.
+// with the first real backend (P2); this package only names the selector.
+// Selection gates runtime adapter construction: every construction route
+// funnels through Consume, whose positional builders make adding a backend to
+// ParseImplemented without its builder a compile failure. Selection does not
+// yet gate job-associated subprocess execution; closing that gap before P2 is
+// tracked by #1560.
 package execbackend
 
 import (
