@@ -152,10 +152,10 @@ jobs:
       # An explicit timeout, not Go's implicit 10m-per-package default (#1549).
       # internal/cli already burns 482.8s on a green main, so a normal PR that adds
       # tests there crosses the ceiling and CI reports `panic: test timed out` under
-      # the name of whichever test happened to be running — an innocent one. The
-      # -race lanes have always carried an EXPLICIT timeout — 20m today
-      # (-test.timeout=20m, below), 35m and 30m at earlier points. This non-race
-      # lane is the one that was still relying on the language default.
+      # the name of whichever test happened to be running — an innocent one.
+      # This is #573's fix ("give the race-detector test step an explicit 20m
+      # timeout") applied to the non-race lane, which was still relying on the
+      # language default.
       - name: Test
         run: go test -timeout 25m ./...
 
