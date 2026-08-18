@@ -55,6 +55,19 @@ var AfterTestTemplatePublish = func() error { return nil }
 // schema. This way a crash leaves a database with no (or a mismatched) sidecar,
 // which fails validation and costs only a rebuild.
 func PublishMigratedTestTemplate(tempPath, path string) error {
+	// Compute the identity from OUR candidate BEFORE it is published. After the
+	// rename the file at `path` is not necessarily ours: another test binary can
+	// rename its own candidate over the same shared cache path at any moment, and
+	// stamping `path` afterwards would authenticate a database we never built.
+	// Round-6 review reproduced exactly that with an interleaving probe — "the
+	// supposedly indivisible API can authenticate a database that replaced its
+	// candidate between the database rename and identity stamping." One function
+	// call is not one filesystem operation.
+	stamp, err := testTemplateStamp(tempPath)
+	if err != nil {
+		return err
+	}
+
 	if err := os.Rename(tempPath, path); err != nil {
 		if validateErr := ValidateTestTemplateIdentity(path); validateErr == nil {
 			return nil
@@ -64,24 +77,35 @@ func PublishMigratedTestTemplate(tempPath, path string) error {
 	if err := AfterTestTemplatePublish(); err != nil {
 		return err
 	}
-	return stampTestTemplateIdentity(path)
+
+	// Defence in depth: if the published file is no longer the one we measured,
+	// another binary won the race. Stamping our identity over its candidate is the
+	// laundering being prevented, so verify what is there instead and accept it
+	// only if it authenticates on its own. (Note: the pre-rename computation above
+	// is what makes this safe — mutation testing showed THAT is the load-bearing
+	// half, and this branch only turns a mismatched sidecar into a clear error.)
+	current, err := testTemplateStamp(path)
+	if err != nil {
+		return err
+	}
+	if current != stamp {
+		if validateErr := ValidateTestTemplateIdentity(path); validateErr == nil {
+			return nil
+		}
+		return fmt.Errorf("test schema template at %s was replaced during publication and does not authenticate", path)
+	}
+	return stampTestTemplateIdentityWith(path, stamp)
 }
 
 // stampTestTemplateIdentity records the identity beside an already-published
 // template, via create-temp + rename so a reader never observes a partial value.
 // Unexported on purpose — see PublishMigratedTestTemplate.
-func stampTestTemplateIdentity(path string) error {
+func stampTestTemplateIdentityWith(path, stamp string) error {
 	temp, err := os.CreateTemp(filepath.Dir(path), ".gitmoot-test-schema-id-*")
 	if err != nil {
 		return fmt.Errorf("create test schema identity sidecar: %w", err)
 	}
 	tempPath := temp.Name()
-	stamp, err := testTemplateStamp(path)
-	if err != nil {
-		_ = temp.Close()
-		_ = os.Remove(tempPath)
-		return err
-	}
 	if _, err := io.WriteString(temp, stamp); err != nil {
 		_ = temp.Close()
 		_ = os.Remove(tempPath)

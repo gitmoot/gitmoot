@@ -442,3 +442,62 @@ func TestValidationRejectsDivergedSchema(t *testing.T) {
 		t.Fatalf("validate rebuilt template: %v", err)
 	}
 }
+
+// TestPublishDoesNotStampAnotherBinarysCandidate pins the interleaving race that
+// round-6 review reproduced: "the supposedly indivisible API can authenticate a
+// database that replaced its candidate between the database rename and identity
+// stamping."
+//
+// One function call is not one filesystem operation. Between publishing our
+// candidate and stamping it, another test binary sharing the same cache path can
+// rename ITS candidate over ours; stamping afterwards would authenticate a
+// database we never built. The seam lets the test occupy exactly that window.
+func TestPublishDoesNotStampAnotherBinarysCandidate(t *testing.T) {
+	template := filepath.Join(t.TempDir(), "schema.db")
+
+	// Build a legitimate template once so a valid foreign candidate exists.
+	foreign := filepath.Join(t.TempDir(), "foreign.db")
+	if err := ensureMigratedTemplate(foreign); err != nil {
+		t.Fatalf("build foreign template: %v", err)
+	}
+	// Age it so it is NOT what the current migrations produce.
+	raw, err := sql.Open("sqlite", foreign)
+	if err != nil {
+		t.Fatalf("open foreign: %v", err)
+	}
+	if _, err := raw.ExecContext(context.Background(), `DROP TABLE IF EXISTS seen_comments`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("age foreign: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close foreign: %v", err)
+	}
+
+	// Occupy the window: replace the just-published database with the foreign one.
+	previous := db.AfterTestTemplatePublish
+	db.AfterTestTemplatePublish = func() error {
+		data, readErr := os.ReadFile(foreign)
+		if readErr != nil {
+			return readErr
+		}
+		return os.WriteFile(template, data, 0o600)
+	}
+	t.Cleanup(func() { db.AfterTestTemplatePublish = previous })
+
+	err = ensureMigratedTemplate(template)
+	db.AfterTestTemplatePublish = previous
+
+	// Whatever happened, the invariant is the same: the file at the cache path must
+	// NOT end up authenticated unless it genuinely matches the current migrations.
+	if validateErr := validateMigratedTemplate(template); validateErr == nil {
+		t.Fatalf("a foreign candidate that replaced ours was authenticated (publish err=%v)", err)
+	}
+
+	// And recovery still works once nothing is interfering.
+	if err := ensureMigratedTemplate(template); err != nil {
+		t.Fatalf("rebuild after interleaving: %v", err)
+	}
+	if err := validateMigratedTemplate(template); err != nil {
+		t.Fatalf("validate rebuilt template: %v", err)
+	}
+}
