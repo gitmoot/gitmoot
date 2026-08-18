@@ -96,3 +96,25 @@ func TestAdvertisedBackendWithoutImplementationFailsLoud(t *testing.T) {
 		t.Fatalf("Resolve(advertised future backend) error = %v, want loud missing-implementation error", err)
 	}
 }
+
+func TestConsumeRequiresPositiveImplementation(t *testing.T) {
+	called := 0
+	got, err := Consume(Local, func() (string, error) {
+		called++
+		return "local-result", nil
+	})
+	if err != nil || got != "local-result" || called != 1 {
+		t.Fatalf("Consume(local) = %q, %v, calls=%d; want local-result, nil, 1", got, err, called)
+	}
+
+	got, err = Consume(Backend("p2-probe"), func() (string, error) {
+		called++
+		return "silently-local", nil
+	})
+	if err == nil || !strings.Contains(err.Error(), `"p2-probe"`) {
+		t.Fatalf("Consume(p2-probe) = %q, %v; want a loud missing-implementation error", got, err)
+	}
+	if called != 1 {
+		t.Fatalf("local builder calls = %d, want 1; future backend reached local implementation", called)
+	}
+}

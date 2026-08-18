@@ -36,12 +36,9 @@ var localAgentDispatchExecBackendFor = func(home string) (execbackend.Backend, e
 }
 
 func foregroundRuntimeAdapterFactoryFor(backend execbackend.Backend) (foregroundRuntimeAdapterFactory, error) {
-	switch backend {
-	case execbackend.Local:
+	return execbackend.Consume(backend, func() (foregroundRuntimeAdapterFactory, error) {
 		return localAgentDispatchRuntimeAdapterFor, nil
-	default:
-		return nil, fmt.Errorf("execution backend %q has no foreground adapter implementation", backend)
-	}
+	})
 }
 
 var dispatchPromptHeadContradictionWarnings = promptHeadContradictionWarnings
@@ -1483,7 +1480,11 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 			return db.Agent{}, noopAgentReservationRelease, err
 		}
 	}
-	adapter, err := runtimeAdapterFor(home, instanceAgent.Runtime, record.CheckoutPath)
+	execBackend, err := localAgentDispatchExecBackendFor(home)
+	if err != nil {
+		return db.Agent{}, noopAgentReservationRelease, err
+	}
+	adapter, err := startRuntimeAdapterForBackend(execBackend, home, instanceAgent.Runtime, record.CheckoutPath)
 	if err != nil {
 		return db.Agent{}, noopAgentReservationRelease, err
 	}

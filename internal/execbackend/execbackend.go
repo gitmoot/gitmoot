@@ -75,6 +75,22 @@ func ParseImplemented(value string) (Backend, error) {
 	}
 }
 
+// Consume dispatches an already-resolved backend to its execution
+// implementation. The positive Local arm is deliberately separate from
+// ParseImplemented: making a future backend parseable cannot make it inherit
+// Local's runner pipeline. When P2 adds an implementation, it must add a
+// positional builder here; changing this signature then makes every
+// construction route fail to compile until it supplies that backend's builder.
+func Consume[T any](backend Backend, local func() (T, error)) (T, error) {
+	switch backend {
+	case Local:
+		return local()
+	default:
+		var zero T
+		return zero, fmt.Errorf("execution backend %q has no execution implementation", backend)
+	}
+}
+
 // Resolve picks the effective backend for one job. A present per-job override
 // wins even when its value is blank, which then fails loudly. A nil override
 // means absent. Empty configBackend is the absent-config default and resolves

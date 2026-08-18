@@ -3,7 +3,9 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -273,7 +275,7 @@ func TestExecBackendResolvedNonLocalCannotRunLocallyForegroundE2E(t *testing.T) 
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("foreground adapter ran locally for a resolved non-local backend (marker err=%v)", err)
 	}
-	if got := errBuf.String(); !strings.Contains(got, `"p2-probe"`) || !strings.Contains(got, "no foreground adapter implementation") {
+	if got := errBuf.String(); !strings.Contains(got, `"p2-probe"`) || !strings.Contains(got, "no execution implementation") {
 		t.Fatalf("foreground error = %q, want resolved backend and missing implementation named", got)
 	}
 	jobs, err := store.ListJobs(context.Background())
@@ -317,8 +319,101 @@ func TestExecBackendResolvedNonLocalCannotRunLocallyDaemonE2E(t *testing.T) {
 		}
 	}
 	failedMessages := execBackendEvents(t, store, jobID)
-	if len(failedMessages) != 1 || !strings.Contains(failedMessages[0], `"p2-probe"`) || !strings.Contains(failedMessages[0], "no daemon adapter implementation") {
+	if len(failedMessages) != 1 || !strings.Contains(failedMessages[0], `"p2-probe"`) || !strings.Contains(failedMessages[0], "no execution implementation") {
 		t.Fatalf("failed events = %q, want resolved backend and missing daemon implementation named", failedMessages)
+	}
+}
+
+// TestP2GapEveryJobAdapterConstructionRouteRefusesLocalFallback supplies an
+// already-resolved future backend directly to every job adapter construction
+// seam. It is also run under an overlay that makes p2-probe parse as
+// implemented: registry acceptance must not make any route invoke Local.
+func TestP2GapEveryJobAdapterConstructionRouteRefusesLocalFallback(t *testing.T) {
+	backend := execbackend.Backend("p2-probe")
+	localDeliveryCalls := 0
+	worker := jobWorker{
+		AdapterFactory: func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+			localDeliveryCalls++
+			return &cliWorkerFakeAdapter{}, nil
+		},
+	}
+	agent := runtime.Agent{Runtime: runtime.ShellRuntime, ExecBackend: string(backend)}
+
+	t.Run("foreground factory", func(t *testing.T) {
+		if _, err := foregroundRuntimeAdapterFactoryFor(backend); err == nil {
+			t.Fatal("foreground factory accepted p2-probe without an implementation")
+		}
+	})
+	t.Run("daemon primary delivery", func(t *testing.T) {
+		if _, _, err := worker.buildSeatAwareAdapterForBackend(backend, &agent, t.TempDir(), workflow.JobPayload{}); err == nil {
+			t.Fatal("daemon primary delivery accepted p2-probe without an implementation")
+		}
+	})
+	t.Run("temporary worker delivery", func(t *testing.T) {
+		if _, err := worker.deliveryAdapterForBackend(backend, agent, t.TempDir()); err == nil {
+			t.Fatal("temporary worker delivery accepted p2-probe without an implementation")
+		}
+	})
+	t.Run("runtime composition rebuild", func(t *testing.T) {
+		if _, err := buildRuntimeAdapter("", agent, t.TempDir(), nil); err == nil {
+			t.Fatal("runtime composition accepted p2-probe without an implementation")
+		}
+	})
+	t.Run("runtime session start", func(t *testing.T) {
+		if _, err := startRuntimeAdapterForBackend(backend, "", runtime.ShellRuntime, t.TempDir()); err == nil {
+			t.Fatal("runtime session start accepted p2-probe without an implementation")
+		}
+	})
+	if localDeliveryCalls != 0 {
+		t.Fatalf("local delivery factory calls = %d, want 0", localDeliveryCalls)
+	}
+}
+
+func TestExecBackendEphemeralResolvesBeforeRuntimeStart(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
+	const jobID = "exec-backend-ephemeral-preflight"
+	const agentName = "reviewer-ephemeral-backend"
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: jobID, Agent: agentName, Action: "ask", Repo: "owner/repo", Branch: "main",
+		Ephemeral: &workflow.EphemeralSpec{Runtime: runtime.CodexRuntime},
+	})
+
+	previousResolver := daemonJobExecBackendFor
+	daemonJobExecBackendFor = func(jobWorker, string, bool) (execbackend.Backend, error) {
+		return "", errors.New("backend preflight refused")
+	}
+	t.Cleanup(func() { daemonJobExecBackendFor = previousResolver })
+
+	startCalls := 0
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return t.TempDir(), nil
+	}
+	worker.StartAdapterFactory = func(execbackend.Backend, string, string) (runtime.Adapter, error) {
+		startCalls++
+		return &cliWorkerFakeAdapter{}, nil
+	}
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if err := worker.run(ctx, job); err != nil {
+		t.Fatalf("worker run: %v", err)
+	}
+	if startCalls != 0 {
+		t.Fatalf("runtime start factory calls = %d, want 0 before backend validation", startCalls)
+	}
+	if _, err := store.GetAgent(ctx, agentName); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("ephemeral agent lookup error = %v, want no materialized agent", err)
+	}
+	after, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob(after): %v", err)
+	}
+	if after.State != string(workflow.JobFailed) {
+		t.Fatalf("job state = %q, want failed", after.State)
 	}
 }
 
