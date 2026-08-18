@@ -153,8 +153,10 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	// background path deliberately leaves resolution to the claiming worker,
 	// which records a loud terminal failure for an invalid queued selection.
 	var foregroundAdapterFactory foregroundRuntimeAdapterFactory
+	var foregroundExecBackend execbackend.Backend
 	if !request.Background {
-		foregroundExecBackend, resolveErr := localAgentDispatchExecBackendFor(request.Home)
+		var resolveErr error
+		foregroundExecBackend, resolveErr = localAgentDispatchExecBackendFor(request.Home)
 		if resolveErr != nil {
 			return localAgentJobOutput{}, resolveErr
 		}
@@ -281,12 +283,24 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			return localAgentJobOutput{}, fmt.Errorf("runtime override: %w", err)
 		}
 	}
+	if !request.Background {
+		// The adapter factory closure already carries this selection, but the
+		// workflow engine also owns job-associated subprocesses (produce checks and
+		// result observation). Stamp the same resolved decision on the effective
+		// foreground agent so those routes cannot silently default back to Local.
+		effectiveAgent.ExecBackend = string(foregroundExecBackend)
+	}
 	if readOnlyImplementationBlocked(request.Action, effectiveAgent) {
 		return enqueuePermissionBlockedLocalAgentJob(ctx, store, request, repo.FullName(), record.DefaultBranch, agent.Name, overrideRuntime, overrideRef, orgPolicy)
 	}
 	var foregroundContract *runtime.RuntimeContractResult
 	if !request.Background {
-		result := localRuntimeContractPreflight(ctx, effectiveAgent)
+		result, err := runtimeContractPreflightForBackend(foregroundExecBackend, func() runtime.RuntimeContractResult {
+			return localRuntimeContractPreflight(ctx, effectiveAgent)
+		})
+		if err != nil {
+			return localAgentJobOutput{}, err
+		}
 		if err := runtime.RuntimeContractDispatchError(effectiveAgent, result); err != nil {
 			return localAgentJobOutput{}, err
 		}
@@ -582,7 +596,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		handled := false
 		if overrideRuntime == "" {
 			var abErr error
-			handled, abErr = maybeRunLiveAB(runCtx, store, request, agent, job, adapter, managed.OK)
+			handled, abErr = maybeRunLiveAB(runCtx, store, request, agent, job, adapter, managed.OK, foregroundExecBackend)
 			if abErr != nil {
 				recordRuntimeOutcome(abErr)
 				return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, abErr)

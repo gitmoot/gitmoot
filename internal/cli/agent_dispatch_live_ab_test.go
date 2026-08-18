@@ -11,6 +11,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -183,7 +184,7 @@ func TestMaybeRunLiveABOffByDefaultIsNoop(t *testing.T) {
 	withLiveABChallengerDeliver(t, &challengerCalls, "Challenger answer.", nil)
 	champ := &liveABChampionAdapter{summary: "Champion answer."}
 
-	handled, err := maybeRunLiveAB(context.Background(), store, request, agent, job, champ, true)
+	handled, err := maybeRunLiveAB(context.Background(), store, request, agent, job, champ, true, execbackend.Local)
 	if err != nil {
 		t.Fatalf("maybeRunLiveAB: %v", err)
 	}
@@ -207,7 +208,7 @@ func TestMaybeRunLiveABUnmanagedIsNoop(t *testing.T) {
 	withLiveABSampler(t, 0.0)
 	champ := &liveABChampionAdapter{summary: "Champion answer."}
 
-	handled, err := maybeRunLiveAB(context.Background(), store, request, agent, job, champ, false /* unmanaged */)
+	handled, err := maybeRunLiveAB(context.Background(), store, request, agent, job, champ, false /* unmanaged */, execbackend.Local)
 	if err != nil {
 		t.Fatalf("maybeRunLiveAB: %v", err)
 	}
@@ -229,7 +230,7 @@ func TestMaybeRunLiveABBelowFloorIsNoop(t *testing.T) {
 	withLiveABInteractive(t, true) // isolate: prove the FLOOR gate, not the tty gate
 	champ := &liveABChampionAdapter{summary: "Champion answer."}
 
-	handled, err := maybeRunLiveAB(context.Background(), store, request, agent, job, champ, true)
+	handled, err := maybeRunLiveAB(context.Background(), store, request, agent, job, champ, true, execbackend.Local)
 	if err != nil {
 		t.Fatalf("maybeRunLiveAB: %v", err)
 	}
@@ -251,7 +252,7 @@ func TestMaybeRunLiveABSamplingMissIsNoop(t *testing.T) {
 	withLiveABInteractive(t, true) // isolate: prove the SAMPLING gate, not the tty gate
 	champ := &liveABChampionAdapter{summary: "Champion answer."}
 
-	handled, err := maybeRunLiveAB(context.Background(), store, request, agent, job, champ, true)
+	handled, err := maybeRunLiveAB(context.Background(), store, request, agent, job, champ, true, execbackend.Local)
 	if err != nil {
 		t.Fatalf("maybeRunLiveAB: %v", err)
 	}
@@ -284,7 +285,7 @@ func TestMaybeRunLiveABInterceptsAndRecords(t *testing.T) {
 	}
 
 	champ := &liveABChampionAdapter{summary: "Champion answer."}
-	handled, err := maybeRunLiveAB(ctx, store, request, agent, job, champ, true)
+	handled, err := maybeRunLiveAB(ctx, store, request, agent, job, champ, true, execbackend.Local)
 	if err != nil {
 		t.Fatalf("maybeRunLiveAB: %v", err)
 	}
@@ -351,7 +352,7 @@ func TestMaybeRunLiveABSerializesChampionBeforeChallenger(t *testing.T) {
 	champ := &liveABChampionAdapter{summary: "Champion answer."}
 	champ.onDeliver = func() { order = append(order, "champion") }
 
-	handled, err := maybeRunLiveAB(context.Background(), store, request, agent, job, champ, true)
+	handled, err := maybeRunLiveAB(context.Background(), store, request, agent, job, champ, true, execbackend.Local)
 	if err != nil {
 		t.Fatalf("maybeRunLiveAB: %v", err)
 	}
@@ -396,7 +397,7 @@ func TestMaybeRunLiveABChallengerErrorFailSafe(t *testing.T) {
 	}
 
 	champ := &liveABChampionAdapter{summary: "Champion answer."}
-	handled, err := maybeRunLiveAB(ctx, store, request, agent, job, champ, true)
+	handled, err := maybeRunLiveAB(ctx, store, request, agent, job, champ, true, execbackend.Local)
 	if err != nil {
 		t.Fatalf("maybeRunLiveAB must be fail-safe (nil error), got %v", err)
 	}
@@ -563,7 +564,7 @@ func TestMaybeRunLiveABChallengerSuccessDoesNotClearConcurrentIncident(t *testin
 	t.Cleanup(func() { skillOptABDeliver = previousDeliver })
 
 	champion := &liveABChampionAdapter{summary: "Champion answer."}
-	handled, err := maybeRunLiveAB(ctx, store, request, agent, job, champion, true)
+	handled, err := maybeRunLiveAB(ctx, store, request, agent, job, champion, true, execbackend.Local)
 	if err != nil || !handled {
 		t.Fatalf("maybeRunLiveAB handled=%v err=%v", handled, err)
 	}
@@ -589,7 +590,7 @@ func TestMaybeRunLiveABNoPickFailSafe(t *testing.T) {
 	ctx := context.Background()
 
 	champ := &liveABChampionAdapter{summary: "Champion answer."}
-	handled, err := maybeRunLiveAB(ctx, store, request, agent, job, champ, true)
+	handled, err := maybeRunLiveAB(ctx, store, request, agent, job, champ, true, execbackend.Local)
 	if err != nil {
 		t.Fatalf("maybeRunLiveAB: %v", err)
 	}
@@ -713,7 +714,7 @@ func TestMaybeRunLiveABChallengerUsesForkedSession(t *testing.T) {
 	withLiveABPresenter(t, skillOptABChampionLabel, skillOptABChallengerLabel, true)
 
 	champ := &liveABChampionAdapter{summary: "Champion answer."}
-	handled, err := maybeRunLiveAB(context.Background(), store, request, agent, job, champ, true)
+	handled, err := maybeRunLiveAB(context.Background(), store, request, agent, job, champ, true, execbackend.Local)
 	if err != nil {
 		t.Fatalf("maybeRunLiveAB: %v", err)
 	}
@@ -743,7 +744,7 @@ func TestMaybeRunLiveABJSONOutputIsNoop(t *testing.T) {
 	withLiveABChallengerDeliver(t, &challengerCalls, "Challenger answer.", nil)
 	champ := &liveABChampionAdapter{summary: "Champion answer."}
 
-	handled, err := maybeRunLiveAB(context.Background(), store, request, agent, job, champ, true)
+	handled, err := maybeRunLiveAB(context.Background(), store, request, agent, job, champ, true, execbackend.Local)
 	if err != nil {
 		t.Fatalf("maybeRunLiveAB: %v", err)
 	}
@@ -773,7 +774,7 @@ func TestMaybeRunLiveABNonInteractiveIsNoop(t *testing.T) {
 	withLiveABChallengerDeliver(t, &challengerCalls, "Challenger answer.", nil)
 	champ := &liveABChampionAdapter{summary: "Champion answer."}
 
-	handled, err := maybeRunLiveAB(context.Background(), store, request, agent, job, champ, true)
+	handled, err := maybeRunLiveAB(context.Background(), store, request, agent, job, champ, true, execbackend.Local)
 	if err != nil {
 		t.Fatalf("maybeRunLiveAB: %v", err)
 	}

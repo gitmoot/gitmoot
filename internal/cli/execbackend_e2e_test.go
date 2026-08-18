@@ -364,6 +364,39 @@ func TestP2GapEveryJobAdapterConstructionRouteRefusesLocalFallback(t *testing.T)
 			t.Fatal("runtime session start accepted p2-probe without an implementation")
 		}
 	})
+	t.Run("one-shot runtime session", func(t *testing.T) {
+		_, err := deliverOneShotRuntimePrompt(context.Background(), runtime.Agent{
+			Runtime:     runtime.ShellRuntime,
+			ExecBackend: string(backend),
+		}, "must not run")
+		if err == nil {
+			t.Fatal("one-shot runtime session accepted p2-probe without an implementation")
+		}
+	})
+	t.Run("runtime contract preflight", func(t *testing.T) {
+		calls := 0
+		if _, err := runtimeContractPreflightForBackend(backend, func() runtime.RuntimeContractResult {
+			calls++
+			return runtime.RuntimeContractResult{}
+		}); err == nil {
+			t.Fatal("runtime contract preflight accepted p2-probe without an implementation")
+		}
+		if calls != 0 {
+			t.Fatalf("local runtime contract preflight calls = %d, want 0", calls)
+		}
+	})
+	t.Run("deferred auth probe", func(t *testing.T) {
+		calls := 0
+		if _, err := authProbeForBackend(backend, func() authProbeVerdict {
+			calls++
+			return authProbeValid
+		}); err == nil {
+			t.Fatal("deferred auth probe accepted p2-probe without an implementation")
+		}
+		if calls != 0 {
+			t.Fatalf("local deferred auth probe calls = %d, want 0", calls)
+		}
+	})
 	if localDeliveryCalls != 0 {
 		t.Fatalf("local delivery factory calls = %d, want 0", localDeliveryCalls)
 	}

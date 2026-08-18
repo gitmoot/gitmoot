@@ -10,6 +10,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -74,7 +75,7 @@ const liveABEventKind = "live_ab_skipped"
 // pick available, record failure) is swallowed, logged as a live_ab_skipped job
 // event, and reported as handled=true with a nil error so the user always gets
 // the champion answer and the primary ask is never degraded.
-func maybeRunLiveAB(ctx context.Context, store *db.Store, request localAgentDispatchRequest, agent db.Agent, job db.Job, adapter workflow.DeliveryAdapter, managed bool) (bool, error) {
+func maybeRunLiveAB(ctx context.Context, store *db.Store, request localAgentDispatchRequest, agent db.Agent, job db.Job, adapter workflow.DeliveryAdapter, managed bool, backend execbackend.Backend) (bool, error) {
 	// --- Cheap gates first (no I/O beyond the policy load); any miss is a no-op. ---
 	if strings.TrimSpace(request.Action) != "ask" {
 		return false, nil
@@ -134,7 +135,9 @@ func maybeRunLiveAB(ctx context.Context, store *db.Store, request localAgentDisp
 	// === Past this point we ARE intercepting (handled=true regardless of outcome). ===
 	// 1) Champion: the canonical answer the user receives, via the normal
 	//    Mailbox.Run path so the job/result are identical to a plain ask.
-	championResult, runErr := (workflow.Mailbox{Store: store, RuntimeDefaultModel: runtimeDefaultModelResolver(request.Home), RuntimeDefaultEffort: runtimeDefaultEffortResolver(request.Home)}).Run(ctx, job.ID, runtimeAgent(agent), adapter)
+	championAgent := runtimeAgent(agent)
+	championAgent.ExecBackend = string(backend)
+	championResult, runErr := (workflow.Mailbox{Store: store, RuntimeDefaultModel: runtimeDefaultModelResolver(request.Home), RuntimeDefaultEffort: runtimeDefaultEffortResolver(request.Home)}).Run(ctx, job.ID, championAgent, adapter)
 	if runErr != nil {
 		// The primary ask itself failed — surface it exactly as the non-intercepted
 		// path would (the caller propagates the same error).
@@ -150,7 +153,7 @@ func maybeRunLiveAB(ctx context.Context, store *db.Store, request localAgentDisp
 	//    the one already-held runtime-session lock. From here everything is
 	//    fail-safe: the champion already answered, so any error degrades to a
 	//    champion-only ask + a live_ab_skipped event.
-	if err := runLiveABChallenger(ctx, store, request, agent, job, templateID, champion, challenger, championAnswer); err != nil {
+	if err := runLiveABChallenger(ctx, store, request, agent, job, templateID, champion, challenger, championAnswer, backend); err != nil {
 		_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: liveABEventKind, Message: err.Error()})
 	}
 	return true, nil
@@ -160,7 +163,7 @@ func maybeRunLiveAB(ctx context.Context, store *db.Store, request localAgentDisp
 // captures the human pick, and records it through the #473 path. Every failure
 // returns an error the fail-safe caller logs as live_ab_skipped; the champion
 // answer is already delivered, so no error here ever degrades the user's ask.
-func runLiveABChallenger(ctx context.Context, store *db.Store, request localAgentDispatchRequest, agent db.Agent, job db.Job, templateID string, champion, challenger skillOptABVariant, championAnswer string) error {
+func runLiveABChallenger(ctx context.Context, store *db.Store, request localAgentDispatchRequest, agent db.Agent, job db.Job, templateID string, champion, challenger skillOptABVariant, championAnswer string, backend execbackend.Backend) error {
 	paths, err := pathsFromFlag(request.Home)
 	if err != nil {
 		return fmt.Errorf("live_ab resolve paths: %w", err)
@@ -187,6 +190,7 @@ func runLiveABChallenger(ctx context.Context, store *db.Store, request localAgen
 		Model:          agent.Model,
 		Effort:         agent.Effort,
 		ConfigHome:     request.Home,
+		ExecBackend:    string(backend),
 	}
 	prompt := strings.TrimSpace(request.Instructions)
 

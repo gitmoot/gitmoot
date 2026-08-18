@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -158,9 +159,29 @@ func (w jobWorker) defaultAuthProbe(ctx context.Context, job db.Job, payload wor
 	if strings.TrimSpace(agent.Runtime) != runtime.ClaudeRuntime {
 		return authProbeUnknown
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, authProbeTimeout)
-	defer cancel()
-	return classifyClaudeAuthProbe(runtime.ClaudeLiveCheck(probeCtx, nil, ""))
+	jobBackend, jobBackendPresent := payload.ExecBackendOverride()
+	backend, err := daemonJobExecBackendFor(w, jobBackend, jobBackendPresent)
+	if err != nil {
+		// run() owns the loud terminal selector failure. This scheduler gate is
+		// advisory; an unresolved backend must not launch a host probe, and Unknown
+		// lets the queued job reach run() where the canonical error is persisted.
+		return authProbeUnknown
+	}
+	verdict, err := authProbeForBackend(backend, func() authProbeVerdict {
+		probeCtx, cancel := context.WithTimeout(ctx, authProbeTimeout)
+		defer cancel()
+		return classifyClaudeAuthProbe(runtime.ClaudeLiveCheck(probeCtx, nil, ""))
+	})
+	if err != nil {
+		return authProbeUnknown
+	}
+	return verdict
+}
+
+func authProbeForBackend(backend execbackend.Backend, local func() authProbeVerdict) (authProbeVerdict, error) {
+	return execbackend.Consume(backend, func() (authProbeVerdict, error) {
+		return local(), nil
+	})
 }
 
 // classifyClaudeAuthProbe maps a runtime.ClaudeLiveCheck result to an

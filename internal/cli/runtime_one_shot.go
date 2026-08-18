@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
@@ -19,7 +20,15 @@ func deliverOneShotRuntimePrompt(ctx context.Context, agent runtime.Agent, promp
 	if adapterDir == "" {
 		adapterDir = agent.RepoScope
 	}
-	adapter, err := runtimeAdapterFor(agent.ConfigHome, agent.Runtime, adapterDir)
+	backend := execbackend.Local
+	if strings.TrimSpace(agent.ExecBackend) != "" {
+		var err error
+		backend, err = execbackend.ParseImplemented(agent.ExecBackend)
+		if err != nil {
+			return "", err
+		}
+	}
+	adapter, err := startRuntimeAdapterForBackend(backend, agent.ConfigHome, agent.Runtime, adapterDir)
 	if err != nil {
 		return "", err
 	}

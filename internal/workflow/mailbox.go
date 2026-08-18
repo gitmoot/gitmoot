@@ -15,6 +15,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/evidence"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/prompts"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -1064,6 +1065,10 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	if err != nil {
 		return AgentResult{}, err
 	}
+	execBackend, err := jobExecutionBackend(agent)
+	if err != nil {
+		return AgentResult{}, err
+	}
 	// A retried job must never carry a previous run's crash report (#806):
 	// reset before this run's deliveries so every payload persist below — a
 	// success terminal included — writes fresh diagnostics state.
@@ -1276,7 +1281,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	// token usage on the same job row.
 	if job.Type == "produce" && strings.TrimSpace(payload.Check) != "" {
 		for correction := 0; ; correction++ {
-			checkOutput, checkErr := runProduceCheck(ctx, payload, m.produceCheckDir, m.produceCheckTimeout)
+			checkOutput, checkErr := runProduceCheck(ctx, payload, m.produceCheckDir, m.produceCheckTimeout, execBackend)
 			if checkErr == nil {
 				break
 			}
@@ -1372,7 +1377,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	}
 	payload.Result = &result
 	if strings.EqualFold(strings.TrimSpace(job.Type), "implement") {
-		payload.ResultObservation = observeResultChanges(ctx, payload.WorktreePath, result)
+		payload.ResultObservation = observeResultChanges(ctx, payload.WorktreePath, result, execBackend)
 	}
 	// #526 deterministic binary-checklist audit of the parsed result. The worktree
 	// observation above is recorded in every mode. Off (the zero value and "off")
@@ -1432,7 +1437,14 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 const maxProduceCheckOutputBytes = 8 * 1024
 const defaultProduceCheckTimeout = 2 * time.Minute
 
-func runProduceCheck(ctx context.Context, payload JobPayload, fallbackDir string, timeout time.Duration) (string, error) {
+func jobExecutionBackend(agent runtime.Agent) (execbackend.Backend, error) {
+	if strings.TrimSpace(agent.ExecBackend) == "" {
+		return execbackend.Local, nil
+	}
+	return execbackend.ParseImplemented(agent.ExecBackend)
+}
+
+func runProduceCheck(ctx context.Context, payload JobPayload, fallbackDir string, timeout time.Duration, backend execbackend.Backend) (string, error) {
 	dir := strings.TrimSpace(payload.WorktreePath)
 	if dir == "" {
 		dir = strings.TrimSpace(fallbackDir)
@@ -1442,7 +1454,9 @@ func runProduceCheck(ctx context.Context, payload JobPayload, fallbackDir string
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	result, err := (subprocess.GroupRunner{MaxOutputBytes: 2 * maxProduceCheckOutputBytes}).Run(checkCtx, dir, "sh", "-c", payload.Check)
+	result, err := execbackend.Consume(backend, func() (subprocess.Result, error) {
+		return (subprocess.GroupRunner{MaxOutputBytes: 2 * maxProduceCheckOutputBytes}).Run(checkCtx, dir, "sh", "-c", payload.Check)
+	})
 	return sanitizeProduceCheckOutput(result.Stdout + result.Stderr), err
 }
 

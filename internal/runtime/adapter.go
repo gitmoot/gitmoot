@@ -76,9 +76,10 @@ type Agent struct {
 	ChatSeat bool
 	// ExecBackend is the execution backend resolved for THIS job at dispatch
 	// (#1536 P1) from [remote_exec].backend plus the payload's exec_backend
-	// override. The daemon stamps it in-memory before adapter construction so
-	// the selection reaches the runner-composition chain; "local" (the only
-	// implemented backend) leaves that composition byte-for-byte unchanged.
+	// override. Dispatch stamps it in-memory before adapter construction so the
+	// same selection reaches runtime preflight, lifecycle, workflow-owned checks,
+	// and result observation; "local" (the only implemented backend) leaves those
+	// paths byte-for-byte unchanged.
 	// Empty — every construction site that does not stamp it (direct adapter
 	// builds, tests, `agent start`) — selects the same local default. In-memory
 	// only; never persisted on the agents table.

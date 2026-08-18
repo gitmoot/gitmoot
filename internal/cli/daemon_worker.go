@@ -283,7 +283,13 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// secondary adapter rebuild consumes the same backend selection.
 	agent.ExecBackend = string(execBackend)
 	preflightRequest := runtime.RuntimeContractRequest{Plan: payload.Plan}
-	if result, checked := w.runtimeContractPreflight(ctx, agent, preflightRequest); checked {
+	if result, checked, preflightErr := w.runtimeContractPreflight(ctx, execBackend, agent, preflightRequest); preflightErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, preflightErr); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, "", preflightErr)
+		return nil
+	} else if checked {
 		if err := runtime.RuntimeContractDispatchError(agent, result); err != nil {
 			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, err); finishErr != nil {
 				return finishErr
@@ -888,11 +894,20 @@ func payloadWithImplementationPreflightRetry(raw string, payload workflow.JobPay
 	return string(encoded), nil
 }
 
-func (w jobWorker) runtimeContractPreflight(ctx context.Context, agent runtime.Agent, request runtime.RuntimeContractRequest) (runtime.RuntimeContractResult, bool) {
+func runtimeContractPreflightForBackend(backend execbackend.Backend, local func() runtime.RuntimeContractResult) (runtime.RuntimeContractResult, error) {
+	return execbackend.Consume(backend, func() (runtime.RuntimeContractResult, error) {
+		return local(), nil
+	})
+}
+
+func (w jobWorker) runtimeContractPreflight(ctx context.Context, backend execbackend.Backend, agent runtime.Agent, request runtime.RuntimeContractRequest) (runtime.RuntimeContractResult, bool, error) {
 	if w.RuntimePreflight == nil {
-		return runtime.RuntimeContractResult{}, false
+		return runtime.RuntimeContractResult{}, false, nil
 	}
-	return w.RuntimePreflight(ctx, agent, request), true
+	result, err := runtimeContractPreflightForBackend(backend, func() runtime.RuntimeContractResult {
+		return w.RuntimePreflight(ctx, agent, request)
+	})
+	return result, true, err
 }
 
 func (w jobWorker) lookupAgent(ctx context.Context, name string) (db.Agent, error) {
