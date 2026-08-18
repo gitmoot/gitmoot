@@ -462,7 +462,8 @@ type GhClient struct {
 	// uses the package-global DefaultLimiter() so every GhClient constructed via
 	// NewClient shares one budget + one secondary-rate-limit backoff window. Tests
 	// set it to an isolated limiter (fake clock) to exercise smoothing/backoff.
-	Limiter *RateLimiter
+	Limiter        *RateLimiter
+	runnerRequired bool
 
 	mutateMu sync.Mutex
 	statsMu  sync.Mutex
@@ -471,6 +472,26 @@ type GhClient struct {
 
 func NewClient(dir string) *GhClient {
 	return &GhClient{Dir: dir}
+}
+
+func NewClientWithRunner(dir string, runner subprocess.Runner) *GhClient {
+	return &GhClient{Dir: dir, Runner: runner, runnerRequired: true}
+}
+
+// WithRunner returns an equivalent client bound to dir and runner. Runtime
+// counters and mutexes are intentionally fresh; policy seams are preserved.
+func (c *GhClient) WithRunner(dir string, runner subprocess.Runner) *GhClient {
+	if c == nil {
+		return NewClientWithRunner(dir, runner)
+	}
+	return &GhClient{
+		Runner:         runner,
+		Dir:            dir,
+		Sleep:          c.Sleep,
+		MaxRetries:     c.MaxRetries,
+		Limiter:        c.Limiter,
+		runnerRequired: true,
+	}
 }
 
 func (c *GhClient) Ping(ctx context.Context) error {
@@ -1533,6 +1554,9 @@ func (c *GhClient) runRequest(ctx context.Context, mutate bool, conditional bool
 
 	runner := c.Runner
 	if runner == nil {
+		if c.runnerRequired {
+			return subprocess.Result{}, errors.New("GitHub client requires an explicit subprocess runner")
+		}
 		runner = subprocess.ExecRunner{}
 	}
 	retries := c.MaxRetries

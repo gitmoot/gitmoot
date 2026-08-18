@@ -904,7 +904,11 @@ func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, rec
 		return localAgentDispatchRequest{}, errors.New("agent review requires --pr number")
 	}
 	if strings.TrimSpace(request.Branch) == "" || strings.TrimSpace(request.HeadSHA) == "" {
-		pr, err := newAgentDispatchGitHubClient(record.CheckoutPath).GetPullRequest(ctx, repo, int64(request.PullRequest))
+		pr, err := jobGitHubClient(
+			record.CheckoutPath,
+			newAgentDispatchGitHubClient(record.CheckoutPath),
+			localDispatchJobRunner(request),
+		).GetPullRequest(ctx, repo, int64(request.PullRequest))
 		if err != nil {
 			return localAgentDispatchRequest{}, fmt.Errorf("resolve pull request #%d: %w", request.PullRequest, err)
 		}
@@ -1176,7 +1180,11 @@ func prepareLocalImplementDispatchRequest(ctx context.Context, store *db.Store, 
 }
 
 func bindLocalImplementRequestToPullRequest(ctx context.Context, store *db.Store, record db.Repo, repo github.Repository, request localAgentDispatchRequest) (localAgentDispatchRequest, error) {
-	pr, err := newAgentDispatchGitHubClient(record.CheckoutPath).GetPullRequest(ctx, repo, int64(request.PullRequest))
+	pr, err := jobGitHubClient(
+		record.CheckoutPath,
+		newAgentDispatchGitHubClient(record.CheckoutPath),
+		localDispatchJobRunner(request),
+	).GetPullRequest(ctx, repo, int64(request.PullRequest))
 	if err != nil {
 		return localAgentDispatchRequest{}, fmt.Errorf("resolve pull request #%d for implement fix-pass: %w", request.PullRequest, err)
 	}

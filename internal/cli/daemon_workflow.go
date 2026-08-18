@@ -41,6 +41,7 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 }
 
 func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout string, home string, runner subprocess.Runner) workflow.Engine {
+	gh = jobGitHubClient(checkout, gh, runner)
 	engine := workflow.Engine{
 		Store:                   store,
 		RequireWorkflowPolicy:   requireWorkflowPolicyResolverRoot(home),
@@ -164,7 +165,7 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 		engine.ArtifactRoot = home
 		engine.BeforeReadOnlyWorktreeCleanup = composeBeforeReadOnlyWorktreeCleanupHooks(
 			pipeline.PipelineServiceArtifactPrecleanupHook(store, config.Paths{Home: home}),
-			askReviewDiffPrecleanupHook(store),
+			askReviewDiffPrecleanupHookForRunner(store, runner),
 		)
 	}
 	if strings.TrimSpace(home) != "" && strings.TrimSpace(checkout) != "" {
@@ -605,13 +606,7 @@ func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Contex
 }
 
 func (f daemonImplementationFinalizer) githubClient(checkout string) github.Client {
-	if f.GitHub == nil {
-		return github.NewClient(checkout)
-	}
-	if _, ok := f.GitHub.(*github.GhClient); ok {
-		return github.NewClient(checkout)
-	}
-	return f.GitHub
+	return jobGitHubClient(checkout, f.GitHub, f.Runner)
 }
 
 func (f daemonImplementationFinalizer) revalidateImplementationPullRequest(ctx context.Context, payload workflow.JobPayload, task db.Task, worktreePath string) (github.PullRequest, bool, error) {
@@ -923,13 +918,7 @@ func nativeMergeGateDisabled() bool {
 }
 
 func (g daemonMergeGate) githubClient(checkout string) github.Client {
-	if g.GitHub == nil {
-		return github.NewClient(checkout)
-	}
-	if _, ok := g.GitHub.(*github.GhClient); ok {
-		return github.NewClient(checkout)
-	}
-	return g.GitHub
+	return jobGitHubClient(checkout, g.GitHub, g.Runner)
 }
 
 func newDaemonPolicyMergeGate(store *db.Store, gh github.Client, checkout string) workflow.PolicyMergeGate {

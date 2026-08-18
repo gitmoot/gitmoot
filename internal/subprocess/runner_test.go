@@ -23,6 +23,28 @@ func TestRunCapturesStdout(t *testing.T) {
 	}
 }
 
+func TestExecRunnerRunExactEnvDoesNotInheritHost(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell command differs on windows")
+	}
+
+	t.Setenv("GITMOOT_EXACT_ENV_AMBIENT", "must-not-leak")
+	result, err := (ExecRunner{}).RunExactEnv(
+		context.Background(),
+		"",
+		[]string{"GITMOOT_EXACT_ENV_VALUE=exact"},
+		"sh",
+		"-c",
+		`printf '%s|%s' "$GITMOOT_EXACT_ENV_VALUE" "${GITMOOT_EXACT_ENV_AMBIENT-unset}"`,
+	)
+	if err != nil {
+		t.Fatalf("RunExactEnv returned error: %v", err)
+	}
+	if result.Stdout != "exact|unset" {
+		t.Fatalf("stdout = %q, want exact environment without ambient variables", result.Stdout)
+	}
+}
+
 func TestGroupRunnerPIDCaptureReportsStartedProcess(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("PID assertion uses a POSIX shell")

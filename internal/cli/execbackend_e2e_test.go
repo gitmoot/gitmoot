@@ -20,6 +20,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
+	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -58,6 +59,14 @@ type p2ProbeSubprocessRunner struct {
 func (r *p2ProbeSubprocessRunner) Run(context.Context, string, string, ...string) (subprocess.Result, error) {
 	r.calls++
 	return subprocess.Result{}, errP2ProbeSubprocessReached
+}
+
+func (r *p2ProbeSubprocessRunner) RunEnv(ctx context.Context, dir string, _ []string, command string, args ...string) (subprocess.Result, error) {
+	return r.Run(ctx, dir, command, args...)
+}
+
+func (r *p2ProbeSubprocessRunner) RunExactEnv(ctx context.Context, dir string, _ []string, command string, args ...string) (subprocess.Result, error) {
+	return r.Run(ctx, dir, command, args...)
 }
 
 func (r *p2ProbeSubprocessRunner) LookPath(string) (string, error) {
@@ -495,18 +504,68 @@ func TestJobCheckoutRouteConsumesResolvedSubprocessRunner(t *testing.T) {
 	}
 }
 
+func TestReadOnlyDiffRouteConsumesResolvedSubprocessRunner(t *testing.T) {
+	runner := &p2ProbeSubprocessRunner{}
+	if _, _, err := captureReadOnlyWorktreeDiffForRunner(context.Background(), t.TempDir(), runner); !errors.Is(err, errP2ProbeSubprocessReached) {
+		t.Fatalf("diff capture error = %v, want resolved p2-probe runner refusal", err)
+	}
+	if runner.calls == 0 {
+		t.Fatal("read-only diff route ignored the resolved p2-probe subprocess runner")
+	}
+}
+
+func TestJobGitHubClientConsumesResolvedSubprocessRunner(t *testing.T) {
+	runner := &p2ProbeSubprocessRunner{}
+	source := &github.GhClient{
+		MaxRetries: 1,
+		Limiter:    github.NewRateLimiter(github.RateLimiterConfig{}),
+	}
+	client := jobGitHubClient(t.TempDir(), source, runner)
+	if err := client.Ping(context.Background()); !errors.Is(err, errP2ProbeSubprocessReached) {
+		t.Fatalf("GitHub client error = %v, want resolved p2-probe runner refusal", err)
+	}
+	if runner.calls == 0 {
+		t.Fatal("job GitHub client ignored the resolved p2-probe subprocess runner")
+	}
+}
+
+func TestDaemonWorkflowGitHubRoutesConsumeResolvedSubprocessRunner(t *testing.T) {
+	runner := &p2ProbeSubprocessRunner{}
+	source := &github.GhClient{
+		MaxRetries: 1,
+		Limiter:    github.NewRateLimiter(github.RateLimiterConfig{}),
+	}
+	checkout := t.TempDir()
+	engine := daemonWorkflowEngineForRunner(nil, source, checkout, "", runner)
+	finalizer, ok := engine.ImplementationFinalizer.(daemonImplementationFinalizer)
+	if !ok {
+		t.Fatalf("implementation finalizer = %T, want daemonImplementationFinalizer", engine.ImplementationFinalizer)
+	}
+	if err := finalizer.githubClient(checkout).Ping(context.Background()); !errors.Is(err, errP2ProbeSubprocessReached) {
+		t.Fatalf("finalizer GitHub error = %v, want resolved p2-probe runner refusal", err)
+	}
+	gate, ok := engine.MergeGate.(daemonMergeGate)
+	if !ok {
+		t.Fatalf("merge gate = %T, want daemonMergeGate", engine.MergeGate)
+	}
+	if err := gate.githubClient(checkout).Ping(context.Background()); !errors.Is(err, errP2ProbeSubprocessReached) {
+		t.Fatalf("merge-gate GitHub error = %v, want resolved p2-probe runner refusal", err)
+	}
+}
+
 // TestJobSubprocessProductionRoutesDoNotCallHostWrappers binds the package
 // contract to every production call site. The wrappers remain for focused
 // legacy tests only; using one from non-test code would silently substitute an
 // ExecRunner and bypass the resolved backend.
 func TestJobSubprocessProductionRoutesDoNotCallHostWrappers(t *testing.T) {
 	forbidden := map[string]struct{}{
-		"defaultCheckout":            {},
-		"resolveJobCheckout":         {},
-		"healRegisteredRepoCheckout": {},
-		"validateTargetCheckout":     {},
-		"validateReviewCheckout":     {},
-		"resyncReviewHead":           {},
+		"defaultCheckout":             {},
+		"resolveJobCheckout":          {},
+		"healRegisteredRepoCheckout":  {},
+		"validateTargetCheckout":      {},
+		"validateReviewCheckout":      {},
+		"resyncReviewHead":            {},
+		"askReviewDiffPrecleanupHook": {},
 	}
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -534,6 +593,16 @@ func TestJobSubprocessProductionRoutesDoNotCallHostWrappers(t *testing.T) {
 			}
 			if _, blocked := forbidden[selector.Sel.Name]; blocked {
 				violations = append(violations, fset.Position(selector.Sel.Pos()).String())
+			}
+			if pkg, ok := selector.X.(*ast.Ident); ok && pkg.Name == "exec" &&
+				(selector.Sel.Name == "Command" || selector.Sel.Name == "CommandContext") && len(call.Args) != 0 {
+				commandArg := call.Args[0]
+				if selector.Sel.Name == "CommandContext" && len(call.Args) > 1 {
+					commandArg = call.Args[1]
+				}
+				if literal, ok := commandArg.(*ast.BasicLit); ok && (literal.Value == `"git"` || literal.Value == `"gh"`) {
+					violations = append(violations, fset.Position(selector.Sel.Pos()).String())
+				}
 			}
 			return true
 		})

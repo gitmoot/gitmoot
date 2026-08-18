@@ -4,6 +4,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
+	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
 
@@ -53,4 +54,14 @@ var _ subprocess.Runner = localJobSubprocessRunner{}
 
 func jobGitClient(dir string, runner subprocess.Runner) gitutil.Client {
 	return gitutil.NewClient(dir, runner)
+}
+
+func jobGitHubClient(dir string, client github.Client, runner subprocess.Runner) github.Client {
+	if gh, ok := client.(*github.GhClient); ok {
+		return gh.WithRunner(dir, runner)
+	}
+	if client != nil {
+		return client
+	}
+	return github.NewClientWithRunner(dir, runner)
 }
