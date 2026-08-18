@@ -19,6 +19,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/permissionpolicy"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
@@ -50,7 +51,7 @@ type jobWorker struct {
 	// inject an opaque fake AdapterFactory may leave this nil and still exercise
 	// elapsed-only progress without replacing their fake.
 	OutputAdapterFactory func(runtime.Agent, string, io.Writer) (workflow.DeliveryAdapter, error)
-	StartAdapterFactory  func(string, string) (runtime.Adapter, error)
+	StartAdapterFactory  func(execbackend.Backend, string, string) (runtime.Adapter, error)
 	CheckoutValidator    func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error)
 	WorkflowFactory      func(string) workflow.Engine
 	CommenterFactory     func(string) github.Client
@@ -198,13 +199,26 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			return nil
 		}
 	}
+	// Resolve WHERE the runtime executes before any path can construct or start
+	// an adapter. In particular, ephemeral jobs materialize and start a host
+	// runtime below, so delaying this decision until after agent lookup would let
+	// them bypass the backend boundary entirely.
+	jobExecBackend, jobExecBackendPresent := payload.ExecBackendOverride()
+	execBackend, err := daemonJobExecBackendFor(w, jobExecBackend, jobExecBackendPresent)
+	if err != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, "", err)
+		return nil
+	}
 	// An ephemeral child carries an inline worker spec instead of a
 	// pre-registered agent. Materialize a throwaway agent + runtime session
 	// from the spec before the normal flow runs (which assumes the agent
 	// already exists via GetAgent below), and register a cleanup defer so the
 	// worker is auto-disposed on every exit path — success, failure, or block.
 	if payload.Ephemeral != nil {
-		if err := w.startEphemeralWorker(ctx, job, payload); err != nil {
+		if err := w.startEphemeralWorker(ctx, job, payload, execBackend); err != nil {
 			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "ephemeral_worker_failed", Message: err.Error()}); eventErr != nil {
 				return eventErr
 			}
@@ -265,8 +279,17 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if !overridden {
 		agent = scopeRegisteredFreshRefForJob(agent, job.ID)
 	}
+	// Stamp the already-resolved decision on the in-memory job agent so every
+	// secondary adapter rebuild consumes the same backend selection.
+	agent.ExecBackend = string(execBackend)
 	preflightRequest := runtime.RuntimeContractRequest{Plan: payload.Plan}
-	if result, checked := w.runtimeContractPreflight(ctx, agent, preflightRequest); checked {
+	if result, checked, preflightErr := w.runtimeContractPreflight(ctx, execBackend, agent, preflightRequest); preflightErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, preflightErr); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, "", preflightErr)
+		return nil
+	} else if checked {
 		if err := runtime.RuntimeContractDispatchError(agent, result); err != nil {
 			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, err); finishErr != nil {
 				return finishErr
@@ -367,9 +390,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	var adapter workflow.DeliveryAdapter
 	var relayToken string
 	if progressTracker != nil {
-		adapter, relayToken, err = w.buildSeatAwareAdapter(&agent, checkout, payload, progressTracker)
+		adapter, relayToken, err = w.buildSeatAwareAdapterForBackend(execBackend, &agent, checkout, payload, progressTracker)
 	} else {
-		adapter, relayToken, err = w.buildSeatAwareAdapter(&agent, checkout, payload)
+		adapter, relayToken, err = w.buildSeatAwareAdapterForBackend(execBackend, &agent, checkout, payload)
 	}
 	if relayToken != "" {
 		defer w.RelayServer.ReleaseSeat(relayToken)
@@ -458,7 +481,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "temp_worker_eligible", Message: eligibleMessage}); eventErr != nil {
 				return eventErr
 			}
-			return w.runWithTempWorker(ctx, job, payload, agent, checkout, policy, eligibleMessage, warningRecorded)
+			return w.runWithTempWorker(ctx, job, payload, execBackend, agent, checkout, policy, eligibleMessage, warningRecorded)
 		} else if strings.TrimSpace(eligibility.Reason) != "" {
 			message = fmt.Sprintf("%s; temp worker ineligible: %s", message, eligibility.Reason)
 		}
@@ -871,11 +894,20 @@ func payloadWithImplementationPreflightRetry(raw string, payload workflow.JobPay
 	return string(encoded), nil
 }
 
-func (w jobWorker) runtimeContractPreflight(ctx context.Context, agent runtime.Agent, request runtime.RuntimeContractRequest) (runtime.RuntimeContractResult, bool) {
+func runtimeContractPreflightForBackend(backend execbackend.Backend, local func() runtime.RuntimeContractResult) (runtime.RuntimeContractResult, error) {
+	return execbackend.Consume(backend, func() (runtime.RuntimeContractResult, error) {
+		return local(), nil
+	})
+}
+
+func (w jobWorker) runtimeContractPreflight(ctx context.Context, backend execbackend.Backend, agent runtime.Agent, request runtime.RuntimeContractRequest) (runtime.RuntimeContractResult, bool, error) {
 	if w.RuntimePreflight == nil {
-		return runtime.RuntimeContractResult{}, false
+		return runtime.RuntimeContractResult{}, false, nil
 	}
-	return w.RuntimePreflight(ctx, agent, request), true
+	result, err := runtimeContractPreflightForBackend(backend, func() runtime.RuntimeContractResult {
+		return w.RuntimePreflight(ctx, agent, request)
+	})
+	return result, true, err
 }
 
 func (w jobWorker) lookupAgent(ctx context.Context, name string) (db.Agent, error) {
@@ -1263,6 +1295,40 @@ func (w jobWorker) parallelSessionPolicy() (config.ParallelSessionPolicy, error)
 		return config.ParallelSessionPolicy{}, err
 	}
 	return config.LoadParallelSessionPolicy(paths)
+}
+
+// resolveExecBackend resolves the effective execution backend for one job
+// (#1536 P1): the optional [remote_exec] section (default "local") overridden
+// by the payload's exec_backend field. It is read per dispatch — like
+// [credentials] — so a config edit takes effect without daemon reload
+// plumbing. A missing config file or section resolves to local; an unknown
+// value (config or override) is a hard error naming the value and the allowed
+// set — the fail-loud contract, never a silent fallback.
+func (w jobWorker) resolveExecBackend(jobOverride string, jobOverridePresent bool) (execbackend.Backend, error) {
+	cfg := config.DefaultRemoteExecConfig()
+	if w.ConfigHomeExplicit || strings.TrimSpace(w.ConfigHome) != "" {
+		paths, err := w.configPaths()
+		if err != nil {
+			return "", err
+		}
+		loaded, loadErr := config.LoadRemoteExecConfig(paths)
+		switch {
+		case loadErr == nil:
+			cfg = loaded
+		case errors.Is(loadErr, os.ErrNotExist):
+			// No config file: the local default applies.
+		default:
+			return "", fmt.Errorf("load [remote_exec] config: %w", loadErr)
+		}
+	}
+	if jobOverridePresent {
+		return execbackend.Resolve(cfg.Backend, &jobOverride)
+	}
+	return execbackend.Resolve(cfg.Backend, nil)
+}
+
+var daemonJobExecBackendFor = func(w jobWorker, jobOverride string, jobOverridePresent bool) (execbackend.Backend, error) {
+	return w.resolveExecBackend(jobOverride, jobOverridePresent)
 }
 
 // repoConcurrency loads the per-repo [repos."owner/repo"] scheduler overrides
@@ -1781,8 +1847,8 @@ type tempWorkerStartResult struct {
 	JobTimeout  time.Duration
 }
 
-func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload workflow.JobPayload, original runtime.Agent, checkout string, policy config.ParallelSessionPolicy, reason string, observePermissionPolicy bool) error {
-	started, err := w.startTempWorker(ctx, job, payload, original, checkout)
+func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload workflow.JobPayload, backend execbackend.Backend, original runtime.Agent, checkout string, policy config.ParallelSessionPolicy, reason string, observePermissionPolicy bool) error {
+	started, err := w.startTempWorker(ctx, job, payload, backend, original, checkout)
 	if err != nil {
 		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "temp_worker_failed", Message: err.Error()}); eventErr != nil {
 			return eventErr
@@ -1827,7 +1893,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	// admission token: this read can observe a cancel/retry generation that raced
 	// after job was admitted. Every pre-flight terminal write below therefore
 	// remains anchored to job, while runtime work uses delegatedJob's metadata.
-	adapter, err := w.AdapterFactory(started.Agent, checkout)
+	adapter, err := w.deliveryAdapterForBackend(backend, started.Agent, checkout)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
@@ -2091,7 +2157,7 @@ func compactMergeBackStrings(values []string) []string {
 	return out
 }
 
-func (w jobWorker) startTempWorker(ctx context.Context, job db.Job, payload workflow.JobPayload, original runtime.Agent, checkout string) (tempWorkerStartResult, error) {
+func (w jobWorker) startTempWorker(ctx context.Context, job db.Job, payload workflow.JobPayload, backend execbackend.Backend, original runtime.Agent, checkout string) (tempWorkerStartResult, error) {
 	idleTimeout := 20 * time.Minute
 	managed, err := w.managedJobConfig(ctx, original.Name)
 	if err != nil {
@@ -2138,7 +2204,7 @@ func (w jobWorker) startTempWorker(ctx context.Context, job db.Job, payload work
 	if err := w.Store.UpsertAgentInstance(ctx, reserved); err != nil {
 		return tempWorkerStartResult{}, err
 	}
-	adapter, err := w.StartAdapterFactory(tempAgent.Runtime, checkout)
+	adapter, err := w.StartAdapterFactory(backend, tempAgent.Runtime, checkout)
 	if err != nil {
 		_ = w.Store.DeleteAgentInstance(context.Background(), reserved.Name)
 		return tempWorkerStartResult{}, err
@@ -2172,7 +2238,7 @@ func (w jobWorker) startTempWorker(ctx context.Context, job db.Job, payload work
 // already the engine-assigned "-ephemeral-" name; callers register a deferred
 // cleanupTempWorker to auto-dispose the worker on every exit path. The worker
 // runs read-only unless the spec opts into a writable autonomy policy.
-func (w jobWorker) startEphemeralWorker(ctx context.Context, job db.Job, payload workflow.JobPayload) (err error) {
+func (w jobWorker) startEphemeralWorker(ctx context.Context, job db.Job, payload workflow.JobPayload, backend execbackend.Backend) (err error) {
 	spec := payload.Ephemeral
 	if spec == nil {
 		return errors.New("ephemeral worker requires a spec")
@@ -2204,6 +2270,7 @@ func (w jobWorker) startEphemeralWorker(ctx context.Context, job db.Job, payload
 		Capabilities:   capabilities,
 		AutonomyPolicy: policy,
 		RepoScope:      payload.Repo,
+		ExecBackend:    string(backend),
 	}
 	// Persisting with RepoScope set associates the worker with payload.Repo
 	// (agent_repos), mirroring how a normal agent gains repo access.
@@ -2257,7 +2324,7 @@ func (w jobWorker) startEphemeralWorker(ctx context.Context, job db.Job, payload
 	if err := w.Store.UpsertAgentInstance(ctx, reserved); err != nil {
 		return err
 	}
-	adapter, err := w.StartAdapterFactory(ephemeralAgent.Runtime, checkout)
+	adapter, err := w.StartAdapterFactory(backend, ephemeralAgent.Runtime, checkout)
 	if err != nil {
 		return err
 	}
@@ -2757,6 +2824,40 @@ func (w jobWorker) outputAdapter(agent runtime.Agent, checkout string, out io.Wr
 // and drop the env runner — never fires for a seat. If that ever changes, thread
 // the relay env into the cockpit rebuild too.
 func (w jobWorker) buildSeatAwareAdapter(agent *runtime.Agent, checkout string, payload workflow.JobPayload, output ...io.Writer) (workflow.DeliveryAdapter, string, error) {
+	backend := execbackend.Local
+	if strings.TrimSpace(agent.ExecBackend) != "" {
+		resolved, err := execbackend.ParseImplemented(agent.ExecBackend)
+		if err != nil {
+			return nil, "", err
+		}
+		backend = resolved
+	}
+	return w.buildSeatAwareAdapterForBackend(backend, agent, checkout, payload, output...)
+}
+
+// buildSeatAwareAdapterForBackend consumes the already-resolved backend at the
+// daemon's adapter boundary. Adding a name to the selector's implemented set is
+// insufficient: a new backend must extend execbackend.Consume and supply its
+// builder at every compiler-identified call site before it can execute.
+func (w jobWorker) buildSeatAwareAdapterForBackend(backend execbackend.Backend, agent *runtime.Agent, checkout string, payload workflow.JobPayload, output ...io.Writer) (workflow.DeliveryAdapter, string, error) {
+	type result struct {
+		adapter workflow.DeliveryAdapter
+		token   string
+	}
+	consumed, err := execbackend.Consume(backend, func() (result, error) {
+		adapter, token, err := w.buildLocalSeatAwareAdapter(agent, checkout, payload, output...)
+		return result{adapter: adapter, token: token}, err
+	})
+	return consumed.adapter, consumed.token, err
+}
+
+func (w jobWorker) deliveryAdapterForBackend(backend execbackend.Backend, agent runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {
+	return execbackend.Consume(backend, func() (workflow.DeliveryAdapter, error) {
+		return w.AdapterFactory(agent, checkout)
+	})
+}
+
+func (w jobWorker) buildLocalSeatAwareAdapter(agent *runtime.Agent, checkout string, payload workflow.JobPayload, output ...io.Writer) (workflow.DeliveryAdapter, string, error) {
 	if w.RelayServer == nil || !payload.MootSeat || strings.TrimSpace(payload.ThreadID) == "" {
 		if len(output) > 0 && output[0] != nil && w.OutputAdapterFactory != nil {
 			adapter, err := w.OutputAdapterFactory(*agent, checkout, output[0])
@@ -2799,6 +2900,27 @@ func (w jobWorker) buildSeatAwareAdapter(agent *runtime.Agent, checkout string, 
 // wrappers still append their environment last and preserve result capture,
 // cancellation, and live output.
 func buildRuntimeAdapter(home string, agent runtime.Agent, checkout string, runner subprocess.Runner) (workflow.DeliveryAdapter, error) {
+	backend := execbackend.Local
+	if agent.ExecBackend != "" {
+		resolved, err := execbackend.ParseImplemented(agent.ExecBackend)
+		if err != nil {
+			return nil, err
+		}
+		backend = resolved
+	}
+	// Consume the positive backend implementation after parsing. A future name
+	// accepted by ParseImplemented still cannot reach Local's composition unless
+	// P2 explicitly extends execbackend.Consume and every compiler-identified
+	// call site supplies that backend's builder.
+	return execbackend.Consume(backend, func() (workflow.DeliveryAdapter, error) {
+		return buildLocalRuntimeAdapter(home, agent, checkout, runner)
+	})
+}
+
+// buildLocalRuntimeAdapter is the pre-#1536 runner-composition pipeline. Keep
+// its ordering unchanged: runtimeJobRunner/credgw, optional Landlock produce
+// wrapper, concrete runtime adapter, then model-gateway wrapping.
+func buildLocalRuntimeAdapter(home string, agent runtime.Agent, checkout string, runner subprocess.Runner) (workflow.DeliveryAdapter, error) {
 	var err error
 	runner, err = runtimeJobRunner(home, agent.Runtime, runner)
 	if err != nil {
@@ -2832,8 +2954,14 @@ func buildRuntimeAdapter(home string, agent runtime.Agent, checkout string, runn
 	return wrapModelGatewayAdapter(adapter, gatewayRunner), nil
 }
 
-func (w jobWorker) defaultStartAdapter(runtimeName string, checkout string) (runtime.Adapter, error) {
-	return runtimeAdapterFor(w.ConfigHome, runtimeName, checkout)
+func startRuntimeAdapterForBackend(backend execbackend.Backend, home string, runtimeName string, checkout string) (runtime.Adapter, error) {
+	return execbackend.Consume(backend, func() (runtime.Adapter, error) {
+		return runtimeAdapterFor(home, runtimeName, checkout)
+	})
+}
+
+func (w jobWorker) defaultStartAdapter(backend execbackend.Backend, runtimeName string, checkout string) (runtime.Adapter, error) {
+	return startRuntimeAdapterForBackend(backend, w.ConfigHome, runtimeName, checkout)
 }
 
 func (w jobWorker) defaultWorkflow(checkout string) workflow.Engine {

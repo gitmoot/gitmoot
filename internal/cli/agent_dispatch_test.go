@@ -268,7 +268,7 @@ func assertCLIReviewLoopHardRefusal(t *testing.T, fixture cliReviewLoopFixture, 
 	t.Helper()
 	adapterCalls := 0
 	previousFactory := localAgentDispatchRuntimeAdapterFor
-	localAgentDispatchRuntimeAdapterFor = func(string, string, string) (runtime.Adapter, error) {
+	localAgentDispatchRuntimeAdapterFor = func(string, runtime.Agent, string) (runtime.Adapter, error) {
 		adapterCalls++
 		return nil, errors.New("adapter must not be selected for a refused review loop")
 	}
@@ -699,7 +699,7 @@ func installReviewLeadTestAdapter(t *testing.T, output string) *cliWorkerFakeAda
 	t.Helper()
 	adapter := &cliWorkerFakeAdapter{output: output}
 	previous := localAgentDispatchRuntimeAdapterFor
-	localAgentDispatchRuntimeAdapterFor = func(string, string, string) (runtime.Adapter, error) {
+	localAgentDispatchRuntimeAdapterFor = func(string, runtime.Agent, string) (runtime.Adapter, error) {
 		return adapter, nil
 	}
 	t.Cleanup(func() { localAgentDispatchRuntimeAdapterFor = previous })

@@ -20,6 +20,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -1202,7 +1203,7 @@ func TestRunQueuedJobsDelegatesBusyRuntimeToTempWorker(t *testing.T) {
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return checkout, nil
 	}
-	worker.StartAdapterFactory = func(_ string, path string) (runtime.Adapter, error) {
+	worker.StartAdapterFactory = func(_ execbackend.Backend, _ string, path string) (runtime.Adapter, error) {
 		startCheckouts = append(startCheckouts, path)
 		return startAdapter, nil
 	}
@@ -1456,7 +1457,7 @@ func TestRunQueuedJobsReturnsTempWorkerIdleAfterDeliveryError(t *testing.T) {
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return checkout, nil
 	}
-	worker.StartAdapterFactory = func(string, string) (runtime.Adapter, error) {
+	worker.StartAdapterFactory = func(execbackend.Backend, string, string) (runtime.Adapter, error) {
 		return startAdapter, nil
 	}
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
@@ -1516,7 +1517,7 @@ func TestRunQueuedJobsCleansTempWorkerWhenDelegationRaceLoses(t *testing.T) {
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return checkout, nil
 	}
-	worker.StartAdapterFactory = func(string, string) (runtime.Adapter, error) {
+	worker.StartAdapterFactory = func(execbackend.Backend, string, string) (runtime.Adapter, error) {
 		return startAdapter, nil
 	}
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
@@ -1572,7 +1573,7 @@ func TestRunQueuedJobsMaterializesAndDisposesEphemeralWorker(t *testing.T) {
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return checkout, nil
 	}
-	worker.StartAdapterFactory = func(_ string, path string) (runtime.Adapter, error) {
+	worker.StartAdapterFactory = func(_ execbackend.Backend, _ string, path string) (runtime.Adapter, error) {
 		startCheckouts = append(startCheckouts, path)
 		return startAdapter, nil
 	}
@@ -1644,7 +1645,7 @@ func TestRunQueuedJobsDisposesEphemeralWorkerOnFailure(t *testing.T) {
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return checkout, nil
 	}
-	worker.StartAdapterFactory = func(string, string) (runtime.Adapter, error) {
+	worker.StartAdapterFactory = func(execbackend.Backend, string, string) (runtime.Adapter, error) {
 		return startAdapter, nil
 	}
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {

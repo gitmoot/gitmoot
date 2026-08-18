@@ -74,6 +74,16 @@ type Agent struct {
 	// also injects a working relay env, so a seat is never elevated without a relay;
 	// never persisted.
 	ChatSeat bool
+	// ExecBackend is the execution backend resolved for THIS job at dispatch
+	// (#1536 P1) from [remote_exec].backend plus the payload's exec_backend
+	// override. Dispatch stamps it in-memory before adapter construction so the
+	// same selection reaches runtime preflight, lifecycle, workflow-owned checks,
+	// and result observation; "local" (the only implemented backend) leaves those
+	// paths byte-for-byte unchanged.
+	// Empty — every construction site that does not stamp it (direct adapter
+	// builds, tests, `agent start`) — selects the same local default. In-memory
+	// only; never persisted on the agents table.
+	ExecBackend string
 	// WorkingDir is the resolved filesystem checkout directory the runtime
 	// adapter should chdir into for a delivery. It is DISTINCT from RepoScope,
 	// which stays in "owner/repo" form (and is validated as such). Callers that

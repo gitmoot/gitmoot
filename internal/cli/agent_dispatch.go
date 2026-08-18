@@ -14,6 +14,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -24,7 +25,21 @@ var newAgentDispatchGitHubClient = func(checkout string) github.Client {
 	return github.NewClient(checkout)
 }
 
-var localAgentDispatchRuntimeAdapterFor = runtimeAdapterFor
+type foregroundRuntimeAdapterFactory func(string, runtime.Agent, string) (runtime.Adapter, error)
+
+var localAgentDispatchRuntimeAdapterFor foregroundRuntimeAdapterFactory = func(home string, agent runtime.Agent, checkout string) (runtime.Adapter, error) {
+	return runtimeAdapterFor(home, agent.Runtime, checkout)
+}
+
+var localAgentDispatchExecBackendFor = func(home string) (execbackend.Backend, error) {
+	return (jobWorker{ConfigHome: home, ConfigHomeExplicit: true}).resolveExecBackend("", false)
+}
+
+func foregroundRuntimeAdapterFactoryFor(backend execbackend.Backend) (foregroundRuntimeAdapterFactory, error) {
+	return execbackend.Consume(backend, func() (foregroundRuntimeAdapterFactory, error) {
+		return localAgentDispatchRuntimeAdapterFor, nil
+	})
+}
 
 var dispatchPromptHeadContradictionWarnings = promptHeadContradictionWarnings
 
@@ -141,6 +156,23 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	overrideRuntime, overrideRef, err := resolveJobRuntimeOverride(request.Runtime, request.RuntimeSession)
 	if err != nil {
 		return localAgentJobOutput{}, err
+	}
+	// Foreground dispatch bypasses jobWorker.run, so resolve its execution
+	// backend here before any durable dispatch state or runtime side effect. The
+	// background path deliberately leaves resolution to the claiming worker,
+	// which records a loud terminal failure for an invalid queued selection.
+	var foregroundAdapterFactory foregroundRuntimeAdapterFactory
+	var foregroundExecBackend execbackend.Backend
+	if !request.Background {
+		var resolveErr error
+		foregroundExecBackend, resolveErr = localAgentDispatchExecBackendFor(request.Home)
+		if resolveErr != nil {
+			return localAgentJobOutput{}, resolveErr
+		}
+		foregroundAdapterFactory, err = foregroundRuntimeAdapterFactoryFor(foregroundExecBackend)
+		if err != nil {
+			return localAgentJobOutput{}, err
+		}
 	}
 	// #1059: validate the --org-role against the registry (unknown role fails
 	// loudly at ingress) and record passive presence for this dispatch. Restored
@@ -260,12 +292,24 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			return localAgentJobOutput{}, fmt.Errorf("runtime override: %w", err)
 		}
 	}
+	if !request.Background {
+		// The adapter factory closure already carries this selection, but the
+		// workflow engine also owns job-associated subprocesses (produce checks and
+		// result observation). Stamp the same resolved decision on the effective
+		// foreground agent so those routes cannot silently default back to Local.
+		effectiveAgent.ExecBackend = string(foregroundExecBackend)
+	}
 	if readOnlyImplementationBlocked(request.Action, effectiveAgent) {
 		return enqueuePermissionBlockedLocalAgentJob(ctx, store, request, repo.FullName(), record.DefaultBranch, agent.Name, overrideRuntime, overrideRef, orgPolicy)
 	}
 	var foregroundContract *runtime.RuntimeContractResult
 	if !request.Background {
-		result := localRuntimeContractPreflight(ctx, effectiveAgent)
+		result, err := runtimeContractPreflightForBackend(foregroundExecBackend, func() runtime.RuntimeContractResult {
+			return localRuntimeContractPreflight(ctx, effectiveAgent)
+		})
+		if err != nil {
+			return localAgentJobOutput{}, err
+		}
 		if err := runtime.RuntimeContractDispatchError(effectiveAgent, result); err != nil {
 			return localAgentJobOutput{}, err
 		}
@@ -500,9 +544,10 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	// AdvanceJob, which fires while this lock is still held) recognizes its own lock
 	// and does not refuse the healthy-path cleanup as a foreign live owner (#536).
 	ctx = workflow.WithRuntimeSelfOwnerToken(ctx, ownerToken)
-	// Adapter selection uses the EFFECTIVE runtime: this is the seam that makes
-	// a --runtime override actually deliver through the override adapter (#531).
-	adapter, err := localAgentDispatchRuntimeAdapterFor(request.Home, effectiveAgent.Runtime, checkoutPath)
+	// Adapter selection uses the complete EFFECTIVE agent: runtime overrides
+	// select the adapter (#531), while the resolved execution backend selects
+	// where that adapter runs (#1536). Neither decision may be discarded here.
+	adapter, err := foregroundAdapterFactory(request.Home, effectiveAgent, checkoutPath)
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}
@@ -565,7 +610,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		handled := false
 		if overrideRuntime == "" {
 			var abErr error
-			handled, abErr = maybeRunLiveAB(runCtx, store, request, agent, job, adapter, managed.OK)
+			handled, abErr = maybeRunLiveAB(runCtx, store, request, agent, job, adapter, managed.OK, foregroundExecBackend)
 			if abErr != nil {
 				recordRuntimeOutcome(abErr)
 				return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, abErr)
@@ -1481,7 +1526,11 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 			return db.Agent{}, noopAgentReservationRelease, err
 		}
 	}
-	adapter, err := runtimeAdapterFor(home, instanceAgent.Runtime, record.CheckoutPath)
+	execBackend, err := localAgentDispatchExecBackendFor(home)
+	if err != nil {
+		return db.Agent{}, noopAgentReservationRelease, err
+	}
+	adapter, err := startRuntimeAdapterForBackend(execBackend, home, instanceAgent.Runtime, record.CheckoutPath)
 	if err != nil {
 		return db.Agent{}, noopAgentReservationRelease, err
 	}
