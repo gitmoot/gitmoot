@@ -113,7 +113,11 @@ func agentOwner(ref string) MemoryOwner {
 // both tables and the FTS5 virtual table under the shipped modernc driver.
 func TestMemoryMigrationCreatesTables(t *testing.T) {
 	ctx := context.Background()
-	store := openMemTestStore(t)
+	store, err := Open(filepath.Join(t.TempDir(), "memory.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
 	for _, name := range []string{"memory_observations", "confirmed_memories", "confirmed_memories_fts", "memory_links"} {
 		exists, err := store.tableExists(ctx, name)
 		if err != nil {
