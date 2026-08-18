@@ -14,14 +14,14 @@ import (
 
 // Test-schema template identity, shared by BOTH cache implementations.
 //
-// Two callers consume the same cached template file at
-// os.TempDir()/gitmoot-test-schema-<hex12>.db: internal/db/dbtest (for every
-// other package's tests) and the in-package helper in internal/db's own tests,
-// which cannot import dbtest without an import cycle. Because they share one
-// path, a template published by either must be identifiable by both — otherwise
-// one guard's acceptance silently overrides the other's rejection. Keeping the
-// logic here, in a non-test file in package db, is what makes that possible; it
-// follows the same additive, test-only precedent as OpenAlreadyMigrated.
+// Two callers consume the same cached template file:
+// internal/db/dbtest (for every other package's tests) and the in-package helper
+// in internal/db's own tests, which cannot import dbtest without an import cycle.
+// Because they share one path, a template published by either must be identifiable
+// by both — otherwise one guard's acceptance silently overrides the other's
+// rejection. Keeping the logic here, in a non-test file in package db, is what
+// makes that possible; it follows the same additive, test-only precedent as
+// OpenAlreadyMigrated.
 //
 // The identity CANNOT live inside the database: a copy of the template becomes a
 // test's store, so any extra schema object would make that store differ from a
@@ -30,6 +30,15 @@ import (
 // TestTemplateIdentityPath is the sidecar holding a template's full migration
 // fingerprint.
 func TestTemplateIdentityPath(path string) string { return path + ".fingerprint" }
+
+// MigratedTestTemplatePath returns the shared cache path for the current Unix
+// user. Test templates and their sidecars are intentionally owner-only, so a
+// global name in a shared temporary directory lets the first user block every
+// other user from rebuilding the cache.
+func MigratedTestTemplatePath(tempDir string) string {
+	fingerprint := SchemaMigrationFingerprint()
+	return filepath.Join(tempDir, fmt.Sprintf("gitmoot-test-schema-%d-%s.db", os.Getuid(), fingerprint[:12]))
+}
 
 // AfterTestTemplatePublish runs between publishing the database and stamping its
 // identity. Production behaviour is a no-op; tests replace it to simulate a crash

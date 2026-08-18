@@ -458,7 +458,31 @@ func isolateMigratedTemplateCache(t *testing.T) string {
 		templatePath = ""
 		templateMu.Unlock()
 	})
-	return filepath.Join(cacheRoot, "gitmoot-test-schema-"+db.SchemaMigrationFingerprint()[:12]+".db")
+	return db.MigratedTestTemplatePath(cacheRoot)
+}
+
+func TestMigratedTemplateUsesCurrentUnixUserPath(t *testing.T) {
+	cacheRoot := t.TempDir()
+	t.Setenv("TMPDIR", cacheRoot)
+	templateMu.Lock()
+	templateReady = false
+	templatePath = ""
+	templateMu.Unlock()
+	t.Cleanup(func() {
+		templateMu.Lock()
+		templateReady = false
+		templatePath = ""
+		templateMu.Unlock()
+	})
+
+	got, err := migratedTemplate()
+	if err != nil {
+		t.Fatalf("build migrated template: %v", err)
+	}
+	want := filepath.Join(cacheRoot, fmt.Sprintf("gitmoot-test-schema-%d-%s.db", os.Getuid(), db.SchemaMigrationFingerprint()[:12]))
+	if got != want {
+		t.Fatalf("migrated template path = %q, want current-user path %q", got, want)
+	}
 }
 
 func ageTemplateForPublicationRace(t *testing.T) string {

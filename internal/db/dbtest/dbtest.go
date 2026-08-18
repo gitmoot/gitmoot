@@ -49,8 +49,7 @@ func migratedTemplate() (string, error) {
 	if templateReady {
 		return templatePath, nil
 	}
-	fingerprint := db.SchemaMigrationFingerprint()
-	templatePath = filepath.Join(os.TempDir(), "gitmoot-test-schema-"+fingerprint[:12]+".db")
+	templatePath = db.MigratedTestTemplatePath(os.TempDir())
 	if err := ensureMigratedTemplate(templatePath); err != nil {
 		return templatePath, err
 	}

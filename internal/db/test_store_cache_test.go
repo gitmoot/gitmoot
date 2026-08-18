@@ -41,8 +41,7 @@ func cachedMigratedTestTemplate() (string, error) {
 	if cachedTestTemplateReady {
 		return cachedTestTemplatePath, nil
 	}
-	fingerprint := SchemaMigrationFingerprint()
-	cachedTestTemplatePath = filepath.Join(os.TempDir(), "gitmoot-test-schema-"+fingerprint[:12]+".db")
+	cachedTestTemplatePath = MigratedTestTemplatePath(os.TempDir())
 	if err := ensureCachedMigratedTestTemplate(cachedTestTemplatePath); err != nil {
 		return cachedTestTemplatePath, err
 	}
@@ -144,6 +143,30 @@ func validateCachedMigratedTestTemplate(path string) error {
 	// above, and the only other binding is a 48-bit filename prefix. Shared with
 	// internal/db/dbtest because both caches use the SAME template path.
 	return ValidateTestTemplateIdentity(path)
+}
+
+func TestCachedMigratedTemplateUsesCurrentUnixUserPath(t *testing.T) {
+	cacheRoot := t.TempDir()
+	t.Setenv("TMPDIR", cacheRoot)
+	cachedTestTemplateMu.Lock()
+	cachedTestTemplateReady = false
+	cachedTestTemplatePath = ""
+	cachedTestTemplateMu.Unlock()
+	t.Cleanup(func() {
+		cachedTestTemplateMu.Lock()
+		cachedTestTemplateReady = false
+		cachedTestTemplatePath = ""
+		cachedTestTemplateMu.Unlock()
+	})
+
+	got, err := cachedMigratedTestTemplate()
+	if err != nil {
+		t.Fatalf("build cached migrated template: %v", err)
+	}
+	want := filepath.Join(cacheRoot, fmt.Sprintf("gitmoot-test-schema-%d-%s.db", os.Getuid(), SchemaMigrationFingerprint()[:12]))
+	if got != want {
+		t.Fatalf("cached migrated template path = %q, want current-user path %q", got, want)
+	}
 }
 
 func TestEnsureCachedMigratedTestTemplateReplacesInvalidRegularFile(t *testing.T) {
