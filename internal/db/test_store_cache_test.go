@@ -84,7 +84,12 @@ func ensureCachedMigratedTestTemplate(path string) error {
 		}
 		return fmt.Errorf("publish test schema template: %w", err)
 	}
-	return nil
+	// Identity is stamped AFTER the database is published, and via the same shared
+	// helper internal/db/dbtest uses. Both caches consume the SAME path
+	// (os.TempDir()/gitmoot-test-schema-<hex12>.db), so a template published by
+	// either must be identifiable by both — otherwise one guard's acceptance
+	// silently overrides the other's rejection.
+	return StampTestTemplateIdentity(path)
 }
 
 func validateCachedMigratedTestTemplate(path string) error {
@@ -120,7 +125,12 @@ func validateCachedMigratedTestTemplate(path string) error {
 	if count != want || minimum != 1 || maximum != want {
 		return fmt.Errorf("cached test schema migration versions are count=%d range=%d..%d, want count=%d range=1..%d", count, minimum, maximum, want, want)
 	}
-	return nil
+
+	// Cardinality is not identity: schema_migrations records version NUMBERS, so a
+	// template built from a DIFFERENT set of the same size passes every check
+	// above, and the only other binding is a 48-bit filename prefix. Shared with
+	// internal/db/dbtest because both caches use the SAME template path.
+	return ValidateTestTemplateIdentity(path)
 }
 
 func TestEnsureCachedMigratedTestTemplateReplacesInvalidRegularFile(t *testing.T) {

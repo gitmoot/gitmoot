@@ -89,13 +89,6 @@ func ensureMigratedTemplate(path string) error {
 		return fmt.Errorf("close migrated test schema template: %w", err)
 	}
 
-	// Publish the identity sidecar BEFORE the database becomes visible. Validation
-	// fails closed on a missing or mismatched sidecar, so a crash between the two
-	// renames costs a rebuild and never yields an unidentified template.
-	if err := stampTemplateIdentity(path); err != nil {
-		return err
-	}
-
 	// The unique file is complete and closed before it becomes visible at the
 	// shared cache path. Concurrent test binaries may race here; each candidate
 	// is complete, and rename is atomic because both names share a directory.
@@ -105,40 +98,33 @@ func ensureMigratedTemplate(path string) error {
 		}
 		return fmt.Errorf("publish test schema template: %w", err)
 	}
-	return nil
+
+	// Seam between the two publishes, so the ORDER itself is testable. A plain
+	// test cannot reach this window: whatever order the two renames happen in, a
+	// completed build ends up consistent. Only an interruption BETWEEN them
+	// distinguishes correct order from inverted, and this hook is how a test
+	// simulates that interruption. See TestPublishOrderSurvivesCrashBetweenRenames.
+	if err := afterTemplatePublish(); err != nil {
+		return err
+	}
+
+	// Stamp identity AFTER the database is published, never before. The sidecar
+	// vouches for the database, so publishing it first leaves a crash window in
+	// which a NEW fingerprint blesses the OLD database still at this path, and
+	// validation then accepts a stale schema. This order means a crash leaves a
+	// database whose sidecar is absent or mismatched, which fails validation and
+	// costs a rebuild. (Round-4 review found the reverse order; it was mine.)
+	//
+	// The helper lives in package db so the in-package cache in internal/db's own
+	// tests — which cannot import this package without an import cycle — shares
+	// exactly this logic against the same shared template path.
+	return db.StampTestTemplateIdentity(path)
 }
 
-// templateIdentityPath is the sidecar holding a template's FULL migration
-// fingerprint. It cannot live inside the database: a copy of the template
-// becomes a test's store, and any extra schema object would make that store
-// differ from a freshly migrated one — the exact equivalence this package exists
-// to guarantee, and which TestOpenMatchesFreshlyMigratedSchema asserts.
-func templateIdentityPath(path string) string { return path + ".fingerprint" }
-
-// stampTemplateIdentity records the full fingerprint next to the template, via
-// create-temp + rename so a reader never observes a partial value.
-func stampTemplateIdentity(path string) error {
-	want := db.SchemaMigrationFingerprint()
-	temp, err := os.CreateTemp(filepath.Dir(path), ".gitmoot-test-schema-id-*")
-	if err != nil {
-		return fmt.Errorf("create test schema identity sidecar: %w", err)
-	}
-	tempPath := temp.Name()
-	if _, err := io.WriteString(temp, want); err != nil {
-		_ = temp.Close()
-		_ = os.Remove(tempPath)
-		return fmt.Errorf("write test schema identity sidecar: %w", err)
-	}
-	if err := temp.Close(); err != nil {
-		_ = os.Remove(tempPath)
-		return fmt.Errorf("close test schema identity sidecar: %w", err)
-	}
-	if err := os.Rename(tempPath, templateIdentityPath(path)); err != nil {
-		_ = os.Remove(tempPath)
-		return fmt.Errorf("publish test schema identity sidecar: %w", err)
-	}
-	return nil
-}
+// afterTemplatePublish runs between publishing the database and stamping its
+// identity. Production behaviour is a no-op; tests replace it to simulate a
+// crash in that window.
+var afterTemplatePublish = func() error { return nil }
 
 func validateMigratedTemplate(path string) error {
 	dsn := &url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro&immutable=1"}
@@ -179,14 +165,7 @@ func validateMigratedTemplate(path string) error {
 	// above, and the only other binding is a 48-bit filename prefix. Compare the
 	// stamped full fingerprint so a wrong-schema template is rejected — and
 	// therefore rebuilt — instead of silently backing every writable test store.
-	stamped, err := os.ReadFile(templateIdentityPath(path))
-	if err != nil {
-		return fmt.Errorf("read cached test schema identity: %w", err)
-	}
-	if got := string(stamped); got != db.SchemaMigrationFingerprint() {
-		return fmt.Errorf("cached test schema identity is %q, want %q", got, db.SchemaMigrationFingerprint())
-	}
-	return nil
+	return db.ValidateTestTemplateIdentity(path)
 }
 
 func checkpointWAL(path string) error {
