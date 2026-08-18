@@ -21,15 +21,6 @@ name: CI
 #     internal/db 2 ways, internal/workflow 4 ways, and internal/daemon 1 way. Each runner downloads
 #     the package bundle and executes from the package directory, preserving Go
 #     test-binary working-directory semantics without recompiling.
-#   - TIMINGS: PRs use the newest non-expired main timing artifact (up to 30
-#     days old) for deterministic LPT balancing. A PR's test set almost never
-#     matches main's exactly, so the timings are RECONCILED against the current
-#     test list (new tests weighted at the median, vanished rows dropped) rather
-#     than discarded — demanding an exact match meant LPT never ran (#930). Only a
-#     missing or corrupt artifact falls back loudly to Stage 1's deterministic
-#     alternation. Coverage never depends on the timings: the shard union is
-#     asserted against the compiled binary's own -test.list. Successful pushes to
-#     main publish fresh per-test timings for subsequent PRs.
 
 on:
   push:
@@ -53,7 +44,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.diff.outputs.code }}
-      timings_run_id: ${{ steps.timings.outputs.timings_run_id }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -75,46 +65,6 @@ jobs:
           else
             echo "code=false" >> "$GITHUB_OUTPUT"
             echo "dep-only diff — race lanes will be skipped"
-          fi
-
-      - name: Find latest main race timings
-        id: timings
-        if: github.event_name == 'pull_request' && steps.diff.outputs.code == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          response="$RUNNER_TEMP/race-timing-artifacts.json"
-          if ! curl --fail --silent --show-error \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts?name=race-test-timings&per_page=100" \
-            --output "$response"; then
-            echo "::warning::could not query main race timings; deterministic fallback will be used"
-            echo "timings_run_id=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          cutoff=$(date -u -d '30 days ago' '+%Y-%m-%dT%H:%M:%SZ')
-          if ! run_id=$(jq -r --arg cutoff "$cutoff" '
-            [
-              .artifacts[]
-              | select(.expired == false)
-              | select(.created_at >= $cutoff)
-              | select(.workflow_run.head_branch == "main")
-            ]
-            | sort_by(.created_at)
-            | last
-            | .workflow_run.id // empty
-          ' "$response"); then
-            echo "::warning::could not parse main race timing metadata; deterministic fallback will be used"
-            run_id=""
-          fi
-          echo "timings_run_id=$run_id" >> "$GITHUB_OUTPUT"
-          if [ -n "$run_id" ]; then
-            echo "using race timings from main workflow run $run_id"
-          else
-            echo "no fresh main race timing artifact; deterministic fallback will be used"
           fi
 
   build-test:
@@ -189,18 +139,6 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Download latest main race timings
-        id: download-timings
-        if: needs.changes.outputs.timings_run_id != ''
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: race-test-timings
-          path: ${{ runner.temp }}/main-race-timings
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          run-id: ${{ needs.changes.outputs.timings_run_id }}
-
       - name: Compile once and partition
         env:
           PACKAGE: ${{ matrix.package }}
@@ -219,31 +157,10 @@ jobs:
             "$bundle/$PACKAGE.test" -test.list '.*'
           ) > "$bundle/tests.list"
 
-          args=(
-            --tests "$bundle/tests.list"
-            --shards "$SHARDS"
+          scripts/partition-race-tests.sh \
+            --tests "$bundle/tests.list" \
+            --shards "$SHARDS" \
             --out-dir "$bundle/partitions"
-          )
-          timings="$RUNNER_TEMP/main-race-timings/race-test-timings.tsv"
-          if [ -s "$timings" ]; then
-            args+=(--timings "$timings" --package "internal/$PACKAGE")
-          else
-            echo "main timings unavailable; using deterministic alternation"
-          fi
-
-          set +e
-          scripts/partition-race-tests.sh "${args[@]}"
-          status=$?
-          set -e
-          if [ "$status" -eq 2 ]; then
-            echo "::warning::main timings are missing or corrupt for internal/$PACKAGE; using deterministic alternation"
-            scripts/partition-race-tests.sh \
-              --tests "$bundle/tests.list" \
-              --shards "$SHARDS" \
-              --out-dir "$bundle/partitions"
-          elif [ "$status" -ne 0 ]; then
-            exit "$status"
-          fi
 
       - name: Upload race binary and shard plan
         uses: actions/upload-artifact@v4
@@ -308,75 +225,11 @@ jobs:
           total=$(wc -l < "$bundle/tests.list" | tr -d ' ')
           echo "running internal/$PACKAGE shard $SHARD: $count of $total tests"
 
-          timing="$RUNNER_TEMP/race-timing-$PACKAGE-$SHARD.json"
           (
             cd "internal/$PACKAGE"
             "$binary" \
               -test.v=test2json \
               -test.run="$run_regex" \
               -test.timeout=20m 2>&1 \
-              | "$test2json" -p "internal/$PACKAGE" -t \
-              | tee "$timing"
+              | "$test2json" -p "internal/$PACKAGE" -t
           )
-
-      - name: Upload raw per-test timings
-        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/upload-artifact@v4
-        with:
-          name: race-timing-${{ matrix.package }}-${{ matrix.shard }}
-          path: ${{ runner.temp }}/race-timing-${{ matrix.package }}-${{ matrix.shard }}.json
-          if-no-files-found: error
-          retention-days: 7
-
-  race-timings:
-    name: publish race timings
-    needs: race
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download raw timing shards
-        uses: actions/download-artifact@v4
-        with:
-          pattern: race-timing-*
-          path: ${{ runner.temp }}/race-timing-shards
-          merge-multiple: true
-
-      - name: Build per-test timing table
-        run: |
-          shopt -s nullglob
-          files=("$RUNNER_TEMP"/race-timing-shards/*.json)
-          if [ "${#files[@]}" -eq 0 ]; then
-            echo "no raw timing shards downloaded" >&2
-            exit 1
-          fi
-
-          jq -sr '
-            [
-              .[]
-              | select(
-                  (.Action == "pass" or .Action == "skip")
-                  and .Test != null
-                  and .Elapsed != null
-                )
-              | select((.Test | contains("/")) | not)
-              | select(.Test | test("^(Test|Fuzz|Example)"))
-              | [.Package, .Test, (.Elapsed | tostring)]
-            ]
-            | sort_by(.[0], .[1])
-            | .[]
-            | @tsv
-          ' "${files[@]}" > "$RUNNER_TEMP/race-test-timings.tsv"
-          if [ ! -s "$RUNNER_TEMP/race-test-timings.tsv" ]; then
-            echo "timing table is empty" >&2
-            exit 1
-          fi
-          awk -F '\t' '{ count[$1]++ } END { for (package in count) print package ": " count[package] " tests" }' \
-            "$RUNNER_TEMP/race-test-timings.tsv" | sort
-
-      - name: Publish main race timings
-        uses: actions/upload-artifact@v4
-        with:
-          name: race-test-timings
-          path: ${{ runner.temp }}/race-test-timings.tsv
-          if-no-files-found: error
-          retention-days: 30

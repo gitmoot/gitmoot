@@ -5,15 +5,12 @@ export LC_ALL=C
 
 usage() {
   cat <<'EOF'
-Usage: partition-race-tests.sh --tests FILE --shards N --out-dir DIR [--timings FILE --package NAME]
+Usage: partition-race-tests.sh --tests FILE --shards N --out-dir DIR
 
-Partitions the current top-level Go test list into N shards. With timings, it
-uses deterministic longest-processing-time-first balancing. Without timings,
-it uses the Stage 1 alternating split (line number modulo shard count).
+Partitions the current top-level Go test list into N shards using the
+deterministic alternating split (line number modulo shard count).
 
-Exit status 2 means the optional timings are malformed or do not exactly match
-the current test list. Callers may retry without --timings. Any coverage
-assertion failure uses status 1 and must remain a hard failure.
+Any coverage assertion failure uses status 1 and must remain a hard failure.
 EOF
 }
 
@@ -22,14 +19,7 @@ fail() {
   exit 1
 }
 
-timings_invalid() {
-  echo "partition-race-tests: unusable timings: $*" >&2
-  exit 2
-}
-
 tests_file=""
-timings_file=""
-package=""
 shards=""
 out_dir=""
 
@@ -38,16 +28,6 @@ while [[ $# -gt 0 ]]; do
     --tests)
       [[ $# -ge 2 ]] || fail "--tests requires a value"
       tests_file="$2"
-      shift 2
-      ;;
-    --timings)
-      [[ $# -ge 2 ]] || fail "--timings requires a value"
-      timings_file="$2"
-      shift 2
-      ;;
-    --package)
-      [[ $# -ge 2 ]] || fail "--package requires a value"
-      package="$2"
       shift 2
       ;;
     --shards)
@@ -74,9 +54,6 @@ done
 [[ -f "$tests_file" ]] || fail "test list does not exist: $tests_file"
 [[ "$shards" =~ ^[1-9][0-9]*$ ]] || fail "--shards must be a positive integer"
 [[ -n "$out_dir" ]] || fail "--out-dir is required"
-if [[ -n "$timings_file" && -z "$package" ]]; then
-  fail "--package is required with --timings"
-fi
 
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/gitmoot-race-partition.XXXXXX")"
 cleanup() { rm -rf "$work_dir"; }
@@ -128,115 +105,16 @@ for ((shard = 0; shard < shards; shard++)); do
   : >"$out_dir/shard-$shard.tests"
 done
 
+# Alternation: awk NR starts at one, so the first test goes to shard 1 (or
+# shard 0 when there is only one shard).
+awk -v shards="$shards" -v out="$out_dir" '
+  { print > (out "/shard-" (NR % shards) ".tests") }
+' "$current_tests"
 mode="alternation"
-if [[ -n "$timings_file" ]]; then
-  [[ -f "$timings_file" ]] || timings_invalid "file does not exist: $timings_file"
 
-  package_timings="$work_dir/package-timings"
-  if ! awk -F '\t' -v package="$package" '
-    NF != 3 { exit 1 }
-    $1 == "" || $2 == "" || $3 !~ /^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$/ { exit 1 }
-    $1 == package { print $2 "\t" $3 }
-  ' "$timings_file" >"$package_timings"; then
-    timings_invalid "expected tab-separated package, test, elapsed rows"
-  fi
-  [[ -s "$package_timings" ]] || timings_invalid "no rows for package $package"
-
-  timing_names="$work_dir/timing-names.sorted"
-  cut -f1 "$package_timings" | sort >"$timing_names"
-  timing_duplicates="$work_dir/timing-names.duplicates"
-  uniq -d "$timing_names" >"$timing_duplicates"
-
-  # A duplicate row makes a test's weight ambiguous — that is a corrupt artifact,
-  # not a stale one, so it stays fatal.
-  if [[ -s "$timing_duplicates" ]]; then
-    echo "partition-race-tests: unusable timings: duplicate rows for package $package" >&2
-    sed 's/^/    /' "$timing_duplicates" >&2
-    exit 2
-  fi
-
-  # RECONCILE the timings against the CURRENT test list rather than demanding they
-  # match it (#930). Requiring an exact match meant any PR that added, renamed, or
-  # deleted a single test fell back to alternation — which is nearly every PR, so
-  # LPT balancing effectively never ran. Instead:
-  #   - a test with a recorded time keeps it;
-  #   - a test that is NEW here (no recorded time) gets the median of the known
-  #     times, so it is scheduled as a typical test rather than a free one;
-  #   - a recorded time for a test that no longer exists is dropped.
-  # Coverage is guaranteed downstream regardless: the shard-union assertion below
-  # compares the partition against the compiled binary's own -test.list, so a
-  # stale artifact can never drop or duplicate a test.
-  missing="$work_dir/timing-names.missing"
-  unknown="$work_dir/timing-names.unknown"
-  comm -23 "$sorted_tests" "$timing_names" >"$missing"
-  comm -13 "$sorted_tests" "$timing_names" >"$unknown"
-
-  reconciled="$work_dir/package-timings.reconciled"
-  awk -F '\t' -v current="$sorted_tests" '
-    BEGIN {
-      while ((getline line < current) > 0) {
-        if (line != "") present[line] = 1
-      }
-      close(current)
-    }
-    # keep only rows for tests that still exist
-    ($1 in present) { recorded[$1] = $2; n++; times[n] = $2 + 0 }
-    END {
-      # median of the known times is the weight for tests we have never timed
-      default_weight = 0
-      if (n > 0) {
-        # insertion sort: n is a few thousand at most, and this keeps the script
-        # dependency-free (no sort subprocess mid-stream).
-        for (i = 2; i <= n; i++) {
-          v = times[i]
-          for (j = i - 1; j >= 1 && times[j] > v; j--) times[j + 1] = times[j]
-          times[j + 1] = v
-        }
-        default_weight = (n % 2) ? times[(n + 1) / 2] : (times[n / 2] + times[n / 2 + 1]) / 2
-      }
-      while ((getline test < current) > 0) {
-        if (test == "") continue
-        print test "\t" ((test in recorded) ? recorded[test] : default_weight)
-      }
-      close(current)
-    }
-  ' "$package_timings" >"$reconciled"
-  package_timings="$reconciled"
-
-  new_count=$(grep -c . "$missing" || true)
-  dropped_count=$(grep -c . "$unknown" || true)
-  if [[ "$new_count" -gt 0 || "$dropped_count" -gt 0 ]]; then
-    echo "partition-race-tests: reconciled timings for $package: ${new_count} new test(s) weighted at the median, ${dropped_count} stale row(s) dropped" >&2
-  fi
-
-  # LPT: longest tests first, test name as the stable duration tiebreak, then
-  # assign to the lowest-load shard (lowest shard number breaks load ties).
-  sorted_timings="$work_dir/package-timings.sorted"
-  sort -t $'\t' -k2,2gr -k1,1 "$package_timings" >"$sorted_timings"
-  awk -F '\t' -v shards="$shards" -v out="$out_dir" '
-    BEGIN {
-      for (i = 0; i < shards; i++) load[i] = 0
-    }
-    {
-      selected = 0
-      for (i = 1; i < shards; i++) {
-        if (load[i] < load[selected]) selected = i
-      }
-      print $1 >> (out "/shard-" selected ".tests")
-      load[selected] += $2
-    }
-  ' "$sorted_timings"
-  mode="lpt"
-else
-  # Preserve Stage 1 exactly: awk NR starts at one, so the first test goes to
-  # shard 1 (or shard 0 when there is only one shard).
-  awk -v shards="$shards" -v out="$out_dir" '
-    { print > (out "/shard-" (NR % shards) ".tests") }
-  ' "$current_tests"
-fi
-
-# Coverage is checked from the current package list, never from the timings.
-# A coverage mismatch is status 1 so CI cannot turn it into a timing fallback.
+# Coverage is checked from the current package list: every test must be
+# assigned to exactly one shard, with no extras. A coverage mismatch is
+# status 1 and must remain a hard failure.
 assigned="$work_dir/assigned"
 for ((shard = 0; shard < shards; shard++)); do
   cat "$out_dir/shard-$shard.tests" >>"$assigned"
