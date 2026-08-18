@@ -68,12 +68,8 @@ func SnapshotMigratedTestTemplate(path string) ([]byte, error) {
 	if err := temp.Close(); err != nil {
 		return nil, fmt.Errorf("close migrated test template snapshot: %w", err)
 	}
-	got, err := testTemplateStamp(tempPath)
-	if err != nil {
+	if err := validateMigratedTestTemplate(tempPath, string(stamped)); err != nil {
 		return nil, fmt.Errorf("validate migrated test template snapshot: %w", err)
-	}
-	if got != string(stamped) {
-		return nil, fmt.Errorf("migrated test template snapshot identity is %q, want %q", got, string(stamped))
 	}
 	return data, nil
 }
@@ -210,6 +206,64 @@ func ValidateTestTemplateIdentity(path string) error {
 	return nil
 }
 
+// ValidateMigratedTestTemplate enforces the complete cache contract: the file
+// must be a healthy SQLite database, carry the fresh-database page metadata,
+// record every current migration, and match its published migration/schema
+// identity. SnapshotMigratedTestTemplate applies the same checks to its private
+// byte copy so a pathname replacement cannot bypass any part of this contract.
+func ValidateMigratedTestTemplate(path string) error {
+	stamped, err := os.ReadFile(TestTemplateIdentityPath(path))
+	if err != nil {
+		return fmt.Errorf("read cached test schema identity: %w", err)
+	}
+	return validateMigratedTestTemplate(path, string(stamped))
+}
+
+func validateMigratedTestTemplate(path, stamped string) error {
+	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro&immutable=1"}).String()
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return fmt.Errorf("open cached test schema template: %w", err)
+	}
+	defer raw.Close()
+
+	var integrity string
+	if err := raw.QueryRowContext(context.Background(), `PRAGMA quick_check`).Scan(&integrity); err != nil {
+		return fmt.Errorf("check cached test schema template integrity: %w", err)
+	}
+	if integrity != "ok" {
+		return fmt.Errorf("cached test schema template integrity check returned %q", integrity)
+	}
+
+	var autoVacuum int
+	if err := raw.QueryRowContext(context.Background(), `PRAGMA auto_vacuum`).Scan(&autoVacuum); err != nil {
+		return fmt.Errorf("read cached test schema auto_vacuum: %w", err)
+	}
+	if autoVacuum != SQLiteAutoVacuumIncremental {
+		return fmt.Errorf("cached test schema auto_vacuum is %d, want %d", autoVacuum, SQLiteAutoVacuumIncremental)
+	}
+
+	var count, minimum, maximum int
+	if err := raw.QueryRowContext(context.Background(), `
+		SELECT COUNT(*), COALESCE(MIN(version), 0), COALESCE(MAX(version), 0)
+		FROM schema_migrations`).Scan(&count, &minimum, &maximum); err != nil {
+		return fmt.Errorf("read cached test schema migration versions: %w", err)
+	}
+	wantCount := SchemaMigrationCount()
+	if count != wantCount || minimum != 1 || maximum != wantCount {
+		return fmt.Errorf("cached test schema migration versions are count=%d range=%d..%d, want count=%d range=1..%d", count, minimum, maximum, wantCount, wantCount)
+	}
+
+	got, err := testTemplateStampFromDB(raw)
+	if err != nil {
+		return err
+	}
+	if got != stamped {
+		return fmt.Errorf("cached test schema identity is %q, want %q", stamped, got)
+	}
+	return nil
+}
+
 // testTemplateStamp is the identity a template must carry: the full ordered
 // migration fingerprint, plus a digest of the schema objects actually in the
 // file. Computed the same way at stamp time and at validation time, so the two
@@ -221,6 +275,10 @@ func testTemplateStamp(path string) (string, error) {
 		return "", fmt.Errorf("open test schema template for identity: %w", err)
 	}
 	defer raw.Close()
+	return testTemplateStampFromDB(raw)
+}
+
+func testTemplateStampFromDB(raw *sql.DB) (string, error) {
 	rows, err := raw.QueryContext(context.Background(),
 		`SELECT type, name, COALESCE(sql, '') FROM sqlite_master ORDER BY type, name`)
 	if err != nil {

@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -124,45 +123,7 @@ func ensureMigratedTemplateOnce(path string) (bool, error) {
 }
 
 func validateMigratedTemplate(path string) error {
-	dsn := &url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro&immutable=1"}
-	raw, err := sql.Open("sqlite", dsn.String())
-	if err != nil {
-		return fmt.Errorf("open cached test schema template: %w", err)
-	}
-	defer raw.Close()
-
-	var integrity string
-	if err := raw.QueryRowContext(context.Background(), `PRAGMA quick_check`).Scan(&integrity); err != nil {
-		return fmt.Errorf("check cached test schema template integrity: %w", err)
-	}
-	if integrity != "ok" {
-		return fmt.Errorf("cached test schema template integrity check returned %q", integrity)
-	}
-	var autoVacuum int
-	if err := raw.QueryRowContext(context.Background(), `PRAGMA auto_vacuum`).Scan(&autoVacuum); err != nil {
-		return fmt.Errorf("read cached test schema auto_vacuum: %w", err)
-	}
-	if autoVacuum != db.SQLiteAutoVacuumIncremental {
-		return fmt.Errorf("cached test schema auto_vacuum is %d, want %d", autoVacuum, db.SQLiteAutoVacuumIncremental)
-	}
-
-	var count, minimum, maximum int
-	if err := raw.QueryRowContext(context.Background(), `
-		SELECT COUNT(*), COALESCE(MIN(version), 0), COALESCE(MAX(version), 0)
-		FROM schema_migrations`).Scan(&count, &minimum, &maximum); err != nil {
-		return fmt.Errorf("read cached test schema migration versions: %w", err)
-	}
-	want := db.SchemaMigrationCount()
-	if count != want || minimum != 1 || maximum != want {
-		return fmt.Errorf("cached test schema migration versions are count=%d range=%d..%d, want count=%d range=1..%d", count, minimum, maximum, want, want)
-	}
-
-	// Cardinality is not identity. schema_migrations records version NUMBERS, so a
-	// template built from a DIFFERENT set of the same size satisfies every check
-	// above, and the only other binding is a 48-bit filename prefix. Compare the
-	// stamped full fingerprint so a wrong-schema template is rejected — and
-	// therefore rebuilt — instead of silently backing every writable test store.
-	return db.ValidateTestTemplateIdentity(path)
+	return db.ValidateMigratedTestTemplate(path)
 }
 
 func checkpointWAL(path string) error {

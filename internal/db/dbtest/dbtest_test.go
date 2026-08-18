@@ -279,6 +279,92 @@ func TestEnsureMigratedTemplateReplacesIncompleteMigrationBookkeeping(t *testing
 	}
 }
 
+func TestSnapshotPreservesFullTemplateValidationContract(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, string)
+		want   string
+	}{
+		{
+			name: "corrupt_table_page",
+			mutate: func(t *testing.T, path string) {
+				t.Helper()
+				raw := openRaw(t, path)
+				var pageSize, rootPage int64
+				if err := raw.QueryRow(`PRAGMA page_size`).Scan(&pageSize); err != nil {
+					_ = raw.Close()
+					t.Fatalf("read page size: %v", err)
+				}
+				if err := raw.QueryRow(`SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'jobs'`).Scan(&rootPage); err != nil {
+					_ = raw.Close()
+					t.Fatalf("read jobs root page: %v", err)
+				}
+				if err := raw.Close(); err != nil {
+					t.Fatalf("close template before corruption: %v", err)
+				}
+
+				file, err := os.OpenFile(path, os.O_RDWR, 0)
+				if err != nil {
+					t.Fatalf("open template for corruption: %v", err)
+				}
+				offset := (rootPage - 1) * pageSize
+				if _, err := file.WriteAt([]byte{0}, offset); err != nil {
+					_ = file.Close()
+					t.Fatalf("corrupt jobs root page: %v", err)
+				}
+				if err := file.Close(); err != nil {
+					t.Fatalf("close corrupted template: %v", err)
+				}
+			},
+			want: "integrity",
+		},
+		{
+			name: "wrong_auto_vacuum",
+			mutate: func(t *testing.T, path string) {
+				t.Helper()
+				raw := openRaw(t, path)
+				defer raw.Close()
+				if _, err := raw.Exec(`PRAGMA auto_vacuum=FULL; VACUUM`); err != nil {
+					t.Fatalf("change auto_vacuum: %v", err)
+				}
+			},
+			want: "auto_vacuum",
+		},
+		{
+			name: "incomplete_migration_bookkeeping",
+			mutate: func(t *testing.T, path string) {
+				t.Helper()
+				raw := openRaw(t, path)
+				defer raw.Close()
+				if _, err := raw.Exec(`DELETE FROM schema_migrations WHERE version = (SELECT MAX(version) FROM schema_migrations)`); err != nil {
+					t.Fatalf("remove migration bookkeeping: %v", err)
+				}
+			},
+			want: "migration versions",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "schema.db")
+			if err := ensureMigratedTemplate(path); err != nil {
+				t.Fatalf("create valid template: %v", err)
+			}
+			test.mutate(t, path)
+
+			// Both mutations leave sqlite_master unchanged, so the published
+			// fingerprint plus schema digest still matches. The snapshot must retain
+			// the rest of the template-validation contract as well.
+			if err := db.ValidateTestTemplateIdentity(path); err != nil {
+				t.Fatalf("identity-only validation unexpectedly failed: %v", err)
+			}
+			if _, err := db.SnapshotMigratedTestTemplate(path); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("snapshot error = %v, want rejection containing %q", err, test.want)
+			}
+		})
+	}
+}
+
 func readSchemaSnapshot(t *testing.T, path string) schemaSnapshot {
 	t.Helper()
 	raw := openRaw(t, path)
