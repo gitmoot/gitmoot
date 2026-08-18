@@ -14,6 +14,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
@@ -314,7 +315,7 @@ func TestProduceCheckGroupKillsChildOnTimeout(t *testing.T) {
 	_, err := runProduceCheck(context.Background(), JobPayload{
 		WorktreePath: dir,
 		Check:        "sleep 30 & child=$!; echo $child > child.pid; wait $child",
-	}, "", 100*time.Millisecond)
+	}, "", 100*time.Millisecond, execbackend.Local)
 	if err == nil {
 		t.Fatal("runProduceCheck succeeded despite timeout")
 	}
@@ -340,6 +341,21 @@ func TestProduceCheckGroupKillsChildOnTimeout(t *testing.T) {
 			t.Fatalf("check child pid %d still exists after group cancellation (kill probe: %v)", pid, err)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestProduceCheckNonLocalBackendCannotRunLocally(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "must-not-run")
+	_, err := runProduceCheck(context.Background(), JobPayload{
+		WorktreePath: dir,
+		Check:        "touch must-not-run",
+	}, "", time.Second, execbackend.Backend("p2-probe"))
+	if err == nil || !strings.Contains(err.Error(), "p2-probe") || !strings.Contains(err.Error(), "no execution implementation") {
+		t.Fatalf("runProduceCheck error = %v, want missing p2-probe implementation", err)
+	}
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatalf("produce check ran locally for non-local backend (marker err=%v)", statErr)
 	}
 }
 

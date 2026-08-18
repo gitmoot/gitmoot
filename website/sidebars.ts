@@ -62,6 +62,7 @@ const sidebars: SidebarsConfig = {
         'reference/bridge',
         'reference/runtime-adapters',
         'reference/credentials',
+        'reference/remote-exec',
         'reference/result-contract',
         'reference/event-stream',
         'reference/skillopt-exchange-contract',

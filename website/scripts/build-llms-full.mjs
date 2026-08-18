@@ -12,6 +12,7 @@ const sources = [
   'docs/local-workflow.md',
   'docs/plugins.md',
   'docs/adapters.md',
+  'docs/remote-exec.md',
   'docs/troubleshooting.md',
   'docs/events.md',
   'docs/heartbeats.md',

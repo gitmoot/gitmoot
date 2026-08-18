@@ -10,6 +10,7 @@ import (
 	"unicode"
 
 	"github.com/gitmoot/gitmoot/internal/evidence"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
 
@@ -128,12 +129,14 @@ type ResultObservation struct {
 
 // observeResultChanges captures the worktree diff and binds it to the result.
 // A nil observation means the engine has no owned worktree from which to read.
-func observeResultChanges(ctx context.Context, worktree string, result AgentResult) *ResultObservation {
+func observeResultChanges(ctx context.Context, worktree string, result AgentResult, backend execbackend.Backend) *ResultObservation {
 	worktree = strings.TrimSpace(worktree)
 	if worktree == "" {
 		return nil
 	}
-	files, err := changedWorktreeFiles(ctx, worktree)
+	files, err := execbackend.Consume(backend, func() ([]string, error) {
+		return changedWorktreeFiles(ctx, worktree)
+	})
 	if err != nil {
 		return &ResultObservation{
 			Source:           ResultObservationSourceWorktreeDiff,

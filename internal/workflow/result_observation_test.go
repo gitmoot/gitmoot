@@ -7,9 +7,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/evidence"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 )
 
 func TestCompareResultChangesFlagsClaimedFileAbsentFromDiff(t *testing.T) {
@@ -209,7 +211,7 @@ func TestObserveResultChangesReadsTrackedAndUntrackedWorktreeDiff(t *testing.T) 
 
 	observation := observeResultChanges(context.Background(), repo, AgentResult{
 		ChangesMade: []string{"updated tracked.go", "added new.go"},
-	})
+	}, execbackend.Local)
 	if observation == nil || observation.Error != "" {
 		t.Fatalf("observation = %+v, want successful worktree diff", observation)
 	}
@@ -223,6 +225,15 @@ func TestObserveResultChangesReadsTrackedAndUntrackedWorktreeDiff(t *testing.T) 
 		if change.Grade != evidence.GradeObserved {
 			t.Fatalf("corroborated change grade = %q, want observed: %+v", change.Grade, change)
 		}
+	}
+}
+
+func TestObserveResultChangesNonLocalBackendCannotRunLocalGit(t *testing.T) {
+	observation := observeResultChanges(context.Background(), t.TempDir(), AgentResult{
+		ChangesMade: []string{"updated tracked.go"},
+	}, execbackend.Backend("p2-probe"))
+	if observation == nil || !strings.Contains(observation.Error, "p2-probe") || !strings.Contains(observation.Error, "no execution implementation") {
+		t.Fatalf("observation = %+v, want missing p2-probe implementation", observation)
 	}
 }
 

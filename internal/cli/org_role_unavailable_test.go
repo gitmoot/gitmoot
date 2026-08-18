@@ -14,6 +14,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/org"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -172,7 +173,7 @@ func TestForegroundDispatchCapturesQuotaFailureAndClearsOnSuccess(t *testing.T) 
 
 	adapter := &cliWorkerFakeAdapter{err: errors.New("API error: You've hit your weekly limit - resets Jul 28, 1am (Europe/Berlin)")}
 	previousAdapterFactory := localAgentDispatchRuntimeAdapterFor
-	localAgentDispatchRuntimeAdapterFor = func(string, string, string) (runtime.Adapter, error) {
+	localAgentDispatchRuntimeAdapterFor = func(string, runtime.Agent, string) (runtime.Adapter, error) {
 		return adapter, nil
 	}
 	t.Cleanup(func() { localAgentDispatchRuntimeAdapterFor = previousAdapterFactory })
@@ -294,7 +295,7 @@ func TestTempWorkerDispatchCapturesQuotaFailureAndClearsOnSuccess(t *testing.T) 
 	delivery := &cliWorkerFakeAdapter{err: errors.New("API error: You've hit your weekly limit - resets Jul 28, 1am (Europe/Berlin)")}
 	wake := &fakeEventWake{}
 	worker := defaultJobWorker(store, io.Discard, home)
-	worker.StartAdapterFactory = func(string, string) (runtime.Adapter, error) { return starter, nil }
+	worker.StartAdapterFactory = func(execbackend.Backend, string, string) (runtime.Adapter, error) { return starter, nil }
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) { return delivery, nil }
 	worker.QuotaWake = wake
 	policy := config.DefaultParallelSessionPolicy()
@@ -314,7 +315,7 @@ func TestTempWorkerDispatchCapturesQuotaFailureAndClearsOnSuccess(t *testing.T) 
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := worker.runWithTempWorker(context.Background(), job, payload, original, checkout, policy, "test contention", false); err != nil {
+		if err := worker.runWithTempWorker(context.Background(), job, payload, execbackend.Local, original, checkout, policy, "test contention", false); err != nil {
 			t.Fatalf("runWithTempWorker(%s): %v", jobID, err)
 		}
 	}
