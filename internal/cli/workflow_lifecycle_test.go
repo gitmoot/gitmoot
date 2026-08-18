@@ -11,6 +11,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 func TestRunWorkflowAutoSettleOnce(t *testing.T) {
@@ -24,7 +25,7 @@ auto_settle_after = "24h"
 `), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -93,7 +94,7 @@ auto_settle_after = "24h"
 `), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -173,7 +174,7 @@ auto_settle_after = "not-a-duration"
 `), 0o600); err != nil {
 		t.Fatalf("write malformed config: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

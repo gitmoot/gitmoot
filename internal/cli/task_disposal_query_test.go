@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -20,7 +21,7 @@ func TestTaskListQueriesStrandedDisposal(t *testing.T) {
 	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("init code=%d stderr=%s", code, stderr.String())
 	}
-	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +60,7 @@ func TestTaskListFindsStrandedTaskWhenEscalationWriteFails(t *testing.T) {
 	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("init code=%d stderr=%s", code, stderr.String())
 	}
-	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

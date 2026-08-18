@@ -15,6 +15,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/org"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -44,7 +45,7 @@ func TestOrgCommandAndAgentOrgRolePrecedence(t *testing.T) {
 	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +169,7 @@ pane = "w1:p2"
 `), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			store, err := db.Open(paths.Database)
+			store, err := dbtest.Open(t, paths.Database)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -625,6 +626,8 @@ func writeOrgEscalateConfig(t *testing.T) string {
 }
 
 func TestOrgPreflightEnqueueParity(t *testing.T) {
+	t.Parallel()
+
 	for _, tt := range []struct {
 		name          string
 		enforce       string
@@ -823,7 +826,7 @@ func TestRunOrgBriefChartStatusAndPresence(t *testing.T) {
 		t.Fatalf("brief path = %q", got)
 	}
 
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -898,7 +901,7 @@ func TestRunOrgBriefRoleResolution(t *testing.T) {
 			if brief.Role != test.wantRole {
 				t.Fatalf("brief role = %q, want %q", brief.Role, test.wantRole)
 			}
-			store, err := db.Open(paths.Database)
+			store, err := dbtest.Open(t, paths.Database)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1008,7 +1011,7 @@ func TestRunOrgOverviewFlagsConsecutiveMissedWakes(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1061,7 +1064,7 @@ func TestRunOrgOverviewFlagsConsecutiveMissedWakes(t *testing.T) {
 
 func TestRunOrgOverviewZeroThresholdNeverFlags(t *testing.T) {
 	home, paths := setupOrgHome(t)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1255,7 +1258,7 @@ recycle_after = "1ns"
 		},
 		ObservedAt: time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC), ProviderVersion: "0.7.5",
 	}})
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1400,7 +1403,7 @@ func TestRunOrgRecycleValidation(t *testing.T) {
 			if calls != 0 {
 				t.Fatalf("provider Recycle called %d times on validation failure", calls)
 			}
-			store, err := db.Open(paths.Database)
+			store, err := dbtest.Open(t, paths.Database)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1426,7 +1429,7 @@ func TestRunOrgRecycleJournalsAndBootsSuccessor(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1472,7 +1475,7 @@ func TestRunOrgRecycleJournalsAndBootsSuccessor(t *testing.T) {
 	if out.Role != "owner" || out.Pane != "w1:p2" || out.Kind != "codex" || out.AgentName != "owner" || out.WorkflowID != "org/owner" {
 		t.Fatalf("output = %+v", out)
 	}
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1496,7 +1499,7 @@ func TestRunOrgRecycleProviderFailureKeepsHandoff(t *testing.T) {
 	if code := runOrgRecycle([]string{"owner", "--kind", "codex", "--handoff", "Safe to resume.", "--home", home}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "handoff journaled in workflow org/owner") {
 		t.Fatalf("code/stderr = %d/%q", code, stderr.String())
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1534,7 +1537,7 @@ func setupOrgRecycleHome(t *testing.T, pane string) (string, config.Paths) {
 
 func TestValidateAndTouchActingOrgRole(t *testing.T) {
 	home, paths := setupOrgHome(t)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1576,7 +1579,7 @@ func TestValidateAndTouchActingOrgRoleRecycleEnforcement(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			home, paths := setupOrgRecycleEnforcementHome(t, test.mode, test.recycleAfter)
-			store, err := db.Open(paths.Database)
+			store, err := dbtest.Open(t, paths.Database)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1658,7 +1661,7 @@ func (s *recycleOverdueRecordingSink) Emit(ctx context.Context, event events.Eve
 
 func TestRecycleOverdueEventBlockCadenceAndFreshClear(t *testing.T) {
 	home, paths := setupOrgRecycleEnforcementHome(t, "block", "1h")
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1735,7 +1738,7 @@ func TestRecycleOverdueEventOffAndNoRuleAreNoOps(t *testing.T) {
 	old := time.Now().UTC().Add(-2 * time.Hour)
 	t.Run("enforcement off", func(t *testing.T) {
 		home, paths := setupOrgRecycleEnforcementHome(t, "off", "1h")
-		store, err := db.Open(paths.Database)
+		store, err := dbtest.Open(t, paths.Database)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1758,7 +1761,7 @@ func TestRecycleOverdueEventOffAndNoRuleAreNoOps(t *testing.T) {
 
 	t.Run("no enabled event rule", func(t *testing.T) {
 		home, paths := setupOrgRecycleEnforcementHome(t, "block", "1h")
-		store, err := db.Open(paths.Database)
+		store, err := dbtest.Open(t, paths.Database)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1775,7 +1778,7 @@ func TestRecycleOverdueEventOffAndNoRuleAreNoOps(t *testing.T) {
 
 	t.Run("fresh dispatch clears a stale episode without a rule", func(t *testing.T) {
 		home, paths := setupOrgRecycleEnforcementHome(t, "block", "1h")
-		store, err := db.Open(paths.Database)
+		store, err := dbtest.Open(t, paths.Database)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1801,7 +1804,7 @@ func TestRecycleOverdueEventFailurePreservesEnforcementOutcome(t *testing.T) {
 	for _, mode := range []string{"block", "warn"} {
 		t.Run(mode, func(t *testing.T) {
 			home, paths := setupOrgRecycleEnforcementHome(t, mode, "1h")
-			store, err := db.Open(paths.Database)
+			store, err := dbtest.Open(t, paths.Database)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1938,7 +1941,7 @@ func TestRunOrgMalformedConfigFailsClosedWithoutPresence(t *testing.T) {
 	if code := Run([]string{"org", "brief", "--home", home, "--role", "owner"}, &stdout, &stderr); code == 0 || !strings.Contains(stderr.String(), "load org registry") {
 		t.Fatalf("brief code/stderr = %d/%q", code, stderr.String())
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2048,7 +2051,7 @@ func TestOrgEventRuleSetScopeRoundTrip(t *testing.T) {
 	if want := "updated " + id + " scope=observer\n"; stdout.String() != want {
 		t.Fatalf("set-scope output=%q, want %q", stdout.String(), want)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2088,7 +2091,7 @@ func TestOrgEventRuleRepoAliasUsesMatchFilter(t *testing.T) {
 	matchID := add("--match")
 	repoID := add("--repo")
 
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}

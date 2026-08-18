@@ -14,6 +14,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 func TestAgentTemplateUpdateInstallsThermoTemplate(t *testing.T) {
@@ -987,7 +988,7 @@ func TestRetiredPlannerHereTemplateIsHiddenAndBlocked(t *testing.T) {
 
 func seedCachedAgentTemplate(t *testing.T, home string, template db.AgentTemplate) {
 	t.Helper()
-	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

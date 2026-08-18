@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 // These tests bind the #597 review findings: the #556 flock refusal must be
@@ -189,6 +190,13 @@ func TestDaemonStopStopsUntrackedFlockHolder(t *testing.T) {
 		t.Fatalf("os.Executable: %v", err)
 	}
 	home := t.TempDir()
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("preseed migrated store: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close preseeded store: %v", err)
+	}
 	// Cosmetic "daemon run" argv so the kill-guard can verify the holder by its
 	// cmdline, as it would a production `gitmoot daemon run`.
 	p := startDaemonRunProc(t, exe, home, "daemon", "run", "--home", home)

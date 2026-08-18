@@ -156,7 +156,7 @@ func TestJobRuntimeLockLiveness(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			store, err := Open(t.TempDir() + "/gitmoot.db")
+			store, err := openCachedTestStore(t, t.TempDir()+"/gitmoot.db")
 			if err != nil {
 				t.Fatalf("Open returned error: %v", err)
 			}

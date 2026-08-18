@@ -15,6 +15,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/skillopt"
 )
@@ -29,7 +30,7 @@ func candidateNotifyFixture(t *testing.T) (*db.Store, db.AgentTemplateVersion, s
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -119,7 +120,7 @@ func TestRunSkillOptImportOffByDefaultByteIdentical(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -141,7 +142,7 @@ func TestRunSkillOptImportOffByDefaultByteIdentical(t *testing.T) {
 		t.Fatalf("runSkillOptImport exit = %d, stderr: %s", code, stderr.String())
 	}
 
-	store2, err := db.Open(paths.Database)
+	store2, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("reopen store returned error: %v", err)
 	}

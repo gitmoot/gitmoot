@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 func TestReconcileTerminalDrivingJob(t *testing.T) {
@@ -311,7 +312,7 @@ func TestFindLiveTaskJobRepoScoped(t *testing.T) {
 func TestFindLiveTaskJobFindsLegacyJobAfterRepoBackfill(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "gitmoot.db")
-	store, err := db.Open(path)
+	store, err := dbtest.Open(t, path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -348,7 +349,7 @@ func TestFindLiveTaskJobFindsLegacyJobAfterRepoBackfill(t *testing.T) {
 		t.Fatalf("raw Close: %v", err)
 	}
 
-	store, err = db.Open(path)
+	store, err = dbtest.Open(t, path)
 	if err != nil {
 		t.Fatalf("reopen with repo backfill migration: %v", err)
 	}

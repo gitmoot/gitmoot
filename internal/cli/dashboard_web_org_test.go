@@ -16,6 +16,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/org"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -49,7 +50,7 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 	home, paths := setupOrgHome(t)
 	enableDashboardOrgDetection(t, paths.ConfigFile)
 
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +247,7 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 
 func TestDashboardOrgProjectionDistinguishesUnavailableAvailableAndNeverReported(t *testing.T) {
 	_, paths := setupOrgHome(t)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -299,7 +300,7 @@ func TestDashboardOrgProjectionDistinguishesUnavailableAvailableAndNeverReported
 func TestDashboardOrgMissedWakeAgeOutMatchesBadgesAndHealth(t *testing.T) {
 	_, paths := setupOrgHome(t)
 	enableDashboardOrgDetection(t, paths.ConfigFile)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +343,7 @@ func TestDashboardOrgMissedWakeAgeOutMatchesBadgesAndHealth(t *testing.T) {
 func TestDashboardOrgResolvedEscalationSurvivesUnrelatedResolutionVolume(t *testing.T) {
 	_, paths := setupOrgHome(t)
 	enableDashboardOrgDetection(t, paths.ConfigFile)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +389,7 @@ func TestDashboardOrgResolvedEscalationSurvivesUnrelatedResolutionVolume(t *test
 func TestDashboardOrgDetectionDisabledIsHonest(t *testing.T) {
 	home, paths := setupOrgHome(t)
 	enableDashboardOrgDetection(t, paths.ConfigFile)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,7 +423,7 @@ func TestDashboardOrgDetectionUsesLoadedOrchestratePolicy(t *testing.T) {
 			if test.enableKnob {
 				enableDashboardOrgDetection(t, paths.ConfigFile)
 			}
-			store, err := db.Open(paths.Database)
+			store, err := dbtest.Open(t, paths.Database)
 			if err != nil {
 				t.Fatal(err)
 			}

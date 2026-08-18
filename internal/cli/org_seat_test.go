@@ -11,6 +11,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/org"
 )
 
@@ -283,7 +284,7 @@ pane = "Owner"
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +329,7 @@ func appendOrgSeatWorker(t *testing.T, paths config.Paths) {
 
 func addOrgSeatWorkerRoutes(t *testing.T, paths config.Paths) {
 	t.Helper()
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,7 +341,7 @@ func addOrgSeatWorkerRoutes(t *testing.T, paths config.Paths) {
 
 func listOrgSeatTestRules(t *testing.T, paths config.Paths) []db.EventRule {
 	t.Helper()
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -14,6 +14,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/memory"
 )
 
@@ -35,7 +36,7 @@ func reviewScoreSeed(t *testing.T, store *db.Store, templateID, versionID string
 // (one via an @latest ref, to prove the reference split) and one at helper.
 func seedSkillTemplates(t *testing.T, home string) (v3ID string) {
 	t.Helper()
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -210,7 +211,7 @@ func seedKnowledge(t *testing.T, home string) (oldID, newID int64) {
 		}
 	}
 
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -385,7 +386,7 @@ func TestKnowledgeJSONIncludesUsageTelemetry(t *testing.T) {
 	home := dashboardTestHome(t)
 	_, newID := seedKnowledge(t, home)
 	paths := config.PathsForHome(home)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +424,7 @@ func TestKnowledgeFactLinkEdges(t *testing.T) {
 	home := dashboardTestHome(t)
 	paths := config.PathsForHome(home)
 	ctx := context.Background()
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -525,7 +526,7 @@ VALUES (?, ?, ?, 'test', '2026-07-10T00:00:00Z')`, src, dst, score); err != nil 
 	// The UI's repo-filtered view intersects the all-repos edge set against its
 	// visible facts. Feeding that same filtered id map to the edge mapper proves
 	// the cross-repo edge drops without special-case link logic.
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
 	}
@@ -554,7 +555,7 @@ VALUES (?, ?, ?, 'test', '2026-07-10T00:00:00Z')`, src, dst, score); err != nil 
 
 func TestKnowledgeSharedFactsUseAuthorAndExposeMarker(t *testing.T) {
 	home := dashboardTestHome(t)
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -624,7 +625,7 @@ func TestKnowledgeSharedFactsUseAuthorAndExposeMarker(t *testing.T) {
 // members' repo hub.
 func TestKnowledgeClusterHierarchy(t *testing.T) {
 	home := dashboardTestHome(t)
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -762,7 +763,7 @@ func TestKnowledgeClusterHierarchy(t *testing.T) {
 
 func TestKnowledgeClusterPayloadParentIDAndLeafFacts(t *testing.T) {
 	home := dashboardTestHome(t)
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -827,7 +828,7 @@ func TestKnowledgeClusterPayloadParentIDAndLeafFacts(t *testing.T) {
 
 func TestKnowledgeClusterPayloadRollsUpArbitraryDepth(t *testing.T) {
 	home := dashboardTestHome(t)
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

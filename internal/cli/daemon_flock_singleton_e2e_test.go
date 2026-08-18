@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
@@ -24,7 +25,14 @@ func TestMain(m *testing.M) {
 	if home := os.Getenv(daemonRunChildHomeEnv); home != "" {
 		os.Exit(Run([]string{"daemon", "run", "--home", home}, os.Stdout, os.Stderr))
 	}
-	os.Exit(m.Run())
+	code := m.Run()
+	if err := cleanupSharedGitmootTestBinary(); err != nil {
+		fmt.Fprintf(os.Stderr, "clean shared gitmoot test binary: %v\n", err)
+		if code == 0 {
+			code = 1
+		}
+	}
+	os.Exit(code)
 }
 
 // daemonRunProc is one real `daemon run` child process launched by the E2E.

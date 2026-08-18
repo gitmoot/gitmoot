@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
@@ -208,7 +209,7 @@ func TestMailboxRejectsUnreservedPipelineInputEnv(t *testing.T) {
 func TestMailboxShellUpstreamContextPersistsAcrossReopenAndDelivery(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "gitmoot.db")
-	store, err := db.Open(path)
+	store, err := dbtest.Open(t, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +230,7 @@ func TestMailboxShellUpstreamContextPersistsAcrossReopenAndDelivery(t *testing.T
 		t.Fatal(err)
 	}
 
-	store, err = db.Open(path)
+	store, err = dbtest.Open(t, path)
 	if err != nil {
 		t.Fatal(err)
 	}

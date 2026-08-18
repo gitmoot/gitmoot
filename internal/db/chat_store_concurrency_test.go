@@ -18,7 +18,7 @@ import (
 // with "assign chat message seq after N attempts: database is locked".
 func TestAddChatMessageConcurrentSeatsDoNotDropTurns(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gitmoot.db")
-	owner, err := Open(path)
+	owner, err := openCachedTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -34,7 +34,7 @@ func TestAddChatMessageConcurrentSeatsDoNotDropTurns(t *testing.T) {
 	const rounds = 5
 	stores := make([]*Store, seats)
 	for i := range stores {
-		st, err := Open(path)
+		st, err := openCachedTestStore(t, path)
 		if err != nil {
 			t.Fatalf("Open seat %d: %v", i, err)
 		}
@@ -85,7 +85,7 @@ func TestAddChatMessageConcurrentSeatsDoNotDropTurns(t *testing.T) {
 // TestCountInFlightChatThreadJobs proves the real-time in-flight gate query counts
 // only an agent's not-yet-terminal jobs whose payload links them to the thread.
 func TestCountInFlightChatThreadJobs(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestCountInFlightChatThreadJobs(t *testing.T) {
 // excluded from the auto-respond candidate set: a seat's @mention of a peer must not
 // double-drive that peer with an extra auto-respond ask on top of its seat job.
 func TestListChatAutoRespondCandidatesExcludesMoot(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

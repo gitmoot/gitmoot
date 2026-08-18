@@ -13,6 +13,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/memory"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -52,7 +53,7 @@ func memoryLifecycleHome(t *testing.T, memoryConfig string) (string, config.Path
 	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+memoryConfig), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

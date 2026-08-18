@@ -10,6 +10,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/skillopt"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -73,7 +74,7 @@ func (s harvestGitHubStub) ListPullRequestChecks(context.Context, github.Reposit
 // openTraceChainStore opens a throwaway SQLite store for the full-chain test.
 func openTraceChainStore(t *testing.T) *db.Store {
 	t.Helper()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

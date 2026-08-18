@@ -15,6 +15,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -162,7 +163,7 @@ Document the workflow.
 		t.Fatalf("goal import output = %q", stdout.String())
 	}
 
-	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -334,7 +335,7 @@ func TestRunGoalImportPreservesExistingTaskProgress(t *testing.T) {
 		t.Fatalf("first import exit code = %d, stderr=%s", code, stderr.String())
 	}
 
-	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -360,7 +361,7 @@ func TestRunGoalImportPreservesExistingTaskProgress(t *testing.T) {
 		t.Fatalf("second import exit code = %d, stderr=%s", code, stderr.String())
 	}
 
-	store, err = db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	store, err = dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
 	}
@@ -384,7 +385,7 @@ func TestRunTaskList(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("goal import exit code = %d, stderr=%s", code, stderr.String())
 	}
-	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -438,7 +439,7 @@ func TestRunGoalImportRollsBackOnTaskFailure(t *testing.T) {
 	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("init exit code = %d, stderr=%s", code, stderr.String())
 	}
-	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -466,7 +467,7 @@ func TestRunGoalImportRollsBackOnTaskFailure(t *testing.T) {
 		t.Fatalf("import exit code = %d, want 1; stderr=%s", code, stderr.String())
 	}
 
-	store, err = db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	store, err = dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
 	}
@@ -585,7 +586,7 @@ func TestRunTaskRunRegistersCurrentRepo(t *testing.T) {
 		t.Fatalf("stdout missing task job id: %q", stdout.String())
 	}
 
-	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -654,7 +655,7 @@ func TestRunTaskRunRegistersCurrentRepo(t *testing.T) {
 	if !strings.Contains(stdout.String(), "job: task-task-001-implement-lead-") {
 		t.Fatalf("stale rerun stdout missing fresh task job id: %q", stdout.String())
 	}
-	store, err = db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	store, err = dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("reopen store after stale rerun: %v", err)
 	}
@@ -691,7 +692,7 @@ func TestRunTaskRunRegistersCurrentRepo(t *testing.T) {
 	if !strings.Contains(stdout.String(), "job: "+updatedQueuedJobID) {
 		t.Fatalf("duplicate rerun stdout = %q, want existing job %s", stdout.String(), updatedQueuedJobID)
 	}
-	store, err = db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	store, err = dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("reopen store after duplicate rerun: %v", err)
 	}
@@ -712,7 +713,7 @@ func TestRunTaskRunRegistersCurrentRepo(t *testing.T) {
 	if !strings.Contains(stdout.String(), "job: task-task-001-implement-lead-") {
 		t.Fatalf("rerun stdout missing fresh task job id: %q", stdout.String())
 	}
-	store, err = db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	store, err = dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
 	}
@@ -1305,7 +1306,7 @@ func TestRunTaskRunWaitsWhenCheckoutMutationLocked(t *testing.T) {
 	runGit(t, repoDir, "-c", "user.name=Gitmoot Test", "-c", "user.email=gitmoot@example.com", "commit", "-m", "initial")
 	withWorkingDirectory(t, repoDir)
 
-	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

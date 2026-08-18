@@ -7,7 +7,7 @@ import (
 )
 
 func TestOrgRolePresenceMigrationAndUpsert(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openRealTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -45,7 +45,7 @@ func TestOrgRolePresenceMigrationAndUpsert(t *testing.T) {
 }
 
 func TestOrgRolePresenceKeyIsCanonicalized(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -70,7 +70,7 @@ func TestOrgRolePresenceKeyIsCanonicalized(t *testing.T) {
 }
 
 func TestTouchOrgRolePresenceRejectsEmptyRole(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}

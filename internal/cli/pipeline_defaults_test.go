@@ -5,7 +5,6 @@ import (
 	"context"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -118,7 +117,7 @@ func TestDefaultMemoryIngestSweepNoSourcesSkip(t *testing.T) {
 	home, _, store := heartbeatLoopE2EHome(t)
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	t.Setenv(defaultMemoryPipelineBinEnv, buildGitmootTestBinary(t))
+	t.Setenv(defaultMemoryPipelineBinEnv, sharedGitmootTestBinary(t))
 	runInstallDefaults(t, home)
 
 	run := runDefaultPipelineToTerminal(t, home, store, "memory-ingest-sweep")
@@ -139,7 +138,7 @@ func TestDefaultMemoryIngestSweepTwoSourcesE2E(t *testing.T) {
 	home, paths, store := heartbeatLoopE2EHome(t)
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	t.Setenv(defaultMemoryPipelineBinEnv, buildGitmootTestBinary(t))
+	t.Setenv(defaultMemoryPipelineBinEnv, sharedGitmootTestBinary(t))
 	runInstallDefaults(t, home)
 	assertDefaultIngestPipelineShape(t, store)
 
@@ -190,7 +189,7 @@ func TestDefaultMemoryIngestSweepAllSourcesFailIsLoud(t *testing.T) {
 	home, paths, store := heartbeatLoopE2EHome(t)
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	t.Setenv(defaultMemoryPipelineBinEnv, buildGitmootTestBinary(t))
+	t.Setenv(defaultMemoryPipelineBinEnv, sharedGitmootTestBinary(t))
 	missing := filepath.Join(t.TempDir(), "missing")
 	appendConfig(t, paths, `
 [[memory.ingest]]
@@ -230,7 +229,7 @@ func TestDefaultMemoryGroomProposeE2E(t *testing.T) {
 	home, paths, store := heartbeatLoopE2EHome(t)
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	t.Setenv(defaultMemoryPipelineBinEnv, buildGitmootTestBinary(t))
+	t.Setenv(defaultMemoryPipelineBinEnv, sharedGitmootTestBinary(t))
 	appendConfig(t, paths, `
 [memory.pipelines]
 repo = "owner/repo"
@@ -361,21 +360,6 @@ func appendConfig(t *testing.T, paths config.Paths, body string) {
 	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+body), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-}
-
-func buildGitmootTestBinary(t *testing.T) string {
-	t.Helper()
-	root, err := filepath.Abs("../..")
-	if err != nil {
-		t.Fatalf("resolve repo root: %v", err)
-	}
-	bin := filepath.Join(t.TempDir(), "gitmoot")
-	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", bin, "./cmd/gitmoot")
-	cmd.Dir = root
-	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("build gitmoot test binary: %v\n%s", err, string(output))
-	}
-	return bin
 }
 
 func listRelativeFiles(t *testing.T, root string) []string {

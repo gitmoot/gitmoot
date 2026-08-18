@@ -25,7 +25,7 @@ func baseline(t *testing.T, store *Store, key string) (int, int) {
 // the stored baseline advances to the newest cumulative after every call.
 func TestRecordRuntimeSessionUsageDelta(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestRecordRuntimeSessionUsageDelta(t *testing.T) {
 // are measured from there.
 func TestRecordRuntimeSessionUsageDeltaBackwardsResync(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestRecordRuntimeSessionUsageDeltaBackwardsResync(t *testing.T) {
 // cumulative report is clamped to 0 before it can corrupt the baseline.
 func TestRecordRuntimeSessionUsageDeltaNegativeClamp(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestRecordRuntimeSessionUsageDeltaNegativeClamp(t *testing.T) {
 // arrival order (a backwards arrival clamps to 0 and resyncs the baseline).
 func TestRecordRuntimeSessionUsageDeltaConcurrent(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

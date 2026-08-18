@@ -8,7 +8,7 @@ import (
 )
 
 func TestBlockedEpisodeRoundTripKeepsFirstBlockedSince(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -71,7 +71,7 @@ func TestBlockedEpisodeRoundTripKeepsFirstBlockedSince(t *testing.T) {
 }
 
 func TestUpsertBlockedEpisodeRejectsEmptySubject(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

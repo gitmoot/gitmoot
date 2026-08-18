@@ -10,6 +10,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 func TestSQLiteAutoVacuumDoctorCheckModes(t *testing.T) {
@@ -51,7 +52,7 @@ func TestSQLiteAutoVacuumDoctorCheckModes(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(incrementalPaths.Database), 0o700); err != nil {
 		t.Fatalf("create incremental home: %v", err)
 	}
-	store, err := db.Open(incrementalPaths.Database)
+	store, err := dbtest.Open(t, incrementalPaths.Database)
 	if err != nil {
 		t.Fatalf("open incremental database: %v", err)
 	}

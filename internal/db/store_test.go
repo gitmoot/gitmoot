@@ -19,7 +19,7 @@ import (
 
 func TestOpenMigratesSchema(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openRealTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -80,9 +80,40 @@ func TestOpenMigratesSchema(t *testing.T) {
 	}
 }
 
+func TestOpenAlreadyMigratedConfiguresSQLiteWithoutMigrating(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenAlreadyMigrated(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("OpenAlreadyMigrated returned error: %v", err)
+	}
+	defer store.Close()
+
+	var busyTimeout int
+	if err := store.db.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil {
+		t.Fatalf("PRAGMA busy_timeout returned error: %v", err)
+	}
+	if busyTimeout != sqliteBusyTimeoutMillis {
+		t.Fatalf("busy_timeout = %d, want %d", busyTimeout, sqliteBusyTimeoutMillis)
+	}
+	var journalMode string
+	if err := store.db.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&journalMode); err != nil {
+		t.Fatalf("PRAGMA journal_mode returned error: %v", err)
+	}
+	if journalMode != "wal" {
+		t.Fatalf("journal_mode = %q, want wal", journalMode)
+	}
+	migrated, err := store.HasTable(ctx, "schema_migrations")
+	if err != nil {
+		t.Fatalf("HasTable(schema_migrations) returned error: %v", err)
+	}
+	if migrated {
+		t.Fatal("OpenAlreadyMigrated unexpectedly ran migrations")
+	}
+}
+
 func TestOpenConfiguresSQLiteContentionPragmas(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gitmoot.db")
-	store, err := Open(path)
+	store, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -142,7 +173,7 @@ func TestOpenDoesNotFullVacuumLegacyDatabase(t *testing.T) {
 		t.Fatalf("close raw legacy database: %v", err)
 	}
 
-	store, err := Open(path)
+	store, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open legacy database: %v", err)
 	}
@@ -184,7 +215,7 @@ func TestOpenPreservesExistingFullAutoVacuumMode(t *testing.T) {
 		t.Fatalf("close raw full auto-vacuum database: %v", err)
 	}
 
-	store, err := Open(path)
+	store, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open full auto-vacuum database: %v", err)
 	}
@@ -208,7 +239,7 @@ func TestOpenPreservesExistingFullAutoVacuumMode(t *testing.T) {
 
 func TestIncrementalVacuumReclaimsOnlyRequestedPages(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "incremental.db"))
+	store, err := openRealTestStore(t, filepath.Join(t.TempDir(), "incremental.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -251,7 +282,7 @@ func TestIncrementalVacuumReclaimsOnlyRequestedPages(t *testing.T) {
 
 func TestNoCIObservationRoundTripAndReset(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -288,7 +319,7 @@ func TestNoCIObservationRoundTripAndReset(t *testing.T) {
 }
 
 func TestOpenConfiguresSynchronousNormal(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openRealTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -316,7 +347,7 @@ func TestOpenConfiguresSynchronousNormal(t *testing.T) {
 
 func TestInteractivePromptStorageAndAnswerValidation(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -378,7 +409,7 @@ func TestInteractivePromptStorageAndAnswerValidation(t *testing.T) {
 
 func TestDeleteInteractivePrompt(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -400,7 +431,7 @@ func TestDeleteInteractivePrompt(t *testing.T) {
 
 func TestDeleteInteractivePromptsByState(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -442,7 +473,7 @@ func TestDeleteInteractivePromptsByState(t *testing.T) {
 
 func TestListSkillOptTrainSessions(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -478,7 +509,7 @@ func TestListSkillOptTrainSessions(t *testing.T) {
 
 func TestSkillOptTrainSessionAndIterationStorage(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -576,7 +607,7 @@ func TestSkillOptTrainSessionAndIterationStorage(t *testing.T) {
 
 func TestSkillOptTrainStorageDefaultsAndValidation(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -617,7 +648,7 @@ func TestSkillOptTrainStorageDefaultsAndValidation(t *testing.T) {
 
 func TestSkillOptReviewWatchStorage(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -679,7 +710,7 @@ func TestSkillOptReviewWatchStorage(t *testing.T) {
 
 func TestSkillOptTrainPublicationAndReviewWatchStorageIsTransactional(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -717,7 +748,7 @@ func TestSkillOptTrainPublicationAndReviewWatchStorageIsTransactional(t *testing
 
 func TestEvalStorageMethods(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -791,7 +822,7 @@ func TestEvalStorageMethods(t *testing.T) {
 
 func TestEvalRunDefaultsToValidationMode(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -811,7 +842,7 @@ func TestEvalRunDefaultsToValidationMode(t *testing.T) {
 
 func TestEvalRunRejectsInvalidModeAndExplorationLevel(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -830,7 +861,7 @@ func TestEvalRunRejectsInvalidModeAndExplorationLevel(t *testing.T) {
 
 func TestRankedReviewStorageAndPairwisePreferences(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -926,7 +957,7 @@ func TestRankedReviewStorageAndPairwisePreferences(t *testing.T) {
 // stored Reasoning (the judge position blob channel) round-trips verbatim.
 func TestListRankedFeedbackEventsAcrossRuns(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -994,7 +1025,7 @@ func TestListRankedFeedbackEventsAcrossRuns(t *testing.T) {
 
 func TestRankedReviewTieGroupsSkipInGroupPairwisePreferences(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1069,7 +1100,7 @@ func TestRankedReviewTieGroupsSkipInGroupPairwisePreferences(t *testing.T) {
 
 func TestRankedReviewStorageRejectsInvalidReferences(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1172,7 +1203,7 @@ func TestRankedReviewStorageRejectsInvalidReferences(t *testing.T) {
 
 func TestRankedReviewStorageRejectsOptionCountMismatch(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1204,7 +1235,7 @@ func TestRankedReviewStorageRejectsOptionCountMismatch(t *testing.T) {
 
 func TestReplaceGeneratedEvalReviewArtifactsRollsBackBatch(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1258,7 +1289,7 @@ func TestReplaceGeneratedEvalReviewArtifactsRollsBackBatch(t *testing.T) {
 
 func TestReplaceGeneratedEvalReviewArtifactsForItemPersists(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1305,7 +1336,7 @@ func TestReplaceGeneratedEvalReviewArtifactsForItemPersists(t *testing.T) {
 
 func TestReplaceGeneratedEvalReviewArtifactsForItemRollsBack(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1353,7 +1384,7 @@ func TestReplaceGeneratedEvalReviewArtifactsForItemRollsBack(t *testing.T) {
 
 func TestReplaceGeneratedEvalReviewArtifactsForItemNoClobber(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1426,7 +1457,7 @@ func TestReplaceGeneratedEvalReviewArtifactsForItemNoClobber(t *testing.T) {
 
 func TestFeedbackEventMethods(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1498,7 +1529,7 @@ func TestFeedbackEventMethods(t *testing.T) {
 
 func TestListResourceLocks(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1537,7 +1568,7 @@ func TestListResourceLocks(t *testing.T) {
 
 func TestResourceLockMethods(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1641,7 +1672,7 @@ func TestResourceLockMethods(t *testing.T) {
 
 func TestDeleteResourceLocksByOwner(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1689,7 +1720,7 @@ func TestDeleteResourceLocksByOwner(t *testing.T) {
 
 func TestDeleteResourceLocksByOwnerIfNotRunning(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1739,7 +1770,7 @@ func TestDeleteResourceLocksByOwnerIfNotRunning(t *testing.T) {
 
 func TestResourceLockRecoversExpiredLock(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1784,7 +1815,7 @@ func TestResourceLockRecoversExpiredLock(t *testing.T) {
 
 func TestResourceLockCleanupSkipsPIDBackedLease(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1827,7 +1858,7 @@ func TestResourceLockCleanupSkipsPIDBackedLease(t *testing.T) {
 // pid-backed lock is still protected (TestResourceLockCleanupSkipsPIDBackedLease).
 func TestDeleteExpiredResourceLocksReapsPIDBackedRuntimeLock(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1860,7 +1891,7 @@ func TestDeleteExpiredResourceLocksReapsPIDBackedRuntimeLock(t *testing.T) {
 
 func TestListExpiredRuntimeSessionLocks(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1889,7 +1920,7 @@ func TestListExpiredRuntimeSessionLocks(t *testing.T) {
 
 func TestExpiredRuntimeLockReaperCanRecoverRunningOwner(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1933,7 +1964,7 @@ func TestExpiredRuntimeLockReaperCanRecoverRunningOwner(t *testing.T) {
 
 func TestStopAgentInstance(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -1977,7 +2008,7 @@ func TestStopAgentInstance(t *testing.T) {
 
 func TestAgentInstanceMethods(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -2164,7 +2195,7 @@ func TestReconcileOrphanedRunningInstances(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+			store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 			if err != nil {
 				t.Fatalf("Open returned error: %v", err)
 			}
@@ -2200,7 +2231,7 @@ func TestReconcileOrphanedRunningInstances(t *testing.T) {
 
 func TestRepositoryMethods(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -2811,7 +2842,7 @@ func TestRepositoryMethods(t *testing.T) {
 
 func TestHealRepoCheckoutRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -2852,7 +2883,7 @@ func TestUpsertRepoProtectsPrimaryCheckoutFromLinkedWorktree(t *testing.T) {
 	linked := filepath.Join(t.TempDir(), "linked")
 	runStoreGit(t, primary, "worktree", "add", "-b", "task", linked)
 
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -2894,7 +2925,7 @@ func runStoreGit(t *testing.T, dir string, args ...string) {
 
 func TestBranchLockSkipNativeReviewFanout(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -2949,7 +2980,7 @@ func TestBranchLockSkipNativeReviewFanout(t *testing.T) {
 
 func TestAddPendingAgentTemplateCandidateRollsBackArtifacts(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -3029,7 +3060,7 @@ func TestMigrateCopiesAgentRepoScopeToAgentRepos(t *testing.T) {
 	store := &Store{db: raw}
 	defer store.Close()
 
-	agentReposMigration := len(migrations) - 1
+	agentReposMigration := len(migrationsBefore(t, "agent_repos"))
 	for i, migration := range migrations {
 		if strings.Contains(migration, "CREATE TABLE agent_repos") {
 			agentReposMigration = i
@@ -3068,7 +3099,7 @@ func TestMigrateAppendsAgentInstanceAutonomyPolicy(t *testing.T) {
 		t.Fatalf("sql.Open returned error: %v", err)
 	}
 	store := &Store{db: raw}
-	for version, migration := range migrations[:len(migrations)-1] {
+	for version, migration := range migrationsBefore(t, "ADD COLUMN autonomy_policy") {
 		if err := store.applyMigration(ctx, version+1, migration); err != nil {
 			t.Fatalf("applyMigration(%d) returned error: %v", version+1, err)
 		}
@@ -3081,7 +3112,7 @@ func TestMigrateAppendsAgentInstanceAutonomyPolicy(t *testing.T) {
 		t.Fatalf("raw Close returned error: %v", err)
 	}
 
-	upgraded, err := Open(path)
+	upgraded, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open upgraded DB returned error: %v", err)
 	}
@@ -3103,7 +3134,7 @@ func TestMigrateAppendsTaskWorktreePath(t *testing.T) {
 		t.Fatalf("sql.Open returned error: %v", err)
 	}
 	store := &Store{db: raw}
-	for version, migration := range migrations[:len(migrations)-1] {
+	for version, migration := range migrationsBefore(t, "worktree_path") {
 		if err := store.applyMigration(ctx, version+1, migration); err != nil {
 			t.Fatalf("applyMigration(%d) returned error: %v", version+1, err)
 		}
@@ -3116,7 +3147,7 @@ func TestMigrateAppendsTaskWorktreePath(t *testing.T) {
 		t.Fatalf("raw Close returned error: %v", err)
 	}
 
-	upgraded, err := Open(path)
+	upgraded, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open upgraded DB returned error: %v", err)
 	}
@@ -3183,7 +3214,7 @@ func TestPollIntervalInheritanceMigrationPreservesExplicitValues(t *testing.T) {
 
 func TestTaskWorktreePathStorage(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -3226,7 +3257,7 @@ func TestTaskWorktreePathStorage(t *testing.T) {
 
 func TestTasksRequireUniqueNonEmptyBranches(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -3248,7 +3279,7 @@ func TestTasksRequireUniqueNonEmptyBranches(t *testing.T) {
 
 func TestTasksAllowSameBranchAcrossRepos(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -3301,7 +3332,7 @@ func TestMigrationDeduplicatesExistingTaskBranches(t *testing.T) {
 		t.Fatalf("raw Close returned error: %v", err)
 	}
 
-	store, err := Open(path)
+	store, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -3367,7 +3398,7 @@ func TestMigrationCopiesPresetsToAgentTemplates(t *testing.T) {
 		t.Fatalf("raw Close returned error: %v", err)
 	}
 
-	store, err := Open(path)
+	store, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -3412,7 +3443,7 @@ func TestMigrationCopiesPresetsToAgentTemplates(t *testing.T) {
 
 func TestListJobsByParent(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -3465,7 +3496,7 @@ func TestListJobsByParent(t *testing.T) {
 
 func TestUpsertAgentPersistsModelAndEffort(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -3532,7 +3563,7 @@ func TestUpsertAgentPersistsModelAndEffort(t *testing.T) {
 
 func TestUpsertAgentInstancePersistsModelAndEffort(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -3579,7 +3610,7 @@ func TestUpsertAgentInstancePersistsModelAndEffort(t *testing.T) {
 
 func TestSkillOptJudgeOutcomeCRUDRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -3708,7 +3739,7 @@ func TestDecideSkillOptTrainCandidateCapturesJudgeOutcome(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+			store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 			if err != nil {
 				t.Fatalf("Open returned error: %v", err)
 			}
@@ -3754,7 +3785,7 @@ func TestDecideSkillOptTrainCandidateSkipsCaptureWithoutJudgeSignal(t *testing.T
 	// record a misleading "judge rejected" outcome — it is skipped entirely.
 	for _, report := range []string{"", "{}", `{"summary":"no judge fields here"}`} {
 		ctx := context.Background()
-		store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+		store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 		if err != nil {
 			t.Fatalf("Open returned error: %v", err)
 		}
@@ -3849,7 +3880,7 @@ func seedSkillOptJudgeCandidate(t *testing.T, store *Store, evalReportJSON strin
 
 func TestCockpitPaneCRUDRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -3952,7 +3983,7 @@ func TestCockpitPaneCRUDRoundTrip(t *testing.T) {
 
 func TestCockpitPaneUniquePerWorkspaceSeat(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -3996,7 +4027,7 @@ func TestCockpitPaneUniquePerWorkspaceSeat(t *testing.T) {
 
 func TestDeleteCockpitPaneByJob(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -4040,7 +4071,7 @@ func TestDeleteCockpitPaneByJob(t *testing.T) {
 // sql.ErrNoRows — when none exists.
 func TestGetCockpitPaneByKey(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -4087,7 +4118,7 @@ func TestGetCockpitPaneByKey(t *testing.T) {
 // roots, oldest first.
 func TestListAllCockpitPanes(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -4127,7 +4158,7 @@ func TestListAllCockpitPanes(t *testing.T) {
 
 func TestGetOrCreateWorkspaceForRoot(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -4194,7 +4225,7 @@ func TestGetOrCreateWorkspaceForRoot(t *testing.T) {
 // miss (never sql.ErrNoRows); delete drops the row and is idempotent.
 func TestGetAndDeleteWorkspaceForRoot(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -4235,7 +4266,7 @@ func TestGetAndDeleteWorkspaceForRoot(t *testing.T) {
 
 func TestGetOrCreateWorkspaceForRootConcurrent(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -4323,7 +4354,7 @@ func TestJobIDsWithPendingDelegationWorktreeReclaim(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -4372,7 +4403,7 @@ func TestJobIDsWithPendingDelegationWorktreeReclaim(t *testing.T) {
 // write. It must never error or deadlock under -race.
 func TestJobIDsWithPendingDelegationWorktreeReclaimRaceSafe(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -4490,7 +4521,7 @@ func TestJobIDsWithPendingAdvanceRetry(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -4539,7 +4570,7 @@ func TestJobIDsWithPendingCommentRetry(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -4578,7 +4609,7 @@ func TestJobIDsWithPendingCommentRetry(t *testing.T) {
 // review: it fails if the SQL kind literals ever drift from the daemon predicates.
 func TestJobIDsWithPendingRetryMutationGuard(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -4646,7 +4677,7 @@ func TestJobIDsWithPendingRetryMutationGuard(t *testing.T) {
 // -race.
 func TestJobIDsWithPendingAdvanceRetryRaceSafe(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -4766,7 +4797,7 @@ func TestJobIDsWithOpenEscalation(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -4804,7 +4835,7 @@ func TestJobIDsWithOpenEscalation(t *testing.T) {
 // caught (#598).
 func TestJobIDsWithOpenEscalationMutationGuard(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -4848,7 +4879,7 @@ func TestJobIDsWithOpenEscalationMutationGuard(t *testing.T) {
 // requests/resolves escalations. Must not error or deadlock under -race.
 func TestJobIDsWithOpenEscalationRaceSafe(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -4936,7 +4967,7 @@ func explainQueryPlan(t *testing.T, store *Store, query string, args ...any) str
 // column is `kind`) is now the SOLE kind index — every kind-filtered query still
 // plans through it after the drop.
 func TestJobEventsKindJobIDCoveringIndexPlan(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -4986,7 +5017,7 @@ func TestJobEventsKindJobIDCoveringIndexPlan(t *testing.T) {
 // (payload included) — in id order, and nil for a type with no rows.
 func TestListJobsByType(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -5051,7 +5082,7 @@ func TestListJobsByType(t *testing.T) {
 
 func TestListJobsByStateAndRepoUseIndexedFilters(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -5137,7 +5168,7 @@ func TestListJobsByStateAndRepoUseIndexedFilters(t *testing.T) {
 
 func TestJobRepoBackfillMigrationUpdatesOnlyStaleRows(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openRealTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -5217,7 +5248,7 @@ func TestJobRepoBackfillMigrationUpdatesOnlyStaleRows(t *testing.T) {
 
 func TestListActiveJobsReturnsOnlyQueuedAndRunningInIDOrder(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -5251,7 +5282,7 @@ func TestListActiveJobsReturnsOnlyQueuedAndRunningInIDOrder(t *testing.T) {
 // queued rows in created_at then rowid order.
 func TestListQueuedJobsUsesQueuedIndex(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -5306,7 +5337,7 @@ func TestListQueuedJobsUsesQueuedIndex(t *testing.T) {
 // by idx_jobs_running_updated_at.
 func TestListRunningJobsUpdatedBeforeOrder(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -5359,7 +5390,7 @@ func TestListRunningJobsUpdatedBeforeOrder(t *testing.T) {
 
 func TestJobGatesRecordListSatisfyCount(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -5415,7 +5446,7 @@ func TestJobGatesRecordListSatisfyCount(t *testing.T) {
 
 func TestListOpenJobGates(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -5455,7 +5486,7 @@ func TestListOpenJobGates(t *testing.T) {
 
 func TestRecordJobGatesReopensRepeatedNeedOnReblock(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

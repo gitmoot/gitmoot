@@ -12,6 +12,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 func TestWebDataSourceSubscribeSharesPollerAndSeedsLateJoiner(t *testing.T) {
@@ -67,7 +68,7 @@ func TestWebDataSourceSubscribeSharesPollerAndSeedsLateJoiner(t *testing.T) {
 
 func TestWebDataSourceSubscribeSharedFanoutOnChange(t *testing.T) {
 	home := dashboardTestHome(t)
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -112,7 +113,7 @@ func TestWebDataSourceSubscribeSharedFanoutOnChange(t *testing.T) {
 		}
 	})
 
-	store, err = db.Open(config.PathsForHome(home).Database)
+	store, err = dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

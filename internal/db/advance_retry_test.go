@@ -46,7 +46,7 @@ func TestLatestAdvancementMarker(t *testing.T) {
 // single row while leaving the job a valid pending-advance-retry candidate.
 func TestAdvanceRetryCollapseMigration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gitmoot.db")
-	store, err := Open(path)
+	store, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestAdvanceRetryCollapseMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store2, err := Open(path)
+	store2, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("re-open (re-apply collapse migration): %v", err)
 	}

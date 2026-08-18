@@ -163,6 +163,8 @@ func TestKeyCLIRegistryGrantsAndSecretSafety(t *testing.T) {
 }
 
 func TestKeyConfigureRejectsUnsafeProxyMetadata(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name     string
 		upstream string

@@ -235,7 +235,7 @@ func TestCanaryMigrationOnPreExistingDB(t *testing.T) {
 	// Apply every migration EXCEPT the last (the #484 canary migration), then seed a
 	// version row through the schema-before-canary.
 	store := &Store{db: raw}
-	for version, migration := range migrations[:len(migrations)-1] {
+	for version, migration := range migrationsBefore(t, "canary_sample") {
 		if err := store.applyMigration(ctx, version+1, migration); err != nil {
 			t.Fatalf("applyMigration(%d): %v", version+1, err)
 		}
@@ -248,7 +248,7 @@ func TestCanaryMigrationOnPreExistingDB(t *testing.T) {
 		t.Fatalf("close raw: %v", err)
 	}
 
-	upgraded, err := Open(path)
+	upgraded, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open (migrate): %v", err)
 	}
@@ -261,7 +261,7 @@ func TestCanaryMigrationOnPreExistingDB(t *testing.T) {
 		t.Fatalf("migrated row canary defaults = (%v, %q), want (0, \"\")", v.CanarySample, v.CanaryStartedAt)
 	}
 	// Idempotent: re-opening applies nothing new.
-	again, err := Open(path)
+	again, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("re-Open (idempotent migrate): %v", err)
 	}

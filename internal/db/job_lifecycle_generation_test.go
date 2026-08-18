@@ -10,7 +10,7 @@ var _ func(*Store, context.Context, string, string, int64, string, string, JobEv
 
 func openLifecycleGenerationStore(t *testing.T) *Store {
 	t.Helper()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

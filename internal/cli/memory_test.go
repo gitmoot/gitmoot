@@ -13,6 +13,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/memory"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -24,7 +25,7 @@ func memoryTestHome(t *testing.T) (string, *db.Store) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

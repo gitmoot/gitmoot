@@ -13,6 +13,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -76,7 +77,7 @@ func TestOrgDirectiveSendBodySourcesAndDirectionPolicy(t *testing.T) {
 			if code := runOrg(test.args(home), &stdout, &stderr); code != 0 {
 				t.Fatalf("send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 			}
-			store, err := db.Open(config.PathsForHome(home).Database)
+			store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -131,7 +132,7 @@ func TestOrgDirectiveAckAuthorizationAndUnackedQuery(t *testing.T) {
 	if code := runOrg([]string{"directive", "ack", fmt.Sprint(directiveID), "--home", home, "--by", "peer"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "cannot acknowledge") {
 		t.Fatalf("unauthorized ack code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +214,7 @@ func TestDirectiveWakeOutboxIsConfigInert(t *testing.T) {
 	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/inert", "act"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,7 +349,7 @@ func TestOrgDirectiveDoneVerbAuthorizationAndCompletion(t *testing.T) {
 	// the CLI would report "completed" while persisting only RECEIPT, leaving the
 	// obligation open. Assert the persisted marker is a done marker naming this
 	// directive, and that no ack marker was written in its place.
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,7 +423,7 @@ func TestOrgDirectiveDoneRefusesSenderAndAncestors(t *testing.T) {
 	}
 
 	// And no completion marker may have been persisted by the refused attempt.
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -468,7 +469,7 @@ func TestOrgDirectiveDoneClearsUnackedListWithoutAck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -533,7 +534,7 @@ func TestOrgDirectiveNudgeClaimRefusesTerminatedObligation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatal(err)
 	}

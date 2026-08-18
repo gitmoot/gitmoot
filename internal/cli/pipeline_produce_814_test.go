@@ -11,6 +11,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -45,7 +46,7 @@ func TestApplyProduceRuntimeGrantsRevalidatesSymlinkAndScopesByAction(t *testing
 	if err := os.MkdirAll(config.PathsForHome(home).Home, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +111,7 @@ func TestApplyProduceRuntimeReadableGrantsRevalidateAtDelivery(t *testing.T) {
 	if err := os.WriteFile(paths.ConfigFile, []byte(configBody), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +185,7 @@ func TestApplyProduceRuntimeGrantsAutoIncludesClaudeHooksAndPreservesNoReads(t *
 	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +244,7 @@ func TestApplyProduceRuntimeGrantsRefusesProtectedClaudeHookLoudly(t *testing.T)
 		t.Fatal(err)
 	}
 	writeClaudeProduceSettings(t, configDir, fmt.Sprintf(`{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":%q}]}]}}`, hookPath))
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +284,7 @@ func TestApplyProduceRuntimeGrantsRecordsClaudeHookParseWarning(t *testing.T) {
 	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -393,7 +394,7 @@ func TestValidatePipelineProducePathsRejectsProtectedAndSymlinkedTargets(t *test
 	if err := os.MkdirAll(config.PathsForHome(home).Home, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,7 +440,7 @@ func TestValidatePipelineProduceReadPaths(t *testing.T) {
 	if err := os.WriteFile(paths.ConfigFile, []byte(configBody), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}

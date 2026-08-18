@@ -14,6 +14,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -52,7 +53,7 @@ scope = ["*"]
 
 func openDirectiveTTLStore(t *testing.T, home string) *db.Store {
 	t.Helper()
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -629,7 +630,7 @@ func TestDirectiveNagInsertToDrainDelivers(t *testing.T) {
 	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -641,11 +642,11 @@ func TestDirectiveNagInsertToDrainDelivers(t *testing.T) {
 	// addresses the sender's PARENT, so a single addressed rule satisfies one path
 	// and silently starves the other — no targetRoles, no insert, no error.
 	if err := store.AddEventRule(ctx, db.EventRule{
-		ID:      "probe-directive",
-		OnKind:  db.WakeOutboxKindDirective,
+		ID:       "probe-directive",
+		OnKind:   db.WakeOutboxKindDirective,
 		WakeRole: "owner",
-		Scope:   db.EventRuleScopeObserver,
-		Enabled: true,
+		Scope:    db.EventRuleScopeObserver,
+		Enabled:  true,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -774,7 +775,7 @@ func TestDirectiveNagRevivesTheDeliveredWakeRowWithoutDuplicating(t *testing.T) 
 		t.Fatal(err)
 	}
 	t.Setenv("GITMOOT_ORG_ROLE", "owner")
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}

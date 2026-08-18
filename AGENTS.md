@@ -74,6 +74,11 @@ go test -timeout 25m ./...
 )
 ```
 
+See [`docs/testing-performance.md`](docs/testing-performance.md) before changing
+test setup or CI partitioning. Writable test databases should copy the cached,
+migration-keyed schema through `internal/db/dbtest`; tests that exercise
+migration behavior must keep using the real `db.Open` path.
+
 Managed-worktree runtime seats append `-buildvcs=false` to inherited `GOFLAGS`
 so stray ancestor `.git` directories cannot confuse Go's VCS root detection.
 

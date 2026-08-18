@@ -16,6 +16,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 func TestDashboardConfigProjectionAllowlist(t *testing.T) {
@@ -134,7 +135,7 @@ private_token = "` + secret + `"
 		t.Fatalf("Chtimes: %v", err)
 	}
 
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

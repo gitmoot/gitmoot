@@ -25,7 +25,7 @@ func rootIDOf(t *testing.T, store *Store, id string) string {
 // in COALESCE(NULLIF(...)) leaves root_id empty and fails here.
 func TestCreateJobPopulatesRootID(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestCreateJobPopulatesRootID(t *testing.T) {
 // payload would not return this set.
 func TestListJobsByRootReturnsTree(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestListJobsByRootReturnsTree(t *testing.T) {
 // ignoring a sibling tree. The empty-tree SUM is COALESCEd to 0.
 func TestCountAndSumJobsByRoot(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestCountAndSumJobsByRoot(t *testing.T) {
 // agent stays in the same tree, so its root_id must not change.
 func TestDelegateQueuedJobPreservesRootID(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -201,9 +201,10 @@ func TestMigrateBackfillsRootID(t *testing.T) {
 		t.Fatalf("sql.Open returned error: %v", err)
 	}
 	store := &Store{db: raw}
-	// Apply every migration EXCEPT the last (the root_id ALTER+index), reproducing a
+	// Apply every migration BEFORE the jobs.root_id ALTER+index, located by content,
+	// reproducing a
 	// DB whose jobs table has no root_id column.
-	for version, migration := range migrations[:len(migrations)-1] {
+	for version, migration := range migrationsBefore(t, "ALTER TABLE jobs ADD COLUMN root_id") {
 		if err := store.applyMigration(ctx, version+1, migration); err != nil {
 			t.Fatalf("applyMigration(%d) returned error: %v", version+1, err)
 		}
@@ -221,7 +222,7 @@ func TestMigrateBackfillsRootID(t *testing.T) {
 		t.Fatalf("raw Close returned error: %v", err)
 	}
 
-	upgraded, err := Open(path)
+	upgraded, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open upgraded DB returned error: %v", err)
 	}

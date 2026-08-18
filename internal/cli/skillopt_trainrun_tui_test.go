@@ -11,6 +11,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 func replaceSkillOptTrainRunTUI(capable bool, run func(home, sessionID string, stdout, stderr io.Writer) int) func() {
@@ -28,7 +29,7 @@ func replaceSkillOptTrainRunTUI(capable bool, run func(home, sessionID string, s
 
 func seedTrainSession(t *testing.T, home string, session db.SkillOptTrainSession) {
 	t.Helper()
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -174,7 +175,7 @@ func TestCreateSkillOptTrainRunSession(t *testing.T) {
 		t.Fatal("expected a session id")
 	}
 	// The session exists and is loadable.
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
