@@ -21,10 +21,10 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
-	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/presence"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -377,7 +377,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 			// Resolve [merge_gate] inside daemonMergeGate for every evaluation so a
 			// live auto_merge flip both re-arms parked tasks and changes their next
 			// gate decision without a daemon restart.
-			MergeGate: newDaemonMergeGate(store, gh, checkout, resolvedHome),
+			MergeGate: newDaemonMergeGate(store, gh, checkout, resolvedHome, subprocess.ExecRunner{}),
 			// Registry default model/effort fallbacks, home-aware and fail-open — see
 			// daemonWorkflowEngine. Empty by default => byte-identical.
 			RuntimeDefaultModel:  runtimeDefaultModelResolver(*home),
@@ -1072,7 +1072,11 @@ func preflightDaemonRepoStart(ctx context.Context, home string, repo github.Repo
 }
 
 func preflightDaemonRepoCheckout(ctx context.Context, repo github.Repository, workDir string) error {
-	_, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: workDir})
+	return preflightDaemonRepoCheckoutWithRunner(ctx, repo, workDir, subprocess.ExecRunner{})
+}
+
+func preflightDaemonRepoCheckoutWithRunner(ctx context.Context, repo github.Repository, workDir string, runner subprocess.Runner) error {
+	_, err := repoRecordForCheckout(ctx, repo, jobGitClient(workDir, runner))
 	return err
 }
 

@@ -144,6 +144,10 @@ func daemonDeterministicCheckerDispatcher(store *db.Store, gh github.Client, che
 // cannot escape into the live checkout (reusing gitmoot's single-binary git tooling, no
 // external sandbox dep).
 func daemonHardVerifierDispatcher(store *db.Store, checkout string, home string) workflow.HardVerifierDispatcher {
+	return daemonHardVerifierDispatcherForRunner(store, checkout, home, localJobSubprocessRunner{})
+}
+
+func daemonHardVerifierDispatcherForRunner(store *db.Store, checkout string, home string, runner subprocess.Runner) workflow.HardVerifierDispatcher {
 	if store == nil {
 		return nil
 	}
@@ -157,11 +161,11 @@ func daemonHardVerifierDispatcher(store *db.Store, checkout string, home string)
 		// grandchildren (a `go test` spawns test binaries, `npm test` spawns node), so
 		// the leg's bounded context can never leave an orphaned suite running. The
 		// short-lived git clone/checkout calls keep the plain ExecRunner (no grandchildren).
-		runner: subprocess.GroupRunner{},
+		runner: jobGroupedSubprocessRunner(runner),
 		sandbox: cloneSandboxProvisioner{
 			base:   checkout,
 			home:   home,
-			runner: subprocess.ExecRunner{},
+			runner: runner,
 			// store backs the checkout-mutation lock that serializes the sandbox clone's
 			// base read against concurrent real jobs on the same daemon checkout (#617).
 			store: store,

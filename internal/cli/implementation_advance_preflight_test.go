@@ -89,7 +89,7 @@ func TestAdvanceImplementationPreflightBlocksBeforeModelAndKeepsResultHonest(t *
 				t.Fatal("documented reset remedy did not clear the preflight refusal")
 			}
 			if test.mode == "divergent" {
-				git := gitutil.Client{Dir: result.fixWorktree}
+				git := gitutil.NewHostClient(result.fixWorktree)
 				currentAncestorDispatch, err := git.IsAncestor(context.Background(), result.currentHead, result.expectedHead)
 				if err != nil {
 					t.Fatalf("compare divergent current head with dispatch head: %v", err)
@@ -1043,7 +1043,7 @@ func TestDaemonImplementationFinalizerKeepsMissingBranchBackstop(t *testing.T) {
 		Repo: "owner/repo", PullRequest: 12, TaskID: "task-backstop",
 		FixWorktree: true, WorktreePath: t.TempDir(), Result: &workflow.AgentResult{Decision: "implemented"},
 	}
-	_, err := (daemonImplementationFinalizer{Store: store, GitHub: github.NoopClient{}}).FinalizeImplementation(ctx, db.Job{ID: "late-backstop", Agent: "lead", Type: "implement"}, payload)
+	_, err := (newHostDaemonImplementationFinalizer(store, github.NoopClient{})).FinalizeImplementation(ctx, db.Job{ID: "late-backstop", Agent: "lead", Type: "implement"}, payload)
 	var blocked workflow.BlockedError
 	if !errors.As(err, &blocked) || !blocked.ResultDeliveryFailed || !strings.Contains(err.Error(), "carries no payload branch") {
 		t.Fatalf("FinalizeImplementation error = %v, want delivery-blocked missing-branch backstop", err)

@@ -93,7 +93,7 @@ type RemoteBranchChecker interface {
 type gitRemoteBranchChecker struct{}
 
 func (gitRemoteBranchChecker) RemoteBranches(ctx context.Context, checkout string, branches []string) (map[string]struct{}, error) {
-	return (gitutil.Client{Dir: checkout}).RemoteBranches(ctx, branches)
+	return (gitutil.NewHostClient(checkout)).RemoteBranches(ctx, branches)
 }
 
 func (d Daemon) Run(ctx context.Context) error {

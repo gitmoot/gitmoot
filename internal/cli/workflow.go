@@ -23,8 +23,8 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
-	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 	"github.com/gitmoot/gitmoot/skills"
 )
@@ -403,6 +403,14 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 	var started db.Task
 	var startedJob db.Job
 	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
+		backend, err := localAgentDispatchExecBackendFor(*home)
+		if err != nil {
+			return err
+		}
+		runner, err := jobSubprocessRunnerForBackend(backend)
+		if err != nil {
+			return err
+		}
 		task, err := store.GetTask(context.Background(), taskID)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -457,7 +465,7 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 			candidate := task
 			candidate.RepoFullName = requestRepo
 			candidate.Branch = requestBranch
-			headSHA, err := (gitutil.Client{Dir: candidate.WorktreePath}).HeadSHA(context.Background())
+			headSHA, err := jobGitClient(candidate.WorktreePath, runner).HeadSHA(context.Background())
 			if err != nil {
 				return fmt.Errorf("resolve task worktree head: %w", err)
 			}
@@ -469,14 +477,14 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 				startedJob = active
 				return nil
 			}
-			dirty, err := taskWorktreeDirty(context.Background(), candidate)
+			dirty, err := taskWorktreeDirtyWithRunner(context.Background(), candidate, runner)
 			if err != nil {
 				return err
 			}
 			if dirty {
 				handled, blockErr := (workflow.Engine{Store: store}).ReconcileDirtyTaskWorktreeLineage(
 					context.Background(),
-					gitutil.Client{Dir: checkout},
+					jobGitClient(checkout, runner),
 					candidate,
 					candidate.WorktreePath,
 					*base,
@@ -500,11 +508,11 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 			BaseBranch: *base,
 			Owner:      *owner,
 			Checkout:   checkout,
-		}, gitutil.Client{Dir: checkout})
+		}, jobGitClient(checkout, runner))
 		if err != nil {
 			return err
 		}
-		headSHA, err := (gitutil.Client{Dir: started.WorktreePath}).HeadSHA(context.Background())
+		headSHA, err := jobGitClient(started.WorktreePath, runner).HeadSHA(context.Background())
 		if err != nil {
 			return fmt.Errorf("resolve task worktree head: %w", err)
 		}
@@ -904,7 +912,15 @@ func runTaskRecover(args []string, stdout, stderr io.Writer) int {
 	}
 	var output taskRecoverOutput
 	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
-		payload, err := recoverTaskImplementation(context.Background(), store, taskID, strings.TrimSpace(*repo), strings.TrimSpace(*owner), *skipFanout, nil)
+		backend, err := localAgentDispatchExecBackendFor(*home)
+		if err != nil {
+			return err
+		}
+		runner, err := jobSubprocessRunnerForBackend(backend)
+		if err != nil {
+			return err
+		}
+		payload, err := recoverTaskImplementationForRunner(context.Background(), store, taskID, strings.TrimSpace(*repo), strings.TrimSpace(*owner), *skipFanout, nil, runner)
 		if err != nil {
 			return err
 		}
@@ -948,6 +964,10 @@ func runTaskRecover(args []string, stdout, stderr io.Writer) int {
 }
 
 func recoverTaskImplementation(ctx context.Context, store *db.Store, taskID string, repoFlag string, owner string, skipFanout bool, gh github.Client) (workflow.JobPayload, error) {
+	return recoverTaskImplementationForRunner(ctx, store, taskID, repoFlag, owner, skipFanout, gh, subprocess.ExecRunner{})
+}
+
+func recoverTaskImplementationForRunner(ctx context.Context, store *db.Store, taskID string, repoFlag string, owner string, skipFanout bool, gh github.Client, runner subprocess.Runner) (workflow.JobPayload, error) {
 	task, err := store.GetTask(ctx, strings.TrimSpace(taskID))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1020,17 +1040,17 @@ func recoverTaskImplementation(ctx context.Context, store *db.Store, taskID stri
 			_, _ = store.ReleaseLockWithEvent(ctx, lock, db.BranchLockEvent{Kind: "released", Message: "released after failed task recover"})
 		}
 	}()
-	headSHA, err := (gitutil.Client{Dir: task.WorktreePath}).HeadSHA(ctx)
+	headSHA, err := jobGitClient(task.WorktreePath, runner).HeadSHA(ctx)
 	if err != nil {
 		return workflow.JobPayload{}, fmt.Errorf("resolve task worktree head: %w", err)
 	}
 	payloadHead := headSHA
-	if dirty, err := taskWorktreeDirty(ctx, task); err != nil {
+	if dirty, err := taskWorktreeDirtyWithRunner(ctx, task, runner); err != nil {
 		return workflow.JobPayload{}, err
 	} else if !dirty {
 		baseHead := previousTaskImplementHeadSHA(ctx, store, task.ID, requestRepo, task.Branch, headSHA)
 		if strings.TrimSpace(baseHead) == "" {
-			baseHead, err = taskRecoverBaseHead(ctx, store, task, requestRepo)
+			baseHead, err = taskRecoverBaseHeadForRunner(ctx, store, task, requestRepo, runner)
 			if err != nil {
 				return workflow.JobPayload{}, err
 			}
@@ -1083,7 +1103,7 @@ func recoverTaskImplementation(ctx context.Context, store *db.Store, taskID stri
 	}, db.JobEvent{Kind: string(workflow.JobRunning), Message: "task recovery started"}); err != nil {
 		return workflow.JobPayload{}, err
 	}
-	finalizer := daemonImplementationFinalizer{Store: store, GitHub: gh}
+	finalizer := daemonImplementationFinalizer{Store: store, GitHub: gh, Runner: runner}
 	finalized, err := finalizer.FinalizeImplementation(ctx, job, payload)
 	if err != nil {
 		state := string(workflow.JobFailed)
@@ -1113,10 +1133,14 @@ func recoverTaskImplementation(ctx context.Context, store *db.Store, taskID stri
 }
 
 func taskWorktreeDirty(ctx context.Context, task db.Task) (bool, error) {
+	return taskWorktreeDirtyWithRunner(ctx, task, subprocess.ExecRunner{})
+}
+
+func taskWorktreeDirtyWithRunner(ctx context.Context, task db.Task, runner subprocess.Runner) (bool, error) {
 	if strings.TrimSpace(task.WorktreePath) == "" {
 		return false, nil
 	}
-	status, err := (gitutil.Client{Dir: task.WorktreePath}).StatusPorcelain(ctx)
+	status, err := jobGitClient(task.WorktreePath, runner).StatusPorcelain(ctx)
 	if err != nil {
 		return false, fmt.Errorf("inspect task worktree %s: %w", task.WorktreePath, err)
 	}
@@ -1231,6 +1255,10 @@ func previousTaskImplementHeadSHA(ctx context.Context, store *db.Store, taskID s
 }
 
 func taskRecoverBaseHead(ctx context.Context, store *db.Store, task db.Task, repo string) (string, error) {
+	return taskRecoverBaseHeadForRunner(ctx, store, task, repo, subprocess.ExecRunner{})
+}
+
+func taskRecoverBaseHeadForRunner(ctx context.Context, store *db.Store, task db.Task, repo string, runner subprocess.Runner) (string, error) {
 	record, err := store.GetRepo(ctx, repo)
 	if err != nil {
 		return "", err
@@ -1239,7 +1267,7 @@ func taskRecoverBaseHead(ctx context.Context, store *db.Store, task db.Task, rep
 	if base == "" {
 		base = "main"
 	}
-	git := gitutil.Client{Dir: task.WorktreePath}
+	git := jobGitClient(task.WorktreePath, runner)
 	var lastErr error
 	for _, rev := range []string{base, "origin/" + base} {
 		sha, err := git.RevParse(ctx, rev)

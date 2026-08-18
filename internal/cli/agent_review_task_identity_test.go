@@ -97,7 +97,7 @@ func c1ReviewRepository(t *testing.T) (repoDir string, oldHead string, newHead s
 	runGit(t, repoDir, "add", "README.md")
 	runGit(t, repoDir, "commit", "-m", "round one")
 	var err error
-	oldHead, err = (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	oldHead, err = (gitutil.NewHostClient(repoDir)).HeadSHA(ctx)
 	if err != nil || oldHead == "" {
 		t.Fatalf("round-one head = %q, err=%v", oldHead, err)
 	}
@@ -106,7 +106,7 @@ func c1ReviewRepository(t *testing.T) (repoDir string, oldHead string, newHead s
 	}
 	runGit(t, repoDir, "add", "README.md")
 	runGit(t, repoDir, "commit", "-m", "round two")
-	newHead, err = (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	newHead, err = (gitutil.NewHostClient(repoDir)).HeadSHA(ctx)
 	if err != nil || newHead == "" || newHead == oldHead {
 		t.Fatalf("round heads old=%q new=%q err=%v", oldHead, newHead, err)
 	}
@@ -157,7 +157,7 @@ func evaluateC1GateScenario(t *testing.T, implementTaskID string, reviewTaskID s
 			ReviewRound: "review-2", Result: &workflow.AgentResult{Decision: "approved", Summary: "round two approved"},
 		})
 	}
-	decision, err := (daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout}).Evaluate(context.Background(), request)
+	decision, err := (newHostDaemonMergeGate(store, gh, checkout, "")).Evaluate(context.Background(), request)
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
 	}
@@ -358,7 +358,7 @@ func TestFixWorktreeStrandReviewBindsImplementTaskE2E(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(fixWorktree, "fix.txt"), []byte("fix\n"), 0o644); err != nil {
 		t.Fatalf("write fix change: %v", err)
 	}
-	if _, err := (daemonImplementationFinalizer{Store: store, GitHub: github.NoopClient{}}).FinalizeImplementation(
+	if _, err := (newHostDaemonImplementationFinalizer(store, github.NoopClient{})).FinalizeImplementation(
 		ctx, db.Job{ID: "fix-leg", Agent: "implementer", Type: "implement"}, workflow.JobPayload{
 			Repo: "owner/repo", Branch: branch, PullRequest: 1530, TaskID: "adhoc-impl",
 			FixWorktree: true, WorktreePath: fixWorktree,

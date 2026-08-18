@@ -302,11 +302,26 @@ func TestExecBackendResolvedNonLocalCannotRunLocallyDaemonE2E(t *testing.T) {
 	}
 	t.Cleanup(func() { daemonJobExecBackendFor = previousResolver })
 
-	execBackendRunOneTick(t, home, store)
+	checkoutCalls := 0
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		checkoutCalls++
+		return t.TempDir(), nil
+	}
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob before run: %v", err)
+	}
+	if err := worker.run(ctx, job); err != nil {
+		t.Fatalf("worker run: %v", err)
+	}
+	if checkoutCalls != 0 {
+		t.Fatalf("checkout validation calls = %d, want zero before non-local runner refusal", checkoutCalls)
+	}
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("daemon adapter ran locally for a resolved non-local backend (marker err=%v)", err)
 	}
-	job, err := store.GetJob(ctx, jobID)
+	job, err = store.GetJob(ctx, jobID)
 	if err != nil {
 		t.Fatalf("GetJob: %v", err)
 	}
@@ -321,6 +336,19 @@ func TestExecBackendResolvedNonLocalCannotRunLocallyDaemonE2E(t *testing.T) {
 	failedMessages := execBackendEvents(t, store, jobID)
 	if len(failedMessages) != 1 || !strings.Contains(failedMessages[0], `"p2-probe"`) || !strings.Contains(failedMessages[0], "no execution implementation") {
 		t.Fatalf("failed events = %q, want resolved backend and missing daemon implementation named", failedMessages)
+	}
+}
+
+// TestP2GapJobSubprocessRoutesRefuseLocalFallback pins the one consumption
+// seam used before job-associated checkout and git work. The P2 overlay adds
+// p2-probe to the implemented registry; a compile-valid mutation that maps it
+// to ExecRunner must make this test fail rather than execute on the host.
+func TestP2GapJobSubprocessRoutesRefuseLocalFallback(t *testing.T) {
+	if backend, err := execbackend.ParseImplemented("p2-probe"); err == nil {
+		t.Fatalf("%s became implemented; add its job subprocess runner before updating this guard", backend)
+	}
+	if _, err := jobSubprocessRunnerForBackend(execbackend.Backend("p2-probe")); err == nil {
+		t.Fatal("p2-probe inherited the local job subprocess runner")
 	}
 }
 

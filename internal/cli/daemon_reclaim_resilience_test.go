@@ -67,7 +67,7 @@ func TestAgedWorktreeReclaimFailureDoesNotBlockDispatch(t *testing.T) {
 		fakeReclaimWorktreeManager: fakeReclaimWorktreeManager{branches: map[string]bool{}},
 		err:                        reclaimErr,
 	}
-	baseWorkflowFactory := worker.WorkflowFactory
+	baseWorkflowFactory := worker.defaultWorkflow
 	worker.WorkflowFactory = func(parentCheckout string) workflow.Engine {
 		engine := baseWorkflowFactory(parentCheckout)
 		engine.DelegationCheckout = checkout
@@ -102,7 +102,7 @@ func TestForceRemoveWorktreeUsesOwningCheckout(t *testing.T) {
 	owner := createDaemonWorkerGitCheckout(t, "main")
 	unrelated := createDaemonWorkerGitCheckout(t, "main")
 	worktreePath := filepath.Join(t.TempDir(), "foreign-owner")
-	if err := (gitutil.Client{Dir: owner}).AddDetachedWorktree(ctx, worktreePath, "HEAD"); err != nil {
+	if err := (gitutil.NewHostClient(owner)).AddDetachedWorktree(ctx, worktreePath, "HEAD"); err != nil {
 		t.Fatalf("create owner worktree: %v", err)
 	}
 
@@ -113,7 +113,7 @@ func TestForceRemoveWorktreeUsesOwningCheckout(t *testing.T) {
 		t.Fatalf("unrelated-checkout control arm err=%v output=%q, want not-a-working-tree failure", err, output)
 	}
 
-	if err := (gitutil.Client{Dir: unrelated}).RemoveWorktreeForce(ctx, worktreePath); err != nil {
+	if err := (gitutil.NewHostClient(unrelated)).RemoveWorktreeForce(ctx, worktreePath); err != nil {
 		t.Fatalf("force remove through owning checkout: %v", err)
 	}
 	if _, err := os.Stat(worktreePath); !os.IsNotExist(err) {
@@ -140,7 +140,7 @@ func TestGitClientErrorIncludesBoundedStderr(t *testing.T) {
 		result: subprocess.Result{Stderr: "\n  " + cause + strings.Repeat("x", 10_000) + "\n"},
 		err:    errors.New("exit status 128"),
 	}
-	err := (gitutil.Client{Runner: runner, Dir: "/repo"}).RemoveWorktreeForce(context.Background(), "/worktree")
+	err := (gitutil.NewClient("/repo", runner)).RemoveWorktreeForce(context.Background(), "/worktree")
 	if err == nil || !strings.Contains(err.Error(), cause) {
 		t.Fatalf("git error = %v, want trimmed stderr cause", err)
 	}

@@ -127,7 +127,7 @@ func TestReviewFixRunsInPerJobBranchWorktree(t *testing.T) {
 	worker := defaultJobWorker(fixture.store, &workerOutput, fixture.rawHome)
 	worker.AdapterFactory = func(_ runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {
 		executionDir = checkout
-		executionBranch, _ = (gitutil.Client{Dir: checkout}).CurrentBranch(ctx)
+		executionBranch, _ = (gitutil.NewHostClient(checkout)).CurrentBranch(ctx)
 		return adapter, nil
 	}
 	worker.CommenterFactory = func(string) github.Client { return github.NoopClient{} }
@@ -161,7 +161,7 @@ func TestReviewFixWorktreeCanCommitAndPushBranchHead(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(allocation.Path, "fix.txt"), []byte("fixed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	git := gitutil.Client{Dir: allocation.Path}
+	git := gitutil.NewHostClient(allocation.Path)
 	if err := git.CommitAll(ctx, "fix round"); err != nil {
 		t.Fatalf("CommitAll: %v", err)
 	}

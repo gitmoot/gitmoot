@@ -57,7 +57,7 @@ func TestDaemonMergeGateHoldsWhileImplementJobActiveOnBranch(t *testing.T) {
 		ID: "fix-round-running", Agent: "implementer", Type: "implement", State: string(workflow.JobRunning),
 	}, workflow.JobPayload{Repo: request.Repo, Branch: request.Branch, TaskID: request.TaskID})
 
-	decision, err := (daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout}).Evaluate(context.Background(), request)
+	decision, err := (newHostDaemonMergeGate(store, gh, checkout, "")).Evaluate(context.Background(), request)
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestDaemonMergeGateHoldsHumanMergeRequestWhileJobActiveOnBranch(t *testing.
 		ID: "fix-round-running", Agent: "implementer", Type: "implement", State: string(workflow.JobRunning),
 	}, workflow.JobPayload{Repo: request.Repo, Branch: request.Branch, TaskID: request.TaskID})
 
-	decision, err := (daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout}).Evaluate(context.Background(), request)
+	decision, err := (newHostDaemonMergeGate(store, gh, checkout, "")).Evaluate(context.Background(), request)
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestDaemonMergeGateDefaultPreservesMergePathWhenMandatoryGatePasses(t *test
 		t.Fatalf("Initialize config: %v", err)
 	}
 
-	decision, err := (daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout, Home: paths.Home}).Evaluate(context.Background(), request)
+	decision, err := (newHostDaemonMergeGate(store, gh, checkout, paths.Home)).Evaluate(context.Background(), request)
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
@@ -139,7 +139,7 @@ scope = ["owner/repo"]
 	if _, err := config.LoadOrg(paths); err != nil {
 		t.Fatalf("LoadOrg: %v", err)
 	}
-	gate := daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout, Home: paths.Home}
+	gate := newHostDaemonMergeGate(store, gh, checkout, paths.Home)
 	renderedReason := ""
 	for attempt := 0; attempt < 2; attempt++ {
 		decision, err := gate.Evaluate(context.Background(), request)
@@ -202,7 +202,7 @@ func TestDaemonMergeGateKillSwitchDoesNotEscalate(t *testing.T) {
 	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+"\n[merge_gate]\nauto_merge = false\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	decision, err := (daemonMergeGate{Store: store, GitHub: gh, FallbackCheckout: checkout, Home: paths.Home}).Evaluate(context.Background(), request)
+	decision, err := (newHostDaemonMergeGate(store, gh, checkout, paths.Home)).Evaluate(context.Background(), request)
 	if err != nil || !decision.LeaveOpen || decision.Reason.IsGateMiss() {
 		t.Fatalf("decision = %+v, err=%v", decision, err)
 	}

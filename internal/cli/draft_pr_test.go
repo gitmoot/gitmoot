@@ -82,7 +82,7 @@ func TestImplementationFinalizerOpensForgePullRequestInRequestedMode(t *testing.
 				TaskTitle: fixture.task.Title, LeadAgent: "lead", PullRequestReady: request.PullRequestReady,
 				Result: &workflow.AgentResult{Decision: "implemented", Summary: "done"},
 			}
-			finalized, err := (daemonImplementationFinalizer{Store: fixture.store, GitHub: gh}).FinalizeImplementation(
+			finalized, err := (newHostDaemonImplementationFinalizer(fixture.store, gh)).FinalizeImplementation(
 				context.Background(), db.Job{ID: "implement", Agent: "lead", Type: "implement"}, payload,
 			)
 			if err != nil {

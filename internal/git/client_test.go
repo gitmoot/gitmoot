@@ -15,7 +15,7 @@ import (
 
 func TestClientUsesSharedSubprocessRunner(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{}, {Stdout: "task-1\n"}, {}, {Stdout: "/repo\n"}, {Stdout: "https://github.com/gitmoot/gitmoot.git\n"}, {}, {}, {}}}
-	client := Client{Runner: runner, Dir: "/repo"}
+	client := NewClient("/repo", runner)
 
 	if err := client.CreateBranch(context.Background(), "task-1", "main"); err != nil {
 		t.Fatalf("CreateBranch returned error: %v", err)
@@ -66,9 +66,16 @@ func TestClientUsesSharedSubprocessRunner(t *testing.T) {
 	runner.wantArgs(t, 8, "git", "pull", "--ff-only", "origin", "main")
 }
 
+func TestClientRequiresSubprocessRunner(t *testing.T) {
+	client := NewClient(t.TempDir(), nil)
+	if _, err := client.HeadSHA(context.Background()); err == nil || !strings.Contains(err.Error(), "git subprocess runner is required") {
+		t.Fatalf("HeadSHA error = %v, want required-runner refusal", err)
+	}
+}
+
 func TestClientStatusPorcelainDisablesOptionalLocks(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: " M file.go\n"}}}
-	status, err := (Client{Runner: runner, Dir: "/repo"}).StatusPorcelain(context.Background())
+	status, err := (NewClient("/repo", runner)).StatusPorcelain(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +119,7 @@ func TestClientIsLinkedWorktree(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			runner := &fakeRunner{results: tc.results, errs: tc.errs}
-			linked, err := (Client{Runner: runner, Dir: "/repo"}).IsLinkedWorktree(context.Background())
+			linked, err := (NewClient("/repo", runner)).IsLinkedWorktree(context.Background())
 			if err != nil {
 				t.Fatalf("IsLinkedWorktree returned error: %v", err)
 			}
@@ -128,7 +135,7 @@ func TestClientIsLinkedWorktree(t *testing.T) {
 
 func TestClientPrimaryWorktree(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "worktree /repo\nHEAD abc\nbranch refs/heads/main\n\nworktree /repo-linked\nHEAD def\nbranch refs/heads/task\n"}}}
-	primary, err := (Client{Runner: runner, Dir: "/repo-linked"}).PrimaryWorktree(context.Background())
+	primary, err := (NewClient("/repo-linked", runner)).PrimaryWorktree(context.Background())
 	if err != nil {
 		t.Fatalf("PrimaryWorktree returned error: %v", err)
 	}
@@ -143,7 +150,7 @@ func TestClientPrimaryWorktreeSkipsBareAndFallsBackToSelf(t *testing.T) {
 		{Stdout: "worktree /repo.git\nbare\n"},
 		{Stdout: "/repo-linked\n"},
 	}}
-	primary, err := (Client{Runner: runner, Dir: "/repo-linked"}).PrimaryWorktree(context.Background())
+	primary, err := (NewClient("/repo-linked", runner)).PrimaryWorktree(context.Background())
 	if err != nil {
 		t.Fatalf("PrimaryWorktree returned error: %v", err)
 	}
@@ -157,7 +164,7 @@ func TestClientPrimaryWorktreeSkipsBareAndFallsBackToSelf(t *testing.T) {
 func TestClientRejectsUnsafeBranchNames(t *testing.T) {
 	for _, branch := range []string{"", " task", "task ", "-bad", "bad branch", "bad..branch", "bad.lock", "HEAD:main", "bad~branch", "bad^branch", "bad?branch", "bad[branch", "bad\\branch", "bad@{branch", "/bad", "bad/", "bad//branch"} {
 		t.Run(branch, func(t *testing.T) {
-			if err := (Client{}).CreateBranch(context.Background(), branch, "main"); err == nil {
+			if err := (NewClient("", nil)).CreateBranch(context.Background(), branch, "main"); err == nil {
 				t.Fatal("CreateBranch accepted unsafe branch")
 			}
 		})
@@ -166,7 +173,7 @@ func TestClientRejectsUnsafeBranchNames(t *testing.T) {
 
 func TestClientWorktreeCommandConstruction(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{}, {}, {}, {}}}
-	client := Client{Runner: runner, Dir: "/repo"}
+	client := NewClient("/repo", runner)
 
 	if err := client.AddWorktree(context.Background(), "task-1", "/worktrees/task-1", "main"); err != nil {
 		t.Fatalf("AddWorktree returned error: %v", err)
@@ -192,41 +199,41 @@ func TestClientWorktreeCommandConstruction(t *testing.T) {
 }
 
 func TestClientAddWorktreeRejectsInvalidInput(t *testing.T) {
-	if err := (Client{}).AddWorktree(context.Background(), "bad branch", "/tmp/wt", "main"); err == nil {
+	if err := (NewClient("", nil)).AddWorktree(context.Background(), "bad branch", "/tmp/wt", "main"); err == nil {
 		t.Fatal("AddWorktree accepted unsafe branch")
 	}
-	if err := (Client{}).AddExistingBranchWorktree(context.Background(), "bad branch", "/tmp/wt"); err == nil {
+	if err := (NewClient("", nil)).AddExistingBranchWorktree(context.Background(), "bad branch", "/tmp/wt"); err == nil {
 		t.Fatal("AddExistingBranchWorktree accepted unsafe branch")
 	}
-	if _, err := (Client{}).BranchExists(context.Background(), "bad branch"); err == nil {
+	if _, err := (NewClient("", nil)).BranchExists(context.Background(), "bad branch"); err == nil {
 		t.Fatal("BranchExists accepted unsafe branch")
 	}
-	if err := (Client{}).AddWorktree(context.Background(), "task-1", "", "main"); err == nil {
+	if err := (NewClient("", nil)).AddWorktree(context.Background(), "task-1", "", "main"); err == nil {
 		t.Fatal("AddWorktree accepted empty path")
 	}
-	if err := (Client{}).AddExistingBranchWorktree(context.Background(), "task-1", " "); err == nil {
+	if err := (NewClient("", nil)).AddExistingBranchWorktree(context.Background(), "task-1", " "); err == nil {
 		t.Fatal("AddExistingBranchWorktree accepted empty path")
 	}
-	if err := (Client{}).RemoveWorktree(context.Background(), " "); err == nil {
+	if err := (NewClient("", nil)).RemoveWorktree(context.Background(), " "); err == nil {
 		t.Fatal("RemoveWorktree accepted empty path")
 	}
-	if err := (Client{}).RemoveWorktreeForce(context.Background(), " "); err == nil {
+	if err := (NewClient("", nil)).RemoveWorktreeForce(context.Background(), " "); err == nil {
 		t.Fatal("RemoveWorktreeForce accepted empty path")
 	}
-	if err := (Client{}).AddDetachedWorktree(context.Background(), "", "main"); err == nil {
+	if err := (NewClient("", nil)).AddDetachedWorktree(context.Background(), "", "main"); err == nil {
 		t.Fatal("AddDetachedWorktree accepted empty path")
 	}
-	if err := (Client{}).AddDetachedWorktree(context.Background(), "/tmp/wt", " "); err == nil {
+	if err := (NewClient("", nil)).AddDetachedWorktree(context.Background(), "/tmp/wt", " "); err == nil {
 		t.Fatal("AddDetachedWorktree accepted empty ref")
 	}
-	if err := (Client{}).AddDetachedWorktree(context.Background(), "/tmp/wt", "-bad"); err == nil {
+	if err := (NewClient("", nil)).AddDetachedWorktree(context.Background(), "/tmp/wt", "-bad"); err == nil {
 		t.Fatal("AddDetachedWorktree accepted ref starting with '-'")
 	}
 }
 
 func TestClientDetachedAndForceRemoveCommandConstruction(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{}, {}, {}}}
-	client := Client{Runner: runner, Dir: "/repo"}
+	client := NewClient("/repo", runner)
 	if err := client.AddDetachedWorktree(context.Background(), "/worktrees/d1", "main"); err != nil {
 		t.Fatalf("AddDetachedWorktree returned error: %v", err)
 	}
@@ -255,7 +262,7 @@ func TestClientRemoveWorktreeForceSmoke(t *testing.T) {
 	runGit(t, dir, "add", "README.md")
 	runGit(t, dir, "commit", "-m", "init")
 
-	client := Client{Dir: dir}
+	client := NewHostClient(dir)
 	wt := filepath.Join(t.TempDir(), "detached")
 	if err := client.AddDetachedWorktree(context.Background(), wt, "HEAD"); err != nil {
 		t.Fatalf("AddDetachedWorktree returned error: %v", err)
@@ -278,7 +285,7 @@ func TestClientRemoveWorktreeForceSmoke(t *testing.T) {
 
 func TestClientMergeBranchesCommandConstruction(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{}, {}}}
-	client := Client{Runner: runner, Dir: "/repo"}
+	client := NewClient("/repo", runner)
 	if err := client.MergeBranches(context.Background(), "/wt/integration", []string{"legA", "legB"}, "integrate"); err != nil {
 		t.Fatalf("MergeBranches returned error: %v", err)
 	}
@@ -288,7 +295,7 @@ func TestClientMergeBranchesCommandConstruction(t *testing.T) {
 
 func TestClientMergeBranchesAbortsAndNamesConflictingBranch(t *testing.T) {
 	runner := &fakeRunner{errs: []error{nil, errors.New("CONFLICT")}}
-	client := Client{Runner: runner, Dir: "/repo"}
+	client := NewClient("/repo", runner)
 	err := client.MergeBranches(context.Background(), "/wt/integration", []string{"legA", "legB"}, "integrate")
 	if err == nil {
 		t.Fatal("expected error when a leg merge conflicts")
@@ -300,10 +307,10 @@ func TestClientMergeBranchesAbortsAndNamesConflictingBranch(t *testing.T) {
 	if len(last) < 3 || last[1] != "merge" || last[2] != "--abort" {
 		t.Fatalf("expected a 'merge --abort' after conflict, got %v", last)
 	}
-	if err := (Client{}).MergeBranches(context.Background(), " ", []string{"legA"}, "m"); err == nil {
+	if err := (NewClient("", nil)).MergeBranches(context.Background(), " ", []string{"legA"}, "m"); err == nil {
 		t.Fatal("MergeBranches accepted an empty dir")
 	}
-	if err := (Client{Runner: &fakeRunner{}}).MergeBranches(context.Background(), "/wt", []string{"bad branch"}, "m"); err == nil {
+	if err := (NewClient("", &fakeRunner{})).MergeBranches(context.Background(), "/wt", []string{"bad branch"}, "m"); err == nil {
 		t.Fatal("MergeBranches accepted an unsafe branch name")
 	}
 }
@@ -337,7 +344,7 @@ func TestClientMergeBranchesSmoke(t *testing.T) {
 	runGit(t, dir, "commit", "-m", "legB")
 	runGit(t, dir, "checkout", "main")
 
-	client := Client{Dir: dir}
+	client := NewHostClient(dir)
 	wt := filepath.Join(t.TempDir(), "integration")
 	if err := client.AddDetachedWorktree(context.Background(), wt, "main"); err != nil {
 		t.Fatalf("AddDetachedWorktree returned error: %v", err)
@@ -367,7 +374,7 @@ func TestClientCommitWorktreeSmoke(t *testing.T) {
 	runGit(t, dir, "add", "README.md")
 	runGit(t, dir, "commit", "-m", "base")
 
-	client := Client{Dir: dir}
+	client := NewHostClient(dir)
 	// Clean worktree -> no commit.
 	committed, err := client.CommitWorktree(context.Background(), dir, "noop")
 	if err != nil {
@@ -394,14 +401,14 @@ func TestClientCommitWorktreeSmoke(t *testing.T) {
 	if !clean {
 		t.Fatal("worktree should be clean after CommitWorktree")
 	}
-	if _, err := (Client{}).CommitWorktree(context.Background(), " ", "m"); err == nil {
+	if _, err := (NewClient("", nil)).CommitWorktree(context.Background(), " ", "m"); err == nil {
 		t.Fatal("CommitWorktree accepted an empty dir")
 	}
 }
 
 func TestClientBranchExistsReturnsFalseForMissingBranch(t *testing.T) {
 	runner := &fakeRunner{errs: []error{errors.New("exit status 1")}}
-	exists, err := (Client{Runner: runner, Dir: "/repo"}).BranchExists(context.Background(), "missing")
+	exists, err := (NewClient("/repo", runner)).BranchExists(context.Background(), "missing")
 	if err != nil {
 		t.Fatalf("BranchExists returned error: %v", err)
 	}
@@ -413,7 +420,7 @@ func TestClientBranchExistsReturnsFalseForMissingBranch(t *testing.T) {
 
 func TestClientRemoteBranchesBatchesExactRefs(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "abc\trefs/heads/feature/one\ndef\trefs/heads/unrequested\n"}}}
-	branches, err := (Client{Runner: runner, Dir: "/repo"}).RemoteBranches(context.Background(), []string{"feature/one", "feature/two"})
+	branches, err := (NewClient("/repo", runner)).RemoteBranches(context.Background(), []string{"feature/one", "feature/two"})
 	if err != nil {
 		t.Fatalf("RemoteBranches: %v", err)
 	}
@@ -421,14 +428,14 @@ func TestClientRemoteBranchesBatchesExactRefs(t *testing.T) {
 		t.Fatalf("branches = %v", branches)
 	}
 	runner.wantArgs(t, 0, "git", "ls-remote", "--heads", "origin", "refs/heads/feature/one", "refs/heads/feature/two")
-	if _, err := (Client{}).RemoteBranches(context.Background(), []string{"bad branch"}); err == nil {
+	if _, err := (NewClient("", nil)).RemoteBranches(context.Background(), []string{"bad branch"}); err == nil {
 		t.Fatal("RemoteBranches accepted unsafe branch")
 	}
 }
 
 func TestClientHeadSHA(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "abc123\n"}}}
-	sha, err := (Client{Runner: runner, Dir: "/repo"}).HeadSHA(context.Background())
+	sha, err := (NewClient("/repo", runner)).HeadSHA(context.Background())
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
@@ -440,7 +447,7 @@ func TestClientHeadSHA(t *testing.T) {
 
 func TestClientRevParse(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "def456\n"}}}
-	sha, err := (Client{Runner: runner, Dir: "/repo"}).RevParse(context.Background(), "origin/main")
+	sha, err := (NewClient("/repo", runner)).RevParse(context.Background(), "origin/main")
 	if err != nil {
 		t.Fatalf("RevParse returned error: %v", err)
 	}
@@ -455,7 +462,7 @@ func TestClientRevParse(t *testing.T) {
 // before ever invoking git (no runner call). Mirrors validateBranch's dash guard.
 func TestClientRevParseRejectsDashRev(t *testing.T) {
 	runner := &fakeRunner{}
-	if _, err := (Client{Runner: runner, Dir: "/repo"}).RevParse(context.Background(), "--upload-pack=evil"); err == nil {
+	if _, err := (NewClient("/repo", runner)).RevParse(context.Background(), "--upload-pack=evil"); err == nil {
 		t.Fatal("RevParse accepted a rev starting with '-', want an error")
 	}
 	if len(runner.calls) != 0 {
@@ -465,18 +472,18 @@ func TestClientRevParseRejectsDashRev(t *testing.T) {
 
 func TestClientFetchRemote(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{}}}
-	if err := (Client{Runner: runner, Dir: "/repo"}).FetchRemote(context.Background(), "origin"); err != nil {
+	if err := (NewClient("/repo", runner)).FetchRemote(context.Background(), "origin"); err != nil {
 		t.Fatalf("FetchRemote returned error: %v", err)
 	}
 	runner.wantArgs(t, 0, "git", "fetch", "origin")
-	if err := (Client{}).FetchRemote(context.Background(), "-unsafe"); err == nil {
+	if err := (NewClient("", nil)).FetchRemote(context.Background(), "-unsafe"); err == nil {
 		t.Fatal("FetchRemote accepted an unsafe remote")
 	}
 }
 
 func TestClientBehindCount(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "12\n"}}}
-	count, err := (Client{Runner: runner, Dir: "/repo"}).BehindCount(context.Background(), "origin/main")
+	count, err := (NewClient("/repo", runner)).BehindCount(context.Background(), "origin/main")
 	if err != nil {
 		t.Fatalf("BehindCount returned error: %v", err)
 	}
@@ -488,10 +495,10 @@ func TestClientBehindCount(t *testing.T) {
 
 func TestClientBehindCountRejectsInvalidOutput(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "many\n"}}}
-	if _, err := (Client{Runner: runner, Dir: "/repo"}).BehindCount(context.Background(), "origin/main"); err == nil {
+	if _, err := (NewClient("/repo", runner)).BehindCount(context.Background(), "origin/main"); err == nil {
 		t.Fatal("BehindCount accepted non-numeric output")
 	}
-	if _, err := (Client{}).BehindCount(context.Background(), "-unsafe"); err == nil {
+	if _, err := (NewClient("", nil)).BehindCount(context.Background(), "-unsafe"); err == nil {
 		t.Fatal("BehindCount accepted an unsafe ref")
 	}
 }
@@ -510,7 +517,7 @@ func TestClientIsAncestor(t *testing.T) {
 	}
 	runGit(t, dir, "add", "history.txt")
 	runGit(t, dir, "commit", "-m", "base")
-	client := Client{Dir: dir}
+	client := NewHostClient(dir)
 	base, err := client.HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA base: %v", err)
@@ -561,7 +568,7 @@ func TestClientCommitExistsDistinguishesMissingObject(t *testing.T) {
 	}
 	runGit(t, dir, "add", "README.md")
 	runGit(t, dir, "commit", "-m", "initial")
-	client := Client{Dir: dir}
+	client := NewHostClient(dir)
 	head, err := client.HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA: %v", err)
@@ -576,7 +583,7 @@ func TestClientCommitExistsDistinguishesMissingObject(t *testing.T) {
 
 func TestClientCommitExistsPropagatesRepositoryFailure(t *testing.T) {
 	runner := &fakeRunner{errs: []error{errors.New("object database unavailable")}}
-	present, err := (Client{Runner: runner, Dir: "/repo"}).CommitExists(context.Background(), "deadbeef")
+	present, err := (NewClient("/repo", runner)).CommitExists(context.Background(), "deadbeef")
 	if err == nil || present {
 		t.Fatalf("CommitExists(repository failure) = %t, %v", present, err)
 	}
@@ -597,7 +604,7 @@ func TestClientCreateBranchSmoke(t *testing.T) {
 	runGit(t, dir, "add", "README.md")
 	runGit(t, dir, "commit", "-m", "init")
 
-	client := Client{Dir: dir}
+	client := NewHostClient(dir)
 	if err := client.CreateBranch(context.Background(), "task-branch", "main"); err != nil {
 		t.Fatalf("CreateBranch returned error: %v", err)
 	}
@@ -624,7 +631,7 @@ func TestClientWorktreeCleanSmoke(t *testing.T) {
 	runGit(t, dir, "add", "README.md")
 	runGit(t, dir, "commit", "-m", "init")
 
-	client := Client{Dir: dir}
+	client := NewHostClient(dir)
 	clean, err := client.WorktreeClean(context.Background())
 	if err != nil {
 		t.Fatalf("WorktreeClean returned error: %v", err)
@@ -659,7 +666,7 @@ func TestClientAddExistingBranchWorktreeRefusesCheckedOutBranchSmoke(t *testing.
 	runGit(t, dir, "commit", "-m", "init")
 	runGit(t, dir, "switch", "-c", "task-branch")
 
-	client := Client{Dir: dir}
+	client := NewHostClient(dir)
 	err := client.AddExistingBranchWorktree(context.Background(), "task-branch", filepath.Join(dir, "task-worktree"))
 	if err == nil {
 		t.Fatal("AddExistingBranchWorktree allowed a branch already checked out in the main worktree")

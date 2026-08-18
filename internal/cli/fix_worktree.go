@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
-	gitutil "github.com/gitmoot/gitmoot/internal/git"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -20,7 +20,11 @@ import (
 // registered checkout already has that branch checked out; an independent clone
 // has its own refs and HEAD, so the fix can commit and push without touching the
 // owner's index, files, or current branch.
-func allocateFixWorktree(ctx context.Context, store *db.Store, home string, checkout string, request workflow.FixWorktreeRequest) (allocation workflow.FixWorktreeAllocation, retErr error) {
+func allocateFixWorktree(ctx context.Context, store *db.Store, home string, checkout string, request workflow.FixWorktreeRequest) (workflow.FixWorktreeAllocation, error) {
+	return allocateFixWorktreeForRunner(ctx, store, home, checkout, request, subprocess.ExecRunner{})
+}
+
+func allocateFixWorktreeForRunner(ctx context.Context, store *db.Store, home string, checkout string, request workflow.FixWorktreeRequest, runner subprocess.Runner) (allocation workflow.FixWorktreeAllocation, retErr error) {
 	if store == nil {
 		return allocation, errors.New("fix worktree store is required")
 	}
@@ -44,7 +48,7 @@ func allocateFixWorktree(ctx context.Context, store *db.Store, home string, chec
 		// interrupted pre-enqueue allocation and must be recreated from a fresh fetch
 		// rather than silently reusing a potentially stale head.
 		if _, jobErr := store.GetJob(ctx, request.JobID); jobErr == nil {
-			branchAtPath, branchErr := (gitutil.Client{Dir: path}).CurrentBranch(ctx)
+			branchAtPath, branchErr := jobGitClient(path, runner).CurrentBranch(ctx)
 			if branchErr == nil && branchAtPath == branch {
 				return allocation, nil
 			}
@@ -59,7 +63,7 @@ func allocateFixWorktree(ctx context.Context, store *db.Store, home string, chec
 		return allocation, fmt.Errorf("inspect fix worktree %s: %w", path, err)
 	}
 
-	source := gitutil.Client{Dir: checkout}
+	source := jobGitClient(checkout, runner)
 	remoteURL, err := source.OriginRemoteConfigured(ctx)
 	if err != nil {
 		return allocation, fmt.Errorf("resolve fix worktree origin: %w", err)
@@ -92,7 +96,7 @@ func allocateFixWorktree(ctx context.Context, store *db.Store, home string, chec
 			_ = os.RemoveAll(path)
 		}
 	}()
-	clone := gitutil.Client{Dir: path}
+	clone := jobGitClient(path, runner)
 	if err := clone.SetRemoteURL(ctx, "origin", remoteURL); err != nil {
 		return allocation, fmt.Errorf("bind fix worktree origin: %w", err)
 	}

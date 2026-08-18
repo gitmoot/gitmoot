@@ -877,7 +877,7 @@ func TestRunQueuedJobsRefreshesImplementedHeadBeforeReviewDispatch(t *testing.T)
 	runGit(t, checkout, "commit", "-m", "initial")
 	runGit(t, checkout, "branch", "-m", "task-1")
 	runGit(t, checkout, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	oldHead, err := (gitutil.Client{Dir: checkout}).HeadSHA(ctx)
+	oldHead, err := (gitutil.NewHostClient(checkout)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
@@ -921,7 +921,7 @@ func TestRunQueuedJobsRefreshesImplementedHeadBeforeReviewDispatch(t *testing.T)
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
 
-	newHead, err := (gitutil.Client{Dir: checkout}).HeadSHA(ctx)
+	newHead, err := (gitutil.NewHostClient(checkout)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
@@ -1921,7 +1921,7 @@ func TestRunQueuedJobsUsesTaskWorktreeForImplement(t *testing.T) {
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	worktree := filepath.Join(t.TempDir(), "task-1")
 	runDaemonWorkerGit(t, checkout, "worktree", "add", "-b", "task-1", worktree, "main")
-	head, err := (gitutil.Client{Dir: worktree}).HeadSHA(ctx)
+	head, err := (gitutil.NewHostClient(worktree)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
@@ -1976,7 +1976,7 @@ func TestRunQueuedJobsResumesSelfDirtyTaskWorktree(t *testing.T) {
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	worktree := filepath.Join(t.TempDir(), "task-resume")
 	runDaemonWorkerGit(t, checkout, "worktree", "add", "-b", "task-resume", worktree, "main")
-	head, err := (gitutil.Client{Dir: worktree}).HeadSHA(ctx)
+	head, err := (gitutil.NewHostClient(worktree)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
@@ -2094,7 +2094,7 @@ func TestRunQueuedJobsResumesDelegatedImplementWithOriginalBranchLock(t *testing
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	worktree := filepath.Join(t.TempDir(), "task-1")
 	runDaemonWorkerGit(t, checkout, "worktree", "add", "-b", "task-1", worktree, "main")
-	head, err := (gitutil.Client{Dir: worktree}).HeadSHA(ctx)
+	head, err := (gitutil.NewHostClient(worktree)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
@@ -2164,7 +2164,7 @@ func TestRunQueuedJobsUsesTaskWorktreeForReview(t *testing.T) {
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	worktree := filepath.Join(t.TempDir(), "task-1")
 	runDaemonWorkerGit(t, checkout, "worktree", "add", "-b", "task-1", worktree, "main")
-	head, err := (gitutil.Client{Dir: worktree}).HeadSHA(ctx)
+	head, err := (gitutil.NewHostClient(worktree)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
@@ -2205,7 +2205,7 @@ func TestRunQueuedJobsKeepsReviewOnRegisteredCheckoutWithoutTaskWorktree(t *test
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	checkout := createDaemonWorkerGitCheckout(t, "task-1")
-	head, err := (gitutil.Client{Dir: checkout}).HeadSHA(ctx)
+	head, err := (gitutil.NewHostClient(checkout)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
@@ -2365,7 +2365,7 @@ func TestRunQueuedJobsFailsReviewOnWrongCheckoutBranchBeforeDelivery(t *testing.
 	runGit(t, checkout, "commit", "-m", "initial")
 	runGit(t, checkout, "branch", "-m", "main")
 	runGit(t, checkout, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	head, err := (gitutil.Client{Dir: checkout}).HeadSHA(ctx)
+	head, err := (gitutil.NewHostClient(checkout)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
@@ -3271,7 +3271,7 @@ func TestRetryPendingJobAdvancementsRefreshesImplementedHeadBeforePreflight(t *t
 	runGit(t, checkout, "commit", "-m", "initial")
 	runGit(t, checkout, "branch", "-m", "task-1")
 	runGit(t, checkout, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	oldHead, err := (gitutil.Client{Dir: checkout}).HeadSHA(ctx)
+	oldHead, err := (gitutil.NewHostClient(checkout)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
@@ -3280,7 +3280,7 @@ func TestRetryPendingJobAdvancementsRefreshesImplementedHeadBeforePreflight(t *t
 	}
 	runGit(t, checkout, "add", "README.md")
 	runGit(t, checkout, "commit", "-m", "implement")
-	newHead, err := (gitutil.Client{Dir: checkout}).HeadSHA(ctx)
+	newHead, err := (gitutil.NewHostClient(checkout)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}

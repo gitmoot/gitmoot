@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
-	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -19,6 +19,10 @@ import (
 // pre-flight guard; every predicate miss or probe/persistence error returns false
 // so jobWorker.run takes the existing checkout-contention path unchanged.
 func (w jobWorker) resumeSelfDirtyWorktree(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent, cause error) (string, workflow.JobPayload, bool) {
+	return w.resumeSelfDirtyWorktreeForRunner(ctx, job, payload, agent, cause, subprocess.ExecRunner{})
+}
+
+func (w jobWorker) resumeSelfDirtyWorktreeForRunner(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent, cause error, runner subprocess.Runner) (string, workflow.JobPayload, bool) {
 	kind, _ := classifyCheckoutContention(cause)
 	if kind != checkoutContentionDirty || cause == nil || !strings.Contains(cause.Error(), "has uncommitted changes") {
 		return "", payload, false
@@ -57,7 +61,7 @@ func (w jobWorker) resumeSelfDirtyWorktree(ctx context.Context, job db.Job, payl
 	if expectedHead == "" {
 		return "", payload, false
 	}
-	head, err := (gitutil.Client{Dir: resolvedCheckout}).HeadSHA(ctx)
+	head, err := jobGitClient(resolvedCheckout, runner).HeadSHA(ctx)
 	if err != nil || head != expectedHead {
 		return "", payload, false
 	}

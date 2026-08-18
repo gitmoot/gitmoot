@@ -18,6 +18,7 @@ import (
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -124,6 +125,17 @@ type localAgentDispatchRequest struct {
 	// without the required audit. It is set by prepareLocalReviewTask and never
 	// persisted in the job payload.
 	ReviewTaskHeadDivergence string
+	jobRunner                subprocess.Runner
+}
+
+func localDispatchJobRunner(request localAgentDispatchRequest) subprocess.Runner {
+	if request.jobRunner != nil {
+		return request.jobRunner
+	}
+	// Direct helper callers are operator-side setup and tests, not admitted job
+	// execution. dispatchLocalAgentJob always installs the resolved backend runner
+	// before reaching these helpers.
+	return subprocess.ExecRunner{}
 }
 
 var promptCommitTokenRE = regexp.MustCompile(`\b[0-9a-fA-F]{7,64}\b`)
@@ -157,19 +169,29 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}
-	// Foreground dispatch bypasses jobWorker.run, so resolve its execution
-	// backend here before any durable dispatch state or runtime side effect. The
-	// background path deliberately leaves resolution to the claiming worker,
-	// which records a loud terminal failure for an invalid queued selection.
+	// Dispatch performs checkout and git preparation before enqueue, so resolve
+	// the execution backend before any of those job-associated subprocesses.
+	// The claiming worker resolves it again from the durable payload/config at
+	// execution time; this ingress decision governs only pre-enqueue work.
 	var foregroundAdapterFactory foregroundRuntimeAdapterFactory
-	var foregroundExecBackend execbackend.Backend
-	if !request.Background {
-		var resolveErr error
-		foregroundExecBackend, resolveErr = localAgentDispatchExecBackendFor(request.Home)
-		if resolveErr != nil {
-			return localAgentJobOutput{}, resolveErr
+	execBackend, err := localAgentDispatchExecBackendFor(request.Home)
+	if err != nil {
+		if !request.Background {
+			return localAgentJobOutput{}, err
 		}
-		foregroundAdapterFactory, err = foregroundRuntimeAdapterFactoryFor(foregroundExecBackend)
+		// Preserve background dispatch's durable fail-loud contract: invalid
+		// configuration is recorded by the claiming worker on the queued job. The
+		// ingress-only checkout preparation is explicitly host-side in this case;
+		// the invalid selection can never reach job execution.
+		request.jobRunner = subprocess.ExecRunner{}
+	} else {
+		request.jobRunner, err = jobSubprocessRunnerForBackend(execBackend)
+		if err != nil {
+			return localAgentJobOutput{}, err
+		}
+	}
+	if !request.Background {
+		foregroundAdapterFactory, err = foregroundRuntimeAdapterFactoryFor(execBackend)
 		if err != nil {
 			return localAgentJobOutput{}, err
 		}
@@ -236,7 +258,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			}
 		}
 		if base != "" {
-			request.ImplementBase, err = resolveLocalImplementBase(ctx, paths, record, base)
+			request.ImplementBase, err = resolveLocalImplementBaseForRunner(ctx, paths, record, base, localDispatchJobRunner(request))
 			if err != nil {
 				return localAgentJobOutput{}, err
 			}
@@ -297,14 +319,14 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		// workflow engine also owns job-associated subprocesses (produce checks and
 		// result observation). Stamp the same resolved decision on the effective
 		// foreground agent so those routes cannot silently default back to Local.
-		effectiveAgent.ExecBackend = string(foregroundExecBackend)
+		effectiveAgent.ExecBackend = string(execBackend)
 	}
 	if readOnlyImplementationBlocked(request.Action, effectiveAgent) {
 		return enqueuePermissionBlockedLocalAgentJob(ctx, store, request, repo.FullName(), record.DefaultBranch, agent.Name, overrideRuntime, overrideRef, orgPolicy)
 	}
 	var foregroundContract *runtime.RuntimeContractResult
 	if !request.Background {
-		result, err := runtimeContractPreflightForBackend(foregroundExecBackend, func() runtime.RuntimeContractResult {
+		result, err := runtimeContractPreflightForBackend(execBackend, func() runtime.RuntimeContractResult {
 			return localRuntimeContractPreflight(ctx, effectiveAgent)
 		})
 		if err != nil {
@@ -342,7 +364,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		// the canonical checkout with its inherited dispatch head before its
 		// committed-tip worktree clears that head. Only review scans its newly
 		// allocated exact-head checkout below.
-		promptHeadWarnings = dispatchPromptHeadContradictionWarnings(ctx, gitutil.Client{Dir: checkoutPath}, request.Instructions, request.HeadSHA)
+		promptHeadWarnings = dispatchPromptHeadContradictionWarnings(ctx, jobGitClient(checkoutPath, localDispatchJobRunner(request)), request.Instructions, request.HeadSHA)
 	}
 	// A --recipe routes this coordinator to a named built-in recipe template's
 	// prompt (resolved from the installed-template store) without rebinding the
@@ -373,7 +395,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			return localAgentJobOutput{}, errors.New("allocate exact-head review worktree: no worktree was allocated")
 		}
 		checkoutPath = readOnlyWorktreePath
-		promptHeadWarnings = dispatchPromptHeadContradictionWarnings(ctx, gitutil.Client{Dir: checkoutPath}, request.Instructions, request.HeadSHA)
+		promptHeadWarnings = dispatchPromptHeadContradictionWarnings(ctx, jobGitClient(checkoutPath, localDispatchJobRunner(request)), request.Instructions, request.HeadSHA)
 	}
 	if readOnlyWorktreePath != "" {
 		if request.Action != "review" {
@@ -444,7 +466,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		// from the (possibly cancelled) request context so removal still runs; the
 		// reactive pool-isolation path defends its own allocation the same way.
 		if readOnlyWorktreePath != "" {
-			_ = gitutil.Client{Dir: record.CheckoutPath}.RemoveWorktreeForce(context.WithoutCancel(ctx), readOnlyWorktreePath)
+			_ = jobGitClient(record.CheckoutPath, localDispatchJobRunner(request)).RemoveWorktreeForce(context.WithoutCancel(ctx), readOnlyWorktreePath)
 		}
 		return localAgentJobOutput{}, err
 	}
@@ -610,7 +632,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		handled := false
 		if overrideRuntime == "" {
 			var abErr error
-			handled, abErr = maybeRunLiveAB(runCtx, store, request, agent, job, adapter, managed.OK, foregroundExecBackend)
+			handled, abErr = maybeRunLiveAB(runCtx, store, request, agent, job, adapter, managed.OK, execBackend)
 			if abErr != nil {
 				recordRuntimeOutcome(abErr)
 				return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, abErr)
@@ -635,7 +657,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		if paths, err := pathsFromFlag(request.Home); err == nil {
 			workflowHome = paths.Home
 		}
-		engine := daemonWorkflowEngine(store, newAgentDispatchGitHubClient(checkoutPath), checkoutPath, workflowHome)
+		engine := daemonWorkflowEngineForRunner(store, newAgentDispatchGitHubClient(checkoutPath), checkoutPath, workflowHome, localDispatchJobRunner(request))
 		if _, err := engine.RunJob(runCtx, job.ID, effectiveAgent, adapter); err != nil {
 			if out, ok, _ := recoverAdvanceErrorOutput(ctx, store, job.ID, request, err); ok {
 				recordRuntimeOutcome(nil)
@@ -919,7 +941,7 @@ func prepareLocalReviewTask(ctx context.Context, store *db.Store, repo github.Re
 				return localAgentDispatchRequest{}, disposedReviewTaskError(task)
 			}
 			if strings.TrimSpace(task.WorktreePath) != "" {
-				head, headErr := (gitutil.Client{Dir: task.WorktreePath}).HeadSHA(ctx)
+				head, headErr := jobGitClient(task.WorktreePath, localDispatchJobRunner(request)).HeadSHA(ctx)
 				if headErr != nil {
 					return localAgentDispatchRequest{}, headErr
 				}
@@ -1008,7 +1030,7 @@ func prepareLocalImplementDispatchRequest(ctx context.Context, store *db.Store, 
 	baseSHA := strings.TrimSpace(request.ImplementBase)
 	deferImplicitPRBase := request.PullRequest > 0 && !request.ImplementBaseResolved && baseSHA == ""
 	if !request.ImplementBaseResolved && !deferImplicitPRBase {
-		baseSHA, err = resolveLocalImplementBase(ctx, paths, record, baseSHA)
+		baseSHA, err = resolveLocalImplementBaseForRunner(ctx, paths, record, baseSHA, localDispatchJobRunner(request))
 		if err != nil {
 			return db.Task{}, localAgentDispatchRequest{}, err
 		}
@@ -1043,7 +1065,7 @@ func prepareLocalImplementDispatchRequest(ctx context.Context, store *db.Store, 
 					Number:  int64(request.PullRequest),
 					HeadRef: branchHint,
 					HeadSHA: request.HeadSHA,
-				}); err != nil {
+				}, localDispatchJobRunner(request)); err != nil {
 					return db.Task{}, localAgentDispatchRequest{}, err
 				}
 			}
@@ -1059,13 +1081,13 @@ func prepareLocalImplementDispatchRequest(ctx context.Context, store *db.Store, 
 			if strings.TrimSpace(existing.WorktreePath) != "" && taskWorktreeHasLiveProcess(existing.WorktreePath) {
 				return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s has a live process still inside task worktree %s; wait for it to exit or stop the orphaned implementer before retrying implement", branchHint, existing.WorktreePath)
 			}
-			if dirty, err := taskWorktreeDirty(ctx, existing); err != nil {
+			if dirty, err := taskWorktreeDirtyWithRunner(ctx, existing, localDispatchJobRunner(request)); err != nil {
 				return db.Task{}, localAgentDispatchRequest{}, err
 			} else if dirty {
 				if baseSHA != "" {
 					handled, blockErr := (workflow.Engine{Store: store}).ReconcileDirtyTaskWorktreeLineage(
 						ctx,
-						gitutil.Client{Dir: record.CheckoutPath},
+						jobGitClient(record.CheckoutPath, localDispatchJobRunner(request)),
 						existing,
 						existing.WorktreePath,
 						baseSHA,
@@ -1126,7 +1148,7 @@ func prepareLocalImplementDispatchRequest(ctx context.Context, store *db.Store, 
 			return db.Task{}, localAgentDispatchRequest{}, pathErr
 		}
 		if task.Branch != branch || strings.TrimSpace(task.WorktreePath) == "" || task.WorktreePath != expectedWorktree {
-			baseSHA, err = resolveLocalImplementBase(ctx, paths, record, "")
+			baseSHA, err = resolveLocalImplementBaseForRunner(ctx, paths, record, "", localDispatchJobRunner(request))
 			if err != nil {
 				return db.Task{}, localAgentDispatchRequest{}, err
 			}
@@ -1144,11 +1166,11 @@ func prepareLocalImplementDispatchRequest(ctx context.Context, store *db.Store, 
 		LineageUnknown: deferImplicitPRBase && baseSHA == "",
 		Owner:          owner,
 		Checkout:       record.CheckoutPath,
-	}, gitutil.Client{Dir: record.CheckoutPath})
+	}, jobGitClient(record.CheckoutPath, localDispatchJobRunner(request)))
 	if err != nil {
 		return db.Task{}, localAgentDispatchRequest{}, err
 	}
-	headSHA, err := (gitutil.Client{Dir: started.WorktreePath}).HeadSHA(ctx)
+	headSHA, err := jobGitClient(started.WorktreePath, localDispatchJobRunner(request)).HeadSHA(ctx)
 	if err != nil {
 		return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("resolve task worktree head: %w", err)
 	}
@@ -1199,7 +1221,7 @@ func bindLocalImplementRequestToPullRequest(ctx context.Context, store *db.Store
 	case workflow.TaskAwaitingHumanMerge:
 		return localAgentDispatchRequest{}, fmt.Errorf("task %s is awaiting a human merge decision; implement fix-pass is refused until it resolves", task.ID)
 	}
-	if err := validateFixPassTaskWorktreeHead(ctx, task, pr); err != nil {
+	if err := validateFixPassTaskWorktreeHead(ctx, task, pr, localDispatchJobRunner(request)); err != nil {
 		return localAgentDispatchRequest{}, err
 	}
 	request.Branch = headBranch
@@ -1210,7 +1232,7 @@ func bindLocalImplementRequestToPullRequest(ctx context.Context, store *db.Store
 	return request, nil
 }
 
-func validateFixPassTaskWorktreeHead(ctx context.Context, task db.Task, pr github.PullRequest) error {
+func validateFixPassTaskWorktreeHead(ctx context.Context, task db.Task, pr github.PullRequest, runner subprocess.Runner) error {
 	path := strings.TrimSpace(task.WorktreePath)
 	expectedBranch := strings.TrimSpace(pr.HeadRef)
 	expectedHead := strings.TrimSpace(pr.HeadSHA)
@@ -1221,7 +1243,7 @@ func validateFixPassTaskWorktreeHead(ctx context.Context, task db.Task, pr githu
 	if expectedHead == "" {
 		return fmt.Errorf("pull request #%d returned no head SHA; cannot prove task worktree %s is current; %s", pr.Number, path, guidance)
 	}
-	git := gitutil.Client{Dir: path}
+	git := jobGitClient(path, runner)
 	branch, err := git.CurrentBranch(ctx)
 	if err != nil {
 		return fmt.Errorf("inspect task worktree branch for pull request #%d: %w; %s", pr.Number, err, guidance)
@@ -1240,6 +1262,10 @@ func validateFixPassTaskWorktreeHead(ctx context.Context, task db.Task, pr githu
 // start from. A CLI value wins over [workflow].implement_base. With neither set,
 // HEAD preserves checkout-following behavior after the stale-feature guard.
 func resolveLocalImplementBase(ctx context.Context, paths config.Paths, record db.Repo, requested string) (string, error) {
+	return resolveLocalImplementBaseForRunner(ctx, paths, record, requested, subprocess.ExecRunner{})
+}
+
+func resolveLocalImplementBaseForRunner(ctx context.Context, paths config.Paths, record db.Repo, requested string, runner subprocess.Runner) (string, error) {
 	base := strings.TrimSpace(requested)
 	if base == "" {
 		configured, err := config.LoadImplementBase(paths)
@@ -1248,7 +1274,7 @@ func resolveLocalImplementBase(ctx context.Context, paths config.Paths, record d
 		}
 		base = strings.TrimSpace(configured)
 	}
-	git := gitutil.Client{Dir: record.CheckoutPath}
+	git := jobGitClient(record.CheckoutPath, runner)
 	if base == "" {
 		if err := guardImplicitImplementBase(ctx, git, record.DefaultBranch); err != nil {
 			return "", err
@@ -1689,7 +1715,7 @@ func resolveLocalAgentRepo(ctx context.Context, store *db.Store, repoFlag string
 	// This prevents an ephemeral cwd from becoming repo.CheckoutPath without
 	// silently rebasing local ask/review behavior onto the stored default branch.
 	if strings.TrimSpace(repoFlag) == "" {
-		if cwdRecord, cwdErr := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: "."}); cwdErr == nil {
+		if cwdRecord, cwdErr := repoRecordForCheckout(ctx, repo, gitutil.NewHostClient(".")); cwdErr == nil {
 			record.DefaultBranch = cwdRecord.DefaultBranch
 		}
 	}
@@ -1700,7 +1726,7 @@ func localAgentTargetRepo(ctx context.Context, repoFlag string) (github.Reposito
 	if strings.TrimSpace(repoFlag) != "" {
 		return daemon.ParseRepository(repoFlag)
 	}
-	remote, err := (gitutil.Client{Dir: "."}).OriginRemote(ctx)
+	remote, err := (gitutil.NewHostClient(".")).OriginRemote(ctx)
 	if err != nil {
 		return github.Repository{}, fmt.Errorf("infer repo from current checkout: %w", err)
 	}
@@ -1772,7 +1798,7 @@ func maybeAllocateDispatchReadOnlyWorktree(ctx context.Context, store *db.Store,
 			return "", errors.New("review read-only worktree requires a head SHA")
 		}
 	}
-	git := gitutil.Client{Dir: checkout}
+	git := jobGitClient(checkout, localDispatchJobRunner(request))
 	path, err := allocateDispatchReadOnlyWorktree(ctx, store, paths.Home, repo, checkout, jobID, "readonly-seat", 0, baseRef, workflow.ReadOnlyWorktreeDispatchLockWaitBudget, git)
 	if err == nil || strings.TrimSpace(request.Action) != "review" {
 		return path, err

@@ -18,6 +18,7 @@ import (
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/pathutil"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
 
 func runRepo(args []string, stdout, stderr io.Writer) int {
@@ -142,7 +143,7 @@ func runRepoAdd(args []string, stdout, stderr io.Writer) int {
 		}
 		writeLine(stderr, "WARN: %s", repoCheckoutHealMessage(repo.FullName(), healedFrom, record.CheckoutPath))
 	}
-	client := gitutil.Client{Dir: record.CheckoutPath}
+	client := gitutil.NewHostClient(record.CheckoutPath)
 	primary, err := client.PrimaryWorktree(context.Background())
 	if err != nil {
 		fmt.Fprintf(stderr, "repo add: resolve primary worktree: %v\n", err)
@@ -451,7 +452,7 @@ func inspectRegisteredRepoCheckout(ctx context.Context, store *db.Store, record 
 	if err != nil {
 		return db.Repo{}, false, false, err
 	}
-	linked, err := (gitutil.Client{Dir: resolved.CheckoutPath}).IsLinkedWorktree(ctx)
+	linked, err := (gitutil.NewHostClient(resolved.CheckoutPath)).IsLinkedWorktree(ctx)
 	if err != nil {
 		return db.Repo{}, false, false, err
 	}
@@ -475,14 +476,18 @@ func resolveRepoRecord(ctx context.Context, store *db.Store, repo github.Reposit
 }
 
 func resolveRegisteredRepoRecord(ctx context.Context, store *db.Store, repo github.Repository, existing db.Repo) (db.Repo, bool, error) {
+	return resolveRegisteredRepoRecordWithRunner(ctx, store, repo, existing, subprocess.ExecRunner{})
+}
+
+func resolveRegisteredRepoRecordWithRunner(ctx context.Context, store *db.Store, repo github.Repository, existing db.Repo, runner subprocess.Runner) (db.Repo, bool, error) {
 	checkout := strings.TrimSpace(existing.CheckoutPath)
 	var checkoutErr error
 	if checkout != "" {
-		resolved, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: checkout})
+		resolved, err := repoRecordForCheckout(ctx, repo, jobGitClient(checkout, runner))
 		if err == nil {
 			primary := strings.TrimSpace(existing.PrimaryCheckoutPath)
 			if primary == "" {
-				primary, err = (gitutil.Client{Dir: checkout}).PrimaryWorktree(ctx)
+				primary, err = jobGitClient(checkout, runner).PrimaryWorktree(ctx)
 				if err != nil {
 					return db.Repo{}, false, fmt.Errorf("resolve primary worktree for %s: %w", repo.FullName(), err)
 				}
@@ -495,7 +500,7 @@ func resolveRegisteredRepoRecord(ctx context.Context, store *db.Store, repo gith
 					if err != nil {
 						return db.Repo{}, false, err
 					}
-					return resolveRegisteredRepoRecord(ctx, store, repo, current)
+					return resolveRegisteredRepoRecordWithRunner(ctx, store, repo, current, runner)
 				}
 			}
 			resolved.PrimaryCheckoutPath = primary
@@ -510,16 +515,16 @@ func resolveRegisteredRepoRecord(ctx context.Context, store *db.Store, repo gith
 	if primary == "" || sameCheckoutPath(primary, checkout) {
 		return db.Repo{}, false, fmt.Errorf("registered checkout %s for %s is unusable and no distinct primary checkout is available: %w", checkout, repo.FullName(), checkoutErr)
 	}
-	resolved, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: primary})
+	resolved, err := repoRecordForCheckout(ctx, repo, jobGitClient(primary, runner))
 	if err != nil {
 		return db.Repo{}, false, fmt.Errorf("registered checkout %s for %s is unusable (%v); verify primary checkout %s: %w", checkout, repo.FullName(), checkoutErr, primary, err)
 	}
-	primary, err = (gitutil.Client{Dir: resolved.CheckoutPath}).PrimaryWorktree(ctx)
+	primary, err = jobGitClient(resolved.CheckoutPath, runner).PrimaryWorktree(ctx)
 	if err != nil {
 		return db.Repo{}, false, fmt.Errorf("resolve primary worktree for %s from %s: %w", repo.FullName(), resolved.CheckoutPath, err)
 	}
 	if !sameCheckoutPath(primary, resolved.CheckoutPath) {
-		resolved, err = repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: primary})
+		resolved, err = repoRecordForCheckout(ctx, repo, jobGitClient(primary, runner))
 		if err != nil {
 			return db.Repo{}, false, fmt.Errorf("verify resolved primary checkout %s for %s: %w", primary, repo.FullName(), err)
 		}
@@ -535,7 +540,7 @@ func resolveRegisteredRepoRecord(ctx context.Context, store *db.Store, repo gith
 		if err != nil {
 			return db.Repo{}, false, err
 		}
-		return resolveRegisteredRepoRecord(ctx, store, repo, current)
+		return resolveRegisteredRepoRecordWithRunner(ctx, store, repo, current, runner)
 	}
 	log.Printf("WARNING: %s", repoCheckoutHealMessage(repo.FullName(), checkout, resolved.CheckoutPath))
 	return resolved, true, nil
@@ -559,7 +564,7 @@ func repoRecordFromPath(ctx context.Context, repo github.Repository, path string
 	if err != nil {
 		return db.Repo{}, err
 	}
-	return repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: checkout})
+	return repoRecordForCheckout(ctx, repo, gitutil.NewHostClient(checkout))
 }
 
 // repoRecordFromStablePath resolves an operator/cwd-provided checkout but pins
@@ -570,7 +575,7 @@ func repoRecordFromStablePath(ctx context.Context, repo github.Repository, path 
 	if err != nil {
 		return db.Repo{}, err
 	}
-	client := gitutil.Client{Dir: checkout}
+	client := gitutil.NewHostClient(checkout)
 	record, err := repoRecordForCheckout(ctx, repo, client)
 	if err != nil {
 		return db.Repo{}, err
@@ -587,7 +592,7 @@ func repoRecordFromStablePath(ctx context.Context, repo github.Repository, path 
 	if !linked || sameCheckoutPath(record.CheckoutPath, primary) {
 		return record, nil
 	}
-	primaryRecord, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: primary})
+	primaryRecord, err := repoRecordForCheckout(ctx, repo, gitutil.NewHostClient(primary))
 	if err != nil {
 		return db.Repo{}, fmt.Errorf("verify primary checkout: %w", err)
 	}

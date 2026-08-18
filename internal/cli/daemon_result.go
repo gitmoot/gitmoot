@@ -304,7 +304,11 @@ func (w jobWorker) finalizeTimedOutJob(ctx context.Context, job db.Job, payload 
 	reason := fmt.Sprintf("job %s exceeded its run deadline: %v", job.ID, cause)
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	engine := w.WorkflowFactory(w.delegationParentCheckout(writeCtx, job))
+	runner, err := w.subprocessRunnerForJob(job)
+	if err != nil {
+		return false, err
+	}
+	engine := w.workflowForJob(w.delegationParentCheckout(writeCtx, job), runner)
 	return engine.FinalizeTimedOutJob(writeCtx, job.ID, reason, string(detailBytes))
 }
 
@@ -319,7 +323,11 @@ func (w jobWorker) finalizeTimedOutJob(ctx context.Context, job db.Job, payload 
 // Returns whether the child was finalized.
 func (w jobWorker) finalizeTimedOutDelegationChild(ctx context.Context, job db.Job, cause error) (bool, error) {
 	reason := fmt.Sprintf("delegation child %s ended without a result: %v", job.ID, cause)
-	engine := w.WorkflowFactory(w.delegationParentCheckout(ctx, job))
+	runner, err := w.subprocessRunnerForJob(job)
+	if err != nil {
+		return false, err
+	}
+	engine := w.workflowForJob(w.delegationParentCheckout(ctx, job), runner)
 	return engine.FinalizeTimedOutDelegationChild(ctx, job.ID, reason)
 }
 

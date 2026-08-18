@@ -121,7 +121,7 @@ func TestDispatchReviewAllocatesDistinctExactHeadWorktrees(t *testing.T) {
 	var scannerInputs []scannerInput
 	originalScanner := dispatchPromptHeadContradictionWarnings
 	dispatchPromptHeadContradictionWarnings = func(_ context.Context, git gitutil.Client, _ string, head string) []string {
-		scannerInputs = append(scannerInputs, scannerInput{dir: git.Dir, head: head})
+		scannerInputs = append(scannerInputs, scannerInput{dir: git.Dir(), head: head})
 		return nil
 	}
 	t.Cleanup(func() { dispatchPromptHeadContradictionWarnings = originalScanner })
@@ -203,7 +203,7 @@ func TestDispatchAskScannerKeepsCanonicalCheckoutAndInheritedHead(t *testing.T) 
 	var gotDir, gotHead string
 	originalScanner := dispatchPromptHeadContradictionWarnings
 	dispatchPromptHeadContradictionWarnings = func(_ context.Context, git gitutil.Client, _ string, head string) []string {
-		gotDir, gotHead = git.Dir, head
+		gotDir, gotHead = git.Dir(), head
 		return nil
 	}
 	t.Cleanup(func() { dispatchPromptHeadContradictionWarnings = originalScanner })
@@ -382,7 +382,7 @@ func readonlyReviewWorktreeGitCheckout(t *testing.T) (string, string, string) {
 
 func readonlyWorktreeHead(t *testing.T, dir string) string {
 	t.Helper()
-	head, err := (gitutil.Client{Dir: dir}).HeadSHA(context.Background())
+	head, err := (gitutil.NewHostClient(dir)).HeadSHA(context.Background())
 	if err != nil {
 		t.Fatalf("HeadSHA(%s): %v", dir, err)
 	}

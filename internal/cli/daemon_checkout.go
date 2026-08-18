@@ -14,6 +14,7 @@ import (
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -33,7 +34,11 @@ func mergeGateCheckout(ctx context.Context, store *db.Store, repo string, fallba
 }
 
 func (w jobWorker) defaultCheckout(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent) (string, error) {
-	checkout, err := w.resolveJobCheckout(ctx, job, payload)
+	return w.defaultCheckoutForRunner(ctx, job, payload, agent, subprocess.ExecRunner{})
+}
+
+func (w jobWorker) defaultCheckoutForRunner(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent, runner subprocess.Runner) (string, error) {
+	checkout, err := w.resolveJobCheckoutForRunner(ctx, job, payload, runner)
 	if err != nil {
 		return "", err
 	}
@@ -49,7 +54,7 @@ func (w jobWorker) defaultCheckout(ctx context.Context, job db.Job, payload work
 		// validateImplementationLock stays UNCONDITIONAL — the branch lock, not this
 		// identity guard, is the designed mutation-safety mechanism (#413).
 		if !isWorktreeLessDelegationChild(payload) {
-			if err := w.validateTargetCheckout(ctx, payload, checkout); err != nil {
+			if err := w.validateTargetCheckoutForRunner(ctx, payload, checkout, runner); err != nil {
 				return "", err
 			}
 		}
@@ -59,7 +64,7 @@ func (w jobWorker) defaultCheckout(ctx context.Context, job db.Job, payload work
 	case "review":
 		switch {
 		case payload.PullRequest > 0 && strings.TrimSpace(payload.TaskID) != "":
-			if err := w.validateReviewCheckout(ctx, payload, checkout); err != nil {
+			if err := w.validateReviewCheckoutForRunner(ctx, payload, checkout, runner); err != nil {
 				// #684: the PR branch commonly advances between enqueue and execution
 				// in an active dev loop, leaving the checkout on a NEWER head than the
 				// one the review was pinned to. Re-target the review to the checkout's
@@ -67,7 +72,7 @@ func (w jobWorker) defaultCheckout(ctx context.Context, job db.Job, payload work
 				// does) when the PR is still open, instead of failing on the mismatch.
 				// A closed/merged PR, a dirty tree, or any other checkout error keeps
 				// the existing terminal / deferral path.
-				if resynced, resyncErr := w.resyncReviewHead(ctx, job, payload, checkout, err); resyncErr != nil {
+				if resynced, resyncErr := w.resyncReviewHeadForRunner(ctx, job, payload, checkout, runner, err); resyncErr != nil {
 					return "", resyncErr
 				} else if resynced {
 					return checkout, nil
@@ -86,7 +91,7 @@ func (w jobWorker) defaultCheckout(ctx context.Context, job db.Job, payload work
 			// Same worktree-less delegation child escape as the implement arm; a
 			// review is read-only ⇒ running it against the shared checkout is
 			// trivially safe (#413).
-			if err := w.validateTargetCheckout(ctx, payload, checkout); err != nil {
+			if err := w.validateTargetCheckoutForRunner(ctx, payload, checkout, runner); err != nil {
 				return "", err
 			}
 		}
@@ -101,7 +106,7 @@ func (w jobWorker) defaultCheckout(ctx context.Context, job db.Job, payload work
 		// issue ask — and a branch-only PR-less CLI ask — run against the
 		// registered checkout as-is.
 		if payload.PullRequest > 0 && strings.TrimSpace(payload.Branch) != "" {
-			if err := w.validateTargetCheckout(ctx, payload, checkout); err != nil {
+			if err := w.validateTargetCheckoutForRunner(ctx, payload, checkout, runner); err != nil {
 				return "", err
 			}
 		}
@@ -110,6 +115,10 @@ func (w jobWorker) defaultCheckout(ctx context.Context, job db.Job, payload work
 }
 
 func (w jobWorker) resolveJobCheckout(ctx context.Context, job db.Job, payload workflow.JobPayload) (string, error) {
+	return w.resolveJobCheckoutForRunner(ctx, job, payload, subprocess.ExecRunner{})
+}
+
+func (w jobWorker) resolveJobCheckoutForRunner(ctx context.Context, job db.Job, payload workflow.JobPayload, runner subprocess.Runner) (string, error) {
 	if payload.FixWorktree {
 		checkout, err := normalizeTaskWorktreePath(payload.WorktreePath)
 		if err != nil {
@@ -122,7 +131,7 @@ func (w jobWorker) resolveJobCheckout(ctx context.Context, job db.Job, payload w
 		if err != nil {
 			return "", err
 		}
-		if err := preflightDaemonRepoCheckout(ctx, repo, checkout); err != nil {
+		if err := preflightDaemonRepoCheckoutWithRunner(ctx, repo, checkout, runner); err != nil {
 			return "", err
 		}
 		return checkout, nil
@@ -135,11 +144,11 @@ func (w jobWorker) resolveJobCheckout(ctx context.Context, job db.Job, payload w
 	if err != nil {
 		return "", err
 	}
-	checkout, err := w.healRegisteredRepoCheckout(ctx, job, repo, repoRecord)
+	checkout, err := w.healRegisteredRepoCheckoutForRunner(ctx, job, repo, repoRecord, runner)
 	if err != nil {
 		return "", err
 	}
-	if err := preflightDaemonRepoCheckout(ctx, repo, checkout); err != nil {
+	if err := preflightDaemonRepoCheckoutWithRunner(ctx, repo, checkout, runner); err != nil {
 		return "", err
 	}
 	taskCheckout, ok, err := w.taskWorktreeCheckout(ctx, payload)
@@ -148,7 +157,7 @@ func (w jobWorker) resolveJobCheckout(ctx context.Context, job db.Job, payload w
 	}
 	if ok {
 		checkout = taskCheckout
-		if err := preflightDaemonRepoCheckout(ctx, repo, checkout); err != nil {
+		if err := preflightDaemonRepoCheckoutWithRunner(ctx, repo, checkout, runner); err != nil {
 			return "", err
 		}
 	}
@@ -156,8 +165,12 @@ func (w jobWorker) resolveJobCheckout(ctx context.Context, job db.Job, payload w
 }
 
 func (w jobWorker) healRegisteredRepoCheckout(ctx context.Context, job db.Job, repo github.Repository, record db.Repo) (string, error) {
+	return w.healRegisteredRepoCheckoutForRunner(ctx, job, repo, record, subprocess.ExecRunner{})
+}
+
+func (w jobWorker) healRegisteredRepoCheckoutForRunner(ctx context.Context, job db.Job, repo github.Repository, record db.Repo, runner subprocess.Runner) (string, error) {
 	checkout := strings.TrimSpace(record.CheckoutPath)
-	resolved, healed, err := resolveRegisteredRepoRecord(ctx, w.Store, repo, record)
+	resolved, healed, err := resolveRegisteredRepoRecordWithRunner(ctx, w.Store, repo, record, runner)
 	if err != nil {
 		return "", err
 	}
@@ -231,7 +244,11 @@ func normalizeTaskWorktreePath(path string) (string, error) {
 }
 
 func (w jobWorker) validateTargetCheckout(ctx context.Context, payload workflow.JobPayload, checkout string) error {
-	git := gitutil.Client{Dir: checkout}
+	return w.validateTargetCheckoutForRunner(ctx, payload, checkout, subprocess.ExecRunner{})
+}
+
+func (w jobWorker) validateTargetCheckoutForRunner(ctx context.Context, payload workflow.JobPayload, checkout string, runner subprocess.Runner) error {
+	git := jobGitClient(checkout, runner)
 	// A fix-round checkout is an independent writable clone attached to the real
 	// task branch. Its allocator bound HEAD to the fetched branch tip at dispatch;
 	// validate branch identity and cleanliness here without comparing the inherited
@@ -339,7 +356,11 @@ func isWorktreeLessDelegationChild(payload workflow.JobPayload) bool {
 }
 
 func (w jobWorker) validateReviewCheckout(ctx context.Context, payload workflow.JobPayload, checkout string) error {
-	git := gitutil.Client{Dir: checkout}
+	return w.validateReviewCheckoutForRunner(ctx, payload, checkout, subprocess.ExecRunner{})
+}
+
+func (w jobWorker) validateReviewCheckoutForRunner(ctx context.Context, payload workflow.JobPayload, checkout string, runner subprocess.Runner) error {
+	git := jobGitClient(checkout, runner)
 	clean, err := git.WorktreeClean(ctx)
 	if err != nil {
 		return err
@@ -418,6 +439,10 @@ func (w jobWorker) reviewPullRequestOpen(ctx context.Context, repo string, numbe
 // returns true so defaultCheckout proceeds with the review. Every declined case
 // returns false so the caller's existing error path runs byte-identically.
 func (w jobWorker) resyncReviewHead(ctx context.Context, job db.Job, payload workflow.JobPayload, checkout string, cause error) (bool, error) {
+	return w.resyncReviewHeadForRunner(ctx, job, payload, checkout, subprocess.ExecRunner{}, cause)
+}
+
+func (w jobWorker) resyncReviewHeadForRunner(ctx context.Context, job db.Job, payload workflow.JobPayload, checkout string, runner subprocess.Runner, cause error) (bool, error) {
 	if !isReviewHeadMismatch(cause) {
 		return false, nil
 	}
@@ -443,11 +468,11 @@ func (w jobWorker) resyncReviewHead(ctx context.Context, job db.Job, payload wor
 	// a detached-HEAD worktree (CurrentBranch errors) is a legitimate #684 target and
 	// is left to proceed. We deliberately do NOT gate on head == pr.HeadSHA because the
 	// PR-watcher can lag the push, which is exactly the drift #684 exists to tolerate.
-	if b, err := (gitutil.Client{Dir: checkout}).CurrentBranch(ctx); err == nil &&
+	if b, err := jobGitClient(checkout, runner).CurrentBranch(ctx); err == nil &&
 		strings.TrimSpace(b) != strings.TrimSpace(payload.Branch) {
 		return false, nil
 	}
-	head, err := (gitutil.Client{Dir: checkout}).HeadSHA(ctx)
+	head, err := jobGitClient(checkout, runner).HeadSHA(ctx)
 	if err != nil {
 		return false, err
 	}

@@ -419,7 +419,7 @@ func TestResolveLocalAgentRepoPreservesRegisteredDefaultBranch(t *testing.T) {
 	if record.DefaultBranch != "main" {
 		t.Fatalf("default branch = %q, want registered main", record.DefaultBranch)
 	}
-	if branch, err := (gitutil.Client{Dir: checkout}).CurrentBranch(ctx); err != nil || branch != "feature/stale" {
+	if branch, err := (gitutil.NewHostClient(checkout)).CurrentBranch(ctx); err != nil || branch != "feature/stale" {
 		t.Fatalf("checkout branch = %q err=%v, want feature/stale", branch, err)
 	}
 }

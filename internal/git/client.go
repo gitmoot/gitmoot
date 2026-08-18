@@ -14,9 +14,25 @@ import (
 )
 
 type Client struct {
-	Runner subprocess.Runner
-	Dir    string
+	runner subprocess.Runner
+	dir    string
 }
+
+// NewClient binds every git command to an explicit subprocess runner. Job paths
+// pass a backend-resolved runner; operator tooling that intentionally executes
+// on the host uses NewHostClient.
+func NewClient(dir string, runner subprocess.Runner) Client {
+	return Client{runner: runner, dir: dir}
+}
+
+// NewHostClient explicitly selects host execution for non-job CLI and daemon
+// administration paths.
+func NewHostClient(dir string) Client {
+	return NewClient(dir, subprocess.ExecRunner{})
+}
+
+// Dir returns the checkout directory bound to this client.
+func (c Client) Dir() string { return c.dir }
 
 const maxGitErrorStderrRunes = 4096
 
@@ -87,7 +103,7 @@ func (c Client) AddDetachedWorktree(ctx context.Context, path string, ref string
 	return err
 }
 
-// CloneLocalNoCheckout makes an INDEPENDENT local clone of this repo (c.Dir) into
+// CloneLocalNoCheckout makes an INDEPENDENT local clone of this repo (c.dir) into
 // dest via `git clone --local --no-checkout`. Because the source is local, git
 // HARDLINKS everything under objects/ (fast, space-cheap) and copies refs, but the
 // clone gets its OWN git directory: its own object DB directory, refs, config, HEAD,
@@ -105,7 +121,7 @@ func (c Client) CloneLocalNoCheckout(ctx context.Context, dest string) error {
 	if err != nil {
 		return err
 	}
-	src := strings.TrimSpace(c.Dir)
+	src := strings.TrimSpace(c.dir)
 	if src == "" {
 		return errors.New("clone source (client dir) is required")
 	}
@@ -224,10 +240,10 @@ func (c Client) RemoveWorktreeForce(ctx context.Context, path string) error {
 		return err
 	}
 	owner, ownerErr := worktreeOwnerCheckout(path)
-	if ownerErr != nil || filepath.Clean(owner) == filepath.Clean(c.Dir) {
+	if ownerErr != nil || filepath.Clean(owner) == filepath.Clean(c.dir) {
 		return err
 	}
-	_, err = (Client{Runner: c.Runner, Dir: owner}).run(ctx, "worktree", "remove", "--force", path)
+	_, err = NewClient(owner, c.runner).run(ctx, "worktree", "remove", "--force", path)
 	return err
 }
 
@@ -265,7 +281,7 @@ func (c Client) MergeBranches(ctx context.Context, dir string, branches []string
 	if strings.TrimSpace(message) == "" {
 		message = "Gitmoot integration merge"
 	}
-	git := Client{Dir: dir, Runner: c.Runner}
+	git := NewClient(dir, c.runner)
 	for _, branch := range branches {
 		if err := validateBranch(branch); err != nil {
 			return err
@@ -294,7 +310,7 @@ func (c Client) CommitWorktree(ctx context.Context, dir string, message string) 
 	if strings.TrimSpace(message) == "" {
 		message = "Gitmoot delegation commit"
 	}
-	git := Client{Dir: dir, Runner: c.Runner}
+	git := NewClient(dir, c.runner)
 	if _, err := git.run(ctx, "add", "-A"); err != nil {
 		return false, err
 	}
@@ -369,7 +385,7 @@ func (c Client) Root(ctx context.Context) (string, error) {
 	return root, nil
 }
 
-// IsLinkedWorktree reports whether c.Dir is a linked worktree rather than the
+// IsLinkedWorktree reports whether c.dir is a linked worktree rather than the
 // primary checkout. Git 2.31 added --path-format=absolute; older versions fall
 // back to resolving git-dir/common-dir relative to the client directory.
 func (c Client) IsLinkedWorktree(ctx context.Context) (bool, error) {
@@ -431,7 +447,7 @@ func (c Client) absoluteGitPath(path string) (string, error) {
 		return "", errors.New("git path is empty")
 	}
 	if !filepath.IsAbs(path) {
-		base := strings.TrimSpace(c.Dir)
+		base := strings.TrimSpace(c.dir)
 		if base == "" {
 			base = "."
 		}
@@ -484,7 +500,7 @@ func (c Client) WorktreeCleanAt(ctx context.Context, path string) (bool, error) 
 	if err != nil {
 		return false, err
 	}
-	return (Client{Runner: c.Runner, Dir: path}).WorktreeClean(ctx)
+	return NewClient(path, c.runner).WorktreeClean(ctx)
 }
 
 func (c Client) StatusPorcelain(ctx context.Context) (string, error) {
@@ -524,7 +540,7 @@ func (c Client) HeadSHAAt(ctx context.Context, path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return (Client{Runner: c.Runner, Dir: path}).HeadSHA(ctx)
+	return NewClient(path, c.runner).HeadSHA(ctx)
 }
 
 func (c Client) RevParse(ctx context.Context, rev string) (string, error) {
@@ -627,11 +643,10 @@ func (c Client) UpdateBase(ctx context.Context, remote string, branch string) er
 }
 
 func (c Client) run(ctx context.Context, args ...string) (subprocess.Result, error) {
-	runner := c.Runner
-	if runner == nil {
-		runner = subprocess.ExecRunner{}
+	if c.runner == nil {
+		return subprocess.Result{}, errors.New("git subprocess runner is required")
 	}
-	result, err := runner.Run(ctx, c.Dir, "git", args...)
+	result, err := c.runner.Run(ctx, c.dir, "git", args...)
 	if err != nil {
 		if stderr := boundedGitErrorStderr(result.Stderr); stderr != "" {
 			return result, fmt.Errorf("git %s: %w (stderr: %s)", strings.Join(args, " "), err, stderr)
@@ -651,7 +666,7 @@ func boundedGitErrorStderr(stderr string) string {
 }
 
 // worktreeOwnerCheckout resolves the repository that owns a linked worktree
-// from the worktree's gitdir pointer, even when Client.Dir is a different clone.
+// from the worktree's gitdir pointer, even when Client.dir is a different clone.
 func worktreeOwnerCheckout(path string) (string, error) {
 	data, err := os.ReadFile(filepath.Join(path, ".git"))
 	if err != nil {

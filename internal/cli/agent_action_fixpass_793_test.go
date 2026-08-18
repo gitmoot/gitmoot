@@ -576,7 +576,7 @@ func TestDaemonImplementationFinalizerPrefersValidatedPullRequest(t *testing.T) 
 		ValidatedPullRequest: true, HeadSHA: fixture.headSHA, TaskID: fixture.task.ID,
 		Result: &workflow.AgentResult{Decision: "implemented", Summary: "fix pass complete"},
 	}
-	finalized, err := (daemonImplementationFinalizer{Store: fixture.store, GitHub: gh}).FinalizeImplementation(ctx, db.Job{ID: "fix-pass", Agent: "lead", Type: "implement"}, payload)
+	finalized, err := (newHostDaemonImplementationFinalizer(fixture.store, gh)).FinalizeImplementation(ctx, db.Job{ID: "fix-pass", Agent: "lead", Type: "implement"}, payload)
 	if err != nil {
 		t.Fatalf("FinalizeImplementation: %v", err)
 	}
@@ -610,7 +610,7 @@ func TestDaemonImplementationFinalizerPayloadlessUsesBranchFallback(t *testing.T
 		Repo: "owner/repo", Branch: fixture.task.Branch, TaskID: fixture.task.ID,
 		Result: &workflow.AgentResult{Decision: "implemented", Summary: "ordinary implementation"},
 	}
-	finalized, err := (daemonImplementationFinalizer{Store: fixture.store, GitHub: gh}).FinalizeImplementation(ctx, db.Job{ID: "ordinary", Agent: "lead", Type: "implement"}, payload)
+	finalized, err := (newHostDaemonImplementationFinalizer(fixture.store, gh)).FinalizeImplementation(ctx, db.Job{ID: "ordinary", Agent: "lead", Type: "implement"}, payload)
 	if err != nil {
 		t.Fatalf("FinalizeImplementation: %v", err)
 	}
@@ -647,7 +647,7 @@ func TestDaemonImplementationFinalizerRevalidatesBoundPullRequest(t *testing.T) 
 				ValidatedPullRequest: true, HeadSHA: fixture.headSHA, TaskID: fixture.task.ID,
 				Result: &workflow.AgentResult{Decision: "implemented", Summary: "fix pass complete"},
 			}
-			_, err := (daemonImplementationFinalizer{Store: fixture.store, GitHub: gh}).FinalizeImplementation(context.Background(), db.Job{ID: "fix-pass", Agent: "lead", Type: "implement"}, payload)
+			_, err := (newHostDaemonImplementationFinalizer(fixture.store, gh)).FinalizeImplementation(context.Background(), db.Job{ID: "fix-pass", Agent: "lead", Type: "implement"}, payload)
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("FinalizeImplementation error = %v, want %q", err, tt.want)
 			}

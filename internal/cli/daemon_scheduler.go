@@ -17,8 +17,8 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
-	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/transcript"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -830,7 +830,11 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 				continue
 			}
 		}
-		engine := worker.WorkflowFactory(worker.delegationParentCheckout(ctx, job))
+		runner, err := worker.subprocessRunnerForJob(job)
+		if err != nil {
+			return err
+		}
+		engine := worker.workflowForJob(worker.delegationParentCheckout(ctx, job), runner)
 		if err := engine.ReclaimTerminalDelegationWorktree(ctx, jobID); err != nil {
 			writeLine(worker.Stdout, "job %s skipped delegation worktree reclaim failed: %v", job.ID, err)
 		}
@@ -870,7 +874,11 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 				continue
 			}
 		}
-		engine := worker.WorkflowFactory(worker.delegationParentCheckout(ctx, job))
+		runner, err := worker.subprocessRunnerForJob(job)
+		if err != nil {
+			return err
+		}
+		engine := worker.workflowForJob(worker.delegationParentCheckout(ctx, job), runner)
 		if err := engine.ReclaimAgedTerminalDelegationWorktree(ctx, jobID, now.Add(-ttl)); err != nil {
 			return err
 		}
@@ -1499,6 +1507,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 		runtimeKey   string
 		worktreePath string
 		repoCheckout string
+		runner       subprocess.Runner
 		// payloadBeforeIsolation is the job's payload as it was before an
 		// isolation worktree was allocated and written into it; non-empty only
 		// for isolation-dispatched jobs.
@@ -1564,7 +1573,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 		// the add (in allocatePoolIsolationWorktree) and this remove run on the
 		// dispatcher goroutine under the tick's per-repo lock, so they never race.
 		if f.worktreePath != "" && f.repoCheckout != "" {
-			_ = gitutil.Client{Dir: f.repoCheckout}.RemoveWorktreeForce(context.WithoutCancel(ctx), f.worktreePath)
+			_ = jobGitClient(f.repoCheckout, f.runner).RemoveWorktreeForce(context.WithoutCancel(ctx), f.worktreePath)
 		}
 		if f.err != nil && firstErr == nil && !errors.Is(f.err, errRuntimeSessionBusy) {
 			firstErr = f.err
@@ -1729,7 +1738,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 						// host-cap or double-dispatch refusal must not strand it on a
 						// reaped path.
 						_ = worker.Store.UpdateJobPayload(context.WithoutCancel(ctx), iso.job.ID, payloadBeforeIsolation)
-						_ = gitutil.Client{Dir: iso.repoCheckout}.RemoveWorktreeForce(context.WithoutCancel(ctx), iso.worktreePath)
+						_ = jobGitClient(iso.repoCheckout, iso.runner).RemoveWorktreeForce(context.WithoutCancel(ctx), iso.worktreePath)
 						continue
 					}
 					inflightCheckouts[iso.checkoutKey] = true
@@ -1745,7 +1754,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					running++
 					dispatched++
 					go func() {
-						done <- finished{jobID: iso.job.ID, checkoutKey: iso.checkoutKey, runtimeKey: iso.runtimeKey, worktreePath: iso.worktreePath, repoCheckout: iso.repoCheckout, payloadBeforeIsolation: payloadBeforeIsolation, err: runPoolJobRecovered(ctx, worker, iso.job)}
+						done <- finished{jobID: iso.job.ID, checkoutKey: iso.checkoutKey, runtimeKey: iso.runtimeKey, worktreePath: iso.worktreePath, repoCheckout: iso.repoCheckout, runner: iso.runner, payloadBeforeIsolation: payloadBeforeIsolation, err: runPoolJobRecovered(ctx, worker, iso.job)}
 					}()
 				}
 			}
@@ -1801,6 +1810,7 @@ type poolIsolatedDispatch struct {
 	runtimeKey   string
 	worktreePath string
 	repoCheckout string
+	runner       subprocess.Runner
 }
 
 // allocatePoolIsolationWorktree creates a detached read-only worktree for a
@@ -1818,7 +1828,11 @@ func (w jobWorker) allocatePoolIsolationWorktree(ctx context.Context, job db.Job
 	if err != nil || strings.TrimSpace(repoRecord.CheckoutPath) == "" {
 		return poolIsolatedDispatch{}, false, err
 	}
-	client := gitutil.Client{Dir: repoRecord.CheckoutPath}
+	runner, err := w.subprocessRunnerForJob(job)
+	if err != nil {
+		return poolIsolatedDispatch{}, false, err
+	}
+	client := jobGitClient(repoRecord.CheckoutPath, runner)
 	// #739: route through the shared read-only allocator so this reactive top-level
 	// isolation path resolves the ref to HEAD (a committed tip that is always
 	// resolvable — NOT the stale current branch the researchers flagged), holds the
@@ -1864,6 +1878,7 @@ func (w jobWorker) allocatePoolIsolationWorktree(ctx context.Context, job db.Job
 		runtimeKey:   queuedJobRuntimeResourceKey(ctx, w.Store, job),
 		worktreePath: path,
 		repoCheckout: repoRecord.CheckoutPath,
+		runner:       runner,
 	}, true, nil
 }
 

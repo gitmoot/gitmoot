@@ -10,9 +10,9 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
-	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -36,6 +36,15 @@ func pipelineStageCheckoutPath(ctx context.Context, store *db.Store, repo string
 func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueuer {
 	mailbox := workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(home), RuntimeDefaultModel: runtimeDefaultModelResolver(home), RequireWorkflowPolicy: requireWorkflowPolicyResolver(home), OrgPolicy: orgPolicyResolver(home)}
 	return func(ctx context.Context, request workflow.JobRequest) (db.Job, error) {
+		var runner subprocess.Runner = subprocess.ExecRunner{}
+		backend, backendErr := localAgentDispatchExecBackendFor(home)
+		if backendErr == nil {
+			var err error
+			runner, err = jobSubprocessRunnerForBackend(backend)
+			if err != nil {
+				return db.Job{}, err
+			}
+		}
 		// #1011 service shell stages are an explicit fail-CLOSED exception to the
 		// generic read-only allocator below. Their run row is authoritative: every
 		// service-triggered shell command gets a detached worktree, and a missing
@@ -65,7 +74,7 @@ func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueue
 			if !errors.Is(getErr, sql.ErrNoRows) {
 				return db.Job{}, getErr
 			}
-			request, worktreePath, worktreeErr = allocatePipelineServiceShellWorktree(ctx, store, home, request)
+			request, worktreePath, worktreeErr = allocatePipelineServiceShellWorktreeForRunner(ctx, store, home, request, runner)
 			if worktreeErr != nil {
 				return db.Job{}, fmt.Errorf("allocate service shell stage detached worktree: %w", worktreeErr)
 			}
@@ -91,9 +100,9 @@ func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueue
 		isolateShell := !serviceShell && pipelineShellStageReadOnlyWorktreeEligible(request)
 		if !serviceShell {
 			if isolateShell {
-				request, worktreePath, worktreeErr = allocatePipelineShellStageReadOnlyWorktree(ctx, store, home, request)
+				request, worktreePath, worktreeErr = allocatePipelineShellStageReadOnlyWorktreeForRunner(ctx, store, home, request, runner)
 			} else {
-				request, worktreePath, worktreeErr = allocatePipelineStageReadOnlyWorktree(ctx, store, home, request)
+				request, worktreePath, worktreeErr = allocatePipelineStageReadOnlyWorktreeForRunner(ctx, store, home, request, runner)
 			}
 		}
 		if strings.TrimSpace(request.Action) == "produce" && strings.TrimSpace(request.WorktreePath) == "" {
@@ -122,7 +131,7 @@ func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueue
 		// task recover` is the operator escape hatch). The two allocators are mutually
 		// exclusive — read-only eligibility excludes the implement action.
 		var writableErr error
-		request, writableErr = allocatePipelineStageWritableWorktree(ctx, store, home, request)
+		request, writableErr = allocatePipelineStageWritableWorktreeForRunner(ctx, store, home, request, runner)
 		if writableErr != nil {
 			return db.Job{}, writableErr
 		}
@@ -139,7 +148,7 @@ func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueue
 			if worktreePath != "" {
 				rollbackCtx := context.WithoutCancel(ctx)
 				if checkout := pipelineStageCheckoutPath(rollbackCtx, store, request.Repo); checkout != "" {
-					_ = gitutil.Client{Dir: checkout}.RemoveWorktreeForce(rollbackCtx, worktreePath)
+					_ = jobGitClient(checkout, runner).RemoveWorktreeForce(rollbackCtx, worktreePath)
 				}
 			}
 			return db.Job{}, err
@@ -182,6 +191,10 @@ func pipelineServiceShellStage(ctx context.Context, store *db.Store, request wor
 }
 
 func allocatePipelineServiceShellWorktree(ctx context.Context, store *db.Store, home string, request workflow.JobRequest) (workflow.JobRequest, string, error) {
+	return allocatePipelineServiceShellWorktreeForRunner(ctx, store, home, request, subprocess.ExecRunner{})
+}
+
+func allocatePipelineServiceShellWorktreeForRunner(ctx context.Context, store *db.Store, home string, request workflow.JobRequest, runner subprocess.Runner) (workflow.JobRequest, string, error) {
 	checkout := pipelineStageCheckoutPath(ctx, store, request.Repo)
 	if checkout == "" {
 		return request, "", nil
@@ -191,7 +204,7 @@ func allocatePipelineServiceShellWorktree(ctx context.Context, store *db.Store, 
 		return request, "", err
 	}
 	path, err := workflow.AllocateReadOnlyWorktree(ctx, store, paths.Home, request.Repo, checkout, request.ID,
-		"pipeline-service-stage", 0, "", workflow.ReadOnlyWorktreeDispatchLockWaitBudget, gitutil.Client{Dir: checkout})
+		"pipeline-service-stage", 0, "", workflow.ReadOnlyWorktreeDispatchLockWaitBudget, jobGitClient(checkout, runner))
 	if err != nil {
 		return request, "", err
 	}
@@ -286,6 +299,10 @@ func pipelineShellStageReadOnlyWorktreeEligible(request workflow.JobRequest) boo
 // Unlike agent isolation, shell commands receive the live managed checkout through
 // GITMOOT_CHECKOUT and do not get prose appended to their fixed instructions.
 func allocatePipelineShellStageReadOnlyWorktree(ctx context.Context, store *db.Store, home string, request workflow.JobRequest) (workflow.JobRequest, string, error) {
+	return allocatePipelineShellStageReadOnlyWorktreeForRunner(ctx, store, home, request, subprocess.ExecRunner{})
+}
+
+func allocatePipelineShellStageReadOnlyWorktreeForRunner(ctx context.Context, store *db.Store, home string, request workflow.JobRequest, runner subprocess.Runner) (workflow.JobRequest, string, error) {
 	checkout := pipelineStageCheckoutPath(ctx, store, request.Repo)
 	if checkout == "" {
 		return request, "", nil // repo not managed/checked out yet — serialize as before
@@ -294,7 +311,7 @@ func allocatePipelineShellStageReadOnlyWorktree(ctx context.Context, store *db.S
 	if err != nil {
 		return request, "", err
 	}
-	path, err := workflow.AllocateReadOnlyWorktree(ctx, store, paths.Home, request.Repo, checkout, request.ID, "pipeline-stage", 0, "", workflow.ReadOnlyWorktreeDispatchLockWaitBudget, gitutil.Client{Dir: checkout})
+	path, err := workflow.AllocateReadOnlyWorktree(ctx, store, paths.Home, request.Repo, checkout, request.ID, "pipeline-stage", 0, "", workflow.ReadOnlyWorktreeDispatchLockWaitBudget, jobGitClient(checkout, runner))
 	if err != nil {
 		return request, "", err
 	}
@@ -318,6 +335,10 @@ func allocatePipelineShellStageReadOnlyWorktree(ctx context.Context, store *db.S
 // genuine allocation failure returns the request unchanged with the error so the
 // caller enqueues on the shared checkout and emits a loud skip event.
 func allocatePipelineStageReadOnlyWorktree(ctx context.Context, store *db.Store, home string, request workflow.JobRequest) (workflow.JobRequest, string, error) {
+	return allocatePipelineStageReadOnlyWorktreeForRunner(ctx, store, home, request, subprocess.ExecRunner{})
+}
+
+func allocatePipelineStageReadOnlyWorktreeForRunner(ctx context.Context, store *db.Store, home string, request workflow.JobRequest, runner subprocess.Runner) (workflow.JobRequest, string, error) {
 	if !pipelineStageReadOnlyWorktreeEligible(request) {
 		return request, "", nil
 	}
@@ -333,7 +354,7 @@ func allocatePipelineStageReadOnlyWorktree(ctx context.Context, store *db.Store,
 	// existing review checkout validation proves HEAD == payload.HeadSHA. Other
 	// read-only stages keep the empty-ref behavior (the checkout's committed tip).
 	baseRef := strings.TrimSpace(request.HeadSHA)
-	path, err := workflow.AllocateReadOnlyWorktree(ctx, store, paths.Home, request.Repo, checkout, request.ID, "pipeline-stage", 0, baseRef, workflow.ReadOnlyWorktreeDispatchLockWaitBudget, gitutil.Client{Dir: checkout})
+	path, err := workflow.AllocateReadOnlyWorktree(ctx, store, paths.Home, request.Repo, checkout, request.ID, "pipeline-stage", 0, baseRef, workflow.ReadOnlyWorktreeDispatchLockWaitBudget, jobGitClient(checkout, runner))
 	if err != nil {
 		return request, "", err
 	}
@@ -391,6 +412,10 @@ func pipelineStageImplementWorktreeEligible(request workflow.JobRequest) bool {
 // false — the task worktree is durable (disposed by the task lifecycle, not the #739
 // read-only cleanup).
 func allocatePipelineStageWritableWorktree(ctx context.Context, store *db.Store, home string, request workflow.JobRequest) (workflow.JobRequest, error) {
+	return allocatePipelineStageWritableWorktreeForRunner(ctx, store, home, request, subprocess.ExecRunner{})
+}
+
+func allocatePipelineStageWritableWorktreeForRunner(ctx context.Context, store *db.Store, home string, request workflow.JobRequest, runner subprocess.Runner) (workflow.JobRequest, error) {
 	if !pipelineStageImplementWorktreeEligible(request) {
 		return request, nil
 	}
@@ -432,6 +457,7 @@ func allocatePipelineStageWritableWorktree(ctx context.Context, store *db.Store,
 		GoalID:       request.GoalID,
 		TaskTitle:    request.TaskTitle,
 		RepoFlag:     request.Repo,
+		jobRunner:    runner,
 	}
 	task, dispatch, err := prepareLocalImplementDispatchRequest(ctx, store, record, repo, dispatch)
 	if err != nil {

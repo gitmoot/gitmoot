@@ -38,7 +38,7 @@ func newSelfDirtyResumeFixtureWithLockOwner(t *testing.T, jobID string, lockOwne
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	worktree := filepath.Join(t.TempDir(), "task-resume")
 	runDaemonWorkerGit(t, checkout, "worktree", "add", "-b", "task-resume", worktree, "main")
-	head, err := (gitutil.Client{Dir: worktree}).HeadSHA(ctx)
+	head, err := (gitutil.NewHostClient(worktree)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestResumeSelfDirtySkipsWrongHeadWhileDirty(t *testing.T) {
 	if payload.HeadSHA != fixture.head {
 		t.Fatalf("fallback payload head = %q, want original %q", payload.HeadSHA, fixture.head)
 	}
-	actualHead, err := (gitutil.Client{Dir: fixture.worktree}).HeadSHA(ctx)
+	actualHead, err := (gitutil.NewHostClient(fixture.worktree)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
@@ -262,7 +262,7 @@ func TestResumeSelfDirtySkipsDirtyByOther(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	checkout := createDaemonWorkerGitCheckout(t, "main")
-	head, err := (gitutil.Client{Dir: checkout}).HeadSHA(ctx)
+	head, err := (gitutil.NewHostClient(checkout)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}

@@ -14,6 +14,7 @@ import (
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -21,10 +22,10 @@ import (
 // at compile time so the engine's runtime type-assertions can never silently fall
 // back (which would skip read-only-fanout or #332 integration worktrees).
 var (
-	_ workflow.WorktreeManager            = gitutil.Client{}
-	_ workflow.ReadOnlyWorktreeManager    = gitutil.Client{}
-	_ workflow.IntegrationWorktreeManager = gitutil.Client{}
-	_ workflow.WorktreeCommitter          = gitutil.Client{}
+	_ workflow.WorktreeManager            = (*gitutil.Client)(nil)
+	_ workflow.ReadOnlyWorktreeManager    = (*gitutil.Client)(nil)
+	_ workflow.IntegrationWorktreeManager = (*gitutil.Client)(nil)
+	_ workflow.WorktreeCommitter          = (*gitutil.Client)(nil)
 )
 
 // daemonWorkflowEngine builds the per-tick/per-repo workflow.Engine. Its `home`
@@ -36,13 +37,17 @@ var (
 // of which re-resolve — so handing it the raw --home would misplace delegation
 // artifacts and the event-sink config probe.
 func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, home string) workflow.Engine {
+	return daemonWorkflowEngineForRunner(store, gh, checkout, home, subprocess.ExecRunner{})
+}
+
+func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout string, home string, runner subprocess.Runner) workflow.Engine {
 	engine := workflow.Engine{
 		Store:                   store,
 		RequireWorkflowPolicy:   requireWorkflowPolicyResolverRoot(home),
 		OrgPolicy:               orgPolicyResolverRoot(home),
 		ProduceCheckDir:         checkout,
-		MergeGate:               newDaemonMergeGate(store, gh, checkout, home),
-		ImplementationFinalizer: daemonImplementationFinalizer{Store: store, GitHub: gh, FallbackCheckout: checkout},
+		MergeGate:               newDaemonMergeGate(store, gh, checkout, home, runner),
+		ImplementationFinalizer: daemonImplementationFinalizer{Store: store, GitHub: gh, FallbackCheckout: checkout, Runner: runner},
 		// escalate_human (#340): @-tag the human on the tree's PR/issue when a leg
 		// pauses awaiting a decision. Best-effort and nil-safe in the engine; the
 		// handle is filled in from policy by applyOrchestratePolicy.
@@ -105,7 +110,7 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 		// no config NO verifier leg runs and NO hard row is written — byte-identical. A
 		// slow suite / unprovisionable sandbox never blocks or fails the merge; promotion
 		// stays manual.
-		HardVerifierDispatcher: daemonHardVerifierDispatcher(store, checkout, home),
+		HardVerifierDispatcher: daemonHardVerifierDispatcherForRunner(store, checkout, home, runner),
 		// Off-by-default agent persistent memory (#626, Phase 1 observation mode):
 		// when at least one agent is enrolled ([agents.<name>].memory = true) and the
 		// global kill switch is off, the engine's Mailbox injects a "Prior learnings"
@@ -131,7 +136,7 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 		// to the documented default warn on any load error.
 		ResultCheckMode: resultChecksMode(home),
 		PayloadRefresher: func(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
-			return refreshDaemonJobPayload(ctx, store, checkout, job, payload)
+			return refreshDaemonJobPayloadForRunner(ctx, store, checkout, job, payload, runner)
 		},
 		// Gate the #484 canary ROUTING seam on the SAME policy.CanaryEnabled() the
 		// OutcomeHarvester's regression comparator above is gated on, so both seams
@@ -165,9 +170,9 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 	if strings.TrimSpace(home) != "" && strings.TrimSpace(checkout) != "" {
 		engine.Home = home
 		engine.DelegationCheckout = checkout
-		engine.DelegationWorktrees = gitutil.Client{Dir: checkout}
+		engine.DelegationWorktrees = jobGitClient(checkout, runner)
 		engine.FixWorktreeAllocator = func(ctx context.Context, request workflow.FixWorktreeRequest) (workflow.FixWorktreeAllocation, error) {
-			return allocateFixWorktree(ctx, store, home, checkout, request)
+			return allocateFixWorktreeForRunner(ctx, store, home, checkout, request, runner)
 		}
 	}
 	return engine
@@ -301,6 +306,11 @@ type daemonImplementationFinalizer struct {
 	Store            *db.Store
 	GitHub           github.Client
 	FallbackCheckout string
+	Runner           subprocess.Runner
+}
+
+func newHostDaemonImplementationFinalizer(store *db.Store, gh github.Client) daemonImplementationFinalizer {
+	return daemonImplementationFinalizer{Store: store, GitHub: gh, Runner: subprocess.ExecRunner{}}
 }
 
 type implementationFinalizationTarget struct {
@@ -327,6 +337,10 @@ const (
 // The returned task copy carries the resolved branch so the finalizer pushes and
 // opens the pull request for exactly the branch this predicate validated.
 func implementationFinalizationTargetFor(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload, phase implementationFinalizationPhase) (implementationFinalizationTarget, error) {
+	return implementationFinalizationTargetForRunner(ctx, store, job, payload, phase, subprocess.ExecRunner{})
+}
+
+func implementationFinalizationTargetForRunner(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload, phase implementationFinalizationPhase, runner subprocess.Runner) (implementationFinalizationTarget, error) {
 	switch phase {
 	case implementationFinalizationBeforeRun, implementationFinalizationAfterRun:
 	default:
@@ -396,7 +410,7 @@ func implementationFinalizationTargetFor(ctx context.Context, store *db.Store, j
 			missing, task.ID, payload.Repo, job.Agent, advice,
 		))
 	}
-	git := gitutil.Client{Dir: worktreePath}
+	git := jobGitClient(worktreePath, runner)
 	currentBranch, err := git.CurrentBranch(ctx)
 	if err != nil {
 		if phase == implementationFinalizationAfterRun {
@@ -459,13 +473,13 @@ func implementationFinalizationTargetFor(ctx context.Context, store *db.Store, j
 }
 
 func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
-	target, err := implementationFinalizationTargetFor(ctx, f.Store, job, payload, implementationFinalizationAfterRun)
+	target, err := implementationFinalizationTargetForRunner(ctx, f.Store, job, payload, implementationFinalizationAfterRun, f.Runner)
 	if err != nil {
 		return payload, err
 	}
 	task := target.Task
 	worktreePath := target.WorktreePath
-	git := gitutil.Client{Dir: worktreePath}
+	git := jobGitClient(worktreePath, f.Runner)
 	validatedPR, hasValidatedPR, err := f.revalidateImplementationPullRequest(ctx, payload, task, worktreePath)
 	if err != nil {
 		return payload, err
@@ -730,13 +744,18 @@ type daemonMergeGate struct {
 	// Home is the resolved <home>/.gitmoot root (or raw --home) used to load the
 	// [merge_gate] policy (#596). Empty uses the default mandatory review-and-CI
 	// merge gate.
-	Home string
+	Home   string
+	Runner subprocess.Runner
 }
 
-func newDaemonMergeGate(store *db.Store, gh github.Client, checkout, home string) daemonMergeGate {
+func newDaemonMergeGate(store *db.Store, gh github.Client, checkout, home string, runner subprocess.Runner) daemonMergeGate {
 	return daemonMergeGate{
-		Store: store, GitHub: gh, FallbackCheckout: checkout, Home: home,
+		Store: store, GitHub: gh, FallbackCheckout: checkout, Home: home, Runner: runner,
 	}
+}
+
+func newHostDaemonMergeGate(store *db.Store, gh github.Client, checkout, home string) daemonMergeGate {
+	return newDaemonMergeGate(store, gh, checkout, home, subprocess.ExecRunner{})
 }
 
 func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeRequest) (workflow.MergeDecision, error) {
@@ -782,7 +801,7 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 	if err != nil {
 		return workflow.MergeDecision{}, err
 	}
-	gate := newDaemonPolicyMergeGate(g.Store, g.githubClient(checkout), checkout)
+	gate := newDaemonPolicyMergeGateForRunner(g.Store, g.githubClient(checkout), checkout, g.Runner)
 	applyResolvedMergeGatePolicy(&gate, policy)
 	// The check above minimizes but does not eliminate the enqueue-to-merge race:
 	// gate.Evaluate still performs review/CI reads before the squash merge, so a job
@@ -914,22 +933,30 @@ func (g daemonMergeGate) githubClient(checkout string) github.Client {
 }
 
 func newDaemonPolicyMergeGate(store *db.Store, gh github.Client, checkout string) workflow.PolicyMergeGate {
+	return newDaemonPolicyMergeGateForRunner(store, gh, checkout, subprocess.ExecRunner{})
+}
+
+func newDaemonPolicyMergeGateForRunner(store *db.Store, gh github.Client, checkout string, runner subprocess.Runner) workflow.PolicyMergeGate {
 	return workflow.PolicyMergeGate{
 		Store:        store,
 		GitHub:       gh,
-		Git:          gitutil.Client{Dir: checkout},
-		Worktrees:    gitutil.Client{Dir: checkout},
+		Git:          jobGitClient(checkout, runner),
+		Worktrees:    jobGitClient(checkout, runner),
 		CheckoutPath: checkout,
 		DeleteBranch: true,
 	}
 }
 
 func refreshDaemonJobPayload(ctx context.Context, store *db.Store, checkout string, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
+	return refreshDaemonJobPayloadForRunner(ctx, store, checkout, job, payload, subprocess.ExecRunner{})
+}
+
+func refreshDaemonJobPayloadForRunner(ctx context.Context, store *db.Store, checkout string, job db.Job, payload workflow.JobPayload, runner subprocess.Runner) (workflow.JobPayload, error) {
 	if job.Type != "implement" || payload.Result == nil || payload.Result.Decision != "implemented" {
 		return payload, nil
 	}
 	if !payloadHasTaskWorktree(ctx, store, payload) {
-		head, err := (gitutil.Client{Dir: checkout}).HeadSHA(ctx)
+		head, err := jobGitClient(checkout, runner).HeadSHA(ctx)
 		if err != nil {
 			return workflow.JobPayload{}, err
 		}
