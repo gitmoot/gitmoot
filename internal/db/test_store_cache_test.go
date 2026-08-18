@@ -6,9 +6,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -23,6 +27,14 @@ var (
 
 const cachedTestTemplatePublicationAttempts = 3
 
+// openRealTestStore bypasses the migrated-schema cache. Use it only when a test
+// observes Open, migration or backfill application, or fresh SQLite setup.
+// Ordinary store tests must use openCachedTestStore.
+func openRealTestStore(t *testing.T, path string) (*Store, error) {
+	t.Helper()
+	return Open(path)
+}
+
 func openCachedTestStore(t *testing.T, path string) (*Store, error) {
 	t.Helper()
 	_, snapshot, err := cachedMigratedTestTemplate()
@@ -33,6 +45,96 @@ func openCachedTestStore(t *testing.T, path string) (*Store, error) {
 		return nil, err
 	}
 	return OpenAlreadyMigrated(path)
+}
+
+func TestStoreOpenPolicy(t *testing.T) {
+	realPathTests := map[string]bool{
+		"TestAdvanceRetryCollapseMigration":                       true,
+		"TestBackfillGhostSessionJobsHonorsDisabledAgePolicy":     true,
+		"TestBackfillGhostSessionJobsReusesReaperAndIsIdempotent": true,
+		"TestCanaryMigrationOnPreExistingDB":                      true,
+		"TestExternallyDrivenColumnMigratesOnPreExistingDB":       true,
+		"TestIncrementalVacuumReclaimsOnlyRequestedPages":         true,
+		"TestJobModelMigrationOnPreExistingDB":                    true,
+		"TestJobRepoBackfillMigrationUpdatesOnlyStaleRows":        true,
+		"TestJobTokenMigrationOnPreExistingDB":                    true,
+		"TestKeychainMigrationAppliesToExistingDatabase":          true,
+		"TestMemoryEventBackfillLiveShapeIsIdempotent":            true,
+		"TestMemoryEventBackfillMixedLiveHistory":                 true,
+		"TestMemoryEventsMigrationFreshAndUpgradeConverge":        true,
+		"TestMemoryHarvestMigrationFreshAndUpgrade":               true,
+		"TestMemoryMigrationCreatesTables":                        true,
+		"TestMigrateAddsPipelinesToUpgradedDB":                    true,
+		"TestMigrateAddsTriggerBindingToExistingPipeline":         true,
+		"TestMigrateAppendsAgentInstanceAutonomyPolicy":           true,
+		"TestMigrateAppendsRootKilled":                            true,
+		"TestMigrateAppendsTaskWorktreePath":                      true,
+		"TestMigrateBackfillsRootID":                              true,
+		"TestMigrationAddsRunnerAndOwnerBootColumns":              true,
+		"TestMigrationCopiesPresetsToAgentTemplates":              true,
+		"TestMigrationDeduplicatesExistingTaskBranches":           true,
+		"TestOpenConfiguresSQLiteContentionPragmas":               true,
+		"TestOpenConfiguresSynchronousNormal":                     true,
+		"TestOpenDoesNotFullVacuumLegacyDatabase":                 true,
+		"TestOpenMigratesSchema":                                  true,
+		"TestOpenPreservesExistingFullAutoVacuumMode":             true,
+		"TestOrgRolePresenceMigrationAndUpsert":                   true,
+		"TestTaskEventsMigrationAppliesToExistingDatabase":        true,
+		"TestWorkflowMetaTextMigrations":                          true,
+	}
+	directOpenFunctions := map[string]bool{
+		"ensureCachedMigratedTestTemplateOnce": true,
+		"openRealTestStore":                    true,
+	}
+	seenRealPath := make(map[string]bool, len(realPathTests))
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package directory: %v", err)
+	}
+	fset := token.NewFileSet()
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, entry.Name(), nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", entry.Name(), err)
+		}
+		for _, declaration := range file.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Body == nil {
+				continue
+			}
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				callee, ok := call.Fun.(*ast.Ident)
+				if !ok {
+					return true
+				}
+				switch callee.Name {
+				case "Open":
+					if !directOpenFunctions[function.Name.Name] {
+						t.Errorf("%s: direct Open in %s; ordinary tests use openCachedTestStore and declared carve-outs use openRealTestStore", fset.Position(call.Pos()), function.Name.Name)
+					}
+				case "openRealTestStore":
+					if !realPathTests[function.Name.Name] {
+						t.Errorf("%s: undeclared real-path store in %s", fset.Position(call.Pos()), function.Name.Name)
+					} else {
+						seenRealPath[function.Name.Name] = true
+					}
+				}
+				return true
+			})
+		}
+	}
+	for name := range realPathTests {
+		if !seenRealPath[name] {
+			t.Errorf("declared real-path test %s does not call openRealTestStore", name)
+		}
+	}
 }
 
 func cachedMigratedTestTemplate() (string, []byte, error) {

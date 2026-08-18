@@ -76,7 +76,7 @@ func TestCompleteMemoryHarvestRunTransactionRollback(t *testing.T) {
 
 func TestMemoryHarvestMigrationFreshAndUpgrade(t *testing.T) {
 	ctx := context.Background()
-	fresh, err := Open(filepath.Join(t.TempDir(), "fresh.db"))
+	fresh, err := openRealTestStore(t, filepath.Join(t.TempDir(), "fresh.db"))
 	if err != nil {
 		t.Fatalf("open fresh store: %v", err)
 	}

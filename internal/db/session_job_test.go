@@ -163,7 +163,7 @@ func TestExternallyDrivenColumnMigratesOnPreExistingDB(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "gitmoot.db")
 
-	store, err := Open(path)
+	store, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestExternallyDrivenColumnMigratesOnPreExistingDB(t *testing.T) {
 		t.Fatalf("Close returned error: %v", err)
 	}
 
-	reopened, err := Open(path)
+	reopened, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("re-Open returned error: %v", err)
 	}

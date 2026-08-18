@@ -221,7 +221,7 @@ func TestMigrateBackfillsRootID(t *testing.T) {
 		t.Fatalf("raw Close returned error: %v", err)
 	}
 
-	upgraded, err := Open(path)
+	upgraded, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open upgraded DB returned error: %v", err)
 	}

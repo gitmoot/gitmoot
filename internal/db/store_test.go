@@ -19,7 +19,7 @@ import (
 
 func TestOpenMigratesSchema(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openRealTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestOpenAlreadyMigratedConfiguresSQLiteWithoutMigrating(t *testing.T) {
 
 func TestOpenConfiguresSQLiteContentionPragmas(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gitmoot.db")
-	store, err := Open(path)
+	store, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestOpenDoesNotFullVacuumLegacyDatabase(t *testing.T) {
 		t.Fatalf("close raw legacy database: %v", err)
 	}
 
-	store, err := Open(path)
+	store, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open legacy database: %v", err)
 	}
@@ -215,7 +215,7 @@ func TestOpenPreservesExistingFullAutoVacuumMode(t *testing.T) {
 		t.Fatalf("close raw full auto-vacuum database: %v", err)
 	}
 
-	store, err := Open(path)
+	store, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open full auto-vacuum database: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestOpenPreservesExistingFullAutoVacuumMode(t *testing.T) {
 
 func TestIncrementalVacuumReclaimsOnlyRequestedPages(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "incremental.db"))
+	store, err := openRealTestStore(t, filepath.Join(t.TempDir(), "incremental.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -319,7 +319,7 @@ func TestNoCIObservationRoundTripAndReset(t *testing.T) {
 }
 
 func TestOpenConfiguresSynchronousNormal(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openRealTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -3112,7 +3112,7 @@ func TestMigrateAppendsAgentInstanceAutonomyPolicy(t *testing.T) {
 		t.Fatalf("raw Close returned error: %v", err)
 	}
 
-	upgraded, err := Open(path)
+	upgraded, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open upgraded DB returned error: %v", err)
 	}
@@ -3147,7 +3147,7 @@ func TestMigrateAppendsTaskWorktreePath(t *testing.T) {
 		t.Fatalf("raw Close returned error: %v", err)
 	}
 
-	upgraded, err := Open(path)
+	upgraded, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open upgraded DB returned error: %v", err)
 	}
@@ -3332,7 +3332,7 @@ func TestMigrationDeduplicatesExistingTaskBranches(t *testing.T) {
 		t.Fatalf("raw Close returned error: %v", err)
 	}
 
-	store, err := Open(path)
+	store, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -3398,7 +3398,7 @@ func TestMigrationCopiesPresetsToAgentTemplates(t *testing.T) {
 		t.Fatalf("raw Close returned error: %v", err)
 	}
 
-	store, err := Open(path)
+	store, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -5168,7 +5168,7 @@ func TestListJobsByStateAndRepoUseIndexedFilters(t *testing.T) {
 
 func TestJobRepoBackfillMigrationUpdatesOnlyStaleRows(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openRealTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

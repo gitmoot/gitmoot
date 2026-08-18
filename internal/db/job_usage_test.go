@@ -289,7 +289,7 @@ INSERT INTO jobs(id, agent, type, state, payload) VALUES ('old', 'w', 'ask', 'su
 
 	// Re-open through the real Store: Migrate must apply the token-column ALTER to
 	// the pre-existing, populated jobs table without error.
-	store, err := Open(path)
+	store, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open (migrate) returned error: %v", err)
 	}
@@ -350,7 +350,7 @@ func TestJobModelMigrationOnPreExistingDB(t *testing.T) {
 		t.Fatalf("close pre-model db: %v", err)
 	}
 
-	store, err := Open(path)
+	store, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open migrated db: %v", err)
 	}

@@ -38,7 +38,7 @@ func openBootTestStore(t *testing.T) *Store {
 
 func TestMigrationAddsRunnerAndOwnerBootColumns(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openRealTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

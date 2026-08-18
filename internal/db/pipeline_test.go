@@ -196,7 +196,7 @@ func TestMigrateAddsPipelinesToUpgradedDB(t *testing.T) {
 		t.Fatalf("close raw: %v", err)
 	}
 
-	upgraded, err := Open(path)
+	upgraded, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open upgraded DB: %v", err)
 	}
@@ -244,7 +244,7 @@ func TestMigrateAddsTriggerBindingToExistingPipeline(t *testing.T) {
 	if err := raw.Close(); err != nil {
 		t.Fatal(err)
 	}
-	upgraded, err := Open(path)
+	upgraded, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open upgraded DB: %v", err)
 	}

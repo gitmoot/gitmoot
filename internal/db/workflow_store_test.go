@@ -784,7 +784,7 @@ func TestWorkflowMetaTextSetPreserveClearAndLimit(t *testing.T) {
 }
 
 func TestWorkflowMetaTextMigrations(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openRealTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

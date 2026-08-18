@@ -12,7 +12,7 @@ import (
 
 func TestMemoryEventsMigrationFreshAndUpgradeConverge(t *testing.T) {
 	ctx := context.Background()
-	fresh, err := Open(filepath.Join(t.TempDir(), "fresh.db"))
+	fresh, err := openRealTestStore(t, filepath.Join(t.TempDir(), "fresh.db"))
 	if err != nil {
 		t.Fatalf("open fresh store: %v", err)
 	}
@@ -24,7 +24,7 @@ func TestMemoryEventsMigrationFreshAndUpgradeConverge(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "upgrade.db")
-	legacy, err := Open(path)
+	legacy, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestMemoryEventsMigrationFreshAndUpgradeConverge(t *testing.T) {
 	if err := legacy.Close(); err != nil {
 		t.Fatal(err)
 	}
-	upgraded, err := Open(path)
+	upgraded, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("open upgraded store: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestMemoryEventRollbackFollowsMutationTransaction(t *testing.T) {
 
 func TestMemoryEventBackfillLiveShapeIsIdempotent(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "memory.db"))
+	store, err := openRealTestStore(t, filepath.Join(t.TempDir(), "memory.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -199,7 +199,7 @@ DELETE FROM memory_events`, retired, active, superseded); err != nil {
 // the missing halves for pre-journal rows.
 func TestMemoryEventBackfillMixedLiveHistory(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "memory.db"))
+	store, err := openRealTestStore(t, filepath.Join(t.TempDir(), "memory.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

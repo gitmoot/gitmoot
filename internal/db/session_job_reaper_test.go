@@ -137,7 +137,7 @@ func TestReapGhostSessionJobsZeroDisablesOnlyAgeFallback(t *testing.T) {
 }
 
 func TestBackfillGhostSessionJobsReusesReaperAndIsIdempotent(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openRealTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -179,7 +179,7 @@ auto_settle_after = "0"
 `), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	store, err := Open(filepath.Join(root, config.DBName))
+	store, err := openRealTestStore(t, filepath.Join(root, config.DBName))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

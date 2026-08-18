@@ -20,6 +20,17 @@ Both packages opened many writable SQLite test stores. `db.Open` runs every one
 of gitmoot's 115 migrations on each open, so rebuilding a fresh schema at each
 call multiplied setup work across the suite and the race matrix.
 
+A same-host A/B run on 2026-08-18 compared pre-#1550 main at `a9d86ca4` with
+this branch based on `101b88e1`. Both runs used Go 1.26.4, `-count=1`, the same
+build cache, and `go test -json` package elapsed times. Three host-dependent
+live-home CLI tests were skipped identically in both runs.
+
+| Package | Baseline | Cached | Reduction |
+| --- | ---: | ---: | ---: |
+| `internal/cli` | 688.709s | 350.124s | 49.2% |
+| `internal/workflow` | 258.934s | 82.755s | 68.0% |
+| Combined | 947.643s | 432.879s | 54.3% |
+
 ## Reuse the migrated schema
 
 Normal tests should open writable stores with `internal/db/dbtest`:
@@ -52,15 +63,29 @@ A test that verifies `Open`, SQLite connection setup, migration application, or
 a backfill must call the real `db.Open` or `Store.Migrate` path. This includes
 tests that construct a partial or old schema and reopen it to apply the missing
 migrations. Pointing those tests at a pre-migrated copy would skip the behavior
-under test.
+under test. In `package db`, make that intent explicit with
+`openRealTestStore`; a source audit rejects direct `Open` calls and undeclared
+real-path tests.
 
-The main carve-out files are:
+The current real-path carve-out files are:
 
-- `internal/db/store_test.go`
+- `internal/db/advance_retry_test.go`
+- `internal/db/boot_id_test.go`
+- `internal/db/job_usage_test.go`
+- `internal/db/keychain_test.go`
+- `internal/db/memory_event_store_test.go`
+- `internal/db/memory_harvest_store_test.go`
+- `internal/db/memory_store_test.go`
+- `internal/db/org_presence_store_test.go`
 - `internal/db/pipeline_test.go`
 - `internal/db/session_job_reaper_test.go`
+- `internal/db/session_job_test.go`
+- `internal/db/store_canary_test.go`
 - `internal/db/store_root_id_test.go`
 - `internal/db/store_root_killed_test.go`
+- `internal/db/store_test.go`
+- `internal/db/task_events_test.go`
+- `internal/db/workflow_store_test.go`
 
 When adding a migration, test both paths: compare a cached test store with a
 freshly migrated store, and keep a focused upgrade test on the real migration
