@@ -51,6 +51,8 @@ var planCensusReleaseBuildContexts = []planCensusBuildContext{
 // as runtime data. TestSemanticPlanCensusCompiledFixtures keeps both limits as
 // explicit negative assertions so they cannot be mistaken for covered cases.
 func TestRuntimeJobPlanFieldsHaveSingleGatedProducer(t *testing.T) {
+	t.Parallel()
+
 	root := filepath.Clean(filepath.Join("..", ".."))
 	totalStarted := time.Now()
 	for _, buildContext := range planCensusReleaseBuildContexts {
@@ -1063,6 +1065,8 @@ func TestSemanticPlanCensusReleaseContexts(t *testing.T) {
 // not merely labels around repeated host-context loads. This compiled producer
 // is selected only when GOOS=linux and GOARCH=arm64 reach packages.Load.
 func TestSemanticPlanCensusReleaseContextApplication(t *testing.T) {
+	t.Parallel()
+
 	root := filepath.Clean(filepath.Join("..", ".."))
 	want := "internal/workflow/testdata/semantic_plan_census/producer/linux_arm64_plan.go::LinuxARM64BuildContext"
 	for _, buildContext := range planCensusReleaseBuildContexts {

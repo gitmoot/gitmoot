@@ -626,6 +626,8 @@ func writeOrgEscalateConfig(t *testing.T) string {
 }
 
 func TestOrgPreflightEnqueueParity(t *testing.T) {
+	t.Parallel()
+
 	for _, tt := range []struct {
 		name          string
 		enforce       string

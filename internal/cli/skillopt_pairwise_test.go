@@ -116,6 +116,8 @@ func writePairwiseJSON(t *testing.T, path string, v any) {
 // A->challenger orientations and asserts the persisted RankedFeedbackEvent names
 // the correct winner. It would FAIL if the unblind were inverted.
 func TestRunSkillOptPairwiseImportUnblindOrientations(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		name        string
 		championIsA bool
