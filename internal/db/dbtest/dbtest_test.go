@@ -861,3 +861,65 @@ func TestPublishDoesNotStampAnotherBinarysCandidate(t *testing.T) {
 		t.Fatalf("validate rebuilt template: %v", err)
 	}
 }
+
+// TestFrontendIsBoundToAuthenticatedSnapshot pins THIS package's cache frontend to
+// db.SnapshotMigratedTestTemplate, mirroring the guard internal/db has for its own
+// frontend. Ruled a merge blocker rather than a follow-up by both review families:
+// g7-review reproduced that swapping db.SnapshotMigratedTestTemplate for a plain
+// os.ReadFile here compiles and leaves BOTH suites green (dbtest ok, internal/db
+// ok), so nothing detected it; gm-review-opus independently reproduced the same
+// mutant and confirmed the in-package half was caught while this half was not.
+//
+// The authenticated operation validates a temp copy of the exact bytes it returns,
+// so a plain read is a silent downgrade with an identical ([]byte, error) shape.
+// The exploitable window is between ensureMigratedTemplate validating the file and
+// the snapshot read landing -- which is why the retry loop exists -- so the test
+// occupies that window through the afterEnsureTemplate seam.
+func TestFrontendIsBoundToAuthenticatedSnapshot(t *testing.T) {
+	cacheRoot := t.TempDir()
+	t.Setenv("TMPDIR", cacheRoot)
+	reset := func() {
+		templateMu.Lock()
+		templateReady = false
+		templatePath = ""
+		templateSnapshot = nil
+		templateMu.Unlock()
+	}
+	reset()
+	t.Cleanup(reset)
+
+	template, _, err := migratedTemplate()
+	if err != nil {
+		t.Fatalf("build migrated template snapshot: %v", err)
+	}
+	reset()
+
+	var foreign []byte
+	fired := false
+	afterEnsureTemplate = func() error {
+		if fired {
+			return nil
+		}
+		fired = true
+		replaceWithForeignSQLite(t, template)
+		data, readErr := os.ReadFile(template)
+		if readErr != nil {
+			return readErr
+		}
+		foreign = data
+		return nil
+	}
+	t.Cleanup(func() { afterEnsureTemplate = func() error { return nil } })
+
+	_, snapshot, err := migratedTemplate()
+	if !fired {
+		t.Fatal("seam never fired: the frontend did not re-read the template")
+	}
+	if err != nil {
+		// Refusing outright is a correct authenticated outcome.
+		return
+	}
+	if bytes.Equal(snapshot, foreign) {
+		t.Fatal("frontend served the database that replaced the validated one: it read the file directly instead of through db.SnapshotMigratedTestTemplate")
+	}
+}

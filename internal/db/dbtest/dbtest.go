@@ -42,6 +42,8 @@ func Open(t *testing.T, path string) (*db.Store, error) {
 	return db.OpenAlreadyMigrated(path)
 }
 
+var afterEnsureTemplate = func() error { return nil }
+
 func migratedTemplate() (string, []byte, error) {
 	templateMu.Lock()
 	defer templateMu.Unlock()
@@ -52,6 +54,15 @@ func migratedTemplate() (string, []byte, error) {
 	var snapshotErr error
 	for attempt := 1; attempt <= templatePublicationAttempts; attempt++ {
 		if err := ensureMigratedTemplate(templatePath); err != nil {
+			return templatePath, nil, err
+		}
+		// Seam between validating the published template and reading it. The retry
+		// loop exists because a concurrent test binary can replace the file in
+		// exactly this window; production behaviour is a no-op and a test replaces
+		// the hook to occupy the window deterministically. Unexported, so this adds
+		// no surface outside the package. Mirrors afterEnsureCachedTemplate in
+		// internal/db's own frontend and db.AfterTestTemplatePublish.
+		if err := afterEnsureTemplate(); err != nil {
 			return templatePath, nil, err
 		}
 		templateSnapshot, snapshotErr = db.SnapshotMigratedTestTemplate(templatePath)
