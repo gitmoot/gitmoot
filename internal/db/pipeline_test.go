@@ -11,7 +11,7 @@ import (
 
 func openPipelineStore(t *testing.T) *Store {
 	t.Helper()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

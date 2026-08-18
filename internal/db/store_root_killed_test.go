@@ -12,7 +12,7 @@ import (
 // flag; and an unknown id reads as not killed (fails open) rather than erroring.
 func TestRootKilledRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

@@ -25,7 +25,7 @@ func rootIDOf(t *testing.T, store *Store, id string) string {
 // in COALESCE(NULLIF(...)) leaves root_id empty and fails here.
 func TestCreateJobPopulatesRootID(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestCreateJobPopulatesRootID(t *testing.T) {
 // payload would not return this set.
 func TestListJobsByRootReturnsTree(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestListJobsByRootReturnsTree(t *testing.T) {
 // ignoring a sibling tree. The empty-tree SUM is COALESCEd to 0.
 func TestCountAndSumJobsByRoot(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestCountAndSumJobsByRoot(t *testing.T) {
 // agent stays in the same tree, so its root_id must not change.
 func TestDelegateQueuedJobPreservesRootID(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

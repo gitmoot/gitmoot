@@ -49,12 +49,12 @@ func subscribeReviewFact(t *testing.T, store *Store, role, repo string, pullRequ
 
 func TestSubscribeAwaitedFactRechecksConcurrentProducerCommit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gitmoot.db")
-	producerStore, err := Open(path)
+	producerStore, err := openCachedTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open producer store: %v", err)
 	}
 	t.Cleanup(func() { _ = producerStore.Close() })
-	subscriberStore, err := Open(path)
+	subscriberStore, err := openCachedTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open subscriber store: %v", err)
 	}

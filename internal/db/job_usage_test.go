@@ -14,7 +14,7 @@ import (
 // every jobs SELECT reads them back consistently.
 func TestUpdateJobUsageRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

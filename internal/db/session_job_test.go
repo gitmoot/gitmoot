@@ -13,7 +13,7 @@ import (
 // byte-identical.
 func TestExternallyDrivenDefaultsFalse(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestExternallyDrivenDefaultsFalse(t *testing.T) {
 // flag and creates the job directly running with its clock-in event.
 func TestCreateExternallyDrivenJobWithEvent(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestCreateExternallyDrivenJobWithEvent(t *testing.T) {
 // for minutes. Session lifecycle cleanup uses separate workflow/age signals.
 func TestListRunningJobsUpdatedBeforeSkipsExternallyDriven(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestListRunningJobsUpdatedBeforeSkipsExternallyDriven(t *testing.T) {
 // same DB is still returned.
 func TestListQueuedJobsSkipsExternallyDriven(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

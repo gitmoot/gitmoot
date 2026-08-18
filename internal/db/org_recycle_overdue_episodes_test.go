@@ -8,7 +8,7 @@ import (
 )
 
 func TestRecycleOverdueEpisodeRoundTripKeepsFirstOverdueSince(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -75,7 +75,7 @@ func TestRecycleOverdueEpisodeRoundTripKeepsFirstOverdueSince(t *testing.T) {
 }
 
 func TestUpsertRecycleOverdueEpisodeRejectsEmptySubject(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
