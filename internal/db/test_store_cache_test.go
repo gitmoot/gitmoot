@@ -569,3 +569,46 @@ func copyCachedTestTemplateSnapshotIfMissing(snapshot []byte, path string) error
 	complete = true
 	return nil
 }
+
+// TestCachedOpenDoesNotMigrate binds the in-package cached frontend to
+// OpenAlreadyMigrated. Swapping it for Open leaves every assertion in the suite
+// green -- a cached copy already carries all 115 migrations and applyMigration is
+// idempotent, so Migrate is a no-op that changes nothing observable (measured:
+// PRAGMA data_version unmoved). What it costs is 115 wasted transactions per store
+// open, which is the entire point of #1550, so the contract needs a non-timing
+// guard. Requested by g7-review; MigrateObserver is the seam.
+func TestCachedOpenDoesNotMigrate(t *testing.T) {
+	cacheRoot := t.TempDir()
+	t.Setenv("TMPDIR", cacheRoot)
+	cachedTestTemplateMu.Lock()
+	cachedTestTemplateReady = false
+	cachedTestTemplatePath = ""
+	cachedTestTemplateSnapshot = nil
+	cachedTestTemplateMu.Unlock()
+	t.Cleanup(func() {
+		cachedTestTemplateMu.Lock()
+		cachedTestTemplateReady = false
+		cachedTestTemplatePath = ""
+		cachedTestTemplateSnapshot = nil
+		cachedTestTemplateMu.Unlock()
+	})
+
+	// Warm the template first: building it legitimately migrates once.
+	if _, _, err := cachedMigratedTestTemplate(); err != nil {
+		t.Fatalf("build cached migrated template: %v", err)
+	}
+
+	migrations := 0
+	MigrateObserver = func() { migrations++ }
+	t.Cleanup(func() { MigrateObserver = func() {} })
+
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "copy.db"))
+	if err != nil {
+		t.Fatalf("open cached test store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	if migrations != 0 {
+		t.Fatalf("Migrate ran %d time(s) on a cached copy: the frontend is not bound to OpenAlreadyMigrated", migrations)
+	}
+}

@@ -36,6 +36,7 @@ func SchemaMigrationCount() int {
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
+	MigrateObserver()
 	for version, migration := range migrations {
 		if err := s.applyMigration(ctx, version+1, migration); err != nil {
 			return err

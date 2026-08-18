@@ -81,6 +81,18 @@ func SnapshotMigratedTestTemplate(path string) ([]byte, error) {
 // completed publish is consistent either way round.
 var AfterTestTemplatePublish = func() error { return nil }
 
+// MigrateObserver is called once at the start of every Migrate. Production
+// behaviour is a no-op; a test replaces it to assert that a CACHED open path never
+// migrates. This exists because a cached copy already carries every migration and
+// applyMigration is idempotent -- it checks schema_migrations and commits early --
+// so running Migrate on a copy changes NOTHING observable in the database
+// (PRAGMA data_version is unmoved, no rows are added, no DDL takes effect). The
+// cost is 115 wasted transactions, which is a performance contract, and a timing
+// assertion is not a contract test. Requested by g7-review during #1550: "bind both
+// cached frontends to OpenAlreadyMigrated with a non-timing test that fails if
+// Migrate runs on the copied destination."
+var MigrateObserver = func() {}
+
 // PublishMigratedTestTemplate moves a freshly migrated database into the shared
 // cache path and stamps its identity, as ONE operation. It reports published
 // when the cache path is authenticated. A false result with no error means

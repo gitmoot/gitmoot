@@ -923,3 +923,45 @@ func TestFrontendIsBoundToAuthenticatedSnapshot(t *testing.T) {
 		t.Fatal("frontend served the database that replaced the validated one: it read the file directly instead of through db.SnapshotMigratedTestTemplate")
 	}
 }
+
+// TestOpenDoesNotMigrate binds THIS package's frontend to db.OpenAlreadyMigrated,
+// mirroring the in-package guard. A cached copy already carries all 115 migrations
+// and db's applyMigration is idempotent, so substituting db.Open changes nothing
+// observable (PRAGMA data_version unmoved, no rows added) and costs 115 wasted
+// transactions per store open -- the whole point of #1550. Timing is not a
+// contract, so db.MigrateObserver is the seam. Requested by g7-review.
+func TestOpenDoesNotMigrate(t *testing.T) {
+	cacheRoot := t.TempDir()
+	t.Setenv("TMPDIR", cacheRoot)
+	templateMu.Lock()
+	templateReady = false
+	templatePath = ""
+	templateSnapshot = nil
+	templateMu.Unlock()
+	t.Cleanup(func() {
+		templateMu.Lock()
+		templateReady = false
+		templatePath = ""
+		templateSnapshot = nil
+		templateMu.Unlock()
+	})
+
+	// Warm the template first: building it legitimately migrates once.
+	if _, _, err := migratedTemplate(); err != nil {
+		t.Fatalf("build migrated template: %v", err)
+	}
+
+	migrateCalls := 0
+	db.MigrateObserver = func() { migrateCalls++ }
+	t.Cleanup(func() { db.MigrateObserver = func() {} })
+
+	store, err := Open(t, filepath.Join(t.TempDir(), "copy.db"))
+	if err != nil {
+		t.Fatalf("dbtest.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	if migrateCalls != 0 {
+		t.Fatalf("Migrate ran %d time(s) on a cached copy: the frontend is not bound to db.OpenAlreadyMigrated", migrateCalls)
+	}
+}
