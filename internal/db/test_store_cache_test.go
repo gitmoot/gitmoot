@@ -243,6 +243,40 @@ func TestCachedMigratedTemplateUsesCurrentUnixUserPath(t *testing.T) {
 	}
 }
 
+// TestTestTemplateStampIsBoundToMigrationFingerprint pins the stamp to the
+// CURRENT migration set. Every consumer of testTemplateStamp compares one stamp
+// against another stamp (test_template_identity.go:113, :137, :207, :269), so a
+// mutant that detaches the stamp from SchemaMigrationFingerprint() -- returning
+// only the file digest -- changes both sides of every comparison identically and
+// passes the entire cache-contract set. Found by g7-review one level downstream
+// of the exported-wrapper gap closed at 7bd3fe46, which is the same defect class
+// a third time: a guard that holds where it is installed and is absent at the
+// next consumer.
+//
+// Why the detachment is exploitable rather than cosmetic: the migration
+// fingerprint reaches the cache PATH only as a 48-bit prefix
+// (gitmoot-test-schema-<uid>-<fingerprint[:12]>.db), so the path alone cannot
+// distinguish two different migration sets that truncate alike, nor a leftover
+// file at a reused path. The stamp carrying the FULL fingerprint is what closes
+// that, and this assertion is what keeps the stamp carrying it.
+func TestTestTemplateStampIsBoundToMigrationFingerprint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stamped.db")
+	if err := os.WriteFile(path, []byte("not a database, only bytes to digest"), 0o600); err != nil {
+		t.Fatalf("write stamp subject: %v", err)
+	}
+	stamp, err := testTemplateStamp(path)
+	if err != nil {
+		t.Fatalf("testTemplateStamp: %v", err)
+	}
+	fingerprint, _, found := strings.Cut(stamp, "\n")
+	if !found {
+		t.Fatalf("stamp %q has no newline: it must be the migration fingerprint, a newline, then the file digest", stamp)
+	}
+	if want := SchemaMigrationFingerprint(); fingerprint != want {
+		t.Fatalf("stamp fingerprint line = %q, want %q (stamp is not bound to the current migration set)", fingerprint, want)
+	}
+}
+
 func replaceCachedTemplateWithForeignSQLite(t *testing.T, path string) {
 	t.Helper()
 	foreign := filepath.Join(t.TempDir(), "foreign.db")
