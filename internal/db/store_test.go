@@ -3060,7 +3060,7 @@ func TestMigrateCopiesAgentRepoScopeToAgentRepos(t *testing.T) {
 	store := &Store{db: raw}
 	defer store.Close()
 
-	agentReposMigration := len(migrations) - 1
+	agentReposMigration := len(migrationsBefore(t, "agent_repos"))
 	for i, migration := range migrations {
 		if strings.Contains(migration, "CREATE TABLE agent_repos") {
 			agentReposMigration = i
@@ -3099,7 +3099,7 @@ func TestMigrateAppendsAgentInstanceAutonomyPolicy(t *testing.T) {
 		t.Fatalf("sql.Open returned error: %v", err)
 	}
 	store := &Store{db: raw}
-	for version, migration := range migrations[:len(migrations)-1] {
+	for version, migration := range migrationsBefore(t, "ADD COLUMN autonomy_policy") {
 		if err := store.applyMigration(ctx, version+1, migration); err != nil {
 			t.Fatalf("applyMigration(%d) returned error: %v", version+1, err)
 		}
@@ -3134,7 +3134,7 @@ func TestMigrateAppendsTaskWorktreePath(t *testing.T) {
 		t.Fatalf("sql.Open returned error: %v", err)
 	}
 	store := &Store{db: raw}
-	for version, migration := range migrations[:len(migrations)-1] {
+	for version, migration := range migrationsBefore(t, "worktree_path") {
 		if err := store.applyMigration(ctx, version+1, migration); err != nil {
 			t.Fatalf("applyMigration(%d) returned error: %v", version+1, err)
 		}

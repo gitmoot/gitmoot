@@ -75,7 +75,7 @@ func TestMigrateAppendsRootKilled(t *testing.T) {
 	store := &Store{db: raw}
 	// Apply every migration EXCEPT the last (the root_killed ALTER), reproducing a
 	// DB whose jobs table has no root_killed column.
-	for version, migration := range migrations[:len(migrations)-1] {
+	for version, migration := range migrationsBefore(t, "root_killed") {
 		if err := store.applyMigration(ctx, version+1, migration); err != nil {
 			t.Fatalf("applyMigration(%d) returned error: %v", version+1, err)
 		}

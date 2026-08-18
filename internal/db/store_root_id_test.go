@@ -201,9 +201,10 @@ func TestMigrateBackfillsRootID(t *testing.T) {
 		t.Fatalf("sql.Open returned error: %v", err)
 	}
 	store := &Store{db: raw}
-	// Apply every migration EXCEPT the last (the root_id ALTER+index), reproducing a
+	// Apply every migration BEFORE the jobs.root_id ALTER+index, located by content,
+	// reproducing a
 	// DB whose jobs table has no root_id column.
-	for version, migration := range migrations[:len(migrations)-1] {
+	for version, migration := range migrationsBefore(t, "ALTER TABLE jobs ADD COLUMN root_id") {
 		if err := store.applyMigration(ctx, version+1, migration); err != nil {
 			t.Fatalf("applyMigration(%d) returned error: %v", version+1, err)
 		}

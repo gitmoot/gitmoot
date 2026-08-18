@@ -235,7 +235,7 @@ func TestCanaryMigrationOnPreExistingDB(t *testing.T) {
 	// Apply every migration EXCEPT the last (the #484 canary migration), then seed a
 	// version row through the schema-before-canary.
 	store := &Store{db: raw}
-	for version, migration := range migrations[:len(migrations)-1] {
+	for version, migration := range migrationsBefore(t, "canary_sample") {
 		if err := store.applyMigration(ctx, version+1, migration); err != nil {
 			t.Fatalf("applyMigration(%d): %v", version+1, err)
 		}
