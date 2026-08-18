@@ -16,10 +16,23 @@
 // P2 extends Consume with a required positional builder, that signature change
 // will make its existing callers fail to compile until they supply it. Adapter
 // builds without a selector retain the Local default. Job-associated git,
-// GitHub CLI, checkout, verifier, and read-only-diff subprocesses consume the
-// resolved runner through Consume and fail closed when the backend has no
-// execution implementation. Operator tooling and daemon supervision/session
-// paths that do not execute a job deliberately retain host-side runners.
+// GitHub CLI, verifier, and read-only-diff subprocesses consume the resolved
+// runner through Consume and fail closed when the backend has no execution
+// implementation. Operator tooling and daemon supervision/session paths
+// deliberately retain host-side runners.
+//
+// ONE KNOWN EXCEPTION, tracked by #1560: the supervisor provisions a job's
+// worktrees on the HOST even though it executes no agent runtime.
+// daemon_supervision.go's WorkflowFactory builds the engine via the
+// ExecRunner{} variant of daemonWorkflowEngine, which binds
+// engine.DelegationWorktrees and engine.FixWorktreeAllocator to that host
+// runner (daemon_workflow.go:174-176); AdvanceJob (daemon/daemon.go:1133) then
+// reaches AllocateIntegrationWorktree (engine_delegation.go:733) for returned
+// delegations. So "supervision" is not a safe proxy for "not job-associated":
+// this path is supervision AND performs job-associated checkout provisioning.
+// Gating it before P2 lands a second backend is #1560. Note the current guard,
+// TestJobSubprocessProductionRoutesDoNotCallHostWrappers, does NOT detect this
+// route.
 package execbackend
 
 import (
