@@ -164,10 +164,6 @@ func (w jobWorker) resolveJobCheckoutForRunner(ctx context.Context, job db.Job, 
 	return checkout, nil
 }
 
-func (w jobWorker) healRegisteredRepoCheckout(ctx context.Context, job db.Job, repo github.Repository, record db.Repo) (string, error) {
-	return w.healRegisteredRepoCheckoutForRunner(ctx, job, repo, record, subprocess.ExecRunner{})
-}
-
 func (w jobWorker) healRegisteredRepoCheckoutForRunner(ctx context.Context, job db.Job, repo github.Repository, record db.Repo, runner subprocess.Runner) (string, error) {
 	checkout := strings.TrimSpace(record.CheckoutPath)
 	resolved, healed, err := resolveRegisteredRepoRecordWithRunner(ctx, w.Store, repo, record, runner)
@@ -355,10 +351,6 @@ func isWorktreeLessDelegationChild(payload workflow.JobPayload) bool {
 	return strings.TrimSpace(payload.DelegationID) != "" && strings.TrimSpace(payload.WorktreePath) == ""
 }
 
-func (w jobWorker) validateReviewCheckout(ctx context.Context, payload workflow.JobPayload, checkout string) error {
-	return w.validateReviewCheckoutForRunner(ctx, payload, checkout, subprocess.ExecRunner{})
-}
-
 func (w jobWorker) validateReviewCheckoutForRunner(ctx context.Context, payload workflow.JobPayload, checkout string, runner subprocess.Runner) error {
 	git := jobGitClient(checkout, runner)
 	clean, err := git.WorktreeClean(ctx)
@@ -438,10 +430,6 @@ func (w jobWorker) reviewPullRequestOpen(ctx context.Context, repo string, numbe
 // comment carry the new head) and records a review_head_resynced event, then
 // returns true so defaultCheckout proceeds with the review. Every declined case
 // returns false so the caller's existing error path runs byte-identically.
-func (w jobWorker) resyncReviewHead(ctx context.Context, job db.Job, payload workflow.JobPayload, checkout string, cause error) (bool, error) {
-	return w.resyncReviewHeadForRunner(ctx, job, payload, checkout, subprocess.ExecRunner{}, cause)
-}
-
 func (w jobWorker) resyncReviewHeadForRunner(ctx context.Context, job db.Job, payload workflow.JobPayload, checkout string, runner subprocess.Runner, cause error) (bool, error) {
 	if !isReviewHeadMismatch(cause) {
 		return false, nil

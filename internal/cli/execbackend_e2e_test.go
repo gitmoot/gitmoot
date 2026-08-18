@@ -6,6 +6,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"os"
 	"path/filepath"
@@ -44,6 +47,22 @@ var execBackendLocalEventKindBaseline = []string{
 	"advance_started",
 	"delegation_worktree_removed",
 	"advance_completed",
+}
+
+var errP2ProbeSubprocessReached = errors.New("p2-probe subprocess runner reached")
+
+type p2ProbeSubprocessRunner struct {
+	calls int
+}
+
+func (r *p2ProbeSubprocessRunner) Run(context.Context, string, string, ...string) (subprocess.Result, error) {
+	r.calls++
+	return subprocess.Result{}, errP2ProbeSubprocessReached
+}
+
+func (r *p2ProbeSubprocessRunner) LookPath(string) (string, error) {
+	r.calls++
+	return "", errP2ProbeSubprocessReached
 }
 
 // execBackendDispatchAsk enqueues a background shell ask and returns its job id.
@@ -347,6 +366,180 @@ func TestP2GapJobSubprocessRoutesRefuseLocalFallback(t *testing.T) {
 	}
 	if _, err := jobSubprocessRunnerForBackend(execbackend.Backend("p2-probe")); err == nil {
 		t.Fatal("p2-probe inherited the local job subprocess runner")
+	}
+}
+
+// TestP2GapEveryJobSubprocessRouteRefusesLocalFallback drives the stored-job
+// selector through every subprocess route shape. A future backend may parse as
+// implemented, but it cannot reach checkout, git, or verifier execution until
+// Consume has a corresponding runner builder.
+func TestP2GapEveryJobSubprocessRouteRefusesLocalFallback(t *testing.T) {
+	const backend = execbackend.Backend("p2-probe")
+	job := db.Job{
+		ID:      "p2-job-subprocess-route",
+		Type:    "ask",
+		Payload: `{"repo":"owner/repo","sender":"local","instructions":"probe","exec_backend":"p2-probe"}`,
+	}
+	payload := workflow.JobPayload{
+		Repo:         "owner/repo",
+		FixWorktree:  true,
+		WorktreePath: t.TempDir(),
+	}
+	worker := jobWorker{}
+
+	previousResolver := daemonJobExecBackendFor
+	var resolvedName string
+	var resolvedPresent bool
+	daemonJobExecBackendFor = func(_ jobWorker, name string, present bool) (execbackend.Backend, error) {
+		resolvedName = name
+		resolvedPresent = present
+		return backend, nil
+	}
+	t.Cleanup(func() { daemonJobExecBackendFor = previousResolver })
+
+	routeRunner := func() (subprocess.Runner, error) {
+		return worker.subprocessRunnerForJob(job)
+	}
+	routes := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "stored payload resolver",
+			run: func() error {
+				_, err := routeRunner()
+				return err
+			},
+		},
+		{
+			name: "default checkout",
+			run: func() error {
+				runner, err := routeRunner()
+				if err != nil {
+					return err
+				}
+				_, err = worker.defaultCheckoutForRunner(context.Background(), job, payload, runtime.Agent{}, runner)
+				return err
+			},
+		},
+		{
+			name: "checkout resolution",
+			run: func() error {
+				runner, err := routeRunner()
+				if err != nil {
+					return err
+				}
+				_, err = worker.resolveJobCheckoutForRunner(context.Background(), job, payload, runner)
+				return err
+			},
+		},
+		{
+			name: "git client",
+			run: func() error {
+				runner, err := routeRunner()
+				if err != nil {
+					return err
+				}
+				_, err = jobGitClient(t.TempDir(), runner).HeadSHA(context.Background())
+				return err
+			},
+		},
+		{
+			name: "hard verifier",
+			run: func() error {
+				runner, err := routeRunner()
+				if err != nil {
+					return err
+				}
+				_ = daemonHardVerifierDispatcherForRunner(nil, t.TempDir(), t.TempDir(), runner)
+				return errors.New("future backend reached hard verifier construction")
+			},
+		},
+	}
+	for _, route := range routes {
+		t.Run(route.name, func(t *testing.T) {
+			err := route.run()
+			if err == nil || !strings.Contains(err.Error(), string(backend)) {
+				t.Fatalf("route error = %v, want fail-closed refusal naming %q", err, backend)
+			}
+		})
+	}
+	if resolvedName != string(backend) || !resolvedPresent {
+		t.Fatalf("subprocessRunnerForJob resolved name=%q present=%v, want stored override %q present", resolvedName, resolvedPresent, backend)
+	}
+}
+
+// TestJobCheckoutRouteConsumesResolvedSubprocessRunner pins the production
+// checkoutForJob call site. Replacing defaultCheckoutForRunner with the
+// host-only defaultCheckout wrapper compiles, but ignores this resolved runner
+// and makes the test fail by executing git locally.
+func TestJobCheckoutRouteConsumesResolvedSubprocessRunner(t *testing.T) {
+	ctx := context.Background()
+	_, _, store := heartbeatLoopE2EHome(t)
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	runner := &p2ProbeSubprocessRunner{}
+	worker := jobWorker{Store: store}
+	_, err := worker.checkoutForJob(
+		ctx,
+		db.Job{ID: "p2-checkout-route", Type: "ask"},
+		workflow.JobPayload{Repo: "owner/repo"},
+		runtime.Agent{},
+		runner,
+	)
+	if !errors.Is(err, errP2ProbeSubprocessReached) {
+		t.Fatalf("checkout error = %v, want resolved p2-probe runner refusal", err)
+	}
+	if runner.calls == 0 {
+		t.Fatal("checkout route ignored the resolved p2-probe subprocess runner")
+	}
+}
+
+// TestJobSubprocessProductionRoutesDoNotCallHostWrappers binds the package
+// contract to every production call site. The wrappers remain for focused
+// legacy tests only; using one from non-test code would silently substitute an
+// ExecRunner and bypass the resolved backend.
+func TestJobSubprocessProductionRoutesDoNotCallHostWrappers(t *testing.T) {
+	forbidden := map[string]struct{}{
+		"defaultCheckout":            {},
+		"resolveJobCheckout":         {},
+		"healRegisteredRepoCheckout": {},
+		"validateTargetCheckout":     {},
+		"validateReviewCheckout":     {},
+		"resyncReviewHead":           {},
+	}
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	var violations []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			selector, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			if _, blocked := forbidden[selector.Sel.Name]; blocked {
+				violations = append(violations, fset.Position(selector.Sel.Pos()).String())
+			}
+			return true
+		})
+	}
+	if len(violations) != 0 {
+		t.Fatalf("production job subprocess routes call host-only wrappers: %v", violations)
 	}
 }
 
