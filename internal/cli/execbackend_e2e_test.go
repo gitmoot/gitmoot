@@ -373,6 +373,26 @@ func TestP2GapEveryJobAdapterConstructionRouteRefusesLocalFallback(t *testing.T)
 			t.Fatal("one-shot runtime session accepted p2-probe without an implementation")
 		}
 	})
+	t.Run("live A/B resumed runtime session", func(t *testing.T) {
+		runner := &agentStartRunner{results: []subprocess.Result{{Stdout: "silently-local"}}}
+		restore := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+		t.Cleanup(restore)
+
+		_, err := realSkillOptABDeliver(context.Background(), runtime.Agent{
+			Name:        "live-ab-challenger",
+			Role:        "reviewer",
+			Runtime:     runtime.ShellRuntime,
+			RuntimeRef:  "printf silently-local",
+			RepoScope:   "owner/repo",
+			ExecBackend: string(backend),
+		}, "must not run")
+		if err == nil {
+			t.Fatal("live A/B resume accepted p2-probe without an implementation")
+		}
+		if len(runner.calls) != 0 {
+			t.Fatalf("live A/B resume invoked the local runtime %d times, want 0", len(runner.calls))
+		}
+	})
 	t.Run("runtime contract preflight", func(t *testing.T) {
 		calls := 0
 		if _, err := runtimeContractPreflightForBackend(backend, func() runtime.RuntimeContractResult {

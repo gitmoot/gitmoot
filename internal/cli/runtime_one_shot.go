@@ -20,13 +20,9 @@ func deliverOneShotRuntimePrompt(ctx context.Context, agent runtime.Agent, promp
 	if adapterDir == "" {
 		adapterDir = agent.RepoScope
 	}
-	backend := execbackend.Local
-	if strings.TrimSpace(agent.ExecBackend) != "" {
-		var err error
-		backend, err = execbackend.ParseImplemented(agent.ExecBackend)
-		if err != nil {
-			return "", err
-		}
+	backend, err := execBackendForRuntimeAgent(agent)
+	if err != nil {
+		return "", err
 	}
 	adapter, err := startRuntimeAdapterForBackend(backend, agent.ConfigHome, agent.Runtime, adapterDir)
 	if err != nil {
@@ -37,4 +33,11 @@ func deliverOneShotRuntimePrompt(ctx context.Context, agent runtime.Agent, promp
 		return "", err
 	}
 	return strings.TrimSpace(started.Raw), nil
+}
+
+func execBackendForRuntimeAgent(agent runtime.Agent) (execbackend.Backend, error) {
+	if strings.TrimSpace(agent.ExecBackend) == "" {
+		return execbackend.Local, nil
+	}
+	return execbackend.ParseImplemented(agent.ExecBackend)
 }

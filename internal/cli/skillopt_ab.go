@@ -152,7 +152,11 @@ func realSkillOptABDeliver(ctx context.Context, agent runtime.Agent, prompt stri
 	if adapterDir == "" {
 		adapterDir = agent.RepoScope
 	}
-	adapter, err := runtimeAdapterFor(agent.ConfigHome, agent.Runtime, adapterDir)
+	backend, err := execBackendForRuntimeAgent(agent)
+	if err != nil {
+		return "", err
+	}
+	adapter, err := startRuntimeAdapterForBackend(backend, agent.ConfigHome, agent.Runtime, adapterDir)
 	if err != nil {
 		return "", err
 	}

@@ -9,11 +9,13 @@
 // with subprocess.GroupRunner{} innermost). The job-scoped
 // Provision/SyncIn/Exec/Collect/Destroy lifecycle from the P0 contract lands
 // with the first real backend (P2); this package only names the selector.
-// Selection gates runtime adapter construction: every construction route
-// funnels through Consume, whose only positive implementation is Local; any
-// other parsed backend is refused at runtime. P2 must extend Consume with a
-// positional builder, and that signature change will make existing construction
-// routes fail to compile until they supply it. Selection does not yet gate
+// Where P1 carries a resolved selection into adapter construction, that route
+// consumes it through Consume, whose only positive implementation is Local; any
+// other parsed backend is refused at runtime. Adding a backend to
+// ParseImplemented alone still compiles and then fails closed at consumption. If
+// P2 extends Consume with a required positional builder, that signature change
+// will make its existing callers fail to compile until they supply it. Adapter
+// builds without a selector retain the Local default. Selection does not yet gate
 // job-associated subprocess execution; closing that gap before P2 is tracked by
 // #1560.
 package execbackend
