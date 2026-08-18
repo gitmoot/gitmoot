@@ -2,10 +2,12 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -45,7 +47,9 @@ func ensureCachedMigratedTestTemplate(path string) error {
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("test schema template %s is not a regular file", path)
 		}
-		return nil
+		if err := validateCachedMigratedTestTemplate(path); err == nil {
+			return nil
+		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("stat test schema template: %w", err)
 	}
@@ -75,12 +79,61 @@ func ensureCachedMigratedTestTemplate(path string) error {
 		return fmt.Errorf("close migrated test schema template: %w", err)
 	}
 	if err := os.Rename(tempPath, path); err != nil {
-		if info, statErr := os.Stat(path); statErr == nil && info.Mode().IsRegular() {
+		if validateErr := validateCachedMigratedTestTemplate(path); validateErr == nil {
 			return nil
 		}
 		return fmt.Errorf("publish test schema template: %w", err)
 	}
 	return nil
+}
+
+func validateCachedMigratedTestTemplate(path string) error {
+	dsn := &url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro&immutable=1"}
+	raw, err := sql.Open("sqlite", dsn.String())
+	if err != nil {
+		return fmt.Errorf("open cached test schema template: %w", err)
+	}
+	defer raw.Close()
+
+	var integrity string
+	if err := raw.QueryRowContext(context.Background(), `PRAGMA quick_check`).Scan(&integrity); err != nil {
+		return fmt.Errorf("check cached test schema template integrity: %w", err)
+	}
+	if integrity != "ok" {
+		return fmt.Errorf("cached test schema template integrity check returned %q", integrity)
+	}
+	var autoVacuum int
+	if err := raw.QueryRowContext(context.Background(), `PRAGMA auto_vacuum`).Scan(&autoVacuum); err != nil {
+		return fmt.Errorf("read cached test schema auto_vacuum: %w", err)
+	}
+	if autoVacuum != SQLiteAutoVacuumIncremental {
+		return fmt.Errorf("cached test schema auto_vacuum is %d, want %d", autoVacuum, SQLiteAutoVacuumIncremental)
+	}
+
+	var count, minimum, maximum int
+	if err := raw.QueryRowContext(context.Background(), `
+		SELECT COUNT(*), COALESCE(MIN(version), 0), COALESCE(MAX(version), 0)
+		FROM schema_migrations`).Scan(&count, &minimum, &maximum); err != nil {
+		return fmt.Errorf("read cached test schema migration versions: %w", err)
+	}
+	want := SchemaMigrationCount()
+	if count != want || minimum != 1 || maximum != want {
+		return fmt.Errorf("cached test schema migration versions are count=%d range=%d..%d, want count=%d range=1..%d", count, minimum, maximum, want, want)
+	}
+	return nil
+}
+
+func TestEnsureCachedMigratedTestTemplateReplacesInvalidRegularFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "schema.db")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatalf("write invalid template: %v", err)
+	}
+	if err := ensureCachedMigratedTestTemplate(path); err != nil {
+		t.Fatalf("repair invalid template: %v", err)
+	}
+	if err := validateCachedMigratedTestTemplate(path); err != nil {
+		t.Fatalf("validate repaired template: %v", err)
+	}
 }
 
 func copyCachedTestTemplateIfMissing(template, path string) error {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"sync"
@@ -112,6 +113,75 @@ func TestOpenConcurrentSamePath(t *testing.T) {
 		if err := store.Close(); err != nil {
 			t.Errorf("Close shared store: %v", err)
 		}
+	}
+}
+
+func TestEnsureMigratedTemplateReplacesInvalidRegularFile(t *testing.T) {
+	tests := []struct {
+		name    string
+		content []byte
+	}{
+		{name: "empty", content: nil},
+		{name: "not_sqlite", content: []byte("not a sqlite database")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			template := filepath.Join(t.TempDir(), "schema.db")
+			if err := os.WriteFile(template, test.content, 0o600); err != nil {
+				t.Fatalf("write invalid template: %v", err)
+			}
+			if err := ensureMigratedTemplate(template); err != nil {
+				t.Fatalf("repair invalid template: %v", err)
+			}
+			if err := validateMigratedTemplate(template); err != nil {
+				t.Fatalf("validate repaired template: %v", err)
+			}
+
+			copyPath := filepath.Join(t.TempDir(), "copy.db")
+			if err := copyTemplateIfMissing(template, copyPath); err != nil {
+				t.Fatalf("copy repaired template: %v", err)
+			}
+			store, err := db.OpenAlreadyMigrated(copyPath)
+			if err != nil {
+				t.Fatalf("open repaired template copy: %v", err)
+			}
+			defer store.Close()
+			if err := store.CreateJob(context.Background(), db.Job{ID: "usable", Agent: "worker", Type: "ask", State: "queued"}); err != nil {
+				t.Fatalf("use repaired template copy: %v", err)
+			}
+		})
+	}
+}
+
+func TestEnsureMigratedTemplateReplacesWrongAutoVacuum(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "schema.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open seed database: %v", err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE cache_seed (id INTEGER PRIMARY KEY)`); err != nil {
+		raw.Close()
+		t.Fatalf("seed existing database: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close seed database: %v", err)
+	}
+	store, err := db.Open(path)
+	if err != nil {
+		t.Fatalf("migrate seed database: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close migrated seed database: %v", err)
+	}
+	if got := readSchemaSnapshot(t, path).autoVacuum; got == db.SQLiteAutoVacuumIncremental {
+		t.Fatalf("seed auto_vacuum unexpectedly equals INCREMENTAL")
+	}
+
+	if err := ensureMigratedTemplate(path); err != nil {
+		t.Fatalf("repair wrong auto_vacuum template: %v", err)
+	}
+	if got := readSchemaSnapshot(t, path).autoVacuum; got != db.SQLiteAutoVacuumIncremental {
+		t.Fatalf("repaired auto_vacuum = %d, want %d", got, db.SQLiteAutoVacuumIncremental)
 	}
 }
 

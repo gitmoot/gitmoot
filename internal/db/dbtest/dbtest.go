@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -54,7 +55,9 @@ func ensureMigratedTemplate(path string) error {
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("test schema template %s is not a regular file", path)
 		}
-		return nil
+		if err := validateMigratedTemplate(path); err == nil {
+			return nil
+		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("stat test schema template: %w", err)
 	}
@@ -90,10 +93,46 @@ func ensureMigratedTemplate(path string) error {
 	// shared cache path. Concurrent test binaries may race here; each candidate
 	// is complete, and rename is atomic because both names share a directory.
 	if err := os.Rename(tempPath, path); err != nil {
-		if info, statErr := os.Stat(path); statErr == nil && info.Mode().IsRegular() {
+		if validateErr := validateMigratedTemplate(path); validateErr == nil {
 			return nil
 		}
 		return fmt.Errorf("publish test schema template: %w", err)
+	}
+	return nil
+}
+
+func validateMigratedTemplate(path string) error {
+	dsn := &url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro&immutable=1"}
+	raw, err := sql.Open("sqlite", dsn.String())
+	if err != nil {
+		return fmt.Errorf("open cached test schema template: %w", err)
+	}
+	defer raw.Close()
+
+	var integrity string
+	if err := raw.QueryRowContext(context.Background(), `PRAGMA quick_check`).Scan(&integrity); err != nil {
+		return fmt.Errorf("check cached test schema template integrity: %w", err)
+	}
+	if integrity != "ok" {
+		return fmt.Errorf("cached test schema template integrity check returned %q", integrity)
+	}
+	var autoVacuum int
+	if err := raw.QueryRowContext(context.Background(), `PRAGMA auto_vacuum`).Scan(&autoVacuum); err != nil {
+		return fmt.Errorf("read cached test schema auto_vacuum: %w", err)
+	}
+	if autoVacuum != db.SQLiteAutoVacuumIncremental {
+		return fmt.Errorf("cached test schema auto_vacuum is %d, want %d", autoVacuum, db.SQLiteAutoVacuumIncremental)
+	}
+
+	var count, minimum, maximum int
+	if err := raw.QueryRowContext(context.Background(), `
+		SELECT COUNT(*), COALESCE(MIN(version), 0), COALESCE(MAX(version), 0)
+		FROM schema_migrations`).Scan(&count, &minimum, &maximum); err != nil {
+		return fmt.Errorf("read cached test schema migration versions: %w", err)
+	}
+	want := db.SchemaMigrationCount()
+	if count != want || minimum != 1 || maximum != want {
+		return fmt.Errorf("cached test schema migration versions are count=%d range=%d..%d, want count=%d range=1..%d", count, minimum, maximum, want, want)
 	}
 	return nil
 }
