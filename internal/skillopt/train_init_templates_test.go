@@ -7,11 +7,12 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 func TestListTrainInitTemplateChoicesIncludesBuiltinInstalledAndAgents(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -95,7 +96,7 @@ func TestListTrainInitTemplateChoicesIncludesBuiltinInstalledAndAgents(t *testin
 
 func TestResolveTrainInitTemplateChoiceInstallsAvailableBuiltin(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -120,7 +121,7 @@ func TestResolveTrainInitTemplateChoiceInstallsAvailableBuiltin(t *testing.T) {
 
 func TestResolveTrainInitTemplateChoiceRejectsMissingCustom(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

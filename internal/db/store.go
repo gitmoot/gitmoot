@@ -54,6 +54,25 @@ type sqlExecer interface {
 const sqliteBusyTimeoutMillis = 15000
 
 func Open(path string) (*Store, error) {
+	store, err := openWritable(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.Migrate(context.Background()); err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+// OpenAlreadyMigrated opens a writable database without running migrations.
+// It is intended for tests that copy a fully migrated schema template. Callers
+// must guarantee that path already contains the current schema.
+func OpenAlreadyMigrated(path string) (*Store, error) {
+	return openWritable(path)
+}
+
+func openWritable(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
@@ -65,12 +84,7 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	store := &Store{db: db, path: path}
-	if err := store.Migrate(context.Background()); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	return store, nil
+	return &Store{db: db, path: path}, nil
 }
 
 func OpenReadOnly(path string) (*Store, error) {

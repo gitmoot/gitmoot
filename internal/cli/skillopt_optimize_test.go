@@ -17,6 +17,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/artifact"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/skillopt"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
@@ -76,7 +77,7 @@ func TestRemoveSkillOptTrainTargetAgents(t *testing.T) {
 	if err := config.Initialize(config.PathsForHome(home)); err != nil {
 		t.Fatalf("init: %v", err)
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -178,7 +179,7 @@ func TestStartAgentOptimizeSessionPersistsBackendAndModel(t *testing.T) {
 		t.Fatal("expected a session id")
 	}
 
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -2282,7 +2283,7 @@ func TestSkillOptTrainContinueOptimizerHandlesMissingIteration(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

@@ -17,6 +17,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/artifact"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/skillopt"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -26,7 +27,7 @@ func waitPendingInteractivePrompt(t *testing.T, home string, timeout time.Durati
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		store, err := db.Open(config.PathsForHome(home).Database)
+		store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 		if err == nil {
 			prompts, listErr := store.ListInteractivePrompts(context.Background(), db.InteractivePromptStatePending)
 			store.Close()
@@ -120,7 +121,7 @@ func startSkillOptTrainGenerationForPersistTest(t *testing.T, home string) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -345,7 +346,7 @@ func seedSkillOptReviewWatcherRun(t *testing.T) (string, *db.Store, artifact.Sto
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -533,7 +534,7 @@ func seedSkillOptTrainFeedbackSynced(t *testing.T) (string, string) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

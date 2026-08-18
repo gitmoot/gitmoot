@@ -10,7 +10,7 @@ import (
 
 func TestTaskEventsMigrationAppliesToExistingDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gitmoot.db")
-	legacy, err := Open(path)
+	legacy, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,7 +30,7 @@ func TestTaskEventsMigrationAppliesToExistingDatabase(t *testing.T) {
 	if err := legacy.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err := Open(path)
+	store, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open existing db: %v", err)
 	}

@@ -10,7 +10,7 @@ import (
 )
 
 func TestCountCurrentJobsByOrgRoleUsesActiveIndexes(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestCountCurrentJobsByOrgRoleUsesActiveIndexes(t *testing.T) {
 }
 
 func TestCountJobsByOrgRoleSince(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -10,6 +10,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 // TestDaemonRunSelfRegistrationSurfacesRunningDaemon is the #505 gap-3 regression:
@@ -86,7 +87,7 @@ func TestDaemonRunStartupReconcile(t *testing.T) {
 
 	// Pre-seed an orphaned running runtime session: a crashed daemon left it at
 	// state=running with an elapsed lease and no active job.
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -137,7 +138,7 @@ func TestDaemonRunStartupReconcile(t *testing.T) {
 	}
 
 	// (b) the orphaned running session was reset to idle.
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

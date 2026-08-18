@@ -12,7 +12,7 @@ import (
 // flag; and an unknown id reads as not killed (fails open) rather than erroring.
 func TestRootKilledRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestMigrateAppendsRootKilled(t *testing.T) {
 	store := &Store{db: raw}
 	// Apply every migration EXCEPT the last (the root_killed ALTER), reproducing a
 	// DB whose jobs table has no root_killed column.
-	for version, migration := range migrations[:len(migrations)-1] {
+	for version, migration := range migrationsBefore(t, "root_killed") {
 		if err := store.applyMigration(ctx, version+1, migration); err != nil {
 			t.Fatalf("applyMigration(%d) returned error: %v", version+1, err)
 		}
@@ -87,7 +87,7 @@ func TestMigrateAppendsRootKilled(t *testing.T) {
 		t.Fatalf("raw Close returned error: %v", err)
 	}
 
-	upgraded, err := Open(path)
+	upgraded, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open upgraded DB returned error: %v", err)
 	}

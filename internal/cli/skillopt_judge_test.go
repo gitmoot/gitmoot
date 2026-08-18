@@ -12,6 +12,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/skillopt"
 )
 
@@ -107,7 +108,7 @@ func newJudgeTestHome(t *testing.T) (string, config.Paths) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -140,7 +141,7 @@ func TestSkillOptJudgePromotePreviewWritesNothing(t *testing.T) {
 		t.Fatalf("preview stdout missing prompt preview: %q", out)
 	}
 
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -181,7 +182,7 @@ func TestSkillOptJudgePromoteRefusesNotAccepted(t *testing.T) {
 		t.Fatalf("stderr missing accepted-gate message: %q", stderr.String())
 	}
 
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -242,7 +243,7 @@ func TestSkillOptJudgePromoteApplyRoundTrip(t *testing.T) {
 		t.Fatalf("version bump = %q→%q", result.PreviousPromptVersion, result.NewPromptVersion)
 	}
 
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -378,7 +379,7 @@ func TestSkillOptJudgeReportRendersMatrixAndAgreement(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}

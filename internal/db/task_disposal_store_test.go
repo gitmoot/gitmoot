@@ -54,7 +54,7 @@ func TestTaskDisposalMigrationIsAppendOnlyTail(t *testing.T) {
 func TestTaskDisposalStatesCannotBeOverwrittenByConditionalUpsert(t *testing.T) {
 	for _, terminal := range []string{"superseded", "stranded"} {
 		t.Run(terminal, func(t *testing.T) {
-			store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+			store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 			if err != nil {
 				t.Fatal(err)
 			}

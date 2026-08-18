@@ -6,6 +6,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 func memoryDaemonHome(t *testing.T, extra string) (string, *db.Store) {
@@ -20,7 +21,7 @@ func memoryDaemonHome(t *testing.T, extra string) (string, *db.Store) {
 			t.Fatalf("write config: %v", err)
 		}
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

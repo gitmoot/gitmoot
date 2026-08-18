@@ -15,6 +15,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -163,7 +164,7 @@ func TestWebDataSourceStateCarriesRootWorkflowOnly(t *testing.T) {
 	}
 
 	home := dashboardTestHome(t)
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -183,7 +184,7 @@ func TestWebDataSourceStateCarriesRootWorkflowOnly(t *testing.T) {
 func TestWebDataSourceGraphWorkflowHubsRespectVisibleJobs(t *testing.T) {
 	t.Parallel()
 	home := dashboardTestHome(t)
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -246,7 +247,7 @@ func TestWebDataSourceGraphWorkflowHubsRespectVisibleJobs(t *testing.T) {
 func TestWebDataSourceGraphUnlabelledLegacyJSONUnchanged(t *testing.T) {
 	t.Parallel()
 	home := dashboardTestHome(t)
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -271,7 +272,7 @@ func TestWebDataSourceGraphUnlabelledLegacyJSONUnchanged(t *testing.T) {
 func TestWebDashboardUnlabelledLegacyHTTPGolden(t *testing.T) {
 	t.Parallel()
 	home := dashboardTestHome(t)
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -332,7 +333,7 @@ func assertDashboardHTTPGolden(t *testing.T, handler http.Handler, target, want 
 func TestWebDataSourceWorkflowGroupsTreesAndPaginates(t *testing.T) {
 	t.Parallel()
 	home := dashboardTestHome(t)
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -414,7 +415,7 @@ func TestWebDataSourceWorkflowsIndexLifecycleCoordinatorAndSlashDetail(t *testin
 	t.Parallel()
 	home := dashboardTestHome(t)
 	paths := config.PathsForHome(home)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -568,7 +569,7 @@ func TestDashboardWorkflowDaemonNotesDoNotAcknowledgeFailuresOrImpersonateCoordi
 	t.Parallel()
 	home := dashboardTestHome(t)
 	paths := config.PathsForHome(home)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -630,7 +631,7 @@ func TestDashboardWorkflowDaemonNotesDoNotAcknowledgeFailuresOrImpersonateCoordi
 		t.Fatalf("detail = %+v; want stalled workflow with human coordinator", detail)
 	}
 
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
 	}

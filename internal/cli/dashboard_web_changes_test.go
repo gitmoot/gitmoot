@@ -6,6 +6,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 func TestWebDataSourceChangeCursor(t *testing.T) {
@@ -26,7 +27,7 @@ func TestWebDataSourceChangeCursor(t *testing.T) {
 	assertCursor("0.0.0.0")
 	assertCursor("0.0.0.0")
 
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -39,7 +40,7 @@ func TestWebDataSourceChangeCursor(t *testing.T) {
 	store.Close()
 	assertCursor("1.0.0.0")
 
-	store, err = db.Open(config.PathsForHome(home).Database)
+	store, err = dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -50,7 +51,7 @@ func TestWebDataSourceChangeCursor(t *testing.T) {
 	store.Close()
 	assertCursor("1.1.0.0")
 
-	store, err = db.Open(config.PathsForHome(home).Database)
+	store, err = dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("reopen for task event: %v", err)
 	}
@@ -64,7 +65,7 @@ func TestWebDataSourceChangeCursor(t *testing.T) {
 	}
 	store.Close()
 	assertCursor("1.1.1.0")
-	store, err = db.Open(config.PathsForHome(home).Database)
+	store, err = dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("reopen for memory event: %v", err)
 	}

@@ -16,7 +16,7 @@ import (
 
 func openWorkflowTestStore(t *testing.T) *Store {
 	t.Helper()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -784,7 +784,11 @@ func TestWorkflowMetaTextSetPreserveClearAndLimit(t *testing.T) {
 }
 
 func TestWorkflowMetaTextMigrations(t *testing.T) {
-	store := openWorkflowTestStore(t)
+	store, err := openRealTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
 	rows, err := store.db.QueryContext(context.Background(), `PRAGMA table_info(workflow_meta)`)
 	if err != nil {
 		t.Fatalf("PRAGMA table_info(workflow_meta): %v", err)

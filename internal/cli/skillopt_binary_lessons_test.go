@@ -9,6 +9,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/skillopt"
 )
 
@@ -49,7 +50,7 @@ func seedBinaryLessonsHome(t *testing.T, home string) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -270,7 +271,7 @@ func TestSkillOptBinaryLessonsApplyDerivesNoPairwisePreference(t *testing.T) {
 	}
 
 	paths := config.PathsForHome(home)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -294,7 +295,7 @@ func TestSkillOptBinaryLessonsApplyExportsCleanly(t *testing.T) {
 
 	// Export resolves the template by reference, so the planner template must exist.
 	paths := config.PathsForHome(home)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -318,7 +319,7 @@ func TestSkillOptBinaryLessonsApplyExportsCleanly(t *testing.T) {
 		t.Fatalf("apply exit=%d stderr=%s", code, errBuf.String())
 	}
 
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open (export): %v", err)
 	}
@@ -345,7 +346,7 @@ func assertNoBinaryLessonEvents(t *testing.T, home, template string) {
 func readRankedFeedbackAcrossRuns(t *testing.T, home, template string) []db.RankedFeedbackEventWithTemplate {
 	t.Helper()
 	paths := config.PathsForHome(home)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

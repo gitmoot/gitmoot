@@ -10,7 +10,7 @@ import (
 
 func TestKeychainMigrationAppliesToExistingDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gitmoot.db")
-	legacy, err := Open(path)
+	legacy, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +34,7 @@ func TestKeychainMigrationAppliesToExistingDatabase(t *testing.T) {
 	if err := legacy.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err := Open(path)
+	store, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open existing database: %v", err)
 	}

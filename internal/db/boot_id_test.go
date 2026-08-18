@@ -28,7 +28,7 @@ func TestBootIDStableAndCached(t *testing.T) {
 
 func openBootTestStore(t *testing.T) *Store {
 	t.Helper()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -38,7 +38,11 @@ func openBootTestStore(t *testing.T) *Store {
 
 func TestMigrationAddsRunnerAndOwnerBootColumns(t *testing.T) {
 	ctx := context.Background()
-	store := openBootTestStore(t)
+	store, err := openRealTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
 	// A targeted projection over the new columns errors if the ALTER TABLEs did not
 	// run — a direct assertion the additive migration landed.
 	if _, err := store.db.ExecContext(ctx, `SELECT runner_pid, runner_boot_id FROM jobs LIMIT 0`); err != nil {

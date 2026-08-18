@@ -8,11 +8,12 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 func TestExportTrainingPackageIncludesBinaryVerdicts(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -72,7 +73,7 @@ func TestExportTrainingPackageIncludesBinaryVerdicts(t *testing.T) {
 
 func TestExportTrainingPackageOmitsBinaryVerdictsWhenAbsent(t *testing.T) {
 	ctx := context.Background()
-	store, err := db.Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

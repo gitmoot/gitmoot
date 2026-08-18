@@ -17,6 +17,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -570,7 +571,7 @@ func TestReplyWakeOutboxZeroRulesLogsUnhealthyWithoutAbortingFleetTick(t *testin
 	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -609,7 +610,7 @@ func TestReplyWakeOutboxUnrelatedEnabledRuleLeavesPendingObligationUnhealthy(t *
 	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -823,7 +824,7 @@ func TestReplyWakeOutboxSurvivesProducerProcessExitAndDrainsOnLaterDaemonTick(t 
 	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -847,7 +848,7 @@ func TestReplyWakeOutboxSurvivesProducerProcessExitAndDrainsOnLaterDaemonTick(t 
 		t.Fatalf("producer process: %v\n%s", err, output)
 	}
 
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -903,7 +904,7 @@ func TestReplyWakeOutboxProducerProcess(t *testing.T) {
 	if databasePath == "" {
 		return
 	}
-	store, err := db.Open(databasePath)
+	store, err := dbtest.Open(t, databasePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -961,7 +962,7 @@ func replyWakeTestHarness(t *testing.T, roles []replyWakeTestRole) (*db.Store, s
 	if err := os.WriteFile(paths.ConfigFile, []byte(body.String()), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}

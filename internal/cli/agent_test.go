@@ -18,6 +18,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -2836,7 +2837,7 @@ func TestRunAgentSubscribeAppliesInstalledTemplateDefaults(t *testing.T) {
 	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("init exit code = %d, stderr=%s", code, stderr.String())
 	}
-	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -2869,7 +2870,7 @@ func TestRunAgentSubscribeAppliesInstalledTemplateDefaults(t *testing.T) {
 		t.Fatalf("subscribe exit code = %d, stderr=%s", code, stderr.String())
 	}
 
-	store, err = db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	store, err = dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
 	}
@@ -2982,7 +2983,7 @@ func TestRunAgentSubscribeRejectsMissingTemplateAndImplementCapability(t *testin
 	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("init exit code = %d, stderr=%s", code, stderr.String())
 	}
-	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -3147,7 +3148,7 @@ func TestRunAgentDoctorPersistsHealth(t *testing.T) {
 		t.Fatalf("doctor exit code = %d, stderr=%s", code, stderr.String())
 	}
 
-	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -3419,7 +3420,7 @@ func seedThermoTemplate(t *testing.T, home string) {
 	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("init exit code = %d, stderr=%s", code, stderr.String())
 	}
-	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -3443,7 +3444,7 @@ func seedPlannerTemplate(t *testing.T, home string) {
 	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("init exit code = %d, stderr=%s", code, stderr.String())
 	}
-	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	store, err := dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

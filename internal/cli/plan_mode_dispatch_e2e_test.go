@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -75,7 +76,7 @@ func TestPlanModeDaemonDispatchE2E(t *testing.T) {
 		if err := os.MkdirAll(paths.Home, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		store, err := db.Open(paths.Database)
+		store, err := dbtest.Open(t, paths.Database)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -177,7 +178,7 @@ func runPlanModeDaemonJob(t *testing.T, rawHome, jobID, runtimeName, runtimeRef 
 	if err := os.MkdirAll(paths.Home, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}

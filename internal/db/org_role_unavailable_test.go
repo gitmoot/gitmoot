@@ -7,7 +7,7 @@ import (
 )
 
 func TestOrgRoleUnavailableLifecycle(t *testing.T) {
-	store, err := Open(t.TempDir() + "/gitmoot.db")
+	store, err := openCachedTestStore(t, t.TempDir()+"/gitmoot.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestOrgRoleUnavailableLifecycle(t *testing.T) {
 }
 
 func TestOrgRoleUnavailableRejectsInvalidInput(t *testing.T) {
-	store, err := Open(t.TempDir() + "/gitmoot.db")
+	store, err := openCachedTestStore(t, t.TempDir()+"/gitmoot.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestOrgRoleUnavailableRejectsInvalidInput(t *testing.T) {
 }
 
 func TestOrgRoleUnavailableRuntimeScopedClear(t *testing.T) {
-	store, err := Open(t.TempDir() + "/gitmoot.db")
+	store, err := openCachedTestStore(t, t.TempDir()+"/gitmoot.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestOrgRoleUnavailableRuntimeScopedClear(t *testing.T) {
 }
 
 func TestOrgRoleUnavailableMalformedUntilFailsClosed(t *testing.T) {
-	store, err := Open(t.TempDir() + "/gitmoot.db")
+	store, err := openCachedTestStore(t, t.TempDir()+"/gitmoot.db")
 	if err != nil {
 		t.Fatal(err)
 	}

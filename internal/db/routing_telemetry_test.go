@@ -12,7 +12,7 @@ import (
 // filters narrow correctly.
 func TestInsertAndListRoutingTelemetry(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestAggregateRoutingTelemetry(t *testing.T) {
 // summary on an un-migrated DB degrades gracefully.
 func TestListRoutingTelemetryMissingTable(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open error: %v", err)
 	}

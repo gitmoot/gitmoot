@@ -9,6 +9,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 // chatSeed captures the thread ids a seeded chat store produced so the assertions
@@ -28,7 +29,7 @@ type chatSeed struct {
 // empty (no-message) thread.
 func seedChatStore(t *testing.T, home string) chatSeed {
 	t.Helper()
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

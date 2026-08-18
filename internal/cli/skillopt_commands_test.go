@@ -13,6 +13,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/artifact"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/skillopt"
 )
 
@@ -22,7 +23,7 @@ func TestSkillOptExportAndImportCommands(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -194,7 +195,7 @@ items:
 	if !strings.Contains(stdout.String(), "promoted candidate planner@v2") {
 		t.Fatalf("candidate promote stdout = %q", stdout.String())
 	}
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open after import returned error: %v", err)
 	}
@@ -247,7 +248,7 @@ items:
 	if !strings.Contains(stdout.String(), "rejected candidate planner@v3") {
 		t.Fatalf("candidate reject stdout = %q", stdout.String())
 	}
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open after reject returned error: %v", err)
 	}
@@ -288,7 +289,7 @@ func TestSkillOptExportIncludesRankedFields(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -393,7 +394,7 @@ func TestSkillOptImportCandidateArtifacts(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -452,7 +453,7 @@ func TestSkillOptImportCandidateArtifacts(t *testing.T) {
 	if !strings.Contains(stdout.String(), "diff_artifact: candidate-diff") {
 		t.Fatalf("candidate show stdout = %q", stdout.String())
 	}
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open after import returned error: %v", err)
 	}
@@ -514,7 +515,7 @@ func TestSkillOptImportCandidateArtifactFailuresDoNotCreatePendingCandidate(t *t
 			if err := config.Initialize(paths); err != nil {
 				t.Fatalf("Initialize returned error: %v", err)
 			}
-			store, err := db.Open(paths.Database)
+			store, err := dbtest.Open(t, paths.Database)
 			if err != nil {
 				t.Fatalf("Open returned error: %v", err)
 			}
@@ -566,7 +567,7 @@ func TestSkillOptImportCandidateArtifactFailuresDoNotCreatePendingCandidate(t *t
 			if !strings.Contains(stderr.String(), tt.wantErr) {
 				t.Fatalf("stderr = %q, want substring %q", stderr.String(), tt.wantErr)
 			}
-			store, err = db.Open(paths.Database)
+			store, err = dbtest.Open(t, paths.Database)
 			if err != nil {
 				t.Fatalf("Open after failed import returned error: %v", err)
 			}

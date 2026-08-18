@@ -16,7 +16,7 @@ import (
 // accepts the `WITH ... AS MATERIALIZED` CTE hint the rewrite depends on.
 func TestJobIDsWithAgedTerminalDelegationWorktree(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

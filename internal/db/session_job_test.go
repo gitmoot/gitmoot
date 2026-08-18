@@ -13,7 +13,7 @@ import (
 // byte-identical.
 func TestExternallyDrivenDefaultsFalse(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestExternallyDrivenDefaultsFalse(t *testing.T) {
 // flag and creates the job directly running with its clock-in event.
 func TestCreateExternallyDrivenJobWithEvent(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestCreateExternallyDrivenJobWithEvent(t *testing.T) {
 // for minutes. Session lifecycle cleanup uses separate workflow/age signals.
 func TestListRunningJobsUpdatedBeforeSkipsExternallyDriven(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestListRunningJobsUpdatedBeforeSkipsExternallyDriven(t *testing.T) {
 // same DB is still returned.
 func TestListQueuedJobsSkipsExternallyDriven(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestExternallyDrivenColumnMigratesOnPreExistingDB(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "gitmoot.db")
 
-	store, err := Open(path)
+	store, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("Open returned error: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestExternallyDrivenColumnMigratesOnPreExistingDB(t *testing.T) {
 		t.Fatalf("Close returned error: %v", err)
 	}
 
-	reopened, err := Open(path)
+	reopened, err := openRealTestStore(t, path)
 	if err != nil {
 		t.Fatalf("re-Open returned error: %v", err)
 	}

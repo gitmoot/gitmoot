@@ -22,6 +22,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/buildinfo"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/update"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -72,7 +73,7 @@ func TestDashboardCacheCursorSelection(t *testing.T) {
 	}
 	assertCursors("0", "0", "0.0", "0.0.0.0")
 
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +369,7 @@ func TestDashboardCachedHandlersMatchModuleBytes(t *testing.T) {
 	home := dashboardTestHome(t)
 	seedWebDashboardTree(t, home)
 	seedAttentionHome(t, home)
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -528,7 +529,7 @@ func TestDashboardCachedTierTwoHandlersMatchModuleBytesEmpty(t *testing.T) {
 func TestDashboardAttentionCacheGateSatisfactionUsesHardMax(t *testing.T) {
 	home := dashboardTestHome(t)
 	ctx := context.Background()
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -592,7 +593,7 @@ func TestDashboardAttentionCacheGateSatisfactionUsesHardMax(t *testing.T) {
 func TestDashboardAgentsCacheRegistryMaxAndJobCursor(t *testing.T) {
 	home := dashboardTestHome(t)
 	ctx := context.Background()
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -748,7 +749,7 @@ func TestDashboardTierTwoCachesUncoveredWritesUseHardMax(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			home := dashboardTestHome(t)
-			store, err := db.Open(config.PathsForHome(home).Database)
+			store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -866,7 +867,7 @@ func TestDashboardHealthSeesLockMutationOnNextResponse(t *testing.T) {
 	if locks := readLocks(); len(locks) != 0 {
 		t.Fatalf("initial locks = %+v", locks)
 	}
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatal(err)
 	}

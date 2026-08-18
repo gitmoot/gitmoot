@@ -16,6 +16,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -44,7 +45,7 @@ func TestWebDataSourceOverviewAndTasksEmpty(t *testing.T) {
 func TestDashboardOverviewUnlabeledJobsNeedsYou(t *testing.T) {
 	home := dashboardTestHome(t)
 	paths := config.PathsForHome(home)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +87,7 @@ func TestDashboardOverviewUnlabeledJobsNeedsYou(t *testing.T) {
 func TestDashboardOverviewUnlabeledJobsNeedsPolicyAndSortsRepos(t *testing.T) {
 	home := dashboardTestHome(t)
 	paths := config.PathsForHome(home)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +130,7 @@ func TestDashboardOverviewUnlabeledJobsNeedsPolicyAndSortsRepos(t *testing.T) {
 func TestDashboardOverviewTasksAndWorkflows(t *testing.T) {
 	home := dashboardTestHome(t)
 	paths := config.PathsForHome(home)
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -245,7 +246,7 @@ func TestDashboardOverviewTasksAndWorkflows(t *testing.T) {
 		t.Fatalf("close raw DB: %v", err)
 	}
 
-	store, err = db.Open(paths.Database)
+	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -345,7 +346,7 @@ func TestDashboardOverviewTasksAndWorkflows(t *testing.T) {
 
 func TestWebDashboardTasksRoundTripAndMergedWindow(t *testing.T) {
 	home := dashboardTestHome(t)
-	store, err := db.Open(config.PathsForHome(home).Database)
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

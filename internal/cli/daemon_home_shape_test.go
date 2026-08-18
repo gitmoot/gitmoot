@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
 )
 
@@ -262,7 +262,7 @@ func TestSupervisorPollerWorkflowArtifactRootResolvedNoPhantom(t *testing.T) {
 	paths := config.PathsForHome(home)
 	resolvedRoot := paths.Home
 
-	store, err := db.Open(paths.Database)
+	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
