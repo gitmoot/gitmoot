@@ -137,6 +137,11 @@ func TestStoreOpenPolicy(t *testing.T) {
 	}
 }
 
+// afterEnsureCachedTemplate is the seam described at its call site: a no-op in
+// every ordinary run, replaced by a test to occupy the window between validating
+// the published template and reading it.
+var afterEnsureCachedTemplate = func() error { return nil }
+
 func cachedMigratedTestTemplate() (string, []byte, error) {
 	cachedTestTemplateMu.Lock()
 	defer cachedTestTemplateMu.Unlock()
@@ -147,6 +152,14 @@ func cachedMigratedTestTemplate() (string, []byte, error) {
 	var snapshotErr error
 	for attempt := 1; attempt <= cachedTestTemplatePublicationAttempts; attempt++ {
 		if err := ensureCachedMigratedTestTemplate(cachedTestTemplatePath); err != nil {
+			return cachedTestTemplatePath, nil, err
+		}
+		// Seam between validating the file and reading it. The retry loop above
+		// exists because another test binary can replace the template in exactly
+		// this window; production behaviour is a no-op, and a test replaces the
+		// hook to drive that window deterministically. Zero production surface:
+		// this whole frontend lives in a _test.go file.
+		if err := afterEnsureCachedTemplate(); err != nil {
 			return cachedTestTemplatePath, nil, err
 		}
 		cachedTestTemplateSnapshot, snapshotErr = SnapshotMigratedTestTemplate(cachedTestTemplatePath)
@@ -343,6 +356,74 @@ func TestCachedStoreCopiesAuthenticatedSnapshotAfterSharedTemplateChanges(t *tes
 	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("close opened store: %v", err)
+	}
+}
+
+// TestCachedFrontendIsBoundToAuthenticatedSnapshot pins the in-package cache
+// FRONTEND to the authenticated snapshot operation, which is a different claim
+// from the one the test above makes. That test proves
+// SnapshotMigratedTestTemplate rejects a replaced file; this one proves
+// cachedMigratedTestTemplate actually goes through it. Nothing else did: swapping
+// the frontend's SnapshotMigratedTestTemplate call for a plain os.ReadFile
+// compiles (identical ([]byte, error) shape) and passes the whole cache-contract
+// suite, because every other assertion either exercises the operation directly or
+// only checks that the bytes it returned round-trip. Found by g7-review as the
+// FOURTH hop of one class on this PR: pure helper -> exported wrapper -> stamp
+// consumer -> cache frontend, each correct where installed and unbound at the
+// next call site.
+//
+// The exploitable window is time-of-check-to-time-of-use: validation happens
+// against the file on disk, and a plain read would hand back whatever bytes are
+// there when the read lands, so a database replaced after validation gets cached
+// and every test in the process then runs against it.
+func TestCachedFrontendIsBoundToAuthenticatedSnapshot(t *testing.T) {
+	cacheRoot := t.TempDir()
+	t.Setenv("TMPDIR", cacheRoot)
+	reset := func() {
+		cachedTestTemplateMu.Lock()
+		cachedTestTemplateReady = false
+		cachedTestTemplatePath = ""
+		cachedTestTemplateSnapshot = nil
+		cachedTestTemplateMu.Unlock()
+	}
+	reset()
+	t.Cleanup(reset)
+
+	template, _, err := cachedMigratedTestTemplate()
+	if err != nil {
+		t.Fatalf("build cached migrated template snapshot: %v", err)
+	}
+	reset()
+
+	// Occupy the window: ensure() has just validated the file, so replace it
+	// before the snapshot read lands. Fire once so the retry loop can recover.
+	var foreign []byte
+	fired := false
+	afterEnsureCachedTemplate = func() error {
+		if fired {
+			return nil
+		}
+		fired = true
+		replaceCachedTemplateWithForeignSQLite(t, template)
+		data, readErr := os.ReadFile(template)
+		if readErr != nil {
+			return readErr
+		}
+		foreign = data
+		return nil
+	}
+	t.Cleanup(func() { afterEnsureCachedTemplate = func() error { return nil } })
+
+	_, snapshot, err := cachedMigratedTestTemplate()
+	if !fired {
+		t.Fatal("seam never fired: the frontend did not re-read the template")
+	}
+	if err != nil {
+		// Refusing outright is a correct authenticated outcome.
+		return
+	}
+	if bytes.Equal(snapshot, foreign) {
+		t.Fatal("frontend served the database that replaced the validated one: it read the file directly instead of through the authenticated snapshot")
 	}
 }
 
