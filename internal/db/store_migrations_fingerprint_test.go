@@ -35,4 +35,25 @@ func TestSchemaMigrationFingerprintFramesOrderedMigrations(t *testing.T) {
 	if original == edited {
 		t.Fatalf("same-length migration edits share fingerprint %q", original)
 	}
+
+	// Everything above exercises the UNEXPORTED helper, but the cache calls the
+	// EXPORTED wrapper: SchemaMigrationFingerprint() feeds both
+	// MigratedTestTemplatePath and testTemplateStamp. Nothing bound the wrapper to
+	// `migrations`, so the whole file could pass while the wrapper hashed something
+	// else entirely. Found by review, then reproduced: mutating the wrapper to
+	// `return schemaMigrationFingerprint(nil)` compiles clean and passes 370/370
+	// internal/db and 16/16 dbtest tests INCLUDING the assertion above. The
+	// consequence was demonstrated with a same-length in-place edit to a real
+	// migration: the clean tree rebuilt the template and served the new schema,
+	// while the mutant reused the cached path and served the OLD schema with every
+	// test green. The two existing callers of the wrapper (test_store_cache_test.go,
+	// dbtest/dbtest_test.go) compute their expected path BY CALLING it, so they are
+	// tautological and can never detect this. This assertion is the binding.
+	//
+	// The sibling SchemaMigrationCount() needs no equivalent: dbtest_test.go checks
+	// it against the row count of a really-migrated database, which is a genuine
+	// binding, and a wrong count fails validation loudly rather than silently.
+	if got, want := SchemaMigrationFingerprint(), schemaMigrationFingerprint(migrations); got != want {
+		t.Fatalf("SchemaMigrationFingerprint() = %q, want %q (wrapper is not bound to the migration set)", got, want)
+	}
 }
