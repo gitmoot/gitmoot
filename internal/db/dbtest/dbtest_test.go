@@ -153,6 +153,50 @@ func TestEnsureMigratedTemplateReplacesInvalidRegularFile(t *testing.T) {
 	}
 }
 
+// TestEnsureMigratedTemplateReplacesForeignIdentity covers the case the other
+// repair tests cannot reach: a template that is a perfectly valid, fully
+// migrated database — passing quick_check, carrying auto_vacuum=INCREMENTAL and
+// all SchemaMigrationCount() versions numbered 1..N — but built from a DIFFERENT
+// migration set. schema_migrations records version NUMBERS, not content, so
+// cardinality alone cannot distinguish it, and the cache path only carries a
+// 48-bit fingerprint prefix. Only the stamped full fingerprint can reject it.
+func TestEnsureMigratedTemplateReplacesForeignIdentity(t *testing.T) {
+	template := filepath.Join(t.TempDir(), "schema.db")
+	if err := ensureMigratedTemplate(template); err != nil {
+		t.Fatalf("build template: %v", err)
+	}
+	if err := validateMigratedTemplate(template); err != nil {
+		t.Fatalf("freshly built template must validate: %v", err)
+	}
+
+	// Forge the identity of an otherwise-perfect template.
+	foreign := "0000000000000000000000000000000000000000000000000000000000000000"
+	if err := os.WriteFile(templateIdentityPath(template), []byte(foreign), 0o600); err != nil {
+		t.Fatalf("write foreign identity: %v", err)
+	}
+	if err := validateMigratedTemplate(template); err == nil {
+		t.Fatal("validation accepted a template whose stamped identity is not the current fingerprint")
+	}
+
+	// A foreign identity must cause a REBUILD, not a hard failure: a stale cache
+	// entry is an ordinary condition on a long-lived host.
+	if err := ensureMigratedTemplate(template); err != nil {
+		t.Fatalf("repair foreign-identity template: %v", err)
+	}
+	if err := validateMigratedTemplate(template); err != nil {
+		t.Fatalf("validate rebuilt template: %v", err)
+	}
+
+	// A missing sidecar must fail closed as well, so a crash between the two
+	// publishes can never yield an unidentified template.
+	if err := os.Remove(templateIdentityPath(template)); err != nil {
+		t.Fatalf("remove identity sidecar: %v", err)
+	}
+	if err := validateMigratedTemplate(template); err == nil {
+		t.Fatal("validation accepted a template with no stamped identity")
+	}
+}
+
 func TestEnsureMigratedTemplateReplacesWrongAutoVacuum(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "schema.db")
 	raw, err := sql.Open("sqlite", path)
