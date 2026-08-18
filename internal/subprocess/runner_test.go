@@ -29,10 +29,13 @@ func TestExecRunnerRunExactEnvDoesNotInheritHost(t *testing.T) {
 	}
 
 	t.Setenv("GITMOOT_EXACT_ENV_AMBIENT", "must-not-leak")
-	result, err := (ExecRunner{}).RunExactEnv(
+	var stdout, stderr bytes.Buffer
+	err := (ExecRunner{}).RunExactEnv(
 		context.Background(),
 		"",
 		[]string{"GITMOOT_EXACT_ENV_VALUE=exact"},
+		&stdout,
+		&stderr,
 		"sh",
 		"-c",
 		`printf '%s|%s' "$GITMOOT_EXACT_ENV_VALUE" "${GITMOOT_EXACT_ENV_AMBIENT-unset}"`,
@@ -40,8 +43,11 @@ func TestExecRunnerRunExactEnvDoesNotInheritHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunExactEnv returned error: %v", err)
 	}
-	if result.Stdout != "exact|unset" {
-		t.Fatalf("stdout = %q, want exact environment without ambient variables", result.Stdout)
+	if stdout.String() != "exact|unset" {
+		t.Fatalf("stdout = %q, want exact environment without ambient variables", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 }
 

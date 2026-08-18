@@ -224,9 +224,7 @@ func (s *readOnlyWorktreeGitSandbox) run(ctx context.Context, label string, args
 	var stderr boundedCountingBuffer
 	stderr.limit = 4096
 	cmdArgs := append([]string{"--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.DevNull}, args...)
-	result, err := runReadOnlyWorktreeGit(ctx, s.runner, s.env, s.worktree, cmdArgs...)
-	_, _ = out.Write([]byte(result.Stdout))
-	_, _ = stderr.Write([]byte(result.Stderr))
+	err := runReadOnlyWorktreeGit(ctx, s.runner, s.env, s.worktree, out, &stderr, cmdArgs...)
 	if err != nil {
 		detail := strings.TrimSpace(stderr.String())
 		if detail != "" {
@@ -250,9 +248,7 @@ func runReadOnlyWorktreeMetadataGitOutput(ctx context.Context, runner subprocess
 	var stdout, stderr boundedCountingBuffer
 	stdout.limit = 64 << 10
 	stderr.limit = 4096
-	result, err := runReadOnlyWorktreeGit(ctx, runner, env, worktree, cmdArgs...)
-	_, _ = stdout.Write([]byte(result.Stdout))
-	_, _ = stderr.Write([]byte(result.Stderr))
+	err := runReadOnlyWorktreeGit(ctx, runner, env, worktree, &stdout, &stderr, cmdArgs...)
 	if err != nil {
 		detail := strings.TrimSpace(stderr.String())
 		if detail != "" {
@@ -267,15 +263,15 @@ func runReadOnlyWorktreeMetadataGitOutput(ctx context.Context, runner subprocess
 	return value, nil
 }
 
-func runReadOnlyWorktreeGit(ctx context.Context, runner subprocess.Runner, env []string, worktree string, args ...string) (subprocess.Result, error) {
+func runReadOnlyWorktreeGit(ctx context.Context, runner subprocess.Runner, env []string, worktree string, stdout, stderr io.Writer, args ...string) error {
 	if runner == nil {
-		return subprocess.Result{}, errors.New("read-only worktree diff has no subprocess runner")
+		return errors.New("read-only worktree diff has no subprocess runner")
 	}
 	envRunner, ok := runner.(subprocess.ExactEnvRunner)
 	if !ok {
-		return subprocess.Result{}, errors.New("read-only worktree diff subprocess runner does not support exact environment isolation")
+		return errors.New("read-only worktree diff subprocess runner does not support exact environment isolation")
 	}
-	return envRunner.RunExactEnv(ctx, worktree, env, "git", args...)
+	return envRunner.RunExactEnv(ctx, worktree, env, stdout, stderr, "git", args...)
 }
 
 func sanitizedReadOnlyWorktreeGitEnv(tempHome string) []string {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,8 +13,34 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
+
+type floodingExactEnvRunner struct {
+	total int
+}
+
+func (f floodingExactEnvRunner) Run(context.Context, string, string, ...string) (subprocess.Result, error) {
+	return subprocess.Result{}, errors.New("unexpected plain subprocess run")
+}
+
+func (f floodingExactEnvRunner) LookPath(file string) (string, error) {
+	return file, nil
+}
+
+func (f floodingExactEnvRunner) RunExactEnv(_ context.Context, _ string, _ []string, stdout, _ io.Writer, _ string, _ ...string) error {
+	chunk := []byte(strings.Repeat("x", 32<<10))
+	for written := 0; written < f.total; written += len(chunk) {
+		remaining := f.total - written
+		if remaining < len(chunk) {
+			_, _ = stdout.Write(chunk[:remaining])
+			continue
+		}
+		_, _ = stdout.Write(chunk)
+	}
+	return nil
+}
 
 func TestComposeBeforeReadOnlyWorktreeCleanupHooksRunsEveryHook(t *testing.T) {
 	firstErr := errors.New("first collector failed")
@@ -37,6 +64,25 @@ func TestComposeBeforeReadOnlyWorktreeCleanupHooksRunsEveryHook(t *testing.T) {
 	}
 	if got := strings.Join(calls, ","); got != "first,second" {
 		t.Fatalf("collector calls = %q, want first,second", got)
+	}
+}
+
+func TestReadOnlyWorktreeDiffRunnerBoundsOutputWhileRunning(t *testing.T) {
+	const total = readOnlyWorktreeDiffMaxBytes * 3
+	sandbox := readOnlyWorktreeGitSandbox{
+		worktree: t.TempDir(),
+		runner:   floodingExactEnvRunner{total: total},
+	}
+
+	out, err := sandbox.run(context.Background(), "capture diff", "diff")
+	if err != nil {
+		t.Fatalf("sandbox run: %v", err)
+	}
+	if len(out.String()) != readOnlyWorktreeDiffMaxBytes {
+		t.Fatalf("buffered bytes = %d, want cap %d", len(out.String()), readOnlyWorktreeDiffMaxBytes)
+	}
+	if out.dropped != total-readOnlyWorktreeDiffMaxBytes {
+		t.Fatalf("dropped bytes = %d, want %d", out.dropped, total-readOnlyWorktreeDiffMaxBytes)
 	}
 }
 

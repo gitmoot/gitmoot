@@ -38,7 +38,7 @@ type EnvRunner interface {
 // this seam when omitted variables must stay absent.
 type ExactEnvRunner interface {
 	Runner
-	RunExactEnv(ctx context.Context, dir string, env []string, command string, args ...string) (Result, error)
+	RunExactEnv(ctx context.Context, dir string, env []string, stdout, stderr io.Writer, command string, args ...string) error
 }
 
 // PIDCallback is invoked after a subprocess has started successfully and before
@@ -114,8 +114,8 @@ func (ExecRunner) RunEnv(ctx context.Context, dir string, env []string, command 
 	return RunEnv(ctx, dir, env, command, args...)
 }
 
-func (ExecRunner) RunExactEnv(ctx context.Context, dir string, env []string, command string, args ...string) (Result, error) {
-	return RunExactEnv(ctx, dir, env, command, args...)
+func (ExecRunner) RunExactEnv(ctx context.Context, dir string, env []string, stdout, stderr io.Writer, command string, args ...string) error {
+	return RunExactEnv(ctx, dir, env, stdout, stderr, command, args...)
 }
 
 func (ExecRunner) RunEnvWithPID(ctx context.Context, dir string, env []string, onPID PIDCallback, command string, args ...string) (Result, error) {
@@ -434,24 +434,17 @@ func RunEnv(ctx context.Context, dir string, extraEnv []string, command string, 
 	}, err
 }
 
-// RunExactEnv runs like Run with exactly env. Unlike RunEnv, omitted host
-// variables are not inherited.
-func RunExactEnv(ctx context.Context, dir string, env []string, command string, args ...string) (Result, error) {
+// RunExactEnv runs with exactly env and streams output into the supplied
+// writers. Unlike RunEnv, omitted host variables are not inherited. Callers
+// retain control over buffering so bounded writers can cap memory while the
+// subprocess is running.
+func RunExactEnv(ctx context.Context, dir string, env []string, stdout, stderr io.Writer, command string, args ...string) error {
 	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.Dir = dir
 	cmd.Env = append([]string(nil), env...)
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	return Result{
-		Command: command,
-		Args:    args,
-		Stdout:  stdout.String(),
-		Stderr:  stderr.String(),
-	}, err
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	return cmd.Run()
 }
 
 // RunEnvWithPID is RunEnv with an additive callback invoked after a successful

@@ -65,8 +65,9 @@ func (r *p2ProbeSubprocessRunner) RunEnv(ctx context.Context, dir string, _ []st
 	return r.Run(ctx, dir, command, args...)
 }
 
-func (r *p2ProbeSubprocessRunner) RunExactEnv(ctx context.Context, dir string, _ []string, command string, args ...string) (subprocess.Result, error) {
-	return r.Run(ctx, dir, command, args...)
+func (r *p2ProbeSubprocessRunner) RunExactEnv(ctx context.Context, dir string, _ []string, _, _ io.Writer, command string, args ...string) error {
+	_, err := r.Run(ctx, dir, command, args...)
+	return err
 }
 
 func (r *p2ProbeSubprocessRunner) LookPath(string) (string, error) {
