@@ -78,18 +78,9 @@ func ensureCachedMigratedTestTemplate(path string) error {
 	if err := store.Close(); err != nil {
 		return fmt.Errorf("close migrated test schema template: %w", err)
 	}
-	if err := os.Rename(tempPath, path); err != nil {
-		if validateErr := validateCachedMigratedTestTemplate(path); validateErr == nil {
-			return nil
-		}
-		return fmt.Errorf("publish test schema template: %w", err)
-	}
-	// Identity is stamped AFTER the database is published, and via the same shared
-	// helper internal/db/dbtest uses. Both caches consume the SAME path
-	// (os.TempDir()/gitmoot-test-schema-<hex12>.db), so a template published by
-	// either must be identifiable by both — otherwise one guard's acceptance
-	// silently overrides the other's rejection.
-	return StampTestTemplateIdentity(path)
+	// Publish + stamp as one operation, shared with internal/db/dbtest: both caches
+	// use the SAME path, so provenance must be guaranteed identically for both.
+	return PublishMigratedTestTemplate(tempPath, path)
 }
 
 func validateCachedMigratedTestTemplate(path string) error {

@@ -198,55 +198,20 @@ func TestEnsureMigratedTemplateReplacesForeignIdentity(t *testing.T) {
 	}
 }
 
-// TestStampOrderRejectsStaleDatabaseWithFreshIdentity pins the publication ORDER,
-// which round-4 review found inverted in my first version of this fix.
+// NOTE: TestValidationRejectsStaleDatabaseWithFreshIdentity used to live here. It
+// forged a fresh identity beside a stale database by calling a bare exported
+// stamp. That entry point is gone: package db now exposes only
+// PublishMigratedTestTemplate, which requires the freshly migrated temp file, so
+// the state that test constructed is no longer reachable from outside the
+// package — which was round-5 review's point ("the shared-path stamp can still
+// authenticate a database that was not produced by the current migrations").
 //
-// The sidecar vouches for the database, so it must be published SECOND. If it is
-// stamped first, a crash before the database rename leaves a NEW fingerprint
-// sitting beside the OLD database — and validation then blesses a stale schema,
-// which is strictly worse than no cache at all because ~600 tests consume it
-// while OpenAlreadyMigrated deliberately skips Migrate.
-//
-// This test simulates that window directly: an old database at the cache path
-// with a current-fingerprint sidecar must be REJECTED, not accepted.
-func TestValidationRejectsStaleDatabaseWithFreshIdentity(t *testing.T) {
-	template := filepath.Join(t.TempDir(), "schema.db")
-	if err := ensureMigratedTemplate(template); err != nil {
-		t.Fatalf("build template: %v", err)
-	}
-
-	// Stand in for "an older database that is structurally fine but not the
-	// current schema": drop a migration row so cardinality no longer matches.
-	raw, err := sql.Open("sqlite", template)
-	if err != nil {
-		t.Fatalf("open template: %v", err)
-	}
-	if _, err := raw.ExecContext(context.Background(),
-		`DELETE FROM schema_migrations WHERE version = (SELECT MAX(version) FROM schema_migrations)`); err != nil {
-		_ = raw.Close()
-		t.Fatalf("age the template: %v", err)
-	}
-	if err := raw.Close(); err != nil {
-		t.Fatalf("close aged template: %v", err)
-	}
-
-	// Re-stamp a CURRENT identity beside that stale database — exactly what the
-	// inverted order produced after a crash.
-	if err := db.StampTestTemplateIdentity(template); err != nil {
-		t.Fatalf("stamp identity: %v", err)
-	}
-	if err := validateMigratedTemplate(template); err == nil {
-		t.Fatal("validation blessed a stale database carrying a current identity sidecar")
-	}
-
-	// And the recovery path still works: rebuild, then validate.
-	if err := ensureMigratedTemplate(template); err != nil {
-		t.Fatalf("rebuild after stale detection: %v", err)
-	}
-	if err := validateMigratedTemplate(template); err != nil {
-		t.Fatalf("validate rebuilt template: %v", err)
-	}
-}
+// The observable contract it cared about — a database whose contents diverge from
+// the current migrations must be rejected — is covered by
+// TestValidationRejectsDivergedSchema, which drops a table and asserts rejection
+// through the public surface. Deleting a test because its scenario became
+// unconstructible is only honest if something still covers the contract; that is
+// why the pointer is here rather than a silent removal.
 
 func TestEnsureMigratedTemplateReplacesWrongAutoVacuum(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "schema.db")
@@ -409,9 +374,9 @@ func TestPublishOrderSurvivesCrashBetweenRenames(t *testing.T) {
 	template := filepath.Join(t.TempDir(), "schema.db")
 
 	crash := errors.New("simulated crash between publishes")
-	previous := afterTemplatePublish
-	afterTemplatePublish = func() error { return crash }
-	t.Cleanup(func() { afterTemplatePublish = previous })
+	previous := db.AfterTestTemplatePublish
+	db.AfterTestTemplatePublish = func() error { return crash }
+	t.Cleanup(func() { db.AfterTestTemplatePublish = previous })
 
 	if err := ensureMigratedTemplate(template); !errors.Is(err, crash) {
 		t.Fatalf("ensureMigratedTemplate error = %v, want the simulated crash", err)
@@ -428,7 +393,7 @@ func TestPublishOrderSurvivesCrashBetweenRenames(t *testing.T) {
 	}
 
 	// Recovery: a normal run rebuilds and stamps.
-	afterTemplatePublish = previous
+	db.AfterTestTemplatePublish = previous
 	if err := ensureMigratedTemplate(template); err != nil {
 		t.Fatalf("rebuild after crash: %v", err)
 	}

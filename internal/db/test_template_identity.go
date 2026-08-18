@@ -31,17 +31,46 @@ import (
 // fingerprint.
 func TestTemplateIdentityPath(path string) string { return path + ".fingerprint" }
 
-// StampTestTemplateIdentity records the full migration fingerprint beside a
-// published template, via create-temp + rename so a reader never observes a
-// partial value.
+// AfterTestTemplatePublish runs between publishing the database and stamping its
+// identity. Production behaviour is a no-op; tests replace it to simulate a crash
+// in that window, which is the only way to observe the publication ORDER — a
+// completed publish is consistent either way round.
+var AfterTestTemplatePublish = func() error { return nil }
+
+// PublishMigratedTestTemplate moves a freshly migrated database into the shared
+// cache path and stamps its identity, as ONE operation.
 //
-// ORDER MATTERS: callers MUST publish the database first and stamp afterwards.
-// The sidecar vouches for the database, so it has to land second. Stamping first
-// leaves a crash window in which a NEW fingerprint vouches for the OLD database
-// still sitting at the path — validation then blesses a stale schema. Publishing
-// the database first means a crash leaves a database with no (or a mismatched)
-// sidecar, which fails validation and costs only a rebuild.
-func StampTestTemplateIdentity(path string) error {
+// It is deliberately not two exported steps. An exported bare "stamp" launders
+// provenance: it records the CURRENT fingerprint beside whatever file happens to
+// sit at the path, so any future caller (or a mis-ordered refactor) could
+// authenticate a database the current migrations never produced. Measured before
+// this change: re-stamping an existing file made it validate clean. Requiring the
+// caller to hand over the temp file it just built means the stamped database is,
+// by construction, the one that was migrated.
+//
+// ORDER MATTERS and is now internal: the database is published FIRST and stamped
+// second. The sidecar vouches for the database, so it has to land second.
+// Stamping first leaves a crash window in which a NEW fingerprint vouches for the
+// OLD database still sitting at the path, and validation then blesses a stale
+// schema. This way a crash leaves a database with no (or a mismatched) sidecar,
+// which fails validation and costs only a rebuild.
+func PublishMigratedTestTemplate(tempPath, path string) error {
+	if err := os.Rename(tempPath, path); err != nil {
+		if validateErr := ValidateTestTemplateIdentity(path); validateErr == nil {
+			return nil
+		}
+		return fmt.Errorf("publish test schema template: %w", err)
+	}
+	if err := AfterTestTemplatePublish(); err != nil {
+		return err
+	}
+	return stampTestTemplateIdentity(path)
+}
+
+// stampTestTemplateIdentity records the identity beside an already-published
+// template, via create-temp + rename so a reader never observes a partial value.
+// Unexported on purpose — see PublishMigratedTestTemplate.
+func stampTestTemplateIdentity(path string) error {
 	temp, err := os.CreateTemp(filepath.Dir(path), ".gitmoot-test-schema-id-*")
 	if err != nil {
 		return fmt.Errorf("create test schema identity sidecar: %w", err)

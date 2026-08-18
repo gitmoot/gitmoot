@@ -89,42 +89,11 @@ func ensureMigratedTemplate(path string) error {
 		return fmt.Errorf("close migrated test schema template: %w", err)
 	}
 
-	// The unique file is complete and closed before it becomes visible at the
-	// shared cache path. Concurrent test binaries may race here; each candidate
-	// is complete, and rename is atomic because both names share a directory.
-	if err := os.Rename(tempPath, path); err != nil {
-		if validateErr := validateMigratedTemplate(path); validateErr == nil {
-			return nil
-		}
-		return fmt.Errorf("publish test schema template: %w", err)
-	}
-
-	// Seam between the two publishes, so the ORDER itself is testable. A plain
-	// test cannot reach this window: whatever order the two renames happen in, a
-	// completed build ends up consistent. Only an interruption BETWEEN them
-	// distinguishes correct order from inverted, and this hook is how a test
-	// simulates that interruption. See TestPublishOrderSurvivesCrashBetweenRenames.
-	if err := afterTemplatePublish(); err != nil {
-		return err
-	}
-
-	// Stamp identity AFTER the database is published, never before. The sidecar
-	// vouches for the database, so publishing it first leaves a crash window in
-	// which a NEW fingerprint blesses the OLD database still at this path, and
-	// validation then accepts a stale schema. This order means a crash leaves a
-	// database whose sidecar is absent or mismatched, which fails validation and
-	// costs a rebuild. (Round-4 review found the reverse order; it was mine.)
-	//
-	// The helper lives in package db so the in-package cache in internal/db's own
-	// tests — which cannot import this package without an import cycle — shares
-	// exactly this logic against the same shared template path.
-	return db.StampTestTemplateIdentity(path)
+	// Publish and stamp as ONE operation: package db owns the order, and requiring
+	// the freshly built temp file means the stamped database is by construction the
+	// one that was migrated. An exported bare stamp would launder provenance.
+	return db.PublishMigratedTestTemplate(tempPath, path)
 }
-
-// afterTemplatePublish runs between publishing the database and stamping its
-// identity. Production behaviour is a no-op; tests replace it to simulate a
-// crash in that window.
-var afterTemplatePublish = func() error { return nil }
 
 func validateMigratedTemplate(path string) error {
 	dsn := &url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro&immutable=1"}
