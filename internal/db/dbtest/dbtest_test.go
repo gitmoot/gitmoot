@@ -185,6 +185,34 @@ func TestEnsureMigratedTemplateReplacesWrongAutoVacuum(t *testing.T) {
 	}
 }
 
+func TestEnsureMigratedTemplateReplacesIncompleteMigrationBookkeeping(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "schema.db")
+	if err := ensureMigratedTemplate(path); err != nil {
+		t.Fatalf("create valid template: %v", err)
+	}
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open template: %v", err)
+	}
+	if _, err := raw.Exec(`DELETE FROM schema_migrations WHERE version = (SELECT MAX(version) FROM schema_migrations)`); err != nil {
+		raw.Close()
+		t.Fatalf("remove migration bookkeeping: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close incomplete template: %v", err)
+	}
+
+	if err := ensureMigratedTemplate(path); err != nil {
+		t.Fatalf("repair incomplete template: %v", err)
+	}
+	if err := validateMigratedTemplate(path); err != nil {
+		t.Fatalf("validate repaired template: %v", err)
+	}
+	if got, want := len(readSchemaSnapshot(t, path).migrationVersions), db.SchemaMigrationCount(); got != want {
+		t.Fatalf("repaired migration count = %d, want %d", got, want)
+	}
+}
+
 func readSchemaSnapshot(t *testing.T, path string) schemaSnapshot {
 	t.Helper()
 	raw := openRaw(t, path)
