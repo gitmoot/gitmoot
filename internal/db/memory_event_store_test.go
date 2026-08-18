@@ -12,7 +12,11 @@ import (
 
 func TestMemoryEventsMigrationFreshAndUpgradeConverge(t *testing.T) {
 	ctx := context.Background()
-	fresh := openMemTestStore(t)
+	fresh, err := Open(filepath.Join(t.TempDir(), "fresh.db"))
+	if err != nil {
+		t.Fatalf("open fresh store: %v", err)
+	}
+	t.Cleanup(func() { _ = fresh.Close() })
 	for _, name := range []string{"memory_events", "idx_memory_events_at", "idx_memory_events_memory_id"} {
 		if ok, err := fresh.tableExists(ctx, name); err != nil || !ok {
 			t.Fatalf("fresh %s exists=%v err=%v", name, ok, err)
@@ -146,7 +150,11 @@ func TestMemoryEventRollbackFollowsMutationTransaction(t *testing.T) {
 
 func TestMemoryEventBackfillLiveShapeIsIdempotent(t *testing.T) {
 	ctx := context.Background()
-	store := openMemTestStore(t)
+	store, err := Open(filepath.Join(t.TempDir(), "memory.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
 	active := mustUpsert(t, store, ConfirmedMemory{Owner: agentOwner("builder"), Key: "active", Content: "active"})
 	retired := mustUpsert(t, store, ConfirmedMemory{Owner: agentOwner("builder"), Key: "retired", Content: "retired"})
 	superseded := mustUpsert(t, store, ConfirmedMemory{Owner: agentOwner("builder"), Key: "superseded", Content: "superseded"})
@@ -191,7 +199,11 @@ DELETE FROM memory_events`, retired, active, superseded); err != nil {
 // the missing halves for pre-journal rows.
 func TestMemoryEventBackfillMixedLiveHistory(t *testing.T) {
 	ctx := context.Background()
-	store := openMemTestStore(t)
+	store, err := Open(filepath.Join(t.TempDir(), "memory.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
 
 	// Pre-journal rows: born before the feature (journal wiped for them only).
 	preActive := mustUpsert(t, store, ConfirmedMemory{Owner: agentOwner("builder"), Key: "pre-active", Content: "a"})

@@ -34,7 +34,8 @@ func TestTemplateIdentityPath(path string) string { return path + ".fingerprint"
 // MigratedTestTemplatePath returns the shared cache path for the current Unix
 // user. Test templates and their sidecars are intentionally owner-only, so a
 // global name in a shared temporary directory lets the first user block every
-// other user from rebuilding the cache.
+// other user from rebuilding the cache. The UID prevents accidental cross-user
+// collisions; it is not a security boundary against deliberate path planting.
 func MigratedTestTemplatePath(tempDir string) string {
 	fingerprint := SchemaMigrationFingerprint()
 	return filepath.Join(tempDir, fmt.Sprintf("gitmoot-test-schema-%d-%s.db", os.Getuid(), fingerprint[:12]))

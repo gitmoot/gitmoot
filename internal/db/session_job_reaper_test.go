@@ -137,7 +137,11 @@ func TestReapGhostSessionJobsZeroDisablesOnlyAgeFallback(t *testing.T) {
 }
 
 func TestBackfillGhostSessionJobsReusesReaperAndIsIdempotent(t *testing.T) {
-	store := openWorkflowTestStore(t)
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
 	ctx := context.Background()
 	old := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 	recent := time.Now().UTC()
