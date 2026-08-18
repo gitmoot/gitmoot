@@ -15,9 +15,9 @@
 // ParseImplemented alone still compiles and then fails closed at consumption. If
 // P2 extends Consume with a required positional builder, that signature change
 // will make its existing callers fail to compile until they supply it. Adapter
-// builds without a selector retain the Local default. Selection does not yet gate
-// job-associated subprocess execution; closing that gap before P2 is tracked by
-// #1560.
+// builds without a selector retain the Local default. Job-associated subprocess
+// execution consumes its resolved selection through Consume and fails closed
+// when the backend has no execution implementation.
 package execbackend
 
 import (
