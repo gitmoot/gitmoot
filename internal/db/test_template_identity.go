@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Test-schema template identity, shared by BOTH cache implementations.
@@ -113,9 +114,12 @@ func PublishMigratedTestTemplate(tempPath, path string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if err := validateMigratedTestTemplate(tempPath, stamp); err != nil {
+		return false, fmt.Errorf("validate test schema template candidate: %w", err)
+	}
 
 	if err := os.Rename(tempPath, path); err != nil {
-		if validateErr := ValidateTestTemplateIdentity(path); validateErr == nil {
+		if validateErr := ValidateMigratedTestTemplate(path); validateErr == nil {
 			return true, nil
 		}
 		return false, fmt.Errorf("publish test schema template: %w", err)
@@ -135,7 +139,7 @@ func PublishMigratedTestTemplate(tempPath, path string) (bool, error) {
 		return false, err
 	}
 	if current != stamp {
-		if validateErr := ValidateTestTemplateIdentity(path); validateErr == nil {
+		if validateErr := ValidateMigratedTestTemplate(path); validateErr == nil {
 			return true, nil
 		}
 		// Another process replaced our candidate but has not yet published its
@@ -143,6 +147,11 @@ func PublishMigratedTestTemplate(tempPath, path string) (bool, error) {
 		// unauthenticated while letting the caller rebuild in this same Open call;
 		// treating this ordinary publication race as a hard error would otherwise
 		// poison a process-wide schema cache.
+		return false, nil
+	}
+	if err := validateMigratedTestTemplate(path, stamp); err != nil {
+		// The candidate changed without changing its schema, for example by
+		// acquiring application rows. Do not stamp it; the caller will rebuild.
 		return false, nil
 	}
 	if err := stampTestTemplateIdentityWith(path, stamp); err != nil {
@@ -208,9 +217,10 @@ func ValidateTestTemplateIdentity(path string) error {
 
 // ValidateMigratedTestTemplate enforces the complete cache contract: the file
 // must be a healthy SQLite database, carry the fresh-database page metadata,
-// record every current migration, and match its published migration/schema
-// identity. SnapshotMigratedTestTemplate applies the same checks to its private
-// byte copy so a pathname replacement cannot bypass any part of this contract.
+// record every current migration, contain no application rows, and match its
+// published migration/schema identity. SnapshotMigratedTestTemplate applies the
+// same checks to its private byte copy so a pathname replacement cannot bypass
+// any part of this contract.
 func ValidateMigratedTestTemplate(path string) error {
 	stamped, err := os.ReadFile(TestTemplateIdentityPath(path))
 	if err != nil {
@@ -253,6 +263,9 @@ func validateMigratedTestTemplate(path, stamped string) error {
 	if count != wantCount || minimum != 1 || maximum != wantCount {
 		return fmt.Errorf("cached test schema migration versions are count=%d range=%d..%d, want count=%d range=1..%d", count, minimum, maximum, wantCount, wantCount)
 	}
+	if err := validateTestTemplateApplicationTablesEmpty(raw); err != nil {
+		return err
+	}
 
 	got, err := testTemplateStampFromDB(raw)
 	if err != nil {
@@ -260,6 +273,48 @@ func validateMigratedTestTemplate(path, stamped string) error {
 	}
 	if got != stamped {
 		return fmt.Errorf("cached test schema identity is %q, want %q", stamped, got)
+	}
+	return nil
+}
+
+func validateTestTemplateApplicationTablesEmpty(raw *sql.DB) error {
+	rows, err := raw.QueryContext(context.Background(), `
+		SELECT name
+		FROM pragma_table_list
+		WHERE schema = 'main'
+			AND type IN ('table', 'virtual')
+			AND name <> 'schema_migrations'
+			AND name NOT LIKE 'sqlite_%'
+		ORDER BY name`)
+	if err != nil {
+		return fmt.Errorf("list cached test schema application tables: %w", err)
+	}
+	var tables []string
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan cached test schema application table: %w", err)
+		}
+		tables = append(tables, table)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close cached test schema application tables: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate cached test schema application tables: %w", err)
+	}
+
+	for _, table := range tables {
+		identifier := `"` + strings.ReplaceAll(table, `"`, `""`) + `"`
+		var populated int
+		if err := raw.QueryRowContext(context.Background(),
+			fmt.Sprintf(`SELECT EXISTS(SELECT 1 FROM %s LIMIT 1)`, identifier)).Scan(&populated); err != nil {
+			return fmt.Errorf("check cached test schema application table %q: %w", table, err)
+		}
+		if populated != 0 {
+			return fmt.Errorf("cached test schema application table %q is not empty", table)
+		}
 	}
 	return nil
 }

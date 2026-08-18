@@ -342,6 +342,24 @@ func TestSnapshotPreservesFullTemplateValidationContract(t *testing.T) {
 			},
 			want: "migration versions",
 		},
+		{
+			name: "application_rows",
+			mutate: func(t *testing.T, path string) {
+				t.Helper()
+				store, err := db.OpenAlreadyMigrated(path)
+				if err != nil {
+					t.Fatalf("open template for application row: %v", err)
+				}
+				if err := store.CreateJob(context.Background(), db.Job{ID: "seeded", Agent: "worker", Type: "ask", State: "queued"}); err != nil {
+					_ = store.Close()
+					t.Fatalf("seed template application row: %v", err)
+				}
+				if err := store.Close(); err != nil {
+					t.Fatalf("close template after application row: %v", err)
+				}
+			},
+			want: "application table \"jobs\" is not empty",
+		},
 	}
 
 	for _, test := range tests {
@@ -352,7 +370,7 @@ func TestSnapshotPreservesFullTemplateValidationContract(t *testing.T) {
 			}
 			test.mutate(t, path)
 
-			// Both mutations leave sqlite_master unchanged, so the published
+			// These mutations leave sqlite_master unchanged, so the published
 			// fingerprint plus schema digest still matches. The snapshot must retain
 			// the rest of the template-validation contract as well.
 			if err := db.ValidateTestTemplateIdentity(path); err != nil {
@@ -362,6 +380,39 @@ func TestSnapshotPreservesFullTemplateValidationContract(t *testing.T) {
 				t.Fatalf("snapshot error = %v, want rejection containing %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestOpenRebuildsCachedTemplateContainingApplicationRows(t *testing.T) {
+	template := isolateMigratedTemplateCache(t)
+	if err := ensureMigratedTemplate(template); err != nil {
+		t.Fatalf("build template: %v", err)
+	}
+	seed, err := db.OpenAlreadyMigrated(template)
+	if err != nil {
+		t.Fatalf("open template for seeding: %v", err)
+	}
+	if err := seed.CreateJob(context.Background(), db.Job{ID: "contaminant", Agent: "worker", Type: "ask", State: "queued"}); err != nil {
+		_ = seed.Close()
+		t.Fatalf("seed cached template: %v", err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("close seeded template: %v", err)
+	}
+	if err := db.ValidateTestTemplateIdentity(template); err != nil {
+		t.Fatalf("schema identity changed after inserting an application row: %v", err)
+	}
+
+	store, err := Open(t, filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("Open with contaminated persistent template: %v", err)
+	}
+	defer store.Close()
+	if _, err := store.GetJob(context.Background(), "contaminant"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetJob(contaminant) error = %v, want sql.ErrNoRows", err)
+	}
+	if err := validateMigratedTemplate(template); err != nil {
+		t.Fatalf("validate rebuilt persistent template: %v", err)
 	}
 }
 
@@ -687,6 +738,56 @@ func TestOpenRetriesSingleLostPublicationRace(t *testing.T) {
 	}
 	if err := validateMigratedTemplate(template); err != nil {
 		t.Fatalf("validate template rebuilt in same Open: %v", err)
+	}
+}
+
+func TestOpenRetriesApplicationRowPublicationRace(t *testing.T) {
+	template := isolateMigratedTemplateCache(t)
+	contaminated := filepath.Join(t.TempDir(), "contaminated.db")
+	if err := ensureMigratedTemplate(contaminated); err != nil {
+		t.Fatalf("build replacement template: %v", err)
+	}
+	seed, err := db.OpenAlreadyMigrated(contaminated)
+	if err != nil {
+		t.Fatalf("open replacement template for seeding: %v", err)
+	}
+	if err := seed.CreateJob(context.Background(), db.Job{ID: "contaminant", Agent: "worker", Type: "ask", State: "queued"}); err != nil {
+		_ = seed.Close()
+		t.Fatalf("seed replacement template: %v", err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("close replacement template: %v", err)
+	}
+	replacement, err := os.ReadFile(contaminated)
+	if err != nil {
+		t.Fatalf("read replacement template: %v", err)
+	}
+
+	previous := db.AfterTestTemplatePublish
+	hookCalls := 0
+	db.AfterTestTemplatePublish = func() error {
+		hookCalls++
+		if hookCalls != 1 {
+			return nil
+		}
+		return os.WriteFile(template, replacement, 0o600)
+	}
+	t.Cleanup(func() { db.AfterTestTemplatePublish = previous })
+
+	store, err := Open(t, filepath.Join(t.TempDir(), "store.db"))
+	db.AfterTestTemplatePublish = previous
+	if err != nil {
+		t.Fatalf("Open after same-schema application-row replacement: %v", err)
+	}
+	defer store.Close()
+	if hookCalls != 2 {
+		t.Fatalf("publication hook calls = %d, want 2 (contaminated race plus in-call rebuild)", hookCalls)
+	}
+	if _, err := store.GetJob(context.Background(), "contaminant"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetJob(contaminant) error = %v, want sql.ErrNoRows", err)
+	}
+	if err := validateMigratedTemplate(template); err != nil {
+		t.Fatalf("validate template rebuilt after same-schema replacement: %v", err)
 	}
 }
 

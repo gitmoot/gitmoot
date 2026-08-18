@@ -210,6 +210,54 @@ func TestCachedStoreCopiesAuthenticatedSnapshotAfterSharedTemplateChanges(t *tes
 	}
 }
 
+func TestOpenCachedTestStoreRebuildsTemplateContainingApplicationRows(t *testing.T) {
+	cacheRoot := t.TempDir()
+	t.Setenv("TMPDIR", cacheRoot)
+	cachedTestTemplateMu.Lock()
+	cachedTestTemplateReady = false
+	cachedTestTemplatePath = ""
+	cachedTestTemplateSnapshot = nil
+	cachedTestTemplateMu.Unlock()
+	t.Cleanup(func() {
+		cachedTestTemplateMu.Lock()
+		cachedTestTemplateReady = false
+		cachedTestTemplatePath = ""
+		cachedTestTemplateSnapshot = nil
+		cachedTestTemplateMu.Unlock()
+	})
+
+	template := MigratedTestTemplatePath(cacheRoot)
+	if err := ensureCachedMigratedTestTemplate(template); err != nil {
+		t.Fatalf("build cached template: %v", err)
+	}
+	seed, err := OpenAlreadyMigrated(template)
+	if err != nil {
+		t.Fatalf("open cached template for seeding: %v", err)
+	}
+	if err := seed.CreateJob(context.Background(), Job{ID: "contaminant", Agent: "worker", Type: "ask", State: "queued"}); err != nil {
+		_ = seed.Close()
+		t.Fatalf("seed cached template: %v", err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("close seeded cached template: %v", err)
+	}
+	if err := ValidateTestTemplateIdentity(template); err != nil {
+		t.Fatalf("schema identity changed after inserting an application row: %v", err)
+	}
+
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("openCachedTestStore with contaminated persistent template: %v", err)
+	}
+	defer store.Close()
+	if _, err := store.GetJob(context.Background(), "contaminant"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetJob(contaminant) error = %v, want sql.ErrNoRows", err)
+	}
+	if err := validateCachedMigratedTestTemplate(template); err != nil {
+		t.Fatalf("validate rebuilt cached template: %v", err)
+	}
+}
+
 func TestEnsureCachedMigratedTestTemplateReplacesInvalidRegularFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "schema.db")
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
