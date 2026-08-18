@@ -10,10 +10,12 @@
 // Provision/SyncIn/Exec/Collect/Destroy lifecycle from the P0 contract lands
 // with the first real backend (P2); this package only names the selector.
 // Selection gates runtime adapter construction: every construction route
-// funnels through Consume, whose positional builders make adding a backend to
-// ParseImplemented without its builder a compile failure. Selection does not
-// yet gate job-associated subprocess execution; closing that gap before P2 is
-// tracked by #1560.
+// funnels through Consume, whose only positive implementation is Local; any
+// other parsed backend is refused at runtime. P2 must extend Consume with a
+// positional builder, and that signature change will make existing construction
+// routes fail to compile until they supply it. Selection does not yet gate
+// job-associated subprocess execution; closing that gap before P2 is tracked by
+// #1560.
 package execbackend
 
 import (
