@@ -41,7 +41,7 @@ go vet ./...
 go test -timeout 25m ./...
 
 # Race gate is scoped (not ./...). Use CI's package shard counts and its
-# deterministic fallback partitioner so no growing package hits one monolithic
+# deterministic alternating partitioner so no growing package hits one monolithic
 # timeout. Each compiled binary covers every package test exactly once.
 (
   set -e
