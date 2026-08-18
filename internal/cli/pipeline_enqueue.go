@@ -36,14 +36,13 @@ func pipelineStageCheckoutPath(ctx context.Context, store *db.Store, repo string
 func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueuer {
 	mailbox := workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(home), RuntimeDefaultModel: runtimeDefaultModelResolver(home), RequireWorkflowPolicy: requireWorkflowPolicyResolver(home), OrgPolicy: orgPolicyResolver(home)}
 	return func(ctx context.Context, request workflow.JobRequest) (db.Job, error) {
-		var runner subprocess.Runner = subprocess.ExecRunner{}
-		backend, backendErr := localAgentDispatchExecBackendFor(home)
-		if backendErr == nil {
-			var err error
-			runner, err = jobSubprocessRunnerForBackend(backend)
-			if err != nil {
-				return db.Job{}, err
-			}
+		backend, err := localAgentDispatchExecBackendFor(home)
+		if err != nil {
+			return db.Job{}, err
+		}
+		runner, err := jobSubprocessRunnerForBackend(backend)
+		if err != nil {
+			return db.Job{}, err
 		}
 		// #1011 service shell stages are an explicit fail-CLOSED exception to the
 		// generic read-only allocator below. Their run row is authoritative: every

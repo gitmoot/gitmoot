@@ -159,7 +159,8 @@ func TestExecBackendLocalExplicitDaemonE2E(t *testing.T) {
 
 // TestExecBackendUnknownFailsLoudDaemonE2E is ACCEPTANCE 3: an unknown
 // backend — "e2b" (not implemented until P5) and the typo "loca" — FAILS LOUD
-// at dispatch naming the value AND the allowed set; the job never runs.
+// at background dispatch naming the value AND the allowed set; no pre-enqueue
+// git preparation or job execution is allowed to run on the host.
 func TestExecBackendUnknownFailsLoudDaemonE2E(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -170,46 +171,43 @@ func TestExecBackendUnknownFailsLoudDaemonE2E(t *testing.T) {
 		{name: "explicit blank", value: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
 			marker := filepath.Join(t.TempDir(), "must-not-run")
 			home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
 			execBackendAppendConfig(t, home, "\n[remote_exec]\nbackend = \""+tc.value+"\"\n")
-			jobID := execBackendDispatchAsk(t, home)
-			execBackendRunOneTick(t, home, store)
+
+			var out, errBuf bytes.Buffer
+			code := Run([]string{
+				"agent", "ask", "shell-asker", "exec backend background probe",
+				"--home", home,
+				"--repo", "owner/repo",
+				"--background",
+				"--json",
+			}, &out, &errBuf)
+			if code == 0 {
+				t.Fatalf("background ask exit = 0, output=%s; want loud backend refusal", out.String())
+			}
 
 			if _, err := os.Stat(marker); !os.IsNotExist(err) {
 				t.Fatalf("adapter ran with an unknown backend (marker err=%v)", err)
 			}
-			job, err := store.GetJob(ctx, jobID)
+			jobs, err := store.ListJobs(context.Background())
 			if err != nil {
-				t.Fatalf("GetJob: %v", err)
+				t.Fatalf("ListJobs: %v", err)
 			}
-			if job.State != string(workflow.JobFailed) {
-				t.Fatalf("job state = %q, want failed", job.State)
-			}
-			events, err := store.ListJobEvents(ctx, jobID)
-			if err != nil {
-				t.Fatalf("ListJobEvents: %v", err)
-			}
-			var failedMessage string
-			for _, event := range events {
-				if event.Kind == "running" {
-					t.Fatalf("job reached running with an unknown backend: %+v", event)
-				}
-				if event.Kind == string(workflow.JobFailed) {
-					failedMessage = event.Message
-				}
+			if len(jobs) != 0 {
+				t.Fatalf("jobs = %+v, want no enqueued row after background preflight refusal", jobs)
 			}
 			// The loud error must name the offending value AND the allowed set
 			// AND its config source — not just be a non-zero exit.
+			failedMessage := errBuf.String()
 			if !strings.Contains(failedMessage, `"`+tc.value+`"`) {
-				t.Fatalf("failed event = %q, want it to name %q", failedMessage, tc.value)
+				t.Fatalf("dispatch error = %q, want it to name %q", failedMessage, tc.value)
 			}
 			if !strings.Contains(failedMessage, "allowed: local") {
-				t.Fatalf("failed event = %q, want the allowed set named", failedMessage)
+				t.Fatalf("dispatch error = %q, want the allowed set named", failedMessage)
 			}
 			if !strings.Contains(failedMessage, "[remote_exec].backend") {
-				t.Fatalf("failed event = %q, want the config key named", failedMessage)
+				t.Fatalf("dispatch error = %q, want the config key named", failedMessage)
 			}
 		})
 	}

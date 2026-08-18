@@ -176,19 +176,11 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	var foregroundAdapterFactory foregroundRuntimeAdapterFactory
 	execBackend, err := localAgentDispatchExecBackendFor(request.Home)
 	if err != nil {
-		if !request.Background {
-			return localAgentJobOutput{}, err
-		}
-		// Preserve background dispatch's durable fail-loud contract: invalid
-		// configuration is recorded by the claiming worker on the queued job. The
-		// ingress-only checkout preparation is explicitly host-side in this case;
-		// the invalid selection can never reach job execution.
-		request.jobRunner = subprocess.ExecRunner{}
-	} else {
-		request.jobRunner, err = jobSubprocessRunnerForBackend(execBackend)
-		if err != nil {
-			return localAgentJobOutput{}, err
-		}
+		return localAgentJobOutput{}, err
+	}
+	request.jobRunner, err = jobSubprocessRunnerForBackend(execBackend)
+	if err != nil {
+		return localAgentJobOutput{}, err
 	}
 	if !request.Background {
 		foregroundAdapterFactory, err = foregroundRuntimeAdapterFactoryFor(execBackend)
