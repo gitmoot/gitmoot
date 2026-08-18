@@ -360,6 +360,30 @@ func TestSnapshotPreservesFullTemplateValidationContract(t *testing.T) {
 			},
 			want: "application table \"jobs\" is not empty",
 		},
+		{
+			name: "migration_bookkeeping_content",
+			mutate: func(t *testing.T, path string) {
+				t.Helper()
+				raw := openRaw(t, path)
+				defer raw.Close()
+				if _, err := raw.Exec(`UPDATE schema_migrations SET applied_at = 'modified' WHERE version = 1`); err != nil {
+					t.Fatalf("modify migration bookkeeping content: %v", err)
+				}
+			},
+			want: "identity",
+		},
+		{
+			name: "sqlite_internal_state",
+			mutate: func(t *testing.T, path string) {
+				t.Helper()
+				raw := openRaw(t, path)
+				defer raw.Close()
+				if _, err := raw.Exec(`INSERT INTO sqlite_sequence(name, seq) VALUES ('jobs', 99)`); err != nil {
+					t.Fatalf("modify SQLite internal state: %v", err)
+				}
+			},
+			want: "identity",
+		},
 	}
 
 	for _, test := range tests {
@@ -370,11 +394,10 @@ func TestSnapshotPreservesFullTemplateValidationContract(t *testing.T) {
 			}
 			test.mutate(t, path)
 
-			// These mutations leave sqlite_master unchanged, so the published
-			// fingerprint plus schema digest still matches. The snapshot must retain
-			// the rest of the template-validation contract as well.
-			if err := db.ValidateTestTemplateIdentity(path); err != nil {
-				t.Fatalf("identity-only validation unexpectedly failed: %v", err)
+			// The persistent identity binds the complete database file, while snapshot
+			// validation must also retain the more specific semantic diagnostics.
+			if err := db.ValidateTestTemplateIdentity(path); err == nil {
+				t.Fatal("identity validation accepted modified template bytes")
 			}
 			if _, err := db.SnapshotMigratedTestTemplate(path); err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("snapshot error = %v, want rejection containing %q", err, test.want)
@@ -399,8 +422,8 @@ func TestOpenRebuildsCachedTemplateContainingApplicationRows(t *testing.T) {
 	if err := seed.Close(); err != nil {
 		t.Fatalf("close seeded template: %v", err)
 	}
-	if err := db.ValidateTestTemplateIdentity(template); err != nil {
-		t.Fatalf("schema identity changed after inserting an application row: %v", err)
+	if err := db.ValidateTestTemplateIdentity(template); err == nil {
+		t.Fatal("identity validation accepted a template containing an application row")
 	}
 
 	store, err := Open(t, filepath.Join(t.TempDir(), "store.db"))
@@ -546,7 +569,7 @@ func TestPublishOrderSurvivesCrashBetweenRenames(t *testing.T) {
 }
 
 // TestValidationRejectsDivergedSchema pins the SECOND half of a template's
-// identity: the schema digest.
+// identity: the complete database-file digest.
 //
 // The migration fingerprint says WHICH ordered set built the template. It cannot
 // say whether the file still contains what that set produces. Drop a table and

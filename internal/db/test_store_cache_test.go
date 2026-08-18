@@ -241,8 +241,8 @@ func TestOpenCachedTestStoreRebuildsTemplateContainingApplicationRows(t *testing
 	if err := seed.Close(); err != nil {
 		t.Fatalf("close seeded cached template: %v", err)
 	}
-	if err := ValidateTestTemplateIdentity(template); err != nil {
-		t.Fatalf("schema identity changed after inserting an application row: %v", err)
+	if err := ValidateTestTemplateIdentity(template); err == nil {
+		t.Fatal("identity validation accepted a template containing an application row")
 	}
 
 	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "store.db"))

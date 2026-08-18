@@ -29,7 +29,7 @@ import (
 // freshly migrated one, which is the equivalence the cache exists to preserve.
 
 // TestTemplateIdentityPath is the sidecar holding a template's full migration
-// fingerprint.
+// fingerprint and exact database-file digest.
 func TestTemplateIdentityPath(path string) string { return path + ".fingerprint" }
 
 // MigratedTestTemplatePath returns the shared cache path for the current Unix
@@ -186,8 +186,8 @@ func stampTestTemplateIdentityWith(path, stamp string) error {
 }
 
 // ValidateTestTemplateIdentity rejects a template whose stamp is absent, does not
-// name the current ordered migration set, or does not match the schema actually
-// present in the file.
+// name the current ordered migration set, or does not match the exact database
+// bytes currently present in the file.
 //
 // Two distinct checks, because two distinct things can be wrong:
 //
@@ -195,11 +195,10 @@ func stampTestTemplateIdentityWith(path, stamp string) error {
 //     set. schema_migrations records version NUMBERS, not content, so a set of the
 //     same cardinality satisfies an integrity check, an auto_vacuum check and a
 //     count/range check; the only other binding is a 48-bit filename prefix.
-//   - the SCHEMA DIGEST catches a template whose contents diverge from what those
-//     migrations produce. A dropped table leaves page integrity intact and the
-//     bookkeeping complete, so quick_check, auto_vacuum, count/range AND the
-//     fingerprint all pass while the schema is missing objects. Measured: before
-//     this digest existed, such a template validated clean.
+//   - the DATABASE DIGEST binds the sidecar to the complete checkpointed file,
+//     including schema, application rows, migration bookkeeping and SQLite page
+//     metadata. A schema-only digest allowed seeded application rows to retain a
+//     valid identity and contaminate every store copied from the persistent cache.
 func ValidateTestTemplateIdentity(path string) error {
 	stamped, err := os.ReadFile(TestTemplateIdentityPath(path))
 	if err != nil {
@@ -218,7 +217,7 @@ func ValidateTestTemplateIdentity(path string) error {
 // ValidateMigratedTestTemplate enforces the complete cache contract: the file
 // must be a healthy SQLite database, carry the fresh-database page metadata,
 // record every current migration, contain no application rows, and match its
-// published migration/schema identity. SnapshotMigratedTestTemplate applies the
+// published migration/database identity. SnapshotMigratedTestTemplate applies the
 // same checks to its private byte copy so a pathname replacement cannot bypass
 // any part of this contract.
 func ValidateMigratedTestTemplate(path string) error {
@@ -267,7 +266,7 @@ func validateMigratedTestTemplate(path, stamped string) error {
 		return err
 	}
 
-	got, err := testTemplateStampFromDB(raw)
+	got, err := testTemplateStamp(path)
 	if err != nil {
 		return err
 	}
@@ -320,36 +319,18 @@ func validateTestTemplateApplicationTablesEmpty(raw *sql.DB) error {
 }
 
 // testTemplateStamp is the identity a template must carry: the full ordered
-// migration fingerprint, plus a digest of the schema objects actually in the
-// file. Computed the same way at stamp time and at validation time, so the two
-// can never drift apart.
+// migration fingerprint, plus a digest of the exact checkpointed database file.
+// Computed the same way at stamp time and validation time, it detects every byte
+// change rather than only changes represented in sqlite_master.
 func testTemplateStamp(path string) (string, error) {
-	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro"}).String()
-	raw, err := sql.Open("sqlite", dsn)
+	file, err := os.Open(path)
 	if err != nil {
 		return "", fmt.Errorf("open test schema template for identity: %w", err)
 	}
-	defer raw.Close()
-	return testTemplateStampFromDB(raw)
-}
-
-func testTemplateStampFromDB(raw *sql.DB) (string, error) {
-	rows, err := raw.QueryContext(context.Background(),
-		`SELECT type, name, COALESCE(sql, '') FROM sqlite_master ORDER BY type, name`)
-	if err != nil {
-		return "", fmt.Errorf("read test schema objects: %w", err)
-	}
-	defer rows.Close()
+	defer file.Close()
 	digest := sha256.New()
-	for rows.Next() {
-		var kind, name, ddl string
-		if err := rows.Scan(&kind, &name, &ddl); err != nil {
-			return "", fmt.Errorf("scan test schema object: %w", err)
-		}
-		fmt.Fprintf(digest, "%s\x00%s\x00%s\x00", kind, name, ddl)
-	}
-	if err := rows.Err(); err != nil {
-		return "", fmt.Errorf("iterate test schema objects: %w", err)
+	if _, err := io.Copy(digest, file); err != nil {
+		return "", fmt.Errorf("hash test schema template: %w", err)
 	}
 	return SchemaMigrationFingerprint() + "\n" + hex.EncodeToString(digest.Sum(nil)), nil
 }
