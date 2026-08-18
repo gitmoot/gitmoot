@@ -436,3 +436,44 @@ func TestPublishOrderSurvivesCrashBetweenRenames(t *testing.T) {
 		t.Fatalf("validate rebuilt template: %v", err)
 	}
 }
+
+// TestValidationRejectsDivergedSchema pins the SECOND half of a template's
+// identity: the schema digest.
+//
+// The migration fingerprint says WHICH ordered set built the template. It cannot
+// say whether the file still contains what that set produces. Drop a table and
+// page integrity stays intact, schema_migrations stays complete, auto_vacuum is
+// unchanged and the fingerprint still matches — every other check passes. This
+// was MEASURED as accepted before the digest existed (claude round-4 probe), so
+// it is a regression test, not a hypothetical.
+func TestValidationRejectsDivergedSchema(t *testing.T) {
+	template := filepath.Join(t.TempDir(), "schema.db")
+	if err := ensureMigratedTemplate(template); err != nil {
+		t.Fatalf("build template: %v", err)
+	}
+	if err := validateMigratedTemplate(template); err != nil {
+		t.Fatalf("freshly built template must validate: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", template)
+	if err != nil {
+		t.Fatalf("open template: %v", err)
+	}
+	if _, err := raw.ExecContext(context.Background(), `DROP TABLE IF EXISTS seen_comments`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("drop a table: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close template: %v", err)
+	}
+
+	if err := validateMigratedTemplate(template); err == nil {
+		t.Fatal("validation accepted a template whose schema diverged from its migrations")
+	}
+	if err := ensureMigratedTemplate(template); err != nil {
+		t.Fatalf("rebuild after divergence: %v", err)
+	}
+	if err := validateMigratedTemplate(template); err != nil {
+		t.Fatalf("validate rebuilt template: %v", err)
+	}
+}

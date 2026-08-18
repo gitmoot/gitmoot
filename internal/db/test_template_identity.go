@@ -1,8 +1,13 @@
 package db
 
 import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 )
@@ -42,7 +47,13 @@ func StampTestTemplateIdentity(path string) error {
 		return fmt.Errorf("create test schema identity sidecar: %w", err)
 	}
 	tempPath := temp.Name()
-	if _, err := io.WriteString(temp, SchemaMigrationFingerprint()); err != nil {
+	stamp, err := testTemplateStamp(path)
+	if err != nil {
+		_ = temp.Close()
+		_ = os.Remove(tempPath)
+		return err
+	}
+	if _, err := io.WriteString(temp, stamp); err != nil {
 		_ = temp.Close()
 		_ = os.Remove(tempPath)
 		return fmt.Errorf("write test schema identity sidecar: %w", err)
@@ -58,20 +69,63 @@ func StampTestTemplateIdentity(path string) error {
 	return nil
 }
 
-// ValidateTestTemplateIdentity rejects a template whose stamped fingerprint is
-// absent or does not name the current ordered migration set.
+// ValidateTestTemplateIdentity rejects a template whose stamp is absent, does not
+// name the current ordered migration set, or does not match the schema actually
+// present in the file.
 //
-// This is the check that cardinality cannot make: schema_migrations records
-// version NUMBERS, not content, so a template built from a DIFFERENT set of the
-// same size satisfies an integrity check, an auto_vacuum check and a
-// count/range check. The only other binding is a 48-bit filename prefix.
+// Two distinct checks, because two distinct things can be wrong:
+//
+//   - the migration FINGERPRINT catches a template built from a different ordered
+//     set. schema_migrations records version NUMBERS, not content, so a set of the
+//     same cardinality satisfies an integrity check, an auto_vacuum check and a
+//     count/range check; the only other binding is a 48-bit filename prefix.
+//   - the SCHEMA DIGEST catches a template whose contents diverge from what those
+//     migrations produce. A dropped table leaves page integrity intact and the
+//     bookkeeping complete, so quick_check, auto_vacuum, count/range AND the
+//     fingerprint all pass while the schema is missing objects. Measured: before
+//     this digest existed, such a template validated clean.
 func ValidateTestTemplateIdentity(path string) error {
 	stamped, err := os.ReadFile(TestTemplateIdentityPath(path))
 	if err != nil {
 		return fmt.Errorf("read cached test schema identity: %w", err)
 	}
-	if got, want := string(stamped), SchemaMigrationFingerprint(); got != want {
+	want, err := testTemplateStamp(path)
+	if err != nil {
+		return err
+	}
+	if got := string(stamped); got != want {
 		return fmt.Errorf("cached test schema identity is %q, want %q", got, want)
 	}
 	return nil
+}
+
+// testTemplateStamp is the identity a template must carry: the full ordered
+// migration fingerprint, plus a digest of the schema objects actually in the
+// file. Computed the same way at stamp time and at validation time, so the two
+// can never drift apart.
+func testTemplateStamp(path string) (string, error) {
+	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro"}).String()
+	raw, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return "", fmt.Errorf("open test schema template for identity: %w", err)
+	}
+	defer raw.Close()
+	rows, err := raw.QueryContext(context.Background(),
+		`SELECT type, name, COALESCE(sql, '') FROM sqlite_master ORDER BY type, name`)
+	if err != nil {
+		return "", fmt.Errorf("read test schema objects: %w", err)
+	}
+	defer rows.Close()
+	digest := sha256.New()
+	for rows.Next() {
+		var kind, name, ddl string
+		if err := rows.Scan(&kind, &name, &ddl); err != nil {
+			return "", fmt.Errorf("scan test schema object: %w", err)
+		}
+		fmt.Fprintf(digest, "%s\x00%s\x00%s\x00", kind, name, ddl)
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("iterate test schema objects: %w", err)
+	}
+	return SchemaMigrationFingerprint() + "\n" + hex.EncodeToString(digest.Sum(nil)), nil
 }
