@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -41,8 +40,7 @@ func TestClaudeProduceHookAutoReadLandlockE2E(t *testing.T) {
 	inputDir := filepath.Join(base, "input")
 	outputDir := filepath.Join(base, "output")
 	workdir := filepath.Join(base, "work")
-	binDir := filepath.Join(base, "bin")
-	for _, dir := range []string{configDir, hookDir, siblingDir, inputDir, outputDir, workdir, binDir} {
+	for _, dir := range []string{configDir, hookDir, siblingDir, inputDir, outputDir, workdir} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -88,12 +86,7 @@ func TestClaudeProduceHookAutoReadLandlockE2E(t *testing.T) {
 		t.Fatalf("hook directory not auto-included: %v", agent.ReadablePaths)
 	}
 
-	gitmoot := filepath.Join(binDir, "gitmoot")
-	build := exec.Command("go", "build", "-buildvcs=false", "-o", gitmoot, "./cmd/gitmoot")
-	build.Dir = filepath.Join("..", "..")
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build gitmoot test binary: %v\n%s", err, output)
-	}
+	gitmoot := sharedGitmootTestBinary(t)
 	reads, readFiles, writes, env, err := produceRuntimeSandboxGrants(agent.Runtime, agent.ReadablePaths, agent.ReadableFiles, agent.WritablePaths)
 	if err != nil {
 		t.Fatal(err)

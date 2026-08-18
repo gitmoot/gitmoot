@@ -282,11 +282,13 @@ func TestReadOnlyWorktreeConcurrentAsksE2E(t *testing.T) {
 // conversation turn, and both turns plus both back-linked job_result conclusions
 // land in the thread.
 func TestMootConcurrentSeatsOnStaleBranchE2E(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := staleBranchGitCheckout(t, "owner/repo")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	bin := buildGitmootBinaryForTest(t)
+	bin := sharedGitmootTestBinary(t)
 
 	stateDir := t.TempDir()
 	// Each seat posts one real chat turn BEFORE the rendezvous, then clears the

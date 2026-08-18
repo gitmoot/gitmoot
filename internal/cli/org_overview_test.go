@@ -15,6 +15,8 @@ import (
 )
 
 func TestStoreOrgLiveSourcePersistedFreshness(t *testing.T) {
+	t.Parallel()
+
 	fresh := time.Now().UTC().Add(-time.Minute)
 	tests := []struct {
 		name       string

@@ -5,8 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -23,21 +21,6 @@ import (
 // home before returning its conclusions, and both the chat turns AND the
 // job_result conclusions land in the thread.
 
-// buildGitmootBinaryForTest compiles the gitmoot CLI once into the test's temp dir
-// so a shell-runtime seat can invoke `gitmoot chat send` as a real subprocess (the
-// ShellAdapter runs `sh -c <script> gitmoot <prompt>`, so the script needs a real
-// binary on disk). It uses the module import path, so the package cwd is enough for
-// `go` to resolve the module.
-func buildGitmootBinaryForTest(t *testing.T) string {
-	t.Helper()
-	bin := filepath.Join(t.TempDir(), "gitmoot")
-	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", bin, "github.com/gitmoot/gitmoot/cmd/gitmoot")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("build gitmoot binary: %v\n%s", err, out)
-	}
-	return bin
-}
-
 // TestMootConversationLoopE2E convenes a two-seat moot through the REAL command and
 // runs both seats on the REAL daemon worker. Each seat's script posts one chat turn
 // via a real `gitmoot chat send --as <self>` subprocess (embedding the home/repo/
@@ -50,11 +33,13 @@ func buildGitmootBinaryForTest(t *testing.T) string {
 // chat turn would target the wrong thread (the chat-turn assertion flips RED); gate
 // postChatThreadResult on the wrong field and the job_result assertion flips.
 func TestMootConversationLoopE2E(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := chatE2EGitCheckout(t, "owner/repo")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	bin := buildGitmootBinaryForTest(t)
+	bin := sharedGitmootTestBinary(t)
 
 	aliceResult := `{"gitmoot_result":{"decision":"approved","summary":"alice: know A, unsure B, would ask C","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
 	bobResult := `{"gitmoot_result":{"decision":"approved","summary":"bob: know P, unsure Q, would ask R","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`

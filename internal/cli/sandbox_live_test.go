@@ -4,7 +4,6 @@ import (
 	"context"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -41,12 +40,7 @@ func TestLiveKimiProduceLandlockState(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(base) })
 
-	binary := filepath.Join(base, "gitmoot")
-	build := exec.Command("go", "build", "-buildvcs=false", "-o", binary, "./cmd/gitmoot")
-	build.Dir = repoRoot
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build live shim: %v\n%s", err, output)
-	}
+	binary := sharedGitmootTestBinary(t)
 
 	home := filepath.Join(base, "home")
 	work := filepath.Join(base, "work")

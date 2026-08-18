@@ -3042,6 +3042,8 @@ func TestPolicyMergeGateDelegatedReviewEvidenceEnumeration(t *testing.T) {
 			for _, linkage := range linkages {
 				linkage := linkage
 				t.Run(linkage.name, func(t *testing.T) {
+					t.Parallel()
+
 					store, gh, gate, request := newMergeGateQuorumScenario(t)
 					parentID := fmt.Sprintf("review-parent-enumeration-%02d", rowIndex)
 					insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{

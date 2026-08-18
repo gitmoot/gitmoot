@@ -317,6 +317,8 @@ func TestResumeSelfDirtySkipsDirtyByOther(t *testing.T) {
 }
 
 func TestResumeSelfDirtyPredicate(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name     string
 		cause    func(selfDirtyResumeFixture) error
