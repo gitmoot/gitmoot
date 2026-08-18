@@ -1,11 +1,11 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"net/url"
 	"os"
@@ -15,38 +15,46 @@ import (
 )
 
 var (
-	cachedTestTemplateMu    sync.Mutex
-	cachedTestTemplateReady bool
-	cachedTestTemplatePath  string
-	cachedTestCopyLocks     sync.Map
+	cachedTestTemplateMu       sync.Mutex
+	cachedTestTemplateReady    bool
+	cachedTestTemplatePath     string
+	cachedTestTemplateSnapshot []byte
+	cachedTestCopyLocks        sync.Map
 )
 
 const cachedTestTemplatePublicationAttempts = 3
 
 func openCachedTestStore(t *testing.T, path string) (*Store, error) {
 	t.Helper()
-	template, err := cachedMigratedTestTemplate()
+	_, snapshot, err := cachedMigratedTestTemplate()
 	if err != nil {
 		return nil, err
 	}
-	if err := copyCachedTestTemplateIfMissing(template, path); err != nil {
+	if err := copyCachedTestTemplateSnapshotIfMissing(snapshot, path); err != nil {
 		return nil, err
 	}
 	return OpenAlreadyMigrated(path)
 }
 
-func cachedMigratedTestTemplate() (string, error) {
+func cachedMigratedTestTemplate() (string, []byte, error) {
 	cachedTestTemplateMu.Lock()
 	defer cachedTestTemplateMu.Unlock()
 	if cachedTestTemplateReady {
-		return cachedTestTemplatePath, nil
+		return cachedTestTemplatePath, cachedTestTemplateSnapshot, nil
 	}
 	cachedTestTemplatePath = MigratedTestTemplatePath(os.TempDir())
-	if err := ensureCachedMigratedTestTemplate(cachedTestTemplatePath); err != nil {
-		return cachedTestTemplatePath, err
+	var snapshotErr error
+	for attempt := 1; attempt <= cachedTestTemplatePublicationAttempts; attempt++ {
+		if err := ensureCachedMigratedTestTemplate(cachedTestTemplatePath); err != nil {
+			return cachedTestTemplatePath, nil, err
+		}
+		cachedTestTemplateSnapshot, snapshotErr = SnapshotMigratedTestTemplate(cachedTestTemplatePath)
+		if snapshotErr == nil {
+			cachedTestTemplateReady = true
+			return cachedTestTemplatePath, cachedTestTemplateSnapshot, nil
+		}
 	}
-	cachedTestTemplateReady = true
-	return cachedTestTemplatePath, nil
+	return cachedTestTemplatePath, nil, fmt.Errorf("snapshot migrated test template after %d attempts: %w", cachedTestTemplatePublicationAttempts, snapshotErr)
 }
 
 func ensureCachedMigratedTestTemplate(path string) error {
@@ -151,21 +159,92 @@ func TestCachedMigratedTemplateUsesCurrentUnixUserPath(t *testing.T) {
 	cachedTestTemplateMu.Lock()
 	cachedTestTemplateReady = false
 	cachedTestTemplatePath = ""
+	cachedTestTemplateSnapshot = nil
 	cachedTestTemplateMu.Unlock()
 	t.Cleanup(func() {
 		cachedTestTemplateMu.Lock()
 		cachedTestTemplateReady = false
 		cachedTestTemplatePath = ""
+		cachedTestTemplateSnapshot = nil
 		cachedTestTemplateMu.Unlock()
 	})
 
-	got, err := cachedMigratedTestTemplate()
+	got, _, err := cachedMigratedTestTemplate()
 	if err != nil {
 		t.Fatalf("build cached migrated template: %v", err)
 	}
 	want := filepath.Join(cacheRoot, fmt.Sprintf("gitmoot-test-schema-%d-%s.db", os.Getuid(), SchemaMigrationFingerprint()[:12]))
 	if got != want {
 		t.Fatalf("cached migrated template path = %q, want current-user path %q", got, want)
+	}
+}
+
+func replaceCachedTemplateWithForeignSQLite(t *testing.T, path string) {
+	t.Helper()
+	foreign := filepath.Join(t.TempDir(), "foreign.db")
+	raw, err := sql.Open("sqlite", foreign)
+	if err != nil {
+		t.Fatalf("open foreign SQLite database: %v", err)
+	}
+	if _, err := raw.ExecContext(context.Background(), `CREATE TABLE foreign_marker (id INTEGER PRIMARY KEY)`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("create foreign SQLite schema: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close foreign SQLite database: %v", err)
+	}
+	data, err := os.ReadFile(foreign)
+	if err != nil {
+		t.Fatalf("read foreign SQLite database: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("replace shared template: %v", err)
+	}
+}
+
+func TestCachedStoreCopiesAuthenticatedSnapshotAfterSharedTemplateChanges(t *testing.T) {
+	cacheRoot := t.TempDir()
+	t.Setenv("TMPDIR", cacheRoot)
+	cachedTestTemplateMu.Lock()
+	cachedTestTemplateReady = false
+	cachedTestTemplatePath = ""
+	cachedTestTemplateSnapshot = nil
+	cachedTestTemplateMu.Unlock()
+	t.Cleanup(func() {
+		cachedTestTemplateMu.Lock()
+		cachedTestTemplateReady = false
+		cachedTestTemplatePath = ""
+		cachedTestTemplateSnapshot = nil
+		cachedTestTemplateMu.Unlock()
+	})
+
+	template, snapshot, err := cachedMigratedTestTemplate()
+	if err != nil {
+		t.Fatalf("build cached migrated template snapshot: %v", err)
+	}
+	replaceCachedTemplateWithForeignSQLite(t, template)
+	if _, err := SnapshotMigratedTestTemplate(template); err == nil {
+		t.Fatal("replacement unexpectedly authenticated as a template snapshot")
+	}
+
+	destination := filepath.Join(t.TempDir(), "copied.db")
+	if err := copyCachedTestTemplateSnapshotIfMissing(snapshot, destination); err != nil {
+		t.Fatalf("copy authenticated snapshot: %v", err)
+	}
+	got, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatalf("read copied snapshot: %v", err)
+	}
+	if !bytes.Equal(got, snapshot) {
+		t.Fatal("copied database differs from the authenticated snapshot")
+	}
+
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "opened.db"))
+	if err != nil {
+		t.Fatalf("openCachedTestStore after shared template replacement: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close opened store: %v", err)
 	}
 }
 
@@ -227,7 +306,7 @@ func TestEnsureCachedMigratedTestTemplateRetriesLostPublicationRace(t *testing.T
 	}
 }
 
-func copyCachedTestTemplateIfMissing(template, path string) error {
+func copyCachedTestTemplateSnapshotIfMissing(snapshot []byte, path string) error {
 	lockValue, _ := cachedTestCopyLocks.LoadOrStore(filepath.Clean(path), &sync.Mutex{})
 	lock := lockValue.(*sync.Mutex)
 	lock.Lock()
@@ -240,11 +319,6 @@ func copyCachedTestTemplateIfMissing(template, path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create test database directory: %w", err)
 	}
-	source, err := os.Open(template)
-	if err != nil {
-		return fmt.Errorf("open test schema template: %w", err)
-	}
-	defer source.Close()
 	destination, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if errors.Is(err, fs.ErrExist) {
 		return nil
@@ -259,7 +333,7 @@ func copyCachedTestTemplateIfMissing(template, path string) error {
 			_ = os.Remove(path)
 		}
 	}()
-	if _, err := io.Copy(destination, source); err != nil {
+	if _, err := destination.Write(snapshot); err != nil {
 		return fmt.Errorf("copy test schema template: %w", err)
 	}
 	if err := destination.Close(); err != nil {

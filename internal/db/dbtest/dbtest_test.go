@@ -1,6 +1,7 @@
 package dbtest
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -140,7 +141,11 @@ func TestEnsureMigratedTemplateReplacesInvalidRegularFile(t *testing.T) {
 			}
 
 			copyPath := filepath.Join(t.TempDir(), "copy.db")
-			if err := copyTemplateIfMissing(template, copyPath); err != nil {
+			snapshot, err := db.SnapshotMigratedTestTemplate(template)
+			if err != nil {
+				t.Fatalf("snapshot repaired template: %v", err)
+			}
+			if err := copyTemplateSnapshotIfMissing(snapshot, copyPath); err != nil {
 				t.Fatalf("copy repaired template: %v", err)
 			}
 			store, err := db.OpenAlreadyMigrated(copyPath)
@@ -451,11 +456,13 @@ func isolateMigratedTemplateCache(t *testing.T) string {
 	templateMu.Lock()
 	templateReady = false
 	templatePath = ""
+	templateSnapshot = nil
 	templateMu.Unlock()
 	t.Cleanup(func() {
 		templateMu.Lock()
 		templateReady = false
 		templatePath = ""
+		templateSnapshot = nil
 		templateMu.Unlock()
 	})
 	return db.MigratedTestTemplatePath(cacheRoot)
@@ -467,21 +474,78 @@ func TestMigratedTemplateUsesCurrentUnixUserPath(t *testing.T) {
 	templateMu.Lock()
 	templateReady = false
 	templatePath = ""
+	templateSnapshot = nil
 	templateMu.Unlock()
 	t.Cleanup(func() {
 		templateMu.Lock()
 		templateReady = false
 		templatePath = ""
+		templateSnapshot = nil
 		templateMu.Unlock()
 	})
 
-	got, err := migratedTemplate()
+	got, _, err := migratedTemplate()
 	if err != nil {
 		t.Fatalf("build migrated template: %v", err)
 	}
 	want := filepath.Join(cacheRoot, fmt.Sprintf("gitmoot-test-schema-%d-%s.db", os.Getuid(), db.SchemaMigrationFingerprint()[:12]))
 	if got != want {
 		t.Fatalf("migrated template path = %q, want current-user path %q", got, want)
+	}
+}
+
+func replaceWithForeignSQLite(t *testing.T, path string) {
+	t.Helper()
+	foreign := filepath.Join(t.TempDir(), "foreign.db")
+	raw, err := sql.Open("sqlite", foreign)
+	if err != nil {
+		t.Fatalf("open foreign SQLite database: %v", err)
+	}
+	if _, err := raw.ExecContext(context.Background(), `CREATE TABLE foreign_marker (id INTEGER PRIMARY KEY)`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("create foreign SQLite schema: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close foreign SQLite database: %v", err)
+	}
+	data, err := os.ReadFile(foreign)
+	if err != nil {
+		t.Fatalf("read foreign SQLite database: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("replace shared template: %v", err)
+	}
+}
+
+func TestOpenCopiesAuthenticatedSnapshotAfterSharedTemplateChanges(t *testing.T) {
+	template := isolateMigratedTemplateCache(t)
+	_, snapshot, err := migratedTemplate()
+	if err != nil {
+		t.Fatalf("build migrated template snapshot: %v", err)
+	}
+	replaceWithForeignSQLite(t, template)
+	if _, err := db.SnapshotMigratedTestTemplate(template); err == nil {
+		t.Fatal("replacement unexpectedly authenticated as a template snapshot")
+	}
+
+	destination := filepath.Join(t.TempDir(), "copied.db")
+	if err := copyTemplateSnapshotIfMissing(snapshot, destination); err != nil {
+		t.Fatalf("copy authenticated snapshot: %v", err)
+	}
+	got, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatalf("read copied snapshot: %v", err)
+	}
+	if !bytes.Equal(got, snapshot) {
+		t.Fatal("copied database differs from the authenticated snapshot")
+	}
+
+	store, err := Open(t, filepath.Join(t.TempDir(), "opened.db"))
+	if err != nil {
+		t.Fatalf("Open after shared template replacement: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close opened store: %v", err)
 	}
 }
 

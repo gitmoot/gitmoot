@@ -7,7 +7,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"net/url"
 	"os"
@@ -19,10 +18,11 @@ import (
 )
 
 var (
-	templateMu    sync.Mutex
-	templateReady bool
-	templatePath  string
-	copyLocks     sync.Map
+	templateMu       sync.Mutex
+	templateReady    bool
+	templatePath     string
+	templateSnapshot []byte
+	copyLocks        sync.Map
 )
 
 const templatePublicationAttempts = 3
@@ -33,28 +33,35 @@ const templatePublicationAttempts = 3
 func Open(t *testing.T, path string) (*db.Store, error) {
 	t.Helper()
 
-	template, err := migratedTemplate()
+	_, snapshot, err := migratedTemplate()
 	if err != nil {
 		return nil, err
 	}
-	if err := copyTemplateIfMissing(template, path); err != nil {
+	if err := copyTemplateSnapshotIfMissing(snapshot, path); err != nil {
 		return nil, err
 	}
 	return db.OpenAlreadyMigrated(path)
 }
 
-func migratedTemplate() (string, error) {
+func migratedTemplate() (string, []byte, error) {
 	templateMu.Lock()
 	defer templateMu.Unlock()
 	if templateReady {
-		return templatePath, nil
+		return templatePath, templateSnapshot, nil
 	}
 	templatePath = db.MigratedTestTemplatePath(os.TempDir())
-	if err := ensureMigratedTemplate(templatePath); err != nil {
-		return templatePath, err
+	var snapshotErr error
+	for attempt := 1; attempt <= templatePublicationAttempts; attempt++ {
+		if err := ensureMigratedTemplate(templatePath); err != nil {
+			return templatePath, nil, err
+		}
+		templateSnapshot, snapshotErr = db.SnapshotMigratedTestTemplate(templatePath)
+		if snapshotErr == nil {
+			templateReady = true
+			return templatePath, templateSnapshot, nil
+		}
 	}
-	templateReady = true
-	return templatePath, nil
+	return templatePath, nil, fmt.Errorf("snapshot migrated test template after %d attempts: %w", templatePublicationAttempts, snapshotErr)
 }
 
 func ensureMigratedTemplate(path string) error {
@@ -170,7 +177,7 @@ func checkpointWAL(path string) error {
 	return nil
 }
 
-func copyTemplateIfMissing(template, path string) error {
+func copyTemplateSnapshotIfMissing(snapshot []byte, path string) error {
 	lockValue, _ := copyLocks.LoadOrStore(filepath.Clean(path), &sync.Mutex{})
 	lock := lockValue.(*sync.Mutex)
 	lock.Lock()
@@ -185,11 +192,6 @@ func copyTemplateIfMissing(template, path string) error {
 		return fmt.Errorf("create test database directory: %w", err)
 	}
 
-	source, err := os.Open(template)
-	if err != nil {
-		return fmt.Errorf("open test schema template: %w", err)
-	}
-	defer source.Close()
 	destination, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if errors.Is(err, fs.ErrExist) {
 		return nil
@@ -204,7 +206,7 @@ func copyTemplateIfMissing(template, path string) error {
 			_ = os.Remove(path)
 		}
 	}()
-	if _, err := io.Copy(destination, source); err != nil {
+	if _, err := destination.Write(snapshot); err != nil {
 		return fmt.Errorf("copy test schema template: %w", err)
 	}
 	if err := destination.Close(); err != nil {

@@ -41,6 +41,43 @@ func MigratedTestTemplatePath(tempDir string) string {
 	return filepath.Join(tempDir, fmt.Sprintf("gitmoot-test-schema-%d-%s.db", os.Getuid(), fingerprint[:12]))
 }
 
+// SnapshotMigratedTestTemplate returns the exact template bytes after proving
+// that those bytes match the published identity. Validation through the shared
+// pathname followed by a later open leaves a replacement window; validating a
+// private copy binds the returned snapshot to the identity that was observed.
+func SnapshotMigratedTestTemplate(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read migrated test template snapshot: %w", err)
+	}
+	stamped, err := os.ReadFile(TestTemplateIdentityPath(path))
+	if err != nil {
+		return nil, fmt.Errorf("read migrated test template snapshot identity: %w", err)
+	}
+
+	temp, err := os.CreateTemp(filepath.Dir(path), ".gitmoot-test-schema-snapshot-*.db")
+	if err != nil {
+		return nil, fmt.Errorf("create migrated test template snapshot: %w", err)
+	}
+	tempPath := temp.Name()
+	defer func() { _ = os.Remove(tempPath) }()
+	if _, err := temp.Write(data); err != nil {
+		_ = temp.Close()
+		return nil, fmt.Errorf("write migrated test template snapshot: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return nil, fmt.Errorf("close migrated test template snapshot: %w", err)
+	}
+	got, err := testTemplateStamp(tempPath)
+	if err != nil {
+		return nil, fmt.Errorf("validate migrated test template snapshot: %w", err)
+	}
+	if got != string(stamped) {
+		return nil, fmt.Errorf("migrated test template snapshot identity is %q, want %q", got, string(stamped))
+	}
+	return data, nil
+}
+
 // AfterTestTemplatePublish runs between publishing the database and stamping its
 // identity. Production behaviour is a no-op; tests replace it to simulate a crash
 // in that window, which is the only way to observe the publication ORDER — a
