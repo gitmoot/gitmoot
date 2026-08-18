@@ -19,11 +19,13 @@ import (
 )
 
 var (
-	templateOnce sync.Once
-	templatePath string
-	templateErr  error
-	copyLocks    sync.Map
+	templateMu    sync.Mutex
+	templateReady bool
+	templatePath  string
+	copyLocks     sync.Map
 )
+
+const templatePublicationAttempts = 3
 
 // Open copies the current migrated schema into path when path does not exist,
 // then opens it without replaying migrations. Existing databases are never
@@ -42,34 +44,53 @@ func Open(t *testing.T, path string) (*db.Store, error) {
 }
 
 func migratedTemplate() (string, error) {
-	templateOnce.Do(func() {
-		fingerprint := db.SchemaMigrationFingerprint()
-		templatePath = filepath.Join(os.TempDir(), "gitmoot-test-schema-"+fingerprint[:12]+".db")
-		templateErr = ensureMigratedTemplate(templatePath)
-	})
-	return templatePath, templateErr
+	templateMu.Lock()
+	defer templateMu.Unlock()
+	if templateReady {
+		return templatePath, nil
+	}
+	fingerprint := db.SchemaMigrationFingerprint()
+	templatePath = filepath.Join(os.TempDir(), "gitmoot-test-schema-"+fingerprint[:12]+".db")
+	if err := ensureMigratedTemplate(templatePath); err != nil {
+		return templatePath, err
+	}
+	templateReady = true
+	return templatePath, nil
 }
 
 func ensureMigratedTemplate(path string) error {
-	if info, err := os.Stat(path); err == nil {
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("test schema template %s is not a regular file", path)
+	for attempt := 1; attempt <= templatePublicationAttempts; attempt++ {
+		retry, err := ensureMigratedTemplateOnce(path)
+		if err != nil {
+			return err
 		}
-		if err := validateMigratedTemplate(path); err == nil {
+		if !retry {
 			return nil
 		}
+	}
+	return fmt.Errorf("test schema template at %s was repeatedly replaced during publication", path)
+}
+
+func ensureMigratedTemplateOnce(path string) (bool, error) {
+	if info, err := os.Stat(path); err == nil {
+		if !info.Mode().IsRegular() {
+			return false, fmt.Errorf("test schema template %s is not a regular file", path)
+		}
+		if err := validateMigratedTemplate(path); err == nil {
+			return false, nil
+		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("stat test schema template: %w", err)
+		return false, fmt.Errorf("stat test schema template: %w", err)
 	}
 
 	temp, err := os.CreateTemp(filepath.Dir(path), ".gitmoot-test-schema-*.db")
 	if err != nil {
-		return fmt.Errorf("create test schema template: %w", err)
+		return false, fmt.Errorf("create test schema template: %w", err)
 	}
 	tempPath := temp.Name()
 	if err := temp.Close(); err != nil {
 		_ = os.Remove(tempPath)
-		return fmt.Errorf("close empty test schema template: %w", err)
+		return false, fmt.Errorf("close empty test schema template: %w", err)
 	}
 	defer func() {
 		_ = os.Remove(tempPath)
@@ -79,20 +100,21 @@ func ensureMigratedTemplate(path string) error {
 
 	store, err := db.Open(tempPath)
 	if err != nil {
-		return fmt.Errorf("migrate test schema template: %w", err)
+		return false, fmt.Errorf("migrate test schema template: %w", err)
 	}
 	if err := checkpointWAL(tempPath); err != nil {
 		_ = store.Close()
-		return err
+		return false, err
 	}
 	if err := store.Close(); err != nil {
-		return fmt.Errorf("close migrated test schema template: %w", err)
+		return false, fmt.Errorf("close migrated test schema template: %w", err)
 	}
 
 	// Publish and stamp as ONE operation: package db owns the order, and requiring
 	// the freshly built temp file means the stamped database is by construction the
 	// one that was migrated. An exported bare stamp would launder provenance.
-	return db.PublishMigratedTestTemplate(tempPath, path)
+	published, err := db.PublishMigratedTestTemplate(tempPath, path)
+	return !published, err
 }
 
 func validateMigratedTemplate(path string) error {

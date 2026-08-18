@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -443,24 +444,29 @@ func TestValidationRejectsDivergedSchema(t *testing.T) {
 	}
 }
 
-// TestPublishDoesNotStampAnotherBinarysCandidate pins the interleaving race that
-// round-6 review reproduced: "the supposedly indivisible API can authenticate a
-// database that replaced its candidate between the database rename and identity
-// stamping."
-//
-// One function call is not one filesystem operation. Between publishing our
-// candidate and stamping it, another test binary sharing the same cache path can
-// rename ITS candidate over ours; stamping afterwards would authenticate a
-// database we never built. The seam lets the test occupy exactly that window.
-func TestPublishDoesNotStampAnotherBinarysCandidate(t *testing.T) {
-	template := filepath.Join(t.TempDir(), "schema.db")
+func isolateMigratedTemplateCache(t *testing.T) string {
+	t.Helper()
+	cacheRoot := t.TempDir()
+	t.Setenv("TMPDIR", cacheRoot)
+	templateMu.Lock()
+	templateReady = false
+	templatePath = ""
+	templateMu.Unlock()
+	t.Cleanup(func() {
+		templateMu.Lock()
+		templateReady = false
+		templatePath = ""
+		templateMu.Unlock()
+	})
+	return filepath.Join(cacheRoot, "gitmoot-test-schema-"+db.SchemaMigrationFingerprint()[:12]+".db")
+}
 
-	// Build a legitimate template once so a valid foreign candidate exists.
+func ageTemplateForPublicationRace(t *testing.T) string {
+	t.Helper()
 	foreign := filepath.Join(t.TempDir(), "foreign.db")
 	if err := ensureMigratedTemplate(foreign); err != nil {
 		t.Fatalf("build foreign template: %v", err)
 	}
-	// Age it so it is NOT what the current migrations produce.
 	raw, err := sql.Open("sqlite", foreign)
 	if err != nil {
 		t.Fatalf("open foreign: %v", err)
@@ -472,6 +478,50 @@ func TestPublishDoesNotStampAnotherBinarysCandidate(t *testing.T) {
 	if err := raw.Close(); err != nil {
 		t.Fatalf("close foreign: %v", err)
 	}
+	return foreign
+}
+
+func TestOpenRetriesSingleLostPublicationRace(t *testing.T) {
+	template := isolateMigratedTemplateCache(t)
+	foreign := ageTemplateForPublicationRace(t)
+
+	previous := db.AfterTestTemplatePublish
+	hookCalls := 0
+	db.AfterTestTemplatePublish = func() error {
+		hookCalls++
+		if hookCalls != 1 {
+			return nil
+		}
+		data, err := os.ReadFile(foreign)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(template, data, 0o600)
+	}
+	t.Cleanup(func() { db.AfterTestTemplatePublish = previous })
+
+	store, err := Open(t, filepath.Join(t.TempDir(), "store.db"))
+	db.AfterTestTemplatePublish = previous
+	if err != nil {
+		t.Fatalf("dbtest.Open after one lost publication race: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	if hookCalls != 2 {
+		t.Fatalf("publication hook calls = %d, want 2 (lost race plus in-call rebuild)", hookCalls)
+	}
+	if err := validateMigratedTemplate(template); err != nil {
+		t.Fatalf("validate template rebuilt in same Open: %v", err)
+	}
+}
+
+// TestPublishDoesNotStampAnotherBinarysCandidate pins both sides of the
+// interleaving contract: a foreign replacement is never authenticated, and a
+// lost publication race cannot poison dbtest.Open for the rest of the binary.
+func TestPublishDoesNotStampAnotherBinarysCandidate(t *testing.T) {
+	template := isolateMigratedTemplateCache(t)
+	foreign := ageTemplateForPublicationRace(t)
 
 	// Occupy the window: replace the just-published database with the foreign one.
 	previous := db.AfterTestTemplatePublish
@@ -484,8 +534,14 @@ func TestPublishDoesNotStampAnotherBinarysCandidate(t *testing.T) {
 	}
 	t.Cleanup(func() { db.AfterTestTemplatePublish = previous })
 
-	err = ensureMigratedTemplate(template)
+	firstStore, err := Open(t, filepath.Join(t.TempDir(), "first.db"))
+	if firstStore != nil {
+		_ = firstStore.Close()
+	}
 	db.AfterTestTemplatePublish = previous
+	if err == nil || !strings.Contains(err.Error(), "repeatedly replaced during publication") {
+		t.Fatalf("first dbtest.Open error = %v, want bounded publication-race exhaustion", err)
+	}
 
 	// Whatever happened, the invariant is the same: the file at the cache path must
 	// NOT end up authenticated unless it genuinely matches the current migrations.
@@ -493,9 +549,15 @@ func TestPublishDoesNotStampAnotherBinarysCandidate(t *testing.T) {
 		t.Fatalf("a foreign candidate that replaced ours was authenticated (publish err=%v)", err)
 	}
 
-	// And recovery still works once nothing is interfering.
-	if err := ensureMigratedTemplate(template); err != nil {
-		t.Fatalf("rebuild after interleaving: %v", err)
+	// Production reaches template construction through migratedTemplate's cache.
+	// A failed first call must not be memoized: once contention clears, the next
+	// caller rebuilds, opens a usable store, and authenticates the template.
+	secondStore, err := Open(t, filepath.Join(t.TempDir(), "second.db"))
+	if err != nil {
+		t.Fatalf("second dbtest.Open after interleaving: %v", err)
+	}
+	if err := secondStore.Close(); err != nil {
+		t.Fatalf("close second store: %v", err)
 	}
 	if err := validateMigratedTemplate(template); err != nil {
 		t.Fatalf("validate rebuilt template: %v", err)

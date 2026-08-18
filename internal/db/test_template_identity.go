@@ -38,7 +38,10 @@ func TestTemplateIdentityPath(path string) string { return path + ".fingerprint"
 var AfterTestTemplatePublish = func() error { return nil }
 
 // PublishMigratedTestTemplate moves a freshly migrated database into the shared
-// cache path and stamps its identity, as ONE operation.
+// cache path and stamps its identity, as ONE operation. It reports published
+// when the cache path is authenticated. A false result with no error means
+// another process replaced the candidate before identity publication; callers
+// must rebuild rather than expose or permanently cache that transient state.
 //
 // It is deliberately not two exported steps. An exported bare "stamp" launders
 // provenance: it records the CURRENT fingerprint beside whatever file happens to
@@ -54,7 +57,7 @@ var AfterTestTemplatePublish = func() error { return nil }
 // OLD database still sitting at the path, and validation then blesses a stale
 // schema. This way a crash leaves a database with no (or a mismatched) sidecar,
 // which fails validation and costs only a rebuild.
-func PublishMigratedTestTemplate(tempPath, path string) error {
+func PublishMigratedTestTemplate(tempPath, path string) (bool, error) {
 	// Compute the identity from OUR candidate BEFORE it is published. After the
 	// rename the file at `path` is not necessarily ours: another test binary can
 	// rename its own candidate over the same shared cache path at any moment, and
@@ -65,17 +68,17 @@ func PublishMigratedTestTemplate(tempPath, path string) error {
 	// call is not one filesystem operation.
 	stamp, err := testTemplateStamp(tempPath)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if err := os.Rename(tempPath, path); err != nil {
 		if validateErr := ValidateTestTemplateIdentity(path); validateErr == nil {
-			return nil
+			return true, nil
 		}
-		return fmt.Errorf("publish test schema template: %w", err)
+		return false, fmt.Errorf("publish test schema template: %w", err)
 	}
 	if err := AfterTestTemplatePublish(); err != nil {
-		return err
+		return false, err
 	}
 
 	// Defence in depth: if the published file is no longer the one we measured,
@@ -86,15 +89,23 @@ func PublishMigratedTestTemplate(tempPath, path string) error {
 	// half, and this branch only turns a mismatched sidecar into a clear error.)
 	current, err := testTemplateStamp(path)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if current != stamp {
 		if validateErr := ValidateTestTemplateIdentity(path); validateErr == nil {
-			return nil
+			return true, nil
 		}
-		return fmt.Errorf("test schema template at %s was replaced during publication and does not authenticate", path)
+		// Another process replaced our candidate but has not yet published its
+		// identity. Returning a retry signal keeps the foreign database
+		// unauthenticated while letting the caller rebuild in this same Open call;
+		// treating this ordinary publication race as a hard error would otherwise
+		// poison a process-wide schema cache.
+		return false, nil
 	}
-	return stampTestTemplateIdentityWith(path, stamp)
+	if err := stampTestTemplateIdentityWith(path, stamp); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // stampTestTemplateIdentity records the identity beside an already-published
