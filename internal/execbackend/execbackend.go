@@ -16,8 +16,11 @@
 // P2 extends Consume with a required positional builder, that signature change
 // will make its existing callers fail to compile until they supply it. Adapter
 // builds without a selector retain the Local default. Job-associated subprocess
-// execution consumes its resolved selection through Consume and fails closed
-// when the backend has no execution implementation.
+// execution is PARTIALLY gated: the git seam resolves its runner through Consume
+// and fails closed, but engine constructors still pass a host runner explicitly
+// (internal/cli/daemon_workflow.go, daemon_worker.go, internal/workflow) and two
+// git calls bypass the seam via raw exec (internal/cli/ask_diff_precleanup.go).
+// Closing those before P2 lands a second backend is tracked by #1560.
 package execbackend
 
 import (
