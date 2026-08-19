@@ -61,7 +61,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 		poller.WatchIssues = watchIssues
 		blobStore := artifact.NewStore(paths.ArtifactBlobs)
 		reviewGitHub := newSkillOptGitHubClient()
-		worker := defaultJobWorker(store, stdout, home)
+		worker := executionBackendJobWorker(store, stdout, home)
 		worker.CommenterFactory = worker.defaultCommenter
 		worker.Admission = worker.loadAdmissionBudget()
 		checkoutLocks := &repoCheckoutLocks{}
@@ -218,7 +218,7 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		return err
 	}
 	startForeignBootRecoveryLoop(ctx, store, stdout)
-	worker := defaultJobWorker(store, stdout, home)
+	worker := executionBackendJobWorker(store, stdout, home)
 	worker.CommenterFactory = worker.defaultCommenter
 	worker.Admission = worker.loadAdmissionBudget()
 	var checkoutLock sync.Mutex

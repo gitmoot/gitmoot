@@ -3,12 +3,11 @@
 // distinct from internal/sandbox and the `sandbox` CLI, which mean Landlock
 // LOCAL confinement and are unrelated to backend selection.
 //
-// P1 ships exactly one backend — "local" — which is a byte-for-byte
-// passthrough to the existing runner-composition pipeline (caller runner or
-// nil → runtimeJobRunner/credgw → maybe Landlock WrappingRunner → adapter,
-// with subprocess.GroupRunner{} innermost). The job-scoped
-// Provision/SyncIn/Exec/Collect/Destroy lifecycle from the P0 contract lands
-// with the first real backend (P2); this package only names the selector.
+// The default backend is "local". P1 introduced its selector as a passthrough;
+// P2b adds the job-scoped lifecycle in lifecycle.go and executes a daemon job in
+// a distinct same-filesystem Git worktree. Host-side checkout/finalizer commands
+// retain their existing runner while runtime delivery uses InstanceRunner and
+// returns changes through BuildChangeSet/ImportChangeSet.
 // Where P1 carries a resolved selection into adapter construction, that route
 // consumes it through Consume, whose only positive implementation is Local; any
 // other parsed backend is refused at runtime. Adding a backend to

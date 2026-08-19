@@ -124,6 +124,8 @@ func (e Engine) now() time.Time {
 // resolves root_id from the payload, and ships a redacted event fire-and-forget.
 func (e Engine) mailbox() Mailbox {
 	mb := NewMailbox(e.Store, e.ResolveDeliveryWorktree)
+	mb.CollectChangeSet = e.CollectChangeSet
+	mb.ApplyChangeSet = e.ApplyChangeSet
 	mb.RequireWorkflowPolicy = e.RequireWorkflowPolicy
 	mb.OrgPolicy = e.OrgPolicy
 	mb.CanaryEnabled = e.CanaryEnabled
