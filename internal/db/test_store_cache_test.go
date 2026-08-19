@@ -53,6 +53,7 @@ func TestStoreOpenPolicy(t *testing.T) {
 		"TestBackfillGhostSessionJobsHonorsDisabledAgePolicy":     true,
 		"TestBackfillGhostSessionJobsReusesReaperAndIsIdempotent": true,
 		"TestCanaryMigrationOnPreExistingDB":                      true,
+		"TestExecBackendAttemptsMigrationFreshAndCached":          true,
 		"TestExternallyDrivenColumnMigratesOnPreExistingDB":       true,
 		"TestIncrementalVacuumReclaimsOnlyRequestedPages":         true,
 		"TestJobModelMigrationOnPreExistingDB":                    true,
@@ -64,6 +65,7 @@ func TestStoreOpenPolicy(t *testing.T) {
 		"TestMemoryEventsMigrationFreshAndUpgradeConverge":        true,
 		"TestMemoryHarvestMigrationFreshAndUpgrade":               true,
 		"TestMemoryMigrationCreatesTables":                        true,
+		"TestMigrateAddsExecBackendAttempts":                      true,
 		"TestMigrateAddsPipelinesToUpgradedDB":                    true,
 		"TestMigrateAddsTriggerBindingToExistingPipeline":         true,
 		"TestMigrateAppendsAgentInstanceAutonomyPolicy":           true,
@@ -572,7 +574,7 @@ func copyCachedTestTemplateSnapshotIfMissing(snapshot []byte, path string) error
 
 // TestCachedOpenDoesNotMigrate binds the in-package cached frontend to
 // OpenAlreadyMigrated. Swapping it for Open leaves every assertion in the suite
-// green -- a cached copy already carries all 115 migrations and applyMigration is
+// green -- a cached copy already carries all 116 migrations and applyMigration is
 // idempotent, so Migrate is a no-op that changes nothing observable (measured:
 // PRAGMA data_version unmoved). What it costs is 115 wasted transactions per store
 // open, which is the entire point of #1550, so the contract needs a non-timing

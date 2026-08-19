@@ -2015,4 +2015,34 @@ CREATE TABLE permission_policy_warning_claims (
 	PRIMARY KEY(agent, runtime, policy, capability, window_start)
 );
 	`,
+	// #1576 execution-backend attempt ledger. A reservation is durable before
+	// provisioning begins: cost_reserved_usd is written in that same insert so
+	// parallel children contend on one primary-keyed reservation. sandbox_id is
+	// deliberately nullable during the provider-create/DB-write crash window, so
+	// a bidirectional reaper can reconcile both ledger->provider and
+	// provider-tags->ledger. daemon_fencing_token and boot_id are both required:
+	// boot_id alone cannot distinguish a daemon crash-and-restart within one host
+	// boot. orphaned is an explicit persisted state so reapers record their
+	// conclusion instead of forcing callers to infer it.
+	`
+CREATE TABLE execbackend_attempts (
+	job_id TEXT NOT NULL,
+	attempt INTEGER NOT NULL,
+	lifecycle_generation INTEGER,
+	provider TEXT NOT NULL,
+	sandbox_id TEXT,
+	daemon_fencing_token TEXT NOT NULL,
+	boot_id TEXT NOT NULL,
+	ttl_expires_at TIMESTAMP NOT NULL,
+	state TEXT NOT NULL CHECK(state IN (
+		'reserved', 'provisioning', 'running', 'collecting', 'destroying',
+		'destroyed', 'orphaned', 'failed'
+	)),
+	cost_reserved_usd REAL,
+	cost_actual_usd REAL,
+	created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (job_id, attempt, lifecycle_generation)
+);
+	`,
 }
