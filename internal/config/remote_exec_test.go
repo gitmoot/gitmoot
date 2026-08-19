@@ -34,6 +34,9 @@ func TestLoadRemoteExecConfigDefaultsToLocal(t *testing.T) {
 	if cfg.Backend != "local" {
 		t.Fatalf("Backend = %q, want the local default", cfg.Backend)
 	}
+	if cfg.LocalIdentity() != nil || cfg.LocalRoot != "" {
+		t.Fatalf("default local privilege config = uid %v gid %v root %q, want unset", cfg.LocalUID, cfg.LocalGID, cfg.LocalRoot)
+	}
 }
 
 func TestLoadRemoteExecConfigExplicitLocal(t *testing.T) {
@@ -44,6 +47,44 @@ func TestLoadRemoteExecConfigExplicitLocal(t *testing.T) {
 	}
 	if cfg.Backend != "local" {
 		t.Fatalf("Backend = %q, want local", cfg.Backend)
+	}
+}
+
+func TestLoadRemoteExecConfigLocalIdentity(t *testing.T) {
+	paths := remoteExecTestPaths(t, "[remote_exec]\nbackend = \"local\"\nlocal_uid = 1234\nlocal_gid = 5678\nlocal_root = \"/var/tmp/gitmoot-local\"\n")
+	cfg, err := LoadRemoteExecConfig(paths)
+	if err != nil {
+		t.Fatalf("LoadRemoteExecConfig: %v", err)
+	}
+	identity := cfg.LocalIdentity()
+	if identity == nil || identity.UID != 1234 || identity.GID != 5678 {
+		t.Fatalf("LocalIdentity = %+v, want uid 1234 gid 5678", identity)
+	}
+	if cfg.LocalRoot != "/var/tmp/gitmoot-local" {
+		t.Fatalf("LocalRoot = %q", cfg.LocalRoot)
+	}
+}
+
+func TestLoadRemoteExecConfigRejectsIncompleteOrRootIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{name: "uid only", content: "local_uid = 1234\n", want: "configured together"},
+		{name: "gid only", content: "local_gid = 1234\n", want: "configured together"},
+		{name: "root uid", content: "local_uid = 0\nlocal_gid = 1234\n", want: "local_uid must be a non-root"},
+		{name: "root gid", content: "local_uid = 1234\nlocal_gid = 0\n", want: "local_gid must be a non-root"},
+		{name: "relative root", content: "local_root = \"relative\"\n", want: "must be an absolute path"},
+		{name: "filesystem root", content: "local_root = \"/\"\n", want: "must not be a filesystem root"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			paths := remoteExecTestPaths(t, "[remote_exec]\nbackend = \"local\"\n"+tc.content)
+			_, err := LoadRemoteExecConfig(paths)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadRemoteExecConfig error = %v, want %q", err, tc.want)
+			}
+		})
 	}
 }
 

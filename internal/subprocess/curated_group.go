@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"syscall"
 )
 
 // CuratedGroupRunner is GroupRunner with an explicit base environment. Runtime
@@ -15,6 +16,7 @@ import (
 type CuratedGroupRunner struct {
 	BaseEnv        []string
 	MaxOutputBytes int
+	Credential     *syscall.Credential
 	// ScratchDirs are recreated empty with mode 0700 for each subprocess and
 	// removed after it exits, including error and cancellation paths.
 	ScratchDirs []string
@@ -68,20 +70,20 @@ func (r CuratedGroupRunner) run(ctx context.Context, dir string, extraEnv []stri
 	env = append(env, extraEnv...)
 	if out != nil {
 		if onPID != nil {
-			return runCuratedGroupStreamWithPID(ctx, dir, env, out, onPID, command, args...)
+			return runCuratedGroupStreamWithPID(ctx, dir, env, out, r.Credential, onPID, command, args...)
 		}
-		return runCuratedGroupStream(ctx, dir, env, out, command, args...)
+		return runCuratedGroupStream(ctx, dir, env, out, r.Credential, command, args...)
 	}
 	if r.MaxOutputBytes > 0 {
 		if onPID != nil {
-			return runCuratedGroupBoundedWithPID(ctx, dir, env, r.MaxOutputBytes, onPID, command, args...)
+			return runCuratedGroupBoundedWithPID(ctx, dir, env, r.MaxOutputBytes, r.Credential, onPID, command, args...)
 		}
-		return runCuratedGroupBounded(ctx, dir, env, r.MaxOutputBytes, command, args...)
+		return runCuratedGroupBounded(ctx, dir, env, r.MaxOutputBytes, r.Credential, command, args...)
 	}
 	if onPID != nil {
-		return runCuratedGroupWithPID(ctx, dir, env, onPID, command, args...)
+		return runCuratedGroupWithPID(ctx, dir, env, r.Credential, onPID, command, args...)
 	}
-	return runCuratedGroup(ctx, dir, env, command, args...)
+	return runCuratedGroup(ctx, dir, env, r.Credential, command, args...)
 }
 
 func (r CuratedGroupRunner) prepareScratch() error {
@@ -95,6 +97,11 @@ func (r CuratedGroupRunner) prepareScratch() error {
 		if err := os.Chmod(path, 0o700); err != nil {
 			return fmt.Errorf("chmod curated runtime scratch: %w", err)
 		}
+		if r.Credential != nil {
+			if err := os.Chown(path, int(r.Credential.Uid), int(r.Credential.Gid)); err != nil {
+				return fmt.Errorf("chown curated runtime scratch: %w", err)
+			}
+		}
 	}
 	return nil
 }
@@ -105,8 +112,8 @@ func (r CuratedGroupRunner) cleanupScratch() {
 	}
 }
 
-func runCuratedGroup(ctx context.Context, dir string, env []string, command string, args ...string) (Result, error) {
-	cmd, sweep := newGroupCmd(ctx, dir, command, args)
+func runCuratedGroup(ctx context.Context, dir string, env []string, credential *syscall.Credential, command string, args ...string) (Result, error) {
+	cmd, sweep := newGroupCmd(ctx, dir, command, args, credential)
 	cmd.Env = env
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -116,8 +123,8 @@ func runCuratedGroup(ctx context.Context, dir string, env []string, command stri
 	return Result{Command: command, Args: args, Stdout: stdout.String(), Stderr: stderr.String()}, err
 }
 
-func runCuratedGroupWithPID(ctx context.Context, dir string, env []string, onPID PIDCallback, command string, args ...string) (Result, error) {
-	cmd, sweep := newGroupCmd(ctx, dir, command, args)
+func runCuratedGroupWithPID(ctx context.Context, dir string, env []string, credential *syscall.Credential, onPID PIDCallback, command string, args ...string) (Result, error) {
+	cmd, sweep := newGroupCmd(ctx, dir, command, args, credential)
 	cmd.Env = env
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -127,8 +134,8 @@ func runCuratedGroupWithPID(ctx context.Context, dir string, env []string, onPID
 	return Result{Command: command, Args: args, Stdout: stdout.String(), Stderr: stderr.String()}, err
 }
 
-func runCuratedGroupBounded(ctx context.Context, dir string, env []string, maxOutputBytes int, command string, args ...string) (Result, error) {
-	cmd, sweep := newGroupCmd(ctx, dir, command, args)
+func runCuratedGroupBounded(ctx context.Context, dir string, env []string, maxOutputBytes int, credential *syscall.Credential, command string, args ...string) (Result, error) {
+	cmd, sweep := newGroupCmd(ctx, dir, command, args, credential)
 	cmd.Env = env
 	stdout := tailBuffer{max: maxOutputBytes}
 	stderr := tailBuffer{max: maxOutputBytes}
@@ -139,8 +146,8 @@ func runCuratedGroupBounded(ctx context.Context, dir string, env []string, maxOu
 	return Result{Command: command, Args: args, Stdout: stdout.String(), Stderr: stderr.String()}, err
 }
 
-func runCuratedGroupBoundedWithPID(ctx context.Context, dir string, env []string, maxOutputBytes int, onPID PIDCallback, command string, args ...string) (Result, error) {
-	cmd, sweep := newGroupCmd(ctx, dir, command, args)
+func runCuratedGroupBoundedWithPID(ctx context.Context, dir string, env []string, maxOutputBytes int, credential *syscall.Credential, onPID PIDCallback, command string, args ...string) (Result, error) {
+	cmd, sweep := newGroupCmd(ctx, dir, command, args, credential)
 	cmd.Env = env
 	stdout := tailBuffer{max: maxOutputBytes}
 	stderr := tailBuffer{max: maxOutputBytes}
@@ -151,22 +158,22 @@ func runCuratedGroupBoundedWithPID(ctx context.Context, dir string, env []string
 	return Result{Command: command, Args: args, Stdout: stdout.String(), Stderr: stderr.String()}, err
 }
 
-func runCuratedGroupStream(ctx context.Context, dir string, env []string, out io.Writer, command string, args ...string) (Result, error) {
+func runCuratedGroupStream(ctx context.Context, dir string, env []string, out io.Writer, credential *syscall.Credential, command string, args ...string) (Result, error) {
 	if out == nil {
-		return runCuratedGroup(ctx, dir, env, command, args...)
+		return runCuratedGroup(ctx, dir, env, credential, command, args...)
 	}
-	cmd, sweep := newGroupCmd(ctx, dir, command, args)
+	cmd, sweep := newGroupCmd(ctx, dir, command, args, credential)
 	cmd.Env = env
 	result, err := runStreamingCmd(cmd, out, command, args)
 	sweep()
 	return result, err
 }
 
-func runCuratedGroupStreamWithPID(ctx context.Context, dir string, env []string, out io.Writer, onPID PIDCallback, command string, args ...string) (Result, error) {
+func runCuratedGroupStreamWithPID(ctx context.Context, dir string, env []string, out io.Writer, credential *syscall.Credential, onPID PIDCallback, command string, args ...string) (Result, error) {
 	if out == nil {
-		return runCuratedGroupWithPID(ctx, dir, env, onPID, command, args...)
+		return runCuratedGroupWithPID(ctx, dir, env, credential, onPID, command, args...)
 	}
-	cmd, sweep := newGroupCmd(ctx, dir, command, args)
+	cmd, sweep := newGroupCmd(ctx, dir, command, args, credential)
 	cmd.Env = env
 	result, err := runStreamingCmdWithPID(cmd, out, onPID, command, args)
 	sweep()

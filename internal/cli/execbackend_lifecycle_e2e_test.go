@@ -8,9 +8,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
@@ -21,7 +23,7 @@ import (
 )
 
 func TestExecutionChangeSetCollectorRequiresLiveOwnedInstance(t *testing.T) {
-	backend, err := execbackend.NewLocalBackend(filepath.Join(t.TempDir(), "instances"))
+	backend, err := execbackend.NewLocalBackend(filepath.Join(t.TempDir(), "instances"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +56,7 @@ func TestExecutionChangeSetCollectorRequiresLiveOwnedInstance(t *testing.T) {
 
 func TestLocalBackendInstanceRunnerPreservesCuratedEnvironment(t *testing.T) {
 	checkout := createDaemonWorkerGitCheckout(t, "curated-backend")
-	backend, err := execbackend.NewLocalBackend(filepath.Join(t.TempDir(), "instances"))
+	backend, err := execbackend.NewLocalBackend(filepath.Join(t.TempDir(), "instances"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,6 +83,81 @@ func TestLocalBackendInstanceRunnerPreservesCuratedEnvironment(t *testing.T) {
 	if !strings.Contains(result.Stdout, "CURATED=yes") {
 		t.Fatalf("backend dropped curated environment:\n%s", result.Stdout)
 	}
+}
+
+func TestDefaultExecutionBackendUsesConfiguredIdentity(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("no privilege to apply a configured non-root identity")
+	}
+	uid, gid := configuredLocalTestIdentity(t)
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	localParent, err := os.MkdirTemp(os.TempDir(), "gitmoot-configured-local-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(localParent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	localRoot := filepath.Join(localParent, "instances")
+	t.Cleanup(func() {
+		_ = os.Remove(localRoot)
+		_ = os.Remove(localParent)
+	})
+	content := fmt.Sprintf("[remote_exec]\nbackend = \"local\"\nlocal_uid = %d\nlocal_gid = %d\nlocal_root = %q\n", uid, gid, localRoot)
+	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	worker := jobWorker{ConfigHome: home, ConfigHomeExplicit: true}
+	lifecycle, err := worker.defaultExecutionBackend(execbackend.Local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := lifecycle.Provision(context.Background(), execbackend.JobScope{JobID: "configured-identity"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lifecycle.Destroy(context.Background(), instance) })
+	checkout := createDaemonWorkerGitCheckout(t, "configured-identity")
+	if err := lifecycle.SyncIn(context.Background(), instance, execbackend.Materials{SourceWorktree: checkout}); err != nil {
+		t.Fatal(err)
+	}
+	stream, err := lifecycle.Exec(context.Background(), instance, execbackend.Command{Dir: instance.Workspace, Name: "id", Args: []string{"-u"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := stream.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.TrimSpace(result.Stdout), strconv.FormatUint(uint64(uid), 10); got != want {
+		t.Fatalf("configured command-reported euid = %q, want %s", got, want)
+	}
+}
+
+func configuredLocalTestIdentity(t *testing.T) (uint32, uint32) {
+	t.Helper()
+	data, err := os.ReadFile("/etc/passwd")
+	if err != nil {
+		t.Skipf("no unprivileged identity configured: %v", err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Split(line, ":")
+		if len(fields) < 4 {
+			continue
+		}
+		uid, uidErr := strconv.ParseUint(fields[2], 10, 32)
+		gid, gidErr := strconv.ParseUint(fields[3], 10, 32)
+		if uidErr == nil && gidErr == nil && uid > 0 && gid > 0 && uid < uint64(^uint32(0)) && gid < uint64(^uint32(0)) {
+			return uint32(uid), uint32(gid)
+		}
+	}
+	t.Skip("no unprivileged identity configured in /etc/passwd")
+	return 0, 0
 }
 
 type byteIdentityHostFinalizer struct {

@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -27,14 +29,33 @@ func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend) (execbac
 		if home == "" {
 			return nil, errors.New("resolve local execution-backend home")
 		}
-		local, err := execbackend.NewLocalBackend(filepath.Join(home, "execbackends", string(execbackend.Local)))
+		cfg := config.DefaultRemoteExecConfig()
+		if w.ConfigHomeExplicit || strings.TrimSpace(w.ConfigHome) != "" {
+			paths, err := w.configPaths()
+			if err != nil {
+				return nil, err
+			}
+			loaded, loadErr := config.LoadRemoteExecConfig(paths)
+			switch {
+			case loadErr == nil:
+				cfg = loaded
+			case errors.Is(loadErr, os.ErrNotExist):
+			default:
+				return nil, fmt.Errorf("load [remote_exec] config: %w", loadErr)
+			}
+		}
+		root := filepath.Join(home, "execbackends", string(execbackend.Local))
+		if cfg.LocalRoot != "" {
+			root = filepath.Clean(cfg.LocalRoot)
+		}
+		local, err := execbackend.NewLocalBackend(root, cfg.LocalIdentity())
 		if err != nil {
 			return nil, err
 		}
 		// Reap once per resolved root in this process. A restarted daemon has a
 		// fresh map and therefore reconciles the prior process's instances before
 		// provisioning its first new job.
-		rootKey := filepath.Join(home, "execbackends", string(execbackend.Local))
+		rootKey := root
 		if _, loaded := reapedExecutionBackendRoots.LoadOrStore(rootKey, struct{}{}); !loaded {
 			if _, err := local.Reap(context.Background()); err != nil {
 				reapedExecutionBackendRoots.Delete(rootKey)

@@ -7,7 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -79,6 +81,186 @@ func TestLocalBackendCollectRoundTripsByteIdentically(t *testing.T) {
 	}
 	if want, got := changeSetSnapshot(t, instance.Workspace), changeSetSnapshot(t, host); got != want {
 		t.Fatalf("collected host tree is not byte-identical\nwant:\n%s\ngot:\n%s", want, got)
+	}
+}
+
+func TestLocalBackendExecDropsPrivilegesAndImportNormalizesOwnership(t *testing.T) {
+	identity := testUnprivilegedIdentities(t, 1)[0]
+	host, _, _ := changeSetRepoPair(t)
+	backend := newPrivilegedTestLocalBackend(t, identity)
+	instance, err := backend.Provision(context.Background(), JobScope{JobID: "privilege-roundtrip"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backend.Destroy(context.Background(), instance) })
+	if err := backend.SyncIn(context.Background(), instance, Materials{SourceWorktree: host}); err != nil {
+		t.Fatal(err)
+	}
+	if uid, gid := pathOwnership(t, instance.Workspace); uid != identity.UID || gid != identity.GID {
+		t.Fatalf("workspace ownership = %d:%d, want configured %d:%d", uid, gid, identity.UID, identity.GID)
+	}
+
+	var streamed strings.Builder
+	stream, err := backend.Exec(context.Background(), instance, Command{
+		Dir:    instance.Workspace,
+		Name:   "/bin/sh",
+		Args:   []string{"-c", `id -u; printf 'agent-owned\000bytes\n' > new.bin`},
+		Output: &streamed,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := stream.Wait()
+	if err != nil {
+		t.Fatalf("non-root Exec: %v (stderr: %s)", err, result.Stderr)
+	}
+	if got, want := strings.TrimSpace(result.Stdout), strconv.FormatUint(uint64(identity.UID), 10); got != want {
+		t.Fatalf("command-reported euid = %q, want configured non-root uid %s", got, want)
+	}
+	if streamed.String() != result.Stdout {
+		t.Fatalf("streamed output = %q, buffered output = %q", streamed.String(), result.Stdout)
+	}
+	if uid, gid := pathOwnership(t, filepath.Join(instance.Workspace, "new.bin")); uid != identity.UID || gid != identity.GID {
+		t.Fatalf("agent-created ownership = %d:%d, want %d:%d", uid, gid, identity.UID, identity.GID)
+	}
+
+	changes, err := backend.Collect(context.Background(), instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairStream, err := backend.Exec(context.Background(), instance, Command{
+		Dir:  instance.Workspace,
+		Name: "/bin/sh",
+		Args: []string{"-c", `set -e; id -u; printf 'repair' > .repair-write; rm .repair-write`},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairResult, err := repairStream.Wait()
+	if err != nil {
+		t.Fatalf("post-collection non-root Exec: %v", err)
+	}
+	if got, want := strings.TrimSpace(repairResult.Stdout), strconv.FormatUint(uint64(identity.UID), 10); got != want {
+		t.Fatalf("post-collection command-reported euid = %q, want %s", got, want)
+	}
+	if err := ImportChangeSet(context.Background(), host, changes); err != nil {
+		t.Fatal(err)
+	}
+	// changeSetSnapshot invokes Git as the daemon uid; reclaim the already-
+	// collected test workspace so the byte-for-byte P2a assertion itself is not
+	// blocked by Git's cross-uid safe.directory policy.
+	chownTree(t, instance.Workspace, LocalIdentity{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())})
+	if want, got := changeSetSnapshot(t, instance.Workspace), changeSetSnapshot(t, host); got != want {
+		t.Fatalf("non-root collected host tree is not byte-identical\nwant:\n%s\ngot:\n%s", want, got)
+	}
+	if uid, gid := pathOwnership(t, filepath.Join(host, "new.bin")); uid != uint32(os.Geteuid()) || gid != uint32(os.Getegid()) {
+		t.Fatalf("imported ownership = %d:%d, want daemon %d:%d", uid, gid, os.Geteuid(), os.Getegid())
+	}
+}
+
+func TestLocalBackendCuratedScratchUsesConfiguredIdentity(t *testing.T) {
+	identity := testUnprivilegedIdentities(t, 1)[0]
+	host, _, _ := changeSetRepoPair(t)
+	backend := newPrivilegedTestLocalBackend(t, identity)
+	instance, err := backend.Provision(context.Background(), JobScope{JobID: "privilege-curated"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backend.Destroy(context.Background(), instance) })
+	if err := backend.SyncIn(context.Background(), instance, Materials{SourceWorktree: host}); err != nil {
+		t.Fatal(err)
+	}
+	scratch := filepath.Join(filepath.Dir(backend.root), "credential-scratch")
+	stream, err := backend.Exec(context.Background(), instance, Command{
+		Dir:         instance.Workspace,
+		Name:        "/bin/sh",
+		Args:        []string{"-c", `set -e; printf 'scratch-ok' > "$GH_CONFIG_DIR/proof"; id -u`},
+		BaseEnv:     []string{"PATH=/usr/bin:/bin", "GH_CONFIG_DIR=" + scratch},
+		ScratchDirs: []string{scratch},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := stream.Wait()
+	if err != nil {
+		t.Fatalf("curated non-root Exec: %v (stderr: %s)", err, result.Stderr)
+	}
+	if got, want := strings.TrimSpace(result.Stdout), strconv.FormatUint(uint64(identity.UID), 10); got != want {
+		t.Fatalf("curated command-reported euid = %q, want %s", got, want)
+	}
+	if _, err := os.Stat(scratch); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("curated scratch survived cleanup: %v", err)
+	}
+}
+
+func TestLocalBackendExecConfiguredIdentityFailureIsLoud(t *testing.T) {
+	identities := testUnprivilegedIdentities(t, 2)
+	if os.Getenv("GITMOOT_LOCAL_BACKEND_IDENTITY_FAILURE_HELPER") == "1" {
+		runLocalBackendIdentityFailureHelper(t, identities[1])
+		return
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("configured identity failure proof requires a root test process")
+	}
+	host, _, _ := changeSetRepoPair(t)
+	backend := newPrivilegedTestLocalBackend(t, identities[1])
+	instance, err := backend.Provision(context.Background(), JobScope{JobID: "privilege-failure"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backend.Destroy(context.Background(), instance) })
+	if err := backend.SyncIn(context.Background(), instance, Materials{SourceWorktree: host}); err != nil {
+		t.Fatal(err)
+	}
+	chownTree(t, instance.Workspace, identities[0])
+
+	helper := filepath.Join(filepath.Dir(backend.root), "identity-failure-helper")
+	binary, err := os.ReadFile(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(helper, binary, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(helper, int(identities[0].UID), int(identities[0].GID)); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(helper, "-test.run=^TestLocalBackendExecConfiguredIdentityFailureIsLoud$")
+	cmd.Env = append(os.Environ(),
+		"GITMOOT_LOCAL_BACKEND_IDENTITY_FAILURE_HELPER=1",
+		"GITMOOT_LOCAL_BACKEND_ROOT="+backend.root,
+		"GITMOOT_LOCAL_BACKEND_INSTANCE_ROOT="+instance.root,
+		"GITMOOT_LOCAL_BACKEND_INSTANCE_ID="+instance.ID,
+		"GITMOOT_LOCAL_BACKEND_WORKSPACE="+instance.Workspace,
+	)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{
+		Uid: identities[0].UID, Gid: identities[0].GID, Groups: []uint32{},
+	}}
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("identity failure helper: %v\n%s", err, output)
+	}
+}
+
+func runLocalBackendIdentityFailureHelper(t *testing.T, target LocalIdentity) {
+	backend, err := NewLocalBackend(os.Getenv("GITMOOT_LOCAL_BACKEND_ROOT"), &target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance := &Instance{
+		ID:        os.Getenv("GITMOOT_LOCAL_BACKEND_INSTANCE_ID"),
+		Workspace: os.Getenv("GITMOOT_LOCAL_BACKEND_WORKSPACE"),
+		root:      os.Getenv("GITMOOT_LOCAL_BACKEND_INSTANCE_ROOT"),
+	}
+	stream, err := backend.Exec(context.Background(), instance, Command{Dir: instance.Workspace, Name: "/bin/true"})
+	if err != nil {
+		t.Fatalf("Exec setup: %v", err)
+	}
+	_, err = stream.Wait()
+	if err == nil {
+		t.Fatal("configured identity failure silently ran the command")
+	}
+	if !strings.Contains(err.Error(), "execute local backend command as uid") || !strings.Contains(err.Error(), "operation not permitted") {
+		t.Fatalf("configured identity failure = %v, want attributed loud error", err)
 	}
 }
 
@@ -334,11 +516,90 @@ func newTestLocalBackend(t *testing.T) *LocalBackend {
 
 func newTestLocalBackendAt(t *testing.T, root string) *LocalBackend {
 	t.Helper()
-	backend, err := NewLocalBackend(root)
+	backend, err := NewLocalBackend(root, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return backend
+}
+
+func newPrivilegedTestLocalBackend(t *testing.T, identity LocalIdentity) *LocalBackend {
+	t.Helper()
+	if os.Geteuid() != 0 {
+		t.Skip("no privilege to apply a configured non-root identity")
+	}
+	parent := t.TempDir()
+	relative, err := filepath.Rel(os.TempDir(), parent)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		t.Skipf("temporary test root %q is not beneath traversable temp root %q", parent, os.TempDir())
+	}
+	for path := parent; filepath.Clean(path) != filepath.Clean(os.TempDir()); path = filepath.Dir(path) {
+		if err := os.Chmod(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backend, err := NewLocalBackend(filepath.Join(parent, "instances"), &identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return backend
+}
+
+func testUnprivilegedIdentities(t *testing.T, count int) []LocalIdentity {
+	t.Helper()
+	data, err := os.ReadFile("/etc/passwd")
+	if err != nil {
+		t.Skipf("no unprivileged identity configured: read /etc/passwd: %v", err)
+	}
+	identities := make([]LocalIdentity, 0, count)
+	seen := make(map[uint32]struct{})
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Split(line, ":")
+		if len(fields) < 4 {
+			continue
+		}
+		uid, uidErr := strconv.ParseUint(fields[2], 10, 32)
+		gid, gidErr := strconv.ParseUint(fields[3], 10, 32)
+		if uidErr != nil || gidErr != nil || uid == 0 || gid == 0 || uid == uint64(^uint32(0)) || gid == uint64(^uint32(0)) {
+			continue
+		}
+		convertedUID := uint32(uid)
+		if _, duplicate := seen[convertedUID]; duplicate {
+			continue
+		}
+		seen[convertedUID] = struct{}{}
+		identities = append(identities, LocalIdentity{UID: convertedUID, GID: uint32(gid)})
+		if len(identities) == count {
+			return identities
+		}
+	}
+	t.Skipf("no unprivileged identity configured: need %d distinct uid/gid pairs, found %d", count, len(identities))
+	return nil
+}
+
+func chownTree(t *testing.T, root string, identity LocalIdentity) {
+	t.Helper()
+	if err := filepath.WalkDir(root, func(path string, _ os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		return os.Lchown(path, int(identity.UID), int(identity.GID))
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func pathOwnership(t *testing.T, path string) (uint32, uint32) {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("filesystem ownership is unavailable on this platform")
+	}
+	return stat.Uid, stat.Gid
 }
 
 func tamperLocalMetadata(t *testing.T, root string, mutate func(map[string]any)) {

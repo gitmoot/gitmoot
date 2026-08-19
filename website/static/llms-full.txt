@@ -1941,6 +1941,11 @@ selection.
 ```toml
 [remote_exec]
 backend = "local"
+# Optional privilege drop; both fields are required together.
+local_uid = 1000
+local_gid = 1000
+# Use a traversable root when the Gitmoot home is below /root.
+local_root = "/var/tmp/gitmoot-local"
 ```
 
 `local` is the default and the only implemented backend. For an engine-driven
@@ -1951,6 +1956,30 @@ survives Mailbox repair deliveries. An implement job's changes return through
 the bounded transactional `BuildChangeSet` / `ImportChangeSet` transport before
 result observation; host Git commands and the finalizer still run against the
 host worktree, and backend-created commits are refused.
+
+`local_uid` and `local_gid` opt agent commands into a kernel-enforced non-root
+identity. Gitmoot never guesses a host account: both numeric values must be set
+together and both must be non-zero. After sync, Gitmoot hands the independent
+workspace to that identity; collection still runs in the daemon, temporarily
+reclaiming the clone for Git's ownership check, and import creates host files as
+the daemon user. Credential-application errors fail the command and never retry
+as the daemon user.
+
+The configured identity must be able to traverse every parent of the local
+backend root. The default root is below the Gitmoot home, so a root daemon whose
+home is under `/root` should also set absolute `local_root` to a dedicated
+directory beneath a suitable operator-managed parent such as `/var/tmp`. A
+filesystem root is rejected. Gitmoot makes its backend root and
+per-instance roots execute-only for traversal while leaving lifecycle metadata
+owned by the daemon. With no uid/gid configured, local execution retains the
+daemon identity for backward compatibility.
+
+The runtime executable and any child-readable file-backed state must also be
+reachable by the configured identity. In particular, a root daemon whose
+`claude` or `codex` resolves below `/root` must install the runtime at a
+traversable location and put that location first in the daemon's `PATH`; do not
+make `/root` traversable just to satisfy this requirement. An inaccessible
+runtime fails command startup rather than falling back to root.
 
 The local worktree's `.git` file points at an absolute gitdir in the source
 repository. That pointer resolves on the same filesystem, so `local` needs no
@@ -10383,6 +10412,39 @@ not enforcement. The strong "agents never hold real credentials" claim also
 requires Landlock read-rules for `runtime-auth.env` (same-UID read is currently
 possible) — that is P3. Codex/Kimi custody and hard egress enforcement also
 remain P3.
+
+## Execution Backend
+
+`[remote_exec] backend = "local"` is the default and only implemented execution
+backend. Engine-driven daemon jobs provision one job-scoped detached worktree,
+run the runtime there with streaming preserved, transactionally import implement
+changes into the host worktree before result observation, and then destroy the
+instance. The host finalizer remains the only committer and pusher. The instance
+persists across Mailbox repair deliveries; cancellation destroys it, and daemon
+startup reaps instances whose recorded owner process is gone.
+
+Local worktrees use Git's absolute gitdir pointer successfully because they share
+the host filesystem, so bundle/base-ref hydration is reserved for a future remote
+provider. Foreground dispatch remains on the host path. Unknown backend names and
+explicit blank selectors fail loudly; a job payload's `exec_backend` overrides
+the config for that job.
+
+Set numeric `[remote_exec] local_uid` and `local_gid` together to run local
+backend agent commands as that non-root identity. Gitmoot never invents an
+account, and a failed credential application fails the command without a root
+fallback. The workspace is handed to the configured identity after sync;
+collection/import remain daemon-side and imported files therefore retain the
+daemon user's ownership. If the default backend root is below a root-only
+parent (for example a root daemon using `/root/.gitmoot`), set absolute
+`local_root` to a dedicated operator-managed path whose parents the configured
+uid can traverse; filesystem roots are rejected. Omitting uid/gid preserves
+the daemon identity.
+
+The runtime executable must be traversable by the configured uid too. If a
+root daemon resolves `claude` or `codex` below `/root`, install the runtime at
+an accessible location and put it first in the daemon's `PATH`; do not loosen
+`/root` permissions. An inaccessible executable fails startup with no root
+fallback.
 
 ## Transcript Retention
 

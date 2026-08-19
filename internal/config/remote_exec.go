@@ -3,6 +3,8 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/execbackend"
@@ -21,6 +23,15 @@ type RemoteExecConfig struct {
 	// Backend is the [remote_exec].backend selection. "local" is the default
 	// and the only implemented value; anything else fails validation loud.
 	Backend string
+	// LocalUID and LocalGID opt local-backend commands into an OS-level
+	// privilege drop. They are a pair: omitting both preserves the daemon
+	// identity, while setting only one is invalid.
+	LocalUID *uint32
+	LocalGID *uint32
+	// LocalRoot optionally relocates local instances beneath a parent the
+	// configured identity can traverse (required when the Gitmoot home itself is
+	// below a root-only directory such as /root).
+	LocalRoot string
 }
 
 // DefaultRemoteExecConfig preserves today's behaviour: the local backend.
@@ -66,6 +77,23 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 				return RemoteExecConfig{}, fmt.Errorf("parse [remote_exec].backend: %w", err)
 			}
 			cfg.Backend = strings.TrimSpace(parsed)
+		case "local_uid", "local_gid":
+			parsed, err := strconv.ParseUint(strings.TrimSpace(value), 10, 32)
+			if err != nil {
+				return RemoteExecConfig{}, fmt.Errorf("parse [remote_exec].%s: expected an unsigned integer: %w", key, err)
+			}
+			converted := uint32(parsed)
+			if key == "local_uid" {
+				cfg.LocalUID = &converted
+			} else {
+				cfg.LocalGID = &converted
+			}
+		case "local_root":
+			parsed, err := parseConfigString(value)
+			if err != nil {
+				return RemoteExecConfig{}, fmt.Errorf("parse [remote_exec].local_root: %w", err)
+			}
+			cfg.LocalRoot = strings.TrimSpace(parsed)
 		default:
 			// Ignore unknown keys so the section remains forward-compatible.
 		}
@@ -80,5 +108,31 @@ func validateRemoteExecConfig(cfg RemoteExecConfig) error {
 	if _, err := execbackend.ParseImplemented(cfg.Backend); err != nil {
 		return fmt.Errorf("unsupported [remote_exec].backend: %w", err)
 	}
+	if (cfg.LocalUID == nil) != (cfg.LocalGID == nil) {
+		return fmt.Errorf("[remote_exec].local_uid and [remote_exec].local_gid must be configured together")
+	}
+	if cfg.LocalUID != nil {
+		if *cfg.LocalUID == 0 || *cfg.LocalUID == ^uint32(0) {
+			return fmt.Errorf("[remote_exec].local_uid must be a non-root usable uid, got %d", *cfg.LocalUID)
+		}
+		if *cfg.LocalGID == 0 || *cfg.LocalGID == ^uint32(0) {
+			return fmt.Errorf("[remote_exec].local_gid must be a non-root usable gid, got %d", *cfg.LocalGID)
+		}
+	}
+	if cfg.LocalRoot != "" && !filepath.IsAbs(cfg.LocalRoot) {
+		return fmt.Errorf("[remote_exec].local_root must be an absolute path, got %q", cfg.LocalRoot)
+	}
+	if cfg.LocalRoot != "" && filepath.Dir(filepath.Clean(cfg.LocalRoot)) == filepath.Clean(cfg.LocalRoot) {
+		return fmt.Errorf("[remote_exec].local_root must not be a filesystem root, got %q", cfg.LocalRoot)
+	}
 	return nil
+}
+
+// LocalIdentity returns nil unless the operator configured both identity
+// fields. No account name or numeric identity is inferred from the host.
+func (cfg RemoteExecConfig) LocalIdentity() *execbackend.LocalIdentity {
+	if cfg.LocalUID == nil || cfg.LocalGID == nil {
+		return nil
+	}
+	return &execbackend.LocalIdentity{UID: *cfg.LocalUID, GID: *cfg.LocalGID}
 }

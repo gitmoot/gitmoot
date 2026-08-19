@@ -134,6 +134,9 @@ artifact_blobs = %q
 # grants), which is unrelated.
 # [remote_exec]
 # backend = "local"
+# local_uid = 1000 # optional; configure together with non-root local_gid
+# local_gid = 1000
+# local_root = "/var/tmp/gitmoot-local" # absolute; parents must be traversable by local_uid
 
 # [transcripts] is ON by default. Raw unredacted runtime output
 # is retained in 0600 per-job append logs for deterministic trajectory export.
