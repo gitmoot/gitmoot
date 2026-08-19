@@ -394,18 +394,8 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		applyReviewPolicy(&engine, *home)
 		wireReviewRiskSignals(&engine, gh)
 		fmt.Fprintf(stdout, "watching %s every %s\n", repo.FullName(), poll.String())
-		return runSingleRepoSupervisor(ctx, *home, daemon.Daemon{
-			Repo:                    repo,
-			PollInterval:            *poll,
-			Store:                   store,
-			GitHub:                  gh,
-			Workflow:                &engine,
-			WatchIssues:             *watchIssues,
-			EscalationTTL:           resolveEscalationTTL(*home),
-			RevertDetectionEnabled:  resolveRevertDetectionEnabled(*home),
-			ObservePermissionPolicy: resolvePermissionPolicyObservationEnabled(*home),
-			AutoMergeEnabled:        autoMergeEnabledResolver(*home),
-		}, store, live, session, stdout)
+		supervisor := newSingleRepoSupervisorDaemon(repo, store, gh, engine, *home, resolvedHome, checkout, stdout, *poll, *watchIssues)
+		return runSingleRepoSupervisor(ctx, *home, supervisor, store, live, session, stdout)
 	})
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return 0
@@ -415,6 +405,41 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func newSingleRepoSupervisorDaemon(
+	repo github.Repository,
+	store *db.Store,
+	gh github.Client,
+	engine workflow.Engine,
+	rawHome string,
+	resolvedHome string,
+	checkout string,
+	stdout io.Writer,
+	pollInterval time.Duration,
+	watchIssues bool,
+) daemon.Daemon {
+	return daemon.Daemon{
+		Repo:         repo,
+		PollInterval: pollInterval,
+		Store:        store,
+		GitHub:       gh,
+		Workflow:     &engine,
+		WorkflowForJob: func(_ context.Context, job db.Job) (*workflow.Engine, error) {
+			runner, err := defaultJobWorker(store, stdout, rawHome).subprocessRunnerForJob(job)
+			if err != nil {
+				return nil, err
+			}
+			jobEngine := engine
+			jobEngine.MergeGate = newDaemonMergeGate(store, gh, checkout, resolvedHome, runner)
+			return &jobEngine, nil
+		},
+		WatchIssues:             watchIssues,
+		EscalationTTL:           resolveEscalationTTL(rawHome),
+		RevertDetectionEnabled:  resolveRevertDetectionEnabled(rawHome),
+		ObservePermissionPolicy: resolvePermissionPolicyObservationEnabled(rawHome),
+		AutoMergeEnabled:        autoMergeEnabledResolver(rawHome),
+	}
 }
 
 func runDaemonStop(args []string, stdout, stderr io.Writer) int {

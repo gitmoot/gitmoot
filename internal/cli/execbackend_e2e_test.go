@@ -548,6 +548,51 @@ func TestP2GapSupervisorAdvanceResolvesJobSubprocessRunner(t *testing.T) {
 	}
 }
 
+func TestP2GapSingleRepoSupervisorAdvanceResolvesJobSubprocessRunner(t *testing.T) {
+	home, paths, store := heartbeatLoopE2EHome(t)
+	payload, err := json.Marshal(workflow.JobPayload{ExecBackend: "p2-probe"})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	previousResolver := daemonJobExecBackendFor
+	var resolvedName string
+	var resolvedPresent bool
+	daemonJobExecBackendFor = func(_ jobWorker, name string, present bool) (execbackend.Backend, error) {
+		resolvedName = name
+		resolvedPresent = present
+		return execbackend.Backend("p2-probe"), nil
+	}
+	t.Cleanup(func() { daemonJobExecBackendFor = previousResolver })
+
+	checkout := t.TempDir()
+	supervisor := newSingleRepoSupervisorDaemon(
+		github.Repository{Owner: "owner", Name: "repo"},
+		store,
+		&cliPollFakeGitHub{},
+		workflow.Engine{Store: store},
+		home,
+		paths.Home,
+		checkout,
+		io.Discard,
+		30*time.Second,
+		false,
+	)
+	if supervisor.WorkflowForJob == nil {
+		t.Fatal("single-repo supervisor has no job-specific workflow factory")
+	}
+	_, err = supervisor.WorkflowForJob(context.Background(), db.Job{
+		ID:      "p2-single-repo-supervisor",
+		Payload: string(payload),
+	})
+	if err == nil || !strings.Contains(err.Error(), "p2-probe") {
+		t.Fatalf("single-repo supervisor workflow error = %v, want fail-closed p2-probe refusal", err)
+	}
+	if resolvedName != "p2-probe" || !resolvedPresent {
+		t.Fatalf("single-repo supervisor resolved name=%q present=%v, want stored p2-probe override", resolvedName, resolvedPresent)
+	}
+}
+
 // TestJobCheckoutRouteConsumesResolvedSubprocessRunner pins the production
 // checkoutForJob call site. Replacing defaultCheckoutForRunner with the
 // host-only defaultCheckout wrapper compiles, but ignores this resolved runner
