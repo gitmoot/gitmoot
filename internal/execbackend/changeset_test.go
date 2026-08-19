@@ -56,6 +56,57 @@ func TestChangeSetRoundTripsTrackedManifestAndIsIdempotent(t *testing.T) {
 	assertChangeSetTreesEqual(t, sandbox, host)
 }
 
+func TestChangeSetRoundTripsTrackedFileToDirectoryTransition(t *testing.T) {
+	host, sandbox, base := changeSetRepoPair(t)
+	if err := os.Remove(filepath.Join(sandbox, "deleted.txt")); err != nil {
+		t.Fatal(err)
+	}
+	writeChangeSetFile(t, sandbox, "deleted.txt/child.txt", "replacement child\n", 0o644)
+
+	changes, err := BuildChangeSet(context.Background(), sandbox, base)
+	if err != nil {
+		t.Fatalf("BuildChangeSet: %v", err)
+	}
+	if err := ImportChangeSet(context.Background(), host, changes); err != nil {
+		t.Fatalf("ImportChangeSet: %v", err)
+	}
+	if got, want := changeSetGit(t, host, "status", "--porcelain=v1", "--untracked-files=all"), changeSetGit(t, sandbox, "status", "--porcelain=v1", "--untracked-files=all"); got != want {
+		t.Fatalf("status differs\nwant:\n%s\ngot:\n%s", want, got)
+	}
+	if got := readChangeSetFile(t, host, "deleted.txt/child.txt"); got != "replacement child\n" {
+		t.Fatalf("replacement child = %q", got)
+	}
+	if err := ImportChangeSet(context.Background(), host, changes); err != nil {
+		t.Fatalf("idempotent ImportChangeSet: %v", err)
+	}
+}
+
+func TestChangeSetFileToDirectoryTransitionRollsBack(t *testing.T) {
+	host, sandbox, base := changeSetRepoPair(t)
+	if err := os.Remove(filepath.Join(sandbox, "deleted.txt")); err != nil {
+		t.Fatal(err)
+	}
+	writeChangeSetFile(t, sandbox, "deleted.txt/child.txt", "replacement child\n", 0o644)
+	changes, err := BuildChangeSet(context.Background(), sandbox, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := changeSetSnapshot(t, host)
+	importer := changeSetImporter{afterMaterialize: func(path string, _ int) error {
+		if path == "deleted.txt/child.txt" {
+			return context.Canceled
+		}
+		return nil
+	}}
+	err = importer.importChangeSet(context.Background(), host, changes)
+	if err == nil || !strings.Contains(err.Error(), "interrupted") {
+		t.Fatalf("interrupted transition error = %v", err)
+	}
+	if after := changeSetSnapshot(t, host); after != before {
+		t.Fatalf("host tree changed after transition rollback\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
 func TestChangeSetInterruptedMaterializationRollsBackEveryPath(t *testing.T) {
 	host, sandbox, base := changeSetRepoPair(t)
 	writeChangeSetFile(t, sandbox, "tracked.txt", "changed\n", 0o644)
@@ -82,7 +133,6 @@ func TestChangeSetInterruptedMaterializationRollsBackEveryPath(t *testing.T) {
 }
 
 func TestChangeSetRejectsUnsafePathsWithAttribution(t *testing.T) {
-	digest := sha256.Sum256([]byte("../../outside"))
 	for _, tc := range []struct {
 		name string
 		path string
@@ -101,6 +151,7 @@ func TestChangeSetRejectsUnsafePathsWithAttribution(t *testing.T) {
 			if tc.kind == ChangeWrite {
 				entry.Size = int64(len(tc.body))
 				entry.Content = tc.body
+				digest := sha256.Sum256(tc.body)
 				entry.SHA256 = hex.EncodeToString(digest[:])
 			}
 			err := validateChangeSet(ChangeSet{Version: ChangeSetVersion, BaseHEAD: strings.Repeat("a", 40), Manifest: []ChangeManifestEntry{entry}})
@@ -108,6 +159,17 @@ func TestChangeSetRejectsUnsafePathsWithAttribution(t *testing.T) {
 				t.Fatalf("rejection error = %v, want attributed path %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestChangeSetRejectsSymlinkIntoGitMetadata(t *testing.T) {
+	_, sandbox, base := changeSetRepoPair(t)
+	if err := os.Symlink(".git/config", filepath.Join(sandbox, "metadata-link")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := BuildChangeSet(context.Background(), sandbox, base)
+	if err == nil || !strings.Contains(err.Error(), "metadata-link") || !strings.Contains(err.Error(), ".git") {
+		t.Fatalf("BuildChangeSet metadata symlink error = %v", err)
 	}
 }
 

@@ -389,32 +389,46 @@ func TestMailboxImportsChangeSetBeforeResultObservation(t *testing.T) {
 	}
 }
 
-func TestMailboxMalformedRedeliveryImportsSameChangeSetIdempotently(t *testing.T) {
+func TestMailboxMalformedRedeliveryImportsFinalCumulativeChangeSet(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	host, _, changes := observationChangeSet(t, "claimed.go", "package imported\n")
+	host, sandbox, _ := observationChangeSet(t, "claimed.go", "package versionA\n")
+	base := strings.TrimSpace(runObservationGit(t, host, "rev-parse", "HEAD"))
 	collections := 0
 	mailbox := Mailbox{
 		Store: store,
 		CollectChangeSet: func(context.Context, execbackend.Backend, string) (*execbackend.ChangeSet, error) {
 			collections++
-			return &changes, nil
+			changes, err := execbackend.BuildChangeSet(context.Background(), sandbox, base)
+			return &changes, err
 		},
 	}
-	valid := `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["updated claimed.go"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
+	deliveries := 0
+	adapter := &fakeDelivery{
+		outputs: []string{"malformed result", `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["updated claimed.go"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`},
+		onDeliver: func() {
+			deliveries++
+			if deliveries == 2 {
+				writeObservationFile(t, sandbox, "claimed.go", "package versionB\n")
+			}
+		},
+	}
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID: "changeset-redelivery", Agent: "audit", Action: "implement", Repo: "gitmoot/gitmoot", WorktreePath: host,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := mailbox.Run(ctx, "changeset-redelivery", shellAgent(), &fakeDelivery{outputs: []string{"malformed result", valid}}); err != nil {
+	if _, err := mailbox.Run(ctx, "changeset-redelivery", shellAgent(), adapter); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if collections != 2 {
-		t.Fatalf("ChangeSet collections = %d, want 2 across malformed-output re-delivery", collections)
+	if deliveries != 2 {
+		t.Fatalf("deliveries = %d, want malformed delivery plus repair", deliveries)
 	}
-	if got := readObservationFile(t, host, "claimed.go"); got != "package imported\n" {
-		t.Fatalf("claimed.go after second import = %q", got)
+	if collections != 1 {
+		t.Fatalf("ChangeSet collections = %d, want one final cumulative collection", collections)
+	}
+	if got := readObservationFile(t, host, "claimed.go"); got != "package versionB\n" {
+		t.Fatalf("claimed.go after repair import = %q", got)
 	}
 }
 

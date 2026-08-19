@@ -24,6 +24,7 @@ const (
 	changeSetRegularMode     = 0o100644
 	changeSetExecutableMode  = 0o100755
 	changeSetSymlinkMode     = 0o120000
+	changeSetDirectoryMode   = 0o040000
 )
 
 type ChangeKind string
@@ -84,9 +85,17 @@ func BuildChangeSet(ctx context.Context, sandbox, expectedBase string) (ChangeSe
 	if err != nil {
 		return ChangeSet{}, fmt.Errorf("list untracked changes: %w", err)
 	}
+	deletedRaw, err := gitBytes(ctx, sandbox, "diff", "--diff-filter=D", "--name-only", "--no-renames", "-z", "HEAD", "--")
+	if err != nil {
+		return ChangeSet{}, fmt.Errorf("list tracked deletions: %w", err)
+	}
 
 	tracked := nulPaths(trackedRaw)
 	untracked := nulPaths(untrackedRaw)
+	deleted := make(map[string]struct{})
+	for _, path := range nulPaths(deletedRaw) {
+		deleted[path] = struct{}{}
+	}
 	if len(tracked)+len(untracked) > MaxChangeSetEntries {
 		return ChangeSet{}, fmt.Errorf("changeset has %d paths (limit %d)", len(tracked)+len(untracked), MaxChangeSetEntries)
 	}
@@ -105,7 +114,8 @@ func BuildChangeSet(ctx context.Context, sandbox, expectedBase string) (ChangeSe
 			if err := validateChangePath(path); err != nil {
 				return ChangeSet{}, err
 			}
-			entry, err := manifestEntry(sandbox, path, item.tracked)
+			_, trackedDeletion := deleted[path]
+			entry, err := manifestEntry(sandbox, path, item.tracked, item.tracked && trackedDeletion)
 			if err != nil {
 				return ChangeSet{}, err
 			}
@@ -120,8 +130,12 @@ func BuildChangeSet(ctx context.Context, sandbox, expectedBase string) (ChangeSe
 	return ChangeSet{Version: ChangeSetVersion, BaseHEAD: expectedBase, Patch: patch, Manifest: manifest}, nil
 }
 
-func manifestEntry(root, path string, tracked bool) (ChangeManifestEntry, error) {
+func manifestEntry(root, path string, tracked, trackedDeletion bool) (ChangeManifestEntry, error) {
 	entry := ChangeManifestEntry{Path: path, Tracked: tracked}
+	if trackedDeletion {
+		entry.Kind = ChangeDelete
+		return entry, nil
+	}
 	info, err := os.Lstat(filepath.Join(root, filepath.FromSlash(path)))
 	if errors.Is(err, fs.ErrNotExist) {
 		if !tracked {
@@ -436,6 +450,11 @@ func validateSymlinkTarget(path, target string) error {
 	if resolved == ".." || strings.HasPrefix(resolved, ".."+string(filepath.Separator)) {
 		return fmt.Errorf("changeset symlink %q escapes the worktree via target %q", path, target)
 	}
+	for _, part := range strings.Split(filepath.ToSlash(resolved), "/") {
+		if strings.EqualFold(part, ".git") {
+			return fmt.Errorf("changeset symlink %q targets forbidden .git metadata via %q", path, target)
+		}
+	}
 	return nil
 }
 
@@ -456,7 +475,7 @@ func verifyStaging(ctx context.Context, stage string, changes ChangeSet) error {
 			return err
 		}
 		if entry.Kind == ChangeDelete {
-			if state.exists {
+			if state.exists && !(state.mode == changeSetDirectoryMode && manifestHasDescendant(changes.Manifest, entry.Path)) {
 				return fmt.Errorf("changeset path %q should be deleted in staging", entry.Path)
 			}
 			continue
@@ -471,6 +490,16 @@ func verifyStaging(ctx context.Context, stage string, changes ChangeSet) error {
 		return fmt.Errorf("changeset manifest paths %q differ from staged paths %q", want, actual)
 	}
 	return nil
+}
+
+func manifestHasDescendant(entries []ChangeManifestEntry, path string) bool {
+	prefix := path + "/"
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Path, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func porcelainPaths(raw []byte) ([]string, error) {
@@ -497,8 +526,12 @@ func porcelainPaths(raw []byte) ([]string, error) {
 }
 
 func inspectNode(root, path string) (nodeState, error) {
-	if err := validateNoSymlinkParent(root, path); err != nil {
+	reachable, err := changeSetPathReachable(root, path)
+	if err != nil {
 		return nodeState{}, err
+	}
+	if !reachable {
+		return nodeState{}, nil
 	}
 	info, err := os.Lstat(filepath.Join(root, filepath.FromSlash(path)))
 	if errors.Is(err, fs.ErrNotExist) {
@@ -506,6 +539,9 @@ func inspectNode(root, path string) (nodeState, error) {
 	}
 	if err != nil {
 		return nodeState{}, fmt.Errorf("inspect changeset path %q: %w", path, err)
+	}
+	if info.IsDir() {
+		return nodeState{exists: true, mode: changeSetDirectoryMode}, nil
 	}
 	content, mode, err := readNode(root, path, info)
 	if err != nil {
@@ -515,26 +551,26 @@ func inspectNode(root, path string) (nodeState, error) {
 	return nodeState{exists: true, mode: mode, size: int64(len(content)), sha256: hex.EncodeToString(sum[:]), content: content}, nil
 }
 
-func validateNoSymlinkParent(root, path string) error {
+func changeSetPathReachable(root, path string) (bool, error) {
 	current := root
 	parts := strings.Split(path, "/")
 	for _, part := range parts[:len(parts)-1] {
 		current = filepath.Join(current, part)
 		info, err := os.Lstat(current)
 		if errors.Is(err, fs.ErrNotExist) {
-			return nil
+			return false, nil
 		}
 		if err != nil {
-			return fmt.Errorf("inspect parent of changeset path %q: %w", path, err)
+			return false, fmt.Errorf("inspect parent of changeset path %q: %w", path, err)
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("changeset path %q escapes through symlink parent %q", path, current)
+			return false, fmt.Errorf("changeset path %q escapes through symlink parent %q", path, current)
 		}
 		if !info.IsDir() {
-			return fmt.Errorf("changeset path %q has non-directory parent %q", path, current)
+			return false, nil
 		}
 	}
-	return nil
+	return true, nil
 }
 
 func sameNode(a, b nodeState) bool {
@@ -568,6 +604,9 @@ func writeEntry(root string, entry ChangeManifestEntry) error {
 func replaceNode(path string, state nodeState) error {
 	if err := removeNode(path); err != nil {
 		return err
+	}
+	if state.mode == changeSetDirectoryMode {
+		return os.Mkdir(path, 0o755)
 	}
 	if state.mode == changeSetSymlinkMode {
 		return os.Symlink(string(state.content), path)
@@ -672,7 +711,20 @@ func restorePaths(root string, entries []ChangeManifestEntry, backup map[string]
 	}
 	sort.Slice(dirs, func(a, b int) bool { return len(dirs[a]) > len(dirs[b]) })
 	for _, dir := range dirs {
-		if err := os.Remove(dir); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		info, err := os.Lstat(dir)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		// A file-to-directory rollback restores the original file at the same
+		// path as a directory created during materialization. Do not remove that
+		// restored node while pruning now-empty created directories.
+		if !info.IsDir() {
+			continue
+		}
+		if err := os.Remove(dir); err != nil {
 			return err
 		}
 	}

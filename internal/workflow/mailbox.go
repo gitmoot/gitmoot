@@ -35,10 +35,9 @@ type Mailbox struct {
 	Store *db.Store
 	// CollectChangeSet is the P2a host-import seam. A non-local backend wires a
 	// collector here once it owns an instance lifecycle (P2b); nil preserves the
-	// local backend byte-for-byte. It is consulted after every successful
-	// delivery, including malformed-output repair turns, because each turn may
-	// have changed the isolated tree. ImportChangeSet is idempotent, so collecting
-	// the same cumulative ChangeSet twice is a no-op.
+	// local backend byte-for-byte. It is consulted once after the delivery sequence
+	// produces a valid result, so repair turns may keep advancing the cumulative
+	// sandbox state without exposing an intermediate materialization on the host.
 	CollectChangeSet func(ctx context.Context, backend execbackend.Backend, jobID string) (*execbackend.ChangeSet, error)
 	// ApplyChangeSet is the host materializer paired with CollectChangeSet. Nil
 	// selects execbackend.ImportChangeSet; the field exists so ordering/failure
@@ -1167,9 +1166,6 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		// agent's output), the precondition for #532 operational classification.
 		return AgentResult{}, deliveryErr
 	}
-	if err := m.importDeliveryChangeSet(ctx, job, payload, execBackend); err != nil {
-		return AgentResult{}, err
-	}
 	// SESSION SAFETY (#531): a job running under a per-job runtime override must
 	// never write back to the agent's stored resume state — the stored ref
 	// belongs to the DEFAULT runtime, and persisting an override-runtime ref
@@ -1248,9 +1244,6 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 				m.recordRoutingTelemetry(ctx, job, agent, payload, AgentResult{}, JobFailed, time.Since(runStart))
 				return AgentResult{}, deliveryErr
 			}
-			if err := m.importDeliveryChangeSet(ctx, job, payload, execBackend); err != nil {
-				return AgentResult{}, err
-			}
 			// Same #531 override + #665 ephemeral guard as the first delivery: never
 			// persist an override-runtime ref or a by-design per-job session onto the
 			// agent's default-runtime resume state.
@@ -1295,6 +1288,9 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 			return AgentResult{}, parseErr
 		}
 	}
+	if err := m.importDeliveryChangeSet(ctx, job, payload, execBackend); err != nil {
+		return AgentResult{}, err
+	}
 
 	// A produce stage may declare a trusted deterministic check. Run it only after
 	// a valid envelope and before terminal persistence. Failures re-deliver to the
@@ -1332,9 +1328,6 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 				m.storeFailureDiagnostics(ctx, job.ID, &payload, diag)
 				_ = m.fail(ctx, job.ID, fmt.Sprintf("produce correction delivery failed: %v", deliveryErr))
 				return AgentResult{}, DeliveryError{Err: deliveryErr}
-			}
-			if err := m.importDeliveryChangeSet(ctx, job, payload, execBackend); err != nil {
-				return AgentResult{}, err
 			}
 			if payload.RuntimeOverride == "" && !registeredFreshRef && !ephemeral {
 				m.persistRefreshedRuntimeRef(ctx, job.ID, agent, refreshedRef)
