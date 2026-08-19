@@ -310,6 +310,13 @@ func (i changeSetImporter) importChangeSet(ctx context.Context, worktree string,
 			atBase = false
 		}
 	}
+	structuralMatch, err := structuralDirectoriesEqual(stage, worktree, changes.Manifest, desiredStates)
+	if err != nil {
+		return err
+	}
+	if !structuralMatch {
+		alreadyApplied = false
+	}
 	if alreadyApplied {
 		return nil
 	}
@@ -328,8 +335,9 @@ func (i changeSetImporter) importChangeSet(ctx context.Context, worktree string,
 		return err
 	}
 	createdDirs := make(map[string]struct{})
+	mutatedPaths := make(map[string]struct{})
 	rollback := func(cause error) error {
-		if err := restorePaths(worktree, changes.Manifest, backup, createdDirs); err != nil {
+		if err := restorePaths(worktree, changes.Manifest, backup, createdDirs, mutatedPaths); err != nil {
 			return fmt.Errorf("%v; rollback failed: %w", cause, err)
 		}
 		return cause
@@ -338,6 +346,9 @@ func (i changeSetImporter) importChangeSet(ctx context.Context, worktree string,
 		if err := ctx.Err(); err != nil {
 			return rollback(fmt.Errorf("changeset import interrupted before path %q: %w", entry.Path, err))
 		}
+		// Mark the path before mutation begins: materializeEntry may fail after
+		// removing or replacing the node, so rollback must own that attempt.
+		mutatedPaths[entry.Path] = struct{}{}
 		if err := materializeEntry(worktree, stage, entry, createdDirs); err != nil {
 			return rollback(fmt.Errorf("materialize changeset path %q: %w", entry.Path, err))
 		}
@@ -346,6 +357,13 @@ func (i changeSetImporter) importChangeSet(ctx context.Context, worktree string,
 				return rollback(fmt.Errorf("changeset import interrupted after path %q: %w", entry.Path, err))
 			}
 		}
+	}
+	materialized, err := materializationMatches(worktree, stage, changes.Manifest, desiredStates)
+	if err != nil {
+		return rollback(fmt.Errorf("verify materialized changeset: %w", err))
+	}
+	if !materialized {
+		return rollback(errors.New("verify materialized changeset: host tree differs from authenticated staging tree"))
 	}
 	finalHEAD, err := gitOutput(ctx, worktree, "rev-parse", "HEAD")
 	if err != nil {
@@ -577,6 +595,80 @@ func sameNode(a, b nodeState) bool {
 	return a.exists == b.exists && (!a.exists || (a.mode == b.mode && a.size == b.size && a.sha256 == b.sha256))
 }
 
+func materializationMatches(root, stage string, entries []ChangeManifestEntry, desired map[string]nodeState) (bool, error) {
+	for _, entry := range entries {
+		current, err := inspectNode(root, entry.Path)
+		if err != nil {
+			return false, err
+		}
+		if !sameNode(current, desired[entry.Path]) {
+			return false, nil
+		}
+	}
+	return structuralDirectoriesEqual(stage, root, entries, desired)
+}
+
+func structuralDirectoriesEqual(wantRoot, gotRoot string, entries []ChangeManifestEntry, desired map[string]nodeState) (bool, error) {
+	for _, entry := range entries {
+		if desired[entry.Path].mode != changeSetDirectoryMode {
+			continue
+		}
+		want, wantDirectory, err := directoryDescendants(wantRoot, entry.Path)
+		if err != nil {
+			return false, err
+		}
+		got, gotDirectory, err := directoryDescendants(gotRoot, entry.Path)
+		if err != nil {
+			return false, err
+		}
+		if !wantDirectory || !gotDirectory || len(want) != len(got) {
+			return false, nil
+		}
+		for path, wantState := range want {
+			gotState, ok := got[path]
+			if !ok || !sameNode(wantState, gotState) {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}
+
+func directoryDescendants(root, path string) (map[string]nodeState, bool, error) {
+	directory := filepath.Join(root, filepath.FromSlash(path))
+	info, err := os.Lstat(directory)
+	if errors.Is(err, fs.ErrNotExist) || (err == nil && !info.IsDir()) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("inspect structural directory %q: %w", path, err)
+	}
+	states := make(map[string]nodeState)
+	err = filepath.WalkDir(directory, func(full string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if full == directory {
+			return nil
+		}
+		relative, err := filepath.Rel(directory, full)
+		if err != nil {
+			return err
+		}
+		relative = filepath.ToSlash(relative)
+		state, err := inspectNode(root, path+"/"+relative)
+		if err != nil {
+			return err
+		}
+		states[relative] = state
+		return nil
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("inspect descendants of structural directory %q: %w", path, err)
+	}
+	return states, true, nil
+}
+
 func materializeEntry(root, stage string, entry ChangeManifestEntry, createdDirs map[string]struct{}) error {
 	path := filepath.Join(root, filepath.FromSlash(entry.Path))
 	if entry.Kind == ChangeDelete {
@@ -687,22 +779,28 @@ func snapshotPaths(root string, entries []ChangeManifestEntry) (map[string]nodeS
 	return result, nil
 }
 
-func restorePaths(root string, entries []ChangeManifestEntry, backup map[string]nodeState, createdDirs map[string]struct{}) error {
+func restorePaths(root string, entries []ChangeManifestEntry, backup map[string]nodeState, createdDirs, mutatedPaths map[string]struct{}) error {
 	ordered := materializationOrder(entries)
+	// Remove importer-owned leaf nodes first. Structural directories are pruned
+	// in the next phase, after their materialized descendants are gone.
 	for index := len(ordered) - 1; index >= 0; index-- {
 		entry := ordered[index]
-		path := filepath.Join(root, filepath.FromSlash(entry.Path))
-		if err := removeNode(path); err != nil {
-			return fmt.Errorf("remove %q during rollback: %w", entry.Path, err)
+		if _, ok := mutatedPaths[entry.Path]; !ok {
+			continue
 		}
-		state := backup[entry.Path]
-		if state.exists {
-			if err := ensureParentDirs(root, entry.Path, nil); err != nil {
-				return err
-			}
-			if err := replaceNode(path, state); err != nil {
-				return fmt.Errorf("restore %q during rollback: %w", entry.Path, err)
-			}
+		path := filepath.Join(root, filepath.FromSlash(entry.Path))
+		info, err := os.Lstat(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("inspect %q during rollback: %w", entry.Path, err)
+		}
+		if info.IsDir() {
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("remove %q during rollback: %w", entry.Path, err)
 		}
 	}
 	dirs := make([]string, 0, len(createdDirs))
@@ -718,14 +816,31 @@ func restorePaths(root string, entries []ChangeManifestEntry, backup map[string]
 		if err != nil {
 			return err
 		}
-		// A file-to-directory rollback restores the original file at the same
-		// path as a directory created during materialization. Do not remove that
-		// restored node while pruning now-empty created directories.
+		// Only directories created by this import belong to this pruning phase.
 		if !info.IsDir() {
 			continue
 		}
 		if err := os.Remove(dir); err != nil {
 			return err
+		}
+	}
+	// Restore ancestors before descendants when a directory was replaced by a
+	// file. Reverse materialization order has exactly that property.
+	for index := len(ordered) - 1; index >= 0; index-- {
+		entry := ordered[index]
+		if _, ok := mutatedPaths[entry.Path]; !ok {
+			continue
+		}
+		state := backup[entry.Path]
+		if !state.exists {
+			continue
+		}
+		path := filepath.Join(root, filepath.FromSlash(entry.Path))
+		if err := ensureParentDirs(root, entry.Path, nil); err != nil {
+			return err
+		}
+		if err := replaceNode(path, state); err != nil {
+			return fmt.Errorf("restore %q during rollback: %w", entry.Path, err)
 		}
 	}
 	return nil

@@ -86,14 +86,14 @@ func TestChangeSetFileToDirectoryTransitionRollsBack(t *testing.T) {
 	if err := os.Remove(filepath.Join(sandbox, "deleted.txt")); err != nil {
 		t.Fatal(err)
 	}
-	writeChangeSetFile(t, sandbox, "deleted.txt/child.txt", "replacement child\n", 0o644)
+	writeChangeSetFile(t, sandbox, "deleted.txt/nested/child.txt", "replacement child\n", 0o644)
 	changes, err := BuildChangeSet(context.Background(), sandbox, base)
 	if err != nil {
 		t.Fatal(err)
 	}
 	before := changeSetSnapshot(t, host)
 	importer := changeSetImporter{afterMaterialize: func(path string, _ int) error {
-		if path == "deleted.txt/child.txt" {
+		if path == "deleted.txt/nested/child.txt" {
 			return context.Canceled
 		}
 		return nil
@@ -104,6 +104,30 @@ func TestChangeSetFileToDirectoryTransitionRollsBack(t *testing.T) {
 	}
 	if after := changeSetSnapshot(t, host); after != before {
 		t.Fatalf("host tree changed after transition rollback\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+func TestChangeSetIdempotencyRejectsUnmanifestedDirectoryDescendant(t *testing.T) {
+	host, sandbox, base := changeSetRepoPair(t)
+	if err := os.Remove(filepath.Join(sandbox, "deleted.txt")); err != nil {
+		t.Fatal(err)
+	}
+	writeChangeSetFile(t, sandbox, "deleted.txt/child.txt", "replacement child\n", 0o644)
+	changes, err := BuildChangeSet(context.Background(), sandbox, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ImportChangeSet(context.Background(), host, changes); err != nil {
+		t.Fatalf("first ImportChangeSet: %v", err)
+	}
+	writeChangeSetFile(t, host, "deleted.txt/host-only.txt", "concurrent host content\n", 0o644)
+
+	err = ImportChangeSet(context.Background(), host, changes)
+	if err == nil || !strings.Contains(err.Error(), "partial or different materialization") {
+		t.Fatalf("ImportChangeSet with unmanifested descendant error = %v", err)
+	}
+	if got := readChangeSetFile(t, host, "deleted.txt/host-only.txt"); got != "concurrent host content\n" {
+		t.Fatalf("unmanifested host descendant changed: %q", got)
 	}
 }
 
