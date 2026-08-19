@@ -107,11 +107,20 @@ type localInstanceMetadata struct {
 	State               string `json:"state"`
 }
 
+// LocalIdentity is the explicitly configured operating-system identity used by
+// local-backend agent commands. UID and GID must both be non-zero; Gitmoot never
+// guesses an account on the host.
+type LocalIdentity struct {
+	UID uint32
+	GID uint32
+}
+
 // LocalBackend executes a job in an independent detached clone on the same
 // filesystem as its host checkout. Each instance owns its Git metadata, refs,
 // config, and objects, and has no remote back to the host repository.
 type LocalBackend struct {
-	root string
+	root     string
+	identity *LocalIdentity
 
 	mu     sync.Mutex
 	active map[string]map[*localExec]struct{}
@@ -121,7 +130,7 @@ type LocalBackend struct {
 	afterWorkspaceCreated func(*Instance)
 }
 
-func NewLocalBackend(root string) (*LocalBackend, error) {
+func NewLocalBackend(root string, identity *LocalIdentity) (*LocalBackend, error) {
 	root = strings.TrimSpace(root)
 	if root == "" {
 		return nil, errors.New("local execution-backend root is required")
@@ -130,7 +139,20 @@ func NewLocalBackend(root string) (*LocalBackend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve local execution-backend root: %w", err)
 	}
-	return &LocalBackend{root: filepath.Clean(absolute), active: make(map[string]map[*localExec]struct{})}, nil
+	absolute = filepath.Clean(absolute)
+	if filepath.Dir(absolute) == absolute {
+		return nil, fmt.Errorf("local execution-backend root must not be a filesystem root: %q", absolute)
+	}
+	if identity != nil {
+		if identity.UID == 0 || identity.UID == ^uint32(0) {
+			return nil, fmt.Errorf("local execution-backend uid must be a non-root usable uid, got %d", identity.UID)
+		}
+		if identity.GID == 0 || identity.GID == ^uint32(0) {
+			return nil, fmt.Errorf("local execution-backend gid must be a non-root usable gid, got %d", identity.GID)
+		}
+		identity = &LocalIdentity{UID: identity.UID, GID: identity.GID}
+	}
+	return &LocalBackend{root: absolute, identity: identity, active: make(map[string]map[*localExec]struct{})}, nil
 }
 
 func (b *LocalBackend) Name() Backend { return Local }
@@ -218,6 +240,9 @@ func (b *LocalBackend) SyncIn(ctx context.Context, instance *Instance, materials
 	if err := ImportChangeSet(ctx, instance.Workspace, changes); err != nil {
 		return fmt.Errorf("materialize local execution sync input: %w", err)
 	}
+	if err := b.handoffWorkspace(instance); err != nil {
+		return err
+	}
 	return writeLocalMetadata(instance.root, metadataForInstance(instance, "running"))
 }
 
@@ -240,12 +265,14 @@ func (b *LocalBackend) Exec(ctx context.Context, instance *Instance, command Com
 		defer close(running.done)
 		defer b.unregister(instance.ID, running)
 		defer cancel()
-		var runner localCommandRunner = subprocess.GroupRunner{MaxOutputBytes: command.MaxOutputBytes}
+		credential := b.credential()
+		var runner localCommandRunner = subprocess.GroupRunner{MaxOutputBytes: command.MaxOutputBytes, Credential: credential}
 		if command.BaseEnv != nil {
 			runner = subprocess.CuratedGroupRunner{
 				BaseEnv:        command.BaseEnv,
 				ScratchDirs:    command.ScratchDirs,
 				MaxOutputBytes: command.MaxOutputBytes,
+				Credential:     credential,
 			}
 		}
 		var result subprocess.Result
@@ -254,6 +281,9 @@ func (b *LocalBackend) Exec(ctx context.Context, instance *Instance, command Com
 			result, runErr = runner.RunEnvStreamWithPID(execCtx, dir, command.Env, command.Output, command.OnStart, command.Name, command.Args...)
 		} else {
 			result, runErr = runner.RunEnvWithPID(execCtx, dir, command.Env, command.OnStart, command.Name, command.Args...)
+		}
+		if runErr != nil && b.identity != nil {
+			runErr = fmt.Errorf("execute local backend command as uid %d gid %d: %w", b.identity.UID, b.identity.GID, runErr)
 		}
 		stream.result <- localExecResult{result: ExecResult{
 			Command: result.Command,
@@ -265,6 +295,44 @@ func (b *LocalBackend) Exec(ctx context.Context, instance *Instance, command Com
 	return stream, nil
 }
 
+func (b *LocalBackend) credential() *syscall.Credential {
+	if b == nil || b.identity == nil {
+		return nil
+	}
+	// An empty Groups slice makes the kernel clear supplementary groups before
+	// setgid/setuid. Retaining the daemon's root groups would defeat the drop.
+	return &syscall.Credential{Uid: b.identity.UID, Gid: b.identity.GID, Groups: []uint32{}}
+}
+
+func (b *LocalBackend) handoffWorkspace(instance *Instance) error {
+	if b.identity == nil {
+		return nil
+	}
+	// Keep backend and instance roots owned by the daemon: execute-only access
+	// lets the configured identity traverse to its workspace without exposing
+	// sibling instance names or writable lifecycle metadata. The configured
+	// root's parent must likewise be traversable by that identity.
+	if err := os.Chmod(b.root, 0o711); err != nil {
+		return fmt.Errorf("make local execution-backend root traversable for uid %d: %w", b.identity.UID, err)
+	}
+	if err := os.Chmod(instance.root, 0o711); err != nil {
+		return fmt.Errorf("make local execution instance %q traversable for uid %d: %w", instance.ID, b.identity.UID, err)
+	}
+	if err := chownLocalWorkspace(instance.Workspace, b.identity.UID, b.identity.GID); err != nil {
+		return fmt.Errorf("hand local execution workspace to uid %d gid %d: %w", b.identity.UID, b.identity.GID, err)
+	}
+	return nil
+}
+
+func chownLocalWorkspace(workspace string, uid, gid uint32) error {
+	return filepath.WalkDir(workspace, func(path string, _ os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		return os.Lchown(path, int(uid), int(gid))
+	})
+}
+
 func (b *LocalBackend) Collect(ctx context.Context, instance *Instance) (ChangeSet, error) {
 	if err := b.validateInstance(instance); err != nil {
 		return ChangeSet{}, err
@@ -272,7 +340,21 @@ func (b *LocalBackend) Collect(ctx context.Context, instance *Instance) (ChangeS
 	if strings.TrimSpace(instance.BaseHEAD) == "" {
 		return ChangeSet{}, errors.New("local execution instance has no synced base HEAD")
 	}
-	return BuildChangeSet(ctx, instance.Workspace, instance.BaseHEAD)
+	if b.identity == nil {
+		return BuildChangeSet(ctx, instance.Workspace, instance.BaseHEAD)
+	}
+	// Git refuses to inspect a repository owned by another uid even when the
+	// daemon is root. Reclaim ownership only for host-side collection, then hand
+	// it back so a later Mailbox repair delivery can reuse the same instance.
+	if err := chownLocalWorkspace(instance.Workspace, uint32(os.Geteuid()), uint32(os.Getegid())); err != nil {
+		return ChangeSet{}, fmt.Errorf("reclaim local execution workspace for collection: %w", err)
+	}
+	changes, collectErr := BuildChangeSet(ctx, instance.Workspace, instance.BaseHEAD)
+	handoffErr := b.handoffWorkspace(instance)
+	if collectErr != nil || handoffErr != nil {
+		return ChangeSet{}, errors.Join(collectErr, handoffErr)
+	}
+	return changes, nil
 }
 
 func (b *LocalBackend) Cancel(ctx context.Context, instance *Instance) error {

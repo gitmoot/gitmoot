@@ -286,6 +286,23 @@ provider. Foreground dispatch remains on the host path. Unknown backend names an
 explicit blank selectors fail loudly; a job payload's `exec_backend` overrides
 the config for that job.
 
+Set numeric `[remote_exec] local_uid` and `local_gid` together to run local
+backend agent commands as that non-root identity. Gitmoot never invents an
+account, and a failed credential application fails the command without a root
+fallback. The workspace is handed to the configured identity after sync;
+collection/import remain daemon-side and imported files therefore retain the
+daemon user's ownership. If the default backend root is below a root-only
+parent (for example a root daemon using `/root/.gitmoot`), set absolute
+`local_root` to a dedicated operator-managed path whose parents the configured
+uid can traverse; filesystem roots are rejected. Omitting uid/gid preserves
+the daemon identity.
+
+The runtime executable must be traversable by the configured uid too. If a
+root daemon resolves `claude` or `codex` below `/root`, install the runtime at
+an accessible location and put it first in the daemon's `PATH`; do not loosen
+`/root` permissions. An inaccessible executable fails startup with no root
+fallback.
+
 ## Transcript Retention
 
 Runtime transcript retention is default-on. Every engine delivery appends its
