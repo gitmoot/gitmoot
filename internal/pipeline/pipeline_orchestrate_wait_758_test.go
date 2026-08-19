@@ -43,7 +43,7 @@ stages:
 // see exactly what the engine would have persisted.
 func seedContinuationJob(t *testing.T, store *db.Store, id, parentID, rootID string) {
 	t.Helper()
-	mailbox := workflow.Mailbox{Store: store}
+	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("test enqueue-only mailbox"))
 	if _, err := mailbox.Enqueue(context.Background(), workflow.JobRequest{
 		ID:          id,
 		Agent:       "planner",

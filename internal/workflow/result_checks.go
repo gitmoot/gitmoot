@@ -157,7 +157,7 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 				Pass:        madePass,
 				Explanation: explain(madePass, "the implement job reports decision \"implemented\" but changes_made[] is empty"),
 			})
-			if in.Observation != nil && in.Observation.Error == "" {
+			if in.Observation != nil && in.Observation.Source == ResultObservationSourceWorktreeDiff && in.Observation.Error == "" {
 				invalidBindings := invalidCapturedBindingClaims(in.Observation.Changes, in.Observation.TouchedFiles)
 				consistent := !in.Observation.Divergent && len(invalidBindings) == 0
 				checks = append(checks, ResultCheck{

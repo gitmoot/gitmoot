@@ -52,7 +52,7 @@ func newTestPipeline(t *testing.T, store *db.Store, name, specYAML string) (db.P
 }
 
 func testStageEnqueuer(store *db.Store) pipeline.PipelineStageEnqueuer {
-	mailbox := workflow.Mailbox{Store: store}
+	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("test enqueue-only mailbox"))
 	return func(ctx context.Context, request workflow.JobRequest) (db.Job, error) {
 		return mailbox.Enqueue(ctx, request)
 	}

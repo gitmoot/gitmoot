@@ -39,7 +39,7 @@ func runMemJob(t *testing.T, store *db.Store, ctrl *MemoryController, output, in
 func runMemJobWithID(t *testing.T, store *db.Store, ctrl *MemoryController, jobID, output, instructions string) string {
 	t.Helper()
 	ctx := context.Background()
-	mb := Mailbox{Store: store}
+	mb := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	if ctrl != nil {
 		mb.injectMemory = ctrl.injectBlock
 		mb.recordMemory = ctrl.record

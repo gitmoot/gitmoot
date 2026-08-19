@@ -69,7 +69,7 @@ func ParseSessionJobDisplayEvent(event db.JobEvent) (SessionJobDisplayEvent, boo
 // result and move the job to its terminal state; lifecycle maintenance separately
 // cancels a genuinely orphaned session row.
 func (m Mailbox) OpenExternalJob(ctx context.Context, request JobRequest) (db.Job, error) {
-	if m.Store == nil {
+	if m.store == nil {
 		return db.Job{}, errors.New("mailbox store is required")
 	}
 	if err := validateJobRequest(request); err != nil {
@@ -117,7 +117,7 @@ func (m Mailbox) OpenExternalJob(ctx context.Context, request JobRequest) (db.Jo
 	if displayEvent, ok := sessionJobDisplayEvent(job.ID, request.HeadSHA); ok {
 		events = append(events, displayEvent)
 	}
-	if err := m.Store.CreateExternallyDrivenJobWithEvent(ctx, job, events[0], events[1:]...); err != nil {
+	if err := m.store.CreateExternallyDrivenJobWithEvent(ctx, job, events[0], events[1:]...); err != nil {
 		return db.Job{}, err
 	}
 	return job, nil
@@ -145,14 +145,14 @@ func (m Mailbox) CloseExternalJob(ctx context.Context, jobID string, result Agen
 // transition share one transaction, so a terminal session row cannot lose usage
 // that was part of the accepted close operation.
 func (m Mailbox) CloseExternalJobWithUsage(ctx context.Context, jobID string, result AgentResult, prOverride int, headSHAOverride, branchOverride string, usage ExternalJobUsage) (db.Job, error) {
-	if m.Store == nil {
+	if m.store == nil {
 		return db.Job{}, errors.New("mailbox store is required")
 	}
 	if _, ok := allowedSet(ResultDecisions)[result.Decision]; !ok {
 		return db.Job{}, fmt.Errorf("unsupported decision %q; want one of %s", result.Decision, strings.Join(ResultDecisions, ", "))
 	}
 
-	job, err := m.Store.GetJob(ctx, jobID)
+	job, err := m.store.GetJob(ctx, jobID)
 	if err != nil {
 		return db.Job{}, err
 	}
@@ -188,7 +188,7 @@ func (m Mailbox) CloseExternalJobWithUsage(ctx context.Context, jobID string, re
 	if displayEvent, ok := sessionJobDisplayEvent(jobID, headSHAOverride); ok {
 		extraEvents = append(extraEvents, displayEvent)
 	}
-	transitioned, err := m.Store.TransitionJobStatePayloadUsageWithEvent(ctx, jobID, string(JobRunning), string(state), encoded,
+	transitioned, err := m.store.TransitionJobStatePayloadUsageWithEvent(ctx, jobID, string(JobRunning), string(state), encoded,
 		strings.TrimSpace(usage.Model), usage.InputTokens, usage.OutputTokens, db.JobEvent{
 			JobID:   jobID,
 			Kind:    string(state),
@@ -198,7 +198,7 @@ func (m Mailbox) CloseExternalJobWithUsage(ctx context.Context, jobID string, re
 		return db.Job{}, err
 	}
 	if !transitioned {
-		latest, getErr := m.Store.GetJob(ctx, jobID)
+		latest, getErr := m.store.GetJob(ctx, jobID)
 		if getErr != nil {
 			return db.Job{}, getErr
 		}
@@ -210,7 +210,7 @@ func (m Mailbox) CloseExternalJobWithUsage(ctx context.Context, jobID string, re
 	if m.emitTerminal != nil {
 		m.emitTerminal(ctx, jobID, state, payload)
 	}
-	return m.Store.GetJob(ctx, jobID)
+	return m.store.GetJob(ctx, jobID)
 }
 
 // OpenExternalJob records a session job's clock-in through the engine's Mailbox so

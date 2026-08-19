@@ -34,7 +34,11 @@ func pipelineStageCheckoutPath(ctx context.Context, store *db.Store, repo string
 // indistinguishable from a normal background job once enqueued (the runner agent
 // carries no template, so canary never actually samples).
 func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueuer {
-	mailbox := workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(home), RuntimeDefaultModel: runtimeDefaultModelResolver(home), RequireWorkflowPolicy: requireWorkflowPolicyResolver(home), OrgPolicy: orgPolicyResolver(home)}
+	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("pipeline stage enqueue"))
+	mailbox.CanaryEnabled = canaryRoutingEnabled(home)
+	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(home)
+	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(home)
+	mailbox.OrgPolicy = orgPolicyResolver(home)
 	return func(ctx context.Context, request workflow.JobRequest) (db.Job, error) {
 		backend, err := localAgentDispatchExecBackendFor(home)
 		if err != nil {

@@ -1082,7 +1082,7 @@ func TestEngineRunJobAdvancesCompletedResult(t *testing.T) {
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"implemented","summary":"opened PR","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 	}}
-	if _, err := (Mailbox{Store: store}).Enqueue(ctx, JobRequest{
+	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, JobRequest{
 		ID:          "implement-job",
 		Agent:       "lead",
 		Action:      "implement",
@@ -1125,7 +1125,7 @@ func TestEngineRunJobWrapsPostSuccessAdvanceError(t *testing.T) {
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"implemented","summary":"opened PR","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 	}}
-	if _, err := (Mailbox{Store: store}).Enqueue(ctx, JobRequest{
+	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, JobRequest{
 		ID:          "implement-job",
 		Agent:       "lead",
 		Action:      "implement",
@@ -1172,7 +1172,7 @@ func TestEngineRunJobDeliveryFailureStaysRaw(t *testing.T) {
 	agent := runtime.Agent{Name: "lead", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "lead"}
 	// A delivery error before the result is stored.
 	adapter := &fakeDelivery{err: errors.New("runtime exploded")}
-	if _, err := (Mailbox{Store: store}).Enqueue(ctx, JobRequest{
+	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, JobRequest{
 		ID:        "implement-job",
 		Agent:     "lead",
 		Action:    "implement",
@@ -1301,7 +1301,7 @@ func TestEngineRunJobPreflightsPolicyBeforeDelivery(t *testing.T) {
 			delivered = true
 		},
 	}
-	if _, err := (Mailbox{Store: store}).Enqueue(ctx, JobRequest{
+	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, JobRequest{
 		ID:          "implement-job",
 		Agent:       "lead",
 		Action:      "implement",
@@ -2338,7 +2338,8 @@ func openEngineStore(t *testing.T) *db.Store {
 
 func testEngine(store *db.Store) Engine {
 	return Engine{
-		Store: store,
+		Store:                   store,
+		ResolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test engine explicit no worktree"),
 		JobID: func(request JobRequest) string {
 			parts := []string{request.Action, request.Agent, request.TaskID}
 			if request.ReviewRound != "" {

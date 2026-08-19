@@ -14,7 +14,7 @@ import (
 func TestMailboxRunRecordsGatesFromNeeds(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"blocked","summary":"needs credentials","findings":[],"changes_made":[],"tests_run":[],"needs":["API key","R2 token"],"delegations":[]}}`,
@@ -47,7 +47,7 @@ func TestMailboxRunRecordsGatesFromNeeds(t *testing.T) {
 func TestMailboxRunBlockedWithoutNeedsRecordsNoGates(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"blocked","summary":"blocked","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,

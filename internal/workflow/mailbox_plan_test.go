@@ -20,7 +20,7 @@ const planResultJSON = `{"gitmoot_result":{"decision":"approved","summary":"done
 func TestMailboxEnqueueRejectsImpossiblePlanRequest(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 
 	cases := map[string]struct {
 		request  JobRequest
@@ -86,7 +86,7 @@ func TestMailboxEnqueueRejectsImpossiblePlanRequest(t *testing.T) {
 // convention-only behaviour #1479 exists to remove.
 func TestMailboxDeliverPlanGate(t *testing.T) {
 	ctx := context.Background()
-	mailbox := Mailbox{Store: openTestStore(t)}
+	mailbox := Mailbox{store: openTestStore(t), resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	job := db.Job{ID: "job-plan-gate", Type: "ask"}
 
 	cases := map[string]struct {
@@ -211,7 +211,7 @@ func TestMailboxDeliverPlanGate(t *testing.T) {
 func TestMailboxRunPersistsPlanEvidence(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID: "job-plan-run", Agent: "planner", Action: "ask", Repo: "owner/repo",
 		Plan: true, PlanInto: "@smol",

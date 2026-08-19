@@ -22,7 +22,7 @@ func TestMailboxRunResultChecksOffIsByteIdentical(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	// Off (the zero value): no audit runs at all.
-	mailbox := Mailbox{Store: store, resultCheckMode: ResultChecksOff}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), resultCheckMode: ResultChecksOff}
 	adapter := &fakeDelivery{outputs: []string{vagueImplementResult}}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-off", Agent: "audit", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {
@@ -69,7 +69,7 @@ func TestMailboxRunResultChecksOffIsByteIdentical(t *testing.T) {
 func TestMailboxRunResultChecksWarnSurfacesButSucceeds(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store, resultCheckMode: ResultChecksWarn}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), resultCheckMode: ResultChecksWarn}
 	adapter := &fakeDelivery{outputs: []string{vagueImplementResult}}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-warn", Agent: "audit", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {
@@ -133,7 +133,7 @@ func TestMailboxRunResultChecksWarnSurfacesButSucceeds(t *testing.T) {
 func TestMailboxRunResultChecksBlockFailsLikeContractViolation(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store, resultCheckMode: ResultChecksBlock}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), resultCheckMode: ResultChecksBlock}
 	adapter := &fakeDelivery{outputs: []string{vagueImplementResult}}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-block", Agent: "audit", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {
@@ -189,7 +189,7 @@ func TestMailboxRunResultChecksWarnCleanResultIsQuiet(t *testing.T) {
 	// audit only fires on genuine failures, not on every job.
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store, resultCheckMode: ResultChecksWarn}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), resultCheckMode: ResultChecksWarn}
 	clean := `{"gitmoot_result":{"decision":"implemented","summary":"implemented X","findings":[],"changes_made":["added foo.go"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
 	adapter := &fakeDelivery{outputs: []string{clean}}
 

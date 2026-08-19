@@ -359,7 +359,7 @@ func TestDefaultCheckoutDeclinesResyncWhenNoLocalPRRecordE2E(t *testing.T) {
 	runDaemonWorkerGit(t, checkout, "commit", "-m", "advance the branch")
 
 	// Deliberately DO NOT UpsertPullRequest: the store has no evidence the PR is live.
-	if _, err := (workflow.Mailbox{Store: store}).Enqueue(ctx, workflow.JobRequest{
+	if _, err := (workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("test enqueue-only mailbox"))).Enqueue(ctx, workflow.JobRequest{
 		ID:          "review-no-pr-1",
 		Agent:       "reviewer",
 		Action:      "review",

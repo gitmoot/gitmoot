@@ -44,6 +44,7 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 	gh = jobGitHubClient(checkout, gh, runner)
 	engine := workflow.Engine{
 		Store:                   store,
+		ResolveDeliveryWorktree: deliveryWorktreeResolver(checkout),
 		RequireWorkflowPolicy:   requireWorkflowPolicyResolverRoot(home),
 		OrgPolicy:               orgPolicyResolverRoot(home),
 		ProduceCheckDir:         checkout,

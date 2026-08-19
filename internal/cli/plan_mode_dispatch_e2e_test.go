@@ -89,7 +89,7 @@ func TestPlanModeDaemonDispatchE2E(t *testing.T) {
 		seedDaemonWorkerAgentWithPolicy(t, store, "planner", runtime.OmpRuntime, "fresh:plan-e2e", []string{"ask"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
 
 		const jobID = "plan-shell-override"
-		_, err = (workflow.Mailbox{Store: store}).Enqueue(ctx, workflow.JobRequest{
+		_, err = (workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("test enqueue-only mailbox"))).Enqueue(ctx, workflow.JobRequest{
 			ID:                 jobID,
 			Agent:              "planner",
 			Action:             "ask",

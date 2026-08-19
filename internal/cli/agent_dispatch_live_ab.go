@@ -137,7 +137,10 @@ func maybeRunLiveAB(ctx context.Context, store *db.Store, request localAgentDisp
 	//    Mailbox.Run path so the job/result are identical to a plain ask.
 	championAgent := runtimeAgent(agent)
 	championAgent.ExecBackend = string(backend)
-	championResult, runErr := (workflow.Mailbox{Store: store, RuntimeDefaultModel: runtimeDefaultModelResolver(request.Home), RuntimeDefaultEffort: runtimeDefaultEffortResolver(request.Home)}).Run(ctx, job.ID, championAgent, adapter)
+	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("live A/B ask delivery"))
+	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(request.Home)
+	mailbox.RuntimeDefaultEffort = runtimeDefaultEffortResolver(request.Home)
+	championResult, runErr := mailbox.Run(ctx, job.ID, championAgent, adapter)
 	if runErr != nil {
 		// The primary ask itself failed — surface it exactly as the non-intercepted
 		// path would (the caller propagates the same error).

@@ -35,7 +35,7 @@ func presetJobPayload(t *testing.T) string {
 func TestPresetDeliveryReferencedFiresOnlyWithPriorState(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	// A shell agent with a concrete, resumable session ref (a command) in
 	// referenced mode. referenced trusts the operator and fires on any runtime once
 	// state exists.
@@ -98,7 +98,7 @@ func TestPresetDeliveryReferencedFiresOnlyWithPriorState(t *testing.T) {
 func TestPresetDeliveryFullModeAlwaysSendsFullEvenWithState(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	// Pre-seed a matching state row: a full agent must ignore it entirely.
 	if err := store.RecordPresetSessionState(ctx, runtime.ShellRuntime, "printf ok", "thermo", "abc123"); err != nil {
 		t.Fatalf("seed RecordPresetSessionState: %v", err)
@@ -136,7 +136,7 @@ func TestPresetDeliveryFullModeAlwaysSendsFullEvenWithState(t *testing.T) {
 func TestPresetDeliveryAutoRequiresPersistedRuntime(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	// Shell leg: auto must NOT shorten (shell is not a persisted runtime).
 	if err := store.RecordPresetSessionState(ctx, runtime.ShellRuntime, "printf ok", "thermo", "abc123"); err != nil {
 		t.Fatalf("seed shell state: %v", err)
@@ -177,7 +177,7 @@ func TestPresetDeliveryAutoRequiresPersistedRuntime(t *testing.T) {
 func TestPresetDeliveryReferencedFallsBackOnCommitMismatch(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	// Marker recorded at an old commit; the job snapshots a newer commit.
 	if err := store.RecordPresetSessionState(ctx, runtime.ShellRuntime, "printf ok", "thermo", "old000"); err != nil {
 		t.Fatalf("seed state: %v", err)

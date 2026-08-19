@@ -123,7 +123,16 @@ func (e Engine) now() time.Time {
 // path is byte-identical. The hook maps the terminal JobState to the event_type,
 // resolves root_id from the payload, and ships a redacted event fire-and-forget.
 func (e Engine) mailbox() Mailbox {
-	mb := Mailbox{Store: e.Store, RequireWorkflowPolicy: e.RequireWorkflowPolicy, OrgPolicy: e.OrgPolicy, CanaryEnabled: e.CanaryEnabled, deferBlocker: e.BlockerDeferrer, RuntimeDefaultModel: e.RuntimeDefaultModel, RuntimeDefaultEffort: e.RuntimeDefaultEffort, routerContextEnabled: e.RouterContextEnabled, resultCheckMode: normalizeResultCheckMode(e.ResultCheckMode), produceCheckDir: e.ProduceCheckDir}
+	mb := NewMailbox(e.Store, e.ResolveDeliveryWorktree)
+	mb.RequireWorkflowPolicy = e.RequireWorkflowPolicy
+	mb.OrgPolicy = e.OrgPolicy
+	mb.CanaryEnabled = e.CanaryEnabled
+	mb.deferBlocker = e.BlockerDeferrer
+	mb.RuntimeDefaultModel = e.RuntimeDefaultModel
+	mb.RuntimeDefaultEffort = e.RuntimeDefaultEffort
+	mb.routerContextEnabled = e.RouterContextEnabled
+	mb.resultCheckMode = normalizeResultCheckMode(e.ResultCheckMode)
+	mb.produceCheckDir = e.ProduceCheckDir
 	// Wire the off-by-default memory hooks (#626). When e.Memory is nil (every
 	// non-enrolled path) both hooks stay nil, so Run's prompt assembly and terminal
 	// path are byte-identical. The hooks themselves also no-op when the executor

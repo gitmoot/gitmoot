@@ -17,7 +17,7 @@ const delegatingResult = `{"gitmoot_result":{"decision":"approved","summary":"do
 func TestMailboxRunStripsPipelineStageDelegations(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	agent := runtime.Agent{Name: "pipeline-x-runner", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "pipeline-runner"}
 	adapter := &fakeDelivery{outputs: []string{delegatingResult}}
 
@@ -49,7 +49,7 @@ func TestMailboxRunStripsPipelineStageDelegations(t *testing.T) {
 func TestMailboxRunKeepsNonPipelineDelegations(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	agent := runtime.Agent{Name: "coord", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "coordinator"}
 	adapter := &fakeDelivery{outputs: []string{delegatingResult}}
 
@@ -85,7 +85,7 @@ const askingResult = `{"gitmoot_result":{"decision":"approved","summary":"done",
 func TestMailboxRunStripsPipelineStageHumanQuestions(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	agent := runtime.Agent{Name: "pipeline-x-runner", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "pipeline-runner"}
 	adapter := &fakeDelivery{outputs: []string{askingResult}}
 
@@ -122,7 +122,7 @@ func TestMailboxRunStripsPipelineStageHumanQuestions(t *testing.T) {
 func TestMailboxRunKeepsNonPipelineHumanQuestions(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	agent := runtime.Agent{Name: "coord", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "coordinator"}
 	adapter := &fakeDelivery{outputs: []string{askingResult}}
 
@@ -156,7 +156,7 @@ const blockedNeedsResult = `{"gitmoot_result":{"decision":"blocked","summary":"m
 func TestMailboxRunSkipsJobGatesForPipelineStages(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	agent := runtime.Agent{Name: "pipeline-x-runner", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "pipeline-runner"}
 	adapter := &fakeDelivery{outputs: []string{blockedNeedsResult}}
 
@@ -190,7 +190,7 @@ func TestMailboxRunSkipsJobGatesForPipelineStages(t *testing.T) {
 func TestMaybeResumeOnGatesClearedRefusesPipelineStages(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	agent := runtime.Agent{Name: "pipeline-x-runner", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "pipeline-runner"}
 	adapter := &fakeDelivery{outputs: []string{blockedNeedsResult}}
 

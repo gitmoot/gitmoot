@@ -175,8 +175,8 @@ func TestBlockedAdvanceDoesNotAbortQueuedJobPass(t *testing.T) {
 		}
 		return &cliWorkerFakeAdapter{output: resultJSON(decision)}, nil
 	}
-	worker.WorkflowFactory = func(string) workflow.Engine {
-		return workflow.Engine{Store: store, ImplementationFinalizer: selectiveBlockedFinalizer{blockedJobID: "a-blocked"}}
+	worker.WorkflowFactory = func(checkout string) workflow.Engine {
+		return workflow.Engine{Store: store, ResolveDeliveryWorktree: deliveryWorktreeResolver(checkout), ImplementationFinalizer: selectiveBlockedFinalizer{blockedJobID: "a-blocked"}}
 	}
 
 	runErr := runQueuedJobsForRepo(ctx, worker, 1, "", "")

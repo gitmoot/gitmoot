@@ -2312,10 +2312,13 @@ contract-hygiene audit that catches results that are technically valid but vague
 or missing evidence. Each check is a yes/no question with an explanation:
 
 - **implement** — a result whose decision is `implemented` must list its
-  `changes_made` and its `tests_run`. When the engine owns a job worktree, it
-  also persists `payload.result_observation` from the worktree diff and fails
-  `implement-changes-observed` if a claim names a path absent from the diff, a
-  claim names no file path, or the diff contains a path no claim mentions.
+  `changes_made` and its `tests_run`. The engine resolves the effective checkout
+  selected by the worker, persists `payload.result_observation` from its diff,
+  and fails `implement-changes-observed` if a claim names a path absent from the
+  diff, a claim names no file path, or the diff contains a path no claim
+  mentions. A worktree-less delegation child instead persists the typed source
+  `excluded_worktree_less_delegation_child`; exclusion is observable and is not
+  graded as diff evidence.
 - **review** — a `changes_requested` review must carry `findings` (evidence).
 - **ask** — the answer (`summary`/`artifact_body`) must be non-empty and
   actionable.

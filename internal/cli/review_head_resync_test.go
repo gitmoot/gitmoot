@@ -75,7 +75,7 @@ func TestDefaultCheckoutResyncsReviewHeadWhenPRIsOpen(t *testing.T) {
 	}
 
 	// A queued review job pinned to the now-stale head.
-	if _, err := (workflow.Mailbox{Store: store}).Enqueue(ctx, workflow.JobRequest{
+	if _, err := (workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("test enqueue-only mailbox"))).Enqueue(ctx, workflow.JobRequest{
 		ID:          "workflow-review-1",
 		Agent:       "reviewer",
 		Action:      "review",
@@ -154,7 +154,7 @@ func TestDefaultCheckoutFailsReviewHeadMismatchWhenPRClosed(t *testing.T) {
 		t.Fatalf("UpsertPullRequest returned error: %v", err)
 	}
 
-	if _, err := (workflow.Mailbox{Store: store}).Enqueue(ctx, workflow.JobRequest{
+	if _, err := (workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("test enqueue-only mailbox"))).Enqueue(ctx, workflow.JobRequest{
 		ID:          "workflow-review-2",
 		Agent:       "reviewer",
 		Action:      "review",
@@ -245,7 +245,7 @@ func TestDefaultCheckoutDeclinesResyncWhenCheckoutOnWrongBranch(t *testing.T) {
 
 	// The queued review is pinned to the feat/x branch + its stale head, but its task
 	// worktree is gone so it resolves the shared checkout (which is on main).
-	if _, err := (workflow.Mailbox{Store: store}).Enqueue(ctx, workflow.JobRequest{
+	if _, err := (workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("test enqueue-only mailbox"))).Enqueue(ctx, workflow.JobRequest{
 		ID:          "workflow-review-3",
 		Agent:       "reviewer",
 		Action:      "review",

@@ -140,7 +140,7 @@ func runMidFlightEnqueueScenario(t *testing.T, usePool bool) string {
 	adapter := &cliWorkerFakeAdapter{output: poolSchedulerAskResult}
 	adapter.onDeliver = func() {
 		once.Do(func() {
-			_, enqErr = (workflow.Mailbox{Store: store}).Enqueue(ctx, workflow.JobRequest{ID: "job-b", Agent: "audit", Action: "ask", Repo: "owner/repo-b", Branch: "main", PullRequest: 2})
+			_, enqErr = (workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("test enqueue-only mailbox"))).Enqueue(ctx, workflow.JobRequest{ID: "job-b", Agent: "audit", Action: "ask", Repo: "owner/repo-b", Branch: "main", PullRequest: 2})
 		})
 	}
 	worker := poolSchedulerWorker(t, store, adapter, usePool)
@@ -624,7 +624,7 @@ func seedDaemonWorkerAgentWithPolicy(t *testing.T, store *db.Store, name string,
 
 func enqueueDaemonWorkerJob(t *testing.T, store *db.Store, request workflow.JobRequest) {
 	t.Helper()
-	if _, err := (workflow.Mailbox{Store: store}).Enqueue(context.Background(), request); err != nil {
+	if _, err := (workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("test enqueue-only mailbox"))).Enqueue(context.Background(), request); err != nil {
 		t.Fatalf("Enqueue returned error: %v", err)
 	}
 }

@@ -351,6 +351,23 @@ func isWorktreeLessDelegationChild(payload workflow.JobPayload) bool {
 	return strings.TrimSpace(payload.DelegationID) != "" && strings.TrimSpace(payload.WorktreePath) == ""
 }
 
+// deliveryWorktreeResolver injects the checkout already resolved by the worker
+// into workflow's result-delivery seam. The one shape that deliberately does
+// not observe that shared checkout is selected by its own predicate, never by a
+// generic empty-path check, and receives a persisted typed marker.
+func deliveryWorktreeResolver(checkout string) workflow.DeliveryWorktreeResolver {
+	checkout = strings.TrimSpace(checkout)
+	return func(_ context.Context, _ db.Job, payload workflow.JobPayload) (workflow.DeliveryWorktreeResolution, error) {
+		if isWorktreeLessDelegationChild(payload) {
+			return workflow.DeliveryWorktreeResolution{ExcludedSource: workflow.ResultObservationSourceWorktreeLessDelegationChild}, nil
+		}
+		if checkout == "" {
+			return workflow.DeliveryWorktreeResolution{}, errors.New("resolved job checkout is empty")
+		}
+		return workflow.DeliveryWorktreeResolution{Path: checkout}, nil
+	}
+}
+
 func (w jobWorker) validateReviewCheckoutForRunner(ctx context.Context, payload workflow.JobPayload, checkout string, runner subprocess.Runner) error {
 	git := jobGitClient(checkout, runner)
 	clean, err := git.WorktreeClean(ctx)

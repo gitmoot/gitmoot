@@ -23,7 +23,7 @@ func TestRoutingTelemetryRecordsRuntimeDefaultModel(t *testing.T) {
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 	}}
-	m := Mailbox{Store: store, RuntimeDefaultModel: func(rt string) string {
+	m := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), RuntimeDefaultModel: func(rt string) string {
 		if rt == runtime.ShellRuntime {
 			return "gpt-5.5"
 		}
@@ -57,7 +57,7 @@ func TestRoutingTelemetryRecordsAdapterFailure(t *testing.T) {
 	seedAgent(t, store, "flaky", []string{"implement"}, "gitmoot/gitmoot")
 	agent := runtime.Agent{Name: "flaky", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "agent"}
 	adapter := &fakeDelivery{err: errors.New("adapter boom")}
-	m := Mailbox{Store: store}
+	m := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	if _, err := m.Enqueue(ctx, JobRequest{ID: "flaky-job", Agent: "flaky", Action: "implement", Repo: "gitmoot/gitmoot", Branch: "task-1", TaskID: "task-1", TaskTitle: "Flaky"}); err != nil {
 		t.Fatalf("Enqueue error: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestRunJobRecordsRoutingTelemetry(t *testing.T) {
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"approved","summary":"looks good","findings":[],"changes_made":[],"tests_run":["go test"],"needs":[],"delegations":[]}}`,
 	}}
-	if _, err := (Mailbox{Store: store}).Enqueue(ctx, JobRequest{
+	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, JobRequest{
 		ID:        "review-job",
 		Agent:     "audit",
 		Action:    "review",
@@ -135,7 +135,7 @@ func TestRunJobRecordsRoutingTelemetry(t *testing.T) {
 func TestRoutingTelemetryFailureIsSwallowed(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	m := Mailbox{Store: store}
+	m := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	// Close the underlying DB so every telemetry query errors.
 	if err := store.Close(); err != nil {
 		t.Fatalf("Close error: %v", err)
@@ -176,10 +176,10 @@ func TestRouterContextOffByDefaultIdenticalPrompt(t *testing.T) {
 
 	// OFF (default construction): prompt has no router block.
 	offAdapter := &fakeDelivery{outputs: []string{`{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}}
-	if _, err := (Mailbox{Store: store}).Enqueue(ctx, req); err != nil {
+	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, req); err != nil {
 		t.Fatalf("Enqueue off error: %v", err)
 	}
-	if _, err := (Mailbox{Store: store}).Run(ctx, "coord", agent, offAdapter); err != nil {
+	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Run(ctx, "coord", agent, offAdapter); err != nil {
 		t.Fatalf("Run off error: %v", err)
 	}
 	if len(offAdapter.prompts) != 1 {
@@ -194,10 +194,10 @@ func TestRouterContextOffByDefaultIdenticalPrompt(t *testing.T) {
 	onReq := req
 	onReq.ID = "coord2"
 	onAdapter := &fakeDelivery{outputs: []string{`{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}}
-	if _, err := (Mailbox{Store: store}).Enqueue(ctx, onReq); err != nil {
+	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, onReq); err != nil {
 		t.Fatalf("Enqueue on error: %v", err)
 	}
-	if _, err := (Mailbox{Store: store, routerContextEnabled: true}).Run(ctx, "coord2", agent, onAdapter); err != nil {
+	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), routerContextEnabled: true}).Run(ctx, "coord2", agent, onAdapter); err != nil {
 		t.Fatalf("Run on error: %v", err)
 	}
 	if len(onAdapter.prompts) != 1 {
@@ -233,14 +233,14 @@ func TestRouterContextSkippedForDelegationChild(t *testing.T) {
 		t.Fatalf("seed telemetry error: %v", err)
 	}
 	agent := runtime.Agent{Name: "worker", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "agent"}
-	if _, err := (Mailbox{Store: store}).Enqueue(ctx, JobRequest{
+	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, JobRequest{
 		ID: "child", Agent: "worker", Action: "review", Repo: "gitmoot/gitmoot", Branch: "task-1", TaskID: "task-1", TaskTitle: "Child",
 		ParentJobID: "some-parent", DelegationID: "d1",
 	}); err != nil {
 		t.Fatalf("Enqueue child error: %v", err)
 	}
 	adapter := &fakeDelivery{outputs: []string{`{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}}
-	if _, err := (Mailbox{Store: store, routerContextEnabled: true}).Run(ctx, "child", agent, adapter); err != nil {
+	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), routerContextEnabled: true}).Run(ctx, "child", agent, adapter); err != nil {
 		t.Fatalf("Run child error: %v", err)
 	}
 	if strings.Contains(adapter.prompts[0], "Observed routing performance") {

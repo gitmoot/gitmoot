@@ -252,7 +252,7 @@ func TestMailboxResultObservationFlowsIntoOffWarnBlockGate(t *testing.T) {
 			ctx := context.Background()
 			store := openTestStore(t)
 			repo := observationTestRepo(t)
-			mailbox := Mailbox{Store: store, resultCheckMode: tc.mode}
+			mailbox := Mailbox{store: store, resolveDeliveryWorktree: PayloadDeliveryWorktreeResolver, resultCheckMode: tc.mode}
 			output := `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["updated absent.go"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
 			adapter := &fakeDelivery{outputs: []string{output}}
 			jobID := "observe-" + string(tc.mode)
@@ -296,7 +296,7 @@ func TestMailboxResultObservationFlagsUnclaimedDiffFile(t *testing.T) {
 	writeObservationFile(t, repo, "claimed.go", "package changed\n")
 	writeObservationFile(t, repo, "unmentioned.go", "package changed\n")
 
-	mailbox := Mailbox{Store: store, resultCheckMode: ResultChecksWarn}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: PayloadDeliveryWorktreeResolver, resultCheckMode: ResultChecksWarn}
 	output := `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["updated claimed.go"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
 	adapter := &fakeDelivery{outputs: []string{output}}
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
@@ -327,7 +327,7 @@ func TestMailboxObservationGapRecordsWithoutRefusingPersistence(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	notGit := t.TempDir()
-	mailbox := Mailbox{Store: store, resultCheckMode: ResultChecksBlock}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: PayloadDeliveryWorktreeResolver, resultCheckMode: ResultChecksBlock}
 	output := `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["updated foo.go"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
 	adapter := &fakeDelivery{outputs: []string{output}}
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
@@ -359,7 +359,8 @@ func TestMailboxImportsChangeSetBeforeResultObservation(t *testing.T) {
 	store := openTestStore(t)
 	host, sandbox, changes := observationChangeSet(t, "claimed.go", "package imported\n")
 	mailbox := Mailbox{
-		Store: store,
+		store:                   store,
+		resolveDeliveryWorktree: PayloadDeliveryWorktreeResolver,
 		CollectChangeSet: func(context.Context, execbackend.Backend, string) (*execbackend.ChangeSet, error) {
 			return &changes, nil
 		},
@@ -396,7 +397,8 @@ func TestMailboxMalformedRedeliveryImportsFinalCumulativeChangeSet(t *testing.T)
 	base := strings.TrimSpace(runObservationGit(t, host, "rev-parse", "HEAD"))
 	collections := 0
 	mailbox := Mailbox{
-		Store: store,
+		store:                   store,
+		resolveDeliveryWorktree: PayloadDeliveryWorktreeResolver,
 		CollectChangeSet: func(context.Context, execbackend.Backend, string) (*execbackend.ChangeSet, error) {
 			collections++
 			changes, err := execbackend.BuildChangeSet(context.Background(), sandbox, base)
@@ -437,7 +439,8 @@ func TestMailboxImportFailureStopsBeforeObservation(t *testing.T) {
 	store := openTestStore(t)
 	host, _, changes := observationChangeSet(t, "claimed.go", "package imported\n")
 	mailbox := Mailbox{
-		Store: store,
+		store:                   store,
+		resolveDeliveryWorktree: PayloadDeliveryWorktreeResolver,
 		CollectChangeSet: func(context.Context, execbackend.Backend, string) (*execbackend.ChangeSet, error) {
 			return &changes, nil
 		},

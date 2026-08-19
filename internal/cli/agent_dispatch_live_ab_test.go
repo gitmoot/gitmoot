@@ -105,7 +105,7 @@ func liveABFixture(t *testing.T, championPulls int) (string, *db.Store, localAge
 		Instructions: "Plan the migration.",
 		Home:         home,
 	}
-	job, err := (workflow.Mailbox{Store: store}).Enqueue(ctx, workflow.JobRequest{
+	job, err := (workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("test enqueue-only mailbox"))).Enqueue(ctx, workflow.JobRequest{
 		ID:           "ask-planner-bot",
 		Agent:        "planner-bot",
 		Action:       "ask",

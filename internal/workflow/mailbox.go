@@ -32,7 +32,12 @@ import (
 const maxRepairAttempts = 2
 
 type Mailbox struct {
-	Store *db.Store
+	store *db.Store
+	// resolveDeliveryWorktree is required by NewMailbox. For implement delivery
+	// it resolves the effective host checkout already selected by the CLI, or
+	// returns an explicit typed exclusion. It is private so production callers
+	// cannot recreate the old optional-field failure with a keyed struct literal.
+	resolveDeliveryWorktree DeliveryWorktreeResolver
 	// CollectChangeSet is the P2a host-import seam. A non-local backend wires a
 	// collector here once it owns an instance lifecycle (P2b); nil preserves the
 	// local backend byte-for-byte. It is consulted once after the delivery sequence
@@ -137,6 +142,52 @@ type Mailbox struct {
 	// produceCheckTimeout bounds each trusted check command. Zero uses the
 	// production default; tests may inject a short timeout.
 	produceCheckTimeout time.Duration
+}
+
+// DeliveryWorktreeResolution is the CLI-owned answer to "where did this job
+// actually run?" Exactly one of Path or ExcludedSource must be populated.
+type DeliveryWorktreeResolution struct {
+	Path           string
+	ExcludedSource string
+}
+
+// DeliveryWorktreeResolver injects checkout resolution into workflow without
+// introducing the forbidden workflow -> cli import.
+type DeliveryWorktreeResolver func(context.Context, db.Job, JobPayload) (DeliveryWorktreeResolution, error)
+
+// NewMailbox requires every construction site to state its delivery-worktree
+// policy. Use UnavailableDeliveryWorktreeResolver at enqueue-only/ask-only sites;
+// it errors loudly if an implement delivery ever reaches that context.
+func NewMailbox(store *db.Store, resolver DeliveryWorktreeResolver) Mailbox {
+	return Mailbox{store: store, resolveDeliveryWorktree: resolver}
+}
+
+// UnavailableDeliveryWorktreeResolver is the explicit sentinel for construction
+// sites that cannot perform implement delivery. Unlike a nil/default resolver,
+// accidental use fails visibly instead of silently suppressing observation.
+func UnavailableDeliveryWorktreeResolver(site string) DeliveryWorktreeResolver {
+	return func(context.Context, db.Job, JobPayload) (DeliveryWorktreeResolution, error) {
+		return DeliveryWorktreeResolution{}, fmt.Errorf("delivery worktree resolution is unavailable at %s", strings.TrimSpace(site))
+	}
+}
+
+// PayloadDeliveryWorktreeResolver is the explicit policy for contexts whose
+// payload already owns the effective checkout (notably focused workflow tests).
+var PayloadDeliveryWorktreeResolver DeliveryWorktreeResolver = func(_ context.Context, _ db.Job, payload JobPayload) (DeliveryWorktreeResolution, error) {
+	path := strings.TrimSpace(payload.WorktreePath)
+	if path == "" {
+		return DeliveryWorktreeResolution{}, errors.New("payload has no delivery worktree path")
+	}
+	return DeliveryWorktreeResolution{Path: path}, nil
+}
+
+// ExcludedDeliveryWorktreeResolver is an explicit sentinel for a context that
+// intentionally does not observe implement worktrees. Production exclusions
+// should normally be selected by a shape-specific CLI predicate instead.
+func ExcludedDeliveryWorktreeResolver(source string) DeliveryWorktreeResolver {
+	return func(context.Context, db.Job, JobPayload) (DeliveryWorktreeResolution, error) {
+		return DeliveryWorktreeResolution{ExcludedSource: strings.TrimSpace(source)}, nil
+	}
 }
 
 // PipelineKeyAccess is the persisted, names-only authorization for one pipeline
@@ -531,7 +582,7 @@ type DeliveryAdapter interface {
 }
 
 func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error) {
-	if m.Store == nil {
+	if m.store == nil {
 		return db.Job{}, errors.New("mailbox store is required")
 	}
 	if err := validateJobRequest(request); err != nil {
@@ -576,7 +627,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 	skipNativeReviewFanout := request.SkipNativeReviewFanout
 	pullRequestReady := request.PullRequestReady
 	if (!skipNativeReviewFanout || !pullRequestReady) && strings.TrimSpace(request.ParentJobID) != "" {
-		if parent, parentErr := m.Store.GetJob(ctx, strings.TrimSpace(request.ParentJobID)); parentErr == nil {
+		if parent, parentErr := m.store.GetJob(ctx, strings.TrimSpace(request.ParentJobID)); parentErr == nil {
 			if parentPayload, parseErr := unmarshalPayload(parent.Payload); parseErr == nil {
 				if parentPayload.SkipNativeReviewFanout {
 					skipNativeReviewFanout = true
@@ -686,18 +737,18 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 	if err != nil {
 		return db.Job{}, err
 	}
-	if err := m.Store.CreateJobWithEvent(ctx, job, db.JobEvent{JobID: job.ID, Kind: string(JobQueued), Message: "job queued"}, request.RequiredEvents...); err != nil {
+	if err := m.store.CreateJobWithEvent(ctx, job, db.JobEvent{JobID: job.ID, Kind: string(JobQueued), Message: "job queued"}, request.RequiredEvents...); err != nil {
 		return db.Job{}, err
 	}
 	if autolabeled {
-		if err := m.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "workflow_autolabeled", Message: fmt.Sprintf("auto-filed under %s (require_workflow=auto for %s; pass --workflow to name your initiative)", strings.TrimSpace(request.WorkflowID), strings.TrimSpace(request.Repo))}); err != nil {
+		if err := m.store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "workflow_autolabeled", Message: fmt.Sprintf("auto-filed under %s (require_workflow=auto for %s; pass --workflow to name your initiative)", strings.TrimSpace(request.WorkflowID), strings.TrimSpace(request.Repo))}); err != nil {
 			// The queued job is durable. Never turn a successful enqueue into a
 			// rejection because an advisory follow-up event could not be written.
 			fmt.Fprintf(os.Stderr, "gitmoot: add workflow_autolabeled event for %s: %v\n", job.ID, err)
 		}
 	}
 	if orgWarning != "" {
-		if err := m.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "org_scope_violation", Message: orgWarning}); err != nil {
+		if err := m.store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "org_scope_violation", Message: orgWarning}); err != nil {
 			// The queued job is durable. An advisory warning event must never undo it.
 			fmt.Fprintf(os.Stderr, "gitmoot: add org_scope_violation event for %s: %v\n", job.ID, err)
 		}
@@ -875,7 +926,7 @@ func (m Mailbox) resolveEnqueueModel(ctx context.Context, request JobRequest) (s
 		agent.Runtime = strings.TrimSpace(request.Ephemeral.Runtime)
 		agent.Model = request.Ephemeral.Model
 	} else {
-		stored, err := m.Store.GetAgent(ctx, request.Agent)
+		stored, err := m.store.GetAgent(ctx, request.Agent)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return "", err
 		}
@@ -896,7 +947,7 @@ func (m Mailbox) resolveEnqueueModel(ctx context.Context, request JobRequest) (s
 }
 
 func (m Mailbox) templateSnapshot(ctx context.Context, agentName string) (db.AgentTemplate, error) {
-	agent, err := m.Store.GetAgent(ctx, agentName)
+	agent, err := m.store.GetAgent(ctx, agentName)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return db.AgentTemplate{}, nil
@@ -906,7 +957,7 @@ func (m Mailbox) templateSnapshot(ctx context.Context, agentName string) (db.Age
 	if strings.TrimSpace(agent.TemplateID) == "" {
 		return db.AgentTemplate{}, nil
 	}
-	template, err := m.Store.GetAgentTemplateReference(ctx, agent.TemplateID)
+	template, err := m.store.GetAgentTemplateReference(ctx, agent.TemplateID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return db.AgentTemplate{}, fmt.Errorf("agent %q references missing template %q", agent.Name, agent.TemplateID)
@@ -949,7 +1000,7 @@ func (m Mailbox) routeCanary(ctx context.Context, agentTemplateRef string, champ
 	if versionRef != "" && versionRef != "current" {
 		return db.AgentTemplate{}, false
 	}
-	canary, found, err := m.Store.GetActiveCanaryVersion(ctx, templateID)
+	canary, found, err := m.store.GetActiveCanaryVersion(ctx, templateID)
 	if err != nil || !found {
 		return db.AgentTemplate{}, false
 	}
@@ -964,7 +1015,7 @@ func (m Mailbox) routeCanary(ctx context.Context, agentTemplateRef string, champ
 	// (canary.ID is "templateID@vN"), so its distinct ResolvedCommit/Content flow
 	// into the payload unchanged and the #465 harvester attributes the outcome to
 	// the canary version. A resolve error falls back to the champion (never break).
-	snap, err := m.Store.GetAgentTemplateReference(ctx, canary.ID)
+	snap, err := m.store.GetAgentTemplateReference(ctx, canary.ID)
 	if err != nil || strings.TrimSpace(snap.VersionID) == "" {
 		return db.AgentTemplate{}, false
 	}
@@ -1058,14 +1109,14 @@ func resumedSelfDirtyWorktreeNotice() string {
 }
 
 func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, adapter DeliveryAdapter) (AgentResult, error) {
-	if m.Store == nil {
+	if m.store == nil {
 		return AgentResult{}, errors.New("mailbox store is required")
 	}
 	if adapter == nil {
 		return AgentResult{}, errors.New("delivery adapter is required")
 	}
 
-	job, err := m.Store.GetJob(ctx, jobID)
+	job, err := m.store.GetJob(ctx, jobID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return AgentResult{}, fmt.Errorf("job %q not found", jobID)
@@ -1288,8 +1339,21 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 			return AgentResult{}, parseErr
 		}
 	}
-	if err := m.importDeliveryChangeSet(ctx, job, payload, execBackend); err != nil {
-		return AgentResult{}, err
+	var deliveryWorktree DeliveryWorktreeResolution
+	if strings.EqualFold(strings.TrimSpace(job.Type), "implement") {
+		var resolveErr error
+		deliveryWorktree, resolveErr = m.deliveryWorktree(ctx, job, payload)
+		if resolveErr != nil {
+			message := fmt.Sprintf("delivery worktree resolution failed: %v", resolveErr)
+			_ = m.addEvent(ctx, job.ID, "delivery_worktree_resolution_failed", message)
+			_ = m.fail(ctx, job.ID, message)
+			return AgentResult{}, errors.New(message)
+		}
+		if deliveryWorktree.ExcludedSource == "" {
+			if err := m.importDeliveryChangeSet(ctx, job, deliveryWorktree.Path, execBackend); err != nil {
+				return AgentResult{}, err
+			}
+		}
 	}
 
 	// A produce stage may declare a trusted deterministic check. Run it only after
@@ -1394,7 +1458,11 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	}
 	payload.Result = &result
 	if strings.EqualFold(strings.TrimSpace(job.Type), "implement") {
-		payload.ResultObservation = observeResultChanges(ctx, payload.WorktreePath, result, execBackend)
+		if deliveryWorktree.ExcludedSource != "" {
+			payload.ResultObservation = excludedResultObservation(deliveryWorktree.ExcludedSource, result)
+		} else {
+			payload.ResultObservation = observeResultChanges(ctx, deliveryWorktree.Path, result, execBackend)
+		}
 	}
 	// #526 deterministic binary-checklist audit of the parsed result. The worktree
 	// observation above is recorded in every mode. Off (the zero value and "off")
@@ -1419,7 +1487,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 			if rootID == "" {
 				rootID = job.ID
 			}
-			_ = m.Store.RecordResultCheckFailures(ctx, job.ID, rootID, job.Type, toDBResultCheckFailures(failed))
+			_ = m.store.RecordResultCheckFailures(ctx, job.ID, rootID, job.Type, toDBResultCheckFailures(failed))
 			if mode == ResultChecksBlock {
 				// Persist the payload (carrying ResultChecks + Result) BEFORE failing so
 				// the job-detail surface shows exactly which checks failed, then map the
@@ -1451,7 +1519,27 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	return result, nil
 }
 
-func (m Mailbox) importDeliveryChangeSet(ctx context.Context, job db.Job, payload JobPayload, backend execbackend.Backend) error {
+func (m Mailbox) deliveryWorktree(ctx context.Context, job db.Job, payload JobPayload) (DeliveryWorktreeResolution, error) {
+	if m.resolveDeliveryWorktree == nil {
+		return DeliveryWorktreeResolution{}, errors.New("mailbox has no delivery worktree resolver")
+	}
+	resolution, err := m.resolveDeliveryWorktree(ctx, job, payload)
+	if err != nil {
+		return DeliveryWorktreeResolution{}, err
+	}
+	resolution.Path = strings.TrimSpace(resolution.Path)
+	resolution.ExcludedSource = strings.TrimSpace(resolution.ExcludedSource)
+	switch {
+	case resolution.Path != "" && resolution.ExcludedSource != "":
+		return DeliveryWorktreeResolution{}, errors.New("delivery worktree resolver returned both a path and an exclusion source")
+	case resolution.Path == "" && resolution.ExcludedSource == "":
+		return DeliveryWorktreeResolution{}, errors.New("delivery worktree resolver returned neither a path nor an exclusion source")
+	default:
+		return resolution, nil
+	}
+}
+
+func (m Mailbox) importDeliveryChangeSet(ctx context.Context, job db.Job, worktree string, backend execbackend.Backend) error {
 	if !strings.EqualFold(strings.TrimSpace(job.Type), "implement") || m.CollectChangeSet == nil {
 		return nil
 	}
@@ -1461,7 +1549,7 @@ func (m Mailbox) importDeliveryChangeSet(ctx context.Context, job db.Job, payloa
 		if apply == nil {
 			apply = execbackend.ImportChangeSet
 		}
-		err = apply(ctx, payload.WorktreePath, *changes)
+		err = apply(ctx, worktree, *changes)
 	}
 	if err == nil {
 		return nil
@@ -1607,7 +1695,7 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		// (fresh/single-use, and every non-codex runtime) skips the delta table
 		// entirely and records the count verbatim (#664).
 		if result.CumulativeUsage && agent.RuntimeRef != "" && agent.RuntimeRef != runtime.LastRef {
-			inTok, outTok, _ = m.Store.RecordRuntimeSessionUsageDelta(ctx, agent.Runtime+":"+agent.RuntimeRef, result.InputTokens, result.OutputTokens)
+			inTok, outTok, _ = m.store.RecordRuntimeSessionUsageDelta(ctx, agent.Runtime+":"+agent.RuntimeRef, result.InputTokens, result.OutputTokens)
 		} else if result.CumulativeUsage {
 			inTok, outTok = 0, 0
 		} else if agent.Runtime == runtime.CodexRuntime && result.RefreshedRuntimeRef != "" && result.RefreshedRuntimeRef != runtime.LastRef {
@@ -1623,13 +1711,13 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 			// (turn1+turn2)-turn1 = turn2. The returned delta is discarded; the verbatim
 			// UpdateJobUsage below records this turn. Errors are swallowed like the delta
 			// call — usage accounting never fails a delivery.
-			_, _, _ = m.Store.RecordRuntimeSessionUsageDelta(ctx, agent.Runtime+":"+result.RefreshedRuntimeRef, result.InputTokens, result.OutputTokens)
+			_, _, _ = m.store.RecordRuntimeSessionUsageDelta(ctx, agent.Runtime+":"+result.RefreshedRuntimeRef, result.InputTokens, result.OutputTokens)
 		}
 		// Only persist when a positive count remains so runtimes that report nothing
 		// (e.g. the shell runtime) or a delta that resolved to 0 leave the columns at
 		// their 0 default rather than taking a no-op write.
 		if inTok > 0 || outTok > 0 {
-			_ = m.Store.UpdateJobUsage(ctx, job.ID, inTok, outTok)
+			_ = m.store.UpdateJobUsage(ctx, job.ID, inTok, outTok)
 		}
 	}
 	diag := failureDiagnosticsFromSession(result.SessionDiag)
@@ -1662,7 +1750,7 @@ func (m Mailbox) persistRefreshedRuntimeRef(ctx context.Context, jobID string, a
 	if refreshedRef == "" || refreshedRef == agent.RuntimeRef {
 		return
 	}
-	_ = m.Store.UpdateAgentRuntimeRef(ctx, agent.Name, refreshedRef)
+	_ = m.store.UpdateAgentRuntimeRef(ctx, agent.Name, refreshedRef)
 	_ = m.addEvent(ctx, jobID, "session_refresh_retry", fmt.Sprintf("re-pinned agent %q to fresh runtime session after dead-session self-heal", agent.Name))
 }
 
@@ -1671,19 +1759,19 @@ func (m Mailbox) finish(ctx context.Context, jobID string, state JobState, messa
 	defer cancel()
 	var transitioned bool
 	var err error
-	if job, loadErr := m.Store.GetJob(writeCtx, jobID); loadErr == nil {
+	if job, loadErr := m.store.GetJob(writeCtx, jobID); loadErr == nil {
 		if payload, payloadErr := unmarshalPayload(job.Payload); payloadErr == nil {
 			clearRuntimeIdentity(&payload)
 			message = terminalMessageWithDiagnostics(state, message, payload.FailureDiagnostics)
 			if encoded, encodeErr := marshalPayload(payload); encodeErr == nil {
-				transitioned, err = m.Store.TransitionJobStatePayloadWithEvent(writeCtx, jobID, string(JobRunning), string(state), encoded, db.JobEvent{
+				transitioned, err = m.store.TransitionJobStatePayloadWithEvent(writeCtx, jobID, string(JobRunning), string(state), encoded, db.JobEvent{
 					JobID: jobID, Kind: string(state), Message: message,
 				})
 			}
 		}
 	}
 	if err == nil && !transitioned {
-		transitioned, err = m.Store.TransitionJobStateWithEvent(writeCtx, jobID, string(JobRunning), string(state), db.JobEvent{
+		transitioned, err = m.store.TransitionJobStateWithEvent(writeCtx, jobID, string(JobRunning), string(state), db.JobEvent{
 			JobID: jobID, Kind: string(state), Message: message,
 		})
 	}
@@ -1691,7 +1779,7 @@ func (m Mailbox) finish(ctx context.Context, jobID string, state JobState, messa
 		return err
 	}
 	if !transitioned {
-		latest, getErr := m.Store.GetJob(writeCtx, jobID)
+		latest, getErr := m.store.GetJob(writeCtx, jobID)
 		if getErr != nil {
 			return getErr
 		}
@@ -1722,7 +1810,7 @@ func (m Mailbox) finish(ctx context.Context, jobID string, state JobState, messa
 // so synthesize a transient Result from it (in-memory only — never persisted).
 // On any load error it returns a minimal payload so the emit still fires.
 func (m Mailbox) loadTerminalEmitPayload(ctx context.Context, jobID, message string) JobPayload {
-	job, err := m.Store.GetJob(ctx, jobID)
+	job, err := m.store.GetJob(ctx, jobID)
 	if err != nil {
 		return JobPayload{Result: &AgentResult{Summary: strings.TrimSpace(message)}}
 	}
@@ -1745,7 +1833,7 @@ func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobS
 	if err != nil {
 		return err
 	}
-	transitioned, err := m.Store.TransitionJobStatePayloadWithEvent(writeCtx, jobID, string(JobRunning), string(state), encoded, db.JobEvent{
+	transitioned, err := m.store.TransitionJobStatePayloadWithEvent(writeCtx, jobID, string(JobRunning), string(state), encoded, db.JobEvent{
 		JobID:   jobID,
 		Kind:    string(state),
 		Message: message,
@@ -1758,7 +1846,7 @@ func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobS
 		return err
 	}
 	if !transitioned {
-		latest, getErr := m.Store.GetJob(writeCtx, jobID)
+		latest, getErr := m.store.GetJob(writeCtx, jobID)
 		if getErr != nil {
 			return getErr
 		}
@@ -1786,7 +1874,7 @@ func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobS
 	// pipeline advancer never folds, and a double execution once the run is
 	// properly resumed.
 	if state == JobBlocked && payload.Result != nil && len(payload.Result.Needs) > 0 && payload.Sender != PipelineJobSender {
-		if _, gateErr := m.Store.RecordJobGates(writeCtx, jobID, payload.Result.Needs); gateErr == nil {
+		if _, gateErr := m.store.RecordJobGates(writeCtx, jobID, payload.Result.Needs); gateErr == nil {
 			_ = m.addEvent(writeCtx, jobID, "gates_recorded", fmt.Sprintf("recorded %d resumable gate(s) from needs", len(payload.Result.Needs)))
 		}
 	}
@@ -1810,7 +1898,7 @@ func terminalMessageWithDiagnostics(state JobState, message string, diag *Failur
 }
 
 func (m Mailbox) ensureRunning(ctx context.Context, jobID string) error {
-	latest, err := m.Store.GetJob(ctx, jobID)
+	latest, err := m.store.GetJob(ctx, jobID)
 	if err != nil {
 		return err
 	}
@@ -1829,7 +1917,7 @@ func (m Mailbox) claim(ctx context.Context, job db.Job) error {
 	// that lets the daemon recover this job immediately after a reboot, and
 	// runner_pid is recorded for observability only. Off Linux BootID() is "", so
 	// the row is identity-less and only the existing age/lease recovery applies.
-	claimed, err := m.Store.ClaimRunningJob(ctx, job.ID, string(JobQueued), string(JobRunning), db.JobEvent{
+	claimed, err := m.store.ClaimRunningJob(ctx, job.ID, string(JobQueued), string(JobRunning), db.JobEvent{
 		JobID:   job.ID,
 		Kind:    string(JobRunning),
 		Message: "job started",
@@ -1838,7 +1926,7 @@ func (m Mailbox) claim(ctx context.Context, job db.Job) error {
 		return err
 	}
 	if !claimed {
-		latest, getErr := m.Store.GetJob(ctx, job.ID)
+		latest, getErr := m.store.GetJob(ctx, job.ID)
 		if getErr != nil {
 			return getErr
 		}
@@ -1861,7 +1949,7 @@ func terminalWriteContext(runCtx context.Context) (context.Context, context.Canc
 }
 
 func (m Mailbox) addEvent(ctx context.Context, jobID string, kind string, message string) error {
-	return m.Store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: kind, Message: message})
+	return m.store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: kind, Message: message})
 }
 
 func (m Mailbox) savePayload(ctx context.Context, jobID string, payload JobPayload) error {
@@ -1869,7 +1957,7 @@ func (m Mailbox) savePayload(ctx context.Context, jobID string, payload JobPaylo
 	if err != nil {
 		return err
 	}
-	return m.Store.UpdateJobPayload(ctx, jobID, encoded)
+	return m.store.UpdateJobPayload(ctx, jobID, encoded)
 }
 
 func (p JobPayload) prompt(action string) prompts.JobPrompt {
