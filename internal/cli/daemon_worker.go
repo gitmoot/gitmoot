@@ -64,7 +64,10 @@ type jobWorker struct {
 	// them nil so checkoutForJob/workflowForJob must consume the resolved runner.
 	CheckoutValidator func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error)
 	WorkflowFactory   func(string) workflow.Engine
-	CommenterFactory  func(string) github.Client
+	// ReclaimJobLookup is a test seam for candidate-local GetJob failures. The
+	// production path is always Store.GetJob.
+	ReclaimJobLookup func(context.Context, string) (db.Job, error)
+	CommenterFactory func(string) github.Client
 	// UsePool selects the opt-in continuous worker-pool scheduler (#394,
 	// --scheduler=pool) over the default per-tick wg.Wait() barrier.
 	UsePool bool

@@ -799,6 +799,10 @@ Delegation worktrees have a separate default-on retention bound:
 `"0"` disables the pass. Blocked, queued, and running owners stay pinned. Run
 `gitmoot doctor` to see stale count, logical size, and the
 reclaimable/pinned/unproven breakdown; dashboard `/api/health` mirrors it.
+Candidate-local lookup, runner, and removal failures skip only that worktree;
+later candidates continue. Repeated failures are logged three times per path,
+then suppressed, while a five-minute summary reports considered, reclaimed, and
+skipped counts. Candidate-query and store-wide lookup failures remain fatal.
 
 Never-started plans have a separate destructive opt-in:
 `[workflow].planned_ttl = "720h"`. It is disabled by default; unset, empty,
@@ -2713,6 +2717,12 @@ force-removed even when dirty, Git worktree metadata is pruned, and
 `delegation_worktree_reclaimed_ttl` is recorded. The dashboard `/api/health`
 response exposes the same count, bytes, path, breakdown, and summary in its
 top-level `worktrees` field.
+
+One unreclaimable candidate does not stop the pass: candidate-local lookup,
+runner, and removal failures are skipped while later paths continue. The daemon
+logs the first three failures for a path, suppresses repeats, and emits a
+five-minute `considered N, reclaimed M, skipped K` summary. Candidate-query and
+store-wide lookup failures still abort the pass and surface normally.
 
 For immediate manual relief, list paths and then prove the owner is final. Do
 not infer safety from directory age alone:
@@ -15403,6 +15413,10 @@ Delegation worktrees use a separate default-on retention policy:
 owners (`succeeded`, `failed`, `cancelled`) older than the TTL are force-removed.
 Blocked, queued, and running owners remain pinned; `gitmoot doctor` reports the
 reclaimable/pinned/unproven counts and logical size.
+Candidate-local lookup, runner, and removal failures skip only that worktree;
+later candidates continue. The daemon logs three failures per path before
+suppressing repeats and emits a five-minute considered/reclaimed/skipped
+summary. Candidate-query and store-wide lookup failures remain fatal.
 
 Never-started `planned` tasks use a separate opt-in policy:
 `[workflow].planned_ttl = "720h"`. It is disabled by default; unset, empty,
@@ -16837,6 +16851,10 @@ owning job is final (`succeeded`, `failed`, or `cancelled`) and its terminal
 delay preserves a short debugging window. `blocked` is resumable and is never a
 TTL reclaim candidate. A successful force-remove and metadata prune records
 `delegation_worktree_reclaimed_ttl`.
+Candidate-local lookup, runner, and removal failures skip only that worktree so
+later candidates continue; candidate-query and store-wide lookup failures still
+abort. Repeated failures log three times per path before suppression, and a
+five-minute summary reports considered, reclaimed, and skipped counts.
 
 `gitmoot doctor` and dashboard `/api/health` surface stale count and logical
 size, split into reclaimable final owners, pinned non-final owners, and unproven

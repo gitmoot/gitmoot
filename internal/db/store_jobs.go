@@ -199,6 +199,30 @@ func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
 	return job, nil
 }
 
+// JobWorktreePath returns the worktree path recorded in one job payload without
+// scanning the rest of the job row. The daemon's best-effort reclaim pass uses
+// this narrow lookup to distinguish a candidate-local GetJob scan failure from a
+// store-wide failure: if this lookup also fails, the pass still escalates.
+func (s *Store) JobWorktreePath(ctx context.Context, id string) (string, error) {
+	var path string
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(json_extract(payload, '$.worktree_path'), '')
+		FROM jobs WHERE id = ? AND json_valid(payload)`, id).Scan(&path)
+	return path, err
+}
+
+// LatestDelegationWorktreeCleanupOutcome returns the newest cleanup outcome for
+// one job. The compound kind/job index makes this a bounded point lookup.
+func (s *Store) LatestDelegationWorktreeCleanupOutcome(ctx context.Context, jobID string) (string, error) {
+	var kind string
+	err := s.db.QueryRowContext(ctx, `SELECT kind FROM job_events
+		WHERE job_id = ? AND kind IN ('delegation_worktree_cleanup_skipped', 'delegation_worktree_removed')
+		ORDER BY id DESC LIMIT 1`, jobID).Scan(&kind)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return kind, err
+}
+
 // jobColumns is the shared core projection ListJobs and ListJobsByType both
 // read, kept as one const so their SELECT lists and scanJobs order cannot drift.
 // Workflow-only scalar projections are selected by ListJobsByWorkflow.
