@@ -44,13 +44,11 @@ func (w jobWorker) defaultCheckoutForRunner(ctx context.Context, job db.Job, pay
 	}
 	switch job.Type {
 	case "implement":
-		// A worktree-less delegation child (delegation leg, empty WorktreePath)
-		// can only resolve the registered shared checkout, which sits on `main`,
-		// never its inherited coordinator branch — so validating that checkout
-		// against payload.Branch would reject it with "checkout branch is main, not
-		// job branch <X>". Skip the branch-identity guard for that child only (the
-		// engine's delegation_worktree_skipped fallback runs it against the shared
-		// checkout and still holds its branch lock); mirror the #389 ask-arm escape.
+		// A delegation child with an empty WorktreePath either resolves a compatible
+		// task-table worktree (validated by taskWorktreeCheckout) or falls back to the
+		// registered shared checkout, which may sit on `main` rather than the inherited
+		// coordinator branch. Preserve the branch-identity escape for this payload
+		// shape; delivery observation separately distinguishes the effective source.
 		// validateImplementationLock stays UNCONDITIONAL — the branch lock, not this
 		// identity guard, is the designed mutation-safety mechanism (#413).
 		if !isWorktreeLessDelegationChild(payload) {
@@ -88,9 +86,9 @@ func (w jobWorker) defaultCheckoutForRunner(ctx context.Context, job db.Job, pay
 			// default-branch checkout ("checkout branch is main, not job branch "),
 			// wedging the heartbeat at the worker before the engine ever sees it.
 		case !isWorktreeLessDelegationChild(payload):
-			// Same worktree-less delegation child escape as the implement arm; a
-			// review is read-only ⇒ running it against the shared checkout is
-			// trivially safe (#413).
+			// Same empty-payload-worktree escape as the implement arm; a review is
+			// read-only, while taskWorktreeCheckout has already checked any task-table
+			// source against the payload's repo and branch (#413).
 			if err := w.validateTargetCheckoutForRunner(ctx, payload, checkout, runner); err != nil {
 				return "", err
 			}
@@ -333,22 +331,44 @@ func isDelegationWorktreeChild(payload workflow.JobPayload) bool {
 	return strings.TrimSpace(payload.DelegationID) != "" && strings.TrimSpace(payload.WorktreePath) != ""
 }
 
-// isWorktreeLessDelegationChild is the exact complement of
-// isDelegationWorktreeChild: a delegation child (it carries a delegation id — a
-// delegation *leg*, NOT just a ParentJobID, which continuations also carry with
-// an empty DelegationID and which route through the `ask` arm) that has no
-// allocated worktree path. With no worktree it can only resolve the repo's
-// registered shared checkout, which sits on `main` — never the inherited
-// coordinator branch (delegationRequest sets Branch: payload.Branch) — so
-// validating that checkout against payload.Branch would reject it with
-// "checkout branch is main, not job branch <X>". A wrong-branch *task* worktree
-// is already rejected upstream at taskWorktreeCheckout, so WorktreePath == ""
-// cleanly means "the shared registered checkout is the only resolution."
-// defaultCheckout's implement/review arms skip the validateTargetCheckout branch
-// guard for such a child (the branch lock, not this identity guard, is the
-// designed mutation-safety mechanism); see #389 (the ask-arm precedent) and #413.
+// isWorktreeLessDelegationChild reports the payload shape of a delegation child
+// with no per-delegation worktree. A TaskID may still resolve an effective
+// task-table worktree, so callers deciding whether the job truly used the shared
+// checkout must also consult taskWorktreeCheckout.
 func isWorktreeLessDelegationChild(payload workflow.JobPayload) bool {
 	return strings.TrimSpace(payload.DelegationID) != "" && strings.TrimSpace(payload.WorktreePath) == ""
+}
+
+// deliveryWorktreeResolver injects the checkout already resolved by the worker
+// into workflow's result-delivery seam. A payload without a per-delegation path
+// may still have an effective task-table worktree, so exclusion is based on that
+// resolved source rather than payload.WorktreePath alone.
+func deliveryWorktreeResolver(store *db.Store, checkout string) workflow.DeliveryWorktreeResolver {
+	checkout = strings.TrimSpace(checkout)
+	return func(ctx context.Context, _ db.Job, payload workflow.JobPayload) (workflow.DeliveryWorktreeResolution, error) {
+		if isWorktreeLessDelegationChild(payload) {
+			if strings.TrimSpace(payload.TaskID) != "" {
+				if store == nil {
+					return workflow.DeliveryWorktreeResolution{}, errors.New("resolve delivery task worktree: store is nil")
+				}
+				taskCheckout, ok, err := (jobWorker{Store: store}).taskWorktreeCheckout(ctx, payload)
+				if err != nil {
+					return workflow.DeliveryWorktreeResolution{}, fmt.Errorf("resolve delivery task worktree: %w", err)
+				}
+				if ok {
+					if !sameCheckoutPath(taskCheckout, checkout) {
+						return workflow.DeliveryWorktreeResolution{}, fmt.Errorf("resolved delivery checkout %q differs from task worktree %q", checkout, taskCheckout)
+					}
+					return workflow.DeliveryWorktreeResolution{Path: checkout}, nil
+				}
+			}
+			return workflow.DeliveryWorktreeResolution{ExcludedSource: workflow.ResultObservationSourceWorktreeLessDelegationChild}, nil
+		}
+		if checkout == "" {
+			return workflow.DeliveryWorktreeResolution{}, errors.New("resolved job checkout is empty")
+		}
+		return workflow.DeliveryWorktreeResolution{Path: checkout}, nil
+	}
 }
 
 func (w jobWorker) validateReviewCheckoutForRunner(ctx context.Context, payload workflow.JobPayload, checkout string, runner subprocess.Runner) error {

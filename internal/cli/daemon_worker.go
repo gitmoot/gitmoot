@@ -2116,7 +2116,12 @@ func (w jobWorker) queueTempWorkerMergeBack(ctx context.Context, completedJobID 
 			"Do not edit files, create commits, open pull requests, or dispatch more agents unless the summary explicitly requires follow-up.",
 		},
 	}
-	if _, err := (workflow.Mailbox{Store: w.Store, CanaryEnabled: canaryRoutingEnabled(w.workflowHome()), RuntimeDefaultModel: runtimeDefaultModelResolver(w.workflowHome()), RequireWorkflowPolicy: requireWorkflowPolicyResolver(w.workflowHome()), OrgPolicy: orgPolicyResolver(w.workflowHome())}).Enqueue(ctx, request); err != nil {
+	mailbox := workflow.NewMailbox(w.Store, workflow.UnavailableDeliveryWorktreeResolver("temporary worker merge-back enqueue"))
+	mailbox.CanaryEnabled = canaryRoutingEnabled(w.workflowHome())
+	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(w.workflowHome())
+	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(w.workflowHome())
+	mailbox.OrgPolicy = orgPolicyResolver(w.workflowHome())
+	if _, err := mailbox.Enqueue(ctx, request); err != nil {
 		return err
 	}
 	return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: completedJob.ID, Kind: "temp_worker_merge_back_queued", Message: fmt.Sprintf("queued summary merge-back job %s for %s", mergeBackID, original.Name)})

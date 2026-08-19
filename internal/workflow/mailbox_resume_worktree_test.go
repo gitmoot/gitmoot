@@ -12,7 +12,7 @@ import (
 func TestMailboxRunPrependsResumeNotice(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	const output = `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
 
 	run := func(t *testing.T, id string, resumed bool) (string, string) {

@@ -23,7 +23,7 @@ import (
 func TestMailboxRunSkipsRefreshedRefPersistForRuntimeOverride(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	defaultRef := "codex-default-session"
 	if err := store.UpsertAgent(ctx, db.Agent{
 		Name:       "shipper",
@@ -82,7 +82,7 @@ func TestMailboxRunSkipsRefreshedRefPersistForRuntimeOverride(t *testing.T) {
 func TestMailboxEnqueuePersistsRuntimeOverride(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 
 	job, err := mailbox.Enqueue(ctx, JobRequest{
 		ID:                 "job-override",
@@ -111,7 +111,7 @@ func TestMailboxEnqueuePersistsRuntimeOverride(t *testing.T) {
 func TestMailboxRunThreadsShellEnvironment(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	env := []string{"GITMOOT_TRIGGER_BODY=first\n第二", "GITMOOT_TRIGGER_SUBJECT=Snowman ☃"}
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-shell-env", Agent: "runner", Action: "ask", Repo: "owner/repo", RuntimeOverride: runtime.ShellRuntime, RuntimeOverrideRef: "printf ok", ShellEnv: env}); err != nil {
 		t.Fatal(err)
@@ -129,7 +129,7 @@ func TestMailboxRunThreadsShellEnvironment(t *testing.T) {
 func TestMailboxPipelineInputEnvDeliveryNeverEntersPromptOrFreeFormResult(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	const sentinel = "SERVICE_INPUT_SENTINEL_1011"
 	inputEnv := []string{"GITMOOT_INPUT_APP_NAME=" + sentinel, "GITMOOT_INPUT_COUNT=3"}
 	const resultJSON = `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
@@ -198,7 +198,7 @@ func TestMailboxPipelineInputEnvDeliveryNeverEntersPromptOrFreeFormResult(t *tes
 }
 
 func TestMailboxRejectsUnreservedPipelineInputEnv(t *testing.T) {
-	mailbox := Mailbox{Store: openTestStore(t)}
+	mailbox := Mailbox{store: openTestStore(t), resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	for _, env := range [][]string{{"PATH=/tmp"}, {"GITMOOT_PIPELINE_NAME=x"}, {"GITMOOT_INPUT_app=x"}, {"GITMOOT_INPUT_APP=x", "GITMOOT_INPUT_APP=y"}} {
 		if _, err := mailbox.Enqueue(context.Background(), JobRequest{ID: "bad-input-env", Agent: "runner", Action: "ask", Repo: "owner/repo", PipelineInputEnv: env}); err == nil {
 			t.Fatalf("Enqueue accepted pipeline input env %#v", env)
@@ -219,7 +219,7 @@ func TestMailboxShellUpstreamContextPersistsAcrossReopenAndDelivery(t *testing.T
 		RuntimeOverride: runtime.ShellRuntime, RuntimeOverrideRef: "printf ok",
 		ShellUpstreamContext: contextJSON,
 	}
-	job, err := (Mailbox{Store: store}).Enqueue(ctx, request)
+	job, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,14 +249,14 @@ func TestMailboxShellUpstreamContextPersistsAcrossReopenAndDelivery(t *testing.T
 
 	adapter := &fakeDelivery{outputs: []string{`{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}}
 	agent := runtime.Agent{Name: "runner", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "owner/repo", Role: "runner"}
-	if _, err := (Mailbox{Store: store}).Run(ctx, job.ID, agent, adapter); err != nil {
+	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Run(ctx, job.ID, agent, adapter); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(adapter.shellUpstreamContexts, []string{contextJSON}) {
 		t.Fatalf("delivered contexts = %#v", adapter.shellUpstreamContexts)
 	}
 
-	plain, err := (Mailbox{Store: store}).Enqueue(ctx, JobRequest{ID: "job-shell-plain", Agent: "runner", Action: "ask", Repo: "owner/repo", RuntimeOverride: runtime.ShellRuntime, RuntimeOverrideRef: "printf ok"})
+	plain, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, JobRequest{ID: "job-shell-plain", Agent: "runner", Action: "ask", Repo: "owner/repo", RuntimeOverride: runtime.ShellRuntime, RuntimeOverrideRef: "printf ok"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +268,7 @@ func TestMailboxShellUpstreamContextPersistsAcrossReopenAndDelivery(t *testing.T
 func TestMailboxShellUpstreamContextFailureRedactsPersistedTempPath(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	secretTempPrefix := filepath.Join(t.TempDir(), "operator-private-temp")
 	t.Setenv("TMPDIR", secretTempPrefix) // Deliberately absent: CreateTemp must fail.
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
@@ -307,7 +307,7 @@ func TestMailboxShellUpstreamContextFailureRedactsPersistedTempPath(t *testing.T
 func TestMailboxEnqueueRejectsInvalidRuntimeOverride(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	freshRef, err := runtime.NewFreshRef()
 	if err != nil {
 		t.Fatalf("NewFreshRef returned error: %v", err)

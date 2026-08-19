@@ -414,7 +414,12 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if divergence := strings.TrimSpace(request.ReviewTaskHeadDivergence); divergence != "" {
 		requiredEvents = append(requiredEvents, db.JobEvent{Kind: "review_task_head_divergence", Message: divergence})
 	}
-	job, err := (workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(request.Home), RuntimeDefaultModel: runtimeDefaultModelResolver(request.Home), RequireWorkflowPolicy: requireWorkflowPolicyResolver(request.Home), OrgPolicy: orgPolicy}).Enqueue(ctx, workflow.JobRequest{
+	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("local agent enqueue"))
+	mailbox.CanaryEnabled = canaryRoutingEnabled(request.Home)
+	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(request.Home)
+	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(request.Home)
+	mailbox.OrgPolicy = orgPolicy
+	job, err := mailbox.Enqueue(ctx, workflow.JobRequest{
 		ID:                     jobID,
 		Agent:                  agent.Name,
 		Action:                 request.Action,
@@ -634,7 +639,9 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			// Wire the home-aware registry defaults so a foreground ask with no
 			// agent/job model or effort pin honors the runtime's defaults too.
 			// Fail-open/empty by default; an agent/job pin wins.
-			mailbox := workflow.Mailbox{Store: store, RuntimeDefaultModel: runtimeDefaultModelResolver(request.Home), RuntimeDefaultEffort: runtimeDefaultEffortResolver(request.Home)}
+			mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("foreground ask delivery"))
+			mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(request.Home)
+			mailbox.RuntimeDefaultEffort = runtimeDefaultEffortResolver(request.Home)
 			if _, err := mailbox.Run(runCtx, job.ID, effectiveAgent, adapter); err != nil {
 				recordRuntimeOutcome(err)
 				return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, err)
@@ -783,7 +790,12 @@ func buildLocalAgentJobOutput(latest db.Job, request localAgentDispatchRequest) 
 }
 
 func enqueuePermissionBlockedLocalAgentJob(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string, defaultBranch string, agentName string, overrideRuntime string, overrideRef string, orgPolicy func(string) workflow.OrgEnforcement) (localAgentJobOutput, error) {
-	job, err := (workflow.Mailbox{Store: store, CanaryEnabled: canaryRoutingEnabled(request.Home), RuntimeDefaultModel: runtimeDefaultModelResolver(request.Home), RequireWorkflowPolicy: requireWorkflowPolicyResolver(request.Home), OrgPolicy: orgPolicy}).Enqueue(ctx, workflow.JobRequest{
+	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("permission-blocked local agent enqueue"))
+	mailbox.CanaryEnabled = canaryRoutingEnabled(request.Home)
+	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(request.Home)
+	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(request.Home)
+	mailbox.OrgPolicy = orgPolicy
+	job, err := mailbox.Enqueue(ctx, workflow.JobRequest{
 		ID:             localAgentJobID(request.Action, agentName),
 		Agent:          agentName,
 		Action:         request.Action,

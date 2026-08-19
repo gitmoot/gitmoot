@@ -19,7 +19,7 @@ func shellCrashAgent(script string) runtime.Agent {
 func TestMailboxRunCapturesCrashDiagnosticsOnNonZeroExit(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	agent := shellCrashAgent(`echo "api_key=super-secret-crash-value" >&2; echo "runtime exploded" >&2; exit 7`)
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-crash", Agent: "audit", Action: "review", Repo: "gitmoot/gitmoot"}); err != nil {
@@ -75,7 +75,7 @@ func TestMailboxRunCapturesCrashDiagnosticsOnNonZeroExit(t *testing.T) {
 func TestMailboxRunCrashDiagnosticsStreamingPhase(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	agent := shellCrashAgent(`echo "partial stdout"; echo "died mid-stream" >&2; exit 3`)
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-stream", Agent: "audit", Action: "review", Repo: "gitmoot/gitmoot"}); err != nil {
@@ -111,7 +111,7 @@ func TestMailboxRunCrashDiagnosticsStreamingPhase(t *testing.T) {
 func TestMailboxRunRecordsResultParseDiagnostics(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	agent := shellCrashAgent(`echo "no envelope from me"; echo "warned on stderr" >&2`)
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-parse", Agent: "audit", Action: "review", Repo: "gitmoot/gitmoot"}); err != nil {
@@ -150,7 +150,7 @@ func TestMailboxRunRecordsResultParseDiagnostics(t *testing.T) {
 func TestMailboxRunSuccessStoresNoFailureDiagnostics(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	agent := shellCrashAgent(`echo '{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`)
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-ok", Agent: "audit", Action: "review", Repo: "gitmoot/gitmoot"}); err != nil {
@@ -182,7 +182,7 @@ func TestMailboxRunSuccessStoresNoFailureDiagnostics(t *testing.T) {
 func TestMailboxRunClearsStaleFailureDiagnosticsOnRetry(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	agent := shellCrashAgent(`echo '{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`)
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-retry", Agent: "audit", Action: "review", Repo: "gitmoot/gitmoot"}); err != nil {

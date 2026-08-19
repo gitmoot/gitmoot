@@ -2206,7 +2206,12 @@ func (d Daemon) enqueueJob(ctx context.Context, request workflow.JobRequest) (db
 		requireWorkflowPolicy = d.Workflow.RequireWorkflowPolicy
 		orgPolicy = d.Workflow.OrgPolicy
 	}
-	job, err := (workflow.Mailbox{Store: d.Store, CanaryEnabled: canaryEnabled, RuntimeDefaultModel: runtimeDefaultModel, RequireWorkflowPolicy: requireWorkflowPolicy, OrgPolicy: orgPolicy}).Enqueue(ctx, request)
+	mailbox := workflow.NewMailbox(d.Store, workflow.UnavailableDeliveryWorktreeResolver("daemon comment enqueue"))
+	mailbox.CanaryEnabled = canaryEnabled
+	mailbox.RuntimeDefaultModel = runtimeDefaultModel
+	mailbox.RequireWorkflowPolicy = requireWorkflowPolicy
+	mailbox.OrgPolicy = orgPolicy
+	job, err := mailbox.Enqueue(ctx, request)
 	return job, true, err
 }
 

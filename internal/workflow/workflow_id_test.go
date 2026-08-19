@@ -79,7 +79,7 @@ func TestMailboxRejectsInvalidWorkflowIDAndExternalJobPersistsValidID(t *testing
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedAgent(t, store, "coord", []string{"ask"}, "acme/widget")
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	_, err := mailbox.Enqueue(ctx, JobRequest{ID: "bad", Agent: "coord", Action: "ask", Repo: "acme/widget", WorkflowID: "Bad_ID"})
 	if err == nil || !strings.Contains(err.Error(), "invalid workflow id") {
 		t.Fatalf("invalid enqueue error = %v", err)

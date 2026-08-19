@@ -16,6 +16,10 @@ import (
 
 type Engine struct {
 	Store *db.Store
+	// ResolveDeliveryWorktree is the injected CLI-owned checkout-resolution seam
+	// used after an implement delivery. The workflow package must not import cli;
+	// daemonWorkflowEngine wires the effective checkout selected by the worker.
+	ResolveDeliveryWorktree DeliveryWorktreeResolver
 	// RequireWorkflowPolicy is passed to every mailbox the engine creates so
 	// continuations and delegation enqueue share the same home-aware policy.
 	RequireWorkflowPolicy func(repo string) RequireWorkflowPolicy

@@ -8,7 +8,7 @@ import (
 func TestEnqueuePersistsPullRequestReadyOptOut(t *testing.T) {
 	store := openEngineStore(t)
 	seedAgent(t, store, "builder", []string{"implement"}, "owner/repo")
-	job, err := (Mailbox{Store: store}).Enqueue(context.Background(), JobRequest{
+	job, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(context.Background(), JobRequest{
 		ID: "implement-ready", Agent: "builder", Action: "implement", Repo: "owner/repo",
 		Branch: "task-ready", TaskID: "task-ready", Instructions: "implement",
 		PullRequestReady: true,

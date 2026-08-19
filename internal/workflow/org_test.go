@@ -25,7 +25,7 @@ func testOrgPolicy(enforce string) func(string) OrgEnforcement {
 
 func TestMailboxOrgScopeGate(t *testing.T) {
 	ctx, store := context.Background(), openTestStore(t)
-	mb := Mailbox{Store: store, OrgPolicy: testOrgPolicy("block"), RequireWorkflowPolicy: func(string) RequireWorkflowPolicy { return RequireWorkflowPolicy{} }}
+	mb := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), OrgPolicy: testOrgPolicy("block"), RequireWorkflowPolicy: func(string) RequireWorkflowPolicy { return RequireWorkflowPolicy{} }}
 	job, err := mb.Enqueue(ctx, JobRequest{ID: "ok", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "local", OperatorOrigin: true, ActingOrgRole: "OWNER"})
 	if err != nil {
 		t.Fatal(err)
@@ -58,7 +58,7 @@ func TestMailboxOrgScopeGate(t *testing.T) {
 
 func TestMailboxOrgWarnAndMalformed(t *testing.T) {
 	ctx, store := context.Background(), openTestStore(t)
-	warn := Mailbox{Store: store, OrgPolicy: testOrgPolicy("warn")}
+	warn := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), OrgPolicy: testOrgPolicy("warn")}
 	job, err := warn.Enqueue(ctx, JobRequest{ID: "warn", Agent: "a", Action: "ask", Repo: "other/repo", Sender: "local", OperatorOrigin: true, ActingOrgRole: "owner"})
 	if err != nil {
 		t.Fatal(err)
@@ -70,7 +70,7 @@ func TestMailboxOrgWarnAndMalformed(t *testing.T) {
 	if len(events) != 2 || events[1].Kind != "org_scope_violation" {
 		t.Fatalf("events=%+v", events)
 	}
-	bad := Mailbox{Store: store, OrgPolicy: func(string) OrgEnforcement { return OrgEnforcement{LoadErr: errors.New("bad org toml")} }}
+	bad := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), OrgPolicy: func(string) OrgEnforcement { return OrgEnforcement{LoadErr: errors.New("bad org toml")} }}
 	if _, err := bad.Enqueue(ctx, JobRequest{ID: "bad-automated", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "local"}); err != nil {
 		t.Fatalf("automated malformed config: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestOrgScopeDecisionEnqueueParity(t *testing.T) {
 				t.Fatalf("decision violation=%q err=%v", violation, decisionErr)
 			}
 			store := openTestStore(t)
-			job, enqueueErr := (Mailbox{Store: store, OrgPolicy: fixedOrgPolicyForTest(policy)}).Enqueue(ctx, JobRequest{ID: "parity", Agent: "a", Action: "ask", Repo: tt.repo, OperatorOrigin: true, ActingOrgRole: tt.role})
+			job, enqueueErr := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), OrgPolicy: fixedOrgPolicyForTest(policy)}).Enqueue(ctx, JobRequest{ID: "parity", Agent: "a", Action: "ask", Repo: tt.repo, OperatorOrigin: true, ActingOrgRole: tt.role})
 			if (enqueueErr != nil) != tt.wantErr {
 				t.Fatalf("enqueue err=%v, decision err=%v", enqueueErr, decisionErr)
 			}

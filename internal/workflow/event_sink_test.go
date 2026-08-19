@@ -62,7 +62,7 @@ func TestEngineEmitsJobFinishedOnSucceededTerminal(t *testing.T) {
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"approved","summary":"looks good","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 	}}
-	if _, err := (Mailbox{Store: store}).Enqueue(ctx, JobRequest{
+	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, JobRequest{
 		ID:        "review-job",
 		Agent:     "audit",
 		Action:    "review",
@@ -107,7 +107,7 @@ func TestEngineEmitsJobFailedOnFailedDecision(t *testing.T) {
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"failed","summary":"could not finish","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 	}}
-	if _, err := (Mailbox{Store: store}).Enqueue(ctx, JobRequest{
+	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, JobRequest{
 		ID:        "review-job",
 		Agent:     "audit",
 		Action:    "review",
@@ -156,7 +156,7 @@ func TestEngineEmitsJobFailedOnDeliveryFailure(t *testing.T) {
 	// A delivery error: Deliver returns an error, so Mailbox.Run takes the m.fail
 	// branch and never reaches finishWithPayload.
 	adapter := &fakeDelivery{err: errors.New("codex transport failure")}
-	if _, err := (Mailbox{Store: store}).Enqueue(ctx, JobRequest{
+	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, JobRequest{
 		ID:        "review-job",
 		Agent:     "audit",
 		Action:    "review",
@@ -211,7 +211,7 @@ func TestEngineEmitsJobFailedOnMalformedOutputAfterRepair(t *testing.T) {
 	// Two un-parseable outputs: the first triggers the repair retry, the second
 	// (also malformed) drives m.fail -> finish with a parse error.
 	adapter := &fakeDelivery{outputs: []string{"not json", "still not json"}}
-	if _, err := (Mailbox{Store: store}).Enqueue(ctx, JobRequest{
+	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, JobRequest{
 		ID:        "review-job",
 		Agent:     "audit",
 		Action:    "review",
@@ -308,7 +308,7 @@ func TestEngineNilSinkIsByteIdentical(t *testing.T) {
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 	}}
-	if _, err := (Mailbox{Store: store}).Enqueue(ctx, JobRequest{
+	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, JobRequest{
 		ID:     "review-job",
 		Agent:  "audit",
 		Action: "review",
@@ -346,7 +346,7 @@ func TestEngineSlowSinkDoesNotDeadlockEngine(t *testing.T) {
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 	}}
-	if _, err := (Mailbox{Store: store}).Enqueue(ctx, JobRequest{
+	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, JobRequest{
 		ID:     "review-job",
 		Agent:  "audit",
 		Action: "review",

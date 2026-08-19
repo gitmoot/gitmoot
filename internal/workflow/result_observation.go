@@ -14,7 +14,10 @@ import (
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
 
-const ResultObservationSourceWorktreeDiff = "worktree_git_diff"
+const (
+	ResultObservationSourceWorktreeDiff                = "worktree_git_diff"
+	ResultObservationSourceWorktreeLessDelegationChild = "excluded_worktree_less_delegation_child"
+)
 
 var resultClaimLineSuffix = regexp.MustCompile(`:\d+(?:(?::|-)\d+)?$`)
 
@@ -127,12 +130,38 @@ type ResultObservation struct {
 	Error            string              `json:"error,omitempty"`
 }
 
+// excludedResultObservation records that a caller deliberately excluded a job
+// shape from worktree observation. Keeping the exclusion typed and persisted
+// makes it distinguishable from a completed observation with no divergence.
+func excludedResultObservation(source string, result AgentResult) *ResultObservation {
+	return &ResultObservation{
+		Source:           strings.TrimSpace(source),
+		TouchedFiles:     []string{},
+		Changes:          reportedChangeObservations(result.ChangesMade),
+		ClaimedOnlyFiles: []string{},
+		UnclaimedFiles:   []string{},
+		UnboundClaims:    []string{},
+		Divergent:        false,
+	}
+}
+
 // observeResultChanges captures the worktree diff and binds it to the result.
-// A nil observation means the engine has no owned worktree from which to read.
+// Callers must resolve or explicitly exclude the delivery worktree before this
+// function is reached; an empty path is therefore recorded as an observation
+// error rather than disappearing as nil.
 func observeResultChanges(ctx context.Context, worktree string, result AgentResult, backend execbackend.Backend) *ResultObservation {
 	worktree = strings.TrimSpace(worktree)
 	if worktree == "" {
-		return nil
+		return &ResultObservation{
+			Source:           ResultObservationSourceWorktreeDiff,
+			TouchedFiles:     []string{},
+			Changes:          reportedChangeObservations(result.ChangesMade),
+			ClaimedOnlyFiles: []string{},
+			UnclaimedFiles:   []string{},
+			UnboundClaims:    []string{},
+			Divergent:        false,
+			Error:            "observe worktree diff: resolved delivery worktree is empty",
+		}
 	}
 	files, err := execbackend.Consume(backend, func() ([]string, error) {
 		return changedWorktreeFiles(ctx, worktree)

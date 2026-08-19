@@ -167,11 +167,9 @@ func TestCanaryLifecycleE2E(t *testing.T) {
 
 		// ROUTING LEG: sample=0.5. Draws below the sample resolve the CANARY snapshot;
 		// draws at/above resolve the CHAMPION. Proves routing genuinely splits traffic.
-		mb := workflow.Mailbox{
-			Store:         store,
-			CanaryEnabled: true,
-			CanaryRand:    scriptedDraws(t, 0.10, 0.20, 0.30, 0.80),
-		}
+		mb := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("canary routing enqueue test"))
+		mb.CanaryEnabled = true
+		mb.CanaryRand = scriptedDraws(t, 0.10, 0.20, 0.30, 0.80)
 		canaryJobs := routeAndAssertSplit(t, mb, agentName, "rollback", championCommit, canaryCommit, []routeCase{
 			{pr: 101, canary: true}, {pr: 102, canary: true}, {pr: 103, canary: true}, {pr: 104, canary: false},
 		})
@@ -234,11 +232,9 @@ func TestCanaryLifecycleE2E(t *testing.T) {
 		// Champion baseline: strong real-CI positives within the window.
 		seedAutoTraceFeedback(t, store, "planner", championID, "a", 3)
 
-		mb := workflow.Mailbox{
-			Store:         store,
-			CanaryEnabled: true,
-			CanaryRand:    scriptedDraws(t, 0.05, 0.15, 0.25, 0.95),
-		}
+		mb := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("canary routing enqueue test"))
+		mb.CanaryEnabled = true
+		mb.CanaryRand = scriptedDraws(t, 0.05, 0.15, 0.25, 0.95)
 		canaryJobs := routeAndAssertSplit(t, mb, agentName, "graduate", championCommit, canaryCommit, []routeCase{
 			{pr: 301, canary: true}, {pr: 302, canary: true}, {pr: 303, canary: true}, {pr: 304, canary: false},
 		})
@@ -342,11 +338,9 @@ func TestCanaryLifecycleE2E(t *testing.T) {
 		// [events] config), so the rollback is asserted on store-observable state
 		// rather than emitted events — the event assertions live in the hand-wired
 		// rollback subtest above.
-		mb := workflow.Mailbox{
-			Store:         store,
-			CanaryEnabled: canaryRoutingEnabled(home),
-			CanaryRand:    scriptedDraws(t, 0.10, 0.20, 0.30, 0.80),
-		}
+		mb := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("canary routing enqueue test"))
+		mb.CanaryEnabled = canaryRoutingEnabled(home)
+		mb.CanaryRand = scriptedDraws(t, 0.10, 0.20, 0.30, 0.80)
 		canaryJobs := routeAndAssertSplit(t, mb, agentName, "wired", championCommit, canaryCommit, []routeCase{
 			{pr: 701, canary: true}, {pr: 702, canary: true}, {pr: 703, canary: true}, {pr: 704, canary: false},
 		})
@@ -397,11 +391,9 @@ func TestCanaryLifecycleE2E(t *testing.T) {
 		store, championID, canaryID, _, canaryCommit, agentName := canaryE2EFixture(t)
 		seedAutoTraceFeedback(t, store, "planner", championID, "a", 3)
 
-		mb := workflow.Mailbox{
-			Store:         store,
-			CanaryEnabled: true,
-			CanaryRand:    scriptedDraws(t, 0.0, 0.0, 0.0, 0.0),
-		}
+		mb := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("canary routing enqueue test"))
+		mb.CanaryEnabled = true
+		mb.CanaryRand = scriptedDraws(t, 0.0, 0.0, 0.0, 0.0)
 		var canaryJobs []workflow.JobPayload
 		for i := 0; i < 4; i++ {
 			_, payload := enqueueImplement(t, mb, agentName, 500+i, fmt.Sprintf("race-job-%d", i))

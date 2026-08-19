@@ -609,7 +609,7 @@ func TestMemoryReplayReportsInjectionDelta(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 	// Create a real job in the store whose instructions match.
-	if _, err := (workflow.Mailbox{Store: store}).Enqueue(ctx, workflow.JobRequest{
+	if _, err := (workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("test enqueue-only mailbox"))).Enqueue(ctx, workflow.JobRequest{
 		ID: "job-1", Agent: "builder", Action: "implement", Repo: "acme/widget",
 		Instructions: "investigate the flaky arm64 runner",
 	}); err != nil {

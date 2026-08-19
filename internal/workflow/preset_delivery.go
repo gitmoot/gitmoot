@@ -112,10 +112,10 @@ func (m Mailbox) usePresetReference(ctx context.Context, agent runtime.Agent, pa
 	if !decidePresetReference(presetDeliveryInputsWithState(base, true)) {
 		return false
 	}
-	if m.Store == nil {
+	if m.store == nil {
 		return false
 	}
-	has, err := m.Store.HasPresetSessionState(ctx, agent.Runtime, agent.RuntimeRef, presetID, payload.TemplateResolvedCommit)
+	has, err := m.store.HasPresetSessionState(ctx, agent.Runtime, agent.RuntimeRef, presetID, payload.TemplateResolvedCommit)
 	if err != nil || !has {
 		return false
 	}
@@ -141,7 +141,7 @@ func presetDeliveryInputsWithState(in presetDeliveryInputs, hasState bool) prese
 // effectiveRef is the session the NEXT job will resume: the refreshed ref when a
 // delivery re-pinned the session, else the agent's current ref.
 func (m Mailbox) recordPresetSessionState(ctx context.Context, agent runtime.Agent, payload JobPayload, effectiveRef string, referenceUsed bool) {
-	if m.Store == nil || referenceUsed {
+	if m.store == nil || referenceUsed {
 		return
 	}
 	mode := normalizePresetDeliveryMode(agent.PresetDelivery)
@@ -156,5 +156,5 @@ func (m Mailbox) recordPresetSessionState(ctx context.Context, agent runtime.Age
 	if !isConcreteSessionRef(effectiveRef) {
 		return
 	}
-	_ = m.Store.RecordPresetSessionState(ctx, agent.Runtime, effectiveRef, presetID, payload.TemplateResolvedCommit)
+	_ = m.store.RecordPresetSessionState(ctx, agent.Runtime, effectiveRef, presetID, payload.TemplateResolvedCommit)
 }

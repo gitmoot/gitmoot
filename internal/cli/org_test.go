@@ -656,7 +656,9 @@ func TestOrgPreflightEnqueueParity(t *testing.T) {
 			}
 			store := openCLIJobStore(t, t.TempDir())
 			defer store.Close()
-			job, err := (workflow.Mailbox{Store: store, OrgPolicy: fixedOrgPolicy(policy)}).Enqueue(context.Background(), workflow.JobRequest{ID: "parity", Agent: "agent", Action: "ask", Repo: tt.repo, OperatorOrigin: true, ActingOrgRole: tt.role})
+			mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("org enqueue test"))
+			mailbox.OrgPolicy = fixedOrgPolicy(policy)
+			job, err := mailbox.Enqueue(context.Background(), workflow.JobRequest{ID: "parity", Agent: "agent", Action: "ask", Repo: tt.repo, OperatorOrigin: true, ActingOrgRole: tt.role})
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("enqueue err=%v, shared err=%v", err, decisionErr)
 			}

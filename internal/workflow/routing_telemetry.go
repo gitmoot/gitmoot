@@ -24,7 +24,7 @@ const maxRouterContextRows = 9
 // been applied to agent.Runtime by the caller); tokens are re-read from the job
 // row where the delivery persisted them (0 for a runtime that reports none).
 func (m Mailbox) recordRoutingTelemetry(ctx context.Context, job db.Job, agent runtime.Agent, payload JobPayload, result AgentResult, state JobState, duration time.Duration) {
-	if m.Store == nil {
+	if m.store == nil {
 		return
 	}
 	// Use the delivery resolver so telemetry cannot drift from the runtime's model
@@ -46,10 +46,10 @@ func (m Mailbox) recordRoutingTelemetry(ctx context.Context, job db.Job, agent r
 	// delegation budget's view (deliver() accumulates usage onto the job row). A
 	// read error just leaves tokens at 0 — advisory only.
 	var inTok, outTok int
-	if fresh, err := m.Store.GetJob(ctx, job.ID); err == nil {
+	if fresh, err := m.store.GetJob(ctx, job.ID); err == nil {
 		inTok, outTok = fresh.InputTokens, fresh.OutputTokens
 	}
-	_ = m.Store.InsertRoutingTelemetry(ctx, db.RoutingTelemetry{
+	_ = m.store.InsertRoutingTelemetry(ctx, db.RoutingTelemetry{
 		JobID:          job.ID,
 		Repo:           payload.Repo,
 		Action:         job.Type,
@@ -79,10 +79,10 @@ func (m Mailbox) recordRoutingTelemetry(ctx context.Context, job db.Job, agent r
 // knob AND on the job being a top-level (coordinator) job, so with the knob off no
 // query runs and the prompt is byte-identical.
 func (m Mailbox) buildRouterContextBlock(ctx context.Context, payload JobPayload) string {
-	if m.Store == nil {
+	if m.store == nil {
 		return ""
 	}
-	rows, err := m.Store.ListRoutingTelemetry(ctx, db.RoutingTelemetryFilter{Repo: strings.TrimSpace(payload.Repo)})
+	rows, err := m.store.ListRoutingTelemetry(ctx, db.RoutingTelemetryFilter{Repo: strings.TrimSpace(payload.Repo)})
 	if err != nil || len(rows) == 0 {
 		return ""
 	}

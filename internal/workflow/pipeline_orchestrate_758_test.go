@@ -38,7 +38,7 @@ func TestPipelineOrchestrateStageFansOutUnderStageJob(t *testing.T) {
 	// dispatchDelegations' preflight rejects the set before enqueuing any child.
 	seedAgent(t, store, "orch-child", []string{"review"}, orchestrateStageRepo)
 
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	const stageID = "prun-orch-1-stage-a0"
 	// Enqueue the orchestrate stage job exactly as pipelineStageJobRequest does: the
 	// pipeline sender, the OrchestrateStage authorization flag, and RootJobID = its
@@ -119,7 +119,7 @@ func TestNonOrchestratePipelineStageStillStripsDelegations(t *testing.T) {
 	engine := testEngine(store)
 	seedAgent(t, store, "orch-child", []string{"review"}, orchestrateStageRepo)
 
-	mailbox := Mailbox{Store: store}
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	const stageID = "prun-leaf-1-stage-a0"
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID:        stageID,

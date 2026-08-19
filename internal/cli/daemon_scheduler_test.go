@@ -441,9 +441,10 @@ func TestRunQueuedJobsPreservesAdvanceRetryForPostDeliveryPermissionError(t *tes
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
 		return adapter, nil
 	}
-	worker.WorkflowFactory = func(string) workflow.Engine {
+	worker.WorkflowFactory = func(resolvedCheckout string) workflow.Engine {
 		return workflow.Engine{
-			Store: store,
+			Store:                   store,
+			ResolveDeliveryWorktree: deliveryWorktreeResolver(store, resolvedCheckout),
 			PayloadRefresher: func(context.Context, db.Job, workflow.JobPayload) (workflow.JobPayload, error) {
 				return workflow.JobPayload{}, errors.New("permission denied while refreshing implemented head")
 			},
@@ -843,8 +844,8 @@ func TestRunQueuedJobsDefersJobsEnqueuedByCurrentSnapshot(t *testing.T) {
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
 		return adapter, nil
 	}
-	worker.WorkflowFactory = func(string) workflow.Engine {
-		return workflow.Engine{Store: store, RequiredReviewers: []string{"reviewer"}}
+	worker.WorkflowFactory = func(checkout string) workflow.Engine {
+		return workflow.Engine{Store: store, ResolveDeliveryWorktree: deliveryWorktreeResolver(store, checkout), RequiredReviewers: []string{"reviewer"}}
 	}
 
 	if err := runQueuedJobsForRepo(ctx, worker, 2, "", ""); err != nil {
@@ -1211,8 +1212,8 @@ func TestRunQueuedJobsDelegatesBusyRuntimeToTempWorker(t *testing.T) {
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
 		return deliveryAdapter, nil
 	}
-	worker.WorkflowFactory = func(string) workflow.Engine {
-		return workflow.Engine{Store: store}
+	worker.WorkflowFactory = func(checkout string) workflow.Engine {
+		return workflow.Engine{Store: store, ResolveDeliveryWorktree: deliveryWorktreeResolver(store, checkout)}
 	}
 
 	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
@@ -2021,8 +2022,8 @@ func TestRunQueuedJobsResumesSelfDirtyTaskWorktree(t *testing.T) {
 		adapterCheckout = checkout
 		return adapter, nil
 	}
-	worker.WorkflowFactory = func(string) workflow.Engine {
-		return workflow.Engine{Store: store}
+	worker.WorkflowFactory = func(checkout string) workflow.Engine {
+		return workflow.Engine{Store: store, ResolveDeliveryWorktree: deliveryWorktreeResolver(store, checkout)}
 	}
 
 	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
@@ -2131,7 +2132,8 @@ func TestRunQueuedJobsResumesDelegatedImplementWithOriginalBranchLock(t *testing
 	}
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
 		return workflow.Engine{
-			Store: store,
+			Store:                   store,
+			ResolveDeliveryWorktree: deliveryWorktreeResolver(store, checkout),
 			PayloadRefresher: func(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
 				return refreshDaemonJobPayload(ctx, store, checkout, job, payload)
 			},

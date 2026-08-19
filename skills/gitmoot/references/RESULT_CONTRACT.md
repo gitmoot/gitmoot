@@ -552,10 +552,14 @@ work was available. Produce remains a leaf, so its delegations are stripped.
 - Do not claim tests were run unless they were actually run.
 - Do not claim files were changed unless they were actually changed. Name
   repo-relative file paths in each `changes_made` entry. At result persistence,
-  an engine-run implement job with an owned worktree records
-  `payload.result_observation`: the files in `git diff HEAD` plus untracked
-  files, each claim's path binding, claimed-only paths, and diff files no claim
-  mentions. A claim that names a repo-relative path is graded `observed` only
+  an ordinary engine-run implement job resolves the effective checkout selected
+  by the worker and records `payload.result_observation`: the files in
+  `git diff HEAD` plus untracked files, each claim's path binding, claimed-only
+  paths, and diff files no claim mentions. A worktree-less delegation child is
+  deliberately not graded against the shared registered checkout; it records a
+  typed observation whose source is
+  `excluded_worktree_less_delegation_child`, rather than omitting the field. A
+  claim that names a repo-relative path is graded `observed` only
   when both its claimed path and per-change observation bind to that exact
   normalized path in `touched_files`. If capture membership is absent or
   indeterminate, the grade remains `reported`. A unique-basename match may
