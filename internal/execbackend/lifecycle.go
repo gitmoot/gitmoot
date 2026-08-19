@@ -48,7 +48,7 @@ type JobScope struct {
 
 // Materials are non-secret inputs staged into one execution instance. The
 // local provider uses the existing BuildChangeSet/ImportChangeSet pair to copy
-// any uncommitted source state after creating its detached Git worktree.
+// any uncommitted source state after creating its independent detached clone.
 type Materials struct {
 	SourceWorktree string
 }
@@ -60,9 +60,7 @@ type Instance struct {
 	Workspace           string
 	BaseHEAD            string
 
-	root           string
-	sourceWorktree string
-	gitCommonDir   string
+	root string
 }
 
 // Command describes one streaming command inside an instance. Dir must be the
@@ -105,24 +103,22 @@ type localInstanceMetadata struct {
 	OwnerPID            int    `json:"owner_pid"`
 	OwnerBootID         string `json:"owner_boot_id,omitempty"`
 	OwnerStartTime      string `json:"owner_start_time,omitempty"`
-	SourceWorktree      string `json:"source_worktree,omitempty"`
-	GitCommonDir        string `json:"git_common_dir,omitempty"`
 	Workspace           string `json:"workspace"`
 	BaseHEAD            string `json:"base_head,omitempty"`
 	State               string `json:"state"`
 }
 
-// LocalBackend executes a job in a detached Git worktree on the same
-// filesystem as its host checkout. The absolute gitdir pointer is usable in
-// this topology, so remote-only bundle hydration is deliberately absent.
+// LocalBackend executes a job in an independent detached clone on the same
+// filesystem as its host checkout. Each instance owns its Git metadata, refs,
+// config, and objects, and has no remote back to the host repository.
 type LocalBackend struct {
 	root string
 
 	mu     sync.Mutex
 	active map[string]map[*localExec]struct{}
 
-	// afterWorkspaceCreated is a test-only crash seam. It fires after Git has
-	// registered the worktree but before SyncIn marks the instance running.
+	// afterWorkspaceCreated is a test-only crash seam. It fires after the clone
+	// exists but before SyncIn marks the instance running.
 	afterWorkspaceCreated func(*Instance)
 }
 
@@ -206,18 +202,12 @@ func (b *LocalBackend) SyncIn(ctx context.Context, instance *Instance, materials
 		return fmt.Errorf("read local execution backend base HEAD: %w", err)
 	}
 	base = strings.TrimSpace(base)
-	commonDir, err := localGitOutput(ctx, source, "rev-parse", "--path-format=absolute", "--git-common-dir")
-	if err != nil {
-		return fmt.Errorf("read local execution backend Git common directory: %w", err)
-	}
-	instance.sourceWorktree = source
-	instance.gitCommonDir = filepath.Clean(strings.TrimSpace(commonDir))
 	instance.BaseHEAD = base
 	if err := writeLocalMetadata(instance.root, metadataForInstance(instance, "syncing")); err != nil {
 		return err
 	}
-	if output, err := localGitCombined(ctx, source, "worktree", "add", "--detach", "--force", instance.Workspace, base); err != nil {
-		return fmt.Errorf("create local execution workspace: %w: %s", err, strings.TrimSpace(output))
+	if err := cloneLocalWorkspace(ctx, source, instance.Workspace, base); err != nil {
+		return err
 	}
 	if b.afterWorkspaceCreated != nil {
 		b.afterWorkspaceCreated(instance)
@@ -331,12 +321,8 @@ func (b *LocalBackend) Destroy(ctx context.Context, instance *Instance) error {
 	}
 	_ = writeLocalMetadata(instanceRoot, metadataForInstance(instance, "destroying"))
 	if _, err := os.Lstat(instance.Workspace); err == nil {
-		if strings.TrimSpace(instance.sourceWorktree) == "" {
-			if err := os.Remove(instance.Workspace); err != nil {
-				return fmt.Errorf("remove orphaned-but-present local execution workspace %q: %w", instance.Workspace, err)
-			}
-		} else if output, err := localGitDirCombined(ctx, instance.gitCommonDir, "worktree", "remove", "--force", instance.Workspace); err != nil {
-			return fmt.Errorf("remove local execution worktree %q: %w: %s", instance.Workspace, err, strings.TrimSpace(output))
+		if err := os.RemoveAll(instance.Workspace); err != nil {
+			return fmt.Errorf("remove local execution workspace %q: %w", instance.Workspace, err)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect local execution workspace %q: %w", instance.Workspace, err)
@@ -350,10 +336,8 @@ func (b *LocalBackend) Destroy(ctx context.Context, instance *Instance) error {
 	return nil
 }
 
-// Reap destroys instances whose recorded owner process is no longer the same
-// live daemon process. A partially-created non-empty directory that Git never
-// registered remains the known #1572 orphaned-but-present failure shape and is
-// returned loudly rather than recursively deleted.
+// Reap destroys independently owned instances whose recorded owner process is
+// no longer the same live daemon process.
 func (b *LocalBackend) Reap(ctx context.Context) ([]string, error) {
 	entries, err := os.ReadDir(b.root)
 	if errors.Is(err, os.ErrNotExist) {
@@ -488,8 +472,6 @@ func metadataForInstance(instance *Instance, state string) localInstanceMetadata
 		OwnerPID:            os.Getpid(),
 		OwnerBootID:         localBootID(),
 		OwnerStartTime:      localProcessStartTime(os.Getpid()),
-		SourceWorktree:      instance.sourceWorktree,
-		GitCommonDir:        instance.gitCommonDir,
 		Workspace:           instance.Workspace,
 		BaseHEAD:            instance.BaseHEAD,
 		State:               state,
@@ -504,8 +486,6 @@ func instanceFromMetadata(root string, meta localInstanceMetadata) *Instance {
 		Workspace:           meta.Workspace,
 		BaseHEAD:            meta.BaseHEAD,
 		root:                root,
-		sourceWorktree:      meta.SourceWorktree,
-		gitCommonDir:        meta.GitCommonDir,
 	}
 }
 
@@ -549,6 +529,19 @@ func readLocalMetadata(root string) (localInstanceMetadata, error) {
 	return meta, nil
 }
 
+func cloneLocalWorkspace(ctx context.Context, source, workspace, base string) error {
+	if output, err := localGitCombined(ctx, source, "clone", "--no-local", "--no-checkout", "--", source, workspace); err != nil {
+		return fmt.Errorf("clone independent local execution workspace: %w: %s", err, strings.TrimSpace(output))
+	}
+	if output, err := localGitCombined(ctx, workspace, "checkout", "--detach", "--force", base); err != nil {
+		return fmt.Errorf("detach local execution workspace at %s: %w: %s", base, err, strings.TrimSpace(output))
+	}
+	if output, err := localGitCombined(ctx, workspace, "remote", "remove", "origin"); err != nil {
+		return fmt.Errorf("sever local execution workspace origin: %w: %s", err, strings.TrimSpace(output))
+	}
+	return nil
+}
+
 func localGitOutput(ctx context.Context, dir string, args ...string) (string, error) {
 	output, err := localGitCombined(ctx, dir, args...)
 	return output, err
@@ -556,15 +549,6 @@ func localGitOutput(ctx context.Context, dir string, args ...string) (string, er
 
 func localGitCombined(ctx context.Context, dir string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
-	output, err := cmd.CombinedOutput()
-	return string(output), err
-}
-
-func localGitDirCombined(ctx context.Context, gitDir string, args ...string) (string, error) {
-	if strings.TrimSpace(gitDir) == "" {
-		return "", errors.New("Git common directory is unavailable")
-	}
-	cmd := exec.CommandContext(ctx, "git", append([]string{"--git-dir", gitDir}, args...)...)
 	output, err := cmd.CombinedOutput()
 	return string(output), err
 }

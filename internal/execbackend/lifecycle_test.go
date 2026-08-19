@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-func TestLocalBackendSyncInUsesResolvableAbsoluteGitdirAndExistingChangeTransport(t *testing.T) {
+func TestLocalBackendSyncInUsesIndependentGitMetadataAndExistingChangeTransport(t *testing.T) {
 	host, _, base := changeSetRepoPair(t)
 	writeChangeSetFile(t, host, "tracked.txt", "dirty source bytes\x00\n", 0o755)
 	writeChangeSetFile(t, host, "nested/untracked.bin", "untracked\x00bytes\n", 0o644)
@@ -29,16 +29,26 @@ func TestLocalBackendSyncInUsesResolvableAbsoluteGitdirAndExistingChangeTranspor
 		t.Fatalf("BaseHEAD = %q, want %q", instance.BaseHEAD, base)
 	}
 
-	pointer, err := os.ReadFile(filepath.Join(instance.Workspace, ".git"))
+	gitInfo, err := os.Stat(filepath.Join(instance.Workspace, ".git"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	gitdir := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(pointer)), "gitdir:"))
-	if !filepath.IsAbs(gitdir) {
-		t.Fatalf("local workspace gitdir = %q, want an absolute pointer for the local-filesystem proof", gitdir)
+	if !gitInfo.IsDir() {
+		t.Fatalf("local workspace .git mode = %s, want independently owned directory", gitInfo.Mode())
+	}
+	hostCommon := strings.TrimSpace(changeSetGit(t, host, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+	workspaceCommon := strings.TrimSpace(changeSetGit(t, instance.Workspace, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+	if filepath.Clean(hostCommon) == filepath.Clean(workspaceCommon) {
+		t.Fatalf("local workspace shares host Git common directory %q", hostCommon)
+	}
+	if _, err := os.Stat(filepath.Join(instance.Workspace, ".git", "objects", "info", "alternates")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("local workspace has a host object alternates link: %v", err)
+	}
+	if got := strings.TrimSpace(changeSetGit(t, instance.Workspace, "remote")); got != "" {
+		t.Fatalf("local workspace retained host remote: %q", got)
 	}
 	if got := strings.TrimSpace(changeSetGit(t, instance.Workspace, "rev-parse", "HEAD")); got != base {
-		t.Fatalf("workspace HEAD through absolute gitdir = %q, want %q", got, base)
+		t.Fatalf("workspace HEAD = %q, want %q", got, base)
 	}
 	if want, got := changeSetSnapshot(t, host), changeSetSnapshot(t, instance.Workspace); got != want {
 		t.Fatalf("SyncIn tree is not byte-identical\nwant:\n%s\ngot:\n%s", want, got)
@@ -68,6 +78,47 @@ func TestLocalBackendCollectRoundTripsByteIdentically(t *testing.T) {
 	}
 	if want, got := changeSetSnapshot(t, instance.Workspace), changeSetSnapshot(t, host); got != want {
 		t.Fatalf("collected host tree is not byte-identical\nwant:\n%s\ngot:\n%s", want, got)
+	}
+}
+
+func TestLocalBackendGitRefsAreIndependentFromHost(t *testing.T) {
+	host, _, victimHead := changeSetRepoPair(t)
+	changeSetGit(t, host, "branch", "ref-victim", victimHead)
+	writeChangeSetFile(t, host, "host-next.txt", "next host commit\n", 0o644)
+	changeSetGit(t, host, "add", "host-next.txt")
+	changeSetGit(t, host, "commit", "-m", "host next")
+	sourceHead := strings.TrimSpace(changeSetGit(t, host, "rev-parse", "HEAD"))
+
+	backend := newTestLocalBackend(t)
+	instance, err := backend.Provision(context.Background(), JobScope{JobID: "ref-isolation"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backend.Destroy(context.Background(), instance) })
+	if err := backend.SyncIn(context.Background(), instance, Materials{SourceWorktree: host}); err != nil {
+		t.Fatal(err)
+	}
+	stream, err := backend.Exec(context.Background(), instance, Command{
+		Dir: instance.Workspace, Name: "git", Args: []string{"update-ref", "refs/heads/ref-victim", "HEAD"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, err := stream.Wait(); err != nil {
+		t.Fatalf("backend git update-ref: %v (stderr: %s)", err, result.Stderr)
+	}
+
+	if got := strings.TrimSpace(changeSetGit(t, host, "rev-parse", "refs/heads/ref-victim")); got != victimHead {
+		t.Fatalf("host ref changed through backend: got %s, want %s", got, victimHead)
+	}
+	if got := strings.TrimSpace(changeSetGit(t, instance.Workspace, "rev-parse", "refs/heads/ref-victim")); got != sourceHead {
+		t.Fatalf("backend ref = %s, want independently updated %s", got, sourceHead)
+	}
+	if got := strings.TrimSpace(changeSetGit(t, instance.Workspace, "rev-parse", "HEAD")); got != sourceHead {
+		t.Fatalf("backend HEAD moved: got %s, want %s", got, sourceHead)
+	}
+	if got := changeSetGit(t, instance.Workspace, "status", "--porcelain=v1", "--untracked-files=all"); got != "" {
+		t.Fatalf("backend worktree changed while updating ref: %q", got)
 	}
 }
 
