@@ -17,7 +17,7 @@ The main-branch baseline that led to issue #1550 recorded:
 - `internal/workflow`: 183.477 seconds
 
 Both packages opened many writable SQLite test stores. `db.Open` runs every one
-of gitmoot's 115 migrations on each open, so rebuilding a fresh schema at each
+of gitmoot's 116 migrations on each open, so rebuilding a fresh schema at each
 call multiplied setup work across the suite and the race matrix.
 
 A same-host A/B run on 2026-08-18 compared pre-#1550 main at `a9d86ca4` with
