@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/permissionpolicy"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -59,7 +58,11 @@ func (w jobWorker) capturePermissionPolicyEffects(ctx context.Context, jobID, ch
 		if w.PermissionPolicyEffectGit != nil {
 			git = w.PermissionPolicyEffectGit(checkout)
 		} else {
-			git = gitutil.Client{Dir: checkout}
+			runner, runnerErr := w.subprocessRunnerForJob(job)
+			if runnerErr != nil {
+				return fmt.Errorf("resolve permission-policy effect runner: %w", runnerErr)
+			}
+			git = jobGitClient(checkout, runner)
 		}
 	}
 	captureCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), permissionPolicyEffectCaptureTimeout)

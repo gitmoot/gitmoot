@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -47,6 +47,10 @@ func composeBeforeReadOnlyWorktreeCleanupHooks(hooks ...beforeReadOnlyWorktreeCl
 // payload JSON so it remains available after synchronous worktree disposal
 // without creating a second file-retention lifecycle.
 func askReviewDiffPrecleanupHook(store *db.Store) beforeReadOnlyWorktreeCleanupHook {
+	return askReviewDiffPrecleanupHookForRunner(store, subprocess.ExecRunner{})
+}
+
+func askReviewDiffPrecleanupHookForRunner(store *db.Store, runner subprocess.Runner) beforeReadOnlyWorktreeCleanupHook {
 	return func(ctx context.Context, jobID, jobType string, payload workflow.JobPayload) error {
 		if store == nil ||
 			(strings.TrimSpace(jobType) != "ask" && strings.TrimSpace(jobType) != "review") ||
@@ -54,7 +58,7 @@ func askReviewDiffPrecleanupHook(store *db.Store) beforeReadOnlyWorktreeCleanupH
 			return nil
 		}
 
-		snapshot, truncated, captureErr := captureReadOnlyWorktreeDiff(ctx, payload.WorktreePath)
+		snapshot, truncated, captureErr := captureReadOnlyWorktreeDiffForRunner(ctx, payload.WorktreePath, runner)
 		job, loadErr := store.GetJob(ctx, jobID)
 		if loadErr != nil {
 			return errors.Join(captureErr, fmt.Errorf("load job before persisting read-only worktree diff: %w", loadErr))
@@ -85,10 +89,14 @@ func askReviewDiffPrecleanupHook(store *db.Store) beforeReadOnlyWorktreeCleanupH
 }
 
 func captureReadOnlyWorktreeDiff(ctx context.Context, worktree string) (string, bool, error) {
+	return captureReadOnlyWorktreeDiffForRunner(ctx, worktree, subprocess.ExecRunner{})
+}
+
+func captureReadOnlyWorktreeDiffForRunner(ctx context.Context, worktree string, runner subprocess.Runner) (string, bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, readOnlyWorktreeDiffTimeout)
 	defer cancel()
 
-	sandbox, err := newReadOnlyWorktreeGitSandbox(ctx, worktree)
+	sandbox, err := newReadOnlyWorktreeGitSandbox(ctx, worktree, runner)
 	if err != nil {
 		return "", false, err
 	}
@@ -126,9 +134,10 @@ type readOnlyWorktreeGitSandbox struct {
 	dir      string
 	worktree string
 	env      []string
+	runner   subprocess.Runner
 }
 
-func newReadOnlyWorktreeGitSandbox(ctx context.Context, worktree string) (*readOnlyWorktreeGitSandbox, error) {
+func newReadOnlyWorktreeGitSandbox(ctx context.Context, worktree string, runner subprocess.Runner) (*readOnlyWorktreeGitSandbox, error) {
 	worktree = filepath.Clean(strings.TrimSpace(worktree))
 	if !filepath.IsAbs(worktree) {
 		absolute, err := filepath.Abs(worktree)
@@ -141,7 +150,7 @@ func newReadOnlyWorktreeGitSandbox(ctx context.Context, worktree string) (*readO
 	if err != nil {
 		return nil, fmt.Errorf("create isolated git metadata: %w", err)
 	}
-	sandbox := &readOnlyWorktreeGitSandbox{dir: temp, worktree: worktree}
+	sandbox := &readOnlyWorktreeGitSandbox{dir: temp, worktree: worktree, runner: runner}
 	ok := false
 	defer func() {
 		if !ok {
@@ -150,19 +159,19 @@ func newReadOnlyWorktreeGitSandbox(ctx context.Context, worktree string) (*readO
 	}()
 
 	baseEnv := sanitizedReadOnlyWorktreeGitEnv(temp)
-	head, err := runReadOnlyWorktreeMetadataGit(ctx, baseEnv, worktree, "resolve HEAD", "rev-parse", "--verify", "HEAD")
+	head, err := runReadOnlyWorktreeMetadataGit(ctx, runner, baseEnv, worktree, "resolve HEAD", "rev-parse", "--verify", "HEAD")
 	if err != nil {
 		return nil, err
 	}
-	indexPath, err := runReadOnlyWorktreeMetadataGit(ctx, baseEnv, worktree, "resolve index", "rev-parse", "--git-path", "index")
+	indexPath, err := runReadOnlyWorktreeMetadataGit(ctx, runner, baseEnv, worktree, "resolve index", "rev-parse", "--git-path", "index")
 	if err != nil {
 		return nil, err
 	}
-	sharedIndexPath, err := runOptionalReadOnlyWorktreeMetadataGit(ctx, baseEnv, worktree, "resolve shared index", "rev-parse", "--shared-index-path")
+	sharedIndexPath, err := runOptionalReadOnlyWorktreeMetadataGit(ctx, runner, baseEnv, worktree, "resolve shared index", "rev-parse", "--shared-index-path")
 	if err != nil {
 		return nil, err
 	}
-	objectsPath, err := runReadOnlyWorktreeMetadataGit(ctx, baseEnv, worktree, "resolve object database", "rev-parse", "--git-path", "objects")
+	objectsPath, err := runReadOnlyWorktreeMetadataGit(ctx, runner, baseEnv, worktree, "resolve object database", "rev-parse", "--git-path", "objects")
 	if err != nil {
 		return nil, err
 	}
@@ -215,12 +224,8 @@ func (s *readOnlyWorktreeGitSandbox) run(ctx context.Context, label string, args
 	var stderr boundedCountingBuffer
 	stderr.limit = 4096
 	cmdArgs := append([]string{"--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.DevNull}, args...)
-	cmd := exec.CommandContext(ctx, "git", cmdArgs...)
-	cmd.Dir = s.worktree
-	cmd.Env = s.env
-	cmd.Stdout = out
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	err := runReadOnlyWorktreeGit(ctx, s.runner, s.env, s.worktree, out, &stderr, cmdArgs...)
+	if err != nil {
 		detail := strings.TrimSpace(stderr.String())
 		if detail != "" {
 			return nil, fmt.Errorf("%s in %s: %w: %s", label, s.worktree, err, detail)
@@ -230,25 +235,21 @@ func (s *readOnlyWorktreeGitSandbox) run(ctx context.Context, label string, args
 	return out, nil
 }
 
-func runReadOnlyWorktreeMetadataGit(ctx context.Context, env []string, worktree, label string, args ...string) (string, error) {
-	return runReadOnlyWorktreeMetadataGitOutput(ctx, env, worktree, label, false, args...)
+func runReadOnlyWorktreeMetadataGit(ctx context.Context, runner subprocess.Runner, env []string, worktree, label string, args ...string) (string, error) {
+	return runReadOnlyWorktreeMetadataGitOutput(ctx, runner, env, worktree, label, false, args...)
 }
 
-func runOptionalReadOnlyWorktreeMetadataGit(ctx context.Context, env []string, worktree, label string, args ...string) (string, error) {
-	return runReadOnlyWorktreeMetadataGitOutput(ctx, env, worktree, label, true, args...)
+func runOptionalReadOnlyWorktreeMetadataGit(ctx context.Context, runner subprocess.Runner, env []string, worktree, label string, args ...string) (string, error) {
+	return runReadOnlyWorktreeMetadataGitOutput(ctx, runner, env, worktree, label, true, args...)
 }
 
-func runReadOnlyWorktreeMetadataGitOutput(ctx context.Context, env []string, worktree, label string, allowEmpty bool, args ...string) (string, error) {
+func runReadOnlyWorktreeMetadataGitOutput(ctx context.Context, runner subprocess.Runner, env []string, worktree, label string, allowEmpty bool, args ...string) (string, error) {
 	cmdArgs := append([]string{"--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.DevNull}, args...)
-	cmd := exec.CommandContext(ctx, "git", cmdArgs...)
-	cmd.Dir = worktree
-	cmd.Env = env
 	var stdout, stderr boundedCountingBuffer
 	stdout.limit = 64 << 10
 	stderr.limit = 4096
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	err := runReadOnlyWorktreeGit(ctx, runner, env, worktree, &stdout, &stderr, cmdArgs...)
+	if err != nil {
 		detail := strings.TrimSpace(stderr.String())
 		if detail != "" {
 			return "", fmt.Errorf("%s in %s: %w: %s", label, worktree, err, detail)
@@ -260,6 +261,17 @@ func runReadOnlyWorktreeMetadataGitOutput(ctx context.Context, env []string, wor
 		return "", fmt.Errorf("%s in %s returned invalid metadata", label, worktree)
 	}
 	return value, nil
+}
+
+func runReadOnlyWorktreeGit(ctx context.Context, runner subprocess.Runner, env []string, worktree string, stdout, stderr io.Writer, args ...string) error {
+	if runner == nil {
+		return errors.New("read-only worktree diff has no subprocess runner")
+	}
+	envRunner, ok := runner.(subprocess.ExactEnvRunner)
+	if !ok {
+		return errors.New("read-only worktree diff subprocess runner does not support exact environment isolation")
+	}
+	return envRunner.RunExactEnv(ctx, worktree, env, stdout, stderr, "git", args...)
 }
 
 func sanitizedReadOnlyWorktreeGitEnv(tempHome string) []string {

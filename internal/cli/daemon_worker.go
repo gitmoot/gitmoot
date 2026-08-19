@@ -52,9 +52,11 @@ type jobWorker struct {
 	// elapsed-only progress without replacing their fake.
 	OutputAdapterFactory func(runtime.Agent, string, io.Writer) (workflow.DeliveryAdapter, error)
 	StartAdapterFactory  func(execbackend.Backend, string, string) (runtime.Adapter, error)
-	CheckoutValidator    func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error)
-	WorkflowFactory      func(string) workflow.Engine
-	CommenterFactory     func(string) github.Client
+	// CheckoutValidator and WorkflowFactory are test overrides. Production leaves
+	// them nil so checkoutForJob/workflowForJob must consume the resolved runner.
+	CheckoutValidator func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error)
+	WorkflowFactory   func(string) workflow.Engine
+	CommenterFactory  func(string) github.Client
 	// UsePool selects the opt-in continuous worker-pool scheduler (#394,
 	// --scheduler=pool) over the default per-tick wg.Wait() barrier.
 	UsePool bool
@@ -161,8 +163,6 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 	worker.AdapterFactory = worker.defaultAdapter
 	worker.OutputAdapterFactory = worker.outputAdapter
 	worker.StartAdapterFactory = worker.defaultStartAdapter
-	worker.CheckoutValidator = worker.defaultCheckout
-	worker.WorkflowFactory = worker.defaultWorkflow
 	worker.AuthProbe = worker.defaultAuthProbe
 	worker.RuntimePreflight = runtime.DefaultRuntimeContractChecker().CheckRequest
 	worker.QuotaWake = newQuotaRoleUnavailableWakeClient()
@@ -181,24 +181,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if err != nil {
 		return w.finishQueuedJob(ctx, job, workflow.JobFailed, err)
 	}
-	// Review-to-fix jobs are the implementation jobs created by workflow
-	// advancement. They are explicitly marked FixWorktree; ordinary task runs,
-	// local implement dispatches, and delegation legs may legitimately be PR-less
-	// and must not inherit this delivery gate. Check the same durable target the
-	// finalizer will use before agent lookup, checkout setup, or adapter delivery.
-	if job.Type == "implement" && payload.FixWorktree {
-		if _, err := implementationFinalizationTargetFor(ctx, w.Store, job, payload, implementationFinalizationBeforeRun); err != nil {
-			err = fmt.Errorf("validate implementation target before model run: %w", err)
-			if !resultDeliveryFailed(err) {
-				return w.retryImplementationPreflight(ctx, job, payload, err)
-			}
-			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, err); finishErr != nil {
-				return finishErr
-			}
-			_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, "", err)
-			return nil
-		}
-	}
 	// Resolve WHERE the runtime executes before any path can construct or start
 	// an adapter. In particular, ephemeral jobs materialize and start a host
 	// runtime below, so delaying this decision until after agent lookup would let
@@ -212,13 +194,39 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, "", err)
 		return nil
 	}
+	jobRunner, err := jobSubprocessRunnerForBackend(execBackend)
+	if err != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, "", err)
+		return nil
+	}
+	// Review-to-fix jobs are the implementation jobs created by workflow
+	// advancement. They are explicitly marked FixWorktree; ordinary task runs,
+	// local implement dispatches, and delegation legs may legitimately be PR-less
+	// and must not inherit this delivery gate. Check the same durable target the
+	// finalizer will use before agent lookup, checkout setup, or adapter delivery.
+	if job.Type == "implement" && payload.FixWorktree {
+		if _, err := implementationFinalizationTargetForRunner(ctx, w.Store, job, payload, implementationFinalizationBeforeRun, jobRunner); err != nil {
+			err = fmt.Errorf("validate implementation target before model run: %w", err)
+			if !resultDeliveryFailed(err) {
+				return w.retryImplementationPreflight(ctx, job, payload, err)
+			}
+			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, err); finishErr != nil {
+				return finishErr
+			}
+			_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, "", err)
+			return nil
+		}
+	}
 	// An ephemeral child carries an inline worker spec instead of a
 	// pre-registered agent. Materialize a throwaway agent + runtime session
 	// from the spec before the normal flow runs (which assumes the agent
 	// already exists via GetAgent below), and register a cleanup defer so the
 	// worker is auto-disposed on every exit path — success, failure, or block.
 	if payload.Ephemeral != nil {
-		if err := w.startEphemeralWorker(ctx, job, payload, execBackend); err != nil {
+		if err := w.startEphemeralWorker(ctx, job, payload, execBackend, jobRunner); err != nil {
 			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "ephemeral_worker_failed", Message: err.Error()}); eventErr != nil {
 				return eventErr
 			}
@@ -345,9 +353,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 		return nil
 	}
-	checkout, err := w.CheckoutValidator(ctx, job, payload, agent)
+	checkout, err := w.checkoutForJob(ctx, job, payload, agent, jobRunner)
 	if err != nil {
-		if resumedCheckout, resumedPayload, ok := w.resumeSelfDirtyWorktree(ctx, job, payload, agent, err); ok {
+		if resumedCheckout, resumedPayload, ok := w.resumeSelfDirtyWorktreeForRunner(ctx, job, payload, agent, err, jobRunner); ok {
 			checkout, payload, err = resumedCheckout, resumedPayload, nil
 		} else {
 			// Checkout-contention deferral (#532 slice C): a NON-delegation job whose
@@ -707,7 +715,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if warningRecorded {
 		adapter = w.observePermissionPolicyEffects(adapter, job.ID, checkout)
 	}
-	engine := w.WorkflowFactory(checkout)
+	engine := w.workflowForJob(checkout, jobRunner)
 	// Wire the PRE-TERMINAL operational-blocker deferrer (#532 slice E) on the LIVE
 	// worker (not the WorkflowFactory-captured copy) so it observes this worker's
 	// EventSink for the first-class job.deferred emit. When a delivery-seam failure
@@ -1848,6 +1856,10 @@ type tempWorkerStartResult struct {
 }
 
 func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload workflow.JobPayload, backend execbackend.Backend, original runtime.Agent, checkout string, policy config.ParallelSessionPolicy, reason string, observePermissionPolicy bool) error {
+	jobRunner, err := jobSubprocessRunnerForBackend(backend)
+	if err != nil {
+		return err
+	}
 	started, err := w.startTempWorker(ctx, job, payload, backend, original, checkout)
 	if err != nil {
 		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "temp_worker_failed", Message: err.Error()}); eventErr != nil {
@@ -2020,7 +2032,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	if observePermissionPolicy {
 		adapter = w.observePermissionPolicyEffects(adapter, delegatedJob.ID, checkout)
 	}
-	engine := w.WorkflowFactory(checkout)
+	engine := w.workflowForJob(checkout, jobRunner)
 	_, err = engine.RunJob(runCtx, delegatedJob.ID, started.Agent, adapter)
 	stopKillPending()
 	if err != nil {
@@ -2238,7 +2250,7 @@ func (w jobWorker) startTempWorker(ctx context.Context, job db.Job, payload work
 // already the engine-assigned "-ephemeral-" name; callers register a deferred
 // cleanupTempWorker to auto-dispose the worker on every exit path. The worker
 // runs read-only unless the spec opts into a writable autonomy policy.
-func (w jobWorker) startEphemeralWorker(ctx context.Context, job db.Job, payload workflow.JobPayload, backend execbackend.Backend) (err error) {
+func (w jobWorker) startEphemeralWorker(ctx context.Context, job db.Job, payload workflow.JobPayload, backend execbackend.Backend, jobRunner subprocess.Runner) (err error) {
 	spec := payload.Ephemeral
 	if spec == nil {
 		return errors.New("ephemeral worker requires a spec")
@@ -2290,7 +2302,7 @@ func (w jobWorker) startEphemeralWorker(ctx context.Context, job db.Job, payload
 	// Normalize the stored policy back onto the in-memory agent so the runtime
 	// session is started with the same sandbox the rest of run will use.
 	ephemeralAgent.AutonomyPolicy = runtime.NormalizeStoredAutonomyPolicy(ephemeralAgent.AutonomyPolicy)
-	checkout, err := w.CheckoutValidator(ctx, job, payload, ephemeralAgent)
+	checkout, err := w.checkoutForJob(ctx, job, payload, ephemeralAgent, jobRunner)
 	if err != nil {
 		return err
 	}
@@ -2748,16 +2760,25 @@ func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 		return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_retry_skipped", Message: err.Error()})
 	}
 	agent := runtimeAgent(dbAgent)
-	if refreshed, ok, err := w.refreshImplementedPayloadForRetry(ctx, job, payload); err != nil {
+	jobBackend, jobBackendPresent := payload.ExecBackendOverride()
+	backend, err := daemonJobExecBackendFor(w, jobBackend, jobBackendPresent)
+	if err != nil {
+		return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry backend resolution failed: "+err.Error())
+	}
+	jobRunner, err := jobSubprocessRunnerForBackend(backend)
+	if err != nil {
+		return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry backend consumption failed: "+err.Error())
+	}
+	if refreshed, ok, err := w.refreshImplementedPayloadForRetry(ctx, job, payload, jobRunner); err != nil {
 		return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry refresh failed: "+err.Error())
 	} else if ok {
 		payload = refreshed
 	}
-	checkout, err := w.CheckoutValidator(ctx, job, payload, agent)
+	checkout, err := w.checkoutForJob(ctx, job, payload, agent, jobRunner)
 	if err != nil {
 		return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry preflight failed: "+err.Error())
 	}
-	engine := w.WorkflowFactory(checkout)
+	engine := w.workflowForJob(checkout, jobRunner)
 	if err := engine.AdvanceJob(ctx, job.ID); err != nil {
 		var awaiting workflow.AwaitingHumanError
 		if errors.As(err, &awaiting) {
@@ -2776,15 +2797,15 @@ func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 	return engine.ReconcileTerminalDrivingJob(ctx, job.ID)
 }
 
-func (w jobWorker) refreshImplementedPayloadForRetry(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, bool, error) {
+func (w jobWorker) refreshImplementedPayloadForRetry(ctx context.Context, job db.Job, payload workflow.JobPayload, runner subprocess.Runner) (workflow.JobPayload, bool, error) {
 	if job.Type != "implement" || payload.Result == nil || payload.Result.Decision != "implemented" {
 		return payload, false, nil
 	}
-	checkout, err := w.resolveJobCheckout(ctx, job, payload)
+	checkout, err := w.resolveJobCheckoutForRunner(ctx, job, payload, runner)
 	if err != nil {
 		return workflow.JobPayload{}, false, err
 	}
-	payload, err = refreshDaemonJobPayload(ctx, w.Store, checkout, job, payload)
+	payload, err = refreshDaemonJobPayloadForRunner(ctx, w.Store, checkout, job, payload, runner)
 	if err != nil {
 		return workflow.JobPayload{}, false, err
 	}
@@ -2965,9 +2986,27 @@ func (w jobWorker) defaultStartAdapter(backend execbackend.Backend, runtimeName 
 }
 
 func (w jobWorker) defaultWorkflow(checkout string) workflow.Engine {
-	engine := daemonWorkflowEngine(w.Store, github.NewClient(checkout), checkout, w.workflowHome())
+	return w.defaultWorkflowForRunner(checkout, subprocess.ExecRunner{})
+}
+
+func (w jobWorker) defaultWorkflowForRunner(checkout string, runner subprocess.Runner) workflow.Engine {
+	engine := daemonWorkflowEngineForRunner(w.Store, github.NewClient(checkout), checkout, w.workflowHome(), runner)
 	w.applyOrchestratePolicy(&engine)
 	return engine
+}
+
+func (w jobWorker) checkoutForJob(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent, runner subprocess.Runner) (string, error) {
+	if w.CheckoutValidator != nil {
+		return w.CheckoutValidator(ctx, job, payload, agent)
+	}
+	return w.defaultCheckoutForRunner(ctx, job, payload, agent, runner)
+}
+
+func (w jobWorker) workflowForJob(checkout string, runner subprocess.Runner) workflow.Engine {
+	if w.WorkflowFactory != nil {
+		return w.WorkflowFactory(checkout)
+	}
+	return w.defaultWorkflowForRunner(checkout, runner)
 }
 
 // applyOrchestratePolicy sets the engine's opt-in [orchestrate] fields — the

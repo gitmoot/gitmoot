@@ -36,7 +36,7 @@ func TestRefreshDaemonJobPayloadPreservesTaskWorktreeHeadForFinalizer(t *testing
 	runGit(t, checkout, "branch", "-m", "main")
 	runGit(t, checkout, "push", "-u", "origin", "main")
 	runGit(t, checkout, "worktree", "add", "-b", "task-1", worktree, "main")
-	oldHead, err := (gitutil.Client{Dir: worktree}).HeadSHA(ctx)
+	oldHead, err := (gitutil.NewHostClient(worktree)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestRefreshDaemonJobPayloadPreservesTaskWorktreeHeadForFinalizer(t *testing
 	}
 	runGit(t, worktree, "add", "feature.txt")
 	runGit(t, worktree, "commit", "-m", "agent self commit")
-	newHead, err := (gitutil.Client{Dir: worktree}).HeadSHA(ctx)
+	newHead, err := (gitutil.NewHostClient(worktree)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestRefreshDaemonJobPayloadPreservesTaskWorktreeHeadForFinalizer(t *testing
 	if refreshed.HeadSHA != oldHead {
 		t.Fatalf("refreshed head = %q, want original %q", refreshed.HeadSHA, oldHead)
 	}
-	finalized, err := (daemonImplementationFinalizer{Store: store, GitHub: github.NoopClient{}}).FinalizeImplementation(ctx, db.Job{ID: "job-implement-worktree", Agent: "lead", Type: "implement"}, refreshed)
+	finalized, err := (newHostDaemonImplementationFinalizer(store, github.NoopClient{})).FinalizeImplementation(ctx, db.Job{ID: "job-implement-worktree", Agent: "lead", Type: "implement"}, refreshed)
 	if err != nil {
 		t.Fatalf("FinalizeImplementation returned error: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestDaemonImplementationFinalizerCommitsBeforeReusingExistingPullRequest(t 
 	if err := store.UpsertPullRequest(ctx, db.PullRequest{RepoFullName: "owner/repo", Number: 12, URL: "https://github.com/owner/repo/pull/12", HeadBranch: "task-1", BaseBranch: "main", HeadSHA: "old", State: "open"}); err != nil {
 		t.Fatalf("UpsertPullRequest returned error: %v", err)
 	}
-	finalizer := daemonImplementationFinalizer{Store: store, GitHub: github.NoopClient{}}
+	finalizer := newHostDaemonImplementationFinalizer(store, github.NoopClient{})
 	payload := workflow.JobPayload{
 		Repo:      "owner/repo",
 		Branch:    "task-1",
@@ -138,14 +138,14 @@ func TestDaemonImplementationFinalizerCommitsBeforeReusingExistingPullRequest(t 
 	if finalized.PullRequest != 12 {
 		t.Fatalf("pull request = %d, want 12", finalized.PullRequest)
 	}
-	clean, err := (gitutil.Client{Dir: repoDir}).WorktreeClean(ctx)
+	clean, err := (gitutil.NewHostClient(repoDir)).WorktreeClean(ctx)
 	if err != nil {
 		t.Fatalf("WorktreeClean returned error: %v", err)
 	}
 	if !clean {
 		t.Fatal("worktree still has uncommitted changes")
 	}
-	localHead, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	localHead, err := (gitutil.NewHostClient(repoDir)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestDaemonImplementationFinalizerAdoptsExistingPullRequestViaEnsure(t *test
 		HeadRef: "task-1",
 		BaseRef: "main",
 	}}
-	finalizer := daemonImplementationFinalizer{Store: store, GitHub: gh}
+	finalizer := newHostDaemonImplementationFinalizer(store, gh)
 	payload := workflow.JobPayload{
 		Repo:      "owner/repo",
 		Branch:    "task-1",
@@ -279,7 +279,7 @@ func TestDaemonImplementationFinalizerPersistsSkipFanoutBeforeOpeningPR(t *testi
 		HeadRef: "task-1",
 		BaseRef: "main",
 	}}
-	finalizer := daemonImplementationFinalizer{Store: store, GitHub: gh}
+	finalizer := newHostDaemonImplementationFinalizer(store, gh)
 	payload := workflow.JobPayload{
 		Repo:                   "owner/repo",
 		Branch:                 "task-1",
@@ -336,7 +336,7 @@ func TestDaemonImplementationFinalizerPersistsSkipFanoutOnNoChangeReFinalize(t *
 	}
 	runGit(t, repoDir, "add", "feature.txt")
 	runGit(t, repoDir, "commit", "-m", "work")
-	head, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	head, err := (gitutil.NewHostClient(repoDir)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
@@ -354,7 +354,7 @@ func TestDaemonImplementationFinalizerPersistsSkipFanoutOnNoChangeReFinalize(t *
 	}
 	// Clean worktree + PR already attached + head unchanged ⇒ the no-changes early
 	// return. NoopClient: no PR-open call is expected on this path.
-	finalizer := daemonImplementationFinalizer{Store: store, GitHub: github.NoopClient{}}
+	finalizer := newHostDaemonImplementationFinalizer(store, github.NoopClient{})
 	payload := workflow.JobPayload{
 		Repo:                   "owner/repo",
 		Branch:                 "task-1",
@@ -401,7 +401,7 @@ func TestDaemonImplementationFinalizerPushesAlreadyCommittedWork(t *testing.T) {
 	runGit(t, repoDir, "branch", "-m", "main")
 	runGit(t, repoDir, "push", "-u", "origin", "main")
 	runGit(t, repoDir, "switch", "-c", "task-1")
-	oldHead, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	oldHead, err := (gitutil.NewHostClient(repoDir)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
@@ -422,7 +422,7 @@ func TestDaemonImplementationFinalizerPushesAlreadyCommittedWork(t *testing.T) {
 	if err := store.UpsertPullRequest(ctx, db.PullRequest{RepoFullName: "owner/repo", Number: 12, URL: "https://github.com/owner/repo/pull/12", HeadBranch: "task-1", BaseBranch: "main", HeadSHA: oldHead, State: "open"}); err != nil {
 		t.Fatalf("UpsertPullRequest returned error: %v", err)
 	}
-	finalizer := daemonImplementationFinalizer{Store: store, GitHub: github.NoopClient{}}
+	finalizer := newHostDaemonImplementationFinalizer(store, github.NoopClient{})
 	payload := workflow.JobPayload{
 		Repo:      "owner/repo",
 		Branch:    "task-1",
@@ -438,7 +438,7 @@ func TestDaemonImplementationFinalizerPushesAlreadyCommittedWork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FinalizeImplementation returned error: %v", err)
 	}
-	localHead, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	localHead, err := (gitutil.NewHostClient(repoDir)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
@@ -480,7 +480,7 @@ func TestDaemonImplementationFinalizerBlocksWrongBranch(t *testing.T) {
 	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Task 1", State: string(workflow.TaskImplementing), Branch: "task-1", WorktreePath: repoDir}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
-	finalizer := daemonImplementationFinalizer{Store: store, GitHub: github.NoopClient{}}
+	finalizer := newHostDaemonImplementationFinalizer(store, github.NoopClient{})
 	payload := workflow.JobPayload{
 		Repo:      "owner/repo",
 		Branch:    "task-1",
@@ -518,7 +518,7 @@ func TestDaemonImplementationFinalizerAllowsAlreadyFinalizedPullRequest(t *testi
 	runGit(t, repoDir, "branch", "-m", "main")
 	runGit(t, repoDir, "push", "-u", "origin", "main")
 	runGit(t, repoDir, "switch", "-c", "task-1")
-	head, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	head, err := (gitutil.NewHostClient(repoDir)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
@@ -531,7 +531,7 @@ func TestDaemonImplementationFinalizerAllowsAlreadyFinalizedPullRequest(t *testi
 	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Task 1", State: string(workflow.TaskImplementing), Branch: "task-1", WorktreePath: repoDir}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
-	finalizer := daemonImplementationFinalizer{Store: store, GitHub: github.NoopClient{}}
+	finalizer := newHostDaemonImplementationFinalizer(store, github.NoopClient{})
 	payload := workflow.JobPayload{
 		Repo:        "owner/repo",
 		Branch:      "task-1",
@@ -762,7 +762,7 @@ func TestDaemonImplementationFinalizerPersistsSkipFanoutWhenExecutorIsDelegatedW
 		HeadRef: "task-busy",
 		BaseRef: "main",
 	}}
-	finalizer := daemonImplementationFinalizer{Store: store, GitHub: gh}
+	finalizer := newHostDaemonImplementationFinalizer(store, gh)
 	payload := workflow.JobPayload{
 		Repo:                   "owner/repo",
 		Branch:                 "task-busy",
@@ -862,7 +862,7 @@ func TestDaemonImplementationFinalizerPreservesPrearmedSkipFanoutWhenPayloadIsFa
 		HeadRef: "task-fixround",
 		BaseRef: "main",
 	}}
-	finalizer := daemonImplementationFinalizer{Store: store, GitHub: gh}
+	finalizer := newHostDaemonImplementationFinalizer(store, gh)
 	payload := workflow.JobPayload{
 		Repo:                   "owner/repo",
 		Branch:                 "task-fixround",

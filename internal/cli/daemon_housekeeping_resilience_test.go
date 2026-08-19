@@ -99,7 +99,7 @@ func TestSkippedDelegationWorktreeReclaimFailureDoesNotBlockDispatch(t *testing.
 	}); err != nil {
 		t.Fatalf("add skipped cleanup marker: %v", err)
 	}
-	baseWorkflowFactory := h.worker.WorkflowFactory
+	baseWorkflowFactory := h.worker.defaultWorkflow
 	var factoryCalls atomic.Int32
 	h.worker.WorkflowFactory = func(checkout string) workflow.Engine {
 		// A nil store makes the selected item's real reclaim operation fail at

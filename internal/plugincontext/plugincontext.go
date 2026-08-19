@@ -160,7 +160,7 @@ func quoteContextValue(value string) string {
 }
 
 func detectRepo(ctx context.Context, cwd string, runner subprocess.Runner) repoInfo {
-	client := gitutil.Client{Dir: cwd, Runner: runner}
+	client := gitutil.NewClient(cwd, runner)
 	root, err := client.Root(ctx)
 	if err != nil {
 		return repoInfo{}

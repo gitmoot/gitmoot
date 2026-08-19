@@ -90,7 +90,7 @@ func TestPipelineAutoMergeShellRuntimeE2E(t *testing.T) {
 	}
 	runDaemonWorkerGit(t, implPayload.WorktreePath, "add", "auto.txt")
 	runDaemonWorkerGit(t, implPayload.WorktreePath, "commit", "-m", "auto merge fixture")
-	head, err := (gitutil.Client{Dir: implPayload.WorktreePath}).HeadSHA(ctx)
+	head, err := (gitutil.NewHostClient(implPayload.WorktreePath)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA: %v", err)
 	}

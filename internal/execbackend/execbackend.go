@@ -15,9 +15,14 @@
 // ParseImplemented alone still compiles and then fails closed at consumption. If
 // P2 extends Consume with a required positional builder, that signature change
 // will make its existing callers fail to compile until they supply it. Adapter
-// builds without a selector retain the Local default. Selection does not yet gate
-// job-associated subprocess execution; closing that gap before P2 is tracked by
-// #1560.
+// builds without a selector retain the Local default. Job-associated git,
+// GitHub CLI, verifier, and read-only-diff subprocesses consume the resolved
+// runner through Consume and fail closed when the backend has no execution
+// implementation. Operator tooling and daemon supervision/session paths
+// deliberately retain host-side runners. When supervision advances a completed
+// job, it resolves that job's stored backend and rebuilds the workflow engine
+// through the same Consume-backed runner seam before any delegation worktree or
+// other job-associated subprocess can execute.
 package execbackend
 
 import (

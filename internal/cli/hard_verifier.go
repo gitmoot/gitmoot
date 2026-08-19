@@ -308,11 +308,11 @@ func (p cloneSandboxProvisioner) Provision(ctx context.Context, ref string) (str
 // holds every object it needs (hardlinked wholesale) and checks out by raw SHA, so a
 // severed origin never reduces what a verifier can read.
 func (p cloneSandboxProvisioner) cloneDetached(ctx context.Context, dest string, ref string) error {
-	source := git.Client{Runner: p.runner, Dir: p.base}
+	source := git.NewClient(p.base, p.runner)
 	if err := source.CloneLocalNoCheckout(ctx, dest); err != nil {
 		return err
 	}
-	clone := git.Client{Runner: p.runner, Dir: dest}
+	clone := git.NewClient(dest, p.runner)
 	if err := clone.CheckoutDetach(ctx, ref); err != nil {
 		return err
 	}

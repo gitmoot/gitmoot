@@ -21,10 +21,10 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
-	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/presence"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -377,7 +377,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 			// Resolve [merge_gate] inside daemonMergeGate for every evaluation so a
 			// live auto_merge flip both re-arms parked tasks and changes their next
 			// gate decision without a daemon restart.
-			MergeGate: newDaemonMergeGate(store, gh, checkout, resolvedHome),
+			MergeGate: newDaemonMergeGate(store, gh, checkout, resolvedHome, subprocess.ExecRunner{}),
 			// Registry default model/effort fallbacks, home-aware and fail-open — see
 			// daemonWorkflowEngine. Empty by default => byte-identical.
 			RuntimeDefaultModel:  runtimeDefaultModelResolver(*home),
@@ -394,18 +394,8 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		applyReviewPolicy(&engine, *home)
 		wireReviewRiskSignals(&engine, gh)
 		fmt.Fprintf(stdout, "watching %s every %s\n", repo.FullName(), poll.String())
-		return runSingleRepoSupervisor(ctx, *home, daemon.Daemon{
-			Repo:                    repo,
-			PollInterval:            *poll,
-			Store:                   store,
-			GitHub:                  gh,
-			Workflow:                &engine,
-			WatchIssues:             *watchIssues,
-			EscalationTTL:           resolveEscalationTTL(*home),
-			RevertDetectionEnabled:  resolveRevertDetectionEnabled(*home),
-			ObservePermissionPolicy: resolvePermissionPolicyObservationEnabled(*home),
-			AutoMergeEnabled:        autoMergeEnabledResolver(*home),
-		}, store, live, session, stdout)
+		supervisor := newSingleRepoSupervisorDaemon(repo, store, gh, engine, *home, resolvedHome, checkout, stdout, *poll, *watchIssues)
+		return runSingleRepoSupervisor(ctx, *home, supervisor, store, live, session, stdout)
 	})
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return 0
@@ -415,6 +405,41 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func newSingleRepoSupervisorDaemon(
+	repo github.Repository,
+	store *db.Store,
+	gh github.Client,
+	engine workflow.Engine,
+	rawHome string,
+	resolvedHome string,
+	checkout string,
+	stdout io.Writer,
+	pollInterval time.Duration,
+	watchIssues bool,
+) daemon.Daemon {
+	return daemon.Daemon{
+		Repo:         repo,
+		PollInterval: pollInterval,
+		Store:        store,
+		GitHub:       gh,
+		Workflow:     &engine,
+		WorkflowForJob: func(_ context.Context, job db.Job) (*workflow.Engine, error) {
+			runner, err := defaultJobWorker(store, stdout, rawHome).subprocessRunnerForJob(job)
+			if err != nil {
+				return nil, err
+			}
+			jobEngine := engine
+			jobEngine.MergeGate = newDaemonMergeGate(store, gh, checkout, resolvedHome, runner)
+			return &jobEngine, nil
+		},
+		WatchIssues:             watchIssues,
+		EscalationTTL:           resolveEscalationTTL(rawHome),
+		RevertDetectionEnabled:  resolveRevertDetectionEnabled(rawHome),
+		ObservePermissionPolicy: resolvePermissionPolicyObservationEnabled(rawHome),
+		AutoMergeEnabled:        autoMergeEnabledResolver(rawHome),
+	}
 }
 
 func runDaemonStop(args []string, stdout, stderr io.Writer) int {
@@ -1072,7 +1097,11 @@ func preflightDaemonRepoStart(ctx context.Context, home string, repo github.Repo
 }
 
 func preflightDaemonRepoCheckout(ctx context.Context, repo github.Repository, workDir string) error {
-	_, err := repoRecordForCheckout(ctx, repo, gitutil.Client{Dir: workDir})
+	return preflightDaemonRepoCheckoutWithRunner(ctx, repo, workDir, subprocess.ExecRunner{})
+}
+
+func preflightDaemonRepoCheckoutWithRunner(ctx context.Context, repo github.Repository, workDir string, runner subprocess.Runner) error {
+	_, err := repoRecordForCheckout(ctx, repo, jobGitClient(workDir, runner))
 	return err
 }
 

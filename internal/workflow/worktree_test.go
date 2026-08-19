@@ -446,7 +446,7 @@ func TestEngineAllocateTaskWorktreeRecutsCleanOffLineageWorktree(t *testing.T) {
 	if task.WorktreePath != path {
 		t.Fatalf("task worktree = %q, want %q", task.WorktreePath, path)
 	}
-	newHead, err := (gitutil.Client{Dir: path}).HeadSHA(ctx)
+	newHead, err := (gitutil.NewHostClient(path)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA re-cut worktree: %v", err)
 	}
@@ -477,7 +477,7 @@ func TestEngineAllocateTaskWorktreeBlocksDirtyOffLineageWorktree(t *testing.T) {
 			t.Fatalf("blocked reason %q missing %q", blocked.Reason, want)
 		}
 	}
-	headAfter, err := (gitutil.Client{Dir: path}).HeadSHA(ctx)
+	headAfter, err := (gitutil.NewHostClient(path)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA preserved worktree: %v", err)
 	}
@@ -938,7 +938,7 @@ func setupOffLineageTaskWorktree(t *testing.T, dirty bool) (context.Context, *db
 	}
 	runWorktreeGit(t, path, "add", "stale.txt")
 	runWorktreeGit(t, path, "commit", "-m", "stale branch")
-	oldHead, err := (gitutil.Client{Dir: path}).HeadSHA(ctx)
+	oldHead, err := (gitutil.NewHostClient(path)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA stale worktree: %v", err)
 	}
@@ -949,7 +949,7 @@ func setupOffLineageTaskWorktree(t *testing.T, dirty bool) (context.Context, *db
 	runWorktreeGit(t, checkout, "add", "current.txt")
 	runWorktreeGit(t, checkout, "commit", "-m", "advance base")
 	runWorktreeGit(t, checkout, "push", "origin", "main")
-	baseHead, err := (gitutil.Client{Dir: checkout}).RevParse(ctx, "origin/main")
+	baseHead, err := (gitutil.NewHostClient(checkout)).RevParse(ctx, "origin/main")
 	if err != nil {
 		t.Fatalf("RevParse origin/main: %v", err)
 	}
@@ -978,7 +978,7 @@ func setupOffLineageTaskWorktree(t *testing.T, dirty bool) (context.Context, *db
 		Owner:      "lead",
 		Checkout:   checkout,
 	}
-	return ctx, store, testEngine(store), gitutil.Client{Dir: checkout}, request, path, oldHead, baseHead
+	return ctx, store, testEngine(store), gitutil.NewHostClient(checkout), request, path, oldHead, baseHead
 }
 
 func runWorktreeGit(t *testing.T, dir string, args ...string) {

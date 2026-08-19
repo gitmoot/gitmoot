@@ -33,6 +33,14 @@ type EnvRunner interface {
 	RunEnv(ctx context.Context, dir string, env []string, command string, args ...string) (Result, error)
 }
 
+// ExactEnvRunner runs with exactly the supplied environment instead of
+// inheriting the host environment. Security-sensitive subprocess setup uses
+// this seam when omitted variables must stay absent.
+type ExactEnvRunner interface {
+	Runner
+	RunExactEnv(ctx context.Context, dir string, env []string, stdout, stderr io.Writer, command string, args ...string) error
+}
+
 // PIDCallback is invoked after a subprocess has started successfully and before
 // its runner blocks waiting for completion.
 type PIDCallback func(pid int)
@@ -104,6 +112,10 @@ func (ExecRunner) LookPath(file string) (string, error) {
 
 func (ExecRunner) RunEnv(ctx context.Context, dir string, env []string, command string, args ...string) (Result, error) {
 	return RunEnv(ctx, dir, env, command, args...)
+}
+
+func (ExecRunner) RunExactEnv(ctx context.Context, dir string, env []string, stdout, stderr io.Writer, command string, args ...string) error {
+	return RunExactEnv(ctx, dir, env, stdout, stderr, command, args...)
 }
 
 func (ExecRunner) RunEnvWithPID(ctx context.Context, dir string, env []string, onPID PIDCallback, command string, args ...string) (Result, error) {
@@ -420,6 +432,19 @@ func RunEnv(ctx context.Context, dir string, extraEnv []string, command string, 
 		Stdout:  stdout.String(),
 		Stderr:  stderr.String(),
 	}, err
+}
+
+// RunExactEnv runs with exactly env and streams output into the supplied
+// writers. Unlike RunEnv, omitted host variables are not inherited. Callers
+// retain control over buffering so bounded writers can cap memory while the
+// subprocess is running.
+func RunExactEnv(ctx context.Context, dir string, env []string, stdout, stderr io.Writer, command string, args ...string) error {
+	cmd := exec.CommandContext(ctx, command, args...)
+	cmd.Dir = dir
+	cmd.Env = append([]string(nil), env...)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	return cmd.Run()
 }
 
 // RunEnvWithPID is RunEnv with an additive callback invoked after a successful

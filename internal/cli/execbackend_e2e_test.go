@@ -6,6 +6,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"os"
 	"path/filepath"
@@ -17,6 +20,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
+	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -44,6 +48,31 @@ var execBackendLocalEventKindBaseline = []string{
 	"advance_started",
 	"delegation_worktree_removed",
 	"advance_completed",
+}
+
+var errP2ProbeSubprocessReached = errors.New("p2-probe subprocess runner reached")
+
+type p2ProbeSubprocessRunner struct {
+	calls int
+}
+
+func (r *p2ProbeSubprocessRunner) Run(context.Context, string, string, ...string) (subprocess.Result, error) {
+	r.calls++
+	return subprocess.Result{}, errP2ProbeSubprocessReached
+}
+
+func (r *p2ProbeSubprocessRunner) RunEnv(ctx context.Context, dir string, _ []string, command string, args ...string) (subprocess.Result, error) {
+	return r.Run(ctx, dir, command, args...)
+}
+
+func (r *p2ProbeSubprocessRunner) RunExactEnv(ctx context.Context, dir string, _ []string, _, _ io.Writer, command string, args ...string) error {
+	_, err := r.Run(ctx, dir, command, args...)
+	return err
+}
+
+func (r *p2ProbeSubprocessRunner) LookPath(string) (string, error) {
+	r.calls++
+	return "", errP2ProbeSubprocessReached
 }
 
 // execBackendDispatchAsk enqueues a background shell ask and returns its job id.
@@ -159,7 +188,8 @@ func TestExecBackendLocalExplicitDaemonE2E(t *testing.T) {
 
 // TestExecBackendUnknownFailsLoudDaemonE2E is ACCEPTANCE 3: an unknown
 // backend — "e2b" (not implemented until P5) and the typo "loca" — FAILS LOUD
-// at dispatch naming the value AND the allowed set; the job never runs.
+// at background dispatch naming the value AND the allowed set; no pre-enqueue
+// git preparation or job execution is allowed to run on the host.
 func TestExecBackendUnknownFailsLoudDaemonE2E(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -170,46 +200,43 @@ func TestExecBackendUnknownFailsLoudDaemonE2E(t *testing.T) {
 		{name: "explicit blank", value: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
 			marker := filepath.Join(t.TempDir(), "must-not-run")
 			home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
 			execBackendAppendConfig(t, home, "\n[remote_exec]\nbackend = \""+tc.value+"\"\n")
-			jobID := execBackendDispatchAsk(t, home)
-			execBackendRunOneTick(t, home, store)
+
+			var out, errBuf bytes.Buffer
+			code := Run([]string{
+				"agent", "ask", "shell-asker", "exec backend background probe",
+				"--home", home,
+				"--repo", "owner/repo",
+				"--background",
+				"--json",
+			}, &out, &errBuf)
+			if code == 0 {
+				t.Fatalf("background ask exit = 0, output=%s; want loud backend refusal", out.String())
+			}
 
 			if _, err := os.Stat(marker); !os.IsNotExist(err) {
 				t.Fatalf("adapter ran with an unknown backend (marker err=%v)", err)
 			}
-			job, err := store.GetJob(ctx, jobID)
+			jobs, err := store.ListJobs(context.Background())
 			if err != nil {
-				t.Fatalf("GetJob: %v", err)
+				t.Fatalf("ListJobs: %v", err)
 			}
-			if job.State != string(workflow.JobFailed) {
-				t.Fatalf("job state = %q, want failed", job.State)
-			}
-			events, err := store.ListJobEvents(ctx, jobID)
-			if err != nil {
-				t.Fatalf("ListJobEvents: %v", err)
-			}
-			var failedMessage string
-			for _, event := range events {
-				if event.Kind == "running" {
-					t.Fatalf("job reached running with an unknown backend: %+v", event)
-				}
-				if event.Kind == string(workflow.JobFailed) {
-					failedMessage = event.Message
-				}
+			if len(jobs) != 0 {
+				t.Fatalf("jobs = %+v, want no enqueued row after background preflight refusal", jobs)
 			}
 			// The loud error must name the offending value AND the allowed set
 			// AND its config source — not just be a non-zero exit.
+			failedMessage := errBuf.String()
 			if !strings.Contains(failedMessage, `"`+tc.value+`"`) {
-				t.Fatalf("failed event = %q, want it to name %q", failedMessage, tc.value)
+				t.Fatalf("dispatch error = %q, want it to name %q", failedMessage, tc.value)
 			}
 			if !strings.Contains(failedMessage, "allowed: local") {
-				t.Fatalf("failed event = %q, want the allowed set named", failedMessage)
+				t.Fatalf("dispatch error = %q, want the allowed set named", failedMessage)
 			}
 			if !strings.Contains(failedMessage, "[remote_exec].backend") {
-				t.Fatalf("failed event = %q, want the config key named", failedMessage)
+				t.Fatalf("dispatch error = %q, want the config key named", failedMessage)
 			}
 		})
 	}
@@ -302,11 +329,26 @@ func TestExecBackendResolvedNonLocalCannotRunLocallyDaemonE2E(t *testing.T) {
 	}
 	t.Cleanup(func() { daemonJobExecBackendFor = previousResolver })
 
-	execBackendRunOneTick(t, home, store)
+	checkoutCalls := 0
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		checkoutCalls++
+		return t.TempDir(), nil
+	}
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob before run: %v", err)
+	}
+	if err := worker.run(ctx, job); err != nil {
+		t.Fatalf("worker run: %v", err)
+	}
+	if checkoutCalls != 0 {
+		t.Fatalf("checkout validation calls = %d, want zero before non-local runner refusal", checkoutCalls)
+	}
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("daemon adapter ran locally for a resolved non-local backend (marker err=%v)", err)
 	}
-	job, err := store.GetJob(ctx, jobID)
+	job, err = store.GetJob(ctx, jobID)
 	if err != nil {
 		t.Fatalf("GetJob: %v", err)
 	}
@@ -321,6 +363,367 @@ func TestExecBackendResolvedNonLocalCannotRunLocallyDaemonE2E(t *testing.T) {
 	failedMessages := execBackendEvents(t, store, jobID)
 	if len(failedMessages) != 1 || !strings.Contains(failedMessages[0], `"p2-probe"`) || !strings.Contains(failedMessages[0], "no execution implementation") {
 		t.Fatalf("failed events = %q, want resolved backend and missing daemon implementation named", failedMessages)
+	}
+}
+
+// TestP2GapJobSubprocessRoutesRefuseLocalFallback pins the one consumption
+// seam used before job-associated checkout and git work. The P2 overlay adds
+// p2-probe to the implemented registry; a compile-valid mutation that maps it
+// to ExecRunner must make this test fail rather than execute on the host.
+func TestP2GapJobSubprocessRoutesRefuseLocalFallback(t *testing.T) {
+	if backend, err := execbackend.ParseImplemented("p2-probe"); err == nil {
+		t.Fatalf("%s became implemented; add its job subprocess runner before updating this guard", backend)
+	}
+	if _, err := jobSubprocessRunnerForBackend(execbackend.Backend("p2-probe")); err == nil {
+		t.Fatal("p2-probe inherited the local job subprocess runner")
+	}
+}
+
+// TestP2GapEveryJobSubprocessRouteRefusesLocalFallback drives the stored-job
+// selector through every subprocess route shape. A future backend may parse as
+// implemented, but it cannot reach checkout, git, or verifier execution until
+// Consume has a corresponding runner builder.
+func TestP2GapEveryJobSubprocessRouteRefusesLocalFallback(t *testing.T) {
+	const backend = execbackend.Backend("p2-probe")
+	job := db.Job{
+		ID:      "p2-job-subprocess-route",
+		Type:    "ask",
+		Payload: `{"repo":"owner/repo","sender":"local","instructions":"probe","exec_backend":"p2-probe"}`,
+	}
+	payload := workflow.JobPayload{
+		Repo:         "owner/repo",
+		FixWorktree:  true,
+		WorktreePath: t.TempDir(),
+	}
+	worker := jobWorker{}
+
+	previousResolver := daemonJobExecBackendFor
+	var resolvedName string
+	var resolvedPresent bool
+	daemonJobExecBackendFor = func(_ jobWorker, name string, present bool) (execbackend.Backend, error) {
+		resolvedName = name
+		resolvedPresent = present
+		return backend, nil
+	}
+	t.Cleanup(func() { daemonJobExecBackendFor = previousResolver })
+
+	routeRunner := func() (subprocess.Runner, error) {
+		return worker.subprocessRunnerForJob(job)
+	}
+	routes := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "stored payload resolver",
+			run: func() error {
+				_, err := routeRunner()
+				return err
+			},
+		},
+		{
+			name: "default checkout",
+			run: func() error {
+				runner, err := routeRunner()
+				if err != nil {
+					return err
+				}
+				_, err = worker.defaultCheckoutForRunner(context.Background(), job, payload, runtime.Agent{}, runner)
+				return err
+			},
+		},
+		{
+			name: "checkout resolution",
+			run: func() error {
+				runner, err := routeRunner()
+				if err != nil {
+					return err
+				}
+				_, err = worker.resolveJobCheckoutForRunner(context.Background(), job, payload, runner)
+				return err
+			},
+		},
+		{
+			name: "git client",
+			run: func() error {
+				runner, err := routeRunner()
+				if err != nil {
+					return err
+				}
+				_, err = jobGitClient(t.TempDir(), runner).HeadSHA(context.Background())
+				return err
+			},
+		},
+		{
+			name: "hard verifier",
+			run: func() error {
+				runner, err := routeRunner()
+				if err != nil {
+					return err
+				}
+				_ = daemonHardVerifierDispatcherForRunner(nil, t.TempDir(), t.TempDir(), runner)
+				return errors.New("future backend reached hard verifier construction")
+			},
+		},
+	}
+	for _, route := range routes {
+		t.Run(route.name, func(t *testing.T) {
+			err := route.run()
+			if err == nil || !strings.Contains(err.Error(), string(backend)) {
+				t.Fatalf("route error = %v, want fail-closed refusal naming %q", err, backend)
+			}
+		})
+	}
+	if resolvedName != string(backend) || !resolvedPresent {
+		t.Fatalf("subprocessRunnerForJob resolved name=%q present=%v, want stored override %q present", resolvedName, resolvedPresent, backend)
+	}
+}
+
+func TestP2GapSupervisorAdvanceResolvesJobSubprocessRunner(t *testing.T) {
+	home, paths, store := heartbeatLoopE2EHome(t)
+	poller := defaultRegisteredRepoPoller(store, 1, false, io.Discard, home, paths.Home)
+	checkout := t.TempDir()
+	repoRecord := db.Repo{Owner: "owner", Name: "repo", CheckoutPath: checkout, PollInterval: "30s"}
+	if err := store.UpsertRepo(context.Background(), repoRecord); err != nil {
+		t.Fatalf("upsert repo: %v", err)
+	}
+	if err := store.UpsertTask(context.Background(), db.Task{
+		ID: "task-p2-supervisor", RepoFullName: repoRecord.FullName(), GoalID: "goal-p2",
+		Title: "P2 supervisor", State: string(workflow.TaskReviewing), Branch: "task-p2",
+	}); err != nil {
+		t.Fatalf("upsert task: %v", err)
+	}
+	if err := store.UpsertPullRequest(context.Background(), db.PullRequest{
+		RepoFullName: repoRecord.FullName(), Number: 7, HeadBranch: "task-p2",
+		BaseBranch: "main", HeadSHA: "p2-head", State: "open",
+	}); err != nil {
+		t.Fatalf("upsert pull request: %v", err)
+	}
+	payload := workflow.JobPayload{
+		Repo: repoRecord.FullName(), Branch: "task-p2", PullRequest: 7,
+		HeadSHA: "p2-head", TaskID: "task-p2-supervisor", ExecBackend: "p2-probe",
+		LeadAgent: "lead", ReviewRound: "round-p2", Reviewers: []string{"audit"},
+		Result: &workflow.AgentResult{Decision: "approved", Summary: "probe"},
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	job := db.Job{
+		ID:      "p2-supervisor-advance",
+		Type:    "review",
+		State:   string(workflow.JobSucceeded),
+		Payload: string(encoded),
+	}
+	if err := store.CreateJobWithEvent(context.Background(), job, db.JobEvent{
+		JobID: job.ID, Kind: string(workflow.JobSucceeded), Message: "probe",
+	}); err != nil {
+		t.Fatalf("create review job: %v", err)
+	}
+	poller.GitHubClient = func(string) github.Client {
+		return &cliPollFakeGitHub{pulls: []github.PullRequest{{
+			Number: 7, Title: "P2 supervisor", State: "open", HeadRef: "task-p2", BaseRef: "main", HeadSHA: "p2-head",
+		}}}
+	}
+
+	previousResolver := daemonJobExecBackendFor
+	var resolvedName string
+	var resolvedPresent bool
+	daemonJobExecBackendFor = func(_ jobWorker, name string, present bool) (execbackend.Backend, error) {
+		resolvedName = name
+		resolvedPresent = present
+		return execbackend.Backend("p2-probe"), nil
+	}
+	t.Cleanup(func() { daemonJobExecBackendFor = previousResolver })
+
+	result, err := poller.pollRepo(context.Background(), repoRecord, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("poll repo persistence error: %v", err)
+	}
+	if !strings.Contains(result.LastError, "p2-probe") {
+		t.Fatalf("supervisor job workflow error = %q, want fail-closed p2-probe refusal", result.LastError)
+	}
+	if resolvedName != "p2-probe" || !resolvedPresent {
+		t.Fatalf("supervisor resolved name=%q present=%v, want stored p2-probe override", resolvedName, resolvedPresent)
+	}
+}
+
+func TestP2GapSingleRepoSupervisorAdvanceResolvesJobSubprocessRunner(t *testing.T) {
+	home, paths, store := heartbeatLoopE2EHome(t)
+	payload, err := json.Marshal(workflow.JobPayload{ExecBackend: "p2-probe"})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	previousResolver := daemonJobExecBackendFor
+	var resolvedName string
+	var resolvedPresent bool
+	daemonJobExecBackendFor = func(_ jobWorker, name string, present bool) (execbackend.Backend, error) {
+		resolvedName = name
+		resolvedPresent = present
+		return execbackend.Backend("p2-probe"), nil
+	}
+	t.Cleanup(func() { daemonJobExecBackendFor = previousResolver })
+
+	checkout := t.TempDir()
+	supervisor := newSingleRepoSupervisorDaemon(
+		github.Repository{Owner: "owner", Name: "repo"},
+		store,
+		&cliPollFakeGitHub{},
+		workflow.Engine{Store: store},
+		home,
+		paths.Home,
+		checkout,
+		io.Discard,
+		30*time.Second,
+		false,
+	)
+	if supervisor.WorkflowForJob == nil {
+		t.Fatal("single-repo supervisor has no job-specific workflow factory")
+	}
+	_, err = supervisor.WorkflowForJob(context.Background(), db.Job{
+		ID:      "p2-single-repo-supervisor",
+		Payload: string(payload),
+	})
+	if err == nil || !strings.Contains(err.Error(), "p2-probe") {
+		t.Fatalf("single-repo supervisor workflow error = %v, want fail-closed p2-probe refusal", err)
+	}
+	if resolvedName != "p2-probe" || !resolvedPresent {
+		t.Fatalf("single-repo supervisor resolved name=%q present=%v, want stored p2-probe override", resolvedName, resolvedPresent)
+	}
+}
+
+// TestJobCheckoutRouteConsumesResolvedSubprocessRunner pins the production
+// checkoutForJob call site. Replacing defaultCheckoutForRunner with the
+// host-only defaultCheckout wrapper compiles, but ignores this resolved runner
+// and makes the test fail by executing git locally.
+func TestJobCheckoutRouteConsumesResolvedSubprocessRunner(t *testing.T) {
+	ctx := context.Background()
+	_, _, store := heartbeatLoopE2EHome(t)
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	runner := &p2ProbeSubprocessRunner{}
+	worker := jobWorker{Store: store}
+	_, err := worker.checkoutForJob(
+		ctx,
+		db.Job{ID: "p2-checkout-route", Type: "ask"},
+		workflow.JobPayload{Repo: "owner/repo"},
+		runtime.Agent{},
+		runner,
+	)
+	if !errors.Is(err, errP2ProbeSubprocessReached) {
+		t.Fatalf("checkout error = %v, want resolved p2-probe runner refusal", err)
+	}
+	if runner.calls == 0 {
+		t.Fatal("checkout route ignored the resolved p2-probe subprocess runner")
+	}
+}
+
+func TestReadOnlyDiffRouteConsumesResolvedSubprocessRunner(t *testing.T) {
+	runner := &p2ProbeSubprocessRunner{}
+	if _, _, err := captureReadOnlyWorktreeDiffForRunner(context.Background(), t.TempDir(), runner); !errors.Is(err, errP2ProbeSubprocessReached) {
+		t.Fatalf("diff capture error = %v, want resolved p2-probe runner refusal", err)
+	}
+	if runner.calls == 0 {
+		t.Fatal("read-only diff route ignored the resolved p2-probe subprocess runner")
+	}
+}
+
+func TestJobGitHubClientConsumesResolvedSubprocessRunner(t *testing.T) {
+	runner := &p2ProbeSubprocessRunner{}
+	source := &github.GhClient{
+		MaxRetries: 1,
+		Limiter:    github.NewRateLimiter(github.RateLimiterConfig{}),
+	}
+	client := jobGitHubClient(t.TempDir(), source, runner)
+	if err := client.Ping(context.Background()); !errors.Is(err, errP2ProbeSubprocessReached) {
+		t.Fatalf("GitHub client error = %v, want resolved p2-probe runner refusal", err)
+	}
+	if runner.calls == 0 {
+		t.Fatal("job GitHub client ignored the resolved p2-probe subprocess runner")
+	}
+}
+
+func TestDaemonWorkflowGitHubRoutesConsumeResolvedSubprocessRunner(t *testing.T) {
+	runner := &p2ProbeSubprocessRunner{}
+	source := &github.GhClient{
+		MaxRetries: 1,
+		Limiter:    github.NewRateLimiter(github.RateLimiterConfig{}),
+	}
+	checkout := t.TempDir()
+	engine := daemonWorkflowEngineForRunner(nil, source, checkout, "", runner)
+	finalizer, ok := engine.ImplementationFinalizer.(daemonImplementationFinalizer)
+	if !ok {
+		t.Fatalf("implementation finalizer = %T, want daemonImplementationFinalizer", engine.ImplementationFinalizer)
+	}
+	if err := finalizer.githubClient(checkout).Ping(context.Background()); !errors.Is(err, errP2ProbeSubprocessReached) {
+		t.Fatalf("finalizer GitHub error = %v, want resolved p2-probe runner refusal", err)
+	}
+	gate, ok := engine.MergeGate.(daemonMergeGate)
+	if !ok {
+		t.Fatalf("merge gate = %T, want daemonMergeGate", engine.MergeGate)
+	}
+	if err := gate.githubClient(checkout).Ping(context.Background()); !errors.Is(err, errP2ProbeSubprocessReached) {
+		t.Fatalf("merge-gate GitHub error = %v, want resolved p2-probe runner refusal", err)
+	}
+}
+
+// TestJobSubprocessProductionRoutesDoNotCallHostWrappers binds the package
+// contract to every production call site. The wrappers remain for focused
+// legacy tests only; using one from non-test code would silently substitute an
+// ExecRunner and bypass the resolved backend.
+func TestJobSubprocessProductionRoutesDoNotCallHostWrappers(t *testing.T) {
+	forbidden := map[string]struct{}{
+		"defaultCheckout":             {},
+		"resolveJobCheckout":          {},
+		"healRegisteredRepoCheckout":  {},
+		"validateTargetCheckout":      {},
+		"validateReviewCheckout":      {},
+		"resyncReviewHead":            {},
+		"askReviewDiffPrecleanupHook": {},
+	}
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	var violations []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			selector, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			if _, blocked := forbidden[selector.Sel.Name]; blocked {
+				violations = append(violations, fset.Position(selector.Sel.Pos()).String())
+			}
+			if pkg, ok := selector.X.(*ast.Ident); ok && pkg.Name == "exec" &&
+				(selector.Sel.Name == "Command" || selector.Sel.Name == "CommandContext") && len(call.Args) != 0 {
+				commandArg := call.Args[0]
+				if selector.Sel.Name == "CommandContext" && len(call.Args) > 1 {
+					commandArg = call.Args[1]
+				}
+				if literal, ok := commandArg.(*ast.BasicLit); ok && (literal.Value == `"git"` || literal.Value == `"gh"`) {
+					violations = append(violations, fset.Position(selector.Sel.Pos()).String())
+				}
+			}
+			return true
+		})
+	}
+	if len(violations) != 0 {
+		t.Fatalf("production job subprocess routes call host-only wrappers: %v", violations)
 	}
 }
 

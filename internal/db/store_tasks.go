@@ -28,13 +28,13 @@ func (s *Store) UpsertRepoForce(ctx context.Context, repo Repo) error {
 func (s *Store) upsertRepo(ctx context.Context, repo Repo, force bool) error {
 	fullName := repo.Owner + "/" + repo.Name
 	if strings.TrimSpace(repo.CheckoutPath) != "" && strings.TrimSpace(repo.PrimaryCheckoutPath) == "" {
-		if primary, err := (gitutil.Client{Dir: repo.CheckoutPath}).PrimaryWorktree(ctx); err == nil {
+		if primary, err := (gitutil.NewHostClient(repo.CheckoutPath)).PrimaryWorktree(ctx); err == nil {
 			repo.PrimaryCheckoutPath = primary
 		}
 	}
 	if !force && strings.TrimSpace(repo.CheckoutPath) != "" {
 		if existing, err := s.GetRepo(ctx, fullName); err == nil && shouldProtectRepoCheckout(existing, repo.CheckoutPath) {
-			if linked, linkErr := (gitutil.Client{Dir: repo.CheckoutPath}).IsLinkedWorktree(ctx); linkErr == nil && linked {
+			if linked, linkErr := (gitutil.NewHostClient(repo.CheckoutPath)).IsLinkedWorktree(ctx); linkErr == nil && linked {
 				log.Printf("WARNING: keeping registered checkout for %s at %s; refusing linked worktree %s (use gitmoot repo add --force to override)", fullName, existing.CheckoutPath, repo.CheckoutPath)
 				repo.CheckoutPath = ""
 				repo.PrimaryCheckoutPath = ""

@@ -384,7 +384,7 @@ func TestPromptHeadWarningNamesBothCommitsAndWinner(t *testing.T) {
 
 func promptHeadWarnings(t *testing.T, checkout string, prompt string, head string) []string {
 	t.Helper()
-	return promptHeadContradictionWarnings(context.Background(), gitutil.Client{Dir: checkout}, prompt, head)
+	return promptHeadContradictionWarnings(context.Background(), gitutil.NewHostClient(checkout), prompt, head)
 }
 
 func promptHeadWarningRepository(t *testing.T) (checkout string, ancestor string, head string, divergent string) {
@@ -417,7 +417,7 @@ func writePromptHeadFixture(t *testing.T, checkout string, contents string, mess
 
 func promptHeadFixtureSHA(t *testing.T, checkout string) string {
 	t.Helper()
-	sha, err := (gitutil.Client{Dir: checkout}).HeadSHA(context.Background())
+	sha, err := (gitutil.NewHostClient(checkout)).HeadSHA(context.Background())
 	if err != nil {
 		t.Fatalf("HeadSHA: %v", err)
 	}

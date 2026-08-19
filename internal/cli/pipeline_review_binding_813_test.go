@@ -257,12 +257,12 @@ func TestPipelineSourceReviewWorktreePinnedToBoundHead(t *testing.T) {
 	}
 	runDaemonWorkerGit(t, checkout, "add", "feature.txt")
 	runDaemonWorkerGit(t, checkout, "commit", "-m", "feature head")
-	head, err := (gitutil.Client{Dir: checkout}).HeadSHA(ctx)
+	head, err := (gitutil.NewHostClient(checkout)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA(feature): %v", err)
 	}
 	runDaemonWorkerGit(t, checkout, "checkout", "main")
-	mainHead, err := (gitutil.Client{Dir: checkout}).HeadSHA(ctx)
+	mainHead, err := (gitutil.NewHostClient(checkout)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA(main): %v", err)
 	}
@@ -288,7 +288,7 @@ func TestPipelineSourceReviewWorktreePinnedToBoundHead(t *testing.T) {
 	if !payload.ReadOnlyWorktree || strings.TrimSpace(payload.WorktreePath) == "" {
 		t.Fatalf("review worktree payload = %+v, want detached read-only worktree", payload)
 	}
-	gotHead, err := (gitutil.Client{Dir: payload.WorktreePath}).HeadSHA(ctx)
+	gotHead, err := (gitutil.NewHostClient(payload.WorktreePath)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA(review worktree): %v", err)
 	}
@@ -334,7 +334,7 @@ func TestPipelineSourceReviewEnqueueReplayAdoptsExistingJob(t *testing.T) {
 	}
 	runDaemonWorkerGit(t, implPayload.WorktreePath, "add", "replay.txt")
 	runDaemonWorkerGit(t, implPayload.WorktreePath, "commit", "-m", "replay head")
-	head, err := (gitutil.Client{Dir: implPayload.WorktreePath}).HeadSHA(ctx)
+	head, err := (gitutil.NewHostClient(implPayload.WorktreePath)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA(impl): %v", err)
 	}
@@ -382,7 +382,7 @@ func TestPipelineSourceReviewEnqueueReplayAdoptsExistingJob(t *testing.T) {
 	if strings.TrimSpace(createdPayload.WorktreePath) == "" {
 		t.Fatal("interrupted review job has no pinned worktree")
 	}
-	createdHead, err := (gitutil.Client{Dir: createdPayload.WorktreePath}).HeadSHA(ctx)
+	createdHead, err := (gitutil.NewHostClient(createdPayload.WorktreePath)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA(interrupted review worktree): %v", err)
 	}
@@ -486,7 +486,7 @@ stages:
 			}
 			runDaemonWorkerGit(t, implPayload.WorktreePath, "add", "change.txt")
 			runDaemonWorkerGit(t, implPayload.WorktreePath, "commit", "-m", "pipeline implementation")
-			head, err := (gitutil.Client{Dir: implPayload.WorktreePath}).HeadSHA(ctx)
+			head, err := (gitutil.NewHostClient(implPayload.WorktreePath)).HeadSHA(ctx)
 			if err != nil {
 				t.Fatalf("HeadSHA(impl): %v", err)
 			}

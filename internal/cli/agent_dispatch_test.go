@@ -600,7 +600,7 @@ func TestReviewDispatchLeadRoutesChangesRequestedFixToImplementer(t *testing.T) 
 			seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 			seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 			seedDaemonWorkerAgentWithPolicy(t, store, "implementer", runtime.ShellRuntime, "true", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
-			head, err := (gitutil.Client{Dir: checkout}).HeadSHA(context.Background())
+			head, err := (gitutil.NewHostClient(checkout)).HeadSHA(context.Background())
 			if err != nil {
 				t.Fatalf("HeadSHA returned error: %v", err)
 			}
@@ -688,7 +688,7 @@ func reviewLeadRefusalStore(t *testing.T) reviewLeadRefusalFixture {
 	store := daemonWorkerStore(t)
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	head, err := (gitutil.Client{Dir: checkout}).HeadSHA(context.Background())
+	head, err := (gitutil.NewHostClient(checkout)).HeadSHA(context.Background())
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}

@@ -727,7 +727,7 @@ func TestPrepareLocalReviewDispatchRequestBindsBranchOwningTaskWithoutWorktree(t
 	}
 	runGit(t, repoDir, "add", "README.md")
 	runGit(t, repoDir, "commit", "-m", "feature")
-	head, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	head, err := (gitutil.NewHostClient(repoDir)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("HeadSHA returned error: %v", err)
 	}
@@ -766,7 +766,7 @@ func TestPrepareLocalReviewDispatchRequestBindsBranchOwningTaskWithoutWorktree(t
 	if request.ReviewTaskHeadDivergence != "" {
 		t.Fatalf("worktree-less bind recorded a divergence note %q; want none", request.ReviewTaskHeadDivergence)
 	}
-	branch, err := (gitutil.Client{Dir: repoDir}).CurrentBranch(ctx)
+	branch, err := (gitutil.NewHostClient(repoDir)).CurrentBranch(ctx)
 	if err != nil {
 		t.Fatalf("CurrentBranch returned error: %v", err)
 	}
@@ -807,7 +807,7 @@ func TestPrepareLocalReviewDispatchRequestBindsTaskWithStaleCheckout(t *testing.
 	}
 	runGit(t, repoDir, "add", "README.md")
 	runGit(t, repoDir, "commit", "-m", "old feature")
-	oldHead, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	oldHead, err := (gitutil.NewHostClient(repoDir)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("old HeadSHA returned error: %v", err)
 	}
@@ -817,7 +817,7 @@ func TestPrepareLocalReviewDispatchRequestBindsTaskWithStaleCheckout(t *testing.
 	}
 	runGit(t, repoDir, "add", "README.md")
 	runGit(t, repoDir, "commit", "-m", "new feature")
-	newHead, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	newHead, err := (gitutil.NewHostClient(repoDir)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("new HeadSHA returned error: %v", err)
 	}
@@ -844,7 +844,7 @@ func TestPrepareLocalReviewDispatchRequestBindsTaskWithStaleCheckout(t *testing.
 	}
 	// Fixture pin: the registered checkout must genuinely sit BEHIND the
 	// requested head (the fix-worktree strand), or this test proves nothing.
-	staleHead, err := (gitutil.Client{Dir: staleWorktree}).HeadSHA(ctx)
+	staleHead, err := (gitutil.NewHostClient(staleWorktree)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatalf("stale HeadSHA returned error: %v", err)
 	}
@@ -940,7 +940,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 			writeFile(t, filepath.Join(repoDir, "README.md"), "review\n")
 			runGit(t, repoDir, "add", "README.md")
 			runGit(t, repoDir, "commit", "-m", "review head")
-			head, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+			head, err := (gitutil.NewHostClient(repoDir)).HeadSHA(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -980,7 +980,7 @@ func TestPrepareLocalReviewTaskReusesNonDismissedMatchingHead(t *testing.T) {
 	writeFile(t, filepath.Join(repoDir, "README.md"), "review\n")
 	runGit(t, repoDir, "add", "README.md")
 	runGit(t, repoDir, "commit", "-m", "review head")
-	head, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	head, err := (gitutil.NewHostClient(repoDir)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1023,7 +1023,7 @@ func TestPrepareLocalReviewTaskMintsIdentityWhenNoTaskOwnsBranch(t *testing.T) {
 	writeFile(t, filepath.Join(repoDir, "README.md"), "review\n")
 	runGit(t, repoDir, "add", "README.md")
 	runGit(t, repoDir, "commit", "-m", "review head")
-	head, err := (gitutil.Client{Dir: repoDir}).HeadSHA(ctx)
+	head, err := (gitutil.NewHostClient(repoDir)).HeadSHA(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

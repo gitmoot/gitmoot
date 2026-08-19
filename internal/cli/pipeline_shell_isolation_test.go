@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -192,6 +195,40 @@ func TestPipelineForkedShellIsolationEventWindowsE2E(t *testing.T) {
 	}
 }
 
+func TestPipelineStageEnqueueBackendResolutionFailureFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	_, _, store := heartbeatLoopE2EHome(t)
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	brokenHome := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(brokenHome, []byte("force backend config resolution failure\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := func() error {
+		_, err := localAgentDispatchExecBackendFor(brokenHome)
+		return err
+	}()
+	if wantErr == nil {
+		t.Fatal("broken home unexpectedly resolved an execution backend")
+	}
+	request := pipeline.PipelineStageJobRequest(
+		db.Pipeline{Name: "backend-resolution-failure", Repo: "owner/repo"},
+		pipeline.Stage{ID: "run", Cmd: "printf ok", Isolate: true},
+		db.PipelineRun{ID: "backend-resolution-failure-run", Trigger: "manual"},
+		0, "", pipeline.PipelineStagePRBinding{}, false,
+	)
+	beforeWorktrees := gitOutput(t, checkout, "worktree", "list", "--porcelain")
+	if _, err := newPipelineStageEnqueuer(store, brokenHome)(ctx, request); err == nil || err.Error() != wantErr.Error() {
+		t.Fatalf("enqueue error = %v, want backend resolution error %v", err, wantErr)
+	}
+	if _, err := store.GetJob(ctx, request.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("backend resolution failure created job %q: %v", request.ID, err)
+	}
+	if afterWorktrees := gitOutput(t, checkout, "worktree", "list", "--porcelain"); afterWorktrees != beforeWorktrees {
+		t.Fatalf("backend resolution failure mutated git worktrees:\nbefore:\n%s\nafter:\n%s", beforeWorktrees, afterWorktrees)
+	}
+}
+
 func TestPipelineShellIsolationAllocationFailureFallsOpenE2E(t *testing.T) {
 	ctx := context.Background()
 	home, _, store := heartbeatLoopE2EHome(t)
@@ -209,6 +246,11 @@ func TestPipelineShellIsolationAllocationFailureFallsOpenE2E(t *testing.T) {
 	if err := os.WriteFile(brokenHome, []byte("force worktree parent creation failure\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	previousResolver := localAgentDispatchExecBackendFor
+	localAgentDispatchExecBackendFor = func(string) (execbackend.Backend, error) {
+		return execbackend.Local, nil
+	}
+	t.Cleanup(func() { localAgentDispatchExecBackendFor = previousResolver })
 
 	enqueue := newPipelineStageEnqueuer(store, brokenHome)
 	if err := runPipelineScanOnce(ctx, store, enqueue, now); err != nil {
