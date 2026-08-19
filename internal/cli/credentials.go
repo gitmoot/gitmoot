@@ -8,6 +8,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/credgw"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
@@ -248,6 +249,24 @@ func graftRuntimeBaseRunner(outer subprocess.Runner, curated subprocess.Runner) 
 		return curated
 	}
 	switch runner := outer.(type) {
+	case execbackend.InstanceRunner:
+		base, ok := curated.(subprocess.CuratedGroupRunner)
+		if !ok {
+			return outer
+		}
+		runner.BaseEnv = append([]string(nil), base.BaseEnv...)
+		runner.ScratchDirs = append([]string(nil), base.ScratchDirs...)
+		runner.MaxOutputBytes = base.MaxOutputBytes
+		return runner
+	case *execbackend.InstanceRunner:
+		base, ok := curated.(subprocess.CuratedGroupRunner)
+		if !ok {
+			return outer
+		}
+		runner.BaseEnv = append([]string(nil), base.BaseEnv...)
+		runner.ScratchDirs = append([]string(nil), base.ScratchDirs...)
+		runner.MaxOutputBytes = base.MaxOutputBytes
+		return runner
 	case subprocess.GroupRunner:
 		return curated
 	case *subprocess.GroupRunner:

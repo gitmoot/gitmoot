@@ -52,6 +52,14 @@ type jobWorker struct {
 	// elapsed-only progress without replacing their fake.
 	OutputAdapterFactory func(runtime.Agent, string, io.Writer) (workflow.DeliveryAdapter, error)
 	StartAdapterFactory  func(execbackend.Backend, string, string) (runtime.Adapter, error)
+	// ExecutionBackendFactory is nil on hand-built/test workers that intentionally
+	// retain the pre-P2b host-only path. executionBackendJobWorker wires it for
+	// real daemon jobs, where one lifecycle instance is acquired after runtime
+	// admission and kept alive through every Mailbox delivery attempt.
+	ExecutionBackendFactory func(execbackend.Backend) (execbackend.ExecutionBackend, error)
+	// executionRunner is run-scoped state on jobWorker's value receiver. Cockpit
+	// adapter rebuilds reuse it so enabling live logs cannot escape the backend.
+	executionRunner subprocess.Runner
 	// CheckoutValidator and WorkflowFactory are test overrides. Production leaves
 	// them nil so checkoutForJob/workflowForJob must consume the resolved runner.
 	CheckoutValidator func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error)
@@ -171,6 +179,21 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 			writeLine(stdout, "job kill-pending recovery failed: %v", err)
 		}
 	})
+	return worker
+}
+
+// executionBackendJobWorker is the production daemon constructor. Keeping the
+// lifecycle opt-in at this boundary preserves defaultJobWorker as the existing
+// unit-test/foreground seam: a hand-built worker has no backend instance and
+// therefore can never accidentally receive a live ChangeSet importer.
+func executionBackendJobWorker(store *db.Store, stdout io.Writer, home string) jobWorker {
+	worker := defaultJobWorker(store, stdout, home)
+	worker.ExecutionBackendFactory = worker.defaultExecutionBackend
+	// Construct the local provider at daemon-worker startup so crash leftovers
+	// are reconciled even when no new job is immediately available to provision.
+	if _, err := worker.ExecutionBackendFactory(execbackend.Local); err != nil {
+		writeLine(stdout, "execution backend startup reap failed: %v", err)
+	}
 	return worker
 }
 
@@ -378,6 +401,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			return nil
 		}
 	}
+	deliveryCheckout := checkout
 	// #732 moot-seat relay injection: a `gitmoot moot` SEAT (payload.MootSeat) must
 	// converse via `gitmoot chat send/wait` mid-run, but its runtime sandbox makes
 	// the home read-only. buildSeatAwareAdapter mints a per-seat token bound to
@@ -561,6 +585,38 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	} else {
 		toolCacheEnv = env
 	}
+	// Acquire the execution-backend lifecycle only after checkout validation and
+	// runtime-session admission. The instance then survives every Mailbox repair
+	// delivery and is destroyed synchronously on every return path. Host checkout,
+	// git, observation, and finalization remain on checkout/jobRunner; only runtime
+	// delivery executes in the distinct backend workspace.
+	lifecycle, instance, lifecycleErr := w.provisionExecutionBackend(ctx, execBackend, job, checkout)
+	if instance != nil {
+		defer w.destroyExecutionBackend(job.ID, lifecycle, instance)
+	}
+	if lifecycleErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, lifecycleErr); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, lifecycleErr)
+		return nil
+	}
+	if lifecycle != nil && instance != nil {
+		deliveryCheckout = instance.Workspace
+		w.executionRunner = execbackend.InstanceRunner{Backend: lifecycle, Instance: instance}
+		if progressTracker != nil {
+			adapter, err = w.executionDeliveryAdapter(agent, deliveryCheckout, relayToken, progressTracker)
+		} else {
+			adapter, err = w.executionDeliveryAdapter(agent, deliveryCheckout, relayToken)
+		}
+		if err != nil {
+			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+				return finishErr
+			}
+			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
+			return nil
+		}
+	}
 	adapter, err = wrapProduceSandboxAdapter(job.Type, agent, adapter)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
@@ -615,7 +671,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		if policyErr == nil && !userOptedOff {
 			cp = w.newCockpit(policy)
 		}
-		meta := cockpitJobMeta(job, payload, agent, checkout, policy.CockpitPaneKey)
+		meta := cockpitJobMeta(job, payload, agent, deliveryCheckout, policy.CockpitPaneKey)
 		seatMode := policy.CockpitPaneKey == config.CockpitPaneKeySeat
 		// Only when the cockpit will actually wrap (herdr available) do we tee the
 		// child's live output into a log the pane tails (Task 6). The tee rebuilds
@@ -654,9 +710,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 				var logPath string
 				var logFile *os.File
 				if progressTracker != nil {
-					teeAdapter, logPath, logFile = w.cockpitLogAdapter(cp, agent, checkout, job.ID, meta.RootJobID, meta.PaneKey, seatMode, progressTracker)
+					teeAdapter, logPath, logFile = w.cockpitLogAdapter(cp, agent, deliveryCheckout, job.ID, meta.RootJobID, meta.PaneKey, seatMode, progressTracker)
 				} else {
-					teeAdapter, logPath, logFile = w.cockpitLogAdapter(cp, agent, checkout, job.ID, meta.RootJobID, meta.PaneKey, seatMode)
+					teeAdapter, logPath, logFile = w.cockpitLogAdapter(cp, agent, deliveryCheckout, job.ID, meta.RootJobID, meta.PaneKey, seatMode)
 				}
 				if logFile != nil {
 					defer func() {
@@ -713,9 +769,10 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	adapter = pipeline.WrapPipelineEnvDeliveryAdapter(w.Store, w.ConfigHome, payload, adapter)
 	adapter = wrapManagedWorktreeRuntimeEnv(payload, adapter)
 	if warningRecorded {
-		adapter = w.observePermissionPolicyEffects(adapter, job.ID, checkout)
+		adapter = w.observePermissionPolicyEffects(adapter, job.ID, deliveryCheckout)
 	}
 	engine := w.workflowForJob(checkout, jobRunner)
+	engine.CollectChangeSet = executionChangeSetCollector(lifecycle, instance, execBackend, job.ID)
 	// Wire the PRE-TERMINAL operational-blocker deferrer (#532 slice E) on the LIVE
 	// worker (not the WorkflowFactory-captured copy) so it observes this worker's
 	// EventSink for the first-class job.deferred emit. When a delivery-seam failure
@@ -1570,7 +1627,17 @@ func (w jobWorker) cockpitTeeAdapter(agent runtime.Agent, checkout string, jobID
 // the file and returns nils so the caller falls back to the P0 pane.
 func (w jobWorker) cockpitTeeOnFile(agent runtime.Agent, checkout, jobID, logPath string, logFile *os.File, additionalOutput ...io.Writer) (workflow.DeliveryAdapter, string, *os.File) {
 	outputs := append([]io.Writer{logFile}, additionalOutput...)
-	adapter, err := buildRuntimeAdapter(w.ConfigHome, agent, checkout, subprocess.TeeRunner{Inner: subprocess.GroupRunner{}, Out: runtimeOutputWriter(outputs...)})
+	inner := subprocess.StreamRunner(subprocess.GroupRunner{})
+	if w.executionRunner != nil {
+		stream, ok := w.executionRunner.(subprocess.StreamRunner)
+		if !ok {
+			_ = logFile.Close()
+			writeLine(w.Stdout, "job %s cockpit tee backend runner lacks streaming", jobID)
+			return nil, "", nil
+		}
+		inner = stream
+	}
+	adapter, err := buildRuntimeAdapter(w.ConfigHome, agent, checkout, subprocess.TeeRunner{Inner: inner, Out: runtimeOutputWriter(outputs...)})
 	if err != nil {
 		// Unsupported runtime: this should never happen (AdapterFactory already
 		// built one above), but stay fail-open rather than leak the open file.

@@ -270,6 +270,22 @@ requires Landlock read-rules for `runtime-auth.env` (same-UID read is currently
 possible) — that is P3. Codex/Kimi custody and hard egress enforcement also
 remain P3.
 
+## Execution Backend
+
+`[remote_exec] backend = "local"` is the default and only implemented execution
+backend. Engine-driven daemon jobs provision one job-scoped detached worktree,
+run the runtime there with streaming preserved, transactionally import implement
+changes into the host worktree before result observation, and then destroy the
+instance. The host finalizer remains the only committer and pusher. The instance
+persists across Mailbox repair deliveries; cancellation destroys it, and daemon
+startup reaps instances whose recorded owner process is gone.
+
+Local worktrees use Git's absolute gitdir pointer successfully because they share
+the host filesystem, so bundle/base-ref hydration is reserved for a future remote
+provider. Foreground dispatch remains on the host path. Unknown backend names and
+explicit blank selectors fail loudly; a job payload's `exec_backend` overrides
+the config for that job.
+
 ## Transcript Retention
 
 Runtime transcript retention is default-on. Every engine delivery appends its

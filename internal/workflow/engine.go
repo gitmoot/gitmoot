@@ -12,6 +12,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 )
 
 type Engine struct {
@@ -20,6 +21,13 @@ type Engine struct {
 	// used after an implement delivery. The workflow package must not import cli;
 	// daemonWorkflowEngine wires the effective checkout selected by the worker.
 	ResolveDeliveryWorktree DeliveryWorktreeResolver
+	// CollectChangeSet is wired only on an engine that owns a live job-scoped
+	// execution-backend instance. Keeping it nil everywhere else prevents a
+	// backend-less job from reaching the transactional importer.
+	CollectChangeSet func(ctx context.Context, backend execbackend.Backend, jobID string) (*execbackend.ChangeSet, error)
+	// ApplyChangeSet is the optional host materializer test seam. Production
+	// leaves it nil and Mailbox selects execbackend.ImportChangeSet.
+	ApplyChangeSet func(ctx context.Context, worktree string, changes execbackend.ChangeSet) error
 	// RequireWorkflowPolicy is passed to every mailbox the engine creates so
 	// continuations and delegation enqueue share the same home-aware policy.
 	RequireWorkflowPolicy func(repo string) RequireWorkflowPolicy

@@ -221,7 +221,9 @@ func TestChangeSetRejectsUnsafePathsWithAttribution(t *testing.T) {
 
 func TestChangeSetRejectsSymlinkIntoGitMetadata(t *testing.T) {
 	_, sandbox, base := changeSetRepoPair(t)
-	if err := os.Symlink(".git/config", filepath.Join(sandbox, "metadata-link")); err != nil {
+	// Mixed case plus a cleaned parent component proves every resolved target
+	// component is checked with EqualFold, not merely an exact ".git" substring.
+	if err := os.Symlink("safe/../.GiT/config", filepath.Join(sandbox, "metadata-link")); err != nil {
 		t.Fatal(err)
 	}
 	_, err := BuildChangeSet(context.Background(), sandbox, base)

@@ -2,7 +2,7 @@
 
 Gitmoot names where a job's runtime subprocess executes through the
 **execution backend** seam (`internal/execbackend`, issue #1535 contract,
-#1536). The seam is deliberately distinct from Landlock **local confinement**
+#1536, #1537). The seam is deliberately distinct from Landlock **local confinement**
 (`internal/sandbox`, the `sandbox` CLI, agent path grants), which restricts
 what a locally-running subprocess may touch and is unaffected by backend
 selection.
@@ -12,13 +12,26 @@ selection.
 backend = "local"
 ```
 
-`local` is the default and the only implemented backend. It is a
-byte-for-byte passthrough: the runner composes in exactly the historical
-order (credential gateway when configured, the Landlock produce wrapper for
-claude/kimi produce jobs with path grants, `subprocess.GroupRunner{}`
-innermost), and a config file with no `[remote_exec]` section behaves
-identically. Gitmoot reads this section when it dispatches a job; it is not
-cached and needs no SIGHUP wiring.
+`local` is the default and the only implemented backend. For an engine-driven
+daemon job, Gitmoot provisions one job-scoped instance, syncs the selected host
+checkout into a distinct detached Git worktree, streams runtime commands there,
+collects changes, and destroys the instance after the job. The same instance
+survives Mailbox repair deliveries. An implement job's changes return through
+the bounded transactional `BuildChangeSet` / `ImportChangeSet` transport before
+result observation; host Git commands and the finalizer still run against the
+host worktree, and backend-created commits are refused.
+
+The local worktree's `.git` file points at an absolute gitdir in the source
+repository. That pointer resolves on the same filesystem, so `local` needs no
+bundle/base-ref hydration; hydration remains a remote-provider concern. Cancel
+kills active command groups and destroys the instance. A restarted daemon reaps
+instances whose recorded owner process is gone. A partially-created non-empty
+directory that Git never registered remains the known orphaned-but-present
+cleanup limitation tracked in #1572.
+
+Gitmoot reads `[remote_exec]` when it dispatches a job; it is not cached and
+needs no SIGHUP wiring. Foreground dispatch retains the host runner path because
+the lifecycle is acquired at the daemon job-worker boundary.
 
 A job payload's `exec_backend` field overrides the config value for that one
 job. When either selector is explicitly present its value must be non-blank;

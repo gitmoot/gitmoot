@@ -101,7 +101,7 @@ func execBackendDispatchAsk(t *testing.T, home string) string {
 
 func execBackendRunOneTick(t *testing.T, home string, store *db.Store) {
 	t.Helper()
-	worker := defaultJobWorker(store, io.Discard, home)
+	worker := executionBackendJobWorker(store, io.Discard, home)
 	if err := runEnabledRepoWorkerTicksTracked(context.Background(), store, worker, 1, "", io.Discard, time.Now().UTC(), nil, nil); err != nil {
 		t.Fatalf("worker tick: %v", err)
 	}
