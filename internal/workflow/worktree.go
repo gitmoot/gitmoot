@@ -1076,17 +1076,29 @@ func (e Engine) lastCleanupOutcomeIsSkip(ctx context.Context, jobID string) bool
 // is NOT covered (that residual is shared with the implement path and unchanged by
 // #739).
 func (e Engine) ReclaimTerminalDelegationWorktree(ctx context.Context, jobID string) error {
+	_, err := e.ReclaimTerminalDelegationWorktreeOutcome(ctx, jobID)
+	return err
+}
+
+// ReclaimTerminalDelegationWorktreeOutcome is the reporting form used by the
+// daemon reclaim pass. reclaimed is true only when this call performed cleanup;
+// a liveness gate or already-clean candidate reports false without an error.
+func (e Engine) ReclaimTerminalDelegationWorktreeOutcome(ctx context.Context, jobID string) (reclaimed bool, err error) {
 	if err := e.validate(); err != nil {
-		return err
+		return false, err
 	}
 	job, payload, err := e.jobPayload(ctx, jobID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	e.cleanupImplementDelegationWorktree(ctx, jobID, job.Type, payload)
 	e.cleanupReadOnlyDelegationWorktree(ctx, jobID, job.Type, payload)
 	e.cleanupFixWorktree(ctx, jobID, job.Type, payload)
-	return nil
+	outcome, err := e.Store.LatestDelegationWorktreeCleanupOutcome(context.WithoutCancel(ctx), jobID)
+	if err != nil {
+		return false, err
+	}
+	return outcome == "delegation_worktree_removed", nil
 }
 
 // ReclaimAgedTerminalDelegationWorktree force-removes a delegation/read-only/fix
@@ -1096,34 +1108,42 @@ func (e Engine) ReclaimTerminalDelegationWorktree(ctx context.Context, jobID str
 // runtime-owner preservation after the 72h default grace period. Blocked jobs
 // are resumable (not final), so they can never pass this gate.
 func (e Engine) ReclaimAgedTerminalDelegationWorktree(ctx context.Context, jobID string, cutoff time.Time) error {
+	_, err := e.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, cutoff)
+	return err
+}
+
+// ReclaimAgedTerminalDelegationWorktreeOutcome is the reporting form used by
+// the daemon reclaim pass. reclaimed is false for every revalidation no-op and
+// true only after the path cleanup and reclaim event complete.
+func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context, jobID string, cutoff time.Time) (reclaimed bool, err error) {
 	if err := e.validate(); err != nil {
-		return err
+		return false, err
 	}
 	job, payload, err := e.jobPayload(ctx, jobID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !IsFinalJobState(job.State) {
-		return fmt.Errorf("refusing TTL worktree reclaim for non-final job %s in state %s", jobID, job.State)
+		return false, fmt.Errorf("refusing TTL worktree reclaim for non-final job %s in state %s", jobID, job.State)
 	}
 	terminalAt, ok := parseStoredJobTime(job.UpdatedAt)
 	if !ok {
 		terminalAt, ok = parseStoredJobTime(job.CreatedAt)
 	}
 	if !ok || terminalAt.After(cutoff.UTC()) {
-		return nil
+		return false, nil
 	}
 	readOnly := isReadOnlyDelegationWorktree(job.Type, payload)
 	implement := isImplementDelegationWorktree(job.Type, payload)
 	fix := isFixWorktree(job.Type, payload)
 	if !readOnly && !implement && !fix {
-		return nil
+		return false, nil
 	}
 	// A deterministic path can appear in more than one historical row. Never let
 	// an aged row reclaim it out from under a newer or resumable owner.
 	jobs, err := e.Store.ListJobs(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	for _, other := range jobs {
 		if other.ID == job.ID {
@@ -1134,39 +1154,40 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktree(ctx context.Context, jobID
 			continue
 		}
 		if !IsFinalJobState(other.State) {
-			return nil
+			return false, nil
 		}
 		otherAt, ok := parseStoredJobTime(other.UpdatedAt)
 		if !ok {
 			otherAt, ok = parseStoredJobTime(other.CreatedAt)
 		}
 		if !ok || otherAt.After(cutoff.UTC()) {
-			return nil
+			return false, nil
 		}
 	}
 	path := strings.TrimSpace(payload.WorktreePath)
 	if fix {
 		expected, err := FixWorktreePath(e.Home, payload.Repo, jobID)
 		if err != nil || filepath.Clean(path) != filepath.Clean(expected) {
-			return fmt.Errorf("refusing TTL reclaim for unmanaged fix worktree %s", path)
+			return false, fmt.Errorf("refusing TTL reclaim for unmanaged fix worktree %s", path)
 		}
 		if err := os.RemoveAll(path); err != nil {
-			return fmt.Errorf("remove aged terminal fix worktree %s: %w", path, err)
+			return false, fmt.Errorf("remove aged terminal fix worktree %s: %w", path, err)
 		}
-		return e.Store.AddJobEvent(context.WithoutCancel(ctx), db.JobEvent{
+		err = e.Store.AddJobEvent(context.WithoutCancel(ctx), db.JobEvent{
 			JobID: jobID, Kind: "delegation_worktree_reclaimed_ttl",
 			Message: fmt.Sprintf("aged terminal fix worktree %s removed after TTL", path),
 		})
+		return err == nil, err
 	}
 	manager, ok := e.DelegationWorktrees.(ReadOnlyWorktreeManager)
 	if !ok || manager == nil {
-		return errors.New("delegation worktree manager cannot force-remove worktrees")
+		return false, errors.New("delegation worktree manager cannot force-remove worktrees")
 	}
 
 	opCtx := context.WithoutCancel(ctx)
 	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(opCtx, e.Store, e.DelegationCheckout, "worktree-ttl-reclaim:"+jobID, time.Now().UTC())
 	if err != nil {
-		return fmt.Errorf("lock checkout for TTL worktree reclaim: %w", err)
+		return false, fmt.Errorf("lock checkout for TTL worktree reclaim: %w", err)
 	}
 	defer func() {
 		if releaseCheckoutLock != nil {
@@ -1176,42 +1197,43 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktree(ctx context.Context, jobID
 
 	if _, statErr := os.Stat(path); statErr == nil {
 		if err := manager.RemoveWorktreeForce(opCtx, path); err != nil {
-			return fmt.Errorf("force-remove aged terminal worktree %s: %w", path, err)
+			return false, fmt.Errorf("force-remove aged terminal worktree %s: %w", path, err)
 		}
 	} else if !os.IsNotExist(statErr) {
-		return fmt.Errorf("inspect aged terminal worktree %s: %w", path, statErr)
+		return false, fmt.Errorf("inspect aged terminal worktree %s: %w", path, statErr)
 	}
 
 	branch := strings.TrimSpace(payload.Branch)
 	if implement {
 		if _, err := releaseDelegationBranchLock(opCtx, e.Store, job.Type, payload); err != nil {
-			return fmt.Errorf("release delegation branch lock %s: %w", branch, err)
+			return false, fmt.Errorf("release delegation branch lock %s: %w", branch, err)
 		}
 		if deleter, ok := e.DelegationWorktrees.(BranchDeleter); ok && deleter != nil {
 			shouldDelete := true
 			if checker, ok := e.DelegationWorktrees.(BranchExistenceChecker); ok && checker != nil {
 				exists, err := checker.BranchExists(opCtx, branch)
 				if err != nil {
-					return fmt.Errorf("inspect delegation branch %s: %w", branch, err)
+					return false, fmt.Errorf("inspect delegation branch %s: %w", branch, err)
 				}
 				shouldDelete = exists
 			}
 			if shouldDelete {
 				if err := deleter.DeleteBranch(opCtx, branch); err != nil {
-					return fmt.Errorf("force-delete aged terminal branch %s: %w", branch, err)
+					return false, fmt.Errorf("force-delete aged terminal branch %s: %w", branch, err)
 				}
 			}
 		}
 	}
 	if pruner, ok := e.DelegationWorktrees.(WorktreePruner); ok && pruner != nil {
 		if err := pruner.PruneWorktrees(opCtx); err != nil {
-			return fmt.Errorf("prune worktree metadata after TTL reclaim: %w", err)
+			return false, fmt.Errorf("prune worktree metadata after TTL reclaim: %w", err)
 		}
 	}
-	return e.Store.AddJobEvent(opCtx, db.JobEvent{
+	err = e.Store.AddJobEvent(opCtx, db.JobEvent{
 		JobID: jobID, Kind: "delegation_worktree_reclaimed_ttl",
 		Message: fmt.Sprintf("aged terminal delegation worktree %s force-removed after TTL", path),
 	})
+	return err == nil, err
 }
 
 func parseStoredJobTime(value string) (time.Time, bool) {
