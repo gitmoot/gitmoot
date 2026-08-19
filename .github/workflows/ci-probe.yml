@@ -1,0 +1,17 @@
+name: CI Probe
+
+# TEMPORARY DIAGNOSTIC (GITMOOT-COC, 2026-08-19). gitmoot/gitmoot has created ZERO
+# workflow runs since 15:16:31Z. The existing CI workflow (id 297258664) has a run
+# queued since 05:38:06Z whose cancel returns HTTP 500 and whose rerun returns HTTP
+# 403 "already running" — i.e. GitHub believes that workflow is occupied. This file
+# exists to discriminate: a NEW workflow id either dispatches (=> the corruption is
+# per-workflow, and recreating ci.yml under a new path is a real workaround) or does
+# not (=> repo-level, support is the only remedy). DELETE once answered.
+on:
+  pull_request:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "dispatch reached a runner at $(date -u +%FT%TZ)"
