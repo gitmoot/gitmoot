@@ -257,7 +257,14 @@ func TestReconcileReviewingPullRequestAdvancesAmongLargeNonReviewPayload(t *test
 
 	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{Ready: true}}
 	engine := workflow.Engine{Store: store, MergeGate: gate}
-	d := Daemon{Repo: repo, Store: store, Workflow: &engine}
+	resolvedJobID := ""
+	d := Daemon{
+		Repo: repo, Store: store, Workflow: &engine,
+		WorkflowForJob: func(_ context.Context, job db.Job) (*workflow.Engine, error) {
+			resolvedJobID = job.ID
+			return &engine, nil
+		},
+	}
 
 	if err := d.reconcileReviewingPullRequest(ctx, reviewPull("abc123"), nil); err != nil {
 		t.Fatalf("reconcileReviewingPullRequest returned error: %v", err)
@@ -268,6 +275,9 @@ func TestReconcileReviewingPullRequestAdvancesAmongLargeNonReviewPayload(t *test
 	}
 	if task.State != string(workflow.TaskReadyToMerge) {
 		t.Fatalf("task state = %q, want ready_to_merge (review advanced despite large non-review payload)", task.State)
+	}
+	if resolvedJobID != "review-audit-task-007-review-1" {
+		t.Fatalf("workflow resolved for job %q, want completed review job", resolvedJobID)
 	}
 	if len(gate.requests) != 1 || gate.requests[0].HeadSHA != "abc123" {
 		t.Fatalf("merge gate requests = %+v, want one for head abc123", gate.requests)

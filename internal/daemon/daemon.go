@@ -44,7 +44,11 @@ type Daemon struct {
 	Store        *db.Store
 	GitHub       github.Client
 	Workflow     *workflow.Engine
-	Sleep        func(context.Context, time.Duration) error
+	// WorkflowForJob optionally resolves the workflow engine used to advance a
+	// completed job. Supervisors use it to bind job-associated subprocess seams
+	// to the backend stored on that job; nil preserves the static Workflow.
+	WorkflowForJob func(context.Context, db.Job) (*workflow.Engine, error)
+	Sleep          func(context.Context, time.Duration) error
 	// Now is an injectable clock (test seam). It defaults to time.Now and is used
 	// to seed/advance the #566 issue-comment `since` cursor deterministically.
 	Now func() time.Time
@@ -1130,7 +1134,17 @@ func (d Daemon) reconcileReviewingPullRequest(ctx context.Context, pull github.P
 		if payload.Result == nil {
 			continue
 		}
-		if err := d.Workflow.AdvanceJob(ctx, job.ID); err != nil {
+		engine := d.Workflow
+		if d.WorkflowForJob != nil {
+			engine, err = d.WorkflowForJob(ctx, job)
+			if err != nil {
+				return fmt.Errorf("resolve workflow for job %q: %w", job.ID, err)
+			}
+			if engine == nil {
+				return fmt.Errorf("resolve workflow for job %q: workflow is nil", job.ID)
+			}
+		}
+		if err := engine.AdvanceJob(ctx, job.ID); err != nil {
 			var blocked workflow.BlockedError
 			if errors.As(err, &blocked) {
 				return nil

@@ -953,11 +953,12 @@ type registeredRepoPoller struct {
 	// PollOnce may mutate the shared checkout, which used to be excluded by the
 	// per-repo lock being held for entire job runs. nil (legacy/test callers)
 	// behaves as always-idle.
-	Inflight          *inflightJobTracker
-	IdleGraceTicks    int
-	IdleMaxMultiplier int
-	GitHubClient      func(checkout string) github.Client
-	WorkflowFactory   func(store *db.Store, gh github.Client, checkout string) *workflow.Engine
+	Inflight           *inflightJobTracker
+	IdleGraceTicks     int
+	IdleMaxMultiplier  int
+	GitHubClient       func(checkout string) github.Client
+	WorkflowFactory    func(store *db.Store, gh github.Client, checkout string) *workflow.Engine
+	JobWorkflowFactory func(context.Context, *db.Store, github.Client, string, db.Job) (*workflow.Engine, error)
 }
 
 // defaultRegisteredRepoPoller wires the registered-repo supervisor's per-tick
@@ -976,6 +977,20 @@ type registeredRepoPoller struct {
 // no-op: resolveEscalationTTL("") returns the default and daemonWorkflowEngine("")
 // leaves ArtifactRoot/Home/EventSink unset.
 func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdout io.Writer, rawHome, resolvedRoot string) registeredRepoPoller {
+	configureWorkflow := func(engine workflow.Engine, store *db.Store) *workflow.Engine {
+		// Apply only the escalate_human notifier handle from policy (#340),
+		// keeping the budget/inlining knobs out of this path so its existing
+		// behavior is unchanged. The notifier itself is already wired by
+		// daemonWorkflowEngine; this just sets the configured @-handle.
+		// orchestratePolicy reads via jobWorker.ConfigHome, which is ALWAYS the
+		// RAW --home (#459) so it never re-resolves into a phantom doubled home.
+		if notifier, ok := engine.EscalationNotifier.(*daemonEscalationNotifier); ok && notifier != nil {
+			if policy, err := defaultJobWorker(store, stdout, rawHome).orchestratePolicy(); err == nil {
+				notifier.Handle = policy.EscalationHandle
+			}
+		}
+		return &engine
+	}
 	return registeredRepoPoller{
 		Store:                   store,
 		Workers:                 workers,
@@ -989,19 +1004,14 @@ func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdo
 		IdleMaxMultiplier:       config.DefaultDaemonIdleMaxMultiplier,
 		GitHubClient:            func(checkout string) github.Client { return github.NewClient(checkout) },
 		WorkflowFactory: func(store *db.Store, gh github.Client, checkout string) *workflow.Engine {
-			engine := daemonWorkflowEngine(store, gh, checkout, resolvedRoot)
-			// Apply only the escalate_human notifier handle from policy (#340),
-			// keeping the budget/inlining knobs out of this path so its existing
-			// behavior is unchanged. The notifier itself is already wired by
-			// daemonWorkflowEngine; this just sets the configured @-handle.
-			// orchestratePolicy reads via jobWorker.ConfigHome, which is ALWAYS the
-			// RAW --home (#459) so it never re-resolves into a phantom doubled home.
-			if notifier, ok := engine.EscalationNotifier.(*daemonEscalationNotifier); ok && notifier != nil {
-				if policy, err := defaultJobWorker(store, stdout, rawHome).orchestratePolicy(); err == nil {
-					notifier.Handle = policy.EscalationHandle
-				}
+			return configureWorkflow(daemonWorkflowEngine(store, gh, checkout, resolvedRoot), store)
+		},
+		JobWorkflowFactory: func(_ context.Context, store *db.Store, gh github.Client, checkout string, job db.Job) (*workflow.Engine, error) {
+			runner, err := defaultJobWorker(store, stdout, rawHome).subprocessRunnerForJob(job)
+			if err != nil {
+				return nil, err
 			}
-			return &engine
+			return configureWorkflow(daemonWorkflowEngineForRunner(store, gh, checkout, resolvedRoot, runner), store), nil
 		},
 	}
 }
@@ -1221,10 +1231,16 @@ func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, 
 		recoveryOnly = true
 	}
 	d := daemon.Daemon{
-		Repo:                    repo,
-		Store:                   store,
-		GitHub:                  gh,
-		Workflow:                engine,
+		Repo:     repo,
+		Store:    store,
+		GitHub:   gh,
+		Workflow: engine,
+		WorkflowForJob: func(ctx context.Context, job db.Job) (*workflow.Engine, error) {
+			if p.JobWorkflowFactory == nil {
+				return engine, nil
+			}
+			return p.JobWorkflowFactory(ctx, store, gh, repoRecord.CheckoutPath, job)
+		},
 		WatchIssues:             p.WatchIssues,
 		EscalationTTL:           p.EscalationTTL,
 		RevertDetectionEnabled:  p.RevertDetectionEnabled,

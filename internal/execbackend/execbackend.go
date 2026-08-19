@@ -19,20 +19,10 @@
 // GitHub CLI, verifier, and read-only-diff subprocesses consume the resolved
 // runner through Consume and fail closed when the backend has no execution
 // implementation. Operator tooling and daemon supervision/session paths
-// deliberately retain host-side runners.
-//
-// ONE KNOWN EXCEPTION, tracked by #1560: the supervisor provisions a job's
-// worktrees on the HOST even though it executes no agent runtime.
-// daemon_supervision.go's WorkflowFactory builds the engine via the
-// ExecRunner{} variant of daemonWorkflowEngine, which binds
-// engine.DelegationWorktrees and engine.FixWorktreeAllocator to that host
-// runner (daemon_workflow.go:174-176); AdvanceJob (daemon/daemon.go:1133) then
-// reaches AllocateIntegrationWorktree (engine_delegation.go:733) for returned
-// delegations. So "supervision" is not a safe proxy for "not job-associated":
-// this path is supervision AND performs job-associated checkout provisioning.
-// Gating it before P2 lands a second backend is #1560. Note the current guard,
-// TestJobSubprocessProductionRoutesDoNotCallHostWrappers, does NOT detect this
-// route.
+// deliberately retain host-side runners. When supervision advances a completed
+// job, it resolves that job's stored backend and rebuilds the workflow engine
+// through the same Consume-backed runner seam before any delegation worktree or
+// other job-associated subprocess can execute.
 package execbackend
 
 import (

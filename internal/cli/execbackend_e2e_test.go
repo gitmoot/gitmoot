@@ -479,6 +479,75 @@ func TestP2GapEveryJobSubprocessRouteRefusesLocalFallback(t *testing.T) {
 	}
 }
 
+func TestP2GapSupervisorAdvanceResolvesJobSubprocessRunner(t *testing.T) {
+	home, paths, store := heartbeatLoopE2EHome(t)
+	poller := defaultRegisteredRepoPoller(store, 1, false, io.Discard, home, paths.Home)
+	checkout := t.TempDir()
+	repoRecord := db.Repo{Owner: "owner", Name: "repo", CheckoutPath: checkout, PollInterval: "30s"}
+	if err := store.UpsertRepo(context.Background(), repoRecord); err != nil {
+		t.Fatalf("upsert repo: %v", err)
+	}
+	if err := store.UpsertTask(context.Background(), db.Task{
+		ID: "task-p2-supervisor", RepoFullName: repoRecord.FullName(), GoalID: "goal-p2",
+		Title: "P2 supervisor", State: string(workflow.TaskReviewing), Branch: "task-p2",
+	}); err != nil {
+		t.Fatalf("upsert task: %v", err)
+	}
+	if err := store.UpsertPullRequest(context.Background(), db.PullRequest{
+		RepoFullName: repoRecord.FullName(), Number: 7, HeadBranch: "task-p2",
+		BaseBranch: "main", HeadSHA: "p2-head", State: "open",
+	}); err != nil {
+		t.Fatalf("upsert pull request: %v", err)
+	}
+	payload := workflow.JobPayload{
+		Repo: repoRecord.FullName(), Branch: "task-p2", PullRequest: 7,
+		HeadSHA: "p2-head", TaskID: "task-p2-supervisor", ExecBackend: "p2-probe",
+		LeadAgent: "lead", ReviewRound: "round-p2", Reviewers: []string{"audit"},
+		Result: &workflow.AgentResult{Decision: "approved", Summary: "probe"},
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	job := db.Job{
+		ID:      "p2-supervisor-advance",
+		Type:    "review",
+		State:   string(workflow.JobSucceeded),
+		Payload: string(encoded),
+	}
+	if err := store.CreateJobWithEvent(context.Background(), job, db.JobEvent{
+		JobID: job.ID, Kind: string(workflow.JobSucceeded), Message: "probe",
+	}); err != nil {
+		t.Fatalf("create review job: %v", err)
+	}
+	poller.GitHubClient = func(string) github.Client {
+		return &cliPollFakeGitHub{pulls: []github.PullRequest{{
+			Number: 7, Title: "P2 supervisor", State: "open", HeadRef: "task-p2", BaseRef: "main", HeadSHA: "p2-head",
+		}}}
+	}
+
+	previousResolver := daemonJobExecBackendFor
+	var resolvedName string
+	var resolvedPresent bool
+	daemonJobExecBackendFor = func(_ jobWorker, name string, present bool) (execbackend.Backend, error) {
+		resolvedName = name
+		resolvedPresent = present
+		return execbackend.Backend("p2-probe"), nil
+	}
+	t.Cleanup(func() { daemonJobExecBackendFor = previousResolver })
+
+	result, err := poller.pollRepo(context.Background(), repoRecord, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("poll repo persistence error: %v", err)
+	}
+	if !strings.Contains(result.LastError, "p2-probe") {
+		t.Fatalf("supervisor job workflow error = %q, want fail-closed p2-probe refusal", result.LastError)
+	}
+	if resolvedName != "p2-probe" || !resolvedPresent {
+		t.Fatalf("supervisor resolved name=%q present=%v, want stored p2-probe override", resolvedName, resolvedPresent)
+	}
+}
+
 // TestJobCheckoutRouteConsumesResolvedSubprocessRunner pins the production
 // checkoutForJob call site. Replacing defaultCheckoutForRunner with the
 // host-only defaultCheckout wrapper compiles, but ignores this resolved runner
