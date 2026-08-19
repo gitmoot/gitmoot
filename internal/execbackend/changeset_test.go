@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +13,38 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestChangeSetJSONTransportPreservesFilenameBytes(t *testing.T) {
+	host, sandbox, base := changeSetRepoPair(t)
+	name := "invalid-\xff-name.txt"
+	writeChangeSetFile(t, sandbox, name, "byte-exact content\n", 0o644)
+
+	changes, err := BuildChangeSet(context.Background(), sandbox, base)
+	if err != nil {
+		t.Fatalf("BuildChangeSet: %v", err)
+	}
+	wire, err := json.Marshal(changes)
+	if err != nil {
+		t.Fatalf("marshal ChangeSet: %v", err)
+	}
+	var transported ChangeSet
+	if err := json.Unmarshal(wire, &transported); err != nil {
+		t.Fatalf("unmarshal ChangeSet: %v", err)
+	}
+	if len(transported.Manifest) != 1 || transported.Manifest[0].Path != name {
+		t.Fatalf("transported manifest = %+v, want byte-exact path %q", transported.Manifest, name)
+	}
+	if err := ImportChangeSet(context.Background(), host, transported); err != nil {
+		t.Fatalf("ImportChangeSet: %v", err)
+	}
+	if got := readChangeSetFile(t, host, name); got != "byte-exact content\n" {
+		t.Fatalf("imported content = %q", got)
+	}
+	replacementName := strings.ToValidUTF8(name, "\uFFFD")
+	if _, err := os.Lstat(filepath.Join(host, replacementName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement-character path %q exists or could not be checked: %v", replacementName, err)
+	}
+}
 
 func TestChangeSetRoundTripsTrackedManifestAndIsIdempotent(t *testing.T) {
 	host, sandbox, base := changeSetRepoPair(t)

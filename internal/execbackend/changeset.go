@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -45,13 +46,54 @@ type ChangeSet struct {
 }
 
 type ChangeManifestEntry struct {
-	Path    string     `json:"path"`
+	// Path carries raw Git filename bytes in a Go string. Its JSON codec uses
+	// []byte encoding so non-UTF-8 Unix filenames survive transport unchanged.
+	Path    string     `json:"-"`
 	Kind    ChangeKind `json:"kind"`
 	Tracked bool       `json:"tracked"`
 	Mode    uint32     `json:"mode,omitempty"`
 	Size    int64      `json:"size,omitempty"`
 	SHA256  string     `json:"sha256,omitempty"`
 	Content []byte     `json:"content,omitempty"`
+}
+
+type changeManifestEntryJSON struct {
+	Path    []byte     `json:"path"`
+	Kind    ChangeKind `json:"kind"`
+	Tracked bool       `json:"tracked"`
+	Mode    uint32     `json:"mode,omitempty"`
+	Size    int64      `json:"size,omitempty"`
+	SHA256  string     `json:"sha256,omitempty"`
+	Content []byte     `json:"content,omitempty"`
+}
+
+func (entry ChangeManifestEntry) MarshalJSON() ([]byte, error) {
+	return json.Marshal(changeManifestEntryJSON{
+		Path:    []byte(entry.Path),
+		Kind:    entry.Kind,
+		Tracked: entry.Tracked,
+		Mode:    entry.Mode,
+		Size:    entry.Size,
+		SHA256:  entry.SHA256,
+		Content: entry.Content,
+	})
+}
+
+func (entry *ChangeManifestEntry) UnmarshalJSON(data []byte) error {
+	var wire changeManifestEntryJSON
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*entry = ChangeManifestEntry{
+		Path:    string(wire.Path),
+		Kind:    wire.Kind,
+		Tracked: wire.Tracked,
+		Mode:    wire.Mode,
+		Size:    wire.Size,
+		SHA256:  wire.SHA256,
+		Content: wire.Content,
+	}
+	return nil
 }
 
 // BuildChangeSet captures uncommitted sandbox changes. expectedBase is supplied
