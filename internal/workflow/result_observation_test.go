@@ -354,6 +354,111 @@ func TestMailboxObservationGapRecordsWithoutRefusingPersistence(t *testing.T) {
 	}
 }
 
+func TestMailboxImportsChangeSetBeforeResultObservation(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	host, sandbox, changes := observationChangeSet(t, "claimed.go", "package imported\n")
+	mailbox := Mailbox{
+		Store: store,
+		CollectChangeSet: func(context.Context, execbackend.Backend, string) (*execbackend.ChangeSet, error) {
+			return &changes, nil
+		},
+	}
+	output := `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["updated claimed.go"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
+	if _, err := mailbox.Enqueue(ctx, JobRequest{
+		ID: "changeset-before-observation", Agent: "audit", Action: "implement", Repo: "gitmoot/gitmoot", WorktreePath: host,
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := mailbox.Run(ctx, "changeset-before-observation", shellAgent(), &fakeDelivery{outputs: []string{output}}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	job, err := store.GetJob(ctx, "changeset-before-observation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := unmarshalPayload(job.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload.ResultObservation == nil || fmt.Sprint(payload.ResultObservation.TouchedFiles) != "[claimed.go]" {
+		t.Fatalf("ResultObservation = %+v, want imported claimed.go; delaying import past observation must fail this test", payload.ResultObservation)
+	}
+	if got := readObservationFile(t, host, "claimed.go"); got != readObservationFile(t, sandbox, "claimed.go") {
+		t.Fatalf("host claimed.go = %q, sandbox = %q", got, readObservationFile(t, sandbox, "claimed.go"))
+	}
+}
+
+func TestMailboxMalformedRedeliveryImportsSameChangeSetIdempotently(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	host, _, changes := observationChangeSet(t, "claimed.go", "package imported\n")
+	collections := 0
+	mailbox := Mailbox{
+		Store: store,
+		CollectChangeSet: func(context.Context, execbackend.Backend, string) (*execbackend.ChangeSet, error) {
+			collections++
+			return &changes, nil
+		},
+	}
+	valid := `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["updated claimed.go"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
+	if _, err := mailbox.Enqueue(ctx, JobRequest{
+		ID: "changeset-redelivery", Agent: "audit", Action: "implement", Repo: "gitmoot/gitmoot", WorktreePath: host,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mailbox.Run(ctx, "changeset-redelivery", shellAgent(), &fakeDelivery{outputs: []string{"malformed result", valid}}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if collections != 2 {
+		t.Fatalf("ChangeSet collections = %d, want 2 across malformed-output re-delivery", collections)
+	}
+	if got := readObservationFile(t, host, "claimed.go"); got != "package imported\n" {
+		t.Fatalf("claimed.go after second import = %q", got)
+	}
+}
+
+func TestMailboxImportFailureStopsBeforeObservation(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	host, _, changes := observationChangeSet(t, "claimed.go", "package imported\n")
+	mailbox := Mailbox{
+		Store: store,
+		CollectChangeSet: func(context.Context, execbackend.Backend, string) (*execbackend.ChangeSet, error) {
+			return &changes, nil
+		},
+		ApplyChangeSet: func(context.Context, string, execbackend.ChangeSet) error {
+			return errors.New("deliberate mid-materialize interruption")
+		},
+	}
+	output := `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["updated claimed.go"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
+	if _, err := mailbox.Enqueue(ctx, JobRequest{
+		ID: "changeset-interrupted", Agent: "audit", Action: "implement", Repo: "gitmoot/gitmoot", WorktreePath: host,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mailbox.Run(ctx, "changeset-interrupted", shellAgent(), &fakeDelivery{outputs: []string{output}}); err == nil || !strings.Contains(err.Error(), "mid-materialize") {
+		t.Fatalf("Run error = %v, want import interruption", err)
+	}
+	job, err := store.GetJob(ctx, "changeset-interrupted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := unmarshalPayload(job.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload.ResultObservation != nil {
+		t.Fatalf("observation ran after failed import: %+v", payload.ResultObservation)
+	}
+	if job.State != string(JobFailed) {
+		t.Fatalf("job state = %q, want failed", job.State)
+	}
+	if got := readObservationFile(t, host, "claimed.go"); got != "package original\n" {
+		t.Fatalf("host changed despite refused mailbox import: %q", got)
+	}
+}
+
 func resultCheckByID(checks []ResultCheck, id string) (ResultCheck, bool) {
 	for _, check := range checks {
 		if check.ID == id {
@@ -388,11 +493,40 @@ func writeObservationFile(t *testing.T, repo, name, content string) {
 	}
 }
 
-func runObservationGit(t *testing.T, repo string, args ...string) {
+func readObservationFile(t *testing.T, repo, name string) string {
+	t.Helper()
+	content, err := os.ReadFile(filepath.Join(repo, name))
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", name, err)
+	}
+	return string(content)
+}
+
+func observationChangeSet(t *testing.T, name, content string) (host, sandbox string, changes execbackend.ChangeSet) {
+	t.Helper()
+	host = observationTestRepo(t)
+	base := strings.TrimSpace(runObservationGit(t, host, "rev-parse", "HEAD"))
+	sandbox = filepath.Join(t.TempDir(), "sandbox")
+	cmd := exec.Command("git", "clone", "--no-hardlinks", host, sandbox)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git clone: %v: %s", err, output)
+	}
+	writeObservationFile(t, sandbox, name, content)
+	var err error
+	changes, err = execbackend.BuildChangeSet(context.Background(), sandbox, base)
+	if err != nil {
+		t.Fatalf("BuildChangeSet: %v", err)
+	}
+	return host, sandbox, changes
+}
+
+func runObservationGit(t *testing.T, repo string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = repo
-	if output, err := cmd.CombinedOutput(); err != nil {
+	output, err := cmd.CombinedOutput()
+	if err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, output)
 	}
+	return string(output)
 }
