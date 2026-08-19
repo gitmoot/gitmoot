@@ -33,6 +33,16 @@ const maxRepairAttempts = 2
 
 type Mailbox struct {
 	Store *db.Store
+	// CollectChangeSet is the P2a host-import seam. A non-local backend wires a
+	// collector here once it owns an instance lifecycle (P2b); nil preserves the
+	// local backend byte-for-byte. It is consulted once after the delivery sequence
+	// produces a valid result, so repair turns may keep advancing the cumulative
+	// sandbox state without exposing an intermediate materialization on the host.
+	CollectChangeSet func(ctx context.Context, backend execbackend.Backend, jobID string) (*execbackend.ChangeSet, error)
+	// ApplyChangeSet is the host materializer paired with CollectChangeSet. Nil
+	// selects execbackend.ImportChangeSet; the field exists so ordering/failure
+	// tests can put a firing barrier exactly at this mailbox seam.
+	ApplyChangeSet func(ctx context.Context, worktree string, changes execbackend.ChangeSet) error
 	// RequireWorkflowPolicy resolves the current policy for a repository at the
 	// enqueue chokepoint. Nil deliberately means feature disabled so existing
 	// direct Mailbox users remain byte-identical.
@@ -1278,6 +1288,9 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 			return AgentResult{}, parseErr
 		}
 	}
+	if err := m.importDeliveryChangeSet(ctx, job, payload, execBackend); err != nil {
+		return AgentResult{}, err
+	}
 
 	// A produce stage may declare a trusted deterministic check. Run it only after
 	// a valid envelope and before terminal persistence. Failures re-deliver to the
@@ -1436,6 +1449,27 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	// write can never turn a successfully-finished job into a failure.
 	m.recordRoutingTelemetry(ctx, job, agent, payload, result, state, time.Since(runStart))
 	return result, nil
+}
+
+func (m Mailbox) importDeliveryChangeSet(ctx context.Context, job db.Job, payload JobPayload, backend execbackend.Backend) error {
+	if !strings.EqualFold(strings.TrimSpace(job.Type), "implement") || m.CollectChangeSet == nil {
+		return nil
+	}
+	changes, err := m.CollectChangeSet(ctx, backend, job.ID)
+	if err == nil && changes != nil {
+		apply := m.ApplyChangeSet
+		if apply == nil {
+			apply = execbackend.ImportChangeSet
+		}
+		err = apply(ctx, payload.WorktreePath, *changes)
+	}
+	if err == nil {
+		return nil
+	}
+	message := fmt.Sprintf("transactional changeset import failed: %v", err)
+	_ = m.addEvent(ctx, job.ID, "changeset_import_failed", message)
+	_ = m.fail(ctx, job.ID, message)
+	return errors.New(message)
 }
 
 const maxProduceCheckOutputBytes = 8 * 1024
