@@ -103,7 +103,6 @@ type localInstanceMetadata struct {
 	OwnerPID            int    `json:"owner_pid"`
 	OwnerBootID         string `json:"owner_boot_id,omitempty"`
 	OwnerStartTime      string `json:"owner_start_time,omitempty"`
-	Workspace           string `json:"workspace"`
 	BaseHEAD            string `json:"base_head,omitempty"`
 	State               string `json:"state"`
 }
@@ -302,7 +301,7 @@ func (b *LocalBackend) Cancel(ctx context.Context, instance *Instance) error {
 	return b.Destroy(ctx, instance)
 }
 
-func (b *LocalBackend) Destroy(ctx context.Context, instance *Instance) error {
+func (b *LocalBackend) Destroy(_ context.Context, instance *Instance) error {
 	if instance == nil {
 		return nil
 	}
@@ -310,27 +309,7 @@ func (b *LocalBackend) Destroy(ctx context.Context, instance *Instance) error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(instanceRoot); errors.Is(err, os.ErrNotExist) {
-		return nil
-	} else if err != nil {
-		return fmt.Errorf("inspect local execution instance %q: %w", instance.ID, err)
-	}
-	meta, metaErr := readLocalMetadata(instanceRoot)
-	if metaErr == nil {
-		instance = instanceFromMetadata(instanceRoot, meta)
-	}
-	_ = writeLocalMetadata(instanceRoot, metadataForInstance(instance, "destroying"))
-	if _, err := os.Lstat(instance.Workspace); err == nil {
-		if err := os.RemoveAll(instance.Workspace); err != nil {
-			return fmt.Errorf("remove local execution workspace %q: %w", instance.Workspace, err)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect local execution workspace %q: %w", instance.Workspace, err)
-	}
-	if err := os.Remove(filepath.Join(instanceRoot, localMetadataName)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove local execution metadata %q: %w", instance.ID, err)
-	}
-	if err := os.Remove(instanceRoot); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := os.RemoveAll(instanceRoot); err != nil {
 		return fmt.Errorf("remove local execution instance %q: %w", instance.ID, err)
 	}
 	return nil
@@ -360,12 +339,12 @@ func (b *LocalBackend) Reap(ctx context.Context) ([]string, error) {
 		if localOwnerAlive(meta.OwnerPID, meta.OwnerBootID, meta.OwnerStartTime) {
 			continue
 		}
-		instance := instanceFromMetadata(root, meta)
-		if err := b.Destroy(ctx, instance); err != nil {
-			reapErrs = append(reapErrs, fmt.Errorf("reap local execution instance %q: %w", meta.ID, err))
+		id := entry.Name()
+		if err := b.Destroy(ctx, &Instance{ID: id}); err != nil {
+			reapErrs = append(reapErrs, fmt.Errorf("reap local execution instance %q: %w", id, err))
 			continue
 		}
-		reaped = append(reaped, meta.ID)
+		reaped = append(reaped, id)
 	}
 	return reaped, errors.Join(reapErrs...)
 }
@@ -472,7 +451,6 @@ func metadataForInstance(instance *Instance, state string) localInstanceMetadata
 		OwnerPID:            os.Getpid(),
 		OwnerBootID:         localBootID(),
 		OwnerStartTime:      localProcessStartTime(os.Getpid()),
-		Workspace:           instance.Workspace,
 		BaseHEAD:            instance.BaseHEAD,
 		State:               state,
 	}
@@ -483,7 +461,7 @@ func instanceFromMetadata(root string, meta localInstanceMetadata) *Instance {
 		ID:                  meta.ID,
 		JobID:               meta.JobID,
 		LifecycleGeneration: meta.LifecycleGeneration,
-		Workspace:           meta.Workspace,
+		Workspace:           filepath.Join(root, localWorkspaceName),
 		BaseHEAD:            meta.BaseHEAD,
 		root:                root,
 	}

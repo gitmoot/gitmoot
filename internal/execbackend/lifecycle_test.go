@@ -2,6 +2,7 @@ package execbackend
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -158,6 +159,73 @@ func TestLocalBackendCancelDestroysInstance(t *testing.T) {
 	}
 }
 
+func TestLocalBackendDestroyIgnoresTamperedMetadataPaths(t *testing.T) {
+	backend := newTestLocalBackend(t)
+	instance, err := backend.Provision(context.Background(), JobScope{JobID: "tampered-destroy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside")
+	writeChangeSetFile(t, outside, "sentinel", "keep\n", 0o600)
+	tamperLocalMetadata(t, instance.root, func(meta map[string]any) {
+		meta["workspace"] = outside
+	})
+	attached, err := backend.Attach(context.Background(), instance.ID)
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	if attached.Workspace != filepath.Join(instance.root, localWorkspaceName) {
+		t.Fatalf("attached workspace = %q, want canonical instance workspace", attached.Workspace)
+	}
+
+	if err := backend.Destroy(context.Background(), attached); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(outside, "sentinel")); err != nil || string(got) != "keep\n" {
+		t.Fatalf("outside sentinel after Destroy = %q, %v", got, err)
+	}
+	if _, err := os.Stat(instance.root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("instance root still exists after Destroy: %v", err)
+	}
+}
+
+func TestLocalBackendReapIgnoresTamperedMetadataPathsAndID(t *testing.T) {
+	backend := newTestLocalBackend(t)
+	instance, err := backend.Provision(context.Background(), JobScope{JobID: "tampered-reap"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sibling, err := backend.Provision(context.Background(), JobScope{JobID: "reap-sibling"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backend.Destroy(context.Background(), sibling) })
+	outside := filepath.Join(t.TempDir(), "outside")
+	writeChangeSetFile(t, outside, "sentinel", "keep\n", 0o600)
+	tamperLocalMetadata(t, instance.root, func(meta map[string]any) {
+		meta["id"] = sibling.ID
+		meta["workspace"] = outside
+		meta["owner_pid"] = 0
+	})
+
+	reaped, err := backend.Reap(context.Background())
+	if err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if len(reaped) != 1 || reaped[0] != instance.ID {
+		t.Fatalf("reaped = %v, want [%s]", reaped, instance.ID)
+	}
+	if got, err := os.ReadFile(filepath.Join(outside, "sentinel")); err != nil || string(got) != "keep\n" {
+		t.Fatalf("outside sentinel after Reap = %q, %v", got, err)
+	}
+	if _, err := os.Stat(sibling.root); err != nil {
+		t.Fatalf("sibling instance removed through tampered metadata id: %v", err)
+	}
+	if _, err := os.Stat(instance.root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reaped instance root still exists: %v", err)
+	}
+}
+
 func TestLocalBackendReapsProcessKilledMidProvision(t *testing.T) {
 	if os.Getenv("GITMOOT_LOCAL_BACKEND_REAP_HELPER") == "1" {
 		runLocalBackendReapHelper(t)
@@ -271,6 +339,27 @@ func newTestLocalBackendAt(t *testing.T, root string) *LocalBackend {
 		t.Fatal(err)
 	}
 	return backend
+}
+
+func tamperLocalMetadata(t *testing.T, root string, mutate func(map[string]any)) {
+	t.Helper()
+	path := filepath.Join(root, localMetadataName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta map[string]any
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatal(err)
+	}
+	mutate(meta)
+	data, err = json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func waitForPath(t *testing.T, path string) {
