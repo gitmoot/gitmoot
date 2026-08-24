@@ -140,9 +140,10 @@ type Engine struct {
 	// performs the worktree-add. Both are optional: when either is unset, the
 	// dispatcher enqueues implement delegations against the shared checkout
 	// (legacy behavior) rather than allocating isolated worktrees.
-	Home                string
-	DelegationWorktrees WorktreeManager
-	DelegationCheckout  string
+	Home                   string
+	DelegationWorktrees    WorktreeManager
+	DelegationCheckout     string
+	cleanupTargetValidator func(home, jobID, jobType string, payload JobPayload) error
 	// BeforeReadOnlyWorktreeCleanup is an optional terminal hook invoked after a
 	// read-only job has settled but before its detached worktree is force-removed.
 	// It lets the CLI durably collect service-stage outputs and worktree diffs

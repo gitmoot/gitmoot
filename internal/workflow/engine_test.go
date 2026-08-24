@@ -2364,6 +2364,12 @@ func testEngine(store *db.Store) Engine {
 		// on the host running the suite. Tests exercising the lease-expiry-boundary
 		// gate (finding 1) override this explicitly.
 		WorktreeHasLiveProcess: func(string) bool { return false },
+		// Most cleanup behavior tests predate deterministic-path identity and use
+		// compact synthetic payloads. Keep those tests focused on their original
+		// axis; identity/containment tests clear this seam and exercise production.
+		cleanupTargetValidator: func(home, _, _ string, payload JobPayload) error {
+			return cleanupPathContained(filepath.Join(home, "worktrees"), payload.WorktreePath)
+		},
 	}
 }
 

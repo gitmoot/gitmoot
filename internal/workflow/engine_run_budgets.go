@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -204,7 +205,9 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	// it once the child is terminal. Deferred so it fires on every return path
 	// below (the delegation DAG early-returns for policy-handled failures and
 	// pending retries). No-op for jobs that did not allocate a read-only worktree.
-	defer e.cleanupReadOnlyDelegationWorktree(ctx, jobID, job.Type, payload)
+	defer func() {
+		retErr = errors.Join(retErr, e.cleanupReadOnlyDelegationWorktree(ctx, jobID, job.Type, payload))
+	}()
 	// A review fix owns an independent writable clone, not a linked delegation
 	// worktree. Remove only that clone after SUCCESSFUL advancement; a finalizer or
 	// store error can leave the clone holding the only committed fix, and the daemon
@@ -212,7 +215,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	// never deleted or unlocked by this cleanup.
 	defer func() {
 		if retErr == nil {
-			e.cleanupFixWorktree(ctx, jobID, job.Type, payload)
+			retErr = e.cleanupFixWorktree(ctx, jobID, job.Type, payload)
 		}
 	}()
 
@@ -221,7 +224,9 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	// do not accumulate in the shared checkout and mislead a later coordinator (#478).
 	// No-op for non-implement / non-delegation jobs and (idempotently) for already
 	// cleaned ones. Skips succeeded legs still feeding a pending integration (#332).
-	defer e.cleanupImplementDelegationWorktree(ctx, jobID, job.Type, payload)
+	defer func() {
+		retErr = errors.Join(retErr, e.cleanupImplementDelegationWorktree(ctx, jobID, job.Type, payload))
+	}()
 
 	// When an integration step (#332) that consumed implement legs via its Deps
 	// reaches a terminal state, tear down those consumed legs' worktrees+branches:
@@ -229,7 +234,9 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	// still pending/running, and nothing else ever reclaims an integration-fed leg
 	// (the merge gate cleans only the task worktree), so they would otherwise
 	// accumulate forever (#478). No-op for a job with no parent/deps.
-	defer e.cleanupConsumedImplementLegWorktrees(ctx, payload)
+	defer func() {
+		retErr = errors.Join(retErr, e.cleanupConsumedImplementLegWorktrees(ctx, payload))
+	}()
 
 	// Commit a succeeded implement leg's work to its own branch BEFORE advancing
 	// the parent's delegation DAG. The parent advance below may enqueue a dependent

@@ -34,7 +34,7 @@ func TestReclaimAgedTerminalDelegationWorktreesTTLAndStateGate(t *testing.T) {
 		seeded{id: "shared-fresh", state: workflow.JobSucceeded, age: time.Hour, path: sharedPath},
 	)
 	for _, row := range rows {
-		payload, err := json.Marshal(workflow.JobPayload{Repo: "owner/repo", DelegationID: row.id, WorktreePath: row.path})
+		payload, err := json.Marshal(workflow.JobPayload{Repo: "owner/repo", WorktreePath: row.path, ReadOnlyWorktree: true})
 		if err != nil {
 			t.Fatal(err)
 		}

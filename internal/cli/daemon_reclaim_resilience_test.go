@@ -32,7 +32,19 @@ func resetDelegationReclaimAccountingForTest(t *testing.T) {
 
 func managedReclaimTestPath(t *testing.T, home, name string) string {
 	t.Helper()
-	path := filepath.Join(home, config.DirName, "worktrees", "owner--repo", "delegations", "parent", name)
+	path := filepath.Join(home, config.DirName, "worktrees", "owner--repo", "delegations", name, "pool-isolation")
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func managedDelegationReclaimTestPath(t *testing.T, home, parentID, delegationID string) string {
+	t.Helper()
+	path, err := workflow.DelegationWorktreePath(filepath.Join(home, config.DirName), "owner/repo", parentID, delegationID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +54,7 @@ func managedReclaimTestPath(t *testing.T, home, name string) string {
 func seedReclaimResilienceCandidateForRepo(t *testing.T, store *db.Store, id string, repo string, path string, now time.Time, pendingMarker bool, badRunner bool) {
 	t.Helper()
 	payload := workflow.JobPayload{
-		Repo: repo, DelegationID: id, WorktreePath: path, ReadOnlyWorktree: true,
+		Repo: repo, WorktreePath: path, ReadOnlyWorktree: true,
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -411,6 +423,39 @@ func TestDelegationCleanupRefusesUncontainedTarget(t *testing.T) {
 	}
 }
 
+// TestDelegationCleanupAccountingFailureFailsClosed kills the mutant that logs
+// a cleanup-obligation persistence failure and reports a candidate-local skip.
+func TestDelegationCleanupAccountingFailureFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	path := managedReclaimTestPath(t, home, "accounting-failure")
+	payload := workflow.JobPayload{Repo: "other/repo", WorktreePath: path, ReadOnlyWorktree: true}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := db.Job{ID: "accounting-failure", Type: "ask", Payload: string(encoded)}
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`
+CREATE TRIGGER fail_cleanup_obligation_accounting
+BEFORE UPDATE ON cleanup_obligations
+BEGIN
+  SELECT RAISE(ABORT, 'injected cleanup accounting failure');
+END;`); err != nil {
+		t.Fatal(err)
+	}
+	worker := defaultJobWorker(store, io.Discard, home)
+	if _, _, err := prepareDelegationCleanup(ctx, worker, "aged", job, path, time.Now().UTC()); err == nil || !strings.Contains(err.Error(), "injected cleanup accounting failure") {
+		t.Fatalf("prepareDelegationCleanup error = %v, want persisted accounting failure", err)
+	}
+}
+
 type failingAgedReclaimManager struct {
 	fakeReclaimWorktreeManager
 	err error
@@ -431,12 +476,12 @@ func TestAgedWorktreeReclaimFailureDoesNotBlockDispatch(t *testing.T) {
 	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
 
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
-	worktreePath := managedReclaimTestPath(t, home, "aged-reclaim-failure")
+	worktreePath := managedReclaimTestPath(t, home, "aged-terminal")
 	seedCLIJob(t, store, db.Job{
 		ID: "aged-terminal", Agent: "reader", Type: "ask", State: string(workflow.JobFailed),
-		Repo: "owner/repo", ParentJobID: "parent", DelegationID: "aged",
+		Repo: "owner/repo",
 		Payload: mustJobPayload(t, workflow.JobPayload{
-			Repo: "owner/repo", DelegationID: "aged", WorktreePath: worktreePath,
+			Repo: "owner/repo", WorktreePath: worktreePath, ReadOnlyWorktree: true,
 		}),
 	}, "seed aged terminal delegation")
 	backdateJobUpdatedAt(t, store.DatabasePath(), "aged-terminal", now.Add(-73*time.Hour))

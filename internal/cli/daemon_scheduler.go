@@ -155,7 +155,7 @@ func logDelegationReclaimFailure(stdout io.Writer, mode string, phase string, jo
 	}
 }
 
-func recordDelegationCleanupFailure(ctx context.Context, worker jobWorker, mode, phase, jobID, path string, err error, now time.Time) db.CleanupObligation {
+func recordDelegationCleanupFailure(ctx context.Context, worker jobWorker, mode, phase, jobID, path string, err error, now time.Time) (db.CleanupObligation, error) {
 	reason := db.ClassifyCleanupObligationFailure(phase, err)
 	obligation, persistErr := worker.Store.RecordCleanupObligationFailure(
 		context.WithoutCancel(ctx), jobID, path, reason, err, now,
@@ -163,7 +163,7 @@ func recordDelegationCleanupFailure(ctx context.Context, worker jobWorker, mode,
 	)
 	if persistErr != nil {
 		logDelegationReclaimFailure(worker.Stdout, mode, phase, jobID, path, fmt.Errorf("%w (persist cleanup obligation: %v)", err, persistErr))
-		return db.CleanupObligation{}
+		return db.CleanupObligation{}, fmt.Errorf("persist cleanup obligation for %s: %w", jobID, persistErr)
 	}
 	logDelegationReclaimFailure(worker.Stdout, mode, phase, jobID, path, err)
 	if obligation.State == db.CleanupObligationQuarantined && obligation.AttemptCount == delegationCleanupRetryBudget {
@@ -174,7 +174,7 @@ func recordDelegationCleanupFailure(ctx context.Context, worker jobWorker, mode,
 				obligation.ResourceID, obligation.AttemptCount, obligation.Reason, obligation.ExpectedPath),
 		})
 	}
-	return obligation
+	return obligation, nil
 }
 
 func delegationCleanupTargetContained(worker jobWorker, job db.Job, obligation db.CleanupObligation) error {
@@ -189,31 +189,31 @@ func delegationCleanupTargetContained(worker jobWorker, job db.Job, obligation d
 	if path != filepath.Clean(obligation.ExpectedPath) {
 		return fmt.Errorf("cleanup path %q does not match obligation %q", path, obligation.ExpectedPath)
 	}
-	root := filepath.Join(worker.workflowHome(), "worktrees")
-	if strings.TrimSpace(worker.workflowHome()) == "" {
-		return errors.New("cleanup worktree root is unavailable")
-	}
-	rel, err := filepath.Rel(root, path)
-	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
-		return fmt.Errorf("cleanup path %q is outside managed root %q", path, root)
-	}
-	return nil
+	return workflow.ValidateDelegationCleanupTarget(worker.workflowHome(), job.ID, job.Type, payload)
 }
 
-func prepareDelegationCleanup(ctx context.Context, worker jobWorker, mode string, job db.Job, path string, now time.Time) (db.CleanupObligation, bool) {
+func prepareDelegationCleanup(ctx context.Context, worker jobWorker, mode string, job db.Job, path string, now time.Time) (db.CleanupObligation, bool, error) {
 	obligation, err := worker.Store.EnsureCleanupObligation(context.WithoutCancel(ctx), job.ID, path, now)
 	if err != nil {
 		logDelegationReclaimFailure(worker.Stdout, mode, "obligation", job.ID, path, err)
-		return db.CleanupObligation{}, false
+		return db.CleanupObligation{}, false, err
+	}
+	if obligation.State == db.CleanupObligationQuarantined || obligation.State == db.CleanupObligationRemoved {
+		return obligation, false, nil
+	}
+	if obligation.State != db.CleanupObligationPending && obligation.State != db.CleanupObligationRetryable {
+		return obligation, false, fmt.Errorf("cleanup obligation %s has unsupported state %q", obligation.ResourceID, obligation.State)
 	}
 	if err := delegationCleanupTargetContained(worker, job, obligation); err != nil {
-		recordDelegationCleanupFailure(ctx, worker, mode, "identity", job.ID, path, err, now)
-		return obligation, false
+		if _, persistErr := recordDelegationCleanupFailure(ctx, worker, mode, "identity", job.ID, path, err, now); persistErr != nil {
+			return obligation, false, persistErr
+		}
+		return obligation, false, nil
 	}
-	return obligation, true
+	return obligation, true, nil
 }
 
-func finishDelegationCleanupAttempt(ctx context.Context, worker jobWorker, jobID, path string, reclaimed bool, now time.Time) {
+func finishDelegationCleanupAttempt(ctx context.Context, worker jobWorker, jobID, path string, reclaimed bool, now time.Time) error {
 	if !reclaimed {
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			reclaimed = true
@@ -222,13 +222,16 @@ func finishDelegationCleanupAttempt(ctx context.Context, worker jobWorker, jobID
 	if reclaimed {
 		if _, err := worker.Store.MarkCleanupObligationRemoved(context.WithoutCancel(ctx), jobID, path, now); err != nil {
 			logDelegationReclaimFailure(worker.Stdout, "state", "removed", jobID, path, err)
+			return err
 		}
 		clearDelegationReclaimFailure(path)
-		return
+		return nil
 	}
 	if _, err := worker.Store.DeferCleanupObligation(context.WithoutCancel(ctx), jobID, path, db.CleanupReasonTerminalDeferred, now, now.Add(delegationCleanupRetryDelay)); err != nil {
 		logDelegationReclaimFailure(worker.Stdout, "state", "deferred", jobID, path, err)
+		return err
 	}
+	return nil
 }
 
 // daemonPollTimeout bounds a single repo's PollOnce / PollRecoveryCommandsOnce.
@@ -991,7 +994,9 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 				return fmt.Errorf("get skipped reclaim candidate %s: %w (path lookup also failed: %v)", jobID, err, pathErr)
 			}
 			path = canonicalDelegationReclaimPath(jobID, path)
-			recordDelegationCleanupFailure(ctx, worker, "skipped", "get_job", jobID, path, err, now)
+			if _, persistErr := recordDelegationCleanupFailure(ctx, worker, "skipped", "get_job", jobID, path, err, now); persistErr != nil {
+				return persistErr
+			}
 			continue
 		}
 		path := delegationReclaimPath(job.ID, job.Payload)
@@ -1009,21 +1014,31 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 				continue
 			}
 		}
-		if _, ok := prepareDelegationCleanup(ctx, worker, "skipped", job, path, now); !ok {
+		_, ok, err := prepareDelegationCleanup(ctx, worker, "skipped", job, path, now)
+		if err != nil {
+			return err
+		}
+		if !ok {
 			continue
 		}
 		runner, err := worker.subprocessRunnerForJob(job)
 		if err != nil {
-			recordDelegationCleanupFailure(ctx, worker, "skipped", "runner", job.ID, path, err, now)
+			if _, persistErr := recordDelegationCleanupFailure(ctx, worker, "skipped", "runner", job.ID, path, err, now); persistErr != nil {
+				return persistErr
+			}
 			continue
 		}
 		engine := worker.workflowForJob(worker.delegationParentCheckout(ctx, job), runner)
 		reclaimed, err := engine.ReclaimTerminalDelegationWorktreeOutcome(ctx, jobID)
 		if err != nil {
-			recordDelegationCleanupFailure(ctx, worker, "skipped", "reclaim", job.ID, path, err, now)
+			if _, persistErr := recordDelegationCleanupFailure(ctx, worker, "skipped", "reclaim", job.ID, path, err, now); persistErr != nil {
+				return persistErr
+			}
 			continue
 		}
-		finishDelegationCleanupAttempt(ctx, worker, job.ID, path, reclaimed, now)
+		if err := finishDelegationCleanupAttempt(ctx, worker, job.ID, path, reclaimed, now); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1055,7 +1070,9 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 				return fmt.Errorf("get aged reclaim candidate %s: %w (path lookup also failed: %v)", jobID, err, pathErr)
 			}
 			path = canonicalDelegationReclaimPath(jobID, path)
-			recordDelegationCleanupFailure(ctx, worker, "aged", "get_job", jobID, path, err, now)
+			if _, persistErr := recordDelegationCleanupFailure(ctx, worker, "aged", "get_job", jobID, path, err, now); persistErr != nil {
+				return persistErr
+			}
 			cand.agedReclaimFailed = true
 			continue
 		}
@@ -1074,24 +1091,34 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 				continue
 			}
 		}
-		if _, ok := prepareDelegationCleanup(ctx, worker, "aged", job, path, now); !ok {
+		_, ok, err := prepareDelegationCleanup(ctx, worker, "aged", job, path, now)
+		if err != nil {
+			return err
+		}
+		if !ok {
 			cand.agedReclaimFailed = true
 			continue
 		}
 		runner, err := worker.subprocessRunnerForJob(job)
 		if err != nil {
-			recordDelegationCleanupFailure(ctx, worker, "aged", "runner", job.ID, path, err, now)
+			if _, persistErr := recordDelegationCleanupFailure(ctx, worker, "aged", "runner", job.ID, path, err, now); persistErr != nil {
+				return persistErr
+			}
 			cand.agedReclaimFailed = true
 			continue
 		}
 		engine := worker.workflowForJob(worker.delegationParentCheckout(ctx, job), runner)
 		reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, now.Add(-ttl))
 		if err != nil {
-			recordDelegationCleanupFailure(ctx, worker, "aged", "reclaim", job.ID, path, err, now)
+			if _, persistErr := recordDelegationCleanupFailure(ctx, worker, "aged", "reclaim", job.ID, path, err, now); persistErr != nil {
+				return persistErr
+			}
 			cand.agedReclaimFailed = true
 			continue
 		}
-		finishDelegationCleanupAttempt(ctx, worker, job.ID, path, reclaimed, now)
+		if err := finishDelegationCleanupAttempt(ctx, worker, job.ID, path, reclaimed, now); err != nil {
+			return err
+		}
 	}
 	return nil
 }

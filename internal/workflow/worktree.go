@@ -721,46 +721,171 @@ func isFixWorktree(jobType string, payload JobPayload) bool {
 		strings.TrimSpace(payload.WorktreePath) != ""
 }
 
-func (e Engine) prepareDelegationCleanupObligation(ctx context.Context, jobID, path string) error {
-	path = filepath.Clean(strings.TrimSpace(path))
+func (e Engine) prepareDelegationCleanupObligation(ctx context.Context, jobID, jobType string, payload JobPayload) (bool, error) {
+	path := filepath.Clean(strings.TrimSpace(payload.WorktreePath))
 	home := filepath.Clean(strings.TrimSpace(e.Home))
 	if path == "." || path == "" {
-		return errors.New("cleanup path is unavailable")
+		return false, errors.New("cleanup path is unavailable")
 	}
-	if _, err := e.Store.EnsureCleanupObligation(context.WithoutCancel(ctx), jobID, path, time.Now().UTC()); err != nil {
-		return err
+	obligation, err := e.Store.EnsureCleanupObligation(context.WithoutCancel(ctx), jobID, path, time.Now().UTC())
+	if err != nil {
+		return false, err
 	}
+	switch obligation.State {
+	case db.CleanupObligationQuarantined, db.CleanupObligationRemoved:
+		return false, nil
+	case db.CleanupObligationPending, db.CleanupObligationRetryable:
+		// Actuation is permitted only for these two non-terminal states.
+	default:
+		return false, fmt.Errorf("cleanup obligation %s has unsupported state %q", obligation.ResourceID, obligation.State)
+	}
+	validator := ValidateDelegationCleanupTarget
+	if e.cleanupTargetValidator != nil {
+		validator = e.cleanupTargetValidator
+	}
+	if err := validator(home, jobID, jobType, payload); err != nil {
+		return false, errors.Join(err, e.deferDelegationCleanupFailure(ctx, jobID, path, "identity", err))
+	}
+	return true, nil
+}
+
+// ValidateDelegationCleanupTarget independently derives the managed path for a
+// cleanup owner and resolves symlinks before accepting filesystem containment.
+func ValidateDelegationCleanupTarget(home, jobID, jobType string, payload JobPayload) error {
+	path := filepath.Clean(strings.TrimSpace(payload.WorktreePath))
+	home = filepath.Clean(strings.TrimSpace(home))
 	if !filepath.IsAbs(path) {
-		err := fmt.Errorf("cleanup path %q is not absolute", path)
-		e.deferDelegationCleanupFailure(ctx, jobID, path, "identity", err)
-		return err
+		return fmt.Errorf("cleanup path %q is not absolute", path)
 	}
 	if home == "." || home == "" {
-		err := errors.New("cleanup worktree home is unavailable")
-		e.deferDelegationCleanupFailure(ctx, jobID, path, "identity", err)
+		return errors.New("cleanup worktree home is unavailable")
+	}
+	expected, err := expectedDelegationCleanupPaths(home, jobID, jobType, payload)
+	if err != nil {
 		return err
 	}
+	matched := false
+	for _, candidate := range expected {
+		if path == filepath.Clean(candidate) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return fmt.Errorf("cleanup path %q does not match the job's derived managed path", path)
+	}
 	root := filepath.Join(home, "worktrees")
-	rel, err := filepath.Rel(root, path)
-	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
-		err := fmt.Errorf("cleanup path %q is outside managed root %q", path, root)
-		e.deferDelegationCleanupFailure(ctx, jobID, path, "identity", err)
+	if err := cleanupPathContained(root, path); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (e Engine) deferDelegationCleanupObligation(ctx context.Context, jobID, path string, reason db.CleanupObligationReason) {
+func expectedDelegationCleanupPaths(home, jobID, jobType string, payload JobPayload) ([]string, error) {
+	if isFixWorktree(jobType, payload) {
+		path, err := FixWorktreePath(home, payload.Repo, jobID)
+		return []string{path}, err
+	}
+	// Match isReadOnlyDelegationWorktree's precedence: the explicit marker is a
+	// top-level dispatch/pipeline/pool allocation even if legacy payload metadata
+	// also carries a DelegationID.
+	if payload.ReadOnlyWorktree {
+		segments := []string{"readonly-seat", "pipeline-service-stage", "pipeline-stage", "pool-isolation"}
+		paths := make([]string, 0, len(segments))
+		for _, segment := range segments {
+			path, err := DelegationWorktreePath(home, payload.Repo, jobID, segment, 0)
+			if err != nil {
+				return nil, err
+			}
+			paths = append(paths, path)
+		}
+		return paths, nil
+	}
+	if strings.TrimSpace(payload.DelegationID) != "" {
+		parentID := strings.TrimSpace(payload.ParentJobID)
+		delegationID := strings.TrimSpace(payload.DelegationID)
+		if parentID == "" {
+			return nil, errors.New("cleanup owner is missing its parent job id")
+		}
+		expectedJobID := parentID + "/delegation/" + delegationID
+		if payload.RetryCount > 0 {
+			expectedJobID += "/retry/" + strconv.Itoa(payload.RetryCount)
+		}
+		if strings.TrimSpace(jobID) != expectedJobID {
+			return nil, fmt.Errorf("cleanup owner job %q does not match parent %q and delegation %q", jobID, parentID, delegationID)
+		}
+		path, err := DelegationWorktreePath(home, payload.Repo, parentID, delegationID, payload.RetryCount)
+		if err != nil {
+			return nil, err
+		}
+		paths := []string{path}
+		if readOnlyDelegationAction(jobType) {
+			integration, err := DelegationWorktreePath(home, payload.Repo, parentID, "integration-"+delegationID, payload.RetryCount)
+			if err != nil {
+				return nil, err
+			}
+			paths = append(paths, integration)
+		}
+		return paths, nil
+	}
+	return nil, errors.New("cleanup owner has no managed worktree identity")
+}
+
+func cleanupPathContained(root, path string) error {
+	resolvedRoot, err := evalPathWithMissingTail(root)
+	if err != nil {
+		return fmt.Errorf("resolve managed cleanup root %q: %w", root, err)
+	}
+	resolvedPath, err := evalPathWithMissingTail(path)
+	if err != nil {
+		return fmt.Errorf("resolve cleanup path %q: %w", path, err)
+	}
+	rel, err := filepath.Rel(resolvedRoot, resolvedPath)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("cleanup path %q resolves outside managed root %q", path, root)
+	}
+	return nil
+}
+
+func evalPathWithMissingTail(path string) (string, error) {
+	current := filepath.Clean(path)
+	var tail []string
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			for i := len(tail) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, tail[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		if info, lerr := os.Lstat(current); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("path component %q is a dangling symlink", current)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", err
+		}
+		tail = append(tail, filepath.Base(current))
+		current = parent
+	}
+}
+
+func (e Engine) deferDelegationCleanupObligation(ctx context.Context, jobID, path string, reason db.CleanupObligationReason) error {
 	now := time.Now().UTC()
-	_, _ = e.Store.DeferCleanupObligation(context.WithoutCancel(ctx), jobID, path, reason, now, now.Add(time.Minute))
+	_, err := e.Store.DeferCleanupObligation(context.WithoutCancel(ctx), jobID, path, reason, now, now.Add(time.Minute))
+	return err
 }
 
-func (e Engine) deferDelegationCleanupFailure(ctx context.Context, jobID, path, phase string, err error) {
-	e.deferDelegationCleanupObligation(ctx, jobID, path, db.ClassifyCleanupObligationFailure(phase, err))
+func (e Engine) deferDelegationCleanupFailure(ctx context.Context, jobID, path, phase string, err error) error {
+	return e.deferDelegationCleanupObligation(ctx, jobID, path, db.ClassifyCleanupObligationFailure(phase, err))
 }
 
-func (e Engine) markDelegationCleanupRemoved(ctx context.Context, jobID, path string) {
-	_, _ = e.Store.MarkCleanupObligationRemoved(context.WithoutCancel(ctx), jobID, path, time.Now().UTC())
+func (e Engine) markDelegationCleanupRemoved(ctx context.Context, jobID, path string) error {
+	_, err := e.Store.MarkCleanupObligationRemoved(context.WithoutCancel(ctx), jobID, path, time.Now().UTC())
+	return err
 }
 
 // cleanupFixWorktree removes an engine-dispatched review fix's independent
@@ -775,11 +900,17 @@ func (e Engine) cleanupFixWorktree(ctx context.Context, jobID string, jobType st
 		return nil
 	}
 	path := strings.TrimSpace(payload.WorktreePath)
-	if err := e.prepareDelegationCleanupObligation(ctx, jobID, path); err != nil {
+	actuate, err := e.prepareDelegationCleanupObligation(ctx, jobID, jobType, payload)
+	if err != nil {
 		return err
 	}
+	if !actuate {
+		return nil
+	}
 	if skip, reason := e.cleanupBlockedByLiveOwner(ctx, jobID, payload); skip {
-		e.deferDelegationCleanupObligation(ctx, jobID, path, db.CleanupReasonTerminalDeferred)
+		if err := e.deferDelegationCleanupObligation(ctx, jobID, path, db.CleanupReasonTerminalDeferred); err != nil {
+			return err
+		}
 		e.recordCleanupSkippedOnce(ctx, jobID, payload, reason)
 		return nil
 	}
@@ -787,26 +918,30 @@ func (e Engine) cleanupFixWorktree(ctx context.Context, jobID string, jobType st
 	expected, err := FixWorktreePath(e.Home, payload.Repo, jobID)
 	if err != nil || filepath.Clean(path) != filepath.Clean(expected) {
 		cleanupErr := fmt.Errorf("refusing unmanaged fix worktree cleanup %s", path)
-		e.deferDelegationCleanupFailure(opCtx, jobID, path, "identity", cleanupErr)
+		if persistErr := e.deferDelegationCleanupFailure(opCtx, jobID, path, "identity", cleanupErr); persistErr != nil {
+			return errors.Join(cleanupErr, persistErr)
+		}
 		e.recordCleanupSkippedOnce(opCtx, jobID, payload, "path is not the job's managed fix-worktree path")
 		return cleanupErr
 	}
 	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
-		e.markDelegationCleanupRemoved(opCtx, jobID, path)
-		return nil
+		return e.markDelegationCleanupRemoved(opCtx, jobID, path)
 	} else if statErr != nil {
-		e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", statErr)
+		if persistErr := e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", statErr); persistErr != nil {
+			return errors.Join(statErr, persistErr)
+		}
 		e.recordCleanupSkippedOnce(opCtx, jobID, payload, fmt.Sprintf("inspect failed: %v", statErr))
 		return fmt.Errorf("inspect fix worktree %s: %w", path, statErr)
 	}
 	if err := os.RemoveAll(path); err != nil {
-		e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", err)
+		if persistErr := e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", err); persistErr != nil {
+			return errors.Join(err, persistErr)
+		}
 		e.recordCleanupSkippedOnce(opCtx, jobID, payload, fmt.Sprintf("remove failed: %v", err))
 		return fmt.Errorf("remove fix worktree %s: %w", path, err)
 	}
 	_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_removed", Message: fmt.Sprintf("fix worktree %s removed", path)})
-	e.markDelegationCleanupRemoved(opCtx, jobID, path)
-	return nil
+	return e.markDelegationCleanupRemoved(opCtx, jobID, path)
 }
 
 // cleanupReadOnlyDelegationWorktree disposes the detached worktree allocated for
@@ -824,13 +959,19 @@ func (e Engine) cleanupReadOnlyDelegationWorktree(ctx context.Context, jobID str
 	// deadline/cancel.
 	opCtx := context.WithoutCancel(ctx)
 	path := strings.TrimSpace(payload.WorktreePath)
-	if err := e.prepareDelegationCleanupObligation(opCtx, jobID, path); err != nil {
+	actuate, err := e.prepareDelegationCleanupObligation(opCtx, jobID, jobType, payload)
+	if err != nil {
 		return err
+	}
+	if !actuate {
+		return nil
 	}
 	manager, ok := e.DelegationWorktrees.(ReadOnlyWorktreeManager)
 	if !ok || manager == nil {
 		cleanupErr := errors.New("delegation worktree manager cannot force-remove worktrees")
-		e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", cleanupErr)
+		if persistErr := e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", cleanupErr); persistErr != nil {
+			return errors.Join(cleanupErr, persistErr)
+		}
 		e.recordReadOnlyCleanupSkippedOnce(opCtx, jobID, path, "delegation worktree manager is unavailable")
 		return cleanupErr
 	}
@@ -838,10 +979,11 @@ func (e Engine) cleanupReadOnlyDelegationWorktree(ctx context.Context, jobID str
 	// passes). If the worktree directory is already gone, do not re-lock or emit a
 	// spurious cleanup-failed event.
 	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
-		e.markDelegationCleanupRemoved(opCtx, jobID, path)
-		return nil
+		return e.markDelegationCleanupRemoved(opCtx, jobID, path)
 	} else if statErr != nil {
-		e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", statErr)
+		if persistErr := e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", statErr); persistErr != nil {
+			return errors.Join(statErr, persistErr)
+		}
 		e.recordReadOnlyCleanupSkippedOnce(opCtx, jobID, path, fmt.Sprintf("inspect failed: %v", statErr))
 		return fmt.Errorf("inspect read-only worktree %s: %w", path, statErr)
 	}
@@ -855,7 +997,9 @@ func (e Engine) cleanupReadOnlyDelegationWorktree(ctx context.Context, jobID str
 	}
 	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(opCtx, e.Store, e.DelegationCheckout, "worktree-cleanup:"+jobID, time.Now().UTC())
 	if err != nil {
-		e.deferDelegationCleanupFailure(opCtx, jobID, path, "lock", err)
+		if persistErr := e.deferDelegationCleanupFailure(opCtx, jobID, path, "lock", err); persistErr != nil {
+			return errors.Join(err, persistErr)
+		}
 		// A transient failure (lock contention) must NOT be terminal: emit the same
 		// reclaim marker the daemon's reclaimSkippedDelegationWorktrees pass keys on,
 		// so ReclaimTerminalDelegationWorktree re-fires this cleanup on a later tick
@@ -871,13 +1015,14 @@ func (e Engine) cleanupReadOnlyDelegationWorktree(ctx context.Context, jobID str
 		}
 	}()
 	if err := manager.RemoveWorktreeForce(opCtx, path); err != nil {
-		e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", err)
+		if persistErr := e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", err); persistErr != nil {
+			return errors.Join(err, persistErr)
+		}
 		e.recordReadOnlyCleanupSkippedOnce(opCtx, jobID, path, fmt.Sprintf("force-remove failed: %v", err))
 		return fmt.Errorf("force-remove read-only worktree %s: %w", path, err)
 	}
 	_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_removed", Message: fmt.Sprintf("read-only worktree %s removed", path)})
-	e.markDelegationCleanupRemoved(opCtx, jobID, path)
-	return nil
+	return e.markDelegationCleanupRemoved(opCtx, jobID, path)
 }
 
 // isImplementDelegationWorktree reports whether a job ran in a per-delegation
@@ -941,8 +1086,12 @@ func (e Engine) cleanupImplementDelegationWorktree(ctx context.Context, jobID st
 		return nil
 	}
 	path := strings.TrimSpace(payload.WorktreePath)
-	if err := e.prepareDelegationCleanupObligation(ctx, jobID, path); err != nil {
+	actuate, err := e.prepareDelegationCleanupObligation(ctx, jobID, jobType, payload)
+	if err != nil {
 		return err
+	}
+	if !actuate {
+		return nil
 	}
 	// Liveness gate (#536): NEVER force-remove a worktree (and delete its branch)
 	// while a live runtime worker could still be writing to it — even past lease
@@ -967,7 +1116,9 @@ func (e Engine) cleanupImplementDelegationWorktree(ctx context.Context, jobID st
 	// later tick; once the foreign lease expires AND no live process holds the
 	// worktree (the worker has actually exited), it is reclaimed rather than leaked.
 	if skip, reason := e.cleanupBlockedByLiveOwner(ctx, jobID, payload); skip {
-		e.deferDelegationCleanupObligation(ctx, jobID, path, db.CleanupReasonTerminalDeferred)
+		if err := e.deferDelegationCleanupObligation(ctx, jobID, path, db.CleanupReasonTerminalDeferred); err != nil {
+			return err
+		}
 		e.recordCleanupSkippedOnce(ctx, jobID, payload, reason)
 		return nil
 	}
@@ -997,7 +1148,9 @@ func (e Engine) cleanupImplementDelegationWorktree(ctx context.Context, jobID st
 	manager, ok := e.DelegationWorktrees.(ReadOnlyWorktreeManager) // RemoveWorktreeForce
 	if !ok || manager == nil {
 		cleanupErr := errors.New("delegation worktree manager cannot force-remove worktrees")
-		e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", cleanupErr)
+		if persistErr := e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", cleanupErr); persistErr != nil {
+			return errors.Join(cleanupErr, persistErr)
+		}
 		e.recordCleanupSkippedOnce(opCtx, jobID, payload, "delegation worktree manager is unavailable")
 		return cleanupErr
 	}
@@ -1021,12 +1174,13 @@ func (e Engine) cleanupImplementDelegationWorktree(ctx context.Context, jobID st
 	}
 	branchCleanupPending := deleter != nil && checker != nil && !branchKnownGone
 	if worktreeGone && !branchCleanupPending {
-		e.markDelegationCleanupRemoved(opCtx, jobID, path)
-		return nil
+		return e.markDelegationCleanupRemoved(opCtx, jobID, path)
 	}
 	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(opCtx, e.Store, e.DelegationCheckout, "worktree-cleanup:"+jobID, time.Now().UTC())
 	if err != nil {
-		e.deferDelegationCleanupFailure(opCtx, jobID, path, "lock", err)
+		if persistErr := e.deferDelegationCleanupFailure(opCtx, jobID, path, "lock", err); persistErr != nil {
+			return errors.Join(err, persistErr)
+		}
 		_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_cleanup_failed", Message: fmt.Sprintf("implement worktree %s cleanup could not lock checkout: %v", path, err)})
 		return fmt.Errorf("lock checkout for implement worktree cleanup: %w", err)
 	}
@@ -1037,7 +1191,9 @@ func (e Engine) cleanupImplementDelegationWorktree(ctx context.Context, jobID st
 	}()
 	if !worktreeGone {
 		if err := manager.RemoveWorktreeForce(opCtx, path); err != nil {
-			e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", err)
+			if persistErr := e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", err); persistErr != nil {
+				return errors.Join(err, persistErr)
+			}
 			_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_cleanup_failed", Message: fmt.Sprintf("implement worktree %s force-remove failed: %v", path, err)})
 			return fmt.Errorf("force-remove implement worktree %s: %w", path, err)
 		}
@@ -1045,7 +1201,9 @@ func (e Engine) cleanupImplementDelegationWorktree(ctx context.Context, jobID st
 	branchDeleted := false
 	if deleter != nil && !branchKnownGone {
 		if err := deleter.DeleteBranch(opCtx, branch); err != nil {
-			e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", err)
+			if persistErr := e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", err); persistErr != nil {
+				return errors.Join(err, persistErr)
+			}
 			_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_cleanup_failed", Message: fmt.Sprintf("implement branch %s delete failed: %v", branch, err)})
 			return fmt.Errorf("delete implement worktree branch %s: %w", branch, err)
 		}
@@ -1059,8 +1217,7 @@ func (e Engine) cleanupImplementDelegationWorktree(ctx context.Context, jobID st
 		message = fmt.Sprintf("implement worktree %s and branch %s removed", path, branch)
 	}
 	_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_removed", Message: message})
-	e.markDelegationCleanupRemoved(opCtx, jobID, path)
-	return nil
+	return e.markDelegationCleanupRemoved(opCtx, jobID, path)
 }
 
 // cleanupBlockedByLiveOwner reports whether the destructive implement-delegation
@@ -1256,8 +1413,12 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 		}
 	}
 	path := strings.TrimSpace(payload.WorktreePath)
-	if err := e.prepareDelegationCleanupObligation(ctx, jobID, path); err != nil {
+	actuate, err := e.prepareDelegationCleanupObligation(ctx, jobID, job.Type, payload)
+	if err != nil {
 		return false, err
+	}
+	if !actuate {
+		return false, nil
 	}
 	if fix {
 		expected, err := FixWorktreePath(e.Home, payload.Repo, jobID)
@@ -1272,7 +1433,7 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 			Message: fmt.Sprintf("aged terminal fix worktree %s removed after TTL", path),
 		})
 		if err == nil {
-			e.markDelegationCleanupRemoved(ctx, jobID, path)
+			err = e.markDelegationCleanupRemoved(ctx, jobID, path)
 		}
 		return err == nil, err
 	}
@@ -1331,7 +1492,7 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 		Message: fmt.Sprintf("aged terminal delegation worktree %s force-removed after TTL", path),
 	})
 	if err == nil {
-		e.markDelegationCleanupRemoved(opCtx, jobID, path)
+		err = e.markDelegationCleanupRemoved(opCtx, jobID, path)
 	}
 	return err == nil, err
 }
@@ -1405,18 +1566,19 @@ func (e Engine) implementLegBranchMayBeMerged(ctx context.Context, payload JobPa
 // ever reclaim an integration-fed leg and its gitmoot-delegation-* branch and
 // worktree would accumulate forever after the tree finished. It re-runs each
 // leg's cleanup, whose #332 guard now observes this consumer terminal and (absent
-// another live consumer) proceeds. Best-effort and idempotent: a no-op for a job
-// with no parent/deps and for already-cleaned legs.
-func (e Engine) cleanupConsumedImplementLegWorktrees(ctx context.Context, payload JobPayload) {
+// another live consumer) proceeds. It is idempotent for already-cleaned legs and
+// fails closed when durable cleanup accounting cannot be persisted.
+func (e Engine) cleanupConsumedImplementLegWorktrees(ctx context.Context, payload JobPayload) error {
 	parentID := strings.TrimSpace(payload.ParentJobID)
 	deps := compactStrings(payload.Deps)
 	if parentID == "" || len(deps) == 0 {
-		return
+		return nil
 	}
 	children, err := e.childDelegationJobs(ctx, parentID)
 	if err != nil {
-		return
+		return err
 	}
+	var cleanupErr error
 	for _, dep := range deps {
 		legJob, ok := children[strings.TrimSpace(dep)]
 		if !ok {
@@ -1424,10 +1586,14 @@ func (e Engine) cleanupConsumedImplementLegWorktrees(ctx context.Context, payloa
 		}
 		legPayload, err := unmarshalPayload(legJob.Payload)
 		if err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
 			continue
 		}
-		e.cleanupImplementDelegationWorktree(ctx, legJob.ID, legJob.Type, legPayload)
+		if err := e.cleanupImplementDelegationWorktree(ctx, legJob.ID, legJob.Type, legPayload); err != nil {
+			return errors.Join(cleanupErr, err)
+		}
 	}
+	return cleanupErr
 }
 
 type worktreeLineageResult struct {

@@ -639,6 +639,8 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		}
 	}
 
+	// Cleanup selectors compare WorktreePath textually with the allocator-derived
+	// obligation path, so managed allocators must preserve their canonical path.
 	payload, err := marshalPayload(JobPayload{
 		Repo:                   request.Repo,
 		Branch:                 request.Branch,

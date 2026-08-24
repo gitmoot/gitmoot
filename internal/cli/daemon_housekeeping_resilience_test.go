@@ -84,7 +84,7 @@ func (h *housekeepingDispatchHarness) runAndAssertDispatched(t *testing.T, repoF
 func TestSkippedDelegationWorktreeReclaimFailureDoesNotBlockDispatch(t *testing.T) {
 	h := newHousekeepingDispatchHarness(t, "queued-after-skipped-reclaim")
 	const failedJobID = "parent/delegation/skipped"
-	worktreePath := managedReclaimTestPath(t, h.home, "skipped-reclaim-failure")
+	worktreePath := managedDelegationReclaimTestPath(t, h.home, "parent", "skipped")
 	seedCLIJob(t, h.store, db.Job{
 		ID: failedJobID, Agent: "reader", Type: "implement", State: string(workflow.JobFailed),
 		Repo: "owner/repo", ParentJobID: "parent", DelegationID: "skipped",
