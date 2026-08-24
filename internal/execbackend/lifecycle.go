@@ -318,13 +318,13 @@ func (b *LocalBackend) handoffWorkspace(instance *Instance) error {
 		return fmt.Errorf("assign local execution-backend root to gid %d: %w", b.identity.GID, err)
 	}
 	if err := os.Chmod(b.root, 0o710); err != nil {
-		return fmt.Errorf("make local execution-backend root traversable for uid %d: %w", b.identity.UID, err)
+		return fmt.Errorf("make local execution-backend root traversable for gid %d: %w", b.identity.GID, err)
 	}
 	if err := b.chown(instance.root, -1, int(b.identity.GID)); err != nil {
 		return fmt.Errorf("assign local execution instance %q to gid %d: %w", instance.ID, b.identity.GID, err)
 	}
 	if err := os.Chmod(instance.root, 0o710); err != nil {
-		return fmt.Errorf("make local execution instance %q traversable for uid %d: %w", instance.ID, b.identity.UID, err)
+		return fmt.Errorf("make local execution instance %q traversable for gid %d: %w", instance.ID, b.identity.GID, err)
 	}
 	if err := chownLocalWorkspace(instance.Workspace, b.identity.UID, b.identity.GID); err != nil {
 		return fmt.Errorf("hand local execution workspace to uid %d gid %d: %w", b.identity.UID, b.identity.GID, err)
