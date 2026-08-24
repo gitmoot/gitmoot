@@ -73,6 +73,25 @@ const (
 	delegationCleanupRetryDelay       = time.Minute
 )
 
+// delegationCleanupPassError stops the current reclaim pass after a selected
+// candidate cannot be durably accounted. The failure is already logged through
+// the bounded per-path suppression seam; the outer worker tick continues
+// ordinary dispatch. Candidate-query and other global store errors remain
+// unwrapped and still abort the tick.
+type delegationCleanupPassError struct {
+	err error
+}
+
+func (e *delegationCleanupPassError) Error() string { return e.err.Error() }
+func (e *delegationCleanupPassError) Unwrap() error { return e.err }
+
+func stopDelegationCleanupPass(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &delegationCleanupPassError{err: err}
+}
+
 type delegationReclaimFailure struct {
 	count    int
 	lastSeen time.Time
@@ -995,7 +1014,7 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 			}
 			path = canonicalDelegationReclaimPath(jobID, path)
 			if _, persistErr := recordDelegationCleanupFailure(ctx, worker, "skipped", "get_job", jobID, path, err, now); persistErr != nil {
-				return persistErr
+				return stopDelegationCleanupPass(persistErr)
 			}
 			continue
 		}
@@ -1016,7 +1035,7 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 		}
 		_, ok, err := prepareDelegationCleanup(ctx, worker, "skipped", job, path, now)
 		if err != nil {
-			return err
+			return stopDelegationCleanupPass(err)
 		}
 		if !ok {
 			continue
@@ -1024,7 +1043,7 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 		runner, err := worker.subprocessRunnerForJob(job)
 		if err != nil {
 			if _, persistErr := recordDelegationCleanupFailure(ctx, worker, "skipped", "runner", job.ID, path, err, now); persistErr != nil {
-				return persistErr
+				return stopDelegationCleanupPass(persistErr)
 			}
 			continue
 		}
@@ -1032,12 +1051,12 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 		reclaimed, err := engine.ReclaimTerminalDelegationWorktreeOutcome(ctx, jobID)
 		if err != nil {
 			if _, persistErr := recordDelegationCleanupFailure(ctx, worker, "skipped", "reclaim", job.ID, path, err, now); persistErr != nil {
-				return persistErr
+				return stopDelegationCleanupPass(persistErr)
 			}
 			continue
 		}
 		if err := finishDelegationCleanupAttempt(ctx, worker, job.ID, path, reclaimed, now); err != nil {
-			return err
+			return stopDelegationCleanupPass(err)
 		}
 	}
 	return nil
@@ -1071,7 +1090,7 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 			}
 			path = canonicalDelegationReclaimPath(jobID, path)
 			if _, persistErr := recordDelegationCleanupFailure(ctx, worker, "aged", "get_job", jobID, path, err, now); persistErr != nil {
-				return persistErr
+				return stopDelegationCleanupPass(persistErr)
 			}
 			cand.agedReclaimFailed = true
 			continue
@@ -1093,7 +1112,7 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 		}
 		_, ok, err := prepareDelegationCleanup(ctx, worker, "aged", job, path, now)
 		if err != nil {
-			return err
+			return stopDelegationCleanupPass(err)
 		}
 		if !ok {
 			cand.agedReclaimFailed = true
@@ -1102,7 +1121,7 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 		runner, err := worker.subprocessRunnerForJob(job)
 		if err != nil {
 			if _, persistErr := recordDelegationCleanupFailure(ctx, worker, "aged", "runner", job.ID, path, err, now); persistErr != nil {
-				return persistErr
+				return stopDelegationCleanupPass(persistErr)
 			}
 			cand.agedReclaimFailed = true
 			continue
@@ -1111,13 +1130,13 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 		reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, now.Add(-ttl))
 		if err != nil {
 			if _, persistErr := recordDelegationCleanupFailure(ctx, worker, "aged", "reclaim", job.ID, path, err, now); persistErr != nil {
-				return persistErr
+				return stopDelegationCleanupPass(persistErr)
 			}
 			cand.agedReclaimFailed = true
 			continue
 		}
 		if err := finishDelegationCleanupAttempt(ctx, worker, job.ID, path, reclaimed, now); err != nil {
-			return err
+			return stopDelegationCleanupPass(err)
 		}
 	}
 	return nil
@@ -1211,7 +1230,10 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 			return err
 		}
 		if err := reclaimSkippedDelegationWorktrees(ctx, worker, repoFilter, rootFilter, tracker.checkoutHeld, cand, now); err != nil {
-			return err
+			var passErr *delegationCleanupPassError
+			if !errors.As(err, &passErr) {
+				return err
+			}
 		}
 		// The store path is already the resolved Gitmoot root. Using it keeps this
 		// hot-read on the daemon's actual home and prevents the raw/resolved
