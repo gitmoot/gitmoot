@@ -296,8 +296,10 @@ collection/import remain daemon-side and imported files therefore retain the
 daemon user's ownership. If the default backend root is below a root-only
 parent (for example a root daemon using `/root/.gitmoot`), set absolute
 `local_root` to a dedicated operator-managed path whose parents the configured
-uid can traverse; filesystem roots are rejected. Omitting uid/gid preserves
-the daemon identity.
+identity can traverse; filesystem roots are rejected. Gitmoot keeps the backend
+and instance roots daemon-owned, assigns them to `local_gid`, and uses mode
+`0710` so the configured command group can traverse without setting execute for
+the Unix `other` class. Omitting uid/gid preserves the daemon identity.
 
 The runtime executable must be traversable by the configured uid too. If a
 root daemon resolves `claude` or `codex` below `/root`, install the runtime at

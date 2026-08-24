@@ -158,6 +158,80 @@ func TestLocalBackendExecDropsPrivilegesAndImportNormalizesOwnership(t *testing.
 	}
 }
 
+func TestLocalBackendWorkspaceTraverseLimitedToConfiguredIdentity(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("workspace traverse identity proof requires a root test process")
+	}
+	identities := testUnprivilegedIdentitiesWithDistinctGIDs(t, 3)
+	configured := LocalIdentity{UID: identities[0].UID, GID: identities[1].GID}
+	third := identities[2]
+
+	host, _, _ := changeSetRepoPair(t)
+	backend := newPrivilegedTestLocalBackend(t, configured)
+	instance, err := backend.Provision(context.Background(), JobScope{JobID: "traverse-boundary"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backend.Destroy(context.Background(), instance) })
+	if err := backend.SyncIn(context.Background(), instance, Materials{SourceWorktree: host}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runAsIdentity(configured, instance.Workspace, "/bin/pwd"); err != nil {
+		t.Fatalf("configured identity uid %d gid %d cannot traverse workspace: %v", configured.UID, configured.GID, err)
+	}
+	if err := runAsIdentity(third, instance.Workspace, "/bin/pwd"); err == nil {
+		t.Fatalf("third identity uid %d gid %d traversed workspace; want permission denied", third.UID, third.GID)
+	}
+
+	for _, path := range []string{backend.root, instance.root} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0o710 {
+			t.Fatalf("traverse parent %q mode = %#o, want 0710", path, got)
+		}
+		if _, gid := pathOwnership(t, path); gid != configured.GID {
+			t.Fatalf("traverse parent %q gid = %d, want configured gid %d", path, gid, configured.GID)
+		}
+	}
+}
+
+func TestLocalBackendWorkspaceTraverseParentPermissions(t *testing.T) {
+	identity := LocalIdentity{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}
+	if identity.UID == 0 || identity.GID == 0 {
+		identity = testUnprivilegedIdentities(t, 1)[0]
+	}
+	backend, err := NewLocalBackend(filepath.Join(t.TempDir(), "instances"), &identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := backend.Provision(context.Background(), JobScope{JobID: "traverse-permissions"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(instance.Workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.handoffWorkspace(instance); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{backend.root, instance.root} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0o710 {
+			t.Fatalf("traverse parent %q mode = %#o, want 0710", path, got)
+		}
+		if _, gid := pathOwnership(t, path); gid != identity.GID {
+			t.Fatalf("traverse parent %q gid = %d, want configured gid %d", path, gid, identity.GID)
+		}
+	}
+}
+
 func TestLocalBackendCuratedScratchUsesConfiguredIdentity(t *testing.T) {
 	identity := testUnprivilegedIdentities(t, 1)[0]
 	host, _, _ := changeSetRepoPair(t)
@@ -575,6 +649,52 @@ func testUnprivilegedIdentities(t *testing.T, count int) []LocalIdentity {
 	}
 	t.Skipf("no unprivileged identity configured: need %d distinct uid/gid pairs, found %d", count, len(identities))
 	return nil
+}
+
+func testUnprivilegedIdentitiesWithDistinctGIDs(t *testing.T, count int) []LocalIdentity {
+	t.Helper()
+	data, err := os.ReadFile("/etc/passwd")
+	if err != nil {
+		t.Skipf("no unprivileged identity configured: read /etc/passwd: %v", err)
+	}
+	identities := make([]LocalIdentity, 0, count)
+	seenUIDs := make(map[uint32]struct{})
+	seenGIDs := make(map[uint32]struct{})
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Split(line, ":")
+		if len(fields) < 4 {
+			continue
+		}
+		uid, uidErr := strconv.ParseUint(fields[2], 10, 32)
+		gid, gidErr := strconv.ParseUint(fields[3], 10, 32)
+		if uidErr != nil || gidErr != nil || uid == 0 || gid == 0 || uid == uint64(^uint32(0)) || gid == uint64(^uint32(0)) {
+			continue
+		}
+		convertedUID, convertedGID := uint32(uid), uint32(gid)
+		if _, duplicate := seenUIDs[convertedUID]; duplicate {
+			continue
+		}
+		if _, duplicate := seenGIDs[convertedGID]; duplicate {
+			continue
+		}
+		seenUIDs[convertedUID] = struct{}{}
+		seenGIDs[convertedGID] = struct{}{}
+		identities = append(identities, LocalIdentity{UID: convertedUID, GID: convertedGID})
+		if len(identities) == count {
+			return identities
+		}
+	}
+	t.Skipf("no unprivileged identities configured: need %d distinct uid/gid pairs, found %d", count, len(identities))
+	return nil
+}
+
+func runAsIdentity(identity LocalIdentity, dir, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{
+		Uid: identity.UID, Gid: identity.GID, Groups: []uint32{},
+	}}
+	return cmd.Run()
 }
 
 func chownTree(t *testing.T, root string, identity LocalIdentity) {

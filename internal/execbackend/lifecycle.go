@@ -308,14 +308,20 @@ func (b *LocalBackend) handoffWorkspace(instance *Instance) error {
 	if b.identity == nil {
 		return nil
 	}
-	// Keep backend and instance roots owned by the daemon: execute-only access
-	// lets the configured identity traverse to its workspace without exposing
-	// sibling instance names or writable lifecycle metadata. The configured
-	// root's parent must likewise be traversable by that identity.
-	if err := os.Chmod(b.root, 0o711); err != nil {
+	// Keep backend and instance roots owned by the daemon, assign their group to
+	// the configured execution gid, and grant traverse only to that group. The
+	// operator-managed parent of b.root must already be traversable by the
+	// configured identity.
+	if err := os.Chown(b.root, -1, int(b.identity.GID)); err != nil {
+		return fmt.Errorf("assign local execution-backend root to gid %d: %w", b.identity.GID, err)
+	}
+	if err := os.Chmod(b.root, 0o710); err != nil {
 		return fmt.Errorf("make local execution-backend root traversable for uid %d: %w", b.identity.UID, err)
 	}
-	if err := os.Chmod(instance.root, 0o711); err != nil {
+	if err := os.Chown(instance.root, -1, int(b.identity.GID)); err != nil {
+		return fmt.Errorf("assign local execution instance %q to gid %d: %w", instance.ID, b.identity.GID, err)
+	}
+	if err := os.Chmod(instance.root, 0o710); err != nil {
 		return fmt.Errorf("make local execution instance %q traversable for uid %d: %w", instance.ID, b.identity.UID, err)
 	}
 	if err := chownLocalWorkspace(instance.Workspace, b.identity.UID, b.identity.GID); err != nil {
