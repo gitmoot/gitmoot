@@ -1501,14 +1501,23 @@ func (s *Store) jobIDsByQuery(ctx context.Context, query string) ([]string, erro
 // the PRODUCTION query text — not a hand-copied duplicate — for each. A change to any
 // of these queries is then exactly what the covering-index test asserts a plan for.
 const (
-	jobIDsWithPendingDelegationWorktreeReclaimSQL = `SELECT job_id FROM job_events
-		WHERE kind = 'delegation_worktree_cleanup_skipped'
-		  AND id IN (
+	jobIDsWithPendingDelegationWorktreeReclaimSQL = `SELECT e.job_id FROM job_events e
+		JOIN jobs j ON j.id = e.job_id
+		LEFT JOIN cleanup_obligations o
+		  ON o.owner_job_id = e.job_id
+		 AND o.expected_path = CASE WHEN json_valid(j.payload)
+			THEN json_extract(j.payload, '$.worktree_path') ELSE '' END
+		WHERE e.kind = 'delegation_worktree_cleanup_skipped'
+		  AND e.id IN (
 			SELECT MAX(id) FROM job_events
 			WHERE kind IN ('delegation_worktree_cleanup_skipped', 'delegation_worktree_removed')
 			GROUP BY job_id
 		)
-		ORDER BY job_id`
+		  AND (o.resource_id IS NULL OR (
+			o.state IN ('pending', 'retryable')
+			AND unixepoch(o.next_attempt_at) <= unixepoch('now')
+		  ))
+		ORDER BY e.job_id`
 
 	jobIDsWithPendingAdvanceRetrySQL = `SELECT job_id FROM job_events
 		WHERE kind IN ('advance_started', 'advance_retry')
@@ -1594,6 +1603,9 @@ func (s *Store) JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cu
 		)
 		SELECT j.id
 		FROM job_wt j
+		LEFT JOIN cleanup_obligations obligation
+		  ON obligation.owner_job_id = j.id
+		 AND obligation.expected_path = j.worktree_path
 		WHERE j.state IN ('succeeded', 'failed', 'cancelled')
 		  AND j.ts <= unixepoch(?)
 		  AND COALESCE(j.worktree_path, '') <> ''
@@ -1611,6 +1623,10 @@ func (s *Store) JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cu
 			WHERE e.job_id = j.id
 			  AND e.kind IN ('delegation_worktree_removed', 'delegation_worktree_reclaimed_ttl')
 		  )
+		  AND (obligation.resource_id IS NULL OR (
+			obligation.state IN ('pending', 'retryable')
+			AND unixepoch(obligation.next_attempt_at) <= unixepoch('now')
+		  ))
 		ORDER BY j.id`, cutoffStr, cutoffStr)
 	if err != nil {
 		return nil, err

@@ -343,7 +343,7 @@ Health is the operability view for unattended runs:
   failed, cancelled).
 - **Delegation worktrees** — `/api/health` reports a `worktrees.summary` line
   (`N stale worktrees / X GB`) plus reclaimable, pinned, unproven, and
-  recent-terminal counts and exact bytes.
+  recent-terminal counts, quarantined cleanup obligations, and exact bytes.
 - **Stuck jobs** — blocked jobs (surfaced at any age) plus queued jobs older than
   10 minutes, each with a **derived why-stuck reason** (from the job's latest
   reason event and any resource lock it is waiting on) and how long it has been

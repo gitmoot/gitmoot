@@ -42,6 +42,8 @@ func runJob(args []string, stdout, stderr io.Writer) int {
 		return runJobRun(args[1:], stdout, stderr)
 	case "retry":
 		return runJobRetry(args[1:], stdout, stderr)
+	case "cleanup":
+		return runJobCleanup(args[1:], stdout, stderr)
 	case "gates":
 		return runJobGates(args[1:], stdout, stderr)
 	case "cancel":
@@ -71,6 +73,8 @@ func printJobUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot job transcript --all [--state succeeded,failed] [--since 720h] --export jsonl [--output path]")
 	fmt.Fprintln(w, "  gitmoot job run <id>")
 	fmt.Fprintln(w, "  gitmoot job retry <id>")
+	fmt.Fprintln(w, "  gitmoot job cleanup list [--state pending|retryable|removed|quarantined] [--json]")
+	fmt.Fprintln(w, "  gitmoot job cleanup reopen <resource-id>")
 	fmt.Fprintln(w, "  gitmoot job gates <id> [--json]")
 	fmt.Fprintln(w, "  gitmoot job gates clear <id> --need \"<text>\"|--all")
 	fmt.Fprintln(w, "  gitmoot job cancel <id>")

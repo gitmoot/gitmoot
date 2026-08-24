@@ -3150,6 +3150,83 @@ func TestRetryPendingJobAdvancementsDoesNotAccumulateAdvanceRetry(t *testing.T) 
 	}
 }
 
+// TestRetryPendingJobAdvancementsDoesNotActuateQuarantinedCleanup kills the
+// mutant that lets AdvanceJob ignore a quarantined obligation. The scheduler
+// re-enters the same failed advancement on every pass, so any bypass is counted
+// once per simulated worker tick.
+func TestRetryPendingJobAdvancementsDoesNotActuateQuarantinedCleanup(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	home := t.TempDir()
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "reviewer", runtime.ShellRuntime, "unused", []string{"review"}, "owner/repo")
+	jobID := "job-quarantined-advance-retry"
+	path, err := workflow.DelegationWorktreePath(home, "owner/repo", jobID, "readonly-seat", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: jobID, Agent: "reviewer", Action: "review", Repo: "owner/repo",
+		Branch: "task-1", PullRequest: 1, TaskID: "task-1", HeadSHA: strings.Repeat("a", 40),
+		WorktreePath: path, ReadOnlyWorktree: true,
+	})
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload.Result = &workflow.AgentResult{Decision: "approved", Summary: "approved"}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateJobPayload(ctx, jobID, string(encoded)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateJobState(ctx, jobID, string(workflow.JobSucceeded)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_retry", Message: "persistent merge gate failure"}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for range delegationCleanupRetryBudget {
+		if _, err := store.RecordCleanupObligationFailure(ctx, jobID, path, db.CleanupReasonUnknown, errors.New("persistent cleanup failure"), now, now.Add(time.Minute), delegationCleanupRetryBudget); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manager := &fakeReclaimWorktreeManager{}
+	gate := &cliWorkerFakeMergeGate{err: errors.New("persistent merge gate failure")}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.WorkflowFactory = func(string) workflow.Engine {
+		return workflow.Engine{
+			Store: store, MergeGate: gate, Home: home, DelegationCheckout: checkout,
+			DelegationWorktrees: manager,
+		}
+	}
+	for pass := range 3 {
+		if err := retryPendingJobAdvancements(ctx, worker, "", "", nil, newTickCandidates(store)); err != nil {
+			t.Fatalf("retry pass %d: %v", pass, err)
+		}
+	}
+	if len(manager.removed) != 0 {
+		t.Fatalf("advance retry actuated quarantined cleanup %d times", len(manager.removed))
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("quarantined path changed during advance retries: %v", err)
+	}
+}
+
 func TestRetryPendingJobAdvancementsRecoversStartedAdvancement(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
@@ -3829,12 +3906,18 @@ func TestReclaimSkippedDelegationWorktrees(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			store := daemonWorkerStore(t)
+			home := t.TempDir()
+			store := openCLIJobStore(t, home)
+			t.Cleanup(func() {
+				if err := store.Close(); err != nil {
+					t.Fatalf("Close returned error: %v", err)
+				}
+			})
 			branch := "gitmoot-delegation-x-d1"
-			wt := t.TempDir()
+			wt := managedDelegationReclaimTestPath(t, home, "parent", "d1")
 			jobID := "parent/delegation/d1"
 			payload := workflow.JobPayload{
-				Repo: "owner/repo", DelegationID: "d1", WorktreePath: wt, Branch: branch,
+				Repo: "owner/repo", ParentJobID: "parent", DelegationID: "d1", WorktreePath: wt, Branch: branch,
 				Result: &workflow.AgentResult{Decision: "failed"},
 			}
 			encoded, err := json.Marshal(payload)
@@ -3864,17 +3947,18 @@ func TestReclaimSkippedDelegationWorktrees(t *testing.T) {
 			}
 
 			manager := &fakeReclaimWorktreeManager{branches: map[string]bool{branch: true}}
-			worker := defaultJobWorker(store, io.Discard)
+			worker := defaultJobWorker(store, io.Discard, home)
 			worker.WorkflowFactory = func(string) workflow.Engine {
 				return workflow.Engine{
 					Store:               store,
+					Home:                worker.workflowHome(),
 					DelegationCheckout:  t.TempDir(),
 					DelegationWorktrees: manager,
 					OwnerPIDLive:        func(int64) bool { return false },
 				}
 			}
 
-			if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(worker.Store)); err != nil {
+			if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(worker.Store), time.Now().UTC()); err != nil {
 				t.Fatalf("reclaimSkippedDelegationWorktrees returned error: %v", err)
 			}
 
@@ -3893,8 +3977,12 @@ func TestReclaimSkippedDelegationWorktrees(t *testing.T) {
 				if len(manager.removed) != 0 {
 					t.Fatalf("active foreign owner must keep preserving: removed=%+v", manager.removed)
 				}
-				if !pending {
-					t.Fatalf("cleanup must still be pending while owner active")
+				obligation, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(jobID, wt))
+				if err != nil {
+					t.Fatalf("GetCleanupObligation returned error: %v", err)
+				}
+				if obligation.State != db.CleanupObligationRetryable || obligation.Reason != db.CleanupReasonTerminalDeferred {
+					t.Fatalf("active-owner cleanup obligation = %+v, want retryable terminal deferral", obligation)
 				}
 			}
 		})
@@ -3910,7 +3998,13 @@ func TestReclaimSkippedDelegationWorktrees(t *testing.T) {
 // JobIDsWithPendingDelegationWorktreeReclaim + a per-candidate GetJob.
 func TestReclaimSkippedDelegationWorktreesBoundedToMarkedJobs(t *testing.T) {
 	ctx := context.Background()
-	store := daemonWorkerStore(t)
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close returned error: %v", err)
+		}
+	})
 
 	// A large backlog of terminal jobs with rich, immutable event history but NO
 	// cleanup marker. These must stay out of the candidate set entirely.
@@ -3941,10 +4035,10 @@ func TestReclaimSkippedDelegationWorktreesBoundedToMarkedJobs(t *testing.T) {
 
 	// The one genuinely-pending delegation child.
 	branch := "gitmoot-delegation-x-d1"
-	wt := t.TempDir()
+	wt := managedDelegationReclaimTestPath(t, home, "parent", "d1")
 	pendingID := "parent/delegation/d1"
 	payload := workflow.JobPayload{
-		Repo: "owner/repo", DelegationID: "d1", WorktreePath: wt, Branch: branch,
+		Repo: "owner/repo", ParentJobID: "parent", DelegationID: "d1", WorktreePath: wt, Branch: branch,
 		Result: &workflow.AgentResult{Decision: "failed"},
 	}
 	encoded, err := json.Marshal(payload)
@@ -3962,17 +4056,18 @@ func TestReclaimSkippedDelegationWorktreesBoundedToMarkedJobs(t *testing.T) {
 	}
 
 	manager := &fakeReclaimWorktreeManager{branches: map[string]bool{branch: true}}
-	worker := defaultJobWorker(store, io.Discard)
+	worker := defaultJobWorker(store, io.Discard, home)
 	worker.WorkflowFactory = func(string) workflow.Engine {
 		return workflow.Engine{
 			Store:               store,
+			Home:                worker.workflowHome(),
 			DelegationCheckout:  t.TempDir(),
 			DelegationWorktrees: manager,
 			OwnerPIDLive:        func(int64) bool { return false },
 		}
 	}
 
-	if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(worker.Store)); err != nil {
+	if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(worker.Store), time.Now().UTC()); err != nil {
 		t.Fatalf("reclaimSkippedDelegationWorktrees returned error: %v", err)
 	}
 

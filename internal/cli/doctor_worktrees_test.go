@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -87,6 +88,10 @@ func TestBuildDelegationWorktreeDoctorCheckThresholds(t *testing.T) {
 	if warn.OK || warn.Required || !strings.Contains(warn.Detail, "10 stale worktrees / 2.0 GB") {
 		t.Fatalf("warning check = %+v", warn)
 	}
+	quarantined := buildDelegationWorktreeDoctorCheck(delegationWorktreeUsage{Quarantined: 1, Summary: "0 stale worktrees / 0 B under /tmp/home/worktrees"})
+	if quarantined.OK || !strings.Contains(quarantined.Detail, "1 cleanup quarantined") {
+		t.Fatalf("quarantined check = %+v", quarantined)
+	}
 }
 
 func TestHealthEndpointSurfacesDelegationWorktreeUsage(t *testing.T) {
@@ -105,6 +110,11 @@ func TestHealthEndpointSurfacesDelegationWorktreeUsage(t *testing.T) {
 		ParentJobID: "parent", DelegationID: "pinned",
 		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", DelegationID: "pinned", WorktreePath: path}),
 	}, string(workflow.JobBlocked))
+	for attempt := 0; attempt < delegationCleanupRetryBudget; attempt++ {
+		if _, err := store.RecordCleanupObligationFailure(context.Background(), "quarantined", filepath.Join(paths.Home, "worktrees", "owner--repo", "delegations", "parent", "quarantined"), db.CleanupReasonUnknown, errors.New("stuck"), time.Now().UTC(), time.Now().UTC().Add(time.Minute), delegationCleanupRetryBudget); err != nil {
+			t.Fatal(err)
+		}
+	}
 	store.Close()
 
 	stubOnDiskBuild(t, "", "")
@@ -120,7 +130,7 @@ func TestHealthEndpointSurfacesDelegationWorktreeUsage(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload.Worktrees.Stale != 1 || payload.Worktrees.Pinned != 1 || payload.Worktrees.SizeBytes != int64(len("dashboard")) {
+	if payload.Worktrees.Stale != 1 || payload.Worktrees.Pinned != 1 || payload.Worktrees.Quarantined != 1 || payload.Worktrees.SizeBytes != int64(len("dashboard")) {
 		t.Fatalf("worktrees = %+v", payload.Worktrees)
 	}
 	if !strings.Contains(payload.Worktrees.Summary, "1 stale worktree") {

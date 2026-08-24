@@ -97,7 +97,7 @@ func TestCleanupImplementDelegationWorktreeRemovesWorktreeAndBranch(t *testing.T
 	engine.DelegationWorktrees = manager
 
 	// The worktree path must exist on disk so the idempotency stat check proceeds.
-	wt := t.TempDir()
+	wt := managedEngineWorktree(t, &engine, "job-1")
 	payload := JobPayload{
 		DelegationID: "d1",
 		WorktreePath: wt,
@@ -156,7 +156,7 @@ func TestCleanupImplementDelegationWorktreePreservesWhileConsumerLive(t *testing
 	legPayload := JobPayload{
 		ParentJobID:  "parent-job",
 		DelegationID: "produce",
-		WorktreePath: t.TempDir(),
+		WorktreePath: managedEngineWorktree(t, &engine, "parent-produce"),
 		Branch:       branch,
 		Result:       &AgentResult{Decision: "implemented"},
 	}
@@ -222,7 +222,7 @@ func TestCleanupConsumedImplementLegWorktreesAfterIntegrationTerminal(t *testing
 		},
 	})
 
-	legWt := t.TempDir()
+	legWt := managedEngineWorktree(t, &engine, "parent-produce")
 	insertCompletedJob(t, store, db.Job{
 		ID: "parent-job/delegation/produce", Agent: "producer", Type: "implement",
 		ParentJobID: "parent-job", DelegationID: "produce",
@@ -268,7 +268,7 @@ func TestAdvanceJobTerminalImplementLegFiresCleanup(t *testing.T) {
 		manager := &fakeWorktreeManager{existingBranches: map[string]bool{branch: true}}
 		engine.DelegationWorktrees = manager
 
-		wt := t.TempDir()
+		wt := managedEngineWorktree(t, &engine, "leg-impl")
 		insertCompletedJob(t, store, db.Job{ID: "leg-impl", Agent: "producer", Type: "implement", DelegationID: "d1"}, JobPayload{
 			DelegationID: "d1", WorktreePath: wt, Branch: branch,
 			Result: &AgentResult{Decision: "implemented", Summary: "done"},
@@ -293,7 +293,7 @@ func TestAdvanceJobTerminalImplementLegFiresCleanup(t *testing.T) {
 		manager := &fakeWorktreeManager{existingBranches: map[string]bool{branch: true}}
 		engine.DelegationWorktrees = manager
 
-		wt := t.TempDir()
+		wt := managedEngineWorktree(t, &engine, "leg-fail")
 		insertCompletedJob(t, store, db.Job{ID: "leg-fail", Agent: "producer", Type: "implement", DelegationID: "d2"}, JobPayload{
 			DelegationID: "d2", WorktreePath: wt, Branch: branch,
 			Result: &AgentResult{Decision: "failed", Summary: "boom"},
@@ -364,7 +364,7 @@ func TestAdvanceJobTerminalImplementLegCleansWhileSelfHoldsLock(t *testing.T) {
 		store := openEngineStore(t)
 		branch := "gitmoot-delegation-x-self"
 		engine, manager := newEngine(t, store, branch)
-		wt := t.TempDir()
+		wt := managedEngineWorktree(t, &engine, "leg-self")
 		jobID := "leg-self"
 		insertCompletedJob(t, store, db.Job{ID: jobID, Agent: "producer", Type: "implement", DelegationID: "d1"}, JobPayload{
 			DelegationID: "d1", WorktreePath: wt, Branch: branch,
@@ -393,7 +393,7 @@ func TestAdvanceJobTerminalImplementLegCleansWhileSelfHoldsLock(t *testing.T) {
 		store := openEngineStore(t)
 		branch := "gitmoot-delegation-x-foreign"
 		engine, manager := newEngine(t, store, branch)
-		wt := t.TempDir()
+		wt := managedEngineWorktree(t, &engine, "leg-foreign")
 		jobID := "leg-foreign"
 		insertCompletedJob(t, store, db.Job{ID: jobID, Agent: "producer", Type: "implement", DelegationID: "d2"}, JobPayload{
 			DelegationID: "d2", WorktreePath: wt, Branch: branch,
@@ -440,7 +440,7 @@ func TestCleanupImplementDelegationWorktreeSkipsIntegrationDep(t *testing.T) {
 		},
 	})
 
-	wt := t.TempDir()
+	wt := managedEngineWorktree(t, &engine, "parent-d1")
 	payload := JobPayload{
 		ParentJobID:  "parent-job",
 		DelegationID: "d1",
@@ -490,7 +490,7 @@ func TestCleanupImplementDelegationWorktreeRefusesWhileRuntimeOwnerActive(t *tes
 			engine.DelegationCheckout = t.TempDir()
 			engine.DelegationWorktrees = manager
 
-			wt := t.TempDir()
+			wt := managedEngineWorktree(t, &engine, "runtime-owner")
 			// Decision "failed" mirrors the bug: the recovered copy fails on the dirty
 			// checkout. Failed legs are always merge-safe, so the merge guard does not
 			// short-circuit and the liveness guard is exercised.
@@ -569,7 +569,7 @@ func TestCleanupImplementDelegationWorktreeLeaseExpiryBoundary(t *testing.T) {
 			engine.DelegationCheckout = t.TempDir()
 			engine.DelegationWorktrees = manager
 
-			wt := t.TempDir()
+			wt := managedEngineWorktree(t, &engine, "lease-boundary")
 			jobID := "parent-job/delegation/task-7302"
 			payload := JobPayload{DelegationID: "d1", WorktreePath: wt, Branch: branch, Result: &AgentResult{Decision: "failed"}}
 			engine.cleanupImplementDelegationWorktree(ctx, jobID, "implement", payload)
@@ -611,7 +611,7 @@ func TestCleanupImplementDelegationWorktreeSkipIsIdempotent(t *testing.T) {
 	engine.DelegationCheckout = t.TempDir()
 	engine.DelegationWorktrees = manager
 
-	wt := t.TempDir()
+	wt := managedEngineWorktree(t, &engine, "task-idem")
 	jobID := "parent-job/delegation/task-idem"
 	payload := JobPayload{DelegationID: "d1", WorktreePath: wt, Branch: branch, Result: &AgentResult{Decision: "failed"}}
 
@@ -647,7 +647,7 @@ func TestCleanupImplementDelegationWorktreeNoBranchDeleter(t *testing.T) {
 	engine.DelegationCheckout = t.TempDir()
 	engine.DelegationWorktrees = manager
 
-	wt := t.TempDir()
+	wt := managedEngineWorktree(t, &engine, "no-deleter")
 	payload := JobPayload{DelegationID: "d1", WorktreePath: wt, Branch: "gitmoot-delegation-x-d1", Result: &AgentResult{Decision: "implemented"}}
 	engine.cleanupImplementDelegationWorktree(ctx, "job-1", "implement", payload)
 
@@ -686,7 +686,7 @@ func TestCleanupImplementDelegationWorktreeNoChecker(t *testing.T) {
 	engine.DelegationWorktrees = manager
 
 	branch := "gitmoot-delegation-x-d1"
-	wt := t.TempDir()
+	wt := managedEngineWorktree(t, &engine, "no-checker")
 	payload := JobPayload{DelegationID: "d1", WorktreePath: wt, Branch: branch, Result: &AgentResult{Decision: "implemented"}}
 	engine.cleanupImplementDelegationWorktree(ctx, "job-1", "implement", payload)
 	if len(manager.removed) != 1 || len(manager.deleted) != 1 {

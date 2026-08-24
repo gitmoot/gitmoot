@@ -2045,4 +2045,33 @@ CREATE TABLE execbackend_attempts (
 	PRIMARY KEY (job_id, attempt, lifecycle_generation)
 );
 	`,
+	// #1572 durable delegation-worktree cleanup obligations. Job events remain
+	// audit output; this row is the restart-safe retry state. The resource id is
+	// derived from (owner job, canonical expected path), while both values remain
+	// explicit so an operator can prove identity before reopening a quarantine.
+	// Removed is terminal; quarantined requires an explicit operator reopen.
+	`
+CREATE TABLE cleanup_obligations (
+	resource_id TEXT PRIMARY KEY,
+	resource_kind TEXT NOT NULL CHECK(resource_kind = 'delegation_worktree'),
+	owner_job_id TEXT NOT NULL,
+	expected_path TEXT NOT NULL,
+	state TEXT NOT NULL CHECK(state IN ('pending', 'retryable', 'removed', 'quarantined')),
+	reason TEXT NOT NULL CHECK(reason IN (
+		'pending', 'removed', 'operator_reopened', 'terminal_cleanup_deferred',
+		'context_interrupted', 'job_lookup', 'runner_resolution', 'checkout_lock',
+		'identity_or_containment', 'unknown'
+	)),
+	attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+	next_attempt_at TEXT NOT NULL,
+	last_error TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX idx_cleanup_obligations_owner_path
+	ON cleanup_obligations(owner_job_id, expected_path);
+CREATE INDEX idx_cleanup_obligations_due
+	ON cleanup_obligations(state, next_attempt_at, owner_job_id)
+	WHERE state IN ('pending', 'retryable');
+	`,
 }

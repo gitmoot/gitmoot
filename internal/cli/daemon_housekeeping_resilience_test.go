@@ -84,7 +84,7 @@ func (h *housekeepingDispatchHarness) runAndAssertDispatched(t *testing.T, repoF
 func TestSkippedDelegationWorktreeReclaimFailureDoesNotBlockDispatch(t *testing.T) {
 	h := newHousekeepingDispatchHarness(t, "queued-after-skipped-reclaim")
 	const failedJobID = "parent/delegation/skipped"
-	worktreePath := t.TempDir()
+	worktreePath := managedDelegationReclaimTestPath(t, h.home, "parent", "skipped")
 	seedCLIJob(t, h.store, db.Job{
 		ID: failedJobID, Agent: "reader", Type: "implement", State: string(workflow.JobFailed),
 		Repo: "owner/repo", ParentJobID: "parent", DelegationID: "skipped",
@@ -112,6 +112,66 @@ func TestSkippedDelegationWorktreeReclaimFailureDoesNotBlockDispatch(t *testing.
 	}
 
 	h.runAndAssertDispatched(t, "owner/repo", "store is required")
+}
+
+// TestCleanupAccountingFailureDoesNotBlockDispatch kills the mutant that
+// returns a selected candidate's cleanup-accounting failure from the worker
+// tick before queued-job dispatch. The failed durable write must stop cleanup,
+// while the unrelated queued job is still admitted.
+func TestCleanupAccountingFailureDoesNotBlockDispatch(t *testing.T) {
+	h := newHousekeepingDispatchHarness(t, "queued-after-cleanup-accounting")
+	const failedJobID = "parent/delegation/accounting"
+	worktreePath := managedDelegationReclaimTestPath(t, h.home, "parent", "accounting")
+	seedCLIJob(t, h.store, db.Job{
+		ID: failedJobID, Agent: "reader", Type: "implement", State: string(workflow.JobFailed),
+		Repo: "owner/repo", ParentJobID: "parent", DelegationID: "accounting",
+		Payload: mustJobPayload(t, workflow.JobPayload{
+			Repo: "owner/repo", ParentJobID: "parent", DelegationID: "accounting",
+			WorktreePath: worktreePath, Branch: "gitmoot-delegation-accounting",
+			Result: &workflow.AgentResult{Decision: "failed"},
+		}),
+	}, "seed accounting-failure delegation")
+	if err := h.store.AddJobEvent(h.ctx, db.JobEvent{
+		JobID: failedJobID, Kind: "delegation_worktree_cleanup_skipped", Message: "preserved",
+	}); err != nil {
+		t.Fatalf("add skipped cleanup marker: %v", err)
+	}
+	if _, err := h.store.EnsureCleanupObligation(h.ctx, failedJobID, worktreePath, time.Now().UTC().Add(-time.Minute)); err != nil {
+		t.Fatalf("seed cleanup obligation: %v", err)
+	}
+	raw, err := sql.Open("sqlite", h.store.DatabasePath())
+	if err != nil {
+		t.Fatalf("open trigger connection: %v", err)
+	}
+	t.Cleanup(func() { raw.Close() })
+	if _, err := raw.Exec(`
+CREATE TRIGGER fail_tick_cleanup_accounting
+BEFORE UPDATE ON cleanup_obligations
+WHEN OLD.owner_job_id = 'parent/delegation/accounting'
+BEGIN
+  SELECT RAISE(ABORT, 'injected tick cleanup accounting failure');
+END;`); err != nil {
+		t.Fatalf("create cleanup accounting trigger: %v", err)
+	}
+	manager := &fakeReclaimWorktreeManager{branches: map[string]bool{"gitmoot-delegation-accounting": true}}
+	h.worker.WorkflowFactory = func(string) workflow.Engine {
+		return workflow.Engine{
+			Store: h.store, Home: h.worker.workflowHome(), DelegationCheckout: h.checkout,
+			DelegationWorktrees: manager,
+		}
+	}
+
+	h.runAndAssertDispatched(t, "owner/repo", "injected tick cleanup accounting failure")
+	if len(manager.removed) != 0 || len(manager.deleted) != 0 {
+		t.Fatalf("unaccounted cleanup actuated: removed=%v deleted=%v", manager.removed, manager.deleted)
+	}
+	obligation, err := h.store.GetCleanupObligation(h.ctx, db.CleanupObligationResourceID(failedJobID, worktreePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obligation.State != db.CleanupObligationPending || obligation.AttemptCount != 0 {
+		t.Fatalf("cleanup obligation changed despite failed accounting: %+v", obligation)
+	}
 }
 
 func TestPendingJobAdvancementFailureDoesNotBlockDispatch(t *testing.T) {

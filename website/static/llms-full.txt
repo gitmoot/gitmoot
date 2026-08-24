@@ -801,7 +801,12 @@ Delegation worktrees have a separate default-on retention bound:
 reclaimable/pinned/unproven breakdown; dashboard `/api/health` mirrors it.
 Candidate-local lookup, runner, and removal failures skip only that worktree;
 later candidates continue. Repeated failures are logged three times per path,
-then suppressed. Candidate-query and store-wide lookup failures remain fatal.
+then suppressed. Each failed cleanup also advances a durable obligation with a
+one-minute retry delay; after three failures it becomes `quarantined` and leaves
+automatic selection. Doctor and `/api/health` report quarantined obligations;
+inspect them with `gitmoot job cleanup list --state quarantined` and explicitly
+reopen one with `gitmoot job cleanup reopen <resource-id>`. Candidate-query and
+store-wide lookup failures remain fatal.
 
 Never-started plans have a separate destructive opt-in:
 `[workflow].planned_ttl = "720h"`. It is disabled by default; unset, empty,
@@ -2715,11 +2720,16 @@ debugging access. Set it to `"0"` to disable the TTL pass. Aged final owners are
 force-removed even when dirty, Git worktree metadata is pruned, and
 `delegation_worktree_reclaimed_ttl` is recorded. The dashboard `/api/health`
 response exposes the same count, bytes, path, breakdown, and summary in its
-top-level `worktrees` field.
+top-level `worktrees` field, including the number of cleanup obligations in
+terminal quarantine.
 
 One unreclaimable candidate does not stop the pass: candidate-local lookup,
 runner, and removal failures are skipped while later paths continue. The daemon
 logs the first three failures for a path and suppresses repeats.
+Each failure advances a durable, restart-safe cleanup obligation. Retries wait
+one minute and stop after the third failure in `quarantined`; quarantined paths
+are not selected again until an operator inspects `gitmoot job cleanup list
+--state quarantined` and runs `gitmoot job cleanup reopen <resource-id>`.
 Candidate-query and store-wide lookup failures still abort the pass and surface
 normally.
 
@@ -7472,7 +7482,7 @@ Health is the operability view for unattended runs:
   failed, cancelled).
 - **Delegation worktrees** — `/api/health` reports a `worktrees.summary` line
   (`N stale worktrees / X GB`) plus reclaimable, pinned, unproven, and
-  recent-terminal counts and exact bytes.
+  recent-terminal counts, quarantined cleanup obligations, and exact bytes.
 - **Stuck jobs** — blocked jobs (surfaced at any age) plus queued jobs older than
   10 minutes, each with a **derived why-stuck reason** (from the job's latest
   reason event and any resource lock it is waiting on) and how long it has been
@@ -10177,7 +10187,9 @@ actionable remediation hint) and live-probes the Claude credential selected by
 after install and before starting the daemon. It also reports delegation
 worktree count and logical disk size, warning at 10 stale worktrees or 1 GB and
 distinguishing aged-final reclaimable owners from pinned non-final owners. A
-running job whose directly recorded runtime PID is confirmably dead is a
+non-zero quarantined cleanup-obligation count is also a worktree warning;
+inspect those rows with `gitmoot job cleanup list --state quarantined`. A running
+job whose directly recorded runtime PID is confirmably dead is a
 required `stuck jobs` failure; legacy jobs with no recorded PID and hosts where
 process identity cannot be verified are neutral and produce no ghost-job
 finding.
@@ -12289,6 +12301,8 @@ gitmoot job transcript <job-id> --export md|jsonl [--output <path>] [--log-path 
 gitmoot job transcript --all [--state succeeded,failed] [--since 720h] --export jsonl [--output <path>]
 gitmoot job events <job-id>
 gitmoot job retry <job-id>
+gitmoot job cleanup list [--state pending|retryable|removed|quarantined] [--json]
+gitmoot job cleanup reopen <resource-id>
 gitmoot job gates <job-id>                                         # list resumable gates; add --json
 gitmoot job gates clear <job-id> --need "<text>"|--all             # satisfy gate(s); auto-resume on last
 gitmoot job cancel <job-id>                                        # one queued|running|blocked job
@@ -15414,8 +15428,12 @@ Blocked, queued, and running owners remain pinned; `gitmoot doctor` reports the
 reclaimable/pinned/unproven counts and logical size.
 Candidate-local lookup, runner, and removal failures skip only that worktree;
 later candidates continue. The daemon logs three failures per path before
-suppressing repeats. Candidate-query and store-wide lookup failures remain
-fatal.
+suppressing repeats. A restart-safe cleanup obligation delays retries by one
+minute and becomes terminal `quarantined` after the third failure; doctor and
+`/api/health` report that count. Use `gitmoot job cleanup list --state
+quarantined` to inspect identities and paths, then `gitmoot job cleanup reopen
+<resource-id>` after repair. Candidate-query and store-wide lookup failures
+remain fatal.
 
 Never-started `planned` tasks use a separate opt-in policy:
 `[workflow].planned_ttl = "720h"`. It is disabled by default; unset, empty,
@@ -16852,11 +16870,16 @@ TTL reclaim candidate. A successful force-remove and metadata prune records
 `delegation_worktree_reclaimed_ttl`.
 Candidate-local lookup, runner, and removal failures skip only that worktree so
 later candidates continue; candidate-query and store-wide lookup failures still
-abort. Repeated failures log three times per path before suppression.
+abort. Repeated failures log three times per path before suppression. Cleanup
+attempt state is also durable: every failure waits one minute before retry, and
+the third failure moves the obligation to terminal `quarantined` state. A
+quarantined target is excluded from automation until an operator verifies its
+job and expected path, then runs `gitmoot job cleanup reopen <resource-id>`.
 
 `gitmoot doctor` and dashboard `/api/health` surface stale count and logical
 size, split into reclaimable final owners, pinned non-final owners, and unproven
-directories. Pinned and unproven worktrees are observation-only.
+directories, plus the quarantined cleanup count. Pinned, unproven, and
+quarantined worktrees are observation-only.
 
 For manual relief, list
 `$GITMOOT_HOME/worktrees/*/delegations/*/*`, map each path to its job's

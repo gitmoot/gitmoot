@@ -25,7 +25,9 @@ actionable remediation hint) and live-probes the Claude credential selected by
 after install and before starting the daemon. It also reports delegation
 worktree count and logical disk size, warning at 10 stale worktrees or 1 GB and
 distinguishing aged-final reclaimable owners from pinned non-final owners. A
-running job whose directly recorded runtime PID is confirmably dead is a
+non-zero quarantined cleanup-obligation count is also a worktree warning;
+inspect those rows with `gitmoot job cleanup list --state quarantined`. A running
+job whose directly recorded runtime PID is confirmably dead is a
 required `stuck jobs` failure; legacy jobs with no recorded PID and hosts where
 process identity cannot be verified are neutral and produce no ghost-job
 finding.
@@ -2137,6 +2139,8 @@ gitmoot job transcript <job-id> --export md|jsonl [--output <path>] [--log-path 
 gitmoot job transcript --all [--state succeeded,failed] [--since 720h] --export jsonl [--output <path>]
 gitmoot job events <job-id>
 gitmoot job retry <job-id>
+gitmoot job cleanup list [--state pending|retryable|removed|quarantined] [--json]
+gitmoot job cleanup reopen <resource-id>
 gitmoot job gates <job-id>                                         # list resumable gates; add --json
 gitmoot job gates clear <job-id> --need "<text>"|--all             # satisfy gate(s); auto-resume on last
 gitmoot job cancel <job-id>                                        # one queued|running|blocked job

@@ -856,8 +856,12 @@ Blocked, queued, and running owners remain pinned; `gitmoot doctor` reports the
 reclaimable/pinned/unproven counts and logical size.
 Candidate-local lookup, runner, and removal failures skip only that worktree;
 later candidates continue. The daemon logs three failures per path before
-suppressing repeats. Candidate-query and store-wide lookup failures remain
-fatal.
+suppressing repeats. A restart-safe cleanup obligation delays retries by one
+minute and becomes terminal `quarantined` after the third failure; doctor and
+`/api/health` report that count. Use `gitmoot job cleanup list --state
+quarantined` to inspect identities and paths, then `gitmoot job cleanup reopen
+<resource-id>` after repair. Candidate-query and store-wide lookup failures
+remain fatal.
 
 Never-started `planned` tasks use a separate opt-in policy:
 `[workflow].planned_ttl = "720h"`. It is disabled by default; unset, empty,
