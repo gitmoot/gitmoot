@@ -1782,11 +1782,7 @@ WHERE repo = '' AND json_valid(payload) AND COALESCE(json_extract(payload, '$.re
 	`
 CREATE TABLE org_role_unavailable (
 	role TEXT PRIMARY KEY,
-	reason TEXT NOT NULL CHECK(reason IN (
-		'pending', 'removed', 'operator_reopened', 'terminal_cleanup_deferred',
-		'context_interrupted', 'job_lookup', 'runner_resolution', 'checkout_lock',
-		'identity_or_containment', 'unknown'
-	)),
+	reason TEXT NOT NULL,
 	unavailable_until TEXT NOT NULL,
 	escalated_at TEXT NOT NULL DEFAULT '',
 	updated_at TEXT NOT NULL
@@ -2061,7 +2057,11 @@ CREATE TABLE cleanup_obligations (
 	owner_job_id TEXT NOT NULL,
 	expected_path TEXT NOT NULL,
 	state TEXT NOT NULL CHECK(state IN ('pending', 'retryable', 'removed', 'quarantined')),
-	reason TEXT NOT NULL,
+	reason TEXT NOT NULL CHECK(reason IN (
+		'pending', 'removed', 'operator_reopened', 'terminal_cleanup_deferred',
+		'context_interrupted', 'job_lookup', 'runner_resolution', 'checkout_lock',
+		'identity_or_containment', 'unknown'
+	)),
 	attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
 	next_attempt_at TEXT NOT NULL,
 	last_error TEXT NOT NULL DEFAULT '',
