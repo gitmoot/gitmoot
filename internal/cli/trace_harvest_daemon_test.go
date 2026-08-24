@@ -97,6 +97,11 @@ func TestDaemonOutcomeHarvesterFailSafeOnBadConfig(t *testing.T) {
 // leaves OutcomeHarvester nil with no [skillopt] config, so the engine constructs
 // no Outcome and harvests nothing (byte-identical default).
 func TestDaemonWorkflowEngineNilHarvesterByDefault(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if _, err := config.DefaultPaths(); err != nil {
+		t.Fatal(err)
+	}
+
 	store := openHarvestStore(t)
 	engine := daemonWorkflowEngine(store, github.NoopClient{}, "/tmp/gitmoot-checkout", "")
 	if engine.OutcomeHarvester != nil {

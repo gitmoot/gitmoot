@@ -147,6 +147,11 @@ func TestResolveEscalationTTLTable(t *testing.T) {
 // invariant the #446/#459 seam shares: a raw --home and the already-resolved
 // <home>/.gitmoot root resolve identically with no phantom doubled home.
 func TestResolveBlockedTTLShapeTolerantNoPhantom(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if _, err := config.DefaultPaths(); err != nil {
+		t.Fatal(err)
+	}
+
 	// A positive TTL resolves identically for BOTH the raw --home and the resolved
 	// <home>/.gitmoot root, creating no phantom in either case.
 	positive := initHomeWithBlockedTTL(t, "48h")
