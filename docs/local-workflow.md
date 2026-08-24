@@ -160,7 +160,8 @@ reclaimable/pinned/unproven breakdown; dashboard `/api/health` mirrors it.
 Candidate-local lookup, runner, and removal failures skip only that worktree;
 later candidates continue. Repeated failures are logged three times per path,
 then suppressed, while a five-minute summary reports considered, reclaimed, and
-skipped counts. Candidate-query and store-wide lookup failures remain fatal.
+skipped counts across the fleet sweep. Candidate-query and store-wide lookup
+failures remain fatal.
 
 Never-started plans have a separate destructive opt-in:
 `[workflow].planned_ttl = "720h"`. It is disabled by default; unset, empty,

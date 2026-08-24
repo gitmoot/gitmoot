@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -29,24 +30,58 @@ func resetDelegationReclaimAccountingForTest(t *testing.T) {
 	delegationReclaimAccounting.Unlock()
 }
 
-type selectiveReclaimManager struct {
-	fakeReclaimWorktreeManager
-	failPath string
-	err      error
-}
+// TestDelegationReclaimFleetSummaryVolumeBoundedAcrossRepos pins the summary
+// at the fleet-sweep boundary. Moving emission back into each repo tick makes
+// this produce one line per enabled repo and fail.
+func TestDelegationReclaimFleetSummaryVolumeBoundedAcrossRepos(t *testing.T) {
+	const repoCount = 4
+	for _, tc := range []struct {
+		name       string
+		candidate  bool
+		considered int
+		skipped    int
+	}{
+		{name: "zero_candidates_volume"},
+		{name: "fleet_totals_include_last_repo", candidate: true, considered: 1, skipped: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetDelegationReclaimAccountingForTest(t)
+			ctx := context.Background()
+			store := daemonWorkerStore(t)
+			for i := 0; i < repoCount; i++ {
+				seedDaemonWorkerRepo(t, store, fmt.Sprintf("owner/repo%d", i), t.TempDir())
+			}
+			now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+			if tc.candidate {
+				repos, err := store.ListRepos(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				lastRepo := repos[len(repos)-1].FullName()
+				seedReclaimResilienceCandidateForRepo(t, store, "last-repo-candidate", lastRepo, t.TempDir(), now, true, true)
+			}
+			var output bytes.Buffer
+			worker := defaultJobWorker(store, &output)
+			tracker := newInflightJobTracker(ctx)
+			defer tracker.drain(io.Discard, time.Second)
 
-func (m *selectiveReclaimManager) RemoveWorktreeForce(_ context.Context, path string) error {
-	if filepath.Clean(path) == filepath.Clean(m.failPath) {
-		return m.err
+			if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", &output, now, nil, tracker); err != nil {
+				t.Fatalf("runEnabledRepoWorkerTicksTracked: %v", err)
+			}
+			for _, mode := range []string{"skipped", "aged"} {
+				line := fmt.Sprintf("%s delegation worktree reclaim: considered %d, reclaimed 0, skipped %d", mode, tc.considered, tc.skipped)
+				if got := strings.Count(output.String(), line); got != 1 {
+					t.Fatalf("%s fleet summary count = %d, want 1 across %d enabled repos:\n%s", mode, got, repoCount, output.String())
+				}
+			}
+		})
 	}
-	m.removed = append(m.removed, path)
-	return nil
 }
 
-func seedReclaimResilienceCandidate(t *testing.T, store *db.Store, id string, path string, now time.Time, pendingMarker bool, badRunner bool) {
+func seedReclaimResilienceCandidateForRepo(t *testing.T, store *db.Store, id string, repo string, path string, now time.Time, pendingMarker bool, badRunner bool) {
 	t.Helper()
 	payload := workflow.JobPayload{
-		Repo: "owner/repo", DelegationID: id, WorktreePath: path, ReadOnlyWorktree: true,
+		Repo: repo, DelegationID: id, WorktreePath: path, ReadOnlyWorktree: true,
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -65,7 +100,7 @@ func seedReclaimResilienceCandidate(t *testing.T, store *db.Store, id string, pa
 	}
 	seedCLIJob(t, store, db.Job{
 		ID: id, Agent: "reader", Type: "ask", State: string(workflow.JobFailed),
-		Repo: "owner/repo", ParentJobID: "parent", DelegationID: id, Payload: string(encoded),
+		Repo: repo, ParentJobID: "parent", DelegationID: id, Payload: string(encoded),
 	}, "seed reclaim resilience candidate")
 	backdateJobUpdatedAt(t, store.DatabasePath(), id, now.Add(-73*time.Hour))
 	if pendingMarker {
@@ -75,6 +110,25 @@ func seedReclaimResilienceCandidate(t *testing.T, store *db.Store, id string, pa
 			t.Fatal(err)
 		}
 	}
+}
+
+type selectiveReclaimManager struct {
+	fakeReclaimWorktreeManager
+	failPath string
+	err      error
+}
+
+func (m *selectiveReclaimManager) RemoveWorktreeForce(_ context.Context, path string) error {
+	if filepath.Clean(path) == filepath.Clean(m.failPath) {
+		return m.err
+	}
+	m.removed = append(m.removed, path)
+	return nil
+}
+
+func seedReclaimResilienceCandidate(t *testing.T, store *db.Store, id string, path string, now time.Time, pendingMarker bool, badRunner bool) {
+	t.Helper()
+	seedReclaimResilienceCandidateForRepo(t, store, id, "owner/repo", path, now, pendingMarker, badRunner)
 }
 
 func mutateReclaimCandidateColumn(t *testing.T, store *db.Store, statement string, args ...any) {

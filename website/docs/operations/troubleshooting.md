@@ -528,8 +528,9 @@ prunes Git worktree metadata, and records
 Blocked, queued, and running owners remain pinned and are never force-removed.
 Candidate-local lookup, runner, and removal failures skip only that worktree;
 later candidates continue. The daemon logs three failures per path before
-suppressing repeats and emits a five-minute considered/reclaimed/skipped
-summary. Candidate-query and store-wide lookup failures remain fatal.
+suppressing repeats and emits a five-minute fleet-wide
+considered/reclaimed/skipped summary. Candidate-query and store-wide lookup
+failures remain fatal.
 
 For immediate relief, list candidate directories and prove ownership before
 removing anything:

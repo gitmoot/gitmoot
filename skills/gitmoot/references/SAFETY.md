@@ -502,7 +502,8 @@ TTL reclaim candidate. A successful force-remove and metadata prune records
 Candidate-local lookup, runner, and removal failures skip only that worktree so
 later candidates continue; candidate-query and store-wide lookup failures still
 abort. Repeated failures log three times per path before suppression, and a
-five-minute summary reports considered, reclaimed, and skipped counts.
+five-minute fleet-wide summary reports considered, reclaimed, and skipped
+counts.
 
 `gitmoot doctor` and dashboard `/api/health` surface stale count and logical
 size, split into reclaimable final owners, pinned non-final owners, and unproven

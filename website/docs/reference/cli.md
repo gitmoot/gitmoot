@@ -1806,8 +1806,9 @@ final job owners older than the TTL are force-reclaimed. Blocked, queued, and
 running owners remain pinned and are reported by `gitmoot doctor`.
 Candidate-local lookup, runner, and removal failures skip only that worktree;
 later candidates continue. Repeated failures log three times per path before
-suppression, and a five-minute summary reports considered, reclaimed, and
-skipped counts. Candidate-query and store-wide lookup failures remain fatal.
+suppression, and a five-minute fleet-wide summary reports considered,
+reclaimed, and skipped counts. Candidate-query and store-wide lookup failures
+remain fatal.
 
 `[workflow].planned_ttl = "720h"` is a separate repository opt-in for old
 never-started plans. It is disabled by default; unset, empty, `"0"`, and invalid

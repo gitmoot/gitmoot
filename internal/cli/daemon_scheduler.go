@@ -92,6 +92,12 @@ type delegationReclaimPassStats struct {
 	skipped    int
 }
 
+func (s *delegationReclaimPassStats) add(other delegationReclaimPassStats) {
+	s.considered += other.considered
+	s.reclaimed += other.reclaimed
+	s.skipped += other.skipped
+}
+
 func delegationReclaimPath(jobID string, payload string) string {
 	if parsed, err := workflow.ParseJobPayload(payload); err == nil {
 		return canonicalDelegationReclaimPath(jobID, parsed.WorktreePath)
@@ -162,8 +168,8 @@ func logDelegationReclaimFailure(stdout io.Writer, mode string, phase string, jo
 	}
 }
 
-func logDelegationReclaimSummary(stdout io.Writer, mode string, repoFilter string, rootFilter string, stats delegationReclaimPassStats, now time.Time) {
-	key := mode + "\x00" + repoFilter + "\x00" + rootFilter
+func logDelegationReclaimSummary(stdout io.Writer, mode string, stats delegationReclaimPassStats, now time.Time) {
+	key := mode
 	delegationReclaimAccounting.Lock()
 	last, seen := delegationReclaimAccounting.summaries[key]
 	if !seen || now.Sub(last) >= delegationReclaimSummaryInterval {
@@ -790,15 +796,69 @@ func (m *candidateMemo) get(fetch func() ([]string, error)) ([]string, error) {
 }
 
 type tickCandidates struct {
-	store           tickCandidateStore
-	advance         candidateMemo
-	comment         candidateMemo
-	reclaim         candidateMemo
-	agedReclaim     candidateMemo
-	skipAgedReclaim bool
+	store                     tickCandidateStore
+	advance                   candidateMemo
+	comment                   candidateMemo
+	reclaim                   candidateMemo
+	agedReclaim               candidateMemo
+	skipAgedReclaim           bool
+	aggregateReclaimSummaries bool
+	reclaimPassRan            bool
+	agedReclaimPassRan        bool
+	reclaimStats              delegationReclaimPassStats
+	agedReclaimStats          delegationReclaimPassStats
+	reclaimUnscoped           map[string]struct{}
+	agedReclaimUnscoped       map[string]struct{}
 	// A best-effort reclaim failure stays outside tick health but must not advance
 	// the success cadence; the fresh per-tick carrier keeps that signal bounded.
 	agedReclaimFailed bool
+}
+
+func (c *tickCandidates) finishReclaimPass(stdout io.Writer, mode string, stats delegationReclaimPassStats, now time.Time) {
+	var aggregate *delegationReclaimPassStats
+	switch mode {
+	case "skipped":
+		c.reclaimPassRan = true
+		aggregate = &c.reclaimStats
+	case "aged":
+		c.agedReclaimPassRan = true
+		aggregate = &c.agedReclaimStats
+	default:
+		return
+	}
+	aggregate.add(stats)
+	if !c.aggregateReclaimSummaries {
+		logDelegationReclaimSummary(stdout, mode, stats, now)
+	}
+}
+
+func (c *tickCandidates) firstUnscopedReclaimAttempt(mode string, jobID string) bool {
+	var seen *map[string]struct{}
+	switch mode {
+	case "skipped":
+		seen = &c.reclaimUnscoped
+	case "aged":
+		seen = &c.agedReclaimUnscoped
+	default:
+		return false
+	}
+	if *seen == nil {
+		*seen = make(map[string]struct{})
+	}
+	if _, ok := (*seen)[jobID]; ok {
+		return false
+	}
+	(*seen)[jobID] = struct{}{}
+	return true
+}
+
+func (c *tickCandidates) logFleetReclaimSummaries(stdout io.Writer, now time.Time) {
+	if c.reclaimPassRan {
+		logDelegationReclaimSummary(stdout, "skipped", c.reclaimStats, now)
+	}
+	if c.agedReclaimPassRan {
+		logDelegationReclaimSummary(stdout, "aged", c.agedReclaimStats, now)
+	}
 }
 
 // newTickCandidates is a package var (not a plain func) only so the once-per-tick
@@ -919,22 +979,28 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 	if err != nil {
 		return err
 	}
-	stats := delegationReclaimPassStats{considered: len(jobIDs)}
+	stats := delegationReclaimPassStats{}
 	defer func() {
-		logDelegationReclaimSummary(worker.Stdout, "skipped", repoFilter, rootFilter, stats, time.Now().UTC())
+		cand.finishReclaimPass(worker.Stdout, "skipped", stats, time.Now().UTC())
 	}()
 	for _, jobID := range jobIDs {
 		job, err := delegationReclaimCandidateJob(ctx, worker, jobID)
 		if errors.Is(err, sql.ErrNoRows) {
 			// A cleanup-marker event with no surviving job row (e.g. a pruned job):
 			// nothing to reclaim, and erroring here would abort the whole tick.
-			stats.skipped++
+			if cand.firstUnscopedReclaimAttempt("skipped", jobID) {
+				stats.considered++
+				stats.skipped++
+			}
 			continue
 		}
 		if err != nil {
 			path, pathErr := worker.Store.JobWorktreePath(ctx, jobID)
 			if errors.Is(pathErr, sql.ErrNoRows) {
-				stats.skipped++
+				if cand.firstUnscopedReclaimAttempt("skipped", jobID) {
+					stats.considered++
+					stats.skipped++
+				}
 				continue
 			}
 			if pathErr != nil {
@@ -942,11 +1008,18 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 			}
 			path = canonicalDelegationReclaimPath(jobID, path)
 			logDelegationReclaimFailure(worker.Stdout, "skipped", "get_job", jobID, path, err)
-			stats.skipped++
+			if cand.firstUnscopedReclaimAttempt("skipped", jobID) {
+				stats.considered++
+				stats.skipped++
+			}
 			continue
 		}
 		path := delegationReclaimPath(job.ID, job.Payload)
-		if !jobStateEligibleForWorktreeReclaim(job.State) || !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+			continue
+		}
+		stats.considered++
+		if !jobStateEligibleForWorktreeReclaim(job.State) {
 			stats.skipped++
 			continue
 		}
@@ -996,20 +1069,26 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 	if err != nil {
 		return err
 	}
-	stats := delegationReclaimPassStats{considered: len(jobIDs)}
+	stats := delegationReclaimPassStats{}
 	defer func() {
-		logDelegationReclaimSummary(worker.Stdout, "aged", repoFilter, rootFilter, stats, now)
+		cand.finishReclaimPass(worker.Stdout, "aged", stats, now)
 	}()
 	for _, jobID := range jobIDs {
 		job, err := delegationReclaimCandidateJob(ctx, worker, jobID)
 		if errors.Is(err, sql.ErrNoRows) {
-			stats.skipped++
+			if cand.firstUnscopedReclaimAttempt("aged", jobID) {
+				stats.considered++
+				stats.skipped++
+			}
 			continue
 		}
 		if err != nil {
 			path, pathErr := worker.Store.JobWorktreePath(ctx, jobID)
 			if errors.Is(pathErr, sql.ErrNoRows) {
-				stats.skipped++
+				if cand.firstUnscopedReclaimAttempt("aged", jobID) {
+					stats.considered++
+					stats.skipped++
+				}
 				continue
 			}
 			if pathErr != nil {
@@ -1018,11 +1097,18 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 			path = canonicalDelegationReclaimPath(jobID, path)
 			logDelegationReclaimFailure(worker.Stdout, "aged", "get_job", jobID, path, err)
 			cand.agedReclaimFailed = true
-			stats.skipped++
+			if cand.firstUnscopedReclaimAttempt("aged", jobID) {
+				stats.considered++
+				stats.skipped++
+			}
 			continue
 		}
 		path := delegationReclaimPath(job.ID, job.Payload)
-		if !workflow.IsFinalJobState(job.State) || !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+			continue
+		}
+		stats.considered++
+		if !workflow.IsFinalJobState(job.State) {
 			stats.skipped++
 			continue
 		}
@@ -1212,6 +1298,7 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 	// instead of once inside each runDaemonWorkerTickTracked collapses 18×/tick down
 	// to 1×/tick on a multi-repo daemon. Fresh each sweep; never retained.
 	cand := newTickCandidates(worker.Store)
+	cand.aggregateReclaimSummaries = true
 	runAgedReclaim := tracker.agedDelegationWorktreeReclaimDue(now)
 	cand.skipAgedReclaim = !runAgedReclaim
 	// Scope tick faults per repo (#555 follow-up): the recovering supervisor
@@ -1251,6 +1338,7 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 			writeLine(stdout, "%s: worker tick error: %v", repo.FullName(), tickErr)
 		}
 	}
+	cand.logFleetReclaimSummaries(stdout, now)
 	if failed == 0 && runAgedReclaim && cand.agedReclaim.done && !cand.agedReclaimFailed {
 		tracker.markAgedDelegationWorktreeReclaimSuccessful(now)
 	}

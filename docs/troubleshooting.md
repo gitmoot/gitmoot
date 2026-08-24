@@ -707,8 +707,9 @@ top-level `worktrees` field.
 One unreclaimable candidate does not stop the pass: candidate-local lookup,
 runner, and removal failures are skipped while later paths continue. The daemon
 logs the first three failures for a path, suppresses repeats, and emits a
-five-minute `considered N, reclaimed M, skipped K` summary. Candidate-query and
-store-wide lookup failures still abort the pass and surface normally.
+five-minute fleet-wide `considered N, reclaimed M, skipped K` summary.
+Candidate-query and store-wide lookup failures still abort the pass and surface
+normally.
 
 For immediate manual relief, list paths and then prove the owner is final. Do
 not infer safety from directory age alone:

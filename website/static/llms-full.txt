@@ -802,7 +802,8 @@ reclaimable/pinned/unproven breakdown; dashboard `/api/health` mirrors it.
 Candidate-local lookup, runner, and removal failures skip only that worktree;
 later candidates continue. Repeated failures are logged three times per path,
 then suppressed, while a five-minute summary reports considered, reclaimed, and
-skipped counts. Candidate-query and store-wide lookup failures remain fatal.
+skipped counts across the fleet sweep. Candidate-query and store-wide lookup
+failures remain fatal.
 
 Never-started plans have a separate destructive opt-in:
 `[workflow].planned_ttl = "720h"`. It is disabled by default; unset, empty,
@@ -2721,8 +2722,9 @@ top-level `worktrees` field.
 One unreclaimable candidate does not stop the pass: candidate-local lookup,
 runner, and removal failures are skipped while later paths continue. The daemon
 logs the first three failures for a path, suppresses repeats, and emits a
-five-minute `considered N, reclaimed M, skipped K` summary. Candidate-query and
-store-wide lookup failures still abort the pass and surface normally.
+five-minute fleet-wide `considered N, reclaimed M, skipped K` summary.
+Candidate-query and store-wide lookup failures still abort the pass and surface
+normally.
 
 For immediate manual relief, list paths and then prove the owner is final. Do
 not infer safety from directory age alone:
@@ -15415,8 +15417,9 @@ Blocked, queued, and running owners remain pinned; `gitmoot doctor` reports the
 reclaimable/pinned/unproven counts and logical size.
 Candidate-local lookup, runner, and removal failures skip only that worktree;
 later candidates continue. The daemon logs three failures per path before
-suppressing repeats and emits a five-minute considered/reclaimed/skipped
-summary. Candidate-query and store-wide lookup failures remain fatal.
+suppressing repeats and emits a five-minute fleet-wide
+considered/reclaimed/skipped summary. Candidate-query and store-wide lookup
+failures remain fatal.
 
 Never-started `planned` tasks use a separate opt-in policy:
 `[workflow].planned_ttl = "720h"`. It is disabled by default; unset, empty,
@@ -16854,7 +16857,8 @@ TTL reclaim candidate. A successful force-remove and metadata prune records
 Candidate-local lookup, runner, and removal failures skip only that worktree so
 later candidates continue; candidate-query and store-wide lookup failures still
 abort. Repeated failures log three times per path before suppression, and a
-five-minute summary reports considered, reclaimed, and skipped counts.
+five-minute fleet-wide summary reports considered, reclaimed, and skipped
+counts.
 
 `gitmoot doctor` and dashboard `/api/health` surface stale count and logical
 size, split into reclaimable final owners, pinned non-final owners, and unproven
