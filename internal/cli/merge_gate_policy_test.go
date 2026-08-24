@@ -118,6 +118,11 @@ require_external_ci = true
 }
 
 func TestApplyMergeGatePolicyEmptyHomeIsNoop(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if _, err := config.DefaultPaths(); err != nil {
+		t.Fatal(err)
+	}
+
 	gate := workflow.PolicyMergeGate{}
 	applyMergeGatePolicy(&gate, "", "jerryfane/noted")
 	if gate.AutoMerge || gate.RequireExternalCI || gate.MinCIWait != 0 || gate.MaxCIWait != 0 {
