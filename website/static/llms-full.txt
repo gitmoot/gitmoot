@@ -1220,6 +1220,14 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    gitmoot lock release owner/project <branch> --owner <agent>
    ```
 
+   Task lane locks remain held after an implement job succeeds so review and fix
+   rounds keep exclusive ownership of the branch. Cancelling a top-level
+   implement releases its lane only when no non-terminal task or job still
+   references the same repository and branch. As a backstop, the daemon releases
+   locks unchanged for at least 24 hours under that same no-live-work condition.
+   Tasks in `blocked`, `awaiting_human_merge`, or `awaiting_human` retain their
+   locks for human resumption.
+
 8. Let the PR converge.
 
    Agents review, request fixes, and rerun work through comments and job output.
@@ -16382,6 +16390,13 @@ by the assigned agent.
 
 Review and ask jobs should inspect and report without mutating branches unless
 the task explicitly instructs otherwise.
+
+A task branch lock spans the complete implement, review, and fix lifecycle; an
+implement success does not release it. Cancelling a top-level implement releases
+the lock only when no non-terminal task or job references the same repository and
+branch. The daemon also reclaims idle locks unchanged for at least 24 hours, using
+the same repo+branch liveness check. `blocked`, `awaiting_human_merge`, and
+`awaiting_human` tasks keep their locks because an operator can resume them.
 
 Do not ask child agents to run PR lifecycle commands such as `git pull`,
 `git merge`, `git push`, or `gh pr merge` to make parallel task PRs mergeable.

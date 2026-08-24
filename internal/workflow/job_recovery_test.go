@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -342,6 +343,44 @@ func TestCancelJobReleasesRuntimeSessionLock(t *testing.T) {
 	}
 	if !reacquired {
 		t.Fatal("second job could not re-acquire the freed runtime-session lock")
+	}
+}
+
+// TestCancelJobReleasesInactiveTaskLaneLock kills the mutant that removes the
+// task-lane release from CancelJob. Once this top-level implement is cancelled
+// and no other non-terminal work references repo+branch, the operator's cancel
+// must immediately free the lane for the replacement writer.
+func TestCancelJobReleasesInactiveTaskLaneLock(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	const branch = "feature/cancelled-writer"
+	acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: branch, Owner: "lead"})
+	if err != nil || !acquired {
+		t.Fatalf("AcquireLock acquired=%v err=%v", acquired, err)
+	}
+	payload, err := json.Marshal(JobPayload{Repo: "owner/repo", Branch: branch, TaskID: "task-cancelled"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: "job-cancelled-writer", Agent: "lead", Type: "implement", State: string(JobQueued), Repo: "owner/repo", Payload: string(payload),
+	}, db.JobEvent{Kind: string(JobQueued), Message: "queued"}); err != nil {
+		t.Fatal(err)
+	}
+
+	job, err := CancelJob(ctx, store, "job-cancelled-writer")
+	if err != nil || job.State != string(JobCancelled) {
+		t.Fatalf("CancelJob job=%+v err=%v", job, err)
+	}
+	if _, err := store.GetBranchLock(ctx, "owner/repo", branch); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetBranchLock after cancel error = %v, want sql.ErrNoRows", err)
+	}
+	events, err := store.ListBranchLockEvents(ctx, "owner/repo", branch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Kind != "released" || !strings.Contains(events[0].Message, "cancellation") {
+		t.Fatalf("branch lock events = %+v, want cancellation release", events)
 	}
 }
 

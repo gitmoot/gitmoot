@@ -373,8 +373,12 @@ gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 ```
 
-Fix: let a running daemon reclaim stale resource locks automatically. Release a
-branch lock only after confirming the owner is no longer working:
+Fix: let a running daemon reclaim stale resource locks automatically. Task lane
+locks are released only after they have been unchanged for at least 24 hours and
+no non-terminal task or job references the same repository and branch. Human-
+resumable `blocked`, `awaiting_human_merge`, and `awaiting_human` tasks retain
+their locks. Release a branch lock manually only after confirming the owner is
+no longer working:
 
 ```sh
 gitmoot lock release owner/repo <branch> --owner <agent>
