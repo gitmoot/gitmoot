@@ -1163,7 +1163,7 @@ func reclaimStaleTaskLaneLocks(ctx context.Context, store *db.Store, repoFilter 
 	}
 	cutoff := now.Add(-staleTaskLaneLockAgeFloor)
 	for _, lock := range locks {
-		released, err := store.ReleaseBranchLockIfInactiveWithEvent(ctx, lock, cutoff, db.BranchLockEvent{
+		released, err := store.ReleaseBranchLockIfInactiveWithEvent(ctx, lock, "", cutoff, db.BranchLockEvent{
 			Kind: "released", Message: "released stale task lane with no non-terminal branch work (#1565)",
 		})
 		if err != nil {

@@ -346,10 +346,10 @@ func TestCancelJobReleasesRuntimeSessionLock(t *testing.T) {
 	}
 }
 
-// TestCancelJobReleasesInactiveTaskLaneLock kills the pre-fix mutant that leaves
-// the production task row implementing before attempting the lane release. Once
-// this top-level implement is cancelled and no other non-terminal work references
-// repo+branch, the operator's cancel must immediately free the lane for a replacement writer.
+// TestCancelJobReleasesInactiveTaskLaneLock kills both a missing self-exclusion,
+// which retains the lane, and task dismissal inside CancelJob, which usurps the
+// stale-task reconciler. Cancellation must free the lane while leaving task state
+// and dismissal audit ownership unchanged.
 func TestCancelJobReleasesInactiveTaskLaneLock(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
@@ -381,8 +381,12 @@ func TestCancelJobReleasesInactiveTaskLaneLock(t *testing.T) {
 		t.Fatalf("GetBranchLock after cancel error = %v, want sql.ErrNoRows", err)
 	}
 	task, err := store.GetTask(ctx, "task-cancelled")
-	if err != nil || task.State != string(TaskDismissed) {
-		t.Fatalf("task after cancel = %+v, err=%v; want dismissed", task, err)
+	if err != nil || task.State != string(TaskImplementing) {
+		t.Fatalf("task after cancel = %+v, err=%v; want implementing for stale-task reconciliation", task, err)
+	}
+	taskEvents, err := store.ListTaskEvents(ctx, task.ID)
+	if err != nil || len(taskEvents) != 0 {
+		t.Fatalf("task events after cancel = %+v, err=%v; dismissal audit belongs to stale-task reconciliation", taskEvents, err)
 	}
 	events, err := store.ListBranchLockEvents(ctx, "owner/repo", branch)
 	if err != nil {
@@ -393,25 +397,28 @@ func TestCancelJobReleasesInactiveTaskLaneLock(t *testing.T) {
 	}
 }
 
-// TestCancelJobTaskLaneReleaseFailsClosed kills mutants that dismiss through a
-// queued successor or widen the implementing-state allowlist to review/unknown
-// states. Those states must retain both task state and lane ownership.
+// TestCancelJobTaskLaneReleaseFailsClosed kills mutants that ignore every task,
+// ignore a different task ID, or widen the implementing-only exclusion to review
+// and unknown states. Those references must retain task state and lane ownership.
 func TestCancelJobTaskLaneReleaseFailsClosed(t *testing.T) {
 	for _, test := range []struct {
-		name      string
-		taskState string
-		otherJob  bool
+		name          string
+		rowTaskID     string
+		payloadTaskID string
+		taskState     string
+		otherJob      bool
 	}{
-		{name: "queued successor", taskState: string(TaskImplementing), otherJob: true},
-		{name: "review-owned task", taskState: string(TaskReviewing)},
-		{name: "unknown task state", taskState: "future_state"},
+		{name: "queued successor", rowTaskID: "task-cancelled", payloadTaskID: "task-cancelled", taskState: string(TaskImplementing), otherJob: true},
+		{name: "different task", rowTaskID: "task-other", payloadTaskID: "task-cancelled", taskState: string(TaskImplementing)},
+		{name: "review-owned task", rowTaskID: "task-cancelled", payloadTaskID: "task-cancelled", taskState: string(TaskReviewing)},
+		{name: "unknown task state", rowTaskID: "task-cancelled", payloadTaskID: "task-cancelled", taskState: "future_state"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
 			store := openTestStore(t)
 			branch := "feature/cancel-veto-" + strings.ReplaceAll(test.name, " ", "-")
 			if err := store.UpsertTask(ctx, db.Task{
-				ID: "task-cancelled", RepoFullName: "owner/repo", State: test.taskState, Branch: branch,
+				ID: test.rowTaskID, RepoFullName: "owner/repo", State: test.taskState, Branch: branch,
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -419,7 +426,7 @@ func TestCancelJobTaskLaneReleaseFailsClosed(t *testing.T) {
 			if err != nil || !acquired {
 				t.Fatalf("AcquireLock acquired=%v err=%v", acquired, err)
 			}
-			payload, err := json.Marshal(JobPayload{Repo: "owner/repo", Branch: branch, TaskID: "task-cancelled"})
+			payload, err := json.Marshal(JobPayload{Repo: "owner/repo", Branch: branch, TaskID: test.payloadTaskID})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -442,7 +449,7 @@ func TestCancelJobTaskLaneReleaseFailsClosed(t *testing.T) {
 			if _, err := store.GetBranchLock(ctx, "owner/repo", branch); err != nil {
 				t.Fatalf("branch lock was released despite %s: %v", test.name, err)
 			}
-			stored, err := store.GetTask(ctx, "task-cancelled")
+			stored, err := store.GetTask(ctx, test.rowTaskID)
 			if err != nil || stored.State != test.taskState {
 				t.Fatalf("task after cancel = %+v, err=%v; want state %q retained", stored, err, test.taskState)
 			}

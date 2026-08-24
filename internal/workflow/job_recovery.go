@@ -395,23 +395,17 @@ func CancelJob(ctx context.Context, store *db.Store, jobID string) (db.Job, erro
 			})
 		}
 		// A top-level task implement owns the task lane rather than an ephemeral
-		// delegation lane. Production creates the implementing task before this job,
-		// so cancellation first dismisses that task when it has no queued/running
-		// successor. RetryJob explicitly recovers a dismissed task before requeueing,
-		// keeping cancellation reversible. Unknown and review-owned task states fail
-		// closed. The store then atomically releases the lane only when no other
-		// non-terminal task or job references the same repo+branch; best-effort lock
-		// cleanup must not roll back a successful cancellation.
+		// delegation lane. Leave task dismissal to the stale-task reconciler, which
+		// owns remote cleanup and the task_dismissed_auto audit event. Cancellation
+		// excludes only this exact implementing task from the atomic release check;
+		// every other task, every unknown/review state, and every non-terminal job
+		// still vetoes. Best-effort cleanup must not roll back a successful cancel.
 		if job.Type == "implement" && strings.TrimSpace(payload.TaskID) != "" && strings.TrimSpace(payload.DelegationID) == "" {
 			repo := strings.TrimSpace(payload.Repo)
 			branch := strings.TrimSpace(payload.Branch)
-			changed, current, terr := store.TransitionTaskStateWithEventIfNoActiveJob(ctx, strings.TrimSpace(payload.TaskID),
-				[]string{string(TaskImplementing)}, string(TaskDismissed), "task_dismissed_job_cancel",
-				fmt.Sprintf("top-level implement job %s cancelled", job.ID))
-			taskDismissed := terr == nil && (changed || current == string(TaskDismissed))
-			if taskDismissed && repo != "" && branch != "" {
+			if repo != "" && branch != "" {
 				if lock, lerr := store.GetBranchLock(ctx, repo, branch); lerr == nil {
-					if released, rerr := store.ReleaseBranchLockIfInactiveWithEvent(ctx, lock, time.Time{}, db.BranchLockEvent{
+					if released, rerr := store.ReleaseBranchLockIfInactiveWithEvent(ctx, lock, strings.TrimSpace(payload.TaskID), time.Time{}, db.BranchLockEvent{
 						Kind: "released", Message: "released after task implement cancellation left no non-terminal branch work (#1565)",
 					}); rerr == nil && released {
 						_ = store.AddJobEvent(ctx, db.JobEvent{

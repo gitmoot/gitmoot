@@ -447,15 +447,18 @@ func (s *Store) ReleaseLockWithEvent(ctx context.Context, lock BranchLock, event
 }
 
 // ReleaseBranchLockIfInactiveWithEvent releases lock only when no non-terminal
-// task or job still references its repo+branch. A zero updatedBefore disables the
-// age predicate for event-driven cleanup such as CancelJob; the daemon sweeper
-// supplies a cutoff so a newly acquired lane can never be reclaimed.
+// task or job still references its repo+branch. ignoredImplementingTaskID lets
+// event-driven cancellation exclude only its exact implementing task while the
+// stale-task reconciler retains ownership of task dismissal and cleanup. Empty
+// disables the exclusion, as the daemon sweeper requires. A zero updatedBefore
+// disables the age predicate; the sweeper supplies a cutoff so a newly acquired
+// lane can never be reclaimed.
 //
 // The terminal sets are deliberately allowlists. A new or unknown lifecycle
 // state therefore keeps the lock until its release policy is decided explicitly.
 // In particular, blocked, awaiting_human_merge, and awaiting_human tasks retain
 // their lanes for operator resumption, and blocked jobs remain non-terminal.
-func (s *Store) ReleaseBranchLockIfInactiveWithEvent(ctx context.Context, lock BranchLock, updatedBefore time.Time, event BranchLockEvent) (bool, error) {
+func (s *Store) ReleaseBranchLockIfInactiveWithEvent(ctx context.Context, lock BranchLock, ignoredImplementingTaskID string, updatedBefore time.Time, event BranchLockEvent) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -469,11 +472,13 @@ func (s *Store) ReleaseBranchLockIfInactiveWithEvent(ctx context.Context, lock B
 		query += ` AND updated_at <= ?`
 		args = append(args, updatedBefore.UTC().Format("2006-01-02 15:04:05"))
 	}
+	args = append(args, strings.TrimSpace(ignoredImplementingTaskID))
 	query += `
 		AND NOT EXISTS (
 			SELECT 1 FROM tasks
 			WHERE tasks.repo_full_name = branch_locks.repo_full_name
 				AND TRIM(tasks.branch) = TRIM(branch_locks.branch)
+				AND NOT (tasks.id = ? AND tasks.state = 'implementing')
 				AND (
 					tasks.state IN (
 						'planned', 'implementing', 'pr_open', 'reviewing', 'changes_requested', 'ready_to_merge',
