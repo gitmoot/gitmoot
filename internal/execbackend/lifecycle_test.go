@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"syscall"
@@ -158,7 +159,7 @@ func TestLocalBackendExecDropsPrivilegesAndImportNormalizesOwnership(t *testing.
 	}
 }
 
-func TestLocalBackendWorkspaceTraverseLimitedToConfiguredIdentity(t *testing.T) {
+func TestLocalBackendWorkspaceTraverseLimitedToConfiguredGroup(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("workspace traverse identity proof requires a root test process")
 	}
@@ -181,7 +182,11 @@ func TestLocalBackendWorkspaceTraverseLimitedToConfiguredIdentity(t *testing.T) 
 		t.Fatalf("configured identity uid %d gid %d cannot traverse workspace: %v", configured.UID, configured.GID, err)
 	}
 	if err := runAsIdentity(third, instance.Workspace, "/bin/pwd"); err == nil {
-		t.Fatalf("third identity uid %d gid %d traversed workspace; want permission denied", third.UID, third.GID)
+		t.Fatalf("identity outside configured group, uid %d gid %d, traversed workspace; want permission denied", third.UID, third.GID)
+	}
+	sameGroupThird := LocalIdentity{UID: third.UID, GID: configured.GID}
+	if err := runAsIdentity(sameGroupThird, instance.Workspace, "/bin/pwd"); err != nil {
+		t.Fatalf("different uid %d carrying configured gid %d cannot traverse group-scoped workspace: %v", sameGroupThird.UID, sameGroupThird.GID, err)
 	}
 
 	for _, path := range []string{backend.root, instance.root} {
@@ -207,6 +212,15 @@ func TestLocalBackendWorkspaceTraverseParentPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	type chownCall struct {
+		path     string
+		uid, gid int
+	}
+	var chownCalls []chownCall
+	backend.chown = func(path string, uid, gid int) error {
+		chownCalls = append(chownCalls, chownCall{path: path, uid: uid, gid: gid})
+		return nil
+	}
 	instance, err := backend.Provision(context.Background(), JobScope{JobID: "traverse-permissions"})
 	if err != nil {
 		t.Fatal(err)
@@ -217,6 +231,13 @@ func TestLocalBackendWorkspaceTraverseParentPermissions(t *testing.T) {
 	if err := backend.handoffWorkspace(instance); err != nil {
 		t.Fatal(err)
 	}
+	wantChownCalls := []chownCall{
+		{path: backend.root, uid: -1, gid: int(identity.GID)},
+		{path: instance.root, uid: -1, gid: int(identity.GID)},
+	}
+	if !reflect.DeepEqual(chownCalls, wantChownCalls) {
+		t.Fatalf("traverse-parent chown calls = %+v, want %+v", chownCalls, wantChownCalls)
+	}
 
 	for _, path := range []string{backend.root, instance.root} {
 		info, err := os.Stat(path)
@@ -225,9 +246,6 @@ func TestLocalBackendWorkspaceTraverseParentPermissions(t *testing.T) {
 		}
 		if got := info.Mode().Perm(); got != 0o710 {
 			t.Fatalf("traverse parent %q mode = %#o, want 0710", path, got)
-		}
-		if _, gid := pathOwnership(t, path); gid != identity.GID {
-			t.Fatalf("traverse parent %q gid = %d, want configured gid %d", path, gid, identity.GID)
 		}
 	}
 }

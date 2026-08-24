@@ -299,7 +299,10 @@ parent (for example a root daemon using `/root/.gitmoot`), set absolute
 identity can traverse; filesystem roots are rejected. Gitmoot keeps the backend
 and instance roots daemon-owned, assigns them to `local_gid`, and uses mode
 `0710` so the configured command group can traverse without setting execute for
-the Unix `other` class. Omitting uid/gid preserves the daemon identity.
+the Unix `other` class. This is a group boundary: use a dedicated `local_gid`
+whose only member is the configured account when unrelated local users must be
+excluded. Gitmoot validates paired, non-zero numeric IDs but cannot portably
+verify host group exclusivity. Omitting uid/gid preserves the daemon identity.
 
 The runtime executable must be traversable by the configured uid too. If a
 root daemon resolves `claude` or `codex` below `/root`, install the runtime at

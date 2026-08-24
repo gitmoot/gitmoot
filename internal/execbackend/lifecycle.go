@@ -121,6 +121,7 @@ type LocalIdentity struct {
 type LocalBackend struct {
 	root     string
 	identity *LocalIdentity
+	chown    func(string, int, int) error
 
 	mu     sync.Mutex
 	active map[string]map[*localExec]struct{}
@@ -152,7 +153,7 @@ func NewLocalBackend(root string, identity *LocalIdentity) (*LocalBackend, error
 		}
 		identity = &LocalIdentity{UID: identity.UID, GID: identity.GID}
 	}
-	return &LocalBackend{root: absolute, identity: identity, active: make(map[string]map[*localExec]struct{})}, nil
+	return &LocalBackend{root: absolute, identity: identity, chown: os.Chown, active: make(map[string]map[*localExec]struct{})}, nil
 }
 
 func (b *LocalBackend) Name() Backend { return Local }
@@ -309,16 +310,17 @@ func (b *LocalBackend) handoffWorkspace(instance *Instance) error {
 		return nil
 	}
 	// Keep backend and instance roots owned by the daemon, assign their group to
-	// the configured execution gid, and grant traverse only to that group. The
-	// operator-managed parent of b.root must already be traversable by the
-	// configured identity.
-	if err := os.Chown(b.root, -1, int(b.identity.GID)); err != nil {
+	// the configured execution gid, and grant traverse to that group. The
+	// operator-managed parent of b.root must already be traversable by the same
+	// group; local_gid must be dedicated when unrelated local users must not
+	// share access.
+	if err := b.chown(b.root, -1, int(b.identity.GID)); err != nil {
 		return fmt.Errorf("assign local execution-backend root to gid %d: %w", b.identity.GID, err)
 	}
 	if err := os.Chmod(b.root, 0o710); err != nil {
 		return fmt.Errorf("make local execution-backend root traversable for uid %d: %w", b.identity.UID, err)
 	}
-	if err := os.Chown(instance.root, -1, int(b.identity.GID)); err != nil {
+	if err := b.chown(instance.root, -1, int(b.identity.GID)); err != nil {
 		return fmt.Errorf("assign local execution instance %q to gid %d: %w", instance.ID, b.identity.GID, err)
 	}
 	if err := os.Chmod(instance.root, 0o710); err != nil {

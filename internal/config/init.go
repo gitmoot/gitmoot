@@ -135,7 +135,7 @@ artifact_blobs = %q
 # [remote_exec]
 # backend = "local"
 # local_uid = 1000 # optional; configure together with non-root local_gid
-# local_gid = 1000
+# local_gid = 1000 # use a dedicated group when unrelated local users must be excluded
 # local_root = "/var/tmp/gitmoot-local" # absolute; parents must be traversable by local_uid
 
 # [transcripts] is ON by default. Raw unredacted runtime output

@@ -1988,8 +1988,13 @@ dedicated directory beneath a suitable operator-managed parent such as
 `/var/tmp`. A filesystem root is rejected. Gitmoot keeps its backend root and
 per-instance roots owned by the daemon, assigns their group to `local_gid`, and
 uses mode `0710` so the configured command group can traverse them without an
-execute bit for the Unix `other` class. With no uid/gid configured, local
-execution retains the daemon identity for backward compatibility.
+execute bit for the Unix `other` class. This is a group boundary: every process
+carrying `local_gid` can traverse, so use a dedicated group whose only member is
+the configured execution account when unrelated local users must be excluded.
+Gitmoot validates that the numeric UID/GID are paired and non-zero, but cannot
+portably prove group exclusivity across host account databases, NSS, or
+containers. With no uid/gid configured, local execution retains the daemon
+identity for backward compatibility.
 
 The runtime executable and any child-readable file-backed state must also be
 reachable by the configured identity. In particular, a root daemon whose
@@ -10470,7 +10475,10 @@ parent (for example a root daemon using `/root/.gitmoot`), set absolute
 identity can traverse; filesystem roots are rejected. Gitmoot keeps the backend
 and instance roots daemon-owned, assigns them to `local_gid`, and uses mode
 `0710` so the configured command group can traverse without setting execute for
-the Unix `other` class. Omitting uid/gid preserves the daemon identity.
+the Unix `other` class. This is a group boundary: use a dedicated `local_gid`
+whose only member is the configured account when unrelated local users must be
+excluded. Gitmoot validates paired, non-zero numeric IDs but cannot portably
+verify host group exclusivity. Omitting uid/gid preserves the daemon identity.
 
 The runtime executable must be traversable by the configured uid too. If a
 root daemon resolves `claude` or `codex` below `/root`, install the runtime at
