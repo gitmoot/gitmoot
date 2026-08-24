@@ -14,6 +14,14 @@ by the assigned agent.
 Review and ask jobs should inspect and report without mutating branches unless
 the task explicitly instructs otherwise.
 
+A task branch lock spans the complete implement, review, and fix lifecycle; an
+implement success does not release it. Cancelling a top-level implement releases
+the lock only when no other non-terminal task or job references the same
+repository and branch. The daemon also reclaims idle locks unchanged for at
+least 24 hours, but only after no non-terminal task or job remains. `blocked`,
+`awaiting_human_merge`, and `awaiting_human` tasks keep their locks because an
+operator can resume them.
+
 Do not ask child agents to run PR lifecycle commands such as `git pull`,
 `git merge`, `git push`, or `gh pr merge` to make parallel task PRs mergeable.
 Gitmoot owns the final merge gate. It serializes merge attempts per base branch,

@@ -159,6 +159,13 @@ Gitmoot uses separate locks for separate resources:
 Review and ask jobs usually inspect and report. Implementation jobs should only
 mutate branches when Gitmoot assigned the job and the branch lock is held.
 
+Task branch locks cover the full implement, review, and fix lifecycle, so an
+implement success deliberately keeps the lock. Cancelling a top-level implement
+releases its lane only when no other non-terminal task or job references the
+same repository and branch. The daemon also reclaims locks unchanged for at
+least 24 hours, but only after no non-terminal task or job remains. Tasks in `blocked`,
+`awaiting_human_merge`, or `awaiting_human` keep their locks for human resumption.
+
 The daemon defaults to `--workers 1`. Raise workers only when jobs use
 independent runtime sessions or managed agent types with `max_background`
 greater than one.

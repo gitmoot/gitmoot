@@ -446,6 +446,85 @@ func (s *Store) ReleaseLockWithEvent(ctx context.Context, lock BranchLock, event
 	return s.releaseLockWithEvent(ctx, lock, false, event)
 }
 
+// ReleaseBranchLockIfInactiveWithEvent releases lock only when no non-terminal
+// task or job still references its repo+branch. ignoredImplementingTaskID lets
+// event-driven cancellation exclude only its exact implementing task while the
+// stale-task reconciler retains ownership of task dismissal and cleanup. Empty
+// disables the exclusion, as the daemon sweeper requires. A zero updatedBefore
+// disables the age predicate; the sweeper supplies a cutoff so a newly acquired
+// lane can never be reclaimed.
+//
+// The terminal sets are deliberately allowlists. A new or unknown lifecycle
+// state therefore keeps the lock until its release policy is decided explicitly.
+// In particular, blocked, awaiting_human_merge, and awaiting_human tasks retain
+// their lanes for operator resumption, and blocked jobs remain non-terminal.
+func (s *Store) ReleaseBranchLockIfInactiveWithEvent(ctx context.Context, lock BranchLock, ignoredImplementingTaskID string, updatedBefore time.Time, event BranchLockEvent) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	query := `DELETE FROM branch_locks
+		WHERE repo_full_name = ? AND branch = ? AND owner = ?`
+	args := []any{strings.TrimSpace(lock.RepoFullName), strings.TrimSpace(lock.Branch), strings.TrimSpace(lock.Owner)}
+	if !updatedBefore.IsZero() {
+		query += ` AND updated_at <= ?`
+		args = append(args, updatedBefore.UTC().Format("2006-01-02 15:04:05"))
+	}
+	args = append(args, strings.TrimSpace(ignoredImplementingTaskID))
+	query += `
+		AND NOT EXISTS (
+			SELECT 1 FROM tasks
+			WHERE tasks.repo_full_name = branch_locks.repo_full_name
+				AND TRIM(tasks.branch) = TRIM(branch_locks.branch)
+				AND NOT (tasks.id = ? AND tasks.state = 'implementing')
+				AND (
+					tasks.state IN (
+						'planned', 'implementing', 'pr_open', 'reviewing', 'changes_requested', 'ready_to_merge',
+						'blocked', 'awaiting_human_merge', 'awaiting_human'
+					)
+					OR tasks.state NOT IN (
+						'planned', 'implementing', 'pr_open', 'reviewing', 'changes_requested', 'ready_to_merge',
+						'merged', 'superseded', 'stranded', 'blocked', 'awaiting_human_merge', 'dismissed', 'awaiting_human'
+					)
+				)
+		)
+		AND NOT EXISTS (
+			SELECT 1 FROM jobs
+			WHERE jobs.state NOT IN ('succeeded', 'failed', 'cancelled')
+				AND json_valid(jobs.payload)
+				AND TRIM(COALESCE(json_extract(jobs.payload, '$.branch'), '')) = TRIM(branch_locks.branch)
+				AND (
+					TRIM(jobs.repo) = TRIM(branch_locks.repo_full_name)
+					OR TRIM(COALESCE(json_extract(jobs.payload, '$.repo'), '')) = TRIM(branch_locks.repo_full_name)
+				)
+		)`
+	result, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, tx.Commit()
+	}
+
+	event.RepoFullName = strings.TrimSpace(lock.RepoFullName)
+	event.Branch = strings.TrimSpace(lock.Branch)
+	event.Owner = strings.TrimSpace(lock.Owner)
+	if strings.TrimSpace(event.Kind) == "" {
+		event.Kind = "released"
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO lock_events(repo_full_name, branch, owner, kind, message)
+		VALUES (?, ?, ?, ?, ?)`, event.RepoFullName, event.Branch, event.Owner, event.Kind, event.Message); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
 func (s *Store) ForceReleaseLockWithEvent(ctx context.Context, repoFullName string, branch string, event BranchLockEvent) (BranchLock, bool, error) {
 	lock, err := s.GetBranchLock(ctx, repoFullName, branch)
 	if errors.Is(err, sql.ErrNoRows) {

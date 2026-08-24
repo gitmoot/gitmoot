@@ -84,6 +84,7 @@ type inflightJobTracker struct {
 	errs                         map[string][]error
 	foreignBootRecoveryAt        time.Time
 	agedDelegationWorktreeReapAt time.Time
+	staleTaskLaneLockReapAt      time.Time
 	liveness                     *daemonLivenessSweep
 }
 
@@ -346,6 +347,26 @@ func (t *inflightJobTracker) markAgedDelegationWorktreeReclaimSuccessful(now tim
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.agedDelegationWorktreeReapAt = now
+}
+
+// staleTaskLaneLockReclaimDue gates the low-frequency branch-lock lifecycle
+// backstop. Its zero value is due so daemon start eagerly checks old lanes.
+func (t *inflightJobTracker) staleTaskLaneLockReclaimDue(now time.Time) bool {
+	if t == nil {
+		return true
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return maintenancePassDue(t.staleTaskLaneLockReapAt, now, staleTaskLaneLockReclaimInterval)
+}
+
+func (t *inflightJobTracker) markStaleTaskLaneLockReclaimSuccessful(now time.Time) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.staleTaskLaneLockReapAt = now
 }
 
 // holderOf returns the job ID currently holding checkoutKey, if any.

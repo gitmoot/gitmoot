@@ -578,6 +578,14 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    gitmoot lock release owner/project <branch> --owner <agent>
    ```
 
+   Task lane locks remain held after an implement job succeeds so review and fix
+   rounds keep exclusive ownership of the branch. Cancelling a top-level
+   implement releases its lane only when no other non-terminal task or job still
+   references the same repository and branch. As a backstop, the daemon releases
+   locks unchanged for at least 24 hours only after no non-terminal task or job
+   remains. Tasks in `blocked`, `awaiting_human_merge`, or `awaiting_human`
+   retain their locks for human resumption.
+
 8. Let the PR converge.
 
    Agents review, request fixes, and rerun work through comments and job output.

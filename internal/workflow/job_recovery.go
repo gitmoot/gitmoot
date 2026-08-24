@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 )
@@ -392,6 +393,28 @@ func CancelJob(ctx context.Context, store *db.Store, jobID string) (db.Job, erro
 				Kind:    "delegation_branch_lock_released",
 				Message: fmt.Sprintf("released delegation branch lock %s on cancel (#617)", strings.TrimSpace(payload.Branch)),
 			})
+		}
+		// A top-level task implement owns the task lane rather than an ephemeral
+		// delegation lane. Leave task dismissal to the stale-task reconciler, which
+		// owns remote cleanup and the task_dismissed_auto audit event. Cancellation
+		// excludes only this exact implementing task from the atomic release check;
+		// every other task, every unknown/review state, and every non-terminal job
+		// still vetoes. Best-effort cleanup must not roll back a successful cancel.
+		if job.Type == "implement" && strings.TrimSpace(payload.TaskID) != "" && strings.TrimSpace(payload.DelegationID) == "" {
+			repo := strings.TrimSpace(payload.Repo)
+			branch := strings.TrimSpace(payload.Branch)
+			if repo != "" && branch != "" {
+				if lock, lerr := store.GetBranchLock(ctx, repo, branch); lerr == nil {
+					if released, rerr := store.ReleaseBranchLockIfInactiveWithEvent(ctx, lock, strings.TrimSpace(payload.TaskID), time.Time{}, db.BranchLockEvent{
+						Kind: "released", Message: "released after task implement cancellation left no non-terminal branch work (#1565)",
+					}); rerr == nil && released {
+						_ = store.AddJobEvent(ctx, db.JobEvent{
+							JobID: job.ID, Kind: "task_lane_lock_released",
+							Message: fmt.Sprintf("released task lane lock %s on cancel (#1565)", branch),
+						})
+					}
+				}
+			}
 		}
 		// Symmetric with the branch-lock release above: dispose a #739 dispatch-time
 		// read-only worktree that this cancel-before-run would otherwise leak.
