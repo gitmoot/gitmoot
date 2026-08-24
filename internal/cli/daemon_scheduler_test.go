@@ -3829,9 +3829,15 @@ func TestReclaimSkippedDelegationWorktrees(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			store := daemonWorkerStore(t)
+			home := t.TempDir()
+			store := openCLIJobStore(t, home)
+			t.Cleanup(func() {
+				if err := store.Close(); err != nil {
+					t.Fatalf("Close returned error: %v", err)
+				}
+			})
 			branch := "gitmoot-delegation-x-d1"
-			wt := t.TempDir()
+			wt := managedReclaimTestPath(t, home, "d1")
 			jobID := "parent/delegation/d1"
 			payload := workflow.JobPayload{
 				Repo: "owner/repo", DelegationID: "d1", WorktreePath: wt, Branch: branch,
@@ -3864,10 +3870,11 @@ func TestReclaimSkippedDelegationWorktrees(t *testing.T) {
 			}
 
 			manager := &fakeReclaimWorktreeManager{branches: map[string]bool{branch: true}}
-			worker := defaultJobWorker(store, io.Discard)
+			worker := defaultJobWorker(store, io.Discard, home)
 			worker.WorkflowFactory = func(string) workflow.Engine {
 				return workflow.Engine{
 					Store:               store,
+					Home:                worker.workflowHome(),
 					DelegationCheckout:  t.TempDir(),
 					DelegationWorktrees: manager,
 					OwnerPIDLive:        func(int64) bool { return false },
@@ -3893,8 +3900,12 @@ func TestReclaimSkippedDelegationWorktrees(t *testing.T) {
 				if len(manager.removed) != 0 {
 					t.Fatalf("active foreign owner must keep preserving: removed=%+v", manager.removed)
 				}
-				if !pending {
-					t.Fatalf("cleanup must still be pending while owner active")
+				obligation, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(jobID, wt))
+				if err != nil {
+					t.Fatalf("GetCleanupObligation returned error: %v", err)
+				}
+				if obligation.State != db.CleanupObligationRetryable || obligation.Reason != db.CleanupReasonTerminalDeferred {
+					t.Fatalf("active-owner cleanup obligation = %+v, want retryable terminal deferral", obligation)
 				}
 			}
 		})
@@ -3910,7 +3921,13 @@ func TestReclaimSkippedDelegationWorktrees(t *testing.T) {
 // JobIDsWithPendingDelegationWorktreeReclaim + a per-candidate GetJob.
 func TestReclaimSkippedDelegationWorktreesBoundedToMarkedJobs(t *testing.T) {
 	ctx := context.Background()
-	store := daemonWorkerStore(t)
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close returned error: %v", err)
+		}
+	})
 
 	// A large backlog of terminal jobs with rich, immutable event history but NO
 	// cleanup marker. These must stay out of the candidate set entirely.
@@ -3941,7 +3958,7 @@ func TestReclaimSkippedDelegationWorktreesBoundedToMarkedJobs(t *testing.T) {
 
 	// The one genuinely-pending delegation child.
 	branch := "gitmoot-delegation-x-d1"
-	wt := t.TempDir()
+	wt := managedReclaimTestPath(t, home, "d1")
 	pendingID := "parent/delegation/d1"
 	payload := workflow.JobPayload{
 		Repo: "owner/repo", DelegationID: "d1", WorktreePath: wt, Branch: branch,
@@ -3962,10 +3979,11 @@ func TestReclaimSkippedDelegationWorktreesBoundedToMarkedJobs(t *testing.T) {
 	}
 
 	manager := &fakeReclaimWorktreeManager{branches: map[string]bool{branch: true}}
-	worker := defaultJobWorker(store, io.Discard)
+	worker := defaultJobWorker(store, io.Discard, home)
 	worker.WorkflowFactory = func(string) workflow.Engine {
 		return workflow.Engine{
 			Store:               store,
+			Home:                worker.workflowHome(),
 			DelegationCheckout:  t.TempDir(),
 			DelegationWorktrees: manager,
 			OwnerPIDLive:        func(int64) bool { return false },

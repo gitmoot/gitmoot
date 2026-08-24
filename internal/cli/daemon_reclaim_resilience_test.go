@@ -252,7 +252,7 @@ func TestAgedDelegationReclaimDestinationRemovesSecondDirectory(t *testing.T) {
 	worker := defaultJobWorker(store, io.Discard, home)
 	worker.WorkflowFactory = func(string) workflow.Engine {
 		return workflow.Engine{
-			Store: store, DelegationCheckout: checkout,
+			Store: store, Home: worker.workflowHome(), DelegationCheckout: checkout,
 			DelegationWorktrees: destinationReclaimManager{client: client, failPath: firstPath},
 		}
 	}
@@ -431,7 +431,7 @@ func TestAgedWorktreeReclaimFailureDoesNotBlockDispatch(t *testing.T) {
 	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
 
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
-	worktreePath := t.TempDir()
+	worktreePath := managedReclaimTestPath(t, home, "aged-reclaim-failure")
 	seedCLIJob(t, store, db.Job{
 		ID: "aged-terminal", Agent: "reader", Type: "ask", State: string(workflow.JobFailed),
 		Repo: "owner/repo", ParentJobID: "parent", DelegationID: "aged",
