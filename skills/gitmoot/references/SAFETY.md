@@ -503,7 +503,9 @@ Candidate-local lookup, runner, and removal failures skip only that worktree so
 later candidates continue; candidate-query and store-wide lookup failures still
 abort. Repeated failures log three times per path before suppression, and a
 five-minute fleet-wide summary reports considered, reclaimed, and skipped
-counts.
+counts. Only a completed fleet sweep emits these unqualified totals;
+cancellation or another early exit suppresses the incomplete prefix instead of
+presenting it as fleet-wide.
 
 `gitmoot doctor` and dashboard `/api/health` surface stale count and logical
 size, split into reclaimable final owners, pinned non-final owners, and unproven

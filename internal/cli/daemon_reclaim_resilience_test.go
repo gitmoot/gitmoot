@@ -150,6 +150,60 @@ func TestAgedDelegationReclaimSummaryDoesNotPhaseLockOnSkippedScans(t *testing.T
 	}
 }
 
+type cancelAfterAgedCandidateStore struct {
+	tickCandidateStore
+	cancel context.CancelFunc
+	called bool
+}
+
+func (s *cancelAfterAgedCandidateStore) JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cutoff time.Time) ([]string, error) {
+	ids, err := s.tickCandidateStore.JobIDsWithAgedTerminalDelegationWorktree(ctx, cutoff)
+	if err == nil {
+		s.called = true
+		s.cancel()
+	}
+	return ids, err
+}
+
+// TestDelegationReclaimIncompleteFleetSweepDoesNotEmitTotals cancels after the
+// global aged query while the first repo is running. The later repo's real
+// candidate is therefore outside the processed prefix, so no fleet-total line
+// may report the prefix's counters.
+func TestDelegationReclaimIncompleteFleetSweepDoesNotEmitTotals(t *testing.T) {
+	resetDelegationReclaimAccountingForTest(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/a-first", t.TempDir())
+	seedDaemonWorkerRepo(t, store, "owner/z-later", t.TempDir())
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	seedReclaimResilienceCandidateForRepo(t, store, "later-aged-candidate", "owner/z-later", t.TempDir(), now, false, false)
+
+	wrapped := &cancelAfterAgedCandidateStore{tickCandidateStore: store, cancel: cancel}
+	realNewTickCandidates := newTickCandidates
+	newTickCandidates = func(tickCandidateStore) *tickCandidates {
+		return realNewTickCandidates(wrapped)
+	}
+	defer func() { newTickCandidates = realNewTickCandidates }()
+
+	var output bytes.Buffer
+	worker := defaultJobWorker(store, &output)
+	tracker := newInflightJobTracker(ctx)
+	defer tracker.drain(io.Discard, time.Second)
+	err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", &output, now, nil, tracker)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("fleet sweep error = %v, want context cancellation", err)
+	}
+	if !wrapped.called {
+		t.Fatal("aged candidate query did not fire before cancellation")
+	}
+	for _, mode := range []string{"skipped", "aged"} {
+		line := mode + " delegation worktree reclaim: considered"
+		if strings.Contains(output.String(), line) {
+			t.Fatalf("incomplete sweep emitted an unqualified %s fleet total:\n%s", mode, output.String())
+		}
+	}
+}
+
 func seedReclaimResilienceCandidateForRepo(t *testing.T, store *db.Store, id string, repo string, path string, now time.Time, pendingMarker bool, badRunner bool) {
 	t.Helper()
 	payload := workflow.JobPayload{

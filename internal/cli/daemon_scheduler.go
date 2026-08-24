@@ -803,12 +803,15 @@ type tickCandidates struct {
 	agedReclaim               candidateMemo
 	skipAgedReclaim           bool
 	aggregateReclaimSummaries bool
-	reclaimPassRan            bool
-	agedReclaimPassRan        bool
-	reclaimStats              delegationReclaimPassStats
-	agedReclaimStats          delegationReclaimPassStats
-	reclaimUnscoped           map[string]struct{}
-	agedReclaimUnscoped       map[string]struct{}
+	// Unqualified aggregate counts are fleet totals only after every enabled
+	// repository has been visited by the sweep.
+	fleetSweepCompleted bool
+	reclaimPassRan      bool
+	agedReclaimPassRan  bool
+	reclaimStats        delegationReclaimPassStats
+	agedReclaimStats    delegationReclaimPassStats
+	reclaimUnscoped     map[string]struct{}
+	agedReclaimUnscoped map[string]struct{}
 	// A best-effort reclaim failure stays outside tick health but must not advance
 	// the success cadence; the fresh per-tick carrier keeps that signal bounded.
 	agedReclaimFailed bool
@@ -853,6 +856,9 @@ func (c *tickCandidates) firstUnscopedReclaimAttempt(mode string, jobID string) 
 }
 
 func (c *tickCandidates) logFleetReclaimSummaries(stdout io.Writer, now time.Time) {
+	if !c.fleetSweepCompleted {
+		return
+	}
 	if c.reclaimPassRan {
 		logDelegationReclaimSummary(stdout, "skipped", c.reclaimStats, now)
 	}
@@ -1303,6 +1309,7 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 	// to 1×/tick on a multi-repo daemon. Fresh each sweep; never retained.
 	cand := newTickCandidates(worker.Store)
 	cand.aggregateReclaimSummaries = true
+	defer cand.logFleetReclaimSummaries(stdout, now)
 	runAgedReclaim := tracker.agedDelegationWorktreeReclaimDue(now)
 	cand.skipAgedReclaim = !runAgedReclaim
 	// Scope tick faults per repo (#555 follow-up): the recovering supervisor
@@ -1335,9 +1342,6 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 			// fault: propagate it immediately so the supervisor treats it as such
 			// (and it never counts toward or masks the escalation streak).
 			if errors.Is(tickErr, context.Canceled) || ctx.Err() != nil {
-				// Preserve the partial fleet health signal accumulated before
-				// shutdown; a pass that never scanned still has no summary to flush.
-				cand.logFleetReclaimSummaries(stdout, now)
 				return tickErr
 			}
 			failed++
@@ -1345,7 +1349,7 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 			writeLine(stdout, "%s: worker tick error: %v", repo.FullName(), tickErr)
 		}
 	}
-	cand.logFleetReclaimSummaries(stdout, now)
+	cand.fleetSweepCompleted = true
 	if failed == 0 && runAgedReclaim && cand.agedReclaim.done && !cand.agedReclaimFailed {
 		tracker.markAgedDelegationWorktreeReclaimSuccessful(now)
 	}

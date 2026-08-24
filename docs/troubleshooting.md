@@ -708,6 +708,9 @@ One unreclaimable candidate does not stop the pass: candidate-local lookup,
 runner, and removal failures are skipped while later paths continue. The daemon
 logs the first three failures for a path, suppresses repeats, and emits a
 five-minute fleet-wide `considered N, reclaimed M, skipped K` summary.
+Only a completed fleet sweep emits these unqualified totals; cancellation or
+another early exit suppresses the incomplete prefix instead of presenting it
+as fleet-wide.
 Candidate-query and store-wide lookup failures still abort the pass and surface
 normally.
 
