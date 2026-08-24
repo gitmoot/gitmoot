@@ -3874,7 +3874,7 @@ func TestReclaimSkippedDelegationWorktrees(t *testing.T) {
 				}
 			}
 
-			if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(worker.Store)); err != nil {
+			if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(worker.Store), time.Now().UTC()); err != nil {
 				t.Fatalf("reclaimSkippedDelegationWorktrees returned error: %v", err)
 			}
 
@@ -3972,7 +3972,7 @@ func TestReclaimSkippedDelegationWorktreesBoundedToMarkedJobs(t *testing.T) {
 		}
 	}
 
-	if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(worker.Store)); err != nil {
+	if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(worker.Store), time.Now().UTC()); err != nil {
 		t.Fatalf("reclaimSkippedDelegationWorktrees returned error: %v", err)
 	}
 

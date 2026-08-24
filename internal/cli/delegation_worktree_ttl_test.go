@@ -24,11 +24,11 @@ func TestReclaimAgedTerminalDelegationWorktreesTTLAndStateGate(t *testing.T) {
 		path  string
 	}
 	rows := []seeded{
-		{id: "terminal-old", state: workflow.JobFailed, age: 73 * time.Hour, path: t.TempDir()},
-		{id: "terminal-fresh", state: workflow.JobSucceeded, age: time.Hour, path: t.TempDir()},
-		{id: "blocked-old", state: workflow.JobBlocked, age: 30 * 24 * time.Hour, path: t.TempDir()},
+		{id: "terminal-old", state: workflow.JobFailed, age: 73 * time.Hour, path: managedReclaimTestPath(t, home, "terminal-old")},
+		{id: "terminal-fresh", state: workflow.JobSucceeded, age: time.Hour, path: managedReclaimTestPath(t, home, "terminal-fresh")},
+		{id: "blocked-old", state: workflow.JobBlocked, age: 30 * 24 * time.Hour, path: managedReclaimTestPath(t, home, "blocked-old")},
 	}
-	sharedPath := t.TempDir()
+	sharedPath := managedReclaimTestPath(t, home, "shared")
 	rows = append(rows,
 		seeded{id: "shared-old", state: workflow.JobFailed, age: 10 * 24 * time.Hour, path: sharedPath},
 		seeded{id: "shared-fresh", state: workflow.JobSucceeded, age: time.Hour, path: sharedPath},
@@ -57,7 +57,7 @@ func TestReclaimAgedTerminalDelegationWorktreesTTLAndStateGate(t *testing.T) {
 	manager := &fakeReclaimWorktreeManager{branches: map[string]bool{}}
 	worker := defaultJobWorker(store, io.Discard, home)
 	worker.WorkflowFactory = func(string) workflow.Engine {
-		return workflow.Engine{Store: store, DelegationCheckout: t.TempDir(), DelegationWorktrees: manager}
+		return workflow.Engine{Store: store, Home: worker.workflowHome(), DelegationCheckout: t.TempDir(), DelegationWorktrees: manager}
 	}
 	if err := reclaimAgedTerminalDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(store), now, 72*time.Hour); err != nil {
 		t.Fatalf("reclaimAgedTerminalDelegationWorktrees: %v", err)

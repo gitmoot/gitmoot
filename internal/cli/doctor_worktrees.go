@@ -29,6 +29,7 @@ type delegationWorktreeUsage struct {
 	Pinned         int    `json:"pinned"`
 	Unproven       int    `json:"unproven"`
 	RecentTerminal int    `json:"recentTerminal"`
+	Quarantined    int    `json:"quarantined"`
 	Root           string `json:"root"`
 	Summary        string `json:"summary"`
 }
@@ -50,6 +51,10 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 	root := filepath.Join(paths.Home, "worktrees")
 	usage := delegationWorktreeUsage{Root: root}
 	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		return usage, err
+	}
+	usage.Quarantined, err = store.CountQuarantinedCleanupObligations(ctx)
 	if err != nil {
 		return usage, err
 	}
@@ -234,7 +239,7 @@ func delegationWorktreeDoctorCheck(paths config.Paths) (doctor.Check, bool) {
 }
 
 func buildDelegationWorktreeDoctorCheck(usage delegationWorktreeUsage) doctor.Check {
-	detail := fmt.Sprintf("%s (%d reclaimable, %d pinned by non-terminal owners, %d unproven; %d recent terminal within TTL)", usage.Summary, usage.Reclaimable, usage.Pinned, usage.Unproven, usage.RecentTerminal)
-	warn := usage.Stale >= delegationWorktreeWarnCount || usage.SizeBytes >= delegationWorktreeWarnBytes
+	detail := fmt.Sprintf("%s (%d reclaimable, %d pinned by non-terminal owners, %d unproven; %d recent terminal within TTL; %d cleanup quarantined)", usage.Summary, usage.Reclaimable, usage.Pinned, usage.Unproven, usage.RecentTerminal, usage.Quarantined)
+	warn := usage.Stale >= delegationWorktreeWarnCount || usage.SizeBytes >= delegationWorktreeWarnBytes || usage.Quarantined > 0
 	return doctor.Check{Name: "worktrees", OK: !warn, Required: false, Detail: detail}
 }

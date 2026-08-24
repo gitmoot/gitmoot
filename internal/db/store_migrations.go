@@ -1782,7 +1782,11 @@ WHERE repo = '' AND json_valid(payload) AND COALESCE(json_extract(payload, '$.re
 	`
 CREATE TABLE org_role_unavailable (
 	role TEXT PRIMARY KEY,
-	reason TEXT NOT NULL,
+	reason TEXT NOT NULL CHECK(reason IN (
+		'pending', 'removed', 'operator_reopened', 'terminal_cleanup_deferred',
+		'context_interrupted', 'job_lookup', 'runner_resolution', 'checkout_lock',
+		'identity_or_containment', 'unknown'
+	)),
 	unavailable_until TEXT NOT NULL,
 	escalated_at TEXT NOT NULL DEFAULT '',
 	updated_at TEXT NOT NULL
@@ -2044,5 +2048,30 @@ CREATE TABLE execbackend_attempts (
 	updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	PRIMARY KEY (job_id, attempt, lifecycle_generation)
 );
+	`,
+	// #1572 durable delegation-worktree cleanup obligations. Job events remain
+	// audit output; this row is the restart-safe retry state. The resource id is
+	// derived from (owner job, canonical expected path), while both values remain
+	// explicit so an operator can prove identity before reopening a quarantine.
+	// Removed is terminal; quarantined requires an explicit operator reopen.
+	`
+CREATE TABLE cleanup_obligations (
+	resource_id TEXT PRIMARY KEY,
+	resource_kind TEXT NOT NULL CHECK(resource_kind = 'delegation_worktree'),
+	owner_job_id TEXT NOT NULL,
+	expected_path TEXT NOT NULL,
+	state TEXT NOT NULL CHECK(state IN ('pending', 'retryable', 'removed', 'quarantined')),
+	reason TEXT NOT NULL,
+	attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+	next_attempt_at TEXT NOT NULL,
+	last_error TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX idx_cleanup_obligations_owner_path
+	ON cleanup_obligations(owner_job_id, expected_path);
+CREATE INDEX idx_cleanup_obligations_due
+	ON cleanup_obligations(state, next_attempt_at, owner_job_id)
+	WHERE state IN ('pending', 'retryable');
 	`,
 }

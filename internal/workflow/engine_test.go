@@ -2367,6 +2367,18 @@ func testEngine(store *db.Store) Engine {
 	}
 }
 
+func managedEngineWorktree(t *testing.T, engine *Engine, name string) string {
+	t.Helper()
+	if strings.TrimSpace(engine.Home) == "" {
+		engine.Home = t.TempDir()
+	}
+	path := filepath.Join(engine.Home, "worktrees", name)
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("create managed worktree %q: %v", path, err)
+	}
+	return path
+}
+
 func seedAgent(t *testing.T, store *db.Store, name string, capabilities []string, repo string) {
 	t.Helper()
 	// Implement-capable agents need a write policy or the fail-closed dispatch

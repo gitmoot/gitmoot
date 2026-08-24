@@ -97,7 +97,7 @@ func TestCleanupDisposesTopLevelReadOnlyWorktree(t *testing.T) {
 	engine.DelegationCheckout = t.TempDir()
 	engine.DelegationWorktrees = manager
 
-	wt := t.TempDir()
+	wt := managedEngineWorktree(t, &engine, "local-ask-seat")
 	hookCalled := false
 	engine.BeforeReadOnlyWorktreeCleanup = func(_ context.Context, jobID, jobType string, payload JobPayload) error {
 		hookCalled = true
@@ -137,7 +137,7 @@ func TestReadOnlyPrecleanupFailureEventRedactsHookError(t *testing.T) {
 	engine.DelegationWorktrees = manager
 
 	const secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
-	wt := t.TempDir()
+	wt := managedEngineWorktree(t, &engine, "secret-capture-error")
 	engine.BeforeReadOnlyWorktreeCleanup = func(context.Context, string, string, JobPayload) error {
 		return errors.New("hostile helper failed with token=" + secret)
 	}
@@ -179,7 +179,7 @@ func TestReclaimReadOnlyWorktree(t *testing.T) {
 	engine.DelegationWorktrees = manager
 
 	// A terminal top-level read-only ask job whose worktree still exists on disk.
-	roWT := t.TempDir()
+	roWT := managedEngineWorktree(t, &engine, "local-ask-seat")
 	roPayload, err := json.Marshal(JobPayload{WorktreePath: roWT, ReadOnlyWorktree: true})
 	if err != nil {
 		t.Fatalf("marshal read-only payload: %v", err)
@@ -196,7 +196,7 @@ func TestReclaimReadOnlyWorktree(t *testing.T) {
 
 	// An implement delegation worktree is still reclaimed by the same path.
 	manager.removedForce = nil
-	implWT := t.TempDir()
+	implWT := managedEngineWorktree(t, &engine, "parent-delegation-d1")
 	implPayload, err := json.Marshal(JobPayload{DelegationID: "d1", WorktreePath: implWT, Branch: "gitmoot-delegation-d1"})
 	if err != nil {
 		t.Fatalf("marshal implement payload: %v", err)
@@ -295,7 +295,7 @@ func TestCleanupReadOnlyDelegationWorktreeForceRemoves(t *testing.T) {
 	engine.DelegationWorktrees = manager
 
 	// The worktree path must exist on disk; cleanup skips an already-gone path.
-	wt := t.TempDir()
+	wt := managedEngineWorktree(t, &engine, "job-1-delegation-d1")
 	payload := JobPayload{DelegationID: "d1", WorktreePath: wt}
 	engine.cleanupReadOnlyDelegationWorktree(ctx, "job-1/delegation/d1", "ask", payload)
 	if len(manager.removedForce) != 1 || manager.removedForce[0] != wt {
@@ -341,7 +341,7 @@ func TestReadOnlyCleanupFailureIsReclaimable(t *testing.T) {
 	manager := &fakeWorktreeManager{removeErr: errors.New("worktree busy")}
 	engine.DelegationWorktrees = manager
 
-	wt := t.TempDir()
+	wt := managedEngineWorktree(t, &engine, "local-ask-seat")
 	payload := JobPayload{WorktreePath: wt, ReadOnlyWorktree: true}
 	engine.cleanupReadOnlyDelegationWorktree(ctx, "local-ask-seat", "ask", payload)
 
@@ -353,6 +353,13 @@ func TestReadOnlyCleanupFailureIsReclaimable(t *testing.T) {
 	}
 	if !engine.lastCleanupOutcomeIsSkip(ctx, "local-ask-seat") {
 		t.Fatal("latest cleanup outcome must be a skip so reclaimSkippedDelegationWorktrees re-fires it")
+	}
+	obligation, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID("local-ask-seat", wt))
+	if err != nil {
+		t.Fatalf("GetCleanupObligation: %v", err)
+	}
+	if obligation.State != db.CleanupObligationRetryable || obligation.Reason != db.CleanupReasonUnknown || obligation.AttemptCount != 0 {
+		t.Fatalf("initial cleanup failure obligation = %+v", obligation)
 	}
 
 	// Deduped: a second failing pass must not grow the event log without bound.

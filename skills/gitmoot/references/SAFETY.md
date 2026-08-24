@@ -501,11 +501,16 @@ TTL reclaim candidate. A successful force-remove and metadata prune records
 `delegation_worktree_reclaimed_ttl`.
 Candidate-local lookup, runner, and removal failures skip only that worktree so
 later candidates continue; candidate-query and store-wide lookup failures still
-abort. Repeated failures log three times per path before suppression.
+abort. Repeated failures log three times per path before suppression. Cleanup
+attempt state is also durable: every failure waits one minute before retry, and
+the third failure moves the obligation to terminal `quarantined` state. A
+quarantined target is excluded from automation until an operator verifies its
+job and expected path, then runs `gitmoot job cleanup reopen <resource-id>`.
 
 `gitmoot doctor` and dashboard `/api/health` surface stale count and logical
 size, split into reclaimable final owners, pinned non-final owners, and unproven
-directories. Pinned and unproven worktrees are observation-only.
+directories, plus the quarantined cleanup count. Pinned, unproven, and
+quarantined worktrees are observation-only.
 
 For manual relief, list
 `$GITMOOT_HOME/worktrees/*/delegations/*/*`, map each path to its job's

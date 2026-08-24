@@ -702,11 +702,16 @@ debugging access. Set it to `"0"` to disable the TTL pass. Aged final owners are
 force-removed even when dirty, Git worktree metadata is pruned, and
 `delegation_worktree_reclaimed_ttl` is recorded. The dashboard `/api/health`
 response exposes the same count, bytes, path, breakdown, and summary in its
-top-level `worktrees` field.
+top-level `worktrees` field, including the number of cleanup obligations in
+terminal quarantine.
 
 One unreclaimable candidate does not stop the pass: candidate-local lookup,
 runner, and removal failures are skipped while later paths continue. The daemon
 logs the first three failures for a path and suppresses repeats.
+Each failure advances a durable, restart-safe cleanup obligation. Retries wait
+one minute and stop after the third failure in `quarantined`; quarantined paths
+are not selected again until an operator inspects `gitmoot job cleanup list
+--state quarantined` and runs `gitmoot job cleanup reopen <resource-id>`.
 Candidate-query and store-wide lookup failures still abort the pass and surface
 normally.
 

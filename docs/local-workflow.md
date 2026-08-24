@@ -159,7 +159,12 @@ Delegation worktrees have a separate default-on retention bound:
 reclaimable/pinned/unproven breakdown; dashboard `/api/health` mirrors it.
 Candidate-local lookup, runner, and removal failures skip only that worktree;
 later candidates continue. Repeated failures are logged three times per path,
-then suppressed. Candidate-query and store-wide lookup failures remain fatal.
+then suppressed. Each failed cleanup also advances a durable obligation with a
+one-minute retry delay; after three failures it becomes `quarantined` and leaves
+automatic selection. Doctor and `/api/health` report quarantined obligations;
+inspect them with `gitmoot job cleanup list --state quarantined` and explicitly
+reopen one with `gitmoot job cleanup reopen <resource-id>`. Candidate-query and
+store-wide lookup failures remain fatal.
 
 Never-started plans have a separate destructive opt-in:
 `[workflow].planned_ttl = "720h"`. It is disabled by default; unset, empty,
