@@ -704,6 +704,12 @@ force-removed even when dirty, Git worktree metadata is pruned, and
 response exposes the same count, bytes, path, breakdown, and summary in its
 top-level `worktrees` field.
 
+One unreclaimable candidate does not stop the pass: candidate-local lookup,
+runner, and removal failures are skipped while later paths continue. The daemon
+logs the first three failures for a path and suppresses repeats.
+Candidate-query and store-wide lookup failures still abort the pass and surface
+normally.
+
 For immediate manual relief, list paths and then prove the owner is final. Do
 not infer safety from directory age alone:
 

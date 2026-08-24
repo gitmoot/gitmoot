@@ -499,6 +499,9 @@ owning job is final (`succeeded`, `failed`, or `cancelled`) and its terminal
 delay preserves a short debugging window. `blocked` is resumable and is never a
 TTL reclaim candidate. A successful force-remove and metadata prune records
 `delegation_worktree_reclaimed_ttl`.
+Candidate-local lookup, runner, and removal failures skip only that worktree so
+later candidates continue; candidate-query and store-wide lookup failures still
+abort. Repeated failures log three times per path before suppression.
 
 `gitmoot doctor` and dashboard `/api/health` surface stale count and logical
 size, split into reclaimable final owners, pinned non-final owners, and unproven

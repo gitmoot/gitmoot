@@ -65,6 +65,94 @@ const foreignBootRecoveryInterval = 15 * time.Second
 // daemon's one-second hot path.
 const agedDelegationWorktreeReclaimInterval = 5 * time.Minute
 
+const (
+	delegationReclaimFailureLogLimit  = 3
+	delegationReclaimFailureMaxPaths  = 4096
+	delegationReclaimFailureRetention = 24 * time.Hour
+)
+
+type delegationReclaimFailure struct {
+	count    int
+	lastSeen time.Time
+}
+
+var delegationReclaimAccounting = struct {
+	sync.Mutex
+	failures map[string]delegationReclaimFailure
+}{
+	failures: map[string]delegationReclaimFailure{},
+}
+
+func delegationReclaimPath(jobID string, payload string) string {
+	if parsed, err := workflow.ParseJobPayload(payload); err == nil {
+		return canonicalDelegationReclaimPath(jobID, parsed.WorktreePath)
+	}
+	return canonicalDelegationReclaimPath(jobID, "")
+}
+
+func canonicalDelegationReclaimPath(jobID string, path string) string {
+	if path = strings.TrimSpace(path); path != "" {
+		return filepath.Clean(path)
+	}
+	return "job:" + strings.TrimSpace(jobID)
+}
+
+func delegationReclaimCandidateJob(ctx context.Context, worker jobWorker, jobID string) (db.Job, error) {
+	if worker.ReclaimJobLookup != nil {
+		return worker.ReclaimJobLookup(ctx, jobID)
+	}
+	return worker.Store.GetJob(ctx, jobID)
+}
+
+// recordDelegationReclaimFailure counts failures by worktree path and returns
+// whether this attempt should be logged. A persistent poison pill therefore
+// remains visible for its first few attempts without flooding every daemon tick.
+func recordDelegationReclaimFailure(path string, now time.Time) (count int, log bool) {
+	delegationReclaimAccounting.Lock()
+	defer delegationReclaimAccounting.Unlock()
+	entry := delegationReclaimAccounting.failures[path]
+	entry.count++
+	entry.lastSeen = now
+	delegationReclaimAccounting.failures[path] = entry
+	if len(delegationReclaimAccounting.failures) > delegationReclaimFailureMaxPaths {
+		cutoff := now.Add(-delegationReclaimFailureRetention)
+		for candidatePath, candidate := range delegationReclaimAccounting.failures {
+			if candidate.lastSeen.Before(cutoff) {
+				delete(delegationReclaimAccounting.failures, candidatePath)
+			}
+		}
+		if len(delegationReclaimAccounting.failures) > delegationReclaimFailureMaxPaths {
+			oldestPath := ""
+			oldestSeen := now
+			for candidatePath, candidate := range delegationReclaimAccounting.failures {
+				if oldestPath == "" || candidate.lastSeen.Before(oldestSeen) {
+					oldestPath = candidatePath
+					oldestSeen = candidate.lastSeen
+				}
+			}
+			delete(delegationReclaimAccounting.failures, oldestPath)
+		}
+	}
+	return entry.count, entry.count <= delegationReclaimFailureLogLimit
+}
+
+func clearDelegationReclaimFailure(path string) {
+	delegationReclaimAccounting.Lock()
+	defer delegationReclaimAccounting.Unlock()
+	delete(delegationReclaimAccounting.failures, path)
+}
+
+func logDelegationReclaimFailure(stdout io.Writer, mode string, phase string, jobID string, path string, err error) {
+	count, shouldLog := recordDelegationReclaimFailure(path, time.Now().UTC())
+	if !shouldLog {
+		return
+	}
+	writeLine(stdout, "job %s %s delegation worktree reclaim failed path=%s phase=%s attempt=%d: %v", jobID, mode, path, phase, count, err)
+	if count == delegationReclaimFailureLogLimit {
+		writeLine(stdout, "job %s delegation worktree reclaim path=%s reached %d failures; further identical-path failures are suppressed", jobID, path, count)
+	}
+}
+
 // daemonPollTimeout bounds a single repo's PollOnce / PollRecoveryCommandsOnce.
 // The poll runs while HOLDING that repo's checkout lock, and both supervisors
 // take each repo's lock SEQUENTIALLY, so a wedged (ctx-respecting-but-slow)
@@ -810,16 +898,29 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 		return err
 	}
 	for _, jobID := range jobIDs {
-		job, err := worker.Store.GetJob(ctx, jobID)
+		job, err := delegationReclaimCandidateJob(ctx, worker, jobID)
 		if errors.Is(err, sql.ErrNoRows) {
 			// A cleanup-marker event with no surviving job row (e.g. a pruned job):
 			// nothing to reclaim, and erroring here would abort the whole tick.
 			continue
 		}
 		if err != nil {
-			return err
+			path, pathErr := worker.Store.JobWorktreePath(ctx, jobID)
+			if errors.Is(pathErr, sql.ErrNoRows) {
+				continue
+			}
+			if pathErr != nil {
+				return fmt.Errorf("get skipped reclaim candidate %s: %w (path lookup also failed: %v)", jobID, err, pathErr)
+			}
+			path = canonicalDelegationReclaimPath(jobID, path)
+			logDelegationReclaimFailure(worker.Stdout, "skipped", "get_job", jobID, path, err)
+			continue
 		}
-		if !jobStateEligibleForWorktreeReclaim(job.State) || !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+		path := delegationReclaimPath(job.ID, job.Payload)
+		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+			continue
+		}
+		if !jobStateEligibleForWorktreeReclaim(job.State) {
 			continue
 		}
 		if checkoutHeld != nil {
@@ -832,12 +933,16 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 		}
 		runner, err := worker.subprocessRunnerForJob(job)
 		if err != nil {
-			return err
+			logDelegationReclaimFailure(worker.Stdout, "skipped", "runner", job.ID, path, err)
+			continue
 		}
 		engine := worker.workflowForJob(worker.delegationParentCheckout(ctx, job), runner)
-		if err := engine.ReclaimTerminalDelegationWorktree(ctx, jobID); err != nil {
-			writeLine(worker.Stdout, "job %s skipped delegation worktree reclaim failed: %v", job.ID, err)
+		_, err = engine.ReclaimTerminalDelegationWorktreeOutcome(ctx, jobID)
+		if err != nil {
+			logDelegationReclaimFailure(worker.Stdout, "skipped", "reclaim", job.ID, path, err)
+			continue
 		}
+		clearDelegationReclaimFailure(path)
 	}
 	return nil
 }
@@ -856,14 +961,28 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 		return err
 	}
 	for _, jobID := range jobIDs {
-		job, err := worker.Store.GetJob(ctx, jobID)
+		job, err := delegationReclaimCandidateJob(ctx, worker, jobID)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
 		if err != nil {
-			return err
+			path, pathErr := worker.Store.JobWorktreePath(ctx, jobID)
+			if errors.Is(pathErr, sql.ErrNoRows) {
+				continue
+			}
+			if pathErr != nil {
+				return fmt.Errorf("get aged reclaim candidate %s: %w (path lookup also failed: %v)", jobID, err, pathErr)
+			}
+			path = canonicalDelegationReclaimPath(jobID, path)
+			logDelegationReclaimFailure(worker.Stdout, "aged", "get_job", jobID, path, err)
+			cand.agedReclaimFailed = true
+			continue
 		}
-		if !workflow.IsFinalJobState(job.State) || !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+		path := delegationReclaimPath(job.ID, job.Payload)
+		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+			continue
+		}
+		if !workflow.IsFinalJobState(job.State) {
 			continue
 		}
 		if checkoutHeld != nil {
@@ -876,12 +995,18 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 		}
 		runner, err := worker.subprocessRunnerForJob(job)
 		if err != nil {
-			return err
+			logDelegationReclaimFailure(worker.Stdout, "aged", "runner", job.ID, path, err)
+			cand.agedReclaimFailed = true
+			continue
 		}
 		engine := worker.workflowForJob(worker.delegationParentCheckout(ctx, job), runner)
-		if err := engine.ReclaimAgedTerminalDelegationWorktree(ctx, jobID, now.Add(-ttl)); err != nil {
-			return err
+		_, err = engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, now.Add(-ttl))
+		if err != nil {
+			logDelegationReclaimFailure(worker.Stdout, "aged", "reclaim", job.ID, path, err)
+			cand.agedReclaimFailed = true
+			continue
 		}
+		clearDelegationReclaimFailure(path)
 	}
 	return nil
 }

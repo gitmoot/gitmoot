@@ -157,6 +157,9 @@ Delegation worktrees have a separate default-on retention bound:
 `"0"` disables the pass. Blocked, queued, and running owners stay pinned. Run
 `gitmoot doctor` to see stale count, logical size, and the
 reclaimable/pinned/unproven breakdown; dashboard `/api/health` mirrors it.
+Candidate-local lookup, runner, and removal failures skip only that worktree;
+later candidates continue. Repeated failures are logged three times per path,
+then suppressed. Candidate-query and store-wide lookup failures remain fatal.
 
 Never-started plans have a separate destructive opt-in:
 `[workflow].planned_ttl = "720h"`. It is disabled by default; unset, empty,
