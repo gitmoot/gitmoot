@@ -346,14 +346,19 @@ func TestCancelJobReleasesRuntimeSessionLock(t *testing.T) {
 	}
 }
 
-// TestCancelJobReleasesInactiveTaskLaneLock kills the mutant that removes the
-// task-lane release from CancelJob. Once this top-level implement is cancelled
-// and no other non-terminal work references repo+branch, the operator's cancel
-// must immediately free the lane for the replacement writer.
+// TestCancelJobReleasesInactiveTaskLaneLock kills the pre-fix mutant that leaves
+// the production task row implementing before attempting the lane release. Once
+// this top-level implement is cancelled and no other non-terminal work references
+// repo+branch, the operator's cancel must immediately free the lane for a replacement writer.
 func TestCancelJobReleasesInactiveTaskLaneLock(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	const branch = "feature/cancelled-writer"
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-cancelled", RepoFullName: "owner/repo", State: string(TaskImplementing), Branch: branch,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: branch, Owner: "lead"})
 	if err != nil || !acquired {
 		t.Fatalf("AcquireLock acquired=%v err=%v", acquired, err)
@@ -375,12 +380,73 @@ func TestCancelJobReleasesInactiveTaskLaneLock(t *testing.T) {
 	if _, err := store.GetBranchLock(ctx, "owner/repo", branch); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("GetBranchLock after cancel error = %v, want sql.ErrNoRows", err)
 	}
+	task, err := store.GetTask(ctx, "task-cancelled")
+	if err != nil || task.State != string(TaskDismissed) {
+		t.Fatalf("task after cancel = %+v, err=%v; want dismissed", task, err)
+	}
 	events, err := store.ListBranchLockEvents(ctx, "owner/repo", branch)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(events) != 1 || events[0].Kind != "released" || !strings.Contains(events[0].Message, "cancellation") {
 		t.Fatalf("branch lock events = %+v, want cancellation release", events)
+	}
+}
+
+// TestCancelJobTaskLaneReleaseFailsClosed kills mutants that dismiss through a
+// queued successor or widen the implementing-state allowlist to review/unknown
+// states. Those states must retain both task state and lane ownership.
+func TestCancelJobTaskLaneReleaseFailsClosed(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		taskState string
+		otherJob  bool
+	}{
+		{name: "queued successor", taskState: string(TaskImplementing), otherJob: true},
+		{name: "review-owned task", taskState: string(TaskReviewing)},
+		{name: "unknown task state", taskState: "future_state"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openTestStore(t)
+			branch := "feature/cancel-veto-" + strings.ReplaceAll(test.name, " ", "-")
+			if err := store.UpsertTask(ctx, db.Task{
+				ID: "task-cancelled", RepoFullName: "owner/repo", State: test.taskState, Branch: branch,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: branch, Owner: "lead"})
+			if err != nil || !acquired {
+				t.Fatalf("AcquireLock acquired=%v err=%v", acquired, err)
+			}
+			payload, err := json.Marshal(JobPayload{Repo: "owner/repo", Branch: branch, TaskID: "task-cancelled"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CreateJobWithEvent(ctx, db.Job{
+				ID: "job-cancelled", Agent: "lead", Type: "implement", State: string(JobQueued), Repo: "owner/repo", Payload: string(payload),
+			}, db.JobEvent{Kind: string(JobQueued), Message: "queued"}); err != nil {
+				t.Fatal(err)
+			}
+			if test.otherJob {
+				if err := store.CreateJobWithEvent(ctx, db.Job{
+					ID: "job-successor", Agent: "lead", Type: "implement", State: string(JobQueued), Repo: "owner/repo", Payload: string(payload),
+				}, db.JobEvent{Kind: string(JobQueued), Message: "queued successor"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if _, err := CancelJob(ctx, store, "job-cancelled"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.GetBranchLock(ctx, "owner/repo", branch); err != nil {
+				t.Fatalf("branch lock was released despite %s: %v", test.name, err)
+			}
+			stored, err := store.GetTask(ctx, "task-cancelled")
+			if err != nil || stored.State != test.taskState {
+				t.Fatalf("task after cancel = %+v, err=%v; want state %q retained", stored, err, test.taskState)
+			}
+		})
 	}
 }
 

@@ -395,14 +395,21 @@ func CancelJob(ctx context.Context, store *db.Store, jobID string) (db.Job, erro
 			})
 		}
 		// A top-level task implement owns the task lane rather than an ephemeral
-		// delegation lane. Cancellation is terminal for this job, so release that
-		// lane only when no other non-terminal task or job still references the
-		// same repo+branch. The store performs the check and delete atomically;
-		// best-effort cleanup must not roll back a successful cancellation.
+		// delegation lane. Production creates the implementing task before this job,
+		// so cancellation first dismisses that task when it has no queued/running
+		// successor. RetryJob explicitly recovers a dismissed task before requeueing,
+		// keeping cancellation reversible. Unknown and review-owned task states fail
+		// closed. The store then atomically releases the lane only when no other
+		// non-terminal task or job references the same repo+branch; best-effort lock
+		// cleanup must not roll back a successful cancellation.
 		if job.Type == "implement" && strings.TrimSpace(payload.TaskID) != "" && strings.TrimSpace(payload.DelegationID) == "" {
 			repo := strings.TrimSpace(payload.Repo)
 			branch := strings.TrimSpace(payload.Branch)
-			if repo != "" && branch != "" {
+			changed, current, terr := store.TransitionTaskStateWithEventIfNoActiveJob(ctx, strings.TrimSpace(payload.TaskID),
+				[]string{string(TaskImplementing)}, string(TaskDismissed), "task_dismissed_job_cancel",
+				fmt.Sprintf("top-level implement job %s cancelled", job.ID))
+			taskDismissed := terr == nil && (changed || current == string(TaskDismissed))
+			if taskDismissed && repo != "" && branch != "" {
 				if lock, lerr := store.GetBranchLock(ctx, repo, branch); lerr == nil {
 					if released, rerr := store.ReleaseBranchLockIfInactiveWithEvent(ctx, lock, time.Time{}, db.BranchLockEvent{
 						Kind: "released", Message: "released after task implement cancellation left no non-terminal branch work (#1565)",
