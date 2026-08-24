@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -26,182 +25,7 @@ func resetDelegationReclaimAccountingForTest(t *testing.T) {
 	t.Helper()
 	delegationReclaimAccounting.Lock()
 	delegationReclaimAccounting.failures = map[string]delegationReclaimFailure{}
-	delegationReclaimAccounting.summaries = map[string]time.Time{}
 	delegationReclaimAccounting.Unlock()
-}
-
-// TestDelegationReclaimFleetSummaryVolumeBoundedAcrossRepos pins the summary
-// at the fleet-sweep boundary. Moving emission back into each repo tick makes
-// this produce one line per enabled repo and fail.
-func TestDelegationReclaimFleetSummaryVolumeBoundedAcrossRepos(t *testing.T) {
-	const repoCount = 4
-	for _, tc := range []struct {
-		name       string
-		candidate  bool
-		considered int
-		skipped    int
-	}{
-		{name: "zero_candidates_volume"},
-		{name: "fleet_totals_include_last_repo", candidate: true, considered: 1, skipped: 1},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			resetDelegationReclaimAccountingForTest(t)
-			ctx := context.Background()
-			store := daemonWorkerStore(t)
-			for i := 0; i < repoCount; i++ {
-				seedDaemonWorkerRepo(t, store, fmt.Sprintf("owner/repo%d", i), t.TempDir())
-			}
-			now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
-			if tc.candidate {
-				repos, err := store.ListRepos(ctx)
-				if err != nil {
-					t.Fatal(err)
-				}
-				lastRepo := repos[len(repos)-1].FullName()
-				seedReclaimResilienceCandidateForRepo(t, store, "last-repo-candidate", lastRepo, t.TempDir(), now, true, true)
-			}
-			var output bytes.Buffer
-			worker := defaultJobWorker(store, &output)
-			tracker := newInflightJobTracker(ctx)
-			defer tracker.drain(io.Discard, time.Second)
-
-			if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", &output, now, nil, tracker); err != nil {
-				t.Fatalf("runEnabledRepoWorkerTicksTracked: %v", err)
-			}
-			for _, mode := range []string{"skipped", "aged"} {
-				line := fmt.Sprintf("%s delegation worktree reclaim: considered %d, reclaimed 0, skipped %d", mode, tc.considered, tc.skipped)
-				if got := strings.Count(output.String(), line); got != 1 {
-					t.Fatalf("%s fleet summary count = %d, want 1 across %d enabled repos:\n%s", mode, got, repoCount, output.String())
-				}
-			}
-		})
-	}
-}
-
-// TestAgedDelegationReclaimSummaryDoesNotPhaseLockOnSkippedScans pins the
-// equal-period cadence interaction. A non-scanning sweep must not consume the
-// summary throttle immediately before the next due scan.
-func TestAgedDelegationReclaimSummaryDoesNotPhaseLockOnSkippedScans(t *testing.T) {
-	for _, mode := range []string{"fleet", "single_repo"} {
-		t.Run(mode, func(t *testing.T) {
-			resetDelegationReclaimAccountingForTest(t)
-			ctx := context.Background()
-			store := daemonWorkerStore(t)
-			checkout := t.TempDir()
-			seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-			now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
-			firstPath := t.TempDir()
-			seedReclaimResilienceCandidateForRepo(t, store, "first-aged-candidate", "owner/repo", firstPath, now, false, false)
-
-			manager := &selectiveReclaimManager{
-				fakeReclaimWorktreeManager: fakeReclaimWorktreeManager{branches: map[string]bool{}},
-				failPath:                   firstPath,
-				err:                        errors.New("transient aged reclaim failure"),
-			}
-			var output bytes.Buffer
-			worker := defaultJobWorker(store, &output)
-			worker.WorkflowFactory = func(string) workflow.Engine {
-				return workflow.Engine{Store: store, DelegationCheckout: checkout, DelegationWorktrees: manager}
-			}
-			tracker := newInflightJobTracker(ctx)
-			defer tracker.drain(io.Discard, time.Second)
-
-			runSweep := func(at time.Time) error {
-				if mode == "fleet" {
-					return runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", &output, at, nil, tracker)
-				}
-				return runDaemonWorkerTickTracked(ctx, store, worker, 1, false, "owner/repo", "", &output, at, tracker, nil)
-			}
-
-			// The failed due pass emits and leaves the aged cadence immediately due.
-			if err := runSweep(now); err != nil {
-				t.Fatalf("failed aged sweep: %v", err)
-			}
-			manager.failPath = ""
-			if err := runSweep(now.Add(time.Second)); err != nil {
-				t.Fatalf("successful retry sweep: %v", err)
-			}
-			if len(manager.removed) != 1 {
-				t.Fatalf("successful retry removed %d worktrees, want 1", len(manager.removed))
-			}
-
-			secondPath := t.TempDir()
-			seedReclaimResilienceCandidateForRepo(t, store, "second-aged-candidate", "owner/repo", secondPath, now.Add(time.Second), false, false)
-			// This is one second before the aged scan is due, but exactly when the
-			// previous summary throttle expires. It must not emit or re-anchor.
-			if err := runSweep(now.Add(delegationReclaimSummaryInterval)); err != nil {
-				t.Fatalf("non-scanning sweep: %v", err)
-			}
-			if err := runSweep(now.Add(agedDelegationWorktreeReclaimInterval + time.Second)); err != nil {
-				t.Fatalf("next due sweep: %v", err)
-			}
-			if len(manager.removed) != 2 {
-				t.Fatalf("due sweep removed %d worktrees, want 2", len(manager.removed))
-			}
-			zeroScan := "aged delegation worktree reclaim: considered 0, reclaimed 0, skipped 0"
-			if strings.Contains(output.String(), zeroScan) {
-				t.Fatalf("non-scanning sweep emitted an aged summary:\n%s", output.String())
-			}
-			want := "aged delegation worktree reclaim: considered 1, reclaimed 1, skipped 0"
-			if got := strings.Count(output.String(), want); got != 1 {
-				t.Fatalf("successful due reclaim summary count = %d, want 1:\n%s", got, output.String())
-			}
-		})
-	}
-}
-
-type cancelAfterAgedCandidateStore struct {
-	tickCandidateStore
-	cancel context.CancelFunc
-	called bool
-}
-
-func (s *cancelAfterAgedCandidateStore) JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cutoff time.Time) ([]string, error) {
-	ids, err := s.tickCandidateStore.JobIDsWithAgedTerminalDelegationWorktree(ctx, cutoff)
-	if err == nil {
-		s.called = true
-		s.cancel()
-	}
-	return ids, err
-}
-
-// TestDelegationReclaimIncompleteFleetSweepDoesNotEmitTotals cancels after the
-// global aged query while the first repo is running. The later repo's real
-// candidate is therefore outside the processed prefix, so no fleet-total line
-// may report the prefix's counters.
-func TestDelegationReclaimIncompleteFleetSweepDoesNotEmitTotals(t *testing.T) {
-	resetDelegationReclaimAccountingForTest(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	store := daemonWorkerStore(t)
-	seedDaemonWorkerRepo(t, store, "owner/a-first", t.TempDir())
-	seedDaemonWorkerRepo(t, store, "owner/z-later", t.TempDir())
-	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
-	seedReclaimResilienceCandidateForRepo(t, store, "later-aged-candidate", "owner/z-later", t.TempDir(), now, false, false)
-
-	wrapped := &cancelAfterAgedCandidateStore{tickCandidateStore: store, cancel: cancel}
-	realNewTickCandidates := newTickCandidates
-	newTickCandidates = func(tickCandidateStore) *tickCandidates {
-		return realNewTickCandidates(wrapped)
-	}
-	defer func() { newTickCandidates = realNewTickCandidates }()
-
-	var output bytes.Buffer
-	worker := defaultJobWorker(store, &output)
-	tracker := newInflightJobTracker(ctx)
-	defer tracker.drain(io.Discard, time.Second)
-	err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", &output, now, nil, tracker)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("fleet sweep error = %v, want context cancellation", err)
-	}
-	if !wrapped.called {
-		t.Fatal("aged candidate query did not fire before cancellation")
-	}
-	for _, mode := range []string{"skipped", "aged"} {
-		line := mode + " delegation worktree reclaim: considered"
-		if strings.Contains(output.String(), line) {
-			t.Fatalf("incomplete sweep emitted an unqualified %s fleet total:\n%s", mode, output.String())
-		}
-	}
 }
 
 func seedReclaimResilienceCandidateForRepo(t *testing.T, store *db.Store, id string, repo string, path string, now time.Time, pendingMarker bool, badRunner bool) {
@@ -326,11 +150,6 @@ func TestDelegationReclaimPoisonPillContinues(t *testing.T) {
 				if len(manager.removed) != 1 || filepath.Clean(manager.removed[0]) != filepath.Clean(goodPath) {
 					t.Fatalf("second candidate was not reclaimed after %s failure: removed=%v", phase, manager.removed)
 				}
-				for _, want := range []string{"considered 2", "reclaimed 1", "skipped 1"} {
-					if !strings.Contains(output.String(), want) {
-						t.Fatalf("summary missing %q: %s", want, output.String())
-					}
-				}
 			})
 		}
 	}
@@ -382,7 +201,7 @@ func TestDelegationReclaimStoreFailureStillAborts(t *testing.T) {
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 	seedReclaimResilienceCandidate(t, store, "a-candidate", t.TempDir(), now, false, false)
 	cand := newTickCandidates(store)
-	if _, _, err := cand.agedDelegationReclaimCandidates(ctx, now.Add(-72*time.Hour)); err != nil {
+	if _, err := cand.agedDelegationReclaimCandidates(ctx, now.Add(-72*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
