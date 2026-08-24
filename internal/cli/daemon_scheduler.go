@@ -886,13 +886,14 @@ func (c *tickCandidates) delegationReclaimCandidates(ctx context.Context) ([]str
 	})
 }
 
-func (c *tickCandidates) agedDelegationReclaimCandidates(ctx context.Context, cutoff time.Time) ([]string, error) {
+func (c *tickCandidates) agedDelegationReclaimCandidates(ctx context.Context, cutoff time.Time) ([]string, bool, error) {
 	if c.skipAgedReclaim {
-		return nil, nil
+		return nil, false, nil
 	}
-	return c.agedReclaim.get(func() ([]string, error) {
+	ids, err := c.agedReclaim.get(func() ([]string, error) {
 		return c.store.JobIDsWithAgedTerminalDelegationWorktree(ctx, cutoff)
 	})
+	return ids, true, err
 }
 
 // retryPendingJobAdvancements re-fires the post-delivery advancement for any
@@ -1065,9 +1066,12 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 	if ttl <= 0 {
 		return nil
 	}
-	jobIDs, err := cand.agedDelegationReclaimCandidates(ctx, now.Add(-ttl))
+	jobIDs, scanned, err := cand.agedDelegationReclaimCandidates(ctx, now.Add(-ttl))
 	if err != nil {
 		return err
+	}
+	if !scanned {
+		return nil
 	}
 	stats := delegationReclaimPassStats{}
 	defer func() {
@@ -1331,6 +1335,9 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 			// fault: propagate it immediately so the supervisor treats it as such
 			// (and it never counts toward or masks the escalation streak).
 			if errors.Is(tickErr, context.Canceled) || ctx.Err() != nil {
+				// Preserve the partial fleet health signal accumulated before
+				// shutdown; a pass that never scanned still has no summary to flush.
+				cand.logFleetReclaimSummaries(stdout, now)
 				return tickErr
 			}
 			failed++

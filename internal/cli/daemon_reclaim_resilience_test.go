@@ -78,6 +78,78 @@ func TestDelegationReclaimFleetSummaryVolumeBoundedAcrossRepos(t *testing.T) {
 	}
 }
 
+// TestAgedDelegationReclaimSummaryDoesNotPhaseLockOnSkippedScans pins the
+// equal-period cadence interaction. A non-scanning sweep must not consume the
+// summary throttle immediately before the next due scan.
+func TestAgedDelegationReclaimSummaryDoesNotPhaseLockOnSkippedScans(t *testing.T) {
+	for _, mode := range []string{"fleet", "single_repo"} {
+		t.Run(mode, func(t *testing.T) {
+			resetDelegationReclaimAccountingForTest(t)
+			ctx := context.Background()
+			store := daemonWorkerStore(t)
+			checkout := t.TempDir()
+			seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+			now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+			firstPath := t.TempDir()
+			seedReclaimResilienceCandidateForRepo(t, store, "first-aged-candidate", "owner/repo", firstPath, now, false, false)
+
+			manager := &selectiveReclaimManager{
+				fakeReclaimWorktreeManager: fakeReclaimWorktreeManager{branches: map[string]bool{}},
+				failPath:                   firstPath,
+				err:                        errors.New("transient aged reclaim failure"),
+			}
+			var output bytes.Buffer
+			worker := defaultJobWorker(store, &output)
+			worker.WorkflowFactory = func(string) workflow.Engine {
+				return workflow.Engine{Store: store, DelegationCheckout: checkout, DelegationWorktrees: manager}
+			}
+			tracker := newInflightJobTracker(ctx)
+			defer tracker.drain(io.Discard, time.Second)
+
+			runSweep := func(at time.Time) error {
+				if mode == "fleet" {
+					return runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", &output, at, nil, tracker)
+				}
+				return runDaemonWorkerTickTracked(ctx, store, worker, 1, false, "owner/repo", "", &output, at, tracker, nil)
+			}
+
+			// The failed due pass emits and leaves the aged cadence immediately due.
+			if err := runSweep(now); err != nil {
+				t.Fatalf("failed aged sweep: %v", err)
+			}
+			manager.failPath = ""
+			if err := runSweep(now.Add(time.Second)); err != nil {
+				t.Fatalf("successful retry sweep: %v", err)
+			}
+			if len(manager.removed) != 1 {
+				t.Fatalf("successful retry removed %d worktrees, want 1", len(manager.removed))
+			}
+
+			secondPath := t.TempDir()
+			seedReclaimResilienceCandidateForRepo(t, store, "second-aged-candidate", "owner/repo", secondPath, now.Add(time.Second), false, false)
+			// This is one second before the aged scan is due, but exactly when the
+			// previous summary throttle expires. It must not emit or re-anchor.
+			if err := runSweep(now.Add(delegationReclaimSummaryInterval)); err != nil {
+				t.Fatalf("non-scanning sweep: %v", err)
+			}
+			if err := runSweep(now.Add(agedDelegationWorktreeReclaimInterval + time.Second)); err != nil {
+				t.Fatalf("next due sweep: %v", err)
+			}
+			if len(manager.removed) != 2 {
+				t.Fatalf("due sweep removed %d worktrees, want 2", len(manager.removed))
+			}
+			zeroScan := "aged delegation worktree reclaim: considered 0, reclaimed 0, skipped 0"
+			if strings.Contains(output.String(), zeroScan) {
+				t.Fatalf("non-scanning sweep emitted an aged summary:\n%s", output.String())
+			}
+			want := "aged delegation worktree reclaim: considered 1, reclaimed 1, skipped 0"
+			if got := strings.Count(output.String(), want); got != 1 {
+				t.Fatalf("successful due reclaim summary count = %d, want 1:\n%s", got, output.String())
+			}
+		})
+	}
+}
+
 func seedReclaimResilienceCandidateForRepo(t *testing.T, store *db.Store, id string, repo string, path string, now time.Time, pendingMarker bool, badRunner bool) {
 	t.Helper()
 	payload := workflow.JobPayload{
@@ -256,7 +328,7 @@ func TestDelegationReclaimStoreFailureStillAborts(t *testing.T) {
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 	seedReclaimResilienceCandidate(t, store, "a-candidate", t.TempDir(), now, false, false)
 	cand := newTickCandidates(store)
-	if _, err := cand.agedDelegationReclaimCandidates(ctx, now.Add(-72*time.Hour)); err != nil {
+	if _, _, err := cand.agedDelegationReclaimCandidates(ctx, now.Add(-72*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
