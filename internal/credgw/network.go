@@ -20,6 +20,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -31,20 +32,24 @@ const networkRenewPrefix = "/_gitmoot/renew/"
 // listener. ClientCAKey never leaves the host; it signs one client certificate
 // for each network proxy lease.
 type NetworkProxyConfig struct {
-	Address           string
-	ServerCertificate tls.Certificate
-	ClientCA          *x509.Certificate
-	ClientCAKey       crypto.Signer
+	Address string
+	// AdvertisedAuthority is the host or host:port clients use. An omitted or
+	// zero port is replaced with the listener's bound port.
+	AdvertisedAuthority string
+	ServerCertificate   tls.Certificate
+	ClientCA            *x509.Certificate
+	ClientCAKey         crypto.Signer
 }
 
 // NetworkProxy is a mandatory-mTLS transport over a Gateway's request-time
 // proxy entries. It never dispatches the legacy entries that retain credentials.
 type NetworkProxy struct {
-	gateway  *Gateway
-	listener net.Listener
-	server   *http.Server
-	clientCA *x509.Certificate
-	caKey    crypto.Signer
+	gateway   *Gateway
+	listener  net.Listener
+	server    *http.Server
+	authority string
+	clientCA  *x509.Certificate
+	caKey     crypto.Signer
 }
 
 // NetworkLease carries no provider credential. Its client certificate and
@@ -66,6 +71,9 @@ func (g *Gateway) StartNetworkProxy(config NetworkProxyConfig) (*NetworkProxy, e
 	}
 	if strings.TrimSpace(config.Address) == "" {
 		return nil, errors.New("network credential gateway listen address is required")
+	}
+	if strings.TrimSpace(config.AdvertisedAuthority) == "" {
+		return nil, errors.New("network credential gateway advertised authority is required")
 	}
 	if len(config.ServerCertificate.Certificate) == 0 || config.ServerCertificate.PrivateKey == nil {
 		return nil, errors.New("network credential gateway server TLS certificate is required")
@@ -94,8 +102,18 @@ func (g *Gateway) StartNetworkProxy(config NetworkProxyConfig) (*NetworkProxy, e
 	if err != nil {
 		return nil, fmt.Errorf("listen for network credential gateway: %w", err)
 	}
+	authority, advertisedHost, err := resolveAdvertisedAuthority(config.AdvertisedAuthority, listener.Addr())
+	if err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
+	if err := verifyServerCertificateAuthority(config.ServerCertificate, advertisedHost); err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
 	network := &NetworkProxy{
-		gateway: g, listener: listener, clientCA: config.ClientCA, caKey: config.ClientCAKey,
+		gateway: g, listener: listener, authority: authority,
+		clientCA: config.ClientCA, caKey: config.ClientCAKey,
 	}
 	network.server = &http.Server{
 		Handler:           network,
@@ -122,7 +140,7 @@ func (n *NetworkProxy) URL() string {
 	if n == nil || n.listener == nil {
 		return ""
 	}
-	return "https://" + n.listener.Addr().String()
+	return "https://" + n.authority
 }
 
 func (n *NetworkProxy) Close(ctx context.Context) error {
@@ -272,7 +290,7 @@ func (n *NetworkProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		n.gateway.serveProxyRequest(w, r, proxyRequestAccess{
 			route: route, capability: capability, suffixRoute: route,
-			authority: n.listener.Addr().String(), clientCertHash: certificateHash, network: true,
+			authority: n.authority, clientCertHash: certificateHash, network: true,
 		})
 		return
 	}
@@ -280,7 +298,7 @@ func (n *NetworkProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (n *NetworkProxy) serveRenewal(w http.ResponseWriter, r *http.Request, route string, certificateHash [sha256.Size]byte) {
-	if r.Method != http.MethodPost || r.URL.IsAbs() || r.URL.Host != "" || !strings.EqualFold(r.Host, n.listener.Addr().String()) {
+	if r.Method != http.MethodPost || r.URL.IsAbs() || r.URL.Host != "" || !strings.EqualFold(r.Host, n.authority) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -298,6 +316,42 @@ func (n *NetworkProxy) serveRenewal(w http.ResponseWriter, r *http.Request, rout
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.WriteString(w, renewed)
+}
+
+func resolveAdvertisedAuthority(configured string, bound net.Addr) (string, string, error) {
+	configured = strings.TrimSpace(configured)
+	parsed, err := url.Parse("https://" + configured)
+	if err != nil || parsed.Host != configured || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", "", fmt.Errorf("network credential gateway advertised authority %q is invalid", configured)
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return "", "", fmt.Errorf("network credential gateway advertised authority %q is invalid", configured)
+	}
+	port := parsed.Port()
+	if port == "" || port == "0" {
+		_, boundPort, splitErr := net.SplitHostPort(bound.String())
+		if splitErr != nil {
+			return "", "", fmt.Errorf("resolve network credential gateway advertised authority: %w", splitErr)
+		}
+		port = boundPort
+	}
+	return net.JoinHostPort(host, port), host, nil
+}
+
+func verifyServerCertificateAuthority(certificate tls.Certificate, advertisedHost string) error {
+	leaf := certificate.Leaf
+	if leaf == nil {
+		var err error
+		leaf, err = x509.ParseCertificate(certificate.Certificate[0])
+		if err != nil {
+			return fmt.Errorf("parse network credential gateway server TLS certificate: %w", err)
+		}
+	}
+	if err := leaf.VerifyHostname(advertisedHost); err != nil {
+		return fmt.Errorf("network credential gateway server TLS certificate does not cover advertised host %q: %w", advertisedHost, err)
+	}
+	return nil
 }
 
 func (g *Gateway) renewProxyCapability(route, capability string, certificateHash [sha256.Size]byte) (string, error) {
