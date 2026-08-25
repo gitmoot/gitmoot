@@ -14,9 +14,85 @@ import (
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 )
 
+func TestIssue1616DescriptionPathLikeTokensDoNotFailObservedChanges(t *testing.T) {
+	const claim = "internal/workflow/result_checks.go:162 — handles pkg.Symbol across a/b"
+	observation := compareResultChanges(
+		[]string{claim},
+		[]string{"internal/workflow/result_checks.go"},
+	)
+	if observation.Divergent {
+		t.Fatalf("description tokens created a false divergence: %+v", observation)
+	}
+	if got, want := fmt.Sprint(observation.Changes[0].ClaimedFiles), "[internal/workflow/result_checks.go]"; got != want {
+		t.Fatalf("ClaimedFiles = %s, want %s", got, want)
+	}
+	check, ok := resultCheckByID(RunResultChecks(ResultCheckInput{
+		Action:      "implement",
+		Result:      AgentResult{Decision: "implemented", ChangesMade: []string{claim}, TestsRun: []string{"targeted test"}},
+		Observation: observation,
+	}), "implement-changes-observed")
+	if !ok || !check.Pass {
+		t.Fatalf("matching leading path binding should pass the observation check: %+v", check)
+	}
+}
+
+func TestIssue1616ClaimedFileAbsentFromDiffStillFails(t *testing.T) {
+	const claim = "internal/workflow/absent.go:17 — updates the result gate"
+	observation := compareResultChanges([]string{claim}, nil)
+	if got, want := fmt.Sprint(observation.ClaimedOnlyFiles), "[internal/workflow/absent.go]"; got != want {
+		t.Fatalf("ClaimedOnlyFiles = %s, want %s", got, want)
+	}
+	check, ok := resultCheckByID(RunResultChecks(ResultCheckInput{
+		Action:      "implement",
+		Result:      AgentResult{Decision: "implemented", ChangesMade: []string{claim}, TestsRun: []string{"targeted test"}},
+		Observation: observation,
+	}), "implement-changes-observed")
+	if !ok || check.Pass {
+		t.Fatalf("claimed file absent from diff should fail the observation check: %+v", check)
+	}
+	if !strings.Contains(check.Explanation, "work may be missing") {
+		t.Fatalf("failure does not name the missing-work condition: %q", check.Explanation)
+	}
+}
+
+func TestIssue1616UnclaimedDiffFileStillFails(t *testing.T) {
+	const claim = "internal/workflow/claimed.go:9 — updates the claimed file"
+	observation := compareResultChanges(
+		[]string{claim},
+		[]string{"internal/workflow/claimed.go", "internal/workflow/unmentioned.go"},
+	)
+	if got, want := fmt.Sprint(observation.UnclaimedFiles), "[internal/workflow/unmentioned.go]"; got != want {
+		t.Fatalf("UnclaimedFiles = %s, want %s", got, want)
+	}
+	failed := failedIDs(ResultCheckInput{
+		Action:      "implement",
+		Result:      AgentResult{Decision: "implemented", ChangesMade: []string{claim}, TestsRun: []string{"targeted test"}},
+		Observation: observation,
+	})
+	if _, ok := failed["implement-changes-observed"]; !ok {
+		t.Fatalf("unclaimed diff file should fail the observation check; failed=%v", keys(failed))
+	}
+}
+
+func TestIssue1616UnboundClaimIsReportedAsParserNote(t *testing.T) {
+	const claim = "updated the result gate without a leading binding"
+	observation := compareResultChanges([]string{claim}, nil)
+	if got, want := fmt.Sprint(observation.UnboundClaims), "["+claim+"]"; got != want {
+		t.Fatalf("UnboundClaims = %s, want %s", got, want)
+	}
+	check, ok := resultCheckByID(RunResultChecks(ResultCheckInput{
+		Action:      "implement",
+		Result:      AgentResult{Decision: "implemented", ChangesMade: []string{claim}, TestsRun: []string{"targeted test"}},
+		Observation: observation,
+	}), "implement-changes-observed")
+	if !ok || !check.Pass {
+		t.Fatalf("an unbound parser note alone should not fail the observation check: %+v", check)
+	}
+}
+
 func TestCompareResultChangesFlagsClaimedFileAbsentFromDiff(t *testing.T) {
 	observation := compareResultChanges(
-		[]string{"updated internal/workflow/absent.go"},
+		[]string{"internal/workflow/absent.go:1 — updated"},
 		nil,
 	)
 	if !observation.Divergent {
@@ -30,7 +106,7 @@ func TestCompareResultChangesFlagsClaimedFileAbsentFromDiff(t *testing.T) {
 	}
 	failed := failedIDs(ResultCheckInput{
 		Action:      "implement",
-		Result:      AgentResult{Decision: "implemented", ChangesMade: []string{"updated internal/workflow/absent.go"}, TestsRun: []string{"go test ./..."}},
+		Result:      AgentResult{Decision: "implemented", ChangesMade: []string{"internal/workflow/absent.go:1 — updated"}, TestsRun: []string{"go test ./..."}},
 		Observation: observation,
 	})
 	if _, ok := failed["implement-changes-observed"]; !ok {
@@ -39,7 +115,7 @@ func TestCompareResultChangesFlagsClaimedFileAbsentFromDiff(t *testing.T) {
 }
 
 func TestCompareResultChangesDoesNotRebindQualifiedClaimByBasename(t *testing.T) {
-	const claim = "updated docs/result_checks.go"
+	const claim = "docs/result_checks.go:1 — updated"
 	observation := compareResultChanges(
 		[]string{claim},
 		[]string{"internal/workflow/result_checks.go"},
@@ -73,7 +149,7 @@ func TestCompareResultChangesDoesNotRebindQualifiedClaimByBasename(t *testing.T)
 }
 
 func TestCompareResultChangesKeepsUnqualifiedBasenameBindingReported(t *testing.T) {
-	const claim = "updated result_checks.go"
+	const claim = "result_checks.go:1 — updated"
 	observation := compareResultChanges(
 		[]string{claim},
 		[]string{"internal/workflow/result_checks.go"},
@@ -91,7 +167,7 @@ func TestCompareResultChangesKeepsUnqualifiedBasenameBindingReported(t *testing.
 }
 
 func TestRunResultChecksRejectsMismatchedObservedPathBinding(t *testing.T) {
-	const claim = "updated docs/result_checks.go"
+	const claim = "docs/result_checks.go:1 — updated"
 	observation := &ResultObservation{
 		Source:       ResultObservationSourceWorktreeDiff,
 		TouchedFiles: []string{"internal/workflow/result_checks.go"},
@@ -115,7 +191,7 @@ func TestRunResultChecksRejectsMismatchedObservedPathBinding(t *testing.T) {
 }
 
 func TestRunResultChecksRejectsObservedBindingAbsentFromTouchedFiles(t *testing.T) {
-	const claim = "updated docs/result_checks.go"
+	const claim = "docs/result_checks.go:1 — updated"
 	observation := &ResultObservation{
 		Source:       ResultObservationSourceWorktreeDiff,
 		TouchedFiles: []string{"internal/workflow/result_checks.go"},
@@ -139,7 +215,7 @@ func TestRunResultChecksRejectsObservedBindingAbsentFromTouchedFiles(t *testing.
 }
 
 func TestRunResultChecksRejectsReportedBindingAbsentFromTouchedFiles(t *testing.T) {
-	const claim = "updated docs/result_checks.go"
+	const claim = "docs/result_checks.go:1 — updated"
 	observation := &ResultObservation{
 		Source:       ResultObservationSourceWorktreeDiff,
 		TouchedFiles: []string{"internal/workflow/result_checks.go"},
@@ -164,7 +240,7 @@ func TestRunResultChecksRejectsReportedBindingAbsentFromTouchedFiles(t *testing.
 
 func TestCompareResultChangesFlagsDiffFileNoClaimMentions(t *testing.T) {
 	observation := compareResultChanges(
-		[]string{"updated internal/workflow/claimed.go"},
+		[]string{"internal/workflow/claimed.go:1 — updated"},
 		[]string{"internal/workflow/claimed.go", "internal/workflow/unmentioned.go"},
 	)
 	if !observation.Divergent {
@@ -178,7 +254,7 @@ func TestCompareResultChangesFlagsDiffFileNoClaimMentions(t *testing.T) {
 	}
 	failed := failedIDs(ResultCheckInput{
 		Action:      "implement",
-		Result:      AgentResult{Decision: "implemented", ChangesMade: []string{"updated internal/workflow/claimed.go"}, TestsRun: []string{"go test ./..."}},
+		Result:      AgentResult{Decision: "implemented", ChangesMade: []string{"internal/workflow/claimed.go:1 — updated"}, TestsRun: []string{"go test ./..."}},
 		Observation: observation,
 	})
 	if _, ok := failed["implement-changes-observed"]; !ok {
@@ -210,7 +286,7 @@ func TestObserveResultChangesReadsTrackedAndUntrackedWorktreeDiff(t *testing.T) 
 	runObservationGit(t, repo, "add", "tracked.go")
 
 	observation := observeResultChanges(context.Background(), repo, AgentResult{
-		ChangesMade: []string{"updated tracked.go", "added new.go"},
+		ChangesMade: []string{"tracked.go:1 — updated", "new.go:1 — added"},
 	}, execbackend.Local)
 	if observation == nil || observation.Error != "" {
 		t.Fatalf("observation = %+v, want successful worktree diff", observation)
@@ -230,7 +306,7 @@ func TestObserveResultChangesReadsTrackedAndUntrackedWorktreeDiff(t *testing.T) 
 
 func TestObserveResultChangesNonLocalBackendCannotRunLocalGit(t *testing.T) {
 	observation := observeResultChanges(context.Background(), t.TempDir(), AgentResult{
-		ChangesMade: []string{"updated tracked.go"},
+		ChangesMade: []string{"tracked.go:1 — updated"},
 	}, execbackend.Backend("p2-probe"))
 	if observation == nil || !strings.Contains(observation.Error, "p2-probe") || !strings.Contains(observation.Error, "no execution implementation") {
 		t.Fatalf("observation = %+v, want missing p2-probe implementation", observation)
@@ -253,7 +329,7 @@ func TestMailboxResultObservationFlowsIntoOffWarnBlockGate(t *testing.T) {
 			store := openTestStore(t)
 			repo := observationTestRepo(t)
 			mailbox := Mailbox{store: store, resolveDeliveryWorktree: PayloadDeliveryWorktreeResolver, resultCheckMode: tc.mode}
-			output := `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["updated absent.go"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
+			output := `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["absent.go:1 — updated"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
 			adapter := &fakeDelivery{outputs: []string{output}}
 			jobID := "observe-" + string(tc.mode)
 			if _, err := mailbox.Enqueue(ctx, JobRequest{
@@ -297,7 +373,7 @@ func TestMailboxResultObservationFlagsUnclaimedDiffFile(t *testing.T) {
 	writeObservationFile(t, repo, "unmentioned.go", "package changed\n")
 
 	mailbox := Mailbox{store: store, resolveDeliveryWorktree: PayloadDeliveryWorktreeResolver, resultCheckMode: ResultChecksWarn}
-	output := `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["updated claimed.go"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
+	output := `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["claimed.go:1 — updated"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
 	adapter := &fakeDelivery{outputs: []string{output}}
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID: "observe-unclaimed", Agent: "audit", Action: "implement", Repo: "gitmoot/gitmoot", WorktreePath: repo,
@@ -328,7 +404,7 @@ func TestMailboxObservationGapRecordsWithoutRefusingPersistence(t *testing.T) {
 	store := openTestStore(t)
 	notGit := t.TempDir()
 	mailbox := Mailbox{store: store, resolveDeliveryWorktree: PayloadDeliveryWorktreeResolver, resultCheckMode: ResultChecksBlock}
-	output := `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["updated foo.go"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
+	output := `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["foo.go:1 — updated"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
 	adapter := &fakeDelivery{outputs: []string{output}}
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID: "observe-gap", Agent: "audit", Action: "implement", Repo: "gitmoot/gitmoot", WorktreePath: notGit,
@@ -365,7 +441,7 @@ func TestMailboxImportsChangeSetBeforeResultObservation(t *testing.T) {
 			return &changes, nil
 		},
 	}
-	output := `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["updated claimed.go"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
+	output := `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["claimed.go:1 — updated"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID: "changeset-before-observation", Agent: "audit", Action: "implement", Repo: "gitmoot/gitmoot", WorktreePath: host,
 	}); err != nil {
@@ -407,7 +483,7 @@ func TestMailboxMalformedRedeliveryImportsFinalCumulativeChangeSet(t *testing.T)
 	}
 	deliveries := 0
 	adapter := &fakeDelivery{
-		outputs: []string{"malformed result", `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["updated claimed.go"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`},
+		outputs: []string{"malformed result", `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["claimed.go:1 — updated"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`},
 		onDeliver: func() {
 			deliveries++
 			if deliveries == 2 {
@@ -448,7 +524,7 @@ func TestMailboxImportFailureStopsBeforeObservation(t *testing.T) {
 			return errors.New("deliberate mid-materialize interruption")
 		},
 	}
-	output := `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["updated claimed.go"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
+	output := `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["claimed.go:1 — updated"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID: "changeset-interrupted", Agent: "audit", Action: "implement", Repo: "gitmoot/gitmoot", WorktreePath: host,
 	}); err != nil {

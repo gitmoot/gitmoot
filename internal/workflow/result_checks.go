@@ -159,18 +159,18 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 			})
 			if in.Observation != nil && in.Observation.Source == ResultObservationSourceWorktreeDiff && in.Observation.Error == "" {
 				invalidBindings := invalidCapturedBindingClaims(in.Observation.Changes, in.Observation.TouchedFiles)
-				consistent := !in.Observation.Divergent && len(invalidBindings) == 0
+				consistent := len(in.Observation.ClaimedOnlyFiles) == 0 && len(in.Observation.UnclaimedFiles) == 0 && len(invalidBindings) == 0
 				checks = append(checks, ResultCheck{
 					ID:       "implement-changes-observed",
 					Action:   "implement",
 					Question: "Do the reported changes_made files match the files observed in the worktree diff?",
 					Pass:     consistent,
 					Explanation: explain(consistent, fmt.Sprintf(
-						"changes_made and the worktree diff diverge (claimed-only: %s; unclaimed diff files: %s; claims without a file path: %s; invalid captured path bindings: %s)",
+						"work may be missing: claimed changes_made files absent from the diff: %s; diff files absent from changes_made: %s; invalid captured path bindings: %s; parser note (non-failing on its own): claims without a leading path:line binding: %s",
 						displayPaths(in.Observation.ClaimedOnlyFiles),
 						displayPaths(in.Observation.UnclaimedFiles),
-						displayPaths(in.Observation.UnboundClaims),
 						displayPaths(invalidBindings),
+						displayPaths(in.Observation.UnboundClaims),
 					)),
 				})
 			}
