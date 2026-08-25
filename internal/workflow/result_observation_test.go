@@ -15,15 +15,15 @@ import (
 )
 
 func TestIssue1616DescriptionPathLikeTokensDoNotFailObservedChanges(t *testing.T) {
-	const claim = "internal/workflow/result_checks.go:162 — handles pkg.Symbol across a/b"
+	const claim = "internal/cli/daemon_worker.go:596 — … via agent.Runtime."
 	observation := compareResultChanges(
 		[]string{claim},
-		[]string{"internal/workflow/result_checks.go"},
+		[]string{"internal/cli/daemon_worker.go"},
 	)
 	if observation.Divergent {
 		t.Fatalf("description tokens created a false divergence: %+v", observation)
 	}
-	if got, want := fmt.Sprint(observation.Changes[0].ClaimedFiles), "[internal/workflow/result_checks.go]"; got != want {
+	if got, want := fmt.Sprint(observation.Changes[0].ClaimedFiles), "[internal/cli/daemon_worker.go]"; got != want {
 		t.Fatalf("ClaimedFiles = %s, want %s", got, want)
 	}
 	check, ok := resultCheckByID(RunResultChecks(ResultCheckInput{
@@ -33,6 +33,45 @@ func TestIssue1616DescriptionPathLikeTokensDoNotFailObservedChanges(t *testing.T
 	}), "implement-changes-observed")
 	if !ok || !check.Pass {
 		t.Fatalf("matching leading path binding should pass the observation check: %+v", check)
+	}
+}
+
+func TestIssue1616ProseFirstTouchedFileBinds(t *testing.T) {
+	const claim = "updated ordinary.go"
+	observation := compareResultChanges([]string{claim}, []string{"ordinary.go"})
+	if observation.Divergent {
+		t.Fatalf("prose-first touched-file claim diverged: %+v", observation)
+	}
+	if got, want := fmt.Sprint(observation.Changes[0].ClaimedFiles), "[ordinary.go]"; got != want {
+		t.Fatalf("ClaimedFiles = %s, want %s", got, want)
+	}
+}
+
+func TestIssue1616ProseFirstOverclaimFailsAsUnbound(t *testing.T) {
+	const (
+		boundClaim = "updated internal/workflow/result_checks.go"
+		overclaim  = "updated absent.go"
+	)
+	observation := compareResultChanges(
+		[]string{boundClaim, overclaim},
+		[]string{"internal/workflow/result_checks.go"},
+	)
+	if got, want := fmt.Sprint(observation.UnboundClaims), "["+overclaim+"]"; got != want {
+		t.Fatalf("UnboundClaims = %s, want %s", got, want)
+	}
+	if got := fmt.Sprint(observation.ClaimedOnlyFiles); got != "[]" {
+		t.Fatalf("unbound prose-first over-claim produced ClaimedOnlyFiles = %s", got)
+	}
+	if got := fmt.Sprint(observation.UnclaimedFiles); got != "[]" {
+		t.Fatalf("fully claimed diff produced UnclaimedFiles = %s", got)
+	}
+	check, ok := resultCheckByID(RunResultChecks(ResultCheckInput{
+		Action:      "implement",
+		Result:      AgentResult{Decision: "implemented", ChangesMade: []string{boundClaim, overclaim}, TestsRun: []string{"targeted test"}},
+		Observation: observation,
+	}), "implement-changes-observed")
+	if !ok || check.Pass {
+		t.Fatalf("unbound prose-first over-claim should fail with a non-empty, fully claimed diff: %+v", check)
 	}
 }
 
@@ -121,7 +160,7 @@ func TestIssue1616UnboundOverclaimFailsWithNonEmptyFullyClaimedDiff(t *testing.T
 func TestIssue1616LeadingPathOverclaimFailsWithNonEmptyFullyClaimedDiff(t *testing.T) {
 	const (
 		boundClaim    = "internal/workflow/result_checks.go:162 — updated the result gate"
-		overclaim     = "internal/workflow/absent.go — updated another gate"
+		overclaim     = "internal/workflow/absent.go:23 — updated another gate"
 		boundDiffFile = "internal/workflow/result_checks.go"
 		overclaimFile = "internal/workflow/absent.go"
 	)
@@ -148,6 +187,12 @@ func TestIssue1616LeadingPathOverclaimFailsWithNonEmptyFullyClaimedDiff(t *testi
 func TestIssue1616UnboundClaimWithEmptyDiffFails(t *testing.T) {
 	const claim = "refactored the credential gate"
 	observation := compareResultChanges([]string{claim}, nil)
+	if got, want := fmt.Sprint(observation.UnboundClaims), "["+claim+"]"; got != want {
+		t.Fatalf("UnboundClaims = %s, want %s", got, want)
+	}
+	if got := fmt.Sprint(observation.ClaimedOnlyFiles); got != "[]" {
+		t.Fatalf("pure prose produced bogus ClaimedOnlyFiles = %s", got)
+	}
 	checks := RunResultChecks(ResultCheckInput{
 		Action:      "implement",
 		Result:      AgentResult{Decision: "implemented", ChangesMade: []string{claim}, TestsRun: []string{"targeted test"}},

@@ -306,18 +306,52 @@ func compareResultChanges(claims, touchedFiles []string) *ResultObservation {
 	}
 }
 
-func claimFilePaths(claim string, _ []string) []string {
-	binding := strings.TrimSpace(claim)
-	if separator := strings.IndexFunc(binding, func(r rune) bool {
-		return unicode.IsSpace(r) || r == '—'
-	}); separator >= 0 {
-		binding = binding[:separator]
-	}
-	binding = normalizeClaimPath(resultClaimLineSuffix.ReplaceAllString(binding, ""))
-	if binding == "" {
+func claimFilePaths(claim string, touchedFiles []string) []string {
+	tokens := strings.FieldsFunc(claim, claimTokenSeparator)
+	if len(tokens) == 0 {
 		return []string{}
 	}
-	return []string{binding}
+
+	touchedFiles = sortedUniquePaths(touchedFiles)
+	touched := make(map[string]struct{}, len(touchedFiles))
+	byBase := make(map[string][]string, len(touchedFiles))
+	for _, file := range touchedFiles {
+		touched[file] = struct{}{}
+		byBase[path.Base(file)] = append(byBase[path.Base(file)], file)
+	}
+
+	leading, hasLineSuffix := normalizeClaimToken(tokens[0])
+	if leading != "" && (hasLineSuffix || claimPathMatchesTouched(leading, touched, byBase)) {
+		return []string{leading}
+	}
+
+	candidates := make([]string, 0)
+	for _, token := range tokens[1:] {
+		candidate, _ := normalizeClaimToken(token)
+		if candidate != "" && claimPathMatchesTouched(candidate, touched, byBase) {
+			candidates = append(candidates, candidate)
+		}
+	}
+	return sortedUniquePaths(candidates)
+}
+
+func claimTokenSeparator(r rune) bool {
+	return unicode.IsSpace(r) || strings.ContainsRune("\"'`()[]{}<>,;", r)
+}
+
+func normalizeClaimToken(token string) (string, bool) {
+	token = strings.Trim(token, ".,;!?\"'`()[]{}<>")
+	hasLineSuffix := resultClaimLineSuffix.MatchString(token)
+	token = resultClaimLineSuffix.ReplaceAllString(token, "")
+	token = strings.TrimSuffix(token, ":")
+	return normalizeClaimPath(token), hasLineSuffix
+}
+
+func claimPathMatchesTouched(candidate string, touched map[string]struct{}, byBase map[string][]string) bool {
+	if hasPath(touched, candidate) {
+		return true
+	}
+	return !strings.Contains(candidate, "/") && len(byBase[candidate]) == 1
 }
 
 func normalizeClaimPath(value string) string {

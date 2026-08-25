@@ -166,7 +166,7 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 					Question: "Do the reported changes_made files match the files observed in the worktree diff?",
 					Pass:     consistent,
 					Explanation: explain(consistent, fmt.Sprintf(
-						"work may be missing: claimed changes_made files absent from the diff: %s; diff files absent from changes_made: %s; claims without a leading repo-relative path binding: %s; invalid captured path bindings: %s",
+						"work may be missing: claimed changes_made files absent from the diff: %s; diff files absent from changes_made: %s; claims without a touched-file path binding: %s; invalid captured path bindings: %s",
 						displayPaths(in.Observation.ClaimedOnlyFiles),
 						displayPaths(in.Observation.UnclaimedFiles),
 						displayPaths(in.Observation.UnboundClaims),
