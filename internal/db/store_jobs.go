@@ -1433,15 +1433,16 @@ func (s *Store) ListJobEvents(ctx context.Context, jobID string) ([]JobEvent, er
 	return events, rows.Err()
 }
 
-// LatestSuccessfulRuntimeRefUse returns when agentName most recently completed
-// a succeeded job on runtimeRef. Runtime selection is dispatch evidence, so the
-// match comes from the effective_runtime/runtime_override event's session-lock
-// key rather than the agent registry's default runtime. That distinction matters
-// for per-job runtime overrides: the resolved runtime can differ from
-// agents.runtime while still resuming the pinned session reference.
-func (s *Store) LatestSuccessfulRuntimeRefUse(ctx context.Context, agentName, runtimeRef string) (time.Time, bool, error) {
+// LatestSuccessfulRuntimeSessionUse returns when agentName most recently
+// completed a succeeded job on the exact runtimeName/runtimeRef session.
+// Runtime selection is dispatch evidence, so the match comes from the newest
+// effective_runtime/runtime_override event for each succeeded job. Restricting
+// each job to its newest selection excludes failed same-row attempts that were
+// followed by a successful retry on another session.
+func (s *Store) LatestSuccessfulRuntimeSessionUse(ctx context.Context, agentName, runtimeName, runtimeRef string) (time.Time, bool, error) {
+	runtimeName = strings.TrimSpace(runtimeName)
 	ref := strings.TrimSpace(runtimeRef)
-	if ref == "" {
+	if runtimeName == "" || ref == "" {
 		return time.Time{}, false, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT e.message, j.updated_at
@@ -1450,6 +1451,10 @@ func (s *Store) LatestSuccessfulRuntimeRefUse(ctx context.Context, agentName, ru
 		WHERE j.agent = ?
 		  AND j.state = 'succeeded'
 		  AND e.kind IN ('effective_runtime', 'runtime_override')
+		  AND e.id = (SELECT MAX(latest.id)
+			FROM job_events latest
+			WHERE latest.job_id = j.id
+			  AND latest.kind IN ('effective_runtime', 'runtime_override'))
 		ORDER BY j.updated_at DESC, e.id DESC`, strings.TrimSpace(agentName))
 	if err != nil {
 		return time.Time{}, false, err
@@ -1461,30 +1466,36 @@ func (s *Store) LatestSuccessfulRuntimeRefUse(ctx context.Context, agentName, ru
 		if err := rows.Scan(&message, &updatedAt); err != nil {
 			return time.Time{}, false, err
 		}
-		if runtimeEventSessionRef(message) == ref {
+		eventRuntime, eventRef := runtimeEventSession(message)
+		if eventRuntime == runtimeName && eventRef == ref {
 			return parseStoredTimestamp(updatedAt), true, nil
 		}
 	}
 	return time.Time{}, false, rows.Err()
 }
 
-func runtimeEventSessionRef(message string) string {
+func runtimeEventSession(message string) (string, string) {
 	const marker = "; session lock "
 	index := strings.LastIndex(message, marker)
 	if index < 0 {
-		return ""
+		return "", ""
 	}
 	lockKey := strings.TrimSpace(message[index+len(marker):])
 	const prefix = "runtime:"
 	if !strings.HasPrefix(lockKey, prefix) {
-		return ""
+		return "", ""
 	}
 	runtimeAndRef := strings.TrimPrefix(lockKey, prefix)
 	separator := strings.IndexByte(runtimeAndRef, ':')
 	if separator < 0 {
-		return ""
+		return "", ""
 	}
-	return strings.TrimSpace(runtimeAndRef[separator+1:])
+	runtimeName := strings.TrimSpace(runtimeAndRef[:separator])
+	ref := strings.TrimSpace(runtimeAndRef[separator+1:])
+	if runtimeName == "" || ref == "" {
+		return "", ""
+	}
+	return runtimeName, ref
 }
 
 // LatestJobEvents returns the most recent event for every job that has one,

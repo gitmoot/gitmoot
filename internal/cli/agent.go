@@ -2126,7 +2126,7 @@ func runAgentShow(args []string, stdout, stderr io.Writer) int {
 		pinned := isPinnedRuntimeRef(agent.Runtime, agent.RuntimeRef)
 		lastSuccessfulUse := ""
 		if pinned {
-			usedAt, found, err := store.LatestSuccessfulRuntimeRefUse(context.Background(), agent.Name, agent.RuntimeRef)
+			usedAt, found, err := store.LatestSuccessfulRuntimeSessionUse(context.Background(), agent.Name, agent.Runtime, agent.RuntimeRef)
 			if err != nil {
 				return err
 			}

@@ -153,30 +153,30 @@ func TestRunAgentShow(t *testing.T) {
 	}
 }
 
-func TestRunAgentShowPinnedRuntimeRefLastSuccessfulUseFromEvent(t *testing.T) {
+func TestRunAgentShowPinnedRuntimeRefLastSuccessfulUseFromMatchingRuntimeEvent(t *testing.T) {
 	home := t.TempDir()
 	store := openCLIJobStore(t, home)
 	ctx := context.Background()
 	const pin = "550e8400-e29b-41d4-a716-446655440021"
 	if err := store.UpsertAgent(ctx, db.Agent{
-		Name: "override-user", Role: "reviewer", Runtime: runtime.CodexRuntime,
+		Name: "pinned-user", Role: "reviewer", Runtime: runtime.CodexRuntime,
 		RuntimeRef: pin, RepoScope: "owner/repo", Capabilities: []string{"review"},
 	}); err != nil {
 		t.Fatalf("UpsertAgent: %v", err)
 	}
 	seedCLIJob(t, store, db.Job{
-		ID: "override-success", Agent: "override-user", Type: "review", State: string(workflow.JobSucceeded), Payload: `{}`,
+		ID: "matching-success", Agent: "pinned-user", Type: "review", State: string(workflow.JobSucceeded), Payload: `{}`,
 	}, "succeeded")
 	if err := store.AddJobEvent(ctx, db.JobEvent{
-		JobID: "override-success", Kind: runtimeOverrideEventKind,
-		Message: "job runs on runtime claude (agent default codex); session lock runtime:claude:" + pin,
+		JobID: "matching-success", Kind: effectiveRuntimeEventKind,
+		Message: "job runs on runtime codex (agent default codex); session lock runtime:codex:" + pin,
 	}); err != nil {
 		t.Fatalf("AddJobEvent: %v", err)
 	}
 	store.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "show", "override-user", "--home", home}, &stdout, &stderr)
+	code := Run([]string{"agent", "show", "pinned-user", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("agent show exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -187,6 +187,38 @@ func TestRunAgentShowPinnedRuntimeRefLastSuccessfulUseFromEvent(t *testing.T) {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("agent show output missing %q:\n%s", want, stdout.String())
 		}
+	}
+}
+
+func TestRunAgentShowPinnedRuntimeRefIgnoresDifferentRuntime(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	ctx := context.Background()
+	const pin = "550e8400-e29b-41d4-a716-446655440022"
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name: "codex-user", Role: "reviewer", Runtime: runtime.CodexRuntime,
+		RuntimeRef: pin, RepoScope: "owner/repo", Capabilities: []string{"review"},
+	}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	seedCLIJob(t, store, db.Job{
+		ID: "claude-success", Agent: "codex-user", Type: "review", State: string(workflow.JobSucceeded), Payload: `{}`,
+	}, "succeeded")
+	if err := store.AddJobEvent(ctx, db.JobEvent{
+		JobID: "claude-success", Kind: runtimeOverrideEventKind,
+		Message: "job runs on runtime claude (agent default codex); session lock runtime:claude:" + pin,
+	}); err != nil {
+		t.Fatalf("AddJobEvent: %v", err)
+	}
+	store.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"agent", "show", "codex-user", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent show exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if want := "runtime_session: pinned (last successful use: never)\n"; !strings.Contains(stdout.String(), want) {
+		t.Fatalf("agent show output missing %q:\n%s", want, stdout.String())
 	}
 }
 
