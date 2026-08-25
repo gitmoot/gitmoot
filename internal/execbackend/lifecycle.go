@@ -278,14 +278,21 @@ func (b *LocalBackend) Exec(ctx context.Context, instance *Instance, command Com
 		}
 		var result subprocess.Result
 		var runErr error
+		// The runner calls onStart only after cmd.Start succeeds, so this records
+		// stage provenance without inferring it from the shared fork/exec errno.
+		started := false
+		onStart := func(pid int) {
+			started = true
+			if command.OnStart != nil {
+				command.OnStart(pid)
+			}
+		}
 		if command.Output != nil {
-			result, runErr = runner.RunEnvStreamWithPID(execCtx, dir, command.Env, command.Output, command.OnStart, command.Name, command.Args...)
+			result, runErr = runner.RunEnvStreamWithPID(execCtx, dir, command.Env, command.Output, onStart, command.Name, command.Args...)
 		} else {
-			result, runErr = runner.RunEnvWithPID(execCtx, dir, command.Env, command.OnStart, command.Name, command.Args...)
+			result, runErr = runner.RunEnvWithPID(execCtx, dir, command.Env, onStart, command.Name, command.Args...)
 		}
-		if b.identity != nil && isCredentialApplicationError(runErr) {
-			runErr = fmt.Errorf("execute local backend command as uid %d gid %d: %w", b.identity.UID, b.identity.GID, runErr)
-		}
+		runErr = frameLocalExecError(b.identity, started, runErr)
 		stream.result <- localExecResult{result: ExecResult{
 			Command: result.Command,
 			Args:    result.Args,
@@ -296,9 +303,11 @@ func (b *LocalBackend) Exec(ctx context.Context, instance *Instance, command Com
 	return stream, nil
 }
 
-func isCredentialApplicationError(err error) bool {
-	var pathErr *os.PathError
-	return errors.As(err, &pathErr) && pathErr.Op == "fork/exec" && errors.Is(pathErr.Err, syscall.EPERM)
+func frameLocalExecError(identity *LocalIdentity, started bool, err error) error {
+	if err == nil || identity == nil || started {
+		return err
+	}
+	return fmt.Errorf("start local backend command with configured identity uid %d gid %d: %w", identity.UID, identity.GID, err)
 }
 
 func (b *LocalBackend) credential() *syscall.Credential {

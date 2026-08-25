@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -354,8 +355,10 @@ func TestLocalBackendExecNonzeroExitDoesNotBlameConfiguredIdentity(t *testing.T)
 		{name: "streaming", output: &strings.Builder{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			startedPID := 0
 			stream, err := backend.Exec(context.Background(), instance, Command{
 				Dir: instance.Workspace, Name: "/bin/sh", Args: []string{"-c", "exit 3"}, Output: tc.output,
+				OnStart: func(pid int) { startedPID = pid },
 			})
 			if err != nil {
 				t.Fatalf("Exec setup: %v", err)
@@ -365,8 +368,92 @@ func TestLocalBackendExecNonzeroExitDoesNotBlameConfiguredIdentity(t *testing.T)
 			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 3 {
 				t.Fatalf("ordinary exit error = %v, want exit status 3", err)
 			}
-			if strings.Contains(err.Error(), "execute local backend command as uid") {
+			if strings.Contains(err.Error(), "configured identity") {
 				t.Fatalf("ordinary exit error = %v, want no configured-identity framing", err)
+			}
+			if startedPID <= 0 {
+				t.Fatalf("forwarded OnStart pid = %d, want positive pid", startedPID)
+			}
+		})
+	}
+}
+
+func TestLocalBackendExecStartFailureAfterIdentityDropHasNeutralContext(t *testing.T) {
+	identity := testUnprivilegedIdentities(t, 1)[0]
+	host, _, _ := changeSetRepoPair(t)
+	backend := newPrivilegedTestLocalBackend(t, identity)
+	instance, err := backend.Provision(context.Background(), JobScope{JobID: "start-eacces"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backend.Destroy(context.Background(), instance) })
+	if err := backend.SyncIn(context.Background(), instance, Materials{SourceWorktree: host}); err != nil {
+		t.Fatal(err)
+	}
+
+	deniedDir := t.TempDir()
+	if err := os.Chmod(deniedDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	commandPath := filepath.Join(deniedDir, "command")
+	if err := os.WriteFile(commandPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(commandPath).CombinedOutput(); err != nil {
+		t.Fatalf("root control could not execute denied command: %v\n%s", err, output)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		output *strings.Builder
+	}{
+		{name: "buffered"},
+		{name: "streaming", output: &strings.Builder{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stream, err := backend.Exec(context.Background(), instance, Command{
+				Dir: instance.Workspace, Name: commandPath, Output: tc.output,
+			})
+			if err != nil {
+				t.Fatalf("Exec setup: %v", err)
+			}
+			_, err = stream.Wait()
+			if !errors.Is(err, syscall.EACCES) {
+				t.Fatalf("identity-restricted start error = %v, want EACCES", err)
+			}
+			want := fmt.Sprintf("start local backend command with configured identity uid %d gid %d", identity.UID, identity.GID)
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("identity-restricted start error = %v, want neutral context %q", err, want)
+			}
+			if strings.Contains(err.Error(), "command as uid") || strings.Contains(err.Error(), "credential application") {
+				t.Fatalf("identity-restricted start error = %v, want no inferred cause", err)
+			}
+		})
+	}
+}
+
+func TestFrameLocalExecStartFailureUsesNeutralIdentityContext(t *testing.T) {
+	identity := LocalIdentity{UID: 123, GID: 456}
+	for _, tc := range []struct {
+		name  string
+		errno syscall.Errno
+	}{
+		{name: "credential_setid_einval", errno: syscall.EINVAL},
+		{name: "credential_setuid_eagain", errno: syscall.EAGAIN},
+		{name: "credential_setgroups_enomem", errno: syscall.ENOMEM},
+		{name: "ordinary_execve_eperm", errno: syscall.EPERM},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			startErr := &os.PathError{Op: "fork/exec", Path: "/bin/tool", Err: tc.errno}
+			got := frameLocalExecError(&identity, false, startErr)
+			if want := "start local backend command with configured identity uid 123 gid 456"; !strings.Contains(got.Error(), want) {
+				t.Fatalf("framed start error = %v, want neutral context %q", got, want)
+			}
+			if strings.Contains(got.Error(), "credential application") || strings.Contains(got.Error(), "command as uid") {
+				t.Fatalf("framed start error = %v, want no inferred cause", got)
+			}
+			if !errors.Is(got, tc.errno) {
+				t.Fatalf("framed start error = %v, want preserved errno %v", got, tc.errno)
 			}
 		})
 	}
@@ -390,7 +477,9 @@ func runLocalBackendIdentityFailureHelper(t *testing.T, target LocalIdentity) {
 	if err == nil {
 		t.Fatal("configured identity failure silently ran the command")
 	}
-	if !strings.Contains(err.Error(), "execute local backend command as uid") || !strings.Contains(err.Error(), "operation not permitted") {
+	wantUID := fmt.Sprintf("uid %d", target.UID)
+	wantGID := fmt.Sprintf("gid %d", target.GID)
+	if !strings.Contains(err.Error(), wantUID) || !strings.Contains(err.Error(), wantGID) || !strings.Contains(err.Error(), "operation not permitted") {
 		t.Fatalf("configured identity failure = %v, want attributed loud error", err)
 	}
 }
