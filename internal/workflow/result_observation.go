@@ -321,14 +321,14 @@ func claimFilePaths(claim string, touchedFiles []string) []string {
 	}
 
 	leading, hasLineSuffix := normalizeClaimToken(tokens[0])
-	if leading != "" && (hasLineSuffix || claimPathMatchesTouched(leading, touched, byBase)) {
+	if leading != "" && (hasLineSuffix || claimPathMatchesTouched(leading, touched, byBase, true)) {
 		return []string{leading}
 	}
 
 	candidates := make([]string, 0)
 	for _, token := range tokens[1:] {
 		candidate, _ := normalizeClaimToken(token)
-		if candidate != "" && claimPathMatchesTouched(candidate, touched, byBase) {
+		if candidate != "" && claimPathMatchesTouched(candidate, touched, byBase, false) {
 			candidates = append(candidates, candidate)
 		}
 	}
@@ -347,11 +347,11 @@ func normalizeClaimToken(token string) (string, bool) {
 	return normalizeClaimPath(token), hasLineSuffix
 }
 
-func claimPathMatchesTouched(candidate string, touched map[string]struct{}, byBase map[string][]string) bool {
+func claimPathMatchesTouched(candidate string, touched map[string]struct{}, byBase map[string][]string, allowUniqueBasename bool) bool {
 	if hasPath(touched, candidate) {
 		return true
 	}
-	return !strings.Contains(candidate, "/") && len(byBase[candidate]) == 1
+	return allowUniqueBasename && !strings.Contains(candidate, "/") && len(byBase[candidate]) == 1
 }
 
 func normalizeClaimPath(value string) string {

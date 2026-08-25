@@ -47,6 +47,44 @@ func TestIssue1616ProseFirstTouchedFileBinds(t *testing.T) {
 	}
 }
 
+func TestIssue1616UniqueBasenameFallbackOnlyBindsLeadingToken(t *testing.T) {
+	const touched = "internal/workflow/result.go"
+
+	t.Run("leading_fallback_binds", func(t *testing.T) {
+		const claim = "result.go — did a thing"
+		observation := compareResultChanges([]string{claim}, []string{touched})
+		if observation.Divergent {
+			t.Fatalf("leading unique basename should bind without divergence: %+v", observation)
+		}
+		change := observation.Changes[0]
+		if got, want := fmt.Sprint(change.ClaimedFiles), "[result.go]"; got != want {
+			t.Fatalf("ClaimedFiles = %s, want %s", got, want)
+		}
+		if got, want := fmt.Sprint(change.Observation), "["+touched+"]"; got != want {
+			t.Fatalf("Observation = %s, want %s", got, want)
+		}
+	})
+
+	t.Run("non_leading_basename_does_not_bind", func(t *testing.T) {
+		const claim = "refactored the credential gate for result.go"
+		observation := compareResultChanges([]string{claim}, []string{touched})
+		if got, want := fmt.Sprint(observation.UnclaimedFiles), "["+touched+"]"; got != want {
+			t.Fatalf("UnclaimedFiles = %s, want %s", got, want)
+		}
+		if got, want := fmt.Sprint(observation.UnboundClaims), "["+claim+"]"; got != want {
+			t.Fatalf("UnboundClaims = %s, want %s", got, want)
+		}
+		check, ok := resultCheckByID(RunResultChecks(ResultCheckInput{
+			Action:      "implement",
+			Result:      AgentResult{Decision: "implemented", ChangesMade: []string{claim}, TestsRun: []string{"targeted test"}},
+			Observation: observation,
+		}), "implement-changes-observed")
+		if !ok || check.Pass {
+			t.Fatalf("incidental mid-prose basename should leave the diff file unclaimed and fail: %+v", check)
+		}
+	})
+}
+
 func TestIssue1616ProseFirstOverclaimFailsAsUnbound(t *testing.T) {
 	const (
 		boundClaim = "updated internal/workflow/result_checks.go"
