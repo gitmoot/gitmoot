@@ -3,6 +3,8 @@ package credgw
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -19,6 +21,11 @@ import (
 )
 
 const DefaultAnthropicUpstream = "https://api.anthropic.com"
+
+const (
+	proxyCapabilityBytes = 32
+	proxyCapabilityTTL   = 5 * time.Minute
+)
 
 type CredentialKind string
 
@@ -95,11 +102,13 @@ type entry struct {
 }
 
 type proxyEntry struct {
-	jobID       string
-	placeholder string
-	policy      ProxyPolicy
-	upstream    *url.URL
-	resolver    CredentialResolver
+	jobID               string
+	placeholder         string
+	policy              ProxyPolicy
+	upstream            *url.URL
+	resolver            CredentialResolver
+	capabilityHash      [sha256.Size]byte
+	capabilityExpiresAt time.Time
 }
 
 func Start(logf LogFunc) (*Gateway, error) {
@@ -157,6 +166,10 @@ func (g *Gateway) RegisterProxy(jobID string, policy ProxyPolicy, resolver Crede
 	if err != nil {
 		return nil, err
 	}
+	capability, capabilityHash, err := mintProxyCapability()
+	if err != nil {
+		return nil, err
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.closed {
@@ -164,9 +177,10 @@ func (g *Gateway) RegisterProxy(jobID string, policy ProxyPolicy, resolver Crede
 	}
 	g.proxyEntries[route] = proxyEntry{
 		jobID: jobID, placeholder: placeholder, policy: validated,
-		upstream: upstream, resolver: resolver,
+		upstream: upstream, resolver: resolver, capabilityHash: capabilityHash,
+		capabilityExpiresAt: time.Now().Add(proxyCapabilityTTL),
 	}
-	return &Lease{gateway: g, placeholder: placeholder, route: route}, nil
+	return &Lease{gateway: g, placeholder: placeholder, route: route, capability: capability}, nil
 }
 
 func (g *Gateway) URL() string {
@@ -320,10 +334,21 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, route strin
 		g.writeLog(r.Method, registered.upstream.Hostname(), http.StatusBadRequest, registered.jobID)
 		return
 	}
-	suffix, err := proxyRequestSuffix(r.URL.EscapedPath(), route)
+	capability, ok := proxyRequestCapability(r.URL.EscapedPath(), route)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		g.writeLog(r.Method, registered.upstream.Hostname(), http.StatusUnauthorized, registered.jobID)
+		return
+	}
+	suffix, err := proxyRequestSuffix(r.URL.EscapedPath(), route+"/"+capability)
 	if err != nil {
 		http.Error(w, "request path refused", http.StatusBadRequest)
 		g.writeLog(r.Method, registered.upstream.Hostname(), http.StatusBadRequest, registered.jobID)
+		return
+	}
+	if !validProxyCapability(capability, registered, time.Now()) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		g.writeLog(r.Method, registered.upstream.Hostname(), http.StatusUnauthorized, registered.jobID)
 		return
 	}
 	resolved, err := registered.resolver(r.Context())
@@ -459,6 +484,29 @@ func proxyRequestSuffix(escapedPath, route string) (string, error) {
 	return decoded, nil
 }
 
+func proxyRequestCapability(escapedPath, route string) (string, bool) {
+	raw := strings.TrimPrefix(escapedPath, route)
+	if !strings.HasPrefix(raw, "/") {
+		return "", false
+	}
+	capability, _, _ := strings.Cut(strings.TrimPrefix(raw, "/"), "/")
+	if len(capability) != proxyCapabilityBytes*2 {
+		return "", false
+	}
+	decoded, err := hex.DecodeString(capability)
+	return capability, err == nil && len(decoded) == proxyCapabilityBytes
+}
+
+func validProxyCapability(capability string, registered proxyEntry, now time.Time) bool {
+	decoded, err := hex.DecodeString(capability)
+	if err != nil || len(decoded) != proxyCapabilityBytes {
+		return false
+	}
+	presented := sha256.Sum256(decoded)
+	matches := subtle.ConstantTimeCompare(presented[:], registered.capabilityHash[:]) == 1
+	return matches && now.Before(registered.capabilityExpiresAt)
+}
+
 func hasDotPathSegment(value string) bool {
 	for _, segment := range strings.Split(value, "/") {
 		if segment == "." || segment == ".." {
@@ -540,6 +588,14 @@ func mintProxyRoute() (string, error) {
 		return "", fmt.Errorf("mint credential gateway route: %w", err)
 	}
 	return "/_gitmoot/proxy/" + hex.EncodeToString(random), nil
+}
+
+func mintProxyCapability() (string, [sha256.Size]byte, error) {
+	random := make([]byte, proxyCapabilityBytes)
+	if _, err := rand.Read(random); err != nil {
+		return "", [sha256.Size]byte{}, fmt.Errorf("mint credential gateway capability: %w", err)
+	}
+	return hex.EncodeToString(random), sha256.Sum256(random), nil
 }
 
 func proxyRoute(escapedPath string) (string, bool) {

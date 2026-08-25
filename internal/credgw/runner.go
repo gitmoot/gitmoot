@@ -21,13 +21,18 @@ type Lease struct {
 	gateway     *Gateway
 	placeholder string
 	route       string
+	capability  string
 }
 
 func (l *Lease) URL() string {
 	if l == nil || l.gateway == nil || l.route == "" {
 		return ""
 	}
-	return l.gateway.URL() + l.route
+	url := l.gateway.URL() + l.route
+	if l.capability != "" {
+		url += "/" + l.capability
+	}
+	return url
 }
 
 func (l *Lease) Placeholder() string {
