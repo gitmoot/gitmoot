@@ -2074,16 +2074,18 @@ func isEphemeralAgentName(name string) bool {
 }
 
 type agentShowOutput struct {
-	Name         string   `json:"name"`
-	Runtime      string   `json:"runtime"`
-	RuntimeRef   string   `json:"runtime_ref"`
-	Role         string   `json:"role"`
-	Capabilities []string `json:"capabilities"`
-	Policy       string   `json:"policy"`
-	TemplateID   string   `json:"template_id,omitempty"`
-	HealthStatus string   `json:"health_status"`
-	RepoScope    string   `json:"repo_scope,omitempty"`
-	AllowedRepos []string `json:"allowed_repos"`
+	Name                        string   `json:"name"`
+	Runtime                     string   `json:"runtime"`
+	RuntimeRef                  string   `json:"runtime_ref"`
+	RuntimeRefPinned            bool     `json:"runtime_ref_pinned"`
+	RuntimeRefLastSuccessfulUse string   `json:"runtime_ref_last_successful_use,omitempty"`
+	Role                        string   `json:"role"`
+	Capabilities                []string `json:"capabilities"`
+	Policy                      string   `json:"policy"`
+	TemplateID                  string   `json:"template_id,omitempty"`
+	HealthStatus                string   `json:"health_status"`
+	RepoScope                   string   `json:"repo_scope,omitempty"`
+	AllowedRepos                []string `json:"allowed_repos"`
 }
 
 func runAgentShow(args []string, stdout, stderr io.Writer) int {
@@ -2121,17 +2123,35 @@ func runAgentShow(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
+		pinned := isPinnedRuntimeRef(agent.Runtime, agent.RuntimeRef)
+		lastSuccessfulUse := ""
+		if pinned {
+			usedAt, found, err := store.LatestSuccessfulRuntimeRefUse(context.Background(), agent.Name, agent.RuntimeRef)
+			if err != nil {
+				return err
+			}
+			switch {
+			case !found:
+				lastSuccessfulUse = "never"
+			case usedAt.IsZero():
+				lastSuccessfulUse = "unknown"
+			default:
+				lastSuccessfulUse = formatRuntimeRefAge(time.Now().UTC(), usedAt)
+			}
+		}
 		output = agentShowOutput{
-			Name:         agent.Name,
-			Runtime:      agent.Runtime,
-			RuntimeRef:   agent.RuntimeRef,
-			Role:         agent.Role,
-			Capabilities: agent.Capabilities,
-			Policy:       runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy),
-			TemplateID:   agent.TemplateID,
-			HealthStatus: agent.HealthStatus,
-			RepoScope:    agent.RepoScope,
-			AllowedRepos: repos,
+			Name:                        agent.Name,
+			Runtime:                     agent.Runtime,
+			RuntimeRef:                  agent.RuntimeRef,
+			RuntimeRefPinned:            pinned,
+			RuntimeRefLastSuccessfulUse: lastSuccessfulUse,
+			Role:                        agent.Role,
+			Capabilities:                agent.Capabilities,
+			Policy:                      runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy),
+			TemplateID:                  agent.TemplateID,
+			HealthStatus:                agent.HealthStatus,
+			RepoScope:                   agent.RepoScope,
+			AllowedRepos:                repos,
 		}
 		return nil
 	}); err != nil {
@@ -2147,7 +2167,11 @@ func runAgentShow(args []string, stdout, stderr io.Writer) int {
 	}
 	writeLine(stdout, "name: %s", output.Name)
 	writeLine(stdout, "runtime: %s", output.Runtime)
-	writeLine(stdout, "runtime_ref: %s", output.RuntimeRef)
+	if output.RuntimeRefPinned {
+		writeLine(stdout, "runtime_ref: pinned %s (last successful use: %s)", output.RuntimeRef, output.RuntimeRefLastSuccessfulUse)
+	} else {
+		writeLine(stdout, "runtime_ref: %s", output.RuntimeRef)
+	}
 	writeLine(stdout, "role: %s", output.Role)
 	writeLine(stdout, "capabilities: %s", strings.Join(output.Capabilities, ","))
 	writeLine(stdout, "policy: %s", output.Policy)
@@ -2156,6 +2180,33 @@ func runAgentShow(args []string, stdout, stderr io.Writer) int {
 	writeLine(stdout, "repo_scope: %s", emptyText(output.RepoScope))
 	writeLine(stdout, "allowed_repos: %s", strings.Join(output.AllowedRepos, ","))
 	return 0
+}
+
+func isPinnedRuntimeRef(runtimeName, ref string) bool {
+	switch strings.TrimSpace(runtimeName) {
+	case runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime, runtime.KimiCLIRuntime:
+	default:
+		return false
+	}
+	ref = strings.TrimSpace(ref)
+	return ref != "" && ref != runtime.LastRef && !runtime.IsFreshRef(ref)
+}
+
+func formatRuntimeRefAge(now, usedAt time.Time) string {
+	age := now.UTC().Sub(usedAt.UTC())
+	if age < 0 {
+		age = 0
+	}
+	switch {
+	case age < time.Minute:
+		return "<1m ago"
+	case age < time.Hour:
+		return fmt.Sprintf("%dm ago", int(age/time.Minute))
+	case age < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(age/time.Hour))
+	default:
+		return fmt.Sprintf("%dd ago", int(age/(24*time.Hour)))
+	}
 }
 
 func runAgentAllow(args []string, stdout, stderr io.Writer) int {

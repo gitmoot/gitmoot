@@ -126,7 +126,7 @@ func TestRunAgentShow(t *testing.T) {
 	for _, want := range []string{
 		"name: audit",
 		"runtime: codex",
-		"runtime_ref: 550e8400-e29b-41d4-a716-446655440001",
+		"runtime_ref: pinned 550e8400-e29b-41d4-a716-446655440001 (last successful use: never)",
 		"role: reviewer",
 		"capabilities: review",
 		"policy: workspace-write",
@@ -147,8 +147,65 @@ func TestRunAgentShow(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &decoded); err != nil {
 		t.Fatalf("json output did not decode: %v\n%s", err, stdout.String())
 	}
-	if decoded.Name != "audit" || decoded.Policy != runtime.AutonomyPolicyWorkspaceWrite || strings.Join(decoded.AllowedRepos, ",") != "gitmoot/gitmoot" {
+	if decoded.Name != "audit" || !decoded.RuntimeRefPinned || decoded.RuntimeRefLastSuccessfulUse != "never" || decoded.Policy != runtime.AutonomyPolicyWorkspaceWrite || strings.Join(decoded.AllowedRepos, ",") != "gitmoot/gitmoot" {
 		t.Fatalf("decoded = %+v", decoded)
+	}
+}
+
+func TestRunAgentShowPinnedRuntimeRefLastSuccessfulUseFromEvent(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	ctx := context.Background()
+	const pin = "550e8400-e29b-41d4-a716-446655440021"
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name: "override-user", Role: "reviewer", Runtime: runtime.CodexRuntime,
+		RuntimeRef: pin, RepoScope: "owner/repo", Capabilities: []string{"review"},
+	}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	seedCLIJob(t, store, db.Job{
+		ID: "override-success", Agent: "override-user", Type: "review", State: string(workflow.JobSucceeded), Payload: `{}`,
+	}, "succeeded")
+	if err := store.AddJobEvent(ctx, db.JobEvent{
+		JobID: "override-success", Kind: runtimeOverrideEventKind,
+		Message: "job runs on runtime claude (agent default codex); session lock runtime:claude:" + pin,
+	}); err != nil {
+		t.Fatalf("AddJobEvent: %v", err)
+	}
+	store.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"agent", "show", "override-user", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent show exit code = %d, stderr=%s", code, stderr.String())
+	}
+	want := "runtime_ref: pinned " + pin + " (last successful use: <1m ago)"
+	if !strings.Contains(stdout.String(), want) {
+		t.Fatalf("agent show output missing %q:\n%s", want, stdout.String())
+	}
+}
+
+func TestRunAgentShowLastRuntimeRefHasNoStaleness(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	if err := store.UpsertAgent(context.Background(), db.Agent{
+		Name: "last-user", Role: "reviewer", Runtime: runtime.CodexRuntime,
+		RuntimeRef: runtime.LastRef, RepoScope: "owner/repo", Capabilities: []string{"review"},
+	}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	store.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"agent", "show", "last-user", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent show exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "runtime_ref: last\n") {
+		t.Fatalf("agent show output does not render last as unpinned:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "last successful use") {
+		t.Fatalf("last runtime ref grew a staleness field:\n%s", stdout.String())
 	}
 }
 
