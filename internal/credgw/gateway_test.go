@@ -229,7 +229,7 @@ func TestGenericProxyCapabilityRejectionsNeverResolveCredential(t *testing.T) {
 			if test.expire {
 				gateway.mu.Lock()
 				entry := gateway.proxyEntries[lease.route]
-				entry.capabilityExpiresAt = time.Now().Add(-time.Second)
+				entry.capability.expiresAt = time.Now().Add(-time.Second)
 				gateway.proxyEntries[lease.route] = entry
 				gateway.mu.Unlock()
 			}
