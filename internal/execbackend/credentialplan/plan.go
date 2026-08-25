@@ -4,6 +4,7 @@ package credentialplan
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net/url"
@@ -25,7 +26,15 @@ type brokerCapability string
 type Plan struct {
 	endpoint          url.URL
 	capability        brokerCapability
-	clientCertificate tls.Certificate
+	clientCertificate clientCertificateMaterial
+}
+
+type clientCertificateMaterial struct {
+	certificateDER               [][]byte
+	privateKeyPKCS8              []byte
+	ocspStaple                   []byte
+	signedCertificateTimestamps  [][]byte
+	supportedSignatureAlgorithms []tls.SignatureScheme
 }
 
 // New constructs a Plan exclusively from a gateway-issued lease. No runtime
@@ -35,6 +44,10 @@ func New(runtimeName string, lease *credgw.NetworkLease) (Plan, error) {
 	if err := RequireCloudRuntimeSupport(runtimeName); err != nil {
 		return Plan{}, err
 	}
+	return newFromNetworkLease(lease)
+}
+
+func newFromNetworkLease(lease *credgw.NetworkLease) (Plan, error) {
 	if lease == nil {
 		return Plan{}, errors.New("remote credential plan requires a broker lease")
 	}
@@ -42,10 +55,14 @@ func New(runtimeName string, lease *credgw.NetworkLease) (Plan, error) {
 	if err != nil {
 		return Plan{}, fmt.Errorf("parse broker lease endpoint: %w", err)
 	}
+	certificate, err := freezeClientCertificate(lease.ClientCertificate())
+	if err != nil {
+		return Plan{}, fmt.Errorf("freeze broker lease client certificate: %w", err)
+	}
 	return Plan{
 		endpoint:          *endpoint,
 		capability:        brokerCapability(lease.Capability()),
-		clientCertificate: cloneCertificate(lease.ClientCertificate()),
+		clientCertificate: certificate,
 	}, nil
 }
 
@@ -59,23 +76,73 @@ func (p Plan) Capability() string {
 	return string(p.capability)
 }
 
-// ClientCertificate returns a copy of the per-job mTLS client certificate.
-func (p Plan) ClientCertificate() tls.Certificate {
-	return cloneCertificate(p.clientCertificate)
+// ClientTLSConfig returns a TLS configuration that can use the per-job client
+// identity without exposing the plan's stored key material. Each handshake
+// receives independently parsed certificate and private-key objects.
+func (p Plan) ClientTLSConfig() (*tls.Config, error) {
+	serverName := p.endpoint.Hostname()
+	if serverName == "" {
+		return nil, errors.New("broker endpoint has no TLS server name")
+	}
+	material := p.clientCertificate
+	if _, err := material.certificate(); err != nil {
+		return nil, fmt.Errorf("prepare broker client certificate: %w", err)
+	}
+	return &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		ServerName: serverName,
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			return material.certificate()
+		},
+	}, nil
 }
 
-func cloneCertificate(certificate tls.Certificate) tls.Certificate {
-	clone := certificate
-	clone.Certificate = make([][]byte, len(certificate.Certificate))
-	for i, der := range certificate.Certificate {
-		clone.Certificate[i] = append([]byte(nil), der...)
+func freezeClientCertificate(certificate tls.Certificate) (clientCertificateMaterial, error) {
+	if len(certificate.Certificate) == 0 || certificate.PrivateKey == nil {
+		return clientCertificateMaterial{}, errors.New("client certificate is incomplete")
 	}
-	clone.OCSPStaple = append([]byte(nil), certificate.OCSPStaple...)
-	clone.SignedCertificateTimestamps = make([][]byte, len(certificate.SignedCertificateTimestamps))
-	for i, timestamp := range certificate.SignedCertificateTimestamps {
-		clone.SignedCertificateTimestamps[i] = append([]byte(nil), timestamp...)
+	privateKeyPKCS8, err := x509.MarshalPKCS8PrivateKey(certificate.PrivateKey)
+	if err != nil {
+		return clientCertificateMaterial{}, fmt.Errorf("marshal client private key: %w", err)
 	}
-	clone.SupportedSignatureAlgorithms = append([]tls.SignatureScheme(nil), certificate.SupportedSignatureAlgorithms...)
+	material := clientCertificateMaterial{
+		certificateDER:               cloneByteSlices(certificate.Certificate),
+		privateKeyPKCS8:              append([]byte(nil), privateKeyPKCS8...),
+		ocspStaple:                   append([]byte(nil), certificate.OCSPStaple...),
+		signedCertificateTimestamps:  cloneByteSlices(certificate.SignedCertificateTimestamps),
+		supportedSignatureAlgorithms: append([]tls.SignatureScheme(nil), certificate.SupportedSignatureAlgorithms...),
+	}
+	return material, nil
+}
+
+func (m clientCertificateMaterial) certificate() (*tls.Certificate, error) {
+	if len(m.certificateDER) == 0 || len(m.privateKeyPKCS8) == 0 {
+		return nil, errors.New("client certificate material is incomplete")
+	}
+	privateKey, err := x509.ParsePKCS8PrivateKey(m.privateKeyPKCS8)
+	if err != nil {
+		return nil, fmt.Errorf("parse client private key: %w", err)
+	}
+	certificateDER := cloneByteSlices(m.certificateDER)
+	leaf, err := x509.ParseCertificate(certificateDER[0])
+	if err != nil {
+		return nil, fmt.Errorf("parse client leaf certificate: %w", err)
+	}
+	return &tls.Certificate{
+		Certificate:                  certificateDER,
+		PrivateKey:                   privateKey,
+		OCSPStaple:                   append([]byte(nil), m.ocspStaple...),
+		SignedCertificateTimestamps:  cloneByteSlices(m.signedCertificateTimestamps),
+		Leaf:                         leaf,
+		SupportedSignatureAlgorithms: append([]tls.SignatureScheme(nil), m.supportedSignatureAlgorithms...),
+	}, nil
+}
+
+func cloneByteSlices(values [][]byte) [][]byte {
+	clone := make([][]byte, len(values))
+	for i, value := range values {
+		clone[i] = append([]byte(nil), value...)
+	}
 	return clone
 }
 
