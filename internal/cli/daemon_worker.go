@@ -67,7 +67,13 @@ type jobWorker struct {
 	// ReclaimJobLookup is a test seam for candidate-local GetJob failures. The
 	// production path is always Store.GetJob.
 	ReclaimJobLookup func(context.Context, string) (db.Job, error)
-	CommenterFactory func(string) github.Client
+	// beforeDeliveryDiagnosticsWrite fires inside recordDeliveryFailureDiagnostics
+	// between the lifecycle read and the generation-conditioned payload write —
+	// i.e. inside the window the compare-and-swap exists to close. It is the only
+	// way to drive that window deterministically, since the two operations are
+	// otherwise adjacent. Production leaves it nil.
+	beforeDeliveryDiagnosticsWrite func()
+	CommenterFactory               func(string) github.Client
 	// UsePool selects the opt-in continuous worker-pool scheduler (#394,
 	// --scheduler=pool) over the default per-tick wg.Wait() barrier.
 	UsePool bool

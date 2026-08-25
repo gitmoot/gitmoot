@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -255,6 +256,11 @@ func TestRecordDeliveryFailureDiagnosticsIgnoresEmptyError(t *testing.T) {
 // A retry that claimed the row between the run error and this write owns a NEWER
 // generation and has already cleared diagnostics for its own run; stamping the
 // dead run's error onto it would be a live-row corruption, so the write drops.
+//
+// It drops SILENTLY, and that is asserted here rather than left implicit: a
+// superseded write is the expected outcome of an ordinary retry, and announcing it
+// on the journal every time would be the noise that teaches operators to skip the
+// line the persistence-failure case needs them to read.
 func TestRecordDeliveryFailureDiagnosticsSkipsSupersededGeneration(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
@@ -263,11 +269,156 @@ func TestRecordDeliveryFailureDiagnosticsSkipsSupersededGeneration(t *testing.T)
 		ID: "job-superseded-delivery-error", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main",
 	})
 	job := mustWorkerJob(t, store, "job-superseded-delivery-error")
-	worker := defaultJobWorker(store, io.Discard, t.TempDir())
+	stdout := &lockedBuffer{}
+	worker := defaultJobWorker(store, stdout, t.TempDir())
 
 	worker.recordDeliveryFailureDiagnostics(ctx, job.ID, job.LifecycleGeneration-1, errors.New(deliveryErrorFixture))
 
 	if diag := deliveryErrorDiagnostics(t, store, job.ID); diag != nil {
 		t.Fatalf("FailureDiagnostics = %+v, want none: a superseded run must not write", diag)
+	}
+	if out := stdout.String(); strings.Contains(out, deliveryDiagnosticsLossPrefix) {
+		t.Fatalf("stdout = %q, want silence: a superseded generation is an EXPECTED drop", out)
+	}
+}
+
+// deliveryDiagnosticsLossPrefix is the journal marker for "the delivery error
+// never reached the row". Both the silence assertion above and the fault
+// assertions below key off it.
+const deliveryDiagnosticsLossPrefix = "delivery-error diagnostics not recorded"
+
+// liveGenerationTail marks the payload a RETRY installed for its own run. The
+// stale observer must leave it exactly as found.
+const liveGenerationTail = "live generation stderr"
+
+// TestRecordDeliveryFailureDiagnosticsLosesTheRaceToANewGeneration is the probe
+// for the defect this round closes: the generation check and the payload write
+// were two statements, so a retry landing BETWEEN them left a stale observer
+// overwriting the new generation's row.
+//
+// The superseded-generation test above cannot catch that. It advances the
+// generation BEFORE the call, so the early check rejects it and the write is never
+// reached — an unconditional write passes that test. Only a retry that lands
+// INSIDE the check-to-write window discriminates, which is what the
+// beforeDeliveryDiagnosticsWrite seam exists to stage. Reverting the write to the
+// unconditional UpdateJobPayload turns this test RED and nothing else.
+func TestRecordDeliveryFailureDiagnosticsLosesTheRaceToANewGeneration(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "job-raced-delivery-error", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main",
+	})
+	// queued -> running -> failed leaves the generation alone (only entry to queued
+	// is a new run), so the observer below genuinely holds the run that failed.
+	for _, step := range [][2]string{{"queued", "running"}, {"running", "failed"}} {
+		transitioned, err := store.TransitionJobState(ctx, "job-raced-delivery-error", step[0], step[1])
+		if err != nil {
+			t.Fatalf("TransitionJobState(%s->%s) returned error: %v", step[0], step[1], err)
+		}
+		if !transitioned {
+			t.Fatalf("TransitionJobState(%s->%s) did not transition; the fixture is not in the shape this probe needs", step[0], step[1])
+		}
+	}
+	observed := mustWorkerJob(t, store, "job-raced-delivery-error")
+
+	// What the retry installs for ITS run: its own diagnostics, no delivery_error.
+	livePayload, err := workflow.ParseJobPayload(observed.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload returned error: %v", err)
+	}
+	livePayload.FailureDiagnostics = &workflow.FailureDiagnostics{
+		Phase: workflow.FailurePhaseLaunched, StderrTail: liveGenerationTail,
+	}
+	liveEncoded, err := json.Marshal(livePayload)
+	if err != nil {
+		t.Fatalf("Marshal(live payload) returned error: %v", err)
+	}
+
+	stdout := &lockedBuffer{}
+	worker := defaultJobWorker(store, stdout, t.TempDir())
+	fired := false
+	worker.beforeDeliveryDiagnosticsWrite = func() {
+		fired = true
+		// failed -> queued is the operator retry: it bumps the generation and
+		// installs the new run's payload, all after the observer's check passed.
+		if err := store.UpdateJobPayloadAndStateWithEvent(ctx, observed.ID, string(liveEncoded), "queued",
+			db.JobEvent{JobID: observed.ID, Kind: "queued", Message: "retry"}); err != nil {
+			t.Errorf("UpdateJobPayloadAndStateWithEvent(retry) returned error: %v", err)
+		}
+	}
+
+	worker.recordDeliveryFailureDiagnostics(ctx, observed.ID, observed.LifecycleGeneration, errors.New(deliveryErrorFixture))
+
+	if !fired {
+		t.Fatal("the race window never opened; the probe proves nothing")
+	}
+	after := mustWorkerJob(t, store, observed.ID)
+	if after.LifecycleGeneration != observed.LifecycleGeneration+1 {
+		t.Fatalf("generation = %d, want %d (the retry did not arm)", after.LifecycleGeneration, observed.LifecycleGeneration+1)
+	}
+	// Byte equality, because "unmodified" is the claim: the stale write must not
+	// have touched ANY part of the live generation's payload.
+	if after.Payload != string(liveEncoded) {
+		t.Fatalf("payload = %q, want the live generation's own payload %q -- a stale observer overwrote a live run",
+			after.Payload, string(liveEncoded))
+	}
+	diag := deliveryErrorDiagnostics(t, store, observed.ID)
+	if diag == nil || diag.StderrTail != liveGenerationTail {
+		t.Fatalf("FailureDiagnostics = %+v, want the live run's own diagnostics kept", diag)
+	}
+	if diag.DeliveryError != "" {
+		t.Fatalf("delivery_error = %q, want empty: a dead run's error must not land on a live run's row", diag.DeliveryError)
+	}
+	// The lost CAS is the superseded case arriving at the write, so it is as quiet
+	// as the check is.
+	if out := stdout.String(); strings.Contains(out, deliveryDiagnosticsLossPrefix) {
+		t.Fatalf("stdout = %q, want silence: losing the CAS is an EXPECTED drop", out)
+	}
+}
+
+// The other half of the split: a persistence FAULT is not expected, so dropping it
+// silently would leave the row with no delivery_error and no explanation anywhere
+// — the journal-versus-row blindness of #1620, one level up. The store is closed
+// inside the write window so the CAS itself fails, which is the arm that matters:
+// the read, the parse and the marshal have all already succeeded.
+func TestRecordDeliveryFailureDiagnosticsReportsPersistenceFailure(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "job-unpersisted-delivery-error", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main",
+	})
+	job := mustWorkerJob(t, store, "job-unpersisted-delivery-error")
+
+	stdout := &lockedBuffer{}
+	worker := defaultJobWorker(store, stdout, t.TempDir())
+	worker.beforeDeliveryDiagnosticsWrite = func() {
+		// A closed store is a persistence fault the write cannot survive, injected
+		// after every earlier step has already succeeded.
+		if err := store.Close(); err != nil {
+			t.Errorf("Close returned error: %v", err)
+		}
+	}
+
+	worker.recordDeliveryFailureDiagnostics(ctx, job.ID, job.LifecycleGeneration, errors.New(deliveryErrorSecretFixture))
+
+	out := stdout.String()
+	if !strings.Contains(out, deliveryDiagnosticsLossPrefix) {
+		t.Fatalf("stdout = %q, want the %q diagnostic for a persistence fault", out, deliveryDiagnosticsLossPrefix)
+	}
+	if !strings.Contains(out, job.ID) {
+		t.Fatalf("stdout = %q, want the job id so an operator can find the row", out)
+	}
+	// The journal line quotes the delivery error, so it is a leak surface exactly
+	// like the stored field. Same redaction, not a second weaker path.
+	if strings.Contains(out, deliveryErrorSecret) {
+		t.Fatalf("the diagnostic leaked the token: %q", out)
+	}
+	if !strings.Contains(out, "[REDACTED]") {
+		t.Fatalf("stdout = %q, want the redaction marker", out)
+	}
+	if !strings.Contains(out, "unexpected status 404 Not Found") {
+		t.Fatalf("stdout = %q, want the triage-bearing text kept", out)
 	}
 }
