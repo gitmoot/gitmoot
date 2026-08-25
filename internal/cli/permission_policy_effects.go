@@ -3,6 +3,9 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -41,12 +44,12 @@ func (w jobWorker) observePermissionPolicyEffects(adapter workflow.DeliveryAdapt
 func (w jobWorker) capturePermissionPolicyEffects(ctx context.Context, jobID, checkout string) error {
 	job, err := w.Store.GetJob(ctx, jobID)
 	if err != nil {
-		writeLine(w.Stdout, "job %s permission-policy effect capture failed: %v", jobID, err)
+		logPermissionPolicyEffectCaptureFailure(w.Stdout, jobID, checkout, err)
 		return err
 	}
 	payload, err := daemonJobPayload(job)
 	if err != nil {
-		writeLine(w.Stdout, "job %s permission-policy effect capture failed: %v", jobID, err)
+		logPermissionPolicyEffectCaptureFailure(w.Stdout, jobID, checkout, err)
 		return err
 	}
 	if strings.TrimSpace(checkout) == "" {
@@ -70,7 +73,33 @@ func (w jobWorker) capturePermissionPolicyEffects(ctx context.Context, jobID, ch
 	_, err = permissionpolicy.RecordEffects(captureCtx, w.Store, jobID, checkout, payload.Branch, payload.PullRequest, git)
 	if err != nil {
 		err = fmt.Errorf("capture repository effects: %w", err)
-		writeLine(w.Stdout, "job %s permission-policy effect capture failed: %v", jobID, err)
+		logPermissionPolicyEffectCaptureFailure(w.Stdout, jobID, checkout, err)
 	}
 	return err
+}
+
+func logPermissionPolicyEffectCaptureFailure(stdout io.Writer, jobID, checkout string, err error) {
+	writeLine(stdout, "job %s permission-policy effect capture failed (%s): %v", jobID, permissionPolicyEffectCaptureLocation(checkout), err)
+}
+
+func permissionPolicyEffectCaptureLocation(checkout string) string {
+	path := workflow.RedactCommentText(checkout)
+	exists, workTree := "unknown", "unknown"
+	if checkout != "" {
+		info, err := os.Stat(checkout)
+		switch {
+		case err == nil:
+			exists = "true"
+			if !info.IsDir() {
+				workTree = "false"
+			} else if _, gitErr := os.Stat(filepath.Join(checkout, ".git")); gitErr == nil {
+				workTree = "true"
+			} else if os.IsNotExist(gitErr) {
+				workTree = "false"
+			}
+		case os.IsNotExist(err):
+			exists = "false"
+		}
+	}
+	return fmt.Sprintf("path=%q exists=%s work_tree=%s", path, exists, workTree)
 }
