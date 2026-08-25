@@ -152,6 +152,80 @@ func TestPermissionPolicyEffectCaptureFailureLogsResolvedLocation(t *testing.T) 
 		}
 		assertPermissionPolicyCaptureLocation(t, output.String(), checkout, "true", "true")
 	})
+
+	t.Run("effect capture logs caller checkout when payload worktree differs", func(t *testing.T) {
+		ctx := context.Background()
+		store := daemonWorkerStore(t)
+		checkout := t.TempDir()
+		payloadCheckout := filepath.Join(t.TempDir(), "different-payload-checkout")
+		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+			ID: "caller-checkout-policy-job", Agent: "policy-agent", Action: "ask",
+			Repo: "owner/repo", Branch: "main", WorktreePath: payloadCheckout,
+		})
+		job, err := store.GetJob(ctx, "caller-checkout-policy-job")
+		if err != nil {
+			t.Fatal(err)
+		}
+		agent := runtime.Agent{
+			Name: "policy-agent", Runtime: runtime.ShellRuntime, RuntimeRef: "printf done",
+			AutonomyPolicy: runtime.AutonomyPolicyAuto,
+		}
+		claimed, err := permissionpolicy.RecordWarning(ctx, store, job, agent, &permissionPolicyTestAdapter{property: runtime.PermissionPolicyNotApplied}, time.Now())
+		if err != nil || !claimed {
+			t.Fatalf("RecordWarning = claimed %t, err %v", claimed, err)
+		}
+
+		var output bytes.Buffer
+		worker := defaultJobWorker(store, &output)
+		worker.PermissionPolicyEffectGit = func(string) permissionpolicy.EffectGit {
+			return &permissionPolicyEffectGitFake{
+				behindErr: errors.New("local upstream unavailable"),
+				remoteErr: errors.New("remote unavailable"),
+			}
+		}
+		if err := worker.capturePermissionPolicyEffects(ctx, job.ID, checkout); err == nil {
+			t.Fatal("capture returned nil error for remote failure")
+		}
+		assertPermissionPolicyCaptureLocation(t, output.String(), checkout, "true", "false")
+	})
+
+	t.Run("runner resolution logs caller checkout", func(t *testing.T) {
+		ctx := context.Background()
+		store := daemonWorkerStore(t)
+		checkout := t.TempDir()
+		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+			ID: "runner-resolution-policy-job", Agent: "policy-agent", Action: "ask",
+			Repo: "owner/repo", Branch: "main", WorktreePath: filepath.Join(t.TempDir(), "payload-checkout"),
+		})
+		job, err := store.GetJob(ctx, "runner-resolution-policy-job")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
+			t.Fatal(err)
+		}
+		payload["exec_backend"] = "unimplemented-runner"
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.UpdateJobPayload(ctx, job.ID, string(encoded)); err != nil {
+			t.Fatal(err)
+		}
+		job, err = store.GetJob(ctx, job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var output bytes.Buffer
+		worker := defaultJobWorker(store, &output)
+		err = worker.capturePermissionPolicyEffects(ctx, job.ID, checkout)
+		if err == nil || !strings.Contains(err.Error(), "resolve permission-policy effect runner") {
+			t.Fatalf("capture error = %v, want runner resolution failure", err)
+		}
+		assertPermissionPolicyCaptureLocation(t, output.String(), checkout, "true", "false")
+	})
 }
 
 func assertPermissionPolicyCaptureLocation(t *testing.T, output, checkout, exists, workTree string) {

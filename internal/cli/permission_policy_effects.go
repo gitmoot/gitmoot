@@ -63,7 +63,9 @@ func (w jobWorker) capturePermissionPolicyEffects(ctx context.Context, jobID, ch
 		} else {
 			runner, runnerErr := w.subprocessRunnerForJob(job)
 			if runnerErr != nil {
-				return fmt.Errorf("resolve permission-policy effect runner: %w", runnerErr)
+				err = fmt.Errorf("resolve permission-policy effect runner: %w", runnerErr)
+				logPermissionPolicyEffectCaptureFailure(w.Stdout, jobID, checkout, err)
+				return err
 			}
 			git = jobGitClient(checkout, runner)
 		}
