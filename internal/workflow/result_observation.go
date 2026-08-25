@@ -313,9 +313,6 @@ func claimFilePaths(claim string, _ []string) []string {
 	}); separator >= 0 {
 		binding = binding[:separator]
 	}
-	if !resultClaimLineSuffix.MatchString(binding) {
-		return []string{}
-	}
 	binding = normalizeClaimPath(resultClaimLineSuffix.ReplaceAllString(binding, ""))
 	if binding == "" {
 		return []string{}

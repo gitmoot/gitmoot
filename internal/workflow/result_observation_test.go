@@ -36,6 +36,28 @@ func TestIssue1616DescriptionPathLikeTokensDoNotFailObservedChanges(t *testing.T
 	}
 }
 
+func TestIssue1616LeadingPathContractFormsBind(t *testing.T) {
+	for _, tc := range []struct {
+		claim   string
+		touched string
+	}{
+		{claim: "internal/foo/bar.go — did a thing", touched: "internal/foo/bar.go"},
+		{claim: "internal/foo/bar.go:12 — did a thing", touched: "internal/foo/bar.go"},
+		{claim: "internal/foo/bar.go:12:4 — did a thing", touched: "internal/foo/bar.go"},
+		{claim: "Makefile — did a thing", touched: "Makefile"},
+	} {
+		t.Run(tc.claim, func(t *testing.T) {
+			observation := compareResultChanges([]string{tc.claim}, []string{tc.touched})
+			if observation.Divergent {
+				t.Fatalf("contract claim diverged: %+v", observation)
+			}
+			if got, want := fmt.Sprint(observation.Changes[0].ClaimedFiles), "["+tc.touched+"]"; got != want {
+				t.Fatalf("ClaimedFiles = %s, want %s", got, want)
+			}
+		})
+	}
+}
+
 func TestIssue1616ClaimedFileAbsentFromDiffStillFails(t *testing.T) {
 	const claim = "internal/workflow/absent.go:17 — updates the result gate"
 	observation := compareResultChanges([]string{claim}, nil)
@@ -74,10 +96,10 @@ func TestIssue1616UnclaimedDiffFileStillFails(t *testing.T) {
 	}
 }
 
-func TestIssue1616UnboundClaimIsReportedAsParserNoteWhenDiffIsBound(t *testing.T) {
+func TestIssue1616UnboundOverclaimFailsWithNonEmptyFullyClaimedDiff(t *testing.T) {
 	const (
 		boundClaim   = "internal/workflow/result_checks.go:162 — updated the result gate"
-		unboundClaim = "refactored the credential gate"
+		unboundClaim = "../internal/workflow/absent.go — updated another gate"
 	)
 	observation := compareResultChanges(
 		[]string{boundClaim, unboundClaim},
@@ -91,8 +113,35 @@ func TestIssue1616UnboundClaimIsReportedAsParserNoteWhenDiffIsBound(t *testing.T
 		Result:      AgentResult{Decision: "implemented", ChangesMade: []string{boundClaim, unboundClaim}, TestsRun: []string{"targeted test"}},
 		Observation: observation,
 	}), "implement-changes-observed")
-	if !ok || !check.Pass {
-		t.Fatalf("an unbound parser note should not fail when the diff is otherwise bound: %+v", check)
+	if !ok || check.Pass {
+		t.Fatalf("an unbound over-claim should fail even when the non-empty diff is fully claimed: %+v", check)
+	}
+}
+
+func TestIssue1616LeadingPathOverclaimFailsWithNonEmptyFullyClaimedDiff(t *testing.T) {
+	const (
+		boundClaim    = "internal/workflow/result_checks.go:162 — updated the result gate"
+		overclaim     = "internal/workflow/absent.go — updated another gate"
+		boundDiffFile = "internal/workflow/result_checks.go"
+		overclaimFile = "internal/workflow/absent.go"
+	)
+	observation := compareResultChanges(
+		[]string{boundClaim, overclaim},
+		[]string{boundDiffFile},
+	)
+	if got, want := fmt.Sprint(observation.ClaimedOnlyFiles), "["+overclaimFile+"]"; got != want {
+		t.Fatalf("ClaimedOnlyFiles = %s, want %s", got, want)
+	}
+	if got := fmt.Sprint(observation.UnclaimedFiles); got != "[]" {
+		t.Fatalf("fully claimed diff produced UnclaimedFiles = %s", got)
+	}
+	check, ok := resultCheckByID(RunResultChecks(ResultCheckInput{
+		Action:      "implement",
+		Result:      AgentResult{Decision: "implemented", ChangesMade: []string{boundClaim, overclaim}, TestsRun: []string{"targeted test"}},
+		Observation: observation,
+	}), "implement-changes-observed")
+	if !ok || check.Pass {
+		t.Fatalf("a leading-path over-claim should fail with a non-empty, fully claimed diff: %+v", check)
 	}
 }
 
@@ -292,7 +341,7 @@ func TestCompareResultChangesFlagsDiffFileNoClaimMentions(t *testing.T) {
 }
 
 func TestCompareResultChangesFlagsUnboundStructuredClaim(t *testing.T) {
-	claim := "Deleted _clear_private_pane_composer and removed its call"
+	claim := "../src/tendwire/command_submission.py — deleted _clear_private_pane_composer"
 	observation := compareResultChanges(
 		[]string{claim},
 		[]string{"src/tendwire/command_submission.py"},

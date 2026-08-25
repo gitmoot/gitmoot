@@ -17508,8 +17508,10 @@ work was available. Produce remains a leaf, so its delegations are stripped.
   An omitted `delivery_status` means unknown or not applicable, not "not
   delivered."
 - Do not claim tests were run unless they were actually run.
-- Do not claim files were changed unless they were actually changed. Name
-  repo-relative file paths in each `changes_made` entry. At result persistence,
+- Do not claim files were changed unless they were actually changed. Each
+  `changes_made` entry begins with the repo-relative file path, optionally
+  followed by `:line` or `:line:column`, and may then include ` — description`.
+  At result persistence,
   an ordinary engine-run implement job resolves the effective checkout selected
   by the worker and records `payload.result_observation`: the files in
   `git diff HEAD` plus untracked files, each claim's path binding, claimed-only

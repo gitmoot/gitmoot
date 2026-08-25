@@ -44,11 +44,13 @@ The `decision` field reports the outcome of the job:
 
 The narrative and evidence fields are reporting-only. Do not claim tests were run
 in `tests_run` unless they were actually run, and do not list files in
-`changes_made` unless they were actually changed. Name repo-relative file paths
-in each `changes_made` entry. At result persistence, an ordinary engine-run
-implement job resolves the effective checkout selected by the worker and records
-`payload.result_observation`: the files in `git diff HEAD` plus untracked files,
-each claim's path binding, claimed-only paths, and diff files no claim mentions.
+`changes_made` unless they were actually changed. Each `changes_made` entry
+begins with the repo-relative file path, optionally followed by `:line` or
+`:line:column`, and may then include ` — description`. At result persistence, an
+ordinary engine-run implement job resolves the effective checkout selected by
+the worker and records `payload.result_observation`: the files in `git diff HEAD`
+plus untracked files, each claim's path binding, claimed-only paths, and diff
+files no claim mentions.
 A worktree-less delegation child is deliberately not graded against the shared
 registered checkout; it records a typed observation whose source is
 `excluded_worktree_less_delegation_child`, rather than omitting the field. A
