@@ -6,6 +6,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -204,9 +205,10 @@ func TestJobPathsDoNotHardcodeHostRunners(t *testing.T) {
 	byKey := make(map[string][]hostRunnerSite)
 	for _, site := range sites {
 		byKey[site.key] = append(byKey[site.key], site)
-		if site.kind == "subprocess.ExecRunner{}" {
+		switch site.kind {
+		case "subprocess.ExecRunner{}", "new(subprocess.ExecRunner)":
 			execRunnerSites++
-		} else {
+		case "exec.Command", "exec.Cmd{}":
 			rawCommandSites++
 		}
 	}
@@ -232,9 +234,9 @@ func TestJobPathsDoNotHardcodeHostRunners(t *testing.T) {
 		var execRunners, rawCommands int
 		for _, site := range actual {
 			switch site.kind {
-			case "subprocess.ExecRunner{}":
+			case "subprocess.ExecRunner{}", "new(subprocess.ExecRunner)":
 				execRunners++
-			case "exec.Command":
+			case "exec.Command", "exec.Cmd{}":
 				rawCommands++
 			}
 		}
@@ -250,10 +252,14 @@ func TestJobPathsDoNotHardcodeHostRunners(t *testing.T) {
 		len(sites), execRunnerSites, rawCommandSites, len(hostRunnerAllowlist))
 }
 
-// collectHardcodedHostRunnerSites is intentionally a syntactic guard. It does
-// not follow runners returned by helpers, fields assigned elsewhere, commands
-// constructed in another package and passed in, reflection, generated files,
-// or os/exec and subprocess imports reached through aliases or dot imports.
+// collectHardcodedHostRunnerSites is intentionally a syntactic guard. Direct
+// exec.Command calls, exec.Cmd{} and &exec.Cmd{} composite literals,
+// subprocess.ExecRunner composite literals, and new(subprocess.ExecRunner)
+// allocations are detected.
+// It does not follow calls through local function values, runners returned by
+// helpers, fields assigned elsewhere, commands constructed in another package
+// and passed in, reflection, generated files, or os/exec and subprocess imports
+// reached through aliases or dot imports.
 // Production files in all three directories are scanned by default, so a new
 // internal/cli file is guarded unless each detected file:function site earns an
 // explicit allowance with a reason.
@@ -296,12 +302,18 @@ func collectHardcodedHostRunnerSites(t *testing.T, repoRoot string) []hostRunner
 				ast.Inspect(node, func(node ast.Node) bool {
 					switch node := node.(type) {
 					case *ast.CompositeLit:
-						if isSelector(node.Type, "subprocess", "ExecRunner") {
+						switch {
+						case isSelector(node.Type, "subprocess", "ExecRunner"):
 							sites = append(sites, hostRunnerSite{key: key, kind: "subprocess.ExecRunner{}", position: fset.Position(node.Pos())})
+						case isSelector(node.Type, "exec", "Cmd"):
+							sites = append(sites, hostRunnerSite{key: key, kind: "exec.Cmd{}", position: fset.Position(node.Pos())})
 						}
 					case *ast.CallExpr:
-						if isSelector(node.Fun, "exec", "Command") || isSelector(node.Fun, "exec", "CommandContext") {
+						switch {
+						case isSelector(node.Fun, "exec", "Command") || isSelector(node.Fun, "exec", "CommandContext"):
 							sites = append(sites, hostRunnerSite{key: key, kind: "exec.Command", position: fset.Position(node.Pos())})
+						case isNewOfSelector(node, "subprocess", "ExecRunner"):
+							sites = append(sites, hostRunnerSite{key: key, kind: "new(subprocess.ExecRunner)", position: fset.Position(node.Pos())})
 						}
 					}
 					return true
@@ -322,6 +334,72 @@ func collectHardcodedHostRunnerSites(t *testing.T, repoRoot string) []hostRunner
 	return sites
 }
 
+// GITMOOT-COC IMPLEMENT: these fixtures pin both newly covered constructions
+// and the deliberately unsupported local-function-value indirection.
+func TestHostRunnerGuardDetectsExecCmdCompositeLiterals(t *testing.T) {
+	sites := collectHostRunnerFixtureSites(t, `package cli
+
+import "os/exec"
+
+func fixture() {
+	_ = exec.Cmd{Path: "/bin/true"}
+	_ = &exec.Cmd{Path: "/bin/true"}
+}
+`)
+	assertHostRunnerFixtureKinds(t, sites, "exec.Cmd{}", "exec.Cmd{}")
+}
+
+func TestHostRunnerGuardDetectsNewExecRunner(t *testing.T) {
+	sites := collectHostRunnerFixtureSites(t, `package cli
+
+import "github.com/gitmoot/gitmoot/internal/subprocess"
+
+func fixture() subprocess.Runner {
+	return new(subprocess.ExecRunner)
+}
+`)
+	assertHostRunnerFixtureKinds(t, sites, "new(subprocess.ExecRunner)")
+}
+
+func TestHostRunnerGuardDocumentsLocalFunctionValueBlindSpot(t *testing.T) {
+	sites := collectHostRunnerFixtureSites(t, `package cli
+
+import "os/exec"
+
+func fixture() *exec.Cmd {
+	command := exec.Command
+	return command("/bin/true")
+}
+`)
+	assertHostRunnerFixtureKinds(t, sites)
+}
+
+func collectHostRunnerFixtureSites(t *testing.T, source string) []hostRunnerSite {
+	t.Helper()
+	repoRoot := t.TempDir()
+	for _, dir := range []string{"internal/cli", "internal/workflow", "internal/daemon"} {
+		if err := os.MkdirAll(filepath.Join(repoRoot, filepath.FromSlash(dir)), 0o755); err != nil {
+			t.Fatalf("create fixture directory %s: %v", dir, err)
+		}
+	}
+	fixture := filepath.Join(repoRoot, "internal", "cli", "fixture.go")
+	if err := os.WriteFile(fixture, []byte(source), 0o600); err != nil {
+		t.Fatalf("write host-runner fixture: %v", err)
+	}
+	return collectHardcodedHostRunnerSites(t, repoRoot)
+}
+
+func assertHostRunnerFixtureKinds(t *testing.T, sites []hostRunnerSite, want ...string) {
+	t.Helper()
+	got := make([]string, 0, len(sites))
+	for _, site := range sites {
+		got = append(got, site.kind)
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("hardcoded host-runner fixture sites = %v, want %v", got, want)
+	}
+}
+
 func isSelector(node ast.Expr, pkg, name string) bool {
 	selector, ok := node.(*ast.SelectorExpr)
 	if !ok || selector.Sel.Name != name {
@@ -329,6 +407,11 @@ func isSelector(node ast.Expr, pkg, name string) bool {
 	}
 	ident, ok := selector.X.(*ast.Ident)
 	return ok && ident.Name == pkg
+}
+
+func isNewOfSelector(call *ast.CallExpr, pkg, name string) bool {
+	ident, ok := call.Fun.(*ast.Ident)
+	return ok && ident.Name == "new" && len(call.Args) == 1 && isSelector(call.Args[0], pkg, name)
 }
 
 func reportUnallowlistedHostRunner(t *testing.T, site hostRunnerSite) {
