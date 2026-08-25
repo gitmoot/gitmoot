@@ -67,7 +67,11 @@ func newNetworkProxyFixtureForAddress(t *testing.T, address, advertisedAuthority
 	clock := &controlledClock{now: now}
 	serverCA, serverCAKey := newTestCertificateAuthority(t, now, "server-ca")
 	clientCA, clientCAKey := newTestCertificateAuthority(t, now, "client-ca")
-	serverCertificate := newTestServerCertificate(t, now, serverCA, serverCAKey, advertisedAuthority)
+	certificateHost := advertisedAuthority
+	if host, _, err := net.SplitHostPort(advertisedAuthority); err == nil {
+		certificateHost = host
+	}
+	serverCertificate := newTestServerCertificate(t, now, serverCA, serverCAKey, certificateHost)
 	gateway, err := Start(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -221,6 +225,149 @@ func TestNetworkProxyWildcardBindUsesAdvertisedAuthority(t *testing.T) {
 	}
 	if got := fixture.resolverCalls.Load(); got != 1 {
 		t.Fatalf("resolver calls after mismatched authority = %d, want 1", got)
+	}
+}
+
+func TestNetworkProxyHTTPSDefaultPortAuthorityForms(t *testing.T) {
+	fixture := newNetworkProxyFixtureForAddress(t, "127.0.0.1:0", "gateway.internal:443")
+	_, port, err := net.SplitHostPort(fixture.network.listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := fixture.register("default-port-job", fixture.clock.Now().Add(30*time.Minute))
+	client := fixture.clientForAddress(lease.ClientCertificate(), "gateway.internal", net.JoinHostPort("127.0.0.1", port))
+
+	request := func(host string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, lease.URL()+"/v1/messages", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = host
+		req.Header.Set("Authorization", "Bearer "+lease.Placeholder())
+		req.Header.Set(CapabilityHeader, lease.Capability())
+		response, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		return response
+	}
+
+	if response := request("gateway.internal"); response.StatusCode != http.StatusOK {
+		t.Fatalf("portless default authority status = %d, want 200", response.StatusCode)
+	}
+	if err := lease.Renew(context.Background(), client); err != nil {
+		t.Fatalf("portless default authority renewal: %v", err)
+	}
+	if response := request("gateway.internal:443"); response.StatusCode != http.StatusOK {
+		t.Fatalf("explicit default authority status = %d, want 200", response.StatusCode)
+	}
+	renewRequest, err := http.NewRequest(http.MethodPost, fixture.network.URL()+networkRenewPrefix+strings.TrimPrefix(lease.lease.route, "/_gitmoot/proxy/"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	renewRequest.Host = "gateway.internal:443"
+	renewRequest.Header.Set(CapabilityHeader, lease.Capability())
+	renewResponse, err := client.Do(renewRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	renewResponse.Body.Close()
+	if renewResponse.StatusCode != http.StatusOK {
+		t.Fatalf("explicit default authority renewal status = %d, want 200", renewResponse.StatusCode)
+	}
+	if got := fixture.resolverCalls.Load(); got != 2 {
+		t.Fatalf("default authority resolver calls = %d, want 2", got)
+	}
+	if got := fixture.upstreamCalls.Load(); got != 2 {
+		t.Fatalf("default authority upstream calls = %d, want 2", got)
+	}
+	fixture.upstreamMu.Lock()
+	defer fixture.upstreamMu.Unlock()
+	if fixture.upstreamAuthorization != "Bearer "+testRealCredential || fixture.upstreamCapability != "" {
+		t.Fatalf("upstream authorization=%q capability=%q", fixture.upstreamAuthorization, fixture.upstreamCapability)
+	}
+}
+
+func TestNetworkProxyHTTPSNonDefaultPortRequiresExplicitPort(t *testing.T) {
+	fixture := newNetworkProxyFixtureForAddress(t, "127.0.0.1:0", "gateway.internal:8443")
+	_, port, err := net.SplitHostPort(fixture.network.listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := fixture.register("non-default-port-job", fixture.clock.Now().Add(30*time.Minute))
+	client := fixture.clientForAddress(lease.ClientCertificate(), "gateway.internal", net.JoinHostPort("127.0.0.1", port))
+
+	request := func(host string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, lease.URL()+"/v1/messages", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = host
+		req.Header.Set("Authorization", "Bearer "+lease.Placeholder())
+		req.Header.Set(CapabilityHeader, lease.Capability())
+		response, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		return response
+	}
+
+	response := request("gateway.internal")
+	if got := fixture.resolverCalls.Load(); got != 0 {
+		t.Fatalf("resolver calls for omitted non-default port = %d, want 0", got)
+	}
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("omitted non-default port status = %d, want 400", response.StatusCode)
+	}
+	if response = request("gateway.internal:8443"); response.StatusCode != http.StatusOK {
+		t.Fatalf("explicit non-default authority status = %d, want 200", response.StatusCode)
+	}
+}
+
+func TestNetworkProxyHTTPSAuthorityRejectsMismatches(t *testing.T) {
+	tests := []struct {
+		name         string
+		host         string
+		absoluteForm bool
+	}{
+		{name: "different host", host: "other.internal"},
+		{name: "different non-default port", host: "gateway.internal:8443"},
+		{name: "userinfo", host: "user@gateway.internal"},
+		{name: "path", host: "gateway.internal/path"},
+		{name: "query", host: "gateway.internal?query"},
+		{name: "fragment", host: "gateway.internal#fragment"},
+		{name: "absolute-form request URI", host: "gateway.internal", absoluteForm: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newNetworkProxyFixtureForAddress(t, "127.0.0.1:0", "gateway.internal:443")
+			lease := fixture.register("mismatch-job", fixture.clock.Now().Add(30*time.Minute))
+			request := httptest.NewRequest(http.MethodPost, lease.lease.route+"/v1/messages", nil)
+			request.Host = test.host
+			request.Header.Set("Authorization", "Bearer "+lease.Placeholder())
+			request.Header.Set(CapabilityHeader, lease.Capability())
+			request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{lease.ClientCertificate().Leaf}}
+			if test.absoluteForm {
+				request.URL.Scheme = "https"
+				request.URL.Host = "gateway.internal"
+				request.RequestURI = request.URL.String()
+			}
+			recorder := httptest.NewRecorder()
+			fixture.network.ServeHTTP(recorder, request)
+			if got := fixture.resolverCalls.Load(); got != 0 {
+				t.Fatalf("resolver calls = %d, want 0", got)
+			}
+			if got := fixture.upstreamCalls.Load(); got != 0 {
+				t.Fatalf("upstream calls = %d, want 0", got)
+			}
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", recorder.Code)
+			}
+		})
 	}
 }
 

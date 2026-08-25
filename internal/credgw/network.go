@@ -288,6 +288,11 @@ func (n *NetworkProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		if sameHTTPSAuthority(r.Host, n.authority) && r.Host != n.authority {
+			request := r.Clone(r.Context())
+			request.Host = n.authority
+			r = request
+		}
 		n.gateway.serveProxyRequest(w, r, proxyRequestAccess{
 			route: route, capability: capability, suffixRoute: route,
 			authority: n.authority, clientCertHash: certificateHash, network: true,
@@ -298,7 +303,7 @@ func (n *NetworkProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (n *NetworkProxy) serveRenewal(w http.ResponseWriter, r *http.Request, route string, certificateHash [sha256.Size]byte) {
-	if r.Method != http.MethodPost || r.URL.IsAbs() || r.URL.Host != "" || !strings.EqualFold(r.Host, n.authority) {
+	if r.Method != http.MethodPost || r.URL.IsAbs() || r.URL.Host != "" || !sameHTTPSAuthority(r.Host, n.authority) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -336,7 +341,36 @@ func resolveAdvertisedAuthority(configured string, bound net.Addr) (string, stri
 		}
 		port = boundPort
 	}
-	return net.JoinHostPort(host, port), host, nil
+	authority, ok := normalizeHTTPSAuthority(net.JoinHostPort(host, port))
+	if !ok {
+		return "", "", fmt.Errorf("network credential gateway advertised authority %q is invalid", configured)
+	}
+	return authority, host, nil
+}
+
+func normalizeHTTPSAuthority(authority string) (string, bool) {
+	parsed, err := url.Parse("https://" + authority)
+	if err != nil || parsed.Host != authority || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", false
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return "", false
+	}
+	port := parsed.Port()
+	if port == "" || port == "443" {
+		if strings.Contains(host, ":") {
+			return "[" + host + "]", true
+		}
+		return host, true
+	}
+	return net.JoinHostPort(host, port), true
+}
+
+func sameHTTPSAuthority(actual, expected string) bool {
+	actual, actualOK := normalizeHTTPSAuthority(actual)
+	expected, expectedOK := normalizeHTTPSAuthority(expected)
+	return actualOK && expectedOK && strings.EqualFold(actual, expected)
 }
 
 func verifyServerCertificateAuthority(certificate tls.Certificate, advertisedHost string) error {
