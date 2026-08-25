@@ -1385,7 +1385,11 @@ func printFailureDiagnostics(stdout io.Writer, diag *workflow.FailureDiagnostics
 		return
 	}
 	fmt.Fprintln(stdout, "failure_diagnostics:")
-	fmt.Fprintf(stdout, "  phase: %s\n", diag.Phase)
+	// A delivery that failed before the adapter reported any session evidence has
+	// no phase to claim (#1620); print nothing rather than a blank "phase:" line.
+	if diag.Phase != "" {
+		fmt.Fprintf(stdout, "  phase: %s\n", diag.Phase)
+	}
 	if diag.ExitCode != nil {
 		fmt.Fprintf(stdout, "  exit_code: %d\n", *diag.ExitCode)
 	}
@@ -1394,6 +1398,15 @@ func printFailureDiagnostics(stdout io.Writer, diag *workflow.FailureDiagnostics
 	}
 	if diag.SessionID != "" {
 		fmt.Fprintf(stdout, "  runtime_session: %s\n", diag.SessionID)
+	}
+	// The engine's own terminal error for the delivery, printed BEFORE the stderr
+	// tail because it is the line that actually distinguishes one exit_code: 1
+	// from another (#1620). Redacted and bounded at capture time, same as the tail.
+	if diag.DeliveryError != "" {
+		fmt.Fprintln(stdout, "  delivery_error:")
+		for _, line := range strings.Split(diag.DeliveryError, "\n") {
+			fmt.Fprintf(stdout, "    %s\n", line)
+		}
 	}
 	if diag.StderrTail != "" {
 		fmt.Fprintln(stdout, "  stderr_tail:")

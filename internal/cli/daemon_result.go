@@ -289,17 +289,21 @@ func (w jobWorker) finalizeTimedOutJob(ctx context.Context, job db.Job, payload 
 		elapsed = time.Since(evidence.Started).Round(time.Millisecond)
 	}
 	stderrTail := ""
+	deliveryError := ""
 	if payload.FailureDiagnostics != nil {
 		stderrTail = payload.FailureDiagnostics.StderrTail
+		deliveryError = payload.FailureDiagnostics.DeliveryError
 	}
 	detailBytes, _ := json.Marshal(struct {
-		Deadline   string `json:"deadline"`
-		Elapsed    string `json:"elapsed"`
-		StderrTail string `json:"stderr_tail,omitempty"`
+		Deadline      string `json:"deadline"`
+		Elapsed       string `json:"elapsed"`
+		StderrTail    string `json:"stderr_tail,omitempty"`
+		DeliveryError string `json:"delivery_error,omitempty"`
 	}{
-		Deadline:   deadline.Format(time.RFC3339Nano),
-		Elapsed:    elapsed.String(),
-		StderrTail: stderrTail,
+		Deadline:      deadline.Format(time.RFC3339Nano),
+		Elapsed:       elapsed.String(),
+		StderrTail:    stderrTail,
+		DeliveryError: deliveryError,
 	})
 	reason := fmt.Sprintf("job %s exceeded its run deadline: %v", job.ID, cause)
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
@@ -369,6 +373,52 @@ type jobLifecycle struct {
 
 func observedJobLifecycle(job db.Job) jobLifecycle {
 	return jobLifecycle{state: job.State, generation: job.LifecycleGeneration}
+}
+
+// recordDeliveryFailureDiagnostics carries the engine's terminal delivery error
+// onto the job row's failure diagnostics (#1620), so `job show` shows the same
+// line the daemon writes to its journal as "job <id> failed: <err>" instead of
+// leaving the runtime's real error ("400 invalid_request_error: ... requires a
+// newer version of Codex", a compaction-endpoint 404) journal-only. It is purely
+// additive: the terminal state, its events, and the journal line are all
+// unchanged, and an existing StderrTail/phase/exit_code is preserved.
+//
+// Best-effort by design, exactly like Mailbox.storeFailureDiagnostics — the row
+// is already terminally settled by the time this runs, so a load or persist
+// failure must never change the failure path.
+//
+// atGeneration is the lifecycle the run OWNED. A retry claimed between the run
+// error and this write bumps the generation and clears diagnostics for its own
+// run, so writing then would stamp a live run's payload with a dead run's error;
+// the guard drops the write instead. It mirrors handleRunJobError's superseded
+// check, and for the same reason.
+func (w jobWorker) recordDeliveryFailureDiagnostics(ctx context.Context, jobID string, atGeneration int64, cause error) {
+	if cause == nil || strings.TrimSpace(cause.Error()) == "" {
+		return
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	latest, err := w.Store.GetJob(writeCtx, jobID)
+	if err != nil || latest.LifecycleGeneration != atGeneration {
+		return
+	}
+	// ParseJobPayload, not daemonJobPayload: this is a read-MODIFY-write, and the
+	// legacy-tolerant decoder is what keeps a payload still carrying the legacy
+	// preset_* keys from losing them on the way back out.
+	payload, err := workflow.ParseJobPayload(latest.Payload)
+	if err != nil {
+		return
+	}
+	updated := workflow.WithDeliveryError(payload.FailureDiagnostics, cause.Error())
+	if updated == nil {
+		return
+	}
+	payload.FailureDiagnostics = updated
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	_ = w.Store.UpdateJobPayload(writeCtx, jobID, string(encoded))
 }
 
 // matches reports whether the row read back is still the run this lifecycle identified.

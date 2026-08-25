@@ -47,9 +47,42 @@ type FailureDiagnostics struct {
 	// stderr, run through the same token-redaction rules as GitHub job comments
 	// and bug reports before storage.
 	StderrTail string `json:"stderr_tail,omitempty"`
+	// DeliveryError is the redacted text of the ENGINE's own terminal error for
+	// the delivery — the very string the daemon logs as "job <id> failed: <err>"
+	// (#1620). It is deliberately NOT folded into StderrTail: that field means
+	// "tail of the runtime CLI's stderr", which is a different source and often
+	// carries only an echo of the prompt. Before this field the daemon journal
+	// held the only copy, so a model/CLI mismatch and a compaction-endpoint 404
+	// both read as an identical `phase: streaming, exit_code: 1` on the job row
+	// and operators re-dispatched instead of triaging. Set only through
+	// WithDeliveryError, which is what keeps redaction from being bypassed.
+	DeliveryError string `json:"delivery_error,omitempty"`
 	// SessionID is the concrete runtime session id in play when one was
 	// created/known.
 	SessionID string `json:"session_id,omitempty"`
+}
+
+// WithDeliveryError records the engine's terminal delivery error on diag and
+// returns it. The detail runs through redactedStderrTail — the IDENTICAL
+// redaction-then-bound path StderrTail uses — because a provider error routinely
+// carries a URL, a request id, or a token, and a job row is a durable, widely
+// read surface.
+//
+// A blank detail (or one that redacts away to nothing) is a no-op that never
+// allocates: a job whose delivery failed with an empty error must not grow an
+// empty diagnostics block. A nil diag with a real detail allocates a PHASE-LESS
+// FailureDiagnostics rather than inventing a phase — the delivery failed without
+// the adapter reporting session evidence, so there is no phase to claim.
+func WithDeliveryError(diag *FailureDiagnostics, detail string) *FailureDiagnostics {
+	redacted := redactedStderrTail(detail)
+	if redacted == "" {
+		return diag
+	}
+	if diag == nil {
+		diag = &FailureDiagnostics{}
+	}
+	diag.DeliveryError = redacted
+	return diag
 }
 
 // failureDiagnosticsFromSession converts an adapter's raw session evidence into

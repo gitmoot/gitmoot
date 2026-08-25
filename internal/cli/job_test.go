@@ -1019,10 +1019,11 @@ func TestPrintJobRendersFailureDiagnosticsBlock(t *testing.T) {
 	payload := workflow.JobPayload{
 		Repo: "owner/repo",
 		FailureDiagnostics: &workflow.FailureDiagnostics{
-			Phase:      workflow.FailurePhaseLaunched,
-			ExitCode:   &exitCode,
-			StderrTail: "first crash line\nsecond crash line",
-			SessionID:  "sess-1234",
+			Phase:         workflow.FailurePhaseLaunched,
+			ExitCode:      &exitCode,
+			StderrTail:    "first crash line\nsecond crash line",
+			DeliveryError: "400 invalid_request_error: model requires a newer CLI",
+			SessionID:     "sess-1234",
 		},
 	}
 
@@ -1034,6 +1035,8 @@ func TestPrintJobRendersFailureDiagnosticsBlock(t *testing.T) {
 		"  phase: launched",
 		"  exit_code: 7",
 		"  runtime_session: sess-1234",
+		"  delivery_error:",
+		"    400 invalid_request_error: model requires a newer CLI",
 		"  stderr_tail:",
 		"    first crash line",
 		"    second crash line",
@@ -1041,6 +1044,26 @@ func TestPrintJobRendersFailureDiagnosticsBlock(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("job show output missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// A delivery that failed before the adapter reported session evidence has no
+// phase to claim (#1620); the block must not render a blank "phase:" line.
+func TestPrintJobFailureDiagnosticsOmitsBlankPhase(t *testing.T) {
+	var buf bytes.Buffer
+	payload := workflow.JobPayload{
+		Repo:               "owner/repo",
+		FailureDiagnostics: workflow.WithDeliveryError(nil, "unexpected status 404 Not Found"),
+	}
+
+	printJob(&buf, db.Job{ID: "job-z", State: "failed", Type: "review", Agent: "audit"}, payload, stuckReason{}, false, "", reviewStatusDisplay{})
+
+	out := buf.String()
+	if !strings.Contains(out, "  delivery_error:") || !strings.Contains(out, "    unexpected status 404 Not Found") {
+		t.Fatalf("job show output missing the delivery error:\n%s", out)
+	}
+	if strings.Contains(out, "  phase:") {
+		t.Fatalf("job show printed a phase line for a phase-less diagnostics:\n%s", out)
 	}
 }
 

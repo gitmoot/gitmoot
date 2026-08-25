@@ -2184,12 +2184,27 @@ valid envelope was found, `recovery` = daemon recovery proved the durable runner
 was gone), the process `exit_code` **or** terminating `signal`,
 a **redacted** stderr tail (hard-capped at 4 KB; redaction runs over the full
 text with the same token-redaction rules as job comments *before* the tail is
-cut, so a secret can never leak partially), and the runtime session id when one
-is known. `gitmoot job show` prints a `failure_diagnostics:` block,
+cut, so a secret can never leak partially), the **`delivery_error`** — the
+engine's own terminal error for the delivery, i.e. the exact line the daemon logs
+as `job <id> failed: <err>` (#1620) — and the runtime session id when one is
+known. `gitmoot job show` prints a `failure_diagnostics:` block,
 `job show --json` carries `payload.failure_diagnostics`, and `gitmoot report
 bug` includes a "Failure diagnostics" section. Successful jobs never store one,
 and a retried job clears the previous run's crash report. Terminal `failed`
 events embed the same bounded, redacted stderr tail for durable triage.
+
+`delivery_error` is what distinguishes faults the row otherwise collapses into
+one identical `phase: streaming, exit_code: 1` — a model/CLI mismatch (`400
+invalid_request_error: The '<model>' model requires a newer version of Codex.`)
+and a compaction-endpoint `404`, say, need different remedies but used to look
+the same on the job row because the runtime's real error existed only in
+`journalctl --user -u gitmoot-daemon`. It is a **different source** from
+`stderr_tail` (which is the runtime CLI's own stderr, often just an echo of the
+skill system prompt) and never replaces it; both go through the identical
+redaction and 4 KB bound, because a provider error routinely carries a URL, a
+request id, or a token. A delivery that failed before the adapter reported any
+session evidence records `delivery_error` with **no** `phase` line, and a
+delivery that failed with an empty error records no field at all.
 
 Jobs stuck in `running` are backstopped too, but transcript silence alone never
 kills work. The recurring same-boot sweep moves `running` to `failed` only when
