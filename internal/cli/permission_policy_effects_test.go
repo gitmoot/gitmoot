@@ -1,12 +1,16 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/permissionpolicy"
@@ -79,6 +83,156 @@ func TestPermissionPolicyEffectCaptureFailureDoesNotFailCleanJob(t *testing.T) {
 	effects := permissionPolicyEffectWarning(t, store, job.ID).Effects
 	if effects == nil || effects.CheckoutDirty == nil || *effects.CheckoutDirty {
 		t.Fatalf("effects = %#v, want checkout_dirty=false", effects)
+	}
+}
+
+func TestPermissionPolicyEffectCaptureFailureLogsResolvedLocation(t *testing.T) {
+	t.Run("job lookup uses caller checkout and identifies non-repository", func(t *testing.T) {
+		checkout := t.TempDir()
+		var output bytes.Buffer
+		worker := defaultJobWorker(daemonWorkerStore(t), &output)
+		if err := worker.capturePermissionPolicyEffects(context.Background(), "missing-policy-job", checkout); err == nil {
+			t.Fatal("capture returned nil error for missing job")
+		}
+		assertPermissionPolicyCaptureLocation(t, output.String(), checkout, "true", "false")
+	})
+
+	t.Run("payload parse uses caller checkout and identifies absent path", func(t *testing.T) {
+		ctx := context.Background()
+		store := daemonWorkerStore(t)
+		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "malformed-policy-job", Agent: "policy-agent", Action: "ask", Repo: "owner/repo"})
+		if err := store.UpdateJobPayload(ctx, "malformed-policy-job", "{"); err != nil {
+			t.Fatal(err)
+		}
+		checkout := filepath.Join(t.TempDir(), "missing")
+		var output bytes.Buffer
+		worker := defaultJobWorker(store, &output)
+		if err := worker.capturePermissionPolicyEffects(ctx, "malformed-policy-job", checkout); err == nil {
+			t.Fatal("capture returned nil error for malformed payload")
+		}
+		assertPermissionPolicyCaptureLocation(t, output.String(), checkout, "false", "unknown")
+	})
+
+	t.Run("effect capture uses payload fallback and identifies work tree", func(t *testing.T) {
+		ctx := context.Background()
+		store := daemonWorkerStore(t)
+		checkout := createDaemonWorkerGitCheckout(t, "main")
+		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+			ID: "fallback-policy-job", Agent: "policy-agent", Action: "ask",
+			Repo: "owner/repo", Branch: "main", WorktreePath: checkout,
+		})
+		job, err := store.GetJob(ctx, "fallback-policy-job")
+		if err != nil {
+			t.Fatal(err)
+		}
+		agent := runtime.Agent{
+			Name: "policy-agent", Runtime: runtime.ShellRuntime, RuntimeRef: "printf done",
+			AutonomyPolicy: runtime.AutonomyPolicyAuto,
+		}
+		claimed, err := permissionpolicy.RecordWarning(ctx, store, job, agent, &permissionPolicyTestAdapter{property: runtime.PermissionPolicyNotApplied}, time.Now())
+		if err != nil || !claimed {
+			t.Fatalf("RecordWarning = claimed %t, err %v", claimed, err)
+		}
+
+		var output bytes.Buffer
+		usedCheckout := ""
+		worker := defaultJobWorker(store, &output)
+		worker.PermissionPolicyEffectGit = func(got string) permissionpolicy.EffectGit {
+			usedCheckout = got
+			return &permissionPolicyEffectGitFake{
+				behindErr: errors.New("local upstream unavailable"),
+				remoteErr: errors.New("remote unavailable"),
+			}
+		}
+		if err := worker.capturePermissionPolicyEffects(ctx, job.ID, ""); err == nil {
+			t.Fatal("capture returned nil error for remote failure")
+		}
+		if usedCheckout != checkout {
+			t.Fatalf("effect git checkout = %q, want payload fallback %q", usedCheckout, checkout)
+		}
+		assertPermissionPolicyCaptureLocation(t, output.String(), checkout, "true", "true")
+	})
+
+	t.Run("effect capture logs caller checkout when payload worktree differs", func(t *testing.T) {
+		ctx := context.Background()
+		store := daemonWorkerStore(t)
+		checkout := t.TempDir()
+		payloadCheckout := filepath.Join(t.TempDir(), "different-payload-checkout")
+		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+			ID: "caller-checkout-policy-job", Agent: "policy-agent", Action: "ask",
+			Repo: "owner/repo", Branch: "main", WorktreePath: payloadCheckout,
+		})
+		job, err := store.GetJob(ctx, "caller-checkout-policy-job")
+		if err != nil {
+			t.Fatal(err)
+		}
+		agent := runtime.Agent{
+			Name: "policy-agent", Runtime: runtime.ShellRuntime, RuntimeRef: "printf done",
+			AutonomyPolicy: runtime.AutonomyPolicyAuto,
+		}
+		claimed, err := permissionpolicy.RecordWarning(ctx, store, job, agent, &permissionPolicyTestAdapter{property: runtime.PermissionPolicyNotApplied}, time.Now())
+		if err != nil || !claimed {
+			t.Fatalf("RecordWarning = claimed %t, err %v", claimed, err)
+		}
+
+		var output bytes.Buffer
+		worker := defaultJobWorker(store, &output)
+		worker.PermissionPolicyEffectGit = func(string) permissionpolicy.EffectGit {
+			return &permissionPolicyEffectGitFake{
+				behindErr: errors.New("local upstream unavailable"),
+				remoteErr: errors.New("remote unavailable"),
+			}
+		}
+		if err := worker.capturePermissionPolicyEffects(ctx, job.ID, checkout); err == nil {
+			t.Fatal("capture returned nil error for remote failure")
+		}
+		assertPermissionPolicyCaptureLocation(t, output.String(), checkout, "true", "false")
+	})
+
+	t.Run("runner resolution logs caller checkout", func(t *testing.T) {
+		ctx := context.Background()
+		store := daemonWorkerStore(t)
+		checkout := t.TempDir()
+		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+			ID: "runner-resolution-policy-job", Agent: "policy-agent", Action: "ask",
+			Repo: "owner/repo", Branch: "main", WorktreePath: filepath.Join(t.TempDir(), "payload-checkout"),
+		})
+		job, err := store.GetJob(ctx, "runner-resolution-policy-job")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
+			t.Fatal(err)
+		}
+		payload["exec_backend"] = "unimplemented-runner"
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.UpdateJobPayload(ctx, job.ID, string(encoded)); err != nil {
+			t.Fatal(err)
+		}
+		job, err = store.GetJob(ctx, job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var output bytes.Buffer
+		worker := defaultJobWorker(store, &output)
+		err = worker.capturePermissionPolicyEffects(ctx, job.ID, checkout)
+		if err == nil || !strings.Contains(err.Error(), "resolve permission-policy effect runner") {
+			t.Fatalf("capture error = %v, want runner resolution failure", err)
+		}
+		assertPermissionPolicyCaptureLocation(t, output.String(), checkout, "true", "false")
+	})
+}
+
+func assertPermissionPolicyCaptureLocation(t *testing.T, output, checkout, exists, workTree string) {
+	t.Helper()
+	want := fmt.Sprintf("path=%q exists=%s work_tree=%s", workflow.RedactCommentText(checkout), exists, workTree)
+	if !strings.Contains(output, want) {
+		t.Fatalf("capture failure output = %q, want location %q", output, want)
 	}
 }
 
