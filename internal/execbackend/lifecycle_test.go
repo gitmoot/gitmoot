@@ -333,6 +333,45 @@ func TestLocalBackendExecConfiguredIdentityFailureIsLoud(t *testing.T) {
 	}
 }
 
+func TestLocalBackendExecNonzeroExitDoesNotBlameConfiguredIdentity(t *testing.T) {
+	identity := testUnprivilegedIdentities(t, 1)[0]
+	host, _, _ := changeSetRepoPair(t)
+	backend := newPrivilegedTestLocalBackend(t, identity)
+	instance, err := backend.Provision(context.Background(), JobScope{JobID: "ordinary-exit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backend.Destroy(context.Background(), instance) })
+	if err := backend.SyncIn(context.Background(), instance, Materials{SourceWorktree: host}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		output *strings.Builder
+	}{
+		{name: "buffered"},
+		{name: "streaming", output: &strings.Builder{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stream, err := backend.Exec(context.Background(), instance, Command{
+				Dir: instance.Workspace, Name: "/bin/sh", Args: []string{"-c", "exit 3"}, Output: tc.output,
+			})
+			if err != nil {
+				t.Fatalf("Exec setup: %v", err)
+			}
+			_, err = stream.Wait()
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 3 {
+				t.Fatalf("ordinary exit error = %v, want exit status 3", err)
+			}
+			if strings.Contains(err.Error(), "execute local backend command as uid") {
+				t.Fatalf("ordinary exit error = %v, want no configured-identity framing", err)
+			}
+		})
+	}
+}
+
 func runLocalBackendIdentityFailureHelper(t *testing.T, target LocalIdentity) {
 	backend, err := NewLocalBackend(os.Getenv("GITMOOT_LOCAL_BACKEND_ROOT"), &target)
 	if err != nil {

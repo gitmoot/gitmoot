@@ -283,7 +283,7 @@ func (b *LocalBackend) Exec(ctx context.Context, instance *Instance, command Com
 		} else {
 			result, runErr = runner.RunEnvWithPID(execCtx, dir, command.Env, command.OnStart, command.Name, command.Args...)
 		}
-		if runErr != nil && b.identity != nil {
+		if b.identity != nil && isCredentialApplicationError(runErr) {
 			runErr = fmt.Errorf("execute local backend command as uid %d gid %d: %w", b.identity.UID, b.identity.GID, runErr)
 		}
 		stream.result <- localExecResult{result: ExecResult{
@@ -294,6 +294,11 @@ func (b *LocalBackend) Exec(ctx context.Context, instance *Instance, command Com
 		}, err: runErr}
 	}()
 	return stream, nil
+}
+
+func isCredentialApplicationError(err error) bool {
+	var pathErr *os.PathError
+	return errors.As(err, &pathErr) && pathErr.Op == "fork/exec" && errors.Is(pathErr.Err, syscall.EPERM)
 }
 
 func (b *LocalBackend) credential() *syscall.Credential {
