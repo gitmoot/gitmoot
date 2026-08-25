@@ -1017,6 +1017,53 @@ func (s *Store) UpdateJobPayload(ctx context.Context, id string, payload string)
 	return tx.Commit()
 }
 
+// UpdateJobPayloadAtGeneration is UpdateJobPayload with the job's LIFECYCLE
+// GENERATION folded into the same UPDATE (#1620).
+//
+// UpdateJobPayload predicates on (id, workflow_id) only. A caller that reads the
+// row, decides the generation it observed is still current, and only THEN writes
+// therefore has a window between the check and the write: a retry claiming the
+// row inside it bumps the generation, and the now-stale writer overwrites the NEW
+// run's payload with the old run's. Making the generation part of the WHERE turns
+// that read-decide-write into one compare-and-swap, so the check cannot go stale
+// before the write it guards.
+//
+// Losing the CAS returns false with the row untouched, and is NOT an error: it
+// means the payload being written describes a superseded run, and writing nothing
+// is the correct outcome. Callers must not retry it. As with
+// TransitionJobStatePayloadWithEventAtGeneration, false alone cannot say whether
+// the state, the generation, or the row's existence is what failed to match; a
+// caller that needs to know re-reads the row.
+//
+// UpdateJobPayload itself is deliberately left alone: its callers write payloads
+// that are not anchored to an observed run, and giving them a CAS they never
+// consented to would silently start dropping their writes.
+func (s *Store) UpdateJobPayloadAtGeneration(ctx context.Context, id string, payload string, atGeneration int64) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	projection := jobProjectionFromPayload(payload)
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND workflow_id = ? AND lifecycle_generation = ?`,
+		payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+		projection.BlockerSuggestedAction, id, projection.WorkflowID, atGeneration)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		if err := rejectWorkflowIDMismatch(ctx, tx, id, projection.WorkflowID); err != nil {
+			return false, err
+		}
+		return false, tx.Commit()
+	}
+	return true, tx.Commit()
+}
+
 func (s *Store) UpdateJobPayloadAndStateWithEvent(ctx context.Context, id string, payload string, state string, event JobEvent) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

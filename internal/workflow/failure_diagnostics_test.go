@@ -244,6 +244,86 @@ func TestRedactedStderrTailBoundsAndRedacts(t *testing.T) {
 	}
 }
 
+// The engine's own delivery error is a DIFFERENT source from the CLI's stderr,
+// but it is exactly as likely to carry a token, a URL, or a request id — so it
+// must go through the identical redaction+bound path (#1620). This is the guard
+// with a real consequence: an unredacted provider error on a durable job row is
+// a token-leak surface.
+func TestWithDeliveryErrorRedactsThroughTheStderrTailPath(t *testing.T) {
+	secret := "ghp_" + strings.Repeat("A", 36)
+	detail := "400 invalid_request_error: rejected (authorization: Bearer " + secret + ")"
+
+	diag := WithDeliveryError(nil, detail)
+
+	if diag == nil {
+		t.Fatal("WithDeliveryError(nil, <detail>) = nil, want an allocated diagnostics")
+	}
+	if strings.Contains(diag.DeliveryError, secret) {
+		t.Fatalf("delivery error leaked the token: %q", diag.DeliveryError)
+	}
+	if !strings.Contains(diag.DeliveryError, "[REDACTED]") {
+		t.Fatalf("delivery error = %q, want the redaction marker", diag.DeliveryError)
+	}
+	if !strings.Contains(diag.DeliveryError, "400 invalid_request_error") {
+		t.Fatalf("delivery error = %q, want the triage-bearing text kept", diag.DeliveryError)
+	}
+	// Identical to what StderrTail would do with the same input — the field must
+	// not acquire its own, weaker redaction path.
+	if want := redactedStderrTail(detail); diag.DeliveryError != want {
+		t.Fatalf("delivery error = %q, want the stderr-tail redaction result %q", diag.DeliveryError, want)
+	}
+}
+
+func TestWithDeliveryErrorBoundsLikeStderrTail(t *testing.T) {
+	detail := strings.Repeat("x", 4*MaxStderrTailBytes) + "\ntail-marker-end"
+
+	diag := WithDeliveryError(nil, detail)
+
+	if len(diag.DeliveryError) > MaxStderrTailBytes {
+		t.Fatalf("len = %d, want <= %d", len(diag.DeliveryError), MaxStderrTailBytes)
+	}
+	if !strings.HasSuffix(diag.DeliveryError, "tail-marker-end") {
+		t.Fatalf("delivery error (%d bytes) does not end at the tail marker", len(diag.DeliveryError))
+	}
+}
+
+// A delivery that failed with an empty error must not grow an empty/garbage
+// field, and must not conjure a diagnostics block out of nothing.
+func TestWithDeliveryErrorIgnoresBlankDetail(t *testing.T) {
+	if diag := WithDeliveryError(nil, ""); diag != nil {
+		t.Fatalf("WithDeliveryError(nil, \"\") = %+v, want nil", diag)
+	}
+	if diag := WithDeliveryError(nil, "   \n\t "); diag != nil {
+		t.Fatalf("WithDeliveryError(nil, whitespace) = %+v, want nil", diag)
+	}
+	existing := &FailureDiagnostics{Phase: FailurePhaseStreaming, StderrTail: "prompt echo"}
+	if diag := WithDeliveryError(existing, " "); diag.DeliveryError != "" {
+		t.Fatalf("delivery error = %q, want it left unset by a blank detail", diag.DeliveryError)
+	}
+}
+
+// Additive only: the crash evidence a job already carried survives untouched.
+func TestWithDeliveryErrorPreservesExistingDiagnostics(t *testing.T) {
+	exitCode := 1
+	existing := &FailureDiagnostics{
+		Phase: FailurePhaseStreaming, ExitCode: &exitCode, Signal: "SIGKILL",
+		StderrTail: "echo of the skill system prompt", SessionID: "sess-9",
+	}
+
+	diag := WithDeliveryError(existing, "unexpected status 404 Not Found")
+
+	if diag != existing {
+		t.Fatalf("WithDeliveryError returned a different diagnostics pointer")
+	}
+	if diag.Phase != FailurePhaseStreaming || diag.ExitCode == nil || *diag.ExitCode != 1 ||
+		diag.Signal != "SIGKILL" || diag.StderrTail != "echo of the skill system prompt" || diag.SessionID != "sess-9" {
+		t.Fatalf("existing diagnostics disturbed: %+v", diag)
+	}
+	if diag.DeliveryError != "unexpected status 404 Not Found" {
+		t.Fatalf("delivery error = %q", diag.DeliveryError)
+	}
+}
+
 func TestTailBytesKeepsValidUTF8(t *testing.T) {
 	// 3-byte runes force the byte cut to land mid-rune, exercising the
 	// boundary re-alignment.

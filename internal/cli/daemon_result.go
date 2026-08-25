@@ -289,17 +289,21 @@ func (w jobWorker) finalizeTimedOutJob(ctx context.Context, job db.Job, payload 
 		elapsed = time.Since(evidence.Started).Round(time.Millisecond)
 	}
 	stderrTail := ""
+	deliveryError := ""
 	if payload.FailureDiagnostics != nil {
 		stderrTail = payload.FailureDiagnostics.StderrTail
+		deliveryError = payload.FailureDiagnostics.DeliveryError
 	}
 	detailBytes, _ := json.Marshal(struct {
-		Deadline   string `json:"deadline"`
-		Elapsed    string `json:"elapsed"`
-		StderrTail string `json:"stderr_tail,omitempty"`
+		Deadline      string `json:"deadline"`
+		Elapsed       string `json:"elapsed"`
+		StderrTail    string `json:"stderr_tail,omitempty"`
+		DeliveryError string `json:"delivery_error,omitempty"`
 	}{
-		Deadline:   deadline.Format(time.RFC3339Nano),
-		Elapsed:    elapsed.String(),
-		StderrTail: stderrTail,
+		Deadline:      deadline.Format(time.RFC3339Nano),
+		Elapsed:       elapsed.String(),
+		StderrTail:    stderrTail,
+		DeliveryError: deliveryError,
 	})
 	reason := fmt.Sprintf("job %s exceeded its run deadline: %v", job.ID, cause)
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
@@ -369,6 +373,100 @@ type jobLifecycle struct {
 
 func observedJobLifecycle(job db.Job) jobLifecycle {
 	return jobLifecycle{state: job.State, generation: job.LifecycleGeneration}
+}
+
+// recordDeliveryFailureDiagnostics carries the engine's terminal delivery error
+// onto the job row's failure diagnostics (#1620), so `job show` shows the same
+// line the daemon writes to its journal as "job <id> failed: <err>" instead of
+// leaving the runtime's real error ("400 invalid_request_error: ... requires a
+// newer version of Codex", a compaction-endpoint 404) journal-only. It is purely
+// additive: the terminal state, its events, and the journal line are all
+// unchanged, and an existing StderrTail/phase/exit_code is preserved.
+//
+// Best-effort by design, exactly like Mailbox.storeFailureDiagnostics — the row
+// is already terminally settled by the time this runs, so a load or persist
+// failure must never change the failure path.
+//
+// atGeneration is the lifecycle the run OWNED. A retry claimed between the run
+// error and this write bumps the generation and clears diagnostics for its own
+// run, so writing then would stamp a live run's payload with a dead run's error;
+// the guard drops the write instead. It mirrors handleRunJobError's superseded
+// check, and for the same reason.
+//
+// The generation is checked TWICE, and the second check is the load-bearing one.
+// The read below only establishes what to write; a retry can still claim the row
+// between that read and the write, and an observer that then wrote
+// unconditionally would clobber the live generation's payload — a diagnostic
+// given authority over the lifecycle it observes, which is the exact inversion the
+// generation anchor exists to prevent. The write is therefore
+// UpdateJobPayloadAtGeneration, whose compare-and-swap makes losing that race a
+// no-op instead of an overwrite. The early check is kept anyway: it is free and
+// skips the read-modify-write entirely in the common superseded case.
+func (w jobWorker) recordDeliveryFailureDiagnostics(ctx context.Context, jobID string, atGeneration int64, cause error) {
+	if cause == nil || strings.TrimSpace(cause.Error()) == "" {
+		return
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	latest, err := w.Store.GetJob(writeCtx, jobID)
+	if err != nil {
+		w.reportDeliveryDiagnosticsLoss(jobID, cause, err)
+		return
+	}
+	if latest.LifecycleGeneration != atGeneration {
+		return
+	}
+	// ParseJobPayload, not daemonJobPayload: this is a read-MODIFY-write, and the
+	// legacy-tolerant decoder is what keeps a payload still carrying the legacy
+	// preset_* keys from losing them on the way back out.
+	payload, err := workflow.ParseJobPayload(latest.Payload)
+	if err != nil {
+		w.reportDeliveryDiagnosticsLoss(jobID, cause, err)
+		return
+	}
+	updated := workflow.WithDeliveryError(payload.FailureDiagnostics, cause.Error())
+	if updated == nil {
+		return
+	}
+	payload.FailureDiagnostics = updated
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		w.reportDeliveryDiagnosticsLoss(jobID, cause, err)
+		return
+	}
+	if w.beforeDeliveryDiagnosticsWrite != nil {
+		w.beforeDeliveryDiagnosticsWrite()
+	}
+	// A LOST CAS is the superseded case arriving at the write instead of at the
+	// check, so it stays exactly as quiet — the discarded bool is the whole point,
+	// not an oversight. Only a genuine persistence FAULT is reported.
+	if _, err := w.Store.UpdateJobPayloadAtGeneration(writeCtx, jobID, string(encoded), atGeneration); err != nil {
+		w.reportDeliveryDiagnosticsLoss(jobID, cause, err)
+	}
+}
+
+// reportDeliveryDiagnosticsLoss says on the daemon journal that the delivery
+// error never reached the job row.
+//
+// The distinction it draws is the whole reason it exists. A SUPERSEDED generation
+// is an expected drop — the write was supposed to be discarded — and stays silent;
+// saying so on every retry would be noise that trains operators to ignore the
+// line. A FAULT (the row would not load, its payload would not parse or re-encode,
+// the write itself failed) is not expected: the row then carries no delivery_error
+// and nothing anywhere says why, which re-creates one level up the exact
+// journal-versus-row blindness #1620 exists to end.
+//
+// Both the fault and the delivery error are redacted through the same
+// RedactCommentText path the stored field uses, because either can quote a
+// provider URL, a request id, or a token, and this text is written to the journal.
+// It remains best-effort: reporting is all it does, and the job's outcome is
+// unchanged.
+func (w jobWorker) reportDeliveryDiagnosticsLoss(jobID string, cause error, fault error) {
+	if w.Stdout == nil {
+		return
+	}
+	writeLine(w.Stdout, "job %s delivery-error diagnostics not recorded: %s", jobID,
+		workflow.RedactCommentText(fmt.Sprintf("%v (delivery error: %v)", fault, cause)))
 }
 
 // matches reports whether the row read back is still the run this lifecycle identified.

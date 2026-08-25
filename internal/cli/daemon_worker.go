@@ -67,7 +67,13 @@ type jobWorker struct {
 	// ReclaimJobLookup is a test seam for candidate-local GetJob failures. The
 	// production path is always Store.GetJob.
 	ReclaimJobLookup func(context.Context, string) (db.Job, error)
-	CommenterFactory func(string) github.Client
+	// beforeDeliveryDiagnosticsWrite fires inside recordDeliveryFailureDiagnostics
+	// between the lifecycle read and the generation-conditioned payload write —
+	// i.e. inside the window the compare-and-swap exists to close. It is the only
+	// way to drive that window deterministically, since the two operations are
+	// otherwise adjacent. Production leaves it nil.
+	beforeDeliveryDiagnosticsWrite func()
+	CommenterFactory               func(string) github.Client
 	// UsePool selects the opt-in continuous worker-pool scheduler (#394,
 	// --scheduler=pool) over the default per-tick wg.Wait() barrier.
 	UsePool bool
@@ -858,6 +864,12 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			}
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, commentErr)
+		// Record the SAME err the journal line below prints, so the job row can
+		// distinguish faults the row otherwise collapses into one exit_code: 1
+		// (#1620). commentErr is deliberately not used here: it can be swapped for
+		// the permission-blocked operator message, and this field means "what the
+		// engine actually failed with".
+		w.recordDeliveryFailureDiagnostics(ctx, job.ID, job.LifecycleGeneration, err)
 		writeLine(w.Stdout, "job %s failed: %v", job.ID, err)
 		return nil
 	}
@@ -2122,6 +2134,10 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 			return reconcileErr
 		}
 		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
+		// Same record as the ordinary path (#1620) — a delegated run's runtime
+		// error was journal-only too, and the temp-worker row is exactly where an
+		// operator looks first.
+		w.recordDeliveryFailureDiagnostics(ctx, delegatedJob.ID, delegatedJob.LifecycleGeneration, err)
 		writeLine(w.Stdout, "job %s failed: %v", delegatedJob.ID, err)
 		return nil
 	}
