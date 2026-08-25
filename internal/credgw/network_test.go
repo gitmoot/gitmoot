@@ -490,6 +490,34 @@ func TestNetworkProxyLegacyEntryCannotReachProxyRoute(t *testing.T) {
 	}
 }
 
+func TestNetworkProxyTerminalRouteDoesNotDispatchLegacyEntry(t *testing.T) {
+	fixture := newNetworkProxyFixture(t)
+	lease := fixture.register("network-job", fixture.clock.Now().Add(30*time.Minute))
+	legacyPlaceholder, err := fixture.gateway.Register("legacy-job", Credential{Kind: CredentialBearer, Value: testRealCredential}, testPolicy(t, fixture.upstream.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPost, fixture.network.URL()+"/v1/messages", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+legacyPlaceholder)
+	response, err := fixture.client(lease.ClientCertificate()).Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if got := fixture.upstreamCalls.Load(); got != 0 {
+		t.Fatalf("terminal network route reached legacy upstream: calls = %d, want 0", got)
+	}
+	if got := fixture.resolverCalls.Load(); got != 0 {
+		t.Fatalf("network resolver calls for terminal route = %d, want 0", got)
+	}
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("terminal network route status = %d, want 404", response.StatusCode)
+	}
+}
+
 func newTestCertificateAuthority(t *testing.T, now time.Time, name string) (*x509.Certificate, crypto.Signer) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
