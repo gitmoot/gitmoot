@@ -1,9 +1,7 @@
 package execbackend
 
 import (
-	"crypto/tls"
 	"errors"
-	"net/url"
 	"reflect"
 	"testing"
 
@@ -11,21 +9,25 @@ import (
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
-// This unkeyed compile-time assertion pins the plan to exactly these three
-// broker-material fields. Adding a raw-key field makes this package fail to
-// compile instead of silently widening the remote credential surface.
-var _ = RemoteCredentialPlan{url.URL{}, BrokerCapability("capability"), tls.Certificate{}}
 var _ func(string, *credgw.NetworkLease) (RemoteCredentialPlan, error) = NewRemoteCredentialPlan
 
 func TestRemoteCredentialPlanCarriesOnlyBrokerMaterial(t *testing.T) {
 	typeOfPlan := reflect.TypeFor[RemoteCredentialPlan]()
 	want := []string{"endpoint", "capability", "clientCertificate"}
+	const owner = "github.com/gitmoot/gitmoot/internal/execbackend/credentialplan"
+	if got := typeOfPlan.PkgPath(); got != owner {
+		t.Fatalf("RemoteCredentialPlan owner = %q, want isolated package %q", got, owner)
+	}
 	if typeOfPlan.NumField() != len(want) {
 		t.Fatalf("RemoteCredentialPlan fields = %d, want exactly %d broker fields", typeOfPlan.NumField(), len(want))
 	}
 	for i, name := range want {
-		if got := typeOfPlan.Field(i).Name; got != name {
+		field := typeOfPlan.Field(i)
+		if got := field.Name; got != name {
 			t.Fatalf("RemoteCredentialPlan field %d = %q, want %q", i, got, name)
+		}
+		if field.PkgPath != owner {
+			t.Fatalf("RemoteCredentialPlan field %q is exported or owned by %q, want private owner %q", name, field.PkgPath, owner)
 		}
 	}
 }
