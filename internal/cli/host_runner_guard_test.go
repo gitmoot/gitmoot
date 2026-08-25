@@ -256,15 +256,13 @@ func TestJobPathsDoNotHardcodeHostRunners(t *testing.T) {
 // exec.Command and exec.CommandContext calls, explicitly typed exec.Cmd{} and
 // &exec.Cmd{} literals, explicitly typed subprocess.ExecRunner{} literals, and
 // new(subprocess.ExecRunner) allocations are detected.
-// The scanner does not type-check, so it cannot follow function or type aliases,
-// helper-returned runners, values stored in fields or interfaces, or commands
-// constructed in another package and passed in. It also misses zero-value
-// declarations and other allocation forms (for example, elided element-type
-// composite literals, var cmd exec.Cmd, var runner subprocess.ExecRunner, and
-// new(exec.Cmd)), process-launch APIs other than the fixed forms above (for
-// example, os.StartProcess or syscall.ForkExec), reflection, generated files,
-// test files, files outside the three directories below, and os/exec or
-// subprocess imports reached through aliases or dot imports.
+// The scanner does not type-check. It recognises exactly the listed syntactic
+// forms. Any other syntax that yields these types is invisible to it—for example
+// elided-element-type literals, zero-value declarations, new() allocations, and
+// type conversions. Process-launch APIs other than the fixed forms above (for
+// example, os.StartProcess or syscall.ForkExec) are also invisible to it.
+// Generated files, test files, and files outside the three directories below are
+// excluded from the scan.
 // Production files in all three directories are scanned by default, so a new
 // internal/cli file is guarded unless each detected file:function site earns an
 // explicit allowance with a reason.

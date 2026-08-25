@@ -44,8 +44,18 @@ Job-execution code in `internal/cli`, `internal/workflow`, and
 host `subprocess.ExecRunner`, constructing an `exec.Cmd`, or calling
 `exec.Command` or `exec.CommandContext` directly. Deliberate host-side exceptions
 require a reasoned `file:function` entry in
-`internal/cli/host_runner_guard_test.go`; that test also documents the syntactic
-guard's blind spots.
+`internal/cli/host_runner_guard_test.go`.
+
+The guard detects direct `exec.Command` and `exec.CommandContext` calls,
+explicitly typed `exec.Cmd{}` and `&exec.Cmd{}` literals, explicitly typed
+`subprocess.ExecRunner{}` literals, and `new(subprocess.ExecRunner)` allocations.
+The scanner does not type-check. It recognises exactly the listed syntactic
+forms. Any other syntax that yields these types is invisible to it—for example
+elided-element-type literals, zero-value declarations, `new()` allocations, and
+type conversions. Process-launch APIs other than the fixed forms above (for
+example, `os.StartProcess` or `syscall.ForkExec`) are also invisible to it.
+Generated files, test files, and files outside `internal/cli`,
+`internal/workflow`, and `internal/daemon` are excluded from the scan.
 
 For docs:
 
