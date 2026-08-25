@@ -8,6 +8,14 @@ import (
 
 var _ func(*Store, context.Context, string, string, int64, string, string, JobEvent, ...JobEvent) (bool, error) = (*Store).TransitionJobStatePayloadWithEventAtGeneration
 
+// The two payload writers must keep DIFFERENT shapes: one anchored, one not. Pinning both
+// signatures makes "collapse them into one function" a COMPILE failure rather than a silent
+// behaviour change, which is the failure mode TestUpdateJobPayloadStaysUnconditional guards
+// at runtime.
+var _ func(*Store, context.Context, string, string) error = (*Store).UpdateJobPayload
+
+var _ func(*Store, context.Context, string, string, int64) (bool, error) = (*Store).UpdateJobPayloadAtGeneration
+
 func openLifecycleGenerationStore(t *testing.T) *Store {
 	t.Helper()
 	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
@@ -225,5 +233,148 @@ func TestTransitionJobStatePayloadWithEventAtGenerationAnchorsPayload(t *testing
 	}
 	if afterLive.State != "blocked" || afterLive.Payload != livePayload {
 		t.Fatalf("live settlement = state %q payload %q, want blocked and replacement payload", afterLive.State, afterLive.Payload)
+	}
+}
+
+// armStaleLifecycleGeneration drives a freshly created queued job through one full retry so it
+// lands at state "failed" with lifecycle_generation 1. That is the ABA shape the anchor exists
+// for: a writer holding generation 0 reads back exactly the state string it expects, and the
+// counter is the only thing that says it is stale.
+func armStaleLifecycleGeneration(t *testing.T, store *Store, id string) {
+	t.Helper()
+	ctx := context.Background()
+	for _, step := range [][2]string{
+		{"queued", "running"}, {"running", "failed"}, {"failed", "queued"},
+		{"queued", "running"}, {"running", "failed"},
+	} {
+		if _, err := store.TransitionJobState(ctx, id, step[0], step[1]); err != nil {
+			t.Fatalf("TransitionJobState(%s->%s) returned error: %v", step[0], step[1], err)
+		}
+	}
+	job, err := store.GetJob(ctx, id)
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != "failed" || job.LifecycleGeneration != 1 {
+		t.Fatalf("fixture = state %q generation %d, want failed/1 -- the stale-generation setup did not arm", job.State, job.LifecycleGeneration)
+	}
+}
+
+// TestUpdateJobPayloadAtGenerationRefusesStaleGeneration pins the payload-only CAS (#1620) at
+// the layer that implements it.
+//
+// The discriminating case is a write whose anchor has gone stale while the row's STATE is
+// unchanged: state-based guards cannot see it, so it is the only case that separates this
+// function from UpdateJobPayload. Losing must be a SILENT NO-OP -- (false, nil), not an error --
+// because the payload describes a superseded run and writing nothing is the correct outcome;
+// returning an error would push callers into a retry that can only make the overwrite happen.
+// The live payload is compared byte-for-byte rather than by decision field, so a partial write
+// that lands the diagnostics but not the rest cannot pass.
+func TestUpdateJobPayloadAtGenerationRefusesStaleGeneration(t *testing.T) {
+	ctx := context.Background()
+	store := openLifecycleGenerationStore(t)
+
+	runTwoPayload := `{"result":{"decision":"implemented","summary":"run two"}}`
+	if err := store.CreateJob(ctx, Job{ID: "payload-gen", Agent: "lead", Type: "implement", State: "queued", Payload: runTwoPayload}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	armStaleLifecycleGeneration(t, store, "payload-gen")
+
+	// The stale writer observed generation 0 -- the run that has already been retried away.
+	runOnePayload := `{"result":{"decision":"blocked","summary":"run one delivery diagnostics"}}`
+	written, err := store.UpdateJobPayloadAtGeneration(ctx, "payload-gen", runOnePayload, 0)
+	if err != nil {
+		t.Fatalf("UpdateJobPayloadAtGeneration at a stale generation returned error %v; losing the CAS is a normal outcome and must not be reported as a failure", err)
+	}
+	if written {
+		t.Fatal("a payload write anchored to generation 0 won against generation 1: the generation is not being applied in the WHERE clause, so run one's payload overwrites run two's (the #1620 race)")
+	}
+
+	afterStale, err := store.GetJob(ctx, "payload-gen")
+	if err != nil {
+		t.Fatalf("GetJob after the refused write returned error: %v", err)
+	}
+	if afterStale.Payload != runTwoPayload {
+		t.Fatalf("payload after the refused write = %q, want %q byte-identical: a lost CAS must leave the row untouched", afterStale.Payload, runTwoPayload)
+	}
+	if afterStale.State != "failed" || afterStale.LifecycleGeneration != 1 {
+		t.Fatalf("row after the refused write = state %q generation %d, want failed/1 unchanged", afterStale.State, afterStale.LifecycleGeneration)
+	}
+
+	// Control: the SAME call at the CURRENT generation lands. Without it a mutant that returns
+	// (false, nil) unconditionally -- or one that never writes at all -- passes everything above.
+	runTwoDiagnostics := `{"result":{"decision":"implemented","summary":"run two delivery diagnostics"}}`
+	written, err = store.UpdateJobPayloadAtGeneration(ctx, "payload-gen", runTwoDiagnostics, 1)
+	if err != nil {
+		t.Fatalf("UpdateJobPayloadAtGeneration at the current generation returned error: %v", err)
+	}
+	if !written {
+		t.Fatal("a payload write anchored to the CURRENT generation lost the CAS; the anchor is rejecting live callers too")
+	}
+	afterLive, err := store.GetJob(ctx, "payload-gen")
+	if err != nil {
+		t.Fatalf("GetJob after the accepted write returned error: %v", err)
+	}
+	if afterLive.Payload != runTwoDiagnostics {
+		t.Fatalf("payload after the accepted write = %q, want %q", afterLive.Payload, runTwoDiagnostics)
+	}
+	// A payload write is not a lifecycle event. If it advanced the counter (or the state), every
+	// anchor held by a concurrent settler would be invalidated by a plain result write, which is
+	// a second way to lose the same data the CAS is here to protect.
+	if afterLive.State != "failed" || afterLive.LifecycleGeneration != 1 {
+		t.Fatalf("row after the accepted write = state %q generation %d, want failed/1: a payload write must advance neither", afterLive.State, afterLive.LifecycleGeneration)
+	}
+}
+
+// TestUpdateJobPayloadStaysUnconditional pins that the UNTOUCHED UpdateJobPayload still writes
+// at any generation.
+//
+// #1620 anchored one caller and deliberately left this function alone: its callers write
+// payloads that were never anchored to an observed run, so they hold no generation to pass. The
+// regression this guards is a later refactor collapsing the two -- routing the generation-less
+// callers through the CAS behind some default anchor. That failure is SILENT by construction:
+// the CAS reports a loss as (false, nil), so every such write would be dropped with no error
+// raised anywhere, and only a job that had been retried at least once would lose its payload.
+func TestUpdateJobPayloadStaysUnconditional(t *testing.T) {
+	ctx := context.Background()
+	store := openLifecycleGenerationStore(t)
+	if err := store.CreateJob(ctx, Job{ID: "payload-plain", Agent: "lead", Type: "implement", State: "queued", Payload: `{"result":{"decision":"implemented"}}`}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+
+	// Generation 0 first: the value a mistakenly-anchored refactor would most plausibly default
+	// to, and therefore the one arm that would keep passing after such a change.
+	atZero := `{"result":{"decision":"implemented","summary":"written at generation 0"}}`
+	if err := store.UpdateJobPayload(ctx, "payload-plain", atZero); err != nil {
+		t.Fatalf("UpdateJobPayload at generation 0 returned error: %v", err)
+	}
+	beforeRetry, err := store.GetJob(ctx, "payload-plain")
+	if err != nil {
+		t.Fatalf("GetJob before the retry returned error: %v", err)
+	}
+	if beforeRetry.Payload != atZero {
+		t.Fatalf("payload at generation 0 = %q, want %q", beforeRetry.Payload, atZero)
+	}
+	if beforeRetry.LifecycleGeneration != 0 {
+		t.Fatalf("generation after an unconditional payload write = %d, want 0: a payload write is not a lifecycle event", beforeRetry.LifecycleGeneration)
+	}
+
+	armStaleLifecycleGeneration(t, store, "payload-plain")
+
+	// Generation 1: the arm that actually discriminates. An anchored variant defaulting to 0
+	// silently drops this write and reports nothing.
+	atOne := `{"result":{"decision":"blocked","summary":"written at generation 1"}}`
+	if err := store.UpdateJobPayload(ctx, "payload-plain", atOne); err != nil {
+		t.Fatalf("UpdateJobPayload at generation 1 returned error: %v", err)
+	}
+	afterRetry, err := store.GetJob(ctx, "payload-plain")
+	if err != nil {
+		t.Fatalf("GetJob after the retry returned error: %v", err)
+	}
+	if afterRetry.Payload != atOne {
+		t.Fatalf("payload after an unconditional write at generation 1 = %q, want %q: UpdateJobPayload has acquired a generation predicate its callers cannot satisfy", afterRetry.Payload, atOne)
+	}
+	if afterRetry.State != "failed" || afterRetry.LifecycleGeneration != 1 {
+		t.Fatalf("row after an unconditional write = state %q generation %d, want failed/1: a payload write must advance neither", afterRetry.State, afterRetry.LifecycleGeneration)
 	}
 }
