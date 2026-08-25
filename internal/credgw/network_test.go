@@ -58,19 +58,27 @@ type networkProxyFixture struct {
 }
 
 func newNetworkProxyFixture(t *testing.T) *networkProxyFixture {
+	return newNetworkProxyFixtureForAddress(t, "127.0.0.1:0", "127.0.0.1")
+}
+
+func newNetworkProxyFixtureForAddress(t *testing.T, address, advertisedAuthority string) *networkProxyFixture {
 	t.Helper()
 	now := time.Date(2026, time.August, 25, 12, 0, 0, 0, time.UTC)
 	clock := &controlledClock{now: now}
 	serverCA, serverCAKey := newTestCertificateAuthority(t, now, "server-ca")
 	clientCA, clientCAKey := newTestCertificateAuthority(t, now, "client-ca")
-	serverCertificate := newTestServerCertificate(t, now, serverCA, serverCAKey)
+	certificateHost := advertisedAuthority
+	if host, _, err := net.SplitHostPort(advertisedAuthority); err == nil {
+		certificateHost = host
+	}
+	serverCertificate := newTestServerCertificate(t, now, serverCA, serverCAKey, certificateHost)
 	gateway, err := Start(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	gateway.now = clock.Now
 	network, err := gateway.StartNetworkProxy(NetworkProxyConfig{
-		Address: "127.0.0.1:0", ServerCertificate: serverCertificate,
+		Address: address, AdvertisedAuthority: advertisedAuthority, ServerCertificate: serverCertificate,
 		ClientCA: clientCA, ClientCAKey: clientCAKey,
 	})
 	if err != nil {
@@ -112,18 +120,28 @@ func (f *networkProxyFixture) register(jobID string, deadline time.Time) *Networ
 }
 
 func (f *networkProxyFixture) client(certificate tls.Certificate) *http.Client {
+	return f.clientForAddress(certificate, "", "")
+}
+
+func (f *networkProxyFixture) clientForAddress(certificate tls.Certificate, serverName, dialAddress string) *http.Client {
 	f.t.Helper()
 	roots := x509.NewCertPool()
 	roots.AddCert(f.serverCA)
-	config := &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS13, Time: f.clock.Now}
+	config := &tls.Config{RootCAs: roots, ServerName: serverName, MinVersion: tls.VersionTLS13, Time: f.clock.Now}
 	if len(certificate.Certificate) != 0 {
 		config.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 			return &certificate, nil
 		}
 	}
-	return &http.Client{Transport: &http.Transport{
+	transport := &http.Transport{
 		TLSClientConfig: config, DisableKeepAlives: true,
-	}}
+	}
+	if dialAddress != "" {
+		transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, dialAddress)
+		}
+	}
+	return &http.Client{Transport: transport}
 }
 
 func (f *networkProxyFixture) request(client *http.Client, lease *NetworkLease, capability string) (*http.Response, error) {
@@ -141,6 +159,8 @@ func (f *networkProxyFixture) request(client *http.Client, lease *NetworkLease, 
 
 func TestNetworkProxyRefusesToStartWithoutTLSMaterial(t *testing.T) {
 	now := time.Date(2026, time.August, 25, 12, 0, 0, 0, time.UTC)
+	serverCA, serverCAKey := newTestCertificateAuthority(t, now, "server-ca")
+	serverCertificate := newTestServerCertificate(t, now, serverCA, serverCAKey, "127.0.0.1")
 	clientCA, clientCAKey := newTestCertificateAuthority(t, now, "client-ca")
 	gateway, err := Start(nil)
 	if err != nil {
@@ -148,10 +168,206 @@ func TestNetworkProxyRefusesToStartWithoutTLSMaterial(t *testing.T) {
 	}
 	defer gateway.Close(context.Background())
 	_, err = gateway.StartNetworkProxy(NetworkProxyConfig{
-		Address: "127.0.0.1:0", ClientCA: clientCA, ClientCAKey: clientCAKey,
+		Address: "127.0.0.1:0", AdvertisedAuthority: "127.0.0.1",
+		ClientCA: clientCA, ClientCAKey: clientCAKey,
 	})
 	if err == nil || !strings.Contains(err.Error(), "server TLS certificate is required") {
 		t.Fatalf("StartNetworkProxy error = %v", err)
+	}
+	_, err = gateway.StartNetworkProxy(NetworkProxyConfig{
+		Address: "127.0.0.1:0", ServerCertificate: serverCertificate,
+		ClientCA: clientCA, ClientCAKey: clientCAKey,
+	})
+	if err == nil || !strings.Contains(err.Error(), "advertised authority is required") {
+		t.Fatalf("StartNetworkProxy without advertised authority error = %v", err)
+	}
+}
+
+func TestNetworkProxyWildcardBindUsesAdvertisedAuthority(t *testing.T) {
+	fixture := newNetworkProxyFixtureForAddress(t, "0.0.0.0:0", "gateway.internal")
+	_, port, err := net.SplitHostPort(fixture.network.listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialAddress := net.JoinHostPort("127.0.0.1", port)
+	lease := fixture.register("wildcard-job", fixture.clock.Now().Add(30*time.Minute))
+	client := fixture.clientForAddress(lease.ClientCertificate(), "gateway.internal", dialAddress)
+
+	response, err := fixture.request(client, lease, lease.Capability())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("wildcard-bind proxy status = %d, want 200", response.StatusCode)
+	}
+	if got := fixture.resolverCalls.Load(); got != 1 {
+		t.Fatalf("wildcard-bind resolver calls = %d, want 1", got)
+	}
+	if err := lease.Renew(context.Background(), client); err != nil {
+		t.Fatalf("wildcard-bind renewal: %v", err)
+	}
+
+	request, err := http.NewRequest(http.MethodPost, lease.URL()+"/v1/messages", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Host = net.JoinHostPort("wrong.internal", port)
+	request.Header.Set("Authorization", "Bearer "+lease.Placeholder())
+	request.Header.Set(CapabilityHeader, lease.Capability())
+	response, err = client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("mismatched advertised authority status = %d, want 400", response.StatusCode)
+	}
+	if got := fixture.resolverCalls.Load(); got != 1 {
+		t.Fatalf("resolver calls after mismatched authority = %d, want 1", got)
+	}
+}
+
+func TestNetworkProxyHTTPSDefaultPortAuthorityForms(t *testing.T) {
+	fixture := newNetworkProxyFixtureForAddress(t, "127.0.0.1:0", "gateway.internal:443")
+	_, port, err := net.SplitHostPort(fixture.network.listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := fixture.register("default-port-job", fixture.clock.Now().Add(30*time.Minute))
+	client := fixture.clientForAddress(lease.ClientCertificate(), "gateway.internal", net.JoinHostPort("127.0.0.1", port))
+
+	request := func(host string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, lease.URL()+"/v1/messages", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = host
+		req.Header.Set("Authorization", "Bearer "+lease.Placeholder())
+		req.Header.Set(CapabilityHeader, lease.Capability())
+		response, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		return response
+	}
+
+	if response := request("gateway.internal"); response.StatusCode != http.StatusOK {
+		t.Fatalf("portless default authority status = %d, want 200", response.StatusCode)
+	}
+	if err := lease.Renew(context.Background(), client); err != nil {
+		t.Fatalf("portless default authority renewal: %v", err)
+	}
+	if response := request("gateway.internal:443"); response.StatusCode != http.StatusOK {
+		t.Fatalf("explicit default authority status = %d, want 200", response.StatusCode)
+	}
+	renewRequest, err := http.NewRequest(http.MethodPost, fixture.network.URL()+networkRenewPrefix+strings.TrimPrefix(lease.lease.route, "/_gitmoot/proxy/"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	renewRequest.Host = "gateway.internal:443"
+	renewRequest.Header.Set(CapabilityHeader, lease.Capability())
+	renewResponse, err := client.Do(renewRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	renewResponse.Body.Close()
+	if renewResponse.StatusCode != http.StatusOK {
+		t.Fatalf("explicit default authority renewal status = %d, want 200", renewResponse.StatusCode)
+	}
+	if got := fixture.resolverCalls.Load(); got != 2 {
+		t.Fatalf("default authority resolver calls = %d, want 2", got)
+	}
+	if got := fixture.upstreamCalls.Load(); got != 2 {
+		t.Fatalf("default authority upstream calls = %d, want 2", got)
+	}
+	fixture.upstreamMu.Lock()
+	defer fixture.upstreamMu.Unlock()
+	if fixture.upstreamAuthorization != "Bearer "+testRealCredential || fixture.upstreamCapability != "" {
+		t.Fatalf("upstream authorization=%q capability=%q", fixture.upstreamAuthorization, fixture.upstreamCapability)
+	}
+}
+
+func TestNetworkProxyHTTPSNonDefaultPortRequiresExplicitPort(t *testing.T) {
+	fixture := newNetworkProxyFixtureForAddress(t, "127.0.0.1:0", "gateway.internal:8443")
+	_, port, err := net.SplitHostPort(fixture.network.listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := fixture.register("non-default-port-job", fixture.clock.Now().Add(30*time.Minute))
+	client := fixture.clientForAddress(lease.ClientCertificate(), "gateway.internal", net.JoinHostPort("127.0.0.1", port))
+
+	request := func(host string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, lease.URL()+"/v1/messages", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = host
+		req.Header.Set("Authorization", "Bearer "+lease.Placeholder())
+		req.Header.Set(CapabilityHeader, lease.Capability())
+		response, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		return response
+	}
+
+	response := request("gateway.internal")
+	if got := fixture.resolverCalls.Load(); got != 0 {
+		t.Fatalf("resolver calls for omitted non-default port = %d, want 0", got)
+	}
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("omitted non-default port status = %d, want 400", response.StatusCode)
+	}
+	if response = request("gateway.internal:8443"); response.StatusCode != http.StatusOK {
+		t.Fatalf("explicit non-default authority status = %d, want 200", response.StatusCode)
+	}
+}
+
+func TestNetworkProxyHTTPSAuthorityRejectsMismatches(t *testing.T) {
+	tests := []struct {
+		name         string
+		host         string
+		absoluteForm bool
+	}{
+		{name: "different host", host: "other.internal"},
+		{name: "different non-default port", host: "gateway.internal:8443"},
+		{name: "userinfo", host: "user@gateway.internal"},
+		{name: "path", host: "gateway.internal/path"},
+		{name: "query", host: "gateway.internal?query"},
+		{name: "fragment", host: "gateway.internal#fragment"},
+		{name: "absolute-form request URI", host: "gateway.internal", absoluteForm: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newNetworkProxyFixtureForAddress(t, "127.0.0.1:0", "gateway.internal:443")
+			lease := fixture.register("mismatch-job", fixture.clock.Now().Add(30*time.Minute))
+			request := httptest.NewRequest(http.MethodPost, lease.lease.route+"/v1/messages", nil)
+			request.Host = test.host
+			request.Header.Set("Authorization", "Bearer "+lease.Placeholder())
+			request.Header.Set(CapabilityHeader, lease.Capability())
+			request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{lease.ClientCertificate().Leaf}}
+			if test.absoluteForm {
+				request.URL.Scheme = "https"
+				request.URL.Host = "gateway.internal"
+				request.RequestURI = request.URL.String()
+			}
+			recorder := httptest.NewRecorder()
+			fixture.network.ServeHTTP(recorder, request)
+			if got := fixture.resolverCalls.Load(); got != 0 {
+				t.Fatalf("resolver calls = %d, want 0", got)
+			}
+			if got := fixture.upstreamCalls.Load(); got != 0 {
+				t.Fatalf("upstream calls = %d, want 0", got)
+			}
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", recorder.Code)
+			}
+		})
 	}
 }
 
@@ -361,7 +577,7 @@ func TestNetworkProxyCapabilityRenewalOverlapAndAbsoluteDeadline(t *testing.T) {
 	}
 }
 
-func TestNetworkProxyRevocationAndLegacyIsolation(t *testing.T) {
+func TestNetworkProxyRevocation(t *testing.T) {
 	fixture := newNetworkProxyFixture(t)
 	lease := fixture.register("revoked-job", fixture.clock.Now().Add(30*time.Minute))
 	client := fixture.client(lease.ClientCertificate())
@@ -387,6 +603,43 @@ func TestNetworkProxyRevocationAndLegacyIsolation(t *testing.T) {
 		t.Fatalf("resolver calls after revocation = %d, want %d", got, resolvedBeforeRevoke)
 	}
 
+	if got := fixture.upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream calls after revocation = %d, want 1", got)
+	}
+}
+
+func TestNetworkProxyLegacyEntryCannotReachProxyRoute(t *testing.T) {
+	fixture := newNetworkProxyFixture(t)
+	lease := fixture.register("network-job", fixture.clock.Now().Add(30*time.Minute))
+	legacyPlaceholder, err := fixture.gateway.Register("legacy-job", Credential{Kind: CredentialBearer, Value: testRealCredential}, testPolicy(t, fixture.upstream.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPost, lease.URL()+"/v1/messages", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+legacyPlaceholder)
+	request.Header.Set(CapabilityHeader, lease.Capability())
+	response, err := fixture.client(lease.ClientCertificate()).Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if got := fixture.resolverCalls.Load(); got != 0 {
+		t.Fatalf("network resolver calls for legacy entry = %d, want 0", got)
+	}
+	if got := fixture.upstreamCalls.Load(); got != 0 {
+		t.Fatalf("legacy entry reached upstream: calls = %d, want 0", got)
+	}
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("legacy entry on proxy route status = %d, want 401", response.StatusCode)
+	}
+}
+
+func TestNetworkProxyTerminalRouteDoesNotDispatchLegacyEntry(t *testing.T) {
+	fixture := newNetworkProxyFixture(t)
+	lease := fixture.register("network-job", fixture.clock.Now().Add(30*time.Minute))
 	legacyPlaceholder, err := fixture.gateway.Register("legacy-job", Credential{Kind: CredentialBearer, Value: testRealCredential}, testPolicy(t, fixture.upstream.URL))
 	if err != nil {
 		t.Fatal(err)
@@ -396,17 +649,19 @@ func TestNetworkProxyRevocationAndLegacyIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	request.Header.Set("Authorization", "Bearer "+legacyPlaceholder)
-	upstreamBeforeLegacyProbe := fixture.upstreamCalls.Load()
-	response, err = fixture.client(lease.ClientCertificate()).Do(request)
+	response, err := fixture.client(lease.ClientCertificate()).Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	if response.StatusCode != http.StatusNotFound {
-		t.Fatalf("legacy route network status = %d, want 404", response.StatusCode)
+	if got := fixture.upstreamCalls.Load(); got != 0 {
+		t.Fatalf("terminal network route reached legacy upstream: calls = %d, want 0", got)
 	}
-	if got := fixture.upstreamCalls.Load(); got != upstreamBeforeLegacyProbe {
-		t.Fatalf("legacy route reached upstream: calls = %d, want %d", got, upstreamBeforeLegacyProbe)
+	if got := fixture.resolverCalls.Load(); got != 0 {
+		t.Fatalf("network resolver calls for terminal route = %d, want 0", got)
+	}
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("terminal network route status = %d, want 404", response.StatusCode)
 	}
 }
 
@@ -434,7 +689,7 @@ func newTestCertificateAuthority(t *testing.T, now time.Time, name string) (*x50
 	return certificate, key
 }
 
-func newTestServerCertificate(t *testing.T, now time.Time, ca *x509.Certificate, caKey crypto.Signer) tls.Certificate {
+func newTestServerCertificate(t *testing.T, now time.Time, ca *x509.Certificate, caKey crypto.Signer, advertisedHost string) tls.Certificate {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -447,6 +702,9 @@ func newTestServerCertificate(t *testing.T, now time.Time, ca *x509.Certificate,
 		KeyUsage:    x509.KeyUsageDigitalSignature,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	if net.ParseIP(advertisedHost) == nil {
+		template.DNSNames = []string{advertisedHost}
 	}
 	der, err := x509.CreateCertificate(rand.Reader, template, ca, &key.PublicKey, caKey)
 	if err != nil {
