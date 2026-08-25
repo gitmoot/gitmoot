@@ -2167,10 +2167,9 @@ func runAgentShow(args []string, stdout, stderr io.Writer) int {
 	}
 	writeLine(stdout, "name: %s", output.Name)
 	writeLine(stdout, "runtime: %s", output.Runtime)
+	writeLine(stdout, "runtime_ref: %s", output.RuntimeRef)
 	if output.RuntimeRefPinned {
-		writeLine(stdout, "runtime_ref: pinned %s (last successful use: %s)", output.RuntimeRef, output.RuntimeRefLastSuccessfulUse)
-	} else {
-		writeLine(stdout, "runtime_ref: %s", output.RuntimeRef)
+		writeLine(stdout, "runtime_session: pinned (last successful use: %s)", output.RuntimeRefLastSuccessfulUse)
 	}
 	writeLine(stdout, "role: %s", output.Role)
 	writeLine(stdout, "capabilities: %s", strings.Join(output.Capabilities, ","))

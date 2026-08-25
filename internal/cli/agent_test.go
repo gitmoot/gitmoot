@@ -126,7 +126,8 @@ func TestRunAgentShow(t *testing.T) {
 	for _, want := range []string{
 		"name: audit",
 		"runtime: codex",
-		"runtime_ref: pinned 550e8400-e29b-41d4-a716-446655440001 (last successful use: never)",
+		"runtime_ref: 550e8400-e29b-41d4-a716-446655440001\n",
+		"runtime_session: pinned (last successful use: never)\n",
 		"role: reviewer",
 		"capabilities: review",
 		"policy: workspace-write",
@@ -147,7 +148,7 @@ func TestRunAgentShow(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &decoded); err != nil {
 		t.Fatalf("json output did not decode: %v\n%s", err, stdout.String())
 	}
-	if decoded.Name != "audit" || !decoded.RuntimeRefPinned || decoded.RuntimeRefLastSuccessfulUse != "never" || decoded.Policy != runtime.AutonomyPolicyWorkspaceWrite || strings.Join(decoded.AllowedRepos, ",") != "gitmoot/gitmoot" {
+	if decoded.Name != "audit" || decoded.RuntimeRef != "550e8400-e29b-41d4-a716-446655440001" || !decoded.RuntimeRefPinned || decoded.RuntimeRefLastSuccessfulUse != "never" || decoded.Policy != runtime.AutonomyPolicyWorkspaceWrite || strings.Join(decoded.AllowedRepos, ",") != "gitmoot/gitmoot" {
 		t.Fatalf("decoded = %+v", decoded)
 	}
 }
@@ -179,9 +180,13 @@ func TestRunAgentShowPinnedRuntimeRefLastSuccessfulUseFromEvent(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("agent show exit code = %d, stderr=%s", code, stderr.String())
 	}
-	want := "runtime_ref: pinned " + pin + " (last successful use: <1m ago)"
-	if !strings.Contains(stdout.String(), want) {
-		t.Fatalf("agent show output missing %q:\n%s", want, stdout.String())
+	for _, want := range []string{
+		"runtime_ref: " + pin + "\n",
+		"runtime_session: pinned (last successful use: <1m ago)\n",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("agent show output missing %q:\n%s", want, stdout.String())
+		}
 	}
 }
 
@@ -204,8 +209,8 @@ func TestRunAgentShowLastRuntimeRefHasNoStaleness(t *testing.T) {
 	if !strings.Contains(stdout.String(), "runtime_ref: last\n") {
 		t.Fatalf("agent show output does not render last as unpinned:\n%s", stdout.String())
 	}
-	if strings.Contains(stdout.String(), "last successful use") {
-		t.Fatalf("last runtime ref grew a staleness field:\n%s", stdout.String())
+	if strings.Contains(stdout.String(), "runtime_session:") {
+		t.Fatalf("last runtime ref grew a runtime session field:\n%s", stdout.String())
 	}
 }
 

@@ -803,13 +803,14 @@ gitmoot agent restart reviewer
 gitmoot agent remove reviewer
 ```
 
-`gitmoot agent show <name>` makes session pinning explicit. An unpinned agent
-prints `runtime_ref: last`; a concrete session prints
-`runtime_ref: pinned <id> (last successful use: <age>)`. The age comes from the
-newest succeeded job whose `effective_runtime` or `runtime_override` event
-resolved to that session, not from the agent's default runtime. A pin with no
-matching successful job prints `last successful use: never`. JSON keeps the raw
-`runtime_ref` and adds `runtime_ref_pinned` plus, only for a pin,
+`gitmoot agent show <name>` keeps the existing `runtime_ref: <id>` line unchanged
+and makes concrete session pinning explicit on a separate
+`runtime_session: pinned (last successful use: <age>)` line. The extra line is
+omitted for an unpinned `runtime_ref: last`. The age comes from the newest
+succeeded job whose `effective_runtime` or `runtime_override` event resolved to
+that session, not from the agent's default runtime. A pin with no matching
+successful job prints `last successful use: never`. JSON keeps the raw
+`runtime_ref` unchanged and adds `runtime_ref_pinned` plus, only for a pin,
 `runtime_ref_last_successful_use`.
 
 `gitmoot agent restart <name>` abandons the agent's runtime session and binds a
