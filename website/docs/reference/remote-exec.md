@@ -34,14 +34,20 @@ reclaiming the clone for Git's ownership check, and import creates host files as
 the daemon user. Credential-application errors fail the command and never retry
 as the daemon user.
 
-The configured identity must be able to traverse every parent of the local
-backend root. The default root is below the Gitmoot home, so a root daemon whose
-home is under `/root` should also set absolute `local_root` to a dedicated
-directory beneath a suitable operator-managed parent such as `/var/tmp`. A
-filesystem root is rejected. Gitmoot makes its backend root and
-per-instance roots execute-only for traversal while leaving lifecycle metadata
-owned by the daemon. With no uid/gid configured, local execution retains the
-daemon identity for backward compatibility.
+The configured identity must be able to traverse every operator-managed parent
+of the local backend root. The default root is below the Gitmoot home, so a root
+daemon whose home is under `/root` should also set absolute `local_root` to a
+dedicated directory beneath a suitable operator-managed parent such as
+`/var/tmp`. A filesystem root is rejected. Gitmoot keeps its backend root and
+per-instance roots owned by the daemon, assigns their group to `local_gid`, and
+uses mode `0710` so the configured command group can traverse them without an
+execute bit for the Unix `other` class. This is a group boundary: every process
+carrying `local_gid` can traverse, so use a dedicated group whose only member is
+the configured execution account when unrelated local users must be excluded.
+Gitmoot validates that the numeric UID/GID are paired and non-zero, but cannot
+portably prove group exclusivity across host account databases, NSS, or
+containers. With no uid/gid configured, local execution retains the daemon
+identity for backward compatibility.
 
 The runtime executable and any child-readable file-backed state must also be
 reachable by the configured identity. In particular, a root daemon whose
