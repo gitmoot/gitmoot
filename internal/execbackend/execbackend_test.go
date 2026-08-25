@@ -81,6 +81,31 @@ func TestAllowedNamesMatchesParse(t *testing.T) {
 	}
 }
 
+func TestBackendBrokeredCredentialRequirementIsClosed(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		backend Backend
+		want    bool
+	}{
+		{name: "local", backend: Local, want: false},
+		{name: "remote", backend: Remote, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := RequiresBrokeredCredentials(test.backend)
+			if err != nil || got != test.want {
+				t.Fatalf("RequiresBrokeredCredentials(%q) = %t, %v; want %t, nil", test.backend, got, err, test.want)
+			}
+		})
+	}
+
+	if got, err := RequiresBrokeredCredentials(Backend("future-backend")); err == nil || !got {
+		t.Fatalf("RequiresBrokeredCredentials(future-backend) = %t, %v; want true and an unclassified error", got, err)
+	}
+	if _, err := Parse(string(Remote)); err == nil {
+		t.Fatal("reserved remote backend became user-selectable before it has an implementation")
+	}
+}
+
 func TestAdvertisedBackendWithoutImplementationFailsLoud(t *testing.T) {
 	original := append([]string(nil), AllowedNames...)
 	defer func() { AllowedNames = original }()
