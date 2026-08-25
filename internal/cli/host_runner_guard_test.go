@@ -253,7 +253,7 @@ func TestJobPathsDoNotHardcodeHostRunners(t *testing.T) {
 }
 
 // collectHardcodedHostRunnerSites is intentionally a syntactic guard. Direct
-// exec.Command calls, exec.Cmd{} and &exec.Cmd{} composite literals,
+// exec.Command and exec.CommandContext calls, exec.Cmd{} and &exec.Cmd{} literals,
 // subprocess.ExecRunner composite literals, and new(subprocess.ExecRunner)
 // allocations are detected.
 // The scanner does not type-check, so it cannot follow function or type aliases,
