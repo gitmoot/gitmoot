@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -158,6 +159,160 @@ func TestGatewayAttachesAPIKeyWithoutForwardingPlaceholder(t *testing.T) {
 	}
 }
 
+func TestGenericProxyCapabilityRejectionsNeverResolveCredential(t *testing.T) {
+	tests := []struct {
+		name       string
+		requestURL func(*Gateway, *Lease, *Lease) string
+		expire     bool
+		second     bool
+	}{
+		{
+			name: "missing capability",
+			requestURL: func(gateway *Gateway, lease, _ *Lease) string {
+				return gateway.URL() + lease.route
+			},
+		},
+		{
+			name: "malformed capability",
+			requestURL: func(gateway *Gateway, lease, _ *Lease) string {
+				return gateway.URL() + lease.route + "/not-a-capability"
+			},
+		},
+		{
+			name:   "capability from another job route",
+			second: true,
+			requestURL: func(gateway *Gateway, lease, other *Lease) string {
+				return gateway.URL() + lease.route + "/" + other.capability
+			},
+		},
+		{
+			name:   "expired capability",
+			expire: true,
+			requestURL: func(_ *Gateway, lease, _ *Lease) string {
+				return lease.URL()
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var upstreamCalls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				upstreamCalls.Add(1)
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer upstream.Close()
+
+			gateway, err := Start(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer gateway.Close(context.Background())
+			policy := ProxyPolicy{Upstream: upstream.URL, AuthKind: ProxyAuthBearer, AllowLoopbackHTTP: true}
+			var resolverCalls atomic.Int32
+			lease, err := gateway.RegisterProxy("capability-job", policy, func(context.Context) (ResolvedCredential, error) {
+				resolverCalls.Add(1)
+				return ResolvedCredential{Value: testRealCredential, Upstream: policy.Upstream, AuthKind: policy.AuthKind}, nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var other *Lease
+			if test.second {
+				other, err = gateway.RegisterProxy("other-job", policy, func(context.Context) (ResolvedCredential, error) {
+					return ResolvedCredential{Value: "other-real-credential", Upstream: policy.Upstream, AuthKind: policy.AuthKind}, nil
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.expire {
+				gateway.mu.Lock()
+				entry := gateway.proxyEntries[lease.route]
+				entry.capabilityExpiresAt = time.Now().Add(-time.Second)
+				gateway.proxyEntries[lease.route] = entry
+				gateway.mu.Unlock()
+			}
+
+			request, err := http.NewRequest(http.MethodPost, test.requestURL(gateway, lease, other), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set("Authorization", "Bearer "+lease.Placeholder())
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response.Body.Close()
+			if response.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusUnauthorized)
+			}
+			if got := resolverCalls.Load(); got != 0 {
+				t.Fatalf("credential resolver calls = %d, want 0", got)
+			}
+			if got := upstreamCalls.Load(); got != 0 {
+				t.Fatalf("upstream calls = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestGenericProxyCapabilityHappyPathSubstitutesCredential(t *testing.T) {
+	var resolverCalls atomic.Int32
+	var upstreamCalls atomic.Int32
+	var mu sync.Mutex
+	var upstreamAuthorization, upstreamAPIKey, upstreamPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		mu.Lock()
+		upstreamAuthorization = r.Header.Get("Authorization")
+		upstreamAPIKey = r.Header.Get("X-Api-Key")
+		upstreamPath = r.URL.Path
+		mu.Unlock()
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer upstream.Close()
+
+	gateway, err := Start(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gateway.Close(context.Background())
+	policy := ProxyPolicy{Upstream: upstream.URL + "/api/v1", AuthKind: ProxyAuthBearer, AllowLoopbackHTTP: true}
+	lease, err := gateway.RegisterProxy("capability-happy", policy, func(context.Context) (ResolvedCredential, error) {
+		resolverCalls.Add(1)
+		return ResolvedCredential{Value: testRealCredential, Upstream: policy.Upstream, AuthKind: policy.AuthKind}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPost, lease.URL()+"/messages", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+lease.Placeholder())
+	request.Header.Set("X-Api-Key", lease.Placeholder())
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusCreated)
+	}
+	if got := resolverCalls.Load(); got != 1 {
+		t.Fatalf("credential resolver calls = %d, want 1", got)
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if upstreamAuthorization != "Bearer "+testRealCredential || upstreamAPIKey != "" || upstreamPath != "/api/v1/messages" {
+		t.Fatalf("upstream authorization=%q api_key=%q path=%q", upstreamAuthorization, upstreamAPIKey, upstreamPath)
+	}
+}
+
 func TestGenericProxyLeaseBearerRotationRevocationAndPathPinning(t *testing.T) {
 	const rotatedCredential = "rotated-real-credential-874"
 	var mu sync.Mutex
@@ -262,7 +417,7 @@ func TestGenericProxyLeaseBearerRotationRevocationAndPathPinning(t *testing.T) {
 	mu.Unlock()
 
 	logged := logs.waitFor(t, "job_id=proxy-job")
-	for _, forbidden := range []string{testRealCredential, rotatedCredential, lease.Placeholder(), testRequestBody, "Authorization", "X-Api-Key"} {
+	for _, forbidden := range []string{testRealCredential, rotatedCredential, lease.Placeholder(), lease.capability, testRequestBody, "Authorization", "X-Api-Key"} {
 		if strings.Contains(logged, forbidden) {
 			t.Fatalf("gateway log leaked %q: %q", forbidden, logged)
 		}
