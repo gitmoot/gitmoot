@@ -307,24 +307,29 @@ func compareResultChanges(claims, touchedFiles []string) *ResultObservation {
 }
 
 func claimFilePaths(claim string, touchedFiles []string) []string {
-	candidates := make([]string, 0)
-	for _, token := range strings.FieldsFunc(claim, claimTokenSeparator) {
-		token = strings.Trim(token, ".,;!?\"'`()[]{}<>")
-		token = resultClaimLineSuffix.ReplaceAllString(token, "")
-		token = strings.TrimSuffix(token, ":")
-		token = normalizeClaimPath(token)
-		if token != "" && looksLikeFilePath(token) {
-			candidates = append(candidates, token)
-		}
+	tokens := strings.FieldsFunc(claim, claimTokenSeparator)
+	if len(tokens) == 0 {
+		return []string{}
 	}
-	// Extensionless paths (for example Makefile) cannot be identified safely from
-	// arbitrary prose. Bind them only when the exact observed path or basename is
-	// explicitly present with token boundaries.
+
+	touchedFiles = sortedUniquePaths(touchedFiles)
+	touched := make(map[string]struct{}, len(touchedFiles))
+	byBase := make(map[string][]string, len(touchedFiles))
 	for _, file := range touchedFiles {
-		for _, candidate := range []string{file, path.Base(file)} {
-			if containsClaimToken(claim, candidate) {
-				candidates = append(candidates, candidate)
-			}
+		touched[file] = struct{}{}
+		byBase[path.Base(file)] = append(byBase[path.Base(file)], file)
+	}
+
+	leading, hasLineSuffix := normalizeClaimToken(tokens[0])
+	if leading != "" && (hasLineSuffix || claimPathMatchesTouched(leading, touched, byBase, true)) {
+		return []string{leading}
+	}
+
+	candidates := make([]string, 0)
+	for _, token := range tokens[1:] {
+		candidate, _ := normalizeClaimToken(token)
+		if candidate != "" && claimPathMatchesTouched(candidate, touched, byBase, false) {
+			candidates = append(candidates, candidate)
 		}
 	}
 	return sortedUniquePaths(candidates)
@@ -332,6 +337,21 @@ func claimFilePaths(claim string, touchedFiles []string) []string {
 
 func claimTokenSeparator(r rune) bool {
 	return unicode.IsSpace(r) || strings.ContainsRune("\"'`()[]{}<>,;", r)
+}
+
+func normalizeClaimToken(token string) (string, bool) {
+	token = strings.Trim(token, ".,;!?\"'`()[]{}<>")
+	hasLineSuffix := resultClaimLineSuffix.MatchString(token)
+	token = resultClaimLineSuffix.ReplaceAllString(token, "")
+	token = strings.TrimSuffix(token, ":")
+	return normalizeClaimPath(token), hasLineSuffix
+}
+
+func claimPathMatchesTouched(candidate string, touched map[string]struct{}, byBase map[string][]string, allowUniqueBasename bool) bool {
+	if hasPath(touched, candidate) {
+		return true
+	}
+	return allowUniqueBasename && !strings.Contains(candidate, "/") && len(byBase[candidate]) == 1
 }
 
 func normalizeClaimPath(value string) string {
@@ -345,35 +365,6 @@ func normalizeClaimPath(value string) string {
 		return ""
 	}
 	return cleaned
-}
-
-func looksLikeFilePath(value string) bool {
-	if strings.Contains(value, "/") {
-		return true
-	}
-	ext := path.Ext(value)
-	if ext == "" || ext == value || len(ext) > 16 {
-		return false
-	}
-	for _, r := range ext[1:] {
-		if unicode.IsLetter(r) {
-			return true
-		}
-	}
-	return false
-}
-
-func containsClaimToken(claim, candidate string) bool {
-	for _, token := range strings.FieldsFunc(claim, claimTokenSeparator) {
-		token = strings.Trim(token, ".,;!?\"'`()[]{}<>")
-		token = resultClaimLineSuffix.ReplaceAllString(token, "")
-		token = strings.TrimSuffix(token, ":")
-		token = normalizeClaimPath(token)
-		if token == candidate {
-			return true
-		}
-	}
-	return false
 }
 
 func hasPath(paths map[string]struct{}, candidate string) bool {
@@ -402,7 +393,7 @@ func anyDivergentChange(changes []ChangeObservation) bool {
 func invalidCapturedBindingClaims(changes []ChangeObservation, touchedFiles []string) []string {
 	var claims []string
 	for _, change := range changes {
-		if !change.HasCapturedPathBinding(touchedFiles) {
+		if len(claimFilePaths(change.Claim, touchedFiles)) > 0 && !change.HasCapturedPathBinding(touchedFiles) {
 			claims = append(claims, change.Claim)
 		}
 	}
