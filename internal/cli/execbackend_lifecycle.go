@@ -70,10 +70,6 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 	if w.ExecutionBackendFactory == nil {
 		return nil, nil, nil
 	}
-	lifecycle, err := w.ExecutionBackendFactory(backend)
-	if err != nil {
-		return nil, nil, fmt.Errorf("construct %s execution backend: %w", backend, err)
-	}
 	requiresBrokeredCredentials, err := execbackend.RequiresBrokeredCredentials(backend)
 	if err != nil {
 		return nil, nil, err
@@ -82,6 +78,10 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 		if err := execbackend.RequireCloudRuntimeCredentialSupport(runtimeName); err != nil {
 			return nil, nil, fmt.Errorf("provision %s execution backend with runtime %q: %w", backend, runtimeName, err)
 		}
+	}
+	lifecycle, err := w.ExecutionBackendFactory(backend)
+	if err != nil {
+		return nil, nil, fmt.Errorf("construct %s execution backend: %w", backend, err)
 	}
 	instance, err := lifecycle.Provision(ctx, execbackend.JobScope{JobID: job.ID, LifecycleGeneration: job.LifecycleGeneration})
 	if err != nil {

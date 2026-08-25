@@ -98,8 +98,8 @@ func TestBackendBrokeredCredentialRequirementIsClosed(t *testing.T) {
 		})
 	}
 
-	if got, err := RequiresBrokeredCredentials(Backend("future-backend")); err == nil || got {
-		t.Fatalf("RequiresBrokeredCredentials(future-backend) = %t, %v; want false and an unclassified error", got, err)
+	if got, err := RequiresBrokeredCredentials(Backend("future-backend")); err == nil || !got {
+		t.Fatalf("RequiresBrokeredCredentials(future-backend) = %t, %v; want true and an unclassified error", got, err)
 	}
 	if _, err := Parse(string(Remote)); err == nil {
 		t.Fatal("reserved remote backend became user-selectable before it has an implementation")

@@ -91,10 +91,29 @@ func TestProvisionExecutionBackendRefusesUnsupportedBrokeredRuntimesBeforeProvis
 			if lifecycle != nil || instance != nil {
 				t.Fatalf("refused lifecycle = %T, instance = %+v; want nil, nil", lifecycle, instance)
 			}
-			if factoryCalls != 1 {
-				t.Fatalf("factory calls = %d, want 1 through the injectable seam", factoryCalls)
+			if factoryCalls != 0 {
+				t.Fatalf("factory calls = %d, want 0 before unsupported runtime refusal", factoryCalls)
 			}
 		})
+	}
+}
+
+func TestProvisionExecutionBackendRejectsUnclassifiedBeforeFactory(t *testing.T) {
+	factoryCalls := 0
+	worker := jobWorker{ExecutionBackendFactory: func(execbackend.Backend) (execbackend.ExecutionBackend, error) {
+		factoryCalls++
+		return &credentialGateBackend{}, nil
+	}}
+
+	lifecycle, instance, err := worker.provisionExecutionBackend(context.Background(), execbackend.Backend("future-backend"), runtime.CodexRuntime, db.Job{ID: "unclassified-credential-gate"}, "/checkout")
+	if err == nil || !strings.Contains(err.Error(), "no brokered credential classification") {
+		t.Fatalf("provisionExecutionBackend(unclassified) error = %v, want classification error", err)
+	}
+	if lifecycle != nil || instance != nil {
+		t.Fatalf("unclassified lifecycle = %T, instance = %+v; want nil, nil", lifecycle, instance)
+	}
+	if factoryCalls != 0 {
+		t.Fatalf("factory calls = %d, want 0 before unclassified backend refusal", factoryCalls)
 	}
 }
 

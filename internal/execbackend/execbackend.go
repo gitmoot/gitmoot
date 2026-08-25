@@ -58,7 +58,7 @@ func RequiresBrokeredCredentials(backend Backend) (bool, error) {
 	case Remote:
 		return true, nil
 	}
-	return false, fmt.Errorf("execution backend %q has no brokered credential classification", backend)
+	return true, fmt.Errorf("execution backend %q has no brokered credential classification", backend)
 }
 
 // Allowed renders the allowed set for error messages (e.g. "local").
