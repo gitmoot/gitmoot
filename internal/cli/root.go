@@ -141,6 +141,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	repoDir := fs.String("repo", ".", "repository directory to check")
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	jsonOutput := fs.Bool("json", false, "print the checks as a JSON array instead of the text table")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -156,11 +157,11 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	// Resolve paths best-effort so the daemon-aware claude auth check (#427) can
 	// locate the running daemon. A failure here (no initialized home) just leaves
 	// Paths zero, which skips the daemon check and keeps the shell-local one.
-	paths, _ := config.DefaultPaths()
+	paths, _ := pathsFromFlag(*home)
 	buildStatus := daemonBuildStatus(paths)
 	stuckStatus := stuckJobsStatus(paths)
 	logStatus := daemonLogStatus(paths)
-	probeRunner, authState, authSource, authErr := runtimeJobRunnerWithAuth("", runtime.ClaudeRuntime, nil)
+	probeRunner, authState, authSource, authErr := runtimeJobRunnerWithAuth(*home, runtime.ClaudeRuntime, nil)
 	contractResults := make([]runtime.RuntimeContractResult, 0, len(runtime.BuiltinRuntimeRegistry().All()))
 	for _, meta := range runtime.BuiltinRuntimeRegistry().All() {
 		contractResults = append(contractResults, runtime.DefaultRuntimeContractChecker().Inspect(context.Background(), meta.Name))
@@ -180,6 +181,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		RuntimeContracts:  contractResults,
 	}
 	checks := checker.Run(context.Background())
+	if check, ok := remoteExecDoctorCheck(paths); ok {
+		checks = append(checks, check)
+	}
 	// #631: surface a stale backlog of blocked jobs (each paused awaiting a human)
 	// so an operator knows they can be bulk-dismissed. Best-effort and appended to
 	// both the text table and the --json array; the dashboard's cheaper

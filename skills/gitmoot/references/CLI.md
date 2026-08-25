@@ -10,7 +10,7 @@ curl -fsSL https://gitmoot.io/install.sh | sh
 gitmoot version
 gitmoot update --check
 gitmoot update --restart-daemon
-gitmoot doctor [--repo <path>]
+gitmoot doctor [--home <path>] [--repo <path>] [--json]
 ```
 
 Verify GitHub access before PR workflows:
@@ -31,6 +31,11 @@ job whose directly recorded runtime PID is confirmably dead is a
 required `stuck jobs` failure; legacy jobs with no recorded PID and hosts where
 process identity cannot be verified are neutral and produce no ghost-job
 finding.
+Doctor validates `[remote_exec]` through the same configuration loader used by
+job dispatch. An absent section passes because remote execution is opt-in; an
+invalid backend, identity pair, numeric identity, or local root is a required
+failure carrying the loader's exact error. Use `--home /x` to preflight
+`/x/.gitmoot/config.toml` without reading the default home.
 For organization roles with an effective `recycle_after`, doctor also reads the
 durable `org_role_presence.last_seen_at` signal. It warns when a specific role
 has never been observed or has been inactive past that bound; an unreadable,
