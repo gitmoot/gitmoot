@@ -74,19 +74,48 @@ func TestIssue1616UnclaimedDiffFileStillFails(t *testing.T) {
 	}
 }
 
-func TestIssue1616UnboundClaimIsReportedAsParserNote(t *testing.T) {
-	const claim = "updated the result gate without a leading binding"
-	observation := compareResultChanges([]string{claim}, nil)
-	if got, want := fmt.Sprint(observation.UnboundClaims), "["+claim+"]"; got != want {
+func TestIssue1616UnboundClaimIsReportedAsParserNoteWhenDiffIsBound(t *testing.T) {
+	const (
+		boundClaim   = "internal/workflow/result_checks.go:162 — updated the result gate"
+		unboundClaim = "refactored the credential gate"
+	)
+	observation := compareResultChanges(
+		[]string{boundClaim, unboundClaim},
+		[]string{"internal/workflow/result_checks.go"},
+	)
+	if got, want := fmt.Sprint(observation.UnboundClaims), "["+unboundClaim+"]"; got != want {
 		t.Fatalf("UnboundClaims = %s, want %s", got, want)
 	}
 	check, ok := resultCheckByID(RunResultChecks(ResultCheckInput{
 		Action:      "implement",
-		Result:      AgentResult{Decision: "implemented", ChangesMade: []string{claim}, TestsRun: []string{"targeted test"}},
+		Result:      AgentResult{Decision: "implemented", ChangesMade: []string{boundClaim, unboundClaim}, TestsRun: []string{"targeted test"}},
 		Observation: observation,
 	}), "implement-changes-observed")
 	if !ok || !check.Pass {
-		t.Fatalf("an unbound parser note alone should not fail the observation check: %+v", check)
+		t.Fatalf("an unbound parser note should not fail when the diff is otherwise bound: %+v", check)
+	}
+}
+
+func TestIssue1616UnboundClaimWithEmptyDiffFails(t *testing.T) {
+	const claim = "refactored the credential gate"
+	observation := compareResultChanges([]string{claim}, nil)
+	checks := RunResultChecks(ResultCheckInput{
+		Action:      "implement",
+		Result:      AgentResult{Decision: "implemented", ChangesMade: []string{claim}, TestsRun: []string{"targeted test"}},
+		Observation: observation,
+	})
+	observed, ok := resultCheckByID(checks, "implement-changes-observed")
+	if !ok || observed.Pass {
+		t.Fatalf("unbound claim with empty diff should fail the observation check: %+v", observed)
+	}
+	if !strings.Contains(observed.Explanation, "work may be missing") {
+		t.Fatalf("failure does not name the missing-work condition: %q", observed.Explanation)
+	}
+	for _, id := range []string{"implement-changes-listed", "implement-tests-listed"} {
+		check, found := resultCheckByID(checks, id)
+		if !found || !check.Pass {
+			t.Fatalf("adjacent check %q should pass and leave the empty-diff guard load-bearing: %+v", id, check)
+		}
 	}
 }
 
