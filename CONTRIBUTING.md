@@ -39,6 +39,12 @@ go test ./...
 git diff --check
 ```
 
+Job-execution code in `internal/cli`, `internal/workflow`, and
+`internal/daemon` must pass its resolved subprocess runner instead of creating a
+host `subprocess.ExecRunner{}` or calling `exec.Command` directly. Deliberate
+host-side exceptions require a reasoned `file:function` entry in
+`internal/cli/host_runner_guard_test.go`.
+
 For docs:
 
 ```sh
