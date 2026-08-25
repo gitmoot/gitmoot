@@ -593,7 +593,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// delivery and is destroyed synchronously on every return path. Host checkout,
 	// git, observation, and finalization remain on checkout/jobRunner; only runtime
 	// delivery executes in the distinct backend workspace.
-	lifecycle, instance, lifecycleErr := w.provisionExecutionBackend(ctx, execBackend, job, checkout)
+	lifecycle, instance, lifecycleErr := w.provisionExecutionBackend(ctx, execBackend, agent.Runtime, job, checkout)
 	if instance != nil {
 		defer w.destroyExecutionBackend(job.ID, lifecycle, instance)
 	}
