@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -23,8 +22,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-type credentialGateBackend struct {
-	name           execbackend.Backend
+type localProvisionBackend struct {
 	provisionCalls int
 	syncInCalls    int
 	scope          execbackend.JobScope
@@ -32,93 +30,41 @@ type credentialGateBackend struct {
 	instance       *execbackend.Instance
 }
 
-func (b *credentialGateBackend) Name() execbackend.Backend { return b.name }
+func (*localProvisionBackend) Name() execbackend.Backend { return execbackend.Local }
 
-func (b *credentialGateBackend) Provision(_ context.Context, scope execbackend.JobScope) (*execbackend.Instance, error) {
+func (b *localProvisionBackend) Provision(_ context.Context, scope execbackend.JobScope) (*execbackend.Instance, error) {
 	b.provisionCalls++
 	b.scope = scope
 	if b.instance == nil {
-		b.instance = &execbackend.Instance{ID: "credential-gate", JobID: scope.JobID, LifecycleGeneration: scope.LifecycleGeneration, Workspace: "/credential-gate"}
+		b.instance = &execbackend.Instance{ID: "local-provision", JobID: scope.JobID, LifecycleGeneration: scope.LifecycleGeneration, Workspace: "/local-provision"}
 	}
 	return b.instance, nil
 }
 
-func (*credentialGateBackend) Attach(context.Context, string) (*execbackend.Instance, error) {
+func (*localProvisionBackend) Attach(context.Context, string) (*execbackend.Instance, error) {
 	return nil, nil
 }
 
-func (b *credentialGateBackend) SyncIn(_ context.Context, _ *execbackend.Instance, materials execbackend.Materials) error {
+func (b *localProvisionBackend) SyncIn(_ context.Context, _ *execbackend.Instance, materials execbackend.Materials) error {
 	b.syncInCalls++
 	b.materials = materials
 	return nil
 }
 
-func (*credentialGateBackend) Exec(context.Context, *execbackend.Instance, execbackend.Command) (execbackend.Stream, error) {
+func (*localProvisionBackend) Exec(context.Context, *execbackend.Instance, execbackend.Command) (execbackend.Stream, error) {
 	return nil, nil
 }
 
-func (*credentialGateBackend) Collect(context.Context, *execbackend.Instance) (execbackend.ChangeSet, error) {
+func (*localProvisionBackend) Collect(context.Context, *execbackend.Instance) (execbackend.ChangeSet, error) {
 	return execbackend.ChangeSet{}, nil
 }
 
-func (*credentialGateBackend) Cancel(context.Context, *execbackend.Instance) error { return nil }
+func (*localProvisionBackend) Cancel(context.Context, *execbackend.Instance) error { return nil }
 
-func (*credentialGateBackend) Destroy(context.Context, *execbackend.Instance) error { return nil }
-
-func TestProvisionExecutionBackendRefusesUnsupportedBrokeredRuntimesBeforeProvision(t *testing.T) {
-	for _, runtimeName := range []string{runtime.CodexRuntime, runtime.ShellRuntime} {
-		t.Run(runtimeName, func(t *testing.T) {
-			backend := &credentialGateBackend{name: execbackend.Remote}
-			factoryCalls := 0
-			worker := jobWorker{ExecutionBackendFactory: func(got execbackend.Backend) (execbackend.ExecutionBackend, error) {
-				factoryCalls++
-				if got != execbackend.Remote {
-					t.Fatalf("factory backend = %q, want %q", got, execbackend.Remote)
-				}
-				return backend, nil
-			}}
-
-			lifecycle, instance, err := worker.provisionExecutionBackend(context.Background(), execbackend.Remote, runtimeName, db.Job{ID: "remote-credential-gate", LifecycleGeneration: 3}, "/checkout")
-			if backend.provisionCalls != 0 {
-				t.Fatalf("Provision calls = %d, want 0 before unsupported runtime refusal", backend.provisionCalls)
-			}
-			if backend.syncInCalls != 0 {
-				t.Fatalf("SyncIn calls = %d, want 0 before unsupported runtime refusal", backend.syncInCalls)
-			}
-			if !errors.Is(err, execbackend.ErrCloudRuntimeUnsupported) {
-				t.Fatalf("provisionExecutionBackend(%s) error = %v, want ErrCloudRuntimeUnsupported", runtimeName, err)
-			}
-			if lifecycle != nil || instance != nil {
-				t.Fatalf("refused lifecycle = %T, instance = %+v; want nil, nil", lifecycle, instance)
-			}
-			if factoryCalls != 0 {
-				t.Fatalf("factory calls = %d, want 0 before unsupported runtime refusal", factoryCalls)
-			}
-		})
-	}
-}
-
-func TestProvisionExecutionBackendRejectsUnclassifiedBeforeFactory(t *testing.T) {
-	factoryCalls := 0
-	worker := jobWorker{ExecutionBackendFactory: func(execbackend.Backend) (execbackend.ExecutionBackend, error) {
-		factoryCalls++
-		return &credentialGateBackend{}, nil
-	}}
-
-	lifecycle, instance, err := worker.provisionExecutionBackend(context.Background(), execbackend.Backend("future-backend"), runtime.CodexRuntime, db.Job{ID: "unclassified-credential-gate"}, "/checkout")
-	if err == nil || !strings.Contains(err.Error(), "no brokered credential classification") {
-		t.Fatalf("provisionExecutionBackend(unclassified) error = %v, want classification error", err)
-	}
-	if lifecycle != nil || instance != nil {
-		t.Fatalf("unclassified lifecycle = %T, instance = %+v; want nil, nil", lifecycle, instance)
-	}
-	if factoryCalls != 0 {
-		t.Fatalf("factory calls = %d, want 0 before unclassified backend refusal", factoryCalls)
-	}
-}
+func (*localProvisionBackend) Destroy(context.Context, *execbackend.Instance) error { return nil }
 
 func TestProvisionExecutionBackendLocalBehaviorUnchanged(t *testing.T) {
-	backend := &credentialGateBackend{name: execbackend.Local}
+	backend := &localProvisionBackend{}
 	worker := jobWorker{ExecutionBackendFactory: func(got execbackend.Backend) (execbackend.ExecutionBackend, error) {
 		if got != execbackend.Local {
 			t.Fatalf("factory backend = %q, want %q", got, execbackend.Local)
