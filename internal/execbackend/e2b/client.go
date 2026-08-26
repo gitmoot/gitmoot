@@ -13,8 +13,11 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"mime"
 	"net/http"
 	"net/url"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -130,7 +133,24 @@ type Sandbox struct {
 	State       string            `json:"state,omitempty"`
 }
 
-type sandboxPage []Sandbox
+type listedSandbox struct {
+	ID          *string           `json:"sandboxID"`
+	TemplateID  *string           `json:"templateID"`
+	Alias       string            `json:"alias,omitempty"`
+	ClientID    *string           `json:"clientID"`
+	EnvdVersion *string           `json:"envdVersion"`
+	StartedAt   *time.Time        `json:"startedAt"`
+	EndAt       *time.Time        `json:"endAt"`
+	CPUCount    *int32            `json:"cpuCount"`
+	MemoryMB    *int32            `json:"memoryMB"`
+	DiskSizeMB  *int32            `json:"diskSizeMB"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
+	State       *string           `json:"state"`
+}
+
+type sandboxPage struct {
+	items []listedSandbox
+}
 
 func (p *sandboxPage) UnmarshalJSON(data []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
@@ -142,9 +162,9 @@ func (p *sandboxPage) UnmarshalJSON(data []byte) error {
 		return errors.New("E2B sandbox inventory must be a JSON array")
 	}
 
-	var page []Sandbox
+	var page []listedSandbox
 	for decoder.More() {
-		var sandbox Sandbox
+		var sandbox listedSandbox
 		if err := decoder.Decode(&sandbox); err != nil {
 			return err
 		}
@@ -160,8 +180,97 @@ func (p *sandboxPage) UnmarshalJSON(data []byte) error {
 	if err := requireJSONEOF(decoder); err != nil {
 		return err
 	}
-	*p = page
+	p.items = page
 	return nil
+}
+
+type inventoryAuthority struct {
+	totalRunning uint64
+	totalSet     bool
+}
+
+func (a *inventoryAuthority) acceptPage(headers http.Header, page sandboxPage, collected int, terminal bool) ([]Sandbox, error) {
+	totalRunning, err := responseTotalRunning(headers)
+	if err != nil {
+		return nil, err
+	}
+	if !a.totalSet {
+		a.totalRunning = totalRunning
+		a.totalSet = true
+	} else if totalRunning != a.totalRunning {
+		return nil, fmt.Errorf("X-Total-Running changed from %d to %d between pages", a.totalRunning, totalRunning)
+	}
+
+	sandboxes := make([]Sandbox, 0, len(page.items))
+	for i := range page.items {
+		sandbox, err := page.items[i].sandbox()
+		if err != nil {
+			return nil, fmt.Errorf("response item %d: %w", collected+i, err)
+		}
+		sandboxes = append(sandboxes, sandbox)
+	}
+
+	newCount := uint64(collected + len(sandboxes))
+	if newCount > a.totalRunning {
+		return nil, fmt.Errorf("collected %d sandboxes, exceeding X-Total-Running %d", newCount, a.totalRunning)
+	}
+	if terminal && newCount != a.totalRunning {
+		return nil, fmt.Errorf("collected %d sandboxes, but X-Total-Running declares %d", newCount, a.totalRunning)
+	}
+	return sandboxes, nil
+}
+
+func (s listedSandbox) sandbox() (Sandbox, error) {
+	missing := make([]string, 0, 10)
+	for name, present := range map[string]bool{
+		"templateID":  s.TemplateID != nil,
+		"sandboxID":   s.ID != nil,
+		"clientID":    s.ClientID != nil,
+		"startedAt":   s.StartedAt != nil,
+		"cpuCount":    s.CPUCount != nil,
+		"memoryMB":    s.MemoryMB != nil,
+		"diskSizeMB":  s.DiskSizeMB != nil,
+		"endAt":       s.EndAt != nil,
+		"state":       s.State != nil,
+		"envdVersion": s.EnvdVersion != nil,
+	} {
+		if !present {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		slices.Sort(missing)
+		return Sandbox{}, fmt.Errorf("missing required ListedSandbox fields: %s", strings.Join(missing, ", "))
+	}
+	if strings.TrimSpace(*s.ID) == "" {
+		return Sandbox{}, errors.New("missing sandboxID")
+	}
+	return Sandbox{
+		ID:          *s.ID,
+		TemplateID:  *s.TemplateID,
+		Alias:       s.Alias,
+		ClientID:    *s.ClientID,
+		EnvdVersion: *s.EnvdVersion,
+		StartedAt:   *s.StartedAt,
+		EndAt:       *s.EndAt,
+		CPUCount:    *s.CPUCount,
+		MemoryMB:    *s.MemoryMB,
+		DiskSizeMB:  *s.DiskSizeMB,
+		Metadata:    s.Metadata,
+		State:       *s.State,
+	}, nil
+}
+
+func responseTotalRunning(headers http.Header) (uint64, error) {
+	values := headers.Values("X-Total-Running")
+	if len(values) != 1 || strings.TrimSpace(values[0]) == "" {
+		return 0, errors.New("missing required X-Total-Running header")
+	}
+	total, err := strconv.ParseUint(strings.TrimSpace(values[0]), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid X-Total-Running value %q", values[0])
+	}
+	return total, nil
 }
 
 // Observation is the three-state result of looking up one sandbox.
@@ -224,6 +333,7 @@ func (c *Client) Create(ctx context.Context, templateID string, ttl time.Duratio
 // List returns all sandboxes in the provider response.
 func (c *Client) List(ctx context.Context) ([]Sandbox, error) {
 	var sandboxes []Sandbox
+	var authority inventoryAuthority
 	nextToken := ""
 	seenTokens := make(map[string]struct{})
 	for pageNumber := 1; pageNumber <= maxListPages; pageNumber++ {
@@ -236,15 +346,18 @@ func (c *Client) List(ctx context.Context) ([]Sandbox, error) {
 		if err != nil {
 			return nil, err
 		}
-		for i := range page {
-			if strings.TrimSpace(page[i].ID) == "" {
-				return nil, c.errorf(nil, "list sandboxes: malformed response item %d: missing sandboxID", len(sandboxes)+i)
-			}
-		}
-		sandboxes = append(sandboxes, page...)
-
 		nextToken = strings.TrimSpace(headers.Get("X-Next-Token"))
-		if nextToken == "" {
+		terminal := nextToken == ""
+		// Require the provider's declared total. If a proxy strips both this
+		// header and X-Next-Token, a complete single page is indistinguishable
+		// from truncation; deferring Gone is safer than authorizing it from an
+		// inventory whose completeness cannot be verified.
+		accepted, err := authority.acceptPage(headers, page, len(sandboxes), terminal)
+		if err != nil {
+			return nil, c.errorf(err, "list sandboxes: inventory is not authoritative")
+		}
+		sandboxes = append(sandboxes, accepted...)
+		if terminal {
 			return sandboxes, nil
 		}
 		if _, duplicate := seenTokens[nextToken]; duplicate {
@@ -390,6 +503,9 @@ func (c *Client) doJSONState(ctx context.Context, method, path string, input any
 	if output == nil {
 		return Present, resp.Header, nil
 	}
+	if err := requireJSONMediaType(resp.Header); err != nil {
+		return Unknown, resp.Header, c.errorf(err, "%s %s: E2B response is not authoritative JSON", method, path)
+	}
 	decoder := json.NewDecoder(bytes.NewReader(responseBody))
 	if err := decoder.Decode(output); err != nil {
 		return Unknown, resp.Header, c.errorf(err, "%s %s: decode E2B response", method, path)
@@ -398,6 +514,21 @@ func (c *Client) doJSONState(ctx context.Context, method, path string, input any
 		return Unknown, resp.Header, c.errorf(err, "%s %s: decode E2B response", method, path)
 	}
 	return Present, resp.Header, nil
+}
+
+func requireJSONMediaType(headers http.Header) error {
+	raw := strings.TrimSpace(headers.Get("Content-Type"))
+	if raw == "" {
+		return errors.New("missing Content-Type")
+	}
+	mediaType, _, err := mime.ParseMediaType(raw)
+	if err != nil {
+		return fmt.Errorf("invalid Content-Type %q", raw)
+	}
+	if !strings.EqualFold(mediaType, "application/json") {
+		return fmt.Errorf("Content-Type %q is not application/json", mediaType)
+	}
+	return nil
 }
 
 func (c *Client) errorf(cause error, format string, args ...any) error {

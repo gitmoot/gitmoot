@@ -28,6 +28,7 @@ func TestClientControlPlaneOperations(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
 		if got := r.Header.Get("X-API-Key"); got != testAPIKey {
 			t.Errorf("X-API-Key = %q, want caller key", got)
 		}
@@ -45,7 +46,8 @@ func TestClientControlPlaneOperations(t *testing.T) {
 			if got := r.URL.Query().Get("limit"); got != "100" {
 				t.Errorf("list limit = %q, want 100", got)
 			}
-			_, _ = w.Write([]byte(`[{"sandboxID":"sbx-1","templateID":"template-a","clientID":"client","envdVersion":"1.0","state":"running"}]`))
+			w.Header().Set("X-Total-Running", "1")
+			_, _ = w.Write([]byte(listedSandboxArray("sbx-1")))
 		case "GET /sandboxes/sbx-1":
 			_, _ = w.Write([]byte(`{"sandboxID":"sbx-1","templateID":"template-a","clientID":"client","envdVersion":"1.0","startedAt":"2026-08-26T10:00:00Z","endAt":"2026-08-26T11:00:00Z","state":"running"}`))
 		case "DELETE /sandboxes/sbx-1":
@@ -102,6 +104,8 @@ func TestClientListFollowsPagination(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Total-Running", "2")
 		if r.Method != http.MethodGet || r.URL.EscapedPath() != "/v2/sandboxes" {
 			http.Error(w, "wrong list route", http.StatusNotFound)
 			return
@@ -112,9 +116,9 @@ func TestClientListFollowsPagination(t *testing.T) {
 		switch token := r.URL.Query().Get("nextToken"); token {
 		case "":
 			w.Header().Set("X-Next-Token", "page-2")
-			_, _ = w.Write([]byte(`[{"sandboxID":"sbx-1"}]`))
+			_, _ = w.Write([]byte(listedSandboxArray("sbx-1")))
 		case "page-2":
-			_, _ = w.Write([]byte(`[{"sandboxID":"sbx-2"}]`))
+			_, _ = w.Write([]byte(listedSandboxArray("sbx-2")))
 		default:
 			http.Error(w, "unexpected token", http.StatusBadRequest)
 		}
@@ -140,6 +144,8 @@ func TestClientListStopsAtPageLimit(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		call := calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Total-Running", "100")
 		w.Header().Set("X-Next-Token", fmt.Sprintf("page-%d", call))
 		_, _ = w.Write([]byte(`[]`))
 	}))
@@ -203,6 +209,7 @@ func TestClientFailureModes(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(test.status)
 				_, _ = w.Write([]byte(test.body))
 			}))
@@ -250,6 +257,8 @@ func TestClientGetRequiresArrayInventory(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.EscapedPath() == "/v2/sandboxes" {
+					w.Header().Set("Content-Type", "application/json")
+					w.Header().Set("X-Total-Running", "0")
 					_, _ = w.Write([]byte(test.inventory))
 					return
 				}
@@ -267,6 +276,119 @@ func TestClientGetRequiresArrayInventory(t *testing.T) {
 	}
 }
 
+func TestClientRequiresAuthoritativeInventory(t *testing.T) {
+	t.Parallel()
+
+	const sandboxID = "isandboxdoesnotexist000"
+	tests := []struct {
+		name               string
+		contentType        string
+		setContentType     bool
+		totalRunning       string
+		inventory          string
+		wantListError      bool
+		wantListed         int
+		wantObservation    State
+		wantObservationErr bool
+	}{
+		{
+			name:               "declared total exposes truncated inventory",
+			contentType:        "application/json",
+			setContentType:     true,
+			totalRunning:       "5",
+			inventory:          listedSandboxArray("sbx-1", "sbx-2"),
+			wantListError:      true,
+			wantObservation:    Unknown,
+			wantObservationErr: true,
+		},
+		{
+			name:            "matching total confirms absence",
+			contentType:     "application/json; charset=utf-8",
+			setContentType:  true,
+			totalRunning:    "2",
+			inventory:       listedSandboxArray("sbx-1", "sbx-2"),
+			wantListed:      2,
+			wantObservation: Gone,
+		},
+		{
+			name:               "missing total is unverified",
+			contentType:        "application/json",
+			setContentType:     true,
+			inventory:          `[]`,
+			wantListError:      true,
+			wantObservation:    Unknown,
+			wantObservationErr: true,
+		},
+		{
+			name:               "missing content type is unverified",
+			totalRunning:       "0",
+			inventory:          `[]`,
+			wantListError:      true,
+			wantObservation:    Unknown,
+			wantObservationErr: true,
+		},
+		{
+			name:               "blank content type is unverified",
+			setContentType:     true,
+			totalRunning:       "0",
+			inventory:          `[]`,
+			wantListError:      true,
+			wantObservation:    Unknown,
+			wantObservationErr: true,
+		},
+		{
+			name:               "non JSON media type is unverified",
+			contentType:        "text/html",
+			setContentType:     true,
+			totalRunning:       "0",
+			inventory:          `[]`,
+			wantListError:      true,
+			wantObservation:    Unknown,
+			wantObservationErr: true,
+		},
+		{
+			name:               "incomplete vendor item is unverified",
+			contentType:        "application/json",
+			setContentType:     true,
+			totalRunning:       "1",
+			inventory:          `[{"sandboxID":"proxy-placeholder"}]`,
+			wantListError:      true,
+			wantObservation:    Unknown,
+			wantObservationErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.EscapedPath() == "/v2/sandboxes" {
+					if test.setContentType {
+						w.Header().Set("Content-Type", test.contentType)
+					}
+					if test.totalRunning != "" {
+						w.Header().Set("X-Total-Running", test.totalRunning)
+					}
+					_, _ = w.Write([]byte(test.inventory))
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(measuredAbsent404Body))
+			}))
+			defer server.Close()
+			client := newTestClient(t, server.URL, time.Second, server.Client())
+
+			listed, listErr := client.List(context.Background())
+			if (listErr != nil) != test.wantListError || len(listed) != test.wantListed {
+				t.Fatalf("List = %+v, %v; want len=%d/error=%v", listed, listErr, test.wantListed, test.wantListError)
+			}
+			observed, err := client.Get(context.Background(), sandboxID)
+			if observed.State != test.wantObservation || (err != nil) != test.wantObservationErr {
+				t.Fatalf("Get state/error = %s/%v, want %s/error=%v", observed.State, err, test.wantObservation, test.wantObservationErr)
+			}
+		})
+	}
+}
+
 func TestClientThreeStateObservation(t *testing.T) {
 	t.Parallel()
 
@@ -277,14 +399,15 @@ func TestClientThreeStateObservation(t *testing.T) {
 		body          string
 		listStatus    int
 		listBody      string
+		listTotal     string
 		wantListCalls int32
 		wantState     State
 		wantErr       bool
 	}{
 		{name: "present", status: http.StatusOK, body: `{"sandboxID":"isandboxdoesnotexist000"}`, wantState: Present},
-		{name: "inventory confirms absent", status: http.StatusNotFound, body: measuredAbsent404Body, listStatus: http.StatusOK, listBody: `[]`, wantListCalls: 1, wantState: Gone},
-		{name: "inventory confirms routing failure is inconclusive", status: http.StatusNotFound, body: measuredRouting404Body, listStatus: http.StatusOK, listBody: `[{"sandboxID":"isandboxdoesnotexist000"}]`, wantListCalls: 1, wantState: Unknown, wantErr: true},
-		{name: "gone response still requires inventory", status: http.StatusGone, body: `{"code":410,"message":"sandbox gone"}`, listStatus: http.StatusOK, listBody: `[]`, wantListCalls: 1, wantState: Gone},
+		{name: "inventory confirms absent", status: http.StatusNotFound, body: measuredAbsent404Body, listStatus: http.StatusOK, listBody: `[]`, listTotal: "0", wantListCalls: 1, wantState: Gone},
+		{name: "inventory confirms routing failure is inconclusive", status: http.StatusNotFound, body: measuredRouting404Body, listStatus: http.StatusOK, listBody: listedSandboxArray("isandboxdoesnotexist000"), listTotal: "1", wantListCalls: 1, wantState: Unknown, wantErr: true},
+		{name: "gone response still requires inventory", status: http.StatusGone, body: `{"code":410,"message":"sandbox gone"}`, listStatus: http.StatusOK, listBody: `[]`, listTotal: "0", wantListCalls: 1, wantState: Gone},
 		{name: "unauthorized", status: http.StatusUnauthorized, wantState: Unknown, wantErr: true},
 		{name: "provider unavailable", status: http.StatusServiceUnavailable, wantState: Unknown, wantErr: true},
 		{name: "inconclusive malformed read", status: http.StatusOK, body: `{`, wantState: Unknown, wantErr: true},
@@ -293,12 +416,14 @@ func TestClientThreeStateObservation(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			var listCalls atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
 				if r.URL.EscapedPath() == "/v2/sandboxes" {
 					listCalls.Add(1)
 					if test.listStatus == 0 {
 						http.Error(w, "unexpected inventory request", http.StatusInternalServerError)
 						return
 					}
+					w.Header().Set("X-Total-Running", test.listTotal)
 					w.WriteHeader(test.listStatus)
 					_, _ = w.Write([]byte(test.listBody))
 					return
@@ -607,6 +732,17 @@ func readBody(t *testing.T, r *http.Request) string {
 		t.Fatalf("read request body: %v", err)
 	}
 	return body.String()
+}
+
+func listedSandboxArray(ids ...string) string {
+	items := make([]string, 0, len(ids))
+	for _, id := range ids {
+		items = append(items, fmt.Sprintf(
+			`{"templateID":"template-a","sandboxID":%q,"clientID":"client","startedAt":"2026-08-26T10:00:00Z","cpuCount":2,"memoryMB":512,"diskSizeMB":1024,"endAt":"2026-08-26T11:00:00Z","state":"running","envdVersion":"1.0"}`,
+			id,
+		))
+	}
+	return "[" + strings.Join(items, ",") + "]"
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
