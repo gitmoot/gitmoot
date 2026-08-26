@@ -187,9 +187,18 @@ func TestWakeOutboxTickHealthIncludesBlockedAndEscalation(t *testing.T) {
 	if !kinds["blocked"] || !kinds["escalation"] {
 		t.Fatalf("pending source kinds = %v, want blocked and escalation", kinds)
 	}
-	if err := wakeOutboxObligationHealth(ctx, store, now.Add(-replyWakeAttemptedUnknownAfter)); err == nil ||
-		!strings.Contains(err.Error(), "pending=2") {
-		t.Fatalf("tick health = %v, want two outstanding obligations", err)
+	health, err := wakeOutboxObligationHealth(
+		ctx,
+		store,
+		now.Add(-replyWakeAttemptedUnknownAfter),
+		func(ctx context.Context) (replyWakeDelivery, error) {
+			rules, err := store.ListEventRules(ctx)
+			return replyWakeDelivery{rules: rules}, err
+		},
+	)
+	if err == nil || health.pending != 2 || health.inert != 0 ||
+		!strings.Contains(err.Error(), "pending=2 inert=0 aged_attempted=0") {
+		t.Fatalf("tick health = %s err=%v, want two routable outstanding obligations", health, err)
 	}
 }
 
@@ -202,8 +211,13 @@ func TestReplyWakeOutboxDrainFailureDoesNotAbortRepoWork(t *testing.T) {
 		Repo: "owner/repo", Branch: "main", PullRequest: 1,
 	})
 	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
-		WorkflowID: "release/drain-isolation", Author: "worker", Body: "no matching route",
+		WorkflowID: "release/drain-isolation", Author: "worker", Body: "matching route without a delivery sink",
 		AddressedTarget: "owner",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddEventRule(context.Background(), db.EventRule{
+		ID: "reply-owner", OnKind: "reply", WakeRole: "owner", Enabled: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +241,7 @@ func TestReplyWakeOutboxDrainFailureDoesNotAbortRepoWork(t *testing.T) {
 	}
 }
 
-func TestReplyWakeOutboxDrainFailureDoesNotEscalateSingleRepoLoop(t *testing.T) {
+func TestReplyWakeOutboxInertHealthDoesNotEscalateSingleRepoLoop(t *testing.T) {
 	store := daemonWorkerStore(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
 	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
@@ -250,20 +264,20 @@ func TestReplyWakeOutboxDrainFailureDoesNotEscalateSingleRepoLoop(t *testing.T) 
 	)
 
 	deadline := time.Now().Add(5 * time.Second)
-	for strings.Count(stdout.String(), "reply wake outbox drain unhealthy:") <= maxConsecutiveWorkerTickFailures {
+	for strings.Count(stdout.String(), "reply wake outbox drain health:") <= maxConsecutiveWorkerTickFailures {
 		select {
 		case err := <-errCh:
-			t.Fatalf("single-repo loop escalated persistent reply wake drain failure: %v", err)
+			t.Fatalf("single-repo loop escalated persistent inert wake health: %v", err)
 		default:
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("single-repo loop did not survive beyond %d drain failures; log=%q", maxConsecutiveWorkerTickFailures, stdout.String())
+			t.Fatalf("single-repo loop did not report inert health beyond %d ticks; log=%q", maxConsecutiveWorkerTickFailures, stdout.String())
 		}
 		time.Sleep(time.Millisecond)
 	}
 	select {
 	case err := <-errCh:
-		t.Fatalf("single-repo loop exited after drain failures: %v", err)
+		t.Fatalf("single-repo loop exited while reporting inert health: %v", err)
 	default:
 	}
 
@@ -277,7 +291,11 @@ func TestReplyWakeOutboxDrainFailureDoesNotEscalateSingleRepoLoop(t *testing.T) 
 		t.Fatal("single-repo loop did not stop after cancellation")
 	}
 	if strings.Contains(stdout.String(), "consecutive failures, escalating") {
-		t.Fatalf("reply wake drain failure reached escalation ladder: %q", stdout.String())
+		t.Fatalf("inert reply wake health reached escalation ladder: %q", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") ||
+		!strings.Contains(stdout.String(), "pending=0 inert=1 aged_attempted=0") {
+		t.Fatalf("inert reply wake health log = %q", stdout.String())
 	}
 }
 
@@ -520,7 +538,7 @@ func TestReplyWakeOutboxReadFailureLogsUnhealthyWithoutAbortingFleetTick(t *test
 	}
 }
 
-func TestReplyWakeOutboxEventRulesReadFailureLogsUnhealthyWithoutAbortingFleetTick(t *testing.T) {
+func TestReplyWakeOutboxHealthFailsClosedWhenEventRulesAreUnreadable(t *testing.T) {
 	store, _, _, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
 	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
 		WorkflowID: "release/rules-read-failure", Author: "worker", Body: "must stay pending",
@@ -550,7 +568,7 @@ func TestReplyWakeOutboxEventRulesReadFailureLogsUnhealthyWithoutAbortingFleetTi
 	var stdout bytes.Buffer
 	tickErr := runEnabledRepoWorkerTicksTracked(
 		context.Background(), store, worker, 0, "", &stdout,
-		createdAt.Add(replyWakeCoalescingWindow+time.Second), nil, nil,
+		createdAt.Add(replyWakeCoalescingWindow-time.Millisecond), nil, nil,
 	)
 	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
 	if err != nil || len(pending) != 1 {
@@ -559,13 +577,14 @@ func TestReplyWakeOutboxEventRulesReadFailureLogsUnhealthyWithoutAbortingFleetTi
 	if tickErr != nil {
 		t.Fatalf("daemon tick aborted after sink resolution skipped a pending wake: %v", tickErr)
 	}
-	if !strings.Contains(stdout.String(), "resolve wake outbox delivery") ||
-		!strings.Contains(stdout.String(), "no such table: event_rules") {
+	if !strings.Contains(stdout.String(), "classify wake outbox obligations") ||
+		!strings.Contains(stdout.String(), "no such table: event_rules") ||
+		strings.Contains(stdout.String(), "inert=") {
 		t.Fatalf("daemon tick log = %q, want explicit event_rules read cause", stdout.String())
 	}
 }
 
-func TestReplyWakeOutboxZeroRulesLogsUnhealthyWithoutAbortingFleetTick(t *testing.T) {
+func TestReplyWakeOutboxZeroRulesReportsInertWithoutUnhealthy(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
 	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
@@ -590,10 +609,11 @@ func TestReplyWakeOutboxZeroRulesLogsUnhealthyWithoutAbortingFleetTick(t *testin
 		time.Now().UTC(), nil, nil,
 	)
 	if tickErr != nil {
-		t.Fatalf("fleet tick aborted on pending-obligation health failure: %v", tickErr)
+		t.Fatalf("fleet tick aborted on inert pending-obligation health: %v", tickErr)
 	}
-	if !strings.Contains(stdout.String(), "outstanding obligations: pending=1") {
-		t.Fatalf("fleet tick log = %q, want pending-obligation health failure", stdout.String())
+	if !strings.Contains(stdout.String(), "reply wake outbox drain health: pending=0 inert=1 aged_attempted=0") ||
+		strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") {
+		t.Fatalf("fleet tick log = %q, want visible inert-only health", stdout.String())
 	}
 	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
 	if err != nil || len(pending) != 1 {
@@ -601,7 +621,7 @@ func TestReplyWakeOutboxZeroRulesLogsUnhealthyWithoutAbortingFleetTick(t *testin
 	}
 }
 
-func TestReplyWakeOutboxUnrelatedEnabledRuleLeavesPendingObligationUnhealthy(t *testing.T) {
+func TestReplyWakeOutboxUnrelatedEnabledRuleReportsPendingObligationInert(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
 	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
@@ -642,10 +662,11 @@ func TestReplyWakeOutboxUnrelatedEnabledRuleLeavesPendingObligationUnhealthy(t *
 		createdAt.Add(replyWakeCoalescingWindow+time.Second), nil, nil,
 	)
 	if tickErr != nil {
-		t.Fatalf("fleet tick aborted on pending-obligation health failure: %v", tickErr)
+		t.Fatalf("fleet tick aborted on inert pending-obligation health: %v", tickErr)
 	}
-	if !strings.Contains(stdout.String(), "outstanding obligations: pending=1") {
-		t.Fatalf("fleet tick log = %q, want pending-obligation health failure", stdout.String())
+	if !strings.Contains(stdout.String(), "reply wake outbox drain health: pending=0 inert=1 aged_attempted=0") ||
+		strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") {
+		t.Fatalf("fleet tick log = %q, want visible inert-only health", stdout.String())
 	}
 	pending, err = store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
 	if err != nil || len(pending) != 1 || pending[0].AttemptCount != 0 {

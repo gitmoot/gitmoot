@@ -1324,8 +1324,11 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 	// #1200/#1201 durable addressed-note wakes belong to the shared store, not
 	// any repository. Drain before listing repos so zero enabled repos cannot
 	// suppress delivery or hide an unreadable outbox behind a healthy fleet tick.
-	if err := drainFleetReplyWakeOutbox(ctx, store, worker, now); err != nil {
+	health, err := drainFleetReplyWakeOutbox(ctx, store, worker, now)
+	if err != nil {
 		writeLine(stdout, "reply wake outbox drain unhealthy: %v", err)
+	} else if health.inert > 0 {
+		writeLine(stdout, "reply wake outbox drain health: %s", health)
 	}
 	if tracker.staleTaskLaneLockReclaimDue(now) {
 		if err := reclaimStaleTaskLaneLocks(ctx, store, "", stdout, now); err != nil {
@@ -1397,11 +1400,12 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 	return nil
 }
 
-func drainFleetReplyWakeOutbox(ctx context.Context, store *db.Store, worker jobWorker, now time.Time) error {
-	if err := drainReplyWakeOutbox(ctx, store, now, worker.replyWakeDelivery); err != nil {
-		return fmt.Errorf("reply wake outbox drain failed: %w", err)
+func drainFleetReplyWakeOutbox(ctx context.Context, store *db.Store, worker jobWorker, now time.Time) (replyWakeOutboxHealth, error) {
+	health, err := drainReplyWakeOutboxWithHealth(ctx, store, now, worker.replyWakeDelivery)
+	if err != nil {
+		return health, fmt.Errorf("reply wake outbox drain failed: %w", err)
 	}
-	return nil
+	return health, nil
 }
 
 func jobStateCanRetryAdvancement(state string) bool {

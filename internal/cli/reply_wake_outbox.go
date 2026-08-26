@@ -32,27 +32,47 @@ type replyWakeDelivery struct {
 
 type replyWakeDeliveryResolver func(context.Context) (replyWakeDelivery, error)
 
+type replyWakeOutboxHealth struct {
+	pending       int
+	inert         int
+	agedAttempted int
+}
+
+func (h replyWakeOutboxHealth) String() string {
+	return fmt.Sprintf(
+		"pending=%d inert=%d aged_attempted=%d",
+		h.pending,
+		h.inert,
+		h.agedAttempted,
+	)
+}
+
 // drainReplyWakeOutbox is a store-global daemon operation. It deliberately
 // reads durable work before resolving delivery: unreadable outbox state and an
 // empty outbox therefore cannot collapse into the same result.
 func drainReplyWakeOutbox(ctx context.Context, store *db.Store, now time.Time, resolve replyWakeDeliveryResolver) error {
+	_, err := drainReplyWakeOutboxWithHealth(ctx, store, now, resolve)
+	return err
+}
+
+func drainReplyWakeOutboxWithHealth(ctx context.Context, store *db.Store, now time.Time, resolve replyWakeDeliveryResolver) (replyWakeOutboxHealth, error) {
 	if store == nil {
-		return errors.New("wake outbox store is required")
+		return replyWakeOutboxHealth{}, errors.New("wake outbox store is required")
 	}
 	attemptedBefore := now.UTC().Add(-replyWakeAttemptedUnknownAfter)
 	obligations, err := store.ListWakeOutboxObligations(ctx, attemptedBefore)
 	if err != nil || obligations.Len() == 0 {
-		return err
+		return replyWakeOutboxHealth{}, err
 	}
 
 	agedAttempted := len(obligations.AgedAttempted)
 	if agedAttempted > 0 {
 		expired, err := store.ExpireAgedWakeOutbox(ctx, attemptedBefore, now)
 		if err != nil {
-			return fmt.Errorf("expire aged attempted wake outbox: %w", err)
+			return replyWakeOutboxHealth{}, fmt.Errorf("expire aged attempted wake outbox: %w", err)
 		}
 		if len(expired) > 0 {
-			return fmt.Errorf(
+			return replyWakeOutboxHealth{}, fmt.Errorf(
 				"wake outbox delivery unknown: expired %d aged attempted rows without retry",
 				len(expired),
 			)
@@ -65,7 +85,7 @@ func drainReplyWakeOutbox(ctx context.Context, store *db.Store, now time.Time, r
 		groups[key] = append(groups[key], entry)
 	}
 	if resolve == nil {
-		return errors.New("wake outbox delivery resolver is required")
+		return replyWakeOutboxHealth{}, errors.New("wake outbox delivery resolver is required")
 	}
 
 	keys := make([]string, 0, len(groups))
@@ -79,14 +99,14 @@ func drainReplyWakeOutbox(ctx context.Context, store *db.Store, now time.Time, r
 		for start := 0; start < len(items); {
 			startedAt, err := time.Parse(time.RFC3339Nano, items[start].CreatedAt)
 			if err != nil {
-				return fmt.Errorf("parse wake outbox created_at for row %d: %w", items[start].ID, err)
+				return replyWakeOutboxHealth{}, fmt.Errorf("parse wake outbox created_at for row %d: %w", items[start].ID, err)
 			}
 			deadline := startedAt.Add(replyWakeCoalescingWindow)
 			end := start + 1
 			for end < len(items) {
 				createdAt, err := time.Parse(time.RFC3339Nano, items[end].CreatedAt)
 				if err != nil {
-					return fmt.Errorf("parse wake outbox created_at for row %d: %w", items[end].ID, err)
+					return replyWakeOutboxHealth{}, fmt.Errorf("parse wake outbox created_at for row %d: %w", items[end].ID, err)
 				}
 				if !createdAt.Before(deadline) {
 					break
@@ -102,7 +122,7 @@ func drainReplyWakeOutbox(ctx context.Context, store *db.Store, now time.Time, r
 			batch := items[start:end]
 			event, err := wakeOutboxEvent(batch, now)
 			if err != nil {
-				return err
+				return replyWakeOutboxHealth{}, err
 			}
 			// Authorization is deliberately batch-scoped and pre-claim. A rule
 			// removed while an earlier synchronous batch is delivering cannot
@@ -110,7 +130,7 @@ func drainReplyWakeOutbox(ctx context.Context, store *db.Store, now time.Time, r
 			// attempted rows on a routing-store failure.
 			delivery, err := resolve(ctx)
 			if err != nil {
-				return fmt.Errorf("resolve wake outbox delivery: %w", err)
+				return replyWakeOutboxHealth{}, fmt.Errorf("resolve wake outbox delivery: %w", err)
 			}
 			if delivery.sink == nil {
 				break
@@ -127,44 +147,54 @@ func drainReplyWakeOutbox(ctx context.Context, store *db.Store, now time.Time, r
 			}
 			claimed, err := store.ClaimWakeOutbox(ctx, ids, now)
 			if err != nil {
-				return err
+				return replyWakeOutboxHealth{}, err
 			}
 			if claimed {
 				event.WakeOutboxIDs = ids
 				if err := emitReplyWakeOutboxEvent(ctx, delivery.sink, event, matchingRules); err != nil {
-					return fmt.Errorf("emit claimed %s wake: %w", event.WakeKind, err)
+					return replyWakeOutboxHealth{}, fmt.Errorf("emit claimed %s wake: %w", event.WakeKind, err)
 				}
 			}
 			start = end
 		}
 	}
-	return wakeOutboxObligationHealth(ctx, store, attemptedBefore)
+	return wakeOutboxObligationHealth(ctx, store, attemptedBefore, resolve)
 }
 
-func wakeOutboxObligationHealth(ctx context.Context, store *db.Store, attemptedBefore time.Time) error {
+func wakeOutboxObligationHealth(ctx context.Context, store *db.Store, attemptedBefore time.Time, resolve replyWakeDeliveryResolver) (replyWakeOutboxHealth, error) {
 	obligations, err := store.ListWakeOutboxObligations(ctx, attemptedBefore)
 	if err != nil {
-		return fmt.Errorf("read wake outbox obligations: %w", err)
+		return replyWakeOutboxHealth{}, fmt.Errorf("read wake outbox obligations: %w", err)
 	}
-	pending := 0
+	health := replyWakeOutboxHealth{agedAttempted: len(obligations.AgedAttempted)}
+	if len(obligations.Pending) == 0 {
+		if health.agedAttempted == 0 {
+			return health, nil
+		}
+		return health, fmt.Errorf("wake outbox has outstanding obligations: %s", health)
+	}
+	if resolve == nil {
+		return replyWakeOutboxHealth{}, errors.New("classify wake outbox obligations: delivery resolver is required")
+	}
+	delivery, err := resolve(ctx)
+	if err != nil {
+		return replyWakeOutboxHealth{}, fmt.Errorf("classify wake outbox obligations: %w", err)
+	}
 	for _, obligation := range obligations.Pending {
-		// Directives are config-inert by contract: without a matching rule their
-		// durable row remains pending for later configuration, not as a permanent
-		// daemon health error stream.
-		if strings.HasPrefix(strings.ToLower(obligation.CoalesceKey), db.WakeOutboxDirectiveCoalescePrefix) {
+		event, err := wakeOutboxEvent([]db.WakeOutboxObligation{obligation}, attemptedBefore)
+		if err != nil {
+			return replyWakeOutboxHealth{}, fmt.Errorf("classify wake outbox row %d: %w", obligation.ID, err)
+		}
+		if len(matchingWakeRules(delivery.rules, event)) == 0 {
+			health.inert++
 			continue
 		}
-		pending++
+		health.pending++
 	}
-	agedAttempted := len(obligations.AgedAttempted)
-	if pending == 0 && agedAttempted == 0 {
-		return nil
+	if health.pending == 0 && health.agedAttempted == 0 {
+		return health, nil
 	}
-	return fmt.Errorf(
-		"wake outbox has outstanding obligations: pending=%d aged_attempted=%d",
-		pending,
-		agedAttempted,
-	)
+	return health, fmt.Errorf("wake outbox has outstanding obligations: %s", health)
 }
 
 type synchronousWakeOutboxSink interface {
