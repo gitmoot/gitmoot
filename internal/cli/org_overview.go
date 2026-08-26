@@ -140,8 +140,9 @@ func storeOrgLiveSource(shared *orgSharedState) orgLiveSource {
 		}
 		now := time.Now().UTC()
 		var latest time.Time
-		states := make(map[string]org.RoleLiveState, len(cfg.Roles()))
-		for _, role := range cfg.Roles() {
+		members := loadOrgRoster(ctx, shared.Store, cfg).Members()
+		states := make(map[string]org.RoleLiveState, len(members))
+		for _, role := range members {
 			state := org.StateUnknown
 			if blocked[role.Name] {
 				state = org.StateBlocked
@@ -213,7 +214,7 @@ func buildOrgStatusRows(ctx context.Context, shared *orgSharedState, src orgLive
 	if err != nil {
 		return nil, &orgLiveSourceError{err: err}
 	}
-	roles := shared.Config.Roles()
+	roles := loadOrgRoster(ctx, shared.Store, shared.Config).Members()
 	rows := make([]orgStatusOutput, 0, len(roles))
 	observedNow := time.Now().UTC()
 	for _, role := range roles {

@@ -899,7 +899,7 @@ func mergeGateEscalationFrom(cfg config.OrgConfig, repo string) string {
 
 func repoOrgOwner(cfg config.OrgConfig, repo string) (string, bool) {
 	best, bestDepth := "", -1
-	for _, role := range cfg.Roles() {
+	for _, role := range loadOrgRoster(context.Background(), nil, cfg).Members() {
 		if config.ScopeMatches(role.Scope, repo) {
 			if depth := len(cfg.Path(role.Name)); depth > bestDepth {
 				best, bestDepth = role.Name, depth

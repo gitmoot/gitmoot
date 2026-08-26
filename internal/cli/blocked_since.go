@@ -312,7 +312,7 @@ func runBlockedRoleWakeOnce(ctx context.Context, store *db.Store, home string, s
 		writeLine(stdout, "blocked_since role org config load failed: %v", err)
 		return
 	}
-	roles := orgConfig.Roles()
+	roles := loadOrgRoster(ctx, store, orgConfig).Members()
 	if len(roles) == 0 {
 		// No org roles configured: there is nothing to snapshot or persist, so
 		// skip silently (matches the pre-#1118 behavior for an unconfigured
