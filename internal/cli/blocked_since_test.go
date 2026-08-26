@@ -376,19 +376,15 @@ func TestRunBlockedRoleWakeOnceDoesNotWakePausedSeat(t *testing.T) {
 		},
 		eventSink: func(context.Context, *db.Store, string) (events.Sink, error) { return sink, nil },
 		roster: func(_ context.Context, _ *db.Store, cfg config.OrgConfig) orgRoster {
-			owner, ownerOK := cfg.Role("owner")
-			review, reviewOK := cfg.Role("review")
-			if !ownerOK || !reviewOK {
-				t.Fatal("test org roles missing")
+			if _, ok := cfg.Role("owner"); !ok {
+				t.Fatal("test org role owner missing")
 			}
-			return orgRoster{
-				members:   []config.OrgRole{owner, review},
-				nudgeable: []config.OrgRole{review},
-				standing: map[string]orgSeatStanding{
-					"owner":  orgSeatPaused,
-					"review": orgSeatActive,
-				},
+			if _, ok := cfg.Role("review"); !ok {
+				t.Fatal("test org role review missing")
 			}
+			// Rosters are constructed only through the resolver (round 3:
+			// the fields are unexported outside internal/config).
+			return resolveOrgRoster(cfg, nil, map[string]string{"owner": "test pause"})
 		},
 	}
 
