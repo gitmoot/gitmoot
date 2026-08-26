@@ -247,7 +247,8 @@ func (f *fakeBlockedRoleAvailability) Available(context.Context) bool {
 	return f.available
 }
 
-func TestRunBlockedRoleWakeOnceUsesInjectedProviderAndDedups(t *testing.T) {
+func blockedRoleWakeTestStore(t *testing.T) (string, *db.Store) {
+	t.Helper()
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
 	if err := config.Initialize(paths); err != nil {
@@ -282,7 +283,12 @@ blocked_role_wake_after = "1h"
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	t.Cleanup(func() { _ = store.Close() })
+	return home, store
+}
+
+func TestRunBlockedRoleWakeOnceUsesInjectedProviderAndDedups(t *testing.T) {
+	home, store := blockedRoleWakeTestStore(t)
 
 	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
 	snapshot := org.Snapshot{
@@ -347,6 +353,54 @@ blocked_role_wake_after = "1h"
 	}
 	if len(livePresence) != 1 || livePresence[0].Role != "owner" || livePresence[0].State != string(org.StateWorking) {
 		t.Fatalf("persisted live presence after reap = %+v", livePresence)
+	}
+}
+
+func TestRunBlockedRoleWakeOnceDoesNotWakePausedSeat(t *testing.T) {
+	home, store := blockedRoleWakeTestStore(t)
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	snapshot := org.Snapshot{
+		States: map[string]org.RoleLiveState{
+			"owner":  {State: org.StateBlocked},
+			"review": {State: org.StateIdle},
+		},
+		ObservedAt: now.Add(-2 * time.Hour), ProviderVersion: "test-v1",
+	}
+	sink := &recordingSink{}
+	var providerRoles []config.OrgRole
+	deps := blockedRoleWakeDependencies{
+		availability: &fakeBlockedRoleAvailability{available: true},
+		provider: func(roles []config.OrgRole) org.Provider {
+			providerRoles = append([]config.OrgRole(nil), roles...)
+			return orgFixtureProvider{snapshot: snapshot}
+		},
+		eventSink: func(context.Context, *db.Store, string) (events.Sink, error) { return sink, nil },
+		roster: func(_ context.Context, _ *db.Store, cfg config.OrgConfig) orgRoster {
+			if _, ok := cfg.Role("owner"); !ok {
+				t.Fatal("test org role owner missing")
+			}
+			if _, ok := cfg.Role("review"); !ok {
+				t.Fatal("test org role review missing")
+			}
+			// Rosters are constructed only through the resolver (round 3:
+			// the fields are unexported outside internal/config).
+			return resolveOrgRoster(cfg, nil, map[string]string{"owner": "test pause"})
+		},
+	}
+
+	runBlockedRoleWakeOnce(context.Background(), store, home, io.Discard, now, deps)
+	if got := len(sink.byType(events.EventJobBlocked)); got != 0 {
+		t.Fatalf("paused owner job.blocked events = %d, want 0", got)
+	}
+	if len(providerRoles) != 2 || providerRoles[0].Name != "owner" || providerRoles[1].Name != "review" {
+		t.Fatalf("provider roles = %v, want Members() including paused owner", providerRoles)
+	}
+	presence, err := store.ListRoleLivePresence(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(presence) != 2 || presence[0].Role != "owner" || presence[0].State != string(org.StateBlocked) {
+		t.Fatalf("persisted live presence = %+v, want paused owner retained", presence)
 	}
 }
 

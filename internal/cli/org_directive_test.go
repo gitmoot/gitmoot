@@ -241,8 +241,14 @@ func TestDirectiveWakeOutboxIsConfigInert(t *testing.T) {
 	if err := drainReplyWakeOutbox(context.Background(), store, createdAt.Add(replyWakeCoalescingWindow+time.Second), replyWakeTestDeliveryResolver(deliverySink)); err != nil {
 		t.Fatalf("config-inert drain for directive %d: %v", directive.ID, err)
 	}
-	if err := wakeOutboxObligationHealth(context.Background(), store, createdAt.Add(-time.Minute)); err != nil {
-		t.Fatalf("config-inert directive health: %v", err)
+	health, err := wakeOutboxObligationHealth(
+		context.Background(),
+		store,
+		createdAt.Add(-time.Minute),
+		replyWakeTestDeliveryResolver(deliverySink),
+	)
+	if err != nil || health.pending != 0 || health.inert != 1 {
+		t.Fatalf("config-inert directive health: %s err=%v", health, err)
 	}
 	stillPending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
 	if err != nil || len(stillPending) != 1 || wake.promptCalls != 0 {

@@ -645,7 +645,7 @@ func runOrgValidateOrShow(args []string, stdout, stderr io.Writer) int {
 	if args[0] == "validate" {
 		return runOrgValidateReality(context.Background(), paths, cfg, stdout, stderr)
 	}
-	for _, role := range cfg.Roles() {
+	for _, role := range loadOrgRoster(context.Background(), nil, cfg).Members() {
 		fmt.Fprintf(stdout, "%s\tparent=%s\tscope=%s\tmerge_rule=%s\n", role.Name, role.Parent, strings.Join(role.Scope, ","), firstNonEmpty(role.MergeRule, "owner"))
 	}
 	return 0
@@ -697,11 +697,12 @@ func runOrgValidateReality(ctx context.Context, paths config.Paths, cfg config.O
 		missedByRole[strings.ToLower(strings.TrimSpace(missed.Role))] = missed.Consecutive
 	}
 	claimedPanes := make(map[string]string)
+	roster := loadOrgRoster(ctx, store, cfg)
 	summary := orgValidationSummary{
-		roles: len(cfg.Roles()), livePanes: len(snapshot.Panes), enabledRoutes: enabledRoutes,
+		roles: len(roster.Members()), livePanes: len(snapshot.Panes), enabledRoutes: enabledRoutes,
 	}
 	var issues []string
-	for _, role := range cfg.Roles() {
+	for _, role := range roster.Members() {
 		name := strings.ToLower(strings.TrimSpace(role.Name))
 		binding := snapshot.PaneBindings[name]
 		if strings.TrimSpace(binding.PaneID) == "" {
@@ -1198,7 +1199,7 @@ func loadOrgCommandState(ctx context.Context, home string) (config.OrgConfig, ma
 }
 
 func orgProviderSnapshot(ctx context.Context, cfg config.OrgConfig) (org.Snapshot, error) {
-	provider := newOrgProvider(cfg.Roles())
+	provider := newOrgProvider(loadOrgRoster(ctx, nil, cfg).Members())
 	if provider == nil {
 		return org.Snapshot{}, errors.New("organization live-state provider is not configured")
 	}

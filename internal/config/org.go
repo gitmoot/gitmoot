@@ -109,7 +109,11 @@ func (c OrgConfig) Roots() []string {
 	return roots
 }
 
-func (c OrgConfig) Roles() []OrgRole {
+// sortedRoles is deliberately unexported (#1635 / PR #1637 round 3): the only
+// cross-package enumeration path is ResolveOrgRoster, so a consumer that
+// bypasses lifecycle classification does not compile. See org_roster.go for
+// the stated limits of this boundary.
+func (c OrgConfig) sortedRoles() []OrgRole {
 	names := make([]string, 0, len(c.roles))
 	for name := range c.roles {
 		names = append(names, name)

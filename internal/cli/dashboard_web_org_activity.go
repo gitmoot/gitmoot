@@ -157,7 +157,7 @@ func (d *webDataSource) fleetActivitySnapshot(ctx context.Context) (dashboardFle
 	if !cfg.Enabled() {
 		live.ObservedAt = time.Now().UTC()
 	} else {
-		provider := newOrgProvider(cfg.Roles())
+		provider := newOrgProvider(loadOrgRoster(ctx, nil, cfg).Members())
 		if provider == nil {
 			sourceErr = errors.New("Herdr organization provider is not configured")
 		} else {
@@ -235,7 +235,7 @@ func buildDashboardFleetActivity(
 	}
 	out.Summary.EscalationsOpen = len(dashboardOrgEscalations(escalations, "", resolved))
 
-	for _, role := range cfg.Roles() {
+	for _, role := range loadOrgRoster(ctx, store, cfg).Members() {
 		name := strings.ToLower(strings.TrimSpace(role.Name))
 		item := dashboardFleetActivityRole{
 			Name: role.Name, DisplayName: dashboardOrgDisplayName(cfg, role.Name),
