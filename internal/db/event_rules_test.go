@@ -42,6 +42,91 @@ func TestEventRuleRoundTrip(t *testing.T) {
 	if len(rules) != 0 {
 		t.Fatalf("rules after delete = %#v", rules)
 	}
+	deletions, err := store.ListDeletedEventRulesForRoutes(ctx, []EventRuleRoute{{
+		OnKind: want.OnKind, WakeRole: want.WakeRole,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deletions) != 1 || deletions[0].EventRule != want || strings.TrimSpace(deletions[0].DeletedAt) == "" {
+		t.Fatalf("deleted rules = %#v, want one complete tombstone for %#v", deletions, want)
+	}
+}
+
+func TestDeleteEventRulesForRoleRecordsDeletionHistory(t *testing.T) {
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	rules := []EventRule{
+		{ID: "owner-reply", OnKind: "reply", WakeRole: "owner", Enabled: true},
+		{ID: "owner-blocked", OnKind: "blocked", WakeRole: "owner", Enabled: true},
+		{ID: "worker-reply", OnKind: "reply", WakeRole: "worker", Enabled: true},
+	}
+	if err := store.AddEventRules(ctx, rules); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := store.DeleteEventRulesForRole(ctx, "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 2 {
+		t.Fatalf("removed rules = %#v, want two owner rules", removed)
+	}
+	active, err := store.ListEventRules(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 || active[0].ID != "worker-reply" {
+		t.Fatalf("active rules = %#v, want worker rule only", active)
+	}
+	deletions, err := store.ListDeletedEventRulesForRoutes(ctx, []EventRuleRoute{
+		{OnKind: "reply", WakeRole: "owner"},
+		{OnKind: "blocked", WakeRole: "owner"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deletions) != 2 || deletions[0].WakeRole != "owner" || deletions[1].WakeRole != "owner" {
+		t.Fatalf("deleted rules = %#v, want two owner tombstones", deletions)
+	}
+}
+
+func TestDeletedEventRuleRouteLookupUsesBoundedIndex(t *testing.T) {
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	rows, err := store.db.QueryContext(context.Background(), `EXPLAIN QUERY PLAN
+		SELECT id, on_kind, match_filter, wake_role, scope, enabled, created_at, deleted_at
+		FROM event_rule_deletions
+		WHERE enabled = 1 AND (wake_role = ? COLLATE NOCASE AND on_kind = ? COLLATE NOCASE)
+		ORDER BY deletion_id`, "owner", "reply")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	usedBoundedIndex := false
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(detail, "idx_event_rule_deletions_route") {
+			usedBoundedIndex = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !usedBoundedIndex {
+		t.Fatal("deleted event-rule route lookup did not use idx_event_rule_deletions_route")
+	}
 }
 
 func TestEventRuleScopeObserverRoundTripAndValidation(t *testing.T) {

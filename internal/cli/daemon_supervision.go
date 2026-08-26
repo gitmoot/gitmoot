@@ -728,8 +728,11 @@ func startSingleRepoWorkerLoop(ctx context.Context, interval time.Duration, stor
 		// The durable reply outbox is store-global maintenance. Run it once at
 		// the supervisor boundary, outside the repository tick, matching the
 		// multi-repo fleet loop.
-		if err := drainFleetReplyWakeOutbox(ctx, store, worker, now); err != nil {
+		health, err := drainFleetReplyWakeOutbox(ctx, store, worker, now)
+		if err != nil {
 			writeLine(stdout, "reply wake outbox drain unhealthy: %v", err)
+		} else if health.inert > 0 {
+			writeLine(stdout, "reply wake outbox drain health: %s", health)
 		}
 		// The checkout lock now guards the TICK (maintenance + claim/dispatch),
 		// not whole job runs: dispatched jobs execute on their own goroutines
