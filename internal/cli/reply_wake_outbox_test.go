@@ -235,6 +235,55 @@ func TestWakeOutboxHealthDistinguishesRemovedRouteFromNeverConfigured(t *testing
 	}
 }
 
+func TestWakeOutboxHealthBoundsDeletedRuleLookupToPendingRoutes(t *testing.T) {
+	store := daemonWorkerStore(t)
+	ctx := context.Background()
+	rules := []db.EventRule{{
+		ID: "reply-owner", OnKind: "reply", WakeRole: "owner", Enabled: true,
+	}}
+	for i := 0; i < 100; i++ {
+		rules = append(rules, db.EventRule{
+			ID: fmt.Sprintf("unrelated-%03d", i), OnKind: "reply", WakeRole: "unrelated", Enabled: true,
+		})
+	}
+	if err := store.AddEventRules(ctx, rules); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/bounded-route-history", Author: "worker", Body: "owner",
+		AddressedTarget: "owner",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteEventRule(ctx, "reply-owner"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DeleteEventRulesForRole(ctx, "unrelated"); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`UPDATE event_rule_deletions SET deleted_at = 'malformed' WHERE wake_role = 'unrelated'`); err != nil {
+		t.Fatal(err)
+	}
+
+	health, err := wakeOutboxObligationHealth(
+		ctx,
+		store,
+		time.Now().UTC().Add(-replyWakeAttemptedUnknownAfter),
+		func(context.Context) (replyWakeDelivery, error) {
+			return replyWakeDelivery{}, nil
+		},
+	)
+	if err == nil || health.routeRemoved != 1 || health.inert != 0 || health.pending != 0 ||
+		!strings.Contains(err.Error(), "pending=0 inert=0 route_removed=1 aged_attempted=0") {
+		t.Fatalf("bounded route-history health = %s err=%v, want one relevant tombstone from 101 total", health, err)
+	}
+}
+
 func TestReplyWakeOutboxMalformedRowDoesNotBlockOtherRoleDelivery(t *testing.T) {
 	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{
 		{"owner", "w1:p1"},

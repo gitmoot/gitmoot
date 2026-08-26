@@ -36,6 +36,13 @@ type DeletedEventRule struct {
 	DeletedAt string
 }
 
+// EventRuleRoute identifies the event kind and addressed role that can make a
+// wake-outbox row routable.
+type EventRuleRoute struct {
+	OnKind   string
+	WakeRole string
+}
+
 // AddEventRule persists a new opt-in event rule.
 func (s *Store) AddEventRule(ctx context.Context, rule EventRule) error {
 	rule, err := normalizeEventRule(rule)
@@ -160,10 +167,34 @@ func (s *Store) ListEventRules(ctx context.Context) ([]EventRule, error) {
 	return rules, rows.Err()
 }
 
-// ListDeletedEventRules returns durable rule tombstones in deletion order.
-func (s *Store) ListDeletedEventRules(ctx context.Context) ([]DeletedEventRule, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, on_kind, COALESCE(match_filter, ''), wake_role, scope, enabled, created_at, deleted_at
-		FROM event_rule_deletions ORDER BY deletion_id`)
+// ListDeletedEventRulesForRoutes returns enabled tombstones for the exact
+// kind/role pairs that could route current wake-outbox rows.
+func (s *Store) ListDeletedEventRulesForRoutes(ctx context.Context, routes []EventRuleRoute) ([]DeletedEventRule, error) {
+	conditions := make([]string, 0, len(routes))
+	args := make([]any, 0, 2*len(routes))
+	seen := make(map[string]struct{}, len(routes))
+	for _, route := range routes {
+		onKind := strings.TrimSpace(route.OnKind)
+		wakeRole := strings.TrimSpace(route.WakeRole)
+		if onKind == "" || wakeRole == "" {
+			continue
+		}
+		key := strings.ToLower(wakeRole) + "\x00" + strings.ToLower(onKind)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		conditions = append(conditions, `(wake_role = ? COLLATE NOCASE AND on_kind = ? COLLATE NOCASE)`)
+		args = append(args, wakeRole, onKind)
+	}
+	if len(conditions) == 0 {
+		return []DeletedEventRule{}, nil
+	}
+	query := `SELECT id, on_kind, COALESCE(match_filter, ''), wake_role, scope, enabled, created_at, deleted_at
+		FROM event_rule_deletions
+		WHERE enabled = 1 AND (` + strings.Join(conditions, " OR ") + `)
+		ORDER BY deletion_id`
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

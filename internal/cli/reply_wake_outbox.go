@@ -35,8 +35,8 @@ type replyWakeDeliveryResolver func(context.Context) (replyWakeDelivery, error)
 type replyWakeOutboxHealth struct {
 	pending int
 	inert   int
-	// routeRemoved means the row matched an earlier authoritative rule
-	// snapshot in this drain, but not the final snapshot.
+	// routeRemoved means a durable tombstone proves that a matching rule was
+	// deleted after the pending row existed.
 	routeRemoved  int
 	agedAttempted int
 }
@@ -188,7 +188,34 @@ func wakeOutboxObligationHealth(
 	if err != nil {
 		return replyWakeOutboxHealth{}, fmt.Errorf("classify wake outbox obligations: %w", err)
 	}
-	deletedRules, err := store.ListDeletedEventRules(ctx)
+	type unmatchedWakeObligation struct {
+		event     events.Event
+		createdAt time.Time
+	}
+	unmatched := make([]unmatchedWakeObligation, 0, len(obligations.Pending))
+	routes := make([]db.EventRuleRoute, 0, len(obligations.Pending))
+	seenRoutes := make(map[string]struct{})
+	for _, obligation := range obligations.Pending {
+		event, err := wakeOutboxEvent([]db.WakeOutboxObligation{obligation}, attemptedBefore)
+		if err != nil {
+			return replyWakeOutboxHealth{}, fmt.Errorf("classify wake outbox row %d: %w", obligation.ID, err)
+		}
+		if len(matchingWakeRules(delivery.rules, event)) > 0 {
+			health.pending++
+			continue
+		}
+		createdAt, err := time.Parse(time.RFC3339Nano, obligation.CreatedAt)
+		if err != nil {
+			return replyWakeOutboxHealth{}, fmt.Errorf("parse wake outbox created_at for row %d: %w", obligation.ID, err)
+		}
+		unmatched = append(unmatched, unmatchedWakeObligation{event: event, createdAt: createdAt})
+		key := wakeRuleRouteKey(event.WakeTargetRole, event.WakeKind)
+		if _, ok := seenRoutes[key]; !ok {
+			seenRoutes[key] = struct{}{}
+			routes = append(routes, db.EventRuleRoute{OnKind: event.WakeKind, WakeRole: event.WakeTargetRole})
+		}
+	}
+	deletedRules, err := store.ListDeletedEventRulesForRoutes(ctx, routes)
 	if err != nil {
 		return replyWakeOutboxHealth{}, fmt.Errorf("classify wake outbox obligations against deleted rules: %w", err)
 	}
@@ -196,24 +223,13 @@ func wakeOutboxObligationHealth(
 	if err != nil {
 		return replyWakeOutboxHealth{}, fmt.Errorf("classify wake outbox obligations against deleted rules: %w", err)
 	}
-	for _, obligation := range obligations.Pending {
-		event, err := wakeOutboxEvent([]db.WakeOutboxObligation{obligation}, attemptedBefore)
-		if err != nil {
-			return replyWakeOutboxHealth{}, fmt.Errorf("classify wake outbox row %d: %w", obligation.ID, err)
-		}
-		if len(matchingWakeRules(delivery.rules, event)) == 0 {
-			createdAt, err := time.Parse(time.RFC3339Nano, obligation.CreatedAt)
-			if err != nil {
-				return replyWakeOutboxHealth{}, fmt.Errorf("parse wake outbox created_at for row %d: %w", obligation.ID, err)
-			}
-			if matchesDeletedWakeRule(deletedRulesAt, event, createdAt) {
-				health.routeRemoved++
-				continue
-			}
-			health.inert++
+	for _, obligation := range unmatched {
+		deletions := deletedRulesAt[wakeRuleRouteKey(obligation.event.WakeTargetRole, obligation.event.WakeKind)]
+		if matchesDeletedWakeRule(deletions, obligation.event, obligation.createdAt) {
+			health.routeRemoved++
 			continue
 		}
-		health.pending++
+		health.inert++
 	}
 	if health.pending == 0 && health.routeRemoved == 0 && health.agedAttempted == 0 {
 		return health, nil
@@ -226,16 +242,21 @@ type deletedWakeRule struct {
 	deletedAt time.Time
 }
 
-func parseDeletedWakeRules(deletions []db.DeletedEventRule) ([]deletedWakeRule, error) {
-	parsed := make([]deletedWakeRule, 0, len(deletions))
+func parseDeletedWakeRules(deletions []db.DeletedEventRule) (map[string][]deletedWakeRule, error) {
+	parsed := make(map[string][]deletedWakeRule)
 	for _, deletion := range deletions {
 		deletedAt, err := time.Parse(time.RFC3339Nano, deletion.DeletedAt)
 		if err != nil {
 			return nil, fmt.Errorf("parse deletion time for event rule %q: %w", deletion.ID, err)
 		}
-		parsed = append(parsed, deletedWakeRule{rule: deletion.EventRule, deletedAt: deletedAt})
+		key := wakeRuleRouteKey(deletion.WakeRole, deletion.OnKind)
+		parsed[key] = append(parsed[key], deletedWakeRule{rule: deletion.EventRule, deletedAt: deletedAt})
 	}
 	return parsed, nil
+}
+
+func wakeRuleRouteKey(wakeRole, onKind string) string {
+	return strings.ToLower(strings.TrimSpace(wakeRole)) + "\x00" + strings.ToLower(strings.TrimSpace(onKind))
 }
 
 func matchesDeletedWakeRule(deletions []deletedWakeRule, event events.Event, rowCreatedAt time.Time) bool {

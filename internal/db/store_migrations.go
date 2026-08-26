@@ -2090,7 +2090,13 @@ CREATE TABLE event_rule_deletions (
 	created_at TEXT NOT NULL,
 	deleted_at TEXT NOT NULL
 );
-CREATE INDEX idx_event_rule_deletions_deleted_at
-	ON event_rule_deletions(deleted_at, deletion_id);
+CREATE INDEX idx_event_rule_deletions_route
+	ON event_rule_deletions(
+		wake_role COLLATE NOCASE,
+		on_kind COLLATE NOCASE,
+		deleted_at,
+		deletion_id
+	)
+	WHERE enabled = 1;
 	`,
 }
