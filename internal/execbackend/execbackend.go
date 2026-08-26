@@ -37,9 +37,9 @@ const (
 	// implemented execution backend. It resolves to today's behaviour exactly:
 	// the existing runner composition with subprocess.GroupRunner{} innermost.
 	Local Backend = "local"
-	// Remote reserves the brokered-credential classification for a future
-	// execution backend. It is intentionally absent from AllowedNames until an
-	// implementation exists, so Parse continues to reject it.
+	// Remote reserves the name for a future execution backend. It is
+	// intentionally absent from AllowedNames until an implementation exists, so
+	// Parse continues to reject it.
 	Remote Backend = "remote"
 )
 
@@ -47,19 +47,6 @@ const (
 // error messages render them. Parse accepts names exclusively from this list,
 // so a backend cannot be accepted without also being advertised.
 var AllowedNames = []string{string(Local)}
-
-// RequiresBrokeredCredentials classifies every declared execution backend.
-// There is intentionally no default arm: a newly declared backend is
-// unclassified until its credential handling is explicitly decided.
-func RequiresBrokeredCredentials(backend Backend) (bool, error) {
-	switch backend {
-	case Local:
-		return false, nil
-	case Remote:
-		return true, nil
-	}
-	return true, fmt.Errorf("execution backend %q has no brokered credential classification", backend)
-}
 
 // Allowed renders the allowed set for error messages (e.g. "local").
 func Allowed() string {

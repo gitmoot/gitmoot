@@ -25,9 +25,8 @@ const DefaultAnthropicUpstream = "https://api.anthropic.com"
 const CapabilityHeader = "X-Gitmoot-Capability"
 
 const (
-	proxyCapabilityBytes   = 32
-	proxyCapabilityTTL     = 5 * time.Minute
-	proxyCapabilityOverlap = 30 * time.Second
+	proxyCapabilityBytes = 32
+	proxyCapabilityTTL   = 5 * time.Minute
 )
 
 type CredentialKind string
@@ -94,7 +93,6 @@ type Gateway struct {
 	mu           sync.RWMutex
 	entries      map[string]entry
 	proxyEntries map[string]proxyEntry
-	networks     map[*NetworkProxy]struct{}
 	now          func() time.Time
 	closed       bool
 }
@@ -107,16 +105,12 @@ type entry struct {
 }
 
 type proxyEntry struct {
-	jobID            string
-	placeholder      string
-	policy           ProxyPolicy
-	upstream         *url.URL
-	resolver         CredentialResolver
-	capability       proxyCapability
-	previous         proxyCapability
-	absoluteDeadline time.Time
-	clientCertHash   [sha256.Size]byte
-	networkEnabled   bool
+	jobID       string
+	placeholder string
+	policy      ProxyPolicy
+	upstream    *url.URL
+	resolver    CredentialResolver
+	capability  proxyCapability
 }
 
 type proxyCapability struct {
@@ -140,7 +134,6 @@ func Start(logf LogFunc) (*Gateway, error) {
 		logf:         logf,
 		entries:      make(map[string]entry),
 		proxyEntries: make(map[string]proxyEntry),
-		networks:     make(map[*NetworkProxy]struct{}),
 		now:          time.Now,
 	}
 	gateway.server = &http.Server{
@@ -273,18 +266,8 @@ func (g *Gateway) Close(ctx context.Context) error {
 	g.closed = true
 	clear(g.entries)
 	clear(g.proxyEntries)
-	networks := make([]*NetworkProxy, 0, len(g.networks))
-	for network := range g.networks {
-		networks = append(networks, network)
-	}
-	clear(g.networks)
 	g.mu.Unlock()
 	var errs []error
-	for _, network := range networks {
-		if err := network.server.Shutdown(ctx); err != nil {
-			errs = append(errs, err)
-		}
-	}
 	if err := g.server.Shutdown(ctx); err != nil {
 		errs = append(errs, err)
 	}
@@ -359,12 +342,10 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, route strin
 }
 
 type proxyRequestAccess struct {
-	route          string
-	capability     string
-	suffixRoute    string
-	authority      string
-	clientCertHash [sha256.Size]byte
-	network        bool
+	route       string
+	capability  string
+	suffixRoute string
+	authority   string
 }
 
 func (g *Gateway) serveProxyRequest(w http.ResponseWriter, r *http.Request, access proxyRequestAccess) {
@@ -384,11 +365,6 @@ func (g *Gateway) serveProxyRequest(w http.ResponseWriter, r *http.Request, acce
 	if r.URL.IsAbs() || r.URL.Host != "" || !strings.EqualFold(r.Host, access.authority) {
 		http.Error(w, "request target refused", http.StatusBadRequest)
 		g.writeLog(r.Method, registered.upstream.Hostname(), http.StatusBadRequest, registered.jobID)
-		return
-	}
-	if access.network && (!registered.networkEnabled || subtle.ConstantTimeCompare(access.clientCertHash[:], registered.clientCertHash[:]) != 1) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		g.writeLog(r.Method, registered.upstream.Hostname(), http.StatusUnauthorized, registered.jobID)
 		return
 	}
 	suffix, err := proxyRequestSuffix(r.URL.EscapedPath(), access.suffixRoute)
@@ -554,9 +530,7 @@ func validProxyCapability(capability string, registered proxyEntry, now time.Tim
 		return false
 	}
 	presented := sha256.Sum256(decoded)
-	current := subtle.ConstantTimeCompare(presented[:], registered.capability.hash[:]) == 1 && now.Before(registered.capability.expiresAt)
-	previous := subtle.ConstantTimeCompare(presented[:], registered.previous.hash[:]) == 1 && now.Before(registered.previous.expiresAt)
-	return current || previous
+	return subtle.ConstantTimeCompare(presented[:], registered.capability.hash[:]) == 1 && now.Before(registered.capability.expiresAt)
 }
 
 func (g *Gateway) nowTime() time.Time {
