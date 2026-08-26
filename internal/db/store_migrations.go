@@ -2113,4 +2113,26 @@ CREATE INDEX idx_event_rule_deletions_route
 ALTER TABLE workflow_notes ADD COLUMN directive_parked_at TEXT NOT NULL DEFAULT '';
 ALTER TABLE workflow_notes ADD COLUMN directive_parked_reason TEXT NOT NULL DEFAULT '';
 	`,
+	// #1635 archive-agents ingest: the durable mirror of herdr-observed
+	// archived seats. herdr is the SOLE authority (gitmoot never writes archive
+	// state to herdr); these rows are a read cache with exactly one write site
+	// (the daemon one-minute org lane) mutated only after a SUCCESSFUL
+	// `herdr agent list` read. org_archive_poll records the last successful
+	// poll so staleness can go LOUD (doctor) while the fail direction stays
+	// preserved-exclusion: herdr-down never flips an archived seat back into
+	// sweeps and nudges.
+	`
+CREATE TABLE org_role_archived (
+	role TEXT PRIMARY KEY,
+	archived_at TEXT NOT NULL,
+	archived_by TEXT NOT NULL DEFAULT '',
+	reason TEXT NOT NULL DEFAULT '',
+	parked_work TEXT NOT NULL DEFAULT '',
+	observed_at TEXT NOT NULL
+);
+CREATE TABLE org_archive_poll (
+	id INTEGER PRIMARY KEY CHECK(id = 1),
+	last_success_at TEXT NOT NULL
+);
+	`,
 }

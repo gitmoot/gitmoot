@@ -206,6 +206,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	if check, ok := orgRoleActivityDoctorCheck(paths); ok {
 		checks = append(checks, check)
 	}
+	if check, ok := orgArchiveMirrorDoctorCheck(paths); ok {
+		checks = append(checks, check)
+	}
 	if check, ok := permissionPolicyObservationDoctorCheck(paths); ok {
 		checks = append(checks, check)
 	}
