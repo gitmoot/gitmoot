@@ -42,6 +42,52 @@ func TestEventRuleRoundTrip(t *testing.T) {
 	if len(rules) != 0 {
 		t.Fatalf("rules after delete = %#v", rules)
 	}
+	deletions, err := store.ListDeletedEventRules(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deletions) != 1 || deletions[0].EventRule != want || strings.TrimSpace(deletions[0].DeletedAt) == "" {
+		t.Fatalf("deleted rules = %#v, want one complete tombstone for %#v", deletions, want)
+	}
+}
+
+func TestDeleteEventRulesForRoleRecordsDeletionHistory(t *testing.T) {
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	rules := []EventRule{
+		{ID: "owner-reply", OnKind: "reply", WakeRole: "owner", Enabled: true},
+		{ID: "owner-blocked", OnKind: "blocked", WakeRole: "owner", Enabled: true},
+		{ID: "worker-reply", OnKind: "reply", WakeRole: "worker", Enabled: true},
+	}
+	if err := store.AddEventRules(ctx, rules); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := store.DeleteEventRulesForRole(ctx, "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 2 {
+		t.Fatalf("removed rules = %#v, want two owner rules", removed)
+	}
+	active, err := store.ListEventRules(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 || active[0].ID != "worker-reply" {
+		t.Fatalf("active rules = %#v, want worker rule only", active)
+	}
+	deletions, err := store.ListDeletedEventRules(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deletions) != 2 || deletions[0].WakeRole != "owner" || deletions[1].WakeRole != "owner" {
+		t.Fatalf("deleted rules = %#v, want two owner tombstones", deletions)
+	}
 }
 
 func TestEventRuleScopeObserverRoundTripAndValidation(t *testing.T) {

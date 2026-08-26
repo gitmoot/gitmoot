@@ -97,10 +97,6 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store *db.Store, now ti
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	// Event-rule deletion is a hard delete, so the store has no durable route
-	// history. Preserve only what this drain can prove from snapshots it read.
-	previouslyRoutable := make(map[int64]struct{})
-
 	for _, key := range keys {
 		items := groups[key]
 		for start := 0; start < len(items); {
@@ -139,14 +135,6 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store *db.Store, now ti
 			if err != nil {
 				return replyWakeOutboxHealth{}, fmt.Errorf("resolve wake outbox delivery: %w", err)
 			}
-			if err := recordRoutableWakeOutboxObligations(
-				delivery.rules,
-				obligations.Pending,
-				now,
-				previouslyRoutable,
-			); err != nil {
-				return replyWakeOutboxHealth{}, err
-			}
 			if delivery.sink == nil {
 				break
 			}
@@ -173,25 +161,7 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store *db.Store, now ti
 			start = end
 		}
 	}
-	return wakeOutboxObligationHealth(ctx, store, attemptedBefore, resolve, previouslyRoutable)
-}
-
-func recordRoutableWakeOutboxObligations(
-	rules []db.EventRule,
-	obligations []db.WakeOutboxObligation,
-	now time.Time,
-	previouslyRoutable map[int64]struct{},
-) error {
-	for _, obligation := range obligations {
-		event, err := wakeOutboxEvent([]db.WakeOutboxObligation{obligation}, now)
-		if err != nil {
-			return fmt.Errorf("classify wake outbox row %d against delivery rules: %w", obligation.ID, err)
-		}
-		if len(matchingWakeRules(rules, event)) > 0 {
-			previouslyRoutable[obligation.ID] = struct{}{}
-		}
-	}
-	return nil
+	return wakeOutboxObligationHealth(ctx, store, attemptedBefore, resolve)
 }
 
 func wakeOutboxObligationHealth(
@@ -199,7 +169,6 @@ func wakeOutboxObligationHealth(
 	store *db.Store,
 	attemptedBefore time.Time,
 	resolve replyWakeDeliveryResolver,
-	previouslyRoutable map[int64]struct{},
 ) (replyWakeOutboxHealth, error) {
 	obligations, err := store.ListWakeOutboxObligations(ctx, attemptedBefore)
 	if err != nil {
@@ -219,13 +188,25 @@ func wakeOutboxObligationHealth(
 	if err != nil {
 		return replyWakeOutboxHealth{}, fmt.Errorf("classify wake outbox obligations: %w", err)
 	}
+	deletedRules, err := store.ListDeletedEventRules(ctx)
+	if err != nil {
+		return replyWakeOutboxHealth{}, fmt.Errorf("classify wake outbox obligations against deleted rules: %w", err)
+	}
+	deletedRulesAt, err := parseDeletedWakeRules(deletedRules)
+	if err != nil {
+		return replyWakeOutboxHealth{}, fmt.Errorf("classify wake outbox obligations against deleted rules: %w", err)
+	}
 	for _, obligation := range obligations.Pending {
 		event, err := wakeOutboxEvent([]db.WakeOutboxObligation{obligation}, attemptedBefore)
 		if err != nil {
 			return replyWakeOutboxHealth{}, fmt.Errorf("classify wake outbox row %d: %w", obligation.ID, err)
 		}
 		if len(matchingWakeRules(delivery.rules, event)) == 0 {
-			if _, wasRoutable := previouslyRoutable[obligation.ID]; wasRoutable {
+			createdAt, err := time.Parse(time.RFC3339Nano, obligation.CreatedAt)
+			if err != nil {
+				return replyWakeOutboxHealth{}, fmt.Errorf("parse wake outbox created_at for row %d: %w", obligation.ID, err)
+			}
+			if matchesDeletedWakeRule(deletedRulesAt, event, createdAt) {
 				health.routeRemoved++
 				continue
 			}
@@ -238,6 +219,35 @@ func wakeOutboxObligationHealth(
 		return health, nil
 	}
 	return health, fmt.Errorf("wake outbox has outstanding obligations: %s", health)
+}
+
+type deletedWakeRule struct {
+	rule      db.EventRule
+	deletedAt time.Time
+}
+
+func parseDeletedWakeRules(deletions []db.DeletedEventRule) ([]deletedWakeRule, error) {
+	parsed := make([]deletedWakeRule, 0, len(deletions))
+	for _, deletion := range deletions {
+		deletedAt, err := time.Parse(time.RFC3339Nano, deletion.DeletedAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse deletion time for event rule %q: %w", deletion.ID, err)
+		}
+		parsed = append(parsed, deletedWakeRule{rule: deletion.EventRule, deletedAt: deletedAt})
+	}
+	return parsed, nil
+}
+
+func matchesDeletedWakeRule(deletions []deletedWakeRule, event events.Event, rowCreatedAt time.Time) bool {
+	for _, deletion := range deletions {
+		if deletion.deletedAt.Before(rowCreatedAt) {
+			continue
+		}
+		if len(matchingWakeRules([]db.EventRule{deletion.rule}, event)) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 type synchronousWakeOutboxSink interface {

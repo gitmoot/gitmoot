@@ -28,6 +28,14 @@ type EventRule struct {
 	CreatedAt   string
 }
 
+// DeletedEventRule preserves the routing semantics and deletion time of a rule.
+// Wake-outbox health uses it to distinguish removed routes from rows that never
+// had a matching route.
+type DeletedEventRule struct {
+	EventRule
+	DeletedAt string
+}
+
 // AddEventRule persists a new opt-in event rule.
 func (s *Store) AddEventRule(ctx context.Context, rule EventRule) error {
 	rule, err := normalizeEventRule(rule)
@@ -152,11 +160,57 @@ func (s *Store) ListEventRules(ctx context.Context) ([]EventRule, error) {
 	return rules, rows.Err()
 }
 
+// ListDeletedEventRules returns durable rule tombstones in deletion order.
+func (s *Store) ListDeletedEventRules(ctx context.Context) ([]DeletedEventRule, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, on_kind, COALESCE(match_filter, ''), wake_role, scope, enabled, created_at, deleted_at
+		FROM event_rule_deletions ORDER BY deletion_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	deletions := []DeletedEventRule{}
+	for rows.Next() {
+		var deletion DeletedEventRule
+		var enabled int
+		if err := rows.Scan(
+			&deletion.ID,
+			&deletion.OnKind,
+			&deletion.MatchFilter,
+			&deletion.WakeRole,
+			&deletion.Scope,
+			&enabled,
+			&deletion.CreatedAt,
+			&deletion.DeletedAt,
+		); err != nil {
+			return nil, err
+		}
+		deletion.Enabled = enabled != 0
+		deletions = append(deletions, deletion)
+	}
+	return deletions, rows.Err()
+}
+
 // DeleteEventRule removes a rule by id. Removing an already-absent id is an
 // idempotent no-op, which keeps best-effort operator cleanup simple.
 func (s *Store) DeleteEventRule(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM event_rules WHERE id = ?`, strings.TrimSpace(id))
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	id = strings.TrimSpace(id)
+	deletedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO event_rule_deletions(
+		id, on_kind, match_filter, wake_role, scope, enabled, created_at, deleted_at
+	)
+	SELECT id, on_kind, match_filter, wake_role, scope, enabled, created_at, ?
+	FROM event_rules WHERE id = ?`, deletedAt, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM event_rules WHERE id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // DeleteEventRulesForRole removes all routes targeting role in one transaction
@@ -194,6 +248,14 @@ func (s *Store) DeleteEventRulesForRole(ctx context.Context, role string) ([]Eve
 		return nil, err
 	}
 	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	deletedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO event_rule_deletions(
+		id, on_kind, match_filter, wake_role, scope, enabled, created_at, deleted_at
+	)
+	SELECT id, on_kind, match_filter, wake_role, scope, enabled, created_at, ?
+	FROM event_rules WHERE LOWER(TRIM(wake_role)) = ?`, deletedAt, role); err != nil {
 		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM event_rules WHERE LOWER(TRIM(wake_role)) = ?`, role); err != nil {

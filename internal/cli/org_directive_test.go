@@ -246,7 +246,6 @@ func TestDirectiveWakeOutboxIsConfigInert(t *testing.T) {
 		store,
 		createdAt.Add(-time.Minute),
 		replyWakeTestDeliveryResolver(deliverySink),
-		nil,
 	)
 	if err != nil || health.pending != 0 || health.inert != 1 {
 		t.Fatalf("config-inert directive health: %s err=%v", health, err)

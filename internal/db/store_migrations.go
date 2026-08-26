@@ -2074,4 +2074,23 @@ CREATE INDEX idx_cleanup_obligations_due
 	ON cleanup_obligations(state, next_attempt_at, owner_job_id)
 	WHERE state IN ('pending', 'retryable');
 	`,
+	// #1496 durable event-rule deletion history. Wake-outbox rows deliberately
+	// remain pending when no route matches; preserving the deleted rule semantics
+	// lets health distinguish a route removed after a row existed from a route
+	// that was never configured. Append-only tail; migrations are positional.
+	`
+CREATE TABLE event_rule_deletions (
+	deletion_id INTEGER PRIMARY KEY AUTOINCREMENT,
+	id TEXT NOT NULL,
+	on_kind TEXT NOT NULL,
+	match_filter TEXT,
+	wake_role TEXT NOT NULL,
+	scope TEXT NOT NULL,
+	enabled INTEGER NOT NULL,
+	created_at TEXT NOT NULL,
+	deleted_at TEXT NOT NULL
+);
+CREATE INDEX idx_event_rule_deletions_deleted_at
+	ON event_rule_deletions(deleted_at, deletion_id);
+	`,
 }
