@@ -379,38 +379,25 @@ func TestReplyWakeOutboxInertHealthDoesNotEscalateSingleRepoLoop(t *testing.T) {
 	live := newDaemonReloadableConfig(30*time.Second, 1, false)
 	tracker := newInflightJobTracker(ctx)
 	var checkoutLock sync.Mutex
-	var stdout syncBuffer
+	stdout := &cancelAfterWakeHealthWriter{
+		cancel:    cancel,
+		threshold: maxConsecutiveWorkerTickFailures + 1,
+	}
 	errCh := startSingleRepoWorkerLoop(
 		ctx, 100*time.Microsecond, store, worker, live, &checkoutLock, tracker,
-		"owner/repo", "", &stdout,
+		"owner/repo", "", stdout,
 	)
 
-	deadline := time.Now().Add(5 * time.Second)
-	for strings.Count(stdout.String(), "reply wake outbox drain health:") <= maxConsecutiveWorkerTickFailures {
-		select {
-		case err := <-errCh:
-			t.Fatalf("single-repo loop escalated persistent inert wake health: %v", err)
-		default:
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("single-repo loop did not report inert health beyond %d ticks; log=%q", maxConsecutiveWorkerTickFailures, stdout.String())
-		}
-		time.Sleep(time.Millisecond)
-	}
-	select {
-	case err := <-errCh:
-		t.Fatalf("single-repo loop exited while reporting inert health: %v", err)
-	default:
-	}
-
-	cancel()
 	select {
 	case err, ok := <-errCh:
 		if ok && err != nil {
-			t.Fatalf("single-repo loop shutdown surfaced error: %v", err)
+			t.Fatalf("single-repo loop escalated persistent inert wake health: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("single-repo loop did not stop after cancellation")
+		t.Fatalf("single-repo loop did not report inert health beyond %d ticks; log=%q", maxConsecutiveWorkerTickFailures, stdout.String())
+	}
+	if got := strings.Count(stdout.String(), "reply wake outbox drain health:"); got <= maxConsecutiveWorkerTickFailures {
+		t.Fatalf("inert health lines = %d, want more than escalation threshold %d; log=%q", got, maxConsecutiveWorkerTickFailures, stdout.String())
 	}
 	if strings.Contains(stdout.String(), "consecutive failures, escalating") {
 		t.Fatalf("inert reply wake health reached escalation ladder: %q", stdout.String())
@@ -419,6 +406,28 @@ func TestReplyWakeOutboxInertHealthDoesNotEscalateSingleRepoLoop(t *testing.T) {
 		!strings.Contains(stdout.String(), "pending=0 inert=1 route_removed=0 aged_attempted=0") {
 		t.Fatalf("inert reply wake health log = %q", stdout.String())
 	}
+}
+
+// cancelAfterWakeHealthWriter makes shutdown deterministic: cancellation is
+// triggered only after the threshold-crossing health line has been committed,
+// so it cannot land inside the drain that produced the observed line.
+type cancelAfterWakeHealthWriter struct {
+	output    syncBuffer
+	cancel    context.CancelFunc
+	threshold int
+	once      sync.Once
+}
+
+func (w *cancelAfterWakeHealthWriter) Write(p []byte) (int, error) {
+	n, err := w.output.Write(p)
+	if err == nil && strings.Count(w.output.String(), "reply wake outbox drain health:") >= w.threshold {
+		w.once.Do(w.cancel)
+	}
+	return n, err
+}
+
+func (w *cancelAfterWakeHealthWriter) String() string {
+	return w.output.String()
 }
 
 func TestReplyWakeOutboxBurstCoalescesToExactlyOneWake(t *testing.T) {
