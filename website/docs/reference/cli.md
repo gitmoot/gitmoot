@@ -1327,6 +1327,20 @@ wall. If Claude supplies no parseable reset, Gitmoot uses the existing bounded
 15-minute quota fallback. Codex and Kimi quota-message detection are not part of
 this phase.
 
+Archived seats (herdrup#173, #1635): when Herdr archives an agent
+(`herdr agent archive`), the daemon's org lane observes the `archived` block on
+`herdr agent list` each tick and drops that seat from `org chart`, `org status`,
+health counts, sweeps, nudge ladders, and live presence — at one shared roster
+choke-point, not per consumer. Herdr owns archive state; Gitmoot only reads it,
+and a missing block means ACTIVE, so either side can deploy first. The seat's
+open directives are parked (nudge ladders suspended — not marked done, which
+would assert a deliverable exists, and not cancelled, which would discard the
+obligation) and return to the live sweep with fresh TTL anchors when an
+unarchive is observed. If Herdr is unreachable the last observation holds —
+exclusions are preserved rather than expiring toward inclusion — and
+`gitmoot doctor` warns once archived seats are held on a stale observation
+(default 15 minutes).
+
 The read-only Org page consumes `GET /api/org` for the store-backed role tree,
 health strip, typed escalations, and current signal feed, plus
 `GET /api/org/role/{name}` for one role's identity, presence, recycle history,
