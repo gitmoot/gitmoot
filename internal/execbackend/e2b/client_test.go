@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 const testAPIKey = "e2b-GITMOOT-COC-IMPL-secret-value"
@@ -29,24 +31,27 @@ func TestClientControlPlaneOperations(t *testing.T) {
 			t.Errorf("Accept = %q, want application/json", got)
 		}
 		switch r.Method + " " + r.URL.EscapedPath() {
-		case "POST /v2/sandboxes":
+		case "POST /sandboxes":
 			if got := readBody(t, r); got != `{"templateID":"template-a","timeout":600,"metadata":{"job":"42"},"envVars":{"MODE":"test"}}` {
 				t.Errorf("create body = %s", got)
 			}
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write([]byte(`{"sandboxID":"sbx-1","templateID":"template-a","clientID":"client","envdVersion":"1.0"}`))
 		case "GET /v2/sandboxes":
+			if got := r.URL.Query().Get("limit"); got != "100" {
+				t.Errorf("list limit = %q, want 100", got)
+			}
 			_, _ = w.Write([]byte(`[{"sandboxID":"sbx-1","templateID":"template-a","clientID":"client","envdVersion":"1.0","state":"running"}]`))
-		case "GET /v2/sandboxes/sbx-1":
+		case "GET /sandboxes/sbx-1":
 			_, _ = w.Write([]byte(`{"sandboxID":"sbx-1","templateID":"template-a","clientID":"client","envdVersion":"1.0","startedAt":"2026-08-26T10:00:00Z","endAt":"2026-08-26T11:00:00Z","state":"running"}`))
-		case "DELETE /v2/sandboxes/sbx-1":
+		case "DELETE /sandboxes/sbx-1":
 			w.WriteHeader(http.StatusNoContent)
-		case "POST /v2/sandboxes/sbx-1/timeout":
+		case "POST /sandboxes/sbx-1/timeout":
 			if got := readBody(t, r); got != `{"timeout":1200}` {
 				t.Errorf("timeout body = %s", got)
 			}
 			w.WriteHeader(http.StatusNoContent)
-		case "GET /v2/sandboxes/sbx-1/metrics":
+		case "GET /sandboxes/sbx-1/metrics":
 			_, _ = w.Write([]byte(`[{"timestampUnix":1787738400,"cpuCount":2,"cpuUsedPct":12.5,"memUsed":10,"memTotal":20,"memCache":3,"diskUsed":30,"diskTotal":40}]`))
 		default:
 			http.Error(w, "unexpected route", http.StatusNotFound)
@@ -54,7 +59,7 @@ func TestClientControlPlaneOperations(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newTestClient(t, server.URL+"/v2", time.Second, server.Client())
+	client := newTestClient(t, server.URL, time.Second, server.Client())
 	ctx := context.Background()
 
 	created, err := client.Create(ctx, "template-a", 10*time.Minute, CreateOptions{
@@ -87,6 +92,44 @@ func TestClientControlPlaneOperations(t *testing.T) {
 	}
 }
 
+func TestClientListFollowsPagination(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Method != http.MethodGet || r.URL.EscapedPath() != "/v2/sandboxes" {
+			http.Error(w, "wrong list route", http.StatusNotFound)
+			return
+		}
+		if got := r.URL.Query().Get("limit"); got != "100" {
+			t.Errorf("limit = %q, want 100", got)
+		}
+		switch token := r.URL.Query().Get("nextToken"); token {
+		case "":
+			w.Header().Set("X-Next-Token", "page-2")
+			_, _ = w.Write([]byte(`[{"sandboxID":"sbx-1"}]`))
+		case "page-2":
+			_, _ = w.Write([]byte(`[{"sandboxID":"sbx-2"}]`))
+		default:
+			http.Error(w, "unexpected token", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	client := newTestClient(t, server.URL, time.Second, server.Client())
+
+	sandboxes, err := client.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sandboxes) != 2 || sandboxes[0].ID != "sbx-1" || sandboxes[1].ID != "sbx-2" {
+		t.Fatalf("List = %+v, want both pages in order", sandboxes)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("list calls = %d, want 2", got)
+	}
+}
+
 func TestClientRequiresCreationTTL(t *testing.T) {
 	t.Parallel()
 
@@ -95,7 +138,7 @@ func TestClientRequiresCreationTTL(t *testing.T) {
 		calls.Add(1)
 	}))
 	defer server.Close()
-	client := newTestClient(t, server.URL+"/v2", time.Second, server.Client())
+	client := newTestClient(t, server.URL, time.Second, server.Client())
 
 	for _, ttl := range []time.Duration{0, -time.Second, 1500 * time.Millisecond} {
 		_, err := client.Create(context.Background(), "template-a", ttl, CreateOptions{})
@@ -129,7 +172,7 @@ func TestClientFailureModes(t *testing.T) {
 				_, _ = w.Write([]byte(test.body))
 			}))
 			defer server.Close()
-			client := newTestClient(t, server.URL+"/v2", time.Second, server.Client())
+			client := newTestClient(t, server.URL, time.Second, server.Client())
 
 			observed, err := client.Get(context.Background(), "sbx-1")
 			if err == nil || observed.State != Unknown {
@@ -144,7 +187,7 @@ func TestClientCollectionNotFoundIsAnError(t *testing.T) {
 
 	server := httptest.NewServer(http.NotFoundHandler())
 	defer server.Close()
-	client := newTestClient(t, server.URL+"/v2", time.Second, server.Client())
+	client := newTestClient(t, server.URL, time.Second, server.Client())
 
 	listed, err := client.List(context.Background())
 	if err == nil || listed != nil {
@@ -176,7 +219,7 @@ func TestClientThreeStateObservation(t *testing.T) {
 				_, _ = w.Write([]byte(test.body))
 			}))
 			defer server.Close()
-			client := newTestClient(t, server.URL+"/v2", time.Second, server.Client())
+			client := newTestClient(t, server.URL, time.Second, server.Client())
 
 			observed, err := client.Get(context.Background(), "sbx-1")
 			if observed.State != test.wantState || (err != nil) != test.wantErr {
@@ -186,7 +229,7 @@ func TestClientThreeStateObservation(t *testing.T) {
 	}
 
 	t.Run("unreachable is unknown", func(t *testing.T) {
-		client := newTestClient(t, "http://e2b.invalid/v2", time.Second, &http.Client{
+		client := newTestClient(t, "http://e2b.invalid", time.Second, &http.Client{
 			Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 				return nil, errors.New("network unreachable")
 			}),
@@ -262,7 +305,7 @@ func TestClientIDOperationsPreserveState(t *testing.T) {
 				_, _ = w.Write([]byte(test.body))
 			}))
 			defer server.Close()
-			client := newTestClient(t, server.URL+"/v2", time.Second, server.Client())
+			client := newTestClient(t, server.URL, time.Second, server.Client())
 
 			state, err := test.operation(context.Background(), client)
 			if state != test.wantState || (err != nil) != test.wantErr {
@@ -281,7 +324,7 @@ func TestClientTimeoutAndCancellation(t *testing.T) {
 	defer server.Close()
 
 	t.Run("bounded timeout", func(t *testing.T) {
-		client := newTestClient(t, server.URL+"/v2", 20*time.Millisecond, server.Client())
+		client := newTestClient(t, server.URL, 20*time.Millisecond, server.Client())
 		started := time.Now()
 		observed, err := client.Get(context.Background(), "sbx-1")
 		if err == nil || observed.State != Unknown || !errors.Is(err, context.DeadlineExceeded) {
@@ -293,7 +336,7 @@ func TestClientTimeoutAndCancellation(t *testing.T) {
 	})
 
 	t.Run("caller cancellation", func(t *testing.T) {
-		client := newTestClient(t, server.URL+"/v2", time.Second, server.Client())
+		client := newTestClient(t, server.URL, time.Second, server.Client())
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		observed, err := client.Get(ctx, "sbx-1")
@@ -311,7 +354,7 @@ func TestClientRedactsAPIKeyFromErrorsAndLogs(t *testing.T) {
 		_, _ = fmt.Fprintf(w, `{"message":"provider echoed %s"}`, testAPIKey)
 	}))
 	defer server.Close()
-	client := newTestClient(t, server.URL+"/v2", time.Second, server.Client())
+	client := newTestClient(t, server.URL, time.Second, server.Client())
 
 	_, err := client.Get(context.Background(), "sbx-1")
 	if err == nil {
@@ -325,6 +368,55 @@ func TestClientRedactsAPIKeyFromErrorsAndLogs(t *testing.T) {
 		}
 		if !strings.Contains(rendered, "[REDACTED]") {
 			t.Fatalf("%s = %q, want redaction marker", name, rendered)
+		}
+	}
+}
+
+func TestClientRedactsAPIKeyAtErrorBodyBoundary(t *testing.T) {
+	t.Parallel()
+
+	// The old pre-redaction limit retained only this seven-byte key prefix.
+	padding := strings.Repeat("x", workflow.MaxStderrTailBytes-6)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = fmt.Fprint(w, padding+testAPIKey+"-tail")
+	}))
+	defer server.Close()
+	client := newTestClient(t, server.URL, time.Second, server.Client())
+
+	_, err := client.Get(context.Background(), "sbx-1")
+	if err == nil {
+		t.Fatal("Get succeeded")
+	}
+	rendered := err.Error()
+	if strings.Contains(rendered, testAPIKey) || strings.Contains(rendered, testAPIKey[:7]) {
+		t.Fatalf("boundary error leaked API key material: %q", rendered)
+	}
+	if !strings.Contains(rendered, "[REDACTED]") {
+		t.Fatalf("boundary error = %q, want redaction marker", rendered)
+	}
+}
+
+func TestClientErrorChainDoesNotExposeAPIKey(t *testing.T) {
+	t.Parallel()
+
+	client := newTestClient(t, "http://e2b.invalid", time.Second, &http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			inner := fmt.Errorf("inner %s: %w", testAPIKey, context.Canceled)
+			return nil, fmt.Errorf("outer %s: %w", testAPIKey, inner)
+		}),
+	})
+
+	_, err := client.Get(context.Background(), "sbx-1")
+	if err == nil {
+		t.Fatal("Get succeeded")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("errors.Is(%v, context.Canceled) = false", err)
+	}
+	for level, current := 0, err; current != nil; level, current = level+1, errors.Unwrap(current) {
+		if strings.Contains(current.Error(), testAPIKey) {
+			t.Fatalf("unwrap level %d leaked API key: %q", level, current.Error())
 		}
 	}
 }
@@ -344,7 +436,7 @@ func TestClientRefusesRedirectWithoutForwardingAPIKey(t *testing.T) {
 		http.Redirect(w, &http.Request{}, destination.URL, http.StatusTemporaryRedirect)
 	}))
 	defer source.Close()
-	client := newTestClient(t, source.URL+"/v2", time.Second, source.Client())
+	client := newTestClient(t, source.URL, time.Second, source.Client())
 
 	observed, err := client.Get(context.Background(), "sbx-1")
 	if err == nil || observed.State != Unknown {

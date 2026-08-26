@@ -22,9 +22,10 @@ import (
 )
 
 const (
-	DefaultBaseURL        = "https://api.e2b.app/v2"
-	DefaultRequestTimeout = 15 * time.Second
-	maxErrorBodyBytes     = workflow.MaxStderrTailBytes
+	DefaultBaseURL            = "https://api.e2b.app"
+	DefaultRequestTimeout     = 15 * time.Second
+	maxProviderErrorBodyBytes = 1 << 20
+	listSandboxesPageSize     = 100
 )
 
 // State distinguishes a confirmed live sandbox, provider-confirmed absence,
@@ -167,7 +168,7 @@ func (c *Client) Create(ctx context.Context, templateID string, ttl time.Duratio
 		return Sandbox{}, fmt.Errorf("E2B create TTL: %w", err)
 	}
 	var sandbox Sandbox
-	err = c.doJSON(ctx, http.MethodPost, "/sandboxes", createPayload{
+	_, err = c.doJSON(ctx, http.MethodPost, "/sandboxes", createPayload{
 		TemplateID: templateID,
 		Timeout:    ttlSeconds,
 		Metadata:   options.Metadata,
@@ -185,15 +186,34 @@ func (c *Client) Create(ctx context.Context, templateID string, ttl time.Duratio
 // List returns all sandboxes in the provider response.
 func (c *Client) List(ctx context.Context) ([]Sandbox, error) {
 	var sandboxes []Sandbox
-	if err := c.doJSON(ctx, http.MethodGet, "/sandboxes", nil, http.StatusOK, &sandboxes); err != nil {
-		return nil, err
-	}
-	for i := range sandboxes {
-		if strings.TrimSpace(sandboxes[i].ID) == "" {
-			return nil, c.errorf(nil, "list sandboxes: malformed response item %d: missing sandboxID", i)
+	nextToken := ""
+	seenTokens := make(map[string]struct{})
+	for {
+		query := url.Values{"limit": []string{fmt.Sprint(listSandboxesPageSize)}}
+		if nextToken != "" {
+			query.Set("nextToken", nextToken)
 		}
+		var page []Sandbox
+		headers, err := c.doJSON(ctx, http.MethodGet, "/v2/sandboxes?"+query.Encode(), nil, http.StatusOK, &page)
+		if err != nil {
+			return nil, err
+		}
+		for i := range page {
+			if strings.TrimSpace(page[i].ID) == "" {
+				return nil, c.errorf(nil, "list sandboxes: malformed response item %d: missing sandboxID", len(sandboxes)+i)
+			}
+		}
+		sandboxes = append(sandboxes, page...)
+
+		nextToken = strings.TrimSpace(headers.Get("X-Next-Token"))
+		if nextToken == "" {
+			return sandboxes, nil
+		}
+		if _, duplicate := seenTokens[nextToken]; duplicate {
+			return nil, c.errorf(nil, "list sandboxes: repeated pagination token %q", nextToken)
+		}
+		seenTokens[nextToken] = struct{}{}
 	}
-	return sandboxes, nil
 }
 
 // Get observes one sandbox. Only 404 or 410 means Gone; every failed or
@@ -204,7 +224,7 @@ func (c *Client) Get(ctx context.Context, sandboxID string) (Observation, error)
 		return Observation{State: Unknown}, err
 	}
 	var sandbox Sandbox
-	status, err := c.doJSONState(ctx, http.MethodGet, path, nil, http.StatusOK, &sandbox)
+	status, _, err := c.doJSONState(ctx, http.MethodGet, path, nil, http.StatusOK, &sandbox)
 	if err != nil {
 		return Observation{State: status}, err
 	}
@@ -224,7 +244,7 @@ func (c *Client) Delete(ctx context.Context, sandboxID string) (State, error) {
 	if err != nil {
 		return Unknown, err
 	}
-	state, err := c.doJSONState(ctx, http.MethodDelete, path, nil, http.StatusNoContent, nil)
+	state, _, err := c.doJSONState(ctx, http.MethodDelete, path, nil, http.StatusNoContent, nil)
 	if err != nil || state == Gone {
 		return state, err
 	}
@@ -241,9 +261,10 @@ func (c *Client) SetTimeout(ctx context.Context, sandboxID string, ttl time.Dura
 	if err != nil {
 		return Unknown, err
 	}
-	return c.doJSONState(ctx, http.MethodPost, path, struct {
+	state, _, err := c.doJSONState(ctx, http.MethodPost, path, struct {
 		Timeout int32 `json:"timeout"`
 	}{Timeout: seconds}, http.StatusNoContent, nil)
+	return state, err
 }
 
 // Metrics reads resource samples without collapsing absence and failed reads.
@@ -253,7 +274,7 @@ func (c *Client) Metrics(ctx context.Context, sandboxID string) (MetricsObservat
 		return MetricsObservation{State: Unknown}, err
 	}
 	var metrics []Metric
-	status, err := c.doJSONState(ctx, http.MethodGet, path, nil, http.StatusOK, &metrics)
+	status, _, err := c.doJSONState(ctx, http.MethodGet, path, nil, http.StatusOK, &metrics)
 	if err != nil {
 		return MetricsObservation{State: status}, err
 	}
@@ -263,23 +284,23 @@ func (c *Client) Metrics(ctx context.Context, sandboxID string) (MetricsObservat
 	return MetricsObservation{State: Present, Metrics: metrics}, nil
 }
 
-func (c *Client) doJSON(ctx context.Context, method, path string, input any, expectedStatus int, output any) error {
-	state, err := c.doJSONState(ctx, method, path, input, expectedStatus, output)
+func (c *Client) doJSON(ctx context.Context, method, path string, input any, expectedStatus int, output any) (http.Header, error) {
+	state, headers, err := c.doJSONState(ctx, method, path, input, expectedStatus, output)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if state != Present {
-		return c.errorf(nil, "%s %s: E2B endpoint was not found", method, path)
+		return nil, c.errorf(nil, "%s %s: E2B endpoint was not found", method, path)
 	}
-	return nil
+	return headers, nil
 }
 
-func (c *Client) doJSONState(ctx context.Context, method, path string, input any, expectedStatus int, output any) (State, error) {
+func (c *Client) doJSONState(ctx context.Context, method, path string, input any, expectedStatus int, output any) (State, http.Header, error) {
 	var body io.Reader
 	if input != nil {
 		encoded, err := json.Marshal(input)
 		if err != nil {
-			return Unknown, c.errorf(err, "%s %s: encode request", method, path)
+			return Unknown, nil, c.errorf(err, "%s %s: encode request", method, path)
 		}
 		body = bytes.NewReader(encoded)
 	}
@@ -289,7 +310,7 @@ func (c *Client) doJSONState(ctx context.Context, method, path string, input any
 	endpoint := strings.TrimRight(c.baseURL.String(), "/") + path
 	req, err := http.NewRequestWithContext(requestCtx, method, endpoint, body)
 	if err != nil {
-		return Unknown, c.errorf(err, "%s %s: build request", method, path)
+		return Unknown, nil, c.errorf(err, "%s %s: build request", method, path)
 	}
 	req.Header.Set("X-API-Key", c.apiKey)
 	req.Header.Set("Accept", "application/json")
@@ -299,30 +320,33 @@ func (c *Client) doJSONState(ctx context.Context, method, path string, input any
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return Unknown, c.errorf(err, "%s %s: control-plane request failed", method, path)
+		return Unknown, nil, c.errorf(err, "%s %s: control-plane request failed", method, path)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
-		return Gone, nil
+		return Gone, resp.Header, nil
 	}
 	if resp.StatusCode != expectedStatus {
-		detail, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes+1))
+		detail, oversized, readErr := readProviderErrorBody(resp.Body)
 		if readErr != nil {
-			return Unknown, c.errorf(readErr, "%s %s: E2B returned HTTP %d and its response could not be read", method, path, resp.StatusCode)
+			return Unknown, resp.Header, c.errorf(readErr, "%s %s: E2B returned HTTP %d and its response could not be read", method, path, resp.StatusCode)
 		}
-		return Unknown, c.errorf(nil, "%s %s: E2B returned HTTP %d: %s", method, path, resp.StatusCode, string(detail))
+		if oversized {
+			return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned HTTP %d with an oversized error response", method, path, resp.StatusCode)
+		}
+		return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned HTTP %d: %s", method, path, resp.StatusCode, detail)
 	}
 	if output == nil {
-		return Present, nil
+		return Present, resp.Header, nil
 	}
 	decoder := json.NewDecoder(resp.Body)
 	if err := decoder.Decode(output); err != nil {
-		return Unknown, c.errorf(err, "%s %s: decode E2B response", method, path)
+		return Unknown, resp.Header, c.errorf(err, "%s %s: decode E2B response", method, path)
 	}
 	if err := requireJSONEOF(decoder); err != nil {
-		return Unknown, c.errorf(err, "%s %s: decode E2B response", method, path)
+		return Unknown, resp.Header, c.errorf(err, "%s %s: decode E2B response", method, path)
 	}
-	return Present, nil
+	return Present, resp.Header, nil
 }
 
 func (c *Client) errorf(cause error, format string, args ...any) error {
@@ -332,17 +356,42 @@ func (c *Client) errorf(cause error, format string, args ...any) error {
 	}
 	return &clientError{
 		message: workflow.RedactedStderrTail(message, c.apiKey),
-		cause:   cause,
+		match:   contextErrorIdentity(cause),
 	}
 }
 
 type clientError struct {
 	message string
-	cause   error
+	match   error
 }
 
 func (e *clientError) Error() string { return e.message }
-func (e *clientError) Unwrap() error { return e.cause }
+
+func (e *clientError) Is(target error) bool {
+	return e.match != nil && errors.Is(e.match, target)
+}
+
+func contextErrorIdentity(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return context.Canceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+func readProviderErrorBody(body io.Reader) (detail string, oversized bool, err error) {
+	data, err := io.ReadAll(io.LimitReader(body, maxProviderErrorBodyBytes+1))
+	if err != nil {
+		return "", false, err
+	}
+	if len(data) > maxProviderErrorBodyBytes {
+		return "", true, nil
+	}
+	return string(data), false, nil
+}
 
 func durationSeconds(ttl time.Duration) (int32, error) {
 	if ttl <= 0 {
