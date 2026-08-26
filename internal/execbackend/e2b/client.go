@@ -27,6 +27,7 @@ const (
 	maxProviderResponseBodyBytes = 1 << 20
 	minAPIKeyLength              = 8
 	listSandboxesPageSize        = 100
+	maxListPages                 = 100
 )
 
 var errIDResponseInconclusive = errors.New("E2B ID response is inconclusive")
@@ -129,6 +130,40 @@ type Sandbox struct {
 	State       string            `json:"state,omitempty"`
 }
 
+type sandboxPage []Sandbox
+
+func (p *sandboxPage) UnmarshalJSON(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	opening, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if opening != json.Delim('[') {
+		return errors.New("E2B sandbox inventory must be a JSON array")
+	}
+
+	var page []Sandbox
+	for decoder.More() {
+		var sandbox Sandbox
+		if err := decoder.Decode(&sandbox); err != nil {
+			return err
+		}
+		page = append(page, sandbox)
+	}
+	closing, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if closing != json.Delim(']') {
+		return errors.New("E2B sandbox inventory has no closing array delimiter")
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return err
+	}
+	*p = page
+	return nil
+}
+
 // Observation is the three-state result of looking up one sandbox.
 type Observation struct {
 	State   State
@@ -191,12 +226,12 @@ func (c *Client) List(ctx context.Context) ([]Sandbox, error) {
 	var sandboxes []Sandbox
 	nextToken := ""
 	seenTokens := make(map[string]struct{})
-	for {
+	for pageNumber := 1; pageNumber <= maxListPages; pageNumber++ {
 		query := url.Values{"limit": []string{fmt.Sprint(listSandboxesPageSize)}}
 		if nextToken != "" {
 			query.Set("nextToken", nextToken)
 		}
-		var page []Sandbox
+		var page sandboxPage
 		headers, err := c.doJSON(ctx, http.MethodGet, "/v2/sandboxes?"+query.Encode(), nil, http.StatusOK, &page)
 		if err != nil {
 			return nil, err
@@ -217,6 +252,7 @@ func (c *Client) List(ctx context.Context) ([]Sandbox, error) {
 		}
 		seenTokens[nextToken] = struct{}{}
 	}
+	return nil, c.errorf(nil, "list sandboxes: exceeded %d pages", maxListPages)
 }
 
 // Get observes one sandbox. An inconclusive ID response becomes Gone only when

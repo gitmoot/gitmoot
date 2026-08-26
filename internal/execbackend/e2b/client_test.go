@@ -134,6 +134,27 @@ func TestClientListFollowsPagination(t *testing.T) {
 	}
 }
 
+func TestClientListStopsAtPageLimit(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := calls.Add(1)
+		w.Header().Set("X-Next-Token", fmt.Sprintf("page-%d", call))
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer server.Close()
+	client := newTestClient(t, server.URL, time.Second, server.Client())
+
+	listed, err := client.List(context.Background())
+	if err == nil || listed != nil || !strings.Contains(err.Error(), "exceeded 100 pages") {
+		t.Fatalf("List = %+v, %v; want page-limit error", listed, err)
+	}
+	if got := calls.Load(); got != maxListPages {
+		t.Fatalf("list calls = %d, want %d", got, maxListPages)
+	}
+}
+
 func TestClientRequiresCreationTTL(t *testing.T) {
 	t.Parallel()
 
@@ -206,6 +227,43 @@ func TestClientCollectionNotFoundIsAnError(t *testing.T) {
 	listed, err := client.List(context.Background())
 	if err == nil || listed != nil {
 		t.Fatalf("List = %+v, %v; collection 404 must not look like an empty successful list", listed, err)
+	}
+}
+
+func TestClientGetRequiresArrayInventory(t *testing.T) {
+	t.Parallel()
+
+	const sandboxID = "isandboxdoesnotexist000"
+	tests := []struct {
+		name      string
+		inventory string
+		wantState State
+		wantErr   bool
+	}{
+		{name: "null", inventory: `null`, wantState: Unknown, wantErr: true},
+		{name: "object", inventory: `{}`, wantState: Unknown, wantErr: true},
+		{name: "string", inventory: `"text"`, wantState: Unknown, wantErr: true},
+		{name: "empty body", inventory: ``, wantState: Unknown, wantErr: true},
+		{name: "empty array confirms absence", inventory: `[]`, wantState: Gone},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.EscapedPath() == "/v2/sandboxes" {
+					_, _ = w.Write([]byte(test.inventory))
+					return
+				}
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(measuredAbsent404Body))
+			}))
+			defer server.Close()
+			client := newTestClient(t, server.URL, time.Second, server.Client())
+
+			observed, err := client.Get(context.Background(), sandboxID)
+			if observed.State != test.wantState || (err != nil) != test.wantErr {
+				t.Fatalf("Get state/error = %s/%v, want %s/error=%v", observed.State, err, test.wantState, test.wantErr)
+			}
+		})
 	}
 }
 
