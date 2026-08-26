@@ -29,6 +29,8 @@ const (
 	listSandboxesPageSize        = 100
 )
 
+var errIDResponseInconclusive = errors.New("E2B ID response is inconclusive")
+
 // State distinguishes a confirmed live sandbox, provider-confirmed absence,
 // and an inconclusive observation. Unknown must be treated as potentially live.
 type State uint8
@@ -217,8 +219,8 @@ func (c *Client) List(ctx context.Context) ([]Sandbox, error) {
 	}
 }
 
-// Get observes one sandbox. Only 404 or 410 means Gone; every failed or
-// undecodable read remains Unknown with an error.
+// Get observes one sandbox. An inconclusive ID response becomes Gone only when
+// a complete, successful List confirms the sandbox is absent.
 func (c *Client) Get(ctx context.Context, sandboxID string) (Observation, error) {
 	path, err := sandboxPath(sandboxID, "")
 	if err != nil {
@@ -227,6 +229,18 @@ func (c *Client) Get(ctx context.Context, sandboxID string) (Observation, error)
 	var sandbox Sandbox
 	status, _, err := c.doJSONState(ctx, http.MethodGet, path, nil, http.StatusOK, &sandbox)
 	if err != nil {
+		if errors.Is(err, errIDResponseInconclusive) {
+			sandboxes, listErr := c.List(ctx)
+			if listErr != nil {
+				return Observation{State: Unknown}, c.errorf(listErr, "get sandbox: ID response was inconclusive and inventory could not confirm absence")
+			}
+			for i := range sandboxes {
+				if sandboxes[i].ID == sandboxID {
+					return Observation{State: Unknown}, err
+				}
+			}
+			return Observation{State: Gone}, nil
+		}
 		return Observation{State: status}, err
 	}
 	if status == Gone {
@@ -238,8 +252,8 @@ func (c *Client) Get(ctx context.Context, sandboxID string) (Observation, error)
 	return Observation{State: Present, Sandbox: &sandbox}, nil
 }
 
-// Delete requests sandbox termination. A successful deletion or an already
-// absent sandbox is Gone; failed communication remains Unknown.
+// Delete requests sandbox termination. A successful deletion is Gone; failed
+// or inconclusive communication remains Unknown.
 func (c *Client) Delete(ctx context.Context, sandboxID string) (State, error) {
 	path, err := sandboxPath(sandboxID, "")
 	if err != nil {
@@ -332,10 +346,7 @@ func (c *Client) doJSONState(ctx context.Context, method, path string, input any
 		return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned HTTP %d with an oversized response", method, path, resp.StatusCode)
 	}
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
-		if isProviderAbsence(responseBody, resp.StatusCode) {
-			return Gone, resp.Header, nil
-		}
-		return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned inconclusive HTTP %d: %s", method, path, resp.StatusCode, responseBody)
+		return Unknown, resp.Header, c.matchedErrorf(errIDResponseInconclusive, "%s %s: E2B returned inconclusive HTTP %d: %s", method, path, resp.StatusCode, responseBody)
 	}
 	if resp.StatusCode != expectedStatus {
 		return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned HTTP %d: %s", method, path, resp.StatusCode, responseBody)
@@ -361,6 +372,13 @@ func (c *Client) errorf(cause error, format string, args ...any) error {
 	return &clientError{
 		message: workflow.RedactedStderrTail(message, c.apiKey),
 		match:   contextErrorIdentity(cause),
+	}
+}
+
+func (c *Client) matchedErrorf(match error, format string, args ...any) error {
+	return &clientError{
+		message: workflow.RedactedStderrTail(fmt.Sprintf(format, args...), c.apiKey),
+		match:   match,
 	}
 }
 
@@ -395,18 +413,6 @@ func readProviderResponseBody(body io.Reader) (data []byte, oversized bool, err 
 		return nil, true, nil
 	}
 	return data, false, nil
-}
-
-func isProviderAbsence(data []byte, status int) bool {
-	var response struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	if err := decoder.Decode(&response); err != nil {
-		return false
-	}
-	return requireJSONEOF(decoder) == nil && response.Code == status && strings.TrimSpace(response.Message) != ""
 }
 
 func durationSeconds(ttl time.Duration) (int32, error) {

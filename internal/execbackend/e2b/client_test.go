@@ -16,7 +16,11 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-const testAPIKey = "e2b-GITMOOT-COC-IMPL-secret-value"
+const (
+	testAPIKey             = "e2b-GITMOOT-COC-IMPL-secret-value"
+	measuredAbsent404Body  = `{"code":404,"message":"Sandbox \"isandboxdoesnotexist000\" doesn't exist or you don't have access to it"}`
+	measuredRouting404Body = `{"code":404,"message":"validation error: no matching operation was found"}`
+)
 
 func TestClientControlPlaneOperations(t *testing.T) {
 	t.Parallel()
@@ -208,33 +212,51 @@ func TestClientCollectionNotFoundIsAnError(t *testing.T) {
 func TestClientThreeStateObservation(t *testing.T) {
 	t.Parallel()
 
+	const sandboxID = "isandboxdoesnotexist000"
 	tests := []struct {
-		name      string
-		status    int
-		body      string
-		wantState State
-		wantErr   bool
+		name          string
+		status        int
+		body          string
+		listStatus    int
+		listBody      string
+		wantListCalls int32
+		wantState     State
+		wantErr       bool
 	}{
-		{name: "present", status: http.StatusOK, body: `{"sandboxID":"sbx-1"}`, wantState: Present},
-		{name: "not found", status: http.StatusNotFound, body: `{"code":404,"message":"sandbox not found"}`, wantState: Gone},
-		{name: "provider confirms gone", status: http.StatusGone, body: `{"code":410,"message":"sandbox gone"}`, wantState: Gone},
-		{name: "routing not found", status: http.StatusNotFound, body: `{"message":"route not found"}`, wantState: Unknown, wantErr: true},
+		{name: "present", status: http.StatusOK, body: `{"sandboxID":"isandboxdoesnotexist000"}`, wantState: Present},
+		{name: "inventory confirms absent", status: http.StatusNotFound, body: measuredAbsent404Body, listStatus: http.StatusOK, listBody: `[]`, wantListCalls: 1, wantState: Gone},
+		{name: "inventory confirms routing failure is inconclusive", status: http.StatusNotFound, body: measuredRouting404Body, listStatus: http.StatusOK, listBody: `[{"sandboxID":"isandboxdoesnotexist000"}]`, wantListCalls: 1, wantState: Unknown, wantErr: true},
+		{name: "gone response still requires inventory", status: http.StatusGone, body: `{"code":410,"message":"sandbox gone"}`, listStatus: http.StatusOK, listBody: `[]`, wantListCalls: 1, wantState: Gone},
 		{name: "unauthorized", status: http.StatusUnauthorized, wantState: Unknown, wantErr: true},
 		{name: "provider unavailable", status: http.StatusServiceUnavailable, wantState: Unknown, wantErr: true},
 		{name: "inconclusive malformed read", status: http.StatusOK, body: `{`, wantState: Unknown, wantErr: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			var listCalls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.EscapedPath() == "/v2/sandboxes" {
+					listCalls.Add(1)
+					if test.listStatus == 0 {
+						http.Error(w, "unexpected inventory request", http.StatusInternalServerError)
+						return
+					}
+					w.WriteHeader(test.listStatus)
+					_, _ = w.Write([]byte(test.listBody))
+					return
+				}
 				w.WriteHeader(test.status)
 				_, _ = w.Write([]byte(test.body))
 			}))
 			defer server.Close()
 			client := newTestClient(t, server.URL, time.Second, server.Client())
 
-			observed, err := client.Get(context.Background(), "sbx-1")
+			observed, err := client.Get(context.Background(), sandboxID)
 			if observed.State != test.wantState || (err != nil) != test.wantErr {
 				t.Fatalf("Get state/error = %s/%v, want %s/error=%v", observed.State, err, test.wantState, test.wantErr)
+			}
+			if got := listCalls.Load(); got != test.wantListCalls {
+				t.Fatalf("inventory calls = %d, want %d", got, test.wantListCalls)
 			}
 		})
 	}
@@ -245,7 +267,7 @@ func TestClientThreeStateObservation(t *testing.T) {
 				return nil, errors.New("network unreachable")
 			}),
 		})
-		observed, err := client.Get(context.Background(), "sbx-1")
+		observed, err := client.Get(context.Background(), sandboxID)
 		if err == nil || observed.State != Unknown {
 			t.Fatalf("Get = %+v, %v; unreachable must remain unknown", observed, err)
 		}
@@ -274,13 +296,24 @@ func TestClientIDOperationsPreserveState(t *testing.T) {
 			wantState: Gone,
 		},
 		{
-			name:      "delete not found confirms gone",
+			name:      "delete absent response is inconclusive",
 			method:    http.MethodDelete,
 			path:      "/sandboxes/sbx-1",
 			status:    http.StatusNotFound,
-			body:      `{"code":404,"message":"sandbox not found"}`,
+			body:      measuredAbsent404Body,
 			operation: func(ctx context.Context, client *Client) (State, error) { return client.Delete(ctx, "sbx-1") },
-			wantState: Gone,
+			wantState: Unknown,
+			wantErr:   true,
+		},
+		{
+			name:      "delete routing response is inconclusive",
+			method:    http.MethodDelete,
+			path:      "/sandboxes/sbx-1",
+			status:    http.StatusNotFound,
+			body:      measuredRouting404Body,
+			operation: func(ctx context.Context, client *Client) (State, error) { return client.Delete(ctx, "sbx-1") },
+			wantState: Unknown,
+			wantErr:   true,
 		},
 		{
 			name:      "delete failure is unknown",
@@ -302,15 +335,16 @@ func TestClientIDOperationsPreserveState(t *testing.T) {
 			wantState: Present,
 		},
 		{
-			name:   "timeout not found confirms gone",
+			name:   "timeout not found is inconclusive",
 			method: http.MethodPost,
 			path:   "/sandboxes/sbx-1/timeout",
 			status: http.StatusNotFound,
-			body:   `{"code":404,"message":"sandbox not found"}`,
+			body:   measuredAbsent404Body,
 			operation: func(ctx context.Context, client *Client) (State, error) {
 				return client.SetTimeout(ctx, "sbx-1", time.Minute)
 			},
-			wantState: Gone,
+			wantState: Unknown,
+			wantErr:   true,
 		},
 		{
 			name:   "metrics failure is unknown",
