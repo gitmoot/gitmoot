@@ -195,10 +195,47 @@ func TestWakeOutboxTickHealthIncludesBlockedAndEscalation(t *testing.T) {
 			rules, err := store.ListEventRules(ctx)
 			return replyWakeDelivery{rules: rules}, err
 		},
+		nil,
 	)
 	if err == nil || health.pending != 2 || health.inert != 0 ||
-		!strings.Contains(err.Error(), "pending=2 inert=0 aged_attempted=0") {
+		!strings.Contains(err.Error(), "pending=2 inert=0 route_removed=0 aged_attempted=0") {
 		t.Fatalf("tick health = %s err=%v, want two routable outstanding obligations", health, err)
+	}
+}
+
+func TestWakeOutboxHealthDistinguishesRemovedRouteFromNeverConfigured(t *testing.T) {
+	store := daemonWorkerStore(t)
+	ctx := context.Background()
+	for _, target := range []string{"owner", "worker"} {
+		if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: "release/route-history", Author: "worker", Body: target,
+			AddressedTarget: target,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("pending = %+v, err=%v", pending, err)
+	}
+	previouslyRoutable := make(map[int64]struct{})
+	for _, row := range pending {
+		if row.TargetRole == "owner" {
+			previouslyRoutable[row.ID] = struct{}{}
+		}
+	}
+	health, err := wakeOutboxObligationHealth(
+		ctx,
+		store,
+		time.Now().UTC().Add(-replyWakeAttemptedUnknownAfter),
+		func(context.Context) (replyWakeDelivery, error) {
+			return replyWakeDelivery{}, nil
+		},
+		previouslyRoutable,
+	)
+	if err == nil || health.pending != 0 || health.inert != 1 || health.routeRemoved != 1 ||
+		!strings.Contains(err.Error(), "pending=0 inert=1 route_removed=1 aged_attempted=0") {
+		t.Fatalf("route-history health = %s err=%v", health, err)
 	}
 }
 
@@ -294,7 +331,7 @@ func TestReplyWakeOutboxInertHealthDoesNotEscalateSingleRepoLoop(t *testing.T) {
 		t.Fatalf("inert reply wake health reached escalation ladder: %q", stdout.String())
 	}
 	if strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") ||
-		!strings.Contains(stdout.String(), "pending=0 inert=1 aged_attempted=0") {
+		!strings.Contains(stdout.String(), "pending=0 inert=1 route_removed=0 aged_attempted=0") {
 		t.Fatalf("inert reply wake health log = %q", stdout.String())
 	}
 }
@@ -611,7 +648,7 @@ func TestReplyWakeOutboxZeroRulesReportsInertWithoutUnhealthy(t *testing.T) {
 	if tickErr != nil {
 		t.Fatalf("fleet tick aborted on inert pending-obligation health: %v", tickErr)
 	}
-	if !strings.Contains(stdout.String(), "reply wake outbox drain health: pending=0 inert=1 aged_attempted=0") ||
+	if !strings.Contains(stdout.String(), "reply wake outbox drain health: pending=0 inert=1 route_removed=0 aged_attempted=0") ||
 		strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") {
 		t.Fatalf("fleet tick log = %q, want visible inert-only health", stdout.String())
 	}
@@ -664,7 +701,7 @@ func TestReplyWakeOutboxUnrelatedEnabledRuleReportsPendingObligationInert(t *tes
 	if tickErr != nil {
 		t.Fatalf("fleet tick aborted on inert pending-obligation health: %v", tickErr)
 	}
-	if !strings.Contains(stdout.String(), "reply wake outbox drain health: pending=0 inert=1 aged_attempted=0") ||
+	if !strings.Contains(stdout.String(), "reply wake outbox drain health: pending=0 inert=1 route_removed=0 aged_attempted=0") ||
 		strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") {
 		t.Fatalf("fleet tick log = %q, want visible inert-only health", stdout.String())
 	}
@@ -767,7 +804,8 @@ func TestReplyWakeOutboxRuleDeletedMidDrainRefusesLaterBatch(t *testing.T) {
 	if tickErr != nil {
 		t.Fatalf("fleet tick aborted on later batch refusal: %v", tickErr)
 	}
-	if !strings.Contains(stdout.String(), "outstanding obligations: pending=1") {
+	if !strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") ||
+		!strings.Contains(stdout.String(), "pending=0 inert=0 route_removed=1 aged_attempted=0") {
 		t.Fatalf("fleet tick log = %q, want later batch refusal", stdout.String())
 	}
 	if wake.promptCalls != 1 {

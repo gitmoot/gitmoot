@@ -33,16 +33,20 @@ type replyWakeDelivery struct {
 type replyWakeDeliveryResolver func(context.Context) (replyWakeDelivery, error)
 
 type replyWakeOutboxHealth struct {
-	pending       int
-	inert         int
+	pending int
+	inert   int
+	// routeRemoved means the row matched an earlier authoritative rule
+	// snapshot in this drain, but not the final snapshot.
+	routeRemoved  int
 	agedAttempted int
 }
 
 func (h replyWakeOutboxHealth) String() string {
 	return fmt.Sprintf(
-		"pending=%d inert=%d aged_attempted=%d",
+		"pending=%d inert=%d route_removed=%d aged_attempted=%d",
 		h.pending,
 		h.inert,
+		h.routeRemoved,
 		h.agedAttempted,
 	)
 }
@@ -93,6 +97,9 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store *db.Store, now ti
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+	// Event-rule deletion is a hard delete, so the store has no durable route
+	// history. Preserve only what this drain can prove from snapshots it read.
+	previouslyRoutable := make(map[int64]struct{})
 
 	for _, key := range keys {
 		items := groups[key]
@@ -132,6 +139,14 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store *db.Store, now ti
 			if err != nil {
 				return replyWakeOutboxHealth{}, fmt.Errorf("resolve wake outbox delivery: %w", err)
 			}
+			if err := recordRoutableWakeOutboxObligations(
+				delivery.rules,
+				obligations.Pending,
+				now,
+				previouslyRoutable,
+			); err != nil {
+				return replyWakeOutboxHealth{}, err
+			}
 			if delivery.sink == nil {
 				break
 			}
@@ -158,10 +173,34 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store *db.Store, now ti
 			start = end
 		}
 	}
-	return wakeOutboxObligationHealth(ctx, store, attemptedBefore, resolve)
+	return wakeOutboxObligationHealth(ctx, store, attemptedBefore, resolve, previouslyRoutable)
 }
 
-func wakeOutboxObligationHealth(ctx context.Context, store *db.Store, attemptedBefore time.Time, resolve replyWakeDeliveryResolver) (replyWakeOutboxHealth, error) {
+func recordRoutableWakeOutboxObligations(
+	rules []db.EventRule,
+	obligations []db.WakeOutboxObligation,
+	now time.Time,
+	previouslyRoutable map[int64]struct{},
+) error {
+	for _, obligation := range obligations {
+		event, err := wakeOutboxEvent([]db.WakeOutboxObligation{obligation}, now)
+		if err != nil {
+			return fmt.Errorf("classify wake outbox row %d against delivery rules: %w", obligation.ID, err)
+		}
+		if len(matchingWakeRules(rules, event)) > 0 {
+			previouslyRoutable[obligation.ID] = struct{}{}
+		}
+	}
+	return nil
+}
+
+func wakeOutboxObligationHealth(
+	ctx context.Context,
+	store *db.Store,
+	attemptedBefore time.Time,
+	resolve replyWakeDeliveryResolver,
+	previouslyRoutable map[int64]struct{},
+) (replyWakeOutboxHealth, error) {
 	obligations, err := store.ListWakeOutboxObligations(ctx, attemptedBefore)
 	if err != nil {
 		return replyWakeOutboxHealth{}, fmt.Errorf("read wake outbox obligations: %w", err)
@@ -186,12 +225,16 @@ func wakeOutboxObligationHealth(ctx context.Context, store *db.Store, attemptedB
 			return replyWakeOutboxHealth{}, fmt.Errorf("classify wake outbox row %d: %w", obligation.ID, err)
 		}
 		if len(matchingWakeRules(delivery.rules, event)) == 0 {
+			if _, wasRoutable := previouslyRoutable[obligation.ID]; wasRoutable {
+				health.routeRemoved++
+				continue
+			}
 			health.inert++
 			continue
 		}
 		health.pending++
 	}
-	if health.pending == 0 && health.agedAttempted == 0 {
+	if health.pending == 0 && health.routeRemoved == 0 && health.agedAttempted == 0 {
 		return health, nil
 	}
 	return health, fmt.Errorf("wake outbox has outstanding obligations: %s", health)
