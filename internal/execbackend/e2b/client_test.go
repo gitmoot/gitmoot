@@ -151,6 +151,16 @@ func TestClientRequiresCreationTTL(t *testing.T) {
 	}
 }
 
+func TestClientRejectsShortAPIKey(t *testing.T) {
+	t.Parallel()
+
+	for _, key := range []string{"", "short", "       "} {
+		if _, err := NewClient(key, Options{}); err == nil {
+			t.Errorf("NewClient(%q) succeeded", key)
+		}
+	}
+}
+
 func TestClientFailureModes(t *testing.T) {
 	t.Parallel()
 
@@ -206,8 +216,9 @@ func TestClientThreeStateObservation(t *testing.T) {
 		wantErr   bool
 	}{
 		{name: "present", status: http.StatusOK, body: `{"sandboxID":"sbx-1"}`, wantState: Present},
-		{name: "not found", status: http.StatusNotFound, wantState: Gone},
-		{name: "provider confirms gone", status: http.StatusGone, wantState: Gone},
+		{name: "not found", status: http.StatusNotFound, body: `{"code":404,"message":"sandbox not found"}`, wantState: Gone},
+		{name: "provider confirms gone", status: http.StatusGone, body: `{"code":410,"message":"sandbox gone"}`, wantState: Gone},
+		{name: "routing not found", status: http.StatusNotFound, body: `{"message":"route not found"}`, wantState: Unknown, wantErr: true},
 		{name: "unauthorized", status: http.StatusUnauthorized, wantState: Unknown, wantErr: true},
 		{name: "provider unavailable", status: http.StatusServiceUnavailable, wantState: Unknown, wantErr: true},
 		{name: "inconclusive malformed read", status: http.StatusOK, body: `{`, wantState: Unknown, wantErr: true},
@@ -246,6 +257,8 @@ func TestClientIDOperationsPreserveState(t *testing.T) {
 
 	tests := []struct {
 		name      string
+		method    string
+		path      string
 		status    int
 		body      string
 		operation func(context.Context, *Client) (State, error)
@@ -254,18 +267,25 @@ func TestClientIDOperationsPreserveState(t *testing.T) {
 	}{
 		{
 			name:      "delete success confirms gone",
+			method:    http.MethodDelete,
+			path:      "/sandboxes/sbx-1",
 			status:    http.StatusNoContent,
 			operation: func(ctx context.Context, client *Client) (State, error) { return client.Delete(ctx, "sbx-1") },
 			wantState: Gone,
 		},
 		{
 			name:      "delete not found confirms gone",
+			method:    http.MethodDelete,
+			path:      "/sandboxes/sbx-1",
 			status:    http.StatusNotFound,
+			body:      `{"code":404,"message":"sandbox not found"}`,
 			operation: func(ctx context.Context, client *Client) (State, error) { return client.Delete(ctx, "sbx-1") },
 			wantState: Gone,
 		},
 		{
 			name:      "delete failure is unknown",
+			method:    http.MethodDelete,
+			path:      "/sandboxes/sbx-1",
 			status:    http.StatusInternalServerError,
 			operation: func(ctx context.Context, client *Client) (State, error) { return client.Delete(ctx, "sbx-1") },
 			wantState: Unknown,
@@ -273,6 +293,8 @@ func TestClientIDOperationsPreserveState(t *testing.T) {
 		},
 		{
 			name:   "timeout success confirms present",
+			method: http.MethodPost,
+			path:   "/sandboxes/sbx-1/timeout",
 			status: http.StatusNoContent,
 			operation: func(ctx context.Context, client *Client) (State, error) {
 				return client.SetTimeout(ctx, "sbx-1", time.Minute)
@@ -281,7 +303,10 @@ func TestClientIDOperationsPreserveState(t *testing.T) {
 		},
 		{
 			name:   "timeout not found confirms gone",
+			method: http.MethodPost,
+			path:   "/sandboxes/sbx-1/timeout",
 			status: http.StatusNotFound,
+			body:   `{"code":404,"message":"sandbox not found"}`,
 			operation: func(ctx context.Context, client *Client) (State, error) {
 				return client.SetTimeout(ctx, "sbx-1", time.Minute)
 			},
@@ -289,6 +314,8 @@ func TestClientIDOperationsPreserveState(t *testing.T) {
 		},
 		{
 			name:   "metrics failure is unknown",
+			method: http.MethodGet,
+			path:   "/sandboxes/sbx-1/metrics",
 			status: http.StatusBadGateway,
 			operation: func(ctx context.Context, client *Client) (State, error) {
 				observed, err := client.Metrics(ctx, "sbx-1")
@@ -300,7 +327,13 @@ func TestClientIDOperationsPreserveState(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != test.method || r.URL.EscapedPath() != test.path {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusNotFound)
+					_, _ = w.Write([]byte(`{"message":"route not found"}`))
+					return
+				}
 				w.WriteHeader(test.status)
 				_, _ = w.Write([]byte(test.body))
 			}))
@@ -312,6 +345,21 @@ func TestClientIDOperationsPreserveState(t *testing.T) {
 				t.Fatalf("state/error = %s/%v, want %s/error=%v", state, err, test.wantState, test.wantErr)
 			}
 		})
+	}
+}
+
+func TestClientRejectsOversizedSuccessBody(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"sandboxID":"sbx-1"}` + strings.Repeat(" ", maxProviderResponseBodyBytes)))
+	}))
+	defer server.Close()
+	client := newTestClient(t, server.URL, time.Second, server.Client())
+
+	observed, err := client.Get(context.Background(), "sbx-1")
+	if err == nil || observed.State != Unknown || !strings.Contains(err.Error(), "oversized response") {
+		t.Fatalf("Get = %+v, %v; want unknown oversized-response error", observed, err)
 	}
 }
 

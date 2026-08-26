@@ -22,10 +22,11 @@ import (
 )
 
 const (
-	DefaultBaseURL            = "https://api.e2b.app"
-	DefaultRequestTimeout     = 15 * time.Second
-	maxProviderErrorBodyBytes = 1 << 20
-	listSandboxesPageSize     = 100
+	DefaultBaseURL               = "https://api.e2b.app"
+	DefaultRequestTimeout        = 15 * time.Second
+	maxProviderResponseBodyBytes = 1 << 20
+	minAPIKeyLength              = 8
+	listSandboxesPageSize        = 100
 )
 
 // State distinguishes a confirmed live sandbox, provider-confirmed absence,
@@ -67,8 +68,8 @@ type Client struct {
 
 // NewClient constructs a bounded E2B control-plane client.
 func NewClient(apiKey string, options Options) (*Client, error) {
-	if strings.TrimSpace(apiKey) == "" {
-		return nil, errors.New("E2B API key is required")
+	if len(strings.TrimSpace(apiKey)) < minAPIKeyLength {
+		return nil, fmt.Errorf("E2B API key must be at least %d characters", minAPIKeyLength)
 	}
 	base := strings.TrimSpace(options.BaseURL)
 	if base == "" {
@@ -323,23 +324,26 @@ func (c *Client) doJSONState(ctx context.Context, method, path string, input any
 		return Unknown, nil, c.errorf(err, "%s %s: control-plane request failed", method, path)
 	}
 	defer resp.Body.Close()
+	responseBody, oversized, readErr := readProviderResponseBody(resp.Body)
+	if readErr != nil {
+		return Unknown, resp.Header, c.errorf(readErr, "%s %s: E2B returned HTTP %d and its response could not be read", method, path, resp.StatusCode)
+	}
+	if oversized {
+		return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned HTTP %d with an oversized response", method, path, resp.StatusCode)
+	}
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
-		return Gone, resp.Header, nil
+		if isProviderAbsence(responseBody, resp.StatusCode) {
+			return Gone, resp.Header, nil
+		}
+		return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned inconclusive HTTP %d: %s", method, path, resp.StatusCode, responseBody)
 	}
 	if resp.StatusCode != expectedStatus {
-		detail, oversized, readErr := readProviderErrorBody(resp.Body)
-		if readErr != nil {
-			return Unknown, resp.Header, c.errorf(readErr, "%s %s: E2B returned HTTP %d and its response could not be read", method, path, resp.StatusCode)
-		}
-		if oversized {
-			return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned HTTP %d with an oversized error response", method, path, resp.StatusCode)
-		}
-		return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned HTTP %d: %s", method, path, resp.StatusCode, detail)
+		return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned HTTP %d: %s", method, path, resp.StatusCode, responseBody)
 	}
 	if output == nil {
 		return Present, resp.Header, nil
 	}
-	decoder := json.NewDecoder(resp.Body)
+	decoder := json.NewDecoder(bytes.NewReader(responseBody))
 	if err := decoder.Decode(output); err != nil {
 		return Unknown, resp.Header, c.errorf(err, "%s %s: decode E2B response", method, path)
 	}
@@ -382,15 +386,27 @@ func contextErrorIdentity(err error) error {
 	}
 }
 
-func readProviderErrorBody(body io.Reader) (detail string, oversized bool, err error) {
-	data, err := io.ReadAll(io.LimitReader(body, maxProviderErrorBodyBytes+1))
+func readProviderResponseBody(body io.Reader) (data []byte, oversized bool, err error) {
+	data, err = io.ReadAll(io.LimitReader(body, maxProviderResponseBodyBytes+1))
 	if err != nil {
-		return "", false, err
+		return nil, false, err
 	}
-	if len(data) > maxProviderErrorBodyBytes {
-		return "", true, nil
+	if len(data) > maxProviderResponseBodyBytes {
+		return nil, true, nil
 	}
-	return string(data), false, nil
+	return data, false, nil
+}
+
+func isProviderAbsence(data []byte, status int) bool {
+	var response struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := decoder.Decode(&response); err != nil {
+		return false
+	}
+	return requireJSONEOF(decoder) == nil && response.Code == status && strings.TrimSpace(response.Message) != ""
 }
 
 func durationSeconds(ttl time.Duration) (int32, error) {
