@@ -43,7 +43,7 @@ func orgRoleActivityDoctorCheck(paths config.Paths) (doctor.Check, bool) {
 
 func monitoredOrgActivityRoles(cfg config.OrgConfig) []config.OrgRole {
 	roles := make([]config.OrgRole, 0)
-	for _, role := range loadOrgRoster(context.Background(), nil, cfg).Members() {
+	for _, role := range loadOrgRoster(context.Background(), nil, cfg).Nudgeable() {
 		if cfg.RecycleAfterFor(role.Name) > 0 {
 			roles = append(roles, role)
 		}

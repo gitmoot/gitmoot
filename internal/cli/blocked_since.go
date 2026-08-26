@@ -41,6 +41,7 @@ type blockedRoleWakeDependencies struct {
 	availability blockedRoleAvailability
 	provider     func([]config.OrgRole) org.Provider
 	eventSink    func(context.Context, *db.Store, string) (events.Sink, error)
+	roster       func(context.Context, *db.Store, config.OrgConfig) orgRoster
 	directives   directiveTTLDependencies
 	awaitedFacts awaitedFactTTLDependencies
 }
@@ -80,6 +81,13 @@ func defaultBlockedRoleWakeDependencies() blockedRoleWakeDependencies {
 		provider:     cockpit.NewHerdrOrgProvider,
 		eventSink:    enabledBlockedSinceEventSink,
 	}
+}
+
+func (d blockedRoleWakeDependencies) loadRoster(ctx context.Context, store *db.Store, cfg config.OrgConfig) orgRoster {
+	if d.roster != nil {
+		return d.roster(ctx, store, cfg)
+	}
+	return loadOrgRoster(ctx, store, cfg)
 }
 
 func (d directiveTTLDependencies) listOpen(ctx context.Context, store *db.Store, limit int) ([]db.OrgDirectiveObligation, error) {
@@ -312,7 +320,8 @@ func runBlockedRoleWakeOnce(ctx context.Context, store *db.Store, home string, s
 		writeLine(stdout, "blocked_since role org config load failed: %v", err)
 		return
 	}
-	roles := loadOrgRoster(ctx, store, orgConfig).Members()
+	roster := deps.loadRoster(ctx, store, orgConfig)
+	roles := roster.Members()
 	if len(roles) == 0 {
 		// No org roles configured: there is nothing to snapshot or persist, so
 		// skip silently (matches the pre-#1118 behavior for an unconfigured
@@ -378,12 +387,30 @@ func runBlockedRoleWakeOnce(ctx context.Context, store *db.Store, home string, s
 	if wakeAfter <= 0 || sink == nil {
 		return
 	}
-	if err := evaluateBlockedRoleEpisodes(ctx, store, sink, snapshot, wakeAfter, stdout, now.UTC()); err != nil {
+	// Presence records every live member; automated alarms evaluate only seats
+	// whose standing permits nudges.
+	nudgeSnapshot := snapshotForOrgRoles(snapshot, roster.Nudgeable())
+	if err := evaluateBlockedRoleEpisodes(ctx, store, sink, nudgeSnapshot, wakeAfter, stdout, now.UTC()); err != nil {
 		writeLine(stdout, "blocked_since role evaluation failed: %v", err)
 	}
-	if err := evaluateInputPendingRoleEpisodes(ctx, store, sink, snapshot, wakeAfter, stdout, now.UTC()); err != nil {
+	if err := evaluateInputPendingRoleEpisodes(ctx, store, sink, nudgeSnapshot, wakeAfter, stdout, now.UTC()); err != nil {
 		writeLine(stdout, "input_pending role evaluation failed: %v", err)
 	}
+}
+
+func snapshotForOrgRoles(snapshot org.Snapshot, roles []config.OrgRole) org.Snapshot {
+	allowed := make(map[string]struct{}, len(roles))
+	for _, role := range roles {
+		allowed[strings.ToLower(strings.TrimSpace(role.Name))] = struct{}{}
+	}
+	states := make(map[string]org.RoleLiveState, len(allowed))
+	for role, state := range snapshot.States {
+		if _, ok := allowed[strings.ToLower(strings.TrimSpace(role))]; ok {
+			states[role] = state
+		}
+	}
+	snapshot.States = states
+	return snapshot
 }
 
 func evaluateAwaitedFactTTLs(ctx context.Context, store *db.Store, orgConfig config.OrgConfig, stdout io.Writer, now time.Time, deps awaitedFactTTLDependencies) error {

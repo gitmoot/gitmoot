@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -25,12 +27,10 @@ var orgRosterAllowedRolesCallSites = map[string]bool{
 	"internal/cli/org_roster.go": true,
 }
 
-// TestOrgRosterSeamIsTheOnlyRolesCallSite scans every non-test Go file under
-// internal/ and cmd/ for `.Roles()` calls and requires each hit to be in the
-// allow-list above. The match is textual by design: a false positive from some
-// future unrelated Roles() method fails LOUDLY here and gets resolved by a
-// deliberate allow-list edit, which is exactly the review conversation the
-// seam wants to force.
+// TestOrgRosterSeamIsTheOnlyRolesCallSite parses every non-test Go file in the
+// repository for executable `.Roles()` calls and requires each hit to be in the
+// allow-list above. This is intentionally syntax-based: comments documenting
+// the seam must not make an implementation with no real Roles call pass.
 func TestOrgRosterSeamIsTheOnlyRolesCallSite(t *testing.T) {
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -40,47 +40,69 @@ func TestOrgRosterSeamIsTheOnlyRolesCallSite(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(repoRoot, "go.mod")); err != nil {
 		t.Fatalf("repo root %s has no go.mod: %v", repoRoot, err)
 	}
-	pattern := regexp.MustCompile(`\.Roles\(\)`)
+	fset := token.NewFileSet()
 	scanned := 0
+	scannedOutsideLegacyRoots := 0
+	seamCalls := 0
 	var violations []string
-	for _, top := range []string{"internal", "cmd"} {
-		err := filepath.WalkDir(filepath.Join(repoRoot, top), func(path string, entry os.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if entry.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-				return nil
-			}
-			rel, err := filepath.Rel(repoRoot, path)
-			if err != nil {
-				return err
-			}
-			rel = filepath.ToSlash(rel)
-			content, err := os.ReadFile(path)
-			if err != nil {
-				return err
-			}
-			scanned++
-			if !pattern.Match(content) {
-				return nil
-			}
-			if !orgRosterAllowedRolesCallSites[rel] {
-				violations = append(violations, rel)
+	err := filepath.WalkDir(repoRoot, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" {
+				return filepath.SkipDir
 			}
 			return nil
-		})
-		if err != nil {
-			t.Fatal(err)
 		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		rel, err := filepath.Rel(repoRoot, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		file, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			return err
+		}
+		scanned++
+		if !strings.HasPrefix(rel, "internal/") && !strings.HasPrefix(rel, "cmd/") {
+			scannedOutsideLegacyRoots++
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			selector, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || selector.Sel.Name != "Roles" {
+				return true
+			}
+			position := fset.Position(selector.Sel.Pos())
+			if orgRosterAllowedRolesCallSites[rel] {
+				seamCalls++
+			} else {
+				violations = append(violations, position.String())
+			}
+			return true
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 	// A broken walk that scans nothing would pass vacuously; require the scan
 	// to have actually covered the tree, including the one allowed file.
 	if scanned < 100 {
 		t.Fatalf("scanned only %d non-test Go files; the walk is broken, not the tree clean", scanned)
 	}
-	seam := filepath.Join(repoRoot, "internal", "cli", "org_roster.go")
-	if content, err := os.ReadFile(seam); err != nil || !pattern.Match(content) {
-		t.Fatalf("seam file %s missing or no longer calls .Roles() (err=%v); the guard's subject moved", seam, err)
+	if scannedOutsideLegacyRoots == 0 {
+		t.Fatal("scanned no non-test Go files outside internal/ and cmd/; repository-wide guard scope regressed")
+	}
+	if seamCalls == 0 {
+		t.Fatal("internal/cli/org_roster.go no longer contains an executable .Roles() call; the guard's subject moved")
 	}
 	if len(violations) != 0 {
 		t.Fatalf("direct config.OrgConfig.Roles() call sites outside the roster seam: %v — route them through resolveOrgRoster/loadOrgRoster (internal/cli/org_roster.go, #1635)", violations)
