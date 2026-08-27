@@ -349,15 +349,15 @@ func TestLoadOrgRosterReadsArchiveMirror(t *testing.T) {
 func TestBuildOrgArchiveMirrorDoctorCheck(t *testing.T) {
 	now := time.Date(2026, 8, 26, 16, 0, 0, 0, time.UTC)
 	rows := []db.OrgRoleArchived{{Role: "scout"}}
-	fresh := buildOrgArchiveMirrorDoctorCheck(rows, now.Add(-2*time.Minute), true, now)
+	fresh := buildOrgArchiveMirrorDoctorCheck(rows, nil, now.Add(-2*time.Minute), true, now)
 	if !fresh.OK || !strings.Contains(fresh.Detail, "scout") {
 		t.Fatalf("fresh = %+v", fresh)
 	}
-	stale := buildOrgArchiveMirrorDoctorCheck(rows, now.Add(-16*time.Minute), true, now)
+	stale := buildOrgArchiveMirrorDoctorCheck(rows, nil, now.Add(-16*time.Minute), true, now)
 	if stale.OK || !strings.Contains(stale.Detail, "STALE") || !strings.Contains(stale.Detail, "exclusions preserved") {
 		t.Fatalf("stale = %+v", stale)
 	}
-	never := buildOrgArchiveMirrorDoctorCheck(rows, time.Time{}, false, now)
+	never := buildOrgArchiveMirrorDoctorCheck(rows, nil, time.Time{}, false, now)
 	if never.OK || !strings.Contains(never.Detail, "NO recorded successful herdr poll") {
 		t.Fatalf("never-succeeded = %+v", never)
 	}
@@ -477,5 +477,25 @@ func TestRefreshOrgArchiveMirrorFresherPositiveEvidenceSupersedesPending(t *test
 	}
 	if last, ok, _ := store.OrgArchivePollLastSuccess(ctx); !ok || !last.Equal(now3) {
 		t.Fatalf("poll stamp = %v ok=%v, want %v", last, ok, now3)
+	}
+}
+
+// The downgrade-visibility line (#1643 ruling, directive 86986): AGED pending
+// rows warn with age+count and the named rollback condition; YOUNG pending
+// rows do not warn (a normal in-flight tick or fresh rollback is not a
+// problem, and a wolf-crying check gets whitelisted). Mutant D-M (drop the
+// pending clause) dies to the aged case.
+func TestBuildOrgArchiveMirrorDoctorCheckPendingObservations(t *testing.T) {
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	aged := []db.OrgRoleArchived{{Role: "scout", ObservedAt: now.Add(-20 * time.Minute).Format(time.RFC3339Nano)}}
+	check := buildOrgArchiveMirrorDoctorCheck(nil, aged, now.Add(-time.Minute), true, now)
+	if check.OK || !strings.Contains(check.Detail, "undrained pending archive observation") ||
+		!strings.Contains(check.Detail, "binary rollback window") || !strings.Contains(check.Detail, "20m0s") {
+		t.Fatalf("aged pending = %+v, want an age-and-count warning naming the rollback condition", check)
+	}
+	young := []db.OrgRoleArchived{{Role: "scout", ObservedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}}
+	check = buildOrgArchiveMirrorDoctorCheck([]db.OrgRoleArchived{{Role: "keeper"}}, young, now.Add(-time.Minute), true, now)
+	if !check.OK {
+		t.Fatalf("young pending = %+v, want no warning — a fresh ledger is normal, not a verdict", check)
 	}
 }
