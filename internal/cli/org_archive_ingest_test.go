@@ -460,11 +460,11 @@ func TestRefreshOrgArchiveMirrorFresherPositiveEvidenceSupersedesPending(t *test
 	if rows, err := store.ListOrgRolesArchived(ctx); err != nil || len(rows) != 0 {
 		t.Fatalf("mirror after contradiction = %+v err=%v, want empty — stale evidence must not resurrect", rows, err)
 	}
-	// The supersede runs through apply + the atomic transition (round 7): the
-	// stale observation lands and is unarchived in the same tick, its pending
-	// row dying inside the transition transaction.
-	if !strings.Contains(sink.String(), "org seat unarchive observed: scout") {
-		t.Fatalf("supersede-by-transition log line missing:\n%s", sink.String())
+	// The supersede runs through the atomic transition DIRECTLY (round 8):
+	// the stale observation never touches the shipping mirror, and its
+	// pending row dies inside the transition transaction.
+	if !strings.Contains(sink.String(), "superseded by fresher positive evidence (atomic)") {
+		t.Fatalf("atomic-supersede log line missing:\n%s", sink.String())
 	}
 
 	// Tick 3: omission — nothing to resurrect, directive stays open, stamp clean.
@@ -548,8 +548,10 @@ func TestRefreshOrgArchiveMirrorSupersededPendingDiesInsideTheTransition(t *test
 	if rows, err := store.ListOrgRolesArchived(ctx); err != nil || len(rows) != 0 {
 		t.Fatalf("mirror after supersede = %+v err=%v, want empty", rows, err)
 	}
-	if _, recorded, _ := store.OrgArchivePollLastSuccess(ctx); recorded {
-		t.Fatal("stamp recorded on a tick with a failed cleanup write")
+	// The contradicted row bypassed the drain entirely (round 8), so the
+	// injected drain-cleanup failure never fired: tick 2 is CLEAN and stamps.
+	if last, ok, _ := store.OrgArchivePollLastSuccess(ctx); !ok || !last.Equal(now2) {
+		t.Fatalf("stamp = %v ok=%v, want clean %v — the atomic supersede is one clean write", last, ok, now2)
 	}
 
 	// Tick 3: omission — nothing left to resurrect.
@@ -591,5 +593,88 @@ func TestOrgArchiveMirrorDoctorFailsLoudOnUnreadableLedger(t *testing.T) {
 	check, present := orgArchiveMirrorDoctorCheck(paths)
 	if !present || check.OK || !strings.Contains(check.Detail, "UNREADABLE") || !strings.Contains(check.Detail, "UNKNOWN, not healthy") {
 		t.Fatalf("unreadable-ledger doctor = present=%v %+v, want a loud UNKNOWN", present, check)
+	}
+}
+
+// The #1643 round-8 codex finding: a contradicted stale observation must
+// NEVER touch the shipping mirror — the round-7 apply-then-transition path
+// gave concurrent readers a window classifying an actively observed seat as
+// archived. The recording seam proves no upsert is attempted for the
+// contradicted role. Mutant C8-M (revert to apply-then-transition) dies here.
+func TestRefreshOrgArchiveMirrorContradictedPendingNeverTouchesTheMirror(t *testing.T) {
+	store := orgArchiveIngestTestStore(t)
+	ctx := context.Background()
+	// Tick 1: archived, upsert fails — pending only.
+	originalUpsert := upsertOrgRoleArchived
+	upsertOrgRoleArchived = func(context.Context, *db.Store, db.OrgRoleArchived) error {
+		return errors.New("injected upsert failure")
+	}
+	now1 := time.Date(2026, 8, 27, 14, 0, 0, 0, time.UTC)
+	refreshOrgArchiveMirror(ctx, store, io.Discard, now1, func(context.Context) ([]byte, error) {
+		return []byte(herdrAgentListArchivedFixture), nil
+	})
+	// Tick 2: ALL-ACTIVE. Record every upsert attempt: the contradicted role
+	// must not appear — the supersede goes straight through the transition.
+	var upserted []string
+	upsertOrgRoleArchived = func(ctx context.Context, store *db.Store, row db.OrgRoleArchived) error {
+		upserted = append(upserted, row.Role)
+		return store.UpsertOrgRoleArchived(ctx, row)
+	}
+	refreshOrgArchiveMirror(ctx, store, io.Discard, now1.Add(time.Minute), func(context.Context) ([]byte, error) {
+		return []byte(herdrAgentListAllActiveFixture), nil
+	})
+	upsertOrgRoleArchived = originalUpsert
+	for _, role := range upserted {
+		if role == "scout" {
+			t.Fatalf("contradicted pending row was written to the shipping mirror (upserts: %v) — readers could classify an active seat as archived", upserted)
+		}
+	}
+	if pending, err := store.ListOrgArchivePending(ctx); err != nil || len(pending) != 0 {
+		t.Fatalf("pending after atomic supersede = %+v err=%v, want gone", pending, err)
+	}
+}
+
+// The #1643 round-8 opus finding (adversary 8): a seat carried on OMISSION
+// alone is UNPROVEN, and its observed_at — refreshed only by positive
+// archived evidence — is that state's own clock. The doctor warns when it
+// ages past the threshold, with age, count, and the condition named; a
+// freshly confirmed row never warns. Mutant A8-M (ignore row age) dies here.
+func TestBuildOrgArchiveMirrorDoctorCheckUnconfirmedExclusions(t *testing.T) {
+	now := time.Date(2026, 8, 27, 15, 0, 0, 0, time.UTC)
+	aged := []db.OrgRoleArchived{{Role: "scout", ObservedAt: now.Add(-30 * time.Minute).Format(time.RFC3339Nano)}}
+	check := buildOrgArchiveMirrorDoctorCheck(aged, nil, now.Add(-time.Minute), true, now)
+	if check.OK || !strings.Contains(check.Detail, "UNCONFIRMED") ||
+		!strings.Contains(check.Detail, "30m0s") || !strings.Contains(check.Detail, "scout") ||
+		!strings.Contains(check.Detail, "aging without bound") {
+		t.Fatalf("aged unconfirmed exclusion = %+v, want age+count+condition — the stamp answers did-this-tick-complete, not is-the-mirror-true", check)
+	}
+	fresh := []db.OrgRoleArchived{{Role: "scout", ObservedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}}
+	if check := buildOrgArchiveMirrorDoctorCheck(fresh, nil, now.Add(-time.Minute), true, now); !check.OK {
+		t.Fatalf("freshly confirmed exclusion = %+v, want healthy", check)
+	}
+}
+
+// The #1643 round-8 codex doctor finding: an unreadable MIRROR must fail loud
+// exactly as the unreadable pending ledger does — the round-7 fix named one
+// field and not the adjacent one. Mutant C8b-M (absent on mirror read error)
+// dies here.
+func TestOrgArchiveMirrorDoctorFailsLoudOnUnreadableMirror(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	original := listOrgRolesArchivedForDoctor
+	listOrgRolesArchivedForDoctor = func(context.Context, *db.Store) ([]db.OrgRoleArchived, error) {
+		return nil, errors.New("injected mirror read failure")
+	}
+	t.Cleanup(func() { listOrgRolesArchivedForDoctor = original })
+	check, present := orgArchiveMirrorDoctorCheck(paths)
+	if !present || check.OK || !strings.Contains(check.Detail, "mirror UNREADABLE") || !strings.Contains(check.Detail, "UNKNOWN, not healthy") {
+		t.Fatalf("unreadable-mirror doctor = present=%v %+v, want a loud UNKNOWN", present, check)
 	}
 }

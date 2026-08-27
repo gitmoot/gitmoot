@@ -29,9 +29,15 @@ func orgArchiveMirrorDoctorCheck(paths config.Paths) (doctor.Check, bool) {
 		return doctor.Check{}, false
 	}
 	defer store.Close()
-	rows, err := store.ListOrgRolesArchived(context.Background())
+	rows, err := listOrgRolesArchivedForDoctor(context.Background(), store)
 	if err != nil {
-		return doctor.Check{}, false
+		// Unreadable is not empty — the same sentence as the pending-ledger
+		// branch below and the parser's missing-agents refusal (#1643 round
+		// 8, codex: the round-7 fix named one field and not the adjacent one).
+		return doctor.Check{
+			Name: orgArchiveMirrorDoctorCheckName, OK: false, Required: false,
+			Detail: fmt.Sprintf("archived-seat mirror UNREADABLE: %v — exclusion state UNKNOWN, not healthy", err),
+		}, true
 	}
 	pending, err := listOrgArchivePendingForDoctor(context.Background(), store)
 	if err != nil {
@@ -71,6 +77,19 @@ func buildOrgArchiveMirrorDoctorCheck(rows []db.OrgRoleArchived, pending []db.Or
 		return doctor.Check{
 			Name: orgArchiveMirrorDoctorCheckName, OK: false, Required: false,
 			Detail: detail + pendingMirrorSuffix(len(rows), roleList),
+		}
+	}
+	// Adversary 8 (#1643 round 8, opus): a seat carried on OMISSION alone is a
+	// third state — not archived-confirmed, not active-observed, just UNPROVEN
+	// — and the poll stamp answers "did this tick complete", not "is the
+	// mirror true". Each row's observed_at is the last POSITIVE confirmation
+	// (refreshed only when the archived block is re-seen, untouched by
+	// omission ticks), so its age is the unproven state's own clock. Age and
+	// count, condition named, no verdict on a young row.
+	if warn, detail := unconfirmedExclusionsDetail(rows, now); warn {
+		return doctor.Check{
+			Name: orgArchiveMirrorDoctorCheckName, OK: false, Required: false,
+			Detail: detail,
 		}
 	}
 	if !everSucceeded {
@@ -126,4 +145,37 @@ func pendingMirrorSuffix(mirrored int, roleList string) string {
 // rather than healthy.
 var listOrgArchivePendingForDoctor = func(ctx context.Context, store *db.Store) ([]db.OrgRoleArchived, error) {
 	return store.ListOrgArchivePending(ctx)
+}
+
+// listOrgRolesArchivedForDoctor is a fault-injection seam: the round-8 guard
+// test makes the mirror unreadable and asserts the doctor reports UNKNOWN
+// rather than silently absenting itself.
+var listOrgRolesArchivedForDoctor = func(ctx context.Context, store *db.Store) ([]db.OrgRoleArchived, error) {
+	return store.ListOrgRolesArchived(ctx)
+}
+
+// unconfirmedExclusionsDetail warns when any mirrored exclusion has gone
+// unconfirmed — its agent neither re-listed archived nor observed active —
+// past the staleness threshold. Expected briefly (an archived agent can drop
+// out of a list transiently); a problem when it persists, because the seat is
+// then excluded on evidence aging without bound while the poll stamp keeps
+// advancing.
+func unconfirmedExclusionsDetail(rows []db.OrgRoleArchived, now time.Time) (bool, string) {
+	oldest := now
+	oldestRole := ""
+	count := 0
+	for _, row := range rows {
+		observed, err := time.Parse(time.RFC3339Nano, row.ObservedAt)
+		if err != nil || now.Sub(observed) <= orgArchiveStaleAfter {
+			continue
+		}
+		count++
+		if observed.Before(oldest) {
+			oldest, oldestRole = observed, row.Role
+		}
+	}
+	if count == 0 {
+		return false, ""
+	}
+	return true, fmt.Sprintf("%d excluded seat(s) UNCONFIRMED — neither re-listed archived nor observed active — oldest %s for %s; excluded on evidence aging without bound while polls keep succeeding", count, now.Sub(oldest).Round(time.Second), oldestRole)
 }

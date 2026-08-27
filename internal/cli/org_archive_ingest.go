@@ -233,14 +233,24 @@ func refreshOrgArchiveMirror(ctx context.Context, store *db.Store, stdout io.Wri
 	}
 	for _, row := range pending {
 		// A pending row CONTRADICTED by this tick's read (agent present
-		// without its block) is deliberately still APPLIED: the same tick's
-		// transition loop, which reads post-drain state and holds the fresh
-		// positive evidence, supersedes it through the ATOMIC transition —
-		// whose transaction also deletes the pending row. Round 6 discarded
-		// such rows with a separate DELETE, a write whose failure left the
-		// contradiction living only in tick memory (round 7): re-deriving the
-		// contradiction each tick from durable state x fresh evidence needs
-		// no memory at all.
+		// without its block) is superseded through the ATOMIC transition
+		// DIRECTLY — without ever touching the shipping mirror (#1643 round
+		// 8, codex): the round-7 apply-then-transition path committed the
+		// stale observation to org_role_archived for a window in which
+		// concurrent readers could classify an actively observed seat as
+		// archived. The transition transaction unparks, removes any mirror
+		// row, and deletes the pending row as one write; a failure leaves the
+		// pending row to re-derive the contradiction next tick (round 7's
+		// property, kept), and success writes nothing a reader could misread.
+		if _, stillArchived := archived[row.Role]; present[row.Role] && !stillArchived {
+			if _, err := unarchiveOrgSeatTransition(ctx, store, row.Role, now); err != nil {
+				writeLine(stdout, "org archive mirror: atomic supersede of stale pending %s failed, retried next tick: %v", row.Role, err)
+				failed = true
+				continue
+			}
+			writeLine(stdout, "org archive mirror: pending observation for %s superseded by fresher positive evidence (atomic)", row.Role)
+			continue
+		}
 		if err := upsertOrgRoleArchived(ctx, store, row); err != nil {
 			writeLine(stdout, "org archive mirror: upsert %s failed, retried next tick from pending: %v", row.Role, err)
 			failed = true
