@@ -232,7 +232,7 @@ func TestExecBackendUnknownFailsLoudDaemonE2E(t *testing.T) {
 			if !strings.Contains(failedMessage, `"`+tc.value+`"`) {
 				t.Fatalf("dispatch error = %q, want it to name %q", failedMessage, tc.value)
 			}
-			if !strings.Contains(failedMessage, "allowed: local") {
+			if !strings.Contains(failedMessage, "allowed: local, remote") {
 				t.Fatalf("dispatch error = %q, want the allowed set named", failedMessage)
 			}
 			if !strings.Contains(failedMessage, "[remote_exec].backend") {
@@ -263,7 +263,7 @@ func TestExecBackendUnknownFailsLoudForegroundE2E(t *testing.T) {
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("foreground adapter ran with an unknown backend (marker err=%v)", err)
 	}
-	if got := errBuf.String(); !strings.Contains(got, `"e2b"`) || !strings.Contains(got, "allowed: local") || !strings.Contains(got, "[remote_exec].backend") {
+	if got := errBuf.String(); !strings.Contains(got, `"e2b"`) || !strings.Contains(got, "allowed: local, remote") || !strings.Contains(got, "[remote_exec].backend") {
 		t.Fatalf("foreground error = %q, want config source + value + allowed set", got)
 	}
 	jobs, err := store.ListJobs(context.Background())
@@ -798,7 +798,7 @@ func TestP2GapEveryJobAdapterConstructionRouteRefusesLocalFallback(t *testing.T)
 	})
 	t.Run("runtime contract preflight", func(t *testing.T) {
 		calls := 0
-		if _, err := runtimeContractPreflightForBackend(backend, func() runtime.RuntimeContractResult {
+		if _, _, err := runtimeContractPreflightForBackend(backend, func() runtime.RuntimeContractResult {
 			calls++
 			return runtime.RuntimeContractResult{}
 		}); err == nil {
@@ -822,6 +822,120 @@ func TestP2GapEveryJobAdapterConstructionRouteRefusesLocalFallback(t *testing.T)
 	})
 	if localDeliveryCalls != 0 {
 		t.Fatalf("local delivery factory calls = %d, want 0", localDeliveryCalls)
+	}
+}
+
+func TestRemoteBackendRefusesEveryHostOnlyRoute(t *testing.T) {
+	localDeliveryCalls := 0
+	worker := jobWorker{
+		AdapterFactory: func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+			localDeliveryCalls++
+			return &cliWorkerFakeAdapter{}, nil
+		},
+	}
+	agent := runtime.Agent{Runtime: runtime.ShellRuntime, ExecBackend: string(execbackend.Remote)}
+
+	t.Run("lifecycle provider is not configured", func(t *testing.T) {
+		if _, err := worker.defaultExecutionBackend(execbackend.Remote); err == nil || !strings.Contains(err.Error(), "not configured") {
+			t.Fatalf("remote lifecycle error = %v, want temporary not-configured refusal", err)
+		}
+	})
+	t.Run("daemon primary delivery is an unprovisioned placeholder", func(t *testing.T) {
+		adapter, token, err := worker.buildSeatAwareAdapterForBackend(execbackend.Remote, &agent, t.TempDir(), workflow.JobPayload{})
+		if err != nil {
+			t.Fatalf("build remote placeholder: %v", err)
+		}
+		if token != "" {
+			t.Fatalf("remote placeholder relay token = %q, want empty", token)
+		}
+		if _, err := adapter.Deliver(context.Background(), agent, runtime.Job{}); err == nil || !strings.Contains(err.Error(), "not provisioned") {
+			t.Fatalf("remote placeholder Deliver error = %v, want unprovisioned refusal", err)
+		}
+	})
+	t.Run("moot seat relay", func(t *testing.T) {
+		if _, _, err := worker.buildSeatAwareAdapterForBackend(execbackend.Remote, &agent, t.TempDir(), workflow.JobPayload{MootSeat: true}); err == nil {
+			t.Fatal("remote moot seat accepted a host relay")
+		}
+	})
+	t.Run("temporary worker delivery", func(t *testing.T) {
+		if _, err := worker.deliveryAdapterForBackend(execbackend.Remote, agent, t.TempDir()); err == nil {
+			t.Fatal("temporary worker accepted remote delivery")
+		}
+	})
+	t.Run("runtime composition requires an instance", func(t *testing.T) {
+		if _, err := buildRuntimeAdapter("", agent, t.TempDir(), subprocess.GroupRunner{}); err == nil || !strings.Contains(err.Error(), "not attached to an instance") {
+			t.Fatalf("remote non-instance runner error = %v, want attached-instance refusal", err)
+		}
+	})
+	t.Run("runtime composition is shell-only without path grants", func(t *testing.T) {
+		backend, err := execbackend.NewLocalBackend(filepath.Join(t.TempDir(), "instances"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		runner := execbackend.InstanceRunner{Backend: backend, Instance: &execbackend.Instance{ID: "remote-fixture"}}
+		adapter, err := buildRuntimeAdapter("", agent, t.TempDir(), runner)
+		if err != nil {
+			t.Fatalf("build remote shell adapter: %v", err)
+		}
+		if _, ok := adapter.(runtime.ShellAdapter); !ok {
+			t.Fatalf("remote shell adapter = %T, want runtime.ShellAdapter", adapter)
+		}
+		unsupportedRuntime := agent
+		unsupportedRuntime.Runtime = runtime.CodexRuntime
+		if _, err := buildRuntimeAdapter("", unsupportedRuntime, t.TempDir(), runner); err == nil {
+			t.Fatal("remote runtime composition accepted a non-shell runtime")
+		}
+		for _, granted := range []runtime.Agent{
+			{Runtime: runtime.ShellRuntime, ExecBackend: string(execbackend.Remote), WritablePaths: []string{"/write"}},
+			{Runtime: runtime.ShellRuntime, ExecBackend: string(execbackend.Remote), ReadablePaths: []string{"/read"}},
+			{Runtime: runtime.ShellRuntime, ExecBackend: string(execbackend.Remote), ReadableFiles: []string{"/file"}},
+		} {
+			if _, err := buildRuntimeAdapter("", granted, t.TempDir(), runner); err == nil {
+				t.Fatalf("remote runtime composition accepted path grants: %+v", granted)
+			}
+		}
+	})
+	t.Run("runtime session start", func(t *testing.T) {
+		if _, err := startRuntimeAdapterForBackend(execbackend.Remote, "", runtime.ShellRuntime, t.TempDir()); err == nil {
+			t.Fatal("agent start accepted the remote backend")
+		}
+	})
+	t.Run("foreground dispatch", func(t *testing.T) {
+		if _, err := foregroundRuntimeAdapterFactoryFor(execbackend.Remote); err == nil {
+			t.Fatal("foreground dispatch accepted the remote backend")
+		}
+	})
+	t.Run("pre-provision runtime contract is skipped", func(t *testing.T) {
+		calls := 0
+		_, checked, err := runtimeContractPreflightForBackend(execbackend.Remote, func() runtime.RuntimeContractResult {
+			calls++
+			return runtime.RuntimeContractResult{}
+		})
+		if err != nil || checked || calls != 0 {
+			t.Fatalf("remote preflight = checked %t, error %v, host calls %d; want skipped", checked, err, calls)
+		}
+	})
+	t.Run("pre-provision auth is unknown", func(t *testing.T) {
+		calls := 0
+		verdict, err := authProbeForBackend(execbackend.Remote, func() authProbeVerdict {
+			calls++
+			return authProbeValid
+		})
+		if err != nil || verdict != authProbeUnknown || calls != 0 {
+			t.Fatalf("remote auth probe = verdict %d, error %v, host calls %d; want unknown without host probe", verdict, err, calls)
+		}
+	})
+	t.Run("job subprocesses remain host-only", func(t *testing.T) {
+		runner, err := jobSubprocessRunnerForBackend(execbackend.Remote)
+		if err != nil {
+			t.Fatalf("remote host subprocess runner: %v", err)
+		}
+		if _, ok := runner.(hostJobSubprocessRunner); !ok {
+			t.Fatalf("remote job subprocess runner = %T, want hostJobSubprocessRunner", runner)
+		}
+	})
+	if localDeliveryCalls != 0 {
+		t.Fatalf("remote routes invoked local delivery factory %d times, want 0", localDeliveryCalls)
 	}
 }
 
@@ -912,7 +1026,7 @@ func TestExecBackendOverrideResolutionDaemonE2E(t *testing.T) {
 		for _, event := range execBackendEvents(t, store, jobID) {
 			failedMessage = event
 		}
-		if !strings.Contains(failedMessage, "exec_backend") || !strings.Contains(failedMessage, `"e2b"`) || !strings.Contains(failedMessage, "allowed: local") {
+		if !strings.Contains(failedMessage, "exec_backend") || !strings.Contains(failedMessage, `"e2b"`) || !strings.Contains(failedMessage, "allowed: local, remote") {
 			t.Fatalf("failed event = %q, want override source + value + allowed set", failedMessage)
 		}
 	})
@@ -1080,7 +1194,7 @@ func TestExecBackendCompositionPreservedForLocal(t *testing.T) {
 	if err == nil {
 		t.Fatal("buildRuntimeAdapter with exec_backend=e2b succeeded, want a loud error")
 	}
-	if !strings.Contains(err.Error(), `"e2b"`) || !strings.Contains(err.Error(), "allowed: local") {
+	if !strings.Contains(err.Error(), `"e2b"`) || !strings.Contains(err.Error(), "allowed: local, remote") {
 		t.Fatalf("composition-site error = %q, want the value AND the allowed set", err)
 	}
 

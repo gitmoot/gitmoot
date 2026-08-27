@@ -39,6 +39,9 @@ var localAgentDispatchExecBackendFor = func(home string) (execbackend.Backend, e
 func foregroundRuntimeAdapterFactoryFor(backend execbackend.Backend) (foregroundRuntimeAdapterFactory, error) {
 	return execbackend.Consume(backend, func() (foregroundRuntimeAdapterFactory, error) {
 		return localAgentDispatchRuntimeAdapterFor, nil
+	}, func() (foregroundRuntimeAdapterFactory, error) {
+		// Foreground dispatch has no daemon lifecycle owner, ledger, or reaper.
+		return nil, errors.New("foreground dispatch does not support the remote execution backend")
 	})
 }
 
@@ -318,16 +321,18 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	}
 	var foregroundContract *runtime.RuntimeContractResult
 	if !request.Background {
-		result, err := runtimeContractPreflightForBackend(execBackend, func() runtime.RuntimeContractResult {
+		result, checked, err := runtimeContractPreflightForBackend(execBackend, func() runtime.RuntimeContractResult {
 			return localRuntimeContractPreflight(ctx, effectiveAgent)
 		})
 		if err != nil {
 			return localAgentJobOutput{}, err
 		}
-		if err := runtime.RuntimeContractDispatchError(effectiveAgent, result); err != nil {
-			return localAgentJobOutput{}, err
+		if checked {
+			if err := runtime.RuntimeContractDispatchError(effectiveAgent, result); err != nil {
+				return localAgentJobOutput{}, err
+			}
+			foregroundContract = &result
 		}
-		foregroundContract = &result
 	}
 	switch request.Action {
 	case "review":

@@ -5,20 +5,20 @@ import (
 	"testing"
 )
 
-func TestParseResolvesAdvertisedLocal(t *testing.T) {
-	for _, value := range []string{"local", " local "} {
+func TestParseResolvesAdvertisedBackends(t *testing.T) {
+	for _, value := range []string{"local", " local ", "remote", " remote "} {
 		backend, err := Parse(value)
 		if err != nil {
-			t.Fatalf("Parse(%q) error = %v, want local", value, err)
+			t.Fatalf("Parse(%q) error = %v", value, err)
 		}
-		if backend != Local {
-			t.Fatalf("Parse(%q) = %q, want %q", value, backend, Local)
+		if backend != Backend(strings.TrimSpace(value)) {
+			t.Fatalf("Parse(%q) = %q", value, backend)
 		}
 	}
 }
 
 func TestParseUnknownAndBlankFailLoudNamingValueAndAllowedSet(t *testing.T) {
-	for _, value := range []string{"", "   ", "e2b", "loca", "LOCAL", "remote"} {
+	for _, value := range []string{"", "   ", "e2b", "loca", "LOCAL"} {
 		backend, err := Parse(value)
 		if err == nil {
 			t.Fatalf("Parse(%q) = %q, want a loud error", value, backend)
@@ -26,7 +26,7 @@ func TestParseUnknownAndBlankFailLoudNamingValueAndAllowedSet(t *testing.T) {
 		if !strings.Contains(err.Error(), `"`+strings.TrimSpace(value)+`"`) {
 			t.Fatalf("Parse(%q) error = %q, want it to name the offending value", value, err)
 		}
-		if !strings.Contains(err.Error(), "allowed: local") {
+		if !strings.Contains(err.Error(), "allowed: local, remote") {
 			t.Fatalf("Parse(%q) error = %q, want it to name the allowed set", value, err)
 		}
 	}
@@ -45,7 +45,7 @@ func TestResolveOverrideWinsOverConfig(t *testing.T) {
 	if err == nil {
 		t.Fatal("Resolve(local, e2b) succeeded, want a loud override error")
 	}
-	if !strings.Contains(err.Error(), "exec_backend") || !strings.Contains(err.Error(), `"e2b"`) || !strings.Contains(err.Error(), "allowed: local") {
+	if !strings.Contains(err.Error(), "exec_backend") || !strings.Contains(err.Error(), `"e2b"`) || !strings.Contains(err.Error(), "allowed: local, remote") {
 		t.Fatalf("Resolve(local, e2b) error = %q, want override source + value + allowed set", err)
 	}
 	// An absent override falls through to the config value; an unknown config
@@ -74,6 +74,9 @@ func TestAllowedNamesMatchesParse(t *testing.T) {
 		if _, err := Parse(name); err != nil {
 			t.Fatalf("AllowedNames entry %q does not parse: %v", name, err)
 		}
+		if _, err := ParseImplemented(name); err != nil {
+			t.Fatalf("AllowedNames entry %q is not implemented: %v", name, err)
+		}
 	}
 	_, err := Parse("definitely-not-a-backend")
 	if err == nil || !strings.Contains(err.Error(), "allowed: "+Allowed()) {
@@ -98,23 +101,33 @@ func TestAdvertisedBackendWithoutImplementationFailsLoud(t *testing.T) {
 }
 
 func TestConsumeRequiresPositiveImplementation(t *testing.T) {
-	called := 0
-	got, err := Consume(Local, func() (string, error) {
-		called++
+	localCalls := 0
+	remoteCalls := 0
+	local := func() (string, error) {
+		localCalls++
 		return "local-result", nil
-	})
-	if err != nil || got != "local-result" || called != 1 {
-		t.Fatalf("Consume(local) = %q, %v, calls=%d; want local-result, nil, 1", got, err, called)
+	}
+	remote := func() (string, error) {
+		remoteCalls++
+		return "remote-result", nil
+	}
+	got, err := Consume(Local, func() (string, error) {
+		return local()
+	}, remote)
+	if err != nil || got != "local-result" || localCalls != 1 || remoteCalls != 0 {
+		t.Fatalf("Consume(local) = %q, %v, local calls=%d remote calls=%d", got, err, localCalls, remoteCalls)
 	}
 
-	got, err = Consume(Backend("p2-probe"), func() (string, error) {
-		called++
-		return "silently-local", nil
-	})
+	got, err = Consume(Remote, local, remote)
+	if err != nil || got != "remote-result" || localCalls != 1 || remoteCalls != 1 {
+		t.Fatalf("Consume(remote) = %q, %v, local calls=%d remote calls=%d", got, err, localCalls, remoteCalls)
+	}
+
+	got, err = Consume(Backend("p2-probe"), local, remote)
 	if err == nil || !strings.Contains(err.Error(), `"p2-probe"`) {
 		t.Fatalf("Consume(p2-probe) = %q, %v; want a loud missing-implementation error", got, err)
 	}
-	if called != 1 {
-		t.Fatalf("local builder calls = %d, want 1; future backend reached local implementation", called)
+	if localCalls != 1 || remoteCalls != 1 {
+		t.Fatalf("p2-probe invoked a builder: local calls=%d remote calls=%d", localCalls, remoteCalls)
 	}
 }

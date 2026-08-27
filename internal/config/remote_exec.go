@@ -20,8 +20,8 @@ import (
 // loads the DefaultRemoteExecConfig ("local"), which is a byte-for-byte
 // passthrough to the pre-#1536 runner composition.
 type RemoteExecConfig struct {
-	// Backend is the [remote_exec].backend selection. "local" is the default
-	// and the only implemented value; anything else fails validation loud.
+	// Backend is the [remote_exec].backend selection. "local" is the default;
+	// "remote" is parseable while its provider factory remains a loud refusal.
 	Backend string
 	// LocalUID and LocalGID opt local-backend commands into an OS-level
 	// privilege drop. They are a pair: omitting both preserves the daemon

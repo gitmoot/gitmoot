@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -73,7 +74,8 @@ func TestProvisionExecutionBackendLocalBehaviorUnchanged(t *testing.T) {
 	}}
 	job := db.Job{ID: "local-credential-gate", LifecycleGeneration: 4}
 
-	lifecycle, instance, err := worker.provisionExecutionBackend(context.Background(), execbackend.Local, runtime.ShellRuntime, job, "/checkout")
+	const ttl = 9 * time.Minute
+	lifecycle, instance, err := worker.provisionExecutionBackend(context.Background(), execbackend.Local, runtime.ShellRuntime, job, ttl, "/checkout")
 	if err != nil {
 		t.Fatalf("provisionExecutionBackend(local): %v", err)
 	}
@@ -83,8 +85,8 @@ func TestProvisionExecutionBackendLocalBehaviorUnchanged(t *testing.T) {
 	if backend.provisionCalls != 1 || backend.syncInCalls != 1 {
 		t.Fatalf("local Provision calls = %d, SyncIn calls = %d; want 1, 1", backend.provisionCalls, backend.syncInCalls)
 	}
-	if backend.scope.JobID != job.ID || backend.scope.LifecycleGeneration != job.LifecycleGeneration {
-		t.Fatalf("local provision scope = %+v, want job id %q generation %d", backend.scope, job.ID, job.LifecycleGeneration)
+	if backend.scope.JobID != job.ID || backend.scope.LifecycleGeneration != job.LifecycleGeneration || backend.scope.TTL != ttl {
+		t.Fatalf("local provision scope = %+v, want job id %q generation %d ttl %s", backend.scope, job.ID, job.LifecycleGeneration, ttl)
 	}
 	if backend.materials.SourceWorktree != "/checkout" {
 		t.Fatalf("local SyncIn source = %q, want /checkout", backend.materials.SourceWorktree)

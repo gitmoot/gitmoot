@@ -17,8 +17,10 @@ local_gid = 1000
 local_root = "/var/tmp/gitmoot-local"
 ```
 
-`local` is the default and the only implemented backend. For an engine-driven
-daemon job, Gitmoot provisions one job-scoped instance, syncs the selected host
+`local` is the default and the only currently provisioned backend. `remote` is
+parseable, but its provider is not configured in this slice; unsupported routes
+refuse explicitly rather than falling back to host execution. For an
+engine-driven daemon job, Gitmoot provisions one job-scoped instance, syncs the selected host
 checkout into a distinct detached Git worktree, streams runtime commands there,
 collects changes, and destroys the instance after the job. The same instance
 survives Mailbox repair deliveries. An implement job's changes return through
@@ -65,16 +67,16 @@ directory that Git never registered remains the known orphaned-but-present
 cleanup limitation tracked in #1572.
 
 Gitmoot reads `[remote_exec]` when it dispatches a job; it is not cached and
-needs no SIGHUP wiring. Foreground dispatch retains the host runner path because
-the lifecycle is acquired at the daemon job-worker boundary.
+needs no SIGHUP wiring. Foreground dispatch refuses `remote` because it has no
+daemon-owned lifecycle, ledger, or reaper.
 
 A job payload's `exec_backend` field overrides the config value for that one
 job. When either selector is explicitly present its value must be non-blank;
 an absent selector defaults to `local`, while `backend = ""` or an explicit
 `"exec_backend":""` fails loudly.
 
-Any value outside the allowed set — currently only `local` — **fails the job
+Any value outside the allowed set (`local`, `remote`) **fails the job
 loudly at dispatch**: the failure names the offending value and the allowed
-set (for example `unknown execution backend "e2b" (allowed: local)`). There
-is no silent fallback. Remote backends (see the parallel-isolated-execution
-epic, #1529) will extend the allowed set in later phases.
+set (for example `unknown execution backend "e2b" (allowed: local, remote)`).
+There is no silent fallback. Provider construction for `remote` lands in later
+phases of the parallel-isolated-execution epic (#1529).

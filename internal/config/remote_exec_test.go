@@ -39,14 +39,18 @@ func TestLoadRemoteExecConfigDefaultsToLocal(t *testing.T) {
 	}
 }
 
-func TestLoadRemoteExecConfigExplicitLocal(t *testing.T) {
-	paths := remoteExecTestPaths(t, "[remote_exec]\nbackend = \"local\"\n")
-	cfg, err := LoadRemoteExecConfig(paths)
-	if err != nil {
-		t.Fatalf("LoadRemoteExecConfig: %v", err)
-	}
-	if cfg.Backend != "local" {
-		t.Fatalf("Backend = %q, want local", cfg.Backend)
+func TestLoadRemoteExecConfigExplicitImplementedBackend(t *testing.T) {
+	for _, backend := range []string{"local", "remote"} {
+		t.Run(backend, func(t *testing.T) {
+			paths := remoteExecTestPaths(t, "[remote_exec]\nbackend = \""+backend+"\"\n")
+			cfg, err := LoadRemoteExecConfig(paths)
+			if err != nil {
+				t.Fatalf("LoadRemoteExecConfig: %v", err)
+			}
+			if cfg.Backend != backend {
+				t.Fatalf("Backend = %q, want %q", cfg.Backend, backend)
+			}
+		})
 	}
 }
 
@@ -98,7 +102,7 @@ func TestLoadRemoteExecConfigUnknownFailsLoud(t *testing.T) {
 		if !strings.Contains(err.Error(), "[remote_exec].backend") {
 			t.Fatalf("backend %q error = %q, want the config key named", value, err)
 		}
-		if !strings.Contains(err.Error(), `"`+value+`"`) || !strings.Contains(err.Error(), "allowed: local") {
+		if !strings.Contains(err.Error(), `"`+value+`"`) || !strings.Contains(err.Error(), "allowed: local, remote") {
 			t.Fatalf("backend %q error = %q, want the value AND the allowed set", value, err)
 		}
 	}
@@ -111,7 +115,7 @@ func TestLoadRemoteExecConfigExplicitBlankFailsLoud(t *testing.T) {
 		if err == nil {
 			t.Fatalf("explicit blank backend %q loaded, want a loud error", value)
 		}
-		if !strings.Contains(err.Error(), "[remote_exec].backend") || !strings.Contains(err.Error(), `unknown execution backend ""`) || !strings.Contains(err.Error(), "allowed: local") {
+		if !strings.Contains(err.Error(), "[remote_exec].backend") || !strings.Contains(err.Error(), `unknown execution backend ""`) || !strings.Contains(err.Error(), "allowed: local, remote") {
 			t.Fatalf("explicit blank backend %q error = %q, want key + blank value + allowed set", value, err)
 		}
 	}

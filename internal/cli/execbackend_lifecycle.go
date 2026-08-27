@@ -55,18 +55,21 @@ func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend) (execbac
 		// Reap once per resolved root in this process. A restarted daemon has a
 		// fresh map and therefore reconciles the prior process's instances before
 		// provisioning its first new job.
-		rootKey := root
+		rootKey := string(backend) + "|" + root
 		if _, loaded := reapedExecutionBackendRoots.LoadOrStore(rootKey, struct{}{}); !loaded {
-			if _, err := local.Reap(context.Background()); err != nil {
+			var reaper execbackend.Reaper = local
+			if _, err := reaper.Reap(context.Background()); err != nil {
 				reapedExecutionBackendRoots.Delete(rootKey)
 				return nil, fmt.Errorf("reap local execution backends: %w", err)
 			}
 		}
 		return local, nil
+	}, func() (execbackend.ExecutionBackend, error) {
+		return nil, errors.New("remote execution backend is not configured")
 	})
 }
 
-func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execbackend.Backend, runtimeName string, job db.Job, checkout string) (execbackend.ExecutionBackend, *execbackend.Instance, error) {
+func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execbackend.Backend, runtimeName string, job db.Job, ttl time.Duration, checkout string) (execbackend.ExecutionBackend, *execbackend.Instance, error) {
 	if w.ExecutionBackendFactory == nil {
 		return nil, nil, nil
 	}
@@ -74,7 +77,7 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 	if err != nil {
 		return nil, nil, fmt.Errorf("construct %s execution backend: %w", backend, err)
 	}
-	instance, err := lifecycle.Provision(ctx, execbackend.JobScope{JobID: job.ID, LifecycleGeneration: job.LifecycleGeneration})
+	instance, err := lifecycle.Provision(ctx, execbackend.JobScope{JobID: job.ID, LifecycleGeneration: job.LifecycleGeneration, TTL: ttl})
 	if err != nil {
 		return nil, nil, fmt.Errorf("provision %s execution backend for job %s: %w", backend, job.ID, err)
 	}

@@ -465,6 +465,21 @@ func TestObserveResultChangesReadsTrackedAndUntrackedWorktreeDiff(t *testing.T) 
 	}
 }
 
+func TestObserveResultChangesRemoteReadsImportedHostWorktree(t *testing.T) {
+	repo := observationTestRepo(t)
+	writeObservationFile(t, repo, "remote.go", "package changed\n")
+
+	observation := observeResultChanges(context.Background(), repo, AgentResult{
+		ChangesMade: []string{"remote.go:1 — imported"},
+	}, execbackend.Remote)
+	if observation == nil || observation.Error != "" || observation.Divergent {
+		t.Fatalf("remote observation = %+v, want successful host worktree diff", observation)
+	}
+	if got, want := fmt.Sprint(observation.TouchedFiles), "[remote.go]"; got != want {
+		t.Fatalf("TouchedFiles = %s, want %s", got, want)
+	}
+}
+
 func TestObserveResultChangesNonLocalBackendCannotRunLocalGit(t *testing.T) {
 	observation := observeResultChanges(context.Background(), t.TempDir(), AgentResult{
 		ChangesMade: []string{"tracked.go:1 — updated"},

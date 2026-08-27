@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
@@ -27,6 +28,8 @@ import (
 type ExecutionBackend interface {
 	Name() Backend
 	Provision(context.Context, JobScope) (*Instance, error)
+	// Attach deliberately has zero non-test callers; #1539 owns the durable
+	// instance ledger and the first production wiring.
 	Attach(context.Context, string) (*Instance, error)
 	SyncIn(context.Context, *Instance, Materials) error
 	Exec(context.Context, *Instance, Command) (Stream, error)
@@ -44,6 +47,7 @@ type Reaper interface {
 type JobScope struct {
 	JobID               string
 	LifecycleGeneration int64
+	TTL                 time.Duration
 }
 
 // Materials are non-secret inputs staged into one execution instance. The

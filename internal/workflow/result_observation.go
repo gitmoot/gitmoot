@@ -165,6 +165,8 @@ func observeResultChanges(ctx context.Context, worktree string, result AgentResu
 	}
 	files, err := execbackend.Consume(backend, func() ([]string, error) {
 		return changedWorktreeFiles(ctx, worktree)
+	}, func() ([]string, error) {
+		return changedWorktreeFiles(ctx, worktree)
 	})
 	if err != nil {
 		return &ResultObservation{
