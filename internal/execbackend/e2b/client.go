@@ -16,7 +16,6 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -149,7 +148,7 @@ type listedSandbox struct {
 }
 
 type sandboxPage struct {
-	items []listedSandbox
+	items []json.RawMessage
 }
 
 func (p *sandboxPage) UnmarshalJSON(data []byte) error {
@@ -162,9 +161,9 @@ func (p *sandboxPage) UnmarshalJSON(data []byte) error {
 		return errors.New("E2B sandbox inventory must be a JSON array")
 	}
 
-	var page []listedSandbox
+	var page []json.RawMessage
 	for decoder.More() {
-		var sandbox listedSandbox
+		var sandbox json.RawMessage
 		if err := decoder.Decode(&sandbox); err != nil {
 			return err
 		}
@@ -186,7 +185,9 @@ func (p *sandboxPage) UnmarshalJSON(data []byte) error {
 
 type inventoryAuthority struct {
 	runningLowerBound uint64
+	runningCollected  uint64
 	runningObserved   bool
+	sawContinuation   bool
 }
 
 func (a *inventoryAuthority) acceptPage(headers http.Header, page sandboxPage, collected int, terminal bool) ([]Sandbox, error) {
@@ -201,49 +202,25 @@ func (a *inventoryAuthority) acceptPage(headers http.Header, page sandboxPage, c
 
 	sandboxes := make([]Sandbox, 0, len(page.items))
 	for i := range page.items {
-		sandbox, err := page.items[i].sandbox()
+		sandbox, err := decodeListedSandbox(page.items[i])
 		if err != nil {
 			return nil, fmt.Errorf("response item %d: %w", collected+i, err)
+		}
+		if sandbox.State == "running" {
+			a.runningCollected++
 		}
 		sandboxes = append(sandboxes, sandbox)
 	}
 
-	newCount := uint64(collected + len(sandboxes))
-	if terminal && a.runningObserved && newCount < a.runningLowerBound {
-		return nil, fmt.Errorf("collected %d sandboxes, fewer than X-Total-Running lower bound %d", newCount, a.runningLowerBound)
-	}
-	if terminal && len(page.items) == listSandboxesPageSize {
-		return nil, fmt.Errorf("terminal page contains the full %d-item limit without a continuation token", listSandboxesPageSize)
+	if terminal && a.runningObserved && a.runningCollected < a.runningLowerBound {
+		return nil, fmt.Errorf("collected %d running sandboxes, fewer than X-Total-Running lower bound %d", a.runningCollected, a.runningLowerBound)
 	}
 	return sandboxes, nil
 }
 
 func (s listedSandbox) sandbox() (Sandbox, error) {
-	missing := make([]string, 0, 9)
-	for name, present := range map[string]bool{
-		"templateID":  s.TemplateID != nil,
-		"sandboxID":   s.ID != nil,
-		"startedAt":   s.StartedAt != nil,
-		"cpuCount":    s.CPUCount != nil,
-		"memoryMB":    s.MemoryMB != nil,
-		"diskSizeMB":  s.DiskSizeMB != nil,
-		"endAt":       s.EndAt != nil,
-		"state":       s.State != nil,
-		"envdVersion": s.EnvdVersion != nil,
-	} {
-		if !present {
-			missing = append(missing, name)
-		}
-	}
-	if len(missing) > 0 {
-		slices.Sort(missing)
-		return Sandbox{}, fmt.Errorf("missing required ListedSandbox fields: %s", strings.Join(missing, ", "))
-	}
 	if strings.TrimSpace(*s.ID) == "" {
 		return Sandbox{}, errors.New("missing sandboxID")
-	}
-	if *s.State != "running" && *s.State != "paused" {
-		return Sandbox{}, fmt.Errorf("invalid SandboxState %q", *s.State)
 	}
 	return Sandbox{
 		ID:          *s.ID,
@@ -259,6 +236,11 @@ func (s listedSandbox) sandbox() (Sandbox, error) {
 		Metadata:    s.Metadata,
 		State:       *s.State,
 	}, nil
+}
+
+type sandboxInventory struct {
+	sandboxes            []Sandbox
+	absenceAuthoritative bool
 }
 
 func responseTotalRunning(headers http.Header) (uint64, bool, error) {
@@ -335,6 +317,11 @@ func (c *Client) Create(ctx context.Context, templateID string, ttl time.Duratio
 
 // List returns all sandboxes in the provider response.
 func (c *Client) List(ctx context.Context) ([]Sandbox, error) {
+	inventory, err := c.list(ctx)
+	return inventory.sandboxes, err
+}
+
+func (c *Client) list(ctx context.Context) (sandboxInventory, error) {
 	var sandboxes []Sandbox
 	var authority inventoryAuthority
 	nextToken := ""
@@ -347,31 +334,33 @@ func (c *Client) List(ctx context.Context) ([]Sandbox, error) {
 		var page sandboxPage
 		headers, err := c.doJSON(ctx, http.MethodGet, "/v2/sandboxes?"+query.Encode(), nil, http.StatusOK, &page)
 		if err != nil {
-			return nil, err
+			return sandboxInventory{}, err
 		}
 		nextToken = strings.TrimSpace(headers.Get("X-Next-Token"))
 		terminal := nextToken == ""
 		// Keep this request unfiltered so paused sandboxes remain visible to the
 		// reaper. For unfiltered responses X-Total-Running is optional and counts
-		// only running sandboxes, so it is a lower bound, never an inventory total.
-		// A present bound still catches the known dropped-next-token truncation.
-		// Without that header, only a terminal page shorter than the requested
-		// limit proves completion. A full terminal page may have lost its next
-		// token, so it must remain inconclusive rather than authorize Gone.
+		// only running sandboxes, so its lower-bound check cannot detect a lost
+		// paused sandbox by construction. The OpenAPI defines X-Next-Token as a
+		// "Cursor to fetch the next page of results, if more exist." Because limit
+		// is only a maximum, page length proves nothing. A single terminal response
+		// is valid List data but cannot authorize absence; only a continuation chain
+		// the provider started and then terminated does so.
 		accepted, err := authority.acceptPage(headers, page, len(sandboxes), terminal)
 		if err != nil {
-			return nil, c.errorf(err, "list sandboxes: inventory is not authoritative")
+			return sandboxInventory{}, c.errorf(err, "list sandboxes: inventory is not authoritative")
 		}
 		sandboxes = append(sandboxes, accepted...)
 		if terminal {
-			return sandboxes, nil
+			return sandboxInventory{sandboxes: sandboxes, absenceAuthoritative: authority.sawContinuation}, nil
 		}
+		authority.sawContinuation = true
 		if _, duplicate := seenTokens[nextToken]; duplicate {
-			return nil, c.errorf(nil, "list sandboxes: repeated pagination token %q", nextToken)
+			return sandboxInventory{}, c.errorf(nil, "list sandboxes: repeated pagination token %q", nextToken)
 		}
 		seenTokens[nextToken] = struct{}{}
 	}
-	return nil, c.errorf(nil, "list sandboxes: exceeded %d pages", maxListPages)
+	return sandboxInventory{}, c.errorf(nil, "list sandboxes: exceeded %d pages", maxListPages)
 }
 
 // Get observes one sandbox. An inconclusive ID response becomes Gone only when
@@ -385,14 +374,17 @@ func (c *Client) Get(ctx context.Context, sandboxID string) (Observation, error)
 	status, _, err := c.doJSONState(ctx, http.MethodGet, path, nil, http.StatusOK, &sandbox)
 	if err != nil {
 		if errors.Is(err, errIDResponseInconclusive) {
-			sandboxes, listErr := c.List(ctx)
+			inventory, listErr := c.list(ctx)
 			if listErr != nil {
 				return Observation{State: Unknown}, c.errorf(listErr, "get sandbox: ID response was inconclusive and inventory could not confirm absence")
 			}
-			for i := range sandboxes {
-				if sandboxes[i].ID == sandboxID {
+			for i := range inventory.sandboxes {
+				if inventory.sandboxes[i].ID == sandboxID {
 					return Observation{State: Unknown}, err
 				}
+			}
+			if !inventory.absenceAuthoritative {
+				return Observation{State: Unknown}, c.errorf(nil, "get sandbox: inventory did not prove all-state completeness")
 			}
 			return Observation{State: Gone}, nil
 		}

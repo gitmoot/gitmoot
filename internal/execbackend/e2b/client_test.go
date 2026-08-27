@@ -251,7 +251,7 @@ func TestClientGetRequiresArrayInventory(t *testing.T) {
 		{name: "object", inventory: `{}`, wantState: Unknown, wantErr: true},
 		{name: "string", inventory: `"text"`, wantState: Unknown, wantErr: true},
 		{name: "empty body", inventory: ``, wantState: Unknown, wantErr: true},
-		{name: "empty array confirms absence", inventory: `[]`, wantState: Gone},
+		{name: "single empty array cannot prove all-state absence", inventory: `[]`, wantState: Unknown, wantErr: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -286,6 +286,9 @@ func TestClientRequiresAuthoritativeInventory(t *testing.T) {
 		setContentType     bool
 		totalRunning       string
 		inventory          string
+		nextToken          string
+		nextTotalRunning   string
+		nextInventory      string
 		wantListError      bool
 		wantListed         int
 		checkFirst         bool
@@ -305,52 +308,97 @@ func TestClientRequiresAuthoritativeInventory(t *testing.T) {
 			wantObservationErr: true,
 		},
 		{
-			name:              "matching total confirms absence",
-			contentType:       "application/json; charset=utf-8",
-			setContentType:    true,
-			totalRunning:      "2",
-			inventory:         listedSandboxArray("sbx-1", "sbx-2"),
-			wantListed:        2,
-			checkFirst:        true,
-			wantFirstState:    "running",
-			wantFirstClientID: "client",
-			wantObservation:   Gone,
+			name:               "matching running total does not cover paused population",
+			contentType:        "application/json; charset=utf-8",
+			setContentType:     true,
+			totalRunning:       "2",
+			inventory:          listedSandboxArray("sbx-1", "sbx-2"),
+			wantListed:         2,
+			checkFirst:         true,
+			wantFirstState:     "running",
+			wantFirstClientID:  "client",
+			wantObservation:    Unknown,
+			wantObservationErr: true,
 		},
 		{
-			name:            "empty unfiltered inventory omits running total",
-			contentType:     "application/json",
-			setContentType:  true,
-			inventory:       `[]`,
-			wantObservation: Gone,
+			name:               "empty unfiltered inventory omits running total",
+			contentType:        "application/json",
+			setContentType:     true,
+			inventory:          `[]`,
+			wantObservation:    Unknown,
+			wantObservationErr: true,
 		},
 		{
-			name:              "paused item may exceed running lower bound",
-			contentType:       "application/json",
-			setContentType:    true,
-			totalRunning:      "0",
-			inventory:         listedSandboxArrayWith("paused", true, "sbx-paused"),
-			wantListed:        1,
-			checkFirst:        true,
-			wantFirstState:    "paused",
-			wantFirstClientID: "client",
-			wantObservation:   Gone,
+			name:               "paused item may exceed running lower bound",
+			contentType:        "application/json",
+			setContentType:     true,
+			totalRunning:       "0",
+			inventory:          listedSandboxArrayWith("paused", true, "sbx-paused"),
+			wantListed:         1,
+			checkFirst:         true,
+			wantFirstState:     "paused",
+			wantFirstClientID:  "client",
+			wantObservation:    Unknown,
+			wantObservationErr: true,
 		},
 		{
-			name:            "deprecated client ID may be absent",
-			contentType:     "application/json",
-			setContentType:  true,
-			inventory:       listedSandboxArrayWith("running", false, "sbx-no-client"),
-			wantListed:      1,
-			checkFirst:      true,
-			wantFirstState:  "running",
-			wantObservation: Gone,
+			name:               "mixed running and paused inventory remains visible",
+			contentType:        "application/json",
+			setContentType:     true,
+			totalRunning:       "1",
+			inventory:          listedSandboxObjects(listedSandboxObject("running", true, 2, 512, "sbx-running"), listedSandboxObject("paused", true, 2, 512, "sbx-paused")),
+			wantListed:         2,
+			checkFirst:         true,
+			wantFirstState:     "running",
+			wantFirstClientID:  "client",
+			wantObservation:    Unknown,
+			wantObservationErr: true,
 		},
 		{
-			name:               "full headerless terminal page is inconclusive",
+			name:               "explicit zero running total does not prove paused absence",
+			contentType:        "application/json",
+			setContentType:     true,
+			totalRunning:       "0",
+			inventory:          `[]`,
+			wantObservation:    Unknown,
+			wantObservationErr: true,
+		},
+		{
+			name:               "deprecated client ID may be absent",
+			contentType:        "application/json",
+			setContentType:     true,
+			inventory:          listedSandboxArrayWith("running", false, "sbx-no-client"),
+			wantListed:         1,
+			checkFirst:         true,
+			wantFirstState:     "running",
+			wantObservation:    Unknown,
+			wantObservationErr: true,
+		},
+		{
+			name:               "full headerless terminal page is valid but inconclusive",
 			contentType:        "application/json",
 			setContentType:     true,
 			inventory:          listedSandboxPage(listSandboxesPageSize),
-			wantListError:      true,
+			wantListed:         listSandboxesPageSize,
+			wantObservation:    Unknown,
+			wantObservationErr: true,
+		},
+		{
+			name:               "short headerless terminal page is valid but inconclusive",
+			contentType:        "application/json",
+			setContentType:     true,
+			inventory:          listedSandboxPage(listSandboxesPageSize - 1),
+			wantListed:         listSandboxesPageSize - 1,
+			wantObservation:    Unknown,
+			wantObservationErr: true,
+		},
+		{
+			name:               "running lower bound cannot detect an omitted paused item",
+			contentType:        "application/json",
+			setContentType:     true,
+			totalRunning:       "1",
+			inventory:          listedSandboxArray("sbx-running"),
+			wantListed:         1,
 			wantObservation:    Unknown,
 			wantObservationErr: true,
 		},
@@ -359,6 +407,24 @@ func TestClientRequiresAuthoritativeInventory(t *testing.T) {
 			contentType:        "application/json",
 			setContentType:     true,
 			inventory:          listedSandboxArrayWith("destroyed", true, "sbx-invalid-state"),
+			wantListError:      true,
+			wantObservation:    Unknown,
+			wantObservationErr: true,
+		},
+		{
+			name:               "CPU count below schema minimum is unverified",
+			contentType:        "application/json",
+			setContentType:     true,
+			inventory:          listedSandboxObjects(listedSandboxObject("running", true, 0, 512, "sbx-invalid-cpu")),
+			wantListError:      true,
+			wantObservation:    Unknown,
+			wantObservationErr: true,
+		},
+		{
+			name:               "memory below schema minimum is unverified",
+			contentType:        "application/json",
+			setContentType:     true,
+			inventory:          listedSandboxObjects(listedSandboxObject("running", true, 2, 64, "sbx-invalid-memory")),
 			wantListError:      true,
 			wantObservation:    Unknown,
 			wantObservationErr: true,
@@ -400,18 +466,42 @@ func TestClientRequiresAuthoritativeInventory(t *testing.T) {
 			wantObservation:    Unknown,
 			wantObservationErr: true,
 		},
+		{
+			name:            "terminated continuation chain confirms absence",
+			contentType:     "application/json",
+			setContentType:  true,
+			totalRunning:    "2",
+			inventory:       listedSandboxArray("sbx-page-1"),
+			nextToken:       "page-2",
+			nextInventory:   listedSandboxArray("sbx-page-2"),
+			wantListed:      2,
+			wantObservation: Gone,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.EscapedPath() == "/v2/sandboxes" {
+					inventory := test.inventory
+					totalRunning := test.totalRunning
+					if token := r.URL.Query().Get("nextToken"); token != "" {
+						if token != test.nextToken || test.nextInventory == "" {
+							http.Error(w, "unexpected next token", http.StatusBadRequest)
+							return
+						}
+						inventory = test.nextInventory
+						totalRunning = test.nextTotalRunning
+					}
 					if test.setContentType {
 						w.Header().Set("Content-Type", test.contentType)
 					}
-					if test.totalRunning != "" {
-						w.Header().Set("X-Total-Running", test.totalRunning)
+					if totalRunning != "" {
+						w.Header().Set("X-Total-Running", totalRunning)
 					}
-					_, _ = w.Write([]byte(test.inventory))
+					if r.URL.Query().Get("nextToken") == "" && test.nextToken != "" {
+						w.Header().Set("X-Next-Token", test.nextToken)
+					}
+					_, _ = w.Write([]byte(inventory))
 					return
 				}
 				w.Header().Set("Content-Type", "application/json")
@@ -446,15 +536,16 @@ func TestClientThreeStateObservation(t *testing.T) {
 		body          string
 		listStatus    int
 		listBody      string
+		listNextBody  string
 		listTotal     string
 		wantListCalls int32
 		wantState     State
 		wantErr       bool
 	}{
 		{name: "present", status: http.StatusOK, body: `{"sandboxID":"isandboxdoesnotexist000"}`, wantState: Present},
-		{name: "inventory confirms absent", status: http.StatusNotFound, body: measuredAbsent404Body, listStatus: http.StatusOK, listBody: `[]`, listTotal: "0", wantListCalls: 1, wantState: Gone},
+		{name: "continued inventory confirms absent", status: http.StatusNotFound, body: measuredAbsent404Body, listStatus: http.StatusOK, listBody: `[]`, listNextBody: `[]`, listTotal: "0", wantListCalls: 2, wantState: Gone},
 		{name: "inventory confirms routing failure is inconclusive", status: http.StatusNotFound, body: measuredRouting404Body, listStatus: http.StatusOK, listBody: listedSandboxArray("isandboxdoesnotexist000"), listTotal: "1", wantListCalls: 1, wantState: Unknown, wantErr: true},
-		{name: "gone response still requires inventory", status: http.StatusGone, body: `{"code":410,"message":"sandbox gone"}`, listStatus: http.StatusOK, listBody: `[]`, listTotal: "0", wantListCalls: 1, wantState: Gone},
+		{name: "gone response still requires continued inventory", status: http.StatusGone, body: `{"code":410,"message":"sandbox gone"}`, listStatus: http.StatusOK, listBody: `[]`, listNextBody: `[]`, listTotal: "0", wantListCalls: 2, wantState: Gone},
 		{name: "unauthorized", status: http.StatusUnauthorized, wantState: Unknown, wantErr: true},
 		{name: "provider unavailable", status: http.StatusServiceUnavailable, wantState: Unknown, wantErr: true},
 		{name: "inconclusive malformed read", status: http.StatusOK, body: `{`, wantState: Unknown, wantErr: true},
@@ -471,8 +562,18 @@ func TestClientThreeStateObservation(t *testing.T) {
 						return
 					}
 					w.Header().Set("X-Total-Running", test.listTotal)
+					body := test.listBody
+					if token := r.URL.Query().Get("nextToken"); token != "" {
+						if token != "page-2" || test.listNextBody == "" {
+							http.Error(w, "unexpected next token", http.StatusBadRequest)
+							return
+						}
+						body = test.listNextBody
+					} else if test.listNextBody != "" {
+						w.Header().Set("X-Next-Token", "page-2")
+					}
 					w.WriteHeader(test.listStatus)
-					_, _ = w.Write([]byte(test.listBody))
+					_, _ = w.Write([]byte(body))
 					return
 				}
 				w.WriteHeader(test.status)
@@ -795,18 +896,28 @@ func listedSandboxPage(count int) string {
 
 func listedSandboxArrayWith(state string, includeClientID bool, ids ...string) string {
 	items := make([]string, 0, len(ids))
+	for _, id := range ids {
+		items = append(items, listedSandboxObject(state, includeClientID, 2, 512, id))
+	}
+	return listedSandboxObjects(items...)
+}
+
+func listedSandboxObject(state string, includeClientID bool, cpuCount, memoryMB int, id string) string {
 	clientID := ""
 	if includeClientID {
 		clientID = `"clientID":"client",`
 	}
-	for _, id := range ids {
-		items = append(items, fmt.Sprintf(
-			`{"templateID":"template-a","sandboxID":%q,%s"startedAt":"2026-08-26T10:00:00Z","cpuCount":2,"memoryMB":512,"diskSizeMB":1024,"endAt":"2026-08-26T11:00:00Z","state":%q,"envdVersion":"1.0"}`,
-			id,
-			clientID,
-			state,
-		))
-	}
+	return fmt.Sprintf(
+		`{"templateID":"template-a","sandboxID":%q,%s"startedAt":"2026-08-26T10:00:00Z","cpuCount":%d,"memoryMB":%d,"diskSizeMB":1024,"endAt":"2026-08-26T11:00:00Z","state":%q,"envdVersion":"1.0"}`,
+		id,
+		clientID,
+		cpuCount,
+		memoryMB,
+		state,
+	)
+}
+
+func listedSandboxObjects(items ...string) string {
 	return "[" + strings.Join(items, ",") + "]"
 }
 
