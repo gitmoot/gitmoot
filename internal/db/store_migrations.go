@@ -2099,4 +2099,18 @@ CREATE INDEX idx_event_rule_deletions_route
 	)
 	WHERE enabled = 1;
 	`,
+	// #1635 archive-agents: parked directive obligations. Parking SUSPENDS the
+	// nudge ladder for a seat taken out of rotation — it is neither done (done
+	// asserts a deliverable exists) nor cancel (cancel discards the obligation).
+	// Suspension preserves #1418's exhaustion discrimination: an archived
+	// seat's directives must not exhaust into the background rate, or
+	// exhaustion stops distinguishing a real stall. Unpark clears the stamp
+	// and resets the nudge anchor (directive_last_nudged_at) to unpark time so
+	// a returning seat is not nagged immediately for time it spent archived.
+	// Rebase note: this entry moved BEHIND #1496's event_rule_deletions when
+	// main gained that tail first — append-only, a new tail, never reordered.
+	`
+ALTER TABLE workflow_notes ADD COLUMN directive_parked_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE workflow_notes ADD COLUMN directive_parked_reason TEXT NOT NULL DEFAULT '';
+	`,
 }
