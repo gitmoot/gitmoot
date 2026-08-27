@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -129,5 +130,52 @@ func TestUnparkRestoresObligationAndResetsNudgeAnchor(t *testing.T) {
 	// Nothing left to unpark.
 	if n, err := store.UnparkOrgDirectivesForRole(ctx, "worker", unparkAt); err != nil || n != 0 {
 		t.Fatalf("re-unpark = %d, %v; want 0", n, err)
+	}
+}
+
+// The transition is one transaction: a failure at ANY point (the hook fires
+// just before commit) rolls back BOTH halves — directives stay parked, the
+// mirror row survives. Mutant P2 (unpark committed in its own transaction
+// before the delete) dies here: the hook failure would then leave directives
+// unparked with the row still present, the exact partial state #1643 round 3
+// proved a later omission strands forever.
+func TestUnarchiveOrgSeatTransitionRollsBackAtomically(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	directive := insertParkTestDirective(t, store, "wave/atomic", "[org:directive to=worker from=owner wf=wave/atomic] parked")
+	if parked, err := store.ParkOpenOrgDirectivesForRole(ctx, "worker", time.Date(2026, 8, 27, 8, 0, 0, 0, time.UTC), "seat archived"); err != nil || parked != 1 {
+		t.Fatalf("park fixture = %d, %v", parked, err)
+	}
+	if err := store.UpsertOrgRoleArchived(ctx, OrgRoleArchived{
+		Role: "worker", ArchivedAt: "2026-08-27T08:00:00Z", ArchivedBy: "herdr-app",
+		ObservedAt: "2026-08-27T08:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	orgUnarchiveTransitionTestHook = func() error { return errors.New("injected pre-commit failure") }
+	t.Cleanup(func() { orgUnarchiveTransitionTestHook = nil })
+	at := time.Date(2026, 8, 27, 8, 5, 0, 0, time.UTC)
+	if _, err := store.UnarchiveOrgSeatTransition(ctx, "worker", at); err == nil {
+		t.Fatal("hooked transition succeeded; the hook is not firing")
+	}
+	if parked, err := store.ListParkedOrgDirectives(ctx, "worker"); err != nil || len(parked) != 1 || parked[0].ID != directive.ID {
+		t.Fatalf("parked after rollback = %+v err=%v, want STILL PARKED — the unpark half must roll back too", parked, err)
+	}
+	if rows, err := store.ListOrgRolesArchived(ctx); err != nil || len(rows) != 1 || rows[0].Role != "worker" {
+		t.Fatalf("mirror after rollback = %+v err=%v, want row preserved", rows, err)
+	}
+
+	orgUnarchiveTransitionTestHook = nil
+	unparked, err := store.UnarchiveOrgSeatTransition(ctx, "worker", at)
+	if err != nil || unparked != 1 {
+		t.Fatalf("clean transition = %d, %v", unparked, err)
+	}
+	if rows, err := store.ListOrgRolesArchived(ctx); err != nil || len(rows) != 0 {
+		t.Fatalf("mirror after clean transition = %+v err=%v, want gone", rows, err)
+	}
+	open, err := store.ListOpenOrgDirectiveObligations(ctx, 50)
+	if err != nil || len(open) != 1 || open[0].ID != directive.ID || open[0].LastNudgedAt != at.UTC().Format(time.RFC3339Nano) {
+		t.Fatalf("directive after clean transition = %+v err=%v, want unparked with the transition anchor", open, err)
 	}
 }

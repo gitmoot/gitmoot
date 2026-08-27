@@ -187,12 +187,14 @@ func TestRefreshOrgArchiveMirrorOmissionPreservesArchiveState(t *testing.T) {
 	}
 }
 
-// The #1643 review-block-2 adversary: a failed unpark mid-transition. The
-// write order (unpark FIRST, delete after) plus the withheld poll stamp make
-// the failure self-healing and loud instead of permanent and silent: the
-// mirror row survives, the stamp does not advance, and the next clean tick
-// completes the transition.
-func TestRefreshOrgArchiveMirrorFailedUnparkIsRetriedNextTick(t *testing.T) {
+// The #1643 round-3 adversary applied to the TRANSITION (block B): a failed
+// atomic transition followed by a list OMISSION. Because unpark+delete are one
+// transaction, the failure leaves the archived state FULLY in force — row
+// present AND directives still parked — so the omission tick preserves a
+// consistent state (and cleanly stamps), and the next positive-evidence tick
+// completes the whole transition. Mutant M-order/P2 (sequential writes) dies
+// here and in the db-level rollback test.
+func TestRefreshOrgArchiveMirrorFailedTransitionStaysConsistentUnderOmission(t *testing.T) {
 	store := orgArchiveIngestTestStore(t)
 	ctx := context.Background()
 	directive, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
@@ -207,26 +209,46 @@ func TestRefreshOrgArchiveMirrorFailedUnparkIsRetriedNextTick(t *testing.T) {
 		return []byte(herdrAgentListArchivedFixture), nil
 	})
 
-	// Tick 2: unarchive observed, but the unpark write FAILS.
-	original := unparkOrgDirectivesForRole
-	unparkOrgDirectivesForRole = func(context.Context, *db.Store, string, time.Time) (int64, error) {
-		return 0, errors.New("injected unpark failure")
+	// Tick 2: unarchive observed, but the ATOMIC transition fails.
+	original := unarchiveOrgSeatTransition
+	unarchiveOrgSeatTransition = func(context.Context, *db.Store, string, time.Time) (int64, error) {
+		return 0, errors.New("injected transition failure")
 	}
 	now2 := now1.Add(time.Minute)
 	refreshOrgArchiveMirror(ctx, store, io.Discard, now2, func(context.Context) ([]byte, error) {
 		return []byte(herdrAgentListAllActiveFixture), nil
 	})
-	unparkOrgDirectivesForRole = original
+	unarchiveOrgSeatTransition = original
 	if rows, err := store.ListOrgRolesArchived(ctx); err != nil || len(rows) != 1 || rows[0].Role != "scout" {
-		t.Fatalf("mirror after failed unpark = %+v err=%v, want row PRESERVED so the transition retries", rows, err)
+		t.Fatalf("mirror after failed transition = %+v err=%v, want row PRESERVED", rows, err)
+	}
+	if parked, err := store.ListParkedOrgDirectives(ctx, "scout"); err != nil || len(parked) != 1 {
+		t.Fatalf("parked after failed transition = %+v err=%v, want STILL PARKED — atomicity means no partial state", parked, err)
 	}
 	if last, _, _ := store.OrgArchivePollLastSuccess(ctx); !last.Equal(now1) {
-		t.Fatalf("poll stamp after failed unpark = %v, want unmoved %v — a failed reconciliation must not disable its own staleness alarm", last, now1)
+		t.Fatalf("poll stamp after failed transition = %v, want unmoved %v", last, now1)
 	}
 
-	// Tick 3: seam restored; the transition completes.
+	// Tick 3: scout is OMITTED from a valid list — the round-3 adversary. The
+	// state is consistent (archived + parked), so this is a CLEAN tick: row
+	// preserved, directives still parked, stamp advances.
 	now3 := now2.Add(time.Minute)
 	refreshOrgArchiveMirror(ctx, store, io.Discard, now3, func(context.Context) ([]byte, error) {
+		return []byte(herdrAgentListScoutOmittedFixture), nil
+	})
+	if rows, err := store.ListOrgRolesArchived(ctx); err != nil || len(rows) != 1 {
+		t.Fatalf("mirror after omission = %+v err=%v, want preserved", rows, err)
+	}
+	if parked, err := store.ListParkedOrgDirectives(ctx, "scout"); err != nil || len(parked) != 1 {
+		t.Fatalf("parked after omission = %+v err=%v, want still parked", parked, err)
+	}
+	if last, _, _ := store.OrgArchivePollLastSuccess(ctx); !last.Equal(now3) {
+		t.Fatalf("poll stamp after consistent omission tick = %v, want %v — nothing was pending, the tick is clean", last, now3)
+	}
+
+	// Tick 4: positive evidence returns; the whole transition completes.
+	now4 := now3.Add(time.Minute)
+	refreshOrgArchiveMirror(ctx, store, io.Discard, now4, func(context.Context) ([]byte, error) {
 		return []byte(herdrAgentListAllActiveFixture), nil
 	})
 	if rows, err := store.ListOrgRolesArchived(ctx); err != nil || len(rows) != 0 {
@@ -236,11 +258,61 @@ func TestRefreshOrgArchiveMirrorFailedUnparkIsRetriedNextTick(t *testing.T) {
 	if err != nil || len(open) != 1 || open[0].ID != directive.ID {
 		t.Fatalf("directives after retry = %+v err=%v, want unparked", open, err)
 	}
-	if got, want := open[0].LastNudgedAt, now3.UTC().Format(time.RFC3339Nano); got != want {
-		t.Fatalf("unpark anchor = %q, want the RETRY tick's stamp %q", got, want)
+	if got, want := open[0].LastNudgedAt, now4.UTC().Format(time.RFC3339Nano); got != want {
+		t.Fatalf("unpark anchor = %q, want the retry tick's stamp %q", got, want)
 	}
-	if last, _, _ := store.OrgArchivePollLastSuccess(ctx); !last.Equal(now3) {
-		t.Fatalf("poll stamp after clean retry = %v, want %v", last, now3)
+}
+
+// The #1643 round-3 adversary applied to PARKING (block A): a failed park
+// followed by a list OMISSION. Parking is driven by the MIRROR — the durable
+// retry state — so the retry fires on the omission tick even though the role
+// never reappears in the list. Mutant P1 (park driven by the transient list)
+// dies here: under P1 the omission tick receives an empty archived map and the
+// directive is never parked while the stamp advances.
+func TestRefreshOrgArchiveMirrorFailedParkRetriesUnderOmission(t *testing.T) {
+	store := orgArchiveIngestTestStore(t)
+	ctx := context.Background()
+	directive, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "wave/ingest", Author: "owner",
+		Body: "[org:directive to=scout from=owner wf=wave/ingest] parked with the seat",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Tick 1: scout archived, but the PARK fails.
+	original := parkOutstandingForArchived
+	parkOutstandingForArchived = func(context.Context, *db.Store, map[string]orgArchivedObservation, time.Time) (int64, error) {
+		return 0, errors.New("injected park failure")
+	}
+	now1 := time.Date(2026, 8, 27, 7, 0, 0, 0, time.UTC)
+	refreshOrgArchiveMirror(ctx, store, io.Discard, now1, func(context.Context) ([]byte, error) {
+		return []byte(herdrAgentListArchivedFixture), nil
+	})
+	parkOutstandingForArchived = original
+	if rows, err := store.ListOrgRolesArchived(ctx); err != nil || len(rows) != 1 {
+		t.Fatalf("mirror after failed park = %+v err=%v, want row present", rows, err)
+	}
+	if open, err := store.ListOpenOrgDirectiveObligations(ctx, 10); err != nil || len(open) != 1 {
+		t.Fatalf("directive after failed park = %+v err=%v, want still OPEN (unparked)", open, err)
+	}
+	if _, recorded, _ := store.OrgArchivePollLastSuccess(ctx); recorded {
+		t.Fatal("poll stamp recorded on a tick with a failed park — the alarm was disabled by its own failure")
+	}
+
+	// Tick 2: scout is OMITTED from a valid list. The mirror row drives the
+	// park retry regardless.
+	now2 := now1.Add(time.Minute)
+	refreshOrgArchiveMirror(ctx, store, io.Discard, now2, func(context.Context) ([]byte, error) {
+		return []byte(herdrAgentListScoutOmittedFixture), nil
+	})
+	if open, err := store.ListOpenOrgDirectiveObligations(ctx, 10); err != nil || len(open) != 0 {
+		t.Fatalf("directive after omission tick = %+v err=%v, want PARKED — the mirror is the retry state, not the list", open, err)
+	}
+	if parked, err := store.ListParkedOrgDirectives(ctx, "scout"); err != nil || len(parked) != 1 || parked[0].ID != directive.ID {
+		t.Fatalf("parked after omission tick = %+v err=%v", parked, err)
+	}
+	if last, _, _ := store.OrgArchivePollLastSuccess(ctx); !last.Equal(now2) {
+		t.Fatalf("poll stamp after the clean retry tick = %v, want %v", last, now2)
 	}
 }
 

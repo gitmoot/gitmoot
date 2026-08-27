@@ -106,13 +106,20 @@ func parseHerdrArchivedAgents(raw []byte, observedAt time.Time) (archived map[st
 	return archived, parked, present, nil
 }
 
-// unparkOrgDirectivesForRole is a fault-injection seam over the store method
-// (the loadOrgRosterObservations idiom): the write-order guard test forces an
-// unpark failure through it to prove a failed transition self-heals instead of
-// silently losing directives forever (#1643 review block 2).
-var unparkOrgDirectivesForRole = func(ctx context.Context, store *db.Store, role string, at time.Time) (int64, error) {
-	return store.UnparkOrgDirectivesForRole(ctx, role, at)
+// unarchiveOrgSeatTransition is a fault-injection seam over the ATOMIC store
+// transition (unpark + mirror delete in one transaction, #1643 round 3): a
+// forced failure must leave the archived state fully intact — row present,
+// directives still parked — so the next positive-evidence tick retries the
+// whole transition and no partial state can be stranded by a later omission.
+var unarchiveOrgSeatTransition = func(ctx context.Context, store *db.Store, role string, at time.Time) (int64, error) {
+	return store.UnarchiveOrgSeatTransition(ctx, role, at)
 }
+
+// parkOutstandingForArchived is a fault-injection seam over the park helper:
+// the retry-under-omission test forces one park failure through it and then
+// proves the next tick retries FROM THE MIRROR even when the role is omitted
+// from the current list.
+var parkOutstandingForArchived = parkOutstandingDirectivesForArchivedSeats
 
 // refreshOrgArchiveMirror reconciles the mirror against one successful herdr
 // read. Every mutation is caused by that read: upserts for observed archived
@@ -197,27 +204,43 @@ func refreshOrgArchiveMirror(ctx context.Context, store *db.Store, stdout io.Wri
 			writeLine(stdout, "org seat %s absent from herdr list; archive state preserved pending positive evidence", row.Role)
 			continue
 		}
-		// Unpark FIRST: if it fails the mirror row survives and the next tick
-		// retries the whole transition; delete-first would orphan the parked
-		// directives permanently with nothing left to trigger a retry.
-		unparked, err := unparkOrgDirectivesForRole(ctx, store, row.Role, now)
+		// The transition is ATOMIC (unpark + mirror delete in one transaction):
+		// a failure leaves the archived state fully in force — row present,
+		// directives still parked — so the next positive-evidence tick retries
+		// the WHOLE transition. Sequential writes here were #1643 round 3's
+		// finding: a partial transition plus a later list omission stranded an
+		// inconsistent state under a clean stamp forever.
+		unparked, err := unarchiveOrgSeatTransition(ctx, store, row.Role, now)
 		if err != nil {
-			writeLine(stdout, "org seat unarchive observed: %s; directive unpark failed, transition retried next tick: %v", row.Role, err)
-			failed = true
-			continue
-		}
-		if _, err := store.DeleteOrgRoleArchived(ctx, row.Role); err != nil {
-			writeLine(stdout, "org archive mirror: delete %s failed, transition retried next tick: %v", row.Role, err)
+			writeLine(stdout, "org seat unarchive observed: %s; transition failed atomically, retried on next positive evidence: %v", row.Role, err)
 			failed = true
 			continue
 		}
 		writeLine(stdout, "org seat unarchive observed: %s; %d directives unparked with fresh TTL anchors", row.Role, unparked)
 	}
-	if n, err := parkOutstandingDirectivesForArchivedSeats(ctx, store, archived, now); err != nil {
-		writeLine(stdout, "org archive mirror: directive park failed: %v", err)
+	// Parking is driven by the MIRROR, not the transient list: the mirror row
+	// is the durable retry state, so a park that failed on an earlier tick is
+	// retried here even when the role is OMITTED from today's list (#1643
+	// round 3 block A — a retry that can only fire when the subject happens to
+	// reappear is not a retry). Idempotent by WHERE, so re-parking every tick
+	// costs nothing.
+	postRows, err := store.ListOrgRolesArchived(ctx)
+	if err != nil {
+		writeLine(stdout, "org archive mirror: re-list for parking failed: %v", err)
 		failed = true
-	} else if n > 0 {
-		writeLine(stdout, "org archive mirror: parked %d open directives for archived seats", n)
+	} else {
+		mirrorSet := make(map[string]orgArchivedObservation, len(postRows))
+		for _, row := range postRows {
+			archivedAt, _ := time.Parse(time.RFC3339Nano, row.ArchivedAt)
+			observedAt, _ := time.Parse(time.RFC3339Nano, row.ObservedAt)
+			mirrorSet[row.Role] = orgArchivedObservation{At: archivedAt, By: row.ArchivedBy, Reason: row.Reason, ObservedAt: observedAt}
+		}
+		if n, err := parkOutstandingForArchived(ctx, store, mirrorSet, now); err != nil {
+			writeLine(stdout, "org archive mirror: directive park failed: %v", err)
+			failed = true
+		} else if n > 0 {
+			writeLine(stdout, "org archive mirror: parked %d open directives for archived seats", n)
+		}
 	}
 	if failed {
 		// A tick with any failed write must not stamp success: the stamp's age

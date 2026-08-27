@@ -68,6 +68,59 @@ WHERE substr(body, 1, length('[org:directive to=' || ? || ' ')) = '[org:directiv
 	return result.RowsAffected()
 }
 
+// orgUnarchiveTransitionTestHook, when set, runs INSIDE the transition
+// transaction just before commit. Tests use it to prove the transaction is
+// genuinely atomic: a hook error must roll back BOTH the unpark and the
+// mirror-row delete, leaving the archived state fully intact.
+var orgUnarchiveTransitionTestHook func() error
+
+// UnarchiveOrgSeatTransition completes an observed archived->active
+// transition ATOMICALLY: unpark the role's directives (nudge anchors reset to
+// the transition time) and delete its mirror row in ONE transaction. Atomicity
+// is the whole point (#1643 round 3): a partial transition — unparked
+// directives with the row gone, or the reverse — is an inconsistent state that
+// a later list OMISSION would preserve forever, because retries are driven by
+// the durable mirror row. All-or-nothing means a failure leaves the archived
+// state fully in force and the next positive-evidence tick retries the whole
+// transition.
+func (s *Store) UnarchiveOrgSeatTransition(ctx context.Context, targetRole string, at time.Time) (int64, error) {
+	targetRole = strings.ToLower(strings.TrimSpace(targetRole))
+	if targetRole == "" {
+		return 0, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stamp := at.UTC().Format(time.RFC3339Nano)
+	result, err := tx.ExecContext(ctx, `
+UPDATE workflow_notes
+SET directive_parked_at = '', directive_parked_reason = '', directive_last_nudged_at = ?
+WHERE substr(body, 1, length('[org:directive to=' || ? || ' ')) = '[org:directive to=' || ? || ' '
+	AND TRIM(directive_parked_at) <> ''`,
+		stamp, targetRole, targetRole)
+	if err != nil {
+		return 0, err
+	}
+	unparked, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM org_role_archived WHERE role = ?`, targetRole); err != nil {
+		return 0, err
+	}
+	if orgUnarchiveTransitionTestHook != nil {
+		if err := orgUnarchiveTransitionTestHook(); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return unparked, nil
+}
+
 // ListParkedOrgDirectives returns parked directive obligations oldest-first,
 // for the archived-seat backlog view. An empty targetRole lists every parked
 // directive.
