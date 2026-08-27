@@ -156,8 +156,12 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	// never spawns claude.
 	// Resolve paths best-effort so the daemon-aware claude auth check (#427) can
 	// locate the running daemon. A failure here (no initialized home) just leaves
-	// Paths zero, which skips the daemon check and keeps the shell-local one.
-	paths, _ := pathsFromFlag(*home)
+	// Paths zero, which skips the daemon check and keeps the shell-local one —
+	// but the error is no longer DISCARDED (#1643 round 11, codex): a zero
+	// Paths reached every check's empty-database absent branch, so a resolution
+	// FAILURE manufactured what reads as absence-by-configuration. The archive
+	// mirror check receives the error and reports UNKNOWN instead of vanishing.
+	paths, pathsErr := pathsFromFlag(*home)
 	buildStatus := daemonBuildStatus(paths)
 	stuckStatus := stuckJobsStatus(paths)
 	logStatus := daemonLogStatus(paths)
@@ -204,6 +208,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		checks = append(checks, check)
 	}
 	if check, ok := orgRoleActivityDoctorCheck(paths); ok {
+		checks = append(checks, check)
+	}
+	if check, ok := orgArchiveMirrorDoctorCheck(paths, pathsErr); ok {
 		checks = append(checks, check)
 	}
 	if check, ok := permissionPolicyObservationDoctorCheck(paths); ok {

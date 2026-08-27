@@ -2113,4 +2113,44 @@ CREATE INDEX idx_event_rule_deletions_route
 ALTER TABLE workflow_notes ADD COLUMN directive_parked_at TEXT NOT NULL DEFAULT '';
 ALTER TABLE workflow_notes ADD COLUMN directive_parked_reason TEXT NOT NULL DEFAULT '';
 	`,
+	// #1635 archive-agents ingest: the durable mirror of herdr-observed
+	// archived seats. herdr is the SOLE authority (gitmoot never writes archive
+	// state to herdr); these rows are a read cache with exactly one write site
+	// (the daemon one-minute org lane) mutated only after a SUCCESSFUL
+	// `herdr agent list` read. org_archive_poll records the last successful
+	// poll so staleness can go LOUD (doctor) while the fail direction stays
+	// preserved-exclusion: herdr-down never flips an archived seat back into
+	// sweeps and nudges.
+	`
+CREATE TABLE org_role_archived (
+	role TEXT PRIMARY KEY,
+	archived_at TEXT NOT NULL,
+	archived_by TEXT NOT NULL DEFAULT '',
+	reason TEXT NOT NULL DEFAULT '',
+	parked_work TEXT NOT NULL DEFAULT '',
+	observed_at TEXT NOT NULL
+);
+CREATE TABLE org_archive_poll (
+	id INTEGER PRIMARY KEY CHECK(id = 1),
+	last_success_at TEXT NOT NULL
+);
+	`,
+	// #1643 round 4: the pending-observation ledger. An observed archived seat
+	// is recorded HERE as the tick's FIRST write, then drained into the mirror
+	// with per-row retry on every tick — so a transient failure creating the
+	// first mirror row leaves durable retry state a later tick can act on even
+	// when a valid list omits the role. A pending row is deleted only after
+	// its mirror upsert succeeds. If this first write itself fails the tick
+	// aborts with the poll stamp withheld — the failed-read equivalence, loud
+	// via staleness rather than silent.
+	`
+CREATE TABLE org_archive_pending (
+	role TEXT PRIMARY KEY,
+	archived_at TEXT NOT NULL,
+	archived_by TEXT NOT NULL DEFAULT '',
+	reason TEXT NOT NULL DEFAULT '',
+	parked_work TEXT NOT NULL DEFAULT '',
+	observed_at TEXT NOT NULL
+);
+	`,
 }

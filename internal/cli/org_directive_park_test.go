@@ -43,6 +43,14 @@ func TestParkOutstandingDirectivesForArchivedSeats(t *testing.T) {
 	archived := map[string]orgArchivedObservation{
 		"scout": {At: at, By: "jarvis", Reason: "project paused", ObservedAt: at.Add(time.Minute)},
 	}
+	// Parking self-invalidates without the mirror row (#1643 round 5), so the
+	// archived seat must be mirrored before its directives can park.
+	if err := store.UpsertOrgRoleArchived(ctx, db.OrgRoleArchived{
+		Role: "scout", ArchivedAt: at.Format(time.RFC3339Nano), ArchivedBy: "jarvis",
+		ObservedAt: at.Add(time.Minute).Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatal(err)
+	}
 	n, err := parkOutstandingDirectivesForArchivedSeats(ctx, store, archived, at.Add(time.Minute))
 	if err != nil || n != 1 {
 		t.Fatalf("parked %d err=%v, want 1", n, err)

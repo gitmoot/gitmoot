@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -49,16 +50,33 @@ func resolveOrgRoster(cfg config.OrgConfig, archived map[string]orgArchivedObser
 }
 
 // loadOrgRosterObservations is the ONE supplier seam for lifecycle
-// observations. It returns nothing today; the #1635 ingest (the herdr
-// `agent list` reader and its durable mirror) lands inside this function
-// without touching any roster consumer. A nil store must stay valid: several
-// call sites resolve the roster without an open store, and missing
-// observations mean an unfiltered (all-active) roster by contract. A package
-// var so tests can classify seats without an ingest.
+// observations: it reads the org_role_archived mirror, which the daemon
+// one-minute lane refreshes from successful `herdr agent list` reads
+// (refreshOrgArchiveMirror — the single write site). A nil store must stay
+// valid: several call sites resolve the roster without an open store, and
+// missing observations mean an unfiltered (all-active) roster by contract.
+// A mirror READ error also yields the unfiltered roster — exclusion requires
+// evidence, and a local store that cannot be read is a loud systemic failure
+// elsewhere; the doctor's staleness check covers the quiet variant. Paused
+// still has no source (its config field is a separate, owner-visible
+// decision). A package var so tests can classify seats without an ingest.
 var loadOrgRosterObservations = func(ctx context.Context, store *db.Store) (archived map[string]orgArchivedObservation, paused map[string]string) {
-	_ = ctx
-	_ = store
-	return nil, nil
+	if store == nil {
+		return nil, nil
+	}
+	rows, err := store.ListOrgRolesArchived(ctx)
+	if err != nil || len(rows) == 0 {
+		return nil, nil
+	}
+	archived = make(map[string]orgArchivedObservation, len(rows))
+	for _, row := range rows {
+		at, _ := time.Parse(time.RFC3339Nano, row.ArchivedAt)
+		observedAt, _ := time.Parse(time.RFC3339Nano, row.ObservedAt)
+		archived[row.Role] = orgArchivedObservation{
+			At: at, By: row.ArchivedBy, Reason: row.Reason, ObservedAt: observedAt,
+		}
+	}
+	return archived, nil
 }
 
 // loadOrgRoster resolves the roster with observations from the supplier seam.
