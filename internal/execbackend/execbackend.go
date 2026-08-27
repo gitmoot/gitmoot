@@ -9,11 +9,11 @@
 // retain their existing runner while runtime delivery uses InstanceRunner and
 // returns changes through BuildChangeSet/ImportChangeSet.
 // Where P1 carries a resolved selection into adapter construction, that route
-// consumes it through Consume, whose only positive implementation is Local; any
-// other parsed backend is refused at runtime. Adding a backend to
-// ParseImplemented alone still compiles and then fails closed at consumption. If
-// P2 extends Consume with a required positional builder, that signature change
-// will make its existing callers fail to compile until they supply it. Adapter
+// consumes it through Consume. Local and Remote are explicit positional arms;
+// any other parsed backend is refused at runtime. Adding a backend to
+// ParseImplemented alone still compiles and then fails closed at consumption.
+// Extending Consume with another required positional builder makes its existing
+// callers fail to compile until they supply it. Adapter
 // builds without a selector retain the Local default. Job-associated git,
 // GitHub CLI, verifier, and read-only-diff subprocesses consume the resolved
 // runner through Consume and fail closed when the backend has no execution
@@ -33,22 +33,21 @@ import (
 type Backend string
 
 const (
-	// Local is the default and — until a remote backend lands — the only
-	// implemented execution backend. It resolves to today's behaviour exactly:
+	// Local is the default execution backend. It resolves to today's behaviour exactly:
 	// the existing runner composition with subprocess.GroupRunner{} innermost.
 	Local Backend = "local"
-	// Remote reserves the name for a future execution backend. It is
-	// intentionally absent from AllowedNames until an implementation exists, so
-	// Parse continues to reject it.
+	// Remote selects provider-backed execution. Slice A makes the selector and
+	// every consumption arm explicit while provider construction remains a loud
+	// temporary refusal.
 	Remote Backend = "remote"
 )
 
 // AllowedNames is the canonical allowed set of backend names, in the order
 // error messages render them. Parse accepts names exclusively from this list,
 // so a backend cannot be accepted without also being advertised.
-var AllowedNames = []string{string(Local)}
+var AllowedNames = []string{string(Local), string(Remote)}
 
-// Allowed renders the allowed set for error messages (e.g. "local").
+// Allowed renders the allowed set for error messages (e.g. "local, remote").
 func Allowed() string {
 	return strings.Join(AllowedNames, ", ")
 }
@@ -83,7 +82,7 @@ func ParseImplemented(value string) (Backend, error) {
 		return "", err
 	}
 	switch backend {
-	case Local:
+	case Local, Remote:
 		return backend, nil
 	default:
 		return "", fmt.Errorf("execution backend %q is advertised but not implemented", backend)
@@ -91,15 +90,17 @@ func ParseImplemented(value string) (Backend, error) {
 }
 
 // Consume dispatches an already-resolved backend to its execution
-// implementation. The positive Local arm is deliberately separate from
+// implementation. The positive arms are deliberately separate from
 // ParseImplemented: making a future backend parseable cannot make it inherit
-// Local's runner pipeline. When P2 adds an implementation, it must add a
-// positional builder here; changing this signature then makes every
-// construction route fail to compile until it supplies that backend's builder.
-func Consume[T any](backend Backend, local func() (T, error)) (T, error) {
+// an existing runner pipeline. New implementations must add a positional
+// builder here; changing this signature then makes every construction route
+// fail to compile until it supplies that backend's builder.
+func Consume[T any](backend Backend, local, remote func() (T, error)) (T, error) {
 	switch backend {
 	case Local:
 		return local()
+	case Remote:
+		return remote()
 	default:
 		var zero T
 		return zero, fmt.Errorf("execution backend %q has no execution implementation", backend)

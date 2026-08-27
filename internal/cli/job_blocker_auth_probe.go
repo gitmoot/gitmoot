@@ -181,6 +181,10 @@ func (w jobWorker) defaultAuthProbe(ctx context.Context, job db.Job, payload wor
 func authProbeForBackend(backend execbackend.Backend, local func() authProbeVerdict) (authProbeVerdict, error) {
 	return execbackend.Consume(backend, func() (authProbeVerdict, error) {
 		return local(), nil
+	}, func() (authProbeVerdict, error) {
+		// A valid host credential says nothing about an unprovisioned remote
+		// instance. Unknown leaves the scheduling decision to the normal cadence.
+		return authProbeUnknown, nil
 	})
 }
 

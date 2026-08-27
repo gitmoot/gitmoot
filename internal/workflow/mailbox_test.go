@@ -359,6 +359,21 @@ func TestProduceCheckNonLocalBackendCannotRunLocally(t *testing.T) {
 	}
 }
 
+func TestRemoteProduceCheckRefusesHostFallback(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "remote-check-must-not-run")
+	_, err := runProduceCheck(context.Background(), JobPayload{
+		WorktreePath: dir,
+		Check:        "touch remote-check-must-not-run",
+	}, "", time.Second, execbackend.Remote)
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatalf("remote produce check executed on the host (marker err=%v)", statErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "not supported on the remote execution backend") {
+		t.Fatalf("runProduceCheck(remote) error = %v, want remote refusal", err)
+	}
+}
+
 func TestMailboxRejectsProduceOutsidePipelineSender(t *testing.T) {
 	mailbox := Mailbox{store: openTestStore(t), resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 	_, err := mailbox.Enqueue(context.Background(), JobRequest{ID: "bad-produce", Agent: "p", Action: "produce", Repo: "owner/repo", Sender: "user"})

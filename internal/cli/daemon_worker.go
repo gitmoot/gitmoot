@@ -599,7 +599,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// delivery and is destroyed synchronously on every return path. Host checkout,
 	// git, observation, and finalization remain on checkout/jobRunner; only runtime
 	// delivery executes in the distinct backend workspace.
-	lifecycle, instance, lifecycleErr := w.provisionExecutionBackend(ctx, execBackend, agent.Runtime, job, checkout)
+	lifecycle, instance, lifecycleErr := w.provisionExecutionBackend(ctx, execBackend, agent.Runtime, job, jobTimeout+runtimeLeaseTeardownGrace, checkout)
 	if instance != nil {
 		defer w.destroyExecutionBackend(job.ID, lifecycle, instance)
 	}
@@ -974,20 +974,29 @@ func payloadWithImplementationPreflightRetry(raw string, payload workflow.JobPay
 	return string(encoded), nil
 }
 
-func runtimeContractPreflightForBackend(backend execbackend.Backend, local func() runtime.RuntimeContractResult) (runtime.RuntimeContractResult, error) {
-	return execbackend.Consume(backend, func() (runtime.RuntimeContractResult, error) {
-		return local(), nil
+func runtimeContractPreflightForBackend(backend execbackend.Backend, local func() runtime.RuntimeContractResult) (runtime.RuntimeContractResult, bool, error) {
+	type result struct {
+		contract runtime.RuntimeContractResult
+		checked  bool
+	}
+	consumed, err := execbackend.Consume(backend, func() (result, error) {
+		return result{contract: local(), checked: true}, nil
+	}, func() (result, error) {
+		// This preflight runs before provisioning, so a host probe would answer
+		// about the wrong machine. The attached instance is checked at delivery.
+		return result{}, nil
 	})
+	return consumed.contract, consumed.checked, err
 }
 
 func (w jobWorker) runtimeContractPreflight(ctx context.Context, backend execbackend.Backend, agent runtime.Agent, request runtime.RuntimeContractRequest) (runtime.RuntimeContractResult, bool, error) {
 	if w.RuntimePreflight == nil {
 		return runtime.RuntimeContractResult{}, false, nil
 	}
-	result, err := runtimeContractPreflightForBackend(backend, func() runtime.RuntimeContractResult {
+	result, checked, err := runtimeContractPreflightForBackend(backend, func() runtime.RuntimeContractResult {
 		return w.RuntimePreflight(ctx, agent, request)
 	})
-	return result, true, err
+	return result, checked, err
 }
 
 func (w jobWorker) lookupAgent(ctx context.Context, name string) (db.Agent, error) {
@@ -2959,13 +2968,31 @@ func (w jobWorker) buildSeatAwareAdapterForBackend(backend execbackend.Backend, 
 	consumed, err := execbackend.Consume(backend, func() (result, error) {
 		adapter, token, err := w.buildLocalSeatAwareAdapter(agent, checkout, payload, output...)
 		return result{adapter: adapter, token: token}, err
+	}, func() (result, error) {
+		if payload.MootSeat {
+			// The chat relay is a host Unix socket and cannot be injected into a
+			// provider-backed instance.
+			return result{}, errors.New("moot-seat relay is not supported on the remote execution backend")
+		}
+		return result{adapter: unprovisionedRemoteDeliveryAdapter{}}, nil
 	})
 	return consumed.adapter, consumed.token, err
+}
+
+// unprovisionedRemoteDeliveryAdapter prevents a configured remote job from
+// falling back to a host adapter before its lifecycle instance is attached.
+type unprovisionedRemoteDeliveryAdapter struct{}
+
+func (unprovisionedRemoteDeliveryAdapter) Deliver(context.Context, runtime.Agent, runtime.Job) (runtime.Result, error) {
+	return runtime.Result{}, errors.New("remote execution backend is not provisioned")
 }
 
 func (w jobWorker) deliveryAdapterForBackend(backend execbackend.Backend, agent runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {
 	return execbackend.Consume(backend, func() (workflow.DeliveryAdapter, error) {
 		return w.AdapterFactory(agent, checkout)
+	}, func() (workflow.DeliveryAdapter, error) {
+		// The temporary-worker loop never provisions an execution instance.
+		return nil, errors.New("temporary workers do not support the remote execution backend")
 	})
 }
 
@@ -3026,7 +3053,45 @@ func buildRuntimeAdapter(home string, agent runtime.Agent, checkout string, runn
 	// call site supplies that backend's builder.
 	return execbackend.Consume(backend, func() (workflow.DeliveryAdapter, error) {
 		return buildLocalRuntimeAdapter(home, agent, checkout, runner)
+	}, func() (workflow.DeliveryAdapter, error) {
+		return buildRemoteRuntimeAdapter(agent, checkout, runner)
 	})
+}
+
+func buildRemoteRuntimeAdapter(agent runtime.Agent, checkout string, runner subprocess.Runner) (workflow.DeliveryAdapter, error) {
+	if !runnerReachesExecutionInstance(runner) {
+		return nil, errors.New("remote execution backend runtime runner is not attached to an instance")
+	}
+	if agent.Runtime != runtime.ShellRuntime {
+		return nil, fmt.Errorf("runtime %q is not supported on the remote execution backend", agent.Runtime)
+	}
+	if len(agent.WritablePaths) > 0 || len(agent.ReadablePaths) > 0 || len(agent.ReadableFiles) > 0 {
+		return nil, errors.New("runtime path grants are not supported on the remote execution backend")
+	}
+	return runtime.ShellAdapter{Dir: checkout, Runner: runner}, nil
+}
+
+func runnerReachesExecutionInstance(runner subprocess.Runner) bool {
+	switch runner := runner.(type) {
+	case execbackend.InstanceRunner:
+		return runner.Backend != nil && runner.Instance != nil
+	case *execbackend.InstanceRunner:
+		return runner != nil && runner.Backend != nil && runner.Instance != nil
+	case subprocess.TeeRunner:
+		return runnerReachesExecutionInstance(runner.Inner)
+	case *subprocess.TeeRunner:
+		return runner != nil && runnerReachesExecutionInstance(runner.Inner)
+	case subprocess.EnvInjectingRunner:
+		return runnerReachesExecutionInstance(runner.Inner)
+	case *subprocess.EnvInjectingRunner:
+		return runner != nil && runnerReachesExecutionInstance(runner.Inner)
+	case subprocess.WrappingRunner:
+		return runnerReachesExecutionInstance(runner.Inner)
+	case *subprocess.WrappingRunner:
+		return runner != nil && runnerReachesExecutionInstance(runner.Inner)
+	default:
+		return false
+	}
 }
 
 // buildLocalRuntimeAdapter is the pre-#1536 runner-composition pipeline. Keep
@@ -3069,6 +3134,9 @@ func buildLocalRuntimeAdapter(home string, agent runtime.Agent, checkout string,
 func startRuntimeAdapterForBackend(backend execbackend.Backend, home string, runtimeName string, checkout string) (runtime.Adapter, error) {
 	return execbackend.Consume(backend, func() (runtime.Adapter, error) {
 		return runtimeAdapterFor(home, runtimeName, checkout)
+	}, func() (runtime.Adapter, error) {
+		// Agent-start sessions are host-owned and have no lifecycle instance.
+		return nil, errors.New("agent start sessions do not support the remote execution backend")
 	})
 }
 

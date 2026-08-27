@@ -1582,8 +1582,13 @@ func runProduceCheck(ctx context.Context, payload JobPayload, fallbackDir string
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	result, err := execbackend.Consume(backend, func() (subprocess.Result, error) {
+	local := func() (subprocess.Result, error) {
 		return (subprocess.GroupRunner{MaxOutputBytes: 2 * maxProduceCheckOutputBytes}).Run(checkCtx, dir, "sh", "-c", payload.Check)
+	}
+	result, err := execbackend.Consume(backend, local, func() (subprocess.Result, error) {
+		// Produce output stays in the instance because only implement imports a
+		// changeset. A host check here would validate stale pre-delivery bytes.
+		return subprocess.Result{}, errors.New("produce deterministic checks are not supported on the remote execution backend")
 	})
 	return sanitizeProduceCheckOutput(result.Stdout + result.Stderr), err
 }

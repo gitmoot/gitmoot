@@ -144,7 +144,7 @@ func daemonDeterministicCheckerDispatcher(store *db.Store, gh github.Client, che
 // cannot escape into the live checkout (reusing gitmoot's single-binary git tooling, no
 // external sandbox dep).
 func daemonHardVerifierDispatcher(store *db.Store, checkout string, home string) workflow.HardVerifierDispatcher {
-	return daemonHardVerifierDispatcherForRunner(store, checkout, home, localJobSubprocessRunner{})
+	return daemonHardVerifierDispatcherForRunner(store, checkout, home, hostJobSubprocessRunner{})
 }
 
 func daemonHardVerifierDispatcherForRunner(store *db.Store, checkout string, home string, runner subprocess.Runner) workflow.HardVerifierDispatcher {

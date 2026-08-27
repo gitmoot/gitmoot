@@ -8,11 +8,11 @@ import (
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
 
-type localJobSubprocessRunner struct {
+type hostJobSubprocessRunner struct {
 	subprocess.ExecRunner
 }
 
-func (localJobSubprocessRunner) grouped() subprocess.Runner {
+func (hostJobSubprocessRunner) grouped() subprocess.Runner {
 	return subprocess.GroupRunner{}
 }
 
@@ -34,12 +34,13 @@ func (w jobWorker) subprocessRunnerForJob(job db.Job) (subprocess.Runner, error)
 }
 
 // jobSubprocessRunnerForBackend is the single consumption seam for
-// job-associated git, checkout, and verifier subprocesses. Local preserves the
-// pre-#1560 host runner; a future backend must add its positional builder to
-// execbackend.Consume before any job subprocess can use it.
+// job-associated git, checkout, and verifier subprocesses. These operations are
+// host-only for both backends; runtime delivery is the only instance-bound path.
 func jobSubprocessRunnerForBackend(backend execbackend.Backend) (subprocess.Runner, error) {
 	return execbackend.Consume(backend, func() (subprocess.Runner, error) {
-		return localJobSubprocessRunner{}, nil
+		return hostJobSubprocessRunner{}, nil
+	}, func() (subprocess.Runner, error) {
+		return hostJobSubprocessRunner{}, nil
 	})
 }
 
@@ -50,7 +51,7 @@ func jobGroupedSubprocessRunner(runner subprocess.Runner) subprocess.Runner {
 	return runner
 }
 
-var _ subprocess.Runner = localJobSubprocessRunner{}
+var _ subprocess.Runner = hostJobSubprocessRunner{}
 
 func jobGitClient(dir string, runner subprocess.Runner) gitutil.Client {
 	return gitutil.NewClient(dir, runner)
