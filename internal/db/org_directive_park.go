@@ -21,6 +21,17 @@ import (
 // ParkOpenOrgDirectivesForRole parks every OPEN directive obligation addressed
 // to targetRole that is not already parked. Done and cancelled directives are
 // untouched (they carry no ladder to suspend). Returns how many rows parked.
+//
+// The EXISTS clause on org_role_archived makes a stale-snapshot park
+// SELF-INVALIDATE AT THE WRITE (#1643 round 5, kimi's finding): a park racing
+// an unarchive transition would otherwise re-park directives whose mirror row
+// the atomic transition just deleted — and with the row gone, no later tick
+// could ever unpark them, because the mirror row is the unpark retry key.
+// Requiring the row to exist AT THE MOMENT OF THE WRITE closes that regardless
+// of caller topology or scheduling. Before this clause the invariant held only
+// because the #556 daemon.lock flock serialises writers — correctness by
+// scheduling, which is not a design property and fires the moment concurrency
+// assumptions change.
 func (s *Store) ParkOpenOrgDirectivesForRole(ctx context.Context, targetRole string, at time.Time, reason string) (int64, error) {
 	targetRole = strings.ToLower(strings.TrimSpace(targetRole))
 	if targetRole == "" {
@@ -32,6 +43,7 @@ UPDATE workflow_notes
 SET directive_parked_at = ?, directive_parked_reason = ?
 WHERE substr(body, 1, length('[org:directive to=' || ? || ' ')) = '[org:directive to=' || ? || ' '
 	AND TRIM(directive_parked_at) = ''
+	AND EXISTS (SELECT 1 FROM org_role_archived WHERE role = ?)
 	AND NOT EXISTS (
 		SELECT 1 FROM workflow_notes r
 		WHERE r.workflow_id = workflow_notes.workflow_id AND (
@@ -39,7 +51,7 @@ WHERE substr(body, 1, length('[org:directive to=' || ? || ' ')) = '[org:directiv
 			OR substr(r.body, 1, length('[org:directive-done id=' || workflow_notes.id || ' ')) = '[org:directive-done id=' || workflow_notes.id || ' '
 		)
 	)`,
-		stamp, strings.TrimSpace(reason), targetRole, targetRole)
+		stamp, strings.TrimSpace(reason), targetRole, targetRole, targetRole)
 	if err != nil {
 		return 0, err
 	}
