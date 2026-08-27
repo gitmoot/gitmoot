@@ -96,9 +96,31 @@ func parseHerdrArchivedAgents(raw []byte, observedAt time.Time) (archived map[st
 			// aborts loudly, and the staleness alarm stays armed.
 			return nil, nil, nil, fmt.Errorf("herdr agent list entry %d has no usable name; refusing an unkeyable read", i)
 		}
+		if present[name] {
+			// F2 (#1643 round 10, codex): duplicate names normalised into one
+			// map key, so `Scout` archived beside ` scout ` active silently
+			// reconciled CONTRADICTORY lifecycle evidence and stamped the
+			// poll a success. The name is the join key; a list that repeats
+			// it is internally malformed whether or not the copies agree —
+			// refuse the read, don't pick a winner.
+			return nil, nil, nil, fmt.Errorf("herdr agent list entry %d duplicates name %q; refusing an internally contradictory read", i, name)
+		}
 		present[name] = true
 		if agent.Archived == nil {
 			continue
+		}
+		// F3 (#1643 round 10, opus): archived_at is the fourth load-bearing
+		// timestamp and it was never validated at entry — a block carrying NO
+		// evidence at all (`{}`, or `at` missing) excluded a seat, and a
+		// future `at` was stored silently. The malformed-string case failed
+		// closed only because encoding/json refuses a bad time.Time — a
+		// decoder side effect, not a guard; absence of the field is not a
+		// decode error, so the guard has to be explicit.
+		if agent.Archived.At.IsZero() {
+			return nil, nil, nil, fmt.Errorf("herdr agent %q carries an archived block with no 'at' timestamp; refusing evidence-free archive state", name)
+		}
+		if agent.Archived.At.After(observedAt) {
+			return nil, nil, nil, fmt.Errorf("herdr agent %q archived at %s, in the future of this observation (%s); refusing noncausal archive evidence", name, agent.Archived.At.UTC().Format(time.RFC3339), observedAt.UTC().Format(time.RFC3339))
 		}
 		archived[name] = orgArchivedObservation{
 			At:         agent.Archived.At,

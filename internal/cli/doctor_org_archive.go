@@ -26,7 +26,18 @@ func orgArchiveMirrorDoctorCheck(paths config.Paths) (doctor.Check, bool) {
 	}
 	store, err := db.OpenReadOnly(paths.Database)
 	if err != nil {
-		return doctor.Check{}, false
+		// F1 (#1643 round 10, codex): an unopenable database made the whole
+		// check VANISH — (Check{}, false) is the absent-by-design contract
+		// (no database configured, or a herdr-less deployment with no rows),
+		// and absence-by-FAILURE wore the same shape. Every guard this file
+		// carries lives inside this check, so its existence must not be
+		// conditional on a read that fails open: an absent check and a
+		// healthy check are indistinguishable to the reader. The taxonomy
+		// one level up — the thing that can be absent is the guard itself.
+		return doctor.Check{
+			Name: orgArchiveMirrorDoctorCheckName, OK: false, Required: false,
+			Detail: fmt.Sprintf("archive database UNOPENABLE: %v — archive state UNKNOWN, not healthy and not absent", err),
+		}, true
 	}
 	defer store.Close()
 	rows, err := listOrgRolesArchivedForDoctor(context.Background(), store)

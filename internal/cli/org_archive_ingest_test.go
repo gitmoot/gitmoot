@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -765,5 +766,71 @@ func TestBuildOrgArchiveMirrorDoctorCheckFuturePollStamp(t *testing.T) {
 	check := buildOrgArchiveMirrorDoctorCheck(rows, nil, now.Add(time.Hour), true, now)
 	if check.OK || !strings.Contains(check.Detail, "FUTURE") || !strings.Contains(check.Detail, "UNKNOWN") {
 		t.Fatalf("future poll stamp = %+v, want an UNKNOWN warning — negative age must not read as fresh", check)
+	}
+}
+
+// F1 (#1643 round 10, codex): an unopenable database made the archive doctor
+// check VANISH — absence-by-failure wearing the absent-by-design shape, so
+// every guard in the file was conditional on a read that failed open. An
+// unreachable database must yield a LOUD check, because an absent check and a
+// healthy check read identically. Mutant F1-M (restore `return Check{},
+// false` on the open error) dies here; the unreadable-mirror and
+// unreadable-ledger tests still pass under it, proving the open, the mirror
+// read, and the ledger read are three distinct failure points.
+func TestOrgArchiveMirrorDoctorFailsLoudOnUnopenableDatabase(t *testing.T) {
+	paths := config.PathsForHome(t.TempDir())
+	paths.Database = filepath.Join(t.TempDir(), "missing", "gitmoot.db")
+	check, present := orgArchiveMirrorDoctorCheck(paths)
+	if !present {
+		t.Fatal("check absent on an unopenable database; absence-by-failure is indistinguishable from healthy")
+	}
+	if check.OK || !strings.Contains(check.Detail, "UNKNOWN") || !strings.Contains(check.Detail, "UNOPENABLE") {
+		t.Fatalf("unopenable database = %+v, want a loud UNKNOWN", check)
+	}
+}
+
+// F2 (#1643 round 10, codex): `Scout` carrying an archived block beside
+// ` scout ` without one normalised into one key — contradictory lifecycle
+// evidence silently reconciled, and the tick stamped success. The name is the
+// join key; a list repeating it is internally malformed whether or not the
+// copies agree. Mutant F2-M (drop the duplicate refusal) dies here; the
+// nameless-entry test still passes under it — unkeyable and doubly-keyed are
+// distinct adversaries.
+func TestParseHerdrArchivedAgentsRefusesDuplicateNames(t *testing.T) {
+	observed := time.Date(2026, 8, 27, 6, 0, 0, 0, time.UTC)
+	contradictory := `{"result":{"agents":[{"name":"Scout","archived":{"at":"2026-08-26T14:29:33Z","by":"x","reason":"y"}},{"name":" scout "}]}}`
+	if _, _, _, err := parseHerdrArchivedAgents([]byte(contradictory), observed); err == nil {
+		t.Fatal("contradictory duplicate parsed; a contradiction must never be reported as successfully reconciled")
+	}
+	agreeing := `{"result":{"agents":[{"name":"keeper"},{"name":"KEEPER"}]}}`
+	if _, _, _, err := parseHerdrArchivedAgents([]byte(agreeing), observed); err == nil {
+		t.Fatal("agreeing duplicate parsed; the join key must be unique regardless of agreement")
+	}
+	distinct := `{"result":{"agents":[{"name":"keeper"},{"name":"scout"}]}}`
+	if _, _, present, err := parseHerdrArchivedAgents([]byte(distinct), observed); err != nil || len(present) != 2 {
+		t.Fatalf("distinct names refused: present=%v err=%v", present, err)
+	}
+}
+
+// F3 (#1643 round 10, opus): the FOURTH timestamp. An archived block with no
+// `at` at all — `{}`, or by/reason without at — excluded a seat on zero
+// evidence, and a future `at` was stored silently; the malformed-string case
+// failed closed only as an encoding/json side effect, which absence does not
+// trigger. The guard is now explicit. Mutant F3-M (drop the at validation)
+// dies here; every other parse refusal test passes under it.
+func TestParseHerdrArchivedAgentsRefusesEvidencelessArchivedBlocks(t *testing.T) {
+	observed := time.Date(2026, 8, 27, 6, 0, 0, 0, time.UTC)
+	for _, tc := range []struct{ label, raw string }{
+		{"empty block", `{"result":{"agents":[{"name":"scout","archived":{}}]}}`},
+		{"missing at", `{"result":{"agents":[{"name":"scout","archived":{"by":"x","reason":"y"}}]}}`},
+		{"future at", `{"result":{"agents":[{"name":"scout","archived":{"at":"2999-01-01T00:00:00Z","by":"x","reason":"y"}}]}}`},
+	} {
+		if _, _, _, err := parseHerdrArchivedAgents([]byte(tc.raw), observed); err == nil {
+			t.Fatalf("%s: parsed without error; an exclusion needs evidence, exactly as lifting one does", tc.label)
+		}
+	}
+	valid := `{"result":{"agents":[{"name":"scout","archived":{"at":"2026-08-26T14:29:33Z","by":"x","reason":"y"}}]}}`
+	if archived, _, _, err := parseHerdrArchivedAgents([]byte(valid), observed); err != nil || len(archived) != 1 {
+		t.Fatalf("valid archived block refused: %v err=%v", archived, err)
 	}
 }
