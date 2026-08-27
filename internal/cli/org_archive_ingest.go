@@ -209,12 +209,30 @@ func refreshOrgArchiveMirror(ctx context.Context, store *db.Store, stdout io.Wri
 	// AND any leftovers from earlier failed ticks, so the retry fires here
 	// regardless of whether the role appears in today's list. A pending row is
 	// deleted only after its mirror upsert succeeds.
+	//
+	// EVIDENCE RECENCY WINS (#1643 round 6, both families independently): a
+	// pending observation CONTRADICTED by this tick's read — the agent PRESENT
+	// WITHOUT its archived block — is STALE and is discarded, never applied.
+	// Without this, the durable record outranks a live contradicting
+	// observation and resurrects an archive the fleet has already left:
+	// permanent wrongful exclusion under a green doctor. A drained pending
+	// observation must never override positive evidence from the same or a
+	// later tick.
 	pending, err := store.ListOrgArchivePending(ctx)
 	if err != nil {
 		writeLine(stdout, "org archive mirror: list pending failed: %v", err)
 		return
 	}
 	for _, row := range pending {
+		if _, stillArchived := archived[row.Role]; present[row.Role] && !stillArchived {
+			if err := store.DeleteOrgArchivePending(ctx, row.Role); err != nil {
+				writeLine(stdout, "org archive mirror: discard of superseded pending %s failed: %v", row.Role, err)
+				failed = true
+				continue
+			}
+			writeLine(stdout, "org archive mirror: pending observation for %s superseded by fresher positive evidence; discarded", row.Role)
+			continue
+		}
 		if err := upsertOrgRoleArchived(ctx, store, row); err != nil {
 			writeLine(stdout, "org archive mirror: upsert %s failed, retried next tick from pending: %v", row.Role, err)
 			failed = true
@@ -230,7 +248,16 @@ func refreshOrgArchiveMirror(ctx context.Context, store *db.Store, stdout io.Wri
 			writeLine(stdout, "org seat archived observed: %s (at %s by %s)", row.Role, row.ArchivedAt, row.ArchivedBy)
 		}
 	}
-	for _, row := range prior {
+	// The transition loop reads POST-DRAIN state (the round-6 invariant): the
+	// pre-drain snapshot is kept only for new-archive logging above, so a row
+	// that landed this tick is still visible to the same tick's
+	// positive-evidence transition check.
+	postDrain, err := store.ListOrgRolesArchived(ctx)
+	if err != nil {
+		writeLine(stdout, "org archive mirror: post-drain list failed: %v", err)
+		return
+	}
+	for _, row := range postDrain {
 		if _, still := archived[row.Role]; still {
 			continue
 		}
