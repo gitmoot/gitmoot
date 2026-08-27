@@ -84,10 +84,17 @@ func parseHerdrArchivedAgents(raw []byte, observedAt time.Time) (archived map[st
 	archived = map[string]orgArchivedObservation{}
 	parked = map[string]string{}
 	present = map[string]bool{}
-	for _, agent := range envelope.Result.Agents {
+	for i, agent := range envelope.Result.Agents {
 		name := strings.ToLower(strings.TrimSpace(agent.Name))
 		if name == "" {
-			continue
+			// A nameless entry (missing name, whitespace, or a null list
+			// element) is a read this ingest cannot key: skipping it would
+			// let the tick reach the success stamp having proven nothing
+			// about that agent — including a possible archived block with no
+			// owner (#1643 round 9, codex). That is the malformed-read
+			// refusal one element down: refuse the whole list, the tick
+			// aborts loudly, and the staleness alarm stays armed.
+			return nil, nil, nil, fmt.Errorf("herdr agent list entry %d has no usable name; refusing an unkeyable read", i)
 		}
 		present[name] = true
 		if agent.Archived == nil {

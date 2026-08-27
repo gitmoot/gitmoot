@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -166,7 +167,12 @@ func (s *Store) OrgArchivePollLastSuccess(ctx context.Context) (time.Time, bool,
 	}
 	parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(stamp))
 	if err != nil {
-		return time.Time{}, false, nil
+		// An unreadable stored stamp is not "never succeeded" (#1643 round 9
+		// checklist walk): folding the parse failure into ok=false flattened
+		// three states into two and made the doctor assert "NO recorded
+		// successful poll" about a stamp that exists. Surface the failure;
+		// the doctor's stamp-unreadable branch reports UNKNOWN, not a story.
+		return time.Time{}, false, fmt.Errorf("org archive poll stamp unreadable: %q: %w", stamp, err)
 	}
 	return parsed, true, nil
 }

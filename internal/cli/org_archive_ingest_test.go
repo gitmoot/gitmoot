@@ -348,7 +348,10 @@ func TestLoadOrgRosterReadsArchiveMirror(t *testing.T) {
 
 func TestBuildOrgArchiveMirrorDoctorCheck(t *testing.T) {
 	now := time.Date(2026, 8, 26, 16, 0, 0, 0, time.UTC)
-	rows := []db.OrgRoleArchived{{Role: "scout"}}
+	// A readable, fresh observed_at: this test's axis is the POLL stamp, and
+	// since round 9 an empty observed_at correctly trips the unusable-evidence
+	// warning instead (its own test below).
+	rows := []db.OrgRoleArchived{{Role: "scout", ObservedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}}
 	fresh := buildOrgArchiveMirrorDoctorCheck(rows, nil, now.Add(-2*time.Minute), true, now)
 	if !fresh.OK || !strings.Contains(fresh.Detail, "scout") {
 		t.Fatalf("fresh = %+v", fresh)
@@ -497,7 +500,7 @@ func TestBuildOrgArchiveMirrorDoctorCheckPendingObservations(t *testing.T) {
 		t.Fatalf("aged pending = %+v, want an age-and-count warning naming the rollback condition", check)
 	}
 	young := []db.OrgRoleArchived{{Role: "scout", ObservedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}}
-	check = buildOrgArchiveMirrorDoctorCheck([]db.OrgRoleArchived{{Role: "keeper"}}, young, now.Add(-time.Minute), true, now)
+	check = buildOrgArchiveMirrorDoctorCheck([]db.OrgRoleArchived{{Role: "keeper", ObservedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}}, young, now.Add(-time.Minute), true, now)
 	if !check.OK {
 		t.Fatalf("young pending = %+v, want no warning — a fresh ledger is normal, not a verdict", check)
 	}
@@ -676,5 +679,91 @@ func TestOrgArchiveMirrorDoctorFailsLoudOnUnreadableMirror(t *testing.T) {
 	check, present := orgArchiveMirrorDoctorCheck(paths)
 	if !present || check.OK || !strings.Contains(check.Detail, "mirror UNREADABLE") || !strings.Contains(check.Detail, "UNKNOWN, not healthy") {
 		t.Fatalf("unreadable-mirror doctor = present=%v %+v, want a loud UNKNOWN", present, check)
+	}
+}
+
+// The #1643 round-9 codex finding: a nameless agents-list entry (missing
+// name, whitespace name, or a null element) was silently skipped, so an
+// incomplete read the ingest could not key still reached the success stamp —
+// including a possible archived block with no owner. Refusing the whole list
+// is the malformed-read rule one element down. Mutant N9-M (restore the
+// `continue` on an empty name) dies here; the envelope-level refusal tests in
+// TestParseHerdrArchivedAgents still pass under it, proving the adversaries
+// are distinct.
+func TestParseHerdrArchivedAgentsRefusesNamelessEntries(t *testing.T) {
+	observed := time.Date(2026, 8, 27, 5, 0, 0, 0, time.UTC)
+	for _, tc := range []struct{ label, raw string }{
+		{"missing name field", `{"result":{"agents":[{"name":"keeper"},{"agent_status":"idle"}]}}`},
+		{"whitespace name", `{"result":{"agents":[{"name":"   "}]}}`},
+		{"null element", `{"result":{"agents":[{"name":"keeper"},null]}}`},
+		{"nameless with archived block", `{"result":{"agents":[{"archived":{"at":"2026-08-26T14:29:33Z","by":"x","reason":"y"}}]}}`},
+	} {
+		if _, _, _, err := parseHerdrArchivedAgents([]byte(tc.raw), observed); err == nil {
+			t.Fatalf("%s: parsed without error; an unkeyable entry must refuse the read so the tick never stamps success over it", tc.label)
+		}
+	}
+	// Control: named entries still parse.
+	if _, _, present, err := parseHerdrArchivedAgents([]byte(`{"result":{"agents":[{"name":"keeper"}]}}`), observed); err != nil || !present["keeper"] {
+		t.Fatalf("named entry refused: present=%v err=%v", present, err)
+	}
+}
+
+// Adversary 9 (#1643 round 9, both families, opus's probe table): observed_at
+// is load-bearing for the round-8 exclusion-age alarm, and the alarm treated
+// an UNREADABLE stamp as a fresh one — empty, garbage, wrong layout, unix
+// seconds, and future timestamps all silenced the exact check built to bound
+// exclusion age. Unusable evidence is UNKNOWN, never young. Mutant A9-M1
+// (restore `if err != nil || age <= threshold { continue }`) dies here while
+// TestBuildOrgArchiveMirrorDoctorCheckUnconfirmedExclusions (readable-ancient)
+// still passes, proving unreadable and aged are distinct adversaries.
+func TestBuildOrgArchiveMirrorDoctorCheckUnusableEvidenceTimestamps(t *testing.T) {
+	now := time.Date(2026, 8, 27, 15, 0, 0, 0, time.UTC)
+	for _, tc := range []struct{ label, observedAt string }{
+		{"empty", ""},
+		{"garbage", "not-a-timestamp"},
+		{"wrong layout", "2026-07-27"},
+		{"unix seconds", "1756300000"},
+		{"future", now.Add(48 * time.Hour).Format(time.RFC3339Nano)},
+	} {
+		rows := []db.OrgRoleArchived{{Role: "scout", ObservedAt: tc.observedAt}}
+		check := buildOrgArchiveMirrorDoctorCheck(rows, nil, now.Add(-time.Minute), true, now)
+		if check.OK || !strings.Contains(check.Detail, "UNKNOWN") || !strings.Contains(check.Detail, "scout") {
+			t.Fatalf("%s observed_at = %+v, want an UNKNOWN warning naming the seat — unreadable evidence must not read as fresh", tc.label, check)
+		}
+	}
+}
+
+// The pending sibling of adversary 9: pendingObservationsDetail's err==nil
+// fold meant a ledger of entirely-unparseable rows reported age zero and
+// never warned. Mutant A9-M2 (restore the err==nil fold) dies here while the
+// mirror-side unusable test above still passes — same principle, distinct
+// code path, separately mutable.
+func TestBuildOrgArchiveMirrorDoctorCheckUnusablePendingTimestamps(t *testing.T) {
+	now := time.Date(2026, 8, 27, 15, 0, 0, 0, time.UTC)
+	for _, observedAt := range []string{"", "xxx", now.Add(time.Hour).Format(time.RFC3339Nano)} {
+		pending := []db.OrgRoleArchived{{Role: "scout", ObservedAt: observedAt}}
+		check := buildOrgArchiveMirrorDoctorCheck(nil, pending, now.Add(-time.Minute), true, now)
+		if check.OK || !strings.Contains(check.Detail, "UNKNOWN") {
+			t.Fatalf("unusable pending observed_at %q = %+v, want an UNKNOWN warning — an unparseable ledger is not a young one", observedAt, check)
+		}
+	}
+	// Control: a young readable pending ledger with no mirrored rows stays quiet.
+	young := []db.OrgRoleArchived{{Role: "scout", ObservedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}}
+	if check := buildOrgArchiveMirrorDoctorCheck(nil, young, now.Add(-time.Minute), true, now); !check.OK {
+		t.Fatalf("young readable pending = %+v, want healthy", check)
+	}
+}
+
+// The third load-bearing timestamp, found by the round-9 checklist walk
+// rather than a reviewer: a poll-success stamp in the FUTURE yields negative
+// age and passed the staleness gate as maximally fresh. Noncausal is UNKNOWN.
+// Mutant F9-M (drop the last.After(now) branch) dies here; the stale and
+// fresh stamp cases in TestBuildOrgArchiveMirrorDoctorCheck still pass.
+func TestBuildOrgArchiveMirrorDoctorCheckFuturePollStamp(t *testing.T) {
+	now := time.Date(2026, 8, 27, 15, 0, 0, 0, time.UTC)
+	rows := []db.OrgRoleArchived{{Role: "scout", ObservedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}}
+	check := buildOrgArchiveMirrorDoctorCheck(rows, nil, now.Add(time.Hour), true, now)
+	if check.OK || !strings.Contains(check.Detail, "FUTURE") || !strings.Contains(check.Detail, "UNKNOWN") {
+		t.Fatalf("future poll stamp = %+v, want an UNKNOWN warning — negative age must not read as fresh", check)
 	}
 }

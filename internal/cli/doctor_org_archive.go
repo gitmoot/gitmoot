@@ -100,6 +100,16 @@ func buildOrgArchiveMirrorDoctorCheck(rows []db.OrgRoleArchived, pending []db.Or
 			Detail: fmt.Sprintf("%d archived seats (%s) mirrored with NO recorded successful herdr poll; freshness unknown (exclusions preserved)", len(rows), roleList),
 		}
 	}
+	if last.After(now) {
+		// A poll stamp in the future (clock step, corrupt row) would read as
+		// negative age and pass the staleness gate as maximally fresh — the
+		// third load-bearing timestamp inheriting adversary 9, found by the
+		// round-9 checklist walk rather than a reviewer. Noncausal is UNKNOWN.
+		return doctor.Check{
+			Name: orgArchiveMirrorDoctorCheckName, OK: false, Required: false,
+			Detail: fmt.Sprintf("%d archived seats (%s) but the poll-success stamp is in the FUTURE (%s vs now %s) — freshness UNKNOWN, not healthy", len(rows), roleList, last.Format(time.RFC3339), now.Format(time.RFC3339)),
+		}
+	}
 	age := now.Sub(last)
 	if age > orgArchiveStaleAfter {
 		return doctor.Check{
@@ -120,11 +130,26 @@ func pendingObservationsDetail(pending []db.OrgRoleArchived, now time.Time) (boo
 	if len(pending) == 0 {
 		return false, ""
 	}
+	// Same adversary-9 rule as the exclusion check below: a pending row whose
+	// observed_at cannot be used (unparseable, or in the future) has UNKNOWN
+	// age — the err==nil fold treated an all-unparseable ledger as age zero.
+	unusable, unusableRole := 0, ""
 	oldest := now
 	for _, row := range pending {
-		if observed, err := time.Parse(time.RFC3339Nano, row.ObservedAt); err == nil && observed.Before(oldest) {
+		observed, err := time.Parse(time.RFC3339Nano, row.ObservedAt)
+		if err != nil || observed.After(now) {
+			unusable++
+			if unusableRole == "" {
+				unusableRole = row.Role
+			}
+			continue
+		}
+		if observed.Before(oldest) {
 			oldest = observed
 		}
+	}
+	if unusable > 0 {
+		return true, fmt.Sprintf("%d pending archive observation(s) with UNUSABLE timestamps (first: %s) — age UNKNOWN and cannot be bounded; not healthy", unusable, unusableRole)
 	}
 	age := now.Sub(oldest)
 	if age <= orgArchiveStaleAfter {
@@ -161,18 +186,35 @@ var listOrgRolesArchivedForDoctor = func(ctx context.Context, store *db.Store) (
 // then excluded on evidence aging without bound while the poll stamp keeps
 // advancing.
 func unconfirmedExclusionsDetail(rows []db.OrgRoleArchived, now time.Time) (bool, string) {
+	// Adversary 9 (#1643 round 9, both families): observed_at is load-bearing
+	// for this alarm, so an evidence timestamp the check cannot use — absent,
+	// unparseable, or in the future (a backward clock step reads as negative
+	// age) — is UNKNOWN, never "fresh". The prior skip-on-error form silenced
+	// the alarm on exactly the rows that most need reporting: unreadable is
+	// not young, the same sentence as the list-read rule above, one field down.
+	unusable, unusableRole := 0, ""
 	oldest := now
 	oldestRole := ""
 	count := 0
 	for _, row := range rows {
 		observed, err := time.Parse(time.RFC3339Nano, row.ObservedAt)
-		if err != nil || now.Sub(observed) <= orgArchiveStaleAfter {
+		if err != nil || observed.After(now) {
+			unusable++
+			if unusableRole == "" {
+				unusableRole = row.Role
+			}
+			continue
+		}
+		if now.Sub(observed) <= orgArchiveStaleAfter {
 			continue
 		}
 		count++
 		if observed.Before(oldest) {
 			oldest, oldestRole = observed, row.Role
 		}
+	}
+	if unusable > 0 {
+		return true, fmt.Sprintf("%d excluded seat(s) with UNUSABLE evidence timestamps (first: %s) — exclusion age UNKNOWN and cannot be bounded; not healthy", unusable, unusableRole)
 	}
 	if count == 0 {
 		return false, ""
