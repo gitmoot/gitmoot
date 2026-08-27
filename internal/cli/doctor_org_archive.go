@@ -209,14 +209,25 @@ var listOrgRolesArchivedForDoctor = func(ctx context.Context, store *db.Store) (
 	return store.ListOrgRolesArchived(ctx)
 }
 
+// orgArchiveEvidenceFloor is the lower bound on believable archive evidence.
+// Derived, not enumerated (#1643 round 13, codex): every stamp in this system
+// is a wall-clock reading from a Unix host, and no Unix wall-clock predates
+// the epoch — so any earlier value is syntactically valid and semantically
+// impossible. The round-11 IsZero check was that reasoning scoped one value
+// too narrowly: "0000-01-01T00:00:00Z" parses cleanly, is not Go's zero time
+// (0001-01-01), and is not future, so it passed every guard. The class is
+// absurd-past, not any particular sentinel.
+var orgArchiveEvidenceFloor = time.Unix(0, 0).UTC()
+
 // unusableArchiveTimestamp reports whether a stored timestamp string cannot
 // serve as evidence: unparseable, the zero time (which formats and re-parses
-// cleanly as 0001-01-01T00:00:00Z, so IsZero must be asked explicitly), or in
-// the future. Shared by the drain's pre-fix-row rejection (#1643 round 11 F2)
-// and the doctor's unusable partition (F3) so the two guards cannot drift.
+// cleanly as 0001-01-01T00:00:00Z, so IsZero must be asked explicitly), before
+// the evidence floor, or in the future. Shared by the drain's pre-fix-row
+// rejection (#1643 round 11 F2) and the doctor's unusable partition (F3) so
+// the callers cannot drift.
 func unusableArchiveTimestamp(value string, now time.Time) bool {
 	parsed, err := time.Parse(time.RFC3339Nano, value)
-	return err != nil || parsed.IsZero() || parsed.After(now)
+	return err != nil || parsed.IsZero() || parsed.Before(orgArchiveEvidenceFloor) || parsed.After(now)
 }
 
 // unconfirmedExclusionsDetail warns when any mirrored exclusion has gone

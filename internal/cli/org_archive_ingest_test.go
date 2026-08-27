@@ -934,3 +934,36 @@ func TestBuildOrgArchiveMirrorDoctorCheckUnusableArchivedAt(t *testing.T) {
 		}
 	}
 }
+
+// R13 (#1643 round 13, codex): "0000-01-01T00:00:00Z" parses cleanly, is not
+// Go's zero time, and is not future — so it passed every round-11 guard and a
+// pending row carrying it drained under an advancing stamp with OK=true. The
+// class is SYNTACTICALLY VALID AND SEMANTICALLY IMPOSSIBLE, closed by a
+// derived lower bound (no Unix wall-clock predates the epoch) in the shared
+// classifier, so all its callers inherit it at once. Mutant R13-M (drop the
+// Before(floor) clause) dies here while the zero-time and future cases still
+// pass — absurd-past is a distinct adversary from both.
+func TestBuildOrgArchiveMirrorDoctorCheckAbsurdPastArchivedAt(t *testing.T) {
+	now := time.Date(2026, 8, 27, 15, 0, 0, 0, time.UTC)
+	freshObs := now.Add(-time.Minute).Format(time.RFC3339Nano)
+	for _, tc := range []struct{ label, archivedAt string }{
+		{"year zero", "0000-01-01T00:00:00Z"},
+		{"pre-epoch", "1969-12-31T23:59:59Z"},
+	} {
+		row := db.OrgRoleArchived{Role: "scout", ArchivedAt: tc.archivedAt, ObservedAt: freshObs}
+		mirror := buildOrgArchiveMirrorDoctorCheck([]db.OrgRoleArchived{row}, nil, now.Add(-time.Minute), true, now)
+		if mirror.OK || !strings.Contains(mirror.Detail, "UNKNOWN") {
+			t.Fatalf("%s archived_at in mirror = %+v, want UNKNOWN — semantically impossible evidence must not read as usable", tc.label, mirror)
+		}
+		pending := buildOrgArchiveMirrorDoctorCheck(nil, []db.OrgRoleArchived{row}, now.Add(-time.Minute), true, now)
+		if pending.OK || !strings.Contains(pending.Detail, "UNKNOWN") {
+			t.Fatalf("%s archived_at in pending = %+v, want UNKNOWN", tc.label, pending)
+		}
+	}
+	// The floor itself is usable: an at-epoch stamp is implausible but not
+	// impossible, and the bound must not creep past its derivation.
+	atEpoch := db.OrgRoleArchived{Role: "scout", ArchivedAt: time.Unix(0, 0).UTC().Format(time.RFC3339Nano), ObservedAt: freshObs}
+	if check := buildOrgArchiveMirrorDoctorCheck([]db.OrgRoleArchived{atEpoch}, nil, now.Add(-time.Minute), true, now); !check.OK {
+		t.Fatalf("at-epoch archived_at = %+v, want healthy — the bound is Before(floor), not Before-or-at", check)
+	}
+}
