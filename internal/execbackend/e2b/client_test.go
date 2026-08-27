@@ -37,7 +37,7 @@ func TestClientControlPlaneOperations(t *testing.T) {
 		}
 		switch r.Method + " " + r.URL.EscapedPath() {
 		case "POST /sandboxes":
-			if got := readBody(t, r); got != `{"templateID":"template-a","timeout":600,"metadata":{"job":"42"},"envVars":{"MODE":"test"}}` {
+			if got := readBody(t, r); got != `{"templateID":"template-a","timeout":600,"autoPause":false,"metadata":{"job":"42"},"envVars":{"MODE":"test"}}` {
 				t.Errorf("create body = %s", got)
 			}
 			w.WriteHeader(http.StatusCreated)
@@ -138,15 +138,47 @@ func TestClientListFollowsPagination(t *testing.T) {
 	}
 }
 
+func TestClientListValidatesNextToken(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		values []string
+		want   string
+	}{
+		{name: "duplicate", values: []string{"page-2", "injected"}, want: "expected one X-Next-Token value"},
+		{name: "empty", values: []string{""}, want: "empty or whitespace-padded"},
+		{name: "oversized", values: []string{strings.Repeat("x", maxNextTokenBytes+1)}, want: "exceeds 4096 bytes"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				for _, value := range test.values {
+					w.Header().Add("X-Next-Token", value)
+				}
+				_, _ = w.Write([]byte(listedSandboxArray("sbx-1")))
+			}))
+			defer server.Close()
+			client := newTestClient(t, server.URL, time.Second, server.Client())
+
+			listed, err := client.List(context.Background())
+			if err == nil || listed != nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("List = %+v, %v; want error containing %q", listed, err, test.want)
+			}
+		})
+	}
+}
+
 func TestClientListStopsAtPageLimit(t *testing.T) {
 	t.Parallel()
 
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		call := calls.Add(1)
+		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("X-Total-Running", "100")
-		w.Header().Set("X-Next-Token", fmt.Sprintf("page-%d", call))
+		w.Header().Set("X-Next-Token", "repeat")
 		_, _ = w.Write([]byte(`[]`))
 	}))
 	defer server.Close()
@@ -237,251 +269,209 @@ func TestClientCollectionNotFoundIsAnError(t *testing.T) {
 	}
 }
 
-func TestClientGetRequiresArrayInventory(t *testing.T) {
+func TestClientListRequiresArrayInventory(t *testing.T) {
 	t.Parallel()
 
-	const sandboxID = "isandboxdoesnotexist000"
 	tests := []struct {
 		name      string
 		inventory string
-		wantState State
 		wantErr   bool
 	}{
-		{name: "null", inventory: `null`, wantState: Unknown, wantErr: true},
-		{name: "object", inventory: `{}`, wantState: Unknown, wantErr: true},
-		{name: "string", inventory: `"text"`, wantState: Unknown, wantErr: true},
-		{name: "empty body", inventory: ``, wantState: Unknown, wantErr: true},
-		{name: "single empty array cannot prove all-state absence", inventory: `[]`, wantState: Unknown, wantErr: true},
+		{name: "null", inventory: `null`, wantErr: true},
+		{name: "object", inventory: `{}`, wantErr: true},
+		{name: "string", inventory: `"text"`, wantErr: true},
+		{name: "empty body", inventory: ``, wantErr: true},
+		{name: "empty array", inventory: `[]`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.EscapedPath() == "/v2/sandboxes" {
-					w.Header().Set("Content-Type", "application/json")
-					w.Header().Set("X-Total-Running", "0")
-					_, _ = w.Write([]byte(test.inventory))
-					return
-				}
-				w.WriteHeader(http.StatusNotFound)
-				_, _ = w.Write([]byte(measuredAbsent404Body))
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-Total-Running", "0")
+				_, _ = w.Write([]byte(test.inventory))
 			}))
 			defer server.Close()
 			client := newTestClient(t, server.URL, time.Second, server.Client())
 
-			observed, err := client.Get(context.Background(), sandboxID)
-			if observed.State != test.wantState || (err != nil) != test.wantErr {
-				t.Fatalf("Get state/error = %s/%v, want %s/error=%v", observed.State, err, test.wantState, test.wantErr)
+			listed, err := client.List(context.Background())
+			if (err != nil) != test.wantErr || len(listed) != 0 {
+				t.Fatalf("List = %+v, %v; want empty/error=%v", listed, err, test.wantErr)
 			}
 		})
 	}
 }
 
-func TestClientRequiresAuthoritativeInventory(t *testing.T) {
+func TestClientValidatesInventoryWithoutInferringAbsence(t *testing.T) {
 	t.Parallel()
 
 	const sandboxID = "isandboxdoesnotexist000"
 	tests := []struct {
-		name               string
-		contentType        string
-		setContentType     bool
-		totalRunning       string
-		inventory          string
-		nextToken          string
-		nextTotalRunning   string
-		nextInventory      string
-		wantListError      bool
-		wantListed         int
-		checkFirst         bool
-		wantFirstState     string
-		wantFirstClientID  string
-		wantObservation    State
-		wantObservationErr bool
+		name              string
+		contentType       string
+		setContentType    bool
+		totalRunning      string
+		inventory         string
+		nextToken         string
+		nextTotalRunning  string
+		nextInventory     string
+		wantListError     bool
+		wantListed        int
+		checkFirst        bool
+		wantFirstState    string
+		wantFirstClientID string
 	}{
 		{
-			name:               "declared total exposes truncated inventory",
-			contentType:        "application/json",
-			setContentType:     true,
-			totalRunning:       "5",
-			inventory:          listedSandboxArray("sbx-1", "sbx-2"),
-			wantListError:      true,
-			wantObservation:    Unknown,
-			wantObservationErr: true,
+			name:           "declared total exposes truncated inventory",
+			contentType:    "application/json",
+			setContentType: true,
+			totalRunning:   "5",
+			inventory:      listedSandboxArray("sbx-1", "sbx-2"),
+			wantListError:  true,
 		},
 		{
-			name:               "matching running total does not cover paused population",
-			contentType:        "application/json; charset=utf-8",
-			setContentType:     true,
-			totalRunning:       "2",
-			inventory:          listedSandboxArray("sbx-1", "sbx-2"),
-			wantListed:         2,
-			checkFirst:         true,
-			wantFirstState:     "running",
-			wantFirstClientID:  "client",
-			wantObservation:    Unknown,
-			wantObservationErr: true,
+			name:              "matching running total does not cover paused population",
+			contentType:       "application/json; charset=utf-8",
+			setContentType:    true,
+			totalRunning:      "2",
+			inventory:         listedSandboxArray("sbx-1", "sbx-2"),
+			wantListed:        2,
+			checkFirst:        true,
+			wantFirstState:    "running",
+			wantFirstClientID: "client",
 		},
 		{
-			name:               "empty unfiltered inventory omits running total",
-			contentType:        "application/json",
-			setContentType:     true,
-			inventory:          `[]`,
-			wantObservation:    Unknown,
-			wantObservationErr: true,
+			name:           "empty unfiltered inventory omits running total",
+			contentType:    "application/json",
+			setContentType: true,
+			inventory:      `[]`,
 		},
 		{
-			name:               "paused item may exceed running lower bound",
-			contentType:        "application/json",
-			setContentType:     true,
-			totalRunning:       "0",
-			inventory:          listedSandboxArrayWith("paused", true, "sbx-paused"),
-			wantListed:         1,
-			checkFirst:         true,
-			wantFirstState:     "paused",
-			wantFirstClientID:  "client",
-			wantObservation:    Unknown,
-			wantObservationErr: true,
+			name:              "paused item may exceed running lower bound",
+			contentType:       "application/json",
+			setContentType:    true,
+			totalRunning:      "0",
+			inventory:         listedSandboxArrayWith("paused", true, "sbx-paused"),
+			wantListed:        1,
+			checkFirst:        true,
+			wantFirstState:    "paused",
+			wantFirstClientID: "client",
 		},
 		{
-			name:               "mixed running and paused inventory remains visible",
-			contentType:        "application/json",
-			setContentType:     true,
-			totalRunning:       "1",
-			inventory:          listedSandboxObjects(listedSandboxObject("running", true, 2, 512, "sbx-running"), listedSandboxObject("paused", true, 2, 512, "sbx-paused")),
-			wantListed:         2,
-			checkFirst:         true,
-			wantFirstState:     "running",
-			wantFirstClientID:  "client",
-			wantObservation:    Unknown,
-			wantObservationErr: true,
+			name:              "mixed running and paused inventory remains visible",
+			contentType:       "application/json",
+			setContentType:    true,
+			totalRunning:      "1",
+			inventory:         listedSandboxObjects(listedSandboxObject("running", true, 2, 512, "sbx-running"), listedSandboxObject("paused", true, 2, 512, "sbx-paused")),
+			wantListed:        2,
+			checkFirst:        true,
+			wantFirstState:    "running",
+			wantFirstClientID: "client",
 		},
 		{
-			name:               "explicit zero running total does not prove paused absence",
-			contentType:        "application/json",
-			setContentType:     true,
-			totalRunning:       "0",
-			inventory:          `[]`,
-			wantObservation:    Unknown,
-			wantObservationErr: true,
+			name:           "explicit zero running total does not prove paused absence",
+			contentType:    "application/json",
+			setContentType: true,
+			totalRunning:   "0",
+			inventory:      `[]`,
 		},
 		{
-			name:               "deprecated client ID may be absent",
-			contentType:        "application/json",
-			setContentType:     true,
-			inventory:          listedSandboxArrayWith("running", false, "sbx-no-client"),
-			wantListed:         1,
-			checkFirst:         true,
-			wantFirstState:     "running",
-			wantObservation:    Unknown,
-			wantObservationErr: true,
+			name:           "deprecated client ID may be absent",
+			contentType:    "application/json",
+			setContentType: true,
+			inventory:      listedSandboxArrayWith("running", false, "sbx-no-client"),
+			wantListed:     1,
+			checkFirst:     true,
+			wantFirstState: "running",
 		},
 		{
-			name:               "full headerless terminal page is valid but inconclusive",
-			contentType:        "application/json",
-			setContentType:     true,
-			inventory:          listedSandboxPage(listSandboxesPageSize),
-			wantListed:         listSandboxesPageSize,
-			wantObservation:    Unknown,
-			wantObservationErr: true,
+			name:           "full headerless terminal page is valid but inconclusive",
+			contentType:    "application/json",
+			setContentType: true,
+			inventory:      listedSandboxPage(listSandboxesPageSize),
+			wantListed:     listSandboxesPageSize,
 		},
 		{
-			name:               "short headerless terminal page is valid but inconclusive",
-			contentType:        "application/json",
-			setContentType:     true,
-			inventory:          listedSandboxPage(listSandboxesPageSize - 1),
-			wantListed:         listSandboxesPageSize - 1,
-			wantObservation:    Unknown,
-			wantObservationErr: true,
+			name:           "short headerless terminal page is valid but inconclusive",
+			contentType:    "application/json",
+			setContentType: true,
+			inventory:      listedSandboxPage(listSandboxesPageSize - 1),
+			wantListed:     listSandboxesPageSize - 1,
 		},
 		{
-			name:               "running lower bound cannot detect an omitted paused item",
-			contentType:        "application/json",
-			setContentType:     true,
-			totalRunning:       "1",
-			inventory:          listedSandboxArray("sbx-running"),
-			wantListed:         1,
-			wantObservation:    Unknown,
-			wantObservationErr: true,
+			name:           "running lower bound cannot detect an omitted paused item",
+			contentType:    "application/json",
+			setContentType: true,
+			totalRunning:   "1",
+			inventory:      listedSandboxArray("sbx-running"),
+			wantListed:     1,
 		},
 		{
-			name:               "invalid sandbox state is unverified",
-			contentType:        "application/json",
-			setContentType:     true,
-			inventory:          listedSandboxArrayWith("destroyed", true, "sbx-invalid-state"),
-			wantListError:      true,
-			wantObservation:    Unknown,
-			wantObservationErr: true,
+			name:           "invalid sandbox state is unverified",
+			contentType:    "application/json",
+			setContentType: true,
+			inventory:      listedSandboxArrayWith("destroyed", true, "sbx-invalid-state"),
+			wantListError:  true,
 		},
 		{
-			name:               "CPU count below schema minimum is unverified",
-			contentType:        "application/json",
-			setContentType:     true,
-			inventory:          listedSandboxObjects(listedSandboxObject("running", true, 0, 512, "sbx-invalid-cpu")),
-			wantListError:      true,
-			wantObservation:    Unknown,
-			wantObservationErr: true,
+			name:           "CPU count below schema minimum is unverified",
+			contentType:    "application/json",
+			setContentType: true,
+			inventory:      listedSandboxObjects(listedSandboxObject("running", true, 0, 512, "sbx-invalid-cpu")),
+			wantListError:  true,
 		},
 		{
-			name:               "memory below schema minimum is unverified",
-			contentType:        "application/json",
-			setContentType:     true,
-			inventory:          listedSandboxObjects(listedSandboxObject("running", true, 2, 64, "sbx-invalid-memory")),
-			wantListError:      true,
-			wantObservation:    Unknown,
-			wantObservationErr: true,
+			name:           "memory below schema minimum is unverified",
+			contentType:    "application/json",
+			setContentType: true,
+			inventory:      listedSandboxObjects(listedSandboxObject("running", true, 2, 64, "sbx-invalid-memory")),
+			wantListError:  true,
 		},
 		{
-			name:               "missing content type is unverified",
-			totalRunning:       "0",
-			inventory:          `[]`,
-			wantListError:      true,
-			wantObservation:    Unknown,
-			wantObservationErr: true,
+			name:          "missing content type is unverified",
+			totalRunning:  "0",
+			inventory:     `[]`,
+			wantListError: true,
 		},
 		{
-			name:               "blank content type is unverified",
-			setContentType:     true,
-			totalRunning:       "0",
-			inventory:          `[]`,
-			wantListError:      true,
-			wantObservation:    Unknown,
-			wantObservationErr: true,
+			name:           "blank content type is unverified",
+			setContentType: true,
+			totalRunning:   "0",
+			inventory:      `[]`,
+			wantListError:  true,
 		},
 		{
-			name:               "non JSON media type is unverified",
-			contentType:        "text/html",
-			setContentType:     true,
-			totalRunning:       "0",
-			inventory:          `[]`,
-			wantListError:      true,
-			wantObservation:    Unknown,
-			wantObservationErr: true,
+			name:           "non JSON media type is unverified",
+			contentType:    "text/html",
+			setContentType: true,
+			totalRunning:   "0",
+			inventory:      `[]`,
+			wantListError:  true,
 		},
 		{
-			name:               "incomplete vendor item is unverified",
-			contentType:        "application/json",
-			setContentType:     true,
-			totalRunning:       "1",
-			inventory:          `[{"sandboxID":"proxy-placeholder"}]`,
-			wantListError:      true,
-			wantObservation:    Unknown,
-			wantObservationErr: true,
+			name:           "incomplete vendor item is unverified",
+			contentType:    "application/json",
+			setContentType: true,
+			totalRunning:   "1",
+			inventory:      `[{"sandboxID":"proxy-placeholder"}]`,
+			wantListError:  true,
 		},
 		{
-			name:            "terminated continuation chain confirms absence",
-			contentType:     "application/json",
-			setContentType:  true,
-			totalRunning:    "2",
-			inventory:       listedSandboxArray("sbx-page-1"),
-			nextToken:       "page-2",
-			nextInventory:   listedSandboxArray("sbx-page-2"),
-			wantListed:      2,
-			wantObservation: Gone,
+			name:           "terminated continuation chain returns every page",
+			contentType:    "application/json",
+			setContentType: true,
+			totalRunning:   "2",
+			inventory:      listedSandboxArray("sbx-page-1"),
+			nextToken:      "page-2",
+			nextInventory:  listedSandboxArray("sbx-page-2"),
+			wantListed:     2,
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			var listCalls atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.EscapedPath() == "/v2/sandboxes" {
+					listCalls.Add(1)
 					inventory := test.inventory
 					totalRunning := test.totalRunning
 					if token := r.URL.Query().Get("nextToken"); token != "" {
@@ -518,9 +508,13 @@ func TestClientRequiresAuthoritativeInventory(t *testing.T) {
 			if test.checkFirst && (listed[0].State != test.wantFirstState || listed[0].ClientID != test.wantFirstClientID) {
 				t.Fatalf("List first item state/clientID = %q/%q, want %q/%q", listed[0].State, listed[0].ClientID, test.wantFirstState, test.wantFirstClientID)
 			}
+			callsAfterList := listCalls.Load()
 			observed, err := client.Get(context.Background(), sandboxID)
-			if observed.State != test.wantObservation || (err != nil) != test.wantObservationErr {
-				t.Fatalf("Get state/error = %s/%v, want %s/error=%v", observed.State, err, test.wantObservation, test.wantObservationErr)
+			if observed.State != Unknown || err == nil {
+				t.Fatalf("Get state/error = %s/%v, want unknown with error", observed.State, err)
+			}
+			if got := listCalls.Load(); got != callsAfterList {
+				t.Fatalf("Get made %d inventory calls, want 0", got-callsAfterList)
 			}
 		})
 	}
@@ -531,21 +525,16 @@ func TestClientThreeStateObservation(t *testing.T) {
 
 	const sandboxID = "isandboxdoesnotexist000"
 	tests := []struct {
-		name          string
-		status        int
-		body          string
-		listStatus    int
-		listBody      string
-		listNextBody  string
-		listTotal     string
-		wantListCalls int32
-		wantState     State
-		wantErr       bool
+		name      string
+		status    int
+		body      string
+		wantState State
+		wantErr   bool
 	}{
 		{name: "present", status: http.StatusOK, body: `{"sandboxID":"isandboxdoesnotexist000"}`, wantState: Present},
-		{name: "continued inventory confirms absent", status: http.StatusNotFound, body: measuredAbsent404Body, listStatus: http.StatusOK, listBody: `[]`, listNextBody: `[]`, listTotal: "0", wantListCalls: 2, wantState: Gone},
-		{name: "inventory confirms routing failure is inconclusive", status: http.StatusNotFound, body: measuredRouting404Body, listStatus: http.StatusOK, listBody: listedSandboxArray("isandboxdoesnotexist000"), listTotal: "1", wantListCalls: 1, wantState: Unknown, wantErr: true},
-		{name: "gone response still requires continued inventory", status: http.StatusGone, body: `{"code":410,"message":"sandbox gone"}`, listStatus: http.StatusOK, listBody: `[]`, listNextBody: `[]`, listTotal: "0", wantListCalls: 2, wantState: Gone},
+		{name: "absent response is inconclusive", status: http.StatusNotFound, body: measuredAbsent404Body, wantState: Unknown, wantErr: true},
+		{name: "routing failure is inconclusive", status: http.StatusNotFound, body: measuredRouting404Body, wantState: Unknown, wantErr: true},
+		{name: "gone response is inconclusive", status: http.StatusGone, body: `{"code":410,"message":"sandbox gone"}`, wantState: Unknown, wantErr: true},
 		{name: "unauthorized", status: http.StatusUnauthorized, wantState: Unknown, wantErr: true},
 		{name: "provider unavailable", status: http.StatusServiceUnavailable, wantState: Unknown, wantErr: true},
 		{name: "inconclusive malformed read", status: http.StatusOK, body: `{`, wantState: Unknown, wantErr: true},
@@ -557,23 +546,7 @@ func TestClientThreeStateObservation(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				if r.URL.EscapedPath() == "/v2/sandboxes" {
 					listCalls.Add(1)
-					if test.listStatus == 0 {
-						http.Error(w, "unexpected inventory request", http.StatusInternalServerError)
-						return
-					}
-					w.Header().Set("X-Total-Running", test.listTotal)
-					body := test.listBody
-					if token := r.URL.Query().Get("nextToken"); token != "" {
-						if token != "page-2" || test.listNextBody == "" {
-							http.Error(w, "unexpected next token", http.StatusBadRequest)
-							return
-						}
-						body = test.listNextBody
-					} else if test.listNextBody != "" {
-						w.Header().Set("X-Next-Token", "page-2")
-					}
-					w.WriteHeader(test.listStatus)
-					_, _ = w.Write([]byte(body))
+					http.Error(w, "unexpected inventory request", http.StatusInternalServerError)
 					return
 				}
 				w.WriteHeader(test.status)
@@ -586,8 +559,8 @@ func TestClientThreeStateObservation(t *testing.T) {
 			if observed.State != test.wantState || (err != nil) != test.wantErr {
 				t.Fatalf("Get state/error = %s/%v, want %s/error=%v", observed.State, err, test.wantState, test.wantErr)
 			}
-			if got := listCalls.Load(); got != test.wantListCalls {
-				t.Fatalf("inventory calls = %d, want %d", got, test.wantListCalls)
+			if got := listCalls.Load(); got != 0 {
+				t.Fatalf("inventory calls = %d, want 0", got)
 			}
 		})
 	}

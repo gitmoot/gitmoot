@@ -30,9 +30,8 @@ const (
 	minAPIKeyLength              = 8
 	listSandboxesPageSize        = 100
 	maxListPages                 = 100
+	maxNextTokenBytes            = 4096
 )
-
-var errIDResponseInconclusive = errors.New("E2B ID response is inconclusive")
 
 // State distinguishes a confirmed live sandbox, provider-confirmed absence,
 // and an inconclusive observation. Unknown must be treated as potentially live.
@@ -183,21 +182,20 @@ func (p *sandboxPage) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-type inventoryAuthority struct {
+type inventoryValidation struct {
 	runningLowerBound uint64
 	runningCollected  uint64
 	runningObserved   bool
-	sawContinuation   bool
 }
 
-func (a *inventoryAuthority) acceptPage(headers http.Header, page sandboxPage, collected int, terminal bool) ([]Sandbox, error) {
+func (v *inventoryValidation) acceptPage(headers http.Header, page sandboxPage, collected int, terminal bool) ([]Sandbox, error) {
 	totalRunning, present, err := responseTotalRunning(headers)
 	if err != nil {
 		return nil, err
 	}
-	if present && (!a.runningObserved || totalRunning > a.runningLowerBound) {
-		a.runningLowerBound = totalRunning
-		a.runningObserved = true
+	if present && (!v.runningObserved || totalRunning > v.runningLowerBound) {
+		v.runningLowerBound = totalRunning
+		v.runningObserved = true
 	}
 
 	sandboxes := make([]Sandbox, 0, len(page.items))
@@ -207,13 +205,13 @@ func (a *inventoryAuthority) acceptPage(headers http.Header, page sandboxPage, c
 			return nil, fmt.Errorf("response item %d: %w", collected+i, err)
 		}
 		if sandbox.State == "running" {
-			a.runningCollected++
+			v.runningCollected++
 		}
 		sandboxes = append(sandboxes, sandbox)
 	}
 
-	if terminal && a.runningObserved && a.runningCollected < a.runningLowerBound {
-		return nil, fmt.Errorf("collected %d running sandboxes, fewer than X-Total-Running lower bound %d", a.runningCollected, a.runningLowerBound)
+	if terminal && v.runningObserved && v.runningCollected < v.runningLowerBound {
+		return nil, fmt.Errorf("collected %d running sandboxes, fewer than X-Total-Running lower bound %d", v.runningCollected, v.runningLowerBound)
 	}
 	return sandboxes, nil
 }
@@ -238,11 +236,6 @@ func (s listedSandbox) sandbox() (Sandbox, error) {
 	}, nil
 }
 
-type sandboxInventory struct {
-	sandboxes            []Sandbox
-	absenceAuthoritative bool
-}
-
 func responseTotalRunning(headers http.Header) (uint64, bool, error) {
 	values := headers.Values("X-Total-Running")
 	if len(values) == 0 {
@@ -256,6 +249,24 @@ func responseTotalRunning(headers http.Header) (uint64, bool, error) {
 		return 0, false, fmt.Errorf("invalid X-Total-Running value %q", values[0])
 	}
 	return total, true, nil
+}
+
+func responseNextToken(headers http.Header) (string, bool, error) {
+	values := headers.Values("X-Next-Token")
+	if len(values) == 0 {
+		return "", false, nil
+	}
+	if len(values) != 1 {
+		return "", false, fmt.Errorf("expected one X-Next-Token value, got %d", len(values))
+	}
+	token := values[0]
+	if token == "" || strings.TrimSpace(token) != token {
+		return "", false, errors.New("invalid empty or whitespace-padded X-Next-Token header")
+	}
+	if len(token) > maxNextTokenBytes {
+		return "", false, fmt.Errorf("X-Next-Token exceeds %d bytes", maxNextTokenBytes)
+	}
+	return token, true, nil
 }
 
 // Observation is the three-state result of looking up one sandbox.
@@ -276,18 +287,20 @@ type Metric struct {
 	DiskTotal     int64   `json:"diskTotal"`
 }
 
-// MetricsObservation preserves provider-confirmed absence separately from an
-// inconclusive metrics read.
+// MetricsObservation preserves successful metrics separately from an
+// inconclusive read.
 type MetricsObservation struct {
 	State   State
 	Metrics []Metric
 }
 
 type createPayload struct {
-	TemplateID string            `json:"templateID"`
-	Timeout    int32             `json:"timeout"`
-	Metadata   map[string]string `json:"metadata,omitempty"`
-	Env        map[string]string `json:"envVars,omitempty"`
+	TemplateID string `json:"templateID"`
+	Timeout    int32  `json:"timeout"`
+	// Get cannot prove all-state absence, so TTL expiry must kill rather than pause.
+	AutoPause bool              `json:"autoPause"`
+	Metadata  map[string]string `json:"metadata,omitempty"`
+	Env       map[string]string `json:"envVars,omitempty"`
 }
 
 // Create starts a sandbox with a required provider-side TTL.
@@ -303,6 +316,7 @@ func (c *Client) Create(ctx context.Context, templateID string, ttl time.Duratio
 	_, err = c.doJSON(ctx, http.MethodPost, "/sandboxes", createPayload{
 		TemplateID: templateID,
 		Timeout:    ttlSeconds,
+		AutoPause:  false,
 		Metadata:   options.Metadata,
 		Env:        options.Env,
 	}, http.StatusCreated, &sandbox)
@@ -317,15 +331,9 @@ func (c *Client) Create(ctx context.Context, templateID string, ttl time.Duratio
 
 // List returns all sandboxes in the provider response.
 func (c *Client) List(ctx context.Context) ([]Sandbox, error) {
-	inventory, err := c.list(ctx)
-	return inventory.sandboxes, err
-}
-
-func (c *Client) list(ctx context.Context) (sandboxInventory, error) {
 	var sandboxes []Sandbox
-	var authority inventoryAuthority
+	var validation inventoryValidation
 	nextToken := ""
-	seenTokens := make(map[string]struct{})
 	for pageNumber := 1; pageNumber <= maxListPages; pageNumber++ {
 		query := url.Values{"limit": []string{fmt.Sprint(listSandboxesPageSize)}}
 		if nextToken != "" {
@@ -334,37 +342,33 @@ func (c *Client) list(ctx context.Context) (sandboxInventory, error) {
 		var page sandboxPage
 		headers, err := c.doJSON(ctx, http.MethodGet, "/v2/sandboxes?"+query.Encode(), nil, http.StatusOK, &page)
 		if err != nil {
-			return sandboxInventory{}, err
+			return nil, err
 		}
-		nextToken = strings.TrimSpace(headers.Get("X-Next-Token"))
-		terminal := nextToken == ""
+		next, hasNext, err := responseNextToken(headers)
+		if err != nil {
+			return nil, c.errorf(err, "list sandboxes: invalid continuation")
+		}
+		terminal := !hasNext
 		// Keep this request unfiltered so paused sandboxes remain visible to the
 		// reaper. For unfiltered responses X-Total-Running is optional and counts
-		// only running sandboxes, so its lower-bound check cannot detect a lost
-		// paused sandbox by construction. The OpenAPI defines X-Next-Token as a
-		// "Cursor to fetch the next page of results, if more exist." Because limit
-		// is only a maximum, page length proves nothing. A single terminal response
-		// is valid List data but cannot authorize absence; only a continuation chain
-		// the provider started and then terminated does so.
-		accepted, err := authority.acceptPage(headers, page, len(sandboxes), terminal)
+		// only running sandboxes, so it is a lower-bound consistency check and
+		// cannot establish all-state absence. List data never authorizes Get to
+		// return Gone.
+		accepted, err := validation.acceptPage(headers, page, len(sandboxes), terminal)
 		if err != nil {
-			return sandboxInventory{}, c.errorf(err, "list sandboxes: inventory is not authoritative")
+			return nil, c.errorf(err, "list sandboxes: invalid inventory")
 		}
 		sandboxes = append(sandboxes, accepted...)
 		if terminal {
-			return sandboxInventory{sandboxes: sandboxes, absenceAuthoritative: authority.sawContinuation}, nil
+			return sandboxes, nil
 		}
-		authority.sawContinuation = true
-		if _, duplicate := seenTokens[nextToken]; duplicate {
-			return sandboxInventory{}, c.errorf(nil, "list sandboxes: repeated pagination token %q", nextToken)
-		}
-		seenTokens[nextToken] = struct{}{}
+		nextToken = next
 	}
-	return sandboxInventory{}, c.errorf(nil, "list sandboxes: exceeded %d pages", maxListPages)
+	return nil, c.errorf(nil, "list sandboxes: exceeded %d pages", maxListPages)
 }
 
-// Get observes one sandbox. An inconclusive ID response becomes Gone only when
-// a complete, successful List confirms the sandbox is absent.
+// Get observes one sandbox. E2B exposes no all-state inventory total, so an
+// inconclusive ID response remains Unknown; List cannot prove absence safely.
 func (c *Client) Get(ctx context.Context, sandboxID string) (Observation, error) {
 	path, err := sandboxPath(sandboxID, "")
 	if err != nil {
@@ -373,25 +377,7 @@ func (c *Client) Get(ctx context.Context, sandboxID string) (Observation, error)
 	var sandbox Sandbox
 	status, _, err := c.doJSONState(ctx, http.MethodGet, path, nil, http.StatusOK, &sandbox)
 	if err != nil {
-		if errors.Is(err, errIDResponseInconclusive) {
-			inventory, listErr := c.list(ctx)
-			if listErr != nil {
-				return Observation{State: Unknown}, c.errorf(listErr, "get sandbox: ID response was inconclusive and inventory could not confirm absence")
-			}
-			for i := range inventory.sandboxes {
-				if inventory.sandboxes[i].ID == sandboxID {
-					return Observation{State: Unknown}, err
-				}
-			}
-			if !inventory.absenceAuthoritative {
-				return Observation{State: Unknown}, c.errorf(nil, "get sandbox: inventory did not prove all-state completeness")
-			}
-			return Observation{State: Gone}, nil
-		}
 		return Observation{State: status}, err
-	}
-	if status == Gone {
-		return Observation{State: Gone}, nil
 	}
 	if strings.TrimSpace(sandbox.ID) == "" {
 		return Observation{State: Unknown}, c.errorf(nil, "get sandbox: malformed response: missing sandboxID")
@@ -407,7 +393,7 @@ func (c *Client) Delete(ctx context.Context, sandboxID string) (State, error) {
 		return Unknown, err
 	}
 	state, _, err := c.doJSONState(ctx, http.MethodDelete, path, nil, http.StatusNoContent, nil)
-	if err != nil || state == Gone {
+	if err != nil {
 		return state, err
 	}
 	return Gone, nil
@@ -439,9 +425,6 @@ func (c *Client) Metrics(ctx context.Context, sandboxID string) (MetricsObservat
 	status, _, err := c.doJSONState(ctx, http.MethodGet, path, nil, http.StatusOK, &metrics)
 	if err != nil {
 		return MetricsObservation{State: status}, err
-	}
-	if status == Gone {
-		return MetricsObservation{State: Gone}, nil
 	}
 	return MetricsObservation{State: Present, Metrics: metrics}, nil
 }
@@ -493,7 +476,7 @@ func (c *Client) doJSONState(ctx context.Context, method, path string, input any
 		return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned HTTP %d with an oversized response", method, path, resp.StatusCode)
 	}
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
-		return Unknown, resp.Header, c.matchedErrorf(errIDResponseInconclusive, "%s %s: E2B returned inconclusive HTTP %d: %s", method, path, resp.StatusCode, responseBody)
+		return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned inconclusive HTTP %d: %s", method, path, resp.StatusCode, responseBody)
 	}
 	if resp.StatusCode != expectedStatus {
 		return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned HTTP %d: %s", method, path, resp.StatusCode, responseBody)
@@ -537,13 +520,6 @@ func (c *Client) errorf(cause error, format string, args ...any) error {
 	return &clientError{
 		message: workflow.RedactedStderrTail(message, c.apiKey),
 		match:   contextErrorIdentity(cause),
-	}
-}
-
-func (c *Client) matchedErrorf(match error, format string, args ...any) error {
-	return &clientError{
-		message: workflow.RedactedStderrTail(fmt.Sprintf(format, args...), c.apiKey),
-		match:   match,
 	}
 }
 
