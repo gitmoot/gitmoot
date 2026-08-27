@@ -20,8 +20,25 @@ const orgArchiveMirrorDoctorCheckName = "org archived-seat mirror"
 // last successful `herdr agent list` poll is older than orgArchiveStaleAfter
 // (~15 missed one-minute lane ticks). No archived rows -> the check is absent:
 // a herdr-less deployment must not see it.
-func orgArchiveMirrorDoctorCheck(paths config.Paths) (doctor.Check, bool) {
+func orgArchiveMirrorDoctorCheck(paths config.Paths, pathsErr error) (doctor.Check, bool) {
+	if pathsErr != nil {
+		// F1 (#1643 round 11, codex, after opus judged the branch below sound):
+		// a discarded home-resolution error produced a ZERO Paths, which
+		// reached the empty-database branch — a FAILURE manufacturing what
+		// reads as absence-by-configuration. The declared-absence exception
+		// below is correct for the case it names; this branch is what keeps
+		// a failure from wearing that case's shape. Resolution failed means
+		// we cannot know whether archive state exists: UNKNOWN, loudly.
+		return doctor.Check{
+			Name: orgArchiveMirrorDoctorCheckName, OK: false, Required: false,
+			Detail: fmt.Sprintf("home resolution FAILED: %v — archive state UNKNOWN, not healthy and not absent", pathsErr),
+		}, true
+	}
 	if strings.TrimSpace(paths.Database) == "" {
+		// Absence-by-CONFIGURATION: an empty database path is a statement in
+		// a config, not a failed read, and the platform convention across
+		// sibling checks is to absent the check. The branch above exists so
+		// no failure can manufacture this state.
 		return doctor.Check{}, false
 	}
 	store, err := db.OpenReadOnly(paths.Database)
@@ -148,7 +165,9 @@ func pendingObservationsDetail(pending []db.OrgRoleArchived, now time.Time) (boo
 	oldest := now
 	for _, row := range pending {
 		observed, err := time.Parse(time.RFC3339Nano, row.ObservedAt)
-		if err != nil || observed.After(now) {
+		// archived_at joins the partition here too (#1643 round 11 F3) —
+		// same rule, distinct code path, separately mutable.
+		if err != nil || observed.IsZero() || observed.After(now) || unusableArchiveTimestamp(row.ArchivedAt, now) {
 			unusable++
 			if unusableRole == "" {
 				unusableRole = row.Role
@@ -190,6 +209,16 @@ var listOrgRolesArchivedForDoctor = func(ctx context.Context, store *db.Store) (
 	return store.ListOrgRolesArchived(ctx)
 }
 
+// unusableArchiveTimestamp reports whether a stored timestamp string cannot
+// serve as evidence: unparseable, the zero time (which formats and re-parses
+// cleanly as 0001-01-01T00:00:00Z, so IsZero must be asked explicitly), or in
+// the future. Shared by the drain's pre-fix-row rejection (#1643 round 11 F2)
+// and the doctor's unusable partition (F3) so the two guards cannot drift.
+func unusableArchiveTimestamp(value string, now time.Time) bool {
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	return err != nil || parsed.IsZero() || parsed.After(now)
+}
+
 // unconfirmedExclusionsDetail warns when any mirrored exclusion has gone
 // unconfirmed — its agent neither re-listed archived nor observed active —
 // past the staleness threshold. Expected briefly (an archived agent can drop
@@ -209,7 +238,10 @@ func unconfirmedExclusionsDetail(rows []db.OrgRoleArchived, now time.Time) (bool
 	count := 0
 	for _, row := range rows {
 		observed, err := time.Parse(time.RFC3339Nano, row.ObservedAt)
-		if err != nil || observed.After(now) {
+		// F3 (#1643 round 11, opus): archived_at joined the partition — the
+		// fourth timestamp was validated at the writer and still invisible to
+		// this guard, so a zero archived_at sat under OK=true.
+		if err != nil || observed.IsZero() || observed.After(now) || unusableArchiveTimestamp(row.ArchivedAt, now) {
 			unusable++
 			if unusableRole == "" {
 				unusableRole = row.Role

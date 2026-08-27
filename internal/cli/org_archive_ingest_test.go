@@ -352,7 +352,7 @@ func TestBuildOrgArchiveMirrorDoctorCheck(t *testing.T) {
 	// A readable, fresh observed_at: this test's axis is the POLL stamp, and
 	// since round 9 an empty observed_at correctly trips the unusable-evidence
 	// warning instead (its own test below).
-	rows := []db.OrgRoleArchived{{Role: "scout", ObservedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}}
+	rows := []db.OrgRoleArchived{{Role: "scout", ArchivedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), ObservedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}}
 	fresh := buildOrgArchiveMirrorDoctorCheck(rows, nil, now.Add(-2*time.Minute), true, now)
 	if !fresh.OK || !strings.Contains(fresh.Detail, "scout") {
 		t.Fatalf("fresh = %+v", fresh)
@@ -494,14 +494,14 @@ func TestRefreshOrgArchiveMirrorFresherPositiveEvidenceSupersedesPending(t *test
 // pending clause) dies to the aged case.
 func TestBuildOrgArchiveMirrorDoctorCheckPendingObservations(t *testing.T) {
 	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
-	aged := []db.OrgRoleArchived{{Role: "scout", ObservedAt: now.Add(-20 * time.Minute).Format(time.RFC3339Nano)}}
+	aged := []db.OrgRoleArchived{{Role: "scout", ArchivedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), ObservedAt: now.Add(-20 * time.Minute).Format(time.RFC3339Nano)}}
 	check := buildOrgArchiveMirrorDoctorCheck(nil, aged, now.Add(-time.Minute), true, now)
 	if check.OK || !strings.Contains(check.Detail, "undrained pending archive observation") ||
 		!strings.Contains(check.Detail, "binary rollback window") || !strings.Contains(check.Detail, "20m0s") {
 		t.Fatalf("aged pending = %+v, want an age-and-count warning naming the rollback condition", check)
 	}
-	young := []db.OrgRoleArchived{{Role: "scout", ObservedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}}
-	check = buildOrgArchiveMirrorDoctorCheck([]db.OrgRoleArchived{{Role: "keeper", ObservedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}}, young, now.Add(-time.Minute), true, now)
+	young := []db.OrgRoleArchived{{Role: "scout", ArchivedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), ObservedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}}
+	check = buildOrgArchiveMirrorDoctorCheck([]db.OrgRoleArchived{{Role: "keeper", ArchivedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), ObservedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}}, young, now.Add(-time.Minute), true, now)
 	if !check.OK {
 		t.Fatalf("young pending = %+v, want no warning — a fresh ledger is normal, not a verdict", check)
 	}
@@ -594,7 +594,7 @@ func TestOrgArchiveMirrorDoctorFailsLoudOnUnreadableLedger(t *testing.T) {
 		return nil, errors.New("injected ledger read failure")
 	}
 	t.Cleanup(func() { listOrgArchivePendingForDoctor = original })
-	check, present := orgArchiveMirrorDoctorCheck(paths)
+	check, present := orgArchiveMirrorDoctorCheck(paths, nil)
 	if !present || check.OK || !strings.Contains(check.Detail, "UNREADABLE") || !strings.Contains(check.Detail, "UNKNOWN, not healthy") {
 		t.Fatalf("unreadable-ledger doctor = present=%v %+v, want a loud UNKNOWN", present, check)
 	}
@@ -645,14 +645,14 @@ func TestRefreshOrgArchiveMirrorContradictedPendingNeverTouchesTheMirror(t *test
 // freshly confirmed row never warns. Mutant A8-M (ignore row age) dies here.
 func TestBuildOrgArchiveMirrorDoctorCheckUnconfirmedExclusions(t *testing.T) {
 	now := time.Date(2026, 8, 27, 15, 0, 0, 0, time.UTC)
-	aged := []db.OrgRoleArchived{{Role: "scout", ObservedAt: now.Add(-30 * time.Minute).Format(time.RFC3339Nano)}}
+	aged := []db.OrgRoleArchived{{Role: "scout", ArchivedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), ObservedAt: now.Add(-30 * time.Minute).Format(time.RFC3339Nano)}}
 	check := buildOrgArchiveMirrorDoctorCheck(aged, nil, now.Add(-time.Minute), true, now)
 	if check.OK || !strings.Contains(check.Detail, "UNCONFIRMED") ||
 		!strings.Contains(check.Detail, "30m0s") || !strings.Contains(check.Detail, "scout") ||
 		!strings.Contains(check.Detail, "aging without bound") {
 		t.Fatalf("aged unconfirmed exclusion = %+v, want age+count+condition — the stamp answers did-this-tick-complete, not is-the-mirror-true", check)
 	}
-	fresh := []db.OrgRoleArchived{{Role: "scout", ObservedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}}
+	fresh := []db.OrgRoleArchived{{Role: "scout", ArchivedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), ObservedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}}
 	if check := buildOrgArchiveMirrorDoctorCheck(fresh, nil, now.Add(-time.Minute), true, now); !check.OK {
 		t.Fatalf("freshly confirmed exclusion = %+v, want healthy", check)
 	}
@@ -677,7 +677,7 @@ func TestOrgArchiveMirrorDoctorFailsLoudOnUnreadableMirror(t *testing.T) {
 		return nil, errors.New("injected mirror read failure")
 	}
 	t.Cleanup(func() { listOrgRolesArchivedForDoctor = original })
-	check, present := orgArchiveMirrorDoctorCheck(paths)
+	check, present := orgArchiveMirrorDoctorCheck(paths, nil)
 	if !present || check.OK || !strings.Contains(check.Detail, "mirror UNREADABLE") || !strings.Contains(check.Detail, "UNKNOWN, not healthy") {
 		t.Fatalf("unreadable-mirror doctor = present=%v %+v, want a loud UNKNOWN", present, check)
 	}
@@ -726,7 +726,7 @@ func TestBuildOrgArchiveMirrorDoctorCheckUnusableEvidenceTimestamps(t *testing.T
 		{"unix seconds", "1756300000"},
 		{"future", now.Add(48 * time.Hour).Format(time.RFC3339Nano)},
 	} {
-		rows := []db.OrgRoleArchived{{Role: "scout", ObservedAt: tc.observedAt}}
+		rows := []db.OrgRoleArchived{{Role: "scout", ArchivedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), ObservedAt: tc.observedAt}}
 		check := buildOrgArchiveMirrorDoctorCheck(rows, nil, now.Add(-time.Minute), true, now)
 		if check.OK || !strings.Contains(check.Detail, "UNKNOWN") || !strings.Contains(check.Detail, "scout") {
 			t.Fatalf("%s observed_at = %+v, want an UNKNOWN warning naming the seat — unreadable evidence must not read as fresh", tc.label, check)
@@ -742,14 +742,14 @@ func TestBuildOrgArchiveMirrorDoctorCheckUnusableEvidenceTimestamps(t *testing.T
 func TestBuildOrgArchiveMirrorDoctorCheckUnusablePendingTimestamps(t *testing.T) {
 	now := time.Date(2026, 8, 27, 15, 0, 0, 0, time.UTC)
 	for _, observedAt := range []string{"", "xxx", now.Add(time.Hour).Format(time.RFC3339Nano)} {
-		pending := []db.OrgRoleArchived{{Role: "scout", ObservedAt: observedAt}}
+		pending := []db.OrgRoleArchived{{Role: "scout", ArchivedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), ObservedAt: observedAt}}
 		check := buildOrgArchiveMirrorDoctorCheck(nil, pending, now.Add(-time.Minute), true, now)
 		if check.OK || !strings.Contains(check.Detail, "UNKNOWN") {
 			t.Fatalf("unusable pending observed_at %q = %+v, want an UNKNOWN warning — an unparseable ledger is not a young one", observedAt, check)
 		}
 	}
 	// Control: a young readable pending ledger with no mirrored rows stays quiet.
-	young := []db.OrgRoleArchived{{Role: "scout", ObservedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}}
+	young := []db.OrgRoleArchived{{Role: "scout", ArchivedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), ObservedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}}
 	if check := buildOrgArchiveMirrorDoctorCheck(nil, young, now.Add(-time.Minute), true, now); !check.OK {
 		t.Fatalf("young readable pending = %+v, want healthy", check)
 	}
@@ -762,7 +762,7 @@ func TestBuildOrgArchiveMirrorDoctorCheckUnusablePendingTimestamps(t *testing.T)
 // fresh stamp cases in TestBuildOrgArchiveMirrorDoctorCheck still pass.
 func TestBuildOrgArchiveMirrorDoctorCheckFuturePollStamp(t *testing.T) {
 	now := time.Date(2026, 8, 27, 15, 0, 0, 0, time.UTC)
-	rows := []db.OrgRoleArchived{{Role: "scout", ObservedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}}
+	rows := []db.OrgRoleArchived{{Role: "scout", ArchivedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), ObservedAt: now.Add(-time.Minute).Format(time.RFC3339Nano)}}
 	check := buildOrgArchiveMirrorDoctorCheck(rows, nil, now.Add(time.Hour), true, now)
 	if check.OK || !strings.Contains(check.Detail, "FUTURE") || !strings.Contains(check.Detail, "UNKNOWN") {
 		t.Fatalf("future poll stamp = %+v, want an UNKNOWN warning — negative age must not read as fresh", check)
@@ -780,7 +780,7 @@ func TestBuildOrgArchiveMirrorDoctorCheckFuturePollStamp(t *testing.T) {
 func TestOrgArchiveMirrorDoctorFailsLoudOnUnopenableDatabase(t *testing.T) {
 	paths := config.PathsForHome(t.TempDir())
 	paths.Database = filepath.Join(t.TempDir(), "missing", "gitmoot.db")
-	check, present := orgArchiveMirrorDoctorCheck(paths)
+	check, present := orgArchiveMirrorDoctorCheck(paths, nil)
 	if !present {
 		t.Fatal("check absent on an unopenable database; absence-by-failure is indistinguishable from healthy")
 	}
@@ -832,5 +832,105 @@ func TestParseHerdrArchivedAgentsRefusesEvidencelessArchivedBlocks(t *testing.T)
 	valid := `{"result":{"agents":[{"name":"scout","archived":{"at":"2026-08-26T14:29:33Z","by":"x","reason":"y"}}]}}`
 	if archived, _, _, err := parseHerdrArchivedAgents([]byte(valid), observed); err != nil || len(archived) != 1 {
 		t.Fatalf("valid archived block refused: %v err=%v", archived, err)
+	}
+}
+
+// F1/F4 (#1643 round 11, codex): a discarded pathsFromFlag error let a zero
+// config.Paths reach the empty-database branch, and the whole check VANISHED —
+// a FAILURE manufacturing what reads as absence-by-configuration. The
+// declared-absence branch itself is sound (opus) and stays; this pins the
+// distinction mechanically: resolution error -> loud UNKNOWN; empty path with
+// NO error -> absent, because someone declared it. Mutant R11-M1 (pass nil at
+// the call site / drop the pathsErr branch) dies here while the
+// unopenable-database test still passes — resolution and open are distinct
+// failure points.
+func TestOrgArchiveMirrorDoctorFailsLoudOnPathResolutionFailure(t *testing.T) {
+	check, present := orgArchiveMirrorDoctorCheck(config.Paths{}, errors.New("HOME unset"))
+	if !present {
+		t.Fatal("check absent on a path-resolution FAILURE; a failure must not wear the declared-absence shape")
+	}
+	if check.OK || !strings.Contains(check.Detail, "home resolution FAILED") || !strings.Contains(check.Detail, "UNKNOWN") {
+		t.Fatalf("path-resolution failure = %+v, want a loud UNKNOWN", check)
+	}
+	if _, present := orgArchiveMirrorDoctorCheck(config.Paths{}, nil); present {
+		t.Fatal("empty database path with NO error must stay absent — absence-by-configuration is a statement someone made")
+	}
+}
+
+// F2/F4 (#1643 round 11, codex): the round-10 ingress guard covered the door,
+// not the room — a PRE-FIX pending row with a zero archived_at was drained
+// into the mirror and the stamp advanced. The drain now rejects unusable
+// durable rows: mirror unwritten, pending row preserved, stamp withheld; the
+// next valid observation heals it through the ingress guard. Mutant R11-M2
+// (drop the drain-side validation) dies here while the round-10 ingress
+// refusal test still passes — door and room are distinct guards.
+func TestRefreshOrgArchiveMirrorRefusesPreFixPendingRows(t *testing.T) {
+	store := orgArchiveIngestTestStore(t)
+	ctx := context.Background()
+	now1 := time.Date(2026, 8, 27, 9, 0, 0, 0, time.UTC)
+	// A pre-round-10 row already durable in the pending ledger: zero
+	// archived_at, valid observation stamp.
+	if err := store.MergeOrgArchivePending(ctx, []db.OrgRoleArchived{{
+		Role: "scout", ArchivedAt: time.Time{}.Format(time.RFC3339Nano),
+		ArchivedBy: "herdr-app", ObservedAt: now1.Add(-time.Hour).Format(time.RFC3339Nano),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	var sink strings.Builder
+	refreshOrgArchiveMirror(ctx, store, &sink, now1, func(context.Context) ([]byte, error) {
+		return []byte(herdrAgentListScoutOmittedFixture), nil
+	})
+	if rows, err := store.ListOrgRolesArchived(ctx); err != nil || len(rows) != 0 {
+		t.Fatalf("mirror after bad-row tick = %+v err=%v, want empty — an evidence-free row must not ship", rows, err)
+	}
+	if pending, err := store.ListOrgArchivePending(ctx); err != nil || len(pending) != 1 {
+		t.Fatalf("pending after bad-row tick = %+v err=%v, want preserved — deletion would lose the observation", pending, err)
+	}
+	if _, ok, err := store.OrgArchivePollLastSuccess(ctx); err != nil || ok {
+		t.Fatalf("stamp advanced over a rejected durable row (ok=%v err=%v); the tick proved nothing about scout", ok, err)
+	}
+	if !strings.Contains(sink.String(), "unusable archived_at") {
+		t.Fatalf("rejection not logged:\n%s", sink.String())
+	}
+	// A valid observation heals it: fresh pending row overwrites, mirror
+	// lands, stamp advances.
+	now2 := now1.Add(time.Minute)
+	refreshOrgArchiveMirror(ctx, store, io.Discard, now2, func(context.Context) ([]byte, error) {
+		return []byte(herdrAgentListArchivedFixture), nil
+	})
+	rows, err := store.ListOrgRolesArchived(ctx)
+	if err != nil || len(rows) != 1 || rows[0].Role != "scout" {
+		t.Fatalf("mirror after healing tick = %+v err=%v", rows, err)
+	}
+	if unusableArchiveTimestamp(rows[0].ArchivedAt, now2) {
+		t.Fatalf("healed mirror row still carries unusable archived_at %q", rows[0].ArchivedAt)
+	}
+	if last, ok, err := store.OrgArchivePollLastSuccess(ctx); err != nil || !ok || !last.Equal(now2) {
+		t.Fatalf("stamp after healing tick = %v ok=%v err=%v, want %v", last, ok, err, now2)
+	}
+}
+
+// F3 (#1643 round 11, opus): the doctor validates observed_at and did not
+// read archived_at, so a zero archived_at under fresh observation and poll
+// stamps produced OK=true. archived_at now joins the unusable partition in
+// BOTH helpers. Mutant R11-M3 (drop archived_at from the partition) dies here
+// while the round-9 observed_at unusable tests still pass — same rule, new
+// field, separately mutable.
+func TestBuildOrgArchiveMirrorDoctorCheckUnusableArchivedAt(t *testing.T) {
+	now := time.Date(2026, 8, 27, 15, 0, 0, 0, time.UTC)
+	freshObs := now.Add(-time.Minute).Format(time.RFC3339Nano)
+	for _, tc := range []struct{ label, archivedAt string }{
+		{"zero", time.Time{}.Format(time.RFC3339Nano)},
+		{"empty", ""},
+		{"future", now.Add(48 * time.Hour).Format(time.RFC3339Nano)},
+	} {
+		mirror := buildOrgArchiveMirrorDoctorCheck([]db.OrgRoleArchived{{Role: "scout", ArchivedAt: tc.archivedAt, ObservedAt: freshObs}}, nil, now.Add(-time.Minute), true, now)
+		if mirror.OK || !strings.Contains(mirror.Detail, "UNKNOWN") {
+			t.Fatalf("mirror row with %s archived_at = %+v, want UNKNOWN — the fourth timestamp must be visible to the guard", tc.label, mirror)
+		}
+		pending := buildOrgArchiveMirrorDoctorCheck(nil, []db.OrgRoleArchived{{Role: "scout", ArchivedAt: tc.archivedAt, ObservedAt: freshObs}}, now.Add(-time.Minute), true, now)
+		if pending.OK || !strings.Contains(pending.Detail, "UNKNOWN") {
+			t.Fatalf("pending row with %s archived_at = %+v, want UNKNOWN", tc.label, pending)
+		}
 	}
 }

@@ -280,6 +280,21 @@ func refreshOrgArchiveMirror(ctx context.Context, store *db.Store, stdout io.Wri
 			writeLine(stdout, "org archive mirror: pending observation for %s superseded by fresher positive evidence (atomic)", row.Role)
 			continue
 		}
+		if unusableArchiveTimestamp(row.ArchivedAt, now) {
+			// F2 (#1643 round 11, codex): the round-10 ingress guard covered
+			// the door and not the room — a pre-fix pending row with a zero
+			// archived_at was copied into the mirror under an advancing
+			// stamp. Bad durable rows are REJECTED AT THE DRAIN, not
+			// repaired: deleting a bad pending row loses an observation
+			// (adversary 4), deleting a bad mirror row un-archives a seat
+			// (adversary 5). Rejection self-heals — the next tick that lists
+			// the agent archived re-merges a valid row over this one via the
+			// ingress guard — and a row nothing ever refreshes keeps the
+			// stamp withheld: loud by staleness, the designed direction.
+			writeLine(stdout, "org archive mirror: pending row for %s has unusable archived_at %q; not applied, stamp withheld", row.Role, row.ArchivedAt)
+			failed = true
+			continue
+		}
 		if err := upsertOrgRoleArchived(ctx, store, row); err != nil {
 			writeLine(stdout, "org archive mirror: upsert %s failed, retried next tick from pending: %v", row.Role, err)
 			failed = true
