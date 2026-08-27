@@ -137,7 +137,7 @@ type listedSandbox struct {
 	ID          *string           `json:"sandboxID"`
 	TemplateID  *string           `json:"templateID"`
 	Alias       string            `json:"alias,omitempty"`
-	ClientID    *string           `json:"clientID"`
+	ClientID    string            `json:"clientID,omitempty"`
 	EnvdVersion *string           `json:"envdVersion"`
 	StartedAt   *time.Time        `json:"startedAt"`
 	EndAt       *time.Time        `json:"endAt"`
@@ -185,20 +185,18 @@ func (p *sandboxPage) UnmarshalJSON(data []byte) error {
 }
 
 type inventoryAuthority struct {
-	totalRunning uint64
-	totalSet     bool
+	runningLowerBound uint64
+	runningObserved   bool
 }
 
 func (a *inventoryAuthority) acceptPage(headers http.Header, page sandboxPage, collected int, terminal bool) ([]Sandbox, error) {
-	totalRunning, err := responseTotalRunning(headers)
+	totalRunning, present, err := responseTotalRunning(headers)
 	if err != nil {
 		return nil, err
 	}
-	if !a.totalSet {
-		a.totalRunning = totalRunning
-		a.totalSet = true
-	} else if totalRunning != a.totalRunning {
-		return nil, fmt.Errorf("X-Total-Running changed from %d to %d between pages", a.totalRunning, totalRunning)
+	if present && (!a.runningObserved || totalRunning > a.runningLowerBound) {
+		a.runningLowerBound = totalRunning
+		a.runningObserved = true
 	}
 
 	sandboxes := make([]Sandbox, 0, len(page.items))
@@ -211,21 +209,17 @@ func (a *inventoryAuthority) acceptPage(headers http.Header, page sandboxPage, c
 	}
 
 	newCount := uint64(collected + len(sandboxes))
-	if newCount > a.totalRunning {
-		return nil, fmt.Errorf("collected %d sandboxes, exceeding X-Total-Running %d", newCount, a.totalRunning)
-	}
-	if terminal && newCount != a.totalRunning {
-		return nil, fmt.Errorf("collected %d sandboxes, but X-Total-Running declares %d", newCount, a.totalRunning)
+	if terminal && a.runningObserved && newCount < a.runningLowerBound {
+		return nil, fmt.Errorf("collected %d sandboxes, fewer than X-Total-Running lower bound %d", newCount, a.runningLowerBound)
 	}
 	return sandboxes, nil
 }
 
 func (s listedSandbox) sandbox() (Sandbox, error) {
-	missing := make([]string, 0, 10)
+	missing := make([]string, 0, 9)
 	for name, present := range map[string]bool{
 		"templateID":  s.TemplateID != nil,
 		"sandboxID":   s.ID != nil,
-		"clientID":    s.ClientID != nil,
 		"startedAt":   s.StartedAt != nil,
 		"cpuCount":    s.CPUCount != nil,
 		"memoryMB":    s.MemoryMB != nil,
@@ -249,7 +243,7 @@ func (s listedSandbox) sandbox() (Sandbox, error) {
 		ID:          *s.ID,
 		TemplateID:  *s.TemplateID,
 		Alias:       s.Alias,
-		ClientID:    *s.ClientID,
+		ClientID:    s.ClientID,
 		EnvdVersion: *s.EnvdVersion,
 		StartedAt:   *s.StartedAt,
 		EndAt:       *s.EndAt,
@@ -261,16 +255,19 @@ func (s listedSandbox) sandbox() (Sandbox, error) {
 	}, nil
 }
 
-func responseTotalRunning(headers http.Header) (uint64, error) {
+func responseTotalRunning(headers http.Header) (uint64, bool, error) {
 	values := headers.Values("X-Total-Running")
+	if len(values) == 0 {
+		return 0, false, nil
+	}
 	if len(values) != 1 || strings.TrimSpace(values[0]) == "" {
-		return 0, errors.New("missing required X-Total-Running header")
+		return 0, false, errors.New("invalid empty X-Total-Running header")
 	}
 	total, err := strconv.ParseUint(strings.TrimSpace(values[0]), 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("invalid X-Total-Running value %q", values[0])
+		return 0, false, fmt.Errorf("invalid X-Total-Running value %q", values[0])
 	}
-	return total, nil
+	return total, true, nil
 }
 
 // Observation is the three-state result of looking up one sandbox.
@@ -348,10 +345,12 @@ func (c *Client) List(ctx context.Context) ([]Sandbox, error) {
 		}
 		nextToken = strings.TrimSpace(headers.Get("X-Next-Token"))
 		terminal := nextToken == ""
-		// Require the provider's declared total. If a proxy strips both this
-		// header and X-Next-Token, a complete single page is indistinguishable
-		// from truncation; deferring Gone is safer than authorizing it from an
-		// inventory whose completeness cannot be verified.
+		// Keep this request unfiltered so paused sandboxes remain visible to the
+		// reaper. For unfiltered responses X-Total-Running is optional and counts
+		// only running sandboxes, so it is a lower bound, never an inventory total.
+		// A present bound still catches the known dropped-next-token truncation.
+		// If a proxy drops both headers there is no stronger API signal; accepting
+		// pagination termination preserves conforming empty and paused inventories.
 		accepted, err := authority.acceptPage(headers, page, len(sandboxes), terminal)
 		if err != nil {
 			return nil, c.errorf(err, "list sandboxes: inventory is not authoritative")

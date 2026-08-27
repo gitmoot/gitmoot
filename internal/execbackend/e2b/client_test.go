@@ -105,7 +105,6 @@ func TestClientListFollowsPagination(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Total-Running", "2")
 		if r.Method != http.MethodGet || r.URL.EscapedPath() != "/v2/sandboxes" {
 			http.Error(w, "wrong list route", http.StatusNotFound)
 			return
@@ -115,6 +114,7 @@ func TestClientListFollowsPagination(t *testing.T) {
 		}
 		switch token := r.URL.Query().Get("nextToken"); token {
 		case "":
+			w.Header().Set("X-Total-Running", "2")
 			w.Header().Set("X-Next-Token", "page-2")
 			_, _ = w.Write([]byte(listedSandboxArray("sbx-1")))
 		case "page-2":
@@ -288,6 +288,9 @@ func TestClientRequiresAuthoritativeInventory(t *testing.T) {
 		inventory          string
 		wantListError      bool
 		wantListed         int
+		checkFirst         bool
+		wantFirstState     string
+		wantFirstClientID  string
 		wantObservation    State
 		wantObservationErr bool
 	}{
@@ -302,22 +305,45 @@ func TestClientRequiresAuthoritativeInventory(t *testing.T) {
 			wantObservationErr: true,
 		},
 		{
-			name:            "matching total confirms absence",
-			contentType:     "application/json; charset=utf-8",
+			name:              "matching total confirms absence",
+			contentType:       "application/json; charset=utf-8",
+			setContentType:    true,
+			totalRunning:      "2",
+			inventory:         listedSandboxArray("sbx-1", "sbx-2"),
+			wantListed:        2,
+			checkFirst:        true,
+			wantFirstState:    "running",
+			wantFirstClientID: "client",
+			wantObservation:   Gone,
+		},
+		{
+			name:            "empty unfiltered inventory omits running total",
+			contentType:     "application/json",
 			setContentType:  true,
-			totalRunning:    "2",
-			inventory:       listedSandboxArray("sbx-1", "sbx-2"),
-			wantListed:      2,
+			inventory:       `[]`,
 			wantObservation: Gone,
 		},
 		{
-			name:               "missing total is unverified",
-			contentType:        "application/json",
-			setContentType:     true,
-			inventory:          `[]`,
-			wantListError:      true,
-			wantObservation:    Unknown,
-			wantObservationErr: true,
+			name:              "paused item may exceed running lower bound",
+			contentType:       "application/json",
+			setContentType:    true,
+			totalRunning:      "0",
+			inventory:         listedSandboxArrayWith("paused", true, "sbx-paused"),
+			wantListed:        1,
+			checkFirst:        true,
+			wantFirstState:    "paused",
+			wantFirstClientID: "client",
+			wantObservation:   Gone,
+		},
+		{
+			name:            "deprecated client ID may be absent",
+			contentType:     "application/json",
+			setContentType:  true,
+			inventory:       listedSandboxArrayWith("running", false, "sbx-no-client"),
+			wantListed:      1,
+			checkFirst:      true,
+			wantFirstState:  "running",
+			wantObservation: Gone,
 		},
 		{
 			name:               "missing content type is unverified",
@@ -380,6 +406,9 @@ func TestClientRequiresAuthoritativeInventory(t *testing.T) {
 			listed, listErr := client.List(context.Background())
 			if (listErr != nil) != test.wantListError || len(listed) != test.wantListed {
 				t.Fatalf("List = %+v, %v; want len=%d/error=%v", listed, listErr, test.wantListed, test.wantListError)
+			}
+			if test.checkFirst && (listed[0].State != test.wantFirstState || listed[0].ClientID != test.wantFirstClientID) {
+				t.Fatalf("List first item state/clientID = %q/%q, want %q/%q", listed[0].State, listed[0].ClientID, test.wantFirstState, test.wantFirstClientID)
 			}
 			observed, err := client.Get(context.Background(), sandboxID)
 			if observed.State != test.wantObservation || (err != nil) != test.wantObservationErr {
@@ -735,11 +764,21 @@ func readBody(t *testing.T, r *http.Request) string {
 }
 
 func listedSandboxArray(ids ...string) string {
+	return listedSandboxArrayWith("running", true, ids...)
+}
+
+func listedSandboxArrayWith(state string, includeClientID bool, ids ...string) string {
 	items := make([]string, 0, len(ids))
+	clientID := ""
+	if includeClientID {
+		clientID = `"clientID":"client",`
+	}
 	for _, id := range ids {
 		items = append(items, fmt.Sprintf(
-			`{"templateID":"template-a","sandboxID":%q,"clientID":"client","startedAt":"2026-08-26T10:00:00Z","cpuCount":2,"memoryMB":512,"diskSizeMB":1024,"endAt":"2026-08-26T11:00:00Z","state":"running","envdVersion":"1.0"}`,
+			`{"templateID":"template-a","sandboxID":%q,%s"startedAt":"2026-08-26T10:00:00Z","cpuCount":2,"memoryMB":512,"diskSizeMB":1024,"endAt":"2026-08-26T11:00:00Z","state":%q,"envdVersion":"1.0"}`,
 			id,
+			clientID,
+			state,
 		))
 	}
 	return "[" + strings.Join(items, ",") + "]"
