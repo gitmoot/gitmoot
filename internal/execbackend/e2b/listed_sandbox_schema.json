@@ -1,0 +1,112 @@
+{
+  "$ref": "#/$defs/ListedSandbox",
+  "$defs": {
+    "CPUCount": {
+      "type": "integer",
+      "format": "int32",
+      "minimum": 1
+    },
+    "MemoryMB": {
+      "type": "integer",
+      "format": "int32",
+      "minimum": 128
+    },
+    "DiskSizeMB": {
+      "type": "integer",
+      "format": "int32",
+      "minimum": 0
+    },
+    "EnvdVersion": {
+      "type": "string"
+    },
+    "SandboxMetadata": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "SandboxState": {
+      "type": "string",
+      "enum": [
+        "running",
+        "paused"
+      ]
+    },
+    "SandboxVolumeMount": {
+      "type": "object",
+      "required": [
+        "name",
+        "path"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      }
+    },
+    "ListedSandbox": {
+      "type": "object",
+      "required": [
+        "templateID",
+        "sandboxID",
+        "startedAt",
+        "cpuCount",
+        "memoryMB",
+        "diskSizeMB",
+        "endAt",
+        "state",
+        "envdVersion"
+      ],
+      "properties": {
+        "templateID": {
+          "type": "string"
+        },
+        "alias": {
+          "type": "string"
+        },
+        "sandboxID": {
+          "type": "string"
+        },
+        "clientID": {
+          "type": "string",
+          "deprecated": true
+        },
+        "startedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "endAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "cpuCount": {
+          "$ref": "#/$defs/CPUCount"
+        },
+        "memoryMB": {
+          "$ref": "#/$defs/MemoryMB"
+        },
+        "diskSizeMB": {
+          "$ref": "#/$defs/DiskSizeMB"
+        },
+        "metadata": {
+          "$ref": "#/$defs/SandboxMetadata"
+        },
+        "state": {
+          "$ref": "#/$defs/SandboxState"
+        },
+        "envdVersion": {
+          "$ref": "#/$defs/EnvdVersion"
+        },
+        "volumeMounts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SandboxVolumeMount"
+          }
+        }
+      }
+    }
+  }
+}

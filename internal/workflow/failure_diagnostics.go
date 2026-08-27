@@ -115,7 +115,20 @@ func failureDiagnosticsFromSession(diag *runtime.SessionDiag) *FailureDiagnostic
 // so the redactor no longer matches it, leaking a partial secret — then only
 // the last MaxStderrTailBytes bytes are kept, aligned to a rune boundary.
 func redactedStderrTail(stderr string) string {
-	return tailBytes(RedactCommentText(strings.TrimSpace(stderr)), MaxStderrTailBytes)
+	return RedactedStderrTail(stderr)
+}
+
+// RedactedStderrTail applies the workflow's shared bounded-error redaction.
+// Explicit secrets cover provider-specific credentials whose format is not
+// recognizable by the generic token patterns.
+func RedactedStderrTail(stderr string, secrets ...string) string {
+	stderr = strings.TrimSpace(stderr)
+	for _, secret := range secrets {
+		if secret != "" {
+			stderr = strings.ReplaceAll(stderr, secret, "[REDACTED]")
+		}
+	}
+	return tailBytes(RedactCommentText(stderr), MaxStderrTailBytes)
 }
 
 // tailBytes returns the trailing at-most-max bytes of s, advanced to the next
