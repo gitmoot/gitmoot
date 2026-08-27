@@ -42,6 +42,9 @@ type blockedRoleWakeDependencies struct {
 	provider     func([]config.OrgRole) org.Provider
 	eventSink    func(context.Context, *db.Store, string) (events.Sink, error)
 	roster       func(context.Context, *db.Store, config.OrgConfig) orgRoster
+	// archiveList overrides the `herdr agent list` read for the #1635
+	// archived-seat mirror refresh; nil means the real herdr binary.
+	archiveList  func(context.Context) ([]byte, error)
 	directives   directiveTTLDependencies
 	awaitedFacts awaitedFactTTLDependencies
 }
@@ -80,6 +83,7 @@ func defaultBlockedRoleWakeDependencies() blockedRoleWakeDependencies {
 		availability: cockpit.New(cockpit.Options{HerdrBin: "herdr"}, nil),
 		provider:     cockpit.NewHerdrOrgProvider,
 		eventSink:    enabledBlockedSinceEventSink,
+		archiveList:  defaultHerdrAgentList,
 	}
 }
 
@@ -355,6 +359,12 @@ func runBlockedRoleWakeOnce(ctx context.Context, store *db.Store, home string, s
 		writeLine(stdout, "blocked_since role loop: herdr not available; org presence + wake skipped this tick")
 		return
 	}
+	// #1635 archived-seat mirror refresh — the ONE write site, gated on herdr
+	// reachability like everything below it. This tick's roster (loaded above)
+	// predates the refresh by design: a one-minute-old observation is inside
+	// the mirror's freshness model, and re-loading here would let a mid-tick
+	// transition split the lane's view of the fleet.
+	refreshOrgArchiveMirror(ctx, store, stdout, now.UTC(), deps.archiveList)
 	if deps.provider == nil {
 		writeLine(stdout, "blocked_since role loop: nil org presence provider factory; skipped")
 		return

@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -16,6 +17,18 @@ func insertParkTestDirective(t *testing.T, store *Store, workflowID, body string
 		t.Fatal(err)
 	}
 	return note
+}
+
+// archiveWorkerInMirror satisfies parking's self-invalidation clause (#1643
+// round 5): a park only lands while the role's mirror row exists.
+func archiveWorkerInMirror(t *testing.T, store *Store) {
+	t.Helper()
+	if err := store.UpsertOrgRoleArchived(context.Background(), OrgRoleArchived{
+		Role: "worker", ArchivedAt: "2026-08-26T12:00:00Z", ArchivedBy: "herdr-app",
+		ObservedAt: "2026-08-26T12:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // Parking a role suspends its OPEN obligations: they leave the live sweep
@@ -36,6 +49,7 @@ func TestParkOrgDirectivesSuspendsOpenSweep(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	archiveWorkerInMirror(t, store)
 	parkedAt := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
 	parked, err := store.ParkOpenOrgDirectivesForRole(ctx, "worker", parkedAt, "seat archived")
 	if err != nil || parked != 2 {
@@ -86,6 +100,7 @@ func TestParkedDirectiveRefusesNudgeMarks(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	archiveWorkerInMirror(t, store)
 	if parked, err := store.ParkOpenOrgDirectivesForRole(ctx, "worker", time.Now(), "seat archived"); err != nil || parked != 2 {
 		t.Fatalf("park = %d, %v", parked, err)
 	}
@@ -108,6 +123,7 @@ func TestUnparkRestoresObligationAndResetsNudgeAnchor(t *testing.T) {
 	if _, err := store.db.ExecContext(ctx, `UPDATE workflow_notes SET created_at = ? WHERE id = ?`, "2026-01-01 00:00:00", old.ID); err != nil {
 		t.Fatal(err)
 	}
+	archiveWorkerInMirror(t, store)
 	if parked, err := store.ParkOpenOrgDirectivesForRole(ctx, "worker", time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC), "seat archived"); err != nil || parked != 1 {
 		t.Fatalf("park = %d, %v", parked, err)
 	}
@@ -129,5 +145,78 @@ func TestUnparkRestoresObligationAndResetsNudgeAnchor(t *testing.T) {
 	// Nothing left to unpark.
 	if n, err := store.UnparkOrgDirectivesForRole(ctx, "worker", unparkAt); err != nil || n != 0 {
 		t.Fatalf("re-unpark = %d, %v; want 0", n, err)
+	}
+}
+
+// The transition is one transaction: a failure at ANY point (the hook fires
+// just before commit) rolls back BOTH halves — directives stay parked, the
+// mirror row survives. Mutant P2 (unpark committed in its own transaction
+// before the delete) dies here: the hook failure would then leave directives
+// unparked with the row still present, the exact partial state #1643 round 3
+// proved a later omission strands forever.
+func TestUnarchiveOrgSeatTransitionRollsBackAtomically(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	directive := insertParkTestDirective(t, store, "wave/atomic", "[org:directive to=worker from=owner wf=wave/atomic] parked")
+	if err := store.UpsertOrgRoleArchived(ctx, OrgRoleArchived{
+		Role: "worker", ArchivedAt: "2026-08-27T08:00:00Z", ArchivedBy: "herdr-app",
+		ObservedAt: "2026-08-27T08:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if parked, err := store.ParkOpenOrgDirectivesForRole(ctx, "worker", time.Date(2026, 8, 27, 8, 0, 0, 0, time.UTC), "seat archived"); err != nil || parked != 1 {
+		t.Fatalf("park fixture = %d, %v", parked, err)
+	}
+
+	orgUnarchiveTransitionTestHook = func() error { return errors.New("injected pre-commit failure") }
+	t.Cleanup(func() { orgUnarchiveTransitionTestHook = nil })
+	at := time.Date(2026, 8, 27, 8, 5, 0, 0, time.UTC)
+	if _, err := store.UnarchiveOrgSeatTransition(ctx, "worker", at); err == nil {
+		t.Fatal("hooked transition succeeded; the hook is not firing")
+	}
+	if parked, err := store.ListParkedOrgDirectives(ctx, "worker"); err != nil || len(parked) != 1 || parked[0].ID != directive.ID {
+		t.Fatalf("parked after rollback = %+v err=%v, want STILL PARKED — the unpark half must roll back too", parked, err)
+	}
+	if rows, err := store.ListOrgRolesArchived(ctx); err != nil || len(rows) != 1 || rows[0].Role != "worker" {
+		t.Fatalf("mirror after rollback = %+v err=%v, want row preserved", rows, err)
+	}
+
+	orgUnarchiveTransitionTestHook = nil
+	unparked, err := store.UnarchiveOrgSeatTransition(ctx, "worker", at)
+	if err != nil || unparked != 1 {
+		t.Fatalf("clean transition = %d, %v", unparked, err)
+	}
+	if rows, err := store.ListOrgRolesArchived(ctx); err != nil || len(rows) != 0 {
+		t.Fatalf("mirror after clean transition = %+v err=%v, want gone", rows, err)
+	}
+	open, err := store.ListOpenOrgDirectiveObligations(ctx, 50)
+	if err != nil || len(open) != 1 || open[0].ID != directive.ID || open[0].LastNudgedAt != at.UTC().Format(time.RFC3339Nano) {
+		t.Fatalf("directive after clean transition = %+v err=%v, want unparked with the transition anchor", open, err)
+	}
+}
+
+// The #1643 round-5 adversary (kimi): a park landing from a STALE snapshot
+// after the unarchive transition deleted the mirror row would re-park
+// directives no later tick could ever unpark — the mirror row is the unpark
+// retry key. The EXISTS clause makes such a park SELF-INVALIDATE at the write:
+// no mirror row, no park, regardless of what the caller believed. Mutant K-M
+// (drop the EXISTS clause) dies only here.
+func TestParkSelfInvalidatesWithoutMirrorRow(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	directive := insertParkTestDirective(t, store, "wave/stale", "[org:directive to=worker from=owner wf=wave/stale] open work")
+	// No mirror row: the caller's snapshot is stale (the transition deleted
+	// it). The park must land NOTHING.
+	if parked, err := store.ParkOpenOrgDirectivesForRole(ctx, "worker", time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC), "stale snapshot"); err != nil || parked != 0 {
+		t.Fatalf("stale-snapshot park = %d, %v; want 0 — self-invalidation at the write", parked, err)
+	}
+	if open, err := store.ListOpenOrgDirectiveObligations(ctx, 10); err != nil || len(open) != 1 || open[0].ID != directive.ID {
+		t.Fatalf("directive after stale park = %+v err=%v, want still OPEN", open, err)
+	}
+	// With the row present the same park lands — the clause gates on the
+	// mirror, not on anything about the directive.
+	archiveWorkerInMirror(t, store)
+	if parked, err := store.ParkOpenOrgDirectivesForRole(ctx, "worker", time.Date(2026, 8, 27, 10, 1, 0, 0, time.UTC), "seat archived"); err != nil || parked != 1 {
+		t.Fatalf("mirrored park = %d, %v; want 1", parked, err)
 	}
 }

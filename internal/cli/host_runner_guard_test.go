@@ -131,6 +131,10 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 		execRunners: 2,
 		reason:      "operator org doctor and seat-management commands use replaceable host runner seams",
 	},
+	"internal/cli/org_archive_ingest.go:defaultHerdrAgentList": {
+		rawCommands: 1,
+		reason:      "daemon org lane reads host-local herdr archive state (#1635); never job work — an injectable dependency tests override, wired to the real binary only in production deps",
+	},
 	"internal/cli/pipeline_enqueue.go:allocatePipelineServiceShellWorktree": {
 		execRunners: 1,
 		reason:      "host-side allocator prepares a managed service-shell worktree before execution",
