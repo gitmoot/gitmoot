@@ -2135,4 +2135,22 @@ CREATE TABLE org_archive_poll (
 	last_success_at TEXT NOT NULL
 );
 	`,
+	// #1643 round 4: the pending-observation ledger. An observed archived seat
+	// is recorded HERE as the tick's FIRST write, then drained into the mirror
+	// with per-row retry on every tick — so a transient failure creating the
+	// first mirror row leaves durable retry state a later tick can act on even
+	// when a valid list omits the role. A pending row is deleted only after
+	// its mirror upsert succeeds. If this first write itself fails the tick
+	// aborts with the poll stamp withheld — the failed-read equivalence, loud
+	// via staleness rather than silent.
+	`
+CREATE TABLE org_archive_pending (
+	role TEXT PRIMARY KEY,
+	archived_at TEXT NOT NULL,
+	archived_by TEXT NOT NULL DEFAULT '',
+	reason TEXT NOT NULL DEFAULT '',
+	parked_work TEXT NOT NULL DEFAULT '',
+	observed_at TEXT NOT NULL
+);
+	`,
 }

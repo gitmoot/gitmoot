@@ -78,6 +78,70 @@ FROM org_role_archived ORDER BY role ASC`)
 	return out, rows.Err()
 }
 
+// MergeOrgArchivePending records observed archived seats into the pending
+// ledger (#1643 round 4) — the tick's FIRST write, in one transaction, so the
+// observation is durable before any mirror write can fail. Existing pending
+// rows for the same role are refreshed; rows for roles NOT in this batch are
+// left alone (they are prior observations still awaiting application — a
+// REPLACE here would re-create the exact loss this table closes).
+func (s *Store) MergeOrgArchivePending(ctx context.Context, rows []OrgRoleArchived) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, row := range rows {
+		role := strings.ToLower(strings.TrimSpace(row.Role))
+		if role == "" {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO org_archive_pending (role, archived_at, archived_by, reason, parked_work, observed_at)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(role) DO UPDATE SET
+	archived_at = excluded.archived_at,
+	archived_by = excluded.archived_by,
+	reason = excluded.reason,
+	parked_work = excluded.parked_work,
+	observed_at = excluded.observed_at`,
+			role, row.ArchivedAt, row.ArchivedBy, row.Reason, row.ParkedWork, row.ObservedAt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// ListOrgArchivePending returns every observation still awaiting application
+// to the mirror, role-ordered.
+func (s *Store) ListOrgArchivePending(ctx context.Context) ([]OrgRoleArchived, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT role, archived_at, archived_by, reason, parked_work, observed_at
+FROM org_archive_pending ORDER BY role ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]OrgRoleArchived, 0)
+	for rows.Next() {
+		var row OrgRoleArchived
+		if err := rows.Scan(&row.Role, &row.ArchivedAt, &row.ArchivedBy, &row.Reason, &row.ParkedWork, &row.ObservedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+// DeleteOrgArchivePending removes one applied pending observation.
+func (s *Store) DeleteOrgArchivePending(ctx context.Context, role string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM org_archive_pending WHERE role = ?`,
+		strings.ToLower(strings.TrimSpace(role)))
+	return err
+}
+
 // RecordOrgArchivePollSuccess stamps the last successful herdr agent-list
 // read. Written ONLY on success: its age is the staleness signal.
 func (s *Store) RecordOrgArchivePollSuccess(ctx context.Context, at time.Time) error {

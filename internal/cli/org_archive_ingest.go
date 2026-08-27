@@ -121,6 +121,13 @@ var unarchiveOrgSeatTransition = func(ctx context.Context, store *db.Store, role
 // from the current list.
 var parkOutstandingForArchived = parkOutstandingDirectivesForArchivedSeats
 
+// upsertOrgRoleArchived is a fault-injection seam over the mirror upsert: the
+// round-4 test forces the FIRST mirror write to fail and then proves the
+// pending ledger retries it on a later tick even under list omission.
+var upsertOrgRoleArchived = func(ctx context.Context, store *db.Store, row db.OrgRoleArchived) error {
+	return store.UpsertOrgRoleArchived(ctx, row)
+}
+
 // refreshOrgArchiveMirror reconciles the mirror against one successful herdr
 // read. Every mutation is caused by that read: upserts for observed archived
 // seats, directive UNPARK + mirror delete for observed archived->active
@@ -160,6 +167,34 @@ func refreshOrgArchiveMirror(ctx context.Context, store *db.Store, stdout io.Wri
 		writeLine(stdout, "org archive mirror: %v; mirror preserved (exclusions unchanged)", err)
 		return
 	}
+	// PHASE 1 (#1643 round 4): record every observed archived seat in the
+	// durable PENDING ledger as the tick's FIRST write, in one transaction.
+	// The observation must exist durably before any mirror write can fail —
+	// otherwise a transient upsert failure followed by a valid list OMISSION
+	// loses the only retry state and the loss is stamped clean. If this first
+	// write itself fails, the tick aborts with the stamp withheld: the
+	// failed-read equivalence, loud via staleness rather than silent.
+	names := make([]string, 0, len(archived))
+	observedRows := make([]db.OrgRoleArchived, 0, len(archived))
+	for name := range archived {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		observation := archived[name]
+		observedRows = append(observedRows, db.OrgRoleArchived{
+			Role:       name,
+			ArchivedAt: observation.At.UTC().Format(time.RFC3339Nano),
+			ArchivedBy: observation.By,
+			Reason:     observation.Reason,
+			ParkedWork: parked[name],
+			ObservedAt: observation.ObservedAt.Format(time.RFC3339Nano),
+		})
+	}
+	if err := store.MergeOrgArchivePending(ctx, observedRows); err != nil {
+		writeLine(stdout, "org archive mirror: observation record failed; tick aborted, stamp withheld: %v", err)
+		return
+	}
 	prior, err := store.ListOrgRolesArchived(ctx)
 	if err != nil {
 		writeLine(stdout, "org archive mirror: list mirror failed: %v", err)
@@ -170,27 +205,29 @@ func refreshOrgArchiveMirror(ctx context.Context, store *db.Store, stdout io.Wri
 	for _, row := range prior {
 		priorRoles[row.Role] = true
 	}
-	names := make([]string, 0, len(archived))
-	for name := range archived {
-		names = append(names, name)
+	// PHASE 2: drain the pending ledger into the mirror — today's observations
+	// AND any leftovers from earlier failed ticks, so the retry fires here
+	// regardless of whether the role appears in today's list. A pending row is
+	// deleted only after its mirror upsert succeeds.
+	pending, err := store.ListOrgArchivePending(ctx)
+	if err != nil {
+		writeLine(stdout, "org archive mirror: list pending failed: %v", err)
+		return
 	}
-	sort.Strings(names)
-	for _, name := range names {
-		observation := archived[name]
-		if err := store.UpsertOrgRoleArchived(ctx, db.OrgRoleArchived{
-			Role:       name,
-			ArchivedAt: observation.At.UTC().Format(time.RFC3339Nano),
-			ArchivedBy: observation.By,
-			Reason:     observation.Reason,
-			ParkedWork: parked[name],
-			ObservedAt: observation.ObservedAt.Format(time.RFC3339Nano),
-		}); err != nil {
-			writeLine(stdout, "org archive mirror: upsert %s failed: %v", name, err)
+	for _, row := range pending {
+		if err := upsertOrgRoleArchived(ctx, store, row); err != nil {
+			writeLine(stdout, "org archive mirror: upsert %s failed, retried next tick from pending: %v", row.Role, err)
 			failed = true
 			continue
 		}
-		if !priorRoles[name] {
-			writeLine(stdout, "org seat archived observed: %s (at %s by %s)", name, observation.At.UTC().Format(time.RFC3339), observation.By)
+		if err := store.DeleteOrgArchivePending(ctx, row.Role); err != nil {
+			// The mirror row landed; a lingering pending row only means a
+			// harmless re-upsert next tick. Still not a clean tick.
+			writeLine(stdout, "org archive mirror: pending cleanup for %s failed: %v", row.Role, err)
+			failed = true
+		}
+		if !priorRoles[row.Role] {
+			writeLine(stdout, "org seat archived observed: %s (at %s by %s)", row.Role, row.ArchivedAt, row.ArchivedBy)
 		}
 	}
 	for _, row := range prior {

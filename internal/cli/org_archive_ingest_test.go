@@ -362,3 +362,59 @@ func TestBuildOrgArchiveMirrorDoctorCheck(t *testing.T) {
 		t.Fatalf("never-succeeded = %+v", never)
 	}
 }
+
+// The #1643 round-4 adversary: a transient failure creating the FIRST mirror
+// row, followed by a valid list OMITTING the role. The pending ledger — the
+// tick's first durable write — survives the failure, so the omission tick
+// retries the upsert FROM PENDING, parks the directives, and only then stamps.
+// Mutant R4-M (drain only today's observations, ignore pending leftovers)
+// dies here while every earlier-round test still passes.
+func TestRefreshOrgArchiveMirrorFailedFirstUpsertRetriesFromPendingUnderOmission(t *testing.T) {
+	store := orgArchiveIngestTestStore(t)
+	ctx := context.Background()
+	directive, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "wave/ingest", Author: "owner",
+		Body: "[org:directive to=scout from=owner wf=wave/ingest] parked with the seat",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Tick 1: scout archived in the list, but the FIRST mirror upsert fails.
+	original := upsertOrgRoleArchived
+	upsertOrgRoleArchived = func(context.Context, *db.Store, db.OrgRoleArchived) error {
+		return errors.New("injected upsert failure")
+	}
+	now1 := time.Date(2026, 8, 27, 9, 0, 0, 0, time.UTC)
+	refreshOrgArchiveMirror(ctx, store, io.Discard, now1, func(context.Context) ([]byte, error) {
+		return []byte(herdrAgentListArchivedFixture), nil
+	})
+	upsertOrgRoleArchived = original
+	if rows, err := store.ListOrgRolesArchived(ctx); err != nil || len(rows) != 0 {
+		t.Fatalf("mirror after failed first upsert = %+v err=%v, want empty", rows, err)
+	}
+	if pending, err := store.ListOrgArchivePending(ctx); err != nil || len(pending) != 1 || pending[0].Role != "scout" {
+		t.Fatalf("pending after failed first upsert = %+v err=%v, want the durable observation", pending, err)
+	}
+	if _, recorded, _ := store.OrgArchivePollLastSuccess(ctx); recorded {
+		t.Fatal("poll stamp recorded on the failing tick")
+	}
+
+	// Tick 2: a valid list OMITS scout entirely. The pending ledger drives the
+	// retry anyway: mirror row lands, directive parks, stamp advances.
+	now2 := now1.Add(time.Minute)
+	refreshOrgArchiveMirror(ctx, store, io.Discard, now2, func(context.Context) ([]byte, error) {
+		return []byte(herdrAgentListScoutOmittedFixture), nil
+	})
+	if rows, err := store.ListOrgRolesArchived(ctx); err != nil || len(rows) != 1 || rows[0].Role != "scout" {
+		t.Fatalf("mirror after omission tick = %+v err=%v, want scout retried FROM PENDING", rows, err)
+	}
+	if pending, err := store.ListOrgArchivePending(ctx); err != nil || len(pending) != 0 {
+		t.Fatalf("pending after successful drain = %+v err=%v, want empty", pending, err)
+	}
+	if parked, err := store.ListParkedOrgDirectives(ctx, "scout"); err != nil || len(parked) != 1 || parked[0].ID != directive.ID {
+		t.Fatalf("parked after retry = %+v err=%v", parked, err)
+	}
+	if last, ok, _ := store.OrgArchivePollLastSuccess(ctx); !ok || !last.Equal(now2) {
+		t.Fatalf("poll stamp = %v ok=%v, want %v — stamped only after the pending work landed", last, ok, now2)
+	}
+}
