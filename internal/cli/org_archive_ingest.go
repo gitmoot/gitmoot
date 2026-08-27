@@ -65,26 +65,32 @@ type herdrArchivedBlock struct {
 }
 
 // parseHerdrArchivedAgents extracts the archived seats from an agent-list
-// read. PRESENCE of the archived block means archived; absence means active
-// (key off the block, never agent_status — herdr-app keeps status `idle` on
-// archived entries by design). The join key is the agent NAME, which matches
-// gitmoot's role name / pane binding. parked_work is kept verbatim.
-func parseHerdrArchivedAgents(raw []byte, observedAt time.Time) (map[string]orgArchivedObservation, map[string]string, error) {
+// read. PRESENCE of the archived block means archived; absence of the block on
+// a PRESENT agent means active (key off the block, never agent_status —
+// herdr-app keeps status `idle` on archived entries by design). The join key
+// is the agent NAME, which matches gitmoot's role name / pane binding.
+// parked_work is kept verbatim. The returned present set carries EVERY agent
+// name in the well-formed list: reconciliation needs it because an agent
+// merely OMITTED from the list is a different fact from one present without
+// the block — omission is not evidence of anything (#1643 review block 1).
+func parseHerdrArchivedAgents(raw []byte, observedAt time.Time) (archived map[string]orgArchivedObservation, parked map[string]string, present map[string]bool, err error) {
 	var envelope herdrAgentListEnvelope
 	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return nil, nil, fmt.Errorf("parse herdr agent list: %w", err)
+		return nil, nil, nil, fmt.Errorf("parse herdr agent list: %w", err)
 	}
 	if envelope.Result.Agents == nil {
-		return nil, nil, fmt.Errorf("herdr agent list returned no agents array; refusing to treat a malformed read as an empty fleet")
+		return nil, nil, nil, fmt.Errorf("herdr agent list returned no agents array; refusing to treat a malformed read as an empty fleet")
 	}
-	archived := map[string]orgArchivedObservation{}
-	parked := map[string]string{}
+	archived = map[string]orgArchivedObservation{}
+	parked = map[string]string{}
+	present = map[string]bool{}
 	for _, agent := range envelope.Result.Agents {
-		if agent.Archived == nil {
-			continue
-		}
 		name := strings.ToLower(strings.TrimSpace(agent.Name))
 		if name == "" {
+			continue
+		}
+		present[name] = true
+		if agent.Archived == nil {
 			continue
 		}
 		archived[name] = orgArchivedObservation{
@@ -97,17 +103,35 @@ func parseHerdrArchivedAgents(raw []byte, observedAt time.Time) (map[string]orgA
 			parked[name] = string(agent.Parked)
 		}
 	}
-	return archived, parked, nil
+	return archived, parked, present, nil
+}
+
+// unparkOrgDirectivesForRole is a fault-injection seam over the store method
+// (the loadOrgRosterObservations idiom): the write-order guard test forces an
+// unpark failure through it to prove a failed transition self-heals instead of
+// silently losing directives forever (#1643 review block 2).
+var unparkOrgDirectivesForRole = func(ctx context.Context, store *db.Store, role string, at time.Time) (int64, error) {
+	return store.UnparkOrgDirectivesForRole(ctx, role, at)
 }
 
 // refreshOrgArchiveMirror reconciles the mirror against one successful herdr
 // read. Every mutation is caused by that read: upserts for observed archived
-// seats, deletes + directive UNPARK for observed archived->active transitions
-// (the successful read is what attests the transition — unparking is never
-// driven by absence of data), directive PARK for the observed archived set
-// (idempotent, so directives minted after archive time still get parked), and
-// the poll-success stamp last. A failed or malformed read logs and changes
-// nothing.
+// seats, directive UNPARK + mirror delete for observed archived->active
+// transitions, directive PARK for the observed archived set (idempotent, so
+// directives minted after archive time still get parked), and the poll-success
+// stamp last. A failed or malformed read logs and changes nothing.
+//
+// LIFTING an exclusion requires evidence, exactly as imposing one does
+// (#1643 review block 1): a transition fires only when the agent is PRESENT
+// in the well-formed list WITHOUT its archived block. An agent merely absent
+// from the list is unknown — its mirror row and parked directives are
+// preserved, and only a log line records the omission.
+//
+// Transitions run unpark-FIRST, delete-after (#1643 review block 2): a failed
+// unpark leaves the mirror row, so the next tick retries (unpark is
+// idempotent) instead of stranding parked directives forever. The poll stamp
+// records success ONLY on a fully clean reconciliation — a tick with any
+// failed write leaves the stamp alone so the staleness alarm can fire.
 func refreshOrgArchiveMirror(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time, list func(context.Context) ([]byte, error)) {
 	if store == nil {
 		return
@@ -124,7 +148,7 @@ func refreshOrgArchiveMirror(ctx context.Context, store *db.Store, stdout io.Wri
 		writeLine(stdout, "org archive mirror: herdr agent list failed; mirror preserved (exclusions unchanged): %v", err)
 		return
 	}
-	archived, parked, err := parseHerdrArchivedAgents(raw, now)
+	archived, parked, present, err := parseHerdrArchivedAgents(raw, now)
 	if err != nil {
 		writeLine(stdout, "org archive mirror: %v; mirror preserved (exclusions unchanged)", err)
 		return
@@ -134,6 +158,7 @@ func refreshOrgArchiveMirror(ctx context.Context, store *db.Store, stdout io.Wri
 		writeLine(stdout, "org archive mirror: list mirror failed: %v", err)
 		return
 	}
+	failed := false
 	priorRoles := make(map[string]bool, len(prior))
 	for _, row := range prior {
 		priorRoles[row.Role] = true
@@ -154,6 +179,7 @@ func refreshOrgArchiveMirror(ctx context.Context, store *db.Store, stdout io.Wri
 			ObservedAt: observation.ObservedAt.Format(time.RFC3339Nano),
 		}); err != nil {
 			writeLine(stdout, "org archive mirror: upsert %s failed: %v", name, err)
+			failed = true
 			continue
 		}
 		if !priorRoles[name] {
@@ -164,24 +190,41 @@ func refreshOrgArchiveMirror(ctx context.Context, store *db.Store, stdout io.Wri
 		if _, still := archived[row.Role]; still {
 			continue
 		}
-		deleted, err := store.DeleteOrgRoleArchived(ctx, row.Role)
-		if err != nil {
-			writeLine(stdout, "org archive mirror: delete %s failed: %v", row.Role, err)
+		if !present[row.Role] {
+			// Omission is not evidence: only an agent PRESENT without its
+			// archived block proves an unarchive. Preserve the row and its
+			// parked directives until positive evidence arrives.
+			writeLine(stdout, "org seat %s absent from herdr list; archive state preserved pending positive evidence", row.Role)
 			continue
 		}
-		if deleted {
-			unparked, err := store.UnparkOrgDirectivesForRole(ctx, row.Role, now)
-			if err != nil {
-				writeLine(stdout, "org seat unarchive observed: %s; directive unpark failed: %v", row.Role, err)
-				continue
-			}
-			writeLine(stdout, "org seat unarchive observed: %s; %d directives unparked with fresh TTL anchors", row.Role, unparked)
+		// Unpark FIRST: if it fails the mirror row survives and the next tick
+		// retries the whole transition; delete-first would orphan the parked
+		// directives permanently with nothing left to trigger a retry.
+		unparked, err := unparkOrgDirectivesForRole(ctx, store, row.Role, now)
+		if err != nil {
+			writeLine(stdout, "org seat unarchive observed: %s; directive unpark failed, transition retried next tick: %v", row.Role, err)
+			failed = true
+			continue
 		}
+		if _, err := store.DeleteOrgRoleArchived(ctx, row.Role); err != nil {
+			writeLine(stdout, "org archive mirror: delete %s failed, transition retried next tick: %v", row.Role, err)
+			failed = true
+			continue
+		}
+		writeLine(stdout, "org seat unarchive observed: %s; %d directives unparked with fresh TTL anchors", row.Role, unparked)
 	}
 	if n, err := parkOutstandingDirectivesForArchivedSeats(ctx, store, archived, now); err != nil {
 		writeLine(stdout, "org archive mirror: directive park failed: %v", err)
+		failed = true
 	} else if n > 0 {
 		writeLine(stdout, "org archive mirror: parked %d open directives for archived seats", n)
+	}
+	if failed {
+		// A tick with any failed write must not stamp success: the stamp's age
+		// is the staleness alarm, and advancing it here would disable the
+		// alarm on exactly the tick that needs it.
+		writeLine(stdout, "org archive mirror: reconciliation incomplete; poll-success stamp withheld")
+		return
 	}
 	if err := store.RecordOrgArchivePollSuccess(ctx, now); err != nil {
 		writeLine(stdout, "org archive mirror: poll-success stamp failed: %v", err)
