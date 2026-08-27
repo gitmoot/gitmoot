@@ -33,9 +33,15 @@ func orgArchiveMirrorDoctorCheck(paths config.Paths) (doctor.Check, bool) {
 	if err != nil {
 		return doctor.Check{}, false
 	}
-	pending, err := store.ListOrgArchivePending(context.Background())
+	pending, err := listOrgArchivePendingForDoctor(context.Background(), store)
 	if err != nil {
-		pending = nil
+		// Unreadable is not empty (#1643 round 7, the same sentence as the
+		// parser's missing-agents refusal): a check that reports healthy when
+		// it cannot see converts an unknown into a false negative.
+		return doctor.Check{
+			Name: orgArchiveMirrorDoctorCheckName, OK: false, Required: false,
+			Detail: fmt.Sprintf("pending archive ledger UNREADABLE: %v — freshness and drain state UNKNOWN, not healthy", err),
+		}, true
 	}
 	if len(rows) == 0 && len(pending) == 0 {
 		return doctor.Check{}, false
@@ -113,4 +119,11 @@ func pendingMirrorSuffix(mirrored int, roleList string) string {
 		return ""
 	}
 	return fmt.Sprintf("; %d archived seats mirrored (%s)", mirrored, roleList)
+}
+
+// listOrgArchivePendingForDoctor is a fault-injection seam: the round-7 guard
+// test makes the ledger unreadable and asserts the doctor reports UNKNOWN
+// rather than healthy.
+var listOrgArchivePendingForDoctor = func(ctx context.Context, store *db.Store) ([]db.OrgRoleArchived, error) {
+	return store.ListOrgArchivePending(ctx)
 }

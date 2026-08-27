@@ -460,8 +460,11 @@ func TestRefreshOrgArchiveMirrorFresherPositiveEvidenceSupersedesPending(t *test
 	if rows, err := store.ListOrgRolesArchived(ctx); err != nil || len(rows) != 0 {
 		t.Fatalf("mirror after contradiction = %+v err=%v, want empty — stale evidence must not resurrect", rows, err)
 	}
-	if !strings.Contains(sink.String(), "superseded by fresher positive evidence") {
-		t.Fatalf("supersede log line missing:\n%s", sink.String())
+	// The supersede runs through apply + the atomic transition (round 7): the
+	// stale observation lands and is unarchived in the same tick, its pending
+	// row dying inside the transition transaction.
+	if !strings.Contains(sink.String(), "org seat unarchive observed: scout") {
+		t.Fatalf("supersede-by-transition log line missing:\n%s", sink.String())
 	}
 
 	// Tick 3: omission — nothing to resurrect, directive stays open, stamp clean.
@@ -497,5 +500,96 @@ func TestBuildOrgArchiveMirrorDoctorCheckPendingObservations(t *testing.T) {
 	check = buildOrgArchiveMirrorDoctorCheck([]db.OrgRoleArchived{{Role: "keeper"}}, young, now.Add(-time.Minute), true, now)
 	if !check.OK {
 		t.Fatalf("young pending = %+v, want no warning — a fresh ledger is normal, not a verdict", check)
+	}
+}
+
+// The #1643 round-7 adversary, part 1: the supersede must be atomic with its
+// consumer. The drain's routine pending cleanup FAILS, so a pending row
+// outlives its application — and the same tick's atomic transition still
+// kills it inside the transaction, so a later omission has nothing to
+// resurrect. Mutant R7-M1 (pending-delete dropped from the transition tx)
+// dies only here: the leftover pending row would reapply the stale archive on
+// the omission tick and park the seat under a clean stamp.
+func TestRefreshOrgArchiveMirrorSupersededPendingDiesInsideTheTransition(t *testing.T) {
+	store := orgArchiveIngestTestStore(t)
+	ctx := context.Background()
+	directive, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "wave/ingest", Author: "owner",
+		Body: "[org:directive to=scout from=owner wf=wave/ingest] must never resurrect",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Tick 1: archived observed, mirror upsert fails — pending only.
+	originalUpsert := upsertOrgRoleArchived
+	upsertOrgRoleArchived = func(context.Context, *db.Store, db.OrgRoleArchived) error {
+		return errors.New("injected upsert failure")
+	}
+	now1 := time.Date(2026, 8, 27, 13, 0, 0, 0, time.UTC)
+	refreshOrgArchiveMirror(ctx, store, io.Discard, now1, func(context.Context) ([]byte, error) {
+		return []byte(herdrAgentListArchivedFixture), nil
+	})
+	upsertOrgRoleArchived = originalUpsert
+
+	// Tick 2: ALL-ACTIVE; the drain's routine pending cleanup FAILS, so only
+	// the transition transaction can kill the pending row — and does.
+	originalDelete := deleteOrgArchivePending
+	deleteOrgArchivePending = func(context.Context, *db.Store, string) error {
+		return errors.New("injected pending-cleanup failure")
+	}
+	now2 := now1.Add(time.Minute)
+	refreshOrgArchiveMirror(ctx, store, io.Discard, now2, func(context.Context) ([]byte, error) {
+		return []byte(herdrAgentListAllActiveFixture), nil
+	})
+	deleteOrgArchivePending = originalDelete
+	if pending, err := store.ListOrgArchivePending(ctx); err != nil || len(pending) != 0 {
+		t.Fatalf("pending after supersede = %+v err=%v, want dead INSIDE the transition transaction", pending, err)
+	}
+	if rows, err := store.ListOrgRolesArchived(ctx); err != nil || len(rows) != 0 {
+		t.Fatalf("mirror after supersede = %+v err=%v, want empty", rows, err)
+	}
+	if _, recorded, _ := store.OrgArchivePollLastSuccess(ctx); recorded {
+		t.Fatal("stamp recorded on a tick with a failed cleanup write")
+	}
+
+	// Tick 3: omission — nothing left to resurrect.
+	now3 := now2.Add(time.Minute)
+	refreshOrgArchiveMirror(ctx, store, io.Discard, now3, func(context.Context) ([]byte, error) {
+		return []byte(herdrAgentListScoutOmittedFixture), nil
+	})
+	if rows, err := store.ListOrgRolesArchived(ctx); err != nil || len(rows) != 0 {
+		t.Fatalf("mirror after omission = %+v err=%v, want still empty — the superseded observation must not return", rows, err)
+	}
+	if open, err := store.ListOpenOrgDirectiveObligations(ctx, 10); err != nil || len(open) != 1 || open[0].ID != directive.ID {
+		t.Fatalf("directive = %+v err=%v, want OPEN, never wrongly parked", open, err)
+	}
+	if last, ok, _ := store.OrgArchivePollLastSuccess(ctx); !ok || !last.Equal(now3) {
+		t.Fatalf("stamp = %v ok=%v, want clean %v", last, ok, now3)
+	}
+}
+
+// The #1643 round-7 adversary, part 2: UNREADABLE IS NOT EMPTY. A doctor that
+// reports healthy when it cannot read the pending ledger converts an unknown
+// into a false negative — the absence-as-evidence class reborn inside the
+// guard built to expose a different absence. Mutant D2-M (swallow the read
+// error and treat the ledger as empty) dies only here.
+func TestOrgArchiveMirrorDoctorFailsLoudOnUnreadableLedger(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	original := listOrgArchivePendingForDoctor
+	listOrgArchivePendingForDoctor = func(context.Context, *db.Store) ([]db.OrgRoleArchived, error) {
+		return nil, errors.New("injected ledger read failure")
+	}
+	t.Cleanup(func() { listOrgArchivePendingForDoctor = original })
+	check, present := orgArchiveMirrorDoctorCheck(paths)
+	if !present || check.OK || !strings.Contains(check.Detail, "UNREADABLE") || !strings.Contains(check.Detail, "UNKNOWN, not healthy") {
+		t.Fatalf("unreadable-ledger doctor = present=%v %+v, want a loud UNKNOWN", present, check)
 	}
 }

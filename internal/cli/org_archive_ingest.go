@@ -121,6 +121,14 @@ var unarchiveOrgSeatTransition = func(ctx context.Context, store *db.Store, role
 // from the current list.
 var parkOutstandingForArchived = parkOutstandingDirectivesForArchivedSeats
 
+// deleteOrgArchivePending is a fault-injection seam over the drain's routine
+// pending cleanup: the round-7 guard test fails it to prove a leftover pending
+// row still dies inside the atomic transition rather than resurrecting a
+// superseded observation on a later omission tick.
+var deleteOrgArchivePending = func(ctx context.Context, store *db.Store, role string) error {
+	return store.DeleteOrgArchivePending(ctx, role)
+}
+
 // upsertOrgRoleArchived is a fault-injection seam over the mirror upsert: the
 // round-4 test forces the FIRST mirror write to fail and then proves the
 // pending ledger retries it on a later tick even under list omission.
@@ -224,21 +232,21 @@ func refreshOrgArchiveMirror(ctx context.Context, store *db.Store, stdout io.Wri
 		return
 	}
 	for _, row := range pending {
-		if _, stillArchived := archived[row.Role]; present[row.Role] && !stillArchived {
-			if err := store.DeleteOrgArchivePending(ctx, row.Role); err != nil {
-				writeLine(stdout, "org archive mirror: discard of superseded pending %s failed: %v", row.Role, err)
-				failed = true
-				continue
-			}
-			writeLine(stdout, "org archive mirror: pending observation for %s superseded by fresher positive evidence; discarded", row.Role)
-			continue
-		}
+		// A pending row CONTRADICTED by this tick's read (agent present
+		// without its block) is deliberately still APPLIED: the same tick's
+		// transition loop, which reads post-drain state and holds the fresh
+		// positive evidence, supersedes it through the ATOMIC transition —
+		// whose transaction also deletes the pending row. Round 6 discarded
+		// such rows with a separate DELETE, a write whose failure left the
+		// contradiction living only in tick memory (round 7): re-deriving the
+		// contradiction each tick from durable state x fresh evidence needs
+		// no memory at all.
 		if err := upsertOrgRoleArchived(ctx, store, row); err != nil {
 			writeLine(stdout, "org archive mirror: upsert %s failed, retried next tick from pending: %v", row.Role, err)
 			failed = true
 			continue
 		}
-		if err := store.DeleteOrgArchivePending(ctx, row.Role); err != nil {
+		if err := deleteOrgArchivePending(ctx, store, row.Role); err != nil {
 			// The mirror row landed; a lingering pending row only means a
 			// harmless re-upsert next tick. Still not a clean tick.
 			writeLine(stdout, "org archive mirror: pending cleanup for %s failed: %v", row.Role, err)

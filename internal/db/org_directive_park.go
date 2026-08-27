@@ -122,6 +122,16 @@ WHERE substr(body, 1, length('[org:directive to=' || ? || ' ')) = '[org:directiv
 	if _, err := tx.ExecContext(ctx, `DELETE FROM org_role_archived WHERE role = ?`, targetRole); err != nil {
 		return 0, err
 	}
+	// The pending row dies IN THE SAME TRANSACTION (#1643 round 7): the
+	// supersede of a stale observation is atomic with the transition that
+	// consumes it, so a contradicted pending row can never outlive the
+	// positive evidence that contradicted it and be re-applied by a later
+	// omission tick. Round 6 discarded contradicted rows with a separate
+	// DELETE — a write whose failure left the contradiction living only in
+	// tick memory, which is adversary 4 one level up.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM org_archive_pending WHERE role = ?`, targetRole); err != nil {
+		return 0, err
+	}
 	if orgUnarchiveTransitionTestHook != nil {
 		if err := orgUnarchiveTransitionTestHook(); err != nil {
 			return 0, err
