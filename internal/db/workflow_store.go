@@ -98,10 +98,16 @@ type OrgDirectiveObligation struct {
 	DoneTTLOverrideSeconds int64
 	// #1352: the completion phase counts separately, because NudgeCount is
 	// cumulative across both phases and never resets at ack. ExhaustedAt is the
-	// terminal stamp — non-empty means the ladder ended and the obligation is
-	// parked but still VISIBLE in this list.
+	// terminal stamp — non-empty means the ladder ended and the obligation
+	// stays open and VISIBLE in this list.
 	DoneNudgeCount int
 	ExhaustedAt    string
+	// #1635: a non-empty ParkedAt suspends the nudge ladder while the target
+	// seat is out of rotation — distinct from ExhaustedAt (terminal) and from
+	// done/cancel (obligation ended). Parked rows leave the open sweep entirely
+	// and are listed by ListParkedOrgDirectives instead.
+	ParkedAt     string
+	ParkedReason string
 }
 
 // WorkflowMeta is the latest external-coordinator handoff identity recorded for
@@ -865,6 +871,7 @@ func (s *Store) CountOpenOrgDirectiveObligations(ctx context.Context) (int, erro
 SELECT COUNT(*)
 FROM workflow_notes d
 WHERE substr(d.body, 1, length('[org:directive ')) = '[org:directive '
+	AND TRIM(d.directive_parked_at) = ''
 	AND NOT EXISTS (
 		SELECT 1 FROM workflow_notes r
 		WHERE r.workflow_id = d.workflow_id AND (
@@ -902,6 +909,7 @@ SELECT d.id, d.workflow_id, d.author, d.body, d.repo, d.memory_observation_id, d
 	), '')
 FROM workflow_notes d INDEXED BY idx_workflow_notes_directive_oldest
 WHERE substr(d.body, 1, length('[org:directive ')) = '[org:directive '
+	AND TRIM(d.directive_parked_at) = ''
 	AND NOT EXISTS (
 		SELECT 1 FROM workflow_notes r
 		WHERE r.workflow_id = d.workflow_id AND (
@@ -946,6 +954,7 @@ WHERE id = ?
 	AND directive_done_nudge_count = ?
 	AND directive_last_nudged_at = ?
 	AND TRIM(directive_exhausted_at) = ''
+	AND TRIM(directive_parked_at) = ''
 	AND substr(body, 1, length('[org:directive ')) = '[org:directive '
 	AND NOT EXISTS (
 		SELECT 1 FROM workflow_notes r
@@ -1012,6 +1021,7 @@ SET directive_nudge_count = directive_nudge_count + 1,
 WHERE id = ?
 	AND directive_nudge_count = ?
 	AND directive_last_nudged_at = ?
+	AND TRIM(directive_parked_at) = ''
 	AND substr(body, 1, length('[org:directive ')) = '[org:directive '
 	AND NOT EXISTS (
 		SELECT 1 FROM workflow_notes r
