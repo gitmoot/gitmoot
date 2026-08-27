@@ -37,11 +37,11 @@ func TestClientControlPlaneOperations(t *testing.T) {
 		}
 		switch r.Method + " " + r.URL.EscapedPath() {
 		case "POST /sandboxes":
-			if got := readBody(t, r); got != `{"templateID":"template-a","timeout":600,"autoPause":false,"metadata":{"job":"42"},"envVars":{"MODE":"test"}}` {
+			if got := readBody(t, r); got != `{"templateID":"template-a","timeout":600,"autoPause":false,"secure":true,"metadata":{"job":"42"},"envVars":{"MODE":"test"}}` {
 				t.Errorf("create body = %s", got)
 			}
 			w.WriteHeader(http.StatusCreated)
-			_, _ = w.Write([]byte(`{"sandboxID":"sbx-1","templateID":"template-a","clientID":"client","envdVersion":"1.0"}`))
+			_, _ = w.Write([]byte(`{"sandboxID":"sbx-1","templateID":"template-a","clientID":"client","envdVersion":"1.0","envdAccessToken":"sandbox-envd-secret","domain":null}`))
 		case "GET /v2/sandboxes":
 			if got := r.URL.Query().Get("limit"); got != "100" {
 				t.Errorf("list limit = %q, want 100", got)
@@ -68,12 +68,15 @@ func TestClientControlPlaneOperations(t *testing.T) {
 	client := newTestClient(t, server.URL, time.Second, server.Client())
 	ctx := context.Background()
 
-	created, err := client.Create(ctx, "template-a", 10*time.Minute, CreateOptions{
+	created, credential, err := client.Create(ctx, "template-a", 10*time.Minute, CreateOptions{
 		Metadata: map[string]string{"job": "42"},
 		Env:      map[string]string{"MODE": "test"},
 	})
-	if err != nil || created.ID != "sbx-1" {
+	if err != nil || created.ID != "sbx-1" || created.Domain != DefaultSandboxDomain || credential.token != "sandbox-envd-secret" {
 		t.Fatalf("Create = %+v, %v", created, err)
+	}
+	if got := fmt.Sprintf("%s/%#v", credential, credential); got != "[REDACTED]/[REDACTED]" {
+		t.Fatalf("credential rendering = %q", got)
 	}
 	listed, err := client.List(ctx)
 	if err != nil || len(listed) != 1 || listed[0].State != "running" {
@@ -204,13 +207,33 @@ func TestClientRequiresCreationTTL(t *testing.T) {
 	client := newTestClient(t, server.URL, time.Second, server.Client())
 
 	for _, ttl := range []time.Duration{0, -time.Second, 1500 * time.Millisecond} {
-		_, err := client.Create(context.Background(), "template-a", ttl, CreateOptions{})
+		_, _, err := client.Create(context.Background(), "template-a", ttl, CreateOptions{})
 		if err == nil {
 			t.Errorf("Create TTL %s succeeded", ttl)
 		}
 	}
 	if got := calls.Load(); got != 0 {
 		t.Fatalf("provider calls = %d, want 0", got)
+	}
+}
+
+func TestClientCreateRequiresEnvdCredential(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if body := readBody(t, r); !strings.Contains(body, `"secure":true`) {
+			t.Errorf("create body = %s, want secure=true", body)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"sandboxID":"sbx-unsecured","templateID":"base","domain":null}`))
+	}))
+	defer server.Close()
+	client := newTestClient(t, server.URL, time.Second, server.Client())
+
+	sandbox, credential, err := client.Create(context.Background(), "base", time.Minute, CreateOptions{})
+	if err == nil || !strings.Contains(err.Error(), "missing envdAccessToken") {
+		t.Fatalf("Create = %+v, %v, %v; want missing-token error", sandbox, credential, err)
 	}
 }
 

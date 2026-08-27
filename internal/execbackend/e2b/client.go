@@ -1,8 +1,7 @@
-// Package e2b implements the E2B control-plane REST client.
+// Package e2b implements E2B control-plane and envd data-plane clients.
 //
-// It deliberately does not implement execbackend.Backend: command execution
-// and file transfer use the sandbox envd protocol and remain outside this
-// package.
+// It deliberately does not implement execbackend.Backend or wire either client
+// into the daemon; provider lifecycle integration remains a separate slice.
 package e2b
 
 import (
@@ -25,6 +24,7 @@ import (
 
 const (
 	DefaultBaseURL               = "https://api.e2b.app"
+	DefaultSandboxDomain         = "e2b.app"
 	DefaultRequestTimeout        = 15 * time.Second
 	maxProviderResponseBodyBytes = 1 << 20
 	minAPIKeyLength              = 8
@@ -129,7 +129,17 @@ type Sandbox struct {
 	DiskSizeMB  int32             `json:"diskSizeMB,omitempty"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
 	State       string            `json:"state,omitempty"`
+	Domain      string            `json:"domain,omitempty"`
 }
+
+// EnvdCredential is a sandbox-scoped envd access credential. Its token is
+// deliberately inaccessible and every standard rendering is redacted.
+type EnvdCredential struct {
+	token string
+}
+
+func (EnvdCredential) String() string   { return "[REDACTED]" }
+func (EnvdCredential) GoString() string { return "[REDACTED]" }
 
 type listedSandbox struct {
 	ID          *string           `json:"sandboxID"`
@@ -298,35 +308,53 @@ type createPayload struct {
 	TemplateID string `json:"templateID"`
 	Timeout    int32  `json:"timeout"`
 	// Get cannot prove all-state absence, so TTL expiry must kill rather than pause.
-	AutoPause bool              `json:"autoPause"`
-	Metadata  map[string]string `json:"metadata,omitempty"`
-	Env       map[string]string `json:"envVars,omitempty"`
+	AutoPause bool `json:"autoPause"`
+	// Secure makes envd reject unauthenticated traffic. Create verifies the
+	// response token so a provider that ignores this request cannot look healthy.
+	Secure   bool              `json:"secure"`
+	Metadata map[string]string `json:"metadata,omitempty"`
+	Env      map[string]string `json:"envVars,omitempty"`
+}
+
+type createResponse struct {
+	Sandbox
+	EnvdAccessToken string  `json:"envdAccessToken"`
+	Domain          *string `json:"domain"`
 }
 
 // Create starts a sandbox with a required provider-side TTL.
-func (c *Client) Create(ctx context.Context, templateID string, ttl time.Duration, options CreateOptions) (Sandbox, error) {
+func (c *Client) Create(ctx context.Context, templateID string, ttl time.Duration, options CreateOptions) (Sandbox, EnvdCredential, error) {
 	if strings.TrimSpace(templateID) == "" {
-		return Sandbox{}, errors.New("E2B template ID is required")
+		return Sandbox{}, EnvdCredential{}, errors.New("E2B template ID is required")
 	}
 	ttlSeconds, err := durationSeconds(ttl)
 	if err != nil {
-		return Sandbox{}, fmt.Errorf("E2B create TTL: %w", err)
+		return Sandbox{}, EnvdCredential{}, fmt.Errorf("E2B create TTL: %w", err)
 	}
-	var sandbox Sandbox
+	var response createResponse
 	_, err = c.doJSON(ctx, http.MethodPost, "/sandboxes", createPayload{
 		TemplateID: templateID,
 		Timeout:    ttlSeconds,
 		AutoPause:  false,
+		Secure:     true,
 		Metadata:   options.Metadata,
 		Env:        options.Env,
-	}, http.StatusCreated, &sandbox)
+	}, http.StatusCreated, &response)
 	if err != nil {
-		return Sandbox{}, err
+		return Sandbox{}, EnvdCredential{}, err
 	}
-	if strings.TrimSpace(sandbox.ID) == "" {
-		return Sandbox{}, c.errorf(nil, "create sandbox: malformed response: missing sandboxID")
+	if strings.TrimSpace(response.ID) == "" {
+		return Sandbox{}, EnvdCredential{}, c.errorf(nil, "create sandbox: malformed response: missing sandboxID")
 	}
-	return sandbox, nil
+	if strings.TrimSpace(response.EnvdAccessToken) == "" {
+		return Sandbox{}, EnvdCredential{}, c.errorf(nil, "create sandbox: secure response is missing envdAccessToken")
+	}
+	domain := DefaultSandboxDomain
+	if response.Domain != nil && strings.TrimSpace(*response.Domain) != "" {
+		domain = strings.TrimSpace(*response.Domain)
+	}
+	response.Sandbox.Domain = domain
+	return response.Sandbox, EnvdCredential{token: response.EnvdAccessToken}, nil
 }
 
 // List returns all sandboxes in the provider response.
