@@ -346,6 +346,24 @@ func TestClientRequiresAuthoritativeInventory(t *testing.T) {
 			wantObservation: Gone,
 		},
 		{
+			name:               "full headerless terminal page is inconclusive",
+			contentType:        "application/json",
+			setContentType:     true,
+			inventory:          listedSandboxPage(listSandboxesPageSize),
+			wantListError:      true,
+			wantObservation:    Unknown,
+			wantObservationErr: true,
+		},
+		{
+			name:               "invalid sandbox state is unverified",
+			contentType:        "application/json",
+			setContentType:     true,
+			inventory:          listedSandboxArrayWith("destroyed", true, "sbx-invalid-state"),
+			wantListError:      true,
+			wantObservation:    Unknown,
+			wantObservationErr: true,
+		},
+		{
 			name:               "missing content type is unverified",
 			totalRunning:       "0",
 			inventory:          `[]`,
@@ -765,6 +783,14 @@ func readBody(t *testing.T, r *http.Request) string {
 
 func listedSandboxArray(ids ...string) string {
 	return listedSandboxArrayWith("running", true, ids...)
+}
+
+func listedSandboxPage(count int) string {
+	ids := make([]string, count)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("sbx-page-%03d", i)
+	}
+	return listedSandboxArray(ids...)
 }
 
 func listedSandboxArrayWith(state string, includeClientID bool, ids ...string) string {

@@ -212,6 +212,9 @@ func (a *inventoryAuthority) acceptPage(headers http.Header, page sandboxPage, c
 	if terminal && a.runningObserved && newCount < a.runningLowerBound {
 		return nil, fmt.Errorf("collected %d sandboxes, fewer than X-Total-Running lower bound %d", newCount, a.runningLowerBound)
 	}
+	if terminal && len(page.items) == listSandboxesPageSize {
+		return nil, fmt.Errorf("terminal page contains the full %d-item limit without a continuation token", listSandboxesPageSize)
+	}
 	return sandboxes, nil
 }
 
@@ -238,6 +241,9 @@ func (s listedSandbox) sandbox() (Sandbox, error) {
 	}
 	if strings.TrimSpace(*s.ID) == "" {
 		return Sandbox{}, errors.New("missing sandboxID")
+	}
+	if *s.State != "running" && *s.State != "paused" {
+		return Sandbox{}, fmt.Errorf("invalid SandboxState %q", *s.State)
 	}
 	return Sandbox{
 		ID:          *s.ID,
@@ -349,8 +355,9 @@ func (c *Client) List(ctx context.Context) ([]Sandbox, error) {
 		// reaper. For unfiltered responses X-Total-Running is optional and counts
 		// only running sandboxes, so it is a lower bound, never an inventory total.
 		// A present bound still catches the known dropped-next-token truncation.
-		// If a proxy drops both headers there is no stronger API signal; accepting
-		// pagination termination preserves conforming empty and paused inventories.
+		// Without that header, only a terminal page shorter than the requested
+		// limit proves completion. A full terminal page may have lost its next
+		// token, so it must remain inconclusive rather than authorize Gone.
 		accepted, err := authority.acceptPage(headers, page, len(sandboxes), terminal)
 		if err != nil {
 			return nil, c.errorf(err, "list sandboxes: inventory is not authoritative")
