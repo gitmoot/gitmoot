@@ -174,6 +174,50 @@ func TestEnvdRefusesRedirectWithoutForwardingAccessToken(t *testing.T) {
 	}
 }
 
+func TestEnvdRejectsInvalidResolvedEndpoint(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		endpoint string
+	}{
+		{name: "unsupported scheme", endpoint: "ftp://envd.example"},
+		{name: "missing host", endpoint: "https:///envd"},
+		{name: "query", endpoint: "https://envd.example?credential=wrong"},
+		{name: "fragment", endpoint: "https://envd.example#fragment"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			envd, err := NewEnvd(Sandbox{ID: "sbx-1"}, EnvdCredential{token: testEnvdToken}, EnvdOptions{
+				EndpointResolver: func(string, int) string { return test.endpoint },
+			})
+			if err == nil || envd != nil || !strings.Contains(err.Error(), "absolute HTTP(S) URL without query or fragment") {
+				t.Fatalf("NewEnvd = %+v, %v; want invalid endpoint error", envd, err)
+			}
+		})
+	}
+}
+
+// The default resolver interpolates Sandbox.Domain, which Create takes straight
+// from the provider response with only TrimSpace applied, so a hostile domain is
+// reachable input rather than a hypothetical.
+func TestEnvdRejectsHostileSandboxDomainThroughDefaultResolver(t *testing.T) {
+	t.Parallel()
+
+	for _, domain := range []string{"e2b.app/path?leak=1", "e2b.app#frag", "e2b.app/?a=b"} {
+		t.Run(domain, func(t *testing.T) {
+			t.Parallel()
+
+			envd, err := NewEnvd(Sandbox{ID: "sbx-1", Domain: domain}, EnvdCredential{token: testEnvdToken}, EnvdOptions{})
+			if err == nil || envd != nil {
+				t.Fatalf("NewEnvd(domain=%q) = %+v, %v; want rejection", domain, envd, err)
+			}
+		})
+	}
+}
+
 func TestEnvdEndpointUsesSandboxIDAndDomainWithoutClientID(t *testing.T) {
 	t.Parallel()
 
