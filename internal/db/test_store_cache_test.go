@@ -85,6 +85,7 @@ func TestStoreOpenPolicy(t *testing.T) {
 		"TestTaskEventsMigrationAppliesToExistingDatabase":        true,
 		"TestWorkflowMetaTextMigrations":                          true,
 	}
+	realPathTests["TestMigrateExecBackendAttemptsLifecycleGenerationNotNullPreservesRows"] = true
 	directOpenFunctions := map[string]bool{
 		"ensureCachedMigratedTestTemplateOnce": true,
 		"openRealTestStore":                    true,
