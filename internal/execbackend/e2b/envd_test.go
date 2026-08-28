@@ -148,6 +148,32 @@ func TestEnvdRejectsMissingCredentialBeforeRequest(t *testing.T) {
 	}
 }
 
+func TestEnvdRefusesRedirectWithoutForwardingAccessToken(t *testing.T) {
+	t.Parallel()
+
+	var destinationCalls atomic.Int32
+	destination := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		destinationCalls.Add(1)
+		if got := r.Header.Get("X-Access-Token"); got != "" {
+			t.Errorf("redirect forwarded envd access token %q", got)
+		}
+	}))
+	defer destination.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Redirect(w, &http.Request{}, destination.URL, http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+	envd := newTestEnvd(t, source, EnvdCredential{token: testEnvdToken})
+
+	err := envd.Upload(context.Background(), "/home/user/input", strings.NewReader("payload"))
+	if err == nil {
+		t.Fatal("Upload succeeded; redirect must fail")
+	}
+	if got := destinationCalls.Load(); got != 0 {
+		t.Fatalf("redirect destination calls = %d, want 0", got)
+	}
+}
+
 func TestEnvdEndpointUsesSandboxIDAndDomainWithoutClientID(t *testing.T) {
 	t.Parallel()
 
