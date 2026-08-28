@@ -239,6 +239,37 @@ func (s *Store) ListExecBackendAttemptsWithoutSandboxID(ctx context.Context) ([]
 	return attempts, rows.Err()
 }
 
+// ListRecoverableExecBackendAttempts returns every active row for one provider.
+// Terminal rows make no claim that a sandbox remains live; if a provider later
+// reports one with only a terminal-row identity, recovery surfaces it as a
+// provider-only allocation rather than silently reviving terminal evidence.
+func (s *Store) ListRecoverableExecBackendAttempts(ctx context.Context, provider string) ([]ExecBackendAttempt, error) {
+	provider = strings.TrimSpace(provider)
+	if provider == "" {
+		return nil, errors.New("execution backend provider is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+execBackendAttemptColumns+`
+		FROM execbackend_attempts
+		WHERE provider = ? AND state NOT IN (?, ?, ?)
+		ORDER BY job_id, lifecycle_generation, attempt`,
+		provider, ExecBackendAttemptStateDestroyed, ExecBackendAttemptStateOrphaned,
+		ExecBackendAttemptStateFailed)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var attempts []ExecBackendAttempt
+	for rows.Next() {
+		attempt, err := scanExecBackendAttempt(rows)
+		if err != nil {
+			return nil, err
+		}
+		attempts = append(attempts, attempt)
+	}
+	return attempts, rows.Err()
+}
+
 func scanExecBackendAttempt(row interface{ Scan(...any) error }) (ExecBackendAttempt, error) {
 	var (
 		attempt      ExecBackendAttempt

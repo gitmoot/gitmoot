@@ -44,9 +44,43 @@ type Reaper interface {
 	Reap(context.Context) ([]string, error)
 }
 
-type JobScope struct {
+// ProviderInstance is the durable identity exposed by a provider inventory.
+// It intentionally omits credentials and data-plane details: recovery only
+// needs enough information to match one live allocation to its ledger row.
+type ProviderInstance struct {
+	ID                  string
 	JobID               string
+	Attempt             int
 	LifecycleGeneration int64
+	DaemonFencingToken  string
+	BootID              string
+}
+
+// ReapReport keeps the inventory that a reaper inspected beside the subset it
+// destroyed. InventoryObserved means the provider returned a valid inventory;
+// InventoryComplete additionally means its contract proves that inventory is
+// exhaustive. Recovery may always use positive observations, but may infer
+// absence only from a complete inventory.
+type ReapReport struct {
+	InventoryObserved bool
+	InventoryComplete bool
+	Inventory         []ProviderInstance
+	Destroyed         []string
+}
+
+// InventoryReaper is implemented by providers whose account observations can
+// be reconciled against the durable execution-attempt ledger.
+type InventoryReaper interface {
+	ReapInventory(context.Context) (ReapReport, error)
+}
+
+type JobScope struct {
+	JobID string
+	// Attempt is one provider allocation within a lifecycle generation. Zero is
+	// accepted as the legacy/default spelling of the first attempt.
+	Attempt             int
+	LifecycleGeneration int64
+	DaemonFencingToken  string
 	TTL                 time.Duration
 }
 

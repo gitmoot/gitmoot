@@ -864,6 +864,15 @@ printf '%s' '{"gitmoot_result":{"decision":"implemented","summary":"remote backe
 	if fmt.Sprint(deleted) != "[sandbox-1]" {
 		t.Fatalf("provider deletes = %v, want exactly [sandbox-1]", deleted)
 	}
+	attempt, err := store.GetExecBackendAttempt(ctx, db.ExecBackendAttemptKey{
+		JobID: job.ID, Attempt: 1, LifecycleGeneration: job.LifecycleGeneration,
+	})
+	if err != nil {
+		t.Fatalf("get remote execution ledger attempt: %v", err)
+	}
+	if attempt.State != db.ExecBackendAttemptStateDestroyed || attempt.SandboxID == nil || *attempt.SandboxID != "sandbox-1" {
+		t.Fatalf("remote execution ledger attempt = %+v, want destroyed sandbox-1", attempt)
+	}
 	if _, err := os.Stat(harness.workspace); !os.IsNotExist(err) {
 		t.Fatalf("sandbox workspace still exists after provider deletion: %v", err)
 	}
