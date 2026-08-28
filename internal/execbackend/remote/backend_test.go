@@ -32,6 +32,7 @@ func TestRemoteProvisionRequiresTTLAndRecordsOwnership(t *testing.T) {
 	harness := newProviderHarness(t)
 	backend := harness.backend(t)
 	backend.bootID = "boot-test"
+	backend.pidNamespace = "pid:[test]"
 	backend.ownerPID = 1234
 	backend.ownerStart = "5678"
 
@@ -54,18 +55,27 @@ func TestRemoteProvisionRequiresTTLAndRecordsOwnership(t *testing.T) {
 		t.Fatalf("instance = %+v", instance)
 	}
 	request := harness.lastCreate()
-	if request.Timeout != 90 || request.Metadata[metadataJobID] != "job-1" || request.Metadata[metadataLifecycleGeneration] != "9" || request.Metadata[metadataBootID] != "boot-test" || request.Metadata[metadataOwnerPID] != "1234" || request.Metadata[metadataOwnerStartTime] != "5678" {
+	if request.Timeout != 90 || request.Metadata[metadataJobID] != "job-1" || request.Metadata[metadataLifecycleGeneration] != "9" || request.Metadata[metadataBootID] != "boot-test" || request.Metadata[metadataOwnerPID] != "1234" || request.Metadata[metadataOwnerPIDNamespace] != "pid:[test]" || request.Metadata[metadataOwnerStartTime] != "5678" {
 		t.Fatalf("create request = %+v", request)
 	}
 }
 
-func TestRemoteExecRefusesRelativeDirAndDoesNotForwardOnStart(t *testing.T) {
+func TestRemoteExecRefusesEscapingDirAndDoesNotForwardOnStart(t *testing.T) {
 	harness := newProviderHarness(t)
 	backend := harness.backend(t)
 	instance := provisionAndSync(t, backend, testSourceRepo(t))
 
-	if stream, err := backend.Exec(context.Background(), instance, execbackend.Command{Name: "true", Dir: "relative"}); err == nil || stream != nil {
-		t.Fatalf("relative Exec = %+v, %v; want refusal", stream, err)
+	for name, dir := range map[string]string{
+		"empty":     "",
+		"relative":  "relative",
+		"sibling":   workspacePath + "-sibling",
+		"traversal": workspacePath + "/../outside",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if stream, err := backend.Exec(context.Background(), instance, execbackend.Command{Name: "true", Dir: dir}); err == nil || stream != nil {
+				t.Fatalf("Exec Dir %q = %+v, %v; want refusal", dir, stream, err)
+			}
+		})
 	}
 	started := false
 	stream, err := backend.Exec(context.Background(), instance, execbackend.Command{
@@ -104,21 +114,50 @@ func TestRemoteDestroyIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestRemoteReapLeavesForeignBootSandboxAlone(t *testing.T) {
+func TestRemoteReapScopesOwnerLivenessToPIDNamespace(t *testing.T) {
 	harness := newProviderHarness(t)
+	reaper := harness.backend(t)
+	if reaper.bootID == "" || reaper.pidNamespace == "" || reaper.ownerStart == "" {
+		t.Fatalf("owner identity is incomplete: boot=%q namespace=%q start=%q", reaper.bootID, reaper.pidNamespace, reaper.ownerStart)
+	}
+
+	const foreignPID = 2147483646
+	foreignOwner := harness.backend(t)
+	foreignOwner.bootID = reaper.bootID
+	foreignOwner.pidNamespace = "pid:[foreign-container]"
+	foreignOwner.ownerPID = foreignPID
+	foreignOwner.ownerStart = "foreign-start"
+	if _, err := foreignOwner.Provision(context.Background(), execbackend.JobScope{JobID: "foreign-live", TTL: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	foreignMetadata := harness.lastCreate().Metadata
+
+	realOwnerAlive := reaper.ownerAlive
+	reaper.ownerAlive = func(pid int, bootID, startTime string) bool {
+		if pid == foreignPID {
+			// This models a live PID that is invisible from the reaper's namespace.
+			return false
+		}
+		return realOwnerAlive(pid, bootID, startTime)
+	}
+	ownerPID := fmt.Sprintf("%d", reaper.ownerPID)
 	harness.setInventory([]e2b.Sandbox{
-		{ID: "foreign", TemplateID: "template-test", State: "running", Metadata: map[string]string{
-			metadataBootID: "boot-foreign", metadataOwnerPID: "999999", metadataOwnerStartTime: "1",
+		{ID: "foreign-boot", TemplateID: "template-test", State: "running", Metadata: map[string]string{
+			metadataBootID: "boot-foreign", metadataOwnerPIDNamespace: reaper.pidNamespace, metadataOwnerPID: "2147483647", metadataOwnerStartTime: "1",
+		}},
+		{ID: "foreign-namespace-live", TemplateID: "template-test", State: "running", Metadata: foreignMetadata},
+		{ID: "missing-namespace", TemplateID: "template-test", State: "paused", Metadata: map[string]string{
+			metadataBootID: reaper.bootID, metadataOwnerPID: "2147483647", metadataOwnerStartTime: "1",
+		}},
+		{ID: "live-local", TemplateID: "template-test", State: "running", Metadata: map[string]string{
+			metadataBootID: reaper.bootID, metadataOwnerPIDNamespace: reaper.pidNamespace, metadataOwnerPID: ownerPID, metadataOwnerStartTime: reaper.ownerStart,
 		}},
 		{ID: "stale-local", TemplateID: "template-test", State: "paused", Metadata: map[string]string{
-			metadataBootID: "boot-local", metadataOwnerPID: "999998", metadataOwnerStartTime: "2",
+			metadataBootID: reaper.bootID, metadataOwnerPIDNamespace: reaper.pidNamespace, metadataOwnerPID: "2147483647", metadataOwnerStartTime: "2",
 		}},
 	})
-	backend := harness.backend(t)
-	backend.bootID = "boot-local"
-	backend.ownerAlive = func(int, string, string) bool { return false }
 
-	reaped, err := backend.Reap(context.Background())
+	reaped, err := reaper.Reap(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,11 +165,11 @@ func TestRemoteReapLeavesForeignBootSandboxAlone(t *testing.T) {
 		t.Fatalf("reaped = %v", reaped)
 	}
 	if got := harness.deletedIDs(); !reflect.DeepEqual(got, []string{"stale-local"}) {
-		t.Fatalf("deleted sandboxes = %v; foreign boot must remain", got)
+		t.Fatalf("deleted sandboxes = %v; foreign scope and live owner must remain", got)
 	}
 }
 
-func TestRemoteCollectMatchesLocalCollect(t *testing.T) {
+func TestRemoteCollectMaterializesSameTreeAsLocalCollect(t *testing.T) {
 	ctx := context.Background()
 	source := testSourceRepo(t)
 	harness := newProviderHarness(t)
@@ -159,10 +198,10 @@ func TestRemoteCollectMatchesLocalCollect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("remote Collect: %v", err)
 	}
-	if !reflect.DeepEqual(remoteChanges, localChanges) {
-		localJSON, _ := json.MarshalIndent(localChanges, "", "  ")
-		remoteJSON, _ := json.MarshalIndent(remoteChanges, "", "  ")
-		t.Fatalf("ChangeSet mismatch\nlocal:\n%s\nremote:\n%s", localJSON, remoteJSON)
+	localTree := materializedTree(t, source, localChanges)
+	remoteTree := materializedTree(t, source, remoteChanges)
+	if !reflect.DeepEqual(remoteTree, localTree) {
+		t.Fatalf("materialized tree mismatch\nlocal: %#v\nremote: %#v", localTree, remoteTree)
 	}
 }
 
@@ -217,11 +256,64 @@ func applyCollectionCorpus(t *testing.T, root string) {
 		t.Fatal(err)
 	}
 	testWriteFile(t, root, "nested/untracked.bin", []byte{'n', 'e', 'w', 0, 0xff, '\n'}, 0o644)
+	testWriteFile(t, root, "staged-new.txt", []byte("staged by agent\n"), 0o644)
+	testGit(t, root, "add", "staged-new.txt")
 	if err := os.Symlink("untracked.bin", filepath.Join(root, "nested", "untracked-link")); err != nil {
 		t.Fatal(err)
 	}
 	invalidName := "invalid-\xff-name.txt"
 	testWriteFile(t, root, invalidName, []byte("byte-exact\n"), 0o644)
+}
+
+type testTreeEntry struct {
+	Mode    os.FileMode
+	Content []byte
+	Target  string
+}
+
+func materializedTree(t *testing.T, source string, changes execbackend.ChangeSet) map[string]testTreeEntry {
+	t.Helper()
+	target := filepath.Join(t.TempDir(), "materialized")
+	testGit(t, filepath.Dir(target), "clone", "-q", "--no-hardlinks", source, target)
+	if err := execbackend.ImportChangeSet(context.Background(), target, changes); err != nil {
+		t.Fatalf("materialize ChangeSet: %v", err)
+	}
+
+	tree := make(map[string]testTreeEntry)
+	err := filepath.WalkDir(target, func(filePath string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(target, filePath)
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if relative == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		item := testTreeEntry{Mode: info.Mode() & (os.ModeType | os.ModePerm)}
+		if info.Mode()&os.ModeSymlink != 0 {
+			item.Target, err = os.Readlink(filePath)
+		} else {
+			item.Content, err = os.ReadFile(filePath)
+		}
+		if err != nil {
+			return err
+		}
+		tree[filepath.ToSlash(relative)] = item
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("snapshot materialized tree: %v", err)
+	}
+	return tree
 }
 
 func testWriteFile(t *testing.T, root, name string, data []byte, mode os.FileMode) {

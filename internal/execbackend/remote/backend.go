@@ -30,6 +30,7 @@ const (
 	metadataLifecycleGeneration = "lifecycle_generation"
 	metadataBootID              = "boot_id"
 	metadataOwnerPID            = "owner_pid"
+	metadataOwnerPIDNamespace   = "owner_pid_namespace"
 	metadataOwnerStartTime      = "owner_start_time"
 )
 
@@ -67,10 +68,11 @@ type Backend struct {
 	templateID string
 	envd       e2b.EnvdOptions
 
-	bootID     string
-	ownerPID   int
-	ownerStart string
-	ownerAlive func(pid int, bootID, startTime string) bool
+	bootID       string
+	pidNamespace string
+	ownerPID     int
+	ownerStart   string
+	ownerAlive   func(pid int, bootID, startTime string) bool
 
 	mu        sync.Mutex
 	sandboxes map[string]*sandboxState
@@ -102,14 +104,15 @@ func NewBackend(client *e2b.Client, options Options) (*Backend, error) {
 	}
 	pid := os.Getpid()
 	return &Backend{
-		client:     client,
-		templateID: templateID,
-		envd:       options.Envd,
-		bootID:     hostBootID(),
-		ownerPID:   pid,
-		ownerStart: processStartTime(pid),
-		ownerAlive: processOwnerAlive,
-		sandboxes:  make(map[string]*sandboxState),
+		client:       client,
+		templateID:   templateID,
+		envd:         options.Envd,
+		bootID:       hostBootID(),
+		pidNamespace: processPIDNamespace(),
+		ownerPID:     pid,
+		ownerStart:   processStartTime(pid),
+		ownerAlive:   processOwnerAlive,
+		sandboxes:    make(map[string]*sandboxState),
 	}, nil
 }
 
@@ -131,6 +134,7 @@ func (b *Backend) Provision(ctx context.Context, scope execbackend.JobScope) (*e
 		metadataLifecycleGeneration: strconv.FormatInt(scope.LifecycleGeneration, 10),
 		metadataBootID:              b.bootID,
 		metadataOwnerPID:            strconv.Itoa(b.ownerPID),
+		metadataOwnerPIDNamespace:   b.pidNamespace,
 		metadataOwnerStartTime:      b.ownerStart,
 	}
 	sandbox, credential, err := b.client.Create(ctx, b.templateID, scope.TTL, e2b.CreateOptions{Metadata: metadata})
@@ -356,9 +360,10 @@ func (b *Backend) Destroy(ctx context.Context, instance *execbackend.Instance) e
 	return nil
 }
 
-// Reap is account-global, unlike LocalBackend.Reap's filesystem-root scope. It
-// must require this host's boot_id before checking owner liveness; otherwise one
-// daemon can delete another host's live sandboxes from the shared E2B account.
+// Reap is account-global, unlike LocalBackend.Reap's filesystem-root scope.
+// boot_id separates machines, but is shared by every PID namespace on one
+// kernel. Require both identities before interpreting PID/start-time liveness,
+// so one container cannot reap another container's live sandbox.
 func (b *Backend) Reap(ctx context.Context) ([]string, error) {
 	if b == nil {
 		return nil, errors.New("remote execution backend is nil")
@@ -372,6 +377,10 @@ func (b *Backend) Reap(ctx context.Context) ([]string, error) {
 	for _, sandbox := range sandboxes {
 		metadata := sandbox.Metadata
 		if strings.TrimSpace(metadata[metadataBootID]) == "" || strings.TrimSpace(metadata[metadataBootID]) != b.bootID {
+			continue
+		}
+		ownerPIDNamespace := strings.TrimSpace(metadata[metadataOwnerPIDNamespace])
+		if ownerPIDNamespace == "" || b.pidNamespace == "" || ownerPIDNamespace != b.pidNamespace {
 			continue
 		}
 		pid, parseErr := strconv.Atoi(strings.TrimSpace(metadata[metadataOwnerPID]))
@@ -534,6 +543,14 @@ func hostBootID() string {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
+}
+
+func processPIDNamespace() string {
+	identity, err := os.Readlink("/proc/self/ns/pid")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(identity)
 }
 
 func processStartTime(pid int) string {
