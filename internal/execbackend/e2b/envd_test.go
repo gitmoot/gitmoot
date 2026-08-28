@@ -5,13 +5,22 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 )
 
 const testEnvdToken = "envd-GITMOOT-IMPL-sandbox-secret"
@@ -96,8 +105,169 @@ func TestEnvdStartNonzeroExitUsesMeasuredEndEvent(t *testing.T) {
 	}
 	result, err := stream.Wait()
 	var exitErr *ExitError
-	if !errors.As(err, &exitErr) || exitErr.Code != 3 || exitErr.Status != "exit status 3" {
+	if !errors.As(err, &exitErr) || exitErr.Code != 3 || exitErr.Status != "exit status 3" || exitErr.ProviderError != "exit status 3" {
 		t.Fatalf("Wait = %+v, %v; want exit code 3", result, err)
+	}
+	if got := strings.Count(err.Error(), "exit status 3"); got != 1 {
+		t.Fatalf("Wait error = %q; provider status repeated %d times", err, got)
+	}
+}
+
+func TestEnvdEndEventSemantics(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		end               string
+		wantError         string
+		wantExitCode      int
+		wantStatus        string
+		wantProviderError string
+	}{
+		{
+			name: "omitted exitCode uses semantic zero",
+			end:  `{"exited":true,"status":"exit status 0"}`,
+		},
+		{
+			name:      "exited false invalidates result",
+			end:       `{"exited":false,"status":"still running"}`,
+			wantError: "did not confirm process termination",
+		},
+		{
+			name:      "provider error fails zero exit",
+			end:       `{"exited":true,"status":"exit status 0","error":"provider process failure"}`,
+			wantError: "provider process failure",
+		},
+		{
+			name:         "status describes nonzero exit",
+			end:          `{"exitCode":7,"exited":true,"status":"exit status 7"}`,
+			wantExitCode: 7,
+			wantStatus:   "exit status 7",
+		},
+		{
+			name:              "provider error augments distinct status",
+			end:               `{"exitCode":7,"exited":true,"status":"exit status 7","error":"provider process failure"}`,
+			wantExitCode:      7,
+			wantStatus:        "exit status 7",
+			wantProviderError: "provider process failure",
+		},
+		{
+			name:      "unknown provider field fails closed",
+			end:       `{"exited":true,"status":"exit status 0","futureField":true}`,
+			wantError: "unknown field",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			result, err := readTestEndEvent(t, test.end)
+			if test.wantExitCode != 0 {
+				var exitErr *ExitError
+				if !errors.As(err, &exitErr) || exitErr.Code != test.wantExitCode || exitErr.Status != test.wantStatus || exitErr.ProviderError != test.wantProviderError {
+					t.Fatalf("end event result = %+v, %v; want ExitError code=%d status=%q provider_error=%q", result, err, test.wantExitCode, test.wantStatus, test.wantProviderError)
+				}
+				return
+			}
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("end event result = %+v, %v; want error containing %q", result, err, test.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("end event result = %+v, %v; want success", result, err)
+			}
+		})
+	}
+}
+
+func TestEndEventFieldsHaveExplicitHandling(t *testing.T) {
+	t.Parallel()
+
+	_, testFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate envd test source")
+	}
+	path := filepath.Join(filepath.Dir(testFile), "envd.go")
+	fileSet := token.NewFileSet()
+	file, err := parser.ParseFile(fileSet, path, nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse envd.go: %v", err)
+	}
+
+	type contractField struct {
+		name   string
+		policy string
+	}
+	var fields []contractField
+	var handler *ast.FuncDecl
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch node := node.(type) {
+		case *ast.TypeSpec:
+			if node.Name.Name != "endEvent" {
+				return true
+			}
+			structure, ok := node.Type.(*ast.StructType)
+			if !ok {
+				t.Fatal("endEvent is not a struct")
+			}
+			for _, field := range structure.Fields.List {
+				policy := ""
+				if field.Tag != nil {
+					rawTag, err := strconv.Unquote(field.Tag.Value)
+					if err != nil {
+						t.Fatalf("parse endEvent field tag: %v", err)
+					}
+					policy = reflect.StructTag(rawTag).Get("envd")
+				}
+				for _, name := range field.Names {
+					fields = append(fields, contractField{name: name.Name, policy: policy})
+				}
+			}
+		case *ast.FuncDecl:
+			if node.Name.Name == "endEventError" {
+				handler = node
+			}
+		}
+		return true
+	})
+	if len(fields) == 0 || handler == nil {
+		t.Fatalf("endEvent contract discovery found %d fields and handler=%v", len(fields), handler != nil)
+	}
+
+	parameter := ""
+	for _, field := range handler.Type.Params.List {
+		typeName, ok := field.Type.(*ast.Ident)
+		if ok && typeName.Name == "endEvent" && len(field.Names) == 1 {
+			parameter = field.Names[0].Name
+			break
+		}
+	}
+	if parameter == "" {
+		t.Fatal("endEventError has no endEvent parameter")
+	}
+	handled := make(map[string]bool, len(fields))
+	ast.Inspect(handler.Body, func(node ast.Node) bool {
+		selector, ok := node.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		base, ok := selector.X.(*ast.Ident)
+		if ok && base.Name == parameter {
+			handled[selector.Sel.Name] = true
+		}
+		return true
+	})
+	for _, field := range fields {
+		if handled[field.name] {
+			continue
+		}
+		const ignoredPrefix = "ignored:"
+		if strings.HasPrefix(field.policy, ignoredPrefix) && strings.TrimSpace(strings.TrimPrefix(field.policy, ignoredPrefix)) != "" {
+			continue
+		}
+		t.Errorf("endEvent.%s is neither read by endEventError nor tagged envd:\"ignored: reason\"", field.name)
 	}
 }
 
@@ -317,6 +487,17 @@ func newTestEnvd(t *testing.T, server *httptest.Server, credential EnvdCredentia
 		t.Fatalf("NewEnvd: %v", err)
 	}
 	return envd
+}
+
+func readTestEndEvent(t *testing.T, event string) (execbackend.ExecResult, error) {
+	t.Helper()
+
+	var stream bytes.Buffer
+	writeConnectTestFrame(t, &stream, 0, `{"event":{"start":{"pid":42}}}`)
+	writeConnectTestFrame(t, &stream, 0, `{"event":{"end":`+event+`}}`)
+	writeConnectTestFrame(t, &stream, connectEndStreamFlag, `{}`)
+	envd := &Envd{credential: EnvdCredential{token: testEnvdToken}}
+	return envd.readStartStream(&stream, StartRequest{Name: "sh"})
 }
 
 func assertEnvdRequest(t *testing.T, request *http.Request, path, contentType string) {

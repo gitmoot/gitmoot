@@ -109,15 +109,25 @@ type StartRequest struct {
 
 // ExitError reports a provider-confirmed non-zero process exit.
 type ExitError struct {
-	Code   int
-	Status string
+	Code          int
+	Status        string
+	ProviderError string
 }
 
 func (e *ExitError) Error() string {
-	if strings.TrimSpace(e.Status) == "" {
+	detail := strings.TrimSpace(e.Status)
+	providerError := strings.TrimSpace(e.ProviderError)
+	if providerError != "" && providerError != detail {
+		if detail == "" {
+			detail = providerError
+		} else {
+			detail += ": " + providerError
+		}
+	}
+	if detail == "" {
 		return fmt.Sprintf("remote command exited with code %d", e.Code)
 	}
-	return fmt.Sprintf("remote command exited with code %d: %s", e.Code, e.Status)
+	return fmt.Sprintf("remote command exited with code %d: %s", e.Code, detail)
 }
 
 type streamResult struct {
@@ -285,8 +295,7 @@ func (e *Envd) readStartStream(reader io.Reader, request StartRequest) (execback
 	started := false
 	ended := false
 	terminal := false
-	var exitCode int
-	var exitStatus string
+	var processEnd endEvent
 
 	for {
 		flag, data, err := readConnectFrame(reader)
@@ -346,8 +355,7 @@ func (e *Envd) readStartStream(reader io.Reader, request StartRequest) (execback
 				return result, e.errorf(nil, "envd Start returned an invalid end event")
 			}
 			ended = true
-			exitCode = response.Event.End.ExitCode
-			exitStatus = response.Event.End.Status
+			processEnd = *response.Event.End
 		case response.Event.Keepalive != nil:
 			continue
 		default:
@@ -363,10 +371,27 @@ func (e *Envd) readStartStream(reader io.Reader, request StartRequest) (execback
 	if !ended {
 		return result, e.errorf(nil, "envd Start stream ended without a process result")
 	}
-	if exitCode != 0 {
-		return result, &ExitError{Code: exitCode, Status: exitStatus}
+	if err := e.endEventError(processEnd); err != nil {
+		return result, err
 	}
 	return result, nil
+}
+
+func (e *Envd) endEventError(event endEvent) error {
+	if !event.Exited {
+		return e.errorf(nil, "envd Start end event did not confirm process termination")
+	}
+	providerError := strings.TrimSpace(event.Error)
+	if providerError != "" {
+		if event.ExitCode == 0 {
+			return e.errorf(nil, "envd process failed: %s", providerError)
+		}
+		return &ExitError{Code: event.ExitCode, Status: event.Status, ProviderError: providerError}
+	}
+	if event.ExitCode != 0 {
+		return &ExitError{Code: event.ExitCode, Status: event.Status}
+	}
+	return nil
 }
 
 type startResponse struct {
@@ -387,11 +412,26 @@ type dataEvent struct {
 	Stderr []byte `json:"stderr"`
 }
 
+// Every field must be read by endEventError or carry an envd:"ignored: reason"
+// tag; TestEndEventFieldsHaveExplicitHandling derives that check from this type.
 type endEvent struct {
 	ExitCode int    `json:"exitCode"`
 	Exited   bool   `json:"exited"`
 	Status   string `json:"status"`
 	Error    string `json:"error"`
+}
+
+// UnmarshalJSON fails closed when envd adds a terminal field that this client
+// does not yet understand. TestEndEventFieldsHaveExplicitHandling separately
+// prevents a field added here from bypassing endEventError.
+func (e *endEvent) UnmarshalJSON(data []byte) error {
+	type wireEndEvent endEvent
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode((*wireEndEvent)(e)); err != nil {
+		return err
+	}
+	return requireJSONEOF(decoder)
 }
 
 type outputTail struct {
