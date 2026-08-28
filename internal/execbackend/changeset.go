@@ -902,6 +902,23 @@ func materializationOrder(entries []ChangeManifestEntry) []ChangeManifestEntry {
 	return ordered
 }
 
+// StageAt materialises baseHEAD in a throwaway worktree beside hostWorktree,
+// calls fn with its path, and removes it.
+func StageAt(ctx context.Context, hostWorktree, baseHEAD string, fn func(stage string) error) (retErr error) {
+	if fn == nil {
+		return errors.New("changeset staging callback is required")
+	}
+	stage, err := createStagingWorktree(ctx, hostWorktree, baseHEAD)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		cleanupErr := removeStagingWorktree(context.WithoutCancel(ctx), hostWorktree, stage)
+		retErr = errors.Join(retErr, cleanupErr)
+	}()
+	return fn(stage)
+}
+
 func createStagingWorktree(ctx context.Context, worktree, base string) (string, error) {
 	parent := filepath.Dir(filepath.Clean(worktree))
 	placeholder, err := os.MkdirTemp(parent, ".gitmoot-changeset-stage-")
