@@ -99,6 +99,17 @@ func execBackendDispatchAsk(t *testing.T, home string) string {
 	return output.JobID
 }
 
+// execBackendDispatchImplement enqueues the implement vehicle needed to reach
+// daemon backend construction without involving implementation preflight.
+func execBackendDispatchImplement(t *testing.T, store *db.Store) string {
+	t.Helper()
+	const jobID = "exec-backend-implement-probe"
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: jobID, Agent: "shell-asker", Action: "implement", Repo: "owner/repo", Branch: "exec-backend-probe",
+	})
+	return jobID
+}
+
 func execBackendRunOneTick(t *testing.T, home string, store *db.Store) {
 	t.Helper()
 	worker := executionBackendJobWorker(store, io.Discard, home)
@@ -321,7 +332,7 @@ func TestExecBackendResolvedNonLocalCannotRunLocallyDaemonE2E(t *testing.T) {
 	ctx := context.Background()
 	marker := filepath.Join(t.TempDir(), "must-not-run-resolved-remote-daemon")
 	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
-	jobID := execBackendDispatchAsk(t, home)
+	jobID := execBackendDispatchImplement(t, store)
 
 	previousResolver := daemonJobExecBackendFor
 	daemonJobExecBackendFor = func(jobWorker, string, bool) (execbackend.Backend, error) {
