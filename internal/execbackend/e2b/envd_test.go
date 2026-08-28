@@ -151,10 +151,21 @@ func TestEnvdEndEventSemantics(t *testing.T) {
 			wantStatus:        "exit status 7",
 			wantProviderError: "provider process failure",
 		},
+		// AXIS CHANGE, deliberate (jarvis ruling, 2026-08-28). The removed case
+		// pinned "an end event carrying a field this client does not model is
+		// REJECTED". That axis is gone on purpose: its subject was the PROVIDER,
+		// it could only fire at runtime, and no fixture of ours could ever turn it
+		// red — so it was a permanently-green check that would first speak by
+		// taking every successful exec down on someone else's release. The
+		// replacement axis is "such a field is ACCEPTED, RECORDED and SURFACED,
+		// and never changes the result", pinned here and in
+		// TestEnvdSurfacesUnknownEndEventFields. The "our struct gained an
+		// unhandled field" axis is unaffected and still covered by
+		// TestEndEventFieldsHaveExplicitHandling, whose subject is our own code
+		// and which fires in CI.
 		{
-			name:      "unknown provider field fails closed",
-			end:       `{"exited":true,"status":"exit status 0","futureField":true}`,
-			wantError: "unknown field",
+			name: "unknown provider field is accepted and does not affect success",
+			end:  `{"exited":true,"status":"exit status 0","futureField":true}`,
 		},
 	}
 	for _, test := range tests {
@@ -517,5 +528,47 @@ func writeConnectTestFrame(t *testing.T, writer io.Writer, flag byte, body strin
 	t.Helper()
 	if _, err := writer.Write(connectFrame(flag, []byte(body))); err != nil {
 		t.Errorf("write Connect frame: %v", err)
+	}
+}
+
+// Frames captured VERBATIM from a live E2B sandbox on 2026-08-28. These are real
+// provider bytes, not fixtures we authored, and they are the only evidence in the
+// tree of what envd actually sends.
+func TestEnvdRealCapturedEndFrames(t *testing.T) {
+	t.Parallel()
+
+	t.Run("zero exit", func(t *testing.T) {
+		t.Parallel()
+
+		if _, err := readTestEndEvent(t, `{"exited": true, "status": "exit status 0"}`); err != nil {
+			t.Fatalf("live zero-exit frame = %v; want success", err)
+		}
+	})
+	t.Run("nonzero exit dedupes identical status and error", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := readTestEndEvent(t, `{"error": "exit status 7", "exitCode": 7, "exited": true, "status": "exit status 7"}`)
+		var exitErr *ExitError
+		if !errors.As(err, &exitErr) {
+			t.Fatalf("live exit-7 frame = %v; want ExitError", err)
+		}
+		if got, want := exitErr.Error(), "remote command exited with code 7: exit status 7"; got != want {
+			t.Fatalf("ExitError.Error() = %q, want %q (the provider sends status and error identical; they must not be doubled)", got, want)
+		}
+	})
+}
+
+func TestEnvdSurfacesUnknownEndEventFields(t *testing.T) {
+	t.Parallel()
+
+	var event endEvent
+	if err := json.Unmarshal([]byte(`{"exited":true,"status":"exit status 0","futureField":true,"another":1}`), &event); err != nil {
+		t.Fatalf("unknown fields must not fail the decode: %v", err)
+	}
+	if got, want := strings.Join(event.UnknownFields, ","), "another,futureField"; got != want {
+		t.Fatalf("UnknownFields = %q, want %q", got, want)
+	}
+	if err := (&Envd{}).endEventError(event); err != nil {
+		t.Fatalf("unknown fields must not change the result: %v", err)
 	}
 }

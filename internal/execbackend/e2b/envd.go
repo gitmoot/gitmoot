@@ -11,6 +11,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -33,15 +34,20 @@ type EnvdOptions struct {
 	HTTPClient       *http.Client
 	RequestTimeout   time.Duration
 	EndpointResolver func(sandboxID string, port int) string
+
+	// OnUnknownEndEventFields, when set, is called once per terminal event that
+	// carries keys this client does not model. It never affects the result.
+	OnUnknownEndEventFields func(fields []string)
 }
 
 // Envd calls one sandbox's authenticated envd endpoint.
 type Envd struct {
-	sandboxID       string
-	credential      EnvdCredential
-	httpClient      *http.Client
-	requestTimeout  time.Duration
-	resolveEndpoint func(string, int) string
+	sandboxID               string
+	credential              EnvdCredential
+	httpClient              *http.Client
+	requestTimeout          time.Duration
+	onUnknownEndEventFields func(fields []string)
+	resolveEndpoint         func(string, int) string
 }
 
 // NewEnvd constructs an authenticated envd client. A missing credential is a
@@ -88,6 +94,8 @@ func NewEnvd(sandbox Sandbox, credential EnvdCredential, options EnvdOptions) (*
 		httpClient:      &httpClientCopy,
 		requestTimeout:  timeout,
 		resolveEndpoint: resolver,
+
+		onUnknownEndEventFields: options.OnUnknownEndEventFields,
 	}
 	if _, err := envd.endpoint(""); err != nil {
 		return nil, err
@@ -356,6 +364,9 @@ func (e *Envd) readStartStream(reader io.Reader, request StartRequest) (execback
 			}
 			ended = true
 			processEnd = *response.Event.End
+			if len(processEnd.UnknownFields) > 0 && e.onUnknownEndEventFields != nil {
+				e.onUnknownEndEventFields(processEnd.UnknownFields)
+			}
 		case response.Event.Keepalive != nil:
 			continue
 		default:
@@ -419,19 +430,56 @@ type endEvent struct {
 	Exited   bool   `json:"exited"`
 	Status   string `json:"status"`
 	Error    string `json:"error"`
+
+	// Not a wire field: the provider keys this client does not model, recorded
+	// so a wire change is observable. Deliberately never consulted when
+	// deciding success — see UnmarshalJSON for why rejecting them is worse.
+	UnknownFields []string `json:"-" envd:"ignored: recorded for observability and surfaced via EnvdOptions.OnUnknownEndEventFields; never used to decide success"`
 }
 
-// UnmarshalJSON fails closed when envd adds a terminal field that this client
-// does not yet understand. TestEndEventFieldsHaveExplicitHandling separately
-// prevents a field added here from bypassing endEventError.
+// UnmarshalJSON ACCEPTS terminal fields this client does not model rather than
+// rejecting them. Additive fields are how wire protocols normally evolve, so
+// failing on one would turn every SUCCESSFUL exec into an outage on the
+// provider's release schedule — and no test of ours could ever go red first,
+// because our fixtures only ever carry fields we already know about. Unknown
+// keys are recorded and surfaced through EnvdOptions.OnUnknownEndEventFields so
+// a provider change is observable instead of silent.
+//
+// TestEndEventFieldsHaveExplicitHandling separately prevents a field added to
+// this struct from bypassing endEventError; that guard's subject is OUR struct
+// and it fires in CI, which is the difference that makes it worth having.
 func (e *endEvent) UnmarshalJSON(data []byte) error {
 	type wireEndEvent endEvent
 	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
 	if err := decoder.Decode((*wireEndEvent)(e)); err != nil {
 		return err
 	}
-	return requireJSONEOF(decoder)
+	if err := requireJSONEOF(decoder); err != nil {
+		return err
+	}
+	e.UnknownFields = unknownEndEventKeys(data)
+	return nil
+}
+
+// unknownEndEventKeys reports the object keys the endEvent struct does not
+// model, in a stable order. It never fails the decode.
+func unknownEndEventKeys(data []byte) []string {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil
+	}
+	known := map[string]struct{}{"exitCode": {}, "exited": {}, "status": {}, "error": {}}
+	unknown := make([]string, 0, len(raw))
+	for key := range raw {
+		if _, ok := known[key]; !ok {
+			unknown = append(unknown, key)
+		}
+	}
+	sort.Strings(unknown)
+	if len(unknown) == 0 {
+		return nil
+	}
+	return unknown
 }
 
 type outputTail struct {
