@@ -317,6 +317,29 @@ live-probe before close. The **OWNER holds merge authority**. Under ultracode,
 orchestrate via the Workflow tool with opus sub-agents (protect the scarcer fable
 quota).
 
+## Escalation: ping your org parent, and ping again
+
+When you need something from your **org parent** — a dispatch you cannot make, a
+ruling, an unblock — **ping them.** A workflow note is durable but it is *not a
+wake*: a coordinator sitting settled will not see one until something rouses it.
+
+- **Need something from your parent → ping**, and leave the durable note too. The
+  ping is the wake; the note is the record.
+- **No reply within well under an hour → ping again.** Do not wait politely.
+- **Only a delivery verdict of `submitted` proves delivery.** `written_to_pty` is
+  delivery-*unknown* — do not blind-retry (that stacks duplicates); verify at the
+  destination instead, by the recipient's status changing or by them acting.
+
+Routing is unchanged: a seat asks its coordinator and the coordinator carries it
+up. This is about being loud with your own parent, not about going around them.
+
+**Why this is a rule and not a preference:** *reporting a blocker feels like
+progress and is not.* A brief nobody dispatched is invisible to every channel
+that shows work — including to the person who has to dispatch it. The
+characteristic failure of an autonomous seat is ending a turn on the sentence
+naming an action instead of the action; "blocked on X" is that sentence, and
+pinging X is the action.
+
 ## PR & commit conventions
 
 - **Commits**: Conventional Commits — `feat:`, `fix:`, `docs:`, `chore:`, `ci:`,
