@@ -179,8 +179,9 @@ func (cfg RemoteExecConfig) ValidateE2BProvider() error {
 	return nil
 }
 
-// GITMOOT-IMPL: LoadE2BAPIKey reads the configured regular 0600 credential file. Callers
-// must keep the returned value in memory only and must never render it.
+// GITMOOT-IMPL: LoadE2BAPIKey follows secret-mount symlinks, then requires a
+// regular credential file with no group or other permissions. Callers must keep
+// the returned value in memory only and must never render it.
 func (cfg RemoteExecConfig) LoadE2BAPIKey() (string, error) {
 	path := strings.TrimSpace(cfg.E2BAPIKeyFile)
 	if path == "" {
@@ -189,15 +190,15 @@ func (cfg RemoteExecConfig) LoadE2BAPIKey() (string, error) {
 	if !filepath.IsAbs(path) {
 		return "", fmt.Errorf("[remote_exec].e2b_api_key_file must be an absolute path")
 	}
-	info, err := os.Lstat(path)
+	info, err := os.Stat(path)
 	if err != nil {
 		return "", fmt.Errorf("read [remote_exec].e2b_api_key_file %s: %w", path, err)
 	}
 	if !info.Mode().IsRegular() {
 		return "", fmt.Errorf("[remote_exec].e2b_api_key_file %s must be a regular file", path)
 	}
-	if mode := info.Mode().Perm(); mode != 0o600 {
-		return "", fmt.Errorf("[remote_exec].e2b_api_key_file %s has permissions %04o; want 0600", path, mode)
+	if mode := info.Mode().Perm(); mode&0o077 != 0 {
+		return "", fmt.Errorf("[remote_exec].e2b_api_key_file %s has permissions %04o; group and other permissions must be zero", path, mode)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {

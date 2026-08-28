@@ -66,6 +66,37 @@ func TestLoadRemoteExecConfigExplicitImplementedBackend(t *testing.T) {
 	}
 }
 
+func TestLoadE2BAPIKeyAcceptsSecureSecretDelivery(t *testing.T) {
+	const secret = "api-key-GITMOOT-IMPL"
+	dir := t.TempDir()
+	target := filepath.Join(dir, "e2b-api-key-target")
+	if err := os.WriteFile(target, []byte(secret+"\n"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "e2b-api-key")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{name: "owner read-only regular file", path: target},
+		{name: "symlinked secret mount", path: link},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := (RemoteExecConfig{E2BAPIKeyFile: tc.path}).LoadE2BAPIKey()
+			if err != nil {
+				t.Fatalf("LoadE2BAPIKey: %v", err)
+			}
+			if got != secret {
+				t.Fatalf("LoadE2BAPIKey = %q, want configured key", got)
+			}
+		})
+	}
+}
+
 func TestLoadRemoteExecConfigRejectsUnusableE2BCredentials(t *testing.T) {
 	const secret = "api-key-must-never-be-rendered-GITMOOT-IMPL"
 	writeKey := func(t *testing.T, mode os.FileMode, content string) string {
@@ -85,7 +116,7 @@ func TestLoadRemoteExecConfigRejectsUnusableE2BCredentials(t *testing.T) {
 		{name: "missing key setting", want: "e2b_api_key_file is required"},
 		{name: "relative key path", keyFile: func(*testing.T) string { return "relative.key" }, want: "must be an absolute path"},
 		{name: "missing key file", keyFile: func(t *testing.T) string { return filepath.Join(t.TempDir(), "missing") }, want: "no such file"},
-		{name: "permissive key mode", keyFile: func(t *testing.T) string { return writeKey(t, 0o644, secret) }, want: "want 0600"},
+		{name: "permissive key mode", keyFile: func(t *testing.T) string { return writeKey(t, 0o644, secret) }, want: "group and other permissions must be zero"},
 		{name: "empty key", keyFile: func(t *testing.T) string { return writeKey(t, 0o600, " \n") }, want: "is empty"},
 		{name: "multiline key", keyFile: func(t *testing.T) string { return writeKey(t, 0o600, secret+"\nsecond") }, want: "exactly one key"},
 		{name: "short key", keyFile: func(t *testing.T) string { return writeKey(t, 0o600, "short") }, want: "at least"},
