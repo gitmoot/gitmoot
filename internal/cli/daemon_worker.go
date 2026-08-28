@@ -201,20 +201,24 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 func executionBackendJobWorker(store *db.Store, stdout io.Writer, home string) jobWorker {
 	worker := defaultJobWorker(store, stdout, home)
 	worker.ExecutionBackendFactory = worker.defaultExecutionBackend
-	// GITMOOT-IMPL: construct the configured provider at daemon-worker startup so
-	// crash leftovers are reconciled even when no new job arrives to provision.
-	startupBackend := execbackend.Local
+	// GITMOOT-IMPL: always reconcile local crash leftovers, including the bounded
+	// set stranded by a switch to remote, then reconcile the configured provider.
+	// The attempts are independent so a local disk failure cannot suppress remote
+	// account reconciliation (or vice versa).
+	startupBackends := []execbackend.Backend{execbackend.Local}
 	if cfg, err := worker.executionBackendConfig(); err != nil {
 		writeLine(stdout, "execution backend startup config failed: %v", err)
 		return worker
 	} else if configured, err := execbackend.ParseImplemented(cfg.Backend); err != nil {
 		writeLine(stdout, "execution backend startup config failed: %v", err)
 		return worker
-	} else {
-		startupBackend = configured
+	} else if configured != execbackend.Local {
+		startupBackends = append(startupBackends, configured)
 	}
-	if _, err := worker.ExecutionBackendFactory(startupBackend); err != nil {
-		writeLine(stdout, "execution backend startup reap failed: %v", err)
+	for _, backend := range startupBackends {
+		if _, err := worker.ExecutionBackendFactory(backend); err != nil {
+			writeLine(stdout, "execution backend startup reap failed for %s: %v", backend, err)
+		}
 	}
 	return worker
 }

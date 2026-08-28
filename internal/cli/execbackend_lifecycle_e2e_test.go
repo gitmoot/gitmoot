@@ -281,6 +281,7 @@ type remoteLifecycleHarness struct {
 	creates        []remoteLifecycleCreateRequest
 	deleted        []string
 	listCalls      int
+	listStatus     int
 	upload         []byte
 	workspace      string
 	runtimeEnv     map[string]string
@@ -310,7 +311,12 @@ func (h *remoteLifecycleHarness) serveControl(w http.ResponseWriter, r *http.Req
 	case r.Method == http.MethodGet && r.URL.Path == "/v2/sandboxes":
 		h.mu.Lock()
 		h.listCalls++
+		status := h.listStatus
 		h.mu.Unlock()
+		if status != 0 {
+			http.Error(w, "list failed", status)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, "[]")
 	case r.Method == http.MethodPost && r.URL.Path == "/sandboxes":
@@ -632,7 +638,9 @@ func TestLocalExecutionBackendShellImplementRoundTripE2E(t *testing.T) {
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 	expectedSHA := filepath.Join(t.TempDir(), "backend.sha256")
 	backendPWD := filepath.Join(t.TempDir(), "backend.pwd")
-	script := `printf 'backend\000produced\377bytes\n' > artifact.bin
+	toolCacheEnvFile := filepath.Join(t.TempDir(), "tool-cache.env")
+	script := `env | grep -E '^(UV_CACHE_DIR|PIP_CACHE_DIR|npm_config_cache|GOCACHE|GOMODCACHE)=' > "$TOOL_CACHE_ENV_FILE"
+printf 'backend\000produced\377bytes\n' > artifact.bin
 sha256sum artifact.bin | cut -d ' ' -f 1 > "$EXPECTED_SHA"
 pwd > "$BACKEND_PWD"
 printf '%s' '{"gitmoot_result":{"decision":"implemented","summary":"backend bytes produced","findings":[],"changes_made":["created artifact.bin"],"tests_run":[],"needs":[],"delegations":[]}}'`
@@ -658,7 +666,7 @@ printf '%s' '{"gitmoot_result":{"decision":"implemented","summary":"backend byte
 		Repo: "owner/repo", Branch: branch, GoalID: "goal-local-backend", TaskID: "task-local-backend",
 		TaskTitle: "Local backend", WorktreePath: checkout, HeadSHA: baseHEAD,
 		ParentJobID: parent.ID, DelegationID: "local-roundtrip", DelegationDepth: 1, DelegatedBy: "local-coder", RootJobID: parent.ID,
-		ShellEnv: []string{"EXPECTED_SHA=" + expectedSHA, "BACKEND_PWD=" + backendPWD},
+		ShellEnv: []string{"EXPECTED_SHA=" + expectedSHA, "BACKEND_PWD=" + backendPWD, "TOOL_CACHE_ENV_FILE=" + toolCacheEnvFile},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -717,6 +725,15 @@ printf '%s' '{"gitmoot_result":{"decision":"implemented","summary":"backend byte
 	}
 	if status := strings.TrimSpace(runGitOutput(t, checkout, "status", "--porcelain")); status != "" {
 		t.Fatalf("host finalizer left a dirty tree: %q", status)
+	}
+	toolCacheEnv, err := os.ReadFile(toolCacheEnvFile)
+	if err != nil {
+		t.Fatalf("read local tool-cache environment: %v", err)
+	}
+	for _, name := range []string{"UV_CACHE_DIR", "PIP_CACHE_DIR", "npm_config_cache", "GOCACHE", "GOMODCACHE"} {
+		if !strings.Contains(string(toolCacheEnv), name+"=") {
+			t.Fatalf("local runtime did not receive %s; environment=%q", name, toolCacheEnv)
+		}
 	}
 }
 
@@ -867,11 +884,60 @@ func TestExecutionBackendJobWorkerReapsConfiguredRemoteAtStartup(t *testing.T) {
 	harness := newRemoteLifecycleHarness(t)
 	home, paths, store := heartbeatLoopE2EHome(t)
 	writeRemoteLifecycleConfig(t, paths, harness.control.URL)
+	staleLocalRoot := filepath.Join(paths.Home, "execbackends", string(execbackend.Local), "stale-local")
+	if err := os.MkdirAll(staleLocalRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staleLocalRoot, "instance.json"), []byte(`{"version":1,"id":"stale-local","job_id":"stale-local","owner_pid":0,"state":"running"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	_ = executionBackendJobWorker(store, io.Discard, home)
 	creates, deleted, listCalls, _, _ := harness.snapshot()
 	if listCalls != 1 || len(creates) != 0 || len(deleted) != 0 {
 		t.Fatalf("startup provider calls: list=%d create=%d delete=%d; want 1, 0, 0", listCalls, len(creates), len(deleted))
 	}
+	if _, err := os.Stat(staleLocalRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale local instance survived remote-configured startup: %v", err)
+	}
+}
+
+// GITMOOT-IMPL: a failed provider inventory must stay loud and retryable; a
+// daemon must not provision against an account it could not reconcile.
+func TestExecutionBackendJobWorkerReportsAndRetriesRemoteStartupReapFailure(t *testing.T) {
+	harness := newRemoteLifecycleHarness(t)
+	harness.listStatus = http.StatusServiceUnavailable
+	home, paths, store := heartbeatLoopE2EHome(t)
+	writeRemoteLifecycleConfig(t, paths, harness.control.URL)
+	var output bytes.Buffer
+	worker := executionBackendJobWorker(store, &output, home)
+	if !strings.Contains(output.String(), "execution backend startup reap failed for remote: reap remote execution backends") {
+		t.Fatalf("startup output = %q, want loud remote reap failure", output.String())
+	}
+	if _, err := worker.ExecutionBackendFactory(execbackend.Remote); err == nil || !strings.Contains(err.Error(), "reap remote execution backends") {
+		t.Fatalf("retry remote startup reap error = %v, want loud reconciliation failure", err)
+	}
+	_, _, listCalls, _, _ := harness.snapshot()
+	if listCalls != 2 {
+		t.Fatalf("remote reap list calls = %d, want 2 after sentinel-restored retry", listCalls)
+	}
+}
+
+// GITMOOT-IMPL: the remote-only job-type refusal must never reject ordinary
+// local work. A local ask reaches the shell runtime and succeeds.
+func TestLocalExecutionBackendAllowsNonImplement(t *testing.T) {
+	ctx := context.Background()
+	marker := filepath.Join(t.TempDir(), "local-ask-ran")
+	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
+	jobID := execBackendDispatchAsk(t, home)
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := defaultJobWorker(store, io.Discard, home)
+	if err := worker.run(ctx, job); err != nil {
+		t.Fatalf("worker.run: %v", err)
+	}
+	assertExecBackendLocalSucceeded(t, store, jobID, marker)
 }
 
 // GITMOOT-IMPL: non-implement work must fail before construction; otherwise a
