@@ -57,6 +57,9 @@ type jobWorker struct {
 	// real daemon jobs, where one lifecycle instance is acquired after runtime
 	// admission and kept alive through every Mailbox delivery attempt.
 	ExecutionBackendFactory func(execbackend.Backend) (execbackend.ExecutionBackend, error)
+	// GITMOOT-IMPL: RemoteEnvdEndpointResolver is an offline-test seam. Production leaves it
+	// nil and resolves envd from [remote_exec].e2b_domain or the provider response.
+	RemoteEnvdEndpointResolver func(sandboxID string, port int) string
 	// executionRunner is run-scoped state on jobWorker's value receiver. Cockpit
 	// adapter rebuilds reuse it so enabling live logs cannot escape the backend.
 	executionRunner subprocess.Runner
@@ -198,10 +201,24 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 func executionBackendJobWorker(store *db.Store, stdout io.Writer, home string) jobWorker {
 	worker := defaultJobWorker(store, stdout, home)
 	worker.ExecutionBackendFactory = worker.defaultExecutionBackend
-	// Construct the local provider at daemon-worker startup so crash leftovers
-	// are reconciled even when no new job is immediately available to provision.
-	if _, err := worker.ExecutionBackendFactory(execbackend.Local); err != nil {
-		writeLine(stdout, "execution backend startup reap failed: %v", err)
+	// GITMOOT-IMPL: always reconcile local crash leftovers, including the bounded
+	// set stranded by a switch to remote, then reconcile the configured provider.
+	// The attempts are independent so a local disk failure cannot suppress remote
+	// account reconciliation (or vice versa).
+	startupBackends := []execbackend.Backend{execbackend.Local}
+	if cfg, err := worker.executionBackendConfig(); err != nil {
+		writeLine(stdout, "execution backend startup config failed: %v", err)
+		return worker
+	} else if configured, err := execbackend.ParseImplemented(cfg.Backend); err != nil {
+		writeLine(stdout, "execution backend startup config failed: %v", err)
+		return worker
+	} else if configured != execbackend.Local {
+		startupBackends = append(startupBackends, configured)
+	}
+	for _, backend := range startupBackends {
+		if _, err := worker.ExecutionBackendFactory(backend); err != nil {
+			writeLine(stdout, "execution backend startup reap failed for %s: %v", backend, err)
+		}
 	}
 	return worker
 }
@@ -220,6 +237,14 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	jobExecBackend, jobExecBackendPresent := payload.ExecBackendOverride()
 	execBackend, err := daemonJobExecBackendFor(w, jobExecBackend, jobExecBackendPresent)
 	if err != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, "", err)
+		return nil
+	}
+	if execBackend != execbackend.Local && job.Type != "implement" {
+		err := fmt.Errorf("%s jobs are not supported on the %s execution backend; only implement jobs transport changes back to the host", job.Type, execBackend)
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
@@ -587,12 +612,14 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// MUST run after applyProduceRuntimeGrants: that call overwrites
 	// agent.WritablePaths for produce jobs, so appending earlier would be lost.
 	var toolCacheEnv []string
-	if cachePaths, cacheErr := w.configPaths(); cacheErr != nil {
-		writeLine(w.Stdout, "job %s tool cache config load failed: %v", job.ID, cacheErr)
-	} else if env, grantErr := applyIsolatedToolCacheGrants(cachePaths, payload, &agent); grantErr != nil {
-		writeLine(w.Stdout, "job %s tool cache grant failed: %v", job.ID, grantErr)
-	} else {
-		toolCacheEnv = env
+	if execBackend == execbackend.Local {
+		if cachePaths, cacheErr := w.configPaths(); cacheErr != nil {
+			writeLine(w.Stdout, "job %s tool cache config load failed: %v", job.ID, cacheErr)
+		} else if env, grantErr := applyIsolatedToolCacheGrants(cachePaths, payload, &agent); grantErr != nil {
+			writeLine(w.Stdout, "job %s tool cache grant failed: %v", job.ID, grantErr)
+		} else {
+			toolCacheEnv = env
+		}
 	}
 	// Acquire the execution-backend lifecycle only after checkout validation and
 	// runtime-session admission. The instance then survives every Mailbox repair
@@ -634,7 +661,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
 	}
-	if len(toolCacheEnv) > 0 {
+	if execBackend == execbackend.Local && len(toolCacheEnv) > 0 {
 		if envAdapter, envErr := injectDeliveryAdapterEnv(adapter, toolCacheEnv); envErr != nil {
 			writeLine(w.Stdout, "job %s tool cache env inject failed: %v", job.ID, envErr)
 		} else {
@@ -669,7 +696,18 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// when --cockpit is off (or herdr is unavailable) the adapter is unchanged and
 	// behavior is byte-identical to today. A policy load failure degrades to no
 	// cockpit rather than failing the job.
-	if payload.Cockpit {
+	cockpitRequested := payload.Cockpit
+	if cockpitRequested && execBackend != execbackend.Local {
+		cockpitRequested = false
+		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "cockpit_unavailable",
+			Message: fmt.Sprintf("cockpit requested but the %s execution backend has no host worktree pane; running without a pane", execBackend),
+		}); eventErr != nil {
+			writeLine(w.Stdout, "job %s cockpit_unavailable event failed: %v", job.ID, eventErr)
+		}
+	}
+	if cockpitRequested {
 		policy, policyErr := w.orchestratePolicy()
 		// A policy LOAD error is not the same as the user opting out (mode off): the
 		// user asked for a cockpit, so degrade to cockpit-unavailable (run unwrapped

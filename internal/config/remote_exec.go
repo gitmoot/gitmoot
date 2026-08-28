@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,7 +22,7 @@ import (
 // passthrough to the pre-#1536 runner composition.
 type RemoteExecConfig struct {
 	// Backend is the [remote_exec].backend selection. "local" is the default;
-	// "remote" is parseable while its provider factory remains a loud refusal.
+	// GITMOOT-IMPL: "remote" requires a validated E2B provider configuration.
 	Backend string
 	// LocalUID and LocalGID opt local-backend commands into an OS-level
 	// privilege drop. They are a pair: omitting both preserves the daemon
@@ -32,6 +33,12 @@ type RemoteExecConfig struct {
 	// configured identity can traverse (required when the Gitmoot home itself is
 	// below a root-only directory such as /root).
 	LocalRoot string
+	// GITMOOT-IMPL: E2BAPIKeyFile is read only while validating or constructing the remote
+	// provider. Secret bytes are deliberately never retained in this config.
+	E2BAPIKeyFile string
+	E2BTemplate   string
+	E2BBaseURL    string
+	E2BDomain     string
 }
 
 // DefaultRemoteExecConfig preserves today's behaviour: the local backend.
@@ -94,6 +101,22 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 				return RemoteExecConfig{}, fmt.Errorf("parse [remote_exec].local_root: %w", err)
 			}
 			cfg.LocalRoot = strings.TrimSpace(parsed)
+		case "e2b_api_key_file", "e2b_template", "e2b_base_url", "e2b_domain":
+			parsed, err := parseConfigString(value)
+			if err != nil {
+				return RemoteExecConfig{}, fmt.Errorf("parse [remote_exec].%s: %w", key, err)
+			}
+			parsed = strings.TrimSpace(parsed)
+			switch key {
+			case "e2b_api_key_file":
+				cfg.E2BAPIKeyFile = parsed
+			case "e2b_template":
+				cfg.E2BTemplate = parsed
+			case "e2b_base_url":
+				cfg.E2BBaseURL = parsed
+			case "e2b_domain":
+				cfg.E2BDomain = parsed
+			}
 		default:
 			// Ignore unknown keys so the section remains forward-compatible.
 		}
@@ -105,7 +128,8 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 }
 
 func validateRemoteExecConfig(cfg RemoteExecConfig) error {
-	if _, err := execbackend.ParseImplemented(cfg.Backend); err != nil {
+	backend, err := execbackend.ParseImplemented(cfg.Backend)
+	if err != nil {
 		return fmt.Errorf("unsupported [remote_exec].backend: %w", err)
 	}
 	if (cfg.LocalUID == nil) != (cfg.LocalGID == nil) {
@@ -124,6 +148,104 @@ func validateRemoteExecConfig(cfg RemoteExecConfig) error {
 	}
 	if cfg.LocalRoot != "" && filepath.Dir(filepath.Clean(cfg.LocalRoot)) == filepath.Clean(cfg.LocalRoot) {
 		return fmt.Errorf("[remote_exec].local_root must not be a filesystem root, got %q", cfg.LocalRoot)
+	}
+	if backend == execbackend.Remote {
+		if err := cfg.ValidateE2BProvider(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// GITMOOT-IMPL: ValidateE2BProvider preflights every value needed to construct the remote
+// provider. It performs no network calls and does not retain credential bytes.
+func (cfg RemoteExecConfig) ValidateE2BProvider() error {
+	apiKey, err := cfg.LoadE2BAPIKey()
+	if err != nil {
+		return err
+	}
+	if len(apiKey) < 8 {
+		return fmt.Errorf("[remote_exec].e2b_api_key_file must contain a key of at least 8 characters")
+	}
+	if strings.TrimSpace(cfg.E2BTemplate) == "" {
+		return fmt.Errorf("[remote_exec].e2b_template is required when backend=remote")
+	}
+	if err := validateE2BDomain(cfg.E2BDomain); err != nil {
+		return fmt.Errorf("invalid [remote_exec].e2b_domain: %w", err)
+	}
+	if err := validateE2BBaseURL(cfg.E2BBaseURL); err != nil {
+		return fmt.Errorf("invalid [remote_exec].e2b_base_url: %w", err)
+	}
+	return nil
+}
+
+// GITMOOT-IMPL: LoadE2BAPIKey follows secret-mount symlinks, then requires a
+// regular credential file with no group or other permissions. Callers must keep
+// the returned value in memory only and must never render it.
+func (cfg RemoteExecConfig) LoadE2BAPIKey() (string, error) {
+	path := strings.TrimSpace(cfg.E2BAPIKeyFile)
+	if path == "" {
+		return "", fmt.Errorf("[remote_exec].e2b_api_key_file is required when backend=remote")
+	}
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("[remote_exec].e2b_api_key_file must be an absolute path")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("read [remote_exec].e2b_api_key_file %s: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("[remote_exec].e2b_api_key_file %s must be a regular file", path)
+	}
+	if mode := info.Mode().Perm(); mode&0o077 != 0 {
+		return "", fmt.Errorf("[remote_exec].e2b_api_key_file %s has permissions %04o; group and other permissions must be zero", path, mode)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read [remote_exec].e2b_api_key_file %s: %w", path, err)
+	}
+	apiKey := strings.TrimSpace(string(data))
+	if apiKey == "" {
+		return "", fmt.Errorf("[remote_exec].e2b_api_key_file %s is empty", path)
+	}
+	if strings.ContainsAny(apiKey, "\r\n") {
+		return "", fmt.Errorf("[remote_exec].e2b_api_key_file %s must contain exactly one key", path)
+	}
+	return apiKey, nil
+}
+
+func validateE2BDomain(domain string) error {
+	domain = strings.TrimSpace(domain)
+	if domain == "" {
+		return nil
+	}
+	if len(domain) > 253 || strings.Trim(domain, ".") != domain {
+		return fmt.Errorf("must be a DNS name without a trailing dot")
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return fmt.Errorf("must be a DNS name")
+		}
+		for _, char := range label {
+			if char != '-' && (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') && (char < '0' || char > '9') {
+				return fmt.Errorf("must be an ASCII DNS name")
+			}
+		}
+	}
+	return nil
+}
+
+func validateE2BBaseURL(base string) error {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return nil
+	}
+	parsed, err := url.Parse(base)
+	if err != nil {
+		return err
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("must be an absolute HTTP(S) URL without query or fragment")
 	}
 	return nil
 }

@@ -99,6 +99,17 @@ func execBackendDispatchAsk(t *testing.T, home string) string {
 	return output.JobID
 }
 
+// execBackendDispatchImplement enqueues the implement vehicle needed to reach
+// daemon backend construction without involving implementation preflight.
+func execBackendDispatchImplement(t *testing.T, store *db.Store) string {
+	t.Helper()
+	const jobID = "exec-backend-implement-probe"
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: jobID, Agent: "shell-asker", Action: "implement", Repo: "owner/repo", Branch: "exec-backend-probe",
+	})
+	return jobID
+}
+
 func execBackendRunOneTick(t *testing.T, home string, store *db.Store) {
 	t.Helper()
 	worker := executionBackendJobWorker(store, io.Discard, home)
@@ -321,7 +332,7 @@ func TestExecBackendResolvedNonLocalCannotRunLocallyDaemonE2E(t *testing.T) {
 	ctx := context.Background()
 	marker := filepath.Join(t.TempDir(), "must-not-run-resolved-remote-daemon")
 	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
-	jobID := execBackendDispatchAsk(t, home)
+	jobID := execBackendDispatchImplement(t, store)
 
 	previousResolver := daemonJobExecBackendFor
 	daemonJobExecBackendFor = func(jobWorker, string, bool) (execbackend.Backend, error) {
@@ -835,9 +846,11 @@ func TestRemoteBackendRefusesEveryHostOnlyRoute(t *testing.T) {
 	}
 	agent := runtime.Agent{Runtime: runtime.ShellRuntime, ExecBackend: string(execbackend.Remote)}
 
-	t.Run("lifecycle provider is not configured", func(t *testing.T) {
-		if _, err := worker.defaultExecutionBackend(execbackend.Remote); err == nil || !strings.Contains(err.Error(), "not configured") {
-			t.Fatalf("remote lifecycle error = %v, want temporary not-configured refusal", err)
+	// GITMOOT-IMPL: Slice D converts only the configured lifecycle route; an
+	// unconfigured remote backend must still refuse before provider construction.
+	t.Run("lifecycle provider requires credential config", func(t *testing.T) {
+		if _, err := worker.defaultExecutionBackend(execbackend.Remote); err == nil || !strings.Contains(err.Error(), "e2b_api_key_file is required") {
+			t.Fatalf("remote lifecycle error = %v, want credential-config refusal", err)
 		}
 	})
 	t.Run("daemon primary delivery is an unprovisioned placeholder", func(t *testing.T) {
