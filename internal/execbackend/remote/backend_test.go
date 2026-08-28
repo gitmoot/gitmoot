@@ -167,6 +167,74 @@ func TestRemoteReapScopesOwnerLivenessToPIDNamespace(t *testing.T) {
 	if got := harness.deletedIDs(); !reflect.DeepEqual(got, []string{"stale-local"}) {
 		t.Fatalf("deleted sandboxes = %v; foreign scope and live owner must remain", got)
 	}
+
+	// GITMOOT-IMPL: kills R34, which makes two absent namespace identities
+	// compare equal and reopens cross-container reaping.
+	blindHarness := newProviderHarness(t)
+	blindHarness.setInventory([]e2b.Sandbox{{
+		ID: "legacy-no-ns", TemplateID: "template-test", State: "running", Metadata: map[string]string{
+			metadataBootID: "boot-blind", metadataOwnerPID: "2147483647", metadataOwnerStartTime: "1",
+		},
+	}})
+	blindReaper := blindHarness.backend(t)
+	blindReaper.bootID = "boot-blind"
+	blindReaper.pidNamespace = ""
+	blindReaper.ownerAlive = func(int, string, string) bool { return false }
+	reaped, err = blindReaper.Reap(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reaped) != 0 || len(blindHarness.deletedIDs()) != 0 {
+		t.Fatalf("blind reaper deleted namespace-less sandbox: reaped=%v deleted=%v", reaped, blindHarness.deletedIDs())
+	}
+}
+
+// GITMOOT-IMPL: kills MA, removal of git apply from syncWorkspaceScript.
+func TestRemoteSyncInAppliesHostChanges(t *testing.T) {
+	source := testSourceRepo(t)
+	harness := newProviderHarness(t)
+	provisionAndSync(t, harness.backend(t), source)
+
+	for name, want := range map[string]string{
+		"input.txt":           "host input change\n",
+		"input-untracked.txt": "host untracked input\n",
+	} {
+		data, err := os.ReadFile(filepath.Join(harness.workspace, name))
+		if err != nil {
+			t.Fatalf("read synced %s: %v", name, err)
+		}
+		if string(data) != want {
+			t.Fatalf("synced %s = %q, want %q", name, data, want)
+		}
+	}
+}
+
+// GITMOOT-IMPL: kills MG, removal of the sandbox-created commit guard.
+func TestRemoteCollectRefusesSandboxCreatedCommit(t *testing.T) {
+	harness := newProviderHarness(t)
+	backend := harness.backend(t)
+	instance := provisionAndSync(t, backend, testSourceRepo(t))
+	testWriteFile(t, harness.workspace, "committed-by-agent.txt", []byte("committed\n"), 0o644)
+	testGit(t, harness.workspace, "add", "committed-by-agent.txt")
+	testGit(t, harness.workspace, "commit", "-q", "-m", "agent commit")
+
+	changes, err := backend.Collect(context.Background(), instance)
+	if err == nil || !strings.Contains(err.Error(), "sandbox-created commits are forbidden") {
+		t.Fatalf("Collect after sandbox commit = %+v, %v; want refusal", changes, err)
+	}
+}
+
+// GITMOOT-IMPL: kills MH, removal of the remote patch-size check.
+func TestRemoteCollectRejectsOversizedPatch(t *testing.T) {
+	harness := newProviderHarness(t)
+	backend := harness.backend(t)
+	instance := provisionAndSync(t, backend, testSourceRepo(t))
+	testWriteFile(t, harness.workspace, "oversized.txt", bytes.Repeat([]byte("x"), execbackend.MaxChangeSetPatchBytes+1024), 0o644)
+
+	changes, err := backend.Collect(context.Background(), instance)
+	if err == nil || !strings.Contains(err.Error(), "remote execution patch is larger than limit") {
+		t.Fatalf("Collect oversized patch = %+v, %v; want size refusal", changes, err)
+	}
 }
 
 func TestRemoteCollectMaterializesSameTreeAsLocalCollect(t *testing.T) {
@@ -479,11 +547,16 @@ func (h *providerHarness) serveStart(w http.ResponseWriter, r *http.Request) {
 	stdout, stderr, exitCode, providerError := h.runProcess(r.Context(), request.Process.Command, request.Process.Args, request.Process.Dir, request.Process.Env)
 	w.Header().Set("Content-Type", "application/connect+json")
 	writeTestConnectJSON(h.t, w, 0, map[string]any{"event": map[string]any{"start": map[string]any{"pid": 42}}})
-	if len(stdout) > 0 {
-		writeTestConnectJSON(h.t, w, 0, map[string]any{"event": map[string]any{"data": map[string]any{"stdout": stdout}}})
+	const testDataFrameBytes = 1 << 20
+	for len(stdout) > 0 {
+		count := min(len(stdout), testDataFrameBytes)
+		writeTestConnectJSON(h.t, w, 0, map[string]any{"event": map[string]any{"data": map[string]any{"stdout": stdout[:count]}}})
+		stdout = stdout[count:]
 	}
-	if len(stderr) > 0 {
-		writeTestConnectJSON(h.t, w, 0, map[string]any{"event": map[string]any{"data": map[string]any{"stderr": stderr}}})
+	for len(stderr) > 0 {
+		count := min(len(stderr), testDataFrameBytes)
+		writeTestConnectJSON(h.t, w, 0, map[string]any{"event": map[string]any{"data": map[string]any{"stderr": stderr[:count]}}})
+		stderr = stderr[count:]
 	}
 	status := fmt.Sprintf("exit status %d", exitCode)
 	writeTestConnectJSON(h.t, w, 0, map[string]any{"event": map[string]any{"end": map[string]any{
@@ -520,7 +593,7 @@ func (h *providerHarness) runProcess(ctx context.Context, command string, args [
 		if err != nil {
 			return nil, nil, 1, err.Error()
 		}
-		if len(inputPatch) > 0 {
+		if len(inputPatch) > 0 && strings.Contains(syncWorkspaceScript, "git apply --binary --whitespace=nowarn /home/user/.gitmoot-sync/changes.patch") {
 			cmd := exec.CommandContext(ctx, "git", "-C", h.workspace, "apply", "--binary", "--whitespace=nowarn", "-")
 			cmd.Stdin = bytes.NewReader(inputPatch)
 			if output, err := cmd.CombinedOutput(); err != nil {

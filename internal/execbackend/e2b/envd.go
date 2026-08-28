@@ -443,6 +443,10 @@ type endEvent struct {
 	UnknownFields []string `json:"-" envd:"ignored: recorded for observability and surfaced via EnvdOptions.OnUnknownEndEventFields; never used to decide success"`
 }
 
+// GITMOOT-IMPL: wireEndEvent avoids recursively invoking endEvent.UnmarshalJSON when
+// encoding/json is used to derive the fields it can address.
+type wireEndEvent endEvent
+
 // UnmarshalJSON ACCEPTS terminal fields this client does not model rather than
 // rejecting them. Additive fields are how wire protocols normally evolve, so
 // failing on one would turn every SUCCESSFUL exec into an outage on the
@@ -455,7 +459,6 @@ type endEvent struct {
 // this struct from bypassing endEventError; that guard's subject is OUR struct
 // and it fires in CI, which is the difference that makes it worth having.
 func (e *endEvent) UnmarshalJSON(data []byte) error {
-	type wireEndEvent endEvent
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	if err := decoder.Decode((*wireEndEvent)(e)); err != nil {
 		return err
@@ -474,12 +477,12 @@ func unknownEndEventKeys(data []byte) []string {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil
 	}
-	known := jsonWireFieldNames(reflect.TypeOf(endEvent{}))
+	known := jsonWireFieldNames(reflect.TypeOf(wireEndEvent{}))
 	unknown := make([]string, 0, len(raw))
 	for key := range raw {
-		// encoding/json matches field names case-insensitively. A key that can
-		// drive the verdict is modeled and must not also be reported as unknown.
-		if _, ok := known[strings.ToLower(key)]; !ok {
+		// A key that can drive the verdict is modeled and must not also be
+		// reported as unknown.
+		if !jsonWireFieldNameKnown(known, key) {
 			unknown = append(unknown, key)
 		}
 	}
@@ -491,22 +494,82 @@ func unknownEndEventKeys(data []byte) []string {
 }
 
 func jsonWireFieldNames(structType reflect.Type) map[string]struct{} {
-	known := make(map[string]struct{}, structType.NumField())
-	for i := 0; i < structType.NumField(); i++ {
-		field := structType.Field(i)
-		if !field.IsExported() {
-			continue
+	for structType.Kind() == reflect.Pointer {
+		structType = structType.Elem()
+	}
+	if structType.Kind() != reflect.Struct {
+		return nil
+	}
+	candidates := make(map[string]struct{}, structType.NumField())
+	collectJSONWireFieldCandidates(structType, make(map[reflect.Type]bool), candidates)
+	known := make(map[string]struct{}, len(candidates))
+	for name := range candidates {
+		if encodingJSONAcceptsWireField(structType, name) {
+			known[name] = struct{}{}
 		}
-		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
-		if name == "-" {
-			continue
-		}
-		if name == "" {
-			name = field.Name
-		}
-		known[strings.ToLower(name)] = struct{}{}
 	}
 	return known
+}
+
+func collectJSONWireFieldCandidates(structType reflect.Type, visited map[reflect.Type]bool, candidates map[string]struct{}) {
+	for structType.Kind() == reflect.Pointer {
+		structType = structType.Elem()
+	}
+	if structType.Kind() != reflect.Struct || visited[structType] {
+		return
+	}
+	visited[structType] = true
+	for i := 0; i < structType.NumField(); i++ {
+		field := structType.Field(i)
+		fieldType := field.Type
+		for fieldType.Kind() == reflect.Pointer {
+			fieldType = fieldType.Elem()
+		}
+		if field.Anonymous {
+			if !field.IsExported() && fieldType.Kind() != reflect.Struct {
+				continue
+			}
+		} else if !field.IsExported() {
+			continue
+		}
+		tag := field.Tag.Get("json")
+		if tag == "-" {
+			continue
+		}
+		name, _, _ := strings.Cut(tag, ",")
+		candidates[field.Name] = struct{}{}
+		if name != "" {
+			candidates[name] = struct{}{}
+		}
+		if field.Anonymous && fieldType.Kind() == reflect.Struct {
+			collectJSONWireFieldCandidates(fieldType, visited, candidates)
+		}
+	}
+}
+
+// GITMOOT-IMPL: encoding/json exposes no field-selection metadata. Probe decoding delegates
+// embedded-field promotion, tags, and shadowing to the codec itself instead of
+// maintaining a second approximation of its dominance rules.
+func encodingJSONAcceptsWireField(structType reflect.Type, name string) bool {
+	data, err := json.Marshal(map[string]any{name: nil})
+	if err != nil {
+		return false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	err = decoder.Decode(reflect.New(structType).Interface())
+	return err == nil || !strings.HasPrefix(err.Error(), "json: unknown field ")
+}
+
+func jsonWireFieldNameKnown(known map[string]struct{}, name string) bool {
+	for candidate := range known {
+		// GITMOOT-IMPL: strings.EqualFold uses Unicode simple case folding, the same matching
+		// relation encoding/json documents for folded field names.
+		if strings.EqualFold(candidate, name) {
+			return true
+		}
+	}
+	return false
 }
 
 type outputTail struct {
