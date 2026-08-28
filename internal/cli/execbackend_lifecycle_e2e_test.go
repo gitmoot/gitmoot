@@ -632,6 +632,10 @@ func (f byteIdentityHostFinalizer) FinalizeImplementation(ctx context.Context, _
 func TestLocalExecutionBackendShellImplementRoundTripE2E(t *testing.T) {
 	ctx := context.Background()
 	home, _, store := heartbeatLoopE2EHome(t)
+	toolCachePolicy, err := config.LoadToolCache(config.PathsForHome(home))
+	if err != nil {
+		t.Fatalf("LoadToolCache: %v", err)
+	}
 	const branch = "gitmoot-delegation-parent-local-roundtrip"
 	checkout := createDaemonWorkerGitCheckout(t, branch)
 	baseHEAD := strings.TrimSpace(runGitOutput(t, checkout, "rev-parse", "HEAD"))
@@ -639,7 +643,7 @@ func TestLocalExecutionBackendShellImplementRoundTripE2E(t *testing.T) {
 	expectedSHA := filepath.Join(t.TempDir(), "backend.sha256")
 	backendPWD := filepath.Join(t.TempDir(), "backend.pwd")
 	toolCacheEnvFile := filepath.Join(t.TempDir(), "tool-cache.env")
-	script := `env | grep -E '^(UV_CACHE_DIR|PIP_CACHE_DIR|npm_config_cache|GOCACHE|GOMODCACHE)=' > "$TOOL_CACHE_ENV_FILE"
+	script := `printf 'UV_CACHE_DIR=%s\nPIP_CACHE_DIR=%s\nnpm_config_cache=%s\nGOCACHE=%s\nGOMODCACHE=%s\n' "$UV_CACHE_DIR" "$PIP_CACHE_DIR" "$npm_config_cache" "$GOCACHE" "$GOMODCACHE" > "$TOOL_CACHE_ENV_FILE"
 printf 'backend\000produced\377bytes\n' > artifact.bin
 sha256sum artifact.bin | cut -d ' ' -f 1 > "$EXPECTED_SHA"
 pwd > "$BACKEND_PWD"
@@ -730,9 +734,17 @@ printf '%s' '{"gitmoot_result":{"decision":"implemented","summary":"backend byte
 	if err != nil {
 		t.Fatalf("read local tool-cache environment: %v", err)
 	}
-	for _, name := range []string{"UV_CACHE_DIR", "PIP_CACHE_DIR", "npm_config_cache", "GOCACHE", "GOMODCACHE"} {
-		if !strings.Contains(string(toolCacheEnv), name+"=") {
-			t.Fatalf("local runtime did not receive %s; environment=%q", name, toolCacheEnv)
+	observedToolCacheEnv := make(map[string]string, len(toolCacheEnvSubdirs))
+	for _, line := range strings.Split(strings.TrimSpace(string(toolCacheEnv)), "\n") {
+		name, value, ok := strings.Cut(line, "=")
+		if ok {
+			observedToolCacheEnv[name] = value
+		}
+	}
+	for _, entry := range toolCacheEnvSubdirs {
+		want := filepath.Join(toolCachePolicy.Dir, entry.subdir)
+		if got := observedToolCacheEnv[entry.env]; got != want {
+			t.Fatalf("local runtime %s = %q, want isolated cache path %q; environment=%q", entry.env, got, want, toolCacheEnv)
 		}
 	}
 }
