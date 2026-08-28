@@ -379,8 +379,7 @@ func (b *Backend) Reap(ctx context.Context) ([]string, error) {
 		if strings.TrimSpace(metadata[metadataBootID]) == "" || strings.TrimSpace(metadata[metadataBootID]) != b.bootID {
 			continue
 		}
-		ownerPIDNamespace := strings.TrimSpace(metadata[metadataOwnerPIDNamespace])
-		if ownerPIDNamespace == "" || b.pidNamespace == "" || ownerPIDNamespace != b.pidNamespace {
+		if !matchingNonEmptyIdentity(metadata[metadataOwnerPIDNamespace], b.pidNamespace) {
 			continue
 		}
 		pid, parseErr := strconv.Atoi(strings.TrimSpace(metadata[metadataOwnerPID]))
@@ -398,6 +397,12 @@ func (b *Backend) Reap(ctx context.Context) ([]string, error) {
 		reaped = append(reaped, sandbox.ID)
 	}
 	return reaped, errors.Join(reapErrs...)
+}
+
+func matchingNonEmptyIdentity(left, right string) bool {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	return left != "" && right != "" && left == right
 }
 
 func (b *Backend) stateFor(instance *execbackend.Instance) (*sandboxState, error) {

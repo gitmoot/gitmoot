@@ -587,21 +587,52 @@ func TestEnvdSurfacesUnknownEndEventFields(t *testing.T) {
 func TestJSONWireFieldNamesMatchEncodingJSON(t *testing.T) {
 	t.Parallel()
 
+	type promotedFields struct {
+		Promoted  string `json:"promoted"`
+		Ambiguous string
+	}
+	type competingFields struct {
+		Ambiguous string
+	}
 	type contractFixture struct {
+		promotedFields
+		competingFields
 		Signal  string `json:"signal,omitempty"`
+		Status  string `json:"status"`
 		Ignored string `json:"-"`
 		Legacy  string
 		hidden  string
 	}
-	known := jsonWireFieldNames(reflect.TypeOf(contractFixture{}))
-	for _, name := range []string{"signal", "legacy"} {
-		if _, ok := known[name]; !ok {
-			t.Errorf("derived JSON wire names = %v; missing %q", known, name)
-		}
+	fixtureType := reflect.TypeOf(contractFixture{})
+	known := jsonWireFieldNames(fixtureType)
+	candidates := map[string]struct{}{
+		"signal":           {},
+		"Signal":           {},
+		"signal,omitempty": {},
+		"legacy":           {},
+		"promoted":         {},
+		"ambiguous":        {},
+		"status":           {},
+		"\u017ftatus":      {},
+		"-":                {},
+		"ignored":          {},
+		"hidden":           {},
+		"spurious":         {},
 	}
-	for _, name := range []string{"signal,omitempty", "-", "ignored", "hidden", ""} {
-		if _, ok := known[name]; ok {
-			t.Errorf("derived JSON wire names = %v; unexpectedly contains %q", known, name)
+	for name := range known {
+		candidates[name] = struct{}{}
+	}
+	for name := range candidates {
+		data, err := json.Marshal(map[string]any{name: "probe"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		decoder.DisallowUnknownFields()
+		actual := decoder.Decode(reflect.New(fixtureType).Interface()) == nil
+		derived := jsonWireFieldNameKnown(known, name)
+		if derived != actual {
+			t.Errorf("derived JSON wire names = %v; key %q derived=%t encoding/json=%t", known, name, derived, actual)
 		}
 	}
 }
