@@ -45,7 +45,9 @@ func TestRemoteProvisionRequiresTTLAndRecordsOwnership(t *testing.T) {
 
 	instance, err := backend.Provision(context.Background(), execbackend.JobScope{
 		JobID:               "job-1",
+		Attempt:             3,
 		LifecycleGeneration: 9,
+		DaemonFencingToken:  "daemon-fence-test",
 		TTL:                 90 * time.Second,
 	})
 	if err != nil {
@@ -55,7 +57,7 @@ func TestRemoteProvisionRequiresTTLAndRecordsOwnership(t *testing.T) {
 		t.Fatalf("instance = %+v", instance)
 	}
 	request := harness.lastCreate()
-	if request.Timeout != 90 || request.Metadata[metadataJobID] != "job-1" || request.Metadata[metadataLifecycleGeneration] != "9" || request.Metadata[metadataBootID] != "boot-test" || request.Metadata[metadataOwnerPID] != "1234" || request.Metadata[metadataOwnerPIDNamespace] != "pid:[test]" || request.Metadata[metadataOwnerStartTime] != "5678" {
+	if request.Timeout != 90 || request.Metadata[metadataJobID] != "job-1" || request.Metadata[metadataAttempt] != "3" || request.Metadata[metadataLifecycleGeneration] != "9" || request.Metadata[metadataDaemonFencingToken] != "daemon-fence-test" || request.Metadata[metadataBootID] != "boot-test" || request.Metadata[metadataOwnerPID] != "1234" || request.Metadata[metadataOwnerPIDNamespace] != "pid:[test]" || request.Metadata[metadataOwnerStartTime] != "5678" {
 		t.Fatalf("create request = %+v", request)
 	}
 }
@@ -155,14 +157,40 @@ func TestRemoteReapScopesOwnerLivenessToPIDNamespace(t *testing.T) {
 		{ID: "stale-local", TemplateID: "template-test", State: "paused", Metadata: map[string]string{
 			metadataBootID: reaper.bootID, metadataOwnerPIDNamespace: reaper.pidNamespace, metadataOwnerPID: "2147483647", metadataOwnerStartTime: "2",
 		}},
+		{ID: "malformed-generation", TemplateID: "template-test", State: "running", Metadata: map[string]string{
+			metadataJobID: "malformed", metadataAttempt: "1", metadataLifecycleGeneration: "not-an-integer",
+			metadataDaemonFencingToken: "fence-malformed", metadataBootID: reaper.bootID,
+		}},
 	})
 
-	reaped, err := reaper.Reap(context.Background())
+	report, err := reaper.ReapInventory(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !report.InventoryObserved || report.InventoryComplete {
+		t.Fatalf("E2B inventory authority = observed:%v complete:%v, want true/false", report.InventoryObserved, report.InventoryComplete)
+	}
+	reaped := report.Destroyed
 	if !reflect.DeepEqual(reaped, []string{"stale-local"}) {
 		t.Fatalf("reaped = %v", reaped)
+	}
+	var foundForeignOwner, foundMalformedGeneration bool
+	for _, instance := range report.Inventory {
+		switch instance.ID {
+		case "foreign-namespace-live":
+			foundForeignOwner = true
+			if instance.JobID != "foreign-live" || instance.Attempt != 1 || instance.LifecycleGeneration != 0 || instance.BootID != reaper.bootID {
+				t.Fatalf("inventory identity = %+v", instance)
+			}
+		case "malformed-generation":
+			foundMalformedGeneration = true
+			if instance.LifecycleGeneration != -1 {
+				t.Fatalf("malformed generation identity = %+v, want unmatchable generation -1", instance)
+			}
+		}
+	}
+	if !foundForeignOwner || !foundMalformedGeneration {
+		t.Fatalf("inventory omitted provisioned sandbox: %+v", report.Inventory)
 	}
 	if got := harness.deletedIDs(); !reflect.DeepEqual(got, []string{"stale-local"}) {
 		t.Fatalf("deleted sandboxes = %v; foreign scope and live owner must remain", got)

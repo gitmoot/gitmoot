@@ -35,7 +35,7 @@ func TestMigrateAddsExecBackendAttempts(t *testing.T) {
 		t.Fatalf("sql.Open: %v", err)
 	}
 	preMigration := &Store{db: raw}
-	for version, migration := range migrationsBefore(t, "CREATE TABLE execbackend_attempts") {
+	for version, migration := range migrationsBefore(t, "lifecycle_generation INTEGER,\n\tprovider TEXT NOT NULL") {
 		if err := preMigration.applyMigration(ctx, version+1, migration); err != nil {
 			t.Fatalf("applyMigration(%d): %v", version+1, err)
 		}
@@ -55,6 +55,63 @@ func TestMigrateAddsExecBackendAttempts(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = upgraded.Close() })
 	assertExecBackendAttemptsTable(t, ctx, upgraded, "upgraded database")
+}
+
+func TestMigrateExecBackendAttemptsLifecycleGenerationNotNullPreservesRows(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "upgrade-not-null.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	preMigration := &Store{db: raw}
+	for version, migration := range migrationsBefore(t, "ALTER TABLE execbackend_attempts RENAME TO execbackend_attempts_nullable_generation") {
+		if err := preMigration.applyMigration(ctx, version+1, migration); err != nil {
+			t.Fatalf("applyMigration(%d): %v", version+1, err)
+		}
+	}
+	if _, err := raw.ExecContext(ctx, `INSERT INTO execbackend_attempts(
+		job_id, attempt, lifecycle_generation, provider, daemon_fencing_token,
+		boot_id, ttl_expires_at, state
+	) VALUES ('preserved', 1, 7, 'e2b', 'fence', 'boot', '2026-08-29T12:00:00Z', 'reserved')`); err != nil {
+		t.Fatalf("seed pre-fix row: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close pre-migration database: %v", err)
+	}
+
+	upgraded, err := openRealTestStore(t, path)
+	if err != nil {
+		t.Fatalf("open upgraded store: %v", err)
+	}
+	t.Cleanup(func() { _ = upgraded.Close() })
+	assertExecBackendAttemptsTable(t, ctx, upgraded, "NOT NULL upgraded database")
+	if attempt, err := upgraded.GetExecBackendAttempt(ctx, ExecBackendAttemptKey{JobID: "preserved", Attempt: 1, LifecycleGeneration: 7}); err != nil {
+		t.Fatalf("read preserved row: %v", err)
+	} else if attempt.State != ExecBackendAttemptStateReserved {
+		t.Fatalf("preserved row state = %q, want reserved", attempt.State)
+	}
+}
+
+func TestExecBackendAttemptLifecycleGenerationEnforcedBySchema(t *testing.T) {
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "schema.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if _, err := store.db.ExecContext(ctx, `INSERT INTO execbackend_attempts(
+			job_id, attempt, lifecycle_generation, provider, daemon_fencing_token,
+			boot_id, ttl_expires_at, state
+		) VALUES ('null-generation', 1, NULL, 'e2b', 'fence', 'boot', '2026-08-29T12:00:00Z', 'reserved')`); err == nil {
+			t.Fatalf("raw NULL lifecycle generation insert %d succeeded", i+1)
+		}
+	}
+	reservation := testExecBackendReservation(ExecBackendAttemptKey{JobID: "negative-generation", Attempt: 1, LifecycleGeneration: -1})
+	if err := store.ReserveExecBackendAttempt(ctx, reservation); err == nil {
+		t.Fatal("negative lifecycle generation succeeded")
+	}
 }
 
 func TestReserveExecBackendAttempt(t *testing.T) {
@@ -185,7 +242,7 @@ func assertExecBackendAttemptsTable(t *testing.T, ctx context.Context, store *St
 	want := []columnContract{
 		{name: "job_id", typeName: "TEXT", notNull: true, pk: 1},
 		{name: "attempt", typeName: "INTEGER", notNull: true, pk: 2},
-		{name: "lifecycle_generation", typeName: "INTEGER", pk: 3},
+		{name: "lifecycle_generation", typeName: "INTEGER", notNull: true, pk: 3},
 		{name: "provider", typeName: "TEXT", notNull: true},
 		{name: "sandbox_id", typeName: "TEXT"},
 		{name: "daemon_fencing_token", typeName: "TEXT", notNull: true},

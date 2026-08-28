@@ -27,7 +27,9 @@ const (
 	syncArchivePath = "/home/user/.gitmoot-sync.tar.gz"
 
 	metadataJobID               = "job_id"
+	metadataAttempt             = "attempt"
 	metadataLifecycleGeneration = "lifecycle_generation"
+	metadataDaemonFencingToken  = "daemon_fencing_token"
 	metadataBootID              = "boot_id"
 	metadataOwnerPID            = "owner_pid"
 	metadataOwnerPIDNamespace   = "owner_pid_namespace"
@@ -92,6 +94,7 @@ type sandboxState struct {
 
 var _ execbackend.ExecutionBackend = (*Backend)(nil)
 var _ execbackend.Reaper = (*Backend)(nil)
+var _ execbackend.InventoryReaper = (*Backend)(nil)
 
 // NewBackend constructs an unwired E2B lifecycle provider.
 func NewBackend(client *e2b.Client, options Options) (*Backend, error) {
@@ -129,13 +132,24 @@ func (b *Backend) Provision(ctx context.Context, scope execbackend.JobScope) (*e
 	if scope.TTL <= 0 {
 		return nil, errors.New("remote execution backend TTL must be positive")
 	}
+	attempt := scope.Attempt
+	if attempt == 0 {
+		attempt = 1
+	}
+	if attempt < 1 {
+		return nil, errors.New("remote execution backend attempt must be positive")
+	}
 	metadata := map[string]string{
 		metadataJobID:               jobID,
+		metadataAttempt:             strconv.Itoa(attempt),
 		metadataLifecycleGeneration: strconv.FormatInt(scope.LifecycleGeneration, 10),
 		metadataBootID:              b.bootID,
 		metadataOwnerPID:            strconv.Itoa(b.ownerPID),
 		metadataOwnerPIDNamespace:   b.pidNamespace,
 		metadataOwnerStartTime:      b.ownerStart,
+	}
+	if token := strings.TrimSpace(scope.DaemonFencingToken); token != "" {
+		metadata[metadataDaemonFencingToken] = token
 	}
 	sandbox, credential, err := b.client.Create(ctx, b.templateID, scope.TTL, e2b.CreateOptions{Metadata: metadata})
 	if err != nil {
@@ -365,17 +379,45 @@ func (b *Backend) Destroy(ctx context.Context, instance *execbackend.Instance) e
 // kernel. Require both identities before interpreting PID/start-time liveness,
 // so one container cannot reap another container's live sandbox.
 func (b *Backend) Reap(ctx context.Context) ([]string, error) {
+	report, err := b.ReapInventory(ctx)
+	return report.Destroyed, err
+}
+
+// ReapInventory returns the provider observations used for the reap decision
+// and the directly deleted subset. E2B cannot prove all-state completeness, so
+// consumers may reconcile positive observations but not infer absence.
+func (b *Backend) ReapInventory(ctx context.Context) (execbackend.ReapReport, error) {
 	if b == nil {
-		return nil, errors.New("remote execution backend is nil")
+		return execbackend.ReapReport{}, errors.New("remote execution backend is nil")
 	}
 	sandboxes, err := b.client.List(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list remote execution sandboxes for reap: %w", err)
+		return execbackend.ReapReport{}, fmt.Errorf("list remote execution sandboxes for reap: %w", err)
+	}
+	report := execbackend.ReapReport{
+		// E2B has no all-state total. A successful List proves every returned
+		// sandbox exists, but a dropped continuation header can still hide a
+		// later page, so absence from this inventory is not authoritative.
+		InventoryObserved: true,
+		Inventory:         make([]execbackend.ProviderInstance, 0, len(sandboxes)),
 	}
 	var reaped []string
 	var reapErrs []error
 	for _, sandbox := range sandboxes {
 		metadata := sandbox.Metadata
+		attempt, _ := strconv.Atoi(strings.TrimSpace(metadata[metadataAttempt]))
+		generation := int64(-1)
+		if parsed, parseErr := strconv.ParseInt(strings.TrimSpace(metadata[metadataLifecycleGeneration]), 10, 64); parseErr == nil && parsed >= 0 {
+			generation = parsed
+		}
+		report.Inventory = append(report.Inventory, execbackend.ProviderInstance{
+			ID:                  sandbox.ID,
+			JobID:               strings.TrimSpace(metadata[metadataJobID]),
+			Attempt:             attempt,
+			LifecycleGeneration: generation,
+			DaemonFencingToken:  strings.TrimSpace(metadata[metadataDaemonFencingToken]),
+			BootID:              strings.TrimSpace(metadata[metadataBootID]),
+		})
 		if strings.TrimSpace(metadata[metadataBootID]) == "" || strings.TrimSpace(metadata[metadataBootID]) != b.bootID {
 			continue
 		}
@@ -396,7 +438,8 @@ func (b *Backend) Reap(ctx context.Context) ([]string, error) {
 		b.mu.Unlock()
 		reaped = append(reaped, sandbox.ID)
 	}
-	return reaped, errors.Join(reapErrs...)
+	report.Destroyed = reaped
+	return report, errors.Join(reapErrs...)
 }
 
 func matchingNonEmptyIdentity(left, right string) bool {

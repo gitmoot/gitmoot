@@ -2153,4 +2153,44 @@ CREATE TABLE org_archive_pending (
 	observed_at TEXT NOT NULL
 );
 	`,
+	// #1634 closes the NULL-primary-key gap in the execution-backend ledger.
+	// SQLite permits multiple NULL values in a composite non-rowid PRIMARY KEY,
+	// so lifecycle_generation must be constrained by the schema rather than only
+	// by Go callers. Rebuild at the append-only tail because SQLite cannot add a
+	// NOT NULL constraint to an existing column in place. The INSERT deliberately
+	// fails closed if an unexpected historical NULL exists; silently dropping or
+	// coalescing such a row would erase evidence of an allocation attempt.
+	`
+ALTER TABLE execbackend_attempts RENAME TO execbackend_attempts_nullable_generation;
+CREATE TABLE execbackend_attempts (
+	job_id TEXT NOT NULL,
+	attempt INTEGER NOT NULL,
+	lifecycle_generation INTEGER NOT NULL CHECK(lifecycle_generation >= 0),
+	provider TEXT NOT NULL,
+	sandbox_id TEXT,
+	daemon_fencing_token TEXT NOT NULL,
+	boot_id TEXT NOT NULL,
+	ttl_expires_at TIMESTAMP NOT NULL,
+	state TEXT NOT NULL CHECK(state IN (
+		'reserved', 'provisioning', 'running', 'collecting', 'destroying',
+		'destroyed', 'orphaned', 'failed'
+	)),
+	cost_reserved_usd REAL,
+	cost_actual_usd REAL,
+	created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY (job_id, attempt, lifecycle_generation)
+);
+INSERT INTO execbackend_attempts(
+	job_id, attempt, lifecycle_generation, provider, sandbox_id,
+	daemon_fencing_token, boot_id, ttl_expires_at, state,
+	cost_reserved_usd, cost_actual_usd, created_at, updated_at
+)
+SELECT
+	job_id, attempt, lifecycle_generation, provider, sandbox_id,
+	daemon_fencing_token, boot_id, ttl_expires_at, state,
+	cost_reserved_usd, cost_actual_usd, created_at, updated_at
+FROM execbackend_attempts_nullable_generation;
+DROP TABLE execbackend_attempts_nullable_generation;
+	`,
 }

@@ -28,6 +28,8 @@ const executionBackendReapTimeout = 30 * time.Second
 
 var reapedExecutionBackendRoots sync.Map
 
+var executionBackendFencingToken = sync.OnceValues(newRuntimeLockOwnerToken)
+
 func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend) (execbackend.ExecutionBackend, error) {
 	return execbackend.Consume(backend, func() (execbackend.ExecutionBackend, error) {
 		home := strings.TrimSpace(w.workflowHome())
@@ -90,6 +92,14 @@ func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend) (execbac
 		if err != nil {
 			return nil, err
 		}
+		fencingToken, err := executionBackendFencingToken()
+		if err != nil {
+			return nil, fmt.Errorf("create execution backend daemon fencing token: %w", err)
+		}
+		ledgeredBackend, err := newLedgeredExecutionBackend(w.Store, remoteBackend, e2bAttemptProvider, fencingToken, db.BootID(), w.Stdout)
+		if err != nil {
+			return nil, err
+		}
 		baseURL := strings.TrimSpace(cfg.E2BBaseURL)
 		if baseURL == "" {
 			baseURL = e2b.DefaultBaseURL
@@ -99,13 +109,13 @@ func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend) (execbac
 		if _, loaded := reapedExecutionBackendRoots.LoadOrStore(reapKey, struct{}{}); !loaded {
 			reapCtx, cancel := context.WithTimeout(context.Background(), executionBackendReapTimeout)
 			defer cancel()
-			var reaper execbackend.Reaper = remoteBackend
+			var reaper execbackend.Reaper = ledgeredBackend
 			if _, err := reaper.Reap(reapCtx); err != nil {
 				reapedExecutionBackendRoots.Delete(reapKey)
 				return nil, fmt.Errorf("reap remote execution backends: %w", err)
 			}
 		}
-		return remoteBackend, nil
+		return ledgeredBackend, nil
 	})
 }
 
@@ -139,7 +149,10 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 	}
 	instance, err := lifecycle.Provision(ctx, execbackend.JobScope{JobID: job.ID, LifecycleGeneration: job.LifecycleGeneration, TTL: ttl})
 	if err != nil {
-		return nil, nil, fmt.Errorf("provision %s execution backend for job %s: %w", backend, job.ID, err)
+		// A provider can create an instance and then fail to persist its handle in
+		// the ledger. Preserve both values so the caller installs its teardown defer
+		// before handling the error; discarding them here strands a billed sandbox.
+		return lifecycle, instance, fmt.Errorf("provision %s execution backend for job %s: %w", backend, job.ID, err)
 	}
 	if err := lifecycle.SyncIn(ctx, instance, execbackend.Materials{SourceWorktree: checkout}); err != nil {
 		return lifecycle, instance, fmt.Errorf("sync job %s into %s execution backend: %w", job.ID, backend, err)
