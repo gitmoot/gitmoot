@@ -835,9 +835,11 @@ func TestRemoteBackendRefusesEveryHostOnlyRoute(t *testing.T) {
 	}
 	agent := runtime.Agent{Runtime: runtime.ShellRuntime, ExecBackend: string(execbackend.Remote)}
 
-	t.Run("lifecycle provider is not configured", func(t *testing.T) {
-		if _, err := worker.defaultExecutionBackend(execbackend.Remote); err == nil || !strings.Contains(err.Error(), "not configured") {
-			t.Fatalf("remote lifecycle error = %v, want temporary not-configured refusal", err)
+	// GITMOOT-IMPL: Slice D converts only the configured lifecycle route; an
+	// unconfigured remote backend must still refuse before provider construction.
+	t.Run("lifecycle provider requires credential config", func(t *testing.T) {
+		if _, err := worker.defaultExecutionBackend(execbackend.Remote); err == nil || !strings.Contains(err.Error(), "e2b_api_key_file is required") {
+			t.Fatalf("remote lifecycle error = %v, want credential-config refusal", err)
 		}
 	})
 	t.Run("daemon primary delivery is an unprovisioned placeholder", func(t *testing.T) {

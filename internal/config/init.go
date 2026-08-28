@@ -126,7 +126,7 @@ artifact_blobs = %q
 # subprocess executes (#1535 contract, #1536). "local" is the default and a
 # byte-for-byte passthrough to the existing runner composition (subprocess
 # GroupRunner innermost; credential-gateway and Landlock produce wrappers
-# unchanged). "remote" is parseable but its provider is not configured yet, so
+# unchanged). "remote" runs shell implementation jobs in an E2B sandbox; all
 # unsupported routes fail loudly instead of falling back to the host. With no
 # [remote_exec] section behavior is byte-identical. Any other value FAILS THE
 # JOB LOUDLY at dispatch naming the value and the allowed set. A job payload's
@@ -138,6 +138,10 @@ artifact_blobs = %q
 # local_uid = 1000 # optional; configure together with non-root local_gid
 # local_gid = 1000 # use a dedicated group when unrelated local users must be excluded
 # local_root = "/var/tmp/gitmoot-local" # absolute; parents must be traversable by local_uid
+# e2b_api_key_file = "/run/secrets/e2b-api-key" # required for remote; regular 0600 file
+# e2b_template = "gitmoot-shell" # required for remote
+# e2b_base_url = "https://api.e2b.app" # optional control-plane override
+# e2b_domain = "e2b.app" # optional sandbox-domain override
 
 # [transcripts] is ON by default. Raw unredacted runtime output
 # is retained in 0600 per-job append logs for deterministic trajectory export.

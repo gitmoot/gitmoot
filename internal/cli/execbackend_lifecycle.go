@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -14,12 +15,16 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
+	"github.com/gitmoot/gitmoot/internal/execbackend/e2b"
+	remoteexec "github.com/gitmoot/gitmoot/internal/execbackend/remote"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 const executionBackendDestroyTimeout = 30 * time.Second
+
+const executionBackendReapTimeout = 30 * time.Second
 
 var reapedExecutionBackendRoots sync.Map
 
@@ -29,20 +34,9 @@ func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend) (execbac
 		if home == "" {
 			return nil, errors.New("resolve local execution-backend home")
 		}
-		cfg := config.DefaultRemoteExecConfig()
-		if w.ConfigHomeExplicit || strings.TrimSpace(w.ConfigHome) != "" {
-			paths, err := w.configPaths()
-			if err != nil {
-				return nil, err
-			}
-			loaded, loadErr := config.LoadRemoteExecConfig(paths)
-			switch {
-			case loadErr == nil:
-				cfg = loaded
-			case errors.Is(loadErr, os.ErrNotExist):
-			default:
-				return nil, fmt.Errorf("load [remote_exec] config: %w", loadErr)
-			}
+		cfg, err := w.executionBackendConfig()
+		if err != nil {
+			return nil, err
 		}
 		root := filepath.Join(home, "execbackends", string(execbackend.Local))
 		if cfg.LocalRoot != "" {
@@ -65,8 +59,74 @@ func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend) (execbac
 		}
 		return local, nil
 	}, func() (execbackend.ExecutionBackend, error) {
-		return nil, errors.New("remote execution backend is not configured")
+		cfg, err := w.executionBackendConfig()
+		if err != nil {
+			return nil, err
+		}
+		if err := cfg.ValidateE2BProvider(); err != nil {
+			return nil, err
+		}
+		apiKey, err := cfg.LoadE2BAPIKey()
+		if err != nil {
+			return nil, err
+		}
+		client, err := e2b.NewClient(apiKey, e2b.Options{BaseURL: cfg.E2BBaseURL})
+		if err != nil {
+			return nil, err
+		}
+		// GITMOOT-IMPL: production resolves provider envd endpoints; the injected
+		// resolver exists only so the lifecycle E2E remains offline and spend-free.
+		resolver := w.RemoteEnvdEndpointResolver
+		if resolver == nil && cfg.E2BDomain != "" {
+			domain := cfg.E2BDomain
+			resolver = func(sandboxID string, port int) string {
+				return fmt.Sprintf("https://%d-%s.%s", port, sandboxID, domain)
+			}
+		}
+		remoteBackend, err := remoteexec.NewBackend(client, remoteexec.Options{
+			TemplateID: cfg.E2BTemplate,
+			Envd:       e2b.EnvdOptions{EndpointResolver: resolver},
+		})
+		if err != nil {
+			return nil, err
+		}
+		baseURL := strings.TrimSpace(cfg.E2BBaseURL)
+		if baseURL == "" {
+			baseURL = e2b.DefaultBaseURL
+		}
+		accountKey := sha256.Sum256([]byte(apiKey))
+		reapKey := fmt.Sprintf("%s|%s|%x", backend, baseURL, accountKey)
+		if _, loaded := reapedExecutionBackendRoots.LoadOrStore(reapKey, struct{}{}); !loaded {
+			reapCtx, cancel := context.WithTimeout(context.Background(), executionBackendReapTimeout)
+			defer cancel()
+			var reaper execbackend.Reaper = remoteBackend
+			if _, err := reaper.Reap(reapCtx); err != nil {
+				reapedExecutionBackendRoots.Delete(reapKey)
+				return nil, fmt.Errorf("reap remote execution backends: %w", err)
+			}
+		}
+		return remoteBackend, nil
 	})
+}
+
+func (w jobWorker) executionBackendConfig() (config.RemoteExecConfig, error) {
+	cfg := config.DefaultRemoteExecConfig()
+	if !w.ConfigHomeExplicit && strings.TrimSpace(w.ConfigHome) == "" {
+		return cfg, nil
+	}
+	paths, err := w.configPaths()
+	if err != nil {
+		return config.RemoteExecConfig{}, err
+	}
+	loaded, loadErr := config.LoadRemoteExecConfig(paths)
+	switch {
+	case loadErr == nil:
+		return loaded, nil
+	case errors.Is(loadErr, os.ErrNotExist):
+		return cfg, nil
+	default:
+		return config.RemoteExecConfig{}, fmt.Errorf("load [remote_exec] config: %w", loadErr)
+	}
 }
 
 func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execbackend.Backend, runtimeName string, job db.Job, ttl time.Duration, checkout string) (execbackend.ExecutionBackend, *execbackend.Instance, error) {
