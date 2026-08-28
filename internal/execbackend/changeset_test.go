@@ -46,6 +46,28 @@ func TestChangeSetJSONTransportPreservesFilenameBytes(t *testing.T) {
 	}
 }
 
+func TestStageAtRemovesWorktreeAfterCallbackFailure(t *testing.T) {
+	host, _, base := changeSetRepoPair(t)
+	sentinel := errors.New("stop staging")
+	var stage string
+	err := StageAt(context.Background(), host, base, func(path string) error {
+		stage = path
+		if got := strings.TrimSpace(changeSetGit(t, path, "rev-parse", "HEAD")); got != base {
+			t.Fatalf("staging HEAD = %s, want %s", got, base)
+		}
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("StageAt error = %v, want callback error", err)
+	}
+	if _, err := os.Stat(stage); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging worktree remains at %q: %v", stage, err)
+	}
+	if got := changeSetGit(t, host, "worktree", "list", "--porcelain"); strings.Contains(got, stage) {
+		t.Fatalf("staging worktree remains registered:\n%s", got)
+	}
+}
+
 func TestChangeSetRoundTripsTrackedManifestAndIsIdempotent(t *testing.T) {
 	host, sandbox, base := changeSetRepoPair(t)
 	writeChangeSetFile(t, sandbox, "tracked.txt", "changed\n", 0o644)
