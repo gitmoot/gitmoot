@@ -11,6 +11,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -35,8 +36,13 @@ type EnvdOptions struct {
 	RequestTimeout   time.Duration
 	EndpointResolver func(sandboxID string, port int) string
 
-	// OnUnknownEndEventFields, when set, is called once per terminal event that
-	// carries keys this client does not model. It never affects the result.
+	// OnUnknownEndEventFields, when set, is called once when a decoded process
+	// end event carries keys this client does not model. It runs before the
+	// Connect terminal frame is validated and never affects the result.
+	//
+	// The callback receives names, not values. It makes additive wire changes
+	// observable, but the client still applies its existing interpretation if an
+	// unknown field changes the meaning of a modeled field.
 	OnUnknownEndEventFields func(fields []string)
 }
 
@@ -468,10 +474,12 @@ func unknownEndEventKeys(data []byte) []string {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil
 	}
-	known := map[string]struct{}{"exitCode": {}, "exited": {}, "status": {}, "error": {}}
+	known := jsonWireFieldNames(reflect.TypeOf(endEvent{}))
 	unknown := make([]string, 0, len(raw))
 	for key := range raw {
-		if _, ok := known[key]; !ok {
+		// encoding/json matches field names case-insensitively. A key that can
+		// drive the verdict is modeled and must not also be reported as unknown.
+		if _, ok := known[strings.ToLower(key)]; !ok {
 			unknown = append(unknown, key)
 		}
 	}
@@ -480,6 +488,25 @@ func unknownEndEventKeys(data []byte) []string {
 		return nil
 	}
 	return unknown
+}
+
+func jsonWireFieldNames(structType reflect.Type) map[string]struct{} {
+	known := make(map[string]struct{}, structType.NumField())
+	for i := 0; i < structType.NumField(); i++ {
+		field := structType.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if name == "-" {
+			continue
+		}
+		if name == "" {
+			name = field.Name
+		}
+		known[strings.ToLower(name)] = struct{}{}
+	}
+	return known
 }
 
 type outputTail struct {

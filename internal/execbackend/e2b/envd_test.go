@@ -562,7 +562,7 @@ func TestEnvdSurfacesUnknownEndEventFields(t *testing.T) {
 	t.Parallel()
 
 	var event endEvent
-	if err := json.Unmarshal([]byte(`{"exited":true,"status":"exit status 0","futureField":true,"another":1}`), &event); err != nil {
+	if err := json.Unmarshal([]byte(`{"exitCode":0,"exited":true,"status":"exit status 0","error":"","futureField":true,"another":1}`), &event); err != nil {
 		t.Fatalf("unknown fields must not fail the decode: %v", err)
 	}
 	if got, want := strings.Join(event.UnknownFields, ","), "another,futureField"; got != want {
@@ -570,5 +570,112 @@ func TestEnvdSurfacesUnknownEndEventFields(t *testing.T) {
 	}
 	if err := (&Envd{}).endEventError(event); err != nil {
 		t.Fatalf("unknown fields must not change the result: %v", err)
+	}
+
+	var caseVariant endEvent
+	if err := json.Unmarshal([]byte(`{"ExitCode":7,"Exited":true,"Status":"exit status 7","Error":"provider failure"}`), &caseVariant); err != nil {
+		t.Fatalf("case-variant modeled fields must decode: %v", err)
+	}
+	if caseVariant.ExitCode != 7 || !caseVariant.Exited || caseVariant.Status != "exit status 7" || caseVariant.Error != "provider failure" {
+		t.Fatalf("case-variant modeled fields = %+v; want all fields consumed", caseVariant)
+	}
+	if len(caseVariant.UnknownFields) != 0 {
+		t.Fatalf("case-variant modeled fields reported as unknown: %v", caseVariant.UnknownFields)
+	}
+}
+
+func TestJSONWireFieldNamesMatchEncodingJSON(t *testing.T) {
+	t.Parallel()
+
+	type contractFixture struct {
+		Signal  string `json:"signal,omitempty"`
+		Ignored string `json:"-"`
+		Legacy  string
+		hidden  string
+	}
+	known := jsonWireFieldNames(reflect.TypeOf(contractFixture{}))
+	for _, name := range []string{"signal", "legacy"} {
+		if _, ok := known[name]; !ok {
+			t.Errorf("derived JSON wire names = %v; missing %q", known, name)
+		}
+	}
+	for _, name := range []string{"signal,omitempty", "-", "ignored", "hidden", ""} {
+		if _, ok := known[name]; ok {
+			t.Errorf("derived JSON wire names = %v; unexpectedly contains %q", known, name)
+		}
+	}
+}
+
+func TestEnvdUnknownEndEventCallbackContract(t *testing.T) {
+	tests := []struct {
+		name          string
+		endEvents     []string
+		wantError     string
+		wantCallbacks [][]string
+	}{
+		{
+			name:          "unknown names are surfaced once in stable order",
+			endEvents:     []string{`{"exitCode":0,"exited":true,"status":"exit status 0","error":"","futureField":true,"another":1}`},
+			wantCallbacks: [][]string{{"another", "futureField"}},
+		},
+		{
+			name:      "modeled fields do not fire callback",
+			endEvents: []string{`{"exitCode":0,"exited":true,"status":"exit status 0","error":""}`},
+		},
+		{
+			name: "second end is rejected before a second callback",
+			endEvents: []string{
+				`{"exited":true,"status":"exit status 0","firstUnknown":true}`,
+				`{"exited":true,"status":"exit status 0","secondUnknown":true}`,
+			},
+			wantError:     "invalid end event",
+			wantCallbacks: [][]string{{"firstUnknown"}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var callbacks [][]string
+			envd, err := NewEnvd(Sandbox{ID: "sbx-test"}, EnvdCredential{token: testEnvdToken}, EnvdOptions{
+				EndpointResolver: func(string, int) string { return "https://envd.example" },
+				OnUnknownEndEventFields: func(fields []string) {
+					callbacks = append(callbacks, append([]string(nil), fields...))
+				},
+			})
+			if err != nil {
+				t.Fatalf("NewEnvd: %v", err)
+			}
+			var stream bytes.Buffer
+			writeConnectTestFrame(t, &stream, 0, `{"event":{"start":{"pid":42}}}`)
+			for _, event := range test.endEvents {
+				writeConnectTestFrame(t, &stream, 0, `{"event":{"end":`+event+`}}`)
+			}
+			writeConnectTestFrame(t, &stream, connectEndStreamFlag, `{}`)
+
+			_, err = envd.readStartStream(&stream, StartRequest{Name: "sh"})
+			if test.wantError == "" {
+				if err != nil {
+					t.Fatalf("readStartStream: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("readStartStream = %v; want error containing %q", err, test.wantError)
+			}
+			if !reflect.DeepEqual(callbacks, test.wantCallbacks) {
+				t.Fatalf("callbacks = %v, want %v", callbacks, test.wantCallbacks)
+			}
+		})
+	}
+}
+
+func TestEnvdRequiresConnectTerminalFrameAfterProcessEnd(t *testing.T) {
+	t.Parallel()
+
+	var stream bytes.Buffer
+	writeConnectTestFrame(t, &stream, 0, `{"event":{"start":{"pid":42}}}`)
+	writeConnectTestFrame(t, &stream, 0, `{"event":{"end":{"exitCode":0,"exited":true,"status":"exit status 0","error":""}}}`)
+
+	envd := &Envd{credential: EnvdCredential{token: testEnvdToken}}
+	_, err := envd.readStartStream(&stream, StartRequest{Name: "sh"})
+	if err == nil || !strings.Contains(err.Error(), "without a terminal frame") {
+		t.Fatalf("readStartStream = %v; want missing terminal-frame error", err)
 	}
 }
