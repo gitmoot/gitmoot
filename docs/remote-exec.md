@@ -15,6 +15,9 @@ local_uid = 1000
 local_gid = 1000
 # Use a traversable root when the Gitmoot home is below /root.
 local_root = "/var/tmp/gitmoot-local"
+# For opt-in broker access from a remote shell, configure both:
+# credential_gateway_listen = "0.0.0.0:8443"
+# credential_gateway_url = "https://broker.example.com:8443"
 ```
 
 `local` is the default and the only currently provisioned backend. `remote` is
@@ -69,6 +72,17 @@ cleanup limitation tracked in #1572.
 Gitmoot reads `[remote_exec]` when it dispatches a job; it is not cached and
 needs no SIGHUP wiring. Foreground dispatch refuses `remote` because it has no
 daemon-owned lifecycle, ledger, or reaper.
+
+When `[credentials].model_gateway = true`, a remote shell job receives the
+non-secret route in `GITMOOT_CREDENTIAL_GATEWAY_URL` and a path to an owner-only
+curl configuration in `GITMOOT_CREDENTIAL_GATEWAY_CURL_CONFIG` for the
+sandbox-reachable credential gateway. The second listener requires a per-job
+mTLS certificate and an opaque
+capability bound to the sandbox id, the `shell` runtime, the job lease expiry,
+and the exact upstream allowlist. Provider keys remain host-side and are loaded
+only after those checks pass. The route is revoked before sandbox teardown.
+Claude, Codex, Kimi, and omp remain unsupported on `remote` until their clients
+can target this mTLS path; Gitmoot never supplies a raw key as a fallback.
 
 A job payload's `exec_backend` field overrides the config value for that one
 job. When either selector is explicitly present its value must be non-blank;

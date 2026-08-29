@@ -1,6 +1,8 @@
 package credgw
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -15,6 +17,7 @@ import (
 	"net/url"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +49,11 @@ type ProxyAuthKind string
 const (
 	ProxyAuthBearer ProxyAuthKind = "bearer"
 	ProxyAuthHeader ProxyAuthKind = "header"
+	// ProxyAuthResolved defers bearer-versus-header placement until the host
+	// resolver loads the current credential. It is valid only for a
+	// sandbox-bound mTLS lease, after every sandbox-side credential has already
+	// been authenticated.
+	ProxyAuthResolved ProxyAuthKind = "resolved"
 )
 
 // ProxyPolicy pins one generic lease to a complete origin, normalized base
@@ -56,6 +64,13 @@ type ProxyPolicy struct {
 	AuthKind          ProxyAuthKind
 	Header            string
 	AllowLoopbackHTTP bool
+	// SandboxID and Runtime are an indivisible remote-lease identity. When set,
+	// the capability and client certificate are bound to both values and expire
+	// at ExpiresAt. Local loopback leases leave all four fields empty.
+	SandboxID    string
+	Runtime      string
+	ExpiresAt    time.Time
+	AllowedHosts []string
 }
 
 // ResolvedCredential is returned for every proxied request. The gateway checks
@@ -85,10 +100,14 @@ var (
 )
 
 type Gateway struct {
-	listener net.Listener
-	server   *http.Server
-	client   *http.Client
-	logf     LogFunc
+	listener       net.Listener
+	server         *http.Server
+	remoteListener net.Listener
+	remoteServer   *http.Server
+	remoteURL      string
+	remoteCA       *certificateAuthority
+	client         *http.Client
+	logf           LogFunc
 
 	mu           sync.RWMutex
 	entries      map[string]entry
@@ -105,12 +124,13 @@ type entry struct {
 }
 
 type proxyEntry struct {
-	jobID       string
-	placeholder string
-	policy      ProxyPolicy
-	upstream    *url.URL
-	resolver    CredentialResolver
-	capability  proxyCapability
+	jobID             string
+	placeholder       string
+	policy            ProxyPolicy
+	upstream          *url.URL
+	resolver          CredentialResolver
+	capability        proxyCapability
+	clientCertificate [sha256.Size]byte
 }
 
 type proxyCapability struct {
@@ -184,12 +204,29 @@ func (g *Gateway) RegisterProxy(jobID string, policy ProxyPolicy, resolver Crede
 		return nil, errors.New("credential gateway is not running")
 	}
 	now := g.nowTime()
+	expiresAt := now.Add(proxyCapabilityTTL)
+	var remoteMaterial RemoteMaterial
+	var clientCertificate [sha256.Size]byte
+	if validated.SandboxID != "" {
+		if g.remoteCA == nil || g.remoteServer == nil || g.remoteURL == "" {
+			return nil, errors.New("remote credential gateway is not configured")
+		}
+		expiresAt = validated.ExpiresAt
+		remoteMaterial, clientCertificate, err = g.remoteCA.issueClient(validated.SandboxID, validated.Runtime, expiresAt)
+		if err != nil {
+			return nil, err
+		}
+		remoteMaterial.URL = g.remoteURL + route
+		remoteMaterial.Capability = capability
+		remoteMaterial.Placeholder = placeholder
+	}
 	g.proxyEntries[route] = proxyEntry{
 		jobID: jobID, placeholder: placeholder, policy: validated,
 		upstream: upstream, resolver: resolver,
-		capability: proxyCapability{hash: capabilityHash, expiresAt: now.Add(proxyCapabilityTTL)},
+		capability:        proxyCapability{hash: capabilityHash, expiresAt: expiresAt},
+		clientCertificate: clientCertificate,
 	}
-	return &Lease{gateway: g, placeholder: placeholder, route: route, capability: capability}, nil
+	return &Lease{gateway: g, placeholder: placeholder, route: route, capability: capability, remote: remoteMaterial}, nil
 }
 
 func (g *Gateway) URL() string {
@@ -254,6 +291,21 @@ func (g *Gateway) revokeProxy(route, placeholder string) {
 	g.mu.Unlock()
 }
 
+// RevokeSandbox removes every in-process capability bound to sandboxID. It is
+// idempotent and is used by both normal teardown and provider startup reap.
+func (g *Gateway) RevokeSandbox(sandboxID string) {
+	if g == nil || strings.TrimSpace(sandboxID) == "" {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for route, registered := range g.proxyEntries {
+		if registered.policy.SandboxID == sandboxID {
+			delete(g.proxyEntries, route)
+		}
+	}
+}
+
 func (g *Gateway) Close(ctx context.Context) error {
 	if g == nil {
 		return nil
@@ -270,6 +322,11 @@ func (g *Gateway) Close(ctx context.Context) error {
 	var errs []error
 	if err := g.server.Shutdown(ctx); err != nil {
 		errs = append(errs, err)
+	}
+	if g.remoteServer != nil {
+		if err := g.remoteServer.Shutdown(ctx); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -342,10 +399,12 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, route strin
 }
 
 type proxyRequestAccess struct {
-	route       string
-	capability  string
-	suffixRoute string
-	authority   string
+	route             string
+	capability        string
+	suffixRoute       string
+	authority         string
+	clientCertificate [sha256.Size]byte
+	remote            bool
 }
 
 func (g *Gateway) serveProxyRequest(w http.ResponseWriter, r *http.Request, access proxyRequestAccess) {
@@ -378,6 +437,13 @@ func (g *Gateway) serveProxyRequest(w http.ResponseWriter, r *http.Request, acce
 		g.writeLog(r.Method, registered.upstream.Hostname(), http.StatusUnauthorized, registered.jobID)
 		return
 	}
+	if registered.policy.SandboxID != "" {
+		if !access.remote || subtle.ConstantTimeCompare(access.clientCertificate[:], registered.clientCertificate[:]) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			g.writeLog(r.Method, registered.upstream.Hostname(), http.StatusUnauthorized, registered.jobID)
+			return
+		}
+	}
 	resolved, err := registered.resolver(r.Context())
 	if err != nil || strings.TrimSpace(resolved.Value) == "" || !resolvedMatchesProxyPolicy(resolved, registered.policy) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -396,11 +462,12 @@ func (g *Gateway) serveProxyRequest(w http.ResponseWriter, r *http.Request, acce
 	outbound.Header = r.Header.Clone()
 	removeHopHeaders(outbound.Header)
 	removeCredentialHeaders(outbound.Header, registered.policy.Header)
-	switch registered.policy.AuthKind {
+	outbound.Header.Del(CapabilityHeader)
+	switch resolved.AuthKind {
 	case ProxyAuthBearer:
 		outbound.Header.Set("Authorization", "Bearer "+resolved.Value)
 	case ProxyAuthHeader:
-		outbound.Header.Set(registered.policy.Header, resolved.Value)
+		outbound.Header.Set(resolved.Header, resolved.Value)
 	}
 
 	response, err := g.client.Do(outbound)
@@ -411,9 +478,9 @@ func (g *Gateway) serveProxyRequest(w http.ResponseWriter, r *http.Request, acce
 	}
 	defer response.Body.Close()
 	removeHopHeaders(response.Header)
-	copyHeader(w.Header(), response.Header)
+	copyRedactedHeader(w.Header(), response.Header, resolved.Value)
 	w.WriteHeader(response.StatusCode)
-	streamResponse(w, response.Body)
+	streamRedactedResponse(w, response.Body, resolved.Value)
 	g.writeLog(r.Method, registered.upstream.Hostname(), response.StatusCode, registered.jobID)
 }
 
@@ -452,6 +519,25 @@ func ValidateProxyPolicy(policy ProxyPolicy) (ProxyPolicy, *url.URL, error) {
 	validated := ProxyPolicy{
 		Upstream: upstream.String(), AuthKind: policy.AuthKind,
 		AllowLoopbackHTTP: policy.AllowLoopbackHTTP,
+		SandboxID:         strings.TrimSpace(policy.SandboxID), Runtime: strings.TrimSpace(policy.Runtime),
+		ExpiresAt: policy.ExpiresAt,
+	}
+	remote := validated.SandboxID != "" || validated.Runtime != "" || !validated.ExpiresAt.IsZero() || len(policy.AllowedHosts) > 0
+	if remote {
+		if validated.SandboxID == "" || validated.Runtime == "" || validated.ExpiresAt.IsZero() {
+			return ProxyPolicy{}, nil, errors.New("remote proxy policy requires sandbox id, runtime, and expiry")
+		}
+		if !validated.ExpiresAt.After(time.Now()) {
+			return ProxyPolicy{}, nil, errors.New("remote proxy policy expiry must be in the future")
+		}
+		allowed, err := normalizeAllowedHosts(policy.AllowedHosts)
+		if err != nil {
+			return ProxyPolicy{}, nil, err
+		}
+		if _, ok := allowed[strings.ToLower(upstream.Hostname())]; !ok {
+			return ProxyPolicy{}, nil, fmt.Errorf("proxy upstream host %q is not allowlisted", upstream.Hostname())
+		}
+		validated.AllowedHosts = sortedHostSet(allowed)
 	}
 	switch policy.AuthKind {
 	case ProxyAuthBearer:
@@ -467,6 +553,13 @@ func ValidateProxyPolicy(policy ProxyPolicy) (ProxyPolicy, *url.URL, error) {
 			return ProxyPolicy{}, nil, fmt.Errorf("proxy header %q is not allowed", policy.Header)
 		}
 		validated.Header = header
+	case ProxyAuthResolved:
+		if !remote {
+			return ProxyPolicy{}, nil, errors.New("resolved proxy auth requires a sandbox-bound remote policy")
+		}
+		if strings.TrimSpace(policy.Header) != "" {
+			return ProxyPolicy{}, nil, errors.New("resolved proxy auth cannot set a header name")
+		}
 	default:
 		return ProxyPolicy{}, nil, fmt.Errorf("invalid proxy auth kind %q", policy.AuthKind)
 	}
@@ -478,7 +571,95 @@ func resolvedMatchesProxyPolicy(resolved ResolvedCredential, want ProxyPolicy) b
 		Upstream: resolved.Upstream, AuthKind: resolved.AuthKind, Header: resolved.Header,
 		AllowLoopbackHTTP: want.AllowLoopbackHTTP,
 	})
-	return err == nil && current.Upstream == want.Upstream && current.AuthKind == want.AuthKind && current.Header == want.Header
+	if err != nil || current.Upstream != want.Upstream {
+		return false
+	}
+	if want.AuthKind == ProxyAuthResolved {
+		return current.AuthKind == ProxyAuthBearer || current.AuthKind == ProxyAuthHeader
+	}
+	return current.AuthKind == want.AuthKind && current.Header == want.Header
+}
+
+func normalizeAllowedHosts(hosts []string) (map[string]struct{}, error) {
+	if len(hosts) == 0 {
+		return nil, errors.New("remote proxy policy upstream allowlist is required")
+	}
+	allowed := make(map[string]struct{}, len(hosts))
+	for _, value := range hosts {
+		host := strings.ToLower(strings.TrimSpace(value))
+		if host == "" || strings.ContainsAny(host, "/:@?#\\") {
+			return nil, fmt.Errorf("invalid proxy allowlist host %q", value)
+		}
+		allowed[host] = struct{}{}
+	}
+	return allowed, nil
+}
+
+func sortedHostSet(hosts map[string]struct{}) []string {
+	values := make([]string, 0, len(hosts))
+	for host := range hosts {
+		values = append(values, host)
+	}
+	sort.Strings(values)
+	return values
+}
+
+func copyRedactedHeader(destination, source http.Header, secret string) {
+	destination.Del("Content-Length")
+	for name, values := range source {
+		if strings.EqualFold(name, "Content-Length") {
+			continue
+		}
+		for _, value := range values {
+			destination.Add(name, strings.ReplaceAll(value, secret, "[REDACTED]"))
+		}
+	}
+}
+
+func streamRedactedResponse(destination io.Writer, source io.Reader, secret string) {
+	if secret == "" {
+		_, _ = io.Copy(destination, source)
+		return
+	}
+	buffered := bufio.NewWriter(destination)
+	redactor := &exactRedactingWriter{destination: buffered, secret: []byte(secret)}
+	_, _ = io.Copy(redactor, source)
+	_ = redactor.flush()
+	_ = buffered.Flush()
+}
+
+type exactRedactingWriter struct {
+	destination io.Writer
+	secret      []byte
+	pending     []byte
+}
+
+func (w *exactRedactingWriter) Write(data []byte) (int, error) {
+	for _, value := range data {
+		w.pending = append(w.pending, value)
+		for len(w.pending) > 0 && !bytes.HasPrefix(w.secret, w.pending) {
+			if _, err := w.destination.Write(w.pending[:1]); err != nil {
+				return 0, err
+			}
+			w.pending = w.pending[1:]
+		}
+		if bytes.Equal(w.pending, w.secret) {
+			if _, err := io.WriteString(w.destination, "[REDACTED]"); err != nil {
+				return 0, err
+			}
+			w.pending = w.pending[:0]
+		}
+	}
+	return len(data), nil
+}
+
+func (w *exactRedactingWriter) flush() error {
+	if len(w.pending) == 0 {
+		return nil
+	}
+	_, err := w.destination.Write(w.pending)
+	w.pending = nil
+	return err
 }
 
 func normalizedProxyPath(escaped string) (string, error) {
@@ -769,6 +950,49 @@ func (r *Registry) Gateway(home string, logf LogFunc) (*Gateway, error) {
 	}
 	r.gateways[key] = gateway
 	return gateway, nil
+}
+
+func (r *Registry) RemoteGateway(home string, logf LogFunc, options RemoteListenerOptions) (*Gateway, error) {
+	if r == nil {
+		return nil, errors.New("model gateway registry is unavailable")
+	}
+	key, err := filepath.Abs(filepath.Clean(home))
+	if err != nil {
+		return nil, fmt.Errorf("resolve model gateway home: %w", err)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	gateway := r.gateways[key]
+	if gateway == nil {
+		gateway, err = Start(logf)
+		if err != nil {
+			return nil, err
+		}
+		r.gateways[key] = gateway
+	}
+	if gateway.RemoteURL() != "" {
+		return gateway, nil
+	}
+	if err := gateway.EnableRemote(options); err != nil {
+		return nil, err
+	}
+	return gateway, nil
+}
+
+func (r *Registry) RevokeSandbox(home, sandboxID string) {
+	if r == nil || strings.TrimSpace(sandboxID) == "" {
+		return
+	}
+	key, err := filepath.Abs(filepath.Clean(home))
+	if err != nil {
+		return
+	}
+	r.mu.Lock()
+	gateway := r.gateways[key]
+	r.mu.Unlock()
+	if gateway != nil {
+		gateway.RevokeSandbox(sandboxID)
+	}
 }
 
 func (r *Registry) CloseHome(ctx context.Context, home string) error {

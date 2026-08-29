@@ -91,6 +91,30 @@ type Materials struct {
 	SourceWorktree string
 }
 
+const (
+	CredentialMaterialDir           = "/home/user/.gitmoot/credential-gateway"
+	CredentialCACertificatePath     = CredentialMaterialDir + "/ca.pem"
+	CredentialClientCertificatePath = CredentialMaterialDir + "/client.pem"
+	CredentialClientPrivateKeyPath  = CredentialMaterialDir + "/client-key.pem"
+	CredentialClientConfigPath      = CredentialMaterialDir + "/client.conf"
+)
+
+// CredentialMaterial contains only an ephemeral broker identity and client
+// configuration. Provider credentials are forbidden here: they remain in the
+// host-side resolver and never enter an execution instance.
+type CredentialMaterial struct {
+	CACertificate     []byte
+	ClientCertificate []byte
+	ClientPrivateKey  []byte
+	ClientConfig      []byte
+}
+
+// CredentialMaterialInstaller is the optional data-plane capability for
+// installing a job-scoped broker identity after provider provisioning.
+type CredentialMaterialInstaller interface {
+	InstallCredentialMaterial(context.Context, *Instance, CredentialMaterial) error
+}
+
 type Instance struct {
 	ID                  string
 	JobID               string

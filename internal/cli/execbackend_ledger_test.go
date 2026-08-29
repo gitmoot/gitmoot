@@ -33,12 +33,15 @@ func TestProvisionExecutionBackendPreservesInstanceOnProvisionError(t *testing.T
 	worker := jobWorker{ExecutionBackendFactory: func(execbackend.Backend) (execbackend.ExecutionBackend, error) {
 		return inner, nil
 	}}
-	lifecycle, got, err := worker.provisionExecutionBackend(context.Background(), execbackend.Remote, "shell", db.Job{ID: instance.JobID}, time.Minute, "/checkout")
+	lifecycle, got, lease, env, err := worker.provisionExecutionBackend(context.Background(), execbackend.Remote, "shell", db.Job{ID: instance.JobID}, time.Minute, "/checkout")
 	if err == nil || !strings.Contains(err.Error(), "persist running row") {
 		t.Fatalf("provision error = %v", err)
 	}
 	if lifecycle != inner || got != instance {
 		t.Fatalf("provision failure returned lifecycle=%T instance=%+v; teardown handle was discarded", lifecycle, got)
+	}
+	if lease != nil || len(env) != 0 {
+		t.Fatalf("provision failure returned credential lease/env = %v %v", lease, env)
 	}
 }
 

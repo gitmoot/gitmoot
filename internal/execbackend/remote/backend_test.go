@@ -116,6 +116,36 @@ func TestRemoteDestroyIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestRemoteInstallCredentialMaterialUploadsProtectedBrokerOnlyBundle(t *testing.T) {
+	harness := newProviderHarness(t)
+	backend := harness.backend(t)
+	instance, err := backend.Provision(context.Background(), execbackend.JobScope{JobID: "job-credential", TTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	material := execbackend.CredentialMaterial{
+		CACertificate: []byte("ca-certificate"), ClientCertificate: []byte("client-certificate"),
+		ClientPrivateKey: []byte("ephemeral-client-private-key"), ClientConfig: []byte("broker-client-config"),
+	}
+	if err := backend.InstallCredentialMaterial(context.Background(), instance, material); err != nil {
+		t.Fatal(err)
+	}
+	harness.mu.Lock()
+	defer harness.mu.Unlock()
+	want := map[string][]byte{
+		execbackend.CredentialCACertificatePath:     material.CACertificate,
+		execbackend.CredentialClientCertificatePath: material.ClientCertificate,
+		execbackend.CredentialClientPrivateKeyPath:  material.ClientPrivateKey,
+		execbackend.CredentialClientConfigPath:      material.ClientConfig,
+	}
+	if !reflect.DeepEqual(harness.uploads, want) {
+		t.Fatalf("credential uploads = %#v, want paths and byte-identical material", harness.uploads)
+	}
+	if !harness.credentialModeApplied {
+		t.Fatal("credential material permissions were not applied")
+	}
+}
+
 func TestRemoteReapScopesOwnerLivenessToPIDNamespace(t *testing.T) {
 	harness := newProviderHarness(t)
 	reaper := harness.backend(t)
@@ -442,11 +472,13 @@ type createRequest struct {
 type providerHarness struct {
 	t *testing.T
 
-	mu        sync.Mutex
-	creates   []createRequest
-	deleted   []string
-	inventory []e2b.Sandbox
-	upload    []byte
+	mu                    sync.Mutex
+	creates               []createRequest
+	deleted               []string
+	inventory             []e2b.Sandbox
+	upload                []byte
+	uploads               map[string][]byte
+	credentialModeApplied bool
 
 	workspace string
 	control   *httptest.Server
@@ -455,7 +487,7 @@ type providerHarness struct {
 
 func newProviderHarness(t *testing.T) *providerHarness {
 	t.Helper()
-	harness := &providerHarness{t: t, workspace: filepath.Join(t.TempDir(), "sandbox-workspace")}
+	harness := &providerHarness{t: t, workspace: filepath.Join(t.TempDir(), "sandbox-workspace"), uploads: make(map[string][]byte)}
 	harness.control = httptest.NewServer(http.HandlerFunc(harness.serveControl))
 	harness.envd = httptest.NewServer(http.HandlerFunc(harness.serveEnvd))
 	t.Cleanup(harness.control.Close)
@@ -541,6 +573,7 @@ func (h *providerHarness) serveEnvd(w http.ResponseWriter, r *http.Request) {
 		}
 		h.mu.Lock()
 		h.upload = data
+		h.uploads[r.URL.Query().Get("path")] = append([]byte(nil), data...)
 		h.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`[]`))
@@ -594,6 +627,12 @@ func (h *providerHarness) serveStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *providerHarness) runProcess(ctx context.Context, command string, args []string, remoteDir string, env map[string]string) ([]byte, []byte, int, string) {
+	if command == "sh" && len(args) == 2 && args[0] == "-c" && strings.Contains(args[1], "chmod 700 "+execbackend.CredentialMaterialDir) {
+		h.mu.Lock()
+		h.credentialModeApplied = true
+		h.mu.Unlock()
+		return nil, nil, 0, ""
+	}
 	if command == "sh" && reflect.DeepEqual(args, []string{"-c", syncWorkspaceScript}) {
 		h.mu.Lock()
 		archive := append([]byte(nil), h.upload...)

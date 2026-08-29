@@ -122,6 +122,14 @@ func (b *ledgeredExecutionBackend) SyncIn(ctx context.Context, instance *execbac
 	return b.inner.SyncIn(ctx, instance, materials)
 }
 
+func (b *ledgeredExecutionBackend) InstallCredentialMaterial(ctx context.Context, instance *execbackend.Instance, material execbackend.CredentialMaterial) error {
+	installer, ok := b.inner.(execbackend.CredentialMaterialInstaller)
+	if !ok {
+		return fmt.Errorf("execution backend %q cannot install credential gateway material", b.inner.Name())
+	}
+	return installer.InstallCredentialMaterial(ctx, instance, material)
+}
+
 func (b *ledgeredExecutionBackend) Exec(ctx context.Context, instance *execbackend.Instance, command execbackend.Command) (execbackend.Stream, error) {
 	return b.inner.Exec(ctx, instance, command)
 }

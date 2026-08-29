@@ -234,6 +234,12 @@ without direct-auth fallback. The child is also pointed at a credential-free
 credential over the placeholder and the gateway would `401` every job (#936).
 It is off by default and does not cover Codex or Kimi.
 
+For remote shell jobs, the same opt-in can issue an ephemeral mTLS client
+identity and capability bound to the sandbox id, runtime, allowlist, and lease
+expiry. Only a curl-config path enters the environment; the upstream key is
+resolved on the host after authentication and never enters the sandbox. Model
+runtimes remain refused remotely until they can present that identity.
+
 ### Runtime ambient credential hygiene
 
 The optional `[credentials] env_curation = true` policy curates only runtime

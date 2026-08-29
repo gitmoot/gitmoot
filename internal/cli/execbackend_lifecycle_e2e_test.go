@@ -86,9 +86,12 @@ func TestProvisionExecutionBackendLocalBehaviorUnchanged(t *testing.T) {
 	job := db.Job{ID: "local-credential-gate", LifecycleGeneration: 4}
 
 	const ttl = 9 * time.Minute
-	lifecycle, instance, err := worker.provisionExecutionBackend(context.Background(), execbackend.Local, runtime.ShellRuntime, job, ttl, "/checkout")
+	lifecycle, instance, lease, env, err := worker.provisionExecutionBackend(context.Background(), execbackend.Local, runtime.ShellRuntime, job, ttl, "/checkout")
 	if err != nil {
 		t.Fatalf("provisionExecutionBackend(local): %v", err)
+	}
+	if lease != nil || len(env) != 0 {
+		t.Fatalf("local credential gateway lease/env = %v %v", lease, env)
 	}
 	if lifecycle != backend || instance != backend.instance {
 		t.Fatalf("local lifecycle = %T, instance = %+v; want injected backend and its instance", lifecycle, instance)

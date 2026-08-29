@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/execbackend/e2b"
@@ -106,16 +107,18 @@ func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend) (execbac
 		}
 		accountKey := sha256.Sum256([]byte(apiKey))
 		reapKey := fmt.Sprintf("%s|%s|%x", backend, baseURL, accountKey)
+		home := w.workflowHome()
+		revokingBackend := &credentialRevokingExecutionBackend{inner: ledgeredBackend, home: home}
 		if _, loaded := reapedExecutionBackendRoots.LoadOrStore(reapKey, struct{}{}); !loaded {
 			reapCtx, cancel := context.WithTimeout(context.Background(), executionBackendReapTimeout)
 			defer cancel()
-			var reaper execbackend.Reaper = ledgeredBackend
+			var reaper execbackend.Reaper = revokingBackend
 			if _, err := reaper.Reap(reapCtx); err != nil {
 				reapedExecutionBackendRoots.Delete(reapKey)
 				return nil, fmt.Errorf("reap remote execution backends: %w", err)
 			}
 		}
-		return ledgeredBackend, nil
+		return revokingBackend, nil
 	})
 }
 
@@ -139,25 +142,40 @@ func (w jobWorker) executionBackendConfig() (config.RemoteExecConfig, error) {
 	}
 }
 
-func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execbackend.Backend, runtimeName string, job db.Job, ttl time.Duration, checkout string) (execbackend.ExecutionBackend, *execbackend.Instance, error) {
+func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execbackend.Backend, runtimeName string, job db.Job, ttl time.Duration, checkout string) (execbackend.ExecutionBackend, *execbackend.Instance, *credgw.Lease, []string, error) {
 	if w.ExecutionBackendFactory == nil {
-		return nil, nil, nil
+		return nil, nil, nil, nil, nil
+	}
+	if backend == execbackend.Remote && runtimeName != runtime.ShellRuntime {
+		return nil, nil, nil, nil, fmt.Errorf("runtime %q is not supported on the remote execution backend; raw-key fallback is forbidden", runtimeName)
+	}
+	var credentialPlan remoteCredentialGatewayPlan
+	if backend == execbackend.Remote {
+		var err error
+		credentialPlan, err = w.prepareRemoteCredentialGateway(ttl)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
 	}
 	lifecycle, err := w.ExecutionBackendFactory(backend)
 	if err != nil {
-		return nil, nil, fmt.Errorf("construct %s execution backend: %w", backend, err)
+		return nil, nil, nil, nil, fmt.Errorf("construct %s execution backend: %w", backend, err)
 	}
 	instance, err := lifecycle.Provision(ctx, execbackend.JobScope{JobID: job.ID, LifecycleGeneration: job.LifecycleGeneration, TTL: ttl})
 	if err != nil {
 		// A provider can create an instance and then fail to persist its handle in
 		// the ledger. Preserve both values so the caller installs its teardown defer
 		// before handling the error; discarding them here strands a billed sandbox.
-		return lifecycle, instance, fmt.Errorf("provision %s execution backend for job %s: %w", backend, job.ID, err)
+		return lifecycle, instance, nil, nil, fmt.Errorf("provision %s execution backend for job %s: %w", backend, job.ID, err)
 	}
 	if err := lifecycle.SyncIn(ctx, instance, execbackend.Materials{SourceWorktree: checkout}); err != nil {
-		return lifecycle, instance, fmt.Errorf("sync job %s into %s execution backend: %w", job.ID, backend, err)
+		return lifecycle, instance, nil, nil, fmt.Errorf("sync job %s into %s execution backend: %w", job.ID, backend, err)
 	}
-	return lifecycle, instance, nil
+	lease, env, err := w.provisionRemoteCredentialGateway(ctx, backend, runtimeName, job.ID, ttl, credentialPlan, lifecycle, instance)
+	if err != nil {
+		return lifecycle, instance, lease, nil, err
+	}
+	return lifecycle, instance, lease, env, nil
 }
 
 func executionChangeSetCollector(lifecycle execbackend.ExecutionBackend, instance *execbackend.Instance, liveBackend execbackend.Backend, liveJobID string) func(context.Context, execbackend.Backend, string) (*execbackend.ChangeSet, error) {

@@ -626,9 +626,12 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// delivery and is destroyed synchronously on every return path. Host checkout,
 	// git, observation, and finalization remain on checkout/jobRunner; only runtime
 	// delivery executes in the distinct backend workspace.
-	lifecycle, instance, lifecycleErr := w.provisionExecutionBackend(ctx, execBackend, agent.Runtime, job, jobTimeout+runtimeLeaseTeardownGrace, checkout)
+	lifecycle, instance, credentialLease, credentialEnv, lifecycleErr := w.provisionExecutionBackend(ctx, execBackend, agent.Runtime, job, jobTimeout+runtimeLeaseTeardownGrace, checkout)
 	if instance != nil {
 		defer w.destroyExecutionBackend(job.ID, lifecycle, instance)
+	}
+	if credentialLease != nil {
+		defer credentialLease.Revoke()
 	}
 	if lifecycleErr != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, lifecycleErr); finishErr != nil {
@@ -640,6 +643,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if lifecycle != nil && instance != nil {
 		deliveryCheckout = instance.Workspace
 		w.executionRunner = execbackend.InstanceRunner{Backend: lifecycle, Instance: instance}
+		if len(credentialEnv) > 0 {
+			w.executionRunner = subprocess.EnvInjectingRunner{Inner: w.executionRunner, Env: credentialEnv}
+		}
 		if progressTracker != nil {
 			adapter, err = w.executionDeliveryAdapter(agent, deliveryCheckout, relayToken, progressTracker)
 		} else {

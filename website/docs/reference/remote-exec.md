@@ -15,10 +15,14 @@ local_uid = 1000
 local_gid = 1000
 # Use a traversable root when the Gitmoot home is below /root.
 local_root = "/var/tmp/gitmoot-local"
+# For opt-in broker access from a remote shell, configure both:
+# credential_gateway_listen = "0.0.0.0:8443"
+# credential_gateway_url = "https://broker.example.com:8443"
 ```
 
-`local` is the default and the only implemented backend. For an engine-driven
-daemon job, Gitmoot provisions one job-scoped instance, syncs the selected host
+`local` is the default. `remote` provisions E2B for engine-driven shell
+implement jobs; unsupported job types and model runtimes refuse before
+provider allocation. For an engine-driven daemon job, Gitmoot provisions one job-scoped instance, syncs the selected host
 checkout into a distinct detached Git worktree, streams runtime commands there,
 collects changes, and destroys the instance after the job. The same instance
 survives Mailbox repair deliveries. An implement job's changes return through
@@ -68,13 +72,23 @@ Gitmoot reads `[remote_exec]` when it dispatches a job; it is not cached and
 needs no SIGHUP wiring. Foreground dispatch retains the host runner path because
 the lifecycle is acquired at the daemon job-worker boundary.
 
+When `[credentials].model_gateway = true`, a remote shell job receives the
+non-secret route in `GITMOOT_CREDENTIAL_GATEWAY_URL` and a path to an owner-only
+curl configuration in `GITMOOT_CREDENTIAL_GATEWAY_CURL_CONFIG` for the
+sandbox-reachable credential gateway. The second listener requires a per-job
+mTLS certificate and an opaque
+capability bound to the sandbox id, the `shell` runtime, the job lease expiry,
+and the exact upstream allowlist. Provider keys remain host-side and are loaded
+only after those checks pass. The route is revoked before sandbox teardown.
+Claude, Codex, Kimi, and omp remain unsupported on `remote` until their clients
+can target this mTLS path; Gitmoot never supplies a raw key as a fallback.
+
 A job payload's `exec_backend` field overrides the config value for that one
 job. When either selector is explicitly present its value must be non-blank;
 an absent selector defaults to `local`, while `backend = ""` or an explicit
 `"exec_backend":""` fails loudly.
 
-Any value outside the allowed set — currently only `local` — **fails the job
+Any value outside the allowed set (`local`, `remote`) **fails the job
 loudly at dispatch**: the failure names the offending value and the allowed
-set (for example `unknown execution backend "e2b" (allowed: local)`). There
-is no silent fallback. Remote backends (see the parallel-isolated-execution
-epic, #1529) will extend the allowed set in later phases.
+set (for example `unknown execution backend "e2b" (allowed: local, remote)`).
+There is no silent fallback.

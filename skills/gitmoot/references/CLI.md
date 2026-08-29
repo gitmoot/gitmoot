@@ -226,12 +226,14 @@ model_gateway_allow_hosts = ["api.anthropic.com"]
 # keychain_path = "/absolute/operator/path/keychain.env"
 ```
 
-Set `model_gateway = true` to opt Claude into the daemon-owned loopback model
-gateway. Each delivery receives a random job-scoped placeholder and
+Set `model_gateway = true` to opt local Claude into the daemon-owned loopback
+model gateway and to make broker material available to remote shell jobs. Each local Claude delivery receives a random job-scoped placeholder and
 `ANTHROPIC_BASE_URL`; only the gateway holds the snapshotted real credential and
 it forwards only to an exact allowlisted hostname. Gateway startup, credential,
 and allowlist failures are fail-closed. The option is off by default and does
-not change Codex or Kimi.
+not enable Codex, Claude, Kimi, or omp on the remote backend. Remote shells get
+only `GITMOOT_CREDENTIAL_GATEWAY_CURL_CONFIG`, whose owner-only file carries a
+lease-bounded mTLS identity and capability; the provider key remains host-side.
 
 With `env_curation = false`, runtime subprocesses inherit the full foreground or
 daemon environment exactly as before. With it enabled, the base allowlist is:
@@ -279,8 +281,9 @@ remain P3.
 
 ## Execution Backend
 
-`[remote_exec] backend = "local"` is the default and only implemented execution
-backend. Engine-driven daemon jobs provision one job-scoped detached worktree,
+`[remote_exec] backend = "local"` is the default. `remote` provisions E2B for
+engine-driven shell implement jobs; unsupported job types and model runtimes
+refuse before provider allocation. Engine-driven daemon jobs provision one job-scoped detached worktree,
 run the runtime there with streaming preserved, transactionally import implement
 changes into the host worktree before result observation, and then destroy the
 instance. The host finalizer remains the only committer and pusher. The instance
@@ -292,6 +295,11 @@ the host filesystem, so bundle/base-ref hydration is reserved for a future remot
 provider. Foreground dispatch remains on the host path. Unknown backend names and
 explicit blank selectors fail loudly; a job payload's `exec_backend` overrides
 the config for that job.
+
+Remote broker access additionally requires paired
+`credential_gateway_listen` and `credential_gateway_url` values. The first is
+the daemon bind address and the second is the HTTPS origin reachable from the
+sandbox. The listener is mTLS-only; credentials are revoked before teardown.
 
 Set numeric `[remote_exec] local_uid` and `local_gid` together to run local
 backend agent commands as that non-root identity. Gitmoot never invents an

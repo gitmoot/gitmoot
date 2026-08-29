@@ -4,6 +4,7 @@ package remote
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"errors"
@@ -95,6 +96,7 @@ type sandboxState struct {
 var _ execbackend.ExecutionBackend = (*Backend)(nil)
 var _ execbackend.Reaper = (*Backend)(nil)
 var _ execbackend.InventoryReaper = (*Backend)(nil)
+var _ execbackend.CredentialMaterialInstaller = (*Backend)(nil)
 
 // NewBackend constructs an unwired E2B lifecycle provider.
 func NewBackend(client *e2b.Client, options Options) (*Backend, error) {
@@ -250,6 +252,43 @@ func (b *Backend) SyncIn(ctx context.Context, instance *execbackend.Instance, ma
 	state.hostBase = hostBase
 	state.remoteBase = remoteBase
 	instance.BaseHEAD = hostBase
+	return nil
+}
+
+// InstallCredentialMaterial writes only the short-lived broker identity. The
+// upstream model credential is never passed to this method or the sandbox.
+func (b *Backend) InstallCredentialMaterial(ctx context.Context, instance *execbackend.Instance, material execbackend.CredentialMaterial) error {
+	state, err := b.stateFor(instance)
+	if err != nil {
+		return err
+	}
+	files := []struct {
+		path string
+		data []byte
+	}{
+		{execbackend.CredentialCACertificatePath, material.CACertificate},
+		{execbackend.CredentialClientCertificatePath, material.ClientCertificate},
+		{execbackend.CredentialClientPrivateKeyPath, material.ClientPrivateKey},
+		{execbackend.CredentialClientConfigPath, material.ClientConfig},
+	}
+	for _, file := range files {
+		if len(file.data) == 0 {
+			return fmt.Errorf("remote credential material %s is empty", path.Base(file.path))
+		}
+		if err := state.envd.Upload(ctx, file.path, bytes.NewReader(file.data)); err != nil {
+			return fmt.Errorf("upload remote credential material %s: %w", path.Base(file.path), err)
+		}
+	}
+	result, err := runEnvd(ctx, state.envd, e2b.StartRequest{
+		Name: "sh", Args: []string{"-c", "chmod 700 " + execbackend.CredentialMaterialDir + " && chmod 600 " + execbackend.CredentialMaterialDir + "/*"},
+		Dir: "/home/user", MaxOutputBytes: 256,
+	})
+	if err != nil {
+		return fmt.Errorf("protect remote credential material: %w", err)
+	}
+	if strings.TrimSpace(result.Stderr) != "" {
+		return errors.New("protect remote credential material returned stderr")
+	}
 	return nil
 }
 

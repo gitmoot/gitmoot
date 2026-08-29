@@ -122,13 +122,15 @@ resolved for each request and they do not alter Claude's model-gateway
 placeholder flow. Ordinary non-pipeline agent jobs and delegated children
 receive no pipeline-stage keys.
 
-The feature is off by default and currently covers Claude only. A populated
+The feature is off by default. It covers local Claude and can issue broker
+material to an opted-in remote shell. A populated
 `runtime-auth.env` is required while it is enabled; Gitmoot fails the delivery
 instead of falling back to ambient auth, Claude's credential store, or direct
 upstream egress. `model_gateway_allow_hosts` is an exact hostname allowlist and
 defaults to `api.anthropic.com`. The upstream is fixed by Gitmoot, not selected
-by the child. Credentials are read once when the adapter is built, never once
-per proxied request, so rotation applies to the next adapter/job.
+by the child. Local Claude credentials are snapshotted when the adapter is
+built. Remote-shell broker credentials are resolved per request, but only after
+mTLS, capability, sandbox/runtime, expiry, and allowlist checks pass.
 
 ## Curated environment
 

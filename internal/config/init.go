@@ -142,6 +142,8 @@ artifact_blobs = %q
 # e2b_template = "gitmoot-shell" # required for remote
 # e2b_base_url = "https://api.e2b.app" # optional control-plane override
 # e2b_domain = "e2b.app" # optional sandbox-domain override
+# credential_gateway_listen = "0.0.0.0:8443" # pair: daemon bind address
+# credential_gateway_url = "https://broker.example.com:8443" # pair: sandbox-reachable origin
 
 # [transcripts] is ON by default. Raw unredacted runtime output
 # is retained in 0600 per-job append logs for deterministic trajectory export.
