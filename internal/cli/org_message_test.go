@@ -5,8 +5,10 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -79,12 +81,34 @@ func TestOrgMessageSendAllowsDifferentlyScopedSameParentSiblings(t *testing.T) {
 	if note.Author != from {
 		t.Fatalf("durable author=%q, want sender %q", note.Author, from)
 	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := runWorkflowJournal([]string{"show-note", strconv.FormatInt(note.ID, 10), "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("note show code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	for _, want := range []string{"note: " + strconv.FormatInt(note.ID, 10), "workflow: gitmoot/1692-test", "author: gm-omp-nag", note.Body} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("note show output=%q, want %q", stdout.String(), want)
+		}
+	}
 	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("pending wakes=%+v err=%v, want one direct wake", pending, err)
 	}
 	if pending[0].SourceKind != db.WakeOutboxSourceWorkflowNote || pending[0].TargetRole != "gm-omp-impl" || pending[0].CoalesceKey != db.WakeOutboxReplyCoalescePrefix+"gm-omp-impl" {
 		t.Fatalf("direct wake=%+v", pending[0])
+	}
+	wakeEvent, err := wakeOutboxEvent([]db.WakeOutboxObligation{{
+		SourceKind:  pending[0].SourceKind,
+		SourceID:    pending[0].SourceID,
+		TargetRole:  pending[0].TargetRole,
+		CoalesceKey: pending[0].CoalesceKey,
+	}}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "gitmoot workflow show-note " + strconv.FormatInt(note.ID, 10); !strings.Contains(wakeEvent.Detail, want) {
+		t.Fatalf("wake detail=%q, want retrieval command %q", wakeEvent.Detail, want)
 	}
 	unacknowledged, err := store.ListUnacknowledgedOrgDirectives(context.Background(), "gm-omp-impl")
 	if err != nil || len(unacknowledged) != 0 {

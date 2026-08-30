@@ -94,3 +94,16 @@ func TestRunRepoCollisionsReportsCleanDistinctFileSets(t *testing.T) {
 		t.Fatalf("clean code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 }
+
+func TestRunRepoCollisionsJSONReturnsEmptyArray(t *testing.T) {
+	client := &fakeRepoCollisionClient{}
+	previous := newRepoCollisionClient
+	newRepoCollisionClient = func() repoCollisionClient { return client }
+	t.Cleanup(func() { newRepoCollisionClient = previous })
+
+	var stdout, stderr bytes.Buffer
+	code := runRepo([]string{"collisions", "gitmoot/gitmoot", "--json"}, &stdout, &stderr)
+	if code != 0 || stdout.String() != "[]\n" {
+		t.Fatalf("clean JSON code=%d out=%q err=%q, want []", code, stdout.String(), stderr.String())
+	}
+}

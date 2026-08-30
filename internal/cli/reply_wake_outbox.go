@@ -365,6 +365,9 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 			break
 		}
 		detail := fmt.Sprintf("%d new items, oldest id %s", len(batch), oldest.SourceID)
+		if oldest.SourceKind == db.WakeOutboxSourceWorkflowNote {
+			detail += "; inspect with gitmoot workflow show-note " + oldest.SourceID
+		}
 		event = events.NewEvent(
 			events.EventOrgReply,
 			"org-reply:"+role,

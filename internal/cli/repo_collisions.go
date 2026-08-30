@@ -100,7 +100,7 @@ func detectOpenPRFileCollisions(ctx context.Context, client repoCollisionClient,
 		fileSets[pull.Number] = set
 	}
 
-	var collisions []repoPRCollision
+	collisions := make([]repoPRCollision, 0)
 	for i := 0; i < len(pulls); i++ {
 		for j := i + 1; j < len(pulls); j++ {
 			first, second := pulls[i].Number, pulls[j].Number

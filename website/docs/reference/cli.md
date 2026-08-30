@@ -334,7 +334,7 @@ primary checkout; an existing valid linked checkout remains usable.
 distinct pair's changed-file sets, and prints one warning per non-empty
 intersection with both PR numbers and the sorted shared paths. It exits 1 when
 collisions exist, 0 when every open PR pair is disjoint, and supports structured
-output with `--json`.
+output with `--json`; a clean result is the iterable empty array `[]`.
 
 Use `daemon start` for the background daemon. Use `daemon run` only when the
 user explicitly wants a foreground process. Keep the default `--workers 1`
@@ -1500,8 +1500,11 @@ message each other if and only if their non-empty `parent` values are equal.
 Repository scope does not grant this channel, and `owner` has no special case.
 The typed note
 `[org:message to=<to> from=<from> wf=<workflow>] <message>` and its addressed
-`reply:<role>` wake row commit atomically. Messages create no directive,
-acknowledgment, completion, TTL, or nag obligation.
+`reply:<role>` wake row commit atomically. The wake includes the exact
+`gitmoot workflow show-note <id>` retrieval command; that command renders the
+citable row's workflow, author, optional repository, timestamp, and body, or
+returns the row as JSON. Messages create no directive, acknowledgment,
+completion, TTL, or nag obligation.
 
 `gitmoot org escalate resolve <escalation-note-id> [--by <role>] [--note
 <answer-note-id>] [--home <dir>]` appends a typed resolution marker to the same
