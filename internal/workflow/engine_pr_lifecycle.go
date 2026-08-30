@@ -72,6 +72,16 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 			return e.recordPullRequestBaseline(ctx, event)
 		}
 		reviewers = eligible
+		for _, reviewer := range reviewers {
+			if err := e.ensureAgentAllowed(ctx, JobRequest{
+				Agent:  reviewer,
+				Action: "review",
+				Repo:   event.Repo,
+				Branch: event.Branch,
+			}, ref); err != nil {
+				return err
+			}
+		}
 		selected, familyDropped, family, err := e.selectNativeReviewFamily(ctx, reviewers)
 		if err != nil {
 			return err
@@ -210,11 +220,7 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 		}
 		requests = append(requests, request)
 	}
-	for _, request := range requests {
-		if err := e.ensureAgentAllowed(ctx, request, ref); err != nil {
-			return err
-		}
-	}
+
 	for _, request := range requests {
 		if err := e.enqueue(ctx, request); err != nil {
 			return err

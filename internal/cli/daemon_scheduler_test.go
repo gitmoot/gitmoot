@@ -915,7 +915,9 @@ func TestRunQueuedJobsRefreshesImplementedHeadBeforeReviewDispatch(t *testing.T)
 		return adapter, nil
 	}
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
-		return daemonWorkflowEngine(store, github.NoopClient{}, checkout, "")
+		engine := daemonWorkflowEngine(store, github.NoopClient{}, checkout, "")
+		engine.NativeReviewFanoutEnabled = func(string) bool { return true }
+		return engine
 	}
 
 	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
@@ -3395,7 +3397,9 @@ func TestRetryPendingJobAdvancementsRefreshesImplementedHeadBeforePreflight(t *t
 	}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
-		return daemonWorkflowEngine(store, github.NoopClient{}, checkout, "")
+		engine := daemonWorkflowEngine(store, github.NoopClient{}, checkout, "")
+		engine.NativeReviewFanoutEnabled = func(string) bool { return true }
+		return engine
 	}
 
 	if err := retryPendingJobAdvancements(ctx, worker, "", "", nil, newTickCandidates(worker.Store)); err != nil {
