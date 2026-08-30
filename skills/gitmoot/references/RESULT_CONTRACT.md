@@ -17,6 +17,21 @@ truthful, and tied to work that actually happened.
 }
 ```
 
+## Review severity
+
+Review results may add a top-level `"severity": "P0"` field. A
+`changes_requested` review must set it to the highest-severity finding, using
+one of `P0`, `P1`, `P2`, or `P3` (`P0` is most severe). Approved reviews may
+include it when reporting non-blocking findings; approved reviews with no
+findings and non-review jobs omit it.
+
+This field is the engine-readable round severity. A `severity` key nested inside
+an individual `findings[]` object remains useful for display, but does not
+replace the top-level field.
+
+Session review jobs use the same rule. Pass `--severity P0|P1|P2|P3` to
+`job close` or `job record` when the decision is `changes_requested`.
+
 ## Display-only in-session review state
 
 An inline PR review can be recorded with `job open --type review --pr <n>

@@ -18,11 +18,15 @@ func openAwaitedFactTestStore(t *testing.T) *Store {
 	return store
 }
 
-func awaitedReviewPayload(t *testing.T, repo string, pullRequest int, headSHA, decision, workflowID string) string {
+func awaitedReviewPayload(t *testing.T, repo string, pullRequest int, headSHA, decision, workflowID string, severity ...string) string {
 	t.Helper()
+	result := map[string]any{"decision": decision}
+	if len(severity) > 0 {
+		result["severity"] = severity[0]
+	}
 	payload := map[string]any{
 		"repo": repo, "pull_request": pullRequest, "head_sha": headSHA,
-		"workflow_id": workflowID, "result": map[string]any{"decision": decision},
+		"workflow_id": workflowID, "result": result,
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -207,7 +211,7 @@ func TestSucceededReviewVerdictsFiltersCanonicalRows(t *testing.T) {
 	seed("valid-a", "audit-a", "review", "succeeded", "Acme/Widget", 52,
 		awaitedReviewPayload(t, "Acme/Widget", 52, "HEAD-A", " APPROVED ", "valid-a"))
 	seed("valid-z", "audit-z", "review", "succeeded", "acme/widget", 52,
-		awaitedReviewPayload(t, "acme/widget", 52, "head-a", "changes_requested", "valid-z"))
+		awaitedReviewPayload(t, "acme/widget", 52, "head-a", "changes_requested", "valid-z", " P1 "))
 	seed("skipped-abstention", "audit-skipped", "review", "succeeded", "acme/widget", 52,
 		awaitedReviewPayload(t, "acme/widget", 52, "head-a", "skipped", "skipped-abstention"))
 	seed("wrong-pr", "audit", "review", "succeeded", "acme/widget", 53,
@@ -245,10 +249,10 @@ func TestSucceededReviewVerdictsFiltersCanonicalRows(t *testing.T) {
 	if len(got) != 3 {
 		t.Fatalf("verdicts = %+v, want exactly the three rows selected by denormalized repo/PR", got)
 	}
-	if got[0].JobID != "valid-a" || got[0].Agent != "audit-a" || got[0].HeadSHA != "head-a" || got[0].Decision != "approved" {
+	if got[0].JobID != "valid-a" || got[0].Agent != "audit-a" || got[0].HeadSHA != "head-a" || got[0].Decision != "approved" || got[0].Severity != "" {
 		t.Fatalf("newest verdict = %+v", got[0])
 	}
-	if got[1].JobID != "valid-z" || got[1].HeadSHA != "head-a" || got[1].Decision != "changes_requested" {
+	if got[1].JobID != "valid-z" || got[1].HeadSHA != "head-a" || got[1].Decision != "changes_requested" || got[1].Severity != "P1" {
 		t.Fatalf("equal-timestamp id-desc verdict = %+v", got[1])
 	}
 	if got[2].JobID != "columns-win" || got[2].HeadSHA != "head-columns" || got[2].Decision != "approved" {

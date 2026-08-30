@@ -52,6 +52,7 @@ type fieldAnnotation struct {
 // one here changes the shape agents copy, so treat them as load-bearing.
 var resultFieldAnnotations = map[string]fieldAnnotation{
 	"decision":        {example: enumExample(workflow.ResultDecisions)},
+	"severity":        {help: `top-level severity (string, one of ` + enumList(workflow.ReviewSeverities) + `): required when a review returns changes_requested; report the highest-severity finding. Omit it for non-review results and approved reviews with no findings.`},
 	"summary":         {example: `"..."`},
 	"findings":        {example: "[]"},
 	"changes_made":    {example: "[]"},
@@ -235,6 +236,11 @@ func renderDelegationHelp() string {
 	// "empty delegations = done" signal and the delegations[<index>] error shape.
 	b.WriteString("- Leave delegations empty ([]) when no follow-up agents are needed — that is how you signal the work is complete.\n")
 	b.WriteString("- Validation errors name the offending entry as delegations[<index>] (id \"<id>\"); fix every listed field.\n")
+	// severity is a top-level review field. It stays out of the generic example
+	// shape because non-review results must not invent a review severity.
+	if h := resultFieldAnnotations["severity"].help; h != "" {
+		b.WriteString("- " + h + "\n")
+	}
 	// artifact_body lives on the top-level result, not on a delegation, but it
 	// is conditionally required by delegations, so document it here.
 	if h := resultFieldAnnotations["artifact_body"].help; h != "" {

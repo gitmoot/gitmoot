@@ -1247,7 +1247,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	m.recordPresetSessionState(ctx, agent, payload, agent.RuntimeRef, referenceUsed)
 	payload.RawOutputs = append(payload.RawOutputs, firstRaw)
 
-	result, parseErr := ExtractAgentResult(firstRaw)
+	result, parseErr := extractAgentResultForAction(firstRaw, job.Type)
 	if parseErr != nil {
 		// The agent may have delivered useful work but omitted the required
 		// gitmoot_result envelope. Re-ask with the repair prompt up to
@@ -1313,7 +1313,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 			lastRaw = repairRaw
 			lastDiag = repairDiag
 
-			result, parseErr = ExtractAgentResult(repairRaw)
+			result, parseErr = extractAgentResultForAction(repairRaw, job.Type)
 			if parseErr == nil {
 				break
 			}
@@ -1402,7 +1402,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 				agent.RuntimeRef = refreshedRef
 			}
 			payload.RawOutputs = append(payload.RawOutputs, correctionRaw)
-			result, parseErr = ExtractAgentResult(correctionRaw)
+			result, parseErr = extractAgentResultForAction(correctionRaw, job.Type)
 			if parseErr != nil {
 				message := fmt.Sprintf("produce correction output malformed: %v", parseErr)
 				payload.Result = &AgentResult{Decision: "failed", Summary: message}

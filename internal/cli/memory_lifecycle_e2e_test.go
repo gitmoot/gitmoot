@@ -431,7 +431,7 @@ func TestMemoryOrdinaryTerminalProducerSubstantivenessGateE2E(t *testing.T) {
 	// Shell fixture: capture the delivered prompt, then branch the decision on a
 	// CHANGES marker carried ONLY in JOB 1's instructions. Jobs without the marker
 	// return a plain approved result (a trivial no-signal success).
-	changesResult := `{"gitmoot_result":{"decision":"changes_requested","summary":"needs work","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+	changesResult := `{"gitmoot_result":{"decision":"changes_requested","severity":"P2","summary":"needs work","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
 	promptFile := filepath.Join(t.TempDir(), "prompt")
 	script := fmt.Sprintf(`printf '%%s' "$1" > %q
 case "$1" in

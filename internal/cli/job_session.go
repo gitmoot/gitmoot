@@ -32,6 +32,7 @@ type jobSessionOutput struct {
 	Repo             string `json:"repo"`
 	ExternallyDriven bool   `json:"externally_driven"`
 	Decision         string `json:"decision,omitempty"`
+	Severity         string `json:"severity,omitempty"`
 	Summary          string `json:"summary,omitempty"`
 	PullRequest      int    `json:"pull_request,omitempty"`
 	HeadSHA          string `json:"head_sha,omitempty"`
@@ -128,6 +129,7 @@ func runJobClose(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	decision := fs.String("decision", "", "result decision: "+strings.Join(workflow.ResultDecisions, "|"))
+	severity := fs.String("severity", "", "review severity: "+strings.Join(workflow.ReviewSeverities, "|"))
 	summary := fs.String("summary", "", "optional result summary")
 	pr := fs.Int("pr", 0, "optional pull request number to record")
 	headSHA := fs.String("head-sha", "", "optional pull request head SHA to record")
@@ -164,6 +166,9 @@ func runJobClose(args []string, stdout, stderr io.Writer) int {
 	if !validateSessionDecision(*decision, stderr) {
 		return 2
 	}
+	if !validateSessionSeverity("", *decision, *severity, stderr) {
+		return 2
+	}
 	if *inputTokens < 0 || *outputTokens < 0 {
 		fmt.Fprintln(stderr, "job close: --input-tokens and --output-tokens must be non-negative")
 		return 2
@@ -174,6 +179,7 @@ func runJobClose(args []string, stdout, stderr io.Writer) int {
 		engine := sessionWorkflowEngine(store, paths.Home)
 		job, err := engine.CloseExternalJobWithUsage(context.Background(), jobID, workflow.AgentResult{
 			Decision: *decision,
+			Severity: strings.TrimSpace(*severity),
 			Summary:  strings.TrimSpace(*summary),
 		}, *pr, *headSHA, *branch, workflow.ExternalJobUsage{
 			Model:        strings.TrimSpace(*model),
@@ -192,6 +198,7 @@ func runJobClose(args []string, stdout, stderr io.Writer) int {
 			Repo:             payload.Repo,
 			ExternallyDriven: job.ExternallyDriven,
 			Decision:         *decision,
+			Severity:         strings.TrimSpace(*severity),
 			Summary:          strings.TrimSpace(*summary),
 			PullRequest:      payload.PullRequest,
 			HeadSHA:          loadSessionJobDisplayHeadSHA(context.Background(), store, job.ID),
@@ -213,6 +220,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 	repo := fs.String("repo", "", "repo scope as owner/repo (must be tracked)")
 	typeName := fs.String("type", "", "job type: "+strings.Join(workflow.DelegationActions, "|"))
 	decision := fs.String("decision", "", "result decision: "+strings.Join(workflow.ResultDecisions, "|"))
+	severity := fs.String("severity", "", "review severity: "+strings.Join(workflow.ReviewSeverities, "|"))
 	title := fs.String("title", "", "optional human title for the job")
 	summary := fs.String("summary", "", "optional result summary")
 	task := fs.String("task", "", "optional task id to associate")
@@ -243,6 +251,9 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if !validateSessionDecision(*decision, stderr) {
+		return 2
+	}
+	if !validateSessionSeverity(action, *decision, *severity, stderr) {
 		return 2
 	}
 	if *inputTokens < 0 || *outputTokens < 0 {
@@ -277,6 +288,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 		}
 		job, err := engine.CloseExternalJobWithUsage(context.Background(), opened.ID, workflow.AgentResult{
 			Decision: *decision,
+			Severity: strings.TrimSpace(*severity),
 			Summary:  strings.TrimSpace(*summary),
 		}, *pr, *headSHA, *branch, workflow.ExternalJobUsage{
 			Model:        strings.TrimSpace(*model),
@@ -295,6 +307,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 			Repo:             fullName,
 			ExternallyDriven: job.ExternallyDriven,
 			Decision:         *decision,
+			Severity:         strings.TrimSpace(*severity),
 			Summary:          strings.TrimSpace(*summary),
 			PullRequest:      payload.PullRequest,
 			HeadSHA:          loadSessionJobDisplayHeadSHA(context.Background(), store, job.ID),
@@ -339,6 +352,31 @@ func validateSessionDecision(value string, stderr io.Writer) bool {
 	}
 	fmt.Fprintf(stderr, "invalid --decision %q; want one of %s\n", value, strings.Join(workflow.ResultDecisions, ", "))
 	return false
+}
+
+// validateSessionSeverity checks the optional review-severity flag before a
+// one-shot record creates durable state. Close operations repeat this validation
+// in the workflow layer after resolving the stored job action.
+func validateSessionSeverity(action, decision, value string, stderr io.Writer) bool {
+	severity := strings.TrimSpace(value)
+	if severity != "" {
+		valid := false
+		for _, candidate := range workflow.ReviewSeverities {
+			if severity == candidate {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			fmt.Fprintf(stderr, "invalid --severity %q; want one of %s\n", value, strings.Join(workflow.ReviewSeverities, ", "))
+			return false
+		}
+	}
+	if action == "review" && decision == "changes_requested" && severity == "" {
+		fmt.Fprintln(stderr, "review changes_requested requires --severity")
+		return false
+	}
+	return true
 }
 
 // validateSessionAgentRepo confirms the agent and repo exist, returning the
@@ -412,6 +450,9 @@ func printJobSessionOutput(stdout io.Writer, out jobSessionOutput, jsonOutput bo
 	writeLine(stdout, "repo: %s", out.Repo)
 	if out.Decision != "" {
 		writeLine(stdout, "decision: %s", out.Decision)
+	}
+	if out.Severity != "" {
+		writeLine(stdout, "severity: %s", out.Severity)
 	}
 	if out.Summary != "" {
 		writeLine(stdout, "summary: %s", out.Summary)

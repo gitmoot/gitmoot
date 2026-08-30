@@ -35,6 +35,11 @@ const PipelineJobSender = "pipeline"
 // ResultDecisions are the allowed values of AgentResult.Decision.
 var ResultDecisions = []string{"approved", "changes_requested", "blocked", "implemented", "failed", "skipped"}
 
+// ReviewSeverities are ordered from most to least severe. A review returning
+// changes_requested must report the highest-severity finding through this
+// engine-readable field rather than only in prose.
+var ReviewSeverities = []string{"P0", "P1", "P2", "P3"}
+
 // DelegationActions is the canonical set of delegation/session job actions.
 var DelegationActions = []string{"ask", "review", "implement"}
 
@@ -129,7 +134,11 @@ type Learning struct {
 var LearningScopes = []string{"repo", "general"}
 
 type AgentResult struct {
-	Decision     string            `json:"decision"`
+	Decision string `json:"decision"`
+	// Severity is the highest-severity review finding. It is optional for
+	// non-review results and approved reviews, but required for a review that
+	// requests changes.
+	Severity     string            `json:"severity,omitempty"`
 	Summary      string            `json:"summary"`
 	Findings     []json.RawMessage `json:"findings"`
 	ChangesMade  []string          `json:"changes_made"`
@@ -224,6 +233,33 @@ func ExtractAgentResult(output string) (AgentResult, error) {
 	return AgentResult{}, errors.New("missing valid gitmoot_result JSON object")
 }
 
+// extractAgentResultForAction applies action-specific contract rules after the
+// generic wire object is parsed. changes_requested is also a valid pipeline
+// produce outcome, so only review jobs require a severity.
+func extractAgentResultForAction(output, action string) (AgentResult, error) {
+	result, err := ExtractAgentResult(output)
+	if err != nil {
+		return AgentResult{}, err
+	}
+	if err := validateAgentResultForAction(result, action); err != nil {
+		return AgentResult{}, err
+	}
+	return result, nil
+}
+
+// validateAgentResultForAction enforces constraints that depend on the job
+// action. Callers that receive an AgentResult directly use this after resolving
+// the job action from durable state.
+func validateAgentResultForAction(result AgentResult, action string) error {
+	if err := validateAgentResultSeverity(result); err != nil {
+		return err
+	}
+	if strings.TrimSpace(action) == "review" && result.Decision == "changes_requested" && result.Severity == "" {
+		return errors.New("gitmoot_result severity is required when a review requests changes")
+	}
+	return nil
+}
+
 func validateAgentResultFields(raw json.RawMessage) error {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {
@@ -266,6 +302,9 @@ func delegationFieldError(i int, d Delegation, field, msg string) error {
 func validateAgentResult(result AgentResult) error {
 	if _, ok := allowedSet(ResultDecisions)[result.Decision]; !ok {
 		return fmt.Errorf("unsupported gitmoot_result decision %q", result.Decision)
+	}
+	if err := validateAgentResultSeverity(result); err != nil {
+		return err
 	}
 	if strings.TrimSpace(result.Summary) == "" {
 		return errors.New("gitmoot_result summary is required")
@@ -327,6 +366,14 @@ func validateAgentResult(result AgentResult) error {
 	}
 	if delegationsRequestArtifacts(result.Delegations) && strings.TrimSpace(result.ArtifactBody) == "" {
 		return errors.New("artifact_body is required when delegations request artifacts")
+	}
+	return nil
+}
+
+func validateAgentResultSeverity(result AgentResult) error {
+	severity := strings.TrimSpace(result.Severity)
+	if severity != "" && (result.Severity != severity || !slices.Contains(ReviewSeverities, severity)) {
+		return fmt.Errorf("unsupported gitmoot_result severity %q (want one of %s)", result.Severity, strings.Join(ReviewSeverities, ", "))
 	}
 	return nil
 }

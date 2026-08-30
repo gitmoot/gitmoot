@@ -18,6 +18,10 @@ import (
 // `sh -c <cmd> gitmoot <prompt>`, so the whole pipeline chain runs with NO LLM and
 // NO network — fully deterministic offline (the #446/#533 shell-runtime idiom).
 func pipelineStageResultCmd(decision, summary string, needs []string) string {
+	return pipelineStageResultCmdWithSeverity(decision, summary, needs, "")
+}
+
+func pipelineStageResultCmdWithSeverity(decision, summary string, needs []string, severity string) string {
 	needsJSON := "[]"
 	if len(needs) > 0 {
 		quoted := make([]string, 0, len(needs))
@@ -26,7 +30,11 @@ func pipelineStageResultCmd(decision, summary string, needs []string) string {
 		}
 		needsJSON = "[" + strings.Join(quoted, ",") + "]"
 	}
-	return `printf '%s' '{"gitmoot_result":{"decision":"` + decision + `","summary":"` + summary +
+	severityJSON := ""
+	if severity != "" {
+		severityJSON = `,"severity":"` + severity + `"`
+	}
+	return `printf '%s' '{"gitmoot_result":{"decision":"` + decision + `"` + severityJSON + `,"summary":"` + summary +
 		`","findings":[],"changes_made":[],"tests_run":[],"needs":` + needsJSON + `,"delegations":[]}}'`
 }
 

@@ -157,14 +157,23 @@ func TestJobCloseAppliesDecision(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"job", "close", opened.JobID, "--home", home, "--decision", "changes_requested", "--summary", "needs work", "--pr", "9", "--head-sha", "close-head", "--json"}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"job", "close", opened.JobID, "--home", home, "--decision", "changes_requested", "--summary", "needs work", "--pr", "9", "--head-sha", "close-head", "--json"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "severity is required") {
+		t.Fatalf("job close without severity exit = %d, stderr=%s", code, stderr.String())
+	}
+	if stored, err := store.GetJob(context.Background(), opened.JobID); err != nil || stored.State != string(workflow.JobRunning) {
+		t.Fatalf("job after rejected close = %+v, err=%v; want running", stored, err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"job", "close", opened.JobID, "--home", home, "--decision", "changes_requested", "--severity", "P1", "--summary", "needs work", "--pr", "9", "--head-sha", "close-head", "--json"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("job close exit = %d, stderr=%s", code, stderr.String())
 	}
 	var closed jobSessionOutput
 	if err := json.Unmarshal(stdout.Bytes(), &closed); err != nil {
 		t.Fatalf("decode close JSON: %v", err)
 	}
-	if closed.State != string(workflow.JobSucceeded) || closed.Decision != "changes_requested" || closed.PullRequest != 9 || closed.HeadSHA != "close-head" {
+	if closed.State != string(workflow.JobSucceeded) || closed.Decision != "changes_requested" || closed.Severity != "P1" || closed.PullRequest != 9 || closed.HeadSHA != "close-head" {
 		t.Fatalf("close output = %+v", closed)
 	}
 	stored, err := store.GetJob(context.Background(), opened.JobID)
@@ -183,6 +192,9 @@ func TestJobCloseAppliesDecision(t *testing.T) {
 	}
 	if payload.ReviewStatusGrade != evidence.GradeReported {
 		t.Fatalf("stored review status grade = %q, want reported", payload.ReviewStatusGrade)
+	}
+	if payload.Result == nil || payload.Result.Severity != "P1" {
+		t.Fatalf("stored result = %+v, want severity P1", payload.Result)
 	}
 	if got := loadSessionJobDisplayHeadSHA(context.Background(), store, opened.JobID); got != "close-head" {
 		t.Fatalf("display head SHA = %q, want close-head", got)
@@ -212,6 +224,40 @@ func TestJobCloseAppliesDecision(t *testing.T) {
 	}
 	if len(listed) != 1 || listed[0].ID != opened.JobID || listed[0].ReviewStatusGrade != evidence.GradeReported {
 		t.Fatalf("job list review = %+v, want closed review with reported grade", listed)
+	}
+}
+
+func TestJobRecordRequiresReviewSeverityBeforeOpeningJob(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	seedSessionAgentRepo(t, store)
+
+	var stdout, stderr bytes.Buffer
+	args := []string{"job", "record", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "review", "--decision", "changes_requested", "--summary", "needs work", "--json"}
+	if code := Run(args, &stdout, &stderr); code != 2 || !strings.Contains(stderr.String(), "requires --severity") {
+		t.Fatalf("job record without severity exit = %d, stderr=%s", code, stderr.String())
+	}
+	jobs, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("rejected job record created jobs: %+v", jobs)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	args = append(args[:len(args)-1], "--severity", "P2", "--json")
+	if code := Run(args, &stdout, &stderr); code != 0 {
+		t.Fatalf("job record with severity exit = %d, stderr=%s", code, stderr.String())
+	}
+	var recorded jobSessionOutput
+	if err := json.Unmarshal(stdout.Bytes(), &recorded); err != nil {
+		t.Fatalf("decode job record JSON: %v (%s)", err, stdout.String())
+	}
+	if recorded.State != string(workflow.JobSucceeded) || recorded.Severity != "P2" {
+		t.Fatalf("job record output = %+v", recorded)
 	}
 }
 

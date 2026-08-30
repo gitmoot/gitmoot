@@ -30,7 +30,7 @@ import (
 // <prompt>`. It ignores its input and echoes a canned gitmoot_result whose
 // metadata.rubric carries the [0,1] dimension scores, exactly the contract the
 // dispatcher's parser reads.
-const reviewShellScript = `printf '%s' '{"gitmoot_result":{"decision":"changes_requested","summary":"scope drift on PR","metadata":{"rubric":{"coverage":0.4,"containment":0.6,"fidelity":0.5,"architecture":0.7,"readability":0.8,"abstraction":0.6}}}}'`
+const reviewShellScript = `printf '%s' '{"gitmoot_result":{"decision":"changes_requested","severity":"P1","summary":"scope drift on PR","metadata":{"rubric":{"coverage":0.4,"containment":0.6,"fidelity":0.5,"architecture":0.7,"readability":0.8,"abstraction":0.6}}}}'`
 
 // seedCodexImplementJob seeds a completed implement job on the codex runtime,
 // attributed to the template version, so the dispatcher recovers the implementer

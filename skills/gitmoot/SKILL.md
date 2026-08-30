@@ -57,7 +57,8 @@ For an in-session PR review, clock in with `--type review --pr <n> --head-sha
 `review_status`, alongside `review_status_grade: reported` and
 `review_status_authority: non_authoritative`. This is display-only,
 caller-reported activity: it does not satisfy, block, or otherwise feed the
-merge gate. Close the session job after posting the verdict.
+merge gate. Close the session job after posting the verdict. A
+`changes_requested` review close must pass `--severity P0|P1|P2|P3`.
 
 For a running engine-dispatched review with an isolated worktree, `job list`
 uses the verified daemon's descendant process tree instead: a runtime descendant
