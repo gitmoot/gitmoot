@@ -380,6 +380,8 @@ gitmoot events --repo owner/repo
 gitmoot repo add owner/repo --path <path> [--poll <duration>]
 gitmoot repo list
 gitmoot repo set-interval owner/repo (<duration>|default)
+gitmoot repo auto-fix owner/repo --pr <number> --disable --by <role-or-agent> --reason "<text>"
+gitmoot repo auto-fix owner/repo --pr <number> --enable --by <role-or-agent> --reason "<text>"
 gitmoot repo set-interval --all (<duration>|default)
 gitmoot repo remove owner/repo
 gitmoot repo doctor owner/repo
@@ -455,6 +457,10 @@ resolved `--poll` / `[daemon].poll` cadence; an explicit `--poll` stores a
 per-repo override. `repo list` renders the sentinel as `inherit`.
 `repo set-interval owner/repo <duration>` changes an override, `default` restores
 inheritance, and `--all` applies either value to every registered repo.
+`repo auto-fix` is a durable, per-PR scheduler control. `--disable` prevents a
+changes-requested auto-fix before ownership resolution or worktree allocation;
+`--enable` explicitly resumes it. Both forms require `--by` and `--reason`, and
+the latest attributed decision remains stored for that PR.
 `repo doctor owner/repo` checks a single repo's checkout/config health. If the
 registered checkout is missing or is no longer a Git worktree, Gitmoot verifies
 the recorded primary checkout, repairs the registration, and reports the

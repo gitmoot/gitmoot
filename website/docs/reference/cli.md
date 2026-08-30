@@ -305,6 +305,8 @@ what an update replaces.
 gitmoot repo add owner/repo --path <path> [--poll <duration>]
 gitmoot repo list
 gitmoot repo set-interval owner/repo (<duration>|default)
+gitmoot repo auto-fix owner/repo --pr <number> --disable --by <role-or-agent> --reason "<text>"
+gitmoot repo auto-fix owner/repo --pr <number> --enable --by <role-or-agent> --reason "<text>"
 gitmoot repo set-interval --all (<duration>|default)
 gitmoot repo remove owner/repo
 gitmoot repo doctor owner/repo
@@ -317,11 +319,16 @@ per Gitmoot home supervises every **enabled** registered repo. Omitting
 `--poll` / `[daemon].poll` cadence; an explicit value is a per-repo override.
 `repo list` prints `inherit`. Use `repo set-interval` with a duration to change
 an override, with `default` to restore inheritance, or with `--all` to update all
-registered repos. `repo doctor owner/repo` checks checkout/config health. If the
-registered checkout is missing or is no longer a Git worktree, Gitmoot verifies
-the recorded primary checkout, repairs the registration, and reports the
-self-heal. Implicit registration from inside a linked task worktree pins the
-repo to its primary checkout; an existing valid linked checkout remains usable.
+registered repos.
+`repo auto-fix` records a durable scheduler decision for one pull request.
+`--disable` stops changes-requested auto-fixes before ownership resolution or
+worktree allocation; `--enable` explicitly resumes them. Both require the audit
+fields `--by` and `--reason`, and the latest decision remains stored per PR.
+`repo doctor owner/repo` checks checkout/config health. If the registered
+checkout is missing or is no longer a Git worktree, Gitmoot verifies the
+recorded primary checkout, repairs the registration, and reports the self-heal.
+Implicit registration from inside a linked task worktree pins the repo to its
+primary checkout; an existing valid linked checkout remains usable.
 
 `gitmoot repo collisions owner/repo` lists open pull requests, compares each
 distinct pair's changed-file sets, and prints one warning per non-empty

@@ -198,6 +198,65 @@ func TestRunRepoSetIntervalSingleDefaultAndAll(t *testing.T) {
 	}
 }
 
+func TestRunRepoAutoFixPersistsPerPullRequestDecision(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	ctx := context.Background()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo"}); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{
+		"repo", "auto-fix", "owner/repo",
+		"--pr", "1686",
+		"--disable",
+		"--by", "owner-role",
+		"--reason", "do not patch this review round",
+		"--home", home,
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("disable code=%d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "auto-fix disabled for owner/repo pull request #1686") {
+		t.Fatalf("disable output = %q", stdout.String())
+	}
+	store = openCLIJobStore(t, home)
+	policy, configured, err := store.PullRequestAutoFixPolicyFor(ctx, "owner/repo", 1686)
+	store.Close()
+	if err != nil || !configured || !policy.Disabled || policy.Actor != "owner-role" {
+		t.Fatalf("disabled policy=%+v configured=%v err=%v", policy, configured, err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{
+		"repo", "auto-fix",
+		"--enable",
+		"--reason", "resume after owner review",
+		"--by", "owner-role",
+		"--pr", "1686",
+		"--home", home,
+		"owner/repo",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("enable code=%d stderr=%s", code, stderr.String())
+	}
+	store = openCLIJobStore(t, home)
+	policy, configured, err = store.PullRequestAutoFixPolicyFor(ctx, "owner/repo", 1686)
+	store.Close()
+	if err != nil || !configured || policy.Disabled || policy.Reason != "resume after owner review" {
+		t.Fatalf("enabled policy=%+v configured=%v err=%v", policy, configured, err)
+	}
+}
+
+func TestRunRepoAutoFixRequiresExplicitAuditedDecision(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"repo", "auto-fix", "owner/repo", "--pr", "7", "--disable"}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "requires --by") {
+		t.Fatalf("code=%d stderr=%q", code, stderr.String())
+	}
+}
+
 func TestRunRepoAddRejectsWrongOrigin(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()

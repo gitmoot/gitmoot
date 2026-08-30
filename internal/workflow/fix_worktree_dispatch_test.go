@@ -17,6 +17,10 @@ func TestReviewFixAllocationFailureRefusesDispatch(t *testing.T) {
 	engine.FixWorktreeAllocator = func(context.Context, FixWorktreeRequest) (FixWorktreeAllocation, error) {
 		return FixWorktreeAllocation{}, errors.New("disk full")
 	}
+	insertCompletedJob(t, store, db.Job{ID: "original-implement", Agent: "lead", Type: "implement"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7",
+		Result: &AgentResult{Decision: "implemented"},
+	})
 	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7",
 		LeadAgent: "lead", Result: &AgentResult{Decision: "changes_requested", Summary: "fix edge case"},
@@ -28,8 +32,8 @@ func TestReviewFixAllocationFailureRefusesDispatch(t *testing.T) {
 		t.Fatalf("ListJobs: %v", err)
 	}
 	for _, job := range jobs {
-		if job.Type == "implement" {
-			t.Fatalf("allocation failure enqueued implement job %s", job.ID)
+		if job.Type == "implement" && job.ID != "original-implement" {
+			t.Fatalf("allocation failure enqueued auto-fix implement job %s", job.ID)
 		}
 	}
 	if advanceErr == nil || advanceErr.Error() != "allocate review fix worktree: disk full" {
