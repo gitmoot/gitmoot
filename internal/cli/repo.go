@@ -37,6 +37,8 @@ func runRepo(args []string, stdout, stderr io.Writer) int {
 		return runRepoRemove(args[1:], stdout, stderr)
 	case "doctor":
 		return runRepoDoctor(args[1:], stdout, stderr)
+	case "collisions":
+		return runRepoCollisions(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown repo command %q\n\n", args[0])
 		printRepoUsage(stderr)
@@ -77,6 +79,7 @@ func printRepoUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot repo set-interval --all (<duration>|default)")
 	fmt.Fprintln(w, "  gitmoot repo remove owner/repo")
 	fmt.Fprintln(w, "  gitmoot repo doctor owner/repo")
+	fmt.Fprintln(w, "  gitmoot repo collisions owner/repo [--json]")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "owner/repo may be given before or after the flags.")
 }

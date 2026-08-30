@@ -383,6 +383,7 @@ gitmoot repo set-interval owner/repo (<duration>|default)
 gitmoot repo set-interval --all (<duration>|default)
 gitmoot repo remove owner/repo
 gitmoot repo doctor owner/repo
+gitmoot repo collisions owner/repo [--json]
 gitmoot daemon start --poll 30s --workers 1
 gitmoot daemon start --session <root-job-id>
 gitmoot daemon start
@@ -395,6 +396,12 @@ gitmoot daemon stop
 For structured local state, use `gitmoot dashboard --json` or
 `gitmoot task list --repo owner/repo --json`. `gitmoot status --json` and
 `gitmoot task show` are not valid commands.
+
+`gitmoot repo collisions owner/repo` lists open pull requests, compares each
+distinct pair's changed-file sets, and prints one warning per non-empty
+intersection with both PR numbers and the sorted shared paths. It exits 1 when
+collisions exist, 0 when every open PR pair is disjoint, and supports structured
+output with `--json`.
 
 `gitmoot daemon status` always prints the configured daemon log path. For a
 running daemon, it also compares that file's last write with the daemon's

@@ -308,6 +308,7 @@ gitmoot repo set-interval owner/repo (<duration>|default)
 gitmoot repo set-interval --all (<duration>|default)
 gitmoot repo remove owner/repo
 gitmoot repo doctor owner/repo
+gitmoot repo collisions owner/repo [--json]
 ```
 
 The `gitmoot repo` commands manage the **watched-repo registry**: one daemon
@@ -321,6 +322,12 @@ registered checkout is missing or is no longer a Git worktree, Gitmoot verifies
 the recorded primary checkout, repairs the registration, and reports the
 self-heal. Implicit registration from inside a linked task worktree pins the
 repo to its primary checkout; an existing valid linked checkout remains usable.
+
+`gitmoot repo collisions owner/repo` lists open pull requests, compares each
+distinct pair's changed-file sets, and prints one warning per non-empty
+intersection with both PR numbers and the sorted shared paths. It exits 1 when
+collisions exist, 0 when every open PR pair is disjoint, and supports structured
+output with `--json`.
 
 Use `daemon start` for the background daemon. Use `daemon run` only when the
 user explicitly wants a foreground process. Keep the default `--workers 1`
