@@ -1112,3 +1112,88 @@ WHERE source_kind = ? AND source_id = ? AND target_role = 'worker'`,
 		}
 	}
 }
+
+func TestInsertOrgDirectiveReceiptPersistentWriterUsesSingleBusyTimeout(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gitmoot.db")
+	holder, err := openCachedTestStore(t, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	contender, err := openCachedTestStore(t, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer contender.Close()
+	if _, err := contender.db.ExecContext(ctx, `PRAGMA busy_timeout = 100`); err != nil {
+		t.Fatal(err)
+	}
+	directive, err := holder.InsertWorkflowNote(ctx, WorkflowNote{
+		WorkflowID:        "receipt/persistent-writer",
+		Author:            "owner",
+		Body:              "[org:directive to=worker from=owner wf=receipt/persistent-writer]\nact",
+		AddressedTarget:   "worker",
+		AddressedWakeKind: WakeOutboxKindDirective,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lock, err := holder.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lock.ExecContext(ctx,
+		`UPDATE workflow_notes SET author = author WHERE id = ?`, directive.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	inserted, receiptErr := contender.InsertOrgDirectiveReceipt(ctx, WorkflowNote{
+		WorkflowID: directive.WorkflowID,
+		Author:     "worker",
+		Body:       fmt.Sprintf("[org:directive-ack id=%d by=worker]", directive.ID),
+	}, directive.ID, "ack")
+	elapsed := time.Since(started)
+	if receiptErr == nil || inserted {
+		t.Fatalf("locked receipt inserted=%v err=%v", inserted, receiptErr)
+	}
+	if elapsed >= 750*time.Millisecond {
+		t.Fatalf("locked receipt returned after %s, want one busy timeout", elapsed)
+	}
+	prefix := fmt.Sprintf("[org:directive-ack id=%d ", directive.ID)
+	var receiptCount int
+	if err := contender.db.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM workflow_notes
+WHERE workflow_id = ? AND substr(body, 1, length(?)) = ?`,
+		directive.WorkflowID, prefix, prefix,
+	).Scan(&receiptCount); err != nil {
+		t.Fatal(err)
+	}
+	if receiptCount != 0 {
+		t.Fatalf("locked receipt rows = %d, want 0", receiptCount)
+	}
+	var state string
+	if err := contender.db.QueryRowContext(ctx, `
+SELECT state FROM wake_outbox
+WHERE source_kind = ? AND source_id = ? AND target_role = 'worker'`,
+		WakeOutboxSourceWorkflowNote, strconv.FormatInt(directive.ID, 10),
+	).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != WakeOutboxStatePending {
+		t.Fatalf("locked wake state = %q, want %q", state, WakeOutboxStatePending)
+	}
+	if err := lock.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	inserted, err = contender.InsertOrgDirectiveReceipt(ctx, WorkflowNote{
+		WorkflowID: directive.WorkflowID,
+		Author:     "worker",
+		Body:       fmt.Sprintf("[org:directive-ack id=%d by=worker]", directive.ID),
+	}, directive.ID, "ack")
+	if err != nil || !inserted {
+		t.Fatalf("receipt after unlock inserted=%v err=%v", inserted, err)
+	}
+}

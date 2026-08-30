@@ -321,7 +321,7 @@ func (s *Store) InsertOrgDirectiveReceipt(
 		if err == nil {
 			return inserted, nil
 		}
-		if !isRetryableSQLiteBusy(err) {
+		if !isRetryableSQLiteSnapshot(err) {
 			return false, err
 		}
 		lastConflict = err
@@ -333,6 +333,18 @@ func (s *Store) InsertOrgDirectiveReceipt(
 		"record directive receipt after %d attempts: %w",
 		maxDirectiveReceiptRetries, lastConflict,
 	)
+}
+
+// isRetryableSQLiteSnapshot accepts only the immediate stale-WAL conflict.
+// Ordinary SQLITE_BUSY has already waited for busy_timeout and must not be
+// multiplied by the retry budget.
+func isRetryableSQLiteSnapshot(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "SQLITE_BUSY_SNAPSHOT") ||
+		strings.Contains(message, "(517)")
 }
 
 func (s *Store) insertOrgDirectiveReceiptOnce(
