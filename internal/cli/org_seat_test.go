@@ -66,6 +66,27 @@ func TestOrgHelpListsSeatPolicyFlags(t *testing.T) {
 	}
 }
 
+func TestOrgSeatAddOwnerBootstrapRemainsRootWithMergeAuthority(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	panes := []org.LivePane{{PaneID: "w1:p1", Label: "Owner"}}
+	withOrgSeatFixtureProvider(t, &panes)
+
+	var stdout, stderr bytes.Buffer
+	code := runOrg([]string{"seat", "add", "owner", "--pane", "Owner", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("owner seat add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, ok := cfg.Role("owner")
+	if !ok || owner.Parent != "" || len(owner.Scope) != 1 || owner.Scope[0] != "*" || owner.MergeRule != "owner" {
+		t.Fatalf("owner role = %+v, present=%t", owner, ok)
+	}
+}
+
 func TestOrgSeatAddEndsGreenOnRealityValidation(t *testing.T) {
 	home, paths, panes := setupOrgSeatTestHome(t)
 	withOrgSeatFixtureProvider(t, &panes)

@@ -63,8 +63,10 @@ func TestOrgCommandAndAgentOrgRolePrecedence(t *testing.T) {
 	if code := runOrg([]string{"validate", "--home", home}, &out, &errOut); code != 0 || out.String() != "ok 1 roles, 1 live panes, 1 enabled routes\n" {
 		t.Fatalf("validate code=%d out=%q err=%q", code, out.String(), errOut.String())
 	}
+	// This fixture intentionally omits merge_rule. Empty means no authority and
+	// must not be rendered as the owner grant.
 	out.Reset()
-	if code := runOrg([]string{"show", "--home", home}, &out, &errOut); code != 0 || !strings.Contains(out.String(), "owner\tparent=\tscope=*\tmerge_rule=owner") {
+	if code := runOrg([]string{"show", "--home", home}, &out, &errOut); code != 0 || !strings.Contains(out.String(), "owner\tparent=\tscope=*\tmerge_rule=none") {
 		t.Fatalf("show code=%d out=%q err=%q", code, out.String(), errOut.String())
 	}
 	t.Setenv("GITMOOT_ORG_ROLE", "env-role")
