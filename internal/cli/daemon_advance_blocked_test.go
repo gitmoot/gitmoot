@@ -12,6 +12,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -19,17 +20,33 @@ import (
 )
 
 func TestBlockedAdvanceSettlesQueriedJobState(t *testing.T) {
-	job, _, events := runNonFastForwardBlockedAdvance(t)
+	job, _, dbEvents, _ := runNonFastForwardBlockedAdvance(t)
 	if job.State != string(workflow.JobBlocked) {
 		t.Fatalf("queried job state = %q, want blocked", job.State)
 	}
-	if !daemonWorkerHasEvent(events, "advance_blocked") {
-		t.Fatalf("events = %+v, want advance_blocked", events)
+	if !daemonWorkerHasEvent(dbEvents, "advance_blocked") {
+		t.Fatalf("events = %+v, want advance_blocked", dbEvents)
+	}
+}
+
+func TestBlockedAdvanceEmitsRoutableTerminalEvent(t *testing.T) {
+	_, _, _, sink := runNonFastForwardBlockedAdvance(t)
+	blocked := sink.byType(events.EventJobBlocked)
+	if len(blocked) != 1 {
+		t.Fatalf("job.blocked emissions = %d, want exactly 1; all=%+v", len(blocked), sink.events)
+	}
+	ev := blocked[0]
+	if ev.Cause != "advance_blocked" || ev.WakeTargetRole != "author" {
+		t.Fatalf("advance-blocked routing metadata = %+v", ev)
+	}
+	kinds := classifyEventRuleKinds(ev)
+	if len(kinds) != 2 || kinds[0] != "job-terminal" || kinds[1] != "blocked" {
+		t.Fatalf("advance-blocked classified kinds = %v, want [job-terminal blocked]", kinds)
 	}
 }
 
 func TestBlockedAdvancePostsBlockedDecision(t *testing.T) {
-	_, body, _ := runNonFastForwardBlockedAdvance(t)
+	_, body, _, _ := runNonFastForwardBlockedAdvance(t)
 	if !strings.Contains(body, "**Decision:** `blocked`") {
 		t.Fatalf("blocked advancement comment did not report blocked:\n%s", body)
 	}
@@ -42,7 +59,7 @@ func TestBlockedAdvancePostsBlockedDecision(t *testing.T) {
 }
 
 func TestBlockedAdvancePersistsBlockedDecision(t *testing.T) {
-	job, _, _ := runNonFastForwardBlockedAdvance(t)
+	job, _, _, _ := runNonFastForwardBlockedAdvance(t)
 	payload, err := daemonJobPayload(job)
 	if err != nil {
 		t.Fatalf("daemonJobPayload returned error: %v", err)
@@ -724,7 +741,7 @@ func (f selectiveBlockedFinalizer) FinalizeImplementation(_ context.Context, job
 	return payload, nil
 }
 
-func runNonFastForwardBlockedAdvance(t *testing.T) (db.Job, string, []db.JobEvent) {
+func runNonFastForwardBlockedAdvance(t *testing.T) (db.Job, string, []db.JobEvent, *recordingSink) {
 	t.Helper()
 	ctx := context.Background()
 	home := t.TempDir()
@@ -764,9 +781,11 @@ func runNonFastForwardBlockedAdvance(t *testing.T) (db.Job, string, []db.JobEven
 	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", Title: "Task 1", State: string(workflow.TaskImplementing), Branch: "task-1", WorktreePath: checkout}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-non-fast-forward", Agent: "lead", Action: "implement", Repo: "owner/repo", Branch: "task-1", PullRequest: 7, TaskID: "task-1", TaskTitle: "Task 1"})
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-non-fast-forward", Agent: "lead", Action: "implement", Repo: "owner/repo", Branch: "task-1", PullRequest: 7, TaskID: "task-1", TaskTitle: "Task 1", ActingOrgRole: "author"})
 	comments := &cliPollFakeGitHub{}
+	sink := &recordingSink{}
 	worker := defaultJobWorker(store, io.Discard)
+	worker.EventSinkOverride = sink
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return checkout, nil
 	}
@@ -792,7 +811,7 @@ func runNonFastForwardBlockedAdvance(t *testing.T) (db.Job, string, []db.JobEven
 	if !strings.HasPrefix(remoteAfter, remoteHead) {
 		t.Fatalf("remote task branch changed after rejected push: got %q, want head %s", remoteAfter, remoteHead)
 	}
-	return job, comments.posted[0].body, events
+	return job, comments.posted[0].body, events, sink
 }
 
 func configureTestGit(t *testing.T, dir string) {

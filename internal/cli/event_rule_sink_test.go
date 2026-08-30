@@ -161,6 +161,7 @@ func TestClassifyEventRuleKinds(t *testing.T) {
 		{name: "failed terminal", event: events.Event{Type: events.EventJobFailed, Cause: "unrelated"}, want: []string{"job-terminal"}},
 		{name: "review verdict", event: events.Event{Type: events.EventJobFinished, Cause: events.EventCauseReviewVerdict}, want: []string{"job-terminal", eventRuleKindReviewVerdict}},
 		{name: "plain blocked terminal and blocked", event: events.Event{Type: events.EventJobBlocked}, want: []string{"job-terminal", "blocked"}},
+		{name: "advance blocked terminal and blocked", event: events.Event{Type: events.EventJobBlocked, Cause: "advance_blocked"}, want: []string{"job-terminal", "blocked"}},
 		{name: "unknown blocked cause", event: events.Event{Type: events.EventJobBlocked, Cause: "other"}},
 		{name: "unknown attention cause", event: events.Event{Type: events.EventJobNeedsAttention, Cause: "other"}},
 	}

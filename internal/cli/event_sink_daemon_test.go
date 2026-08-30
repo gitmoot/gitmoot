@@ -141,7 +141,7 @@ func TestDaemonTerminalEmissionKindsDriveObserverCoverage(t *testing.T) {
 		{name: "failed", emission: daemonTerminalFailed, want: []string{"job-terminal"}},
 		{name: "blocked", emission: daemonTerminalBlocked, want: []string{"job-terminal", "blocked"}},
 		{name: "permission guard", emission: daemonTerminalPermissionGuard, want: []string{"guard"}},
-		{name: "advance blocked", emission: daemonTerminalAdvanceBlocked},
+		{name: "advance blocked", emission: daemonTerminalAdvanceBlocked, want: []string{"job-terminal", "blocked"}},
 		{name: "deferred", emission: daemonTerminalDeferred},
 	}
 	if len(tests) != int(daemonTerminalEmissionKindCount) {

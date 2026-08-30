@@ -427,9 +427,10 @@ func classifyEventRuleKinds(event events.Event) []string {
 			return []string{"guard"}
 		case "blocked_since":
 			return []string{"blocked"}
-		case "":
-			// A plain blocked transition is both a terminal outcome and the
-			// narrower blocked rule kind.
+		case "", "advance_blocked":
+			// A blocked terminal transition is both a terminal outcome and the
+			// narrower blocked rule kind. advance_blocked names the daemon path,
+			// not a distinct routing policy.
 			return []string{"job-terminal", "blocked"}
 		}
 	case events.EventJobNeedsAttention:
