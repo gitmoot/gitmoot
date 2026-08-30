@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -169,6 +171,96 @@ func TestRemoteProxyExpiryAndAllowlistFailClosed(t *testing.T) {
 	if response.StatusCode != http.StatusUnauthorized || resolverCalls.Load() != 0 {
 		t.Fatalf("expired status=%d resolver=%d", response.StatusCode, resolverCalls.Load())
 	}
+}
+
+func TestRemoteProxyRedactsTransformedCredentialRepresentations(t *testing.T) {
+	const (
+		credential      = "Sk-Ant+/=Credential?MixedCase"
+		visibleSentinel = "visible-positive-control"
+	)
+	for _, test := range []struct {
+		name      string
+		transform func(string) string
+	}{
+		{name: "base64", transform: func(value string) string { return base64.StdEncoding.EncodeToString([]byte(value)) }},
+		{name: "URL encoded", transform: url.QueryEscape},
+		{name: "case varied", transform: alternateCredentialCase},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			transformed := test.transform(credential)
+			planted := visibleSentinel + ":" + transformed
+			if !strings.Contains(planted, visibleSentinel) || !strings.Contains(planted, transformed) {
+				t.Fatal("positive control cannot detect planted transformed credential")
+			}
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("X-Reflected-Credential", planted)
+				_, _ = io.WriteString(w, visibleSentinel+":"+transformed[:len(transformed)/2])
+				w.(http.Flusher).Flush()
+				_, _ = io.WriteString(w, transformed[len(transformed)/2:])
+			}))
+			defer upstream.Close()
+
+			gateway, err := Start(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer gateway.Close(context.Background())
+			if err := gateway.EnableRemote(RemoteListenerOptions{ListenAddress: "127.0.0.1:0"}); err != nil {
+				t.Fatal(err)
+			}
+			lease, err := gateway.RegisterProxy("transformed-response", ProxyPolicy{
+				Upstream: upstream.URL, AuthKind: ProxyAuthResolved, AllowLoopbackHTTP: true,
+				SandboxID: "sandbox-transform", Runtime: "shell", ExpiresAt: time.Now().Add(time.Minute),
+				AllowedHosts: []string{"127.0.0.1"},
+			}, func(context.Context) (ResolvedCredential, error) {
+				return ResolvedCredential{Value: credential, Upstream: upstream.URL, AuthKind: ProxyAuthBearer}, nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			material := lease.RemoteMaterial()
+			request, _ := http.NewRequest(http.MethodGet, material.URL, nil)
+			request.Header.Set(CapabilityHeader, material.Capability)
+			request.Header.Set("Authorization", "Bearer "+material.Placeholder)
+			response, err := remoteMaterialClient(t, material).Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(response.Body)
+			response.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			header := response.Header.Get("X-Reflected-Credential")
+			bodyText := string(body)
+			if !strings.Contains(bodyText, visibleSentinel) || !strings.Contains(header, visibleSentinel) {
+				t.Fatalf("positive control missing from body/header lengths %d/%d", len(bodyText), len(header))
+			}
+			if strings.Contains(bodyText, transformed) || strings.Contains(header, transformed) || !strings.Contains(bodyText, "[REDACTED]") || !strings.Contains(header, "[REDACTED]") {
+				t.Fatalf("transformed credential redaction failed for body/header lengths %d/%d", len(bodyText), len(header))
+			}
+		})
+	}
+}
+
+func alternateCredentialCase(value string) string {
+	result := []byte(value)
+	upper := false
+	for index, character := range result {
+		switch {
+		case character >= 'a' && character <= 'z':
+			if upper {
+				result[index] = character - ('a' - 'A')
+			}
+			upper = !upper
+		case character >= 'A' && character <= 'Z':
+			if !upper {
+				result[index] = character + ('a' - 'A')
+			}
+			upper = !upper
+		}
+	}
+	return string(result)
 }
 
 func remoteMaterialClient(t *testing.T, material RemoteMaterial) *http.Client {

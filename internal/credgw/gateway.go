@@ -7,6 +7,8 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base32"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -18,6 +20,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -605,61 +608,162 @@ func sortedHostSet(hosts map[string]struct{}) []string {
 }
 
 func copyRedactedHeader(destination, source http.Header, secret string) {
+	patterns := credentialRedactionPatterns(secret)
 	destination.Del("Content-Length")
 	for name, values := range source {
 		if strings.EqualFold(name, "Content-Length") {
 			continue
 		}
 		for _, value := range values {
-			destination.Add(name, strings.ReplaceAll(value, secret, "[REDACTED]"))
+			destination.Add(name, redactCredentialText(value, patterns))
 		}
 	}
 }
 
 func streamRedactedResponse(destination io.Writer, source io.Reader, secret string) {
-	if secret == "" {
+	patterns := credentialRedactionPatterns(secret)
+	if len(patterns) == 0 {
 		_, _ = io.Copy(destination, source)
 		return
 	}
 	buffered := bufio.NewWriter(destination)
-	redactor := &exactRedactingWriter{destination: buffered, secret: []byte(secret)}
+	redactor := &credentialRedactingWriter{destination: buffered, patterns: patterns}
 	_, _ = io.Copy(redactor, source)
 	_ = redactor.flush()
 	_ = buffered.Flush()
 }
 
-type exactRedactingWriter struct {
+type credentialRedactionPattern struct {
+	value     []byte
+	asciiFold bool
+}
+
+// credentialRedactionPatterns derives standard reversible textual forms from
+// the host credential. The proxy applies this one set to headers and streaming
+// bodies so an upstream cannot evade the boundary merely by changing transport
+// encoding or ASCII case.
+func credentialRedactionPatterns(secret string) []credentialRedactionPattern {
+	if secret == "" {
+		return nil
+	}
+	raw := []byte(secret)
+	patterns := make(map[string]bool)
+	add := func(value string, asciiFold bool) {
+		if value == "" {
+			return
+		}
+		patterns[value] = patterns[value] || asciiFold
+	}
+	add(secret, true)
+	add(url.QueryEscape(secret), true)
+	add(url.PathEscape(secret), true)
+	add(percentEncodeAll(raw), true)
+	add(hex.EncodeToString(raw), true)
+	add(base64.StdEncoding.EncodeToString(raw), false)
+	add(base64.RawStdEncoding.EncodeToString(raw), false)
+	add(base64.URLEncoding.EncodeToString(raw), false)
+	add(base64.RawURLEncoding.EncodeToString(raw), false)
+	add(base32.StdEncoding.EncodeToString(raw), true)
+	add(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(raw), true)
+	add(base32.HexEncoding.EncodeToString(raw), true)
+	add(base32.HexEncoding.WithPadding(base32.NoPadding).EncodeToString(raw), true)
+	quoted := strconv.Quote(secret)
+	add(quoted[1:len(quoted)-1], false)
+
+	result := make([]credentialRedactionPattern, 0, len(patterns))
+	for value, asciiFold := range patterns {
+		result = append(result, credentialRedactionPattern{value: []byte(value), asciiFold: asciiFold})
+	}
+	sort.Slice(result, func(i, j int) bool { return len(result[i].value) > len(result[j].value) })
+	return result
+}
+
+func percentEncodeAll(value []byte) string {
+	const digits = "0123456789ABCDEF"
+	encoded := make([]byte, 0, len(value)*3)
+	for _, character := range value {
+		encoded = append(encoded, '%', digits[character>>4], digits[character&0x0f])
+	}
+	return string(encoded)
+}
+
+func redactCredentialText(value string, patterns []credentialRedactionPattern) string {
+	var redacted strings.Builder
+	writer := &credentialRedactingWriter{destination: &redacted, patterns: patterns}
+	_, _ = writer.Write([]byte(value))
+	_ = writer.flush()
+	return redacted.String()
+}
+
+type credentialRedactingWriter struct {
 	destination io.Writer
-	secret      []byte
+	patterns    []credentialRedactionPattern
 	pending     []byte
 }
 
-func (w *exactRedactingWriter) Write(data []byte) (int, error) {
+func (w *credentialRedactingWriter) Write(data []byte) (int, error) {
 	for _, value := range data {
 		w.pending = append(w.pending, value)
-		for len(w.pending) > 0 && !bytes.HasPrefix(w.secret, w.pending) {
+		for len(w.pending) > 0 {
+			matchLength, couldGrow := w.match()
+			if matchLength > 0 && !couldGrow {
+				if _, err := io.WriteString(w.destination, "[REDACTED]"); err != nil {
+					return 0, err
+				}
+				w.pending = w.pending[matchLength:]
+				continue
+			}
+			if couldGrow {
+				break
+			}
 			if _, err := w.destination.Write(w.pending[:1]); err != nil {
 				return 0, err
 			}
 			w.pending = w.pending[1:]
 		}
-		if bytes.Equal(w.pending, w.secret) {
-			if _, err := io.WriteString(w.destination, "[REDACTED]"); err != nil {
-				return 0, err
-			}
-			w.pending = w.pending[:0]
-		}
 	}
 	return len(data), nil
 }
 
-func (w *exactRedactingWriter) flush() error {
-	if len(w.pending) == 0 {
-		return nil
+func (w *credentialRedactingWriter) match() (matchLength int, couldGrow bool) {
+	for _, pattern := range w.patterns {
+		if patternPrefix(pattern, w.pending) && len(w.pending) < len(pattern.value) {
+			couldGrow = true
+		}
+		if len(w.pending) >= len(pattern.value) && patternPrefix(pattern, w.pending[:len(pattern.value)]) && len(pattern.value) > matchLength {
+			matchLength = len(pattern.value)
+		}
 	}
-	_, err := w.destination.Write(w.pending)
-	w.pending = nil
-	return err
+	return matchLength, couldGrow
+}
+
+func patternPrefix(pattern credentialRedactionPattern, prefix []byte) bool {
+	if len(prefix) > len(pattern.value) {
+		return false
+	}
+	want := pattern.value[:len(prefix)]
+	if pattern.asciiFold {
+		return bytes.EqualFold(want, prefix)
+	}
+	return bytes.Equal(want, prefix)
+}
+
+func (w *credentialRedactingWriter) flush() error {
+	for len(w.pending) > 0 {
+		matchLength, _ := w.match()
+		if matchLength > 0 {
+			if _, err := io.WriteString(w.destination, "[REDACTED]"); err != nil {
+				return err
+			}
+			w.pending = w.pending[matchLength:]
+			continue
+		}
+		if _, err := w.destination.Write(w.pending[:1]); err != nil {
+			return err
+		}
+		w.pending = w.pending[1:]
+	}
+	return nil
 }
 
 func normalizedProxyPath(escaped string) (string, error) {

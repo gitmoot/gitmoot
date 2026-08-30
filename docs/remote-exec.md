@@ -81,6 +81,8 @@ mTLS certificate and an opaque
 capability bound to the sandbox id, the `shell` runtime, the job lease expiry,
 and the exact upstream allowlist. Provider keys remain host-side and are loaded
 only after those checks pass. The route is revoked before sandbox teardown.
+Provider response headers and streamed bodies filter the raw key, ASCII-case
+variants, and standard reversible URL/base encodings across chunk boundaries.
 Claude, Codex, Kimi, and omp remain unsupported on `remote` until their clients
 can target this mTLS path; Gitmoot never supplies a raw key as a fallback.
 

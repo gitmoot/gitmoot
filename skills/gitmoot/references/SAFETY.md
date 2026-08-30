@@ -237,8 +237,11 @@ It is off by default and does not cover Codex or Kimi.
 For remote shell jobs, the same opt-in can issue an ephemeral mTLS client
 identity and capability bound to the sandbox id, runtime, allowlist, and lease
 expiry. Only a curl-config path enters the environment; the upstream key is
-resolved on the host after authentication and never enters the sandbox. Model
-runtimes remain refused remotely until they can present that identity.
+resolved on the host after authentication and never enters the sandbox.
+Response headers and streamed bodies pass through the same filter for the raw
+key, ASCII-case variants, and standard reversible URL/base encodings, including
+values split across transport chunks. Model runtimes remain refused remotely
+until they can present that identity.
 
 ### Runtime ambient credential hygiene
 
