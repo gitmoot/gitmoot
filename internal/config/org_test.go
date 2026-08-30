@@ -465,8 +465,8 @@ func TestScopeSubset(t *testing.T) {
 		{[]string{"one/repo"}, []string{"one/*"}, true}, {[]string{"one/*"}, []string{"*"}, true},
 		{[]string{"one/*"}, []string{"two/*"}, false}, {[]string{"*"}, []string{"one/*"}, false},
 	} {
-		if got := scopeSubset(tt.child, tt.parent); got != tt.want {
-			t.Fatalf("scopeSubset(%v,%v)=%v", tt.child, tt.parent, got)
+		if got := ScopeSubset(tt.child, tt.parent); got != tt.want {
+			t.Fatalf("ScopeSubset(%v,%v)=%v", tt.child, tt.parent, got)
 		}
 	}
 }

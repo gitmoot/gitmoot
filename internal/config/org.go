@@ -574,7 +574,7 @@ func ValidateOrg(cfg OrgConfig) error {
 		if role.Parent == "" {
 			continue
 		}
-		if !scopeSubset(role.Scope, cfg.roles[role.Parent].Scope) {
+		if !ScopeSubset(role.Scope, cfg.roles[role.Parent].Scope) {
 			return fmt.Errorf("org role %q: scope is not a subset of parent %q", name, role.Parent)
 		}
 	}
@@ -635,7 +635,9 @@ func ScopeMatches(scope []string, repo string) bool {
 	return false
 }
 
-func scopeSubset(child, parent []string) bool {
+// ScopeSubset reports whether every child scope is covered by a parent scope.
+// It returns false when either side contains an invalid scope.
+func ScopeSubset(child, parent []string) bool {
 	for _, rawChild := range child {
 		c, err := normalizeOrgScope(rawChild)
 		if err != nil {

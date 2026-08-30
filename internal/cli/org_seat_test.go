@@ -55,6 +55,38 @@ func (p orgSeatFixtureProvider) Snapshot(context.Context) (org.Snapshot, error) 
 
 func (orgSeatFixtureProvider) Recycle(context.Context, org.RecycleRequest) error { return nil }
 
+func TestOrgHelpListsSeatPolicyFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := runOrg([]string{"--help"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("org help code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	const want = "org seat add NAME --pane LABEL [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]"
+	if !strings.Contains(stdout.String(), want) {
+		t.Fatalf("org help missing %q:\n%s", want, stdout.String())
+	}
+}
+
+func TestOrgSeatAddOwnerBootstrapRemainsRootWithMergeAuthority(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	panes := []org.LivePane{{PaneID: "w1:p1", Label: "Owner"}}
+	withOrgSeatFixtureProvider(t, &panes)
+
+	var stdout, stderr bytes.Buffer
+	code := runOrg([]string{"seat", "add", "owner", "--pane", "Owner", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("owner seat add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, ok := cfg.Role("owner")
+	if !ok || owner.Parent != "" || len(owner.Scope) != 1 || owner.Scope[0] != "*" || owner.MergeRule != "owner" {
+		t.Fatalf("owner role = %+v, present=%t", owner, ok)
+	}
+}
+
 func TestOrgSeatAddEndsGreenOnRealityValidation(t *testing.T) {
 	home, paths, panes := setupOrgSeatTestHome(t)
 	withOrgSeatFixtureProvider(t, &panes)
@@ -83,7 +115,7 @@ func TestOrgSeatAddEndsGreenOnRealityValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	worker, ok := cfg.Role("worker")
-	if !ok || worker.Pane != "Worker" || worker.Parent != "owner" || len(worker.Scope) != 1 || worker.Scope[0] != "*" {
+	if !ok || worker.Pane != "Worker" || worker.Parent != "owner" || len(worker.Scope) != 1 || worker.Scope[0] != "*" || worker.MergeRule != "" {
 		t.Fatalf("worker role = %+v, present=%t", worker, ok)
 	}
 	rules := listOrgSeatTestRules(t, paths)
@@ -101,6 +133,96 @@ func TestOrgSeatAddEndsGreenOnRealityValidation(t *testing.T) {
 	}
 	if got := len(listOrgSeatTestRules(t, paths)); got != 6 {
 		t.Fatalf("event rules after repair = %d, want 6", got)
+	}
+}
+
+func TestOrgSeatAddInheritsActingRoleWithoutMergeAuthority(t *testing.T) {
+	home, paths, panes := setupOrgSeatTestHome(t)
+	addOrgSeatCoordinator(t, paths, "none")
+	panes = append(panes, org.LivePane{PaneID: "w1:p3", Label: "Coordinator"})
+	withOrgSeatFixtureProvider(t, &panes)
+	t.Setenv("GITMOOT_ORG_ROLE", "coordinator")
+
+	var stdout, stderr bytes.Buffer
+	code := runOrg([]string{"seat", "add", "worker", "--pane", "Worker", "--home", home}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("seat add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, ok := cfg.Role("worker")
+	if !ok || worker.Parent != "coordinator" || len(worker.Scope) != 1 || worker.Scope[0] != "gitmoot/*" || worker.MergeRule != "" {
+		t.Fatalf("worker role = %+v, present=%t", worker, ok)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := runOrg([]string{"show", "--home", home}, &stdout, &stderr); code != 0 ||
+		!strings.Contains(stdout.String(), "worker\tparent=coordinator\tscope=gitmoot/*\tmerge_rule=none") {
+		t.Fatalf("org show code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestOrgSeatAddAcceptsBoundedOverrides(t *testing.T) {
+	home, paths, panes := setupOrgSeatTestHome(t)
+	addOrgSeatCoordinator(t, paths, "self")
+	panes = append(panes, org.LivePane{PaneID: "w1:p3", Label: "Coordinator"})
+	withOrgSeatFixtureProvider(t, &panes)
+	t.Setenv("GITMOOT_ORG_ROLE", "coordinator")
+
+	var stdout, stderr bytes.Buffer
+	code := runOrg([]string{
+		"seat", "add", "worker", "--pane", "Worker", "--home", home,
+		"--parent", "owner", "--scope", "gitmoot/repo", "--merge-rule", "self",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("seat add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, ok := cfg.Role("worker")
+	if !ok || worker.Parent != "owner" || len(worker.Scope) != 1 || worker.Scope[0] != "gitmoot/repo" || worker.MergeRule != "self" {
+		t.Fatalf("worker role = %+v, present=%t", worker, ok)
+	}
+}
+
+func TestOrgSeatAddRejectsUnsafeHierarchyAndAuthority(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		mergeRule string
+		args      []string
+		want      string
+	}{
+		{name: "unknown parent", args: []string{"--parent", "missing"}, want: `parent role "missing" is not declared`},
+		{name: "parent cycle", args: []string{"--parent", "worker"}, want: `would create a cycle for "worker"`},
+		{name: "scope widening", args: []string{"--parent", "owner", "--scope", "*"}, want: `exceeds acting role "coordinator" scope`},
+		{name: "merge escalation", args: []string{"--parent", "owner", "--merge-rule", "self"}, want: `exceeds acting role "coordinator" authority`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home, paths, panes := setupOrgSeatTestHome(t)
+			addOrgSeatCoordinator(t, paths, test.mergeRule)
+			panes = append(panes, org.LivePane{PaneID: "w1:p3", Label: "Coordinator"})
+			withOrgSeatFixtureProvider(t, &panes)
+			t.Setenv("GITMOOT_ORG_ROLE", "coordinator")
+
+			args := []string{"seat", "add", "worker", "--pane", "Worker", "--home", home}
+			args = append(args, test.args...)
+			var stdout, stderr bytes.Buffer
+			code := runOrg(args, &stdout, &stderr)
+			if code != 2 || !strings.Contains(stderr.String(), test.want) {
+				t.Fatalf("seat add code=%d out=%q err=%q, want error containing %q", code, stdout.String(), stderr.String(), test.want)
+			}
+			cfg, err := config.LoadOrg(paths)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := cfg.Role("worker"); ok {
+				t.Fatal("rejected seat add created worker")
+			}
+		})
 	}
 }
 
@@ -311,6 +433,31 @@ func withOrgSeatFixtureProvider(t *testing.T, panes *[]org.LivePane) {
 		return orgSeatFixtureProvider{roles: append([]config.OrgRole(nil), roles...), panes: panes}
 	}
 	t.Cleanup(func() { newOrgProvider = original })
+}
+
+func addOrgSeatCoordinator(t *testing.T, paths config.Paths, mergeRule string) {
+	t.Helper()
+	edit, _, err := config.UpsertOrgSeatRole(paths, config.OrgRole{
+		Name: "coordinator", Parent: "owner", Scope: []string{"gitmoot/*"},
+		MergeRule: mergeRule, Pane: "Coordinator",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !edit.Changed() {
+		t.Fatal("coordinator config edit did not change config")
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.AddEventRule(context.Background(), db.EventRule{
+		ID: "coordinator-reply", OnKind: "reply", WakeRole: "coordinator",
+		Scope: db.EventRuleScopeAddressed, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func appendOrgSeatWorker(t *testing.T, paths config.Paths) {
