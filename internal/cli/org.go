@@ -140,7 +140,7 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org chart [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org status [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org recycle ROLE --kind KIND --handoff NOTE [--pane ID] [--json] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot org seat add NAME --pane LABEL [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org seat add NAME --pane LABEL [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org escalate --to ROLE --workflow LABEL [--org-role ROLE] [--repo OWNER/REPO] [--json] [--home DIR] \"QUESTION\"")
 	fmt.Fprintln(w, "  gitmoot org escalate resolve NOTE_ID [--by ROLE] [--note ANSWER_NOTE_ID] [--home DIR]")

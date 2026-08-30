@@ -1522,7 +1522,7 @@ claimed by any role; each failure includes category counts and a reason.
 `gitmoot org seat add <name> --pane <label> [--parent ROLE] [--scope REPO,...]
 [--merge-rule owner|self|none] [--home DIR]` claims the one live Herdr pane
 with that exact label, writes or repairs the role's `pane` binding, and installs
-addressed `reply`, `blocked`, `directive`, and `escalation` routes with stable
+addressed `reply`, `blocked`, `directive`, `escalation`, and `fact` routes with stable
 IDs `org-seat-<name>-<kind>`. Duplicate labels hard-fail instead of choosing a
 pane.
 
@@ -1547,7 +1547,7 @@ unreadable branch state also fails closed. A safe removal deletes the role and
 all of its wake routes, closes the pane, and then runs the same reality
 validation. Roles that still parent another role cannot be removed.
 
-The four provisioned routes are enabled, addressed, and have an empty match
+The five provisioned routes are enabled, addressed, and have an empty match
 filter. Remove one by its stable ID with `org events rule rm` to quiet that kind;
 this is destructive and re-running `seat add` recreates it. There is currently
 no non-destructive event-rule disable verb.

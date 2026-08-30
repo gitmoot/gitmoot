@@ -55,6 +55,17 @@ func (p orgSeatFixtureProvider) Snapshot(context.Context) (org.Snapshot, error) 
 
 func (orgSeatFixtureProvider) Recycle(context.Context, org.RecycleRequest) error { return nil }
 
+func TestOrgHelpListsSeatPolicyFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := runOrg([]string{"--help"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("org help code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	const want = "org seat add NAME --pane LABEL [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]"
+	if !strings.Contains(stdout.String(), want) {
+		t.Fatalf("org help missing %q:\n%s", want, stdout.String())
+	}
+}
+
 func TestOrgSeatAddEndsGreenOnRealityValidation(t *testing.T) {
 	home, paths, panes := setupOrgSeatTestHome(t)
 	withOrgSeatFixtureProvider(t, &panes)
