@@ -1010,7 +1010,7 @@ func (d Daemon) supersedeStaleReviewJobs(ctx context.Context, pull github.PullRe
 		if err != nil {
 			return err
 		}
-		if !workflowReviewJobMatchesPull(d.Repo.FullName(), pull, payload) {
+		if !reviewJobTargetsPull(d.Repo.FullName(), pull, payload) {
 			continue
 		}
 		if strings.TrimSpace(payload.HeadSHA) == pull.HeadSHA {
@@ -1022,6 +1022,16 @@ func (d Daemon) supersedeStaleReviewJobs(ctx context.Context, pull github.PullRe
 		}
 	}
 	return nil
+}
+
+// reviewJobTargetsPull is deliberately broader than
+// workflowReviewJobMatchesPull: supersession applies to every queued/running
+// review pinned to an obsolete head, including deliberate review roots that do
+// not carry native fanout metadata.
+func reviewJobTargetsPull(repoFullName string, pull github.PullRequest, payload workflow.JobPayload) bool {
+	return payload.Repo == repoFullName &&
+		payload.PullRequest == int(pull.Number) &&
+		payload.Branch == pull.HeadRef
 }
 
 func workflowReviewJobMatchesPull(repoFullName string, pull github.PullRequest, payload workflow.JobPayload) bool {

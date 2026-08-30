@@ -10,14 +10,10 @@ import (
 
 var _ func(context.Context, *db.Store, string, int, string, []string) (ReviewLoopMatch, bool, error) = DetectReviewLoop
 
-// Review-loop family-count tests (#1528). The guard must count DISTINCT
-// REVIEWER FAMILIES at the head, not agreement among whoever happened to run.
-// Every test pins the fixture property it is named for — asserted or derived
-// from the store, never assumed — so a silently weakened fixture goes red
-// instead of passing for the wrong reason.
+// Review-loop tests pin the agent-identity boundary. Runtime family is
+// deliberately not part of the refusal: a different agent of the same family
+// remains an independent reviewer for the merge gate.
 
-// seedReviewLoopAgent registers an agent with an EXPLICIT runtime (and model),
-// because family — not agent name — is what the guard must count.
 func seedReviewLoopAgent(t *testing.T, store *db.Store, name, runtimeName, model string) {
 	t.Helper()
 	if err := store.UpsertAgent(context.Background(), db.Agent{
@@ -35,10 +31,6 @@ func seedReviewLoopAgent(t *testing.T, store *db.Store, name, runtimeName, model
 	}
 }
 
-// seedReviewLoopVerdict stores a succeeded review job and READS IT BACK,
-// asserting the fixture's distinguishing properties (head, decision, recorded
-// runtime) actually landed — a fixture that can be silently weakened is not a
-// test.
 func seedReviewLoopVerdict(t *testing.T, store *db.Store, jobID, agent, headSHA, decision, effectiveRuntime string) {
 	t.Helper()
 	ctx := context.Background()
@@ -73,302 +65,113 @@ func seedReviewLoopVerdict(t *testing.T, store *db.Store, jobID, agent, headSHA,
 	}
 }
 
-// Acceptance 1 — same family, same head, unanimous approval: STILL REFUSED.
-// The anti-loop property itself; must fail if the guard is removed.
-func TestDetectReviewLoopSameFamilySameHeadRefused(t *testing.T) {
+func TestDetectReviewLoopSameAgentSameHeadRefused(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedReviewLoopAgent(t, store, "g7-review", "codex", "gpt-5.6-sol")
-	seedReviewLoopVerdict(t, store, "prior-review", "g7-review", "head-a", "approved", "codex")
+	seedReviewLoopVerdict(t, store, "review-g7", "g7-review", "head-a", "approved", "codex")
 
 	match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"})
 	if err != nil {
 		t.Fatalf("DetectReviewLoop: %v", err)
 	}
 	if !detected {
-		t.Fatal("same family re-reviewing a unanimously approved head must be refused")
+		t.Fatal("same agent at the same head must be refused")
 	}
-	// Pin the fixture: the requester IS the verdict's agent.
-	if match.Agent != "g7-review" {
-		t.Fatalf("matched agent = %q, want g7-review (fixture weakened)", match.Agent)
+	if match.Agent != "g7-review" || match.JobID != "review-g7" || match.Decision != "approved" {
+		t.Fatalf("match = %+v", match)
 	}
-	if match.Family != "codex" {
-		t.Fatalf("match.Family = %q, want codex named in the refusal", match.Family)
+	if !strings.Contains(match.Reason(), "agent g7-review already holds") {
+		t.Fatalf("reason = %q", match.Reason())
 	}
-	reason := match.Reason()
-	if !strings.Contains(reason, `runtime family "codex"`) || !strings.Contains(reason, "prior-review") {
-		t.Fatalf("refusal must name the represented family and the evidence job: %q", reason)
-	}
-	if strings.Contains(reason, "push a new commit") {
-		t.Fatalf("refusal must not prescribe manufacturing a commit: %q", reason)
-	}
-	if got := countJobEvents(t, store, "prior-review", ReviewLoopDetectedEventKind); got != 1 {
-		t.Fatalf("review_loop_detected events = %d, want one claimed event", got)
-	}
-}
 
-// Acceptance 2 — unrepresented family, same head, unanimous approval: NOW
-// ALLOWED. This is the case the old guard blocked on PR #1527 (gm-review-kimi
-// refused after a claude approval) and the test that fails on the old code.
-func TestDetectReviewLoopUnrepresentedFamilyAllowed(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedReviewLoopAgent(t, store, "gm-review-opus", "claude", "claude-opus-4-8")
-	seedReviewLoopAgent(t, store, "gm-review-kimi", "kimi", "kimi-for-coding")
-	seedReviewLoopVerdict(t, store, "prior-review", "gm-review-opus", "head-a", "approved", "claude")
-
-	// Pin the fixture: the two agents are DIFFERENT families, and the head's
-	// history is a unanimous approval (the shape the old guard refused).
-	holder, err := store.GetAgent(ctx, "gm-review-opus")
+	events, err := store.ListJobEvents(ctx, "review-g7")
 	if err != nil {
-		t.Fatalf("GetAgent(gm-review-opus): %v", err)
+		t.Fatalf("ListJobEvents: %v", err)
 	}
-	requester, err := store.GetAgent(ctx, "gm-review-kimi")
-	if err != nil {
-		t.Fatalf("GetAgent(gm-review-kimi): %v", err)
-	}
-	if holder.Runtime == requester.Runtime {
-		t.Fatalf("fixture weakened: %s and %s must be different runtime families", holder.Name, requester.Name)
-	}
-
-	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"gm-review-kimi"}); err != nil {
-		t.Fatalf("DetectReviewLoop: %v", err)
-	} else if detected {
-		t.Fatal("a review from an unrepresented family is new information; the guard must allow it")
-	}
-}
-
-// Acceptance 3 — THE DISCRIMINATOR: different NAME, SAME family -> REFUSED.
-// g7-review holds the approval; af-review-sol requests one; both are
-// codex/gpt-5.6-sol. A name-keyed implementation passes tests 1 and 2 and
-// fails ONLY here.
-func TestDetectReviewLoopDifferentNameSameFamilyRefused(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedReviewLoopAgent(t, store, "g7-review", "codex", "gpt-5.6-sol")
-	seedReviewLoopAgent(t, store, "af-review-sol", "codex", "gpt-5.6-sol")
-	seedReviewLoopVerdict(t, store, "prior-review", "g7-review", "head-a", "approved", "codex")
-
-	// Pin the fixture INDEPENDENTLY of the resolver under test: different
-	// names, same runtime AND same model, read straight from the registry.
-	holder, err := store.GetAgent(ctx, "g7-review")
-	if err != nil {
-		t.Fatalf("GetAgent(g7-review): %v", err)
-	}
-	requester, err := store.GetAgent(ctx, "af-review-sol")
-	if err != nil {
-		t.Fatalf("GetAgent(af-review-sol): %v", err)
-	}
-	if holder.Name == requester.Name {
-		t.Fatal("fixture weakened: the discriminator needs DIFFERENT agent names")
-	}
-	if holder.Runtime != requester.Runtime || holder.Model != requester.Model {
-		t.Fatalf("fixture weakened: both agents must be the same family (runtime+model), got %s/%s vs %s/%s",
-			holder.Runtime, holder.Model, requester.Runtime, requester.Model)
-	}
-
-	match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"af-review-sol"})
-	if err != nil {
-		t.Fatalf("DetectReviewLoop: %v", err)
-	}
-	if !detected {
-		t.Fatal("af-review-sol is a different NAME but the SAME codex family as g7-review; the guard must refuse")
-	}
-	if match.Family != "codex" {
-		t.Fatalf("match.Family = %q, want codex", match.Family)
-	}
-}
-
-// Acceptance 4 — mixed decisions at the head: still allowed (unchanged),
-// even when the requester's family IS represented. Guards against the
-// narrowing accidentally widening the mixed-decision path.
-func TestDetectReviewLoopMixedDecisionsAllowed(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedReviewLoopAgent(t, store, "gm-review-opus", "claude", "claude-opus-4-8")
-	seedReviewLoopAgent(t, store, "g7-review", "codex", "gpt-5.6-sol")
-	seedReviewLoopVerdict(t, store, "prior-approved", "gm-review-opus", "head-a", "approved", "claude")
-	seedReviewLoopVerdict(t, store, "prior-changes", "g7-review", "head-a", "changes_requested", "codex")
-
-	// Pin the fixture: BOTH verdicts sit at the SAME head and DISAGREE.
-	verdicts, err := store.SucceededReviewVerdicts(ctx, "owner/repo", 227)
-	if err != nil {
-		t.Fatalf("SucceededReviewVerdicts: %v", err)
-	}
-	atHead := map[string]string{}
-	for _, verdict := range verdicts {
-		if verdict.HeadSHA == "head-a" {
-			atHead[verdict.JobID] = verdict.Decision
+	var claims int
+	for _, event := range events {
+		if event.Kind == ReviewLoopDetectedEventKind {
+			claims++
 		}
 	}
-	if len(atHead) != 2 || atHead["prior-approved"] == atHead["prior-changes"] {
-		t.Fatalf("fixture weakened: want two disagreeing verdicts at head-a, got %v", atHead)
-	}
-
-	// The requester's family (claude) IS represented at the head; only the
-	// mixed decisions may allow this.
-	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"gm-review-opus"}); err != nil {
-		t.Fatalf("DetectReviewLoop: %v", err)
-	} else if detected {
-		t.Fatal("mixed decisions at the head must still proceed; the earlier claim is unstable")
+	if claims != 1 {
+		t.Fatalf("review-loop claim count = %d, want 1", claims)
 	}
 }
 
-// Acceptance 5 — empty requested head: allowed before any succeeded history,
-// refused after, regardless of families (unchanged rule).
+func TestDetectReviewLoopDifferentAgentSameFamilyAllowed(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedReviewLoopAgent(t, store, "g7-review", "codex", "gpt-5.6-sol")
+	seedReviewLoopAgent(t, store, "g6-review-sol", "codex", "gpt-5.6-sol")
+	seedReviewLoopVerdict(t, store, "review-g7", "g7-review", "head-a", "approved", "codex")
+
+	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"}); err != nil || !detected {
+		t.Fatalf("control same-agent detection = %v, err=%v; want true", detected, err)
+	}
+	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"g6-review-sol"}); err != nil {
+		t.Fatalf("DetectReviewLoop different agent: %v", err)
+	} else if detected {
+		t.Fatal("different agent in the same runtime family must remain eligible")
+	}
+}
+
+func TestFindRepeatedReviewersFiltersOnlyAgentsWithVerdicts(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedReviewLoopAgent(t, store, "g7-review", "codex", "gpt-5.6-sol")
+	seedReviewLoopAgent(t, store, "g6-review-sol", "codex", "gpt-5.6-sol")
+	seedReviewLoopVerdict(t, store, "review-g7", "g7-review", "head-a", "changes_requested", "codex")
+
+	matches, err := FindRepeatedReviewers(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review", "g6-review-sol"})
+	if err != nil {
+		t.Fatalf("FindRepeatedReviewers: %v", err)
+	}
+	if len(matches) != 1 || matches[0].Agent != "g7-review" {
+		t.Fatalf("matches = %+v, want only g7-review", matches)
+	}
+}
+
+func TestDetectReviewLoopSameAgentNewHeadAllowed(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedReviewLoopAgent(t, store, "g7-review", "codex", "gpt-5.6-sol")
+	seedReviewLoopVerdict(t, store, "review-g7", "g7-review", "head-a", "approved", "codex")
+
+	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"}); err != nil || !detected {
+		t.Fatalf("control same-head detection = %v, err=%v; want true", detected, err)
+	}
+	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-b", []string{"g7-review"}); err != nil {
+		t.Fatalf("DetectReviewLoop new head: %v", err)
+	} else if detected {
+		t.Fatal("a new head must permit the same reviewer")
+	}
+}
+
 func TestDetectReviewLoopEmptyHeadRule(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	seedReviewLoopAgent(t, store, "gm-review-kimi", "kimi", "kimi-for-coding")
+	seedReviewLoopAgent(t, store, "g7-review", "codex", "gpt-5.6-sol")
 
-	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "", []string{"gm-review-kimi"}); err != nil {
-		t.Fatalf("DetectReviewLoop(empty, no history): %v", err)
+	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "", []string{"g7-review"}); err != nil {
+		t.Fatalf("DetectReviewLoop before history: %v", err)
 	} else if detected {
-		t.Fatal("empty head with no succeeded history must proceed")
+		t.Fatal("empty head before any succeeded history must be allowed")
 	}
-
-	// Even a verdict from a DIFFERENT family must not let an empty head
-	// through once history exists: the empty head cannot prove a new commit.
-	seedReviewLoopAgent(t, store, "gm-review-opus", "claude", "claude-opus-4-8")
-	seedReviewLoopVerdict(t, store, "prior-review", "gm-review-opus", "head-a", "approved", "claude")
-	match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "", []string{"gm-review-kimi"})
+	seedReviewLoopVerdict(t, store, "review-g7", "g7-review", "head-a", "approved", "codex")
+	match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "", []string{"g7-review"})
 	if err != nil {
-		t.Fatalf("DetectReviewLoop(empty, with history): %v", err)
+		t.Fatalf("DetectReviewLoop after history: %v", err)
 	}
 	if !detected || !match.EmptyHead {
-		t.Fatalf("empty head after succeeded history must fail closed: detected=%v match=%+v", detected, match)
-	}
-	if !strings.Contains(match.Reason(), "requested head SHA is empty") {
-		t.Fatalf("empty-head refusal must keep its own message branch: %q", match.Reason())
+		t.Fatalf("empty-head match = %+v, detected=%v", match, detected)
 	}
 }
 
-// Acceptance 8 — unknown family FAILS CLOSED. An unknown that counted as "not
-// yet represented" would turn the guard into a way to add unlimited reviews.
-func TestDetectReviewLoopUnknownFamilyFailsClosed(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedReviewLoopAgent(t, store, "gm-review-kimi", "kimi", "kimi-for-coding")
-
-	t.Run("verdict family unknown", func(t *testing.T) {
-		// The verdict's agent is absent from the registry and recorded no
-		// runtime: its family cannot be determined.
-		seedReviewLoopVerdict(t, store, "ghost-review", "ghost", "head-a", "approved", "")
-		if _, err := store.GetAgent(ctx, "ghost"); err == nil {
-			t.Fatal("fixture weakened: ghost must be ABSENT from the registry")
-		}
-		match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"gm-review-kimi"})
-		if err != nil {
-			t.Fatalf("DetectReviewLoop: %v", err)
-		}
-		if !detected {
-			t.Fatal("a verdict whose family cannot be determined must fail closed, not read as unrepresented")
-		}
-		if match.Family != "" {
-			t.Fatalf("fail-closed refusal names no family, got %q", match.Family)
-		}
-		if !strings.Contains(match.Reason(), "fail-closed") {
-			t.Fatalf("fail-closed refusal must say so: %q", match.Reason())
-		}
-	})
-
-	t.Run("requester family unknown", func(t *testing.T) {
-		seedReviewLoopAgent(t, store, "g7-review", "codex", "gpt-5.6-sol")
-		seedReviewLoopVerdict(t, store, "prior-review", "g7-review", "head-b", "approved", "codex")
-		if _, err := store.GetAgent(ctx, "ghost-requester"); err == nil {
-			t.Fatal("fixture weakened: ghost-requester must be ABSENT from the registry")
-		}
-		if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-b", []string{"ghost-requester"}); err != nil {
-			t.Fatalf("DetectReviewLoop: %v", err)
-		} else if !detected {
-			t.Fatal("a requester whose family cannot be determined cannot prove new information; must fail closed")
-		}
-	})
-
-	t.Run("mixed requester batch with unknown family", func(t *testing.T) {
-		seedReviewLoopAgent(t, store, "g7-review-batch", "codex", "gpt-5.6-sol")
-		seedReviewLoopVerdict(t, store, "prior-review-batch", "g7-review-batch", "head-c", "approved", "codex")
-		if _, err := store.GetAgent(ctx, "ghost-requester-batch"); err == nil {
-			t.Fatal("fixture weakened: ghost-requester-batch must be ABSENT from the registry")
-		}
-		// Pin the anchor the ordering cases below lean on: without the ghost,
-		// the batch PROVABLY brings a new family and is allowed — the unknown
-		// requester is the ONLY thing refusing.
-		if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-c", []string{"gm-review-kimi"}); err != nil {
-			t.Fatalf("DetectReviewLoop(known-only baseline): %v", err)
-		} else if detected {
-			t.Fatal("fixture weakened: the known-new requester alone must be ALLOWED, or this case cannot isolate the unknown's refusal")
-		}
-		match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-c", []string{"ghost-requester-batch", "gm-review-kimi"})
-		if err != nil {
-			t.Fatalf("DetectReviewLoop: %v", err)
-		}
-		if !detected {
-			t.Fatal("one known-new requester must not hide an unresolved requester in the same batch")
-		}
-		if match.Family != "" {
-			t.Fatalf("mixed unknown batch must use the fail-closed refusal, got family %q", match.Family)
-		}
-	})
-
-	// Ordering cases (#1528 review): the original defect was order-dependent,
-	// so the fail-closed boundary must be order-INDEPENDENT. Each case pins the
-	// same anchor — the known requesters alone would be ALLOWED — so an
-	// "allow immediately on the first known-new family" implementation goes
-	// red here instead of surviving.
-	t.Run("mixed requester batch unknown LAST", func(t *testing.T) {
-		seedReviewLoopAgent(t, store, "g7-review-last", "codex", "gpt-5.6-sol")
-		seedReviewLoopVerdict(t, store, "prior-review-last", "g7-review-last", "head-d", "approved", "codex")
-		if _, err := store.GetAgent(ctx, "ghost-requester-last"); err == nil {
-			t.Fatal("fixture weakened: ghost-requester-last must be ABSENT from the registry")
-		}
-		if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-d", []string{"gm-review-kimi"}); err != nil {
-			t.Fatalf("DetectReviewLoop(known-only baseline): %v", err)
-		} else if detected {
-			t.Fatal("fixture weakened: the known-new requester alone must be ALLOWED, or this case cannot isolate the unknown's refusal")
-		}
-		match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-d", []string{"gm-review-kimi", "ghost-requester-last"})
-		if err != nil {
-			t.Fatalf("DetectReviewLoop: %v", err)
-		}
-		if !detected {
-			t.Fatal("an unresolved requester in LAST position must still fail closed; an allow-on-first-known-new implementation passes for the wrong reason")
-		}
-		if match.Family != "" {
-			t.Fatalf("unknown-last batch must use the fail-closed refusal, got family %q", match.Family)
-		}
-	})
-
-	t.Run("mixed requester batch unknown BETWEEN two resolvable requesters", func(t *testing.T) {
-		seedReviewLoopAgent(t, store, "g7-review-between", "codex", "gpt-5.6-sol")
-		seedReviewLoopAgent(t, store, "gm-review-opus-between", "claude", "claude-opus-4-8")
-		seedReviewLoopVerdict(t, store, "prior-review-between", "g7-review-between", "head-e", "approved", "codex")
-		if _, err := store.GetAgent(ctx, "ghost-requester-between"); err == nil {
-			t.Fatal("fixture weakened: ghost-requester-between must be ABSENT from the registry")
-		}
-		// Baseline: BOTH flanking requesters are resolvable, and kimi is a
-		// provably NEW family — without the ghost the batch is allowed.
-		if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-e", []string{"gm-review-kimi", "gm-review-opus-between"}); err != nil {
-			t.Fatalf("DetectReviewLoop(known-only baseline): %v", err)
-		} else if detected {
-			t.Fatal("fixture weakened: the two resolvable requesters alone must be ALLOWED, or this case cannot isolate the unknown's refusal")
-		}
-		match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-e", []string{"gm-review-kimi", "ghost-requester-between", "gm-review-opus-between"})
-		if err != nil {
-			t.Fatalf("DetectReviewLoop: %v", err)
-		}
-		if !detected {
-			t.Fatal("an unresolved requester BETWEEN two resolvable ones must still fail closed; an allow-on-first-known-new implementation passes for the wrong reason")
-		}
-		if match.Family != "" {
-			t.Fatalf("unknown-between batch must use the fail-closed refusal, got family %q", match.Family)
-		}
-	})
-}
-
-// Acceptance 7 — resolver precedence: a recorded effective runtime beats the
-// registry default when they disagree (the override-run case), the registry
-// covers unrecorded jobs, and the unknown case reports ok=false.
+// Runtime-family resolution still backs native one-family selection: a recorded
+// effective runtime wins, the registry covers unrecorded jobs, and unknown
+// agents report ok=false.
 func TestResolveRuntimeFamilyPrecedence(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

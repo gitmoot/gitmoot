@@ -522,8 +522,9 @@ stages:
   may merge after review and CI (see [Gate stages](#gate-stages)).
 - **Declared review suppresses native fan-out.** When an implement stage has a
   downstream `action: review` stage with `source` pointing to it, its job carries
-  `SkipNativeReviewFanout`. Gitmoot does not also enqueue the ordinary native
-  reviewers; without that declaration, native review behavior is unchanged.
+  `SkipNativeReviewFanout`. Gitmoot does not also enqueue native reviewers;
+  without that declaration, scheduling follows `[review].native_fanout_enabled`
+  (off by default, with repository overrides).
 - Still a **leaf** — it may mutate but never fan out.
 
 ### Source-bound review stages

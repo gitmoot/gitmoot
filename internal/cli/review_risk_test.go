@@ -24,6 +24,9 @@ func TestApplyReviewPolicyOffByDefault(t *testing.T) {
 	if engine.RiskTiersEnabled {
 		t.Fatal("applyReviewPolicy must leave risk tiers OFF when [review] is absent")
 	}
+	if engine.NativeReviewFanoutEnabled == nil || engine.NativeReviewFanoutEnabled("owner/repo") {
+		t.Fatal("applyReviewPolicy must install native fanout OFF when [review] is absent")
+	}
 }
 
 func TestApplyReviewPolicyEnabledFromConfig(t *testing.T) {
@@ -32,7 +35,7 @@ func TestApplyReviewPolicyEnabledFromConfig(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	body := "[review]\nrisk_tiers_enabled = true\nhigh_risk_paths = [\"cmd/**\"]\nrisk_label_high = \"sev:1\"\n"
+	body := "[review]\nnative_fanout_enabled = true\nrisk_tiers_enabled = true\nhigh_risk_paths = [\"cmd/**\"]\nrisk_label_high = \"sev:1\"\n[repos.\"owner/off\".review]\nnative_fanout_enabled = false\n"
 	if err := os.WriteFile(filepath.Join(root, config.ConfigName), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -47,6 +50,12 @@ func TestApplyReviewPolicyEnabledFromConfig(t *testing.T) {
 	if engine.RiskLabelHigh != "sev:1" {
 		t.Fatalf("RiskLabelHigh = %q", engine.RiskLabelHigh)
 	}
+	if engine.NativeReviewFanoutEnabled == nil || !engine.NativeReviewFanoutEnabled("owner/on") {
+		t.Fatal("global native_fanout_enabled = true was not applied")
+	}
+	if engine.NativeReviewFanoutEnabled("owner/off") {
+		t.Fatal("repository native_fanout_enabled = false override was not applied")
+	}
 }
 
 func TestApplyReviewPolicyEmptyHomeIsOff(t *testing.T) {
@@ -54,5 +63,8 @@ func TestApplyReviewPolicyEmptyHomeIsOff(t *testing.T) {
 	applyReviewPolicy(&engine, "")
 	if engine.RiskTiersEnabled {
 		t.Fatal("empty home must resolve to risk tiers OFF")
+	}
+	if engine.NativeReviewFanoutEnabled == nil || engine.NativeReviewFanoutEnabled("owner/repo") {
+		t.Fatal("empty home must resolve native fanout OFF")
 	}
 }

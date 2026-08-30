@@ -10,28 +10,29 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// loadReviewPolicy reads the [review] section for a `home` that may be either an
-// already-resolved <home>/.gitmoot root or a raw --home (resolveConfigFile
-// handles both). It fails safe to the default (risk tiers OFF) so a missing or
-// malformed config never turns the opt-in path on or breaks the daemon.
-func loadReviewPolicy(home string) config.ReviewPolicy {
+// loadReviewConfig reads the global and repository-scoped [review] settings for
+// a `home` that may be either an already-resolved <home>/.gitmoot root or a raw
+// --home. It fails safe to the default: native fanout and risk tiers both off.
+func loadReviewConfig(home string) config.ReviewConfig {
 	cfg := resolveConfigFile(home)
 	if cfg == "" {
-		return config.DefaultReviewPolicy()
+		return config.ReviewConfig{Global: config.DefaultReviewPolicy()}
 	}
-	policy, err := config.LoadReviewPolicy(config.Paths{ConfigFile: cfg})
+	policy, err := config.LoadReviewConfig(config.Paths{ConfigFile: cfg})
 	if err != nil {
-		return config.DefaultReviewPolicy()
+		return config.ReviewConfig{Global: config.DefaultReviewPolicy()}
 	}
 	return policy
 }
 
-// applyReviewPolicy copies the opt-in [review] risk-tiered review policy (#650)
-// onto the engine. With risk tiers off (the default) it sets RiskTiersEnabled
-// false and the engine's review fan-out is byte-identical, so calling it
-// unconditionally at engine construction is safe.
+// applyReviewPolicy copies the global risk-tier policy and installs the
+// repository-aware native-fanout resolver onto the engine.
 func applyReviewPolicy(engine *workflow.Engine, home string) {
-	policy := loadReviewPolicy(home)
+	cfg := loadReviewConfig(home)
+	policy := cfg.For("")
+	engine.NativeReviewFanoutEnabled = func(repo string) bool {
+		return cfg.For(repo).NativeFanoutEnabled
+	}
 	engine.RiskTiersEnabled = policy.RiskTiersEnabled
 	engine.HighRiskPaths = policy.HighRiskPaths
 	engine.RiskLabelHigh = policy.RiskLabelHigh

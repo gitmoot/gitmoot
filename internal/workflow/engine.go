@@ -357,6 +357,11 @@ type Engine struct {
 	// forward row; "block" additionally fails the job via the contract-violation
 	// path.
 	ResultCheckMode ResultCheckMode
+	// NativeReviewFanoutEnabled resolves whether native PR events may schedule
+	// reviews for a repository. The daemon always wires it from [review] config,
+	// whose default is false. Nil preserves the legacy enabled behavior for direct
+	// Engine constructions that do not participate in host configuration.
+	NativeReviewFanoutEnabled func(repo string) bool
 	// RiskTiersEnabled gates the opt-in risk-tiered adaptive review (#650). When
 	// false (the default), HandlePullRequestOpened NEVER classifies a PR and runs
 	// the single-review fan-out byte-identically. When true, a PR opened event is

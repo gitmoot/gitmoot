@@ -34,7 +34,8 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 	if len(reviewers) == 0 {
 		reviewers = compactStrings(append([]string{}, e.RequiredReviewers...))
 	}
-	if event.SkipReviewFanout {
+	nativeFanoutDisabled := e.NativeReviewFanoutEnabled != nil && !e.NativeReviewFanoutEnabled(event.Repo)
+	if event.SkipReviewFanout || nativeFanoutDisabled {
 		return e.recordPullRequestBaseline(ctx, event)
 	}
 	// #1236: filter the roster down to agents that may actually review THIS head.
@@ -71,6 +72,28 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 			return e.recordPullRequestBaseline(ctx, event)
 		}
 		reviewers = eligible
+		selected, familyDropped, family, err := e.selectNativeReviewFamily(ctx, reviewers)
+		if err != nil {
+			return err
+		}
+		if len(familyDropped) > 0 {
+			_ = e.Store.AddTaskEvent(ctx, db.TaskEvent{
+				TaskID: event.TaskID,
+				Kind:   "review_fanout_family_selected",
+				Reason: fmt.Sprintf("pull request #%d at %s: selected runtime family %q with [%s]; dropped %s",
+					event.PullRequest, event.HeadSHA, family, strings.Join(selected, " "), strings.Join(familyDropped, "; ")),
+			})
+		}
+		if len(selected) == 0 {
+			_ = e.Store.AddTaskEvent(ctx, db.TaskEvent{
+				TaskID: event.TaskID,
+				Kind:   "review_fanout_no_resolved_family",
+				Reason: fmt.Sprintf("pull request #%d at %s: no configured reviewer had a resolvable runtime family; no review dispatched and the native merge gate was NOT run",
+					event.PullRequest, event.HeadSHA),
+			})
+			return e.recordPullRequestBaseline(ctx, event)
+		}
+		reviewers = selected
 	}
 	if len(reviewers) == 0 {
 		decision, err := e.runMergeGate(ctx, "", JobPayload{
@@ -93,14 +116,35 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 		}
 		return e.recordPullRequestBaseline(ctx, event)
 	}
-	reviewRound, err := e.nextReviewRound(ctx, event)
+	repeated, err := FindRepeatedReviewers(ctx, e.Store, event.Repo, event.PullRequest, event.HeadSHA, reviewers)
 	if err != nil {
 		return err
 	}
-	if match, detected, err := DetectReviewLoop(ctx, e.Store, event.Repo, event.PullRequest, event.HeadSHA, reviewers); err != nil {
+	if len(repeated) > 0 {
+		repeatedAgents := make(map[string]struct{}, len(repeated))
+		for _, match := range repeated {
+			repeatedAgents[strings.ToLower(strings.TrimSpace(match.Agent))] = struct{}{}
+		}
+		filtered := reviewers[:0]
+		for _, reviewer := range reviewers {
+			if _, exists := repeatedAgents[strings.ToLower(strings.TrimSpace(reviewer))]; !exists {
+				filtered = append(filtered, reviewer)
+			}
+		}
+		_ = e.Store.AddTaskEvent(ctx, db.TaskEvent{
+			TaskID: event.TaskID,
+			Kind:   ReviewLoopDetectedEventKind,
+			Reason: fmt.Sprintf("pull request #%d at %s: skipped agents with existing exact-head verdicts [%s]",
+				event.PullRequest, event.HeadSHA, strings.Join(matchAgents(repeated), " ")),
+		})
+		if len(filtered) == 0 {
+			return e.block(ctx, ref, repeated[0].Reason())
+		}
+		reviewers = filtered
+	}
+	reviewRound, err := e.nextReviewRound(ctx, event)
+	if err != nil {
 		return err
-	} else if detected {
-		return e.block(ctx, ref, match.Reason())
 	}
 	// Opt-in risk-tiered adaptive review (#650). When RiskTiersEnabled, classify
 	// the PR (label > path > default). A `high` tier replaces the single native
@@ -632,6 +676,43 @@ func (e Engine) eligibleReviewers(ctx context.Context, repo string, implementer 
 		eligible = append(eligible, name)
 	}
 	return eligible, dropped
+}
+
+// selectNativeReviewFamily keeps the configured order and selects the runtime
+// family of the first reviewer whose family can be resolved. Later reviewers in
+// that family remain in the fanout; every other family is reserved for an
+// explicit `agent review` request.
+func (e Engine) selectNativeReviewFamily(ctx context.Context, reviewers []string) ([]string, []string, string, error) {
+	selected := make([]string, 0, len(reviewers))
+	dropped := make([]string, 0, len(reviewers))
+	selectedFamily := ""
+	for _, reviewer := range reviewers {
+		family, ok, err := ResolveRuntimeFamily(ctx, e.Store, reviewer, "")
+		if err != nil {
+			return nil, nil, "", err
+		}
+		if !ok {
+			dropped = append(dropped, fmt.Sprintf("%s (runtime family unresolved)", reviewer))
+			continue
+		}
+		if selectedFamily == "" {
+			selectedFamily = family
+		}
+		if family != selectedFamily {
+			dropped = append(dropped, fmt.Sprintf("%s (runtime family %s)", reviewer, family))
+			continue
+		}
+		selected = append(selected, reviewer)
+	}
+	return selected, dropped, selectedFamily, nil
+}
+
+func matchAgents(matches []ReviewLoopMatch) []string {
+	agents := make([]string, 0, len(matches))
+	for _, match := range matches {
+		agents = append(agents, match.Agent)
+	}
+	return agents
 }
 
 func (e Engine) recordPullRequestBaseline(ctx context.Context, event PullRequestEvent) error {

@@ -16,40 +16,43 @@ func writeReviewConfig(t *testing.T, body string) Paths {
 	return Paths{ConfigFile: cfg}
 }
 
-func TestLoadReviewPolicyDefaultsOff(t *testing.T) {
-	// No file at all -> default (off), no error.
-	policy, err := LoadReviewPolicy(Paths{ConfigFile: filepath.Join(t.TempDir(), "missing.toml")})
+func TestLoadReviewConfigDefaultsNativeFanoutOff(t *testing.T) {
+	cfg, err := LoadReviewConfig(Paths{ConfigFile: filepath.Join(t.TempDir(), "missing.toml")})
 	if err != nil {
-		t.Fatalf("LoadReviewPolicy(missing) error: %v", err)
+		t.Fatalf("LoadReviewConfig(missing) error: %v", err)
 	}
-	if policy.RiskTiersEnabled {
+	if cfg.For("owner/repo").NativeFanoutEnabled {
+		t.Fatal("missing config must default native fanout OFF")
+	}
+	if cfg.For("owner/repo").RiskTiersEnabled {
 		t.Fatal("missing config must default risk tiers OFF")
 	}
 
-	// A config with no [review] section -> default off.
-	policy, err = LoadReviewPolicy(writeReviewConfig(t, "[orchestrate]\ncockpit_mode = \"off\"\n"))
+	cfg, err = LoadReviewConfig(writeReviewConfig(t, "[orchestrate]\ncockpit_mode = \"off\"\n"))
 	if err != nil {
-		t.Fatalf("LoadReviewPolicy(no section) error: %v", err)
+		t.Fatalf("LoadReviewConfig(no section) error: %v", err)
 	}
-	if policy.RiskTiersEnabled {
-		t.Fatal("absent [review] section must default OFF")
+	if cfg.For("owner/repo").NativeFanoutEnabled {
+		t.Fatal("absent [review] section must default native fanout OFF")
 	}
 }
 
-func TestLoadReviewPolicyParsesFields(t *testing.T) {
+func TestLoadReviewConfigParsesGlobalFields(t *testing.T) {
 	body := `
 [review]
+native_fanout_enabled = true
 risk_tiers_enabled = true
 high_risk_paths = ["**/auth/**", "cmd/**", "go.mod"]
 risk_label_high = "sev:1"
 risk_label_routine = "sev:routine"
 `
-	policy, err := LoadReviewPolicy(writeReviewConfig(t, body))
+	cfg, err := LoadReviewConfig(writeReviewConfig(t, body))
 	if err != nil {
-		t.Fatalf("LoadReviewPolicy error: %v", err)
+		t.Fatalf("LoadReviewConfig error: %v", err)
 	}
-	if !policy.RiskTiersEnabled {
-		t.Fatal("risk_tiers_enabled = true not parsed")
+	policy := cfg.For("owner/repo")
+	if !policy.NativeFanoutEnabled || !policy.RiskTiersEnabled {
+		t.Fatalf("parsed switches = %+v", policy)
 	}
 	if len(policy.HighRiskPaths) != 3 || policy.HighRiskPaths[1] != "cmd/**" {
 		t.Fatalf("high_risk_paths = %v", policy.HighRiskPaths)
@@ -59,9 +62,28 @@ risk_label_routine = "sev:routine"
 	}
 }
 
-func TestLoadReviewPolicyRejectsBadBool(t *testing.T) {
-	_, err := LoadReviewPolicy(writeReviewConfig(t, "[review]\nrisk_tiers_enabled = yes\n"))
+func TestLoadReviewConfigRepoOverrideWins(t *testing.T) {
+	body := `
+[review]
+native_fanout_enabled = false
+[repos."owner/enabled".review]
+native_fanout_enabled = true
+`
+	cfg, err := LoadReviewConfig(writeReviewConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadReviewConfig error: %v", err)
+	}
+	if cfg.For("owner/disabled").NativeFanoutEnabled {
+		t.Fatal("repo without override must inherit global OFF")
+	}
+	if !cfg.For("owner/enabled").NativeFanoutEnabled {
+		t.Fatal("repository override must enable native fanout")
+	}
+}
+
+func TestLoadReviewConfigRejectsBadBool(t *testing.T) {
+	_, err := LoadReviewConfig(writeReviewConfig(t, "[review]\nnative_fanout_enabled = yes\n"))
 	if err == nil {
-		t.Fatal("expected error for non-bool risk_tiers_enabled")
+		t.Fatal("expected error for non-bool native_fanout_enabled")
 	}
 }
