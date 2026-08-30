@@ -363,7 +363,7 @@ func TestCLIReviewLoopUnresolvableReviewerFailsClosedBeforeIdentityGuard(t *test
 	t.Cleanup(func() { localAgentDispatchRuntimeAdapterFor = previousFactory })
 
 	_, err = dispatchLocalAgentJob(ctx, fixture.store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "ghost-reviewer", Action: "review", PullRequest: 227,
+		RepoFlag: "owner/repo", Agent: "ghost-reviewer", LeadAgent: "reviewer", Action: "review", PullRequest: 227,
 		Branch: "main", HeadSHA: "same-head", Instructions: "Review unchanged head.", Home: fixture.home,
 	})
 	if err == nil || !strings.Contains(err.Error(), `agent "ghost-reviewer" not found`) {
