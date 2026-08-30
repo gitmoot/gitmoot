@@ -125,6 +125,21 @@ func TestEventRuleDirectiveWakePromptMatchesCurrentPhase(t *testing.T) {
 		})
 	}
 }
+func TestEventRuleReviewVerdictWakePrompt(t *testing.T) {
+	event := events.Event{
+		JobID:          "review-42",
+		Repo:           "gitmoot/gitmoot",
+		Detail:         "one blocking issue",
+		PullRequest:    42,
+		ReviewDecision: "changes_requested",
+	}
+	prompt := eventRuleWakePrompt(eventRuleKindReviewVerdict, event)
+	for _, want := range []string{"changes_requested", "gitmoot/gitmoot#42", "review-42", "one blocking issue"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt %q does not contain %q", prompt, want)
+		}
+	}
+}
 
 func TestClassifyEventRuleKinds(t *testing.T) {
 	tests := []struct {
@@ -144,6 +159,7 @@ func TestClassifyEventRuleKinds(t *testing.T) {
 		{name: "addressed awaited fact", event: events.Event{Type: events.EventOrgFact, Cause: "awaited_fact_satisfied"}, want: []string{"fact"}},
 		{name: "finished terminal", event: events.Event{Type: events.EventJobFinished}, want: []string{"job-terminal"}},
 		{name: "failed terminal", event: events.Event{Type: events.EventJobFailed, Cause: "unrelated"}, want: []string{"job-terminal"}},
+		{name: "review verdict", event: events.Event{Type: events.EventJobFinished, Cause: events.EventCauseReviewVerdict}, want: []string{"job-terminal", eventRuleKindReviewVerdict}},
 		{name: "plain blocked terminal and blocked", event: events.Event{Type: events.EventJobBlocked}, want: []string{"job-terminal", "blocked"}},
 		{name: "unknown blocked cause", event: events.Event{Type: events.EventJobBlocked, Cause: "other"}},
 		{name: "unknown attention cause", event: events.Event{Type: events.EventJobNeedsAttention, Cause: "other"}},
@@ -159,7 +175,7 @@ func TestClassifyEventRuleKinds(t *testing.T) {
 
 func TestWakeTargetRoleProductionWritesMatchObserverRegistry(t *testing.T) {
 	writes := productionWakeTargetRoleWrites(t)
-	if got, want := fmt.Sprint(writes), "[internal/cli/blocked_since.go:buildDirectiveEscalationEvent internal/cli/blocked_since.go:buildDirectiveNudgeEvent internal/cli/blocked_since.go:emitInputPendingEpisode internal/cli/event_rule_sink.go:addressBlockedEvent internal/cli/event_sink.go:emitDaemonTerminalEvent internal/cli/reply_wake_outbox.go:wakeOutboxEvent internal/daemon/task_disposal.go:strandTask]"; got != want {
+	if got, want := fmt.Sprint(writes), "[internal/cli/blocked_since.go:buildDirectiveEscalationEvent internal/cli/blocked_since.go:buildDirectiveNudgeEvent internal/cli/blocked_since.go:emitInputPendingEpisode internal/cli/event_rule_sink.go:addressBlockedEvent internal/cli/event_sink.go:emitDaemonTerminalEvent internal/cli/reply_wake_outbox.go:wakeOutboxEvent internal/daemon/task_disposal.go:strandTask internal/workflow/engine_types.go:mailbox]"; got != want {
 		t.Fatalf("production WakeTargetRole writes = %s, want %s", got, want)
 	}
 	registryWrites := make([]wakeTargetRoleWrite, 0, len(wakeTargetRoleProducers))
@@ -350,6 +366,24 @@ func productionSelectorCallSites(t *testing.T, selectorName string) []wakeTarget
 		return calls[i].function < calls[j].function
 	})
 	return calls
+}
+
+func TestJobTerminalAddressedScopeMatchesDispatcherOnly(t *testing.T) {
+	author := db.EventRule{WakeRole: "author", Scope: db.EventRuleScopeAddressed}
+	other := db.EventRule{WakeRole: "other", Scope: db.EventRuleScopeAddressed}
+	observer := db.EventRule{WakeRole: "auditor", Scope: db.EventRuleScopeObserver}
+	addressed := events.Event{Type: events.EventJobFinished, Cause: events.EventCauseReviewVerdict, WakeTargetRole: "author"}
+	if !eventRuleMatchesAddressee(author, addressed) ||
+		eventRuleMatchesAddressee(other, addressed) ||
+		!eventRuleMatchesAddressee(observer, addressed) {
+		t.Fatal("addressed terminal event did not match author and observer only")
+	}
+	roleless := events.Event{Type: events.EventJobFinished}
+	if eventRuleMatchesAddressee(author, roleless) ||
+		eventRuleMatchesAddressee(other, roleless) ||
+		!eventRuleMatchesAddressee(observer, roleless) {
+		t.Fatal("roleless terminal event did not match observer only")
+	}
 }
 
 func TestEventRuleAddresseeGateIsKindAgnosticAndObserverExempt(t *testing.T) {
@@ -557,15 +591,21 @@ pane="w1:p2"
 	}
 }
 
-func TestEventRuleMatchV1(t *testing.T) {
+func TestEventRuleMatchUsesExactRepositoryAndSubstringJobID(t *testing.T) {
 	event := events.Event{Repo: "Acme/Widget", JobID: "Job-AbC"}
-	for _, filter := range []string{"", "acme/w", "WIDGET", "job-a", "ABC"} {
+	for _, filter := range []string{"", "acme/widget", "WIDGET", "job-a", "ABC"} {
 		if !eventRuleMatches(filter, event) {
 			t.Fatalf("filter %q did not match", filter)
 		}
 	}
-	if eventRuleMatches("missing", event) {
-		t.Fatal("unexpected match")
+	for _, filter := range []string{"acme/w", "acme/widget-plus", "missing"} {
+		if eventRuleMatches(filter, event) {
+			t.Fatalf("filter %q unexpectedly matched", filter)
+		}
+	}
+	prefixCollision := events.Event{Repo: "acme/widget-plus", JobID: "other"}
+	if eventRuleMatches("acme/widget", prefixCollision) {
+		t.Fatal("exact repo filter matched a prefix-colliding repository")
 	}
 }
 
@@ -812,6 +852,63 @@ func TestEventRuleWakeFiresEachMatchingRule(t *testing.T) {
 	sink.evaluate(context.Background(), events.Event{Type: events.EventJobBlocked, JobID: "job-1", WakeTargetRole: "owner"})
 	if wake.promptCalls != 2 {
 		t.Fatalf("want a wake for each of the 2 matching rules, got %d", wake.promptCalls)
+	}
+}
+func TestReviewVerdictWakeTargetsOwnerAndObservers(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configBody := `
+[org.roles."owner"]
+scope=["*"]
+pane="w1:p0"
+[org.roles."author"]
+parent="owner"
+scope=["*"]
+pane="w1:p1"
+[org.roles."other"]
+parent="owner"
+scope=["*"]
+pane="w1:p2"
+[org.roles."auditor"]
+parent="owner"
+scope=["*"]
+pane="w1:p3"
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(configBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, rule := range []db.EventRule{
+		{ID: "author", OnKind: eventRuleKindReviewVerdict, WakeRole: "author", Scope: db.EventRuleScopeAddressed, Enabled: true},
+		{ID: "other", OnKind: eventRuleKindReviewVerdict, WakeRole: "other", Scope: db.EventRuleScopeAddressed, Enabled: true},
+		{ID: "auditor", OnKind: eventRuleKindReviewVerdict, WakeRole: "auditor", Scope: db.EventRuleScopeObserver, Enabled: true},
+	} {
+		if err := store.AddEventRule(context.Background(), rule); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wake := &fakeEventWake{}
+	sink := &eventRuleSink{store: store, home: home, wake: wake}
+	sink.evaluate(context.Background(), events.Event{
+		Type:           events.EventJobFinished,
+		Cause:          events.EventCauseReviewVerdict,
+		JobID:          "review-42",
+		Repo:           "owner/repo",
+		WakeTargetRole: "author",
+		PullRequest:    42,
+		ReviewDecision: "approved",
+	})
+
+	sort.Strings(wake.panes)
+	if got, want := fmt.Sprint(wake.panes), "[w1:p1 w1:p3]"; got != want {
+		t.Fatalf("woken panes = %s, want %s", got, want)
 	}
 }
 

@@ -2007,8 +2007,8 @@ func TestOrgEventRuleAddListRemoveAndValidation(t *testing.T) {
 	}
 	out.Reset()
 	errOut.Reset()
-	if code := runOrg([]string{"events", "rule", "add", "--home", home, "--on", "reply", "--wake", "owner", "--scope", "observer"}, &out, &errOut); code != 0 {
-		t.Fatalf("add reply code=%d out=%q err=%q", code, out.String(), errOut.String())
+	if code := runOrg([]string{"events", "rule", "add", "--home", home, "--on", "review-verdict", "--wake", "owner", "--scope", "observer"}, &out, &errOut); code != 0 {
+		t.Fatalf("add review-verdict code=%d out=%q err=%q", code, out.String(), errOut.String())
 	}
 
 	out.Reset()

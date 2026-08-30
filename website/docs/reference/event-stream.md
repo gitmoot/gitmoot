@@ -171,6 +171,7 @@ pane = "w1:p2"
 
 ```sh
 gitmoot org events rule add --on guard --match owner/repo --wake maintainer
+gitmoot org events rule add --on review-verdict --match owner/repo --wake maintainer
 gitmoot org events rule add --on blocked --repo tendwire --wake maintainer
 gitmoot org events rule add --on pane_input_pending --wake maintainer
 gitmoot org events rule add --on reply --wake maintainer
@@ -184,7 +185,7 @@ gitmoot org events rule rm <rule-id>
 Rules default to `--scope addressed`: when an event carries a target role, only
 the matching addressed rule receives it. During rule evaluation,
 `--scope observer` exempts a rule from that addressee gate.
-Events without a target role keep matching both scopes exactly as before.
+Events without a target role match observer rules only.
 Durable-outbox claim authorization is scope-blind: among enabled,
 filter-matching rules for the event's own kind, wake-role equality with the
 addressed target is the only routing condition. An observer-scoped rule is
@@ -205,13 +206,19 @@ rule set is empty.
 Filtered non-reply rules remain `addressed` after upgrade and must be promoted
 manually with `set-scope` when observer delivery is intended.
 
-Kinds are `escalation`, `attention`, `guard`, `job-terminal`, `blocked`,
-`recycle-overdue`, `pane_input_pending`, and `reply`.
-The v1 `--match` filter is a case-insensitive substring tested against the event
-repo and job id; empty matches all. `--repo` is an alias for that same filter;
-pass only one of the two flags. A plain `job.blocked` event matches both
-`job-terminal` and `blocked`, while guard-caused blocks match `guard` first. A
-synthesized `blocked_since` event matches only `blocked`. Task episodes due in
+Kinds are `escalation`, `attention`, `guard`, `job-terminal`,
+`review-verdict`, `blocked`, `recycle-overdue`, `pane_input_pending`, `reply`,
+`directive`, and `fact`.
+An owner/repo `--match` or `--repo` filter is case-insensitive and exact.
+Filters without a slash retain case-insensitive substring matching against the
+event repo and job id; empty matches all. Pass only one of `--match` and
+`--repo`. A successful review terminal whose decision is `approved` or
+`changes_requested` matches both `job-terminal` and `review-verdict` and
+addresses the pull request owner's role. If no role can be resolved, addressed
+rules fail closed while observer rules can still receive the verdict. A plain
+`job.blocked` event matches both `job-terminal` and `blocked`, while
+guard-caused blocks match `guard` first. A synthesized `blocked_since` event
+matches only `blocked`. Task episodes due in
 one evaluator pass are emitted as one oldest-first digest; blocked roles retain
 one event per role. Set
 `[orchestrate].blocked_role_wake_after` to a positive Go duration to emit such an

@@ -114,6 +114,10 @@ const (
 	EventOrchestrationFinished EventType = "orchestration.finished"
 )
 
+// EventCauseReviewVerdict marks a terminal review whose decision is ready for
+// the pull request owner.
+const EventCauseReviewVerdict = "review_verdict"
+
 // Event is the stable, versioned, redacted JSON object emitted outbound. Every
 // free-text field is redacted at construction (see NewEvent); ids are opaque,
 // Cause is a trusted enum, ts is RFC3339, and status is the terminal/lifecycle
@@ -145,11 +149,14 @@ type Event struct {
 	// EventType. It is assigned by trusted emit sites and deliberately bypasses
 	// free-text redaction and path scrubbing.
 	Cause string `json:"cause,omitempty"`
-	// WakeKind, WakeTargetRole, and WakeOutboxIDs are internal delivery metadata
-	// for the durable wake drain. They never alter the public event JSON contract.
+	// WakeKind, WakeTargetRole, WakeOutboxIDs, PullRequest, and ReviewDecision
+	// are internal delivery metadata. They never alter the public event JSON
+	// contract.
 	WakeKind       string  `json:"-"`
 	WakeTargetRole string  `json:"-"`
 	WakeOutboxIDs  []int64 `json:"-"`
+	PullRequest    int     `json:"-"`
+	ReviewDecision string  `json:"-"`
 }
 
 // Sink is the injected outbound seam the engine and daemon call from the

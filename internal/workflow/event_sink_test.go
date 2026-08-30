@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
@@ -63,13 +64,15 @@ func TestEngineEmitsJobFinishedOnSucceededTerminal(t *testing.T) {
 		`{"gitmoot_result":{"decision":"approved","summary":"looks good","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 	}}
 	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, JobRequest{
-		ID:        "review-job",
-		Agent:     "audit",
-		Action:    "review",
-		Repo:      "gitmoot/gitmoot",
-		Branch:    "task-9",
-		TaskID:    "task-9",
-		TaskTitle: "Review",
+		ID:            "review-job",
+		Agent:         "audit",
+		Action:        "review",
+		Repo:          "gitmoot/gitmoot",
+		Branch:        "task-9",
+		PullRequest:   42,
+		TaskID:        "task-9",
+		TaskTitle:     "Review",
+		ActingOrgRole: "author",
 	}); err != nil {
 		t.Fatalf("Enqueue returned error: %v", err)
 	}
@@ -86,11 +89,56 @@ func TestEngineEmitsJobFinishedOnSucceededTerminal(t *testing.T) {
 	if ev.JobID != "review-job" || ev.RootID != "review-job" || ev.Repo != "gitmoot/gitmoot" || ev.Status != "succeeded" {
 		t.Fatalf("job.finished event = %+v", ev)
 	}
+	if ev.WakeTargetRole != "author" {
+		t.Fatalf("wake target role = %q, want author", ev.WakeTargetRole)
+	}
+	if ev.Cause != events.EventCauseReviewVerdict || ev.PullRequest != 42 || ev.ReviewDecision != "approved" {
+		t.Fatalf("review verdict metadata = %+v", ev)
+	}
 	if ev.SchemaVersion != 1 {
 		t.Fatalf("schema_version = %d, want 1", ev.SchemaVersion)
 	}
 	if ev.Detail != "looks good" {
 		t.Fatalf("detail = %q, want the result summary", ev.Detail)
+	}
+}
+
+func TestEngineEmitsChangesRequestedReviewVerdict(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName:  "gitmoot/gitmoot",
+		Branch:        "task-43",
+		Owner:         "audit",
+		ActingOrgRole: "author",
+	}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	sink := &recordingSink{}
+	engine := testEngine(store)
+	engine.EventSink = sink
+	mailbox := engine.mailbox()
+
+	mailbox.emitTerminal(ctx, "review-43", JobSucceeded, JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		Branch:      "task-43",
+		PullRequest: 43,
+		Result: &AgentResult{
+			Decision: "changes_requested",
+			Summary:  "one blocking issue",
+		},
+	})
+
+	finished := sink.byType(events.EventJobFinished)
+	if len(finished) != 1 {
+		t.Fatalf("job.finished emissions = %d, want 1; all=%+v", len(finished), sink.snapshot())
+	}
+	event := finished[0]
+	if event.Cause != events.EventCauseReviewVerdict ||
+		event.ReviewDecision != "changes_requested" ||
+		event.PullRequest != 43 ||
+		event.WakeTargetRole != "author" {
+		t.Fatalf("changes-requested verdict event = %+v", event)
 	}
 }
 

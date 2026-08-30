@@ -28,6 +28,7 @@ const (
 	eventRuleProbeTimeout           = 5 * time.Second
 	directiveCompletionOverdueCause = "directive_completion_overdue"
 	directiveTerminalCause          = "directive_terminal"
+	eventRuleKindReviewVerdict      = "review-verdict"
 )
 
 type eventWakeClient interface {
@@ -413,7 +414,12 @@ func (s *eventRuleSink) resolveRolePane(ctx context.Context, cfg config.OrgConfi
 
 func classifyEventRuleKinds(event events.Event) []string {
 	switch event.Type {
-	case events.EventJobFinished, events.EventJobFailed:
+	case events.EventJobFinished:
+		if event.Cause == events.EventCauseReviewVerdict {
+			return []string{"job-terminal", eventRuleKindReviewVerdict}
+		}
+		return []string{"job-terminal"}
+	case events.EventJobFailed:
 		return []string{"job-terminal"}
 	case events.EventJobBlocked:
 		switch event.Cause {
@@ -471,11 +477,25 @@ func eventRuleMatches(filter string, event events.Event) bool {
 	if filter == "" {
 		return true
 	}
+	if strings.Contains(filter, "/") {
+		return strings.EqualFold(strings.TrimSpace(event.Repo), filter)
+	}
 	return strings.Contains(strings.ToLower(event.Repo), filter) ||
 		strings.Contains(strings.ToLower(event.JobID), filter)
 }
 
 func eventRuleWakePrompt(kind string, event events.Event) string {
+	if strings.EqualFold(strings.TrimSpace(kind), eventRuleKindReviewVerdict) {
+		detail := truncateForWake(strings.TrimSpace(event.Detail), 320)
+		prompt := fmt.Sprintf(
+			"gitmoot review verdict %s for %s#%d from job %s",
+			event.ReviewDecision, event.Repo, event.PullRequest, event.JobID,
+		)
+		if detail != "" {
+			prompt += ": " + detail
+		}
+		return prompt
+	}
 	if strings.EqualFold(strings.TrimSpace(kind), db.WakeOutboxKindDirective) {
 		directiveID := strings.TrimPrefix(event.RootID, db.WakeOutboxSourceWorkflowNote+":")
 		switch event.Cause {

@@ -68,7 +68,7 @@ func TestFinishQueuedJobEmitsJobFailed(t *testing.T) {
 	if err := store.CreateJob(ctx, db.Job{ID: "queued-job", Agent: "coord", Type: "ask", State: string(workflow.JobQueued)}); err != nil {
 		t.Fatalf("CreateJob returned error: %v", err)
 	}
-	payload := workflow.JobPayload{Repo: "owner/repo", RootJobID: "root-1"}
+	payload := workflow.JobPayload{Repo: "owner/repo", RootJobID: "root-1", ActingOrgRole: "author"}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
@@ -92,6 +92,9 @@ func TestFinishQueuedJobEmitsJobFailed(t *testing.T) {
 	ev := failed[0]
 	if ev.JobID != "queued-job" || ev.RootID != "root-1" || ev.Repo != "owner/repo" || ev.Status != "failed" {
 		t.Fatalf("job.failed event = %+v", ev)
+	}
+	if ev.WakeTargetRole != "author" {
+		t.Fatalf("wake target role = %q, want author", ev.WakeTargetRole)
 	}
 	if ev.SchemaVersion != 1 {
 		t.Fatalf("schema_version = %d, want 1", ev.SchemaVersion)

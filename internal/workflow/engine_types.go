@@ -159,7 +159,7 @@ func (e Engine) mailbox() Mailbox {
 		if payload.Result != nil {
 			detail = payload.Result.Summary
 		}
-		events.EmitEvent(ctx, e.EventSink, events.NewEvent(
+		event := events.NewEvent(
 			eventType,
 			jobID,
 			rootID,
@@ -168,7 +168,28 @@ func (e Engine) mailbox() Mailbox {
 			detail,
 			e.now(),
 			RedactCommentText,
-		))
+		)
+		wakeTargetRole := NormalizeActingOrgRole(payload.ActingOrgRole)
+		if state == JobSucceeded && payload.PullRequest > 0 && payload.Result != nil {
+			decision := strings.ToLower(strings.TrimSpace(payload.Result.Decision))
+			if decision == "approved" || decision == "changes_requested" {
+				owner := wakeTargetRole
+				if owner == "" && e.Store != nil {
+					resolved, err := e.Store.ResolvePullRequestOwner(
+						ctx, payload.Repo, payload.Branch, payload.PullRequest, payload.TaskID,
+					)
+					if err == nil {
+						owner = NormalizeActingOrgRole(resolved)
+					}
+				}
+				event.Cause = events.EventCauseReviewVerdict
+				wakeTargetRole = owner
+				event.PullRequest = payload.PullRequest
+				event.ReviewDecision = decision
+			}
+		}
+		event.WakeTargetRole = wakeTargetRole
+		events.EmitEvent(ctx, e.EventSink, event)
 	}
 	return mb
 }

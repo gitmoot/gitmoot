@@ -225,7 +225,7 @@ func emitDaemonTerminalEvent(ctx context.Context, sink events.Sink, store *db.St
 	if len(cause) > 0 {
 		event.Cause = strings.TrimSpace(cause[0])
 	}
-	if eventType == events.EventJobBlocked && wakeTargetRole != "" {
+	if wakeTargetRole != "" {
 		event.WakeTargetRole = wakeTargetRole
 	}
 	events.EmitEvent(ctx, sink, event)
