@@ -338,6 +338,64 @@ func TestCLIReviewLoopRefusesBothHeadResolutionBranches(t *testing.T) {
 	}
 }
 
+// The agent-identity loop guard never admits an unresolved requester. Production
+// dispatch resolves and authorizes the reviewer before DetectReviewLoop, so an
+// unregistered reviewer must fail closed without creating loop evidence or work.
+func TestCLIReviewLoopUnresolvableReviewerFailsClosedBeforeIdentityGuard(t *testing.T) {
+	ctx := context.Background()
+	fixture := newCLIReviewLoopFixture(t)
+	seedCLIReviewLoopVerdict(t, fixture.store, "prior-review", "same-head", "approved")
+
+	family, resolved, err := workflow.ResolveRuntimeFamily(ctx, fixture.store, "ghost-reviewer", "")
+	if err != nil {
+		t.Fatalf("ResolveRuntimeFamily: %v", err)
+	}
+	if resolved || family != "" {
+		t.Fatalf("fixture weakened: ghost-reviewer family = %q, resolved=%v; want unresolved", family, resolved)
+	}
+
+	adapterCalls := 0
+	previousFactory := localAgentDispatchRuntimeAdapterFor
+	localAgentDispatchRuntimeAdapterFor = func(string, runtime.Agent, string) (runtime.Adapter, error) {
+		adapterCalls++
+		return nil, errors.New("adapter must not be selected for an unresolved reviewer")
+	}
+	t.Cleanup(func() { localAgentDispatchRuntimeAdapterFor = previousFactory })
+
+	_, err = dispatchLocalAgentJob(ctx, fixture.store, localAgentDispatchRequest{
+		RepoFlag: "owner/repo", Agent: "ghost-reviewer", Action: "review", PullRequest: 227,
+		Branch: "main", HeadSHA: "same-head", Instructions: "Review unchanged head.", Home: fixture.home,
+	})
+	if err == nil || !strings.Contains(err.Error(), `agent "ghost-reviewer" not found`) {
+		t.Fatalf("dispatch error = %v, want fail-closed unregistered reviewer refusal", err)
+	}
+
+	jobs, listErr := fixture.store.ListJobs(ctx)
+	if listErr != nil {
+		t.Fatalf("ListJobs: %v", listErr)
+	}
+	if len(jobs) != 1 || jobs[0].ID != "prior-review" {
+		t.Fatalf("jobs = %+v, want only the prior succeeded review", jobs)
+	}
+	if got := countCLIJobEvents(t, fixture.store, "prior-review", workflow.ReviewLoopDetectedEventKind); got != 0 {
+		t.Fatalf("review_loop_detected events = %d, want zero before identity guard", got)
+	}
+	tasks, listErr := fixture.store.ListTasks(ctx)
+	if listErr != nil {
+		t.Fatalf("ListTasks: %v", listErr)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("tasks = %+v, want none before reviewer admission", tasks)
+	}
+	worktreeRoot := filepath.Join(config.PathsForHome(fixture.home).Home, "worktrees")
+	if _, statErr := os.Stat(worktreeRoot); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("worktree root %q was created before refusal: %v", worktreeRoot, statErr)
+	}
+	if adapterCalls != 0 {
+		t.Fatalf("runtime adapter selected %d times, want zero", adapterCalls)
+	}
+}
+
 // TestCLIReviewLoopAllowsNewHeadAndMixedDecisions kills repo/PR-only and
 // decision-blind suppression mutants at the CLI preparation seam.
 func TestCLIReviewLoopAllowsNewHeadAndMixedDecisions(t *testing.T) {
