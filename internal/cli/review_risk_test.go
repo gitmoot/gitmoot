@@ -101,6 +101,30 @@ func TestApplyReviewPolicyInvalidSeverityRetainsValidSafetyPolicy(t *testing.T) 
 	}
 }
 
+func TestApplyReviewPolicyInvalidRepoSeverityOverridesPermissiveGlobal(t *testing.T) {
+	home := t.TempDir()
+	root := config.PathsForHome(home).Home
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "[review]\nblocking_severity = \"P1\"\n[repos.\"owner/sensitive\".review]\nblocking_severity = \"critical\"\nnative_fanout_enabled = true\n"
+	if err := os.WriteFile(filepath.Join(root, config.ConfigName), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var engine workflow.Engine
+	applyReviewPolicy(&engine, root)
+
+	if got := engine.ReviewBlockingSeverity("owner/ordinary"); got != reviewseverity.P1 {
+		t.Fatalf("ordinary repository blocking severity = %q, want global P1", got)
+	}
+	if got := engine.ReviewBlockingSeverity("owner/sensitive"); got != reviewseverity.P3 {
+		t.Fatalf("invalid sensitive repository threshold = %q, want fail-closed P3", got)
+	}
+	if !engine.NativeReviewFanoutEnabled("owner/sensitive") {
+		t.Fatal("invalid threshold discarded a valid repository override")
+	}
+}
+
 func TestApplyReviewPolicyEmptyHomeIsOff(t *testing.T) {
 	var engine workflow.Engine
 	applyReviewPolicy(&engine, "")

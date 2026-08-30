@@ -127,6 +127,26 @@ high_risk_paths = ["cmd/**"]
 	}
 }
 
+func TestLoadReviewConfigInvalidRepoSeverityFailsClosedWithoutDiscardingOverrides(t *testing.T) {
+	body := `[review]
+blocking_severity = "P1"
+[repos."owner/sensitive".review]
+blocking_severity = "critical"
+native_fanout_enabled = true
+`
+	cfg, err := LoadReviewConfig(writeReviewConfig(t, body))
+	if err == nil || !strings.Contains(err.Error(), "P0, P1, P2, P3") {
+		t.Fatalf("bad repository blocking severity error = %v, want canonical choices", err)
+	}
+	if got := cfg.For("owner/ordinary").BlockingSeverity; got != reviewseverity.P1 {
+		t.Fatalf("global blocking severity = %q, want P1", got)
+	}
+	sensitive := cfg.For("owner/sensitive")
+	if sensitive.BlockingSeverity != reviewseverity.P3 || !sensitive.NativeFanoutEnabled {
+		t.Fatalf("sensitive repository policy = %+v, want fail-closed P3 with valid override retained", sensitive)
+	}
+}
+
 func TestDefaultConfigDocumentsReviewBlockingSeverity(t *testing.T) {
 	content := DefaultConfig(PathsForHome(t.TempDir()))
 	for _, want := range []string{

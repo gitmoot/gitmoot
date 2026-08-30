@@ -688,6 +688,8 @@ func applyReviewPolicyOverrideField(override *reviewPolicyOverride, key string, 
 	case "blocking_severity":
 		parsed, err := parseReviewBlockingSeverity(value)
 		if err != nil {
+			safe := reviewseverity.DefaultBlocking
+			override.blockingSeverity = &safe
 			return err
 		}
 		override.blockingSeverity = &parsed
