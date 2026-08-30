@@ -200,8 +200,9 @@ func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
 }
 
 // ResolvePullRequestOwner returns the strongest stored org owner for one pull
-// request task. Acting-role attribution wins, followed by the branch lock, then
-// the earliest implementing agent. An unresolved owner is ("", nil).
+// request task. Implement-job acting-role attribution wins, followed by the
+// branch lock, then the earliest implementing agent. An unresolved owner is
+// ("", nil).
 func (s *Store) ResolvePullRequestOwner(
 	ctx context.Context,
 	repo string,
@@ -221,6 +222,7 @@ func (s *Store) ResolvePullRequestOwner(
 SELECT trim(json_extract(payload, '$.acting_org_role'))
 FROM jobs
 WHERE repo = ? AND pull_request = ?
+	AND type = 'implement'
 	AND json_valid(payload)
 	AND json_type(payload, '$.acting_org_role') = 'text'
 	AND trim(json_extract(payload, '$.acting_org_role')) != ''

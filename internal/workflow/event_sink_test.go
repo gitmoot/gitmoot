@@ -56,6 +56,14 @@ func TestEngineEmitsJobFinishedOnSucceededTerminal(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName:  "gitmoot/gitmoot",
+		Branch:        "task-9",
+		Owner:         "audit",
+		ActingOrgRole: "author",
+	}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
 	sink := &recordingSink{}
 	engine := testEngine(store)
 	engine.EventSink = sink
@@ -72,7 +80,7 @@ func TestEngineEmitsJobFinishedOnSucceededTerminal(t *testing.T) {
 		PullRequest:   42,
 		TaskID:        "task-9",
 		TaskTitle:     "Review",
-		ActingOrgRole: "author",
+		ActingOrgRole: "reviewer",
 	}); err != nil {
 		t.Fatalf("Enqueue returned error: %v", err)
 	}
@@ -114,15 +122,21 @@ func TestEngineEmitsChangesRequestedReviewVerdict(t *testing.T) {
 	}); err != nil || !acquired {
 		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
 	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "review-43", Agent: "audit", Type: "review", State: string(JobSucceeded), Payload: "{}",
+	}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
 	sink := &recordingSink{}
 	engine := testEngine(store)
 	engine.EventSink = sink
 	mailbox := engine.mailbox()
 
 	mailbox.emitTerminal(ctx, "review-43", JobSucceeded, JobPayload{
-		Repo:        "gitmoot/gitmoot",
-		Branch:      "task-43",
-		PullRequest: 43,
+		Repo:          "gitmoot/gitmoot",
+		Branch:        "task-43",
+		PullRequest:   43,
+		ActingOrgRole: "auditor",
 		Result: &AgentResult{
 			Decision: "changes_requested",
 			Summary:  "one blocking issue",
@@ -139,6 +153,36 @@ func TestEngineEmitsChangesRequestedReviewVerdict(t *testing.T) {
 		event.PullRequest != 43 ||
 		event.WakeTargetRole != "author" {
 		t.Fatalf("changes-requested verdict event = %+v", event)
+	}
+}
+func TestEngineDoesNotClassifyNonReviewApprovedResult(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "ask-44", Agent: "helper", Type: "ask", State: string(JobSucceeded), Payload: "{}",
+	}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	sink := &recordingSink{}
+	engine := testEngine(store)
+	engine.EventSink = sink
+	engine.mailbox().emitTerminal(ctx, "ask-44", JobSucceeded, JobPayload{
+		Repo:          "gitmoot/gitmoot",
+		PullRequest:   44,
+		ActingOrgRole: "requester",
+		Result:        &AgentResult{Decision: "approved", Summary: "answer accepted"},
+	})
+
+	finished := sink.byType(events.EventJobFinished)
+	if len(finished) != 1 {
+		t.Fatalf("job.finished emissions = %d, want 1; all=%+v", len(finished), sink.snapshot())
+	}
+	event := finished[0]
+	if event.Cause != "" || event.PullRequest != 0 || event.ReviewDecision != "" {
+		t.Fatalf("non-review terminal was classified as a review verdict: %+v", event)
+	}
+	if event.WakeTargetRole != "requester" {
+		t.Fatalf("ordinary terminal target = %q, want requester", event.WakeTargetRole)
 	}
 }
 

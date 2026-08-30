@@ -5529,7 +5529,7 @@ func TestResolvePullRequestOwnerPrecedenceAndFailClosed(t *testing.T) {
 		}
 	}
 
-	addJob("role-owner", "reviewer", "review", "owner/repo", 10, "task-role", "seat-owner")
+	addJob("role-owner", "implementer", "implement", "owner/repo", 10, "task-role", "seat-owner")
 	addJob("role-implement", "implementer", "implement", "owner/repo", 10, "task-role", "")
 	if created, err := store.CreateLock(ctx, BranchLock{
 		RepoFullName: "owner/repo", Branch: "branch-role", Owner: "lock-owner",
@@ -5538,6 +5538,7 @@ func TestResolvePullRequestOwnerPrecedenceAndFailClosed(t *testing.T) {
 		t.Fatalf("create role branch lock = %v, err=%v", created, err)
 	}
 	addJob("other-task-role", "reviewer", "review", "owner/repo", 11, "other-task", "wrong-owner")
+	addJob("same-task-review", "reviewer", "review", "owner/repo", 11, "wanted-task", "auditor")
 	addJob("task-implement", "task-implementer", "implement", "owner/repo", 11, "wanted-task", "")
 	if created, err := store.CreateLock(ctx, BranchLock{
 		RepoFullName: "owner/repo", Branch: "branch-lock", Owner: "lock-owner",
@@ -5556,7 +5557,7 @@ func TestResolvePullRequestOwnerPrecedenceAndFailClosed(t *testing.T) {
 		want        string
 	}{
 		{name: "acting role wins", branch: "branch-role", pullRequest: 10, taskID: "task-role", want: "seat-owner"},
-		{name: "branch lock beats other task role", branch: "branch-lock", pullRequest: 11, taskID: "wanted-task", want: "branch-owner"},
+		{name: "branch lock beats review role", branch: "branch-lock", pullRequest: 11, taskID: "wanted-task", want: "branch-owner"},
 		{name: "earliest implementing agent", pullRequest: 12, taskID: "task-implement", want: "first-implementer"},
 		{name: "unresolved", pullRequest: 13, taskID: "missing"},
 	}
