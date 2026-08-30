@@ -199,6 +199,72 @@ func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
 	return job, nil
 }
 
+// ResolvePullRequestOwner returns the strongest stored org owner for one pull
+// request task. Implement-job acting-role attribution wins, followed by the
+// branch lock, then the earliest implementing agent. An unresolved owner is
+// ("", nil).
+func (s *Store) ResolvePullRequestOwner(
+	ctx context.Context,
+	repo string,
+	branch string,
+	pullRequest int,
+	taskID string,
+) (string, error) {
+	repo = strings.TrimSpace(repo)
+	branch = strings.TrimSpace(branch)
+	taskID = strings.TrimSpace(taskID)
+	if repo == "" || pullRequest <= 0 {
+		return "", nil
+	}
+
+	var owner string
+	err := s.db.QueryRowContext(ctx, `
+SELECT trim(json_extract(payload, '$.acting_org_role'))
+FROM jobs
+WHERE repo = ? AND pull_request = ?
+	AND type = 'implement'
+	AND json_valid(payload)
+	AND json_type(payload, '$.acting_org_role') = 'text'
+	AND trim(json_extract(payload, '$.acting_org_role')) != ''
+	AND (? = '' OR COALESCE(json_extract(payload, '$.task_id'), '') = ?)
+ORDER BY created_at, id
+LIMIT 1`, repo, pullRequest, taskID, taskID).Scan(&owner)
+	if err == nil {
+		return strings.TrimSpace(owner), nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+
+	if branch != "" {
+		lock, err := s.GetBranchLock(ctx, repo, branch)
+		switch {
+		case err == nil && strings.TrimSpace(lock.ActingOrgRole) != "":
+			return strings.TrimSpace(lock.ActingOrgRole), nil
+		case err != nil && !errors.Is(err, sql.ErrNoRows):
+			return "", err
+		}
+	}
+
+	err = s.db.QueryRowContext(ctx, `
+SELECT agent
+FROM jobs
+WHERE repo = ? AND pull_request = ? AND type = 'implement'
+	AND (? = '' OR (
+		json_valid(payload)
+		AND COALESCE(json_extract(payload, '$.task_id'), '') = ?
+	))
+ORDER BY created_at, id
+LIMIT 1`, repo, pullRequest, taskID, taskID).Scan(&owner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(owner), nil
+}
+
 // JobWorktreePath returns the worktree path recorded in one job payload without
 // scanning the rest of the job row. The daemon's best-effort reclaim pass uses
 // this narrow lookup to distinguish a candidate-local GetJob scan failure from a

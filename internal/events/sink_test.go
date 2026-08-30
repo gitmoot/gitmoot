@@ -11,6 +11,8 @@ import (
 func TestNewEventContractShape(t *testing.T) {
 	ts := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
 	ev := NewEvent(EventJobFinished, "job-1", "root-1", "gitmoot/gitmoot", "succeeded", "all good", ts, nil)
+	ev.PullRequest = 42
+	ev.ReviewDecision = "approved"
 
 	if ev.SchemaVersion != 1 {
 		t.Fatalf("SchemaVersion = %d, want 1", ev.SchemaVersion)
@@ -47,6 +49,11 @@ func TestNewEventContractShape(t *testing.T) {
 	}
 	if decoded["event_type"].(string) != "job.finished" {
 		t.Fatalf("event_type = %v, want job.finished", decoded["event_type"])
+	}
+	for _, key := range []string{"pull_request", "review_decision"} {
+		if _, ok := decoded[key]; ok {
+			t.Fatalf("internal event metadata %q must not be serialized; got %s", key, raw)
+		}
 	}
 	if _, ok := decoded["cause"]; ok {
 		t.Fatalf("empty optional cause must be omitted; got %s", raw)

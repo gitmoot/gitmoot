@@ -1585,6 +1585,7 @@ Event-rule wakes are separately opt-in:
 
 ```sh
 gitmoot org events rule add --on attention --match owner/repo --wake maintainer
+gitmoot org events rule add --on review-verdict --match owner/repo --wake maintainer
 gitmoot org events rule add --on blocked --repo tendwire --wake maintainer
 gitmoot org events rule add --on pane_input_pending --wake maintainer
 gitmoot org events rule add --on reply --wake maintainer
@@ -1596,8 +1597,13 @@ gitmoot org events rule set-scope --home /alternate/home <rule-id> observer
 gitmoot org events rule rm --home /alternate/home <rule-id>
 ```
 
-`--on` accepts `escalation`, `attention`, `guard`, `job-terminal`, `blocked`,
-`recycle-overdue`, `pane_input_pending`, `reply`, `directive`, or `fact`. `pane_input_pending` matches the
+`--on` accepts `escalation`, `attention`, `guard`, `job-terminal`,
+`review-verdict`, `blocked`, `recycle-overdue`, `pane_input_pending`, `reply`,
+`directive`, or `fact`. A successful review terminal whose decision is
+`approved` or `changes_requested` matches both `job-terminal` and
+`review-verdict` and addresses the resolved pull request owner. If no owner can
+be resolved, addressed rules fail closed while observer rules remain eligible.
+`pane_input_pending` matches the
 `org.input_pending` event emitted when Herdr continuously reports
 `input_pending: true` for a role's pane longer than
 `[orchestrate].blocked_role_wake_after`; it re-nudges at most once per that
@@ -1634,15 +1640,17 @@ manually with `set-scope` when observer delivery is intended.
 Every outbox row retains a queryable `pending`, `attempted`, `delivered`,
 `stalled`, `failed`, or `delivery_unknown` state, so never-attempted is not
 confused with success and outstanding rows contribute to daemon tick health.
-`--match` is a case-insensitive substring matched against the event repo or job
-id; empty matches all. `--repo` is a discoverable alias for the same substring
-filter; pass only one of `--match` or `--repo`. The wake role must exist and set
+Repository comparison for a slash-bearing owner/repo filter is
+case-insensitive and exact. Job IDs always use case-insensitive substring
+matching, including slash-bearing delegation IDs. Without a slash, repositories
+also use substring matching; omit either flag to match every event of that kind.
+Pass only one of `--match` and `--repo`. The wake role must exist and set
 `pane = "<herdr-pane>"`; Gitmoot resolves that value as an exact pane label first
 and otherwise treats it as a literal pane id.
 Delivery is verified with Herdr's `agent_prompted` versus
 `agent_prompt_stalled` result. `attention`, `guard`, `job-terminal`,
-`recycle-overdue`, and `pane_input_pending` wakes remain best-effort; zero rules
-leaves the feature off.
+`review-verdict`, `recycle-overdue`, and `pane_input_pending` wakes remain
+best-effort; zero rules leaves the feature off.
 
 ```sh
 gitmoot orchestrate planner "Coordinate the dashboard wave." --repo owner/repo --workflow fable/dashboard-redesign

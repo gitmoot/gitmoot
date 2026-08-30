@@ -634,6 +634,7 @@ func TestPreflightReadOnlyImplementEmitsJobBlocked(t *testing.T) {
 	seedDaemonWorkerAgentWithPolicy(t, store, "lead", runtime.CodexRuntime, "unused", []string{"implement"}, "gitmoot/gitmoot", runtime.AutonomyPolicyReadOnly)
 	job := db.Job{ID: "impl-job", Agent: "lead", Type: "implement", State: string(workflow.JobQueued), Payload: mustJobPayload(t, workflow.JobPayload{
 		Repo: "gitmoot/gitmoot", Branch: "feature", TaskID: "task-impl", TaskTitle: "Solo implement", Sender: "lead", RootJobID: "root-impl",
+		ActingOrgRole: "author",
 	})}
 	if err := store.CreateJobWithEvent(ctx, job, db.JobEvent{Kind: string(workflow.JobQueued), Message: "seed"}); err != nil {
 		t.Fatalf("CreateJobWithEvent returned error: %v", err)
@@ -662,6 +663,12 @@ func TestPreflightReadOnlyImplementEmitsJobBlocked(t *testing.T) {
 	if ev.Detail != agentPermissionBlockedMessage {
 		t.Fatalf("detail = %q, want the permission-blocked message", ev.Detail)
 	}
+	if ev.Cause != "permission_guard" || ev.WakeTargetRole != "author" {
+		t.Fatalf("permission guard routing metadata = %+v", ev)
+	}
+	if kinds := classifyEventRuleKinds(ev); len(kinds) != 1 || kinds[0] != "guard" {
+		t.Fatalf("permission guard classified kinds = %v, want [guard]", kinds)
+	}
 }
 
 // TestPreflightAutoImplementIsPermissionBlocked closes the #452 gap: an implement
@@ -675,6 +682,7 @@ func TestPreflightAutoImplementIsPermissionBlocked(t *testing.T) {
 	seedDaemonWorkerAgentWithPolicy(t, store, "lead", runtime.CodexRuntime, "unused", []string{"implement"}, "gitmoot/gitmoot", runtime.AutonomyPolicyAuto)
 	job := db.Job{ID: "impl-auto-job", Agent: "lead", Type: "implement", State: string(workflow.JobQueued), Payload: mustJobPayload(t, workflow.JobPayload{
 		Repo: "gitmoot/gitmoot", Branch: "feature", TaskID: "task-impl", TaskTitle: "Solo implement", Sender: "lead", RootJobID: "root-impl",
+		ActingOrgRole: "author",
 	})}
 	if err := store.CreateJobWithEvent(ctx, job, db.JobEvent{Kind: string(workflow.JobQueued), Message: "seed"}); err != nil {
 		t.Fatalf("CreateJobWithEvent returned error: %v", err)
@@ -695,16 +703,23 @@ func TestPreflightAutoImplementIsPermissionBlocked(t *testing.T) {
 	if len(blocked) != 1 {
 		t.Fatalf("job.blocked emissions = %d, want exactly 1; all=%+v", len(blocked), sink.events)
 	}
-	if blocked[0].Detail != agentPermissionBlockedMessage {
-		t.Fatalf("detail = %q, want the permission-blocked message", blocked[0].Detail)
+	ev := blocked[0]
+	if ev.Detail != agentPermissionBlockedMessage {
+		t.Fatalf("detail = %q, want the permission-blocked message", ev.Detail)
+	}
+	if ev.Cause != "permission_guard" || ev.WakeTargetRole != "author" {
+		t.Fatalf("permission guard routing metadata = %+v", ev)
+	}
+	if kinds := classifyEventRuleKinds(ev); len(kinds) != 1 || kinds[0] != "guard" {
+		t.Fatalf("permission guard classified kinds = %v, want [guard]", kinds)
 	}
 }
 
 // TestPreflightEphemeralDelegationChildAdvancesParent is the load-bearing test for
 // finding 3: an EPHEMERAL delegation child whose pre-flight fails goes through the
-// ephemeral wrapper at run() (~2083-2093) — an `ephemeral_worker_failed` event +
-// finishQueuedJob(JobFailed) + postJobResultComment + a cleanupTempWorker defer —
-// which is NOT byte-identical routing to the other finishQueuedJob sites. Assert
+// ephemeral wrapper at run() (~2083-2093): an `ephemeral_worker_failed` event,
+// finishQueuedJob(JobFailed), postJobResultComment, and a cleanupTempWorker defer.
+// This is not byte-identical routing to the other finishQueuedJob sites. Assert
 // that this wrapper still finalizes the delegation child (synthetic result + DAG
 // advance + failure_policy).
 func TestPreflightEphemeralDelegationChildAdvancesParent(t *testing.T) {

@@ -28,6 +28,7 @@ const (
 	eventRuleProbeTimeout           = 5 * time.Second
 	directiveCompletionOverdueCause = "directive_completion_overdue"
 	directiveTerminalCause          = "directive_terminal"
+	eventRuleKindReviewVerdict      = "review-verdict"
 )
 
 type eventWakeClient interface {
@@ -413,7 +414,12 @@ func (s *eventRuleSink) resolveRolePane(ctx context.Context, cfg config.OrgConfi
 
 func classifyEventRuleKinds(event events.Event) []string {
 	switch event.Type {
-	case events.EventJobFinished, events.EventJobFailed:
+	case events.EventJobFinished:
+		if event.Cause == events.EventCauseReviewVerdict {
+			return []string{"job-terminal", eventRuleKindReviewVerdict}
+		}
+		return []string{"job-terminal"}
+	case events.EventJobFailed:
 		return []string{"job-terminal"}
 	case events.EventJobBlocked:
 		switch event.Cause {
@@ -421,9 +427,10 @@ func classifyEventRuleKinds(event events.Event) []string {
 			return []string{"guard"}
 		case "blocked_since":
 			return []string{"blocked"}
-		case "":
-			// A plain blocked transition is both a terminal outcome and the
-			// narrower blocked rule kind.
+		case "", "advance_blocked":
+			// A blocked terminal transition is both a terminal outcome and the
+			// narrower blocked rule kind. advance_blocked names the daemon path,
+			// not a distinct routing policy.
 			return []string{"job-terminal", "blocked"}
 		}
 	case events.EventJobNeedsAttention:
@@ -471,11 +478,26 @@ func eventRuleMatches(filter string, event events.Event) bool {
 	if filter == "" {
 		return true
 	}
-	return strings.Contains(strings.ToLower(event.Repo), filter) ||
-		strings.Contains(strings.ToLower(event.JobID), filter)
+	repo := strings.ToLower(strings.TrimSpace(event.Repo))
+	jobID := strings.ToLower(event.JobID)
+	if strings.Contains(filter, "/") {
+		return repo == filter || strings.Contains(jobID, filter)
+	}
+	return strings.Contains(repo, filter) || strings.Contains(jobID, filter)
 }
 
 func eventRuleWakePrompt(kind string, event events.Event) string {
+	if strings.EqualFold(strings.TrimSpace(kind), eventRuleKindReviewVerdict) {
+		detail := truncateForWake(strings.TrimSpace(event.Detail), 320)
+		prompt := fmt.Sprintf(
+			"gitmoot review verdict %s for %s#%d from job %s",
+			event.ReviewDecision, event.Repo, event.PullRequest, event.JobID,
+		)
+		if detail != "" {
+			prompt += ": " + detail
+		}
+		return prompt
+	}
 	if strings.EqualFold(strings.TrimSpace(kind), db.WakeOutboxKindDirective) {
 		directiveID := strings.TrimPrefix(event.RootID, db.WakeOutboxSourceWorkflowNote+":")
 		switch event.Cause {

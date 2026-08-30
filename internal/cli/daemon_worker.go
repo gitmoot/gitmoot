@@ -395,7 +395,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		// genuine transition above, nil-safe when [events] is OFF. The following
 		// finalizePreflightDelegationChild only attaches a synthetic result
 		// (savePayload, no transition), so it never re-emits.
-		emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, job.ID, events.EventJobBlocked, string(workflow.JobBlocked), agentPermissionBlockedMessage, "permission_guard")
+		emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, job.ID, daemonTerminalPermissionGuard, string(workflow.JobBlocked), agentPermissionBlockedMessage)
 		_ = w.postJobResultComment(ctx, job.ID, agent, "", errors.New(agentPermissionBlockedMessage))
 		writeLine(w.Stdout, "job %s blocked: %s", job.ID, agentPermissionBlockedMessage)
 		// A read-only implement DELEGATION child short-circuits to blocked here,
@@ -956,7 +956,7 @@ func (w jobWorker) retryImplementationPreflight(ctx context.Context, job db.Job,
 		if err != nil || !transitioned {
 			return err
 		}
-		emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, job.ID, events.EventJobDeferred, string(workflow.JobQueued), message)
+		emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, job.ID, daemonTerminalDeferred, string(workflow.JobQueued), message)
 		return nil
 	}
 	exhausted := fmt.Errorf("automatic implementation preflight retries exhausted after %d attempts for task %s in worktree %q: %w; inspect and repair the worktree, then run `gitmoot job retry %s`; if the dispatch metadata is stale, dispatch a fresh fix job against pull request #%d's current head", implementationPreflightAttemptLimit, payload.TaskID, payload.WorktreePath, cause, job.ID, payload.PullRequest)

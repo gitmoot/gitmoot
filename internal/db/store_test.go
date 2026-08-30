@@ -5508,3 +5508,67 @@ func TestRecordJobGatesReopensRepeatedNeedOnReblock(t *testing.T) {
 		t.Fatalf("CountJobGates after reblock = (%d,%d,%v), want (1,1,nil)", total, open, err)
 	}
 }
+
+func TestResolvePullRequestOwnerPrecedenceAndFailClosed(t *testing.T) {
+	ctx := context.Background()
+	store := openWorkflowTestStore(t)
+	addJob := func(id, agent, action, repo string, pullRequest int, taskID, actingRole string) {
+		payload, err := json.Marshal(map[string]any{
+			"repo":            repo,
+			"pull_request":    pullRequest,
+			"task_id":         taskID,
+			"acting_org_role": actingRole,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.CreateJob(ctx, Job{
+			ID: id, Agent: agent, Type: action, State: "succeeded", Payload: string(payload),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	addJob("role-owner", "implementer", "implement", "owner/repo", 10, "task-role", "seat-owner")
+	addJob("role-implement", "implementer", "implement", "owner/repo", 10, "task-role", "")
+	if created, err := store.CreateLock(ctx, BranchLock{
+		RepoFullName: "owner/repo", Branch: "branch-role", Owner: "lock-owner",
+		ActingOrgRole: "branch-owner",
+	}); err != nil || !created {
+		t.Fatalf("create role branch lock = %v, err=%v", created, err)
+	}
+	addJob("other-task-role", "reviewer", "review", "owner/repo", 11, "other-task", "wrong-owner")
+	addJob("same-task-review", "reviewer", "review", "owner/repo", 11, "wanted-task", "auditor")
+	addJob("task-implement", "task-implementer", "implement", "owner/repo", 11, "wanted-task", "")
+	if created, err := store.CreateLock(ctx, BranchLock{
+		RepoFullName: "owner/repo", Branch: "branch-lock", Owner: "lock-owner",
+		ActingOrgRole: "branch-owner",
+	}); err != nil || !created {
+		t.Fatalf("create fallback branch lock = %v, err=%v", created, err)
+	}
+	addJob("implement-a", "first-implementer", "implement", "owner/repo", 12, "task-implement", "")
+	addJob("implement-b", "later-implementer", "implement", "owner/repo", 12, "task-implement", "")
+
+	tests := []struct {
+		name        string
+		branch      string
+		pullRequest int
+		taskID      string
+		want        string
+	}{
+		{name: "acting role wins", branch: "branch-role", pullRequest: 10, taskID: "task-role", want: "seat-owner"},
+		{name: "branch lock beats review role", branch: "branch-lock", pullRequest: 11, taskID: "wanted-task", want: "branch-owner"},
+		{name: "earliest implementing agent", pullRequest: 12, taskID: "task-implement", want: "first-implementer"},
+		{name: "unresolved", pullRequest: 13, taskID: "missing"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := store.ResolvePullRequestOwner(
+				ctx, "owner/repo", test.branch, test.pullRequest, test.taskID,
+			)
+			if err != nil || got != test.want {
+				t.Fatalf("ResolvePullRequestOwner = %q, err=%v, want %q", got, err, test.want)
+			}
+		})
+	}
+}

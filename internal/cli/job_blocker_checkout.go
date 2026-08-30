@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -171,6 +170,6 @@ func (w jobWorker) deferCheckoutContention(ctx context.Context, job db.Job, payl
 	}
 	// Additive job.deferred, best-effort and nil-safe when [events] is OFF. No
 	// job.failed precedes it: finishQueuedJob was never called (pre-terminal).
-	emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, job.ID, events.EventJobDeferred, string(workflow.JobQueued), message)
+	emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, job.ID, daemonTerminalDeferred, string(workflow.JobQueued), message)
 	return true, nil
 }

@@ -1769,6 +1769,7 @@ var eventRuleKinds = map[string]struct{}{
 	"attention":          {},
 	"guard":              {},
 	"job-terminal":       {},
+	"review-verdict":     {},
 	"blocked":            {},
 	"recycle-overdue":    {},
 	"pane_input_pending": {},
@@ -1807,7 +1808,7 @@ func runOrgEvents(args []string, stdout, stderr io.Writer) int {
 
 func printOrgEventRuleUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot org events rule add --on <kind> [--match <filter> | --repo <substring>] --wake <role> [--scope addressed|observer] [--home path]")
+	fmt.Fprintln(w, "  gitmoot org events rule add --on <kind> [--match <filter> | --repo <filter>] --wake <role> [--scope addressed|observer] [--home path]")
 	fmt.Fprintln(w, "  gitmoot org events rule list [--home path]")
 	fmt.Fprintln(w, "  gitmoot org events rule set-scope [--home path] <id> observer|addressed")
 	fmt.Fprintln(w, "  gitmoot org events rule rm [--home path] <id>")
@@ -1817,12 +1818,12 @@ func runOrgEventRuleAdd(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("org events rule add", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	onKind := fs.String("on", "", "event kind: escalation, attention, guard, job-terminal, blocked, recycle-overdue, pane_input_pending, reply, directive, or fact")
-	// V1 intentionally keeps matching simple and inspectable: one
-	// case-insensitive substring tested independently against repo and job id;
-	// an empty filter matches every event of the selected kind.
-	match := fs.String("match", "", "case-insensitive substring matched against event repo or job id; empty matches all")
-	repo := fs.String("repo", "", "case-insensitive repo substring (alias for --match)")
+	onKind := fs.String("on", "", "event kind: escalation, attention, guard, job-terminal, review-verdict, blocked, recycle-overdue, pane_input_pending, reply, directive, or fact")
+	// A slash makes the repository comparison exact while job IDs always retain
+	// case-insensitive substring matching. Without a slash, repositories also use
+	// substring matching. An empty filter matches every event of the selected kind.
+	match := fs.String("match", "", "slash filters match owner/repo exactly and job IDs by substring; other filters use repo or job-ID substrings; empty matches all")
+	repo := fs.String("repo", "", "repository alias; owner/name is exact against repo while job-ID substring matching remains active")
 	wake := fs.String("wake", "", "organization role to wake")
 	scopeFlag := fs.String("scope", string(db.EventRuleScopeAddressed), "rule scope: addressed or observer")
 	if err := fs.Parse(args); err != nil {
@@ -1851,7 +1852,7 @@ func runOrgEventRuleAdd(args []string, stdout, stderr io.Writer) int {
 	}
 	kind := strings.ToLower(strings.TrimSpace(*onKind))
 	if _, ok := eventRuleKinds[kind]; !ok {
-		fmt.Fprintf(stderr, "unknown event rule kind %q; want escalation, attention, guard, job-terminal, blocked, recycle-overdue, pane_input_pending, reply, directive, or fact\n", kind)
+		fmt.Fprintf(stderr, "unknown event rule kind %q; want escalation, attention, guard, job-terminal, review-verdict, blocked, recycle-overdue, pane_input_pending, reply, directive, or fact\n", kind)
 		return 2
 	}
 	roleName := strings.ToLower(strings.TrimSpace(*wake))

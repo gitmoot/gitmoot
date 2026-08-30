@@ -40,7 +40,7 @@ var wakeTargetRoleProducers = []wakeTargetRoleProducer{
 	{
 		File:     "internal/cli/event_sink.go",
 		Function: "emitDaemonTerminalEvent",
-		Kinds:    blockedWakeDirectedKinds,
+		Kinds:    daemonTerminalWakeDirectedKinds,
 	},
 	{
 		File:     "internal/cli/blocked_since.go",
@@ -57,6 +57,11 @@ var wakeTargetRoleProducers = []wakeTargetRoleProducer{
 		Function: "strandTask",
 		Kinds:    taskDisposalDirectedKinds,
 	},
+	{
+		File:     "internal/workflow/engine_types.go",
+		Function: "mailbox",
+		Kinds:    engineTerminalWakeDirectedKinds,
+	},
 }
 
 func directiveNudgeDirectedKinds() []string {
@@ -69,6 +74,10 @@ func directiveEscalationDirectedKinds() []string {
 
 func blockedWakeDirectedKinds() []string {
 	return []string{db.WakeOutboxKindBlocked}
+}
+
+func engineTerminalWakeDirectedKinds() []string {
+	return []string{"job-terminal", eventRuleKindReviewVerdict, db.WakeOutboxKindBlocked}
 }
 
 func inputPendingDirectedKinds() []string {
