@@ -238,13 +238,15 @@ For remote shell jobs, the same opt-in can issue an ephemeral mTLS client
 identity and capability bound to the sandbox id, runtime, allowlist, and lease
 expiry. Only a curl-config path enters the environment; the upstream key is
 resolved on the host after authentication and never enters the sandbox.
-Response headers and streamed bodies are decoded before passing through the
-same filter for the raw key, ASCII-case variants, and standard reversible
-URL/base encodings, including values split across transport chunks. The host
-stages each filtered response through EOF before release, then evaluates
-initial headers and finalized HTTP/1.1 trailers together. Upstream requests use
-HTTP/1.1 because Go discards forbidden HTTP/2 encoding trailers before exposing
-them; any unexpected HTTP/2 response fails closed. Model runtimes remain
+The host transport decodes negotiated gzip before filtering. Initial residual
+`Content-Encoding` and unexpected HTTP/2 responses fail before body release.
+Credential-bearing response field names are dropped; remaining field values
+and body bytes are filtered incrementally with bounded carry-over, so streaming
+does not wait for EOF. ASCII-case variants and standard reversible URL/base
+encodings remain best-effort defense in depth. The contract covers accidental
+exact-byte reflection by a trusted, operator-selected upstream. Malicious
+upstreams and transformed application payloads, including application-layer
+compression without `Content-Encoding`, are out of scope. Model runtimes remain
 refused remotely until they can present that identity.
 
 ### Runtime ambient credential hygiene

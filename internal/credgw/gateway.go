@@ -18,7 +18,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"path"
 	"path/filepath"
 	"sort"
@@ -177,10 +176,10 @@ func Start(logf LogFunc) (*Gateway, error) {
 
 func proxyHTTPTransport() *http.Transport {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	// Go drops forbidden HTTP/2 trailers before exposing Response.Trailer. An
-	// upstream could therefore hide Content-Encoding there while leaving a
-	// recoverable compressed body. Keep the proxy on HTTP/1.1, whose declared
-	// trailers remain available to the post-EOF forwarding decision.
+	// Go drops forbidden HTTP/2 trailers before exposing Response.Trailer. Keep
+	// the upstream protocol on HTTP/1.1 so response metadata is not silently
+	// protocol-dependent; an unexpected HTTP/2 response is refused before its
+	// body is streamed.
 	transport.ForceAttemptHTTP2 = false
 	transport.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
 	return transport
@@ -499,52 +498,25 @@ func (g *Gateway) serveProxyRequest(w http.ResponseWriter, r *http.Request, acce
 		return
 	}
 	defer response.Body.Close()
-	staged, err := stageRedactedProxyResponse(response, resolved.Value)
-	if err != nil {
+	if !responseSafeToStream(response) {
 		http.Error(w, "upstream response failed", http.StatusBadGateway)
 		g.writeLog(r.Method, registered.upstream.Hostname(), http.StatusBadGateway, registered.jobID)
 		return
 	}
-	defer discardStagedProxyResponse(staged)
 	removeHopHeaders(response.Header)
 	copyRedactedHeader(w.Header(), response.Header, resolved.Value)
 	w.WriteHeader(response.StatusCode)
-	_, _ = io.Copy(w, staged)
+	_ = streamRedactedResponse(w, response.Body, resolved.Value)
 	g.writeLog(r.Method, registered.upstream.Hostname(), response.StatusCode, registered.jobID)
 }
 
-func stageRedactedProxyResponse(response *http.Response, secret string) (*os.File, error) {
-	staged, err := os.CreateTemp("", "gitmoot-credential-response-*")
-	if err != nil {
-		return nil, err
-	}
-	keep := false
-	defer func() {
-		if !keep {
-			discardStagedProxyResponse(staged)
-		}
-	}()
-	if err := streamRedactedResponse(staged, response.Body, secret); err != nil {
-		return nil, err
-	}
-	// Response.Trailer is complete only after Body reaches EOF. This single
-	// post-EOF decision covers initial headers and HTTP/1.1 trailers, and rejects
-	// HTTP/2 entirely, before any byte is released to the sandbox.
-	if !responseSafeToForward(response) {
-		return nil, errors.New("upstream response encoding refused")
-	}
-	if _, err := staged.Seek(0, io.SeekStart); err != nil {
-		return nil, err
-	}
-	keep = true
-	return staged, nil
-}
-
-func responseSafeToForward(response *http.Response) bool {
+func responseSafeToStream(response *http.Response) bool {
+	// This decision intentionally uses only the initial response metadata. HTTP
+	// trailers are complete only at EOF; waiting for them would reintroduce
+	// whole-response staging and break unbounded streams such as SSE.
 	return response != nil &&
 		response.ProtoMajor == 1 &&
-		!headerContains(response.Header, "Content-Encoding") &&
-		!headerContains(response.Trailer, "Content-Encoding")
+		!headerContains(response.Header, "Content-Encoding")
 }
 
 func headerContains(header http.Header, name string) bool {
@@ -554,15 +526,6 @@ func headerContains(header http.Header, name string) bool {
 		}
 	}
 	return false
-}
-
-func discardStagedProxyResponse(staged *os.File) {
-	if staged == nil {
-		return
-	}
-	name := staged.Name()
-	_ = staged.Close()
-	_ = os.Remove(name)
 }
 
 // ValidateProxyPolicy returns a canonical policy and parsed upstream. Callers
@@ -685,11 +648,18 @@ func sortedHostSet(hosts map[string]struct{}) []string {
 	return values
 }
 
+// For an authenticated RegisterProxy lease pinned to an operator-selected
+// HTTPS upstream, prevent a non-malicious upstream's accidental exact-byte
+// reflection of the credential in response body bytes or HTTP field
+// names/values from reaching the sandbox. Malicious or compromised upstreams
+// and transformed application payloads are out of scope. The finite reversible
+// forms below are defense in depth, not an application-layer DLP guarantee;
+// that exclusion includes application/gzip data without Content-Encoding.
 func copyRedactedHeader(destination, source http.Header, secret string) {
 	patterns := credentialRedactionPatterns(secret)
 	destination.Del("Content-Length")
 	for name, values := range source {
-		if strings.EqualFold(name, "Content-Length") {
+		if strings.EqualFold(name, "Content-Length") || redactCredentialText(name, patterns) != name {
 			continue
 		}
 		for _, value := range values {
@@ -698,18 +668,42 @@ func copyRedactedHeader(destination, source http.Header, secret string) {
 	}
 }
 
-func streamRedactedResponse(destination io.Writer, source io.Reader, secret string) error {
+func streamRedactedResponse(destination http.ResponseWriter, source io.Reader, secret string) error {
 	patterns := credentialRedactionPatterns(secret)
-	if len(patterns) == 0 {
-		_, err := io.Copy(destination, source)
-		return err
-	}
 	buffered := bufio.NewWriter(destination)
 	redactor := &credentialRedactingWriter{destination: buffered, patterns: patterns}
-	_, copyErr := io.Copy(redactor, source)
-	flushErr := redactor.flush()
-	bufferErr := buffered.Flush()
-	return errors.Join(copyErr, flushErr, bufferErr)
+	controller := http.NewResponseController(destination)
+	buffer := make([]byte, 32*1024)
+	for {
+		n, readErr := source.Read(buffer)
+		if n > 0 {
+			if _, err := redactor.Write(buffer[:n]); err != nil {
+				return err
+			}
+			if err := buffered.Flush(); err != nil {
+				return err
+			}
+			if err := controller.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+				return err
+			}
+		}
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				return readErr
+			}
+			break
+		}
+	}
+	if err := redactor.flush(); err != nil {
+		return err
+	}
+	if err := buffered.Flush(); err != nil {
+		return err
+	}
+	if err := controller.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return err
+	}
+	return nil
 }
 
 type credentialRedactionPattern struct {

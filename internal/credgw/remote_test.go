@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -109,14 +111,14 @@ func TestRemoteProxyAuthenticatesBeforeCredentialLoadAndRevokes(t *testing.T) {
 		t.Fatalf("success status=%d resolver=%d upstream=%d", response.StatusCode, resolverCalls.Load(), upstreamCalls.Load())
 	}
 	if !strings.Contains(body, visibleSentinel) || strings.Contains(body, testRealCredential) || !strings.Contains(body, "[REDACTED]") {
-		t.Fatalf("redacted body lost control or exposed credential: %q", body)
+		t.Fatalf("redacted body lost control or exposed credential, length=%d", len(body))
 	}
 	if got := response.Header.Get("X-Reflected-Credential"); strings.Contains(got, testRealCredential) || !strings.Contains(got, "[REDACTED]") {
-		t.Fatalf("redacted response header = %q", got)
+		t.Fatalf("redacted response header length=%d", len(got))
 	}
 	logged := logs.waitFor(t, "job_id=remote-job")
 	if strings.Contains(logged, testRealCredential) || strings.Contains(logged, material.Capability) || strings.Contains(logged, material.Placeholder) {
-		t.Fatalf("gateway log contains protected material: %q", logged)
+		t.Fatalf("gateway log contains protected material, length=%d", len(logged))
 	}
 
 	lease.Revoke()
@@ -308,40 +310,13 @@ func TestRemoteProxyRejectsUnsupportedContentEncoding(t *testing.T) {
 	}
 }
 
-func TestRemoteProxyRejectsContentEncodingTrailerBeforeForwarding(t *testing.T) {
-	assertRemoteProxyRejectsContentEncodingTrailer(t, false)
-}
-
-func TestRemoteProxyRejectsHTTP2ContentEncodingTrailerBeforeForwarding(t *testing.T) {
-	assertRemoteProxyRejectsContentEncodingTrailer(t, true)
-}
-
-func assertRemoteProxyRejectsContentEncodingTrailer(t *testing.T, useHTTP2 bool) {
-	t.Helper()
-	const visibleSentinel = "visible-trailer-positive-control"
-	var encoded bytes.Buffer
-	compressed := gzip.NewWriter(&encoded)
-	_, _ = io.WriteString(compressed, visibleSentinel+":"+testRealCredential)
-	if err := compressed.Close(); err != nil {
-		t.Fatal(err)
-	}
-	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if gotHTTP2 := r.ProtoMajor == 2; gotHTTP2 != useHTTP2 {
-			t.Errorf("upstream protocol major = %d, want HTTP/2=%v", r.ProtoMajor, useHTTP2)
-		}
-		if !useHTTP2 {
-			w.Header().Set("Trailer", "Content-Encoding")
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(encoded.Bytes())
-		w.Header().Set(http.TrailerPrefix+"Content-Encoding", "gzip")
+func TestRemoteProxyRejectsUnexpectedHTTP2BeforeForwarding(t *testing.T) {
+	const visibleSentinel = "visible-http2-positive-control"
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, visibleSentinel)
 	}))
-	upstream.EnableHTTP2 = useHTTP2
-	if useHTTP2 {
-		upstream.StartTLS()
-	} else {
-		upstream.Start()
-	}
+	upstream.EnableHTTP2 = true
+	upstream.StartTLS()
 	defer upstream.Close()
 
 	upstreamClient := upstream.Client()
@@ -354,44 +329,190 @@ func assertRemoteProxyRejectsContentEncodingTrailer(t *testing.T, useHTTP2 bool)
 	if err != nil {
 		t.Fatal(err)
 	}
-	controlReader, err := gzip.NewReader(bytes.NewReader(controlBody))
-	if err != nil {
-		t.Fatal(err)
-	}
-	controlDecoded, err := io.ReadAll(controlReader)
-	controlReader.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantTrailer := "gzip"
-	wantProtoMajor := 1
-	if useHTTP2 {
-		// net/http rejects this forbidden HTTP/2 trailer before exposing it to
-		// callers. The recoverable body proves why the proxy refuses HTTP/2.
-		wantTrailer = ""
-		wantProtoMajor = 2
-	}
-	if controlResponse.ProtoMajor != wantProtoMajor || controlResponse.Trailer.Get("Content-Encoding") != wantTrailer || !strings.Contains(string(controlDecoded), visibleSentinel) || !strings.Contains(string(controlDecoded), testRealCredential) {
-		t.Fatal("positive control did not expose the planted trailer-encoded credential")
+	if controlResponse.ProtoMajor != 2 || string(controlBody) != visibleSentinel {
+		t.Fatal("positive control did not produce the expected HTTP/2 response")
 	}
 
-	gateway, material := newRemoteProxyTestLease(t, upstream.URL, "trailer-response")
+	gateway, material := newRemoteProxyTestLease(t, upstream.URL, "http2-response")
 	defer gateway.Close(context.Background())
 	gateway.client = upstreamClient
-	request, _ := http.NewRequest(http.MethodGet, material.URL, nil)
-	request.Header.Set(CapabilityHeader, material.Capability)
-	request.Header.Set("Authorization", "Bearer "+material.Placeholder)
-	response, err := remoteMaterialClient(t, material).Do(request)
-	if err != nil {
-		t.Fatal(err)
-	}
+	response := requestRemoteProxy(t, material)
 	body, err := io.ReadAll(response.Body)
 	response.Body.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.StatusCode != http.StatusBadGateway || strings.Contains(string(body), visibleSentinel) || strings.Contains(string(body), testRealCredential) {
-		t.Fatalf("trailer encoding status=%d body length=%d", response.StatusCode, len(body))
+	if response.StatusCode != http.StatusBadGateway || strings.Contains(string(body), visibleSentinel) {
+		t.Fatalf("HTTP/2 response status=%d body length=%d", response.StatusCode, len(body))
+	}
+}
+
+func TestRemoteProxyStreamsSSEBeforeUpstreamEOF(t *testing.T) {
+	const (
+		firstEvent  = "event: ready\ndata: first\n\n"
+		secondEvent = "event: done\ndata: second\n\n"
+	)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	finish := func() { releaseOnce.Do(func() { close(release) }) }
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, firstEvent)
+		w.(http.Flusher).Flush()
+		<-release
+		_, _ = io.WriteString(w, secondEvent)
+		w.(http.Flusher).Flush()
+	}))
+	defer upstream.Close()
+
+	gateway, material := newRemoteProxyTestLease(t, upstream.URL, "streaming-response")
+	defer gateway.Close(context.Background())
+	defer finish()
+	request, _ := http.NewRequest(http.MethodGet, material.URL, nil)
+	request.Header.Set(CapabilityHeader, material.Capability)
+	request.Header.Set("Authorization", "Bearer "+material.Placeholder)
+	client := remoteMaterialClient(t, material)
+	responseResult := make(chan struct {
+		response *http.Response
+		err      error
+	}, 1)
+	go func() {
+		response, err := client.Do(request)
+		responseResult <- struct {
+			response *http.Response
+			err      error
+		}{response: response, err: err}
+	}()
+
+	var response *http.Response
+	select {
+	case result := <-responseResult:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		response = result.response
+	case <-time.After(5 * time.Second):
+		finish()
+		t.Fatal("remote proxy did not release SSE headers before upstream EOF")
+	}
+	defer response.Body.Close()
+	first := make([]byte, len(firstEvent))
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(response.Body, first)
+		firstResult <- err
+	}()
+	select {
+	case err := <-firstResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		finish()
+		t.Fatal("remote proxy did not flush the first SSE event")
+	}
+	if response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != "text/event-stream" || string(first) != firstEvent {
+		t.Fatalf("first SSE event status=%d content_type=%q bytes=%d", response.StatusCode, response.Header.Get("Content-Type"), len(first))
+	}
+	finish()
+	rest, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(rest) != secondEvent {
+		t.Fatalf("second SSE event bytes=%d", len(rest))
+	}
+}
+
+func TestCredentialRedactorBoundsCarryAndRedactsSplitSecret(t *testing.T) {
+	patterns := credentialRedactionPatterns(testRealCredential)
+	maxPatternLength := 0
+	var longestPattern []byte
+	for _, pattern := range patterns {
+		if len(pattern.value) > maxPatternLength {
+			maxPatternLength = len(pattern.value)
+			longestPattern = pattern.value
+		}
+	}
+	var destination countingWriter
+	redactor := &credentialRedactingWriter{destination: &destination, patterns: patterns}
+	chunk := bytes.Repeat([]byte("ordinary-response-byte"), 2048)
+	for range 256 {
+		if _, err := redactor.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		if len(redactor.pending) >= maxPatternLength {
+			t.Fatalf("redactor retained %d bytes, bound is %d", len(redactor.pending), maxPatternLength-1)
+		}
+	}
+	beforeBound := destination.written
+	if _, err := redactor.Write(append([]byte("visible:"), longestPattern[:maxPatternLength-1]...)); err != nil {
+		t.Fatal(err)
+	}
+	if destination.written <= beforeBound || len(redactor.pending) != maxPatternLength-1 {
+		t.Fatalf("redactor progress=%v retained=%d bound=%d", destination.written > beforeBound, len(redactor.pending), maxPatternLength-1)
+	}
+	var splitOutput bytes.Buffer
+	splitRedactor := &credentialRedactingWriter{destination: &splitOutput, patterns: patterns}
+	if _, err := splitRedactor.Write([]byte("visible:" + testRealCredential[:19])); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := splitRedactor.Write([]byte(testRealCredential[19:] + ":done")); err != nil {
+		t.Fatal(err)
+	}
+	if err := splitRedactor.flush(); err != nil {
+		t.Fatal(err)
+	}
+	if output := splitOutput.String(); !strings.Contains(output, "visible:") || !strings.Contains(output, "[REDACTED]") || strings.Contains(output, testRealCredential) {
+		t.Fatalf("split redaction output length=%d", len(output))
+	}
+}
+
+func TestRemoteProxyDropsCredentialBearingResponseHeaderNames(t *testing.T) {
+	credentialHeader := "X-" + testRealCredential
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(credentialHeader, "harmless")
+		w.Header().Set("X-Visible-Control", "preserved")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	gateway, material := newRemoteProxyTestLease(t, upstream.URL, "header-name-response")
+	defer gateway.Close(context.Background())
+	response := requestRemoteProxy(t, material)
+	response.Body.Close()
+	for name := range response.Header {
+		if strings.Contains(strings.ToLower(name), strings.ToLower(testRealCredential)) {
+			t.Fatal("credential-bearing response header name was forwarded")
+		}
+	}
+	if response.StatusCode != http.StatusNoContent || response.Header.Get("X-Visible-Control") != "preserved" {
+		t.Fatalf("header-name response status=%d control=%q", response.StatusCode, response.Header.Get("X-Visible-Control"))
+	}
+}
+
+func TestRemoteProxyPreservesOrdinaryResponse(t *testing.T) {
+	const body = "ordinary response body"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Add("X-Visible-Control", "one")
+		w.Header().Add("X-Visible-Control", "two")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = io.WriteString(w, body)
+	}))
+	defer upstream.Close()
+
+	gateway, material := newRemoteProxyTestLease(t, upstream.URL, "ordinary-response")
+	defer gateway.Close(context.Background())
+	response := requestRemoteProxy(t, material)
+	responseBody, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusAccepted || response.Header.Get("Content-Type") != "application/json" || !slices.Equal(response.Header.Values("X-Visible-Control"), []string{"one", "two"}) || string(responseBody) != body {
+		t.Fatalf("ordinary response status=%d content_type=%q controls=%d body_bytes=%d", response.StatusCode, response.Header.Get("Content-Type"), len(response.Header.Values("X-Visible-Control")), len(responseBody))
 	}
 }
 
@@ -458,6 +579,30 @@ func TestRegistryRemoteGatewayRejectsChangedCoordinates(t *testing.T) {
 			}
 		})
 	}
+}
+
+type countingWriter struct {
+	written int64
+}
+
+func (w *countingWriter) Write(data []byte) (int, error) {
+	w.written += int64(len(data))
+	return len(data), nil
+}
+
+func requestRemoteProxy(t *testing.T, material RemoteMaterial) *http.Response {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodGet, material.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(CapabilityHeader, material.Capability)
+	request.Header.Set("Authorization", "Bearer "+material.Placeholder)
+	response, err := remoteMaterialClient(t, material).Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return response
 }
 
 func newRemoteProxyTestLease(t *testing.T, upstreamURL, jobID string) (*Gateway, RemoteMaterial) {

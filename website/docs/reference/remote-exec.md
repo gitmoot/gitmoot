@@ -83,13 +83,15 @@ mTLS certificate and an opaque
 capability bound to the sandbox id, the `shell` runtime, the job lease expiry,
 and the exact upstream allowlist. Provider keys remain host-side and are loaded
 only after those checks pass. The route is revoked before sandbox teardown.
-Provider response headers and streamed bodies are decoded before filtering the
-raw key, ASCII-case variants, and standard reversible URL/base encodings across
-chunk boundaries. The host stages each filtered response through EOF before
-release, then evaluates initial headers and finalized HTTP/1.1 trailers
-together. Upstream requests use HTTP/1.1 because Go discards forbidden HTTP/2
-encoding trailers before exposing them; any unexpected HTTP/2 response fails
-closed.
+Before release, the host refuses an initial residual `Content-Encoding` or an
+unexpected HTTP/2 response. It drops response field names containing the key,
+redacts key bytes from remaining field values, and incrementally filters body
+bytes with bounded carry-over so matches split across transport chunks are
+removed without delaying streamed responses until EOF. Standard reversible
+URL/base encodings remain best-effort defense in depth. The contract covers an
+accidental exact-byte reflection by the trusted, operator-selected upstream;
+malicious upstreams and transformed application payloads, including
+application-layer compression without `Content-Encoding`, are out of scope.
 Claude, Codex, Kimi, and omp remain unsupported on `remote` until their clients
 can target this mTLS path; Gitmoot never supplies a raw key as a fallback.
 

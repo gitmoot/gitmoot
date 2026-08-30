@@ -95,6 +95,14 @@ exercising the credential on the pinned upstream. Curated upstreams and base
 paths are part of the model. A malicious or compromised upstream could still
 reflect a credential, so configure only trusted services.
 
+For an authenticated `RegisterProxy` lease pinned to an operator-selected
+HTTPS upstream, response filtering prevents a non-malicious upstream's
+accidental exact-byte reflection of the credential in response body bytes or
+HTTP field names or values from reaching the sandbox. Malicious or compromised
+upstreams and transformed application payloads are out of scope. That includes
+application-layer compression such as `Content-Type: application/gzip` without
+`Content-Encoding`; this boundary is not a general data-loss-prevention layer.
+
 ## Claude model gateway
 
 `model_gateway = true` opts Claude deliveries into a daemon-owned loopback

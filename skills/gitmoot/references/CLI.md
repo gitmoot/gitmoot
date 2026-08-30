@@ -4061,7 +4061,11 @@ The lease is revoked when delivery ends.
 Proxied mode hides key bytes; it does **not** prevent an authorized child from
 exercising the credential on the pinned upstream. Curated upstreams and base
 paths are part of the model. Configure only trusted upstreams. Pipeline key
-delivery stays separate from the Claude model gateway.
+delivery stays separate from the Claude model gateway. For authenticated remote
+leases, response filtering covers accidental exact-byte reflection in body
+bytes and HTTP field names or values. Malicious upstreams and transformed
+application payloads, including application-layer compression without a
+`Content-Encoding` header, are outside that boundary.
 
 For a non-empty run payload, every agent stage (including roots) receives a
 dynamically fenced, 6000-byte-bounded `UNTRUSTED external data` block before
