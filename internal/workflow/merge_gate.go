@@ -736,7 +736,10 @@ func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job, blockingSev
 				unrecognized = append(unrecognized, fmt.Sprintf("%s (nil result)", childID))
 				continue
 			}
-			decision := effectiveReviewDecision(payload.Result, blockingSeverity)
+			decision := strings.TrimSpace(payload.Result.Decision)
+			if strings.EqualFold(strings.TrimSpace(child.Type), "review") {
+				decision = effectiveReviewDecision(payload.Result, blockingSeverity)
+			}
 			switch decision {
 			case "approved":
 				hasApproval = true

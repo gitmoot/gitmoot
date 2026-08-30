@@ -533,7 +533,7 @@ func TestDelegatedReviewEvidenceUsesBlockingSeverity(t *testing.T) {
 		t.Fatalf("marshalPayload returned error: %v", err)
 	}
 	children := []db.Job{{
-		ID: "child-review", State: string(JobSucceeded), Payload: string(encoded),
+		ID: "child-review", Type: "review", State: string(JobSucceeded), Payload: string(encoded),
 	}}
 
 	if err := ensureDelegatedReviewEvidence(db.Job{ID: "parent-review"}, children, reviewseverity.P1); err != nil {
@@ -541,6 +541,12 @@ func TestDelegatedReviewEvidenceUsesBlockingSeverity(t *testing.T) {
 	}
 	if err := ensureDelegatedReviewEvidence(db.Job{ID: "parent-review"}, children, reviewseverity.P2); err == nil || !strings.Contains(err.Error(), "blocking") {
 		t.Fatalf("at-threshold delegated review error = %v, want blocking evidence", err)
+	}
+	askChildren := []db.Job{{
+		ID: "child-ask", Type: "ask", State: string(JobSucceeded), Payload: string(encoded),
+	}}
+	if err := ensureDelegatedReviewEvidence(db.Job{ID: "parent-review"}, askChildren, reviewseverity.P1); err == nil || !strings.Contains(err.Error(), "blocking") {
+		t.Fatalf("sub-threshold non-review child error = %v, want raw blocking decision", err)
 	}
 }
 
