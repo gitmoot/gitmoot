@@ -757,19 +757,25 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 			})
 		}
 	} else if readOnlyFanoutNeedsWorktree(payload, d) {
+		baseRef := strings.TrimSpace(payload.HeadSHA)
+		if baseRef == "" {
+			baseRef = payload.Branch
+		}
 		// Read-only fan-out: >=2 read-only siblings share the parent repo and would
 		// otherwise serialize on the repo:<repo> checkout key (only one runs per
 		// daemon tick). Give this child its own detached, branch-lock-free worktree
 		// so its checkout key is worktree:<path> and the siblings run concurrently.
 		if manager, ok := e.DelegationWorktrees.(ReadOnlyWorktreeManager); !ok || strings.TrimSpace(e.Home) == "" {
-			// Isolation is unavailable (no Home/worktree manager, or the manager
-			// cannot create detached worktrees): the siblings fall back to the shared
-			// checkout and serialize. Emit a parent event so the loss of parallelism
-			// is observable rather than silent.
+			kind := "delegation_worktree_skipped"
+			message := fmt.Sprintf("delegation %q read-only fan-out runs serialized in the shared checkout: detached worktree isolation unavailable", request.DelegationID)
+			if strings.TrimSpace(payload.HeadSHA) != "" {
+				kind = "delegation_worktree_deferred"
+				message = fmt.Sprintf("delegation %q exact-head worktree allocation deferred to the job worker; shared-checkout delivery remains forbidden", request.DelegationID)
+			}
 			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
 				JobID:   job.ID,
-				Kind:    "delegation_worktree_skipped",
-				Message: fmt.Sprintf("delegation %q read-only fan-out runs serialized in the shared checkout: detached worktree isolation unavailable", request.DelegationID),
+				Kind:    kind,
+				Message: message,
 			})
 		} else {
 			path, err := e.AllocateReadOnlyDelegationWorktree(ctx, DelegationWorktreeRequest{
@@ -778,7 +784,7 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 				ParentJobID:  job.ID,
 				DelegationID: request.DelegationID,
 				Delegation:   d,
-				BaseBranch:   payload.Branch,
+				BaseBranch:   baseRef,
 				Checkout:     e.DelegationCheckout,
 				RetryAttempt: request.RetryCount,
 			}, manager)
@@ -790,10 +796,12 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 				return err
 			}
 			request.WorktreePath = path
-			// The detached worktree is created at the parent base-branch tip, which
-			// may have advanced past the inherited HeadSHA. Clear it so the child
-			// validates against its own fresh worktree HEAD (see isDelegationWorktreeChild).
-			request.HeadSHA = ""
+			// A PR-bound review remains pinned to the exact parent head used to
+			// create this detached worktree. Other read-only delegations preserve
+			// the legacy branch-tip behavior and validate their worktree directly.
+			if strings.TrimSpace(payload.HeadSHA) == "" {
+				request.HeadSHA = ""
+			}
 			// The worktree is the committed tip: it omits gitignored (repos/**) and
 			// uncommitted working-tree files. Point the child at the canonical base
 			// checkout so an analysis task does not silently report working-tree state

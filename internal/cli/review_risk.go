@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/config"
@@ -72,5 +73,56 @@ func wireReviewRiskSignals(engine *workflow.Engine, gh github.Client) {
 			}
 		}
 		return labels, paths, nil
+	}
+}
+
+func wireReviewChangedFiles(engine *workflow.Engine, gh github.Client) {
+	if engine == nil || gh == nil {
+		return
+	}
+	engine.ReviewChangedFiles = func(ctx context.Context, repo string, _ int, previousHead string, currentHead string) ([]string, error) {
+		owner, name, ok := strings.Cut(strings.TrimSpace(repo), "/")
+		if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
+			return nil, fmt.Errorf("review scope: invalid repo %q", repo)
+		}
+		compare, err := gh.CompareCommits(
+			ctx,
+			github.Repository{Owner: owner, Name: name},
+			strings.TrimSpace(previousHead),
+			strings.TrimSpace(currentHead),
+		)
+		if err != nil {
+			return nil, err
+		}
+		switch strings.TrimSpace(compare.Status) {
+		case "ahead", "identical":
+		default:
+			return nil, workflow.ReviewScopeUnavailableError{
+				Reason: fmt.Sprintf("review scope compare is %q, not a direct follow-up", compare.Status),
+			}
+		}
+		// GitHub caps the compare response's files array at 300. Exactly 300 is
+		// ambiguous, so fail closed rather than silently under-review a truncated
+		// follow-up scope.
+		if len(compare.Files) >= 300 {
+			return nil, workflow.ReviewScopeUnavailableError{
+				Reason: fmt.Sprintf("review scope compare returned %d files and may be truncated", len(compare.Files)),
+			}
+		}
+		seen := make(map[string]struct{}, len(compare.Files))
+		paths := make([]string, 0, len(compare.Files))
+		for _, file := range compare.Files {
+			path := strings.TrimSpace(file.Filename)
+			if path == "" {
+				continue
+			}
+			if _, exists := seen[path]; exists {
+				continue
+			}
+			seen[path] = struct{}{}
+			paths = append(paths, path)
+		}
+		sort.Strings(paths)
+		return paths, nil
 	}
 }

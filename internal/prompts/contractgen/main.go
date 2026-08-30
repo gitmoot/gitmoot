@@ -74,6 +74,7 @@ var delegationFieldAnnotations = map[string]fieldAnnotation{
 	"action":         {help: `action (string, required): one of ` + enumList(workflow.DelegationActions) + `.`},
 	"worktree":       {help: `worktree (string, optional): worktree path for the child job.`},
 	"prompt":         {help: `prompt (string, required): what the agent should do.`},
+	"review_scope":   {help: `review_scope (object, engine-owned; agents must omit): persisted native follow-up scope containing the prior reviewer head, named findings, and files changed since that exact head.`},
 	"artifacts":      {help: `artifacts (string[], optional): named artifact handles passed to the child; when any delegation sets this, the parent result must also set the top-level artifact_body.`},
 	"deps":           {help: `deps (string[], optional): sibling delegation ids this entry waits for; it runs only after every dep succeeds.`},
 	"timeout":        {help: `timeout (string, optional): a positive Go duration (e.g. "10m").`},

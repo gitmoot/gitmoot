@@ -159,6 +159,7 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 	// byte-identical unless a home config turns it on.
 	applyReviewPolicy(&engine, home)
 	wireReviewRiskSignals(&engine, gh)
+	wireReviewChangedFiles(&engine, gh)
 	if strings.TrimSpace(home) != "" {
 		// Root delegation artifacts under GITMOOT_HOME (alongside worktrees)
 		// rather than inside the repo checkout, so generated briefs stay out of

@@ -112,6 +112,86 @@ func (w jobWorker) defaultCheckoutForRunner(ctx context.Context, job db.Job, pay
 	return checkout, nil
 }
 
+// prepareNativeReviewWorktreeForRunner gives every native PR review leg the same
+// exact-head isolation as a deliberate `agent review` dispatch. It covers both
+// routine workflow jobs and high-risk lens children that reached the worker
+// without a dispatch-time worktree. It runs after scheduler admission, including
+// the disk guard, and before checkout validation. The persisted marker lets the
+// existing terminal cleanup reclaim the detached worktree.
+func (w jobWorker) prepareNativeReviewWorktreeForRunner(ctx context.Context, job db.Job, payload workflow.JobPayload, runner subprocess.Runner) (workflow.JobPayload, error) {
+	if job.Type != "review" ||
+		payload.PullRequest <= 0 ||
+		strings.TrimSpace(payload.HeadSHA) == "" ||
+		strings.TrimSpace(payload.ReviewRound) == "" ||
+		len(payload.Reviewers) == 0 ||
+		strings.TrimSpace(payload.WorktreePath) != "" {
+		return payload, nil
+	}
+	repoRecord, err := w.Store.GetRepo(ctx, payload.Repo)
+	if err != nil {
+		return payload, err
+	}
+	checkout := strings.TrimSpace(repoRecord.CheckoutPath)
+	if checkout == "" {
+		return payload, fmt.Errorf("native review repo %s has no registered checkout", payload.Repo)
+	}
+	client := jobGitClient(checkout, runner)
+	allocate := func() (string, error) {
+		return workflow.AllocateReadOnlyWorktree(
+			ctx,
+			w.Store,
+			w.workflowHome(),
+			payload.Repo,
+			checkout,
+			job.ID,
+			"readonly-seat",
+			0,
+			strings.TrimSpace(payload.HeadSHA),
+			0,
+			client,
+		)
+	}
+	path, err := allocate()
+	if err != nil {
+		fetchErr := client.FetchPullRequest(ctx, "origin", payload.PullRequest)
+		if fetchErr != nil {
+			return payload, fmt.Errorf("allocate native review worktree: %w; fetch PR ref: %v", err, fetchErr)
+		}
+		path, err = allocate()
+		if err != nil {
+			return payload, fmt.Errorf("allocate native review worktree after fetch: %w", err)
+		}
+	}
+	cleanup := func() {
+		_ = client.RemoveWorktreeForce(context.WithoutCancel(ctx), path)
+	}
+	payload.WorktreePath = path
+	payload.ReadOnlyWorktree = true
+	if note := workflow.ReadOnlyWorktreeContextNote(checkout); note != "" {
+		payload.Instructions += note
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		cleanup()
+		return payload, err
+	}
+	written, err := w.Store.UpdateJobPayloadAtGeneration(ctx, job.ID, string(encoded), job.LifecycleGeneration)
+	if err != nil {
+		cleanup()
+		return payload, err
+	}
+	if !written {
+		cleanup()
+		return payload, fmt.Errorf("native review job %s advanced while allocating its exact-head worktree", job.ID)
+	}
+	_ = w.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   job.ID,
+		Kind:    "review_worktree_allocated_exact_head",
+		Message: fmt.Sprintf("allocated owned read-only worktree at review head %s", strings.TrimSpace(payload.HeadSHA)),
+	})
+	return payload, nil
+}
+
 func (w jobWorker) resolveJobCheckout(ctx context.Context, job db.Job, payload workflow.JobPayload) (string, error) {
 	return w.resolveJobCheckoutForRunner(ctx, job, payload, subprocess.ExecRunner{})
 }

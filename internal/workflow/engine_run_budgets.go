@@ -813,6 +813,7 @@ func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) 
 		LeadAgent:       payload.LeadAgent,
 		Reviewers:       payload.Reviewers,
 		ReviewRound:     payload.ReviewRound,
+		ReviewScope:     cloneReviewScope(d.ReviewScope),
 		Sender:          job.Agent,
 		Instructions:    strings.TrimSpace(d.Prompt),
 		Constraints:     payload.Constraints,

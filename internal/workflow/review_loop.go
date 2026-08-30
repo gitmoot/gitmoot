@@ -1,8 +1,11 @@
 package workflow
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -11,6 +14,10 @@ import (
 // ReviewLoopDetectedEventKind marks a refused review dispatch whose verdict is
 // already stable at the requested PR head.
 const ReviewLoopDetectedEventKind = "review_loop_detected"
+
+// ReviewScopeUnavailableBlockMarker distinguishes a durable, exact-head scope
+// block from other workflow blocks that the daemon must continue retrying.
+const ReviewScopeUnavailableBlockMarker = "cannot safely scope follow-up review"
 
 // ReviewLoopMatch identifies the succeeded review used only as escalation
 // evidence. It is intentionally not an AgentResult and cannot be served as a
@@ -134,4 +141,215 @@ func FindRepeatedReviewers(ctx context.Context, store *db.Store, repo string, pu
 		matches = append(matches, match)
 	}
 	return matches, nil
+}
+
+type reviewScopeCandidate struct {
+	job      db.Job
+	payload  JobPayload
+	round    int
+	findings []string
+}
+
+// ReviewScopeUnavailableError marks a follow-up range that cannot be scoped
+// safely. Callers block the task visibly instead of falling back to a full review
+// or retrying the same permanently unscopable head on every daemon poll.
+type ReviewScopeUnavailableError struct {
+	Reason string
+}
+
+func (e ReviewScopeUnavailableError) Error() string {
+	return strings.TrimSpace(e.Reason)
+}
+
+func reviewScopeKey(reviewer, delegationID string) string {
+	reviewer = strings.ToLower(strings.TrimSpace(reviewer))
+	delegationID = strings.ToLower(strings.TrimSpace(delegationID))
+	if delegationID == "" {
+		return reviewer
+	}
+	return reviewer + "\x00" + delegationID
+}
+
+func reviewScopeFor(scopes map[string]*ReviewScope, reviewer, delegationID string) *ReviewScope {
+	if scope := scopes[reviewScopeKey(reviewer, delegationID)]; scope != nil {
+		return scope
+	}
+	return scopes[reviewScopeKey(reviewer, "")]
+}
+
+func (e Engine) followUpReviewScopes(ctx context.Context, event PullRequestEvent, reviewers []string, jobs []db.Job) (map[string]*ReviewScope, error) {
+	wanted := make(map[string]struct{}, len(reviewers))
+	for _, reviewer := range reviewers {
+		wanted[strings.ToLower(strings.TrimSpace(reviewer))] = struct{}{}
+	}
+	current := JobPayload{Repo: event.Repo, PullRequest: event.PullRequest, TaskID: event.TaskID}
+	candidates := make(map[string]reviewScopeCandidate, len(wanted))
+	for _, job := range jobs {
+		if job.Type != "review" {
+			continue
+		}
+		payload, err := unmarshalPayload(job.Payload)
+		if err != nil {
+			return nil, err
+		}
+		if !sameTask(current, payload) || payload.Result == nil {
+			continue
+		}
+		previousHead := strings.TrimSpace(payload.HeadSHA)
+		if previousHead == "" || previousHead == strings.TrimSpace(event.HeadSHA) {
+			continue
+		}
+		findings := namedReviewFindings(*payload.Result)
+		switch strings.TrimSpace(payload.Result.Decision) {
+		case "approved", "changes_requested":
+			if job.State != string(JobSucceeded) {
+				continue
+			}
+		case "blocked":
+			if job.State != string(JobBlocked) || len(findings) == 0 {
+				continue
+			}
+		default:
+			continue
+		}
+		reviewerKey := strings.ToLower(strings.TrimSpace(reviewDecisionAgent(job, payload)))
+		if _, ok := wanted[reviewerKey]; !ok {
+			continue
+		}
+		candidate := reviewScopeCandidate{
+			job:      job,
+			payload:  payload,
+			round:    reviewRoundCount(payload.ReviewRound),
+			findings: findings,
+		}
+		scopeKey := reviewScopeKey(reviewerKey, payload.DelegationID)
+		if prior, ok := candidates[scopeKey]; !ok || laterReviewScopeCandidate(candidate, prior) {
+			candidates[scopeKey] = candidate
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	if e.ReviewChangedFiles == nil {
+		return nil, ReviewScopeUnavailableError{Reason: "scoped follow-up review requires a changed-files resolver"}
+	}
+	filesByHead := make(map[string][]string, len(candidates))
+	scopes := make(map[string]*ReviewScope, len(candidates))
+	for scopeKey, candidate := range candidates {
+		previousHead := strings.TrimSpace(candidate.payload.HeadSHA)
+		files, ok := filesByHead[previousHead]
+		if !ok {
+			var err error
+			files, err = e.ReviewChangedFiles(ctx, event.Repo, event.PullRequest, previousHead, event.HeadSHA)
+			if err != nil {
+				return nil, fmt.Errorf("resolve review scope from %s to %s: %w", previousHead, event.HeadSHA, err)
+			}
+			files = sortedUniqueStrings(files)
+			filesByHead[previousHead] = files
+		}
+		scopes[scopeKey] = &ReviewScope{
+			PreviousHeadSHA: previousHead,
+			Findings:        append([]string(nil), candidate.findings...),
+			ChangedFiles:    append([]string(nil), files...),
+		}
+	}
+	return scopes, nil
+}
+
+func laterReviewScopeCandidate(candidate, prior reviewScopeCandidate) bool {
+	if candidate.round != prior.round {
+		return candidate.round > prior.round
+	}
+	if candidate.job.UpdatedAt != prior.job.UpdatedAt {
+		return candidate.job.UpdatedAt > prior.job.UpdatedAt
+	}
+	if candidate.job.CreatedAt != prior.job.CreatedAt {
+		return candidate.job.CreatedAt > prior.job.CreatedAt
+	}
+	return candidate.job.ID > prior.job.ID
+}
+
+func namedReviewFindings(result AgentResult) []string {
+	findings := make([]string, 0, len(result.Findings))
+	for _, raw := range result.Findings {
+		var text string
+		if err := json.Unmarshal(raw, &text); err == nil {
+			findings = append(findings, text)
+			continue
+		}
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, raw); err == nil {
+			findings = append(findings, compact.String())
+		}
+	}
+	findings = stableUniqueStrings(findings)
+	if len(findings) == 0 && strings.TrimSpace(result.Decision) == "changes_requested" && strings.TrimSpace(result.Summary) != "" {
+		findings = []string{strings.TrimSpace(result.Summary)}
+	}
+	return findings
+}
+
+func stableUniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func sortedUniqueStrings(values []string) []string {
+	out := stableUniqueStrings(values)
+	sort.Strings(out)
+	return out
+}
+
+func scopedReviewInstructions(event PullRequestEvent, scope *ReviewScope) string {
+	var instructions strings.Builder
+	fmt.Fprintf(&instructions, "Review pull request #%d as a scoped follow-up for task %s.\n", event.PullRequest, taskLabel(event.TaskID, event.TaskTitle))
+	fmt.Fprintf(&instructions, "The reviewer last saw exact head %s; the current head is %s. Diff from that prior head, never from the PR base.\n", scope.PreviousHeadSHA, event.HeadSHA)
+	instructions.WriteString("Named findings still in scope:\n")
+	if len(scope.Findings) == 0 {
+		instructions.WriteString("- none\n")
+	} else {
+		for _, finding := range scope.Findings {
+			fmt.Fprintf(&instructions, "- %s\n", finding)
+		}
+	}
+	instructions.WriteString("Files changed since the reviewer last saw the branch:\n")
+	if len(scope.ChangedFiles) == 0 {
+		instructions.WriteString("- none\n")
+	} else {
+		for _, path := range scope.ChangedFiles {
+			fmt.Fprintf(&instructions, "- %s\n", path)
+		}
+	}
+	instructions.WriteString("Do not re-review the full PR-to-base diff. Validate the named findings and the listed changed files, inspecting dependencies only as needed to detect defects introduced by those changes. Report only unresolved named findings or new defects introduced since the prior head.")
+	if len(scope.Findings) == 0 && len(scope.ChangedFiles) == 0 {
+		instructions.WriteString(" The scope is empty: approve without rereading the full diff.")
+	}
+	return instructions.String()
+}
+
+func reviewFixInstructions(reviewer string, result AgentResult) string {
+	base := fmt.Sprintf("Address requested changes from %s: %s", reviewer, result.Summary)
+	findings := namedReviewFindings(result)
+	if len(findings) == 0 {
+		return base
+	}
+	var instructions strings.Builder
+	instructions.WriteString(base)
+	instructions.WriteString("\nNamed findings to close:\n")
+	for _, finding := range findings {
+		fmt.Fprintf(&instructions, "- %s\n", finding)
+	}
+	return strings.TrimSpace(instructions.String())
 }

@@ -389,9 +389,10 @@ type CombinedStatus struct {
 }
 
 type CompareResult struct {
-	Status   string `json:"status"`
-	AheadBy  int    `json:"ahead_by"`
-	BehindBy int    `json:"behind_by"`
+	Status   string            `json:"status"`
+	AheadBy  int               `json:"ahead_by"`
+	BehindBy int               `json:"behind_by"`
+	Files    []PullRequestFile `json:"files"`
 }
 
 type CommitStatusInput struct {

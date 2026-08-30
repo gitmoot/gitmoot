@@ -154,7 +154,7 @@ func TestParseLensFindingsSkipsMalformed(t *testing.T) {
 func TestHighRiskLensDelegations(t *testing.T) {
 	event := PullRequestEvent{PullRequest: 42, TaskID: "task-x", TaskTitle: "T"}
 
-	two := highRiskLensDelegations([]string{"audit"}, event)
+	two := highRiskLensDelegations([]string{"audit"}, event, nil)
 	if len(two) != 2 {
 		t.Fatalf("single reviewer -> %d lenses, want 2", len(two))
 	}
@@ -170,7 +170,7 @@ func TestHighRiskLensDelegations(t *testing.T) {
 		}
 	}
 
-	three := highRiskLensDelegations([]string{"a", "b", "c"}, event)
+	three := highRiskLensDelegations([]string{"a", "b", "c"}, event, nil)
 	if len(three) != 3 {
 		t.Fatalf("3 reviewers -> %d lenses, want 3 (regression added)", len(three))
 	}
@@ -183,7 +183,7 @@ func TestHighRiskLensDelegations(t *testing.T) {
 		}
 	}
 
-	if got := highRiskLensDelegations(nil, event); got != nil {
+	if got := highRiskLensDelegations(nil, event, nil); got != nil {
 		t.Fatalf("no reviewers -> %+v, want nil", got)
 	}
 }

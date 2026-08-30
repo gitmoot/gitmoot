@@ -689,7 +689,7 @@ func TestListRecentClosedPullRequestsDecodesMergedAt(t *testing.T) {
 func TestCompareCommitsUsesEscapedCompareEndpoint(t *testing.T) {
 	runner := &fakeRunner{
 		results: []subprocess.Result{{
-			Stdout: `{"status": "ahead", "ahead_by": 3, "behind_by": 0}`,
+			Stdout: `{"status": "ahead", "ahead_by": 3, "behind_by": 0, "files": [{"filename": "internal/review.go", "status": "modified"}]}`,
 		}},
 	}
 	client := GhClient{Runner: runner}
@@ -699,7 +699,8 @@ func TestCompareCommitsUsesEscapedCompareEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CompareCommits returned error: %v", err)
 	}
-	if compare.Status != "ahead" || compare.AheadBy != 3 || compare.BehindBy != 0 {
+	if compare.Status != "ahead" || compare.AheadBy != 3 || compare.BehindBy != 0 ||
+		len(compare.Files) != 1 || compare.Files[0].Filename != "internal/review.go" {
 		t.Fatalf("compare = %+v", compare)
 	}
 	runner.wantArgs(t, 0, "api", "repos/gitmoot/gitmoot/compare/release%2F1.0...head123")

@@ -152,14 +152,23 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 		}
 		reviewers = filtered
 	}
-	reviewRound, err := e.nextReviewRound(ctx, event)
+	reviewRound, reviewJobs, err := e.nextReviewRound(ctx, event)
 	if err != nil {
 		return err
+	}
+	reviewScopes, err := e.followUpReviewScopes(ctx, event, reviewers, reviewJobs)
+	if err != nil {
+		var unavailable ReviewScopeUnavailableError
+		if !errors.As(err, &unavailable) {
+			return err
+		}
+		reason := fmt.Sprintf("repo=%s pull_request=%d head_sha=%s: %s: %v", event.Repo, event.PullRequest, event.HeadSHA, ReviewScopeUnavailableBlockMarker, err)
+		_ = e.Store.AddTaskEvent(ctx, db.TaskEvent{TaskID: event.TaskID, Kind: "review_scope_unavailable", Reason: reason})
+		return e.block(ctx, ref, reason)
 	}
 	// Opt-in risk-tiered adaptive review (#650). When RiskTiersEnabled, classify
 	// the PR (label > path > default). A `high` tier replaces the single native
 	// fan-out with a refutation-lens delegation batch synthesized by the EXISTING
-	// quorum synthesis_rule engine. The whole block is gated on the flag, so with
 	// risk tiers off (the default) the classifier is never called and the
 	// single-review path below is byte-identical.
 	if e.RiskTiersEnabled {
@@ -186,11 +195,20 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 		}
 		classification := ClassifyRisk(e.HighRiskPaths, e.RiskLabelHigh, e.RiskLabelRoutine, labels, changedPaths)
 		if classification.Tier == RiskTierHigh {
-			return e.dispatchHighRiskReview(ctx, event, reviewers, classification, reviewRound, ref)
+			return e.dispatchHighRiskReview(ctx, event, reviewers, reviewScopes, classification, reviewRound, ref)
 		}
 	}
 	requests := make([]JobRequest, 0, len(reviewers))
 	for _, reviewer := range reviewers {
+		instructions := fmt.Sprintf(
+			"Review pull request #%d for task %s.",
+			event.PullRequest,
+			taskLabel(event.TaskID, event.TaskTitle),
+		)
+		scope := reviewScopeFor(reviewScopes, reviewer, "")
+		if scope != nil {
+			instructions = scopedReviewInstructions(event, scope)
+		}
 		request := JobRequest{
 			PolicyExempt: "exempt",
 			// #1250: fanout children were enqueued with NO attribution — measured at
@@ -211,12 +229,9 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 			LeadAgent:     event.LeadAgent,
 			Reviewers:     reviewers,
 			ReviewRound:   reviewRound,
+			ReviewScope:   scope,
 			Sender:        event.Sender,
-			Instructions: fmt.Sprintf(
-				"Review pull request #%d for task %s.",
-				event.PullRequest,
-				taskLabel(event.TaskID, event.TaskTitle),
-			),
+			Instructions:  instructions,
 		}
 		requests = append(requests, request)
 	}
@@ -248,7 +263,7 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 // from the stable review round for this head SHA, and the lens children are
 // review jobs the daemon's PR-watcher routing already recognizes, so a re-poll at
 // the same head never re-dispatches.
-func (e Engine) dispatchHighRiskReview(ctx context.Context, event PullRequestEvent, reviewers []string, classification RiskClassification, round string, ref taskRef) error {
+func (e Engine) dispatchHighRiskReview(ctx context.Context, event PullRequestEvent, reviewers []string, reviewScopes map[string]*ReviewScope, classification RiskClassification, round string, ref taskRef) error {
 	coordID := "review-coordinator/" + event.Branch + "/" + round
 	if _, err := e.Store.GetJob(ctx, coordID); err == nil {
 		// Already dispatched for this head SHA/round: idempotent no-op.
@@ -257,7 +272,7 @@ func (e Engine) dispatchHighRiskReview(ctx context.Context, event PullRequestEve
 		return err
 	}
 
-	delegations := highRiskLensDelegations(reviewers, event)
+	delegations := highRiskLensDelegations(reviewers, event, reviewScopes)
 	if len(delegations) < 2 {
 		// Defensive: no reviewers to fan out to. Fall back to recording the baseline
 		// rather than silently dropping the PR (should not happen — callers guarantee
@@ -734,10 +749,10 @@ func (e Engine) recordPullRequestBaseline(ctx context.Context, event PullRequest
 	})
 }
 
-func (e Engine) nextReviewRound(ctx context.Context, event PullRequestEvent) (string, error) {
+func (e Engine) nextReviewRound(ctx context.Context, event PullRequestEvent) (string, []db.Job, error) {
 	jobs, err := e.Store.ListJobs(ctx)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	current := JobPayload{Repo: event.Repo, PullRequest: event.PullRequest, TaskID: event.TaskID}
 	rounds := map[string]bool{}
@@ -748,7 +763,7 @@ func (e Engine) nextReviewRound(ctx context.Context, event PullRequestEvent) (st
 		}
 		payload, err := unmarshalPayload(job.Payload)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 		if !sameTask(current, payload) {
 			continue
@@ -763,9 +778,9 @@ func (e Engine) nextReviewRound(ctx context.Context, event PullRequestEvent) (st
 		rounds[round] = true
 	}
 	if existingHeadRound != "" {
-		return existingHeadRound, nil
+		return existingHeadRound, jobs, nil
 	}
-	return "review-" + strconv.Itoa(len(rounds)+1), nil
+	return "review-" + strconv.Itoa(len(rounds)+1), jobs, nil
 }
 
 func (e Engine) reviewApprovalAlreadyAdvanced(ctx context.Context, ref taskRef) (bool, error) {

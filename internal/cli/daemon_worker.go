@@ -410,6 +410,24 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 		return nil
 	}
+	nativeReviewDeliveryStarted := false
+	payload, err = w.prepareNativeReviewWorktreeForRunner(ctx, job, payload, jobRunner)
+	if err != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
+		return nil
+	}
+	nativeReviewWorktreeOwned := payload.ReadOnlyWorktree && strings.TrimSpace(payload.WorktreePath) != ""
+	if nativeReviewWorktreeOwned {
+		defer func() {
+			if nativeReviewDeliveryStarted {
+				return
+			}
+			w.cleanupUndeliveredNativeReviewWorktree(context.WithoutCancel(ctx), job.ID, payload, jobRunner)
+		}()
+	}
 	checkout, err := w.checkoutForJob(ctx, job, payload, agent, jobRunner)
 	if err != nil {
 		if resumedCheckout, resumedPayload, ok := w.resumeSelfDirtyWorktreeForRunner(ctx, job, payload, agent, err, jobRunner); ok {
@@ -869,6 +887,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			<-done
 		}
 	}
+	nativeReviewDeliveryStarted = true
 	_, err = engine.RunJob(runCtx, job.ID, agent, adapter)
 	stopKillPending()
 	stopProgress()
@@ -926,6 +945,23 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	_ = w.postJobResultComment(ctx, job.ID, agent, checkout, nil)
 	writeLine(w.Stdout, "job %s completed", job.ID)
 	return nil
+}
+
+func (w jobWorker) cleanupUndeliveredNativeReviewWorktree(ctx context.Context, jobID string, payload workflow.JobPayload, runner subprocess.Runner) {
+	job, err := w.Store.GetJob(ctx, jobID)
+	if err != nil {
+		writeLine(w.Stdout, "job %s native review pre-delivery cleanup lookup failed: %v", jobID, err)
+		return
+	}
+	switch workflow.JobState(job.State) {
+	case workflow.JobFailed, workflow.JobCancelled:
+	default:
+		return
+	}
+	engine := w.workflowForJob(strings.TrimSpace(payload.WorktreePath), runner)
+	if err := engine.ReclaimTerminalDelegationWorktree(ctx, jobID); err != nil {
+		writeLine(w.Stdout, "job %s native review pre-delivery cleanup failed: %v", jobID, err)
+	}
 }
 
 const implementationPreflightAttemptLimit = 3

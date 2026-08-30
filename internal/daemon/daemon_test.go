@@ -227,6 +227,100 @@ func TestPollOnceRoutesPullRequestUpdatesToWorkflow(t *testing.T) {
 	}
 }
 
+func TestPollOnceRecordsBlockedUnscopableHeadOnce(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	for _, agent := range []db.Agent{
+		{Name: "lead", Role: "lead", Runtime: "codex", RuntimeRef: "last", RepoScope: repo.FullName(), Capabilities: []string{"implement"}, AutonomyPolicy: "workspace-write", HealthStatus: "ok"},
+		{Name: "audit", Role: "reviewer", Runtime: "codex", RuntimeRef: "last", RepoScope: repo.FullName(), Capabilities: []string{"review"}, AutonomyPolicy: "auto", HealthStatus: "ok"},
+	} {
+		if err := store.UpsertAgent(ctx, agent); err != nil {
+			t.Fatalf("UpsertAgent %s: %v", agent.Name, err)
+		}
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-7", Owner: "lead"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock acquired=%v err=%v", acquired, err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-007", RepoFullName: repo.FullName(), GoalID: "goal-1", Title: "Task 7",
+		State: string(workflow.TaskPullRequestOpen), Branch: "task-7",
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	priorPayload, err := json.Marshal(workflow.JobPayload{
+		Repo: repo.FullName(), Branch: "task-7", PullRequest: 7, HeadSHA: "head-one",
+		TaskID: "task-007", TaskTitle: "Task 7", LeadAgent: "lead", Reviewers: []string{"audit"},
+		ReviewRound: "review-1", Result: &workflow.AgentResult{Decision: "changes_requested", Summary: "fix it"},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal prior review: %v", err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "prior-review", Agent: "audit", Type: "review", State: string(workflow.JobSucceeded), Payload: string(priorPayload),
+	}); err != nil {
+		t.Fatalf("CreateJob prior review: %v", err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo.FullName(), Number: 7, HeadBranch: "task-7", BaseBranch: "main",
+		HeadSHA: "head-one", State: "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{
+			Number: 7, Title: "Task 7", State: "open", URL: "https://github.com/gitmoot/gitmoot/pull/7",
+			HeadRef: "task-7", BaseRef: "main", HeadSHA: "head-two",
+		}},
+		comments: map[int64][]github.IssueComment{7: {}},
+	}
+	resolverCalls := 0
+	engine := workflow.Engine{
+		Store: store, RequiredReviewers: []string{"audit"},
+		ReviewChangedFiles: func(context.Context, string, int, string, string) ([]string, error) {
+			resolverCalls++
+			return nil, workflow.ReviewScopeUnavailableError{Reason: `review scope compare is "diverged", not a direct follow-up`}
+		},
+	}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+	for poll := range 5 {
+		if err := daemon.PollOnce(ctx); err != nil {
+			t.Fatalf("PollOnce %d: %v", poll+1, err)
+		}
+	}
+	if resolverCalls != 1 {
+		t.Fatalf("changed-files resolver calls = %d, want one durable blocked outcome", resolverCalls)
+	}
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].ID != "prior-review" {
+		t.Fatalf("jobs after unscopable head = %+v, want prior review only", jobs)
+	}
+	task, err := store.GetTask(ctx, "task-007")
+	if err != nil || task.State != string(workflow.TaskBlocked) {
+		t.Fatalf("task after unscopable head = %+v err=%v, want blocked", task, err)
+	}
+	events, err := store.ListTaskEvents(ctx, "task-007")
+	if err != nil {
+		t.Fatalf("ListTaskEvents: %v", err)
+	}
+	scopeEvents := 0
+	for _, event := range events {
+		if event.Kind == "review_scope_unavailable" {
+			scopeEvents++
+		}
+	}
+	if scopeEvents != 1 {
+		t.Fatalf("review_scope_unavailable events = %d, want 1", scopeEvents)
+	}
+	stored, err := store.GetPullRequest(ctx, repo.FullName(), 7)
+	if err != nil || stored.HeadSHA != "head-two" {
+		t.Fatalf("stored blocked baseline = %+v err=%v, want head-two", stored, err)
+	}
+}
+
 func TestHandlePullRequestWorkflowSkipsReviewFanoutWhenLockSet(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)

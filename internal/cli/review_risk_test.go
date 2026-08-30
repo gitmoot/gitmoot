@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -66,5 +69,68 @@ func TestApplyReviewPolicyEmptyHomeIsOff(t *testing.T) {
 	}
 	if engine.NativeReviewFanoutEnabled == nil || engine.NativeReviewFanoutEnabled("owner/repo") {
 		t.Fatal("empty home must resolve native fanout OFF")
+	}
+}
+
+type reviewCompareClient struct {
+	github.NoopClient
+	base   string
+	head   string
+	result github.CompareResult
+}
+
+func (c *reviewCompareClient) CompareCommits(_ context.Context, _ github.Repository, base string, head string) (github.CompareResult, error) {
+	c.base, c.head = base, head
+	return c.result, nil
+}
+
+func TestWireReviewChangedFilesUsesExactReviewerHead(t *testing.T) {
+	client := &reviewCompareClient{result: github.CompareResult{Status: "ahead", Files: []github.PullRequestFile{
+		{Filename: "internal/z.go"},
+		{Filename: "internal/a.go"},
+		{Filename: "internal/a.go"},
+	}}}
+	var engine workflow.Engine
+	wireReviewChangedFiles(&engine, client)
+	if engine.ReviewChangedFiles == nil {
+		t.Fatal("ReviewChangedFiles was not wired")
+	}
+	files, err := engine.ReviewChangedFiles(context.Background(), "owner/repo", 17, "reviewer-head", "current-head")
+	if err != nil {
+		t.Fatalf("ReviewChangedFiles: %v", err)
+	}
+	if client.base != "reviewer-head" || client.head != "current-head" {
+		t.Fatalf("compare range = %s...%s, want reviewer-head...current-head", client.base, client.head)
+	}
+	if len(files) != 2 || files[0] != "internal/a.go" || files[1] != "internal/z.go" {
+		t.Fatalf("changed files = %#v, want sorted exact-head paths", files)
+	}
+}
+
+func TestWireReviewChangedFilesRejectsPossiblyTruncatedCompare(t *testing.T) {
+	files := make([]github.PullRequestFile, 300)
+	for i := range files {
+		files[i].Filename = "same-path-is-still-ambiguous"
+	}
+	client := &reviewCompareClient{result: github.CompareResult{Status: "ahead", Files: files}}
+	var engine workflow.Engine
+	wireReviewChangedFiles(&engine, client)
+
+	_, err := engine.ReviewChangedFiles(context.Background(), "owner/repo", 17, "reviewer-head", "current-head")
+	var unavailable workflow.ReviewScopeUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("ReviewChangedFiles error = %v, want ReviewScopeUnavailableError", err)
+	}
+}
+
+func TestWireReviewChangedFilesMarksDivergedRangeUnscopable(t *testing.T) {
+	client := &reviewCompareClient{result: github.CompareResult{Status: "diverged"}}
+	var engine workflow.Engine
+	wireReviewChangedFiles(&engine, client)
+
+	_, err := engine.ReviewChangedFiles(context.Background(), "owner/repo", 17, "reviewer-head", "current-head")
+	var unavailable workflow.ReviewScopeUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("ReviewChangedFiles error = %v, want ReviewScopeUnavailableError", err)
 	}
 }
