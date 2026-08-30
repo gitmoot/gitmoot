@@ -87,7 +87,11 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 	// reached an approving outcome (succeeded state or an approving decision).
 	if delegationSynthesisRequiresQuorum(parentResult.Delegations) {
 		k := delegationQuorumThreshold(parentResult.Delegations)
-		if !delegationQuorumSatisfied(parentResult.Delegations, children, childPayloads, k) {
+		satisfied := delegationQuorumSatisfied(parentResult.Delegations, children, childPayloads, k)
+		if parentPayload.RiskTier == RiskTierHigh {
+			satisfied = reviewDelegationQuorumSatisfied(parentResult.Delegations, children, childPayloads, k, e.reviewBlockingSeverity(parentPayload.Repo))
+		}
+		if !satisfied {
 			reason := fmt.Sprintf("delegation synthesis_rule quorum failed: fewer than %d delegated children for %s were approved/succeeded", k, parentJob.ID)
 			if e.isPipelineOrchestrateRoot(ctx, parentJob, parentPayload) {
 				return e.enqueueFinalizeContinuation(ctx, parentJob, parentPayload, reason)
@@ -1340,6 +1344,26 @@ func delegationQuorumSatisfied(delegations []Delegation, children map[string]db.
 	return approving >= k
 }
 
+func reviewDelegationQuorumSatisfied(delegations []Delegation, children map[string]db.Job, childPayloads map[string]JobPayload, k int, blockingSeverity string) bool {
+	approving := 0
+	for _, d := range delegations {
+		child, ok := children[d.ID]
+		if !ok {
+			continue
+		}
+		if payload, ok := childPayloads[d.ID]; ok && payload.Result != nil {
+			if delegationDecisionApproves(effectiveReviewDecision(payload.Result, blockingSeverity)) {
+				approving++
+			}
+			continue
+		}
+		if child.State == string(JobSucceeded) {
+			approving++
+		}
+	}
+	return approving >= k
+}
+
 // highRiskLensQuorumMet reports whether the high-risk review coordinator that owns
 // a lens child (childPayload.ParentJobID) has its cross-lens quorum satisfied
 // (#650). It is the gate the native required-reviewer merge path consults for a
@@ -1380,7 +1404,7 @@ func (e Engine) highRiskLensQuorumMet(ctx context.Context, childPayload JobPaylo
 		childPayloads[id] = payload
 	}
 	k := delegationQuorumThreshold(coordPayload.Result.Delegations)
-	return delegationQuorumSatisfied(coordPayload.Result.Delegations, children, childPayloads, k), nil
+	return reviewDelegationQuorumSatisfied(coordPayload.Result.Delegations, children, childPayloads, k, e.reviewBlockingSeverity(childPayload.Repo)), nil
 }
 
 func delegationDecisionApproves(decision string) bool {

@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
@@ -1336,6 +1338,7 @@ func TestEngineAdvanceReviewChangesRequestedDispatchesActingRoleAcrossTaskOwnerL
 	seedAgent(t, store, "payload-default", []string{"implement"}, "gitmoot/gitmoot")
 	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
 	engine.RequireWorkflowPolicy = func(string) RequireWorkflowPolicy { return RequireWorkflowPolicy{Enabled: true, Mode: "strict"} }
 	insertCompletedJob(t, store, db.Job{
 		ID: "original-implement", Agent: "task-owner", Type: "implement",
@@ -1363,7 +1366,12 @@ func TestEngineAdvanceReviewChangesRequestedDispatchesActingRoleAcrossTaskOwnerL
 		TaskTitle:     "Workflow Engine",
 		LeadAgent:     "payload-default",
 		ActingOrgRole: "owner-role",
-		Result:        &AgentResult{Decision: "changes_requested", Summary: "fix edge case"},
+		Result: &AgentResult{
+			Decision: "changes_requested",
+			Severity: reviewseverity.P1,
+			Summary:  "fix edge case",
+			Findings: []json.RawMessage{json.RawMessage(`{"severity":"P1","summary":"edge case"}`)},
+		},
 	})
 
 	err := engine.AdvanceJob(ctx, "review-job")
@@ -1392,6 +1400,67 @@ func TestEngineAdvanceReviewChangesRequestedDispatchesActingRoleAcrossTaskOwnerL
 	}
 	if lock.Owner != "task-owner" || lock.ActingOrgRole != "owner-role" {
 		t.Fatalf("branch lock = %+v, want task-owner serialization with owner-role attribution", lock)
+	}
+}
+
+func TestEngineAdvanceReviewSubthresholdApprovesWithNotes(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(repo string) string {
+		if repo != "mobile/app" {
+			t.Fatalf("blocking severity repo = %q, want mobile/app", repo)
+		}
+		return reviewseverity.P1
+	}
+	gate := &fakeMergeGate{decision: MergeDecision{Ready: true}}
+	engine.MergeGate = gate
+	finding := json.RawMessage(`{"severity":"P2","summary":"medium polish"}`)
+	insertCompletedJob(t, store, db.Job{
+		ID:    "review-notes",
+		Agent: "audit",
+		Type:  "review",
+	}, JobPayload{
+		Repo:        "mobile/app",
+		Branch:      "task-8",
+		PullRequest: 8,
+		TaskID:      "task-8",
+		TaskTitle:   "Mobile App",
+		LeadAgent:   "lead",
+		Result: &AgentResult{
+			Decision: "changes_requested",
+			Severity: reviewseverity.P2,
+			Summary:  "non-blocking polish",
+			Findings: []json.RawMessage{finding},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "review-notes"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	assertTaskState(t, store, "task-8", TaskReadyToMerge)
+	if _, err := store.GetJob(ctx, "implement-lead-task-8"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("sub-threshold review fix job error = %v, want sql.ErrNoRows", err)
+	}
+	if len(gate.requests) != 1 || gate.requests[0].ReviewBlockingSeverity != reviewseverity.P1 {
+		t.Fatalf("merge gate requests = %+v, want threshold P1", gate.requests)
+	}
+	stored := mustJob(t, store, "review-notes")
+	payload, err := ParseJobPayload(stored.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload returned error: %v", err)
+	}
+	if payload.Result == nil || payload.Result.Decision != "changes_requested" || payload.Result.Severity != reviewseverity.P2 ||
+		len(payload.Result.Findings) != 1 || string(payload.Result.Findings[0]) != string(finding) {
+		t.Fatalf("stored result was rewritten or findings lost: %+v", payload.Result)
+	}
+	events, err := store.ListJobEvents(ctx, "review-notes")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if !hasEventKind(events, reviewApprovedWithNotesEventKind) {
+		t.Fatalf("events = %+v, want %s", events, reviewApprovedWithNotesEventKind)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 )
 
 func highRiskEvent() PullRequestEvent {
@@ -426,6 +427,43 @@ func TestHighRiskChangesRequestedLensFailsQuorum(t *testing.T) {
 	assertTaskState(t, store, "task-7", TaskBlocked)
 	if jobExists(t, store, delegationContinuationID(coordID)) {
 		t.Fatal("an unmet quorum must NOT enqueue a coordinator continuation")
+	}
+}
+
+func TestHighRiskSubthresholdLensSatisfiesQuorum(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement", "ask"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "sec", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	engine.RiskTiersEnabled = true
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+
+	if err := engine.HandlePullRequestOpened(ctx, highRiskEvent()); err != nil {
+		t.Fatalf("HandlePullRequestOpened returned error: %v", err)
+	}
+	coordID := "review-coordinator/task-7/review-1"
+	correctnessID := coordID + "/delegation/" + LensCorrectness
+	securityID := coordID + "/delegation/" + LensSecurity
+	completeDelegationChild(t, store, correctnessID, JobSucceeded, AgentResult{Decision: "approved", Summary: "clean"})
+	if err := engine.AdvanceJob(ctx, correctnessID); err != nil {
+		t.Fatalf("AdvanceJob(correctness) returned error: %v", err)
+	}
+	completeDelegationChild(t, store, securityID, JobSucceeded, AgentResult{
+		Decision: "changes_requested",
+		Severity: reviewseverity.P2,
+		Summary:  "non-blocking polish",
+	})
+	if err := engine.AdvanceJob(ctx, securityID); err != nil {
+		t.Fatalf("AdvanceJob(security) returned error: %v", err)
+	}
+
+	if !jobExists(t, store, delegationContinuationID(coordID)) {
+		t.Fatal("sub-threshold lens must satisfy quorum and enqueue the coordinator continuation")
+	}
+	if task, _ := store.GetTask(ctx, "task-7"); task.State == string(TaskBlocked) {
+		t.Fatal("sub-threshold lens must not block the task")
 	}
 }
 

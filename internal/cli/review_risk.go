@@ -16,7 +16,8 @@ import (
 
 // loadReviewConfig reads the global and repository-scoped [review] settings for
 // a `home` that may be either an already-resolved <home>/.gitmoot root or a raw
-// --home. It fails safe to the default: native fanout and risk tiers both off.
+// --home. It fails safe to the defaults: blocking severity P3, with native
+// fanout and risk tiers both off.
 func loadReviewConfig(home string) config.ReviewConfig {
 	cfg := resolveConfigFile(home)
 	if cfg == "" {
@@ -30,12 +31,15 @@ func loadReviewConfig(home string) config.ReviewConfig {
 }
 
 // applyReviewPolicy copies the global risk-tier policy and installs the
-// repository-aware native-fanout resolver onto the engine.
+// repository-aware native-fanout and blocking-severity resolvers onto the engine.
 func applyReviewPolicy(engine *workflow.Engine, home string) {
 	cfg := loadReviewConfig(home)
 	policy := cfg.For("")
 	engine.NativeReviewFanoutEnabled = func(repo string) bool {
 		return cfg.For(repo).NativeFanoutEnabled
+	}
+	engine.ReviewBlockingSeverity = func(repo string) string {
+		return cfg.For(repo).BlockingSeverity
 	}
 	engine.RiskTiersEnabled = policy.RiskTiersEnabled
 	engine.HighRiskPaths = policy.HighRiskPaths

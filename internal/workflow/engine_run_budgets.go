@@ -520,7 +520,19 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			return e.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_skipped_no_pr", Message: "no pull request is attached; skipping review advancement"})
 		}
 		reviewer := reviewDecisionAgent(job, payload)
-		switch payload.Result.Decision {
+		blockingSeverity := e.reviewBlockingSeverity(payload.Repo)
+		effectiveDecision := effectiveReviewDecision(payload.Result, blockingSeverity)
+		if payload.Result.Decision == "changes_requested" && effectiveDecision == "approved" {
+			if err := e.Store.AddJobEvent(ctx, db.JobEvent{
+				JobID: job.ID,
+				Kind:  reviewApprovedWithNotesEventKind,
+				Message: fmt.Sprintf("review severity %s is below repository blocking severity %s; findings remain recorded and no fix is dispatched",
+					payload.Result.Severity, blockingSeverity),
+			}); err != nil {
+				return err
+			}
+		}
+		switch effectiveDecision {
 		case "changes_requested":
 			if err := e.setTaskState(ctx, ref, TaskChangesRequested); err != nil {
 				return err

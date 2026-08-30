@@ -14,6 +14,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -36,6 +37,9 @@ func TestApplyReviewPolicyOffByDefault(t *testing.T) {
 	if engine.NativeReviewFanoutEnabled == nil || engine.NativeReviewFanoutEnabled("owner/repo") {
 		t.Fatal("applyReviewPolicy must install native fanout OFF when [review] is absent")
 	}
+	if engine.ReviewBlockingSeverity == nil || engine.ReviewBlockingSeverity("owner/repo") != reviewseverity.DefaultBlocking {
+		t.Fatal("applyReviewPolicy must install block-all review severity when [review] is absent")
+	}
 }
 
 func TestApplyReviewPolicyEnabledFromConfig(t *testing.T) {
@@ -44,7 +48,7 @@ func TestApplyReviewPolicyEnabledFromConfig(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	body := "[review]\nnative_fanout_enabled = true\nrisk_tiers_enabled = true\nhigh_risk_paths = [\"cmd/**\"]\nrisk_label_high = \"sev:1\"\n[repos.\"owner/off\".review]\nnative_fanout_enabled = false\n"
+	body := "[review]\nnative_fanout_enabled = true\nblocking_severity = \"P2\"\nrisk_tiers_enabled = true\nhigh_risk_paths = [\"cmd/**\"]\nrisk_label_high = \"sev:1\"\n[repos.\"owner/off\".review]\nnative_fanout_enabled = false\nblocking_severity = \"P1\"\n"
 	if err := os.WriteFile(filepath.Join(root, config.ConfigName), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -65,6 +69,12 @@ func TestApplyReviewPolicyEnabledFromConfig(t *testing.T) {
 	if engine.NativeReviewFanoutEnabled("owner/off") {
 		t.Fatal("repository native_fanout_enabled = false override was not applied")
 	}
+	if engine.ReviewBlockingSeverity == nil || engine.ReviewBlockingSeverity("owner/on") != reviewseverity.P2 {
+		t.Fatal("global blocking_severity = P2 was not applied")
+	}
+	if engine.ReviewBlockingSeverity("owner/off") != reviewseverity.P1 {
+		t.Fatal("repository blocking_severity = P1 override was not applied")
+	}
 }
 
 func TestApplyReviewPolicyEmptyHomeIsOff(t *testing.T) {
@@ -75,6 +85,9 @@ func TestApplyReviewPolicyEmptyHomeIsOff(t *testing.T) {
 	}
 	if engine.NativeReviewFanoutEnabled == nil || engine.NativeReviewFanoutEnabled("owner/repo") {
 		t.Fatal("empty home must resolve native fanout OFF")
+	}
+	if engine.ReviewBlockingSeverity == nil || engine.ReviewBlockingSeverity("owner/repo") != reviewseverity.DefaultBlocking {
+		t.Fatal("empty home must resolve blocking severity to P3")
 	}
 }
 

@@ -767,11 +767,29 @@ transition **instead of** `job.failed` (no preceding `job.failed`); the rule
 still holds and is forward-compatible with the older `job.failed`→`job.deferred`
 flap. See `docs/events.md` for the full contract.
 
-## Risk-Tiered Adaptive Review
+## Review Policy
 
-Scale review depth to a change's blast radius via the off-by-default `[review]`
-config section — it is **not** in the generated default config, so this is its
-discovery surface:
+Review severity controls whether a reported finding restarts the fix loop. The
+default preserves the existing block-all behavior:
+
+```toml
+[review]
+blocking_severity = "P3"
+
+[repos."themartianapp/keephair".review]
+blocking_severity = "P1"
+```
+
+The threshold is inclusive. `P1` blocks `P0` and `P1`; `P2` and `P3` still post
+their findings and record the raw `changes_requested` result, but Gitmoot treats
+the round as approved-with-notes and does not dispatch a fix. The global default
+is `P3`, so every valid finding blocks unless a repository overrides it.
+Configured values must be `P0`, `P1`, `P2`, or `P3`.
+
+### Risk-Tiered Adaptive Review
+
+Set `risk_tiers_enabled = true` in `[review]` to scale review depth to a
+change's blast radius:
 
 ```toml
 [review]
@@ -782,20 +800,20 @@ risk_label_high = "risk:high"                 # PR label that forces the high ti
 risk_label_routine = "risk:routine"           # PR label that forces the routine tier
 ```
 
-With `risk_tiers_enabled = true`, each opened PR is classified — **explicit PR
+With `risk_tiers_enabled = true`, each opened PR is classified: **explicit PR
 label > changed-path glob match > default routine** (a `risk:high`/`risk:routine`
 label wins over paths; a high label wins a label tie). A `routine` PR keeps the
 unchanged single-reviewer fan-out. A `high` PR instead fans out a delegation
-batch of **refutation-framed lens reviewers** (correctness, security, and — with
-≥3 configured reviewers — regression), each prompted to *disprove* the change and
-return structured findings `{lens, refuted, severity, confidence, evidence}` in
-`gitmoot_result.findings`. The lenses are synthesized by the existing delegation
-`synthesis_rule = quorum` engine: **any critical-severity refutation (a `blocked`
-lens decision) fails the quorum and blocks the merge**; unanimous approval
-satisfies it. The resolved tier is recorded as a `risk_tier_resolved` job event so
-an escalation is explainable in the report/dashboard. With the section absent or
-`risk_tiers_enabled` off, PR review is byte-identical to the single-reviewer path.
-The competition tier (two implementations + a judge) is a planned follow-up.
+batch of **refutation-framed lens reviewers** (correctness, security, and, with
+three or more configured reviewers, regression), each prompted to *disprove*
+the change and return structured findings `{lens, refuted, severity, confidence,
+evidence}` in `gitmoot_result.findings`. The lenses are synthesized by the
+existing delegation `synthesis_rule = quorum` engine: **any blocking refutation
+fails the quorum and blocks the merge**; the configured quorum of effective
+approvals satisfies it. The resolved tier is recorded as a
+escalation is explainable in the report/dashboard. With `risk_tiers_enabled`
+off, PR review uses the single-reviewer path. The competition tier (two
+implementations + a judge) is a planned follow-up.
 
 ## Bug Reports
 

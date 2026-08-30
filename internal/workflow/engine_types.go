@@ -297,6 +297,9 @@ type MergeRequest struct {
 	WorkflowID              string
 	Reviewer                string
 	ReviewOptional          bool
+	// ReviewBlockingSeverity is the resolved repository threshold carried into
+	// the merge gate. Empty preserves the historical block-all behavior.
+	ReviewBlockingSeverity string
 	// HumanMergeRequested is an explicit, authorized human instruction. It is
 	// evaluated inside PolicyMergeGate, never by a caller-side bypass.
 	HumanMergeRequested bool
