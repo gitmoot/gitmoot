@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -62,13 +63,21 @@ SELECT id, source_kind, source_id, target_role, coalesce_key, state,
 		CASE
 			WHEN source_kind != 'workflow_note' OR coalesce_key NOT LIKE 'directive:%' THEN ''
 			WHEN EXISTS (
-				SELECT 1 FROM workflow_notes r
-				WHERE substr(r.body, 1, length('[org:directive-cancel id=' || wake_outbox.source_id || ' ')) = '[org:directive-cancel id=' || wake_outbox.source_id || ' '
-					OR substr(r.body, 1, length('[org:directive-done id=' || wake_outbox.source_id || ' ')) = '[org:directive-done id=' || wake_outbox.source_id || ' '
+				SELECT 1
+				FROM workflow_notes d
+				JOIN workflow_notes r ON r.workflow_id = d.workflow_id
+				WHERE d.id = CAST(wake_outbox.source_id AS INTEGER)
+					AND (
+						substr(r.body, 1, length('[org:directive-cancel id=' || wake_outbox.source_id || ' ')) = '[org:directive-cancel id=' || wake_outbox.source_id || ' '
+						OR substr(r.body, 1, length('[org:directive-done id=' || wake_outbox.source_id || ' ')) = '[org:directive-done id=' || wake_outbox.source_id || ' '
+					)
 			) THEN 'terminal'
 			WHEN EXISTS (
-				SELECT 1 FROM workflow_notes r
-				WHERE substr(r.body, 1, length('[org:directive-ack id=' || wake_outbox.source_id || ' ')) = '[org:directive-ack id=' || wake_outbox.source_id || ' '
+				SELECT 1
+				FROM workflow_notes d
+				JOIN workflow_notes r ON r.workflow_id = d.workflow_id
+				WHERE d.id = CAST(wake_outbox.source_id AS INTEGER)
+					AND substr(r.body, 1, length('[org:directive-ack id=' || wake_outbox.source_id || ' ')) = '[org:directive-ack id=' || wake_outbox.source_id || ' '
 			) THEN 'completion'
 			ELSE 'acknowledgment'
 		END
@@ -95,6 +104,63 @@ func TestListWakeOutboxObligationsExecutesGeneratedQuery(t *testing.T) {
 	}
 	if !reflect.DeepEqual(recorder.args, wantArgs) {
 		t.Fatalf("executed args = %#v, want independent args %#v", recorder.args, wantArgs)
+	}
+}
+
+func TestListWakeOutboxObligationsScopesDirectiveReceiptsToWorkflow(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	addDirective := func(workflowID string) WorkflowNote {
+		note, err := store.InsertWorkflowNote(ctx, WorkflowNote{
+			WorkflowID:        workflowID,
+			Author:            "owner",
+			Body:              "[org:directive to=worker from=owner wf=" + workflowID + "]\nact",
+			AddressedTarget:   "worker",
+			AddressedWakeKind: WakeOutboxKindDirective,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return note
+	}
+	addReceipt := func(workflowID, kind string, directiveID int64) {
+		if _, err := store.InsertWorkflowNote(ctx, WorkflowNote{
+			WorkflowID: workflowID,
+			Author:     "worker",
+			Body:       fmt.Sprintf("[org:directive-%s id=%d by=worker]", kind, directiveID),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	unread := addDirective("phase/main")
+	crossWorkflow := addDirective("phase/main")
+	acknowledged := addDirective("phase/main")
+	terminated := addDirective("phase/main")
+	addReceipt("phase/other", "done", crossWorkflow.ID)
+	addReceipt("phase/main", "ack", acknowledged.ID)
+	addReceipt("phase/main", "done", terminated.ID)
+
+	obligations, err := store.ListWakeOutboxObligations(ctx, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(map[int64]string, len(obligations.Pending))
+	for _, obligation := range obligations.Pending {
+		sourceID, err := strconv.ParseInt(obligation.SourceID, 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got[sourceID] = obligation.DirectivePhase
+	}
+	want := map[int64]string{
+		unread.ID:        WakeOutboxDirectivePhaseAcknowledgment,
+		crossWorkflow.ID: WakeOutboxDirectivePhaseAcknowledgment,
+		acknowledged.ID:  WakeOutboxDirectivePhaseCompletion,
+		terminated.ID:    WakeOutboxDirectivePhaseTerminal,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("directive phases = %v, want %v", got, want)
 	}
 }
 
@@ -415,5 +481,141 @@ func TestExpireAgedWakeOutboxRecordsDeliveryUnknownWithoutRetry(t *testing.T) {
 	events, err = store.ListJobEvents(ctx, fmt.Sprintf("wake-outbox:%d", pending[0].ID))
 	if err != nil || len(events) != 1 {
 		t.Fatalf("events after second expiry = %+v, err=%v", events, err)
+	}
+}
+
+func TestWakeOutboxSupersededMigrationPreservesRowsAndScopesTerminalMarkers(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gitmoot.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preMigration := &Store{db: raw}
+	for version, migration := range migrationsBefore(
+		t,
+		"ALTER TABLE wake_outbox RENAME TO wake_outbox_before_superseded",
+	) {
+		if err := preMigration.applyMigration(ctx, version+1, migration); err != nil {
+			t.Fatalf("applyMigration(%d): %v", version+1, err)
+		}
+	}
+	addDirective := func(workflowID string) WorkflowNote {
+		note, err := preMigration.InsertWorkflowNote(ctx, WorkflowNote{
+			WorkflowID: workflowID,
+			Author:     "owner",
+			Body:       "[org:directive to=worker from=owner wf=" + workflowID + "]\nact",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return note
+	}
+	addReceipt := func(workflowID, kind string, directiveID int64) {
+		if _, err := preMigration.InsertWorkflowNote(ctx, WorkflowNote{
+			WorkflowID: workflowID,
+			Author:     "worker",
+			Body:       fmt.Sprintf("[org:directive-%s id=%d by=worker]", kind, directiveID),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	terminalPending := addDirective("migration/main")
+	crossWorkflow := addDirective("migration/main")
+	acknowledged := addDirective("migration/main")
+	terminalAttempted := addDirective("migration/main")
+	addReceipt("migration/main", "done", terminalPending.ID)
+	addReceipt("migration/other", "done", crossWorkflow.ID)
+	addReceipt("migration/main", "ack", acknowledged.ID)
+	addReceipt("migration/main", "cancel", terminalAttempted.ID)
+
+	type fixture struct {
+		id           int64
+		sourceKind   string
+		sourceID     string
+		coalesceKey  string
+		state        string
+		attemptCount int
+		lastError    string
+		createdAt    string
+		attemptedAt  any
+		finishedAt   any
+		updatedAt    string
+	}
+	fixtures := []fixture{
+		{101, WakeOutboxSourceWorkflowNote, strconv.FormatInt(terminalPending.ID, 10), "directive:worker", WakeOutboxStatePending, 0, "", "2026-08-30T01:00:00.000Z", nil, nil, "2026-08-30T01:00:01.000Z"},
+		{102, WakeOutboxSourceWorkflowNote, strconv.FormatInt(crossWorkflow.ID, 10), "directive:worker", WakeOutboxStatePending, 1, "cross-workflow-control", "2026-08-30T02:00:00.000Z", nil, nil, "2026-08-30T02:00:01.000Z"},
+		{103, WakeOutboxSourceWorkflowNote, strconv.FormatInt(acknowledged.ID, 10), "directive:worker", WakeOutboxStatePending, 2, "completion-control", "2026-08-30T03:00:00.000Z", nil, nil, "2026-08-30T03:00:01.000Z"},
+		{104, WakeOutboxSourceWorkflowNote, strconv.FormatInt(terminalAttempted.ID, 10), "directive:worker", WakeOutboxStateAttempted, 3, "attempted-control", "2026-08-30T04:00:00.000Z", "2026-08-30T04:00:02.000Z", nil, "2026-08-30T04:00:03.000Z"},
+		{105, WakeOutboxSourceWorkflowNote, "generic", "reply:worker", WakeOutboxStateDelivered, 4, "generic-control", "2026-08-30T05:00:00.000Z", "2026-08-30T05:00:02.000Z", "2026-08-30T05:00:03.000Z", "2026-08-30T05:00:04.000Z"},
+	}
+	for _, row := range fixtures {
+		if _, err := raw.ExecContext(ctx, `
+INSERT INTO wake_outbox(
+	id, source_kind, source_id, target_role, coalesce_key, state,
+	attempt_count, last_error, created_at, attempted_at, finished_at, updated_at
+) VALUES (?, ?, ?, 'worker', ?, ?, ?, ?, ?, ?, ?, ?)`,
+			row.id, row.sourceKind, row.sourceID, row.coalesceKey, row.state,
+			row.attemptCount, row.lastError, row.createdAt, row.attemptedAt,
+			row.finishedAt, row.updatedAt,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	upgraded, err := openRealTestStore(t, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upgraded.Close()
+	rows, err := upgraded.ListWakeOutbox(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != len(fixtures) {
+		t.Fatalf("migrated rows = %+v, want %d", rows, len(fixtures))
+	}
+	byID := make(map[int64]WakeOutboxEntry, len(rows))
+	for _, row := range rows {
+		byID[row.ID] = row
+	}
+	superseded := byID[101]
+	if superseded.State != WakeOutboxStateSuperseded ||
+		superseded.CreatedAt != fixtures[0].createdAt ||
+		superseded.AttemptCount != fixtures[0].attemptCount ||
+		superseded.FinishedAt == "" ||
+		superseded.UpdatedAt == fixtures[0].updatedAt {
+		t.Fatalf("terminal pending migration = %+v", superseded)
+	}
+	for _, fixture := range fixtures[1:] {
+		row := byID[fixture.id]
+		wantAttempted, _ := fixture.attemptedAt.(string)
+		wantFinished, _ := fixture.finishedAt.(string)
+		if row.SourceKind != fixture.sourceKind ||
+			row.SourceID != fixture.sourceID ||
+			row.CoalesceKey != fixture.coalesceKey ||
+			row.State != fixture.state ||
+			row.AttemptCount != fixture.attemptCount ||
+			row.LastError != fixture.lastError ||
+			row.CreatedAt != fixture.createdAt ||
+			row.AttemptedAt != wantAttempted ||
+			row.FinishedAt != wantFinished ||
+			row.UpdatedAt != fixture.updatedAt {
+			t.Fatalf("migration changed control row %d: %+v", fixture.id, row)
+		}
+	}
+	var indexCount int
+	if err := upgraded.db.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM sqlite_master
+WHERE type = 'index' AND name IN ('idx_wake_outbox_pending', 'idx_wake_outbox_attempted')`,
+	).Scan(&indexCount); err != nil {
+		t.Fatal(err)
+	}
+	if indexCount != 2 {
+		t.Fatalf("wake outbox indexes after migration = %d, want 2", indexCount)
 	}
 }

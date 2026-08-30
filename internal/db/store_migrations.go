@@ -2237,9 +2237,14 @@ SET state = 'superseded',
 WHERE state = 'pending' AND source_kind = 'workflow_note'
 	AND coalesce_key LIKE 'directive:%'
 	AND EXISTS (
-		SELECT 1 FROM workflow_notes r
-		WHERE substr(r.body, 1, length('[org:directive-cancel id=' || wake_outbox.source_id || ' ')) = '[org:directive-cancel id=' || wake_outbox.source_id || ' '
-			OR substr(r.body, 1, length('[org:directive-done id=' || wake_outbox.source_id || ' ')) = '[org:directive-done id=' || wake_outbox.source_id || ' '
+		SELECT 1
+		FROM workflow_notes d
+		JOIN workflow_notes r ON r.workflow_id = d.workflow_id
+		WHERE d.id = CAST(wake_outbox.source_id AS INTEGER)
+			AND (
+				substr(r.body, 1, length('[org:directive-cancel id=' || wake_outbox.source_id || ' ')) = '[org:directive-cancel id=' || wake_outbox.source_id || ' '
+				OR substr(r.body, 1, length('[org:directive-done id=' || wake_outbox.source_id || ' ')) = '[org:directive-done id=' || wake_outbox.source_id || ' '
+			)
 	);
 
 CREATE INDEX idx_wake_outbox_pending

@@ -405,13 +405,21 @@ SELECT id, source_kind, source_id, target_role, coalesce_key, state,
 		CASE
 			WHEN source_kind != 'workflow_note' OR coalesce_key NOT LIKE 'directive:%' THEN ''
 			WHEN EXISTS (
-				SELECT 1 FROM workflow_notes r
-				WHERE substr(r.body, 1, length('[org:directive-cancel id=' || wake_outbox.source_id || ' ')) = '[org:directive-cancel id=' || wake_outbox.source_id || ' '
-					OR substr(r.body, 1, length('[org:directive-done id=' || wake_outbox.source_id || ' ')) = '[org:directive-done id=' || wake_outbox.source_id || ' '
+				SELECT 1
+				FROM workflow_notes d
+				JOIN workflow_notes r ON r.workflow_id = d.workflow_id
+				WHERE d.id = CAST(wake_outbox.source_id AS INTEGER)
+					AND (
+						substr(r.body, 1, length('[org:directive-cancel id=' || wake_outbox.source_id || ' ')) = '[org:directive-cancel id=' || wake_outbox.source_id || ' '
+						OR substr(r.body, 1, length('[org:directive-done id=' || wake_outbox.source_id || ' ')) = '[org:directive-done id=' || wake_outbox.source_id || ' '
+					)
 			) THEN 'terminal'
 			WHEN EXISTS (
-				SELECT 1 FROM workflow_notes r
-				WHERE substr(r.body, 1, length('[org:directive-ack id=' || wake_outbox.source_id || ' ')) = '[org:directive-ack id=' || wake_outbox.source_id || ' '
+				SELECT 1
+				FROM workflow_notes d
+				JOIN workflow_notes r ON r.workflow_id = d.workflow_id
+				WHERE d.id = CAST(wake_outbox.source_id AS INTEGER)
+					AND substr(r.body, 1, length('[org:directive-ack id=' || wake_outbox.source_id || ' ')) = '[org:directive-ack id=' || wake_outbox.source_id || ' '
 			) THEN 'completion'
 			ELSE 'acknowledgment'
 		END
