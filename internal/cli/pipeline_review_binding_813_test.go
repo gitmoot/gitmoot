@@ -438,6 +438,10 @@ func TestPipelineSourceReviewShellRuntimeE2E(t *testing.T) {
 	for _, decision := range []string{"changes_requested", "approved"} {
 		t.Run(decision, func(t *testing.T) {
 			ctx := context.Background()
+			severity := ""
+			if decision == "changes_requested" {
+				severity = "P1"
+			}
 			home, _, store := heartbeatLoopE2EHome(t)
 			checkout := createDaemonWorkerGitCheckout(t, "main")
 			seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
@@ -445,7 +449,7 @@ func TestPipelineSourceReviewShellRuntimeE2E(t *testing.T) {
 				pipelineStageResultCmd("implemented", "fixed", nil),
 				[]string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
 			seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime,
-				pipelineStageResultCmd(decision, "review verdict", nil),
+				pipelineStageResultCmdWithSeverity(decision, "review verdict", nil, severity),
 				[]string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 
 			const specYAML = `name: source-review-e2e

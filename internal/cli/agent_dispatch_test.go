@@ -667,7 +667,7 @@ func TestReviewDispatchLeadRoutesChangesRequestedFixToImplementer(t *testing.T) 
 			if err != nil {
 				t.Fatalf("HeadSHA returned error: %v", err)
 			}
-			adapter := installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"changes_requested","summary":"fix the edge case","findings":[{"severity":"high","description":"edge case"}],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`)
+			adapter := installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"changes_requested","severity":"P1","summary":"fix the edge case","findings":[{"severity":"P1","description":"edge case"}],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`)
 			previousGitHubFactory := newAgentDispatchGitHubClient
 			newAgentDispatchGitHubClient = func(string) github.Client { return github.NoopClient{} }
 			t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
