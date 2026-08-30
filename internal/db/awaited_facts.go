@@ -217,11 +217,12 @@ type SucceededReviewVerdict struct {
 	EffectiveRuntime string
 }
 
-// SucceededReviewVerdicts returns valid succeeded review verdicts for repo/PR,
-// newest first. Head SHA and decision live only in the JSON payload, so they are
-// decoded and filtered in Go rather than pretending jobs has indexed columns for
-// them. This is a pure read: unlike SubscribeAwaitedFact it creates no durable
-// interest or other state.
+// SucceededReviewVerdicts returns stable approved or changes-requested review
+// verdicts for repo/PR, newest first. Head SHA and decision live only in the JSON
+// payload, so they are decoded and filtered in Go rather than pretending jobs
+// has indexed columns for them. This is a pure read: unlike SubscribeAwaitedFact
+// it creates no durable interest or other state. Skipped reviews are abstentions,
+// not verdicts, and must remain retryable at the same head.
 func (s *Store) SucceededReviewVerdicts(ctx context.Context, repo string, pullRequest int) ([]SucceededReviewVerdict, error) {
 	repo = strings.ToLower(strings.TrimSpace(repo))
 	if repo == "" {
@@ -251,7 +252,7 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 			continue
 		}
 		decision := strings.ToLower(strings.TrimSpace(decoded.Result.Decision))
-		if decision == "" {
+		if decision != "approved" && decision != "changes_requested" {
 			continue
 		}
 		verdicts = append(verdicts, SucceededReviewVerdict{

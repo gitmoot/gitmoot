@@ -162,3 +162,78 @@ func TestFanoutUnconfiguredRosterStillRunsTheMergeGate(t *testing.T) {
 		t.Fatalf("merge gate requests = %+v, want exactly one for an unconfigured roster", gate.requests)
 	}
 }
+
+func TestFanoutSelectsOneRuntimeFamilyInConfiguredOrder(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "impl", []string{"implement"}, "owner/repo")
+	seedReviewLoopAgent(t, store, "codex-a", "codex", "gpt-5.6-sol")
+	seedReviewLoopAgent(t, store, "codex-b", "codex", "gpt-5.6-sol")
+	seedReviewLoopAgent(t, store, "claude-a", "claude", "opus-5")
+	engine := testEngine(store)
+
+	err := engine.HandlePullRequestOpened(ctx, PullRequestEvent{
+		Repo:              "owner/repo",
+		Branch:            "task-7",
+		PullRequest:       7,
+		HeadSHA:           "head123",
+		TaskID:            "task-7",
+		LeadAgent:         "impl",
+		Sender:            "impl",
+		RequiredReviewers: []string{"codex-a", "claude-a", "codex-b"},
+	})
+	if err != nil {
+		t.Fatalf("HandlePullRequestOpened returned error: %v", err)
+	}
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	var reviewers []string
+	for _, job := range jobs {
+		if job.Type == "review" {
+			reviewers = append(reviewers, job.Agent)
+		}
+	}
+	if len(reviewers) != 2 || reviewers[0] != "codex-a" || reviewers[1] != "codex-b" {
+		t.Fatalf("review jobs = %v, want [codex-a codex-b]", reviewers)
+	}
+}
+
+func TestConfiguredNativeFanoutOffSkipsReviewsAndMergeGate(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "impl", []string{"implement"}, "owner/repo")
+	seedAgent(t, store, "reviewer", []string{"review"}, "owner/repo")
+	engine := testEngine(store)
+	engine.NativeReviewFanoutEnabled = func(string) bool { return false }
+	gate := &fakeMergeGate{decision: MergeDecision{Merged: true}}
+	engine.MergeGate = gate
+
+	err := engine.HandlePullRequestOpened(ctx, PullRequestEvent{
+		Repo:              "owner/repo",
+		Branch:            "task-8",
+		PullRequest:       8,
+		HeadSHA:           "head-off",
+		TaskID:            "task-8",
+		LeadAgent:         "impl",
+		Sender:            "impl",
+		RequiredReviewers: []string{"reviewer"},
+	})
+	if err != nil {
+		t.Fatalf("HandlePullRequestOpened returned error: %v", err)
+	}
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	var reviewJobs int
+	for _, job := range jobs {
+		if job.Type == "review" {
+			reviewJobs++
+		}
+	}
+	if reviewJobs != 0 || len(gate.requests) != 0 {
+		t.Fatalf("fanout off produced %d review jobs and %d merge-gate requests", reviewJobs, len(gate.requests))
+	}
+}

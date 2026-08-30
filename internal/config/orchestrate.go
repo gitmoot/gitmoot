@@ -488,12 +488,14 @@ func validateEventsPolicy(policy EventsPolicy) error {
 	return nil
 }
 
-// ReviewPolicy is the host-level review policy read from the [review] section of
-// the gitmoot config (#650). It gates the OPT-IN risk-tiered adaptive review:
-// when RiskTiersEnabled is false (the default) the workflow engine never
-// classifies a PR and the single-review fan-out is byte-identical. HighRiskPaths,
-// RiskLabelHigh, and RiskLabelRoutine are only consulted when risk tiers are on.
+// ReviewPolicy is the resolved review policy for one repository. Native review
+// fanout is disabled by default: agents and coordinators request reviews
+// explicitly, while operators may opt a repository back into native scheduling.
+// Risk-tiered adaptive review remains independently opt-in.
 type ReviewPolicy struct {
+	// NativeFanoutEnabled permits HandlePullRequestOpened to schedule the
+	// configured native reviewer roster. Default false = OFF.
+	NativeFanoutEnabled bool
 	// RiskTiersEnabled opts the engine into risk-tiered review. Default false = OFF.
 	RiskTiersEnabled bool
 	// HighRiskPaths is the changed-path glob list that resolves the `high` tier.
@@ -507,22 +509,46 @@ type ReviewPolicy struct {
 }
 
 func DefaultReviewPolicy() ReviewPolicy {
-	return ReviewPolicy{RiskTiersEnabled: false}
+	return ReviewPolicy{NativeFanoutEnabled: false, RiskTiersEnabled: false}
 }
 
-// LoadReviewPolicy parses the [review] section. A missing config file or section
-// yields the default (risk tiers OFF), so the caller never has to distinguish
-// "no config" from "explicitly off".
-func LoadReviewPolicy(paths Paths) (ReviewPolicy, error) {
+// ReviewConfig is the parsed global [review] policy plus the
+// [repos."owner/repo".review].native_fanout_enabled override.
+type ReviewConfig struct {
+	Global ReviewPolicy
+	repos  map[string]reviewPolicyOverride
+}
+
+type reviewPolicyOverride struct {
+	nativeFanoutEnabled *bool
+}
+
+// For resolves the effective policy for repo. Risk-tier settings remain global;
+// only native fanout has a repository override.
+func (c ReviewConfig) For(repo string) ReviewPolicy {
+	policy := c.Global
+	policy.HighRiskPaths = append([]string(nil), policy.HighRiskPaths...)
+	override, ok := c.repos[strings.TrimSpace(repo)]
+	if ok && override.nativeFanoutEnabled != nil {
+		policy.NativeFanoutEnabled = *override.nativeFanoutEnabled
+	}
+	return policy
+}
+
+// LoadReviewConfig parses [review] and [repos."owner/repo".review]. A missing
+// config file or section yields the default with native fanout and risk tiers
+// both disabled.
+func LoadReviewConfig(paths Paths) (ReviewConfig, error) {
 	content, err := os.ReadFile(paths.ConfigFile)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return DefaultReviewPolicy(), nil
+			return ReviewConfig{Global: DefaultReviewPolicy(), repos: map[string]reviewPolicyOverride{}}, nil
 		}
-		return ReviewPolicy{}, err
+		return ReviewConfig{}, err
 	}
-	policy := DefaultReviewPolicy()
-	current := false
+	cfg := ReviewConfig{Global: DefaultReviewPolicy(), repos: map[string]reviewPolicyOverride{}}
+	var repo string
+	inSection := false
 	for _, raw := range strings.Split(string(content), "\n") {
 		line := strings.TrimSpace(stripConfigComment(raw))
 		if line == "" {
@@ -530,25 +556,69 @@ func LoadReviewPolicy(paths Paths) (ReviewPolicy, error) {
 		}
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			section := strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
-			current = strings.TrimSpace(section) == "review"
+			repo, inSection = parseReviewSection(section)
+			if inSection && repo != "" {
+				if _, ok := cfg.repos[repo]; !ok {
+					cfg.repos[repo] = reviewPolicyOverride{}
+				}
+			}
 			continue
 		}
-		if !current {
+		if !inSection {
 			continue
 		}
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
 			continue
 		}
-		if err := applyReviewPolicyField(&policy, strings.TrimSpace(key), strings.TrimSpace(value)); err != nil {
-			return ReviewPolicy{}, fmt.Errorf("parse [review].%s: %w", strings.TrimSpace(key), err)
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if repo == "" {
+			if err := applyReviewPolicyField(&cfg.Global, key, value); err != nil {
+				return ReviewConfig{}, fmt.Errorf("parse [review].%s: %w", key, err)
+			}
+			continue
 		}
+		override := cfg.repos[repo]
+		if err := applyReviewPolicyOverrideField(&override, key, value); err != nil {
+			return ReviewConfig{}, fmt.Errorf("parse [repos.%q.review].%s: %w", repo, key, err)
+		}
+		cfg.repos[repo] = override
 	}
-	return policy, nil
+	return cfg, nil
+}
+
+func parseReviewSection(section string) (string, bool) {
+	section = strings.TrimSpace(section)
+	if section == "review" {
+		return "", true
+	}
+	if !strings.HasPrefix(section, "repos.") || !strings.HasSuffix(section, ".review") {
+		return "", false
+	}
+	rest := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(section, "repos."), ".review"))
+	if rest == "" {
+		return "", false
+	}
+	if strings.HasPrefix(rest, "\"") {
+		unquoted, err := strconv.Unquote(rest)
+		if err != nil || strings.TrimSpace(unquoted) == "" {
+			return "", false
+		}
+		return strings.TrimSpace(unquoted), true
+	}
+	return rest, true
 }
 
 func applyReviewPolicyField(policy *ReviewPolicy, key string, value string) error {
 	switch key {
+	case "native_fanout_enabled":
+		parsed, err := parseConfigBool(value)
+		if err != nil {
+			return err
+		}
+		policy.NativeFanoutEnabled = parsed
+		return nil
 	case "risk_tiers_enabled":
 		parsed, err := parseConfigBool(value)
 		if err != nil {
@@ -580,6 +650,18 @@ func applyReviewPolicyField(policy *ReviewPolicy, key string, value string) erro
 	default:
 		return nil
 	}
+}
+
+func applyReviewPolicyOverrideField(override *reviewPolicyOverride, key string, value string) error {
+	if key != "native_fanout_enabled" {
+		return nil
+	}
+	parsed, err := parseConfigBool(value)
+	if err != nil {
+		return err
+	}
+	override.nativeFanoutEnabled = &parsed
+	return nil
 }
 
 // SkillOptPolicy is the host-level template-learning policy read from the

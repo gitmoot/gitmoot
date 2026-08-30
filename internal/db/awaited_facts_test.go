@@ -208,6 +208,8 @@ func TestSucceededReviewVerdictsFiltersCanonicalRows(t *testing.T) {
 		awaitedReviewPayload(t, "Acme/Widget", 52, "HEAD-A", " APPROVED ", "valid-a"))
 	seed("valid-z", "audit-z", "review", "succeeded", "acme/widget", 52,
 		awaitedReviewPayload(t, "acme/widget", 52, "head-a", "changes_requested", "valid-z"))
+	seed("skipped-abstention", "audit-skipped", "review", "succeeded", "acme/widget", 52,
+		awaitedReviewPayload(t, "acme/widget", 52, "head-a", "skipped", "skipped-abstention"))
 	seed("wrong-pr", "audit", "review", "succeeded", "acme/widget", 53,
 		awaitedReviewPayload(t, "acme/widget", 53, "head-a", "approved", "wrong-pr"))
 	seed("wrong-repo", "audit", "review", "succeeded", "acme/other", 52,

@@ -99,6 +99,10 @@ func TestHighRiskReviewLoopBlocksBeforeCoordinator(t *testing.T) {
 		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, HeadSHA: "high-head",
 		TaskID: "task-7", ReviewRound: "review-1", Result: &AgentResult{Decision: "changes_requested"},
 	})
+	insertCompletedJob(t, store, db.Job{ID: "prior-high-risk-security-review", Agent: "sec", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, HeadSHA: "high-head",
+		TaskID: "task-7", ReviewRound: "review-1", Result: &AgentResult{Decision: "approved"},
+	})
 	engine := testEngine(store)
 	engine.RiskTiersEnabled = true
 	event := highRiskEvent()

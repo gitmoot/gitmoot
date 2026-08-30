@@ -180,6 +180,43 @@ func TestSupersedeStaleReviewJobsSkipsLargeNonReviewPayload(t *testing.T) {
 	}
 }
 
+func TestSupersedeStaleReviewJobsIncludesDeliberateReviewRoots(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	payload, err := json.Marshal(workflow.JobPayload{
+		Repo:        repo.FullName(),
+		Branch:      "task-7",
+		PullRequest: 7,
+		HeadSHA:     "old-head",
+		TaskID:      "task-007",
+	})
+	if err != nil {
+		t.Fatalf("Marshal review payload returned error: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID:      "deliberate-review-stale",
+		Agent:   "audit",
+		Type:    "review",
+		State:   string(workflow.JobQueued),
+		Payload: string(payload),
+	}, db.JobEvent{JobID: "deliberate-review-stale", Kind: string(workflow.JobQueued)}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+
+	d := Daemon{Repo: repo, Store: store, Workflow: &workflow.Engine{Store: store}}
+	if err := d.supersedeStaleReviewJobs(ctx, reviewPull("new-head"), nil); err != nil {
+		t.Fatalf("supersedeStaleReviewJobs returned error: %v", err)
+	}
+	job, err := store.GetJob(ctx, "deliberate-review-stale")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobCancelled) {
+		t.Fatalf("stale deliberate review state = %q, want cancelled", job.State)
+	}
+}
+
 // TestPullRequestWorkflowRoutingStaleAmongLargeNonReviewPayload proves routing's
 // stale detection is unchanged by the projection swap.
 func TestPullRequestWorkflowRoutingStaleAmongLargeNonReviewPayload(t *testing.T) {
