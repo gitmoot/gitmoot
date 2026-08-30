@@ -323,6 +323,20 @@ an accessible location and put it first in the daemon's `PATH`; do not loosen
 `/root` permissions. An inaccessible executable fails startup with no root
 fallback.
 
+Runtime contract preflight evaluates UID-dependent requirements against
+`local_uid` when that identity is configured. This lets a root daemon dispatch
+Claude with `danger-full-access` to a non-root local backend without weakening
+Claude's root refusal. When `local_uid` is absent, preflight still evaluates the
+daemon identity, so the default root path remains refused.
+
+To prove a parallel local wave, use an isolated `--home`, one distinct
+`fresh:<suffix>` session per Claude leg, and a daemon started with `--parallel
+N`. Dispatch all implement legs together with `--background` and
+`--skip-native-review-fanout`. Each parsed `gitmoot_result` should report UID,
+GID, workspace, start/end timestamps, and visible markers. The gate passes only
+when peak overlap is N, workspace paths are distinct, each leg sees only its own
+marker, and the isolated ledger contains zero remote execution attempts.
+
 ## Transcript Retention
 
 Runtime transcript retention is default-on. Every engine delivery appends its

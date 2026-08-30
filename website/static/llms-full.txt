@@ -387,8 +387,8 @@ gitmoot job events <job-id>
 gitmoot job gates <job-id>
 gitmoot job gates clear <job-id> --need "<text>"|--all
 gitmoot job open --agent <name> --repo owner/repo --type ask|review|implement [--title "..."]
-gitmoot job close <job-id> --decision approved|changes_requested|blocked|implemented|failed [--summary "..."]
-gitmoot job record --agent <name> --repo owner/repo --type ask|review|implement --decision implemented [--summary "..."]
+gitmoot job close <job-id> --decision approved|changes_requested|blocked|implemented|failed [--severity P0|P1|P2|P3] [--summary "..."]
+gitmoot job record --agent <name> --repo owner/repo --type ask|review|implement --decision implemented [--severity P0|P1|P2|P3] [--summary "..."]
 gitmoot report bug --job <job-id> --preview
 gitmoot report bug --job <job-id> --create --yes
 gitmoot lock list --repo owner/repo
@@ -1967,9 +1967,9 @@ local_root = "/var/tmp/gitmoot-local"
 # credential_gateway_url = "https://broker.example.com:8443"
 ```
 
-`local` is the default and the only currently provisioned backend. `remote` is
-parseable, but its provider is not configured in this slice; unsupported routes
-refuse explicitly rather than falling back to host execution. For an
+`local` is the default. `remote` provisions E2B for engine-driven shell
+implement jobs; unsupported job types and model runtimes refuse before
+provider allocation. For an
 engine-driven daemon job, Gitmoot provisions one job-scoped instance, syncs the selected host
 checkout into a distinct detached Git worktree, streams runtime commands there,
 collects changes, and destroys the instance after the job. The same instance
@@ -2008,6 +2008,12 @@ traversable location and put that location first in the daemon's `PATH`; do not
 make `/root` traversable just to satisfy this requirement. An inaccessible
 runtime fails command startup rather than falling back to root.
 
+Runtime contract preflight evaluates UID-dependent requirements against
+`local_uid` when that identity is configured. This lets a root daemon dispatch
+Claude with `danger-full-access` to a non-root local backend without weakening
+Claude's root refusal. When `local_uid` is absent, preflight still evaluates the
+daemon identity, so the default root path remains refused.
+
 The local worktree's `.git` file points at an absolute gitdir in the source
 repository. That pointer resolves on the same filesystem, so `local` needs no
 bundle/base-ref hydration; hydration remains a remote-provider concern. Cancel
@@ -2015,6 +2021,38 @@ kills active command groups and destroys the instance. A restarted daemon reaps
 instances whose recorded owner process is gone. A partially-created non-empty
 directory that Git never registered remains the known orphaned-but-present
 cleanup limitation tracked in #1572.
+
+## Proving a Parallel Local Wave
+
+Run the proof with a dedicated `--home`; never point it at the live Gitmoot
+home. Keep the source checkout under a path the configured identity can
+traverse, set `backend = "local"`, and give every Claude leg a distinct
+`fresh:<suffix>` session:
+
+```sh
+gitmoot agent subscribe gate-a --runtime claude --session fresh:gate-a \
+  --role implementer --repo OWNER/REPO --policy danger-full-access \
+  --capability implement --home "$PROOF_HOME"
+gitmoot daemon run --repo OWNER/REPO --parallel 4 --poll 1s \
+  --home "$PROOF_HOME"
+gitmoot agent implement gate-a "record uid, gid, pwd, start, end, and visible markers" \
+  --repo OWNER/REPO --base HEAD --background --skip-native-review-fanout \
+  --home "$PROOF_HOME"
+```
+
+Dispatch the other legs together, not after the first settles. Every leg's
+`gitmoot_result` should include its UID, GID, workspace, start and end
+timestamps, and visible marker set in `summary`; its marker in `changes_made`;
+and the read-back and visibility checks in `tests_run`.
+
+The proof passes only when all of these are independently observed:
+
+- every runtime delivery returns a parsed `gitmoot_result`;
+- the reported UID/GID equal the configured non-root identity;
+- the intervals overlap with measured peak concurrency equal to the leg count;
+- every workspace path is distinct, and each leg sees only its own marker;
+- the isolated ledger contains zero remote execution attempts, and no E2B
+  credential or `remote` selector is present.
 
 Gitmoot reads `[remote_exec]` when it dispatches a job. Once the process starts
 a remote credential listener for a home, those listener coordinates are
@@ -2051,8 +2089,7 @@ an absent selector defaults to `local`, while `backend = ""` or an explicit
 Any value outside the allowed set (`local`, `remote`) **fails the job
 loudly at dispatch**: the failure names the offending value and the allowed
 set (for example `unknown execution backend "e2b" (allowed: local, remote)`).
-There is no silent fallback. Provider construction for `remote` lands in later
-phases of the parallel-isolated-execution epic (#1529).
+There is no silent fallback.
 
 ---
 
@@ -3815,8 +3852,9 @@ stages:
   may merge after review and CI (see [Gate stages](#gate-stages)).
 - **Declared review suppresses native fan-out.** When an implement stage has a
   downstream `action: review` stage with `source` pointing to it, its job carries
-  `SkipNativeReviewFanout`. Gitmoot does not also enqueue the ordinary native
-  reviewers; without that declaration, native review behavior is unchanged.
+  `SkipNativeReviewFanout`. Gitmoot does not also enqueue native reviewers;
+  without that declaration, scheduling follows `[review].native_fanout_enabled`
+  (off by default, with repository overrides).
 - Still a **leaf** — it may mutate but never fan out.
 
 ### Source-bound review stages
@@ -9681,7 +9719,8 @@ For an in-session PR review, clock in with `--type review --pr <n> --head-sha
 `review_status`, alongside `review_status_grade: reported` and
 `review_status_authority: non_authoritative`. This is display-only,
 caller-reported activity: it does not satisfy, block, or otherwise feed the
-merge gate. Close the session job after posting the verdict.
+merge gate. Close the session job after posting the verdict. A
+`changes_requested` review close must pass `--severity P0|P1|P2|P3`.
 
 For a running engine-dispatched review with an isolated worktree, `job list`
 uses the verified daemon's descendant process tree instead: a runtime descendant
@@ -10534,6 +10573,20 @@ root daemon resolves `claude` or `codex` below `/root`, install the runtime at
 an accessible location and put it first in the daemon's `PATH`; do not loosen
 `/root` permissions. An inaccessible executable fails startup with no root
 fallback.
+
+Runtime contract preflight evaluates UID-dependent requirements against
+`local_uid` when that identity is configured. This lets a root daemon dispatch
+Claude with `danger-full-access` to a non-root local backend without weakening
+Claude's root refusal. When `local_uid` is absent, preflight still evaluates the
+daemon identity, so the default root path remains refused.
+
+To prove a parallel local wave, use an isolated `--home`, one distinct
+`fresh:<suffix>` session per Claude leg, and a daemon started with `--parallel
+N`. Dispatch all implement legs together with `--background` and
+`--skip-native-review-fanout`. Each parsed `gitmoot_result` should report UID,
+GID, workspace, start/end timestamps, and visible markers. The gate passes only
+when peak overlap is N, workspace paths are distinct, each leg sees only its own
+marker, and the isolated ledger contains zero remote execution attempts.
 
 ## Transcript Retention
 
@@ -12570,15 +12623,16 @@ gitmoot job open --agent <name> --repo owner/repo --type ask|review|implement \
 
 # Clock out: apply the result and move the job to its terminal state.
 gitmoot job close <id> --decision approved|changes_requested|blocked|implemented|failed|skipped \
-                 [--summary "..."] [--pr <n>] [--head-sha <sha>] \
-                 [--branch <name>] [--model <name>] \
-                 [--input-tokens <n>] [--output-tokens <n>] [--json]
+                 [--severity P0|P1|P2|P3] [--summary "..."] \
+                 [--pr <n>] [--head-sha <sha>] [--branch <name>] \
+                 [--model <name>] [--input-tokens <n>] [--output-tokens <n>] [--json]
 
 # One-shot post-hoc: create an already-terminal job (open + close in one).
 gitmoot job record --agent <name> --repo owner/repo --type ask|review|implement \
-                 --decision <decision> [--title "..."] [--summary "..."] \
-                 [--task <id>] [--parent-job-id <id>] [--pr <n>] \
-                 [--head-sha <sha>] [--branch <name>] [--model <name>] \
+                 --decision <decision> [--severity P0|P1|P2|P3] \
+                 [--title "..."] [--summary "..."] [--task <id>] \
+                 [--parent-job-id <id>] [--pr <n>] [--head-sha <sha>] \
+                 [--branch <name>] [--model <name>] \
                  [--input-tokens <n>] [--output-tokens <n>] [--json]
 ```
 
@@ -12600,6 +12654,10 @@ caller-reported evidence: Gitmoot records only values supplied explicitly to
 `close` or `record`, and leaves the model empty and token counts zero when they
 are omitted.
 
+A review recorded with `changes_requested` must pass `--severity` with the
+highest finding severity. Other decisions and non-review session jobs may omit
+it.
+
 For a seat's internal fan-out, the recording convention is to use the seat's
 registered agent name, link each recorded unit to the seat job with
 `--parent-job-id`, and give it a descriptive `--title`. This is a convention,
@@ -12615,7 +12673,7 @@ gitmoot job open --agent <name> --repo owner/repo --type review \
 gitmoot workflow note <label> "reviewed tests and error paths"
 # Post the verdict, then:
 gitmoot job close <id> --decision approved|changes_requested|blocked \
-  --summary "..."
+  --summary "..." [--severity P0|P1|P2|P3]
 ```
 
 For a running externally-driven review, `job list` and `job show` derive
@@ -17085,6 +17143,21 @@ truthful, and tied to work that actually happened.
   }
 }
 ```
+
+## Review severity
+
+Review results may add a top-level `"severity": "P0"` field. A
+`changes_requested` review must set it to the highest-severity finding, using
+one of `P0`, `P1`, `P2`, or `P3` (`P0` is most severe). Approved reviews may
+include it when reporting non-blocking findings; approved reviews with no
+findings and non-review jobs omit it.
+
+This field is the engine-readable round severity. A `severity` key nested inside
+an individual `findings[]` object remains useful for display, but does not
+replace the top-level field.
+
+Session review jobs use the same rule. Pass `--severity P0|P1|P2|P3` to
+`job close` or `job record` when the decision is `changes_requested`.
 
 ## Display-only in-session review state
 
