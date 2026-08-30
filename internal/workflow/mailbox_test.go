@@ -1736,6 +1736,40 @@ func TestMailboxRunRetriesMalformedOutputOnce(t *testing.T) {
 	}
 }
 
+func TestMailboxRunRepairsReviewVerdictMissingSeverity(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
+	adapter := &fakeDelivery{outputs: []string{
+		`{"gitmoot_result":{"decision":"changes_requested","summary":"fix the finding","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		`{"gitmoot_result":{"decision":"changes_requested","severity":"P1","summary":"fix the finding","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+	}}
+
+	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-review-severity", Agent: "audit", Action: "review", Repo: "gitmoot/gitmoot"}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+	result, err := mailbox.Run(ctx, "job-review-severity", agent, adapter)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.Severity != "P1" {
+		t.Fatalf("severity = %q, want P1", result.Severity)
+	}
+	if len(adapter.prompts) != 2 {
+		t.Fatalf("deliveries = %d, want missing-severity delivery plus repair", len(adapter.prompts))
+	}
+	for _, want := range []string{
+		"severity is required when a review requests changes",
+		"top-level severity",
+		"P0|P1|P2|P3",
+	} {
+		if !strings.Contains(adapter.prompts[1], want) {
+			t.Fatalf("repair prompt missing %q:\n%s", want, adapter.prompts[1])
+		}
+	}
+}
+
 func TestMailboxRunSalvagesMissingEnvelopeAfterSecondRepair(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)

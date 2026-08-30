@@ -42,6 +42,18 @@ The `decision` field reports the outcome of the job:
   stage state, not the separate skipped state used for downstream stages that
   never ran.
 
+## Review severity
+
+Review results may add a top-level `"severity": "P0"` field. A
+`changes_requested` review must set it to the highest-severity finding, using
+one of `P0`, `P1`, `P2`, or `P3` (`P0` is most severe). Approved reviews may
+include it when reporting non-blocking findings; approved reviews with no
+findings and non-review jobs omit it.
+
+This field is the engine-readable round severity. A `severity` key nested inside
+an individual `findings[]` object remains useful for display, but does not
+replace the top-level field.
+
 The narrative and evidence fields are reporting-only. Do not claim tests were run
 in `tests_run` unless they were actually run, and do not list files in
 `changes_made` unless they were actually changed. Name repo-relative file paths

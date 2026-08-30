@@ -64,6 +64,50 @@ func TestExtractAgentResultRejectsUnsupportedDecision(t *testing.T) {
 	}
 }
 
+func TestExtractAgentResultAcceptsCanonicalReviewSeverities(t *testing.T) {
+	for _, severity := range ReviewSeverities {
+		t.Run(severity, func(t *testing.T) {
+			output := `{"gitmoot_result":{"decision":"changes_requested","severity":"` + severity + `","summary":"fix finding"}}`
+
+			result, err := extractAgentResultForAction(output, "review")
+			if err != nil {
+				t.Fatalf("extractAgentResultForAction returned error: %v", err)
+			}
+			if result.Severity != severity {
+				t.Fatalf("severity = %q, want %q", result.Severity, severity)
+			}
+		})
+	}
+}
+
+func TestExtractAgentResultRequiresSeverityForChangesRequestedReview(t *testing.T) {
+	output := `{"gitmoot_result":{"decision":"changes_requested","summary":"fix finding"}}`
+
+	_, err := extractAgentResultForAction(output, "review")
+	if err == nil {
+		t.Fatal("extractAgentResultForAction accepted a review changes_requested verdict without severity")
+	}
+	if !strings.Contains(err.Error(), "severity is required when a review requests changes") {
+		t.Fatalf("error = %v", err)
+	}
+
+	if _, err := extractAgentResultForAction(output, "implement"); err != nil {
+		t.Fatalf("non-review changes_requested result rejected: %v", err)
+	}
+}
+
+func TestExtractAgentResultRejectsUnsupportedReviewSeverity(t *testing.T) {
+	output := `{"gitmoot_result":{"decision":"changes_requested","severity":"critical","summary":"fix finding"}}`
+
+	_, err := extractAgentResultForAction(output, "review")
+	if err == nil {
+		t.Fatal("extractAgentResultForAction accepted unsupported severity")
+	}
+	if !strings.Contains(err.Error(), `unsupported gitmoot_result severity "critical"`) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestExtractAgentResultAcceptsSkipped(t *testing.T) {
 	output := `{"gitmoot_result":{"decision":"skipped","summary":"no new replies","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
 
