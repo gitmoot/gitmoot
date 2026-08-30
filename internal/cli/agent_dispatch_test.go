@@ -650,9 +650,9 @@ func TestDispatchReviewManagedTypeRequiresExplicitLeadBeforeProvisioning(t *test
 	}
 }
 
-// PRE-FIX RED at the production CLI parser. This kills parsed-but-unthreaded
-// --lead, reversed firstNonEmpty precedence, and fix routing back to the reviewer.
-func TestReviewDispatchLeadRoutesChangesRequestedFixToImplementer(t *testing.T) {
+// A review's --lead routes the review workflow, but it is not PR ownership.
+// Auto-fix must use the implementing agent recorded on the shared task.
+func TestReviewDispatchRoutesChangesRequestedFixToTaskImplementer(t *testing.T) {
 	for _, surface := range []string{"review", "run"} {
 		t.Run(surface, func(t *testing.T) {
 			home := t.TempDir()
@@ -663,6 +663,25 @@ func TestReviewDispatchLeadRoutesChangesRequestedFixToImplementer(t *testing.T) 
 			seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 			seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 			seedDaemonWorkerAgentWithPolicy(t, store, "implementer", runtime.ShellRuntime, "true", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
+			seedDaemonWorkerAgentWithPolicy(t, store, "payload-default", runtime.ShellRuntime, "true", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
+			if err := store.UpsertTask(context.Background(), db.Task{
+				ID: "owned-task", RepoFullName: "owner/repo", Branch: "feature/review", State: string(workflow.TaskReviewing),
+			}); err != nil {
+				t.Fatalf("UpsertTask returned error: %v", err)
+			}
+			originalPayload, err := json.Marshal(workflow.JobPayload{
+				Repo: "owner/repo", Branch: "feature/review", PullRequest: 7, TaskID: "owned-task",
+				Result: &workflow.AgentResult{Decision: "implemented"},
+			})
+			if err != nil {
+				t.Fatalf("marshal original implement payload: %v", err)
+			}
+			if err := store.CreateJob(context.Background(), db.Job{
+				ID: "original-implement", Agent: "implementer", Type: "implement",
+				State: string(workflow.JobSucceeded), Payload: string(originalPayload),
+			}); err != nil {
+				t.Fatalf("CreateJob(original-implement): %v", err)
+			}
 			head, err := (gitutil.NewHostClient(checkout)).HeadSHA(context.Background())
 			if err != nil {
 				t.Fatalf("HeadSHA returned error: %v", err)
@@ -674,7 +693,7 @@ func TestReviewDispatchLeadRoutesChangesRequestedFixToImplementer(t *testing.T) 
 
 			args := []string{
 				"reviewer", "Review this PR.", "--repo", "owner/repo", "--pr", "7",
-				"--head-sha", head, "--branch", "feature/review", "--lead", "implementer", "--home", home,
+				"--head-sha", head, "--branch", "feature/review", "--lead", "payload-default", "--home", home,
 			}
 			var stdout, stderr bytes.Buffer
 			var exit int
@@ -694,8 +713,8 @@ func TestReviewDispatchLeadRoutesChangesRequestedFixToImplementer(t *testing.T) 
 			if err != nil {
 				t.Fatalf("ListJobs returned error: %v", err)
 			}
-			if len(jobs) != 2 {
-				t.Fatalf("jobs = %+v, want review plus fix job", jobs)
+			if len(jobs) != 3 {
+				t.Fatalf("jobs = %+v, want original implement, review, and fix jobs", jobs)
 			}
 			var reviewJob, fixJob *db.Job
 			for index := range jobs {
@@ -703,7 +722,9 @@ func TestReviewDispatchLeadRoutesChangesRequestedFixToImplementer(t *testing.T) 
 				case "review":
 					reviewJob = &jobs[index]
 				case "implement":
-					fixJob = &jobs[index]
+					if jobs[index].ID != "original-implement" {
+						fixJob = &jobs[index]
+					}
 				}
 			}
 			if reviewJob == nil || reviewJob.Agent != "reviewer" {

@@ -33,6 +33,8 @@ func runRepo(args []string, stdout, stderr io.Writer) int {
 		return runRepoList(args[1:], stdout, stderr)
 	case "set-interval":
 		return runRepoSetInterval(args[1:], stdout, stderr)
+	case "auto-fix":
+		return runRepoAutoFix(args[1:], stdout, stderr)
 	case "remove":
 		return runRepoRemove(args[1:], stdout, stderr)
 	case "doctor":
@@ -74,6 +76,7 @@ func printRepoUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot repo add owner/repo --path <path> [--poll <duration>] [--force] [--agents-md]")
 	fmt.Fprintln(w, "  gitmoot repo list")
 	fmt.Fprintln(w, "  gitmoot repo set-interval owner/repo (<duration>|default)")
+	fmt.Fprintln(w, "  gitmoot repo auto-fix owner/repo --pr <number> (--disable|--enable) --by <role-or-agent> --reason <text>")
 	fmt.Fprintln(w, "  gitmoot repo set-interval --all (<duration>|default)")
 	fmt.Fprintln(w, "  gitmoot repo remove owner/repo")
 	fmt.Fprintln(w, "  gitmoot repo doctor owner/repo")
@@ -338,6 +341,75 @@ func runRepoSetInterval(args []string, stdout, stderr io.Writer) int {
 	} else {
 		writeLine(stdout, "set poll interval for %s to %s", repoArg, display)
 	}
+	return 0
+}
+
+func runRepoAutoFix(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("repo auto-fix", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	pullRequest := fs.Int("pr", 0, "pull request number")
+	disable := fs.Bool("disable", false, "disable automatic changes-requested fix dispatch")
+	enable := fs.Bool("enable", false, "re-enable automatic changes-requested fix dispatch")
+	actor := fs.String("by", "", "role or agent recording the decision")
+	reason := fs.String("reason", "", "durable reason for the decision")
+	repoArg, code := parseRepoPositional(
+		fs,
+		"repo auto-fix",
+		args,
+		map[string]struct{}{"home": {}, "pr": {}, "by": {}, "reason": {}},
+		map[string]struct{}{"disable": {}, "enable": {}},
+		stderr,
+	)
+	if code >= 0 {
+		return code
+	}
+	if *disable == *enable {
+		fmt.Fprintln(stderr, "repo auto-fix requires exactly one of --disable or --enable")
+		return 2
+	}
+	if *pullRequest <= 0 {
+		fmt.Fprintln(stderr, "repo auto-fix requires a positive --pr number")
+		return 2
+	}
+	if strings.TrimSpace(*actor) == "" {
+		fmt.Fprintln(stderr, "repo auto-fix requires --by")
+		return 2
+	}
+	if strings.TrimSpace(*reason) == "" {
+		fmt.Fprintln(stderr, "repo auto-fix requires --reason")
+		return 2
+	}
+	repo, err := daemon.ParseRepository(repoArg)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid repo: %v\n", err)
+		return 2
+	}
+	repoArg = repo.FullName()
+	if err := withStore(*home, func(store *db.Store) error {
+		if _, err := store.GetRepo(context.Background(), repoArg); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("repo %s is not registered", repoArg)
+			}
+			return err
+		}
+		return store.SetPullRequestAutoFixPolicy(
+			context.Background(),
+			repoArg,
+			*pullRequest,
+			*disable,
+			*actor,
+			*reason,
+		)
+	}); err != nil {
+		fmt.Fprintf(stderr, "repo auto-fix: %v\n", err)
+		return 1
+	}
+	state := "enabled"
+	if *disable {
+		state = "disabled"
+	}
+	writeLine(stdout, "auto-fix %s for %s pull request #%d by %s: %s", state, repoArg, *pullRequest, strings.TrimSpace(*actor), strings.TrimSpace(*reason))
 	return 0
 }
 
