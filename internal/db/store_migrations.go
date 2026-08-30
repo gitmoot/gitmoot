@@ -2193,4 +2193,65 @@ SELECT
 FROM execbackend_attempts_nullable_generation;
 DROP TABLE execbackend_attempts_nullable_generation;
 	`,
+	// #1679 directive receipts retire stale pending wakes. Superseded is a
+	// terminal, non-delivery outcome: calling these rows delivered or failed
+	// would falsify the durable audit. The rebuild extends SQLite's state CHECK;
+	// the UPDATE cleans only already-terminal historical directives because an
+	// acked, still-open pending row may be a legitimate completion nudge.
+	`
+ALTER TABLE wake_outbox RENAME TO wake_outbox_before_superseded;
+
+CREATE TABLE wake_outbox (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	source_kind TEXT NOT NULL,
+	source_id TEXT NOT NULL,
+	target_role TEXT NOT NULL,
+	coalesce_key TEXT NOT NULL,
+	state TEXT NOT NULL DEFAULT 'pending'
+		CHECK(state IN ('pending', 'attempted', 'delivered', 'stalled', 'failed', 'delivery_unknown', 'superseded')),
+	attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+	last_error TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+	attempted_at TEXT,
+	finished_at TEXT,
+	updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+	UNIQUE(source_kind, source_id, target_role)
+);
+
+INSERT INTO wake_outbox(
+	id, source_kind, source_id, target_role, coalesce_key, state,
+	attempt_count, last_error, created_at, attempted_at, finished_at, updated_at
+)
+SELECT
+	id, source_kind, source_id, target_role, coalesce_key, state,
+	attempt_count, last_error, created_at, attempted_at, finished_at, updated_at
+FROM wake_outbox_before_superseded;
+
+DROP TABLE wake_outbox_before_superseded;
+
+UPDATE wake_outbox
+SET state = 'superseded',
+	last_error = 'directive terminated before wake delivery',
+	finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+	updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE state = 'pending' AND source_kind = 'workflow_note'
+	AND coalesce_key LIKE 'directive:%'
+	AND EXISTS (
+		SELECT 1
+		FROM workflow_notes d
+		JOIN workflow_notes r ON r.workflow_id = d.workflow_id
+		WHERE d.id = CAST(wake_outbox.source_id AS INTEGER)
+			AND (
+				substr(r.body, 1, length('[org:directive-cancel id=' || wake_outbox.source_id || ' ')) = '[org:directive-cancel id=' || wake_outbox.source_id || ' '
+				OR substr(r.body, 1, length('[org:directive-done id=' || wake_outbox.source_id || ' ')) = '[org:directive-done id=' || wake_outbox.source_id || ' '
+			)
+	);
+
+CREATE INDEX idx_wake_outbox_pending
+	ON wake_outbox(target_role, coalesce_key, created_at, id)
+	WHERE state = 'pending';
+CREATE INDEX idx_wake_outbox_attempted
+	ON wake_outbox(attempted_at, id)
+	WHERE state = 'attempted';
+	`,
 }

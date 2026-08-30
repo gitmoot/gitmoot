@@ -250,9 +250,9 @@ func runOrgDirectiveReceipt(kind string, args []string, stdout, stderr io.Writer
 		if body == "" {
 			return errors.New("could not format directive receipt")
 		}
-		_, err = store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		_, err = store.InsertOrgDirectiveReceipt(ctx, db.WorkflowNote{
 			WorkflowID: target.WorkflowID, Author: by, Body: body, Repo: target.Repo,
-		})
+		}, directiveID, kind)
 		workflowID = target.WorkflowID
 		return err
 	}); err != nil {

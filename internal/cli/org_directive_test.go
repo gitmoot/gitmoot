@@ -14,6 +14,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
+	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -165,6 +166,93 @@ func TestOrgDirectiveAckAuthorizationAndUnackedQuery(t *testing.T) {
 	}
 }
 
+func TestOrgDirectiveReceiptsAreIdempotentAndRetireStaleWakes(t *testing.T) {
+	home := directiveTestHome(t)
+	t.Setenv("GITMOOT_ORG_ROLE", "owner")
+	var stdout, stderr bytes.Buffer
+	send := func(workflowID string) string {
+		t.Helper()
+		stdout.Reset()
+		stderr.Reset()
+		if code := runOrg([]string{
+			"directive", "send", "--home", home, "--to", "worker",
+			"--workflow", workflowID, "deliver the result",
+		}, &stdout, &stderr); code != 0 {
+			t.Fatalf("send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+		}
+		return strings.Fields(stdout.String())[2]
+	}
+	receipt := func(kind, id string) {
+		t.Helper()
+		stdout.Reset()
+		stderr.Reset()
+		if code := runOrg([]string{
+			"directive", kind, id, "--home", home, "--by", "worker",
+		}, &stdout, &stderr); code != 0 {
+			t.Fatalf("%s %s code=%d out=%q err=%q", kind, id, code, stdout.String(), stderr.String())
+		}
+	}
+
+	ackedThenDone := send("release/idempotent-receipts")
+	receipt("ack", ackedThenDone)
+	receipt("ack", ackedThenDone)
+	receipt("done", ackedThenDone)
+	receipt("done", ackedThenDone)
+	receipt("ack", ackedThenDone)
+
+	doneBeforeAck := send("release/terminal-before-receipt")
+	receipt("done", doneBeforeAck)
+	receipt("ack", doneBeforeAck)
+
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var notes []db.WorkflowNote
+	for _, workflowID := range []string{"release/idempotent-receipts", "release/terminal-before-receipt"} {
+		found, err := store.ListWorkflowNotes(context.Background(), workflowID, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		notes = append(notes, found...)
+	}
+	counts := map[string]int{}
+	for _, note := range notes {
+		if id, _, ok := workflow.ParseOrgDirectiveAckNote(note.Body); ok {
+			counts[fmt.Sprintf("ack:%d", id)]++
+		}
+		if id, _, ok := workflow.ParseOrgDirectiveDoneNote(note.Body); ok {
+			counts[fmt.Sprintf("done:%d", id)]++
+		}
+	}
+	if got := counts["ack:"+ackedThenDone]; got != 1 {
+		t.Fatalf("ack rows for %s = %d, want 1 after replay", ackedThenDone, got)
+	}
+	if got := counts["done:"+ackedThenDone]; got != 1 {
+		t.Fatalf("done rows for %s = %d, want 1 after replay", ackedThenDone, got)
+	}
+	if got := counts["ack:"+doneBeforeAck]; got != 0 {
+		t.Fatalf("ack rows for terminal directive %s = %d, want 0", doneBeforeAck, got)
+	}
+	if got := counts["done:"+doneBeforeAck]; got != 1 {
+		t.Fatalf("done rows for %s = %d, want 1", doneBeforeAck, got)
+	}
+
+	wakes, err := store.ListWakeOutbox(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wakes) != 2 {
+		t.Fatalf("wake rows = %+v, want one stable row per directive", wakes)
+	}
+	for _, wake := range wakes {
+		if wake.State != db.WakeOutboxStateSuperseded {
+			t.Fatalf("wake %d state = %q, want superseded after receipt", wake.ID, wake.State)
+		}
+	}
+}
+
 func TestOrgDirectiveReceiptRequiresActingRole(t *testing.T) {
 	home := directiveTestHome(t)
 	t.Setenv("GITMOOT_ORG_ROLE", "owner")
@@ -313,6 +401,82 @@ func TestDirectiveWakeOutboxUsesSeparateCoalesceNamespace(t *testing.T) {
 	}
 	if wake.promptCalls != 2 || !strings.Contains(directivePrompt, fmt.Sprintf("directive %d", directive.ID)) || !strings.Contains(directivePrompt, fmt.Sprintf("gitmoot org directive ack %d --by owner", directive.ID)) {
 		t.Fatalf("directive wake calls=%d prompts=%q", wake.promptCalls, wake.prompts)
+	}
+}
+
+func TestDirectiveWakeDrainDoesNotCoalesceDifferentObligations(t *testing.T) {
+	store, deliverySink, wake, _ := replyWakeTestHarness(
+		t,
+		[]replyWakeTestRole{
+			{name: "owner", pane: "w1:p1"},
+			{name: "worker", pane: "w1:p2"},
+		},
+	)
+	ctx := context.Background()
+	if err := store.AddEventRule(ctx, db.EventRule{
+		ID: "directive-worker", OnKind: db.WakeOutboxKindDirective,
+		WakeRole: "worker", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	completion, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID:        "release/mixed-completion",
+		Author:            "owner",
+		Body:              workflow.FormatOrgDirectiveNote("owner", "worker", "release/mixed-completion", "finish"),
+		AddressedTarget:   "worker",
+		AddressedWakeKind: db.WakeOutboxKindDirective,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inserted, err := store.InsertOrgDirectiveReceipt(ctx, db.WorkflowNote{
+		WorkflowID: completion.WorkflowID,
+		Author:     "worker",
+		Body:       workflow.FormatOrgDirectiveAckNote(completion.ID, "worker"),
+	}, completion.ID, "ack"); err != nil || !inserted {
+		t.Fatalf("ack completion directive inserted=%v err=%v", inserted, err)
+	}
+	nag := events.NewEvent(
+		events.EventOrgDirective,
+		strconv.FormatInt(completion.ID, 10),
+		db.WakeOutboxSourceWorkflowNote+":"+strconv.FormatInt(completion.ID, 10),
+		"gitmoot/gitmoot",
+		"overdue",
+		fmt.Sprintf("directive %d to worker awaits completion", completion.ID),
+		time.Now().UTC(),
+		workflow.RedactCommentText,
+	)
+	nag.Cause = directiveCompletionOverdueCause
+	nag.WakeTargetRole = "worker"
+	deliverySink.sink.Emit(ctx, nag)
+
+	unread, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID:        "release/mixed-ack",
+		Author:            "owner",
+		Body:              workflow.FormatOrgDirectiveNote("owner", "worker", "release/mixed-ack", "start"),
+		AddressedTarget:   "worker",
+		AddressedWakeKind: db.WakeOutboxKindDirective,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainReplyWakeAfterAllRowsAreDue(t, store, deliverySink)
+
+	var completionPrompt, acknowledgmentPrompt string
+	for _, prompt := range wake.prompts {
+		switch {
+		case strings.Contains(prompt, fmt.Sprintf("gitmoot org directive done %d --by worker", completion.ID)):
+			completionPrompt = prompt
+		case strings.Contains(prompt, fmt.Sprintf("gitmoot org directive ack %d --by worker", unread.ID)):
+			acknowledgmentPrompt = prompt
+		}
+	}
+	if wake.promptCalls != 2 || completionPrompt == "" || acknowledgmentPrompt == "" {
+		t.Fatalf("directive prompts calls=%d prompts=%q", wake.promptCalls, wake.prompts)
+	}
+	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
+	if err != nil || len(delivered) != 2 {
+		t.Fatalf("delivered directive rows=%+v err=%v", delivered, err)
 	}
 }
 

@@ -25,7 +25,9 @@ const (
 	eventRuleWakeTimeout = 12 * time.Second
 	// eventRuleProbeTimeout bounds the availability probe and each pane-label
 	// resolution (a herdr `pane list`) so neither can hang the wake path.
-	eventRuleProbeTimeout = 5 * time.Second
+	eventRuleProbeTimeout           = 5 * time.Second
+	directiveCompletionOverdueCause = "directive_completion_overdue"
+	directiveTerminalCause          = "directive_terminal"
 )
 
 type eventWakeClient interface {
@@ -476,10 +478,20 @@ func eventRuleMatches(filter string, event events.Event) bool {
 func eventRuleWakePrompt(kind string, event events.Event) string {
 	if strings.EqualFold(strings.TrimSpace(kind), db.WakeOutboxKindDirective) {
 		directiveID := strings.TrimPrefix(event.RootID, db.WakeOutboxSourceWorkflowNote+":")
-		return fmt.Sprintf(
-			"gitmoot directive %s for %s; acknowledge receipt with: gitmoot org directive ack %s --by %s",
-			directiveID, event.WakeTargetRole, directiveID, event.WakeTargetRole,
-		)
+		switch event.Cause {
+		case directiveCompletionOverdueCause:
+			return fmt.Sprintf(
+				"gitmoot directive %s for %s is acknowledged but incomplete; finish the assigned deliverable, then record completion with: gitmoot org directive done %s --by %s",
+				directiveID, event.WakeTargetRole, directiveID, event.WakeTargetRole,
+			)
+		case directiveTerminalCause:
+			return fmt.Sprintf("gitmoot directive %s for %s is already terminal; no receipt or completion action is required", directiveID, event.WakeTargetRole)
+		default:
+			return fmt.Sprintf(
+				"gitmoot directive %s for %s; acknowledge receipt with: gitmoot org directive ack %s --by %s",
+				directiveID, event.WakeTargetRole, directiveID, event.WakeTargetRole,
+			)
+		}
 	}
 	if strings.EqualFold(strings.TrimSpace(kind), db.WakeOutboxKindFact) {
 		detail := truncateForWake(strings.TrimSpace(event.Detail), 320)

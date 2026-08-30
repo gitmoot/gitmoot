@@ -713,6 +713,91 @@ func TestDirectiveNagInsertToDrainDelivers(t *testing.T) {
 
 }
 
+// #1679 production-path guard: a completion nag reuses the directive's stable
+// outbox row, so the drain must recover the CURRENT phase from durable receipts.
+// A unit call with a hand-built Cause would pass while production still decoded
+// every row as addressed_directive and emitted another ack command.
+func TestDirectiveCompletionNagInsertToDrainRequestsDeliverable(t *testing.T) {
+	ctx := context.Background()
+	home := directiveTestHome(t)
+	t.Setenv("GITMOOT_ORG_ROLE", "owner")
+	var stdout, stderr bytes.Buffer
+	if code := runOrg([]string{
+		"directive", "send", "--home", home, "--to", "worker",
+		"--workflow", "release/completion-prompt", "ship the deliverable",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("send code=%d err=%q", code, stderr.String())
+	}
+	directiveID := strings.Fields(stdout.String())[2]
+	stdout.Reset()
+	stderr.Reset()
+	if code := runOrg([]string{
+		"directive", "ack", directiveID, "--home", home, "--by", "worker",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("ack code=%d err=%q", code, stderr.String())
+	}
+
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.AddEventRule(ctx, db.EventRule{
+		ID:       "completion-directive",
+		OnKind:   db.WakeOutboxKindDirective,
+		WakeRole: "worker",
+		Scope:    db.EventRuleScopeObserver,
+		Enabled:  true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	before, err := store.ListWakeOutbox(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != 1 || before[0].State != db.WakeOutboxStateSuperseded {
+		t.Fatalf("receipt wake before completion nag = %+v, want one superseded row", before)
+	}
+
+	nag := events.NewEvent(
+		events.EventOrgDirective,
+		directiveID,
+		db.WakeOutboxSourceWorkflowNote+":"+directiveID,
+		"gitmoot/gitmoot",
+		"overdue",
+		"directive "+directiveID+" to worker awaits completion",
+		time.Now().UTC(),
+		workflow.RedactCommentText,
+	)
+	nag.Cause = directiveCompletionOverdueCause
+	nag.WakeTargetRole = "worker"
+	(&eventRuleSink{store: store, home: home, wake: &fakeEventWake{}}).Emit(ctx, nag)
+
+	obligations, err := store.ListWakeOutboxObligations(ctx, time.Now().UTC().Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obligations.Pending) != 1 {
+		t.Fatalf("pending completion wakes = %+v, want one revived row", obligations.Pending)
+	}
+	decoded, err := wakeOutboxEvent(obligations.Pending, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Cause != directiveCompletionOverdueCause {
+		t.Fatalf("decoded cause = %q, want %q", decoded.Cause, directiveCompletionOverdueCause)
+	}
+	prompt := eventRuleWakePrompt(db.WakeOutboxKindDirective, decoded)
+	if !strings.Contains(prompt, "finish the assigned deliverable") ||
+		!strings.Contains(prompt, "gitmoot org directive done "+directiveID+" --by worker") {
+		t.Fatalf("completion prompt = %q, want deliverable and done command", prompt)
+	}
+	if strings.Contains(prompt, "gitmoot org directive ack") || strings.Contains(prompt, "acknowledge receipt") {
+		t.Fatalf("completion prompt regressed to receipt ceremony: %q", prompt)
+	}
+}
+
 // #1352 F1 — the count-error FALLBACK, exercised rather than assumed. Changing
 // sweepWindow's fallback from 200 to 1 previously left all 17 directive tests
 // green: nothing drove the error path, so a regression could silently evaluate a
