@@ -2343,15 +2343,16 @@ gitmoot job open --agent <name> --repo owner/repo --type ask|review|implement \
 
 # Clock out: apply the result and move the job to its terminal state.
 gitmoot job close <id> --decision approved|changes_requested|blocked|implemented|failed|skipped \
-                 [--summary "..."] [--pr <n>] [--head-sha <sha>] \
-                 [--branch <name>] [--model <name>] \
-                 [--input-tokens <n>] [--output-tokens <n>] [--json]
+                 [--severity P0|P1|P2|P3] [--summary "..."] \
+                 [--pr <n>] [--head-sha <sha>] [--branch <name>] \
+                 [--model <name>] [--input-tokens <n>] [--output-tokens <n>] [--json]
 
 # One-shot post-hoc: create an already-terminal job (open + close in one).
 gitmoot job record --agent <name> --repo owner/repo --type ask|review|implement \
-                 --decision <decision> [--title "..."] [--summary "..."] \
-                 [--task <id>] [--parent-job-id <id>] [--pr <n>] \
-                 [--head-sha <sha>] [--branch <name>] [--model <name>] \
+                 --decision <decision> [--severity P0|P1|P2|P3] \
+                 [--title "..."] [--summary "..."] [--task <id>] \
+                 [--parent-job-id <id>] [--pr <n>] [--head-sha <sha>] \
+                 [--branch <name>] [--model <name>] \
                  [--input-tokens <n>] [--output-tokens <n>] [--json]
 ```
 
@@ -2373,6 +2374,10 @@ caller-reported evidence: Gitmoot records only values supplied explicitly to
 `close` or `record`, and leaves the model empty and token counts zero when they
 are omitted.
 
+A review recorded with `changes_requested` must pass `--severity` with the
+highest finding severity. Other decisions and non-review session jobs may omit
+it.
+
 For a seat's internal fan-out, the recording convention is to use the seat's
 registered agent name, link each recorded unit to the seat job with
 `--parent-job-id`, and give it a descriptive `--title`. This is a convention,
@@ -2388,7 +2393,7 @@ gitmoot job open --agent <name> --repo owner/repo --type review \
 gitmoot workflow note <label> "reviewed tests and error paths"
 # Post the verdict, then:
 gitmoot job close <id> --decision approved|changes_requested|blocked \
-  --summary "..."
+  --summary "..." [--severity P0|P1|P2|P3]
 ```
 
 For a running externally-driven review, `job list` and `job show` derive

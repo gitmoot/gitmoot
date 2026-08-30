@@ -241,10 +241,23 @@ func extractAgentResultForAction(output, action string) (AgentResult, error) {
 	if err != nil {
 		return AgentResult{}, err
 	}
-	if strings.TrimSpace(action) == "review" && result.Decision == "changes_requested" && result.Severity == "" {
-		return AgentResult{}, errors.New("gitmoot_result severity is required when a review requests changes")
+	if err := validateAgentResultForAction(result, action); err != nil {
+		return AgentResult{}, err
 	}
 	return result, nil
+}
+
+// validateAgentResultForAction enforces constraints that depend on the job
+// action. Callers that receive an AgentResult directly use this after resolving
+// the job action from durable state.
+func validateAgentResultForAction(result AgentResult, action string) error {
+	if err := validateAgentResultSeverity(result); err != nil {
+		return err
+	}
+	if strings.TrimSpace(action) == "review" && result.Decision == "changes_requested" && result.Severity == "" {
+		return errors.New("gitmoot_result severity is required when a review requests changes")
+	}
+	return nil
 }
 
 func validateAgentResultFields(raw json.RawMessage) error {
@@ -290,11 +303,8 @@ func validateAgentResult(result AgentResult) error {
 	if _, ok := allowedSet(ResultDecisions)[result.Decision]; !ok {
 		return fmt.Errorf("unsupported gitmoot_result decision %q", result.Decision)
 	}
-	severity := strings.TrimSpace(result.Severity)
-	if severity != "" {
-		if result.Severity != severity || !slices.Contains(ReviewSeverities, severity) {
-			return fmt.Errorf("unsupported gitmoot_result severity %q (want one of %s)", result.Severity, strings.Join(ReviewSeverities, ", "))
-		}
+	if err := validateAgentResultSeverity(result); err != nil {
+		return err
 	}
 	if strings.TrimSpace(result.Summary) == "" {
 		return errors.New("gitmoot_result summary is required")
@@ -356,6 +366,14 @@ func validateAgentResult(result AgentResult) error {
 	}
 	if delegationsRequestArtifacts(result.Delegations) && strings.TrimSpace(result.ArtifactBody) == "" {
 		return errors.New("artifact_body is required when delegations request artifacts")
+	}
+	return nil
+}
+
+func validateAgentResultSeverity(result AgentResult) error {
+	severity := strings.TrimSpace(result.Severity)
+	if severity != "" && (result.Severity != severity || !slices.Contains(ReviewSeverities, severity)) {
+		return fmt.Errorf("unsupported gitmoot_result severity %q (want one of %s)", result.Severity, strings.Join(ReviewSeverities, ", "))
 	}
 	return nil
 }

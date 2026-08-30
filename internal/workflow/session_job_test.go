@@ -153,6 +153,48 @@ func TestCloseExternalJobAppliesDecision(t *testing.T) {
 	}
 }
 
+func TestCloseExternalJobRequiresSeverityForChangesRequestedReview(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+
+	if _, err := engine.OpenExternalJob(ctx, JobRequest{
+		ID:     "session-review",
+		Agent:  "lead",
+		Action: "review",
+		Repo:   "gitmoot/gitmoot",
+	}); err != nil {
+		t.Fatalf("OpenExternalJob returned error: %v", err)
+	}
+
+	if _, err := engine.CloseExternalJob(ctx, "session-review", AgentResult{
+		Decision: "changes_requested",
+		Summary:  "fix the finding",
+	}, 0, "", ""); err == nil || !strings.Contains(err.Error(), "severity is required") {
+		t.Fatalf("CloseExternalJob without severity error = %v, want severity requirement", err)
+	}
+	if stored := mustJob(t, store, "session-review"); stored.State != string(JobRunning) {
+		t.Fatalf("job state after rejected close = %q, want running", stored.State)
+	}
+
+	closed, err := engine.CloseExternalJob(ctx, "session-review", AgentResult{
+		Decision: "changes_requested",
+		Severity: "P1",
+		Summary:  "fix the finding",
+	}, 0, "", "")
+	if err != nil {
+		t.Fatalf("CloseExternalJob with severity returned error: %v", err)
+	}
+	payload, err := unmarshalPayload(closed.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload returned error: %v", err)
+	}
+	if payload.Result == nil || payload.Result.Severity != "P1" {
+		t.Fatalf("payload result = %+v, want severity P1", payload.Result)
+	}
+}
+
 // TestCloseExternalJobRecordsPRAndBranch proves the optional --pr/--branch
 // overrides land on the stored payload.
 func TestCloseExternalJobRecordsPRAndBranch(t *testing.T) {

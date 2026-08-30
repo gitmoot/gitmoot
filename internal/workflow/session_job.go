@@ -162,6 +162,9 @@ func (m Mailbox) CloseExternalJobWithUsage(ctx context.Context, jobID string, re
 	if job.State != string(JobRunning) {
 		return db.Job{}, fmt.Errorf("job %q is %s, not running; it has already been closed", jobID, job.State)
 	}
+	if err := validateAgentResultForAction(result, job.Type); err != nil {
+		return db.Job{}, err
+	}
 
 	payload, err := unmarshalPayload(job.Payload)
 	if err != nil {

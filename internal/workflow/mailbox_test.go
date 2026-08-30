@@ -1743,6 +1743,7 @@ func TestMailboxRunRepairsReviewVerdictMissingSeverity(t *testing.T) {
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"changes_requested","summary":"fix the finding","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		`{"gitmoot_result":{"decision":"changes_requested","summary":"still missing severity","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 		`{"gitmoot_result":{"decision":"changes_requested","severity":"P1","summary":"fix the finding","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 	}}
 
@@ -1756,17 +1757,22 @@ func TestMailboxRunRepairsReviewVerdictMissingSeverity(t *testing.T) {
 	if result.Severity != "P1" {
 		t.Fatalf("severity = %q, want P1", result.Severity)
 	}
-	if len(adapter.prompts) != 2 {
-		t.Fatalf("deliveries = %d, want missing-severity delivery plus repair", len(adapter.prompts))
+	if len(adapter.prompts) != 3 {
+		t.Fatalf("deliveries = %d, want initial delivery plus two repairs", len(adapter.prompts))
 	}
-	for _, want := range []string{
-		"severity is required when a review requests changes",
-		"top-level severity",
-		"P0|P1|P2|P3",
-	} {
-		if !strings.Contains(adapter.prompts[1], want) {
-			t.Fatalf("repair prompt missing %q:\n%s", want, adapter.prompts[1])
+	for i, prompt := range adapter.prompts[1:] {
+		for _, want := range []string{
+			"severity is required when a review requests changes",
+			"top-level severity",
+			"P0|P1|P2|P3",
+		} {
+			if !strings.Contains(prompt, want) {
+				t.Fatalf("repair prompt %d missing %q:\n%s", i+1, want, prompt)
+			}
 		}
+	}
+	if !strings.Contains(adapter.prompts[2], "still missing severity") {
+		t.Fatalf("second repair prompt did not include the first repair output:\n%s", adapter.prompts[2])
 	}
 }
 

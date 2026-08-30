@@ -50,6 +50,9 @@ one of `P0`, `P1`, `P2`, or `P3` (`P0` is most severe). Approved reviews may
 include it when reporting non-blocking findings; approved reviews with no
 findings and non-review jobs omit it.
 
+Session review jobs use the same rule. Pass `--severity P0|P1|P2|P3` to
+`job close` or `job record` when the decision is `changes_requested`.
+
 This field is the engine-readable round severity. A `severity` key nested inside
 an individual `findings[]` object remains useful for display, but does not
 replace the top-level field.
