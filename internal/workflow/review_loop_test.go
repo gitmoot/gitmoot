@@ -100,6 +100,19 @@ func TestDetectReviewLoopSameAgentSameHeadRefused(t *testing.T) {
 	}
 }
 
+func TestDetectReviewLoopSkippedSameAgentSameHeadAllowed(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedReviewLoopAgent(t, store, "g7-review", "codex", "gpt-5.6-sol")
+	seedReviewLoopVerdict(t, store, "review-g7-skipped", "g7-review", "head-a", "skipped", "codex")
+
+	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"}); err != nil {
+		t.Fatalf("DetectReviewLoop skipped abstention: %v", err)
+	} else if detected {
+		t.Fatal("skipped is an abstention and must not suppress same-agent retry")
+	}
+}
+
 func TestDetectReviewLoopDifferentAgentSameFamilyAllowed(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
