@@ -165,6 +165,93 @@ func TestOrgDirectiveAckAuthorizationAndUnackedQuery(t *testing.T) {
 	}
 }
 
+func TestOrgDirectiveReceiptsAreIdempotentAndRetireStaleWakes(t *testing.T) {
+	home := directiveTestHome(t)
+	t.Setenv("GITMOOT_ORG_ROLE", "owner")
+	var stdout, stderr bytes.Buffer
+	send := func(workflowID string) string {
+		t.Helper()
+		stdout.Reset()
+		stderr.Reset()
+		if code := runOrg([]string{
+			"directive", "send", "--home", home, "--to", "worker",
+			"--workflow", workflowID, "deliver the result",
+		}, &stdout, &stderr); code != 0 {
+			t.Fatalf("send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+		}
+		return strings.Fields(stdout.String())[2]
+	}
+	receipt := func(kind, id string) {
+		t.Helper()
+		stdout.Reset()
+		stderr.Reset()
+		if code := runOrg([]string{
+			"directive", kind, id, "--home", home, "--by", "worker",
+		}, &stdout, &stderr); code != 0 {
+			t.Fatalf("%s %s code=%d out=%q err=%q", kind, id, code, stdout.String(), stderr.String())
+		}
+	}
+
+	ackedThenDone := send("release/idempotent-receipts")
+	receipt("ack", ackedThenDone)
+	receipt("ack", ackedThenDone)
+	receipt("done", ackedThenDone)
+	receipt("done", ackedThenDone)
+	receipt("ack", ackedThenDone)
+
+	doneBeforeAck := send("release/terminal-before-receipt")
+	receipt("done", doneBeforeAck)
+	receipt("ack", doneBeforeAck)
+
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var notes []db.WorkflowNote
+	for _, workflowID := range []string{"release/idempotent-receipts", "release/terminal-before-receipt"} {
+		found, err := store.ListWorkflowNotes(context.Background(), workflowID, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		notes = append(notes, found...)
+	}
+	counts := map[string]int{}
+	for _, note := range notes {
+		if id, _, ok := workflow.ParseOrgDirectiveAckNote(note.Body); ok {
+			counts[fmt.Sprintf("ack:%d", id)]++
+		}
+		if id, _, ok := workflow.ParseOrgDirectiveDoneNote(note.Body); ok {
+			counts[fmt.Sprintf("done:%d", id)]++
+		}
+	}
+	if got := counts["ack:"+ackedThenDone]; got != 1 {
+		t.Fatalf("ack rows for %s = %d, want 1 after replay", ackedThenDone, got)
+	}
+	if got := counts["done:"+ackedThenDone]; got != 1 {
+		t.Fatalf("done rows for %s = %d, want 1 after replay", ackedThenDone, got)
+	}
+	if got := counts["ack:"+doneBeforeAck]; got != 0 {
+		t.Fatalf("ack rows for terminal directive %s = %d, want 0", doneBeforeAck, got)
+	}
+	if got := counts["done:"+doneBeforeAck]; got != 1 {
+		t.Fatalf("done rows for %s = %d, want 1", doneBeforeAck, got)
+	}
+
+	wakes, err := store.ListWakeOutbox(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wakes) != 2 {
+		t.Fatalf("wake rows = %+v, want one stable row per directive", wakes)
+	}
+	for _, wake := range wakes {
+		if wake.State != db.WakeOutboxStateSuperseded {
+			t.Fatalf("wake %d state = %q, want superseded after receipt", wake.ID, wake.State)
+		}
+	}
+}
+
 func TestOrgDirectiveReceiptRequiresActingRole(t *testing.T) {
 	home := directiveTestHome(t)
 	t.Setenv("GITMOOT_ORG_ROLE", "owner")

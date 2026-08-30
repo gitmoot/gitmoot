@@ -11,11 +11,12 @@ import (
 )
 
 const (
-	WakeOutboxStatePending   = "pending"
-	WakeOutboxStateAttempted = "attempted"
-	WakeOutboxStateDelivered = "delivered"
-	WakeOutboxStateStalled   = "stalled"
-	WakeOutboxStateFailed    = "failed"
+	WakeOutboxStatePending    = "pending"
+	WakeOutboxStateAttempted  = "attempted"
+	WakeOutboxStateDelivered  = "delivered"
+	WakeOutboxStateStalled    = "stalled"
+	WakeOutboxStateFailed     = "failed"
+	WakeOutboxStateSuperseded = "superseded"
 	// WakeOutboxStateDeliveryUnknown means a prior process claimed the row but
 	// disappeared before recording whether Herdr accepted the wake. It is
 	// terminal and MUST NOT be retried blindly.
@@ -41,6 +42,10 @@ const (
 	WakeOutboxReplyCoalescePrefix     = WakeOutboxKindReply + ":"
 	WakeOutboxDirectiveCoalescePrefix = WakeOutboxKindDirective + ":"
 	WakeOutboxFactCoalescePrefix      = WakeOutboxKindFact + ":"
+
+	WakeOutboxDirectivePhaseAcknowledgment = "acknowledgment"
+	WakeOutboxDirectivePhaseCompletion     = "completion"
+	WakeOutboxDirectivePhaseTerminal       = "terminal"
 )
 
 type wakeOutboxStateInterpretation uint8
@@ -63,6 +68,7 @@ var wakeOutboxStateDefinitions = [...]wakeOutboxStateDefinition{
 	{WakeOutboxStateDelivered, wakeOutboxStateTerminal},
 	{WakeOutboxStateStalled, wakeOutboxStateTerminal},
 	{WakeOutboxStateFailed, wakeOutboxStateTerminal},
+	{WakeOutboxStateSuperseded, wakeOutboxStateTerminal},
 	{WakeOutboxStateDeliveryUnknown, wakeOutboxStateDeliveryUnknown},
 }
 
@@ -93,12 +99,13 @@ type WakeOutboxEntry struct {
 // State is deliberately absent: ListWakeOutboxObligations classifies it before
 // returning across the package boundary.
 type WakeOutboxObligation struct {
-	ID          int64
-	SourceKind  string
-	SourceID    string
-	TargetRole  string
-	CoalesceKey string
-	CreatedAt   string
+	ID             int64
+	SourceKind     string
+	SourceID       string
+	TargetRole     string
+	CoalesceKey    string
+	CreatedAt      string
+	DirectivePhase string
 }
 
 // WakeOutboxObligationProjection exposes decisions, not persisted states.
@@ -117,6 +124,27 @@ func insertWorkflowNoteWakeOutboxTx(ctx context.Context, tx *sql.Tx, noteID int6
 		wakeKind, targetRole,
 	); err != nil {
 		return fmt.Errorf("insert workflow note wake outbox: %w", err)
+	}
+	return nil
+}
+
+// supersedeDirectiveWakeOutboxTx retires a receipt wake in the same transaction
+// that records the receipt. A later completion nudge revives the same stable row.
+func supersedeDirectiveWakeOutboxTx(ctx context.Context, tx *sql.Tx, directiveID int64, receiptKind string) error {
+	_, err := tx.ExecContext(ctx, `
+UPDATE wake_outbox
+SET state = 'superseded',
+	last_error = ?,
+	finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+	updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE source_kind = ? AND source_id = ?
+	AND coalesce_key LIKE 'directive:%' AND state = 'pending'`,
+		"directive "+strings.TrimSpace(receiptKind)+" recorded before wake delivery",
+		WakeOutboxSourceWorkflowNote,
+		strconv.FormatInt(directiveID, 10),
+	)
+	if err != nil {
+		return fmt.Errorf("supersede directive wake outbox: %w", err)
 	}
 	return nil
 }
@@ -331,18 +359,19 @@ func listWakeOutboxObligations(
 	out := WakeOutboxObligationProjection{}
 	for rows.Next() {
 		var entry WakeOutboxEntry
+		var directivePhase string
 		if err := rows.Scan(
 			&entry.ID, &entry.SourceKind, &entry.SourceID, &entry.TargetRole,
 			&entry.CoalesceKey, &entry.State, &entry.AttemptCount,
 			&entry.LastError, &entry.CreatedAt, &entry.AttemptedAt,
-			&entry.FinishedAt, &entry.UpdatedAt,
+			&entry.FinishedAt, &entry.UpdatedAt, &directivePhase,
 		); err != nil {
 			return WakeOutboxObligationProjection{}, err
 		}
 		obligation := WakeOutboxObligation{
 			ID: entry.ID, SourceKind: entry.SourceKind, SourceID: entry.SourceID,
 			TargetRole: entry.TargetRole, CoalesceKey: entry.CoalesceKey,
-			CreatedAt: entry.CreatedAt,
+			CreatedAt: entry.CreatedAt, DirectivePhase: directivePhase,
 		}
 		interpretation, ok := interpretWakeOutboxState(entry.State)
 		if !ok {
@@ -372,7 +401,20 @@ func wakeOutboxObligationQuery(attemptedBefore time.Time) (string, []any) {
 	return `
 SELECT id, source_kind, source_id, target_role, coalesce_key, state,
 		attempt_count, last_error, created_at, COALESCE(attempted_at, ''),
-		COALESCE(finished_at, ''), updated_at
+		COALESCE(finished_at, ''), updated_at,
+		CASE
+			WHEN source_kind != 'workflow_note' OR coalesce_key NOT LIKE 'directive:%' THEN ''
+			WHEN EXISTS (
+				SELECT 1 FROM workflow_notes r
+				WHERE substr(r.body, 1, length('[org:directive-cancel id=' || wake_outbox.source_id || ' ')) = '[org:directive-cancel id=' || wake_outbox.source_id || ' '
+					OR substr(r.body, 1, length('[org:directive-done id=' || wake_outbox.source_id || ' ')) = '[org:directive-done id=' || wake_outbox.source_id || ' '
+			) THEN 'terminal'
+			WHEN EXISTS (
+				SELECT 1 FROM workflow_notes r
+				WHERE substr(r.body, 1, length('[org:directive-ack id=' || wake_outbox.source_id || ' ')) = '[org:directive-ack id=' || wake_outbox.source_id || ' '
+			) THEN 'completion'
+			ELSE 'acknowledgment'
+		END
 FROM wake_outbox
 WHERE ` + predicate + `
 ORDER BY created_at, id`, args

@@ -22,6 +22,7 @@ func TestWakeOutboxStateClassificationIsExhaustive(t *testing.T) {
 		{WakeOutboxStateDelivered, wakeOutboxStateTerminal},
 		{WakeOutboxStateStalled, wakeOutboxStateTerminal},
 		{WakeOutboxStateFailed, wakeOutboxStateTerminal},
+		{WakeOutboxStateSuperseded, wakeOutboxStateTerminal},
 		{WakeOutboxStateDeliveryUnknown, wakeOutboxStateDeliveryUnknown},
 	}
 	if len(tests) != int(wakeOutboxStateCount) {
