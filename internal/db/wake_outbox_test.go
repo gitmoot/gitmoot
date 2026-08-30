@@ -58,7 +58,20 @@ func (r *recordingWakeOutboxQueryer) QueryContext(
 const expectedWakeOutboxObligationQuery = `
 SELECT id, source_kind, source_id, target_role, coalesce_key, state,
 		attempt_count, last_error, created_at, COALESCE(attempted_at, ''),
-		COALESCE(finished_at, ''), updated_at
+		COALESCE(finished_at, ''), updated_at,
+		CASE
+			WHEN source_kind != 'workflow_note' OR coalesce_key NOT LIKE 'directive:%' THEN ''
+			WHEN EXISTS (
+				SELECT 1 FROM workflow_notes r
+				WHERE substr(r.body, 1, length('[org:directive-cancel id=' || wake_outbox.source_id || ' ')) = '[org:directive-cancel id=' || wake_outbox.source_id || ' '
+					OR substr(r.body, 1, length('[org:directive-done id=' || wake_outbox.source_id || ' ')) = '[org:directive-done id=' || wake_outbox.source_id || ' '
+			) THEN 'terminal'
+			WHEN EXISTS (
+				SELECT 1 FROM workflow_notes r
+				WHERE substr(r.body, 1, length('[org:directive-ack id=' || wake_outbox.source_id || ' ')) = '[org:directive-ack id=' || wake_outbox.source_id || ' '
+			) THEN 'completion'
+			ELSE 'acknowledgment'
+		END
 FROM wake_outbox
 WHERE state = ? OR (state = ? AND attempted_at IS NOT NULL AND attempted_at <= ?)
 ORDER BY created_at, id`
