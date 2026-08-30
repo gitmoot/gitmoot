@@ -1330,22 +1330,31 @@ func TestEngineRunJobPreflightsPolicyBeforeDelivery(t *testing.T) {
 func TestEngineAdvanceReviewChangesRequestedDispatchesFix(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "owner-role", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "task-owner", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "payload-default", []string{"implement"}, "gitmoot/gitmoot")
 	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
 	engine.RequireWorkflowPolicy = func(string) RequireWorkflowPolicy { return RequireWorkflowPolicy{Enabled: true, Mode: "strict"} }
+	insertCompletedJob(t, store, db.Job{
+		ID: "original-implement", Agent: "task-owner", Type: "implement",
+	}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7",
+		Result: &AgentResult{Decision: "implemented"},
+	})
 	insertCompletedJob(t, store, db.Job{
 		ID:    "review-job",
 		Agent: "audit",
 		Type:  "review",
 	}, JobPayload{
-		Repo:        "gitmoot/gitmoot",
-		Branch:      "task-7",
-		PullRequest: 7,
-		TaskID:      "task-7",
-		TaskTitle:   "Workflow Engine",
-		LeadAgent:   "lead",
-		Result:      &AgentResult{Decision: "changes_requested", Summary: "fix edge case"},
+		Repo:          "gitmoot/gitmoot",
+		Branch:        "task-7",
+		PullRequest:   7,
+		TaskID:        "task-7",
+		TaskTitle:     "Workflow Engine",
+		LeadAgent:     "payload-default",
+		ActingOrgRole: "owner-role",
+		Result:        &AgentResult{Decision: "changes_requested", Summary: "fix edge case"},
 	})
 
 	err := engine.AdvanceJob(ctx, "review-job")
@@ -1354,7 +1363,7 @@ func TestEngineAdvanceReviewChangesRequestedDispatchesFix(t *testing.T) {
 		t.Fatalf("AdvanceJob returned error: %v", err)
 	}
 	assertTaskState(t, store, "task-7", TaskChangesRequested)
-	job := mustJob(t, store, "implement-lead-task-7")
+	job := mustJob(t, store, "implement-owner-role-task-7")
 	if !strings.Contains(job.Payload, "fix edge case") {
 		t.Fatalf("fix job payload = %s", job.Payload)
 	}
@@ -1507,6 +1516,12 @@ func TestEngineAdvanceReviewChangesRequestedReplayIsIdempotent(t *testing.T) {
 	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
 	insertCompletedJob(t, store, db.Job{
+		ID: "original-implement", Agent: "lead", Type: "implement",
+	}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7",
+		Result: &AgentResult{Decision: "implemented"},
+	})
+	insertCompletedJob(t, store, db.Job{
 		ID:    "review-job",
 		Agent: "audit",
 		Type:  "review",
@@ -1543,14 +1558,18 @@ func TestEngineAdvanceReviewChangesRequestedReplayIsIdempotent(t *testing.T) {
 	assertTaskState(t, store, "task-7", TaskChangesRequested)
 }
 
-func TestEngineAdvanceReviewChangesRequestedUsesBranchLockLead(t *testing.T) {
+func TestEngineAdvanceReviewChangesRequestedUsesTaskImplementerWhenActingRoleAbsent(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-7", Owner: "lead"}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
+	seedAgent(t, store, "task-owner", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "wrong-default", []string{"implement"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
+	insertCompletedJob(t, store, db.Job{
+		ID: "original-implement", Agent: "task-owner", Type: "implement",
+	}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7",
+		Result: &AgentResult{Decision: "implemented"},
+	})
 	insertCompletedJob(t, store, db.Job{
 		ID:    "manual-review-job",
 		Agent: "audit",
@@ -1561,19 +1580,205 @@ func TestEngineAdvanceReviewChangesRequestedUsesBranchLockLead(t *testing.T) {
 		PullRequest: 7,
 		TaskID:      "task-7",
 		TaskTitle:   "Workflow Engine",
+		LeadAgent:   "wrong-default",
 		Result:      &AgentResult{Decision: "changes_requested", Summary: "fix manual review"},
 	})
 
-	err := engine.AdvanceJob(ctx, "manual-review-job")
-
-	if err != nil {
+	if err := engine.AdvanceJob(ctx, "manual-review-job"); err != nil {
 		t.Fatalf("AdvanceJob returned error: %v", err)
 	}
 	assertTaskState(t, store, "task-7", TaskChangesRequested)
-	job := mustJob(t, store, "implement-lead-task-7")
+	job := mustJob(t, store, "implement-task-owner-task-7")
 	if !strings.Contains(job.Payload, "fix manual review") {
 		t.Fatalf("fix job payload = %s", job.Payload)
 	}
+	if _, err := store.GetJob(ctx, "implement-wrong-default-task-7"); err == nil {
+		t.Fatal("branch-lock or payload default received auto-fix ownership")
+	}
+}
+
+func TestEngineAdvanceReviewChangesRequestedFailsClosedWithoutOwnership(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "payload-default", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	allocations := 0
+	engine.FixWorktreeAllocator = func(_ context.Context, request FixWorktreeRequest) (FixWorktreeAllocation, error) {
+		allocations++
+		return FixWorktreeAllocation{Path: filepath.Join(t.TempDir(), request.JobID)}, nil
+	}
+	insertCompletedJob(t, store, db.Job{
+		ID: "review-without-owner", Agent: "audit", Type: "review",
+	}, JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		Branch:      "task-7",
+		PullRequest: 7,
+		TaskID:      "task-7",
+		TaskTitle:   "Workflow Engine",
+		LeadAgent:   "payload-default",
+		Result:      &AgentResult{Decision: "changes_requested", Summary: "fix without guessing"},
+	})
+
+	err := engine.AdvanceJob(ctx, "review-without-owner")
+	var blocked BlockedError
+	if !errors.As(err, &blocked) || !strings.Contains(blocked.Reason, "auto-fix ownership unresolved") {
+		t.Fatalf("AdvanceJob error = %v, want ownership BlockedError", err)
+	}
+	assertTaskState(t, store, "task-7", TaskBlocked)
+	if allocations != 0 {
+		t.Fatalf("fix worktree allocations = %d, want zero", allocations)
+	}
+	if _, err := store.GetJob(ctx, "implement-payload-default-task-7"); err == nil {
+		t.Fatal("payload default received an ownership-unresolved auto-fix")
+	}
+	events, err := store.ListTaskEvents(ctx, "task-7")
+	if err != nil {
+		t.Fatalf("ListTaskEvents: %v", err)
+	}
+	found := false
+	for _, event := range events {
+		if event.Kind == "review_auto_fix_blocked" && strings.Contains(event.Reason, "ownership unresolved") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("task events = %+v, want review_auto_fix_blocked ownership event", events)
+	}
+}
+
+func TestEngineAdvanceReviewChangesRequestedFailsClosedForAmbiguousTaskImplementers(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "first-owner", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "second-owner", []string{"implement"}, "gitmoot/gitmoot")
+	for _, agent := range []string{"second-owner", "first-owner"} {
+		insertCompletedJob(t, store, db.Job{
+			ID: "original-implement-" + agent, Agent: agent, Type: "implement",
+		}, JobPayload{
+			Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7",
+			Result: &AgentResult{Decision: "implemented"},
+		})
+	}
+	engine := testEngine(store)
+	allocations := 0
+	engine.FixWorktreeAllocator = func(_ context.Context, request FixWorktreeRequest) (FixWorktreeAllocation, error) {
+		allocations++
+		return FixWorktreeAllocation{Path: filepath.Join(t.TempDir(), request.JobID)}, nil
+	}
+	insertCompletedJob(t, store, db.Job{
+		ID: "review-ambiguous-owner", Agent: "audit", Type: "review",
+	}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7",
+		Result: &AgentResult{Decision: "changes_requested", Summary: "choose no default"},
+	})
+
+	err := engine.AdvanceJob(ctx, "review-ambiguous-owner")
+	var blocked BlockedError
+	if !errors.As(err, &blocked) || !strings.Contains(blocked.Reason, "auto-fix ownership ambiguous") || !strings.Contains(blocked.Reason, "[first-owner second-owner]") {
+		t.Fatalf("AdvanceJob error = %v, want sorted ambiguous-ownership BlockedError", err)
+	}
+	if allocations != 0 {
+		t.Fatalf("fix worktree allocations = %d, want zero", allocations)
+	}
+}
+
+func TestEngineAdvanceReviewChangesRequestedDoesNotBypassUnresolvableActingRole(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "task-owner", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "payload-default", []string{"implement"}, "gitmoot/gitmoot")
+	insertCompletedJob(t, store, db.Job{
+		ID: "original-implement", Agent: "task-owner", Type: "implement",
+	}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7",
+		Result: &AgentResult{Decision: "implemented"},
+	})
+	engine := testEngine(store)
+	allocations := 0
+	engine.FixWorktreeAllocator = func(_ context.Context, request FixWorktreeRequest) (FixWorktreeAllocation, error) {
+		allocations++
+		return FixWorktreeAllocation{Path: filepath.Join(t.TempDir(), request.JobID)}, nil
+	}
+	insertCompletedJob(t, store, db.Job{
+		ID: "review-with-role", Agent: "audit", Type: "review",
+	}, JobPayload{
+		Repo:          "gitmoot/gitmoot",
+		Branch:        "task-7",
+		PullRequest:   7,
+		TaskID:        "task-7",
+		TaskTitle:     "Workflow Engine",
+		LeadAgent:     "payload-default",
+		ActingOrgRole: "gitmoot",
+		Result:        &AgentResult{Decision: "changes_requested", Summary: "respect coordinator ownership"},
+	})
+
+	err := engine.AdvanceJob(ctx, "review-with-role")
+	var blocked BlockedError
+	if !errors.As(err, &blocked) || !strings.Contains(blocked.Reason, `agent "gitmoot" is not subscribed`) {
+		t.Fatalf("AdvanceJob error = %v, want acting-role BlockedError", err)
+	}
+	if allocations != 0 {
+		t.Fatalf("fix worktree allocations = %d, want zero", allocations)
+	}
+	if _, err := store.GetJob(ctx, "implement-task-owner-task-7"); err == nil {
+		t.Fatal("task implementer bypassed an explicit but unresolvable acting role")
+	}
+	if _, err := store.GetJob(ctx, "implement-payload-default-task-7"); err == nil {
+		t.Fatal("payload default bypassed an explicit but unresolvable acting role")
+	}
+}
+
+func TestEngineAdvanceReviewChangesRequestedHonorsPersistentRefusal(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "task-owner", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
+	insertCompletedJob(t, store, db.Job{
+		ID: "original-implement", Agent: "task-owner", Type: "implement",
+	}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7",
+		Result: &AgentResult{Decision: "implemented"},
+	})
+	if err := store.SetPullRequestAutoFixPolicy(ctx, "gitmoot/gitmoot", 7, true, "gitmoot", "coordinator declined automatic patching"); err != nil {
+		t.Fatalf("disable auto-fix: %v", err)
+	}
+	engine := testEngine(store)
+	allocations := 0
+	engine.FixWorktreeAllocator = func(_ context.Context, request FixWorktreeRequest) (FixWorktreeAllocation, error) {
+		allocations++
+		return FixWorktreeAllocation{Path: filepath.Join(t.TempDir(), request.JobID)}, nil
+	}
+	insertCompletedJob(t, store, db.Job{
+		ID: "review-refused", Agent: "audit", Type: "review",
+	}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7",
+		TaskTitle: "Workflow Engine",
+		Result:    &AgentResult{Decision: "changes_requested", Summary: "do not patch automatically"},
+	})
+
+	err := engine.AdvanceJob(ctx, "review-refused")
+	var blocked BlockedError
+	if !errors.As(err, &blocked) || !strings.Contains(blocked.Reason, "auto-fix disabled") || !strings.Contains(blocked.Reason, "coordinator declined automatic patching") {
+		t.Fatalf("AdvanceJob error = %v, want durable refusal BlockedError", err)
+	}
+	if allocations != 0 {
+		t.Fatalf("fix worktree allocations = %d, want zero while disabled", allocations)
+	}
+	if _, err := store.GetJob(ctx, "implement-task-owner-task-7"); err == nil {
+		t.Fatal("disabled PR dispatched an auto-fix")
+	}
+
+	if err := store.SetPullRequestAutoFixPolicy(ctx, "gitmoot/gitmoot", 7, false, "gitmoot", "owner resumed automatic fixes"); err != nil {
+		t.Fatalf("enable auto-fix: %v", err)
+	}
+	if err := engine.AdvanceJob(ctx, "review-refused"); err != nil {
+		t.Fatalf("AdvanceJob after re-enable: %v", err)
+	}
+	if allocations != 1 {
+		t.Fatalf("fix worktree allocations = %d, want one after re-enable", allocations)
+	}
+	mustJob(t, store, "implement-task-owner-task-7")
 }
 
 func TestEngineAdvanceReviewApprovalRunsMergeGate(t *testing.T) {
@@ -1748,6 +1953,12 @@ func TestEngineAdvanceReviewApprovalPreservesChangesRequested(t *testing.T) {
 	gate := &fakeMergeGate{decision: MergeDecision{Ready: true}}
 	engine.MergeGate = gate
 	reviewers := []string{"audit", "security"}
+	insertCompletedJob(t, store, db.Job{
+		ID: "original-implement", Agent: "lead", Type: "implement",
+	}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7",
+		Result: &AgentResult{Decision: "implemented"},
+	})
 	insertCompletedJob(t, store, db.Job{
 		ID:    "audit-review",
 		Agent: "audit",

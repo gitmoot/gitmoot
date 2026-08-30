@@ -952,6 +952,13 @@ func enqueueAdvanceCreatedHeadlessFixJob(t *testing.T, store *db.Store, jobID, b
 	ctx := context.Background()
 	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"review"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "original-headless-implement", Agent: "lead", Action: "implement", Repo: "owner/repo",
+		Branch: branch, PullRequest: 1514, TaskID: "task-1514",
+	})
+	if err := store.UpdateJobState(ctx, "original-headless-implement", string(workflow.JobSucceeded)); err != nil {
+		t.Fatalf("UpdateJobState(original-headless-implement): %v", err)
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: "headless-review", Agent: "audit", Action: "review", Repo: "owner/repo",
 		Branch: branch, PullRequest: 1514, TaskID: "task-1514", LeadAgent: "lead",
 	})

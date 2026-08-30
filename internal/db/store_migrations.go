@@ -2254,4 +2254,18 @@ CREATE INDEX idx_wake_outbox_attempted
 	ON wake_outbox(attempted_at, id)
 	WHERE state = 'attempted';
 	`,
+	// #1686 per-PR auto-fix refusal. The scheduler reads this local durable
+	// policy before resolving an owner or allocating a fix worktree.
+	`
+CREATE TABLE pull_request_auto_fix_policies (
+	repo_full_name TEXT NOT NULL COLLATE NOCASE,
+	pull_request INTEGER NOT NULL CHECK(pull_request > 0),
+	disabled INTEGER NOT NULL CHECK(disabled IN (0, 1)),
+	actor TEXT NOT NULL,
+	reason TEXT NOT NULL,
+	created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+	updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+	PRIMARY KEY (repo_full_name, pull_request)
+);
+	`,
 }
