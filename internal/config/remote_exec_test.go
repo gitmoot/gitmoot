@@ -49,7 +49,7 @@ func TestLoadRemoteExecConfigExplicitImplementedBackend(t *testing.T) {
 				if err := os.WriteFile(keyFile, []byte("api-key-GITMOOT-IMPL\n"), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				content += fmt.Sprintf("e2b_api_key_file = %q\ne2b_template = \"template-test\"\ne2b_base_url = \"https://control.example\"\ne2b_domain = \"sandboxes.example\"\n", keyFile)
+				content += fmt.Sprintf("e2b_api_key_file = %q\ne2b_template = \"template-test\"\ne2b_base_url = \"https://control.example\"\ne2b_domain = \"sandboxes.example\"\ncredential_gateway_listen = \"127.0.0.1:8443\"\ncredential_gateway_url = \"https://broker.example:8443\"\n", keyFile)
 			}
 			paths := remoteExecTestPaths(t, content)
 			cfg, err := LoadRemoteExecConfig(paths)
@@ -59,7 +59,7 @@ func TestLoadRemoteExecConfigExplicitImplementedBackend(t *testing.T) {
 			if cfg.Backend != backend {
 				t.Fatalf("Backend = %q, want %q", cfg.Backend, backend)
 			}
-			if backend == "remote" && (cfg.E2BTemplate != "template-test" || cfg.E2BBaseURL != "https://control.example" || cfg.E2BDomain != "sandboxes.example") {
+			if backend == "remote" && (cfg.E2BTemplate != "template-test" || cfg.E2BBaseURL != "https://control.example" || cfg.E2BDomain != "sandboxes.example" || cfg.CredentialGatewayListen != "127.0.0.1:8443" || cfg.CredentialGatewayURL != "https://broker.example:8443") {
 				t.Fatalf("remote provider config = %+v", cfg)
 			}
 		})
@@ -145,6 +145,32 @@ func TestLoadRemoteExecConfigRejectsUnusableE2BCredentials(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), secret) {
 				t.Fatalf("LoadRemoteExecConfig leaked API key: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateCredentialGatewayRequiresReachableHTTPSPair(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		listen string
+		url    string
+		want   string
+	}{
+		{name: "valid", listen: "0.0.0.0:8443", url: "https://broker.example:8443"},
+		{name: "missing URL", listen: "0.0.0.0:8443", want: "configured together"},
+		{name: "missing listen", url: "https://broker.example:8443", want: "configured together"},
+		{name: "zero port", listen: "0.0.0.0:0", url: "https://broker.example", want: "non-zero TCP port"},
+		{name: "HTTP URL", listen: "0.0.0.0:8443", url: "http://broker.example:8443", want: "HTTPS origin"},
+		{name: "URL path", listen: "0.0.0.0:8443", url: "https://broker.example:8443/path", want: "HTTPS origin"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := (RemoteExecConfig{CredentialGatewayListen: tc.listen, CredentialGatewayURL: tc.url}).ValidateCredentialGateway()
+			if tc.want == "" && err != nil {
+				t.Fatal(err)
+			}
+			if tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
+				t.Fatalf("ValidateCredentialGateway error = %v, want %q", err, tc.want)
 			}
 		})
 	}

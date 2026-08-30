@@ -22,6 +22,7 @@ type Lease struct {
 	placeholder string
 	route       string
 	capability  string
+	remote      RemoteMaterial
 }
 
 func (l *Lease) URL() string {
@@ -40,6 +41,19 @@ func (l *Lease) Placeholder() string {
 		return ""
 	}
 	return l.placeholder
+}
+
+// RemoteMaterial returns a defensive copy of the job-scoped mTLS bundle. A
+// zero value means this is a loopback-only lease.
+func (l *Lease) RemoteMaterial() RemoteMaterial {
+	if l == nil {
+		return RemoteMaterial{}
+	}
+	material := l.remote
+	material.CACertificate = append([]byte(nil), material.CACertificate...)
+	material.ClientCertificate = append([]byte(nil), material.ClientCertificate...)
+	material.ClientPrivateKey = append([]byte(nil), material.ClientPrivateKey...)
+	return material
 }
 
 func (l *Lease) Revoke() {

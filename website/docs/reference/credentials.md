@@ -82,6 +82,14 @@ an authorized child from exercising the credential on the pinned upstream.
 Curated upstreams and base paths are part of the model; configure only trusted
 services.
 
+For an authenticated `RegisterProxy` lease pinned to an operator-selected
+HTTPS upstream, response filtering prevents a non-malicious upstream's
+accidental exact-byte reflection of the credential in response body bytes or
+HTTP field names or values from reaching the sandbox. Malicious or compromised
+upstreams and transformed application payloads are out of scope. That includes
+application-layer compression such as `Content-Type: application/gzip` without
+`Content-Encoding`; this boundary is not a general data-loss-prevention layer.
+
 Ordinary agent jobs receive no keys, and delegation children do not inherit a
 pipeline stage's access.
 
@@ -108,13 +116,15 @@ config is only read, never modified.
 Pipeline `injected` and generic `proxied` key delivery is independent of the
 Claude gateway and does not alter its model-runtime placeholder flow.
 
-The feature is off by default and currently covers Claude only. A populated
+The feature is off by default. It covers local Claude and can issue broker
+material to an opted-in remote shell. A populated
 `runtime-auth.env` is required while it is enabled; Gitmoot fails the delivery
 instead of falling back to ambient auth, Claude's credential store, or direct
 upstream egress. `model_gateway_allow_hosts` is an exact hostname allowlist and
 defaults to `api.anthropic.com`. The upstream is fixed by Gitmoot, not selected
-by the child. Credentials are read once when the adapter is built, never once
-per proxied request, so rotation applies to the next adapter/job.
+by the child. Local Claude credentials are snapshotted when the adapter is
+built. Remote-shell broker credentials are resolved per request, but only after
+mTLS, capability, sandbox/runtime, expiry, and allowlist checks pass.
 
 ## Curated environment
 

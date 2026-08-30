@@ -234,6 +234,21 @@ without direct-auth fallback. The child is also pointed at a credential-free
 credential over the placeholder and the gateway would `401` every job (#936).
 It is off by default and does not cover Codex or Kimi.
 
+For remote shell jobs, the same opt-in can issue an ephemeral mTLS client
+identity and capability bound to the sandbox id, runtime, allowlist, and lease
+expiry. Only a curl-config path enters the environment; the upstream key is
+resolved on the host after authentication and never enters the sandbox.
+The host transport decodes negotiated gzip before filtering. Initial residual
+`Content-Encoding` and unexpected HTTP/2 responses fail before body release.
+Credential-bearing response field names are dropped; remaining field values
+and body bytes are filtered incrementally with bounded carry-over, so streaming
+does not wait for EOF. ASCII-case variants and standard reversible URL/base
+encodings remain best-effort defense in depth. The contract covers accidental
+exact-byte reflection by a trusted, operator-selected upstream. Malicious
+upstreams and transformed application payloads, including application-layer
+compression without `Content-Encoding`, are out of scope. Model runtimes remain
+refused remotely until they can present that identity.
+
 ### Runtime ambient credential hygiene
 
 The optional `[credentials] env_curation = true` policy curates only runtime

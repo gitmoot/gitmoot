@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -39,6 +40,11 @@ type RemoteExecConfig struct {
 	E2BTemplate   string
 	E2BBaseURL    string
 	E2BDomain     string
+	// CredentialGatewayListen is the daemon bind address; URL is the HTTPS
+	// origin reachable from a sandbox. They are configured together and are
+	// used only for opt-in broker material, never for the provider control key.
+	CredentialGatewayListen string
+	CredentialGatewayURL    string
 }
 
 // DefaultRemoteExecConfig preserves today's behaviour: the local backend.
@@ -101,7 +107,7 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 				return RemoteExecConfig{}, fmt.Errorf("parse [remote_exec].local_root: %w", err)
 			}
 			cfg.LocalRoot = strings.TrimSpace(parsed)
-		case "e2b_api_key_file", "e2b_template", "e2b_base_url", "e2b_domain":
+		case "e2b_api_key_file", "e2b_template", "e2b_base_url", "e2b_domain", "credential_gateway_listen", "credential_gateway_url":
 			parsed, err := parseConfigString(value)
 			if err != nil {
 				return RemoteExecConfig{}, fmt.Errorf("parse [remote_exec].%s: %w", key, err)
@@ -116,6 +122,10 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 				cfg.E2BBaseURL = parsed
 			case "e2b_domain":
 				cfg.E2BDomain = parsed
+			case "credential_gateway_listen":
+				cfg.CredentialGatewayListen = parsed
+			case "credential_gateway_url":
+				cfg.CredentialGatewayURL = parsed
 			}
 		default:
 			// Ignore unknown keys so the section remains forward-compatible.
@@ -175,6 +185,35 @@ func (cfg RemoteExecConfig) ValidateE2BProvider() error {
 	}
 	if err := validateE2BBaseURL(cfg.E2BBaseURL); err != nil {
 		return fmt.Errorf("invalid [remote_exec].e2b_base_url: %w", err)
+	}
+	if err := cfg.ValidateCredentialGateway(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ValidateCredentialGateway validates only transport coordinates. The mTLS CA
+// and all job credentials are generated in memory by credgw.
+func (cfg RemoteExecConfig) ValidateCredentialGateway() error {
+	listenAddress := strings.TrimSpace(cfg.CredentialGatewayListen)
+	advertiseURL := strings.TrimSpace(cfg.CredentialGatewayURL)
+	if listenAddress == "" && advertiseURL == "" {
+		return nil
+	}
+	if listenAddress == "" || advertiseURL == "" {
+		return fmt.Errorf("[remote_exec].credential_gateway_listen and [remote_exec].credential_gateway_url must be configured together")
+	}
+	_, port, err := net.SplitHostPort(listenAddress)
+	if err != nil {
+		return fmt.Errorf("invalid [remote_exec].credential_gateway_listen: %w", err)
+	}
+	portNumber, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || portNumber == 0 {
+		return fmt.Errorf("invalid [remote_exec].credential_gateway_listen: require a non-zero TCP port")
+	}
+	parsed, err := url.Parse(advertiseURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil || parsed.Opaque != "" || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("invalid [remote_exec].credential_gateway_url: require an HTTPS origin without path, query, credentials, or fragment")
 	}
 	return nil
 }

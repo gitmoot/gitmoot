@@ -15,6 +15,9 @@ local_uid = 1000
 local_gid = 1000
 # Use a traversable root when the Gitmoot home is below /root.
 local_root = "/var/tmp/gitmoot-local"
+# For opt-in broker access from a remote shell, configure both:
+# credential_gateway_listen = "0.0.0.0:8443"
+# credential_gateway_url = "https://broker.example.com:8443"
 ```
 
 `local` is the default and the only currently provisioned backend. `remote` is
@@ -66,9 +69,32 @@ instances whose recorded owner process is gone. A partially-created non-empty
 directory that Git never registered remains the known orphaned-but-present
 cleanup limitation tracked in #1572.
 
-Gitmoot reads `[remote_exec]` when it dispatches a job; it is not cached and
-needs no SIGHUP wiring. Foreground dispatch refuses `remote` because it has no
-daemon-owned lifecycle, ledger, or reaper.
+Gitmoot reads `[remote_exec]` when it dispatches a job. Once the process starts
+a remote credential listener for a home, those listener coordinates are
+immutable: a later dispatch with changed coordinates fails loudly until the
+daemon restarts instead of silently reusing a stale endpoint. Foreground
+dispatch refuses `remote` because it has no daemon-owned lifecycle, ledger, or
+reaper.
+
+When `[credentials].model_gateway = true`, a remote shell job receives the
+non-secret route in `GITMOOT_CREDENTIAL_GATEWAY_URL` and a path to an owner-only
+curl configuration in `GITMOOT_CREDENTIAL_GATEWAY_CURL_CONFIG` for the
+sandbox-reachable credential gateway. The second listener requires a per-job
+mTLS certificate and an opaque
+capability bound to the sandbox id, the `shell` runtime, the job lease expiry,
+and the exact upstream allowlist. Provider keys remain host-side and are loaded
+only after those checks pass. The route is revoked before sandbox teardown.
+Before release, the host refuses an initial residual `Content-Encoding` or an
+unexpected HTTP/2 response. It drops response field names containing the key,
+redacts key bytes from remaining field values, and incrementally filters body
+bytes with bounded carry-over so matches split across transport chunks are
+removed without delaying streamed responses until EOF. Standard reversible
+URL/base encodings remain best-effort defense in depth. The contract covers an
+accidental exact-byte reflection by the trusted, operator-selected upstream;
+malicious upstreams and transformed application payloads, including
+application-layer compression without `Content-Encoding`, are out of scope.
+Claude, Codex, Kimi, and omp remain unsupported on `remote` until their clients
+can target this mTLS path; Gitmoot never supplies a raw key as a fallback.
 
 A job payload's `exec_backend` field overrides the config value for that one
 job. When either selector is explicitly present its value must be non-blank;
