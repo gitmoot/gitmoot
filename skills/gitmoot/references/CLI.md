@@ -1668,6 +1668,16 @@ code-level marker to migrate. The note and a `pending` wake outbox row commit
 atomically. With an opt-in `reply` rule, a daemon tick wakes the addressed role
 through its configured Herdr pane.
 
+`gitmoot org message send --to <role> --workflow <label> [--org-role
+<from-role>] [--repo <owner/repo>] [--json] "<message>"` records a durable
+sender-attributed heads-up between two distinct configured roles. The roles may
+message each other if and only if their non-empty `parent` values are equal.
+Repository scope does not grant this channel, and `owner` has no special case.
+The typed note
+`[org:message to=<to> from=<from> wf=<workflow>] <message>` and its addressed
+`reply:<role>` wake row commit atomically. Messages create no directive,
+acknowledgment, completion, TTL, or nag obligation.
+
 `gitmoot org escalate resolve <escalation-note-id> [--by <role>] [--note
 <answer-note-id>] [--home <dir>]` appends a typed resolution marker to the same
 workflow journal. `--by` defaults to the escalation's target role, and `--note`
