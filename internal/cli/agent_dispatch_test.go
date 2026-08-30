@@ -249,6 +249,11 @@ func newCLIReviewLoopFixture(t *testing.T) cliReviewLoopFixture {
 
 func seedCLIReviewLoopVerdict(t *testing.T, store *db.Store, id, head, decision string) {
 	t.Helper()
+	seedCLIReviewLoopVerdictForAgent(t, store, "reviewer", id, head, decision)
+}
+
+func seedCLIReviewLoopVerdictForAgent(t *testing.T, store *db.Store, agent, id, head, decision string) {
+	t.Helper()
 	payload, err := json.Marshal(workflow.JobPayload{
 		Repo: "owner/repo", Branch: "main", PullRequest: 227, HeadSHA: head,
 		TaskID: "review-pr-227", ReviewRound: "review-1",
@@ -258,7 +263,7 @@ func seedCLIReviewLoopVerdict(t *testing.T, store *db.Store, id, head, decision 
 		t.Fatalf("Marshal verdict: %v", err)
 	}
 	if err := store.CreateJobWithEvent(context.Background(), db.Job{
-		ID: id, Agent: "reviewer", Type: "review", State: string(workflow.JobSucceeded), Payload: string(payload),
+		ID: id, Agent: agent, Type: "review", State: string(workflow.JobSucceeded), Payload: string(payload),
 	}, db.JobEvent{Kind: string(workflow.JobSucceeded), Message: decision}); err != nil {
 		t.Fatalf("CreateJobWithEvent(%s): %v", id, err)
 	}
@@ -344,7 +349,7 @@ func TestCLIReviewLoopRefusesBothHeadResolutionBranches(t *testing.T) {
 func TestCLIReviewLoopUnresolvableReviewerFailsClosedBeforeIdentityGuard(t *testing.T) {
 	ctx := context.Background()
 	fixture := newCLIReviewLoopFixture(t)
-	seedCLIReviewLoopVerdict(t, fixture.store, "prior-review", "same-head", "approved")
+	seedCLIReviewLoopVerdictForAgent(t, fixture.store, "ghost-reviewer", "prior-review", "same-head", "approved")
 
 	family, resolved, err := workflow.ResolveRuntimeFamily(ctx, fixture.store, "ghost-reviewer", "")
 	if err != nil {
