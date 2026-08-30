@@ -1640,10 +1640,11 @@ manually with `set-scope` when observer delivery is intended.
 Every outbox row retains a queryable `pending`, `attempted`, `delivered`,
 `stalled`, `failed`, or `delivery_unknown` state, so never-attempted is not
 confused with success and outstanding rows contribute to daemon tick health.
-An owner/repo `--match` or `--repo` filter is case-insensitive and exact.
-Filters without a slash retain case-insensitive substring matching against the
-event repo and job id; omit either flag to match every event of that kind. Pass
-only one of `--match` and `--repo`. The wake role must exist and set
+Repository comparison for a slash-bearing owner/repo filter is
+case-insensitive and exact. Job IDs always use case-insensitive substring
+matching, including slash-bearing delegation IDs. Without a slash, repositories
+also use substring matching; omit either flag to match every event of that kind.
+Pass only one of `--match` and `--repo`. The wake role must exist and set
 `pane = "<herdr-pane>"`; Gitmoot resolves that value as an exact pane label first
 and otherwise treats it as a literal pane id.
 Delivery is verified with Herdr's `agent_prompted` versus

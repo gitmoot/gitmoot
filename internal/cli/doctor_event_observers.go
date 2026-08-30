@@ -76,10 +76,6 @@ func blockedWakeDirectedKinds() []string {
 	return []string{db.WakeOutboxKindBlocked}
 }
 
-func daemonTerminalWakeDirectedKinds() []string {
-	return []string{"job-terminal", db.WakeOutboxKindBlocked}
-}
-
 func engineTerminalWakeDirectedKinds() []string {
 	return []string{"job-terminal", eventRuleKindReviewVerdict, db.WakeOutboxKindBlocked}
 }

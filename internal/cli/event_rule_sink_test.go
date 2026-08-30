@@ -518,7 +518,7 @@ pane="w1:p4"
 				}); err != nil {
 					t.Fatal(err)
 				}
-				emitDaemonTerminalEvent(ctx, sink, store, "blocked-job", events.EventJobBlocked, string(workflow.JobBlocked), "blocked")
+				emitDaemonTerminalEvent(ctx, sink, store, "blocked-job", daemonTerminalBlocked, string(workflow.JobBlocked), "blocked")
 			} else {
 				sink.Emit(ctx, events.Event{Type: events.EventJobBlocked, Cause: "blocked_since", JobID: "blocked-task", Repo: test.repo})
 			}
@@ -601,6 +601,12 @@ func TestEventRuleMatchUsesExactRepositoryAndSubstringJobID(t *testing.T) {
 	for _, filter := range []string{"acme/w", "acme/widget-plus", "missing"} {
 		if eventRuleMatches(filter, event) {
 			t.Fatalf("filter %q unexpectedly matched", filter)
+		}
+	}
+	delegated := events.Event{Repo: "owner/repo", JobID: "root/delegation/check"}
+	for _, filter := range []string{"root/delegation/check", "delegation/check"} {
+		if !eventRuleMatches(filter, delegated) {
+			t.Fatalf("slash-bearing job-id filter %q did not match %q", filter, delegated.JobID)
 		}
 	}
 	prefixCollision := events.Event{Repo: "acme/widget-plus", JobID: "other"}

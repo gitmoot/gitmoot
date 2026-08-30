@@ -10,7 +10,6 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -58,8 +57,8 @@ func (w jobWorker) afterQueuedJobTransition(ctx context.Context, jobID string, s
 		// nil-safe when [events] is OFF. The subsequent finalizePreflightDelegationChild
 		// only attaches a synthetic result via savePayload (no further transition),
 		// so it does not double-emit.
-		if eventType, ok := daemonTerminalEventType(state); ok {
-			emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, eventType, string(state), cause.Error())
+		if eventKind, ok := daemonTerminalEventKind(state); ok {
+			emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, eventKind, string(state), cause.Error())
 		}
 	}
 	// A delegation child that fails in ANY pre-flight step (checkout/branch-lock
@@ -173,7 +172,7 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, observed
 				// Mailbox.finishWithPayload chokepoint), so emit job.blocked exactly
 				// once here. The following finalizePreflightDelegationChild only attaches
 				// a synthetic result (savePayload, no transition), so it never re-emits.
-				emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, events.EventJobBlocked, string(workflow.JobBlocked), agentPermissionBlockedMessage, "permission_guard")
+				emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, daemonTerminalPermissionGuard, string(workflow.JobBlocked), agentPermissionBlockedMessage)
 				// A WRITABLE implement DELEGATION child whose runtime fails MID-RUN
 				// with a permission error (read-only FS / sandbox denies write) is
 				// transitioned JobRunning->JobBlocked here and returns early — it never
@@ -530,7 +529,7 @@ func (w jobWorker) settleBlockedAdvancement(ctx context.Context, jobID string, o
 		return err
 	}
 	if transitioned {
-		emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, events.EventJobBlocked, string(workflow.JobBlocked), message, "advance_blocked")
+		emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, daemonTerminalAdvanceBlocked, string(workflow.JobBlocked), message)
 		return nil
 	}
 	latest, err = w.Store.GetJob(ctx, jobID)

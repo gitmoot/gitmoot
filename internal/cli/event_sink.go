@@ -172,18 +172,73 @@ func resolveConfigFile(home string) string {
 	return cfg
 }
 
-// daemonTerminalEventType maps a daemon-owned terminal JobState to the outbound
-// event_type (#446). Only failed/blocked map (the succeeded path is engine-owned
-// via the Mailbox chokepoint); any other state returns ok=false.
-func daemonTerminalEventType(state workflow.JobState) (events.EventType, bool) {
+type daemonTerminalEmissionKind uint8
+
+const (
+	daemonTerminalFailed daemonTerminalEmissionKind = iota
+	daemonTerminalBlocked
+	daemonTerminalPermissionGuard
+	daemonTerminalAdvanceBlocked
+	daemonTerminalDeferred
+	daemonTerminalEmissionKindCount
+)
+
+type daemonTerminalEventSpec struct {
+	eventType events.EventType
+	cause     string
+}
+
+func (kind daemonTerminalEmissionKind) spec() (daemonTerminalEventSpec, bool) {
+	switch kind {
+	case daemonTerminalFailed:
+		return daemonTerminalEventSpec{eventType: events.EventJobFailed}, true
+	case daemonTerminalBlocked:
+		return daemonTerminalEventSpec{eventType: events.EventJobBlocked}, true
+	case daemonTerminalPermissionGuard:
+		return daemonTerminalEventSpec{eventType: events.EventJobBlocked, cause: "permission_guard"}, true
+	case daemonTerminalAdvanceBlocked:
+		return daemonTerminalEventSpec{eventType: events.EventJobBlocked, cause: "advance_blocked"}, true
+	case daemonTerminalDeferred:
+		return daemonTerminalEventSpec{eventType: events.EventJobDeferred}, true
+	default:
+		return daemonTerminalEventSpec{}, false
+	}
+}
+
+// daemonTerminalEventKind maps daemon-owned terminal job states onto the
+// emission kinds accepted by emitDaemonTerminalEvent. Succeeded jobs remain
+// engine-owned.
+func daemonTerminalEventKind(state workflow.JobState) (daemonTerminalEmissionKind, bool) {
 	switch state {
 	case workflow.JobFailed:
-		return events.EventJobFailed, true
+		return daemonTerminalFailed, true
 	case workflow.JobBlocked:
-		return events.EventJobBlocked, true
+		return daemonTerminalBlocked, true
 	default:
-		return "", false
+		return 0, false
 	}
+}
+
+// daemonTerminalWakeDirectedKinds derives doctor coverage from every emission
+// kind the producer accepts. The count sentinel makes additions enter this loop,
+// while spec and per-kind doctor tests reject unmapped or uncovered kinds.
+func daemonTerminalWakeDirectedKinds() []string {
+	seen := make(map[string]struct{})
+	var kinds []string
+	for emission := daemonTerminalEmissionKind(0); emission < daemonTerminalEmissionKindCount; emission++ {
+		spec, ok := emission.spec()
+		if !ok {
+			continue
+		}
+		for _, kind := range classifyEventRuleKinds(events.Event{Type: spec.eventType, Cause: spec.cause}) {
+			if _, exists := seen[kind]; exists {
+				continue
+			}
+			seen[kind] = struct{}{}
+			kinds = append(kinds, kind)
+		}
+	}
+	return kinds
 }
 
 // emitDaemonTerminalEvent emits a best-effort terminal event for a job the
@@ -194,8 +249,9 @@ func daemonTerminalEventType(state workflow.JobState) (events.EventType, bool) {
 // resolves root_id from the payload (falling back to the job id). It must only be
 // called on a GENUINE transition so the engine and daemon never double-emit for
 // the same terminal state.
-func emitDaemonTerminalEvent(ctx context.Context, sink events.Sink, store *db.Store, jobID string, eventType events.EventType, status, detail string, cause ...string) {
-	if sink == nil {
+func emitDaemonTerminalEvent(ctx context.Context, sink events.Sink, store *db.Store, jobID string, emission daemonTerminalEmissionKind, status, detail string) {
+	spec, ok := emission.spec()
+	if sink == nil || !ok {
 		return
 	}
 	repo := ""
@@ -213,7 +269,7 @@ func emitDaemonTerminalEvent(ctx context.Context, sink events.Sink, store *db.St
 		}
 	}
 	event := events.NewEvent(
-		eventType,
+		spec.eventType,
 		jobID,
 		rootID,
 		repo,
@@ -222,8 +278,8 @@ func emitDaemonTerminalEvent(ctx context.Context, sink events.Sink, store *db.St
 		time.Time{},
 		workflow.RedactCommentText,
 	)
-	if len(cause) > 0 {
-		event.Cause = strings.TrimSpace(cause[0])
+	if spec.cause != "" {
+		event.Cause = spec.cause
 	}
 	if wakeTargetRole != "" {
 		event.WakeTargetRole = wakeTargetRole

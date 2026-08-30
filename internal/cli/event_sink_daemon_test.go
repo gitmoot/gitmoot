@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -128,6 +129,38 @@ func TestFinishQueuedJobEmitsJobBlocked(t *testing.T) {
 		t.Fatalf("job.blocked emissions = %d, want 1", len(got))
 	} else if got[0].WakeTargetRole != "gmc-gate" {
 		t.Fatalf("job.blocked wake target = %q, want recorded role gmc-gate", got[0].WakeTargetRole)
+	}
+}
+
+func TestDaemonTerminalEmissionKindsDriveObserverCoverage(t *testing.T) {
+	tests := []struct {
+		name     string
+		emission daemonTerminalEmissionKind
+		want     []string
+	}{
+		{name: "failed", emission: daemonTerminalFailed, want: []string{"job-terminal"}},
+		{name: "blocked", emission: daemonTerminalBlocked, want: []string{"job-terminal", "blocked"}},
+		{name: "permission guard", emission: daemonTerminalPermissionGuard, want: []string{"guard"}},
+		{name: "advance blocked", emission: daemonTerminalAdvanceBlocked},
+		{name: "deferred", emission: daemonTerminalDeferred},
+	}
+	if len(tests) != int(daemonTerminalEmissionKindCount) {
+		t.Fatalf("emission cases = %d, want %d", len(tests), daemonTerminalEmissionKindCount)
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			spec, ok := test.emission.spec()
+			if !ok {
+				t.Fatalf("emission %d has no event specification", test.emission)
+			}
+			got := classifyEventRuleKinds(events.Event{Type: spec.eventType, Cause: spec.cause})
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("classified kinds = %v, want %v", got, test.want)
+			}
+		})
+	}
+	if got, want := daemonTerminalWakeDirectedKinds(), []string{"job-terminal", "blocked", "guard"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("derived directed kinds = %v, want %v", got, want)
 	}
 }
 

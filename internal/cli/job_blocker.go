@@ -14,7 +14,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -526,7 +525,7 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 		// terminal-set transition for this run — the [events] stream sees the deferral
 		// directly, with no preceding failed→deferred flap. Best-effort and nil-safe
 		// when [events] is OFF, mirroring the daemon's other emits.
-		emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, events.EventJobDeferred, string(workflow.JobQueued), message)
+		emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, daemonTerminalDeferred, string(workflow.JobQueued), message)
 	}
 	return transitioned, nil
 }

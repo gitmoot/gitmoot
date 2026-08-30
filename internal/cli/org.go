@@ -1819,11 +1819,11 @@ func runOrgEventRuleAdd(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	onKind := fs.String("on", "", "event kind: escalation, attention, guard, job-terminal, review-verdict, blocked, recycle-overdue, pane_input_pending, reply, directive, or fact")
-	// A slash identifies an owner/repo filter and is matched exactly. Filters
-	// without a slash retain case-insensitive substring matching against repo and
-	// job id; an empty filter matches every event of the selected kind.
-	match := fs.String("match", "", "exact owner/repo when the filter contains '/', otherwise a case-insensitive repo or job-id substring; empty matches all")
-	repo := fs.String("repo", "", "repository filter; owner/name is exact, other values are case-insensitive substrings")
+	// A slash makes the repository comparison exact while job IDs always retain
+	// case-insensitive substring matching. Without a slash, repositories also use
+	// substring matching. An empty filter matches every event of the selected kind.
+	match := fs.String("match", "", "slash filters match owner/repo exactly and job IDs by substring; other filters use repo or job-ID substrings; empty matches all")
+	repo := fs.String("repo", "", "repository alias; owner/name is exact against repo while job-ID substring matching remains active")
 	wake := fs.String("wake", "", "organization role to wake")
 	scopeFlag := fs.String("scope", string(db.EventRuleScopeAddressed), "rule scope: addressed or observer")
 	if err := fs.Parse(args); err != nil {

@@ -204,9 +204,10 @@ manually with `set-scope` when observer delivery is intended.
 Kinds are `escalation`, `attention`, `guard`, `job-terminal`,
 `review-verdict`, `blocked`, `recycle-overdue`, `pane_input_pending`, `reply`,
 `directive`, and `fact`.
-An owner/repo `--match` or `--repo` filter is case-insensitive and exact.
-Filters without a slash retain case-insensitive substring matching against the
-event repo and job id; empty matches all. Pass only one of `--match` and
+Repository comparison for a slash-bearing owner/repo filter is
+case-insensitive and exact. Job IDs always use case-insensitive substring
+matching, including slash-bearing delegation IDs. Without a slash, repositories
+also use substring matching; empty matches all. Pass only one of `--match` and
 `--repo`. A successful review terminal whose decision is `approved` or
 `changes_requested` matches both `job-terminal` and `review-verdict` and
 addresses the pull request owner's role. If no role can be resolved, addressed

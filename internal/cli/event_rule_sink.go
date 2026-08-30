@@ -477,11 +477,12 @@ func eventRuleMatches(filter string, event events.Event) bool {
 	if filter == "" {
 		return true
 	}
+	repo := strings.ToLower(strings.TrimSpace(event.Repo))
+	jobID := strings.ToLower(event.JobID)
 	if strings.Contains(filter, "/") {
-		return strings.EqualFold(strings.TrimSpace(event.Repo), filter)
+		return repo == filter || strings.Contains(jobID, filter)
 	}
-	return strings.Contains(strings.ToLower(event.Repo), filter) ||
-		strings.Contains(strings.ToLower(event.JobID), filter)
+	return strings.Contains(repo, filter) || strings.Contains(jobID, filter)
 }
 
 func eventRuleWakePrompt(kind string, event events.Event) string {
