@@ -1,6 +1,7 @@
 package credgw
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -241,6 +242,126 @@ func TestRemoteProxyRedactsTransformedCredentialRepresentations(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRemoteProxyDecodesGzipBeforeCredentialRedaction(t *testing.T) {
+	const visibleSentinel = "visible-gzip-positive-control"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			t.Errorf("host transport Accept-Encoding = %q, want gzip", r.Header.Get("Accept-Encoding"))
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		compressed := gzip.NewWriter(w)
+		_, _ = io.WriteString(compressed, visibleSentinel+":"+testRealCredential)
+		_ = compressed.Close()
+	}))
+	defer upstream.Close()
+
+	gateway, material := newRemoteProxyTestLease(t, upstream.URL, "gzip-response")
+	defer gateway.Close(context.Background())
+	request, _ := http.NewRequest(http.MethodGet, material.URL, nil)
+	request.Header.Set(CapabilityHeader, material.Capability)
+	request.Header.Set("Authorization", "Bearer "+material.Placeholder)
+	request.Header.Set("Accept-Encoding", "gzip")
+	response, err := remoteMaterialClient(t, material).Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || response.Header.Get("Content-Encoding") != "" {
+		t.Fatalf("gateway response status=%d encoding=%q", response.StatusCode, response.Header.Get("Content-Encoding"))
+	}
+	if !strings.Contains(string(body), visibleSentinel) || strings.Contains(string(body), testRealCredential) || !strings.Contains(string(body), "[REDACTED]") {
+		t.Fatalf("decoded response redaction failed, body length %d", len(body))
+	}
+}
+
+func TestRemoteProxyRejectsUnsupportedContentEncoding(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Encoding", "br")
+		_, _ = io.WriteString(w, "encoded-positive-control:"+testRealCredential)
+	}))
+	defer upstream.Close()
+
+	gateway, material := newRemoteProxyTestLease(t, upstream.URL, "unsupported-response")
+	defer gateway.Close(context.Background())
+	request, _ := http.NewRequest(http.MethodGet, material.URL, nil)
+	request.Header.Set(CapabilityHeader, material.Capability)
+	request.Header.Set("Authorization", "Bearer "+material.Placeholder)
+	response, err := remoteMaterialClient(t, material).Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusBadGateway || strings.Contains(string(body), testRealCredential) || strings.Contains(string(body), "encoded-positive-control") {
+		t.Fatalf("unsupported encoding status=%d body length=%d", response.StatusCode, len(body))
+	}
+}
+
+func TestRegistryRemoteGatewayRejectsChangedCoordinates(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		change func(RemoteListenerOptions) RemoteListenerOptions
+	}{
+		{name: "listen address", change: func(options RemoteListenerOptions) RemoteListenerOptions {
+			options.ListenAddress = "127.0.0.1:1"
+			return options
+		}},
+		{name: "advertise URL", change: func(options RemoteListenerOptions) RemoteListenerOptions {
+			options.AdvertiseURL = "https://replacement.example:9443"
+			return options
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registry := NewRegistry()
+			home := t.TempDir()
+			options := RemoteListenerOptions{ListenAddress: "127.0.0.1:0", AdvertiseURL: "https://initial.example:8443"}
+			gateway, err := registry.RemoteGateway(home, nil, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer gateway.Close(context.Background())
+			reused, err := registry.RemoteGateway(home, nil, options)
+			if err != nil || reused != gateway {
+				t.Fatalf("identical options reuse gateway=%v err=%v", reused == gateway, err)
+			}
+			if stale, err := registry.RemoteGateway(home, nil, test.change(options)); err == nil || stale != nil || !strings.Contains(err.Error(), "configuration changed") {
+				t.Fatalf("changed options gateway=%v error=%v", stale != nil, err)
+			}
+		})
+	}
+}
+
+func newRemoteProxyTestLease(t *testing.T, upstreamURL, jobID string) (*Gateway, RemoteMaterial) {
+	t.Helper()
+	gateway, err := Start(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.EnableRemote(RemoteListenerOptions{ListenAddress: "127.0.0.1:0"}); err != nil {
+		_ = gateway.Close(context.Background())
+		t.Fatal(err)
+	}
+	lease, err := gateway.RegisterProxy(jobID, ProxyPolicy{
+		Upstream: upstreamURL, AuthKind: ProxyAuthResolved, AllowLoopbackHTTP: true,
+		SandboxID: "sandbox-" + jobID, Runtime: "shell", ExpiresAt: time.Now().Add(time.Minute),
+		AllowedHosts: []string{"127.0.0.1"},
+	}, func(context.Context) (ResolvedCredential, error) {
+		return ResolvedCredential{Value: testRealCredential, Upstream: upstreamURL, AuthKind: ProxyAuthBearer}, nil
+	})
+	if err != nil {
+		_ = gateway.Close(context.Background())
+		t.Fatal(err)
+	}
+	return gateway, lease.RemoteMaterial()
 }
 
 func alternateCredentialCase(value string) string {

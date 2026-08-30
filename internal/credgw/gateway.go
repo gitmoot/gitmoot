@@ -109,6 +109,7 @@ type Gateway struct {
 	remoteServer   *http.Server
 	remoteURL      string
 	remoteCA       *certificateAuthority
+	remoteOptions  RemoteListenerOptions
 	client         *http.Client
 	logf           LogFunc
 
@@ -466,6 +467,10 @@ func (g *Gateway) serveProxyRequest(w http.ResponseWriter, r *http.Request, acce
 	removeHopHeaders(outbound.Header)
 	removeCredentialHeaders(outbound.Header, registered.policy.Header)
 	outbound.Header.Del(CapabilityHeader)
+	// Let the host transport negotiate and transparently decode gzip. A
+	// sandbox-supplied Accept-Encoding would otherwise leave compressed bytes
+	// opaque to the credential redactor and recoverable after forwarding.
+	outbound.Header.Del("Accept-Encoding")
 	switch resolved.AuthKind {
 	case ProxyAuthBearer:
 		outbound.Header.Set("Authorization", "Bearer "+resolved.Value)
@@ -481,6 +486,11 @@ func (g *Gateway) serveProxyRequest(w http.ResponseWriter, r *http.Request, acce
 	}
 	defer response.Body.Close()
 	removeHopHeaders(response.Header)
+	if len(response.Header.Values("Content-Encoding")) != 0 {
+		http.Error(w, "upstream response encoding refused", http.StatusBadGateway)
+		g.writeLog(r.Method, registered.upstream.Hostname(), http.StatusBadGateway, registered.jobID)
+		return
+	}
 	copyRedactedHeader(w.Header(), response.Header, resolved.Value)
 	w.WriteHeader(response.StatusCode)
 	streamRedactedResponse(w, response.Body, resolved.Value)
@@ -1074,7 +1084,10 @@ func (r *Registry) RemoteGateway(home string, logf LogFunc, options RemoteListen
 		}
 		r.gateways[key] = gateway
 	}
-	if gateway.RemoteURL() != "" {
+	if configured, err := gateway.remoteConfiguredFor(options); configured {
+		if err != nil {
+			return nil, err
+		}
 		return gateway, nil
 	}
 	if err := gateway.EnableRemote(options); err != nil {

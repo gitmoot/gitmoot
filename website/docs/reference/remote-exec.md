@@ -68,9 +68,12 @@ instances whose recorded owner process is gone. A partially-created non-empty
 directory that Git never registered remains the known orphaned-but-present
 cleanup limitation tracked in #1572.
 
-Gitmoot reads `[remote_exec]` when it dispatches a job; it is not cached and
-needs no SIGHUP wiring. Foreground dispatch retains the host runner path because
-the lifecycle is acquired at the daemon job-worker boundary.
+Gitmoot reads `[remote_exec]` when it dispatches a job. Once the process starts
+a remote credential listener for a home, those listener coordinates are
+immutable: a later dispatch with changed coordinates fails loudly until the
+daemon restarts instead of silently reusing a stale endpoint. Foreground
+dispatch retains the host runner path because the lifecycle is acquired at the
+daemon job-worker boundary.
 
 When `[credentials].model_gateway = true`, a remote shell job receives the
 non-secret route in `GITMOOT_CREDENTIAL_GATEWAY_URL` and a path to an owner-only
@@ -80,8 +83,9 @@ mTLS certificate and an opaque
 capability bound to the sandbox id, the `shell` runtime, the job lease expiry,
 and the exact upstream allowlist. Provider keys remain host-side and are loaded
 only after those checks pass. The route is revoked before sandbox teardown.
-Provider response headers and streamed bodies filter the raw key, ASCII-case
-variants, and standard reversible URL/base encodings across chunk boundaries.
+Provider response headers and streamed bodies are decoded before filtering the
+raw key, ASCII-case variants, and standard reversible URL/base encodings across
+chunk boundaries. Unsupported content encodings fail closed.
 Claude, Codex, Kimi, and omp remain unsupported on `remote` until their clients
 can target this mTLS path; Gitmoot never supplies a raw key as a fallback.
 

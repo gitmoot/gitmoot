@@ -74,7 +74,8 @@ func (g *Gateway) EnableRemote(options RemoteListenerOptions) error {
 	if g == nil {
 		return errors.New("credential gateway is not running")
 	}
-	listenAddress := strings.TrimSpace(options.ListenAddress)
+	configuredOptions := normalizedRemoteListenerOptions(options)
+	listenAddress := configuredOptions.ListenAddress
 	if listenAddress == "" {
 		return errors.New("remote credential gateway listen address is required")
 	}
@@ -82,7 +83,7 @@ func (g *Gateway) EnableRemote(options RemoteListenerOptions) error {
 	if err != nil {
 		return fmt.Errorf("listen for remote credential gateway: %w", err)
 	}
-	advertiseURL, err := remoteAdvertiseURL(options.AdvertiseURL, listener.Addr())
+	advertiseURL, err := remoteAdvertiseURL(configuredOptions.AdvertiseURL, listener.Addr())
 	if err != nil {
 		_ = listener.Close()
 		return err
@@ -128,9 +129,35 @@ func (g *Gateway) EnableRemote(options RemoteListenerOptions) error {
 	g.remoteServer = server
 	g.remoteURL = advertiseURL.String()
 	g.remoteCA = ca
+	g.remoteOptions = configuredOptions
 	g.mu.Unlock()
 	go func() { _ = server.Serve(tlsListener) }()
 	return nil
+}
+
+func normalizedRemoteListenerOptions(options RemoteListenerOptions) RemoteListenerOptions {
+	return RemoteListenerOptions{
+		ListenAddress: strings.TrimSpace(options.ListenAddress),
+		AdvertiseURL:  strings.TrimSpace(options.AdvertiseURL),
+	}
+}
+
+// remoteConfiguredFor allows immutable listener reuse only when a later
+// dispatch requested the same coordinates. Rebinding would invalidate active
+// per-job certificates, so changed coordinates fail loudly until restart.
+func (g *Gateway) remoteConfiguredFor(options RemoteListenerOptions) (bool, error) {
+	if g == nil {
+		return false, errors.New("credential gateway is not running")
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if g.remoteServer == nil {
+		return false, nil
+	}
+	if g.remoteOptions != normalizedRemoteListenerOptions(options) {
+		return true, errors.New("remote credential gateway configuration changed; restart the daemon to apply listener coordinates")
+	}
+	return true, nil
 }
 
 func (g *Gateway) RemoteURL() string {

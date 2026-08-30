@@ -238,10 +238,11 @@ For remote shell jobs, the same opt-in can issue an ephemeral mTLS client
 identity and capability bound to the sandbox id, runtime, allowlist, and lease
 expiry. Only a curl-config path enters the environment; the upstream key is
 resolved on the host after authentication and never enters the sandbox.
-Response headers and streamed bodies pass through the same filter for the raw
-key, ASCII-case variants, and standard reversible URL/base encodings, including
-values split across transport chunks. Model runtimes remain refused remotely
-until they can present that identity.
+Response headers and streamed bodies are decoded before passing through the
+same filter for the raw key, ASCII-case variants, and standard reversible
+URL/base encodings, including values split across transport chunks. Unsupported
+content encodings fail closed. Model runtimes remain refused remotely until
+they can present that identity.
 
 ### Runtime ambient credential hygiene
 
