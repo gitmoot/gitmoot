@@ -109,10 +109,21 @@ func TestLoadReviewConfigRejectsBadBool(t *testing.T) {
 	}
 }
 
-func TestLoadReviewConfigRejectsBadBlockingSeverity(t *testing.T) {
-	_, err := LoadReviewConfig(writeReviewConfig(t, "[review]\nblocking_severity = \"P4\"\n"))
+func TestLoadReviewConfigRejectsBadBlockingSeverityWithoutDiscardingValidFields(t *testing.T) {
+	body := `[review]
+blocking_severity = "P4"
+native_fanout_enabled = true
+risk_tiers_enabled = true
+high_risk_paths = ["cmd/**"]
+`
+	cfg, err := LoadReviewConfig(writeReviewConfig(t, body))
 	if err == nil || !strings.Contains(err.Error(), "P0, P1, P2, P3") {
 		t.Fatalf("bad blocking severity error = %v, want canonical choices", err)
+	}
+	policy := cfg.For("owner/repo")
+	if policy.BlockingSeverity != reviewseverity.P3 || !policy.NativeFanoutEnabled || !policy.RiskTiersEnabled ||
+		len(policy.HighRiskPaths) != 1 || policy.HighRiskPaths[0] != "cmd/**" {
+		t.Fatalf("partial policy = %+v, want P3 with valid review fields retained", policy)
 	}
 }
 

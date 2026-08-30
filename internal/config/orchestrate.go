@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -550,7 +551,9 @@ func (c ReviewConfig) For(repo string) ReviewPolicy {
 
 // LoadReviewConfig parses [review] and [repos."owner/repo".review]. A missing
 // config file or section yields blocking severity P3, with native fanout and
-// risk tiers disabled.
+// risk tiers disabled. Invalid fields retain their safe defaults while valid
+// fields continue to load; the joined parse error still lets strict callers
+// reject the file.
 func LoadReviewConfig(paths Paths) (ReviewConfig, error) {
 	content, err := os.ReadFile(paths.ConfigFile)
 	if err != nil {
@@ -562,6 +565,7 @@ func LoadReviewConfig(paths Paths) (ReviewConfig, error) {
 	cfg := ReviewConfig{Global: DefaultReviewPolicy(), repos: map[string]reviewPolicyOverride{}}
 	var repo string
 	inSection := false
+	var parseErrors []error
 	for _, raw := range strings.Split(string(content), "\n") {
 		line := strings.TrimSpace(stripConfigComment(raw))
 		if line == "" {
@@ -588,17 +592,17 @@ func LoadReviewConfig(paths Paths) (ReviewConfig, error) {
 		value = strings.TrimSpace(value)
 		if repo == "" {
 			if err := applyReviewPolicyField(&cfg.Global, key, value); err != nil {
-				return ReviewConfig{}, fmt.Errorf("parse [review].%s: %w", key, err)
+				parseErrors = append(parseErrors, fmt.Errorf("parse [review].%s: %w", key, err))
 			}
 			continue
 		}
 		override := cfg.repos[repo]
 		if err := applyReviewPolicyOverrideField(&override, key, value); err != nil {
-			return ReviewConfig{}, fmt.Errorf("parse [repos.%q.review].%s: %w", repo, key, err)
+			parseErrors = append(parseErrors, fmt.Errorf("parse [repos.%q.review].%s: %w", repo, key, err))
 		}
 		cfg.repos[repo] = override
 	}
-	return cfg, nil
+	return cfg, errors.Join(parseErrors...)
 }
 
 func parseReviewSection(section string) (string, bool) {

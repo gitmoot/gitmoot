@@ -86,8 +86,8 @@ the path heuristics, and a high label wins a label tie.
 The lens outcomes are synthesized by the existing delegation `synthesis_rule =
 quorum` engine: **any blocking refutation fails the quorum and blocks the merge**;
 the configured quorum of effective approvals satisfies it. The resolved tier is
-`risk_tier_resolved` job event so an escalation is explainable in the report and
-dashboard.
+recorded as a `risk_tier_resolved` job event so an escalation is explainable in
+the report and dashboard.
 
 With `risk_tiers_enabled` off, PR review uses the single-reviewer path. The
 competition tier (two independent implementations plus a judge) is a planned

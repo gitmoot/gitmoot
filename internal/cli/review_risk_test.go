@@ -77,6 +77,30 @@ func TestApplyReviewPolicyEnabledFromConfig(t *testing.T) {
 	}
 }
 
+func TestApplyReviewPolicyInvalidSeverityRetainsValidSafetyPolicy(t *testing.T) {
+	home := t.TempDir()
+	root := config.PathsForHome(home).Home
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "[review]\nblocking_severity = \"critical\"\nnative_fanout_enabled = true\nrisk_tiers_enabled = true\nhigh_risk_paths = [\"cmd/**\"]\n"
+	if err := os.WriteFile(filepath.Join(root, config.ConfigName), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var engine workflow.Engine
+	applyReviewPolicy(&engine, root)
+
+	if !engine.RiskTiersEnabled || len(engine.HighRiskPaths) != 1 || engine.HighRiskPaths[0] != "cmd/**" {
+		t.Fatalf("invalid threshold discarded valid high-risk policy: enabled=%v paths=%v", engine.RiskTiersEnabled, engine.HighRiskPaths)
+	}
+	if engine.NativeReviewFanoutEnabled == nil || !engine.NativeReviewFanoutEnabled("owner/repo") {
+		t.Fatal("invalid threshold discarded valid native fanout policy")
+	}
+	if engine.ReviewBlockingSeverity == nil || engine.ReviewBlockingSeverity("owner/repo") != reviewseverity.P3 {
+		t.Fatal("invalid threshold must fail closed to P3")
+	}
+}
+
 func TestApplyReviewPolicyEmptyHomeIsOff(t *testing.T) {
 	var engine workflow.Engine
 	applyReviewPolicy(&engine, "")

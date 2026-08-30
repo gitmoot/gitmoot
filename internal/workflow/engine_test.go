@@ -1446,6 +1446,12 @@ func TestEngineAdvanceReviewSubthresholdApprovesWithNotes(t *testing.T) {
 	if len(gate.requests) != 1 || gate.requests[0].ReviewBlockingSeverity != reviewseverity.P1 {
 		t.Fatalf("merge gate requests = %+v, want threshold P1", gate.requests)
 	}
+	if err := engine.AdvanceJob(ctx, "review-notes"); err != nil {
+		t.Fatalf("replayed AdvanceJob returned error: %v", err)
+	}
+	if len(gate.requests) != 1 {
+		t.Fatalf("replayed approved-with-notes review evaluated merge gate %d times, want 1", len(gate.requests))
+	}
 	stored := mustJob(t, store, "review-notes")
 	payload, err := ParseJobPayload(stored.Payload)
 	if err != nil {
@@ -1455,12 +1461,73 @@ func TestEngineAdvanceReviewSubthresholdApprovesWithNotes(t *testing.T) {
 		len(payload.Result.Findings) != 1 || string(payload.Result.Findings[0]) != string(finding) {
 		t.Fatalf("stored result was rewritten or findings lost: %+v", payload.Result)
 	}
-	events, err := store.ListJobEvents(ctx, "review-notes")
-	if err != nil {
-		t.Fatalf("ListJobEvents returned error: %v", err)
+	if got := countJobEvents(t, store, "review-notes", reviewApprovedWithNotesEventKind); got != 1 {
+		t.Fatalf("%s events = %d, want 1", reviewApprovedWithNotesEventKind, got)
 	}
-	if !hasEventKind(events, reviewApprovedWithNotesEventKind) {
-		t.Fatalf("events = %+v, want %s", events, reviewApprovedWithNotesEventKind)
+}
+
+func TestAllRequiredReviewersApprovedCountsSubthresholdReview(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+	insertCompletedJob(t, store, db.Job{ID: "review-audit", Agent: "audit", Type: "review"}, JobPayload{
+		Repo:        "mobile/app",
+		PullRequest: 8,
+		TaskID:      "task-8",
+		ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "changes_requested",
+			Severity: reviewseverity.P2,
+			Summary:  "non-blocking audit note",
+		},
+	})
+	payload := JobPayload{
+		Repo:        "mobile/app",
+		PullRequest: 8,
+		TaskID:      "task-8",
+		ReviewRound: "review-1",
+		Reviewers:   []string{"audit", "security"},
+	}
+
+	approved, err := engine.allRequiredReviewersApproved(ctx, "security", payload)
+	if err != nil {
+		t.Fatalf("allRequiredReviewersApproved returned error: %v", err)
+	}
+	if !approved {
+		t.Fatal("sub-threshold audit review must count toward required-reviewer approval")
+	}
+}
+
+func TestEngineAdvanceReviewSubthresholdEventIsIdempotentAfterMergeError(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+	gate := &fakeMergeGate{err: errors.New("temporary merge gate failure")}
+	engine.MergeGate = gate
+	insertCompletedJob(t, store, db.Job{ID: "review-notes-retry", Agent: "audit", Type: "review"}, JobPayload{
+		Repo:        "mobile/app",
+		Branch:      "task-9",
+		PullRequest: 9,
+		TaskID:      "task-9",
+		Result: &AgentResult{
+			Decision: "changes_requested",
+			Severity: reviewseverity.P2,
+			Summary:  "non-blocking retry note",
+		},
+	})
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := engine.AdvanceJob(ctx, "review-notes-retry"); err == nil || !strings.Contains(err.Error(), "temporary merge gate failure") {
+			t.Fatalf("AdvanceJob attempt %d error = %v, want temporary merge gate failure", attempt, err)
+		}
+	}
+	if len(gate.requests) != 2 {
+		t.Fatalf("merge gate requests = %d, want 2 retry attempts", len(gate.requests))
+	}
+	if got := countJobEvents(t, store, "review-notes-retry", reviewApprovedWithNotesEventKind); got != 1 {
+		t.Fatalf("%s events = %d, want 1 across retries", reviewApprovedWithNotesEventKind, got)
 	}
 }
 
@@ -5116,6 +5183,7 @@ func (f fakeImplementationFinalizer) FinalizeImplementation(context.Context, db.
 type fakeMergeGate struct {
 	decision   MergeDecision
 	onEvaluate func(MergeRequest)
+	err        error
 	requests   []MergeRequest
 }
 
@@ -5124,7 +5192,7 @@ func (f *fakeMergeGate) Evaluate(_ context.Context, request MergeRequest) (Merge
 	if f.onEvaluate != nil {
 		f.onEvaluate(request)
 	}
-	return f.decision, nil
+	return f.decision, f.err
 }
 
 // TestCanonicalDelegationSetHashStableUnderReorder pins the order-independence and

@@ -460,6 +460,36 @@ func TestPolicyMergeGateTreatsSubthresholdReviewAsIndependentApproval(t *testing
 	}
 }
 
+func TestPolicyMergeGateTreatsHeadlessSubthresholdReviewAsApproval(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: "sol", Type: "implement"}, JobPayload{
+		Repo: "mobile/app", PullRequest: 9, HeadSHA: "head123", TaskID: "task-9",
+		Result: &AgentResult{Decision: "implemented", Summary: "implemented"},
+	})
+	insertCompletedJob(t, store, db.Job{ID: "review-integration-notes", Agent: "audit", Type: "review"}, JobPayload{
+		Repo:         "mobile/app",
+		PullRequest:  9,
+		TaskID:       "task-9",
+		ReviewRound:  "review-1",
+		DelegationID: "integration-review",
+		WorktreePath: "/tmp/integration-review",
+		Result: &AgentResult{
+			Decision: "changes_requested",
+			Severity: reviewseverity.P2,
+			Summary:  "headless integration notes",
+		},
+	})
+
+	err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
+		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "audit",
+		ReviewBlockingSeverity: reviewseverity.P1,
+	}, "head123")
+	if err != nil {
+		t.Fatalf("headless sub-threshold ensureFinalReviewCaptured returned error: %v", err)
+	}
+}
+
 func TestPolicyMergeGateChecksAuthorshipForSubthresholdApproval(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

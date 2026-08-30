@@ -811,7 +811,8 @@ evidence}` in `gitmoot_result.findings`. The lenses are synthesized by the
 existing delegation `synthesis_rule = quorum` engine: **any blocking refutation
 fails the quorum and blocks the merge**; the configured quorum of effective
 approvals satisfies it. The resolved tier is recorded as a
-escalation is explainable in the report/dashboard. With `risk_tiers_enabled`
+`risk_tier_resolved` job event so an escalation is explainable in the
+report/dashboard. With `risk_tiers_enabled`
 off, PR review uses the single-reviewer path. The competition tier (two
 implementations + a judge) is a planned follow-up.
 
