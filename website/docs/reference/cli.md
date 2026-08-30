@@ -1429,15 +1429,25 @@ at enqueue.
 `enforce = "block"` is the default; `"warn"` allows the job and records an
 `org_scope_violation` event. Merge rules are advisory in this phase.
 
-`gitmoot org seat add <name> --pane <label> [--home DIR]` claims the one live
-Herdr pane with that exact label, writes or repairs the role's `pane` binding,
-and installs addressed `reply`, `blocked`, `directive`, and `escalation` routes with stable
+`gitmoot org seat add <name> --pane <label> [--parent ROLE] [--scope REPO,...]
+[--merge-rule owner|self|none] [--home DIR]` claims the one live Herdr pane
+with that exact label, writes or repairs the role's `pane` binding, and installs
+addressed `reply`, `blocked`, `directive`, and `escalation` routes with stable
 IDs `org-seat-<name>-<kind>`. Duplicate labels hard-fail instead of choosing a
-pane. New child seats inherit the `owner` role's scope and parent; an empty
-registry must add `owner` first. Re-running the command repairs missing owned
-pieces without duplicating routes. It finishes by running the same reality
-validation as `org validate`, so success includes a green live-pane and route
-verdict rather than only confirming that config parsed.
+pane.
+
+For a new non-owner seat, the acting role comes from `GITMOOT_ORG_ROLE` and
+falls back to `owner` only when the variable is unset. The new seat inherits
+that role as its parent and copies its scope. `--parent` must name an existing
+role and cannot create a cycle. An explicit `--scope` must stay within both the
+acting role's scope and the selected parent's scope. Merge authority defaults
+to empty; an explicit `--merge-rule` cannot exceed the acting role's authority.
+The empty-registry `owner` bootstrap keeps its `*` scope and `owner` merge rule.
+The three role flags initialize new seats only; re-running the command repairs
+missing owned pieces without rewriting existing role policy or duplicating
+routes. The command finishes with the same reality validation as `org validate`,
+so success includes a green live-pane and route verdict rather than only
+confirming that config parsed.
 
 `gitmoot org seat rm <name> [--home DIR]` resolves the role's live pane and
 checks every distinct Git checkout reported by that pane's `cwd` and
