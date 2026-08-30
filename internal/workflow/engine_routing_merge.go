@@ -82,6 +82,10 @@ func (e Engine) dispatchFix(ctx context.Context, reviewer string, payload JobPay
 	if err != nil {
 		return e.blockAutoFix(ctx, ref, err.Error())
 	}
+	branchOwner, err := e.fixBranchLockOwner(ctx, payload, leadAgent)
+	if err != nil {
+		return e.blockAutoFix(ctx, ref, fmt.Sprintf("auto-fix branch lock owner unresolved: %v", err))
+	}
 	request := JobRequest{
 		PolicyExempt:  "exempt",
 		Agent:         leadAgent,
@@ -107,7 +111,7 @@ func (e Engine) dispatchFix(ctx context.Context, reviewer string, payload JobPay
 	if request.ID == "" {
 		request.ID = e.jobID(request)
 	}
-	if err := e.ensureAgentAllowed(ctx, request, ref); err != nil {
+	if err := e.ensureAgentAllowedWithBranchOwner(ctx, request, branchOwner, ref, false); err != nil {
 		return err
 	}
 	// Fail closed at the dispatch site. Falling through here would enqueue the fix
@@ -166,6 +170,24 @@ func (e Engine) autoFixOwner(ctx context.Context, payload JobPayload) (string, e
 	default:
 		return "", fmt.Errorf("auto-fix ownership ambiguous: task %s has implementing agents [%s]", payload.TaskID, strings.Join(agents, " "))
 	}
+}
+
+// fixBranchLockOwner preserves the task's existing serialization owner while an
+// acting org role executes the isolated fix. The lock is never an ownership
+// source: it cannot change the agent selected by autoFixOwner.
+func (e Engine) fixBranchLockOwner(ctx context.Context, payload JobPayload, executionAgent string) (string, error) {
+	lock, err := e.Store.GetBranchLock(ctx, payload.Repo, payload.Branch)
+	if errors.Is(err, sql.ErrNoRows) {
+		return executionAgent, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	owner := strings.TrimSpace(lock.Owner)
+	if owner == "" {
+		return "", errors.New("existing branch lock has no owner")
+	}
+	return owner, nil
 }
 
 func (e Engine) blockAutoFix(ctx context.Context, ref taskRef, reason string) error {
@@ -435,6 +457,13 @@ func (e Engine) ensureJobExecutorAllowed(ctx context.Context, job db.Job, payloa
 	authorizationAgent := job.Agent
 	if job.Type == "implement" && payload.DelegationReason == "runtime_session_busy" && payload.DelegatedAgent == job.Agent && strings.TrimSpace(payload.OriginalAgent) != "" {
 		branchOwner = payload.OriginalAgent
+	}
+	if job.Type == "implement" && payload.FixWorktree {
+		fixOwner, err := e.fixBranchLockOwner(ctx, payload, branchOwner)
+		if err != nil {
+			return e.block(ctx, ref, fmt.Sprintf("auto-fix branch lock owner unresolved: %v", err))
+		}
+		branchOwner = fixOwner
 	}
 	if payload.DelegationReason == "runtime_session_busy" && payload.DelegatedAgent == job.Agent && strings.TrimSpace(payload.OriginalAgent) != "" {
 		authorizationAgent = payload.OriginalAgent

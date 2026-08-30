@@ -1327,7 +1327,7 @@ func TestEngineRunJobPreflightsPolicyBeforeDelivery(t *testing.T) {
 	assertTaskState(t, store, "task-7", TaskBlocked)
 }
 
-func TestEngineAdvanceReviewChangesRequestedDispatchesFix(t *testing.T) {
+func TestEngineAdvanceReviewChangesRequestedDispatchesActingRoleAcrossTaskOwnerLock(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedAgent(t, store, "owner-role", []string{"implement"}, "gitmoot/gitmoot")
@@ -1342,6 +1342,14 @@ func TestEngineAdvanceReviewChangesRequestedDispatchesFix(t *testing.T) {
 		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7",
 		Result: &AgentResult{Decision: "implemented"},
 	})
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName:  "gitmoot/gitmoot",
+		Branch:        "task-7",
+		Owner:         "task-owner",
+		ActingOrgRole: "owner-role",
+	}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
 	insertCompletedJob(t, store, db.Job{
 		ID:    "review-job",
 		Agent: "audit",
@@ -1373,6 +1381,16 @@ func TestEngineAdvanceReviewChangesRequestedDispatchesFix(t *testing.T) {
 	}
 	if !payload.FixWorktree || strings.TrimSpace(payload.WorktreePath) == "" {
 		t.Fatalf("fix job payload lacks per-job writable worktree: %+v", payload)
+	}
+	if err := engine.ensureJobExecutorAllowed(ctx, job, payload, taskRef{ID: "task-7"}); err != nil {
+		t.Fatalf("fix executor preflight rejected acting role across task-owner lock: %v", err)
+	}
+	lock, err := store.GetBranchLock(ctx, "gitmoot/gitmoot", "task-7")
+	if err != nil {
+		t.Fatalf("GetBranchLock: %v", err)
+	}
+	if lock.Owner != "task-owner" || lock.ActingOrgRole != "owner-role" {
+		t.Fatalf("branch lock = %+v, want task-owner serialization with owner-role attribution", lock)
 	}
 }
 
@@ -1563,6 +1581,13 @@ func TestEngineAdvanceReviewChangesRequestedUsesTaskImplementerWhenActingRoleAbs
 	store := openEngineStore(t)
 	seedAgent(t, store, "task-owner", []string{"implement"}, "gitmoot/gitmoot")
 	seedAgent(t, store, "wrong-default", []string{"implement"}, "gitmoot/gitmoot")
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName: "gitmoot/gitmoot",
+		Branch:       "task-7",
+		Owner:        "wrong-default",
+	}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
 	engine := testEngine(store)
 	insertCompletedJob(t, store, db.Job{
 		ID: "original-implement", Agent: "task-owner", Type: "implement",
@@ -1591,6 +1616,13 @@ func TestEngineAdvanceReviewChangesRequestedUsesTaskImplementerWhenActingRoleAbs
 	job := mustJob(t, store, "implement-task-owner-task-7")
 	if !strings.Contains(job.Payload, "fix manual review") {
 		t.Fatalf("fix job payload = %s", job.Payload)
+	}
+	payload, err := ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload: %v", err)
+	}
+	if err := engine.ensureJobExecutorAllowed(ctx, job, payload, taskRef{ID: "task-7"}); err != nil {
+		t.Fatalf("fix executor preflight routed ownership from branch lock: %v", err)
 	}
 	if _, err := store.GetJob(ctx, "implement-wrong-default-task-7"); err == nil {
 		t.Fatal("branch-lock or payload default received auto-fix ownership")
