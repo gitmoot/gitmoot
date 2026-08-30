@@ -54,11 +54,16 @@ type RuntimeContract struct {
 	Requirements []RuntimeRequirement
 }
 
-// RuntimeContractRequest carries only request-scoped axes that select adapter
-// argv requirements. It is deliberately not runtime.Job: constructing the job
-// delivered to an adapter remains the mailbox gate's single responsibility.
+// RuntimeContractRequest carries request-scoped axes used to evaluate adapter
+// requirements before delivery. It is deliberately not runtime.Job:
+// constructing the delivered job remains the mailbox gate's responsibility.
 type RuntimeContractRequest struct {
 	Plan bool
+	// EffectiveUIDKnown means the delivery target will run with EffectiveUID
+	// instead of the checker process identity. Only the resolved execution
+	// backend may set this override.
+	EffectiveUID      int
+	EffectiveUIDKnown bool
 }
 
 func (c RuntimeContract) clone() RuntimeContract {
@@ -162,7 +167,7 @@ func (c *RuntimeContractChecker) CheckRequest(ctx context.Context, agent Agent, 
 	if !ok {
 		return RuntimeContractResult{Runtime: agent.Runtime, Version: "unknown", State: RuntimeContractUnknown, Instrument: "runtime-registry"}
 	}
-	return c.check(ctx, meta, func(req RuntimeRequirement) bool { return requirementApplies(req, agent, request) })
+	return c.check(ctx, meta, request, func(req RuntimeRequirement) bool { return requirementApplies(req, agent, request) })
 }
 
 // Inspect evaluates a runtime's requirements for doctor. It deliberately SKIPS
@@ -184,7 +189,7 @@ func (c *RuntimeContractChecker) Inspect(ctx context.Context, runtimeName string
 	if !ok {
 		return RuntimeContractResult{Runtime: runtimeName, Version: "unknown", State: RuntimeContractUnknown, Instrument: "runtime-registry"}
 	}
-	return c.check(ctx, meta, func(req RuntimeRequirement) bool { return !req.PlanMode })
+	return c.check(ctx, meta, RuntimeContractRequest{}, func(req RuntimeRequirement) bool { return !req.PlanMode })
 }
 
 func (c *RuntimeContractChecker) registry() Registry {
@@ -194,7 +199,7 @@ func (c *RuntimeContractChecker) registry() Registry {
 	return c.Registry
 }
 
-func (c *RuntimeContractChecker) check(ctx context.Context, meta RuntimeMetadata, applies func(RuntimeRequirement) bool) RuntimeContractResult {
+func (c *RuntimeContractChecker) check(ctx context.Context, meta RuntimeMetadata, request RuntimeContractRequest, applies func(RuntimeRequirement) bool) RuntimeContractResult {
 	result := RuntimeContractResult{Runtime: meta.Name, Binary: meta.Contract.Binary, Version: "unknown", State: RuntimeContractSupported, Instrument: "declaration"}
 	var flagRequirements []RuntimeRequirement
 	for _, req := range meta.Contract.Requirements {
@@ -205,7 +210,7 @@ func (c *RuntimeContractChecker) check(ctx context.Context, meta RuntimeMetadata
 			flagRequirements = append(flagRequirements, req)
 			continue
 		}
-		rr := c.evaluatePrecondition(req)
+		rr := c.evaluatePrecondition(req, request)
 		result.Requirements = append(result.Requirements, rr)
 		mergeContractState(&result, rr)
 	}
@@ -237,17 +242,20 @@ func (c *RuntimeContractChecker) check(ctx context.Context, meta RuntimeMetadata
 	return result
 }
 
-func (c *RuntimeContractChecker) evaluatePrecondition(req RuntimeRequirement) RuntimeRequirementResult {
+func (c *RuntimeContractChecker) evaluatePrecondition(req RuntimeRequirement, request RuntimeContractRequest) RuntimeRequirementResult {
 	rr := RuntimeRequirementResult{Kind: req.Kind, Name: req.Name, Flag: req.Flag, Source: req.Source, Remedy: req.Remedy, Instrument: req.Instrument}
 	switch req.Kind {
 	case RuntimeRequirementNonRootEUID:
-		lookup := c.EffectiveUID
-		if lookup == nil {
-			rr.State = RuntimeContractUnknown
-			rr.Detail = "effective uid is unavailable"
-			return rr
+		euid, known := request.EffectiveUID, request.EffectiveUIDKnown
+		if !known {
+			lookup := c.EffectiveUID
+			if lookup == nil {
+				rr.State = RuntimeContractUnknown
+				rr.Detail = "effective uid is unavailable"
+				return rr
+			}
+			euid, known = lookup()
 		}
-		euid, known := lookup()
 		if !known {
 			rr.State = RuntimeContractUnknown
 			rr.Detail = "effective uid is unavailable"

@@ -1037,6 +1037,16 @@ func (w jobWorker) runtimeContractPreflight(ctx context.Context, backend execbac
 	if w.RuntimePreflight == nil {
 		return runtime.RuntimeContractResult{}, false, nil
 	}
+	if backend == execbackend.Local {
+		cfg, err := w.executionBackendConfig()
+		if err != nil {
+			return runtime.RuntimeContractResult{}, false, err
+		}
+		if identity := cfg.LocalIdentity(); identity != nil {
+			request.EffectiveUID = int(identity.UID)
+			request.EffectiveUIDKnown = true
+		}
+	}
 	result, checked, err := runtimeContractPreflightForBackend(backend, func() runtime.RuntimeContractResult {
 		return w.RuntimePreflight(ctx, agent, request)
 	})

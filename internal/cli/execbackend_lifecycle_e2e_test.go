@@ -224,6 +224,56 @@ func TestDefaultExecutionBackendUsesConfiguredIdentity(t *testing.T) {
 	}
 }
 
+func TestRuntimeContractPreflightUsesExecutionIdentityOnlyWhenConfigured(t *testing.T) {
+	tests := []struct {
+		name      string
+		config    string
+		wantUID   int
+		wantKnown bool
+	}{
+		{
+			name:      "configured non-root identity",
+			config:    "[remote_exec]\nbackend = \"local\"\nlocal_uid = 996\nlocal_gid = 986\nlocal_root = \"/var/tmp/gitmoot-local\"\n",
+			wantUID:   996,
+			wantKnown: true,
+		},
+		{name: "default daemon identity"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			if tt.config != "" {
+				paths := config.PathsForHome(home)
+				if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(paths.ConfigFile, []byte(tt.config), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			calls := 0
+			worker := jobWorker{
+				ConfigHome:         home,
+				ConfigHomeExplicit: true,
+				RuntimePreflight: func(_ context.Context, _ runtime.Agent, request runtime.RuntimeContractRequest) runtime.RuntimeContractResult {
+					calls++
+					if request.EffectiveUIDKnown != tt.wantKnown || request.EffectiveUID != tt.wantUID {
+						t.Fatalf("runtime preflight effective uid = %d known %t, want %d known %t", request.EffectiveUID, request.EffectiveUIDKnown, tt.wantUID, tt.wantKnown)
+					}
+					return runtime.RuntimeContractResult{State: runtime.RuntimeContractSupported}
+				},
+			}
+			_, checked, err := worker.runtimeContractPreflight(context.Background(), execbackend.Local, runtime.Agent{}, runtime.RuntimeContractRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !checked || calls != 1 {
+				t.Fatalf("runtime preflight = checked %t calls %d, want checked with one call", checked, calls)
+			}
+		})
+	}
+}
+
 func configuredLocalTestIdentity(t *testing.T) (uint32, uint32) {
 	t.Helper()
 	data, err := os.ReadFile("/etc/passwd")
