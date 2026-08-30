@@ -34,13 +34,13 @@ parent="owner"
 scope=["*"]
 [org.roles."gm-omp-nag"]
 parent="gitmoot"
-scope=["gitmoot/*"]
+scope=["gitmoot/nag"]
 [org.roles."gm-omp-impl"]
 parent="gitmoot"
-scope=["gitmoot/*"]
+scope=["gitmoot/implementation"]
 [org.roles."gm-omp-verdict"]
 parent="gitmoot"
-scope=["gitmoot/*"]
+scope=["gitmoot/review"]
 `
 	if err := os.WriteFile(paths.ConfigFile, []byte(configBody), 0o600); err != nil {
 		t.Fatal(err)
@@ -48,7 +48,7 @@ scope=["gitmoot/*"]
 	return home
 }
 
-func TestOrgMessageSendAllowsSameParentSibling(t *testing.T) {
+func TestOrgMessageSendAllowsDifferentlyScopedSameParentSiblings(t *testing.T) {
 	home := orgMessageTestHome(t)
 	t.Setenv("GITMOOT_ORG_ROLE", "gm-omp-nag")
 	var stdout, stderr bytes.Buffer
@@ -104,6 +104,34 @@ func TestOrgMessageSendAllowsOwnerChildrenAsOrdinarySiblings(t *testing.T) {
 	}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("owner-child sibling send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestOrgMessageSendRefusesOwnerAsEndpoint(t *testing.T) {
+	tests := []struct {
+		name string
+		from string
+		to   string
+		want string
+	}{
+		{name: "owner sender", from: "owner", to: "jarvis", want: `roles "owner" and "jarvis" do not share a parent`},
+		{name: "owner recipient", from: "jarvis", to: "owner", want: `roles "jarvis" and "owner" do not share a parent`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			home := orgMessageTestHome(t)
+			t.Setenv("GITMOOT_ORG_ROLE", test.from)
+			var stdout, stderr bytes.Buffer
+			code := runOrg([]string{
+				"message", "send", "--home", home,
+				"--to", test.to,
+				"--workflow", "gitmoot/1692-owner-endpoint",
+				"Owner has no parent and gets no direct bypass",
+			}, &stdout, &stderr)
+			if code != 2 || !strings.Contains(stderr.String(), test.want) {
+				t.Fatalf("owner endpoint send code=%d out=%q err=%q, want %q", code, stdout.String(), stderr.String(), test.want)
+			}
+		})
 	}
 }
 
