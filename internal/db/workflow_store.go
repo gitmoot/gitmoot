@@ -289,6 +289,152 @@ func (s *Store) InsertWorkflowNote(ctx context.Context, note WorkflowNote) (Work
 	return stored, err
 }
 
+const maxDirectiveReceiptRetries = 16
+
+// InsertOrgDirectiveReceipt atomically records one typed directive receipt and
+// retires any still-pending wake for the phase it satisfies. Replays are
+// successful no-ops: repeated delivery prompts must not append duplicate audit
+// rows, and an acknowledgement after done/cancel must not reopen ceremony.
+func (s *Store) InsertOrgDirectiveReceipt(
+	ctx context.Context,
+	note WorkflowNote,
+	directiveID int64,
+	kind string,
+) (bool, error) {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	if directiveID <= 0 {
+		return false, errors.New("directive receipt requires a positive directive id")
+	}
+	switch kind {
+	case "ack", "done", "cancel":
+	default:
+		return false, fmt.Errorf("unsupported directive receipt kind %q", kind)
+	}
+	prefix := fmt.Sprintf("[org:directive-%s id=%d ", kind, directiveID)
+	if !strings.HasPrefix(note.Body, prefix) {
+		return false, fmt.Errorf("directive %s receipt body does not identify directive %d", kind, directiveID)
+	}
+
+	var lastConflict error
+	for attempt := range maxDirectiveReceiptRetries {
+		inserted, err := s.insertOrgDirectiveReceiptOnce(ctx, note, directiveID, kind)
+		if err == nil {
+			return inserted, nil
+		}
+		if !isRetryableSQLiteSnapshot(err) {
+			return false, err
+		}
+		lastConflict = err
+		if attempt < maxDirectiveReceiptRetries-1 {
+			seqConflictBackoff(attempt)
+		}
+	}
+	return false, fmt.Errorf(
+		"record directive receipt after %d attempts: %w",
+		maxDirectiveReceiptRetries, lastConflict,
+	)
+}
+
+// isRetryableSQLiteSnapshot accepts only the immediate stale-WAL conflict.
+// Ordinary SQLITE_BUSY has already waited for busy_timeout and must not be
+// multiplied by the retry budget.
+func isRetryableSQLiteSnapshot(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "SQLITE_BUSY_SNAPSHOT") ||
+		strings.Contains(message, "(517)")
+}
+
+func (s *Store) insertOrgDirectiveReceiptOnce(
+	ctx context.Context,
+	note WorkflowNote,
+	directiveID int64,
+	kind string,
+) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Acquire the SQLite writer lock before reading receipt markers. Separate
+	// Stores then serialize here instead of both reading absence from WAL
+	// snapshots that one can no longer upgrade after the other commits.
+	result, err := tx.ExecContext(ctx, `
+UPDATE workflow_notes SET workflow_id = workflow_id WHERE id = ?`, directiveID)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected != 1 {
+		return false, fmt.Errorf("directive %d not found", directiveID)
+	}
+	var workflowID string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT workflow_id FROM workflow_notes WHERE id = ?`, directiveID,
+	).Scan(&workflowID); err != nil {
+		return false, err
+	}
+	workflowID = strings.TrimSpace(workflowID)
+	if strings.TrimSpace(note.WorkflowID) != workflowID {
+		return false, fmt.Errorf(
+			"directive %d belongs to workflow %q, not %q",
+			directiveID, workflowID, strings.TrimSpace(note.WorkflowID),
+		)
+	}
+
+	recordedKinds := []string{kind}
+	if kind == "ack" {
+		recordedKinds = []string{"ack", "done", "cancel"}
+	} else {
+		// Completion and cancellation are both terminal. The first terminal
+		// marker wins; a delayed prompt cannot append the opposite marker.
+		recordedKinds = []string{"done", "cancel"}
+	}
+	for _, recordedKind := range recordedKinds {
+		exists, err := orgDirectiveReceiptExistsTx(ctx, tx, workflowID, directiveID, recordedKind)
+		if err != nil {
+			return false, err
+		}
+		if exists {
+			return false, tx.Commit()
+		}
+	}
+
+	if _, err := insertWorkflowNoteTx(ctx, tx, note); err != nil {
+		return false, err
+	}
+	if err := supersedeDirectiveWakeOutboxTx(ctx, tx, directiveID, kind); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func orgDirectiveReceiptExistsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	workflowID string,
+	directiveID int64,
+	kind string,
+) (bool, error) {
+	prefix := fmt.Sprintf("[org:directive-%s id=%d ", kind, directiveID)
+	var exists bool
+	err := tx.QueryRowContext(ctx, `
+SELECT EXISTS(
+	SELECT 1 FROM workflow_notes
+	WHERE workflow_id = ? AND substr(body, 1, length(?)) = ?
+)`, workflowID, prefix, prefix).Scan(&exists)
+	return exists, err
+}
+
 // InsertWorkflowNoteWithMeta atomically appends a note and updates the
 // workflow's coordinator handoff metadata with the values from this note.
 func (s *Store) InsertWorkflowNoteWithMeta(ctx context.Context, note WorkflowNote, meta WorkflowMeta) (WorkflowNote, error) {

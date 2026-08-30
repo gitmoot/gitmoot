@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1018,5 +1019,181 @@ func TestWorkflowIDForPullRequestPrefersPullNumberOverReusedBranch(t *testing.T)
 	got, err = store.WorkflowIDForPullRequest(ctx, "owner/repo", 999, "shared")
 	if err != nil || got != "wfB" {
 		t.Fatalf("WorkflowIDForPullRequest(999) branch fallback = %q, err=%v; want wfB", got, err)
+	}
+}
+
+func TestInsertOrgDirectiveReceiptConcurrentStoresIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gitmoot.db")
+	owner, err := openCachedTestStore(t, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+
+	const seatCount = 6
+	stores := make([]*Store, seatCount)
+	for index := range stores {
+		store, err := openCachedTestStore(t, path)
+		if err != nil {
+			t.Fatalf("open store %d: %v", index, err)
+		}
+		stores[index] = store
+		defer store.Close()
+	}
+
+	for round := range 4 {
+		workflowID := fmt.Sprintf("receipt/concurrent/%d", round)
+		directive, err := owner.InsertWorkflowNote(ctx, WorkflowNote{
+			WorkflowID:        workflowID,
+			Author:            "owner",
+			Body:              "[org:directive to=worker from=owner wf=" + workflowID + "]\nact",
+			AddressedTarget:   "worker",
+			AddressedWakeKind: WakeOutboxKindDirective,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var failures []error
+		inserted := 0
+		for index := range stores {
+			wg.Add(1)
+			go func(index int) {
+				defer wg.Done()
+				<-start
+				wrote, err := stores[index].InsertOrgDirectiveReceipt(ctx, WorkflowNote{
+					WorkflowID: workflowID,
+					Author:     "worker",
+					Body:       fmt.Sprintf("[org:directive-ack id=%d by=worker]", directive.ID),
+				}, directive.ID, "ack")
+				mu.Lock()
+				defer mu.Unlock()
+				if err != nil {
+					failures = append(failures, err)
+				}
+				if wrote {
+					inserted++
+				}
+			}(index)
+		}
+		close(start)
+		wg.Wait()
+		if len(failures) != 0 {
+			t.Fatalf("round %d concurrent receipts failed: %v", round, failures)
+		}
+		if inserted != 1 {
+			t.Fatalf("round %d inserted receipts = %d, want 1", round, inserted)
+		}
+		prefix := fmt.Sprintf("[org:directive-ack id=%d ", directive.ID)
+		var receiptCount int
+		if err := owner.db.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM workflow_notes
+WHERE workflow_id = ? AND substr(body, 1, length(?)) = ?`,
+			workflowID, prefix, prefix,
+		).Scan(&receiptCount); err != nil {
+			t.Fatal(err)
+		}
+		if receiptCount != 1 {
+			t.Fatalf("round %d receipt rows = %d, want 1", round, receiptCount)
+		}
+		var state string
+		if err := owner.db.QueryRowContext(ctx, `
+SELECT state FROM wake_outbox
+WHERE source_kind = ? AND source_id = ? AND target_role = 'worker'`,
+			WakeOutboxSourceWorkflowNote, strconv.FormatInt(directive.ID, 10),
+		).Scan(&state); err != nil {
+			t.Fatal(err)
+		}
+		if state != WakeOutboxStateSuperseded {
+			t.Fatalf("round %d wake state = %q, want %q", round, state, WakeOutboxStateSuperseded)
+		}
+	}
+}
+
+func TestInsertOrgDirectiveReceiptPersistentWriterUsesSingleBusyTimeout(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gitmoot.db")
+	holder, err := openCachedTestStore(t, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	contender, err := openCachedTestStore(t, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer contender.Close()
+	if _, err := contender.db.ExecContext(ctx, `PRAGMA busy_timeout = 100`); err != nil {
+		t.Fatal(err)
+	}
+	directive, err := holder.InsertWorkflowNote(ctx, WorkflowNote{
+		WorkflowID:        "receipt/persistent-writer",
+		Author:            "owner",
+		Body:              "[org:directive to=worker from=owner wf=receipt/persistent-writer]\nact",
+		AddressedTarget:   "worker",
+		AddressedWakeKind: WakeOutboxKindDirective,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lock, err := holder.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lock.ExecContext(ctx,
+		`UPDATE workflow_notes SET author = author WHERE id = ?`, directive.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	inserted, receiptErr := contender.InsertOrgDirectiveReceipt(ctx, WorkflowNote{
+		WorkflowID: directive.WorkflowID,
+		Author:     "worker",
+		Body:       fmt.Sprintf("[org:directive-ack id=%d by=worker]", directive.ID),
+	}, directive.ID, "ack")
+	elapsed := time.Since(started)
+	if receiptErr == nil || inserted {
+		t.Fatalf("locked receipt inserted=%v err=%v", inserted, receiptErr)
+	}
+	if elapsed >= 750*time.Millisecond {
+		t.Fatalf("locked receipt returned after %s, want one busy timeout", elapsed)
+	}
+	prefix := fmt.Sprintf("[org:directive-ack id=%d ", directive.ID)
+	var receiptCount int
+	if err := contender.db.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM workflow_notes
+WHERE workflow_id = ? AND substr(body, 1, length(?)) = ?`,
+		directive.WorkflowID, prefix, prefix,
+	).Scan(&receiptCount); err != nil {
+		t.Fatal(err)
+	}
+	if receiptCount != 0 {
+		t.Fatalf("locked receipt rows = %d, want 0", receiptCount)
+	}
+	var state string
+	if err := contender.db.QueryRowContext(ctx, `
+SELECT state FROM wake_outbox
+WHERE source_kind = ? AND source_id = ? AND target_role = 'worker'`,
+		WakeOutboxSourceWorkflowNote, strconv.FormatInt(directive.ID, 10),
+	).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != WakeOutboxStatePending {
+		t.Fatalf("locked wake state = %q, want %q", state, WakeOutboxStatePending)
+	}
+	if err := lock.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	inserted, err = contender.InsertOrgDirectiveReceipt(ctx, WorkflowNote{
+		WorkflowID: directive.WorkflowID,
+		Author:     "worker",
+		Body:       fmt.Sprintf("[org:directive-ack id=%d by=worker]", directive.ID),
+	}, directive.ID, "ack")
+	if err != nil || !inserted {
+		t.Fatalf("receipt after unlock inserted=%v err=%v", inserted, err)
 	}
 }

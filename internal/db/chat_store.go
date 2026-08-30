@@ -498,7 +498,14 @@ func isRetryableSeqConflict(err error) bool {
 	if strings.Contains(msg, "UNIQUE constraint failed") && strings.Contains(msg, "seq") {
 		return true
 	}
-	// WAL snapshot / busy conflicts that a retry (re-reading MAX(seq)) resolves.
+	return isRetryableSQLiteBusy(err)
+}
+
+func isRetryableSQLiteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
 	return strings.Contains(msg, "SQLITE_BUSY_SNAPSHOT") ||
 		strings.Contains(msg, "(517)") ||
 		strings.Contains(msg, "database is locked") ||

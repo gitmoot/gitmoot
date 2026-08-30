@@ -86,6 +86,12 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store *db.Store, now ti
 	groups := make(map[string][]db.WakeOutboxObligation)
 	for _, entry := range obligations.Pending {
 		key := strings.ToLower(strings.TrimSpace(entry.TargetRole)) + "\x00" + entry.CoalesceKey
+		if entry.SourceKind == db.WakeOutboxSourceWorkflowNote &&
+			strings.HasPrefix(strings.ToLower(entry.CoalesceKey), db.WakeOutboxDirectiveCoalescePrefix) {
+			// A directive prompt names exactly one obligation and command. Never
+			// let role-level coalescing mark another directive delivered unseen.
+			key += "\x00" + entry.SourceID + "\x00" + entry.DirectivePhase
+		}
 		groups[key] = append(groups[key], entry)
 	}
 	if resolve == nil {
@@ -348,7 +354,14 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 				now,
 				workflow.RedactCommentText,
 			)
-			event.Cause = "addressed_directive"
+			switch oldest.DirectivePhase {
+			case db.WakeOutboxDirectivePhaseCompletion:
+				event.Cause = directiveCompletionOverdueCause
+			case db.WakeOutboxDirectivePhaseTerminal:
+				event.Cause = directiveTerminalCause
+			default:
+				event.Cause = "addressed_directive"
+			}
 			break
 		}
 		detail := fmt.Sprintf("%d new items, oldest id %s", len(batch), oldest.SourceID)

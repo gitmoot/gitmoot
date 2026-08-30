@@ -73,6 +73,59 @@ func (f *fakeEventWake) ResolvePaneByLabel(_ context.Context, label string) (str
 	return pane, ok
 }
 
+func TestEventRuleDirectiveWakePromptMatchesCurrentPhase(t *testing.T) {
+	base := events.Event{
+		RootID:         db.WakeOutboxSourceWorkflowNote + ":42",
+		WakeTargetRole: "worker",
+	}
+	tests := []struct {
+		name      string
+		cause     string
+		want      []string
+		forbidden []string
+	}{
+		{
+			name:      "receipt",
+			cause:     "addressed_directive",
+			want:      []string{"acknowledge receipt", "gitmoot org directive ack 42 --by worker"},
+			forbidden: []string{"gitmoot org directive done"},
+		},
+		{
+			// MUTANT: reverting to the fixed receipt prompt would tell an already
+			// acknowledged recipient to append another ack instead of delivering.
+			name:      "completion",
+			cause:     directiveCompletionOverdueCause,
+			want:      []string{"finish the assigned deliverable", "gitmoot org directive done 42 --by worker"},
+			forbidden: []string{"gitmoot org directive ack", "acknowledge receipt"},
+		},
+		{
+			// MUTANT: a stale pending wake for a terminal directive must never
+			// render either state-changing command.
+			name:      "terminal",
+			cause:     directiveTerminalCause,
+			want:      []string{"already terminal", "no receipt or completion action is required"},
+			forbidden: []string{"gitmoot org directive ack", "gitmoot org directive done"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := base
+			event.Cause = tt.cause
+			prompt := eventRuleWakePrompt(db.WakeOutboxKindDirective, event)
+			for _, want := range tt.want {
+				if !strings.Contains(prompt, want) {
+					t.Fatalf("prompt %q does not contain %q", prompt, want)
+				}
+			}
+			for _, forbidden := range tt.forbidden {
+				if strings.Contains(prompt, forbidden) {
+					t.Fatalf("prompt %q contains forbidden %q", prompt, forbidden)
+				}
+			}
+		})
+	}
+}
+
 func TestClassifyEventRuleKinds(t *testing.T) {
 	tests := []struct {
 		name  string
