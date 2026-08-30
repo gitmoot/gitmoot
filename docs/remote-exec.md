@@ -86,7 +86,11 @@ and the exact upstream allowlist. Provider keys remain host-side and are loaded
 only after those checks pass. The route is revoked before sandbox teardown.
 Provider response headers and streamed bodies are decoded before filtering the
 raw key, ASCII-case variants, and standard reversible URL/base encodings across
-chunk boundaries. Unsupported content encodings fail closed.
+chunk boundaries. The host stages each filtered response through EOF before
+release, then evaluates initial headers and finalized HTTP/1.1 trailers
+together. Upstream requests use HTTP/1.1 because Go discards forbidden HTTP/2
+encoding trailers before exposing them; any unexpected HTTP/2 response fails
+closed.
 Claude, Codex, Kimi, and omp remain unsupported on `remote` until their clients
 can target this mTLS path; Gitmoot never supplies a raw key as a fallback.
 

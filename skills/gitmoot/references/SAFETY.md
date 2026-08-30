@@ -240,9 +240,12 @@ expiry. Only a curl-config path enters the environment; the upstream key is
 resolved on the host after authentication and never enters the sandbox.
 Response headers and streamed bodies are decoded before passing through the
 same filter for the raw key, ASCII-case variants, and standard reversible
-URL/base encodings, including values split across transport chunks. Unsupported
-content encodings fail closed. Model runtimes remain refused remotely until
-they can present that identity.
+URL/base encodings, including values split across transport chunks. The host
+stages each filtered response through EOF before release, then evaluates
+initial headers and finalized HTTP/1.1 trailers together. Upstream requests use
+HTTP/1.1 because Go discards forbidden HTTP/2 encoding trailers before exposing
+them; any unexpected HTTP/2 response fails closed. Model runtimes remain
+refused remotely until they can present that identity.
 
 ### Runtime ambient credential hygiene
 

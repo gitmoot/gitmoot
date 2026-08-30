@@ -1,8 +1,10 @@
 package credgw
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -303,6 +305,124 @@ func TestRemoteProxyRejectsUnsupportedContentEncoding(t *testing.T) {
 	}
 	if response.StatusCode != http.StatusBadGateway || strings.Contains(string(body), testRealCredential) || strings.Contains(string(body), "encoded-positive-control") {
 		t.Fatalf("unsupported encoding status=%d body length=%d", response.StatusCode, len(body))
+	}
+}
+
+func TestRemoteProxyRejectsContentEncodingTrailerBeforeForwarding(t *testing.T) {
+	assertRemoteProxyRejectsContentEncodingTrailer(t, false)
+}
+
+func TestRemoteProxyRejectsHTTP2ContentEncodingTrailerBeforeForwarding(t *testing.T) {
+	assertRemoteProxyRejectsContentEncodingTrailer(t, true)
+}
+
+func assertRemoteProxyRejectsContentEncodingTrailer(t *testing.T, useHTTP2 bool) {
+	t.Helper()
+	const visibleSentinel = "visible-trailer-positive-control"
+	var encoded bytes.Buffer
+	compressed := gzip.NewWriter(&encoded)
+	_, _ = io.WriteString(compressed, visibleSentinel+":"+testRealCredential)
+	if err := compressed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if gotHTTP2 := r.ProtoMajor == 2; gotHTTP2 != useHTTP2 {
+			t.Errorf("upstream protocol major = %d, want HTTP/2=%v", r.ProtoMajor, useHTTP2)
+		}
+		if !useHTTP2 {
+			w.Header().Set("Trailer", "Content-Encoding")
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(encoded.Bytes())
+		w.Header().Set(http.TrailerPrefix+"Content-Encoding", "gzip")
+	}))
+	upstream.EnableHTTP2 = useHTTP2
+	if useHTTP2 {
+		upstream.StartTLS()
+	} else {
+		upstream.Start()
+	}
+	defer upstream.Close()
+
+	upstreamClient := upstream.Client()
+	controlResponse, err := upstreamClient.Get(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlBody, err := io.ReadAll(controlResponse.Body)
+	controlResponse.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlReader, err := gzip.NewReader(bytes.NewReader(controlBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlDecoded, err := io.ReadAll(controlReader)
+	controlReader.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTrailer := "gzip"
+	wantProtoMajor := 1
+	if useHTTP2 {
+		// net/http rejects this forbidden HTTP/2 trailer before exposing it to
+		// callers. The recoverable body proves why the proxy refuses HTTP/2.
+		wantTrailer = ""
+		wantProtoMajor = 2
+	}
+	if controlResponse.ProtoMajor != wantProtoMajor || controlResponse.Trailer.Get("Content-Encoding") != wantTrailer || !strings.Contains(string(controlDecoded), visibleSentinel) || !strings.Contains(string(controlDecoded), testRealCredential) {
+		t.Fatal("positive control did not expose the planted trailer-encoded credential")
+	}
+
+	gateway, material := newRemoteProxyTestLease(t, upstream.URL, "trailer-response")
+	defer gateway.Close(context.Background())
+	gateway.client = upstreamClient
+	request, _ := http.NewRequest(http.MethodGet, material.URL, nil)
+	request.Header.Set(CapabilityHeader, material.Capability)
+	request.Header.Set("Authorization", "Bearer "+material.Placeholder)
+	response, err := remoteMaterialClient(t, material).Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusBadGateway || strings.Contains(string(body), visibleSentinel) || strings.Contains(string(body), testRealCredential) {
+		t.Fatalf("trailer encoding status=%d body length=%d", response.StatusCode, len(body))
+	}
+}
+
+func TestRemoteProxyForwardsLargeUnencodedResponse(t *testing.T) {
+	const responseSize = 2 << 20
+	expected := bytes.Repeat([]byte("normal-proxy-response\n"), responseSize/len("normal-proxy-response\n")+1)
+	expected = expected[:responseSize]
+	expectedHash := sha256.Sum256(expected)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(expected)
+	}))
+	defer upstream.Close()
+
+	gateway, material := newRemoteProxyTestLease(t, upstream.URL, "large-response")
+	defer gateway.Close(context.Background())
+	request, _ := http.NewRequest(http.MethodGet, material.URL, nil)
+	request.Header.Set(CapabilityHeader, material.Capability)
+	request.Header.Set("Authorization", "Bearer "+material.Placeholder)
+	response, err := remoteMaterialClient(t, material).Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.New()
+	written, err := io.Copy(hash, response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || written != responseSize || !bytes.Equal(hash.Sum(nil), expectedHash[:]) {
+		t.Fatalf("large response status=%d bytes=%d hash_match=%v", response.StatusCode, written, bytes.Equal(hash.Sum(nil), expectedHash[:]))
 	}
 }
 
