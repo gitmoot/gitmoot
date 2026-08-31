@@ -321,28 +321,48 @@ quota).
 
 **Current mode: DRAIN.**
 
-Update the line above whenever the owner switches modes. The mode changes how
-much work may start; it never relaxes correctness, exact-head review, CI, or
-owner merge authority.
+A mode switch has two required records:
+
+1. Update the line above through the normal repository process. This is the
+   durable default for new checkouts and sessions.
+2. Write an `[operating-mode ...]` note to `gitmoot/worktree-lifecycle`. The note
+   takes effect immediately for already-running coordinators and seats.
+
+At every check-in, the coordinator reads the latest mode note and steers active
+seats that still have an older `AGENTS.md`. If the repository line and latest
+note disagree, enforce the more restrictive mode until they are synchronized.
+The mode changes how much work may start; it never relaxes correctness,
+exact-head review, CI, or owner merge authority.
+
+Across both modes, use exactly one independent reviewer per corrected head.
+Parallel review lanes mean different PRs, not multiple reviewers on one head.
+Review panels and fanout require explicit, durable owner authorization for that
+specific incident; an incident does not override this rule by itself.
 
 ### Throughput mode
 
 - Start independent, issue-backed work when ownership and integration order are
   clear.
-- Parallelize genuinely independent implementation and review lanes under the
-  repository's normal safety and review rules.
+- Parallelize genuinely independent implementation lanes and reviews of
+  different PRs under the repository's normal safety rules.
 - Stop opening new lanes when work queues behind shared files, unresolved
   integration order, or repeated review findings.
 
 ### Drain mode
 
 - Finish and merge the active queue; do not expand it. Do not start new issues,
-  PRs, experiments, speculative cleanup, or review panels unless a security,
-  data-loss, or live-service incident requires it.
-- Let work already in flight reach its next stable reviewed head. After that
-  wave, cap concurrency at **two implementation seats and one independent
-  reviewer**.
-- Use one independent reviewer per corrected head. Do not fan reviews out.
+  PRs, experiments, or speculative cleanup unless a security, data-loss, or
+  live-service incident requires containment.
+- The activation note must enumerate the grandfathered running implementation
+  seats and review jobs. An unlisted item is not part of the transition wave.
+  Each listed item loses its exemption at its first subsequent terminal handoff:
+  review verdict, blocked or parked seat, merged PR, or explicit cancellation.
+- After activation, cap the `gitmoot/*` scope at **two active implementers and
+  one running reviewer**. An active implementer is a persistent seat currently
+  changing code or a running engine implementation job. A running reviewer is a
+  review job in `running`; queued reviews do not consume the slot. Do not
+  enqueue another review while the running slot is occupied. Never replace a
+  completed transition-wave item with new work.
 - Prioritize merge-ready work and merge-gate integrity, then serial dependency
   chains, then resource-safety work. Rebase conflicted branches only after
   upstream merges settle. Keep drafts and backlog work parked.
