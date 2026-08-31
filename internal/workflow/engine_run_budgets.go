@@ -365,7 +365,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			return nil
 		}
 		blockingSeverity = e.reviewBlockingSeverity(payload.Repo)
-		effectiveDecision = effectiveReviewDecision(payload.Result, blockingSeverity)
+		effectiveDecision = effectiveReviewDecisionForPayload(payload, blockingSeverity)
 	}
 	if payload.Result.Decision == "blocked" || payload.Result.Decision == "failed" {
 		return e.block(ctx, ref, payload.Result.Summary)

@@ -226,7 +226,7 @@ func (e Engine) allRequiredReviewersApproved(ctx context.Context, currentReviewe
 		if !sameTask(payload, jobPayload) || !sameReviewRound(payload, jobPayload) || jobPayload.Result == nil {
 			continue
 		}
-		if effectiveReviewDecision(jobPayload.Result, blockingSeverity) == "approved" {
+		if effectiveReviewDecisionForPayload(jobPayload, blockingSeverity) == "approved" {
 			approved[reviewDecisionAgent(job, jobPayload)] = true
 		}
 	}

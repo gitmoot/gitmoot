@@ -26,6 +26,13 @@ func (e Engine) reviewBlockingSeverity(repo string) string {
 // effectiveReviewDecision converts only a sub-threshold changes-requested
 // result into an engine-level approval. The stored AgentResult remains unchanged
 // so its summary and findings remain available to comment/rendering surfaces.
+//
+// It takes a bare result, so it cannot see who dispatched the review. Callers
+// holding a stored JobPayload MUST use effectiveReviewDecisionForPayload
+// instead: this helper would fold a pipeline-sender verdict the pipeline
+// advancer owns. The remaining direct callers are the ones with no payload to
+// consult — comment rendering (which resolves the threshold to "" for pipeline
+// jobs) and delegation-child evaluation.
 func effectiveReviewDecision(result *AgentResult, blockingSeverity string) string {
 	if result == nil {
 		return ""

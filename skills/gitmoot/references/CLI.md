@@ -790,6 +790,11 @@ fields remain active. Any other review-policy parse or read error rejects the
 entire applied review policy, restoring `P3` with native fanout and risk tiers
 off.
 
+The threshold applies to native review rounds only. A pipeline review stage is
+report-only — the pipeline advancer owns folding its verdict — so its raw
+`changes_requested` keeps blocking the merge gate at every threshold and never
+counts toward required-reviewer approval.
+
 ### Risk-Tiered Adaptive Review
 
 Set `risk_tiers_enabled = true` in `[review]` to scale review depth to a

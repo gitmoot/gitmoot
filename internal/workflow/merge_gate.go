@@ -654,7 +654,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if _, superseded := supersededReviewIDs[job.ID]; superseded {
 			continue
 		}
-		if effectiveReviewDecision(payload.Result, request.ReviewBlockingSeverity) == "approved" {
+		if effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity) == "approved" {
 			reviewerAgent := strings.TrimSpace(job.Agent)
 			switch {
 			case reviewerAgent == "":
@@ -687,7 +687,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			}
 			return err
 		}
-		switch effectiveReviewDecision(payload.Result, request.ReviewBlockingSeverity) {
+		switch effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity) {
 		case "approved":
 			if err := ensureDelegatedReviewEvidence(job, delegationChildrenByParent[job.ID], request.ReviewBlockingSeverity); err != nil {
 				return err

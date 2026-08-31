@@ -603,6 +603,53 @@ func TestPolicyMergeGateChecksHeadlessSubthresholdReviewAuthorship(t *testing.T)
 	}
 }
 
+// The pre-round fallback (reached when no review is recorded at the evaluated
+// head) also reads stored review payloads, so it must go through the same
+// payload-aware authority as the at-head path. A pipeline stage verdict for an
+// earlier head is not an approval this gate may claim: folding it made the gate
+// report a self-approval authorship failure — i.e. it had already classified the
+// stage's changes_requested as an approval — instead of the real reason the
+// review is unusable. Sender is the only difference between the two cases.
+func TestPolicyMergeGateFallbackKeepsPipelineReviewVerdictRaw(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		sender string
+		want   string
+	}{
+		{name: "native", sender: "", want: "independent reviewer is required"},
+		{name: "pipeline", sender: PipelineJobSender, want: "different head SHA"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			insertCompletedJob(t, store, db.Job{ID: "implement-stale", Agent: "stagebot", Type: "implement"}, JobPayload{
+				Repo: "mobile/app", PullRequest: 9, HeadSHA: "head123", TaskID: "task-9",
+				Result: &AgentResult{Decision: "implemented", Summary: "implemented"},
+			})
+			insertCompletedJob(t, store, db.Job{ID: "review-stale", Agent: "stagebot", Type: "review"}, JobPayload{
+				Repo:        "mobile/app",
+				PullRequest: 9,
+				HeadSHA:     "oldhead",
+				TaskID:      "task-9",
+				Sender:      tc.sender,
+				Result: &AgentResult{
+					Decision: "changes_requested",
+					Severity: reviewseverity.P2,
+					Summary:  "stage refused",
+				},
+			})
+
+			err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
+				Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "stagebot",
+				ReviewBlockingSeverity: reviewseverity.P1,
+			}, "head123")
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ensureFinalReviewCaptured error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestPolicyMergeGatePassesBlockingSeverityToHeadlessDelegatedEvidence(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

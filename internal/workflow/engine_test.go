@@ -1499,6 +1499,59 @@ func TestAllRequiredReviewersApprovedCountsSubthresholdReview(t *testing.T) {
 	}
 }
 
+// A pipeline review stage binds its job to the task/PR/head under Sender=pipeline
+// (internal/pipeline/run.go) and records no ReviewRound, so once the PR head moves
+// on, that stale stage verdict still shares the round of the current native review
+// (sameReviewRound treats two empty rounds as one round). Required-reviewer
+// counting reads stored payloads, so folding a sub-threshold pipeline
+// changes_requested here would let a stage veto satisfy a reviewer slot and clear
+// the merge prerequisites — the pipeline advancer owns that verdict, not this
+// counter. Sender is the only difference between the two cases below.
+func TestAllRequiredReviewersApprovedRejectsFoldedPipelineVeto(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		sender string
+		want   bool
+	}{
+		{name: "native", sender: "", want: true},
+		{name: "pipeline", sender: PipelineJobSender, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			engine := testEngine(store)
+			engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+			insertCompletedJob(t, store, db.Job{ID: "review-stale", Agent: "audit", Type: "review"}, JobPayload{
+				Repo:        "mobile/app",
+				PullRequest: 8,
+				TaskID:      "task-8",
+				HeadSHA:     "oldhead",
+				Sender:      tc.sender,
+				Result: &AgentResult{
+					Decision: "changes_requested",
+					Severity: reviewseverity.P2,
+					Summary:  "stage refused",
+				},
+			})
+			payload := JobPayload{
+				Repo:        "mobile/app",
+				PullRequest: 8,
+				TaskID:      "task-8",
+				HeadSHA:     "head123",
+				Reviewers:   []string{"audit", "security"},
+			}
+
+			approved, err := engine.allRequiredReviewersApproved(ctx, "security", payload)
+			if err != nil {
+				t.Fatalf("allRequiredReviewersApproved returned error: %v", err)
+			}
+			if approved != tc.want {
+				t.Fatalf("allRequiredReviewersApproved = %v, want %v", approved, tc.want)
+			}
+		})
+	}
+}
+
 func TestEngineAdvanceReviewSubthresholdEventIsIdempotentAfterMergeError(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
