@@ -538,9 +538,9 @@ func (c Client) WorktreeCleanAt(ctx context.Context, path string) (bool, error) 
 	if err != nil {
 		return false, err
 	}
-	clean, err := NewClient(path, c.runner).WorktreeClean(ctx)
+	result, err := NewClient(path, c.runner).run(ctx, "status", "--porcelain", "--ignored")
 	if err == nil {
-		return clean, nil
+		return strings.TrimSpace(result.Stdout) == "", nil
 	}
 	gitDir, gitDirErr := worktreeGitDir(path)
 	if gitDirErr == nil {

@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -150,8 +151,11 @@ func worktreeLiveness(path string, procRoot string) (live bool, known bool) {
 			continue
 		}
 		cwd, err := os.Readlink(filepath.Join(procRoot, name, "cwd"))
-		if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
 			continue
+		}
+		if err != nil {
+			return false, false
 		}
 		cwd = strings.TrimSuffix(strings.TrimSpace(cwd), " (deleted)")
 		if cwd == abs || strings.HasPrefix(cwd, abs+string(os.PathSeparator)) {

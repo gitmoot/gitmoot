@@ -15,6 +15,22 @@ func TestWorktreeLiveness(t *testing.T) {
 		}
 	})
 
+	t.Run("unknown when a process cwd is unreadable", func(t *testing.T) {
+		worktree := t.TempDir()
+		procRoot := t.TempDir()
+		processDir := filepath.Join(procRoot, "999999998")
+		if err := os.Mkdir(processDir, 0o755); err != nil {
+			t.Fatalf("Mkdir process dir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(processDir, "cwd"), []byte("not a symlink"), 0o644); err != nil {
+			t.Fatalf("WriteFile cwd: %v", err)
+		}
+		live, known := worktreeLiveness(worktree, procRoot)
+		if live || known {
+			t.Fatalf("worktreeLiveness with unreadable cwd = (%v, %v), want (false, false)", live, known)
+		}
+	})
+
 	t.Run("known live cwd", func(t *testing.T) {
 		worktree := t.TempDir()
 		procRoot := t.TempDir()

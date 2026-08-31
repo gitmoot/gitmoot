@@ -855,11 +855,13 @@ type tickCandidateStore interface {
 // (retry-on-error — see tickCandidates for why per-repo fault isolation matters). It
 // is consumed only on the synchronous tick goroutine, so it needs no synchronization.
 type candidateMemo struct {
-	done bool
-	ids  []string
+	attempted bool
+	done      bool
+	ids       []string
 }
 
 func (m *candidateMemo) get(fetch func() ([]string, error)) ([]string, error) {
+	m.attempted = true
 	if m.done {
 		return m.ids, nil
 	}
@@ -1269,7 +1271,11 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 		runWorktreeReclaim := tracker.worktreeReclaimDue(now)
 		cand.skipAgedReclaim = !runWorktreeReclaim
 		if runWorktreeReclaim {
-			defer tracker.markWorktreeReclaimAttempted(now)
+			defer func() {
+				if cand.taskReclaim.attempted || cand.agedReclaim.attempted {
+					tracker.markWorktreeReclaimAttempted(now)
+				}
+			}()
 		}
 	}
 	if ownsCandidates && tracker.staleTaskLaneLockReclaimDue(now) {
@@ -1447,7 +1453,7 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 			writeLine(stdout, "%s: worker tick error: %v", repo.FullName(), tickErr)
 		}
 	}
-	if runAgedReclaim {
+	if runAgedReclaim && (cand.taskReclaim.attempted || cand.agedReclaim.attempted) {
 		tracker.markWorktreeReclaimAttempted(now)
 	}
 	// Every enabled repo failing is the global-fault signal: return it so the

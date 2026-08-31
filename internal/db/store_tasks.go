@@ -296,15 +296,16 @@ func (s *Store) TaskIDsWithTerminalWorktree(ctx context.Context) ([]string, erro
 	return ids, rows.Err()
 }
 
-// TaskHasActiveWorktreeOwner reports whether a queued/running job names either
-// the task or its recorded worktree. Malformed JSON returns an error, making the
-// caller retain the worktree rather than infer that it is unowned.
+// TaskHasActiveWorktreeOwner reports whether any non-final job with valid
+// payload JSON names either the task or its recorded worktree. Invalid legacy
+// payloads are unrelated, so they cannot poison ownership checks store-wide.
 func (s *Store) TaskHasActiveWorktreeOwner(ctx context.Context, taskID, path string) (bool, error) {
 	var active bool
 	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
 		SELECT 1
 		FROM jobs
-		WHERE state IN ('queued', 'running')
+		WHERE state NOT IN ('succeeded', 'failed', 'cancelled')
+		  AND json_valid(payload)
 		  AND (
 			trim(COALESCE(json_extract(payload, '$.task_id'), '')) = ?
 			OR trim(COALESCE(json_extract(payload, '$.worktree_path'), '')) = ?

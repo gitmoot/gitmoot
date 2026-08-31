@@ -176,7 +176,9 @@ func TestTaskHasActiveWorktreeOwnerMatchesTaskOrPath(t *testing.T) {
 	for _, job := range []Job{
 		{ID: "by-task", Agent: "agent", Type: "implement", State: "queued", Payload: `{"task_id":"task-1"}`},
 		{ID: "by-path", Agent: "agent", Type: "review", State: "running", Payload: `{"worktree_path":"/worktrees/task-2"}`},
+		{ID: "blocked-owner", Agent: "agent", Type: "implement", State: "blocked", Payload: `{"task_id":"task-4","worktree_path":"/worktrees/task-4"}`},
 		{ID: "finished", Agent: "agent", Type: "implement", State: "succeeded", Payload: `{"task_id":"task-3","worktree_path":"/worktrees/task-3"}`},
+		{ID: "malformed-unrelated", Agent: "agent", Type: "implement", State: "queued", Payload: `not json at all`},
 	} {
 		if err := store.CreateJobWithEvent(ctx, job, JobEvent{Kind: job.State, Message: "seed"}); err != nil {
 			t.Fatalf("CreateJobWithEvent %s: %v", job.ID, err)
@@ -190,6 +192,8 @@ func TestTaskHasActiveWorktreeOwnerMatchesTaskOrPath(t *testing.T) {
 		{taskID: "task-1", path: "/other", want: true},
 		{taskID: "other", path: "/worktrees/task-2", want: true},
 		{taskID: "task-3", path: "/worktrees/task-3", want: false},
+		{taskID: "task-4", path: "/worktrees/task-4", want: true},
+		{taskID: "unowned", path: "/worktrees/unowned", want: false},
 	} {
 		got, err := store.TaskHasActiveWorktreeOwner(ctx, tc.taskID, tc.path)
 		if err != nil {

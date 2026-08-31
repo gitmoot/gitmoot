@@ -523,9 +523,10 @@ rsync -a --delete build/ /var/www/gitmoot-docs/
 Every five minutes, the daemon checks task-owned worktrees whose task is
 `merged`, `dismissed`, `superseded`, or `stranded`. Age alone never qualifies a
 task worktree. Gitmoot retains it unless the recorded path is deterministic,
-there is no active job or branch lock, `/proc/<pid>/cwd` conclusively shows no
-live process inside it, and `git status` proves it clean. Removal is non-force
-and preserves the branch.
+there is no non-final job or branch lock, the `/proc/<pid>/cwd` scan is
+conclusive with no live process inside it, and `git status --porcelain --ignored`
+reports no tracked, untracked, or ignored content. Removal is non-force and
+preserves the branch.
 
 A worktree registered to an older checkout root is removed through the owner in
 its `.git` pointer. If that owner cannot inspect or remove it, Gitmoot records

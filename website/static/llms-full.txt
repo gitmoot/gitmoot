@@ -2755,11 +2755,11 @@ only in `merged`, `dismissed`, `superseded`, or `stranded`. Age is not an
 eligibility signal. Before removal, Gitmoot re-reads the task under the checkout
 mutation lock and requires all of these checks to pass:
 
-- no queued or running job names the task or path
+- no non-final job names the task or path
 - no branch lock owns the task branch
-- `/proc/<pid>/cwd` was readable and no process has a cwd in the worktree
+- the `/proc/<pid>/cwd` scan was conclusive and no process has a cwd in the worktree
 - the recorded path is the deterministic task path
-- `git status` proves the worktree is clean
+- `git status --porcelain --ignored` reports no tracked, untracked, or ignored content
 
 Removal uses `git worktree remove` without `--force` and preserves the branch.
 Gitmoot then clears the task's stored path and records

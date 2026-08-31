@@ -5151,6 +5151,42 @@ func TestAgedDelegationReclaimThrottledAcrossMultiRepoTicks(t *testing.T) {
 	}
 }
 
+func TestWorktreeReclaimCadenceDoesNotAdvanceWhenPoolSkipsPass(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	const repo = "owner/repo"
+	seedDaemonWorkerRepo(t, store, repo, t.TempDir())
+	worker := defaultJobWorker(store, io.Discard)
+	tracker := newInflightJobTracker(ctx)
+	defer tracker.drain(io.Discard, time.Second)
+	if !tracker.tryBeginPool(repo) {
+		t.Fatal("tryBeginPool returned false")
+	}
+
+	counter := &countingCandidateStore{inner: store}
+	realNewTickCandidates := newTickCandidates
+	newTickCandidates = func(tickCandidateStore) *tickCandidates {
+		return realNewTickCandidates(counter)
+	}
+	defer func() { newTickCandidates = realNewTickCandidates }()
+
+	now := time.Now().UTC()
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now, nil, tracker); err != nil {
+		t.Fatalf("pool-blocked runEnabledRepoWorkerTicksTracked returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&counter.agedReclaim); got != 0 {
+		t.Fatalf("pool-blocked aged-reclaim query count = %d, want 0", got)
+	}
+	tracker.endPool(repo)
+
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now.Add(time.Second), nil, tracker); err != nil {
+		t.Fatalf("post-pool runEnabledRepoWorkerTicksTracked returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&counter.agedReclaim); got != 1 {
+		t.Fatalf("post-pool aged-reclaim query count = %d, want 1", got)
+	}
+}
+
 // TestTickCandidatesRetriesOnError pins FIX-A (#620 review): the per-tick carrier
 // memoizes SUCCESSES only. The first access to each query returns the store's
 // transient error WITHOUT memoizing it; the second access re-runs the query and

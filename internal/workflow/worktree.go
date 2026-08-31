@@ -1656,15 +1656,24 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 			return false, nil
 		}
 		manager, ok := e.DelegationWorktrees.(WritableWorktreeLineageManager)
-		if !ok || manager == nil || strings.TrimSpace(payload.Branch) == "" {
-			return false, nil
+		if !ok || manager == nil {
+			return false, errors.New("delegation worktree manager cannot prove fix worktree lineage")
+		}
+		if strings.TrimSpace(payload.Branch) == "" {
+			return false, errors.New("terminal fix worktree payload has no branch")
 		}
 		clean, err := manager.WorktreeCleanAt(ctx, path)
-		if err != nil || !clean {
+		if err != nil {
+			return false, fmt.Errorf("prove aged terminal fix worktree clean: %w", err)
+		}
+		if !clean {
 			return false, nil
 		}
 		reachable, err := manager.WorktreeHeadReachableFromRemote(ctx, path, payload.Branch)
-		if err != nil || !reachable {
+		if err != nil {
+			return false, fmt.Errorf("prove aged terminal fix worktree head reachable from remote: %w", err)
+		}
+		if !reachable {
 			return false, nil
 		}
 		live, known = e.worktreeLiveness(path)
@@ -1672,7 +1681,10 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 			return false, nil
 		}
 		clean, err = manager.WorktreeCleanAt(ctx, path)
-		if err != nil || !clean {
+		if err != nil {
+			return false, fmt.Errorf("recheck aged terminal fix worktree clean: %w", err)
+		}
+		if !clean {
 			return false, nil
 		}
 		if err := os.RemoveAll(path); err != nil {

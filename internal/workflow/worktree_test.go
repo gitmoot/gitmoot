@@ -919,7 +919,10 @@ func TestEngineReclaimTerminalTaskWorktreeKeepsLiveDirtyAdhocAtAnyAge(t *testing
 	if err := os.WriteFile(filepath.Join(checkout, "base.txt"), []byte("base\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile base: %v", err)
 	}
-	runWorktreeGit(t, checkout, "add", "base.txt")
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte("GOALS/\nCLAUDE.local.md\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile .gitignore: %v", err)
+	}
+	runWorktreeGit(t, checkout, "add", "base.txt", ".gitignore")
 	runWorktreeGit(t, checkout, "commit", "-m", "base")
 
 	home := filepath.Join(root, "home")
@@ -931,7 +934,8 @@ func TestEngineReclaimTerminalTaskWorktreeKeepsLiveDirtyAdhocAtAnyAge(t *testing
 		t.Fatalf("MkdirAll worktree parent: %v", err)
 	}
 	runWorktreeGit(t, checkout, "worktree", "add", "-b", "adhoc-old-live", path, "HEAD")
-	if err := os.WriteFile(filepath.Join(path, "uncommitted.txt"), []byte("preserve me\n"), 0o644); err != nil {
+	untrackedPath := filepath.Join(path, "uncommitted.txt")
+	if err := os.WriteFile(untrackedPath, []byte("preserve me\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile uncommitted change: %v", err)
 	}
 
@@ -960,7 +964,7 @@ func TestEngineReclaimTerminalTaskWorktreeKeepsLiveDirtyAdhocAtAnyAge(t *testing
 	if err := store.UpsertTask(ctx, db.Task{
 		ID:           "adhoc-old-live",
 		RepoFullName: "owner/repo",
-		State:        string(TaskImplementing),
+		State:        string(TaskDismissed),
 		Branch:       "adhoc-old-live",
 		WorktreePath: path,
 	}); err != nil {
@@ -972,20 +976,55 @@ func TestEngineReclaimTerminalTaskWorktreeKeepsLiveDirtyAdhocAtAnyAge(t *testing
 
 	outcome, err := engine.ReclaimTerminalTaskWorktreeOutcome(ctx, home, checkout, "adhoc-old-live", manager)
 	if err != nil {
-		t.Fatalf("ReclaimTerminalTaskWorktreeOutcome: %v", err)
+		t.Fatalf("live ReclaimTerminalTaskWorktreeOutcome: %v", err)
 	}
-	if outcome.Reclaimed || outcome.Classification != TaskWorktreeReclaimNotTerminal {
-		t.Fatalf("outcome = %+v, want retained not-terminal task", outcome)
-	}
-	clean, err := manager.WorktreeCleanAt(ctx, path)
-	if err != nil {
-		t.Fatalf("WorktreeCleanAt: %v", err)
-	}
-	if clean {
-		t.Fatal("KEEP fixture unexpectedly clean")
+	if outcome.Reclaimed || outcome.Classification != TaskWorktreeReclaimLiveProcess {
+		t.Fatalf("live outcome = %+v, want retained live-process task", outcome)
 	}
 	if live, known := WorktreeLiveness(path); !live || !known {
 		t.Fatalf("KEEP fixture process after reclaim: live=%v known=%v", live, known)
+	}
+	if content, err := os.ReadFile(untrackedPath); err != nil || string(content) != "preserve me\n" {
+		t.Fatalf("uncommitted work after live reclaim = %q, err=%v", content, err)
+	}
+
+	if err := liveProcess.Process.Kill(); err != nil {
+		t.Fatalf("kill live worktree process: %v", err)
+	}
+	_ = liveProcess.Wait()
+	outcome, err = engine.ReclaimTerminalTaskWorktreeOutcome(ctx, home, checkout, "adhoc-old-live", manager)
+	if err != nil {
+		t.Fatalf("dirty ReclaimTerminalTaskWorktreeOutcome: %v", err)
+	}
+	if outcome.Reclaimed || outcome.Classification != TaskWorktreeReclaimDirty {
+		t.Fatalf("dirty outcome = %+v, want retained dirty task", outcome)
+	}
+	if clean, err := manager.WorktreeCleanAt(ctx, path); err != nil || clean {
+		t.Fatalf("dirty WorktreeCleanAt = %v, err=%v, want false nil", clean, err)
+	}
+
+	if err := os.Remove(untrackedPath); err != nil {
+		t.Fatalf("remove untracked fixture: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(path, "GOALS"), 0o755); err != nil {
+		t.Fatalf("MkdirAll ignored content: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "GOALS", "plan.md"), []byte("preserve ignored plan\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile ignored plan: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "CLAUDE.local.md"), []byte("preserve ignored instructions\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile ignored instructions: %v", err)
+	}
+	runWorktreeGit(t, path, "check-ignore", "GOALS/plan.md", "CLAUDE.local.md")
+	outcome, err = engine.ReclaimTerminalTaskWorktreeOutcome(ctx, home, checkout, "adhoc-old-live", manager)
+	if err != nil {
+		t.Fatalf("ignored-content ReclaimTerminalTaskWorktreeOutcome: %v", err)
+	}
+	if outcome.Reclaimed || outcome.Classification != TaskWorktreeReclaimDirty {
+		t.Fatalf("ignored-content outcome = %+v, want retained dirty task", outcome)
+	}
+	if clean, err := manager.WorktreeCleanAt(ctx, path); err != nil || clean {
+		t.Fatalf("ignored-content WorktreeCleanAt = %v, err=%v, want false nil", clean, err)
 	}
 	task, err := store.GetTask(ctx, "adhoc-old-live")
 	if err != nil {
@@ -994,8 +1033,10 @@ func TestEngineReclaimTerminalTaskWorktreeKeepsLiveDirtyAdhocAtAnyAge(t *testing
 	if task.WorktreePath != path {
 		t.Fatalf("worktree path = %q, want preserved %q", task.WorktreePath, path)
 	}
-	if content, err := os.ReadFile(filepath.Join(path, "uncommitted.txt")); err != nil || string(content) != "preserve me\n" {
-		t.Fatalf("uncommitted work after reclaim = %q, err=%v", content, err)
+	for _, ignored := range []string{"GOALS/plan.md", "CLAUDE.local.md"} {
+		if _, err := os.Stat(filepath.Join(path, ignored)); err != nil {
+			t.Fatalf("ignored content %s was removed: %v", ignored, err)
+		}
 	}
 }
 
@@ -1327,7 +1368,7 @@ func TestEngineReclaimTerminalTaskWorktreeRejectsUnmanagedPath(t *testing.T) {
 	}
 }
 
-func TestEngineReclaimTerminalTaskWorktreeKeepsActiveJobOwner(t *testing.T) {
+func TestEngineReclaimTerminalTaskWorktreeKeepsBlockedJobOwner(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	home := t.TempDir()
@@ -1351,8 +1392,8 @@ func TestEngineReclaimTerminalTaskWorktreeKeepsActiveJobOwner(t *testing.T) {
 		t.Fatalf("marshalPayload: %v", err)
 	}
 	if err := store.CreateJobWithEvent(ctx, db.Job{
-		ID: "active-owner", Agent: "reviewer", Type: "review", State: string(JobRunning), Payload: payload,
-	}, db.JobEvent{Kind: string(JobRunning), Message: "seed"}); err != nil {
+		ID: "active-owner", Agent: "reviewer", Type: "review", State: string(JobBlocked), Payload: payload,
+	}, db.JobEvent{Kind: string(JobBlocked), Message: "seed"}); err != nil {
 		t.Fatalf("CreateJobWithEvent: %v", err)
 	}
 	manager := &fakeWorktreeManager{}
@@ -1424,13 +1465,18 @@ func TestEngineReclaimAgedFixWorktreeKeepsLiveProcess(t *testing.T) {
 
 func TestEngineReclaimAgedFixWorktreeRequiresCleanRemoteReachableHead(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		clean     bool
-		reachable bool
-		want      bool
+		name         string
+		clean        bool
+		reachable    bool
+		cleanErr     error
+		reachableErr error
+		want         bool
+		wantErr      string
 	}{
 		{name: "dirty", clean: false, reachable: true},
 		{name: "unpushed head", clean: true, reachable: false},
+		{name: "clean probe error", cleanErr: errors.New("clean probe failed"), wantErr: "prove aged terminal fix worktree clean"},
+		{name: "reachability probe error", clean: true, reachableErr: errors.New("reachability probe failed"), wantErr: "head reachable from remote"},
 		{name: "clean pushed head", clean: true, reachable: true, want: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1465,17 +1511,23 @@ func TestEngineReclaimAgedFixWorktreeRequiresCleanRemoteReachableHead(t *testing
 				t.Fatalf("CreateJobWithEvent: %v", err)
 			}
 			manager := &fakeWorktreeManager{
-				cleanSet:    true,
-				clean:       tc.clean,
-				ancestorSet: true,
-				ancestor:    tc.reachable,
+				cleanSet:     true,
+				clean:        tc.clean,
+				cleanErr:     tc.cleanErr,
+				reachableErr: tc.reachableErr,
+				ancestorSet:  true,
+				ancestor:     tc.reachable,
 			}
 			engine := testEngine(store)
 			engine.Home = home
 			engine.DelegationWorktrees = manager
 
 			reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
-			if err != nil {
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome error = %v, want %q", err, tc.wantErr)
+				}
+			} else if err != nil {
 				t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
 			}
 			if reclaimed != tc.want {
@@ -1593,6 +1645,8 @@ type fakeWorktreeManager struct {
 	ancestorSet      bool
 	clean            bool
 	cleanSet         bool
+	cleanErr         error
+	reachableErr     error
 	cleanCalls       []string
 	ancestorCalls    [][2]string
 	calls            []worktreeCall
@@ -1673,6 +1727,9 @@ func (f *fakeWorktreeManager) IsAncestor(_ context.Context, ancestor, descendant
 
 func (f *fakeWorktreeManager) WorktreeCleanAt(_ context.Context, path string) (bool, error) {
 	f.cleanCalls = append(f.cleanCalls, path)
+	if f.cleanErr != nil {
+		return false, f.cleanErr
+	}
 	if f.cleanSet {
 		return f.clean, nil
 	}
@@ -1680,6 +1737,9 @@ func (f *fakeWorktreeManager) WorktreeCleanAt(_ context.Context, path string) (b
 }
 
 func (f *fakeWorktreeManager) WorktreeHeadReachableFromRemote(ctx context.Context, path string, branch string) (bool, error) {
+	if f.reachableErr != nil {
+		return false, f.reachableErr
+	}
 	head, err := f.HeadSHAAt(ctx, path)
 	if err != nil {
 		return false, err
