@@ -39,6 +39,34 @@ func IsDisposedTaskState(state string) bool {
 	}
 }
 
+// TaskEventMergedBlockRefused is the durable trace setTaskState leaves when it
+// refuses to rewrite a `merged` task into `blocked`. It is an informational
+// event: the task does not move, so FromState/ToState stay empty per the
+// db.TaskEvent contract, and the refused destination is named in Reason.
+const TaskEventMergedBlockRefused = "task_merged_block_refused"
+
+// IsMergedToBlockedRegression reports the one task-state move that is never
+// right: rewriting a task whose work already LANDED (`merged`) into `blocked`,
+// the terminal quality-failure state.
+//
+// It exists because a dead DELEGATION CHILD reaches the parent's failure_policy
+// long after the parent's pull request merged (#1673: the daemon sweep that
+// terminates queued legs whose pull request is no longer open). The default
+// block_parent policy ends in setTaskState(TaskBlocked), whose only other guard
+// is IsDisposedTaskState — which does not list `merged`. Without this predicate
+// the choice is to rewrite `merged` to `blocked` or to strand the coordinator,
+// and both are wrong: a review leg that never ran must not undo the record that
+// the change shipped.
+//
+// Deliberately scoped to this one edge rather than freezing `merged` outright,
+// because legitimate paths DO leave `merged`: `gitmoot task resume-work` moves a
+// merged task back to `implementing` (internal/cli/workflow.go:752), and the
+// pull-request lifecycle re-enters pr_open/reviewing on a fresh cycle. Only the
+// blocked direction is a regression, so only it is refused.
+func IsMergedToBlockedRegression(from, to string) bool {
+	return TaskState(from) == TaskMerged && TaskState(to) == TaskBlocked
+}
+
 type JobState string
 
 const (

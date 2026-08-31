@@ -117,3 +117,76 @@ func TestSetTaskStateCannotResurrectEvidenceDisposedTask(t *testing.T) {
 		})
 	}
 }
+
+// TestSetTaskStateRefusesMergedToBlockedAndLeavesADurableTrace pins the #1673
+// state-machine rule. A queued delegation child of an already-merged pull request
+// dies in the daemon's closed-PR sweep; the child's advance ends in the parent's
+// default block_parent policy, which calls setTaskState(TaskBlocked). Rewriting a
+// `merged` task to `blocked` would undo the one record the sweep's own premise
+// asserts — that the change shipped — so the move is refused.
+//
+// It differs from the disposed-state refusals above in the way that matters: it
+// returns NO error. The advance that asked for the block still has to finish
+// releasing the coordinator, so the refusal cannot be reported by failing it; the
+// durable task event IS the report. Both identities setTaskState can resolve are
+// covered: the payload task id, and the canonical task owning its branch.
+func TestSetTaskStateRefusesMergedToBlockedAndLeavesADurableTrace(t *testing.T) {
+	store, err := dbtest.Open(t, filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	const repo, branch = "owner/repo", "feature/merged"
+	if err := store.UpsertTask(ctx, db.Task{ID: "canonical", RepoFullName: repo, State: string(TaskMerged), Branch: branch}); err != nil {
+		t.Fatal(err)
+	}
+	engine := Engine{Store: store}
+	for _, ref := range []taskRef{
+		{ID: "canonical", Repo: repo, Branch: branch},   // payload task id
+		{ID: "late-review", Repo: repo, Branch: branch}, // fresh id on the taken branch
+	} {
+		if err := engine.setTaskState(ctx, ref, TaskBlocked); err != nil {
+			t.Fatalf("setTaskState(%+v, blocked) returned error %v; refusing the block must not fail the advance that asked for it", ref, err)
+		}
+		task, err := store.GetTask(ctx, "canonical")
+		if err != nil {
+			t.Fatalf("GetTask(canonical) returned error: %v", err)
+		}
+		if task.State != string(TaskMerged) {
+			t.Fatalf("task state = %q after setTaskState(%+v, blocked), want merged (the landed-work record must survive)", task.State, ref)
+		}
+	}
+	if _, err := store.GetTask(ctx, "late-review"); err == nil {
+		t.Fatal("GetTask(late-review) succeeded; the refusal must not mint a second task on the merged branch")
+	}
+
+	// The refusal is silent to the caller, so the trace is the only way anybody
+	// learns a block was dropped. One per refused call, on the canonical task.
+	events, err := store.ListTaskEvents(ctx, "canonical")
+	if err != nil {
+		t.Fatalf("ListTaskEvents returned error: %v", err)
+	}
+	refusals := 0
+	for _, event := range events {
+		if event.Kind != TaskEventMergedBlockRefused {
+			continue
+		}
+		refusals++
+		if !strings.Contains(event.Reason, string(TaskMerged)) || !strings.Contains(event.Reason, string(TaskBlocked)) {
+			t.Fatalf("%s reason = %q, want both states named", TaskEventMergedBlockRefused, event.Reason)
+		}
+	}
+	if refusals != 2 {
+		t.Fatalf("%s events = %d, want 2 (one per refused identity)", TaskEventMergedBlockRefused, refusals)
+	}
+
+	// `merged` is NOT frozen: the refusal is scoped to the blocked direction, so
+	// `gitmoot task resume-work`'s merged -> implementing move still applies.
+	if err := engine.setTaskState(ctx, taskRef{ID: "canonical", Repo: repo, Branch: branch}, TaskImplementing); err != nil {
+		t.Fatalf("setTaskState(canonical, implementing) returned error: %v", err)
+	}
+	if task, _ := store.GetTask(ctx, "canonical"); task.State != string(TaskImplementing) {
+		t.Fatalf("task state = %q, want implementing; the guard must not freeze merged outright", task.State)
+	}
+}

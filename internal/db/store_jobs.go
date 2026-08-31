@@ -513,6 +513,47 @@ func (s *Store) CountQueuedJobsForRepo(ctx context.Context, repo string) (int, e
 	return count, err
 }
 
+// listQueuedJobsForRepoSQL mirrors listQueuedJobsSQL with a repo residual and the
+// denormalized repo/pull_request columns projected, so a repo-scoped consumer can
+// select its own candidates WITHOUT decoding another repo's payload.
+//
+// INDEXED BY is not decoration. MEASURED with EXPLAIN QUERY PLAN: left to itself the
+// planner picks idx_jobs_repo (repo=?) and then builds a TEMP B-TREE for the ORDER BY,
+// which walks every job this repo has ever had and sorts them. The queued set is tiny
+// by construction — that is the premise of the whole sweep — so scanning the partial
+// index in created_at order with repo as the residual is strictly cheaper and needs no
+// sort. The literal 'queued' predicate is what makes the partial index usable at all;
+// the hint follows the existing precedent at countCurrentJobsByOrgRoleRunningSQL.
+const listQueuedJobsForRepoSQL = `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, repo, pull_request
+		FROM jobs INDEXED BY idx_jobs_queued_created
+		WHERE state = 'queued' AND externally_driven = 0 AND repo = ? ORDER BY created_at, rowid`
+
+// ListQueuedJobsForRepo returns this repo's queued engine-owned jobs in created_at
+// (then rowid) order, with the repo and pull_request projections populated.
+//
+// It exists because ListQueuedJobs is HOME-WIDE and projects neither column, so a
+// repo-scoped caller had to decode every payload in the home just to discover whose
+// row it was — which meant one undecodable payload in ANY repo could fail EVERY
+// watched repo's poll, permanently, since that condition is not transient. Filtering
+// in SQL means a foreign row is never read at all.
+func (s *Store) ListQueuedJobsForRepo(ctx context.Context, repo string) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, listQueuedJobsForRepoSQL, strings.TrimSpace(repo))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []Job
+	for rows.Next() {
+		var job Job
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.Repo, &job.PullRequest); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
 const countCurrentJobsByOrgRoleRunningSQL = `SELECT json_extract(payload, '$.acting_org_role') AS role, COUNT(*)
 	FROM jobs INDEXED BY idx_jobs_running_updated_at
 	WHERE state = 'running' AND json_valid(payload)

@@ -5332,6 +5332,68 @@ func TestListQueuedJobsUsesQueuedIndex(t *testing.T) {
 	}
 }
 
+// TestListQueuedJobsForRepoScopesInSQL pins #1673's selection surface: the repo-scoped
+// queued lister returns ONLY this repo's queued rows with the denormalized repo and
+// pull_request projections populated, and is still served by the partial queued index.
+// The projection matters because a repo-scoped consumer that had to decode payloads to
+// discover ownership let one undecodable row in ANY repo fail EVERY repo's poll.
+func TestListQueuedJobsForRepoScopesInSQL(t *testing.T) {
+	ctx := context.Background()
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	seed := []struct {
+		id, state, payload string
+	}{
+		{"mine-2", "queued", `{"repo":"gitmoot/gitmoot","pull_request":8}`},
+		{"mine-1", "queued", `{"repo":"gitmoot/gitmoot","pull_request":7}`},
+		{"foreign", "queued", `{"repo":"gitmoot/other","pull_request":7}`},
+		{"mine-running", "running", `{"repo":"gitmoot/gitmoot","pull_request":9}`},
+	}
+	for _, s := range seed {
+		if err := store.CreateJob(ctx, Job{ID: s.id, Agent: "a", Type: "review", State: s.state, Payload: s.payload}); err != nil {
+			t.Fatalf("CreateJob(%s) returned error: %v", s.id, err)
+		}
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET created_at = '2026-01-01 00:00:00' WHERE id = 'mine-1'`); err != nil {
+		t.Fatalf("set created_at(mine-1) returned error: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET created_at = '2026-01-02 00:00:00' WHERE id = 'mine-2'`); err != nil {
+		t.Fatalf("set created_at(mine-2) returned error: %v", err)
+	}
+
+	plan := explainQueryPlan(t, store, listQueuedJobsForRepoSQL, "gitmoot/gitmoot")
+	if !strings.Contains(plan, "USING INDEX idx_jobs_queued_created") {
+		t.Fatalf("ListQueuedJobsForRepo plan does not use idx_jobs_queued_created:\n%s", plan)
+	}
+	if strings.Contains(plan, "TEMP B-TREE") {
+		t.Fatalf("ListQueuedJobsForRepo plan builds a temp b-tree:\n%s", plan)
+	}
+
+	got, err := store.ListQueuedJobsForRepo(ctx, "gitmoot/gitmoot")
+	if err != nil {
+		t.Fatalf("ListQueuedJobsForRepo returned error: %v", err)
+	}
+	wantIDs := []string{"mine-1", "mine-2"}
+	if len(got) != len(wantIDs) {
+		t.Fatalf("returned %d jobs, want %d (this repo's queued rows only): %+v", len(got), len(wantIDs), got)
+	}
+	for i, job := range got {
+		if job.ID != wantIDs[i] {
+			t.Fatalf("job[%d].ID = %q, want %q (created_at, rowid order)", i, job.ID, wantIDs[i])
+		}
+		if job.Repo != "gitmoot/gitmoot" {
+			t.Fatalf("job[%d].Repo = %q, want the projection populated", i, job.Repo)
+		}
+		if job.PullRequest <= 0 {
+			t.Fatalf("job[%d].PullRequest = %d, want the projection populated", i, job.PullRequest)
+		}
+	}
+}
+
 // TestListRunningJobsUpdatedBeforeOrder pins FIX-4a (#619): ListRunningJobsUpdatedBefore
 // orders by updated_at (not id), applies the running/threshold filter, and is served
 // by idx_jobs_running_updated_at.

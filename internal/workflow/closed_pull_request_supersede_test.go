@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"testing"
@@ -203,5 +204,161 @@ func insertQueuedJob(t *testing.T, store *db.Store, job db.Job, payload JobPaylo
 	job.Payload = encoded
 	if err := store.CreateJob(context.Background(), job); err != nil {
 		t.Fatalf("CreateJob(%s) returned error: %v", job.ID, err)
+	}
+}
+
+// TestFinalizeClosedPullRequestDelegationChildOfMergedTaskReleasesCoordinator is
+// the PR's headline case, driven through the real fan-out route. A review fan-out
+// on a pull request that has since MERGED leaves queued children; the sweep must be
+// able to hand each one to the coordinator-releasing path without the parent's
+// failure_policy rewriting `merged` to `blocked` on the way (#1673).
+//
+// It asserts on the PARENT, not just the child: under the default block_parent the
+// coordinator's policy runs to its own decision (a BlockedError naming the closed
+// PR) while the task stays merged, and under `continue` the coordinator continuation
+// job is actually minted — the row that read ErrNoRows while the sweep was refusing
+// to route these children at all.
+func TestFinalizeClosedPullRequestDelegationChildOfMergedTaskReleasesCoordinator(t *testing.T) {
+	for _, tc := range []struct {
+		policy string
+		// wantBlocked is the block_parent contract: the parent's policy surfaces a
+		// BlockedError, which is the DAG deciding, not the sweep failing.
+		wantBlocked bool
+		// wantContinuation is the coordinator continuation the `continue` policy
+		// mints once every delegation is resolved.
+		wantContinuation bool
+	}{
+		{policy: "", wantBlocked: true},
+		{policy: "continue", wantContinuation: true},
+	} {
+		name := tc.policy
+		if name == "" {
+			name = "block_parent_default"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			seedAgent(t, store, "coord", []string{"ask"}, "gitmoot/gitmoot")
+			seedAgent(t, store, "api", []string{"review"}, "gitmoot/gitmoot")
+			seedAgent(t, store, "ui", []string{"review"}, "gitmoot/gitmoot")
+			engine := testEngine(store)
+			// The task is MERGED before the sweep runs: the daemon's own
+			// reconcileExternallyMergedTasks drives it there in the same PollOnce.
+			if err := store.UpsertTask(ctx, db.Task{
+				ID: "task-7", RepoFullName: "gitmoot/gitmoot", GoalID: "goal-1", Title: "Parent",
+				State: string(TaskMerged), Branch: "task-7",
+			}); err != nil {
+				t.Fatalf("UpsertTask(task-7) returned error: %v", err)
+			}
+			delegations := []Delegation{
+				{ID: "api", Agent: "api", Action: "review", Prompt: "review api", FailurePolicy: tc.policy},
+				{ID: "ui", Agent: "ui", Action: "review", Prompt: "review ui", FailurePolicy: tc.policy},
+			}
+			insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, JobPayload{
+				Repo:        "gitmoot/gitmoot",
+				Branch:      "task-7",
+				PullRequest: 7,
+				TaskID:      "task-7",
+				TaskTitle:   "Parent",
+				Sender:      "coord",
+				Result: &AgentResult{
+					Decision:    "approved",
+					Summary:     "fan out",
+					Delegations: delegations,
+				},
+			})
+			if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+				t.Fatalf("AdvanceJob(parent) returned error: %v", err)
+			}
+
+			children := []string{"parent-job/delegation/api", "parent-job/delegation/ui"}
+			for _, child := range children {
+				if mustJob(t, store, child).State != string(JobQueued) {
+					t.Fatalf("child %s is not queued", child)
+				}
+				finalized, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, child,
+					"queued review job superseded: gitmoot/gitmoot pull request #7 is no longer open")
+				var blocked BlockedError
+				switch {
+				case tc.wantBlocked:
+					if !errors.As(err, &blocked) {
+						t.Fatalf("finalize %s error = %v, want a BlockedError from the parent's block_parent policy", child, err)
+					}
+					if !strings.Contains(blocked.Reason, "pull request #7 is no longer open") {
+						t.Fatalf("blocked reason = %q, want the closed PR named", blocked.Reason)
+					}
+				case err != nil:
+					t.Fatalf("finalize %s returned error: %v", child, err)
+				}
+				if !finalized {
+					t.Fatalf("finalized = false for %s, want the queued child terminated and its parent advanced", child)
+				}
+
+				terminal := mustJob(t, store, child)
+				if terminal.State != string(JobFailed) {
+					t.Fatalf("child %s state = %q, want failed (the only terminal state a child can advance a parent from)", child, terminal.State)
+				}
+				payload, err := unmarshalPayload(terminal.Payload)
+				if err != nil {
+					t.Fatalf("unmarshalPayload(%s) returned error: %v", child, err)
+				}
+				if payload.Result == nil {
+					t.Fatalf("child %s has no result: the coordinator would wait forever", child)
+				}
+				if !strings.Contains(payload.Result.Summary, "pull request #7 is no longer open") {
+					t.Fatalf("child %s result summary = %q, want the closed PR named", child, payload.Result.Summary)
+				}
+			}
+
+			// PARENT SIDE. The merged record survives the whole sweep: this is the
+			// state whose loss the pre-fix daemon avoided only by refusing to route
+			// these children, which stranded the coordinator instead.
+			assertTaskState(t, store, "task-7", TaskMerged)
+
+			// The coordinator's delegation barrier no longer waits on anything: every
+			// delegation is resolved as far as the parent's own resolver is concerned.
+			resolved, err := engine.childDelegationJobs(ctx, "parent-job")
+			if err != nil {
+				t.Fatalf("childDelegationJobs returned error: %v", err)
+			}
+			if !allDelegationsResolved(delegations, resolved, nil) {
+				t.Fatalf("coordinator still waiting: children = %+v", resolved)
+			}
+
+			continuation, err := store.GetJob(ctx, DelegationContinuationID("parent-job"))
+			switch {
+			case tc.wantContinuation:
+				if err != nil {
+					t.Fatalf("GetJob(continuation) returned error: %v; the coordinator was not released", err)
+				}
+				if continuation.State != string(JobQueued) {
+					t.Fatalf("continuation state = %q, want queued", continuation.State)
+				}
+			default:
+				// block_parent deliberately mints no continuation; the parent's
+				// BlockedError above is its terminal decision.
+				if !errors.Is(err, sql.ErrNoRows) {
+					t.Fatalf("GetJob(continuation) = %+v err=%v, want no row under block_parent", continuation, err)
+				}
+			}
+
+			// The refused block is legible after the fact, not silent.
+			events, err := store.ListTaskEvents(ctx, "task-7")
+			if err != nil {
+				t.Fatalf("ListTaskEvents returned error: %v", err)
+			}
+			refusals := 0
+			for _, event := range events {
+				if event.Kind == TaskEventMergedBlockRefused {
+					refusals++
+				}
+			}
+			if tc.wantBlocked && refusals == 0 {
+				t.Fatalf("no %s task event: the dropped block left no trace", TaskEventMergedBlockRefused)
+			}
+			if !tc.wantBlocked && refusals != 0 {
+				t.Fatalf("%s events = %d under %s, want 0 (no block was ever attempted)", TaskEventMergedBlockRefused, refusals, name)
+			}
+		})
 	}
 }

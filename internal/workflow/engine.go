@@ -420,6 +420,15 @@ func (e Engine) setTaskState(ctx context.Context, ref taskRef, state TaskState) 
 		if IsDisposedTaskState(existing.State) && existing.State != string(state) {
 			return fmt.Errorf("task %s is %s; workflow advancement cannot move it to %s", existing.ID, existing.State, state)
 		}
+		// A dead delegation child must not undo the record that the work landed
+		// (#1673). The refusal returns nil ON PURPOSE: the block_parent advance that
+		// asked for it still has to finish releasing the coordinator, so this leaves a
+		// durable task event instead of an error. What block_parent then observes is
+		// exactly: child failed and finalized, parent advanced, task still `merged`.
+		if IsMergedToBlockedRegression(existing.State, string(state)) {
+			e.recordRefusedMergedBlock(ctx, existing.ID, state)
+			return nil
+		}
 		if task.GoalID == "" {
 			task.GoalID = existing.GoalID
 		}
@@ -449,11 +458,34 @@ func (e Engine) setTaskState(ctx context.Context, ref taskRef, state TaskState) 
 			if IsDisposedTaskState(byBranch.State) && byBranch.State != string(state) {
 				return fmt.Errorf("task %s is %s; workflow advancement cannot move it to %s", byBranch.ID, byBranch.State, state)
 			}
+			// Second identity setTaskState can resolve (see dismissedTaskForAdvancement):
+			// the branch's canonical task. A merged canonical task reached through a
+			// FRESH task id is the same landed-work record and gets the same refusal —
+			// guarding only the id path would leave the regression fully reachable.
+			if IsMergedToBlockedRegression(byBranch.State, string(state)) {
+				e.recordRefusedMergedBlock(ctx, byBranch.ID, state)
+				return nil
+			}
 			byBranch.State = string(state)
 			return e.Store.UpsertTask(ctx, byBranch)
 		}
 	}
 	return e.Store.UpsertTask(ctx, task)
+}
+
+// recordRefusedMergedBlock leaves the durable trace for a refused merged->blocked
+// move. Best-effort and error-free by design: the whole point of the refusal is
+// that the surrounding advance must still complete (a dead delegation child has to
+// release its coordinator), so an unwritable audit row must not become an error
+// that fails it. Mirrors the best-effort AddTaskEvent provenance writes in
+// engine_pr_lifecycle.go.
+func (e Engine) recordRefusedMergedBlock(ctx context.Context, taskID string, requested TaskState) {
+	_ = e.Store.AddTaskEvent(ctx, db.TaskEvent{
+		TaskID: taskID,
+		Kind:   TaskEventMergedBlockRefused,
+		Reason: fmt.Sprintf("refused %s -> %s: the pull request already merged, so the landed-work record is kept; the advance that requested it continues",
+			TaskMerged, requested),
+	})
 }
 
 func (e Engine) jobID(request JobRequest) string {

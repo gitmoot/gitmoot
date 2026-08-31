@@ -324,7 +324,11 @@ func TestPollOnceRoutesQueuedDelegationChildToTheChildPath(t *testing.T) {
 	}{
 		{coordinator + "/delegation/correctness", workflow.JobFailed, "a cancelled child cannot advance its coordinator"},
 		{"missing-coordinator/delegation/security", workflow.JobCancelled, "an orphaned child has no coordinator to release"},
-		{mergedCoordinator + "/delegation/correctness", workflow.JobCancelled, "advancing a merged task's coordinator would rewrite merged to blocked"},
+		// A merged task's coordinator must STILL be released. Refusing here traded one
+		// strand for another: reconcileExternallyMergedTasks drives the task to `merged`
+		// earlier in the SAME poll, so every child took the cancel path and no
+		// coordinator ever advanced. Protecting `merged` is setTaskState's job.
+		{mergedCoordinator + "/delegation/correctness", workflow.JobFailed, "a merged task's coordinator must still be released"},
 	} {
 		job, err := store.GetJob(ctx, tc.id)
 		if err != nil {
@@ -346,6 +350,36 @@ func TestPollOnceRoutesQueuedDelegationChildToTheChildPath(t *testing.T) {
 		if legible != 1 {
 			t.Fatalf("%s %s events = %d, want 1", tc.id, workflow.JobEventSupersededPullRequestClosed, legible)
 		}
+	}
+
+	// The child must have been RELEASED into the DAG, not merely killed. The
+	// load-bearing observable is the SYNTHETIC RESULT on the child: advanceDelegations
+	// refuses a child whose Result is nil, which is precisely how a cancelled child
+	// left its coordinator waiting forever. (advance_completed is NOT the instrument:
+	// with the default block_parent policy AdvanceJob returns a BlockedError and that
+	// event is never written, even though the DAG did act.)
+	for _, child := range []string{coordinator + "/delegation/correctness", mergedCoordinator + "/delegation/correctness"} {
+		job, err := store.GetJob(ctx, child)
+		if err != nil {
+			t.Fatalf("GetJob(%s): %v", child, err)
+		}
+		var payload workflow.JobPayload
+		if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
+			t.Fatalf("unmarshal %s: %v", child, err)
+		}
+		if payload.Result == nil {
+			t.Fatalf("child %s has no result: its coordinator can never advance", child)
+		}
+	}
+
+	// The live task records the DAG's decision (block_parent). That transition IS the
+	// release: the coordinator is no longer waiting on a child that will never run.
+	live, err := store.GetTask(ctx, "task-7")
+	if err != nil {
+		t.Fatalf("GetTask(task-7): %v", err)
+	}
+	if live.State != string(workflow.TaskBlocked) {
+		t.Fatalf("task-7 state = %q, want blocked (the coordinator's failure_policy decision)", live.State)
 	}
 
 	// The merged task must still be merged: the sweep's premise is that the PR

@@ -1049,27 +1049,42 @@ func (d Daemon) supersedeStaleReviewJobs(ctx context.Context, pull github.PullRe
 //     pre-#843 rows read 0; 0 means "no PR recorded", never "PR zero".
 //   - four PR-bound classes are exempt and enumerated in queuedJobSurvivesClosedPullRequest.
 func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, openPullNumbers map[int64]struct{}) error {
-	// ListQueuedJobs filters state in SQL against the partial index on
-	// state='queued' and already excludes externally-driven rows.
-	jobs, err := d.Store.ListQueuedJobs(ctx)
+	// Repo-scoped in SQL. ListQueuedJobs is HOME-WIDE and projects neither repo nor
+	// pull_request, so selecting candidates from it meant decoding every payload in
+	// the home — and one undecodable row in ANY repo then failed EVERY watched repo's
+	// poll, permanently, because that condition never clears. This query never reads a
+	// foreign row, and keeps the literal 'queued' predicate so the partial index
+	// idx_jobs_queued_created still applies.
+	jobs, err := d.Store.ListQueuedJobsForRepo(ctx, d.Repo.FullName())
 	if err != nil {
 		return err
 	}
+	// One forge answer per number per poll. Without it, N queued jobs bound to the
+	// same unrecorded number cost N identical GetPullRequest calls in a single poll,
+	// and an issue-bound job — which can never be terminated — repeats that cost on
+	// every poll forever.
+	evidence := map[int]bool{}
 	var firstErr error
 	for _, job := range jobs {
+		if job.PullRequest <= 0 {
+			continue
+		}
+		if _, open := openPullNumbers[int64(job.PullRequest)]; open {
+			continue
+		}
 		payload, err := workflowPayload(job)
 		if err != nil {
-			// A payload this poll cannot parse is not evidence that the work is
-			// pointless. Leave it queued and surface the error.
-			if firstErr == nil {
-				firstErr = err
-			}
+			// This repo's own row, and it cannot be parsed. Skip it — an unparseable
+			// payload is not evidence the work is pointless — but do NOT fail the poll:
+			// the condition is permanent, so returning it here would wedge every later
+			// reconciler in the chain on every tick. The log line is the trace.
+			d.logf("queued-job sweep: skipping %s: %v", job.ID, err)
 			continue
 		}
-		if payload.Repo != d.Repo.FullName() || payload.PullRequest <= 0 {
-			continue
-		}
-		if _, open := openPullNumbers[int64(payload.PullRequest)]; open {
+		if payload.PullRequest <= 0 || payload.Repo != d.Repo.FullName() {
+			// The projection and the payload disagree (a pre-#843 row was never
+			// backfilled, or a payload was rewritten without its projection). Trust the
+			// payload, which is what every other consumer reads.
 			continue
 		}
 		// Cheapest-first, and the order is load-bearing rather than cosmetic: the
@@ -1092,7 +1107,7 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 		// every child, which gets no `routed` event of its own — and an issue number
 		// can never appear in a list of PRs. Require a second, independent instrument
 		// before terminating anything.
-		known, err := d.pullRequestNumberIsAPullRequest(ctx, payload.PullRequest)
+		known, err := d.pullRequestNumberIsAPullRequest(ctx, payload.PullRequest, evidence)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -1104,11 +1119,28 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 		}
 		reason := fmt.Sprintf("queued %s job superseded: %s pull request #%d is no longer open",
 			job.Type, payload.Repo, payload.PullRequest)
-		if d.queuedChildCanReleaseCoordinator(ctx, payload) {
+		releasesCoordinator, err := d.queuedChildCanReleaseCoordinator(ctx, payload)
+		if err != nil {
+			// A store error here is not evidence about the coordinator. Skipping keeps a
+			// transient failure from silently downgrading a child with a LIVE parent to
+			// the cancel path, which would strand that coordinator for good.
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if releasesCoordinator {
+			engine, err := d.workflowForJob(ctx, job)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
 			// A delegation child must also release its coordinator; see
 			// FinalizeClosedPullRequestDelegationChild for why its terminal state
 			// differs from the top-level path.
-			if _, err := d.Workflow.FinalizeClosedPullRequestDelegationChild(ctx, job.ID, reason); err != nil {
+			if _, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, job.ID, reason); err != nil {
 				// The parent's failure_policy decides what a dead child means, and it
 				// RECORDS that decision: block_parent surfaces as BlockedError,
 				// escalate_human as AwaitingHumanError. Both are the DAG acting, not this
@@ -1145,7 +1177,26 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 // So fall back to asking the forge about that one number. Any error, including the 404
 // an issue number produces, is NO EVIDENCE and leaves the job queued: a transient
 // forge failure must never be read as licence to terminate, and the next poll retries.
-func (d Daemon) pullRequestNumberIsAPullRequest(ctx context.Context, number int) (bool, error) {
+func (d Daemon) pullRequestNumberIsAPullRequest(ctx context.Context, number int, memo map[int]bool) (bool, error) {
+	if memo != nil {
+		if answer, seen := memo[number]; seen {
+			return answer, nil
+		}
+	}
+	answer, err := d.resolvePullRequestNumberEvidence(ctx, number)
+	if err != nil {
+		return false, err
+	}
+	if memo != nil {
+		// Cache the NEGATIVE too. An issue-bound job can never be terminated, so
+		// without this every queued job sharing that number pays the same 404 again,
+		// once per job per poll, forever.
+		memo[number] = answer
+	}
+	return answer, nil
+}
+
+func (d Daemon) resolvePullRequestNumberEvidence(ctx context.Context, number int) (bool, error) {
 	_, err := d.Store.GetPullRequest(ctx, d.Repo.FullName(), int64(number))
 	if err == nil {
 		return true, nil
@@ -1160,40 +1211,70 @@ func (d Daemon) pullRequestNumberIsAPullRequest(ctx context.Context, number int)
 	return pull.Number == int64(number), nil
 }
 
+// workflowForJob resolves the engine to advance THIS job with. Every other daemon
+// path that reaches AdvanceJob does this (reconcileReviewingPullRequest), because
+// WorkflowForJob binds the exec backend recorded on the job; using the repo-default
+// engine instead would advance a job on the wrong runner.
+func (d Daemon) workflowForJob(ctx context.Context, job db.Job) (*workflow.Engine, error) {
+	if d.WorkflowForJob == nil {
+		return d.Workflow, nil
+	}
+	engine, err := d.WorkflowForJob(ctx, job)
+	if err != nil {
+		return nil, fmt.Errorf("resolve workflow for job %q: %w", job.ID, err)
+	}
+	if engine == nil {
+		return nil, fmt.Errorf("resolve workflow for job %q: workflow is nil", job.ID)
+	}
+	return engine, nil
+}
+
 // queuedChildCanReleaseCoordinator reports whether terminating this queued job
-// should drive its coordinator. It requires a delegation parent whose row still
-// exists — an ORPHANED child (parent purged, or a synthetic id never persisted) must
-// take the top-level path, because the child finalizer walks to the parent and would
-// fail with "job not found" on every poll, and an error that recurs forever is
-// exactly the camouflage this sweep exists to remove.
+// should drive its coordinator, and distinguishes "no" from "cannot tell".
 //
-// It also requires the task NOT to have settled already. The advance a dead child
-// triggers ends in the parent's failure_policy, and block_parent calls
-// setTaskState(blocked), whose only guard is IsDisposedTaskState. A task that already
-// reached `merged` would therefore be rewritten from merged to blocked by a sweep
-// whose entire premise is that the PR merged — the state that matters most, undone.
-func (d Daemon) queuedChildCanReleaseCoordinator(ctx context.Context, payload workflow.JobPayload) bool {
+// It requires a delegation parent whose row still EXISTS. An orphaned child — parent
+// purged, or a synthetic id never persisted — takes the top-level path, because the
+// child finalizer walks to the parent and would fail with "job not found" on every
+// poll, and an error that recurs forever is the camouflage this sweep removes.
+//
+// It does NOT refuse on a merged task any more, and that reversal is the point. The
+// merged-task refusal traded one strand for another: in the PR's own headline case —
+// reconcileExternallyMergedTasks drives the task to `merged` EARLIER IN THE SAME POLL
+// — every child then took the cancel path and its coordinator was never released, so
+// the strand simply moved from the child to the parent. Protecting `merged` belongs in
+// the state machine, not here: setTaskState now refuses merged -> blocked, so the
+// advance can run and the record that the work landed still cannot be undone.
+//
+// A store error returns an error rather than false. Reading a transient failure as
+// "no coordinator" would downgrade a child with a LIVE parent to the cancel path and
+// strand that coordinator permanently, for the duration of one failed query.
+func (d Daemon) queuedChildCanReleaseCoordinator(ctx context.Context, payload workflow.JobPayload) (bool, error) {
 	parentID := strings.TrimSpace(payload.ParentJobID)
 	if parentID == "" || d.Workflow == nil {
-		return false
+		return false, nil
 	}
 	if _, err := d.Store.GetJob(ctx, parentID); err != nil {
-		return false
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
 	}
 	taskID := strings.TrimSpace(payload.TaskID)
 	if taskID == "" {
-		return true
+		return true, nil
 	}
 	task, err := d.Store.GetTask(ctx, taskID)
 	if err != nil {
-		// No task evidence: do not risk driving an advance that writes task state.
-		return false
+		if errors.Is(err, sql.ErrNoRows) {
+			// No task at all: the child still has a coordinator to release, and there
+			// is no task state for the advance to write.
+			return true, nil
+		}
+		return false, err
 	}
-	switch task.State {
-	case string(workflow.TaskMerged), string(workflow.TaskBlocked):
-		return false
-	}
-	return !workflow.IsDisposedTaskState(task.State)
+	// A DISPOSED task (dismissed, superseded, stranded) is deliberately outside the
+	// state machine's normal transitions, so leave those alone.
+	return !workflow.IsDisposedTaskState(task.State), nil
 }
 
 // queuedJobSurvivesClosedPullRequest reports whether a queued PR-bound job must be
@@ -1218,6 +1299,13 @@ func (d Daemon) queuedChildCanReleaseCoordinator(ctx context.Context, payload wo
 //   - a TEMP-WORKER MERGE-BACK summary describes work that already ran. Today it
 //     carries PullRequest 0 so the caller's `> 0` gate already skips it; it is named
 //     here so a future field addition cannot make it collateral.
+//   - a job an operator RETRIED after this sweep terminated it. `gitmoot job retry`
+//     accepts `cancelled` and writes the row back to `queued` with a `retry_queued`
+//     event, so without this the sweep re-cancelled it on the very next poll, forever:
+//     an operator's explicit instruction silently undone in a loop, which is the exact
+//     failure this sweep was built to remove rather than create. The test is ORDER, not
+//     mere presence: a retry NEWER than the newest supersede means "I know, do it
+//     anyway", while a retry older than the supersede is history.
 func (d Daemon) queuedJobSurvivesClosedPullRequest(ctx context.Context, job db.Job, payload workflow.JobPayload) (bool, error) {
 	if payload.Sender == workflow.PipelineJobSender || payload.Sender == "local" {
 		return true, nil
@@ -1235,6 +1323,15 @@ func (d Daemon) queuedJobSurvivesClosedPullRequest(ctx context.Context, job db.J
 	for _, event := range events {
 		if event.Kind == "routed" {
 			return true, nil
+		}
+	}
+	// Newest-first: the last word between a supersede and a retry decides.
+	for i := len(events) - 1; i >= 0; i-- {
+		switch events[i].Kind {
+		case "retry_queued":
+			return true, nil
+		case workflow.JobEventSupersededPullRequestClosed:
+			return false, nil
 		}
 	}
 	return false, nil
