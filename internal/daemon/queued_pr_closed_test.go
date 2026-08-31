@@ -76,6 +76,14 @@ func TestPollOnceSupersedesQueuedLegsWhosePullRequestClosed(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AddJobEvent routed: %v", err)
 	}
+	// A coordinator continuation synthesizes work that already happened; its id is
+	// deterministically parent + "/continuation" and it carries the parent as
+	// ParentJobID, which is what the exemption keys on. Without the exemption it
+	// would take the delegation-child path and be failed instead.
+	seedQueuedJob(t, store, "coordinator-job/continuation", "lead", "ask", workflow.JobPayload{
+		Repo: repo.FullName(), Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "lead",
+		ParentJobID: "coordinator-job",
+	})
 
 	engine := workflow.Engine{Store: store}
 	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
@@ -98,6 +106,7 @@ func TestPollOnceSupersedesQueuedLegsWhosePullRequestClosed(t *testing.T) {
 		{"pipeline-stage", workflow.JobQueued, "pipeline stage jobs own run rows"},
 		{"merge-back-summary", workflow.JobQueued, "a merge-back describes work that already ran"},
 		{"human-comment-ask", workflow.JobQueued, "an operator asked for it explicitly"},
+		{"coordinator-job/continuation", workflow.JobQueued, "a continuation synthesizes work that already happened"},
 	} {
 		job, err := store.GetJob(ctx, tc.id)
 		if err != nil {
@@ -125,6 +134,95 @@ func TestPollOnceSupersedesQueuedLegsWhosePullRequestClosed(t *testing.T) {
 		}
 		if superseded != 1 {
 			t.Fatalf("%s %s events = %d, want 1 across two polls", id, workflow.JobEventSupersededPullRequestClosed, superseded)
+		}
+	}
+}
+
+// TestPollOnceRoutesQueuedDelegationChildToTheChildPath pins the daemon-side wiring
+// of the two terminal paths. A child with a LIVE coordinator must not be cancelled:
+// finalizeTimedOutJob's state gate rejects `cancelled`, so a cancelled child would
+// leave its coordinator waiting and the strand would move up one level. An ORPHANED
+// child takes the top-level path instead, because walking to a parent that does not
+// exist fails every poll — a permanent error is the camouflage this sweep removes.
+func TestPollOnceRoutesQueuedDelegationChildToTheChildPath(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	for _, agent := range []db.Agent{
+		{Name: "coord", Role: "coordinator", Runtime: "codex", RuntimeRef: "last", RepoScope: repo.FullName(), Capabilities: []string{"ask"}, AutonomyPolicy: "auto", HealthStatus: "ok"},
+		{Name: "audit", Role: "reviewer", Runtime: "codex", RuntimeRef: "last", RepoScope: repo.FullName(), Capabilities: []string{"review"}, AutonomyPolicy: "auto", HealthStatus: "ok"},
+	} {
+		if err := store.UpsertAgent(ctx, agent); err != nil {
+			t.Fatalf("UpsertAgent %s: %v", agent.Name, err)
+		}
+	}
+	// PR 7 is absent from the open listing: merged underneath its fan-out.
+	client := &fakeGitHub{pulls: nil, comments: map[int64][]github.IssueComment{}}
+
+	coordinator := "review-coordinator/task-7/review-1"
+	coordinatorPayload, err := json.Marshal(workflow.JobPayload{
+		Repo: repo.FullName(), Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "lead",
+		Result: &workflow.AgentResult{
+			Decision: "approved",
+			Summary:  "fan out",
+			Delegations: []workflow.Delegation{
+				{ID: "correctness", Agent: "audit", Action: "review", Prompt: "review correctness"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(coordinator): %v", err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: coordinator, Agent: "coord", Type: "ask", State: string(workflow.JobSucceeded), Payload: string(coordinatorPayload),
+	}); err != nil {
+		t.Fatalf("CreateJob(coordinator): %v", err)
+	}
+	seedQueuedJob(t, store, coordinator+"/delegation/correctness", "audit", "review", workflow.JobPayload{
+		Repo: repo.FullName(), Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "lead",
+		ParentJobID: coordinator, DelegationID: "correctness",
+	})
+	// Same shape, but its coordinator row does not exist.
+	seedQueuedJob(t, store, "missing-coordinator/delegation/security", "audit", "review", workflow.JobPayload{
+		Repo: repo.FullName(), Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "lead",
+		ParentJobID: "missing-coordinator", DelegationID: "security",
+	})
+
+	engine := workflow.Engine{Store: store}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+	for poll := range 2 {
+		if err := daemon.PollOnce(ctx); err != nil {
+			t.Fatalf("PollOnce %d: %v", poll+1, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		id    string
+		state workflow.JobState
+		why   string
+	}{
+		{coordinator + "/delegation/correctness", workflow.JobFailed, "a cancelled child cannot advance its coordinator"},
+		{"missing-coordinator/delegation/security", workflow.JobCancelled, "an orphaned child has no coordinator to release"},
+	} {
+		job, err := store.GetJob(ctx, tc.id)
+		if err != nil {
+			t.Fatalf("GetJob(%s): %v", tc.id, err)
+		}
+		if job.State != string(tc.state) {
+			t.Fatalf("%s state = %q, want %q (%s)", tc.id, job.State, tc.state, tc.why)
+		}
+		events, err := store.ListJobEvents(ctx, tc.id)
+		if err != nil {
+			t.Fatalf("ListJobEvents(%s): %v", tc.id, err)
+		}
+		legible := 0
+		for _, event := range events {
+			if event.Kind == workflow.JobEventSupersededPullRequestClosed {
+				legible++
+			}
+		}
+		if legible != 1 {
+			t.Fatalf("%s %s events = %d, want 1", tc.id, workflow.JobEventSupersededPullRequestClosed, legible)
 		}
 	}
 }

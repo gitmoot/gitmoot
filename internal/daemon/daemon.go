@@ -1084,13 +1084,10 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 		}
 		reason := fmt.Sprintf("queued %s job superseded: %s pull request #%d is no longer open",
 			job.Type, payload.Repo, payload.PullRequest)
-		if strings.TrimSpace(payload.ParentJobID) != "" {
+		if d.queuedJobHasLiveCoordinator(ctx, payload) {
 			// A delegation child must also release its coordinator; see
 			// FinalizeClosedPullRequestDelegationChild for why its terminal state
 			// differs from the top-level path.
-			if d.Workflow == nil {
-				continue
-			}
 			if _, err := d.Workflow.FinalizeClosedPullRequestDelegationChild(ctx, job.ID, reason); err != nil {
 				// The parent's failure_policy decides what a dead child means, and
 				// block_parent (the default) surfaces as a BlockedError. That is the DAG
@@ -1108,6 +1105,23 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 		}
 	}
 	return firstErr
+}
+
+// queuedJobHasLiveCoordinator reports whether this queued job is a delegation child
+// whose coordinator row still exists, i.e. whether terminating it has a parent to
+// release. An ORPHANED child — parent purged, or a synthetic id whose coordinator was
+// never persisted — must take the top-level path instead: the child finalizer walks
+// to the parent and would fail with "job not found", and an error that recurs every
+// poll is exactly the camouflage this sweep exists to remove.
+func (d Daemon) queuedJobHasLiveCoordinator(ctx context.Context, payload workflow.JobPayload) bool {
+	parentID := strings.TrimSpace(payload.ParentJobID)
+	if parentID == "" || d.Workflow == nil {
+		return false
+	}
+	if _, err := d.Store.GetJob(ctx, parentID); err != nil {
+		return false
+	}
+	return true
 }
 
 // queuedJobSurvivesClosedPullRequest reports whether a queued PR-bound job must be
