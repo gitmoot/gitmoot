@@ -1079,6 +1079,85 @@ func TestPollOnceDismissedEscalationDoesNotBlockEligibleMerge(t *testing.T) {
 	}
 }
 
+func TestPollOnceClearedMergeGateSupersedesInitialMarker(t *testing.T) {
+	ctx := context.Background()
+	_, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskReadyToMerge)
+	client.checks[0].Bucket = "pass"
+	client.checks[0].State = "COMPLETED"
+	client.checks[0].CompletedAt = "2026-08-31T03:20:15Z"
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(client.statuses) != 2 {
+		t.Fatalf("statuses = %+v, want initial pending marker followed by success", client.statuses)
+	}
+	if marker := client.statuses[0]; marker.Context != "gitmoot/merge-gate" ||
+		marker.State != "pending" ||
+		marker.Description != "Gitmoot merge gate has not cleared this head" {
+		t.Fatalf("initial status = %+v, want uncleared-head pending marker", marker)
+	}
+	if cleared := client.statuses[1]; cleared.Context != "gitmoot/merge-gate" || cleared.State != "success" {
+		t.Fatalf("final status = %+v, want cleared-head success", cleared)
+	}
+	if len(client.merges) != 1 {
+		t.Fatalf("merge inputs = %+v, want one merge", client.merges)
+	}
+}
+
+func TestPollOnceMarksManagedHeadBeforeMergeGateIsEligible(t *testing.T) {
+	ctx := context.Background()
+	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskChangesRequested)
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(client.statuses) != 1 {
+		t.Fatalf("statuses = %+v, want one pending marker", client.statuses)
+	}
+	if marker := client.statuses[0]; marker.Context != "gitmoot/merge-gate" ||
+		marker.State != "pending" ||
+		marker.Description != "Gitmoot merge gate has not cleared this head" {
+		t.Fatalf("status = %+v, want uncleared-head pending marker", marker)
+	}
+	if len(client.merges) != 0 {
+		t.Fatalf("merge inputs = %+v, want none", client.merges)
+	}
+	gate, err := store.GetMergeGate(ctx, "gitmoot/gitmoot", 7)
+	if err != nil {
+		t.Fatalf("GetMergeGate returned error: %v", err)
+	}
+	if gate.State != "pending" || gate.Reason != "Gitmoot merge gate has not cleared this head" {
+		t.Fatalf("merge gate row = %+v, want uncleared-head pending marker", gate)
+	}
+}
+
+func TestPollOnceMarkerWriteFailureDoesNotBlockClearedHead(t *testing.T) {
+	ctx := context.Background()
+	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskReadyToMerge)
+	client.checks[0].Bucket = "pass"
+	client.checks[0].State = "COMPLETED"
+	client.checks[0].CompletedAt = "2026-08-31T03:20:15Z"
+	client.statusErrs = []error{errors.New("marker status bookkeeping unavailable")}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(client.statuses) != 2 || client.statuses[0].State != "pending" || client.statuses[1].State != "success" {
+		t.Fatalf("statuses = %+v, want failed pending attempt followed by success", client.statuses)
+	}
+	if len(client.merges) != 1 {
+		t.Fatalf("merge inputs = %+v, want one merge despite marker write failure", client.merges)
+	}
+	task, err := store.GetTask(ctx, "task-7")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskMerged) {
+		t.Fatalf("task state = %q, want %q", task.State, workflow.TaskMerged)
+	}
+}
+
 func TestMergeGateSkippedFanoutStaysPendingWhileNamedCheckRuns(t *testing.T) {
 	ctx := context.Background()
 	store, client, daemon, gate := newSkippedFanoutPendingGateDaemon(t, workflow.TaskReadyToMerge)

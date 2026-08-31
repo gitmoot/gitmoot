@@ -29,6 +29,8 @@ const (
 	externalMergeReconcileLookupLimit = 20
 	staleTaskReconcileLimit           = 20
 	staleTaskReconcileScanLimit       = 200
+	mergeGateStatusContext            = "gitmoot/merge-gate"
+	mergeGateUnclearedDescription     = "Gitmoot merge gate has not cleared this head"
 )
 
 // issueCommentPollOverlap is subtracted from the persisted last-seen cursor when
@@ -173,6 +175,7 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		d.ensureMergeGateStatus(ctx, pull)
 		mergeReadinessHandled := false
 		if changed {
 			if handled, err := d.handlePullRequestWorkflowChange(ctx, pull, reviewMemo); err != nil {
@@ -912,6 +915,69 @@ func (d Daemon) recordPullRequest(ctx context.Context, pull github.PullRequest) 
 		HeadSHA:      pull.HeadSHA,
 		State:        pull.State,
 	})
+}
+
+// ensureMergeGateStatus makes an unjudged managed head visible without making
+// GitHub status bookkeeping part of the merge decision. The local merge-gate
+// row suppresses an API read on every poll; a new or previously unseen head is
+// probed once so an existing current-head verdict is never overwritten.
+func (d Daemon) ensureMergeGateStatus(ctx context.Context, pull github.PullRequest) {
+	if d.Workflow == nil || d.Workflow.MergeGate == nil {
+		return
+	}
+	headSHA := strings.TrimSpace(pull.HeadSHA)
+	if headSHA == "" {
+		return
+	}
+
+	_, gateErr := d.Store.GetMergeGate(ctx, d.Repo.FullName(), pull.Number)
+	if gateErr != nil && !errors.Is(gateErr, sql.ErrNoRows) {
+		d.logf("merge-gate marker lookup failed for %s#%d: %v", d.Repo.FullName(), pull.Number, gateErr)
+		return
+	}
+	previous, pullErr := d.Store.GetPullRequest(ctx, d.Repo.FullName(), pull.Number)
+	if pullErr != nil && !errors.Is(pullErr, sql.ErrNoRows) {
+		d.logf("merge-gate marker pull request lookup failed for %s#%d: %v", d.Repo.FullName(), pull.Number, pullErr)
+		return
+	}
+	if gateErr == nil && pullErr == nil && strings.TrimSpace(previous.HeadSHA) == headSHA {
+		return
+	}
+	if _, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			d.logf("merge-gate marker task lookup failed for %s#%d: %v", d.Repo.FullName(), pull.Number, err)
+		}
+		return
+	}
+
+	combined, err := d.GitHub.GetCombinedStatus(ctx, d.Repo, headSHA)
+	if err != nil {
+		d.logf("merge-gate marker status lookup failed for %s#%d at %s: %v", d.Repo.FullName(), pull.Number, headSHA, err)
+		return
+	}
+	for _, status := range combined.Statuses {
+		if strings.TrimSpace(status.Context) == mergeGateStatusContext {
+			return
+		}
+	}
+	if _, err := d.GitHub.CreateCommitStatus(ctx, github.CommitStatusInput{
+		Repo:        d.Repo,
+		SHA:         headSHA,
+		State:       "pending",
+		Context:     mergeGateStatusContext,
+		Description: mergeGateUnclearedDescription,
+	}); err != nil {
+		d.logf("merge-gate marker write failed for %s#%d at %s: %v", d.Repo.FullName(), pull.Number, headSHA, err)
+		return
+	}
+	if err := d.Store.UpsertMergeGate(ctx, db.MergeGate{
+		RepoFullName: d.Repo.FullName(),
+		PullRequest:  pull.Number,
+		State:        "pending",
+		Reason:       mergeGateUnclearedDescription,
+	}); err != nil {
+		d.logf("merge-gate marker record failed for %s#%d at %s: %v", d.Repo.FullName(), pull.Number, headSHA, err)
+	}
 }
 
 func (d Daemon) pullRequestStoredMerged(ctx context.Context, pull github.PullRequest) (bool, error) {
