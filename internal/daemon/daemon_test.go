@@ -1210,6 +1210,52 @@ func TestPollOnceAutoMergeDisabledDoesNotPublishMarker(t *testing.T) {
 	}
 }
 
+func TestPollOnceExternalMergeGateDoesNotPublishMarker(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("GITMOOT_DISABLE_NATIVE_MERGE_GATE", "1")
+	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskChangesRequested)
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(client.statuses) != 0 {
+		t.Fatalf("statuses = %+v, want no marker when an external gate owns the decision", client.statuses)
+	}
+	observation, err := store.GetMergeGateStatusObservation(ctx, "gitmoot/gitmoot", 7)
+	if err != nil {
+		t.Fatalf("GetMergeGateStatusObservation returned error: %v", err)
+	}
+	if observation.Kind != mergeGateStatusInactive {
+		t.Fatalf("status observation = %+v, want inactive under an external gate", observation)
+	}
+}
+
+func TestPollOnceExternalMergeGateClearsGenericMarker(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("GITMOOT_DISABLE_NATIVE_MERGE_GATE", "1")
+	_, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskChangesRequested)
+	if _, err := client.CreateCommitStatus(ctx, github.CommitStatusInput{
+		Repo:        daemon.Repo,
+		SHA:         "abc123",
+		State:       "pending",
+		Context:     workflow.GitmootMergeGateContext,
+		Description: mergeGateUnclearedDescription,
+	}); err != nil {
+		t.Fatalf("seed CreateCommitStatus returned error: %v", err)
+	}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(client.statuses) != 2 {
+		t.Fatalf("statuses = %+v, want seeded marker followed by not-applied success", client.statuses)
+	}
+	cleared := client.statuses[1]
+	if cleared.State != "success" || cleared.Description != mergeGateNotAppliedDescription {
+		t.Fatalf("clearance status = %+v, want not-applied success", cleared)
+	}
+}
+
 func TestPollOnceAwaitingHumanClearsOnlyGenericMarker(t *testing.T) {
 	ctx := context.Background()
 	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskAwaitingHumanMerge)

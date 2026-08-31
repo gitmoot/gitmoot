@@ -943,8 +943,12 @@ func (d Daemon) ensureMergeGateStatus(ctx context.Context, pull github.PullReque
 	if observationErr != nil && !errors.Is(observationErr, sql.ErrNoRows) {
 		d.logf("merge-gate status observation lookup failed for %s#%d: %v", d.Repo.FullName(), pull.Number, observationErr)
 	}
-	autoMergeEnabled := d.AutoMergeEnabled == nil || d.AutoMergeEnabled(d.Repo.FullName())
-	applies := autoMergeEnabled && mergeGateMarkerApplies(task.State)
+	// An operator who handed the merge decision away (either kill-switch) gets no
+	// marker: a status describing a gate that will never run is a permanent
+	// pending nothing in Gitmoot can resolve.
+	gateOwnsDecision := !workflow.NativeMergeGateDisabled() &&
+		(d.AutoMergeEnabled == nil || d.AutoMergeEnabled(d.Repo.FullName()))
+	applies := gateOwnsDecision && mergeGateMarkerApplies(task.State)
 	if observationErr == nil && observation.HeadSHA == headSHA {
 		if applies && (observation.Kind == mergeGateStatusMarker || observation.Kind == mergeGateStatusObserved) {
 			return

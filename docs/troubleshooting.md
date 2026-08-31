@@ -640,14 +640,18 @@ git status --short
 ```
 
 Fixes:
-- The generic `has not cleared this head` status makes an active managed head
-  visibly unjudged. A later gate evaluation replaces it with the specific
-  pending, failure, or success verdict for that same head.
-- Repositories with native auto-merge disabled and tasks parked for a human do
-  not retain the generic pending marker. Gitmoot replaces only that generic
-  marker with `Gitmoot merge gate is not applied to this head`; it preserves a
-  real gate failure or specific pending verdict.
 
+- The generic `has not cleared this head` status makes an active managed head
+  visibly unjudged, so an unevaluated head stops reading as an approved one. A
+  later gate evaluation replaces it with the specific pending, failure, or
+  success verdict for that same head.
+- Gitmoot publishes it only while it owns the merge decision. With
+  `[merge_gate] auto_merge = false`, with `GITMOOT_DISABLE_NATIVE_MERGE_GATE=1`,
+  or once a task is parked for a human or terminal, Gitmoot replaces only its own
+  generic marker with `Gitmoot merge gate is not applied to this head` and
+  preserves a real gate failure or a specific pending verdict.
+- A draft pull request keeps the generic marker until it is undrafted, because
+  the gate deliberately withholds a verdict on a draft head.
 - Clean the local worktree before the daemon attempts the merge.
 - If the reason says an active job is in flight on the PR branch, let that queued
   or running job settle (or cancel it deliberately). This is a transient safety

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,6 +28,20 @@ const (
 	commitStatusDescriptionMaxRunes         = 140
 	mergeQueueLockTTL                       = 30 * time.Minute
 )
+
+// NativeMergeGateDisabled reports whether the operator handed the merge decision
+// to an external gate via GITMOOT_DISABLE_NATIVE_MERGE_GATE (#545). It is the
+// single source for that answer: the native gate abstains, and every observer of
+// the gate's commit status must stay silent rather than publish a verdict-shaped
+// status no Gitmoot code path will ever resolve.
+func NativeMergeGateDisabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GITMOOT_DISABLE_NATIVE_MERGE_GATE"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
 
 type MergeGateGitHub interface {
 	GetPullRequest(ctx context.Context, repo github.Repository, number int64) (github.PullRequest, error)

@@ -407,6 +407,31 @@ Fix: let the job settle or cancel it deliberately. The daemon re-evaluates the
 unchanged policy merge path on its next tick; do not release its branch lock
 while the job is active.
 
+## Gate Status Says A Head Was Never Cleared
+
+Symptom: a pull request carries `gitmoot/merge-gate` = pending with the
+description `Gitmoot merge gate has not cleared this head`.
+
+Likely cause: this is the intended signal, not a failure. GitHub's
+`mergeStateStatus` reports the absence of blockers, so a head Gitmoot has never
+evaluated used to read exactly like one it approved. Gitmoot now marks an active
+managed head as unjudged until its own gate produces a verdict.
+
+Check:
+
+```sh
+gh pr view <number> --repo owner/repo --json statusCheckRollup,mergeStateStatus
+gitmoot task list --repo owner/repo
+```
+
+Fix: nothing to do. A later gate evaluation replaces the marker with the
+specific pending, failure, or success verdict for the same head. Gitmoot marks
+heads only while it owns the merge decision: with `[merge_gate] auto_merge =
+false`, with `GITMOOT_DISABLE_NATIVE_MERGE_GATE=1`, or once a task is parked for
+a human, it replaces only its own generic marker with `Gitmoot merge gate is not
+applied to this head` and leaves any real gate verdict untouched. A draft pull
+request keeps the marker until it is undrafted.
+
 ## Dashboard Blank Or Noninteractive
 
 Symptom: `gitmoot dashboard` does not open the TUI, prints plain output, or
