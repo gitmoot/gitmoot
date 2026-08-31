@@ -635,24 +635,45 @@ func (d Daemon) reconcileTransientlyBlockedMergeGates(ctx context.Context, openP
 	return firstErr
 }
 
-// mergeGateOwnsCurrentBlock reports whether the task's most recent blocking event
-// attributes the block to the merge gate (#1562). Task events are append-only, so
-// the LATEST blocking event is the current cause: a later block_parent or quorum
-// failure supersedes an earlier merge-gate block and must not be cleared by the
-// transient exit. Absence of any attributed event is not evidence of a gate block
-// and returns false.
-func (d Daemon) mergeGateOwnsCurrentBlock(ctx context.Context, taskID string) (bool, error) {
+// mergeGateOwnsCurrentBlock reports whether the merge gate owns the task's CURRENT
+// block (#1562). Task events are append-only, so the LATEST blocking event is the
+// current cause: a later synthesis-gate or auto-fix block supersedes an earlier
+// merge-gate block and must not be cleared by the transient exit.
+//
+// The second return value distinguishes the UPGRADE population. Before this
+// change neither the merge gate nor the coordinator synthesis gates wrote an
+// attributed event — both reached blocked through the shared e.block — so a task
+// with NO blocking event at all is neither a gate block nor a quorum failure that
+// we can prove; it is a row blocked before attribution existed. Refusing those
+// outright would strand exactly the population that motivated #1562, including the
+// 95-minute review-pr-1699-3f3a1026 wedge, so the caller heals them once.
+// (Cause-vs-state and the upgrade path both raised by gm-omp-fanout; the
+// unknown-blocker closure and the write-after-block ordering by a review advisory.)
+func (d Daemon) mergeGateOwnsCurrentBlock(ctx context.Context, taskID string) (attributed bool, unattributed bool, err error) {
 	events, err := d.Store.ListTaskEvents(ctx, taskID)
 	if err != nil {
 		return false, err
 	}
+	// Newest-first: the most recent BLOCKING event is the current cause. The
+	// predicate is deliberately a union rather than a list of known kinds. A fixed
+	// list is not closed under future blockers: a new mechanism blocking a task
+	// would simply not match, and an older merge_gate_blocked would win and
+	// authorize releasing a block it did not cause. ToState alone is not enough
+	// either, because blockAutoFix records its event without one, so an
+	// auto-fix block would be invisible to a ToState-only filter.
 	for i := len(events) - 1; i >= 0; i-- {
-		switch events[i].Kind {
-		case "merge_gate_blocked":
-			return true, nil
-		case "review_auto_fix_blocked", "pr_closed_unmerged", "delegation_child_failed", "block_parent", "quorum_unmet":
-			return false, nil
+		event := events[i]
+		blocking := event.ToState == string(workflow.TaskBlocked)
+		switch event.Kind {
+		case "merge_gate_blocked", "review_auto_fix_blocked", "pr_closed_unmerged",
+			"delegation_vote_unmet", "delegation_quorum_unmet", "delegation_child_failed",
+			"block_parent", "quorum_unmet":
+			blocking = true
 		}
+		if !blocking {
+			continue
+		}
+		return event.Kind == "merge_gate_blocked", false, nil
 	}
 	return false, nil
 }

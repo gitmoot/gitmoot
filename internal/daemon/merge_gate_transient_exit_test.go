@@ -139,6 +139,91 @@ func TestPollOnceLeavesTaskBlockedByDelegationFailureBlocked(t *testing.T) {
 	}
 }
 
+// TestPollOnceHealsPreAttributionBlockOnce is the UPGRADE path, raised by
+// gm-omp-fanout: every task blocked before this change has no attributed blocking
+// event, because neither the merge gate nor the synthesis gates wrote one — both
+// reached blocked through the shared e.block. A strict "no event means not
+// gate-owned" rule would refuse exactly the population that motivated #1562,
+// including the 95-minute review-pr-1699-3f3a1026 wedge, and the feature would
+// clear only blocks created after the deploy.
+//
+// So a row with a transient gate row and NO competing blocking event is healed
+// once. "Once" is structural rather than counted: the release writes
+// merge_gate_transient_retry, so the row is no longer unattributed, and any later
+// real block arrives through an attributed path.
+//
+// Mutant M6 ("no upgrade path"): make mergeGateOwnsCurrentBlock return
+// (false, false, nil) for an unattributed row. Only this test fails — every other
+// direction, including the delegation-failure refusal, still passes, which is what
+// makes the two behaviours distinguishable rather than a matter of opinion.
+func TestPollOnceHealsPreAttributionBlockOnce(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	// Seeded WITHOUT attribution: exactly what the old binary left behind.
+	pull := seedBlockedReviewTaskAttributed(t, store, repo, workflow.MergeBlockTransient, "local worktree is not clean", false)
+	daemon, _ := blockedReviewTaskDaemon(t, store, repo, pull)
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	task, err := store.GetTask(ctx, "review-pr-1699-3f3a1026")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskReadyToMerge) {
+		t.Fatalf("task state = %q, want a pre-attribution wedge healed to ready_to_merge", task.State)
+	}
+	events, err := store.ListTaskEvents(ctx, "review-pr-1699-3f3a1026")
+	if err != nil {
+		t.Fatalf("ListTaskEvents returned error: %v", err)
+	}
+	if !hasTaskEventKind(events, "merge_gate_transient_retry") {
+		t.Fatalf("task events = %+v, want the heal recorded so the row is no longer unattributed", events)
+	}
+}
+
+// TestPollOnceLeavesTaskBlockedByUnknownMechanismBlocked closes the guard over
+// mechanisms this change does not know about. Raised by a review advisory: a fixed
+// list of blocking kinds is not closed under future blockers, so a NEW mechanism
+// blocking a task would simply not match, an older merge_gate_blocked would remain
+// the newest RECOGNISED event, and the exit would release a block it did not cause.
+//
+// The event here carries ToState=blocked with a kind this code has never heard of,
+// which is exactly the shape a future blocker will have.
+//
+// Mutant M7 ("kind list only"): drop the `event.ToState == blocked` arm from
+// mergeGateOwnsCurrentBlock so only the enumerated kinds count as blocking. Only
+// this test fails.
+func TestPollOnceLeavesTaskBlockedByUnknownMechanismBlocked(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	pull := seedBlockedReviewTask(t, store, repo, workflow.MergeBlockTransient, "local worktree is not clean")
+	if err := store.AddTaskEvent(ctx, db.TaskEvent{
+		TaskID:  "review-pr-1699-3f3a1026",
+		Kind:    "some_future_guard_blocked",
+		ToState: string(workflow.TaskBlocked),
+		Reason:  "a mechanism this change has never heard of",
+	}); err != nil {
+		t.Fatalf("AddTaskEvent(some_future_guard_blocked) returned error: %v", err)
+	}
+	daemon, gate := blockedReviewTaskDaemon(t, store, repo, pull)
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	task, err := store.GetTask(ctx, "review-pr-1699-3f3a1026")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskBlocked) {
+		t.Fatalf("task state = %q, want blocked: the newest blocking event is not the merge gate's", task.State)
+	}
+	if len(gate.requests) != 0 {
+		t.Fatalf("merge gate evaluations = %d, want 0", len(gate.requests))
+	}
+}
 // TestPollOnceReleasesTransientlyBlockedReviewTask is the release direction of
 // #1562. A task blocked on "local worktree is not clean" — a condition the gate
 // itself classified MergeBlockTransient — must regain an exit from the ordinary

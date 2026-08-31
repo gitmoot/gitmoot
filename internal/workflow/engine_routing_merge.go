@@ -207,19 +207,50 @@ func (e Engine) blockAutoFix(ctx context.Context, ref taskRef, reason string) er
 // task is blocked and that some merge-gate row exists, and would clear a quorum
 // failure as though it were self-clearing infrastructure. Mirrors blockAutoFix.
 func (e Engine) blockMergeGate(ctx context.Context, ref taskRef, reason string) error {
-	if strings.TrimSpace(ref.ID) != "" {
-		if err := e.Store.AddTaskEvent(ctx, db.TaskEvent{
-			TaskID:  ref.ID,
-			Kind:    "merge_gate_blocked",
-			ToState: string(TaskBlocked),
-			Reason:  reason,
-		}); err != nil {
-			return fmt.Errorf("record merge-gate block: %w", err)
-		}
-	}
-	return e.block(ctx, ref, reason)
+	return e.blockAttributed(ctx, ref, "merge_gate_blocked", reason, "merge-gate")
 }
 
+// blockSynthesisGate attributes a coordinator synthesis-gate block (vote or
+// quorum unmet) on the task, mirroring blockMergeGate and blockAutoFix (#1562).
+//
+// Attributing BOTH sides is what makes absence meaningful. With only the merge
+// gate attributed, a task carrying no blocking event is ambiguous — it could be a
+// pre-attribution legacy block OR a fresh quorum failure — so an exit path can
+// neither release legacy wedges nor refuse quorum failures without guessing. Once
+// both write an event, "no blocking event at all" identifies exactly one
+// population: rows blocked before this shipped.
+func (e Engine) blockSynthesisGate(ctx context.Context, ref taskRef, kind string, reason string) error {
+	return e.blockAttributed(ctx, ref, kind, reason, "synthesis-gate")
+}
+
+// blockAttributed blocks the task and records WHICH mechanism did it, in that
+// order. The order is load-bearing: e.block signals success by returning a
+// BlockedError and a store failure by returning a plain error, so writing the
+// attribution first would leave a durable "this task is blocked by X" event behind
+// a transition that never happened — and a later block from a mechanism that
+// writes no event of its own would then be released on the strength of that stale
+// claim. Attribution failure is logged into the returned error but never converts a
+// successful block into a failure, because the block itself is already durable.
+func (e Engine) blockAttributed(ctx context.Context, ref taskRef, kind string, reason string, label string) error {
+	blockErr := e.block(ctx, ref, reason)
+	var blocked BlockedError
+	if !errors.As(blockErr, &blocked) {
+		// The transition itself failed; there is no block to attribute.
+		return blockErr
+	}
+	if strings.TrimSpace(ref.ID) == "" {
+		return blockErr
+	}
+	if err := e.Store.AddTaskEvent(ctx, db.TaskEvent{
+		TaskID:  ref.ID,
+		Kind:    kind,
+		ToState: string(TaskBlocked),
+		Reason:  reason,
+	}); err != nil {
+		return fmt.Errorf("record %s block for task %s: %w", label, ref.ID, err)
+	}
+	return blockErr
+}
 func (e Engine) allRequiredReviewersApproved(ctx context.Context, currentReviewer string, payload JobPayload) (bool, error) {
 	required := e.requiredReviewers(payload)
 	if len(required) == 0 {
