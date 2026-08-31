@@ -534,17 +534,19 @@ objects are ignored, and a grafts file makes the clone unprovable.
 The proven clone is renamed to `<path>.ttl-reclaiming-<random>` and re-proven
 there. After the final Git proof it is renamed to a second random sibling, then
 scanned for nested object databases, and both names a writer could have observed
-are fenced with a zero-byte file so no directory can ever exist at them again — a
-writer that recreates a quarantine name after the final scan can neither be
-deleted nor orphaned. A name a writer wins first is retained, never removed.
-Nested object databases are proved from BYTES: a loose candidate must decompress
-to a `commit`/`tree`/`blob`/`tag` header, a pack candidate must carry the `PACK`
-magic, so ignored content-addressed build output stays reclaimable. The final
-liveness gate covers both process working directories and open file descriptors
-and retains on an inconclusive `/proc` scan. An interrupted removal leaves a
-quarantine DIRECTORY, restored by the next pass
+are fenced with a zero-byte file so no directory can ever exist at them again. A
+name another writer wins first — directory, symlink or non-empty file — is
+retained, never deleted and never followed, and the pass refuses to complete while
+it survives. Only a zero-byte regular file is a spent fence; fences are pruned
+after 24h and counted by `gitmoot doctor` and `/api/health`. Nested object
+databases are proved from BYTES: a loose candidate must hash (SHA-1 or SHA-256) to
+its storage name, and a pack needs the `PACK` magic, a supported version, a
+non-zero object count and its sibling `.idx`, so ignored content-addressed build
+output stays reclaimable. The final liveness gate covers both process working
+directories and open file descriptors and retains on an inconclusive `/proc` scan.
+An interrupted removal leaves a quarantine DIRECTORY, restored by the next pass
 (`delegation_worktree_quarantine_restored`); no pass completes removal while one
-survives, and `gitmoot doctor` counts them. Fence files are not quarantines.
+survives, and `gitmoot doctor` counts them.
 `delegation_worktree_retained_unpublished` with obligation reason
 `unpublished_commits` (the normal outcome for a squash-merged branch, whose
 content is published while its commits are not, and for an ignored nested

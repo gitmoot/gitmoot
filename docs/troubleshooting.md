@@ -769,20 +769,28 @@ nested-object-database scan, so the only path Git ever ran in is no longer the
 path being deleted. Both names a writer could have observed are then **fenced
 with a zero-byte file**: `mkdir` on the name fails, and any path below it fails
 with `ENOTDIR`, so a writer that recreates a quarantine name after the final scan
-cannot orphan content there. A name a writer wins first is never deleted — the
-clone is restored and the obligation stays open. The final liveness gate scans
-both process working directories and open file descriptors; an inconclusive
-`/proc` scan retains the clone. A failed proof renames the current quarantine
-back. An interrupted removal leaves a `.ttl-reclaiming-*` DIRECTORY; the next
-pass restores it (`delegation_worktree_quarantine_restored`) and re-proves it
-from scratch rather than treating the absent original path as a completed
-removal. Fence files are not quarantines and are never counted as one.
+cannot orphan content there. A name another writer wins first — a directory, a
+symlink aimed at its own tree, a non-empty file — is never deleted or followed:
+the clone is restored, the obligation stays open, and the reclaim refuses to
+complete. Only a zero-byte regular file counts as a spent fence; every other
+surviving entry at a quarantine name is reported as unproven by `gitmoot doctor`
+and blocks completion. Spent fences are pruned after 24h and counted in
+`gitmoot doctor` / `/api/health` so they are bounded and visible rather than
+silently accumulating. The final liveness gate scans both process working
+directories and open file descriptors; an inconclusive `/proc` scan retains the
+clone. A failed proof renames the current quarantine back. An interrupted removal
+leaves a `.ttl-reclaiming-*` DIRECTORY; the next pass restores it
+(`delegation_worktree_quarantine_restored`) and re-proves it from scratch rather
+than treating the absent original path as a completed removal.
 
-A nested object database is recognised by its BYTES, not its layout: a loose
-candidate must decompress to a `commit`/`tree`/`blob`/`tag` header and a pack
-candidate must carry the `PACK` magic. Ordinary ignored content-addressed build
-output uses the same hex-fanout and `pack-<hash>.pack` naming, and classifying it
-as Git data would retain every clone with a build cache.
+A nested object database is recognised by its BYTES, not its layout. A loose
+candidate is accepted only when its decompressed content hashes (SHA-1 or
+SHA-256) to the name it is stored under — the same property Git relies on — so a
+truncated or fabricated Git-shaped cache entry is rejected. A pack candidate needs
+the `PACK` magic, a supported version, a non-zero object count, a plausible size,
+and the sibling `.idx` Git always writes. Ordinary ignored content-addressed build
+output uses the same hex-fanout and `pack-<hash>.pack` naming, and retaining on
+those names alone would make the pass inert on any repo with a build cache.
 
 Every retention records **why**, once per reason per job, so an inert deployment
 is visible instead of silent: `delegation_worktree_retained_unpublished` (also

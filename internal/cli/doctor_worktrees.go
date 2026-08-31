@@ -30,6 +30,7 @@ type delegationWorktreeUsage struct {
 	Unproven       int    `json:"unproven"`
 	RecentTerminal int    `json:"recentTerminal"`
 	Quarantined    int    `json:"quarantined"`
+	Fences         int    `json:"fences"`
 	Root           string `json:"root"`
 	Summary        string `json:"summary"`
 }
@@ -120,16 +121,32 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 			return
 		}
 		for _, quarantine := range quarantines {
-			info, err := os.Stat(quarantine)
+			info, err := os.Lstat(quarantine)
 			switch {
 			case err == nil && info.IsDir():
 				pathsOnDisk[quarantine] = struct{}{}
 				quarantineClasses[quarantine] = class
-			case err != nil && !os.IsNotExist(err):
+			case err == nil:
+				// A surviving non-directory (a symlink a writer aimed elsewhere, a
+				// non-empty file) is not a clone and has no size to attribute, but
+				// it is unowned garbage at a managed name.
+				usage.Unproven++
+				usage.Stale++
+			case !os.IsNotExist(err):
 				usage.Unproven++
 				usage.Stale++
 			}
 		}
+		// Spent fences are reported separately: they hold no bytes, but two
+		// directory entries per reclaimed fix job should be visible rather than
+		// silently accumulating.
+		fences, err := workflow.FixCloneFences(path)
+		if err != nil {
+			usage.Unproven++
+			usage.Stale++
+			return
+		}
+		usage.Fences += len(fences)
 	}
 	for path, class := range owned {
 		if info, err := os.Stat(path); err == nil && info.IsDir() {
@@ -284,7 +301,7 @@ func delegationWorktreeDoctorCheck(paths config.Paths) (doctor.Check, bool) {
 }
 
 func buildDelegationWorktreeDoctorCheck(usage delegationWorktreeUsage) doctor.Check {
-	detail := fmt.Sprintf("%s (%d reclaimable, %d pinned by non-terminal owners, %d unproven; %d recent terminal within TTL; %d cleanup quarantined)", usage.Summary, usage.Reclaimable, usage.Pinned, usage.Unproven, usage.RecentTerminal, usage.Quarantined)
+	detail := fmt.Sprintf("%s (%d reclaimable, %d pinned by non-terminal owners, %d unproven; %d recent terminal within TTL; %d cleanup quarantined; %d spent removal fences)", usage.Summary, usage.Reclaimable, usage.Pinned, usage.Unproven, usage.RecentTerminal, usage.Quarantined, usage.Fences)
 	warn := usage.Stale >= delegationWorktreeWarnCount || usage.SizeBytes >= delegationWorktreeWarnBytes || usage.Quarantined > 0
 	return doctor.Check{Name: "worktrees", OK: !warn, Required: false, Detail: detail}
 }

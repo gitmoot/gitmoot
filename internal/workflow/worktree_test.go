@@ -5,6 +5,7 @@ import (
 	"compress/zlib"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"os"
 	"os/exec"
@@ -2243,6 +2244,7 @@ func TestEngineRetainFixCloneWithRacingQuarantineWriter(t *testing.T) {
 	store := openEngineStore(t)
 	home := t.TempDir()
 	jobID := "fix-racing-quarantine"
+
 	path, err := FixWorktreePath(home, "owner/repo", jobID)
 	if err != nil {
 		t.Fatalf("FixWorktreePath: %v", err)
@@ -2284,6 +2286,259 @@ func TestEngineRetainFixCloneWithRacingQuarantineWriter(t *testing.T) {
 	}
 	if retained != 1 {
 		t.Fatalf("racing-writer retentions = %d, want 1: %+v", retained, events)
+	}
+}
+
+// The reviewer's end state, replayed through the production path: the clone path
+// is absent and the only quarantine-named sibling is a SYMLINK a writer aimed at
+// its own directory. Classifying survivors as "not a directory" made that symlink
+// invisible, so the pass recorded a completed reclaim, retired the job, and left
+// the writer's content unreachable by any later pass.
+func TestEngineReclaimAgedFixCloneRetainsSymlinkQuarantineWinner(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	jobID := "fix-symlink-quarantine"
+	path, err := FixWorktreePath(home, "owner/repo", jobID)
+	if err != nil {
+		t.Fatalf("FixWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll fix parent: %v", err)
+	}
+	target := filepath.Join(t.TempDir(), "writer-target")
+	if err := os.MkdirAll(filepath.Join(target, "late", ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll writer target: %v", err)
+	}
+	planted := path + fixCloneQuarantinePrefix + "5150c0de5150c0de"
+	if err := os.Symlink(target, planted); err != nil {
+		t.Fatalf("plant symlink quarantine: %v", err)
+	}
+	payload, err := marshalPayload(JobPayload{
+		Repo: "owner/repo", Branch: "feature/fix", WorktreePath: path, FixWorktree: true,
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: jobID, Agent: "fixer", Type: "implement", State: string(JobSucceeded),
+		Repo: "owner/repo", Payload: payload,
+	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+	engine := testEngine(store)
+	engine.Home = home
+	engine.DelegationCheckout = t.TempDir()
+	engine.DelegationWorktrees = &fakeWorktreeManager{cleanSet: true, clean: true}
+
+	reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
+	if reclaimed {
+		t.Fatal("a symlink quarantine winner let the reclaim complete")
+	}
+	if err == nil {
+		t.Fatal("a surviving symlink quarantine was accepted silently")
+	}
+	// Never followed, never deleted: the writer's content is intact and the name
+	// stays visible to the scan every later pass consults.
+	info, err := os.Lstat(planted)
+	if err != nil {
+		t.Fatalf("planted symlink was removed: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("planted name %s is no longer a symlink: %v", planted, info.Mode())
+	}
+	if _, err := os.Stat(filepath.Join(target, "late", ".git")); err != nil {
+		t.Fatalf("writer content was deleted through the symlink: %v", err)
+	}
+	survivors, err := FixCloneQuarantines(path)
+	if err != nil {
+		t.Fatalf("FixCloneQuarantines: %v", err)
+	}
+	if len(survivors) != 1 || survivors[0] != planted {
+		t.Fatalf("symlink survivors = %v, want %s", survivors, planted)
+	}
+	if fences, err := FixCloneFences(path); err != nil || len(fences) != 0 {
+		t.Fatalf("symlink counted as a spent fence: %v (err %v)", fences, err)
+	}
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	for _, event := range events {
+		if event.Kind == "delegation_worktree_reclaimed_ttl" {
+			t.Fatalf("reclaim was recorded complete with a symlink survivor: %+v", event)
+		}
+	}
+
+	// The fence itself must also refuse the name rather than follow or clobber it.
+	if fenced, err := fenceFixCloneQuarantineName(planted); err != nil || fenced {
+		t.Fatalf("fence on a symlink = (%v, %v), want (false, nil)", fenced, err)
+	}
+	if info, err := os.Lstat(planted); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("fence replaced the symlink: %v (err %v)", info, err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "late", ".git")); err != nil {
+		t.Fatalf("fence wrote through the symlink: %v", err)
+	}
+}
+
+// Git-SHAPED is not Git: a cache entry can carry a well-formed object header or
+// the PACK magic and still hold nothing recoverable. Retaining on those keeps
+// every clone with such a cache forever, which is the inert-pass failure the
+// content check exists to avoid.
+func TestNestedGitObjectDatabaseRejectsCorruptGitShapedCaches(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, root string)
+	}{
+		{
+			name: "loose object declaring more bytes than it carries",
+			setup: func(t *testing.T, root string) {
+				writeZlibFile(t, filepath.Join(root, "cache", "ab", strings.Repeat("c", 38)), "blob 999999\x00x")
+			},
+		},
+		{
+			name: "loose object whose bytes do not hash to its name",
+			setup: func(t *testing.T, root string) {
+				writeZlibFile(t, filepath.Join(root, "cache", "ab", strings.Repeat("c", 38)), "blob 5\x00hello")
+			},
+		},
+		{
+			name: "pack file holding only the magic",
+			setup: func(t *testing.T, root string) {
+				name := filepath.Join(root, "cache", "pack", "pack-"+strings.Repeat("a", 40)+".pack")
+				if err := os.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+					t.Fatalf("MkdirAll pack directory: %v", err)
+				}
+				if err := os.WriteFile(name, []byte("PACK"), 0o644); err != nil {
+					t.Fatalf("write pack: %v", err)
+				}
+			},
+		},
+		{
+			name: "pack file with no index beside it",
+			setup: func(t *testing.T, root string) {
+				name := filepath.Join(root, "cache", "pack", "pack-"+strings.Repeat("b", 40)+".pack")
+				if err := os.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+					t.Fatalf("MkdirAll pack directory: %v", err)
+				}
+				body := append([]byte("PACK"), 0, 0, 0, 2, 0, 0, 0, 1)
+				body = append(body, make([]byte, 32)...)
+				if err := os.WriteFile(name, body, 0o644); err != nil {
+					t.Fatalf("write pack: %v", err)
+				}
+			},
+		},
+		{
+			name: "indexed pack with an unsupported version",
+			setup: func(t *testing.T, root string) {
+				writePackFile(t, root, strings.Repeat("c", 40), 7, 1)
+			},
+		},
+		{
+			name: "indexed pack carrying no objects",
+			setup: func(t *testing.T, root string) {
+				writePackFile(t, root, strings.Repeat("d", 40), 2, 0)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			tc.setup(t, root)
+			nested, err := nestedGitObjectDatabase(ctx, root)
+			if err != nil {
+				t.Fatalf("nestedGitObjectDatabase: %v", err)
+			}
+			if nested != "" {
+				t.Fatalf("corrupt Git-shaped cache classified as object database %q", nested)
+			}
+		})
+	}
+}
+
+// writePackFile lays down an INDEXED pack of the requested version and object
+// count, sized past the header-plus-checksum floor, so the only thing under test
+// is the structural check rather than the size or index preconditions.
+func writePackFile(t *testing.T, root, hashName string, version, objects uint32) {
+	t.Helper()
+	name := filepath.Join(root, "cache", "pack", "pack-"+hashName+".pack")
+	if err := os.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+		t.Fatalf("MkdirAll pack directory: %v", err)
+	}
+	body := make([]byte, 0, 12+1+20)
+	body = append(body, "PACK"...)
+	body = binary.BigEndian.AppendUint32(body, version)
+	body = binary.BigEndian.AppendUint32(body, objects)
+	body = append(body, make([]byte, 1+20)...)
+	if err := os.WriteFile(name, body, 0o644); err != nil {
+		t.Fatalf("write pack: %v", err)
+	}
+	if err := os.WriteFile(strings.TrimSuffix(name, ".pack")+".idx", []byte("idx"), 0o644); err != nil {
+		t.Fatalf("write pack index: %v", err)
+	}
+}
+
+func writeZlibFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll %s: %v", filepath.Dir(path), err)
+	}
+	var deflated bytes.Buffer
+	writer := zlib.NewWriter(&deflated)
+	if _, err := writer.Write([]byte(body)); err != nil {
+		t.Fatalf("deflate %s: %v", path, err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close deflater: %v", err)
+	}
+	if err := os.WriteFile(path, deflated.Bytes(), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// Fences are bounded and visible: an aged one is pruned, a fresh one is kept
+// because a writer from the current pass could still name it, and a survivor is
+// never touched by the pruner.
+func TestPruneFixCloneFences(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "clone")
+	aged := path + fixCloneQuarantinePrefix + "aaaaaaaa"
+	fresh := path + fixCloneQuarantinePrefix + "bbbbbbbb"
+	survivor := path + fixCloneQuarantinePrefix + "cccccccc"
+	for _, fence := range []string{aged, fresh} {
+		if err := os.WriteFile(fence, nil, 0o444); err != nil {
+			t.Fatalf("write fence: %v", err)
+		}
+	}
+	if err := os.Mkdir(survivor, 0o755); err != nil {
+		t.Fatalf("Mkdir survivor: %v", err)
+	}
+	past := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(aged, past, past); err != nil {
+		t.Fatalf("Chtimes aged fence: %v", err)
+	}
+
+	fences, err := FixCloneFences(path)
+	if err != nil || len(fences) != 2 {
+		t.Fatalf("FixCloneFences = %v (err %v), want both fences", fences, err)
+	}
+	pruned, err := PruneFixCloneFences(path, time.Now().Add(-24*time.Hour))
+	if err != nil || pruned != 1 {
+		t.Fatalf("PruneFixCloneFences = %d (err %v), want 1", pruned, err)
+	}
+	if _, err := os.Lstat(aged); !os.IsNotExist(err) {
+		t.Fatalf("aged fence survived pruning: %v", err)
+	}
+	if _, err := os.Lstat(fresh); err != nil {
+		t.Fatalf("fresh fence was pruned: %v", err)
+	}
+	if _, err := os.Lstat(survivor); err != nil {
+		t.Fatalf("pruner removed a surviving quarantine: %v", err)
+	}
+	survivors, err := FixCloneQuarantines(path)
+	if err != nil || len(survivors) != 1 || survivors[0] != survivor {
+		t.Fatalf("survivors = %v (err %v), want only %s", survivors, err, survivor)
 	}
 }
 

@@ -1,21 +1,26 @@
 package workflow
 
 import (
+	"bufio"
 	"bytes"
 	"compress/zlib"
 	"context"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -1695,6 +1700,12 @@ func (e Engine) completeAgedTerminalFixWorktreeReclaim(ctx context.Context, jobI
 // reconstructing one name.
 const fixCloneQuarantinePrefix = ".ttl-reclaiming-"
 
+// fixCloneFenceRetention bounds how long a spent fence file is kept. It only has
+// to outlive any process that could still name the quarantine it replaced; a day
+// covers a daemon restart overlap and keeps the directory-entry cost per reclaimed
+// job at zero in steady state.
+const fixCloneFenceRetention = 24 * time.Hour
+
 // FixCloneQuarantines lists the interrupted-removal siblings of a fix clone. The
 // daemon and doctor need this too: an absent clone path is only evidence of a
 // completed removal when no quarantine of it survives.
@@ -1704,55 +1715,117 @@ const fixCloneQuarantinePrefix = ".ttl-reclaiming-"
 // brackets), and a pattern that silently matches nothing would be read as "no
 // quarantine" by callers that then delete.
 func FixCloneQuarantines(path string) ([]string, error) {
+	quarantines, _, err := classifyFixCloneQuarantineNames(path)
+	return quarantines, err
+}
+
+// FixCloneFences lists the spent quarantine names of a fix clone: zero-byte
+// regular files left behind so a delayed writer can never recreate the name.
+// Doctor and /api/health report them, because two directory entries per reclaimed
+// job are otherwise invisible inode usage.
+func FixCloneFences(path string) ([]string, error) {
+	_, fences, err := classifyFixCloneQuarantineNames(path)
+	return fences, err
+}
+
+// classifyFixCloneQuarantineNames splits the quarantine-named siblings of a clone
+// into SURVIVORS and FENCES.
+//
+// Only a zero-byte REGULAR file is a fence. Anything else — a directory, a
+// symlink (which a writer can point at a directory it still writes into), a
+// device node, a non-empty file — is a survivor, because it can hold or reach
+// content and something other than this code created it. Classifying by "not a
+// directory" let a symlink win a fence name and then vanish from every scan.
+func classifyFixCloneQuarantineNames(path string) (survivors, fences []string, err error) {
 	path = filepath.Clean(strings.TrimSpace(path))
 	if path == "" || path == "." {
-		return nil, nil
+		return nil, nil, nil
 	}
 	parent, base := filepath.Dir(path), filepath.Base(path)
 	entries, err := os.ReadDir(parent)
 	if os.IsNotExist(err) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	prefix := base + fixCloneQuarantinePrefix
-	var quarantines []string
 	for _, entry := range entries {
 		if !strings.HasPrefix(entry.Name(), prefix) {
 			continue
 		}
-		// Only a DIRECTORY is a surviving clone. A regular file with the same
-		// name is a fence written after a completed removal (see
-		// fenceFixCloneQuarantineName): it holds no content and exists precisely
-		// so that the name can never become a directory again.
-		if !entry.IsDir() {
+		candidate := filepath.Join(parent, entry.Name())
+		// Type() reports the LSTAT type, so a symlink is never mistaken for its
+		// target. An info error is reported rather than swallowed: a name that
+		// cannot be classified must not be read as absent by a caller that
+		// completes a removal on that basis.
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			if os.IsNotExist(infoErr) {
+				continue
+			}
+			return nil, nil, fmt.Errorf("classify fix clone quarantine %s: %w", candidate, infoErr)
+		}
+		if entry.Type().IsRegular() && info.Size() == 0 {
+			fences = append(fences, candidate)
 			continue
 		}
-		quarantines = append(quarantines, filepath.Join(parent, entry.Name()))
+		survivors = append(survivors, candidate)
 	}
-	return quarantines, nil
+	return survivors, fences, nil
 }
 
-// fenceFixCloneQuarantineName makes a quarantine name permanently unusable as a
-// directory. A writer that learned the name while the proofs ran can otherwise
-// recreate it AFTER the final survivor scan, and that late directory is invisible
-// to every later pass because the reclaim completion event retires the job.
+// fenceFixCloneQuarantineName makes a quarantine name permanently unusable. A
+// writer that learned the name while the proofs ran can otherwise recreate it
+// AFTER the final survivor scan, and that late entry is invisible to every later
+// pass because the reclaim completion event retires the job.
 //
 // A zero-byte regular file closes that window without a scan: `mkdir` on the name
 // fails with EEXIST and any path BELOW it fails with ENOTDIR, so no content can
 // ever be orphaned there. It returns false when the name is already taken, which
 // is the writer having won the race — the caller then retains instead of
-// completing.
+// completing. O_CREATE|O_EXCL already refuses an existing symlink rather than
+// following it; O_NOFOLLOW states that requirement explicitly so a later change of
+// flags cannot quietly start writing through a writer's link. What keeps a symlink
+// winner VISIBLE is classifyFixCloneQuarantineNames, not these flags.
 func fenceFixCloneQuarantineName(path string) (bool, error) {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o444)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o444)
 	if err == nil {
 		return true, file.Close()
 	}
-	if os.IsExist(err) {
+	if os.IsExist(err) || errors.Is(err, syscall.ELOOP) {
 		return false, nil
 	}
 	return false, fmt.Errorf("fence fix clone quarantine name %s: %w", path, err)
+}
+
+// PruneFixCloneFences removes spent fences last modified before cutoff. A fence
+// only has to outlive the writers that could still name it, and this pass has
+// already proved no process holds a working directory or descriptor inside the
+// clone, so an aged fence is dead weight. It never touches a survivor.
+func PruneFixCloneFences(path string, cutoff time.Time) (int, error) {
+	fences, err := FixCloneFences(path)
+	if err != nil {
+		return 0, err
+	}
+	pruned := 0
+	for _, fence := range fences {
+		info, err := os.Lstat(fence)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return pruned, fmt.Errorf("inspect fix clone fence %s: %w", fence, err)
+		}
+		if !info.Mode().IsRegular() || info.Size() != 0 || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		if err := os.Remove(fence); err != nil && !os.IsNotExist(err) {
+			return pruned, fmt.Errorf("prune fix clone fence %s: %w", fence, err)
+		}
+		pruned++
+	}
+	return pruned, nil
 }
 
 func newFixCloneQuarantinePath(path string) (string, error) {
@@ -1797,14 +1870,19 @@ func isHexObjectName(value string, lengths ...int) bool {
 }
 
 // looseGitObjectDatabase reports the object database owning a loose object.
-// A hex-fanout NAME is not evidence: ordinary ignored content-addressed build
-// output uses the same layout, so the candidate's bytes must decompress to a
-// Git object header before the clone is retained.
+//
+// Neither the hex-fanout NAME nor a plausible header is evidence: ordinary
+// ignored content-addressed build output uses the same layout, and a truncated or
+// synthetic Git-shaped cache entry can carry a well-formed header. The candidate
+// is accepted only when its decompressed bytes hash to the name it is stored
+// under, which is the same property Git itself relies on — so a real object is
+// always recognised and a corrupt or fabricated one never is.
 func looseGitObjectDatabase(absolute, rel string, entry fs.DirEntry) (string, error) {
 	if entry.IsDir() || !isHexObjectName(entry.Name(), 38, 62) {
 		return "", nil
 	}
-	if !isHexObjectName(filepath.Base(filepath.Dir(rel)), 2) {
+	fanout := filepath.Base(filepath.Dir(rel))
+	if !isHexObjectName(fanout, 2) {
 		return "", nil
 	}
 	file, err := os.Open(absolute)
@@ -1820,19 +1898,50 @@ func looseGitObjectDatabase(absolute, rel string, entry fs.DirEntry) (string, er
 		return "", nil // not zlib: ordinary content-addressed content
 	}
 	defer reader.Close()
-	// A Git object begins "<type> <size>\x00"; the longest type is "commit".
-	header := make([]byte, 32)
-	read, err := io.ReadFull(reader, header)
-	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
-		return "", nil // corrupt deflate stream: not a readable Git object
-	}
-	if !isGitObjectHeader(header[:read]) {
+	if !looseObjectHashMatchesName(reader, strings.ToLower(fanout+entry.Name())) {
 		return "", nil
 	}
 	return filepath.Dir(filepath.Dir(rel)), nil
 }
 
+// looseObjectHashMatchesName streams the decompressed object through both Git
+// hash functions and compares against the storage name. It also enforces the
+// declared size, so a header claiming more bytes than the stream carries — the
+// truncated-cache case — is rejected rather than trusted.
+func looseObjectHashMatchesName(reader io.Reader, name string) bool {
+	buffered := bufio.NewReader(reader)
+	header, err := buffered.ReadBytes(0)
+	if err != nil || !isGitObjectHeader(header) {
+		return false
+	}
+	declared, err := strconv.ParseInt(string(header[bytes.IndexByte(header, ' ')+1:len(header)-1]), 10, 64)
+	if err != nil || declared < 0 {
+		return false
+	}
+	var digest hash.Hash
+	switch len(name) {
+	case 40:
+		digest = sha1.New()
+	case 64:
+		digest = sha256.New()
+	default:
+		return false
+	}
+	digest.Write(header)
+	// The hash is what decides; this bound is why the decision is cheap. Reading
+	// one byte past the declared size caps the work an adversarial header can ask
+	// for, and a length mismatch short-circuits before the comparison.
+	copied, err := io.Copy(digest, io.LimitReader(buffered, declared+1))
+	if err != nil || copied != declared {
+		return false
+	}
+	return hex.EncodeToString(digest.Sum(nil)) == name
+}
+
 func isGitObjectHeader(header []byte) bool {
+	if len(header) < 4 || header[len(header)-1] != 0 {
+		return false
+	}
 	space := bytes.IndexByte(header, ' ')
 	if space <= 0 {
 		return false
@@ -1842,11 +1951,11 @@ func isGitObjectHeader(header []byte) bool {
 	default:
 		return false
 	}
-	terminator := bytes.IndexByte(header[space+1:], 0)
-	if terminator <= 0 {
+	size := header[space+1 : len(header)-1]
+	if len(size) == 0 || (len(size) > 1 && size[0] == '0') {
 		return false
 	}
-	for _, digit := range header[space+1 : space+1+terminator] {
+	for _, digit := range size {
 		if digit < '0' || digit > '9' {
 			return false
 		}
@@ -1854,8 +1963,14 @@ func isGitObjectHeader(header []byte) bool {
 	return true
 }
 
-// packedGitObjectDatabase requires the PACK magic, not merely the pack naming
-// convention, for the same reason looseGitObjectDatabase reads its candidate.
+// packedGitObjectDatabase accepts a pack only on STRUCTURE, not on the naming
+// convention and not on the four magic bytes alone: a file containing just
+// "PACK" carries no objects and no recoverable history, and treating it as one
+// retains every clone with a Git-shaped cache entry.
+//
+// The checks mirror what Git itself requires to open a pack: the magic, a
+// supported version, a non-zero object count, a trailing checksum of the pack
+// hash's width, and the sibling index Git always writes beside it.
 func packedGitObjectDatabase(absolute, rel string, entry fs.DirEntry) (string, error) {
 	if entry.IsDir() || filepath.Base(filepath.Dir(rel)) != "pack" {
 		return "", nil
@@ -1864,8 +1979,27 @@ func packedGitObjectDatabase(absolute, rel string, entry fs.DirEntry) (string, e
 	if !strings.HasPrefix(name, "pack-") || !strings.HasSuffix(name, ".pack") {
 		return "", nil
 	}
-	if !isHexObjectName(strings.TrimSuffix(strings.TrimPrefix(name, "pack-"), ".pack"), 40, 64) {
+	hashName := strings.TrimSuffix(strings.TrimPrefix(name, "pack-"), ".pack")
+	if !isHexObjectName(hashName, 40, 64) {
 		return "", nil
+	}
+	info, err := entry.Info()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("inspect possible Git pack %s: %w", absolute, err)
+	}
+	// header (12) + at least one object byte + trailing pack checksum.
+	checksum := int64(len(hashName) / 2)
+	if info.Size() < 12+1+checksum {
+		return "", nil
+	}
+	if _, err := os.Stat(strings.TrimSuffix(absolute, ".pack") + ".idx"); err != nil {
+		if os.IsNotExist(err) {
+			return "", nil // no index: Git cannot read it either
+		}
+		return "", fmt.Errorf("inspect Git pack index for %s: %w", absolute, err)
 	}
 	file, err := os.Open(absolute)
 	if err != nil {
@@ -1875,9 +2009,18 @@ func packedGitObjectDatabase(absolute, rel string, entry fs.DirEntry) (string, e
 		return "", fmt.Errorf("inspect possible Git pack %s: %w", absolute, err)
 	}
 	defer file.Close()
-	magic := make([]byte, 4)
-	if read, err := io.ReadFull(file, magic); err != nil || string(magic[:read]) != "PACK" {
+	header := make([]byte, 12)
+	if _, err := io.ReadFull(file, header); err != nil {
 		return "", nil
+	}
+	if string(header[:4]) != "PACK" {
+		return "", nil
+	}
+	if version := binary.BigEndian.Uint32(header[4:8]); version != 2 && version != 3 {
+		return "", nil
+	}
+	if binary.BigEndian.Uint32(header[8:12]) == 0 {
+		return "", nil // a pack of nothing holds nothing to lose
 	}
 	return filepath.Dir(filepath.Dir(rel)), nil
 }
@@ -1977,6 +2120,17 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 	case len(quarantines) == 1 && present:
 		return false, fmt.Errorf("refusing TTL reclaim: quarantined fix clone %s from an interrupted removal still exists beside %s", quarantines[0], path)
 	case len(quarantines) == 1:
+		// A survivor is only restorable when it is a DIRECTORY this code could have
+		// renamed aside. A symlink or a file at that name was created by something
+		// else: restoring it would install a foreign object as the clone and then
+		// re-prove it as one, so the pass refuses and leaves it for an operator.
+		info, statErr := os.Lstat(quarantines[0])
+		if statErr != nil {
+			return false, fmt.Errorf("inspect quarantined fix clone %s: %w", quarantines[0], statErr)
+		}
+		if !info.IsDir() {
+			return false, fmt.Errorf("refusing TTL reclaim: quarantine name %s beside %s is a %s created by another writer, not an interrupted removal", quarantines[0], path, info.Mode().Type())
+		}
 		// Interrupted removal: restore the clone and let a later pass re-prove it
 		// from scratch. The earlier proofs died with the interrupted pass.
 		if renameErr := os.Rename(quarantines[0], path); renameErr != nil {
@@ -2165,18 +2319,26 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 		return false, fmt.Errorf("remove quarantined fix clone %s: %w", quarantine, err)
 	}
 	// Fence the sealed name too: between RemoveAll and this call it is the only
-	// other name a writer could have observed. EEXIST here means the writer won
-	// that instant, so the reclaim does not complete and the surviving directory
-	// stays a candidate for the next pass.
+	// other name a writer could have observed. Losing the name means something
+	// else now owns it — a directory, or a SYMLINK aimed at a directory it keeps
+	// writing into — so the reclaim records why it did not complete instead of
+	// returning silently, which previously let the next pass see no survivor and
+	// retire the job.
 	if fenced, err := fenceFixCloneQuarantineName(quarantine); err != nil {
 		return false, err
 	} else if !fenced {
-		return false, nil
+		return false, e.retainFixCloneWithRacingQuarantineWriter(ctx, jobID, path, quarantine)
 	}
 	if survivors, err := FixCloneQuarantines(path); err != nil {
 		return false, fmt.Errorf("recheck fix clone quarantine siblings after removal: %w", err)
 	} else if len(survivors) != 0 {
-		return false, nil
+		return false, e.retainFixCloneWithRacingQuarantineWriter(ctx, jobID, path, strings.Join(survivors, ", "))
+	}
+	// Spent fences are bounded here rather than kept forever: this pass has just
+	// proved no process holds a working directory or descriptor inside the clone,
+	// so a fence from an earlier pass can no longer be protecting anything.
+	if _, err := PruneFixCloneFences(path, time.Now().UTC().Add(-fixCloneFenceRetention)); err != nil {
+		return false, err
 	}
 	// A concurrent actor may have restored this clone to its original path while we
 	// held the quarantine name. Completing the reclaim then would record a removal

@@ -591,18 +591,21 @@ re-proven there. After the final Git proof, Gitmoot renames it to a second rando
 sibling before the last nested-object-database scan, then fences both names a
 writer could have observed with a zero-byte file: `mkdir` on such a name fails and
 any path below it fails with `ENOTDIR`, so a writer recreating a quarantine name
-after the final scan cannot orphan content. A name a writer wins first is never
-deleted; the clone is restored and the obligation stays open. Nested object
-databases are recognised by their bytes — a loose candidate must decompress to a
-Git object header, a pack candidate must carry the `PACK` magic — so ordinary
-ignored content-addressed build output stays reclaimable. The final liveness gate
-scans both process working directories and open file descriptors and retains on an
-inconclusive `/proc` scan. A failed proof renames the current quarantine back. An
-interrupted removal leaves a quarantine DIRECTORY, restored by the next pass
+after the final scan cannot orphan content. A name another writer wins first — a
+directory, a symlink, a non-empty file — is never deleted or followed; the clone is
+restored, the obligation stays open, and the pass refuses to complete. Only a
+zero-byte regular file counts as a spent fence; spent fences are pruned after 24h
+and counted by `gitmoot doctor` and `/api/health`. Nested object databases are
+recognised by their bytes: a loose candidate must hash (SHA-1 or SHA-256) to its
+storage name, and a pack needs the `PACK` magic, a supported version, a non-zero
+object count and its sibling `.idx`, so ordinary ignored content-addressed build
+output stays reclaimable. The final liveness gate scans both process working
+directories and open file descriptors and retains on an inconclusive `/proc` scan.
+A failed proof renames the current quarantine back. An interrupted removal leaves a
+quarantine DIRECTORY, restored by the next pass
 (`delegation_worktree_quarantine_restored`) and re-proven; the scheduler does not
 complete removal while one survives, and `gitmoot doctor` counts those
-directories. Fence files are never counted as quarantines. Every retention
-records its reason once per job:
+directories. Every retention records its reason once per job:
 `delegation_worktree_retained_unpublished` (with obligation reason
 `unpublished_commits`; squash-merged branches land here by design, because a
 squash publishes the content and not the commits; ignored nested repositories
