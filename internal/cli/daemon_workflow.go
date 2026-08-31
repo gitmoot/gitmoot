@@ -10,6 +10,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/events"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
@@ -855,17 +856,11 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 	}
 	cfg, _ := loadMergeGateOrgConfig(g.Home)
 	from, fromDeclared := mergeGateEscalationFrom(cfg, request.Repo)
-	// The note is an escalation, so it must route as one. It previously carried no
-	// wake kind, which defaults to "reply" (db/workflow_store.go), and delivery then
-	// demanded an on=reply rule for the recipient -- a route the escalation kinds
-	// provisioned by org seat add do not satisfy.
 	rules, err := g.Store.ListEventRules(ctx)
 	if err != nil {
 		return fmt.Errorf("resolve merge-gate escalation routes: %w", err)
 	}
-	to := mergeGateEscalationTo(cfg, from, fromDeclared, func(role string) bool {
-		return roleHasEnabledWakeRoute(rules, db.WakeOutboxKindEscalation, role)
-	})
+	to := mergeGateEscalationTo(cfg, from, fromDeclared, rules)
 	body := workflow.FormatOrgEscalateNote(from, to, label, reason.Render())
 	if body == "" {
 		return errors.New("format merge-gate escalation note")
@@ -874,18 +869,25 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 	if !parsed {
 		return errors.New("parse merge-gate escalation note")
 	}
+	// DEDUP IS ROUTE-INDEPENDENT ON PURPOSE. The recipient is now derived from the
+	// chart and from mutable event-rule state, so comparing whole bodies would let
+	// one gate miss escalate again the moment routing changes between ticks, leaving
+	// two open escalations addressed to two roles for one miss. The identity of an
+	// escalation is who raised it, for which workflow, about what.
 	notes, err := g.Store.ListWorkflowNotes(ctx, label, 0)
 	if err != nil {
 		return err
 	}
+	question := reason.Render()
 	for _, note := range notes {
-		if note.Body == body {
+		existingFrom, _, existingWF, existingQuestion, ok := workflow.ParseOrgEscalateNote(note.Body)
+		if ok && existingFrom == from && existingWF == label && existingQuestion == question {
 			return nil
 		}
 	}
 	if _, err := g.Store.InsertWorkflowNote(ctx, db.WorkflowNote{
 		WorkflowID: label, Author: from, Body: body, Repo: request.Repo,
-		AddressedTarget: addressedTarget, AddressedWakeKind: db.WakeOutboxKindEscalation,
+		AddressedTarget: addressedTarget,
 	}); err != nil {
 		return fmt.Errorf("record merge-gate escalation: %w", err)
 	}
@@ -923,17 +925,15 @@ func mergeGateEscalationFrom(cfg config.OrgConfig, repo string) (string, bool) {
 // chart answer is the nearest ancestor, which is the same upward rule org escalate
 // enforces on the CLI path (it refuses a --to outside cfg.Ancestors(from)).
 //
-// deliverable reports whether a role has an enabled wake route for this kind. The
-// nearest ancestor is preferred, but an ancestor with no route is a note nobody
-// receives: matchingWakeRules is scope-blind and requires OnKind+WakeRole, and an
-// unmatched outbox row is never expired, so it sits pending forever. We therefore
-// climb to the first ancestor that can be woken and only fall back to the nearest
-// one when nobody in the chain can be.
+// An ancestor with no wake route is a note nobody receives: an unmatched outbox
+// row is inert and is never expired. So the nearest ancestor is preferred, the
+// climb continues to the first ancestor that can be woken, and the nearest one is
+// kept only when nobody in the chain can be.
 //
 // ValidateOrg admits exactly one root and requires it be named "owner"
 // (config/org.go), so the unplaced-sender case is that constant rather than a
 // Roots() lookup; if that invariant is ever relaxed, this returns the wrong role.
-func mergeGateEscalationTo(cfg config.OrgConfig, from string, fromDeclared bool, deliverable func(string) bool) string {
+func mergeGateEscalationTo(cfg config.OrgConfig, from string, fromDeclared bool, rules []db.EventRule) string {
 	if !fromDeclared {
 		return orgChartRootRole
 	}
@@ -945,7 +945,7 @@ func mergeGateEscalationTo(cfg config.OrgConfig, from string, fromDeclared bool,
 		return from
 	}
 	for _, ancestor := range ancestors {
-		if deliverable(ancestor) {
+		if mergeGateEscalationDeliverable(rules, ancestor) {
 			return ancestor
 		}
 	}
@@ -955,18 +955,26 @@ func mergeGateEscalationTo(cfg config.OrgConfig, from string, fromDeclared bool,
 // orgChartRootRole is the single root name ValidateOrg admits.
 const orgChartRootRole = "owner"
 
-// roleHasEnabledWakeRoute mirrors what matchingWakeRules will demand at delivery
-// time: an enabled rule whose kind and wake role both match. Filters are left to
-// the delivery check, which sees the event a rule may filter on.
-func roleHasEnabledWakeRoute(rules []db.EventRule, kind, role string) bool {
-	for _, rule := range rules {
-		if rule.Enabled &&
-			strings.EqualFold(strings.TrimSpace(rule.OnKind), kind) &&
-			strings.EqualFold(strings.TrimSpace(rule.WakeRole), strings.TrimSpace(role)) {
-			return true
-		}
+// mergeGateEscalationDeliverable asks the DELIVERY matcher itself, rather than
+// restating its rule. A previous round asked whether the role had an on=escalation
+// route, which sounds right and is wrong: wakeOutboxKindForSource derives a
+// workflow-note row's kind from the SOURCE, so this note is delivered as a reply
+// regardless of any wake kind on the note (#1728 review). Reusing matchingWakeRules
+// keeps that answer correct if the derivation ever changes, and carries its
+// MatchFilter semantics for free -- a filtered rule cannot match the empty-repo
+// event a workflow-note wake builds.
+func mergeGateEscalationDeliverable(rules []db.EventRule, role string) bool {
+	kind, ok := wakeOutboxKindForSource(db.WakeOutboxSourceWorkflowNote, wakeOutboxNoteCoalesceKey(role))
+	if !ok {
+		return false
 	}
-	return false
+	return len(matchingWakeRules(rules, events.Event{WakeKind: kind, WakeTargetRole: strings.ToLower(strings.TrimSpace(role))})) != 0
+}
+
+// wakeOutboxNoteCoalesceKey mirrors db's key composition for an addressed note
+// wake, which is what wakeOutboxKindForSource inspects.
+func wakeOutboxNoteCoalesceKey(role string) string {
+	return db.WakeOutboxKindReply + ":" + strings.ToLower(strings.TrimSpace(role))
 }
 
 func repoOrgOwner(cfg config.OrgConfig, repo string) (string, bool) {

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"slices"
 	"strings"
 	"testing"
 
@@ -180,17 +179,26 @@ scope = ["owner/repo"]
 		outbox[0].TargetRole != "coordinator" || outbox[0].SourceID != fmt.Sprint(notes[0].ID) {
 		t.Fatalf("merge-gate wake outbox = %+v, err=%v", outbox, err)
 	}
-	// An escalation must route AS an escalation. With no wake kind the row keys
-	// "reply:<role>", and delivery then demands an on=reply rule the escalation
-	// routes provisioned by org seat add do not satisfy (#1728 review).
-	if outbox[0].CoalesceKey != "escalation:coordinator" {
-		t.Fatalf("merge-gate wake coalesce key = %q, want escalation:coordinator", outbox[0].CoalesceKey)
+	// The row keys "reply:<role>" and that is CORRECT, not a leftover: a
+	// workflow-note wake's delivery kind comes from the SOURCE kind
+	// (wakeOutboxKindForSource), so a wake kind on the note would change this key
+	// while changing nothing about delivery. A previous round set one and claimed it
+	// fixed routing; it did not (#1728 review). Deliverability is decided by the
+	// recipient having an on=reply rule, which is what the resolver checks.
+	if outbox[0].CoalesceKey != "reply:coordinator" {
+		t.Fatalf("merge-gate wake coalesce key = %q, want reply:coordinator", outbox[0].CoalesceKey)
 	}
 }
 
 // The end-to-end test above pins the parent path through gate.Evaluate. This pins
 // the branches a single gate run cannot reach, and every case expects a DIFFERENT
 // role: a table whose rows all expect "owner" cannot discriminate its own ladder.
+//
+// The rules are REAL db.EventRule values, not an injected predicate. The previous
+// round injected a fake here, so the production predicate was never executed and
+// two P1 routing defects shipped green underneath a passing table (#1728 review).
+// A rule of the wrong KIND must therefore fail these cases, which is the axis the
+// fake could not express.
 func TestMergeGateEscalationToResolvesChartAndDeliverability(t *testing.T) {
 	chart := func(t *testing.T, body string) config.OrgConfig {
 		t.Helper()
@@ -225,48 +233,144 @@ scope = ["owner/repo"]
 parent = "lead"
 scope = ["other/repo"]
 `
-	reachable := func(roles ...string) func(string) bool {
-		return func(role string) bool { return slices.Contains(roles, role) }
+	// A workflow-note wake is delivered as a REPLY whatever the note says, so only
+	// on=reply rules make a role reachable here.
+	reply := func(roles ...string) []db.EventRule {
+		rules := make([]db.EventRule, 0, len(roles))
+		for i, role := range roles {
+			rules = append(rules, db.EventRule{
+				ID: fmt.Sprintf("reply-%d-%s", i, role), OnKind: "reply", WakeRole: role,
+				Scope: db.EventRuleScopeAddressed, Enabled: true,
+			})
+		}
+		return rules
 	}
 	for _, test := range []struct {
-		name        string
-		body        string
-		from        string
-		declared    bool
-		deliverable func(string) bool
-		want        string
+		name     string
+		body     string
+		from     string
+		declared bool
+		rules    []db.EventRule
+		want     string
 	}{
 		{
 			name: "nearest ancestor when it can be woken", body: populated,
-			from: "coordinator", declared: true, deliverable: reachable("lead", "owner"), want: "lead",
+			from: "coordinator", declared: true, rules: reply("lead", "owner"), want: "lead",
 		},
 		{
 			name: "climbs past an ancestor with no wake route", body: populated,
-			from: "coordinator", declared: true, deliverable: reachable("owner"), want: "owner",
+			from: "coordinator", declared: true, rules: reply("owner"), want: "owner",
 		},
 		{
 			name: "keeps the nearest ancestor when nobody can be woken", body: populated,
-			from: "coordinator", declared: true, deliverable: reachable(), want: "lead",
+			from: "coordinator", declared: true, rules: nil, want: "lead",
+		},
+		{
+			name: "an escalation-kind rule does not make a role reachable", body: populated,
+			from: "coordinator", declared: true, want: "owner",
+			rules: append(reply("owner"), db.EventRule{
+				ID: "escalation-lead", OnKind: "escalation", WakeRole: "lead",
+				Scope: db.EventRuleScopeAddressed, Enabled: true,
+			}),
+		},
+		{
+			name: "a disabled rule does not make a role reachable", body: populated,
+			from: "coordinator", declared: true, want: "owner",
+			rules: append(reply("owner"), db.EventRule{
+				ID: "reply-lead-disabled", OnKind: "reply", WakeRole: "lead",
+				Scope: db.EventRuleScopeAddressed, Enabled: false,
+			}),
+		},
+		{
+			name: "a filtered rule cannot match the empty-repo note event", body: populated,
+			from: "coordinator", declared: true, want: "owner",
+			rules: append(reply("owner"), db.EventRule{
+				ID: "reply-lead-filtered", OnKind: "reply", WakeRole: "lead",
+				MatchFilter: "owner/repo", Scope: db.EventRuleScopeAddressed, Enabled: true,
+			}),
 		},
 		{
 			name: "chart root is the actor", body: populated,
-			from: "owner", declared: true, deliverable: reachable("owner"), want: "owner",
+			from: "owner", declared: true, rules: reply("owner"), want: "owner",
 		},
 		{
 			name: "repo-name segment colliding with a role never inherits its parent", body: populated,
-			from: "vetrina", declared: false, deliverable: reachable("lead", "owner"), want: "owner",
+			from: "vetrina", declared: false, rules: reply("lead", "owner"), want: "owner",
 		},
 		{
 			name: "absent chart falls back to the root name", body: "",
-			from: "appkit-demo", declared: false, deliverable: reachable(), want: "owner",
+			from: "appkit-demo", declared: false, rules: nil, want: "owner",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			got := mergeGateEscalationTo(chart(t, test.body), test.from, test.declared, test.deliverable)
+			got := mergeGateEscalationTo(chart(t, test.body), test.from, test.declared, test.rules)
 			if got != test.want {
 				t.Fatalf("mergeGateEscalationTo(%q, declared=%t) = %q, want %q", test.from, test.declared, got, test.want)
 			}
 		})
+	}
+}
+
+// One gate miss is ONE escalation even if routing moves under it. The recipient is
+// derived from mutable event-rule state, so a body-equality dedup re-escalated the
+// same miss to a second role the moment an operator seated the coordinator between
+// ticks, leaving two open escalations that resolve independently (#1728 review).
+func TestDaemonMergeGateEscalatesOnceAcrossARoutingChange(t *testing.T) {
+	store, checkout, gh, request := daemonMergeGateActiveJobFixture(t, false)
+	request.WorkflowID = "goal-reroute"
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	content := config.DefaultConfig(paths) + `
+[org.roles."owner"]
+scope = ["*"]
+[org.roles."coordinator"]
+parent = "owner"
+scope = ["owner/*"]
+[org.roles."worker"]
+parent = "coordinator"
+scope = ["owner/repo"]
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	addRule := func(id, role string) {
+		t.Helper()
+		if err := store.AddEventRule(context.Background(), db.EventRule{
+			ID: id, OnKind: "reply", WakeRole: role,
+			Scope: db.EventRuleScopeAddressed, Enabled: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Tick 1: only owner is reachable, so the climb passes coordinator.
+	addRule("reply-owner", "owner")
+	gate := newHostDaemonMergeGate(store, gh, checkout, paths.Home)
+	if _, err := gate.Evaluate(context.Background(), request); err != nil {
+		t.Fatalf("first evaluate: %v", err)
+	}
+	notes, err := store.ListWorkflowNotes(context.Background(), request.WorkflowID, 0)
+	if err != nil || len(notes) != 1 {
+		t.Fatalf("notes after first tick = %+v, err=%v", notes, err)
+	}
+	if _, to, _, _, ok := workflow.ParseOrgEscalateNote(notes[0].Body); !ok || to != "owner" {
+		t.Fatalf("first escalation addressed %q, want owner", to)
+	}
+
+	// Tick 2: the operator seats the coordinator, so routing now stops one level
+	// lower. The miss is unchanged, so it must NOT escalate a second time.
+	addRule("reply-coordinator", "coordinator")
+	if _, err := gate.Evaluate(context.Background(), request); err != nil {
+		t.Fatalf("second evaluate: %v", err)
+	}
+	notes, err = store.ListWorkflowNotes(context.Background(), request.WorkflowID, 0)
+	if err != nil || len(notes) != 1 {
+		t.Fatalf("notes after reroute = %d, want the single original escalation; err=%v", len(notes), err)
+	}
+	outbox, err := store.ListWakeOutbox(context.Background(), "")
+	if err != nil || len(outbox) != 1 {
+		t.Fatalf("wake outbox after reroute = %+v, err=%v; want one row", outbox, err)
 	}
 }
 

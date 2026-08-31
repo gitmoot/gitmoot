@@ -592,7 +592,8 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    Native task auto-merge is enabled by default, but only with an approved review
    verdict for the exact current head SHA and green SHA-scoped commit statuses
    and check-runs. A miss leaves the PR open, records an org escalation, and wakes
-   `jarvis`. Set `[merge_gate] auto_merge = false` globally or per repository as
+   the nearest ancestor of the org role that owns the repo which has a wake route.
+   Set `[merge_gate] auto_merge = false` globally or per repository as
    an explicit kill-switch. The merge gate also checks local worktree cleanliness,
    branch freshness, and mergeability. Final merge work
    is serialized per repository base branch. Before the policy gate can issue

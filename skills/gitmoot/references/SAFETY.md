@@ -46,8 +46,8 @@ merges gatelessly; the external gate makes the call.
 Gitmoot enables native task auto-merge by default, but only when an affirmative
 review verdict matches the exact current head SHA and all SHA-scoped commit
 statuses and check-runs are green. Missing or failing evidence parks the task in
-`awaiting_human_merge`, journals the reason, and actively wakes the parent of
-the org role that owns the repo.
+`awaiting_human_merge`, journals the reason, and actively wakes the nearest
+ancestor of the org role that owns the repo which has a wake route.
 Set `auto_merge = false` globally or per repo as an explicit kill-switch:
 
 ```toml
@@ -80,7 +80,7 @@ synthetic `gitmoot/ci` success. GitHub Actions creates a check-run a few seconds
 *after* a head is pushed, so a single zero observation cannot distinguish "no CI
 configured" from "CI not created yet". Instead the gate returns **pending**
 (a non-escalating, automatically-retried hold — not a policy miss, so it does
-not park the task or wake the owning role's parent) and only concludes "no CI" after a **second
+not park the task or wake the owning role's ancestor) and only concludes "no CI" after a **second
 consecutive zero-external observation at the same head**, at least `min_ci_wait`
 (default `60s`) later. The gate is re-evaluated every daemon poll, so a
 genuinely CI-less repo merges exactly one grace window later, provided the
