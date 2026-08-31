@@ -69,11 +69,17 @@ func TestRoutineRoundUnionsBareAndLensScopes(t *testing.T) {
 	if payload.ReviewScope == nil {
 		t.Fatal("routine round 3 lost the scope")
 	}
-	joined := strings.Join(payload.ReviewScope.Findings, " ")
-	for _, want := range []string{`"id":"R-1"`, `"id":"C-2"`, `"id":"S-2"`} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("routine scope findings = %#v, want %s carried forward", payload.ReviewScope.Findings, want)
-		}
+	// EXACT order, not membership: the reviewer's own routine findings first, then each
+	// lens in sorted lens id order. Map-order iteration over the candidate set left this
+	// nondeterministic, and the order reaches production identity through
+	// scopedReviewInstructions -> JobRequest.Instructions -> Engine.jobID.
+	wantFindings := []string{
+		`{"id":"R-1","summary":"routine finding"}`,
+		`{"lens":"correctness","id":"C-2","summary":"correctness finding"}`,
+		`{"lens":"security","id":"S-2","summary":"security finding"}`,
+	}
+	if strings.Join(payload.ReviewScope.Findings, "\n") != strings.Join(wantFindings, "\n") {
+		t.Fatalf("routine scope findings = %#v, want %#v in that order", payload.ReviewScope.Findings, wantFindings)
 	}
 	// The OLDEST baseline is named, because its file range covers the newer one.
 	if payload.ReviewScope.PreviousHeadSHA != "head-one" {
@@ -82,6 +88,91 @@ func TestRoutineRoundUnionsBareAndLensScopes(t *testing.T) {
 	files := strings.Join(payload.ReviewScope.ChangedFiles, ",")
 	if files != "internal/from_head_one.go,internal/from_head_two.go" {
 		t.Fatalf("scope files = %#v, want the union of both baselines", payload.ReviewScope.ChangedFiles)
+	}
+}
+
+// TestRoutineScopeAggregateOrderAndJobIDAreDeterministic pins the P2 finding from the
+// exact-head verdict. routineScopeAggregates finalized the union with
+// stableUniqueStrings, whose first-seen order came from MAP iteration over the candidate
+// set, so a routine round with more than one live scope for one reviewer emitted its
+// findings in a random order. That order reaches the reviewer through
+// scopedReviewInstructions -> JobRequest.Instructions, and production's Engine.jobID
+// (engine.go) fnv-hashes Instructions, so two runs on byte-identical inputs derived two
+// different job ids for the same work.
+//
+// One bare candidate plus three lenses has 24 map orders, only one of which is the
+// wanted one; the loop iterates enough times that any surviving nondeterminism fails
+// rather than flakes.
+func TestRoutineScopeAggregateOrderAndJobIDAreDeterministic(t *testing.T) {
+	candidates := map[reviewScopeKey]reviewScopeCandidate{
+		lensScopeKey("audit", ""):              {round: 1},
+		lensScopeKey("audit", LensCorrectness): {round: 2},
+		lensScopeKey("audit", LensSecurity):    {round: 2},
+		lensScopeKey("audit", LensRegression):  {round: 2},
+	}
+	scopes := map[reviewScopeKey]*ReviewScope{
+		lensScopeKey("audit", ""): {
+			PreviousHeadSHA: "head-one",
+			Findings:        []string{"routine finding"},
+			ChangedFiles:    []string{"internal/routine.go"},
+		},
+		lensScopeKey("audit", LensCorrectness): {
+			PreviousHeadSHA: "head-two",
+			Findings:        []string{"correctness finding"},
+			ChangedFiles:    []string{"internal/correctness.go"},
+		},
+		lensScopeKey("audit", LensSecurity): {
+			PreviousHeadSHA: "head-two",
+			Findings:        []string{"security finding"},
+			ChangedFiles:    []string{"internal/security.go"},
+		},
+		lensScopeKey("audit", LensRegression): {
+			PreviousHeadSHA: "head-two",
+			Findings:        []string{"regression finding"},
+			ChangedFiles:    []string{"internal/regression.go"},
+		},
+	}
+	// The reviewer's own routine findings first, then one block per lens in sorted lens
+	// id order: correctness, regression, security.
+	wantFindings := []string{
+		"routine finding",
+		"correctness finding",
+		"regression finding",
+		"security finding",
+	}
+	// A zero-value Engine has no JobID seam, so this is the PRODUCTION identity hash
+	// that consumes Instructions — testEngine's stub id would hide the whole finding.
+	engine := Engine{}
+	event := reviewRefanoutEvent("head-three")
+	var wantID string
+	for i := range 200 {
+		aggregate := routineScopeAggregates(candidates, scopes)[routineScopeKey("audit")]
+		if aggregate == nil {
+			t.Fatalf("iteration %d: no routine aggregate", i)
+		}
+		if strings.Join(aggregate.Findings, "\n") != strings.Join(wantFindings, "\n") {
+			t.Fatalf("iteration %d: aggregate findings = %#v, want %#v in that order", i, aggregate.Findings, wantFindings)
+		}
+		if aggregate.PreviousHeadSHA != "head-one" {
+			t.Fatalf("iteration %d: aggregate baseline = %q, want head-one", i, aggregate.PreviousHeadSHA)
+		}
+		id := engine.jobID(JobRequest{
+			Repo:         event.Repo,
+			Branch:       event.Branch,
+			PullRequest:  event.PullRequest,
+			TaskID:       event.TaskID,
+			Agent:        "audit",
+			Action:       "review",
+			ReviewRound:  "review-3",
+			Instructions: scopedReviewInstructions(event, aggregate),
+		})
+		if i == 0 {
+			wantID = id
+			continue
+		}
+		if id != wantID {
+			t.Fatalf("iteration %d: derived job id = %s, want %s — the scoped prompt is not byte-stable", i, id, wantID)
+		}
 	}
 }
 
