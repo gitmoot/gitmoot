@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -1342,27 +1341,17 @@ func wrapProduceSandboxAdapter(action string, agent runtime.Agent, adapter workf
 const maxReadOnlyRuntimeStateFileBytes = 1 << 20
 
 type readOnlySandboxGrants struct {
-	reads      []string
-	readFiles  []string
-	writes     []string
-	env        []string
-	cacheRoot  string
-	stateDir   string
-	credential *readOnlyRuntimeCredential
-}
-
-type readOnlyRuntimeCredential struct {
-	sourcePath string
-	stagedPath string
-	section    string
-	keys       map[string]struct{}
-	shape      any
+	reads     []string
+	readFiles []string
+	writes    []string
+	env       []string
+	cacheRoot string
+	stateDir  string
 }
 
 type readOnlyRuntimeAdapter struct {
 	runtime.Adapter
-	credential *readOnlyRuntimeCredential
-	stateRoot  string
+	stateRoot string
 }
 
 func (a readOnlyRuntimeAdapter) PermissionPolicyApplication(agent runtime.Agent) runtime.PermissionPolicyApplication {
@@ -1371,19 +1360,15 @@ func (a readOnlyRuntimeAdapter) PermissionPolicyApplication(agent runtime.Agent)
 
 func (a readOnlyRuntimeAdapter) Deliver(ctx context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error) {
 	result, deliverErr := a.Adapter.Deliver(ctx, agent, job)
-	var syncErr error
-	if deliverErr == nil && a.credential != nil {
-		if err := a.credential.persist(); err != nil {
-			syncErr = fmt.Errorf("persist read-only seat runtime credential: %w", err)
-		}
-	}
+	// The prompt can rewrite every file under stateRoot. Never synchronize that
+	// untrusted state back to the shared runtime profile; refreshes are job-local.
 	var cleanupErr error
 	if a.stateRoot != "" {
 		if err := os.RemoveAll(a.stateRoot); err != nil {
 			cleanupErr = fmt.Errorf("remove read-only seat runtime state: %w", err)
 		}
 	}
-	return result, errors.Join(deliverErr, syncErr, cleanupErr)
+	return result, errors.Join(deliverErr, cleanupErr)
 }
 
 func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout string, adapter workflow.DeliveryAdapter) (workflow.DeliveryAdapter, error) {
@@ -1405,7 +1390,7 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 	if err != nil {
 		return nil, err
 	}
-	if grants.stateDir == "" && grants.credential == nil {
+	if grants.stateDir == "" {
 		return wrapped, nil
 	}
 	runtimeAdapter, ok := wrapped.(runtime.Adapter)
@@ -1413,9 +1398,8 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 		return nil, fmt.Errorf("read-only Landlock sandbox returned incompatible %T adapter", wrapped)
 	}
 	return readOnlyRuntimeAdapter{
-		Adapter:    runtimeAdapter,
-		credential: grants.credential,
-		stateRoot:  filepath.Join(grants.cacheRoot, "runtime-state"),
+		Adapter:   runtimeAdapter,
+		stateRoot: filepath.Join(grants.cacheRoot, "runtime-state"),
 	}, nil
 }
 
@@ -1516,12 +1500,11 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	}
 	grants.reads = append(grants.reads, metadata...)
 
-	stateDir, credential, stateEnv, err := prepareReadOnlyRuntimeState(agent, grants.cacheRoot, gatewayMode)
+	stateDir, stateEnv, err := prepareReadOnlyRuntimeState(agent, grants.cacheRoot, gatewayMode)
 	if err != nil {
 		return grants, err
 	}
 	grants.stateDir = stateDir
-	grants.credential = credential
 	grants.env = append(grants.env, stateEnv...)
 
 	tempDir := filepath.Join(grants.cacheRoot, "tmp")
@@ -1552,10 +1535,10 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	return grants, nil
 }
 
-func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayMode bool) (string, *readOnlyRuntimeCredential, []string, error) {
+func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayMode bool) (string, []string, error) {
 	userHome, err := os.UserHomeDir()
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("resolve read-only runtime state home: %w", err)
+		return "", nil, fmt.Errorf("resolve read-only runtime state home: %w", err)
 	}
 	sourceDir := strings.TrimSpace(agent.RuntimeConfigDir)
 	var relativeState, credentialFile, credentialSection string
@@ -1582,259 +1565,84 @@ func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayM
 		relativeState = filepath.Join("home", ".kimi-code")
 		credentialFile = filepath.Join("credentials", "kimi-code.json")
 	case runtime.ShellRuntime:
-		return "", nil, nil, nil
+		return "", nil, nil
 	case runtime.OmpRuntime:
-		return "", nil, nil, errors.New("read-only seats cannot use omp without an isolated credential broker")
+		return "", nil, errors.New("read-only seats cannot use omp without an isolated credential broker")
 	default:
-		return "", nil, nil, fmt.Errorf("read-only seat runtime %q has no isolated state policy", agent.Runtime)
+		return "", nil, fmt.Errorf("read-only seat runtime %q has no isolated state policy", agent.Runtime)
 	}
 	sourceDir, err = filepath.Abs(sourceDir)
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("resolve runtime state directory %q: %w", sourceDir, err)
+		return "", nil, fmt.Errorf("resolve runtime state directory %q: %w", sourceDir, err)
 	}
 	if resolved, resolveErr := filepath.EvalSymlinks(sourceDir); resolveErr == nil {
 		sourceDir = resolved
 	}
 	stateDir := filepath.Join(cacheRoot, "runtime-state", relativeState)
 	if err := os.RemoveAll(stateDir); err != nil {
-		return "", nil, nil, fmt.Errorf("reset isolated runtime state %q: %w", stateDir, err)
+		return "", nil, fmt.Errorf("reset isolated runtime state %q: %w", stateDir, err)
 	}
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return "", nil, nil, fmt.Errorf("create isolated runtime state %q: %w", stateDir, err)
+		return "", nil, fmt.Errorf("create isolated runtime state %q: %w", stateDir, err)
 	}
-	var credential *readOnlyRuntimeCredential
 	if credentialFile != "" {
-		credential, err = stageReadOnlyRuntimeCredential(
+		if err := stageReadOnlyRuntimeCredential(
 			filepath.Join(sourceDir, credentialFile),
 			filepath.Join(stateDir, credentialFile),
 			credentialSection,
-		)
-		if err != nil {
-			return "", nil, nil, err
+		); err != nil {
+			return "", nil, err
 		}
 	}
-	stateEnv := []string{}
+	var stateEnv []string
 	switch agent.Runtime {
 	case runtime.ClaudeRuntime:
 		stateEnv = append(stateEnv, "CLAUDE_CONFIG_DIR="+stateDir)
 	case runtime.CodexRuntime:
 		stateEnv = append(stateEnv, "CODEX_HOME="+stateDir)
 	}
-	return stateDir, credential, stateEnv, nil
+	return stateDir, stateEnv, nil
 }
 
-func copyReadOnlyRuntimeCredential(source, destination string) (map[string]struct{}, error) {
+func stageReadOnlyRuntimeCredential(source, destination, section string) error {
 	info, err := os.Lstat(source)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("inspect runtime state file %q: %w", source, err)
+		return fmt.Errorf("inspect runtime state file %q: %w", source, err)
 	}
 	if !info.Mode().IsRegular() || info.Size() > maxReadOnlyRuntimeStateFileBytes {
-		return nil, fmt.Errorf("runtime state file %q must be a regular file no larger than %d bytes", source, maxReadOnlyRuntimeStateFileBytes)
+		return fmt.Errorf("runtime state file %q must be a regular file no larger than %d bytes", source, maxReadOnlyRuntimeStateFileBytes)
 	}
 	data, err := os.ReadFile(source)
 	if err != nil {
-		return nil, fmt.Errorf("read runtime state file %q: %w", source, err)
+		return fmt.Errorf("read runtime state file %q: %w", source, err)
 	}
-	keys, err := jsonObjectKeys(data)
-	if err != nil {
-		return nil, fmt.Errorf("validate runtime credential %q: %w", source, err)
-	}
-	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(destination, data, 0o600); err != nil {
-		return nil, fmt.Errorf("stage runtime state file %q: %w", destination, err)
-	}
-	return keys, nil
-}
-
-func stageReadOnlyRuntimeCredential(source, destination, section string) (*readOnlyRuntimeCredential, error) {
-	keys, err := copyReadOnlyRuntimeCredential(source, destination)
-	if err != nil || keys == nil {
-		return nil, err
-	}
-	data, err := os.ReadFile(destination)
-	if err != nil {
-		return nil, err
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil || object == nil {
+		if err == nil {
+			err = errors.New("credential must be a JSON object")
+		}
+		return fmt.Errorf("validate runtime credential %q: %w", source, err)
 	}
 	if section != "" {
-		var object map[string]json.RawMessage
-		if err := json.Unmarshal(data, &object); err != nil {
-			return nil, err
-		}
 		value, ok := object[section]
 		if !ok {
-			return nil, fmt.Errorf("runtime credential %q lacks required %q section", source, section)
+			return fmt.Errorf("runtime credential %q lacks required %q section", source, section)
 		}
 		data, err = json.Marshal(map[string]json.RawMessage{section: value})
 		if err != nil {
-			return nil, err
-		}
-		if err := os.WriteFile(destination, data, 0o600); err != nil {
-			return nil, err
-		}
-		keys = map[string]struct{}{section: {}}
-	}
-	shape, err := jsonDocumentShape(data)
-	if err != nil {
-		return nil, err
-	}
-	return &readOnlyRuntimeCredential{
-		sourcePath: source,
-		stagedPath: destination,
-		section:    section,
-		keys:       keys,
-		shape:      shape,
-	}, nil
-}
-
-func (c *readOnlyRuntimeCredential) persist() error {
-	if c == nil {
-		return nil
-	}
-	info, err := os.Lstat(c.stagedPath)
-	if err != nil {
-		return fmt.Errorf("inspect staged credential %q: %w", c.stagedPath, err)
-	}
-	if !info.Mode().IsRegular() || info.Size() > maxReadOnlyRuntimeStateFileBytes {
-		return fmt.Errorf("staged credential %q must be a regular file no larger than %d bytes", c.stagedPath, maxReadOnlyRuntimeStateFileBytes)
-	}
-	data, err := os.ReadFile(c.stagedPath)
-	if err != nil {
-		return fmt.Errorf("read staged credential %q: %w", c.stagedPath, err)
-	}
-	keys, err := jsonObjectKeys(data)
-	if err != nil {
-		return fmt.Errorf("validate staged credential %q: %w", c.stagedPath, err)
-	}
-	if !sameJSONKeySet(keys, c.keys) {
-		return fmt.Errorf("staged credential %q changed its top-level schema", c.stagedPath)
-	}
-	shape, err := jsonDocumentShape(data)
-	if err != nil {
-		return fmt.Errorf("inspect staged credential schema: %w", err)
-	}
-	if c.shape != nil && !reflect.DeepEqual(shape, c.shape) {
-		return fmt.Errorf("staged credential %q changed its nested schema", c.stagedPath)
-	}
-	sourceInfo, err := os.Lstat(c.sourcePath)
-	if err != nil {
-		return fmt.Errorf("inspect source credential %q: %w", c.sourcePath, err)
-	}
-	if !sourceInfo.Mode().IsRegular() || sourceInfo.Size() > maxReadOnlyRuntimeStateFileBytes {
-		return fmt.Errorf("source credential %q must remain a bounded regular file", c.sourcePath)
-	}
-	if c.section != "" {
-		var stagedObject, sourceObject map[string]json.RawMessage
-		if err := json.Unmarshal(data, &stagedObject); err != nil {
-			return err
-		}
-		sourceData, err := os.ReadFile(c.sourcePath)
-		if err != nil {
-			return err
-		}
-		if err := json.Unmarshal(sourceData, &sourceObject); err != nil {
-			return fmt.Errorf("validate source credential %q: %w", c.sourcePath, err)
-		}
-		sourceObject[c.section] = stagedObject[c.section]
-		data, err = json.Marshal(sourceObject)
-		if err != nil {
-			return err
-		}
-		if len(data) > maxReadOnlyRuntimeStateFileBytes {
-			return fmt.Errorf("merged credential %q exceeds %d bytes", c.sourcePath, maxReadOnlyRuntimeStateFileBytes)
+			return fmt.Errorf("isolate runtime credential %q: %w", source, err)
 		}
 	}
-	temp, err := os.CreateTemp(filepath.Dir(c.sourcePath), ".gitmoot-runtime-auth-*")
-	if err != nil {
-		return fmt.Errorf("create credential replacement: %w", err)
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		return fmt.Errorf("create isolated runtime state directory: %w", err)
 	}
-	tempPath := temp.Name()
-	defer os.Remove(tempPath)
-	if err := temp.Chmod(0o600); err != nil {
-		_ = temp.Close()
-		return err
-	}
-	if _, err := temp.Write(data); err != nil {
-		_ = temp.Close()
-		return err
-	}
-	if err := temp.Sync(); err != nil {
-		_ = temp.Close()
-		return err
-	}
-	if err := temp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tempPath, c.sourcePath); err != nil {
-		return fmt.Errorf("replace source credential: %w", err)
+	if err := os.WriteFile(destination, data, 0o600); err != nil {
+		return fmt.Errorf("stage runtime state file %q: %w", destination, err)
 	}
 	return nil
-}
-
-func jsonObjectKeys(data []byte) (map[string]struct{}, error) {
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(data, &object); err != nil {
-		return nil, err
-	}
-	if object == nil {
-		return nil, errors.New("credential must be a JSON object")
-	}
-	keys := make(map[string]struct{}, len(object))
-	for key := range object {
-		keys[key] = struct{}{}
-	}
-	return keys, nil
-}
-
-func jsonDocumentShape(data []byte) (any, error) {
-	var value any
-	if err := json.Unmarshal(data, &value); err != nil {
-		return nil, err
-	}
-	return jsonValueShape(value), nil
-}
-
-func jsonValueShape(value any) any {
-	switch value := value.(type) {
-	case map[string]any:
-		shape := make(map[string]any, len(value))
-		for key, child := range value {
-			shape[key] = jsonValueShape(child)
-		}
-		return shape
-	case []any:
-		shape := make([]any, len(value))
-		for index, child := range value {
-			shape[index] = jsonValueShape(child)
-		}
-		return shape
-	case string:
-		return "string"
-	case float64:
-		return "number"
-	case bool:
-		return "boolean"
-	case nil:
-		return "null"
-	default:
-		return fmt.Sprintf("%T", value)
-	}
-}
-
-func sameJSONKeySet(left, right map[string]struct{}) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for key := range left {
-		if _, ok := right[key]; !ok {
-			return false
-		}
-	}
-	return true
 }
 
 func readOnlyRuntimeBaseEnv(runtimeName string, environ []string, githubDir string) []string {

@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -252,14 +251,15 @@ func TestWrapReadOnlySandboxAdapterUsesExplicitReadsAndIsolatedState(t *testing.
 	if !ok {
 		t.Fatalf("wrapped adapter = %T, want readOnlyRuntimeAdapter", wrapped)
 	}
-	stagedCredential, err := os.ReadFile(stateAdapter.credential.stagedPath)
+	stagedPath := filepath.Join(stateAdapter.stateRoot, ".claude", ".credentials.json")
+	stagedCredential, err := os.ReadFile(stagedPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(stagedCredential), "mcpOAuth") || strings.Contains(string(stagedCredential), "must-stay-hidden") {
 		t.Fatalf("isolated Claude credential leaked unrelated profile credentials: %s", stagedCredential)
 	}
-	if _, err := os.Stat(filepath.Join(filepath.Dir(stateAdapter.credential.stagedPath), "settings.json")); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(filepath.Dir(stagedPath), "settings.json")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("isolated profile copied host settings: %v", err)
 	}
 	adapter, ok := stateAdapter.Adapter.(runtime.ClaudeAdapter)
@@ -391,76 +391,75 @@ func TestReadOnlyRuntimeAdapterRemovesStagedState(t *testing.T) {
 	}
 }
 
-func TestReadOnlyRuntimeCredentialPersistsOnlyStableJSONSchema(t *testing.T) {
-	dir := t.TempDir()
-	source := filepath.Join(dir, "auth.json")
-	staged := filepath.Join(dir, "staged.json")
-	if err := os.WriteFile(source, []byte(`{"token":"old"}`), 0o600); err != nil {
+func TestReadOnlyRuntimeAdapterNeverPersistsStagedCredential(t *testing.T) {
+	configHome := t.TempDir()
+	checkout := filepath.Join(t.TempDir(), "review-worktree")
+	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(staged, []byte(`{"token":"refreshed"}`), 0o600); err != nil {
+	sourceDir := t.TempDir()
+	source := filepath.Join(sourceDir, ".credentials.json")
+	const sourceCredential = `{"claudeAiOauth":{"accessToken":"host"},"mcpOAuth":{"secret":"preserve"}}`
+	if err := os.WriteFile(source, []byte(sourceCredential), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	shape, err := jsonDocumentShape([]byte(`{"token":"old"}`))
+	agent := runtime.Agent{
+		Name: "reviewer", Role: "reviewer", Runtime: runtime.ClaudeRuntime,
+		RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "owner/repo",
+		AutonomyPolicy: runtime.AutonomyPolicyReadOnly, ReadOnlySeat: true,
+		RuntimeConfigDir: sourceDir,
+	}
+	wrapped, err := wrapReadOnlySandboxAdapter(configHome, agent, checkout, runtime.ClaudeAdapter{
+		Runner: &sandboxAdapterCaptureRunner{stdout: `{"result":"done"}`},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	credential := &readOnlyRuntimeCredential{
-		sourcePath: source,
-		stagedPath: staged,
-		keys:       map[string]struct{}{"token": {}},
-		shape:      shape,
+	adapter, ok := wrapped.(readOnlyRuntimeAdapter)
+	if !ok {
+		t.Fatalf("wrapped adapter = %T, want readOnlyRuntimeAdapter", wrapped)
 	}
-	if err := credential.persist(); err != nil {
+	staged := filepath.Join(adapter.stateRoot, ".claude", ".credentials.json")
+	if err := os.WriteFile(staged, []byte(`{"claudeAiOauth":{"accessToken":"attacker-controlled"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if data, err := os.ReadFile(source); err != nil || string(data) != `{"token":"refreshed"}` {
-		t.Fatalf("persisted credential = %q, err=%v", data, err)
-	}
-	if err := os.WriteFile(staged, []byte(`{"token":{"value":"poisoned"}}`), 0o600); err != nil {
+	if _, err := adapter.Deliver(context.Background(), agent, runtime.Job{Prompt: "review"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := credential.persist(); err == nil || !strings.Contains(err.Error(), "nested schema") {
-		t.Fatalf("nested schema drift error = %v", err)
+	if data, err := os.ReadFile(source); err != nil || string(data) != sourceCredential {
+		t.Fatalf("shared credential changed to %q, err=%v", data, err)
 	}
-	if err := os.WriteFile(staged, []byte(`{"token":"poisoned","extra":true}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := credential.persist(); err == nil || !strings.Contains(err.Error(), "top-level schema") {
-		t.Fatalf("schema drift error = %v", err)
-	}
-	if data, err := os.ReadFile(source); err != nil || string(data) != `{"token":"refreshed"}` {
-		t.Fatalf("source changed after rejected schema drift: %q, err=%v", data, err)
+	if _, err := os.Stat(adapter.stateRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staged runtime state survived delivery: %v", err)
 	}
 }
 
-func TestClaudeCredentialRefreshPreservesUnrelatedSections(t *testing.T) {
+func TestStageReadOnlyRuntimeCredentialCopiesOnlyProviderSection(t *testing.T) {
 	dir := t.TempDir()
 	source := filepath.Join(dir, ".credentials.json")
 	staged := filepath.Join(dir, "isolated", ".credentials.json")
-	if err := os.WriteFile(source, []byte(`{"claudeAiOauth":{"accessToken":"old"},"mcpOAuth":{"secret":"preserve"}}`), 0o600); err != nil {
+	const sourceCredential = `{"claudeAiOauth":{"accessToken":"old"},"mcpOAuth":{"secret":"preserve"}}`
+	if err := os.WriteFile(source, []byte(sourceCredential), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	credential, err := stageReadOnlyRuntimeCredential(source, staged, "claudeAiOauth")
+	if err := stageReadOnlyRuntimeCredential(source, staged, "claudeAiOauth"); err != nil {
+		t.Fatal(err)
+	}
+	stagedData, err := os.ReadFile(staged)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(staged, []byte(`{"claudeAiOauth":{"accessToken":"refreshed"}}`), 0o600); err != nil {
+	if strings.Contains(string(stagedData), "mcpOAuth") || strings.Contains(string(stagedData), "preserve") {
+		t.Fatalf("staged credential leaked unrelated provider state: %s", stagedData)
+	}
+	if !strings.Contains(string(stagedData), "claudeAiOauth") {
+		t.Fatalf("staged credential lacks Claude OAuth state: %s", stagedData)
+	}
+	if err := os.WriteFile(staged, []byte(`{"claudeAiOauth":{"accessToken":"attacker-controlled"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := credential.persist(); err != nil {
-		t.Fatal(err)
-	}
-	var result map[string]map[string]string
-	data, err := os.ReadFile(source)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(data, &result); err != nil {
-		t.Fatal(err)
-	}
-	if result["claudeAiOauth"]["accessToken"] != "refreshed" || result["mcpOAuth"]["secret"] != "preserve" {
-		t.Fatalf("merged Claude credential = %v", result)
+	if data, err := os.ReadFile(source); err != nil || string(data) != sourceCredential {
+		t.Fatalf("shared credential changed to %q, err=%v", data, err)
 	}
 }
 

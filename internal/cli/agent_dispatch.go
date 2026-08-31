@@ -389,23 +389,26 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		}
 		recipeTemplate = &tmpl
 	}
-	// Give an eligible read-only job its own detached worktree BEFORE enqueue so
-	// its checkout key is worktree:<path> (queuedJobCheckoutKey) and same-repo
-	// seats (moot, chat-task, autorespond, `agent ask --background`) run
-	// concurrently instead of serializing on the shared repo:<repo> key. Foreground
-	// asks run inline and never serialize, so they are left untouched. Ask remains
-	// FAIL-OPEN because its isolation is a throughput optimization. Review is
-	// FAIL-CLOSED because falling back to its shared checkout would review a commit
-	// other than the requested head.
+	// Give every eligible read-only job its own detached worktree BEFORE enqueue.
+	// The worktree is both its checkout key and its hard filesystem boundary.
+	// Falling back to the shared checkout would silently drop that boundary, so
+	// allocation failure refuses both exact-head reviews and taskless background
+	// asks. Foreground and task-bearing asks keep their existing checkout policy.
 	jobID := localAgentJobID(request.Action, agent.Name)
 	readOnlyWorktreePath, readOnlyWorktreeErr := maybeAllocateDispatchReadOnlyWorktree(ctx, store, request, repo.FullName(), record.CheckoutPath, jobID)
-	if request.Action == "review" {
+	if dispatchReadOnlyWorktreeEligible(request) {
+		kind := "read-only ask"
+		if request.Action == "review" {
+			kind = "exact-head review"
+		}
 		if readOnlyWorktreeErr != nil {
-			return localAgentJobOutput{}, fmt.Errorf("allocate exact-head review worktree: %w", readOnlyWorktreeErr)
+			return localAgentJobOutput{}, fmt.Errorf("allocate %s worktree: %w", kind, readOnlyWorktreeErr)
 		}
 		if strings.TrimSpace(readOnlyWorktreePath) == "" {
-			return localAgentJobOutput{}, errors.New("allocate exact-head review worktree: no worktree was allocated")
+			return localAgentJobOutput{}, fmt.Errorf("allocate %s worktree: no worktree was allocated", kind)
 		}
+	}
+	if request.Action == "review" {
 		checkoutPath = readOnlyWorktreePath
 		promptHeadWarnings = dispatchPromptHeadContradictionWarnings(ctx, jobGitClient(checkoutPath, localDispatchJobRunner(request)), request.Instructions, request.HeadSHA)
 	}
@@ -508,13 +511,10 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "route_selected", Message: routeSelectedMessage(request)}); err != nil {
 		return localAgentJobOutput{}, err
 	}
-	// Emit the #739 read-only isolation outcome now that the job row exists (job
-	// events carry a JobID FK). Allocated → observable worktree:<path> key; a
-	// fail-open skip → loud event so a lost-parallelism serialize is never silent.
+	// Emit the #739 read-only allocation after the job row exists because job
+	// events carry a JobID foreign key. Allocation failures returned before enqueue.
 	if readOnlyWorktreePath != "" {
 		_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "readonly_worktree_allocated", Message: fmt.Sprintf("read-only worktree %s allocated at dispatch (#739); job keyed worktree:<path> to run beside same-repo seats", readOnlyWorktreePath)})
-	} else if readOnlyWorktreeErr != nil {
-		_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "readonly_worktree_skipped", Message: fmt.Sprintf("read-only worktree isolation skipped (#739); job runs serialized in the shared checkout: %v", readOnlyWorktreeErr)})
 	}
 	if overrideRuntime == "" {
 		effectiveAgent = scopeRegisteredFreshRefForJob(effectiveAgent, job.ID)
@@ -1824,9 +1824,8 @@ func dispatchReadOnlyWorktreeEligible(request localAgentDispatchRequest) bool {
 // with a distinct worktree:<path> checkout key (#739). It resolves the ref to the
 // checkout HEAD for ask and to HeadSHA for review via the shared
 // workflow.AllocateReadOnlyWorktree primitive, holding the checkout mutation
-// lock. Ask remains fail-open at the call site. Review retries after fetching the
-// PR ref for a cold checkout, then fails closed at the call site rather than
-// falling back to the stale shared checkout.
+// lock. Both callers fail closed. Review additionally retries after fetching the
+// PR ref for a cold checkout.
 func maybeAllocateDispatchReadOnlyWorktree(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string, checkout string, jobID string) (string, error) {
 	if !dispatchReadOnlyWorktreeEligible(request) {
 		return "", nil

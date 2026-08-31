@@ -617,22 +617,19 @@ func TestBackgroundAskDiffCaptureFailureDoesNotBlockCleanupE2E(t *testing.T) {
 	}
 }
 
-// TestReadOnlyWorktreeAllocFailIsFailOpenE2E proves the FAIL-OPEN contract: when
-// the dispatch-time worktree allocation genuinely fails, the ask is still enqueued
-// unchanged (no worktree, shared repo:<repo> checkout key), a loud
-// readonly_worktree_skipped event is recorded, and the job still runs to a terminal
-// decision on the shared checkout. Dispatch NEVER fails for a lost-parallelism
-// optimization. The allocation is forced to fail by planting a FILE where the
-// per-repo worktree directory must be created (git worktree add can never mkdir it).
-func TestReadOnlyWorktreeAllocFailIsFailOpenE2E(t *testing.T) {
+// TestReadOnlyWorktreeAllocFailIsFailClosedE2E proves allocation is part of the
+// taskless background ask's security boundary. A real filesystem failure must
+// refuse dispatch before enqueue rather than run the prompt on the shared checkout.
+// The allocation is forced to fail by planting a file where the per-repo worktree
+// directory must be created.
+func TestReadOnlyWorktreeAllocFailIsFailClosedE2E(t *testing.T) {
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := staleBranchGitCheckout(t, "owner/repo")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "solo", runtime.ShellRuntime,
-		fmt.Sprintf("printf '%%s' '%s'", rendezvousResult("approved", "ran on the shared checkout")), []string{"ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "solo", runtime.ShellRuntime, "true", []string{"ask"}, "owner/repo")
 
-	// Plant a FILE at <home>/.gitmoot/worktrees/owner--repo so os.MkdirAll of the
+	// Plant a file at <home>/.gitmoot/worktrees/owner--repo so os.MkdirAll of the
 	// deterministic worktree parent (…/owner--repo/delegations/<jobID>) fails ENOTDIR.
 	wtDir := filepath.Join(home, ".gitmoot", "worktrees")
 	if err := os.MkdirAll(wtDir, 0o755); err != nil {
@@ -642,40 +639,12 @@ func TestReadOnlyWorktreeAllocFailIsFailOpenE2E(t *testing.T) {
 		t.Fatalf("plant blocking file: %v", err)
 	}
 
-	out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
+	_, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
 		RepoFlag: "owner/repo", Agent: "solo", Action: "ask", Instructions: "audit anyway", Background: true, Home: home})
-	if err != nil {
-		t.Fatalf("dispatch must NOT fail on a worktree alloc error (fail-open): %v", err)
+	if err == nil || !strings.Contains(err.Error(), "allocate read-only ask worktree") {
+		t.Fatalf("allocation error = %v, want fail-closed taskless ask refusal", err)
 	}
-	job, err := store.GetJob(ctx, out.JobID)
-	if err != nil {
-		t.Fatalf("GetJob: %v", err)
-	}
-	payload, err := daemonJobPayload(job)
-	if err != nil {
-		t.Fatalf("payload: %v", err)
-	}
-	if strings.TrimSpace(payload.WorktreePath) != "" {
-		t.Fatalf("fail-open payload has WorktreePath %q, want empty (allocation failed)", payload.WorktreePath)
-	}
-	if payload.ReadOnlyWorktree {
-		t.Fatal("fail-open payload ReadOnlyWorktree = true, want false (no worktree allocated)")
-	}
-	// The job stays on the shared checkout key, and the loud skip event is recorded.
-	if key := queuedJobCheckoutKey(ctx, store, job); key != "repo:owner/repo" {
-		t.Fatalf("fail-open checkout key = %q, want repo:owner/repo (serialized on the shared checkout)", key)
-	}
-	if n := countCLIJobEvents(t, store, out.JobID, "readonly_worktree_skipped"); n != 1 {
-		t.Fatalf("readonly_worktree_skipped events = %d, want 1 (loud fail-open)", n)
-	}
-	if n := countCLIJobEvents(t, store, out.JobID, "readonly_worktree_allocated"); n != 0 {
-		t.Fatalf("readonly_worktree_allocated events = %d, want 0 (allocation failed)", n)
-	}
-
-	// The job still runs to a terminal decision on the shared checkout.
-	worker := readonlyPoolWorker(store, home)
-	terminal := chatE2EDriveUntilTerminal(t, ctx, worker, store, out.JobID)
-	if terminal.State != string(workflow.JobSucceeded) {
-		t.Fatalf("fail-open job state = %q, want succeeded (must run on the shared checkout)", terminal.State)
+	if jobs, listErr := store.ListJobs(ctx); listErr != nil || len(jobs) != 0 {
+		t.Fatalf("jobs after allocation refusal=%+v err=%v, want none", jobs, listErr)
 	}
 }
