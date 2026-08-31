@@ -285,13 +285,14 @@ func cleanupNativeReviewWorktrees(t *testing.T, checkout string, paths ...string
 
 // TestRoutineNativeReviewLegsGetDistinctSchedulerCheckoutKeys is F2. Two reviewer
 // legs for ONE pull request used to be admitted on the same repo:<repo> checkout
-// key, because queuedJobCheckoutKey reads payload.WorktreePath and the routine leg
-// carried none until the worker allocated one AFTER admission. Scheduler
-// exclusivity is strict (`if s.checkouts[checkoutKey] { return false }`), so only
-// one leg ran per tick and it held that key for a full LLM review.
+// key, because queuedJobCheckoutKey saw no payload WorktreePath until the worker
+// allocated one AFTER admission. Scheduler exclusivity is strict
+// (`if s.checkouts[checkoutKey] { return false }`), so only one leg ran per tick
+// and it held that key for a full LLM review.
 //
-// MUTATION PROOF: make prepareNativeReviewWorktree return its request untouched
-// and both keys collapse to "repo:owner/repo".
+// MUTATION PROOF: make prepareNativeReviewWorktree return its request untouched.
+// The payload assertions fail even though the scheduler's defensive job-local key
+// prevents TaskID from redirecting the leg to the implementation checkout.
 func TestRoutineNativeReviewLegsGetDistinctSchedulerCheckoutKeys(t *testing.T) {
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
@@ -300,6 +301,12 @@ func TestRoutineNativeReviewLegsGetDistinctSchedulerCheckoutKeys(t *testing.T) {
 	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer-a", runtime.ClaudeRuntime, runtime.LastRef, []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer-b", runtime.ClaudeRuntime, runtime.LastRef, []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	seedDaemonWorkerAgentWithPolicy(t, store, "implementer", runtime.ShellRuntime, "true", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-1698", RepoFullName: "owner/repo", State: string(workflow.TaskImplementing),
+		Branch: "feature/review", WorktreePath: sharedCheckout,
+	}); err != nil {
+		t.Fatalf("seed owning implementation task: %v", err)
+	}
 
 	fanout := routineNativeReviewFanoutEngine(store, sharedCheckout, home)
 	if err := fanout.HandlePullRequestOpened(ctx, workflow.PullRequestEvent{
@@ -344,8 +351,9 @@ func TestRoutineNativeReviewLegsGetDistinctSchedulerCheckoutKeys(t *testing.T) {
 			t.Fatalf("leg %s worktree head = %q, want the review head %q", job.ID, head, reviewHead)
 		}
 		key := queuedJobCheckoutKey(ctx, store, job)
-		if !strings.HasPrefix(key, "worktree:") {
-			t.Fatalf("leg %s checkout key = %q, want worktree:<path> (it would serialize on the shared repo key)", job.ID, key)
+		wantKey := "worktree:" + payload.WorktreePath
+		if key != wantKey {
+			t.Fatalf("leg %s checkout key = %q, want exact review worktree key %q, not owning task checkout %q", job.ID, key, wantKey, sharedCheckout)
 		}
 		keys[job.ID] = key
 		// The SAME configuration must not also allocate in the worker: the helper's
