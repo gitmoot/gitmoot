@@ -38,9 +38,6 @@ func TestRunTaskResumeWorkTransitionsAndReenablesFixPass(t *testing.T) {
 		workflow.TaskAwaitingHumanMerge,
 	} {
 		t.Run(string(state), func(t *testing.T) {
-			previousLiveness := taskWorktreeLiveness
-			taskWorktreeLiveness = func(string) (bool, bool) { return false, true }
-			t.Cleanup(func() { taskWorktreeLiveness = previousLiveness })
 			fixture := newFixPassFixture(t, state)
 			installFixPassPullRequestClient(t, fixture.pullRequest())
 			args := []string{"task", "resume-work", fixture.task.ID, "--home", fixture.home, "--reason", "coordinator requested fixes", "--json"}

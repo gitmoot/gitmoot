@@ -701,6 +701,9 @@ mutation lock and requires all of these checks to pass:
 - the recorded path is the deterministic task path
 - `git status --porcelain --ignored` reports no tracked, untracked, or ignored content
 
+A malformed payload on any non-final job also counts as an active owner because
+Gitmoot cannot prove that it refers to another worktree.
+
 Removal uses `git worktree remove` without `--force` and preserves the branch.
 Gitmoot then clears the task's stored path and records
 `terminal_worktree_reclaimed`. A live process, unreadable process table, dirty
@@ -720,9 +723,11 @@ final owners that are **reclaimable**, resumable/non-final owners that are
 `[workflow].delegation_worktree_ttl = "72h"` is default-on because a final
 delegation owner cannot resume, while the grace period preserves short-term
 debugging access. Set it to `"0"` to disable the TTL pass. Aged read-only and
-delegation worktrees are force-removed even when dirty. An independent fix clone
-is removed only when it is clean and its HEAD is reachable from the recorded
-remote branch, so TTL alone cannot discard local commits.
+delegation worktrees are force-removed even when dirty. For an independent fix
+clone, Gitmoot refreshes the recorded branch from its real `origin`, then removes
+the clone only when it is clean and its HEAD is reachable from that refreshed
+remote branch. A branch absent from `origin` keeps the clone without treating
+the absence as a cleanup error, so TTL alone cannot discard local commits.
 `delegation_worktree_reclaimed_ttl` is recorded after removal. The dashboard
 `/api/health` response exposes the same count, bytes, path, breakdown, and
 summary in its top-level `worktrees` field, including the number of cleanup

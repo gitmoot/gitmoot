@@ -29,6 +29,10 @@ func TestWorktreeLiveness(t *testing.T) {
 		if live || known {
 			t.Fatalf("worktreeLiveness with unreadable cwd = (%v, %v), want (false, false)", live, known)
 		}
+		live, known = bestEffortWorktreeLiveness(worktree, procRoot)
+		if live || !known {
+			t.Fatalf("best-effort liveness with unreadable foreign cwd = (%v, %v), want (false, true)", live, known)
+		}
 	})
 
 	t.Run("live cwd wins after an unreadable process", func(t *testing.T) {

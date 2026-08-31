@@ -125,7 +125,7 @@ func TestTaskIDsWithTerminalWorktreeUsesLifecycleStateAndClassification(t *testi
 		{ID: "merged", State: "merged", WorktreePath: "/worktrees/merged"},
 		{ID: "dismissed", State: "dismissed", WorktreePath: "/worktrees/dismissed"},
 		{ID: "superseded", State: "superseded", WorktreePath: "/worktrees/superseded"},
-		{ID: "stranded", State: "stranded", WorktreePath: "/worktrees/stranded"},
+		{ID: "stranded", State: "stranded", WorktreePath: " /worktrees/stranded "},
 		{ID: "blocked", State: "blocked", WorktreePath: "/worktrees/blocked"},
 		{ID: "implementing", State: "implementing", WorktreePath: "/worktrees/implementing"},
 		{ID: "empty-path", State: "merged"},
@@ -137,6 +137,13 @@ func TestTaskIDsWithTerminalWorktreeUsesLifecycleStateAndClassification(t *testi
 	classified, err := store.ClassifyTerminalTaskWorktreeUnremovable(ctx, "stranded", "/worktrees/stranded")
 	if err != nil || !classified {
 		t.Fatalf("ClassifyTerminalTaskWorktreeUnremovable classified=%v err=%v", classified, err)
+	}
+	events, err := store.ListTaskEvents(ctx, "stranded")
+	if err != nil {
+		t.Fatalf("ListTaskEvents after classification: %v", err)
+	}
+	if len(events) != 1 || events[0].FromState != "" || events[0].ToState != "" || events[0].Reason != "/worktrees/stranded" {
+		t.Fatalf("classification event = %+v, want normalized informational event", events)
 	}
 
 	ids, err := store.TaskIDsWithTerminalWorktree(ctx)
@@ -178,7 +185,7 @@ func TestTaskHasActiveWorktreeOwnerMatchesTaskOrPath(t *testing.T) {
 		{ID: "by-path", Agent: "agent", Type: "review", State: "running", Payload: `{"worktree_path":"/worktrees/task-2"}`},
 		{ID: "blocked-owner", Agent: "agent", Type: "implement", State: "blocked", Payload: `{"task_id":"task-4","worktree_path":"/worktrees/task-4"}`},
 		{ID: "finished", Agent: "agent", Type: "implement", State: "succeeded", Payload: `{"task_id":"task-3","worktree_path":"/worktrees/task-3"}`},
-		{ID: "malformed-unrelated", Agent: "agent", Type: "implement", State: "queued", Payload: `not json at all`},
+		{ID: "malformed-finished", Agent: "agent", Type: "implement", State: "failed", Payload: `not json at all`},
 	} {
 		if err := store.CreateJobWithEvent(ctx, job, JobEvent{Kind: job.State, Message: "seed"}); err != nil {
 			t.Fatalf("CreateJobWithEvent %s: %v", job.ID, err)
@@ -202,5 +209,17 @@ func TestTaskHasActiveWorktreeOwnerMatchesTaskOrPath(t *testing.T) {
 		if got != tc.want {
 			t.Fatalf("TaskHasActiveWorktreeOwner(%q, %q) = %v, want %v", tc.taskID, tc.path, got, tc.want)
 		}
+	}
+	if err := store.CreateJobWithEvent(ctx, Job{
+		ID: "malformed-active", Agent: "agent", Type: "implement", State: "queued", Payload: `not json at all`,
+	}, JobEvent{Kind: "queued", Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent malformed-active: %v", err)
+	}
+	got, err := store.TaskHasActiveWorktreeOwner(ctx, "unowned", "/worktrees/unowned")
+	if err != nil {
+		t.Fatalf("TaskHasActiveWorktreeOwner with malformed active payload: %v", err)
+	}
+	if !got {
+		t.Fatal("malformed non-final payload did not fail closed as an active owner")
 	}
 }

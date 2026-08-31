@@ -580,11 +580,23 @@ func (c Client) WorktreeHeadReachableFromRemote(ctx context.Context, path string
 		return false, err
 	}
 	worktree := NewClient(path, c.runner)
+	remoteBranches, err := worktree.RemoteBranches(ctx, []string{branch})
+	if err != nil {
+		return false, err
+	}
+	if _, ok := remoteBranches[branch]; !ok {
+		return false, nil
+	}
+	remoteRef := "refs/heads/" + branch
+	trackingRef := "refs/remotes/origin/" + branch
+	if _, err := worktree.run(ctx, "fetch", "--no-tags", "origin", "+"+remoteRef+":"+trackingRef); err != nil {
+		return false, err
+	}
 	head, err := worktree.HeadSHA(ctx)
 	if err != nil {
 		return false, err
 	}
-	remoteHead, err := worktree.RevParse(ctx, "origin/"+branch)
+	remoteHead, err := worktree.RevParse(ctx, trackingRef)
 	if err != nil {
 		return false, err
 	}

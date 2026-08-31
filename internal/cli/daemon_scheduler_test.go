@@ -1975,9 +1975,6 @@ func TestRunQueuedJobsUsesTaskWorktreeForImplement(t *testing.T) {
 
 func TestRunQueuedJobsResumesSelfDirtyTaskWorktree(t *testing.T) {
 	ctx := context.Background()
-	previousLiveness := taskWorktreeLiveness
-	taskWorktreeLiveness = func(string) (bool, bool) { return false, true }
-	t.Cleanup(func() { taskWorktreeLiveness = previousLiveness })
 	store := daemonWorkerStore(t)
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	worktree := filepath.Join(t.TempDir(), "task-resume")

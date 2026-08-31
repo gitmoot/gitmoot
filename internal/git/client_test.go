@@ -489,6 +489,68 @@ func TestClientWorktreeHeadReachableFromRemote(t *testing.T) {
 	}
 }
 
+func TestClientWorktreeHeadReachableFromRemoteRefreshesLocalFixClone(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "origin.git")
+	source := filepath.Join(root, "source")
+	fixClone := filepath.Join(root, "fix")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "clone", remote, source)
+	runGit(t, source, "config", "user.email", "gitmoot@example.com")
+	runGit(t, source, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(source, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile base: %v", err)
+	}
+	runGit(t, source, "add", "base.txt")
+	runGit(t, source, "commit", "-m", "base")
+	runGit(t, source, "branch", "-M", "main")
+	runGit(t, source, "push", "-u", "origin", "main")
+	runGit(t, source, "switch", "-c", "feature/fix")
+	if err := os.WriteFile(filepath.Join(source, "fix.txt"), []byte("fix\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile fix: %v", err)
+	}
+	runGit(t, source, "add", "fix.txt")
+	runGit(t, source, "commit", "-m", "fix")
+	runGit(t, source, "push", "-u", "origin", "feature/fix")
+	featureHead, err := NewHostClient(source).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("feature HeadSHA: %v", err)
+	}
+	runGit(t, source, "switch", "main")
+	runGit(t, source, "branch", "-D", "feature/fix")
+
+	sourceClient := NewHostClient(source)
+	if err := sourceClient.CloneLocalNoCheckout(ctx, fixClone); err != nil {
+		t.Fatalf("CloneLocalNoCheckout: %v", err)
+	}
+	fixClient := NewHostClient(fixClone)
+	if err := fixClient.SetRemoteURL(ctx, "origin", remote); err != nil {
+		t.Fatalf("SetRemoteURL: %v", err)
+	}
+	if err := fixClient.CheckoutBranchAt(ctx, "feature/fix", featureHead); err != nil {
+		t.Fatalf("CheckoutBranchAt: %v", err)
+	}
+	if _, err := fixClient.RevParse(ctx, "refs/remotes/origin/feature/fix"); err == nil {
+		t.Fatal("local fix clone unexpectedly began with the remote-tracking feature ref")
+	}
+
+	reachable, err := sourceClient.WorktreeHeadReachableFromRemote(ctx, fixClone, "feature/fix")
+	if err != nil || !reachable {
+		t.Fatalf("local fix clone reachable=%v err=%v, want true after refresh", reachable, err)
+	}
+	if _, err := fixClient.RevParse(ctx, "refs/remotes/origin/feature/fix"); err != nil {
+		t.Fatalf("refreshed remote-tracking feature ref: %v", err)
+	}
+	reachable, err = sourceClient.WorktreeHeadReachableFromRemote(ctx, fixClone, "feature/missing")
+	if err != nil || reachable {
+		t.Fatalf("missing remote branch reachable=%v err=%v, want false nil", reachable, err)
+	}
+}
+
 func TestClientRevParse(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "def456\n"}}}
 	sha, err := (NewClient("/repo", runner)).RevParse(context.Background(), "origin/main")

@@ -528,6 +528,9 @@ conclusive with no live process inside it, and `git status --porcelain --ignored
 reports no tracked, untracked, or ignored content. Removal is non-force and
 preserves the branch.
 
+A malformed payload on any non-final job also pins task worktrees because
+Gitmoot cannot prove that the job owns some other path.
+
 A worktree registered to an older checkout root is removed through the owner in
 its `.git` pointer. If that owner cannot inspect or remove it, Gitmoot records
 `terminal_worktree_unremovable` once instead of retrying every daemon tick.
@@ -539,8 +542,10 @@ cleanup count in its top-level `worktrees` field.
 
 `[workflow].delegation_worktree_ttl = "72h"` is default-on. After that grace
 period the daemon force-removes dirty terminal-owned read-only and delegation
-worktrees. Independent fix clones must be clean, and their HEAD must be
-reachable from the recorded remote branch. A successful removal records
+worktrees. For an independent fix clone, Gitmoot refreshes the recorded branch
+from its real `origin`, then requires a clean tree whose HEAD is reachable from
+that refreshed remote branch. A branch absent from `origin` keeps the clone
+without counting as a cleanup failure. A successful removal records
 `delegation_worktree_reclaimed_ttl`. Set the TTL to `"0"` to disable this pass.
 Blocked, queued, and running owners remain pinned and are never force-removed.
 Candidate-local failures skip only that worktree, and later candidates continue.

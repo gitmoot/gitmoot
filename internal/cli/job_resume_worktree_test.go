@@ -525,9 +525,6 @@ func TestResumeSelfDirtyPredicateRequiresExactDirtyText(t *testing.T) {
 }
 
 func TestResumeSelfDirtyEventMessageNamesPathAndAttempt(t *testing.T) {
-	previousLiveness := taskWorktreeLiveness
-	taskWorktreeLiveness = func(string) (bool, bool) { return false, true }
-	t.Cleanup(func() { taskWorktreeLiveness = previousLiveness })
 	fixture := newSelfDirtyResumeFixture(t, "job-resume-event")
 	if err := runQueuedJobsForRepo(context.Background(), fixture.worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)

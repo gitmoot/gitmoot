@@ -81,7 +81,7 @@ func (e Engine) worktreeLiveness(path string) (live bool, known bool) {
 	if e.WorktreeHasLiveProcess != nil {
 		return e.WorktreeHasLiveProcess(path), true
 	}
-	return WorktreeLiveness(path)
+	return strictWorktreeLiveness(path)
 }
 
 // worktreeHasLiveProcess reports whether a live process on this host still has its
@@ -96,14 +96,14 @@ func (e Engine) worktreeHasLiveProcess(path string) bool {
 }
 
 // WorktreeLiveness reports whether a live process on this host has its cwd in
-// path and whether the /proc scan was conclusive. A false, false result means
-// the process table could not be read, so safety-sensitive recovery callers must
-// treat the worktree as potentially live.
+// path. It preserves the best-effort contract used by recovery callers:
+// known=false means the process table itself could not be read, while
+// inaccessible foreign-process cwd links are skipped.
 func WorktreeLiveness(path string) (live bool, known bool) {
-	return worktreeLiveness(path, "/proc")
+	return bestEffortWorktreeLiveness(path, "/proc")
 }
 
-// WorktreeHasLiveProcess exposes the same conservative /proc cwd liveness probe
+// WorktreeHasLiveProcess exposes the same best-effort /proc cwd liveness probe
 // used by destructive worktree cleanup to CLI recovery/dispatch paths. It is
 // intentionally best-effort: false means "no same-host cwd owner observed", not a
 // proof that no external process can write.
@@ -112,20 +112,19 @@ func WorktreeHasLiveProcess(path string) bool {
 	return live
 }
 
-// defaultWorktreeHasLiveProcess is a best-effort Linux /proc scan: it returns true
-// when any process's cwd symlink resolves to path or a descendant of it. The codex
-// resume worker in #536 ran with cwd == the delegation worktree, so its presence is
-// the decisive "still writing" signal independent of any lock or PID. On a platform
-// without a readable /proc (e.g. darwin) it returns false — it cannot detect a live
-// worker there, so it favors not stranding the worktree (the lease/lock gate still
-// applies while the lease is unexpired). A worktree mid-removal can report a cwd of
-// "<path> (deleted)"; that suffix is stripped before comparison.
-func defaultWorktreeHasLiveProcess(path string) bool {
-	live, _ := WorktreeLiveness(path)
-	return live
+func strictWorktreeLiveness(path string) (live bool, known bool) {
+	return worktreeLiveness(path, "/proc")
 }
 
 func worktreeLiveness(path string, procRoot string) (live bool, known bool) {
+	return scanWorktreeLiveness(path, procRoot, true)
+}
+
+func bestEffortWorktreeLiveness(path string, procRoot string) (live bool, known bool) {
+	return scanWorktreeLiveness(path, procRoot, false)
+}
+
+func scanWorktreeLiveness(path string, procRoot string, requireEveryCWD bool) (live bool, known bool) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return false, true
@@ -156,7 +155,9 @@ func worktreeLiveness(path string, procRoot string) (live bool, known bool) {
 			continue
 		}
 		if err != nil {
-			conclusive = false
+			if requireEveryCWD {
+				conclusive = false
+			}
 			continue
 		}
 		cwd = strings.TrimSuffix(strings.TrimSpace(cwd), " (deleted)")

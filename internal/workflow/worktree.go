@@ -202,10 +202,13 @@ func (e Engine) ReclaimTerminalTaskWorktreeOutcome(ctx context.Context, home, ch
 	outcome.Path = path
 	expected, err := TaskWorktreePath(home, task.RepoFullName, task.ID)
 	if err != nil || path == "" || filepath.Clean(path) != filepath.Clean(expected) {
-		if _, classifyErr := e.Store.ClassifyTerminalTaskWorktreeUnremovable(ctx, task.ID, path); classifyErr != nil {
+		classified, classifyErr := e.Store.ClassifyTerminalTaskWorktreeUnremovable(ctx, task.ID, path)
+		if classifyErr != nil {
 			return outcome, classifyErr
 		}
-		outcome.Classification = TaskWorktreeReclaimPathMismatch
+		if classified {
+			outcome.Classification = TaskWorktreeReclaimPathMismatch
+		}
 		return outcome, nil
 	}
 
@@ -266,10 +269,13 @@ func (e Engine) ReclaimTerminalTaskWorktreeOutcome(ctx context.Context, home, ch
 		return outcome, fmt.Errorf("inspect terminal task worktree %s: %w", path, err)
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		if _, classifyErr := e.Store.ClassifyTerminalTaskWorktreeUnremovable(opCtx, task.ID, path); classifyErr != nil {
+		classified, classifyErr := e.Store.ClassifyTerminalTaskWorktreeUnremovable(opCtx, task.ID, path)
+		if classifyErr != nil {
 			return outcome, classifyErr
 		}
-		outcome.Classification = TaskWorktreeReclaimPathMismatch
+		if classified {
+			outcome.Classification = TaskWorktreeReclaimPathMismatch
+		}
 		return outcome, nil
 	}
 	clean, err := manager.WorktreePristineAt(opCtx, path)
@@ -338,10 +344,13 @@ func (e Engine) ReclaimTerminalTaskWorktreeOutcome(ctx context.Context, home, ch
 }
 
 func (e Engine) classifyTerminalTaskWorktreeUnremovable(ctx context.Context, taskID, path string, outcome TaskWorktreeReclaimOutcome) (TaskWorktreeReclaimOutcome, error) {
-	if _, err := e.Store.ClassifyTerminalTaskWorktreeUnremovable(ctx, taskID, path); err != nil {
+	classified, err := e.Store.ClassifyTerminalTaskWorktreeUnremovable(ctx, taskID, path)
+	if err != nil {
 		return outcome, err
 	}
-	outcome.Classification = TaskWorktreeReclaimUnremovable
+	if classified {
+		outcome.Classification = TaskWorktreeReclaimUnremovable
+	}
 	return outcome, nil
 }
 
@@ -362,7 +371,7 @@ func (e Engine) taskWorktreeHasActiveOwner(ctx context.Context, task db.Task, pa
 }
 
 func isTerminalTaskWorktreeState(state string) bool {
-	return TaskState(state) == TaskMerged || IsDisposedTaskState(state)
+	return db.IsTerminalTaskWorktreeState(state)
 }
 
 func isTerminalWorktreeRemovalError(err error) bool {
