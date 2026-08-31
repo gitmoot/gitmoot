@@ -1572,12 +1572,14 @@ acting role's scope and the selected parent's scope. Merge authority defaults
 to empty; an explicit `--merge-rule` cannot exceed the acting role's authority.
 The empty-registry `owner` bootstrap keeps its `*` scope and `owner` merge rule.
 The three policy flags initialize new seats only. An existing role accepts an
-explicit policy value only when it matches the stored value; a changed value is
-rejected instead of being silently ignored. Re-running with matching values or
-without those flags repairs missing owned pieces, fills an empty pane binding,
-canonicalizes a matching label binding, or replaces a non-empty binding only
-when its former target no longer resolves. It does not rewrite existing policy
-or duplicate routes.
+explicit policy value only when it matches the stored value; `--scope` matches
+as an unordered set, and a changed value is rejected instead of being silently
+ignored. An invalid `--merge-rule` is always rejected as invalid, on new and
+existing roles alike. Re-running with matching values or without those flags
+repairs missing owned pieces, fills an empty pane binding, canonicalizes a
+matching label binding, or replaces a non-empty binding only when its former
+target no longer resolves. It does not rewrite existing policy or duplicate
+routes.
 
 `gitmoot org seat rm <name> [--home DIR]` resolves the role's live pane when it
 has a binding and checks every distinct Git checkout reported by that pane's

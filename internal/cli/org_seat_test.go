@@ -315,12 +315,24 @@ func TestOrgSeatAddCreatesUnboundThenBinds(t *testing.T) {
 }
 
 func TestOrgSeatAddRejectsPolicyChangesForExistingRole(t *testing.T) {
+	// The parent case names a DECLARED role: an undeclared one cannot tell
+	// "differs from stored" apart from "does not exist", and only the first is
+	// the axis this guard decides.
+	declareSecondParent := func(t *testing.T, paths config.Paths) {
+		t.Helper()
+		if _, _, err := config.UpsertOrgSeatRole(paths, config.OrgRole{
+			Name: "second", Parent: "owner", Scope: []string{"*"},
+		}, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
 	for _, test := range []struct {
-		name string
-		args []string
-		flag string
+		name  string
+		setup func(*testing.T, config.Paths)
+		args  []string
+		flag  string
 	}{
-		{name: "parent", args: []string{"--parent", "missing"}, flag: "--parent"},
+		{name: "parent", setup: declareSecondParent, args: []string{"--parent", "second"}, flag: "--parent"},
 		{name: "scope", args: []string{"--scope", "gitmoot/only"}, flag: "--scope"},
 		{name: "merge rule", args: []string{"--merge-rule", "self"}, flag: "--merge-rule"},
 	} {
@@ -330,6 +342,9 @@ func TestOrgSeatAddRejectsPolicyChangesForExistingRole(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			if code := runOrg([]string{"seat", "add", "worker", "--home", home}, &stdout, &stderr); code != 0 {
 				t.Fatalf("unbound setup code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+			}
+			if test.setup != nil {
+				test.setup(t, paths)
 			}
 
 			args := append([]string{"seat", "add", "worker", "--pane", "w1:p2"}, test.args...)
@@ -383,6 +398,61 @@ func TestOrgSeatAddAcceptsMatchingPolicyFlagsForExistingRole(t *testing.T) {
 	}
 	if got := len(listOrgSeatTestRules(t, paths)); got != 6 {
 		t.Fatalf("routes after matching retry = %d, want 6", got)
+	}
+}
+
+func TestOrgSeatAddAcceptsReorderedScopeForExistingRole(t *testing.T) {
+	home, paths, panes := setupOrgSeatTestHome(t)
+	withOrgSeatFixtureProvider(t, &panes)
+	create := []string{
+		"seat", "add", "worker", "--pane", "Worker",
+		"--scope", "gitmoot/a,gitmoot/b", "--home", home,
+	}
+	var stdout, stderr bytes.Buffer
+	if code := runOrg(create, &stdout, &stderr); code != 0 {
+		t.Fatalf("scoped create code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	reordered := []string{
+		"seat", "add", "worker", "--pane", "Worker",
+		"--scope", "gitmoot/b,gitmoot/a", "--home", home,
+	}
+	if code := runOrg(reordered, &stdout, &stderr); code != 0 {
+		t.Fatalf("reordered scope retry code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, ok := cfg.Role("worker")
+	if !ok || !slices.Equal(worker.Scope, []string{"gitmoot/a", "gitmoot/b"}) {
+		t.Fatalf("worker scope after reordered retry = %+v, present=%t", worker, ok)
+	}
+}
+
+func TestOrgSeatAddRejectsInvalidMergeRuleForExistingRole(t *testing.T) {
+	home, paths, panes := setupOrgSeatTestHome(t)
+	withOrgSeatFixtureProvider(t, &panes)
+	var stdout, stderr bytes.Buffer
+	if code := runOrg([]string{"seat", "add", "worker", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("unbound setup code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code := runOrg([]string{
+		"seat", "add", "worker", "--pane", "w1:p2",
+		"--merge-rule", "totally-bogus", "--home", home,
+	}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), `invalid --merge-rule "totally-bogus"; use owner, self, or none`) {
+		t.Fatalf("invalid merge rule code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if worker, ok := cfg.Role("worker"); !ok || worker.Pane != "" {
+		t.Fatalf("worker changed after invalid merge rule: %+v, present=%t", worker, ok)
 	}
 }
 

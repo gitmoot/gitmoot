@@ -226,6 +226,11 @@ func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "org seat add: %v\n", err)
 		return 2
 	}
+	requestedMergeRule := strings.ToLower(strings.TrimSpace(*mergeRuleFlag))
+	if mergeRuleSet && requestedMergeRule != "owner" && requestedMergeRule != "self" && requestedMergeRule != "none" {
+		fmt.Fprintf(stderr, "org seat add: invalid --merge-rule %q; use owner, self, or none\n", *mergeRuleFlag)
+		return 2
+	}
 
 	paths, err := pathsFromFlag(*home)
 	if err != nil {
@@ -246,18 +251,17 @@ func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
 		if parentSet && strings.ToLower(strings.TrimSpace(*parentFlag)) != strings.ToLower(strings.TrimSpace(current.Parent)) {
 			changedPolicyFlags = append(changedPolicyFlags, "--parent")
 		}
-		if scopeSet && !slices.Equal(requestedScope, current.Scope) {
+		if scopeSet && !orgSeatScopeSetEqual(requestedScope, current.Scope) {
 			changedPolicyFlags = append(changedPolicyFlags, "--scope")
 		}
-		requestedMergeRule := strings.ToLower(strings.TrimSpace(*mergeRuleFlag))
-		currentMergeRule := strings.ToLower(strings.TrimSpace(current.MergeRule))
-		if requestedMergeRule == "" {
-			requestedMergeRule = "none"
+		wantMergeRule, haveMergeRule := requestedMergeRule, strings.ToLower(strings.TrimSpace(current.MergeRule))
+		if wantMergeRule == "" {
+			wantMergeRule = "none"
 		}
-		if currentMergeRule == "" {
-			currentMergeRule = "none"
+		if haveMergeRule == "" {
+			haveMergeRule = "none"
 		}
-		if mergeRuleSet && requestedMergeRule != currentMergeRule {
+		if mergeRuleSet && wantMergeRule != haveMergeRule {
 			changedPolicyFlags = append(changedPolicyFlags, "--merge-rule")
 		}
 		if len(changedPolicyFlags) != 0 {
@@ -674,6 +678,23 @@ func parseOrgSeatScope(raw string, set bool) ([]string, error) {
 		scope = append(scope, entry)
 	}
 	return scope, nil
+}
+
+// orgSeatScopeSetEqual compares two scopes as sets. Scope is consumed as a set
+// everywhere else (config.ScopeMatches, config.ScopeSubset), so a reordered
+// restatement of the same scope is not a policy change.
+func orgSeatScopeSetEqual(requested, current []string) bool {
+	if len(requested) != len(current) {
+		return false
+	}
+	left := append([]string(nil), requested...)
+	right := make([]string, 0, len(current))
+	for _, entry := range current {
+		right = append(right, strings.ToLower(strings.TrimSpace(entry)))
+	}
+	slices.Sort(left)
+	slices.Sort(right)
+	return slices.Equal(left, right)
 }
 
 func orgSeatParentCreatesCycle(cfg config.OrgConfig, name, parent string) bool {
