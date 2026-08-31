@@ -36,6 +36,24 @@ func (c Client) Dir() string { return c.dir }
 
 const maxGitErrorStderrRunes = 4096
 
+type terminalWorktreeRemovalError struct {
+	err error
+}
+
+func (e terminalWorktreeRemovalError) Error() string {
+	return e.err.Error()
+}
+
+func (e terminalWorktreeRemovalError) Unwrap() error {
+	return e.err
+}
+
+// TerminalWorktreeRemoval marks a stale worktree-admin/registered-root mismatch
+// that cannot become healthy by retrying the same registered-root command.
+func (e terminalWorktreeRemovalError) TerminalWorktreeRemoval() bool {
+	return true
+}
+
 func (c Client) CreateBranch(ctx context.Context, branch string, base string) error {
 	if err := validateBranch(branch); err != nil {
 		return err
@@ -218,12 +236,7 @@ func (c Client) RemoteBranches(ctx context.Context, branches []string) (map[stri
 }
 
 func (c Client) RemoveWorktree(ctx context.Context, path string) error {
-	path, err := validateWorktreePath(path)
-	if err != nil {
-		return err
-	}
-	_, err = c.run(ctx, "worktree", "remove", path)
-	return err
+	return c.removeWorktree(ctx, path, false)
 }
 
 // RemoveWorktreeForce removes a worktree even when it has uncommitted or
@@ -231,20 +244,45 @@ func (c Client) RemoveWorktree(ctx context.Context, path string) error {
 // read-only delegation fan-out worktrees) whose contents are never integrated,
 // so a runtime that left scratch files behind must not block disposal.
 func (c Client) RemoveWorktreeForce(ctx context.Context, path string) error {
+	return c.removeWorktree(ctx, path, true)
+}
+
+func (c Client) removeWorktree(ctx context.Context, path string, force bool) error {
 	path, err := validateWorktreePath(path)
 	if err != nil {
 		return err
 	}
-	result, err := c.run(ctx, "worktree", "remove", "--force", path)
+	args := []string{"worktree", "remove"}
+	if force {
+		args = append(args, "--force")
+	}
+	args = append(args, path)
+	result, err := c.run(ctx, args...)
 	if err == nil || !strings.Contains(strings.ToLower(result.Stderr), "is not a working tree") {
 		return err
 	}
 	owner, ownerErr := worktreeOwnerCheckout(path)
-	if ownerErr != nil || filepath.Clean(owner) == filepath.Clean(c.dir) {
-		return err
+	if ownerErr != nil {
+		return terminalWorktreeRemovalError{err: fmt.Errorf("%w: resolve owning checkout: %v", err, ownerErr)}
 	}
-	_, err = NewClient(owner, c.runner).run(ctx, "worktree", "remove", "--force", path)
-	return err
+	if filepath.Clean(owner) == filepath.Clean(c.dir) {
+		return terminalWorktreeRemovalError{err: err}
+	}
+	fallbackResult, fallbackErr := NewClient(owner, c.runner).run(ctx, args...)
+	if fallbackErr == nil {
+		return nil
+	}
+	if terminalWorktreeRegistrationFailure(fallbackResult.Stderr) {
+		return terminalWorktreeRemovalError{err: fmt.Errorf("%w: owning checkout %s also rejected removal: %v", err, owner, fallbackErr)}
+	}
+	return fallbackErr
+}
+
+func terminalWorktreeRegistrationFailure(stderr string) bool {
+	lower := strings.ToLower(stderr)
+	return strings.Contains(lower, "is not a working tree") ||
+		strings.Contains(lower, "not a git repository") ||
+		strings.Contains(lower, "cannot change to")
 }
 
 // PruneWorktrees removes stale administrative entries left by interrupted or
@@ -500,7 +538,43 @@ func (c Client) WorktreeCleanAt(ctx context.Context, path string) (bool, error) 
 	if err != nil {
 		return false, err
 	}
-	return NewClient(path, c.runner).WorktreeClean(ctx)
+	clean, err := NewClient(path, c.runner).WorktreeClean(ctx)
+	if err == nil {
+		return clean, nil
+	}
+	gitDir, gitDirErr := worktreeGitDir(path)
+	if gitDirErr == nil {
+		if _, statErr := os.Stat(gitDir); os.IsNotExist(statErr) {
+			return false, terminalWorktreeRemovalError{err: fmt.Errorf("%w: worktree admin directory %s is missing", err, gitDir)}
+		}
+	}
+	owner, ownerErr := worktreeOwnerCheckout(path)
+	if ownerErr == nil && filepath.Clean(owner) != filepath.Clean(c.dir) {
+		return false, terminalWorktreeRemovalError{err: fmt.Errorf("%w: worktree is registered to %s, not %s", err, owner, c.dir)}
+	}
+	return false, err
+}
+
+// WorktreeHeadReachableFromRemote proves that removing an independent writable
+// clone will not discard commits that exist only in that clone.
+func (c Client) WorktreeHeadReachableFromRemote(ctx context.Context, path string, branch string) (bool, error) {
+	path, err := validateWorktreePath(path)
+	if err != nil {
+		return false, err
+	}
+	if err := validateBranch(branch); err != nil {
+		return false, err
+	}
+	worktree := NewClient(path, c.runner)
+	head, err := worktree.HeadSHA(ctx)
+	if err != nil {
+		return false, err
+	}
+	remoteHead, err := worktree.RevParse(ctx, "origin/"+branch)
+	if err != nil {
+		return false, err
+	}
+	return worktree.IsAncestor(ctx, head, remoteHead)
 }
 
 func (c Client) StatusPorcelain(ctx context.Context) (string, error) {
@@ -665,9 +739,9 @@ func boundedGitErrorStderr(stderr string) string {
 	return string(runes[:maxGitErrorStderrRunes]) + "..."
 }
 
-// worktreeOwnerCheckout resolves the repository that owns a linked worktree
-// from the worktree's gitdir pointer, even when Client.dir is a different clone.
-func worktreeOwnerCheckout(path string) (string, error) {
+// worktreeGitDir resolves the administrative directory named by a linked
+// worktree's .git pointer.
+func worktreeGitDir(path string) (string, error) {
 	data, err := os.ReadFile(filepath.Join(path, ".git"))
 	if err != nil {
 		return "", err
@@ -681,7 +755,16 @@ func worktreeOwnerCheckout(path string) (string, error) {
 	if !filepath.IsAbs(gitDir) {
 		gitDir = filepath.Join(path, gitDir)
 	}
-	gitDir = filepath.Clean(gitDir)
+	return filepath.Clean(gitDir), nil
+}
+
+// worktreeOwnerCheckout resolves the repository that owns a linked worktree
+// from the worktree's gitdir pointer, even when Client.dir is a different clone.
+func worktreeOwnerCheckout(path string) (string, error) {
+	gitDir, err := worktreeGitDir(path)
+	if err != nil {
+		return "", err
+	}
 	worktreesDir := filepath.Dir(gitDir)
 	if filepath.Base(worktreesDir) != "worktrees" {
 		return "", fmt.Errorf("worktree %s has unexpected gitdir %s", path, gitDir)

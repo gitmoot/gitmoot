@@ -117,3 +117,86 @@ func TestGuardedTaskTransitionRefusesMatchingActiveJob(t *testing.T) {
 		})
 	}
 }
+
+func TestTaskIDsWithTerminalWorktreeUsesLifecycleStateAndClassification(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	for _, task := range []Task{
+		{ID: "merged", State: "merged", WorktreePath: "/worktrees/merged"},
+		{ID: "dismissed", State: "dismissed", WorktreePath: "/worktrees/dismissed"},
+		{ID: "superseded", State: "superseded", WorktreePath: "/worktrees/superseded"},
+		{ID: "stranded", State: "stranded", WorktreePath: "/worktrees/stranded"},
+		{ID: "blocked", State: "blocked", WorktreePath: "/worktrees/blocked"},
+		{ID: "implementing", State: "implementing", WorktreePath: "/worktrees/implementing"},
+		{ID: "empty-path", State: "merged"},
+	} {
+		if err := store.UpsertTask(ctx, task); err != nil {
+			t.Fatalf("UpsertTask %s: %v", task.ID, err)
+		}
+	}
+	classified, err := store.ClassifyTerminalTaskWorktreeUnremovable(ctx, "stranded", "/worktrees/stranded")
+	if err != nil || !classified {
+		t.Fatalf("ClassifyTerminalTaskWorktreeUnremovable classified=%v err=%v", classified, err)
+	}
+
+	ids, err := store.TaskIDsWithTerminalWorktree(ctx)
+	if err != nil {
+		t.Fatalf("TaskIDsWithTerminalWorktree: %v", err)
+	}
+	want := []string{"dismissed", "merged", "superseded"}
+	if len(ids) != len(want) {
+		t.Fatalf("terminal worktree ids = %v, want %v", ids, want)
+	}
+	for i := range want {
+		if ids[i] != want[i] {
+			t.Fatalf("terminal worktree ids = %v, want %v", ids, want)
+		}
+	}
+	if err := store.AddTaskEvent(ctx, TaskEvent{TaskID: "stranded", Kind: "task_rechecked", Reason: "new lifecycle evidence"}); err != nil {
+		t.Fatalf("AddTaskEvent after classification: %v", err)
+	}
+	ids, err = store.TaskIDsWithTerminalWorktree(ctx)
+	if err != nil {
+		t.Fatalf("TaskIDsWithTerminalWorktree after later event: %v", err)
+	}
+	want = []string{"dismissed", "merged", "stranded", "superseded"}
+	if len(ids) != len(want) {
+		t.Fatalf("terminal worktree ids after later event = %v, want %v", ids, want)
+	}
+	for i := range want {
+		if ids[i] != want[i] {
+			t.Fatalf("terminal worktree ids after later event = %v, want %v", ids, want)
+		}
+	}
+}
+
+func TestTaskHasActiveWorktreeOwnerMatchesTaskOrPath(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	for _, job := range []Job{
+		{ID: "by-task", Agent: "agent", Type: "implement", State: "queued", Payload: `{"task_id":"task-1"}`},
+		{ID: "by-path", Agent: "agent", Type: "review", State: "running", Payload: `{"worktree_path":"/worktrees/task-2"}`},
+		{ID: "finished", Agent: "agent", Type: "implement", State: "succeeded", Payload: `{"task_id":"task-3","worktree_path":"/worktrees/task-3"}`},
+	} {
+		if err := store.CreateJobWithEvent(ctx, job, JobEvent{Kind: job.State, Message: "seed"}); err != nil {
+			t.Fatalf("CreateJobWithEvent %s: %v", job.ID, err)
+		}
+	}
+	for _, tc := range []struct {
+		taskID string
+		path   string
+		want   bool
+	}{
+		{taskID: "task-1", path: "/other", want: true},
+		{taskID: "other", path: "/worktrees/task-2", want: true},
+		{taskID: "task-3", path: "/worktrees/task-3", want: false},
+	} {
+		got, err := store.TaskHasActiveWorktreeOwner(ctx, tc.taskID, tc.path)
+		if err != nil {
+			t.Fatalf("TaskHasActiveWorktreeOwner(%q, %q): %v", tc.taskID, tc.path, err)
+		}
+		if got != tc.want {
+			t.Fatalf("TaskHasActiveWorktreeOwner(%q, %q) = %v, want %v", tc.taskID, tc.path, got, tc.want)
+		}
+	}
+}

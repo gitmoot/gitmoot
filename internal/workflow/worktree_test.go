@@ -900,6 +900,598 @@ func TestAllocateDelegationWorktreeReleasesBranchLockOnFailure(t *testing.T) {
 	}
 }
 
+func TestEngineReclaimTerminalTaskWorktreeKeepsLiveDirtyAdhocAtAnyAge(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	if _, err := exec.LookPath("sleep"); err != nil {
+		t.Skip("sleep not installed")
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	checkout := filepath.Join(root, "checkout")
+	if err := os.MkdirAll(checkout, 0o755); err != nil {
+		t.Fatalf("MkdirAll checkout: %v", err)
+	}
+	runWorktreeGit(t, checkout, "init", "-b", "main")
+	runWorktreeGit(t, checkout, "config", "user.email", "gitmoot@example.com")
+	runWorktreeGit(t, checkout, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(checkout, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile base: %v", err)
+	}
+	runWorktreeGit(t, checkout, "add", "base.txt")
+	runWorktreeGit(t, checkout, "commit", "-m", "base")
+
+	home := filepath.Join(root, "home")
+	path, err := TaskWorktreePath(home, "owner/repo", "adhoc-old-live")
+	if err != nil {
+		t.Fatalf("TaskWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll worktree parent: %v", err)
+	}
+	runWorktreeGit(t, checkout, "worktree", "add", "-b", "adhoc-old-live", path, "HEAD")
+	if err := os.WriteFile(filepath.Join(path, "uncommitted.txt"), []byte("preserve me\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile uncommitted change: %v", err)
+	}
+
+	liveProcess := exec.Command("sleep", "30")
+	liveProcess.Dir = path
+	if err := liveProcess.Start(); err != nil {
+		t.Fatalf("start live worktree process: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = liveProcess.Process.Kill()
+		_ = liveProcess.Wait()
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		live, known := WorktreeLiveness(path)
+		if live && known {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("live worktree process was not observable: live=%v known=%v", live, known)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	store := openEngineStore(t)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "adhoc-old-live",
+		RepoFullName: "owner/repo",
+		State:        string(TaskImplementing),
+		Branch:       "adhoc-old-live",
+		WorktreePath: path,
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	manager := gitutil.NewHostClient(checkout)
+	engine := testEngine(store)
+	engine.WorktreeHasLiveProcess = nil
+
+	outcome, err := engine.ReclaimTerminalTaskWorktreeOutcome(ctx, home, checkout, "adhoc-old-live", manager)
+	if err != nil {
+		t.Fatalf("ReclaimTerminalTaskWorktreeOutcome: %v", err)
+	}
+	if outcome.Reclaimed || outcome.Classification != TaskWorktreeReclaimNotTerminal {
+		t.Fatalf("outcome = %+v, want retained not-terminal task", outcome)
+	}
+	clean, err := manager.WorktreeCleanAt(ctx, path)
+	if err != nil {
+		t.Fatalf("WorktreeCleanAt: %v", err)
+	}
+	if clean {
+		t.Fatal("KEEP fixture unexpectedly clean")
+	}
+	if live, known := WorktreeLiveness(path); !live || !known {
+		t.Fatalf("KEEP fixture process after reclaim: live=%v known=%v", live, known)
+	}
+	task, err := store.GetTask(ctx, "adhoc-old-live")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if task.WorktreePath != path {
+		t.Fatalf("worktree path = %q, want preserved %q", task.WorktreePath, path)
+	}
+	if content, err := os.ReadFile(filepath.Join(path, "uncommitted.txt")); err != nil || string(content) != "preserve me\n" {
+		t.Fatalf("uncommitted work after reclaim = %q, err=%v", content, err)
+	}
+}
+
+func TestEngineReclaimTerminalTaskWorktreeReclaimsTaskKinds(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		id    string
+		state TaskState
+	}{
+		{name: "adhoc dismissed", id: "adhoc-clean", state: TaskDismissed},
+		{name: "review pr merged", id: "review-pr-17-clean", state: TaskMerged},
+		{name: "task superseded", id: "task-clean", state: TaskSuperseded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			home := t.TempDir()
+			checkout := t.TempDir()
+			path, err := TaskWorktreePath(home, "owner/repo", tc.id)
+			if err != nil {
+				t.Fatalf("TaskWorktreePath: %v", err)
+			}
+			if err := os.MkdirAll(path, 0o755); err != nil {
+				t.Fatalf("MkdirAll worktree: %v", err)
+			}
+			if err := store.UpsertTask(ctx, db.Task{
+				ID:           tc.id,
+				RepoFullName: "owner/repo",
+				State:        string(tc.state),
+				Branch:       tc.id,
+				WorktreePath: path,
+			}); err != nil {
+				t.Fatalf("UpsertTask: %v", err)
+			}
+			manager := &fakeWorktreeManager{}
+			engine := testEngine(store)
+
+			outcome, err := engine.ReclaimTerminalTaskWorktreeOutcome(ctx, home, checkout, tc.id, manager)
+			if err != nil {
+				t.Fatalf("ReclaimTerminalTaskWorktreeOutcome: %v", err)
+			}
+			if !outcome.Reclaimed || outcome.Classification != TaskWorktreeReclaimReclaimed {
+				t.Fatalf("outcome = %+v, want reclaimed", outcome)
+			}
+			if len(manager.cleanCalls) != 2 || len(manager.removed) != 1 || manager.removed[0] != path {
+				t.Fatalf("manager safety/removal calls: clean=%v removed=%v", manager.cleanCalls, manager.removed)
+			}
+			if len(manager.deletedBranches) != 0 {
+				t.Fatalf("terminal task branch was deleted: %v", manager.deletedBranches)
+			}
+			task, err := store.GetTask(ctx, tc.id)
+			if err != nil {
+				t.Fatalf("GetTask: %v", err)
+			}
+			if task.WorktreePath != "" || task.Branch != tc.id {
+				t.Fatalf("task after reclaim = %+v, want empty path and preserved branch", task)
+			}
+			events, err := store.ListTaskEvents(ctx, tc.id)
+			if err != nil {
+				t.Fatalf("ListTaskEvents: %v", err)
+			}
+			if len(events) != 1 || events[0].Kind != "terminal_worktree_reclaimed" || events[0].Reason != path {
+				t.Fatalf("task events = %+v", events)
+			}
+		})
+	}
+}
+
+func TestEngineReclaimTerminalTaskWorktreeKeepsUnsafeCandidates(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		live           bool
+		known          bool
+		clean          bool
+		want           TaskWorktreeReclaimClassification
+		wantCleanCalls int
+	}{
+		{name: "live process", live: true, known: true, clean: true, want: TaskWorktreeReclaimLiveProcess},
+		{name: "unknown process table", known: false, clean: true, want: TaskWorktreeReclaimLivenessUnknown},
+		{name: "dirty worktree", known: true, clean: false, want: TaskWorktreeReclaimDirty, wantCleanCalls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			home := t.TempDir()
+			path, err := TaskWorktreePath(home, "owner/repo", "adhoc-terminal")
+			if err != nil {
+				t.Fatalf("TaskWorktreePath: %v", err)
+			}
+			if err := os.MkdirAll(path, 0o755); err != nil {
+				t.Fatalf("MkdirAll worktree: %v", err)
+			}
+			if err := store.UpsertTask(ctx, db.Task{
+				ID:           "adhoc-terminal",
+				RepoFullName: "owner/repo",
+				State:        string(TaskDismissed),
+				WorktreePath: path,
+			}); err != nil {
+				t.Fatalf("UpsertTask: %v", err)
+			}
+			manager := &fakeWorktreeManager{cleanSet: true, clean: tc.clean}
+			engine := testEngine(store)
+			engine.WorktreeHasLiveProcess = nil
+			engine.WorktreeLiveness = func(gotPath string) (bool, bool) {
+				if gotPath != path {
+					t.Fatalf("liveness path = %q, want %q", gotPath, path)
+				}
+				return tc.live, tc.known
+			}
+
+			outcome, err := engine.ReclaimTerminalTaskWorktreeOutcome(ctx, home, t.TempDir(), "adhoc-terminal", manager)
+			if err != nil {
+				t.Fatalf("ReclaimTerminalTaskWorktreeOutcome: %v", err)
+			}
+			if outcome.Reclaimed || outcome.Classification != tc.want {
+				t.Fatalf("outcome = %+v, want retained %s", outcome, tc.want)
+			}
+			if len(manager.cleanCalls) != tc.wantCleanCalls || len(manager.removed) != 0 {
+				t.Fatalf("unsafe worktree was over-inspected or removed: clean=%v removed=%v", manager.cleanCalls, manager.removed)
+			}
+			task, err := store.GetTask(ctx, "adhoc-terminal")
+			if err != nil {
+				t.Fatalf("GetTask: %v", err)
+			}
+			if task.WorktreePath != path {
+				t.Fatalf("worktree path = %q, want preserved %q", task.WorktreePath, path)
+			}
+		})
+	}
+}
+
+type fakeTerminalWorktreeRemovalError struct{}
+
+func (fakeTerminalWorktreeRemovalError) Error() string {
+	return "registered root does not own worktree"
+}
+
+func (fakeTerminalWorktreeRemovalError) TerminalWorktreeRemoval() bool {
+	return true
+}
+
+func TestEngineReclaimTerminalTaskWorktreeClassifiesUnremovableOnce(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	path, err := TaskWorktreePath(home, "owner/repo", "review-pr-unremovable")
+	if err != nil {
+		t.Fatalf("TaskWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktree: %v", err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "review-pr-unremovable",
+		RepoFullName: "owner/repo",
+		State:        string(TaskMerged),
+		WorktreePath: path,
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	manager := &fakeWorktreeManager{removeErr: fakeTerminalWorktreeRemovalError{}}
+	engine := testEngine(store)
+
+	outcome, err := engine.ReclaimTerminalTaskWorktreeOutcome(ctx, home, t.TempDir(), "review-pr-unremovable", manager)
+	if err != nil {
+		t.Fatalf("ReclaimTerminalTaskWorktreeOutcome: %v", err)
+	}
+	if outcome.Reclaimed || outcome.Classification != TaskWorktreeReclaimUnremovable {
+		t.Fatalf("outcome = %+v, want terminal-unremovable", outcome)
+	}
+	ids, err := store.TaskIDsWithTerminalWorktree(ctx)
+	if err != nil {
+		t.Fatalf("TaskIDsWithTerminalWorktree: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("classified candidate remained retryable: %v", ids)
+	}
+	events, err := store.ListTaskEvents(ctx, "review-pr-unremovable")
+	if err != nil {
+		t.Fatalf("ListTaskEvents: %v", err)
+	}
+	if len(events) != 1 || events[0].Kind != "terminal_worktree_unremovable" || events[0].Reason != path {
+		t.Fatalf("task events = %+v", events)
+	}
+}
+
+func TestEngineReclaimTerminalTaskWorktreeClassifiesMissingGitAdmin(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	checkout := filepath.Join(root, "checkout")
+	if err := os.MkdirAll(checkout, 0o755); err != nil {
+		t.Fatalf("MkdirAll checkout: %v", err)
+	}
+	runWorktreeGit(t, checkout, "init", "-b", "main")
+	runWorktreeGit(t, checkout, "config", "user.email", "gitmoot@example.com")
+	runWorktreeGit(t, checkout, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(checkout, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile base: %v", err)
+	}
+	runWorktreeGit(t, checkout, "add", "base.txt")
+	runWorktreeGit(t, checkout, "commit", "-m", "base")
+
+	home := filepath.Join(root, "home")
+	path, err := TaskWorktreePath(home, "owner/repo", "adhoc-missing-admin")
+	if err != nil {
+		t.Fatalf("TaskWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll worktree parent: %v", err)
+	}
+	runWorktreeGit(t, checkout, "worktree", "add", "-b", "adhoc-missing-admin", path, "HEAD")
+	gitFile, err := os.ReadFile(filepath.Join(path, ".git"))
+	if err != nil {
+		t.Fatalf("ReadFile .git: %v", err)
+	}
+	line, _, _ := strings.Cut(strings.TrimSpace(string(gitFile)), "\n")
+	gitDir, ok := strings.CutPrefix(strings.TrimSpace(line), "gitdir:")
+	if !ok {
+		t.Fatalf("worktree .git pointer = %q", line)
+	}
+	gitDir = strings.TrimSpace(gitDir)
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(path, gitDir)
+	}
+	if err := os.RemoveAll(filepath.Clean(gitDir)); err != nil {
+		t.Fatalf("remove isolated worktree admin: %v", err)
+	}
+
+	store := openEngineStore(t)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "adhoc-missing-admin",
+		RepoFullName: "owner/repo",
+		State:        string(TaskDismissed),
+		Branch:       "adhoc-missing-admin",
+		WorktreePath: path,
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	engine := testEngine(store)
+	outcome, err := engine.ReclaimTerminalTaskWorktreeOutcome(ctx, home, checkout, "adhoc-missing-admin", gitutil.NewHostClient(checkout))
+	if err != nil {
+		t.Fatalf("ReclaimTerminalTaskWorktreeOutcome: %v", err)
+	}
+	if outcome.Reclaimed || outcome.Classification != TaskWorktreeReclaimUnremovable {
+		t.Fatalf("outcome = %+v, want terminal-unremovable", outcome)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("unprovable worktree was removed: %v", err)
+	}
+	ids, err := store.TaskIDsWithTerminalWorktree(ctx)
+	if err != nil {
+		t.Fatalf("TaskIDsWithTerminalWorktree: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("missing-admin candidate remained retryable: %v", ids)
+	}
+}
+
+func TestEngineReclaimTerminalTaskWorktreeKeepsBranchLockOwner(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	path, err := TaskWorktreePath(home, "owner/repo", "task-locked")
+	if err != nil {
+		t.Fatalf("TaskWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktree: %v", err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-locked",
+		RepoFullName: "owner/repo",
+		State:        string(TaskMerged),
+		Branch:       "task-locked",
+		WorktreePath: path,
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	created, err := store.CreateLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: "task-locked", Owner: "live-owner"})
+	if err != nil || !created {
+		t.Fatalf("CreateLock created=%v err=%v", created, err)
+	}
+	manager := &fakeWorktreeManager{}
+	engine := testEngine(store)
+
+	outcome, err := engine.ReclaimTerminalTaskWorktreeOutcome(ctx, home, t.TempDir(), "task-locked", manager)
+	if err != nil {
+		t.Fatalf("ReclaimTerminalTaskWorktreeOutcome: %v", err)
+	}
+	if outcome.Reclaimed || outcome.Classification != TaskWorktreeReclaimActiveOwner {
+		t.Fatalf("outcome = %+v, want active owner keep", outcome)
+	}
+	if len(manager.cleanCalls) != 0 || len(manager.removed) != 0 {
+		t.Fatalf("owned worktree was inspected or removed: clean=%v removed=%v", manager.cleanCalls, manager.removed)
+	}
+}
+
+func TestEngineReclaimTerminalTaskWorktreeRejectsUnmanagedPath(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	unmanaged := t.TempDir()
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-unmanaged",
+		RepoFullName: "owner/repo",
+		State:        string(TaskDismissed),
+		WorktreePath: unmanaged,
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	manager := &fakeWorktreeManager{}
+	engine := testEngine(store)
+
+	outcome, err := engine.ReclaimTerminalTaskWorktreeOutcome(ctx, home, t.TempDir(), "task-unmanaged", manager)
+	if err != nil {
+		t.Fatalf("ReclaimTerminalTaskWorktreeOutcome: %v", err)
+	}
+	if outcome.Reclaimed || outcome.Classification != TaskWorktreeReclaimPathMismatch {
+		t.Fatalf("outcome = %+v, want path mismatch keep", outcome)
+	}
+	if len(manager.cleanCalls) != 0 || len(manager.removed) != 0 {
+		t.Fatalf("unmanaged path was inspected or removed: clean=%v removed=%v", manager.cleanCalls, manager.removed)
+	}
+	if _, err := os.Stat(unmanaged); err != nil {
+		t.Fatalf("unmanaged path changed: %v", err)
+	}
+}
+
+func TestEngineReclaimTerminalTaskWorktreeKeepsActiveJobOwner(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	path, err := TaskWorktreePath(home, "owner/repo", "review-pr-active")
+	if err != nil {
+		t.Fatalf("TaskWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktree: %v", err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "review-pr-active",
+		RepoFullName: "owner/repo",
+		State:        string(TaskMerged),
+		WorktreePath: path,
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	payload, err := marshalPayload(JobPayload{TaskID: "review-pr-active", WorktreePath: path})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: "active-owner", Agent: "reviewer", Type: "review", State: string(JobRunning), Payload: payload,
+	}, db.JobEvent{Kind: string(JobRunning), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+	manager := &fakeWorktreeManager{}
+	engine := testEngine(store)
+
+	outcome, err := engine.ReclaimTerminalTaskWorktreeOutcome(ctx, home, t.TempDir(), "review-pr-active", manager)
+	if err != nil {
+		t.Fatalf("ReclaimTerminalTaskWorktreeOutcome: %v", err)
+	}
+	if outcome.Reclaimed || outcome.Classification != TaskWorktreeReclaimActiveOwner {
+		t.Fatalf("outcome = %+v, want active owner keep", outcome)
+	}
+	if len(manager.cleanCalls) != 0 || len(manager.removed) != 0 {
+		t.Fatalf("active job worktree was inspected or removed: clean=%v removed=%v", manager.cleanCalls, manager.removed)
+	}
+}
+
+func TestEngineReclaimAgedFixWorktreeKeepsLiveProcess(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	const jobID = "fix-live"
+	path, err := FixWorktreePath(home, "owner/repo", jobID)
+	if err != nil {
+		t.Fatalf("FixWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll fix worktree: %v", err)
+	}
+	payload, err := marshalPayload(JobPayload{
+		Repo:         "owner/repo",
+		WorktreePath: path,
+		FixWorktree:  true,
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID:      jobID,
+		Agent:   "fixer",
+		Type:    "implement",
+		State:   string(JobSucceeded),
+		Repo:    "owner/repo",
+		Payload: payload,
+	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+	engine := testEngine(store)
+	engine.Home = home
+	engine.WorktreeHasLiveProcess = nil
+	engine.WorktreeLiveness = func(gotPath string) (bool, bool) {
+		if gotPath != path {
+			t.Fatalf("liveness path = %q, want %q", gotPath, path)
+		}
+		return true, true
+	}
+
+	reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
+	}
+	if reclaimed {
+		t.Fatal("live fix worktree was reclaimed")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("live fix worktree was removed: %v", err)
+	}
+}
+
+func TestEngineReclaimAgedFixWorktreeRequiresCleanRemoteReachableHead(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		clean     bool
+		reachable bool
+		want      bool
+	}{
+		{name: "dirty", clean: false, reachable: true},
+		{name: "unpushed head", clean: true, reachable: false},
+		{name: "clean pushed head", clean: true, reachable: true, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			home := t.TempDir()
+			jobID := "fix-" + strings.ReplaceAll(tc.name, " ", "-")
+			path, err := FixWorktreePath(home, "owner/repo", jobID)
+			if err != nil {
+				t.Fatalf("FixWorktreePath: %v", err)
+			}
+			if err := os.MkdirAll(path, 0o755); err != nil {
+				t.Fatalf("MkdirAll fix worktree: %v", err)
+			}
+			payload, err := marshalPayload(JobPayload{
+				Repo:         "owner/repo",
+				Branch:       "feature/fix",
+				WorktreePath: path,
+				FixWorktree:  true,
+			})
+			if err != nil {
+				t.Fatalf("marshalPayload: %v", err)
+			}
+			if err := store.CreateJobWithEvent(ctx, db.Job{
+				ID:      jobID,
+				Agent:   "fixer",
+				Type:    "implement",
+				State:   string(JobSucceeded),
+				Repo:    "owner/repo",
+				Payload: payload,
+			}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
+				t.Fatalf("CreateJobWithEvent: %v", err)
+			}
+			manager := &fakeWorktreeManager{
+				cleanSet:    true,
+				clean:       tc.clean,
+				ancestorSet: true,
+				ancestor:    tc.reachable,
+			}
+			engine := testEngine(store)
+			engine.Home = home
+			engine.DelegationWorktrees = manager
+
+			reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
+			if err != nil {
+				t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
+			}
+			if reclaimed != tc.want {
+				t.Fatalf("reclaimed = %v, want %v", reclaimed, tc.want)
+			}
+			_, statErr := os.Stat(path)
+			if tc.want && !os.IsNotExist(statErr) {
+				t.Fatalf("eligible fix worktree remains: %v", statErr)
+			}
+			if !tc.want && statErr != nil {
+				t.Fatalf("ineligible fix worktree was removed: %v", statErr)
+			}
+		})
+	}
+}
+
 func setupOffLineageTaskWorktree(t *testing.T, dirty bool) (context.Context, *db.Store, Engine, gitutil.Client, TaskWorktreeRequest, string, string, string) {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
@@ -1085,6 +1677,18 @@ func (f *fakeWorktreeManager) WorktreeCleanAt(_ context.Context, path string) (b
 		return f.clean, nil
 	}
 	return true, nil
+}
+
+func (f *fakeWorktreeManager) WorktreeHeadReachableFromRemote(ctx context.Context, path string, branch string) (bool, error) {
+	head, err := f.HeadSHAAt(ctx, path)
+	if err != nil {
+		return false, err
+	}
+	remoteHead, err := f.RevParse(ctx, "origin/"+branch)
+	if err != nil {
+		return false, err
+	}
+	return f.IsAncestor(ctx, head, remoteHead)
 }
 
 func (f *fakeWorktreeManager) AddDetachedWorktree(_ context.Context, path string, ref string) error {

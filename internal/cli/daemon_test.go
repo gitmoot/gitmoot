@@ -854,6 +854,7 @@ type countingCandidateStore struct {
 	comment     int32
 	reclaim     int32
 	agedReclaim int32
+	taskReclaim int32
 }
 
 func (c *countingCandidateStore) JobIDsWithPendingAdvanceRetry(ctx context.Context) ([]string, error) {
@@ -876,6 +877,11 @@ func (c *countingCandidateStore) JobIDsWithAgedTerminalDelegationWorktree(ctx co
 	return c.inner.JobIDsWithAgedTerminalDelegationWorktree(ctx, cutoff)
 }
 
+func (c *countingCandidateStore) TaskIDsWithTerminalWorktree(ctx context.Context) ([]string, error) {
+	atomic.AddInt32(&c.taskReclaim, 1)
+	return c.inner.TaskIDsWithTerminalWorktree(ctx)
+}
+
 // flakyCandidateStore returns an error on the first call to each candidate query and
 // the memoized success on every later call, counting total calls per query. It backs
 // TestTickCandidatesRetriesOnError's proof that tickCandidates memoizes SUCCESSES
@@ -886,6 +892,7 @@ type flakyCandidateStore struct {
 	commentCalls     int32
 	reclaimCalls     int32
 	agedReclaimCalls int32
+	taskReclaimCalls int32
 }
 
 var errCandidateTransient = errors.New("transient store fault")
@@ -916,4 +923,11 @@ func (s *flakyCandidateStore) JobIDsWithAgedTerminalDelegationWorktree(context.C
 		return nil, errCandidateTransient
 	}
 	return []string{"aged-reclaim-job"}, nil
+}
+
+func (s *flakyCandidateStore) TaskIDsWithTerminalWorktree(context.Context) ([]string, error) {
+	if atomic.AddInt32(&s.taskReclaimCalls, 1) == 1 {
+		return nil, errCandidateTransient
+	}
+	return []string{"task-reclaim"}, nil
 }

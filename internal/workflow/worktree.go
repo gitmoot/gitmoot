@@ -37,8 +37,29 @@ type WritableWorktreeLineageManager interface {
 	RevParse(ctx context.Context, rev string) (string, error)
 	IsAncestor(ctx context.Context, ancestor, descendant string) (bool, error)
 	WorktreeCleanAt(ctx context.Context, path string) (bool, error)
+	WorktreeHeadReachableFromRemote(ctx context.Context, path string, branch string) (bool, error)
 	RemoveWorktree(ctx context.Context, path string) error
 	DeleteBranch(ctx context.Context, branch string) error
+}
+
+type TaskWorktreeReclaimClassification string
+
+const (
+	TaskWorktreeReclaimReclaimed       TaskWorktreeReclaimClassification = "reclaimed"
+	TaskWorktreeReclaimAlreadyAbsent   TaskWorktreeReclaimClassification = "already_absent"
+	TaskWorktreeReclaimNotTerminal     TaskWorktreeReclaimClassification = "not_terminal"
+	TaskWorktreeReclaimPathMismatch    TaskWorktreeReclaimClassification = "path_mismatch"
+	TaskWorktreeReclaimActiveOwner     TaskWorktreeReclaimClassification = "active_owner"
+	TaskWorktreeReclaimLivenessUnknown TaskWorktreeReclaimClassification = "liveness_unknown"
+	TaskWorktreeReclaimLiveProcess     TaskWorktreeReclaimClassification = "live_process"
+	TaskWorktreeReclaimDirty           TaskWorktreeReclaimClassification = "dirty"
+	TaskWorktreeReclaimUnremovable     TaskWorktreeReclaimClassification = "terminal_unremovable"
+)
+
+type TaskWorktreeReclaimOutcome struct {
+	Reclaimed      bool
+	Classification TaskWorktreeReclaimClassification
+	Path           string
 }
 
 // ReadOnlyWorktreeManager allocates and disposes throwaway detached worktrees
@@ -143,6 +164,211 @@ func (e Engine) ReconcileDirtyTaskWorktreeLineage(ctx context.Context, manager W
 		Branch:    task.Branch,
 	}
 	return true, blockTaskForDirtyWorktree(ctx, e.Store, task, request, path, reason)
+}
+
+// ReclaimTerminalTaskWorktreeOutcome removes a task-owned worktree only after
+// terminal state, deterministic ownership, active-job absence, conclusive
+// process liveness, and cleanliness are all revalidated under the same checkout
+// mutation lock used by allocation. The task branch is deliberately preserved.
+func (e Engine) ReclaimTerminalTaskWorktreeOutcome(ctx context.Context, home, checkout, taskID string, manager WritableWorktreeLineageManager) (TaskWorktreeReclaimOutcome, error) {
+	outcome := TaskWorktreeReclaimOutcome{}
+	if err := e.validate(); err != nil {
+		return outcome, err
+	}
+	if strings.TrimSpace(taskID) == "" {
+		return outcome, errors.New("task worktree task id is required")
+	}
+	if strings.TrimSpace(home) == "" {
+		return outcome, errors.New("task worktree home is required")
+	}
+	if strings.TrimSpace(checkout) == "" {
+		return outcome, errors.New("task worktree checkout is required")
+	}
+	if manager == nil {
+		return outcome, errors.New("task worktree manager is required")
+	}
+
+	task, err := e.Store.GetTask(ctx, taskID)
+	if err != nil {
+		return outcome, err
+	}
+	if !isTerminalTaskWorktreeState(task.State) {
+		outcome.Classification = TaskWorktreeReclaimNotTerminal
+		outcome.Path = strings.TrimSpace(task.WorktreePath)
+		return outcome, nil
+	}
+	path := strings.TrimSpace(task.WorktreePath)
+	outcome.Path = path
+	expected, err := TaskWorktreePath(home, task.RepoFullName, task.ID)
+	if err != nil || path == "" || filepath.Clean(path) != filepath.Clean(expected) {
+		if _, classifyErr := e.Store.ClassifyTerminalTaskWorktreeUnremovable(ctx, task.ID, path); classifyErr != nil {
+			return outcome, classifyErr
+		}
+		outcome.Classification = TaskWorktreeReclaimPathMismatch
+		return outcome, nil
+	}
+
+	opCtx := context.WithoutCancel(ctx)
+	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(opCtx, e.Store, checkout, "task-worktree-reclaim:"+task.ID, time.Now().UTC())
+	if err != nil {
+		return outcome, fmt.Errorf("lock checkout for terminal task worktree reclaim: %w", err)
+	}
+	defer func() {
+		if releaseCheckoutLock != nil {
+			_ = releaseCheckoutLock(context.Background())
+		}
+	}()
+
+	// Allocation and recovery can race the candidate scan. Re-read after taking
+	// the checkout lock and require the same terminal task/path episode.
+	task, err = e.Store.GetTask(opCtx, task.ID)
+	if err != nil {
+		return outcome, err
+	}
+	if !isTerminalTaskWorktreeState(task.State) {
+		outcome.Classification = TaskWorktreeReclaimNotTerminal
+		return outcome, nil
+	}
+	if strings.TrimSpace(task.WorktreePath) != path {
+		outcome.Classification = TaskWorktreeReclaimPathMismatch
+		return outcome, nil
+	}
+	active, err := e.taskWorktreeHasActiveOwner(opCtx, task, path)
+	if err != nil {
+		return outcome, fmt.Errorf("check active task worktree owner: %w", err)
+	}
+	if active {
+		outcome.Classification = TaskWorktreeReclaimActiveOwner
+		return outcome, nil
+	}
+	live, known := e.worktreeLiveness(path)
+	if !known {
+		outcome.Classification = TaskWorktreeReclaimLivenessUnknown
+		return outcome, nil
+	}
+	if live {
+		outcome.Classification = TaskWorktreeReclaimLiveProcess
+		return outcome, nil
+	}
+
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		changed, finishErr := e.Store.CompleteTerminalTaskWorktreeReclaim(opCtx, task.ID, path)
+		if finishErr != nil {
+			return outcome, finishErr
+		}
+		outcome.Reclaimed = changed
+		outcome.Classification = TaskWorktreeReclaimAlreadyAbsent
+		return outcome, nil
+	}
+	if err != nil {
+		return outcome, fmt.Errorf("inspect terminal task worktree %s: %w", path, err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		if _, classifyErr := e.Store.ClassifyTerminalTaskWorktreeUnremovable(opCtx, task.ID, path); classifyErr != nil {
+			return outcome, classifyErr
+		}
+		outcome.Classification = TaskWorktreeReclaimPathMismatch
+		return outcome, nil
+	}
+	clean, err := manager.WorktreeCleanAt(opCtx, path)
+	if err != nil {
+		if isTerminalWorktreeRemovalError(err) {
+			return e.classifyTerminalTaskWorktreeUnremovable(opCtx, task.ID, path, outcome)
+		}
+		return outcome, fmt.Errorf("prove terminal task worktree clean at %s: %w", path, err)
+	}
+	if !clean {
+		outcome.Classification = TaskWorktreeReclaimDirty
+		return outcome, nil
+	}
+
+	// Final guards minimize the status/liveness-to-unlink window. Git's
+	// non-force removal remains the last line of defense against new dirtiness.
+	task, err = e.Store.GetTask(opCtx, task.ID)
+	if err != nil {
+		return outcome, err
+	}
+	if !isTerminalTaskWorktreeState(task.State) || strings.TrimSpace(task.WorktreePath) != path {
+		outcome.Classification = TaskWorktreeReclaimNotTerminal
+		return outcome, nil
+	}
+	active, err = e.taskWorktreeHasActiveOwner(opCtx, task, path)
+	if err != nil {
+		return outcome, fmt.Errorf("recheck active task worktree owner: %w", err)
+	}
+	if active {
+		outcome.Classification = TaskWorktreeReclaimActiveOwner
+		return outcome, nil
+	}
+	live, known = e.worktreeLiveness(path)
+	if !known {
+		outcome.Classification = TaskWorktreeReclaimLivenessUnknown
+		return outcome, nil
+	}
+	if live {
+		outcome.Classification = TaskWorktreeReclaimLiveProcess
+		return outcome, nil
+	}
+	clean, err = manager.WorktreeCleanAt(opCtx, path)
+	if err != nil {
+		if isTerminalWorktreeRemovalError(err) {
+			return e.classifyTerminalTaskWorktreeUnremovable(opCtx, task.ID, path, outcome)
+		}
+		return outcome, fmt.Errorf("recheck terminal task worktree clean at %s: %w", path, err)
+	}
+	if !clean {
+		outcome.Classification = TaskWorktreeReclaimDirty
+		return outcome, nil
+	}
+	if err := manager.RemoveWorktree(opCtx, path); err != nil {
+		if isTerminalWorktreeRemovalError(err) {
+			return e.classifyTerminalTaskWorktreeUnremovable(opCtx, task.ID, path, outcome)
+		}
+		return outcome, fmt.Errorf("remove terminal task worktree %s: %w", path, err)
+	}
+	changed, err := e.Store.CompleteTerminalTaskWorktreeReclaim(opCtx, task.ID, path)
+	if err != nil {
+		return outcome, err
+	}
+	outcome.Reclaimed = changed
+	outcome.Classification = TaskWorktreeReclaimReclaimed
+	return outcome, nil
+}
+
+func (e Engine) classifyTerminalTaskWorktreeUnremovable(ctx context.Context, taskID, path string, outcome TaskWorktreeReclaimOutcome) (TaskWorktreeReclaimOutcome, error) {
+	if _, err := e.Store.ClassifyTerminalTaskWorktreeUnremovable(ctx, taskID, path); err != nil {
+		return outcome, err
+	}
+	outcome.Classification = TaskWorktreeReclaimUnremovable
+	return outcome, nil
+}
+
+func (e Engine) taskWorktreeHasActiveOwner(ctx context.Context, task db.Task, path string) (bool, error) {
+	active, err := e.Store.TaskHasActiveWorktreeOwner(ctx, task.ID, path)
+	if err != nil || active {
+		return active, err
+	}
+	if strings.TrimSpace(task.Branch) == "" {
+		return false, nil
+	}
+	if _, err := e.Store.GetBranchLock(ctx, task.RepoFullName, task.Branch); err == nil {
+		return true, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	return false, nil
+}
+
+func isTerminalTaskWorktreeState(state string) bool {
+	return TaskState(state) == TaskMerged || IsDisposedTaskState(state)
+}
+
+func isTerminalWorktreeRemovalError(err error) bool {
+	var terminal interface {
+		TerminalWorktreeRemoval() bool
+	}
+	return errors.As(err, &terminal) && terminal.TerminalWorktreeRemoval()
 }
 
 func (e Engine) AllocateTaskWorktree(ctx context.Context, request TaskWorktreeRequest, manager WorktreeManager) (db.Task, error) {
@@ -1424,6 +1650,30 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 		expected, err := FixWorktreePath(e.Home, payload.Repo, jobID)
 		if err != nil || filepath.Clean(path) != filepath.Clean(expected) {
 			return false, fmt.Errorf("refusing TTL reclaim for unmanaged fix worktree %s", path)
+		}
+		live, known := e.worktreeLiveness(path)
+		if !known || live {
+			return false, nil
+		}
+		manager, ok := e.DelegationWorktrees.(WritableWorktreeLineageManager)
+		if !ok || manager == nil || strings.TrimSpace(payload.Branch) == "" {
+			return false, nil
+		}
+		clean, err := manager.WorktreeCleanAt(ctx, path)
+		if err != nil || !clean {
+			return false, nil
+		}
+		reachable, err := manager.WorktreeHeadReachableFromRemote(ctx, path, payload.Branch)
+		if err != nil || !reachable {
+			return false, nil
+		}
+		live, known = e.worktreeLiveness(path)
+		if !known || live {
+			return false, nil
+		}
+		clean, err = manager.WorktreeCleanAt(ctx, path)
+		if err != nil || !clean {
+			return false, nil
 		}
 		if err := os.RemoveAll(path); err != nil {
 			return false, fmt.Errorf("remove aged terminal fix worktree %s: %w", path, err)

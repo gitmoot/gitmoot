@@ -530,8 +530,11 @@ func TestAgedWorktreeReclaimFailureDoesNotBlockDispatch(t *testing.T) {
 	if !strings.Contains(stdout.String(), reclaimErr.Error()) {
 		t.Fatalf("reclaim failure was not logged: %q", stdout.String())
 	}
-	if !tracker.agedDelegationWorktreeReclaimDue(now) {
-		t.Fatal("failed reclaim advanced the success cadence; want immediate retry eligibility")
+	if tracker.worktreeReclaimDue(now.Add(worktreeReclaimInterval - time.Nanosecond)) {
+		t.Fatal("failed reclaim remained immediately due; want bounded retry cadence")
+	}
+	if !tracker.worktreeReclaimDue(now.Add(worktreeReclaimInterval)) {
+		t.Fatal("failed reclaim was not eligible at the next bounded cadence")
 	}
 }
 
@@ -553,6 +556,77 @@ func TestForceRemoveWorktreeUsesOwningCheckout(t *testing.T) {
 
 	if err := (gitutil.NewHostClient(unrelated)).RemoveWorktreeForce(ctx, worktreePath); err != nil {
 		t.Fatalf("force remove through owning checkout: %v", err)
+	}
+	if _, err := os.Stat(worktreePath); !os.IsNotExist(err) {
+		t.Fatalf("foreign-owned worktree remains after recovery: stat err=%v", err)
+	}
+}
+
+func TestReclaimTerminalTaskWorktreesRemovesCleanDismissedTask(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	})
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	worker := defaultJobWorker(store, io.Discard, home)
+	path, err := workflow.TaskWorktreePath(worker.workflowHome(), "owner/repo", "adhoc-finished")
+	if err != nil {
+		t.Fatalf("TaskWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll worktree parent: %v", err)
+	}
+	if err := (gitutil.NewHostClient(checkout)).AddWorktree(ctx, "adhoc-finished", path, "HEAD"); err != nil {
+		t.Fatalf("AddWorktree: %v", err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "adhoc-finished",
+		RepoFullName: "owner/repo",
+		State:        string(workflow.TaskDismissed),
+		Branch:       "adhoc-finished",
+		WorktreePath: path,
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+
+	if err := reclaimTerminalTaskWorktrees(ctx, worker, "owner/repo", nil, newTickCandidates(store), io.Discard); err != nil {
+		t.Fatalf("reclaimTerminalTaskWorktrees: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("terminal task worktree remains: stat err=%v", err)
+	}
+	task, err := store.GetTask(ctx, "adhoc-finished")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if task.WorktreePath != "" || task.Branch != "adhoc-finished" {
+		t.Fatalf("task after reclaim = %+v, want empty path and preserved branch", task)
+	}
+}
+
+func TestRemoveWorktreeUsesOwningCheckout(t *testing.T) {
+	ctx := context.Background()
+	owner := createDaemonWorkerGitCheckout(t, "main")
+	unrelated := createDaemonWorkerGitCheckout(t, "main")
+	worktreePath := filepath.Join(t.TempDir(), "foreign-owner-clean")
+	if err := (gitutil.NewHostClient(owner)).AddDetachedWorktree(ctx, worktreePath, "HEAD"); err != nil {
+		t.Fatalf("create owner worktree: %v", err)
+	}
+
+	cmd := exec.CommandContext(ctx, "git", "worktree", "remove", worktreePath)
+	cmd.Dir = unrelated
+	output, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(strings.ToLower(string(output)), "is not a working tree") {
+		t.Fatalf("unrelated-checkout control arm err=%v output=%q, want not-a-working-tree failure", err, output)
+	}
+
+	if err := (gitutil.NewHostClient(unrelated)).RemoveWorktree(ctx, worktreePath); err != nil {
+		t.Fatalf("remove through owning checkout: %v", err)
 	}
 	if _, err := os.Stat(worktreePath); !os.IsNotExist(err) {
 		t.Fatalf("foreign-owned worktree remains after recovery: stat err=%v", err)

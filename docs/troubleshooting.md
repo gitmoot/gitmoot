@@ -688,9 +688,30 @@ Fixes:
   then abstains from its native merge gate — fail-closed, it never merges
   gatelessly; the external gate makes the call.
 
-## Delegation worktrees consume too much disk
+## Worktrees consume too much disk
 
-`gitmoot doctor` reports delegation-worktree usage as
+The daemon checks task-owned worktrees every five minutes. A task is eligible
+only in `merged`, `dismissed`, `superseded`, or `stranded`. Age is not an
+eligibility signal. Before removal, Gitmoot re-reads the task under the checkout
+mutation lock and requires all of these checks to pass:
+
+- no queued or running job names the task or path
+- no branch lock owns the task branch
+- `/proc/<pid>/cwd` was readable and no process has a cwd in the worktree
+- the recorded path is the deterministic task path
+- `git status` proves the worktree is clean
+
+Removal uses `git worktree remove` without `--force` and preserves the branch.
+Gitmoot then clears the task's stored path and records
+`terminal_worktree_reclaimed`. A live process, unreadable process table, dirty
+tree, active owner, or failed cleanliness proof retains the path.
+
+If the worktree belongs to an older checkout root, Gitmoot retries removal
+through the owner named by the worktree's `.git` pointer. An owner mismatch that
+cannot be inspected or removed is recorded as `terminal_worktree_unremovable`
+and excluded from later passes. A later task update makes it eligible again.
+
+`gitmoot doctor` also reports delegation-worktree usage as
 `N stale worktrees / X GB under <home>/worktrees`. The detail separates aged
 final owners that are **reclaimable**, resumable/non-final owners that are
 **pinned**, and directories whose owner is **unproven**. Pinned includes
@@ -698,22 +719,24 @@ final owners that are **reclaimable**, resumable/non-final owners that are
 
 `[workflow].delegation_worktree_ttl = "72h"` is default-on because a final
 delegation owner cannot resume, while the grace period preserves short-term
-debugging access. Set it to `"0"` to disable the TTL pass. Aged final owners are
-force-removed even when dirty, Git worktree metadata is pruned, and
-`delegation_worktree_reclaimed_ttl` is recorded. The dashboard `/api/health`
-response exposes the same count, bytes, path, breakdown, and summary in its
-top-level `worktrees` field, including the number of cleanup obligations in
-terminal quarantine.
+debugging access. Set it to `"0"` to disable the TTL pass. Aged read-only and
+delegation worktrees are force-removed even when dirty. An independent fix clone
+is removed only when it is clean and its HEAD is reachable from the recorded
+remote branch, so TTL alone cannot discard local commits.
+`delegation_worktree_reclaimed_ttl` is recorded after removal. The dashboard
+`/api/health` response exposes the same count, bytes, path, breakdown, and
+summary in its top-level `worktrees` field, including the number of cleanup
+obligations in terminal quarantine.
 
-One unreclaimable candidate does not stop the pass: candidate-local lookup,
-runner, and removal failures are skipped while later paths continue. The daemon
-logs the first three failures for a path and suppresses repeats.
+One unreclaimable delegation candidate does not stop the pass. Candidate-local
+lookup, runner, and removal failures are skipped while later paths continue.
+The daemon logs the first three failures for a path and suppresses repeats.
 Each failure advances a durable, restart-safe cleanup obligation. Retries wait
 one minute and stop after the third failure in `quarantined`; quarantined paths
 are not selected again until an operator inspects `gitmoot job cleanup list
 --state quarantined` and runs `gitmoot job cleanup reopen <resource-id>`.
-Candidate-query and store-wide lookup failures still abort the pass and surface
-normally.
+The five-minute worktree cadence advances after every attempted pass, including
+passes with candidate failures, so a failed cleanup cannot hot-loop.
 
 For immediate manual relief, list paths and then prove the owner is final. Do
 not infer safety from directory age alone:

@@ -173,6 +173,11 @@ type Engine struct {
 	// terminal the worker has already exited, so the probe reports false and cleanup
 	// proceeds unchanged.
 	WorktreeHasLiveProcess func(path string) bool
+	// WorktreeLiveness is the proof-bearing form used by terminal task reclaim.
+	// known=false is a hard keep decision because an unreadable process table
+	// cannot prove that unlinking is safe. WorktreeHasLiveProcess remains the
+	// compatibility seam for existing cleanup tests and callers.
+	WorktreeLiveness func(path string) (live bool, known bool)
 	// CanaryEnabled gates the #484 canary ROUTING seam (Mailbox.routeCanary) on the
 	// SAME [skillopt] policy.CanaryEnabled() the daemon's regression comparator
 	// (daemonOutcomeHarvesterWithCanary) is gated on, so both seams turn on/off

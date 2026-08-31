@@ -387,8 +387,8 @@ gitmoot job events <job-id>
 gitmoot job gates <job-id>
 gitmoot job gates clear <job-id> --need "<text>"|--all
 gitmoot job open --agent <name> --repo owner/repo --type ask|review|implement [--title "..."]
-gitmoot job close <job-id> --decision approved|changes_requested|blocked|implemented|failed [--summary "..."]
-gitmoot job record --agent <name> --repo owner/repo --type ask|review|implement --decision implemented [--summary "..."]
+gitmoot job close <job-id> --decision approved|changes_requested|blocked|implemented|failed [--severity P0|P1|P2|P3] [--summary "..."]
+gitmoot job record --agent <name> --repo owner/repo --type ask|review|implement --decision implemented [--severity P0|P1|P2|P3] [--summary "..."]
 gitmoot report bug --job <job-id> --preview
 gitmoot report bug --job <job-id> --create --yes
 gitmoot lock list --repo owner/repo
@@ -2748,9 +2748,30 @@ Fixes:
   then abstains from its native merge gate — fail-closed, it never merges
   gatelessly; the external gate makes the call.
 
-## Delegation worktrees consume too much disk
+## Worktrees consume too much disk
 
-`gitmoot doctor` reports delegation-worktree usage as
+The daemon checks task-owned worktrees every five minutes. A task is eligible
+only in `merged`, `dismissed`, `superseded`, or `stranded`. Age is not an
+eligibility signal. Before removal, Gitmoot re-reads the task under the checkout
+mutation lock and requires all of these checks to pass:
+
+- no queued or running job names the task or path
+- no branch lock owns the task branch
+- `/proc/<pid>/cwd` was readable and no process has a cwd in the worktree
+- the recorded path is the deterministic task path
+- `git status` proves the worktree is clean
+
+Removal uses `git worktree remove` without `--force` and preserves the branch.
+Gitmoot then clears the task's stored path and records
+`terminal_worktree_reclaimed`. A live process, unreadable process table, dirty
+tree, active owner, or failed cleanliness proof retains the path.
+
+If the worktree belongs to an older checkout root, Gitmoot retries removal
+through the owner named by the worktree's `.git` pointer. An owner mismatch that
+cannot be inspected or removed is recorded as `terminal_worktree_unremovable`
+and excluded from later passes. A later task update makes it eligible again.
+
+`gitmoot doctor` also reports delegation-worktree usage as
 `N stale worktrees / X GB under <home>/worktrees`. The detail separates aged
 final owners that are **reclaimable**, resumable/non-final owners that are
 **pinned**, and directories whose owner is **unproven**. Pinned includes
@@ -2758,22 +2779,24 @@ final owners that are **reclaimable**, resumable/non-final owners that are
 
 `[workflow].delegation_worktree_ttl = "72h"` is default-on because a final
 delegation owner cannot resume, while the grace period preserves short-term
-debugging access. Set it to `"0"` to disable the TTL pass. Aged final owners are
-force-removed even when dirty, Git worktree metadata is pruned, and
-`delegation_worktree_reclaimed_ttl` is recorded. The dashboard `/api/health`
-response exposes the same count, bytes, path, breakdown, and summary in its
-top-level `worktrees` field, including the number of cleanup obligations in
-terminal quarantine.
+debugging access. Set it to `"0"` to disable the TTL pass. Aged read-only and
+delegation worktrees are force-removed even when dirty. An independent fix clone
+is removed only when it is clean and its HEAD is reachable from the recorded
+remote branch, so TTL alone cannot discard local commits.
+`delegation_worktree_reclaimed_ttl` is recorded after removal. The dashboard
+`/api/health` response exposes the same count, bytes, path, breakdown, and
+summary in its top-level `worktrees` field, including the number of cleanup
+obligations in terminal quarantine.
 
-One unreclaimable candidate does not stop the pass: candidate-local lookup,
-runner, and removal failures are skipped while later paths continue. The daemon
-logs the first three failures for a path and suppresses repeats.
+One unreclaimable delegation candidate does not stop the pass. Candidate-local
+lookup, runner, and removal failures are skipped while later paths continue.
+The daemon logs the first three failures for a path and suppresses repeats.
 Each failure advances a durable, restart-safe cleanup obligation. Retries wait
 one minute and stop after the third failure in `quarantined`; quarantined paths
 are not selected again until an operator inspects `gitmoot job cleanup list
 --state quarantined` and runs `gitmoot job cleanup reopen <resource-id>`.
-Candidate-query and store-wide lookup failures still abort the pass and surface
-normally.
+The five-minute worktree cadence advances after every attempted pass, including
+passes with candidate failures, so a failed cleanup cannot hot-loop.
 
 For immediate manual relief, list paths and then prove the owner is final. Do
 not infer safety from directory age alone:
@@ -3815,8 +3838,9 @@ stages:
   may merge after review and CI (see [Gate stages](#gate-stages)).
 - **Declared review suppresses native fan-out.** When an implement stage has a
   downstream `action: review` stage with `source` pointing to it, its job carries
-  `SkipNativeReviewFanout`. Gitmoot does not also enqueue the ordinary native
-  reviewers; without that declaration, native review behavior is unchanged.
+  `SkipNativeReviewFanout`. Gitmoot does not also enqueue native reviewers;
+  without that declaration, scheduling follows `[review].native_fanout_enabled`
+  (off by default, with repository overrides).
 - Still a **leaf** — it may mutate but never fan out.
 
 ### Source-bound review stages
@@ -9681,7 +9705,8 @@ For an in-session PR review, clock in with `--type review --pr <n> --head-sha
 `review_status`, alongside `review_status_grade: reported` and
 `review_status_authority: non_authoritative`. This is display-only,
 caller-reported activity: it does not satisfy, block, or otherwise feed the
-merge gate. Close the session job after posting the verdict.
+merge gate. Close the session job after posting the verdict. A
+`changes_requested` review close must pass `--severity P0|P1|P2|P3`.
 
 For a running engine-dispatched review with an isolated worktree, `job list`
 uses the verified daemon's descendant process tree instead: a runtime descendant
@@ -10592,6 +10617,8 @@ gitmoot events --repo owner/repo
 gitmoot repo add owner/repo --path <path> [--poll <duration>]
 gitmoot repo list
 gitmoot repo set-interval owner/repo (<duration>|default)
+gitmoot repo auto-fix owner/repo --pr <number> --disable --by <role-or-agent> --reason "<text>"
+gitmoot repo auto-fix owner/repo --pr <number> --enable --by <role-or-agent> --reason "<text>"
 gitmoot repo set-interval --all (<duration>|default)
 gitmoot repo remove owner/repo
 gitmoot repo doctor owner/repo
@@ -10660,6 +10687,10 @@ resolved `--poll` / `[daemon].poll` cadence; an explicit `--poll` stores a
 per-repo override. `repo list` renders the sentinel as `inherit`.
 `repo set-interval owner/repo <duration>` changes an override, `default` restores
 inheritance, and `--all` applies either value to every registered repo.
+`repo auto-fix` is a durable, per-PR scheduler control. `--disable` prevents a
+changes-requested auto-fix before ownership resolution or worktree allocation;
+`--enable` explicitly resumes it. Both forms require `--by` and `--reason`, and
+the latest attributed decision remains stored for that PR.
 `repo doctor owner/repo` checks a single repo's checkout/config health. If the
 registered checkout is missing or is no longer a Git worktree, Gitmoot verifies
 the recorded primary checkout, repairs the registration, and reports the
@@ -12570,15 +12601,16 @@ gitmoot job open --agent <name> --repo owner/repo --type ask|review|implement \
 
 # Clock out: apply the result and move the job to its terminal state.
 gitmoot job close <id> --decision approved|changes_requested|blocked|implemented|failed|skipped \
-                 [--summary "..."] [--pr <n>] [--head-sha <sha>] \
-                 [--branch <name>] [--model <name>] \
-                 [--input-tokens <n>] [--output-tokens <n>] [--json]
+                 [--severity P0|P1|P2|P3] [--summary "..."] \
+                 [--pr <n>] [--head-sha <sha>] [--branch <name>] \
+                 [--model <name>] [--input-tokens <n>] [--output-tokens <n>] [--json]
 
 # One-shot post-hoc: create an already-terminal job (open + close in one).
 gitmoot job record --agent <name> --repo owner/repo --type ask|review|implement \
-                 --decision <decision> [--title "..."] [--summary "..."] \
-                 [--task <id>] [--parent-job-id <id>] [--pr <n>] \
-                 [--head-sha <sha>] [--branch <name>] [--model <name>] \
+                 --decision <decision> [--severity P0|P1|P2|P3] \
+                 [--title "..."] [--summary "..."] [--task <id>] \
+                 [--parent-job-id <id>] [--pr <n>] [--head-sha <sha>] \
+                 [--branch <name>] [--model <name>] \
                  [--input-tokens <n>] [--output-tokens <n>] [--json]
 ```
 
@@ -12600,6 +12632,10 @@ caller-reported evidence: Gitmoot records only values supplied explicitly to
 `close` or `record`, and leaves the model empty and token counts zero when they
 are omitted.
 
+A review recorded with `changes_requested` must pass `--severity` with the
+highest finding severity. Other decisions and non-review session jobs may omit
+it.
+
 For a seat's internal fan-out, the recording convention is to use the seat's
 registered agent name, link each recorded unit to the seat job with
 `--parent-job-id`, and give it a descriptive `--title`. This is a convention,
@@ -12615,7 +12651,7 @@ gitmoot job open --agent <name> --repo owner/repo --type review \
 gitmoot workflow note <label> "reviewed tests and error paths"
 # Post the verdict, then:
 gitmoot job close <id> --decision approved|changes_requested|blocked \
-  --summary "..."
+  --summary "..." [--severity P0|P1|P2|P3]
 ```
 
 For a running externally-driven review, `job list` and `job show` derive
@@ -17085,6 +17121,21 @@ truthful, and tied to work that actually happened.
   }
 }
 ```
+
+## Review severity
+
+Review results may add a top-level `"severity": "P0"` field. A
+`changes_requested` review must set it to the highest-severity finding, using
+one of `P0`, `P1`, `P2`, or `P3` (`P0` is most severe). Approved reviews may
+include it when reporting non-blocking findings; approved reviews with no
+findings and non-review jobs omit it.
+
+This field is the engine-readable round severity. A `severity` key nested inside
+an individual `findings[]` object remains useful for display, but does not
+replace the top-level field.
+
+Session review jobs use the same rule. Pass `--severity P0|P1|P2|P3` to
+`job close` or `job record` when the decision is `changes_requested`.
 
 ## Display-only in-session review state
 

@@ -445,6 +445,50 @@ func TestClientHeadSHA(t *testing.T) {
 	runner.wantArgs(t, 0, "git", "rev-parse", "HEAD")
 }
 
+func TestClientWorktreeHeadReachableFromRemote(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "origin.git")
+	seed := filepath.Join(root, "seed")
+	worktree := filepath.Join(root, "fix")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "clone", remote, seed)
+	runGit(t, seed, "config", "user.email", "gitmoot@example.com")
+	runGit(t, seed, "config", "user.name", "Gitmoot")
+	runGit(t, seed, "switch", "-c", "feature/fix")
+	if err := os.WriteFile(filepath.Join(seed, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile base: %v", err)
+	}
+	runGit(t, seed, "add", "base.txt")
+	runGit(t, seed, "commit", "-m", "base")
+	runGit(t, seed, "push", "-u", "origin", "feature/fix")
+	runGit(t, root, "clone", remote, worktree)
+	runGit(t, worktree, "switch", "feature/fix")
+	runGit(t, worktree, "config", "user.email", "gitmoot@example.com")
+	runGit(t, worktree, "config", "user.name", "Gitmoot")
+
+	client := NewHostClient(seed)
+	reachable, err := client.WorktreeHeadReachableFromRemote(ctx, worktree, "feature/fix")
+	if err != nil || !reachable {
+		t.Fatalf("pushed head reachable=%v err=%v, want true", reachable, err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "local.txt"), []byte("local\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile local: %v", err)
+	}
+	runGit(t, worktree, "add", "local.txt")
+	runGit(t, worktree, "commit", "-m", "local only")
+	reachable, err = client.WorktreeHeadReachableFromRemote(ctx, worktree, "feature/fix")
+	if err != nil {
+		t.Fatalf("local head reachability: %v", err)
+	}
+	if reachable {
+		t.Fatal("unpushed local head reported reachable from remote")
+	}
+}
+
 func TestClientRevParse(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "def456\n"}}}
 	sha, err := (NewClient("/repo", runner)).RevParse(context.Background(), "origin/main")

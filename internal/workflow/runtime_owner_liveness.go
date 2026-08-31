@@ -70,6 +70,19 @@ func (e Engine) ownerPIDLive() func(int64) bool {
 	return defaultOwnerPIDLive
 }
 
+// worktreeLiveness reports both the cwd result and whether the process table
+// was readable. New destructive paths require known=true; older cleanup paths
+// retain their best-effort boolean seam.
+func (e Engine) worktreeLiveness(path string) (live bool, known bool) {
+	if e.WorktreeLiveness != nil {
+		return e.WorktreeLiveness(path)
+	}
+	if e.WorktreeHasLiveProcess != nil {
+		return e.WorktreeHasLiveProcess(path), true
+	}
+	return WorktreeLiveness(path)
+}
+
 // worktreeHasLiveProcess reports whether a live process on this host still has its
 // working directory inside the worktree at path. It is the lock-independent,
 // PID-reuse- and hostname-rename-immune never-clobber gate the destructive cleanup
@@ -77,10 +90,8 @@ func (e Engine) ownerPIDLive() func(int64) bool {
 // force-removed even after its runtime-session lease has expired and its lock been
 // reaped (#536 finding 1).
 func (e Engine) worktreeHasLiveProcess(path string) bool {
-	if e.WorktreeHasLiveProcess != nil {
-		return e.WorktreeHasLiveProcess(path)
-	}
-	return defaultWorktreeHasLiveProcess(path)
+	live, _ := e.worktreeLiveness(path)
+	return live
 }
 
 // WorktreeLiveness reports whether a live process on this host has its cwd in

@@ -518,25 +518,36 @@ npm run build
 rsync -a --delete build/ /var/www/gitmoot-docs/
 ```
 
-## Delegation worktrees consume too much disk
+## Worktrees consume too much disk
+
+Every five minutes, the daemon checks task-owned worktrees whose task is
+`merged`, `dismissed`, `superseded`, or `stranded`. Age alone never qualifies a
+task worktree. Gitmoot retains it unless the recorded path is deterministic,
+there is no active job or branch lock, `/proc/<pid>/cwd` conclusively shows no
+live process inside it, and `git status` proves it clean. Removal is non-force
+and preserves the branch.
+
+A worktree registered to an older checkout root is removed through the owner in
+its `.git` pointer. If that owner cannot inspect or remove it, Gitmoot records
+`terminal_worktree_unremovable` once instead of retrying every daemon tick.
 
 `gitmoot doctor` reports `N stale worktrees / X GB under <home>/worktrees` and
-separates reclaimable final owners, pinned non-final owners, and unproven
-directories. `/api/health` exposes the same metric and the quarantined cleanup
-count in its top-level `worktrees` field.
+separates reclaimable final delegation owners, pinned non-final owners, and
+unproven directories. `/api/health` exposes the same metric and quarantined
+cleanup count in its top-level `worktrees` field.
 
-`[workflow].delegation_worktree_ttl = "72h"` is default-on: after that grace
-period the daemon force-removes dirty terminal-owned delegation worktrees,
-prunes Git worktree metadata, and records
-`delegation_worktree_reclaimed_ttl`. Set it to `"0"` to disable this pass.
+`[workflow].delegation_worktree_ttl = "72h"` is default-on. After that grace
+period the daemon force-removes dirty terminal-owned read-only and delegation
+worktrees. Independent fix clones must be clean, and their HEAD must be
+reachable from the recorded remote branch. A successful removal records
+`delegation_worktree_reclaimed_ttl`. Set the TTL to `"0"` to disable this pass.
 Blocked, queued, and running owners remain pinned and are never force-removed.
-Candidate-local lookup, runner, and removal failures skip only that worktree;
-later candidates continue. The daemon logs three failures per path before
-suppressing repeats. Each failure advances a restart-safe cleanup obligation;
-retries wait one minute and stop in terminal `quarantined` state after the third
-failure. Inspect quarantines with `gitmoot job cleanup list --state quarantined`
-and explicitly reopen a repaired target with `gitmoot job cleanup reopen
-<resource-id>`. Candidate-query and store-wide lookup failures remain fatal.
+Candidate-local failures skip only that worktree, and later candidates continue.
+The five-minute pass cadence advances after every attempt so a failed cleanup
+cannot hot-loop. Cleanup obligations still retry once per minute and stop in
+`quarantined` after the third failure. Inspect them with `gitmoot job cleanup
+list --state quarantined` and reopen a repaired target with
+`gitmoot job cleanup reopen <resource-id>`.
 
 For immediate relief, list candidate directories and prove ownership before
 removing anything:
