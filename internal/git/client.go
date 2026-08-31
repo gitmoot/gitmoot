@@ -645,13 +645,20 @@ func (c Client) RefreshCloneProofRefs(ctx context.Context, path string, remoteUR
 // It is local-only, so callers can repeat it immediately before removal.
 // RefreshCloneProofRefs must have populated the proof namespace first; an empty
 // namespace makes every local commit clone-only, which retains the clone.
+//
+// The exclusion globs name EXACTLY the two subnamespaces the refresh fetches and
+// prunes. A wider glob over the whole namespace would let any other ref under it
+// act as an exclusion tip that prune can never remove, and one such ref hides
+// every unpublished commit behind it.
 func (c Client) CloneOnlyCommit(ctx context.Context, path string) (string, error) {
 	path, err := validateWorktreePath(path)
 	if err != nil {
 		return "", err
 	}
 	result, err := NewClient(path, c.runner).run(ctx, "rev-list", "--max-count=1", "--all", "--reflog",
-		"--not", "--glob="+cloneReclaimProofNamespace+"*")
+		"--not",
+		"--glob="+cloneReclaimProofNamespace+"heads/*",
+		"--glob="+cloneReclaimProofNamespace+"tags/*")
 	if err != nil {
 		return "", err
 	}

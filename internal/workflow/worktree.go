@@ -1655,6 +1655,18 @@ func (e Engine) completeAgedTerminalFixWorktreeReclaim(ctx context.Context, jobI
 // by repeating every proof on the quarantined copy.
 const fixCloneQuarantineSuffix = ".ttl-reclaiming"
 
+// pathPresent distinguishes "absent" from "cannot tell", so a stat failure is
+// never read as an absence by a caller that deletes things.
+func pathPresent(path string) (bool, error) {
+	if _, err := os.Lstat(path); err == nil {
+		return true, nil
+	} else if os.IsNotExist(err) {
+		return false, nil
+	} else {
+		return false, err
+	}
+}
+
 // reclaimAgedTerminalFixClone removes a terminal fix worktree's independent
 // clone only after proving that its object database holds nothing unpublished.
 // A fix worktree is a standalone clone, so removal takes its objects with it:
@@ -1666,10 +1678,35 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 	if err != nil || filepath.Clean(path) != filepath.Clean(expected) {
 		return false, fmt.Errorf("refusing TTL reclaim for unmanaged fix worktree %s", path)
 	}
-	if _, statErr := os.Lstat(path); os.IsNotExist(statErr) {
+	// The quarantine is inspected BEFORE the absent-path completion, because a
+	// crash between the rename and the removal produces exactly that state: an
+	// absent path beside a quarantined clone. Completing the reclaim there would
+	// record the removal, retire the candidate, and leave the clone on disk with
+	// nothing left to find it.
+	quarantine := path + fixCloneQuarantineSuffix
+	quarantined, err := pathPresent(quarantine)
+	if err != nil {
+		return false, fmt.Errorf("inspect fix clone quarantine path %s: %w", quarantine, err)
+	}
+	present, err := pathPresent(path)
+	if err != nil {
+		return false, fmt.Errorf("inspect aged terminal fix worktree %s: %w", path, err)
+	}
+	switch {
+	case quarantined && present:
+		return false, fmt.Errorf("refusing TTL reclaim: quarantined fix clone %s from an interrupted removal still exists beside %s", quarantine, path)
+	case quarantined:
+		// Interrupted removal: restore the clone and let a later pass re-prove it
+		// from scratch. The earlier proofs died with the interrupted pass.
+		if renameErr := os.Rename(quarantine, path); renameErr != nil {
+			return false, fmt.Errorf("restore interrupted quarantined fix clone %s to %s: %w", quarantine, path, renameErr)
+		}
+		return false, e.Store.AddJobEvent(context.WithoutCancel(ctx), db.JobEvent{
+			JobID: jobID, Kind: "delegation_worktree_quarantine_restored",
+			Message: fmt.Sprintf("restored fix clone %s after an interrupted TTL removal; safety will be re-proven", path),
+		})
+	case !present:
 		return e.completeAgedTerminalFixWorktreeReclaim(ctx, jobID, path)
-	} else if statErr != nil {
-		return false, fmt.Errorf("inspect aged terminal fix worktree %s: %w", path, statErr)
 	}
 	// A live process wins before any manager capability or probe matters: the
 	// cheapest gate is also the one that must never be skipped.
@@ -1682,12 +1719,6 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 	}
 	// The proof is ref-based, not branch-based, so a payload without a branch is
 	// provable: the trusted remote's refs decide, never the recorded branch name.
-	quarantine := path + fixCloneQuarantineSuffix
-	if _, statErr := os.Lstat(quarantine); statErr == nil {
-		return false, fmt.Errorf("refusing TTL reclaim: quarantined fix clone %s from an interrupted removal still exists", quarantine)
-	} else if !os.IsNotExist(statErr) {
-		return false, fmt.Errorf("inspect fix clone quarantine path %s: %w", quarantine, statErr)
-	}
 	clean, err := manager.WorktreePristineAt(ctx, path)
 	if err != nil {
 		return false, fmt.Errorf("prove aged terminal fix worktree clean: %w", err)

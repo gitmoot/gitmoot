@@ -1210,14 +1210,18 @@ const terminalTaskWorktreeReclaimPassBudget = 8
 // terminalTaskWorktreeReclaimResume rotates the bounded window so a candidate
 // that can never be reclaimed cannot starve the ones behind it: the pass resumes
 // at the first id at or after the last pass's unreached candidate.
+// The marker is keyed by repo filter. The candidate list is host-wide and every
+// repo's pass walks all of it, skipping other repos' candidates for free, so one
+// shared marker let a small repo's completed pass reset a large repo's window to
+// the start on every tick and starve its tail forever.
 var terminalTaskWorktreeReclaimResume = struct {
 	sync.Mutex
-	taskID string
-}{}
+	taskIDByRepo map[string]string
+}{taskIDByRepo: map[string]string{}}
 
-func rotateTerminalTaskWorktreeCandidates(ids []string) []string {
+func rotateTerminalTaskWorktreeCandidates(repoFilter string, ids []string) []string {
 	terminalTaskWorktreeReclaimResume.Lock()
-	resume := terminalTaskWorktreeReclaimResume.taskID
+	resume := terminalTaskWorktreeReclaimResume.taskIDByRepo[repoFilter]
 	terminalTaskWorktreeReclaimResume.Unlock()
 	if resume == "" || len(ids) == 0 {
 		return ids
@@ -1234,10 +1238,14 @@ func rotateTerminalTaskWorktreeCandidates(ids []string) []string {
 	return ids
 }
 
-func setTerminalTaskWorktreeReclaimResume(taskID string) {
+func setTerminalTaskWorktreeReclaimResume(repoFilter string, taskID string) {
 	terminalTaskWorktreeReclaimResume.Lock()
-	terminalTaskWorktreeReclaimResume.taskID = taskID
-	terminalTaskWorktreeReclaimResume.Unlock()
+	defer terminalTaskWorktreeReclaimResume.Unlock()
+	if taskID == "" {
+		delete(terminalTaskWorktreeReclaimResume.taskIDByRepo, repoFilter)
+		return
+	}
+	terminalTaskWorktreeReclaimResume.taskIDByRepo[repoFilter] = taskID
 }
 
 // reclaimTerminalTaskWorktrees removes task-owned worktrees based on terminal
@@ -1263,7 +1271,7 @@ func reclaimTerminalTaskWorktrees(ctx context.Context, worker jobWorker, repoFil
 	if malformedErr != nil {
 		writeLine(stdout, "terminal task worktree reclaim could not identify malformed non-final owner: %v", malformedErr)
 	}
-	rotated := rotateTerminalTaskWorktreeCandidates(taskIDs)
+	rotated := rotateTerminalTaskWorktreeCandidates(repoFilter, taskIDs)
 	attempts := 0
 	resume := ""
 	for i, taskID := range rotated {
@@ -1318,7 +1326,7 @@ func reclaimTerminalTaskWorktrees(ctx context.Context, worker jobWorker, repoFil
 			logTaskWorktreeRetention(stdout, task.ID, outcome.Path, outcome.Classification, malformedJobID)
 		}
 	}
-	setTerminalTaskWorktreeReclaimResume(resume)
+	setTerminalTaskWorktreeReclaimResume(repoFilter, resume)
 	return nil
 }
 

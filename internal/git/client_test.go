@@ -544,6 +544,55 @@ func TestClientCloneOnlyCommitSeesEveryLocalRef(t *testing.T) {
 	}
 }
 
+// The refresh fetches and prunes only heads/* and tags/* inside the proof
+// namespace, so the proof must exclude exactly those. A wider glob would let any
+// other ref parked in the namespace act as an unprunable exclusion tip that hides
+// every unpublished commit behind it.
+func TestClientCloneOnlyCommitIgnoresUnprunableNamespaceRefs(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "origin.git")
+	seed := filepath.Join(root, "seed")
+	clone := filepath.Join(root, "fix")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "clone", remote, seed)
+	runGit(t, seed, "config", "user.email", "gitmoot@example.com")
+	runGit(t, seed, "config", "user.name", "Gitmoot")
+	runGit(t, seed, "switch", "-c", "feature/fix")
+	if err := os.WriteFile(filepath.Join(seed, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile base: %v", err)
+	}
+	runGit(t, seed, "add", "base.txt")
+	runGit(t, seed, "commit", "-m", "base")
+	runGit(t, seed, "push", "-u", "origin", "feature/fix")
+	runGit(t, root, "clone", remote, clone)
+	runGit(t, clone, "switch", "feature/fix")
+	runGit(t, clone, "config", "user.email", "gitmoot@example.com")
+	runGit(t, clone, "config", "user.name", "Gitmoot")
+	runGit(t, clone, "commit", "--allow-empty", "-m", "clone only")
+	cloneHead, err := NewHostClient(clone).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("clone HeadSHA: %v", err)
+	}
+	// Park the unpublished commit under the proof namespace, outside heads/tags.
+	runGit(t, clone, "update-ref", "refs/remotes/gitmoot-reclaim-proof/evil", cloneHead)
+
+	host := NewHostClient(seed)
+	if err := host.RefreshCloneProofRefs(ctx, clone, remote); err != nil {
+		t.Fatalf("RefreshCloneProofRefs: %v", err)
+	}
+	unpublished, err := host.CloneOnlyCommit(ctx, clone)
+	if err != nil {
+		t.Fatalf("CloneOnlyCommit: %v", err)
+	}
+	if unpublished != cloneHead {
+		t.Fatalf("clone-only commit = %q, want %s despite the parked namespace ref", unpublished, cloneHead)
+	}
+}
+
 func TestClientCloneOnlyCommitDistrustsCloneOrigin(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")

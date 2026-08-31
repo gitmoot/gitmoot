@@ -665,6 +665,35 @@ func TestReclaimTerminalTaskWorktreesRemovesCleanDismissedTask(t *testing.T) {
 	}
 }
 
+// The candidate list is host-wide, so every repo's pass walks all of it. A pass
+// that completes for a small repo must not reset a large repo's rotation window,
+// which is what a single shared resume marker did: repo A's tail never ran.
+func TestTerminalTaskWorktreeReclaimResumeIsPerRepo(t *testing.T) {
+	t.Cleanup(func() {
+		setTerminalTaskWorktreeReclaimResume("owner/big", "")
+		setTerminalTaskWorktreeReclaimResume("owner/small", "")
+	})
+	ids := []string{"a01", "a02", "a03", "b01"}
+
+	setTerminalTaskWorktreeReclaimResume("owner/big", "a03")
+	// The small repo's pass walks the whole list and completes, clearing only its
+	// own marker.
+	setTerminalTaskWorktreeReclaimResume("owner/small", "")
+
+	rotated := rotateTerminalTaskWorktreeCandidates("owner/big", ids)
+	if len(rotated) == 0 || rotated[0] != "a03" {
+		t.Fatalf("big repo window = %v, want it to resume at a03", rotated)
+	}
+	if got := rotateTerminalTaskWorktreeCandidates("owner/small", ids); got[0] != "a01" {
+		t.Fatalf("small repo window = %v, want it to start at a01", got)
+	}
+	// A completed pass for the big repo clears its own marker and starts over.
+	setTerminalTaskWorktreeReclaimResume("owner/big", "")
+	if got := rotateTerminalTaskWorktreeCandidates("owner/big", ids); got[0] != "a01" {
+		t.Fatalf("big repo window after completion = %v, want it to start at a01", got)
+	}
+}
+
 func TestReclaimTerminalTaskWorktreesNamesMalformedGlobalPin(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()

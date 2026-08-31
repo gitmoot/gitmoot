@@ -52,6 +52,76 @@ func TestCleanupObligationsMigrationFreshAndUpgrade(t *testing.T) {
 	}
 }
 
+// The rebuild that widened the reason CHECK must carry existing rows across.
+// Applying migrations only up to the ORIGINAL create leaves the table empty, so
+// this test seeds it at the pre-rebuild version and asserts the data survives.
+func TestCleanupObligationsRebuildPreservesLegacyRows(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "rebuild.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	preRebuild := &Store{db: raw}
+	// Unique to the rebuild: only that migration lists unpublished_commits.
+	for version, migration := range migrationsBefore(t, "'identity_or_containment', 'unpublished_commits', 'unknown'") {
+		if err := preRebuild.applyMigration(ctx, version+1, migration); err != nil {
+			t.Fatalf("applyMigration(%d): %v", version+1, err)
+		}
+	}
+	if exists, err := preRebuild.HasTable(ctx, "cleanup_obligations"); err != nil || !exists {
+		t.Fatalf("pre-rebuild cleanup_obligations exists=%v err=%v", exists, err)
+	}
+	quarantinedID := CleanupObligationResourceID("job-q", "/tmp/managed/q")
+	retryableID := CleanupObligationResourceID("job-r", "/tmp/managed/r")
+	if _, err := raw.ExecContext(ctx, `
+		INSERT INTO cleanup_obligations (
+			resource_id, resource_kind, owner_job_id, expected_path, state,
+			reason, attempt_count, next_attempt_at, last_error, created_at, updated_at
+		) VALUES
+			(?, 'delegation_worktree', 'job-q', '/tmp/managed/q', 'quarantined',
+				'identity_or_containment', 3, '2026-01-01T00:00:00Z', 'boom', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+			(?, 'delegation_worktree', 'job-r', '/tmp/managed/r', 'retryable',
+				'checkout_lock', 1, '2026-01-02T00:00:00Z', '', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')`,
+		quarantinedID, retryableID); err != nil {
+		t.Fatalf("seed pre-rebuild rows: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close pre-rebuild store: %v", err)
+	}
+
+	upgraded, err := openRealTestStore(t, path)
+	if err != nil {
+		t.Fatalf("open upgraded store: %v", err)
+	}
+	t.Cleanup(func() { _ = upgraded.Close() })
+	for _, want := range []CleanupObligation{
+		{ResourceID: quarantinedID, OwnerJobID: "job-q", ExpectedPath: "/tmp/managed/q", State: "quarantined", Reason: CleanupReasonIdentityOrContainment, AttemptCount: 3, LastError: "boom"},
+		{ResourceID: retryableID, OwnerJobID: "job-r", ExpectedPath: "/tmp/managed/r", State: "retryable", Reason: CleanupReasonCheckoutLock, AttemptCount: 1},
+	} {
+		got, err := upgraded.GetCleanupObligation(ctx, want.ResourceID)
+		if err != nil {
+			t.Fatalf("GetCleanupObligation(%s): %v", want.ResourceID, err)
+		}
+		if got.OwnerJobID != want.OwnerJobID || got.ExpectedPath != want.ExpectedPath ||
+			got.State != want.State || got.Reason != want.Reason ||
+			got.AttemptCount != want.AttemptCount || got.LastError != want.LastError {
+			t.Fatalf("row %s = %+v, want %+v", want.ResourceID, got, want)
+		}
+	}
+	// The widened CHECK and both indexes must exist on the rebuilt table.
+	if _, err := upgraded.DeferCleanupObligation(ctx, "job-r", "/tmp/managed/r", CleanupReasonUnpublishedCommits, time.Now().UTC(), time.Now().UTC().Add(time.Minute)); err != nil {
+		t.Fatalf("DeferCleanupObligation with the widened reason: %v", err)
+	}
+	for _, index := range []string{"idx_cleanup_obligations_owner_path", "idx_cleanup_obligations_due"} {
+		var name string
+		if err := upgraded.db.QueryRowContext(ctx,
+			`SELECT name FROM sqlite_master WHERE type='index' AND name=?`, index).Scan(&name); err != nil {
+			t.Fatalf("index %s missing after rebuild: %v", index, err)
+		}
+	}
+}
+
 func TestCleanupObligationAcceptsUnpublishedCommitsReason(t *testing.T) {
 	ctx := context.Background()
 	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
@@ -69,6 +139,39 @@ func TestCleanupObligationAcceptsUnpublishedCommitsReason(t *testing.T) {
 	}
 	if obligation.State != "retryable" {
 		t.Fatalf("state = %q, want retryable", obligation.State)
+	}
+}
+
+func TestDeferCleanupObligationKeepsSpecificReasonOverTerminalDeferral(t *testing.T) {
+	ctx := context.Background()
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	path := "/tmp/managed/fix-clone"
+	if _, err := store.DeferCleanupObligation(ctx, "job-1", path, CleanupReasonUnpublishedCommits, now, now.Add(time.Minute)); err != nil {
+		t.Fatalf("specific deferral: %v", err)
+	}
+	// The daemon stamps the generic deferral after every unfinished pass.
+	obligation, err := store.DeferCleanupObligation(ctx, "job-1", path, CleanupReasonTerminalDeferred, now.Add(time.Minute), now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("generic deferral: %v", err)
+	}
+	if obligation.Reason != CleanupReasonUnpublishedCommits {
+		t.Fatalf("reason = %q, want the specific diagnosis to survive", obligation.Reason)
+	}
+	if obligation.NextAttemptAt == "" || obligation.State != "retryable" {
+		t.Fatalf("obligation = %+v, want a rescheduled retryable row", obligation)
+	}
+	// A different specific reason must still win.
+	obligation, err = store.DeferCleanupObligation(ctx, "job-1", path, CleanupReasonCheckoutLock, now.Add(2*time.Minute), now.Add(3*time.Minute))
+	if err != nil {
+		t.Fatalf("second specific deferral: %v", err)
+	}
+	if obligation.Reason != CleanupReasonCheckoutLock {
+		t.Fatalf("reason = %q, want checkout_lock", obligation.Reason)
 	}
 }
 

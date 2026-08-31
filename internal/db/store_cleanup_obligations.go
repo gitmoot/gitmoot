@@ -133,16 +133,30 @@ func (s *Store) RecordCleanupObligationFailure(ctx context.Context, ownerJobID, 
 	return s.GetCleanupObligation(ctx, obligation.ResourceID)
 }
 
+// DeferCleanupObligation reschedules an obligation. The GENERIC terminal
+// deferral never overwrites a specific diagnosis: the daemon stamps it after
+// every pass that did not finish, so letting it win would erase the one field
+// that explains WHY a path is still there (unpublished_commits, for example) and
+// would make any "announce on the transition" caller re-announce every pass. A
+// specific reason always wins, including over another specific reason.
 func (s *Store) DeferCleanupObligation(ctx context.Context, ownerJobID, expectedPath string, reason CleanupObligationReason, now, nextAttempt time.Time) (CleanupObligation, error) {
 	obligation, err := s.EnsureCleanupObligation(ctx, ownerJobID, expectedPath, now)
 	if err != nil {
 		return CleanupObligation{}, err
 	}
+	trimmed := strings.TrimSpace(string(reason))
 	_, err = s.db.ExecContext(ctx, `
 		UPDATE cleanup_obligations
-		SET state='retryable', reason=?, next_attempt_at=?, updated_at=?
+		SET state='retryable',
+			reason=CASE
+				WHEN ? = 'terminal_cleanup_deferred'
+					AND reason NOT IN ('pending', 'terminal_cleanup_deferred', 'removed', 'operator_reopened')
+				THEN reason
+				ELSE ?
+			END,
+			next_attempt_at=?, updated_at=?
 		WHERE resource_id=? AND state IN ('pending', 'retryable')`,
-		strings.TrimSpace(string(reason)), cleanupObligationTime(nextAttempt), cleanupObligationTime(now), obligation.ResourceID)
+		trimmed, trimmed, cleanupObligationTime(nextAttempt), cleanupObligationTime(now), obligation.ResourceID)
 	if err != nil {
 		return CleanupObligation{}, err
 	}

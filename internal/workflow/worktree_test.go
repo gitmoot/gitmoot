@@ -1864,6 +1864,80 @@ func TestEngineReclaimAgedFixCloneRefusesLeftoverQuarantine(t *testing.T) {
 	}
 }
 
+// A crash between the quarantine rename and the removal leaves the clone at the
+// quarantine path with nothing at the original path. That must be RESTORED, never
+// reported as a completed reclaim: completing it retires the candidate forever
+// and leaves the only copy of the commits on disk with no owner.
+func TestEngineReclaimAgedFixCloneRestoresInterruptedQuarantine(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	const jobID = "fix-interrupted-quarantine"
+	path, err := FixWorktreePath(home, "owner/repo", jobID)
+	if err != nil {
+		t.Fatalf("FixWorktreePath: %v", err)
+	}
+	quarantine := path + fixCloneQuarantineSuffix
+	if err := os.MkdirAll(quarantine, 0o755); err != nil {
+		t.Fatalf("MkdirAll quarantine: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(quarantine, "only-copy"), []byte("commits\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile only-copy: %v", err)
+	}
+	payload, err := marshalPayload(JobPayload{
+		Repo:         "owner/repo",
+		Branch:       "feature/fix",
+		WorktreePath: path,
+		FixWorktree:  true,
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID:      jobID,
+		Agent:   "fixer",
+		Type:    "implement",
+		State:   string(JobSucceeded),
+		Repo:    "owner/repo",
+		Payload: payload,
+	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+	engine := testEngine(store)
+	engine.Home = home
+	engine.DelegationWorktrees = &fakeWorktreeManager{cleanSet: true, clean: true, cloneOnly: map[string]string{}}
+
+	reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
+	}
+	if reclaimed {
+		t.Fatal("interrupted quarantine was reported as a completed reclaim")
+	}
+	if _, statErr := os.Stat(filepath.Join(path, "only-copy")); statErr != nil {
+		t.Fatalf("clone was not restored to %s: %v", path, statErr)
+	}
+	if _, statErr := os.Stat(quarantine); !os.IsNotExist(statErr) {
+		t.Fatalf("quarantine path survived the restore: %v", statErr)
+	}
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	restored := false
+	for _, event := range events {
+		if event.Kind == "delegation_worktree_reclaimed_ttl" {
+			t.Fatalf("interrupted quarantine recorded a TTL reclaim: %+v", events)
+		}
+		if event.Kind == "delegation_worktree_quarantine_restored" {
+			restored = true
+		}
+	}
+	if !restored {
+		t.Fatalf("missing quarantine restore event: %+v", events)
+	}
+}
+
 func setupOffLineageTaskWorktree(t *testing.T, dirty bool) (context.Context, *db.Store, Engine, gitutil.Client, TaskWorktreeRequest, string, string, string) {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
