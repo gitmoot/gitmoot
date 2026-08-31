@@ -489,7 +489,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	}
 	var reviewsAtHead []reviewAtHead
 	for _, job := range jobs {
-		if job.Type != "review" || isDelegationChild(job) {
+		if job.Type != "review" {
 			continue
 		}
 		payload, err := unmarshalPayload(job.Payload)
@@ -915,6 +915,9 @@ func reviewJobRecordedAfter(left db.Job, right db.Job) bool {
 func reviewJobSupersedes(leftJob db.Job, leftPayload JobPayload, rightJob db.Job, rightPayload JobPayload) bool {
 	leftRound := reviewRoundKeyForJob(leftJob, leftPayload)
 	rightRound := reviewRoundKeyForJob(rightJob, rightPayload)
+	if (leftRound.name != "") != (rightRound.name != "") {
+		return false
+	}
 	if reviewRoundKeyAfter(leftRound, rightRound) {
 		return true
 	}
