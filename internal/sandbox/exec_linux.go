@@ -19,6 +19,12 @@ import (
 // an important write operation outside the policy.
 const MinimumABI = 3
 
+// ReadOnlyWorkdirSupported reports whether this build can enforce the review
+// seat's hard read-only checkout boundary.
+func ReadOnlyWorkdirSupported() bool {
+	return true
+}
+
 // Exec applies Gitmoot's strict filesystem ruleset to the current process and
 // replaces it with argv. Landlock restrictions survive execve, so the runtime
 // and every descendant inherit the same filesystem confinement.

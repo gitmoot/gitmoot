@@ -138,6 +138,54 @@ func TestApplyIsolatedToolCacheGrantsCreatesDirsEnvAndGrant(t *testing.T) {
 	}
 }
 
+func TestApplyIsolatedToolCacheGrantsReviewRejectsProtectedPathBeforeMutation(t *testing.T) {
+	base := t.TempDir()
+	checkout := filepath.Join(base, "review-worktree")
+	commonDir := filepath.Join(base, "main", ".git")
+	gitDir := filepath.Join(commonDir, "worktrees", "review")
+	if err := os.MkdirAll(gitDir, 0o700); err != nil {
+		t.Fatalf("mkdir linked metadata: %v", err)
+	}
+	if err := os.MkdirAll(checkout, 0o700); err != nil {
+		t.Fatalf("mkdir checkout: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, ".git"), []byte("gitdir: "+gitDir+"\n"), 0o600); err != nil {
+		t.Fatalf("write gitdir file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "commondir"), []byte("../..\n"), 0o600); err != nil {
+		t.Fatalf("write commondir: %v", err)
+	}
+
+	for _, test := range []struct {
+		name      string
+		cacheRoot string
+	}{
+		{name: "checkout", cacheRoot: filepath.Join(checkout, "cache")},
+		{name: "linked gitdir", cacheRoot: filepath.Join(gitDir, "cache")},
+		{name: "common git directory", cacheRoot: filepath.Join(commonDir, "cache")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			paths := config.PathsForHome(t.TempDir())
+			if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+				t.Fatalf("mkdir config home: %v", err)
+			}
+			configBody := "[cache]\nenabled = true\ndir = " + strconv.Quote(test.cacheRoot) + "\n"
+			if err := os.WriteFile(paths.ConfigFile, []byte(configBody), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			agent := runtime.Agent{Runtime: runtime.CodexRuntime, ReviewSeat: true}
+
+			_, err := applyIsolatedToolCacheGrants(paths, workflow.JobPayload{WorktreePath: checkout}, &agent)
+			if err == nil || !strings.Contains(err.Error(), "overlaps") {
+				t.Errorf("applyIsolatedToolCacheGrants error = %v, want protected-path rejection", err)
+			}
+			if _, statErr := os.Lstat(test.cacheRoot); !os.IsNotExist(statErr) {
+				t.Fatalf("unsafe review cache was mutated before validation: %v", statErr)
+			}
+		})
+	}
+}
+
 func splitEnvKV(kv string) (key, val string, ok bool) {
 	for i := 0; i < len(kv); i++ {
 		if kv[i] == '=' {

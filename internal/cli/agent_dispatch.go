@@ -18,6 +18,7 @@ import (
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/sandbox"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -60,6 +61,8 @@ func foregroundRuntimeAdapterFactoryFor(backend execbackend.Backend) (foreground
 var dispatchPromptHeadContradictionWarnings = promptHeadContradictionWarnings
 
 var allocateDispatchReadOnlyWorktree = workflow.AllocateReadOnlyWorktree
+
+var reviewReadOnlyWorkdirSupported = sandbox.ReadOnlyWorkdirSupported
 
 var fetchDispatchReviewPullRequest = func(ctx context.Context, git gitutil.Client, pullRequest int) error {
 	return git.FetchPullRequest(ctx, "origin", pullRequest)
@@ -1848,6 +1851,9 @@ func maybeAllocateDispatchReadOnlyWorktree(ctx context.Context, store *db.Store,
 }
 
 func reviewReadOnlyWorktreeCapacity(home string) error {
+	if !reviewReadOnlyWorkdirSupported() {
+		return errors.New("exact-head review sandbox is supported only on Linux")
+	}
 	paths, err := pathsFromFlag(home)
 	if err != nil {
 		return err

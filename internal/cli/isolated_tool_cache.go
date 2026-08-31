@@ -77,6 +77,11 @@ func applyIsolatedToolCacheGrants(paths config.Paths, payload workflow.JobPayloa
 	if !policy.Enabled || strings.TrimSpace(policy.Dir) == "" {
 		return nil, nil
 	}
+	if agent.ReviewSeat {
+		if err := validateReviewWritablePaths(payload.WorktreePath, []string{policy.Dir}); err != nil {
+			return nil, err
+		}
+	}
 	if err := os.MkdirAll(policy.Dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create shared tool cache dir %s: %w", policy.Dir, err)
 	}

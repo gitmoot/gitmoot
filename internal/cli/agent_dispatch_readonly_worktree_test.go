@@ -199,6 +199,17 @@ func TestDispatchReviewAllocatesDistinctExactHeadWorktrees(t *testing.T) {
 	}
 }
 
+func TestReviewReadOnlyWorktreeCapacityRejectsUnsupportedPlatform(t *testing.T) {
+	original := reviewReadOnlyWorkdirSupported
+	reviewReadOnlyWorkdirSupported = func() bool { return false }
+	t.Cleanup(func() { reviewReadOnlyWorkdirSupported = original })
+
+	err := reviewReadOnlyWorktreeCapacity(t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "supported only on Linux") {
+		t.Fatalf("reviewReadOnlyWorktreeCapacity error = %v, want early Linux-only rejection", err)
+	}
+}
+
 func TestDispatchAskScannerKeepsCanonicalCheckoutAndInheritedHead(t *testing.T) {
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
