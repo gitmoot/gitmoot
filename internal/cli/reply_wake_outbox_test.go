@@ -146,6 +146,52 @@ func TestWakeOutboxCoalescesPerKindAndRole(t *testing.T) {
 	}
 }
 
+func TestWakeOutboxCoalescedPromptNamesEveryWorkflowNote(t *testing.T) {
+	store, deliverySink, wake, _ := replyWakeTestHarness(
+		t,
+		[]replyWakeTestRole{{name: "owner", pane: "w1:p1"}},
+	)
+	ctx := context.Background()
+	thread, err := store.CreateChatThread(ctx, db.ChatThread{Slug: "mixed-note-wake", Repo: "owner/repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chat, err := store.AddChatMessage(ctx, db.ChatMessage{
+		ThreadID: thread.ID, AuthorName: "human", Kind: db.ChatKindChat,
+		Body: "@owner first", Mentions: []string{"owner"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	notes := make([]db.WorkflowNote, 0, 2)
+	for _, body := range []string{"first message", "second message"} {
+		note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID:      "release/distinct-note-wakes",
+			Author:          "worker",
+			Body:            body,
+			AddressedTarget: "owner",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		notes = append(notes, note)
+	}
+
+	drainReplyWakeAfterAllRowsAreDue(t, store, deliverySink)
+	if wake.promptCalls != 1 {
+		t.Fatalf("wake calls=%d, want one coalesced wake: %q", wake.promptCalls, wake.prompts)
+	}
+	if want := "3 new items, oldest id " + chat.ID; !strings.Contains(wake.prompt, want) {
+		t.Fatalf("coalesced prompt=%q, want %q", wake.prompt, want)
+	}
+	for _, note := range notes {
+		command := "gitmoot workflow show-note " + fmt.Sprint(note.ID)
+		if matches := strings.Count(wake.prompt, command); matches != 1 {
+			t.Fatalf("retrieval command %q appeared %d times, want exactly one: %q", command, matches, wake.prompt)
+		}
+	}
+}
+
 func TestWakeOutboxTickHealthIncludesBlockedAndEscalation(t *testing.T) {
 	store := daemonWorkerStore(t)
 	ctx := context.Background()
@@ -465,6 +511,34 @@ func TestReplyWakeOutboxBurstCoalescesToExactlyOneWake(t *testing.T) {
 	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
 	if err != nil || len(delivered) != 10 {
 		t.Fatalf("delivered rows = %+v, err=%v", delivered, err)
+	}
+}
+
+func TestReplyWakeOutboxSplitsOversizedAddressedNoteBatch(t *testing.T) {
+	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
+	ctx := context.Background()
+	noteIDs := make([]int64, 0, replyWakeMaxCoalescedItems+1)
+	for index := 0; index < replyWakeMaxCoalescedItems+1; index++ {
+		note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: "release/bounded-burst", Author: "worker",
+			Body: fmt.Sprintf("addressed item %d", index+1), AddressedTarget: "owner",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		noteIDs = append(noteIDs, note.ID)
+	}
+
+	drainReplyWakeAfterAllRowsAreDue(t, store, sink)
+	if wake.promptCalls != 2 {
+		t.Fatalf("wake calls=%d, want two count-bounded batches: %q", wake.promptCalls, wake.prompts)
+	}
+	normalizedPrompts := strings.ReplaceAll(strings.Join(wake.prompts, "\n"), "\n", "; ") + ";"
+	for _, noteID := range noteIDs {
+		command := "gitmoot workflow show-note " + fmt.Sprint(noteID)
+		if matches := strings.Count(normalizedPrompts, command+";"); matches != 1 {
+			t.Fatalf("retrieval command %q appeared %d times, want exactly one: %q", command, matches, wake.prompts)
+		}
 	}
 }
 

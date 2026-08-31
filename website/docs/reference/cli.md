@@ -310,6 +310,7 @@ gitmoot repo auto-fix owner/repo --pr <number> --enable --by <role-or-agent> --r
 gitmoot repo set-interval --all (<duration>|default)
 gitmoot repo remove owner/repo
 gitmoot repo doctor owner/repo
+gitmoot repo collisions owner/repo [--limit N] [--json]
 ```
 
 The `gitmoot repo` commands manage the **watched-repo registry**: one daemon
@@ -329,6 +330,14 @@ checkout is missing or is no longer a Git worktree, Gitmoot verifies the
 recorded primary checkout, repairs the registration, and reports the self-heal.
 Implicit registration from inside a linked task worktree pins the repo to its
 primary checkout; an existing valid linked checkout remains usable.
+
+`gitmoot repo collisions owner/repo` inspects at most the newest `--limit` open
+pull requests (default 25, maximum 100), compares each selected pair's current
+changed-filename sets, and prints one warning per non-empty intersection with
+both PR numbers and the sorted shared paths. It exits 1 when collisions exist, 0
+when every inspected pair is disjoint, and supports structured output with
+`--json`; a clean result is the iterable empty array `[]`. Rename history is not
+available, so a concurrent edit of a renamed path's old name may be missed.
 
 Use `daemon start` for the background daemon. Use `daemon run` only when the
 user explicitly wants a foreground process. Keep the default `--workers 1`
@@ -1499,6 +1508,20 @@ no code-level marker to migrate. The note and a `pending` wake outbox row commit
 atomically. With an opt-in `reply` rule, a daemon tick wakes the addressed role
 through its configured Herdr pane.
 
+`gitmoot org message send --to <role> --workflow <label> [--org-role
+<from-role>] [--repo <owner/repo>] [--json] "<message>"` records a durable
+sender-attributed heads-up between two distinct configured roles. The roles may
+message each other if and only if their non-empty `parent` values are equal.
+Repository scope does not grant this channel, and `owner` has no special case.
+The typed note
+`[org:message to=<to> from=<from> wf=<workflow>] <message>` and its addressed
+`reply:<role>` wake row commit atomically. The wake includes the exact
+`gitmoot workflow show-note <id>` retrieval command; that command renders the
+citable row's workflow, author, optional repository, timestamp, and body, or
+returns the row as JSON. Plain output marks bodies above 512 runes as truncated
+and points to `--json`; JSON preserves the full stored body. Messages create no
+directive, acknowledgment, completion, TTL, or nag obligation.
+
 `gitmoot org escalate resolve <escalation-note-id> [--by <role>] [--note
 <answer-note-id>] [--home <dir>]` appends a typed resolution marker to the same
 workflow journal. `--by` defaults to the escalation's target role, and `--note`
@@ -1679,6 +1702,7 @@ gitmoot workflow list
 gitmoot workflow show fable/dashboard-redesign --limit 100
 gitmoot workflow describe fable/dashboard-redesign "Coordinate and ship the dashboard redesign."
 gitmoot workflow note fable/dashboard-redesign "Implementation started." --author operator --status active
+gitmoot workflow show-note 42
 gitmoot workflow close fable/dashboard-redesign --reason "Shipped and verified."
 ```
 

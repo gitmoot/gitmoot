@@ -118,6 +118,8 @@ func runOrg(args []string, stdout, stderr io.Writer) int {
 		return runOrgEscalate(args[1:], stdout, stderr)
 	case "directive":
 		return runOrgDirective(args[1:], stdout, stderr)
+	case "message":
+		return runOrgMessage(args[1:], stdout, stderr)
 	case "await":
 		return runOrgAwait(args[1:], stdout, stderr)
 	case "events":
@@ -143,6 +145,7 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org seat add NAME --pane LABEL [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org escalate --to ROLE --workflow LABEL [--org-role ROLE] [--repo OWNER/REPO] [--json] [--home DIR] \"QUESTION\"")
+	fmt.Fprintln(w, "  gitmoot org message send --to ROLE --workflow LABEL [--org-role ROLE] [--repo OWNER/REPO] [--json] [--home DIR] \"MESSAGE\"")
 	fmt.Fprintln(w, "  gitmoot org escalate resolve NOTE_ID [--by ROLE] [--note ANSWER_NOTE_ID] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org directive send --to ROLE --workflow LABEL (--stdin | -F FILE | TEXT) [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org directive ack ID [--by ROLE] [--home DIR]")
@@ -1578,7 +1581,7 @@ func runOrgEscalate(args []string, stdout, stderr io.Writer) int {
 	fromFlag := fs.String("org-role", "", "acting organization role")
 	repo := fs.String("repo", "", "repository binding for the escalation note")
 	jsonOutput := fs.Bool("json", false, "print the escalation as JSON")
-	question, flagArgs, ok := orgEscalateQuestionAndFlags(args)
+	question, flagArgs, ok := orgAddressedTextAndFlags(args)
 	if !ok {
 		fmt.Fprintln(stderr, "org escalate requires exactly one question")
 		return 2
@@ -1858,7 +1861,7 @@ func orgEscalateResolveIDAndFlags(args []string) (string, []string, bool) {
 	return strings.TrimSpace(args[idIndex]), flagArgs, strings.TrimSpace(args[idIndex]) != ""
 }
 
-func orgEscalateQuestionAndFlags(args []string) (string, []string, bool) {
+func orgAddressedTextAndFlags(args []string) (string, []string, bool) {
 	needsValue := map[string]bool{"--home": true, "--to": true, "--workflow": true, "--org-role": true, "--repo": true}
 	for i := 0; i < len(args); i++ {
 		arg := args[i]

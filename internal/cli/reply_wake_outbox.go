@@ -18,7 +18,8 @@ const (
 	// replyWakeCoalescingWindow is long enough to absorb a burst of separate
 	// short-lived `org escalate` processes while keeping the daemon-tick wake
 	// latency small. Rolling windows start at the oldest pending item.
-	replyWakeCoalescingWindow = 5 * time.Second
+	replyWakeCoalescingWindow  = 5 * time.Second
+	replyWakeMaxCoalescedItems = 10
 	// A synchronous reply wake gets one 12s Herdr call plus bounded probes and
 	// its terminal store write. Thirty seconds leaves margin for a live owner;
 	// older attempted rows are crash residue whose delivery outcome is unknown.
@@ -112,7 +113,7 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store *db.Store, now ti
 			}
 			deadline := startedAt.Add(replyWakeCoalescingWindow)
 			end := start + 1
-			for end < len(items) {
+			for end < len(items) && end-start < replyWakeMaxCoalescedItems {
 				createdAt, err := time.Parse(time.RFC3339Nano, items[end].CreatedAt)
 				if err != nil {
 					return replyWakeOutboxHealth{}, fmt.Errorf("parse wake outbox created_at for row %d: %w", items[end].ID, err)
@@ -365,6 +366,15 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 			break
 		}
 		detail := fmt.Sprintf("%d new items, oldest id %s", len(batch), oldest.SourceID)
+		retrievalCommands := make([]string, 0, len(batch))
+		for _, entry := range batch {
+			if entry.SourceKind == db.WakeOutboxSourceWorkflowNote {
+				retrievalCommands = append(retrievalCommands, "gitmoot workflow show-note "+entry.SourceID)
+			}
+		}
+		if len(retrievalCommands) > 0 {
+			detail += "; inspect with " + strings.Join(retrievalCommands, "; ")
+		}
 		event = events.NewEvent(
 			events.EventOrgReply,
 			"org-reply:"+role,
