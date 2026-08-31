@@ -140,7 +140,7 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org chart [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org status [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org recycle ROLE --kind KIND --handoff NOTE [--pane ID] [--json] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot org seat add NAME --pane LABEL [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org seat add NAME --pane LABEL [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org escalate --to ROLE --workflow LABEL [--org-role ROLE] [--repo OWNER/REPO] [--json] [--home DIR] \"QUESTION\"")
 	fmt.Fprintln(w, "  gitmoot org escalate resolve NOTE_ID [--by ROLE] [--note ANSWER_NOTE_ID] [--home DIR]")
@@ -178,7 +178,7 @@ func runOrgSeat(args []string, stdout, stderr io.Writer) int {
 
 func printOrgSeatUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot org seat add NAME --pane LABEL [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org seat add NAME --pane LABEL [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--home DIR]")
 }
 
@@ -187,6 +187,9 @@ func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	paneFlag := fs.String("pane", "", "exact live Herdr pane label to claim")
+	parentFlag := fs.String("parent", "", "parent role (defaults to GITMOOT_ORG_ROLE, then owner)")
+	scopeFlag := fs.String("scope", "", "comma-separated repository scope (defaults to the acting role's scope)")
+	mergeRuleFlag := fs.String("merge-rule", "", "merge authority to grant explicitly: owner, self, or none")
 	nameArg, flagArgs := leadingOrgSeatName(args)
 	if err := fs.Parse(flagArgs); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -212,6 +215,12 @@ func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
 	paneLabel := strings.TrimSpace(*paneFlag)
 	if paneLabel == "" {
 		fmt.Fprintln(stderr, "org seat add requires --pane with an exact live Herdr pane label")
+		return 2
+	}
+	scopeSet := hasFlag(flagArgs, "scope")
+	requestedScope, err := parseOrgSeatScope(*scopeFlag, scopeSet)
+	if err != nil {
+		fmt.Fprintf(stderr, "org seat add: %v\n", err)
 		return 2
 	}
 
@@ -249,7 +258,13 @@ func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	desired, roleExists, err := orgSeatDesiredRole(cfg, snapshot, name, paneLabel, pane.PaneID)
+	desired, roleExists, err := orgSeatDesiredRole(cfg, snapshot, name, paneLabel, pane.PaneID, orgSeatRoleOptions{
+		ActingRole: strings.TrimSpace(os.Getenv("GITMOOT_ORG_ROLE")),
+		Parent:     *parentFlag,
+		Scope:      requestedScope,
+		ScopeSet:   scopeSet,
+		MergeRule:  *mergeRuleFlag,
+	})
 	if err != nil {
 		fmt.Fprintf(stderr, "org seat add: %v\n", err)
 		return 2
@@ -473,7 +488,15 @@ func orgSeatPaneByID(panes []org.LivePane, paneID string) (org.LivePane, bool) {
 	return org.LivePane{}, false
 }
 
-func orgSeatDesiredRole(cfg config.OrgConfig, snapshot org.Snapshot, name, paneLabel, paneID string) (config.OrgRole, bool, error) {
+type orgSeatRoleOptions struct {
+	ActingRole string
+	Parent     string
+	Scope      []string
+	ScopeSet   bool
+	MergeRule  string
+}
+
+func orgSeatDesiredRole(cfg config.OrgConfig, snapshot org.Snapshot, name, paneLabel, paneID string, options orgSeatRoleOptions) (config.OrgRole, bool, error) {
 	if current, ok := cfg.Role(name); ok {
 		if strings.TrimSpace(current.Pane) == "" {
 			current.Pane = paneLabel
@@ -494,14 +517,107 @@ func orgSeatDesiredRole(cfg config.OrgConfig, snapshot org.Snapshot, name, paneL
 		}
 		return config.OrgRole{Name: name, Scope: []string{"*"}, MergeRule: "owner", Pane: paneLabel}, false, nil
 	}
-	owner, ok := cfg.Role("owner")
-	if !ok {
-		return config.OrgRole{}, false, errors.New("add the owner seat before child seats")
+
+	actingRoleName := strings.ToLower(strings.TrimSpace(options.ActingRole))
+	if actingRoleName == "" {
+		actingRoleName = "owner"
 	}
+	actingRole, ok := cfg.Role(actingRoleName)
+	if !ok {
+		return config.OrgRole{}, false, fmt.Errorf("acting role %q is not declared", actingRoleName)
+	}
+
+	parentName := strings.ToLower(strings.TrimSpace(options.Parent))
+	if parentName == "" {
+		parentName = actingRoleName
+	}
+	if !validOrgSeatName(parentName) {
+		return config.OrgRole{}, false, fmt.Errorf("invalid parent role name %q", options.Parent)
+	}
+	if orgSeatParentCreatesCycle(cfg, name, parentName) {
+		return config.OrgRole{}, false, fmt.Errorf("parent role %q would create a cycle for %q", parentName, name)
+	}
+	parent, ok := cfg.Role(parentName)
+	if !ok {
+		return config.OrgRole{}, false, fmt.Errorf("parent role %q is not declared", parentName)
+	}
+
+	scope := append([]string(nil), actingRole.Scope...)
+	if options.ScopeSet {
+		scope = append([]string(nil), options.Scope...)
+	}
+	if !config.ScopeSubset(scope, scope) {
+		return config.OrgRole{}, false, fmt.Errorf("invalid --scope %q", strings.Join(scope, ","))
+	}
+	if !config.ScopeSubset(scope, actingRole.Scope) {
+		return config.OrgRole{}, false, fmt.Errorf("requested scope %q exceeds acting role %q scope", strings.Join(scope, ","), actingRoleName)
+	}
+	if !config.ScopeSubset(scope, parent.Scope) {
+		return config.OrgRole{}, false, fmt.Errorf("requested scope %q exceeds parent role %q scope", strings.Join(scope, ","), parentName)
+	}
+
+	mergeRule := strings.ToLower(strings.TrimSpace(options.MergeRule))
+	if mergeRule != "" && mergeRule != "owner" && mergeRule != "self" && mergeRule != "none" {
+		return config.OrgRole{}, false, fmt.Errorf("invalid --merge-rule %q; use owner, self, or none", options.MergeRule)
+	}
+	if !orgSeatMergeRuleAllows(actingRole.MergeRule, mergeRule) {
+		return config.OrgRole{}, false, fmt.Errorf("merge rule %q exceeds acting role %q authority", mergeRule, actingRoleName)
+	}
+
 	return config.OrgRole{
-		Name: name, Parent: owner.Name, Scope: append([]string(nil), owner.Scope...),
-		MergeRule: "owner", Pane: paneLabel,
+		Name: name, Parent: parentName, Scope: scope,
+		MergeRule: mergeRule, Pane: paneLabel,
 	}, false, nil
+}
+
+func parseOrgSeatScope(raw string, set bool) ([]string, error) {
+	if !set {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	scope := make([]string, 0, len(parts))
+	seen := make(map[string]bool, len(parts))
+	for _, part := range parts {
+		entry := strings.ToLower(strings.TrimSpace(part))
+		if entry == "" {
+			return nil, errors.New("--scope must contain one or more comma-separated repository scopes")
+		}
+		if seen[entry] {
+			return nil, fmt.Errorf("--scope contains duplicate %q", entry)
+		}
+		seen[entry] = true
+		scope = append(scope, entry)
+	}
+	return scope, nil
+}
+
+func orgSeatParentCreatesCycle(cfg config.OrgConfig, name, parent string) bool {
+	seen := map[string]bool{}
+	for current := parent; current != ""; {
+		if current == name || seen[current] {
+			return true
+		}
+		seen[current] = true
+		role, ok := cfg.Role(current)
+		if !ok {
+			return false
+		}
+		current = role.Parent
+	}
+	return false
+}
+
+func orgSeatMergeRuleAllows(granter, requested string) bool {
+	switch strings.ToLower(strings.TrimSpace(requested)) {
+	case "", "none":
+		return true
+	case "self":
+		return granter == "self" || granter == "owner"
+	case "owner":
+		return granter == "owner"
+	default:
+		return false
+	}
 }
 
 func orgSeatDefaultRules(role string) []db.EventRule {
@@ -646,7 +762,7 @@ func runOrgValidateOrShow(args []string, stdout, stderr io.Writer) int {
 		return runOrgValidateReality(context.Background(), paths, cfg, stdout, stderr)
 	}
 	for _, role := range loadOrgRoster(context.Background(), nil, cfg).Members() {
-		fmt.Fprintf(stdout, "%s\tparent=%s\tscope=%s\tmerge_rule=%s\n", role.Name, role.Parent, strings.Join(role.Scope, ","), firstNonEmpty(role.MergeRule, "owner"))
+		fmt.Fprintf(stdout, "%s\tparent=%s\tscope=%s\tmerge_rule=%s\n", role.Name, role.Parent, strings.Join(role.Scope, ","), firstNonEmpty(role.MergeRule, "none"))
 	}
 	return 0
 }
