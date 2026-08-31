@@ -753,12 +753,20 @@ interrupted removal leaves a `.ttl-reclaiming-*` sibling; the next pass restores
 it (`delegation_worktree_quarantine_restored`) and re-proves it from scratch
 rather than treating the absent original path as a completed removal.
 
-A retained clone records **why**: the `delegation_worktree_retained_unpublished`
-job event names the offending commit, and the cleanup obligation carries reason
-`unpublished_commits` until the state changes. A squash merge publishes the
-content under a new commit while the branch commits stay clone-only, so a
-squash-merged fix clone is retained by design rather than silently retried
-forever.
+Every retention records **why**, once per reason, so an inert deployment is
+visible instead of silent. `delegation_worktree_retained_unpublished` names the
+offending commit and sets cleanup-obligation reason `unpublished_commits`; a
+squash merge publishes the content under a new commit while the branch commits
+stay clone-only, so a squash-merged fix clone is retained by design rather than
+silently retried forever. `delegation_worktree_retained_dirty` covers the common
+case of a clone still holding tracked, untracked or ignored content — the
+pristine check includes ignored files, so leftover build output keeps the clone.
+`delegation_worktree_liveness_unknown` fires when the process table cannot be
+read, which is the state that makes the whole pass inert.
+
+`gitmoot doctor` and `/api/health` also count `.ttl-reclaiming-*` siblings of fix
+clones, so an interrupted removal is visible on the host rather than only in the
+job log.
 
 An already-absent managed fix path completes the same bookkeeping instead of
 consuming retries or entering quarantine. `delegation_worktree_reclaimed_ttl`

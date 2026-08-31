@@ -73,14 +73,22 @@ func (e Engine) ownerPIDLive() func(int64) bool {
 }
 
 // worktreeLiveness reports both the cwd result and whether the process table
-// was readable. New destructive paths require known=true; older cleanup paths
-// retain their best-effort boolean seam.
+// was readable. New destructive paths require known=true.
+//
+// The older boolean seam CANNOT supply certainty: it returns one bit and has no
+// way to say "the process table was unreadable". A caller that wires it must not
+// silently convert "proof required" back into best-effort, so a live answer is
+// honoured (it can only retain) while a not-live answer is reported as
+// INCONCLUSIVE and the strict scan decides.
 func (e Engine) worktreeLiveness(path string) (live bool, known bool) {
 	if e.WorktreeLiveness != nil {
 		return e.WorktreeLiveness(path)
 	}
 	if e.WorktreeHasLiveProcess != nil {
-		return e.WorktreeHasLiveProcess(path), true
+		if e.WorktreeHasLiveProcess(path) {
+			return true, true
+		}
+		return strictWorktreeLiveness(path)
 	}
 	return strictWorktreeLiveness(path)
 }

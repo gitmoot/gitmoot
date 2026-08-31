@@ -1796,7 +1796,7 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 		return false, fmt.Errorf("prove aged terminal fix worktree clean: %w", err)
 	}
 	if !clean {
-		return false, nil
+		return false, e.recordFixCloneRetainedDirty(ctx, jobID, path)
 	}
 	// The clone's own `origin` is writable by whatever ran inside it, so it is not
 	// evidence: the registered repository checkout supplies the trusted URL.
@@ -1851,7 +1851,10 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 		return restore(fmt.Errorf("recheck quarantined fix clone clean: %w", err))
 	}
 	if !clean {
-		return restore(nil)
+		if _, restoreErr := restore(nil); restoreErr != nil {
+			return false, restoreErr
+		}
+		return false, e.recordFixCloneRetainedDirty(ctx, jobID, path)
 	}
 	unpublished, err = manager.CloneOnlyCommit(ctx, quarantine)
 	if err != nil {
@@ -1866,52 +1869,60 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 	if err := os.RemoveAll(quarantine); err != nil {
 		return false, fmt.Errorf("remove quarantined fix clone %s: %w", quarantine, err)
 	}
+	// A concurrent actor may have restored this clone to its original path while we
+	// held the quarantine name. Completing the reclaim then would record a removal
+	// for a clone that is alive again.
+	if present, err := pathPresent(path); err != nil {
+		return false, fmt.Errorf("recheck aged terminal fix worktree %s after removal: %w", path, err)
+	} else if present {
+		return false, nil
+	}
 	return e.completeAgedTerminalFixWorktreeReclaim(ctx, jobID, path)
 }
 
 func (e Engine) retainFixCloneWithUnpublishedCommits(ctx context.Context, jobID, path, sha string) error {
-	opCtx := context.WithoutCancel(ctx)
-	// Dedupe on the EVENT LOG, not on the obligation reason: the event and the
-	// reason are separate writes, so a crash between them would otherwise
-	// re-announce forever. The log is the record that already exists.
-	events, err := e.Store.ListJobEvents(opCtx, jobID)
-	if err != nil {
+	if err := e.recordFixCloneRetention(ctx, jobID, "delegation_worktree_retained_unpublished",
+		fmt.Sprintf("fix clone %s retained after TTL: commit %s is in no trusted remote ref", path, sha)); err != nil {
 		return err
 	}
-	message := fmt.Sprintf("fix clone %s retained after TTL: commit %s is in no trusted remote ref", path, sha)
-	for _, event := range events {
-		if event.Kind == "delegation_worktree_retained_unpublished" && event.Message == message {
-			return e.deferDelegationCleanupObligation(opCtx, jobID, path, db.CleanupReasonUnpublishedCommits)
-		}
-	}
-	if err := e.Store.AddJobEvent(opCtx, db.JobEvent{
-		JobID: jobID, Kind: "delegation_worktree_retained_unpublished", Message: message,
-	}); err != nil {
-		return err
-	}
-	return e.deferDelegationCleanupObligation(opCtx, jobID, path, db.CleanupReasonUnpublishedCommits)
+	return e.deferDelegationCleanupObligation(context.WithoutCancel(ctx), jobID, path, db.CleanupReasonUnpublishedCommits)
 }
 
 // recordFixCloneLivenessUnknown makes an inert deployment visible. A process
 // table that cannot be read (a non-root daemon seeing EACCES on another user's
 // process, or a host with no /proc at all) retains every clone forever, and
 // without this event that is indistinguishable from clones that are genuinely
-// still in use. Deduped on the event log so the five-minute pass records it once.
+// still in use.
 func (e Engine) recordFixCloneLivenessUnknown(ctx context.Context, jobID, path string) error {
+	return e.recordFixCloneRetention(ctx, jobID, "delegation_worktree_liveness_unknown",
+		fmt.Sprintf("fix clone %s retained after TTL: process liveness could not be proven", path))
+}
+
+// recordFixCloneRetainedDirty records the retention reason most clones will
+// actually hit: the pristine check includes ignored files, so any build output
+// left behind keeps the clone. That branch used to be a silent keep, which is the
+// same defect as an unrecorded inconclusive liveness probe.
+func (e Engine) recordFixCloneRetainedDirty(ctx context.Context, jobID, path string) error {
+	return e.recordFixCloneRetention(ctx, jobID, "delegation_worktree_retained_dirty",
+		fmt.Sprintf("fix clone %s retained after TTL: working tree holds tracked, untracked or ignored content", path))
+}
+
+// recordFixCloneRetention appends a retention event once. It dedupes on the event
+// log rather than on the cleanup obligation, because the obligation reason is
+// rewritten by the daemon's generic per-pass deferral and because a crash between
+// two writes must not re-announce on the next five-minute pass.
+func (e Engine) recordFixCloneRetention(ctx context.Context, jobID, kind, message string) error {
 	opCtx := context.WithoutCancel(ctx)
 	events, err := e.Store.ListJobEvents(opCtx, jobID)
 	if err != nil {
 		return err
 	}
-	message := fmt.Sprintf("fix clone %s retained after TTL: process liveness could not be proven", path)
 	for _, event := range events {
-		if event.Kind == "delegation_worktree_liveness_unknown" && event.Message == message {
+		if event.Kind == kind && event.Message == message {
 			return nil
 		}
 	}
-	return e.Store.AddJobEvent(opCtx, db.JobEvent{
-		JobID: jobID, Kind: "delegation_worktree_liveness_unknown", Message: message,
-	})
+	return e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: kind, Message: message})
 }
 
 // ReclaimAgedTerminalDelegationWorktreeOutcome is the reporting form used by
@@ -1975,6 +1986,20 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 		return false, nil
 	}
 	if fix {
+		// Two reclaimers on one host (the documented `gitmoot daemon restart`
+		// double-daemon window) would otherwise interleave inside the proof and the
+		// rename. The clone is standalone, but this is the same lock every other
+		// reclaim path takes, so it serialises them against each other.
+		lockCtx := context.WithoutCancel(ctx)
+		releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(lockCtx, e.Store, e.DelegationCheckout, "worktree-ttl-reclaim:"+jobID, time.Now().UTC())
+		if err != nil {
+			return false, fmt.Errorf("lock checkout for TTL fix clone reclaim: %w", err)
+		}
+		defer func() {
+			if releaseCheckoutLock != nil {
+				_ = releaseCheckoutLock(context.Background())
+			}
+		}()
 		return e.reclaimAgedTerminalFixClone(ctx, jobID, payload, path)
 	}
 	manager, ok := e.DelegationWorktrees.(ReadOnlyWorktreeManager)

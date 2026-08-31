@@ -564,11 +564,16 @@ quarantined path, and a writer holding only an open file descriptor stays
 undetectable. A failed re-proof renames the clone back. An interrupted removal is
 restored by the next pass (`delegation_worktree_quarantine_restored`) and
 re-proven, and the scheduler does not treat the absent original path as a
-completed removal while such a sibling survives. A retained clone records the
-`delegation_worktree_retained_unpublished` event and carries cleanup-obligation
-reason `unpublished_commits`; squash-merged fix branches land here by design,
-because a squash publishes the content and not the commits. An already-absent
-managed fix path completes cleanup
+completed removal while such a sibling survives, and `gitmoot doctor` counts
+those siblings. Every retention records its reason once:
+`delegation_worktree_retained_unpublished` (with obligation reason
+`unpublished_commits`; squash-merged branches land here by design, because a
+squash publishes the content and not the commits),
+`delegation_worktree_retained_dirty` (tracked, untracked or ignored content —
+the pristine check includes ignored files), and
+`delegation_worktree_liveness_unknown` (the process table could not be read,
+which is what makes the pass inert).
+An already-absent managed fix path completes cleanup
 bookkeeping instead of consuming retries or entering quarantine. A successful
 removal or already-absent reconciliation records
 `delegation_worktree_reclaimed_ttl`. Set the TTL to `"0"` to disable this pass.

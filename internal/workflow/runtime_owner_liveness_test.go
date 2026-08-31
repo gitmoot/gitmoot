@@ -128,3 +128,28 @@ func TestWorktreeLiveness(t *testing.T) {
 		}
 	})
 }
+
+// The older boolean seam carries one bit and cannot report an unreadable process
+// table. Wiring it must not silently turn "proof required" back into best-effort.
+func TestWorktreeLivenessLegacySeamCannotClaimCertainty(t *testing.T) {
+	worktree := t.TempDir()
+	engine := Engine{WorktreeHasLiveProcess: func(string) bool { return true }}
+	if live, known := engine.worktreeLiveness(worktree); !live || !known {
+		t.Fatalf("legacy live answer = (%v, %v), want (true, true)", live, known)
+	}
+
+	// A not-live answer from that seam is inconclusive on its own, so the strict
+	// scan decides and its certainty is what the caller sees.
+	strict := Engine{WorktreeHasLiveProcess: func(string) bool { return false }}
+	live, known := strict.worktreeLiveness(worktree)
+	if live {
+		t.Fatalf("legacy not-live answer reported live=%v", live)
+	}
+	hostLive, hostKnown := WorktreeLiveness(worktree)
+	if hostLive {
+		t.Skip("host process table reports a live process in the temp worktree")
+	}
+	if known != hostKnown {
+		t.Fatalf("legacy seam certainty = %v, want the strict scan's %v", known, hostKnown)
+	}
+}

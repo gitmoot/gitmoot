@@ -1893,6 +1893,71 @@ func TestFixCloneQuarantinesFindsPathsWithGlobMetacharacters(t *testing.T) {
 	}
 }
 
+// The pristine check includes ignored files, so a clone holding build output is
+// the retention most hosts will actually hit. It must record why, like the other
+// retention branches: a silent keep is indistinguishable from a live worker.
+func TestEngineReclaimAgedFixCloneRecordsDirtyRetention(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	const jobID = "fix-dirty-retention"
+	path, err := FixWorktreePath(home, "owner/repo", jobID)
+	if err != nil {
+		t.Fatalf("FixWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll fix worktree: %v", err)
+	}
+	payload, err := marshalPayload(JobPayload{
+		Repo:         "owner/repo",
+		Branch:       "feature/fix",
+		WorktreePath: path,
+		FixWorktree:  true,
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID:      jobID,
+		Agent:   "fixer",
+		Type:    "implement",
+		State:   string(JobSucceeded),
+		Repo:    "owner/repo",
+		Payload: payload,
+	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+	engine := testEngine(store)
+	engine.Home = home
+	engine.DelegationWorktrees = &fakeWorktreeManager{cleanSet: true, clean: false}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
+		if err != nil {
+			t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
+		}
+		if reclaimed {
+			t.Fatal("dirty fix clone was reclaimed")
+		}
+	}
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	dirty := 0
+	for _, event := range events {
+		if event.Kind == "delegation_worktree_retained_dirty" {
+			dirty++
+		}
+	}
+	if dirty != 1 {
+		t.Fatalf("dirty retention events = %d, want exactly 1: %+v", dirty, events)
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("dirty fix clone was removed: %v", statErr)
+	}
+}
+
 // The ordinary (non-TTL) fix-clone cleanup runs on every terminal advance and on
 // the skipped-cleanup pass, so it must make the same inference as the TTL pass:
 // an absent path is not a completed removal while a quarantine of it survives.

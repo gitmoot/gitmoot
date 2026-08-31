@@ -533,13 +533,14 @@ is never trusted, replace objects are ignored, and a grafts file makes the clone
 unprovable. The proven clone is renamed to `<path>.ttl-reclaiming-<random>`,
 re-proven there, and only then deleted; an interrupted removal is restored by the
 next pass (`delegation_worktree_quarantine_restored`) and no pass treats the
-absent original path as a completed removal while such a sibling exists. A clone
-that still holds unpublished commits records
-`delegation_worktree_retained_unpublished` and obligation reason
-`unpublished_commits` — the normal outcome for a squash-merged branch, whose
-content is published while its commits are not. An inconclusive process-liveness
-probe records `delegation_worktree_liveness_unknown` so a host where the process
-table cannot be read is visibly inert rather than silently retaining everything.
+absent original path as a completed removal while such a sibling exists, and
+`gitmoot doctor` counts those siblings. Every retention records its reason once:
+`delegation_worktree_retained_unpublished` with obligation reason
+`unpublished_commits` (the normal outcome for a squash-merged branch, whose
+content is published while its commits are not),
+`delegation_worktree_retained_dirty` when the tree still holds tracked, untracked
+or ignored content, and `delegation_worktree_liveness_unknown` when the process
+table cannot be read — the state that makes the whole pass inert.
 
 Task-owned worktrees have their own pass, driven by terminal task lifecycle state
 rather than age, and bounded at eight safety proofs per tick with a per-repo
