@@ -134,6 +134,12 @@ func (e Engine) mailbox() Mailbox {
 	mb.RuntimeDefaultEffort = e.RuntimeDefaultEffort
 	mb.routerContextEnabled = e.RouterContextEnabled
 	mb.resultCheckMode = normalizeResultCheckMode(e.ResultCheckMode)
+	// Session review jobs close through the Mailbox and never run AdvanceJob, so
+	// they need the same repository policy the advancement path uses in order to
+	// record the folded outcome (#1685-adjacent): without it the merge gate folds
+	// their sub-threshold verdict into an approval while gitmoot proof, which keys
+	// its claim on the durable event, renders "0 approved".
+	mb.reviewBlockingSeverity = e.reviewBlockingSeverity
 	mb.produceCheckDir = e.ProduceCheckDir
 	// Wire the off-by-default memory hooks (#626). When e.Memory is nil (every
 	// non-enrolled path) both hooks stay nil, so Run's prompt assembly and terminal

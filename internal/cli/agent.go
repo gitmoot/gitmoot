@@ -2620,9 +2620,14 @@ func withStoreAndPaths(home string, fn func(config.Paths, *db.Store) error) erro
 	// transaction, so the store — not the engine — renders its wake detail. Install
 	// the same repository policy applyReviewPolicy gives the engine, or that one
 	// wake channel would report a raw verdict the engine has already folded.
-	reviewPolicy := loadReviewConfig(home)
+	//
+	// Resolved PER CALL, not snapshotted here: applyReviewPolicy's closure re-reads
+	// [review] on every engine tick, so a config captured once at daemon start
+	// would drift out of agreement with the engine after any live edit — the wake
+	// would report a raw verdict the engine had folded, which is the exact
+	// disagreement this resolver exists to remove.
 	store.SetReviewBlockingSeverity(func(repo string) string {
-		return reviewPolicy.For(repo).BlockingSeverity
+		return loadReviewConfig(home).For(repo).BlockingSeverity
 	})
 	defer store.Close()
 	return fn(paths, store)

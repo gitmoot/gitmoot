@@ -136,6 +136,11 @@ type Mailbox struct {
 	// foreground path — is byte-identical. The daemon resolves the real mode
 	// (default warn) from config and wires it through Engine.ResultCheckMode.
 	resultCheckMode ResultCheckMode
+	// reviewBlockingSeverity resolves the repository review policy for session
+	// review jobs, which close through CloseExternalJobWithUsage and never reach
+	// AdvanceJob. nil fails closed to block-all, under which the effective
+	// decision equals the raw one and no outcome event is owed.
+	reviewBlockingSeverity func(repo string) string
 	// produceCheckDir is the resolved stage checkout used as cwd for trusted
 	// operator checks when the payload has no explicit disposable worktree.
 	produceCheckDir string

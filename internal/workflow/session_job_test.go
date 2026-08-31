@@ -9,6 +9,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/evidence"
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 )
 
 // TestOpenExternalJobCreatesRunningNoQueue proves `job open` (clock-in) creates a
@@ -192,6 +193,70 @@ func TestCloseExternalJobRequiresSeverityForChangesRequestedReview(t *testing.T)
 	}
 	if payload.Result == nil || payload.Result.Severity != "P1" {
 		t.Fatalf("payload result = %+v, want severity P1", payload.Result)
+	}
+}
+
+// A session review job closes here and never runs AdvanceJob, so the durable
+// review_approved_with_notes event that path writes has to be written here too.
+// The merge gate folds a sub-threshold verdict into an approval either way, while
+// proof/project.go keys its review.approved claim on this event — so without it
+// the two surfaces disagree about the same verdict and `gitmoot proof` renders
+// "0 approved" for a PR the gate will merge.
+func TestCloseExternalJobRecordsApprovedWithNotesForSubthresholdReview(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+
+	if _, err := engine.OpenExternalJob(ctx, JobRequest{
+		ID: "session-review-notes", Agent: "lead", Action: "review",
+		Repo: "gitmoot/gitmoot", PullRequest: 8,
+	}); err != nil {
+		t.Fatalf("OpenExternalJob returned error: %v", err)
+	}
+	if _, err := engine.CloseExternalJob(ctx, "session-review-notes", AgentResult{
+		Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "non-blocking polish",
+	}, 0, "", ""); err != nil {
+		t.Fatalf("CloseExternalJob returned error: %v", err)
+	}
+	if got := countJobEvents(t, store, "session-review-notes", ReviewApprovedWithNotesEventKind); got != 1 {
+		t.Fatalf("%s events = %d, want 1", ReviewApprovedWithNotesEventKind, got)
+	}
+	// The raw verdict is never rewritten; only the outcome is recorded alongside.
+	stored := mustJob(t, store, "session-review-notes")
+	payload, err := unmarshalPayload(stored.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload returned error: %v", err)
+	}
+	if payload.Result == nil || payload.Result.Decision != "changes_requested" {
+		t.Fatalf("stored decision = %+v, want the raw changes_requested preserved", payload.Result)
+	}
+}
+
+// AT-THRESHOLD CONTROL: a genuinely blocking session review owes no outcome
+// event. Without this the test above would pass on a mutant that writes the
+// event unconditionally.
+func TestCloseExternalJobRecordsNoOutcomeForBlockingSessionReview(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P2 }
+
+	if _, err := engine.OpenExternalJob(ctx, JobRequest{
+		ID: "session-review-blocking", Agent: "lead", Action: "review",
+		Repo: "gitmoot/gitmoot", PullRequest: 8,
+	}); err != nil {
+		t.Fatalf("OpenExternalJob returned error: %v", err)
+	}
+	if _, err := engine.CloseExternalJob(ctx, "session-review-blocking", AgentResult{
+		Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "blocking",
+	}, 0, "", ""); err != nil {
+		t.Fatalf("CloseExternalJob returned error: %v", err)
+	}
+	if got := countJobEvents(t, store, "session-review-blocking", ReviewApprovedWithNotesEventKind); got != 0 {
+		t.Fatalf("%s events = %d, want 0 for an at-threshold blocking review", ReviewApprovedWithNotesEventKind, got)
 	}
 }
 
