@@ -293,6 +293,9 @@ type JobRequest struct {
 	// the engine never persists a refreshed session ref for an overridden job.
 	RuntimeOverride    string
 	RuntimeOverrideRef string
+	// RuntimeConfigDir records the non-secret runtime state directory selected at
+	// dispatch so a detached worker uses the same credential store.
+	RuntimeConfigDir string
 	// EffectiveRuntime may be set when the caller intends to execute an already-
 	// resolved runtime inline. Background callers leave it empty; a foreground
 	// job later deferred to a worker is re-recorded at actual execution time.
@@ -462,6 +465,7 @@ type JobPayload struct {
 	WorkflowID         string `json:"workflow_id,omitempty"`
 	RuntimeOverride    string `json:"runtime_override,omitempty"`
 	RuntimeOverrideRef string `json:"runtime_override_ref,omitempty"`
+	RuntimeConfigDir   string `json:"runtime_config_dir,omitempty"`
 	// ExecBackend is the per-job execution-backend override (#1536 P1): when
 	// set it wins over the [remote_exec].backend config value at dispatch.
 	// "local" (the only implemented backend) is a byte-for-byte passthrough;
@@ -691,6 +695,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		WorkflowID:             strings.TrimSpace(request.WorkflowID),
 		RuntimeOverride:        strings.TrimSpace(request.RuntimeOverride),
 		RuntimeOverrideRef:     strings.TrimSpace(request.RuntimeOverrideRef),
+		RuntimeConfigDir:       strings.TrimSpace(request.RuntimeConfigDir),
 		EffectiveRuntime:       strings.TrimSpace(request.EffectiveRuntime),
 		ShellEnv:               append([]string(nil), request.ShellEnv...),
 		PipelineInputEnv:       append([]string(nil), request.PipelineInputEnv...),

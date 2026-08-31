@@ -23,6 +23,16 @@ const MinimumABI = 3
 // replaces it with argv. Landlock restrictions survive execve, so the runtime
 // and every descendant inherit the same filesystem confinement.
 func Exec(readPaths, readFiles, writePaths []string, argv []string) error {
+	return execSandbox(readPaths, readFiles, writePaths, argv, false)
+}
+
+// ExecReadOnlyWorkdir applies the same strict ruleset as Exec without granting
+// the current working directory implicit write access.
+func ExecReadOnlyWorkdir(readPaths, readFiles, writePaths []string, argv []string) error {
+	return execSandbox(readPaths, readFiles, writePaths, argv, true)
+}
+
+func execSandbox(readPaths, readFiles, writePaths []string, argv []string, readOnlyWorkdir bool) error {
 	if len(argv) == 0 || strings.TrimSpace(argv[0]) == "" {
 		return errors.New("sandbox target command is required")
 	}
@@ -42,7 +52,7 @@ func Exec(readPaths, readFiles, writePaths []string, argv []string) error {
 	if err != nil {
 		return fmt.Errorf("resolve sandbox workdir: %w", err)
 	}
-	writable, err := writableRoots(writePaths, workdir)
+	writable, err := writableRoots(writePaths, workdir, !readOnlyWorkdir)
 	if err != nil {
 		return err
 	}
@@ -172,9 +182,11 @@ func readableRoots(paths []string, executable string) ([]string, error) {
 	return roots, nil
 }
 
-func writableRoots(paths []string, workdir string) ([]string, error) {
+func writableRoots(paths []string, workdir string, includeImplicitRoots bool) ([]string, error) {
 	candidates := append([]string{}, paths...)
-	candidates = append(candidates, workdir, os.TempDir(), "/tmp")
+	if includeImplicitRoots {
+		candidates = append(candidates, workdir, os.TempDir(), "/tmp")
+	}
 	seen := make(map[string]struct{}, len(candidates))
 	roots := make([]string, 0, len(candidates))
 	for _, path := range candidates {

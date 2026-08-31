@@ -80,6 +80,54 @@ func TestSandboxExecKernelE2E(t *testing.T) {
 	}
 }
 
+func TestSandboxExecReadOnlyWorkdirE2E(t *testing.T) {
+	requireLandlockABI(t)
+	gitmoot := buildGitmootBinary(t)
+	base := t.TempDir()
+	workdir := filepath.Join(base, "review-worktree")
+	cacheDir := filepath.Join(base, "review-cache")
+	for _, dir := range []string{workdir, cacheDir, filepath.Join(cacheDir, "tmp")} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source := filepath.Join(workdir, "source.txt")
+	if err := os.WriteFile(source, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workdir, "go.mod"), []byte("module reviewtest\n\ngo 1.22\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workdir, "review_test.go"), []byte("package reviewtest\n\nimport \"testing\"\n\nfunc TestReviewerCanRunTests(t *testing.T) {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cacheArtifact := filepath.Join(cacheDir, "test-result")
+	script := `set -eu
+go test -count=1 .
+printf passed > "$1"
+if { printf mutated > "$2"; } 2>/dev/null; then exit 41; fi
+`
+	command := exec.Command(gitmoot, "sandbox-exec", "--read-only-workdir", "--write", cacheDir, "--", "/bin/sh", "-c", script, "gitmoot-test", cacheArtifact, source)
+	command.Dir = workdir
+	command.Env = append(os.Environ(),
+		"GOTOOLCHAIN=local",
+		"GOCACHE="+filepath.Join(cacheDir, "go-build"),
+		"GOMODCACHE="+filepath.Join(cacheDir, "go-mod"),
+		"GOPATH="+filepath.Join(cacheDir, "gopath"),
+		"TMPDIR="+filepath.Join(cacheDir, "tmp"),
+	)
+	if combined, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("executable read-only review sandbox failed: %v\n%s", err, combined)
+	}
+	if data, err := os.ReadFile(cacheArtifact); err != nil || string(data) != "passed" {
+		t.Fatalf("cache artifact = %q, err=%v", data, err)
+	}
+	if data, err := os.ReadFile(source); err != nil || string(data) != "unchanged" {
+		t.Fatalf("review worktree changed to %q, err=%v", data, err)
+	}
+}
+
 func TestSandboxExecReadOnlyInputE2E(t *testing.T) {
 	requireLandlockABI(t)
 	gitmoot := buildGitmootBinary(t)

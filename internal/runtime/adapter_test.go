@@ -382,6 +382,20 @@ func TestCodexDeliverChatSeatSandbox(t *testing.T) {
 	runner.want(t, 0, "codex", "exec", "--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "--json", "resume", "--last", "--", "converse")
 }
 
+func TestCodexDeliverReviewSeatCanRunToolsAndNetwork(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "ok"}}}
+	adapter := CodexAdapter{Runner: runner}
+	agent := Agent{
+		Name: "reviewer", Role: "reviewer", Runtime: CodexRuntime, RepoScope: "gitmoot/gitmoot",
+		RuntimeRef: "last", AutonomyPolicy: AutonomyPolicyReadOnly, ReviewSeat: true,
+		WritablePaths: []string{"/cache/tools"},
+	}
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	runner.want(t, 0, "codex", "exec", "--sandbox", "workspace-write", "--add-dir", "/cache/tools", "-c", "sandbox_workspace_write.network_access=true", "--json", "resume", "--last", "--", "review")
+}
+
 // TestCodexDeliverNonSeatSandboxUnchanged proves a NON-seat read-only job keeps
 // the exact pre-#732 read-only sandbox args (byte-identical).
 func TestCodexDeliverNonSeatSandboxUnchanged(t *testing.T) {
@@ -1190,6 +1204,20 @@ func TestClaudeDeliverCommandAppliesAutonomyPolicy(t *testing.T) {
 			runner.want(t, 0, "claude", "--permission-mode", tt.mode, "--resume", "550e8400-e29b-41d4-a716-446655440002", "-p", "--output-format", "json", "--", "review")
 		})
 	}
+}
+
+func TestClaudeDeliverReviewSeatCanRunToolsAndNetwork(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"result":"done"}`}}}
+	adapter := ClaudeAdapter{Runner: runner}
+	agent := Agent{
+		Name: "reviewer", Role: "reviewer", Runtime: ClaudeRuntime,
+		RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "gitmoot/gitmoot",
+		AutonomyPolicy: AutonomyPolicyReadOnly, ReviewSeat: true,
+	}
+	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err != nil {
+		t.Fatalf("Deliver returned error: %v", err)
+	}
+	runner.want(t, 0, "claude", "--restricted", "--permission-mode", "dontAsk", "--allowedTools", "Bash,WebFetch,WebSearch", "--resume", "550e8400-e29b-41d4-a716-446655440002", "-p", "--output-format", "json", "--", "review")
 }
 
 func TestClaudeDeliverFallsBackToText(t *testing.T) {

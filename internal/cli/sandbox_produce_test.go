@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -214,4 +215,113 @@ func TestProduceRunnerComposesUnderTeeAndScopesByAction(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(codex, codexBase) {
 		t.Fatalf("Codex adapter changed: %T %+v, err=%v", codex, codex, err)
 	}
+}
+
+func TestWrapReviewSandboxAdapterPinsReadOnlyCheckoutAndRuntimeState(t *testing.T) {
+	configHome := t.TempDir()
+	checkout := filepath.Join(t.TempDir(), "review-worktree")
+	stateDir := filepath.Join(t.TempDir(), "claude-state")
+	if err := os.MkdirAll(checkout, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	agent := runtime.Agent{
+		Runtime:          runtime.ClaudeRuntime,
+		AutonomyPolicy:   runtime.AutonomyPolicyReadOnly,
+		ReviewSeat:       true,
+		RuntimeConfigDir: stateDir,
+	}
+	wrapped, err := wrapReviewSandboxAdapter(configHome, agent, checkout, runtime.ClaudeAdapter{Runner: subprocess.GroupRunner{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, ok := wrapped.(runtime.ClaudeAdapter)
+	if !ok {
+		t.Fatalf("wrapped adapter = %T, want runtime.ClaudeAdapter", wrapped)
+	}
+	runner, ok := adapter.Runner.(subprocess.WrappingRunner)
+	if !ok {
+		t.Fatalf("wrapped runner = %T, want subprocess.WrappingRunner", adapter.Runner)
+	}
+	if !runner.ReadOnlyWorkdir {
+		t.Fatal("review runner ReadOnlyWorkdir = false")
+	}
+	if !containsPath(runner.WritablePaths, stateDir) {
+		t.Fatalf("review writes %v do not include selected runtime state %q", runner.WritablePaths, stateDir)
+	}
+	if !containsEnv(runner.Env, "CLAUDE_CONFIG_DIR="+stateDir) || !containsEnvPrefix(runner.Env, "GOCACHE=") || !containsEnvPrefix(runner.Env, "TMPDIR=") {
+		t.Fatalf("review env %v lacks runtime state, Go cache, or temp grants", runner.Env)
+	}
+}
+
+func TestWrapReviewSandboxAdapterRejectsWritableRuntimeStateInsideCheckout(t *testing.T) {
+	checkout := t.TempDir()
+	stateDir := filepath.Join(checkout, ".claude")
+	agent := runtime.Agent{
+		Runtime:          runtime.ClaudeRuntime,
+		ReviewSeat:       true,
+		RuntimeConfigDir: stateDir,
+	}
+	_, err := wrapReviewSandboxAdapter(t.TempDir(), agent, checkout, runtime.ClaudeAdapter{})
+	if err == nil || !strings.Contains(err.Error(), "overlaps read-only worktree") {
+		t.Fatalf("overlap error = %v", err)
+	}
+	if _, statErr := os.Stat(stateDir); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("unsafe state directory was created before refusal: %v", statErr)
+	}
+}
+
+func TestApplyReviewSeatRequiresOwnedReviewWorktree(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		action     string
+		readOnly   bool
+		wantReview bool
+		wantConfig string
+	}{
+		{name: "review worktree", action: "review", readOnly: true, wantReview: true, wantConfig: "/profiles/reviewer"},
+		{name: "review shared checkout", action: "review", readOnly: false},
+		{name: "ask worktree", action: "ask", readOnly: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			agent := runtime.Agent{}
+			applyReviewSeat(test.action, test.readOnly, " /profiles/reviewer ", &agent)
+			if agent.ReviewSeat != test.wantReview || agent.RuntimeConfigDir != test.wantConfig {
+				t.Fatalf("review marker = %v config = %q, want %v %q", agent.ReviewSeat, agent.RuntimeConfigDir, test.wantReview, test.wantConfig)
+			}
+		})
+	}
+}
+
+func TestSelectedRuntimeConfigDirCapturesClaudeDispatchProfile(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "/profiles/reviewer")
+	if got := selectedRuntimeConfigDir(runtime.ClaudeRuntime); got != "/profiles/reviewer" {
+		t.Fatalf("selectedRuntimeConfigDir = %q, want /profiles/reviewer", got)
+	}
+}
+
+func containsPath(paths []string, want string) bool {
+	for _, path := range paths {
+		if path == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsEnv(env []string, want string) bool {
+	for _, entry := range env {
+		if entry == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsEnvPrefix(env []string, prefix string) bool {
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			return true
+		}
+	}
+	return false
 }

@@ -60,6 +60,7 @@ func runSandboxExec(args []string, _ io.Writer, stderr io.Writer) int {
 	fs := flag.NewFlagSet("sandbox-exec", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var reads, readFiles, writes sandboxPathFlags
+	readOnlyWorkdir := fs.Bool("read-only-workdir", false, "deny writes to the sandbox working directory")
 	fs.Var(&reads, "read", "absolute directory readable by the sandbox (repeatable)")
 	fs.Var(&readFiles, "read-file", "absolute file readable by the sandbox (repeatable)")
 	fs.Var(&writes, "write", "absolute directory writable by the sandbox (repeatable)")
@@ -74,7 +75,13 @@ func runSandboxExec(args []string, _ io.Writer, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "sandbox-exec requires -- <command> [args...]")
 		return 2
 	}
-	if err := sandbox.Exec([]string(reads), []string(readFiles), []string(writes), argv); err != nil {
+	var err error
+	if *readOnlyWorkdir {
+		err = sandbox.ExecReadOnlyWorkdir([]string(reads), []string(readFiles), []string(writes), argv)
+	} else {
+		err = sandbox.Exec([]string(reads), []string(readFiles), []string(writes), argv)
+	}
+	if err != nil {
 		fmt.Fprintf(stderr, "sandbox-exec: %v\n", err)
 		return 1
 	}

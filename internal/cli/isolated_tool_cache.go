@@ -43,19 +43,13 @@ var toolCacheEnvSubdirs = []struct{ env, subdir string }{
 // widening WritablePaths for them is a harmless no-op — nothing reads it — and
 // the env vars alone suffice to redirect their cache.
 //
-// codex only honors WritablePaths under the workspace-write autonomy policy
-// (codexSandboxArgs' --add-dir loop; read-only mode grants nothing). Pointing
-// UV_CACHE_DIR/GOCACHE/etc. at the shared dir for a read-only codex job would
-// redirect tools to a directory their sandbox cannot write, breaking Go builds
-// and degrading uv/pip/npm — worse than leaving the env unset. So a read-only
-// (or unrecognized) codex autonomy policy is a no-op here; danger-full-access
-// is unrestricted and proceeds like any other job. A ChatSeat is ALSO a no-op:
-// codexSandboxArgs returns workspace-write for a ChatSeat WITHOUT ever reaching
-// the --add-dir loop (its only implicit writable roots are workdir/tmp), so a
-// chat seat never gets the shared directory writable regardless of policy —
-// injecting the env for it would reproduce the exact same-directory-unwritable
-// failure this gate exists to prevent (#1113 finder, confirmed against
-// TestCodexDeliverChatSeatSandbox).
+// Codex normally honors WritablePaths only under workspace-write. Pointing
+// tool cache variables at an external directory under its native read-only
+// sandbox would break test execution, so ordinary read-only jobs remain a
+// no-op. ReviewSeat is the deliberate exception: codexSandboxArgs selects
+// workspace-write plus the cache grant, while Gitmoot's outer Landlock wrapper
+// keeps the checkout read-only. A ChatSeat remains a no-op because its dedicated
+// sandbox branch does not consume WritablePaths.
 //
 // Errors here are the caller's to treat as fail-open: this is disk hygiene, not
 // a security precondition, and must never fail a job.
@@ -67,11 +61,13 @@ func applyIsolatedToolCacheGrants(paths config.Paths, payload workflow.JobPayloa
 		if agent.ChatSeat {
 			return nil, nil
 		}
-		switch runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
-		case runtime.AutonomyPolicyWorkspaceWrite, runtime.AutonomyPolicyDangerFullAccess:
-			// proceeds below
-		default:
-			return nil, nil
+		if !agent.ReviewSeat {
+			switch runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
+			case runtime.AutonomyPolicyWorkspaceWrite, runtime.AutonomyPolicyDangerFullAccess:
+				// proceeds below
+			default:
+				return nil, nil
+			}
 		}
 	}
 	policy, err := config.LoadToolCache(paths)

@@ -110,6 +110,9 @@ func TestDispatchReviewAllocatesDistinctExactHeadWorktrees(t *testing.T) {
 	store, home := blockerE2EHome(t)
 	checkout, firstHead, secondHead := readonlyReviewWorktreeGitCheckout(t)
 	seedReviewDispatchFixture(t, store, checkout)
+	configDir := filepath.Join(t.TempDir(), "claude-profile")
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime, "550e8400-e29b-41d4-a716-446655440002", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
 		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
 	})
@@ -165,6 +168,9 @@ func TestDispatchReviewAllocatesDistinctExactHeadWorktrees(t *testing.T) {
 		}
 		if got.payload.HeadSHA != got.head {
 			t.Fatalf("%s payload HeadSHA=%q, want preserved %q", got.name, got.payload.HeadSHA, got.head)
+		}
+		if got.payload.RuntimeConfigDir != configDir {
+			t.Fatalf("%s payload RuntimeConfigDir=%q, want dispatch profile %q", got.name, got.payload.RuntimeConfigDir, configDir)
 		}
 		if actual := readonlyWorktreeHead(t, got.payload.WorktreePath); actual != got.head {
 			t.Fatalf("%s worktree HEAD=%q, want %q", got.name, actual, got.head)

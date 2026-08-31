@@ -29,7 +29,19 @@ var newAgentDispatchGitHubClient = func(checkout string) github.Client {
 type foregroundRuntimeAdapterFactory func(string, runtime.Agent, string) (runtime.Adapter, error)
 
 var localAgentDispatchRuntimeAdapterFor foregroundRuntimeAdapterFactory = func(home string, agent runtime.Agent, checkout string) (runtime.Adapter, error) {
-	return runtimeAdapterFor(home, agent.Runtime, checkout)
+	delivery, err := buildRuntimeAdapter(home, agent, checkout, nil)
+	if err != nil {
+		return nil, err
+	}
+	delivery, err = wrapReviewSandboxAdapter(home, agent, checkout, delivery)
+	if err != nil {
+		return nil, err
+	}
+	adapter, ok := delivery.(runtime.Adapter)
+	if !ok {
+		return nil, fmt.Errorf("foreground runtime adapter has incompatible type %T", delivery)
+	}
+	return adapter, nil
 }
 
 var localAgentDispatchExecBackendFor = func(home string) (execbackend.Backend, error) {
@@ -393,6 +405,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		}
 		checkoutPath = readOnlyWorktreePath
 		promptHeadWarnings = dispatchPromptHeadContradictionWarnings(ctx, jobGitClient(checkoutPath, localDispatchJobRunner(request)), request.Instructions, request.HeadSHA)
+		applyReviewSeat(request.Action, true, selectedRuntimeConfigDir(effectiveAgent.Runtime), &effectiveAgent)
 	}
 	if readOnlyWorktreePath != "" {
 		if request.Action != "review" {
@@ -447,6 +460,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		WorkflowID:             request.WorkflowID,
 		RuntimeOverride:        overrideRuntime,
 		RuntimeOverrideRef:     overrideRef,
+		RuntimeConfigDir:       effectiveAgent.RuntimeConfigDir,
 		EffectiveRuntime:       effectiveRuntimeAtEnqueue,
 		RequiredEvents:         requiredEvents,
 		Cockpit:                request.Cockpit,

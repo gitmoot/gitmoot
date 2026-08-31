@@ -347,6 +347,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// Stamp the already-resolved decision on the in-memory job agent so every
 	// secondary adapter rebuild consumes the same backend selection.
 	agent.ExecBackend = string(execBackend)
+	applyReviewSeat(job.Type, payload.ReadOnlyWorktree, payload.RuntimeConfigDir, &agent)
 	preflightRequest := runtime.RuntimeContractRequest{Plan: payload.Plan}
 	if result, checked, preflightErr := w.runtimeContractPreflight(ctx, execBackend, agent, preflightRequest); preflightErr != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, preflightErr); finishErr != nil {
@@ -660,6 +661,14 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 	}
 	adapter, err = wrapProduceSandboxAdapter(job.Type, agent, adapter)
+	if err != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
+		return nil
+	}
+	adapter, err = wrapReviewSandboxAdapter(w.ConfigHome, agent, deliveryCheckout, adapter)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
@@ -1315,9 +1324,221 @@ func wrapProduceSandboxAdapter(action string, agent runtime.Agent, adapter workf
 	case *runtime.KimiAdapter:
 		a.Runner = landlockProduceRunner(a.Runner, reads, readFiles, writes, env)
 		return a, nil
+
 	default:
 		return nil, fmt.Errorf("produce Landlock sandbox cannot wrap %s adapter %T", agent.Runtime, adapter)
 	}
+}
+
+func wrapReviewSandboxAdapter(home string, agent runtime.Agent, checkout string, adapter workflow.DeliveryAdapter) (workflow.DeliveryAdapter, error) {
+	if !agent.ReviewSeat {
+		return adapter, nil
+	}
+	writes, env, err := reviewRuntimeSandboxGrants(home, agent, checkout)
+	if err != nil {
+		return nil, err
+	}
+	wrap := func(runner subprocess.Runner) subprocess.Runner {
+		return landlockReviewRunner(runner, writes, env)
+	}
+	switch a := adapter.(type) {
+	case modelGatewayRuntimeAdapter:
+		wrapped, err := wrapReviewSandboxAdapter(home, agent, checkout, a.Adapter)
+		if err != nil {
+			return nil, err
+		}
+		runtimeAdapter, ok := wrapped.(runtime.Adapter)
+		if !ok {
+			return nil, fmt.Errorf("review Landlock sandbox returned incompatible %T adapter", wrapped)
+		}
+		a.Adapter = runtimeAdapter
+		return a, nil
+	case runtime.ClaudeAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case *runtime.ClaudeAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case runtime.CodexAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case *runtime.CodexAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case runtime.KimiAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case *runtime.KimiAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case runtime.KimiCLIAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case *runtime.KimiCLIAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case runtime.OmpAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case *runtime.OmpAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case runtime.ShellAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+
+	case *runtime.ShellAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	default:
+		return nil, fmt.Errorf("review Landlock sandbox cannot wrap %s adapter %T", agent.Runtime, adapter)
+	}
+}
+func applyReviewSeat(action string, readOnlyWorktree bool, configDir string, agent *runtime.Agent) {
+	if agent == nil || strings.TrimSpace(action) != "review" || !readOnlyWorktree {
+		return
+	}
+	agent.ReviewSeat = true
+	agent.RuntimeConfigDir = strings.TrimSpace(configDir)
+}
+
+func selectedRuntimeConfigDir(runtimeName string) string {
+	switch runtimeName {
+	case runtime.ClaudeRuntime:
+		return strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR"))
+	case runtime.CodexRuntime:
+		return strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	default:
+		return ""
+	}
+}
+
+func reviewRuntimeSandboxGrants(home string, agent runtime.Agent, checkout string) ([]string, []string, error) {
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve review sandbox config paths: %w", err)
+	}
+	policy, err := config.LoadToolCache(paths)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load review tool cache config: %w", err)
+	}
+	if policy.Enabled {
+		if err := validateReviewWritablePaths(checkout, []string{policy.Dir}); err != nil {
+			return nil, nil, err
+		}
+	}
+	toolEnv, err := applyIsolatedToolCacheGrants(paths, workflow.JobPayload{WorktreePath: checkout}, &agent)
+	if err != nil {
+		return nil, nil, err
+	}
+	writes := append([]string(nil), agent.WritablePaths...)
+	env := append([]string(nil), toolEnv...)
+
+	cacheRoot := policy.Dir
+	if !policy.Enabled {
+		cacheRoot = filepath.Join(paths.Home, "cache", "review-tools")
+		for _, entry := range toolCacheEnvSubdirs {
+			dir := filepath.Join(cacheRoot, entry.subdir)
+			env = append(env, entry.env+"="+dir)
+		}
+	}
+	// Codex workspace-write admits TMPDIR as a native writable root. Pointing it
+	// at the cache root keeps the tool caches writable in foreground reviews,
+	// where the adapter receives no later daemon-side --add-dir mutation.
+	tempDir := cacheRoot
+	writes = appendUniquePath(writes, cacheRoot)
+
+	stateDir := strings.TrimSpace(agent.RuntimeConfigDir)
+	if stateDir == "" {
+		userHome, homeErr := os.UserHomeDir()
+		if homeErr != nil {
+			return nil, nil, fmt.Errorf("resolve review runtime state home: %w", homeErr)
+		}
+		switch agent.Runtime {
+		case runtime.ClaudeRuntime:
+			stateDir = filepath.Join(userHome, ".claude")
+		case runtime.CodexRuntime:
+			stateDir = filepath.Join(userHome, ".codex")
+		case runtime.KimiRuntime, runtime.KimiCLIRuntime:
+			stateDir = filepath.Join(userHome, ".kimi-code")
+		}
+	}
+	if stateDir != "" {
+		writes = appendUniquePath(writes, stateDir)
+		switch agent.Runtime {
+		case runtime.ClaudeRuntime:
+			env = append(env, "CLAUDE_CONFIG_DIR="+stateDir)
+		case runtime.CodexRuntime:
+			env = append(env, "CODEX_HOME="+stateDir)
+		}
+	}
+	writes = appendUniquePath(writes, tempDir)
+	if err := validateReviewWritablePaths(checkout, writes); err != nil {
+		return nil, nil, err
+	}
+	for _, path := range writes {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			return nil, nil, fmt.Errorf("create review sandbox write directory %q: %w", path, err)
+		}
+	}
+	env = append(env, "TMPDIR="+tempDir, "TMP="+tempDir, "TEMP="+tempDir)
+	return compactCleanPaths(writes), env, nil
+}
+
+func validateReviewWritablePaths(checkout string, writes []string) error {
+	resolvedCheckout, err := resolvePathForContainment(checkout)
+	if err != nil {
+		return fmt.Errorf("resolve review worktree %q: %w", checkout, err)
+	}
+	for _, path := range compactCleanPaths(writes) {
+		if !filepath.IsAbs(path) {
+			return fmt.Errorf("review sandbox write path %q must be absolute", path)
+		}
+		resolvedWrite, err := resolvePathForContainment(path)
+		if err != nil {
+			return fmt.Errorf("resolve review sandbox write path %q: %w", path, err)
+		}
+		if pathsOverlap(resolvedCheckout, resolvedWrite) {
+			return fmt.Errorf("review sandbox write path %q overlaps read-only worktree %q", path, checkout)
+		}
+	}
+	return nil
+}
+
+func resolvePathForContainment(path string) (string, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	path = filepath.Clean(path)
+	current := path
+	var suffix []string
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", err
+		}
+		suffix = append(suffix, filepath.Base(current))
+		current = parent
+	}
+}
+
+func pathsOverlap(left, right string) bool {
+	contains := func(parent, child string) bool {
+		rel, err := filepath.Rel(parent, child)
+		return err == nil && (rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))))
+	}
+	return contains(left, right) || contains(right, left)
 }
 
 func produceRuntimeSandboxGrants(runtimeName string, readable, readFiles, writable []string) ([]string, []string, []string, []string, error) {
@@ -1373,17 +1594,28 @@ func compactCleanPaths(paths []string) []string {
 }
 
 func landlockProduceRunner(runner subprocess.Runner, reads, readFiles, writes, env []string) subprocess.Runner {
+	return landlockRuntimeRunner(runner, reads, readFiles, writes, env, false)
+}
+
+func landlockReviewRunner(runner subprocess.Runner, writes, env []string) subprocess.Runner {
+	return landlockRuntimeRunner(runner, nil, nil, writes, env, true)
+}
+
+func landlockRuntimeRunner(runner subprocess.Runner, reads, readFiles, writes, env []string, readOnlyWorkdir bool) subprocess.Runner {
 	readable := append([]string(nil), reads...)
 	files := append([]string(nil), readFiles...)
 	writable := append([]string(nil), writes...)
 	runtimeEnv := append([]string(nil), env...)
+	wrap := func(inner subprocess.Runner) subprocess.WrappingRunner {
+		return subprocess.WrappingRunner{Inner: inner, ReadablePaths: readable, ReadableFiles: files, WritablePaths: writable, ReadOnlyWorkdir: readOnlyWorkdir, Env: runtimeEnv}
+	}
 	if tee, ok := runner.(subprocess.TeeRunner); ok {
 		inner := tee.Inner
 		if inner == nil {
 			inner = subprocess.GroupRunner{}
 		}
 		if _, wrapped := inner.(subprocess.WrappingRunner); !wrapped {
-			tee.Inner = subprocess.WrappingRunner{Inner: inner, ReadablePaths: readable, ReadableFiles: files, WritablePaths: writable, Env: runtimeEnv}
+			tee.Inner = wrap(inner)
 		}
 		return tee
 	}
@@ -1393,7 +1625,7 @@ func landlockProduceRunner(runner subprocess.Runner, reads, readFiles, writes, e
 			inner = subprocess.GroupRunner{}
 		}
 		if _, wrapped := inner.(subprocess.WrappingRunner); !wrapped {
-			tee.Inner = subprocess.WrappingRunner{Inner: inner, ReadablePaths: readable, ReadableFiles: files, WritablePaths: writable, Env: runtimeEnv}
+			tee.Inner = wrap(inner)
 		}
 		return tee
 	}
@@ -1403,7 +1635,7 @@ func landlockProduceRunner(runner subprocess.Runner, reads, readFiles, writes, e
 	if _, wrapped := runner.(subprocess.WrappingRunner); wrapped {
 		return runner
 	}
-	return subprocess.WrappingRunner{Inner: runner, ReadablePaths: readable, ReadableFiles: files, WritablePaths: writable, Env: runtimeEnv}
+	return wrap(runner)
 }
 
 // configPaths resolves this worker's config.Paths for READ-ONLY policy loading
