@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -1217,6 +1218,132 @@ func TestClientAddExistingBranchWorktreeRefusesCheckedOutBranchSmoke(t *testing.
 	if err == nil {
 		t.Fatal("AddExistingBranchWorktree allowed a branch already checked out in the main worktree")
 	}
+}
+
+// ChangedFiles must survive every path shape the compare API can name AND every
+// record shape `-z --name-status` can emit: a rename is a THREE-field record and
+// reports its new path, while whitespace/quote/non-ASCII paths are exactly the
+// ones git C-quotes without -z.
+func TestClientChangedFilesEnumeratesEveryRecordShapeSmoke(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	runGit(t, dir, "init", "-b", "main")
+	runGit(t, dir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, dir, "config", "user.name", "Gitmoot")
+	writeGitFixture(t, dir, "keep.txt", "keep\n")
+	writeGitFixture(t, dir, "modify.txt", "one\n")
+	writeGitFixture(t, dir, "remove.txt", "gone soon\n")
+	writeGitFixture(t, dir, "old/name.txt", strings.Repeat("stable rename body\n", 20))
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-m", "base")
+	base := gitFixtureHead(t, dir)
+
+	writeGitFixture(t, dir, "modify.txt", "two\n")
+	if err := os.Remove(filepath.Join(dir, "remove.txt")); err != nil {
+		t.Fatalf("Remove returned error: %v", err)
+	}
+	writeGitFixture(t, dir, "docs/with space.md", "added\n")
+	writeGitFixture(t, dir, "docs/caf\u00e9.md", "added\n")
+	writeGitFixture(t, dir, "docs/\"quoted\".md", "added\n")
+	if err := os.MkdirAll(filepath.Join(dir, "new"), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	runGit(t, dir, "mv", "old/name.txt", "new/name.txt")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-m", "follow-up")
+	head := gitFixtureHead(t, dir)
+
+	files, err := NewHostClient(dir).ChangedFiles(context.Background(), base, head)
+	if err != nil {
+		t.Fatalf("ChangedFiles returned error: %v", err)
+	}
+	sort.Strings(files)
+	want := []string{
+		`docs/"quoted".md`,
+		"docs/caf\u00e9.md",
+		"docs/with space.md",
+		"modify.txt",
+		"new/name.txt",
+		"remove.txt",
+	}
+	if !reflect.DeepEqual(files, want) {
+		t.Fatalf("ChangedFiles = %q\nwant %q", files, want)
+	}
+}
+
+// The range is base...head (merge-base), matching GitHub's compare endpoint, so
+// commits made on the base branch AFTER the fork point are not in scope.
+func TestClientChangedFilesUsesMergeBaseRangeSmoke(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	runGit(t, dir, "init", "-b", "main")
+	runGit(t, dir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, dir, "config", "user.name", "Gitmoot")
+	writeGitFixture(t, dir, "README.md", "base\n")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-m", "fork point")
+
+	runGit(t, dir, "switch", "-c", "feature")
+	writeGitFixture(t, dir, "feature.txt", "feature\n")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-m", "feature work")
+	head := gitFixtureHead(t, dir)
+
+	runGit(t, dir, "switch", "main")
+	writeGitFixture(t, dir, "unrelated.txt", "moved on\n")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-m", "base moved on")
+	base := gitFixtureHead(t, dir)
+
+	files, err := NewHostClient(dir).ChangedFiles(context.Background(), base, head)
+	if err != nil {
+		t.Fatalf("ChangedFiles returned error: %v", err)
+	}
+	if !reflect.DeepEqual(files, []string{"feature.txt"}) {
+		t.Fatalf("ChangedFiles = %q, want only the feature-side change (three-dot range)", files)
+	}
+}
+
+// -z output is NUL-TERMINATED. A record that runs off the end means the read was
+// cut short, and that must be an error rather than a silently shorter list.
+func TestParseNameStatusZRejectsTruncatedRecord(t *testing.T) {
+	for _, out := range []string{
+		"M\x00kept.go\x00R100\x00old.go\x00",
+		"M\x00kept.go\x00M\x00",
+		"M\x00kept.go\x00A\x00\x00",
+	} {
+		if _, err := parseNameStatusZ(out); err == nil {
+			t.Fatalf("parseNameStatusZ(%q) = nil error, want a mid-record failure", out)
+		}
+	}
+	files, err := parseNameStatusZ("")
+	if err != nil || len(files) != 0 {
+		t.Fatalf("parseNameStatusZ(\"\") = (%q, %v), want an empty enumeration", files, err)
+	}
+}
+
+func writeGitFixture(t *testing.T, dir string, name string, body string) {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+}
+
+func gitFixtureHead(t *testing.T, dir string) string {
+	t.Helper()
+	sha, err := NewHostClient(dir).HeadSHA(context.Background())
+	if err != nil {
+		t.Fatalf("HeadSHA returned error: %v", err)
+	}
+	return sha
 }
 
 func runGit(t *testing.T, dir string, args ...string) {

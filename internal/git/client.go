@@ -837,6 +837,66 @@ func (c Client) IsAncestor(ctx context.Context, ancestor, descendant string) (bo
 	return false, err
 }
 
+// ChangedFiles enumerates the paths a merge-base range changed, matching the
+// `base...head` semantics of GitHub's compare endpoint (`git diff A...B` is
+// `git diff $(git merge-base A B) B`). Unlike every hosted enumeration of that
+// range it is UNCAPPED and cannot truncate silently — the compare payload stops
+// at 300 files and the diff media type truncates nondeterministically without
+// saying so — which makes it the only instrument that can prove a review scope
+// is the whole range. `-z` keeps the output unambiguous for paths carrying
+// whitespace, quotes or non-ASCII bytes, which git would otherwise C-quote.
+//
+// A rename or copy reports its NEW path, the same path the compare API names in
+// `files[].filename`.
+func (c Client) ChangedFiles(ctx context.Context, base string, head string) ([]string, error) {
+	base, head = strings.TrimSpace(base), strings.TrimSpace(head)
+	if err := validateRef(base); err != nil {
+		return nil, err
+	}
+	if err := validateRef(head); err != nil {
+		return nil, err
+	}
+	result, err := c.run(ctx, "diff", "-z", "--name-status", base+"..."+head)
+	if err != nil {
+		return nil, err
+	}
+	return parseNameStatusZ(result.Stdout)
+}
+
+// parseNameStatusZ decodes `git diff -z --name-status`: NUL-TERMINATED fields
+// where a status is followed by one path, except rename/copy statuses (`R100`,
+// `C75`) which are followed by the old path AND the new path. A record that runs
+// off the end of the output is an error rather than a dropped path, so a
+// truncated read can never be mistaken for a complete enumeration.
+func parseNameStatusZ(out string) ([]string, error) {
+	fields := strings.Split(out, "\x00")
+	// -z terminates rather than separates, so a non-empty output ends in "".
+	if n := len(fields); n > 0 && fields[n-1] == "" {
+		fields = fields[:n-1]
+	}
+	paths := make([]string, 0, len(fields)/2)
+	for index := 0; index < len(fields); {
+		status := fields[index]
+		if status == "" {
+			return nil, fmt.Errorf("git diff --name-status field %d is not a status", index)
+		}
+		fieldsInRecord := 1
+		if status[0] == 'R' || status[0] == 'C' {
+			fieldsInRecord = 2
+		}
+		if index+fieldsInRecord >= len(fields) {
+			return nil, fmt.Errorf("git diff --name-status ended mid-record after status %q", status)
+		}
+		path := fields[index+fieldsInRecord]
+		if path == "" {
+			return nil, fmt.Errorf("git diff --name-status record %q names an empty path", status)
+		}
+		paths = append(paths, path)
+		index += fieldsInRecord + 1
+	}
+	return paths, nil
+}
+
 // BehindCount reports how many commits upstream has that HEAD does not. It is
 // the checkout-side equivalent of `git rev-list --count HEAD..<upstream>`.
 func (c Client) BehindCount(ctx context.Context, upstream string) (int, error) {

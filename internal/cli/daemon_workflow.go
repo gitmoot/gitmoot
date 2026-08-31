@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/config"
@@ -159,6 +158,11 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 	// byte-identical unless a home config turns it on.
 	applyReviewPolicy(&engine, home)
 	wireReviewRiskSignals(&engine, gh)
+	// The review-scope seam needs the daemon's CHECKOUT, not just the API client:
+	// no hosted compare response can prove its own file list is the whole range,
+	// so a >300-file follow-up is only scopable by enumerating it with local git.
+	// With no checkout the seam still installs and fails closed instead.
+	wireReviewChangedFiles(&engine, gh, checkout, runner)
 	if strings.TrimSpace(home) != "" {
 		// Root delegation artifacts under GITMOOT_HOME (alongside worktrees)
 		// rather than inside the repo checkout, so generated briefs stay out of
@@ -755,7 +759,7 @@ func newHostDaemonMergeGate(store *db.Store, gh github.Client, checkout, home st
 }
 
 func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeRequest) (workflow.MergeDecision, error) {
-	if nativeMergeGateDisabled() {
+	if workflow.NativeMergeGateDisabled() {
 		return workflow.MergeDecision{
 			Ready:  false,
 			Reason: workflow.PlainReason("native Gitmoot merge gate disabled by GITMOOT_DISABLE_NATIVE_MERGE_GATE; use external gate"),
@@ -907,15 +911,6 @@ func repoOrgOwner(cfg config.OrgConfig, repo string) (string, bool) {
 		}
 	}
 	return best, best != ""
-}
-
-func nativeMergeGateDisabled() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("GITMOOT_DISABLE_NATIVE_MERGE_GATE"))) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
-	}
 }
 
 func (g daemonMergeGate) githubClient(checkout string) github.Client {

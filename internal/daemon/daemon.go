@@ -29,6 +29,11 @@ const (
 	externalMergeReconcileLookupLimit = 20
 	staleTaskReconcileLimit           = 20
 	staleTaskReconcileScanLimit       = 200
+	mergeGateUnclearedDescription     = "Gitmoot merge gate has not cleared this head"
+	mergeGateNotAppliedDescription    = "Gitmoot merge gate is not applied to this head"
+	mergeGateStatusMarker             = "marker"
+	mergeGateStatusObserved           = "observed"
+	mergeGateStatusInactive           = "inactive"
 )
 
 // issueCommentPollOverlap is subtracted from the persisted last-seen cursor when
@@ -164,51 +169,70 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	// consumer that needs it, never retained beyond this poll.
 	reviewMemo := newReviewJobsMemo(d.Store)
 	for _, pull := range pulls {
-		headRepo := strings.TrimSpace(pull.HeadRepoFullName)
-		if headRepo == "" || headRepo == d.Repo.FullName() {
+		// A fork head shares nothing with a local branch but its NAME. Every step
+		// below either resolves, stores or advances a local task keyed on that
+		// name, so all of them are fenced behind one identity check: routing a
+		// fork pull request as a local task lets an outside contributor's PR park
+		// or merge local work. Comment handling stays outside the fence, because a
+		// maintainer commenting on a fork PR is legitimate and the command paths
+		// resolve tasks through the guarded resolver, which refuses a fork head.
+		local := d.pullRequestHeadIsLocal(pull)
+		if local {
 			openBranches[pull.HeadRef] = struct{}{}
 		}
 		openPullNumbers[pull.Number] = struct{}{}
-		changed, err := d.pullRequestChanged(ctx, pull, reviewMemo)
-		if err != nil {
-			return err
-		}
-		mergeReadinessHandled := false
-		if changed {
-			if handled, err := d.handlePullRequestWorkflowChange(ctx, pull, reviewMemo); err != nil {
-				if firstErr == nil {
-					firstErr = err
-				}
-				changed = false
-			} else {
-				mergeReadinessHandled = handled
-				merged, err := d.pullRequestStoredMerged(ctx, pull)
-				if err != nil {
-					return err
-				}
-				if merged {
-					changed = false
-				}
-			}
-		}
-		if changed {
-			if err := d.recordPullRequest(ctx, pull); err != nil {
-				return err
-			}
-		}
-		// Change routing and merge eligibility are independent. A retained stale
-		// review can keep routing "changed" after its job is terminal, while a
-		// ready task still needs its gate re-evaluated on every poll (#1336).
-		// HandlePullRequestOpened runs the gate itself when no reviewers are
-		// configured; avoid evaluating it twice in that one composition.
-		if !mergeReadinessHandled {
-			retry, err := d.pullRequestReadyToMerge(ctx, pull)
+		if local {
+			changed, err := d.pullRequestChanged(ctx, pull, reviewMemo)
 			if err != nil {
 				return err
 			}
-			if retry {
-				if err := d.handleReadyToMergeWorkflow(ctx, pull); err != nil && firstErr == nil {
-					firstErr = err
+			d.ensureMergeGateStatus(ctx, pull)
+			mergeReadinessHandled := false
+			if changed {
+				if handled, err := d.handlePullRequestWorkflowChange(ctx, pull, reviewMemo); err != nil {
+					if firstErr == nil {
+						firstErr = err
+					}
+					changed = false
+				} else {
+					// The lifecycle already ran for this PR at this head in THIS poll, so
+					// reconcileReviewingPullRequest must not re-enter it: reading the
+					// poll's pre-dispatch snapshot it would see no review at the current
+					// head and derive the same round a second time, whose instructions,
+					// and therefore whose deterministic job id, can differ from the ones
+					// just enqueued. Recording that one fact is O(1); dropping the whole
+					// repo-wide snapshot instead cost a fresh ListJobsByType per changed
+					// PR, defeating the once-per-poll memo it was added to preserve.
+					reviewMemo.noteLifecycleRun(pull)
+					mergeReadinessHandled = handled
+					merged, err := d.pullRequestStoredMerged(ctx, pull)
+					if err != nil {
+						return err
+					}
+					if merged {
+						changed = false
+					}
+				}
+			}
+			if changed {
+				if err := d.recordPullRequest(ctx, pull); err != nil {
+					return err
+				}
+			}
+			// Change routing and merge eligibility are independent. A retained stale
+			// review can keep routing "changed" after its job is terminal, while a
+			// ready task still needs its gate re-evaluated on every poll (#1336).
+			// HandlePullRequestOpened runs the gate itself when no reviewers are
+			// configured; avoid evaluating it twice in that one composition.
+			if !mergeReadinessHandled {
+				retry, err := d.pullRequestReadyToMerge(ctx, pull)
+				if err != nil {
+					return err
+				}
+				if retry {
+					if err := d.handleReadyToMergeWorkflow(ctx, pull); err != nil && firstErr == nil {
+						firstErr = err
+					}
 				}
 			}
 		}
@@ -221,8 +245,10 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 				return err
 			}
 		}
-		if err := d.reconcileReviewingPullRequest(ctx, pull, reviewMemo); err != nil && firstErr == nil {
-			firstErr = err
+		if local {
+			if err := d.reconcileReviewingPullRequest(ctx, pull, reviewMemo); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	// Corrective revert detection (#467): OFF-BY-DEFAULT cheap short-circuit. When
@@ -426,6 +452,18 @@ func (d Daemon) logf(format string, args ...any) {
 	log.Printf(format, args...)
 }
 
+// pullRequestHeadIsLocal reports whether a pull request's head branch lives in
+// the watched repository. HeadRef text can collide with a local branch name
+// without being that branch, so every consumer that resolves a task, stores a
+// mirror row, or writes a status from HeadRef must reject a fork head through
+// this one predicate. The comparison is case-INSENSITIVE because GitHub repo
+// names are, and rejecting a legitimate same-repo pull request over letter case
+// would silently disable routing for ordinary work.
+func (d Daemon) pullRequestHeadIsLocal(pull github.PullRequest) bool {
+	headRepo := strings.TrimSpace(pull.HeadRepoFullName)
+	return headRepo == "" || strings.EqualFold(headRepo, d.Repo.FullName())
+}
+
 // reconcilePROpenTasks promotes implementing/blocked tasks whose branch carries
 // an open same-repo pull request back to pr_open (#920). It is a catch-up for
 // missed or mis-sequenced PR-open events: without it a wedged task hides its PR
@@ -454,8 +492,7 @@ func (d Daemon) reconcilePROpenTasks(ctx context.Context, pulls []github.PullReq
 	}
 	var firstErr error
 	for _, pull := range pulls {
-		headRepo := strings.TrimSpace(pull.HeadRepoFullName)
-		if headRepo != "" && headRepo != d.Repo.FullName() {
+		if !d.pullRequestHeadIsLocal(pull) {
 			continue
 		}
 		for _, task := range byBranch[strings.TrimSpace(pull.HeadRef)] {
@@ -554,6 +591,13 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 			if firstErr == nil {
 				firstErr = err
 			}
+			continue
+		}
+		// A fork pull request can carry the same HeadRef as a local task's branch,
+		// and a MERGED fork PR must never advance that task. The stored mirror row
+		// is keyed on branch text alone, so identity is re-checked here against
+		// the freshly fetched pull request.
+		if !d.pullRequestHeadIsLocal(pull) {
 			continue
 		}
 		if !pullRequestListedAsMerged(pull) {
@@ -819,6 +863,10 @@ type reviewJobsMemo struct {
 	store reviewJobLister
 	done  bool
 	jobs  []db.Job
+	// lifecycleRuns records the head each PR's workflow lifecycle already ran at in
+	// THIS poll. It is not part of the snapshot: it is the one fact that makes the
+	// snapshot's staleness harmless, without re-fetching it.
+	lifecycleRuns map[int64]string
 }
 
 func (m *reviewJobsMemo) get(ctx context.Context) ([]db.Job, error) {
@@ -832,6 +880,27 @@ func (m *reviewJobsMemo) get(ctx context.Context) ([]db.Job, error) {
 	m.jobs = jobs
 	m.done = true
 	return m.jobs, nil
+}
+
+// noteLifecycleRun records that this PR's workflow lifecycle ran at this head in the
+// current poll. The dispatch it may have performed is invisible to the snapshot taken
+// before it, so a later consumer must not treat "no review at this head" as an
+// instruction to derive the round again.
+func (m *reviewJobsMemo) noteLifecycleRun(pull github.PullRequest) {
+	if m.lifecycleRuns == nil {
+		m.lifecycleRuns = map[int64]string{}
+	}
+	m.lifecycleRuns[pull.Number] = strings.TrimSpace(pull.HeadSHA)
+}
+
+// lifecycleRanAtHead reports whether noteLifecycleRun already recorded this PR at this
+// exact head during this poll.
+func (m *reviewJobsMemo) lifecycleRanAtHead(pull github.PullRequest) bool {
+	if m == nil || len(m.lifecycleRuns) == 0 {
+		return false
+	}
+	head, ok := m.lifecycleRuns[pull.Number]
+	return ok && head == strings.TrimSpace(pull.HeadSHA)
 }
 
 // newReviewJobsMemo is a package var (not a plain func) only so the once-per-poll
@@ -914,6 +983,127 @@ func (d Daemon) recordPullRequest(ctx context.Context, pull github.PullRequest) 
 	})
 }
 
+// ensureMergeGateStatus reconciles the visible status for one managed PR head.
+// Its exact-head observation is independent of both pull-request routing and the
+// merge-gate decision, so a bookkeeping failure retries without changing either.
+func (d Daemon) ensureMergeGateStatus(ctx context.Context, pull github.PullRequest) {
+	if d.Workflow == nil || d.Workflow.MergeGate == nil {
+		return
+	}
+	// A fork head must never resolve a local task by branch text, or an unrelated
+	// contributor's pull request inherits a marker no Gitmoot workflow resolves.
+	if !d.pullRequestHeadIsLocal(pull) {
+		return
+	}
+	headSHA := strings.TrimSpace(pull.HeadSHA)
+	if headSHA == "" {
+		return
+	}
+	task, err := d.lookupPolledPullRequestTask(ctx, pull)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			d.logf("merge-gate marker task lookup failed for %s#%d: %v", d.Repo.FullName(), pull.Number, err)
+		}
+		return
+	}
+
+	observation, observationErr := d.Store.GetMergeGateStatusObservation(ctx, d.Repo.FullName(), pull.Number)
+	if observationErr != nil && !errors.Is(observationErr, sql.ErrNoRows) {
+		d.logf("merge-gate status observation lookup failed for %s#%d: %v", d.Repo.FullName(), pull.Number, observationErr)
+	}
+	// An operator who handed the merge decision away (either kill-switch) gets no
+	// marker: a status describing a gate that will never run is a permanent
+	// pending nothing in Gitmoot can resolve.
+	gateOwnsDecision := !workflow.NativeMergeGateDisabled() &&
+		(d.AutoMergeEnabled == nil || d.AutoMergeEnabled(d.Repo.FullName()))
+	applies := gateOwnsDecision && mergeGateMarkerApplies(task.State)
+	if observationErr == nil && observation.HeadSHA == headSHA {
+		if applies && (observation.Kind == mergeGateStatusMarker || observation.Kind == mergeGateStatusObserved) {
+			return
+		}
+		if !applies && observation.Kind == mergeGateStatusInactive {
+			return
+		}
+	}
+
+	combined, err := d.GitHub.GetCombinedStatus(ctx, d.Repo, headSHA)
+	if err != nil {
+		d.logf("merge-gate marker status lookup failed for %s#%d at %s: %v", d.Repo.FullName(), pull.Number, headSHA, err)
+		return
+	}
+	status, found := latestMergeGateStatus(combined.Statuses)
+	if applies {
+		if found && !(status.State == "success" && status.Description == mergeGateNotAppliedDescription) {
+			kind := mergeGateStatusObserved
+			if status.State == "pending" && status.Description == mergeGateUnclearedDescription {
+				kind = mergeGateStatusMarker
+			}
+			d.recordMergeGateStatusObservation(ctx, pull.Number, headSHA, kind)
+			return
+		}
+		if _, err := d.GitHub.CreateCommitStatus(ctx, github.CommitStatusInput{
+			Repo:        d.Repo,
+			SHA:         headSHA,
+			State:       "pending",
+			Context:     workflow.GitmootMergeGateContext,
+			Description: mergeGateUnclearedDescription,
+		}); err != nil {
+			d.logf("merge-gate marker write failed for %s#%d at %s: %v", d.Repo.FullName(), pull.Number, headSHA, err)
+			return
+		}
+		d.recordMergeGateStatusObservation(ctx, pull.Number, headSHA, mergeGateStatusMarker)
+		return
+	}
+
+	if found && status.State == "pending" && status.Description == mergeGateUnclearedDescription {
+		if _, err := d.GitHub.CreateCommitStatus(ctx, github.CommitStatusInput{
+			Repo:        d.Repo,
+			SHA:         headSHA,
+			State:       "success",
+			Context:     workflow.GitmootMergeGateContext,
+			Description: mergeGateNotAppliedDescription,
+		}); err != nil {
+			d.logf("merge-gate marker clearance failed for %s#%d at %s: %v", d.Repo.FullName(), pull.Number, headSHA, err)
+			return
+		}
+	}
+	d.recordMergeGateStatusObservation(ctx, pull.Number, headSHA, mergeGateStatusInactive)
+}
+
+func mergeGateMarkerApplies(state string) bool {
+	switch workflow.TaskState(strings.TrimSpace(state)) {
+	case workflow.TaskPullRequestOpen,
+		workflow.TaskReviewing,
+		workflow.TaskChangesRequested,
+		workflow.TaskReadyToMerge,
+		workflow.TaskBlocked,
+		workflow.TaskAwaitingHuman:
+		return true
+	default:
+		return false
+	}
+}
+
+func latestMergeGateStatus(statuses []github.CommitStatus) (github.CommitStatus, bool) {
+	for i := len(statuses) - 1; i >= 0; i-- {
+		if strings.TrimSpace(statuses[i].Context) == workflow.GitmootMergeGateContext {
+			return statuses[i], true
+		}
+	}
+	return github.CommitStatus{}, false
+}
+
+func (d Daemon) recordMergeGateStatusObservation(ctx context.Context, pullRequest int64, headSHA string, kind string) {
+	if err := d.Store.UpsertMergeGateStatusObservation(ctx, db.MergeGateStatusObservation{
+		RepoFullName: d.Repo.FullName(),
+		PullRequest:  pullRequest,
+		HeadSHA:      headSHA,
+		Kind:         kind,
+	}); err != nil {
+		d.logf("merge-gate status observation write failed for %s#%d at %s: %v", d.Repo.FullName(), pullRequest, headSHA, err)
+	}
+}
+
 func (d Daemon) pullRequestStoredMerged(ctx context.Context, pull github.PullRequest) (bool, error) {
 	stored, err := d.Store.GetPullRequest(ctx, d.Repo.FullName(), pull.Number)
 	if err != nil {
@@ -953,7 +1143,7 @@ func (d Daemon) handlePullRequestWorkflowChange(ctx context.Context, pull github
 		title:  pull.Title,
 		branch: pull.HeadRef,
 	}
-	if task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef); err == nil {
+	if task, err := d.lookupPolledPullRequestTask(ctx, pull); err == nil {
 		ref.id = task.ID
 		ref.goalID = task.GoalID
 		ref.title = task.Title
@@ -1044,7 +1234,7 @@ func workflowReviewJobMatchesPull(repoFullName string, pull github.PullRequest, 
 }
 
 func (d Daemon) pullRequestReadyToMerge(ctx context.Context, pull github.PullRequest) (bool, error) {
-	task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	task, err := d.lookupPolledPullRequestTask(ctx, pull)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
@@ -1061,7 +1251,7 @@ func (d Daemon) handleReadyToMergeWorkflow(ctx context.Context, pull github.Pull
 	if d.Workflow == nil {
 		return nil
 	}
-	task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	task, err := d.lookupPolledPullRequestTask(ctx, pull)
 	if err != nil {
 		return err
 	}
@@ -1096,7 +1286,7 @@ func (d Daemon) reconcileReviewingPullRequest(ctx context.Context, pull github.P
 	if d.Workflow == nil {
 		return nil
 	}
-	task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	task, err := d.lookupPolledPullRequestTask(ctx, pull)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
@@ -1164,7 +1354,11 @@ func (d Daemon) reconcileReviewingPullRequest(ctx context.Context, pull github.P
 			return nil
 		}
 	}
-	if hasCurrentReview {
+	// Either a review already exists at this head, or the lifecycle already ran for
+	// this PR at this head earlier in THIS poll — in which case any job it dispatched
+	// is invisible to the snapshot above, and re-entering would derive the same round
+	// twice.
+	if hasCurrentReview || memo.lifecycleRanAtHead(pull) {
 		return nil
 	}
 	return d.handlePullRequestWorkflow(ctx, pull, memo)
@@ -1306,6 +1500,12 @@ func (d Daemon) reconcileClosedReviewingTasks(ctx context.Context, openBranches 
 		if _, ok := candidates[pull.HeadRef]; !ok {
 			continue
 		}
+		// Fork heads are excluded outright: the fuzzy same-branch resolution below
+		// is keyed on branch text, so a merged fork PR would otherwise drive a
+		// local reviewing task to merged and delete its worktree.
+		if !d.pullRequestHeadIsLocal(pull) {
+			continue
+		}
 		closedByBranch[pull.HeadRef] = append(closedByBranch[pull.HeadRef], pull)
 	}
 	for branch, candidate := range candidates {
@@ -1390,6 +1590,21 @@ func selectReconciledPull(pinnedNumber int64, pinnedHeadSHA string, pulls []gith
 func pullRequestListedAsMerged(pull github.PullRequest) bool {
 	return strings.TrimSpace(pull.MergedAt) != "" || pull.Merged ||
 		strings.EqualFold(strings.TrimSpace(pull.State), "merged")
+}
+
+// lookupPolledPullRequestTask resolves the managed task for a POLLED pull
+// request. A fork head whose HeadRef merely COLLIDES with a local branch name
+// must resolve nothing: routing it as that task lets an outside contributor's
+// pull request drive a local task's review, gate and merge. The identity check
+// lives here, in the one resolver every polled-PR consumer calls, rather than at
+// each call site, so a consumer added later cannot reintroduce the hole. A fork
+// head reports sql.ErrNoRows, which every caller already handles as "this pull
+// request has no managed task".
+func (d Daemon) lookupPolledPullRequestTask(ctx context.Context, pull github.PullRequest) (db.Task, error) {
+	if !d.pullRequestHeadIsLocal(pull) {
+		return db.Task{}, sql.ErrNoRows
+	}
+	return d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
 }
 
 func (d Daemon) lookupPullRequestTask(ctx context.Context, repoFullName string, branch string) (db.Task, error) {
@@ -2013,7 +2228,7 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 	if d.Workflow == nil {
 		return d.ack(ctx, pull.Number, "Gitmoot cannot merge this PR because the workflow engine is not configured.")
 	}
-	task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	task, err := d.lookupPolledPullRequestTask(ctx, pull)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot cannot merge PR #%d because branch `%s` is not registered as a task.", pull.Number, pull.HeadRef))
@@ -2142,7 +2357,7 @@ func (d Daemon) commentTaskRef(ctx context.Context, pull github.PullRequest, com
 		title:  pull.Title,
 		branch: pull.HeadRef,
 	}
-	task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	task, err := d.lookupPolledPullRequestTask(ctx, pull)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ref, nil

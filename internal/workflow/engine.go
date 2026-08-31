@@ -396,6 +396,13 @@ type Engine struct {
 	// wired only in cli (a GitHub read), keeping the engine free of the github
 	// client coupling.
 	PullRequestSignals func(ctx context.Context, repo string, number int) (labels []string, changedPaths []string, err error)
+	// ReviewChangedFiles resolves the repository-relative files changed from the
+	// exact head a reviewer last saw to the current PR head. A scoped follow-up
+	// never degrades SILENTLY: when this seam is unavailable or cannot scope the
+	// range, HandlePullRequestOpened records a review_scope_unavailable task event
+	// and re-reviews the full PR at that head, which re-anchors the prior head so
+	// the next round is scoped again.
+	ReviewChangedFiles func(ctx context.Context, repo string, pullRequest int, previousHead string, currentHead string) ([]string, error)
 }
 
 func (e Engine) block(ctx context.Context, ref taskRef, reason string) error {
