@@ -241,19 +241,27 @@ func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "org seat add: load org registry: %v\n", err)
 		return 1
 	}
-	if _, exists := cfg.Role(name); exists {
-		var policyFlags []string
-		if parentSet {
-			policyFlags = append(policyFlags, "--parent")
+	if current, exists := cfg.Role(name); exists {
+		var changedPolicyFlags []string
+		if parentSet && strings.ToLower(strings.TrimSpace(*parentFlag)) != strings.ToLower(strings.TrimSpace(current.Parent)) {
+			changedPolicyFlags = append(changedPolicyFlags, "--parent")
 		}
-		if scopeSet {
-			policyFlags = append(policyFlags, "--scope")
+		if scopeSet && !slices.Equal(requestedScope, current.Scope) {
+			changedPolicyFlags = append(changedPolicyFlags, "--scope")
 		}
-		if mergeRuleSet {
-			policyFlags = append(policyFlags, "--merge-rule")
+		requestedMergeRule := strings.ToLower(strings.TrimSpace(*mergeRuleFlag))
+		currentMergeRule := strings.ToLower(strings.TrimSpace(current.MergeRule))
+		if requestedMergeRule == "" {
+			requestedMergeRule = "none"
 		}
-		if len(policyFlags) != 0 {
-			fmt.Fprintf(stderr, "org seat add: role %q already exists; %s apply only when creating a role\n", name, strings.Join(policyFlags, ", "))
+		if currentMergeRule == "" {
+			currentMergeRule = "none"
+		}
+		if mergeRuleSet && requestedMergeRule != currentMergeRule {
+			changedPolicyFlags = append(changedPolicyFlags, "--merge-rule")
+		}
+		if len(changedPolicyFlags) != 0 {
+			fmt.Fprintf(stderr, "org seat add: role %q already exists; %s differ from its existing policy\n", name, strings.Join(changedPolicyFlags, ", "))
 			return 2
 		}
 	}
@@ -582,6 +590,9 @@ func orgSeatDesiredRole(cfg config.OrgConfig, snapshot org.Snapshot, name, paneR
 				"role %q already binds %q (resolved to %s), not pane %s referenced by %q",
 				current.Name, current.Pane, binding.PaneID, paneID, paneReference,
 			)
+		}
+		if strings.TrimSpace(current.Pane) != paneID {
+			current.Pane = paneID
 		}
 		return current, true, nil
 	}

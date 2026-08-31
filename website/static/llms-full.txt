@@ -11738,9 +11738,11 @@ repairs a role and installs addressed `reply`, `blocked`, `directive`,
 
 With `--pane`, Gitmoot resolves a literal live pane id first, then a unique
 exact live label, and stores the resolved pane id. Existing label-based commands
-therefore keep working, while later cosmetic label changes do not retarget or
-break bindings created by this command. Duplicate labels, unknown references,
-and a supplied but empty `--pane` hard-fail before any role or route is written.
+therefore keep working; re-running one for the same resolved pane canonicalizes
+that existing binding to the pane id. Later cosmetic label changes do not
+retarget or break bindings written by this command. Duplicate labels, unknown
+references, and a supplied but empty `--pane` hard-fail before any role or route
+is written.
 Omit `--pane` to create an unbound role and the same routes; re-run the command
 with `--pane ID_OR_LABEL` to bind that role later. If a configured binding stops
 resolving, for example after Herdr recreates a pane with a new id, the same
@@ -11760,11 +11762,13 @@ role and cannot create a cycle. An explicit `--scope` must stay within both the
 acting role's scope and the selected parent's scope. Merge authority defaults
 to empty; an explicit `--merge-rule` cannot exceed the acting role's authority.
 The empty-registry `owner` bootstrap keeps its `*` scope and `owner` merge rule.
-The three policy flags initialize new seats only. Supplying any of them for an
-existing role is rejected instead of being silently ignored. Re-running without
-those flags repairs missing owned pieces, fills an empty pane binding, or
-replaces a non-empty binding only when its former target no longer resolves. It
-does not rewrite existing policy or duplicate routes.
+The three policy flags initialize new seats only. An existing role accepts an
+explicit policy value only when it matches the stored value; a changed value is
+rejected instead of being silently ignored. Re-running with matching values or
+without those flags repairs missing owned pieces, fills an empty pane binding,
+canonicalizes a matching label binding, or replaces a non-empty binding only
+when its former target no longer resolves. It does not rewrite existing policy
+or duplicate routes.
 
 `gitmoot org seat rm <name> [--home DIR]` resolves the role's live pane when it
 has a binding and checks every distinct Git checkout reported by that pane's

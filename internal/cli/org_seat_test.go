@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -211,6 +212,37 @@ func TestOrgSeatAddLiteralPaneIDPrecedesDuplicateLabels(t *testing.T) {
 	}
 }
 
+func TestOrgSeatAddCanonicalizesExistingLabelBinding(t *testing.T) {
+	home, paths, panes := setupOrgSeatTestHome(t)
+	withOrgSeatFixtureProvider(t, &panes)
+
+	var stdout, stderr bytes.Buffer
+	code := runOrg([]string{"seat", "add", "owner", "--pane", "w1:p1", "--home", home}, &stdout, &stderr)
+	if code != 0 || !strings.Contains(stdout.String(), `role owner repaired pane="w1:p1"`) {
+		t.Fatalf("label canonicalization code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, ok := cfg.Role("owner")
+	if !ok || owner.Pane != "w1:p1" {
+		t.Fatalf("canonicalized owner role = %+v, present=%t", owner, ok)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := runOrg([]string{"seat", "add", "worker", "--pane", "w1:p2", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("worker claim code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+
+	panes[0].Label = "Renamed Owner"
+	stdout.Reset()
+	stderr.Reset()
+	if code := runOrg([]string{"validate", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("validate canonicalized binding code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+}
+
 func TestOrgSeatBindingSurvivesLabelRename(t *testing.T) {
 	home, _, panes := setupOrgSeatTestHome(t)
 	withOrgSeatFixtureProvider(t, &panes)
@@ -282,15 +314,15 @@ func TestOrgSeatAddCreatesUnboundThenBinds(t *testing.T) {
 	}
 }
 
-func TestOrgSeatAddRejectsPolicyFlagsForExistingRole(t *testing.T) {
+func TestOrgSeatAddRejectsPolicyChangesForExistingRole(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		args []string
 		flag string
 	}{
-		{name: "parent", args: []string{"--parent", "owner"}, flag: "--parent"},
+		{name: "parent", args: []string{"--parent", "missing"}, flag: "--parent"},
 		{name: "scope", args: []string{"--scope", "gitmoot/only"}, flag: "--scope"},
-		{name: "merge rule", args: []string{"--merge-rule", "totally-bogus"}, flag: "--merge-rule"},
+		{name: "merge rule", args: []string{"--merge-rule", "self"}, flag: "--merge-rule"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			home, paths, panes := setupOrgSeatTestHome(t)
@@ -305,8 +337,8 @@ func TestOrgSeatAddRejectsPolicyFlagsForExistingRole(t *testing.T) {
 			stdout.Reset()
 			stderr.Reset()
 			code := runOrg(args, &stdout, &stderr)
-			if code != 2 || !strings.Contains(stderr.String(), test.flag+" apply only when creating a role") {
-				t.Fatalf("existing policy add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+			if code != 2 || !strings.Contains(stderr.String(), test.flag+" differ from its existing policy") {
+				t.Fatalf("existing policy change code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 			}
 			cfg, err := config.LoadOrg(paths)
 			if err != nil {
@@ -320,6 +352,37 @@ func TestOrgSeatAddRejectsPolicyFlagsForExistingRole(t *testing.T) {
 				t.Fatalf("routes after rejected policy flag = %d, want 6", got)
 			}
 		})
+	}
+}
+
+func TestOrgSeatAddAcceptsMatchingPolicyFlagsForExistingRole(t *testing.T) {
+	home, paths, panes := setupOrgSeatTestHome(t)
+	withOrgSeatFixtureProvider(t, &panes)
+	args := []string{
+		"seat", "add", "worker", "--pane", "Worker", "--parent", "owner",
+		"--scope", "gitmoot/gitmoot", "--merge-rule", "none", "--home", home,
+	}
+	var stdout, stderr bytes.Buffer
+	if code := runOrg(args, &stdout, &stderr); code != 0 {
+		t.Fatalf("initial policy add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := runOrg(args, &stdout, &stderr); code != 0 ||
+		!strings.Contains(stdout.String(), `role worker existed pane="w1:p2"`) {
+		t.Fatalf("matching policy retry code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, ok := cfg.Role("worker")
+	if !ok || worker.Parent != "owner" || !slices.Equal(worker.Scope, []string{"gitmoot/gitmoot"}) ||
+		worker.MergeRule != "none" || worker.Pane != "w1:p2" {
+		t.Fatalf("worker after matching retry = %+v, present=%t", worker, ok)
+	}
+	if got := len(listOrgSeatTestRules(t, paths)); got != 6 {
+		t.Fatalf("routes after matching retry = %d, want 6", got)
 	}
 }
 
