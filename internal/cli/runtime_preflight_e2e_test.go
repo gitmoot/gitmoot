@@ -80,6 +80,56 @@ func TestRuntimePreflightStubBinaryE2E(t *testing.T) {
 }
 
 func TestRuntimePreflightDefaultWorkerDoesNotAssumeConfiguredExecutionIdentity(t *testing.T) {
+	rawHome, store, job := configuredClaudePreflightJob(t, "host-only-preflight")
+
+	preflightCalls := 0
+	worker := defaultJobWorker(store, io.Discard, rawHome)
+	worker.RuntimePreflight = func(_ context.Context, agent runtime.Agent, request runtime.RuntimeContractRequest) runtime.RuntimeContractResult {
+		preflightCalls++
+		if request.EffectiveUIDKnown {
+			t.Fatalf("host-only worker preflight received execution uid %d", request.EffectiveUID)
+		}
+		return unsupportedEffectiveUIDPreflight(agent)
+	}
+	if err := worker.run(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := store.GetJob(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preflightCalls != 1 || completed.State != string(workflow.JobBlocked) {
+		t.Fatalf("host-only preflight calls = %d, job state = %q; want one call and blocked", preflightCalls, completed.State)
+	}
+}
+
+func TestRuntimePreflightLifecycleWorkerUsesConfiguredExecutionIdentity(t *testing.T) {
+	rawHome, store, job := configuredClaudePreflightJob(t, "lifecycle-preflight")
+
+	preflightCalls := 0
+	worker := defaultJobWorker(store, io.Discard, rawHome)
+	worker.ExecutionBackendFactory = worker.defaultExecutionBackend
+	worker.RuntimePreflight = func(_ context.Context, agent runtime.Agent, request runtime.RuntimeContractRequest) runtime.RuntimeContractResult {
+		preflightCalls++
+		if !request.EffectiveUIDKnown || request.EffectiveUID != 996 {
+			t.Fatalf("lifecycle worker preflight effective uid = %d known %t, want 996 known", request.EffectiveUID, request.EffectiveUIDKnown)
+		}
+		return unsupportedEffectiveUIDPreflight(agent)
+	}
+	if err := worker.run(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := store.GetJob(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preflightCalls != 1 || completed.State != string(workflow.JobBlocked) {
+		t.Fatalf("lifecycle preflight calls = %d, job state = %q; want one call and blocked", preflightCalls, completed.State)
+	}
+}
+
+func configuredClaudePreflightJob(t *testing.T, jobID string) (string, *db.Store, db.Job) {
+	t.Helper()
 	rawHome := t.TempDir()
 	paths, err := pathsFromFlag(rawHome)
 	if err != nil {
@@ -96,40 +146,24 @@ func TestRuntimePreflightDefaultWorkerDoesNotAssumeConfiguredExecutionIdentity(t
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	checkout := createDaemonWorkerGitCheckout(t, "host-only-preflight")
+	checkout := createDaemonWorkerGitCheckout(t, jobID)
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgentWithPolicy(t, store, "root-claude", runtime.ClaudeRuntime, "fresh:host-only", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyDangerFullAccess)
-	const jobID = "host-only-preflight"
+	seedDaemonWorkerAgentWithPolicy(t, store, "root-claude", runtime.ClaudeRuntime, "fresh:"+jobID, []string{"implement"}, "owner/repo", runtime.AutonomyPolicyDangerFullAccess)
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: jobID, Agent: "root-claude", Action: "implement", Repo: "owner/repo", Branch: "main"})
-
-	preflightCalls := 0
-	worker := defaultJobWorker(store, io.Discard, rawHome)
-	worker.RuntimePreflight = func(_ context.Context, agent runtime.Agent, request runtime.RuntimeContractRequest) runtime.RuntimeContractResult {
-		preflightCalls++
-		if request.EffectiveUIDKnown {
-			t.Fatalf("host-only worker preflight received execution uid %d", request.EffectiveUID)
-		}
-		return runtime.RuntimeContractResult{
-			Runtime: agent.Runtime, State: runtime.RuntimeContractUnsupported, Instrument: "effective-uid",
-			Requirements: []runtime.RuntimeRequirementResult{{
-				Kind: runtime.RuntimeRequirementNonRootEUID, Name: "effective uid must be non-root",
-				Remedy: "run as non-root", State: runtime.RuntimeContractUnsupported, Instrument: "effective-uid",
-			}},
-		}
-	}
 	job, err := store.GetJob(context.Background(), jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := worker.run(context.Background(), job); err != nil {
-		t.Fatal(err)
-	}
-	completed, err := store.GetJob(context.Background(), jobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if preflightCalls != 1 || completed.State != string(workflow.JobBlocked) {
-		t.Fatalf("host-only preflight calls = %d, job state = %q; want one call and blocked", preflightCalls, completed.State)
+	return rawHome, store, job
+}
+
+func unsupportedEffectiveUIDPreflight(agent runtime.Agent) runtime.RuntimeContractResult {
+	return runtime.RuntimeContractResult{
+		Runtime: agent.Runtime, State: runtime.RuntimeContractUnsupported, Instrument: "effective-uid",
+		Requirements: []runtime.RuntimeRequirementResult{{
+			Kind: runtime.RuntimeRequirementNonRootEUID, Name: "effective uid must be non-root",
+			Remedy: "run as non-root", State: runtime.RuntimeContractUnsupported, Instrument: "effective-uid",
+		}},
 	}
 }
 

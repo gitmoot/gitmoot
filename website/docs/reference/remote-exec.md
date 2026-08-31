@@ -121,8 +121,8 @@ Gitmoot reads `[remote_exec]` when it dispatches a job. Once the process starts
 a remote credential listener for a home, those listener coordinates are
 immutable: a later dispatch with changed coordinates fails loudly until the
 daemon restarts instead of silently reusing a stale endpoint. Foreground
-dispatch retains the host runner path because the lifecycle is acquired at the
-daemon job-worker boundary.
+dispatch refuses `remote` because it has no daemon-owned lifecycle, ledger, or
+reaper.
 
 When `[credentials].model_gateway = true`, a remote shell job receives the
 non-secret route in `GITMOOT_CREDENTIAL_GATEWAY_URL` and a path to an owner-only
