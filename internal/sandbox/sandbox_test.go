@@ -93,6 +93,7 @@ func TestSandboxExecReadOnlyWorkdirE2E(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	cleanupProbeDir := filepath.Join(cacheDir, "go-mod", ".cleanup-probe")
 	// The go command installs downloaded toolchains as read-only modules. Make
 	// their directories removable before testing.TempDir cleans the sandbox.
 	t.Cleanup(func() {
@@ -107,6 +108,14 @@ func TestSandboxExecReadOnlyWorkdirE2E(t *testing.T) {
 		})
 		if err != nil {
 			t.Errorf("make sandbox tool cache removable: %v", err)
+			return
+		}
+		if info, statErr := os.Stat(cleanupProbeDir); statErr == nil {
+			if info.Mode().Perm()&0o200 == 0 {
+				t.Errorf("sandbox tool cache cleanup left probe directory read-only: %v", info.Mode().Perm())
+			}
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			t.Errorf("inspect sandbox tool cache cleanup probe: %v", statErr)
 		}
 	})
 	source := filepath.Join(workdir, "source.txt")
@@ -162,7 +171,6 @@ if cat "$4" >/dev/null 2>&1; then exit 43; fi
 	}
 	// Exercise the cleanup contract even when the host already has the requested
 	// Go toolchain and therefore does not download a read-only toolchain module.
-	cleanupProbeDir := filepath.Join(cacheDir, "go-mod", ".cleanup-probe")
 	if err := os.MkdirAll(cleanupProbeDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
