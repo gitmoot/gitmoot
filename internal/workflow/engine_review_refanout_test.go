@@ -58,6 +58,14 @@ func TestFollowUpReviewScopesFindingsAndFilesFromReviewerHead(t *testing.T) {
 		TaskID:      "task-1678",
 		LeadAgent:   "lead",
 	})
+	// #1712 (landed on main after this branch opened) made the fix DISPATCH an
+	// explicit per-PR opt-in: report-only is the default, because the requester
+	// already owns the context and worktree. This test is about what the fix job
+	// CARRIES, so it enables the policy as a production precondition — exactly the
+	// row AdvanceJob reads — and still drives the real dispatch path afterwards
+	// (PullRequestAutoFixPolicyFor -> dispatchFix -> autoFixOwner ->
+	// fixBranchLockOwner -> FixWorktreeAllocator -> enqueue).
+	enableAutoFix(t, store, 1678)
 	insertPriorReviewResult(t, store, "prior-review", "head-one", AgentResult{
 		Decision: "changes_requested",
 		Summary:  "Fix the boundary check.",
