@@ -335,8 +335,8 @@ func TestExecBackendResolvedNonLocalCannotRunLocallyDaemonE2E(t *testing.T) {
 	jobID := execBackendDispatchImplement(t, store)
 
 	previousResolver := daemonJobExecBackendFor
-	daemonJobExecBackendFor = func(jobWorker, string, bool) (execbackend.Backend, error) {
-		return execbackend.Backend("p2-probe"), nil
+	daemonJobExecBackendFor = func(jobWorker, string, bool) (execbackend.Backend, config.RemoteExecConfig, error) {
+		return execbackend.Backend("p2-probe"), config.DefaultRemoteExecConfig(), nil
 	}
 	t.Cleanup(func() { daemonJobExecBackendFor = previousResolver })
 
@@ -411,10 +411,10 @@ func TestP2GapEveryJobSubprocessRouteRefusesLocalFallback(t *testing.T) {
 	previousResolver := daemonJobExecBackendFor
 	var resolvedName string
 	var resolvedPresent bool
-	daemonJobExecBackendFor = func(_ jobWorker, name string, present bool) (execbackend.Backend, error) {
+	daemonJobExecBackendFor = func(_ jobWorker, name string, present bool) (execbackend.Backend, config.RemoteExecConfig, error) {
 		resolvedName = name
 		resolvedPresent = present
-		return backend, nil
+		return backend, config.DefaultRemoteExecConfig(), nil
 	}
 	t.Cleanup(func() { daemonJobExecBackendFor = previousResolver })
 
@@ -540,10 +540,10 @@ func TestP2GapSupervisorAdvanceResolvesJobSubprocessRunner(t *testing.T) {
 	previousResolver := daemonJobExecBackendFor
 	var resolvedName string
 	var resolvedPresent bool
-	daemonJobExecBackendFor = func(_ jobWorker, name string, present bool) (execbackend.Backend, error) {
+	daemonJobExecBackendFor = func(_ jobWorker, name string, present bool) (execbackend.Backend, config.RemoteExecConfig, error) {
 		resolvedName = name
 		resolvedPresent = present
-		return execbackend.Backend("p2-probe"), nil
+		return execbackend.Backend("p2-probe"), config.DefaultRemoteExecConfig(), nil
 	}
 	t.Cleanup(func() { daemonJobExecBackendFor = previousResolver })
 
@@ -569,10 +569,10 @@ func TestP2GapSingleRepoSupervisorAdvanceResolvesJobSubprocessRunner(t *testing.
 	previousResolver := daemonJobExecBackendFor
 	var resolvedName string
 	var resolvedPresent bool
-	daemonJobExecBackendFor = func(_ jobWorker, name string, present bool) (execbackend.Backend, error) {
+	daemonJobExecBackendFor = func(_ jobWorker, name string, present bool) (execbackend.Backend, config.RemoteExecConfig, error) {
 		resolvedName = name
 		resolvedPresent = present
-		return execbackend.Backend("p2-probe"), nil
+		return execbackend.Backend("p2-probe"), config.DefaultRemoteExecConfig(), nil
 	}
 	t.Cleanup(func() { daemonJobExecBackendFor = previousResolver })
 
@@ -849,7 +849,7 @@ func TestRemoteBackendRefusesEveryHostOnlyRoute(t *testing.T) {
 	// GITMOOT-IMPL: Slice D converts only the configured lifecycle route; an
 	// unconfigured remote backend must still refuse before provider construction.
 	t.Run("lifecycle provider requires credential config", func(t *testing.T) {
-		if _, err := worker.defaultExecutionBackend(execbackend.Remote); err == nil || !strings.Contains(err.Error(), "e2b_api_key_file is required") {
+		if _, err := worker.defaultExecutionBackend(execbackend.Remote, executionBackendConfigForTest(t, worker)); err == nil || !strings.Contains(err.Error(), "e2b_api_key_file is required") {
 			t.Fatalf("remote lifecycle error = %v, want credential-config refusal", err)
 		}
 	})
@@ -964,8 +964,8 @@ func TestExecBackendEphemeralResolvesBeforeRuntimeStart(t *testing.T) {
 	})
 
 	previousResolver := daemonJobExecBackendFor
-	daemonJobExecBackendFor = func(jobWorker, string, bool) (execbackend.Backend, error) {
-		return "", errors.New("backend preflight refused")
+	daemonJobExecBackendFor = func(jobWorker, string, bool) (execbackend.Backend, config.RemoteExecConfig, error) {
+		return "", config.RemoteExecConfig{}, errors.New("backend preflight refused")
 	}
 	t.Cleanup(func() { daemonJobExecBackendFor = previousResolver })
 

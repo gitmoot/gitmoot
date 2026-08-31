@@ -55,8 +55,9 @@ type jobWorker struct {
 	// ExecutionBackendFactory is nil on hand-built/test workers that intentionally
 	// retain the pre-P2b host-only path. executionBackendJobWorker wires it for
 	// real daemon jobs, where one lifecycle instance is acquired after runtime
-	// admission and kept alive through every Mailbox delivery attempt.
-	ExecutionBackendFactory func(execbackend.Backend) (execbackend.ExecutionBackend, error)
+	// admission and kept alive through every Mailbox delivery attempt. The factory
+	// must consume the same config snapshot used for preflight.
+	ExecutionBackendFactory func(execbackend.Backend, config.RemoteExecConfig) (execbackend.ExecutionBackend, error)
 	// GITMOOT-IMPL: RemoteEnvdEndpointResolver is an offline-test seam. Production leaves it
 	// nil and resolves envd from [remote_exec].e2b_domain or the provider response.
 	RemoteEnvdEndpointResolver func(sandboxID string, port int) string
@@ -205,18 +206,20 @@ func executionBackendJobWorker(store *db.Store, stdout io.Writer, home string) j
 	// set stranded by a switch to remote, then reconcile the configured provider.
 	// The attempts are independent so a local disk failure cannot suppress remote
 	// account reconciliation (or vice versa).
-	startupBackends := []execbackend.Backend{execbackend.Local}
-	if cfg, err := worker.executionBackendConfig(); err != nil {
+	cfg, err := worker.executionBackendConfig()
+	if err != nil {
 		writeLine(stdout, "execution backend startup config failed: %v", err)
 		return worker
-	} else if configured, err := execbackend.ParseImplemented(cfg.Backend); err != nil {
+	}
+	startupBackends := []execbackend.Backend{execbackend.Local}
+	if configured, err := execbackend.ParseImplemented(cfg.Backend); err != nil {
 		writeLine(stdout, "execution backend startup config failed: %v", err)
 		return worker
 	} else if configured != execbackend.Local {
 		startupBackends = append(startupBackends, configured)
 	}
 	for _, backend := range startupBackends {
-		if _, err := worker.ExecutionBackendFactory(backend); err != nil {
+		if _, err := worker.ExecutionBackendFactory(backend, cfg); err != nil {
 			writeLine(stdout, "execution backend startup reap failed for %s: %v", backend, err)
 		}
 	}
@@ -235,7 +238,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// runtime below, so delaying this decision until after agent lookup would let
 	// them bypass the backend boundary entirely.
 	jobExecBackend, jobExecBackendPresent := payload.ExecBackendOverride()
-	execBackend, err := daemonJobExecBackendFor(w, jobExecBackend, jobExecBackendPresent)
+	execBackend, execConfig, err := daemonJobExecBackendFor(w, jobExecBackend, jobExecBackendPresent)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
@@ -348,7 +351,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// secondary adapter rebuild consumes the same backend selection.
 	agent.ExecBackend = string(execBackend)
 	preflightRequest := runtime.RuntimeContractRequest{Plan: payload.Plan}
-	if result, checked, preflightErr := w.runtimeContractPreflight(ctx, execBackend, agent, preflightRequest); preflightErr != nil {
+	if result, checked, preflightErr := w.runtimeContractPreflight(ctx, execBackend, execConfig, agent, preflightRequest); preflightErr != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, preflightErr); finishErr != nil {
 			return finishErr
 		}
@@ -644,7 +647,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// delivery and is destroyed synchronously on every return path. Host checkout,
 	// git, observation, and finalization remain on checkout/jobRunner; only runtime
 	// delivery executes in the distinct backend workspace.
-	lifecycle, instance, credentialLease, credentialEnv, lifecycleErr := w.provisionExecutionBackend(ctx, execBackend, agent.Runtime, job, jobTimeout+runtimeLeaseTeardownGrace, checkout)
+	lifecycle, instance, credentialLease, credentialEnv, lifecycleErr := w.provisionExecutionBackend(ctx, execBackend, execConfig, agent.Runtime, job, jobTimeout+runtimeLeaseTeardownGrace, checkout)
 	if instance != nil {
 		defer w.destroyExecutionBackend(job.ID, lifecycle, instance)
 	}
@@ -1069,9 +1072,15 @@ func runtimeContractPreflightForBackend(backend execbackend.Backend, local func(
 	return consumed.contract, consumed.checked, err
 }
 
-func (w jobWorker) runtimeContractPreflight(ctx context.Context, backend execbackend.Backend, agent runtime.Agent, request runtime.RuntimeContractRequest) (runtime.RuntimeContractResult, bool, error) {
+func (w jobWorker) runtimeContractPreflight(ctx context.Context, backend execbackend.Backend, cfg config.RemoteExecConfig, agent runtime.Agent, request runtime.RuntimeContractRequest) (runtime.RuntimeContractResult, bool, error) {
 	if w.RuntimePreflight == nil {
 		return runtime.RuntimeContractResult{}, false, nil
+	}
+	if backend == execbackend.Local && w.ExecutionBackendFactory != nil {
+		if identity := cfg.LocalIdentity(); identity != nil {
+			request.EffectiveUID = int(identity.UID)
+			request.EffectiveUIDKnown = true
+		}
 	}
 	result, checked, err := runtimeContractPreflightForBackend(backend, func() runtime.RuntimeContractResult {
 		return w.RuntimePreflight(ctx, agent, request)
@@ -1473,30 +1482,20 @@ func (w jobWorker) parallelSessionPolicy() (config.ParallelSessionPolicy, error)
 // plumbing. A missing config file or section resolves to local; an unknown
 // value (config or override) is a hard error naming the value and the allowed
 // set — the fail-loud contract, never a silent fallback.
-func (w jobWorker) resolveExecBackend(jobOverride string, jobOverridePresent bool) (execbackend.Backend, error) {
-	cfg := config.DefaultRemoteExecConfig()
-	if w.ConfigHomeExplicit || strings.TrimSpace(w.ConfigHome) != "" {
-		paths, err := w.configPaths()
-		if err != nil {
-			return "", err
-		}
-		loaded, loadErr := config.LoadRemoteExecConfig(paths)
-		switch {
-		case loadErr == nil:
-			cfg = loaded
-		case errors.Is(loadErr, os.ErrNotExist):
-			// No config file: the local default applies.
-		default:
-			return "", fmt.Errorf("load [remote_exec] config: %w", loadErr)
-		}
+func (w jobWorker) resolveExecBackend(jobOverride string, jobOverridePresent bool) (execbackend.Backend, config.RemoteExecConfig, error) {
+	cfg, err := w.executionBackendConfig()
+	if err != nil {
+		return "", config.RemoteExecConfig{}, err
 	}
 	if jobOverridePresent {
-		return execbackend.Resolve(cfg.Backend, &jobOverride)
+		backend, err := execbackend.Resolve(cfg.Backend, &jobOverride)
+		return backend, cfg, err
 	}
-	return execbackend.Resolve(cfg.Backend, nil)
+	backend, err := execbackend.Resolve(cfg.Backend, nil)
+	return backend, cfg, err
 }
 
-var daemonJobExecBackendFor = func(w jobWorker, jobOverride string, jobOverridePresent bool) (execbackend.Backend, error) {
+var daemonJobExecBackendFor = func(w jobWorker, jobOverride string, jobOverridePresent bool) (execbackend.Backend, config.RemoteExecConfig, error) {
 	return w.resolveExecBackend(jobOverride, jobOverridePresent)
 }
 
@@ -2941,7 +2940,7 @@ func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 	}
 	agent := runtimeAgent(dbAgent)
 	jobBackend, jobBackendPresent := payload.ExecBackendOverride()
-	backend, err := daemonJobExecBackendFor(w, jobBackend, jobBackendPresent)
+	backend, _, err := daemonJobExecBackendFor(w, jobBackend, jobBackendPresent)
 	if err != nil {
 		return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry backend resolution failed: "+err.Error())
 	}

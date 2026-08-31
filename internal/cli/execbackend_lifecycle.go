@@ -31,15 +31,11 @@ var reapedExecutionBackendRoots sync.Map
 
 var executionBackendFencingToken = sync.OnceValues(newRuntimeLockOwnerToken)
 
-func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend) (execbackend.ExecutionBackend, error) {
+func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend, cfg config.RemoteExecConfig) (execbackend.ExecutionBackend, error) {
 	return execbackend.Consume(backend, func() (execbackend.ExecutionBackend, error) {
 		home := strings.TrimSpace(w.workflowHome())
 		if home == "" {
 			return nil, errors.New("resolve local execution-backend home")
-		}
-		cfg, err := w.executionBackendConfig()
-		if err != nil {
-			return nil, err
 		}
 		root := filepath.Join(home, "execbackends", string(execbackend.Local))
 		if cfg.LocalRoot != "" {
@@ -62,10 +58,6 @@ func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend) (execbac
 		}
 		return local, nil
 	}, func() (execbackend.ExecutionBackend, error) {
-		cfg, err := w.executionBackendConfig()
-		if err != nil {
-			return nil, err
-		}
 		if err := cfg.ValidateE2BProvider(); err != nil {
 			return nil, err
 		}
@@ -142,7 +134,7 @@ func (w jobWorker) executionBackendConfig() (config.RemoteExecConfig, error) {
 	}
 }
 
-func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execbackend.Backend, runtimeName string, job db.Job, ttl time.Duration, checkout string) (execbackend.ExecutionBackend, *execbackend.Instance, *credgw.Lease, []string, error) {
+func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execbackend.Backend, cfg config.RemoteExecConfig, runtimeName string, job db.Job, ttl time.Duration, checkout string) (execbackend.ExecutionBackend, *execbackend.Instance, *credgw.Lease, []string, error) {
 	if w.ExecutionBackendFactory == nil {
 		return nil, nil, nil, nil, nil
 	}
@@ -152,12 +144,12 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 	var credentialPlan remoteCredentialGatewayPlan
 	if backend == execbackend.Remote {
 		var err error
-		credentialPlan, err = w.prepareRemoteCredentialGateway(ttl)
+		credentialPlan, err = w.prepareRemoteCredentialGateway(cfg, ttl)
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
 	}
-	lifecycle, err := w.ExecutionBackendFactory(backend)
+	lifecycle, err := w.ExecutionBackendFactory(backend, cfg)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("construct %s execution backend: %w", backend, err)
 	}

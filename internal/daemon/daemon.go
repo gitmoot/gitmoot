@@ -1099,11 +1099,9 @@ func (d Daemon) pullRequestReadyToMerge(ctx context.Context, pull github.PullReq
 		}
 		return false, err
 	}
-	if lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), pull.HeadRef); err == nil && lock.SkipNativeReviewFanout {
-		return false, nil
-	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return false, err
-	}
+	// TaskReadyToMerge is the retry authority. SkipNativeReviewFanout controls
+	// PR-open review routing only; a direct review can leave this task pending
+	// on CI, and suppressing its poll here strands gitmoot/merge-gate (#1708).
 	return task.State == string(workflow.TaskReadyToMerge), nil
 }
 
@@ -1118,9 +1116,6 @@ func (d Daemon) handleReadyToMergeWorkflow(ctx context.Context, pull github.Pull
 	lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), pull.HeadRef)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
-	}
-	if lock.SkipNativeReviewFanout {
-		return nil
 	}
 	leadAgent := strings.TrimSpace(lock.Owner)
 	if leadAgent == "" {
