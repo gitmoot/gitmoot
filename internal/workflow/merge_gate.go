@@ -1288,15 +1288,16 @@ func (g PolicyMergeGate) pending(ctx context.Context, request MergeRequest, sha 
 		if err != nil {
 			return MergeDecision{}, err
 		}
-		if _, err := g.GitHub.CreateCommitStatus(ctx, github.CommitStatusInput{
+		// The ready_to_merge task state is the retry authority. Publishing this
+		// status is observability only; a transient forge failure must not strand
+		// an approved review before the daemon can re-evaluate pending CI (#1708).
+		_, _ = g.GitHub.CreateCommitStatus(ctx, github.CommitStatusInput{
 			Repo:        repo,
 			SHA:         sha,
 			State:       "pending",
 			Context:     gitmootMergeGateContext,
 			Description: commitStatusDescription(reason),
-		}); err != nil {
-			return MergeDecision{}, err
-		}
+		})
 	}
 	return MergeDecision{Ready: true, Reason: PlainReason(reason)}, nil
 }

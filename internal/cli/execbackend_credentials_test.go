@@ -94,9 +94,11 @@ credential_gateway_url = %q
 	lifecycle := &credentialRevokingExecutionBackend{inner: inner, home: paths.Home}
 	worker := jobWorker{
 		ConfigHome: baseHome, ConfigHomeExplicit: true,
-		ExecutionBackendFactory: func(execbackend.Backend) (execbackend.ExecutionBackend, error) { return lifecycle, nil },
+		ExecutionBackendFactory: func(_ execbackend.Backend, _ config.RemoteExecConfig) (execbackend.ExecutionBackend, error) {
+			return lifecycle, nil
+		},
 	}
-	gotLifecycle, instance, lease, env, err := worker.provisionExecutionBackend(context.Background(), execbackend.Remote, runtime.ShellRuntime, db.Job{ID: "job-brokered"}, time.Minute, "/checkout")
+	gotLifecycle, instance, lease, env, err := worker.provisionExecutionBackend(context.Background(), execbackend.Remote, executionBackendConfigForTest(t, worker), runtime.ShellRuntime, db.Job{ID: "job-brokered"}, time.Minute, "/checkout")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,11 +207,11 @@ credential_gateway_url = %q
 
 func TestRemoteModelRuntimeRefusesBeforeProviderSpend(t *testing.T) {
 	var factoryCalls atomic.Int32
-	worker := jobWorker{ExecutionBackendFactory: func(execbackend.Backend) (execbackend.ExecutionBackend, error) {
+	worker := jobWorker{ExecutionBackendFactory: func(_ execbackend.Backend, _ config.RemoteExecConfig) (execbackend.ExecutionBackend, error) {
 		factoryCalls.Add(1)
 		return nil, errors.New("must not construct")
 	}}
-	_, instance, lease, env, err := worker.provisionExecutionBackend(context.Background(), execbackend.Remote, runtime.ClaudeRuntime, db.Job{ID: "job-no-fallback"}, time.Minute, "/checkout")
+	_, instance, lease, env, err := worker.provisionExecutionBackend(context.Background(), execbackend.Remote, executionBackendConfigForTest(t, worker), runtime.ClaudeRuntime, db.Job{ID: "job-no-fallback"}, time.Minute, "/checkout")
 	if err == nil || !strings.Contains(err.Error(), "raw-key fallback is forbidden") || instance != nil || lease != nil || len(env) != 0 || factoryCalls.Load() != 0 {
 		t.Fatalf("refusal instance=%+v lease=%v env=%v factory=%d err=%v", instance, lease, env, factoryCalls.Load(), err)
 	}
@@ -253,12 +255,12 @@ e2b_template = "template-test"
 			var factoryCalls atomic.Int32
 			worker := jobWorker{
 				ConfigHome: baseHome, ConfigHomeExplicit: true,
-				ExecutionBackendFactory: func(execbackend.Backend) (execbackend.ExecutionBackend, error) {
+				ExecutionBackendFactory: func(_ execbackend.Backend, _ config.RemoteExecConfig) (execbackend.ExecutionBackend, error) {
 					factoryCalls.Add(1)
 					return nil, errors.New("must not construct")
 				},
 			}
-			_, instance, lease, env, err := worker.provisionExecutionBackend(context.Background(), execbackend.Remote, runtime.ShellRuntime, db.Job{ID: "job-invalid-gateway"}, time.Minute, "/checkout")
+			_, instance, lease, env, err := worker.provisionExecutionBackend(context.Background(), execbackend.Remote, executionBackendConfigForTest(t, worker), runtime.ShellRuntime, db.Job{ID: "job-invalid-gateway"}, time.Minute, "/checkout")
 			if err == nil || !strings.Contains(err.Error(), test.wantErrorContains) || instance != nil || lease != nil || len(env) != 0 || factoryCalls.Load() != 0 {
 				t.Fatalf("preflight instance=%+v lease=%v env=%v factory=%d err=%v", instance, lease, env, factoryCalls.Load(), err)
 			}

@@ -218,6 +218,16 @@ func TestRuntimePreflightHonorsDeclaredPrecondition(t *testing.T) {
 	if err := RuntimeContractDispatchError(agent, result); err == nil || !strings.Contains(err.Error(), "--permission-mode bypassPermissions") {
 		t.Fatalf("precondition error = %v, want exact argv", err)
 	}
+	result = checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{
+		EffectiveUID:      996,
+		EffectiveUIDKnown: true,
+	})
+	if result.State != RuntimeContractSupported || len(result.Requirements) != 1 ||
+		result.Requirements[0].State != RuntimeContractSupported ||
+		result.Requirements[0].Instrument != "effective-uid" ||
+		!strings.Contains(result.Requirements[0].Detail, "996") {
+		t.Fatalf("configured execution identity result = %#v, want supported effective uid 996", result)
+	}
 	checker.EffectiveUID = func() (int, bool) { return 0, false }
 	result = checker.Check(context.Background(), agent)
 	if result.State != RuntimeContractUnknown || result.Instrument != "effective-uid" {
