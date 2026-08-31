@@ -372,11 +372,15 @@ specific incident; an incident does not override this rule by itself.
   one running reviewer**. An active implementer is a persistent seat currently
   changing code or a running engine implementation job.
 - A DRAIN mode-switch PR is not merge-ready until the coordinator configures
-  the shared daemon with `[daemon] workers = 1`, applies the warm reload, and
-  verifies the effective worker count. This is the atomic runtime gate shared by
-  native PR fanout, heartbeats, and manual background reviews. All DRAIN reviews
-  must run as background engine jobs; never bypass the gate with a foreground or
-  persistent-seat reviewer.
+  the shared daemon with `[daemon] workers = 1`; every active
+  `[repos."gitmoot/*"].max_parallel` override must be absent, zero, or one.
+  Apply the warm reload and verify both the effective global worker count and
+  every effective per-repository limit. This is the atomic runtime gate shared
+  by native PR fanout, heartbeats, and manual background reviews.
+- Before that PR merges, every foreground or persistent-seat review already in
+  progress must reach a terminal handoff; those reviews cannot be grandfathered.
+  All DRAIN reviews then run as background engine jobs. Never bypass the shared
+  gate with a foreground or persistent-seat reviewer.
 - Before that PR merges, disable every `action=review` heartbeat and allow
   exactly one review-capable agent on each active `gitmoot/*` repository. For a
   PR with a branch lock, the native PR watcher is the sole producer; do not also
