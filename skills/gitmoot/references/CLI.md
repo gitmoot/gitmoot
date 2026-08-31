@@ -2727,11 +2727,12 @@ disables it (a negative value is rejected). Unlike `[orchestrate].escalation_ttl
 
 Native task auto-merge is enabled by default only behind an exact-head approved
 review and green SHA-scoped commit statuses/check-runs. A gate miss parks the
-task as `awaiting_human_merge`, records an org escalation, and addresses the
-parent of the org role that owns the repo. The recipient comes from the chart
-alone and is never swapped for a reachable role; `org validate` reports one with
-no wake route or pane binding.
-Set `[repos."owner/repo".merge_gate] auto_merge = false` as an explicit
+task as `awaiting_human_merge` and records an org escalation. It selects the
+most-specific live role whose scope matches the repo and addresses that role's
+nearest chart ancestor. With no live match it addresses `owner`; a root match
+addresses itself. Routing does not change based on predicted deliverability;
+`org validate` reports missing wake routes and pane bindings. Set
+`[repos."owner/repo".merge_gate] auto_merge = false` as an explicit
 kill-switch; that deliberate hold does not escalate. Pipeline `allow_auto_merge`
 is independent, and an authorized `@gitmoot merge` remains an explicit override.
 

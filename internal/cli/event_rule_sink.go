@@ -354,7 +354,7 @@ func (s *eventRuleSink) addressBlockedEvent(ctx context.Context, event events.Ev
 	}
 	if targetRole == "" {
 		if cfg, ok := s.loadOrgConfig(); ok {
-			targetRole, _ = repoOrgOwner(cfg, event.Repo)
+			targetRole, _ = repoOrgOwner(ctx, s.store, cfg, event.Repo)
 		}
 	}
 	if targetRole != "" {

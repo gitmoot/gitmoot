@@ -854,7 +854,7 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 		label = "pr-" + strings.ReplaceAll(request.Repo, "/", "-") + "-" + fmt.Sprint(request.PullRequest)
 	}
 	cfg, _ := loadMergeGateOrgConfig(g.Home)
-	from, fromDeclared := mergeGateEscalationFrom(cfg, request.Repo)
+	from, fromDeclared := mergeGateEscalationFrom(ctx, g.Store, cfg, request.Repo)
 	to := mergeGateEscalationTo(cfg, from, fromDeclared)
 	body := workflow.FormatOrgEscalateNote(from, to, label, reason.Render())
 	if body == "" {
@@ -864,18 +864,18 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 	if !parsed {
 		return errors.New("parse merge-gate escalation note")
 	}
-	// DEDUP IS ROUTE-INDEPENDENT ON PURPOSE. Comparing whole bodies once meant a
-	// changed recipient re-escalated the same miss, leaving two open escalations
-	// addressed to two roles. The identity of an escalation is who raised it, for
-	// which workflow, about what.
+	// The stable miss identity is workflow + question + accountable recipient.
+	// The roster-derived author is deliberately excluded: equal-scope seat churn
+	// must not duplicate an open escalation. The recipient is deliberately included:
+	// a reorg must enqueue the still-open miss for the newly accountable branch.
 	notes, err := g.Store.ListWorkflowNotes(ctx, label, 0)
 	if err != nil {
 		return err
 	}
 	question := reason.Render()
 	for _, note := range notes {
-		existingFrom, _, existingWF, existingQuestion, ok := workflow.ParseOrgEscalateNote(note.Body)
-		if ok && existingFrom == from && existingWF == label && existingQuestion == question {
+		_, existingTo, existingWF, existingQuestion, ok := workflow.ParseOrgEscalateNote(note.Body)
+		if ok && existingTo == to && existingWF == label && existingQuestion == question {
 			return nil
 		}
 	}
@@ -902,8 +902,8 @@ func loadMergeGateOrgConfig(home string) (config.OrgConfig, bool) {
 // repo, and this fleet has repos and roles sharing names (vetrina, joltra), so a
 // synthesized name can collide with an unrelated declared role. Routing off that
 // collision would escalate into a branch that owns nothing here.
-func mergeGateEscalationFrom(cfg config.OrgConfig, repo string) (string, bool) {
-	if owner, ok := repoOrgOwner(cfg, repo); ok {
+func mergeGateEscalationFrom(ctx context.Context, store *db.Store, cfg config.OrgConfig, repo string) (string, bool) {
+	if owner, ok := repoOrgOwner(ctx, store, cfg, repo); ok {
 		return owner, true
 	}
 	parts := strings.Split(strings.TrimSpace(repo), "/")
@@ -952,16 +952,47 @@ func mergeGateEscalationTo(cfg config.OrgConfig, from string, fromDeclared bool)
 // orgChartRootRole is the single root name ValidateOrg admits.
 const orgChartRootRole = "owner"
 
-func repoOrgOwner(cfg config.OrgConfig, repo string) (string, bool) {
-	best, bestDepth := "", -1
-	for _, role := range loadOrgRoster(context.Background(), nil, cfg).Members() {
-		if config.ScopeMatches(role.Scope, repo) {
-			if depth := len(cfg.Path(role.Name)); depth > bestDepth {
-				best, bestDepth = role.Name, depth
-			}
+// repoOrgOwner returns the most-specific live role whose scope matches repo.
+// Exact repo scope outranks owner-wide scope, which outranks global scope.
+// Chart depth and then the roster's stable name order break equal-specificity
+// ties without allowing a deeper wildcard branch to defeat an exact owner.
+func repoOrgOwner(ctx context.Context, store *db.Store, cfg config.OrgConfig, repo string) (string, bool) {
+	best, bestSpecificity, bestDepth := "", -1, -1
+	for _, role := range loadOrgRoster(ctx, store, cfg).Members() {
+		specificity := repoScopeSpecificity(role.Scope, repo)
+		if specificity < 0 {
+			continue
+		}
+		depth := len(cfg.Path(role.Name))
+		if specificity > bestSpecificity || (specificity == bestSpecificity && depth > bestDepth) {
+			best, bestSpecificity, bestDepth = role.Name, specificity, depth
 		}
 	}
 	return best, best != ""
+}
+
+func repoScopeSpecificity(scope []string, repo string) int {
+	repo = strings.ToLower(strings.TrimSpace(repo))
+	parts := strings.Split(repo, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return -1
+	}
+	best := -1
+	for _, raw := range scope {
+		switch strings.ToLower(strings.TrimSpace(raw)) {
+		case repo:
+			return 2
+		case parts[0] + "/*":
+			if best < 1 {
+				best = 1
+			}
+		case "*":
+			if best < 0 {
+				best = 0
+			}
+		}
+	}
+	return best
 }
 
 func (g daemonMergeGate) githubClient(checkout string) github.Client {

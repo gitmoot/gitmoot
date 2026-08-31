@@ -1233,11 +1233,14 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    Agents review, request fixes, and rerun work through comments and job output.
    Native task auto-merge is enabled by default, but only with an approved review
    verdict for the exact current head SHA and green SHA-scoped commit statuses
-   and check-runs. A miss leaves the PR open, records an org escalation, and wakes
-   the parent of the org role that owns the repo. That recipient comes from the
-   chart alone and is never swapped for a reachable role; `org validate` reports a
-   recipient that has no wake route or pane binding.
-   Set `[merge_gate] auto_merge = false` globally or per repository as
+   and check-runs. A miss leaves the PR open, records an org escalation, and
+   enqueues an addressed workflow-note wake. The sender is the most-specific live
+   org role whose scope matches the repo, and the recipient is its nearest chart
+   ancestor. With no live match, the recipient is the `owner` root; when the match
+   is already the root, the note addresses that root itself. Routing never changes
+   based on predicted deliverability; `org validate` reports missing wake routes
+   and pane bindings. Set `[merge_gate] auto_merge = false` globally or per
+   repository as
    an explicit kill-switch. The merge gate also checks local worktree cleanliness,
    branch freshness, and mergeability. Final merge work
    is serialized per repository base branch. Before the policy gate can issue
@@ -2784,8 +2787,9 @@ Fixes:
   manually or run an explicit implement/fix job, then rerun review/merge.
 - Fix failing external CI or Gitmoot statuses.
 - If the task is `awaiting_human_merge`, inspect its reason. Either the mandatory
-  exact-head review/CI gate missed (also escalated to the owning role's parent) or the repository
-  has the explicit `[merge_gate] auto_merge = false` kill-switch. Merge it in
+  exact-head review/CI gate missed (and the daemon journaled its chart-derived org
+  escalation) or the repository has the explicit
+  `[merge_gate] auto_merge = false` kill-switch. Merge it in
   GitHub or use an authorized `@gitmoot merge` comment. If more implementation
   is required instead, a coordinator can explicitly run `gitmoot task
   resume-work <id> --reason "..." --override-pending-human-decision`; this
@@ -13017,11 +13021,12 @@ disables it (a negative value is rejected). Unlike `[orchestrate].escalation_ttl
 
 Native task auto-merge is enabled by default only behind an exact-head approved
 review and green SHA-scoped commit statuses/check-runs. A gate miss parks the
-task as `awaiting_human_merge`, records an org escalation, and addresses the
-parent of the org role that owns the repo. The recipient comes from the chart
-alone and is never swapped for a reachable role; `org validate` reports one with
-no wake route or pane binding.
-Set `[repos."owner/repo".merge_gate] auto_merge = false` as an explicit
+task as `awaiting_human_merge` and records an org escalation. It selects the
+most-specific live role whose scope matches the repo and addresses that role's
+nearest chart ancestor. With no live match it addresses `owner`; a root match
+addresses itself. Routing does not change based on predicted deliverability;
+`org validate` reports missing wake routes and pane bindings. Set
+`[repos."owner/repo".merge_gate] auto_merge = false` as an explicit
 kill-switch; that deliberate hold does not escalate. Pipeline `allow_auto_merge`
 is independent, and an authorized `@gitmoot merge` remains an explicit override.
 
@@ -16711,9 +16716,12 @@ merges gatelessly; the external gate makes the call.
 Gitmoot enables native task auto-merge by default, but only when an affirmative
 review verdict matches the exact current head SHA and all SHA-scoped commit
 statuses and check-runs are green. Missing or failing evidence parks the task in
-`awaiting_human_merge`, journals the reason, and addresses the parent of the org
-role that owns the repo; `org validate` reports an unreachable recipient.
-Set `auto_merge = false` globally or per repo as an explicit kill-switch:
+`awaiting_human_merge` and journals an org escalation from the most-specific live
+role whose scope matches the repo to its nearest chart ancestor. With no live
+match it addresses `owner`; a root match addresses itself. Routing does not
+change based on predicted deliverability; `org validate` reports missing wake
+routes and pane bindings. Set `auto_merge = false` globally or per repo as an
+explicit kill-switch:
 
 ```toml
 [repos."owner/repo".merge_gate]
@@ -16744,9 +16752,10 @@ Gitmoot does **not** immediately treat the repo as CI-less and stamp the
 synthetic `gitmoot/ci` success. GitHub Actions creates a check-run a few seconds
 *after* a head is pushed, so a single zero observation cannot distinguish "no CI
 configured" from "CI not created yet". Instead the gate returns **pending**
-(a non-escalating, automatically-retried hold — not a policy miss, so it does
-not park the task or wake the owning role's parent) and only concludes "no CI" after a **second
-consecutive zero-external observation at the same head**, at least `min_ci_wait`
+(a non-escalating, automatically retried hold, not a policy miss, so it does
+not park the task or enqueue an org escalation) and only concludes "no CI" after
+a **second consecutive zero-external observation at the same head**, at least
+`min_ci_wait`
 (default `60s`) later. The gate is re-evaluated every daemon poll, so a
 genuinely CI-less repo merges exactly one grace window later, provided the
 exact-head review is also clean. Two extra guards layer on top:

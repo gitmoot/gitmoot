@@ -673,8 +673,9 @@ Fixes:
   manually or run an explicit implement/fix job, then rerun review/merge.
 - Fix failing external CI or Gitmoot statuses.
 - If the task is `awaiting_human_merge`, inspect its reason. Either the mandatory
-  exact-head review/CI gate missed (also escalated to the owning role's parent) or the repository
-  has the explicit `[merge_gate] auto_merge = false` kill-switch. Merge it in
+  exact-head review/CI gate missed (and the daemon journaled its chart-derived org
+  escalation) or the repository has the explicit
+  `[merge_gate] auto_merge = false` kill-switch. Merge it in
   GitHub or use an authorized `@gitmoot merge` comment. If more implementation
   is required instead, a coordinator can explicitly run `gitmoot task
   resume-work <id> --reason "..." --override-pending-human-decision`; this
