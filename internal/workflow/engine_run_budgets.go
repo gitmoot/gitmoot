@@ -365,6 +365,10 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			return nil
 		}
 		blockingSeverity = e.reviewBlockingSeverity(payload.Repo)
+		// Pipeline-sender reviews already returned above as report-only, so this is
+		// reached only by native reviews. Folding through the payload authority
+		// anyway keeps the invariant LOCAL rather than dependent on that distant
+		// early return surviving future edits.
 		effectiveDecision = effectiveReviewDecisionForPayload(payload, blockingSeverity)
 	}
 	if payload.Result.Decision == "blocked" || payload.Result.Decision == "failed" {

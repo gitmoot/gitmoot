@@ -1628,6 +1628,57 @@ func TestEngineAdvanceReviewSubthresholdRecordsOutcomeAfterTaskReadyToMerge(t *t
 	}
 }
 
+// P1 from the g7-review verdict on #1693. allRequiredReviewersApproved scans
+// STORED review payloads, so it can see a pipeline job — and folding it through
+// the bare-result helper discarded Sender. A stale pipeline P2 veto then counted
+// as a required reviewer's approval under a P1 threshold, helping satisfy merge
+// prerequisites the pipeline had explicitly refused. Pipeline and local review
+// jobs both carry an empty ReviewRound, so sameReviewRound does not separate them.
+func TestAllRequiredReviewersApprovedKeepsPipelineVetoRaw(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+
+	pipelineVeto := JobPayload{
+		Repo: "mobile/app", PullRequest: 8, TaskID: "task-8",
+		Sender: PipelineJobSender,
+		Result: &AgentResult{
+			Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "stage refused",
+		},
+	}
+	insertCompletedJob(t, store, db.Job{ID: "review-pipeline", Agent: "stagebot", Type: "review"}, pipelineVeto)
+
+	payload := JobPayload{
+		Repo: "mobile/app", PullRequest: 8, TaskID: "task-8",
+		Reviewers: []string{"stagebot", "audit"},
+	}
+	approved, err := engine.allRequiredReviewersApproved(ctx, "audit", payload)
+	if err != nil {
+		t.Fatalf("allRequiredReviewersApproved returned error: %v", err)
+	}
+	if approved {
+		t.Fatal("a pipeline changes_requested veto must never count as a required reviewer's approval")
+	}
+
+	// ACCEPTANCE: the same sub-threshold verdict from a NATIVE reviewer still
+	// counts, so the fix is the pipeline exemption and not a blanket refusal.
+	// A fresh store, because the two rows would otherwise both be scanned.
+	nativeStore := openEngineStore(t)
+	nativeEngine := testEngine(nativeStore)
+	nativeEngine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+	nativeSubThreshold := pipelineVeto
+	nativeSubThreshold.Sender = "stagebot"
+	insertCompletedJob(t, nativeStore, db.Job{ID: "review-native", Agent: "stagebot", Type: "review"}, nativeSubThreshold)
+	approved, err = nativeEngine.allRequiredReviewersApproved(ctx, "audit", payload)
+	if err != nil {
+		t.Fatalf("allRequiredReviewersApproved returned error: %v", err)
+	}
+	if !approved {
+		t.Fatal("a native sub-threshold review must still count toward required-reviewer approval")
+	}
+}
+
 func TestEngineAdvancePipelineReviewIsReportOnly(t *testing.T) {
 	for _, decision := range []string{"changes_requested", "approved"} {
 		t.Run(decision, func(t *testing.T) {
