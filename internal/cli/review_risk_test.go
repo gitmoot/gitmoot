@@ -3,8 +3,10 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/config"
@@ -107,12 +109,40 @@ func TestWireReviewChangedFilesUsesExactReviewerHead(t *testing.T) {
 	}
 }
 
-func TestWireReviewChangedFilesRejectsPossiblyTruncatedCompare(t *testing.T) {
-	files := make([]github.PullRequestFile, 300)
+// A follow-up range larger than GitHub's 300-file compare cap is scopable as
+// long as CompareCommits recovered the whole list: gitmoot generates such ranges
+// itself when the merge gate updates a PR branch, so rejecting them on size
+// alone rejected its own input.
+func TestWireReviewChangedFilesScopesCompleteCompareBeyondCompareCap(t *testing.T) {
+	files := make([]github.PullRequestFile, 1200)
 	for i := range files {
-		files[i].Filename = "same-path-is-still-ambiguous"
+		files[i].Filename = fmt.Sprintf("internal/pkg%04d/file.go", len(files)-i)
 	}
 	client := &reviewCompareClient{result: github.CompareResult{Status: "ahead", Files: files}}
+	var engine workflow.Engine
+	wireReviewChangedFiles(&engine, client)
+
+	paths, err := engine.ReviewChangedFiles(context.Background(), "owner/repo", 17, "reviewer-head", "current-head")
+	if err != nil {
+		t.Fatalf("a complete %d-file compare must scope: %v", len(files), err)
+	}
+	if len(paths) != len(files) {
+		t.Fatalf("changed files = %d, want all %d paths", len(paths), len(files))
+	}
+	if !sort.StringsAreSorted(paths) {
+		t.Fatalf("changed files are not sorted: %v...", paths[:3])
+	}
+	if paths[0] != "internal/pkg0001/file.go" || paths[len(paths)-1] != "internal/pkg1200/file.go" {
+		t.Fatalf("changed files bounds = %q..%q", paths[0], paths[len(paths)-1])
+	}
+}
+
+func TestWireReviewChangedFilesRejectsTruncatedCompare(t *testing.T) {
+	files := make([]github.PullRequestFile, 300)
+	for i := range files {
+		files[i].Filename = fmt.Sprintf("internal/pkg%04d/file.go", i)
+	}
+	client := &reviewCompareClient{result: github.CompareResult{Status: "ahead", Files: files, Truncated: true}}
 	var engine workflow.Engine
 	wireReviewChangedFiles(&engine, client)
 

@@ -15,9 +15,12 @@ import (
 // already stable at the requested PR head.
 const ReviewLoopDetectedEventKind = "review_loop_detected"
 
-// ReviewScopeUnavailableBlockMarker distinguishes a durable, exact-head scope
-// block from other workflow blocks that the daemon must continue retrying.
-const ReviewScopeUnavailableBlockMarker = "cannot safely scope follow-up review"
+// ReviewScopeUnavailableMarker tags the task event recorded when a follow-up
+// review range cannot be scoped from the exact head a reviewer last saw (a
+// force-push makes that head DIVERGED, or the compare is truncated). It marks an
+// audit record, never a block: blocking wedged the loop permanently, because the
+// prior head a scope is derived from only advances when a new review job runs.
+const ReviewScopeUnavailableMarker = "cannot safely scope follow-up review"
 
 // ReviewLoopMatch identifies the succeeded review used only as escalation
 // evidence. It is intentionally not an AgentResult and cannot be served as a
@@ -150,9 +153,13 @@ type reviewScopeCandidate struct {
 	findings []string
 }
 
-// ReviewScopeUnavailableError marks a follow-up range that cannot be scoped
-// safely. Callers block the task visibly instead of falling back to a full review
-// or retrying the same permanently unscopable head on every daemon poll.
+// ReviewScopeUnavailableError marks a follow-up RANGE that cannot be scoped from
+// the exact head a reviewer last saw (a force-push left it diverged, the compare
+// is truncated). HandlePullRequestOpened records it and re-reviews the full PR at
+// that head, which re-anchors the prior head for the next round; blocking instead
+// wedged the loop for good. A MISSING resolver is a wiring fault rather than an
+// unscopable range, so it returns a plain error: the misconfiguration keeps
+// surfacing instead of silently degrading every round to a full review.
 type ReviewScopeUnavailableError struct {
 	Reason string
 }
@@ -175,6 +182,101 @@ func reviewScopeFor(scopes map[string]*ReviewScope, reviewer, delegationID strin
 		return scope
 	}
 	return scopes[reviewScopeKey(reviewer, "")]
+}
+
+// reviewScopeUnavailableRecorded reports whether this exact head already carries a
+// review_scope_unavailable record. One poll can reach HandlePullRequestOpened
+// twice — reconcileReviewingPullRequest re-enters with the poll's PRE-dispatch
+// review-job snapshot — so the audit record is claimed at most once per head
+// instead of once per invocation.
+func (e Engine) reviewScopeUnavailableRecorded(ctx context.Context, taskID, reason string) (bool, error) {
+	events, err := e.Store.ListTaskEvents(ctx, taskID)
+	if err != nil {
+		return false, err
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Kind == "review_scope_unavailable" && events[i].Reason == reason {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// routineReviewScopeKey names the aggregate scope a ROUTINE round reads when a
+// reviewer's only prior verdicts are LENS children of a high-risk round.
+// Delegation ids never contain a NUL byte, so this key cannot collide with
+// reviewScopeKey(reviewer, lens).
+func routineReviewScopeKey(reviewer string) string {
+	return reviewScopeKey(reviewer, "") + "\x00\x00routine"
+}
+
+// reviewScopeForRoutine resolves the scope for a ROUTINE (non-lens) round: the
+// reviewer's own prior routine verdict when it has one, else the aggregate of the
+// lens verdicts that same reviewer produced in a preceding high-risk round.
+// Without the aggregate, a high-risk round followed by a routine round (label
+// removed, or RiskTiersEnabled flipped) missed every lens-keyed candidate on the
+// bare-reviewer lookup and silently dispatched an unscoped full-PR re-review.
+func reviewScopeForRoutine(scopes map[string]*ReviewScope, reviewer string) *ReviewScope {
+	if scope := scopes[reviewScopeKey(reviewer, "")]; scope != nil {
+		return scope
+	}
+	return scopes[routineReviewScopeKey(reviewer)]
+}
+
+// routineScopeAggregates unions each reviewer's LENS scopes into one routine
+// scope keyed by routineReviewScopeKey. Findings and changed files are merged and
+// the OLDEST baseline head is named, because its changed-file range is the
+// superset a routine round must cover. A reviewer that already has a bare
+// routine scope needs no aggregate.
+func routineScopeAggregates(candidates map[string]reviewScopeCandidate, scopes map[string]*ReviewScope) map[string]*ReviewScope {
+	merged := make(map[string]*ReviewScope, len(candidates))
+	rounds := make(map[string]int, len(candidates))
+	for _, candidate := range candidates {
+		lens := strings.TrimSpace(candidate.payload.DelegationID)
+		if lens == "" {
+			continue
+		}
+		reviewer := strings.ToLower(strings.TrimSpace(reviewDecisionAgent(candidate.job, candidate.payload)))
+		if scopes[reviewScopeKey(reviewer, "")] != nil {
+			continue
+		}
+		scope := scopes[reviewScopeKey(reviewer, lens)]
+		if scope == nil {
+			continue
+		}
+		key := routineReviewScopeKey(reviewer)
+		prior, ok := merged[key]
+		if !ok {
+			merged[key] = &ReviewScope{
+				PreviousHeadSHA: scope.PreviousHeadSHA,
+				Findings:        append([]string(nil), scope.Findings...),
+				ChangedFiles:    append([]string(nil), scope.ChangedFiles...),
+			}
+			rounds[key] = candidate.round
+			continue
+		}
+		if olderRoutineBaseline(candidate.round, scope.PreviousHeadSHA, rounds[key], prior.PreviousHeadSHA) {
+			prior.PreviousHeadSHA = scope.PreviousHeadSHA
+			rounds[key] = candidate.round
+		}
+		prior.Findings = append(prior.Findings, scope.Findings...)
+		prior.ChangedFiles = append(prior.ChangedFiles, scope.ChangedFiles...)
+	}
+	for _, scope := range merged {
+		scope.Findings = stableUniqueStrings(scope.Findings)
+		scope.ChangedFiles = sortedUniqueStrings(scope.ChangedFiles)
+	}
+	return merged
+}
+
+// olderRoutineBaseline reports whether a candidate lens scope is the older
+// baseline: the earlier round wins, then the lexicographically smaller head so
+// map iteration order cannot change which head the aggregate names.
+func olderRoutineBaseline(round int, head string, priorRound int, priorHead string) bool {
+	if round != priorRound {
+		return round < priorRound
+	}
+	return head < priorHead
 }
 
 func (e Engine) followUpReviewScopes(ctx context.Context, event PullRequestEvent, reviewers []string, jobs []db.Job) (map[string]*ReviewScope, error) {
@@ -231,7 +333,7 @@ func (e Engine) followUpReviewScopes(ctx context.Context, event PullRequestEvent
 		return nil, nil
 	}
 	if e.ReviewChangedFiles == nil {
-		return nil, ReviewScopeUnavailableError{Reason: "scoped follow-up review requires a changed-files resolver"}
+		return nil, fmt.Errorf("scoped follow-up review requires a changed-files resolver")
 	}
 	filesByHead := make(map[string][]string, len(candidates))
 	scopes := make(map[string]*ReviewScope, len(candidates))
@@ -252,6 +354,9 @@ func (e Engine) followUpReviewScopes(ctx context.Context, event PullRequestEvent
 			Findings:        append([]string(nil), candidate.findings...),
 			ChangedFiles:    append([]string(nil), files...),
 		}
+	}
+	for key, aggregate := range routineScopeAggregates(candidates, scopes) {
+		scopes[key] = aggregate
 	}
 	return scopes, nil
 }

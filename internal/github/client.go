@@ -393,6 +393,12 @@ type CompareResult struct {
 	AheadBy  int               `json:"ahead_by"`
 	BehindBy int               `json:"behind_by"`
 	Files    []PullRequestFile `json:"files"`
+	// Truncated reports that Files is demonstrably INCOMPLETE for this range:
+	// the compare endpoint returned its 300-file maximum and CompareCommits
+	// could not recover the remainder. It is computed by CompareCommits and
+	// deliberately never decoded from a payload, so no API response can claim
+	// a file list is complete when it is not.
+	Truncated bool `json:"-"`
 }
 
 type CommitStatusInput struct {
@@ -1148,10 +1154,212 @@ func (c *GhClient) WorkflowsExistAtRef(ctx context.Context, repo Repository, ref
 	return false, err
 }
 
+// compareFilesCap is GitHub's hard ceiling on the compare endpoint's `files`
+// array. Per the REST reference for "Compare two commits": "The list of changed
+// files is only shown on the FIRST page of results, and it includes up to 300
+// changed files FOR THE ENTIRE COMPARISON."
+// (https://docs.github.com/en/rest/commits/commits#compare-two-commits)
+//
+// So `page`/`per_page` page the COMMITS array only; page 2 of a compare carries
+// no `files` at all. Merging pages — what apiPaginatedJSON would do if the
+// payload were a top-level array — cannot recover a capped file list, which is
+// why CompareCommits falls back to the diff media type instead of paginating.
+const compareFilesCap = 300
+
+// CompareCommits reports the base...head comparison, including the COMPLETE set
+// of changed files. A compare response caps `files` at compareFilesCap, and that
+// cap is reachable by ranges gitmoot generates itself (a merge-gate branch
+// update makes a new head whose follow-up range spans everything base touched
+// since the merge-base), so a capped list is re-derived from the range's diff.
+// When it cannot be re-derived the result is flagged Truncated rather than
+// failed: callers needing a complete list (review scoping) fail closed on the
+// flag, while callers reading only the object-level status (the merge gate's
+// branch-freshness check) must not start erroring on large diffs.
 func (c *GhClient) CompareCommits(ctx context.Context, repo Repository, base string, head string) (CompareResult, error) {
+	path := endpoint(repo, "compare", url.PathEscape(base+"..."+head))
 	var result CompareResult
-	err := c.apiJSON(ctx, false, &result, endpoint(repo, "compare", url.PathEscape(base+"..."+head)))
-	return result, err
+	if err := c.apiJSON(ctx, false, &result, path); err != nil {
+		return CompareResult{}, err
+	}
+	if len(result.Files) < compareFilesCap {
+		return result, nil
+	}
+	diffFiles, err := c.compareFilesFromDiff(ctx, path)
+	if err != nil {
+		result.Truncated = true
+		return result, nil
+	}
+	merged, complete := mergeCompareFiles(result.Files, diffFiles)
+	if !complete {
+		// The diff did not account for every file the capped page already
+		// reported, so it is not a trustworthy superset of the range.
+		result.Truncated = true
+		return result, nil
+	}
+	result.Files = merged
+	return result, nil
+}
+
+// compareFilesFromDiff enumerates a compare range's changed files from the diff
+// media type, which is not subject to the `files` cap. Custom media types do not
+// support pagination parameters, so this is a single request that returns the
+// whole range.
+func (c *GhClient) compareFilesFromDiff(ctx context.Context, path string) ([]PullRequestFile, error) {
+	result, err := c.run(ctx, false, "api", "-H", "Accept: application/vnd.github.diff", path)
+	if err != nil {
+		return nil, err
+	}
+	files, err := parseDiffFiles(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	if len(files) == 0 {
+		return nil, errors.New("compare diff enumerated no changed files")
+	}
+	return files, nil
+}
+
+// mergeCompareFiles returns the capped page's entries (they carry the API's own
+// status and patch) followed by every diff-only file, and reports whether the
+// diff covered every file the capped page named. A diff that does not cover the
+// capped page means the two sources disagree, so the union is not provably the
+// whole range.
+func mergeCompareFiles(capped []PullRequestFile, diff []PullRequestFile) ([]PullRequestFile, bool) {
+	fromDiff := make(map[string]struct{}, len(diff))
+	for _, file := range diff {
+		fromDiff[file.Filename] = struct{}{}
+	}
+	merged := make([]PullRequestFile, 0, len(capped)+len(diff))
+	seen := make(map[string]struct{}, len(capped)+len(diff))
+	for _, file := range capped {
+		if _, ok := fromDiff[file.Filename]; !ok {
+			return nil, false
+		}
+		if _, dup := seen[file.Filename]; dup {
+			continue
+		}
+		seen[file.Filename] = struct{}{}
+		merged = append(merged, file)
+	}
+	for _, file := range diff {
+		if _, dup := seen[file.Filename]; dup {
+			continue
+		}
+		seen[file.Filename] = struct{}{}
+		merged = append(merged, file)
+	}
+	return merged, true
+}
+
+// parseDiffFiles extracts one entry per file from a unified git diff. Names come
+// from the `+++ b/` header when present (it survives paths containing spaces,
+// which the `diff --git` line cannot express unambiguously), from `--- a/` for
+// deletions, from `rename to` for renames, and from the `diff --git` line's
+// equal-path halves for entries with no hunk headers at all (binary files).
+func parseDiffFiles(diff string) ([]PullRequestFile, error) {
+	var (
+		files   []PullRequestFile
+		current PullRequestFile
+		header  string
+		open    bool
+		oldPath string
+	)
+	flush := func() error {
+		if !open {
+			return nil
+		}
+		open = false
+		if current.Filename == "" {
+			return fmt.Errorf("compare diff header names no file: %q", header)
+		}
+		files = append(files, current)
+		return nil
+	}
+	scanner := bufio.NewScanner(strings.NewReader(diff))
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case strings.HasPrefix(line, "diff --git "):
+			if err := flush(); err != nil {
+				return nil, err
+			}
+			header = strings.TrimPrefix(line, "diff --git ")
+			current = PullRequestFile{Filename: diffHeaderPath(header), Status: "modified"}
+			oldPath, open = "", true
+		case !open:
+			continue
+		case strings.HasPrefix(line, "new file mode"):
+			current.Status = "added"
+		case strings.HasPrefix(line, "deleted file mode"):
+			current.Status = "removed"
+		case strings.HasPrefix(line, "rename to "):
+			current.Status = "renamed"
+			current.Filename = unquoteDiffPath(strings.TrimPrefix(line, "rename to "))
+		case strings.HasPrefix(line, "--- "):
+			oldPath = diffSidePath(strings.TrimPrefix(line, "--- "), "a/")
+		case strings.HasPrefix(line, "+++ "):
+			if path := diffSidePath(strings.TrimPrefix(line, "+++ "), "b/"); path != "" {
+				current.Filename = path
+			} else if oldPath != "" {
+				// `+++ /dev/null`: a deletion is named by its old path.
+				current.Filename = oldPath
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan compare diff: %w", err)
+	}
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	return files, nil
+}
+
+// diffSidePath takes the path from a `--- a/P` / `+++ b/P` header. It tolerates a
+// git-quoted path (`"b/caf\303\251.md"`, emitted for non-ASCII names) and the
+// tab-delimited field git appends when a path contains whitespace, and returns ""
+// for anything that does not carry the side's prefix at all (`/dev/null`).
+func diffSidePath(rest string, prefix string) string {
+	if tab := strings.IndexByte(rest, '\t'); tab >= 0 {
+		rest = rest[:tab]
+	}
+	rest = unquoteDiffPath(rest)
+	if !strings.HasPrefix(rest, prefix) {
+		return ""
+	}
+	return strings.TrimPrefix(rest, prefix)
+}
+
+// diffHeaderPath recovers the path from a `diff --git a/P b/P` header by taking
+// the split whose two halves name the same path. Renames and quoted (non-ASCII)
+// pairs have no such split, so it returns "" and the caller falls back to the
+// `rename to` / `+++ b/` / `--- a/` headers.
+func diffHeaderPath(header string) string {
+	for offset := 0; offset < len(header); {
+		index := strings.Index(header[offset:], " b/")
+		if index < 0 {
+			return ""
+		}
+		index += offset
+		left, right := header[:index], header[index+len(" b/"):]
+		if strings.HasPrefix(left, "a/") && left[len("a/"):] == right {
+			return right
+		}
+		offset = index + 1
+	}
+	return ""
+}
+
+func unquoteDiffPath(path string) string {
+	if !strings.HasPrefix(path, `"`) {
+		return path
+	}
+	unquoted, err := strconv.Unquote(path)
+	if err != nil {
+		return path
+	}
+	return unquoted
 }
 
 func (c *GhClient) ListPullRequestChecks(ctx context.Context, repo Repository, number int64) ([]PullRequestCheck, error) {

@@ -162,9 +162,28 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 		if !errors.As(err, &unavailable) {
 			return err
 		}
-		reason := fmt.Sprintf("repo=%s pull_request=%d head_sha=%s: %s: %v", event.Repo, event.PullRequest, event.HeadSHA, ReviewScopeUnavailableBlockMarker, err)
-		_ = e.Store.AddTaskEvent(ctx, db.TaskEvent{TaskID: event.TaskID, Kind: "review_scope_unavailable", Reason: reason})
-		return e.block(ctx, ref, reason)
+		// The range from the head this reviewer last saw to the current head cannot
+		// be scoped: a force-push/rebase left it DIVERGED, or the compare is
+		// truncated. Blocking here wedged the loop PERMANENTLY — followUpReviewScopes
+		// derives the prior head from the newest review job carrying a Result, and
+		// while dispatch is blocked no review job is ever created, so every later
+		// head re-compared the same unscopable range and blocked again with no path
+		// back. Record the loss of scope and degrade to a FULL review at THIS head
+		// instead: one wasted full re-review is the pre-scoping behaviour and it
+		// self-heals, because the new job re-anchors the prior head for the next
+		// round. The event write is propagated, not ignored: it is the only durable
+		// record that this head's review was unscoped.
+		reason := fmt.Sprintf("repo=%s pull_request=%d head_sha=%s: %s: %v", event.Repo, event.PullRequest, event.HeadSHA, ReviewScopeUnavailableMarker, err)
+		recorded, recordedErr := e.reviewScopeUnavailableRecorded(ctx, event.TaskID, reason)
+		if recordedErr != nil {
+			return recordedErr
+		}
+		if !recorded {
+			if eventErr := e.Store.AddTaskEvent(ctx, db.TaskEvent{TaskID: event.TaskID, Kind: "review_scope_unavailable", Reason: reason}); eventErr != nil {
+				return eventErr
+			}
+		}
+		reviewScopes = nil
 	}
 	// Opt-in risk-tiered adaptive review (#650). When RiskTiersEnabled, classify
 	// the PR (label > path > default). A `high` tier replaces the single native
@@ -205,7 +224,7 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 			event.PullRequest,
 			taskLabel(event.TaskID, event.TaskTitle),
 		)
-		scope := reviewScopeFor(reviewScopes, reviewer, "")
+		scope := reviewScopeForRoutine(reviewScopes, reviewer)
 		if scope != nil {
 			instructions = scopedReviewInstructions(event, scope)
 		}
@@ -237,14 +256,159 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 	}
 
 	for _, request := range requests {
-		if err := e.enqueue(ctx, request); err != nil {
+		prepared, allocated, err := e.prepareNativeReviewWorktree(ctx, request)
+		if err != nil {
 			return err
+		}
+		if err := e.enqueue(ctx, prepared); err != nil {
+			if allocated {
+				// The worktree now belongs to a job that does not exist, and its path is
+				// DETERMINISTIC: leaving it would make every later poll's allocation fail
+				// with "already exists" and wedge this head permanently. Mirrors the
+				// worker helper, which likewise reclaims on a failed payload persist.
+				e.releaseNativeReviewWorktree(context.WithoutCancel(ctx), prepared.WorktreePath)
+			}
+			return err
+		}
+		if allocated {
+			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+				JobID:   prepared.ID,
+				Kind:    "review_worktree_allocated_exact_head",
+				Message: fmt.Sprintf("allocated owned read-only worktree at review head %s before enqueue", strings.TrimSpace(prepared.HeadSHA)),
+			})
 		}
 	}
 	if err := e.setTaskState(ctx, ref, TaskReviewing); err != nil {
 		return err
 	}
 	return e.recordPullRequestBaseline(ctx, event)
+}
+
+// prepareNativeReviewWorktree gives a ROUTINE native review leg its own detached
+// exact-head worktree BEFORE it is enqueued, so the job is born with its FINAL
+// WorktreePath and FINAL Instructions. That is the invariant every OTHER
+// read-only dispatch path already holds (the `agent review/ask` CLI dispatch, the
+// read-only delegation fan-out, and the pipeline stages all allocate then
+// enqueue). Allocating AFTER enqueue — in the worker, which is where the routine
+// leg alone used to do it — was one asymmetry behind three separate defects:
+//
+//   - queuedJobCheckoutKey reads payload.WorktreePath at scheduler admission, so
+//     an empty path keyed every reviewer leg to the shared repo:<repo> key. Only
+//     one was admitted per tick, each holding that key for a full LLM review.
+//   - The worker then mutated Instructions and WorktreePath. A re-poll at the same
+//     head re-derives the SAME deterministic job id (nextReviewRound returns the
+//     existing head's round) but no longer matched the stored payload, so
+//     existingJobMatchesRequest returned false and the raw
+//     "UNIQUE constraint failed: jobs.id" surfaced out of HandlePullRequestOpened.
+//   - An allocation failure terminally failed the leg inside the worker, and
+//     because the payload was left UNMUTATED the next poll's re-enqueue matched it
+//     and was a silent no-op — the id was burned and FindRepeatedReviewers only
+//     re-enlists succeeded verdicts, so that verdict could never be re-attempted.
+//
+// An engine with no read-only worktree manager (or no Home / DelegationCheckout)
+// is left byte-identical: the leg is enqueued with no path and the worker's
+// prepareNativeReviewWorktreeForRunner allocates it exactly as before. The two
+// configurations are DISJOINT — a leg born with a WorktreePath makes that worker
+// helper return early on its own gate — so no configuration ever has two live
+// allocation paths. The returned bool reports whether this call really allocated,
+// so the durable audit event is written exactly once per worktree.
+func (e Engine) prepareNativeReviewWorktree(ctx context.Context, request JobRequest) (JobRequest, bool, error) {
+	manager, ok := e.DelegationWorktrees.(ReadOnlyWorktreeManager)
+	if !ok || strings.TrimSpace(e.Home) == "" || strings.TrimSpace(e.DelegationCheckout) == "" {
+		return request, false, nil
+	}
+	head := strings.TrimSpace(request.HeadSHA)
+	if head == "" || request.PullRequest <= 0 {
+		// Nothing to pin a worktree to (a PR-less review heartbeat, #564). The
+		// worker's shared-checkout arm already handles this shape.
+		return request, false, nil
+	}
+	if request.ID == "" {
+		request.ID = e.jobID(request)
+	}
+	// jobID hashes Instructions, so it is resolved from the request as built — the
+	// id is byte-identical to the one this leg has always had, and appending the
+	// worktree note below cannot move it. The path is deterministic in
+	// (home, repo, job id) and AllocateReadOnlyWorktree recomputes exactly this
+	// value; resolving it here lets the idempotence check below compare the SAME
+	// payload the enqueue will store.
+	path, err := DelegationWorktreePath(e.Home, request.Repo, request.ID, "readonly-seat", 0)
+	if err != nil {
+		return request, false, err
+	}
+	request.WorktreePath = path
+	request.ReadOnlyWorktree = true
+	if note := readOnlyWorktreeContextNote(e.DelegationCheckout); note != "" {
+		request.Instructions += note
+	}
+	// `git worktree add` at an already-occupied path FAILS, so a second poll at the
+	// same head must never reach the allocation: the leg is already enqueued and
+	// e.enqueue no-ops on the payload match. Deciding that BEFORE the
+	// side-effecting call is what keeps the re-poll idempotent instead of turning
+	// it into an allocation error.
+	matches, err := e.existingJobMatchesRequest(ctx, request)
+	if err != nil {
+		return request, false, err
+	}
+	if matches {
+		return request, false, nil
+	}
+	if err := e.allocateNativeReviewWorktree(ctx, request, manager, head); err != nil {
+		return request, false, err
+	}
+	return request, true, nil
+}
+
+// allocateNativeReviewWorktree creates the detached worktree at the review head,
+// retrying once after fetching pull/<n>/head. It uses the SHORT
+// ReadOnlyWorktreeDispatchLockWaitBudget, like every other pre-enqueue read-only
+// site: this runs synchronously on the daemon's per-repo poll loop, where the full
+// two-minute checkout-mutation wait would freeze that repo's whole dispatch loop.
+func (e Engine) allocateNativeReviewWorktree(ctx context.Context, request JobRequest, manager ReadOnlyWorktreeManager, head string) error {
+	allocate := func() error {
+		_, err := AllocateReadOnlyWorktree(ctx, e.Store, e.Home, request.Repo, e.DelegationCheckout, request.ID, "readonly-seat", 0, head, ReadOnlyWorktreeDispatchLockWaitBudget, manager)
+		return err
+	}
+	err := allocate()
+	if err == nil {
+		return nil
+	}
+	// A spent lock-wait budget is transient and self-healing: the holder is another
+	// worker's short shared-.git op. Return it so THIS poll fails and the daemon
+	// re-fires HandlePullRequestOpened, which re-derives the same id and
+	// re-attempts. A fetch cannot help it, so do not spend one.
+	var blocked BlockedError
+	if errors.As(err, &blocked) {
+		return fmt.Errorf("allocate exact-head review worktree for %s: %w", request.Agent, err)
+	}
+	// A cold checkout may not carry the PR commit object even though the forge
+	// supplied its SHA, and nothing in the poll path fetches it; `git worktree add
+	// --detach <sha>` then fails with "invalid reference". Both other exact-head
+	// allocation sites carry this pull/<n>/head retry.
+	fetcher, canFetch := manager.(PullRequestFetcher)
+	if !canFetch {
+		return fmt.Errorf("allocate exact-head review worktree for %s: %w", request.Agent, err)
+	}
+	if fetchErr := fetcher.FetchPullRequest(ctx, "origin", request.PullRequest); fetchErr != nil {
+		return fmt.Errorf("allocate exact-head review worktree for %s: %w; fetch PR ref: %v", request.Agent, err, fetchErr)
+	}
+	if retryErr := allocate(); retryErr != nil {
+		return fmt.Errorf("allocate exact-head review worktree for %s after fetching pull/%d/head: %w", request.Agent, request.PullRequest, retryErr)
+	}
+	return nil
+}
+
+// releaseNativeReviewWorktree force-removes a worktree this poll allocated for a
+// leg that then failed to enqueue. Best-effort: the caller is already returning
+// the enqueue error, and a failed removal leaves exactly the orphan that
+// removal was meant to avoid, which the next poll surfaces as an allocation
+// error rather than hiding.
+func (e Engine) releaseNativeReviewWorktree(ctx context.Context, path string) {
+	manager, ok := e.DelegationWorktrees.(ReadOnlyWorktreeManager)
+	if !ok || strings.TrimSpace(path) == "" {
+		return
+	}
+	_ = manager.RemoveWorktreeForce(ctx, path)
 }
 
 // dispatchHighRiskReview replaces the single native review fan-out with a

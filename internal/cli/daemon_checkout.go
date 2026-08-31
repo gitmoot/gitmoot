@@ -112,12 +112,18 @@ func (w jobWorker) defaultCheckoutForRunner(ctx context.Context, job db.Job, pay
 	return checkout, nil
 }
 
-// prepareNativeReviewWorktreeForRunner gives every native PR review leg the same
-// exact-head isolation as a deliberate `agent review` dispatch. It covers both
-// routine workflow jobs and high-risk lens children that reached the worker
-// without a dispatch-time worktree. It runs after scheduler admission, including
-// the disk guard, and before checkout validation. The persisted marker lets the
-// existing terminal cleanup reclaim the detached worktree.
+// prepareNativeReviewWorktreeForRunner gives a native PR review leg that reached
+// the worker WITHOUT a dispatch-time worktree the same exact-head isolation as a
+// deliberate `agent review` dispatch. Since the engine hoisted the ROUTINE leg's
+// allocation to before enqueue (prepareNativeReviewWorktree), the remaining
+// callers are the configurations where no engine allocation happens at all: an
+// engine with no read-only worktree manager or no Home/DelegationCheckout (the
+// routine leg and the high-risk lens child both arrive path-less there). A leg
+// born with a WorktreePath fails the last gate conjunct below and returns
+// untouched, so no configuration has two live allocation paths. It runs after
+// scheduler admission, including the disk guard, and before checkout validation.
+// The persisted marker lets the existing terminal cleanup reclaim the detached
+// worktree.
 func (w jobWorker) prepareNativeReviewWorktreeForRunner(ctx context.Context, job db.Job, payload workflow.JobPayload, runner subprocess.Runner) (workflow.JobPayload, error) {
 	if job.Type != "review" ||
 		payload.PullRequest <= 0 ||
@@ -147,12 +153,22 @@ func (w jobWorker) prepareNativeReviewWorktreeForRunner(ctx context.Context, job
 			"readonly-seat",
 			0,
 			strings.TrimSpace(payload.HeadSHA),
-			0,
+			// Short budget, like every other read-only allocation site: passing 0
+			// expanded to the ~2-minute checkoutMutationWaitTimeout, stalling this
+			// worker slot on a lock another worker holds for a short shared-.git op.
+			// The caller now DEFERS a spent budget for re-dispatch instead of waiting.
+			workflow.ReadOnlyWorktreeDispatchLockWaitBudget,
 			client,
 		)
 	}
 	path, err := allocate()
 	if err != nil {
+		// A spent checkout-mutation-lock budget is contention, not a cold checkout: a
+		// fetch cannot help it, and the caller defers the leg for re-dispatch. Return
+		// it unwrapped-in-kind so that classification still sees the BlockedError.
+		if workflow.CheckoutMutationLockContention(err) {
+			return payload, fmt.Errorf("allocate native review worktree: %w", err)
+		}
 		fetchErr := client.FetchPullRequest(ctx, "origin", payload.PullRequest)
 		if fetchErr != nil {
 			return payload, fmt.Errorf("allocate native review worktree: %w; fetch PR ref: %v", err, fetchErr)

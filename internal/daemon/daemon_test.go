@@ -227,7 +227,7 @@ func TestPollOnceRoutesPullRequestUpdatesToWorkflow(t *testing.T) {
 	}
 }
 
-func TestPollOnceRecordsBlockedUnscopableHeadOnce(t *testing.T) {
+func TestPollOnceDegradesUnscopableHeadToRecordedFullReview(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
 	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
@@ -283,24 +283,52 @@ func TestPollOnceRecordsBlockedUnscopableHeadOnce(t *testing.T) {
 		},
 	}
 	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
-	for poll := range 5 {
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce 1: %v", err)
+	}
+	// One derivation for this head, not one per consumer: the dispatch invalidates
+	// the poll's review-job snapshot, so reconcileReviewingPullRequest sees the
+	// review that was just enqueued instead of re-entering the lifecycle.
+	if resolverCalls != 1 {
+		t.Fatalf("changed-files resolver calls in poll 1 = %d, want 1", resolverCalls)
+	}
+	for poll := range 4 {
 		if err := daemon.PollOnce(ctx); err != nil {
-			t.Fatalf("PollOnce %d: %v", poll+1, err)
+			t.Fatalf("PollOnce %d: %v", poll+2, err)
 		}
 	}
+	// The degraded review is dispatched AT this head, so routing stops seeing the
+	// PR as changed. A range that keeps re-resolving every poll is the wedge this
+	// replaced.
 	if resolverCalls != 1 {
-		t.Fatalf("changed-files resolver calls = %d, want one durable blocked outcome", resolverCalls)
+		t.Fatalf("changed-files resolver calls = %d after 5 polls, want no re-fire beyond the first", resolverCalls)
 	}
 	jobs, err := store.ListJobs(ctx)
 	if err != nil {
 		t.Fatalf("ListJobs: %v", err)
 	}
-	if len(jobs) != 1 || jobs[0].ID != "prior-review" {
-		t.Fatalf("jobs after unscopable head = %+v, want prior review only", jobs)
+	var dispatched []db.Job
+	for _, job := range jobs {
+		if job.ID != "prior-review" {
+			dispatched = append(dispatched, job)
+		}
+	}
+	if len(dispatched) != 1 {
+		t.Fatalf("jobs dispatched after unscopable head = %+v, want exactly one full review", dispatched)
+	}
+	var payload workflow.JobPayload
+	if err := json.Unmarshal([]byte(dispatched[0].Payload), &payload); err != nil {
+		t.Fatalf("unmarshal dispatched payload: %v", err)
+	}
+	if payload.HeadSHA != "head-two" {
+		t.Fatalf("dispatched review head = %q, want head-two (re-anchors the prior head)", payload.HeadSHA)
+	}
+	if strings.Contains(payload.Instructions, "scoped follow-up") {
+		t.Fatalf("dispatched instructions = %q, want an unscoped full review", payload.Instructions)
 	}
 	task, err := store.GetTask(ctx, "task-007")
-	if err != nil || task.State != string(workflow.TaskBlocked) {
-		t.Fatalf("task after unscopable head = %+v err=%v, want blocked", task, err)
+	if err != nil || task.State != string(workflow.TaskReviewing) {
+		t.Fatalf("task after unscopable head = %+v err=%v, want reviewing, not a permanent block", task, err)
 	}
 	events, err := store.ListTaskEvents(ctx, "task-007")
 	if err != nil {
@@ -317,7 +345,7 @@ func TestPollOnceRecordsBlockedUnscopableHeadOnce(t *testing.T) {
 	}
 	stored, err := store.GetPullRequest(ctx, repo.FullName(), 7)
 	if err != nil || stored.HeadSHA != "head-two" {
-		t.Fatalf("stored blocked baseline = %+v err=%v, want head-two", stored, err)
+		t.Fatalf("stored baseline = %+v err=%v, want head-two", stored, err)
 	}
 }
 

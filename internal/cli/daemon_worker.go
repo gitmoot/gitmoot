@@ -416,6 +416,21 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	nativeReviewDeliveryStarted := false
 	payload, err = w.prepareNativeReviewWorktreeForRunner(ctx, job, payload, jobRunner)
 	if err != nil {
+		// An exact-head allocation that spent its checkout-mutation-lock budget is
+		// TRANSIENT: the holder is another worker's short shared-.git op. Terminally
+		// failing the leg here BURNED the verdict — the payload is left unmutated, so
+		// the next poll's re-enqueue matches it and is a silent no-op, and
+		// FindRepeatedReviewers only re-enlists SUCCEEDED verdicts, so nothing ever
+		// re-attempts it. Hold the still-queued leg for re-dispatch instead, exactly
+		// like the checkout-preflight site below. Every other allocation failure (a
+		// missing commit object, an unwritable path) is unclassified and keeps the
+		// terminal path, and the hold itself is bounded by maxOperationalBlockerRetries.
+		if deferred, deferErr := w.deferCheckoutContention(ctx, job, payload, err); deferErr != nil {
+			writeLine(w.Stdout, "job %s review-worktree contention deferral failed: %v", job.ID, deferErr)
+		} else if deferred {
+			writeLine(w.Stdout, "job %s deferred on review-worktree contention: %v", job.ID, err)
+			return nil
+		}
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}

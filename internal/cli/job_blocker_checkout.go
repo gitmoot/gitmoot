@@ -71,6 +71,21 @@ func classifyCheckoutContention(cause error) (checkoutContentionKind, string) {
 	if cause == nil {
 		return checkoutContentionNone, ""
 	}
+	// A FOURTH family, matched by TYPE rather than by a loose substring: the
+	// checkout MUTATION lock. Every exact-head read-only worktree allocation takes
+	// it, and a waiter that spends its short budget gets a BlockedError carrying
+	// the mutation-busy reason. The holder is another worker's short shared-.git op
+	// (a detached worktree add, the merge gate), so it self-heals exactly like
+	// branch-lock contention — same short exponential backoff, no suggested_action
+	// for a human. workflow.CheckoutMutationLockContention requires BOTH the
+	// BlockedError type and that message, so the arm can only match this one
+	// family: a NON-transient allocation failure (a missing commit object, an
+	// unwritable path) is unclassified and keeps its existing terminal path, and
+	// even a genuine hold is bounded by maxOperationalBlockerRetries rather than
+	// spinning forever.
+	if workflow.CheckoutMutationLockContention(cause) {
+		return checkoutContentionLock, ""
+	}
 	text := cause.Error()
 	// Match ONLY the three daemon-owned pre-flight string families the #532 design
 	// names: branch-lock contention, a dirty checkout, and a wrong HEAD. The

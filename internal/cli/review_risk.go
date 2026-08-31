@@ -101,12 +101,14 @@ func wireReviewChangedFiles(engine *workflow.Engine, gh github.Client) {
 				Reason: fmt.Sprintf("review scope compare is %q, not a direct follow-up", compare.Status),
 			}
 		}
-		// GitHub caps the compare response's files array at 300. Exactly 300 is
-		// ambiguous, so fail closed rather than silently under-review a truncated
-		// follow-up scope.
-		if len(compare.Files) >= 300 {
+		// Size alone is no longer ambiguous: CompareCommits recovers the full
+		// file list past GitHub's 300-file compare cap and flags Truncated only
+		// when it demonstrably could not, so a large-but-complete follow-up
+		// range — exactly what a merge-gate branch update produces — scopes
+		// normally, and only a genuinely unknown list fails closed.
+		if compare.Truncated {
 			return nil, workflow.ReviewScopeUnavailableError{
-				Reason: fmt.Sprintf("review scope compare returned %d files and may be truncated", len(compare.Files)),
+				Reason: fmt.Sprintf("review scope compare file list is truncated at %d files", len(compare.Files)),
 			}
 		}
 		seen := make(map[string]struct{}, len(compare.Files))

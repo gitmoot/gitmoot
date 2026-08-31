@@ -176,19 +176,19 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 		mergeReadinessHandled := false
 		if changed {
 			if handled, err := d.handlePullRequestWorkflowChange(ctx, pull, reviewMemo); err != nil {
-				var blocked workflow.BlockedError
-				if errors.As(err, &blocked) && strings.Contains(blocked.Reason, workflow.ReviewScopeUnavailableBlockMarker) {
-					// A workflow block is a durable, visible outcome for this exact
-					// head, not a transient poll failure. Record the PR baseline so
-					// the same unscopable range does not re-fire forever.
-					mergeReadinessHandled = true
-				} else {
-					if firstErr == nil {
-						firstErr = err
-					}
-					changed = false
+				if firstErr == nil {
+					firstErr = err
 				}
+				changed = false
 			} else {
+				// A workflow dispatch just created review jobs, so the poll's
+				// pre-dispatch snapshot no longer describes this PR. Drop it:
+				// reconcileReviewingPullRequest reads the same memo later in this
+				// iteration and, seeing no review at the current head, re-entered
+				// HandlePullRequestOpened — a second derivation of the same round
+				// whose instructions (and therefore whose deterministic job id) can
+				// differ from the ones just enqueued.
+				reviewMemo.invalidate()
 				mergeReadinessHandled = handled
 				merged, err := d.pullRequestStoredMerged(ctx, pull)
 				if err != nil {
@@ -467,18 +467,6 @@ func (d Daemon) reconcilePROpenTasks(ctx context.Context, pulls []github.PullReq
 			continue
 		}
 		for _, task := range byBranch[strings.TrimSpace(pull.HeadRef)] {
-			if task.State == string(workflow.TaskBlocked) {
-				unavailable, err := d.taskReviewScopeUnavailableAtHead(ctx, task.ID, pull)
-				if err != nil {
-					if firstErr == nil {
-						firstErr = err
-					}
-					continue
-				}
-				if unavailable {
-					continue
-				}
-			}
 			changed, _, err := d.Store.TransitionTaskStateWithEvent(ctx, task.ID,
 				[]string{string(workflow.TaskImplementing), string(workflow.TaskBlocked)},
 				string(workflow.TaskPullRequestOpen), "task_pr_open_auto",
@@ -854,6 +842,14 @@ func (m *reviewJobsMemo) get(ctx context.Context) ([]db.Job, error) {
 	return m.jobs, nil
 }
 
+// invalidate drops the snapshot after a dispatch mutates the review-job set, so a
+// later consumer in the SAME poll observes the jobs that dispatch created instead
+// of re-deriving a round that already exists.
+func (m *reviewJobsMemo) invalidate() {
+	m.done = false
+	m.jobs = nil
+}
+
 // newReviewJobsMemo is a package var (not a plain func) only so the once-per-poll
 // regression test can substitute a memo backed by a counting store; production never
 // reassigns it.
@@ -919,35 +915,7 @@ func (d Daemon) pullRequestWorkflowRouting(ctx context.Context, pull github.Pull
 			routing.stale = true
 		}
 	}
-	if routing.stale {
-		task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
-		if err == nil {
-			unavailable, eventErr := d.taskReviewScopeUnavailableAtHead(ctx, task.ID, pull)
-			if eventErr != nil {
-				return pullRequestRouting{}, eventErr
-			}
-			if unavailable {
-				return pullRequestRouting{}, nil
-			}
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return pullRequestRouting{}, err
-		}
-	}
 	return routing, nil
-}
-
-func (d Daemon) taskReviewScopeUnavailableAtHead(ctx context.Context, taskID string, pull github.PullRequest) (bool, error) {
-	events, err := d.Store.ListTaskEvents(ctx, taskID)
-	if err != nil {
-		return false, err
-	}
-	marker := fmt.Sprintf("pull_request=%d head_sha=%s:", pull.Number, strings.TrimSpace(pull.HeadSHA))
-	for i := len(events) - 1; i >= 0; i-- {
-		if events[i].Kind == "review_scope_unavailable" && strings.Contains(events[i].Reason, marker) {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 func (d Daemon) recordPullRequest(ctx context.Context, pull github.PullRequest) error {
