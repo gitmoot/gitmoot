@@ -329,16 +329,19 @@ that PR's `mergedAt` time. At the next check-in, the coordinator must:
 2. comment on the merged mode-switch PR with this exact transition record:
    `[workload-mode-transition]`, `mode: <THROUGHPUT|DRAIN>`,
    `effective_commit: <40-character SHA>`, `observed_at: <RFC3339>`, zero or more
-   `implementer: <seat> pr=<number>` lines, zero or more
-   `review: <job-id> pr=<number>` lines, then
+   `implementer: <seat> issue=<number> pr=<number|none> accepted_at=<RFC3339>`
+   lines, zero or more `review: <job-id> pr=<number> created_at=<RFC3339>`
+   lines, then
    `[/workload-mode-transition]`.
 
 For DRAIN, the listed transition wave is derived from durable timestamps:
 implementation assignments accepted before `mergedAt` that have not reached a
 terminal handoff, plus review jobs created before `mergedAt` that were queued or
-running then. The merged PR always exists, so this record does not depend on a
-pre-existing workflow. The mode changes how much work may start; it never
-relaxes correctness, exact-head review, CI, or owner merge authority.
+running then. `accepted_at` is the timestamp of the Herdr pane's first
+`working` status event after the issue-backed assignment prompt; `created_at` is
+the job-store timestamp. The merged PR always exists, so this record does not
+depend on a pre-existing workflow. The mode changes how much work may start; it
+never relaxes correctness, exact-head review, CI, or owner merge authority.
 
 Across both modes, use exactly one independent reviewer per corrected head.
 Parallel review lanes mean different PRs, not multiple reviewers on one head.
@@ -366,11 +369,19 @@ specific incident; an incident does not override this rule by itself.
   explicit cancellation. Once occupancy reaches the cap, it must not rise above
   it again; never replace a completed transition-wave item with new work.
 - After activation, cap the `gitmoot/*` scope at **two active implementers and
-  one admitted review job**. An active implementer is a persistent seat
-  currently changing code or a running engine implementation job. An admitted
-  review job is in `queued` or `running`. Only the coordinator may enqueue
-  reviews in DRAIN, serially, after confirming there is no queued or running
-  review job across `gitmoot/*`.
+  one running reviewer**. An active implementer is a persistent seat currently
+  changing code or a running engine implementation job.
+- A DRAIN mode-switch PR is not merge-ready until the coordinator configures
+  the shared daemon with `[daemon] workers = 1`, applies the warm reload, and
+  verifies the effective worker count. This is the atomic runtime gate shared by
+  native PR fanout, heartbeats, and manual background reviews. All DRAIN reviews
+  must run as background engine jobs; never bypass the gate with a foreground or
+  persistent-seat reviewer.
+- Before that PR merges, disable every `action=review` heartbeat and allow
+  exactly one review-capable agent on each active `gitmoot/*` repository. For a
+  PR with a branch lock, the native PR watcher is the sole producer; do not also
+  dispatch a manual review. For a PR without a branch lock, native fanout cannot
+  run, so only the coordinator may enqueue its single manual review.
 - Prioritize merge-ready work and merge-gate integrity, then serial dependency
   chains, then resource-safety work. Rebase conflicted branches only after
   upstream merges settle. Keep drafts and backlog work parked.
