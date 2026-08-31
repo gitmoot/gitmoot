@@ -445,7 +445,7 @@ func TestClientHeadSHA(t *testing.T) {
 	runner.wantArgs(t, 0, "git", "rev-parse", "HEAD")
 }
 
-func TestClientWorktreeHeadReachableFromRemote(t *testing.T) {
+func TestClientCloneOnlyCommitSeesEveryLocalRef(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
 	}
@@ -453,7 +453,7 @@ func TestClientWorktreeHeadReachableFromRemote(t *testing.T) {
 	root := t.TempDir()
 	remote := filepath.Join(root, "origin.git")
 	seed := filepath.Join(root, "seed")
-	worktree := filepath.Join(root, "fix")
+	clone := filepath.Join(root, "fix")
 	runGit(t, root, "init", "--bare", remote)
 	runGit(t, root, "clone", remote, seed)
 	runGit(t, seed, "config", "user.email", "gitmoot@example.com")
@@ -465,42 +465,139 @@ func TestClientWorktreeHeadReachableFromRemote(t *testing.T) {
 	runGit(t, seed, "add", "base.txt")
 	runGit(t, seed, "commit", "-m", "base")
 	runGit(t, seed, "push", "-u", "origin", "feature/fix")
-	runGit(t, remote, "symbolic-ref", "HEAD", "refs/heads/feature/fix")
-	runGit(t, root, "clone", remote, worktree)
-	runGit(t, worktree, "switch", "feature/fix")
-	runGit(t, worktree, "config", "user.email", "gitmoot@example.com")
-	runGit(t, worktree, "config", "user.name", "Gitmoot")
+	runGit(t, root, "clone", remote, clone)
+	runGit(t, clone, "switch", "feature/fix")
+	runGit(t, clone, "config", "user.email", "gitmoot@example.com")
+	runGit(t, clone, "config", "user.name", "Gitmoot")
 
-	client := NewHostClient(seed)
-	_, reachable, err := client.WorktreeHeadReachableFromRemote(ctx, worktree, "feature/fix")
-	if err != nil || !reachable {
-		t.Fatalf("pushed head reachable=%v err=%v, want true", reachable, err)
+	host := NewHostClient(seed)
+	cloneClient := NewHostClient(clone)
+	if err := host.RefreshCloneProofRefs(ctx, clone, remote); err != nil {
+		t.Fatalf("RefreshCloneProofRefs: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(worktree, "local.txt"), []byte("local\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile local: %v", err)
-	}
-	runGit(t, worktree, "add", "local.txt")
-	runGit(t, worktree, "commit", "-m", "local only")
-	_, reachable, err = client.WorktreeHeadReachableFromRemote(ctx, worktree, "feature/fix")
+	unpublished, err := host.CloneOnlyCommit(ctx, clone)
 	if err != nil {
-		t.Fatalf("local head reachability: %v", err)
+		t.Fatalf("CloneOnlyCommit on a fully pushed clone: %v", err)
 	}
-	if reachable {
-		t.Fatal("unpushed local head reported reachable from remote")
+	if unpublished != "" {
+		t.Fatalf("fully pushed clone reported clone-only commit %s", unpublished)
 	}
-	trackingRef, reachable, err := client.WorktreeHeadReachableFromRemote(ctx, worktree, "feature/missing")
+
+	// A side branch is exactly what a HEAD-ancestry proof misses: status stays
+	// empty, HEAD stays published, and RemoveAll would take the objects with it.
+	runGit(t, clone, "switch", "-c", "scratch")
+	runGit(t, clone, "commit", "--allow-empty", "-m", "clone only")
+	scratch, err := cloneClient.HeadSHA(ctx)
 	if err != nil {
-		t.Fatalf("missing branch default-fallback reachability: %v", err)
+		t.Fatalf("scratch HeadSHA: %v", err)
 	}
-	if reachable {
-		t.Fatal("unpushed local head reported reachable from remote default branch")
+	runGit(t, clone, "switch", "feature/fix")
+	status, err := cloneClient.StatusPorcelain(ctx)
+	if err != nil {
+		t.Fatalf("StatusPorcelain: %v", err)
 	}
-	if trackingRef != "refs/remotes/origin/feature/fix" {
-		t.Fatalf("fallback tracking ref = %q, want origin feature branch", trackingRef)
+	if status != "" {
+		t.Fatalf("clone with a side branch is not status-clean: %q", status)
+	}
+	if err := host.RefreshCloneProofRefs(ctx, clone, remote); err != nil {
+		t.Fatalf("RefreshCloneProofRefs after side branch: %v", err)
+	}
+	unpublished, err = host.CloneOnlyCommit(ctx, clone)
+	if err != nil {
+		t.Fatalf("CloneOnlyCommit with a side branch: %v", err)
+	}
+	if unpublished != scratch {
+		t.Fatalf("clone-only commit = %q, want side-branch commit %s", unpublished, scratch)
+	}
+
+	// Publishing the side branch discharges it without any other change.
+	runGit(t, clone, "push", "origin", "scratch")
+	if err := host.RefreshCloneProofRefs(ctx, clone, remote); err != nil {
+		t.Fatalf("RefreshCloneProofRefs after push: %v", err)
+	}
+	unpublished, err = host.CloneOnlyCommit(ctx, clone)
+	if err != nil {
+		t.Fatalf("CloneOnlyCommit after push: %v", err)
+	}
+	if unpublished != "" {
+		t.Fatalf("pushed side branch still reported clone-only commit %s", unpublished)
+	}
+
+	// A stash holds commits that no ref reaches and that `git status` cannot see.
+	if err := os.WriteFile(filepath.Join(clone, "base.txt"), []byte("stashed\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile stashed: %v", err)
+	}
+	runGit(t, clone, "stash", "push", "-m", "clone only stash")
+	status, err = cloneClient.StatusPorcelain(ctx)
+	if err != nil {
+		t.Fatalf("StatusPorcelain after stash: %v", err)
+	}
+	if status != "" {
+		t.Fatalf("stashed clone is not status-clean: %q", status)
+	}
+	unpublished, err = host.CloneOnlyCommit(ctx, clone)
+	if err != nil {
+		t.Fatalf("CloneOnlyCommit with a stash: %v", err)
+	}
+	if unpublished == "" {
+		t.Fatal("stashed clone-only commit reported as fully published")
 	}
 }
 
-func TestClientWorktreeHeadReachableFromRemoteRefreshesLocalFixClone(t *testing.T) {
+func TestClientCloneOnlyCommitDistrustsCloneOrigin(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "origin.git")
+	seed := filepath.Join(root, "seed")
+	clone := filepath.Join(root, "fix")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "clone", remote, seed)
+	runGit(t, seed, "config", "user.email", "gitmoot@example.com")
+	runGit(t, seed, "config", "user.name", "Gitmoot")
+	runGit(t, seed, "switch", "-c", "feature/fix")
+	if err := os.WriteFile(filepath.Join(seed, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile base: %v", err)
+	}
+	runGit(t, seed, "add", "base.txt")
+	runGit(t, seed, "commit", "-m", "base")
+	runGit(t, seed, "push", "-u", "origin", "feature/fix")
+	runGit(t, root, "clone", remote, clone)
+	runGit(t, clone, "switch", "feature/fix")
+	runGit(t, clone, "config", "user.email", "gitmoot@example.com")
+	runGit(t, clone, "config", "user.name", "Gitmoot")
+	runGit(t, clone, "commit", "--allow-empty", "-m", "clone only")
+	cloneHead, err := NewHostClient(clone).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("clone HeadSHA: %v", err)
+	}
+	// Whatever ran in the clone can repoint its own origin at itself, which would
+	// make every local commit look published to a proof that trusts clone config.
+	runGit(t, clone, "remote", "set-url", "origin", clone)
+
+	host := NewHostClient(seed)
+	trusted, err := host.RemoteURL(ctx, "origin")
+	if err != nil {
+		t.Fatalf("RemoteURL: %v", err)
+	}
+	if trusted != remote {
+		t.Fatalf("trusted remote url = %q, want %q", trusted, remote)
+	}
+	if err := host.RefreshCloneProofRefs(ctx, clone, trusted); err != nil {
+		t.Fatalf("RefreshCloneProofRefs: %v", err)
+	}
+	unpublished, err := host.CloneOnlyCommit(ctx, clone)
+	if err != nil {
+		t.Fatalf("CloneOnlyCommit: %v", err)
+	}
+	if unpublished != cloneHead {
+		t.Fatalf("clone-only commit = %q, want %s despite the rewritten origin", unpublished, cloneHead)
+	}
+}
+
+func TestClientCloneOnlyCommitDischargesMergedDeletedBranch(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
 	}
@@ -520,7 +617,6 @@ func TestClientWorktreeHeadReachableFromRemoteRefreshesLocalFixClone(t *testing.
 	runGit(t, source, "commit", "-m", "base")
 	runGit(t, source, "branch", "-M", "main")
 	runGit(t, source, "push", "-u", "origin", "main")
-	runGit(t, remote, "symbolic-ref", "HEAD", "refs/heads/main")
 	runGit(t, source, "switch", "-c", "feature/fix")
 	if err := os.WriteFile(filepath.Join(source, "fix.txt"), []byte("fix\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile fix: %v", err)
@@ -532,11 +628,6 @@ func TestClientWorktreeHeadReachableFromRemoteRefreshesLocalFixClone(t *testing.
 	if err != nil {
 		t.Fatalf("feature HeadSHA: %v", err)
 	}
-	runGit(t, source, "switch", "main")
-	runGit(t, source, "merge", "--ff-only", "feature/fix")
-	runGit(t, source, "push", "origin", "main")
-	runGit(t, source, "push", "origin", "--delete", "feature/fix")
-	runGit(t, source, "branch", "-D", "feature/fix")
 
 	sourceClient := NewHostClient(source)
 	if err := sourceClient.CloneLocalNoCheckout(ctx, fixClone); err != nil {
@@ -549,19 +640,64 @@ func TestClientWorktreeHeadReachableFromRemoteRefreshesLocalFixClone(t *testing.
 	if err := fixClient.CheckoutBranchAt(ctx, "feature/fix", featureHead); err != nil {
 		t.Fatalf("CheckoutBranchAt: %v", err)
 	}
-	if _, err := fixClient.RevParse(ctx, "refs/remotes/origin/feature/fix"); err == nil {
-		t.Fatal("local fix clone unexpectedly began with the remote-tracking feature ref")
+
+	// Merge the branch and delete it on origin, the state a reclaim candidate is
+	// normally in: the commits survive on the default branch, so nothing is lost.
+	runGit(t, source, "switch", "main")
+	runGit(t, source, "merge", "--ff-only", "feature/fix")
+	runGit(t, source, "push", "origin", "main")
+	runGit(t, source, "push", "origin", "--delete", "feature/fix")
+	runGit(t, source, "branch", "-D", "feature/fix")
+
+	if err := sourceClient.RefreshCloneProofRefs(ctx, fixClone, remote); err != nil {
+		t.Fatalf("RefreshCloneProofRefs: %v", err)
+	}
+	unpublished, err := sourceClient.CloneOnlyCommit(ctx, fixClone)
+	if err != nil {
+		t.Fatalf("CloneOnlyCommit: %v", err)
+	}
+	if unpublished != "" {
+		t.Fatalf("merged-and-deleted branch reported clone-only commit %s", unpublished)
 	}
 
-	trackingRef, reachable, err := sourceClient.WorktreeHeadReachableFromRemote(ctx, fixClone, "feature/fix")
-	if err != nil || !reachable {
-		t.Fatalf("merged head reachable=%v err=%v, want true through default branch", reachable, err)
+	// A squash merge republishes the CONTENT under a new commit, so the branch
+	// commits themselves remain clone-only and the clone is retained. This is the
+	// documented conservative outcome, asserted so it cannot regress silently.
+	runGit(t, source, "switch", "-c", "feature/squash")
+	if err := os.WriteFile(filepath.Join(source, "squash.txt"), []byte("squash\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile squash: %v", err)
 	}
-	if trackingRef != "refs/remotes/origin/main" {
-		t.Fatalf("fallback tracking ref = %q, want refs/remotes/origin/main", trackingRef)
+	runGit(t, source, "add", "squash.txt")
+	runGit(t, source, "commit", "-m", "squash candidate")
+	squashHead, err := NewHostClient(source).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("squash HeadSHA: %v", err)
 	}
-	if _, err := fixClient.RevParse(ctx, trackingRef); err != nil {
-		t.Fatalf("refreshed default-branch tracking ref: %v", err)
+	squashClone := filepath.Join(root, "squash-fix")
+	if err := sourceClient.CloneLocalNoCheckout(ctx, squashClone); err != nil {
+		t.Fatalf("CloneLocalNoCheckout squash: %v", err)
+	}
+	squashClient := NewHostClient(squashClone)
+	if err := squashClient.SetRemoteURL(ctx, "origin", remote); err != nil {
+		t.Fatalf("SetRemoteURL squash: %v", err)
+	}
+	if err := squashClient.CheckoutBranchAt(ctx, "feature/squash", squashHead); err != nil {
+		t.Fatalf("CheckoutBranchAt squash: %v", err)
+	}
+	runGit(t, source, "switch", "main")
+	runGit(t, source, "merge", "--squash", "feature/squash")
+	runGit(t, source, "commit", "-m", "squashed fix")
+	runGit(t, source, "push", "origin", "main")
+	runGit(t, source, "branch", "-D", "feature/squash")
+	if err := sourceClient.RefreshCloneProofRefs(ctx, squashClone, remote); err != nil {
+		t.Fatalf("RefreshCloneProofRefs squash: %v", err)
+	}
+	unpublished, err = sourceClient.CloneOnlyCommit(ctx, squashClone)
+	if err != nil {
+		t.Fatalf("CloneOnlyCommit squash: %v", err)
+	}
+	if unpublished != squashHead {
+		t.Fatalf("squash-merged clone-only commit = %q, want %s", unpublished, squashHead)
 	}
 }
 
@@ -765,6 +901,25 @@ func TestClientWorktreePristineAtPreservesStandaloneCloneStatusError(t *testing.
 		t.Fatalf("standalone clone status failure was classified terminal: %v", err)
 	}
 	runner.wantArgs(t, 0, "git", "status", "--porcelain", "--ignored")
+}
+
+func TestClientRemoveWorktreeKeepsVanishedPathRetryable(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "gone")
+	cause := errors.New("fatal: '" + path + "' is not a working tree")
+	runner := &fakeRunner{
+		results: []subprocess.Result{{Stderr: "fatal: is not a working tree"}},
+		errs:    []error{cause},
+	}
+	err := NewClient(root, runner).RemoveWorktree(context.Background(), path)
+	if !errors.Is(err, cause) {
+		t.Fatalf("RemoveWorktree error = %v, want original removal error", err)
+	}
+	var terminal terminalWorktreeRemovalError
+	if errors.As(err, &terminal) {
+		t.Fatalf("vanished worktree path was classified terminal: %v", err)
+	}
+	runner.wantArgs(t, 0, "git", "worktree", "remove", path)
 }
 
 func TestClientWorktreeCleanSmoke(t *testing.T) {

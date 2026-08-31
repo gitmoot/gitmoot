@@ -235,30 +235,6 @@ func (c Client) RemoteBranches(ctx context.Context, branches []string) (map[stri
 	return out, nil
 }
 
-// RemoteDefaultBranch resolves origin's symbolic HEAD to a branch name.
-func (c Client) RemoteDefaultBranch(ctx context.Context) (string, error) {
-	result, err := c.run(ctx, "ls-remote", "--symref", "origin", "HEAD")
-	if err != nil {
-		return "", err
-	}
-	for _, line := range strings.Split(result.Stdout, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 3 || fields[0] != "ref:" || fields[2] != "HEAD" {
-			continue
-		}
-		const heads = "refs/heads/"
-		if !strings.HasPrefix(fields[1], heads) {
-			return "", fmt.Errorf("origin HEAD points outside %s: %s", heads, fields[1])
-		}
-		branch := strings.TrimPrefix(fields[1], heads)
-		if err := validateBranch(branch); err != nil {
-			return "", err
-		}
-		return branch, nil
-	}
-	return "", errors.New("origin has no symbolic default branch")
-}
-
 func (c Client) RemoveWorktree(ctx context.Context, path string) error {
 	return c.removeWorktree(ctx, path, false)
 }
@@ -285,8 +261,17 @@ func (c Client) removeWorktree(ctx context.Context, path string, force bool) err
 	if err == nil || !strings.Contains(strings.ToLower(result.Stderr), "is not a working tree") {
 		return err
 	}
+	// A path that vanished between the caller's stat and this removal is a race,
+	// not a registration failure: the next pass sees an absent path and reconciles
+	// it. Classifying it terminal is sticky and permanently retires the candidate.
+	if _, statErr := os.Lstat(path); os.IsNotExist(statErr) {
+		return err
+	}
 	owner, ownerErr := worktreeOwnerCheckout(path)
 	if ownerErr != nil {
+		if errors.Is(ownerErr, os.ErrNotExist) {
+			return err
+		}
 		return terminalWorktreeRemovalError{err: fmt.Errorf("%w: resolve owning checkout: %v", err, ownerErr)}
 	}
 	if filepath.Clean(owner) == filepath.Clean(c.dir) {
@@ -599,60 +584,83 @@ func (c Client) worktreeStatusEmptyAt(ctx context.Context, path string, includeI
 	return false, err
 }
 
-// WorktreeHeadReachableFromRemote proves that removing an independent writable
-// clone will not discard commits that exist only in that clone. It returns the
-// refreshed local tracking ref so callers can repeat a final local-only proof.
-// When the recorded branch was deleted after merge, origin's default branch is
-// the authoritative fallback.
-func (c Client) WorktreeHeadReachableFromRemote(ctx context.Context, path string, branch string) (trackingRef string, reachable bool, err error) {
-	path, err = validateWorktreePath(path)
+// cloneReclaimProofNamespace holds the refs fetched from the TRUSTED remote URL
+// during a disposable-clone removal proof. It is deliberately separate from
+// refs/remotes/origin/*: a disposable clone's own remote configuration is
+// writable by whatever ran in it, so origin is not evidence of anything.
+const cloneReclaimProofNamespace = "refs/remotes/gitmoot-reclaim-proof/"
+
+// RemoteURL returns the URL of a remote in this client's checkout. The registered
+// repository checkout is the trust anchor for disposable-clone removal proofs.
+func (c Client) RemoteURL(ctx context.Context, remote string) (string, error) {
+	remote = strings.TrimSpace(remote)
+	if remote == "" {
+		remote = "origin"
+	}
+	if strings.HasPrefix(remote, "-") || strings.ContainsAny(remote, " \t\r\n") {
+		return "", fmt.Errorf("remote %q is invalid", remote)
+	}
+	result, err := c.run(ctx, "remote", "get-url", remote)
 	if err != nil {
-		return "", false, err
+		return "", err
 	}
-	if err := validateBranch(branch); err != nil {
-		return "", false, err
+	url := strings.TrimSpace(result.Stdout)
+	if url == "" {
+		return "", fmt.Errorf("remote %q has no url", remote)
 	}
-	worktree := NewClient(path, c.runner)
-	remoteBranches, err := worktree.RemoteBranches(ctx, []string{branch})
-	if err != nil {
-		return "", false, err
-	}
-	targetBranch := branch
-	if _, ok := remoteBranches[branch]; !ok {
-		targetBranch, err = worktree.RemoteDefaultBranch(ctx)
-		if err != nil {
-			return "", false, err
-		}
-	}
-	remoteRef := "refs/heads/" + targetBranch
-	trackingRef = "refs/remotes/origin/" + targetBranch
-	if _, err := worktree.run(ctx, "fetch", "--no-tags", "origin", "+"+remoteRef+":"+trackingRef); err != nil {
-		return "", false, err
-	}
-	reachable, err = worktree.WorktreeHeadReachableFromRef(ctx, path, trackingRef)
-	return trackingRef, reachable, err
+	return url, nil
 }
 
-// WorktreeHeadReachableFromRef performs the final local-only ancestry proof
-// after any remote refresh has completed.
-func (c Client) WorktreeHeadReachableFromRef(ctx context.Context, path string, ref string) (bool, error) {
+// RefreshCloneProofRefs mirrors every branch and tag of the trusted remote URL
+// into the clone's proof namespace, pruning refs the remote no longer has. It
+// takes a URL rather than a remote name so the proof never consults the
+// disposable clone's own (mutable) remote configuration.
+func (c Client) RefreshCloneProofRefs(ctx context.Context, path string, remoteURL string) error {
 	path, err := validateWorktreePath(path)
 	if err != nil {
-		return false, err
+		return err
 	}
-	if err := validateRef(ref); err != nil {
-		return false, err
+	remoteURL = strings.TrimSpace(remoteURL)
+	switch {
+	case remoteURL == "":
+		return errors.New("trusted remote url is required")
+	case strings.HasPrefix(remoteURL, "-"):
+		return fmt.Errorf("trusted remote url %q must not start with '-'", remoteURL)
+	case strings.ContainsAny(remoteURL, " \t\r\n"):
+		return fmt.Errorf("trusted remote url %q must not contain whitespace", remoteURL)
 	}
-	worktree := NewClient(path, c.runner)
-	head, err := worktree.HeadSHA(ctx)
+	_, err = NewClient(path, c.runner).run(ctx, "fetch", "--prune", "--no-write-fetch-head", remoteURL,
+		"+refs/heads/*:"+cloneReclaimProofNamespace+"heads/*",
+		"+refs/tags/*:"+cloneReclaimProofNamespace+"tags/*",
+	)
+	return err
+}
+
+// CloneOnlyCommit returns the first commit that some local ref or reflog in the
+// clone reaches and no ref of the trusted remote contains, or "" when every
+// local commit is published. Removing a clone deletes its whole object database,
+// so HEAD ancestry alone is not a proof: side branches, tags, stashes and
+// reflog-only commits are exactly what a HEAD check misses.
+//
+// It is local-only, so callers can repeat it immediately before removal.
+// RefreshCloneProofRefs must have populated the proof namespace first; an empty
+// namespace makes every local commit clone-only, which retains the clone.
+func (c Client) CloneOnlyCommit(ctx context.Context, path string) (string, error) {
+	path, err := validateWorktreePath(path)
 	if err != nil {
-		return false, err
+		return "", err
 	}
-	refHead, err := worktree.RevParse(ctx, ref)
+	result, err := NewClient(path, c.runner).run(ctx, "rev-list", "--max-count=1", "--all", "--reflog",
+		"--not", "--glob="+cloneReclaimProofNamespace+"*")
 	if err != nil {
-		return false, err
+		return "", err
 	}
-	return worktree.IsAncestor(ctx, head, refHead)
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		if sha := strings.TrimSpace(line); sha != "" {
+			return sha, nil
+		}
+	}
+	return "", nil
 }
 
 func (c Client) StatusPorcelain(ctx context.Context) (string, error) {

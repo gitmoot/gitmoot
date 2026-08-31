@@ -730,14 +730,31 @@ Gitmoot never force-removes those.
 `[workflow].delegation_worktree_ttl = "72h"` is default-on because a final
 delegation owner cannot resume, while the grace period preserves short-term
 debugging access. Set it to `"0"` to disable the TTL pass. Aged read-only and
-delegation worktrees are force-removed even when dirty. For an independent fix
-clone, Gitmoot refreshes the recorded branch from its real `origin` within a
-two-minute probe deadline, then removes the clone only when it is clean and its
-HEAD is still reachable from that refreshed remote branch immediately before
-removal. If the recorded branch was deleted after merge, Gitmoot refreshes
-`origin`'s symbolic default branch and requires the same ancestry proof there.
-An unavailable default branch or unreachable HEAD retains the clone, so TTL
-alone cannot discard local commits.
+delegation worktrees are force-removed even when dirty. An independent fix
+clone is different: removing it deletes its object database, so a clean working
+tree and a published HEAD are not sufficient evidence. Gitmoot mirrors every
+branch and tag of the **registered repository checkout's** remote URL into the
+clone's own proof namespace (`refs/remotes/gitmoot-reclaim-proof/*`, pruned each
+pass) within a two-minute probe deadline, then requires that no commit reachable
+from any local ref or reflog is missing from those refs. The trusted URL comes
+from the registered checkout, never from the clone's own `origin`, which
+whatever ran in the clone could have rewritten.
+
+The proven-disposable clone is then **renamed to a sibling
+`<path>.ttl-reclaiming` before deletion** and every proof is repeated there:
+the rename is a single filesystem operation, so a commit racing the final proof
+lands in a path that no longer exists, and anything that followed the directory
+is caught by the re-proof. A failed re-proof renames the clone back. A leftover
+`.ttl-reclaiming` directory from an interrupted removal is reported, never
+deleted.
+
+A retained clone records **why**: the `delegation_worktree_retained_unpublished`
+job event names the offending commit, and the cleanup obligation carries reason
+`unpublished_commits` until the state changes. A squash merge publishes the
+content under a new commit while the branch commits stay clone-only, so a
+squash-merged fix clone is retained by design rather than silently retried
+forever.
+
 An already-absent managed fix path completes the same bookkeeping instead of
 consuming retries or entering quarantine. `delegation_worktree_reclaimed_ttl`
 is recorded after removal or this already-absent reconciliation. The dashboard
@@ -746,7 +763,10 @@ summary in its top-level `worktrees` field, including the number of cleanup
 obligations in terminal quarantine.
 
 Terminal-task reclaim failures use the same three-message path limit before
-suppressing identical repeats.
+suppressing identical repeats. The pass proves at most eight candidates per
+tick — each proof takes the checkout mutation lock and walks the ignored tree
+twice — and rotates its window through the candidate list so a permanently
+retained worktree cannot starve the ones behind it.
 
 One unreclaimable delegation candidate does not stop the pass. Candidate-local
 lookup, runner, and removal failures are skipped while later paths continue.

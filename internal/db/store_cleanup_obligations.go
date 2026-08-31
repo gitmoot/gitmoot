@@ -45,7 +45,12 @@ const (
 	CleanupReasonRunnerResolution      CleanupObligationReason = "runner_resolution"
 	CleanupReasonCheckoutLock          CleanupObligationReason = "checkout_lock"
 	CleanupReasonIdentityOrContainment CleanupObligationReason = "identity_or_containment"
-	CleanupReasonUnknown               CleanupObligationReason = "unknown"
+	// CleanupReasonUnpublishedCommits retains a disposable clone whose object
+	// database still holds commits no trusted remote ref contains: deleting it
+	// would be the only copy's last moment. Squash-merged branches land here, so
+	// the reason is durable and operator-visible rather than a silent no-op.
+	CleanupReasonUnpublishedCommits CleanupObligationReason = "unpublished_commits"
+	CleanupReasonUnknown            CleanupObligationReason = "unknown"
 )
 
 func ClassifyCleanupObligationFailure(phase string, err error) CleanupObligationReason {

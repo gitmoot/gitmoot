@@ -181,6 +181,12 @@ func scanWorktreeLiveness(path string, procRoot string, requireEveryCWD bool) (l
 		if err != nil {
 			if requireEveryCWD {
 				kernelThread, statErr := procEntryIsKernelThread(filepath.Join(procRoot, name))
+				// A process that exited during the probe cannot be holding a cwd in
+				// the worktree, so its disappearance is irrelevant rather than
+				// inconclusive: the readlink path above already skips ENOENT.
+				if errors.Is(statErr, os.ErrNotExist) {
+					continue
+				}
 				if statErr != nil || !kernelThread {
 					conclusive = false
 				}

@@ -28,7 +28,9 @@ func TestCleanupObligationsMigrationFreshAndUpgrade(t *testing.T) {
 		t.Fatalf("sql.Open: %v", err)
 	}
 	preMigration := &Store{db: raw}
-	for version, migration := range migrationsBefore(t, "CREATE TABLE cleanup_obligations") {
+	// Unique to the original migration: the rebuild that adds unpublished_commits
+	// repeats every other line of this CREATE TABLE.
+	for version, migration := range migrationsBefore(t, "'identity_or_containment', 'unknown'") {
 		if err := preMigration.applyMigration(ctx, version+1, migration); err != nil {
 			t.Fatalf("applyMigration(%d): %v", version+1, err)
 		}
@@ -47,6 +49,26 @@ func TestCleanupObligationsMigrationFreshAndUpgrade(t *testing.T) {
 	t.Cleanup(func() { _ = upgraded.Close() })
 	if exists, err := upgraded.HasTable(ctx, "cleanup_obligations"); err != nil || !exists {
 		t.Fatalf("upgraded cleanup_obligations exists=%v err=%v", exists, err)
+	}
+}
+
+func TestCleanupObligationAcceptsUnpublishedCommitsReason(t *testing.T) {
+	ctx := context.Background()
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	obligation, err := store.DeferCleanupObligation(ctx, "job-unpublished", "/tmp/managed/fix-clone", CleanupReasonUnpublishedCommits, now, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("DeferCleanupObligation: %v", err)
+	}
+	if obligation.Reason != CleanupReasonUnpublishedCommits {
+		t.Fatalf("reason = %q, want %q", obligation.Reason, CleanupReasonUnpublishedCommits)
+	}
+	if obligation.State != "retryable" {
+		t.Fatalf("state = %q, want retryable", obligation.State)
 	}
 }
 

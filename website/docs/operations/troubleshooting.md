@@ -547,13 +547,22 @@ quarantined cleanup count in its top-level `worktrees` field.
 
 `[workflow].delegation_worktree_ttl = "72h"` is default-on. After that grace
 period the daemon force-removes dirty terminal-owned read-only and delegation
-worktrees. For an independent fix clone, Gitmoot refreshes the recorded branch
-from its real `origin` within a two-minute probe deadline, then requires a clean
-tree whose HEAD is still reachable from that refreshed remote branch immediately
-before removal. If the recorded branch was deleted after merge, Gitmoot
-refreshes `origin`'s symbolic default branch and requires the same ancestry
-proof there. An unavailable default branch or unreachable HEAD keeps the clone.
-An already-absent managed fix path completes cleanup
+worktrees. An independent fix clone is different: removing it deletes its object
+database, so Gitmoot mirrors every branch and tag of the **registered repository
+checkout's** remote URL into the clone's proof namespace
+(`refs/remotes/gitmoot-reclaim-proof/*`, pruned each pass) within a two-minute
+probe deadline, then requires that no commit reachable from any local ref or
+reflog is absent from those refs. The clone's own `origin` is never trusted; it
+is writable by whatever ran in the clone.
+
+A proven-disposable clone is renamed to `<path>.ttl-reclaiming` and re-proven
+there before deletion, so a commit racing the final proof cannot be discarded; a
+failed re-proof renames it back, and a leftover `.ttl-reclaiming` directory is
+reported rather than deleted. A retained clone records the
+`delegation_worktree_retained_unpublished` event and carries cleanup-obligation
+reason `unpublished_commits`; squash-merged fix branches land here by design,
+because a squash publishes the content and not the commits. An already-absent
+managed fix path completes cleanup
 bookkeeping instead of consuming retries or entering quarantine. A successful
 removal or already-absent reconciliation records
 `delegation_worktree_reclaimed_ttl`. Set the TTL to `"0"` to disable this pass.
@@ -566,7 +575,10 @@ list --state quarantined` and reopen a repaired target with
 `gitmoot job cleanup reopen <resource-id>`.
 
 Repeated terminal-task failures log three times per path before identical
-messages are suppressed.
+messages are suppressed. The terminal-task pass proves at most eight candidates
+per tick, because each proof takes the checkout mutation lock and walks the
+ignored tree twice; the window rotates through the candidate list so a
+permanently retained worktree cannot starve the ones behind it.
 
 For immediate relief, list candidate directories and prove ownership before
 removing anything:

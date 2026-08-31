@@ -25,6 +25,11 @@ func TestWorktreeLiveness(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(processDir, "cwd"), []byte("not a symlink"), 0o644); err != nil {
 			t.Fatalf("WriteFile cwd: %v", err)
 		}
+		// A userland process: PF_KTHREAD (0x00200000) clear in stat field 9.
+		const stat = "999999998 (agent) S 1 0 0 0 -1 4194560 0\n"
+		if err := os.WriteFile(filepath.Join(processDir, "stat"), []byte(stat), 0o644); err != nil {
+			t.Fatalf("WriteFile stat: %v", err)
+		}
 		live, known := worktreeLiveness(worktree, procRoot)
 		if live || known {
 			t.Fatalf("worktreeLiveness with unreadable cwd = (%v, %v), want (false, false)", live, known)
@@ -32,6 +37,24 @@ func TestWorktreeLiveness(t *testing.T) {
 		live, known = bestEffortWorktreeLiveness(worktree, procRoot)
 		if live || !known {
 			t.Fatalf("best-effort liveness with unreadable foreign cwd = (%v, %v), want (false, true)", live, known)
+		}
+	})
+
+	t.Run("process that exits during the probe is irrelevant", func(t *testing.T) {
+		worktree := t.TempDir()
+		procRoot := t.TempDir()
+		processDir := filepath.Join(procRoot, "999999996")
+		if err := os.Mkdir(processDir, 0o755); err != nil {
+			t.Fatalf("Mkdir process dir: %v", err)
+		}
+		// cwd is unreadable and stat is already gone: the process exited between the
+		// directory listing and the probe, so it holds no cwd anywhere.
+		if err := os.WriteFile(filepath.Join(processDir, "cwd"), []byte("not a symlink"), 0o644); err != nil {
+			t.Fatalf("WriteFile cwd: %v", err)
+		}
+		live, known := worktreeLiveness(worktree, procRoot)
+		if live || !known {
+			t.Fatalf("worktreeLiveness with an exited process = (%v, %v), want (false, true)", live, known)
 		}
 	})
 

@@ -1115,7 +1115,7 @@ func TestEngineReclaimTerminalTaskWorktreeReclaimsTaskKinds(t *testing.T) {
 			}); err != nil {
 				t.Fatalf("UpsertTask: %v", err)
 			}
-			manager := &fakeWorktreeManager{}
+			manager := &fakeWorktreeManager{existingBranches: map[string]bool{tc.id: true}}
 			engine := testEngine(store)
 
 			outcome, err := engine.ReclaimTerminalTaskWorktreeOutcome(ctx, home, checkout, tc.id, manager)
@@ -1212,6 +1212,47 @@ func TestEngineReclaimTerminalTaskWorktreeKeepsUnsafeCandidates(t *testing.T) {
 	}
 }
 
+// A preserved task branch that no longer exists means safety is unprovable, not
+// that the pass is broken: it classifies instead of erroring on every tick.
+func TestEngineReclaimTerminalTaskWorktreeClassifiesMissingBranch(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	const taskID = "review-pr-42-missing-branch"
+	path, err := TaskWorktreePath(home, "owner/repo", taskID)
+	if err != nil {
+		t.Fatalf("TaskWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktree: %v", err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           taskID,
+		RepoFullName: "owner/repo",
+		State:        string(TaskMerged),
+		Branch:       taskID,
+		WorktreePath: path,
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	manager := &fakeWorktreeManager{existingBranches: map[string]bool{}}
+	engine := testEngine(store)
+
+	outcome, err := engine.ReclaimTerminalTaskWorktreeOutcome(ctx, home, t.TempDir(), taskID, manager)
+	if err != nil {
+		t.Fatalf("ReclaimTerminalTaskWorktreeOutcome: %v", err)
+	}
+	if outcome.Reclaimed || outcome.Classification != TaskWorktreeReclaimHeadUnreachable {
+		t.Fatalf("outcome = %+v, want head_unreachable retention", outcome)
+	}
+	if len(manager.removed) != 0 {
+		t.Fatalf("worktree was removed without a reachable branch: %v", manager.removed)
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("worktree was deleted: %v", statErr)
+	}
+}
+
 type fakeTerminalWorktreeRemovalError struct{}
 
 func (fakeTerminalWorktreeRemovalError) Error() string {
@@ -1242,7 +1283,10 @@ func TestEngineReclaimTerminalTaskWorktreeClassifiesUnremovableOnce(t *testing.T
 	}); err != nil {
 		t.Fatalf("UpsertTask: %v", err)
 	}
-	manager := &fakeWorktreeManager{removeErr: fakeTerminalWorktreeRemovalError{}}
+	manager := &fakeWorktreeManager{
+		removeErr:        fakeTerminalWorktreeRemovalError{},
+		existingBranches: map[string]bool{"review-pr-unremovable": true},
+	}
 	engine := testEngine(store)
 
 	outcome, err := engine.ReclaimTerminalTaskWorktreeOutcome(ctx, home, t.TempDir(), "review-pr-unremovable", manager)
@@ -1555,27 +1599,27 @@ func TestEngineReclaimAgedFixWorktreeCompletesAlreadyAbsentPath(t *testing.T) {
 	}
 }
 
-func TestEngineReclaimAgedFixWorktreeRequiresCleanRemoteReachableHead(t *testing.T) {
+func TestEngineReclaimAgedFixCloneRequiresPublishedObjectDatabase(t *testing.T) {
 	for _, tc := range []struct {
 		name            string
 		clean           bool
-		reachable       bool
+		unpublished     string
 		cleanErr        error
-		reachableErr    error
+		remoteURLErr    error
+		refreshErr      error
+		cloneOnlyErr    error
 		requireDeadline bool
-		refReachable    bool
-		refReachableSet bool
-		refReachableErr error
 		want            bool
 		wantErr         string
+		wantRetained    bool
 	}{
-		{name: "dirty", clean: false, reachable: true},
-		{name: "unpushed head", clean: true, reachable: false},
+		{name: "dirty", clean: false},
+		{name: "unpublished side branch", clean: true, unpublished: "deadbeef", wantRetained: true},
 		{name: "clean probe error", cleanErr: errors.New("clean probe failed"), wantErr: "prove aged terminal fix worktree clean"},
-		{name: "reachability probe error", clean: true, reachableErr: errors.New("reachability probe failed"), wantErr: "head reachable from remote"},
-		{name: "head changes after remote refresh", clean: true, reachable: true, refReachableSet: true, refReachable: false},
-		{name: "final reachability probe error", clean: true, reachable: true, refReachableErr: errors.New("final reachability probe failed"), wantErr: "recheck aged terminal fix worktree head reachable"},
-		{name: "clean pushed head", clean: true, reachable: true, requireDeadline: true, want: true},
+		{name: "trusted remote url error", clean: true, remoteURLErr: errors.New("no origin"), wantErr: "resolve trusted remote url"},
+		{name: "proof refresh error", clean: true, refreshErr: errors.New("fetch failed"), wantErr: "refresh trusted remote refs"},
+		{name: "clone-only probe error", clean: true, cloneOnlyErr: errors.New("rev-list failed"), wantErr: "holds no unpublished commits"},
+		{name: "fully published clone", clean: true, requireDeadline: true, want: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -1612,13 +1656,15 @@ func TestEngineReclaimAgedFixWorktreeRequiresCleanRemoteReachableHead(t *testing
 				cleanSet:        true,
 				clean:           tc.clean,
 				cleanErr:        tc.cleanErr,
-				reachableErr:    tc.reachableErr,
+				remoteURL:       "https://example.invalid/owner/repo.git",
+				remoteURLErr:    tc.remoteURLErr,
+				refreshErr:      tc.refreshErr,
+				cloneOnlyErr:    tc.cloneOnlyErr,
 				requireDeadline: tc.requireDeadline,
-				refReachable:    tc.refReachable,
-				refReachableSet: tc.refReachableSet,
-				refReachableErr: tc.refReachableErr,
-				ancestorSet:     true,
-				ancestor:        tc.reachable,
+				cloneOnly: map[string]string{
+					path:                            tc.unpublished,
+					path + fixCloneQuarantineSuffix: tc.unpublished,
+				},
 			}
 			engine := testEngine(store)
 			engine.Home = home
@@ -1637,12 +1683,184 @@ func TestEngineReclaimAgedFixWorktreeRequiresCleanRemoteReachableHead(t *testing
 			}
 			_, statErr := os.Stat(path)
 			if tc.want && !os.IsNotExist(statErr) {
-				t.Fatalf("eligible fix worktree remains: %v", statErr)
+				t.Fatalf("eligible fix clone remains: %v", statErr)
 			}
 			if !tc.want && statErr != nil {
-				t.Fatalf("ineligible fix worktree was removed: %v", statErr)
+				t.Fatalf("ineligible fix clone was removed: %v", statErr)
+			}
+			if _, quarantineErr := os.Stat(path + fixCloneQuarantineSuffix); !os.IsNotExist(quarantineErr) {
+				t.Fatalf("quarantine path survived the pass: %v", quarantineErr)
+			}
+			if tc.want && len(manager.refreshedURLs) == 0 {
+				t.Fatal("removal proof never refreshed the trusted remote refs")
+			}
+			for _, url := range manager.refreshedURLs {
+				if url != "https://example.invalid/owner/repo.git" {
+					t.Fatalf("proof refreshed from %q, want the trusted checkout remote", url)
+				}
+			}
+			obligation, obligationErr := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(jobID, path))
+			if tc.wantRetained {
+				if obligationErr != nil {
+					t.Fatalf("GetCleanupObligation: %v", obligationErr)
+				}
+				if obligation.Reason != db.CleanupReasonUnpublishedCommits {
+					t.Fatalf("obligation reason = %q, want %q", obligation.Reason, db.CleanupReasonUnpublishedCommits)
+				}
+				events, eventsErr := store.ListJobEvents(ctx, jobID)
+				if eventsErr != nil {
+					t.Fatalf("ListJobEvents: %v", eventsErr)
+				}
+				retained := 0
+				for _, event := range events {
+					if event.Kind == "delegation_worktree_retained_unpublished" {
+						retained++
+					}
+				}
+				if retained != 1 {
+					t.Fatalf("retained events = %d, want exactly 1: %+v", retained, events)
+				}
+				// A second pass must not re-announce a reason that already holds.
+				if _, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour)); err != nil {
+					t.Fatalf("second reclaim pass: %v", err)
+				}
+				events, eventsErr = store.ListJobEvents(ctx, jobID)
+				if eventsErr != nil {
+					t.Fatalf("ListJobEvents after second pass: %v", eventsErr)
+				}
+				retained = 0
+				for _, event := range events {
+					if event.Kind == "delegation_worktree_retained_unpublished" {
+						retained++
+					}
+				}
+				if retained != 1 {
+					t.Fatalf("retained events after second pass = %d, want 1", retained)
+				}
 			}
 		})
+	}
+}
+
+// TestEngineReclaimAgedFixCloneQuarantinesBeforeRemoval pins the atomicity
+// boundary: a commit that lands after the first proof is caught by the proof
+// repeated on the quarantined copy, and the clone is put back where it was.
+func TestEngineReclaimAgedFixCloneQuarantinesBeforeRemoval(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	jobID := "fix-quarantine-race"
+	path, err := FixWorktreePath(home, "owner/repo", jobID)
+	if err != nil {
+		t.Fatalf("FixWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll fix worktree: %v", err)
+	}
+	marker := filepath.Join(path, "marker")
+	if err := os.WriteFile(marker, []byte("clone\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile marker: %v", err)
+	}
+	payload, err := marshalPayload(JobPayload{
+		Repo:         "owner/repo",
+		Branch:       "feature/fix",
+		WorktreePath: path,
+		FixWorktree:  true,
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID:      jobID,
+		Agent:   "fixer",
+		Type:    "implement",
+		State:   string(JobSucceeded),
+		Repo:    "owner/repo",
+		Payload: payload,
+	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+	quarantine := path + fixCloneQuarantineSuffix
+	manager := &fakeWorktreeManager{
+		cleanSet:  true,
+		clean:     true,
+		cloneOnly: map[string]string{},
+	}
+	// The first proof sees a published clone; a commit then lands, which only the
+	// quarantined re-proof can observe.
+	manager.cloneOnlyHook = func(probed string) {
+		if probed == path {
+			manager.cloneOnly[quarantine] = "racing-commit"
+		}
+	}
+	engine := testEngine(store)
+	engine.Home = home
+	engine.DelegationWorktrees = manager
+
+	reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
+	}
+	if reclaimed {
+		t.Fatal("clone with a commit landing after the first proof was reclaimed")
+	}
+	if _, statErr := os.Stat(marker); statErr != nil {
+		t.Fatalf("restored clone lost its content: %v", statErr)
+	}
+	if _, statErr := os.Stat(quarantine); !os.IsNotExist(statErr) {
+		t.Fatalf("clone was left quarantined: %v", statErr)
+	}
+	if len(manager.cloneOnlyCalls) < 2 || manager.cloneOnlyCalls[1] != quarantine {
+		t.Fatalf("clone-only probes = %v, want a re-proof on the quarantined path", manager.cloneOnlyCalls)
+	}
+}
+
+// TestEngineReclaimAgedFixCloneRefusesLeftoverQuarantine keeps an interrupted
+// removal visible instead of deleting a directory nobody has proven anything about.
+func TestEngineReclaimAgedFixCloneRefusesLeftoverQuarantine(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	jobID := "fix-leftover-quarantine"
+	path, err := FixWorktreePath(home, "owner/repo", jobID)
+	if err != nil {
+		t.Fatalf("FixWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll fix worktree: %v", err)
+	}
+	if err := os.MkdirAll(path+fixCloneQuarantineSuffix, 0o755); err != nil {
+		t.Fatalf("MkdirAll quarantine: %v", err)
+	}
+	payload, err := marshalPayload(JobPayload{
+		Repo:         "owner/repo",
+		Branch:       "feature/fix",
+		WorktreePath: path,
+		FixWorktree:  true,
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID:      jobID,
+		Agent:   "fixer",
+		Type:    "implement",
+		State:   string(JobSucceeded),
+		Repo:    "owner/repo",
+		Payload: payload,
+	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+	engine := testEngine(store)
+	engine.Home = home
+	engine.DelegationWorktrees = &fakeWorktreeManager{cleanSet: true, clean: true, cloneOnly: map[string]string{}}
+
+	if _, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour)); err == nil ||
+		!strings.Contains(err.Error(), "quarantined fix clone") {
+		t.Fatalf("error = %v, want a refusal naming the leftover quarantine", err)
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("clone was removed despite the refusal: %v", statErr)
 	}
 }
 
@@ -1748,11 +1966,16 @@ type fakeWorktreeManager struct {
 	clean            bool
 	cleanSet         bool
 	cleanErr         error
-	reachableErr     error
+	remoteURL        string
+	remoteURLErr     error
+	refreshErr       error
 	requireDeadline  bool
-	refReachable     bool
-	refReachableSet  bool
-	refReachableErr  error
+	refreshedPaths   []string
+	refreshedURLs    []string
+	cloneOnly        map[string]string // path -> unpublished sha ("" proves published)
+	cloneOnlyErr     error
+	cloneOnlyCalls   []string
+	cloneOnlyHook    func(path string) // mutate the clone between proof rounds
 	cleanCalls       []string
 	ancestorCalls    [][2]string
 	calls            []worktreeCall
@@ -1846,44 +2069,36 @@ func (f *fakeWorktreeManager) WorktreePristineAt(ctx context.Context, path strin
 	return f.WorktreeCleanAt(ctx, path)
 }
 
-func (f *fakeWorktreeManager) WorktreeHeadReachableFromRemote(ctx context.Context, path string, branch string) (string, bool, error) {
-	if f.requireDeadline {
-		if _, ok := ctx.Deadline(); !ok {
-			return "", false, errors.New("remote reachability probe has no deadline")
-		}
+func (f *fakeWorktreeManager) RemoteURL(_ context.Context, remote string) (string, error) {
+	if f.remoteURLErr != nil {
+		return "", f.remoteURLErr
 	}
-	if f.reachableErr != nil {
-		return "", false, f.reachableErr
+	if f.remoteURL != "" {
+		return f.remoteURL, nil
 	}
-	head, err := f.HeadSHAAt(ctx, path)
-	if err != nil {
-		return "", false, err
-	}
-	trackingRef := "refs/remotes/origin/" + branch
-	remoteHead, err := f.RevParse(ctx, trackingRef)
-	if err != nil {
-		return "", false, err
-	}
-	reachable, err := f.IsAncestor(ctx, head, remoteHead)
-	return trackingRef, reachable, err
+	return "https://example.invalid/" + remote + ".git", nil
 }
 
-func (f *fakeWorktreeManager) WorktreeHeadReachableFromRef(ctx context.Context, path string, ref string) (bool, error) {
-	if f.refReachableErr != nil {
-		return false, f.refReachableErr
+func (f *fakeWorktreeManager) RefreshCloneProofRefs(ctx context.Context, path string, remoteURL string) error {
+	if f.requireDeadline {
+		if _, ok := ctx.Deadline(); !ok {
+			return errors.New("trusted remote refresh has no deadline")
+		}
 	}
-	if f.refReachableSet {
-		return f.refReachable, nil
+	f.refreshedPaths = append(f.refreshedPaths, path)
+	f.refreshedURLs = append(f.refreshedURLs, remoteURL)
+	return f.refreshErr
+}
+
+func (f *fakeWorktreeManager) CloneOnlyCommit(_ context.Context, path string) (string, error) {
+	f.cloneOnlyCalls = append(f.cloneOnlyCalls, path)
+	if f.cloneOnlyHook != nil {
+		f.cloneOnlyHook(path)
 	}
-	head, err := f.HeadSHAAt(ctx, path)
-	if err != nil {
-		return false, err
+	if f.cloneOnlyErr != nil {
+		return "", f.cloneOnlyErr
 	}
-	refHead, err := f.RevParse(ctx, ref)
-	if err != nil {
-		return false, err
-	}
-	return f.IsAncestor(ctx, head, refHead)
+	return f.cloneOnly[path], nil
 }
 
 func (f *fakeWorktreeManager) AddDetachedWorktree(_ context.Context, path string, ref string) error {

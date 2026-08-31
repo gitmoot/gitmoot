@@ -38,8 +38,10 @@ type WritableWorktreeLineageManager interface {
 	IsAncestor(ctx context.Context, ancestor, descendant string) (bool, error)
 	WorktreeCleanAt(ctx context.Context, path string) (bool, error)
 	WorktreePristineAt(ctx context.Context, path string) (bool, error)
-	WorktreeHeadReachableFromRemote(ctx context.Context, path string, branch string) (trackingRef string, reachable bool, err error)
-	WorktreeHeadReachableFromRef(ctx context.Context, path string, ref string) (bool, error)
+	BranchExists(ctx context.Context, branch string) (bool, error)
+	RemoteURL(ctx context.Context, remote string) (string, error)
+	RefreshCloneProofRefs(ctx context.Context, path string, remoteURL string) error
+	CloneOnlyCommit(ctx context.Context, path string) (string, error)
 	RemoveWorktree(ctx context.Context, path string) error
 	DeleteBranch(ctx context.Context, branch string) error
 }
@@ -357,6 +359,16 @@ func (e Engine) ReclaimTerminalTaskWorktreeOutcome(ctx context.Context, home, ch
 func taskWorktreeHeadReachableFromBranch(ctx context.Context, task db.Task, path string, manager WritableWorktreeLineageManager) (bool, error) {
 	branch := strings.TrimSpace(task.Branch)
 	if branch == "" {
+		return false, nil
+	}
+	// The preserved branch is the durable home for this worktree's commits. If it
+	// is gone, safety is unprovable rather than broken: report it as unreachable so
+	// the pass records head_unreachable instead of erroring on every tick forever.
+	exists, err := manager.BranchExists(ctx, branch)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
 		return false, nil
 	}
 	head, err := manager.HeadSHAAt(ctx, path)
@@ -1635,6 +1647,141 @@ func (e Engine) completeAgedTerminalFixWorktreeReclaim(ctx context.Context, jobI
 	return err == nil, err
 }
 
+// fixCloneQuarantineSuffix names the sibling path a proven-disposable fix clone
+// is renamed to before deletion. The rename is the atomicity boundary the proof
+// needs: it is a single filesystem operation on the same directory, and once it
+// returns no `git -C <original path>` can create a commit inside the clone that
+// is about to be deleted. Anything that followed the directory instead is caught
+// by repeating every proof on the quarantined copy.
+const fixCloneQuarantineSuffix = ".ttl-reclaiming"
+
+// reclaimAgedTerminalFixClone removes a terminal fix worktree's independent
+// clone only after proving that its object database holds nothing unpublished.
+// A fix worktree is a standalone clone, so removal takes its objects with it:
+// HEAD ancestry is not a sufficient proof, because side branches, tags, stashes
+// and reflog-only commits all survive a clean `git status` and all die with the
+// directory.
+func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, payload JobPayload, path string) (bool, error) {
+	expected, err := FixWorktreePath(e.Home, payload.Repo, jobID)
+	if err != nil || filepath.Clean(path) != filepath.Clean(expected) {
+		return false, fmt.Errorf("refusing TTL reclaim for unmanaged fix worktree %s", path)
+	}
+	if _, statErr := os.Lstat(path); os.IsNotExist(statErr) {
+		return e.completeAgedTerminalFixWorktreeReclaim(ctx, jobID, path)
+	} else if statErr != nil {
+		return false, fmt.Errorf("inspect aged terminal fix worktree %s: %w", path, statErr)
+	}
+	// A live process wins before any manager capability or probe matters: the
+	// cheapest gate is also the one that must never be skipped.
+	if live, known := e.worktreeLiveness(path); !known || live {
+		return false, nil
+	}
+	manager, ok := e.DelegationWorktrees.(WritableWorktreeLineageManager)
+	if !ok || manager == nil {
+		return false, errors.New("delegation worktree manager cannot prove fix worktree lineage")
+	}
+	// The proof is ref-based, not branch-based, so a payload without a branch is
+	// provable: the trusted remote's refs decide, never the recorded branch name.
+	quarantine := path + fixCloneQuarantineSuffix
+	if _, statErr := os.Lstat(quarantine); statErr == nil {
+		return false, fmt.Errorf("refusing TTL reclaim: quarantined fix clone %s from an interrupted removal still exists", quarantine)
+	} else if !os.IsNotExist(statErr) {
+		return false, fmt.Errorf("inspect fix clone quarantine path %s: %w", quarantine, statErr)
+	}
+	clean, err := manager.WorktreePristineAt(ctx, path)
+	if err != nil {
+		return false, fmt.Errorf("prove aged terminal fix worktree clean: %w", err)
+	}
+	if !clean {
+		return false, nil
+	}
+	// The clone's own `origin` is writable by whatever ran inside it, so it is not
+	// evidence: the registered repository checkout supplies the trusted URL.
+	remoteURL, err := manager.RemoteURL(ctx, "origin")
+	if err != nil {
+		return false, fmt.Errorf("resolve trusted remote url for aged terminal fix worktree: %w", err)
+	}
+	probeCtx, cancelProbe := context.WithTimeout(ctx, remoteWorktreeReachabilityTimeout)
+	err = manager.RefreshCloneProofRefs(probeCtx, path, remoteURL)
+	cancelProbe()
+	if err != nil {
+		return false, fmt.Errorf("refresh trusted remote refs for aged terminal fix worktree: %w", err)
+	}
+	unpublished, err := manager.CloneOnlyCommit(ctx, path)
+	if err != nil {
+		return false, fmt.Errorf("prove aged terminal fix worktree holds no unpublished commits: %w", err)
+	}
+	if unpublished != "" {
+		return false, e.retainFixCloneWithUnpublishedCommits(ctx, jobID, path, unpublished)
+	}
+	if live, known := e.worktreeLiveness(path); !known || live {
+		return false, nil
+	}
+	if err := os.Rename(path, quarantine); err != nil {
+		return false, fmt.Errorf("quarantine aged terminal fix worktree %s: %w", path, err)
+	}
+	restore := func(reason error) (bool, error) {
+		if renameErr := os.Rename(quarantine, path); renameErr != nil {
+			if reason != nil {
+				return false, fmt.Errorf("restore quarantined fix clone %s to %s: %w (while retaining after %v)", quarantine, path, renameErr, reason)
+			}
+			return false, fmt.Errorf("restore quarantined fix clone %s to %s: %w", quarantine, path, renameErr)
+		}
+		return false, reason
+	}
+	if live, known := e.worktreeLiveness(quarantine); !known || live {
+		return restore(nil)
+	}
+	clean, err = manager.WorktreePristineAt(ctx, quarantine)
+	if err != nil {
+		return restore(fmt.Errorf("recheck quarantined fix clone clean: %w", err))
+	}
+	if !clean {
+		return restore(nil)
+	}
+	unpublished, err = manager.CloneOnlyCommit(ctx, quarantine)
+	if err != nil {
+		return restore(fmt.Errorf("recheck quarantined fix clone for unpublished commits: %w", err))
+	}
+	if unpublished != "" {
+		if _, restoreErr := restore(nil); restoreErr != nil {
+			return false, restoreErr
+		}
+		return false, e.retainFixCloneWithUnpublishedCommits(ctx, jobID, path, unpublished)
+	}
+	if err := os.RemoveAll(quarantine); err != nil {
+		return false, fmt.Errorf("remove quarantined fix clone %s: %w", quarantine, err)
+	}
+	return e.completeAgedTerminalFixWorktreeReclaim(ctx, jobID, path)
+}
+
+// retainFixCloneWithUnpublishedCommits records WHY a clone survived its TTL. A
+// squash merge publishes the content and not the commits, so this is the normal
+// outcome for a squash-merged fix branch: the obligation row keeps the reason and
+// the sha visible to an operator instead of retrying silently forever.
+func (e Engine) retainFixCloneWithUnpublishedCommits(ctx context.Context, jobID, path, sha string) error {
+	opCtx := context.WithoutCancel(ctx)
+	// The reclaim pass revisits every aged candidate on a five-minute cadence, so
+	// the event is emitted on the transition into this reason, not per attempt.
+	announce := true
+	obligation, err := e.Store.GetCleanupObligation(opCtx, db.CleanupObligationResourceID(jobID, path))
+	switch {
+	case err == nil:
+		announce = obligation.Reason != db.CleanupReasonUnpublishedCommits
+	case !errors.Is(err, sql.ErrNoRows):
+		return err
+	}
+	if announce {
+		if err := e.Store.AddJobEvent(opCtx, db.JobEvent{
+			JobID: jobID, Kind: "delegation_worktree_retained_unpublished",
+			Message: fmt.Sprintf("fix clone %s retained after TTL: commit %s is in no trusted remote ref", path, sha),
+		}); err != nil {
+			return err
+		}
+	}
+	return e.deferDelegationCleanupObligation(opCtx, jobID, path, db.CleanupReasonUnpublishedCommits)
+}
+
 // ReclaimAgedTerminalDelegationWorktreeOutcome is the reporting form used by
 // the daemon reclaim pass. reclaimed is false for every revalidation no-op and
 // true only after the path cleanup and reclaim event complete.
@@ -1696,67 +1843,7 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 		return false, nil
 	}
 	if fix {
-		expected, err := FixWorktreePath(e.Home, payload.Repo, jobID)
-		if err != nil || filepath.Clean(path) != filepath.Clean(expected) {
-			return false, fmt.Errorf("refusing TTL reclaim for unmanaged fix worktree %s", path)
-		}
-		if _, statErr := os.Lstat(path); os.IsNotExist(statErr) {
-			return e.completeAgedTerminalFixWorktreeReclaim(ctx, jobID, path)
-		} else if statErr != nil {
-			return false, fmt.Errorf("inspect aged terminal fix worktree %s: %w", path, statErr)
-		}
-		live, known := e.worktreeLiveness(path)
-		if !known || live {
-			return false, nil
-		}
-		manager, ok := e.DelegationWorktrees.(WritableWorktreeLineageManager)
-		if !ok || manager == nil {
-			return false, errors.New("delegation worktree manager cannot prove fix worktree lineage")
-		}
-		if strings.TrimSpace(payload.Branch) == "" {
-			return false, errors.New("terminal fix worktree payload has no branch")
-		}
-		clean, err := manager.WorktreePristineAt(ctx, path)
-		if err != nil {
-			return false, fmt.Errorf("prove aged terminal fix worktree clean: %w", err)
-		}
-		if !clean {
-			return false, nil
-		}
-		probeCtx, cancelProbe := context.WithTimeout(ctx, remoteWorktreeReachabilityTimeout)
-		trackingRef, reachable, err := manager.WorktreeHeadReachableFromRemote(probeCtx, path, payload.Branch)
-		cancelProbe()
-		if err != nil {
-			return false, fmt.Errorf("prove aged terminal fix worktree head reachable from remote: %w", err)
-		}
-		if !reachable {
-			return false, nil
-		}
-		live, known = e.worktreeLiveness(path)
-		if !known || live {
-			return false, nil
-		}
-		clean, err = manager.WorktreePristineAt(ctx, path)
-		if err != nil {
-			return false, fmt.Errorf("recheck aged terminal fix worktree clean: %w", err)
-		}
-		if !clean {
-			return false, nil
-		}
-		if strings.TrimSpace(trackingRef) == "" {
-			return false, errors.New("remote reachability proof returned no tracking ref")
-		}
-		reachable, err = manager.WorktreeHeadReachableFromRef(ctx, path, trackingRef)
-		if err != nil {
-			return false, fmt.Errorf("recheck aged terminal fix worktree head reachable from remote: %w", err)
-		}
-		if !reachable {
-			return false, nil
-		}
-		if err := os.RemoveAll(path); err != nil {
-			return false, fmt.Errorf("remove aged terminal fix worktree %s: %w", path, err)
-		}
-		return e.completeAgedTerminalFixWorktreeReclaim(ctx, jobID, path)
+		return e.reclaimAgedTerminalFixClone(ctx, jobID, payload, path)
 	}
 	manager, ok := e.DelegationWorktrees.(ReadOnlyWorktreeManager)
 	if !ok || manager == nil {

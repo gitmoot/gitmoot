@@ -1199,6 +1199,47 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 	return nil
 }
 
+// terminalTaskWorktreeReclaimPassBudget caps how many candidates enter the
+// engine's safety proof per tick. Each one takes the checkout mutation lock with
+// the package's two-minute wait budget and runs two `git status --ignored`
+// scans, and the candidate list has no age filter, so a host that accumulates
+// permanently retained worktrees would otherwise spend the whole tick here
+// ahead of dispatch.
+const terminalTaskWorktreeReclaimPassBudget = 8
+
+// terminalTaskWorktreeReclaimResume rotates the bounded window so a candidate
+// that can never be reclaimed cannot starve the ones behind it: the pass resumes
+// at the first id at or after the last pass's unreached candidate.
+var terminalTaskWorktreeReclaimResume = struct {
+	sync.Mutex
+	taskID string
+}{}
+
+func rotateTerminalTaskWorktreeCandidates(ids []string) []string {
+	terminalTaskWorktreeReclaimResume.Lock()
+	resume := terminalTaskWorktreeReclaimResume.taskID
+	terminalTaskWorktreeReclaimResume.Unlock()
+	if resume == "" || len(ids) == 0 {
+		return ids
+	}
+	for i, id := range ids {
+		if id >= resume {
+			if i == 0 {
+				return ids
+			}
+			rotated := make([]string, 0, len(ids))
+			return append(append(rotated, ids[i:]...), ids[:i]...)
+		}
+	}
+	return ids
+}
+
+func setTerminalTaskWorktreeReclaimResume(taskID string) {
+	terminalTaskWorktreeReclaimResume.Lock()
+	terminalTaskWorktreeReclaimResume.taskID = taskID
+	terminalTaskWorktreeReclaimResume.Unlock()
+}
+
 // reclaimTerminalTaskWorktrees removes task-owned worktrees based on terminal
 // lifecycle state, never age. Each candidate is independently safety-checked by
 // the workflow engine; item failures are logged and left for the next bounded
@@ -1222,7 +1263,14 @@ func reclaimTerminalTaskWorktrees(ctx context.Context, worker jobWorker, repoFil
 	if malformedErr != nil {
 		writeLine(stdout, "terminal task worktree reclaim could not identify malformed non-final owner: %v", malformedErr)
 	}
-	for _, taskID := range taskIDs {
+	rotated := rotateTerminalTaskWorktreeCandidates(taskIDs)
+	attempts := 0
+	resume := ""
+	for i, taskID := range rotated {
+		if attempts >= terminalTaskWorktreeReclaimPassBudget {
+			resume = rotated[i]
+			break
+		}
 		task, err := worker.Store.GetTask(ctx, taskID)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
@@ -1254,6 +1302,7 @@ func reclaimTerminalTaskWorktrees(ctx context.Context, worker jobWorker, repoFil
 			writeLine(stdout, "terminal task worktree reclaim candidate %s has no writable worktree manager", task.ID)
 			continue
 		}
+		attempts++
 		outcome, err := engine.ReclaimTerminalTaskWorktreeOutcome(ctx, home, checkout, task.ID, manager)
 		if err != nil {
 			logTaskWorktreeReclaimFailure(stdout, task.ID, path, err)
@@ -1269,6 +1318,7 @@ func reclaimTerminalTaskWorktrees(ctx context.Context, worker jobWorker, repoFil
 			logTaskWorktreeRetention(stdout, task.ID, outcome.Path, outcome.Classification, malformedJobID)
 		}
 	}
+	setTerminalTaskWorktreeReclaimResume(resume)
 	return nil
 }
 
