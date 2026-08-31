@@ -110,6 +110,70 @@ func TestPollOnceReleasesTransientlyBlockedReviewTask(t *testing.T) {
 	}
 }
 
+// TestSecondPollEvaluatesGateAfterTransientRelease is the reviewer-requested
+// completion of the release direction, and the one that distinguishes a REAL exit
+// from a merely cosmetic state change. Releasing the row to ready_to_merge is
+// worthless if nothing consumes that state: a branchless review task is invisible
+// to a pull.HeadRef lookup, so before lookupReadyPullRequestTask existed the
+// released task sat in ready_to_merge and the gate was never re-run — the
+// automatic self-clearing retry #1562 asks for did not happen, only manual
+// `task resume-work` recovery.
+//
+// Poll 1 releases; poll 2 MUST reach the merge gate.
+//
+// Mutant M3 ("released but never consumed"): revert
+// pullRequestReadyToMerge/handleReadyToMergeWorkflow to
+// d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef). Poll 1 still
+// releases and every other test in this file still passes; only this one fails,
+// which is exactly the gap the reviewer found at head d73d3d9c.
+func TestSecondPollEvaluatesGateAfterTransientRelease(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	pull := seedBlockedReviewTask(t, store, repo, workflow.MergeBlockTransient, "local worktree is not clean")
+	daemon, gate := blockedReviewTaskDaemon(t, store, repo, pull)
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("poll 1 PollOnce returned error: %v", err)
+	}
+	task, err := store.GetTask(ctx, "review-pr-1699-3f3a1026")
+	if err != nil {
+		t.Fatalf("GetTask after poll 1 returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskReadyToMerge) {
+		t.Fatalf("poll 1 task state = %q, want ready_to_merge", task.State)
+	}
+
+	ready, err := daemon.pullRequestReadyToMerge(ctx, pull)
+	if err != nil {
+		t.Fatalf("pullRequestReadyToMerge returned error: %v", err)
+	}
+	if !ready {
+		t.Fatalf("pullRequestReadyToMerge = false for a released branchless review task; the ready path cannot see it")
+	}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("poll 2 PollOnce returned error: %v", err)
+	}
+	if len(gate.requests) == 0 {
+		t.Fatalf("merge gate evaluations after release = 0, want the released task re-evaluated by a later poll")
+	}
+	for _, request := range gate.requests {
+		if request.PullRequest != 1699 {
+			t.Fatalf("merge gate evaluated the wrong pull request: %+v", request)
+		}
+	}
+	// The ref must name the review task, never the branch's canonical implement
+	// task: a branchless row carrying the PR branch would advance the wrong task.
+	events, err := store.ListTaskEvents(ctx, "review-pr-1699-3f3a1026")
+	if err != nil {
+		t.Fatalf("ListTaskEvents returned error: %v", err)
+	}
+	if !hasTaskEventKind(events, "merge_gate_transient_retry") {
+		t.Fatalf("task events = %+v, want the release recorded on the review task itself", events)
+	}
+}
+
 // TestPollOnceLeavesQualityBlockedReviewTaskBlocked is the direction that stops
 // the obvious wrong fix. An authoritative quality rejection must stay blocked.
 //

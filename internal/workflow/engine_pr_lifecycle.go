@@ -531,6 +531,13 @@ func (e Engine) HandlePullRequestReadyToMerge(ctx context.Context, event PullReq
 	// primary merge-gate path. Repeated polls are deduped durably by the store.
 	_, _ = RecordPullRequestWorkflowTransition(ctx, e.Store, event, PullRequestJournalReady)
 	ref := taskRefFromPullRequest(event)
+	// A local review task deliberately owns no branch so it cannot collide with the
+	// implement task that owns (repo, head branch). Carrying the PR's branch into
+	// its ref would let setTaskState's branch-reuse fallback advance that OTHER
+	// task instead of this one. Mirrors the same guard on the PR-closed path.
+	if stored, storedErr := e.Store.GetTask(ctx, event.TaskID); storedErr == nil && strings.TrimSpace(stored.Branch) == "" {
+		ref.Branch = ""
+	}
 	_, err := e.runMergeGateWithHumanMerge(ctx, "", JobPayload{
 		Repo:                    event.Repo,
 		Branch:                  event.Branch,

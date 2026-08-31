@@ -1324,8 +1324,42 @@ func workflowReviewJobMatchesPull(repoFullName string, pull github.PullRequest, 
 		len(payload.Reviewers) > 0
 }
 
+// lookupReadyPullRequestTask resolves the task driving a pull request for the
+// ready-to-merge path. It prefers the branch-keyed lookup every other caller
+// uses, then falls back to the durable review-pr-<number>-<hash> id for a
+// BRANCHLESS local review task (#1562). Without the fallback a task released from
+// a transient merge-gate block is never re-evaluated, because a branchless row is
+// invisible to a pull.HeadRef lookup — the release would restore an operator exit
+// (`task resume-work` accepts ready_to_merge) and nothing else.
+//
+// The fallback is deliberately scoped to this path rather than widened into
+// lookupPullRequestTask, whose other callers reason about branch-owned work.
+func (d Daemon) lookupReadyPullRequestTask(ctx context.Context, pull github.PullRequest) (db.Task, error) {
+	task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	if err == nil {
+		return task, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return db.Task{}, err
+	}
+	tasks, listErr := d.Store.ListTasksByRepo(ctx, d.Repo.FullName())
+	if listErr != nil {
+		return db.Task{}, listErr
+	}
+	for _, candidate := range tasks {
+		if strings.TrimSpace(candidate.Branch) != "" {
+			continue
+		}
+		number, ok := reviewTaskPullRequestNumber(candidate.ID)
+		if ok && number == pull.Number {
+			return candidate, nil
+		}
+	}
+	return db.Task{}, sql.ErrNoRows
+}
+
 func (d Daemon) pullRequestReadyToMerge(ctx context.Context, pull github.PullRequest) (bool, error) {
-	task, err := d.lookupPolledPullRequestTask(ctx, pull)
+	task, err := d.lookupReadyPullRequestTask(ctx, pull)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
@@ -1335,11 +1369,6 @@ func (d Daemon) pullRequestReadyToMerge(ctx context.Context, pull github.PullReq
 	// TaskReadyToMerge is the retry authority. SkipNativeReviewFanout controls
 	// PR-open review routing only; a direct review can leave this task pending
 	// on CI, and suppressing its poll here strands gitmoot/merge-gate (#1708).
-	//
-	// This predicate is deliberately NOT the #1562 transient-block exit: it
-	// resolves its task from pull.HeadRef, and the population that actually wedges
-	// is the branchless local review-pr-<number>-<hash> task, which no HeadRef
-	// lookup can find. reconcileTransientlyBlockedMergeGates owns that exit.
 	return task.State == string(workflow.TaskReadyToMerge), nil
 }
 
@@ -1347,7 +1376,7 @@ func (d Daemon) handleReadyToMergeWorkflow(ctx context.Context, pull github.Pull
 	if d.Workflow == nil {
 		return nil
 	}
-	task, err := d.lookupPolledPullRequestTask(ctx, pull)
+	task, err := d.lookupReadyPullRequestTask(ctx, pull)
 	if err != nil {
 		return err
 	}
