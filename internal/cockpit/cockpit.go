@@ -250,9 +250,10 @@ func (c *Cockpit) AgentPrompt(ctx context.Context, pane, prompt, until string) (
 	return c.client.agentPrompt(ctx, pane, prompt, until)
 }
 
-// ResolvePaneByLabel resolves a Herdr pane binding (an exact label or literal
-// pane id) to its current live pane id. Stable labels keep reaching recycled
-// panes; stale literal ids fail. Any Herdr error reports "not found".
+// ResolvePaneByLabel resolves a Herdr pane binding (a literal pane id or exact
+// label) to its current live pane id. Literal ids remain pinned to one pane;
+// labels follow whichever current pane uniquely carries that cosmetic value.
+// Stale ids, absent labels, and ambiguous labels fail.
 func (c *Cockpit) ResolvePaneByLabel(ctx context.Context, label string) (string, bool) {
 	if c == nil {
 		return "", false

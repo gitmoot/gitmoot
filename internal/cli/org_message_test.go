@@ -1,0 +1,251 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
+	"github.com/gitmoot/gitmoot/internal/workflow"
+)
+
+func orgMessageTestHome(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configBody := `[org.roles."owner"]
+scope=["*"]
+[org.roles."gitmoot"]
+parent="owner"
+scope=["*"]
+[org.roles."jarvis"]
+parent="owner"
+scope=["*"]
+[org.roles."deimos"]
+parent="owner"
+scope=["*"]
+[org.roles."gm-omp-nag"]
+parent="gitmoot"
+scope=["gitmoot/nag"]
+[org.roles."gm-omp-impl"]
+parent="gitmoot"
+scope=["gitmoot/implementation"]
+[org.roles."gm-omp-verdict"]
+parent="gitmoot"
+scope=["gitmoot/review"]
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(configBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return home
+}
+
+func orgMessageSeedWorkflow(t *testing.T, home, workflowID string) {
+	t.Helper()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.CreateJob(context.Background(), db.Job{
+		ID:      "message-fixture-job",
+		Agent:   "worker",
+		Type:    "ask",
+		State:   "succeeded",
+		Repo:    "gitmoot/gitmoot",
+		Payload: fmt.Sprintf(`{"workflow_id":%q}`, workflowID),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOrgMessageSendAllowsDifferentlyScopedSameParentSiblings(t *testing.T) {
+	home := orgMessageTestHome(t)
+	orgMessageSeedWorkflow(t, home, "gitmoot/1692-test")
+	t.Setenv("GITMOOT_ORG_ROLE", "gm-omp-nag")
+	var stdout, stderr bytes.Buffer
+	code := runOrg([]string{
+		"message", "send", "--home", home,
+		"--to", "gm-omp-impl",
+		"--workflow", "gitmoot/1692-test",
+		"Our open PRs touch internal/cli/org.go",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("sibling send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	notes, err := store.ListWorkflowNotes(context.Background(), "gitmoot/1692-test", 0)
+	if err != nil || len(notes) != 1 {
+		t.Fatalf("notes=%+v err=%v, want one durable message", notes, err)
+	}
+	note := notes[0]
+	from, to, workflowID, message, ok := workflow.ParseOrgMessageNote(note.Body)
+	if !ok || from != "gm-omp-nag" || to != "gm-omp-impl" || workflowID != "gitmoot/1692-test" || message != "Our open PRs touch internal/cli/org.go" {
+		t.Fatalf("parsed message=(from=%q to=%q workflow=%q message=%q ok=%v)", from, to, workflowID, message, ok)
+	}
+	if note.Author != from {
+		t.Fatalf("durable author=%q, want sender %q", note.Author, from)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := runWorkflowJournal([]string{"show-note", strconv.FormatInt(note.ID, 10), "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("note show code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	for _, want := range []string{"note: " + strconv.FormatInt(note.ID, 10), "workflow: gitmoot/1692-test", "author: gm-omp-nag", note.Body} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("note show output=%q, want %q", stdout.String(), want)
+		}
+	}
+	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending wakes=%+v err=%v, want one direct wake", pending, err)
+	}
+	if pending[0].SourceKind != db.WakeOutboxSourceWorkflowNote || pending[0].TargetRole != "gm-omp-impl" || pending[0].CoalesceKey != db.WakeOutboxReplyCoalescePrefix+"gm-omp-impl" {
+		t.Fatalf("direct wake=%+v", pending[0])
+	}
+	wakeEvent, err := wakeOutboxEvent([]db.WakeOutboxObligation{{
+		SourceKind:  pending[0].SourceKind,
+		SourceID:    pending[0].SourceID,
+		TargetRole:  pending[0].TargetRole,
+		CoalesceKey: pending[0].CoalesceKey,
+	}}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	retrievalCommand := "gitmoot workflow show-note " + strconv.FormatInt(note.ID, 10)
+	if !strings.Contains(wakeEvent.Detail, retrievalCommand) {
+		t.Fatalf("wake detail=%q, want retrieval command %q", wakeEvent.Detail, retrievalCommand)
+	}
+	if prompt := eventRuleWakePrompt("reply", wakeEvent); !strings.Contains(prompt, retrievalCommand) {
+		t.Fatalf("recipient prompt=%q, want retrieval command %q", prompt, retrievalCommand)
+	}
+	unacknowledged, err := store.ListUnacknowledgedOrgDirectives(context.Background(), "gm-omp-impl")
+	if err != nil || len(unacknowledged) != 0 {
+		t.Fatalf("message created directive obligations=%+v err=%v", unacknowledged, err)
+	}
+}
+
+func TestOrgMessageSendAllowsOwnerChildrenAsOrdinarySiblings(t *testing.T) {
+	home := orgMessageTestHome(t)
+	orgMessageSeedWorkflow(t, home, "gitmoot/1692-owner-children")
+	t.Setenv("GITMOOT_ORG_ROLE", "jarvis")
+	var stdout, stderr bytes.Buffer
+	code := runOrg([]string{
+		"message", "send", "--home", home,
+		"--to", "deimos",
+		"--workflow", "gitmoot/1692-owner-children",
+		"Owner children use the ordinary sibling predicate",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("owner-child sibling send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestOrgMessageSendRefusesUnknownWorkflow(t *testing.T) {
+	home := orgMessageTestHome(t)
+	t.Setenv("GITMOOT_ORG_ROLE", "gm-omp-nag")
+	var stdout, stderr bytes.Buffer
+	code := runOrg([]string{
+		"message", "send", "--home", home,
+		"--to", "gm-omp-impl",
+		"--workflow", "gitmoot/1692-typo",
+		"Do not create a phantom workflow",
+	}, &stdout, &stderr)
+	want := `workflow "gitmoot/1692-typo" has no jobs; refusing message to guard against a typo`
+	if code != 1 || !strings.Contains(stderr.String(), want) {
+		t.Fatalf("unknown-workflow send code=%d out=%q err=%q, want %q", code, stdout.String(), stderr.String(), want)
+	}
+
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	notes, err := store.ListWorkflowNotes(context.Background(), "gitmoot/1692-typo", 0)
+	if err != nil || len(notes) != 0 {
+		t.Fatalf("phantom workflow notes=%+v err=%v", notes, err)
+	}
+	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("phantom workflow wakes=%+v err=%v", pending, err)
+	}
+}
+
+func TestOrgMessageSendRefusesOwnerAsEndpoint(t *testing.T) {
+	tests := []struct {
+		name string
+		from string
+		to   string
+		want string
+	}{
+		{name: "owner sender", from: "owner", to: "jarvis", want: `roles "owner" and "jarvis" do not share a parent`},
+		{name: "owner recipient", from: "jarvis", to: "owner", want: `roles "jarvis" and "owner" do not share a parent`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			home := orgMessageTestHome(t)
+			t.Setenv("GITMOOT_ORG_ROLE", test.from)
+			var stdout, stderr bytes.Buffer
+			code := runOrg([]string{
+				"message", "send", "--home", home,
+				"--to", test.to,
+				"--workflow", "gitmoot/1692-owner-endpoint",
+				"Owner has no parent and gets no direct bypass",
+			}, &stdout, &stderr)
+			if code != 2 || !strings.Contains(stderr.String(), test.want) {
+				t.Fatalf("owner endpoint send code=%d out=%q err=%q, want %q", code, stdout.String(), stderr.String(), test.want)
+			}
+		})
+	}
+}
+
+func TestOrgMessageSendRefusesDifferentParentDespiteWildcardScope(t *testing.T) {
+	home := orgMessageTestHome(t)
+	t.Setenv("GITMOOT_ORG_ROLE", "gm-omp-nag")
+	var stdout, stderr bytes.Buffer
+	code := runOrg([]string{
+		"message", "send", "--home", home,
+		"--to", "jarvis",
+		"--workflow", "gitmoot/1692-cross-parent",
+		"Scopes must not grant this channel",
+	}, &stdout, &stderr)
+	want := `roles "gm-omp-nag" and "jarvis" do not share a parent`
+	if code != 2 || !strings.Contains(stderr.String(), want) {
+		t.Fatalf("cross-parent send code=%d out=%q err=%q, want %q", code, stdout.String(), stderr.String(), want)
+	}
+}
+
+func TestOrgMessageSendRefusesSelf(t *testing.T) {
+	home := orgMessageTestHome(t)
+	t.Setenv("GITMOOT_ORG_ROLE", "gm-omp-nag")
+	var stdout, stderr bytes.Buffer
+	code := runOrg([]string{
+		"message", "send", "--home", home,
+		"--to", "gm-omp-nag",
+		"--workflow", "gitmoot/1692-self",
+		"Self is not a second role",
+	}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), `must differ from acting role "gm-omp-nag"`) {
+		t.Fatalf("self send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+}

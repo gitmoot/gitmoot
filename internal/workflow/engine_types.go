@@ -187,6 +187,15 @@ func (e Engine) mailbox() Mailbox {
 				wakeTargetRole = owner
 				event.PullRequest = payload.PullRequest
 				event.ReviewDecision = decision
+				if decision == "changes_requested" {
+					// Sender is a transport or agent identity, not necessarily a
+					// routable org role. ActingOrgRole is the persisted requester
+					// role paired with that sender; legacy jobs without one keep
+					// the resolved PR owner fallback above (#1712).
+					if requesterRole := NormalizeActingOrgRole(payload.ActingOrgRole); requesterRole != "" {
+						wakeTargetRole = requesterRole
+					}
+				}
 			}
 		}
 		event.WakeTargetRole = wakeTargetRole

@@ -1330,6 +1330,7 @@ func TestEngineRunJobPreflightsPolicyBeforeDelivery(t *testing.T) {
 func TestEngineAdvanceReviewChangesRequestedDispatchesActingRoleAcrossTaskOwnerLock(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
+	enableAutoFix(t, store, 7)
 	seedAgent(t, store, "owner-role", []string{"implement"}, "gitmoot/gitmoot")
 	seedAgent(t, store, "task-owner", []string{"implement"}, "gitmoot/gitmoot")
 	seedAgent(t, store, "payload-default", []string{"implement"}, "gitmoot/gitmoot")
@@ -1531,6 +1532,7 @@ func TestEngineAdvanceReviewApprovedSkipsMergeGateWhenNoPullRequest(t *testing.T
 func TestEngineAdvanceReviewChangesRequestedReplayIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
+	enableAutoFix(t, store, 7)
 	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
 	insertCompletedJob(t, store, db.Job{
@@ -1579,6 +1581,7 @@ func TestEngineAdvanceReviewChangesRequestedReplayIsIdempotent(t *testing.T) {
 func TestEngineAdvanceReviewChangesRequestedUsesTaskImplementerWhenActingRoleAbsent(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
+	enableAutoFix(t, store, 7)
 	seedAgent(t, store, "task-owner", []string{"implement"}, "gitmoot/gitmoot")
 	seedAgent(t, store, "wrong-default", []string{"implement"}, "gitmoot/gitmoot")
 	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
@@ -1632,6 +1635,7 @@ func TestEngineAdvanceReviewChangesRequestedUsesTaskImplementerWhenActingRoleAbs
 func TestEngineAdvanceReviewChangesRequestedFailsClosedWithoutOwnership(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
+	enableAutoFix(t, store, 7)
 	seedAgent(t, store, "payload-default", []string{"implement"}, "gitmoot/gitmoot")
 	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
@@ -1682,6 +1686,7 @@ func TestEngineAdvanceReviewChangesRequestedFailsClosedWithoutOwnership(t *testi
 func TestEngineAdvanceReviewChangesRequestedFailsClosedForAmbiguousTaskImplementers(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
+	enableAutoFix(t, store, 7)
 	seedAgent(t, store, "first-owner", []string{"implement"}, "gitmoot/gitmoot")
 	seedAgent(t, store, "second-owner", []string{"implement"}, "gitmoot/gitmoot")
 	for _, agent := range []string{"second-owner", "first-owner"} {
@@ -1718,6 +1723,7 @@ func TestEngineAdvanceReviewChangesRequestedFailsClosedForAmbiguousTaskImplement
 func TestEngineAdvanceReviewChangesRequestedDoesNotBypassUnresolvableActingRole(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
+	enableAutoFix(t, store, 7)
 	seedAgent(t, store, "task-owner", []string{"implement"}, "gitmoot/gitmoot")
 	seedAgent(t, store, "payload-default", []string{"implement"}, "gitmoot/gitmoot")
 	insertCompletedJob(t, store, db.Job{
@@ -1761,7 +1767,7 @@ func TestEngineAdvanceReviewChangesRequestedDoesNotBypassUnresolvableActingRole(
 	}
 }
 
-func TestEngineAdvanceReviewChangesRequestedHonorsPersistentRefusal(t *testing.T) {
+func TestEngineAdvanceReviewChangesRequestedRequiresPersistentOptIn(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedAgent(t, store, "task-owner", []string{"implement"}, "gitmoot/gitmoot")
@@ -1789,11 +1795,10 @@ func TestEngineAdvanceReviewChangesRequestedHonorsPersistentRefusal(t *testing.T
 		Result:    &AgentResult{Decision: "changes_requested", Summary: "do not patch automatically"},
 	})
 
-	err := engine.AdvanceJob(ctx, "review-refused")
-	var blocked BlockedError
-	if !errors.As(err, &blocked) || !strings.Contains(blocked.Reason, "auto-fix disabled") || !strings.Contains(blocked.Reason, "coordinator declined automatic patching") {
-		t.Fatalf("AdvanceJob error = %v, want durable refusal BlockedError", err)
+	if err := engine.AdvanceJob(ctx, "review-refused"); err != nil {
+		t.Fatalf("AdvanceJob while disabled returned error: %v", err)
 	}
+	assertTaskState(t, store, "task-7", TaskChangesRequested)
 	if allocations != 0 {
 		t.Fatalf("fix worktree allocations = %d, want zero while disabled", allocations)
 	}
@@ -2652,6 +2657,20 @@ func seedAgent(t *testing.T, store *db.Store, name string, capabilities []string
 		HealthStatus:   "ok",
 	}); err != nil {
 		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+}
+
+func enableAutoFix(t *testing.T, store *db.Store, pullRequest int) {
+	t.Helper()
+	if err := store.SetPullRequestAutoFixPolicy(
+		context.Background(),
+		"gitmoot/gitmoot",
+		pullRequest,
+		false,
+		"test",
+		"explicit autonomous-chain opt-in",
+	); err != nil {
+		t.Fatalf("SetPullRequestAutoFixPolicy returned error: %v", err)
 	}
 }
 
