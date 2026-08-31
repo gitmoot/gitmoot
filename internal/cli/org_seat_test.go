@@ -166,6 +166,51 @@ func TestOrgSeatAddAcceptsLiteralPaneID(t *testing.T) {
 	}
 }
 
+func TestOrgSeatAddRejectsPaneClaimedByAnotherRole(t *testing.T) {
+	home, paths, panes := setupOrgSeatTestHome(t)
+	withOrgSeatFixtureProvider(t, &panes)
+
+	var stdout, stderr bytes.Buffer
+	code := runOrg([]string{"seat", "add", "worker", "--pane", "w1:p1", "--home", home}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), `pane w1:p1 ("Owner") is already claimed by role "owner"`) {
+		t.Fatalf("double-claim add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cfg.Role("worker"); ok {
+		t.Fatal("double-claim rejection created worker")
+	}
+	if got := len(listOrgSeatTestRules(t, paths)); got != 1 {
+		t.Fatalf("routes after double-claim rejection = %d, want 1", got)
+	}
+}
+
+func TestOrgSeatAddLiteralPaneIDPrecedesDuplicateLabels(t *testing.T) {
+	home, paths, panes := setupOrgSeatTestHome(t)
+	panes = append(panes,
+		org.LivePane{PaneID: "w1:p6", Label: "w1:p8"},
+		org.LivePane{PaneID: "w1:p7", Label: "w1:p8"},
+		org.LivePane{PaneID: "w1:p8", Label: "real-target"},
+	)
+	withOrgSeatFixtureProvider(t, &panes)
+
+	var stdout, stderr bytes.Buffer
+	code := runOrg([]string{"seat", "add", "worker", "--pane", "w1:p8", "--home", home}, &stdout, &stderr)
+	if code != 0 || !strings.Contains(stdout.String(), `pane w1:p8 claimed label="real-target"`) {
+		t.Fatalf("literal-id precedence add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, ok := cfg.Role("worker")
+	if !ok || worker.Pane != "w1:p8" {
+		t.Fatalf("literal-id worker role = %+v, present=%t", worker, ok)
+	}
+}
+
 func TestOrgSeatBindingSurvivesLabelRename(t *testing.T) {
 	home, _, panes := setupOrgSeatTestHome(t)
 	withOrgSeatFixtureProvider(t, &panes)
@@ -190,7 +235,8 @@ func TestOrgSeatAddCreatesUnboundThenBinds(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := runOrg([]string{"seat", "add", "worker", "--home", home}, &stdout, &stderr)
 	if code != 0 || !strings.Contains(stdout.String(), `role worker created pane=""`) ||
-		!strings.Contains(stdout.String(), "role worker is unbound") {
+		!strings.Contains(stdout.String(), "role worker is unbound") ||
+		!strings.Contains(stdout.String(), "ok role worker unbound enabled_routes=5") {
 		t.Fatalf("unbound seat add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 	cfg, err := config.LoadOrg(paths)
@@ -233,6 +279,47 @@ func TestOrgSeatAddCreatesUnboundThenBinds(t *testing.T) {
 	if code := runOrg([]string{"validate", "--home", home}, &stdout, &stderr); code != 0 ||
 		!strings.Contains(stdout.String(), "ok 2 roles, 2 live panes, 6 enabled routes") {
 		t.Fatalf("validate bound seat code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestOrgSeatAddRejectsPolicyFlagsForExistingRole(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+		flag string
+	}{
+		{name: "parent", args: []string{"--parent", "owner"}, flag: "--parent"},
+		{name: "scope", args: []string{"--scope", "gitmoot/only"}, flag: "--scope"},
+		{name: "merge rule", args: []string{"--merge-rule", "totally-bogus"}, flag: "--merge-rule"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home, paths, panes := setupOrgSeatTestHome(t)
+			withOrgSeatFixtureProvider(t, &panes)
+			var stdout, stderr bytes.Buffer
+			if code := runOrg([]string{"seat", "add", "worker", "--home", home}, &stdout, &stderr); code != 0 {
+				t.Fatalf("unbound setup code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+			}
+
+			args := append([]string{"seat", "add", "worker", "--pane", "w1:p2"}, test.args...)
+			args = append(args, "--home", home)
+			stdout.Reset()
+			stderr.Reset()
+			code := runOrg(args, &stdout, &stderr)
+			if code != 2 || !strings.Contains(stderr.String(), test.flag+" apply only when creating a role") {
+				t.Fatalf("existing policy add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+			}
+			cfg, err := config.LoadOrg(paths)
+			if err != nil {
+				t.Fatal(err)
+			}
+			worker, ok := cfg.Role("worker")
+			if !ok || worker.Pane != "" || len(worker.Scope) != 1 || worker.Scope[0] != "*" {
+				t.Fatalf("worker changed after rejected policy flag: %+v, present=%t", worker, ok)
+			}
+			if got := len(listOrgSeatTestRules(t, paths)); got != 6 {
+				t.Fatalf("routes after rejected policy flag = %d, want 6", got)
+			}
+		})
 	}
 }
 
@@ -847,6 +934,36 @@ func TestOrgSeatRemoveValidationRejectsLeftoverOwnedRoute(t *testing.T) {
 	code := runOrg([]string{"seat", "rm", "worker", "--home", home}, &stdout, &stderr)
 	if code != 1 || !strings.Contains(stderr.String(), `role "worker" still owns 1 routes`) {
 		t.Fatalf("leftover route seat rm code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestOrgSeatRemoveValidationRejectsRemainingRole(t *testing.T) {
+	home, paths, panes := setupOrgSeatTestHome(t)
+	appendOrgSeatWorker(t, paths)
+	addOrgSeatWorkerRoutes(t, paths)
+	withOrgSeatFixtureProvider(t, &panes)
+	originalBranchCheck := orgSeatBranchCheck
+	orgSeatBranchCheck = func(context.Context, org.LivePane) error { return nil }
+	t.Cleanup(func() { orgSeatBranchCheck = originalBranchCheck })
+	originalClose := orgSeatClosePane
+	orgSeatClosePane = func(_ context.Context, paneID string) error {
+		for i, pane := range panes {
+			if pane.PaneID == paneID {
+				panes = append(panes[:i], panes[i+1:]...)
+				break
+			}
+		}
+		_, _, err := config.UpsertOrgSeatRole(paths, config.OrgRole{
+			Name: "worker", Parent: "owner", Scope: []string{"*"}, Pane: "w1:p2",
+		}, "")
+		return err
+	}
+	t.Cleanup(func() { orgSeatClosePane = originalClose })
+
+	var stdout, stderr bytes.Buffer
+	code := runOrg([]string{"seat", "rm", "worker", "--home", home}, &stdout, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), `role "worker" remains after removal`) {
+		t.Fatalf("remaining role seat rm code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 }
 

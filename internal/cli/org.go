@@ -218,7 +218,9 @@ func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "org seat add: --pane must not be empty; omit the flag to create an unbound role")
 		return 2
 	}
+	parentSet := hasFlag(flagArgs, "parent")
 	scopeSet := hasFlag(flagArgs, "scope")
+	mergeRuleSet := hasFlag(flagArgs, "merge-rule")
 	requestedScope, err := parseOrgSeatScope(*scopeFlag, scopeSet)
 	if err != nil {
 		fmt.Fprintf(stderr, "org seat add: %v\n", err)
@@ -238,6 +240,22 @@ func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "org seat add: load org registry: %v\n", err)
 		return 1
+	}
+	if _, exists := cfg.Role(name); exists {
+		var policyFlags []string
+		if parentSet {
+			policyFlags = append(policyFlags, "--parent")
+		}
+		if scopeSet {
+			policyFlags = append(policyFlags, "--scope")
+		}
+		if mergeRuleSet {
+			policyFlags = append(policyFlags, "--merge-rule")
+		}
+		if len(policyFlags) != 0 {
+			fmt.Fprintf(stderr, "org seat add: role %q already exists; %s apply only when creating a role\n", name, strings.Join(policyFlags, ", "))
+			return 2
+		}
 	}
 	ctx := context.Background()
 	var snapshot org.Snapshot
@@ -341,9 +359,9 @@ func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
 	}
 	if strings.TrimSpace(desired.Pane) == "" {
 		fmt.Fprintf(stdout, "role %s is unbound; bind with gitmoot org seat add %s --pane ID_OR_LABEL\n", name, name)
-		return 0
+		return runOrgSeatValidateAdded(ctx, paths, fresh, name, false, stdout, stderr)
 	}
-	return runOrgSeatValidatePresent(ctx, paths, fresh, name, stdout, stderr)
+	return runOrgSeatValidateAdded(ctx, paths, fresh, name, true, stdout, stderr)
 }
 
 func runOrgSeatRemove(args []string, stdout, stderr io.Writer) int {
@@ -823,20 +841,26 @@ func runOrgValidateOrShow(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func runOrgSeatValidatePresent(ctx context.Context, paths config.Paths, cfg config.OrgConfig, roleName string, stdout, stderr io.Writer) int {
+func runOrgSeatValidateAdded(ctx context.Context, paths config.Paths, cfg config.OrgConfig, roleName string, requireBound bool, stdout, stderr io.Writer) int {
 	role, ok := cfg.Role(roleName)
 	if !ok {
 		fmt.Fprintf(stderr, "org seat add validation: role %q is absent after write\n", roleName)
 		return 1
 	}
-	snapshot, err := orgProviderSnapshot(ctx, cfg)
-	if err != nil {
-		fmt.Fprintf(stderr, "org seat add validation: Herdr snapshot unavailable: %v\n", err)
-		return 1
-	}
-	binding := snapshot.PaneBindings[role.Name]
-	if strings.TrimSpace(binding.PaneID) == "" {
-		fmt.Fprintf(stderr, "org seat add validation: role %q pane is unresolved: %s\n", role.Name, firstNonEmpty(binding.Detail, "no live pane binding"))
+	var binding org.PaneBinding
+	if requireBound {
+		snapshot, err := orgProviderSnapshot(ctx, cfg)
+		if err != nil {
+			fmt.Fprintf(stderr, "org seat add validation: Herdr snapshot unavailable: %v\n", err)
+			return 1
+		}
+		binding = snapshot.PaneBindings[role.Name]
+		if strings.TrimSpace(binding.PaneID) == "" {
+			fmt.Fprintf(stderr, "org seat add validation: role %q pane is unresolved: %s\n", role.Name, firstNonEmpty(binding.Detail, "no live pane binding"))
+			return 1
+		}
+	} else if strings.TrimSpace(role.Pane) != "" {
+		fmt.Fprintf(stderr, "org seat add validation: role %q unexpectedly binds pane %q\n", role.Name, role.Pane)
 		return 1
 	}
 	store, err := db.OpenReadOnly(paths.Database)
@@ -862,6 +886,10 @@ func runOrgSeatValidatePresent(ctx context.Context, paths config.Paths, cfg conf
 		}
 		fmt.Fprintf(stderr, "org seat add validation: role %q is missing routes %s\n", role.Name, strings.Join(ids, ", "))
 		return 1
+	}
+	if !requireBound {
+		fmt.Fprintf(stdout, "ok role %s unbound enabled_routes=%d\n", role.Name, len(orgSeatDefaultRouteKinds))
+		return 0
 	}
 	fmt.Fprintf(stdout, "ok role %s pane=%s enabled_routes=%d\n", role.Name, binding.PaneID, len(orgSeatDefaultRouteKinds))
 	return 0

@@ -1453,10 +1453,11 @@ with `--pane ID_OR_LABEL` to bind that role later. If a configured binding stops
 resolving, for example after Herdr recreates a pane with a new id, the same
 command can rebind the role to a live unclaimed pane while preserving its policy
 and routes. A configured binding that still resolves is immutable. An ambiguous
-label binding must be disambiguated in Herdr before rebinding. Bound creation or
-repair validates the affected role's live binding and five routes without
-making unrelated intentionally unbound roles decide its exit code. Unbound
-creation reports the deferred bind command. The global `org validate` command
+label binding must be disambiguated in Herdr before rebinding. Every successful
+add validates the affected role and five routes. Bound creation and repair also
+validate the live binding without making unrelated intentionally unbound roles
+decide the exit code. Unbound creation reports the deferred bind command and an
+`ok role NAME unbound enabled_routes=5` verdict. The global `org validate` command
 continues to report every unbound role until it is attached.
 
 For a new non-owner seat, the acting role comes from `GITMOOT_ORG_ROLE` and
@@ -1466,10 +1467,11 @@ role and cannot create a cycle. An explicit `--scope` must stay within both the
 acting role's scope and the selected parent's scope. Merge authority defaults
 to empty; an explicit `--merge-rule` cannot exceed the acting role's authority.
 The empty-registry `owner` bootstrap keeps its `*` scope and `owner` merge rule.
-The three policy flags initialize new seats only; re-running the command repairs
-missing owned pieces, fills an empty pane binding, or replaces a non-empty
-binding only when its former target no longer resolves. It does not rewrite
-existing policy or duplicate routes.
+The three policy flags initialize new seats only. Supplying any of them for an
+existing role is rejected instead of being silently ignored. Re-running without
+those flags repairs missing owned pieces, fills an empty pane binding, or
+replaces a non-empty binding only when its former target no longer resolves. It
+does not rewrite existing policy or duplicate routes.
 
 `gitmoot org seat rm <name> [--home DIR]` resolves the role's live pane when it
 has a binding and checks every distinct Git checkout reported by that pane's

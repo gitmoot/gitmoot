@@ -27,16 +27,20 @@ func (e OrgSeatConfigEdit) Restore() error {
 }
 
 // UpsertOrgSeatRole adds a role section, fills an empty pane binding, or
-// replaces rebindFromPane with the desired binding. Matching the previous
-// binding prevents a concurrent config update from being overwritten. Other
-// existing role fields are never rewritten.
+// replaces rebindFromPane with the desired binding. The guard and edit use the
+// same file snapshot, so a concurrent config update cannot pass validation
+// against stale bytes. Other existing role fields are never rewritten.
 func UpsertOrgSeatRole(paths Paths, desired OrgRole, rebindFromPane string) (OrgSeatConfigEdit, bool, error) {
 	desired.Name = strings.ToLower(strings.TrimSpace(desired.Name))
 	desired.Pane = strings.TrimSpace(desired.Pane)
 	if desired.Name == "" {
 		return OrgSeatConfigEdit{}, false, fmt.Errorf("org seat role name is required")
 	}
-	cfg, err := LoadOrg(paths)
+	original, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		return OrgSeatConfigEdit{}, false, err
+	}
+	cfg, err := parseOrgContent(original)
 	if err != nil {
 		return OrgSeatConfigEdit{}, false, err
 	}
@@ -59,10 +63,6 @@ func UpsertOrgSeatRole(paths Paths, desired OrgRole, rebindFromPane string) (Org
 		}
 	}
 
-	original, err := os.ReadFile(paths.ConfigFile)
-	if err != nil {
-		return OrgSeatConfigEdit{}, false, err
-	}
 	updated := string(original)
 	if exists {
 		updated, err = setOrgRolePane(updated, desired.Name, desired.Pane)
