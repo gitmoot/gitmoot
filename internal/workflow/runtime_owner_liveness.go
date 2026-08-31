@@ -72,23 +72,21 @@ func (e Engine) ownerPIDLive() func(int64) bool {
 	return defaultOwnerPIDLive
 }
 
-// worktreeLiveness reports both the cwd result and whether the process table
-// was readable. New destructive paths require known=true.
+// worktreeLiveness reports both the cwd result and whether the process table was
+// readable. New destructive paths require known=true.
 //
-// The older boolean seam CANNOT supply certainty: it returns one bit and has no
-// way to say "the process table was unreadable". A caller that wires it must not
-// silently convert "proof required" back into best-effort, so a live answer is
-// honoured (it can only retain) while a not-live answer is reported as
-// INCONCLUSIVE and the strict scan decides.
+// WorktreeHasLiveProcess is an INJECTION SEAM, not a downgrade: a caller that
+// wires it is asserting an authoritative answer (tests and recovery callers that
+// already know the process state), so its result is taken as certain. Consulting
+// the host scan instead would make an injected answer depend on the machine the
+// code happens to run on, which is exactly what an injection seam exists to
+// avoid. Production wires neither field and falls through to the strict scan.
 func (e Engine) worktreeLiveness(path string) (live bool, known bool) {
 	if e.WorktreeLiveness != nil {
 		return e.WorktreeLiveness(path)
 	}
 	if e.WorktreeHasLiveProcess != nil {
-		if e.WorktreeHasLiveProcess(path) {
-			return true, true
-		}
-		return strictWorktreeLiveness(path)
+		return e.WorktreeHasLiveProcess(path), true
 	}
 	return strictWorktreeLiveness(path)
 }

@@ -129,27 +129,33 @@ func TestWorktreeLiveness(t *testing.T) {
 	})
 }
 
-// The older boolean seam carries one bit and cannot report an unreadable process
-// table. Wiring it must not silently turn "proof required" back into best-effort.
-func TestWorktreeLivenessLegacySeamCannotClaimCertainty(t *testing.T) {
+// The boolean seam is an injection point: its answer must be taken verbatim, in
+// both directions, so a wired test or recovery caller does not silently depend on
+// the host process table. The strict scan is what production gets.
+func TestWorktreeLivenessBooleanSeamIsAuthoritative(t *testing.T) {
 	worktree := t.TempDir()
-	engine := Engine{WorktreeHasLiveProcess: func(string) bool { return true }}
-	if live, known := engine.worktreeLiveness(worktree); !live || !known {
-		t.Fatalf("legacy live answer = (%v, %v), want (true, true)", live, known)
+	for _, tc := range []struct {
+		name string
+		live bool
+	}{
+		{name: "live", live: true},
+		{name: "not live", live: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine := Engine{WorktreeHasLiveProcess: func(string) bool { return tc.live }}
+			live, known := engine.worktreeLiveness(worktree)
+			if live != tc.live || !known {
+				t.Fatalf("worktreeLiveness = (%v, %v), want (%v, true)", live, known, tc.live)
+			}
+		})
 	}
+	if _, known := (Engine{}).worktreeLiveness(worktree); known != mustHostLivenessKnown(t, worktree) {
+		t.Fatal("unwired engine did not fall through to the strict host scan")
+	}
+}
 
-	// A not-live answer from that seam is inconclusive on its own, so the strict
-	// scan decides and its certainty is what the caller sees.
-	strict := Engine{WorktreeHasLiveProcess: func(string) bool { return false }}
-	live, known := strict.worktreeLiveness(worktree)
-	if live {
-		t.Fatalf("legacy not-live answer reported live=%v", live)
-	}
-	hostLive, hostKnown := WorktreeLiveness(worktree)
-	if hostLive {
-		t.Skip("host process table reports a live process in the temp worktree")
-	}
-	if known != hostKnown {
-		t.Fatalf("legacy seam certainty = %v, want the strict scan's %v", known, hostKnown)
-	}
+func mustHostLivenessKnown(t *testing.T, path string) bool {
+	t.Helper()
+	_, known := WorktreeLiveness(path)
+	return known
 }
