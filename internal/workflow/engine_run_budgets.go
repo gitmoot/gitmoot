@@ -59,10 +59,19 @@ func (e Engine) RunJob(ctx context.Context, jobID string, agent runtime.Agent, a
 // deadline, elapsed duration, and bounded stderr tail. The method is idempotent:
 // a result-bearing or non-failed terminal job is never rewritten.
 func (e Engine) FinalizeTimedOutJob(ctx context.Context, jobID string, reason string, timeoutDetail string) (bool, error) {
-	return e.finalizeTimedOutJob(ctx, jobID, reason, "job_timeout", timeoutDetail, false)
+	return e.finalizeTimedOutJob(ctx, jobID, reason, "job_timeout", timeoutDetail, false, nil)
 }
 
-func (e Engine) finalizeTimedOutJob(ctx context.Context, jobID string, reason string, eventKind string, eventDetail string, delegationOnly bool) (bool, error) {
+// atGeneration, when non-nil, pins every write to ONE observed lifecycle. A
+// caller recovering work it decided about earlier (the closed-PR supersession
+// debt) cannot otherwise tell "the run I judged" from "a retry that has since
+// been queued and claimed": finalizing by job id alone would stamp the old
+// synthetic failure onto the new run and advance its parent on it. With the
+// anchor set, the read, the payload write and the parent advance each refuse a
+// row whose generation has moved, so a mid-flight retry loses instead of being
+// finalized. Nil restores the historical behavior for the deadline callers, whose
+// verdict is formed and applied within one pass.
+func (e Engine) finalizeTimedOutJob(ctx context.Context, jobID string, reason string, eventKind string, eventDetail string, delegationOnly bool, atGeneration *int64) (bool, error) {
 	if err := e.validate(); err != nil {
 		return false, err
 	}
@@ -97,8 +106,26 @@ func (e Engine) finalizeTimedOutJob(ctx context.Context, jobID string, reason st
 	}
 	mailbox := e.mailbox()
 	if job.State == string(JobRunning) {
+		if atGeneration != nil {
+			// A running row under an anchored recovery means a worker has claimed this
+			// job. finishWithPayload is unanchored, so refuse rather than race it: the
+			// live run settles through its own terminal path.
+			return false, nil
+		}
 		if err := mailbox.finishWithPayload(ctx, jobID, JobFailed, reason, payload); err != nil {
 			return false, err
+		}
+	} else if atGeneration != nil {
+		encoded, err := marshalPayload(payload)
+		if err != nil {
+			return false, err
+		}
+		written, err := e.Store.UpdateJobPayloadAtGeneration(ctx, jobID, encoded, *atGeneration)
+		if err != nil {
+			return false, err
+		}
+		if !written {
+			return false, nil
 		}
 	} else {
 		// Already terminal-failed/blocked: only attach the synthetic result so
@@ -117,6 +144,19 @@ func (e Engine) finalizeTimedOutJob(ctx context.Context, jobID string, reason st
 	if strings.TrimSpace(payload.ParentJobID) == "" {
 		return true, nil
 	}
+	// The parent advance settles the coordinator ON THIS CHILD'S RESULT, so it is
+	// re-checked rather than assumed: a retry queued between the payload write and
+	// here owns the row now, and advancing its parent on the superseded run's
+	// verdict is the same defect one step later.
+	if atGeneration != nil {
+		current, err := e.Store.GetJob(ctx, jobID)
+		if err != nil {
+			return false, err
+		}
+		if current.LifecycleGeneration != *atGeneration || current.State != job.State {
+			return false, nil
+		}
+	}
 	if err := e.AdvanceJob(ctx, jobID); err != nil {
 		return true, err
 	}
@@ -129,7 +169,13 @@ func (e Engine) finalizeTimedOutJob(ctx context.Context, jobID string, reason st
 // FinalizeTimedOutDelegationChild preserves the established engine API for
 // delegation callers while routing through the all-job terminalizer.
 func (e Engine) FinalizeTimedOutDelegationChild(ctx context.Context, jobID string, reason string) (bool, error) {
-	return e.finalizeTimedOutJob(ctx, jobID, reason, "delegation_timeout_finalized", reason, true)
+	return e.finalizeTimedOutJob(ctx, jobID, reason, "delegation_timeout_finalized", reason, true, nil)
+}
+
+// finalizeSupersededDelegationChildAtGeneration is the closed-PR recovery's
+// finalizer: the same terminalizer, pinned to the lifecycle the debt names.
+func (e Engine) finalizeSupersededDelegationChildAtGeneration(ctx context.Context, jobID string, reason string, generation int64) (bool, error) {
+	return e.finalizeTimedOutJob(ctx, jobID, reason, "delegation_timeout_finalized", reason, true, &generation)
 }
 
 func (e Engine) refreshJobPayload(ctx context.Context, jobID string) error {

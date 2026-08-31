@@ -49,7 +49,14 @@ var jobStateWriteAllowlist = map[string]int{
 	// replacing its result payload. It is anchored to the observed state and
 	// lifecycle generation and carries bumpLifecycleGenerationSQL like every
 	// other state assignment, so a stale run cannot rewrite a newer result.
-	"internal/db/store_jobs.go": 10,
+	//
+	// The eleventh (TransitionJobStateAtGeneration, #1673) is the eventless
+	// counterpart: a recovery pass CLAIMS the exact run it decided about by
+	// re-asserting (state, generation) as a self-transition, so a retry queued
+	// since that decision wins instead of being finalized by the stale verdict. It
+	// carries bumpLifecycleGenerationSQL too, so a claim that is also a re-queue
+	// advances the counter exactly like every other writer.
+	"internal/db/store_jobs.go": 11,
 }
 
 // TestEveryJobStateWriteBumpsTheLifecycleGeneration enforces the seam #1407's design rests on.

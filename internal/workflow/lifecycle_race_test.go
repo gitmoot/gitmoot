@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	dbtest "github.com/gitmoot/gitmoot/internal/db/dbtest"
@@ -234,6 +235,203 @@ func TestCompletePendingSupersedeFinalizationVoidsADebtFromAnOlderLifecycle(t *t
 				t.Fatalf("task state moved %q -> %q: the parent was advanced on a newer lifecycle", taskBefore, got)
 			}
 		})
+	}
+}
+
+func countWorkflowJobEvents(t *testing.T, store *db.Store, jobID string, kind string) int {
+	t.Helper()
+	count := 0
+	for _, got := range mustJobEventKinds(t, store, jobID) {
+		if got == kind {
+			count++
+		}
+	}
+	return count
+}
+
+// TestCompletePendingSupersedeFinalizationRefusesARetryClaimedMidPayment drives the
+// interleaving itself through the production entry point, at every window a read
+// cannot close.
+//
+// The recovery reads the job and its debt in one transaction and writes in others.
+// `gitmoot job retry` can queue generation N+1 and a worker can claim it in ANY of
+// those gaps, and a payment that acts by job id would then release the claimed
+// run's locks, stamp the superseded run's PR-closed failure onto it, and advance
+// its coordinator on that.
+//
+// One subtest per gap, because a different guard owns each and mutual masking would
+// otherwise make all of them look tested by one:
+//
+//	after-read       the atomic claim CAS on (state, generation)
+//	after-claim      the payment's own re-read, which gates the UNANCHORED cleanups
+//	before-finalize  the anchored payload write inside the finalizer
+//
+// The expected outcome is identical at every stage — that is the point.
+func TestCompletePendingSupersedeFinalizationRefusesARetryClaimedMidPayment(t *testing.T) {
+	for _, stage := range []string{
+		supersedeDebtStageAfterRead,
+		supersedeDebtStageAfterClaim,
+		supersedeDebtStageBeforeFinalize,
+	} {
+		t.Run(stage, func(t *testing.T) {
+			runSupersedeDebtInterleaveCase(t, stage)
+		})
+	}
+}
+
+func runSupersedeDebtInterleaveCase(t *testing.T, stage string) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "api", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-7", RepoFullName: "gitmoot/gitmoot", State: string(TaskImplementing), Branch: "task-7",
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "coord",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "fan out",
+			Delegations: []Delegation{
+				{ID: "api", Agent: "api", Action: "review", Prompt: "review api"},
+			},
+		},
+	})
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob(parent-job): %v", err)
+	}
+	const child = "parent-job/delegation/api"
+	observed := mustJob(t, store, child)
+	if _, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, observed, "pr closed"); err != nil && !isDelegationPolicyOutcome(err) {
+		t.Fatalf("FinalizeClosedPullRequestDelegationChild: %v", err)
+	}
+	// The debt is outstanding again, anchored on the superseded run.
+	if err := store.AddJobEvent(ctx, db.JobEvent{
+		JobID: child, Kind: JobEventSupersedeFinalizePending,
+		Message: formatSupersedeFinalizeDebt(observed.LifecycleGeneration, "pr closed"),
+	}); err != nil {
+		t.Fatalf("arm the superseded run's debt: %v", err)
+	}
+
+	// The retry+claim happens in the window named by stage.
+	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
+	const lockKey = "runtime:codex:session-retry"
+	interleaved := 0
+	supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) {
+		if at != stage {
+			return
+		}
+		interleaved++
+		if _, err := RetryJob(hookCtx, store, child); err != nil {
+			t.Fatalf("RetryJob in the interleave window: %v", err)
+		}
+		if err := clearChildResult(hookCtx, store, child); err != nil {
+			t.Fatalf("clear child result: %v", err)
+		}
+		if err := store.UpdateJobState(hookCtx, child, string(JobRunning)); err != nil {
+			t.Fatalf("UpdateJobState(running): %v", err)
+		}
+		// The claimed run holds its own runtime-session lock, which a stale payment
+		// would release: the observable that separates "refused" from "acted".
+		locked, err := store.AcquireResourceLock(hookCtx, db.ResourceLock{
+			ResourceKey: lockKey, OwnerJobID: child, OwnerToken: "token-retry",
+			ExpiresAt: now.Add(30 * time.Minute).Format(time.RFC3339Nano),
+		}, now)
+		if err != nil || !locked {
+			t.Fatalf("AcquireResourceLock acquired=%v err=%v", locked, err)
+		}
+	}
+	t.Cleanup(func() { supersedeDebtInterleaveHook = nil })
+	finalizedBefore := countWorkflowJobEvents(t, store, child, "delegation_timeout_finalized")
+
+	handled, err := engine.CompletePendingSupersedeFinalization(ctx, child)
+	if err != nil {
+		t.Fatalf("CompletePendingSupersedeFinalization: %v", err)
+	}
+	if interleaved != 1 {
+		t.Fatalf("interleave hook ran %d times at stage %q; the window under test was not entered", interleaved, stage)
+	}
+	if !handled {
+		t.Fatal("the debt was left outstanding with no disposition")
+	}
+	live := mustJob(t, store, child)
+	if live.State != string(JobRunning) {
+		t.Fatalf("claimed run = %q, want running: the stale payment terminated it", live.State)
+	}
+	payload, err := unmarshalPayload(live.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload: %v", err)
+	}
+	if payload.Result != nil {
+		t.Fatalf("the superseded run's failure was stamped onto the claimed run: %+v", payload.Result)
+	}
+	if got := countWorkflowJobEvents(t, store, child, "delegation_timeout_finalized"); got != finalizedBefore {
+		t.Fatalf("delegation_timeout_finalized events = %d, want %d: the claimed run was finalized", got, finalizedBefore)
+	}
+	held, err := store.GetResourceLock(ctx, lockKey)
+	if err != nil || held.OwnerJobID != child {
+		t.Fatalf("resource lock = %+v err=%v, want still held by the claimed run", held, err)
+	}
+}
+
+// TestSupersedeDebtCompletionDoesNotClearANewerDebt closes the other half of the
+// same window, on the marker rather than the row.
+//
+// The candidate query is last-one-wins by event id. A retried run that gets
+// superseded AGAIN writes its own pending marker; if the older payment then writes
+// an unconditional completion, that completion becomes the latest marker and
+// silently clears a debt nobody ever paid — the strand returns, now invisible.
+//
+// MUTATION PROOF: drop the latest-marker check from
+// recordSupersedeFinalizationCompleted and the newer debt disappears from the
+// candidate set.
+func TestSupersedeDebtCompletionDoesNotClearANewerDebt(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "impl", []string{"implement"}, "gitmoot/gitmoot")
+	insertQueuedJob(t, store, db.Job{ID: "workflow-debt", Agent: "impl", Type: "implement"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "impl",
+	})
+	const older, newer = int64(3), int64(4)
+	for _, generation := range []int64{older, newer} {
+		if err := store.AddJobEvent(ctx, db.JobEvent{
+			JobID: "workflow-debt", Kind: JobEventSupersedeFinalizePending,
+			Message: formatSupersedeFinalizeDebt(generation, "pr closed"),
+		}); err != nil {
+			t.Fatalf("arm debt for generation %d: %v", generation, err)
+		}
+	}
+
+	// The OLDER payment finishes last. It must not close the newer debt.
+	if err := recordSupersedeFinalizationCompleted(ctx, store, "workflow-debt", "pr closed", older, nil); err != nil {
+		t.Fatalf("recordSupersedeFinalizationCompleted: %v", err)
+	}
+	if debt, err := latestSupersedeFinalizeDebt(ctx, store, "workflow-debt"); err != nil || !debt.pending || debt.generation != newer {
+		t.Fatalf("debt = %+v err=%v, want the newer generation %d still outstanding", debt, err, newer)
+	}
+	pending, err := store.JobIDsWithPendingSupersedeFinalization(ctx)
+	if err != nil {
+		t.Fatalf("JobIDsWithPendingSupersedeFinalization: %v", err)
+	}
+	found := false
+	for _, id := range pending {
+		if id == "workflow-debt" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the newer debt was cleared by the older payment; no poll will ever pay it")
+	}
+
+	// The matching payment DOES close it, so nothing is frozen.
+	if err := recordSupersedeFinalizationCompleted(ctx, store, "workflow-debt", "pr closed", newer, nil); err != nil {
+		t.Fatalf("matching recordSupersedeFinalizationCompleted: %v", err)
+	}
+	if debt, err := latestSupersedeFinalizeDebt(ctx, store, "workflow-debt"); err != nil || debt.pending {
+		t.Fatalf("debt = %+v err=%v, want closed by its own payment", debt, err)
 	}
 }
 

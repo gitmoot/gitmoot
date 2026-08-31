@@ -727,6 +727,28 @@ func (s *Store) TransitionJobState(ctx context.Context, id string, from string, 
 	return affected == 1, nil
 }
 
+// TransitionJobStateAtGeneration is TransitionJobState with the LIFECYCLE
+// GENERATION pinned and NO event written.
+//
+// It exists for a recovery pass that must convert a check-then-act into a
+// compare-and-swap without leaving an audit row per attempt. A caller re-asserts
+// (state, generation) as a self-transition to claim the exact run it decided
+// about; a retry queued since that decision moves the generation, so the claim
+// fails. Writing an event here instead would append one row per poll for as long
+// as a fault persists, which is the unbounded job_events growth the advance-retry
+// markers were reshaped to avoid (#598).
+func (s *Store) TransitionJobStateAtGeneration(ctx context.Context, id string, from string, fromGeneration int64, to string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND lifecycle_generation = ?`, to, to, id, from, fromGeneration)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
+}
+
 func (s *Store) TransitionJobStateWithEvent(ctx context.Context, id string, from string, to string, event JobEvent) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

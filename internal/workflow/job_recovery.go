@@ -595,7 +595,7 @@ func SupersedeClosedPullRequestJob(ctx context.Context, store *db.Store, observe
 		}
 		return latest, false, nil
 	}
-	if err := completeSupersedeFinalization(ctx, nil, store, observed, reason); err != nil {
+	if err := completeSupersedeFinalization(ctx, nil, store, observed, reason, observed.LifecycleGeneration); err != nil {
 		return db.Job{}, true, err
 	}
 	updated, err := store.GetJob(ctx, observed.ID)
@@ -650,7 +650,7 @@ func (e Engine) FinalizeClosedPullRequestDelegationChild(ctx context.Context, ob
 	if !transitioned {
 		return false, nil
 	}
-	return true, completeSupersedeFinalization(ctx, &e, e.Store, observed, reason)
+	return true, completeSupersedeFinalization(ctx, &e, e.Store, observed, reason, observed.LifecycleGeneration)
 }
 
 // CompletePendingSupersedeFinalization re-drives the follow-up work a supersession
@@ -690,12 +690,51 @@ func (e Engine) CompletePendingSupersedeFinalization(ctx context.Context, jobID 
 	if !debt.pending {
 		return false, nil
 	}
-	terminal := job.State == string(JobCancelled) || job.State == string(JobFailed)
+	terminal := isSupersededTerminalState(job.State)
 	if !debt.anchored || !terminal || debt.generation != job.LifecycleGeneration {
 		return true, recordSupersedeFinalizationVoided(ctx, e.Store, job, debt)
 	}
-	return true, completeSupersedeFinalization(ctx, &e, e.Store, job, debt.reason)
+	if supersedeDebtInterleaveHook != nil {
+		supersedeDebtInterleaveHook(ctx, supersedeDebtStageAfterRead)
+	}
+	// CLAIM the run, rather than acting on the read above. The read and the writes
+	// live in different transactions, so between them `gitmoot job retry` can queue
+	// a new lifecycle and a worker can claim it — and finalizing by job id alone
+	// would then stamp the superseded run's failure onto a job that is running.
+	// The self-transition re-asserts (state, generation) inside the statement, so a
+	// moved row loses the claim and is re-classified instead. It writes no event:
+	// one row per poll for as long as a fault persists is the unbounded
+	// job_events growth the advance-retry markers exist to avoid.
+	claimed, err := e.Store.TransitionJobStateAtGeneration(ctx, job.ID, job.State, job.LifecycleGeneration, job.State)
+	if err != nil {
+		return false, err
+	}
+	if !claimed {
+		latest, getErr := e.Store.GetJob(ctx, jobID)
+		if getErr != nil {
+			return false, getErr
+		}
+		return true, recordSupersedeFinalizationVoided(ctx, e.Store, latest, debt)
+	}
+	return true, completeSupersedeFinalization(ctx, &e, e.Store, job, debt.reason, job.LifecycleGeneration)
 }
+
+// supersedeDebtInterleaveHook is a test seam for the windows a read cannot close:
+// between the classification, the claim, and each anchored write, `gitmoot job
+// retry` can queue a new lifecycle and a worker can claim it. Production leaves it
+// nil, so the pass is byte-identical; a test sets it to perform that interleaving
+// at one named stage and prove the guard owning that stage refuses.
+//
+// One stage per guard, so a test kills exactly one: the claim CAS, the payment's
+// own re-read (which gates the UNANCHORED cleanups), and the anchored payload
+// write inside the finalizer.
+const (
+	supersedeDebtStageAfterRead      = "after-read"
+	supersedeDebtStageAfterClaim     = "after-claim"
+	supersedeDebtStageBeforeFinalize = "before-finalize"
+)
+
+var supersedeDebtInterleaveHook func(ctx context.Context, stage string)
 
 // supersedeFinalizeDebt is the state of a job's supersession debt: whether one is
 // outstanding, which lifecycle incurred it, and the reason to reuse when paying.
@@ -756,31 +795,60 @@ func recordSupersedeFinalizationVoided(ctx context.Context, store *db.Store, job
 // failure_policy ACTING, not this path failing, so the debt is settled and the
 // error is returned for the caller to classify. Any other error leaves the
 // pending marker in place, which is what makes the next poll retry it.
-func completeSupersedeFinalization(ctx context.Context, engine *Engine, store *db.Store, job db.Job, reason string) error {
+func completeSupersedeFinalization(ctx context.Context, engine *Engine, store *db.Store, job db.Job, reason string, generation int64) error {
+	// Every step below belongs to ONE lifecycle, so start from a fresh read rather
+	// than the caller's row: the inline caller's copy still shows `queued` (it was
+	// taken before the terminal transition), and a recovery caller's copy can be
+	// stale in the other direction — a retry may have queued and a worker claimed a
+	// newer run since it decided. A moved row does nothing here beyond conditionally
+	// closing the debt it was carrying: releasing another run's locks or worktree
+	// would be worse than leaving this debt for the next poll.
+	if supersedeDebtInterleaveHook != nil {
+		supersedeDebtInterleaveHook(ctx, supersedeDebtStageAfterClaim)
+	}
+	current, err := store.GetJob(ctx, job.ID)
+	if err != nil {
+		return err
+	}
+	if current.LifecycleGeneration != generation || !isSupersededTerminalState(current.State) {
+		return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, generation, nil)
+	}
 	// A queued job dying here owes the SAME cleanups a cancel does — resource locks,
 	// a per-delegation branch lock, the task lane lock, a dispatch-time read-only
 	// worktree. Copying only the worktree half (the shape SupersedeStaleHeadJob
 	// carries, where the targeted review legs hold none of the others) would leak
 	// locks that block the next same-repo work.
-	releaseAbortedJobResources(ctx, store, job, abortCauseSupersede)
+	releaseAbortedJobResources(ctx, store, current, abortCauseSupersede)
 	if engine == nil {
-		return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, nil)
+		return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, generation, nil)
 	}
-	payload, perr := unmarshalPayload(job.Payload)
+	payload, perr := unmarshalPayload(current.Payload)
 	if perr != nil || strings.TrimSpace(payload.ParentJobID) == "" {
-		return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, nil)
+		return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, generation, nil)
 	}
-	finalized, finalizeErr := engine.FinalizeTimedOutDelegationChild(ctx, job.ID, reason)
+	if supersedeDebtInterleaveHook != nil {
+		supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeFinalize)
+	}
+	finalized, finalizeErr := engine.finalizeSupersededDelegationChildAtGeneration(ctx, job.ID, reason, generation)
 	if finalizeErr != nil && !isDelegationPolicyOutcome(finalizeErr) {
 		return finalizeErr
 	}
-	// finalized == false with no error means the child ALREADY carries a synthetic
-	// result: a previous attempt stamped it and then failed. The finalizer
-	// short-circuits on that, so the step still owed is the parent advance — and
-	// skipping it here is exactly the strand this whole marker exists to prevent.
-	// AdvanceJob is re-entrant (the post-delivery retry pass re-calls it on the
-	// same job), so driving it again on an already-advanced parent is a no-op.
 	if !finalized && finalizeErr == nil {
+		// The finalizer returns this both when the result is ALREADY stamped (a
+		// previous attempt got that far and then failed) and when it refused because
+		// the row moved to another lifecycle. Only the first owes a parent advance,
+		// and advancing the coordinator on a run that is no longer this one is the
+		// same defect the anchor exists to stop — so re-read and require the anchored
+		// lifecycle before touching the parent.
+		latest, err := store.GetJob(ctx, job.ID)
+		if err != nil {
+			return err
+		}
+		if latest.LifecycleGeneration != generation || !isSupersededTerminalState(latest.State) {
+			return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, generation, nil)
+		}
+		// AdvanceJob is re-entrant (the post-delivery retry pass re-calls it on the
+		// same job), so driving it again on an already-advanced parent is a no-op.
 		if err := engine.AdvanceJob(ctx, job.ID); err != nil {
 			if !isDelegationPolicyOutcome(err) {
 				return err
@@ -788,7 +856,15 @@ func completeSupersedeFinalization(ctx context.Context, engine *Engine, store *d
 			finalizeErr = err
 		}
 	}
-	return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, finalizeErr)
+	return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, generation, finalizeErr)
+}
+
+// isSupersededTerminalState reports whether a job row is in one of the two states
+// a closed-PR supersession writes. It is the "is this still the settled run I owe
+// work for?" half of every anchor check: a `queued` or `running` row means a retry
+// owns the job now, and its generation will have moved with it.
+func isSupersededTerminalState(state string) bool {
+	return state == string(JobCancelled) || state == string(JobFailed)
 }
 
 // isDelegationPolicyOutcome reports whether an error is the parent's
@@ -801,10 +877,25 @@ func isDelegationPolicyOutcome(err error) bool {
 	return errors.As(err, &blocked) || errors.As(err, &awaiting)
 }
 
-// recordSupersedeFinalizationCompleted closes the durable debt. It runs only once
-// every owed step has either succeeded or ended in a policy outcome; any other
-// failure returns earlier and leaves the pending marker for the next poll.
-func recordSupersedeFinalizationCompleted(ctx context.Context, store *db.Store, jobID string, reason string, outcome error) error {
+// recordSupersedeFinalizationCompleted closes the durable debt for ONE lifecycle.
+// It runs only once every owed step has either succeeded or ended in a policy
+// outcome; any other failure returns earlier and leaves the pending marker for
+// the next poll.
+//
+// The close is CONDITIONAL on the latest pending marker still being the one this
+// payment claimed. A retried run that gets superseded again writes a NEWER pending
+// marker, and the candidate query is last-one-wins by event id — so an
+// unconditional completion written afterwards would silently clear a debt nobody
+// ever paid. When that has happened the newer debt is left outstanding and the next
+// poll picks it up.
+func recordSupersedeFinalizationCompleted(ctx context.Context, store *db.Store, jobID string, reason string, generation int64, outcome error) error {
+	debt, err := latestSupersedeFinalizeDebt(ctx, store, jobID)
+	if err != nil {
+		return err
+	}
+	if !debt.pending || !debt.anchored || debt.generation != generation {
+		return outcome
+	}
 	if err := store.AddJobEvent(ctx, db.JobEvent{
 		JobID:   jobID,
 		Kind:    JobEventSupersedeFinalizeCompleted,
