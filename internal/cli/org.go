@@ -213,6 +213,11 @@ func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	paneRef := strings.TrimSpace(*paneFlag)
+	paneSet := hasFlag(flagArgs, "pane")
+	if paneSet && paneRef == "" {
+		fmt.Fprintln(stderr, "org seat add: --pane must not be empty; omit the flag to create an unbound role")
+		return 2
+	}
 	scopeSet := hasFlag(flagArgs, "scope")
 	requestedScope, err := parseOrgSeatScope(*scopeFlag, scopeSet)
 	if err != nil {
@@ -330,7 +335,7 @@ func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "role %s is unbound; bind with gitmoot org seat add %s --pane ID_OR_LABEL\n", name, name)
 		return 0
 	}
-	return runOrgValidateReality(ctx, paths, fresh, stdout, stderr)
+	return runOrgSeatValidatePresent(ctx, paths, fresh, name, stdout, stderr)
 }
 
 func runOrgSeatRemove(args []string, stdout, stderr io.Writer) int {
@@ -384,26 +389,31 @@ func runOrgSeatRemove(args []string, stdout, stderr io.Writer) int {
 	}
 
 	ctx := context.Background()
-	snapshotCtx, cancel := context.WithTimeout(ctx, orgSeatExternalTimeout)
-	snapshot, err := orgProviderSnapshot(snapshotCtx, cfg)
-	cancel()
-	if err != nil {
-		fmt.Fprintf(stderr, "org seat rm: inspect live Herdr panes: %v\n", err)
-		return 1
-	}
-	binding := snapshot.PaneBindings[role.Name]
-	if strings.TrimSpace(binding.PaneID) == "" {
-		fmt.Fprintf(stderr, "org seat rm: role %q pane is unresolved: %s\n", role.Name, firstNonEmpty(binding.Detail, "no live pane binding"))
-		return 1
-	}
-	pane, ok := orgSeatPaneByID(snapshot.Panes, binding.PaneID)
-	if !ok {
-		fmt.Fprintf(stderr, "org seat rm: resolved pane %s is absent from the live snapshot\n", binding.PaneID)
-		return 1
-	}
-	if err := orgSeatBranchCheck(ctx, pane); err != nil {
-		fmt.Fprintf(stderr, "org seat rm: refusing to remove %q: %v\n", role.Name, err)
-		return 1
+	var pane org.LivePane
+	hasLivePane := false
+	unresolvedDetail := "Herdr pane binding is unset"
+	if strings.TrimSpace(role.Pane) != "" {
+		snapshotCtx, cancel := context.WithTimeout(ctx, orgSeatExternalTimeout)
+		snapshot, snapshotErr := orgProviderSnapshot(snapshotCtx, cfg)
+		cancel()
+		if snapshotErr != nil {
+			fmt.Fprintf(stderr, "org seat rm: inspect live Herdr panes: %v\n", snapshotErr)
+			return 1
+		}
+		binding := snapshot.PaneBindings[role.Name]
+		unresolvedDetail = firstNonEmpty(binding.Detail, "no live pane binding")
+		if strings.TrimSpace(binding.PaneID) != "" {
+			pane, ok = orgSeatPaneByID(snapshot.Panes, binding.PaneID)
+			if !ok {
+				fmt.Fprintf(stderr, "org seat rm: resolved pane %s is absent from the live snapshot\n", binding.PaneID)
+				return 1
+			}
+			if err := orgSeatBranchCheck(ctx, pane); err != nil {
+				fmt.Fprintf(stderr, "org seat rm: refusing to remove %q: %v\n", role.Name, err)
+				return 1
+			}
+			hasLivePane = true
+		}
 	}
 	store, err := db.Open(paths.Database)
 	if err != nil {
@@ -423,28 +433,38 @@ func runOrgSeatRemove(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "org seat rm: remove wake routes: %v\n", errors.Join(err, restoreErr))
 		return 1
 	}
-	closeCtx, closeCancel := context.WithTimeout(ctx, orgSeatExternalTimeout)
-	closeErr := orgSeatClosePane(closeCtx, pane.PaneID)
-	closeCancel()
-	if closeErr != nil {
-		rulesRestoreErr := store.AddEventRules(ctx, removedRules)
-		configRestoreErr := configEdit.Restore()
-		store.Close()
-		fmt.Fprintf(stderr, "org seat rm: close pane %s: %v\n", pane.PaneID, errors.Join(closeErr, rulesRestoreErr, configRestoreErr))
-		return 1
+	if hasLivePane {
+		closeCtx, closeCancel := context.WithTimeout(ctx, orgSeatExternalTimeout)
+		closeErr := orgSeatClosePane(closeCtx, pane.PaneID)
+		closeCancel()
+		if closeErr != nil {
+			rulesRestoreErr := store.AddEventRules(ctx, removedRules)
+			configRestoreErr := configEdit.Restore()
+			store.Close()
+			fmt.Fprintf(stderr, "org seat rm: close pane %s: %v\n", pane.PaneID, errors.Join(closeErr, rulesRestoreErr, configRestoreErr))
+			return 1
+		}
 	}
 	if err := store.Close(); err != nil {
 		fmt.Fprintf(stderr, "org seat rm: close store: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "pane %s closed\n", pane.PaneID)
+	if hasLivePane {
+		fmt.Fprintf(stdout, "pane %s closed\n", pane.PaneID)
+	} else {
+		fmt.Fprintf(stdout, "role %s had no resolved live pane (%s); no pane closed\n", role.Name, unresolvedDetail)
+	}
 	fmt.Fprintf(stdout, "role %s removed with %d wake routes\n", role.Name, len(removedRules))
 	fresh, err := config.LoadOrg(paths)
 	if err != nil {
 		fmt.Fprintf(stderr, "org seat rm: reload org registry: %v\n", err)
 		return 1
 	}
-	return runOrgValidateReality(ctx, paths, fresh, stdout, stderr)
+	closedPaneID := ""
+	if hasLivePane {
+		closedPaneID = pane.PaneID
+	}
+	return runOrgSeatValidateRemoved(ctx, paths, fresh, role.Name, closedPaneID, stdout, stderr)
 }
 
 func leadingOrgSeatName(args []string) (string, []string) {
@@ -776,6 +796,91 @@ func runOrgValidateOrShow(args []string, stdout, stderr io.Writer) int {
 	for _, role := range loadOrgRoster(context.Background(), nil, cfg).Members() {
 		fmt.Fprintf(stdout, "%s\tparent=%s\tscope=%s\tmerge_rule=%s\n", role.Name, role.Parent, strings.Join(role.Scope, ","), firstNonEmpty(role.MergeRule, "none"))
 	}
+	return 0
+}
+
+func runOrgSeatValidatePresent(ctx context.Context, paths config.Paths, cfg config.OrgConfig, roleName string, stdout, stderr io.Writer) int {
+	role, ok := cfg.Role(roleName)
+	if !ok {
+		fmt.Fprintf(stderr, "org seat add validation: role %q is absent after write\n", roleName)
+		return 1
+	}
+	snapshot, err := orgProviderSnapshot(ctx, cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "org seat add validation: Herdr snapshot unavailable: %v\n", err)
+		return 1
+	}
+	binding := snapshot.PaneBindings[role.Name]
+	if strings.TrimSpace(binding.PaneID) == "" {
+		fmt.Fprintf(stderr, "org seat add validation: role %q pane is unresolved: %s\n", role.Name, firstNonEmpty(binding.Detail, "no live pane binding"))
+		return 1
+	}
+	store, err := db.OpenReadOnly(paths.Database)
+	if err != nil {
+		fmt.Fprintf(stderr, "org seat add validation: open store: %v\n", err)
+		return 1
+	}
+	defer store.Close()
+	rules, err := store.ListEventRules(ctx)
+	if err != nil {
+		fmt.Fprintf(stderr, "org seat add validation: list event routes: %v\n", err)
+		return 1
+	}
+	missing, _, err := missingOrgSeatRules(orgSeatDefaultRules(role.Name), rules)
+	if err != nil {
+		fmt.Fprintf(stderr, "org seat add validation: %v\n", err)
+		return 1
+	}
+	if len(missing) != 0 {
+		ids := make([]string, len(missing))
+		for i, rule := range missing {
+			ids[i] = rule.ID
+		}
+		fmt.Fprintf(stderr, "org seat add validation: role %q is missing routes %s\n", role.Name, strings.Join(ids, ", "))
+		return 1
+	}
+	fmt.Fprintf(stdout, "ok role %s pane=%s enabled_routes=%d\n", role.Name, binding.PaneID, len(orgSeatDefaultRouteKinds))
+	return 0
+}
+
+func runOrgSeatValidateRemoved(ctx context.Context, paths config.Paths, cfg config.OrgConfig, roleName, closedPaneID string, stdout, stderr io.Writer) int {
+	if _, ok := cfg.Role(roleName); ok {
+		fmt.Fprintf(stderr, "org seat rm validation: role %q remains after removal\n", roleName)
+		return 1
+	}
+	store, err := db.OpenReadOnly(paths.Database)
+	if err != nil {
+		fmt.Fprintf(stderr, "org seat rm validation: open store: %v\n", err)
+		return 1
+	}
+	defer store.Close()
+	rules, err := store.ListEventRules(ctx)
+	if err != nil {
+		fmt.Fprintf(stderr, "org seat rm validation: list event routes: %v\n", err)
+		return 1
+	}
+	ownedRoutes := 0
+	for _, rule := range rules {
+		if strings.EqualFold(strings.TrimSpace(rule.WakeRole), roleName) {
+			ownedRoutes++
+		}
+	}
+	if ownedRoutes != 0 {
+		fmt.Fprintf(stderr, "org seat rm validation: role %q still owns %d routes\n", roleName, ownedRoutes)
+		return 1
+	}
+	if closedPaneID != "" {
+		snapshot, snapshotErr := orgProviderSnapshot(ctx, cfg)
+		if snapshotErr != nil {
+			fmt.Fprintf(stderr, "org seat rm validation: Herdr snapshot unavailable: %v\n", snapshotErr)
+			return 1
+		}
+		if _, present := orgSeatPaneByID(snapshot.Panes, closedPaneID); present {
+			fmt.Fprintf(stderr, "org seat rm validation: pane %s remains live after close\n", closedPaneID)
+			return 1
+		}
+	}
+	fmt.Fprintf(stdout, "ok role %s absent owned_routes=%d\n", roleName, ownedRoutes)
 	return 0
 }
 

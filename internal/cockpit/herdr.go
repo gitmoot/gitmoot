@@ -311,11 +311,13 @@ func (c herdrClient) resolvePaneByLabel(ctx context.Context, binding string) (st
 	if err := json.Unmarshal([]byte(out), &pl); err != nil {
 		return "", false, fmt.Errorf("parse pane list: %w", err)
 	}
-	resolved := ""
 	for _, p := range pl.Result.Panes {
 		if p.PaneID == binding && p.PaneID != "" {
 			return p.PaneID, true, nil
 		}
+	}
+	resolved := ""
+	for _, p := range pl.Result.Panes {
 		if p.PaneID != "" && p.Label == binding {
 			if resolved != "" {
 				return "", false, nil

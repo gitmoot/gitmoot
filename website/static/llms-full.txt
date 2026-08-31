@@ -11739,13 +11739,14 @@ repairs a role and installs addressed `reply`, `blocked`, `directive`,
 With `--pane`, Gitmoot resolves a literal live pane id first, then a unique
 exact live label, and stores the resolved pane id. Existing label-based commands
 therefore keep working, while later cosmetic label changes do not retarget or
-break bindings created by this command. Duplicate labels and unknown references
-hard-fail before any role or route is written. Without `--pane`, the command
-creates an unbound role and the same routes; re-run it with `--pane ID_OR_LABEL`
-to bind that role later. Bound creation finishes with the same live reality
-validation as `org validate`. Unbound creation skips that impossible live check
-and reports the deferred bind command; `org validate` continues to report the
-role as unbound until it is attached.
+break bindings created by this command. Duplicate labels, unknown references,
+and a supplied but empty `--pane` hard-fail before any role or route is written.
+Omit `--pane` to create an unbound role and the same routes; re-run the command
+with `--pane ID_OR_LABEL` to bind that role later. Bound creation validates the
+affected role's live binding and five routes without making unrelated
+intentionally unbound roles decide its exit code. Unbound creation reports the
+deferred bind command. The global `org validate` command continues to report
+every unbound role until it is attached.
 
 For a new non-owner seat, the acting role comes from `GITMOOT_ORG_ROLE` and
 falls back to `owner` only when the variable is unset. The new seat inherits
@@ -11758,13 +11759,17 @@ The three policy flags initialize new seats only; re-running the command repairs
 missing owned pieces or fills an empty pane binding without rewriting existing
 policy, rebinding an attached role, or duplicating routes.
 
-`gitmoot org seat rm <name> [--home DIR]` resolves the role's live pane and
-checks every distinct Git checkout reported by that pane's `cwd` and
-`foreground_cwd`. It refuses a dirty checkout or a branch whose `HEAD` is not
-merged into the locally known `origin/HEAD` (falling back to `origin/main`);
-unreadable branch state also fails closed. A safe removal deletes the role and
-all of its wake routes, closes the pane, and then runs the same reality
-validation. Roles that still parent another role cannot be removed.
+`gitmoot org seat rm <name> [--home DIR]` resolves the role's live pane when it
+has a binding and checks every distinct Git checkout reported by that pane's
+`cwd` and `foreground_cwd`. It refuses a dirty checkout or a branch whose `HEAD`
+is not merged into the locally known `origin/HEAD` (falling back to
+`origin/main`); unreadable branch state also fails closed. A safe removal deletes
+the role and all of its wake routes, closes a resolved live pane, and validates
+that the role, routes, and closed pane are absent. If the binding is unset,
+stale, or ambiguous in an otherwise successful live snapshot, removal deletes
+only the role and routes; it skips branch checks and pane close because no live
+pane was identified. A provider error for a configured binding still fails
+closed. Roles that still parent another role cannot be removed.
 
 The five provisioned routes are enabled, addressed, and have an empty match
 filter. Remove one by its stable ID with `org events rule rm` to quiet that kind;

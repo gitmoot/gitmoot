@@ -97,7 +97,10 @@ func TestHerdrOrgProviderPresenceWakePaneBindingParity(t *testing.T) {
 {"pane_id":"w1:p2","label":"duplicate-label","agent_status":"idle"},
 {"pane_id":"w1:p3","label":"duplicate-label","agent_status":"blocked"},
 {"pane_id":"w1:p4","label":"literal-label","agent_status":"done"},
-{"pane_id":"w1:p5","label":"empty-binding","agent_status":"working"}
+{"pane_id":"w1:p5","label":"empty-binding","agent_status":"working"},
+{"pane_id":"w1:p6","label":"w1:p8","agent_status":"idle"},
+{"pane_id":"w1:p7","label":"w1:p8","agent_status":"blocked"},
+{"pane_id":"w1:p8","label":"id-target","agent_status":"working"}
 ]`
 	run := func(_ context.Context, args ...string) (string, error) {
 		switch strings.Join(args, " ") {
@@ -136,6 +139,7 @@ func TestHerdrOrgProviderPresenceWakePaneBindingParity(t *testing.T) {
 		{name: "binding matching one label", binding: "unique-label", wantPane: "w1:p1", wantState: org.StateWorking, wantOK: true},
 		{name: "binding matching multiple labels", binding: "duplicate-label", wantState: org.StateUnknown},
 		{name: "literal pane id", binding: "w1:p4", wantPane: "w1:p4", wantState: org.StateDone, wantOK: true},
+		{name: "literal pane id precedes duplicate labels", binding: "w1:p8", wantPane: "w1:p8", wantState: org.StateWorking, wantOK: true},
 		{name: "absent literal pane id", binding: "w9:p9", wantState: org.StateUnknown},
 		{name: "binding matching nothing", binding: "missing-label", wantState: org.StateUnknown},
 	}
