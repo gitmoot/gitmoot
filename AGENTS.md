@@ -321,18 +321,24 @@ quota).
 
 **Current mode: DRAIN.**
 
-A mode switch has two required records:
+A mode switch is a merged PR that changes the line above. It takes effect at
+that PR's `mergedAt` time. At the next check-in, the coordinator must:
 
-1. Update the line above through the normal repository process. This is the
-   durable default for new checkouts and sessions.
-2. Write an `[operating-mode ...]` note to `gitmoot/worktree-lifecycle`. The note
-   takes effect immediately for already-running coordinators and seats.
+1. fetch `origin/main`, read the marker from `origin/main:AGENTS.md` rather than
+   the seat's worktree, and steer every active seat to the merged mode;
+2. comment on the merged mode-switch PR with this exact transition record:
+   `[workload-mode-transition]`, `mode: <THROUGHPUT|DRAIN>`,
+   `effective_commit: <40-character SHA>`, `observed_at: <RFC3339>`, zero or more
+   `implementer: <seat> pr=<number>` lines, zero or more
+   `review: <job-id> pr=<number>` lines, then
+   `[/workload-mode-transition]`.
 
-At every check-in, the coordinator reads the latest mode note and steers active
-seats that still have an older `AGENTS.md`. If the repository line and latest
-note disagree, enforce the more restrictive mode until they are synchronized.
-The mode changes how much work may start; it never relaxes correctness,
-exact-head review, CI, or owner merge authority.
+For DRAIN, the listed transition wave is derived from durable timestamps:
+implementation assignments accepted before `mergedAt` that have not reached a
+terminal handoff, plus review jobs created before `mergedAt` that were queued or
+running then. The merged PR always exists, so this record does not depend on a
+pre-existing workflow. The mode changes how much work may start; it never
+relaxes correctness, exact-head review, CI, or owner merge authority.
 
 Across both modes, use exactly one independent reviewer per corrected head.
 Parallel review lanes mean different PRs, not multiple reviewers on one head.
@@ -353,16 +359,18 @@ specific incident; an incident does not override this rule by itself.
 - Finish and merge the active queue; do not expand it. Do not start new issues,
   PRs, experiments, or speculative cleanup unless a security, data-loss, or
   live-service incident requires containment.
-- The activation note must enumerate the grandfathered running implementation
-  seats and review jobs. An unlisted item is not part of the transition wave.
-  Each listed item loses its exemption at its first subsequent terminal handoff:
-  review verdict, blocked or parked seat, merged PR, or explicit cancellation.
+- Grandfathered transition-wave items may temporarily exceed the normal cap,
+  but they count toward occupancy. No unlisted work may start while occupancy
+  exceeds the cap. Each listed item loses its exemption at its first subsequent
+  terminal handoff: review verdict, blocked or parked seat, merged PR, or
+  explicit cancellation. Once occupancy reaches the cap, it must not rise above
+  it again; never replace a completed transition-wave item with new work.
 - After activation, cap the `gitmoot/*` scope at **two active implementers and
-  one running reviewer**. An active implementer is a persistent seat currently
-  changing code or a running engine implementation job. A running reviewer is a
-  review job in `running`; queued reviews do not consume the slot. Do not
-  enqueue another review while the running slot is occupied. Never replace a
-  completed transition-wave item with new work.
+  one admitted review job**. An active implementer is a persistent seat
+  currently changing code or a running engine implementation job. An admitted
+  review job is in `queued` or `running`. Only the coordinator may enqueue
+  reviews in DRAIN, serially, after confirming there is no queued or running
+  review job across `gitmoot/*`.
 - Prioritize merge-ready work and merge-gate integrity, then serial dependency
   chains, then resource-safety work. Rebase conflicted branches only after
   upstream merges settle. Keep drafts and backlog work parked.
