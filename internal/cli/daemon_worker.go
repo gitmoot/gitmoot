@@ -2837,7 +2837,8 @@ func blockTaskForPermissionBlockedJob(ctx context.Context, store *db.Store, job 
 			task.Branch = existing.Branch
 		}
 	}
-	return store.UpsertTask(ctx, task)
+	_, err = workflow.PersistTaskState(ctx, store, task, workflow.TaskBlocked)
+	return err
 }
 
 func (w jobWorker) jobNeedsAdvanceRetry(ctx context.Context, jobID string) (bool, error) {

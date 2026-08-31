@@ -144,13 +144,54 @@ func TestPollOnceAsksTheForgeOncePerNumberPerPoll(t *testing.T) {
 			asked++
 		}
 	}
-	if asked > polls {
-		t.Fatalf("forge asked about #12 %d times across %d polls with 3 jobs, want at most one per poll", asked, polls)
+	if asked != polls {
+		t.Fatalf("forge asked about #12 %d times across %d polls with 3 jobs, want exactly one per poll", asked, polls)
 	}
 	for _, id := range []string{"issue-child-a", "issue-child-b", "issue-child-c"} {
 		if job, err := store.GetJob(ctx, id); err != nil || job.State != string(workflow.JobQueued) {
 			t.Fatalf("%s = %+v err=%v, want queued: an issue number is not a closed PR", id, job.State, err)
 		}
+	}
+}
+
+func TestPollOnceDoesNotReuseForgeAnswersAcrossPolls(t *testing.T) {
+	ctx := context.Background()
+	store, repo, client := closedPullRequestSweepFixture(t)
+	client.pullsByNumber[7] = github.PullRequest{
+		Number: 7, State: "open", HeadRef: "task-7", BaseRef: "main", HeadSHA: "head-seven",
+	}
+	seedQueuedJob(t, store, "review", "audit", "review", workflow.JobPayload{
+		Repo: repo.FullName(), Branch: "task-7", PullRequest: 7, TaskID: "task-7",
+		LeadAgent: "lead", Sender: "github",
+	})
+	engine := workflow.Engine{Store: store}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce with open pull request: %v", err)
+	}
+	if job, err := store.GetJob(ctx, "review"); err != nil || job.State != string(workflow.JobQueued) {
+		t.Fatalf("job after open answer = %+v err=%v, want queued", job.State, err)
+	}
+
+	client.pullsByNumber[7] = github.PullRequest{
+		Number: 7, State: "closed", HeadRef: "task-7", BaseRef: "main", HeadSHA: "head-seven",
+	}
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce with closed pull request: %v", err)
+	}
+	if job, err := store.GetJob(ctx, "review"); err != nil || job.State != string(workflow.JobCancelled) {
+		t.Fatalf("job after closed answer = %+v err=%v, want cancelled", job.State, err)
+	}
+
+	asked := 0
+	for _, number := range client.getPullRequestCalls {
+		if number == 7 {
+			asked++
+		}
+	}
+	if asked != 2 {
+		t.Fatalf("forge asked about #7 %d times across two polls, want once per poll", asked)
 	}
 }
 

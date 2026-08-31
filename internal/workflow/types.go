@@ -39,9 +39,9 @@ func IsDisposedTaskState(state string) bool {
 	}
 }
 
-// TaskEventMergedRegressionRefused is the durable trace setTaskState leaves when
-// it refuses to overwrite a `merged` task with a state that asserts the work is
-// not done. It is an informational event: the task does not move, so
+// TaskEventMergedRegressionRefused is the durable trace PersistTaskState leaves
+// when it refuses to overwrite a `merged` task with a state that asserts the
+// work is not done. It is an informational event: the task does not move, so
 // FromState/ToState stay empty per the db.TaskEvent contract, and the refused
 // destination is named in Reason.
 const TaskEventMergedRegressionRefused = "task_merged_regression_refused"
@@ -58,10 +58,9 @@ const TaskEventMergedRegressionRefused = "task_merged_regression_refused"
 // rewrite the landed-work record or to strand the coordinator, and both are wrong.
 //
 // The rule is a TARGET-state test, not a from/to pair, because the from side is
-// enforced by the write itself: setTaskState routes a regression target through
-// Store.UpsertTaskUnlessStates with `merged` forbidden, so the "is it still
-// merged?" question is answered by the UPDATE's own WHERE clause rather than by a
-// pre-read another daemon can invalidate.
+// enforced by PersistTaskState's conditional UPDATE. The "is it still merged?"
+// question is answered by the statement that writes rather than by a pre-read
+// another daemon can invalidate.
 //
 // Every TaskState, with its verdict for a task that is already `merged`:
 //
@@ -74,9 +73,9 @@ const TaskEventMergedRegressionRefused = "task_merged_regression_refused"
 //	                     would hand the same dead child the same regression one
 //	                     step later. Nothing legitimately moves landed work back
 //	                     to a pre-work state.
-//	implementing         PERMITTED. `gitmoot task resume-work`
-//	                     (internal/cli/workflow.go:752) is the one legitimate exit
-//	                     from merged: a follow-up cycle on the same task.
+//	implementing         PERMITTED. It is not a terminal failure-policy result.
+//	                     The CLI resume-work command separately rejects `merged`;
+//	                     this state-machine guard does not claim that CLI path.
 //	pr_open              PERMITTED. A real pull request exists on the branch —
 //	                     the fresh cycle resume-work started.
 //	reviewing            PERMITTED. A real review is running on that real PR.

@@ -510,6 +510,38 @@ func TestEngineAllocateTaskWorktreeBlocksDirtyOffLineageWorktree(t *testing.T) {
 	}
 }
 
+func TestEngineAllocateTaskWorktreeCannotBlockMergedTaskForDirtyWorktree(t *testing.T) {
+	ctx, store, engine, manager, request, _, _, _ := setupOffLineageTaskWorktree(t, true)
+	task, err := store.GetTask(ctx, request.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task.State = string(TaskMerged)
+	if err := store.UpsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = engine.AllocateTaskWorktree(ctx, request, manager)
+	var blocked BlockedError
+	if !errors.As(err, &blocked) {
+		t.Fatalf("AllocateTaskWorktree error = %v, want BlockedError", err)
+	}
+	task, err = store.GetTask(ctx, request.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != string(TaskMerged) {
+		t.Fatalf("task state = %q, want merged", task.State)
+	}
+	events, err := store.ListTaskEvents(ctx, request.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Kind != TaskEventMergedRegressionRefused {
+		t.Fatalf("task events = %+v, want one merged-regression refusal", events)
+	}
+}
+
 func TestEngineAllocateTaskWorktreeUsesExistingBranchWhenBranchAlreadyExists(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

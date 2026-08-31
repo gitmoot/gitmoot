@@ -546,3 +546,36 @@ func TestPermissionBlockedJobCannotResurrectDismissedTask(t *testing.T) {
 		t.Fatalf("task resurrected to %s", task.State)
 	}
 }
+
+func TestPermissionBlockedJobCannotOverwriteMergedTask(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-1", RepoFullName: "owner/repo", State: string(workflow.TaskMerged), Branch: "feature/one",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(workflow.JobPayload{
+		TaskID: "task-1", Repo: "owner/repo", Branch: "feature/one",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blockTaskForPermissionBlockedJob(ctx, store, db.Job{ID: "job-1", Payload: string(payload)}); err != nil {
+		t.Fatalf("blockTaskForPermissionBlockedJob returned error: %v", err)
+	}
+	task, err := store.GetTask(ctx, "task-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != string(workflow.TaskMerged) {
+		t.Fatalf("task state = %q, want merged", task.State)
+	}
+	events, err := store.ListTaskEvents(ctx, "task-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Kind != workflow.TaskEventMergedRegressionRefused {
+		t.Fatalf("task events = %+v, want one merged-regression refusal", events)
+	}
+}

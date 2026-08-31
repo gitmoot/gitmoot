@@ -193,11 +193,10 @@ func TestSetTaskStateRefusesMergedRegressionAndLeavesADurableTrace(t *testing.T)
 }
 
 // TestSetTaskStateAllowsMergedToNonRegressionStates is the other half of the rule,
-// and the one a widened refusal would break. `merged` is NOT frozen: every state
-// that is either the resume-work exit or a real pull-request lifecycle position
-// still lands, and leaves no refusal event. `implementing` is the load-bearing case
-// — it is `gitmoot task resume-work` (internal/cli/workflow.go:752), the one
-// legitimate production path out of merged.
+// and the one a widened refusal would break. The guard is deliberately limited to
+// the three states a dead leg's failure policy can write; it does not freeze every
+// other state transition out of merged. The CLI resume-work contract is tested at
+// its own entry point and separately rejects merged.
 func TestSetTaskStateAllowsMergedToNonRegressionStates(t *testing.T) {
 	for _, allowed := range []TaskState{
 		TaskImplementing, TaskPullRequestOpen, TaskReviewing, TaskChangesRequested,
