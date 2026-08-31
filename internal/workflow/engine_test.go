@@ -1707,6 +1707,38 @@ func TestEngineAdvanceReviewSubthresholdRecordsOutcomeWithoutPullRequest(t *test
 	}
 }
 
+// The ask-gate returns before the rest of review advancement, so a review that
+// carries human_questions[] used to be folded to approved by every consumer and
+// recorded by none. The outcome write is hoisted above every early return for
+// exactly this reason — chasing them one at a time is what produced four rounds
+// of the same finding.
+func TestEngineAdvanceReviewSubthresholdRecordsOutcomeBeforeAskGate(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+	engine.MergeGate = &fakeMergeGate{decision: MergeDecision{Ready: true}}
+	insertCompletedJob(t, store, db.Job{ID: "review-asking", Agent: "audit", Type: "review"}, JobPayload{
+		Repo: "mobile/app", Branch: "task-8", PullRequest: 8,
+		TaskID: "task-8", TaskTitle: "Mobile App", LeadAgent: "lead",
+		Result: &AgentResult{
+			Decision: "changes_requested", Severity: reviewseverity.P2,
+			Summary:        "non-blocking polish, but one question",
+			HumanQuestions: []HumanQuestion{{ID: "q1", Prompt: "should the threshold apply to docs-only PRs?"}},
+		},
+	})
+	// The ask-gate pauses the tree; that is expected and not the thing under test.
+	err := engine.AdvanceJob(ctx, "review-asking")
+	var awaiting AwaitingHumanError
+	if err != nil && !errors.As(err, &awaiting) {
+		t.Fatalf("AdvanceJob returned unexpected error: %v", err)
+	}
+	if got := countJobEvents(t, store, "review-asking", ReviewApprovedWithNotesEventKind); got != 1 {
+		t.Fatalf("%s events = %d, want 1 despite the ask-gate pausing the round",
+			ReviewApprovedWithNotesEventKind, got)
+	}
+}
+
 func TestEngineAdvancePipelineReviewIsReportOnly(t *testing.T) {
 	for _, decision := range []string{"changes_requested", "approved"} {
 		t.Run(decision, func(t *testing.T) {

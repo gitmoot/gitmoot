@@ -374,6 +374,28 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	if payload.Result.Decision == "blocked" || payload.Result.Decision == "failed" {
 		return e.block(ctx, ref, payload.Result.Summary)
 	}
+	// The folded review outcome is recorded HERE — immediately after the
+	// blocked/failed return and before EVERY later early return — because each of
+	// those returns skips it while the consumers keep folding the same verdict:
+	//   - the ask-gate below returns for a review carrying human_questions[]
+	//   - the approval replay guard returns once the task is ready_to_merge
+	//   - the PR-less arm terminates at advance_skipped_no_pr
+	// A fold that no consumer can see recorded is the defect this whole change
+	// set exists to remove, so the write is hoisted above all of them rather than
+	// chased past one at a time. blocked/failed are already excluded by the
+	// changes_requested test and by the return above; pipeline stages returned
+	// report-only far earlier. AddJobEventIfAbsent keeps every replay idempotent.
+	if job.Type == "review" &&
+		payload.Result.Decision == "changes_requested" && effectiveDecision == "approved" {
+		if err := e.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
+			JobID: job.ID,
+			Kind:  ReviewApprovedWithNotesEventKind,
+			Message: fmt.Sprintf("review severity %s is below repository blocking severity %s; findings remain recorded and no fix is dispatched",
+				payload.Result.Severity, blockingSeverity),
+		}); err != nil {
+			return err
+		}
+	}
 	// Ask-gate (#445): a HEALTHY result that carries human_questions[] pauses the
 	// task at awaiting_human for a specific human answer instead of guessing —
 	// reusing the escalate_human pause machinery on a SUCCESS result. It runs
@@ -401,30 +423,6 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		// job's sole continuation, so short-circuit here — the asking result's own
 		// delegations[] must NOT also dispatch and no second continuation enqueues.
 		return nil
-	}
-	// A sub-threshold changes-requested review is recorded as approved-with-notes
-	// BEFORE the approval replay guard below. Once the task has already reached
-	// ready_to_merge that guard returns early, so a write on its far side silently
-	// drops the only durable evidence the proof projector keys the approval claim
-	// on, leaving proof contradicting the PR comment. AddJobEventIfAbsent keeps the
-	// replay path idempotent.
-	//
-	// NOT restricted to PullRequest > 0. A PR-less review child is still FOLDED:
-	// advanceDelegations runs before this and counts a sub-threshold child toward
-	// delegation quorum and verify synthesis, so its outcome is load-bearing even
-	// though it never reaches the PR-only advancement arm. Gating this write on a
-	// pull request suppressed the only event proof/project.go recognizes for
-	// exactly those children.
-	if job.Type == "review" &&
-		payload.Result.Decision == "changes_requested" && effectiveDecision == "approved" {
-		if err := e.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
-			JobID: job.ID,
-			Kind:  ReviewApprovedWithNotesEventKind,
-			Message: fmt.Sprintf("review severity %s is below repository blocking severity %s; findings remain recorded and no fix is dispatched",
-				payload.Result.Severity, blockingSeverity),
-		}); err != nil {
-			return err
-		}
 	}
 	if job.Type == "review" && effectiveDecision == "approved" {
 		done, err := e.reviewApprovalAlreadyAdvanced(ctx, ref)
