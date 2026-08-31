@@ -824,6 +824,14 @@ func TestClientCloneOnlyCommitFailsClosedOnUnprovableObjectStore(t *testing.T) {
 	if _, err := os.Stat(loose); err != nil {
 		t.Skipf("head object is packed, not loose: %v", err)
 	}
+	// Git writes loose objects read-only (0444) and their directory 0555, so a
+	// non-root run cannot overwrite either without widening the modes first.
+	if err := os.Chmod(filepath.Dir(loose), 0o755); err != nil {
+		t.Fatalf("Chmod object directory: %v", err)
+	}
+	if err := os.Chmod(loose, 0o644); err != nil {
+		t.Fatalf("Chmod loose object: %v", err)
+	}
 	if err := os.WriteFile(loose, []byte("not a git object"), 0o644); err != nil {
 		t.Fatalf("corrupt loose object: %v", err)
 	}
