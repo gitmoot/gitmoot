@@ -413,6 +413,48 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 		return nil
 	}
+	nativeReviewDeliveryStarted := false
+	payload, err = w.prepareNativeReviewWorktreeForRunner(ctx, job, payload, jobRunner)
+	if err != nil {
+		// An exact-head allocation that spent its checkout-mutation-lock budget is
+		// TRANSIENT: the holder is another worker's short shared-.git op. Terminally
+		// failing the leg here BURNED the verdict — the payload is left unmutated, so
+		// the next poll's re-enqueue matches it and is a silent no-op, and
+		// FindRepeatedReviewers only re-enlists SUCCEEDED verdicts, so nothing ever
+		// re-attempts it. Hold the still-queued leg for re-dispatch instead, exactly
+		// like the checkout-preflight site below. Every other allocation failure (a
+		// missing commit object, an unwritable path) is unclassified and keeps the
+		// terminal path, and the hold itself is bounded by maxOperationalBlockerRetries.
+		//
+		// This site uses deferPreDeliveryAllocationContention rather than the general
+		// helper because a high-risk LENS CHILD reaches this same path-less fallback
+		// (TestNativeReviewWorktreePreparationCoversHighRiskLensChild), and the general
+		// helper's delegation-child exclusion would route it to
+		// finishQueuedJob(JobFailed) → finalizePreflightDelegationChild, advancing the
+		// delegation DAG with a synthetic `failed` verdict on a lock another worker
+		// holds for a sub-second op. The narrowing is typed and pre-delivery only; see
+		// the helper's own comment for why that is the safe boundary.
+		if deferred, deferErr := w.deferPreDeliveryAllocationContention(ctx, job, payload, err); deferErr != nil {
+			writeLine(w.Stdout, "job %s review-worktree contention deferral failed: %v", job.ID, deferErr)
+		} else if deferred {
+			writeLine(w.Stdout, "job %s deferred on review-worktree contention: %v", job.ID, err)
+			return nil
+		}
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
+		return nil
+	}
+	nativeReviewWorktreeOwned := payload.ReadOnlyWorktree && strings.TrimSpace(payload.WorktreePath) != ""
+	if nativeReviewWorktreeOwned {
+		defer func() {
+			if nativeReviewDeliveryStarted {
+				return
+			}
+			w.cleanupUndeliveredNativeReviewWorktree(context.WithoutCancel(ctx), job.ID, payload, jobRunner)
+		}()
+	}
 	checkout, err := w.checkoutForJob(ctx, job, payload, agent, jobRunner)
 	if err != nil {
 		if resumedCheckout, resumedPayload, ok := w.resumeSelfDirtyWorktreeForRunner(ctx, job, payload, agent, err, jobRunner); ok {
@@ -872,6 +914,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			<-done
 		}
 	}
+	nativeReviewDeliveryStarted = true
 	_, err = engine.RunJob(runCtx, job.ID, agent, adapter)
 	stopKillPending()
 	stopProgress()
@@ -929,6 +972,23 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	_ = w.postJobResultComment(ctx, job.ID, agent, checkout, nil)
 	writeLine(w.Stdout, "job %s completed", job.ID)
 	return nil
+}
+
+func (w jobWorker) cleanupUndeliveredNativeReviewWorktree(ctx context.Context, jobID string, payload workflow.JobPayload, runner subprocess.Runner) {
+	job, err := w.Store.GetJob(ctx, jobID)
+	if err != nil {
+		writeLine(w.Stdout, "job %s native review pre-delivery cleanup lookup failed: %v", jobID, err)
+		return
+	}
+	switch workflow.JobState(job.State) {
+	case workflow.JobFailed, workflow.JobCancelled:
+	default:
+		return
+	}
+	engine := w.workflowForJob(strings.TrimSpace(payload.WorktreePath), runner)
+	if err := engine.ReclaimTerminalDelegationWorktree(ctx, jobID); err != nil {
+		writeLine(w.Stdout, "job %s native review pre-delivery cleanup failed: %v", jobID, err)
+	}
 }
 
 const implementationPreflightAttemptLimit = 3

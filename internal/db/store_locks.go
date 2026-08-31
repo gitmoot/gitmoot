@@ -647,6 +647,28 @@ func (s *Store) GetMergeGate(ctx context.Context, repoFullName string, pullReque
 	return gate, nil
 }
 
+func (s *Store) UpsertMergeGateStatusObservation(ctx context.Context, obs MergeGateStatusObservation) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO merge_gate_status_observations(repo_full_name, pull_request, head_sha, kind, updated_at)
+		VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(repo_full_name, pull_request) DO UPDATE SET
+			head_sha = excluded.head_sha,
+			kind = excluded.kind,
+			updated_at = CURRENT_TIMESTAMP`,
+		obs.RepoFullName, obs.PullRequest, obs.HeadSHA, obs.Kind)
+	return err
+}
+
+func (s *Store) GetMergeGateStatusObservation(ctx context.Context, repoFullName string, pullRequest int64) (MergeGateStatusObservation, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT repo_full_name, pull_request, head_sha, kind
+		FROM merge_gate_status_observations WHERE repo_full_name = ? AND pull_request = ?`,
+		repoFullName, pullRequest)
+	var obs MergeGateStatusObservation
+	if err := row.Scan(&obs.RepoFullName, &obs.PullRequest, &obs.HeadSHA, &obs.Kind); err != nil {
+		return MergeGateStatusObservation{}, err
+	}
+	return obs, nil
+}
+
 // UpsertNoCIObservation records (or refreshes) the first zero-external CI
 // observation for a PR (#596). Recording at a new head SHA overwrites the prior
 // observation, which is exactly the reset-on-new-head semantics the merge gate

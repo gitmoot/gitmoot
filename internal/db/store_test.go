@@ -280,6 +280,43 @@ func TestIncrementalVacuumReclaimsOnlyRequestedPages(t *testing.T) {
 	}
 }
 
+func TestMergeGateStatusObservationRoundTripAndReset(t *testing.T) {
+	ctx := context.Background()
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	if _, err := store.GetMergeGateStatusObservation(ctx, "gitmoot/gitmoot", 11); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetMergeGateStatusObservation on empty table error = %v, want sql.ErrNoRows", err)
+	}
+
+	first := MergeGateStatusObservation{RepoFullName: "gitmoot/gitmoot", PullRequest: 11, HeadSHA: "aaaa111", Kind: "pending"}
+	if err := store.UpsertMergeGateStatusObservation(ctx, first); err != nil {
+		t.Fatalf("UpsertMergeGateStatusObservation returned error: %v", err)
+	}
+	got, err := store.GetMergeGateStatusObservation(ctx, "gitmoot/gitmoot", 11)
+	if err != nil {
+		t.Fatalf("GetMergeGateStatusObservation returned error: %v", err)
+	}
+	if got != first {
+		t.Fatalf("observation = %+v, want %+v", got, first)
+	}
+
+	second := MergeGateStatusObservation{RepoFullName: "gitmoot/gitmoot", PullRequest: 11, HeadSHA: "bbbb222", Kind: "not_applied"}
+	if err := store.UpsertMergeGateStatusObservation(ctx, second); err != nil {
+		t.Fatalf("second UpsertMergeGateStatusObservation returned error: %v", err)
+	}
+	got, err = store.GetMergeGateStatusObservation(ctx, "gitmoot/gitmoot", 11)
+	if err != nil {
+		t.Fatalf("GetMergeGateStatusObservation after reset returned error: %v", err)
+	}
+	if got != second {
+		t.Fatalf("observation after reset = %+v, want %+v", got, second)
+	}
+}
+
 func TestNoCIObservationRoundTripAndReset(t *testing.T) {
 	ctx := context.Background()
 	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
