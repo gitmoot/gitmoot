@@ -323,11 +323,12 @@ an accessible location and put it first in the daemon's `PATH`; do not loosen
 `/root` permissions. An inaccessible executable fails startup with no root
 fallback.
 
-Runtime contract preflight evaluates UID-dependent requirements against
-`local_uid` when that identity is configured. This lets a root daemon dispatch
-Claude with `danger-full-access` to a non-root local backend without weakening
-Claude's root refusal. When `local_uid` is absent, preflight still evaluates the
-daemon identity, so the default root path remains refused.
+For daemon jobs that own an execution-backend lifecycle, runtime contract
+preflight evaluates UID-dependent requirements against configured `local_uid`.
+This lets a root daemon dispatch Claude with `danger-full-access` to a non-root
+local backend without weakening Claude's root refusal. Host-only paths such as
+`gitmoot job run` do not provision that lifecycle and still evaluate the host
+process identity. When `local_uid` is absent, daemon jobs do the same.
 
 To prove a parallel local wave, use an isolated `--home`, one distinct
 `fresh:<suffix>` session per Claude leg, and a daemon started with `--parallel

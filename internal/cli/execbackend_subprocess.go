@@ -26,7 +26,7 @@ func (w jobWorker) subprocessRunnerForJob(job db.Job) (subprocess.Runner, error)
 		return nil, err
 	}
 	name, present := payload.ExecBackendOverride()
-	backend, err := daemonJobExecBackendFor(w, name, present)
+	backend, _, err := daemonJobExecBackendFor(w, name, present)
 	if err != nil {
 		return nil, err
 	}

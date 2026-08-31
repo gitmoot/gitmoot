@@ -79,6 +79,60 @@ func TestRuntimePreflightStubBinaryE2E(t *testing.T) {
 	})
 }
 
+func TestRuntimePreflightDefaultWorkerDoesNotAssumeConfiguredExecutionIdentity(t *testing.T) {
+	rawHome := t.TempDir()
+	paths, err := pathsFromFlag(rawHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(paths.Home, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[remote_exec]\nbackend = \"local\"\nlocal_uid = 996\nlocal_gid = 986\nlocal_root = \"/var/tmp/gitmoot-local\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	checkout := createDaemonWorkerGitCheckout(t, "host-only-preflight")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgentWithPolicy(t, store, "root-claude", runtime.ClaudeRuntime, "fresh:host-only", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyDangerFullAccess)
+	const jobID = "host-only-preflight"
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: jobID, Agent: "root-claude", Action: "implement", Repo: "owner/repo", Branch: "main"})
+
+	preflightCalls := 0
+	worker := defaultJobWorker(store, io.Discard, rawHome)
+	worker.RuntimePreflight = func(_ context.Context, agent runtime.Agent, request runtime.RuntimeContractRequest) runtime.RuntimeContractResult {
+		preflightCalls++
+		if request.EffectiveUIDKnown {
+			t.Fatalf("host-only worker preflight received execution uid %d", request.EffectiveUID)
+		}
+		return runtime.RuntimeContractResult{
+			Runtime: agent.Runtime, State: runtime.RuntimeContractUnsupported, Instrument: "effective-uid",
+			Requirements: []runtime.RuntimeRequirementResult{{
+				Kind: runtime.RuntimeRequirementNonRootEUID, Name: "effective uid must be non-root",
+				Remedy: "run as non-root", State: runtime.RuntimeContractUnsupported, Instrument: "effective-uid",
+			}},
+		}
+	}
+	job, err := store.GetJob(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.run(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := store.GetJob(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preflightCalls != 1 || completed.State != string(workflow.JobBlocked) {
+		t.Fatalf("host-only preflight calls = %d, job state = %q; want one call and blocked", preflightCalls, completed.State)
+	}
+}
+
 func writeRuntimePreflightStub(t *testing.T, path, mode string) {
 	t.Helper()
 	help := "Usage: kimi [options]\\n  --print\\n  -p, --prompt\\n  --output-format\\n"
