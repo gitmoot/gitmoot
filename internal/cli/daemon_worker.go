@@ -1444,7 +1444,7 @@ type readOnlySandboxGrants struct {
 
 type readOnlyRuntimeAdapter struct {
 	runtime.Adapter
-	stateRoot string
+	cleanupRoot string
 }
 
 func (a readOnlyRuntimeAdapter) PermissionPolicyApplication(agent runtime.Agent) runtime.PermissionPolicyApplication {
@@ -1458,13 +1458,14 @@ func (a readOnlyRuntimeAdapter) Deliver(ctx context.Context, agent runtime.Agent
 }
 
 func (a readOnlyRuntimeAdapter) cleanup() error {
-	// The prompt can rewrite every file under stateRoot. Delete it, but never
-	// synchronize that untrusted state back to the shared runtime profile.
-	if a.stateRoot == "" {
+	// The prompt can move or rewrite anything under the job-private writable
+	// cache. Delete that entire root so renamed credentials cannot escape cleanup;
+	// never synchronize untrusted state back to the shared runtime profile.
+	if a.cleanupRoot == "" {
 		return nil
 	}
-	if err := os.RemoveAll(a.stateRoot); err != nil {
-		return fmt.Errorf("remove read-only seat runtime state: %w", err)
+	if err := os.RemoveAll(a.cleanupRoot); err != nil {
+		return fmt.Errorf("remove read-only seat cache: %w", err)
 	}
 	return nil
 }
@@ -1496,8 +1497,8 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 		return nil, fmt.Errorf("read-only Landlock sandbox returned incompatible %T adapter", wrapped)
 	}
 	return readOnlyRuntimeAdapter{
-		Adapter:   runtimeAdapter,
-		stateRoot: filepath.Join(grants.cacheRoot, "runtime-state"),
+		Adapter:     runtimeAdapter,
+		cleanupRoot: grants.cacheRoot,
 	}, nil
 }
 
@@ -1640,6 +1641,7 @@ func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayM
 	}
 	sourceDir := strings.TrimSpace(agent.RuntimeConfigDir)
 	var relativeState, credentialFile, credentialSection string
+	stateRoot := filepath.Join(cacheRoot, "runtime-state")
 	switch agent.Runtime {
 	case runtime.ClaudeRuntime:
 		if sourceDir == "" {
@@ -1660,6 +1662,9 @@ func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayM
 		if sourceDir == "" {
 			sourceDir = filepath.Join(userHome, ".kimi-code")
 		}
+		// Kimi reads HOME/.kimi-code. The sandbox supplies HOME=cacheRoot/home,
+		// so stage its isolated profile at that exact path.
+		stateRoot = cacheRoot
 		relativeState = filepath.Join("home", ".kimi-code")
 		credentialFile = filepath.Join("credentials", "kimi-code.json")
 	case runtime.ShellRuntime:
@@ -1676,7 +1681,7 @@ func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayM
 	if resolved, resolveErr := filepath.EvalSymlinks(sourceDir); resolveErr == nil {
 		sourceDir = resolved
 	}
-	stateDir := filepath.Join(cacheRoot, "runtime-state", relativeState)
+	stateDir := filepath.Join(stateRoot, relativeState)
 	if err := os.RemoveAll(stateDir); err != nil {
 		return "", nil, fmt.Errorf("reset isolated runtime state %q: %w", stateDir, err)
 	}

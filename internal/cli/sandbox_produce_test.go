@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -154,6 +155,62 @@ func (r *repairStateRunner) RunEnv(_ context.Context, _ string, env []string, co
 
 func (r *repairStateRunner) LookPath(file string) (string, error) { return file, nil }
 
+type kimiHomeStateRunner struct {
+	home               string
+	credentialObserved bool
+}
+
+func (r *kimiHomeStateRunner) Run(context.Context, string, string, ...string) (subprocess.Result, error) {
+	return subprocess.Result{}, errors.New("kimi-home runner requires explicit environment")
+}
+
+func (r *kimiHomeStateRunner) RunEnv(_ context.Context, _ string, env []string, command string, args ...string) (subprocess.Result, error) {
+	r.home = envValue(env, "HOME")
+	if r.home == "" {
+		return subprocess.Result{}, errors.New("missing isolated HOME")
+	}
+	credential := filepath.Join(r.home, ".kimi-code", "credentials", "kimi-code.json")
+	if _, err := os.ReadFile(credential); err != nil {
+		return subprocess.Result{}, fmt.Errorf("read Kimi credential under HOME: %w", err)
+	}
+	r.credentialObserved = true
+	return subprocess.Result{
+		Command: command,
+		Args:    args,
+		Stdout:  `{"role":"assistant","content":"{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"Kimi profile observed\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[],\"delegations\":[]}}"}` + "\n",
+	}, nil
+}
+
+func (r *kimiHomeStateRunner) LookPath(file string) (string, error) { return file, nil }
+
+type renameRuntimeStateRunner struct {
+	savedState string
+}
+
+func (r *renameRuntimeStateRunner) Run(context.Context, string, string, ...string) (subprocess.Result, error) {
+	return subprocess.Result{}, errors.New("rename-state runner requires explicit environment")
+}
+
+func (r *renameRuntimeStateRunner) RunEnv(_ context.Context, _ string, env []string, command string, args ...string) (subprocess.Result, error) {
+	stateDir := envValue(env, "CLAUDE_CONFIG_DIR")
+	if stateDir == "" {
+		return subprocess.Result{}, errors.New("missing isolated CLAUDE_CONFIG_DIR")
+	}
+	stateRoot := filepath.Dir(stateDir)
+	cacheRoot := filepath.Dir(stateRoot)
+	r.savedState = filepath.Join(cacheRoot, "saved-runtime-state")
+	if err := os.Rename(stateRoot, r.savedState); err != nil {
+		return subprocess.Result{}, fmt.Errorf("move runtime state inside writable cache: %w", err)
+	}
+	return subprocess.Result{
+		Command: command,
+		Args:    args,
+		Stdout:  `{"result":"{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"state moved\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[],\"delegations\":[]}}"}`,
+	}, nil
+}
+
+func (r *renameRuntimeStateRunner) LookPath(file string) (string, error) { return file, nil }
+
 func TestWorkerClaudeKimiProduceDispatchWrappedArgv(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -298,7 +355,7 @@ func TestWrapReadOnlySandboxAdapterUsesExplicitReadsAndIsolatedState(t *testing.
 	if !ok {
 		t.Fatalf("wrapped adapter = %T, want readOnlyRuntimeAdapter", wrapped)
 	}
-	stagedPath := filepath.Join(stateAdapter.stateRoot, ".claude", ".credentials.json")
+	stagedPath := filepath.Join(stateAdapter.cleanupRoot, "runtime-state", ".claude", ".credentials.json")
 	stagedCredential, err := os.ReadFile(stagedPath)
 	if err != nil {
 		t.Fatal(err)
@@ -412,8 +469,8 @@ func TestReadOnlyRuntimeStateSurvivesRepairDeliveries(t *testing.T) {
 	}
 	runner := &sandboxAdapterCaptureRunner{stdout: `{"result":"done"}`}
 	adapter := readOnlyRuntimeAdapter{
-		Adapter:   runtime.ClaudeAdapter{Runner: runner},
-		stateRoot: stateRoot,
+		Adapter:     runtime.ClaudeAdapter{Runner: runner},
+		cleanupRoot: stateRoot,
 	}
 	agent := runtime.Agent{
 		Name: "reviewer", Role: "reviewer", Runtime: runtime.ClaudeRuntime,
@@ -483,6 +540,102 @@ func TestWorkerReadOnlyRuntimeStateSurvivesMailboxRepair(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Dir(runner.stateDir)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("isolated runtime state survived job boundary: %v", err)
+	}
+}
+
+func TestWorkerKimiReadOnlySeatStagesProfileUnderEffectiveHome(t *testing.T) {
+	ctx := context.Background()
+	store, home := blockerE2EHome(t)
+	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	sourceDir := t.TempDir()
+	credentialDir := filepath.Join(sourceDir, "credentials")
+	if err := os.MkdirAll(credentialDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const sourceCredential = `{"access_token":"host"}`
+	if err := os.WriteFile(filepath.Join(credentialDir, "kimi-code.json"), []byte(sourceCredential), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seedDaemonWorkerAgentWithPolicy(t, store, "kimi-reviewer", runtime.KimiRuntime,
+		"session_550e8400-e29b-41d4-a716-446655440000", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "kimi-review", Agent: "kimi-reviewer", Action: "review", Repo: "owner/repo",
+		WorktreePath: checkout, ReadOnlySeat: true, RuntimeConfigDir: sourceDir,
+	})
+	runner := &kimiHomeStateRunner{}
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return runtime.KimiAdapter{Runner: runner, Dir: checkout}, nil
+	}
+	job, err := store.GetJob(ctx, "kimi-review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.run(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != string(workflow.JobSucceeded) || !runner.credentialObserved {
+		t.Fatalf("Kimi job state=%q credentialObserved=%v payload=%s", stored.State, runner.credentialObserved, stored.Payload)
+	}
+	if data, err := os.ReadFile(filepath.Join(credentialDir, "kimi-code.json")); err != nil || string(data) != sourceCredential {
+		t.Fatalf("shared Kimi credential changed to %q, err=%v", data, err)
+	}
+	if _, err := os.Stat(filepath.Dir(runner.home)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Kimi job-private cache survived job boundary: %v", err)
+	}
+}
+
+func TestWorkerReadOnlyCleanupRemovesRenamedRuntimeState(t *testing.T) {
+	ctx := context.Background()
+	store, home := blockerE2EHome(t)
+	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	sourceDir := t.TempDir()
+	const sourceCredential = `{"claudeAiOauth":{"accessToken":"host"}}`
+	if err := os.WriteFile(filepath.Join(sourceDir, ".credentials.json"), []byte(sourceCredential), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime,
+		"550e8400-e29b-41d4-a716-446655440002", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "rename-state-review", Agent: "reviewer", Action: "review", Repo: "owner/repo",
+		WorktreePath: checkout, ReadOnlySeat: true, RuntimeConfigDir: sourceDir,
+	})
+	runner := &renameRuntimeStateRunner{}
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return runtime.ClaudeAdapter{Runner: runner}, nil
+	}
+	job, err := store.GetJob(ctx, "rename-state-review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.run(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != string(workflow.JobSucceeded) || runner.savedState == "" {
+		t.Fatalf("rename-state job state=%q savedState=%q payload=%s", stored.State, runner.savedState, stored.Payload)
+	}
+	if _, err := os.Stat(runner.savedState); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("renamed runtime state survived job boundary: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(sourceDir, ".credentials.json")); err != nil || string(data) != sourceCredential {
+		t.Fatalf("shared credential changed to %q, err=%v", data, err)
 	}
 }
 
@@ -572,7 +725,7 @@ func TestReadOnlyRuntimeAdapterNeverPersistsStagedCredential(t *testing.T) {
 	if !ok {
 		t.Fatalf("wrapped adapter = %T, want readOnlyRuntimeAdapter", wrapped)
 	}
-	staged := filepath.Join(adapter.stateRoot, ".claude", ".credentials.json")
+	staged := filepath.Join(adapter.cleanupRoot, "runtime-state", ".claude", ".credentials.json")
 	if err := os.WriteFile(staged, []byte(`{"claudeAiOauth":{"accessToken":"attacker-controlled"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -582,13 +735,13 @@ func TestReadOnlyRuntimeAdapterNeverPersistsStagedCredential(t *testing.T) {
 	if data, err := os.ReadFile(source); err != nil || string(data) != sourceCredential {
 		t.Fatalf("shared credential changed to %q, err=%v", data, err)
 	}
-	if _, err := os.Stat(adapter.stateRoot); err != nil {
+	if _, err := os.Stat(adapter.cleanupRoot); err != nil {
 		t.Fatalf("staged runtime state removed before job boundary: %v", err)
 	}
 	if err := adapter.cleanup(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(adapter.stateRoot); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(adapter.cleanupRoot); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("staged runtime state survived job cleanup: %v", err)
 	}
 }
