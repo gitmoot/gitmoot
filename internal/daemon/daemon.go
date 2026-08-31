@@ -169,8 +169,7 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	// consumer that needs it, never retained beyond this poll.
 	reviewMemo := newReviewJobsMemo(d.Store)
 	for _, pull := range pulls {
-		headRepo := strings.TrimSpace(pull.HeadRepoFullName)
-		if headRepo == "" || headRepo == d.Repo.FullName() {
+		if d.pullRequestHeadIsLocal(pull) {
 			openBranches[pull.HeadRef] = struct{}{}
 		}
 		openPullNumbers[pull.Number] = struct{}{}
@@ -432,6 +431,15 @@ func (d Daemon) logf(format string, args ...any) {
 	log.Printf(format, args...)
 }
 
+// pullRequestHeadIsLocal reports whether a pull request's head branch lives in
+// the watched repository. HeadRef text can collide with a local branch name
+// without being that branch, so every consumer that resolves a task or a status
+// from HeadRef must reject a fork head through this one predicate.
+func (d Daemon) pullRequestHeadIsLocal(pull github.PullRequest) bool {
+	headRepo := strings.TrimSpace(pull.HeadRepoFullName)
+	return headRepo == "" || headRepo == d.Repo.FullName()
+}
+
 // reconcilePROpenTasks promotes implementing/blocked tasks whose branch carries
 // an open same-repo pull request back to pr_open (#920). It is a catch-up for
 // missed or mis-sequenced PR-open events: without it a wedged task hides its PR
@@ -460,8 +468,7 @@ func (d Daemon) reconcilePROpenTasks(ctx context.Context, pulls []github.PullReq
 	}
 	var firstErr error
 	for _, pull := range pulls {
-		headRepo := strings.TrimSpace(pull.HeadRepoFullName)
-		if headRepo != "" && headRepo != d.Repo.FullName() {
+		if !d.pullRequestHeadIsLocal(pull) {
 			continue
 		}
 		for _, task := range byBranch[strings.TrimSpace(pull.HeadRef)] {
@@ -925,6 +932,11 @@ func (d Daemon) recordPullRequest(ctx context.Context, pull github.PullRequest) 
 // merge-gate decision, so a bookkeeping failure retries without changing either.
 func (d Daemon) ensureMergeGateStatus(ctx context.Context, pull github.PullRequest) {
 	if d.Workflow == nil || d.Workflow.MergeGate == nil {
+		return
+	}
+	// A fork head must never resolve a local task by branch text, or an unrelated
+	// contributor's pull request inherits a marker no Gitmoot workflow resolves.
+	if !d.pullRequestHeadIsLocal(pull) {
 		return
 	}
 	headSHA := strings.TrimSpace(pull.HeadSHA)

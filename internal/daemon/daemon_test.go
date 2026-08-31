@@ -1326,6 +1326,45 @@ func TestPollOnceInactiveTaskPreservesRealGateVerdict(t *testing.T) {
 	}
 }
 
+func TestPollOnceForkHeadCollidingWithManagedBranchGetsNoMarker(t *testing.T) {
+	ctx := context.Background()
+	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskChangesRequested)
+	// A fork pull request whose head branch TEXT collides with the managed
+	// task-7 branch. Seeded in the local mirror at its own head so routing sees
+	// no change and the marker reconciler is the only consumer under test.
+	fork := client.pulls[0]
+	fork.Number = 99
+	fork.HeadRepoFullName = "fork/gitmoot"
+	fork.HeadSHA = "fork123"
+	client.pulls = append(client.pulls, fork)
+	client.comments[99] = []github.IssueComment{}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: "gitmoot/gitmoot",
+		Number:       99,
+		HeadBranch:   "task-7",
+		BaseBranch:   "main",
+		HeadSHA:      "fork123",
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	// The managed same-repo head is still marked in this very poll, so the guard
+	// rejects fork identity rather than disabling the feature.
+	if client.combinedStatusCalls != 1 || len(client.statuses) != 1 {
+		t.Fatalf("GetCombinedStatus calls = %d statuses = %+v, want exactly the managed head reconciled", client.combinedStatusCalls, client.statuses)
+	}
+	if client.statuses[0].SHA != "abc123" {
+		t.Fatalf("status SHA = %q, want the managed head abc123 and never the fork head", client.statuses[0].SHA)
+	}
+	if _, err := store.GetMergeGateStatusObservation(ctx, "gitmoot/gitmoot", 99); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetMergeGateStatusObservation error = %v, want no observation for a fork pull request", err)
+	}
+}
+
 func TestPollOnceMarkerObservationAvoidsRepeatedStatusReads(t *testing.T) {
 	ctx := context.Background()
 	_, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskChangesRequested)
