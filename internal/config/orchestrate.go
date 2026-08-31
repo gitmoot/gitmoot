@@ -696,6 +696,7 @@ func applyReviewPolicyField(policy *ReviewPolicy, key string, value string) erro
 	case "blocking_severity":
 		parsed, err := parseReviewBlockingSeverity(value)
 		if err != nil {
+			policy.BlockingSeverity = reviewseverity.DefaultBlocking
 			return err
 		}
 		policy.BlockingSeverity = parsed

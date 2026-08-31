@@ -133,6 +133,23 @@ high_risk_paths = ["cmd/**"]
 	}
 }
 
+func TestLoadReviewConfigDuplicateInvalidGlobalSeverityFailsClosed(t *testing.T) {
+	body := `[review]
+blocking_severity = "P1"
+blocking_severity = "bogus"
+`
+	cfg, err := LoadReviewConfig(writeReviewConfig(t, body))
+	if err == nil {
+		t.Fatal("duplicate invalid global threshold must report a parse error")
+	}
+	if !ReviewConfigErrorsOnlyBlockingSeverity(err) {
+		t.Fatalf("duplicate invalid threshold error was not classified as safe field recovery: %v", err)
+	}
+	if got := cfg.For("owner/repo").BlockingSeverity; got != reviewseverity.P3 {
+		t.Fatalf("duplicate invalid global threshold = %q, want fail-closed P3", got)
+	}
+}
+
 func TestLoadReviewConfigInvalidRepoSeverityFailsClosedWithoutDiscardingOverrides(t *testing.T) {
 	body := `[review]
 blocking_severity = "P1"

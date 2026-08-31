@@ -57,6 +57,10 @@ The threshold is inclusive. `P1` blocks `P0` and `P1`; `P2` and `P3` findings
 are still posted and the raw `changes_requested` result remains stored, but the
 round resolves as approved-with-notes and Gitmoot does not dispatch a fix. The
 global default is `P3`. Configured values must be `P0`, `P1`, `P2`, or `P3`.
+An invalid `blocking_severity` value falls back to `P3` while other valid review
+fields remain active. Any other review-policy parse or read error rejects the
+entire applied review policy, restoring `P3` with native fanout and risk tiers
+off.
 
 ### Risk-Tiered Adaptive Review
 

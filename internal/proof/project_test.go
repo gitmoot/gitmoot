@@ -328,7 +328,7 @@ func TestApprovedWithNotesProofUsesDurableOutcomeEvent(t *testing.T) {
 	}
 
 	events["review-job"] = []db.JobEvent{{
-		JobID: "review-job", Kind: reviewApprovedWithNotesEventKind,
+		JobID: "review-job", Kind: workflow.ReviewApprovedWithNotesEventKind,
 		Message:   "review severity P2 is below repository blocking severity P1",
 		CreatedAt: "2026-07-17 01:09:30",
 	}}
@@ -347,7 +347,7 @@ func TestApprovedWithNotesProofUsesDurableOutcomeEvent(t *testing.T) {
 		}
 		for _, claim := range node.Claims {
 			if claim.Type == "review.independent_approved" &&
-				claim.Source != "job_event."+reviewApprovedWithNotesEventKind {
+				claim.Source != "job_event."+workflow.ReviewApprovedWithNotesEventKind {
 				t.Fatalf("approved-with-notes claim source = %q", claim.Source)
 			}
 		}

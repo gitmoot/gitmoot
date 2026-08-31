@@ -1461,8 +1461,8 @@ func TestEngineAdvanceReviewSubthresholdApprovesWithNotes(t *testing.T) {
 		len(payload.Result.Findings) != 1 || string(payload.Result.Findings[0]) != string(finding) {
 		t.Fatalf("stored result was rewritten or findings lost: %+v", payload.Result)
 	}
-	if got := countJobEvents(t, store, "review-notes", reviewApprovedWithNotesEventKind); got != 1 {
-		t.Fatalf("%s events = %d, want 1", reviewApprovedWithNotesEventKind, got)
+	if got := countJobEvents(t, store, "review-notes", ReviewApprovedWithNotesEventKind); got != 1 {
+		t.Fatalf("%s events = %d, want 1", ReviewApprovedWithNotesEventKind, got)
 	}
 }
 
@@ -1526,8 +1526,8 @@ func TestEngineAdvanceReviewSubthresholdEventIsIdempotentAfterMergeError(t *test
 	if len(gate.requests) != 2 {
 		t.Fatalf("merge gate requests = %d, want 2 retry attempts", len(gate.requests))
 	}
-	if got := countJobEvents(t, store, "review-notes-retry", reviewApprovedWithNotesEventKind); got != 1 {
-		t.Fatalf("%s events = %d, want 1 across retries", reviewApprovedWithNotesEventKind, got)
+	if got := countJobEvents(t, store, "review-notes-retry", ReviewApprovedWithNotesEventKind); got != 1 {
+		t.Fatalf("%s events = %d, want 1 across retries", ReviewApprovedWithNotesEventKind, got)
 	}
 }
 

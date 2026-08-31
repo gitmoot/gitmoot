@@ -91,6 +91,25 @@ func TestRenderJobResultCommentNeverInfersApprovedWithNotesFromMissingDecision(t
 	}
 }
 
+func TestRenderJobResultCommentDoesNotAnnotatePlainApproval(t *testing.T) {
+	body := RenderJobResultComment(JobResultComment{
+		JobID:                  "review-approved",
+		JobType:                "review",
+		JobState:               string(JobSucceeded),
+		ReviewBlockingSeverity: reviewseverity.P1,
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "clean",
+		},
+	})
+	if !strings.Contains(body, "**Decision:** `approved`") {
+		t.Fatalf("approved comment lost raw decision:\n%s", body)
+	}
+	if strings.Contains(body, "**Review Outcome:**") {
+		t.Fatalf("plain approval was mislabeled approved-with-notes:\n%s", body)
+	}
+}
+
 func TestRenderJobResultCommentRendersFindings(t *testing.T) {
 	body := RenderJobResultComment(JobResultComment{
 		AgentName: "researcher",

@@ -6,7 +6,9 @@ import (
 	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 )
 
-const reviewApprovedWithNotesEventKind = "review_approved_with_notes"
+// ReviewApprovedWithNotesEventKind records the durable effective outcome for a
+// raw changes-requested review whose severity is below repository policy.
+const ReviewApprovedWithNotesEventKind = "review_approved_with_notes"
 
 // reviewBlockingSeverity resolves the repository policy while preserving the
 // historical fail-closed behavior for engines that are not wired from config.

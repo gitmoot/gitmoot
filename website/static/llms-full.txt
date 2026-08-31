@@ -11048,6 +11048,10 @@ their findings and record the raw `changes_requested` result, but Gitmoot treats
 the round as approved-with-notes and does not dispatch a fix. The global default
 is `P3`, so every valid finding blocks unless a repository overrides it.
 Configured values must be `P0`, `P1`, `P2`, or `P3`.
+An invalid `blocking_severity` value falls back to `P3` while other valid review
+fields remain active. Any other review-policy parse or read error rejects the
+entire applied review policy, restoring `P3` with native fanout and risk tiers
+off.
 
 ### Risk-Tiered Adaptive Review
 

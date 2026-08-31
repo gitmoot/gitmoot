@@ -14,8 +14,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-const reviewApprovedWithNotesEventKind = "review_approved_with_notes"
-
 // PRReceipt is structured store evidence about a pull request and its daemon
 // workflow-journal receipts. Empty fields are honest evidence gaps.
 type PRReceipt struct {
@@ -272,11 +270,11 @@ func (p *projector) factNodes(job db.Job, projection payloadProjection, result *
 			effectiveDecision := strings.TrimSpace(result.Decision)
 			approvalSource := "jobs.review"
 			if effectiveDecision == "changes_requested" &&
-				hasJobEvent(p.events[job.ID], reviewApprovedWithNotesEventKind) {
+				hasJobEvent(p.events[job.ID], workflow.ReviewApprovedWithNotesEventKind) {
 				effectiveDecision = "approved"
 				attrs["effective_decision"] = effectiveDecision
 				attrs["review_outcome"] = "approved-with-notes"
-				approvalSource = "job_event." + reviewApprovedWithNotesEventKind
+				approvalSource = "job_event." + workflow.ReviewApprovedWithNotesEventKind
 			}
 			if effectiveDecision == "approved" {
 				claimType := "review.approved"

@@ -1324,6 +1324,13 @@ func delegationQuorumThreshold(delegations []Delegation) int {
 	return k
 }
 
+// reviewDelegationQuorumSatisfied counts effective approving outcomes until K.
+// Parsed results are decision-first because changes_requested reviews map to a
+// succeeded job state; a state-first shortcut would count a refuting lens as an
+// approval and let a high-risk PR clear the #650 quorum. Repository blocking
+// severity applies only to review actions or review-typed children. Ask and
+// implement children retain their raw decisions. A succeeded job state is used
+// only when the child has no parsed result.
 func reviewDelegationQuorumSatisfied(delegations []Delegation, children map[string]db.Job, childPayloads map[string]JobPayload, k int, blockingSeverity string) bool {
 	approving := 0
 	for _, d := range delegations {
