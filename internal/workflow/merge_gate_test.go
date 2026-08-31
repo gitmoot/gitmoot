@@ -38,6 +38,9 @@ type mergeGateReviewFixture struct {
 	decision  string
 	hasResult bool
 	recorded  string
+	// emptyRound reproduces a CLI-dispatched review: `gitmoot agent review` sets
+	// HeadSHA and never sets ReviewRound.
+	emptyRound bool
 }
 
 func newMergeGateQuorumScenario(t *testing.T) (*db.Store, *fakeMergeGateGitHub, PolicyMergeGate, MergeRequest) {
@@ -80,6 +83,9 @@ func insertMergeGateReviewFixture(t *testing.T, store *db.Store, fixture mergeGa
 		HeadSHA:     headSHA,
 		TaskID:      "task-9",
 		ReviewRound: "review-1",
+	}
+	if fixture.emptyRound {
+		payload.ReviewRound = ""
 	}
 	if fixture.hasResult {
 		payload.Result = &AgentResult{Decision: fixture.decision, Summary: "fixture verdict"}
@@ -129,9 +135,13 @@ func insertMergeGateDelegationChild(t *testing.T, store *db.Store, parentID, del
 func insertMergeGateHeadlessIntegrationParent(t *testing.T, store *db.Store, parentID string) {
 	t.Helper()
 	insertCompletedJob(t, store, db.Job{
-		ID:           parentID,
-		Agent:        "reviewer-a",
-		Type:         "review",
+		ID:    parentID,
+		Agent: "reviewer-a",
+		Type:  "review",
+		// Production shape: mailbox.Enqueue writes ParentJobID AND DelegationID for
+		// every delegated review, so isDelegationChild is true for this row. The
+		// quorum scenario's implement job is the delegator.
+		ParentJobID:  "implement-job",
 		DelegationID: "verify-parent",
 	}, JobPayload{
 		Repo:         "gitmoot/gitmoot",
@@ -963,6 +973,128 @@ func TestPolicyMergeGateBlockingDelegationChildUnderNonReviewParent(t *testing.T
 	}
 	if !strings.Contains(decision.Reason.Render(), "blocking result from security") {
 		t.Fatalf("decision reason = %q, want delegated blocking verdict", decision.Reason)
+	}
+}
+
+// TestPolicyMergeGateUndecidedRoundOrderNeverHidesUnfinishedReviewer pins the
+// property that replaced per-reviewer "latest row wins" selection: when two rows
+// from one reviewer at the evaluated head cannot be ordered (one explicit
+// review-N, one CLI-dispatched empty round), an unfinished or crashed slot must
+// still block. It is asserted in BOTH job-id orders, so an implementation that
+// resolves the tie through ListJobs' ORDER BY id fails one direction, and the
+// approval is recorded LATER than the unfinished row, so a "latest timestamp
+// wins" implementation fails both.
+func TestPolicyMergeGateUndecidedRoundOrderNeverHidesUnfinishedReviewer(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		state       JobState
+		wantReason  string
+		wantPending bool
+	}{
+		{name: "queued", state: JobQueued, wantReason: "waiting for reviewer audit", wantPending: true},
+		{name: "running", state: JobRunning, wantReason: "waiting for reviewer audit", wantPending: true},
+		{name: "failed", state: JobFailed, wantReason: "crashed reviewer audit"},
+		{name: "cancelled", state: JobCancelled, wantReason: "crashed reviewer audit"},
+	} {
+		for _, order := range []struct {
+			name       string
+			manualID   string
+			numberedID string
+		}{
+			{name: "manual id sorts first", manualID: "aaa-manual-review", numberedID: "zzz-dispatched-review"},
+			{name: "numbered id sorts first", manualID: "zzz-manual-review", numberedID: "aaa-dispatched-review"},
+		} {
+			t.Run(tc.name+"/"+order.name, func(t *testing.T) {
+				store, gh, gate, request := newMergeGateQuorumScenario(t)
+				insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+					id: order.numberedID, agent: "audit", state: tc.state,
+					recorded: "2026-07-31 12:00:00",
+				})
+				insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+					id: order.manualID, agent: "audit", hasResult: true, decision: "approved",
+					recorded: "2026-07-31 12:01:00", emptyRound: true,
+				})
+
+				decision, err := gate.Evaluate(context.Background(), request)
+				if err != nil {
+					t.Fatalf("Evaluate returned error: %v", err)
+				}
+				if decision.Merged {
+					t.Fatalf("decision = %+v, want unfinished reviewer slot to hold the merge", decision)
+				}
+				if tc.wantPending && decision.Reason.IsGateMiss() {
+					t.Fatalf("decision = %+v, want unfinished slot to wait without escalating", decision)
+				}
+				if !tc.wantPending && (!decision.LeaveOpen || !decision.Reason.IsGateMiss()) {
+					t.Fatalf("decision = %+v, want crashed slot parked as a gate miss", decision)
+				}
+				if !strings.Contains(decision.Reason.Render(), tc.wantReason) ||
+					!strings.Contains(decision.Reason.Render(), order.numberedID) {
+					t.Fatalf("decision reason = %q, want %q naming %s", decision.Reason, tc.wantReason, order.numberedID)
+				}
+				if len(gh.merges) != 0 {
+					t.Fatalf("merge calls = %+v, want none", gh.merges)
+				}
+			})
+		}
+	}
+}
+
+// TestPolicyMergeGateAdvancesIntegrationWorktreeReviewAsDelegationChild is the
+// #388 regression in its PRODUCTION row shape: mailbox.Enqueue writes both
+// ParentJobID and DelegationID, so the gate-required #332 integration review IS a
+// delegation child. Its HeadSHA is cleared by the engine, so it can never appear
+// in the exact-head scan; excluding it from round selection as a round-history
+// duplicate deadlocks the merge. Its parent is an orchestrating job, not a review,
+// so it is nobody's sub-review.
+func TestPolicyMergeGateAdvancesIntegrationWorktreeReviewAsDelegationChild(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: "gitmoot/gitmoot",
+		Number:       9,
+		HeadBranch:   "task-9",
+		BaseBranch:   "main",
+		HeadSHA:      "head123",
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+	insertCompletedJob(t, store, db.Job{ID: "coordinator-job", Agent: "coordinator", Type: "ask"}, JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		PullRequest: 9,
+		TaskID:      "task-9",
+		Result:      &AgentResult{Decision: "approved", Summary: "verify gate fanned out"},
+	})
+	insertIndependentMergeGateReview(t, store, db.Job{
+		ID:           "coordinator-job/delegation/verify-gate",
+		Agent:        "audit",
+		Type:         "review",
+		ParentJobID:  "coordinator-job",
+		DelegationID: "verify-gate",
+	}, JobPayload{
+		Repo:         "gitmoot/gitmoot",
+		PullRequest:  9,
+		TaskID:       "task-9",
+		ReviewRound:  "review-1",
+		DelegationID: "verify-gate",
+		WorktreePath: "/tmp/gitmoot/integration-verify-gate",
+		Result:       &AgentResult{Decision: "approved", Summary: "integration verified"},
+	})
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr:          github.PullRequest{Number: 9, HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+	}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.Merged {
+		t.Fatalf("production-shape integration review did not advance to merge: decision = %+v", decision)
 	}
 }
 
@@ -2714,9 +2846,11 @@ func TestPolicyMergeGateAcceptsHeadlessIntegrationParentWhenDelegationChildrenSu
 	store, gh, gate, request := newMergeGateQuorumScenario(t)
 	const parentID = "review-parent-healthy"
 	insertCompletedJob(t, store, db.Job{
-		ID:           parentID,
-		Agent:        "reviewer-a",
-		Type:         "review",
+		ID:    parentID,
+		Agent: "reviewer-a",
+		Type:  "review",
+		// Production shape: a delegated review row carries both ids.
+		ParentJobID:  "implement-job",
 		DelegationID: "verify-parent",
 	}, JobPayload{
 		Repo:         "gitmoot/gitmoot",
@@ -3535,7 +3669,13 @@ func TestPolicyMergeGateAdvancesIntegrationWorktreeReviewWithoutHeadSHA(t *testi
 	}
 	// An integration-worktree review: a delegation child (DelegationID +
 	// WorktreePath set) whose HeadSHA the engine intentionally cleared.
-	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review", DelegationID: "verify-gate"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{
+		ID:           "review-job",
+		Agent:        "audit",
+		Type:         "review",
+		ParentJobID:  "review-job-implement-author",
+		DelegationID: "verify-gate",
+	}, JobPayload{
 		Repo:         "gitmoot/gitmoot",
 		PullRequest:  9,
 		TaskID:       "task-9",
@@ -3570,7 +3710,13 @@ func TestPolicyMergeGateAdvancesIntegrationWorktreeReviewWithoutHeadSHA(t *testi
 func TestPolicyMergeGateBlocksDelegationReviewForMismatchedHead(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review", DelegationID: "verify-gate"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{
+		ID:           "review-job",
+		Agent:        "audit",
+		Type:         "review",
+		ParentJobID:  "review-job-implement-author",
+		DelegationID: "verify-gate",
+	}, JobPayload{
 		Repo:         "gitmoot/gitmoot",
 		PullRequest:  9,
 		HeadSHA:      "stale999",

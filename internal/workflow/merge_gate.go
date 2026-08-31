@@ -483,11 +483,12 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	}
 	// A round can order remediation, but it must not hide a blocking verdict or
 	// an unfinished reviewer slot captured at the head currently being evaluated.
-	type reviewAtHead struct {
+	type taskReview struct {
 		job     db.Job
 		payload JobPayload
 	}
-	var reviewsAtHead []reviewAtHead
+	var taskReviews []taskReview
+	taskReviewIDs := make(map[string]struct{})
 	for _, job := range jobs {
 		if job.Type != "review" {
 			continue
@@ -499,40 +500,24 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if !sameTask(current, payload) {
 			continue
 		}
-		reviewHead := strings.TrimSpace(payload.HeadSHA)
+		taskReviews = append(taskReviews, taskReview{job: job, payload: payload})
+		taskReviewIDs[job.ID] = struct{}{}
+	}
+	var reviewsAtHead []taskReview
+	for _, review := range taskReviews {
+		reviewHead := strings.TrimSpace(review.payload.HeadSHA)
 		if reviewHead == "" || reviewHead != headSHA {
 			continue
 		}
-		reviewsAtHead = append(reviewsAtHead, reviewAtHead{job: job, payload: payload})
+		reviewsAtHead = append(reviewsAtHead, review)
 	}
-	latestReviewByReviewer := map[string]reviewAtHead{}
-	var reviewerOrder []string
-	for _, review := range reviewsAtHead {
-		reviewer := strings.TrimSpace(review.job.Agent)
-		latest, exists := latestReviewByReviewer[reviewer]
-		if !exists {
-			reviewerOrder = append(reviewerOrder, reviewer)
-			latestReviewByReviewer[reviewer] = review
-			continue
-		}
-		if reviewJobSupersedes(review.job, review.payload, latest.job, latest.payload) {
-			latestReviewByReviewer[reviewer] = review
-		}
-	}
-	for _, reviewer := range reviewerOrder {
-		review := latestReviewByReviewer[reviewer]
-		switch JobState(review.job.State) {
-		case JobQueued, JobRunning:
-			return mergePending{reason: fmt.Sprintf("waiting for reviewer %s at evaluated head (job %s is %s)", reviewer, review.job.ID, review.job.State)}
-		case JobFailed, JobCancelled:
-			return fmt.Errorf("crashed reviewer %s at evaluated head (job %s is %s); requeue or reassign the review", reviewer, review.job.ID, review.job.State)
-		}
-	}
+	// Supersession is resolved BEFORE any state or verdict scan, and it covers a
+	// row in any state: a strictly later terminal verdict from the same reviewer
+	// is what clears a crashed or requeued slot. Rows whose order cannot be
+	// established -- one explicit review-N against one empty round -- supersede
+	// in neither direction, so no row is ever hidden by ListJobs' id order.
 	supersededReviewIDs := map[string]struct{}{}
 	for _, review := range reviewsAtHead {
-		if review.payload.Result == nil {
-			continue
-		}
 		reviewer := strings.TrimSpace(review.job.Agent)
 		if reviewer == "" {
 			continue
@@ -547,11 +532,26 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			}
 		}
 	}
+	var activeAtHead []taskReview
 	for _, review := range reviewsAtHead {
-		if review.payload.Result == nil {
+		if _, superseded := supersededReviewIDs[review.job.ID]; superseded {
 			continue
 		}
-		if _, superseded := supersededReviewIDs[review.job.ID]; superseded {
+		activeAtHead = append(activeAtHead, review)
+	}
+	// EVERY unsuperseded slot at the evaluated head is inspected, not one row per
+	// reviewer: an unfinished or crashed reviewer must not be hidden by a sibling
+	// row of the same reviewer whose recency cannot be decided.
+	for _, review := range activeAtHead {
+		switch JobState(review.job.State) {
+		case JobQueued, JobRunning:
+			return mergePending{reason: fmt.Sprintf("waiting for reviewer %s at evaluated head (job %s is %s)", strings.TrimSpace(review.job.Agent), review.job.ID, review.job.State)}
+		case JobFailed, JobCancelled:
+			return fmt.Errorf("crashed reviewer %s at evaluated head (job %s is %s); requeue or reassign the review", strings.TrimSpace(review.job.Agent), review.job.ID, review.job.State)
+		}
+	}
+	for _, review := range activeAtHead {
+		if review.payload.Result == nil {
 			continue
 		}
 		switch review.payload.Result.Decision {
@@ -559,12 +559,12 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", review.job.Agent)}
 		}
 	}
-	if len(latestReviewByReviewer) > 0 {
+	if len(activeAtHead) > 0 {
 		var selfApprovalReason string
 		var unknownImplementerReason string
 		var unattributedReviewerReason string
-		for _, reviewer := range reviewerOrder {
-			review := latestReviewByReviewer[reviewer]
+		for _, review := range activeAtHead {
+			reviewer := strings.TrimSpace(review.job.Agent)
 			if JobState(review.job.State) != JobSucceeded {
 				return fmt.Errorf("reviewer %s at evaluated head has unusable job state %s (job %s)", reviewer, review.job.State, review.job.ID)
 			}
@@ -603,21 +603,14 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	}
 	var latest reviewRoundKey
 	haveLatest := false
-	for _, job := range jobs {
-		if job.Type != "review" || isDelegationChild(job) {
+	for _, review := range taskReviews {
+		if isRoundHistoryDuplicate(review.job, taskReviewIDs) {
 			continue
 		}
-		payload, err := unmarshalPayload(job.Payload)
-		if err != nil {
-			return err
-		}
-		if !sameTask(current, payload) {
+		if _, superseded := supersededReviewIDs[review.job.ID]; superseded {
 			continue
 		}
-		if _, superseded := supersededReviewIDs[job.ID]; superseded {
-			continue
-		}
-		candidate := reviewRoundKeyForJob(job, payload)
+		candidate := reviewRoundKeyForJob(review.job, review.payload)
 		if !haveLatest || reviewRoundKeyAfter(candidate, latest) {
 			latest = candidate
 			haveLatest = true
@@ -635,16 +628,14 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		payload JobPayload
 	}
 	var eligible []eligibleReview
-	for _, job := range jobs {
-		if job.Type != "review" || isDelegationChild(job) {
+	for _, review := range taskReviews {
+		job := review.job
+		payload := review.payload
+		if isRoundHistoryDuplicate(job, taskReviewIDs) {
 			continue
 		}
-		payload, err := unmarshalPayload(job.Payload)
-		if err != nil {
-			return err
-		}
 		candidate := reviewRoundKeyForJob(job, payload)
-		if !sameTask(current, payload) || !sameReviewRoundKey(candidate, latest) || payload.Result == nil {
+		if !sameReviewRoundKey(candidate, latest) || payload.Result == nil {
 			continue
 		}
 		if _, superseded := supersededReviewIDs[job.ID]; superseded {
@@ -912,6 +903,7 @@ func reviewJobRecordedAfter(left db.Job, right db.Job) bool {
 	}
 	return false
 }
+
 func reviewJobSupersedes(leftJob db.Job, leftPayload JobPayload, rightJob db.Job, rightPayload JobPayload) bool {
 	leftRound := reviewRoundKeyForJob(leftJob, leftPayload)
 	rightRound := reviewRoundKeyForJob(rightJob, rightPayload)
@@ -925,6 +917,25 @@ func reviewJobSupersedes(leftJob db.Job, leftPayload JobPayload, rightJob db.Job
 		return false
 	}
 	return reviewJobRecordedAfter(leftJob, rightJob)
+}
+
+// isRoundHistoryDuplicate reports whether a delegated review row is a SUB-REVIEW
+// of another review job for the same task. Those rows are round-history
+// duplicates of their parent (#1737: a lens child's id is its parent's id plus a
+// suffix, and its verdict is already validated as the parent's evidence by
+// ensureDelegatedReviewEvidence), so they must not compete for the latest round.
+//
+// A delegated review whose parent is NOT a review job for this task is the
+// gate's own required review, not a duplicate of one. A #332 integration-worktree
+// review is exactly that shape -- the engine clears its HeadSHA, so it can never
+// appear in reviewsAtHead -- and excluding it from round selection deadlocks the
+// merge (#388).
+func isRoundHistoryDuplicate(job db.Job, taskReviewIDs map[string]struct{}) bool {
+	if !isDelegationChild(job) {
+		return false
+	}
+	_, parentIsTaskReview := taskReviewIDs[strings.TrimSpace(job.ParentJobID)]
+	return parentIsTaskReview
 }
 
 type reviewRoundKey struct {
