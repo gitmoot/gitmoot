@@ -2060,6 +2060,79 @@ func TestEngineReclaimAgedFixCloneRechecksNestedRepositoriesAfterQuarantine(t *t
 	}
 }
 
+// A writer that remembers the first quarantine name can race after the sealed
+// scan. The second rename keeps that write out of the directory being removed,
+// and the survivor scan prevents completed bookkeeping until the new sibling is
+// restored and classified.
+func TestEngineReclaimAgedFixClonePreservesPostScanPathWriter(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	jobID := "fix-post-scan-writer"
+	path, err := FixWorktreePath(home, "owner/repo", jobID)
+	if err != nil {
+		t.Fatalf("FixWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll fix worktree: %v", err)
+	}
+	payload, err := marshalPayload(JobPayload{
+		Repo: "owner/repo", Branch: "feature/fix", WorktreePath: path, FixWorktree: true,
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: jobID, Agent: "fixer", Type: "implement", State: string(JobSucceeded),
+		Repo: "owner/repo", Payload: payload,
+	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+	manager := &fakeWorktreeManager{cleanSet: true, clean: true}
+	engine := testEngine(store)
+	engine.Home = home
+	engine.DelegationCheckout = t.TempDir()
+	engine.DelegationWorktrees = manager
+	wrote := false
+	engine.WorktreeLiveness = func(probed string) (bool, bool) {
+		if !wrote && len(manager.cloneOnlyCalls) == 2 &&
+			probed != path && probed != manager.cloneOnlyCalls[1] {
+			late := filepath.Join(manager.cloneOnlyCalls[1], "late", ".git")
+			if err := os.MkdirAll(late, 0o755); err != nil {
+				t.Fatalf("MkdirAll post-scan nested repository: %v", err)
+			}
+			wrote = true
+		}
+		return false, true
+	}
+
+	reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("first reclaim pass: %v", err)
+	}
+	if reclaimed || !wrote {
+		t.Fatalf("first pass = (reclaimed %v, wrote %v), want retained late writer", reclaimed, wrote)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("sealed clone original path = %v, want absent pending survivor restore", err)
+	}
+	survivors, err := FixCloneQuarantines(path)
+	if err != nil || len(survivors) != 1 {
+		t.Fatalf("post-scan writer survivors = %v (err %v), want one", survivors, err)
+	}
+
+	reclaimed, err = engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("restore pass: %v", err)
+	}
+	if reclaimed {
+		t.Fatal("restored post-scan writer content was reclaimed")
+	}
+	if _, err := os.Stat(filepath.Join(path, "late", ".git")); err != nil {
+		t.Fatalf("post-scan writer content was not restored: %v", err)
+	}
+}
+
 // TestEngineReclaimAgedFixCloneRefusesLeftoverQuarantine keeps an interrupted
 // removal visible instead of deleting a directory nobody has proven anything about.
 func TestEngineReclaimAgedFixCloneRefusesLeftoverQuarantine(t *testing.T) {
