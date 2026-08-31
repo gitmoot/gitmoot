@@ -216,6 +216,24 @@ func TestTerminalTaskReclaimRepeatedFailureStopsRelogging(t *testing.T) {
 	}
 }
 
+func TestTerminalTaskRetentionStopsReloggingAndNamesMalformedOwner(t *testing.T) {
+	resetDelegationReclaimAccountingForTest(t)
+	path := filepath.Join(t.TempDir(), "task-retained")
+	var output bytes.Buffer
+	for range delegationReclaimFailureLogLimit + 2 {
+		logTaskWorktreeRetention(&output, "task-retained", path, workflow.TaskWorktreeReclaimActiveOwner, "malformed-active")
+	}
+	if got := strings.Count(output.String(), "terminal task worktree retained"); got != delegationReclaimFailureLogLimit {
+		t.Fatalf("retention log count = %d, want %d before suppression:\n%s", got, delegationReclaimFailureLogLimit, output.String())
+	}
+	if !strings.Contains(output.String(), "malformed_non_final_job=malformed-active") {
+		t.Fatalf("retention log omitted malformed owner: %s", output.String())
+	}
+	if !strings.Contains(output.String(), "further identical retention messages are suppressed") {
+		t.Fatalf("missing retention suppression notice: %s", output.String())
+	}
+}
+
 func TestDelegationReclaimStoreFailureStillAborts(t *testing.T) {
 	resetDelegationReclaimAccountingForTest(t)
 	ctx := context.Background()
@@ -634,6 +652,56 @@ func TestReclaimTerminalTaskWorktreesRemovesCleanDismissedTask(t *testing.T) {
 	}
 	if task.WorktreePath != "" || task.Branch != "adhoc-finished" {
 		t.Fatalf("task after reclaim = %+v, want empty path and preserved branch", task)
+	}
+}
+
+func TestReclaimTerminalTaskWorktreesNamesMalformedGlobalPin(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	})
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	worker := defaultJobWorker(store, io.Discard, home)
+	path, err := workflow.TaskWorktreePath(worker.workflowHome(), "owner/repo", "globally-pinned")
+	if err != nil {
+		t.Fatalf("TaskWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll worktree parent: %v", err)
+	}
+	if err := (gitutil.NewHostClient(checkout)).AddWorktree(ctx, "globally-pinned", path, "HEAD"); err != nil {
+		t.Fatalf("AddWorktree: %v", err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "globally-pinned",
+		RepoFullName: "owner/repo",
+		State:        string(workflow.TaskDismissed),
+		Branch:       "globally-pinned",
+		WorktreePath: path,
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: "malformed-global-pin", Agent: "agent", Type: "implement", State: "queued", Payload: `not json`,
+	}, db.JobEvent{Kind: "queued", Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent malformed global pin: %v", err)
+	}
+
+	var output bytes.Buffer
+	if err := reclaimTerminalTaskWorktrees(ctx, worker, "owner/repo", nil, newTickCandidates(store), &output); err != nil {
+		t.Fatalf("reclaimTerminalTaskWorktrees: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("globally pinned worktree was removed: %v", err)
+	}
+	if !strings.Contains(output.String(), "classification=active_owner") ||
+		!strings.Contains(output.String(), "malformed_non_final_job=malformed-global-pin") {
+		t.Fatalf("malformed global pin was not explained: %s", output.String())
 	}
 }
 

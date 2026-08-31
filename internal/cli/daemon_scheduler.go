@@ -193,6 +193,26 @@ func logTaskWorktreeReclaimFailure(stdout io.Writer, taskID string, path string,
 	}
 }
 
+func logTaskWorktreeRetention(stdout io.Writer, taskID string, path string, classification workflow.TaskWorktreeReclaimClassification, malformedJobID string) {
+	if classification == "" {
+		return
+	}
+	path = filepath.Clean(path)
+	key := path + "|retained|" + string(classification)
+	count, shouldLog := recordDelegationReclaimFailure(key, time.Now().UTC())
+	if !shouldLog {
+		return
+	}
+	detail := ""
+	if classification == workflow.TaskWorktreeReclaimActiveOwner && strings.TrimSpace(malformedJobID) != "" {
+		detail = " malformed_non_final_job=" + strings.TrimSpace(malformedJobID)
+	}
+	writeLine(stdout, "terminal task worktree retained task=%s path=%s classification=%s observation=%d%s", taskID, path, classification, count, detail)
+	if count == delegationReclaimFailureLogLimit {
+		writeLine(stdout, "terminal task worktree retention task=%s path=%s classification=%s reached %d observations; further identical retention messages are suppressed", taskID, path, classification, count)
+	}
+}
+
 func recordDelegationCleanupFailure(ctx context.Context, worker jobWorker, mode, phase, jobID, path string, err error, now time.Time) (db.CleanupObligation, error) {
 	reason := db.ClassifyCleanupObligationFailure(phase, err)
 	obligation, persistErr := worker.Store.RecordCleanupObligationFailure(
@@ -1172,9 +1192,16 @@ func reclaimTerminalTaskWorktrees(ctx context.Context, worker jobWorker, repoFil
 	if err != nil {
 		return err
 	}
+	if len(taskIDs) == 0 {
+		return nil
+	}
 	home := worker.workflowHome()
 	if strings.TrimSpace(home) == "" {
 		return errors.New("resolve Gitmoot home for terminal task worktree reclaim")
+	}
+	malformedJobID, malformedErr := worker.Store.FirstMalformedNonFinalJob(ctx)
+	if malformedErr != nil {
+		writeLine(stdout, "terminal task worktree reclaim could not identify malformed non-final owner: %v", malformedErr)
 	}
 	for _, taskID := range taskIDs {
 		task, err := worker.Store.GetTask(ctx, taskID)
@@ -1219,6 +1246,8 @@ func reclaimTerminalTaskWorktrees(ctx context.Context, worker jobWorker, repoFil
 			writeLine(stdout, "terminal task worktree reclaimed: task=%s path=%s classification=%s", task.ID, outcome.Path, outcome.Classification)
 		case outcome.Classification == workflow.TaskWorktreeReclaimUnremovable || outcome.Classification == workflow.TaskWorktreeReclaimPathMismatch:
 			writeLine(stdout, "terminal task worktree classified: task=%s path=%s classification=%s", task.ID, outcome.Path, outcome.Classification)
+		default:
+			logTaskWorktreeRetention(stdout, task.ID, outcome.Path, outcome.Classification, malformedJobID)
 		}
 	}
 	return nil

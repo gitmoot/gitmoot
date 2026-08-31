@@ -594,15 +594,29 @@ func (c Client) WorktreeHeadReachableFromRemote(ctx context.Context, path string
 	if _, err := worktree.run(ctx, "fetch", "--no-tags", "origin", "+"+remoteRef+":"+trackingRef); err != nil {
 		return false, err
 	}
+	return worktree.WorktreeHeadReachableFromRef(ctx, path, trackingRef)
+}
+
+// WorktreeHeadReachableFromRef performs the final local-only ancestry proof
+// after any remote refresh has completed.
+func (c Client) WorktreeHeadReachableFromRef(ctx context.Context, path string, ref string) (bool, error) {
+	path, err := validateWorktreePath(path)
+	if err != nil {
+		return false, err
+	}
+	if err := validateRef(ref); err != nil {
+		return false, err
+	}
+	worktree := NewClient(path, c.runner)
 	head, err := worktree.HeadSHA(ctx)
 	if err != nil {
 		return false, err
 	}
-	remoteHead, err := worktree.RevParse(ctx, trackingRef)
+	refHead, err := worktree.RevParse(ctx, ref)
 	if err != nil {
 		return false, err
 	}
-	return worktree.IsAncestor(ctx, head, remoteHead)
+	return worktree.IsAncestor(ctx, head, refHead)
 }
 
 func (c Client) StatusPorcelain(ctx context.Context) (string, error) {

@@ -39,6 +39,7 @@ type WritableWorktreeLineageManager interface {
 	WorktreeCleanAt(ctx context.Context, path string) (bool, error)
 	WorktreePristineAt(ctx context.Context, path string) (bool, error)
 	WorktreeHeadReachableFromRemote(ctx context.Context, path string, branch string) (bool, error)
+	WorktreeHeadReachableFromRef(ctx context.Context, path string, ref string) (bool, error)
 	RemoveWorktree(ctx context.Context, path string) error
 	DeleteBranch(ctx context.Context, branch string) error
 }
@@ -63,6 +64,8 @@ type TaskWorktreeReclaimOutcome struct {
 	Classification TaskWorktreeReclaimClassification
 	Path           string
 }
+
+const remoteWorktreeReachabilityTimeout = 2 * time.Minute
 
 // ReadOnlyWorktreeManager allocates and disposes throwaway detached worktrees
 // for read-only (ask/review) delegation fan-out. Unlike implement worktrees
@@ -1704,7 +1707,9 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 		if !clean {
 			return false, nil
 		}
-		reachable, err := manager.WorktreeHeadReachableFromRemote(ctx, path, payload.Branch)
+		probeCtx, cancelProbe := context.WithTimeout(ctx, remoteWorktreeReachabilityTimeout)
+		reachable, err := manager.WorktreeHeadReachableFromRemote(probeCtx, path, payload.Branch)
+		cancelProbe()
 		if err != nil {
 			return false, fmt.Errorf("prove aged terminal fix worktree head reachable from remote: %w", err)
 		}
@@ -1720,6 +1725,14 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 			return false, fmt.Errorf("recheck aged terminal fix worktree clean: %w", err)
 		}
 		if !clean {
+			return false, nil
+		}
+		trackingRef := "refs/remotes/origin/" + strings.TrimSpace(payload.Branch)
+		reachable, err = manager.WorktreeHeadReachableFromRef(ctx, path, trackingRef)
+		if err != nil {
+			return false, fmt.Errorf("recheck aged terminal fix worktree head reachable from remote: %w", err)
+		}
+		if !reachable {
 			return false, nil
 		}
 		if err := os.RemoveAll(path); err != nil {

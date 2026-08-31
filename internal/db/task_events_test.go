@@ -210,6 +210,13 @@ func TestTaskHasActiveWorktreeOwnerMatchesTaskOrPath(t *testing.T) {
 			t.Fatalf("TaskHasActiveWorktreeOwner(%q, %q) = %v, want %v", tc.taskID, tc.path, got, tc.want)
 		}
 	}
+	malformedJobID, err := store.FirstMalformedNonFinalJob(ctx)
+	if err != nil {
+		t.Fatalf("FirstMalformedNonFinalJob without active malformed payload: %v", err)
+	}
+	if malformedJobID != "" {
+		t.Fatalf("FirstMalformedNonFinalJob = %q before active malformed payload, want empty", malformedJobID)
+	}
 	if err := store.CreateJobWithEvent(ctx, Job{
 		ID: "malformed-active", Agent: "agent", Type: "implement", State: "queued", Payload: `not json at all`,
 	}, JobEvent{Kind: "queued", Message: "seed"}); err != nil {
@@ -221,5 +228,12 @@ func TestTaskHasActiveWorktreeOwnerMatchesTaskOrPath(t *testing.T) {
 	}
 	if !got {
 		t.Fatal("malformed non-final payload did not fail closed as an active owner")
+	}
+	malformedJobID, err = store.FirstMalformedNonFinalJob(ctx)
+	if err != nil {
+		t.Fatalf("FirstMalformedNonFinalJob: %v", err)
+	}
+	if malformedJobID != "malformed-active" {
+		t.Fatalf("FirstMalformedNonFinalJob = %q, want malformed-active", malformedJobID)
 	}
 }

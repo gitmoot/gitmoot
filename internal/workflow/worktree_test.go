@@ -1510,19 +1510,25 @@ func TestEngineReclaimAgedFixWorktreeKeepsLiveProcess(t *testing.T) {
 
 func TestEngineReclaimAgedFixWorktreeRequiresCleanRemoteReachableHead(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		clean        bool
-		reachable    bool
-		cleanErr     error
-		reachableErr error
-		want         bool
-		wantErr      string
+		name            string
+		clean           bool
+		reachable       bool
+		cleanErr        error
+		reachableErr    error
+		requireDeadline bool
+		refReachable    bool
+		refReachableSet bool
+		refReachableErr error
+		want            bool
+		wantErr         string
 	}{
 		{name: "dirty", clean: false, reachable: true},
 		{name: "unpushed head", clean: true, reachable: false},
 		{name: "clean probe error", cleanErr: errors.New("clean probe failed"), wantErr: "prove aged terminal fix worktree clean"},
 		{name: "reachability probe error", clean: true, reachableErr: errors.New("reachability probe failed"), wantErr: "head reachable from remote"},
-		{name: "clean pushed head", clean: true, reachable: true, want: true},
+		{name: "head changes after remote refresh", clean: true, reachable: true, refReachableSet: true, refReachable: false},
+		{name: "final reachability probe error", clean: true, reachable: true, refReachableErr: errors.New("final reachability probe failed"), wantErr: "recheck aged terminal fix worktree head reachable"},
+		{name: "clean pushed head", clean: true, reachable: true, requireDeadline: true, want: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -1556,12 +1562,16 @@ func TestEngineReclaimAgedFixWorktreeRequiresCleanRemoteReachableHead(t *testing
 				t.Fatalf("CreateJobWithEvent: %v", err)
 			}
 			manager := &fakeWorktreeManager{
-				cleanSet:     true,
-				clean:        tc.clean,
-				cleanErr:     tc.cleanErr,
-				reachableErr: tc.reachableErr,
-				ancestorSet:  true,
-				ancestor:     tc.reachable,
+				cleanSet:        true,
+				clean:           tc.clean,
+				cleanErr:        tc.cleanErr,
+				reachableErr:    tc.reachableErr,
+				requireDeadline: tc.requireDeadline,
+				refReachable:    tc.refReachable,
+				refReachableSet: tc.refReachableSet,
+				refReachableErr: tc.refReachableErr,
+				ancestorSet:     true,
+				ancestor:        tc.reachable,
 			}
 			engine := testEngine(store)
 			engine.Home = home
@@ -1692,6 +1702,10 @@ type fakeWorktreeManager struct {
 	cleanSet         bool
 	cleanErr         error
 	reachableErr     error
+	requireDeadline  bool
+	refReachable     bool
+	refReachableSet  bool
+	refReachableErr  error
 	cleanCalls       []string
 	ancestorCalls    [][2]string
 	calls            []worktreeCall
@@ -1786,6 +1800,11 @@ func (f *fakeWorktreeManager) WorktreePristineAt(ctx context.Context, path strin
 }
 
 func (f *fakeWorktreeManager) WorktreeHeadReachableFromRemote(ctx context.Context, path string, branch string) (bool, error) {
+	if f.requireDeadline {
+		if _, ok := ctx.Deadline(); !ok {
+			return false, errors.New("remote reachability probe has no deadline")
+		}
+	}
 	if f.reachableErr != nil {
 		return false, f.reachableErr
 	}
@@ -1798,6 +1817,24 @@ func (f *fakeWorktreeManager) WorktreeHeadReachableFromRemote(ctx context.Contex
 		return false, err
 	}
 	return f.IsAncestor(ctx, head, remoteHead)
+}
+
+func (f *fakeWorktreeManager) WorktreeHeadReachableFromRef(ctx context.Context, path string, ref string) (bool, error) {
+	if f.refReachableErr != nil {
+		return false, f.refReachableErr
+	}
+	if f.refReachableSet {
+		return f.refReachable, nil
+	}
+	head, err := f.HeadSHAAt(ctx, path)
+	if err != nil {
+		return false, err
+	}
+	refHead, err := f.RevParse(ctx, ref)
+	if err != nil {
+		return false, err
+	}
+	return f.IsAncestor(ctx, head, refHead)
 }
 
 func (f *fakeWorktreeManager) AddDetachedWorktree(_ context.Context, path string, ref string) error {

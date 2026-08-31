@@ -530,23 +530,28 @@ tracked, untracked, or ignored content. Removal is non-force and preserves the
 branch.
 
 A malformed payload on any non-final job also pins task worktrees because
-Gitmoot cannot prove that the job owns some other path.
+Gitmoot cannot prove that the job owns some other path. The bounded retention
+log names one malformed job responsible for this global safety pin.
 
 A worktree registered to an older checkout root is removed through the owner in
 its `.git` pointer. If that owner cannot inspect or remove it, Gitmoot records
 `terminal_worktree_unremovable` once instead of retrying every daemon tick.
+Retention decisions log three times per path and classification before
+identical messages are suppressed.
 
-`gitmoot doctor` reports `N stale worktrees / X GB under <home>/worktrees` and
-separates reclaimable final delegation owners, pinned non-final owners, and
-unproven directories. `/api/health` exposes the same metric and quarantined
-cleanup count in its top-level `worktrees` field.
+`gitmoot doctor` reports delegation worktrees only; ordinary task worktrees
+appear in the bounded `terminal task worktree retained` daemon lines instead.
+Doctor separates reclaimable final delegation owners, pinned non-final owners,
+and unproven directories. `/api/health` exposes the same delegation metric and
+quarantined cleanup count in its top-level `worktrees` field.
 
 `[workflow].delegation_worktree_ttl = "72h"` is default-on. After that grace
 period the daemon force-removes dirty terminal-owned read-only and delegation
 worktrees. For an independent fix clone, Gitmoot refreshes the recorded branch
-from its real `origin`, then requires a clean tree whose HEAD is reachable from
-that refreshed remote branch. A branch absent from `origin` keeps the clone
-without counting as a cleanup failure. A successful removal records
+from its real `origin` within a two-minute probe deadline, then requires a clean
+tree whose HEAD is still reachable from that refreshed remote branch immediately
+before removal. A branch absent from `origin` keeps the clone without counting
+as a cleanup failure. A successful removal records
 `delegation_worktree_reclaimed_ttl`. Set the TTL to `"0"` to disable this pass.
 Blocked, queued, and running owners remain pinned and are never force-removed.
 Candidate-local failures skip only that worktree, and later candidates continue.

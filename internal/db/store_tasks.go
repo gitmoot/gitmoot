@@ -269,6 +269,8 @@ var terminalTaskWorktreeStates = [...]string{
 
 var terminalTaskWorktreeStatePlaceholders = strings.TrimSuffix(strings.Repeat("?, ", len(terminalTaskWorktreeStates)), ", ")
 
+const nonFinalJobStatePredicate = "state NOT IN ('succeeded', 'failed', 'cancelled')"
+
 // IsTerminalTaskWorktreeState reports whether task worktree maintenance may
 // consider a lifecycle state terminal.
 func IsTerminalTaskWorktreeState(state string) bool {
@@ -335,7 +337,7 @@ func (s *Store) TaskHasActiveWorktreeOwner(ctx context.Context, taskID, path str
 	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
 		SELECT 1
 		FROM jobs
-		WHERE state NOT IN ('succeeded', 'failed', 'cancelled')
+		WHERE `+nonFinalJobStatePredicate+`
 		  AND CASE
 			WHEN NOT json_valid(payload) THEN 1
 			ELSE (
@@ -345,6 +347,22 @@ func (s *Store) TaskHasActiveWorktreeOwner(ctx context.Context, taskID, path str
 		  END
 	)`, strings.TrimSpace(taskID), strings.TrimSpace(path)).Scan(&active)
 	return active, err
+}
+
+// FirstMalformedNonFinalJob returns one job responsible for the global
+// fail-closed ownership pin, or an empty ID when no such job exists.
+func (s *Store) FirstMalformedNonFinalJob(ctx context.Context) (string, error) {
+	var id string
+	err := s.db.QueryRowContext(ctx, `SELECT id
+		FROM jobs
+		WHERE `+nonFinalJobStatePredicate+`
+		  AND NOT json_valid(payload)
+		ORDER BY id
+		LIMIT 1`).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
 }
 
 // CompleteTerminalTaskWorktreeReclaim clears the exact still-terminal task/path
