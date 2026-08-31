@@ -56,14 +56,6 @@ func TestEngineEmitsJobFinishedOnSucceededTerminal(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
-		RepoFullName:  "gitmoot/gitmoot",
-		Branch:        "task-9",
-		Owner:         "audit",
-		ActingOrgRole: "author",
-	}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
 	sink := &recordingSink{}
 	engine := testEngine(store)
 	engine.EventSink = sink
@@ -80,6 +72,7 @@ func TestEngineEmitsJobFinishedOnSucceededTerminal(t *testing.T) {
 		PullRequest:   42,
 		TaskID:        "task-9",
 		TaskTitle:     "Review",
+		LeadAgent:     "author",
 		ActingOrgRole: "reviewer",
 	}); err != nil {
 		t.Fatalf("Enqueue returned error: %v", err)
@@ -99,6 +92,9 @@ func TestEngineEmitsJobFinishedOnSucceededTerminal(t *testing.T) {
 	}
 	if ev.WakeTargetRole != "author" {
 		t.Fatalf("wake target role = %q, want author", ev.WakeTargetRole)
+	}
+	if got := ev.WakeTargetRoles; len(got) != 2 || got[0] != "reviewer" || got[1] != "author" {
+		t.Fatalf("wake target roles = %v, want [reviewer author]", got)
 	}
 	if ev.Cause != events.EventCauseReviewVerdict || ev.PullRequest != 42 || ev.ReviewDecision != "approved" {
 		t.Fatalf("review verdict metadata = %+v", ev)
@@ -203,6 +199,9 @@ func TestEngineReturnsChangesRequestedToRequesterWithoutDefaultAutoFix(t *testin
 		event.WakeTargetRole != "requester" ||
 		event.Detail != "one blocking issue" {
 		t.Fatalf("changes-requested verdict event = %+v", event)
+	}
+	if got := event.WakeTargetRoles; len(got) != 2 || got[0] != "requester" || got[1] != "author" {
+		t.Fatalf("wake target roles = %v, want [requester author]", got)
 	}
 }
 func TestEngineDoesNotClassifyNonReviewApprovedResult(t *testing.T) {
