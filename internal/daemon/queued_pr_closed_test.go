@@ -36,6 +36,15 @@ func TestPollOnceSupersedesQueuedLegsWhosePullRequestClosed(t *testing.T) {
 		}},
 		comments: map[int64][]github.IssueComment{9: {}},
 	}
+	// The recorded pull_requests row is the second instrument: it is what proves #7
+	// is a PULL REQUEST rather than an issue number that can never appear in a PR
+	// listing. #12 below deliberately has no row.
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo.FullName(), Number: 7, HeadBranch: "task-7", BaseBranch: "main",
+		HeadSHA: "head-seven", State: "closed",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest 7: %v", err)
+	}
 
 	seedQueuedJob(t, store, "stranded-review", "audit", "review", workflow.JobPayload{
 		Repo: repo.FullName(), Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "lead",
@@ -84,6 +93,19 @@ func TestPollOnceSupersedesQueuedLegsWhosePullRequestClosed(t *testing.T) {
 		Repo: repo.FullName(), Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "lead",
 		ParentJobID: "coordinator-job",
 	})
+	seedQueuedJob(t, store, "issue-ask-child", "audit", "ask", workflow.JobPayload{
+		// handleIssueAsk stores an ISSUE number in PullRequest, and delegationRequest
+		// copies it onto children, which get no `routed` event of their own. Issue #12
+		// can never appear in a PR listing, so "absent" says nothing about it.
+		Repo: repo.FullName(), Branch: "task-12", PullRequest: 12, TaskID: "task-12", LeadAgent: "lead",
+		ParentJobID: "issue-coordinator", DelegationID: "research",
+	})
+	seedQueuedJob(t, store, "cli-dispatched-review", "audit", "review", workflow.JobPayload{
+		// `gitmoot agent review ... --pr 7` enqueues with Sender "local" and no
+		// routed event: an operator asked for it by name.
+		Repo: repo.FullName(), Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "lead",
+		Sender: "local",
+	})
 
 	engine := workflow.Engine{Store: store}
 	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
@@ -107,6 +129,8 @@ func TestPollOnceSupersedesQueuedLegsWhosePullRequestClosed(t *testing.T) {
 		{"merge-back-summary", workflow.JobQueued, "a merge-back describes work that already ran"},
 		{"human-comment-ask", workflow.JobQueued, "an operator asked for it explicitly"},
 		{"coordinator-job/continuation", workflow.JobQueued, "a continuation synthesizes work that already happened"},
+		{"issue-ask-child", workflow.JobQueued, "issue #12 is not a pull request at all"},
+		{"cli-dispatched-review", workflow.JobQueued, "an operator dispatched it by name"},
 	} {
 		job, err := store.GetJob(ctx, tc.id)
 		if err != nil {
@@ -156,8 +180,47 @@ func TestPollOnceRoutesQueuedDelegationChildToTheChildPath(t *testing.T) {
 			t.Fatalf("UpsertAgent %s: %v", agent.Name, err)
 		}
 	}
-	// PR 7 is absent from the open listing: merged underneath its fan-out.
-	client := &fakeGitHub{pulls: nil, comments: map[int64][]github.IssueComment{}}
+	// PR 7 is absent from the open listing (merged underneath its fan-out) but IS a
+	// recorded pull request, which is what the sweep requires as positive evidence.
+	client := &fakeGitHub{
+		pulls:    nil,
+		comments: map[int64][]github.IssueComment{},
+		// reconcileExternallyMergedTasks looks these up for the seeded tasks.
+		// #7 is CLOSED WITHOUT MERGING, so the external-merge reconciler leaves
+		// task-7 alone and its coordinator is still legitimately advanceable. #8 is
+		// merged, which is what drives task-8 to `merged` before the sweep runs.
+		pullsByNumber: map[int64]github.PullRequest{
+			7: {Number: 7, State: "closed", HeadRef: "task-7", BaseRef: "main", HeadSHA: "head-seven"},
+			8: {Number: 8, State: "closed", HeadRef: "task-8", BaseRef: "main", HeadSHA: "head-eight", Merged: true},
+		},
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo.FullName(), Number: 7, HeadBranch: "task-7", BaseBranch: "main",
+		HeadSHA: "head-seven", State: "closed",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest 7: %v", err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo.FullName(), Number: 8, HeadBranch: "task-8", BaseBranch: "main",
+		HeadSHA: "head-eight", State: "closed",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest 8: %v", err)
+	}
+	// task-7 is still live, so its coordinator can legitimately be advanced.
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-7", RepoFullName: repo.FullName(), GoalID: "goal-1", Title: "Task 7",
+		State: string(workflow.TaskReviewing), Branch: "task-7",
+	}); err != nil {
+		t.Fatalf("UpsertTask task-7: %v", err)
+	}
+	// task-8 already MERGED. Advancing its coordinator would end in block_parent ->
+	// setTaskState(blocked), rewriting the one state the sweep's own premise asserts.
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-8", RepoFullName: repo.FullName(), GoalID: "goal-1", Title: "Task 8",
+		State: string(workflow.TaskMerged), Branch: "task-8",
+	}); err != nil {
+		t.Fatalf("UpsertTask task-8: %v", err)
+	}
 
 	coordinator := "review-coordinator/task-7/review-1"
 	coordinatorPayload, err := json.Marshal(workflow.JobPayload{
@@ -187,6 +250,31 @@ func TestPollOnceRoutesQueuedDelegationChildToTheChildPath(t *testing.T) {
 		Repo: repo.FullName(), Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "lead",
 		ParentJobID: "missing-coordinator", DelegationID: "security",
 	})
+	// A child of a coordinator whose task already MERGED: terminate it, but never
+	// drive an advance that would rewrite `merged` to `blocked`.
+	mergedCoordinator := "review-coordinator/task-8/review-1"
+	mergedCoordinatorPayload, err := json.Marshal(workflow.JobPayload{
+		Repo: repo.FullName(), Branch: "task-8", PullRequest: 8, TaskID: "task-8", LeadAgent: "lead",
+		Result: &workflow.AgentResult{
+			Decision: "approved",
+			Summary:  "fan out",
+			Delegations: []workflow.Delegation{
+				{ID: "correctness", Agent: "audit", Action: "review", Prompt: "review correctness"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(mergedCoordinator): %v", err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: mergedCoordinator, Agent: "coord", Type: "ask", State: string(workflow.JobSucceeded), Payload: string(mergedCoordinatorPayload),
+	}); err != nil {
+		t.Fatalf("CreateJob(mergedCoordinator): %v", err)
+	}
+	seedQueuedJob(t, store, mergedCoordinator+"/delegation/correctness", "audit", "review", workflow.JobPayload{
+		Repo: repo.FullName(), Branch: "task-8", PullRequest: 8, TaskID: "task-8", LeadAgent: "lead",
+		ParentJobID: mergedCoordinator, DelegationID: "correctness",
+	})
 
 	engine := workflow.Engine{Store: store}
 	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
@@ -203,6 +291,7 @@ func TestPollOnceRoutesQueuedDelegationChildToTheChildPath(t *testing.T) {
 	}{
 		{coordinator + "/delegation/correctness", workflow.JobFailed, "a cancelled child cannot advance its coordinator"},
 		{"missing-coordinator/delegation/security", workflow.JobCancelled, "an orphaned child has no coordinator to release"},
+		{mergedCoordinator + "/delegation/correctness", workflow.JobCancelled, "advancing a merged task's coordinator would rewrite merged to blocked"},
 	} {
 		job, err := store.GetJob(ctx, tc.id)
 		if err != nil {
@@ -224,6 +313,16 @@ func TestPollOnceRoutesQueuedDelegationChildToTheChildPath(t *testing.T) {
 		if legible != 1 {
 			t.Fatalf("%s %s events = %d, want 1", tc.id, workflow.JobEventSupersededPullRequestClosed, legible)
 		}
+	}
+
+	// The merged task must still be merged: the sweep's premise is that the PR
+	// merged, so undoing that state is the one outcome it can never be allowed.
+	merged, err := store.GetTask(ctx, "task-8")
+	if err != nil {
+		t.Fatalf("GetTask(task-8): %v", err)
+	}
+	if merged.State != string(workflow.TaskMerged) {
+		t.Fatalf("task-8 state = %q, want merged", merged.State)
 	}
 }
 

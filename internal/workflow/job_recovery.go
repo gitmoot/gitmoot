@@ -375,60 +375,76 @@ func CancelJob(ctx context.Context, store *db.Store, jobID string) (db.Job, erro
 		}
 		return db.Job{}, fmt.Errorf("job %s is %s; cancel requires queued, running or blocked", latest.ID, latest.State)
 	}
-	// Best-effort: release any resource locks the cancelled job still owns (e.g. a
-	// stranded runtime-session lock whose deferred release never ran because the
-	// job was killed) so the next job on that runtime session does not wait out
-	// the full lock TTL. This only makes the existing TTL-based reaper release
-	// happen sooner for a cancelled job — the same brief same-session window
-	// already exists when a long-running job's lock TTL lapses while its runtime
-	// is still in flight; cancelling signals intent to abandon the job. A fully
-	// race-free release would have to reap the runtime process first (separate,
-	// larger change). We swallow the error on purpose: lock cleanup is incidental
-	// and must never make a successful cancel fail.
+	releaseAbortedJobResources(ctx, store, job, abortCauseCancel)
+	return store.GetJob(ctx, job.ID)
+}
+
+// abortCause names why a job is being ended outside its terminal engine path. It
+// exists only so the audit messages keep saying what actually happened: a cancel
+// reads "on cancel", a supersede reads "on supersede", and neither pretends to be
+// the other.
+type abortCause struct {
+	verb string
+	noun string
+}
+
+var (
+	abortCauseCancel    = abortCause{verb: "cancel", noun: "cancellation"}
+	abortCauseSupersede = abortCause{verb: "supersede", noun: "supersession"}
+)
+
+// releaseAbortedJobResources runs the best-effort cleanups a job that dies BEFORE
+// its terminal engine path owes: the resource locks it still holds, its
+// per-delegation branch lock, its task lane lock, and its dispatch-time read-only
+// worktree. Every one is swallowed on error, because incidental cleanup must never
+// roll back a successful abort — but skipping them leaks locks that block the next
+// same-repo work, so any path that ends a job outside AdvanceJob has to call this.
+func releaseAbortedJobResources(ctx context.Context, store *db.Store, job db.Job, cause abortCause) {
+	// A stranded runtime-session lock whose deferred release never ran would
+	// otherwise make the next job on that session wait out the full TTL. This only
+	// makes the existing TTL-based reaper release happen sooner: the same brief
+	// same-session window already exists when a long-running job's lock TTL lapses
+	// while its runtime is still in flight, and abandoning the job signals intent.
 	_, _ = store.DeleteResourceLocksByOwner(ctx, job.ID)
-	// Best-effort: an implement delegation leg cancelled here never runs the engine's
-	// terminal cleanupImplementDelegationWorktree (that fires from AdvanceJob, which a
-	// cancel bypasses), so its per-delegation branch lock would otherwise leak exactly
-	// like the success path did before #617. Release it symmetric with
-	// AllocateDelegationWorktree's CreateLock so a cancelled burst does not strand
-	// gitmoot-delegation-* locks that block the next same-repo orchestration. Gated to
-	// worktree-isolated implement legs and swallowed on error: lock cleanup is
-	// incidental and must never make a successful cancel fail.
-	if payload, perr := unmarshalPayload(job.Payload); perr == nil {
-		if released, rerr := releaseDelegationBranchLock(ctx, store, job.Type, payload); rerr == nil && released {
-			_ = store.AddJobEvent(ctx, db.JobEvent{
-				JobID:   job.ID,
-				Kind:    "delegation_branch_lock_released",
-				Message: fmt.Sprintf("released delegation branch lock %s on cancel (#617)", strings.TrimSpace(payload.Branch)),
-			})
-		}
-		// A top-level task implement owns the task lane rather than an ephemeral
-		// delegation lane. Leave task dismissal to the stale-task reconciler, which
-		// owns remote cleanup and the task_dismissed_auto audit event. Cancellation
-		// excludes only this exact implementing task from the atomic release check;
-		// every other task, every unknown/review state, and every non-terminal job
-		// still vetoes. Best-effort cleanup must not roll back a successful cancel.
-		if job.Type == "implement" && strings.TrimSpace(payload.TaskID) != "" && strings.TrimSpace(payload.DelegationID) == "" {
-			repo := strings.TrimSpace(payload.Repo)
-			branch := strings.TrimSpace(payload.Branch)
-			if repo != "" && branch != "" {
-				if lock, lerr := store.GetBranchLock(ctx, repo, branch); lerr == nil {
-					if released, rerr := store.ReleaseBranchLockIfInactiveWithEvent(ctx, lock, strings.TrimSpace(payload.TaskID), time.Time{}, db.BranchLockEvent{
-						Kind: "released", Message: "released after task implement cancellation left no non-terminal branch work (#1565)",
-					}); rerr == nil && released {
-						_ = store.AddJobEvent(ctx, db.JobEvent{
-							JobID: job.ID, Kind: "task_lane_lock_released",
-							Message: fmt.Sprintf("released task lane lock %s on cancel (#1565)", branch),
-						})
-					}
+	payload, perr := unmarshalPayload(job.Payload)
+	if perr != nil {
+		return
+	}
+	// An implement delegation leg that dies here never runs the engine's terminal
+	// cleanupImplementDelegationWorktree (that fires from AdvanceJob), so its
+	// per-delegation branch lock would leak exactly like the success path did before
+	// #617. Gated to worktree-isolated implement legs.
+	if released, rerr := releaseDelegationBranchLock(ctx, store, job.Type, payload); rerr == nil && released {
+		_ = store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "delegation_branch_lock_released",
+			Message: fmt.Sprintf("released delegation branch lock %s on %s (#617)", strings.TrimSpace(payload.Branch), cause.verb),
+		})
+	}
+	// A top-level task implement owns the task lane rather than an ephemeral
+	// delegation lane. Task dismissal stays with the stale-task reconciler, which
+	// owns remote cleanup and the audit event; this excludes only this exact
+	// implementing task from the atomic release check, and every other task, every
+	// unknown/review state and every non-terminal job still vetoes.
+	if job.Type == "implement" && strings.TrimSpace(payload.TaskID) != "" && strings.TrimSpace(payload.DelegationID) == "" {
+		repo := strings.TrimSpace(payload.Repo)
+		branch := strings.TrimSpace(payload.Branch)
+		if repo != "" && branch != "" {
+			if lock, lerr := store.GetBranchLock(ctx, repo, branch); lerr == nil {
+				if released, rerr := store.ReleaseBranchLockIfInactiveWithEvent(ctx, lock, strings.TrimSpace(payload.TaskID), time.Time{}, db.BranchLockEvent{
+					Kind: "released", Message: fmt.Sprintf("released after task implement %s left no non-terminal branch work (#1565)", cause.noun),
+				}); rerr == nil && released {
+					_ = store.AddJobEvent(ctx, db.JobEvent{
+						JobID: job.ID, Kind: "task_lane_lock_released",
+						Message: fmt.Sprintf("released task lane lock %s on %s (#1565)", branch, cause.verb),
+					})
 				}
 			}
 		}
-		// Symmetric with the branch-lock release above: dispose a #739 dispatch-time
-		// read-only worktree that this cancel-before-run would otherwise leak.
-		recordReadOnlyWorktreeReclaimOnAbort(ctx, store, job, payload)
 	}
-	return store.GetJob(ctx, job.ID)
+	// Dispose a #739 dispatch-time read-only worktree that dying before running
+	// would otherwise leak.
+	recordReadOnlyWorktreeReclaimOnAbort(ctx, store, job, payload)
 }
 
 func SupersedeStaleHeadJob(ctx context.Context, store *db.Store, jobID string, reason string) (db.Job, bool, error) {
@@ -520,11 +536,12 @@ func SupersedeClosedPullRequestJob(ctx context.Context, store *db.Store, jobID s
 		}
 		return latest, false, nil
 	}
-	// Same symmetry as CancelJob and SupersedeStaleHeadJob: a job that carried a
-	// dispatch-time read-only worktree must not leak it when it dies before running.
-	if payload, perr := unmarshalPayload(job.Payload); perr == nil {
-		recordReadOnlyWorktreeReclaimOnAbort(ctx, store, job, payload)
-	}
+	// A queued job dying here owes the SAME cleanups a cancel does — resource locks,
+	// a per-delegation branch lock, the task lane lock, a dispatch-time read-only
+	// worktree. Copying only the worktree half (the shape SupersedeStaleHeadJob
+	// carries, where the targeted review legs hold none of the others) would leak
+	// locks that block the next same-repo work.
+	releaseAbortedJobResources(ctx, store, job, abortCauseSupersede)
 	updated, err := store.GetJob(ctx, job.ID)
 	return updated, true, err
 }
@@ -566,6 +583,6 @@ func (e Engine) FinalizeClosedPullRequestDelegationChild(ctx context.Context, jo
 	if !transitioned {
 		return false, nil
 	}
-	recordReadOnlyWorktreeReclaimOnAbort(ctx, e.Store, job, payload)
+	releaseAbortedJobResources(ctx, e.Store, job, abortCauseSupersede)
 	return e.FinalizeTimedOutDelegationChild(ctx, job.ID, reason)
 }
