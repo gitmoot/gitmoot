@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -711,6 +712,41 @@ func TestReclaimTerminalTaskWorktreesNamesMalformedGlobalPin(t *testing.T) {
 	if !strings.Contains(output.String(), "classification=active_owner") ||
 		!strings.Contains(output.String(), "malformed_non_final_job=malformed-global-pin") {
 		t.Fatalf("malformed global pin was not explained: %s", output.String())
+	}
+}
+
+func TestTerminalTaskReclaimMemoizesMalformedOwnerAcrossRepos(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "cross-repo-candidate", RepoFullName: "owner/other", State: string(workflow.TaskDismissed), WorktreePath: "/worktrees/cross-repo-candidate",
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: "cross-repo-malformed", Agent: "agent", Type: "implement", State: "queued", Payload: `not json`,
+	}, db.JobEvent{Kind: "queued", Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+	counter := &countingCandidateStore{inner: store}
+	candidates := newTickCandidates(counter)
+	worker := defaultJobWorker(store, io.Discard, home)
+	for _, repo := range []string{"owner/one", "owner/two"} {
+		if err := reclaimTerminalTaskWorktrees(ctx, worker, repo, "", nil, candidates, io.Discard); err != nil {
+			t.Fatalf("reclaimTerminalTaskWorktrees(%s): %v", repo, err)
+		}
+	}
+	if got := atomic.LoadInt32(&counter.taskReclaim); got != 1 {
+		t.Fatalf("terminal task query ran %d times across repos, want 1", got)
+	}
+	if got := atomic.LoadInt32(&counter.malformedOwner); got != 1 {
+		t.Fatalf("malformed owner query ran %d times across repos, want 1", got)
 	}
 }
 
