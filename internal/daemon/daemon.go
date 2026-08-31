@@ -1325,35 +1325,57 @@ func workflowReviewJobMatchesPull(repoFullName string, pull github.PullRequest, 
 }
 
 // lookupReadyPullRequestTask resolves the task driving a pull request for the
-// ready-to-merge path. It prefers the branch-keyed lookup every other caller
-// uses, then falls back to the durable review-pr-<number>-<hash> id for a
-// BRANCHLESS local review task (#1562). Without the fallback a task released from
-// a transient merge-gate block is never re-evaluated, because a branchless row is
-// invisible to a pull.HeadRef lookup — the release would restore an operator exit
-// (`task resume-work` accepts ready_to_merge) and nothing else.
+// ready-to-merge path. Two rows can legitimately describe one PR: the implement
+// task that owns (repo, head branch), and a BRANCHLESS local review task keyed by
+// its durable review-pr-<number>-<hash> id. A branchless row is invisible to a
+// pull.HeadRef lookup, so without the fallback a task released from a transient
+// merge-gate block is never re-evaluated and the release restores an operator exit
+// (`task resume-work` accepts ready_to_merge) and nothing else (#1562).
+//
+// Selection prefers a candidate that is ACTUALLY ready_to_merge, because a
+// branch-first lookup strands the released review task whenever its branch has a
+// canonical implementation task in some other state — a supported coexistence.
+// When both are ready, or neither is, the branch-keyed row wins, so this differs
+// from the previous behaviour in exactly one case: the branch owner is not ready
+// and a branchless review task is.
 //
 // The fallback is deliberately scoped to this path rather than widened into
 // lookupPullRequestTask, whose other callers reason about branch-owned work.
 func (d Daemon) lookupReadyPullRequestTask(ctx context.Context, pull github.PullRequest) (db.Task, error) {
-	task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
-	if err == nil {
-		return task, nil
+	branchTask, branchErr := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	if branchErr != nil && !errors.Is(branchErr, sql.ErrNoRows) {
+		return db.Task{}, branchErr
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return db.Task{}, err
+	branchFound := branchErr == nil
+	if branchFound && branchTask.State == string(workflow.TaskReadyToMerge) {
+		return branchTask, nil
 	}
 	tasks, listErr := d.Store.ListTasksByRepo(ctx, d.Repo.FullName())
 	if listErr != nil {
 		return db.Task{}, listErr
 	}
+	var branchless db.Task
+	var branchlessFound bool
 	for _, candidate := range tasks {
 		if strings.TrimSpace(candidate.Branch) != "" {
 			continue
 		}
 		number, ok := reviewTaskPullRequestNumber(candidate.ID)
-		if ok && number == pull.Number {
+		if !ok || number != pull.Number {
+			continue
+		}
+		if candidate.State == string(workflow.TaskReadyToMerge) {
 			return candidate, nil
 		}
+		if !branchlessFound {
+			branchless, branchlessFound = candidate, true
+		}
+	}
+	if branchFound {
+		return branchTask, nil
+	}
+	if branchlessFound {
+		return branchless, nil
 	}
 	return db.Task{}, sql.ErrNoRows
 }

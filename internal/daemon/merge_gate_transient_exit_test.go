@@ -174,6 +174,80 @@ func TestSecondPollEvaluatesGateAfterTransientRelease(t *testing.T) {
 	}
 }
 
+// TestSecondPollEvaluatesGateWhenBranchOwnerIsNotReady is the two-row form of the
+// release direction, and it is the shape production actually has. Two rows
+// legitimately describe one PR: the implement task owning (repo, head branch), and
+// the branchless local review task keyed by its durable id. That coexistence is
+// already modeled at external_merge_reconcile_test.go:190-196.
+//
+// A branch-FIRST ready lookup strands the released review task here: it finds the
+// implementation task, sees pull_request_open, reports not-ready, and performs zero
+// merge-gate evaluations, so the transient release is again a state change nothing
+// consumes. The one-row fixture cannot see this, which is why it passed against
+// the branch-first version at head 9ba794d8.
+//
+// Mutant M4 ("branch owner wins"): in lookupReadyPullRequestTask, return branchTask
+// whenever branchFound, before the branchless scan. Only this test fails; the
+// single-row two-poll test still passes.
+func TestSecondPollEvaluatesGateWhenBranchOwnerIsNotReady(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	pull := seedBlockedReviewTask(t, store, repo, workflow.MergeBlockTransient, "local worktree is not clean")
+	// The implement task owns the unique (repo, branch) slot and is NOT ready.
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "implementation-task",
+		RepoFullName: repo.FullName(),
+		GoalID:       "goal-1699",
+		Title:        "Implement 1699",
+		State:        string(workflow.TaskPullRequestOpen),
+		Branch:       "task-1699",
+	}); err != nil {
+		t.Fatalf("UpsertTask(implementation-task) returned error: %v", err)
+	}
+	daemon, gate := blockedReviewTaskDaemon(t, store, repo, pull)
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("poll 1 PollOnce returned error: %v", err)
+	}
+	review, err := store.GetTask(ctx, "review-pr-1699-3f3a1026")
+	if err != nil {
+		t.Fatalf("GetTask(review) after poll 1 returned error: %v", err)
+	}
+	if review.State != string(workflow.TaskReadyToMerge) {
+		t.Fatalf("poll 1 review task state = %q, want ready_to_merge", review.State)
+	}
+
+	ready, err := daemon.pullRequestReadyToMerge(ctx, pull)
+	if err != nil {
+		t.Fatalf("pullRequestReadyToMerge returned error: %v", err)
+	}
+	if !ready {
+		t.Fatalf("pullRequestReadyToMerge = false: the released review task is hidden by the non-ready branch owner")
+	}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("poll 2 PollOnce returned error: %v", err)
+	}
+	if len(gate.requests) == 0 {
+		t.Fatalf("merge gate evaluations after release = 0, want the released review task re-evaluated despite the branch owner")
+	}
+	for _, request := range gate.requests {
+		if request.TaskID != "review-pr-1699-3f3a1026" {
+			t.Fatalf("merge gate evaluated task %q, want the released review task, never the branch owner", request.TaskID)
+		}
+	}
+	// The implementation task must be untouched: this path may not advance work it
+	// does not own.
+	implementation, err := store.GetTask(ctx, "implementation-task")
+	if err != nil {
+		t.Fatalf("GetTask(implementation-task) returned error: %v", err)
+	}
+	if implementation.State != string(workflow.TaskPullRequestOpen) {
+		t.Fatalf("implementation task state = %q, want pull_request_open left alone", implementation.State)
+	}
+}
+
 // TestPollOnceLeavesQualityBlockedReviewTaskBlocked is the direction that stops
 // the obvious wrong fix. An authoritative quality rejection must stay blocked.
 //
