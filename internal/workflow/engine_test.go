@@ -1871,8 +1871,8 @@ func TestRecordFoldedReviewOutcomeExclusionsSurviveTheHoist(t *testing.T) {
 // stale-review-round return, so a stale round records its own folded outcome
 // where previously it recorded nothing. That is defensible — the event is a fact
 // about THAT job's verdict, not about whether its round is current — but it is
-// only safe if it cannot buy merge eligibility. This pins that: a superseded
-// review carrying the event must still not satisfy the gate.
+// only safe if it cannot buy merge eligibility. This enters through AdvanceJob
+// to pin both the hoisted write and the gate's rejection of the superseded round.
 func TestStaleRoundOutcomeEventDoesNotGrantMergeEligibility(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -1888,23 +1888,23 @@ func TestStaleRoundOutcomeEventDoesNotGrantMergeEligibility(t *testing.T) {
 	}
 	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-stale", Agent: "audit", Type: "review"}, stale)
 
-	// The stale round records its outcome under the hoisted write.
-	if err := engine.recordFoldedReviewOutcome(ctx,
-		db.Job{ID: "review-stale", Agent: "audit", Type: "review"}, stale); err != nil {
-		t.Fatalf("recordFoldedReviewOutcome returned error: %v", err)
-	}
-	if got := countJobEvents(t, store, "review-stale", ReviewApprovedWithNotesEventKind); got != 1 {
-		t.Fatalf("%s events = %d, want 1", ReviewApprovedWithNotesEventKind, got)
-	}
-
-	// A LATER round from the same reviewer supersedes it with a real blocking
-	// verdict. The gate must block despite the stale round's recorded fold.
+	// A LATER round from the same reviewer makes review-1 stale before AdvanceJob
+	// sees it and supersedes it with a real blocking verdict.
 	current := stale
 	current.ReviewRound = "review-2"
 	current.Result = &AgentResult{
 		Decision: "changes_requested", Severity: reviewseverity.P0, Summary: "blocking now",
 	}
 	insertCompletedJob(t, store, db.Job{ID: "review-current", Agent: "audit", Type: "review"}, current)
+
+	// AdvanceJob must still record the stale round's folded outcome before taking
+	// its stale-round return.
+	if err := engine.AdvanceJob(ctx, "review-stale"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	if got := countJobEvents(t, store, "review-stale", ReviewApprovedWithNotesEventKind); got != 1 {
+		t.Fatalf("%s events = %d, want 1", ReviewApprovedWithNotesEventKind, got)
+	}
 
 	err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
 		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "audit",
