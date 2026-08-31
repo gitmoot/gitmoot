@@ -6,11 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/events"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
@@ -856,11 +856,7 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 	}
 	cfg, _ := loadMergeGateOrgConfig(g.Home)
 	from, fromDeclared := mergeGateEscalationFrom(cfg, request.Repo)
-	rules, err := g.Store.ListEventRules(ctx)
-	if err != nil {
-		return fmt.Errorf("resolve merge-gate escalation routes: %w", err)
-	}
-	to := mergeGateEscalationTo(cfg, from, fromDeclared, rules)
+	to := mergeGateEscalationTo(cfg, from, fromDeclared)
 	body := workflow.FormatOrgEscalateNote(from, to, label, reason.Render())
 	if body == "" {
 		return errors.New("format merge-gate escalation note")
@@ -869,11 +865,10 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 	if !parsed {
 		return errors.New("parse merge-gate escalation note")
 	}
-	// DEDUP IS ROUTE-INDEPENDENT ON PURPOSE. The recipient is now derived from the
-	// chart and from mutable event-rule state, so comparing whole bodies would let
-	// one gate miss escalate again the moment routing changes between ticks, leaving
-	// two open escalations addressed to two roles for one miss. The identity of an
-	// escalation is who raised it, for which workflow, about what.
+	// DEDUP IS ROUTE-INDEPENDENT ON PURPOSE. Comparing whole bodies once meant a
+	// changed recipient re-escalated the same miss, leaving two open escalations
+	// addressed to two roles. The identity of an escalation is who raised it, for
+	// which workflow, about what.
 	notes, err := g.Store.ListWorkflowNotes(ctx, label, 0)
 	if err != nil {
 		return err
@@ -890,6 +885,31 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 		AddressedTarget: addressedTarget,
 	}); err != nil {
 		return fmt.Errorf("record merge-gate escalation: %w", err)
+	}
+	// An escalation nobody can receive must be VISIBLE rather than rerouted: the
+	// chart names who is accountable, and quietly waking somebody else would hide
+	// an unseated role instead of reporting it.
+	rules, err := g.Store.ListEventRules(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve merge-gate escalation routes: %w", err)
+	}
+	blocker := mergeGateEscalationUnreachable(cfg, rules, to, time.Now().UTC())
+	if blocker == "" {
+		return nil
+	}
+	warning := fmt.Sprintf(
+		"merge-gate escalation for %s is addressed to org role %q, which %s; it will not wake anyone until that is fixed",
+		label, to, blocker,
+	)
+	for _, note := range notes {
+		if note.Body == warning {
+			return nil
+		}
+	}
+	if _, err := g.Store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: label, Author: from, Body: warning, Repo: request.Repo,
+	}); err != nil {
+		return fmt.Errorf("record merge-gate escalation routing warning: %w", err)
 	}
 	return nil
 }
@@ -919,21 +939,26 @@ func mergeGateEscalationFrom(cfg config.OrgConfig, repo string) (string, bool) {
 	return "gitmoot", false
 }
 
-// mergeGateEscalationTo resolves the role that must ACT on a gate miss, and it
-// must resolve to somebody a wake can actually reach. Before #1727 the recipient
-// was the literal "jarvis", so every engine escalation bypassed the chart; the
-// chart answer is the nearest ancestor, which is the same upward rule org escalate
-// enforces on the CLI path (it refuses a --to outside cfg.Ancestors(from)).
+// mergeGateEscalationTo resolves the role that must ACT on a gate miss: the
+// nearest ancestor of the escalating role. That is the same upward rule org
+// escalate enforces on the CLI path (it refuses a --to outside cfg.Ancestors),
+// and before #1727 it was the literal "jarvis", so every engine escalation
+// bypassed the chart.
 //
-// An ancestor with no wake route is a note nobody receives: an unmatched outbox
-// row is inert and is never expired. So the nearest ancestor is preferred, the
-// climb continues to the first ancestor that can be woken, and the nearest one is
-// kept only when nobody in the chain can be.
+// IT DOES NOT PREDICT DELIVERABILITY, DELIBERATELY (#1728 review, P1b). Two
+// rounds tried: first asking for an escalation-kind route, which delivery never
+// demands, then asking with an event missing the JobID a MatchFilter is tested
+// against. Both disagreed with the drain, and pane resolvability -- the next
+// input -- cannot be predicted at all, because a pane can vanish between this
+// write and the delivery attempt. Rerouting on a guess also moves accountability:
+// an operator seating a role would silently change who owns a gate miss. The
+// chart answer is stable, and an unroutable recipient is surfaced instead
+// (mergeGateEscalationUnroutable) rather than quietly reassigned.
 //
 // ValidateOrg admits exactly one root and requires it be named "owner"
 // (config/org.go), so the unplaced-sender case is that constant rather than a
 // Roots() lookup; if that invariant is ever relaxed, this returns the wrong role.
-func mergeGateEscalationTo(cfg config.OrgConfig, from string, fromDeclared bool, rules []db.EventRule) string {
+func mergeGateEscalationTo(cfg config.OrgConfig, from string, fromDeclared bool) string {
 	if !fromDeclared {
 		return orgChartRootRole
 	}
@@ -944,37 +969,36 @@ func mergeGateEscalationTo(cfg config.OrgConfig, from string, fromDeclared bool,
 		// higher role to name and a note addressed anywhere else would be a guess.
 		return from
 	}
-	for _, ancestor := range ancestors {
-		if mergeGateEscalationDeliverable(rules, ancestor) {
-			return ancestor
-		}
-	}
 	return ancestors[0]
 }
 
 // orgChartRootRole is the single root name ValidateOrg admits.
 const orgChartRootRole = "owner"
 
-// mergeGateEscalationDeliverable asks the DELIVERY matcher itself, rather than
-// restating its rule. A previous round asked whether the role had an on=escalation
-// route, which sounds right and is wrong: wakeOutboxKindForSource derives a
-// workflow-note row's kind from the SOURCE, so this note is delivered as a reply
-// regardless of any wake kind on the note (#1728 review). Reusing matchingWakeRules
-// keeps that answer correct if the derivation ever changes, and carries its
-// MatchFilter semantics for free -- a filtered rule cannot match the empty-repo
-// event a workflow-note wake builds.
-func mergeGateEscalationDeliverable(rules []db.EventRule, role string) bool {
-	kind, ok := wakeOutboxKindForSource(db.WakeOutboxSourceWorkflowNote, wakeOutboxNoteCoalesceKey(role))
-	if !ok {
-		return false
+// mergeGateEscalationUnreachable names a DEFINITE, statically visible reason an
+// addressed note to role cannot be delivered, or "" when none is visible. It
+// informs an operator note and NEVER chooses the recipient.
+//
+// It asks about routes with the event the drain itself builds, so it cannot
+// disagree with delivery about MatchFilter the way a hand-rolled predicate did
+// (#1728 review, P1a).
+//
+// IT IS NOT A REACHABILITY GUARANTEE and "" must not be read as one: a role with
+// a route and a non-empty binding still parks as stalled if that binding no
+// longer resolves to a live pane. That case (#1728 review, P1b) is NOT fixed by
+// this function.
+func mergeGateEscalationUnreachable(cfg config.OrgConfig, rules []db.EventRule, role string, now time.Time) string {
+	if len(matchingWakeRules(rules, addressedNoteWakeEvent(role, "", "", now))) == 0 {
+		return fmt.Sprintf("has no enabled wake route; seat it with gitmoot org seat add %s --pane ID_OR_LABEL", role)
 	}
-	return len(matchingWakeRules(rules, events.Event{WakeKind: kind, WakeTargetRole: strings.ToLower(strings.TrimSpace(role))})) != 0
-}
-
-// wakeOutboxNoteCoalesceKey mirrors db's key composition for an addressed note
-// wake, which is what wakeOutboxKindForSource inspects.
-func wakeOutboxNoteCoalesceKey(role string) string {
-	return db.WakeOutboxKindReply + ":" + strings.ToLower(strings.TrimSpace(role))
+	declared, ok := cfg.Role(role)
+	if !ok {
+		return "is not declared in the org chart"
+	}
+	if strings.TrimSpace(declared.Pane) == "" {
+		return fmt.Sprintf("has no pane binding, so its wake parks as stalled; bind it with gitmoot org seat add %s --pane ID_OR_LABEL", role)
+	}
+	return ""
 }
 
 func repoOrgOwner(cfg config.OrgConfig, repo string) (string, bool) {
