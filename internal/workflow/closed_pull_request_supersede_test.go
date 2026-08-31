@@ -211,25 +211,38 @@ func insertQueuedJob(t *testing.T, store *db.Store, job db.Job, payload JobPaylo
 // the PR's headline case, driven through the real fan-out route. A review fan-out
 // on a pull request that has since MERGED leaves queued children; the sweep must be
 // able to hand each one to the coordinator-releasing path without the parent's
-// failure_policy rewriting `merged` to `blocked` on the way (#1673).
+// failure_policy overwriting `merged` on the way (#1673).
 //
 // It asserts on the PARENT, not just the child: under the default block_parent the
 // coordinator's policy runs to its own decision (a BlockedError naming the closed
-// PR) while the task stays merged, and under `continue` the coordinator continuation
+// PR) while the task stays merged, under `continue` the coordinator continuation
 // job is actually minted — the row that read ErrNoRows while the sweep was refusing
-// to route these children at all.
+// to route these children at all — and under `escalate_human` the pause surfaces an
+// AwaitingHumanError while the task stays merged.
+//
+// escalate_human is here because it is this change's OWN new edge: routing the
+// queued child to the finalizer instead of cancelling it is what first makes
+// pauseAwaitingHuman -> setTaskState(TaskAwaitingHuman) reachable on a merged task,
+// so a refusal scoped to `blocked` alone would leave the regression fully open
+// through the escalation door.
 func TestFinalizeClosedPullRequestDelegationChildOfMergedTaskReleasesCoordinator(t *testing.T) {
 	for _, tc := range []struct {
 		policy string
 		// wantBlocked is the block_parent contract: the parent's policy surfaces a
 		// BlockedError, which is the DAG deciding, not the sweep failing.
 		wantBlocked bool
+		// wantAwaitingHuman is the escalate_human contract: the parent pauses with an
+		// AwaitingHumanError and enqueues no continuation.
+		wantAwaitingHuman bool
 		// wantContinuation is the coordinator continuation the `continue` policy
 		// mints once every delegation is resolved.
 		wantContinuation bool
+		// wantRefusal is whether the policy attempted a write over `merged` at all.
+		wantRefusal bool
 	}{
-		{policy: "", wantBlocked: true},
+		{policy: "", wantBlocked: true, wantRefusal: true},
 		{policy: "continue", wantContinuation: true},
+		{policy: "escalate_human", wantAwaitingHuman: true, wantRefusal: true},
 	} {
 		name := tc.policy
 		if name == "" {
@@ -279,6 +292,7 @@ func TestFinalizeClosedPullRequestDelegationChildOfMergedTaskReleasesCoordinator
 				finalized, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, child,
 					"queued review job superseded: gitmoot/gitmoot pull request #7 is no longer open")
 				var blocked BlockedError
+				var awaiting AwaitingHumanError
 				switch {
 				case tc.wantBlocked:
 					if !errors.As(err, &blocked) {
@@ -286,6 +300,13 @@ func TestFinalizeClosedPullRequestDelegationChildOfMergedTaskReleasesCoordinator
 					}
 					if !strings.Contains(blocked.Reason, "pull request #7 is no longer open") {
 						t.Fatalf("blocked reason = %q, want the closed PR named", blocked.Reason)
+					}
+				case tc.wantAwaitingHuman:
+					if !errors.As(err, &awaiting) {
+						t.Fatalf("finalize %s error = %v, want an AwaitingHumanError from the parent's escalate_human policy", child, err)
+					}
+					if !strings.Contains(awaiting.Reason, "pull request #7 is no longer open") {
+						t.Fatalf("awaiting_human reason = %q, want the closed PR named", awaiting.Reason)
 					}
 				case err != nil:
 					t.Fatalf("finalize %s returned error: %v", child, err)
@@ -335,29 +356,29 @@ func TestFinalizeClosedPullRequestDelegationChildOfMergedTaskReleasesCoordinator
 					t.Fatalf("continuation state = %q, want queued", continuation.State)
 				}
 			default:
-				// block_parent deliberately mints no continuation; the parent's
-				// BlockedError above is its terminal decision.
+				// block_parent and escalate_human deliberately mint no continuation:
+				// the parent's BlockedError / AwaitingHumanError above is its decision.
 				if !errors.Is(err, sql.ErrNoRows) {
-					t.Fatalf("GetJob(continuation) = %+v err=%v, want no row under block_parent", continuation, err)
+					t.Fatalf("GetJob(continuation) = %+v err=%v, want no row under %s", continuation, err, name)
 				}
 			}
 
-			// The refused block is legible after the fact, not silent.
+			// The refused write is legible after the fact, not silent.
 			events, err := store.ListTaskEvents(ctx, "task-7")
 			if err != nil {
 				t.Fatalf("ListTaskEvents returned error: %v", err)
 			}
 			refusals := 0
 			for _, event := range events {
-				if event.Kind == TaskEventMergedBlockRefused {
+				if event.Kind == TaskEventMergedRegressionRefused {
 					refusals++
 				}
 			}
-			if tc.wantBlocked && refusals == 0 {
-				t.Fatalf("no %s task event: the dropped block left no trace", TaskEventMergedBlockRefused)
+			if tc.wantRefusal && refusals == 0 {
+				t.Fatalf("no %s task event under %s: the dropped write left no trace", TaskEventMergedRegressionRefused, name)
 			}
-			if !tc.wantBlocked && refusals != 0 {
-				t.Fatalf("%s events = %d under %s, want 0 (no block was ever attempted)", TaskEventMergedBlockRefused, refusals, name)
+			if !tc.wantRefusal && refusals != 0 {
+				t.Fatalf("%s events = %d under %s, want 0 (no write over merged was ever attempted)", TaskEventMergedRegressionRefused, refusals, name)
 			}
 		})
 	}

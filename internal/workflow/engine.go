@@ -420,15 +420,9 @@ func (e Engine) setTaskState(ctx context.Context, ref taskRef, state TaskState) 
 		if IsDisposedTaskState(existing.State) && existing.State != string(state) {
 			return fmt.Errorf("task %s is %s; workflow advancement cannot move it to %s", existing.ID, existing.State, state)
 		}
-		// A dead delegation child must not undo the record that the work landed
-		// (#1673). The refusal returns nil ON PURPOSE: the block_parent advance that
-		// asked for it still has to finish releasing the coordinator, so this leaves a
-		// durable task event instead of an error. What block_parent then observes is
-		// exactly: child failed and finalized, parent advanced, task still `merged`.
-		if IsMergedToBlockedRegression(existing.State, string(state)) {
-			e.recordRefusedMergedBlock(ctx, existing.ID, state)
-			return nil
-		}
+		// The merged-regression refusal is NOT here: an advisory check on this read
+		// loses the race a second daemon can win between the read and the write, so
+		// it lives on the write itself (writeTaskState).
 		if task.GoalID == "" {
 			task.GoalID = existing.GoalID
 		}
@@ -458,31 +452,56 @@ func (e Engine) setTaskState(ctx context.Context, ref taskRef, state TaskState) 
 			if IsDisposedTaskState(byBranch.State) && byBranch.State != string(state) {
 				return fmt.Errorf("task %s is %s; workflow advancement cannot move it to %s", byBranch.ID, byBranch.State, state)
 			}
-			// Second identity setTaskState can resolve (see dismissedTaskForAdvancement):
-			// the branch's canonical task. A merged canonical task reached through a
-			// FRESH task id is the same landed-work record and gets the same refusal —
-			// guarding only the id path would leave the regression fully reachable.
-			if IsMergedToBlockedRegression(byBranch.State, string(state)) {
-				e.recordRefusedMergedBlock(ctx, byBranch.ID, state)
-				return nil
-			}
 			byBranch.State = string(state)
-			return e.Store.UpsertTask(ctx, byBranch)
+			return e.writeTaskState(ctx, byBranch, state)
 		}
 	}
-	return e.Store.UpsertTask(ctx, task)
+	return e.writeTaskState(ctx, task, state)
 }
 
-// recordRefusedMergedBlock leaves the durable trace for a refused merged->blocked
-// move. Best-effort and error-free by design: the whole point of the refusal is
-// that the surrounding advance must still complete (a dead delegation child has to
-// release its coordinator), so an unwritable audit row must not become an error
-// that fails it. Mirrors the best-effort AddTaskEvent provenance writes in
-// engine_pr_lifecycle.go.
-func (e Engine) recordRefusedMergedBlock(ctx context.Context, taskID string, requested TaskState) {
+// writeTaskState is setTaskState's single write point, and the place the
+// merged-regression rule is ENFORCED rather than merely checked.
+//
+// For a state that would undo the record that the work landed
+// (IsMergedWorkRegressionTarget: planned/blocked/awaiting_human) the write is
+// CONDITIONAL: UpsertTaskUnlessStates carries `tasks.state NOT IN ('merged')` on
+// the conflict UPDATE, so the "is it still merged?" question is answered inside
+// the same statement that writes. The advisory pre-read this replaced lost the
+// interleaving where a second daemon (or the daemon's own
+// reconcileExternallyMergedTasks in the same PollOnce) wrote `merged` after the
+// read and before the upsert; the stale write then won. Every other state takes
+// the plain upsert, so a legitimate merged -> implementing (resume-work) or a
+// fresh pull-request cycle is untouched.
+//
+// A refused write returns nil ON PURPOSE: the failure policy that asked for it
+// still has to finish releasing the coordinator, so the refusal is reported by a
+// durable task event instead of an error. What block_parent / escalate_human then
+// observe is exactly: child failed and finalized, parent advanced, task still
+// `merged`.
+func (e Engine) writeTaskState(ctx context.Context, task db.Task, state TaskState) error {
+	if !IsMergedWorkRegressionTarget(string(state)) {
+		return e.Store.UpsertTask(ctx, task)
+	}
+	written, err := e.Store.UpsertTaskUnlessStates(ctx, task, []string{string(TaskMerged)})
+	if err != nil {
+		return err
+	}
+	if !written {
+		e.recordRefusedMergedRegression(ctx, task.ID, state)
+	}
+	return nil
+}
+
+// recordRefusedMergedRegression leaves the durable trace for a write the
+// conditional upsert refused. Best-effort and error-free by design: the whole
+// point of the refusal is that the surrounding advance must still complete (a dead
+// delegation child has to release its coordinator), so an unwritable audit row must
+// not become an error that fails it. Mirrors the best-effort AddTaskEvent
+// provenance writes in engine_pr_lifecycle.go.
+func (e Engine) recordRefusedMergedRegression(ctx context.Context, taskID string, requested TaskState) {
 	_ = e.Store.AddTaskEvent(ctx, db.TaskEvent{
 		TaskID: taskID,
-		Kind:   TaskEventMergedBlockRefused,
+		Kind:   TaskEventMergedRegressionRefused,
 		Reason: fmt.Sprintf("refused %s -> %s: the pull request already merged, so the landed-work record is kept; the advance that requested it continues",
 			TaskMerged, requested),
 	})

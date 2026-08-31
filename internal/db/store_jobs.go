@@ -524,9 +524,13 @@ func (s *Store) CountQueuedJobsForRepo(ctx context.Context, repo string) (int, e
 // index in created_at order with repo as the residual is strictly cheaper and needs no
 // sort. The literal 'queued' predicate is what makes the partial index usable at all;
 // the hint follows the existing precedent at countCurrentJobsByOrgRoleRunningSQL.
+// The repo residual is CASE-INSENSITIVE because forge repository identity is: a row
+// projected `Gitmoot/Gitmoot` against a daemon registered as `gitmoot/gitmoot` would
+// otherwise be invisible to every poll, forever. It costs nothing here — repo is a
+// residual over the queued rows, not the indexed term.
 const listQueuedJobsForRepoSQL = `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, repo, pull_request
 		FROM jobs INDEXED BY idx_jobs_queued_created
-		WHERE state = 'queued' AND externally_driven = 0 AND repo = ? ORDER BY created_at, rowid`
+		WHERE state = 'queued' AND externally_driven = 0 AND lower(repo) = lower(?) ORDER BY created_at, rowid`
 
 // ListQueuedJobsForRepo returns this repo's queued engine-owned jobs in created_at
 // (then rowid) order, with the repo and pull_request projections populated.

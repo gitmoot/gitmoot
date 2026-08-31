@@ -35,16 +35,15 @@ func TestPollOnceSupersedesQueuedLegsWhosePullRequestClosed(t *testing.T) {
 			HeadRef: "task-9", BaseRef: "main", HeadSHA: "head-nine",
 		}},
 		comments: map[int64][]github.IssueComment{9: {}},
-		// #11 is a real CLOSED pull request the store never recorded — a PR opened and
-		// closed between polls, a fresh home, a restored database. Issue #12 is absent
-		// from here too, which is what a 404 looks like.
+		// The forge is the authority: a number must BE a pull request and must not be
+		// open right now. #7 is closed. #11 is a real closed PR the store never
+		// recorded (a PR opened and closed between polls, a fresh home, a restored
+		// database). Issue #12 is absent from here, which is what a 404 looks like.
 		pullsByNumber: map[int64]github.PullRequest{
+			7:  {Number: 7, State: "closed", HeadRef: "task-7", BaseRef: "main", HeadSHA: "head-seven"},
 			11: {Number: 11, State: "closed", HeadRef: "task-11", BaseRef: "main", HeadSHA: "head-eleven"},
 		},
 	}
-	// The recorded pull_requests row is the second instrument: it is what proves #7
-	// is a PULL REQUEST rather than an issue number that can never appear in a PR
-	// listing. #12 below deliberately has no row.
 	if err := store.UpsertPullRequest(ctx, db.PullRequest{
 		RepoFullName: repo.FullName(), Number: 7, HeadBranch: "task-7", BaseBranch: "main",
 		HeadSHA: "head-seven", State: "closed",

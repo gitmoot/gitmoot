@@ -1066,12 +1066,6 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 	evidence := map[int]bool{}
 	var firstErr error
 	for _, job := range jobs {
-		if job.PullRequest <= 0 {
-			continue
-		}
-		if _, open := openPullNumbers[int64(job.PullRequest)]; open {
-			continue
-		}
 		payload, err := workflowPayload(job)
 		if err != nil {
 			// This repo's own row, and it cannot be parsed. Skip it — an unparseable
@@ -1081,10 +1075,23 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 			d.logf("queued-job sweep: skipping %s: %v", job.ID, err)
 			continue
 		}
-		if payload.PullRequest <= 0 || payload.Repo != d.Repo.FullName() {
-			// The projection and the payload disagree (a pre-#843 row was never
-			// backfilled, or a payload was rewritten without its projection). Trust the
-			// payload, which is what every other consumer reads.
+		// The PAYLOAD is authoritative for the number, not the projection.
+		// jobs.pull_request was never backfilled, so a pre-#843 row carries 0 there
+		// while its payload names a real PR — reading the projection alone left exactly
+		// those legacy rows invisible, which is the population this sweep exists for.
+		// The projection's job is done: it kept the SQL from ever reading another
+		// repo's row.
+		number := payload.PullRequest
+		if number <= 0 {
+			continue
+		}
+		// Case-insensitive, because forge repository identity is. A row projected
+		// `Gitmoot/Gitmoot` against a daemon registered as `gitmoot/gitmoot` would
+		// otherwise never be selected by any poll, forever.
+		if !strings.EqualFold(strings.TrimSpace(payload.Repo), d.Repo.FullName()) {
+			continue
+		}
+		if _, open := openPullNumbers[int64(number)]; open {
 			continue
 		}
 		// Cheapest-first, and the order is load-bearing rather than cosmetic: the
@@ -1101,24 +1108,15 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 		if survives {
 			continue
 		}
-		// "Absent from the open PR list" is not evidence the number IS a pull
-		// request. payload.PullRequest also carries ISSUE numbers — handleIssueAsk
-		// stores the issue number in that field, and delegationRequest copies it onto
-		// every child, which gets no `routed` event of its own — and an issue number
-		// can never appear in a list of PRs. Require a second, independent instrument
-		// before terminating anything.
-		known, err := d.pullRequestNumberIsAPullRequest(ctx, payload.PullRequest, evidence)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		if !known {
+		// The open-PR listing is only a prefilter: it is a snapshot from the top of the
+		// poll and it cannot separate a closed PR from an ISSUE number. Ask the forge
+		// for the authoritative answer — is this a pull request, and is it not open
+		// right now — before terminating anything.
+		if !d.pullRequestIsClosedOnTheForge(ctx, number, evidence) {
 			continue
 		}
 		reason := fmt.Sprintf("queued %s job superseded: %s pull request #%d is no longer open",
-			job.Type, payload.Repo, payload.PullRequest)
+			job.Type, payload.Repo, number)
 		releasesCoordinator, err := d.queuedChildCanReleaseCoordinator(ctx, payload)
 		if err != nil {
 			// A store error here is not evidence about the coordinator. Skipping keeps a
@@ -1163,52 +1161,37 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 	return firstErr
 }
 
-// pullRequestNumberIsAPullRequest reports whether this number names a PULL REQUEST in
-// this repo. It is the second instrument, independent of the open-PR listing, and it
-// exists because "absent from the open list" was doing two jobs at once: the payload
-// field carries ISSUE numbers too (handleIssueAsk stores one there, and
-// delegationRequest copies it onto every child), and an issue number is absent from a
-// list of pull requests for a reason that has nothing to do with being closed.
+// pullRequestIsClosedOnTheForge reports whether this number names a pull request in
+// this repo that is NOT open, memoized per number for the caller's poll.
 //
-// A recorded pull_requests row answers it for free. Its ABSENCE is not an answer,
-// though: a PR the daemon never observed while open — a fresh home, a restored
-// database, a PR opened and closed between polls — has no row either, and treating
-// that as "leave it queued" would strand exactly the legs this sweep exists to clear.
-// So fall back to asking the forge about that one number. Any error, including the 404
-// an issue number produces, is NO EVIDENCE and leaves the job queued: a transient
-// forge failure must never be read as licence to terminate, and the next poll retries.
-func (d Daemon) pullRequestNumberIsAPullRequest(ctx context.Context, number int, memo map[int]bool) (bool, error) {
+// It answers the whole question in one place, because splitting it was wrong twice
+// over. Absence from the poll's open-PR listing is a cheap PREFILTER and nothing more:
+// it cannot tell a closed PR from an ISSUE number (payload.PullRequest carries those
+// too, and delegationRequest copies them onto children), and it is a SNAPSHOT taken at
+// the top of the poll, so a PR reopened before the sweep runs still looks absent. A
+// recorded pull_requests row proves the number is a PR but says nothing current about
+// its state.
+//
+// So the forge decides, and it must say BOTH things: this number is a pull request,
+// and it is not open right now. Any error — including the 404 an issue number produces
+// — is NO EVIDENCE and leaves the job queued, because a transient forge failure must
+// never read as licence to terminate somebody's work. The memo caches negatives too:
+// an issue-bound job can never be terminated, so without that every job sharing the
+// number re-asks on every poll, forever.
+func (d Daemon) pullRequestIsClosedOnTheForge(ctx context.Context, number int, memo map[int]bool) bool {
 	if memo != nil {
 		if answer, seen := memo[number]; seen {
-			return answer, nil
+			return answer
 		}
 	}
-	answer, err := d.resolvePullRequestNumberEvidence(ctx, number)
-	if err != nil {
-		return false, err
+	answer := false
+	if pull, err := d.GitHub.GetPullRequest(ctx, d.Repo, int64(number)); err == nil {
+		answer = pull.Number == int64(number) && !strings.EqualFold(strings.TrimSpace(pull.State), "open")
 	}
 	if memo != nil {
-		// Cache the NEGATIVE too. An issue-bound job can never be terminated, so
-		// without this every queued job sharing that number pays the same 404 again,
-		// once per job per poll, forever.
 		memo[number] = answer
 	}
-	return answer, nil
-}
-
-func (d Daemon) resolvePullRequestNumberEvidence(ctx context.Context, number int) (bool, error) {
-	_, err := d.Store.GetPullRequest(ctx, d.Repo.FullName(), int64(number))
-	if err == nil {
-		return true, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return false, err
-	}
-	pull, forgeErr := d.GitHub.GetPullRequest(ctx, d.Repo, int64(number))
-	if forgeErr != nil {
-		return false, nil
-	}
-	return pull.Number == int64(number), nil
+	return answer
 }
 
 // workflowForJob resolves the engine to advance THIS job with. Every other daemon

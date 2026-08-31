@@ -5392,6 +5392,56 @@ func TestListQueuedJobsForRepoScopesInSQL(t *testing.T) {
 			t.Fatalf("job[%d].PullRequest = %d, want the projection populated", i, job.PullRequest)
 		}
 	}
+
+	// A LEGACY row must stay visible. jobs.repo was retro-backfilled (#1066) but
+	// jobs.pull_request never was, so a pre-#843 row can carry the right repo and a
+	// zero pull_request while its PAYLOAD names a real PR. This query must not filter
+	// on the projected number, or precisely those rows — the ones most likely to be
+	// stranded, because they are the oldest — would be invisible to every consumer.
+	// Only the same package can build this state: every exported write recomputes the
+	// projection from the payload.
+	if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET pull_request = 0 WHERE id = 'mine-1'`); err != nil {
+		t.Fatalf("clear pull_request(mine-1) returned error: %v", err)
+	}
+	legacy, err := store.ListQueuedJobsForRepo(ctx, "gitmoot/gitmoot")
+	if err != nil {
+		t.Fatalf("ListQueuedJobsForRepo after clearing the projection: %v", err)
+	}
+	found := false
+	for _, job := range legacy {
+		if job.ID == "mine-1" {
+			found = true
+			if job.PullRequest != 0 {
+				t.Fatalf("mine-1 PullRequest = %d, want the cleared projection reported as-is", job.PullRequest)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("a row with a zero pull_request projection vanished: legacy rows must reach the consumer that can read their payload")
+	}
+
+	// Case-variant projection must still be selected: forge repository identity is
+	// case-insensitive, so a row projected with different casing is the same repo's
+	// work. Left case-sensitive, those rows were unreachable by any poll.
+	if err := store.CreateJob(ctx, Job{
+		ID: "case-variant", Agent: "a", Type: "review", State: "queued",
+		Payload: `{"repo":"Gitmoot/Gitmoot","pull_request":7}`,
+	}); err != nil {
+		t.Fatalf("CreateJob(case-variant) returned error: %v", err)
+	}
+	variants, err := store.ListQueuedJobsForRepo(ctx, "gitmoot/gitmoot")
+	if err != nil {
+		t.Fatalf("ListQueuedJobsForRepo after case-variant row: %v", err)
+	}
+	sawVariant := false
+	for _, job := range variants {
+		if job.ID == "case-variant" {
+			sawVariant = true
+		}
+	}
+	if !sawVariant {
+		t.Fatal("a case-variant repo projection was not selected: forge repo identity is case-insensitive")
+	}
 }
 
 // TestListRunningJobsUpdatedBeforeOrder pins FIX-4a (#619): ListRunningJobsUpdatedBefore

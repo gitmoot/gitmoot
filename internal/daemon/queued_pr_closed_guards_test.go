@@ -87,6 +87,13 @@ func TestPollOnceIsUnaffectedByAnotherRepoUndecodablePayload(t *testing.T) {
 		Repo: repo.FullName(), Branch: "task-7", PullRequest: 7, TaskID: "task-7",
 		LeadAgent: "lead", Sender: "github",
 	})
+	// Same repo, different casing on the payload. Forge repository identity is
+	// case-insensitive, so this is this daemon's work and must be swept; a
+	// case-sensitive comparison left rows like it stranded forever.
+	seedQueuedJob(t, store, "case-variant-review", "audit", "review", workflow.JobPayload{
+		Repo: "Gitmoot/Gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7",
+		LeadAgent: "lead", Sender: "github",
+	})
 	engine := workflow.Engine{Store: store}
 	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
 
@@ -101,6 +108,9 @@ func TestPollOnceIsUnaffectedByAnotherRepoUndecodablePayload(t *testing.T) {
 	// The foreign row is untouched: not this daemon's business.
 	if job, err := store.GetJob(ctx, "foreign-bad-payload"); err != nil || job.State != string(workflow.JobQueued) {
 		t.Fatalf("foreign row = %+v err=%v, want queued and untouched", job.State, err)
+	}
+	if job, err := store.GetJob(ctx, "case-variant-review"); err != nil || job.State != string(workflow.JobCancelled) {
+		t.Fatalf("case-variant row = %+v err=%v, want cancelled: repo identity is case-insensitive", job.State, err)
 	}
 }
 
@@ -165,5 +175,43 @@ func closedPullRequestSweepFixture(t *testing.T) (*db.Store, github.Repository, 
 	}); err != nil {
 		t.Fatalf("UpsertPullRequest 7: %v", err)
 	}
-	return store, repo, &fakeGitHub{comments: map[int64][]github.IssueComment{}}
+	// The forge is the authority on "is this a pull request, and is it not open".
+	// #7 is closed; #12 is absent, which is what an issue number looks like.
+	return store, repo, &fakeGitHub{
+		comments:      map[int64][]github.IssueComment{},
+		pullsByNumber: map[int64]github.PullRequest{7: {Number: 7, State: "closed", HeadRef: "task-7", BaseRef: "main", HeadSHA: "head-seven"}},
+	}
+}
+
+// TestPollOnceLeavesQueuedWorkAloneWhenThePullRequestReopens pins the snapshot race.
+// openPullNumbers is captured at the top of PollOnce, so a PR reopened before the
+// sweep runs still looks absent from it. Absence is only a prefilter: the forge's
+// CURRENT state decides, or live work would be cancelled out from under a reopened PR.
+func TestPollOnceLeavesQueuedWorkAloneWhenThePullRequestReopens(t *testing.T) {
+	ctx := context.Background()
+	store, repo, client := closedPullRequestSweepFixture(t)
+	// Reopened after the listing this poll will use: absent from the open set, open
+	// on the forge.
+	client.pullsByNumber[7] = github.PullRequest{
+		Number: 7, State: "open", HeadRef: "task-7", BaseRef: "main", HeadSHA: "head-seven",
+	}
+	seedQueuedJob(t, store, "reopened-review", "audit", "review", workflow.JobPayload{
+		Repo: repo.FullName(), Branch: "task-7", PullRequest: 7, TaskID: "task-7",
+		LeadAgent: "lead", Sender: "github",
+	})
+	engine := workflow.Engine{Store: store}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+
+	for poll := range 3 {
+		if err := daemon.PollOnce(ctx); err != nil {
+			t.Fatalf("PollOnce %d: %v", poll+1, err)
+		}
+	}
+	job, err := store.GetJob(ctx, "reopened-review")
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if job.State != string(workflow.JobQueued) {
+		t.Fatalf("state = %q, want queued: the PR is open on the forge, whatever the poll's snapshot said", job.State)
+	}
 }
