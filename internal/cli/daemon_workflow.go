@@ -854,8 +854,19 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 		label = "pr-" + strings.ReplaceAll(request.Repo, "/", "-") + "-" + fmt.Sprint(request.PullRequest)
 	}
 	cfg, _ := loadMergeGateOrgConfig(g.Home)
-	from := mergeGateEscalationFrom(cfg, request.Repo)
-	body := workflow.FormatOrgEscalateNote(from, mergeGateEscalationTo(cfg, from), label, reason.Render())
+	from, fromDeclared := mergeGateEscalationFrom(cfg, request.Repo)
+	// The note is an escalation, so it must route as one. It previously carried no
+	// wake kind, which defaults to "reply" (db/workflow_store.go), and delivery then
+	// demanded an on=reply rule for the recipient -- a route the escalation kinds
+	// provisioned by org seat add do not satisfy.
+	rules, err := g.Store.ListEventRules(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve merge-gate escalation routes: %w", err)
+	}
+	to := mergeGateEscalationTo(cfg, from, fromDeclared, func(role string) bool {
+		return roleHasEnabledWakeRoute(rules, db.WakeOutboxKindEscalation, role)
+	})
+	body := workflow.FormatOrgEscalateNote(from, to, label, reason.Render())
 	if body == "" {
 		return errors.New("format merge-gate escalation note")
 	}
@@ -874,7 +885,7 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 	}
 	if _, err := g.Store.InsertWorkflowNote(ctx, db.WorkflowNote{
 		WorkflowID: label, Author: from, Body: body, Repo: request.Repo,
-		AddressedTarget: addressedTarget,
+		AddressedTarget: addressedTarget, AddressedWakeKind: db.WakeOutboxKindEscalation,
 	}); err != nil {
 		return fmt.Errorf("record merge-gate escalation: %w", err)
 	}
@@ -890,38 +901,72 @@ func loadMergeGateOrgConfig(home string) (config.OrgConfig, bool) {
 	return cfg, err == nil
 }
 
-func mergeGateEscalationFrom(cfg config.OrgConfig, repo string) string {
+// mergeGateEscalationFrom names the escalating role and reports whether the CHART
+// placed it. The bool is load-bearing: an unplaced name is synthesized from the
+// repo, and this fleet has repos and roles sharing names (vetrina, joltra), so a
+// synthesized name can collide with an unrelated declared role. Routing off that
+// collision would escalate into a branch that owns nothing here.
+func mergeGateEscalationFrom(cfg config.OrgConfig, repo string) (string, bool) {
 	if owner, ok := repoOrgOwner(cfg, repo); ok {
-		return owner
+		return owner, true
 	}
 	parts := strings.Split(strings.TrimSpace(repo), "/")
 	if len(parts) == 2 && parts[1] != "" {
-		return parts[1]
+		return parts[1], false
 	}
-	return "gitmoot"
+	return "gitmoot", false
 }
 
-// mergeGateEscalationTo resolves the role that must act on a gate miss. It is the
-// nearest ancestor of the escalating role, which is the same upward rule the CLI
-// path already enforces -- org escalate refuses a --to that is not in
-// cfg.Ancestors(from) (org.go). Before #1727 this was the literal "jarvis", so
-// every engine escalation bypassed the chart and landed on one role regardless of
-// who actually owned the project.
-func mergeGateEscalationTo(cfg config.OrgConfig, from string) string {
-	if ancestors := cfg.Ancestors(from); len(ancestors) != 0 {
-		return ancestors[0]
+// mergeGateEscalationTo resolves the role that must ACT on a gate miss, and it
+// must resolve to somebody a wake can actually reach. Before #1727 the recipient
+// was the literal "jarvis", so every engine escalation bypassed the chart; the
+// chart answer is the nearest ancestor, which is the same upward rule org escalate
+// enforces on the CLI path (it refuses a --to outside cfg.Ancestors(from)).
+//
+// deliverable reports whether a role has an enabled wake route for this kind. The
+// nearest ancestor is preferred, but an ancestor with no route is a note nobody
+// receives: matchingWakeRules is scope-blind and requires OnKind+WakeRole, and an
+// unmatched outbox row is never expired, so it sits pending forever. We therefore
+// climb to the first ancestor that can be woken and only fall back to the nearest
+// one when nobody in the chain can be.
+//
+// ValidateOrg admits exactly one root and requires it be named "owner"
+// (config/org.go), so the unplaced-sender case is that constant rather than a
+// Roots() lookup; if that invariant is ever relaxed, this returns the wrong role.
+func mergeGateEscalationTo(cfg config.OrgConfig, from string, fromDeclared bool, deliverable func(string) bool) string {
+	if !fromDeclared {
+		return orgChartRootRole
 	}
-	if _, declared := cfg.Role(from); declared {
-		// from is a chart root: nobody is above it, so it is the actor. Addressing
-		// anyone else here would be a guess the chart did not make.
+	ancestors := cfg.Ancestors(from)
+	if len(ancestors) == 0 {
+		// from IS the root: nobody is above it, so it is the actor. org escalate
+		// refuses a self-addressed question between humans; here there is no
+		// higher role to name and a note addressed anywhere else would be a guess.
 		return from
 	}
-	// from was synthesized from the repo name because no role's scope matched, so
-	// the chart cannot place it. The root owns what nobody claimed.
-	if roots := cfg.Roots(); len(roots) != 0 {
-		return roots[0]
+	for _, ancestor := range ancestors {
+		if deliverable(ancestor) {
+			return ancestor
+		}
 	}
-	return "owner"
+	return ancestors[0]
+}
+
+// orgChartRootRole is the single root name ValidateOrg admits.
+const orgChartRootRole = "owner"
+
+// roleHasEnabledWakeRoute mirrors what matchingWakeRules will demand at delivery
+// time: an enabled rule whose kind and wake role both match. Filters are left to
+// the delivery check, which sees the event a rule may filter on.
+func roleHasEnabledWakeRoute(rules []db.EventRule, kind, role string) bool {
+	for _, rule := range rules {
+		if rule.Enabled &&
+			strings.EqualFold(strings.TrimSpace(rule.OnKind), kind) &&
+			strings.EqualFold(strings.TrimSpace(rule.WakeRole), strings.TrimSpace(role)) {
+			return true
+		}
+	}
+	return false
 }
 
 func repoOrgOwner(cfg config.OrgConfig, repo string) (string, bool) {

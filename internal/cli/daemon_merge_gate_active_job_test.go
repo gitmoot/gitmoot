@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -179,12 +180,18 @@ scope = ["owner/repo"]
 		outbox[0].TargetRole != "coordinator" || outbox[0].SourceID != fmt.Sprint(notes[0].ID) {
 		t.Fatalf("merge-gate wake outbox = %+v, err=%v", outbox, err)
 	}
+	// An escalation must route AS an escalation. With no wake kind the row keys
+	// "reply:<role>", and delivery then demands an on=reply rule the escalation
+	// routes provisioned by org seat add do not satisfy (#1728 review).
+	if outbox[0].CoalesceKey != "escalation:coordinator" {
+		t.Fatalf("merge-gate wake coalesce key = %q, want escalation:coordinator", outbox[0].CoalesceKey)
+	}
 }
 
-// The end-to-end test above pins the parent path through gate.Evaluate. These
-// pin the branches taken when the chart cannot name a parent, which no single
-// gate run can reach.
-func TestMergeGateEscalationToFallsBackWhenChartCannotNameAParent(t *testing.T) {
+// The end-to-end test above pins the parent path through gate.Evaluate. This pins
+// the branches a single gate run cannot reach, and every case expects a DIFFERENT
+// role: a table whose rows all expect "owner" cannot discriminate its own ladder.
+func TestMergeGateEscalationToResolvesChartAndDeliverability(t *testing.T) {
 	chart := func(t *testing.T, body string) config.OrgConfig {
 		t.Helper()
 		paths := config.PathsForHome(t.TempDir())
@@ -200,29 +207,97 @@ func TestMergeGateEscalationToFallsBackWhenChartCannotNameAParent(t *testing.T) 
 		}
 		return cfg
 	}
+	// "vetrina" is BOTH a declared role and a plausible repo-name segment, which is
+	// the collision the fromDeclared flag exists to refuse. Its parent is DELIBERATELY
+	// not the root: if provenance were ignored, the chart would place it and route to
+	// "lead", so the expected "owner" is a discriminating value rather than a
+	// coincidence of the ladder's last rung.
 	populated := `
 [org.roles."owner"]
 scope = ["*"]
-[org.roles."coordinator"]
+[org.roles."lead"]
 parent = "owner"
-scope = ["owner/*"]
+scope = ["*"]
+[org.roles."coordinator"]
+parent = "lead"
+scope = ["owner/repo"]
+[org.roles."vetrina"]
+parent = "lead"
+scope = ["other/repo"]
 `
+	reachable := func(roles ...string) func(string) bool {
+		return func(role string) bool { return slices.Contains(roles, role) }
+	}
 	for _, test := range []struct {
-		name string
-		body string
-		from string
-		want string
+		name        string
+		body        string
+		from        string
+		declared    bool
+		deliverable func(string) bool
+		want        string
 	}{
-		{name: "declared child resolves its parent", body: populated, from: "coordinator", want: "owner"},
-		{name: "chart root is the actor", body: populated, from: "owner", want: "owner"},
-		{name: "undeclared role falls back to the root", body: populated, from: "appkit-demo", want: "owner"},
-		{name: "absent chart falls back to owner", body: "", from: "appkit-demo", want: "owner"},
+		{
+			name: "nearest ancestor when it can be woken", body: populated,
+			from: "coordinator", declared: true, deliverable: reachable("lead", "owner"), want: "lead",
+		},
+		{
+			name: "climbs past an ancestor with no wake route", body: populated,
+			from: "coordinator", declared: true, deliverable: reachable("owner"), want: "owner",
+		},
+		{
+			name: "keeps the nearest ancestor when nobody can be woken", body: populated,
+			from: "coordinator", declared: true, deliverable: reachable(), want: "lead",
+		},
+		{
+			name: "chart root is the actor", body: populated,
+			from: "owner", declared: true, deliverable: reachable("owner"), want: "owner",
+		},
+		{
+			name: "repo-name segment colliding with a role never inherits its parent", body: populated,
+			from: "vetrina", declared: false, deliverable: reachable("lead", "owner"), want: "owner",
+		},
+		{
+			name: "absent chart falls back to the root name", body: "",
+			from: "appkit-demo", declared: false, deliverable: reachable(), want: "owner",
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if got := mergeGateEscalationTo(chart(t, test.body), test.from); got != test.want {
-				t.Fatalf("mergeGateEscalationTo(%q) = %q, want %q", test.from, got, test.want)
+			got := mergeGateEscalationTo(chart(t, test.body), test.from, test.declared, test.deliverable)
+			if got != test.want {
+				t.Fatalf("mergeGateEscalationTo(%q, declared=%t) = %q, want %q", test.from, test.declared, got, test.want)
 			}
 		})
+	}
+}
+
+// repoOrgOwner picks the deepest scope match and breaks equal-depth ties by name.
+// Pre-#1727 that chose only the note's author; it now chooses the RECIPIENT's
+// branch too, so the tie-break is load-bearing and pinned here.
+func TestMergeGateEscalationFromBreaksEqualDepthScopeTiesByName(t *testing.T) {
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	content := config.DefaultConfig(paths) + `
+[org.roles."owner"]
+scope = ["*"]
+[org.roles."zeta"]
+parent = "owner"
+scope = ["*"]
+[org.roles."alpha"]
+parent = "owner"
+scope = ["*"]
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		t.Fatalf("LoadOrg: %v", err)
+	}
+	from, declared := mergeGateEscalationFrom(cfg, "owner/repo")
+	if from != "alpha" || !declared {
+		t.Fatalf("mergeGateEscalationFrom = (%q, %t), want the alphabetically first equal-depth match", from, declared)
 	}
 }
 

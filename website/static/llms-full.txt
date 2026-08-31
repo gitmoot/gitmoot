@@ -2782,7 +2782,7 @@ Fixes:
   manually or run an explicit implement/fix job, then rerun review/merge.
 - Fix failing external CI or Gitmoot statuses.
 - If the task is `awaiting_human_merge`, inspect its reason. Either the mandatory
-  exact-head review/CI gate missed (also escalated to `jarvis`) or the repository
+  exact-head review/CI gate missed (also escalated to the owning role's parent) or the repository
   has the explicit `[merge_gate] auto_merge = false` kill-switch. Merge it in
   GitHub or use an authorized `@gitmoot merge` comment. If more implementation
   is required instead, a coordinator can explicitly run `gitmoot task
@@ -16707,7 +16707,8 @@ merges gatelessly; the external gate makes the call.
 Gitmoot enables native task auto-merge by default, but only when an affirmative
 review verdict matches the exact current head SHA and all SHA-scoped commit
 statuses and check-runs are green. Missing or failing evidence parks the task in
-`awaiting_human_merge`, journals the reason, and actively wakes `jarvis`.
+`awaiting_human_merge`, journals the reason, and actively wakes the parent of
+the org role that owns the repo.
 Set `auto_merge = false` globally or per repo as an explicit kill-switch:
 
 ```toml
@@ -16740,7 +16741,7 @@ synthetic `gitmoot/ci` success. GitHub Actions creates a check-run a few seconds
 *after* a head is pushed, so a single zero observation cannot distinguish "no CI
 configured" from "CI not created yet". Instead the gate returns **pending**
 (a non-escalating, automatically-retried hold — not a policy miss, so it does
-not park the task or wake `jarvis`) and only concludes "no CI" after a **second
+not park the task or wake the owning role's parent) and only concludes "no CI" after a **second
 consecutive zero-external observation at the same head**, at least `min_ci_wait`
 (default `60s`) later. The gate is re-evaluated every daemon poll, so a
 genuinely CI-less repo merges exactly one grace window later, provided the
