@@ -175,7 +175,8 @@ func (e Engine) mailbox() Mailbox {
 			e.now(),
 			RedactCommentText,
 		)
-		wakeTargetRole := NormalizeActingOrgRole(payload.ActingOrgRole)
+		requesterRole := NormalizeActingOrgRole(payload.ActingOrgRole)
+		wakeTargetRole := requesterRole
 		if state == JobSucceeded && payload.PullRequest > 0 && payload.Result != nil && e.Store != nil {
 			job, jobErr := e.Store.GetJob(ctx, jobID)
 			if jobErr == nil && strings.EqualFold(strings.TrimSpace(job.Type), "review") {
@@ -188,6 +189,12 @@ func (e Engine) mailbox() Mailbox {
 					if resolveErr == nil {
 						owner = NormalizeActingOrgRole(resolved)
 					}
+					if resolveErr == nil && owner == "" {
+						// Persistent seats implement directly rather than through
+						// implement jobs. Review dispatch still persists the
+						// registered implementing seat as LeadAgent.
+						owner = NormalizeActingOrgRole(payload.LeadAgent)
+					}
 					event.Cause = events.EventCauseReviewVerdict
 					wakeTargetRole = owner
 					event.PullRequest = payload.PullRequest
@@ -197,9 +204,15 @@ func (e Engine) mailbox() Mailbox {
 						// routable org role. ActingOrgRole is the persisted requester
 						// role paired with that sender; legacy jobs without one keep
 						// the resolved PR owner fallback above (#1712).
-						if requesterRole := NormalizeActingOrgRole(payload.ActingOrgRole); requesterRole != "" {
+						if requesterRole != "" {
 							wakeTargetRole = requesterRole
 						}
+					}
+					if requesterRole != "" {
+						event.WakeTargetRoles = append(event.WakeTargetRoles, requesterRole)
+					}
+					if owner != "" && !strings.EqualFold(owner, requesterRole) {
+						event.WakeTargetRoles = append(event.WakeTargetRoles, owner)
 					}
 				}
 			}

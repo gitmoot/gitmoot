@@ -314,13 +314,24 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 // eventRuleMatchesAddressee is the single scope gate shared by durable enqueue
 // and live evaluation. Addressed rules require positive target evidence;
 // observer rules deliberately retain fleet-wide oversight for address-less and
-// directed events alike.
+// directed events alike. Multi-address events match any listed role.
 func eventRuleMatchesAddressee(rule db.EventRule, event events.Event) bool {
 	if rule.Scope == db.EventRuleScopeObserver {
 		return true
 	}
-	target := strings.TrimSpace(event.WakeTargetRole)
-	return target != "" && strings.EqualFold(strings.TrimSpace(rule.WakeRole), target)
+	role := strings.TrimSpace(rule.WakeRole)
+	if role == "" {
+		return false
+	}
+	if target := strings.TrimSpace(event.WakeTargetRole); target != "" && strings.EqualFold(role, target) {
+		return true
+	}
+	for _, target := range event.WakeTargetRoles {
+		if target = strings.TrimSpace(target); target != "" && strings.EqualFold(role, target) {
+			return true
+		}
+	}
+	return false
 }
 
 // addressBlockedEvent enriches every blocked event at the event-sink source
