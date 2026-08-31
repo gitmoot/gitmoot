@@ -93,6 +93,34 @@ func TestSandboxExecReadOnlyWorkdirE2E(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// The go command installs downloaded toolchains as read-only modules. Make
+	// their directories removable before testing.TempDir cleans the sandbox.
+	t.Cleanup(func() {
+		err := filepath.Walk(cacheDir, func(path string, info os.FileInfo, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if info.IsDir() {
+				return os.Chmod(path, 0o700)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Errorf("make sandbox tool cache removable: %v", err)
+		}
+	})
+	// Exercise the cleanup contract even when the host already has the requested
+	// Go toolchain and therefore does not download a read-only toolchain module.
+	cleanupProbeDir := filepath.Join(cacheDir, "go-mod", ".cleanup-probe")
+	if err := os.MkdirAll(cleanupProbeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cleanupProbeDir, "artifact"), []byte("probe"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cleanupProbeDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
 	source := filepath.Join(workdir, "source.txt")
 	if err := os.WriteFile(source, []byte("unchanged"), 0o600); err != nil {
 		t.Fatal(err)
@@ -126,7 +154,7 @@ if cat "$4" >/dev/null 2>&1; then exit 43; fi
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + filepath.Join(cacheDir, "home"),
 		"GOTOOLCHAIN=go1.26.0",
-		"GOFLAGS=-modcacherw",
+		"GOFLAGS=" + os.Getenv("GOFLAGS"),
 		"GOCACHE=" + filepath.Join(cacheDir, "go-build"),
 		"GOMODCACHE=" + filepath.Join(cacheDir, "go-mod"),
 		"GOPATH=" + filepath.Join(cacheDir, "gopath"),
