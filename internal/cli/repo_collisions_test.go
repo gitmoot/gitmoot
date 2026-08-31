@@ -36,7 +36,7 @@ func TestDetectOpenPRFileCollisionsUsesDistinctPRIntersections(t *testing.T) {
 			30: {{Filename: "README.md"}, {Filename: "README.md"}, {Filename: "internal/workflow/engine.go"}},
 		},
 	}
-	got, err := detectOpenPRFileCollisions(context.Background(), client, github.Repository{Owner: "gitmoot", Name: "gitmoot"})
+	got, err := detectOpenPRFileCollisions(context.Background(), client, github.Repository{Owner: "gitmoot", Name: "gitmoot"}, repoCollisionDefaultLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,6 +49,34 @@ func TestDetectOpenPRFileCollisionsUsesDistinctPRIntersections(t *testing.T) {
 	}
 	if !reflect.DeepEqual(client.fileCalls, []int64{10, 20, 30}) {
 		t.Fatalf("file calls=%v, want sorted distinct PRs", client.fileCalls)
+	}
+}
+
+func TestDetectOpenPRFileCollisionsLimitsNewestPullRequests(t *testing.T) {
+	client := &fakeRepoCollisionClient{
+		pulls: []github.PullRequest{{Number: 1}, {Number: 4}, {Number: 2}, {Number: 3}},
+		files: map[int64][]github.PullRequestFile{
+			1: {{Filename: "old-one.txt"}},
+			2: {{Filename: "old-two.txt"}},
+			3: {{Filename: "shared.txt"}},
+			4: {{Filename: "shared.txt"}},
+		},
+	}
+	got, err := detectOpenPRFileCollisions(
+		context.Background(),
+		client,
+		github.Repository{Owner: "gitmoot", Name: "gitmoot"},
+		2,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []repoPRCollision{{FirstPR: 3, SecondPR: 4, Files: []string{"shared.txt"}}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("collisions=%+v, want %+v", got, want)
+	}
+	if !reflect.DeepEqual(client.fileCalls, []int64{3, 4}) {
+		t.Fatalf("file calls=%v, want only two newest pull requests", client.fileCalls)
 	}
 }
 
@@ -105,5 +133,17 @@ func TestRunRepoCollisionsJSONReturnsEmptyArray(t *testing.T) {
 	code := runRepo([]string{"collisions", "gitmoot/gitmoot", "--json"}, &stdout, &stderr)
 	if code != 0 || stdout.String() != "[]\n" {
 		t.Fatalf("clean JSON code=%d out=%q err=%q, want []", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestRunRepoCollisionsRejectsUnboundedLimits(t *testing.T) {
+	for _, limit := range []string{"0", "101"} {
+		t.Run(limit, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := runRepo([]string{"collisions", "gitmoot/gitmoot", "--limit", limit}, &stdout, &stderr)
+			if code != 2 || !strings.Contains(stderr.String(), "--limit must be between 1 and 100") {
+				t.Fatalf("limit=%s code=%d out=%q err=%q", limit, code, stdout.String(), stderr.String())
+			}
+		})
 	}
 }

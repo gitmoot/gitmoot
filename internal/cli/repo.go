@@ -82,7 +82,7 @@ func printRepoUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot repo set-interval --all (<duration>|default)")
 	fmt.Fprintln(w, "  gitmoot repo remove owner/repo")
 	fmt.Fprintln(w, "  gitmoot repo doctor owner/repo")
-	fmt.Fprintln(w, "  gitmoot repo collisions owner/repo [--json]")
+	fmt.Fprintln(w, "  gitmoot repo collisions owner/repo [--limit N] [--json]")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "owner/repo may be given before or after the flags.")
 }

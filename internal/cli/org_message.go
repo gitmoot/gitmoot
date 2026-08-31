@@ -118,7 +118,13 @@ func runOrgMessageSend(args []string, stdout, stderr io.Writer) int {
 	}
 	var note db.WorkflowNote
 	if err := withStore(*home, func(store *db.Store) error {
-		var err error
+		count, err := store.CountJobsByWorkflow(context.Background(), label)
+		if err != nil {
+			return err
+		}
+		if count == 0 {
+			return fmt.Errorf("workflow %q has no jobs; refusing message to guard against a typo", label)
+		}
 		note, err = store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
 			WorkflowID:      label,
 			Author:          from,

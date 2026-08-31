@@ -10595,7 +10595,7 @@ gitmoot repo set-interval owner/repo (<duration>|default)
 gitmoot repo set-interval --all (<duration>|default)
 gitmoot repo remove owner/repo
 gitmoot repo doctor owner/repo
-gitmoot repo collisions owner/repo [--json]
+gitmoot repo collisions owner/repo [--limit N] [--json]
 gitmoot daemon start --poll 30s --workers 1
 gitmoot daemon start --session <root-job-id>
 gitmoot daemon start
@@ -10609,11 +10609,13 @@ For structured local state, use `gitmoot dashboard --json` or
 `gitmoot task list --repo owner/repo --json`. `gitmoot status --json` and
 `gitmoot task show` are not valid commands.
 
-`gitmoot repo collisions owner/repo` lists open pull requests, compares each
-distinct pair's changed-file sets, and prints one warning per non-empty
-intersection with both PR numbers and the sorted shared paths. It exits 1 when
-collisions exist, 0 when every open PR pair is disjoint, and supports structured
-output with `--json`; a clean result is the iterable empty array `[]`.
+`gitmoot repo collisions owner/repo` inspects at most the newest `--limit` open
+pull requests (default 25, maximum 100), compares each selected pair's current
+changed-filename sets, and prints one warning per non-empty intersection with
+both PR numbers and the sorted shared paths. It exits 1 when collisions exist, 0
+when every inspected pair is disjoint, and supports structured output with
+`--json`; a clean result is the iterable empty array `[]`. Rename history is not
+available, so a concurrent edit of a renamed path's old name may be missed.
 
 `gitmoot daemon status` always prints the configured daemon log path. For a
 running daemon, it also compares that file's last write with the daemon's
@@ -12120,6 +12122,7 @@ gitmoot workflow list
 gitmoot workflow show fable/dashboard-redesign --limit 100
 gitmoot workflow describe fable/dashboard-redesign "Coordinate and ship the dashboard redesign."
 gitmoot workflow note fable/dashboard-redesign "Implementation started." --author operator --status active
+gitmoot workflow show-note 42
 gitmoot workflow close fable/dashboard-redesign --reason "Shipped and verified."
 ```
 

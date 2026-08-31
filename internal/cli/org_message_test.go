@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -50,8 +51,32 @@ scope=["gitmoot/review"]
 	return home
 }
 
+func orgMessageSeedWorkflow(t *testing.T, home, workflowID string) {
+	t.Helper()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.CreateJob(context.Background(), db.Job{
+		ID:      "message-fixture-job",
+		Agent:   "worker",
+		Type:    "ask",
+		State:   "succeeded",
+		Repo:    "gitmoot/gitmoot",
+		Payload: fmt.Sprintf(`{"workflow_id":%q}`, workflowID),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestOrgMessageSendAllowsDifferentlyScopedSameParentSiblings(t *testing.T) {
 	home := orgMessageTestHome(t)
+	orgMessageSeedWorkflow(t, home, "gitmoot/1692-test")
 	t.Setenv("GITMOOT_ORG_ROLE", "gm-omp-nag")
 	var stdout, stderr bytes.Buffer
 	code := runOrg([]string{
@@ -122,6 +147,7 @@ func TestOrgMessageSendAllowsDifferentlyScopedSameParentSiblings(t *testing.T) {
 
 func TestOrgMessageSendAllowsOwnerChildrenAsOrdinarySiblings(t *testing.T) {
 	home := orgMessageTestHome(t)
+	orgMessageSeedWorkflow(t, home, "gitmoot/1692-owner-children")
 	t.Setenv("GITMOOT_ORG_ROLE", "jarvis")
 	var stdout, stderr bytes.Buffer
 	code := runOrg([]string{
@@ -132,6 +158,36 @@ func TestOrgMessageSendAllowsOwnerChildrenAsOrdinarySiblings(t *testing.T) {
 	}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("owner-child sibling send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestOrgMessageSendRefusesUnknownWorkflow(t *testing.T) {
+	home := orgMessageTestHome(t)
+	t.Setenv("GITMOOT_ORG_ROLE", "gm-omp-nag")
+	var stdout, stderr bytes.Buffer
+	code := runOrg([]string{
+		"message", "send", "--home", home,
+		"--to", "gm-omp-impl",
+		"--workflow", "gitmoot/1692-typo",
+		"Do not create a phantom workflow",
+	}, &stdout, &stderr)
+	want := `workflow "gitmoot/1692-typo" has no jobs; refusing message to guard against a typo`
+	if code != 1 || !strings.Contains(stderr.String(), want) {
+		t.Fatalf("unknown-workflow send code=%d out=%q err=%q, want %q", code, stdout.String(), stderr.String(), want)
+	}
+
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	notes, err := store.ListWorkflowNotes(context.Background(), "gitmoot/1692-typo", 0)
+	if err != nil || len(notes) != 0 {
+		t.Fatalf("phantom workflow notes=%+v err=%v", notes, err)
+	}
+	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("phantom workflow wakes=%+v err=%v", pending, err)
 	}
 }
 

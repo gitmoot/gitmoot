@@ -244,8 +244,8 @@ can discover Gitmoot through an installed runtime plugin. Use
 adds the resolved `.gitmoot` home to the sandbox on Linux, macOS, and Windows.
 Use `gitmoot goal template` when
 writing a standard task-by-task goal file. Use `gitmoot workflow list`, `gitmoot
-workflow show`, `gitmoot workflow describe`, `gitmoot workflow note`, and
-`gitmoot workflow close` to
+workflow show`, `gitmoot workflow show-note`, `gitmoot workflow describe`,
+`gitmoot workflow note`, and `gitmoot workflow close` to
 inspect external-coordinator workflow groups, set their stable description, add
 verbatim journal entries, set a manual status escape hatch, optionally stage
 a note in persistent memory, and end a finished group. Workflow hygiene:

@@ -14,6 +14,11 @@ import (
 	"github.com/gitmoot/gitmoot/internal/github"
 )
 
+const (
+	repoCollisionDefaultLimit = 25
+	repoCollisionMaxLimit     = 100
+)
+
 type repoCollisionClient interface {
 	ListPullRequests(context.Context, github.Repository, string) ([]github.PullRequest, error)
 	ListPullRequestFiles(context.Context, github.Repository, int64) ([]github.PullRequestFile, error)
@@ -33,6 +38,7 @@ func runRepoCollisions(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("repo collisions", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	jsonOutput := fs.Bool("json", false, "print collisions as JSON")
+	limit := fs.Int("limit", repoCollisionDefaultLimit, "maximum newest open pull requests to inspect (1-100)")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fs.Usage()
 		if len(args) == 0 {
@@ -41,16 +47,20 @@ func runRepoCollisions(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	repoArg, code := parseRepoPositional(fs, "repo collisions", args, nil, map[string]struct{}{"json": {}}, stderr)
+	repoArg, code := parseRepoPositional(fs, "repo collisions", args, map[string]struct{}{"limit": {}}, map[string]struct{}{"json": {}}, stderr)
 	if code >= 0 {
 		return code
+	}
+	if *limit < 1 || *limit > repoCollisionMaxLimit {
+		fmt.Fprintf(stderr, "repo collisions: --limit must be between 1 and %d\n", repoCollisionMaxLimit)
+		return 2
 	}
 	repo, err := daemon.ParseRepository(repoArg)
 	if err != nil {
 		fmt.Fprintf(stderr, "repo collisions: invalid repo: %v\n", err)
 		return 2
 	}
-	collisions, err := detectOpenPRFileCollisions(context.Background(), newRepoCollisionClient(), repo)
+	collisions, err := detectOpenPRFileCollisions(context.Background(), newRepoCollisionClient(), repo, *limit)
 	if err != nil {
 		fmt.Fprintf(stderr, "repo collisions: %v\n", err)
 		return 1
@@ -76,13 +86,20 @@ func runRepoCollisions(args []string, stdout, stderr io.Writer) int {
 	return 1
 }
 
-func detectOpenPRFileCollisions(ctx context.Context, client repoCollisionClient, repo github.Repository) ([]repoPRCollision, error) {
+func detectOpenPRFileCollisions(ctx context.Context, client repoCollisionClient, repo github.Repository, limit int) ([]repoPRCollision, error) {
 	if client == nil {
 		return nil, errors.New("GitHub client is required")
+	}
+	if limit < 1 {
+		return nil, errors.New("pull request limit must be positive")
 	}
 	pulls, err := client.ListPullRequests(ctx, repo, "open")
 	if err != nil {
 		return nil, fmt.Errorf("list open pull requests for %s: %w", repo.FullName(), err)
+	}
+	sort.Slice(pulls, func(i, j int) bool { return pulls[i].Number > pulls[j].Number })
+	if len(pulls) > limit {
+		pulls = pulls[:limit]
 	}
 	sort.Slice(pulls, func(i, j int) bool { return pulls[i].Number < pulls[j].Number })
 	fileSets := make(map[int64]map[string]struct{}, len(pulls))
